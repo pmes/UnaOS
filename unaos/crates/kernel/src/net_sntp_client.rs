@@ -181,6 +181,7 @@ fn src_word(s: clock::ClockSource) -> &'static str {
     match s {
         clock::ClockSource::Unset => "unset",
         clock::ClockSource::Manual => "manual (date -s)",
+        clock::ClockSource::Rtc => "rtc",
         clock::ClockSource::Sntp { .. } => "sntp",
     }
 }

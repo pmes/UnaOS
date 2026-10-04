@@ -778,3 +778,17 @@ pub fn volkeys_selftest() {
     let _ = crate::drivers::hda::vol::apply(l0, m0);
     OSD_UNTIL.store(0, Ordering::Relaxed);
 }
+
+/// SETTINGS (R75): set the volume level (`0..=16`) and mute directly (a slider and a toggle), the same
+/// store + amp write + indicator `volkey_usage` does. Returns whether an amp verb was issued.
+pub fn set_volume(level: u8, muted: bool) -> bool {
+    let lv = level.min(16);
+    VOL_LEVEL.store(lv, Ordering::Relaxed);
+    VOL_MUTED.store(muted as u8, Ordering::Relaxed);
+    #[cfg(all(target_arch = "x86_64", feature = "hda"))]
+    let written = crate::drivers::hda::vol::apply(lv, muted) > 0;
+    #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
+    let written = false;
+    if muted { osd_set(OSD_MUTED, lv) } else { osd_set(OSD_VOL, lv) }
+    written
+}

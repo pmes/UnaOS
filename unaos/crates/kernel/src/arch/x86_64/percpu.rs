@@ -137,3 +137,55 @@ pub fn note_tick() {
 pub fn note_ipi() {
     this_cpu().ipis.fetch_add(1, Ordering::Relaxed);
 }
+
+/// LINUXABI — one template line for the SYSCALL stub (`unaos_syscall_entry`): park the user's r8 (Linux
+/// syscall arg 4, which the stub overwrites with r10 for the 5-arg C ABI) in the per-CPU scratch that
+/// `syscall_user_rsp` vacated two pushes earlier. Knob-off expands to an EMPTY template line, so the stub's
+/// machine code is byte-identical. Defined at the FILE TAIL: no `panic::Location` above shifts.
+#[cfg(feature = "linuxabi")]
+#[macro_export]
+macro_rules! linuxabi_r8 {
+    () => {
+        "mov gs:[{uoff}], r8"
+    };
+}
+#[cfg(not(feature = "linuxabi"))]
+#[macro_export]
+macro_rules! linuxabi_r8 {
+    () => {
+        ""
+    };
+}
+
+/// LINUXABI2 — push the callee-saved GPRs (rbx rbp r12-r15) under rcx/r11/user-rsp on the task's kernel stack (6 pushes = 48 bytes, so the
+/// 16-byte alignment the stub documents is kept). Lets `fork` give the child the parent's register file and `execve` rewrite the return
+/// frame. Knob-off expands to an EMPTY template line: the stub's machine code is byte-identical.
+#[cfg(feature = "linuxabi")]
+#[macro_export]
+macro_rules! linuxabi_save {
+    () => {
+        "push rbx\npush rbp\npush r12\npush r13\npush r14\npush r15"
+    };
+}
+#[cfg(not(feature = "linuxabi"))]
+#[macro_export]
+macro_rules! linuxabi_save {
+    () => {
+        ""
+    };
+}
+/// LINUXABI2 — the matching pops, placed right after `call {dispatch}` (rax must survive: pops touch only the six).
+#[cfg(feature = "linuxabi")]
+#[macro_export]
+macro_rules! linuxabi_restore {
+    () => {
+        "pop r15\npop r14\npop r13\npop r12\npop rbp\npop rbx"
+    };
+}
+#[cfg(not(feature = "linuxabi"))]
+#[macro_export]
+macro_rules! linuxabi_restore {
+    () => {
+        ""
+    };
+}

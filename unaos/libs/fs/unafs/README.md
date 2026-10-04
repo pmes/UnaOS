@@ -351,7 +351,8 @@ depend on it with `default-features = false`.
 | `BlockDevice` trait + `MemDevice` | ✅ | ✅ |
 | `adapter` (512↔4096 `BlockAdapter` over `SectorDevice`; GPT/MBR parse; `MemSectorDevice`) | ✅ | ✅ |
 | `UnaFS` core ops (`format`/`mount`/`read`/`write`/`ls`/`mkdir`/`set_attribute`/`get_attribute`) | ✅ | ✅ |
-| `query` engine (`Query` parsing, `UnaFS::query`, `cosine_similarity`) | ✅ | ✅ |
+| `query` engine (`Query`/`Expr` parsing, B+tree planner, `UnaFS::query` → `QueryHit`, `cosine_similarity`) | ✅ | ✅ |
+| `index` (catalog record, index key encodings) + `clock` (timestamp hook) | ✅ | ✅ |
 | Mutations: `unlink` (full catalog scrub + extent frees) | ✅ | ✅ |
 | Mutations: `rename` (same-dir and cross-dir; refuses overwrite and directory loops) | ✅ | ✅ |
 | Mutations: `remove_attribute` (inline and spilled; index entries scrubbed) | ✅ | ✅ |
@@ -427,6 +428,72 @@ golden, and deserialize(golden) == value). Any layout drift — a field reorder,
 type change, a codec-config regression — fails a KAT immediately. **These vectors
 must never be edited to make a change pass; they are the format contract.**
 
+## Format v6: the indexed catalog and the query language (B302 F3F4)
+
+A v6 volume's attribute catalog is no longer a list. The catalog inode (id 2)
+holds one 40 B **catalog record** (`UNAFSCX1 | eq_root | ord_root | entries |
+fnv`, KAT `kat_catalog_record_v6`) naming two `btree.rs` trees, both under
+`LexCmp`, both with empty values:
+
+| Tree | Key (big-endian) | Answers |
+| :--- | :--- | :--- |
+| equality | `key_hash ‖ val_hash ‖ inode_id` | `k == v` (one prefix range); every inode carrying `k` (`!=`, similarity) |
+| ordered | `key_hash ‖ tag ‖ value bytes ‖ inode_id` — Int: tag 1, sign-flipped; Float: tag 2, total-order bits; String: tag 3, NUL escaped `00 FF`, capped at 96 B, `00 00` end or `00 01` spill marker | `> < >= <=`, `BETWEEN`, `a <= k <= b` (range scans) |
+
+Tree nodes come from the volume's refcount map and are path-copied, so an
+index mutation joins the operation's transaction and becomes durable at the
+same single root-sector flip (root record → inode map → catalog inode →
+record → roots). A snapshot pins the index as-of; fsck counts the tree blocks
+and its repair scrubs entries naming dead inodes out of both trees. Blob and
+Vector values are equality-indexed only. The key encodings are pinned by
+`kat_index_keys_v6`.
+
+**Query language** (`query.rs`): `k == v`, `k != v`, `k > v`, `k < v`,
+`k >= v`, `k <= v`, `k BETWEEN a AND b`, `a <= k <= b` / `a < k < b` (and the
+`>` mirror), `similarity(k, [..]) > t`, combined with `AND`/`OR` (AND binds
+tighter) and parentheses; keywords are case-insensitive. Operands are typed:
+equality compares the stored `AttributeValue` exactly (`Int(4)` ≠ `Float(4.0)`);
+the ordering operators compare Int and Float numerically across the two types
+and Strings bytewise; any other pairing never matches, and every predicate
+requires its key to be present. Each predicate's index scan yields a candidate
+superset (AND intersects, OR unions); every candidate is verified against the
+inode's real values, so the index changes the cost of an answer, never the
+answer — `tests/query_kats.rs` asserts every operator on a v6 volume and a v5
+(flat) volume and sweeps the ordered index against brute force. Scores: AND
+multiplies, OR takes the max, so a lone similarity score survives AND-ed
+filters bit-exactly. **Vector similarity is still a scan** of the inodes
+carrying the key — there is no ANN index.
+
+`query` returns `Vec<QueryHit { inode_id, path, score }>` in ascending id
+order; `query_inodes` keeps the older `(Inode, f32)` shape.
+
+**Paths (M3).** Every v6 inode block carries a hand-packed META TRAILER right
+after its unchanged bincode bytes — `UNAFSMT1 | parent | ctime | mtime | atime
+| name_len | name` (KAT `kat_inode_meta_trailer_v6`; names over 255 B store
+`0xFFFF` and the path asks the parent's listing). `Inode`'s own encoding is
+untouched (the new fields are `serde(skip)`), so every kept golden holds; the
+trailer is magic-discriminated like the spill trailer, which follows it.
+`mkdir`/`create_file`/the batch path stamp the link, `rename` restamps it in
+the same transaction, and `UnaFS::path_of` derives `/a/b/c` in O(depth) inode
+reads (bounded at 4096 links — a cycle is `CorruptVolume`). fsck walks the name
+tree and reports `bad_parent_links`; repair restamps them. A pre-v6 volume
+derives paths by one name-tree walk per query.
+
+**Timestamps (M4, audit B292).** The same trailer carries `ctime` (last
+metadata change: create, attribute, rename), `mtime` (last data change: create,
+write, a directory's entry list) and `atime` (stamped at create and write only
+— under CoW a read that wrote would cost a commit, so the policy is noatime),
+all unix seconds from `clock::now()`: an embedder's `clock::set_clock_hook`
+(the kernel's wall clock), else `SystemTime` under `std`, else 0. `UnaFS::stat`
+returns them with the parent link; on a v3–v5 volume they read 0 (nowhere to
+keep them), which is what the kernel's `DirEnt.mtime` maps to `None`.
+
+v3–v5 volumes still mount read/write with their flat catalog (overwrite now
+scrubs the replaced entry; the same planner and verifier answer the full
+grammar over it). `tools/unafs migrate --from old.img --to new.img` replays a
+v2 **or** v3–v5 image into a fresh v6 one (`legacy::migrate_k8_into`;
+retained snapshots and unnamed objects do not carry over).
+
 ## Direction: meeting and surpassing BeFS
 
 UnaFS is a modernized take on the Be File System — BeFS's celebrated ideas
@@ -439,11 +506,13 @@ similarity — semantic search as a filesystem primitive.
 Known honest caveats in the current implementation, which the arcs below
 address:
 
-- The attribute catalog is a flat, hash-bucketed list, (de)serialized whole:
-  every non-equality query scans it, and **every `set_attribute` rewrites the
-  entire catalog** — O(n), a scaling cliff rather than an index. (The bulk
-  create+write path amortizes this across a batch — one catalog rewrite for the
-  whole set — but the per-op single-attribute cost is still O(n) until F4.)
+- ~~The attribute catalog is a flat list rewritten whole on every
+  `set_attribute`~~ — **retired on v6 (B302)**: the catalog is two B+trees
+  (equality + ordered) behind a 40 B catalog record; `set_attribute` is a
+  log-time insert, range operators are range scans, and `query` returns paths.
+  A v3–v5 volume keeps its flat catalog (still O(n)) until
+  `tools/unafs migrate` replays it into v6. Vector similarity has no index: it
+  scans the inodes carrying the key.
 - Directories are flat serialized vectors; data blocks are unchecksummed (the
   root record is checksummed); extents are a flat inline list (large-file
   depth limit).
@@ -454,8 +523,8 @@ Planned arcs (sequencing in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §2):
 | :--- | :--- |
 | F1 | ~~Journal rollback/replay~~ — **superseded by K8a** (commit is one atomic root flip; there is no torn state to roll back) |
 | F2 | `unlink` / `rename` / `remove_attribute` + catalog removal — **✅ landed** (each a single atomic CoW transaction; kernel verbs `urm`/`umv`/`urmattr` + the `F2-mutations` witness complete the surface) |
-| F3 | Generic on-disk B+tree (shared by indexes and directories, as BeFS did) |
-| F4 | Per-attribute B+tree indexes: log-time equality, true range queries |
+| F3 | Generic on-disk B+tree (shared by indexes and directories, as BeFS did) — **✅ wired (B302): the v6 attribute catalog lives on it** |
+| F4 | Per-attribute B+tree indexes: log-time equality, true range queries — **✅ landed (B302): `>= <= BETWEEN`, two-sided ranges, `AND`/`OR`/parentheses, typed operands, paths in every hit** |
 | F5 | **Live queries** — delta-emitting persistent queries published over bandy (the query-driven spatial UI, now including similarity) |
 | F6–F8 | B+tree directories; metadata checksums; extent trees |
 | K1–K4 | Kernel convergence: **`no_std` core (K1, ✅)** → **512↔4096 block adapter + partitions (K2, ✅)** → **read-only kernel mount (K3, ✅)** → **kernel writes (K4, ✅)** |

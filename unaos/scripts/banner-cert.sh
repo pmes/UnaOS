@@ -265,6 +265,7 @@ bc_table() {
 cat <<'TABLE'
 witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|!baremetal,!bootlog,!usbdebug@except:x86_64+wc,!tegra|measured(1)
 wc|[wc-x] desktop-app DECLINE reason=no-storage name=/|-|measured(1)
+linuxabi|:: LINUXABI: path=|-|measured(1)
 wcg-paygo|[wc-g] paygo win=|witness|measured
 wcdvalve|[wc-d] valve CLOSED util~|witness|measured
 logts|:: LOGWIT-1 probe seq=|witness|measured
@@ -297,6 +298,7 @@ gen7|:: gen7: r6 next=STOP-window-or-register-block-out-of-range|-|measured
 gmux_igd|:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD|intel-ivb|measured
 unaos_ivb|@boot iGPU trace 1 (pre-EBS) collected.|-|measured
 ahci|:: AHCI: port=|-|measured
+root-prefer|[bootdisk] root candidates:|-|measured
 bar1wedge|:: BAR1WEDGE: rung=first-stall|-|measured
 bar1exp-uc|:: x86 bar1exp: UC arm ARMED via=|-|measured
 beam|:: BEAMX86: head=|nvidia-kepler,nvidia-kepler-takeover|measured
@@ -326,6 +328,7 @@ ga10bprobe5|[ga10bfw] window_need=|ga10bprobe5a+witness|measured(1)
 ga10bprobe5a|[ga10bprobe5a] -> REFUSED reason=|tegra|measured(13)
 baremetal|:: UnaOS bare-metal — Pi 4 microSD-slot boot, serial console (no framebuffer) ::|-|measured(1)
 skip_xhci|:: xHCI bring-up SKIPPED (skip_xhci feature): video only, no USB ::|-|measured(1)
+lowbat_shutdown|:: LOWBAT-SHUTDOWN armed: pct=|-|measured(1)
 smp7|[smp7] cores online=|baremetal|measured(1)
 v3d|:: V3D: CT1 did not idle within budget|-|measured(1)
 vugpar|:: [spread2] window|baremetal|measured(1)

@@ -99,3 +99,14 @@ fn write_gmux(raw: u16) -> bool {
 fn write_gmux(_raw: u16) -> bool {
     false
 }
+
+/// SETTINGS (R75): the current level `0..=STEPS`.
+pub fn level() -> u8 { LEVEL.load(Ordering::Relaxed) }
+/// SETTINGS (R75): set the level directly (a slider), through the same pending/indicator path a key uses.
+pub fn set_level(lv: u8) {
+    let lv = if lv > STEPS { STEPS } else { lv };
+    let up = lv >= LEVEL.load(Ordering::Relaxed);
+    LEVEL.store(lv, Ordering::Relaxed);
+    PENDING.store(if up { 2 } else { 1 }, Ordering::Release);
+    status::bright_show(lv);
+}

@@ -32,6 +32,10 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   provenance is RULINGS.md's heard-by column; a seat named in Peter's words is its subject.
 - **Peter's charter beats any drifted doc.** Handler charters come from `docs/CODEX.md`'s manifest;
   never derive a handler's purpose from its current README (see `unaos-gemini-derail.md`).
+  **Charter before code** (Peter 2026-10-01, after the kernel grew a second settings store beside
+  Principia): every new kernel file in the app-domain scope declares its owning handler and seam in a
+  `CHARTER:` header, a preference lives in Principia's store and never in a new `<home>` dotfile;
+  GATE-CHARTER (`unaos/scripts/charter-check.sh`, in `./arroyo check`) enforces both; brief head step 11.
 
 ## 1. Focus, seats, sessions
 

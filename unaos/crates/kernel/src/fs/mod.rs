@@ -40,7 +40,7 @@ pub mod bootdisk;
 #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
 pub mod sdhc4c;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))] // UNAFSX86: x86 arms it with UNAOS_UNAFS=1
 pub mod unafs;
 
 /// VFS-1: the unifying virtual-filesystem spine (mount table + resolver + the
@@ -153,3 +153,9 @@ pub fn ns_bump<T, E>(r: Result<T, E>) -> Result<T, E> {
     }
     r
 }
+
+/// TRASH (R75): the desktop Trash — `.Trash/` + `.index`, moved by `rename`. See the module docs.
+pub mod trash;
+
+/// ATTRSURF (B299): the one fulfiller of the typed-attribute surface (verbs, syscalls, bus).
+pub mod attrsys;

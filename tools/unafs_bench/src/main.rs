@@ -62,12 +62,14 @@ fn main() -> Result<()> {
     let mut rng = rand::rng();
     let types = ["engram", "directive", "noise"];
 
+    let mut created: Vec<u64> = Vec::with_capacity(num_inodes);
     let start_time = Instant::now();
     for i in 0..num_inodes {
         let filename = format!("file_{}.txt", i);
         let inode_id = fs
             .create_file(root_id, filename)
             .context("Failed to create file")?;
+        created.push(inode_id);
 
         let mut vec_data = Vec::with_capacity(384);
         for _ in 0..384 {
@@ -164,7 +166,7 @@ fn main() -> Result<()> {
     );
 
     let query_start = Instant::now();
-    let results = fs.query(&query_str)?;
+    let results = fs.query_inodes(&query_str)?;
     let query_latency = query_start.elapsed();
 
     println!("-> Query executed, analyzing {} results...", results.len());
@@ -227,7 +229,7 @@ fn main() -> Result<()> {
     // unaos/libs/fs/unafs/tests/query_kats.rs). The 384-dim random inodes mismatch
     // the 2-dim target (score 0.0), so exactly the sentinel survives.
     println!("-> Executing golden-KAT correctness query...");
-    let golden = fs.query("similarity(embedding, [4.0, 3.0]) > 0.5 AND type == \"engram\"")?;
+    let golden = fs.query_inodes("similarity(embedding, [4.0, 3.0]) > 0.5 AND type == \"engram\"")?;
     assert_eq!(
         golden.len(),
         1,
@@ -248,12 +250,32 @@ fn main() -> Result<()> {
     );
 
     // Strict `>`: a threshold exactly equal to the score must exclude it.
-    let strict = fs.query("similarity(embedding, [4.0, 3.0]) > 0.96")?;
+    let strict = fs.query_inodes("similarity(embedding, [4.0, 3.0]) > 0.96")?;
     assert!(
         strict.iter().all(|(inode, _)| inode.id != sentinel_id),
         "Strict-threshold breach! Score 0.96 cleared threshold 0.96"
     );
     println!("-> Golden-KAT gate passed (score 0x{:08x}, strict-> exclusion held).", GOLDEN_345_BITS);
+
+    // Action 3b (B302 F4): ordered-index insert + range-scan cost. 2000 Int
+    // attributes go into the ordered B+tree (log-time inserts on a catalog
+    // already holding 20k entries); a 100-wide range is then a range scan, and
+    // its answer is checked exactly.
+    println!("-> F4: 2000 ordered inserts + a range query...");
+    let insert_start = Instant::now();
+    for (i, &id) in created.iter().take(2000).enumerate() {
+        fs.set_attribute(id, "rank".to_string(), AttributeValue::Int(i as i64))
+            .context("Failed to set rank")?;
+    }
+    let insert_latency = insert_start.elapsed();
+    let range_start = Instant::now();
+    let ranged = fs.query("rank BETWEEN 100 AND 199")?;
+    let range_latency = range_start.elapsed();
+    anyhow::ensure!(ranged.len() == 100, "range query: expected 100 hits, got {}", ranged.len());
+    anyhow::ensure!(
+        ranged.iter().all(|h| h.path.starts_with("/file_")),
+        "range hits carry their paths"
+    );
 
     // Action 4: Telemetry Output
     println!("\n================================================================================");
@@ -263,6 +285,8 @@ fn main() -> Result<()> {
     println!("Cold-Boot Recovery Time:    {:?}", recovery_latency);
     println!("Compound Query Speed:       {:?}", query_latency);
     println!("Valid Inodes Matched:       {}", valid_count);
+    println!("Ordered Inserts (2000):     {:?}", insert_latency);
+    println!("Range Query (100 of 2000):  {:?}", range_latency);
     println!("================================================================================");
 
     // Clean up

@@ -129,7 +129,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -141,19 +141,70 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     let ran = run(name);
     let (p, f) = (PASS.load(Ordering::Relaxed).wrapping_sub(p0), FAIL.load(Ordering::Relaxed).wrapping_sub(f0));
     if ran == 0 && name.is_some() {
-        console.println("tests: no such fixture (try `tests list`)");
+        console.println_styled(crate::video::theme::TERM_RED, "tests: no such fixture (try `tests list`)");
     } else {
         let mut names = alloc::string::String::new();
         for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
-        console.println(&format!("tests: ran={} pass={} fail={} failed=[{}]", ran, p, f, names));
+        console.println_styled(if f == 0 { crate::video::theme::TERM_GREEN } else { crate::video::theme::TERM_RED }, &format!("tests: ran={} pass={} fail={} failed=[{}]", ran, p, f, names));
     }
 }
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
+    {
+        static LDONE: AtomicBool = AtomicBool::new(false);
+        if !LDONE.swap(true, Ordering::AcqRel) { register("linuxabi", crate::arch::linuxabi::selftest); register("linuxabi2", crate::arch::linuxabi::selftest2); }
+    }
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); register("shortcuts", crate::video::shortcuts::selftest); register("scrollback", crate::console::scrollback_selftest); register("termcolor", crate::termcolor::selftest); }
     }
+    // SETTINGS (R75): the settings fixture (open, idle=5, save, re-read, compare) beside it.
+    #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        static DONE2: AtomicBool = AtomicBool::new(false);
+        if !DONE2.swap(true, Ordering::AcqRel) { register("settings", crate::video::settings::selftest_all); register("prefs", crate::prefs::selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ }
+    }
+    // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
+    #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        static DONE3: AtomicBool = AtomicBool::new(false);
+        if !DONE3.swap(true, Ordering::AcqRel) { register("power", crate::video::powerui::selftest); }
+    }
+    // IMGVIEW (R75): the image viewer's open / zoom / browse / refusal fixture.
+    #[cfg(all(feature = "witness", feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        static DONE3: AtomicBool = AtomicBool::new(false);
+        if !DONE3.swap(true, Ordering::AcqRel) { register("imgview", crate::video::facet::imgview_selftest); }
+    }
+}
+
+/// SELFINSTALL: register `selfinstall` (the `install ssd --dry-run` plan) exactly once. x86 + the
+/// installer + AHCI only; on a lane with no SATA disk the fixture prints SKIP, never a pin.
+fn ensure_selfinstall() {
+    #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); }
+    }
+}
+
+/// UNAFSX86 M4: register `unafs` (the root-volume seam fixture) exactly once, on any build carrying the
+/// native module under the `unafs` feature; on a FAT root the fixture prints SKIP, never a pin.
+fn ensure_unafsx86() {
+    #[cfg(feature = "unafs")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); }
+    }
+}
+
+/// ATTRSURF (B299): register `tests attr` exactly once, every build — the fixture decides PASS or an
+/// honest SKIP (`reason=no-unafs-volume`) from the mounted tree, so it needs no knob.
+fn ensure_attr() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) { register("attr", crate::fs::attrsys::selftest); }
 }

@@ -2517,6 +2517,43 @@ extern "C" fn user_task_trampoline() -> ! {
     // U3.5: a PREEMPTIBLE task drops to ring 3 with RFLAGS.IF SET so the timer can evict it; the
     // default cooperative task keeps IF clear (INITIAL_RFLAGS), running to completion FIFO.
     let user_rflags = if preemptible { INITIAL_RFLAGS | RFLAGS_IF } else { INITIAL_RFLAGS };
+    // LINUXABI2: a `fork` child enters ring 3 with the parent's callee-saved registers and rax = 0 (the register file the SYSCALL stub pushed).
+    #[cfg(feature = "linuxabi")]
+    if let Some(regs) = crate::arch::linuxabi::take_fork_regs(unsafe { (*raw).user_cr3 }) {
+        unsafe {
+            core::arch::asm!(
+                "swapgs",
+                "push {ss}",
+                "push {ursp}",
+                "push {rflags}",
+                "push {cs}",
+                "push {entry}",
+                "mov rbx, [rax]",
+                "mov rbp, [rax+8]",
+                "mov r12, [rax+16]",
+                "mov r13, [rax+24]",
+                "mov r14, [rax+32]",
+                "mov r15, [rax+40]",
+                "xor eax, eax",
+                "xor ecx, ecx",
+                "xor edx, edx",
+                "xor esi, esi",
+                "xor edi, edi",
+                "xor r8d, r8d",
+                "xor r9d, r9d",
+                "xor r10d, r10d",
+                "xor r11d, r11d",
+                "iretq",
+                ss = in(reg) crate::arch::gdt::USER_DATA_SEL as u64,
+                ursp = in(reg) user_rsp,
+                rflags = in(reg) INITIAL_RFLAGS | RFLAGS_IF,
+                cs = in(reg) crate::arch::gdt::USER_CODE_SEL as u64,
+                entry = in(reg) entry,
+                in("rax") regs.as_ptr(),
+                options(noreturn),
+            );
+        }
+    }
 
     // Drop to ring 3. `swapgs` parks this CPU's PerCpuData pointer in the GS shadow for the syscall
     // path; the `iretq` frame is [SS, RSP, RFLAGS, CS, RIP] (RIP pushed LAST so `iretq` pops it
@@ -6327,7 +6364,7 @@ fn run() -> ! {
                 // stale-high would be the bug.
                 let target_cr3 = {
                     let uc = unsafe { (*raw).user_cr3 };
-                    if uc != 0 { uc } else { crate::arch::memory::kernel_cr3() }
+                    { #[cfg(feature = "linuxabi")] if uc != 0 { crate::arch::linuxabi::on_dispatch(uc); } /* LINUXABI2: re-assert this process's FS_BASE per switch-in */ if uc != 0 { uc } else { crate::arch::memory::kernel_cr3() } }
                 };
                 //
                 // VUGSPREAD adds one counter and no branch. `CR3_RELOADS` already counted the RARE
@@ -7689,4 +7726,10 @@ pub fn run_queue_stealable(cpu: usize) -> usize {
     if cpu >= MAX_CPUS { return 0; }
     let (ready, pinned) = RUN_QUEUES[cpu].lock().census();
     ready.saturating_sub(pinned)
+}
+
+/// ACTIVITY (R75) — the cumulative count of tasks the work-stealer has moved between cores since boot
+/// (the SMPLOAD witness's `migr=` is the per-window delta of this). One relaxed load.
+pub fn migrations_total() -> u64 {
+    STEAL_MOVES.load(Ordering::Relaxed)
 }

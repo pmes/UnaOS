@@ -135,6 +135,9 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # configuration the WC-D `[wc-d] verify` verdict was cleared in. NOTE these change compiled-in behaviour:
 # a build made with them is NOT the flashable default image.
 #
+# RTCCLOCK (R75): UNAOS_TZ_MIN=<minutes east of UTC> is read with `option_env!` by clock.rs (TZ_MIN, default 0); the
+# CMOS RTC is read as UTC and the menubar clock shows it plus this offset. Not a cargo feature.
+#
 # PI-V3D-81: UNAOS_V3D81_SETTLE_MS is the same kind of knob — read with `option_env!` by
 # arch/aarch64/v3d.rs, not a cargo feature. It sets how long a reply-less NOTIFY post settles before
 # the effect is read (default 250 ms, capped at 10 s, ignored unless a UNAOS_V3D81_* leg is armed).
@@ -262,6 +265,7 @@ _feats=""
 # reaches the boot media.
 [ -n "${UNAOS_WCDVALVE:-}" ] && _feats="${_feats}wcdvalve,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
+[ -n "${UNAOS_LOWBAT_SHUTDOWN:-}" ] && _feats="${_feats}lowbat_shutdown," # POWERMENU M3: value (percent) is read by option_env! in video/powerui.rs
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
 # CLOCK-2: UNAOS_LOGTS=1 arms the `logts` feature — a compact timestamp prefix on each serial LINE
 # (monotonic ms → UTC after a civil anchor). CLOCK-2b: the prefix covers the UART and both capture
@@ -1211,6 +1215,10 @@ fi
 [ -n "${UNAOS_VSYNCPACE:-}" ] && _feats="${_feats}vsyncpace,"
 # INSTGUI: UNAOS_INSTGUI=1 opens the graphical installer dialog on the wc desktop (implies wc).
 [ -n "${UNAOS_INSTGUI:-}" ] && _feats="${_feats}instgui,"
+# LINUXABI: UNAOS_LINUXABI=1 arms the Linux x86_64 syscall-compat layer (`linux <path>`, `tests linuxabi`). x86-only. Kept in sync with builder/src/main.rs and scripts/banner-cert.sh.
+[ -n "${UNAOS_LINUXABI:-}" ] && _feats="${_feats}linuxabi,"
+# BANDY3: UNAOS_BUSREG=1 arms fulfiller registration on the bus wire (crate::bus_route; `tests bandy3`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_BUSREG:-}" ] && _feats="${_feats}busreg,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
@@ -2622,6 +2630,19 @@ fi
 # (stripped by arm_features below, exactly as `ahci` itself is).
 # Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
 [ -n "${UNAOS_AHCI_WRITE:-}" ] && _feats="${_feats}ahci-write,"
+# SELFINSTALL M3 (SH-3): UNAOS_ROOT_PREFER=ahci|sdhc pins the bootdisk root walk to that source family when
+# it carries this kernel (the card AND the internal SSD both do after `install ssd --write`); the boot
+# prints `[bootdisk] root candidates: ... chose= prefer=` either way. Default OFF => first-found.
+# Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
+[ "${UNAOS_ROOT_PREFER:-}" = "ahci" ] && _feats="${_feats}root-prefer-ahci,"
+[ "${UNAOS_ROOT_PREFER:-}" = "sdhc" ] && _feats="${_feats}root-prefer-sdhc,"
+# UNAFSX86 (rmbp-ledger B298, SH-2 rung 1): UNAOS_UNAFS=1 compiles the native UnaFS volume into the x86
+# kernel (fs/unafs.rs, the VFS NativeBackend, bootdisk's native `/`), and `esp-x86` additionally lays
+# target/unaos-x86-card.img — GPT p1 = the EFI System FAT (ESP + data trees), p2 = a `tools/unafs init`
+# volume. The boot prints `:: UNAFSX86: root=unafs|fat disk=... -> PASS|SKIP ::`. aarch64 carries the
+# module unconditionally, so this knob changes nothing there (its K8_FEATS arm is harmless by design).
+# Default OFF => the x86 image is byte-identical. Kept in sync with builder/src/main.rs and Cargo.toml.
+[ -n "${UNAOS_UNAFS:-}" ] && _feats="${_feats}unafs,"
 # HDA (rmbp-ledger B127, arc 1): UNAOS_HDA=1 arms drivers/hda.rs — the High Definition Audio
 # controller, the kernel's first audio line. NOTHING IN THIS KERNEL HAS EVER TOUCHED AUDIO, and the
 # reason is structural rather than an omission: `PciScanner::enumerate_buses` matches exactly one
@@ -2679,6 +2700,7 @@ fi
 #   UNAOS_HDA=1 UNAOS_HDATONE=1 UNAOS_HDA_AMP=8192 ./arroyo esp-x86
 # HDATONE3 (rmbp-ledger B218): three more build-time knobs, same `option_env!` idiom, none a cargo feature:
 #   UNAOS_HDA_HZ=<220|440>   tone pitch (anything else -> 440); UNAOS_HDA_SECS=<1..3>  buffer length in seconds (default 1);
+#   UNAOS_HDA_GPIO=<mask>    HDATONE6: Cirrus codec GPIO bits driven HIGH (decimal or 0x hex; default 0x08 = speaker amp, HP bit 0x02 held LOW); read by rustc via option_env!, no builder read.
 #   UNAOS_HDA_MEMBERS=1      force ONE DAC member (skips the association pair-walk; `members=1`).
 # `:: HDA-PCM: … hz= secs= fade_ms=` and `[hda] amp … rate= fmt_rd= pcmcaps=` on the wire name what an image carries.
 #   UNAOS_HDA=1 UNAOS_HDATONE=1 UNAOS_HDA_HZ=220 UNAOS_HDA_SECS=2 UNAOS_HDA_MEMBERS=1 ./arroyo esp-x86
@@ -3635,6 +3657,15 @@ build_user_vug_x86() {
     # 2143, so `kvug` compiles out the shard raytracer it replaces. Measured 0x1fc5 with `kvug`, against
     # an unchanged 0x1f57 without it.
     build_one_vug_x86 VUGK-X86.ELF "kvug"
+    build_user_linux_hello_x86   # LINUXABI: target/HELLO.LNX — staged as APPS/HELLO.LNX by the builder
+}
+
+# LINUXABI: generate the ~170-byte static Linux x86_64 fixture from bytes (crates/user-linux-hello is a HOST
+# program that writes the ELF; no binary blob is checked in). Always built: it is a 170-byte file, inert
+# unless the kernel carries `linuxabi` and someone runs `linux`/`tests linuxabi`.
+build_user_linux_hello_x86() {
+    mkdir -p "${WORKSPACE_DIR}/target"
+    ( cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly run --release --quiet -- "${WORKSPACE_DIR}/target/HELLO.LNX" )
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).
@@ -3665,6 +3696,31 @@ build_user_pulse_x86() {
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/PULSE-X86.ELF" | tr -d ' ')"
     [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: PULSE-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 cpu-pulse program: PULSE-X86.ELF (${psz} B)${COLOR_RESET}"
+}
+
+# BANDY3 M3: build the x86_64 static ELF64 ring-3 FULFILLER (crates/user-prefs → target/PREFS-X86.ELF), staged
+# as APPS/PREFS.BIN by the builder. The exact shape of build_user_pulse_x86 above (same linker-script SHAPE, same
+# four assertions, same explicit --target). PREFS.BIN registers Principia's PrefGet/PrefList bus verbs and
+# answers the requests the kernel relays to it (UNAOS_BUSREG=1; knob off it prints its refusal and exits).
+build_user_pulse_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 Principia prefs fulfiller static-ELF program (crates/user-prefs → target/PREFS-X86.ELF)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-prefs"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-prefs/target/x86_64-unknown-none/release/user-prefs" \
+      "${WORKSPACE_DIR}/target/PREFS-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/PREFS-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: PREFS-X86.ELF missing/empty — x86 PREFS build failed${COLOR_RESET}"; exit 1; }
+    local fmag; fmag="$(head -c 4 "${WORKSPACE_DIR}/target/PREFS-X86.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$fmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: PREFS-X86.ELF does not start with the ELF magic; first 4 bytes = ${fmag}${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/PREFS-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: PREFS-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/PREFS-X86.ELF" | tr -d ' ')"
+    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: PREFS-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 Principia prefs fulfiller program: PREFS-X86.ELF (${psz} B)${COLOR_RESET}"
 }
 
 build_kernel_aarch64() {
@@ -3704,6 +3760,7 @@ launch_x86_64() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
+    build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -4669,6 +4726,7 @@ test_x86_64() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
+    build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_kernel_x86_64
 
     # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
@@ -5125,6 +5183,7 @@ USER_CHECK_MATRIX=(
   "user-stat     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-vug      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-pulse    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-prefs    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
   "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
@@ -6381,7 +6440,7 @@ KERNEL_CFG_MATRIX=(
   # feature table, the board union, the unnamed-knob set, `x86_cfg_universe` and the derived mix-leg
   # count are all unchanged. Board legs +1 (40 -> 41, counted from the runner's own banner, not from
   # the prose figures above — those are older and were not re-derived here); gate +1.
-  "arm-tegra-supstate-el0-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,supstate"
+  "arm-tegra-supstate-el0-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,supstate,busreg"
 
   # GA10B-PROBE1 armed (appended 2026-08-25) — `ga10bprobe1` gates `arch/aarch64/ga10b_probe.rs` (the
   # whole first-probe-rung module) and its one appended call site in `tegra_early_stop`. Without a leg
@@ -7023,7 +7082,7 @@ KERNEL_CFG_MATRIX=(
   # a banner that says otherwise. That is the one failure this knob must not have. Board legs +3.
   "x86-sdw-ro ../../x86_64-unaos.json witness,logts,wedge2,sched_demo,skip_xhci,sdhcblk,sdw,sdw-ro"
   "arm-tegra-sdw-ro ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdwrite,sdw-ro"
-  "arm-pi-sdw-ro ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login,loginst,sdw-ro"
+  "arm-pi-sdw-ro ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,unafs,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login,loginst,sdw-ro"
   # ── WITNESSGAP (appended 2026-09-07, orin 20) — the WITNESS-FREE polarity, which is the polarity
   # every piece of BOOT MEDIA actually ships ──────────────────────────────────────────────────────
   #
@@ -8088,7 +8147,7 @@ BRACEPY
     # no_std)]` precisely so a plain `cargo test` can run them on the host: net's 29 TCP assertions
     # guard a crate the kernel links, and rast's golden images are the "same scene ⇒ same pixels on
     # both arches" oracle. Neither was run by anything.
-    if (cd "$WORKSPACE_DIR" && cargo test -p net -p rast); then
+    if (cd "$WORKSPACE_DIR" && cargo test -p net -p rast -p una-abi); then
         echo -e "${COLOR_GREEN}  ✅ host suites, kernel workspace (net, rast)${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}  ❌ a kernel-workspace host test suite FAILED${COLOR_RESET}"
@@ -8242,6 +8301,13 @@ BRACEPY
         echo -e "${COLOR_RED}  ❌ builder (host) FAILED to compile${COLOR_RESET}"
         _rrc=1
     fi
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: user-linux-hello (host fixture generator, LINUXABI)...${COLOR_RESET}"
+    if (cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly check --release); then
+        echo -e "${COLOR_GREEN}  ✅ user-linux-hello (host)${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}  ❌ user-linux-hello (host) FAILED to compile${COLOR_RESET}"
+        _rrc=1
+    fi
     if "$WORKSPACE_DIR/scripts/check-roots.sh"; then
         echo -e "${COLOR_GREEN}  ✅ check roots (every binary target is named by a leg of this gate)${COLOR_RESET}"
     else
@@ -8282,6 +8348,18 @@ BRACEPY
     else
         [ "$_vrrc" -eq 2 ] && echo -e "${COLOR_RED}❌ verb-roots gate gave NO VERDICT — its controls did not fire, which is not a clean tree${COLOR_RESET}"
         [ "$_vrrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a shell verb is in one table and not the other (see GATE-VERBS above)${COLOR_RESET}"; return 1; }
+    fi
+
+    # GATE-CHARTER (AUDIT 2026-10-01, B297): every kernel file in the app-domain scope (video/, fs/,
+    #   install/, selfhost/, the shell files, hda_play) names the CODEX handler that owns its domain and
+    #   the seam it sits on (`CHARTER: <Handler> — <seam>` header, or a grandfather row in
+    #   `scripts/charter.registry`), and every `<home>/.name` literal the kernel writes is an allowlisted
+    #   dotfile. Four control probes first; a control that does not fire is exit 2 and NO verdict.
+    local _chrc=0
+    "$WORKSPACE_DIR/scripts/charter-check.sh" "$WORKSPACE_DIR" || _chrc=$?
+    if [ "$_chrc" -ne 0 ]; then
+        [ "$_chrc" -eq 2 ] && echo -e "${COLOR_RED}❌ charter gate gave NO VERDICT — its controls did not fire, which is not a clean tree${COLOR_RESET}"
+        [ "$_chrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a kernel file declares no owning handler, or writes a dotfile off the allowlist (see GATE-CHARTER above)${COLOR_RESET}"; return 1; }
     fi
 
     # GATE-TESTROOTS (TESTROOTS, rmbp, 2026-09-16): GATE-ROOTS' shape applied to the THIRD kind of
@@ -8501,12 +8579,43 @@ pack_source_along() {
 # had put on the card. The old one-line instruction ("copy the contents to a FAT32 USB root") was
 # correct for a ONE-STICK boot and silently wrong for a two-device one; naming the two volumes is
 # the fix. On a single stick, write BOTH trees to that one root and everything behaves as before.
+# UNAFSX86 M3 (rmbp-ledger B298, SH-2 rung 1): with UNAOS_UNAFS=1, `esp-x86` also lays ONE card image —
+# target/unaos-x86-card.img, GPT: p1 = EFI System FAT32 (the ESP tree + the data tree, so the firmware
+# still finds the ESP as partition 1 and the kernel mounts it at /boot and /apps), p2 = a `tools/unafs
+# init` volume the kernel's `locate_unafs` finds by superblock magic and `bind_root` makes `/`.
+# UNAOS_X86_UNAFS_MB sizes p2 (default 512, capped at 2048 per LAWS' 2 GiB image cap). Write the
+# whole image to the card (`dd`), not the trees. Boot witness:
+#   :: UNAFSX86: root=unafs disk=<source> blocks=<n> gen=<g> home=/home -> PASS ::
+esp_x86_unafs_card() {
+    local unafs_mb="${UNAOS_X86_UNAFS_MB:-512}"
+    if [ "$unafs_mb" -gt 2048 ] 2>/dev/null; then
+        echo -e "${COLOR_YELLOW}⚠ UNAOS_X86_UNAFS_MB=${unafs_mb} capped at 2048 (the 2 GiB image cap)${COLOR_RESET}"
+        unafs_mb=2048
+    fi
+    local vol="${WORKSPACE_DIR}/target/unafs-x86.img"
+    local card="${WORKSPACE_DIR}/target/unaos-x86-card.img"
+    local UNAFS_CLI_MANIFEST="${WORKSPACE_DIR}/../tools/unafs/Cargo.toml"
+    echo -e "${COLOR_YELLOW}⚡ UNAFSX86: formatting the x86 UnaFS system volume (${unafs_mb} MiB)...${COLOR_RESET}"
+    rm -f "$vol" "$card"
+    cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$vol" -s "$unafs_mb" || {
+        echo -e "${COLOR_RED}❌ UNAFSX86: tools/unafs init failed — no card image${COLOR_RESET}"; return 1; }
+    python3 "${WORKSPACE_DIR}/scripts/make-x86-card.py" \
+        --esp "${WORKSPACE_DIR}/target/x86_64_esp" --data "${WORKSPACE_DIR}/target/x86_64_data" \
+        --unafs "$vol" -o "$card" || {
+        echo -e "${COLOR_RED}❌ UNAFSX86: make-x86-card.py failed — no card image${COLOR_RESET}"; return 1; }
+    rm -f "$vol"
+    echo -e "${COLOR_GREEN}✅ x86 CARD (UnaFS root): ${card}${COLOR_RESET}"
+    echo -e "   sha256: $(sha256_of "$card")"
+    echo -e "   p1 = ESP (FAT32, boot + data trees) · p2 = UnaFS system volume (${unafs_mb} MiB) — dd the whole image"
+}
+
 esp_x86() {
     echo -e "${COLOR_CYAN}⚡ Building x86_64 kernel + bootloader and packaging the ESP (no QEMU)...${COLOR_RESET}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP as HELLO.BIN
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
+    build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8543,6 +8652,7 @@ esp_x86() {
     echo -e "               data tree -> the USB stick, or \`bg /apps/VUG.ELF\` reports -ENOENT."
     echo -e "   Probe after boot: \`cat hello.txt\` must say 'DATA volume' — if it says anything else,"
     echo -e "               the kernel is reading a stick you did not stage."
+    if [ -n "${UNAOS_UNAFS:-}" ]; then esp_x86_unafs_card || exit $?; fi   # UNAFSX86 M3
 }
 
 # VMIMAGE-1: emit ONE self-contained, distributable bootable disk image — a GPT disk with a FAT32
@@ -8563,6 +8673,7 @@ vm_image() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
+    build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8605,6 +8716,7 @@ fat_img() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
+    build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86
@@ -8675,6 +8787,16 @@ test_selfhost() {
         echo -e "${COLOR_GREEN}✅ SELFHOST: the shard verified and enumerated its own source tree${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}❌ SELFHOST: no 'src verified ... -> PASS ::' line in ${log}${COLOR_RESET}"
+        exit 1
+    fi
+    # SRCEXTRACT: the `tests srcextract` fixture (the extraction DRY RUN) registers after the PASS above and
+    # runs at boot on this lane (`tests-at-boot`). Its own verdict is pinned here, not in a spec — this lane
+    # has none (see the UNAOS_SELFHOST note above) — so the rung-3 walk cannot rot behind rung 2's PASS.
+    awk '/SRCEXTRACT:/' "$log" || true
+    if awk '/:: SRCEXTRACT: files=[0-9]+ dirs=[0-9]+ bytes=[0-9]+ renamed=[0-9]+ ms=[0-9]+ verify=dry -> PASS ::/{f=1} END{exit !f}' "$log"; then
+        echo -e "${COLOR_GREEN}✅ SRCEXTRACT: the extraction walk (dry run) passed over the shard's own source${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}❌ SRCEXTRACT: no ':: SRCEXTRACT: ... verify=dry -> PASS ::' line in ${log}${COLOR_RESET}"
         exit 1
     fi
     scan_serial_faults "$log"
@@ -9927,6 +10049,12 @@ kernel8() {
     # DEFAULT-QUIET: `kernel8-test` (the battery) arms UNAOS_WITNESS so the Pi bare-metal image carries the
     # M6b..U7 fixture cascade (CAPSTONE + all -> PASS lines). The plain `kernel8` media build leaves it unset,
     # so the flashed image is quiet — reaches the shell with CAPSTONE + device honesty lines only.
+    # UNAFSX86 (B298): the Pi image carries fs::unafs unconditionally (every gate is `any(target_arch =
+    # "aarch64", feature = "unafs")`), so this arm arms nothing new there — it exists so the knob reaches
+    # every image by one name (GATE-K8REACH) and a Pi build with the knob set is the same kernel.
+    if [ -n "${UNAOS_UNAFS:-}" ]; then
+        K8_FEATS="${K8_FEATS},unafs"
+    fi
     if [ -n "${UNAOS_WITNESS:-}" ]; then
         K8_FEATS="${K8_FEATS},witness"
         echo -e "${COLOR_YELLOW}  • UNAOS_WITNESS: kernel8 carries the M6b..U7 fixture battery (CAPSTONE + PASS lines)${COLOR_RESET}"
@@ -9937,6 +10065,12 @@ kernel8() {
     if [ -n "${UNAOS_TESTS_AT_BOOT:-}" ]; then
         K8_FEATS="${K8_FEATS},tests-at-boot"
         echo -e "${COLOR_YELLOW}  • UNAOS_TESTS_AT_BOOT: kernel8 runs the desktop fixture registry at boot (R77 M3)${COLOR_RESET}"
+    fi
+    # POWERMENU M3 (merge9 fold, GATE-K8REACH): UNAOS_LOWBAT_SHUTDOWN=<pct> adds `lowbat_shutdown` (the percent itself
+    # is read by option_env! in video/powerui.rs, so the knob must be on the kernel8 build command too).
+    if [ -n "${UNAOS_LOWBAT_SHUTDOWN:-}" ]; then
+        K8_FEATS="${K8_FEATS},lowbat_shutdown"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LOWBAT_SHUTDOWN=${UNAOS_LOWBAT_SHUTDOWN}: kernel8 shuts down cleanly at that battery percent (POWERMENU M3)${COLOR_RESET}"
     fi
     # CLOCK-2: UNAOS_LOGTS=1 adds the `logts` feature — a compact timestamp prefix on each serial LINE
     # (monotonic ms → UTC after a civil anchor). K8_FEATS is CURATED (does not draw from the general
@@ -10772,6 +10906,10 @@ kernel8() {
     if [ -n "${UNAOS_LOGINST:-}" ]; then
         K8_FEATS="${K8_FEATS},loginst"
         echo -e "${COLOR_YELLOW}  • UNAOS_LOGINST: the LOGIN fixtures (BOOT-TIME WRITE: user una with a known password in USERS.DAT; home; screen)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_BUSREG:-}" ]; then
+        K8_FEATS="${K8_FEATS},busreg"
+        echo -e "${COLOR_YELLOW}  • UNAOS_BUSREG: BANDY3 fulfiller registration on the bus wire (register verb 127, registrable tags 128..=255, kernel relay; tests bandy3)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"

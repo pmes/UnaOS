@@ -1,0 +1,95 @@
+# charter.registry — GATE-CHARTER's grandfather table and dotfile allowlist (AUDIT 2026-10-01,
+# docs/dev/evidence/rmbp-0929/AUDIT-HANDLERS-UNAFS.md). A kernel file in the APP-DOMAIN scope
+# (video/, fs/, install/, selfhost/, help.rs, termcolor.rs, shellux.rs, clipboard.rs, shell.rs,
+# drivers/hda_play.rs) must carry a `CHARTER:` header line or a row here. Rows here are the files
+# that existed BEFORE the gate; a NEW file never gets a row — it declares in its own header.
+#
+# file | <CODEX handler or Kernel> | <seam> | <ref>
+#   seam: wm (window manager / compositor / glass — the kernel's own), driver, fs-core (the VFS and
+#   the volume code), shared-core (a no_std lib both rings link), fulfiller (the kernel fulfils the
+#   owner's bus verbs), kernel-by-ruling (R-id), owed (the audit row that says it must move)
+video/activity.rs | pulse | owed | B289
+video/appmenu.rs | Kernel | wm | menus (crystal.rs: the bandy menu protocol is a later arc)
+video/beam.rs | Kernel | wm | compositor
+video/brightkeys.rs | Principia | owed | B287 (brightness is a preference)
+video/ceramic.rs | Kernel | wm | theme/paint
+video/clipboard.rs | Kernel | wm | one text buffer; no handler owns it
+video/crystal.rs | Kernel | wm | menus
+video/cursor.rs | Kernel | wm | pointer
+video/desktop_firmware.rs | Kernel | wm | aarch64 desktop ignition
+video/desktop_uefi.rs | Kernel | wm | x86 desktop ignition
+video/dimidle.rs | Principia | owed | B287 (idle blank is a preference)
+video/dock.rs | Kernel | wm | the dock strip; its pins file is B287
+video/facet.rs | Facet | owed | B289 (documented in its header: the vessel is std/WGPU)
+video/fbcon.rs | Kernel | wm | framebuffer console
+video/fileview.rs | Tabula | owed | B289
+video/font.rs | Kernel | wm | glyphs
+video/framebuffer.rs | Kernel | wm | surface
+video/instgui.rs | Amber Bytes | owed | B296 (the installer ensemble)
+video/keymap.rs | Kernel | driver | HID decode
+video/knurl.rs | Kernel | wm | controls
+video/login.rs | Holocron | kernel-by-ruling | R51/R62/R64 — the login screen is the kernel's until Holocron exists
+video/menubar.rs | Kernel | wm | menubar
+video/mod.rs | Kernel | wm | module root
+video/paper.rs | Kernel | wm | wallpaper paint; the wallpaper choice is B287
+video/png.rs | Kernel | shared-core | PNG/deflate codec (lux is the host twin; one codec owed)
+video/powerui.rs | Kernel | wm | power menu; battery thresholds are a Principia preference (B287)
+video/prtscr.rs | Kernel | wm | screenshot capture
+video/pulsewin.rs | pulse | owed | B289
+video/quarry.rs | Matrix | kernel-by-ruling | R50 "quarry is our finder" (B288)
+video/quarry/live.rs | Matrix | kernel-by-ruling | R50 (B288); opener routing is B293
+video/quarry/ops.rs | Matrix | kernel-by-ruling | R50 (B288)
+video/screen.rs | Kernel | wm | glass
+video/settings.rs | Principia | owed | B287
+video/shortcuts.rs | Kernel | wm | chord table and overlay
+video/shotsel.rs | Kernel | wm | screenshot region
+video/status.rs | Kernel | wm | status line
+video/strip.rs | Kernel | wm | dock strip
+video/termsel.rs | Midden | shared-core | selection over the shell line (midden_core is the verb side)
+video/textedit.rs | Tabula | owed | B289
+video/theme.rs | Kernel | wm | theme tables
+video/vperf.rs | Kernel | wm | compositor perf
+video/wallpaper.rs | Principia | owed | B287
+video/wcf.rs | Kernel | wm | compositor
+video/wcg.rs | Kernel | wm | compositor
+video/wcpar.rs | Kernel | wm | compositor
+video/winlist.rs | Kernel | wm | window menu
+video/winmenu.rs | Kernel | wm | window menu
+video/winsnap.rs | Kernel | wm | snapping
+video/witness.rs | Kernel | wm | witness lines
+video/wm.rs | Kernel | wm | the window manager
+fs/bootdisk.rs | Kernel | fs-core | root binding
+fs/fat.rs | Kernel | fs-core | FAT volume
+fs/fatperf.rs | Kernel | fs-core | FAT bench
+fs/holocron.rs | Holocron | owed | B296 (the kernel-side record store; the handler is design-only)
+fs/mod.rs | Kernel | fs-core | module root
+fs/sdhc4c.rs | Kernel | driver | card seam
+fs/trash.rs | Matrix | owed | B288
+fs/unafs.rs | Kernel | fs-core | the UnaFS mount (shared-core: unaos/libs/fs/unafs)
+fs/users.rs | Holocron | owed | B296
+fs/vfs.rs | Kernel | fs-core | the mount table
+install/clone.rs | Amber Bytes | owed | B296
+install/fat32.rs | Amber Bytes | owed | B296
+install/gpt.rs | Amber Bytes | owed | B296
+install/mod.rs | Amber Bytes | owed | B296
+install/partition.rs | Amber Bytes | owed | B296
+install/pi.rs | Amber Bytes | owed | B296
+install/selfguard.rs | Amber Bytes | owed | B296
+install/selfinstall.rs | Amber Bytes | owed | B296
+selfhost/extract.rs | Geode | owed | B296
+selfhost/inflate.rs | Geode | owed | B296 (one deflate with video/png.rs owed)
+selfhost/mod.rs | Geode | owed | B296
+selfhost/tar.rs | Geode | owed | B296
+help.rs | Midden | shared-core | midden_core verb tables
+termcolor.rs | Midden | shared-core | SGR on the console
+shellux.rs | Midden | shared-core | line editing
+shell.rs | Midden | shared-core | the verb dispatch (GATE-VERBS keeps it one set with HOST_VERBS)
+drivers/hda_play.rs | Stria | owed | B289
+# dotfile | <name as the literal spells it> | <ref> — every `<home>/.name` literal the kernel writes
+dotfile | .settings | B287 (moves to Principia's store)
+dotfile | .dock | B287
+dotfile | .Trash | B288
+dotfile | .Trash/.index | B288
+dotfile | .index | B288
+dotfile | .config/unaos/preferences.toml | B300 (Principia's path — the ONE preference store, PREFS)
+dotfile | .new | swap-temp suffix of the atomic write pattern (USERS.NEW shape; prefs.rs), not a dotfile

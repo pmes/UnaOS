@@ -150,8 +150,12 @@ pub fn request_open(path: &str) {
 pub fn service() {
     let want = PENDING.lock().take();
     if let Some(p) = want {
-        if let Err(e) = open(&p) {
-            serial_println!("[fileview] refuse path={} reason={}", p, e);
+        match open(&p) {
+            Ok(_) => serial_println!("[quarry] open TEXT consumed=viewer path={}", p),
+            Err(e) => {
+                serial_println!("[quarry] open TEXT consumed=refused path={} reason={}", p, e);
+                serial_println!("[fileview] refuse path={} reason={}", p, e);
+            }
         }
     }
 }
@@ -423,4 +427,9 @@ pub fn selftest() {
         }
         Err(e) => serial_println!(":: FILEVIEW: refused reason={} -> FAIL ::", e),
     }
+}
+
+/// HELPVERB (R75) — open in-memory text (a `man` page) in the viewer under `title`. Same body as [`open`].
+pub fn open_text(title: &str, text: &str) -> Result<(usize, usize, usize, usize), String> {
+    open_bytes(title, text.as_bytes(), false)
 }

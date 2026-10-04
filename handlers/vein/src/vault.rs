@@ -155,7 +155,7 @@ impl DiskManager {
 
         let mut inodes = self
             .fs
-            .query(&query_str)
+            .query_inodes(&query_str)
             .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
 
         // === THE NEUROSURGERY: ATTENTION SPAN ===
@@ -190,7 +190,7 @@ impl DiskManager {
 
         let mut inodes = self
             .fs
-            .query(query_str)
+            .query_inodes(query_str)
             .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
 
         // Sort by ID descending (newest first)
@@ -216,7 +216,7 @@ impl DiskManager {
 
         let mut inodes = self
             .fs
-            .query(query_str)
+            .query_inodes(query_str)
             .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
 
         // 1. Sort DESCENDING (newest first) to establish the pagination baseline

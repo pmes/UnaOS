@@ -179,6 +179,14 @@ pub fn set(t: WallTime) -> Result<(), ()> {
     // anchors advance in lock-step. This does NOT touch the FAT anchor above, so `date`/`fat_stamp`
     // witnesses are byte-identical to JD17.
     set_anchor(base_secs.saturating_add(UNIX_1980), ticks, ClockSource::Manual);
+    // RTCCLOCK (R75): write the CMOS back (shown time minus the display offset) so the clock survives a reboot.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let utc = (base_secs.saturating_add(UNIX_1980) as i64 - TZ_MIN * 60).max(0) as u64;
+        let (y, mo, d, h, mi, s) = civil_from_unix(utc);
+        let ok = crate::arch::rtc::write(y as u32, mo, d, h, mi, s);
+        serial_println!("[rtc] written y={} mo={} d={} h={} mi={} s={} ok={}", y, mo, d, h, mi, s, ok as u8);
+    }
     Ok(())
 }
 
@@ -230,6 +238,8 @@ pub enum ClockSource {
     Unset,
     Manual,
     Sntp { stratum: u8 },
+    /// RTCCLOCK (R75): the battery-backed CMOS RTC read at boot (x86 only). Priority sntp > verb > rtc.
+    Rtc,
 }
 
 /// The canonical civil-time anchor: a UTC Unix second paired with the monotonic counter reading taken
@@ -388,6 +398,53 @@ pub fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     (year, month, d, hh, mm, ss)
 }
 
+/// RTCCLOCK: the display offset in minutes east of UTC (`UNAOS_TZ_MIN`, build knob, default 0). The CMOS RTC is
+/// read as UTC; this is added to the anchor so the bar shows local time. `date -s` writes `shown - TZ_MIN` back.
+pub const TZ_MIN: i64 = parse_i64(option_env!("UNAOS_TZ_MIN"));
+const fn parse_i64(v: Option<&str>) -> i64 {
+    let b = match v { Some(s) => s.as_bytes(), None => return 0 };
+    let (mut i, mut neg, mut n) = (0usize, false, 0i64);
+    if !b.is_empty() && (b[0] == b'-' || b[0] == b'+') { neg = b[0] == b'-'; i = 1; }
+    while i < b.len() {
+        if b[i] < b'0' || b[i] > b'9' { return 0; }
+        n = n * 10 + (b[i] - b'0') as i64;
+        i += 1;
+    }
+    if neg { -n } else { n }
+}
+
+/// Inverse of [`civil_from_unix`] (Hinnant days-from-civil): UTC Unix seconds from a civil date/time.
+pub fn unix_from_civil(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> u64 {
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if mo > 2 { mo - 3 } else { mo + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + h as i64 * 3_600 + mi as i64 * 60 + s as i64;
+    if secs < 0 { 0 } else { secs as u64 }
+}
+
+/// RTCCLOCK: anchor the civil clock from the CMOS RTC (`rtc_unix` = the RTC read as UTC), adding [`TZ_MIN`].
+/// Lowest priority: declines (returns false) when an SNTP or operator anchor already stands.
+pub fn anchor_from_rtc(rtc_unix: u64) -> bool {
+    if matches!(try_source(), ClockSource::Sntp { .. } | ClockSource::Manual) {
+        return false;
+    }
+    let shown = (rtc_unix as i64 + TZ_MIN * 60).max(0) as u64;
+    set_anchor(shown, mono_ticks().unwrap_or(0), ClockSource::Rtc);
+    true
+}
+
+/// RTCCLOCK boot hook: x86 reads the CMOS and anchors; every other arch has no RTC and says so.
+pub fn rtc_boot() {
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::rtc::boot_anchor();
+    #[cfg(not(target_arch = "x86_64"))]
+    serial_println!(":: RTC: rtc=none -> PASS ::");
+}
+
 /// A fixed-width byte writer for the ISO renderer (no allocation, no heap).
 struct IsoWriter<'a> {
     buf: &'a mut [u8],
@@ -466,4 +523,10 @@ pub fn fat_stamp() -> (u16, u16) {
         Some(t) => fat_pack(&t),
         None => (0, 0),
     }
+}
+
+/// SRCEXTRACT: milliseconds since boot from the free-running counter (`None` where the arch has no
+/// calibrated counter). The ms twin of [`uptime_secs`], for a verb that reports its own elapsed time.
+pub fn uptime_ms() -> Option<u64> {
+    monotonic().map(|(ticks, freq)| ticks.saturating_mul(1000) / freq.max(1))
 }

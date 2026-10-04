@@ -364,7 +364,7 @@ pub fn terminal_action_in(
         | Action::Deselect => ("ok", if !sel.apply(act, line.len()) { 0 } else if scroll { 2 } else { 1 }),
         // Not this consumer's business: the capture actions are delivered and acted on at the
         // decoder (`Action::is_capture`), and `LogOut` is KEYMAP's slot, bound by nobody.
-        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut | Action::BrightnessDown | Action::BrightnessUp | Action::CycleWindow | Action::LockScreen => ("ignored", 0),
+        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut | Action::BrightnessDown | Action::BrightnessUp | Action::CycleWindow | Action::LockScreen | Action::ShowShortcuts | Action::ScrollPageUp | Action::ScrollPageDown | Action::ScrollTop | Action::ScrollBottom | Action::SnapLeft | Action::SnapRight | Action::SnapZoom | Action::SnapRestore | Action::ScreenshotWindow | Action::WinNudgeLeft | Action::WinNudgeRight | Action::WinNudgeUp | Action::WinNudgeDown | Action::WinSizeLeft | Action::WinSizeRight | Action::WinSizeUp | Action::WinSizeDown | Action::Minimize | Action::CycleApp => ("ignored", 0),
         // TERMSEL2 M3 — the caret (`LineSel::caret_action`).
         Action::CursorLeft | Action::CursorRight | Action::CursorLineStart | Action::CursorLineEnd => {
             ("ok", sel.caret_action(act, line.len()))
@@ -383,6 +383,7 @@ pub const fn action_code(a: Action) -> u64 {
     match a {
         Action::Screenshot => 1,
         Action::ScreenshotRegion => 2,
+        Action::ScreenshotWindow => 30,
         Action::Copy => 3,
         Action::Cut => 4,
         Action::Paste => 5,
@@ -401,6 +402,23 @@ pub const fn action_code(a: Action) -> u64 {
         Action::BrightnessUp => 18,
         Action::CycleWindow => 20,
         Action::LockScreen => 19,
+        Action::ShowShortcuts => 21,
+        Action::ScrollPageUp => 22,
+        Action::ScrollPageDown => 23,
+        Action::ScrollTop => 24,
+        Action::ScrollBottom => 25,
+        Action::SnapLeft => 26,
+        Action::SnapRight => 27,
+        Action::SnapZoom => 28,
+        Action::SnapRestore => 29,
+        Action::WinNudgeLeft => 31,
+        Action::WinNudgeRight => 32,
+        Action::WinNudgeUp => 33,
+        Action::WinNudgeDown => 34,
+        Action::WinSizeLeft => 35,
+        Action::WinSizeRight => 36,
+        Action::WinSizeUp => 37,
+        Action::WinSizeDown => 38, Action::Minimize => 39, Action::CycleApp => 40, // WINDOWLIST
     }
 }
 

@@ -42,7 +42,6 @@
 //! K8b's retained roots ADD roots to this walk — that arc must extend
 //! [`UnaFS::fsck`]'s root set before it lands (standing STOP-class note).
 
-use crate::catalog::deserialize_catalog;
 use crate::fs::{FileSystemError, UnaFS};
 use crate::root::ROOT_BLOCK;
 use crate::storage::{BLOCK_SIZE, BlockDevice};
@@ -70,12 +69,18 @@ pub struct FsckReport {
     pub scrubbed_catalog_entries: usize,
     /// Whether this pass was allowed to mutate the volume.
     pub repaired: bool,
+    /// v6 (B302 M3): name-reachable inodes whose parent pointer / stored name
+    /// disagrees with the directory entry that names them (repair restamps).
+    pub bad_parent_links: Vec<u64>,
 }
 
 impl FsckReport {
     /// True when the scan found nothing inconsistent.
     pub fn is_clean(&self) -> bool {
-        self.leaked_blocks.is_empty() && self.orphan_inodes.is_empty() && !self.dirty_journal
+        self.leaked_blocks.is_empty()
+            && self.orphan_inodes.is_empty()
+            && self.bad_parent_links.is_empty()
+            && !self.dirty_journal
     }
 }
 
@@ -122,6 +127,8 @@ impl<D: BlockDevice> UnaFS<D> {
             }
         }
 
+        let link_faults = self.parent_link_faults()?;
+
         let mut report = FsckReport {
             dirty_journal: false,
             blocks_in_use,
@@ -131,6 +138,7 @@ impl<D: BlockDevice> UnaFS<D> {
             reclaimed_blocks: 0,
             scrubbed_catalog_entries: 0,
             repaired: repair,
+            bad_parent_links: link_faults.iter().map(|f| f.0).collect(),
         };
 
         if !repair {
@@ -141,8 +149,12 @@ impl<D: BlockDevice> UnaFS<D> {
         // rewrite reshapes the catalog's blocks, hence the re-walk below).
         if !orphan_inodes.is_empty() {
             let orphan_set: BTreeSet<u64> = orphan_inodes.iter().copied().collect();
-            report.scrubbed_catalog_entries = self.count_catalog_entries(&orphan_set)?;
-            self.remove_catalog_entries(|e| orphan_set.contains(&e.inode_id))?;
+            report.scrubbed_catalog_entries = self.index_scrub_ids(&orphan_set)?;
+        }
+
+        // Phase 1b (v6): restamp parent pointers to what the name tree says.
+        for (child, dir, name) in link_faults {
+            self.relink_inode(child, dir, &name)?;
         }
 
         // Phase 2: re-walk and rebuild the refcount map to the computed
@@ -242,6 +254,10 @@ impl<D: BlockDevice> UnaFS<D> {
                 }
             }
         }
+        // v6: the catalog's two index trees are owned by the catalog inode.
+        for b in self.catalog_tree_blocks()? {
+            Self::bump_block(b, block_count, &mut counts);
+        }
 
         // --- Every retained snapshot root (K8b) ---
         // A snapshot holds one reference to each block its inode-map tree
@@ -282,33 +298,42 @@ impl<D: BlockDevice> UnaFS<D> {
         }
     }
 
-    /// The set of inode ids the attribute catalog references (deduplicated).
-    fn catalog_inode_ids(&mut self) -> Result<BTreeSet<u64>, FileSystemError> {
-        let catalog = self.superblock.catalog_inode;
-        if catalog == 0 {
-            return Ok(BTreeSet::new());
+    /// v6: walk the name tree and list every `(child, dir, name)` whose child
+    /// inode's parent pointer is not `dir`, or whose stored name (when
+    /// stored) is not `name`. Empty on a pre-v6 volume (no pointers to check).
+    fn parent_link_faults(&mut self) -> Result<Vec<(u64, u64, alloc::string::String)>, FileSystemError> {
+        let mut faults = Vec::new();
+        if !self.superblock.indexed() {
+            return Ok(faults);
         }
-        let inode = self.read_inode(catalog)?;
-        if inode.size == 0 {
-            return Ok(BTreeSet::new());
+        let root = self.superblock.root_inode;
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        seen.insert(root);
+        let mut stack = alloc::vec![root];
+        while let Some(dir) = stack.pop() {
+            for e in self.ls(dir)? {
+                if !seen.insert(e.inode_id) {
+                    continue;
+                }
+                let child = self.read_inode(e.inode_id)?;
+                let name_ok = match &child.name {
+                    Some(n) => *n == e.name,
+                    None => e.name.len() > crate::inode::INODE_META_NAME_MAX,
+                };
+                if child.parent != dir || !name_ok {
+                    faults.push((e.inode_id, dir, e.name.clone()));
+                }
+                if e.kind == crate::inode::FileKind::Directory {
+                    stack.push(e.inode_id);
+                }
+            }
         }
-        let data = self.read_data(catalog, 0, inode.size)?;
-        let entries = deserialize_catalog(&data)?;
-        Ok(entries.iter().map(|e| e.inode_id).collect())
+        Ok(faults)
     }
 
-    /// Count catalog entries (with duplicates) whose inode is in `ids`.
-    fn count_catalog_entries(&mut self, ids: &BTreeSet<u64>) -> Result<usize, FileSystemError> {
-        let catalog = self.superblock.catalog_inode;
-        if catalog == 0 {
-            return Ok(0);
-        }
-        let inode = self.read_inode(catalog)?;
-        if inode.size == 0 {
-            return Ok(0);
-        }
-        let data = self.read_data(catalog, 0, inode.size)?;
-        let entries = deserialize_catalog(&data)?;
-        Ok(entries.iter().filter(|e| ids.contains(&e.inode_id)).count())
+    /// The set of inode ids the attribute index references (deduplicated):
+    /// both B+trees on v6, the flat list on v3–v5.
+    fn catalog_inode_ids(&mut self) -> Result<BTreeSet<u64>, FileSystemError> {
+        self.index_inode_ids()
     }
 }

@@ -363,7 +363,7 @@ pub(crate) fn hid_screenshot_chord_edge(
     prev_keys: &[u8; 6],
     modifiers: u8,
 ) -> Option<(crate::video::keymap::Action, &'static str)> {
-    crate::video::keymap::resolve_edge(crate::video::keymap::active(), cur_keys, prev_keys, modifiers)
+    crate::video::keymap::note_mods(modifiers); crate::video::keymap::resolve_edge(crate::video::keymap::active(), cur_keys, prev_keys, modifiers) // WINRESIZE M2 — the latest modifier byte, for Shift-drag aspect
 }
 
 /// KEYMAP — the 0x46 press edge's MEANING, resolved through the theme's table instead of assumed.
@@ -17245,20 +17245,21 @@ impl XhciController {
         // ── RX: one outstanding IN TRB; a completion is one frame (short packet) or a ZLP (0 bytes). ──
         if let Some((code, residue)) = usbnet::take_done() {
             if code == 1 || code == 13 {
-                let n = usbnet::RX_CHUNK.saturating_sub(residue as usize);
-                dma_coherency::inval(rx_phys as usize, usbnet::RX_CHUNK);
-                let frame = unsafe { core::slice::from_raw_parts(rx_phys as *const u8, n.min(usbnet::RX_CHUNK)) };
+                let rxl = usbnet::rx_len(); // USBNET5 M1: 20/24/26 KiB for the AX88179, 2 KiB for ECM
+                let n = rxl.saturating_sub(residue as usize);
+                dma_coherency::inval(rx_phys as usize, rxl);
+                let frame = unsafe { core::slice::from_raw_parts(rx_phys as *const u8, n.min(rxl)) };
                 if usbnet::kind() == usbnet::KIND_AX88179 { usbnet::deliver_ax(frame); } else { usbnet::deliver(frame); }
             } else {
                 usbnet::note_error(code);
             }
         }
         if !usbnet::armed() {
-            dma_coherency::clean(rx_phys as usize, usbnet::RX_CHUNK);
+            dma_coherency::clean(rx_phys as usize, usbnet::rx_len());
             let wait_trb_phys = {
                 let ring = match self.slots[slot as usize].bulk_in_ring.as_mut() { Some(r) => r, None => return };
                 let base = ring.get_ptr();
-                match ring.push(Trb { parameter: rx_phys, status: usbnet::RX_CHUNK as u32, control: (1 << 10) | (1 << 5) }) {
+                match ring.push(Trb { parameter: rx_phys, status: usbnet::rx_len() as u32, control: (1 << 10) | (1 << 5) }) {
                     Ok(idx) => base + (idx as u64) * core::mem::size_of::<Trb>() as u64,
                     Err(_) => return,
                 }
@@ -17398,9 +17399,25 @@ impl XhciController {
                 if !self.ax_write(slot, usbnet::ax::REG_MEDIUM_STATUS_MODE, &m.to_le_bytes()) {
                     serial_println!("[usbnet] MEDIUM_STATUS_MODE rewrite refused for {:#06x}", m);
                 }
+                self.usbnet_ax_regs(slot, "linkup"); // USBNET5 M2: the RX-side registers as the part holds them once the link is negotiated
             }
         }
         usbnet::witness_tick(now, slot);
+    }
+    /// USBNET5 M2: read back and print every RX-side register (`[usbnet] regs when= rxctl= rxcoe= medium= monitor= pause=lo/hi qctrl=`);
+    /// the MEDIUM_STATUS_MODE readback is kept for the witness `re=` (RECEIVE_EN).
+    fn usbnet_ax_regs(&mut self, slot: u8, when: &str) {
+        use usbnet::ax::*;
+        let (mut rc, mut med, mut coe, mut mon, mut lo, mut hi, mut q) = ([0u8; 2], [0u8; 2], [0u8; 1], [0u8; 1], [0u8; 1], [0u8; 1], [0u8; 5]);
+        let ok = self.ax_read(slot, REG_RX_CTL, &mut rc) & self.ax_read(slot, REG_MEDIUM_STATUS_MODE, &mut med) & self.ax_read(slot, REG_RXCOE_CTL, &mut coe)
+            & self.ax_read(slot, REG_MONITOR_MODE, &mut mon) & self.ax_read(slot, REG_PAUSE_WATERLVL_LOW, &mut lo) & self.ax_read(slot, REG_PAUSE_WATERLVL_HIGH, &mut hi)
+            & self.ax_read(slot, REG_RX_BULKIN_QCTRL, &mut q);
+        let medium = u16::from_le_bytes(med);
+        usbnet::note_medium_readback(medium);
+        serial_println!(
+            "[usbnet] regs when={} rxctl={:#06x} medium={:#06x} rxcoe={:#04x} monitor={:#04x} pause={:#04x}/{:#04x} qctrl={:02x?} re={} ok={}",
+            when, u16::from_le_bytes(rc), medium, coe[0], mon[0], lo[0], hi[0], q, (medium >> 8) & 1, ok as u8
+        );
     }
     fn ax_wait_ms(ms: u64) {
         let t0 = crate::arch::ms();
@@ -17430,7 +17447,9 @@ impl XhciController {
         if !self.ax_read(slot, REG_NODE_ID, &mut mac) || !usbnet::set_mac_bytes(&mac) { usbnet::set_up(slot, false, Some("NODE_ID")); return; }
         let mut link = [0u8; 1];
         let _ = self.ax_read(slot, REG_PHYSICAL_LINK_STATUS, &mut link);
-        let qctrl = if usbnet::out_mps() >= 1024 || link[0] & 0x04 != 0 { BULKIN_QCTRL_SS } else { BULKIN_QCTRL_HS };
+        let qctrl = if usbnet::out_mps() >= 1024 || link[0] & 0x04 != 0 { BULKIN_QCTRL_SS } else if link[0] & 0x02 != 0 { BULKIN_QCTRL_HS } else { BULKIN_QCTRL_FS };
+        let rxbuf = usbnet::set_rx_len_from_qctrl(&qctrl); // USBNET5 M1: post 1024*(q[3]+2) bytes per bulk-IN TD, as Linux rx_urb_size
+        serial_println!("[usbnet] rx buf={} qctrl={:02x?}", rxbuf, qctrl);
         if !self.ax_write(slot, REG_RX_BULKIN_QCTRL, &qctrl) { usbnet::set_up(slot, false, Some("RX_BULKIN_QCTRL")); return; }
         if !self.ax_write(slot, REG_PAUSE_WATERLVL_LOW, &[0x34]) || !self.ax_write(slot, REG_PAUSE_WATERLVL_HIGH, &[0x52]) { usbnet::set_up(slot, false, Some("PAUSE_WATERLVL")); return; }
         if !self.ax_write(slot, REG_RXCOE_CTL, &[0]) || !self.ax_write(slot, REG_TXCOE_CTL, &[0]) { usbnet::set_up(slot, false, Some("COE_CTL")); return; }
@@ -17446,6 +17465,7 @@ impl XhciController {
             "[usbnet] ax88179 link_status={:#04x} medium(readback)={:#06x} qctrl={} phy_aneg={} — UNFLOWN register map, confirm on the bench",
             link[0], u16::from_le_bytes(medium), if qctrl == BULKIN_QCTRL_SS { "ss" } else { "hs" }, phy_ok as u8
         );
+        self.usbnet_ax_regs(slot, "bringup");
         usbnet::set_up(slot, phy_ok, None);
     }
 

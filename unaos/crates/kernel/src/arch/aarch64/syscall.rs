@@ -4494,7 +4494,7 @@ pub fn clear_handle_row(asid: u64) {
     // BANDY-1 M2: drain this ASID's bus mailbox alongside its handles/inbox — undelivered replies
     // die with their tenant (the boxes free here), and the gen bump above already makes any reply
     // enqueued in a race dead-on-arrival for the next tenant (bus_mrecv verifies the stamp).
-    bus_mbox_clear(asid);
+    bus_mbox_clear(asid); #[cfg(feature = "busreg")] crate::bus_route::on_exit(&BUSREG_OPS, asid as usize);
     // U7: DISOWN any still-live transfer this dying ASID sent (SENDER -> u64::MAX, never a real ASID):
     // revoke authority dies with the sender, so the ASID's next tenant can neither revoke nor be blamed
     // for the old tenant's transfers (txids are monotonic and were returned to EL0 — without this, a
@@ -6898,7 +6898,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_OPEN => sys_open(a0, a1, a2),
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), // STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
+        SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
         SYS_CLOSE => sys_close(a0),
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
@@ -16548,7 +16548,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // [name_len][name][content] payload + empty/at-ceiling content, decode fail-closed. A SIBLING
     // of BANDY-CODEC (the BANDY-1 goldens/witness stay byte-identical). Read-only, in-RAM; its own
     // uncounted `:: BANDY-CODEC2: … PASS ::` line.
-    crate::bus::bus_codec2_selftest();
+    crate::bus::bus_codec2_selftest(); crate::bus::attr::selftest(); // ATTRSURF: the attribute-verb goldens beside BANDY-2's.
     u7stk!("after:bus_codec2");
     // BANDY-1 M5 (verdict C): the stamping witness — caller-supplied principal rejected, replies
     // stamped with the reserved kernel kind (fail-closed everywhere a grantee/owner can appear),
@@ -23101,7 +23101,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
         Ok(h) => h,
         Err(_) => return EINVAL,
     };
-    if hdr.kind != crate::bus::BUS_KIND_REQUEST || crate::bus::request_validate(&hdr).is_err() {
+    #[cfg(feature = "busreg")] { if hdr.kind == crate::bus::BUS_KIND_REPLY { return crate::bus_route::fulfiller_reply(&BUSREG_OPS, asid as usize, agen, &hdr, frame); } } if hdr.kind != crate::bus::BUS_KIND_REQUEST || crate::bus::request_validate(&hdr).is_err() { // BANDY3: under `busreg` a ring-3 REPLY frame is legal only as a fulfiller's answer to a relay it holds (bus_route.rs)
         return EINVAL; // a REPLY frame, nonzero status, or CALLER-SUPPLIED PRINCIPAL — rejected
     }
     let body = &frame[crate::bus::BUS_HDR_LEN..];
@@ -23113,7 +23113,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
     // EL0 bytes for this field were required zero above, and fulfillment below receives `ppid`
     // (the stamped identity) directly; hdr.principal is never read again.
     // Fulfill under the INVOKER's identity (verdict D) — synchronously, in this SVC context.
-    let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new(); #[cfg(feature = "busreg")] { let mut pw = [0u8; 32]; ppid.write(&mut pw); match crate::bus_route::route_request(&BUSREG_OPS, asid as usize, agen, pw, &hdr, body) { crate::bus_route::Route::Kernel => {} crate::bus_route::Route::Relayed => return 0, crate::bus_route::Route::Reply(st) => return bus_reply_enqueue(asid, hdr.corr, hdr.verb, st, &[]) } }
     let status = match hdr.verb {
         crate::bus::BUS_VERB_LS => bus_ls(&mut text),
         crate::bus::BUS_VERB_CAT => match crate::bus::cat_body_parse(body) {
@@ -23155,7 +23155,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), // ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST => crate::prefs::bus_fulfil(hdr.verb, body, pref_caller_in_session(ppid), &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal_of(&ppid), &mut text), // ATTRSURF (B299): the attribute verbs under the STAMPED principal. PREFS (B300): Principia's verbs over the one store. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)
@@ -25732,4 +25732,135 @@ fn armrouter_witness() {
         if df { ",appmenu,brightkeys,volkeys" } else { "" },
         moved, if seams { "PASS" } else { "FAIL" }
     );
+}
+
+/// PREFS (rmbp-ledger B300): may a caller with principal `ppid` SET a preference? Only a program of the OPEN
+/// session: the session is a `user:` record and the caller carries exactly it (`session_restamp` stamps
+/// every program loaded in the session). Without `login` there is no session: reads only.
+fn pref_caller_in_session(ppid: PrincipalRecord) -> bool {
+    #[cfg(feature = "login")]
+    {
+        let s = { let _irq = IrqGuard::mask_save(); *SESSION.lock() };
+        return s.kind == PRIN_USER && s == ppid;
+    }
+    #[cfg(not(feature = "login"))]
+    {
+        let _ = ppid;
+        false
+    }
+}
+
+// =================================================================================================
+// BANDY3 (ROADMAP §3b, the fulfiller seam): this arch's thin half of `crate::bus_route` — the mailbox
+// ops table the router drives (ASID + ASID_GEN keyed, the existing BUS_MBOX / BUS_SEM), and the
+// `tests bandy3` fixture's hooks over the PRODUCTION `sys_msend_for`. Appended at the file tail.
+// =================================================================================================
+#[cfg(feature = "busreg")]
+fn busreg_push(row: usize, frame: alloc::boxed::Box<[u8]>) -> bool {
+    if row >= BUS_MBOX.len() {
+        return false;
+    }
+    bus_sem_init_once();
+    let agen = ASID_GEN[row].load(Ordering::Acquire);
+    if !bus_mbox_push(row as u64, agen, frame) {
+        return false;
+    }
+    BUS_SEM[row].post();
+    true
+}
+#[cfg(feature = "busreg")]
+fn busreg_has_room(row: usize) -> bool {
+    row < BUS_MBOX.len() && bus_mbox_has_room(row as u64)
+}
+#[cfg(feature = "busreg")]
+fn busreg_gen(row: usize) -> u64 {
+    if row < ASID_GEN.len() { ASID_GEN[row].load(Ordering::Acquire) } else { u64::MAX }
+}
+#[cfg(feature = "busreg")]
+static BUSREG_OPS: crate::bus_route::Ops = crate::bus_route::Ops { push: busreg_push, has_room: busreg_has_room, rgen: busreg_gen };
+
+/// The scratch principal the fixture's rows are stamped with (kernel-minted, like every stamp).
+#[cfg(feature = "busreg")]
+fn busreg_fx_prin(row: usize) -> PrincipalRecord {
+    if row == 6 { PrincipalRecord::program(b"prog:BANDY3A") } else { PrincipalRecord::program(b"prog:BANDY3F") }
+}
+#[cfg(feature = "busreg")]
+fn busreg_fx_send(row: usize, frame: &[u8]) -> i64 {
+    let agen = ASID_GEN[row].load(Ordering::Acquire);
+    sys_msend_for(row as u64, agen, busreg_fx_prin(row), frame)
+}
+#[cfg(feature = "busreg")]
+fn busreg_fx_pop(row: usize) -> Option<alloc::boxed::Box<[u8]>> {
+    bus_mbox_pop(row as u64).map(|m| m.frame)
+}
+#[cfg(feature = "busreg")]
+fn busreg_fx_clear(row: usize) {
+    bus_mbox_clear(row as u64);
+}
+#[cfg(feature = "busreg")]
+fn busreg_fx_stamp(row: usize) -> [u8; 32] {
+    let mut p = [0u8; 32];
+    busreg_fx_prin(row).write(&mut p);
+    p
+}
+#[cfg(feature = "busreg")]
+static BUSREG_FX: crate::bus_route::Fixture = crate::bus_route::Fixture {
+    ops: &BUSREG_OPS,
+    send: busreg_fx_send,
+    pop: busreg_fx_pop,
+    clear: busreg_fx_clear,
+    stamp: busreg_fx_stamp,
+    rows: (6, 7), // the scratch ASIDs the BANDY-STAMP fixture already uses (caller 6, fulfiller 7)
+};
+
+/// `tests bandy3` — the fulfiller-registration witness on aarch64.
+#[cfg(feature = "busreg")]
+pub fn bandy3_selftest() {
+    bus_sem_init_once();
+    crate::bus_route::selftest(&BUSREG_FX);
+}
+
+// =================================================================================================
+// ATTRSURF (B299) — the attribute syscalls, aarch64 arm. The body is `fs::attrsys::syscall_fulfil`,
+// shared with x86 and with both bus arms; this arm only copies in, names the caller, and copies out.
+// =================================================================================================
+
+/// The VFS principal string for a stamped record — the SAME projection a native `owner` row is written
+/// with (`principal_native_string`), so the attribute ACL and the SYS_OPEN ACL name one person one
+/// way. An anonymous / un-projectable caller is `anon` (public objects only).
+fn attrsurf_principal_of(rec: &PrincipalRecord) -> alloc::string::String {
+    let mut b = [0u8; K4_STR_MAX];
+    match principal_native_string(rec, &mut b) {
+        Some(n) => match core::str::from_utf8(&b[..n]) {
+            Ok(s) => alloc::string::String::from(s),
+            Err(_) => alloc::string::String::from("anon"),
+        },
+        None => alloc::string::String::from("anon"),
+    }
+}
+
+/// `SYS_ATTR_SET/GET/LIST`, `SYS_QUERY`, `SYS_STAT` — see una-abi's ATTRSURF block for the layouts.
+fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let principal = attrsurf_principal_of(&current_principal());
+    let n = a1 as usize;
+    if n == 0 || n > crate::fs::attrsys::IN_MAX {
+        return EINVAL;
+    }
+    let mut inb = alloc::vec![0u8; n];
+    if copy_from_user(&mut inb, a0, n).is_err() {
+        return EFAULT;
+    }
+    let cap = match nr {
+        una_abi::SYS_ATTR_SET => 0,
+        una_abi::SYS_STAT => una_abi::USER_STAT_LEN,
+        _ => a3 as usize,
+    };
+    let out = match crate::fs::attrsys::syscall_fulfil(nr, &inb, &principal, cap) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    if !out.is_empty() && copy_to_user(a2, &out, out.len()).is_err() {
+        return EFAULT;
+    }
+    if nr == una_abi::SYS_STAT { 0 } else { out.len() as i64 }
 }

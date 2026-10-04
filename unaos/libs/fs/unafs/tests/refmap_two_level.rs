@@ -75,7 +75,7 @@ fn chunk_bytes(ci: usize, len: usize) -> Vec<u8> {
 #[test]
 fn two_level_volume_formats_mounts_and_roundtrips() {
     let mut fs = fresh_fs(TWO_LEVEL_MB);
-    assert_eq!(fs.superblock.version, 5);
+    assert_eq!(fs.superblock.version, unafs::superblock::VERSION);
     assert!(fs.superblock.block_count > MAX_BLOCK_COUNT_ONE_LEVEL);
     assert!(fs.superblock.refmap_two_level());
 
@@ -155,7 +155,9 @@ fn snapshot_retains_old_bytes_on_a_two_level_volume() {
 // ---------------------------------------------------------------------------
 #[test]
 fn v4_and_v3_volumes_mount_and_read_bit_perfect() {
-    let mut fs = fresh_fs(16);
+    // A genuine v5 image (flat catalog, no v6 inode trailers): small v5 is
+    // byte-identical to v4/v3 apart from the version stamp.
+    let mut fs = UnaFS::format_with_version(MemDevice::new(), 16, 5).expect("format v5");
     assert!(!fs.superblock.refmap_two_level(), "small volume is one level");
     let root = fs.superblock.root_inode;
     let id = fs.create_file(root, "old.txt".into()).unwrap();

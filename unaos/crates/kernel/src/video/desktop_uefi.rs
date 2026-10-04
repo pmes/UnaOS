@@ -450,7 +450,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     {
         super::cursor::undraw();
         let fb = *super::WRITER.lock();
-        fb.fill_screen(wm::DESKTOP_BG);
+        if !crate::splash::glass_held() { fb.fill_screen(wm::DESKTOP_BG); } // SPLASH2 M2: the takeover already blitted the splash — no DESKTOP_BG flash under it
         fb.flush_all();
     }
     super::wcpar::start(); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] crate::drivers::gpu::kepler_vblank::pump_spawn_once(); // KVBLANK6 — task context; WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
@@ -686,6 +686,7 @@ pub fn desktop_app_service() {
     // already make from this lane. See `wm::pace_service`.
     super::wm::pace_service();
     crate::splash::hold_service(); // SPLASHX86: the 5 s bound on the boot splash hold
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::dock::dockpin_service(); // DOCKPIN — the owed `<home>/.dock` load (login) and save (a Keep/Remove press), VFS work that cannot run in the click router.
 
     // MENUSTAT — the desktop STATUS MODEL's poll, here and for `pace_service`'s reason: this is the
     // `wc`-gated body the ~1 kHz device-service task calls on EVERY pass, and it must run AHEAD of
@@ -713,7 +714,7 @@ pub fn desktop_app_service() {
     // the ~999 passes in between. The FIRST pass finds `LAST_POLL_MS == 0` and sweeps immediately,
     // so the item is resolved before the bar reaches the glass rather than ten seconds after.
     super::status::poll(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::brightkeys::service(); // BRIGHTKEYS — applies a pending backlight step (gmux port I/O belongs on this pass, not in the decoder). ⚠ SAME-LINE fold.
-    super::status::poll(); #[cfg(feature = "wc")] super::dock::lp_service(crate::arch::ms()); // DOCKRUN — 600 ms hold on a running dock tile opens its menu.
+    super::status::poll(); super::powerui::lowbat_service(); #[cfg(feature = "wc")] super::dock::lp_service(crate::arch::ms()); // DOCKRUN — 600 ms hold on a running dock tile opens its menu.
 
     // Not armed = the activation never completed. Cheapest test first, and it is the one that is
     // false on every boot without the Kepler takeover.

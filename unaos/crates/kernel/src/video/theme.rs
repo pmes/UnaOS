@@ -557,13 +557,41 @@ use super::keymap::{Action, Binding, Table, ALT, CMD, CTRL, SHIFT};
 /// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
-pub static CRISPY_ROWS: [Binding; 27] = [
+pub static CRISPY_ROWS: [Binding; 53] = [
+    // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
+    Binding { roles: CMD | ALT, usage: 0x50, action: Action::SnapLeft, token: "cmd-alt-left" },
+    Binding { roles: CMD | ALT, usage: 0x4F, action: Action::SnapRight, token: "cmd-alt-right" },
+    Binding { roles: CMD | ALT, usage: 0x52, action: Action::SnapZoom, token: "cmd-alt-up" },
+    Binding { roles: CMD | ALT, usage: 0x51, action: Action::SnapRestore, token: "cmd-alt-down" },
+    Binding { roles: CTRL | ALT, usage: 0x50, action: Action::SnapLeft, token: "ctrl-alt-left" },
+    Binding { roles: CTRL | ALT, usage: 0x4F, action: Action::SnapRight, token: "ctrl-alt-right" },
+    Binding { roles: CTRL | ALT, usage: 0x52, action: Action::SnapZoom, token: "ctrl-alt-up" },
+    Binding { roles: CTRL | ALT, usage: 0x51, action: Action::SnapRestore, token: "ctrl-alt-down" },
+    // WINRESIZE (R75) — Ctrl+arrow nudges the focused window, Ctrl+Shift+arrow resizes it. FIRST in the
+    // table: the Shift row is above the Ctrl row on every usage (`no_shadow`), and both are above the
+    // bare caret/select rows on the same usages, which they take over while Ctrl is held.
+    Binding { roles: CTRL | SHIFT, usage: 0x50, action: Action::WinSizeLeft, token: "ctrl-shift-left" },
+    Binding { roles: CTRL | SHIFT, usage: 0x4F, action: Action::WinSizeRight, token: "ctrl-shift-right" },
+    Binding { roles: CTRL | SHIFT, usage: 0x52, action: Action::WinSizeUp, token: "ctrl-shift-up" },
+    Binding { roles: CTRL | SHIFT, usage: 0x51, action: Action::WinSizeDown, token: "ctrl-shift-down" },
+    Binding { roles: CTRL, usage: 0x50, action: Action::WinNudgeLeft, token: "ctrl-left" },
+    Binding { roles: CTRL, usage: 0x4F, action: Action::WinNudgeRight, token: "ctrl-right" },
+    Binding { roles: CTRL, usage: 0x52, action: Action::WinNudgeUp, token: "ctrl-up" },
+    Binding { roles: CTRL, usage: 0x51, action: Action::WinNudgeDown, token: "ctrl-down" },
     // The two chords flight 11 proved on metal. Their tokens are the exact bytes the `[prtscr]`
     // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
-    Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: "cmd-shift-3" },
-    Binding { roles: CMD | SHIFT, usage: 0x21, action: Action::ScreenshotRegion, token: "cmd-shift-4" },
+    Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: super::shortcuts::C_CMD_SHIFT_3 },
+    Binding { roles: CMD | SHIFT, usage: 0x21, action: Action::ScreenshotRegion, token: super::shortcuts::C_CMD_SHIFT_4 },
+    Binding { roles: CMD | SHIFT, usage: 0x22, action: Action::ScreenshotWindow, token: "cmd-shift-5" }, // SHOTREGION M2
     // The SLOT (R60). LOGINFLOW may bind it; nothing else may, and nothing acts on it today.
     Binding { roles: CMD | SHIFT, usage: 0x14, action: Action::LogOut, token: "cmd-shift-q" },
+    // SCROLLBACK (R75) — ABOVE every bare Home/End row (`no_shadow`). Cmd+Home/End and Ctrl+Home/End jump, Shift+PgUp/PgDn page.
+    Binding { roles: SHIFT, usage: 0x4B, action: Action::ScrollPageUp, token: "shift-pgup" },
+    Binding { roles: SHIFT, usage: 0x4E, action: Action::ScrollPageDown, token: "shift-pgdn" },
+    Binding { roles: CMD, usage: 0x4A, action: Action::ScrollTop, token: "cmd-home" },
+    Binding { roles: CMD, usage: 0x4D, action: Action::ScrollBottom, token: "cmd-end" },
+    Binding { roles: CTRL, usage: 0x4A, action: Action::ScrollTop, token: "ctrl-home" },
+    Binding { roles: CTRL, usage: 0x4D, action: Action::ScrollBottom, token: "ctrl-end" },
     // TERMSEL — to the line start / end, the Mac chords. ABOVE the bare Shift rows (precedence).
     Binding { roles: CMD | SHIFT, usage: 0x50, action: Action::SelectLineStart, token: "cmd-shift-left" },
     Binding { roles: CMD | SHIFT, usage: 0x4F, action: Action::SelectLineEnd, token: "cmd-shift-right" },
@@ -594,18 +622,20 @@ pub static CRISPY_ROWS: [Binding; 27] = [
     // (0x1B reaches every key consumer as before), so a menu that dismisses on it is unaffected.
     Binding { roles: 0, usage: 0x29, action: Action::Deselect, token: "esc" },
     // WINCYCLE — Alt+Tab and the Mac's own ⌘Tab. Above the bare rows on usage 0x2B (none exist).
-    Binding { roles: ALT, usage: 0x2B, action: Action::CycleWindow, token: "alt-tab" },
-    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: "cmd-tab" },
+    Binding { roles: ALT, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB },
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_CMD_TAB }, Binding { roles: CMD, usage: 0x10, action: Action::Minimize, token: super::shortcuts::C_CMD_M }, Binding { roles: CMD, usage: 0x35, action: Action::CycleApp, token: super::shortcuts::C_CMD_GRAVE }, // WINDOWLIST — ⌘M minimise, ⌘` next window of the same app (CRISPY)
     // Print Screen. `roles: 0` — the key means capture whatever else is held, which is precisely
     // what the `0x46` edge did before it was a row. A theme that drops this row disarms the key.
-    Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "print-screen" },
+    Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: super::shortcuts::C_PRINT_SCREEN },
     // BRIGHTKEYS: the Apple keyboard's F1/F2 are brightness down/up (HID 0x3A/0x3B). Consumed by
     // `video::brightkeys` at `pal::push_event`.
     Binding { roles: 0, usage: 0x3A, action: Action::BrightnessDown, token: "f1-brightness-down" },
     Binding { roles: 0, usage: 0x3B, action: Action::BrightnessUp, token: "f2-brightness-up" },
     // SCREENLOCK — ⌘L and Ctrl+Alt+L lock the session (usage 0x0F = L; no other row watches it).
-    Binding { roles: CMD, usage: 0x0F, action: Action::LockScreen, token: "cmd-l" },
-    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: "ctrl-alt-l" },
+    Binding { roles: CMD, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CMD_L },
+    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CTRL_ALT_L },
+    // SHORTCUTS — ⌘/ opens the help overlay (usage 0x38 = `/`; no other row watches it).
+    Binding { roles: CMD, usage: 0x38, action: Action::ShowShortcuts, token: super::shortcuts::C_CMD_SLASH },
 ];
 
 /// **The desktop's live table.** `cmd_role` is `HID_MOD_GUI`, so every `CMD` above is the Command
@@ -623,13 +653,33 @@ pub static CRISPY_BINDINGS: &Table = &Table {
 /// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
 /// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
 /// moves to Alt there, not because a second Copy row was written.
-pub static PC_ROWS: [Binding; 17] = [
+pub static PC_ROWS: [Binding; 35] = [
+    // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
+    Binding { roles: CTRL | ALT, usage: 0x50, action: Action::SnapLeft, token: "ctrl-alt-left" },
+    Binding { roles: CTRL | ALT, usage: 0x4F, action: Action::SnapRight, token: "ctrl-alt-right" },
+    Binding { roles: CTRL | ALT, usage: 0x52, action: Action::SnapZoom, token: "ctrl-alt-up" },
+    Binding { roles: CTRL | ALT, usage: 0x51, action: Action::SnapRestore, token: "ctrl-alt-down" },
+    // WINRESIZE (R75) — Ctrl+arrow nudges the focused window, Ctrl+Shift+arrow resizes it. FIRST in the
+    // table: the Shift row is above the Ctrl row on every usage (`no_shadow`), and both are above the
+    // bare caret/select rows on the same usages, which they take over while Ctrl is held.
+    Binding { roles: CTRL | SHIFT, usage: 0x50, action: Action::WinSizeLeft, token: "ctrl-shift-left" },
+    Binding { roles: CTRL | SHIFT, usage: 0x4F, action: Action::WinSizeRight, token: "ctrl-shift-right" },
+    Binding { roles: CTRL | SHIFT, usage: 0x52, action: Action::WinSizeUp, token: "ctrl-shift-up" },
+    Binding { roles: CTRL | SHIFT, usage: 0x51, action: Action::WinSizeDown, token: "ctrl-shift-down" },
+    Binding { roles: CTRL, usage: 0x50, action: Action::WinNudgeLeft, token: "ctrl-left" },
+    Binding { roles: CTRL, usage: 0x4F, action: Action::WinNudgeRight, token: "ctrl-right" },
+    Binding { roles: CTRL, usage: 0x52, action: Action::WinNudgeUp, token: "ctrl-up" },
+    Binding { roles: CTRL, usage: 0x51, action: Action::WinNudgeDown, token: "ctrl-down" },
     // PrtSc. The SHIFTED row is written ABOVE the bare one, and it has to be: the bare row names
     // no roles, so it matches with Shift held too and would shadow the region chord entirely. That
     // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
     Binding { roles: SHIFT, usage: 0x46, action: Action::ScreenshotRegion, token: "shift-prtsc" },
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "prtsc" },
-    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: "alt-tab" }, // WINCYCLE — Alt is the PC's cmd role
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB }, Binding { roles: CMD, usage: 0x10, action: Action::Minimize, token: super::shortcuts::C_CMD_M }, Binding { roles: CMD, usage: 0x35, action: Action::CycleApp, token: super::shortcuts::C_CMD_GRAVE }, // WINCYCLE — Alt is the PC's cmd role; WINDOWLIST — Alt+M / Alt+` on the PC table
+    Binding { roles: SHIFT, usage: 0x4B, action: Action::ScrollPageUp, token: "shift-pgup" }, // SCROLLBACK (R75) — above the bare Home/End rows
+    Binding { roles: SHIFT, usage: 0x4E, action: Action::ScrollPageDown, token: "shift-pgdn" },
+    Binding { roles: CTRL, usage: 0x4A, action: Action::ScrollTop, token: "ctrl-home" },
+    Binding { roles: CTRL, usage: 0x4D, action: Action::ScrollBottom, token: "ctrl-end" },
     Binding { roles: CMD, usage: 0x06, action: Action::Copy, token: "alt-c" },
     Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "alt-v" },
     Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "alt-x" },
@@ -646,7 +696,7 @@ pub static PC_ROWS: [Binding; 17] = [
     Binding { roles: 0, usage: 0x4F, action: Action::CursorRight, token: "right" },
     Binding { roles: 0, usage: 0x4A, action: Action::CursorLineStart, token: "home" },
     Binding { roles: 0, usage: 0x4D, action: Action::CursorLineEnd, token: "end" },
-    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: "ctrl-alt-l" }, // SCREENLOCK — Ctrl+Alt+L
+    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CTRL_ALT_L }, // SCREENLOCK — Ctrl+Alt+L
 ];
 
 /// The PC table. `cmd_role` is `HID_MOD_ALT` — R61's *"(alt-c on pc)"*, and the one field that
@@ -722,3 +772,19 @@ pub const CAPTURE_DIR: &str = "Desktop";
 /// second theme lands: `dir=/home/una/Desktop` alone cannot be told from a Windows-shaped theme
 /// that happens to agree. Every line that prints [`CAPTURE_DIR`]'s consequence prints this first.
 pub const NAME: &str = "crispy";
+
+// --- TERMCOLOR (R75) — the terminal's 16-colour palette --------------------------------------------
+/// The console's default text colour (what an attribute-less cell paints).
+pub const TERM_FG: u32 = 0x00AA_AAAA;
+/// The prompt's colour on the Moonstone console ground — the accent, lifted so it reads on dark.
+pub const TERM_ACCENT: u32 = 0x007F_B2F0;
+/// ANSI 0..7 (normal) then 8..15 (bright), tuned for the dark `0x2D2B55` ground.
+pub const ANSI16: [u32; 16] = [
+    0x0000_0000, 0x00CD_3131, 0x000D_BC79, 0x00E5_E510, 0x0024_72C8, 0x00BC_3FBC, 0x0011_A8CD, 0x00E5_E5E5,
+    0x0066_6666, 0x00F1_4C4C, 0x0023_D18B, 0x00F5_F543, 0x003B_8EEA, 0x00D6_70D6, 0x0029_B8DB, 0x00FF_FFFF,
+];
+/// Named picks the shell's own output uses (`Console::style`).
+pub const TERM_RED: u8 = 31;
+pub const TERM_GREEN: u8 = 32;
+pub const TERM_BLUE: u8 = 94;
+pub const TERM_DIM: u8 = 90;

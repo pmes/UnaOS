@@ -52,8 +52,10 @@ static SPLASH_UP: AtomicBool = AtomicBool::new(false);
 /// Whether the splash currently owns the pre-GUI panel (never true on
 /// usbdebug/bootlog/witness builds — main.rs gates the paint off them).
 pub fn active() -> bool {
-    SPLASH_UP.load(Ordering::Relaxed)
+    SPLASH_UP.load(Ordering::Relaxed) || HOLD_GLASS.load(Ordering::Relaxed) // SPLASH2: the takeover blit keeps the glass owned until hold_release
 }
+/// SPLASH2: true from the takeover blit (the splash IS the glass) until `hold_release`.
+static HOLD_GLASS: AtomicBool = AtomicBool::new(false);
 
 /// Splash backdrop — near-black, so the beam and spectrum carry the frame.
 const SPLASH_BG: u32 = 0x0006_0608;
@@ -787,6 +789,7 @@ pub fn hold_release(by: &str) {
     if id == 0 {
         return;
     }
+    HOLD_GLASS.store(false, Ordering::Relaxed);
     let t_rel = crate::arch::ms();
     crate::video::wm::clear_modal_top(id);
     crate::video::wm::close(id);
@@ -806,3 +809,59 @@ pub fn hold_service() {
         hold_release("timeout");
     }
 }
+
+// =================================================================================================
+// SPLASH2 — the splash owns the glass from the FIRST frame the panel can show (the UEFI GOP framebuffer,
+// painted at boot entry) through the Kepler takeover (the compositor's first frame IS the splash — the
+// same RAM surface `hold_open` parks) until the first real screen is PAINTED (`login::open_as`, or the
+// desktop's furniture composite in `users::stage_publish`) — not until `store-loaded`.
+
+/// M1 — paint the splash on the GOP framebuffer at boot entry (allocation-free; pre-heap). On builds
+/// where `boot_splash` is armed (non-usbdebug/bootlog/witness) that is the animated paint; on the
+/// excluded builds (the metal bench carries `bootlog`) it is the same static frame, unarmed, with
+/// `SPLASH_UP` set so the console's milestone lines stay off the glass.
+#[cfg(target_arch = "x86_64")]
+pub fn gop_stage(base: usize, len: usize, info: FrameBufferInfo) {
+    let t0 = crate::arch::ms();
+    #[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+    boot_splash(base, len, info);
+    #[cfg(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))]
+    {
+        paint(base, len, info, false);
+        SPLASH_UP.store(true, Ordering::Relaxed);
+    }
+    serial_println!(":: SPLASH: stage=gop at_ms={} paint_ms={} WxH={}x{} ::", t0, crate::arch::ms().saturating_sub(t0), info.width, info.height);
+}
+
+/// M2 — at the takeover's full-panel clear: render the hold surface (heap exists by now) and BLIT it to
+/// the live panel instead of clearing, so the first frame after the takeover is the splash (no black
+/// frame, no bar/console flash). Returns true when the splash is on the glass. `fb` is the panel handle.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn takeover_blit(fb: &crate::video::FrameBuffer) -> bool {
+    hold_prepare();
+    let g = HOLD_SURF.lock();
+    let Some((surf, w, h)) = g.as_ref() else { return false };
+    let i = fb.info();
+    if i.bytes_per_pixel != 4 || *w != i.width || *h != i.height {
+        return false;
+    }
+    let row = *w * 4;
+    let pitch = i.stride * 4;
+    for y in 0..*h {
+        fb.blit(y * pitch, &surf[y * row..(y + 1) * row]);
+    }
+    fb.flush_all();
+    HOLD_GLASS.store(true, Ordering::Relaxed);
+    serial_println!(":: SPLASH: stage=takeover at_ms={} ::", crate::arch::ms());
+    true
+}
+
+/// Whether the takeover blit has put the splash on the glass (activate_on skips its DESKTOP_BG clear).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn glass_held() -> bool {
+    HOLD_GLASS.load(Ordering::Relaxed)
+}
+
+/// SPLASH2: builds without a compositor hold nothing; `login::open_as` calls this unconditionally.
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn hold_release(_by: &str) {}

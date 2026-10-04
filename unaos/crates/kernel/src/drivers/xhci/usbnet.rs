@@ -82,11 +82,24 @@ const RING: usize = 8;
 /// Bulk-IN transfer size. Larger than any frame the device may send (1514 + a possible VLAN tag),
 /// so every frame completes as ONE short packet (completion code 13) and never spans two TRBs.
 pub const RX_CHUNK: usize = 2048;
+/// USBNET5 M1: the AX88179 bulk-IN buffer is `1024*(QCTRL[3]+2)` (Linux `rx_urb_size`): SS 20 KiB, HS 24 KiB,
+/// FS 26 KiB. The largest is 26624 B; the slot's 32 KiB `scsi_data_buffer` (64 KiB aligned, so one TRB never
+/// crosses a 64 KiB boundary) holds RX at +0 and TX at +28672. ECM keeps `RX_CHUNK`.
+pub const RX_CHUNK_MAX: usize = 26624;
+static RX_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(RX_CHUNK);
+/// The bulk-IN transfer size currently posted (ECM 2048; AX88179 per link speed after bring-up).
+pub fn rx_len() -> usize { RX_LEN.load(Ordering::Relaxed) }
+/// Set the AX bulk-IN size from the QCTRL tuple written (Linux `1024*(q[3]+2)`), clamped to `RX_CHUNK_MAX`.
+pub fn set_rx_len_from_qctrl(q: &[u8; 5]) -> usize {
+    let n = (1024 * (q[3] as usize + 2)).min(RX_CHUNK_MAX);
+    RX_LEN.store(n, Ordering::Relaxed);
+    n
+}
 /// Where the RX and TX bounce buffers live inside the slot's `scsi_data_buffer` (32 KiB, allocated
 /// by `configure_endpoints` for every bulk device, never used by BOT on a slot that runs no SCSI).
-/// RX at +0, TX at +4096: disjoint, each 2 KiB, both 64-byte aligned.
+/// RX at +0 (up to RX_CHUNK_MAX), TX at +28672: disjoint, both 64-byte aligned (USBNET5 moved TX up for the 20-26 KiB AX88179 RX buffer).
 pub const RX_BUF_OFFSET: usize = 0;
-pub const TX_BUF_OFFSET: usize = 4096;
+pub const TX_BUF_OFFSET: usize = 28672;
 
 // ── The link's identity and state ────────────────────────────────────────────────────────────────
 const ST_ABSENT: u8 = 0;
@@ -593,6 +606,8 @@ pub mod ax {
     /// Bulk-IN queue control by USB speed (the part's aggregation timer/size tuple).
     pub const BULKIN_QCTRL_SS: [u8; 5] = [0x07, 0x4f, 0x00, 0x12, 0xff];
     pub const BULKIN_QCTRL_HS: [u8; 5] = [0x07, 0x20, 0x03, 0x16, 0xff];
+    /// Linux `ax88179_bulkin_size[3]`: full-speed USB.
+    pub const BULKIN_QCTRL_FS: [u8; 5] = [0x07, 0xcc, 0x4c, 0x18, 0x08];
     /// TX header: two little-endian u32 — [0] = frame length, [1] = flags; bit 31|15 (0x80008000)
     /// asks the part to pad when the transfer would otherwise end exactly on a max packet.
     pub const TX_HDR_LEN: usize = 8;
@@ -649,6 +664,15 @@ pub fn deliver_ax(buf: &[u8]) {
         let h = hdr_off + i * 4;
         let pkt_hdr = u32::from_le_bytes([buf[h], buf[h + 1], buf[h + 2], buf[h + 3]]);
         let pkt_len = ((pkt_hdr >> 16) & 0x1fff) as usize;
+        // USBNET5 M3: the chip's own DROP marker (boot 18: 0x80008000, len 0) is counted and skipped, never a whole-transfer short.
+        if pkt_hdr & ax::RXHDR_DROP_ERR != 0 {
+            RX_CHIP_DROP.fetch_add(1, Ordering::Relaxed);
+            RX_DROP.fetch_add(1, Ordering::Relaxed);
+            rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, pkt_hdr, "chip-drop");
+            rx_dump_once(buf, hdr_off);
+            if pkt_len != 0 && off + pkt_len <= hdr_off { off += (pkt_len + 7) & !7; }
+            continue;
+        }
         if pkt_len < ax::RX_PAD + 14 || off + pkt_len > hdr_off {
             RX_SHORT.fetch_add(1, Ordering::Relaxed);
             ERRORS.fetch_add(1, Ordering::Relaxed);
@@ -677,6 +701,19 @@ static RX_OK: AtomicU64 = AtomicU64::new(0);
 static RX_CRC: AtomicU64 = AtomicU64::new(0);
 static RX_DROP_ERR: AtomicU64 = AtomicU64::new(0);
 static RX_SHORT: AtomicU64 = AtomicU64::new(0);
+static RX_CHIP_DROP: AtomicU64 = AtomicU64::new(0);
+static MEDIUM_RB: AtomicU16 = AtomicU16::new(0);
+static RX_DUMPED: AtomicU8 = AtomicU8::new(0);
+/// Last MEDIUM_STATUS_MODE read back from the part (`re=` is its RECEIVE_EN bit).
+pub fn note_medium_readback(m: u16) { MEDIUM_RB.store(m, Ordering::Relaxed); }
+/// USBNET5: the first chip-dropped transfer's head and trailer bytes, once, so the payload under a DROP header is readable.
+fn rx_dump_once(buf: &[u8], hdr_off: usize) {
+    if RX_DUMPED.swap(1, Ordering::Relaxed) != 0 { return; }
+    let n = buf.len();
+    serial_println!("[usbnet] rx dump head={:02x?}", &buf[..n.min(32)]);
+    let t = hdr_off.min(n);
+    serial_println!("[usbnet] rx dump trailer@{}={:02x?}", t, &buf[t..n.min(t + 16)]);
+}
 static RX_RAW_SEEN: AtomicU64 = AtomicU64::new(0);
 /// M1: print the first dropped transfer's shape once, so a geometry mismatch is named on the bench.
 fn rx_raw_once(len: usize, rx_hdr: u32, pkt_cnt: usize, hdr_off: usize, first_pkt_hdr: u32, reason: &str) {
@@ -697,10 +734,10 @@ fn rollup() {
     }
     REPORTED.store(total, Ordering::Relaxed);
     serial_println!(
-        ":: USBNET: rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} ::",
+        ":: USBNET: rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} rx_chip_drop={} ::",
         RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed),
         RX_DROP.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed),
-        RX_OK.load(Ordering::Relaxed), RX_CRC.load(Ordering::Relaxed), RX_DROP_ERR.load(Ordering::Relaxed), RX_SHORT.load(Ordering::Relaxed)
+        RX_OK.load(Ordering::Relaxed), RX_CRC.load(Ordering::Relaxed), RX_DROP_ERR.load(Ordering::Relaxed), RX_SHORT.load(Ordering::Relaxed), RX_CHIP_DROP.load(Ordering::Relaxed)
     );
 }
 
@@ -808,12 +845,13 @@ pub fn witness(bus: &str, slot: u8) {
     let m = mac();
     let ok = m.iter().any(|&b| b != 0);
     serial_println!(
-        ":: USBNET: bus={} slot={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} speed={} usb={} rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} -> {} ::",
+        ":: USBNET: bus={} slot={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} speed={} usb={} rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} rx_chip_drop={} buf={} re={} -> {} ::",
         bus, slot, m[0], m[1], m[2], m[3], m[4], m[5],
         if LINK.load(Ordering::Relaxed) { "up" } else { "down" }, SPEED_MBPS.load(Ordering::Relaxed), usb_name(),
         RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed),
         RX_DROP.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed),
         RX_OK.load(Ordering::Relaxed), RX_CRC.load(Ordering::Relaxed), RX_DROP_ERR.load(Ordering::Relaxed), RX_SHORT.load(Ordering::Relaxed),
+        RX_CHIP_DROP.load(Ordering::Relaxed), rx_len(), (MEDIUM_RB.load(Ordering::Relaxed) >> 8) & 1,
         if ok { "PASS" } else { "FAIL" }
     );
 }

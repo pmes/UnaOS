@@ -4149,9 +4149,10 @@ pub fn wr_burst_flush() {
     let last = LAST_WRITE.swap(0, Relaxed);
     let wall = last.saturating_sub(first).max(ms).max(1);
     let bytes = blocks * 512;
+    let (fat_w, dirent_w, max_run) = crate::fs::fat::wr_stats_take(); // SDHCMULTI2
     serial_println!(
-        ":: SDHCWR: blocks={} calls={} multi_calls={} bytes={} ms={} busy_ms={} wall_ms={} errs={} kbps={} -> {} ::",
-        blocks, calls, multi, bytes, ms, busy, wall, errs, bytes / wall,
+        ":: SDHCWR: blocks={} calls={} multi_calls={} bytes={} ms={} busy_ms={} wall_ms={} errs={} kbps={} fat_writes={} dirent_writes={} max_run_blocks={} -> {} ::",
+        blocks, calls, multi, bytes, ms, busy, wall, errs, bytes / wall, fat_w, dirent_w, max_run,
         if errs == 0 { "PASS" } else { "FAIL" }
     );
     WIN_BLOCKS.store(0, Relaxed); WIN_CALLS.store(0, Relaxed); WIN_MULTI.store(0, Relaxed);
@@ -4162,6 +4163,8 @@ pub fn wr_burst_flush() {
 /// runs long after a burst ends, so `:: SDHCWR:` appears without a timer).
 #[cfg(feature = "sdw")]
 pub fn wr_census_idle() {
+    let last = wrcensus::LAST_WRITE.load(core::sync::atomic::Ordering::Relaxed);
+    if last != 0 && wrcensus::now_ms().saturating_sub(last) > 1000 { crate::fs::fat::flush_pending_dirent_try(); } // SDHCMULTI2 M2: the deferred dir entry lands inside the burst it belongs to
     let last = wrcensus::LAST_WRITE.load(core::sync::atomic::Ordering::Relaxed);
     if last != 0 && wrcensus::now_ms().saturating_sub(last) > wrcensus::BURST_GAP_MS {
         wr_burst_flush();

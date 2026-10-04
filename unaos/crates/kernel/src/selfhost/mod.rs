@@ -40,6 +40,7 @@
 
 pub mod inflate;
 pub mod tar;
+pub mod extract;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -389,4 +390,8 @@ fn run() {
         census.dirs,
         census.bytes
     );
+
+    // SRCEXTRACT: the payload is good, so register the extraction DRY RUN as `tests srcextract` (runs
+    // on the spot under `tests-at-boot`, deferred behind the `tests` verb on the desktop).
+    crate::tests::register("srcextract", extract::dry_run_fixture);
 }

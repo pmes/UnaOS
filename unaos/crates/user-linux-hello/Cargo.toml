@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# LINUXABI fixture generator: a HOST program that writes a hand-assembled static Linux x86_64 ELF
+# (`write(1, "hello from linux abi\n")` + `exit_group(0)`, raw syscalls) to the path in argv[1]. No binary
+# blob is checked in. Its own workspace root so `./arroyo check` never builds it for the kernel target.
+[workspace]
+
+[package]
+name = "user-linux-hello"
+version = "0.1.0"
+edition = "2021"
+publish = false

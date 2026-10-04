@@ -47,7 +47,7 @@ pub fn blanked() -> bool { BLANKED.load(Ordering::Relaxed) }
 
 fn threshold_ms() -> u64 {
     let o = THRESH_OVERRIDE_MS.load(Ordering::Relaxed);
-    if o != 0 { o } else { IDLE_MIN as u64 * 60_000 }
+    if o != 0 { o } else { idle_min() as u64 * 60_000 }
 }
 
 /// The input seam, called from `pal::pop_event` for every popped event. Stamps the idle clock on any
@@ -163,4 +163,14 @@ fn finish(ok: bool, swallowed: u32) {
         swallowed,
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+/// SETTINGS (R75): runtime idle minutes; `u32::MAX` = not set, use the build value `IDLE_MIN`.
+static IDLE_MIN_RT: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The idle minutes in force (runtime value if set, else the build value). 0 = never.
+pub fn idle_min() -> u32 { let v = IDLE_MIN_RT.load(Ordering::Relaxed); if v == u32::MAX { IDLE_MIN } else { v } }
+/// SETTINGS: set the idle minutes at runtime (0 = never; capped at 1440) and restart the idle clock.
+pub fn set_idle_min(n: u32) {
+    IDLE_MIN_RT.store(n.min(1440), Ordering::Relaxed);
+    LAST_ACTIVITY_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
 }

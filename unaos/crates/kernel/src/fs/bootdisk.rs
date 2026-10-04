@@ -923,7 +923,7 @@ fn aliased_field(disks: &[Disk]) -> String {
 /// `unafs` is passed in rather than probed here so this stays pure: the walk knows which disks carry
 /// a UnaFS volume, and asking the block layer from inside a planner would make it untestable.
 fn plan(disks: &[Disk], unafs: &[bool]) -> (Option<usize>, Vec<Home>) {
-    let root_ix = disks.iter().position(|d| !d.hits.is_empty());
+    let root_ix = pick_root(disks);
     let mut used: Vec<String> = Vec::new();
     let mut others: Vec<Home> = Vec::new();
     for (i, d) in disks.iter().enumerate() {
@@ -997,7 +997,7 @@ fn walk_and_witness() -> Survey {
         }
     }
 
-    let (root_ix, others) = plan(&disks, &unafs);
+    let (root_ix, others) = plan(&disks, &unafs); root_candidates(&disks, root_ix); // SELFINSTALL M3: name what the root walk chose when both the card and the SSD carry UnaOS
     let matching = disks.iter().filter(|d| !d.hits.is_empty()).count();
     let win = window_addr();
 
@@ -1287,7 +1287,7 @@ fn u64le(b: &[u8], o: usize) -> u64 {
 /// forbids ("two of them live at once … is a K4 write-coherence hazard"). So it is neither: the
 /// value is reported on the wire and `/` falls back to the FAT volume the kernel WAS found on.
 fn unafs_state(_src: BlockSource) -> &'static str {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {
         let handle = fat::handle_of(_src);
         if crate::fs::unafs::locate_on(handle).is_err() {
@@ -1300,7 +1300,7 @@ fn unafs_state(_src: BlockSource) -> &'static str {
             _ => "present-on-other-handle",
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
     {
         "unbuilt"
     }
@@ -1315,11 +1315,11 @@ fn unafs_state(_src: BlockSource) -> &'static str {
 /// root_inode / catalog_inode), so a friend's UnaFS volume has no name to be mounted under and
 /// inventing one is what §"The other disks" forbids.
 fn unafs_present(_src: BlockSource) -> bool {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {
         crate::fs::unafs::locate_on(fat::handle_of(_src)).is_ok()
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
     {
         false
     }
@@ -1483,20 +1483,20 @@ pub(crate) fn bind_root(
 ) {
     use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL};
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     let native_root = unafs == "present";
-    // `NativeBackend` is `#[cfg(target_arch = "aarch64")]` in fs/vfs.rs, so on a build that does not
+    // `NativeBackend` is `#[cfg(any(target_arch = "aarch64", feature = "unafs"))]` in fs/vfs.rs (UNAFSX86), so on a build that does not
     // have the type there is no native root to bind whatever the state string says. This cannot
     // change a real boot's answer — [`unafs_state`] returns `"unbuilt"` on those targets — but it
     // makes leg 6's `present` case HONEST on x86_64 (it asserts the FAT fallback there, and says so
     // on the wire) instead of asking for a mount the type system does not have.
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
     let native_root = {
         let _ = unafs;
         false
     };
 
-    #[cfg(all(target_arch = "aarch64", not(feature = "sdwrite")))] // SDWRITE (A60): knob-off keeps this arm verbatim; the twin that samples the BACKEND is folded onto the closing line below.
+    #[cfg(all(any(target_arch = "aarch64", feature = "unafs"), not(feature = "sdwrite")))] // SDWRITE (A60): knob-off keeps this arm verbatim; the twin that samples the BACKEND is folded onto the closing line below.
     if native_root {
         mt.mount("/", alloc::boxed::Box::new(crate::fs::vfs::NativeBackend::new("native")));
         if announce {
@@ -1509,7 +1509,7 @@ pub(crate) fn bind_root(
                 if src.write_veto().is_none() { "yes" } else { "no" }
             );
         }
-    } #[cfg(all(target_arch = "aarch64", feature = "sdwrite"))] if native_root { native_root_mount(mt, src, announce); } // SDWRITE (A60), second finding: the native arm samples the backend it MOUNTS, not the BlockSource. See `native_root_mount` at the file tail.
+    } #[cfg(all(any(target_arch = "aarch64", feature = "unafs"), feature = "sdwrite"))] if native_root { native_root_mount(mt, src, announce); } // SDWRITE (A60), second finding: the native arm samples the backend it MOUNTS, not the BlockSource. See `native_root_mount` at the file tail.
     if !native_root {
         let be = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src);
         let rw = !be.read_only();
@@ -1522,6 +1522,7 @@ pub(crate) fn bind_root(
             );
         }
     }
+    #[cfg(feature = "unafs")] if announce { unafsx86_witness(src, native_root); } // UNAFSX86 (B298): ONE line naming which root this disk got
 
     let boot = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src);
     let boot_rw = !boot.read_only();
@@ -2061,9 +2062,9 @@ pub fn unafsroot_selftest() {
     //   absent, present-on-other-handle, unbuilt -> `/` FAT, on every build.
     // `/boot` is the FAT volume `boot` and `/apps` is the same name rooted at `APPS_DIR`, in all
     // four tables — a native `/` moves neither.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     const ROOT_WHEN_PRESENT: &str = "native";
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
     const ROOT_WHEN_PRESENT: &str = "boot";
     let shape = |state: &str| -> (String, String, String, String, usize) {
         let mut mt = crate::fs::vfs::MountTable::new();
@@ -2146,7 +2147,7 @@ fn assert_admit(
 
 /// SDWRITE: the `rw=` WORD, from a veto. One mapping, used by the native root's announce and driven
 /// BOTH WAYS by leg 8 — so inverting it is a red fixture and not a quiet lie on the wire.
-#[cfg(all(target_arch = "aarch64", feature = "sdwrite"))]
+#[cfg(all(any(target_arch = "aarch64", feature = "unafs"), feature = "sdwrite"))]
 fn native_root_rw_word(veto: Option<&'static str>) -> &'static str {
     if veto.is_none() { "yes" } else { "no" }
 }
@@ -2161,7 +2162,7 @@ fn native_root_rw_word(veto: Option<&'static str>) -> &'static str {
 /// the very backend handed to `mt.mount`, and `NativeBackend::write_veto` forwards the block layer's
 /// answer for the handle the shared unafs mount is riding — so `rw=yes` on `/` is a statement about
 /// the disk, not a hope about it.
-#[cfg(all(target_arch = "aarch64", feature = "sdwrite"))]
+#[cfg(all(any(target_arch = "aarch64", feature = "unafs"), feature = "sdwrite"))]
 fn native_root_mount(mt: &mut crate::fs::vfs::MountTable, src: BlockSource, announce: bool) {
     use crate::fs::vfs::VfsBackend;
     let be = crate::fs::vfs::NativeBackend::new("native");
@@ -2208,15 +2209,15 @@ pub fn sdwrite_posture_selftest() {
     let posture = cfg!(feature = "sdwrite");
 
     // (1) the mapping, driven both ways.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     let map_ok = native_root_rw_word(None) == "yes" && native_root_rw_word(Some("refused")) == "no";
     // `NativeBackend` and its announce are aarch64-only, so on x86 there is no mapping to drive and
     // the leg says so rather than asserting a function that does not exist.
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
     let map_ok = true;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     const MAP_FIELD: &str = "yes/no";
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
     const MAP_FIELD: &str = "n/a(x86)";
 
     // (2) one answer per source — the FAT view and the block view, compared for every source.
@@ -2956,5 +2957,86 @@ pub fn root_pass_fixture() {
         crate::arch::ms().saturating_sub(start),
         start,
         seen
+    );
+}
+
+// =================================================================================================
+// SELFINSTALL M3 (SH-3) — the SSD boot: the root walk names its candidates, and a knob picks between them.
+// File tail: nothing above moves.
+//
+// The walk already finds a SATA root by CONTENT (AHCIBOOT). Once the card has cloned itself onto the
+// internal SSD, BOTH carry this kernel, and `plan` bound whichever the live-source order listed first
+// (the card's rungs before the SATA rung). `[bootdisk] root candidates:` says which disks carried the
+// kernel and which was chosen, so the boot-19/20 capture names it instead of leaving it to inference;
+// `UNAOS_ROOT_PREFER=ahci|sdhc` (cargo features `root-prefer-ahci` / `root-prefer-sdhc`) pins the pick
+// to that source family when it has a hit, and falls back to first-found when it has none.
+// =================================================================================================
+
+/// First disk with a kernel hit — or, under a `root-prefer-*` build, the first such disk of that family.
+fn pick_root(disks: &[Disk]) -> Option<usize> {
+    #[cfg(feature = "root-prefer-ahci")]
+    if let Some(i) = disks.iter().position(|d| !d.hits.is_empty() && d.source.name().starts_with("ahci")) {
+        return Some(i);
+    }
+    #[cfg(feature = "root-prefer-sdhc")]
+    if let Some(i) = disks.iter().position(|d| !d.hits.is_empty() && d.source.name().starts_with("sdhc")) {
+        return Some(i);
+    }
+    disks.iter().position(|d| !d.hits.is_empty())
+}
+
+/// `[bootdisk] root candidates: sdhc=<hit|nohit|absent> ahci=<hit|nohit|absent> usb=<..> chose=<source|none> prefer=<ahci|sdhc|none>`
+fn root_candidates(disks: &[Disk], root_ix: Option<usize>) {
+    fn fam(disks: &[Disk], prefix: &str) -> &'static str {
+        let mut seen = false;
+        for d in disks {
+            if d.source.name().starts_with(prefix) {
+                seen = true;
+                if !d.hits.is_empty() {
+                    return "hit";
+                }
+            }
+        }
+        if seen { "nohit" } else { "absent" }
+    }
+    let prefer = if cfg!(feature = "root-prefer-ahci") {
+        "ahci"
+    } else if cfg!(feature = "root-prefer-sdhc") {
+        "sdhc"
+    } else {
+        "none"
+    };
+    serial_println!(
+        "[bootdisk] root candidates: sdhc={} ahci={} usb={} chose={} prefer={}",
+        fam(disks, "sdhc"),
+        fam(disks, "ahci"),
+        fam(disks, "usb"),
+        root_ix.map_or("none", |i| disks[i].source.name()),
+        prefer
+    );
+}
+
+/// UNAFSX86 (rmbp-ledger B298): the ONE bind-time witness for the native-root decision, printed with the
+/// root announce (once per boot). `root=unafs` when `/` is the disk's UnaFS volume (PASS), `root=fat` when
+/// it fell back to the FAT boot volume (SKIP — a card with no UnaFS partition, or the shared mount riding
+/// another disk; the `[vfs] root mount` line beside it names the source). `blocks`/`gen` are the mounted
+/// volume's superblock block count and last committed root generation, 0 on a FAT root; `home` is where
+/// `users::ensure_home` will put `/home/<user>` (lowercase on UnaFS, the 8.3 `HOME/<NAME>` on FAT).
+/// Decimal only, so one awk reads it.
+#[cfg(feature = "unafs")]
+fn unafsx86_witness(src: BlockSource, native_root: bool) {
+    let (blocks, generation) = if native_root {
+        crate::fs::unafs::with_unafs(|fs| (fs.superblock.block_count, fs.root_generation())).unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+    serial_println!(
+        ":: UNAFSX86: root={} disk={} blocks={} gen={} home={} -> {} ::",
+        if native_root { "unafs" } else { "fat" },
+        src.name(),
+        blocks,
+        generation,
+        if native_root { "/home" } else { "/HOME" },
+        if native_root { "PASS" } else { "SKIP" }
     );
 }

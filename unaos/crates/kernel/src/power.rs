@@ -56,6 +56,8 @@
 /// platform resets, or the failure witness prints and the core parks in `hlt_loop`.
 pub fn reboot() -> ! {
     serial_println!("[pwrreboot] reboot verb invoked — dispatching the platform mechanism");
+    prelude("reboot"); // POWERMENU M1
+    crate::fs::fat::flush_pending_dirent_by("shutdown"); // SDHCMULTI2 M2: a deferred dir entry must not die with the power
     platform_reboot()
 }
 
@@ -64,8 +66,10 @@ pub fn reboot() -> ! {
 /// platform cuts power, or the failure witness prints and the core parks in `hlt_loop`.
 pub fn shutdown() -> ! {
     serial_println!("[pwrshutoff] shutdown verb invoked — dispatching the platform mechanism");
+    prelude("shutdown"); // POWERMENU M1
     #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
     crate::drivers::gpu::kepler_vblank::shutdown_census(); // KVBLANK6 — the kept-live vector's last census
+    crate::fs::fat::flush_pending_dirent_by("shutdown"); // SDHCMULTI2 M2
     platform_shutdown()
 }
 
@@ -116,6 +120,7 @@ fn platform_reboot() -> ! {
     // staging ring by a contended lock, and the reset takes the machine microseconds from here — a
     // deferred line is not a lost one only while a next print exists, and past this call there is
     // none. Flush the whole ring, uncapped, through the raw lock-free writer, then say so.
+    going("reboot"); // POWERMENU M1
     crate::serial_ring::power_drain("pwrreboot");
     let ret = psci_call(PSCI_SYSTEM_RESET);
     // A returning SYSTEM_RESET is a refusal (NOT_SUPPORTED and friends are negative per PSCI).
@@ -135,6 +140,7 @@ fn platform_shutdown() -> ! {
     // PWRDRAIN (SO31, trunk queue §1 (f)): render13 boot 1 was dropping 5 331 lines into a saturated
     // ring; on that boot every line still staged when SYSTEM_OFF landed died with the power, this
     // verb's own witness included. Flush the ring whole, uncapped, before the SMC.
+    going("shutdown"); // POWERMENU M1
     crate::serial_ring::power_drain("pwrshutoff");
     let ret = psci_call(PSCI_SYSTEM_OFF);
     serial_println!(
@@ -190,6 +196,7 @@ fn platform_reboot() -> ! {
     // still be pumped (`acpi_power::reboot` masks them as its second statement, and a masked
     // `hlt()` inside the TX pump would never wake).
     ftdi_flush_witness("pwrreboot");
+    going("reboot"); // POWERMENU M1 — the last witness before the firmware call
     crate::arch::acpi_power::reboot();
 }
 
@@ -251,6 +258,7 @@ fn platform_shutdown() -> ! {
     // That fold is also why `video/crystal.rs`'s Shut Down and `video/instgui.rs` — which call
     // `poweroff` DIRECTLY, bypassing this function entirely — now reach the cable at all.
     ftdi_flush_witness("pwrshutoff");
+    going("shutdown"); // POWERMENU M1 — the last witness before the firmware call
     crate::arch::acpi_power::poweroff();
 }
 
@@ -287,6 +295,7 @@ pub fn crystal_restart() -> ! {
     // line most likely to be staged — a desktop press happens with the compositor printing. Flush
     // before the SMC. The witness rides the `[pwrreboot]` family, not `[crystal]`: it is a statement
     // about the TRANSPORT, and a reader grepping `ring drained` wants both verbs in one tally.
+    going("reboot"); // POWERMENU M1
     crate::serial_ring::power_drain("pwrreboot");
     let ret = psci_call(PSCI_SYSTEM_RESET);
     serial_println!(
@@ -303,6 +312,7 @@ pub fn crystal_restart() -> ! {
 pub fn crystal_shutdown() -> ! {
     serial_println!("[crystal] verb=shutdown -> PSCI SYSTEM_OFF");
     // PWRDRAIN: trunk queue §1 (f) names this call site by name. Flush the ring whole before the SMC.
+    going("shutdown"); // POWERMENU M1
     crate::serial_ring::power_drain("pwrshutoff");
     let ret = psci_call(PSCI_SYSTEM_OFF);
     serial_println!(
@@ -310,4 +320,34 @@ pub fn crystal_shutdown() -> ! {
         ret
     );
     crate::hlt_loop();
+}
+
+// ── POWERMENU (R75) M1 — the CLEAN prelude every power verb runs before the firmware call ─────────
+//
+// Order: flush the deferred FAT dirent (SDHCMULTI2) -> close every window (LOGOUTDESK's sweep: the apps' own
+// teardown paths run while the machine is still alive) -> stop the HDA output streams (no pop / no DMA into a
+// powering-down chipset) -> [`going`] prints the one witness line immediately before the ACPI/PSCI call, so it is the
+// LAST `:: POWER:` line and the firmware-side drain lines follow it.
+static PRE_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PRE_FLUSH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static PRE_HDA: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Run the clean prelude for `action` (`"shutdown"` / `"reboot"`). Idempotent enough: a second call finds nothing to do.
+pub fn prelude(action: &str) {
+    use core::sync::atomic::Ordering;
+    let _ = action;
+    let flushed = crate::fs::fat::dirent_pending();
+    crate::fs::fat::flush_pending_dirent_by("shutdown");
+    PRE_FLUSH.store(flushed, Ordering::Relaxed);
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    { let (n, _k) = crate::video::wm::close_all_furniture(); PRE_WIN.store(n as u32, Ordering::Relaxed); }
+    #[cfg(all(target_arch = "x86_64", feature = "hda"))]
+    PRE_HDA.store(crate::drivers::hda::powerdown::stop(), Ordering::Relaxed);
+}
+
+/// The witness: printed once, right before the firmware call.
+pub fn going(action: &str) {
+    use core::sync::atomic::Ordering;
+    serial_println!(":: POWER: action={} windows_closed={} flushed={} hda_stopped={} -> going ::", action,
+        PRE_WIN.load(Ordering::Relaxed), PRE_FLUSH.load(Ordering::Relaxed) as u8, PRE_HDA.load(Ordering::Relaxed) as u8);
 }

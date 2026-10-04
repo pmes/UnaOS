@@ -864,6 +864,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
 /// ACL row (LEDGER SO35); the FILES a program creates inside it are owned through the SYS_OPEN
 /// owner/grants rows exactly as any private create, and that is what the home ACL proof exercises.
 pub fn ensure_home(name: &[u8]) -> Result<&'static str, UsersError> {
+    #[cfg(feature = "unafs")] if let Some(v) = ensure_home_native(name) { return v; } // UNAFSX86 (B298): a UnaFS `/` owns /home; the FAT body below is the fallback
     let fs = store_mount().map_err(|_| UsersError::Volume)?;
     let home_fc = match fs.locate_in_dir(0, "HOME") {
         Ok((de, _, _)) if de.is_dir => de.first_cluster(),
@@ -3038,7 +3039,7 @@ fn stage_publish(st: BootStage, why: &str) {
         if st == BootStage::Desktop && why != "store-has-users" {
             crate::video::crystal::login::installer_release();
         }
-        crate::splash::hold_release("store-loaded"); // SPLASHX86: the stage is known and its first window is up beneath — the glass is handed over
+        if st == BootStage::Desktop { crate::splash::hold_release("first-screen"); } // SPLASH2 M3: the desktop furniture has composited above (BAR_HELD composite) — hand the glass over; setter / login screens release from `login::open_as` AFTER their first paint (5 s `hold_service` bound stays)
     }
 }
 
@@ -3145,15 +3146,7 @@ pub fn installer_create_user(name: &[u8], password: &[u8]) -> Result<(), &'stati
     if boot_stage() != BootStage::CreateUser {
         return Err("not the create-user stage");
     }
-    if !name_ok(name) {
-        return Err("Name: a-z 0-9 _ - , letter first, 8 max");
-    }
-    if name == ROOT_NAME {
-        return Err("root is taken");
-    }
-    if password.is_empty() {
-        return Err("Type a password");
-    }
+    create_user_rules(name, password)?;
     let made = adduser_commit(name).map_err(|_| "Could not create the user")?;
     if set_first_password(name, password).is_err() {
         serial_println!("[login] installer: create-user user={} row made but the password was NOT written (the form stays)", wire_name(name));
@@ -3199,3 +3192,80 @@ fn boot2_login_entry() { crate::video::crystal::login::boot2_fixture(b"una", b"c
 /// LOGINFLOW2 M2 — LOGOUTUI M4: the refused-logout alert and the accepted Log Out round trip.
 #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn logout_entry() { crate::video::crystal::login::logout_fixture(b"una", b"correct-horse"); }
+
+/// SETTINGS2 (R75): the create-user form's validation, shared with the Settings Users tab (the same
+/// words the installer form shows). `Ok` = name and password are acceptable to create with.
+pub fn create_user_rules(name: &[u8], password: &[u8]) -> Result<(), &'static str> {
+    if !name_ok(name) {
+        return Err("Name: a-z 0-9 _ - , letter first, 8 max");
+    }
+    if name == ROOT_NAME {
+        return Err("root is taken");
+    }
+    if password.is_empty() {
+        return Err("Type a password");
+    }
+    Ok(())
+}
+
+/// SETTINGS2: the reason the last `users`/`deluser` verb ended with (`listed`, `deleted`, `self`, `root-row`, `last-user`, ...).
+pub fn usermgmt_last() -> &'static str {
+    *USERMGMT_LAST.lock()
+}
+
+/// SETTINGS2: may the set-password screen WRITE `name`'s password? An unset row (the first choice), any row
+/// from the root session (Reset password), or the session's own row (Change password).
+pub fn setpw_allowed(name: &[u8]) -> bool {
+    if password_unset(name) == Some(true) || root_session() {
+        return true;
+    }
+    let mut nb = [0u8; NAME_MAX];
+    matches!(whoami(&mut nb), Some(n) if &nb[..n] == name)
+}
+
+/// SETTINGS2: write `name`'s password under [`setpw_allowed`] (the screen's entry).
+pub fn set_password_checked(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
+    if !setpw_allowed(name) {
+        return Err(UsersError::Refused);
+    }
+    set_password(name, password)
+}
+
+/// UNAFSX86 (rmbp-ledger B298): `/home/<name>` on whichever backend owns `/`, through the mount table.
+///
+/// `None` = the root is NOT the native UnaFS volume (a FAT-only card, or no root at all) — the caller
+/// keeps the FAT 8.3 path (`HOME/<NAME>`), so a card with no UnaFS partition boots exactly as before.
+/// `Some(..)` = the root is native: `/home` and `/home/<name>` are created as directories through
+/// `MountTable::create` (idempotent), lowercase because `name_ok` admits only lowercase. THE CONTRACT
+/// PREFS and every later home consumer rely on: `/home/<user>` is the same string on both roots
+/// (`home_of`), and the mount table — not the caller — decides which medium it lands on.
+#[cfg(feature = "unafs")]
+fn ensure_home_native(name: &[u8]) -> Option<Result<&'static str, UsersError>> {
+    use crate::fs::vfs::{NodeKind, VfsError, KERNEL_PRINCIPAL};
+    let mt = crate::shell::vfs_mount_table();
+    if mt.volume_name("/").ok()? != "native" {
+        return None;
+    }
+    let leaf = match core::str::from_utf8(name) {
+        Ok(l) => l,
+        Err(_) => return Some(Err(UsersError::BadName)),
+    };
+    let child = alloc::format!("{}/{}", HOME_ROOT, leaf);
+    let mut verdict = "exists";
+    for p in [HOME_ROOT, child.as_str()] {
+        match mt.stat(p) {
+            Ok(st) if st.kind == NodeKind::Dir => {}
+            Ok(_) => return Some(Err(UsersError::Volume)),
+            Err(VfsError::NoSuchPath) => {
+                if mt.create(p, NodeKind::Dir, KERNEL_PRINCIPAL).is_err() {
+                    serial_println!("[users] home=/home/{} NOT created reason=native-create volume=unafs", leaf);
+                    return Some(Err(UsersError::Volume));
+                }
+                verdict = "created";
+            }
+            Err(_) => return Some(Err(UsersError::Volume)),
+        }
+    }
+    serial_println!("[users] home=/home/{} {} volume=unafs", leaf, verdict);
+    Some(Ok(verdict))
+}

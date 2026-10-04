@@ -3108,11 +3108,20 @@ fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: boo
         anchored as u8,
         core::str::from_utf8(c).unwrap_or("?????"),
         // The anchor's real source: `sntp` (a reply), `verb` (`date -s`), `placeholder` (the bar shows a
-        // time with NO anchor behind it — a bug the line now names; there is no RTC source in `ClockSource`).
+        // time with NO anchor behind it — a bug the line now names; `rtc` = the CMOS clock read at boot, RTCCLOCK).
         match crate::clock::try_source() {
             crate::clock::ClockSource::Sntp { .. } => "sntp",
             crate::clock::ClockSource::Manual => "verb",
+            crate::clock::ClockSource::Rtc => "rtc",
             crate::clock::ClockSource::Unset => if anchored { "placeholder" } else { "none" },
         }
     );
+}
+
+/// POWERMENU (R75) M2 — the battery item's PRESS cell on the panel (`None` when the bar is off, there is no room, or there is no battery source).
+pub fn batt_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
+    super::status::bar_item()?;
+    let (rx, ry, w, h) = strip_rect(pw, ph)?;
+    let x0 = batt_slot(w)?;
+    Some((rx + x0, ry, BATT_ITEM_W, h))
 }

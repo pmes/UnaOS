@@ -525,4 +525,8 @@ FORBID :: SNTP: .* -> FAIL ::
 # `serial_line::census_poll` (riding `serial_ring::mirror_service`, every lane, once a second): the
 # line-level lock's census. PASS = it printed; `unaos/scripts/serial-merged.sh <log>` is the check on a
 # capture (boot 17: 197 merged lines; boot 18 should be 0).
-REQUIRE :: SERIAL: lines=[1-9]\d* merged_fixed=\d+ trunc=\d+ deferred=\d+ defer_lost=\d+ bypass=\d+ -> PASS ::
+REQUIRE :: SERIAL: lines=[1-9]\d* merged_fixed=\d+ trunc=0 deferred=\d+ defer_lost=\d+ bypass=\d+ by_source=\[emit:\d+,user:\d+,raw:\d+,ring:\d+\] -> PASS ::
+
+# RTCCLOCK (R75): QEMU has a CMOS RTC; the boot witness prints and passes (consistent reads, a possible date).
+REQUIRE :: RTC: y=
+FORBID :: RTC: .* -> FAIL ::
