@@ -25865,26 +25865,6 @@ fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     if nr == una_abi::SYS_STAT { 0 } else { out.len() as i64 }
 }
 
-// ==========================================================================================
-// VEINCORE (B304): this arch's thin half of `crate::vein_bus` — the kernel-as-caller inject (the
-// `vein rsp` shell line) and the `tests vein` fixture over the SAME BANDY3 ops/fixture tables.
-// =================================================================================================
-#[cfg(feature = "vein")]
-pub fn vein_inject(verb: u8, body: &[u8]) -> i64 {
-    bus_sem_init_once();
-    crate::bus_route::inject(&BUSREG_OPS, verb, body)
-}
-#[cfg(feature = "vein")]
-pub fn vein_owned(verb: u8) -> bool {
-    crate::bus_route::is_owned(&BUSREG_OPS, verb)
-}
-/// `tests vein` — the chat-verb witness on aarch64.
-#[cfg(feature = "vein")]
-pub fn vein_selftest() {
-    bus_sem_init_once();
-    crate::vein_bus::selftest(&BUSREG_FX);
-}
-
 /// NETRING3 M1 (B306): `SYS_GETRANDOM(buf, len) -> count / -errno` — the aarch64 twin (RNDR-seeded where
 /// the CPU has it, else jitter; the seed source is said on the wire).
 #[cfg(feature = "netring3")]

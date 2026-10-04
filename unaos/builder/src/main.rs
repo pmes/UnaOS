@@ -735,8 +735,6 @@ fn main() {
     if std::env::var("UNAOS_LINUXABI").is_ok() { feats.push("linuxabi"); }
     // BANDY3: UNAOS_BUSREG=1 arms fulfiller registration on the bus wire. Kept in sync with arroyo.
     if std::env::var("UNAOS_BUSREG").is_ok() { feats.push("busreg"); }
-    // VEINCORE (B304): UNAOS_VEIN=1 arms the chat verbs' kernel relay plumbing (`vein` verb, `tests vein`); implies busreg. Kept in sync with arroyo.
-    if std::env::var("UNAOS_VEIN").is_ok() { feats.push("vein"); }
     // LUMENBIN: UNAOS_LUMEN=1 arms the lumen dock pin by default and `tests lumen`. Kept in sync with arroyo.
     if std::env::var("UNAOS_LUMEN").is_ok() { feats.push("lumen"); }
     // NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM / SYS_RESOLVE and `tests net`. Kept in sync with arroyo.
@@ -1003,23 +1001,17 @@ fn main() {
         println!("   BIG: target/BIG-X86.ELF absent — ESP has no BIG.BIN (run via ./arroyo esp-x86)");
     }
 
-    // VEINCORE (B304): the chat fulfiller (crates/user-vein → target/VEIN-X86.ELF by arroyo's
-    // build_user_vein_x86), staged as APPS/VEIN.BIN — `bg /apps/VEIN.BIN` registers the chat verbs 130..=133.
-    let vein_elf = target_dir.join("VEIN-X86.ELF");
-    if vein_elf.exists() {
-        std::fs::copy(&vein_elf, esp_apps.join("VEIN.BIN")).unwrap();
-        println!("   VEIN: copied VEIN.BIN into APPS/ on the ESP (bg /apps/VEIN.BIN)");
-    } else {
-        println!("   VEIN: target/VEIN-X86.ELF absent — ESP has no VEIN.BIN (run via ./arroyo esp-x86)");
-    // LUMENBIN (B305): the ring-3 chat window (crates/user-lumen, built by arroyo's build_user_lumen_x86 to
-    // target/LUMEN-X86.ELF), staged as APPS/LUMEN.BIN beside PREFS.BIN — `lumen` (= `bg /apps/LUMEN.BIN`)
-    // opens it; it speaks the chat verbs VEIN.BIN fulfils.
+    // LUMENAPP (B323, R82): Lumen is ONE program — the ring-3 chat app that talks to the provider itself
+    // (crates/user-lumen linking vein_core + vein_ring3; built by arroyo's build_user_lumen_x86 to
+    // target/LUMEN-X86.ELF), staged as APPS/LUMEN.ELF. VEIN.BIN (the retired chat daemon) is gone. (This
+    // block also restores the two closing braces the merge10 fold dropped after the VEIN and LUMEN arms.)
     let lumen_elf = target_dir.join("LUMEN-X86.ELF");
     if lumen_elf.exists() {
-        std::fs::copy(&lumen_elf, esp_apps.join("LUMEN.BIN")).unwrap();
-        println!("   LUMEN: copied LUMEN.BIN into APPS/ on the ESP (lumen / bg /apps/LUMEN.BIN)");
+        std::fs::copy(&lumen_elf, esp_apps.join("LUMEN.ELF")).unwrap();
+        println!("   LUMEN: copied LUMEN.ELF into APPS/ on the ESP (lumen)");
     } else {
-        println!("   LUMEN: target/LUMEN-X86.ELF absent — ESP has no LUMEN.BIN (run via ./arroyo esp-x86)");
+        println!("   LUMEN: target/LUMEN-X86.ELF absent — ESP has no LUMEN.ELF (run via ./arroyo esp-x86)");
+    }
     // NETRING3 M3 (B306): the ring-3 network client (crates/user-net, built by arroyo's build_user_net_x86 to
     // target/NET-X86.ELF), staged as APPS/NET.BIN — `bg /apps/NET.BIN` resolves, connects :80 and prints
     // the `:: NETRING3:` verdict (UNAOS_NETRING3=1).
@@ -1090,10 +1082,8 @@ fn main() {
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
         // BANDY3 M3: the prefs fulfiller rides the DATA volume too — `bg /apps/PREFS.BIN` reads it there.
         (target_dir.join("PREFS-X86.ELF"), "PREFS.BIN"),
-        // VEINCORE (B304): the chat fulfiller rides the DATA volume too.
-        (target_dir.join("VEIN-X86.ELF"), "VEIN.BIN"),
-        // LUMENBIN: the chat window rides the DATA volume too — `lumen` reads it there.
-        (target_dir.join("LUMEN-X86.ELF"), "LUMEN.BIN"),
+        // LUMENAPP (B323): the one-program chat app rides the DATA volume too — `lumen` reads it there.
+        (target_dir.join("LUMEN-X86.ELF"), "LUMEN.ELF"),
         // NETRING3 M3: the network client rides the DATA volume too — `bg /apps/NET.BIN` reads it there.
         (target_dir.join("NET-X86.ELF"), "NET.BIN"),
         // RING3WIN (B316): the ELF-window proof program — `tests ring3win` reads /apps/BIG.BIN there.

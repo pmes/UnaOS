@@ -447,7 +447,6 @@ dependencies = [
  "unafs",
  "unaos-boot-info",
  "unaos-xusb-fw",
- "vein_core",
  "volatile 0.6.1",
  "x86_64",
 ]
@@ -467,10 +466,6 @@ name = "unty"
 version = "0.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
-
-[[package]]
-name = "vein_core"
-version = "0.1.0"
 
 [[package]]
 name = "volatile"

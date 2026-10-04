@@ -3726,13 +3726,6 @@ busreg = []
 # `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 lumen = []
 
-# VEINCORE (rmbp-ledger B304; docs/dev/evidence/rmbp-1004/VEINCORE.md): UNAOS_VEIN=1 arms the CHAT verbs'
-# kernel side — relay plumbing only (the verbs are OWNED by ring 3: APPS/VEIN.BIN): `bus_route::inject`
-# reached from the `vein` shell verb (`vein rsp …`, the bench relay companion's answer line) and the
-# `tests vein` fixture. Implies `busreg`. Off: nothing of crate::vein_bus is compiled. Kept in sync with
-# `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
-vein = ["busreg"]
-
 # NETRING3 (rmbp-ledger B306): UNAOS_NETRING3=1 arms ring-3 entropy and name resolution — `SYS_GETRANDOM`
 # (56, the SHA-256 DRBG on top of `rand.rs`, whose cfg and `hash`'s widen to this feature) and
 # `SYS_RESOLVE` (57, `smolnet::resolve` on x86; -ENODEV on aarch64), `crate::netring3` and `tests net`.
@@ -3775,9 +3768,6 @@ midden_core = { path = "../../libs/sys/midden_core", default-features = false }
 # PREFS (rmbp-ledger B300): Principia's shared preference core — value model + TOML subset codec, the
 # same crate `handlers/principia` links. no_std + alloc, zero deps; arch-neutral.
 prefs_core = { path = "../../libs/sys/prefs_core" }
-# VEINCORE (B304): Vein's shared no_std core — the chat bus codec the `vein` shell verb and `tests vein`
-# use (the same crate VEIN.BIN and handlers/vein link). Zero deps; only reached under feature `vein`.
-vein_core = { path = "../../libs/sys/vein_core" }
 # SELFINSTALL2 (rmbp-ledger B310): Amber Bytes' shared disk-layout core — GPT encode/decode, the partition
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).
