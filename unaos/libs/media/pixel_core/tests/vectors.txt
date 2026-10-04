@@ -217,3 +217,14 @@ b4c79cb8ffd2f1c096af27f9d82b5feaa0aa2cb049c791e0f6251de0435066e5 bmp/rgb32.bmp h
 4c1189e3a039b1e5aae6347024684937c495a5736a3c309dc7c2e3c161f89751 bmp/rgb32bf.bmp https://raw.githubusercontent.com/image-rs/image/main/tests/images/bmp/images/rgb32bf.bmp
 257e0127fa0ccdb6eb8381338dda0fb692b2ea4d38775f1aed56dfdccaed2ab4 bmp/rgba32.bmp https://raw.githubusercontent.com/image-rs/image/main/tests/images/bmp/images/rgba32.bmp
 1d2183466e05c768b5a9d2ce5d132d72db2272bb331c7b27560d24f197f4165e bmp/rgba32abf.bmp https://raw.githubusercontent.com/image-rs/image/main/tests/images/bmp/images/rgba32abf.bmp
+# WebP: image-rs/image-webp test images (libwebp gallery2 lossless+alpha, palette regressions, one lossy for the refusal).
+49a902b9c35bd2031bf26234c59ff369dd3ae18a3b58247285104a23346ba2d4 webp/1_webp_ll.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/1_webp_ll.webp
+67d332b637d19997ca95359099067205ce28226d15320ae8f17da51e4f814c95 webp/2_webp_ll.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/2_webp_ll.webp
+764f01c6f3e50ce4002004073cc01dc9960882925cdf775a4ddb000c8ec74bf2 webp/3_webp_ll.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/3_webp_ll.webp
+b3ad6ddb0c1e64557dfdd31721fcbfb5bdaac5eff5a77f15c105881e0b7f2579 webp/4_webp_ll.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/4_webp_ll.webp
+6853c4f14122fe2ad8bf6926f5e294a0528c60f20f3dcbd9e9b781d6260a8850 webp/5_webp_ll.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/5_webp_ll.webp
+5d1088fc3cb9ef8061aaca6ff5bd15ef98bcf23d00722dbf2311aa155dcc2c67 webp/color_index.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/regression/color_index.webp
+1ea4a670f30492b93ea2a008edcebf4a4d9c9354a8b7f5408871a063b5ec708c webp/lossless_indexed_1bit_palette.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/regression/lossless_indexed_1bit_palette.webp
+e6ba9f187b5095413cc774d9bf97c0ef03732ad979ea4b7184ec6e1a86d43a4f webp/lossless_indexed_2bit_palette.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/regression/lossless_indexed_2bit_palette.webp
+ee85a860cbc3ecfa7177db9ae0d49811be0a05ff6dc1167b1fdb9984bf9890c1 webp/lossless_indexed_4bit_palette.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/regression/lossless_indexed_4bit_palette.webp
+4a5afeaff8483923da964bc7896f02d0283e8bff99b5b8f82a31ae3214dab1d0 webp/lossy_gallery1_1.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery1/1.webp

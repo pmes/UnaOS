@@ -131,3 +131,27 @@ byte-identical to their PNG source — whose decode is itself Chromium-exact.
 Pinned digests now cover 89 Chromium-exact files (28 JPEG, 40 GIF incl. every frame, 21 BMP).
 
 Not decoded: GIF Plain Text rendering (no browser renders it either); BMP 2/64-bit, OS/2 Huffman/RLE24, V5 ICC.
+
+## M4 — WebP lossless (VP8L) and `tools/pixel-check`
+
+RFC 9649: §2 RIFF (simple `VP8L` and extended `VP8X` files), §3.2 header, §4 all four transforms (predictor:
+14 modes + border + rightmost-TR rule; colour: signed 3.5 deltas; subtract-green; colour indexing with
+palette delta coding and 1/2/4-bit bundling), §5.2.2 LZ77 with the 120-entry distance map and prefix-coded
+lengths/distances, §5.2.3 colour cache, §6.2.1 simple + normal prefix codes (code-length code, `max_symbol`),
+§6.2.2 meta prefix codes / entropy image.
+
+KATs: 9 VP8L files from image-rs/image-webp (libwebp gallery2 lossless+alpha ×5, palette 1/2/4-bit ×3,
+`color_index`) — **9/9 byte-identical to image-webp** (lossless has exactly one right answer); `lossy` VP8 is
+refused by name. Chromium: the 3 opaque palette files exact; on the 6 translucent ones every OPAQUE pixel is
+exact and translucent pixels differ by ≤ 1 after compositing (Chromium decodes WebP to premultiplied
+storage with libwebp's fast multiply; the frame oracle's canvas readback shows the same rounding).
+Plus 4 lossless files written by Chromium's own encoder (`toDataURL('image/webp', 1.0)`) from opaque
+sources — **4/4 exact against Chromium's decode**; three (< 200 KB each) are committed under
+`tests/fixtures/webp/` and pinned. The one inflater also gets its own KAT: CPython gzip/zlib level-9 streams
+inflate to the exact text, a flipped trailer is refused (`TrailerMismatch`/`AdlerMismatch`).
+
+`tools/pixel-check` (pixel_core only, no other crate): `pixel-check <in> [out.png]` decodes anything to an
+RGBA PNG for eyes; `--frames` writes each composited frame; `--compare` / `--compare-raw` score the two
+Chromium oracles; `--digest` prints the pinned KAT digest.
+
+Not decoded: lossy VP8 (RFC 6386 intra decoder + ALPH) — OWED; animation (ANIM/ANMF) — OWED.

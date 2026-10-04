@@ -13,7 +13,11 @@ pub fn vdir() -> PathBuf {
 
 /// Read a cached vector, or `None` (the test then prints SKIP: offline / not fetched).
 pub fn load(rel: &str) -> Option<Vec<u8>> {
-    let p = vdir().join(rel);
+    // `fixtures/…` are small committed files (generated, no public URL); everything else is fetched.
+    let p = match rel.strip_prefix("fixtures/") {
+        Some(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join(rel),
+        None => vdir().join(rel),
+    };
     match std::fs::read(&p) {
         Ok(b) => Some(b),
         Err(_) => {

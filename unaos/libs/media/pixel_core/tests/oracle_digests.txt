@@ -90,3 +90,9 @@ gif/nul-application-extension.gif 1x1 ffffffff plain
 gif/plain-text.gif 40x8 0e7977b7 plain
 gif/sample_1.gif 10x10 c33b036b plain
 gif/transparent.gif 2x2 4fd49817 plain
+webp/lossless_indexed_1bit_palette.webp 230x128 08ef5d34 plain
+webp/lossless_indexed_2bit_palette.webp 230x128 6f8d670d plain
+webp/lossless_indexed_4bit_palette.webp 500x300 680ef942 plain
+fixtures/webp/cat-ll.webp 320x240 826206a5 plain
+fixtures/webp/grumpycat-ll.webp 320x180 ce9320a6 plain
+fixtures/webp/pal8v5-ll.webp 127x64 0dc3db86 plain
