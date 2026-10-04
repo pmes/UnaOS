@@ -210,7 +210,7 @@ pub fn exec_reset() {
 }
 
 /// Free `cr3`'s slot (where `FS_TAB` is cleared: `gc`, session end).
-pub fn release(cr3: u64) {
+pub fn release_slot(cr3: u64) {
     for s in TAB.iter() {
         if s.key.load(Ordering::Acquire) == cr3 {
             s.key.store(0, Ordering::Release);

@@ -869,7 +869,7 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
                 lp.asp.free_frames();
             } // else: leak the space rather than free tables a still-live task may be running on
             fs_tab_clear(i.pml4);
-            fpu::release(i.pml4); // LINUXABI3
+            fpu::release_slot(i.pml4); // LINUXABI3
         }
     }
     proc::reset_session();

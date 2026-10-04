@@ -3796,6 +3796,8 @@ build_user_vein_x86() {
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/VEIN-X86.ELF" | tr -d ' ')"
     [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VEIN-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 Vein chat fulfiller program: VEIN-X86.ELF (${psz} B)${COLOR_RESET}"
+}
+
 # LUMENBIN (B305): build the x86_64 static ELF64 ring-3 CHAT WINDOW (crates/user-lumen → target/LUMEN-X86.ELF),
 # staged as APPS/LUMEN.BIN by the builder. The exact shape of build_user_prefs_x86 above (same linker-script
 # SHAPE, same four assertions, same explicit --target). Built on every x86 media run like PREFS.BIN: the
@@ -3820,6 +3822,8 @@ build_user_lumen_x86() {
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" | tr -d ' ')"
     [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 Lumen chat window program: LUMEN-X86.ELF (${psz} B)${COLOR_RESET}"
+}
+
 # NETRING3 M3 (B306): build the x86_64 static ELF64 ring-3 network client (crates/user-net → target/NET-X86.ELF),
 # staged as APPS/NET.BIN by the builder. The exact shape of build_user_prefs_x86 above. NET.BIN draws entropy,
 # resolves api.anthropic.com, connects :80 and prints the status line (UNAOS_NETRING3=1; knob off the two new
@@ -3843,6 +3847,8 @@ build_user_net_x86() {
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/NET-X86.ELF" | tr -d ' ')"
     [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (${psz} B)${COLOR_RESET}"
+}
+
 # RING3WIN M4 (B316): build BIG.BIN — the ELF-window proof program (crates/user-big → target/BIG-X86.ELF),
 # staged as APPS/BIG.BIN by the builder; `tests ring3win` runs it. x86 only. Unlike its siblings it links at
 # the ABSOLUTE ELF-window VA (crates/user-big/user-big-x86.ld, no PHDRS) and declares a 256 KiB stack with
@@ -5334,6 +5340,7 @@ USER_CHECK_MATRIX=(
   "user-vug      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-pulse    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-prefs    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-big      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-vein     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-vein/user-vein-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"

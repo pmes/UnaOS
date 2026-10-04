@@ -137,7 +137,7 @@ pub fn gc() {
                 lp.fds.clear(); // pipe EOF for the peers
                 lp.asp.free_frames();
                 super::fs_tab_clear(i.pml4);
-                super::fpu::release(i.pml4); // LINUXABI3
+                super::fpu::release_slot(i.pml4); // LINUXABI3
                 i.freed.store(true, Ordering::Release);
             }
         }
