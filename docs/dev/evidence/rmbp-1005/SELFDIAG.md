@@ -45,7 +45,7 @@ selfhost tree; (4) the rebuild and reboot need a native toolchain (SH-5) that do
   `unaos/crates/kernel/src/...`), and asks for one unified diff. No tree ⇒ it says so and names the verb:
   `src extract`.
 - **M3 APPLY + RECORD** — the diff is applied to the selfhost tree (resolve every hunk of every file
-  first; any mismatch refuses the whole answer; then stream each file to `<file>.dgn`, copy back, unlink);
+  first; any mismatch refuses the whole answer; then stream each file to `<file>~dgn`, copy back, unlink);
   `/var/log/diag.<n>.md` records the prompt, the answer, applied/refused and a `fails:` line the NEXT boot's
   kernel reads to append `## next boot <m>` with each tag's new verdict (`fixed` / `still-failing` /
   `unseen`). Wire: `:: SELFDIAG: fails=<n> asked=<n> patched=<n> refused=<n> -> PASS ::`. The rebuild and

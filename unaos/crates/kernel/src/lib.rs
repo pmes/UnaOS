@@ -276,3 +276,5 @@ pub mod execname;
 // SYS_PATH_READ/WRITE fulfilment and `tests selfdiag` (`selfdiag`). Tail statements, so no existing line moves.
 #[cfg(feature = "selfdiag")]
 pub mod bootwit;
+#[cfg(feature = "selfdiag")]
+pub mod selfdiag;
