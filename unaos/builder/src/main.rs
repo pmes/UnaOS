@@ -1011,6 +1011,7 @@ fn main() {
         println!("   VEIN: copied VEIN.BIN into APPS/ on the ESP (bg /apps/VEIN.BIN)");
     } else {
         println!("   VEIN: target/VEIN-X86.ELF absent — ESP has no VEIN.BIN (run via ./arroyo esp-x86)");
+    }
     // LUMENBIN (B305): the ring-3 chat window (crates/user-lumen, built by arroyo's build_user_lumen_x86 to
     // target/LUMEN-X86.ELF), staged as APPS/LUMEN.BIN beside PREFS.BIN — `lumen` (= `bg /apps/LUMEN.BIN`)
     // opens it; it speaks the chat verbs VEIN.BIN fulfils.
@@ -1020,6 +1021,7 @@ fn main() {
         println!("   LUMEN: copied LUMEN.BIN into APPS/ on the ESP (lumen / bg /apps/LUMEN.BIN)");
     } else {
         println!("   LUMEN: target/LUMEN-X86.ELF absent — ESP has no LUMEN.BIN (run via ./arroyo esp-x86)");
+    }
     // NETRING3 M3 (B306): the ring-3 network client (crates/user-net, built by arroyo's build_user_net_x86 to
     // target/NET-X86.ELF), staged as APPS/NET.BIN — `bg /apps/NET.BIN` resolves, connects :80 and prints
     // the `:: NETRING3:` verdict (UNAOS_NETRING3=1).
