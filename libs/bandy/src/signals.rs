@@ -81,6 +81,10 @@ pub enum SMessage {
     StorageQuery {
         receipt_id: u64,
         embedding: Vec<f32>,
+        /// EMBED (B317): the `<provider>/<model>` that made `embedding`; the vault compares it only
+        /// with vectors tagged the same. Empty (an older sender) compares every vector.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        embed_model: String,
     },
     StorageQueryResult {
         receipt_id: u64,
@@ -96,6 +100,9 @@ pub enum SMessage {
         timestamp: String,
         embedding: Vec<f32>,
         memory_type: String,
+        /// EMBED (B317): stored as `una:embed-model` beside the vector (empty = no vector written).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        embed_model: String,
     },
     StorageSaveResult {
         receipt_id: u64,
@@ -110,6 +117,32 @@ pub enum SMessage {
     StorageLoadPagedResult {
         receipt_id: u64,
         records: Vec<DispatchRecord>,
+    },
+    /// EMBED (B317): ask the vault for up to `limit` memories whose vector was not made by
+    /// `embed_model` (`limit == 0` only counts them).
+    ReEmbed {
+        receipt_id: u64,
+        embed_model: String,
+        limit: usize,
+    },
+    /// The vault's answer: `(inode id, content)` to re-embed, and how many are stale in all.
+    ReEmbedBatch {
+        receipt_id: u64,
+        items: Vec<(u64, String)>,
+        stale_total: usize,
+    },
+    /// New vectors for the batch, made by `embed_model`.
+    ReEmbedWrite {
+        receipt_id: u64,
+        embed_model: String,
+        vectors: Vec<(u64, Vec<f32>)>,
+    },
+    /// The vault wrote `written` vectors; `remaining` are still stale.
+    ReEmbedDone {
+        receipt_id: u64,
+        written: usize,
+        remaining: usize,
+        error: Option<String>,
     },
 
     // --- AETHER (The Browser) ---

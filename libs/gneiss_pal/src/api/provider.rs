@@ -182,12 +182,7 @@ pub trait ModelProvider: Send + Sync {
     /// [`ChatDelta::Text`] then one [`ChatDelta::Stop`].
     fn stream<'a>(&'a self, req: &'a ChatRequest) -> BoxFuture<'a, Result<DeltaStream<'a>, ProviderError>>;
 
-    /// A semantic embedding of `text`, for Vein's vault. Optional: a provider
-    /// without an embeddings endpoint answers [`ProviderError::Unsupported`].
-    fn embed<'a>(&'a self, _text: &'a str) -> BoxFuture<'a, Result<Vec<f32>, ProviderError>> {
-        let name = self.name().to_string();
-        Box::pin(async move { Err(ProviderError::Unsupported(format!("embeddings ({name} has no embeddings endpoint)"))) })
-    }
+    // EMBED (B317): no `embed` here — the embedder is its own seam (`super::embed::Embedder`).
 }
 
 // ---------------------------------------------------------------------------

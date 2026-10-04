@@ -27,7 +27,8 @@ use std::sync::Arc;
 
 use bandy::{PrefValue, PrincipiaCommand, SMessage};
 use gneiss_pal::api::{
-    ChatRequest, ChatResponse, ModelProvider, PREF_NS, Part, ProviderConfig, StopReason, build_provider_with_env,
+    ChatRequest, ChatResponse, EmbedConfig, Embedder, ModelProvider, PREF_NS, Part, ProviderConfig, RECALL_OFF_NO_EMBEDDER,
+    StopReason, build_embedder_with_env, build_provider_with_env,
 };
 use principia::prefs::PrefStore;
 
@@ -88,11 +89,115 @@ impl ProviderSlot {
         p.generate(req).await.map_err(|e| format!("{} :: {e}", p.name()))
     }
 
-    /// An embedding for the vault. A provider without embeddings (Claude)
-    /// answers an error; the callers already store an empty vector then.
-    pub async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        let p = self.provider()?;
-        p.embed(text).await.map_err(|e| e.to_string())
+    /// The chat provider's `(name, model)`, for the settings label.
+    pub fn chat_pair(&self) -> Option<(String, String)> {
+        self.inner.as_ref().ok().map(|(p, _)| (p.name().to_string(), p.model().to_string()))
+    }
+}
+
+/// EMBED (B317): the embedder slot — its own setting, independent of the chat
+/// provider (R81). Built at start and rebuilt on a `vein` preference change.
+#[derive(Clone)]
+pub struct EmbedSlot {
+    /// What the preferences asked for (`None` = they could not be read/parsed).
+    cfg: Option<EmbedConfig>,
+    /// The live embedder, or why there is none.
+    inner: Result<Arc<dyn Embedder>, String>,
+}
+
+/// One text's vector and the tag it carries (`una:embed-model`). An empty
+/// vector (recall off, or the embedder failed) is stored as no vector.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Embedded {
+    pub vector: Vec<f32>,
+    pub tag: String,
+}
+
+impl EmbedSlot {
+    pub fn load() -> Self {
+        Self::load_from(&principia::default_prefs_path(), |k| std::env::var(k).ok())
+    }
+
+    pub fn load_from(path: &Path, env: impl Fn(&str) -> Option<String>) -> Self {
+        match PrefStore::load(path) {
+            Ok(store) => Self::from_lookup(|k| store.get(PREF_NS, k), env),
+            Err(e) => EmbedSlot { cfg: None, inner: Err(format!("preferences unreadable ({}): {e:#}", path.display())) },
+        }
+    }
+
+    pub fn from_lookup(get: impl Fn(&str) -> Option<PrefValue>, env: impl Fn(&str) -> Option<String>) -> Self {
+        match EmbedConfig::from_prefs(get, &env) {
+            Ok(cfg) => {
+                let inner = build_embedder_with_env(&cfg, &env).map(Arc::from).map_err(|e| e.to_string());
+                EmbedSlot { cfg: Some(cfg), inner }
+            }
+            Err(e) => EmbedSlot { cfg: None, inner: Err(e.to_string()) },
+        }
+    }
+
+    /// An embedder directly (tests, and a caller that built one itself).
+    pub fn from_embedder(e: Arc<dyn Embedder>) -> Self {
+        EmbedSlot { cfg: None, inner: Ok(e) }
+    }
+
+    pub fn config(&self) -> Option<&EmbedConfig> {
+        self.cfg.as_ref()
+    }
+
+    /// True when vectors are written and recall runs.
+    pub fn enabled(&self) -> bool {
+        matches!(&self.inner, Ok(e) if e.enabled())
+    }
+
+    /// The tag a vector from this slot carries; empty when recall is off.
+    pub fn tag(&self) -> String {
+        match &self.inner {
+            Ok(e) if e.enabled() => e.tag(),
+            _ => String::new(),
+        }
+    }
+
+    /// The in-chat reason recall is off, or `None` when it is on.
+    pub fn recall_off(&self) -> Option<String> {
+        match &self.inner {
+            Ok(e) if e.enabled() => None,
+            Ok(_) => Some(RECALL_OFF_NO_EMBEDDER.to_string()),
+            Err(why) => Some(format!(":: BRAIN :: RECALL OFF :: {why}")),
+        }
+    }
+
+    /// The console lines at start: `:: BRAIN :: EMBED <provider>/<model> dims=<n>`,
+    /// then the recall-off line when recall is off.
+    pub fn status_line(&self) -> String {
+        let head = match (&self.inner, &self.cfg) {
+            (Ok(e), _) => format!(":: BRAIN :: EMBED {}/{} dims={}", e.name(), e.model(), e.dims()),
+            (Err(_), Some(c)) => format!(":: BRAIN :: EMBED {} UNAVAILABLE", c.tag()),
+            (Err(_), None) => ":: BRAIN :: EMBED UNCONFIGURED".to_string(),
+        };
+        match self.recall_off() {
+            None => format!("{head}\n\n"),
+            Some(off) => format!("{head}\n{off}\n\n"),
+        }
+    }
+
+    /// Embed a batch. Recall off answers empty vectors (stored as no vector).
+    pub async fn embed_many(&self, texts: &[&str]) -> Result<Vec<Embedded>, String> {
+        let e = match &self.inner {
+            Ok(e) if e.enabled() => e.clone(),
+            _ => return Ok(vec![Embedded::default(); texts.len()]),
+        };
+        let tag = e.tag();
+        let vecs = e.embed(texts).await.map_err(|err| format!("{} embedder :: {err}", e.name()))?;
+        Ok(vecs.into_iter().map(|vector| Embedded { vector, tag: tag.clone() }).collect())
+    }
+
+    /// Embed one text for the vault. Failure or recall-off is an empty vector
+    /// and the reason (the caller says it in-chat); a store is never blocked.
+    pub async fn embed_one(&self, text: &str) -> (Embedded, Option<String>) {
+        match self.embed_many(&[text]).await {
+            Ok(mut v) => (v.pop().unwrap_or_default(), None),
+            Err(why) => (Embedded::default(), Some(format!(":: BRAIN :: EMBED FAILED :: {why}"))),
+        }
     }
 }
 
@@ -197,5 +302,50 @@ mod tests {
             "[declined by the provider: cyber]"
         );
         assert!(render_reply(&r("long", StopReason::MaxTokens)).contains("max_tokens"));
+    }
+
+    // EMBED (B317): the embedder slot is its own setting.
+    #[test]
+    fn embed_slot_defaults_off_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = EmbedSlot::load_from(&dir.path().join("preferences.toml"), none);
+        assert_eq!(
+            slot.status_line(),
+            ":: BRAIN :: EMBED off/none dims=0\n:: BRAIN :: RECALL OFF :: no embedder — set vein.embed.provider\n\n"
+        );
+        assert!(!slot.enabled());
+        assert_eq!(slot.tag(), "");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (e, why) = rt.block_on(slot.embed_one("hello"));
+        assert_eq!((e, why), (Embedded::default(), None));
+    }
+
+    #[test]
+    fn embed_slot_is_gemini_with_a_key_even_when_chat_is_claude() {
+        let env = |k: &str| match k {
+            "GEMINI_API_KEY" => Some("g".to_string()),
+            "ANTHROPIC_API_KEY" => Some("a".to_string()),
+            _ => None,
+        };
+        let chat = ProviderSlot::from_lookup(|_| None, env);
+        assert_eq!(chat.status_line(), ":: BRAIN :: ONLINE (claude / claude-opus-5-5)\n\n");
+        let slot = EmbedSlot::from_lookup(|_| None, env);
+        assert_eq!(slot.status_line(), ":: BRAIN :: EMBED gemini/text-embedding-004 dims=768\n\n");
+        assert_eq!(slot.tag(), "gemini/text-embedding-004");
+        assert!(slot.recall_off().is_none());
+    }
+
+    #[test]
+    fn embed_slot_unavailable_names_the_fix() {
+        let slot = EmbedSlot::from_lookup(
+            |k| match k {
+                "embed.provider" => Some(PrefValue::Str("gemini".into())),
+                "gemini.auth" => Some(PrefValue::Str("api_key".into())),
+                _ => None,
+            },
+            none,
+        );
+        let line = slot.status_line();
+        assert!(line.starts_with(":: BRAIN :: EMBED gemini/text-embedding-004 UNAVAILABLE\n:: BRAIN :: RECALL OFF :: set GEMINI_API_KEY"), "{line}");
     }
 }

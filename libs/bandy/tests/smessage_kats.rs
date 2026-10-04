@@ -176,7 +176,7 @@ kat!(
 
 kat!(
     kat_storage_query,
-    SMessage::StorageQuery { receipt_id: 7, embedding: vec![0.5, 0.25] },
+    SMessage::StorageQuery { receipt_id: 7, embedding: vec![0.5, 0.25], embed_model: String::new() },
     r#"{"StorageQuery":{"receipt_id":7,"embedding":[0.5,0.25]}}"#
 );
 kat!(
@@ -190,6 +190,32 @@ kat!(
     },
     r#"{"StorageQueryResult":{"receipt_id":7,"memories":["m1"],"directives":[],"engrams":["e1"],"chrono":[]}}"#
 );
+// EMBED (B317): the model tag rides beside the vector; empty is omitted (older senders unchanged).
+kat!(
+    kat_storage_query_tagged,
+    SMessage::StorageQuery { receipt_id: 7, embedding: vec![0.5], embed_model: "local/all-MiniLM-L6-v2".to_string() },
+    r#"{"StorageQuery":{"receipt_id":7,"embedding":[0.5],"embed_model":"local/all-MiniLM-L6-v2"}}"#
+);
+kat!(
+    kat_reembed,
+    SMessage::ReEmbed { receipt_id: 3, embed_model: "gemini/text-embedding-004".to_string(), limit: 32 },
+    r#"{"ReEmbed":{"receipt_id":3,"embed_model":"gemini/text-embedding-004","limit":32}}"#
+);
+kat!(
+    kat_reembed_batch,
+    SMessage::ReEmbedBatch { receipt_id: 3, items: vec![(5, "hi".to_string())], stale_total: 9 },
+    r#"{"ReEmbedBatch":{"receipt_id":3,"items":[[5,"hi"]],"stale_total":9}}"#
+);
+kat!(
+    kat_reembed_write,
+    SMessage::ReEmbedWrite { receipt_id: 3, embed_model: "off/none".to_string(), vectors: vec![(5, vec![1.0])] },
+    r#"{"ReEmbedWrite":{"receipt_id":3,"embed_model":"off/none","vectors":[[5,[1.0]]]}}"#
+);
+kat!(
+    kat_reembed_done,
+    SMessage::ReEmbedDone { receipt_id: 3, written: 1, remaining: 8, error: None },
+    r#"{"ReEmbedDone":{"receipt_id":3,"written":1,"remaining":8,"error":null}}"#
+);
 kat!(
     kat_storage_save,
     SMessage::StorageSave {
@@ -199,6 +225,7 @@ kat!(
         timestamp: "2026-07-13T00:00:00Z".to_string(),
         embedding: vec![0.0],
         memory_type: "engram".to_string(),
+        embed_model: String::new(),
     },
     r#"{"StorageSave":{"receipt_id":8,"sender":"vein","content":"engram body","timestamp":"2026-07-13T00:00:00Z","embedding":[0.0],"memory_type":"engram"}}"#
 );
@@ -718,6 +745,10 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::StorageSaveResult { .. } => "StorageSaveResult",
         SMessage::StorageLoadPaged { .. } => "StorageLoadPaged",
         SMessage::StorageLoadPagedResult { .. } => "StorageLoadPagedResult",
+        SMessage::ReEmbed { .. } => "ReEmbed",
+        SMessage::ReEmbedBatch { .. } => "ReEmbedBatch",
+        SMessage::ReEmbedWrite { .. } => "ReEmbedWrite",
+        SMessage::ReEmbedDone { .. } => "ReEmbedDone",
         SMessage::OpenDocument { .. } => "OpenDocument",
         SMessage::SurfaceBlit { .. } => "SurfaceBlit",
         SMessage::PlayMedia { .. } => "PlayMedia",

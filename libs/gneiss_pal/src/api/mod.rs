@@ -25,8 +25,11 @@
 //! wire shape); each provider documents what it does with an attachment.
 
 pub mod claude;
+pub mod embed;
 pub mod format;
 pub mod gemini;
+#[cfg(feature = "local-embed")]
+pub mod local;
 pub mod provider;
 pub mod retry;
 pub mod sse;
@@ -36,7 +39,11 @@ mod tests;
 use serde::{Deserialize, Serialize};
 
 pub use claude::ClaudeProvider;
-pub use gemini::{GeminiAuth, GeminiConfig, GeminiProvider};
+pub use embed::{
+    EmbedConfig, EmbedKind, Embedder, LOCAL_DEFAULT_EMBED_MODEL, NoEmbedder, RECALL_OFF_NO_EMBEDDER, build_embedder,
+    build_embedder_with_env, known_dims, provider_label,
+};
+pub use gemini::{GeminiAuth, GeminiConfig, GeminiEmbedder, GeminiProvider};
 pub use provider::{
     AuthMode, BoxFuture, ChatDelta, ChatMessage, ChatRequest, ChatResponse, DeltaStream, GeminiSettings, MODEL_CHOICES,
     ModelProvider, PREF_NS, model_menu, ProviderConfig, ProviderError, ProviderKind, Role, StopReason, Usage, build_provider,
