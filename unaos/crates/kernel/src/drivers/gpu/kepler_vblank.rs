@@ -1199,7 +1199,7 @@ extern "x86-interrupt" fn kepler_vblank_isr(_f: x86_64::structures::idt::Interru
     if bar0 != 0 && IRQ_LIVE.load(Ordering::Acquire) {
         let head = IRQ_HEAD.load(Ordering::Relaxed) as usize;
         if head < 4 {
-            ISR_CALLS.fetch_add(1, Ordering::Relaxed);
+            ISR_CALLS.fetch_add(1, Ordering::Relaxed); kv8_isr_enter(bar0); // KVBLANK8 M2: the PMC line enable dropped for the ISR.
             let vb = 1u32 << DISP_INTR_HEAD_BIT_VBLANK;
             let entry = WIN_EN_ENTRY.load(Ordering::Relaxed);
             let en_reg = disp_head(DISP_INTR_HOST_HEAD_EN, head);
@@ -1257,6 +1257,7 @@ extern "x86-interrupt" fn kepler_vblank_isr(_f: x86_64::structures::idt::Interru
                     mmio_write(bar0, regs::NV_PMC_INTR_EN, IRQ_PMC_ENTRY.load(Ordering::Relaxed));
                     IRQ_STORMED.store(true, Ordering::Relaxed);
                 }
+                kv8_isr_exit(bar0, head); // KVBLANK8 M2: PMC read-back, MSI re-arm through the config mirror, the line enable 0->1.
             }
         }
     }
@@ -1912,6 +1913,11 @@ static KV8_HSUM_POST: AtomicU32 = AtomicU32::new(0);
 /// Called at the end of every arm (rung 3, `tests kvblank8`): the destination the MSI was programmed with.
 fn kv8_note_arm(msg_addr: u32) {
     KV8_DEST1.store(((msg_addr >> 12) & 0xFF) + 1, Ordering::Release);
+    let bdf1 = VB_BDF1.load(Ordering::Acquire);
+    if bdf1 != 0 {
+        let bdf = bdf1 - 1;
+        KV8_MSI_CAP.store(kv8_msi_cap((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8) as u32, Ordering::Relaxed);
+    }
     KV8_ARM_MS.store(crate::arch::ms(), Ordering::Relaxed);
     KV8_FIRST_ISR_MS.store(0, Ordering::Relaxed);
 }
@@ -2244,5 +2250,70 @@ fn kv8_takeover(msg_addr: u32) {
     {
         KV8_HOLD.store(true, Ordering::Release);
         let _ = kv8_snapshot("takeover");
+    }
+}
+
+// ── KVBLANK8 M2 — the PMC re-edge, the mirror re-arm, the same-frame storm guard ──────────────────────────────────
+//
+// MSI is a message on the RISING edge of the GPU's interrupt output. KVBLANK3..7 acked the PDISPLAY head latch and
+// re-armed the head enable, but never touched the output line itself: if ANY PDISPLAY source is still asserted after
+// the vblank ack (boot 19's `INTR_HEAD_STATUS` carried bits 1 and 25 beside VBLANK the whole boot), `PMC_INTR_0` bit
+// 26 never falls and the function never sees a new edge — "fires once" exactly. The ISR now drops `INTR_ENABLE_HOST`'s
+// hardware bit (0x140 bit 0, envytools `pmc.rst:346-347`) on entry and raises it again on exit with a read-back: a
+// 0->1 on the line enable presents any still-pending source as a fresh edge. Between the two it reads `PMC_INTR_0` and
+// `INTR_HOST_SUMMARY` (so the M1 line says what was still asserted) and repeats the KVBLANK7 MSI re-arm through the
+// BAR0 PCI-config mirror (`0x088000`, envytools `docs/hw/mmio.rst` PPCI: "PCI configuration space mirror"), since a
+// write through CF8 and a write through the mirror are not proven equivalent on this die. A storm is bounded: 64 ISR
+// entries with `HEAD_STAT.VERT[31:16]` unchanged cut the line at PMC and set `IRQ_STORMED`, a printed result.
+
+/// `PPCI` — the PCI configuration space mirror in BAR0 (envytools `mmio.rst`). [EXT].
+const KV8_PPCI_MIRROR: usize = 0x088000;
+/// ISR entries tolerated inside ONE vblank before the line is cut.
+const KV8_SAME_FRAME_CAP: u32 = 64;
+static KV8_SAME_FRAME: AtomicU32 = AtomicU32::new(0);
+static KV8_LAST_FRAME: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The MSI capability offset, found at the arm (task / edge context) so the ISR never walks config space.
+static KV8_MSI_CAP: AtomicU32 = AtomicU32::new(0);
+
+/// ISR entry: the PMC output line enable's hardware bit off, so the exit's 0->1 is a real transition.
+#[inline]
+fn kv8_isr_enter(bar0: usize) {
+    let entry = IRQ_PMC_ENTRY.load(Ordering::Relaxed);
+    unsafe { mmio_write(bar0, regs::NV_PMC_INTR_EN, entry & !PMC_ENABLE_HOST_HW) };
+}
+
+/// ISR exit (after the acks and the head re-arm): read what is still asserted, re-arm MSI through the mirror, bound the
+/// storm, and raise the line enable again with a read-back.
+#[inline]
+fn kv8_isr_exit(bar0: usize, head: usize) {
+    unsafe {
+        KV8_PMC_POST.store(mmio_read(bar0, regs::NV_PMC_INTR_0), Ordering::Relaxed);
+        KV8_HSUM_POST.store(mmio_read(bar0, regs::NV_PDISPLAY_BASE + DISP_INTR_HOST_SUMMARY), Ordering::Relaxed);
+        if IRQ_WIRE.load(Ordering::Relaxed) == 1 {
+            // The offset cached at the arm: no CF8/CFC cycle from the ISR (port pairs have no lock in this tree).
+            let cap = KV8_MSI_CAP.load(Ordering::Relaxed);
+            if cap != 0 {
+                core::ptr::write_volatile((bar0 + KV8_PPCI_MIRROR + cap as usize) as *mut u8, 0xFF);
+                KV8_MIRROR_REARMS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let frame = mmio_read(bar0, regs::NV_PDISPLAY_BASE + 0x6000 + head * 0x800 + 0x340) >> 16;
+        if KV8_LAST_FRAME.swap(frame, Ordering::Relaxed) == frame {
+            if KV8_SAME_FRAME.fetch_add(1, Ordering::Relaxed) + 1 >= KV8_SAME_FRAME_CAP {
+                IRQ_STORMED.store(true, Ordering::Relaxed);
+            }
+        } else {
+            KV8_SAME_FRAME.store(0, Ordering::Relaxed);
+        }
+        let entry = IRQ_PMC_ENTRY.load(Ordering::Relaxed);
+        if IRQ_STORMED.load(Ordering::Relaxed) {
+            mmio_write(bar0, regs::NV_PMC_INTR_EN, entry & !PMC_ENABLE_HOST_HW);
+            return;
+        }
+        mmio_write(bar0, regs::NV_PMC_INTR_EN, entry | PMC_ENABLE_HOST_HW);
+        KV8_PMC_REARMS.fetch_add(1, Ordering::Relaxed);
+        if mmio_read(bar0, regs::NV_PMC_INTR_EN) & PMC_ENABLE_HOST_HW != 0 {
+            KV8_PMC_REARM_RB.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
