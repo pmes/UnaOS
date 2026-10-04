@@ -133,7 +133,6 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet();
     crate::video::blitter::ensure_tests(); // KCOMP (B321): `tests blitter`.
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
@@ -322,6 +321,9 @@ fn ensure_kvblank8() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("kvblank8", crate::drivers::gpu::kepler_vblank::kvblank8_selftest); }
+    }
+}
+
 /// GEN7R8 (B320, R80): register `tests gen7` — the Ivy Bridge ladder's rung R8 (the BCS blit at the
 /// panel's geometry into scratch) — exactly once, on a `gen7r8` (`UNAOS_IVB3D_R8`) build. The boot only
 /// stashes R8's inputs at R7's tail; this fixture runs the rung and prints `:: GEN7R8: … ::`.
