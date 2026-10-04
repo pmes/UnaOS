@@ -354,8 +354,6 @@ fn top(console: &mut Console, n: usize) {
     comp_rows(console);
 }
 
-/// M4 slot: the compositor split rows (filled by M4).
-fn comp_rows(_console: &mut Console) {}
 
 // ---- M3 — per-syscall latency histograms + per-task CPU share ----------------------------------------
 
@@ -473,5 +471,101 @@ fn tasks(console: &mut Console) {
     }
 }
 
-/// M4 slot: the compositor baseline (filled by M4).
-fn comp_baseline() {}
+
+// ---- M4 — the compositor split + `tests prof` --------------------------------------------------------
+
+#[cfg(feature = "witness")]
+static COMP0: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Take the `[comp2]` counters' baseline at `prof start`.
+fn comp_baseline() {
+    #[cfg(feature = "witness")]
+    for (b, v) in COMP0.iter().zip(crate::video::wm::prof_comp2()) {
+        b.store(v, Relaxed);
+    }
+}
+
+/// The compositor's present / compose / blit per-pass means over the profiling window, as three
+/// `prof top` rows. `src=window` is a true delta; `src=since-rollup` means a `[comp2]` rollup drained
+/// the counters mid-run and the means cover the span since that drain.
+fn comp_rows(console: &mut Console) {
+    #[cfg(feature = "witness")]
+    {
+        let cur = crate::video::wm::prof_comp2();
+        let base: Vec<u64> = COMP0.iter().map(|b| b.load(Relaxed)).collect();
+        let window = cur.iter().zip(base.iter()).all(|(c, b)| c >= b);
+        let d: Vec<u64> = if window { cur.iter().zip(base.iter()).map(|(c, b)| c - b).collect() } else { cur.to_vec() };
+        let passes = d[0];
+        let us = |cyc: u64| if passes == 0 { 0 } else { cyc_to_ns(cyc / passes) / 1000 };
+        let src = if window { "window" } else { "since-rollup" };
+        for (name, cyc) in [("present", d[4]), ("compose", d[3]), ("blit", d[1].saturating_sub(d[2]))] {
+            out(console, &format!("[prof] top row=wc:{} mean_us={} passes={} src={}", name, us(cyc), passes, src));
+        }
+    }
+    #[cfg(not(feature = "witness"))]
+    out(console, "[prof] top row=wc: (the [comp2] split needs a witness image)");
+}
+
+/// The 1 s window `tests prof` profiles.
+pub const TEST_MS: u64 = 1000;
+
+/// The synthetic load `tests prof` runs on this CPU: an FNV-1a churn over a stack buffer until the
+/// deadline. Never inlined, so its bucket is its own.
+#[inline(never)]
+pub fn synthetic_load(deadline: u64) -> u64 {
+    let mut buf = [0u8; 1024];
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0usize;
+    while crate::arch::now_cycles() < deadline {
+        for b in buf.iter_mut() {
+            h = (h ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            *b = (h >> 7) as u8 ^ i as u8;
+        }
+        i = i.wrapping_add(1);
+        core::hint::black_box(&buf);
+    }
+    h
+}
+
+/// `tests prof` registration, once (never at boot, R80).
+pub fn ensure_tests() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        crate::tests::register("prof", selftest);
+    }
+}
+
+/// `tests prof`: arm at the tick rate, run the synthetic load for [`TEST_MS`], stop, and assert
+/// `samples > 0` and `dropped == 0`. A run already in progress is restarted (its samples are lost).
+pub fn selftest() {
+    let hz = start(tick_hz());
+    let chz = cycle_hz();
+    let span = if chz == 0 { 2_500_000_000 } else { chz / 1000 * TEST_MS };
+    let h = synthetic_load(crate::arch::now_cycles().wrapping_add(span));
+    core::hint::black_box(h);
+    stop();
+    let v = samples();
+    let (n, d) = (v.len(), dropped());
+    let load = synthetic_load as *const () as usize as u64;
+    let me = crate::arch::percpu::this_cpu().cpu_index as u8;
+    let in_load = v.iter().filter(|s| s.cpu == me && s.ring == 0 && s.rip >= load && s.rip < load + 512).count();
+    let mine = v.iter().filter(|s| s.cpu == me).count();
+    let (top, top_pct) = match buckets(&v).first() {
+        Some(((ring, b), c)) => (format!("{:#x}{}", b << BUCKET_SHIFT, if *ring == 3 { "/ring3" } else { "" }), pct(*c, n)),
+        None => (String::from("none"), pct(0, 0)),
+    };
+    serial_println!(
+        "[prof] test top_pct={} cpu={} cpu_samples={} in_load={} load={:#x} anchor={:#x} span_ms={} cpus_sampled={}",
+        top_pct,
+        me,
+        mine,
+        in_load,
+        load,
+        anchor(),
+        span_ms(),
+        (0..CPUS).filter(|&c| v.iter().any(|s| s.cpu as usize == c)).count()
+    );
+    let pass = n > 0 && d == 0;
+    serial_println!(":: PROFILE: hz={} samples={} dropped={} top={} -> {} ::", hz, n, d, top, if pass { "PASS" } else { "FAIL" });
+    crate::tests::tally(pass);
+}
