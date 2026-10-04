@@ -78,3 +78,40 @@ band is kernel heap; the CE reads it only through a sysmem mapping in the channe
 compose straight into a VRAM band). That mapping is KBLIT's to establish; `Surface::mem` carries
 `Mem::Ram` vs `Mem::Scanout` so the GPU blitter can refuse (`BlitErr::Unsupported` → fallback) a
 source it cannot address.
+
+## M2–M4 — what was built
+
+- **M2** `unaos/crates/kernel/src/video/blitter.rs` (CHARTER: Kernel — wm). `Blitter`, `BlitJob { src,
+  dst: Surface, rects: &[Rect], op: Copy|CopyAlpha }`, `Surface { fb: FrameBuffer, mem: Ram|Scanout }`,
+  `Fence`, `BlitErr { Unavailable, Unsupported, Bounds, Timeout }`. `CpuBlitter::blit` is the moved
+  present: `wcpar::par_blit` over contiguous source rows (x86 + `wc`), else `wm::kcomp_row` per row
+  (= `comp_mark_row` + `blit_traced`, the exact pair the inline loop ran). `GpuBlitter` returns
+  `Unavailable`; `probe` answers `feature-off` / `kblit-channel-absent`. `run_on` is the fallback rule.
+  Knob `UNAOS_WC_BLITTER=gpu` → `wc_gpublit` (Cargo.toml, arroyo `_feats`, builder, k8-reach NA row).
+- **M3** `wm::stage_window`: the no-clip arm's `par_blit` + serial copy is now
+  `blitter::present_band(r.id, fb, &layer, bx, by + band, bw, rows)`; if it returns false the inline
+  row loop still copies (a second net under the fallback). The occluded-span arm is unchanged.
+  `[wc-h] rollup` gains `blitter=<cpu|gpu> blit_us=<cumulative per window> gpu_fallback=<n>` directly
+  after `beamcross_ppk=` (arity 43 → 46); every spec rule on that line (`pi4-regression.spec:1028–1030,
+  1139–1140`, `x86-witness.spec:1245`) keys `.*` wildcards across that slot, so none moves.
+  Byte-identity argument: the destination offsets are the same expressions
+  (`(dy*stride + dx)*bpp + y*stride*bpp` = `py*fb_row + bx*bpp`), the primitive is the same
+  (`FrameBuffer::blit` via `blit_traced`, or `par_blit` with the same arguments), and the order of the
+  witness accounting is unchanged (it never read the panel). The added cost per band is one `dyn` call,
+  one rect validation and two `now_cycles` reads.
+- **M4** `tests blitter` (registered from `tests::shell_verb`, never at boot): 512×512 into a 640×520
+  heap destination at (8,4) — the old inline path vs `CpuBlitter` (checksums equal, not blank), then
+  `GpuBlitter` via `run_on` (direct blit = `Unavailable`, fallback taken, counted exactly once, output
+  equal), plus a bounds refusal. Lines:
+  `[kcomp] w=512 h=512 inline_us=… cpu_us=… gpu_path_us=… cks_inline=… cks_cpu=… cks_gpu=… blank=… par=… gpu_direct=unavailable fallback_counted=1 bounds_refused=1`
+  `:: KCOMP: blitter=cpu census=10 hot=window-present cpu_us=<n> gpu=unavailable fallback_ok=1 -> PASS ::`
+
+**On metal, expect** `[wc] blitter=cpu reason=feature-off` once at the first composite (or
+`reason=kblit-channel-absent` with `UNAOS_WC_BLITTER=gpu`), and every `[wc-h] rollup` carrying
+`blitter=cpu blit_us=<n> gpu_fallback=0`. The unchanged-ness proof on metal is the existing lines:
+`:: WCPAR: … -> PASS`, `[wc-g] … -> CLEAN`, `[wc-h] rollup … -> TEAR-FREE` at flight 19's rates, and the
+screenshot readback (`prtscr`) as before. `blit_us` should sit at or just above the rollup's present
+time (it is the present plus the dispatch).
+
+**Proved here (R78, no QEMU):** compile legs and the static gates — see the report in the ledger row's
+source. NOT proved here: any runtime number; the first `tests blitter` run is the bench's.
