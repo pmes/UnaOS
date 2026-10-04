@@ -179,7 +179,7 @@ fn pick_slot(k: usize, id: u32) {
         && crate::arch::aarch64::syscall::user_input_push_owner(asid, una_abi::input_ev_pack(INPUT_EV_MENU_PICK, id as u64));
     #[cfg(all(target_arch = "aarch64", not(any(feature = "baremetal", feature = "tegra_el0"))))]
     let delivered = false;
-    serial_println!("[menubar] pick owner={} item={} delivered={}", asid, id, delivered);
+    crate::bootlog_println!("[menubar] pick owner={} item={} delivered={}", asid, id, delivered);
 }
 
 /// Hand `asid`'s tree to the bar for each window that owner has right now; returns `(attached, seen)`.

@@ -659,12 +659,12 @@ fn open_as(state: State) {
     MISS_SAID.store(false, Ordering::Relaxed); // LOGINFLOW — the one miss line is per OPEN, not per boot
     KEY_SAID.store(false, Ordering::Relaxed); // LOGIN13 M3 — and so is the one key line
     if HEADLESS.load(Ordering::Relaxed) {
-        serial_println!("[login] screen open window=no (fixture — headless form)");
+        crate::bootlog_println!("[login] screen open window=no (fixture — headless form)");
         crate::splash::hold_release("first-screen");
         return;
     }
     let Some((_s, ow, oh)) = wm::spawn_geometry(W, H) else {
-        serial_println!("[login] screen open window=no (no surface yet — headless form)");
+        crate::bootlog_println!("[login] screen open window=no (no surface yet — headless form)");
         crate::splash::hold_release("first-screen");
         return;
     };
@@ -700,7 +700,7 @@ fn open_as(state: State) {
     // Modal over the glass: the console keeps taking glyphs, serial keeps every line, but it stops
     // presenting until the session opens (instgui's rule and reason).
     fbcon::console_present_suspend(true);
-    serial_println!("[login] screen open window={} box={}x{} at ({},{}) modal=true", id, ow, oh, ox, oy);
+    crate::bootlog_println!("[login] screen open window={} box={}x{} at ({},{}) modal=true", id, ow, oh, ox, oy);
     repaint();
     crate::splash::hold_release("first-screen"); // SPLASH2 M3: the first real screen (setter / create-user / login) is PAINTED — the splash gives the glass up now
 }

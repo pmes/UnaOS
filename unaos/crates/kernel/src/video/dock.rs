@@ -2664,7 +2664,7 @@ fn pins_census_once(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) {
             }
         }
     }
-    serial_println!(
+    crate::bootlog_println!(
         "[dock] pins={} quarry={} console={} shell={} pulse={} tiles={} quarry_compiled={} ::",
         pins,
         yn(quarry),

@@ -11,17 +11,17 @@ impl PciScanner {
     /// enable Bus Master).
     pub fn scan() -> Option<(u64, u8, u8, u8)> {
         if let Some(found) = Self::enumerate_buses() {
-            serial_println!("[PCI] FOUND XHCI CONTROLLER AT PHYSICAL ADDRESS: 0x{:X} (bus {} dev {} fn {})",
+            crate::bootlog_println!("[PCI] FOUND XHCI CONTROLLER AT PHYSICAL ADDRESS: 0x{:X} (bus {} dev {} fn {})",
                 found.0, found.1, found.2, found.3);
             Some(found)
         } else {
-            serial_println!("[PCI] WARNING: XHCI CONTROLLER NOT FOUND");
+            crate::bootlog_println!("[PCI] WARNING: XHCI CONTROLLER NOT FOUND");
             None
         }
     }
 
     pub fn enumerate_buses() -> Option<(u64, u8, u8, u8)> {
-        serial_println!("PCI: Commencing motherboard scan..."); // BOOTWAITS (rmbp-ledger B152): B127's HDA enumeration hook WAS appended here, on the first statement of the kernel's one PCI walk, and B127's own comment named this placement as the thing a later fold should undo: "armed, this charges HDA bring-up to the `pci-scan` BPACE delta stamped at `arch/x86_64/pci.rs:882`. The placement a future fold should prefer is the AHCI-shaped append at `arch/x86_64/pci.rs:1048`, which sits outside every pacing accumulator; that file is not in this arc's brief and was therefore not touched." This arc's brief names that file, so the move is made. It was not cosmetic: flight 11 stamped `pci-scan t=26941ms d=1315ms` and 1210 ms of that delta is HDA (`[hda] census` 25731 ms -> `[hda] audit stage=end` 26941 ms, dominated by `HDA-TONE ... run_ms=1200`), while the walk the tag is NAMED for costs 6 ms on this machine (`[PCI-CENSUS] done: devices=20 functions=27 ... elapsed=6ms`, bootpace.md §10o) — so the tag was reporting a default-OFF audio knob under a PCI name at 200x the size of the thing it claimed to measure. ⚠ LINE-NEUTRAL removal: the statement is deleted but this physical LINE stays, because `panic::Location` records embed line numbers and deleting the line would shift every one below it exactly as adding a cfg'd-OFF block would.
+        crate::bootlog_println!("PCI: Commencing motherboard scan..."); // BOOTWAITS (rmbp-ledger B152): B127's HDA enumeration hook WAS appended here, on the first statement of the kernel's one PCI walk, and B127's own comment named this placement as the thing a later fold should undo: "armed, this charges HDA bring-up to the `pci-scan` BPACE delta stamped at `arch/x86_64/pci.rs:882`. The placement a future fold should prefer is the AHCI-shaped append at `arch/x86_64/pci.rs:1048`, which sits outside every pacing accumulator; that file is not in this arc's brief and was therefore not touched." This arc's brief names that file, so the move is made. It was not cosmetic: flight 11 stamped `pci-scan t=26941ms d=1315ms` and 1210 ms of that delta is HDA (`[hda] census` 25731 ms -> `[hda] audit stage=end` 26941 ms, dominated by `HDA-TONE ... run_ms=1200`), while the walk the tag is NAMED for costs 6 ms on this machine (`[PCI-CENSUS] done: devices=20 functions=27 ... elapsed=6ms`, bootpace.md §10o) — so the tag was reporting a default-OFF audio knob under a PCI name at 200x the size of the thing it claimed to measure. ⚠ LINE-NEUTRAL removal: the statement is deleted but this physical LINE stays, because `panic::Location` records embed line numbers and deleting the line would shift every one below it exactly as adding a cfg'd-OFF block would.
 
         for bus in 0..=255 {
             for device in 0..=31 {
@@ -79,7 +79,7 @@ impl PciScanner {
     /// write-all-ones/restore dance), and no COMMAND bit is touched.
     pub fn storage_inventory() -> alloc::vec::Vec<(u8, u8, u8)> {
         let mut sdhci = alloc::vec::Vec::new();
-        serial_println!("[PCI-STOR] storage-class census (class 0x01 mass-storage, class 0x08/0x05 SDHCI)...");
+        crate::bootlog_println!("[PCI-STOR] storage-class census (class 0x01 mass-storage, class 0x08/0x05 SDHCI)...");
 
         for bus in 0u16..256 {
             for slot in 0u8..32 {
@@ -118,7 +118,7 @@ impl PciScanner {
 
                     let vend = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, func, 0x00) };
                     let dev = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, func, 0x02) };
-                    serial_println!(
+                    crate::bootlog_println!(
                         "[PCI-STOR] bdf {}:{}.{} {:04x}:{:04x} class={:02x} sub={:02x} progif={:02x} ({}) bar0={:#x}",
                         bus, slot, func, vend, dev, class_code, subclass, prog_if, kind,
                         Self::get_bar_address(bus as u8, slot, func)
@@ -132,7 +132,7 @@ impl PciScanner {
         }
 
         if sdhci.is_empty() {
-            serial_println!("[PCI-STOR] no SD host controller (class 0x08/0x05) on this machine");
+            crate::bootlog_println!("[PCI-STOR] no SD host controller (class 0x08/0x05) on this machine");
         }
         sdhci
     }
@@ -189,11 +189,11 @@ impl PciScanner {
             let intr = crate::arch::pci::read_config_32(bus, slot, func, 0x3C);
             let int_line = (intr & 0xFF) as u8;
             let int_pin = ((intr >> 8) & 0xFF) as u8;
-            serial_println!(
+            crate::bootlog_println!(
                 "[PCI-PROBE] bdf {}:{}.{} COMMAND={:#06x} (IntxDisable bit10={}) STATUS={:#06x} (CapList bit4={})",
                 bus, slot, func, command, (command >> 10) & 1, status, (status >> 4) & 1
             );
-            serial_println!(
+            crate::bootlog_println!(
                 "[PCI-PROBE] Interrupt Line (IRQ)={} ({:#x}), Interrupt Pin=INT{}",
                 int_line, int_line, (b'A' + int_pin.saturating_sub(1)) as char
             );
@@ -213,7 +213,7 @@ impl PciScanner {
                         0x11 => "MSI-X",
                         _ => "?",
                     };
-                    serial_println!(
+                    crate::bootlog_println!(
                         "[PCI-PROBE]   cap@{:#04x} id={:#04x} ({}) next={:#04x} word0={:#010x}",
                         cap_ptr, cap_id, name, next, cap
                     );
@@ -222,7 +222,7 @@ impl PciScanner {
                         let mc = ((cap >> 16) & 0xFFFF) as u16;
                         let table = crate::arch::pci::read_config_32(bus, slot, func, cap_ptr + 4);
                         let pba = crate::arch::pci::read_config_32(bus, slot, func, cap_ptr + 8);
-                        serial_println!(
+                        crate::bootlog_println!(
                             "[PCI-PROBE]     MSI-X TableSize={} (entries) Enable={} FuncMask={} TableOff/BIR={:#x} PBA={:#x}",
                             (mc & 0x7FF) + 1, (mc >> 15) & 1, (mc >> 14) & 1, table, pba
                         );
@@ -249,7 +249,7 @@ impl PciScanner {
             // Capability list must be present (Status bit 4).
             let status = (crate::arch::pci::read_config_32(bus, slot, func, 0x04) >> 16) as u16;
             if (status & (1 << 4)) == 0 {
-                serial_println!("[MSI-X] {}:{}.{} has no capability list; cannot enable MSI-X.", bus, slot, func);
+                crate::bootlog_println!("[MSI-X] {}:{}.{} has no capability list; cannot enable MSI-X.", bus, slot, func);
                 return false;
             }
 
@@ -267,7 +267,7 @@ impl PciScanner {
                 guard += 1;
             }
             if msix_cap == 0 {
-                serial_println!("[MSI-X] {}:{}.{} has no MSI-X capability (id 0x11).", bus, slot, func);
+                crate::bootlog_println!("[MSI-X] {}:{}.{} has no MSI-X capability (id 0x11).", bus, slot, func);
                 return false;
             }
 
@@ -298,7 +298,7 @@ impl PciScanner {
             let mc = (mc | (1u16 << 15)) & !(1u16 << 14);
             crate::arch::pci::write_config_16(bus, slot, func, msix_cap + 2, mc);
 
-            serial_println!(
+            crate::bootlog_println!(
                 "[MSI-X] Enabled on {}:{}.{}: cap@{:#04x} table@{:#x} entry0(addr={:#x} data={:#x}) MsgCtl={:#06x}",
                 bus, slot, func, msix_cap, table, msg_addr, vector, mc
             );
@@ -315,7 +315,7 @@ impl PciScanner {
         unsafe {
             let status = (crate::arch::pci::read_config_32(bus, slot, func, 0x04) >> 16) as u16;
             if (status & (1 << 4)) == 0 {
-                serial_println!("[MSI] {}:{}.{} has no capability list.", bus, slot, func);
+                crate::bootlog_println!("[MSI] {}:{}.{} has no capability list.", bus, slot, func);
                 return false;
             }
 
@@ -333,7 +333,7 @@ impl PciScanner {
                 guard += 1;
             }
             if msi_cap == 0 {
-                serial_println!("[MSI] {}:{}.{} has no MSI capability (id 0x05).", bus, slot, func);
+                crate::bootlog_println!("[MSI] {}:{}.{} has no MSI capability (id 0x05).", bus, slot, func);
                 return false;
             }
 
@@ -359,7 +359,7 @@ impl PciScanner {
             let msg_ctl = (msg_ctl & !(0x7u16 << 4)) | 1;
             crate::arch::pci::write_config_16(bus, slot, func, msi_cap + 2, msg_ctl);
 
-            serial_println!(
+            crate::bootlog_println!(
                 "[MSI] Enabled on {}:{}.{}: cap@{:#04x} addr={:#x} data={:#x} ({}-bit) MsgCtl={:#06x}",
                 bus, slot, func, msi_cap, msg_addr, vector,
                 if is_64bit { 64 } else { 32 }, msg_ctl
@@ -373,7 +373,7 @@ impl PciScanner {
         let current_val = unsafe { crate::arch::pci::read_config_16(bus, slot, func, command_reg_offset) };
         // Bit 10 (0x400) = Interrupt Disable (1 = Disabled)
         unsafe { crate::arch::pci::write_config_16(bus, slot, func, command_reg_offset, current_val | (1 << 10)) };
-        serial_println!("xHCI: PCI Interrupts DISABLED (Bit 10 Set).");
+        crate::bootlog_println!("xHCI: PCI Interrupts DISABLED (Bit 10 Set).");
     }
 
     /// HDA-1 — AUDIO-CLASS CENSUS (read-only), rmbp-ledger B127. THE SHAPE IS `storage_inventory`'s

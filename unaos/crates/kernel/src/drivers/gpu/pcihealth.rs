@@ -434,7 +434,7 @@ pub fn census(ep_bus: u8, ep_slot: u8, ep_func: u8) {
             crate::arch::pci::read_config_16(rb, rs, rf, 0x3E),
         )
     };
-    serial_println!(
+    crate::census_println!(
         "[pcih] rp-boot bdf={}:{}.{} secsta={:04x} bridgectl={:04x} (secsta is a since-boot W1C \
          latch — compare rp-at-wedge against THIS, not against zero)",
         rb, rs, rf, rp_secsta, rp_brctl

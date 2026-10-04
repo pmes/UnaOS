@@ -378,14 +378,14 @@ unsafe fn census(op: u64, ports: u32, idx: usize, label: &str) -> u32 {
         if ccs != 0 {
             connected += 1;
         }
-        serial_println!(
+        crate::census_println!(
             ":: EHCI-CONFIG: [{}] census{} PORTSC[{}]={:#010x} connect={} enabled={} reset={} power={} owner={} line={} ::",
             idx, label, i, portsc, ccs, ped, pr, pp,
             if owner != 0 { "companion" } else { "EHCI" },
             line_state(ls)
         );
     }
-    serial_println!(
+    crate::census_println!(
         ":: EHCI-CONFIG: [{}] census{} = {} connected ::",
         idx, label, connected
     );
@@ -416,7 +416,7 @@ pub(crate) struct EhciFnHandle {
 pub(crate) unsafe fn wake_run(bus: u8, dev: u8, func: u8, idx: usize) -> Option<EhciFnHandle> {
     let vendor = read_config_16(bus, dev, func, 0x00);
     let device = read_config_16(bus, dev, func, 0x02);
-    serial_println!(
+    crate::census_println!(
         ":: EHCI-CONFIG: [{}] bdf {}:{}.{} id {:04x}:{:04x} — begin wake sequence ::",
         idx, bus, dev, func, vendor, device
     );
@@ -442,7 +442,7 @@ pub(crate) unsafe fn wake_run(bus: u8, dev: u8, func: u8, idx: usize) -> Option<
             let new = pmcsr & !0x3 & !(1 << 15);
             crate::arch::pci::write_config_32(bus, dev, func, pm_cap + 4, new);
             let after = read_config_32(bus, dev, func, pm_cap + 4);
-            serial_println!(
+            crate::census_println!(
                 ":: EHCI-CONFIG: [{}] PMCSR D{}->D0: wrote {:#06x} read-back {:#06x} (power-state=D{}) ::",
                 idx, state_before, new & 0xFFFF, after & 0xFFFF, after & 0x3
             );
@@ -450,17 +450,17 @@ pub(crate) unsafe fn wake_run(bus: u8, dev: u8, func: u8, idx: usize) -> Option<
             // trustworthy (PCI PM spec allows up to 10ms for D3hot->D0). No-op when already D0.
             settle_ms(10);
         } else {
-            serial_println!(":: EHCI-CONFIG: [{}] PMCSR already D0 (no transition) ::", idx);
+            crate::census_println!(":: EHCI-CONFIG: [{}] PMCSR already D0 (no transition) ::", idx);
         }
     } else {
-        serial_println!(":: EHCI-CONFIG: [{}] no PCI PM capability — cannot set D0, continuing ::", idx);
+        crate::census_println!(":: EHCI-CONFIG: [{}] no PCI PM capability — cannot set D0, continuing ::", idx);
     }
 
     // MMIO cap registers (guarded). If the BAR is unmapped we cannot configure — report + skip.
     let caplength_word = match mmio_read32(bar0 + CAP_CAPLENGTH) {
         Some(v) => v,
         None => {
-            serial_println!(
+            crate::census_println!(
                 ":: EHCI-CONFIG: [{}] BAR0 {:#x} not present in firmware identity map — SKIPPED (no writes) ::",
                 idx, bar0
             );
@@ -502,12 +502,12 @@ pub(crate) unsafe fn wake_run(bus: u8, dev: u8, func: u8, idx: usize) -> Option<
         // Enables = 0 (all SMI sources off), RW1C status (31:29) = 1s to acknowledge.
         crate::arch::pci::write_config_32(bus, dev, func, eecp + 4, 0xE000_0000);
         let legctl_cleared = read_config_32(bus, dev, func, eecp + 4);
-        serial_println!(
+        crate::census_println!(
             ":: EHCI-CONFIG: [{}] USBLEGCTLSTS@{:#04x}: pre={:#010x} post-own={:#010x} cleared->{:#010x} (SMI enables off + RW1C status acked, quirk_usb_handoff_ehci discipline) ::",
             idx, eecp + 4, legctl_pre, legctl_post_own, legctl_cleared
         );
         if cleared {
-            serial_println!(
+            crate::census_println!(
                 ":: EHCI-CONFIG: [{}] USBLEGSUP@{:#04x}: OS-own set, BIOS-owned cleared (was BIOS={} OS={}, now {:#010x}) ::",
                 idx, eecp, bios_before, os_before, after
             );
@@ -518,7 +518,7 @@ pub(crate) unsafe fn wake_run(bus: u8, dev: u8, func: u8, idx: usize) -> Option<
             );
         }
     } else {
-        serial_println!(
+        crate::census_println!(
             ":: EHCI-CONFIG: [{}] no EHCI extended-cap (EECP=0) — no BIOS/OS handoff needed ::", idx
         );
     }
@@ -529,7 +529,7 @@ pub(crate) unsafe fn wake_run(bus: u8, dev: u8, func: u8, idx: usize) -> Option<
     let running = wait_bounded(|| (mmio_read32(op + OP_USBSTS).unwrap_or(0x1000) >> 12) & 0x1 == 0);
     let usbcmd_after = mmio_read32(op + OP_USBCMD).unwrap_or(0);
     let usbsts_after = mmio_read32(op + OP_USBSTS).unwrap_or(0);
-    serial_println!(
+    crate::census_println!(
         ":: EHCI-CONFIG: [{}] RS 0->1: USBCMD {:#010x}->{:#010x} (RS={}), USBSTS={:#010x} HCHalted={} {} ::",
         idx, usbcmd_before, usbcmd_after, usbcmd_after & 0x1, usbsts_after, (usbsts_after >> 12) & 0x1,
         if running { "(running)" } else { "(STOP-NOTE: HCHalted did not clear within budget)" }
@@ -555,7 +555,7 @@ pub(crate) unsafe fn wake_route(h: &EhciFnHandle, idx: usize) {
     // ---- Step 3b: CONFIGFLAG=1 (route ports to this EHCI), then port-power on (PPC honored). ----
     let _ = mmio_write32(op + OP_CONFIGFLAG, 0x1);
     let cf_after = mmio_read32(op + OP_CONFIGFLAG).unwrap_or(0) & 0x1;
-    serial_println!(
+    crate::census_println!(
         ":: EHCI-CONFIG: [{}] CONFIGFLAG 0->1: read-back CF={} {} ::",
         idx, cf_after,
         if cf_after == 1 { "(ports routed to EHCI)" } else { "(STOP-NOTE: CF did not stick)" }
@@ -576,9 +576,9 @@ pub(crate) unsafe fn wake_route(h: &EhciFnHandle, idx: usize) {
                 }
             }
         }
-        serial_println!(":: EHCI-CONFIG: [{}] port-power applied (PPC=1) on {} ports ::", idx, n_ports);
+        crate::census_println!(":: EHCI-CONFIG: [{}] port-power applied (PPC=1) on {} ports ::", idx, n_ports);
     } else {
-        serial_println!(":: EHCI-CONFIG: [{}] PPC=0 — ports always-powered, no PP write ::", idx);
+        crate::census_println!(":: EHCI-CONFIG: [{}] PPC=0 — ports always-powered, no PP write ::", idx);
     }
 
     // EPACE-TRIM M4 (GR18) — the pre-look settle, priced by what actually happened above.
@@ -608,7 +608,7 @@ pub(crate) unsafe fn wake_route(h: &EhciFnHandle, idx: usize) {
     if ppc != 1 {
         PWR_SETTLE_TRIMMED.store(true, core::sync::atomic::Ordering::Relaxed);
     }
-    serial_println!(
+    crate::census_println!(
         ":: EHCI-CONFIG: [{}] pre-look settle {} ms ({}) — caller's 100 ms T_ATTDB debounce follows ::",
         idx, settle,
         if ppc == 1 { "PPC=1, port power applied here" } else { "EPACE-TRIM M4: PPC=0, no power edge to settle" }
@@ -629,7 +629,7 @@ unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, 
 
     // ---- Census A: RS=1, CONFIGFLAG=0 (ports still routed to the companion). ----
     let cf_before = mmio_read32(op + OP_CONFIGFLAG).unwrap_or(0) & 0x1;
-    serial_println!(
+    crate::census_println!(
         ":: EHCI-CONFIG: [{}] censusA context: CONFIGFLAG={} (route-to-EHCI={}), N_PORTS={} PPC={} ::",
         idx, cf_before, cf_before, n_ports, ppc
     );
@@ -651,7 +651,7 @@ unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, 
     // ---- Census B: RS=1, CONFIGFLAG=1, ports powered, after the full 150 ms settle. ----
     let census_b = census(op, n_ports, idx, "B");
 
-    serial_println!(
+    crate::census_println!(
         ":: EHCI-CONFIG: [{}] done — censusA={} connected, censusB={} connected ::",
         idx, census_a, census_b
     );
@@ -662,8 +662,8 @@ unsafe fn configure_controller(bus: u8, dev: u8, func: u8, idx: usize) -> (u32, 
 /// read-only scout. Walks EHCI functions, wakes each minimally, and reports two PORTSC censuses.
 #[cfg(feature = "ehciconfig")]
 pub fn configure_and_relook() {
-    serial_println!(":: EHCI-CONFIG: begin ::");
-    serial_println!(":: EHCI-CONFIG: minimal wake + two PORTSC censuses (CF 0 then 1) — evidence only; NO enumeration/transfers/reset/driver; writes confined to EHCI PMCSR/USBLEGSUP-OS-own/USBLEGCTLSTS/RS/CONFIGFLAG/PORTSC-PP ::");
+    crate::census_println!(":: EHCI-CONFIG: begin ::");
+    crate::census_println!(":: EHCI-CONFIG: minimal wake + two PORTSC censuses (CF 0 then 1) — evidence only; NO enumeration/transfers/reset/driver; writes confined to EHCI PMCSR/USBLEGSUP-OS-own/USBLEGCTLSTS/RS/CONFIGFLAG/PORTSC-PP ::");
 
     let mut controllers = 0usize;
     let mut total_a = 0u32;
@@ -696,10 +696,10 @@ pub fn configure_and_relook() {
     }
 
     if controllers == 0 {
-        serial_println!(":: EHCI-CONFIG: no EHCI controller found (class 0x0C0320) ::");
+        crate::census_println!(":: EHCI-CONFIG: no EHCI controller found (class 0x0C0320) ::");
     }
 
-    serial_println!(
+    crate::census_println!(
         ":: EHCI-CONFIG: end ({} controllers, censusA={} connected, censusB={} connected) ::",
         controllers, total_a, total_b
     );

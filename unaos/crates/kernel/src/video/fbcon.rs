@@ -1056,7 +1056,7 @@ pub fn console_pace_census_once() {
     // The census goes out BEFORE the flush, so its own glyphs are carried by the flush it describes
     // rather than left owed behind it. The numbers therefore describe the run up to this line, which
     // is what they claim.
-    serial_println!(
+    crate::census_println!(
         "[wc-x] console-pace ran={} held={} busy={} idle={} budget_us={} hz={}",
         PACE_RAN.load(Ordering::Relaxed),
         PACE_HELD.load(Ordering::Relaxed),
@@ -1223,7 +1223,7 @@ fn route_present_banded(owed_now: Owed, coalesce: bool) {
         }
     }
     if ok && !ROUTE_ANNOUNCED.swap(true, Ordering::Relaxed) {
-        serial_println!(
+        crate::census_println!(
             "[wc-x] console-route first-paint win={} (glyphs -> window surface, damage-limited)",
             id
         );
@@ -1917,7 +1917,7 @@ pub fn panel_console_window_open() -> wm::WinId {
         match got {
             Some(g) => g,
             None => {
-                serial_println!("[wc-x] console-window DECLINE reason=console-not-ready");
+                crate::census_println!("[wc-x] console-window DECLINE reason=console-not-ready");
                 return wm::WIN_NONE;
             }
         }
@@ -1930,7 +1930,7 @@ pub fn panel_console_window_open() -> wm::WinId {
     // request and the allocator is not something to enter with interrupts off.
     let mut store: Vec<u8> = alloc::vec::Vec::new();
     if store.try_reserve_exact(len).is_err() {
-        serial_println!("[wc-x] console-window DECLINE reason=alloc len={}", len);
+        crate::census_println!("[wc-x] console-window DECLINE reason=alloc len={}", len);
         return wm::WIN_NONE;
     }
     store.resize(len, 0);
@@ -1963,7 +1963,7 @@ pub fn panel_console_window_open() -> wm::WinId {
     let (_scale, ow, oh) = match wm::spawn_geometry(cw, ch) {
         Some(g) => g,
         None => {
-            serial_println!("[wc-x] console-window DECLINE reason=geometry-unavailable");
+            crate::census_println!("[wc-x] console-window DECLINE reason=geometry-unavailable");
             return wm::WIN_NONE;
         }
     };
@@ -2021,7 +2021,7 @@ pub fn panel_console_window_open() -> wm::WinId {
         // Fail closed and leave no orphan row: the window is closed and the surface is dropped with
         // `store` at the end of this scope.
         wm::close(id);
-        serial_println!("[wc-x] console-window DECLINE reason=install-contended");
+        crate::census_println!("[wc-x] console-window DECLINE reason=install-contended");
         return wm::WIN_NONE;
     }
 
@@ -2038,15 +2038,15 @@ pub fn panel_console_window_open() -> wm::WinId {
     // also why the two `[wc-x]` lines that follow are safe here — same context, same rule.
     publish_panel_owner(PanelOwner::ConsoleWindow, "fbcon::panel_console_window_open");
     let (gcols, grows) = ((cw / cell_w).max(1), (ch / cell_h).max(1));
-    serial_println!(
+    crate::census_println!(
         "[wc-x] console-window win={} panel={}x{} surf={}x{} box={}x{} at ({},{}) cell={}x{} cols={} rows={}",
         id, pw, ph, cw, ch, ow, oh, ox, oy, cell_w, cell_h, gcols, grows
     );
-    serial_println!(
+    crate::census_println!(
         "[wc-x] console-window panic-fallback armed win={} (panic paints the PANEL, not the window)",
         id
     );
-    serial_println!("[fbcon] remint win={} repainted_rows={} from={} grid={}x{} was={}x{} cursor={},{} retain={}", id, rm.repainted_rows, if rm.had { "cells" } else { "none" }, rgc, rgr, rm.was.0, rm.was.1, rm.col, rm.row, if retained { "ok" } else { "declined" }); route_present(); cascadefit_witness(pw, ph, ox, oy, ow, oh); route_present(); // CONSOLETEXT — the witness, on EVERY mint and UNGATED (no `witness` knob): this is the one line that separates "the console came back with its text" from "the console came back black", and the second is the defect render8 caught on the glass with nothing on the wire to name it. `from=none repainted_rows=0` is a FIRST mint; `from=cells repainted_rows=<n>` is a re-mint that restored `n` rows; `from=cells repainted_rows=0` is a re-mint whose previous screenful was genuinely blank. `retain` reads `ok` when the store was adopted by the install block — read back from `c.win_cells` inside the install block itself — and `declined` when the allocation was refused, i.e. when the NEXT mint will have nothing to repaint from. Emitted before `route_present` and outside every lock, per this function's standing rule for its two `[wc-x]` lines. ⚠ SAME-LINE fold, line-NEUTRAL. ‖ CASCADEFIT — the fit is MEASURED here, after the row exists and against the box that was actually created, and never asserted: both windows' geometry is a runtime function of the furniture, so `overlap_rows=` is the only honest statement of the rule. ⚠ SAME-LINE fold, line-NEUTRAL (PARITY.md §5.3).
+    crate::bootlog_println!("[fbcon] remint win={} repainted_rows={} from={} grid={}x{} was={}x{} cursor={},{} retain={}", id, rm.repainted_rows, if rm.had { "cells" } else { "none" }, rgc, rgr, rm.was.0, rm.was.1, rm.col, rm.row, if retained { "ok" } else { "declined" }); route_present(); cascadefit_witness(pw, ph, ox, oy, ow, oh); route_present(); // CONSOLETEXT — the witness, on EVERY mint and UNGATED (no `witness` knob): this is the one line that separates "the console came back with its text" from "the console came back black", and the second is the defect render8 caught on the glass with nothing on the wire to name it. `from=none repainted_rows=0` is a FIRST mint; `from=cells repainted_rows=<n>` is a re-mint that restored `n` rows; `from=cells repainted_rows=0` is a re-mint whose previous screenful was genuinely blank. `retain` reads `ok` when the store was adopted by the install block — read back from `c.win_cells` inside the install block itself — and `declined` when the allocation was refused, i.e. when the NEXT mint will have nothing to repaint from. Emitted before `route_present` and outside every lock, per this function's standing rule for its two `[wc-x]` lines. ⚠ SAME-LINE fold, line-NEUTRAL. ‖ CASCADEFIT — the fit is MEASURED here, after the row exists and against the box that was actually created, and never asserted: both windows' geometry is a runtime function of the furniture, so `overlap_rows=` is the only honest statement of the rule. ⚠ SAME-LINE fold, line-NEUTRAL (PARITY.md §5.3).
     id
 }
 
@@ -2544,7 +2544,7 @@ pub fn console_live_service() {
     }
     let n = LIVE_PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
     if n >= LIVE_CENSUS_AT && !LIVE_CENSUS_DONE.swap(true, Ordering::Relaxed) {
-        serial_println!(
+        crate::census_println!(
             "[wc-x] livecon census presents={} ran={} held={} busy={} idle={} (the console window presented {} times FROM THE RENDER SERVICE after the GUI handoff — a frozen snapshot presents none and prints no such line)",
             n,
             PACE_RAN.load(Ordering::Relaxed),
@@ -3153,7 +3153,7 @@ fn console_work_bottom(pw: usize, ph: usize) -> usize {
         return bottom;
     }
     if keep.saturating_sub(wtop) * 2 < bottom.saturating_sub(wtop) {
-        serial_println!(
+        crate::bootlog_println!(
             "[deskcascade] fit RELAXED panel={}x{} work={}..{} keepout={} -> the boot window below would leave the console less than half its work area; the console keeps the whole area and the boxes may overlap (clamped, never negative — the pulse window is the intruder on a panel this short)",
             pw, ph, wtop, bottom, keep
         );
@@ -3193,13 +3193,13 @@ fn cascadefit_witness(pw: usize, ph: usize, ox: usize, oy: usize, ow: usize, oh:
     match super::pulsewin::boot_box(pw, ph) {
         Some((px, py, pbw, pbh)) => {
             let n = box_overlap_rows((ox, oy, ow, oh), (px, py, pbw, pbh));
-            serial_println!(
+            crate::bootlog_println!(
                 "[deskcascade] fit console={}x{}+{}+{} pulse={}x{}+{}+{} overlap_rows={} -> {}",
                 ow, oh, ox, oy, pbw, pbh, px, py, n,
                 if n == 0 { "FIT" } else { "OVERLAP" }
             );
         }
-        None => serial_println!(
+        None => crate::bootlog_println!(
             "[deskcascade] fit console={}x{}+{}+{} pulse=none overlap_rows=0 -> FIT (no second boot window claims a keep-out on this desktop: `pulsewin::boot_box` is None — unarmed, or the panel cannot seat it)",
             ow, oh, ox, oy
         ),

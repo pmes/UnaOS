@@ -1042,7 +1042,7 @@ impl Screen {
         let seed = DESKTOP_BG_SEED.load(core::sync::atomic::Ordering::Acquire);
         if seed != SEED_NONE {
             back.fill_screen(seed);
-            serial_println!(
+            crate::census_println!(
                 "[wc-x] backbuffer resync {}x{} (desktop bg {:08X})",
                 info.width,
                 info.height,

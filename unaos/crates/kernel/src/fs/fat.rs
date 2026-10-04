@@ -4438,7 +4438,7 @@ impl FatFs {
             return None;
         }
         if de.size < crate::fs::sdhc4c::RESERVE_BYTES {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: SDHC4C: reserve NAME={} size={} < required {} ::",
                 NAME, de.size, crate::fs::sdhc4c::RESERVE_BYTES
             );
@@ -4451,7 +4451,7 @@ impl FatFs {
         }
         let first = de.first_cluster;
         if !self.valid_cluster(first) {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: SDHC4C: reserve NAME={} first_cluster={} is not a valid data cluster (2..{}) ::",
                 NAME, first, self.count_of_clusters + 2
             );
@@ -4475,7 +4475,7 @@ impl FatFs {
             }
         };
         if clusters.len() < need {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: SDHC4C: reserve NAME={} chain covers {} clusters, needs {} ::",
                 NAME, clusters.len(), need
             );
@@ -4492,7 +4492,7 @@ impl FatFs {
             }
         }
         if runs != 1 {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: SDHC4C: reserve NAME={} cluster={} size={} runs={} contiguous=0 ::",
                 NAME, first, de.size, runs
             );
@@ -4514,7 +4514,7 @@ impl FatFs {
         // of reach of a permitted write — whatever the chain walk returned, and whether or not the
         // BPB is honest about anything else.
         if a < self.data_start {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: SDHC4C: reserve NAME={} lba={} is BELOW data_start={} ::",
                 NAME, a, self.data_start
             );
@@ -4524,7 +4524,7 @@ impl FatFs {
         // (2) and it ends at or before the last addressable data sector.
         let data_end = self.data_start + self.count_of_clusters as u64 * self.sec_per_clus as u64;
         if b > data_end {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: SDHC4C: reserve NAME={} end={} is PAST the data region end={} ::",
                 NAME, b, data_end
             );
@@ -4534,7 +4534,7 @@ impl FatFs {
         // (3) the volume's and the partition's own extents — two separate on-disk claims, checked
         // by the same `in_extent` every read of this volume is checked against.
         if let Err(e) = self.in_extent(a, nsec) {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: SDHC4C: reserve NAME={} extent=[{}..{}) rejected by in_extent ({:?}) ::",
                 NAME, a, b, e
             );
@@ -4546,7 +4546,7 @@ impl FatFs {
             .map(|d| d.num_blocks)
             .unwrap_or(0);
         if b > dev_blocks {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: SDHC4C: reserve NAME={} end={} is PAST the card's num_blocks={} ::",
                 NAME, b, dev_blocks
             );
@@ -4614,7 +4614,7 @@ impl FatFs {
             }
         };
         if wrote != rec.len() {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: SDHC4C: in-place write SHORT wrote={} of {} lba=[{}..{}) ::",
                 wrote, rec.len(), a, b
             );
@@ -4638,7 +4638,7 @@ impl FatFs {
         }
         let got = permit::fnv1a(&back);
         if back.len() == rec.len() && got == want && back[..] == rec[..] {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: SDHC4C: in-place write ok bytes={} lba=[{}..{}) readback=MATCH fnv=0x{:08x} ::",
                 wrote, a, b, got
             );
@@ -4657,7 +4657,7 @@ impl FatFs {
     #[cfg(not(feature = "sdw"))]
     fn sdhc4c_write_verify(&self, _first: u32, _sectors: u64) {
         let (a, b) = crate::fs::sdhc4c::extent();
-        serial_println!(
+        crate::bootlog_println!(
             ":: SDHC4C: in-place write SKIPPED lba=[{}..{}) — this build carries no `sdw` feature, \
              so it contains no CMD24 ladder for the internal SD card; the permit is armed and the \
              extent is published, but nothing can write to it (UNAOS_SDW=1 arms the write leg) ::",

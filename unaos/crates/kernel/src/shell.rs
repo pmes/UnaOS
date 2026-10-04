@@ -5042,7 +5042,7 @@ pub fn fatverb_storage_witness() {
     // go-red measured missing. Both share one latch, so on a boot that bound a root the leg has
     // already spoken by here and this is a no-op.
     #[cfg(feature = "witness")]
-    x86bind_witness(&vfs_mount_table(), true);
+    if !crate::tests::defer("x86bind", x86bind_test) { x86bind_witness(&vfs_mount_table(), true); }
 }
 
 /// Run one command. Returns `true` if the command took over the whole screen with its own
@@ -7479,7 +7479,7 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
         stamp(&READ_BIND, &READ_BIND_SEQ, match crate::fs::bootdisk::locate() {
             crate::fs::bootdisk::Verdict::Bound(f) => bind::of_name(f.source.name()),
             crate::fs::bootdisk::Verdict::None_(_) => bind::DECLINED,
-        }); #[cfg(feature = "witness")] x86bind_witness(&mt, false); // X86BIND: the fixture, folded onto this line so arming `witness` shifts no ungated line (LAWS §5 byte identity). `settled=false`: a table builder cannot know enumeration is finished.
+        }); #[cfg(feature = "witness")] { if !crate::tests::defer("x86bind", x86bind_test) { x86bind_witness(&mt, false); } } // X86BIND: the fixture, folded onto this line so arming `witness` shifts no ungated line (LAWS §5 byte identity). `settled=false`: a table builder cannot know enumeration is finished.
     }
     mt
 }
@@ -8992,4 +8992,10 @@ pub(crate) fn exec_resolve_display(word: &str) -> Option<String> {
     }
     let name = midden_core::resolve_exec(word, &mut FatVolume)?;
     Some(exec_display_path(&name).unwrap_or(name))
+}
+
+/// QUIETBOOT2 (B325, R80): `tests x86bind` — the X86BIND root-binding fixture against the live mount table, settled.
+#[cfg(feature = "witness")]
+fn x86bind_test() {
+    x86bind_witness(&vfs_mount_table(), true);
 }

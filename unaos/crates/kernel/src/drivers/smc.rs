@@ -956,18 +956,18 @@ fn fmt_hex(bytes: &[u8]) -> alloc::string::String {
 /// yields the machine's real battery-key inventory. Read-only w.r.t. SMC state (no WRITE_CMD).
 /// Fires once at boot from `pci::init` under the `smc` feature.
 pub fn scout() {
-    serial_println!(":: SMC-SCOUT: begin (ports data={:#x} cmd={:#x}) ::", SMC_DATA_PORT, SMC_CMD_PORT);
+    crate::census_println!(":: SMC-SCOUT: begin (ports data={:#x} cmd={:#x}) ::", SMC_DATA_PORT, SMC_CMD_PORT);
     // SMC-DIAG: timestamp + raw pre-touch status byte BEFORE the first transaction — lets a
     // sitting compare when each build first touches the SMC (the GUI's quiet boot reaches this
     // point much earlier than the fbcon-heavy usbdebug boot) and what the status port reads cold.
-    serial_println!(
+    crate::census_println!(
         ":: SMC-DIAG: pre-touch t={}ms raw status={:#04x} ::",
         crate::arch::ms(),
         read_status()
     );
 
     if !present() {
-        serial_println!(":: SMC-SCOUT: end (present=N — no SMC answered REV; metal-first battery keys) ::");
+        crate::census_println!(":: SMC-SCOUT: end (present=N — no SMC answered REV; metal-first battery keys) ::");
         return;
     }
 
@@ -980,7 +980,7 @@ pub fn scout() {
             Ok(n) => {
                 found += 1;
                 let name = core::str::from_utf8(&key[..]).unwrap_or("????");
-                serial_println!(
+                crate::census_println!(
                     ":: SMC-SCOUT: key {} present len={} bytes=[{}] ({}) ::",
                     name, n, fmt_hex(&buf[..n]), desc
                 );
@@ -998,7 +998,7 @@ pub fn scout() {
                         // The first read was the anomaly, not the key set. Record it as present.
                         found += 1;
                         note_shape(key, SHAPE_PRESENT);
-                        serial_println!(
+                        crate::census_println!(
                             ":: SMC-SCOUT: key {} present len={} bytes=[{}] — first read said absent, second disagreed (bad sample, not an inventory fact) ({}) ::",
                             name, n, fmt_hex(&again[..n]), desc
                         );
@@ -1008,7 +1008,7 @@ pub fn scout() {
                         // looked the key up, twice, and answered "no such key". Said plainly,
                         // because this is the reading that used to arrive dressed as
                         // `SMC-DIAG: FIRST FAILURE … == evidence`.
-                        serial_println!(
+                        crate::census_println!(
                             ":: SMC-SCOUT: key {} absent (x2) — this SMC does not carry it (clean negative answer, not a fault) ({}) ::",
                             name, desc
                         );
@@ -1043,7 +1043,7 @@ pub fn scout() {
             for b in &keycount[..n] {
                 count = (count << 8) | (*b as u32);
             }
-            serial_println!(":: SMC-SCOUT: #KEY count={} — walking index list ::", count);
+            crate::census_println!(":: SMC-SCOUT: #KEY count={} — walking index list ::", count);
             let cap = count.min(MAX_ENUM_KEYS);
             let mut walked = 0u32;
             for idx in 0..cap {
@@ -1075,7 +1075,7 @@ pub fn scout() {
                         #[cfg(feature = "smcwalk")]
                         {
                             let ns = core::str::from_utf8(&name).unwrap_or("????");
-                            serial_println!(":: SMC-SCOUT: idx {} = {} ::", idx, ns);
+                            crate::census_println!(":: SMC-SCOUT: idx {} = {} ::", idx, ns);
                         }
                     }
                     // Absent and Stuck are different facts and no longer share a line (review
@@ -1083,7 +1083,7 @@ pub fn scout() {
                     // while a wedged handshake is a fault that happens to end it too. This path
                     // deliberately does not touch the one-shot DIAG — see `read_key_by_index`.
                     Err(SmcError::Absent) => {
-                        serial_println!(
+                        crate::census_println!(
                             ":: SMC-SCOUT: index enumeration ended at idx {} — GET_KEY_BY_INDEX answered no-such-index (clean stop) ::",
                             idx
                         );
@@ -1105,10 +1105,10 @@ pub fn scout() {
             // PREDICTION for Boot W (falsifiable, write the reading beside it): with the per-name
             // dump quiet, storage bring-up returns to ~11.4 s and `SPACE ftdi=` to ~180 ms (Boot V:
             // 14.9 s / 1519 ms; Boot U: 11.4 s / 177 ms), and `gui=` returns to the ~3408 ms band.
-            serial_println!(":: SMC-SCOUT: index walk done ({} of {} names) ::", walked, count);
+            crate::census_println!(":: SMC-SCOUT: index walk done ({} of {} names) ::", walked, count);
         }
         _ => {
-            serial_println!(":: SMC-SCOUT: index enumeration unavailable (no #KEY — QEMU/limited SMC; metal yields the full list) ::");
+            crate::census_println!(":: SMC-SCOUT: index enumeration unavailable (no #KEY — QEMU/limited SMC; metal yields the full list) ::");
         }
     }
 
@@ -1129,7 +1129,7 @@ pub fn scout() {
         );
     }
 
-    serial_println!(
+    crate::census_println!(
         ":: SMC-SCOUT: end (present=Y probed={} found={}) == witness ::",
         probed, found
     );
@@ -1511,7 +1511,7 @@ pub mod battery {
                 let mut noted = ACW_NOTED.lock();
                 if !*noted {
                     *noted = true;
-                    serial_println!(
+                    crate::census_println!(
                         ":: SMC-BATT: AC-W is absent on this SMC (clean negative answer, not a fault) — AC presence is UNKNOWN; ac=derived:* is inferred from the B0AC sign, and the key is re-probed every {} ms == witness ::",
                         ABSENT_REPROBE_MS
                     );

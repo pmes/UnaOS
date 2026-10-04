@@ -2663,7 +2663,7 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> u64 {
 
 /// SINKDRAIN, once per boot, x86 only. Called from [`mirror_service`], last of the four.
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
-fn sinkdrain_selftest() {
+fn sinkdrain_selftest() { if crate::tests::defer("sinkdrain", sinkdrain_selftest) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests sinkdrain` fires it.
     if SINKDRAIN_DONE.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -2796,7 +2796,7 @@ fn sinkdrain_selftest() {
 // metal boot takes, with no `cfg` anywhere on it:
 //
 //     video/wm.rs:14451          comp2_emit(span)                      (`witness`)
-//     video/wm.rs:13462          serial_println!("[comp2] rollup …")
+//     video/wm.rs:13462          crate::census_println!("[comp2] rollup …")
 //     arch/aarch64/serial.rs:284 serial_println! -> aarch64::serial::_print
 //     arch/aarch64/serial.rs:177 _print
 //     arch/aarch64/serial.rs:203   arch::without_interrupts(|| {

@@ -3431,7 +3431,7 @@ fn m4_note() -> &'static str {
 unsafe fn ensure_bus_master(bus: u8, dev: u8, func: u8, idx: usize) {
     let cmd = read_config_32(bus, dev, func, 0x04);
     if cmd & 0x6 == 0x6 {
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [{}] PCI COMMAND={:#06x} — memory-space + bus-master already enabled ::",
             idx,
             cmd & 0xFFFF
@@ -3443,7 +3443,7 @@ unsafe fn ensure_bus_master(bus: u8, dev: u8, func: u8, idx: usize) {
     // the RW1C status half to 0 instead: config writes to STATUS are write-1-to-clear).
     write_config_32(bus, dev, func, 0x04, (cmd & 0x0000_FFFF) | 0x6);
     let after = read_config_32(bus, dev, func, 0x04);
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: [{}] PCI COMMAND {:#06x}->{:#06x} (memory-space + bus-master enabled; declared surface extension) ::",
         idx,
         cmd & 0xFFFF,
@@ -3491,7 +3491,7 @@ impl Controller {
         // USBSTS.ASS handshakes — the Linux ehci-hcd idiom.
         // Evidence line: virt AND page-table-resolved phys of the QH the controller will
         // fetch (probe-5: static-pool DMA, low physical), + CTRLDSSEGMENT read-back.
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [{}] schedules armed (static pool): framelist phys={:#x} async head={:#x} work QH={:#x} CTRLDSSEGMENT={:#x} (dummy-head ring, ASE per-transfer, PSE deferred) ::",
             self.idx,
             self.frame_list_phys,
@@ -3518,7 +3518,7 @@ impl Controller {
         if !stale {
             return false;
         }
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [{}] firmware-stale controller state: USBCMD={:#010x} (PSE={} ASE={}) USBSTS={:#010x} (HSE={}) — pre-approved HCRESET path (traced inconsistency) ::",
             self.idx, cmd,
             (cmd >> 4) & 1, (cmd >> 5) & 1, sts, (sts >> 4) & 1
@@ -3533,7 +3533,7 @@ impl Controller {
         let reset_done = wait_bounded(|| {
             mmio_read32(self.op + OP_USBCMD).unwrap_or(CMD_HCRESET) & CMD_HCRESET == 0
         });
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [{}] HCRESET: halted={} reset-cleared={} USBCMD={:#010x} USBSTS={:#010x} (defaults; RS + CONFIGFLAG re-applied next) ::",
             self.idx, halted, reset_done,
             mmio_read32(self.op + OP_USBCMD).unwrap_or(0),
@@ -3669,7 +3669,7 @@ impl Controller {
         // Stage count is exact and free: SETUP + STATUS always, DATA only when wLength > 0
         // (`control_txn` above). The per-stage ass/act splits are the accumulator deltas.
         let stg = if w_length > 0 { 3 } else { 2 };
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [{}] EPACE-TRIM M8 SLOW-XFER addr={} hub={}.{} spd={} bmreq={:#04x} breq={:#04x} wval={:#06x} widx={:#06x} wlen={} stg={} xfer={}{} act={}{} ass={}{} seq={}/{} == witness ::",
             self.idx, t.addr, t.hub_addr, t.hub_port, spd,
             bm_req, b_req, w_value, w_index, w_length, stg,
@@ -3857,7 +3857,7 @@ impl Controller {
             let (ev, eu) = epace_fmt(en_cy);
             let (wv, wu) = epace_fmt(wait_cy);
             let (dv, du) = epace_fmt(dis_cy);
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] chain HSE sub-split: sched-en={}{} done-wait={}{} sched-dis={}{} == witness ::",
                 self.idx, ev, eu, wv, wu, dv, du
             );
@@ -4008,7 +4008,7 @@ impl Controller {
             }
             let before = mmio_read32(addr).unwrap_or(0);
             if before & PORT_CCS == 0 {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] port {} connect dropped during reset sequence (PORTSC={:#010x}){} ::",
                     self.idx, port, before, m4_note()
                 );
@@ -4022,7 +4022,7 @@ impl Controller {
             let cleared = wait_bounded(|| mmio_read32(addr).unwrap_or(PORT_PR) & PORT_PR == 0);
             settle_ms(10); // post-reset recovery before trusting PED
             let after = mmio_read32(addr).unwrap_or(0);
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] port {} reset attempt {}: PORTSC {:#010x} -> {:#010x} (PR-cleared={} PED={} owner={}) ::",
                 self.idx, port, attempt, before, after, cleared,
                 (after >> 2) & 1,
@@ -4067,7 +4067,7 @@ impl Controller {
         }
         let tok = core::ptr::read_volatile(&(*qh).overlay[2]);
         (*qh).overlay[0] = PTR_TERMINATE;
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [{}] live-port smoke ({}): USBSTS={:#010x} HSE={} HCHalted={} post-token={:#010x} == witness ::",
             self.idx, tag, sts, (sts >> 4) & 1, (sts >> 12) & 1, tok
         );
@@ -4184,7 +4184,7 @@ impl Controller {
 
         // Full device descriptor: the M1 branch-decider evidence.
         let Ok(n) = self.control(&t, 0x80, 6, 0x0100, 0, 18, true) else {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] address {} BURNED (full device descriptor unreadable post-address) ::",
                 self.idx, addr
             );
@@ -4195,7 +4195,7 @@ impl Controller {
             // real MPS0 were below 64 would end this IN on a short packet at its true MPS0 —
             // i.e. it lands HERE, not on the `d[7] != 64` cross-check below, which never gets to
             // run. `n` is then the device's actual MPS0, so this line names the number too.
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] address {} BURNED (short device descriptor: {} bytes){} ::",
                 self.idx, addr, n,
                 if hs_skip_preread {
@@ -4223,7 +4223,7 @@ impl Controller {
         // users of `t.mps0`, so the correction lands before any further wire traffic. Only the
         // legal set is accepted, exactly as the pre-read's own filter did.
         if hs_skip_preread && d[7] != 64 {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] BUY-2 FALSIFIED addr={} {:04x}:{:04x} spd=HS reports bMaxPacketSize0={} — USB 2.0 §5.5.3 permits only 64 at high speed; the skipped 8-byte pre-read would have caught this, MPS0 corrected for subsequent transfers == witness ::",
                 self.idx, addr, vid, pid, d[7]
             );
@@ -4234,7 +4234,7 @@ impl Controller {
         }
         // The M1 witness. At depth 0 this line IS the topology fork decision (design §2.4).
         if depth == 0 {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] M1 root device addr={} {:04x}:{:04x} class={:#04x} speed={} -> TOPOLOGY {} == witness ::",
                 self.idx, addr, vid, pid, class, speed,
                 if class == 0x09 { "A (hub tier / RMH)" } else { "B (direct device)" }
@@ -4250,12 +4250,12 @@ impl Controller {
             // (TT must be the SMSC hub 4, never the FS Broadcom hub 5) readable straight off
             // this line for every device, not just the Bluetooth one.
             #[cfg(not(feature = "bt"))]
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] M1 hub-downstream device addr={} {:04x}:{:04x} class={:#04x} speed={} (hub {} port {}) == witness ::",
                 self.idx, addr, vid, pid, class, speed, hub_addr, hub_port
             );
             #[cfg(feature = "bt")]
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] M1 hub-downstream device addr={} {:04x}:{:04x} class={:#04x} speed={} depth={} (parent hub {} port {}) tt=(hub {} port {}) == witness ::",
                 self.idx, addr, vid, pid, class, speed, depth,
                 self.bt_parent.0, self.bt_parent.1, hub_addr, hub_port
@@ -4281,7 +4281,7 @@ impl Controller {
             #[cfg(feature = "bt")]
             const HUB_DEPTH_CAP: u8 = 3;
             if depth >= HUB_DEPTH_CAP {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] hub at depth {} (addr {}) — beyond the internal tier; skipped ::",
                     self.idx, depth, addr
                 );
@@ -4308,12 +4308,12 @@ impl Controller {
             return;
         };
         if n < 7 {
-            serial_println!(":: EHCI-HID: [{}] hub addr {} short hub descriptor ({} bytes) ::", self.idx, hub.addr, n);
+            crate::bootlog_println!(":: EHCI-HID: [{}] hub addr {} short hub descriptor ({} bytes) ::", self.idx, hub.addr, n);
             return;
         }
         let nbr_ports = (*self.data_buf.add(2)).min(15);
         let pwr2good_ms = (*self.data_buf.add(5) as u64) * 2;
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [{}] hub addr {}: {} downstream ports (pwr-on 2 good {} ms) — walking ::",
             self.idx, hub.addr, nbr_ports, pwr2good_ms
         );
@@ -4426,7 +4426,7 @@ impl Controller {
             } else if rst_ms >= 50 {
                 // >=, not >: at exactly 50 ms the poll has reached the constant M5 replaced, so
                 // the boundary band is loud rather than silent.
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] EPACE-TRIM M5 TRIPWIRE — hub {} port {} took ~{} ms to clear PORT_RESET, at or past the 50 ms constant M5 replaced == witness ::",
                     self.idx, hub.addr, port, rst_ms
                 );
@@ -4437,12 +4437,12 @@ impl Controller {
                 // hub really does hold reset that long and M6 bought nothing on this port. That
                 // is a legitimate outcome, so the line is a named tripwire rather than a
                 // failure: it can fire on healthy hardware, and its absence is the trim paying.
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] EPACE-TRIM M6 TRIPWIRE — hub {} port {} took ~{} ms to clear PORT_RESET ({} x {} ms poll steps past the {} ms T_DRST floor); at or past the 20 ms the 10 ms grain reported, so M6's finer grain bought nothing here == witness ::",
                     self.idx, hub.addr, port, rst_ms, poll_steps, GRAIN_MS, T_DRST_MS
                 );
             } else if poll_steps > 0 {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] hub {} port {} PORT_RESET cleared after ~{} ms (T_DRST floor {} ms + {} x {} ms poll step(s)) ::",
                     self.idx, hub.addr, port, rst_ms, T_DRST_MS, poll_steps, GRAIN_MS
                 );
@@ -4452,7 +4452,7 @@ impl Controller {
             let _ = self.control(hub, 0x23, 1, 20, port, 0, false);
             self.pace.add(EP_HUBRST, hubrst_t0);
             if !ok || status & (1 << 1) == 0 {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] hub {} port {} did not enable after reset (status {:#010x}) — skipped ::",
                     self.idx, hub.addr, port, status
                 );
@@ -4587,7 +4587,7 @@ impl Controller {
             return;
         }
         #[cfg(feature = "uvc")] { let _b = self.data_buf; crate::drivers::uvc::probe(self.idx, t.addr, cfg, config_value, _b, &mut |bm, br, wv, wi, wl, di| self.control(t, bm, br, wv, wi, wl, di)); } if nfound == 0 { // UVC (rmbp-ledger B143) — THE CLASS-0xEF / VIDEO-IAD RECOGNITION ARM, and the ONE line this arc adds to this file. Placed HERE, immediately before the "nothing to arm" exit, for the reason the `bt` arm one statement up is placed before it: the rMBP's built-in FaceTime HD camera (`05ac:8510`, class 0xEF with a video IAD, HS, controller [0] addr 2) has NO HID interface at all, so every boot this kernel has ever taken enumerated it, printed that exit line and dropped it — flight 11's `:: EHCI-HID: [0] addr 2 has no HID interrupt-IN endpoint — nothing to arm ::` is the whole history of this device. AFTER the HID walk finished into `found[]` and BEFORE the exit, which is what makes reusing `cfg` safe here (it aliases `self.data_buf`, so any transfer destroys it — `uvc::probe` reads it ONLY for its no-traffic IAD gate and re-reads the descriptor in full before walking anything). It does NOT claim the device and does NOT return: the exit line below still prints for the camera, so this arc ADDS wire and removes none. The closure is the transfer seam — `control()` with the `Target` bound — which is what lets the whole driver live in `drivers/uvc.rs` and be reached from here by one call. ⚠ LINE-NEUTRAL SAME-LINE FOLD, and non-negotiable in this file: `mod.rs` is 18k lines, a large fraction of them below this point, and ONE new source line would move every `panic::Location` record in them and the knob-off image with it (LEDGER P7, LAWS §5). The statement is FIRST and every `//` is last, so nothing is commented out. Knob off => the whole `#[cfg]` block is erased, `drivers/mod.rs`'s `pub mod uvc` is never lexed, and `./arroyo knoboff uvc` compares byte-identical.
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] addr {} has no HID interrupt-IN endpoint — nothing to arm ::",
                 self.idx, t.addr
             );
@@ -4622,7 +4622,7 @@ impl Controller {
             if !self.arm_interrupt_ep(t, ep, mps.min(64), proto == 1, proto == 2, None, intf) {
                 continue;
             }
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] M2 armed {} addr={} ep=IN{} mps={} interval={} (boot protocol) == witness ::",
                 self.idx,
                 if proto == 1 { "keyboard" } else { "boot-mouse" },
@@ -4652,7 +4652,7 @@ impl Controller {
         report_len: u16,
     ) {
         if report_len == 0 {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] addr {} intf {} non-boot HID but no report-descriptor length in the HID descriptor — skipped ::",
                 self.idx, t.addr, intf
             );
@@ -4675,7 +4675,7 @@ impl Controller {
         // dump: the leading bytes, hex, on one line — enough to reconstruct the field map.
         dump_report_descriptor(self.idx, t.addr, intf, report_len, desc);
         let Some(layout) = parse_report_descriptor(desc) else {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] addr {} intf {} report descriptor has no X/Y pointer field (parsed {} of {} B) — not a cursor device; skipped ::",
                 self.idx, t.addr, intf, n, report_len
             );
@@ -4717,13 +4717,13 @@ impl Controller {
             // EHCI-5 M1: the Apple vendor-multitouch interface (Report ID 0x44, page 0xFF00). The
             // descriptor does not describe the finger layout — arm to CAPTURE the raw body and
             // decode the first finger at the HYPOTHESIS offsets (confirmed/corrected at the sitting).
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] M1 armed vendor-multitouch addr={} ep=IN{} mps={} interval={} id={:#04x} body={}b (capture; hypothesis X@{} Y@{} le16, touch@{}) == witness ::",
                 self.idx, t.addr, ep, mps, interval, layout.report_id, layout.total_bits,
                 VMT_FINGER_ABS_X, VMT_FINGER_ABS_Y, VMT_FINGER_TOUCH,
             );
         } else {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] M2 armed report-pointer addr={} ep=IN{} mps={} interval={} ({}; X@{}/{}b Y@{}/{}b btn@{}x{} id={} body={}b{}) == witness ::",
                 self.idx, t.addr, ep, mps, interval,
                 if layout.relative { "relative" } else { "absolute" },
@@ -4795,7 +4795,7 @@ impl Controller {
         let latched = self.bcm5974_mode_attempt(t, intf, intf as u16, "hid1.11-intf")
             || (intf as u16 != BCM5974_MODE_REQ_INDEX
                 && self.bcm5974_mode_attempt(t, intf, BCM5974_MODE_REQ_INDEX, "legacy-index0"));
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [{}] [tp] mt route={} latched={} (addr={} intf={}; the readback's route — a stream that disagrees is routed by the stream) == witness ::",
             self.idx, if latched { "vendor" } else { "legacy" }, if latched { "yes" } else { "no" },
             t.addr, intf
@@ -4829,7 +4829,7 @@ impl Controller {
             Ok(got) => {
                 let n = (got as usize).min(N);
                 let cur = if n > 0 { *self.data_buf } else { 0 };
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] M1 bcm5974 GET_REPORT(feature) addr={} intf={} widx={} got={}b byte0={:#04x} == witness ::",
                     self.idx, t.addr, intf, w_index, got, cur
                 );
@@ -4885,7 +4885,7 @@ impl Controller {
         }
         let latched = read_back && back[0] == BCM5974_MODE_VENDOR;
         let (mut wh, mut bh) = ([0u8; TP_HEX_MAX], [0u8; TP_HEX_MAX]);
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [{}] [tp] mode wrote={} readback={} latched={} (addr={} intf={} widx={} try={} set={} readback_ok={}) == witness ::",
             self.idx,
             tp_hex(&mut wh, &wrote),
@@ -5019,7 +5019,7 @@ impl Controller {
         let caps = (leds >> 1) & 1;
         match self.control(t, 0x21, 0x09, 0x0200, intf as u16, 1, false) {
             Ok(_) => {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT ok addr={} intf={} == witness ::",
                     self.idx, caps, leds, t.addr, intf
                 );
@@ -5042,7 +5042,7 @@ impl Controller {
                 false
             }
             Err(e) => {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] ALLKEYS caps={} leds={:#04x} SET_REPORT nak addr={} intf={} ({}) — LED latched off, case still tracked ::",
                     self.idx, caps, leds, t.addr, intf, e
                 );
@@ -14009,7 +14009,7 @@ impl Controller {
                         // §33h), not an endpoint that is polled too slowly. Global numbers, so two
                         // endpoints in one capture carry the same pair — they shared the pass.
                         let (pp_max_us, pp_mean_us) = pass_period_read();
-                        serial_println!(
+                        crate::bootlog_println!(
                             ":: EHCI-HID: [{}] EHCIDARK addr={} ep=IN{} kind={} reports={} cad={}ms windows={} dark={}ms max={}ms missed<={} pass_period_us_max={} pass_period_us_mean={} == witness ::",
                             idx, chars & 0x7F, (chars >> 8) & 0xF, int_ep_kind(e),
                             e.reports.wrapping_add(1), e.dark_cad_ms, e.dark_windows,
@@ -14118,7 +14118,7 @@ impl Controller {
                                 // first id-0x02 report whatever its position in the stream, and the
                                 // census line carries the rest.
                                 if e.tp.n[0] == 1 {
-                                    serial_println!(
+                                    crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] trackpad format witness: 8-byte id=0x02 rel — buttons={:#04x} dx={} dy={} == witness ::",
                                         idx, buttons, dx, dy
                                     );
@@ -14160,12 +14160,12 @@ impl Controller {
                                     },
                                 );
                                 if press {
-                                    serial_println!(
+                                    crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
                                         idx, buttons
                                     );
                                 } else if release {
-                                    serial_println!(
+                                    crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] trackpad release (button-up edge, buttons={:#04x}) == witness ::",
                                         idx, buttons
                                     );
@@ -14177,7 +14177,7 @@ impl Controller {
                               // confirms the `VMT_FINGER_*` offsets this decode installs NOTHING.
                               TpRoute::Mt { present, x, y } => {
                                 if e.tp.n[1] == 1 {
-                                    serial_println!(
+                                    crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] trackpad vendor frame: id={:#04x} len={} first-finger present={} x={} y={} (HYPOTHESIS offsets X@{} Y@{} touch@{}; decode only, NOT installed) == witness ::",
                                         idx, TRACKPAD_VENDOR_REPORT_ID, report.len(), present, x, y,
                                         VMT_FINGER_ABS_X, VMT_FINGER_ABS_Y, VMT_FINGER_TOUCH
@@ -14197,7 +14197,7 @@ impl Controller {
                                 }
                                 let (buttons, dx, dy, wit) = e.tp.mt_step(f);
                                 if wit {
-                                    serial_println!(
+                                    crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] [tp] mt fingers={} mover={} x={} y={} dx={} dy={} curve={}/{}@{} frame={} == witness ::", // TPSCALE (B214): dx/dy are the SCALED pixels the router takes; div= names the divisor so a glass reading can re-derive raw units
                                         idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, TP_MT_DIV_LOW, TP_MT_DIV_HIGH, TP_MT_CURVE_KNEE, e.tp.mt_frames
                                     );
@@ -14216,12 +14216,12 @@ impl Controller {
                                     },
                                 );
                                 if press {
-                                    serial_println!(
+                                    crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
                                         idx, buttons
                                     );
                                 } else if release {
-                                    serial_println!(
+                                    crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] trackpad release (button-up edge, buttons={:#04x}) == witness ::",
                                         idx, buttons
                                     );
@@ -14265,7 +14265,7 @@ impl Controller {
                                 },
                             );
                             if e.reports == 1 || e.reports % 32 == 0 {
-                                serial_println!(
+                                crate::bootlog_println!(
                                     ":: EHCI-HID: [{}] report-pointer {} reports, last {} x={} y={} buttons={:#04x} fingers={} == witness ::",
                                     idx, e.reports,
                                     if l.relative { "rel" } else { "abs" },
@@ -14294,7 +14294,7 @@ impl Controller {
                             n_led += 1;
                         }
                         if e.reports == 1 || e.reports % 32 == 0 {
-                            serial_println!(
+                            crate::bootlog_println!(
                                 ":: EHCI-HID: [{}] kbd {} reports, last {:02x} {:02x} .. == witness ::",
                                 idx, e.reports, report[0], report.get(2).copied().unwrap_or(0)
                             );
@@ -14321,7 +14321,7 @@ impl Controller {
                             },
                         );
                         if e.reports == 1 || e.reports % 32 == 0 {
-                            serial_println!(
+                            crate::bootlog_println!(
                                 ":: EHCI-HID: [{}] mouse {} reports, last dx={} dy={} buttons={:#04x} == witness ::",
                                 idx, e.reports, dx, dy, report[0]
                             );
@@ -14382,7 +14382,7 @@ impl Controller {
                 let ok = self
                     .control(&t, 0x02, 0x01, 0x0000, (ep as u16) | 0x0080, 0, false)
                     .is_ok();
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] KBDFLAP HALT-CLEAR addr={} ep=IN{} kind={} attempt={}/{} ClearFeature(ENDPOINT_HALT) -> {} == witness ::",
                     self.idx, t.addr, ep, int_ep_kind(&self.int_eps[ep_i]),
                     self.int_eps[ep_i].halt_clears, HALT_CLEARS_MAX,
@@ -14445,17 +14445,17 @@ impl Controller {
                 survivors += 1;
             }
             if survivors == 0 {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] RETIRE-CONSEQUENCE addr={} ep=IN{} role={} is out for the rest of this boot — NO live {} endpoint remains on this controller at this pass (a later M2 arm supersedes this line) == witness ::",
                     self.idx, r_addr, r_ep, role, role
                 );
             } else if survivors == 1 {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] RETIRE-CONSEQUENCE addr={} ep=IN{} role={} is out for the rest of this boot — {} input rides addr={} ep=IN{} only == witness ::",
                     self.idx, r_addr, r_ep, role, role, s_addr, s_ep
                 );
             } else {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] RETIRE-CONSEQUENCE addr={} ep=IN{} role={} is out for the rest of this boot — {} input rides {} live endpoints (first addr={} ep=IN{}) == witness ::",
                     self.idx, r_addr, r_ep, role, role, survivors, s_addr, s_ep
                 );
@@ -14678,7 +14678,7 @@ fn pass_period_read() -> (u32, u64) {
 /// It runs BEFORE any endpoint is armed and restores all four counters before returning, so a
 /// boot's EHCIDARK line reports the machine's own passes and not the fixture's tally — the same
 /// discipline `isr_selftest` keeps with the ISRARM operational counters.
-fn pass_period_selftest() {
+fn pass_period_selftest() { if crate::tests::defer("passperiod", pass_period_selftest) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests passperiod` fires it.
     let (s_last, s_max, s_sum, s_n) = (
         PASS_LAST_TSC.load(Ordering::Relaxed),
         PASS_MAX_US.load(Ordering::Relaxed),
@@ -15255,7 +15255,7 @@ unsafe fn isr_arm_controller(idx: usize, bus: u8, dev: u8, func: u8, op: u64) {
         return;
     }
     ISR_ARMED.fetch_add(1, Ordering::Relaxed);
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: [{}] ISRARM armed via={} vector {:#04x}, USBINTR {:#010x} -> {:#010x} (USBINT unmasked). The polled pass REMAINS the fallback: if this vector never fires, an `ISRARM IRQ DEAD` line follows and nothing else changes == witness ::",
         idx, IsrVia(via, msg_addr), // IOAPIC2 (rmbp-ledger B191) — `msi addr=…` or `ioapic-intx gsi=…`
         ehci_vec, // VECTORS (rmbp-ledger B168) — the allocated vector, same-line substitution.
@@ -15437,7 +15437,7 @@ fn isr_rollup(now_ms: u64) {
         // boot would otherwise carry the verdict without a single number behind it, and an operator
         // would have to take "everything still polled" on the driver's word. `poll_rearm=` is that
         // word's evidence: nonzero here means the fallback is not merely nominated but working.
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: ISRARM IRQ DEAD — completion interrupt armed (MSI or I/O APIC INTx) on {} controller(s) and USBINTR enabled, but the vector has NOT been delivered once in {} ms (irq={} isr_rearm={} poll_rearm={}). Every endpoint is being re-armed by the POLLED pass, exactly as before this arc; the dark window is unchanged and EHCIDARK still measures it. This is the fallback working, not a crash == witness ::",
             armed, now_ms, entries, rearms, POLL_REARMS.load(Ordering::Relaxed)
         );
@@ -15449,7 +15449,7 @@ fn isr_rollup(now_ms: u64) {
     }
     ISR_LOG_MS.store(now_ms, Ordering::Relaxed);
     ISR_LOG_REARMS.store(rearms, Ordering::Relaxed);
-    serial_println!(
+    crate::census_println!(
         ":: EHCI-HID: ISRARM armed={} refused={} irq={} isr_rearm={} poll_rearm={} depth_max={} ring={} dropped={} ringfull={} cont_isr={} cont_poll={} oversize={} == witness ::",
         armed,
         ISR_REFUSED.load(Ordering::Relaxed),
@@ -15989,7 +15989,7 @@ unsafe fn kbdwit_note_halt(e: &mut IntEp, idx: usize, tok: u32) {
     // last activity: 2444 - 1823 = 621 ms, and `reports_prior=0` on the line says as much.
     let quiet = now.wrapping_sub(e.kbdwit_armed_ms);
     let (class, _) = halt_class(tok);
-    serial_println!(
+    crate::census_println!(
         ":: KBDWIT: [{}] ep=IN{} addr={} kind={} SILENCE-CUT-BY-HALT class={} tok={:#010x} cerr={} halted={} xact={} babble={} dbuf={} missed={} err={} rem={} armed_ms={} now_ms={} quiet_ms={} deadline_ms={} short_by_ms={} polls={} walks={} split_or={:#018x} reports_prior={} toggle={} == witness ::",
         idx,
         (chars >> 8) & 0xF,
@@ -16073,7 +16073,7 @@ unsafe fn kbdwit_note_silence_end(e: &mut IntEp, idx: usize, verdict: &str, tok:
     e.kbdwit_broke = true;
     let now = crate::arch::ms();
     let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
-    serial_println!(
+    crate::census_println!(
         ":: KBDWIT: [{}] ep=IN{} addr={} {} tok={:#010x} halted={} xact={} babble={} dbuf={} rem={} armed_ms={} now_ms={} quiet_ms={} polls={} walks={} split_or={:#018x} reports_prior={} toggle={} == witness ::",
         idx,
         (chars >> 8) & 0xF,
@@ -16245,7 +16245,7 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     // `polls == 0` simply cannot arise on that path. `polls=` remains on the line regardless,
     // which is what guards against reading a SMALL sample (the dead path's other, unavoidable
     // weakness) as a verdict.
-    serial_println!(
+    crate::census_println!(
         ":: KBDWIT: [{}] ep=IN{} addr={} kind={} NO-COMPLETIONS class={} sched={} polls={} walks={} split_or={:#018x} quiet={}ms armed_ms={} last_ms={} now_ms={} reports={} toggle={} dead={} == witness ::",
         idx, epn, addr, kind,
         if e.kbdwit_last_ms == 0 { "never-completed" } else { "went-quiet" },
@@ -16265,7 +16265,7 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     // `qtd_driven=0` marks `qtd_tok` as NOT DRIVEN: on the overlay-direct path the controller is
     // never given that qTD, so the word is untouched zeroed pool memory and must not be decoded —
     // it would read `active=0 halted=0`, i.e. "completed cleanly", contradicting line 1.
-    serial_println!(
+    crate::census_println!(
         ":: KBDWIT: [{}] ep=IN{} path={} seen={:#010x} ovl_tok={:#010x} qtd_tok={:#010x} qtd_driven={} live={:#010x} == witness ::",
         idx, epn,
         if om { "overlay-direct" } else { "qtd-chain" },
@@ -16275,7 +16275,7 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     // the armed total means not one byte moved. `tog` is the qTD Data Toggle (token bit 31) — so
     // named, not `dt`, because line 7 already reports an elapsed-milliseconds field and one
     // `awk '/dt=/'` must not match two unrelated quantities in the same dump.
-    serial_println!(
+    crate::census_println!(
         ":: KBDWIT: [{}] ep=IN{} tok active={} halted={} dbuf={} babble={} xact={} missed={} split={} ping={} pid={} cerr={} ioc={} tog={} rem={} == witness ::",
         idx, epn,
         (live >> 7) & 1, (live >> 6) & 1, (live >> 5) & 1, (live >> 4) & 1,
@@ -16285,7 +16285,7 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     );
     // 4/7 — the queue head verbatim. `ovl4` is split progress on THIS transfer; `ovl5` is residue
     // the driver never clears on the overlay-direct path — read the block above before using it.
-    serial_println!(
+    crate::census_println!(
         ":: KBDWIT: [{}] ep=IN{} qh={:#010x} chars={:#010x} caps={:#010x} horiz={:#010x} cur={:#010x} ovl0={:#010x} ovl1={:#010x} ovl3={:#010x} ovl4={:#010x} ovl5={:#010x} == witness ::",
         idx, epn, qh_phys, chars, caps, horiz, cur, ovl0, ovl1, ovl3, ovl4, ovl5,
     );
@@ -16293,7 +16293,7 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     // `fl0` is frame-list entry 0, the head of the periodic chain the controller walks. If neither
     // it nor any `horiz` in that chain reaches `qh`, this endpoint is orphaned from the schedule
     // and no amount of healthy controller state could ever have completed it.
-    serial_println!(
+    crate::census_println!(
         ":: KBDWIT: [{}] ep=IN{} mps={} eps={} dtc={} smask={:#04x} cmask={:#04x} tt=hub{}:port{} mult={} buf_phys={:#010x} qtd_phys={:#010x} fl0={:#010x} == witness ::",
         idx, epn,
         (chars >> 16) & 0x7FF, kbdwit_eps(chars), (chars >> 14) & 1,
@@ -16310,7 +16310,7 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     );
     // 6/7 — controller state. `ok=0` means the MMIO read itself failed and the hex is a
     // placeholder, NOT a set of clear status bits.
-    serial_println!(
+    crate::census_println!(
         ":: KBDWIT: [{}] ep=IN{} usbsts={:#010x} usbcmd={:#010x} ok={} hch={} hse={} pss={} ass={} rs={} pse={} ase={} == witness ::",
         idx, epn,
         sts.unwrap_or(0), cmd.unwrap_or(0),
@@ -16354,7 +16354,7 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
         (Some(arm), Some(fire)) => fire.wrapping_sub(arm) & 0x3FFF,
         _ => 0,
     };
-    serial_println!(
+    crate::census_println!(
         ":: KBDWIT: [{}] ep=IN{} frindex arm={:#06x} fire={:#06x} post={:#06x} ok={} post_ok={} adv={:#06x} post_ms={} == witness ::",
         idx, epn,
         e.kbdwit_armed_frindex.unwrap_or(0) & 0x3FFF,
@@ -16875,7 +16875,7 @@ unsafe fn flush_held_releases(e: &mut IntEp, idx: usize) {
         }
         let ascii = super::xhci::hid_key_release_ascii(keycode, e.kbd_prev_mods, caps);
         if ascii != 0 {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] KEYUP-FLUSH: '{}' (scancode {:#x}) — endpoint retired, release synthesised == witness ::",
                 idx, ascii as char, keycode
             );
@@ -17584,7 +17584,7 @@ fn tp_census_rollup(e: &mut IntEp, idx: usize, now_ms: u64) {
     let f0 = e.tp.first_len[0] as usize;
     let f1 = e.tp.first_len[1] as usize;
     let f2 = e.tp.first_len[2] as usize;
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: [{}] [tp] ids=02:{},44:{},other:{} sizes={}/{} first_bytes=02[{}] 44[{}] other[{}] == witness ::",
         idx,
         e.tp.n[0], e.tp.n[1], e.tp.n[2],
@@ -17721,7 +17721,7 @@ unsafe fn trackpad_dispatch_selftest() {
         TpRoute::Mt { present, x, y } => (present, x, y),
         _ => (false, 0, 0),
     };
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: [tp] dispatch self-test capture={} -> rel buttons={:#04x} dx={} dy={} | 0x44 {} -> mt present={} x={} y={} | runt={} rel={} mt={} empty={} census=02:{},44:{},other:{} sizes={}/{} ok={} :: {} ::",
         tp_hex(&mut h, &r2),
         rel_btn, rel_dx, rel_dy,
@@ -18024,7 +18024,7 @@ unsafe fn dump_report_descriptor(idx: usize, addr: u8, intf: u8, report_len: u16
         hex.push(char::from_digit(hi as u32, 16).unwrap());
         hex.push(char::from_digit(lo as u32, 16).unwrap());
     }
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: [{}] addr {} intf {} report descriptor ({} of {} B){}: {} ::",
         idx, addr, intf, desc.len(), report_len,
         if desc.len() < report_len as usize { " [truncated at read cap]" } else { "" },
@@ -18050,7 +18050,7 @@ fn dump_vendor_report(idx: usize, count: u32, report: &[u8]) {
         hex.push(char::from_digit((b >> 4) as u32, 16).unwrap());
         hex.push(char::from_digit((b & 0xF) as u32, 16).unwrap());
     }
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: [{}] vendor-multitouch raw report #{} ({} B): {} == witness ::",
         idx, count, report.len(), hex
     );
@@ -18099,7 +18099,7 @@ unsafe fn parser_selftest() {
     let legit_ok = parse_report_descriptor(&legit)
         .map(|l| l.has_xy && l.x_size == 16 && l.y_size == 16 && l.x_off == 0 && l.y_off == 16)
         .unwrap_or(false);
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: report-parser self-test: hostile report_count clamped (bounded={}, cap={}), legit X/Y parse ok={} == witness ::",
         hostile_bounded, MAX_REPORT_FIELDS, legit_ok
     );
@@ -18246,7 +18246,7 @@ unsafe fn vendor_multitouch_selftest() {
         .map(|l| l.vendor_mt && !l.has_xy && l.report_id == 0x44)
         .unwrap_or(false);
 
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: vendor-multitouch self-test: recognized={} (id={:#04x}, min-bits={}), real-array-descriptor recognized={}, first-finger decode dx={} dy={} ok={} == witness ::",
         vendor_ok, id, VMT_MIN_VENDOR_BITS, real_ok, dx, dy, decode_ok
     ); tpscale_selftest(); // TPSCALE (B214): the divisor against flight 13's own numbers, beside the decoder's self-test it scales
@@ -18261,12 +18261,12 @@ unsafe fn vendor_multitouch_selftest() {
 /// entries — which name the faulting source BDF, reason, and address. Zero writes.
 unsafe fn dmar_report() {
     let Some(dmar) = crate::arch::x86_64::acpi::find_acpi_table(b"DMAR") else {
-        serial_println!(":: EHCI-HID: DMAR: no ACPI DMAR table — VT-d not described; IOMMU theory falsified ::");
+        crate::bootlog_println!(":: EHCI-HID: DMAR: no ACPI DMAR table — VT-d not described; IOMMU theory falsified ::");
         return;
     };
     let len = mmio_read32(dmar + 4).unwrap_or(0) as u64; // SDT header length
     let haw = mmio_read32(dmar + 36).unwrap_or(0);
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: DMAR present @ {:#x} len={} host-addr-width={} flags={:#04x} ::",
         dmar, len, (haw & 0xFF) + 1, (haw >> 8) & 0xFF
     );
@@ -18290,7 +18290,7 @@ unsafe fn dmar_report() {
             let cap = (cap_lo as u64) | ((cap_hi as u64) << 32);
             let fro = ((cap >> 24) & 0x3FF) * 16; // fault-recording offset, 128-bit units
             let nfr = ((cap >> 40) & 0xFF) + 1;
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: DMAR DRHD[{}] base={:#x} GSTS={:#010x} (TES={}) FSTS={:#010x} CAP={:#018x} NFR={} ::",
                 unit, base, gsts, (gsts >> 31) & 1, fsts, cap, nfr
             );
@@ -18299,7 +18299,7 @@ unsafe fn dmar_report() {
             // blocks device DMA exactly like the observed master aborts; every OS clears it
             // at IOMMU handoff. Read-only dump: enable/status + both regions' bounds.
             let pmen = mmio_read32(base + 0x64).unwrap_or(0);
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: DMAR DRHD[{}] PMEN={:#010x} (EPM={} PRS={}) PLMR {:#010x}..{:#010x} PHMR {:#010x}_{:08x}..{:#010x}_{:08x} == witness ::",
                 unit, pmen, (pmen >> 31) & 1, pmen & 1,
                 mmio_read32(base + 0x68).unwrap_or(0),
@@ -18317,7 +18317,7 @@ unsafe fn dmar_report() {
                 let d0 = mmio_read32(dmar + soff).unwrap_or(0);
                 let d1 = mmio_read32(dmar + soff + 4).unwrap_or(0);
                 let slen2 = (d0 >> 8) & 0xFF;
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: DMAR DRHD[{}] scope: type={} len={} start-bus={} path[0]={:#04x},{:#04x} ::",
                     unit, d0 & 0xFF, slen2, (d0 >> 24) & 0xFF, d1 & 0xFF, (d1 >> 8) & 0xFF
                 );
@@ -18334,7 +18334,7 @@ unsafe fn dmar_report() {
                     | ((mmio_read32(fr + 12).unwrap_or(0) as u64) << 32);
                 if hi >> 63 != 0 {
                     let sid = hi & 0xFFFF;
-                    serial_println!(
+                    crate::bootlog_println!(
                         ":: EHCI-HID: DMAR DRHD[{}] FAULT[{}]: source {:02x}:{:02x}.{} reason={:#04x} addr={:#x} == witness ::",
                         unit, i, (sid >> 8) & 0xFF, (sid >> 3) & 0x1F, sid & 0x7,
                         (hi >> 32) & 0xFF, lo & !0xFFF
@@ -18346,7 +18346,7 @@ unsafe fn dmar_report() {
         off += slen as u64;
     }
     if unit == 0 {
-        serial_println!(":: EHCI-HID: DMAR table has no DRHD units ::");
+        crate::bootlog_println!(":: EHCI-HID: DMAR table has no DRHD units ::");
     }
 }
 
@@ -18357,7 +18357,7 @@ unsafe fn dmar_report() {
 unsafe fn pci_evidence(bus: u8, dev: u8, func: u8, idx: usize) {
     let sc = read_config_32(bus, dev, func, 0x04);
     let status = (sc >> 16) as u16;
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: [{}] PCI STATUS={:#06x} RMA={} RTA={} STA={} SSE={} DPE={} MDPE={} == witness ::",
         idx, status,
         (status >> 13) & 1, // Received Master Abort
@@ -18369,7 +18369,7 @@ unsafe fn pci_evidence(bus: u8, dev: u8, func: u8, idx: usize) {
     );
     for row in 0..8u8 {
         let base = row * 32;
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [{}] CFG {:#04x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} ::",
             idx, base,
             read_config_32(bus, dev, func, base),
@@ -18390,7 +18390,7 @@ unsafe fn pci_evidence(bus: u8, dev: u8, func: u8, idx: usize) {
 /// flip / xhci::init (the internal HID sit on non-switchable EHCI-only ports, so the two
 /// stacks' port sets are disjoint by hardware — PORTSW-1 §7f).
 pub fn init() {
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: begin (EHCI-3 driver, polled model + ISRARM completion interrupt, knob-gated) ::"
     );
     // EPACE: the module's own entry→exit span — the self-check target for the per-phase split.
@@ -18405,7 +18405,7 @@ pub fn init() {
     // an absent one, and the same is true of the mechanism under it. This fixture drives the real
     // `isr_service_ep` against a hand-built completion so the ISR path is exercised on every boot,
     // QEMU included. See `isr_selftest`.
-    unsafe { isr_selftest() };
+    if !crate::tests::defer("ehciisr", ehci_isr_test) { unsafe { isr_selftest() }; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests ehciisr` fires it.
     // PASSPERIOD: the census's new pair, for the same reason and in the same place. A healthy QEMU
     // boot runs every pass at the tick, so the STALL half of the instrument — the only half that
     // matters — would never execute on any gate this repo runs. See `pass_period_selftest`.
@@ -18464,13 +18464,13 @@ pub fn init() {
                     // never be mistaken for an inherited verdict. The "verdict CARRIED" witness
                     // moves with the read, so a capture still distinguishes measured from inherited.
                     if h.addr64 != 0 {
-                        serial_println!(
+                        crate::bootlog_println!(
                             ":: EHCI-HID: [{}] note: controller advertises 64-bit addressing; CTRLDSSEGMENT pinned to 0 (all DMA < 4 GiB) ::",
                             idx
                         );
                     }
                     if idx >= MAX_CONTROLLERS {
-                        serial_println!(
+                        crate::bootlog_println!(
                             ":: EHCI-HID: [{}] more EHCI functions than static DMA pools ({}) — skipped ::",
                             idx, MAX_CONTROLLERS
                         );
@@ -18591,7 +18591,7 @@ pub fn init() {
                                 & STS_HCHALTED
                                 == 0
                         });
-                        serial_println!(
+                        crate::bootlog_println!(
                             ":: EHCI-HID: [{}] post-HCRESET restart: RS=1 running={} ::",
                             idx, running
                         );
@@ -18665,7 +18665,7 @@ pub fn init() {
                         let _ = wait_bounded(|| {
                             mmio_read32(h.op + OP_USBSTS).unwrap_or(0) & (1 << 14) == 0
                         });
-                        serial_println!(
+                        crate::bootlog_println!(
                             ":: EHCI-HID: [{}] periodic DMA smoke pass {} ({}): USBSTS={:#010x} HSE={} HCHalted={} post-token={:#010x} == witness ::",
                             idx, pass,
                             match pass {
@@ -18772,7 +18772,7 @@ pub fn init() {
             // trust. `rootrst=` in the EPACE line counts only what was PAID, so the two
             // instruments cross-check: the drop in `rootrst=` must equal the ms named here.
             if elapsed_ms > 0 {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] BUY-1 T_ATTDB overlap: {} ms owed, {} ms already elapsed under the earlier controllers' bring-up/port walk, {} ms spun here == witness ::",
                     idx, T_ATTDB_MS, elapsed_ms, owed_ms
                 );
@@ -18782,7 +18782,7 @@ pub fn init() {
             // verdict and a self-measured one can never be confused.
             if !c.overlay_mode && CHAIN_HSE_SEEN.load(core::sync::atomic::Ordering::Relaxed) {
                 c.overlay_mode = true;
-                serial_println!(
+                crate::bootlog_println!(
                     ":: EHCI-HID: [{}] chain-HSE verdict CARRIED from an earlier controller — OVERLAY-DIRECT for this port walk (probe + re-init skipped; inference, not a measurement on this function) ::",
                     idx
                 );
@@ -18791,7 +18791,7 @@ pub fn init() {
                 let portsc = mmio_read32(h.op + OP_PORTSC0 + 4 * port as u64).unwrap_or(0);
                 if portsc & PORT_CCS == 0 || portsc & PORT_OWNER != 0 {
                     // Loud, because this is the branch a too-short debounce would take.
-                    serial_println!(
+                    crate::bootlog_println!(
                         ":: EHCI-HID: [{}] port {} not walked: PORTSC={:#010x} CCS={} owner={} (post-T_ATTDB sample){} ::",
                         idx, port, portsc, portsc & PORT_CCS,
                         if portsc & PORT_OWNER != 0 { "companion" } else { "EHCI" },
@@ -18821,7 +18821,7 @@ pub fn init() {
                             c.overlay_mode = true;
                             CHAIN_HSE_SEEN
                                 .store(true, core::sync::atomic::Ordering::Relaxed);
-                            serial_println!(
+                            crate::bootlog_println!(
                                 ":: EHCI-HID: [{}] qTD-fetch HSE — OVERLAY-DIRECT mode + full HCRESET re-init (probe-14 silicon finding) ::",
                                 idx
                             );
@@ -18891,7 +18891,7 @@ pub fn init() {
         // RCBA base from the LPC bridge (0:31.0) config 0xF0 (bit 0 = enable).
         let rcba_reg = read_config_32(0, 31, 0, 0xF0);
         let rcba = (rcba_reg as u64) & !0x3FFF;
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: RCBA reg={:#010x} base={:#x} en={} ::",
             rcba_reg, rcba, rcba_reg & 1
         );
@@ -18900,12 +18900,12 @@ pub fn init() {
             // — a misconfigured isoch/private channel would abort device WRITES specifically.
             for off in [0x0000u64, 0x0014, 0x0018, 0x001C, 0x0020, 0x0024, 0x0028, 0x0030] {
                 if let Some(v) = mmio_read32(rcba + off) {
-                    serial_println!(":: EHCI-HID: RCBA+{:#06x} = {:#010x} ::", off, v);
+                    crate::bootlog_println!(":: EHCI-HID: RCBA+{:#06x} = {:#010x} ::", off, v);
                 }
             }
             for off in [0x3400u64, 0x3404, 0x3410, 0x3414, 0x3418, 0x341C, 0x3420, 0x3428, 0x342C, 0x3430, 0x3434] {
                 if let Some(v) = mmio_read32(rcba + off) {
-                    serial_println!(":: EHCI-HID: RCBA+{:#06x} = {:#010x} ::", off, v);
+                    crate::bootlog_println!(":: EHCI-HID: RCBA+{:#06x} = {:#010x} ::", off, v);
                 }
             }
         }
@@ -18935,7 +18935,7 @@ pub fn init() {
         let (xv, xu) = epace_fmt(c.pace.xfer_cy);
         let (av, au) = epace_fmt(c.pace.ass_cy);
         let (cv, cu) = epace_fmt(c.pace.act_cy);
-        serial_println!(
+        crate::census_println!(
             ":: EPACE: [{}] {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) [{}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) resid={}{}] {{xfer={}{}(n={}) ass={}{} act={}{}}} == witness ::",
             c.idx,
             EPACE_TAGS[EP_WAKE], parts_ms[EP_WAKE], unit, c.pace.n[EP_WAKE],
@@ -18955,7 +18955,7 @@ pub fn init() {
         // that a device pathological enough to exceed the cap reports its true crossing count
         // instead of looking like exactly `M8_SLOW_CAP` slow transfers.
         if c.pace.slow_n > M8_SLOW_CAP {
-            serial_println!(
+            crate::bootlog_println!(
                 ":: EHCI-HID: [{}] EPACE-TRIM M8 SLOW-XFER cap reached — {} transfers crossed the {} ms threshold, {} printed, {} suppressed == witness ::",
                 c.idx, c.pace.slow_n, M8_SLOW_MS, M8_SLOW_CAP,
                 c.pace.slow_n.saturating_sub(M8_SLOW_CAP)
@@ -18967,7 +18967,7 @@ pub fn init() {
         let (st, su) = epace_fmt(selftest_cy);
         let (ev, eu) = epace_fmt(evid_cy);
         let (iv, iu) = epace_fmt(init_cy);
-        serial_println!(
+        crate::census_println!(
             ":: EPACE: selftest={}{} evid={}{} init={}{} hz={} == the ehci-hid d= split ::",
             st, su, ev, eu, iv, iu,
             crate::arch::x86_64::apic::tsc_hz()
@@ -18988,7 +18988,7 @@ pub fn init() {
         unsafe { isr_arm_controller(c.idx, c.bus, c.dev, c.func, c.op) };
     }
     *EHCI_HID.lock() = Some(ctrls);
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: end ({} controllers, {} HID endpoints armed) ::",
         n, armed
     );
@@ -19266,7 +19266,7 @@ fn tpscale_selftest() {
     let ok = got[0] == 37 && got[1] == 24 && got[2] == -15 && got[3] == 0 && got[4] == 0
         && knee[0] == 3 && knee[1] == 3 && knee[2] == 4 && knee[3] == -4 && knee[4] == 5
         && TP_MT_DIV_LOW > 1 && TP_MT_DIV_HIGH < TP_MT_DIV_LOW && got[0] > TP_MT_MAX_STEP / TP_MT_DIV_LOW;
-    serial_println!(
+    crate::bootlog_println!(
         ":: EHCI-HID: TPSCALE self-test: curve={}/{}@{} raw={},{},{},{},{} -> px={},{},{},{},{} knee={},{},{},{},{} (clamp-step={}px/frame, toward-zero) -> {} ::",
         TP_MT_DIV_LOW, TP_MT_DIV_HIGH, TP_MT_CURVE_KNEE, raw[0], raw[1], raw[2], raw[3], raw[4], got[0], got[1], got[2], got[3], got[4],
         knee[0], knee[1], knee[2], knee[3], knee[4], tp_scale(TP_MT_MAX_STEP),
@@ -19398,7 +19398,7 @@ impl Controller {
             ":: USBNET-EHCI: addr={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} -> PASS ::",
             addr, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], if up { "up" } else { "down" }
         );
-        serial_println!(":: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::");
+        crate::bootlog_println!(":: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::");
     }
 }
 
@@ -19465,7 +19465,7 @@ unsafe fn ptr2_isr_idle_drop(ep: &IsrEp, slot: usize, len: usize, depth: u32, ta
 /// Consumer side: the first `isr_take` ever — one line, from the pass (never the ISR).
 fn ptr2_attach_note(slot: usize, backlog: u32) {
     if !PTR2_ATTACHED.swap(true, Ordering::Relaxed) {
-        serial_println!(
+        crate::bootlog_println!(
             ":: EHCI-HID: [ehci] consumer attached at={}ms slot={} ring_backlog={} dropped_before={} dropped_idle_before={} == witness ::",
             crate::arch::ms(), slot, backlog, ISR_DROPPED.load(Ordering::Relaxed), PTR2_DROPPED_IDLE.load(Ordering::Relaxed)
         );
@@ -19545,4 +19545,10 @@ fn tp_div_high() -> i32 { match tp_speed_get() { 0 => 4, 2 => 2, _ => TP_MT_DIV_
 /// QUIETBOOT (R80): `tests ehci` — the hardening self-test chain `init` used to run at every boot.
 fn ehci_selftest() {
     unsafe { parser_selftest() };
+}
+
+/// QUIETBOOT2 (B325, R80): `tests ehciisr` — the ISRARM self-test (`isr_selftest`) off the boot path. It drives
+/// `isr_service_ep` against a hand-built completion, so fired from the shell it shares the live ring for one pass.
+fn ehci_isr_test() {
+    unsafe { isr_selftest() };
 }

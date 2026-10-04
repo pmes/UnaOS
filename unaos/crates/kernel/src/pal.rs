@@ -2115,7 +2115,7 @@ impl<'a> TargetPal<'a> {
         // gates can verify the scale layer on every target (x86 GUI, arm virt, Pi render
         // service, Orin panel) without a screen.
         let m = crate::ui::Metrics::for_height(surface.height());
-        serial_println!(
+        crate::bootlog_println!(
             ":: UI1: scale={} cell={}x{} line={} ::",
             m.scale,
             m.cell_w,

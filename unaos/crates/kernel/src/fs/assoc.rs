@@ -144,8 +144,8 @@ pub fn seed_once() {
     }
     let mt = crate::shell::vfs_mount_table();
     match seed_in(&mt) {
-        Ok(n) => serial_println!("[assoc] seed dir={} created={} types={} source=db", TYPES_DIR, n, BUILTIN.len()),
-        Err(VfsError::Unsupported) => serial_println!("[assoc] seed=skip reason=enotsup (root takes no attributes) source=builtin types={}", BUILTIN.len()),
+        Ok(n) => crate::bootlog_println!("[assoc] seed dir={} created={} types={} source=db", TYPES_DIR, n, BUILTIN.len()),
+        Err(VfsError::Unsupported) => crate::bootlog_println!("[assoc] seed=skip reason=enotsup (root takes no attributes) source=builtin types={}", BUILTIN.len()),
         Err(e) => serial_println!("[assoc] seed=fail ({}) source=builtin", crate::fs::attrsys::refusal(&e)),
     }
 }

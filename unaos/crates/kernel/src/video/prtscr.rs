@@ -2248,7 +2248,7 @@ fn dir_refused(plan: &DirPlan, path: &str, at: &str, why: &str) {
 /// the volume and any directory entry. GO RED by giving `plan_dir` a fallback destination for
 /// `None` — the shared-folder hack Peter refused — which turns the `Err` assertion false and the
 /// capture into an attempted write; that is the mutation this arm exists to catch.
-pub fn dir_fixture() {
+pub fn dir_fixture() { static QB2: AtomicBool = AtomicBool::new(false); if crate::tests::defer_fast("prtscrdir", dir_fixture, &QB2) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests prtscrdir` fires it.
     static DONE: AtomicBool = AtomicBool::new(false);
     // A relaxed load in steady state; the RMW happens exactly once, on the first pass.
     if DONE.load(Ordering::Relaxed) || DONE.swap(true, Ordering::Relaxed) {

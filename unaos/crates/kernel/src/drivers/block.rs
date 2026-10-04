@@ -944,7 +944,7 @@ pub fn usb_publish_gen() -> u64 {
 /// device on a recycled slot number and must survive.
 pub fn unpublish_usb_geometry(slot_id: u8, captured_gen: u64) -> bool {
     if USB_PUBLISH_GEN.load(core::sync::atomic::Ordering::Acquire) != captured_gen {
-        serial_println!(
+        crate::bootlog_println!(
             ":: BLK: retraction SKIPPED slot={} — a newer publish (gen {}) superseded the one this retraction was earned against (gen {}); the live disk survives ::",
             slot_id, USB_PUBLISH_GEN.load(core::sync::atomic::Ordering::Acquire), captured_gen
         );
@@ -1759,7 +1759,7 @@ pub fn register_sdhc(num_blocks: u64, block_addressed: bool) -> bool {
     };
     *SDHC_BLOCK_DEVICE.lock() = Some(dev);
     let mib = num_blocks.saturating_mul(SECTOR_BYTES as u64) / (1024 * 1024);
-    serial_println!(
+    crate::bootlog_println!(
         ":: SDHCBLK: registered internal SD card as block handle Sdhc — blocks={} ({} MiB) addressing={} \
          (global BLOCK_DEVICE untouched) ::",
         num_blocks, mib, if block_addressed { "block" } else { "byte" }
@@ -2807,7 +2807,7 @@ pub fn register_ahci(ix: usize, port: u8, num_blocks: u64, model: &[u8; 40]) -> 
     };
     AHCI_DISKS.lock()[ix] = Some(AhciDisk { info: dev, port });
     let mib = num_blocks.saturating_mul(SECTOR_BYTES as u64) / (1024 * 1024);
-    serial_println!(
+    crate::bootlog_println!(
         ":: AHCI: registered port={} as registry index {} — blocks={} ({} MiB) READ-ONLY \
          (global BLOCK_DEVICE untouched, installer not told) ::",
         port, ix, num_blocks, mib

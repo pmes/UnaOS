@@ -145,7 +145,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             boot_info.framebuffer_info,
         );
         let i = boot_info.framebuffer_info;
-        serial_println!(
+        unaos_kernel::bootlog_println!(
             ":: video: WRITER seeded base={:08X} len={} panel={}x{} stride={}px pitch={}B bpp={} ::",
             boot_info.framebuffer_addr,
             boot_info.framebuffer_size,
@@ -293,7 +293,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 4. Global Heap Allocation (Phase 3 Memory Translation)
     unaos_kernel::arch::memory::init(boot_info);
-    serial_println!(":: KERNEL HEAP ALLOCATED ::"); #[cfg(feature = "witness")] unaos_kernel::fs::bootdisk::unafsroot_selftest(); // UNAFSROOT (orin 26): HOMESOIL leg 6 on the boot path — the ONE heap-up line x86, virt and the Pi all pass through, so `test`/`test-arm` execute the root layout rule (nothing under walk_and_witness runs on a headless boot: measured `[vfs]` 0 lines on both captures). Same-line append, code before the comment; witness-free media compile none of it. The tegra path has its own heap line (tegra_early_stop) and is untouched.
+    unaos_kernel::bootlog_println!(":: KERNEL HEAP ALLOCATED ::"); #[cfg(feature = "witness")] unaos_kernel::fs::bootdisk::unafsroot_selftest(); // UNAFSROOT (orin 26): HOMESOIL leg 6 on the boot path — the ONE heap-up line x86, virt and the Pi all pass through, so `test`/`test-arm` execute the root layout rule (nothing under walk_and_witness runs on a headless boot: measured `[vfs]` 0 lines on both captures). Same-line append, code before the comment; witness-free media compile none of it. The tegra path has its own heap line (tegra_early_stop) and is untouched.
     unaos_kernel::bootpace::record("heap");
 
     // VPERF M3 EARLY-ATTACH (bench QoL, Peter's word 2026-07-16): usbdebug builds attach the
@@ -864,8 +864,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // DEFAULT-QUIET: re-proofs of metal-confirmed facts — behind the `witness` battery knob.
         #[cfg(feature = "witness")]
         {
-            unaos_kernel::arch::syscall::nmi_self_fire();
-            unaos_kernel::arch::syscall::canonical_guard_selftest();
+            unaos_kernel::tests::register("u20c", unaos_kernel::arch::syscall::nmi_self_fire); // QUIETBOOT2 (B325, R80): a boot fixture — `tests u20c` fires it.
+            unaos_kernel::tests::register("canonguard", unaos_kernel::arch::syscall::canonical_guard_selftest); // QUIETBOOT2 (B325, R80): a boot fixture — `tests canonguard` fires it.
         }
 
         // MIDDEN-M1 (witness battery): the x86 half of the shell-core fixture — see the aarch64
@@ -900,14 +900,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // SNTP correctness under `./arroyo test` in any environment (the live boot sync in `service_net`
         // stays honest-but-INCOMPLETE under hermetic slirp). Prints `:: SNTP-X86-GATE: ... PASS [w=0x1f] ::`.
         #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "smolnet"))]
-        unaos_kernel::smolnet::sntp_x86_gate();
+        unaos_kernel::tests::register("sntp", unaos_kernel::smolnet::sntp_x86_gate); // QUIETBOOT2 (B325, R80): `tests sntp` fires it — and the canned reply no longer sets the boot's clock to 2026-07-22 (boot 20 did).
 
         // SOCK-8 GATE (witness battery): the deterministic x86 DNS client battery — canned datagrams
         // through the shared `crate::net_dns` parser, no NIC/network required. Proves x86 DNS parsing
         // (well-formed A / truncated / compression-loop / rcode) under `./arroyo test` in any environment
         // (the live boot resolve in `service_net` stays a bonus). Prints `:: DNS-X86-GATE: ... PASS [w=0xf] ::`.
         #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "smolnet"))]
-        unaos_kernel::smolnet::dns_x86_gate(); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] unaos_kernel::net_fetch::parse_gate();
+        unaos_kernel::tests::register("dns", unaos_kernel::smolnet::dns_x86_gate); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] unaos_kernel::tests::register("netfetch", || { let _ = unaos_kernel::net_fetch::parse_gate(); });
 
         // U1a: x86 ring-3 round-trip (the aarch64 M6a equivalent). Turn scheduling on (the default
         // test build never enables the feature-gated demo below, so the APs would otherwise idle in
@@ -1583,14 +1583,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 render_cpu,
                 unaos_kernel::arch::sched::PRIO_NORMAL, unaos_kernel::arch::sched::RENDER_PATH_STACK_SIZE, // RENDSTACK — the render service comes off the BLANKET 16 KiB onto a MEASURED 32 KiB, the same cure and the same number the Pi applied to `usb-pump`/`input` after dsktp boot 11 (`PUMP_PATH_STACK_SIZE`, this file's tail). QUARRYX86-2 is what made it owed on this arch: its x86 click-router arm (`arch/x86_64/syscall.rs`) drains the dock's Quarry latch by calling `quarry::service()` -> `open()` — a panel read, two VFS `read_dir`s and a surface alloc — and the only two routers that reach it here are `kernel_main` (the BOOT stack, not a `Task` at all) and THIS task. The size comes from the `:: STACK: render high=` readings the `witness` probe now takes on the service dump's ~5 s cadence, not from the Pi's precedent: the RENDSTACK block at the tail of `arch/x86_64/sched.rs` carries the numbers and the margin. `TASK_STACK_SIZE` is untouched — sizing one deep path is the honest fix; raising the blanket charges every kernel task in the system for it. ⚠ FOLDED onto the pre-existing arg line with the call RENAMED in place, never a line added: this file's panic `Location`s are load-bearing and its line count is identical before and after. x86-only by construction — the whole `if` sits under `#[cfg(all(target_arch = "x86_64", not(feature = "rast")))]` (line 1510), so no aarch64 byte moves.
             );
-            serial_println!(
+            unaos_kernel::bootlog_println!(
                 ":: SCHED-X86: RENDER on core {} + INPUT/usb-pump on core {} ({} AP(s) dispatching) — OS on its own scheduler ::",
                 render_cpu, svc_cpu, online.len()
             );
             // The BSP joins the scheduler. Diverges — nothing below this line runs on this path.
             unaos_kernel::arch::sched::run_bsp(0);
         }
-        serial_println!(
+        unaos_kernel::bootlog_println!(
             ":: SCHED-X86: {} AP(s) dispatching — the render/service split needs 2 distinct cores; GUI stays inline on the BSP ::",
             online.len()
         );
@@ -2334,7 +2334,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // (dtb fields are Copy; grabbed before `memory::init` consumes the &'static mut borrow.)
     let (dtb_addr, dtb_size) = (boot_info.dtb_addr, boot_info.dtb_size);
     unaos_kernel::arch::memory::init(boot_info);
-    serial_println!(":: KERNEL HEAP ALLOCATED ::"); #[cfg(feature = "orindesk")] unaos_kernel::arch::display_tegra::orin_wm1(); // ORIN-WM1 — one wm window on the JD1 scanout (tail block)
+    unaos_kernel::bootlog_println!(":: KERNEL HEAP ALLOCATED ::"); #[cfg(feature = "orindesk")] unaos_kernel::arch::display_tegra::orin_wm1(); // ORIN-WM1 — one wm window on the JD1 scanout (tail block)
     // XCARVE-2 temporal bracket: heap carved + span-B top published (`select_heap_region`). span-B now
     // covers the 0x26b900000 target, so this is the first bracket whose bisect can fire on the target.
     unaos_kernel::vugras::phase("post-heap-init"); #[cfg(feature = "ga10bprobe4a")] if let Some(g) = unaos_kernel::arch::fdt_tegra::bpmp_geometry(dtb_addr, dtb_size, mmu.ram_gib_mask) { if let Some(c) = unaos_kernel::arch::bpmp_tegra::chan_reopen(&g) { unaos_kernel::arch::ga10b_probe::ga10bprobe4_run(&c, dtb_addr, dtb_size, mmu.ram_gib_mask); } } // GA10B-PROBE4 (UNAOS_GA10B_PROBE4=1 for rung 4a alone, =2 for 4a then 4b; default OFF; a FOURTH sibling of the probe knobs) — rungs 4a/4b of the GA10B ladder, brief docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md. HERE, not in the BPMP block above, because the rung's own 2 MiB Normal-NC DMA window is seated by `select_heap_region` inside `memory::init` two lines up (the NET4A law; `[ga10b4nc]` census) — boot 1 of 2026-09-11 ran the rung in the BPMP block and read REFUSED reason=no-dma-window with the census printing after it. The BPMP channel is re-derived from the same DTB geometry by `chan_reopen` (addresses only; the IVC channel `jb1b_ping` established stays established — no second SYNC). 4a RETURNS (desktop behind it) unless the BCR self-locks or sticks (SYSTEM_OFF); 4b ends the machine in SYSTEM_OFF on every path. Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves.
@@ -5878,7 +5878,7 @@ fn x86_typematic_pump() {
 /// per tick — so this is a faithful translation of the service rate and not a boot-pace regression.
 #[cfg(target_arch = "x86_64")]
 fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, two cfg-EXCLUSIVE definitions — this x86 body and the Pi body above; `usb_pump` is gone.
-    serial_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu);
+    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu);
     loop {
         // Nap first: `spawn` puts us on the run queue immediately, and the framebuffer handoff on the
         // BSP is still finishing. One tick costs nothing and keeps the first pass off that seam.
@@ -6121,7 +6121,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
 fn input_service(cpu: usize) { // ONEOS5 (R16, SR21): ONE name, two cfg-EXCLUSIVE definitions — this x86 body and the Pi PL011 body above; `input_service` is gone.
     use core::sync::atomic::Ordering;
     use unaos_kernel::pal::Event;
-    serial_println!(":: SCHED-X86: input task dispatched on core {} ::", cpu); #[cfg(all(feature = "wc", feature = "witness"))] ptrlag_selftest(); // PTRLAG (B134) — the installer's geometry door driven across a HELD `WRITER`, ON THE BAND UNDER TEST: this task is the one that calls `x86_ptr_install`, and the fixture runs on its core before it has taken a single report, so the priming read is the first thing that door ever does. At the pre-PTRLAG code control never returns from it (`*WRITER.lock()` is non-reentrant and this core holds it) — that HANG is the go-red, scored by the wall. The fn is at this file's tail. ⚠ LINE-NEUTRAL fold, `wc`-erased.
+    unaos_kernel::bootlog_println!(":: SCHED-X86: input task dispatched on core {} ::", cpu); #[cfg(all(feature = "wc", feature = "witness"))] ptrlag_selftest(); // PTRLAG (B134) — the installer's geometry door driven across a HELD `WRITER`, ON THE BAND UNDER TEST: this task is the one that calls `x86_ptr_install`, and the fixture runs on its core before it has taken a single report, so the priming read is the first thing that door ever does. At the pre-PTRLAG code control never returns from it (`*WRITER.lock()` is non-reentrant and this core holds it) — that HANG is the go-red, scored by the wall. The fn is at this file's tail. ⚠ LINE-NEUTRAL fold, `wc`-erased.
     let mut pulse_ms = unaos_kernel::arch::ms();
     // INPUT-UNGATE producer state. `owed_motion` is summed relative travel the channel refused;
     // `owed_event` is the ONE must-survive event it refused. Both are owed to the channel in that
@@ -6300,7 +6300,7 @@ fn open_shell_window(
     }
     let mut store: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     if store.try_reserve_exact(len).is_err() {
-        serial_println!("[shellwin] DECLINE reason=alloc len={}", len);
+        unaos_kernel::bootlog_println!("[shellwin] DECLINE reason=alloc len={}", len);
         return None;
     }
     store.resize(len, 0);
@@ -6401,7 +6401,7 @@ fn x86_render_service(cpu: usize) {
     // gives the gate.
     let my_epoch = RENDER_ROLE_EPOCH_X86.load(Ordering::Acquire);
     if rescue {
-        serial_println!(
+        unaos_kernel::bootlog_println!(
             ":: SCHED-X86: render task is a REHOMED instance on core {} — draining GUI_CHANNEL_X86 \
              again; the previous instance's shell window is owed a re-mint (WCSER-REMINT, below) ::",
             cpu
@@ -6581,7 +6581,7 @@ fn x86_render_service(cpu: usize) {
     );
 
     if desktop {
-        serial_println!(
+        unaos_kernel::bootlog_println!(
             "[shelldesk] backdrop=crispy-scene shell=off-glass bg={:08X} core={}",
             unaos_kernel::video::wm::DESKTOP_BG,
             cpu
@@ -6599,7 +6599,7 @@ fn x86_render_service(cpu: usize) {
                 shell_id,
                 unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
             );
-            serial_println!(
+            unaos_kernel::bootlog_println!(
                 "[shellwin] backdrop=crispy-scene shell=window win={} surf={}x{} core={} == witness ::",
                 shell_id,
                 shell_pal.width(),
@@ -6615,7 +6615,7 @@ fn x86_render_service(cpu: usize) {
     // has built the panel surface and presented a frame. Spawned is not dispatched (the WINX-2/WINX-3
     // lesson); a spawn line with no dispatch line means the task is sitting in a run queue nobody
     // pops, which is the exact failure this whole arc exists to remove.
-    serial_println!(
+    unaos_kernel::bootlog_println!(
         ":: SCHED-X86: render task dispatched on core {} — panel owned by the scheduler ::",
         cpu
     );
@@ -7716,7 +7716,7 @@ static STACKPOOL_LAST_PROBE_MS: core::sync::atomic::AtomicU64 =
 // ORIN-WM1 (tail block) — why the call site above is ONE APPENDED STATEMENT and where it sits.
 // =================================================================================================
 //
-// THE STATEMENT. `tegra_early_stop`'s step 3c line, `serial_println!(":: KERNEL HEAP ALLOCATED ::");`,
+// THE STATEMENT. `tegra_early_stop`'s step 3c line, `unaos_kernel::bootlog_println!(":: KERNEL HEAP ALLOCATED ::");`,
 // carries `#[cfg(feature = "orindesk")] unaos_kernel::arch::display_tegra::orin_wm1();` APPENDED to it
 // rather than a new line of its own. That is the `smpmark` / DARKWIN-GUARD idiom in this tree, and the
 // reason is measured, not stylistic: inserting a line into `main.rs` shifts the line-number constants
@@ -9129,7 +9129,7 @@ fn tegra_desk_cascade() -> bool {
         return false;
     }
 
-    serial_println!(
+    unaos_kernel::bootlog_println!(
         "[deskcascade] arming cascade panel={}x{}x{} stage={} table={} route={} conwin={} furn={} render={} witness={} (desktop_firmware::activate on the boot core, §5.2 CROSSED by this knob alone; the u7stk-tagged boot-core:pre/post-cascade pair around it is the stack number the stop-line asked for — A38: named, not reproduced)",
         pw, ph, info.bytes_per_pixel, staged, live,
         if fbcon::console_is_routed() { "ROUTED" } else { "UNROUTED" },
@@ -9155,7 +9155,7 @@ fn tegra_desk_cascade() -> bool {
         );
         return false;
     }
-    serial_println!(
+    unaos_kernel::bootlog_println!(
         "[deskcascade] -> CASCADED windows={} bar=1 owns_pixels={} route={} activate={} (the console is windowed when route=ROUTED; the render pass ahead presents the scene and mints the shell window on its first pass)",
         windows,
         menubar::owns_pixels() as u8,
@@ -10263,7 +10263,7 @@ fn ptrlag_panel_wh() -> Option<(i32, i32)> {
 /// Called once, from the input task's dispatch line — the band under test, before any report has been
 /// taken, so the priming read is the first thing the installer's door ever did.
 #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
-fn ptrlag_selftest() {
+fn ptrlag_selftest() { if unaos_kernel::tests::defer("ptrlag", ptrlag_selftest) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests ptrlag` fires it.
     use core::sync::atomic::Ordering::Relaxed;
     /// PTRLAG — released-half attempts; `lockfix_b1_selftest`'s `RELEASED_TRIES` and its reasoning.
     const RELEASED_TRIES: u32 = 64;
@@ -10409,7 +10409,7 @@ fn tegra_boot_focus(win: &Option<ShellWin>) {
     }
     let held = wm::focus_asid();
     let Some(w) = win.as_ref() else {
-        serial_println!(
+        unaos_kernel::bootlog_println!(
             "[deskcascade] boot-focus target=shell asid={:#x} win={} held={:#x} -> NO-SHELL (this scene minted no shell window — the decline and its reason are on the line above — so there is no row to focus and focus is left exactly where the cascade put it)",
             wm::KERNEL_OWNER_DESKTOP,
             wm::WIN_NONE,
@@ -10418,7 +10418,7 @@ fn tegra_boot_focus(win: &Option<ShellWin>) {
         return;
     };
     wm::focus_changed(wm::KERNEL_OWNER_DESKTOP);
-    serial_println!(
+    unaos_kernel::bootlog_println!(
         "[deskcascade] boot-focus target=shell asid={:#x} win={} held={:#x} now={:#x} -> FOCUSED (SO14: the cascade's last focus call is quarry::open's own raise, ~8 s before this line, so the shell was minted front and DEAF — every Enter and Backspace bound by quarry::key_route. Quarry stays open and on the glass, unfocused; clicking it focuses it as before)",
         wm::KERNEL_OWNER_DESKTOP,
         w.id,

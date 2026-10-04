@@ -170,7 +170,7 @@ pub fn boot_anchor() {
         None => serial_println!(":: RTC: y=0 mo=0 d=0 h=0 mi=0 s=0 bcd=0 h24=0 century=assumed reads=inconsistent -> FAIL ::"),
         Some(r) => {
             let ok = plausible(&r);
-            serial_println!(
+            crate::census_println!(
                 ":: RTC: y={} mo={} d={} h={} mi={} s={} bcd={} h24={} century={} tz_min={} -> {} ::",
                 r.y, r.mo, r.d, r.h, r.mi, r.s, r.bcd as u8, r.h24 as u8,
                 if r.century_reg.is_some() { "fadt" } else { "assumed" },

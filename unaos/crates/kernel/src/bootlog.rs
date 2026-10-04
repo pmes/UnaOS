@@ -107,3 +107,15 @@ pub fn service_serial_dump() {
         serial_println!(":: BOOTLOG: [{:>8} ms] {} ::", ms, tag);
     }
 }
+
+/// QUIETBOOT2 (B325, R80) — a line of BRING-UP PROSE (the narration of a driver coming up: xHCI/SDHC/AHCI
+/// register walks, SMP/APIC chatter, compositor first-paint traces). Printed on a `bootlog` build
+/// (`UNAOS_BOOTLOG=1`, the photograph-the-boot mode) and on a `tests-at-boot` build (every QEMU battery lane,
+/// so no pinned spec line moves); silent on the quiet metal boot. A refusal, a stage, a panic or a `-> FAIL`
+/// line never takes this macro.
+#[macro_export]
+macro_rules! bootlog_println {
+    ($($arg:tt)*) => {
+        if cfg!(any(feature = "bootlog", feature = "tests-at-boot")) { $crate::serial_line::emit(format_args!($($arg)*), true); }
+    };
+}

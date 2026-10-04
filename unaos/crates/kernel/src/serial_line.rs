@@ -285,7 +285,7 @@ pub fn emit_user(row: usize, text: &str) {
 // (0 = empty slot). 48 slots, linear probe, CAS on the key — lock-free, so the emit path stays safe from
 // an ISR; a full table counts the line in `TAG_OTHER`. Closed (one relaxed load per line) once the
 // boot line has printed.
-const TAG_SLOTS: usize = 48;
+const TAG_SLOTS: usize = 128; // QUIETBOOT2 (B325): 48 -> 128 — boot 20 filled 48 slots before SMC-SCOUT/gen7 spoke, so its `top=` named neither.
 static TAG_KEY: [AtomicU64; TAG_SLOTS] = [const { AtomicU64::new(0) }; TAG_SLOTS];
 static TAG_N: [AtomicU64; TAG_SLOTS] = [const { AtomicU64::new(0) }; TAG_SLOTS];
 static TAG_OTHER: AtomicU64 = AtomicU64::new(0);
@@ -308,7 +308,7 @@ fn tag_note(b: &[u8]) {
     if TAG_CLOSED.load(Relaxed) { return; }
     let k = tag_key(b);
     if k == 0 { TAG_OTHER.fetch_add(1, Relaxed); return; }
-    let h = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % TAG_SLOTS;
+    let h = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57) as usize % TAG_SLOTS;
     for j in 0..TAG_SLOTS {
         let s = (h + j) % TAG_SLOTS;
         let cur = TAG_KEY[s].load(Relaxed);
