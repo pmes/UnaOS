@@ -94,3 +94,40 @@ sizes 1..33), `grumpycat` (4:4:4)):
 
 Not decoded: arithmetic coding, lossless, hierarchical, 12-bit, DNL; ICC profiles not applied; a truncated
 progressive file is refused rather than shown at its partial quality.
+
+## M3 — GIF, BMP, QOI
+
+A second oracle mode lands for animation: `oracle/chromium-frames.cjs` runs Chromium's WebCodecs
+`ImageDecoder` over the file, draws every (composited) frame to a canvas and reads it back with
+`getImageData` — Chromium's own RGBA per frame, no screenshot; `pixel-check --compare-raw` diffs all four
+channels of every frame (fully transparent pixels compare equal whatever their colour bytes).
+
+**GIF** (GIF89a; 87a too): §17–18 header/LSD, §19/§21 colour tables, §20 image descriptor + Appendix E
+interlace, §22/Appendix F LZW (code growth to 12 bits, Clear, EOI, deferred clear, KwKwK), §23 GCE (disposal
+0–3, transparency, delay), NETSCAPE2.0/ANIMEXTS1.0 loop count. Composition as the browsers do it: canvas starts
+transparent (background colour index ignored), disposal 2 clears the rectangle to transparent, disposal 3
+restores the pre-frame canvas; a frame with short LZW data keeps the pixels it delivered.
+Vectors: the pygif test-suite (disposal ×4, animation ×5, loop ×5, interlace, transparency, LZW edge cases
+255/4095/large/max codes, no-clear, extra/missing pixels, plain-text, comment, 87a, LCT…) + image-rs samples
+(1000×1000 two-frame animations, alpha) — 46 files.
+**Chromium frame oracle: 40/40 files Chromium decodes → every frame exact (62 frames, max abs diff 0).**
+Divergences, all by Chromium refusing: `invalid-code.gif` (pixel_core keeps the pixels before the bad code),
+`max-codes.gif` (a legal deferred-clear stream; pixel_core decodes it), `image-zero-size.gif`; `no-data`,
+`zero-width`, `zero-height` are refused by both.
+
+**BMP**: core/info/V2–V5/OS2 headers; 1/4/8-bit palettes; 16-bit X1R5G5B5 and BI_BITFIELDS (565); 24-bit;
+32-bit BI_RGB (opaque) and BI_BITFIELDS/BI_ALPHABITFIELDS with alpha; bottom-up and top-down; RLE8/RLE4
+(skipped pixels transparent); BI_PNG/BI_JPEG delegated to our own decoders. Narrow mask channels widen by
+`round(v·255/(2ⁿ−1))` (Blink's table — bit replication was ±1 off on rgb16, the oracle caught it).
+Vectors: 21 files (bmpsuite subset + the Core/Info/V4/V5 set). **Chromium: 21/21 exact**, plus four
+generated top-down variants (rgb24, rgb32bf, pal8v5, rgb16-565) **4/4 exact**; `cargo test` re-derives a
+top-down variant of every uncompressed vector and requires an identical decode. Image crate: 20/20 identical.
+
+**QOI** (spec 1.0, all six ops, index hash, run, end marker): exact by construction. qoiformat.org's test
+zip is not reachable from the build proxy, and Chromium does not decode QOI, so the oracle is transitive:
+all 103 PngSuite images re-encoded by an independent QOI writer (the `image` crate's `qoi`) decode
+byte-identical to their PNG source — whose decode is itself Chromium-exact.
+
+Pinned digests now cover 89 Chromium-exact files (28 JPEG, 40 GIF incl. every frame, 21 BMP).
+
+Not decoded: GIF Plain Text rendering (no browser renders it either); BMP 2/64-bit, OS/2 Huffman/RLE24, V5 ICC.

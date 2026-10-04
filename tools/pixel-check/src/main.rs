@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! pixel-check <in> [out.png]                 decode with pixel_core, print a summary, write RGBA PNG
+//! pixel-check --compare-raw <in> <dir>      exact RGBA, every frame, vs chromium-frames.cjs output
 //! pixel-check --digest [--orient] <in>...   CRC-32 of the decoded RGBA (the tests' pinned KAT digest)
 //! pixel-check --frames <in> <dir>            write every composited animation frame as <dir>/fNNN.png
 //! pixel-check --compare <in> <shot.png> <r,g,b> [--orient] [--frame N]
@@ -94,6 +95,54 @@ fn run(args: &[String]) -> Result<(), String> {
                 h,
                 100.0 * exact as f64 / n as f64,
                 psnr
+            );
+            Ok(())
+        }
+        Some("--compare-raw") => {
+            // Exact RGBA comparison, every frame, against chromium-frames.cjs output
+            // (<dir>/<basename>.fNNN.rgba).
+            let input = args.get(1).ok_or("--compare-raw <in> <dir>")?;
+            let dir = args.get(2).ok_or("missing raw dir")?;
+            let img = decode(input)?;
+            let frames: Vec<Vec<u8>> = match img.frames.as_ref() {
+                Some(f) => f.iter().map(|f| f.rgba.clone()).collect(),
+                None => vec![img.rgba.clone()],
+            };
+            let base = std::path::Path::new(input).file_name().unwrap().to_string_lossy().into_owned();
+            let (mut exact_frames, mut maxd, mut diff_bytes, mut total) = (0usize, 0u8, 0usize, 0usize);
+            let mut theirs_n = 0;
+            while std::path::Path::new(&format!("{dir}/{base}.f{theirs_n:03}.rgba")).exists() {
+                theirs_n += 1;
+            }
+            for (i, ours) in frames.iter().enumerate() {
+                let Ok(theirs) = std::fs::read(format!("{dir}/{base}.f{i:03}.rgba")) else { break };
+                if theirs.len() != ours.len() {
+                    return Err(format!("frame {i}: size {} vs chromium {}", ours.len(), theirs.len()));
+                }
+                let mut fd = 0usize;
+                for (p, q) in ours.chunks_exact(4).zip(theirs.chunks_exact(4)) {
+                    if p[3] == 0 && q[3] == 0 {
+                        total += 4;
+                        continue;
+                    }
+                    for c in 0..4 {
+                        let dd = p[c].abs_diff(q[c]);
+                        maxd = maxd.max(dd);
+                        fd += (dd != 0) as usize;
+                    }
+                    total += 4;
+                }
+                diff_bytes += fd;
+                exact_frames += (fd == 0) as usize;
+            }
+            println!(
+                "{input} {}x{} frames ours={} chromium={} exact_frames={} max_abs_diff={maxd} exact={:.3}%",
+                img.width,
+                img.height,
+                frames.len(),
+                theirs_n,
+                exact_frames,
+                100.0 * (total - diff_bytes) as f64 / total.max(1) as f64
             );
             Ok(())
         }
