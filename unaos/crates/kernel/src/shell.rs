@@ -6941,9 +6941,9 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
         return false;
     };
-    let n = bytes.len();
+    let n = bytes.len(); serial_println!("[bg] spawn path={} bytes={} pid=pending", path, n); // NETHANG M1: the breadcrumb AHEAD of the spawn — boot 20 went dark after `[gui] app-enter` with no line naming which step it reached
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
-        Ok((pid, asid, entry)) => { crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL: no `panic::Location` in this shared file moves. Name the launch BEFORE the job row is claimed — the task is runnable the instant the spawn returns and may reach its window create first, and a name armed late is a title the operator watches change. `owner_of_launch` corrects the per-arch off-by-one in the spawn handle; the rule and that correction are both stated at `wm::app_name_arm`. Fail-closed: a full name table costs the window its name, never the launch.
+        Ok((pid, asid, entry)) => { serial_println!("[bg] spawn path={} pid={} asid={:#x} -> started", path, pid, asid); crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL: no `panic::Location` in this shared file moves. Name the launch BEFORE the job row is claimed — the task is runnable the instant the spawn returns and may reach its window create first, and a name armed late is a title the operator watches change. `owner_of_launch` corrects the per-arch off-by-one in the spawn handle; the rule and that correction are both stated at `wm::app_name_arm`. Fail-closed: a full name table costs the window its name, never the launch.
             let mut jobs = BG_JOBS.lock();
             // BGREAP-CLOSE: `bg_jobs_claim` reclaims rows whose job is provably finished before it
             // reports the table full — a close-box press retires the kernel row without telling this
@@ -7362,9 +7362,9 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // The ELF64 / little-endian / e_machine pre-checks already ran inside `read_el0_image` (the
     // arch's own twin, so EM_X86_64 there and EM_AARCH64 here), which named any of them; the kernel
     // loader re-validates from scratch regardless.
-    if !exec_detaches(&bytes, &canon, typed) { run_image(console, &canon, bytes); return true; } let n = bytes.len(); // EXECNAME (B322, R82) — ⚠ SAME-LINE fold, line-NEUTRAL: the program decides — a window or a resident server detaches below (the `bg` body), anything else runs in the foreground through `run`'s own body.
+    if !exec_detaches(&bytes, &canon, typed) { serial_println!("[bg] spawn path={} bytes={} pid=foreground", load_path, bytes.len()); run_image(console, &canon, bytes); return true; } let n = bytes.len(); serial_println!("[bg] spawn path={} bytes={} pid=pending", load_path, n); // NETHANG M1 breadcrumbs (code first). EXECNAME (B322, R82) — ⚠ SAME-LINE fold, line-NEUTRAL: the program decides — a window or a resident server detaches below (the `bg` body), anything else runs in the foreground through `run`'s own body.
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
-        Ok((pid, slot, entry)) => { crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), &canon); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The bare-name launch names its windows exactly as `bg_program` does and is armed first for the same reason. `canon` is the spelling the operator's typed name resolved to, which is the spelling they expect to read back in the title bar.
+        Ok((pid, slot, entry)) => { serial_println!("[bg] spawn path={} pid={} asid={:#x} -> started", load_path, pid, slot); crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), &canon); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The bare-name launch names its windows exactly as `bg_program` does and is armed first for the same reason. `canon` is the spelling the operator's typed name resolved to, which is the spelling they expect to read back in the title bar.
             if !adopt_bg_job(pid, slot, &canon) {
                 // Spawned but untrackable — kill it rather than leave a job `jobs` could never reap
                 // and `kill` could never name. Same rule `bg` follows, same reason.
