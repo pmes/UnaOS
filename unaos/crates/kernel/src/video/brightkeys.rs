@@ -20,60 +20,54 @@
 //! Two halves, split by context. [`key`] runs where the HID decoder pushes its `Action` (interrupt
 //! or device-service context): it only moves the level, raises a pending flag and starts the bar's
 //! indicator — atomics, no port I/O, no heap. [`service`] runs on the desktop service pass: it
-//! takes the pending flag, writes the gmux brightness register (only when `gmux_igd` is compiled
-//! in; otherwise `gmux_written=0`) and prints the witness.
+//! takes the pending flag, writes the level through `backlight::set_level_via` (BRIGHTFLOOR: the one
+//! writer — floor, gmux register, readback) and prints the witness.
 //!
 //! `:: BRIGHTKEYS: key=<up|down> level=<n>/16 gmux_written=<0|1> indicator=1 -> PASS ::`
 //! `indicator=1` is measured (`status::bright_item()` answers `Some(level)` right after the key),
-//! `gmux_written=1` only when the register write completed.
+//! `gmux_written=1` only when the register READ BACK the value written (BRIGHTFLOOR).
 
 use crate::video::keymap::Action;
 use crate::video::status;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-/// Backlight steps (`0..=16`). The gmux register is 16-bit; a step is `level * 0xFFFF / 16`.
-pub const STEPS: u8 = 16;
-/// Level assumed before the first key (the register is not read back at boot).
-const DEFAULT_LEVEL: u8 = 12;
+/// Backlight steps (`0..=16` in the step rule; the lit range is `backlight::FLOOR..=STEPS`).
+pub const STEPS: u8 = crate::video::backlight::STEPS;
 
-static LEVEL: AtomicU8 = AtomicU8::new(DEFAULT_LEVEL);
 /// 0 = nothing pending, 1 = pending `down`, 2 = pending `up` (last key wins).
 static PENDING: AtomicU8 = AtomicU8::new(0);
 
-/// The pure step rule: one notch, clamped to `0..=STEPS`.
+/// The pure step rule: one notch, clamped to `0..=STEPS`. (The FLOOR is applied by the caller through
+/// `backlight::stage`/`set_level_via` — the rule stays the plain notch the aarch64 checks pin.)
 pub const fn step(level: u8, up: bool) -> u8 {
     if up { if level >= STEPS { STEPS } else { level + 1 } } else if level == 0 { 0 } else { level - 1 }
 }
 
-/// Register value for a level.
-pub const fn raw_for(level: u8) -> u16 {
-    ((level as u32 * 0xFFFF) / STEPS as u32) as u16
-}
-
-/// Called by `pal::push_event` for a brightness action. Non-blocking, no port I/O.
+/// Called by `pal::push_event` for a brightness action. Non-blocking, no port I/O: the level is STAGED
+/// (BRIGHTFLOOR: clamped to the floor — Down at level 1 stays at 1) and the desktop pass writes it.
 pub fn key(act: Action) {
     let up = matches!(act, Action::BrightnessUp);
-    let lv = step(LEVEL.load(Ordering::Relaxed), up);
-    LEVEL.store(lv, Ordering::Relaxed);
+    let lv = crate::video::backlight::stage(step(crate::video::backlight::level(), up));
     PENDING.store(if up { 2 } else { 1 }, Ordering::Release);
     status::bright_show(lv);
 }
 
-static SELFTESTED: AtomicU8 = AtomicU8::new(0);
-
-/// Desktop service pass: apply a pending step to the gmux and witness it. The FIRST call also runs
-/// the boot fixture (an up step and a down step through the real [`key`] path, no gmux write, the
-/// indicator cleared afterwards) so a board with no operator hands — QEMU, a bench replay — still
-/// states the witness; a real key press prints its own with `gmux_written` measured.
+/// Desktop service pass: apply a pending step through THE backlight writer and witness it. R80: the
+/// boot fixture that used to run on the first call is now part of `tests brightfloor` ([`selftest`]).
 pub fn service() {
-    if SELFTESTED.swap(1, Ordering::AcqRel) == 0 {
-        for act in [Action::BrightnessUp, Action::BrightnessDown] {
-            key(act);
-            apply(false);
-        }
-        status::bright_clear();
-    }
     apply(true);
+}
+
+/// The BRIGHTKEYS key-path fixture (an up step and a down step through the real [`key`] path, no
+/// register write, the indicator cleared afterwards). Called from `backlight::selftest`.
+pub fn selftest() {
+    let prev = crate::video::backlight::level();
+    for act in [Action::BrightnessUp, Action::BrightnessDown] {
+        key(act);
+        apply(false);
+    }
+    status::bright_clear();
+    let _ = crate::video::backlight::stage(prev);
 }
 
 fn apply(write: bool) {
@@ -81,8 +75,10 @@ fn apply(write: bool) {
     if p == 0 {
         return;
     }
-    let lv = LEVEL.load(Ordering::Relaxed);
-    let written = write && write_gmux(raw_for(lv));
+    let lv = crate::video::backlight::level();
+    // BRIGHTFLOOR: `gmux_written` is the READBACK verdict now (the register holds the value written,
+    // nonzero), not "the transaction completed".
+    let written = write && crate::video::backlight::set_level_via(lv, "keys").on;
     let indicator = status::bright_item() == Some(lv);
     serial_println!(
         ":: BRIGHTKEYS: key={} level={}/{} gmux_written={} indicator={} -> {} ::",
@@ -91,22 +87,5 @@ fn apply(write: bool) {
     );
 }
 
-#[cfg(all(feature = "gmux_igd", feature = "intel-ivb"))]
-fn write_gmux(raw: u16) -> bool {
-    crate::drivers::gpu::igpu::gmux_set_brightness(raw)
-}
-#[cfg(not(all(feature = "gmux_igd", feature = "intel-ivb")))]
-fn write_gmux(_raw: u16) -> bool {
-    false
-}
-
-/// SETTINGS (R75): the current level `0..=STEPS`.
-pub fn level() -> u8 { LEVEL.load(Ordering::Relaxed) }
-/// SETTINGS (R75): set the level directly (a slider), through the same pending/indicator path a key uses.
-pub fn set_level(lv: u8) {
-    let lv = if lv > STEPS { STEPS } else { lv };
-    let up = lv >= LEVEL.load(Ordering::Relaxed);
-    LEVEL.store(lv, Ordering::Relaxed);
-    PENDING.store(if up { 2 } else { 1 }, Ordering::Release);
-    status::bright_show(lv);
-}
+/// SETTINGS (R75): the current level (`backlight::FLOOR..=STEPS`).
+pub fn level() -> u8 { crate::video::backlight::level() }

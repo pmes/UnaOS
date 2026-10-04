@@ -1163,3 +1163,7 @@ pub mod shotsel;
 // POWERMENU (R75): the power UI state (two-step confirm, battery panel text, low-battery notice). Same gate as `crystal`.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod powerui;
+
+// BRIGHTFLOOR (B312): THE one backlight writer — floor, gmux register, readback. Same gate as brightkeys.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod backlight;
