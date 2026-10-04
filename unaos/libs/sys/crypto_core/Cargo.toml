@@ -1,0 +1,20 @@
+[package]
+name = "crypto_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "CRYPTOCORE (SR27): the cryptographic primitives UnaOS owns, written from the specifications — shared by Ring 0 and Ring 3."
+
+# CRYPTOCORE (LEDGER SR27, R83): `#![no_std]`, the primitives need NO allocator (`alloc` only adds
+# Vec-returning conveniences and Argon2's self-allocated memory), and NO dependencies — not even for the
+# constant-time helpers (`ct.rs` is ours). A member of the ROOT host workspace and a path dep of the kernel.
+# Known-answer tests: `tests/kat.rs` (embedded RFC/FIPS vectors + NIST CAVP / Wycheproof files fetched at
+# test time, pinned by URL + sha256 in `vectors.txt`, skipped offline). Zero dev-dependencies as well.
+
+[features]
+default = []
+alloc = []
+# `std`: host conveniences only (an `OsEntropy` over /dev/urandom). Never enabled by the kernel.
+std = ["alloc"]
+
+[dependencies]
