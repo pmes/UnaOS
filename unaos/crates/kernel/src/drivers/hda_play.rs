@@ -20,7 +20,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 const ENTRIES: usize = 4;
 const ENTRY_BYTES: usize = 32 * 1024;
 const RING_BYTES: usize = ENTRIES * ENTRY_BYTES;
-const FIFO_CAP: usize = 128 * 1024;
+// AUDIO7 (B313) M3: was 128 KiB = RING_BYTES — with feed()'s 2x frame estimate the FIFO topped out at 96 KiB
+// (90312 bytes at 44.1 kHz) and never reached the RING_BYTES prime threshold: armed, never RUN, silent (PLAY2).
+const FIFO_CAP: usize = 2 * RING_BYTES;
 
 static REQ_RATE: AtomicU32 = AtomicU32::new(0);
 static RING_ADDR: AtomicU64 = AtomicU64::new(0);
@@ -34,12 +36,16 @@ struct St {
     fifo: VecDeque<u8>, carry: Vec<u8>,
     prev_cur: usize, silent: u32, underruns: u32, completed: u64, err: u32,
     in_frames: u64, out_n: u64, resampled: bool,
+    // AUDIO7 (B313) M3 — the run witness: RUN readback, LPIB at RUN and as it moves, the first buffer's level.
+    run_bit: bool, run_ms: u64, lpib0: u32, lpib_last: u32, lpib_moved: bool, moved_ms: u64, next_print: u64,
+    level: u32, witnessed: bool, tag: u32, armed_ms: u64,
 }
 impl St {
     const fn new() -> St {
         St { armed: false, running: false, ended: false, done: false, base: 0, sd: 0, eff_rate: 48_000,
              src_rate: 48_000, src_ch: 2, src_bits: 16, fifo: VecDeque::new(), carry: Vec::new(),
-             prev_cur: 0, silent: 0, underruns: 0, completed: 0, err: 0, in_frames: 0, out_n: 0, resampled: false }
+             prev_cur: 0, silent: 0, underruns: 0, completed: 0, err: 0, in_frames: 0, out_n: 0, resampled: false,
+             run_bit: false, run_ms: 0, lpib0: 0, lpib_last: 0, lpib_moved: false, moved_ms: 0, next_print: 0, level: 0, witnessed: false, tag: 0, armed_ms: 0 }
     }
 }
 static ST: spin::Mutex<St> = spin::Mutex::new(St::new());
@@ -69,7 +75,7 @@ fn rate_cap_bit(rate: u32) -> Option<u32> {
 /// The seam `run_tone` calls (same-line fold, before the SDnCTL reset). The tone has already powered the
 /// path, unmuted the amps, driven GPIO/EAPD and bound the converters to `STREAM_TAG`; this sets the converter
 /// format for the requested rate, builds the 4-entry ring and programs (but does not RUN) the stream.
-pub(super) fn gate(base: u64, sd: u64, iss: u8, rings: &mut Rings, cad: u8, paths: &[Path], a: &mut Audit) -> bool {
+pub(super) fn gate(base: u64, sd: u64, iss: u8, rings: &mut Rings, cad: u8, paths: &[Path], chan: &[u8], a: &mut Audit) -> bool {
     let want = REQ_RATE.swap(0, Ordering::AcqRel);
     if want == 0 || paths.is_empty() {
         return false;
@@ -110,24 +116,15 @@ pub(super) fn gate(base: u64, sd: u64, iss: u8, rings: &mut Rings, cad: u8, path
         }
     }
     core::sync::atomic::fence(Ordering::SeqCst);
-    let c0 = r8(base, sd + SD_CTL);
-    w8(base, sd + SD_CTL, (c0 & !(SDCTL_RUN as u8)) | SDCTL_SRST as u8);
-    wait_us(10_000, || r8(base, sd + SD_CTL) & SDCTL_SRST as u8 != 0);
-    w8(base, sd + SD_CTL, r8(base, sd + SD_CTL) & !(SDCTL_SRST as u8));
-    wait_us(10_000, || r8(base, sd + SD_CTL) & SDCTL_SRST as u8 == 0);
-    w32(base, sd + SD_BDPL, (bus_addr(bdl) & 0xFFFF_FFFF) as u32);
-    w32(base, sd + SD_BDPU, (bus_addr(bdl) >> 32) as u32);
-    w32(base, sd + SD_CBL, RING_BYTES as u32);
-    w16(base, sd + SD_LVI, (ENTRIES - 1) as u16);
-    w16(base, sd + SD_FMT, fmt);
-    w8(base, sd + SD_STS, SDSTS_BCIS | SDSTS_FIFOE | SDSTS_DESE);
-    w8(base, sd + SD_CTL + 2, (STREAM_TAG << 4) as u8);
-    w8(base, sd + SD_CTL, SDCTL_IOCE as u8);
-    a.stream += 10;
+    // AUDIO7 (B313) M2: the ONE reset the tone also uses — stop, SRST, STS, flush, snoop, descriptor, codec re-bind
+    // with the converter format = SDxFMT, and the M1 `run=<n> play pre:/post:/diff` lines.
+    let rr = super::stream::rearm(rings, &super::stream::Params { base, sd, cad, bdl, bdl_bytes: ENTRIES * 16, buf: ring, buf_bytes: RING_BYTES,
+        cbl: RING_BYTES as u32, lvi: (ENTRIES - 1) as u16, fmt, tag: STREAM_TAG, paths, chan }, "play", a);
     let mut s = ST.lock();
-    s.armed = true; s.base = base; s.sd = sd; s.eff_rate = eff; s.resampled = eff != want;
+    s.armed = true; s.base = base; s.sd = sd; s.eff_rate = eff; s.resampled = eff != want; s.tag = STREAM_TAG; s.armed_ms = crate::arch::ms();
     serial_println!("[play] arm sd={} iss={} want_rate={} eff_rate={} fmt={:#06x}(readback {:#06x}) pcmcaps={:#010x} ring={:#x} entries={}x{} cbl={}(readback {}) lvi={}(readback {}) ioc=1 poll=lpib",
         0, iss, want, eff, fmt, back, caps, ring, ENTRIES, ENTRY_BYTES, RING_BYTES, r32(base, sd + SD_CBL), ENTRIES - 1, r16(base, sd + SD_LVI));
+    serial_println!("[play] rearm run={} dac_fmt_match={} tag_match={} sdfmt_rd={:#06x} stable={}", rr.run, rr.fmt_match as u8, rr.tag_match as u8, rr.sdfmt_rd, rr.stable as u8);
     true
 }
 
@@ -159,7 +156,7 @@ pub fn feed(data: &[u8]) -> usize {
     if !s.armed || s.ended || data.is_empty() { return 0; }
     let fin = s.src_ch * s.src_bits / 8;
     let nframes = (s.carry.len() + data.len()) / fin;
-    let ratio = (s.eff_rate / s.src_rate.max(1)) as usize + 1;
+    let ratio = ((s.eff_rate + s.src_rate.max(1) - 1) / s.src_rate.max(1)) as usize; // AUDIO7 M3: ceil, not +1 (a 2x over-estimate at equal rates)
     if s.fifo.len() + nframes * ratio * 4 > FIFO_CAP { return 0; }
     let mut buf = core::mem::take(&mut s.carry);
     buf.extend_from_slice(data);
@@ -218,6 +215,7 @@ fn refill(s: &mut St, i: usize, prefill: bool) {
     for k in 0..n { unsafe { core::ptr::write_volatile(dst.add(k), s.fifo.pop_front().unwrap_or(0)); } }
     unsafe { core::ptr::write_bytes(dst.add(n), 0, ENTRY_BYTES - n); }
     core::sync::atomic::fence(Ordering::SeqCst);
+    super::stream::flush(dst as u64, ENTRY_BYTES); // AUDIO7 M2: the entry reaches memory before the DMA can fetch it
     if n == 0 && s.ended { s.silent += 1; } else if n < ENTRY_BYTES && !s.ended && !prefill { s.underruns += 1; }
 }
 
@@ -225,13 +223,20 @@ fn ring_pump(s: &mut St) {
     if !s.armed || s.done { return; }
     let (b, sd) = (s.base, s.sd);
     if !s.running {
-        if s.fifo.len() < RING_BYTES && !s.ended { return; }
+        // AUDIO7 M3: start once a whole ring is queued, OR the producer is done, OR another chunk could not fit.
+        if s.fifo.len() < RING_BYTES && !s.ended && s.fifo.len() + ENTRY_BYTES <= FIFO_CAP { return; }
         for i in 0..ENTRIES { refill(s, i, true); }
+        s.level = rms(RING_ADDR.load(Ordering::Relaxed), ENTRY_BYTES);
         s.prev_cur = 0;
-        w8(b, sd + SD_CTL, SDCTL_IOCE as u8 | SDCTL_RUN as u8);
+        s.lpib0 = r32(b, sd + SD_LPIB);
+        s.lpib_last = s.lpib0;
+        let (ctl, on) = super::stream::run(b, sd, s.tag);
+        s.run_bit = on; s.run_ms = crate::arch::ms(); s.moved_ms = s.run_ms; s.next_print = s.run_ms + 100;
+        serial_println!("[play] run ctl={:#08x} run_bit={} lpib0={} level={} fifo={}", ctl, on as u8, s.lpib0, s.level, s.fifo.len());
         s.running = true;
         return;
     }
+    track(s);
     let sts = r8(b, sd + SD_STS);
     if sts & (SDSTS_BCIS | SDSTS_FIFOE | SDSTS_DESE) != 0 {
         if sts & (SDSTS_FIFOE | SDSTS_DESE) != 0 { s.err += 1; }
@@ -330,9 +335,10 @@ fn report() {
     let frames = s.in_frames;
     let want = w.data_len / (w.ch * w.bits / 8) as u64;
     let ms = frames * 1000 / w.rate as u64;
-    let ok = frames == want && s.underruns == 0 && s.err == 0 && s.completed >= 1;
-    serial_println!("[play] done resampled={} eff_rate={} entries={} fifoe_dese={}", s.resampled as u8, s.eff_rate, s.completed, s.err);
-    serial_println!(":: PLAYWAV: path={} rate={} ch={} bits={} secs={}.{} under={} -> {} ::", w.path, w.rate, w.ch, w.bits, ms / 1000, (ms % 1000) / 100, s.underruns, if ok { "PASS" } else { "FAIL" });
+    let ok = frames == want && s.underruns == 0 && s.err == 0 && s.completed >= 1 && s.lpib_moved && s.done;
+    serial_println!("[play] done resampled={} eff_rate={} entries={} fifoe_dese={} run_bit={} lpib_moved={} level={}", s.resampled as u8, s.eff_rate, s.completed, s.err, s.run_bit as u8, s.lpib_moved as u8, s.level);
+    // AUDIO7 M4: `done=` is the ring's own drain (LPIB walked past the last data entry and every entry refilled with silence).
+    serial_println!(":: PLAYWAV: path={} rate={} frames={} lpib_moved={} done={} -> {} :: ch={} bits={} secs={}.{} under={} ::", w.path, w.rate, frames, s.lpib_moved as u8, s.done as u8, if ok { "PASS" } else { "FAIL" }, w.ch, w.bits, ms / 1000, (ms % 1000) / 100, s.underruns);
 }
 
 /// The service tick (folded at the top of `probe_after_root`): latched opens, file pump, ring refill.
@@ -421,16 +427,70 @@ pub fn selftest() {
         serial_println!(":: PLAYWAV: path=- reason=no-writable-path -> FAIL ::");
         return;
     };
-    if open_wav(path).is_ok() {
-        let t0 = crate::arch::ms();
-        while ACTIVE.load(Ordering::Acquire) && crate::arch::ms().saturating_sub(t0) < 8_000 {
-            service();
-            delay_us(2_000);
+    // AUDIO7 M4: the completion is the ring's drain (`report()` from `service()`), not a wall clock. The loop
+    // ends on that, or on a STALL (LPIB still for 1 s while running, or no RUN 2 s after the arm). No codec = SKIP.
+    match open_wav(path) {
+        Ok(()) => {
+            let mut stalled = false;
+            while ACTIVE.load(Ordering::Acquire) {
+                service();
+                let (_done, _moved, st) = progress();
+                if st { stalled = true; break; }
+                delay_us(2_000);
+            }
+            if stalled {
+                let (lp, run_bit, fifo) = { let s = ST.lock(); (s.lpib_last, s.run_bit as u8, s.fifo.len()) };
+                stop();
+                serial_println!(":: PLAYWAV: path={} reason=stalled lpib={} run_bit={} fifo={} -> FAIL ::", path, lp, run_bit, fifo);
+            }
         }
-        if ACTIVE.load(Ordering::Acquire) {
-            stop();
-            serial_println!(":: PLAYWAV: path={} reason=timeout -> FAIL ::", path);
-        }
+        Err(r) => serial_println!(":: PLAYWAV: path={} reason=no-codec ({}) -> SKIP ::", path, r),
     }
     let _ = mt.unlink(path, p);
+}
+
+// ── AUDIO7 (B313) M3 — the play witness ──────────────────────────────────────────────────────────────
+
+/// RMS of the interleaved 16-bit samples in `[p, p + bytes)`, CPU view (integer square root).
+fn rms(p: u64, bytes: usize) -> u32 {
+    if p == 0 { return 0; }
+    let n = bytes / 2;
+    let mut acc: u64 = 0;
+    for i in 0..n {
+        let v = unsafe { core::ptr::read_volatile((p + (i * 2) as u64) as *const i16) } as i64;
+        acc += (v * v) as u64;
+    }
+    let mean = if n == 0 { 0 } else { acc / n as u64 };
+    let (mut x, mut y) = (mean, (mean + 1) / 2);
+    if mean < 2 { return mean as u32; }
+    while y < x { x = y; y = (x + mean / x) / 2; }
+    x as u32
+}
+
+/// LPIB while running: printed every 100 ms for the first second, then every second; the one-shot witness
+/// line once 300 ms have passed. `moved_ms` is the last time LPIB changed (the stall guard reads it).
+fn track(s: &mut St) {
+    let (b, sd) = (s.base, s.sd);
+    let now = crate::arch::ms();
+    let l = r32(b, sd + SD_LPIB);
+    if l != s.lpib_last { s.lpib_moved = true; s.lpib_last = l; s.moved_ms = now; }
+    if now >= s.next_print {
+        let el = now.saturating_sub(s.run_ms);
+        serial_println!("[play] t={} lpib={} sts={:#04x} ctl={:#04x} completed={} fifo={} under={}", el, l, r8(b, sd + SD_STS), r8(b, sd + SD_CTL), s.completed, s.fifo.len(), s.underruns);
+        s.next_print = now + if el < 1000 { 100 } else { 1000 };
+    }
+    if !s.witnessed && now.saturating_sub(s.run_ms) >= 300 {
+        s.witnessed = true;
+        let r = super::stream::last();
+        serial_println!("[play] run={} lpib={} lpib0={} lpib_now={} tag={} dac_fmt={} level={}", s.run_bit as u8, s.lpib_moved as u8, s.lpib0, l, r.tag_match as u8, r.fmt_match as u8, s.level);
+    }
+}
+
+/// `tests playwav` completion state: (done by the ring's own drain, LPIB moved, stalled).
+fn progress() -> (bool, bool, bool) {
+    let Some(s) = ST.try_lock() else { return (false, false, false) };
+    let now = crate::arch::ms();
+    let stalled = s.armed && !s.done && ((s.running && now.saturating_sub(s.moved_ms) > 1000)
+        || (!s.running && s.armed_ms != 0 && now.saturating_sub(s.armed_ms) > 2000));
+    (s.done, s.lpib_moved, stalled)
 }

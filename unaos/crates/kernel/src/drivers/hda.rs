@@ -1856,7 +1856,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
             if ws[nid as usize].out_amp() {
                 // GET_AMP_GAIN_MUTE payload: bit15 output, bit13 left. Read the left channel; the
                 // two are written back together, which is what this driver set them to.
-                if let Some(v) = rings.cmd(cad, nid, VERB_GET_AMP_GAIN_MUTE, 0x80, a) {
+                if let Some(v) = rings.cmd16(cad, nid, VERB_GET_AMP_GAIN_MUTE, 0xA000, a) {
                     a.verbs_get += 1;
                     s[m].out_amp[i] = (v & 0xFFFF) as u16;
                     s[m].out_amp_ok[i] = true;
@@ -2010,8 +2010,8 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
             mpin, pwr_pin & 0x0F, (pwr_pin >> 4) & 0x0F, pwr_pin & 0xFF,
             s[m].power[(paths[m].len as usize).saturating_sub(1)], s[m].power[0]
         );
-        let amp_dac = rings.cmd(cad, mdac, VERB_GET_AMP_GAIN_MUTE, 0x80, a).unwrap_or(0xFFFF_FFFF);
-        let amp_pin = rings.cmd(cad, mpin, VERB_GET_AMP_GAIN_MUTE, 0x80, a).unwrap_or(0xFFFF_FFFF);
+        let amp_dac = rings.cmd16(cad, mdac, VERB_GET_AMP_GAIN_MUTE, 0xA000, a).unwrap_or(0xFFFF_FFFF);
+        let amp_pin = rings.cmd16(cad, mpin, VERB_GET_AMP_GAIN_MUTE, 0xA000, a).unwrap_or(0xFFFF_FFFF);
         let pinctl_back = rings.cmd(cad, mpin, VERB_GET_PIN_CONTROL, 0, a).unwrap_or(0xFFFF_FFFF);
         let fmt_conv = rings.cmd(cad, mdac, VERB_GET_CONVERTER_FORMAT, 0, a).unwrap_or(0xFFFF_FFFF);
         let pcm_caps = rings.cmd(cad, mdac, VERB_GET_PARAMETER, PARAM_SUPPORTED_PCM, a).unwrap_or(0xFFFF_FFFF); // HDATONE3 M1
@@ -2031,24 +2031,24 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 
     // ── Program the stream descriptor. [HDA-SPEC §3.3.35 ff.] ───────────────────────────────────
     // Stream reset, which the specification requires before a descriptor is reprogrammed.
-    if play::gate(base, sd, iss, rings, cad, &paths[..np], a) { return; } w8(base, sd + SD_CTL, (saved_ctl as u8 & !(SDCTL_RUN as u8)) | SDCTL_SRST as u8); // PLAYWAV (R75): LINE-NEUTRAL fold — a `play` request takes the stream here (the tone has powered/unmuted/bound everything above)
-    a.stream += 1;
-    let srst_set = wait_us(10_000, || r8(base, sd + SD_CTL) & SDCTL_SRST as u8 != 0);
-    w8(base, sd + SD_CTL, r8(base, sd + SD_CTL) & !(SDCTL_SRST as u8));
-    a.stream += 1;
-    let srst_clr = wait_us(10_000, || r8(base, sd + SD_CTL) & SDCTL_SRST as u8 == 0);
-
-    w32(base, sd + SD_BDPL, (bus_addr(bdl) & 0xFFFF_FFFF) as u32);
-    w32(base, sd + SD_BDPU, (bus_addr(bdl) >> 32) as u32);
-    w32(base, sd + SD_CBL, PCM_BYTES as u32);
-    w16(base, sd + SD_LVI, (BDL_ENTRIES - 1) as u16);
-    w16(base, sd + SD_FMT, FMT_48K_16_STEREO);
-    // Clear the sticky status bits so BCIS, FIFOE and DESE below are all facts about THIS run.
-    w8(base, sd + SD_STS, SDSTS_BCIS | SDSTS_FIFOE | SDSTS_DESE);
-    // Stream number into bits 23:20 of SDnCTL — the third byte of the 24-bit register.
-    w8(base, sd + SD_CTL + 2, (STREAM_TAG << 4) as u8);
-    w8(base, sd + SD_CTL, SDCTL_IOCE as u8);
-    a.stream += 7;
+    if play::gate(base, sd, iss, rings, cad, &paths[..np], &pchan[..np], a) { return; } let _ = saved_ctl; // PLAYWAV (R75): LINE-NEUTRAL fold — a `play` request takes the stream here (the tone has powered/unmuted/bound everything above). AUDIO7 (B313): play re-arms through stream::rearm too
+    // AUDIO7 (B313) M2 — the tone's own stop/SRST/descriptor block is gone: BOTH the tone and `play` call
+    // `stream::rearm`, which stops (RUN cleared and observed), pulses SRST, clears STS, flushes the PCM buffer
+    // and the BDL out of the CPU cache, clears PCIe No-Snoop + TCSEL, rewrites BDPL/U CBL LVI FMT and the tag,
+    // then re-binds the codec path with the converter format = the SAME word as SDxFMT, and prints the M1
+    // `run=<n> pre:` / `post:` / `diff` lines. These lines stay as comments so the file's line numbers hold.
+    let rr = stream::rearm(rings, &stream::Params { base, sd, cad, bdl, bdl_bytes: BDL_BYTES, buf: pcm, buf_bytes: PCM_BYTES, cbl: PCM_BYTES as u32, lvi: (BDL_ENTRIES - 1) as u16, fmt: FMT_48K_16_STEREO, tag: STREAM_TAG, paths: &paths[..np], chan: &pchan[..np] }, "tone", a);
+    let (srst_set, srst_clr) = (rr.srst_set, rr.srst_clr);
+    //
+    // (was) w32 SD_BDPL/SD_BDPU = bdl
+    // (was) w32 SD_CBL = PCM_BYTES
+    // (was) w16 SD_LVI = BDL_ENTRIES - 1
+    // (was) w16 SD_FMT = FMT_48K_16_STEREO
+    // (was) STS W1C — now inside stream::rearm, so BCIS, FIFOE and DESE below are still facts about THIS run.
+    // (was) w8 SD_STS
+    // Stream number into bits 23:20 of SDnCTL — written by stream::rearm and again with RUN below.
+    // (was) w8 SD_CTL+2 = tag, w8 SD_CTL = IOCE
+    // (was) a.stream += 7 — stream::rearm counts its own writes.
 
     let fmt_back = r16(base, sd + SD_FMT); let disc = disc_read(base, sd, rings, cad, &paths, np, a); // HDATONE5 M1
     let cbl_back = r32(base, sd + SD_CBL);
@@ -2254,7 +2254,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         (run_ctl & SDCTL_RUN != 0) as u8, run_readback_ok as u8, if dac_d0 { "D0" } else { "D3" }, settled_max, gpio_final, (gpio_final >> 1) & 1, (gpio_final >> 3) & 1, pin_hex(pin_actual[0]), if np > 1 { pin_hex(pin_actual[1]) } else { '-' }, run_reasserts, stall_reasserts,
         disc.sdfmt, &disc.chan[..np], &disc.eapd[..np], disc.vendor >> 16, disc.vendor & 0xFFFF
     );
-    a.line("tone");
+    stream::verdict_tone(advanced); a.line("tone");
 }
 
 // ===================== BOOTSLOW (rmbp-ledger B201) — THE PROBE, AFTER THE ROOT =====================
@@ -2633,3 +2633,7 @@ pub mod powerdown {
         true
     }
 }
+// AUDIO7 (B313): the one stream discipline (rearm / run / the per-run register snapshot) tone and play share.
+#[cfg(feature = "hda-tone")]
+#[path = "hda_stream.rs"]
+pub mod stream;
