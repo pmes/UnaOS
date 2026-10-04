@@ -3600,6 +3600,7 @@ print("model=fixed span=%d cap=16384" % (hi - lo)); sys.exit(0 if hi - lo <= 163
 PY
 )" || { echo -e "${COLOR_RED}ERROR: ${lbl} does not fit its ring-3 window: ${out}${COLOR_RESET}"; exit 1; }
     echo -e "   ${lbl}: ${sz} B file, ${out}"
+    bash "${WORKSPACE_DIR}/scripts/elf-entry-check.sh" "$f" || { echo -e "${COLOR_RED}ERROR: ${lbl} cannot run at its entry (LUMENCRASH gate, scripts/elf-entry-check.sh)${COLOR_RESET}"; exit 1; }   # LUMENCRASH M4 (B326): a GOT load through a discarded .got, a dangling RIP-relative target, or a ring-0 instruction at entry is refused here, not as a #GP on metal
 }
 
 # WINX-5: build the x86_64 static ELF64 EL0 PERSISTENCE program (crates/user-stat → target/STAT-X86.ELF).
@@ -3821,6 +3822,7 @@ build_user_net_x86() {
     [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/NET-X86.ELF" | tr -d ' ')"
     [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    bash "${WORKSPACE_DIR}/scripts/elf-entry-check.sh" "${WORKSPACE_DIR}/target/NET-X86.ELF" || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF cannot run at its entry (LUMENCRASH gate)${COLOR_RESET}"; exit 1; }   # LUMENCRASH M4 (B326)
     echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (${psz} B)${COLOR_RESET}"
 }
 
