@@ -58,3 +58,24 @@ on connect with the defaults and no Gemini key:
 `:: BRAIN :: EMBED off/none dims=0` then `:: BRAIN :: RECALL OFF :: no embedder — set vein.embed.provider`.
 
 **Owed.** The canonical HF safetensors pin; the no_std metal forward pass; Holocron custody of keys.
+
+## Results (2026-10-04)
+
+- M1 `b7583b08` — `Embedder`, `GeminiEmbedder`, `NoEmbedder`, `EmbedConfig::from_prefs`, `EmbedSlot`
+  in Vein, tagged vault vectors, the `ReEmbed*` bus messages (with KATs) and the re-embed driver
+  (`handlers/vein/src/reembed.rs`; it landed in this commit, M3 only added the label).
+- M2 `2903a303` — `LocalEmbedder` (`libs/gneiss_pal/src/api/local/{mod,onnx,wordpiece}.rs`),
+  `tools/una-models` (fetch/verify/list, sha256 pins on the archive and on each file), the golden
+  test `libs/gneiss_pal/tests/local_embed_golden.rs` + fixture.
+- M3 `e061b205` — Lumen settings dialog label (`libs/quartzite/src/platforms/gtk/workspace/sidebar.rs`).
+- M4 — this file's results, Vein README embedder section, ROADMAP SH-4 clause, ledger B317.
+
+Gates (exit codes, repo root): `cargo test -q -p gneiss_pal -p vein -p principia -p bandy` → 0
+(gneiss_pal 42 lib + 1 golden, vein 16, principia 19, bandy 102 KATs); `cargo test -q -p gneiss_pal`
+alone (feature off) → 0; `cargo check -q -p lumen` → 0; `charter-check.sh` → 0.
+Golden: `minilm golden: 20/20 token-exact, worst cosine to reference 0.9999996`; with no model:
+`SKIP minilm golden: all-MiniLM-L6-v2 is not installed in /nonexistent/unaos/models/all-MiniLM-L6-v2 — run \`tools/una-models fetch all-MiniLM-L6-v2\``.
+`tools/una-models fetch all-MiniLM-L6-v2` → 0, `verify` → 0 (three `ok` lines).
+
+Not compile-checked here: the quartzite `gtk` feature (no GTK4 on this container), so the dialog
+label is written but its compile is owed to a GTK4 host.

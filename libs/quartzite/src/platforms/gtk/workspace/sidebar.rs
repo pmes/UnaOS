@@ -199,7 +199,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
             configured.as_ref().map(|c| (c.kind.as_str(), c.model.as_str())),
             embed_cfg.as_ref(),
         );
-        vbox.append(&Label::new(Some(&provider_label)));
+        vbox.append(&Label::new(Some(provider_label.as_str())));
 
         let hbox_hist = Box::new(Orientation::Horizontal, 12);
         hbox_hist.append(&Label::new(Some("Enable History")));
