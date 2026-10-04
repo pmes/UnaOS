@@ -527,7 +527,7 @@ fn issue(p: &AhciPort, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool)
         // DW0: CFL in DWORDs (bits 4:0) — a Register H2D FIS is 20 bytes = 5 DWORDs; W (bit 6) is
         // the direction, 0 for a device-to-host transfer; PRDTL in bits 31:16.
         let hdr = p.clb as *mut u32;
-        let dw0: u32 = 5 | (if write { 1 << 6 } else { 0 }) | (1u32 << 16);
+        let dw0: u32 = 5 | (if write { 1 << 6 } else { 0 }) | (((bytes != 0) as u32) << 16); // AHCIROOT (B332): PRDTL 0 for a non-data command (FLUSH CACHE EXT)
         hdr.add(0).write_volatile(dw0);
         hdr.add(1).write_volatile(0); // PRDBC — the controller writes the byte count back here
         let ctba = bus_addr(p.ctba);
@@ -545,7 +545,7 @@ fn issue(p: &AhciPort, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool)
 
     pw32(abar, port, P_CI, 1);
 
-    let done = wait_ms(T_CMD_MS, || {
+    let done = wait_ms(if cmd == ATA_FLUSH_CACHE_EXT { T_FLUSH_MS } else { T_CMD_MS }, || { // AHCIROOT (B332): a flush drains the cache, so it gets its own bound
         pr32(abar, port, P_CI) & 1 == 0 || pr32(abar, port, P_IS) & PIS_TFES != 0
     });
 
@@ -563,8 +563,8 @@ fn issue(p: &AhciPort, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool)
     }
     if is & PIS_TFES != 0 || tfd & TFD_ERR != 0 {
         serial_println!(
-            "[ahci] port {} command {:#04x} task-file error (PxIS={:#010x} PxTFD={:#010x} err={:#04x} PxSERR={:#010x})",
-            port, cmd, is, tfd, (tfd >> 8) & 0xFF, pr32(abar, port, P_SERR)
+            "[ahci] port {} command {:#04x} task-file error (PxIS={:#010x} PxTFD={:#010x} err={:#04x} [{}] PxSERR={:#010x})",
+            port, cmd, is, tfd, (tfd >> 8) & 0xFF, ata_error_names(((tfd >> 8) & 0xFF) as u8), pr32(abar, port, P_SERR)
         );
         return Err(());
     }
@@ -1007,4 +1007,49 @@ pub(crate) fn write_block_at(port_ix: usize, lba: u64, buf: &[u8]) -> Result<(),
         core::ptr::copy_nonoverlapping(buf.as_ptr(), p.dma as *mut u8, SECTOR_BYTES);
     }
     issue(&p, ATA_WRITE_DMA_EXT, lba, 1, SECTOR_BYTES, true)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// AHCIROOT (rmbp-ledger B332) — FLUSH CACHE EXT and the error-register decode.
+//
+// ATA8-ACS `FLUSH CACHE EXT` (0xEA) is a NON-DATA command: no PRDT entry (PRDTL 0, set in [`issue`]
+// from `bytes == 0`), no LBA, completion when the device has written its volatile cache to the
+// medium. It is the barrier UnaFS's commit needs before its root flip (`fs::unafs::SdSectorDevice::
+// flush`) and what a dropped grant issues. It writes no user data, so it is compiled ungated in the
+// opcode set the `issue` timeout names; it is only ISSUED under `ahciroot`.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ATA8-ACS `FLUSH CACHE EXT`.
+const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
+
+/// A flush may legitimately take as long as the drive needs to drain its cache; a spinning disk with
+/// a full cache needs seconds. Ten seconds is a deadline, not an expectation.
+const T_FLUSH_MS: u64 = 10_000;
+
+/// ATA8-ACS §6.2 error register bits, named — so a failed write says WHY rather than a hex byte.
+fn ata_error_names(err: u8) -> &'static str {
+    match err {
+        0 => "none",
+        e if e & 0x80 != 0 => "ICRC interface-CRC",
+        e if e & 0x40 != 0 => "UNC uncorrectable-data",
+        e if e & 0x10 != 0 => "IDNF id-not-found (LBA out of range)",
+        e if e & 0x04 != 0 => "ABRT command-aborted",
+        e if e & 0x02 != 0 => "EOM/NM",
+        _ => "other",
+    }
+}
+
+/// AHCIROOT: `FLUSH CACHE EXT` on the disk at registry index `port_ix`. Bounded by [`T_FLUSH_MS`];
+/// a failure is printed by [`issue`] with the error register decoded.
+#[cfg(feature = "ahciroot")]
+pub(crate) fn flush_at(port_ix: usize) -> Result<(), ()> {
+    if port_ix >= MAX_AHCI_DISKS {
+        return Err(());
+    }
+    let guard = PORTS.lock();
+    let p = match guard[port_ix] {
+        Some(p) => p,
+        None => return Err(()),
+    };
+    issue(&p, ATA_FLUSH_CACHE_EXT, 0, 0, 0, false)
 }
