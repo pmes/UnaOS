@@ -3731,6 +3731,13 @@ lumen = []
 # `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 vein = ["busreg"]
 
+# NETRING3 (rmbp-ledger B306): UNAOS_NETRING3=1 arms ring-3 entropy and name resolution — `SYS_GETRANDOM`
+# (56, the SHA-256 DRBG on top of `rand.rs`, whose cfg and `hash`'s widen to this feature) and
+# `SYS_RESOLVE` (57, `smolnet::resolve` on x86; -ENODEV on aarch64), `crate::netring3` and `tests net`.
+# Both arches. Off: neither arm is compiled and the numbers fall to the unknown-syscall default. Kept in
+# sync with `unaos/arroyo` (the x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+netring3 = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

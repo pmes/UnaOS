@@ -130,6 +130,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         return;
     }
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); // LUMENBIN: `tests lumen`
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_netring3();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -216,5 +217,11 @@ fn ensure_lumen() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); }
+/// NETRING3 (B306): register `tests net` (M1 entropy + M2 resolve) exactly once under `netring3`.
+fn ensure_netring3() {
+    #[cfg(feature = "netring3")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("net", crate::netring3::selftest); }
     }
 }

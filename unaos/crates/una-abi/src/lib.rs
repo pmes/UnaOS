@@ -1115,3 +1115,23 @@ mod veincore_abi {
         std::println!(":: VEINCORE-ABI: chat=130..=133 more={} ecanceled={} -> PASS ::", BUS_STATUS_MORE, ECANCELED);
     }
 }
+// =================================================================================================
+// NETRING3 (B306) — entropy and name resolution for ring 3, the rungs under a metal HTTPS client.
+// Both numbers mean the same verb on both arches. Appended at the file tail so no existing line moves.
+// =================================================================================================
+
+/// `SYS_GETRANDOM(buf, len) -> bytes written / -errno` — fill `buf` from the kernel DRBG (SHA-256,
+/// seeded from RDSEED/RDRAND/RNDR plus cycle-counter jitter, reseeded every 64 KiB). At most
+/// [`GETRANDOM_MAX`] bytes per call; a short count is a legal answer and ring 3 loops for more.
+pub const SYS_GETRANDOM: u64 = 56;
+/// Most bytes one `SYS_GETRANDOM` call writes.
+pub const GETRANDOM_MAX: usize = 256;
+/// `SYS_RESOLVE(name_ptr, name_len, out_ptr) -> 0 / -errno` — resolve a DNS name through the kernel's
+/// resolver (the DHCP-leased nameserver, gateway fallback). Writes [`RESOLVE_OUT_LEN`] bytes:
+/// `[v4 4][v6 16]` (the v6 slot is zero in v1). `-ENODEV` no network stack / no NIC, `-ENOENT` no
+/// answer, `-EINVAL` an empty or over-long name (1..=[`RESOLVE_NAME_MAX`]).
+pub const SYS_RESOLVE: u64 = 57;
+/// Bytes `SYS_RESOLVE` writes.
+pub const RESOLVE_OUT_LEN: usize = 20;
+/// Longest name `SYS_RESOLVE` accepts.
+pub const RESOLVE_NAME_MAX: usize = 253;
