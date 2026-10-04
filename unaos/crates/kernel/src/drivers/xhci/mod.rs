@@ -4779,16 +4779,11 @@ impl XhciController {
                                                 let ep_mps = ((desc_data[offset + 4] as u16) | ((desc_data[offset + 5] as u16) << 8)) & 0x07FF;
                                                 if (ep_attr & 0x03) == 0x02 { // Bulk transfer type
                                                     if (ep_addr & 0x80) != 0 {
-                                                        serial_println!("xHCI: >>> BULK IN EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
+                                                        crate::bootlog_println!("xHCI: >>> BULK IN EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
                                                         bulk_in = Some((ep_addr, ep_mps)); #[cfg(feature = "usbnet")] usbnet::note_bulk_ep(slot_id as u8, ep_addr, ep_mps); // USBNET7: the FIRST bulk endpoint of each direction is remembered (Linux usbnet_get_endpoints); this walk keeps the last
                                                     } else {
-                                                        serial_println!("xHCI: >>> BULK OUT EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
-                                                        bulk_out = Some((ep_addr, ep_mps)); #[cfg(feature = "usbnet")] usbnet::note_bulk_ep(slot_id as u8, ep_addr, ep_mps); // USBNET7: see the IN twin above
-                                                        crate::bootlog_println!("xHCI: >>> BULK IN EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
-                                                        bulk_in = Some((ep_addr, ep_mps));
-                                                    } else {
                                                         crate::bootlog_println!("xHCI: >>> BULK OUT EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
-                                                        bulk_out = Some((ep_addr, ep_mps));
+                                                        bulk_out = Some((ep_addr, ep_mps)); #[cfg(feature = "usbnet")] usbnet::note_bulk_ep(slot_id as u8, ep_addr, ep_mps); // USBNET7: see the IN twin above
                                                     }
                                                 }
                                             }
