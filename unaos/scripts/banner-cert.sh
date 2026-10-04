@@ -267,7 +267,7 @@ witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|!bar
 wc|[wc-x] desktop-app|-|measured(1)
 linuxabi|:: LINUXABI: path=|-|measured(1)
 busreg|:: BANDY3: registered=|-|measured
-wcg-paygo|paygo|witness|measured
+wcg-paygo| paygo win|witness|measured
 wcdvalve|[wc-d] valve CLOSED util~|witness|measured
 logts|:: LOGWIT-1 probe seq=|witness|measured
 usbdebug|USB-DEBUG: ptr report (rel)|-|measured
@@ -298,7 +298,7 @@ intel-ivb|:: igpu: VERDICT: Present but BAR not decoding|-|measured
 gen7|:: gen7: r6 next=STOP-window-or-register-block-out-of-range|-|measured
 gmux_igd|:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD|intel-ivb|measured
 unaos_ivb|@boot iGPU trace 1 (pre-EBS) collected.|-|measured
-ahci|:: AHCI:|-|measured
+ahci|AHCI: selfcheck|-|measured
 root-prefer|[bootdisk] root candidates:|-|measured
 bar1wedge|:: BAR1WEDGE: rung=first-stall|-|measured
 bar1exp-uc|:: x86 bar1exp: UC arm ARMED via=|-|measured
