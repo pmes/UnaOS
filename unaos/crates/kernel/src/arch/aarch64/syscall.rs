@@ -6898,7 +6898,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_OPEN => sys_open(a0, a1, a2),
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
+        SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), una_abi::SYS_SBRK => super::xwin::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
         SYS_CLOSE => sys_close(a0),
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
@@ -7221,7 +7221,7 @@ fn user_range_ok(user_va: u64, len: usize, writable: bool) -> bool {
         return false; // length wraps the address space
     };
     let lo = if writable { base + super::uslots::USER_CODE_SIZE as u64 } else { base };
-    user_va >= lo && end <= base + size as u64
+    (user_va >= lo && end <= base + size as u64) || super::xwin::range_ok(user_va, len, writable) // RING3ABI2 M5 (B333): the extension GiB — the ELF window's LIVE leaves (walked) and the args page (read only)
 }
 
 /// Copy `len` bytes from the EL0 buffer at `user_va` into `kdst`, after validating the whole SOURCE range
@@ -7735,6 +7735,12 @@ fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
         return Err(MapErr::Empty);
     }
     let (base, size) = super::uslots::user_region();
+    if let Some(r) = super::xwin::place_elf_model(bytes) { // RING3ABI2 M5 (B333): the image asked for the ELF window (lowest PT_LOAD >= una_abi::USER_XWIN_VA_ARM)
+        let (slot, entry, sp, nsegs) = r.map_err(MapErr::BadElf)?;
+        let ttbr0 = super::uslots::slot_ttbr0(slot);
+        slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::image_of(bytes)); #[cfg(feature = "login")] session_restamp(ttbr0 >> 48);
+        return Ok(Mapped { base: entry, sp, ttbr0, slot, len: bytes.len(), is_elf: true, nsegs });
+    }
     let elf_plan = if is_elf_image(bytes) {
         Some(validate_elf(bytes, size).map_err(MapErr::BadElf)?)
     } else {
@@ -7781,7 +7787,7 @@ fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
             (base, 1, false)
         }
     };
-    let ttbr0 = super::uslots::slot_ttbr0(slot);
+    let ttbr0 = super::uslots::slot_ttbr0(slot); super::xwin::slot_placed(slot, base); // RING3ABI2: the args page (argc 0 until a launcher writes words) and the whole ELF window as this fixed-model program's SYS_SBRK heap
     // IMAGE_SHA256 (code-signing): stamp this slot's persistent principal from the loaded IMAGE bytes, not
     // any 8.3 name — the SOLE mint path, kernel-derived from the untrusted image, never EL0-set. Two
     // byte-identical images share a principal; two different images do not. Hashed over the WHOLE file image
@@ -7851,15 +7857,19 @@ const RUN_IMAGE_KSTACK_SIZE: usize = 32 * 1024;
 /// invariant (shell.rs). `deadline_ticks` is a CNTPCT span (`timer::cntfrq()` = 1 s).
 /// Returns `(outcome, entry)` where `entry` is the EL0 entry VA the image was mapped at (for the caller's
 /// witness line) — or an operator string if the image could not be loaded.
-pub fn run_user_image(
+pub fn run_user_image_argv(
     name: &'static str,
     bytes: &[u8],
     deadline_ticks: u64,
+    argv: &[&str],
 ) -> Result<(RunOutcome, u64), &'static str> {
     // Fail-closed backstop (the caller also bounds): the whole image must fit the slot window. The mapper
     // re-bounds the flat path to one code page and each ELF segment to the window.
-    if bytes.len() > super::uslots::USER_REGION_SIZE {
-        return Err("image larger than the 16 KiB user window");
+    if bytes.len() > super::xwin::IMAGE_CAP { // RING3ABI2 M5: the 4 MiB ELF window; the mapper still bounds a classic image to 16 KiB
+        return Err("image larger than the 4 MiB user image cap");
+    }
+    if !super::xwin::argv_fits(argv) {
+        return Err("the command line does not fit the 4 KiB args page (32 words max, RING3ABI2)");
     }
     // EL0-EL1CORE — the same pre-check `spawn_user_image_bg` makes, asked about the core THIS launcher
     // pins to (`this_cpu()`, the sys_spawn co-location invariant) rather than about `CPU_AUTO`. On the
@@ -7887,7 +7897,7 @@ pub fn run_user_image(
             });
         }
     };
-    let asid = mapped.ttbr0 >> 48;
+    let asid = mapped.ttbr0 >> 48; super::xwin::args_write(mapped.slot, argv); // RING3ABI2 M2: the words, before the task exists
     // VUG-BG: this is the FOREGROUND launcher, so the new address space is explicitly NOT detached.
     // Cleared rather than merely "not set": ASIDs recycle, and a slot last used by a `bg` spawn would
     // otherwise hand its stale detached bit to the next foreground program that inherits the number.
@@ -8328,9 +8338,12 @@ pub enum BgPoll {
 /// (the shell's `bg` verb) records the pid and reaps it later via [`bg_poll`]. Mirrors
 /// `run_user_image`'s front half exactly — same bounds, same console-cap endowment, same EXEC1-M
 /// publish order — and diverges only where the contract block above says it does.
-pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    if bytes.len() > super::uslots::USER_REGION_SIZE {
-        return Err("image larger than the 16 KiB user window");
+pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
+    if bytes.len() > super::xwin::IMAGE_CAP { // RING3ABI2 M5: the 4 MiB ELF window
+        return Err("image larger than the 4 MiB user image cap");
+    }
+    if !super::xwin::argv_fits(argv) {
+        return Err("the command line does not fit the 4 KiB args page (32 words max, RING3ABI2)");
     }
     // EL0-EL1CORE — REFUSE BEFORE ANYTHING IS CLAIMED. `sched::spawn_user_slot` filters the EL0
     // candidate set down to cores that are at EL1 and REFUSES (returns task id 0) when that set is
@@ -8364,7 +8377,7 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
             });
         }
     };
-    let asid = mapped.ttbr0 >> 48;
+    let asid = mapped.ttbr0 >> 48; super::xwin::args_write(mapped.slot, argv); // RING3ABI2 M2
     // VUG-BG: mark the address space DETACHED before the task can be dispatched, so the program observes
     // the bit on its very first info-page read rather than racing the launcher. See `set_detached`.
     set_detached(asid, true);
@@ -25898,4 +25911,37 @@ fn sys_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
         Ok(out) => if copy_to_user(out_ptr, &out, out.len()).is_err() { EFAULT } else { 0 },
         Err(e) => e,
     }
+}
+
+// =================================================================================================
+// RING3ABI2 (rmbp-ledger B333) — the argv-less launchers every older caller uses, and SYS_WHOAMI.
+// =================================================================================================
+
+/// RING3ABI2 M2: the foreground launcher without words.
+pub fn run_user_image(name: &'static str, bytes: &[u8], deadline_ticks: u64) -> Result<(RunOutcome, u64), &'static str> {
+    run_user_image_argv(name, bytes, deadline_ticks, &[])
+}
+
+/// RING3ABI2 M2: the background launcher without words.
+pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
+    spawn_user_image_bg_argv(bytes, &[])
+}
+
+/// RING3ABI2 M3: `SYS_WHOAMI(buf, len)` on aarch64. A program launched while a session is open runs as
+/// the session user (`session_restamp` at load; a closed session's programs are ended at logout, SECLOGIN
+/// M3), so the record is the session's — `crate::ring3abi::whoami_record` over the users store. An
+/// anonymous caller (no session; the boot/shared root) is `-ENOENT`.
+fn sys_whoami(buf: u64, len: u64) -> i64 {
+    let uid = if current_asid() == 0 { 0 } else { crate::ring3abi::session_uid() };
+    let rec = match crate::ring3abi::whoami_record(uid) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if (len as usize) < rec.len() {
+        return una_abi::ERANGE;
+    }
+    if copy_to_user(buf, &rec, rec.len()).is_err() {
+        return EFAULT;
+    }
+    rec.len() as i64
 }

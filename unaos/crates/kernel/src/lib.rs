@@ -272,3 +272,6 @@ pub mod lumen;
 // EXECNAME (rmbp-ledger B322): `tests exec`, the bare-name resolve + launch-note witness over the staged x86 programs. Tail statement, so no existing line moves.
 #[cfg(target_arch = "x86_64")]
 pub mod execname;
+// RING3ABI2 (rmbp-ledger B333): the SYS_WHOAMI record and `tests ring3abi` (args page, getrandom, the ELF windows). Tail statement, so no existing line moves.
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+pub mod ring3abi;

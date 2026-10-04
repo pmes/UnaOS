@@ -537,8 +537,10 @@ pub enum Plan {
     /// The core answered in full; the ring renders this message and is done.
     Say(Message),
     /// A bare name resolved to a program. `typed` is what the user wrote,
-    /// `name` is the on-disk spelling to load.
-    Exec { typed: String, name: String },
+    /// `name` is the on-disk spelling to load, `args` the words that followed
+    /// it on the line (RING3ABI2, B333: the program's `argv[1..]`; `argv[0]` is
+    /// `typed`). The core splits the line once, so both rings pass the same words.
+    Exec { typed: String, name: String, args: Vec<String> },
     /// A verb only the ring can service. `verb` is the first word; `rest` is
     /// the remainder of the line, untouched, for the ring to re-split exactly
     /// as it always has.
@@ -578,7 +580,7 @@ pub fn plan(line: &str, facts: &Facts, vol: &mut dyn Volume) -> Plan {
     }
     if facts.exec {
         if let Some(name) = resolve_exec(word, vol) {
-            return Plan::Exec { typed: word.to_string(), name };
+            return Plan::Exec { typed: word.to_string(), name, args: args.iter().map(|a| a.to_string()).collect() };
         }
     }
     if let Some(line) = gated_off_line(canon) {
@@ -793,7 +795,7 @@ mod tests {
         // Its full name still launches it.
         assert_eq!(
             plan("STAT.ELF", &f, &mut vol()),
-            Plan::Exec { typed: "STAT.ELF".to_string(), name: "STAT.ELF".to_string() }
+            Plan::Exec { typed: "STAT.ELF".to_string(), name: "STAT.ELF".to_string(), args: Vec::new() }
         );
     }
 
@@ -802,7 +804,7 @@ mod tests {
         let f = Facts { exec: true, x86: true, ..Facts::bare() };
         assert_eq!(
             plan("vug", &f, &mut vol()),
-            Plan::Exec { typed: "vug".to_string(), name: "VUG.ELF".to_string() }
+            Plan::Exec { typed: "vug".to_string(), name: "VUG.ELF".to_string(), args: Vec::new() }
         );
     }
 
@@ -848,7 +850,7 @@ mod tests {
         assert!(!is_verb("pulse", &shipped));
         assert_eq!(
             plan("vug", &shipped, &mut vol()),
-            Plan::Exec { typed: "vug".to_string(), name: "VUG.ELF".to_string() }
+            Plan::Exec { typed: "vug".to_string(), name: "VUG.ELF".to_string(), args: Vec::new() }
         );
         let x86 = Facts { x86: true, proc_verbs: true, exec: true, ..Facts::bare() };
         assert!(!is_verb("vug", &x86));
@@ -885,7 +887,7 @@ mod tests {
         // A non-verb is still a program, and its own spelling is preserved.
         assert_eq!(
             plan("VUG", &f, &mut v),
-            Plan::Exec { typed: "VUG".to_string(), name: "VUG.ELF".to_string() }
+            Plan::Exec { typed: "VUG".to_string(), name: "VUG.ELF".to_string(), args: Vec::new() }
         );
     }
 
@@ -1036,7 +1038,7 @@ mod tests {
         assert!(!is_verb("vug", &arm));
         assert_eq!(
             plan("vug", &x86, &mut vol()),
-            Plan::Exec { typed: "vug".to_string(), name: "VUG.ELF".to_string() }
+            Plan::Exec { typed: "vug".to_string(), name: "VUG.ELF".to_string(), args: Vec::new() }
         );
         // The process verbs follow `proc_verbs`, not the arch.
         assert!(!is_verb("storm", &Facts::bare()));
@@ -1251,8 +1253,10 @@ mod execname_tests {
         // M3: `lumen` is no verb any more — the line plans as Exec, which is what the dock pin dispatches too.
         let f = Facts { exec: true, proc_verbs: true, x86: true, ..Facts::bare() };
         assert!(!is_verb("lumen", &f));
-        assert_eq!(plan("lumen", &f, &mut NameList(&staged)), Plan::Exec { typed: "lumen".to_string(), name: "LUMEN.ELF".to_string() });
-        assert_eq!(plan("/apps/LUMEN.ELF", &f, &mut NameList(&["/apps/LUMEN.ELF"])), Plan::Exec { typed: "/apps/LUMEN.ELF".to_string(), name: "/apps/LUMEN.ELF".to_string() });
+        assert_eq!(plan("lumen", &f, &mut NameList(&staged)), Plan::Exec { typed: "lumen".to_string(), name: "LUMEN.ELF".to_string(), args: Vec::new() });
+        assert_eq!(plan("/apps/LUMEN.ELF", &f, &mut NameList(&["/apps/LUMEN.ELF"])), Plan::Exec { typed: "/apps/LUMEN.ELF".to_string(), name: "/apps/LUMEN.ELF".to_string(), args: Vec::new() });
+        // RING3ABI2 (B333): the words after the program are its argv[1..], split once by the core.
+        assert_eq!(plan("net  example.com  80", &f, &mut NameList(&["NET.ELF"])), Plan::Exec { typed: "net".to_string(), name: "NET.ELF".to_string(), args: vec!["example.com".to_string(), "80".to_string()] });
     }
 }
 
@@ -1320,7 +1324,7 @@ mod gated_tests {
         assert_eq!(gated_off_line("install"), Some(want.clone()));
         assert_eq!(plan("install", &f, &mut NameList(&[])), Plan::Say(Message::TerminalOutput(want)));
         // A staged program by that name is still a program.
-        assert_eq!(plan("install", &f, &mut NameList(&["INSTALL.ELF"])), Plan::Exec { typed: "install".to_string(), name: "INSTALL.ELF".to_string() });
+        assert_eq!(plan("install", &f, &mut NameList(&["INSTALL.ELF"])), Plan::Exec { typed: "install".to_string(), name: "INSTALL.ELF".to_string(), args: Vec::new() });
         // An unknown word stays unknown.
         assert!(matches!(plan("nosuchword", &f, &mut NameList(&[])), Plan::Say(Message::TerminalError(_))));
     }

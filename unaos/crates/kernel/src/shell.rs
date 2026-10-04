@@ -2968,10 +2968,10 @@ pub fn midden_witness() { if crate::tests::defer("tste", midden_witness) { retur
     // 3. resolve — the `.elf` the user did not type, elided against the on-disk name.
     let mut vol = midden_core::NameList(NAMES);
     let p = midden_core::plan("vug", &facts, &mut vol);
-    let ok = matches!(&p, midden_core::Plan::Exec { typed, name }
+    let ok = matches!(&p, midden_core::Plan::Exec { typed, name, .. }
         if typed == "vug" && name == "VUG.ELF");
     verdict("midden.resolve", ok, &alloc::format!("{:?}", p));
-    if let midden_core::Plan::Exec { typed, name } = &p {
+    if let midden_core::Plan::Exec { typed, name, .. } = &p {
         serial_println!(":: [midden] resolve \"{}\" -> {} ::", typed, name);
     }
 
@@ -5113,16 +5113,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             render_message(console, &msg);
             return false;
         }
-        midden_core::Plan::Exec { typed, name } => {
+        midden_core::Plan::Exec { typed, name, args } => {
             #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
-            bare_exec(console, &typed, &name);
+            bare_exec(console, &typed, &name, &args); // RING3ABI2 M2 (B333): the words after the name are the program's argv[1..]
             // BARENAME (§6.6a): the day a loader arrived on aarch64 the compiler pointed here, as
             // this comment used to promise. What is left is the build with no process table at all,
             // which never sets `Facts::exec` and so is never handed this arm; the branch stays so
             // the match is total.
             #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
             {
-                let _ = (&typed, &name);
+                let _ = (&typed, &name, &args);
                 console.println_styled(crate::video::theme::TERM_RED, "Unknown command. Type 'help' for assistance.");
             }
             return false;
@@ -5504,7 +5504,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // `run /apps/VUG.ELF` and `run VUG.ELF` both reach the DATA volume's `APPS/` there.
             match args.first() {
                 None => console.println_styled(crate::video::theme::TERM_RED, "usage: run <path>   (load + execute an ELF64 user program)"),
-                Some(&path) => run_program(console, path),
+                Some(&path) => run_program(console, path, &args[1..]), // RING3ABI2 M2: `run <path> a b` passes `a b`
             }
         },
         "cp" | "copy" => {
@@ -6181,7 +6181,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match args.first() {
                 None => console.println_styled(crate::video::theme::TERM_RED, "usage: bg <path>   (run an ELF64 user program in the background)"),
                 Some(&path) => {
-                    bg_program(console, path);
+                    bg_program(console, path, &args[1..]); // RING3ABI2 M2: `bg <path> a b` passes `a b`
                 }
             }
         },
@@ -6292,7 +6292,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
             for _ in 0..n {
-                if !bg_program(console, "/apps/VUG.ELF") {
+                if !bg_program(console, "/apps/VUG.ELF", &[]) {
                     // `bg_program` has already said WHY, but not uniformly on this wire: a SPAWN
                     // refusal also prints `:: BGRUN: bg … rejected (…)` to serial, while an
                     // IMAGE-READ failure (missing, empty or oversized /apps/VUG.ELF) is console-only.
@@ -6494,7 +6494,7 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
     // The hard read ceiling: a file at or under it may still be rejected by the loader, but we never
     // read past it. JETSON-EL0: the aarch64 side goes through the `uslots` facade.
     #[cfg(target_arch = "aarch64")]
-    let cap: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64;
+    let cap: u64 = crate::arch::aarch64::xwin::IMAGE_CAP as u64; // RING3ABI2 M5: the 4 MiB ELF window (the loader still bounds a classic image to 16 KiB)
     #[cfg(not(target_arch = "aarch64"))]
     let cap: u64 = crate::arch::syscall::user_image_cap() as u64; // RING3WIN: the image cap, not the 16 KiB fixed window
     #[cfg(target_arch = "x86_64")]
@@ -6605,10 +6605,10 @@ fn cyc_to_us(dt: u64) -> u64 {
 }
 
 #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
-fn run_program(console: &mut Console, path: &str) {
+fn run_program(console: &mut Console, path: &str, rest: &[&str]) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
-    }; run_image(console, path, bytes) } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] fn run_image(console: &mut Console, path: &str, bytes: alloc::vec::Vec<u8>) { // EXECNAME (B322) — ⚠ SAME-LINE fold, line-NEUTRAL: `run` is split at its read so the bare-name launch (bare_exec, a foreground program) runs the bytes it already read through this SAME body; `run <path>` is unchanged.
+    }; let mut argv = alloc::vec![path]; argv.extend_from_slice(rest); run_image(console, path, bytes, &argv) } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] fn run_image(console: &mut Console, path: &str, bytes: alloc::vec::Vec<u8>, argv: &[&str]) { // EXECNAME (B322) — ⚠ SAME-LINE fold, line-NEUTRAL: `run` is split at its read so the bare-name launch (bare_exec, a foreground program) runs the bytes it already read through this SAME body; `run <path>` is unchanged.
     // Hand the bytes to the kernel loader: map into a fresh user slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
@@ -6619,7 +6619,7 @@ fn run_program(console: &mut Console, path: &str) {
     let deadline = 5 * crate::arch::aarch64::timer::cntfrq();
     #[cfg(target_arch = "x86_64")]
     let deadline: u64 = 5_000;
-    match crate::arch::syscall::run_user_image("shell-run", &bytes, deadline) {
+    match crate::arch::syscall::run_user_image_argv("shell-run", &bytes, deadline, argv) {
         Ok((outcome, entry)) => {
             use crate::arch::syscall::RunOutcome;
             match outcome {
@@ -6937,12 +6937,22 @@ fn storm_fat_writer(_: usize) {
 /// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
 /// back the moment this returns; the program (and its window, if it creates one) keeps running.
 #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
-fn bg_program(console: &mut Console, path: &str) -> bool {
+fn bg_program(console: &mut Console, path: &str, rest: &[&str]) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
         return false;
     };
+    let mut argv = alloc::vec![path];
+    argv.extend_from_slice(rest);
+    bg_image(console, path, &bytes, &argv).is_some()
+}
+
+/// RING3ABI2 M2 (B333): THE background body — spawn `bytes` detached with `argv`, title its windows,
+/// claim a job row. `bg <path>` and a bare name that detaches (`bare_exec`) both call this, so the two
+/// launches share one path; `Some((pid, slot, entry))` when the job is running and tracked.
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
+fn bg_image(console: &mut Console, path: &str, bytes: &[u8], argv: &[&str]) -> Option<(u64, u64, u64)> {
     let n = bytes.len(); serial_println!("[bg] spawn path={} bytes={} pid=pending", path, n); // NETHANG M1: the breadcrumb AHEAD of the spawn — boot 20 went dark after `[gui] app-enter` with no line naming which step it reached
-    match crate::arch::syscall::spawn_user_image_bg(&bytes) {
+    match crate::arch::syscall::spawn_user_image_bg_argv(bytes, argv) {
         Ok((pid, asid, entry)) => { serial_println!("[bg] spawn path={} pid={} asid={:#x} -> started", path, pid, asid); crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL: no `panic::Location` in this shared file moves. Name the launch BEFORE the job row is claimed — the task is runnable the instant the spawn returns and may reach its window create first, and a name armed late is a title the operator watches change. `owner_of_launch` corrects the per-arch off-by-one in the spawn handle; the rule and that correction are both stated at `wm::app_name_arm`. Fail-closed: a full name table costs the window its name, never the launch.
             let mut jobs = BG_JOBS.lock();
             // BGREAP-CLOSE: `bg_jobs_claim` reclaims rows whose job is provably finished before it
@@ -6957,7 +6967,7 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
                     "bg: {}: job table full — spawned pid {} was killed ({})",
                     path, pid, why
                 ));
-                return false;
+                return None;
             };
             let mut name = [0u8; 32];
             let nlen = path.len().min(32);
@@ -6968,12 +6978,12 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
                 ":: BGRUN: bg {} — loaded {} bytes, entry {:#x}, pid={} slot={} (window layer arms asid=slot+1) DETACHED ::",
                 path, n, entry, pid, asid
             );
-            true
+            Some((pid, asid, entry))
         }
         Err(why) => {
             console.println(&alloc::format!("bg: {}: {}", path, why));
             serial_println!(":: BGRUN: bg {} — rejected ({}) ::", path, why);
-            false
+            None
         }
     }
 }
@@ -7328,7 +7338,9 @@ fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option
 /// per-segment W^X mapping, the ring-3 window bound and the fault-kill net are the same ones CFU-2's
 /// write gate is built on. This adds a way to CALL the loader, never a way to relax it.
 #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
-fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
+fn bare_exec(console: &mut Console, typed: &str, name: &str, args: &[String]) -> bool {
+    let mut argv: Vec<&str> = alloc::vec![typed]; // RING3ABI2 M2 (B333): argv[0] is the word that named the program
+    argv.extend(args.iter().map(|a| a.as_str()));
     // --- re-resolve the core's answer over the live volume ---------------------------------------
     // The core probed a moment ago; re-resolving costs one walk and closes the window where the
     // volume changed underneath. A miss is a RACE, not a typo, and `bare_exec_reresolve` says so —
@@ -7362,33 +7374,17 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // The ELF64 / little-endian / e_machine pre-checks already ran inside `read_el0_image` (the
     // arch's own twin, so EM_X86_64 there and EM_AARCH64 here), which named any of them; the kernel
     // loader re-validates from scratch regardless.
-    if !exec_detaches(&bytes, &canon, typed) { serial_println!("[bg] spawn path={} bytes={} pid=foreground", load_path, bytes.len()); run_image(console, &canon, bytes); return true; } let n = bytes.len(); serial_println!("[bg] spawn path={} bytes={} pid=pending", load_path, n); // NETHANG M1 breadcrumbs (code first). EXECNAME (B322, R82) — ⚠ SAME-LINE fold, line-NEUTRAL: the program decides — a window or a resident server detaches below (the `bg` body), anything else runs in the foreground through `run`'s own body.
-    match crate::arch::syscall::spawn_user_image_bg(&bytes) {
-        Ok((pid, slot, entry)) => { serial_println!("[bg] spawn path={} pid={} asid={:#x} -> started", load_path, pid, slot); crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), &canon); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The bare-name launch names its windows exactly as `bg_program` does and is armed first for the same reason. `canon` is the spelling the operator's typed name resolved to, which is the spelling they expect to read back in the title bar.
-            if !adopt_bg_job(pid, slot, &canon) {
-                // Spawned but untrackable — kill it rather than leave a job `jobs` could never reap
-                // and `kill` could never name. Same rule `bg` follows, same reason.
-                let why = crate::arch::syscall::bg_kill(pid, slot);
-                console.println(&alloc::format!(
-                    "{}: job table full — spawned pid {} was killed ({})", typed, pid, why
-                ));
-                serial_println!(
-                    ":: BAREXEC: {} — job table full, pid={} killed ({}) ::", canon, pid, why
-                );
-                return true;
-            }
-            console.println(&alloc::format!(
-                "{}: started — pid {} (`jobs` lists it, `kill {}` stops it)", canon, pid, pid
-            ));
+    if !exec_detaches(&bytes, &canon, typed) { serial_println!("[bg] spawn path={} bytes={} pid=foreground", load_path, bytes.len()); run_image(console, &canon, bytes, &argv); return true; } let n = bytes.len(); // EXECNAME (B322, R82): the program decides — a window or a resident server detaches below, anything else runs in the foreground through `run`'s own body. RING3ABI2 M2 (B333): the detached launch is `bg`'s own body (`bg_image`), so `bg`, `run` and a bare name share one path and carry the same argv.
+    match bg_image(console, &canon, &bytes, &argv) {
+        Some((pid, slot, entry)) => {
             serial_println!(
-                ":: BAREXEC: {} (typed '{}') — loaded {} bytes, entry {:#x}, pid={} slot={} DETACHED, left RUNNING ::",
-                canon, typed, n, entry, pid, slot
+                ":: BAREXEC: {} (typed '{}') — loaded {} bytes, entry {:#x}, pid={} slot={} argc={} DETACHED, left RUNNING ::",
+                canon, typed, n, entry, pid, slot, argv.len()
             );
             true
         }
-        Err(why) => {
-            console.println(&alloc::format!("{}: {}", typed, why));
-            serial_println!(":: BAREXEC: {} — rejected ({}) ::", canon, why);
+        None => {
+            serial_println!(":: BAREXEC: {} — not started (the bg line above names why) ::", canon);
             true
         }
     }

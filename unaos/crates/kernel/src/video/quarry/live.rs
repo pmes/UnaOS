@@ -1418,9 +1418,9 @@ fn launch(path: &str) -> String {
     // the file manager, which is why it is a `target_arch` LAWS §3 allows; `shell::read_el0_image`
     // carries the identical pair of lines for the identical reason and is the other launcher.
     #[cfg(target_arch = "aarch64")]
-    let cap: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
+    let cap: u64 = crate::arch::aarch64::xwin::IMAGE_CAP as u64; // RING3ABI2 M5: the 4 MiB ELF window (was the 16 KiB classic window — a LUMEN.ELF double-click was refused as oversize)
     #[cfg(not(target_arch = "aarch64"))]
-    let cap: u64 = crate::arch::syscall::user_window_size() as u64;
+    let cap: u64 = crate::arch::syscall::user_image_cap() as u64; // RING3ABI2 M6: the image cap (RING3WIN), not the 16 KiB fixed window
     // The reap-then-ceiling pre-check moved to [`run_act`] (rmbp-7 QUARRY) — same two steps, same
     // order, same refusal line, but arch-neutral, because the ceiling is Quarry's table's and not
     // this arch's. By the time this body runs the table is reaped and has a free slot.
