@@ -8771,8 +8771,8 @@ test_selfhost() {
     # export produced a builder banner reading `selfhost,...` over a booted kernel with the module
     # compiled OUT, and a gate that could only ever report "not packed". Re-exec with the environment
     # already set is the only way a lane can arm a knob for its own build.
-    if [ -z "${UNAOS_SELFHOST:-}" ] || [ -n "${UNAOS_NOSRC:-}" ]; then
-        exec env -u UNAOS_NOSRC UNAOS_SELFHOST=1 "$0" test-selfhost "$layout" "$secs"
+    if [ -z "${UNAOS_SELFHOST:-}" ] || [ -n "${UNAOS_NOSRC:-}" ] || [ -z "${UNAOS_TESTS_AT_BOOT:-}" ]; then # QUIETBOOT (R80): the verify is a registered test now (`tests selfhost`); this lane runs it at boot via tests-at-boot
+        exec env -u UNAOS_NOSRC UNAOS_SELFHOST=1 UNAOS_TESTS_AT_BOOT=1 "$0" test-selfhost "$layout" "$secs"
     fi
     esp_x86
     UNAOS_SRCFIXTURE=1 bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" "$layout"

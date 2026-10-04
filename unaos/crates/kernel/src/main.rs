@@ -9886,7 +9886,7 @@ fn bootclock_report(stamps: (u64, u64, u64)) {
     // `BPACE t=`/`d=` is divided by, so this line and that block are comparable by construction.
     let hz = unaos_kernel::bootpace::origin_hz();
     let kernel_entry = unaos_kernel::bootpace::origin_cycles();
-    let sane = entry != 0 && read >= entry && jump >= read && kernel_entry >= jump;
+    let sane = entry != 0 && read >= entry && jump >= read && kernel_entry >= jump; if sane { unaos_kernel::bootpace::note_loader_entry(entry); } // QUIETBOOT M4: the BOOT line reuses this stamp.
     let (fw, rd, jp) = if sane {
         (Some(entry), Some(read - entry), Some(jump - read))
     } else {

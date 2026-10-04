@@ -119,7 +119,7 @@ fn emit_src(args: fmt::Arguments, nl: bool, user: bool) {
         lb.n += 1;
     }
     let line = core::str::from_utf8(&lb.b[..lb.n]).unwrap_or("[serial] utf8?\n");
-    LINES.fetch_add(1, Relaxed);
+    LINES.fetch_add(1, Relaxed); tag_note(&lb.b[..lb.n]); // QUIETBOOT M4: per-tag tally until the `:: BOOT:` line (same-line fold).
     if user { SRC_USER.fetch_add(1, Relaxed); } else { SRC_EMIT.fetch_add(1, Relaxed); }
 
     let masked = irq_masked();
@@ -275,4 +275,67 @@ pub fn emit_user(row: usize, text: &str) {
             guard.n = 0;
         }
     }
+}
+
+// ── QUIETBOOT M4 (R80, rmbp-ledger B311) — the per-tag tally of the lines printed BEFORE `:: BOOT:` ──
+//
+// `tests quietboot` names the loudest tags when the boot is over its bound. A tag is the first word
+// after `:: ` (up to `:`, ` ` or `=`) or a leading `[tag]`, cut to 8 bytes and packed into one `u64`
+// (0 = empty slot). 48 slots, linear probe, CAS on the key — lock-free, so the emit path stays safe from
+// an ISR; a full table counts the line in `TAG_OTHER`. Closed (one relaxed load per line) once the
+// boot line has printed.
+const TAG_SLOTS: usize = 48;
+static TAG_KEY: [AtomicU64; TAG_SLOTS] = [const { AtomicU64::new(0) }; TAG_SLOTS];
+static TAG_N: [AtomicU64; TAG_SLOTS] = [const { AtomicU64::new(0) }; TAG_SLOTS];
+static TAG_OTHER: AtomicU64 = AtomicU64::new(0);
+static TAG_CLOSED: AtomicBool = AtomicBool::new(false);
+
+fn tag_key(b: &[u8]) -> u64 {
+    let (start, stop): (usize, &[u8]) = if b.starts_with(b":: ") { (3, b": =\n") } else if b.first() == Some(&b'[') { (0, b"]\n") } else { (0, b": =\n") };
+    let mut k = 0u64;
+    let mut i = 0usize;
+    while i < 8 && start + i < b.len() {
+        let c = b[start + i];
+        if stop.contains(&c) { if c == b']' && i < 8 { k |= (c as u64) << (8 * i); } break; }
+        k |= (c as u64) << (8 * i);
+        i += 1;
+    }
+    k
+}
+
+fn tag_note(b: &[u8]) {
+    if TAG_CLOSED.load(Relaxed) { return; }
+    let k = tag_key(b);
+    if k == 0 { TAG_OTHER.fetch_add(1, Relaxed); return; }
+    let h = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % TAG_SLOTS;
+    for j in 0..TAG_SLOTS {
+        let s = (h + j) % TAG_SLOTS;
+        let cur = TAG_KEY[s].load(Relaxed);
+        if cur == k || (cur == 0 && TAG_KEY[s].compare_exchange(0, k, Relaxed, Relaxed).map_or_else(|v| v == k, |_| true)) {
+            TAG_N[s].fetch_add(1, Relaxed);
+            return;
+        }
+    }
+    TAG_OTHER.fetch_add(1, Relaxed);
+}
+
+/// Stop tallying (the `:: BOOT:` line calls this right after it reads `LINES`).
+pub fn tag_close() { TAG_CLOSED.store(true, Relaxed); }
+
+/// The `n` loudest tags before the boot line, as `(tag bytes, count)` — the tag is up to 8 ASCII bytes.
+pub fn tag_top(out: &mut [([u8; 8], u64)]) -> usize {
+    let mut taken = [false; TAG_SLOTS];
+    let mut w = 0usize;
+    while w < out.len() {
+        let mut best: Option<usize> = None;
+        for s in 0..TAG_SLOTS {
+            if taken[s] || TAG_KEY[s].load(Relaxed) == 0 { continue; }
+            if best.is_none_or(|b| TAG_N[s].load(Relaxed) > TAG_N[b].load(Relaxed)) { best = Some(s); }
+        }
+        let Some(s) = best else { break };
+        taken[s] = true;
+        out[w] = (TAG_KEY[s].load(Relaxed).to_le_bytes(), TAG_N[s].load(Relaxed));
+        w += 1;
+    }
+    w
 }

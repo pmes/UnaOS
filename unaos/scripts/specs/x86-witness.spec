@@ -6,6 +6,9 @@
 #           ./arroyo mbench --follow ~/rmbp-serial.log --spec scripts/specs/x86-witness.spec \
 #                   --platform x86 --timeout 300
 #   Build:  UNAOS_WC=1 (+ the kepler knobs) + `witness` + `logts` + UNAOS_WCG_PAYGO=1.
+#           + UNAOS_TESTS_AT_BOOT=1 UNAOS_CENSUS=1 since QUIETBOOT (R80, rmbp-ledger B311): a quiet metal boot
+#           defers the boot witnesses (`:: TSTE: midden.*`, `:: PRTSCR-DIR-FIX:` …) behind `tests` and the
+#           periodic samplers behind `census`, so this spec scores a witness-battery capture only.
 #
 # SCOPE, stated first because it is what keeps every directive below non-vacuous. This spec
 # asserts a PAYGO-ARMED, LOGTS-PREFIXED, WITNESS-ARMED x86 boot and nothing else. A

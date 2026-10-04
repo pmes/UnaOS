@@ -225,3 +225,37 @@ pub fn defer(name: &'static str, f: fn()) -> bool {
     true
 }
 
+/// QUIETBOOT M4 — the bound on serial lines before `:: BOOT:`, set from the flight-19 sweep: boot 1 printed
+/// 2710 lines to its first stage, ~1900 of them knob-recon rungs the flight line armed (SMC walk, gen7,
+/// Kepler/KFBIND/KDHEAD, iGPU, BT). This arc takes the census + witness ~290 out, so the same knob line
+/// should read ~2420; 2500 leaves room for enumeration variance and FAILS if a census or a witness creeps
+/// back. A boot without the recon knobs reads ~500 and the bound tightens with the knob line.
+pub const QUIETBOOT_BOUND: u64 = 2500;
+
+/// `tests quietboot`: `:: QUIETBOOT: lines=<n> bound=<B> census=<bits> -> PASS|FAIL|SKIP ::`, naming the
+/// eight loudest tags when over. SKIP on a build that runs its fixtures at boot or arms every census
+/// (`tests-at-boot` / `census` — the QEMU lanes), which is not the quiet boot being measured.
+pub fn quietboot_selftest() {
+    let Some(n) = crate::bootpace::boot_lines() else {
+        serial_println!(":: QUIETBOOT: lines=- bound={} -> SKIP (no `:: BOOT:` line yet: no first-boot stage resolved) ::", QUIETBOOT_BOUND);
+        return;
+    };
+    if cfg!(feature = "tests-at-boot") || cfg!(feature = "census") {
+        serial_println!(":: QUIETBOOT: lines={} bound={} census={} -> SKIP (tests-at-boot/census build: not the quiet boot) ::", n, QUIETBOOT_BOUND, crate::census::bits());
+        return;
+    }
+    let ok = n <= QUIETBOOT_BOUND;
+    if !ok {
+        let mut top = [([0u8; 8], 0u64); 8];
+        let k = crate::serial_line::tag_top(&mut top);
+        let mut s = alloc::string::String::new();
+        for (t, c) in &top[..k] {
+            let end = t.iter().position(|b| *b == 0).unwrap_or(8);
+            if !s.is_empty() { s.push(','); }
+            s.push_str(core::str::from_utf8(&t[..end]).unwrap_or("?"));
+            s.push_str(&format!(":{}", c));
+        }
+        serial_println!(":: QUIETBOOT: top=[{}] ::", s);
+    }
+    serial_println!(":: QUIETBOOT: lines={} bound={} census={} -> {} ::", n, QUIETBOOT_BOUND, crate::census::bits(), if ok { "PASS" } else { "FAIL" });
+}
