@@ -112,6 +112,16 @@ impl Principia {
         &self.prefs
     }
 
+    /// The value in force for `ns`/`key` under the process environment:
+    /// stored, else the schema default, else its derived [`prefs_core::rules::Rule`]
+    /// (R81's embedder: gemini when the Gemini key variable is set, else local
+    /// when the local model is installed, else off). The bus `PrefGet` keeps
+    /// answering the raw store (`None` = unset), byte for byte the kernel's
+    /// PREF_GET.
+    pub fn effective(&self, ns: &str, key: &str) -> Option<(PrefValue, prefs_core::schema::Source)> {
+        self.prefs.effective(ns, key, |k| std::env::var(k).ok())
+    }
+
     /// The Synaptic Receiver: one inbound message in, at most one outbound
     /// message out. The caller publishes what comes back.
     pub fn process_impulse(&mut self, msg: &SMessage) -> Option<SMessage> {

@@ -132,6 +132,22 @@ impl PrefStore {
         self.namespaces.keys().cloned().collect()
     }
 
+    /// The value IN FORCE for `ns`/`key`: the stored one, else the schema's
+    /// default, else the schema's derived default ([`prefs_core::rules::Rule`],
+    /// e.g. R81's embedder). `env` answers environment variables (the process
+    /// environment in [`crate::Principia::effective`]; a script in tests); the
+    /// local-model cache is found from `XDG_CACHE_HOME` / `HOME` through it.
+    /// [`PrefStore::get`] stays the raw store: an unset key there is `None`.
+    pub fn effective(
+        &self,
+        ns: &str,
+        key: &str,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<(PrefValue, prefs_core::schema::Source)> {
+        let host = HostEnv { store: self, env };
+        prefs_core::schema::effective(ns, key, &host).map(|(v, src)| (from_core(&v), src))
+    }
+
     /// Set `ns`/`key` and persist the whole document atomically.
     ///
     /// The write first goes through the ONE schema validator both rings run,
@@ -233,6 +249,41 @@ const HEADER: &str = "\
 # Hand edits are read on next load (live reload is not implemented yet).
 
 ";
+
+// ---------------------------------------------------------------------------
+// DEFAULT RULES — what a prefs_core rule may see on the host
+// ---------------------------------------------------------------------------
+
+/// `${XDG_CACHE_HOME:-$HOME/.cache}/unaos/models` — where `tools/una-models`
+/// installs (the same path `gneiss_pal::api::local::model_dir` reads).
+pub fn models_dir(env: &impl Fn(&str) -> Option<String>) -> PathBuf {
+    let base = env("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(".cache"));
+    base.join("unaos").join("models")
+}
+
+/// The store plus an environment, as a [`prefs_core::rules::RuleEnv`].
+struct HostEnv<'a, E: Fn(&str) -> Option<String>> {
+    store: &'a PrefStore,
+    env: E,
+}
+
+impl<E: Fn(&str) -> Option<String>> prefs_core::rules::RuleEnv for HostEnv<'_, E> {
+    fn pref(&self, ns: &str, key: &str) -> Option<prefs_core::PrefValue> {
+        self.store.get(ns, key).map(|v| to_core(&v))
+    }
+    fn env_set(&self, var: &str) -> bool {
+        (self.env)(var).is_some_and(|v| !v.trim().is_empty())
+    }
+    /// Installed = every file of the `tools/una-models` manifest present.
+    fn local_model_installed(&self, name: &str) -> bool {
+        let dir = models_dir(&self.env).join(name);
+        prefs_core::schema::LOCAL_MODEL_FILES.iter().all(|f| dir.join(f).is_file())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // VALIDATION
@@ -542,6 +593,72 @@ mod tests {
         assert_eq!((a.value, a.clamped), (PrefValue::Int(-5), false));
         assert!(s.set("vein", "provider", PrefValue::Str("hal9000".into())).is_err());
         assert_eq!(s.get("vein", "provider"), None, "a refused write leaves no trace");
+    }
+
+    /// PRINCIPIA2 M3 (R81): `vein.embed.provider`'s derived default, every
+    /// branch, on the host — the real model cache on disk, a scripted env.
+    #[test]
+    fn the_embedder_rule_on_the_host() {
+        use prefs_core::rules::Rule;
+        use prefs_core::schema::Source;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut s = store(&dir);
+        let xdg = cache.path().to_string_lossy().to_string();
+        let env_with = |vars: &'static [(&'static str, &'static str)], xdg: String| {
+            move |k: &str| {
+                if k == "XDG_CACHE_HOME" {
+                    return Some(xdg.clone());
+                }
+                vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+            }
+        };
+        let rule = Source::Rule(Rule::Embedder);
+        let s_ = |x: &str| PrefValue::Str(x.into());
+
+        // off: no key variable, no model.
+        assert_eq!(s.effective("vein", "embed.provider", env_with(&[], xdg.clone())), Some((s_("off"), rule)));
+        // a blank key variable is not a key.
+        assert_eq!(
+            s.effective("vein", "embed.provider", env_with(&[("GEMINI_API_KEY", " ")], xdg.clone())).unwrap().0,
+            s_("off")
+        );
+        // local: install the manifest's files (a partial install is not installed).
+        let mdir = models_dir(&env_with(&[], xdg.clone())).join(prefs_core::schema::LOCAL_EMBED_MODEL);
+        fs::create_dir_all(&mdir).unwrap();
+        fs::write(mdir.join("model.onnx"), b"x").unwrap();
+        assert_eq!(s.effective("vein", "embed.provider", env_with(&[], xdg.clone())).unwrap().0, s_("off"));
+        fs::write(mdir.join("vocab.txt"), b"x").unwrap();
+        fs::write(mdir.join("config.json"), b"x").unwrap();
+        assert_eq!(s.effective("vein", "embed.provider", env_with(&[], xdg.clone())), Some((s_("local"), rule)));
+        // gemini: the default key variable is set — wins over the installed model.
+        assert_eq!(
+            s.effective("vein", "embed.provider", env_with(&[("GEMINI_API_KEY", "k")], xdg.clone())),
+            Some((s_("gemini"), rule))
+        );
+        // ...and follows `vein.gemini.api_key_env` when it names another variable.
+        s.set("vein", "gemini.api_key_env", s_("MY_GEM")).unwrap();
+        assert_eq!(
+            s.effective("vein", "embed.provider", env_with(&[("GEMINI_API_KEY", "k")], xdg.clone())).unwrap().0,
+            s_("local")
+        );
+        assert_eq!(
+            s.effective("vein", "embed.provider", env_with(&[("MY_GEM", "k")], xdg.clone())).unwrap().0,
+            s_("gemini")
+        );
+        // A stored choice beats the rule; the store itself never holds a default.
+        s.set("vein", "embed.provider", s_("off")).unwrap();
+        assert_eq!(
+            s.effective("vein", "embed.provider", env_with(&[("MY_GEM", "k")], xdg.clone())),
+            Some((s_("off"), Source::Stored))
+        );
+        assert_eq!(s.get("vein", "provider"), None);
+        // vein.provider defaults to claude; the chat model follows it.
+        assert_eq!(s.effective("vein", "provider", env_with(&[], xdg.clone())), Some((s_("claude"), Source::Default)));
+        assert_eq!(
+            s.effective("vein", "model", env_with(&[], xdg.clone())),
+            Some((s_("claude-opus-5-5"), Source::Rule(Rule::ChatModel)))
+        );
     }
 
     #[test]
