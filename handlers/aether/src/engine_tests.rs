@@ -2191,4 +2191,74 @@ mod tests {
         assert_eq!(paint("a").color, None, ":focus-visible/:has must not match");
         assert_eq!(paint("a").bold, Some(true), ":not(:focus-visible) is a tautology");
     }
+
+    /// AETHERSEE helper: the layout box of the element with this id.
+    fn box_by_id(tree: &layout::LayoutTree, id: &str) -> taffy::Layout {
+        for (node_id, dom_node) in &tree.node_map {
+            if let Some(el) = dom_node.as_element() {
+                if el.attributes.borrow().get("id") == Some(id) {
+                    return *tree.taffy.layout(*node_id).unwrap();
+                }
+            }
+        }
+        panic!("no element #{id}");
+    }
+
+    #[test]
+    fn aethersee_display_flex_is_a_row_with_flex_properties() {
+        // AETHERSEE fix 1 (corpus 02/03/09): display:flex was kept as
+        // Aether's internal column, and flex/gap/flex-wrap were ignored.
+        let html = r#"<!DOCTYPE html><html><body style="margin:0">
+            <div id="row"><div id="side">s</div><div id="main">m</div></div>
+            <div id="wrap"><div id="c1">a</div><div id="c2">b</div><div id="c3">c</div></div>
+        </body></html>"#;
+        let mut tree = layout::compute_layout_sized(&dom::parse_html(html), 800.0, 600.0);
+        css::apply_css(&mut tree, r#"
+            #row { display: flex; gap: 20px; }
+            #side { flex: 0 0 200px; }
+            #main { flex: 1; }
+            #wrap { display: flex; flex-wrap: wrap; gap: 10px; }
+            #wrap div { width: 300px; height: 50px; }
+        "#);
+        let (side, main) = (box_by_id(&tree, "side"), box_by_id(&tree, "main"));
+        assert_eq!(side.size.width, 200.0, "flex-basis 200px, no grow/shrink");
+        assert_eq!(side.location.y, main.location.y, "flex items share one row");
+        assert_eq!(main.location.x, 220.0, "column gap between items");
+        assert_eq!(main.size.width, 580.0, "flex:1 takes the remaining space");
+        let (c1, c2, c3) = (box_by_id(&tree, "c1"), box_by_id(&tree, "c2"), box_by_id(&tree, "c3"));
+        assert_eq!((c1.location.y, c2.location.y), (0.0, 0.0), "two 300px items fit a row");
+        assert_eq!(c2.location.x, 310.0);
+        assert_eq!(c3.location.y, 60.0, "third wraps below with the row gap");
+    }
+
+    #[test]
+    fn aethersee_flex_shorthand_grammar() {
+        use taffy::style::Dimension;
+        let f = css::parse_flex_shorthand;
+        assert_eq!(f("1"), Some((1.0, 1.0, Dimension::percent(0.0))));
+        assert_eq!(f("0 0 200px"), Some((0.0, 0.0, Dimension::length(200.0))));
+        assert_eq!(f("none"), Some((0.0, 0.0, Dimension::auto())));
+        assert_eq!(f("auto"), Some((1.0, 1.0, Dimension::auto())));
+        assert_eq!(f("2 30%"), Some((2.0, 1.0, Dimension::percent(0.3))));
+        assert_eq!(f("120px"), Some((1.0, 1.0, Dimension::length(120.0))));
+    }
+
+    #[test]
+    fn aethersee_sole_text_run_wraps_inside_its_box() {
+        // A paragraph narrower than the viewport: its only text run must
+        // wrap at the paragraph's width, not at the viewport's.
+        let html = r#"<!DOCTYPE html><html><body style="margin:0"><p id="p" style="width:200px;margin:0">
+            one two three four five six seven eight nine ten eleven twelve</p></body></html>"#;
+        let mut tree = layout::compute_layout_sized(&dom::parse_html(html), 800.0, 600.0);
+        css::apply_css(&mut tree, "");
+        for (node_id, dom_node) in &tree.node_map {
+            if dom_node.as_text().is_some_and(|t| t.borrow().contains("twelve")) {
+                let l = tree.taffy.layout(*node_id).unwrap();
+                assert!(l.size.width <= 200.0, "text run {} wide in a 200px box", l.size.width);
+                assert!(l.size.height > 30.0, "it wraps onto several lines");
+                return;
+            }
+        }
+        panic!("text run not found");
+    }
 }

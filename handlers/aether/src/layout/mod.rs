@@ -86,6 +86,16 @@ impl LayoutTree {
     }
 }
 
+trait ExactlyOneText {
+    fn exactly_one_text(self) -> bool;
+}
+impl<I: Iterator<Item = NodeRef>> ExactlyOneText for I {
+    /// True when the iterator yields exactly one node and it is text.
+    fn exactly_one_text(mut self) -> bool {
+        matches!((self.next(), self.next()), (Some(n), None) if n.as_text().is_some())
+    }
+}
+
 /// Elements whose subtrees produce no boxes.
 fn is_non_rendered(name: &str) -> bool {
     // noscript: scripting IS enabled here (page scripts run), so its
@@ -363,6 +373,27 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         } else {
             kids.iter().map(|&(id, _)| id).collect()
         };
+
+        // A text run that is its box's ONLY child may shrink to the box's
+        // width and wrap inside it (its min-content is its widest word).
+        // With shrink 0 its flex base size was its max-content width capped
+        // at the VIEWPORT, so every paragraph narrower than the viewport
+        // painted past its own right edge. Runs that share a line with
+        // siblings keep shrink 0: shrunk side by side, each would wrap into
+        // its own column instead of flowing onto the next line.
+        if let [only] = child_ids.as_slice() {
+            let only_is_text = dom_node
+                .children()
+                .filter(|c| generates_box(c))
+                .exactly_one_text();
+            if only_is_text {
+                if let Ok(st) = taffy.style(*only) {
+                    let mut st = st.clone();
+                    st.flex_shrink = 1.0;
+                    let _ = taffy.set_style(*only, st);
+                }
+            }
+        }
 
         let tag = dom_node
             .as_element()
@@ -703,9 +734,14 @@ pub fn remeasure(tree: &mut LayoutTree) {
             let Some((text, font_size, line_mult, nowrap, family)) = text_info.get(&node_id) else {
                 return Size { width: known.width.unwrap_or(0.0), height: known.height.unwrap_or(0.0) };
             };
+            // Min-content (a flex item's automatic minimum size) is the
+            // widest unbreakable word: wrap at every opportunity. Without
+            // it a `flex: 1` column of text claimed its whole max-content
+            // width as its minimum and overflowed its container.
             let wrap_width = known.width.unwrap_or(match avail.width {
                 AvailableSpace::Definite(w) => w,
-                _ => vw_cap,
+                AvailableSpace::MinContent => 0.0,
+                AvailableSpace::MaxContent => vw_cap,
             });
             let effective_wrap = if *nowrap { f32::MAX } else { wrap_width.max(1.0) };
             let fam_font = family_font(*family);
