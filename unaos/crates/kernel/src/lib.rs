@@ -272,3 +272,5 @@ pub mod lumen;
 // EXECNAME (rmbp-ledger B322): `tests exec`, the bare-name resolve + launch-note witness over the staged x86 programs. Tail statement, so no existing line moves.
 #[cfg(target_arch = "x86_64")]
 pub mod execname;
+// PROFILE (rmbp-ledger B331): the sampling profiler (`prof` verb, `tests prof`). Runtime-armed, off by default; tail statement, so no existing line moves.
+pub mod prof;
