@@ -1,0 +1,436 @@
+//! CHARTER: Kernel — fs-core
+//!
+//! FILETYPE (B307, audit B293) — every file has a TYPE, and the type is an ATTRIBUTE on the file.
+//!
+//! The type attribute is `una:type`, a MIME string (`BEOS:TYPE`'s role). [`type_of`] answers a path's
+//! type and says WHICH SOURCE decided it, in this order:
+//!
+//! 1. **Attribute** — `una:type` on the object (UnaFS volumes; ATTRSURF's `MountTable::get_attr`).
+//! 2. **Sniffed** — the first [`SNIFF_LEN`] bytes: PNG, `RIFF....WAVE`, ELF (UnaOS vs Linux, below),
+//!    gzip, `ustar`, then a UTF-8/ASCII text heuristic. Content beats the name.
+//! 3. **Extension** — ONE static table ([`EXT_TABLE`]); the only place a name decides anything.
+//! 4. **Unknown** — `application/octet-stream`.
+//!
+//! On a FAT volume every attribute call answers `-ENOTSUP`, so leg 1 is skipped there and the answer
+//! comes from the sniff or the table — and the source printed says so. Nothing here keeps a store of
+//! its own: the attribute IS the type (R79 — the seam is the volume, not a second table on disk).
+//!
+//! THE ELF SPLIT is the one the two loaders already make. A UnaOS image (`arch/*/elf.rs`) is linked at
+//! vaddr 0 and biased into a slot window, so its lowest `PT_LOAD` vaddr is below the 64 KiB floor; a
+//! static Linux image (`arch/x86_64/linuxabi/elf.rs`, `IMAGE_FLOOR`) is mapped at its own fixed vaddrs,
+//! at or above it. The floor is the test.
+//!
+//! Design: `docs/dev/evidence/rmbp-1004/FILETYPE.md`.
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL};
+
+/// The type attribute's key.
+pub const TYPE_KEY: &str = "una:type";
+
+pub const TEXT_PLAIN: &str = "text/plain";
+pub const IMAGE_PNG: &str = "image/png";
+pub const AUDIO_WAV: &str = "audio/wav";
+pub const UNAOS_ELF: &str = "application/x-unaos-elf";
+pub const UNAOS_BIN: &str = "application/x-unaos-bin";
+pub const LINUX_ELF: &str = "application/x-linux-elf";
+pub const DIRECTORY: &str = "inode/directory";
+pub const GZIP: &str = "application/gzip";
+pub const TAR: &str = "application/x-tar";
+pub const OCTET: &str = "application/octet-stream";
+
+/// How many leading bytes the sniff reads (`ustar` sits at 257..262, so a tar needs 263).
+pub const SNIFF_LEN: usize = 512;
+
+/// The lowest `PT_LOAD` vaddr a static Linux image may carry — `linuxabi::elf::IMAGE_FLOOR`.
+const LINUX_VADDR_FLOOR: u64 = 0x1_0000;
+
+/// Which leg of [`type_of`] decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Attribute,
+    Sniffed,
+    Extension,
+    Unknown,
+}
+
+impl Source {
+    pub fn name(self) -> &'static str {
+        match self {
+            Source::Attribute => "attribute",
+            Source::Sniffed => "sniffed",
+            Source::Extension => "extension",
+            Source::Unknown => "unknown",
+        }
+    }
+}
+
+/// THE extension table — every extension the old Quarry if-chains knew, plus the ones they disagreed
+/// on (`.sha/.cfg/.ini`) and the shapes this tree ships (`.lnx`, `.tgz`, `.tar`, `.toml`, `.json`).
+/// Matched case-insensitively against the text after the LAST dot (a leading dot is a name, not an
+/// extension). This is the ONLY name-based routing in the kernel's open path.
+pub const EXT_TABLE: &[(&str, &str)] = &[
+    ("elf", UNAOS_ELF),
+    ("bin", UNAOS_BIN),
+    ("lnx", LINUX_ELF),
+    ("png", IMAGE_PNG),
+    ("wav", AUDIO_WAV),
+    ("txt", TEXT_PLAIN),
+    ("md", TEXT_PLAIN),
+    ("log", TEXT_PLAIN),
+    ("spec", TEXT_PLAIN),
+    ("sha", TEXT_PLAIN),
+    ("cfg", TEXT_PLAIN),
+    ("ini", TEXT_PLAIN),
+    ("toml", TEXT_PLAIN),
+    ("json", TEXT_PLAIN),
+    ("tgz", GZIP),
+    ("gz", GZIP),
+    ("tar", TAR),
+];
+
+/// The extension of `name` (without the dot), or `None`. Pure.
+pub fn ext_of(name: &str) -> Option<&str> {
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    match leaf.rfind('.') {
+        Some(i) if i > 0 && i + 1 < leaf.len() => Some(&leaf[i + 1..]),
+        _ => None,
+    }
+}
+
+/// The table's answer for `name`, or `None`. Pure.
+pub fn by_extension(name: &str) -> Option<&'static str> {
+    let e = ext_of(name)?;
+    EXT_TABLE.iter().find(|(x, _)| e.eq_ignore_ascii_case(x)).map(|(_, m)| *m)
+}
+
+fn u16le(b: &[u8], o: usize) -> Option<u64> {
+    b.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]) as u64)
+}
+fn u64le(b: &[u8], o: usize) -> Option<u64> {
+    b.get(o..o + 8).map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+}
+
+/// UnaOS or Linux, for a buffer that starts with `\x7fELF`. The lowest `PT_LOAD` vaddr among the
+/// program headers that fit in `b`; when none fit, `e_entry` stands in. Pure.
+fn elf_flavour(b: &[u8]) -> &'static str {
+    let phoff = u64le(b, 32).unwrap_or(0) as usize;
+    let phnum = u16le(b, 56).unwrap_or(0) as usize;
+    let phent = u16le(b, 54).unwrap_or(0) as usize;
+    let mut min: Option<u64> = None;
+    if phent == 56 {
+        for i in 0..phnum.min(16) {
+            let ph = phoff.saturating_add(i * 56);
+            let Some(ty) = b.get(ph..ph + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]])) else { break };
+            if ty != 1 {
+                continue;
+            }
+            if let Some(va) = u64le(b, ph + 16) {
+                min = Some(min.map_or(va, |m: u64| m.min(va)));
+            }
+        }
+    }
+    let va = min.or_else(|| u64le(b, 24)).unwrap_or(0);
+    if va >= LINUX_VADDR_FLOOR { LINUX_ELF } else { UNAOS_ELF }
+}
+
+/// Is `b` (a PREFIX of a file, possibly cut mid-character) text: no NUL, valid UTF-8 up to a cut
+/// tail of at most 3 bytes, and almost no control bytes besides TAB/LF/CR/FF/ESC. Pure.
+pub fn looks_text(b: &[u8]) -> bool {
+    if b.is_empty() || b.contains(&0) {
+        return false;
+    }
+    match core::str::from_utf8(b) {
+        Ok(_) => {}
+        Err(e) => {
+            if e.error_len().is_some() || b.len() - e.valid_up_to() > 3 {
+                return false;
+            }
+        }
+    }
+    let ctl = b.iter().filter(|&&c| c < 0x20 && !matches!(c, b'\t' | b'\n' | b'\r' | 0x0c | 0x1b)).count();
+    ctl * 32 <= b.len()
+}
+
+/// The sniff over a file's leading bytes. `None` = nothing recognised (the table decides). Pure.
+pub fn sniff(b: &[u8]) -> Option<&'static str> {
+    if b.len() >= 8 && b[..8] == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a] {
+        return Some(IMAGE_PNG);
+    }
+    if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WAVE" {
+        return Some(AUDIO_WAV);
+    }
+    if b.len() >= 4 && b[..4] == [0x7f, b'E', b'L', b'F'] {
+        return Some(elf_flavour(b));
+    }
+    if b.len() >= 2 && b[0] == 0x1f && b[1] == 0x8b {
+        return Some(GZIP);
+    }
+    if b.len() >= 262 && &b[257..262] == b"ustar" {
+        return Some(TAR);
+    }
+    if looks_text(b) {
+        return Some(TEXT_PLAIN);
+    }
+    None
+}
+
+/// [`type_of`] against a mount table the caller already holds (Quarry asks inside its model lock and
+/// builds the table once per activation).
+pub fn type_of_in(mt: &MountTable, path: &str) -> (String, Source) {
+    let st = mt.stat(path);
+    if let Ok(s) = &st {
+        if matches!(s.kind, NodeKind::Dir) {
+            return (String::from(DIRECTORY), Source::Sniffed);
+        }
+    }
+    if let Ok(AttrValue::Str(m)) = mt.get_attr(path, TYPE_KEY, KERNEL_PRINCIPAL) {
+        if !m.is_empty() {
+            return (m, Source::Attribute);
+        }
+    }
+    if let Ok(s) = &st {
+        if s.size > 0 {
+            let want = core::cmp::min(s.size, SNIFF_LEN as u64) as usize;
+            if let Ok(head) = mt.read(path, 0, want) {
+                if let Some(m) = sniff(&head) {
+                    return (String::from(m), Source::Sniffed);
+                }
+            }
+        }
+    }
+    if let Some(m) = by_extension(path) {
+        return (String::from(m), Source::Extension);
+    }
+    (String::from(OCTET), Source::Unknown)
+}
+
+/// The type of `path` and the leg that decided it.
+pub fn type_of(path: &str) -> (String, Source) {
+    type_of_in(&crate::shell::vfs_mount_table(), path)
+}
+
+/// Write `una:type = mime` on `path`. `Ok(true)` stamped, `Ok(false)` the volume takes no attributes
+/// (FAT: the skip is printed once per call, never silent).
+pub fn stamp_as_in(mt: &MountTable, path: &str, mime: &str) -> Result<bool, VfsError> {
+    match mt.set_attr(path, TYPE_KEY, AttrValue::Str(String::from(mime)), KERNEL_PRINCIPAL) {
+        Ok(()) => {
+            serial_println!("[filetype] stamp path={} type={}", path, mime);
+            Ok(true)
+        }
+        Err(VfsError::Unsupported) => {
+            serial_println!("[filetype] stamp=skip reason=enotsup path={} type={}", path, mime);
+            Ok(false)
+        }
+        Err(e) => {
+            serial_println!("[filetype] stamp=fail path={} type={} ({})", path, mime, crate::fs::attrsys::refusal(&e));
+            Err(e)
+        }
+    }
+}
+
+/// Stamp `path` with a type its WRITER knows (a screenshot is `image/png` whatever its name says).
+pub fn stamp_as(path: &str, mime: &str) -> bool {
+    matches!(stamp_as_in(&crate::shell::vfs_mount_table(), path, mime), Ok(true))
+}
+
+/// Stamp `path` with what the sniff/table says (an attribute already present is kept).
+pub fn stamp(path: &str) -> bool {
+    let mt = crate::shell::vfs_mount_table();
+    let (m, src) = type_of_in(&mt, path);
+    if src == Source::Attribute {
+        return true;
+    }
+    matches!(stamp_as_in(&mt, path, &m), Ok(true))
+}
+
+/// Carry `src`'s `una:type` to `dst` (the `cp` leg; `rename` keeps attributes by inode). Copies
+/// `una:preferred` too: a per-file opener choice belongs to the file. Silent when there is nothing to
+/// carry or the destination takes no attributes.
+pub fn carry_in(mt: &MountTable, src: &str, dst: &str) {
+    for k in [TYPE_KEY, crate::fs::assoc::PREFERRED_KEY] {
+        if let Ok(v) = mt.get_attr(src, k, KERNEL_PRINCIPAL) {
+            match mt.set_attr(dst, k, v, KERNEL_PRINCIPAL) {
+                Ok(()) => serial_println!("[filetype] carry {} {} -> {}", k, src, dst),
+                Err(VfsError::Unsupported) => serial_println!("[filetype] carry=skip reason=enotsup key={} dst={}", k, dst),
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+/// `file <path>` — `<path>: <type> <source>` (the Unix name, R26). `file -s <path>` also stamps it.
+pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
+    let (do_stamp, rest): (bool, Vec<&str>) = match args.first() {
+        Some(&"-s") => (true, args[1..].to_vec()),
+        _ => (false, args.to_vec()),
+    };
+    if rest.is_empty() {
+        console.println("usage: file [-s] <path>...   (type and the leg that decided it; -s stamps una:type)");
+        return;
+    }
+    let mt = crate::shell::vfs_mount_table();
+    for a in rest {
+        let path = crate::shell::vfs_path(a);
+        if let Err(e) = mt.stat(&path) {
+            console.println(&alloc::format!("file: {}: {}", path, crate::fs::attrsys::refusal(&e)));
+            continue;
+        }
+        let (m, src) = type_of_in(&mt, &path);
+        let line = alloc::format!("{}: {} {}", path, m, src.name());
+        console.println(&line);
+        serial_println!("[filetype] file {}", line);
+        if do_stamp && src != Source::Attribute {
+            let r = match stamp_as_in(&mt, &path, &m) {
+                Ok(true) => "stamped",
+                Ok(false) => "skip (this volume carries no typed attributes, -ENOTSUP)",
+                Err(_) => "failed",
+            };
+            console.println(&alloc::format!("file: {}: una:type {}", path, r));
+        }
+    }
+}
+
+/// `tests filetype` registration, once (the fixture decides PASS or SKIP legs itself).
+pub fn ensure_tests() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) {
+        crate::tests::register("filetype", selftest);
+    }
+}
+
+/// M4 — `tests filetype`. Creates one file of each kind under `/home` (else `/`), and checks:
+/// the sniff on content, the table on a contentless name, unknown on neither, the attribute after a
+/// stamp (UnaFS) or the skip (FAT), the association source, an opener changed with an ordinary
+/// attribute write being followed, a per-file `una:preferred` winning, and Quarry's own handler
+/// function agreeing with `opener_for` on every file.
+///
+/// `:: FILETYPE: typed=<n> sniffed=<n> ext=<n> assoc=<src> override=<ok> quarry=<ok> -> PASS ::`
+pub fn selftest() {
+    use crate::fs::assoc;
+    let mt = crate::shell::vfs_mount_table();
+    let dir = ["/home", "/"].iter().copied().find(|d| matches!(mt.stat(d), Ok(s) if matches!(s.kind, NodeKind::Dir)));
+    let Some(dir) = dir else {
+        serial_println!(":: FILETYPE: typed=0 sniffed=0 ext=0 assoc=- override=- quarry=- reason=no-volume -> SKIP ::");
+        return;
+    };
+    let p = |leaf: &str| if dir == "/" { alloc::format!("/{}", leaf) } else { alloc::format!("{}/{}", dir, leaf) };
+    let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
+    let mut wav = Vec::from(&b"RIFF\x24\x00\x00\x00WAVEfmt "[..]);
+    wav.extend_from_slice(&[0u8; 8]);
+    let mut lnx = alloc::vec![0u8; 64 + 56];
+    lnx[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    lnx[4] = 2;
+    lnx[5] = 1;
+    lnx[32] = 64; // e_phoff
+    lnx[54] = 56; // e_phentsize
+    lnx[56] = 1; // e_phnum
+    lnx[64] = 1; // PT_LOAD
+    lnx[64 + 16..64 + 24].copy_from_slice(&0x40_0000u64.to_le_bytes());
+    let mut una = lnx.clone();
+    una[64 + 16..64 + 24].copy_from_slice(&0u64.to_le_bytes());
+    // (leaf, content, the type it must come out as, the leg that must decide it before any stamp)
+    let cases: [(&str, &[u8], &str, Source); 8] = [
+        ("FTPIC.DAT", png, IMAGE_PNG, Source::Sniffed),
+        ("FTSND", &wav, AUDIO_WAV, Source::Sniffed),
+        ("FTNOTE", b"hello, typed world\n", TEXT_PLAIN, Source::Sniffed),
+        ("FTLNX.ELF", &lnx, LINUX_ELF, Source::Sniffed),
+        ("FTUNA", &una, UNAOS_ELF, Source::Sniffed),
+        ("FTCONF.CFG", b"", TEXT_PLAIN, Source::Extension),
+        ("FTBLOB.BIN", b"", UNAOS_BIN, Source::Extension),
+        ("FTMYSTERY", b"", OCTET, Source::Unknown),
+    ];
+    let k = KERNEL_PRINCIPAL;
+    let (mut sniffed, mut ext, mut unknown, mut wrong) = (0u32, 0u32, 0u32, 0u32);
+    for (leaf, body, want, src_want) in cases.iter() {
+        let path = p(leaf);
+        let _ = mt.unlink(&path, k);
+        if mt.create(&path, NodeKind::File, k).is_err() || (!body.is_empty() && mt.write(&path, 0, body, k).is_err()) {
+            serial_println!(":: FILETYPE: typed=0 sniffed=0 ext=0 assoc=- override=- quarry=- dir={} reason=create {} -> FAIL ::", dir, leaf);
+            return;
+        }
+        let (m, src) = type_of_in(&mt, &path);
+        if m != *want || src != *src_want {
+            serial_println!("[filetype] fixture MISMATCH {} -> {} {} (want {} {})", path, m, src.name(), want, src_want.name());
+            wrong += 1;
+        }
+        match src {
+            Source::Sniffed => sniffed += 1,
+            Source::Extension => ext += 1,
+            Source::Unknown => unknown += 1,
+            Source::Attribute => {}
+        }
+    }
+    // The attribute leg: stamp the text file and read it back as `attribute`.
+    let note = p("FTNOTE");
+    let attrs = !matches!(mt.list_attrs(&note, k), Err(VfsError::Unsupported));
+    let mut typed = 0u32;
+    let attr_ok = if attrs {
+        for (leaf, _, want, _) in cases.iter() {
+            let path = p(leaf);
+            if matches!(stamp_as_in(&mt, &path, want), Ok(true)) && type_of_in(&mt, &path) == (String::from(*want), Source::Attribute) {
+                typed += 1;
+            }
+        }
+        typed == cases.len() as u32
+    } else {
+        let skipped = matches!(stamp_as_in(&mt, &note, TEXT_PLAIN), Ok(false));
+        serial_println!("[filetype] fixture attribute legs SKIP (this volume carries no typed attributes; the builtin table is exercised)");
+        skipped
+    };
+    // The association: source, then an opener changed with an ordinary attribute write.
+    let _ = assoc::seed_in(&mt);
+    let (op0, asrc) = assoc::opener_for_in(&mt, &note, TEXT_PLAIN);
+    let assoc_ok;
+    let override_ok;
+    if attrs && asrc == "db" {
+        let obj = assoc::object_path(TEXT_PLAIN);
+        let changed = mt.set_attr(&obj, assoc::OPENER_KEY, AttrValue::Str(String::from("fileview")), k).is_ok()
+            && assoc::opener_for_in(&mt, &note, TEXT_PLAIN).0 == "fileview";
+        let _ = mt.set_attr(&obj, assoc::OPENER_KEY, AttrValue::Str(op0.clone()), k);
+        assoc_ok = changed && op0 == "textedit";
+        // Per-file override wins over the database.
+        let set = mt.set_attr(&note, assoc::PREFERRED_KEY, AttrValue::Str(String::from("fileview")), k).is_ok();
+        let (op1, s1) = assoc::opener_for_in(&mt, &note, TEXT_PLAIN);
+        override_ok = set && op1 == "fileview" && s1 == "override";
+    } else {
+        assoc_ok = !attrs && asrc == "builtin" && op0 == "textedit";
+        override_ok = !attrs; // SKIP leg on FAT: there is nowhere to put a per-file choice
+    }
+    // Quarry's handler function agrees with `opener_for` on every case file.
+    #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let quarry = {
+        let mut agree = true;
+        for (leaf, _, _, _) in cases.iter() {
+            let path = p(leaf);
+            let (m, _) = type_of_in(&mt, &path);
+            let want = crate::video::quarry::live::openers::effective(&assoc::opener_for_in(&mt, &path, &m).0, &path);
+            let got = crate::video::quarry::live::open_handler_path(&path);
+            if got != want {
+                serial_println!("[filetype] fixture QUARRY MISMATCH {} handler={} opener_for={}", path, got, want);
+                agree = false;
+            }
+        }
+        if agree { "ok" } else { "MISMATCH" }
+    };
+    #[cfg(not(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    let quarry = "skip(no-quarry)";
+    for (leaf, _, _, _) in cases.iter() {
+        let _ = mt.unlink(&p(leaf), k);
+    }
+    let pass = wrong == 0 && sniffed == 5 && ext == 2 && unknown == 1 && attr_ok && assoc_ok && override_ok && quarry != "MISMATCH";
+    serial_println!(
+        ":: FILETYPE: typed={} sniffed={} ext={} assoc={} override={} quarry={} dir={} attrs={} -> {} ::",
+        typed,
+        sniffed,
+        ext,
+        asrc,
+        if !attrs { "skip" } else if override_ok { "ok" } else { "FAIL" },
+        quarry,
+        dir,
+        if attrs { "unafs" } else { "none(fat)" },
+        if pass { "PASS" } else { "FAIL" }
+    );
+}

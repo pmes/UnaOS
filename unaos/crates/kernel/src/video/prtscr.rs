@@ -1463,7 +1463,13 @@ impl Job {
                     if pass { "PASS" } else { "FAIL" }
                 );
                 // SHOTMOUNT (SO19): the route witness, once per capture, at the verdict.
-                let via_vfs = self.routed.take().is_some();
+                let routed = self.routed.take();
+                let via_vfs = routed.is_some();
+                // FILETYPE (B307): the writer knows what it wrote — stamp `una:type` (a FAT target
+                // prints `[filetype] stamp=skip reason=enotsup`, never silent).
+                if let Some(r) = &routed {
+                    let _ = crate::fs::filetype::stamp_as_in(&r.0, &self.vpath, crate::fs::filetype::IMAGE_PNG);
+                }
                 serial_println!(
                     ":: SHOTMOUNT: via={} path={} bytes={} -> {} ::",
                     if via_vfs { "vfs" } else { "fat" },
