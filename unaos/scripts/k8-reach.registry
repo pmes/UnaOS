@@ -51,7 +51,7 @@ UNAOS_IOAPIC   NA   --evidence, run at this commit and quoted verbatim: `ioapic:
 UNAOS_JD1DC                TODO  seeded 2026-09-06; 19 Pi-live cfg site(s)
 UNAOS_KDISP_HOLD           TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_KEPLER               TODO  seeded 2026-09-06; 1 Pi-live cfg site(s)
-UNAOS_KEPLER_CE            TODO  seeded 2026-09-06; no Pi-live cfg site
+UNAOS_KEPLER_CE   NA   --evidence: nvidia-kepler-ce 3 sites, 0 Pi-live, 0 negated [implies: nvidia-kepler] — the module declaration in drivers/gpu/mod.rs and the `arm_context` call in drivers/gpu/kepler.rs are both `all(target_arch = "x86_64", feature = "nvidia-kepler-ce")` (GPUTESTS M3, B334: the aarch64 leg no longer compiles the driver as dead code, and arroyo's `arm_features` strips the feature), and the `tests ce`/`tests kblit` registrations live in arch/x86_64/syscall.rs. The subject is the GK107 copy engine of the rMBP's discrete NVIDIA part (KBLIT, B319); a Pi 4 has none. Ruled by GPUTESTS 2026-10-04.
 UNAOS_KEPLER_FIFO          TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_KEPLER_TAKEOVER      TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_MTRAW                TODO  seeded 2026-09-06; no Pi-live cfg site
@@ -173,4 +173,4 @@ UNAOS_NET4_RINGDUMP   ENV   option_env! at arch/aarch64/rtl8168_tegra.rs:2461 an
 UNAOS_NET4_BUF1   ENV   option_env! at arch/aarch64/rtl8168_tegra.rs:2947 and :3151 (the single-buffer RX classification arm of the same hunt); orin debugging knob set by hand, named by no verb
 UNAOS_NET4_DHCP_MS   ENV   option_env! at arch/aarch64/rtl8168_tegra.rs:5522 (the NET4 driver-DHCP wait in ms, parsed at build time); orin tuning knob set by hand, named by no verb
 UNAOS_LINUXABI   NA   --evidence: linuxabi lives only in arch/x86_64/linuxabi (x86 mod tree), 0 Pi-live; the Linux-compat layer is an x86 rung.
-UNAOS_WC_BLITTER   NA   --evidence: wc_gpublit 2 sites, 0 Pi-live — both are the two arms of `GpuBlitter::probe` in video/blitter.rs, each inside `all(target_arch = "x86_64", feature = "wc_gpublit")` (one negated: the `feature-off` answer every Pi build takes). The subject is the GK107 copy engine of a discrete NVIDIA part (KBLIT); a Pi 4 has none. KCOMP (B321).
+UNAOS_WC_BLITTER   NA   --evidence: wc_gpublit 2 sites, 0 Pi-live [implies: wc, GPUTESTS M3] — both are the two arms of `GpuBlitter::probe` in video/blitter.rs, each inside `all(target_arch = "x86_64", feature = "wc_gpublit")` (one negated: the `feature-off` answer every Pi build takes). The subject is the GK107 copy engine of a discrete NVIDIA part (KBLIT); a Pi 4 has none. KCOMP (B321).

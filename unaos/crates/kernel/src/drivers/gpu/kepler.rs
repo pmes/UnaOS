@@ -1499,7 +1499,7 @@ pub fn init(gpu: &GpuInfo) {
         // KBLIT / R80 — the ladder no longer RUNS at boot: nothing runs at boot but the boot.
         // `kepler::init` only banks the context the two fixtures need; `tests ce` runs the
         // read-only ladder and `tests kblit` the channel + blit, both fired from the shell.
-        #[cfg(feature = "nvidia-kepler-ce")]
+        #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-ce"))]
         crate::drivers::gpu::kepler_ce::arm_context(bar0, bar1_base, bar1_size, vram_size);
 
         // Recon Probe before any engine state modification

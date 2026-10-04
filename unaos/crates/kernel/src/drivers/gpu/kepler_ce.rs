@@ -1243,8 +1243,8 @@ fn kb_mmio(bar0: usize, off: usize, val: u32) -> u32 {
 /// The wedge detector (M4, the BAR1WEDGE lesson): poll `f` until it returns `true` or the
 /// millisecond budget expires. Returns `(ok, elapsed_us)`. A stalled GPU NEVER hangs the
 /// console — the wait is bounded and the caller prints the timeout. Timed with the arch-neutral
-/// `crate::arch::ms()` (present on both arches) so this file type-checks on the aarch64 leg too,
-/// where the whole kepler driver is dead code but must still compile under the knob.
+/// `crate::arch::ms()` (present on both arches). Since GPUTESTS M3 (B334) this module is declared
+/// x86_64-only in `drivers/gpu/mod.rs`, so the aarch64 leg no longer compiles it at all.
 const KB_WAIT_MS: u64 = 1500;
 fn kb_wait<F: Fn() -> bool>(f: F) -> (bool, u64) {
     let t0 = crate::arch::ms();

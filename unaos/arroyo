@@ -825,7 +825,9 @@ _feats="${_feats}sdw,"
 # (drivers/gpu/kepler_ce.rs) — R1 PTOP sweep, R2 CE PRI probe, R3 wide runlist scan, R5
 # firmware instance-block walk. Runs from kepler::init ABOVE the fifo leg, so it is upstream
 # of every FECS access and reads the runlist array PRE-SUBMIT. Implies nvidia-kepler; does
-# NOT require UNAOS_KEPLER_FIFO. Kept in sync with builder/src/main.rs.
+# NOT require UNAOS_KEPLER_FIFO. Kept in sync with builder/src/main.rs. KBLIT/R80: the ladder and the
+# KBLIT blit run from `tests ce` / `tests kblit`, never at boot. GPUTESTS (B334): x86_64-only module,
+# stripped by arm_features (k8-reach NA row).
 [ -n "${UNAOS_KEPLER_CE:-}" ] && _feats="${_feats}nvidia-kepler-ce,"
 # SHUTRESTORE (rmbp, 2026-09-15) — the SEVEN refuted Kepler rungs whose CODE had been deleted, each
 # back behind a knob of its own. RULINGS R19 (Peter, 2026-09-05): "you take a path that does not work
@@ -3188,6 +3190,12 @@ arm_features() {
     # Jetson media hash for zero observable change. Stripped => the aarch64 media stay byte-identical
     # and the banner stops claiming an interrupt controller that board does not have.
     f="${f//,ioapic,/,}"
+    # GPUTESTS M3 (B334): `nvidia-kepler-ce` rides the same strip. `drivers/gpu/kepler_ce.rs` is now
+    # declared `#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-ce"))]` and its two consumers
+    # (`kepler::init`'s `arm_context`, the x86 `tests ce`/`tests kblit` registrations) carry the same
+    # conjunction, so the feature emits not one byte of aarch64 CODE; stripping it keeps the aarch64
+    # `-Cmetadata` fingerprint unchanged when an x86 knob line carries `UNAOS_KEPLER_CE=1`.
+    f="${f//,nvidia-kepler-ce,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
