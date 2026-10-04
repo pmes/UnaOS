@@ -1,0 +1,31 @@
+# PIXELCORE pinned oracle digests: <vector path> <WxH> <crc32 of pixel_core RGBA> <orient|plain>.
+# Each line was pinned only when the Chromium oracle (oracle/run-oracle.sh) scored that file max_abs_diff=0;
+# the test then holds pixel_core to Chromium's answer without needing Chromium. Regenerate: pixel-check --digest.
+jpeg/16bit-qtables.jpg 1x1 b3d9e635 orient
+jpeg/Landscape_6.jpg 1800x1200 f0c7d788 orient
+jpeg/Portrait_8.jpg 1200x1800 6afafbc2 orient
+jpeg/cat.jpg 320x240 826206a5 orient
+jpeg/extraneous-data.jpg 16x16 43f52c09 orient
+jpeg/grumpycat.jpg 320x180 ce9320a6 orient
+jpeg/jpg-cmyk-1.jpg 32x32 75e9dbc7 orient
+jpeg/jpg-cmyk-2.jpg 256x256 a2abbfa3 orient
+jpeg/jpg-gray.jpg 32x32 61c58183 orient
+jpeg/jpg-progressive.jpg 32x32 f9b362ac orient
+jpeg/jpg-size-15x15.jpg 15x15 cfa7144b orient
+jpeg/jpg-size-16x16.jpg 16x16 43f52c09 orient
+jpeg/jpg-size-17x17.jpg 17x17 563becf1 orient
+jpeg/jpg-size-1x1.jpg 1x1 ba721d53 orient
+jpeg/jpg-size-31x31.jpg 31x31 ffb4cc7d orient
+jpeg/jpg-size-32x32.jpg 32x32 f9b362ac orient
+jpeg/jpg-size-33x33.jpg 33x33 40bf7a98 orient
+jpeg/jpg-size-7x7.jpg 7x7 52b3c7ac orient
+jpeg/jpg-size-8x8.jpg 8x8 f4cd9ef2 orient
+jpeg/jpg-size-9x9.jpg 9x9 cfe66a5b orient
+jpeg/jpg-srgb-icc.jpg 1x1 0c463091 orient
+jpeg/mjpeg.jpg 960x720 c23a4c69 orient
+jpeg/progressive3.jpg 650x470 9ee37941 orient
+jpeg/progtest.jpg 32x23 4d1990c4 orient
+jpeg/restarts.jpg 33x33 74255488 orient
+jpeg/rgb.jpg 500x333 4c5d7e6c orient
+jpeg/testimgint.jpg 227x149 0ff3f8b0 orient
+jpeg/testorig.jpg 227x149 18a3e2fd orient

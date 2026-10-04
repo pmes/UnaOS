@@ -61,3 +61,36 @@ rounding.
 Not decoded: gAMA/cHRM/sRGB/iCCP colour management (samples returned as stored); sBIT (advisory); APNG
 (`acTL/fcTL/fdAT`) — an APNG decodes as its default image. Inflate is the audited bit-at-a-time "puff"
 decoder — correct, not fast; a table-driven fast path is owed.
+
+## M2 — JPEG
+
+Spec sections (ITU-T T.81): B.1 marker syntax (fill bytes, stuffing); B.2.4.1 DQT 8/16-bit; B.2.4.2 DHT +
+Annex C code generation; B.2.2 SOF0 baseline, SOF1 extended Huffman (8-bit), SOF2 progressive; B.2.3 SOS with
+A.2 MCU/block order (interleaved and non-interleaved); B.2.4.4 DRI + F.1.2.3 RSTn; F.2.2 sequential Huffman;
+G.1.2 progressive — DC first/refine, AC first/refine with EOB runs (spectral selection AND successive
+approximation); sampling factors 1..4 with 4:4:4, 4:2:2, 4:2:0 proven. Annex K.3 tables pre-installed in
+slots 0/1 (Motion-JPEG frames carry no DHT). JFIF/T.871 YCbCr; Adobe APP14 RGB/CMYK/YCCK; EXIF 2.3 IFD0
+orientation read into `Image::orientation`, applied by `Image::apply_orientation` (all eight, unit-tested).
+
+Reconstruction, chosen to match the IJG reference Chromium builds on (libjpeg-turbo):
+IDCT = IJG **islow** (integer LLM, 13-bit constants, PASS1_BITS=2, rounding descale, clamp) — the IEEE 1180
+accuracy class, bit-exact with libjpeg-turbo's C/SIMD islow; chroma = libjpeg **fancy** upsampling (h2v1,
+h2v2 triangle filters, h1v2 with biases 1/2; other ratios replicated); colour = libjpeg's 16-bit fixed-point
+YCbCr→RGB; inverted-Adobe CMYK → RGB as `C·K/255` truncated (Blink's formula).
+
+KATs (30 files: libjpeg-turbo `testorig/testimgint/testimgari`, EXIF `Landscape_6`/`Portrait_8`, image-rs
+progressive `cat/3/test`, jpeg-decoder reftests `restarts` (DRI 5), `mjpeg` (4:2:2, DRI, no DHT), `rgb`
+(Adobe RGB), `ycck`, `16bit-qtables`, `extraneous-data`, Mozilla's `jpg-*` (gray, CMYK ×2, progressive, ICC,
+sizes 1..33), `grumpycat` (4:4:4)):
+
+* **Chromium oracle: 28/28 decodable non-ICC files EXACT — max abs diff 0, 100 % bytes, PSNR ∞** — including
+  the photos (Landscape_6 1800×1200 rotated, Portrait_8, progressive3 650×470, cat, rgb, grumpycat, mjpeg
+  960×720), far past the brief's ≥ 45 dB bar. These 28 are pinned as CRC-32 digests in
+  `tests/oracle_digests.txt`, so `cargo test` holds pixel_core to Chromium's answer offline.
+* `ycck.jpg` decodes structurally right but scores 20.4 dB: it carries a CMYK ICC profile (18 APP2 chunks)
+  that Chromium applies and pixel_core does not. ICC is the ceiling, not a decode bug.
+* `testimgari.jpg` (arithmetic) is refused by name; a truncated file is refused.
+* Second opinion (`image` crate / zune-jpeg, a different IDCT and upsampler): 26 files, PSNR 44.9–71 dB.
+
+Not decoded: arithmetic coding, lossless, hierarchical, 12-bit, DNL; ICC profiles not applied; a truncated
+progressive file is refused rather than shown at its partial quality.

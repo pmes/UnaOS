@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! pixel-check <in> [out.png]                 decode with pixel_core, print a summary, write RGBA PNG
+//! pixel-check --digest [--orient] <in>...   CRC-32 of the decoded RGBA (the tests' pinned KAT digest)
 //! pixel-check --frames <in> <dir>            write every composited animation frame as <dir>/fNNN.png
 //! pixel-check --compare <in> <shot.png> <r,g,b> [--orient] [--frame N]
 //!                                            composite pixel_core's RGBA over the background r,g,b and
@@ -94,6 +95,28 @@ fn run(args: &[String]) -> Result<(), String> {
                 100.0 * exact as f64 / n as f64,
                 psnr
             );
+            Ok(())
+        }
+        Some("--digest") => {
+            // CRC-32 of the decoded RGBA (orientation applied with --orient; every frame of an
+            // animation, concatenated) — the KAT digest the tests pin.
+            let orient = args.iter().any(|a| a == "--orient");
+            for input in args[1..].iter().filter(|a| !a.starts_with("--")) {
+                match decode(input) {
+                    Ok(mut img) => {
+                        if orient {
+                            img.apply_orientation();
+                        }
+                        let mut c = pixel_core::crc::Crc32::new();
+                        match img.frames.as_ref() {
+                            Some(fr) => fr.iter().for_each(|f| c.update(&f.rgba)),
+                            None => c.update(&img.rgba),
+                        }
+                        println!("{input} {}x{} {:08x}", img.width, img.height, c.finish());
+                    }
+                    Err(e) => println!("{e} ERR"),
+                }
+            }
             Ok(())
         }
         Some("--frames") => {
