@@ -1163,3 +1163,7 @@ pub const ATTR_KEY_TRASH_BY: &str = "una:trash-by";
 pub const TRASH_DIR_NAME: &str = ".Trash";
 /// The listing query (every object carrying an origin; callers scope it to their Trash folder).
 pub const TRASH_QUERY: &str = "una:trash-origin != \"\"";
+// LUMENAPP (B323) — the `.note.unaos.app` flags word a windowed program carries (EXECNAME B322 owns the
+// note: name "UnaOS", type 1, desc = flags). Bit0 = windowed (a bare-word launch detaches it). Appended
+// at the file tail; the fold reconciles a duplicate from EXECNAME.
+pub const APP_NOTE_WINDOWED: u32 = 1;

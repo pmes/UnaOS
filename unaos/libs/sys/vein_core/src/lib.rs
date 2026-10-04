@@ -3,28 +3,81 @@
 //
 //! CHARTER: Vein — shared-core
 //!
-//! VEINCORE (rmbp-ledger B304; ROADMAP §3b "port the bus, not the binary"). Vein's shared core: what the
-//! host handler (`handlers/vein`), the ring-3 fulfiller (`crates/user-vein` → `APPS/VEIN.BIN`) and the
-//! kernel's relay plumbing (`vein rsp`, `tests vein`) all link, so the rings cannot drift.
+//! Vein's shared core (VEINCORE B304; reshaped by LUMENAPP B323 under R82). Vein is a LIBRARY, never a
+//! daemon: the host handler (`handlers/vein`), the ring-3 Lumen app (`crates/user-lumen` → `APPS/LUMEN.ELF`)
+//! and later the smart installer's diagnosis program link this crate and run it inside themselves.
+//! Everything here is pure and host-unit-tested; the syscall-backed half (DNS, TCP, TLS, the PREFS bus
+//! reads, the UnaFS key file) is `unaos/libs/sys/vein_ring3`, behind [`client::Transport`].
 //!
-//! * [`wire`] — the chat verbs' bus bodies (ChatSend, ChatReply, ChatCancel, ChatStatus), base64 and the
-//!   `[vein-relay]` line format. No allocation. The KATs are the spec of record; the human-readable
-//!   layouts are at the top of `docs/dev/evidence/rmbp-1004/VEINCORE.md`.
-//! * [`provider`] — the `Provider` trait and the two metal providers of v1: `Echo` and `Relay`; the
-//!   ChatReply chunker. No allocation.
-//! * [`model`] / [`context`] (feature `alloc`) — the conversation model (`ChatMessage`, `Conversation`,
-//!   `ChatRequest`, `ChatResponse`, `StopReason`: the SAME names as VEINPROV's `gneiss_pal::api`, reconciled
-//!   at the fold) and the pure half of the context assembler.
+//! * [`claude`] — the Claude Messages request encoder and the incremental SSE/JSON [`claude::StreamDecoder`].
+//! * [`http`] — HTTP/1.1 request head, response head parser, chunked transfer decoder.
+//! * [`client`] — the [`client::Transport`] trait and [`client::exchange`]: one request → streamed deltas.
+//! * [`prefs`] — the resolution rules: Principia values (`vein.provider`, `vein.model`, `vein.endpoint`,
+//!   `vein.tls`, `vein.key_file`) + the key's state → which provider runs and whether the key may be sent.
+//! * [`provider`] — the offline `Echo` provider (no key, no network: the window still answers).
+//! * [`json`] — the minimal no-alloc JSON string escape/scan the above share.
+//! * [`model`] / [`context`] (feature `alloc`) — the conversation model and the pure context assembler.
 #![no_std]
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod claude;
+pub mod client;
+pub mod http;
+pub mod json;
+pub mod prefs;
 pub mod provider;
-pub mod wire;
+pub mod role;
 
 #[cfg(feature = "alloc")]
 pub mod context;
 #[cfg(feature = "alloc")]
 pub mod model;
+
+pub use role::Role;
+
+/// A bounded byte writer over a caller buffer: never panics, records overflow.
+pub struct Out<'a> {
+    buf: &'a mut [u8],
+    n: usize,
+    over: bool,
+}
+
+impl<'a> Out<'a> {
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Out { buf, n: 0, over: false }
+    }
+    pub fn put(&mut self, b: &[u8]) {
+        if self.over || self.n + b.len() > self.buf.len() {
+            self.over = true;
+            return;
+        }
+        self.buf[self.n..self.n + b.len()].copy_from_slice(b);
+        self.n += b.len();
+    }
+    pub fn dec(&mut self, mut v: u64) {
+        let mut d = [0u8; 20];
+        let mut i = d.len();
+        loop {
+            i -= 1;
+            d[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        self.put(&d[i..]);
+    }
+    pub fn len(&self) -> usize {
+        self.n
+    }
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+    /// The written bytes, or `None` if anything overflowed.
+    pub fn done(self) -> Option<usize> {
+        if self.over { None } else { Some(self.n) }
+    }
+}

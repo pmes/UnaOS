@@ -3,12 +3,12 @@ name = "vein_core"
 version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
-description = "Vein's shared core: the conversation model, the pure context assembler and the chat bus codec — shared by Ring 0, the ring-3 VEIN.BIN and the host Vein handler."
+description = "Vein's shared core: the Claude Messages encoder and stream decoder, HTTP/1.1 framing, the Transport-driven client, the prefs resolution rules and the conversation model — linked by the host Vein handler and by every ring-3 caller of Vein (LUMEN.ELF, the installer)."
 
-# VEINCORE (rmbp-ledger B304, ROADMAP §3b): the midden_core / prefs_core shape. `#![no_std]`,
-# `#![forbid(unsafe_code)]`, NO dependencies. A member of the ROOT host workspace (handlers/vein links it),
-# a path dep of the kernel (feature `vein`) and of crates/user-vein (default-features = false: the wire
-# codec and the providers need no allocator; the conversation model and the assembler need `alloc`).
+# VEINCORE (rmbp-ledger B304), reshaped by LUMENAPP (B323, R82): the midden_core / prefs_core shape.
+# `#![no_std]`, `#![forbid(unsafe_code)]`, NO dependencies. A member of the ROOT host workspace
+# (handlers/vein links it) and a path dep of unaos/libs/sys/vein_ring3 (default-features = false: the
+# client, encoder and decoder need no allocator; the conversation model and the assembler need `alloc`).
 [features]
 default = ["alloc"]
 alloc = []

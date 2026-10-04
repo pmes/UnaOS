@@ -60,7 +60,7 @@ pub fn assemble(system: &str, conv: &Conversation, user: &str, max_tokens: u32) 
 }
 
 /// The canonical plain-text rendering of a request (`System:` / `User:` / `Assistant:` paragraphs) —
-/// what a text-only provider (the relay bridge's log, a line-protocol model) is given; identical bytes on
+/// what a text-only provider (a log, a line-protocol model) is given; identical bytes on
 /// every ring.
 pub fn render(req: &ChatRequest) -> String {
     let mut s = String::new();

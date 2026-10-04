@@ -6173,7 +6173,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             crate::power::reboot();
         },
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
-        "lumen" => { bg_program(console, "/apps/LUMEN.BIN"); } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] "bg" => { // LUMENBIN (B305) — `lumen` opens the ring-3 chat window: EXACTLY `bg /apps/LUMEN.BIN` (same spawn, job table, window title), so it carries `bg`'s cfg; the dock's lumen pin runs this verb. ⚠ SAME-LINE fold, line-NEUTRAL, code before comment.
+        "lumen" => { bg_program(console, "/apps/LUMEN.ELF"); } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] "bg" => { // LUMENBIN (B305) — `lumen` opens the ring-3 chat window: EXACTLY `bg /apps/LUMEN.BIN` (same spawn, job table, window title), so it carries `bg`'s cfg; the dock's lumen pin runs this verb. ⚠ SAME-LINE fold, line-NEUTRAL, code before comment.
             // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
             // walk — this is what turns the WC-TAB binding into a workflow: `run` blocks until its app
