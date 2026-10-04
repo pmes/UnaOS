@@ -5315,13 +5315,13 @@ USER_CHECK_MATRIX=(
   "user-prefs    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-big      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
-  "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x10000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
   "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-vug      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-pulse    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
-  "user-lumen    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-lumen    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
 )
 
 # Type-check every USER_CHECK_MATRIX row whose arch label matches $1, and print one summary line in the
