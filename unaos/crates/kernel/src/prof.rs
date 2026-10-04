@@ -246,8 +246,19 @@ pub fn span_ms() -> u64 {
     cyc_to_ns(t1.wrapping_sub(t0)) / 1_000_000
 }
 
-/// Hook for the later milestones' per-run state (syscall histograms, compositor baseline).
-fn on_start() {}
+/// Per-run state the views keep: syscall histograms cleared, compositor baseline taken.
+fn on_start() {
+    for h in SYS_H.iter() {
+        for b in h.iter() {
+            b.store(0, Relaxed);
+        }
+    }
+    for i in 0..SYS_SLOTS {
+        SYS_SUM_NS[i].store(0, Relaxed);
+        SYS_MAX_NS[i].store(0, Relaxed);
+    }
+    comp_baseline();
+}
 
 /// One line to the console AND the serial wire (`tools/flame` reads serial).
 fn out(console: &mut Console, s: &str) {
@@ -283,7 +294,9 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         }
         Some("dump") => dump(console),
         Some("top") => top(console, num(1).unwrap_or(10) as usize),
-        _ => console.println("usage: prof [status] | prof start [hz] | prof stop | prof top [n] | prof dump"),
+        Some("sys") => sys(console),
+        Some("tasks") => tasks(console),
+        _ => console.println("usage: prof [status] | prof start [hz] | prof stop | prof top [n] | prof dump | prof sys | prof tasks"),
     }
 }
 
@@ -343,3 +356,122 @@ fn top(console: &mut Console, n: usize) {
 
 /// M4 slot: the compositor split rows (filled by M4).
 fn comp_rows(_console: &mut Console) {}
+
+// ---- M3 — per-syscall latency histograms + per-task CPU share ----------------------------------------
+
+/// Syscall numbers tracked one-for-one; a number at or past the last slot is pooled into it.
+pub const SYS_SLOTS: usize = 64;
+/// log2 buckets of nanoseconds: bucket `b` holds `[2^(b-1), 2^b)` ns (bucket 0 = 0 ns); the last is open.
+pub const SYS_BUCKETS: usize = 32;
+static SYS_H: [[AtomicU32; SYS_BUCKETS]; SYS_SLOTS] = [const { [const { AtomicU32::new(0) }; SYS_BUCKETS] }; SYS_SLOTS];
+static SYS_SUM_NS: [AtomicU64; SYS_SLOTS] = [const { AtomicU64::new(0) }; SYS_SLOTS];
+static SYS_MAX_NS: [AtomicU64; SYS_SLOTS] = [const { AtomicU64::new(0) }; SYS_SLOTS];
+
+/// Syscall entry: the start stamp when armed (never 0), else 0. One relaxed load disarmed.
+#[inline]
+pub fn sys_t0() -> u64 {
+    if ARMED.load(Relaxed) { crate::arch::now_cycles() | 1 } else { 0 }
+}
+
+/// Syscall exit: charge `nr`'s histogram with the time since `t0` (a 0 stamp = not armed at entry).
+/// A blocking verb (sleep, wait) is charged its whole blocked time: this is latency as the caller
+/// saw it, not CPU.
+#[inline]
+pub fn sys_note(nr: u64, t0: u64) {
+    if t0 == 0 {
+        return;
+    }
+    let ns = cyc_to_ns(crate::arch::now_cycles().wrapping_sub(t0));
+    let slot = (nr as usize).min(SYS_SLOTS - 1);
+    let b = ((64 - ns.leading_zeros()) as usize).min(SYS_BUCKETS - 1);
+    SYS_H[slot][b].fetch_add(1, Relaxed);
+    SYS_SUM_NS[slot].fetch_add(ns, Relaxed);
+    SYS_MAX_NS[slot].fetch_max(ns, Relaxed);
+}
+
+/// The upper bound (ns) of bucket `b`.
+fn bucket_hi(b: usize) -> u64 {
+    if b == 0 { 0 } else { 1u64 << b }
+}
+
+/// `prof sys` — one row per syscall number seen in the run.
+fn sys(console: &mut Console) {
+    out(console, &summary_line());
+    let mut rows = 0;
+    for nr in 0..SYS_SLOTS {
+        let h: Vec<u32> = SYS_H[nr].iter().map(|b| b.load(Relaxed)).collect();
+        let calls: u64 = h.iter().map(|&c| c as u64).sum();
+        if calls == 0 {
+            continue;
+        }
+        rows += 1;
+        let quant = |q: u64| {
+            let want = (calls * q).div_ceil(100).max(1);
+            let mut acc = 0u64;
+            for (b, &c) in h.iter().enumerate() {
+                acc += c as u64;
+                if acc >= want {
+                    return bucket_hi(b);
+                }
+            }
+            bucket_hi(SYS_BUCKETS - 1)
+        };
+        let mut hist = String::new();
+        for (b, &c) in h.iter().enumerate() {
+            if c != 0 {
+                if !hist.is_empty() {
+                    hist.push(',');
+                }
+                hist.push_str(&format!("<{}:{}", bucket_hi(b), c));
+            }
+        }
+        out(console, &format!(
+            "[prof] sys nr={}{} calls={} mean_ns={} p50_ns<={} p99_ns<={} max_ns={} hist={}",
+            nr,
+            if nr == SYS_SLOTS - 1 { "+" } else { "" },
+            calls,
+            SYS_SUM_NS[nr].load(Relaxed) / calls,
+            quant(50),
+            quant(99),
+            SYS_MAX_NS[nr].load(Relaxed),
+            hist
+        ));
+    }
+    if rows == 0 {
+        out(console, "[prof] sys: no syscalls in this run (arm with `prof start`)");
+    }
+}
+
+/// `prof tasks` — per-task CPU share from the samples (task 0 = no task: idle / scheduler context).
+fn tasks(console: &mut Console) {
+    let v = samples();
+    out(console, &summary_line());
+    let total = v.len();
+    let mut keys: Vec<(u64, u8)> = v.iter().map(|s| (s.tid, s.ring)).collect();
+    keys.sort_unstable();
+    // (tid, samples, ring-3 samples)
+    let mut rows: Vec<(u64, usize, usize)> = Vec::new();
+    for (tid, ring) in keys {
+        match rows.last_mut() {
+            Some(r) if r.0 == tid => {
+                r.1 += 1;
+                r.2 += (ring == 3) as usize;
+            }
+            _ => rows.push((tid, 1, (ring == 3) as usize)),
+        }
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (tid, n, u) in rows {
+        out(console, &format!(
+            "[prof] task tid={}{} samples={} pct={} ring3={}",
+            tid,
+            if tid == 0 { " (idle)" } else { "" },
+            n,
+            pct(n, total),
+            pct(u, n.max(1))
+        ));
+    }
+}
+
+/// M4 slot: the compositor baseline (filled by M4).
+fn comp_baseline() {}
