@@ -129,7 +129,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); // LUMENBIN: `tests lumen`
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -207,4 +207,14 @@ fn ensure_unafsx86() {
 fn ensure_attr() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) { register("attr", crate::fs::attrsys::selftest); }
+}
+
+/// LUMENBIN (B305): register `lumen` (the LUMEN.BIN chat-window fixture, crate::lumen) exactly once on a
+/// `lumen` build; off x86 `wc` the fixture prints SKIP with its reason, never a pin.
+fn ensure_lumen() {
+    #[cfg(feature = "lumen")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); }
+    }
 }
