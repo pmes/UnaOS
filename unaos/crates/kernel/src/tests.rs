@@ -131,6 +131,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     }
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); // LUMENBIN: `tests lumen`
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_netring3();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -223,5 +224,12 @@ fn ensure_netring3() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("net", crate::netring3::selftest); }
+/// RING3WIN (B316): register `tests ring3win` exactly once on x86 (the ELF window is x86's this arc; the
+/// fixture SKIPs when the volume carries no `/apps/BIG.BIN`).
+fn ensure_ring3win() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); }
     }
 }

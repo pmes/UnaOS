@@ -1045,7 +1045,7 @@ pub fn free_user_space_by_cr3(cr3: u64) {
                 (s as u64) + 1,
                 "route=self-exit shell-raise=skipped siblings=untouched",
             );
-            unsafe { clear_slot_fb(s) };
+            unsafe { clear_slot_fb(s) }; unsafe { xwin_free(s) }; // RING3WIN: the ELF window's frames go back to the heap before the slot is claimable
             SLOT_USED[s].store(false, Ordering::Release); crate::video::wm::app_name_forget(crate::video::wm::owner_of_launch(s as u64)); // SO22: a recycled slot must not wear its predecessor's name — forgotten the instant the slot is free
             // SMPBAL-X86: the RECYCLE point. `clear_slot_fb` above already bumped, but state that
             // dependency here rather than inheriting it — this store is what makes the slot claimable
@@ -4034,3 +4034,273 @@ pub fn fb_wc_witness() {
         );
     }
 }
+
+// =================================================================================================
+// RING3WIN (rmbp-ledger B316) — THE ELF WINDOW ("XWIN"). CHARTER: Kernel — driver (Zone 2, the Map).
+// -------------------------------------------------------------------------------------------------
+// A UnaOS ring-3 program gets the address space its ELF asks for. The classic 16 KiB window at
+// `USER_BASE` cannot grow in place: the FB hole above it (`+0x4000` info page, `+0x5000` surface slot 0)
+// is ABI every shipped binary hangs off its `_start`. So each slot carries a SECOND window, clear of the
+// first 2 MiB, at `USER_BASE + XWIN_OFF` for `XWIN_BYTES` — PD entries 1..=XWIN_PTS of the slot's own PD,
+// with the PTs static per slot (`.bss`, 4 KiB each) and the FRAMES taken on demand from the kernel heap
+// (4 KiB-aligned `alloc_zeroed`, the same allocator `linuxabi::AddrSpace` and `alloc_page_frame` use) and
+// returned to it at teardown (`xwin_free`, called by `free_user_space_by_cr3` beside `clear_slot_fb`).
+//
+// Who uses it: an elf-model image (lowest PT_LOAD `p_vaddr >= XWIN_OFF`, see `elf.rs`) maps its segments,
+// its stack (top of the window, one unmapped guard page below) and its heap here; a fixed-model image
+// (linked at 0 — every program shipped before this arc) uses it only as its `SYS_SBRK` heap.
+//
+// TLB: every leaf mutation bumps `AS_GEN` (SMPBAL-X86), exactly as the FB map/unmap does. A frame is
+// returned to the heap only after its leaf is cleared and with the kernel CR3 live on the freeing core
+// (`free_user_space_by_cr3`'s precondition); another core can consume a stale user translation only by
+// dispatching a task, and dispatch reloads CR3 on a generation change.
+// =================================================================================================
+
+/// RING3WIN: offset of the ELF window from the slot's window base (una-abi's number).
+pub const XWIN_OFF: usize = una_abi::USER_XWIN_OFF as usize;
+/// RING3WIN: the ELF window = the per-program cap (una-abi's number; arroyo's `USER_WINDOW_BYTES`).
+pub const XWIN_BYTES: usize = una_abi::USER_WINDOW_BYTES as usize;
+/// PTs per slot: one per 2 MiB of the window.
+const XWIN_PTS: usize = XWIN_BYTES / (512 * 4096);
+const _: () = assert!(XWIN_OFF >= USER_STATIC_SIZE && XWIN_OFF % (512 * 4096) == 0);
+const _: () = assert!(XWIN_PTS >= 1 && XWIN_OFF / (512 * 4096) + XWIN_PTS <= 512);
+
+static mut SLOT_XPT: [[PageTable; XWIN_PTS]; USER_SLOTS] =
+    [const { [const { PageTable::zeroed() }; XWIN_PTS] }; USER_SLOTS];
+/// Frames each slot holds in its ELF window right now.
+static XWIN_PAGES: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
+/// Frames held across ALL slots — the number `tests ring3win` watches return after an exit.
+static XWIN_LIVE: AtomicU64 = AtomicU64::new(0);
+/// The heap break and its ceiling, as byte offsets from the window base. `brk_max == 0` = no heap (a
+/// slot the loader did not place, e.g. an inline fixture) — `SYS_SBRK` answers `-ENOMEM`.
+static XWIN_BRK: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
+static XWIN_BRK_LO: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
+static XWIN_BRK_MAX: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
+/// What the last `xwin_free` released: frames, and the heap bytes the tenant had grown.
+static XWIN_LAST_FREED: AtomicU64 = AtomicU64::new(0);
+static XWIN_LAST_HEAP: AtomicU64 = AtomicU64::new(0);
+/// Serialises `SYS_SBRK` (sibling ELF-2 threads share one slot's break).
+static XWIN_SBRK_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+#[inline]
+fn xwin_pt_ptr(s: usize, i: usize) -> *mut u64 {
+    unsafe { (&raw mut SLOT_XPT[s][i]).cast::<u64>() }
+}
+
+/// RING3WIN: frames held in ELF windows across every slot.
+pub fn xwin_live_pages() -> u64 {
+    XWIN_LIVE.load(Ordering::Acquire)
+}
+/// RING3WIN: `(frames, heap bytes)` the most recent teardown returned.
+pub fn xwin_last_freed() -> (u64, u64) {
+    (XWIN_LAST_FREED.load(Ordering::Acquire), XWIN_LAST_HEAP.load(Ordering::Acquire))
+}
+
+/// RING3WIN: is `[ptr, end)` inside the ELF window (VA bounds only — the live-leaf walk decides)?
+pub fn xwin_contains(ptr: u64, end: u64) -> bool {
+    let lo = super::syscall::USER_BASE + XWIN_OFF as u64;
+    ptr >= lo && end >= ptr && end <= lo + XWIN_BYTES as u64
+}
+
+/// Leaf slot for window offset `off` (`XWIN_OFF <= off < XWIN_OFF + XWIN_BYTES`) in slot `s`, wiring the
+/// PD entry to the slot's static PT on first use.
+unsafe fn xwin_leaf(s: usize, off: usize) -> *mut u64 {
+    let rel = off - XWIN_OFF;
+    let i = rel / (512 * 4096);
+    let va = super::syscall::USER_BASE + off as u64;
+    let pd = slot_pd_ptr(s);
+    let pt = xwin_pt_ptr(s, i);
+    unsafe {
+        let pde = pd.add(pd_index(va));
+        if *pde & PTE_PRESENT == 0 {
+            core::ptr::write_bytes(pt, 0, 512);
+            *pde = (table_pa(pt) & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+        }
+        pt.add(pt_index(va))
+    }
+}
+
+/// RING3WIN: map (or re-permission) the page at window offset `off` of slot `s`. A fresh page gets a
+/// zeroed heap frame; an existing one keeps its frame and takes the UNION of the old and new rights
+/// (two segments sharing a page) — refused if that union is W+X. `Err(())` = the heap is out of frames
+/// or the union is W+X; nothing is half-done for that page.
+pub unsafe fn xwin_map_page(s: usize, off: usize, writable: bool, exec: bool) -> Result<(), ()> {
+    assert!(s < USER_SLOTS && off % 4096 == 0, "xwin_map_page: bad slot/offset");
+    if off < XWIN_OFF || off >= XWIN_OFF + XWIN_BYTES {
+        return Err(());
+    }
+    let va = super::syscall::USER_BASE + off as u64;
+    unsafe {
+        let leaf = xwin_leaf(s, off);
+        let old = *leaf;
+        let (w, x, frame) = if old & PTE_PRESENT != 0 {
+            (writable || old & PTE_WRITABLE != 0, exec || old & PTE_NX == 0, old & PTE_ADDR)
+        } else {
+            let p = alloc_zeroed(Layout::from_size_align_unchecked(4096, 4096));
+            if p.is_null() {
+                return Err(());
+            }
+            XWIN_PAGES[s].fetch_add(1, Ordering::AcqRel);
+            XWIN_LIVE.fetch_add(1, Ordering::AcqRel);
+            (writable, exec, p as u64)
+        };
+        if w && x {
+            if old & PTE_PRESENT == 0 {
+                *leaf = (frame & PTE_ADDR) | PTE_PRESENT | PTE_USER | PTE_NX; // keep it accounted; freed at teardown
+            }
+            return Err(());
+        }
+        let mut flags = PTE_PRESENT | PTE_USER;
+        if w {
+            flags |= PTE_WRITABLE;
+        }
+        if !x {
+            flags |= PTE_NX;
+        }
+        *leaf = (frame & PTE_ADDR) | flags;
+        invlpg(va);
+    }
+    bump_as_gen();
+    Ok(())
+}
+
+/// RING3WIN: kernel identity pointer to the frame behind window offset `off` of slot `s` (page-aligned
+/// `off`), or `None` if unmapped. Loader copies go through this, never the ring-3 VA (W^X by construction).
+pub fn xwin_frame_ptr(s: usize, off: usize) -> Option<*mut u8> {
+    if s >= USER_SLOTS || off < XWIN_OFF || off >= XWIN_OFF + XWIN_BYTES {
+        return None;
+    }
+    let va = super::syscall::USER_BASE + off as u64;
+    unsafe {
+        let pde = *slot_pd_ptr(s).add(pd_index(va));
+        if pde & PTE_PRESENT == 0 {
+            return None;
+        }
+        let e = *xwin_pt_ptr(s, (off - XWIN_OFF) / (512 * 4096)).add(pt_index(va));
+        if e & PTE_PRESENT == 0 { None } else { Some((e & PTE_ADDR) as *mut u8) }
+    }
+}
+
+/// RING3WIN: copy `src` into slot `s`'s ELF window at offset `off` through the identity alias. Every
+/// page touched must already be mapped. `false` if one is not.
+pub fn xwin_copy_in(s: usize, off: usize, src: &[u8]) -> bool {
+    let mut done = 0usize;
+    while done < src.len() {
+        let o = off + done;
+        let Some(f) = xwin_frame_ptr(s, o & !0xFFF) else { return false };
+        let n = (4096 - (o & 0xFFF)).min(src.len() - done);
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr().add(done), f.add(o & 0xFFF), n) };
+        done += n;
+    }
+    true
+}
+
+/// Unmap one page and return its frame to the heap (no-op if unmapped).
+unsafe fn xwin_unmap_page(s: usize, off: usize) {
+    let va = super::syscall::USER_BASE + off as u64;
+    unsafe {
+        let pde = *slot_pd_ptr(s).add(pd_index(va));
+        if pde & PTE_PRESENT == 0 {
+            return;
+        }
+        let leaf = xwin_pt_ptr(s, (off - XWIN_OFF) / (512 * 4096)).add(pt_index(va));
+        let e = *leaf;
+        if e & PTE_PRESENT == 0 {
+            return;
+        }
+        *leaf = 0;
+        invlpg(va);
+        alloc::alloc::dealloc((e & PTE_ADDR) as *mut u8, Layout::from_size_align_unchecked(4096, 4096));
+    }
+    XWIN_PAGES[s].fetch_sub(1, Ordering::AcqRel);
+    XWIN_LIVE.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// RING3WIN: return every frame slot `s` holds in its ELF window, clear the PD entries and the heap
+/// state. Idempotent. Called from `free_user_space_by_cr3` (kernel CR3 live) and by the loader before it
+/// places an image (a defensive reset — a correctly torn-down slot holds nothing).
+pub unsafe fn xwin_free(s: usize) {
+    debug_assert!(s < USER_SLOTS);
+    let held = XWIN_PAGES[s].load(Ordering::Acquire);
+    let heap = XWIN_BRK[s].load(Ordering::Acquire).saturating_sub(XWIN_BRK_LO[s].load(Ordering::Acquire));
+    for i in 0..XWIN_PTS {
+        let va = super::syscall::USER_BASE + (XWIN_OFF + i * 512 * 4096) as u64;
+        let pde = unsafe { slot_pd_ptr(s).add(pd_index(va)) };
+        if unsafe { *pde } & PTE_PRESENT == 0 {
+            continue;
+        }
+        for l in 0..512 {
+            unsafe { xwin_unmap_page(s, XWIN_OFF + i * 512 * 4096 + l * 4096) };
+        }
+        unsafe { *pde = 0 };
+    }
+    XWIN_BRK[s].store(0, Ordering::Release);
+    XWIN_BRK_LO[s].store(0, Ordering::Release);
+    XWIN_BRK_MAX[s].store(0, Ordering::Release);
+    if held != 0 {
+        XWIN_LAST_FREED.store(held, Ordering::Release);
+        XWIN_LAST_HEAP.store(heap, Ordering::Release);
+    }
+    bump_as_gen();
+}
+
+/// RING3WIN: arm slot `s`'s heap: the break starts at window offset `lo` and may grow to `max` (both
+/// page-aligned offsets inside the ELF window). Called by the loader for every program it places.
+pub fn xwin_set_heap(s: usize, lo: u64, max: u64) {
+    XWIN_BRK_LO[s].store(lo, Ordering::Release);
+    XWIN_BRK_MAX[s].store(max, Ordering::Release);
+    XWIN_BRK[s].store(lo, Ordering::Release);
+}
+
+/// RING3WIN: `SYS_SBRK(delta)` for the CALLER's slot — returns the OLD break VA, or `ENOMEM`/`EINVAL`.
+/// Growth maps zeroed RW+NX pages up to the new break (page-rounded); shrink frees whole pages above it.
+pub fn sys_sbrk(delta: i64) -> i64 {
+    let Some(s) = current_slot() else { return una_abi::ENOMEM };
+    let _g = XWIN_SBRK_LOCK.lock();
+    let (lo, max) = (XWIN_BRK_LO[s].load(Ordering::Acquire), XWIN_BRK_MAX[s].load(Ordering::Acquire));
+    let cur = XWIN_BRK[s].load(Ordering::Acquire);
+    let base = super::syscall::USER_BASE;
+    if max == 0 {
+        return una_abi::ENOMEM;
+    }
+    let new = (cur as i64).wrapping_add(delta);
+    if delta < 0 && (new < lo as i64) {
+        return una_abi::EINVAL;
+    }
+    if delta > 0 && (new < cur as i64 || new as u64 > max) {
+        serial_println!(
+            ":: RING3WIN: sbrk refused slot={} brk={:#x} delta={} cap={:#x} -ENOMEM ::",
+            s, base + cur, delta, base + max
+        );
+        return una_abi::ENOMEM;
+    }
+    let new = new as u64;
+    let up = |v: u64| (v + 0xFFF) & !0xFFF;
+    if new > cur {
+        let mut p = up(cur);
+        while p < up(new) {
+            if unsafe { xwin_map_page(s, p as usize, true, false) }.is_err() {
+                // Unwind this call's pages so the break and the mapping agree.
+                let mut q = up(cur);
+                while q < p {
+                    unsafe { xwin_unmap_page(s, q as usize) };
+                    q += 4096;
+                }
+                bump_as_gen();
+                serial_println!(":: RING3WIN: sbrk refused slot={} delta={} reason=heap-frames -ENOMEM ::", s, delta);
+                return una_abi::ENOMEM;
+            }
+            p += 4096;
+        }
+    } else if new < cur {
+        let mut p = up(new);
+        while p < up(cur) {
+            unsafe { xwin_unmap_page(s, p as usize) };
+            p += 4096;
+        }
+        bump_as_gen();
+    }
+    XWIN_BRK[s].store(new, Ordering::Release);
+    (base + cur) as i64
+}
+const _: () = assert!(super::syscall::USER_BASE == una_abi::USER_BASE_X86); // RING3WIN: elf-model images link at USER_XWIN_VA_X86

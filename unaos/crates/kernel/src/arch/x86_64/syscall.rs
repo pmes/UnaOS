@@ -2626,6 +2626,8 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), #[cfg(feature = "netring3")] una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_CLOSE => sys_close(a0),
+        SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), // RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
         // so the dispatch match is byte-identical there and an unknown number falls to the default.
@@ -2982,7 +2984,7 @@ fn user_range_ok(ptr: u64, len: u64, access: UserAccess) -> Result<(), i64> {
     };
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let end = ptr.wrapping_add(len);
-    if end < ptr || ptr < lo || end > window_end {
+    if end < ptr || !((ptr >= lo && end <= window_end) || super::memory::xwin_contains(ptr, end)) { // RING3WIN: the ELF window is a legal buffer range too (the live-leaf walk below still decides); the FB hole stays out
         return Err(EFAULT);
     }
     // CFU-2: the authoritative gate. In-window is necessary, never sufficient — the live leaf decides.
@@ -16884,8 +16886,8 @@ fn bg_kill_forget(pid: u64) {
 /// another core the instant it is enqueued — before the `pid` store below lands. Anything keyed off the
 /// row must therefore be valid at spawn time, not at store time.
 fn load_program_common(bytes: &[u8]) -> Result<(super::elf::Mapped, usize), &'static str> {
-    if bytes.len() > user_window_size() {
-        return Err("image larger than the 16 KiB user window");
+    if bytes.len() > user_image_cap() {
+        return Err("image larger than the 4 MiB user image cap (RING3WIN)");
     }
     let Some(pi) = proc_reserve() else {
         // PROCREAP: `proc_reserve` has already run the BGRUN-SCAV sweep, so this refusal names what is
@@ -29943,8 +29945,7 @@ fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 
 // ==========================================================================================// VEINCORE (B304): this arch's thin half of `crate::vein_bus` — the kernel-as-caller inject (the
 // `vein rsp` shell line) and the `tests vein` fixture over the SAME BANDY3 ops/fixture tables.
-// =================================================================================================
-#[cfg(feature = "vein")]
+// ==========================================================================================#[cfg(feature = "vein")]
 pub fn vein_inject(verb: u8, body: &[u8]) -> i64 {
     busx_sem_init_once();
     crate::bus_route::inject(&BUSREG_OPS, verb, body)
@@ -29996,4 +29997,78 @@ fn sys_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
         },
         Err(e) => e,
     }
+=======
+/// RING3WIN (B316): the largest program IMAGE a reader may hand the loader — the ELF window
+/// (`una_abi::USER_WINDOW_BYTES`, 4 MiB). The loader then decides fixed vs elf model from the PT_LOAD
+/// layout; a fixed-model image still has to fit `user_window_size()` (16 KiB) span-wise.
+pub fn user_image_cap() -> usize {
+    super::memory::XWIN_BYTES
+}
+
+// =================================================================================================
+// RING3WIN (B316) — `tests ring3win`: run `/apps/BIG.BIN` (crates/user-big, linked in the ELF window) and
+// prove the elf model end to end: the 64 KiB static array's checksum matches the kernel's own computation,
+// the 32 KiB-frame recursion ran on the declared stack, the SYS_SBRK heap carried a 100 KiB `Vec`, a
+// request past the cap was refused -ENOMEM, and after the exit every ELF-window frame went back to the
+// heap (the live-frame count returns to its value before the launch).
+// =================================================================================================
+
+/// RING3WIN: the checksum BIG.BIN computes over its static array — FNV-1a 32 over `a[i] = i*7 + (i>>8)`.
+/// Computed here independently, never trusted from the program.
+pub fn ring3win_big_fnv() -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for i in 0..65536u32 {
+        h ^= (i.wrapping_mul(7).wrapping_add(i >> 8)) as u8 as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// RING3WIN: the `tests ring3win` fixture. SKIP (never a pin) when the volume carries no BIG.BIN.
+pub fn ring3win_selftest() {
+    const PATH: &str = "/apps/BIG.BIN";
+    let mt = crate::shell::vfs_mount_table();
+    let full = crate::shell::vfs_path(PATH);
+    let st = match mt.stat(&full) {
+        Ok(s) => s,
+        Err(_) => {
+            serial_println!(":: RING3WIN: model=elf window={} big_ok=0 reason=no-big-bin -> SKIP ::", user_image_cap());
+            return;
+        }
+    };
+    let bytes = match mt.read(&full, 0, st.size as usize) {
+        Ok(b) if b.len() as u64 == st.size && b.len() <= user_image_cap() => b,
+        _ => {
+            serial_println!(":: RING3WIN: model=elf window={} big_ok=0 reason=read -> FAIL ::", user_image_cap());
+            return;
+        }
+    };
+    let live0 = super::memory::xwin_live_pages();
+    let res = run_user_image("ring3win", &bytes, 10_000);
+    let status = match res {
+        Ok((RunOutcome::Exited(st), _)) => Some(st as u32),
+        _ => None,
+    };
+    // The slot is released by refcount a little after the Proc row (SO22's note) — wait, bounded 2 s.
+    let dl = crate::arch::ticks() + 2_000;
+    while super::memory::xwin_live_pages() != live0 && crate::arch::ticks() < dl {
+        crate::arch::sched::yield_now();
+    }
+    let live1 = super::memory::xwin_live_pages();
+    let (freed_pages, heap) = super::memory::xwin_last_freed();
+    let want = ring3win_big_fnv();
+    let (bits, ck_ok) = match status {
+        Some(s) => (s & 0xFF, s & 0x7FFF_FF00 == want & 0x7FFF_FF00),
+        None => (0, false),
+    };
+    let big_ok = bits == 0x0F && ck_ok;
+    let freed = live1 == live0 && freed_pages > 0;
+    serial_println!(
+        "[ring3win] status={:?} bits={:#x} fnv_want={:#x} ck_ok={} live0={} live1={} freed_pages={} heap={}",
+        status, bits, want, ck_ok, live0, live1, freed_pages, heap
+    );
+    serial_println!(
+        ":: RING3WIN: model=elf window={} big_ok={} sbrk={} freed={} -> {} ::",
+        user_image_cap(), big_ok as u8, heap, freed as u8, if big_ok && freed { "PASS" } else { "FAIL" }
+    );
 }

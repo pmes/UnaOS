@@ -3558,6 +3558,44 @@ build_user_hello_x86() {
     echo -e "${COLOR_GREEN}✅ x86 user blob: $(wc -c < "${WORKSPACE_DIR}/target/hello.bin" | tr -d ' ') bytes${COLOR_RESET}"
 }
 
+# RING3WIN (rmbp-ledger B316): THE x86 RING-3 IMAGE CAP, ONE NUMBER. A UnaOS ring-3 program gets the
+# address space its ELF asks for: an image linked at 0 keeps the FIXED 16 KiB window (unchanged since U1a),
+# an image linked in the ELF window (lowest PT_LOAD >= USER_XWIN_VA_X86) gets up to USER_WINDOW_BYTES of
+# image + stack. The number lives in una-abi (`USER_WINDOW_BYTES`), the kernel derives its `XWIN_BYTES` from
+# it, the builder carries the same literal; `scripts/window-parity.sh` (run by `check` beside
+# knob-parity) reds when any of the four disagree. aarch64 is untouched — its asserts below still read
+# USER_REGION_SIZE (16384).
+USER_WINDOW_BYTES=4194304
+USER_XWIN_VA_X86=$((0x10000200000))
+# user_elf_window_check <file> <label> — the x86 user-ELF gate every build_user_*_x86 step calls (it
+# replaced four copies of `[ size -le 16384 ]`). It reads the PT_LOAD layout, not just the file size:
+#   fixed model: the in-window span (max end - min vaddr) must be <= 16384 — the bound the loader enforces
+#   elf model:   span + stack (PT_GNU_STACK p_memsz, default 64 KiB) + one guard page <= USER_WINDOW_BYTES
+# and the file itself must be <= USER_WINDOW_BYTES (the readers' cap). Prints the model and the numbers.
+user_elf_window_check() {
+    local f="$1" lbl="$2" sz out
+    sz="$(wc -c < "$f" | tr -d ' ')"
+    [ "$sz" -le "$USER_WINDOW_BYTES" ] || { echo -e "${COLOR_RED}ERROR: ${lbl} ${sz} bytes > USER_WINDOW_BYTES (${USER_WINDOW_BYTES})${COLOR_RESET}"; exit 1; }
+    out="$(python3 - "$f" "$USER_WINDOW_BYTES" "$USER_XWIN_VA_X86" <<'PY'
+import struct, sys
+b = open(sys.argv[1], 'rb').read(); cap = int(sys.argv[2]); xva = int(sys.argv[3])
+phoff, = struct.unpack_from('<Q', b, 32); phent, phnum = struct.unpack_from('<HH', b, 54)
+loads, stack = [], 0
+for i in range(phnum):
+    t, fl, off, va, pa, fs, ms, al = struct.unpack_from('<IIQQQQQQ', b, phoff + i * phent)
+    if t == 1: loads.append((va, ms))
+    if t == 0x6474E551: stack = ms
+lo = min(v for v, _ in loads); hi = max(v + m for v, m in loads)
+if lo >= xva:
+    st = ((stack + 0xFFF) & ~0xFFF) if stack else 65536
+    need = (hi - xva) + st + 4096
+    print("model=elf span=%d stack=%d need=%d cap=%d" % (hi - lo, st, need, cap)); sys.exit(0 if need <= cap and st <= (1 << 20) else 1)
+print("model=fixed span=%d cap=16384" % (hi - lo)); sys.exit(0 if hi - lo <= 16384 else 1)
+PY
+)" || { echo -e "${COLOR_RED}ERROR: ${lbl} does not fit its ring-3 window: ${out}${COLOR_RESET}"; exit 1; }
+    echo -e "   ${lbl}: ${sz} B file, ${out}"
+}
+
 # WINX-5: build the x86_64 static ELF64 EL0 PERSISTENCE program (crates/user-stat → target/STAT-X86.ELF).
 # The x86 twin of the aarch64 STAT.ELF build in build_user_aarch64(): same crate, same app logic, same
 # linker-script SHAPE (crates/user-stat/user-stat-x86.ld — two PT_LOAD segments via a PHDRS clause);
@@ -3588,7 +3626,7 @@ build_user_stat_x86() {
     local smach; smach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/STAT-X86.ELF" | tr -d ' \n')"
     [ "$smach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: STAT-X86.ELF e_machine is ${smach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
     local ssz; ssz="$(wc -c < "${WORKSPACE_DIR}/target/STAT-X86.ELF" | tr -d ' ')"
-    [ "$ssz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: STAT-X86.ELF ${ssz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/STAT-X86.ELF" "STAT-X86.ELF"   # RING3WIN: was `[ size -le 16384 ]`; now the layout-aware gate against USER_WINDOW_BYTES
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 persistence program: STAT-X86.ELF (${ssz} B)${COLOR_RESET}"
 }
 
@@ -3649,7 +3687,7 @@ build_one_vug_x86() {
     local vmach; vmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/${out}" | tr -d ' \n')"
     [ "$vmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: ${out} e_machine is ${vmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
     local vsz; vsz="$(wc -c < "${WORKSPACE_DIR}/target/${out}" | tr -d ' ')"
-    [ "$vsz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: ${out} ${vsz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/${out}" "${out}"   # RING3WIN: was `[ size -le 16384 ]`; now the layout-aware gate against USER_WINDOW_BYTES
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 mini-vug program: ${out} (${vsz} B)${COLOR_RESET}"
 }
 
@@ -3700,7 +3738,7 @@ build_user_pulse_x86() {
     local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/PULSE-X86.ELF" | tr -d ' \n')"
     [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: PULSE-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/PULSE-X86.ELF" | tr -d ' ')"
-    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: PULSE-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/PULSE-X86.ELF" "PULSE-X86.ELF"   # RING3WIN: was `[ size -le 16384 ]`; now the layout-aware gate against USER_WINDOW_BYTES
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 cpu-pulse program: PULSE-X86.ELF (${psz} B)${COLOR_RESET}"
 }
 
@@ -3728,7 +3766,7 @@ build_user_prefs_x86() {
     local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/PREFS-X86.ELF" | tr -d ' \n')"
     [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: PREFS-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/PREFS-X86.ELF" | tr -d ' ')"
-    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: PREFS-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/PREFS-X86.ELF" "PREFS-X86.ELF"   # RING3WIN: was `[ size -le 16384 ]`; now the layout-aware gate against USER_WINDOW_BYTES
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 Principia prefs fulfiller program: PREFS-X86.ELF (${psz} B)${COLOR_RESET}"
 }
 
@@ -3801,6 +3839,26 @@ build_user_net_x86() {
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/NET-X86.ELF" | tr -d ' ')"
     [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (${psz} B)${COLOR_RESET}"
+# RING3WIN M4 (B316): build BIG.BIN — the ELF-window proof program (crates/user-big → target/BIG-X86.ELF),
+# staged as APPS/BIG.BIN by the builder; `tests ring3win` runs it. x86 only. Unlike its siblings it links at
+# the ABSOLUTE ELF-window VA (crates/user-big/user-big-x86.ld, no PHDRS) and declares a 256 KiB stack with
+# `-z stack-size`, which lld writes into PT_GNU_STACK's p_memsz — the kernel's stack request.
+build_user_big_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 ELF-window proof program (crates/user-big → target/BIG-X86.ELF)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-big"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-big/target/x86_64-unknown-none/release/user-big" \
+      "${WORKSPACE_DIR}/target/BIG-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/BIG-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: BIG-X86.ELF missing/empty — x86 BIG build failed${COLOR_RESET}"; exit 1; }
+    local bmach; bmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/BIG-X86.ELF" | tr -d ' \n')"
+    [ "$bmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: BIG-X86.ELF e_machine is ${bmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/BIG-X86.ELF" "BIG-X86.ELF"
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 ELF-window proof program: BIG-X86.ELF${COLOR_RESET}"
 }
 
 build_kernel_aarch64() {
@@ -3844,6 +3902,7 @@ launch_x86_64() {
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -4813,6 +4872,7 @@ test_x86_64() {
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
     build_kernel_x86_64
 
     # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
@@ -7826,7 +7886,7 @@ check_kernel_cfg() {
     # its own file only so it can be run (and gone red) by hand: `bash unaos/scripts/knob-parity.sh`.
     # Exit 2 from it is a PARSE FAILURE (a control probe missed a name this tree provably contains) —
     # no verdict, and red, because an unchecked check is never a silent pass.
-    bash "$WORKSPACE_DIR/scripts/knob-parity.sh" "$WORKSPACE_DIR" || return 1
+    bash "$WORKSPACE_DIR/scripts/knob-parity.sh" "$WORKSPACE_DIR" || return 1; bash "$WORKSPACE_DIR/scripts/window-parity.sh" "$WORKSPACE_DIR" || return 1   # RING3WIN: the ring-3 image cap is one number across una-abi, the kernel, arroyo and the builder
     echo -e "${COLOR_GREEN}✅ kernel cfg coverage OK (${_n} legs)${COLOR_RESET}"
 }
 
@@ -8714,6 +8774,7 @@ esp_x86() {
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8775,6 +8836,7 @@ vm_image() {
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8821,6 +8883,7 @@ fat_img() {
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86

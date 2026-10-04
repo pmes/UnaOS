@@ -6496,7 +6496,7 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
     #[cfg(target_arch = "aarch64")]
     let cap: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64;
     #[cfg(not(target_arch = "aarch64"))]
-    let cap: u64 = crate::arch::syscall::user_window_size() as u64;
+    let cap: u64 = crate::arch::syscall::user_image_cap() as u64; // RING3WIN: the image cap, not the 16 KiB fixed window
     #[cfg(target_arch = "x86_64")]
     let t_entry = crate::arch::now_cycles();
 
