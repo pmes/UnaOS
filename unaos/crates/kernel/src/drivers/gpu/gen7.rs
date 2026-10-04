@@ -5660,8 +5660,12 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     // `igpu.rs`, and would let a future caller pass a verdict R7 did not reach. (2) Knob-off byte
     // identity: this statement is the LAST thing in the file's last function, so with `gen7r8` off
     // nothing below it exists to shift and no `panic::Location` line moves (LAWS §5).
+    //
+    // GEN7R8 M2 (B320, R80): the call is now a STASH, not the rung. R8 is a test — it moved behind
+    // `tests gen7` — so the boot records what R8 needs from THIS boot (BAR0, BDF, R3's wake, R7's
+    // verdict, the panel geometry) and prints nothing; R19's dependency rides in the stash unchanged.
     #[cfg(feature = "gen7r8")]
-    r8::fb_blit(
+    r8::stash(
         bar0,
         bar0_size,
         bus,
@@ -5799,7 +5803,7 @@ mod r8 {
     /// scratch, under a held wake, and score it on three witnesses: the rectangle's pixels, the bytes
     /// OUTSIDE the rectangle, and the sentinel store.
     ///
-    /// Called from the tail of `blit()` (R7) with R7's own verdict for this boot — see the call site
+    /// Run by `tests gen7` (GEN7R8, R80) from the boot stash R7's tail leaves, with R7's own verdict for this boot — see the call site
     /// for why the dependency is wired that way rather than through `igpu::init`.
     ///
     /// # Safety
@@ -5810,7 +5814,7 @@ mod r8 {
     /// re-read), the four BCS ring registers (restored to their captured entry images, only once the
     /// ring is confirmed disabled), and one GTT-flush register. It writes no display register and it
     /// never writes the framebuffer.
-    pub(super) unsafe fn fb_blit(
+    unsafe fn fb_blit(
         bar0: usize,
         bar0_size: usize,
         bus: u8,
@@ -5818,6 +5822,8 @@ mod r8 {
         func: u8,
         wake: GtWake,
         r7_verdict: &str,
+        geo: Geo,
+        out: &mut Witness,
     ) {
         serial_println!(
             ":: gen7: r8 begin rung=R8 wake={} reachable={} write_ok={} r7={} cands={} bdf={}:{}.{} bar0_size={} ladder=GEN7-3D engine=BCS shape=framebuffer-geometry-into-CPU-readable-scratch ::",
@@ -5862,16 +5868,9 @@ mod r8 {
         // the display lock would trade a diagnostic rung for a hang. A lock we cannot take is reported
         // as `fb=locked` and the rung falls back to the stated constants — the same three-valued
         // honesty the rest of the module uses, never a silent substitution.
-        let (fb_src, fb_w, fb_h, fb_stride_px, fb_bpp, fb_base, fb_len) = {
-            match crate::video::WRITER.try_lock() {
-                Some(fb) if fb.is_ready() => {
-                    let i = fb.info();
-                    ("panel", i.width, i.height, i.stride, i.bytes_per_pixel, fb.base(), fb.len())
-                }
-                Some(_) => ("fallback-unattached", R8_FALLBACK_W, R8_RECT_H, R8_FALLBACK_STRIDE, 4, 0, 0),
-                None => ("fallback-locked", R8_FALLBACK_W, R8_RECT_H, R8_FALLBACK_STRIDE, 4, 0, 0),
-            }
-        };
+        // GEN7R8 M2: read at the boot STASH (inside `igpu::init`, where flights 10-19 read `fb=panel`),
+        // not here — `tests gen7` runs from a shell whose caller may hold the display lock.
+        let Geo { src: fb_src, w: fb_w, h: fb_h, stride: fb_stride_px, bpp: fb_bpp, base: fb_base, len: fb_len } = geo;
         let dst_pitch_bytes = fb_stride_px.saturating_mul(fb_bpp);
         let dst_pitch_dw = dst_pitch_bytes / 4;
         // One slack row past the rectangle, deliberately: if X2/Y2 turn out to be INCLUSIVE, the extra
@@ -5881,6 +5880,7 @@ mod r8 {
         let dst_span_bytes = dst_rows.saturating_mul(dst_pitch_bytes);
         let dst_bytes = (dst_span_bytes + 4095) & !4095usize;
         let dst_dw_span = dst_rows * dst_pitch_dw;
+        out.window = dst_bytes; // GEN7R8 M1/M2: the window the witness reports — rows x pitch, page-rounded
         let src_pitch_bytes = R8_RECT_W * 4;
         let src_bytes = R8_RECT_H * src_pitch_bytes;
         let rect_x = fb_w.saturating_sub(R8_RECT_W);
@@ -6486,7 +6486,7 @@ mod r8 {
                 clflush_range(dst_page as usize, dst_bytes);
                 let sentinel_drain = core::ptr::read_volatile(dst_u32.add(sentinel_dw) as *const u32);
                 let sentinel_hit = sentinel_drain == R8_SENTINEL;
-                let (rect_match, spill, dst_crc, _src_crc_drain) = scan();
+                let (rect_match, spill, dst_crc, src_crc_drain) = scan();
                 let copy_full = rect_match == rect_dw;
                 serial_println!(
                     ":: gen7: r8 cand={} col=drain ring_idle={} drain_iters={} drain_cyc={} budget={} head_drain={:08X} tail={:08X} sentinel_drain={:08X} sentinel_hit={} rect_match={}/{} spill={} dst_crc={:08X} exec_sentinel_hit={} exec_rect_match={}/{} exec_spill={} settled={} ::",
@@ -6503,6 +6503,18 @@ mod r8 {
                     if rect_match != rect_exec || spill != spill_exec || sentinel_hit != sentinel_hit_exec { 0 } else { 1 }
                 );
 
+                // GEN7R8 M2 — the ring's own head/tail readback in one line, and the blit's wall time.
+                // `advanced` is the head leaving its arm image (it must, for the CS to have parsed a
+                // dword); the PASS condition still also wants head == tail and the checksum.
+                let head_now = rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+                let tail_now = rd(bar0, g7regs::BCS_RING_TAIL);
+                serial_println!("[gen7] r8 ring head={:08X} tail={:08X} advanced={}", head_now, tail_now, if head_moved { 1 } else { 0 });
+                if armed {
+                    out.armed = true;
+                    out.ring_advanced = head_moved && head_now == RING_TAIL_BYTES;
+                    out.csum_match = copy_full && spill == 0 && dst_crc == src_crc_drain;
+                    out.us = r8_cycles_to_us(cyc.saturating_add(drain_cyc));
+                }
                 wr(bar0, g7regs::BCS_RING_CTL, 0);
                 let ctl_off = rd(bar0, g7regs::BCS_RING_CTL);
                 let ring_disabled = ctl_off & 1 == 0;
@@ -6835,6 +6847,7 @@ mod r8 {
             tlb_verdict
         );
 
+        out.verdict = match safety_override { Some(v) => v, None => exec_verdict }; // GEN7R8: the witness's verdict
         let next = if let Some(sv) = safety_override {
             match sv {
                 "r8-ring-would-not-disable" =>
@@ -6871,4 +6884,140 @@ mod r8 {
         serial_println!(":: gen7: r8 end ::");
     }
 
+
+    // =================================================================================
+    // GEN7R8 (B320) — R8 behind `tests gen7` (R80), and its one-line witness.
+    // =================================================================================
+
+    /// The panel geometry as the boot read it. `src` names where it came from, exactly as the old
+    /// in-rung read did (`panel` / `fallback-unattached` / `fallback-locked`).
+    #[derive(Clone, Copy)]
+    struct Geo {
+        src: &'static str,
+        w: usize,
+        h: usize,
+        stride: usize,
+        bpp: usize,
+        base: usize,
+        len: usize,
+    }
+
+    /// Everything R8 needs from THIS boot. R19's dependency is `r7`: R7's own verdict string.
+    #[derive(Clone, Copy)]
+    struct Ctx {
+        bar0: usize,
+        bar0_size: usize,
+        bus: u8,
+        slot: u8,
+        func: u8,
+        wake: GtWake,
+        r7: &'static str,
+        geo: Geo,
+    }
+
+    /// What the witness line reports. `verdict` stays empty on every early return — and every early
+    /// return in `fb_blit` precedes the GGTT claim (`writes=0`), so empty is exactly REFUSED.
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct Witness {
+        window: usize,
+        armed: bool,
+        ring_advanced: bool,
+        csum_match: bool,
+        us: u64,
+        verdict: &'static str,
+    }
+
+    static STASH: spin::Mutex<Option<Ctx>> = spin::Mutex::new(None);
+    /// The first armed run's witness. R8's pages are `reclaim=held` (GEN7TLB HOLD, gen7.md §2.6), so a
+    /// second armed run would hold another ~1 MiB for an answer this boot already has: it replays.
+    static DONE: spin::Mutex<Option<Witness>> = spin::Mutex::new(None);
+
+    fn r8_cycles_to_us(dt: u64) -> u64 {
+        let hz = crate::arch::apic::tsc_hz();
+        let hz = if hz == 0 { 1_250_000_000 } else { hz }; // the uncalibrated fallback `video::strip` uses
+        dt.saturating_mul(1_000_000) / hz
+    }
+
+    /// Called from R7's tail on the boot path. Reads the panel geometry the way the rung always did
+    /// (`try_lock`, never a blocking take on the boot path) and records the boot's facts. Prints nothing.
+    pub(super) unsafe fn stash(
+        bar0: usize,
+        bar0_size: usize,
+        bus: u8,
+        slot: u8,
+        func: u8,
+        wake: GtWake,
+        r7_verdict: &'static str,
+    ) {
+        let geo = match crate::video::WRITER.try_lock() {
+            Some(fb) if fb.is_ready() => {
+                let i = fb.info();
+                Geo { src: "panel", w: i.width, h: i.height, stride: i.stride, bpp: i.bytes_per_pixel, base: fb.base(), len: fb.len() }
+            }
+            Some(_) => Geo { src: "fallback-unattached", w: R8_FALLBACK_W, h: R8_RECT_H, stride: R8_FALLBACK_STRIDE, bpp: 4, base: 0, len: 0 },
+            None => Geo { src: "fallback-locked", w: R8_FALLBACK_W, h: R8_RECT_H, stride: R8_FALLBACK_STRIDE, bpp: 4, base: 0, len: 0 },
+        };
+        *STASH.lock() = Some(Ctx { bar0, bar0_size, bus, slot, func, wake, r7: r7_verdict, geo });
+    }
+
+    fn print_witness(w: &Witness, replay: bool) -> &'static str {
+        let result = if w.verdict.is_empty() {
+            "REFUSED"
+        } else if w.verdict == "r8-fb-blit-verified" && w.armed && w.ring_advanced && w.csum_match {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        // GEN7R8 M3 — R2's behavioural witness. R2 asked "is the GT awake?" and its battery was blind
+        // (gen7.md §2.2). An engine that moved 16 KiB through a held wake on this boot IS awake; any
+        // other outcome leaves R2 where its battery left it.
+        let r2 = if result == "PASS" { "behavioural-ok" } else { "still-dark" };
+        serial_println!(
+            ":: GEN7R8: window={} ring_advanced={} csum={} us={} r2={} verdict={} replay={} -> {} ::",
+            w.window,
+            if w.ring_advanced { 1 } else { 0 },
+            if w.csum_match { "match" } else { "mismatch" },
+            w.us,
+            r2,
+            if w.verdict.is_empty() { "refused-see-the-r8-verdict-line" } else { w.verdict },
+            if replay { 1 } else { 0 },
+            result
+        );
+        result
+    }
+
+    /// `tests gen7`: run R8 once from the boot stash and print the witness.
+    pub(super) fn test() {
+        if let Some(w) = *DONE.lock() {
+            serial_println!(":: gen7: r8 replay=1 note=this-boot-already-armed-R8-and-its-pages-are-held-a-second-run-would-hold-another-window ::");
+            print_witness(&w, true);
+            return;
+        }
+        let ctx = *STASH.lock();
+        let mut w = Witness::default();
+        match ctx {
+            None => {
+                serial_println!(":: gen7: r8 verdict=r8-gated-on-r7 r7=not-reached writes=0 note=no-boot-stash-R7-returned-before-its-tail-on-this-boot-so-R8s-question-is-unaskable ::");
+            }
+            Some(c) => {
+                serial_println!(
+                    ":: gen7: r8 test r7={} wake={} geo={} fb_w={} fb_h={} stride_px={} note=R8-runs-under-tests-gen7-R80-the-boot-only-stashed-its-inputs ::",
+                    c.r7, c.wake.name(), c.geo.src, c.geo.w, c.geo.h, c.geo.stride
+                );
+                // SAFETY: `bar0` is the IGD BAR0 mapping `igpu::init` published and R1-R7 used on this
+                // boot; it is never unmapped. `fb_blit`'s own contract (the `blit` contract) applies.
+                unsafe { fb_blit(c.bar0, c.bar0_size, c.bus, c.slot, c.func, c.wake, c.r7, c.geo, &mut w) };
+            }
+        }
+        print_witness(&w, false);
+        if w.armed {
+            *DONE.lock() = Some(w);
+        }
+    }
+}
+
+/// GEN7R8 (B320): the `tests gen7` fixture — rung R8 from the boot stash, one witness line.
+#[cfg(feature = "gen7r8")]
+pub fn r8_test() {
+    r8::test()
 }
