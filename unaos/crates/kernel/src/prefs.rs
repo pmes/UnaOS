@@ -164,7 +164,15 @@ fn ensure_dirs() {
 
 // ── Load ─────────────────────────────────────────────────────────────────────────────────────
 
+/// TESTFIX3: set by `tests prefs` around its DELIBERATE malformed reload, so that expected refusal is said
+/// as a `[prefs]` line and not as a `:: PREFS: … -> FAIL` the scorer counts (FLIGHT 19 counted it).
+static FIXTURE_QUIET: AtomicBool = AtomicBool::new(false);
+
 fn witness(ok: bool) {
+    if FIXTURE_QUIET.load(Ordering::Acquire) {
+        serial_println!("[prefs] fixture malformed reload loaded={} held={} (expected refusal)", LOADED_N.load(Ordering::Relaxed), !ok as u8);
+        return;
+    }
     serial_println!(
         ":: PREFS: path={} loaded={} saved={} ns={} -> {} ::",
         path(), LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed), NS, if ok { "PASS" } else { "FAIL" }
@@ -595,7 +603,9 @@ pub fn codec_selftest() -> bool {
     };
     // GET: frozen golden — `system.audio.mute`, corr 21.
     const GOLDEN_REQ_PREF_GET: &[u8] = &[
-        b'U', b'B', b'S', b'1', 1, 1, 11, 0, 21, 0, 0, 0, 0, 0, 0, 0, //
+        // TESTFIX3: verb byte 16 = PREF_GET since the merge9 fold moved PREFS to 16..=18 (11 is ATTR_SET now);
+        // the stale 11 was the one KAT short on the metal (`kats=8/9`).
+        b'U', b'B', b'S', b'1', 1, 1, 16, 0, 21, 0, 0, 0, 0, 0, 0, 0, //
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
         17, 0, 0, 0, b's', b'y', b's', b't', b'e', b'm', b'.', b'a', b'u', b'd', b'i', b'o', b'.', b'm', b'u', b't', b'e',
     ];
@@ -635,6 +645,7 @@ pub fn selftest() {
     let original = read_all(&p);
     let tree0 = TREE.lock().clone();
     let held0 = HELD.load(Ordering::Acquire);
+    let (loaded0, saved0) = (LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed));
     HELD.store(false, Ordering::Release);
     // Leg 1 — the four types, through set (which saves by the swap).
     let vals = [
@@ -659,7 +670,9 @@ pub fn selftest() {
     let bad = b"[system]\ndisplay.brightness = 3\nrecents = [\"a\"]\n";
     let _ = write_all(&p, bad);
     *LOADED_FOR.lock() = None;
+    FIXTURE_QUIET.store(true, Ordering::Release);
     ensure_loaded();
+    FIXTURE_QUIET.store(false, Ordering::Release);
     let refused = HELD.load(Ordering::Acquire) && TREE.lock().is_empty() && int(key::BRIGHTNESS, 0, 16).is_none();
     let held = save().is_err() && read_all(&p).as_deref() == Some(&bad[..]);
     // Restore the operator's file and tree exactly.
@@ -674,6 +687,8 @@ pub fn selftest() {
     }
     *TREE.lock() = tree0;
     HELD.store(held0, Ordering::Release);
+    LOADED_N.store(loaded0, Ordering::Relaxed);
+    SAVED_N.store(saved0, Ordering::Relaxed);
     let restored = read_all(&p) == original;
     let ok = codec && set_ok && file_ok && no_temp && refused && held && restored;
     serial_println!(

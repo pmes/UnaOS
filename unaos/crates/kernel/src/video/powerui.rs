@@ -158,6 +158,7 @@ fn post_notice(level: u8, pct: u16) {
 /// Called from the device-service task beside `status::poll` (never from a composite).
 pub fn lowbat_service() {
     let Some((b, _)) = crate::video::status::reading() else { return };
+    if crate::video::status::reading_is_fixture() { return; } // TESTFIX3: a fixture's injected percent is never the battery — no notice, no mask latch, no shutdown
     let mut m = DONE_MASK.load(Ordering::Relaxed);
     let hit = threshold_hit(b.percent, b.charging, &mut m);
     if hit != 0 { DONE_MASK.store(m, Ordering::Relaxed); post_notice(hit, b.percent); }

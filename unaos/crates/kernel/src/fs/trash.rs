@@ -305,7 +305,7 @@ fn trash_inner(path: &str) -> Result<String, String> {
         if n > 99 {
             return Err(String::from("too-many-collisions"));
         }
-        name = alloc::format!("{}~{}", leaf(path), n);
+        name = collision_name(leaf(path), n); // TESTFIX3: 8.3-safe on FAT (see collision_name)
     }
     let when = crate::clock::unix_now().unwrap_or(0);
     let dst = join(&td, &name);
@@ -539,7 +539,7 @@ pub fn selftest() {
     let c1 = trash(&path);
     let _ = t.create(&path, NodeKind::File, P);
     let c2 = trash(&path);
-    let coll = matches!((&c1, &c2), (Ok(a), Ok(b)) if a != b && b.ends_with("~1"));
+    let coll = matches!((&c1, &c2), (Ok(a), Ok(b)) if a != b && b.contains("~1")); // TESTFIX3: `TRASHF~1.TXT` on FAT
     let _ = empty();
     let none_left = match s {
         Store::Attrs => !t.query(TRASH_QUERY, P).unwrap_or_default().iter().any(|(_, p)| parent(p).eq_ignore_ascii_case(&td)),
@@ -553,4 +553,23 @@ pub fn selftest() {
         ":: TRASH: store={} trashed={} restored={} emptied={} query_ok={} -> {} ::",
         s.name(), trashed, restored, emptied, query_ok, if pass { "PASS" } else { "FAIL" }
     );
+}
+
+/// TESTFIX3 (FLIGHT 19 `tests trash`): the `n`th collision name for `leaf`. The old `<leaf>~<n>`
+/// (`TRASHFX.TXT~1`) is not an 8.3 name, and FAT's cross-directory `move_entry` refuses a non-8.3
+/// destination (`[fs] mv … lfn=1 ok=false` -> `reason=Unsupported`), so the SECOND trash of a name
+/// failed on the metal's FAT home. When `leaf` is itself 8.3 the suffix goes inside the stem
+/// (`TRASHF~1.TXT`, the stem cut to keep 8 bytes) so the move stays representable; a leaf that is
+/// already long keeps `<leaf>~<n>` (the volume either takes long names or refused the leaf already).
+fn collision_name(leaf: &str, n: u32) -> String {
+    let suffix = alloc::format!("~{}", n);
+    if crate::fs::fat::is_long_name(leaf) {
+        return alloc::format!("{}{}", leaf, suffix);
+    }
+    let (stem, ext) = match leaf.find('.') {
+        Some(i) => (&leaf[..i], &leaf[i..]),
+        None => (leaf, ""),
+    };
+    let keep = stem.len().min(8usize.saturating_sub(suffix.len()));
+    alloc::format!("{}{}{}", &stem[..keep], suffix, ext)
 }

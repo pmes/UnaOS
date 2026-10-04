@@ -792,3 +792,13 @@ pub fn set_volume(level: u8, muted: bool) -> bool {
     if muted { osd_set(OSD_MUTED, lv) } else { osd_set(OSD_VOL, lv) }
     written
 }
+
+/// TESTFIX3 — true while the reading in force is a FIXTURE's (`inject`), not the SMC's. The live
+/// low-battery monitor (`powerui::lowbat_service`) must not act on it: FLIGHT 19's `tests power`
+/// injected 7 % for its panel leg, the device-service pass read it as the battery, posted a REAL
+/// "Low Battery" alert (the login screen's modal Alert state), and that modal then swallowed every
+/// press for the rest of the run (`[login] press … swallowed=2` -> `[clickroute] … deliver=false`).
+pub fn reading_is_fixture() -> bool {
+    SRC.load(Ordering::Relaxed) == SRC_FIXTURE
+}
+

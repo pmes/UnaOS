@@ -119,6 +119,7 @@ pub static DOCS: &[VerbDoc] = &[
     d("ps", "system", "scheduler task table and per-core census", "ps", &["ps"]),
     d("top", "system", "per-core scheduler load table", "top", &["top"]),
     d("batmon", "system", "one fresh battery line (SMC machines)", "batmon", &["batmon"]),
+    d("battery", "system", "battery charge, state and time remaining as the status menu shows them", "battery", &["battery"]),
     d("dmesg", "system", "print the boot-milestone ring with timestamps", "dmesg", &["dmesg"]),
     d("run", "system", "load an ELF64 user program and run it in the foreground, reporting its exit status", "run <path>", &["run /apps/ELFHELLO.ELF"]),
     d("bg", "system", "run a user program in the background; its window stays open", "bg <path>", &["bg /apps/VUG.ELF"]),

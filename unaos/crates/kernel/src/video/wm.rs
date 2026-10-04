@@ -30052,3 +30052,10 @@ pub fn wl_fixture_mint(asid: u64, title: &[u8]) -> WinId {
     let len = core::mem::size_of_val(&HT_SURF);
     create(asid, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, title)
 }
+
+/// TESTFIX3 — true while a modal row (the splash hold, the login screen, an alert) is pinned topmost:
+/// a fixture that reads its own pixels back cannot see them under it and must SKIP, not FAIL.
+pub fn modal_top_held() -> bool {
+    MODAL_WIN.load(core::sync::atomic::Ordering::Acquire) != WIN_NONE
+}
+

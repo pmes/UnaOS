@@ -408,7 +408,11 @@ pub fn codec_kats() -> u32 {
     if &r[..rn] == GOLDEN_FUL_REPLY && matches!(crate::bus::frame_parse(&r[..rn]), Ok(p) if p.kind == crate::bus::BUS_KIND_REPLY && p.corr == 5) {
         w |= 1 << 2;
     }
-    if crate::bus::verb_valid(128) && crate::bus::verb_valid(255) && crate::bus::verb_valid(BUS_VERB_REGISTER) && !crate::bus::verb_valid(11) && !crate::bus::verb_valid(0) {
+    // TESTFIX3: the "unassigned kernel tag" probe was 11, which the merge9 fold gave to ATTR_SET (11..=15) —
+    // the bit failed on the metal (`w=0x1f7/0x1ff`). Probe 126, the unassigned tag under REGISTER, and hold
+    // the kernel-owned tags (ATTR_SET, PREF_GET) valid so the kernel range is pinned, not guessed.
+    if crate::bus::verb_valid(128) && crate::bus::verb_valid(255) && crate::bus::verb_valid(BUS_VERB_REGISTER) && !crate::bus::verb_valid(126) && !crate::bus::verb_valid(0)
+        && crate::bus::verb_valid(una_abi::BUS_VERB_ATTR_SET) && crate::bus::verb_valid(una_abi::BUS_VERB_PREF_GET) {
         w |= 1 << 3;
     }
     w
