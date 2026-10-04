@@ -69,6 +69,8 @@ pub enum GptError {
     BadIndex,
     /// More entries than the array holds.
     TooManyEntries,
+    /// AHCIROOT: the sector source refused a read ([`read_table_with`]).
+    Io,
 }
 
 impl fmt::Display for GptError {
@@ -85,6 +87,7 @@ impl fmt::Display for GptError {
             GptError::Overlap => f.write_str("entries overlap"),
             GptError::BadIndex => f.write_str("slot index out of range or unused"),
             GptError::TooManyEntries => f.write_str("more entries than the array holds"),
+            GptError::Io => f.write_str("a sector read failed"),
         }
     }
 }
@@ -474,5 +477,80 @@ pub fn parse_image(disk: &[u8]) -> Result<Table, GptError> {
     let header = Header::decode(&disk[SECTOR..2 * SECTOR], total)?;
     let o = header.entries_lba as usize * SECTOR;
     let entries = decode_array(&disk[o..o + header.array_sectors() as usize * SECTOR], &header)?;
+    Ok(Table { header, entries })
+}
+
+// ---------------------------------------------------------------------------------------------
+// AHCIROOT (rmbp-ledger B332): THE ONE GPT READER. The kernel carried six hand-rolled readers of the
+// same bytes (fs/fat.rs's volume walk, drivers/ahci.rs's LBA-0 census, install/pi.rs's and the Orin
+// card driver's sector-0 classifiers and scratch chooser, install/gpt.rs's table read); every one of
+// them now asks these functions, so "is this a GPT" has one answer in both rings.
+// ---------------------------------------------------------------------------------------------
+
+/// Does this sector carry the `EFI PART` header signature (primary or backup header)?
+pub fn has_signature(sector: &[u8]) -> bool {
+    sector.len() >= 8 && &sector[0..8] == b"EFI PART"
+}
+
+/// The first of the four MBR entries whose TYPE byte is 0xEE (protective), if any. Reads the type
+/// byte only — the caller decides whether the 0x55AA signature or the entry size matter to it.
+pub fn protective_slot(s: &[u8]) -> Option<usize> {
+    if s.len() < SECTOR {
+        return None;
+    }
+    (0..4usize).find(|&i| s[446 + 16 * i + 4] == 0xEE)
+}
+
+/// What LBA 0 says about the disk's partitioning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sector0 {
+    /// No 0x55AA, or a signature over no real partition entry (a FAT superfloppy reads here).
+    None,
+    /// A classic MBR: at least one entry with a non-zero type AND a non-zero size, no 0xEE.
+    Mbr,
+    /// A protective (or hybrid) MBR: an 0xEE entry with a non-zero size — the real table is the GPT.
+    Protective,
+}
+
+/// Classify LBA 0. BOTH the type and the size of an entry are read, so a superfloppy's boot code is
+/// never mistaken for a table (the AHCI census rule, now the only copy).
+pub fn classify_sector0(s: &[u8]) -> Sector0 {
+    if s.len() < SECTOR || s[510] != 0x55 || s[511] != 0xAA {
+        return Sector0::None;
+    }
+    let mut real = false;
+    for e in 0..4usize {
+        let b = 446 + e * 16;
+        let ptype = s[b + 4];
+        let size = u32le(s, b + 12);
+        if ptype == 0xEE && size != 0 {
+            return Sector0::Protective;
+        }
+        if ptype != 0 && size != 0 {
+            real = true;
+        }
+    }
+    if real { Sector0::Mbr } else { Sector0::None }
+}
+
+/// Read and VALIDATE a GPT off any sector source: the header at LBA 1 (signature, CRC, bounds), then
+/// its entry array (CRC, every in-use entry inside the usable range). `read(lba, buf)` fills `buf`
+/// (a whole number of 512-byte sectors) or fails. The protective MBR is NOT required here: a
+/// superfloppy-GPT and a hybrid both carry a valid header, and the header is what vouches for the
+/// entries. A table that does not validate is not a table — no entries are guessed out of it.
+pub fn read_table_with<F: FnMut(u64, &mut [u8]) -> bool>(total: u64, mut read: F) -> Result<Table, GptError> {
+    if total < 3 {
+        return Err(GptError::TooSmall);
+    }
+    let mut h = [0u8; SECTOR];
+    if !read(1, &mut h) {
+        return Err(GptError::Io);
+    }
+    let header = Header::decode(&h, total)?;
+    let mut raw = alloc::vec![0u8; header.array_sectors() as usize * SECTOR];
+    if !read(header.entries_lba, &mut raw) {
+        return Err(GptError::Io);
+    }
+    let entries = decode_array(&raw, &header)?;
     Ok(Table { header, entries })
 }

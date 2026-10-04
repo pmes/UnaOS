@@ -423,6 +423,7 @@ pub fn write_ssd_confirmed(out: &mut dyn FnMut(&str), force: bool, _confirm: Opt
     };
     // SELFINSTALL2 M2: mirror the UnaFS volume (sector clone of the running span) and fsck the copy.
     #[cfg(feature = "unafs")] let (cloned_mib, fsck_tag, unafs_ok) = mirror_unafs(&mut disk, &plan, unafs_src, out); #[cfg(not(feature = "unafs"))] let (cloned_mib, fsck_tag, unafs_ok) = { let _ = unafs_src; (0u64, "skip", true) };
+    #[cfg(feature = "ahciroot")] let (cloned_mib, fsck_tag, unafs_ok) = if unafs_src.is_none() { fresh_unafs(&mut disk, &plan, port, out) } else { (cloned_mib, fsck_tag, unafs_ok) }; // AHCIROOT (B332) M3
     let ms = crate::arch::ticks().wrapping_sub(t0);
     let pass = w.files > 0 && w.verified == w.files && unafs_ok;
     serial_println!(
@@ -479,6 +480,7 @@ pub fn selftest() {
 pub fn ssd_plan(disk_sectors: u64, unafs_sectors: Option<u64>) -> Result<amber_core::Plan, amber_core::PlanError> {
     use amber_core::{PartKind, PartReq, Size};
     let esp = PartReq { kind: PartKind::Esp, size: Size::Sectors(ESP_SECTORS), name: "UNAOS-ESP", seed: b"UNAOS-INSTALL-ESP" };
+    #[cfg(feature = "ahciroot")] let unafs_sectors = Some(unafs_sectors.filter(|&n| n > 0).unwrap_or(super::ahciroot::FRESH_UNAFS_MIB * 2048) + super::ahciroot::SCRATCH_SECTORS); // AHCIROOT (B332) M3: p2 always (cloned or fresh), plus the 64-sector scratch tail outside the volume
     match unafs_sectors {
         Some(n) if n > 0 => {
             let ufs = PartReq { kind: PartKind::UnaFS, size: Size::Sectors(n), name: "UNAOS-UNAFS", seed: b"UNAOS-INSTALL-UFS" };
@@ -553,8 +555,9 @@ fn print_plan(p: &Probe, out: &mut dyn FnMut(&str)) {
             }
         }
         _ => {
-            serial_println!("[install] unafs mirror: none (the running system has no UnaFS root to mirror; the SSD gets the ESP only)");
-            out("  unafs: none — the running system has no UnaFS root; the SSD gets the ESP only");
+            #[cfg(feature = "ahciroot")] { serial_println!("[install] unafs: fresh {} MiB volume (UnaFS::format, the `unafs init` code) + {} scratch sectors — the running system has no UnaFS root to mirror", super::ahciroot::FRESH_UNAFS_MIB, super::ahciroot::SCRATCH_SECTORS); out("  unafs: a fresh UnaFS volume (UnaFS::format) — the running system has no UnaFS root to mirror"); }
+            #[cfg(not(feature = "ahciroot"))] { serial_println!("[install] unafs mirror: none (the running system has no UnaFS root to mirror; the SSD gets the ESP only)");
+            out("  unafs: none — the running system has no UnaFS root; the SSD gets the ESP only"); }
         }
     }
     let _ = &mut cloned;
@@ -613,7 +616,7 @@ pub fn install_selftest() {
         p.parts.len() == 2
             && p.parts[0].first == 2048
             && p.parts[1].first == 2048 + ESP_SECTORS
-            && p.parts[1].sectors() == 1_048_576
+            && p.parts[1].sectors() == 1_048_576 + PLAN_SCRATCH
             && p.gpt().is_ok()
     });
     let tiny_refused = ssd_plan(500_000, Some(1_048_576)).is_err();
@@ -640,4 +643,36 @@ pub fn install_selftest() {
 #[cfg(feature = "ahciroot")]
 pub fn stranger_token(port: u8, sectors: u64) -> String {
     alloc::format!("ERASE-{}-{}", port, sectors)
+}
+
+/// AHCIROOT (B332): the scratch tail the plan adds to p2 (0 without the knob) — `tests install`'s
+/// planner check reads it so the synthetic plan is asserted in both polarities.
+#[cfg(feature = "ahciroot")]
+const PLAN_SCRATCH: u64 = super::ahciroot::SCRATCH_SECTORS;
+#[cfg(not(feature = "ahciroot"))]
+const PLAN_SCRATCH: u64 = 0;
+
+/// AHCIROOT (B332) M3: `--write`'s UnaFS leg when there is no running volume to mirror — format p2 with
+/// `UnaFS::format` through the held install grant, then fsck the result. Returns `(0, fsck tag, ok)`.
+#[cfg(feature = "ahciroot")]
+fn fresh_unafs(disk: &mut AhciDisk, plan: &amber_core::Plan, port: u8, out: &mut dyn FnMut(&str)) -> (u64, &'static str, bool) {
+    let Some(dst) = plan.part(amber_core::PartKind::UnaFS) else { return (0, "skip", false) };
+    let mib = super::ahciroot::FRESH_UNAFS_MIB;
+    serial_println!("[install] unafs fresh: UnaFS::format {} MiB at lba={} (p2 {}..{}, scratch tail {} sectors)", mib, dst.first, dst.first, dst.last, super::ahciroot::SCRATCH_SECTORS);
+    let blocks = match super::ahciroot::format_fresh(port, dst.first, mib) {
+        Ok(n) => n,
+        Err(why) => {
+            serial_println!("[install] unafs fresh FAILED: {}", why);
+            out("install ssd --write: formatting the SSD's UnaFS partition FAILED");
+            return (0, "skip", false);
+        }
+    };
+    match super::unafsmirror::fsck_target(disk, dst.first, blocks) {
+        Ok(true) => (0, "ok", true),
+        Ok(false) => (0, "fail", false),
+        Err(why) => {
+            serial_println!("[install] unafs fsck of the fresh volume: {}", why);
+            (0, "fail", false)
+        }
+    }
 }

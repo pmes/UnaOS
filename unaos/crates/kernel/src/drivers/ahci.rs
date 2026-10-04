@@ -652,32 +652,15 @@ fn decode_identity(buf: &[u8; SECTOR_BYTES]) -> Identity {
 /// really lives at LBA 1. This function only ever sees LBA 0, so it decides GPT from the protective
 /// MBR's type byte, which is what a GPT disk is required to carry.
 fn sector0_kind(buf: &[u8; SECTOR_BYTES]) -> &'static str {
-    if buf[510] != 0x55 || buf[511] != 0xAA {
-        return "none";
+    // AHCIROOT (rmbp-ledger B332): the rule below is amber_core's `classify_sector0` now — the ONE copy.
+    // BOTH fields of an entry are read (type AND size), which is what stops a FAT SUPERFLOPPY — a BPB
+    // with 0x55AA at offset 510 and boot code where a table would be — from being called an MBR; a
+    // superfloppy reads `none`: "LBA 0 carries a boot signature and no partition table".
+    match amber_core::gpt::classify_sector0(buf) {
+        amber_core::gpt::Sector0::Protective => "GPT",
+        amber_core::gpt::Sector0::Mbr => "MBR",
+        amber_core::gpt::Sector0::None => "none",
     }
-    // MBR partition table: four 16-byte entries at 0x1BE; the type byte is at entry offset 4 and the
-    // sector count is the little-endian u32 at entry offset 12.
-    //
-    // BOTH fields are read, and that is not belt-and-braces — it is what stops a FAT SUPERFLOPPY
-    // from being called an MBR. A superfloppy's LBA 0 is a BPB, which carries the same 0x55AA at
-    // offset 510 and has ordinary boot code or padding where the partition table would be, so a
-    // signature-only test reports `MBR` on a disk that has no partition table at all. Requiring one
-    // entry with a non-zero TYPE and a non-zero SIZE makes the verdict a statement about a table
-    // that exists. A superfloppy then reads `none`, which is the honest answer this arc can give:
-    // "LBA 0 carries a boot signature and no partition table".
-    let mut real_entry = false;
-    for e in 0..4 {
-        let base = 0x1BE + e * 16;
-        let ptype = buf[base + 4];
-        let psize = u32::from_le_bytes([buf[base + 12], buf[base + 13], buf[base + 14], buf[base + 15]]);
-        if ptype == 0xEE && psize != 0 {
-            return "GPT";
-        }
-        if ptype != 0 && psize != 0 {
-            real_entry = true;
-        }
-    }
-    if real_entry { "MBR" } else { "none" }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════

@@ -755,3 +755,8 @@ pub mod partition;
 // volume + fsck of the copy). Gated on exactly its consumer, `selfinstall`, plus the `unafs` module it reads.
 #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci", feature = "unafs"))]
 pub mod unafsmirror;
+
+// AHCIROOT (rmbp-ledger B332, R82): the SSD UnaFS root — the root/scratch grant judgment, the fresh-p2
+// format and `tests ahciw`. Gated exactly as its consumers (bootdisk, fs::unafs, selfinstall, tests).
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub mod ahciroot;
