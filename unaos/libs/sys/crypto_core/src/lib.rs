@@ -61,9 +61,9 @@ pub mod x25519;
 pub mod ed25519;
 mod bigint;
 pub mod p256;
-// M-later pub mod blake2b;
-// M-later pub mod argon2;
-// M-later pub mod drbg;
+pub mod blake2b;
+pub mod argon2;
+pub mod drbg;
 
 pub use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 

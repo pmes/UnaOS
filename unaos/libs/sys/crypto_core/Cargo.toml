@@ -18,3 +18,8 @@ alloc = []
 std = ["alloc"]
 
 [dependencies]
+
+# The tests link the crate with its `std` conveniences on (Argon2's allocating `hash`, `OsEntropy`, the
+# Vec-returning AEAD wrappers). A path self-reference — still zero third-party crates.
+[dev-dependencies]
+crypto_core = { path = ".", features = ["std"] }

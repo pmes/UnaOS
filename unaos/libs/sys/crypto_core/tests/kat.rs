@@ -41,3 +41,8 @@ fn m2_aead() {
 fn m3_curves() {
     run(&["x25519/", "ed25519/", "p256/"]);
 }
+
+#[test]
+fn m4_argon2_drbg_ct() {
+    run(&["blake2b/", "argon2/", "drbg/", "ct/"]);
+}

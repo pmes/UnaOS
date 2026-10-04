@@ -1344,6 +1344,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-check"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1365,6 +1372,9 @@ dependencies = [
 [[package]]
 name = "crypto_core"
 version = "0.1.0"
+dependencies = [
+ "crypto_core",
+]
 
 [[package]]
 name = "cssparser"
