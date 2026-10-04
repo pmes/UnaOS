@@ -698,7 +698,7 @@ fn vfs_copy_bytes(
             break; // short write — report what landed rather than looping forever
         }
     }
-    Ok(off)
+    crate::fs::filetype::carry_in(mt, src, dst); Ok(off) // FILETYPE (B307): `una:type`/`una:preferred` travel with the bytes (rename keeps them by inode; a copy must carry them). ⚠ SAME-LINE fold.
 }
 
 /// JD8 `cp <src> <dst>`: copy a FILE. `cp FILE DIR/` lands as `DIR/<leaf>`. JD14: no-clobber is the
@@ -5432,7 +5432,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 (Some("-x"), Some(key), Some(path)) => setfattr_x(console, key, path),
                 _ => setfattr_cmd(console, &args), // ATTRSURF: `setfattr <path> <key>=<value>` (body at the file tail)
             }
-        }, "getfattr" => getfattr_cmd(console, &args), "query" => query_cmd(console, &args), // ATTRSURF (B299): getfattr (no key = the listing; no `lsattr`, R26) and query, bodies at the file tail. ⚠ SAME-LINE fold.
+        }, "getfattr" => getfattr_cmd(console, &args), "query" => query_cmd(console, &args), "file" => crate::fs::filetype::shell_verb(&args, console), "assoc" => crate::fs::assoc::shell_verb(&args, console), // FILETYPE (B307): `file` / `assoc`, bodies in fs/filetype.rs and fs/assoc.rs. ATTRSURF (B299): getfattr (no key = the listing; no `lsattr`, R26) and query, bodies at the file tail. ⚠ SAME-LINE fold.
         // RELICS (R26 clause 2): five spellings (`usnaps` `usnap` `usnapdrop` `usnapls` `usnapcat`)
         // become ONE verb with subcommands. They were never five commands: they were one noun with
         // five operations, which is what a subcommand is for, and the `u` prefix said only "the

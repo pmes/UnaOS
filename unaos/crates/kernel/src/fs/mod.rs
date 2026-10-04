@@ -159,3 +159,8 @@ pub mod trash;
 
 /// ATTRSURF (B299): the one fulfiller of the typed-attribute surface (verbs, syscalls, bus).
 pub mod attrsys;
+
+/// FILETYPE (B307): `una:type` — the file's MIME type as an attribute; sniff and extension fallbacks.
+pub mod filetype;
+/// FILETYPE M2 (B307): the type database — type → opener as attributes on `/system/types/*`.
+pub mod assoc;

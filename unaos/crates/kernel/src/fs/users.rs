@@ -1237,7 +1237,7 @@ pub fn service() {
             #[cfg(all(feature = "loginst", feature = "tests-at-boot"))]
             LOGINST_LIVE.store(true, Ordering::Release); // LOGINORDER (B206): the chain is live from here to the end of this arm — the desktop press battery waits for it
             SERVICED.store(true, Ordering::Relaxed);
-            root_credential_ignition(); // LOGIN14 (R65): root's row, and the set-password screen if its password is not chosen yet
+            root_credential_ignition(); crate::fs::assoc::seed_once(); // FILETYPE (B307): the type database is written on the first boot of an attribute-bearing root (idempotent; FAT says source=builtin). LOGIN14 (R65): root's row, and the set-password screen if its password is not chosen yet
             #[cfg(feature = "loginst")]
             { login_rootpw_fixture(); login_bootroot_fixture(); login_adduser_fixture(); login_usermgmt_root_fixture(); login_rootout_fixture(); login_usermgmt_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]

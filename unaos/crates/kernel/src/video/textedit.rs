@@ -478,8 +478,10 @@ pub fn save(print: bool) -> Result<(usize, usize, usize), String> {
         return Err(String::from("is a directory"));
     }
     let p = crate::fs::vfs::KERNEL_PRINCIPAL;
+    let pref = mt.get_attr(&path, crate::fs::assoc::PREFERRED_KEY, p).ok(); // FILETYPE (B307): the save re-creates the file; a per-file opener choice survives it
     let _ = mt.unlink(&path, p);
     mt.create(&path, NodeKind::File, p).map_err(|e| alloc::format!("create: {:?}", e))?;
+    if let Some(v) = pref { let _ = mt.set_attr(&path, crate::fs::assoc::PREFERRED_KEY, v, p); }
     let mut off = 0usize;
     while off < text.len() {
         let n = core::cmp::min(CHUNK, text.len() - off);
@@ -489,6 +491,7 @@ pub fn save(print: bool) -> Result<(usize, usize, usize), String> {
         }
         off += w;
     }
+    let _ = crate::fs::filetype::stamp_as_in(&mt, &path, crate::fs::filetype::TEXT_PLAIN); // FILETYPE (B307): a saved document is text/plain
     let lines = text.iter().filter(|&&b| b == b'\n').count() + (text.last().map_or(0, |&b| (b != b'\n') as usize));
     let retitle = {
         let mut g = STATE.lock();

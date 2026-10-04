@@ -454,22 +454,13 @@ struct CacheEnt {
 enum Act {
     /// Nothing to do outside the lock (a selection, a scroll, a navigation — all already applied).
     None,
-    /// Read and spawn this absolute path.
-    Launch(String),
-    /// A double-click on something Quarry cannot open yet. Census, no action.
-    NoOpener(String),
-    /// FILEVIEW — show this absolute path in the read-only text viewer (`video/fileview.rs`).
-    Text(String),
-    /// PLAYWAV (R75) — a `.WAV`: latch it for the HDA player (`drivers/hda_play.rs`), serviced on the tick.
-    Play(String),
-    /// FACET — show this absolute path in the image viewer. The FIRST opener this tree has ever had:
-    /// [`Act::NoOpener`]'s census line says "no opener exists in this tree", and for `.PNG` that
-    /// sentence has stopped being true. Kept as its own variant rather than folded into
-    /// [`Act::Launch`] because the two are genuinely different findings — `Launch` reaches the ELF
-    /// loader and the scheduler and mints a JOB, `View` reaches a decoder and mints a WINDOW, and
-    /// only one of them is bounded by [`MAX_JOBS`].
-    #[cfg(feature = "facet")]
-    View(String),
+    /// FILETYPE (B307): open `path` (of type `mime`) with opener `opener` — performed outside the
+    /// lock by [`openers::open`], the ONE dispatch. Replaces the per-extension variants (`Launch`,
+    /// `Text`, `Play`, `View`) the deleted if-chain produced.
+    Open { opener: String, path: String, mime: String },
+    /// A double-click on something nothing opens: its type has opener `none`, or its opener is not
+    /// compiled into this build (`why` = `" in this build"`). Census, no action.
+    NoOpener { path: String, mime: String, why: &'static str },
 }
 
 struct Model {
@@ -694,96 +685,49 @@ fn dedupe_by_name(rows: &mut Vec<DirEnt>) {
 /// [`launch`] reports whatever it says. A `.ELF` that is not one is refused with the loader's own
 /// words, not with a guess made here.
 fn is_executable(name: &str) -> bool {
-    let n = name.as_bytes();
-    let ends = |ext: &[u8]| n.len() > ext.len() && n[n.len() - ext.len()..].eq_ignore_ascii_case(ext);
-    ends(b".elf") || ends(b".bin")
+    // FILETYPE (B307): the PAINT hint only (the row glyph, read per frame, so no sniff), and it asks
+    // the one extension table rather than carrying a chain of its own. Routing is by type.
+    use crate::fs::filetype as ft;
+    matches!(ft::by_extension(name), Some(ft::UNAOS_ELF) | Some(ft::UNAOS_BIN))
 }
 
-/// QUARRYOPEN — the extension, uppercased, with its dot. `""` when the name carries none.
-///
-/// A leading dot is NOT an extension (`.PROFILE` is a name, not a type), which is why the match
-/// demands a non-zero index as well as a non-empty tail.
-fn ext_of(name: &str) -> String {
-    match name.rfind('.') {
-        Some(i) if i > 0 && i + 1 < name.len() => {
-            let mut s = String::from(".");
-            s.push_str(&name[i + 1..].to_ascii_uppercase());
-            s
-        }
-        _ => String::new(),
-    }
-}
-
-/// QUARRYOPEN — **what kind of thing this name is**, as one wire token: `png` · `elf` · `bin` ·
-/// `text` · `unknown`.
-///
-/// This is a LABEL for the witness and nothing else — no routing decision is taken from it
-/// ([`open_handler`] takes those, and the two are proven to agree by [`open_selftest`]'s leg 1). It
-/// exists because flight 11's press line said `kind=file` for a program, for a screenshot and for a
-/// config file alike, so the wire could not tell an operator staring at `-> select` whether the row
-/// they pressed was openable at all.
-///
-/// `bin` is its own token rather than folded into `elf`: `is_executable` admits both and the loader
-/// treats them as genuinely different shapes (a validated ELF64 against a flat blob bounded to one
-/// code page), so a witness that called a `.BIN` an ELF would be wrong about the thing it names.
-/// PLAYWAV (R75): is this a `.WAV` name. Pure.
-fn is_wav_name(name: &str) -> bool {
-    let n = name.as_bytes();
-    n.len() > 4 && n[n.len() - 4..].eq_ignore_ascii_case(b".wav")
-}
-
-fn open_kind(name: &str) -> &'static str {
-    let n = name.as_bytes();
-    let ends = |ext: &[u8]| n.len() > ext.len() && n[n.len() - ext.len()..].eq_ignore_ascii_case(ext);
-    if ends(b".elf") {
-        "elf"
-    } else if ends(b".bin") {
-        "bin"
-    } else if ends(b".png") {
-        "png"
-    } else if ends(b".wav") {
-        "wav"
-    } else if ends(b".txt") || ends(b".md") || ends(b".log") || ends(b".sha") || ends(b".cfg") || ends(b".ini") {
-        "text"
-    } else {
-        "unknown"
+/// FILETYPE (B307) — **what kind of thing this type is**, as the short wire token the QUARRYOPEN
+/// witness has always printed (`elf` · `bin` · `png` · `wav` · `text` · `unknown`). A LABEL derived
+/// from the type, never a routing input. Pure.
+fn kind_token(mime: &str) -> &'static str {
+    use crate::fs::filetype as ft;
+    match mime {
+        ft::UNAOS_ELF => "elf",
+        ft::UNAOS_BIN => "bin",
+        ft::LINUX_ELF => "linux",
+        ft::IMAGE_PNG => "png",
+        ft::AUDIO_WAV => "wav",
+        m if m.starts_with("text/") => "text",
+        _ => "unknown",
     }
 }
 
-/// QUARRYOPEN — **who would open this name**, as one wire token: `launch` · `facet` · `none`.
-///
-/// THE SAME TESTS [`Model::activate_row`] TAKES, IN THE SAME ORDER, including the `facet` `cfg`: a
-/// build without the image viewer has no handler for a `.PNG` and this function must say so, or the
-/// wire would promise an opener the image cannot reach. That agreement is not left to a reader —
-/// [`open_selftest`]'s leg 1 drives every name through BOTH this function and `activate_row` and
-/// fails if the token and the `Act` ever disagree.
-fn open_handler(name: &str) -> &'static str {
-    if is_executable(name) {
-        return "launch";
-    }
-    #[cfg(feature = "facet")]
-    if crate::video::facet::is_png_name(name) {
-        return "facet";
-    }
-    if is_wav_name(name) {
-        return "play";
-    }
-    if crate::video::fileview::is_text_name(name) {
-        return "fileview";
-    }
-    "none"
+/// FILETYPE (B307) — the TYPE and OPENER for `path`: `filetype::type_of` then `assoc::opener_for`, the
+/// same two calls [`Model::activate_row`] makes, so the label, the handler and the act cannot drift.
+fn route(mt: &crate::fs::vfs::MountTable, path: &str) -> (String, String) {
+    let (mime, _) = crate::fs::filetype::type_of_in(mt, path);
+    let (opener, _) = crate::fs::assoc::opener_for_in(mt, path, &mime);
+    (mime, opener)
 }
 
-/// QUARRYOPEN — the sentence a press on an UNOPENABLE row owes the wire.
-///
-/// `no handler for .TXT`, or the dotless form for a name that has no extension to blame.
-fn no_handler_reason(name: &str) -> String {
-    let e = ext_of(name);
-    if e.is_empty() {
-        alloc::format!("no handler for {} — it carries no extension", name)
-    } else {
-        alloc::format!("no handler for {}", e)
-    }
+/// QUARRYOPEN — the kind token for `path`, derived from its type (the witness's leg-1 label).
+#[cfg(feature = "witness")]
+fn open_kind(path: &str) -> &'static str {
+    kind_token(&route(&crate::shell::vfs_mount_table(), path).0)
+}
+
+/// QUARRYOPEN — **who would open this path**, as one wire token (`launch` `facet` `play` `textedit`
+/// `fileview` `linux` a program path, or `none`): the same two calls `activate_row` takes, through
+/// [`openers::effective`]. [`open_selftest`]'s leg 1 drives every name through BOTH and fails on any
+/// disagreement; `tests filetype` asks this function too.
+pub fn open_handler_path(path: &str) -> String {
+    let (_, opener) = route(&crate::shell::vfs_mount_table(), path);
+    openers::effective(&opener, path)
 }
 
 /// QUARRYOPEN — **the outcome tail for an ACTIVATION**, shared by the pointer's witness
@@ -797,19 +741,12 @@ fn no_handler_reason(name: &str) -> String {
 fn act_tail(act: &Act) -> Option<String> {
     match act {
         Act::None => None,
-        Act::Launch(p) => {
-            Some(alloc::format!("open kind={} handler=launch", open_kind(&leaf(p))))
+        Act::Open { opener, path, mime } => {
+            Some(alloc::format!("open kind={} handler={}", kind_token(mime), openers::effective(opener, path)))
         }
-        #[cfg(feature = "facet")]
-        Act::View(p) => Some(alloc::format!("open kind={} handler=facet", open_kind(&leaf(p)))),
-        // The press SELECTED, because that is all that happened on the glass — and then it says
-        // why nothing else did. Before QUARRYOPEN this case printed `miss`: the second press of a
-        // double-press on a `.TXT` changes no selection, no focus and no cwd, so the model diff
-        // read "nothing", which is exactly the word an operator must not be given for a gesture
-        // the window DID understand and DID refuse.
-        Act::NoOpener(p) => Some(alloc::format!("select ({})", no_handler_reason(&leaf(p)))),
-        Act::Text(p) => Some(alloc::format!("open kind={} handler=fileview", open_kind(&leaf(p)))),
-        Act::Play(p) => Some(alloc::format!("open kind={} handler=play", open_kind(&leaf(p)))),
+        // The press SELECTED, because that is all that happened on the glass — and then it says why
+        // nothing else did, naming the TYPE (FILETYPE): `no opener for application/octet-stream`.
+        Act::NoOpener { mime, why, .. } => Some(alloc::format!("select (no opener for {}{})", mime, why)),
     }
 }
 
@@ -1256,11 +1193,11 @@ impl Model {
     /// **Open list row `i`** — the one decision behind both the double-click and Enter.
     ///
     /// A DIRECTORY is entered, exactly as v1's Enter did (revealing it on the left first, so the two
-    /// panes never disagree). A LAUNCHABLE file becomes an [`Act::Launch`] for the caller to run
+    /// panes never disagree). A LAUNCHABLE file becomes an [`Act::Open`] for the caller to run
     /// outside the lock. Anything else becomes an [`Act::NoOpener`] — honestly, and with a census
     /// line, because "nothing happened" and "nothing CAN happen yet" are different facts and only
-    /// one of them is a bug. There are no openers in this tree: no registry, no association table,
-    /// no viewer. `quarry.md` §7 says what a `.TXT` double-click is waiting on.
+    /// one of them is a bug. FILETYPE (B307): a file opens BY TYPE through `fs::filetype` +
+    /// `fs::assoc` + [`openers`]; the extension table is one fallback leg of the type, not the router.
     fn activate_row(&mut self, i: usize) -> Act {
         let Some(e) = self.list.get(i) else {
             return Act::None;
@@ -1283,28 +1220,15 @@ impl Model {
             self.focus = Pane::List;
             self.status = None;
             Act::None
-        } else if is_executable(&name) {
-            Act::Launch(p)
         } else {
-            // FACET — the OPENER ARM. Asked after `is_executable` and before the census, so the two
-            // routing tests stay disjoint by extension (`.ELF`/`.BIN` spawn, `.PNG` views) and a
-            // file that is neither still reaches the honest "nothing opens this yet" line. It is one
-            // `cfg`-gated arm rather than a registry: an association TABLE is the right shape for
-            // the second opener and the wrong shape for the first, and `quarry.md` §7 already says
-            // what the table needs before it can exist.
-            #[cfg(feature = "facet")]
-            if crate::video::facet::is_png_name(&name) {
-                return Act::View(p);
-            }
-            // PLAYWAV (R75) — `.WAV` plays through the HDA stream.
-            if is_wav_name(&name) {
-                return Act::Play(p);
-            }
-            // FILEVIEW — `.TXT`/`.MD`/`.LOG`/`.SPEC`/no extension open in the read-only text viewer.
-            if crate::video::fileview::is_text_name(&name) {
-                return Act::Text(p);
-            }
-            Act::NoOpener(p)
+            // FILETYPE (B307): OPEN BY TYPE. The type (attribute → sniff → extension table →
+            // unknown), then the opener (the file's `una:preferred` → `/system/types/<type>` →
+            // the builtin table), then ONE act that `openers::open` performs outside the lock. The
+            // per-extension if-chain that stood here is deleted, not kept beside it; a dotless file
+            // is whatever its bytes say.
+            let mt = crate::shell::vfs_mount_table();
+            let (mime, opener) = route(&mt, &p);
+            openers::act(opener, p, mime)
         }
     }
 }
@@ -1620,76 +1544,17 @@ fn launch(path: &str) -> String {
 fn run_act(act: Act) {
     let line = match act {
         Act::None => return,
-        Act::Launch(p) => {
-            // Reap first, then test the ceiling — the two steps that used to open the aarch64
-            // [`launch`] body, hoisted here (rmbp-7 QUARRY) so [`MAX_JOBS`] and [`JOBS`] have an
-            // arch-neutral reader and mean the same thing on both chips. Order and wording are
-            // unchanged, so the aarch64 serial line is byte-for-byte what it was.
-            reap_jobs();
-            if JOBS.lock().len() >= MAX_JOBS {
-                let s = alloc::format!("{} live jobs — kill one first", MAX_JOBS);
-                serial_println!("[quarry] launch REFUSED path={} reason=job-table-full ({})", p, s);
-                s
-            } else {
-                let r = launch(&p);
-                reap_jobs();
-                r
-            }
-        }
-        // FILEVIEW — latched like FACET's View, for the same stack-depth reason (click-router depth).
-        Act::Text(p) => {
-            // TEXTEDIT (R75) — a file the user owns opens the EDITOR, any other the read-only viewer.
-            if crate::video::textedit::may_edit(&p) {
-                crate::video::textedit::request_open(&p);
-                serial_println!("[quarry] open TEXT path={} -> textedit (latched for the render pass)", p);
-            } else {
-                crate::video::fileview::request_open(&p);
-                serial_println!("[quarry] open TEXT path={} -> fileview (latched for the render pass)", p);
-            }
-            alloc::format!("opening {}", leaf(&p))
-        }
-        Act::Play(p) => {
-            #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
-            { crate::drivers::hda::play::request_open(&p); serial_println!("[quarry] open PLAY path={} -> play (latched for the service tick)", p); }
-            #[cfg(not(all(target_arch = "x86_64", feature = "hda-tone")))]
-            serial_println!("[quarry] open PLAY path={} -> no audio in this build (UNAOS_HDA+UNAOS_HDATONE arm it)", p);
-            alloc::format!("playing {}", leaf(&p))
-        }
-        Act::NoOpener(p) => {
-            // The honest census. An operator who double-presses `CONFIG.TXT` and sees nothing must
-            // be able to tell "broken" from "not built yet".
-            //
-            // QUARRYOPEN — **"no opener exists in this tree" STOPPED BEING TRUE** the day FACET
-            // landed (`3c6e406a`), and a census sentence that is false about the tree it censuses is
-            // worse than no sentence. It now names THIS name's kind and THIS build's handler set,
-            // which is also what makes the line agree word-for-word with the `-> select (no handler
-            // for .TXT)` tail the press witness printed one line above it.
+        // FILETYPE (B307): every opener — launch, viewer, editor, player, image viewer, a program —
+        // goes through the ONE dispatch. Latching (facet, fileview, textedit, play) is kept there,
+        // for the click-router stack-depth reason each of those modules states.
+        Act::Open { opener, path, mime } => openers::open(&opener, &path, &mime),
+        Act::NoOpener { path, mime, why } => {
+            // The honest census, naming the TYPE and how to give it an opener.
             serial_println!(
-                "[quarry] open UNHANDLED path={} kind={} handler=none — {} (this build opens: .ELF/.BIN -> launch via spawn_user_image_bg{}; anything else needs the opener registry named in quarry.md 7)",
-                p,
-                open_kind(&leaf(&p)),
-                no_handler_reason(&leaf(&p)),
-                if cfg!(feature = "facet") { ", .PNG -> facet" } else { ", and .PNG only when UNAOS_FACET=1 armed the viewer — this image has none" }
+                "[quarry] open UNHANDLED path={} type={} kind={} handler=none — no opener for {}{} (set one: `assoc {} <opener>`, or per file `setfattr {} una:preferred=<opener>`)",
+                path, mime, kind_token(&mime), mime, why, mime, path
             );
-            alloc::format!("no opener for {}", leaf(&p))
-        }
-        // FACET — LATCHED, not opened, and that is `dock::press_at`'s law rather than caution.
-        //
-        // This function runs at CLICK-ROUTER DEPTH (and at key-router depth), on the input-drain
-        // band's 16 KiB kernel stack — the stack Pi boot 11 overflowed with `quarry::open()` called
-        // from exactly here. `facet::open_inner` is strictly heavier than that overflow was: a chunk
-        // walk through the VFS, a megabyte-scale streaming read, the whole inflate, an allocation
-        // and the window table. So the gesture stores a path and `facet::service()` — chained from
-        // [`service`] below, which the render pass already drains every pass — does the work.
-        //
-        // The status line therefore says OPENING rather than a verdict: `[facet] present` or
-        // `[facet] refuse` is the verdict, it lands on the wire one pass later, and claiming one
-        // here would be a claim this function cannot have.
-        #[cfg(feature = "facet")]
-        Act::View(p) => {
-            crate::video::facet::request_open(&p);
-            serial_println!("[quarry] open VIEW path={} -> facet (latched for the render pass)", p);
-            alloc::format!("opening {}", leaf(&p))
+            alloc::format!("no opener for {}{}", mime, why)
         }
     };
     if let Some(m) = MODEL.lock().as_mut() {
@@ -2653,7 +2518,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
 /// both sides of the one call instead, so the outcome word is a measurement:
 ///
 ///  * `open kind=<png|elf|bin|text|unknown> handler=<facet|launch>` — the press produced deferred
-///    work that leaves this window ([`Act::Launch`], and FACET's [`Act::View`]). The only outcome
+///    work that leaves this window ([`Act::Open`], and FACET's image opener). The only outcome
 ///    that is read from the act rather than from the model, because it is the only one that has not
 ///    happened yet when this runs. QUARRYOPEN replaced the bare word `launch` here: flight 11's
 ///    operator, told only `kind=file -> select`, had no way to learn from the wire that the row
@@ -3408,7 +3273,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         return Err("a list press did not select its row and focus its pane");
     }
     match (content_press(&mut m, px_x, row0_y), clock_live) {
-        (Act::Launch(p), true) => {
+        (Act::Open { opener, path: p, .. }, true) if opener == "launch" => {
             if p != "/apps/VUG.ELF" {
                 return Err("the double-click launched the wrong path");
             }
@@ -3432,7 +3297,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     m.click_ms = 0;
     let _ = content_press(&mut m, px_x, row1_y);
     match (content_press(&mut m, px_x, row1_y), clock_live) {
-        (Act::Text(p), true) => {
+        (Act::Open { opener, path: p, .. }, true) if opener == "textedit" || opener == "fileview" => {
             if p != "/apps/CONFIG.TXT" {
                 return Err("the text double-click named the wrong path");
             }
@@ -3575,7 +3440,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     // must still not eat the stamp.
     let _ = wheel_scroll(&mut m, list_x, list_y, -1);
     match (content_press(&mut m, px_x, row0_y), clock_live) {
-        (Act::Launch(p), true) if p == "/apps/VUG.ELF" => {}
+        (Act::Open { opener, path: p, .. }, true) if opener == "launch" && p == "/apps/VUG.ELF" => {}
         (Act::None, false) => {} // the zero-clock guard, as everywhere else in this battery
         (_, true) => return Err("a scroll between two presses broke the double-click"),
         (_, false) => return Err("a double-click fired on a zero clock"),
@@ -4223,7 +4088,7 @@ pub fn open_selftest() {
     let png_tail = if cfg!(feature = "facet") {
         "open kind=png handler=facet"
     } else {
-        "select (no handler for .PNG)"
+        "select (no opener for image/png in this build)"
     };
     let png_handler = if cfg!(feature = "facet") { "facet" } else { "none" };
     let cases: [(&str, &str, &str, &str); 6] = [
@@ -4231,8 +4096,10 @@ pub fn open_selftest() {
         ("S8W.BIN", "bin", "launch", "open kind=bin handler=launch"),
         ("SCREEN6.PNG", "png", png_handler, png_tail),
         ("CONFIG.TXT", "text", "fileview", "open kind=text handler=fileview"),
-        ("READ_ME", "unknown", "fileview", "open kind=unknown handler=fileview"),
-        ("CONFIG.CAB", "unknown", "none", "select (no handler for .CAB)"),
+        // FILETYPE (B307): a dotless name is NOT text by fiat any more — the sniff decides, and a
+        // name with neither content nor a known extension is `application/octet-stream`.
+        ("READ_ME", "unknown", "none", "select (no opener for application/octet-stream)"),
+        ("CONFIG.CAB", "unknown", "none", "select (no opener for application/octet-stream)"),
     ];
     let mut leg_agree = true;
     for (name, kind, handler, tail) in cases {
@@ -4245,10 +4112,11 @@ pub fn open_selftest() {
         m.list_sel = 0;
         let act = m.activate_row(0);
         let got = act_tail(&act).unwrap_or_else(|| String::from("<not an activation>"));
-        if open_kind(name) != kind || open_handler(name) != handler || got != tail {
+        let full = join(&m.cwd, name);
+        if open_kind(&full) != kind || open_handler_path(&full) != handler || got != tail {
             serial_println!(
                 "[quarry] QUARRYOPEN leg1 MISMATCH name={} kind={}(want {}) handler={}(want {}) tail=\"{}\"(want \"{}\")",
-                name, open_kind(name), kind, open_handler(name), handler, got, tail
+                name, open_kind(&full), kind, open_handler_path(&full), handler, got, tail
             );
             leg_agree = false;
         }
@@ -4307,7 +4175,7 @@ pub fn open_selftest() {
     // ── leg 4: the keyboard says what the pointer says ───────────────────────────────────────────
     // Same `Act`, same `act_tail`, therefore the same sentence — the property that keeps an Enter
     // and a double-press from describing one decision two ways on one capture.
-    let enter_tail = act_tail(&Act::Launch(String::from("/apps/VUG.ELF")))
+    let enter_tail = act_tail(&Act::Open { opener: String::from("launch"), path: String::from("/apps/VUG.ELF"), mime: String::from(crate::fs::filetype::UNAOS_ELF) })
         .unwrap_or_else(|| String::from("<none>"));
     let leg_parity = enter_tail == "open kind=elf handler=launch";
 
@@ -4350,13 +4218,13 @@ pub fn fileopen_selftest() {
     let mut root_v = false;
     let mut home_e = false;
     if staged[0] {
-        run_act(Act::Text(root.clone()));
+        run_act(Act::Open { opener: String::from("textedit"), path: root.clone(), mime: String::from(crate::fs::filetype::TEXT_PLAIN) });
         service();
         root_v = crate::video::fileview::is_open() && crate::video::fileview::shown() == root && !crate::video::textedit::is_open();
         if root_v { windows += 1; }
     }
     if staged[1] {
-        run_act(Act::Text(home.clone()));
+        run_act(Act::Open { opener: String::from("textedit"), path: home.clone(), mime: String::from(crate::fs::filetype::TEXT_PLAIN) });
         service();
         home_e = crate::video::textedit::is_open() && crate::video::textedit::may_edit(&home);
         if home_e { windows += 1; }
@@ -4375,3 +4243,8 @@ pub fn fileopen_selftest() {
         if ok { "PASS" } else { "FAIL" }
     );
 }
+
+// FILETYPE M3 (B307): the ONE opener dispatch — a child module so it reaches `launch`, `JOBS` and
+// `Act` without widening them. CHARTER in its header.
+#[path = "openers.rs"]
+pub mod openers;

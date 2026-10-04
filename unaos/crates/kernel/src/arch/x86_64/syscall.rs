@@ -29959,7 +29959,6 @@ pub fn vein_owned(verb: u8) -> bool {
 pub fn vein_selftest() {
     busx_sem_init_once();
     crate::vein_bus::selftest(&BUSREG_FX);
-=======
 /// NETRING3 M1 (B306): `SYS_GETRANDOM(buf, len) -> count / -errno` — at most `GETRANDOM_MAX` bytes from
 /// the kernel DRBG (`crate::netring3::getrandom`); the kernel copy is zeroed before return.
 #[cfg(feature = "netring3")]
@@ -30071,4 +30070,19 @@ pub fn ring3win_selftest() {
         ":: RING3WIN: model=elf window={} big_ok={} sbrk={} freed={} -> {} ::",
         user_image_cap(), big_ok as u8, heap, freed as u8, if big_ok && freed { "PASS" } else { "FAIL" }
     );
+=======
+/// FILETYPE (B307) — the KERNEL hands a ring-3 program one unsolicited `BUS_VERB_NOTICE` frame in its
+/// mailbox (`row` = the slot `spawn_user_image_bg` returned), body = the bytes given (Quarry's program
+/// opener: the path of the file to open, because there is no `SYS_EXEC` with an argv — `quarry.md` §7
+/// item 8). The SAME enqueue a fulfilled verb's reply takes (`busx_reply_enqueue`, generation-stamped,
+/// semaphore posted), corr 0, status 0. Returns 0, or the errno (`EINVAL` row out of range or body over
+/// the ceiling, `EAGAIN` mailbox full). A program that never calls `SYS_MRECV` simply never reads it.
+pub fn bus_notice_to(row: usize, body: &[u8]) -> i64 {
+    if row >= BUSX_MBOX.len() || body.len() > crate::bus::BUS_BODY_MAX {
+        return EINVAL;
+    }
+    if !busx_mbox_has_room(row) {
+        return EAGAIN;
+    }
+    busx_reply_enqueue(row, 0, crate::bus::BUS_VERB_NOTICE, 0, body)
 }

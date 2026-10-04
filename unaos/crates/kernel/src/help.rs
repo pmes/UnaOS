@@ -64,6 +64,8 @@ pub static DOCS: &[VerbDoc] = &[
     d("setfattr", "files", "set a typed attribute (value typed by shape: 42, 1.5, \"text\", b64:.., [f,f]) or drop one", "setfattr <path> <key>=<value> | setfattr -x <key> <path>", &["setfattr NOTES.TXT kind=\"note\"", "setfattr A.JPG emb=[0.1,0.9,0.2]", "setfattr -x kind NOTES.TXT"]),
     d("getfattr", "files", "print one typed attribute, or all of them, as `key: type value`", "getfattr <path> [<key>]", &["getfattr NOTES.TXT", "getfattr NOTES.TXT kind"]),
     d("query", "files", "find every readable object whose attributes match; prints `id path`", "query <expr>", &["query kind == \"note\"", "query size > 100", "query similarity(emb, [0.1,0.9,0.2]) > 0.8"]),
+    d("file", "files", "the file's type (a MIME string) and which leg decided it: attribute, sniffed, extension or unknown; -s stamps una:type", "file [-s] <path>...", &["file NOTES.TXT", "file -s SHOT1.PNG"]),
+    d("assoc", "files", "the type database: every type's opener, icon and name, and the source (db or builtin); set a type's opener", "assoc [<mime> [<opener>]]", &["assoc", "assoc text/plain", "assoc text/plain fileview"]),
     d("snap", "files", "snapshots of the native volume: list, create, drop, browse", "snap list | create <name> | drop <gen> | ls <gen> [path] | cat <gen> <path>", &["snap list", "snap create before-edit", "snap cat 3 NOTES.TXT"]),
     d("trash", "files", "move a file to the trash, list, restore or empty it", "trash <path> | trash list | trash restore <name> | trash empty", &["trash OLD.TXT", "trash list", "trash restore OLD.TXT"]),
     d("dd", "files", "raw 512-byte block: read one (`if=`) or patch one byte (`of=` `byte=`)", "dd if=<lba> | dd of=<lba> byte=<0xNN>", &["dd if=0", "dd of=2048 byte=0xAA"]),

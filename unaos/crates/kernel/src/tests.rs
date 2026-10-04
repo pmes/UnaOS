@@ -132,6 +132,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); // LUMENBIN: `tests lumen`
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_netring3();
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
