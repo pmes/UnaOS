@@ -734,6 +734,8 @@ fn main() {
     if std::env::var("UNAOS_LINUXABI").is_ok() { feats.push("linuxabi"); }
     // BANDY3: UNAOS_BUSREG=1 arms fulfiller registration on the bus wire. Kept in sync with arroyo.
     if std::env::var("UNAOS_BUSREG").is_ok() { feats.push("busreg"); }
+    // VEINCORE (B304): UNAOS_VEIN=1 arms the chat verbs' kernel relay plumbing (`vein` verb, `tests vein`); implies busreg. Kept in sync with arroyo.
+    if std::env::var("UNAOS_VEIN").is_ok() { feats.push("vein"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words
     // breadcrumbs along the focus-raise/composite chain (x86: bare 16550 at 0x3F8, no lock). Media
     // builds come from THIS list, not arroyo's (the s42/INSTGUI lesson), so the knob is mapped here
@@ -975,6 +977,16 @@ fn main() {
         println!("   PREFS: target/PREFS-X86.ELF absent — ESP has no PREFS.BIN (run via ./arroyo esp-x86)");
     }
 
+    // VEINCORE (B304): the chat fulfiller (crates/user-vein → target/VEIN-X86.ELF by arroyo's
+    // build_user_vein_x86), staged as APPS/VEIN.BIN — `bg /apps/VEIN.BIN` registers the chat verbs 130..=133.
+    let vein_elf = target_dir.join("VEIN-X86.ELF");
+    if vein_elf.exists() {
+        std::fs::copy(&vein_elf, esp_apps.join("VEIN.BIN")).unwrap();
+        println!("   VEIN: copied VEIN.BIN into APPS/ on the ESP (bg /apps/VEIN.BIN)");
+    } else {
+        println!("   VEIN: target/VEIN-X86.ELF absent — ESP has no VEIN.BIN (run via ./arroyo esp-x86)");
+    }
+
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
     //
@@ -1034,6 +1046,8 @@ fn main() {
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
         // BANDY3 M3: the prefs fulfiller rides the DATA volume too — `bg /apps/PREFS.BIN` reads it there.
         (target_dir.join("PREFS-X86.ELF"), "PREFS.BIN"),
+        // VEINCORE (B304): the chat fulfiller rides the DATA volume too.
+        (target_dir.join("VEIN-X86.ELF"), "VEIN.BIN"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();

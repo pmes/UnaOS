@@ -98,7 +98,7 @@ impl<'b> Chunker<'b> {
 }
 
 /// The per-frame text size VEIN.BIN uses (small: its whole program lives in a 16 KiB window).
-pub const METAL_CHUNK: usize = 256;
+pub const METAL_CHUNK: usize = 128;
 
 /// Echo: `echo: ` + the prompt reversed by characters, streamed in `chunk`-sized frames.
 pub struct Echo<'b> {
