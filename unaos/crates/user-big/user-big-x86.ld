@@ -28,6 +28,9 @@ SECTIONS
     .rodata : {
         *(.rodata .rodata.*)
     }
+    /* EXECNAME (B322, R82): the launch declaration (una_abi::AppNote), KEPT ahead of the DISCARD rule below
+       (the first matching rule wins); lld gives an allocated SHT_NOTE output section its own PT_NOTE. */
+    .note.unaos.app : { KEEP(*(.note.unaos.app)) }
 
     . = ALIGN(0x1000);
     .data : {

@@ -6608,7 +6608,7 @@ fn cyc_to_us(dt: u64) -> u64 {
 fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
-    };
+    }; run_image(console, path, bytes) } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] fn run_image(console: &mut Console, path: &str, bytes: alloc::vec::Vec<u8>) { // EXECNAME (B322) — ⚠ SAME-LINE fold, line-NEUTRAL: `run` is split at its read so the bare-name launch (bare_exec, a foreground program) runs the bytes it already read through this SAME body; `run <path>` is unchanged.
     // Hand the bytes to the kernel loader: map into a fresh user slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
@@ -7362,7 +7362,7 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // The ELF64 / little-endian / e_machine pre-checks already ran inside `read_el0_image` (the
     // arch's own twin, so EM_X86_64 there and EM_AARCH64 here), which named any of them; the kernel
     // loader re-validates from scratch regardless.
-    let n = bytes.len();
+    if !exec_detaches(&bytes, &canon, typed) { run_image(console, &canon, bytes); return true; } let n = bytes.len(); // EXECNAME (B322, R82) — ⚠ SAME-LINE fold, line-NEUTRAL: the program decides — a window or a resident server detaches below (the `bg` body), anything else runs in the foreground through `run`'s own body.
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
         Ok((pid, slot, entry)) => { crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), &canon); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The bare-name launch names its windows exactly as `bg_program` does and is armed first for the same reason. `canon` is the spelling the operator's typed name resolved to, which is the spelling they expect to read back in the title bar.
             if !adopt_bg_job(pid, slot, &canon) {
@@ -8934,4 +8934,22 @@ fn query_cmd(console: &mut Console, args: &[&str]) {
         }
         Err(e) => vfs_say(console, &alloc::format!("query: {}", crate::fs::attrsys::refusal(&e))),
     }
+}
+
+/// EXECNAME (rmbp-ledger B322, R82): does a bare-name launch of `bytes` DETACH (the `bg` body) or run in
+/// the FOREGROUND (the `run` body)? The program says, in its `.note.unaos.app` note
+/// (`una_abi::AppNote`, emitted by its own link); `midden_core::launch_mode` applies the rule — a window
+/// or a resident server detaches, anything else (and an image with no note) runs in the foreground.
+/// x86 asks its loader's door (`elf::app_flags`, which refuses a foreign `e_machine`); aarch64 asks the
+/// shared core directly (that arch's loader lives inside its syscall module). One serial line either way.
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
+fn exec_detaches(bytes: &[u8], canon: &str, typed: &str) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let flags = crate::arch::elf::app_flags(bytes);
+    #[cfg(not(target_arch = "x86_64"))]
+    let flags = midden_core::app_note_flags(bytes).unwrap_or(0);
+    let detach = midden_core::launch_mode(flags) == midden_core::LaunchMode::Detach;
+    serial_println!(":: BAREXEC: {} (typed '{}') — note flags={} -> {} ::", canon, typed, flags,
+        if detach { "detach" } else { "foreground" });
+    detach
 }

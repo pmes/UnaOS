@@ -380,3 +380,9 @@ pub extern "C" fn _start() -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     exit(3)
 }
+
+/// EXECNAME (B322, R82): this program's launch declaration — a console program (no SYS_WIN_CREATE): a bare `net` runs in the foreground like `run`.
+/// Kept by the x86 link script under a PT_NOTE header; read by `midden_core::app_note_flags`.
+#[used]
+#[link_section = ".note.unaos.app"]
+static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(0);
