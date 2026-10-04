@@ -275,6 +275,10 @@ nvidia-kepler-kfunwedge = ["nvidia-kepler", "nvidia-kepler-fifo"]
 # builder/src/main.rs and scripts/banner-cert.sh; `x86-all` names the feature, which is what puts
 # the knob under `./arroyo check`'s KNOB→BUILDER WIRING CHECK.
 nvidia-kepler-vblank = ["nvidia-kepler", "beam"]
+# KVBLANK8 (rmbp-ledger B318): UNAOS_KVBLANK_TRACE=1 prints the whole vblank interrupt path at rung 3's arm, 100 ms
+# after the first ISR and at 2 s, plus a 1 s 60 Hz census and `:: KVBLANK8: lost_at=… ::`. The trace only; the
+# KVBLANK8 fix and `tests kvblank8` are unconditional under nvidia-kepler-vblank. OFF => the trace task is not compiled.
+kvblank_trace = ["nvidia-kepler-vblank"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/desktop_uefi.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in

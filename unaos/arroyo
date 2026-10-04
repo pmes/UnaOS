@@ -1167,6 +1167,8 @@ fi
 # Kept in sync with crates/kernel/Cargo.toml AND builder/src/main.rs (the four-place trap); the map
 # line is parser-conformant so the KNOB→BUILDER WIRING CHECK covers it.
 [ -n "${UNAOS_KEPLER_VBLANK:-}" ] && _feats="${_feats}nvidia-kepler-vblank,"
+# KVBLANK8 (B318): UNAOS_KVBLANK_TRACE=1 prints the vblank interrupt path at takeover (implies nvidia-kepler-vblank). x86-only. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_KVBLANK_TRACE:-}" ] && _feats="${_feats}kvblank_trace,"
 # R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
 # (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
 # measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is

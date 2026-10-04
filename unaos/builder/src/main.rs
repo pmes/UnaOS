@@ -699,6 +699,8 @@ fn main() {
     // WIRING CHECK goes red if this line is dropped. DEFAULT OFF => the module, all four call sites
     // and every `:: kepler: vblank ` string unlinked => byte-identical media.
     if std::env::var("UNAOS_KEPLER_VBLANK").is_ok() { feats.push("nvidia-kepler-vblank"); }
+    // KVBLANK8 (B318): UNAOS_KVBLANK_TRACE=1 prints the vblank interrupt path at takeover. Kept in sync with arroyo.
+    if std::env::var("UNAOS_KVBLANK_TRACE").is_ok() { feats.push("kvblank_trace"); }
     // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
     // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
     // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,

@@ -496,3 +496,20 @@ pub fn send_nmi_bounded(dest: u32) -> bool {
         true
     }
 }
+
+/// KVBLANK8 (rmbp-ledger B318) — the local APIC's view of ONE vector on THIS cpu: `(in_service,
+/// requested, tpr, ppr)`. ISR bit `v` lives in ISR register `v / 32` at bit `v % 32` (xAPIC MMIO
+/// `0x100 + 0x10 * i`, x2APIC MSR `0x810 + i`), IRR likewise at `0x200` / `0x820`; TPR `0x080` /
+/// `0x808`, PPR `0x0A0` / `0x80A` (Intel SDM Vol. 3, "Local APIC Register Address Map" and the x2APIC
+/// MSR table). Read-only. A vector held in IRR forever, or left in ISR after the handler's EOI, is the
+/// "fires once" shape the KVBLANK8 instrument tests for. File tail, so nothing above moves.
+pub fn vector_state(v: u8) -> (bool, bool, u32, u32) {
+    let (i, b) = ((v / 32) as usize, (v % 32) as u32);
+    unsafe {
+        let isr = lapic_read(0x100 + 0x10 * i, 0x810 + i as u32);
+        let irr = lapic_read(0x200 + 0x10 * i, 0x820 + i as u32);
+        let tpr = lapic_read(0x080, 0x808);
+        let ppr = lapic_read(0x0A0, 0x80A);
+        (isr & (1 << b) != 0, irr & (1 << b) != 0, tpr, ppr)
+    }
+}
