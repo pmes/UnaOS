@@ -9,3 +9,8 @@ description = "Principia's preference core: the value model, the namespaced tree
 # `#![forbid(unsafe_code)]`, and NO dependencies — the midden_core shape: a member of the ROOT host
 # workspace (Principia links it) and a path dep of the kernel.
 [dependencies]
+
+# PRINCIPIA2 (SR32): a TEST-ONLY dependency — `tests/wire_abi.rs` pins `wire::VERB_*` / `BODY_MAX` to the
+# one ABI crate (zero deps, const-only). The library itself still depends on nothing.
+[dev-dependencies]
+una-abi = { path = "../../../crates/una-abi" }

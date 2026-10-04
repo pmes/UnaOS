@@ -132,6 +132,11 @@ impl PrefStore {
         self.namespaces.keys().cloned().collect()
     }
 
+    /// Would setting `key` in `ns` collide with an existing dotted path?
+    pub fn is_collision(&self, ns: &str, key: &str) -> bool {
+        self.namespaces.get(ns).is_some_and(|n| colliding_key(n, key).is_some())
+    }
+
     /// The value IN FORCE for `ns`/`key`: the stored one, else the schema's
     /// default, else the schema's derived default ([`prefs_core::rules::Rule`],
     /// e.g. R81's embedder). `env` answers environment variables (the process

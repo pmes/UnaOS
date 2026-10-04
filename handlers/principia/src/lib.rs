@@ -46,6 +46,7 @@
 //!   store is the mechanism, the levels are not yet defined.
 
 pub mod prefs;
+pub mod wire;
 
 use std::fs;
 use std::path::{Path, PathBuf};

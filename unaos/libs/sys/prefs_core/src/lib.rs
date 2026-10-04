@@ -41,6 +41,7 @@ extern crate std;
 
 pub mod rules;
 pub mod schema;
+pub mod wire;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
