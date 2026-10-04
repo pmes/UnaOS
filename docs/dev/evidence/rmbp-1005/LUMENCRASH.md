@@ -39,6 +39,11 @@ Not the stack, not a syscall shape, not a segment op: the kernel's RSP (fixed mo
 BIG.ELF) is inside a mapped page in both models, and the soft-float target means a 16-vs-8 misalignment cannot
 fault.
 
+Why only the FIXED model fails silently: there the program links at 0, so the discarded GOT's address 0 is in
+range of every RIP-relative load and lands on `_start`. In the ELF-window model (linked at 0x10000200000) the same
+reference cannot reach VA 0 and lld refuses the link (`relocation R_X86_64_GOTPCREL out of range … references
+'BRK_CUR'` — measured by adding one `#[no_mangle]` static to a scratch copy of user-big).
+
 **In this tree** the instruction is gone: LUMENAPP's LUMEN.ELF has no exported static (its +0x3f is a `callq`
 to `Line::wire`), and no other x86 user crate has one. The cause is latent, not fixed: the next `#[no_mangle]`
 static, or an `extern` static from a library, in ANY x86 user program crashes the same way at its first touch.
@@ -54,7 +59,8 @@ kernel spawn change: both models hand a correct RSP.
 * **M2** FIX — `x86_64-unknown-none.json` gains `"relax-elf-relocations": true`: LLVM emits `REX_GOTPCRELX`,
   lld (static, non-PIE, every symbol non-preemptible) rewrites each GOT load into a direct `leaq sym(%rip)`,
   so no GOT exists to discard. Proven on the flown source: the same +0x34 becomes
-  `leaq 0x1fc5(%rip), %r13  # 0x2000 <WIT>`. One file fixes every x86 user crate (lumen, prefs, net, big, vug,
+  `leaq 0x1fc5(%rip), %r13  # 0x2000 <WIT>`; and the scratch user-big with a `#[no_mangle]` static, refused by
+  lld before, links and passes M4. One file fixes every x86 user crate (lumen, prefs, net, big, vug,
   pulse, stat, hello).
 * **M3** WITNESS — `tests lumen` gains a SPAWN step: it spawns the real LUMEN.ELF through
   `spawn_user_image_bg` (what `bg` and the bare-name launch call), waits ≤ 2 s for the program's first wire line
