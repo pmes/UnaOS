@@ -266,6 +266,7 @@ cat <<'TABLE'
 witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|!baremetal,!bootlog,!usbdebug@except:x86_64+wc,!tegra|measured(1)
 wc|[wc-x] desktop-app DECLINE reason=no-storage name=/|-|measured(1)
 linuxabi|:: LINUXABI: path=|-|measured(1)
+busreg|:: BANDY3: registered=|-|measured
 wcg-paygo|[wc-g] paygo win=|witness|measured
 wcdvalve|[wc-d] valve CLOSED util~|witness|measured
 logts|:: LOGWIT-1 probe seq=|witness|measured
@@ -339,6 +340,7 @@ pirast|:: RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::|
 desktop_firmware|[deskfw] activate DECLINE reason=no-panel|@arch:aarch64|measured(1)
 quarry|[quarry] DECLINE reason=dock-cannot-host-full-strip panel=|-|measured(1)
 wedge2|-|no gated string literal anywhere under cfg(feature="wedge2") — the knob only re-times an existing path; certify it from its serial witness, not from the artifact|unmeasured-here
+selfhost|:: SELFHOST:|-|measured
 TABLE
 }
 

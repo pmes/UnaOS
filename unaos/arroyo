@@ -3702,7 +3702,7 @@ build_user_pulse_x86() {
 # as APPS/PREFS.BIN by the builder. The exact shape of build_user_pulse_x86 above (same linker-script SHAPE, same
 # four assertions, same explicit --target). PREFS.BIN registers Principia's PrefGet/PrefList bus verbs and
 # answers the requests the kernel relays to it (UNAOS_BUSREG=1; knob off it prints its refusal and exits).
-build_user_pulse_x86() {
+build_user_prefs_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 Principia prefs fulfiller static-ELF program (crates/user-prefs → target/PREFS-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
