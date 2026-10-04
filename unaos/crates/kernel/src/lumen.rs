@@ -129,7 +129,7 @@ pub fn selftest() {
         why("not-the-elf-model");
         return verdict(window, "FAIL");
     }
-    if note.map_or(true, |f| f & una_abi::APP_NOTE_WINDOWED == 0) {
+    if note.map_or(true, |f| f & una_abi::APP_FLAG_WINDOWED == 0) {
         why("no-windowed-app-note");
         return verdict(window, "FAIL");
     }

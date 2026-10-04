@@ -14,13 +14,12 @@
 //! `:: EXECNAME: SKIP (<reason>) ::` when no program source is mounted.
 //!
 //! PASS = every name resolves to `/apps/<NAME>.ELF` and every declaration matches the table below
-//! (LUMEN windowed, PREFS resident, NET and BIG console with a note present; VEIN unchecked — LUMENAPP
-//! retires it this wave, and at that fold its row leaves this table and the line reads 4/4).
+//! (LUMEN windowed, PREFS resident, NET and BIG console with a note present). VEIN left this table at the
+//! merge11 fold: LUMENAPP (B323, R82) retired the chat daemon, so the line reads 4/4.
 
 /// (bare name, expected flags — `None` = not checked).
 const STAGED: &[(&str, Option<u32>)] = &[
     ("prefs", Some(una_abi::APP_FLAG_RESIDENT)),
-    ("vein", None),
     ("lumen", Some(una_abi::APP_FLAG_WINDOWED)),
     ("net", Some(0)),
     ("big", Some(0)),

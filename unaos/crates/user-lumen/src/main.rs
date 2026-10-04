@@ -40,19 +40,6 @@ use vein_core::prefs::{KeyState, Plan};
 use vein_core::Role;
 use vein_ring3::sys::{now_ms, sleep_ms, sys, write};
 
-/// The app note the loader and the shell read (EXECNAME): name "UnaOS", type 1, desc = flags, bit0 =
-/// windowed (a bare-word launch detaches it).
-#[repr(C, align(4))]
-struct AppNote {
-    namesz: u32,
-    descsz: u32,
-    ntype: u32,
-    name: [u8; 8],
-    flags: u32,
-}
-#[used]
-#[link_section = ".note.unaos.app"]
-static APP_NOTE: AppNote = AppNote { namesz: 6, descsz: 4, ntype: 1, name: *b"UnaOS\0\0\0", flags: una_abi::APP_NOTE_WINDOWED };
 
 const ACTION_CLEAR_VIEW: u64 = 41;
 const ACTION_CURSOR_LEFT: u64 = 13;

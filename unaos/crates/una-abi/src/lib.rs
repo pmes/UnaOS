@@ -1197,7 +1197,3 @@ impl AppNote {
     }
 }
 const _: () = assert!(core::mem::size_of::<AppNote>() == 24);
-// LUMENAPP (B323) — the `.note.unaos.app` flags word a windowed program carries (EXECNAME B322 owns the
-// note: name "UnaOS", type 1, desc = flags). Bit0 = windowed (a bare-word launch detaches it). Appended
-// at the file tail; the fold reconciles a duplicate from EXECNAME.
-pub const APP_NOTE_WINDOWED: u32 = 1;

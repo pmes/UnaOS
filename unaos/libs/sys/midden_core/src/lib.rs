@@ -1238,9 +1238,9 @@ mod execname_tests {
 
     #[test]
     fn the_staged_elf_names_resolve_by_bare_name_and_bin_never_did() {
-        let staged = ["PREFS.ELF", "VEIN.ELF", "LUMEN.ELF", "NET.ELF", "BIG.ELF"];
+        let staged = ["PREFS.ELF", "LUMEN.ELF", "NET.ELF", "BIG.ELF"];
         let mut v = NameList(&staged);
-        for (w, want) in [("prefs", "PREFS.ELF"), ("vein", "VEIN.ELF"), ("lumen", "LUMEN.ELF"), ("net", "NET.ELF"), ("big", "BIG.ELF")] {
+        for (w, want) in [("prefs", "PREFS.ELF"), ("lumen", "LUMEN.ELF"), ("net", "NET.ELF"), ("big", "BIG.ELF")] {
             assert_eq!(resolve_exec(w, &mut v).as_deref(), Some(want), "{w}");
         }
         // B322: the old staging name was unreachable by bare name — the reason the `lumen` arm existed.

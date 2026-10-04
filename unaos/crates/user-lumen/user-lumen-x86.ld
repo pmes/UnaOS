@@ -40,10 +40,6 @@ SECTIONS
     .rodata : {
         *(.rodata .rodata.*)
     }
-    .note.unaos.app : ALIGN(4) {
-        KEEP(*(.note.unaos.app))
-    }
-
     . = ALIGN(0x1000);
     .data : {
         *(.data .data.*)
