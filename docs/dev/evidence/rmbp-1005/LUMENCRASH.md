@@ -82,3 +82,15 @@ kernel spawn change: both models hand a correct RSP.
 aarch64 images link `relocation-model: static` (`aarch64-base.json`) and reach statics with `adrp`, so the GOT
 class does not arise there today; the M4 gate is x86-only. The `/DISCARD/ *(.got)` lines stay (with M2 there is
 no GOT to discard and M4 refuses an image if one ever comes back).
+
+## Results (no QEMU, R78)
+
+* M4 on the flown image (776ffbe7 source, stripped, 12672 B): `refused got-at-0 at entry+0x34 — movq -0x3b(%rip),
+  %r13 # 0x0` plus the four other `WIT` sites → `-> FAIL`; the same source with M2's target → `-> PASS`.
+* Every x86 image this tree stages, built by its arroyo function with M2 + M4: STAT, VUG, VUGC, VUGX, VUGK, PULSE,
+  LUMEN (elf model, 127704 B), NET, PREFS, BIG — all `:: ELFENTRY: … -> PASS ::`.
+* Compile legs: x86 metal shape (…,lumen,netring3,prefs_reset,census,installdemo,instgui,witness) exit 0;
+  aarch64 `login,loginst,virt_el0,lumen` exit 0.
+* The metal wire for `tests lumen`: `:: LUMENAPP: image=/apps/LUMEN.ELF window=elf … -> PASS ::`, the program's
+  own `:: LUMEN: start provider=… ::`, `[lumencrash] pid=… slot=… entry=0x10000200000 wait_ms=2000 kill=…`,
+  `:: LUMENCRASH: spawned=1 first_line=ok -> PASS ::`.
