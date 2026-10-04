@@ -3363,11 +3363,14 @@ version = "0.1.0"
 dependencies = [
  "bandy",
  "chrono",
+ "futures-core",
+ "futures-util",
  "log",
  "octocrab",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -8179,6 +8182,7 @@ dependencies = [
  "gneiss_pal",
  "log",
  "matrix",
+ "principia",
  "quartzite",
  "quote",
  "rand 0.10.2",
