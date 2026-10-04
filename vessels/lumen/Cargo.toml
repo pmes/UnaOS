@@ -11,6 +11,7 @@ license = "GPL-3.0-or-later"
 
 [features]
 default = []
+local-embed = ["vein/local-embed"] # the on-device embedder for the product build: `cargo build -p lumen --features local-embed`
 gtk = ["quartzite/gtk"]
 gnome = ["quartzite/gnome"]
 qt = ["quartzite/qt"]
