@@ -1070,3 +1070,48 @@ mod attrsurf_tests {
         std::println!(":: ATTRSURF-ABI: wire hdr={} value_max={} syscalls=51..=55 bus=11..=15 -> PASS ::", ATTR_WIRE_HDR_LEN, ATTR_VALUE_MAX);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// VEINCORE (rmbp-ledger B304; docs/dev/evidence/rmbp-1004/VEINCORE.md): the CHAT verbs, OWNED by ring 3
+// (`APPS/VEIN.BIN` registers them with BUS_VERB_REGISTER; the kernel only relays). The bodies are
+// `unaos/libs/sys/vein_core/src/wire.rs` (its KATs are the spec); the kernel const-asserts these tags
+// against that crate's mirrors under feature `vein`.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ChatSend `conv u32 · text` — answered by a SEQUENCE of REPLY frames on the caller's corr, each a
+/// ChatReply body; non-final frames ride [`BUS_STATUS_MORE`], the last rides 0 with `done = 1`.
+pub const BUS_VERB_CHAT_SEND: u8 = 130;
+/// ChatReply as a REQUEST: accepted by VEIN.BIN from the KERNEL principal only — the relay companion's
+/// answer typed into the serial console as `vein rsp …` and injected by the kernel (`bus_route::inject`).
+pub const BUS_VERB_CHAT_REPLY: u8 = 131;
+/// ChatCancel `conv u32` — the cut stream ends with [`ECANCELED`]; the cancel's own reply is status 0.
+pub const BUS_VERB_CHAT_CANCEL: u8 = 132;
+/// ChatStatus (empty) → `ready u8 · plen u8 · mlen u8 · rsvd u8 · provider · model`.
+pub const BUS_VERB_CHAT_STATUS: u8 = 133;
+/// The one POSITIVE reply status: a non-final frame of a multi-frame answer. The relay delivers it WITH
+/// its body and keeps the correlation open; status 0 or an errno closes it (VEINCORE's `more` flag).
+pub const BUS_STATUS_MORE: i32 = 1;
+/// Operation cancelled — the final status of a chat stream a ChatCancel cut.
+pub const ECANCELED: i64 = -125;
+
+const _: () = assert!(BUS_VERB_CHAT_SEND >= BUS_VERB_FULFIL_MIN && BUS_VERB_CHAT_SEND > BUS_VERB_R3PREF_LIST);
+const _: () = assert!(BUS_VERB_CHAT_REPLY == BUS_VERB_CHAT_SEND + 1 && BUS_VERB_CHAT_CANCEL == BUS_VERB_CHAT_SEND + 2 && BUS_VERB_CHAT_STATUS == BUS_VERB_CHAT_SEND + 3);
+
+#[cfg(test)]
+mod veincore_abi {
+    use super::*;
+    extern crate std;
+
+    #[test]
+    fn chat_verbs_are_registrable_and_distinct() {
+        let v = [BUS_VERB_CHAT_SEND, BUS_VERB_CHAT_REPLY, BUS_VERB_CHAT_CANCEL, BUS_VERB_CHAT_STATUS];
+        for (i, a) in v.iter().enumerate() {
+            assert!(*a >= BUS_VERB_FULFIL_MIN);
+            assert!(*a != BUS_VERB_R3PREF_GET && *a != BUS_VERB_R3PREF_LIST);
+            assert!(!v[..i].contains(a));
+        }
+        assert!(v.len() <= BUS_REG_MAX_PER_ROW);
+        assert!(BUS_STATUS_MORE > 0);
+        std::println!(":: VEINCORE-ABI: chat=130..=133 more={} ecanceled={} -> PASS ::", BUS_STATUS_MORE, ECANCELED);
+    }
+}
