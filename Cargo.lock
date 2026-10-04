@@ -4012,6 +4012,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "holocron"
+version = "0.1.0"
+dependencies = [
+ "holocron_core",
+ "unafs",
+]
+
+[[package]]
+name = "holocron_core"
+version = "0.1.0"
+
+[[package]]
 name = "html5ever"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

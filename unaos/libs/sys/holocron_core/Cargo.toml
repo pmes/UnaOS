@@ -1,0 +1,21 @@
+[package]
+name = "holocron_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Holocron's keyring core: the secret file format, the ring, the bus surface and the SSH-agent framing — shared by Ring 0 and Ring 3."
+
+# HOLOCRON1 (LEDGER SR33, R83): `#![no_std]` + `alloc`, NO dependencies. The cryptography is not here:
+# it arrives through the `Sealer`/`Signer` traits (src/seal.rs). Until CRYPTOCORE (SR27) folds, the only
+# implementation is the deliberately INSECURE test suite (src/testseal.rs, suite byte 0xFE, refused by the
+# production suite). The fold is ONE adapter (src/cc.rs): uncomment the dependency below and point the
+# feature at it.
+#
+#   crypto_core = { path = "../crypto_core", optional = true, default-features = false, features = ["alloc"] }
+
+[features]
+default = []
+# Fold: `crypto_core = ["dep:crypto_core"]` once the dependency line above is live.
+crypto_core = []
+
+[dependencies]

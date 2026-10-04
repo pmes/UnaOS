@@ -1,0 +1,15 @@
+[package]
+name = "holocron"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Holocron (CODEX §2, The Key): the host keyring daemon, its Unix-socket bus, the SSH agent and the client consumers link."
+
+# HOLOCRON1 (LEDGER SR33). The policy, formats and codecs are `holocron_core` (no_std, shared with the
+# metal); this crate is the host's I/O: the ~/.holocron directory store, a UnaFS-volume store (typed
+# attributes), SO_PEERCRED principal stamping, the daemon and the client. No third-party dependencies.
+
+[dependencies]
+holocron_core = { path = "../../unaos/libs/sys/holocron_core" }
+# The no_std core of UnaFS only (the `std` feature would pull gneiss_pal's network stack into a keyring).
+unafs = { path = "../../unaos/libs/fs/unafs", default-features = false }
