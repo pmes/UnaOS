@@ -230,7 +230,7 @@ fn ensure_netring3() {
     #[cfg(feature = "netring3")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("net", crate::netring3::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("net", crate::netring3::selftest); register("nethang", crate::netring3::nethang_selftest); } // NETHANG: `tests nethang` (code first)
     }
 }
 
