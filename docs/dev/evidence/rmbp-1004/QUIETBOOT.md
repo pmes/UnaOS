@@ -108,3 +108,48 @@ lines; the rest of R80's "real boot speed" is the knob line (see design question
 `:: BOOT: firmware->loader=<ms> loader->desktop=<ms> total=<ms> lines=<n> ::` once per boot, right
 after the first `:: FIRSTBOOT:` line; `tests quietboot` →
 `:: QUIETBOOT: lines=<n> bound=<B> census=<on-bits> -> PASS|FAIL ::`.
+
+## Built (branch exec-rmbp-quietboot)
+
+* M2 `census.rs` + gates (one same-line statement per sampler): `serial_line::census_poll`,
+  `kepler_vblank::vbjitter_witness`, `sched::emit_smpload_witness` / `emit_stack_witness` /
+  `emit_load_witness`, `wcpar::emit`, `ehci::ptrstutter_witness`, `deadman::tick`, `screen` `[wc-w]` rollup,
+  `serial_ring::mirror_service` / `tx_rollup`, `rtwit::rollup`, `usbnet::rollup`, `sdhc::wr_burst_flush`,
+  main.rs `[schedx86] depth` + `ptrinstall_rollup`. Verb row in `midden_core` HOST_VERBS + help row + dispatch arm.
+  Knob: Cargo `census`, arroyo `_feats` + head-`case` export for the battery verbs, builder push, K8_FEATS arm,
+  `banner-cert.sh` row `census|:: CENSUS: armed=all|-|measured(1)` (measured on a metal+census ELF).
+* M3 `tests::defer(name, f)`: first statement of the fixture; inline under `tests-at-boot` or while `tests`
+  runs, else registered once. Sites: `shell::midden_witness` (tste), `shell::fatverb_storage_witness`,
+  `bootdisk::homesoil_selftest`, `ehci` parser chain (ehci), `selfhost::verify_source_once`,
+  `prtscr::selftest_once`, `sched::smpload_selftest`; main.rs ring-3 block: `sched::enable()` stays, the
+  U1a..U3.5 + SERWIT-1 body runs only under `tests-at-boot`, else `tests u3` (= `u3_probe_once`). Registry
+  CAP 48 → 80. `test-selfhost` re-execs with `UNAOS_TESTS_AT_BOOT=1`; `x86-witness.spec` (metal) names
+  `UNAOS_TESTS_AT_BOOT=1 UNAOS_CENSUS=1` in its Build line.
+* M4 `bootpace::boot_line()` from `users::stage_witness` (first call only), `note_loader_entry` from
+  `bootclock_report`, a lock-free per-tag tally in `serial_line` (48 slots, closed at the BOOT line),
+  `tests quietboot` (bound 2500, SKIP on tests-at-boot/census builds, prints `top=[tag:n,…]` when over).
+
+## Expectation vs flight 19
+
+Boot 1 to the installer stage: 2710 lines before. Taken out by this arc on the same knob line: SERWIT/U-battery
+~165, TSTE+relics ~39, EHCI self-test chain (+clip/termsel/keymap/keyrepeat/tpframe/appclip) ~45, HOMESOIL 9,
+deadman/schedx86/etc ~15 → expected ~2420, under the 2500 bound. Installer→desktop (1746) loses ~870
+(SERIAL 64, BPACE stays, deadman 103, wc-w 101, mirror 97, schedx86 42, STACK 22, rtwit 21, ptrinstall 19,
+USBNET rx 16, VBJITTER 17, SMPLOAD 11, WCPAR+wcpar 16, PTRSTUTTER 9, sertx 8, SDHCWR 2, PRTSCR 4, SELFHOST 2).
+Without the recon knobs (SMCWALK, gen7, kepler rungs, KFBIND/KDHEAD, BT/BTC, wifi, uvc, EHCI-CONFIG) the
+first stage should come in near 500 lines.
+
+## Owed / design questions
+
+1. The ~1900 KNOB-RECON lines are the flight line's choice; R80's "real boot speed" flight wants the recon
+   knobs off (UNAOS_SMCWALK alone is 516 lines). A seat decision, not code.
+2. BPACE (128 reprints on boot 1) is kept: it is the boot-phase ledger and x86-splash.spec's COMPLETE marker.
+   Gating it needs the splash lane to arm UNAOS_CENSUS first.
+3. `[deadman]` is now a census: a wedge on a quiet boot has no 1 Hz line unless `census start deadman` or
+   UNAOS_CENSUS. Seat: keep it always-on?
+4. `tests ring3` (the U1a..U3.5 spawn battery from the shell) is not built: it awaits verdicts on a worker
+   core at early boot; driving it from the desktop needs the TSTE-2 launcher refactor.
+5. Witness-gated compositor instruments (`[wc-h]` `[wc-b]` `[wc-d]` `[wc-g]` `[wc-a]`), KBDWIT (builder
+   default-ON) and the `[sdhc] write census` are a second pass.
+6. Fixtures with an internal once-latch (fatverb, prtscr, smpload, selfhost) print on the FIRST `tests` run only.
+7. The BOOT line rides `fs/users.rs` (FIRSTBOOT): a build without `login` prints none.
