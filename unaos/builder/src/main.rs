@@ -310,6 +310,9 @@ fn main() {
     // Default OFF => no ATA write opcode is linked (`WRITE-DMA-EXT-0x35` is 0 hits on the ELF) and
     // media are byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
     if std::env::var("UNAOS_AHCI_WRITE").is_ok() { feats.push("ahci-write"); }
+    // AHCIROOT (rmbp-ledger B332): the SSD UnaFS root + the kernel-held SATA write grant. Implies ahci-write,
+    // unafs, installdemo in Cargo.toml. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
+    if std::env::var("UNAOS_AHCIROOT").is_ok() { feats.push("ahciroot"); }
     // SELFINSTALL M3 (SH-3): UNAOS_ROOT_PREFER=ahci|sdhc picks the bootdisk root when both the card and the SSD carry
     // UnaOS (cargo features root-prefer-ahci / root-prefer-sdhc). Default OFF => first-found. Kept in sync with arroyo.
     match std::env::var("UNAOS_ROOT_PREFER").as_deref() {
