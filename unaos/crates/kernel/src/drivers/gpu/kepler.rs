@@ -1496,8 +1496,11 @@ pub fn init(gpu: &GpuInfo) {
         // the 0x700000 aperture in one shot. It is restored at every use and the restore is
         // READ BACK — a restore that is written but never read is a success echo that
         // cannot fail, and a failure VOIDs the affected verdict rather than passing quietly.
+        // KBLIT / R80 — the ladder no longer RUNS at boot: nothing runs at boot but the boot.
+        // `kepler::init` only banks the context the two fixtures need; `tests ce` runs the
+        // read-only ladder and `tests kblit` the channel + blit, both fired from the shell.
         #[cfg(feature = "nvidia-kepler-ce")]
-        crate::drivers::gpu::kepler_ce::ladder(bar0, vram_size);
+        crate::drivers::gpu::kepler_ce::arm_context(bar0, bar1_base, bar1_size, vram_size);
 
         // Recon Probe before any engine state modification
 

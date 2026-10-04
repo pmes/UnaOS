@@ -17546,6 +17546,8 @@ fn winx_launcher(demo_cpu: usize) {
     // (that IS its verdict) and would otherwise change which owner the routing legs start from.
     #[cfg(all(feature = "witness", feature = "wc"))]
     crate::tests::register("dock", crate::video::dock::selftest); #[cfg(all(feature = "witness", feature = "wc", feature = "quarry"))] crate::tests::register("fileopen", crate::video::quarry::live::fileopen_selftest); #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("textedit", crate::video::textedit::selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("activity", crate::video::activity::selftest); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only. // TEXTEDIT (R75) — editor fixture; ACTIVITY (R75) — the activity window fixture.
+    // KBLIT (B319, R80) — the CE ladder and the first copy-engine blit, moved OFF boot into `tests ce` / `tests kblit` (kepler::init only banks the GPU context). Both behind `nvidia-kepler-ce`, default OFF; the module and both registrations vanish unarmed.
+    #[cfg(feature = "nvidia-kepler-ce")] crate::tests::register("ce", crate::drivers::gpu::kepler_ce::tests_ce); #[cfg(feature = "nvidia-kepler-ce")] crate::tests::register("kblit", crate::drivers::gpu::kepler_ce::tests_kblit);
     // CRYSTAL — the SHARD menu fixture. Runs after `dock::selftest` (which runs `menubar::selftest`),
     // so the bar tenant it enables is already proven present and flush. It enables the bar itself,
     // opens the menu off the crystal, resolves every item, fires the SAFE picks, and dismisses three
