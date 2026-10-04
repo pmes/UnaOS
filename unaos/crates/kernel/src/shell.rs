@@ -8981,3 +8981,15 @@ fn exec_display_path(name: &str) -> Option<String> {
         Err(_) => Some(hit.clone()),
     }
 }
+
+/// EXECNAME (B322): what a bare `word` resolves to RIGHT NOW, through the very path `which` and the
+/// launch take (`midden_core::resolve_exec` over [`FatVolume`], then [`exec_display_path`]) — for the
+/// `tests exec` fixture (`crate::execname`), so the witness cannot test a second resolver.
+#[cfg(target_arch = "x86_64")] // its one caller, `tests exec`, is x86 (the five images are x86 images)
+pub(crate) fn exec_resolve_display(word: &str) -> Option<String> {
+    if !midden_facts().exec {
+        return None;
+    }
+    let name = midden_core::resolve_exec(word, &mut FatVolume)?;
+    Some(exec_display_path(&name).unwrap_or(name))
+}

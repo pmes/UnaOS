@@ -51,3 +51,48 @@ still always detaches (`video/quarry/openers.rs`) — moving it onto `launch_mod
 outside this arc's files. Programs have no argv yet (`net tls <host>` is still owed by NETRING3).
 
 ## Survivors of `grep -rn '\.BIN'` (justified)
+
+Every survivor of the five program names, and every other `.BIN` in `unaos/`, is one of:
+
+1. **Genuine flat blobs** (`llvm-objcopy -O binary`, no ELF header): `HELLO.BIN` (the Pi and x86 U2 flat
+   program), `MIDDEN.BIN`, `K2OWN.BIN`, `K2IMP.BIN` (the Pi EL0 fixture blobs, `-O binary
+   --only-section=.text`), `target/user_blob.bin`. They keep the name; it is true.
+2. **Data files, not programs**: the storage / ownership / write-path fixture names the kernel creates
+   at run time (`SCRATCH.BIN`, `GROW.BIN`, `S8W.BIN`, `OWNED.BIN`, `DEFER*.BIN`, `STOR*.BIN`, `K2PRIV.BIN`,
+   `K3PAT.BIN`, `FRESH.BIN`, `DELME.BIN`, `BUSPRIV.BIN`, `OTHER.BIN`, `COPY.BIN`, `A11/B11.BIN`,
+   `UNALOG.BIN`, the `FM*`/`S2MV*`/`K6*`/`K9*` rows and the rest). Bytes on a volume; `.BIN` is right.
+3. **The generic `.ELF/.BIN` opener rule** in Quarry (`video/quarry/live.rs`, `openers.rs`) and the
+   `is_elf_image` doc in `arch/x86_64/elf.rs`: they name the flat format, which still exists.
+4. **VEIN, left for LUMENAPP** (B323 deletes them this wave; editing a file another arc deletes is a
+   modify/delete conflict at the fold): `crates/user-vein/*`, `kernel/src/vein_bus.rs`,
+   `libs/sys/vein_core/*` comments, `handlers/vein/*` comments, and `crates/user-lumen/{Cargo.toml,
+   src/main.rs}` comments plus its `NO_PROVIDER` string (LUMENAPP rewrites that crate; this arc adds only
+   its note static at the tail). VEIN's FUNCTIONAL names — the builder's staging, arroyo, the
+   `tests lumen` load in `lumen.rs`, help's `vein` row — were renamed so an unfolded tree is consistent.
+5. **History**: ledger and queue rows, `docs/MILESTONES.md`, `docs/dev/evidence/**` captures, and the
+   two EXECNAME comments that quote the old name on purpose (`midden_core` test, the `shell.rs` arm note).
+
+## Witness — what the metal boot prints
+
+`tests exec` on the boot-21 image (program source mounted, all five staged):
+
+```
+:: EXECNAME: prefs -> /apps/PREFS.ELF flags=2 note=yes launch=detach ::
+:: EXECNAME: vein -> /apps/VEIN.ELF flags=0 note=no launch=foreground ::
+:: EXECNAME: lumen -> /apps/LUMEN.ELF flags=1 note=yes launch=detach ::
+:: EXECNAME: net -> /apps/NET.ELF flags=0 note=yes launch=foreground ::
+:: EXECNAME: big -> /apps/BIG.ELF flags=0 note=yes launch=foreground ::
+:: EXECNAME: resolved=5/5 windowed=1 console=4 -> PASS ::
+```
+
+After LUMENAPP's fold the `vein` row leaves `STAGED` (`kernel/src/execname.rs`) and the line is
+`resolved=4/4 windowed=1 console=3`. Operator checks at the prompt: `which lumen` →
+`lumen: program /apps/LUMEN.ELF`; typing `lumen` → serial `:: BAREXEC: /apps/LUMEN.ELF (typed 'lumen') —
+note flags=1 -> detach ::` then the existing `… DETACHED, left RUNNING ::`; typing `net` → `note flags=0
+-> foreground ::` then `:: EXEC: run /apps/NET.ELF — … exit=<n> ::`. The dock's lumen pin prints
+`[dock] dockpin verb /apps/LUMEN.ELF` followed by the same two BAREXEC lines.
+
+Host proof: `cargo test -p midden_core` (the note parser by program header and by section header, the
+malformed-note `None` cases, the launch rule, `.ELF` resolution and the `.BIN` miss, `lumen` planning as
+Exec); the real staged images were parsed by the same function (LUMEN 1, PREFS 2, NET 0, BIG 0; VUG,
+PULSE, STAT 1 on both arches).

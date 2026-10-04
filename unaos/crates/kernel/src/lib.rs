@@ -269,3 +269,6 @@ pub mod prefs;
 // LUMENBIN (rmbp-ledger B305): `tests lumen`, the fixture for the ring-3 Lumen chat window (APPS/LUMEN.ELF). Tail statement, so no existing line moves.
 #[cfg(feature = "lumen")]
 pub mod lumen;
+// EXECNAME (rmbp-ledger B322): `tests exec`, the bare-name resolve + launch-note witness over the staged x86 programs. Tail statement, so no existing line moves.
+#[cfg(target_arch = "x86_64")]
+pub mod execname;
