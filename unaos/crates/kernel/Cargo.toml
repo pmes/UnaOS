@@ -3796,6 +3796,7 @@ rast = { path = "../rast", optional = true }
 noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "size_20", "size_24", "unicode-basic-latin"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
+unafs = { path = "../../libs/fs/unafs", default-features = false }
 # BeFS-K3: the native UnaFS filesystem, no_std core only (on-disk types, codec,
 # BlockDevice/SectorDevice adapter seam). The default `std` feature would pull
 # host-native backends (FileDevice/mmap/bandy/query) — never enable it here.
@@ -3813,6 +3814,7 @@ smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-e
 unaos-xusb-fw = { path = "../xusb-fw", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
+smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
 # UNAFSX86: the same no_std UnaFS core, OPTIONAL on x86 — pulled only by the `unafs` feature (UNAOS_UNAFS=1).
 unafs = { path = "../../libs/fs/unafs", default-features = false, optional = true }
 x86_64 = "0.15.5"
