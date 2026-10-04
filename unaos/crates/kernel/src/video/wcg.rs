@@ -1807,7 +1807,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // `decl_lock=` on the same line is comparing eight different moments to a ninth.
     let blitnet = super::wm::blit_net_snapshot();
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} shrunk={} blitnet=[{},{},{},{},{},{},{},{}] beam={} beamobs={} beamwaits={} beamwait_us={} beammaxwait_us={} beamgiveup={} beamcross_ppk={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} shrunk={} blitnet=[{},{},{},{},{},{},{},{}] beam={} beamobs={} beamwaits={} beamwait_us={} beammaxwait_us={} beamgiveup={} beamcross_ppk={} blitter={} blit_us={} gpu_fallback={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
         id,
         scope,
         emit,
@@ -1838,6 +1838,9 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         H_BEAMMAXWAIT[i].load(Ordering::Relaxed),
         H_BEAMGIVEUP[i].load(Ordering::Relaxed),
         H_BEAMCROSS[i].load(Ordering::Relaxed),
+        super::blitter::selected().name(),
+        cycles_to_us(H_BLITCYC[i].load(Ordering::Relaxed)),
+        H_GPUFB[i].load(Ordering::Relaxed),
         H_FIXTURE[i].load(Ordering::Relaxed),
         H_WHOLE[i].load(Ordering::Relaxed),
         H_BANDED[i].load(Ordering::Relaxed),
@@ -4557,4 +4560,23 @@ fn seam_census_emit(id: u32) {
             "QUIET"
         }
     );
+}
+
+// ---- KCOMP — the blitter's share of each window's present, on the `[wc-h] rollup` -------------------
+//
+// `blitter=` `blit_us=` `gpu_fallback=` are INSERTED directly after `beamcross_ppk=` (the tail of the
+// beam run, inside `pop=all-presents`, the one place no spec keys an adjacency on — the COMPGATE and
+// BEAM paragraphs above). Arity 43 -> 46. Both counters are cumulative per window, like the beam keys.
+static H_BLITCYC: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_GPUFB: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// KCOMP — one present through `blitter::present_band`: its cycles, and whether the CPU fallback ran.
+pub fn blit_note(id: u32, cyc: u64, fell_back: bool) {
+    let i = id as usize;
+    if i < IDS {
+        H_BLITCYC[i].fetch_add(cyc, Ordering::Relaxed);
+        if fell_back {
+            H_GPUFB[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
