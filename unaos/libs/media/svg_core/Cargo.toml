@@ -17,3 +17,9 @@ default = []
 # Host convenience: `std` lets `FontSet::system()` load the fonts under /usr/share/fonts. The renderer never
 # needs it; a no_std caller hands its own font bytes to `FontSet::add`.
 std = []
+
+# Test-only: pixel_core decodes Chromium's oracle screenshots and the PNG/JPEG data inside test SVGs. A
+# dev-dependency is not linked into the library, so pixel_core's own optional dependency on svg_core does
+# not form a cycle.
+[dev-dependencies]
+pixel_core = { path = "../pixel_core" }

@@ -83,6 +83,13 @@ pub fn parse_color(s: &str) -> Option<Color> {
         } as f32;
         match fname {
             "rgb" | "rgba" => {
+                // Legacy (comma) syntax: the three channels must all be numbers or all percentages.
+                if main.contains(',') {
+                    let pc = parts.iter().filter(|p| p.ends_with('%')).count();
+                    if pc != 0 && pc != 3 {
+                        return None;
+                    }
+                }
                 let ch = |p: &str| -> Option<u8> {
                     if let Some(v) = p.strip_suffix('%') {
                         Some(clamp_u8(v.trim().parse::<f64>().ok()? * 255.0 / 100.0))

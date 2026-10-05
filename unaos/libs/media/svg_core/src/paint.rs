@@ -110,6 +110,10 @@ impl Shader {
                 let cc = pd.0 * pd.0 + pd.1 * pd.1 - fr * fr;
                 let t = if a.abs() < 1e-9 {
                     if b == 0.0 {
+                        // Concentric equal circles: Chromium paints the inside with t = 0, the outside not at all.
+                        if cc <= 0.0 {
+                            return stops_at(stops, spread_t(0.0, *spread));
+                        }
                         return [0.0; 4];
                     }
                     let t = cc / (2.0 * b);

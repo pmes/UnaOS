@@ -152,6 +152,16 @@ pub enum Unit {
     Pt,
     Pc,
     Percent,
+    Q,
+    Rem,
+    Ch,
+    Ic,
+    Lh,
+    Rlh,
+    Vw,
+    Vh,
+    Vmin,
+    Vmax,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -192,6 +202,16 @@ pub fn length_at(s: &[u8], i: &mut usize) -> Option<Length> {
             "mm" => Unit::Mm,
             "pt" => Unit::Pt,
             "pc" => Unit::Pc,
+            "q" => Unit::Q,
+            "rem" => Unit::Rem,
+            "ch" => Unit::Ch,
+            "ic" => Unit::Ic,
+            "lh" => Unit::Lh,
+            "rlh" => Unit::Rlh,
+            "vw" | "vi" => Unit::Vw,
+            "vh" | "vb" => Unit::Vh,
+            "vmin" => Unit::Vmin,
+            "vmax" => Unit::Vmax,
             _ => return None,
         };
         (unit, k)
@@ -248,6 +268,16 @@ pub fn resolve(l: Length, axis: Axis, vw: f64, vh: f64, font_size: f64) -> f64 {
         Unit::Mm => l.v * 96.0 / 25.4,
         Unit::Pt => l.v * 4.0 / 3.0,
         Unit::Pc => l.v * 16.0,
+        Unit::Q => l.v * 96.0 / 101.6,
+        // Font- and viewport-relative units without font/viewport knowledge (the renderer resolves them
+        // properly in `Renderer::len`): CSS Values 4 fallbacks.
+        Unit::Rem => l.v * 16.0,
+        Unit::Ch => l.v * font_size / 2.0,
+        Unit::Ic => l.v * font_size,
+        Unit::Lh => l.v * font_size * 1.2,
+        Unit::Rlh => l.v * 16.0 * 1.2,
+        Unit::Vw | Unit::Vmin | Unit::Vmax => l.v * vw / 100.0,
+        Unit::Vh => l.v * vh / 100.0,
         Unit::Percent => {
             let base = match axis {
                 Axis::X => vw,
