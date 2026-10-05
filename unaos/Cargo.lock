@@ -426,6 +426,7 @@ name = "unaos-builder"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "crypto_core",
  "fatfs",
 ]
 

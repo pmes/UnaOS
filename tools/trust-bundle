@@ -12,9 +12,11 @@
 # If curl.se is unreachable it tries the same Mozilla bundle as packaged by certifi on PyPI (recorded in SOURCE as
 # such) — never a distro store, which may carry local additions.
 #
-# The builder stages it onto the boot volume's data tree (NOT done here — arroyo is not edited by this arc):
-#   mkdir -p "$ESP_DIR/system/trust" && cp "$WORKSPACE_DIR/system/trust/roots.pem" "$ESP_DIR/system/trust/roots.pem"
-# and the kernel/user TLS client loads it with tls_core::x509::TrustStore::from_pem.
+# The builder stages it (VEINTLS, SR36: unaos/builder/src/main.rs `stage_trust`) onto the ESP and the x86 DATA
+# volume as system/trust/roots.pem, after checking its sha256 against roots.pem.sha256 with crypto_core's
+# SHA-256 (a mismatch stops the build; an absent bundle is reported and nothing is staged). Ring 3 loads it with
+# vein_ring3::trust::load (SYS_OPEN /system/trust/roots.pem) -> tls_core::x509::TrustStore::from_pem.
+# Run before `./arroyo esp-x86`:   tools/trust-bundle   (re-run when the Mozilla bundle moves; commit the new pin)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/system/trust"
