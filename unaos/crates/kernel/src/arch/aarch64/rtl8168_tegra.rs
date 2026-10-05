@@ -2383,12 +2383,18 @@ mod metal {
             // Wait (bounded) for the descriptor to be handed back (OWN cleared by the NIC). NC memory ⇒
             // each poll reads OWN straight from DRAM (no invalidate); `dma_rmb` orders the OWN read so the
             // completion is observed correctly.
+            // ARMNET (B346): bounded by WALL time (TX_WAIT_MS of the stack clock), not 1,000,000 spins — a
+            // count that is a different duration on every core clock, and a stall the caller cannot size.
             let mut done = false;
-            for _ in 0..1_000_000 {
+            let t_end = crate::clock::stack_ms() + TX_WAIT_MS;
+            loop {
                 dma_rmb();
                 let dd = unsafe { read_volatile(desc) };
                 if dd.opts1 & DESC_OWN == 0 {
                     done = true;
+                    break;
+                }
+                if crate::clock::stack_ms() >= t_end {
                     break;
                 }
                 core::hint::spin_loop();
@@ -5538,6 +5544,9 @@ mod metal {
         DHCP_TIMEOUT_MS
     }
 
+    /// ARMNET (B346): the TX completion wait's wall bound (a 1514-byte frame at 10 Mb/s is ~1.2 ms on the wire).
+    const TX_WAIT_MS: i64 = 5;
+
     /// Monotonic millisecond clock from the free-running counter (CNTPCT). Readable at EL2, where
     /// `net4_bringup` runs (before the JC3 EL2→EL1 drop); drives both smoltcp time and the DHCP timeout.
     /// ARMNET (B346): `clock::stack_ms`, the one stack clock (CNTPCT/CNTFRQ; it wrapped here after ~4 days).
@@ -5614,8 +5623,8 @@ mod metal {
         //    placeholder (NET-DHCP — the do-it-right fix for the NET-4-landing static bring-up IP). The
         //    helper configures the interface in place; the bounded witness poll below then exercises the
         //    seam against whichever config it settled on. ──
-        let netcfg = crate::net_phy::dhcp_or_static(
-            P4, &mut iface, &mut dev, &now_ms, dhcp_timeout_ms(), OUR_IP, 24, GATEWAY_IP,
+        let netcfg = crate::net_phy::dhcp_or_static_gated(
+            P4, &mut iface, &mut dev, &now_ms, dhcp_timeout_ms(), OUR_IP, 24, GATEWAY_IP, Some(&net6_rx_ready),
         );
 
         // NET-4c: evidence snapshot right after the discover window — did the DISCOVER
@@ -5657,12 +5666,21 @@ mod metal {
         // arriving after it could ever be answered). Poll with the real clock for a real-time bound.
         const PUMP_WINDOW_MS: i64 = 1_000;
         let t0 = now_ms();
+        let mut next_poll: i64 = 0; // ARMNET (B346): poll on `poll_delay` or an RX arrival, never every pass
         loop {
             let t = now_ms();
             if t.saturating_sub(t0) >= PUMP_WINDOW_MS {
                 break;
             }
+            if t < next_poll && !net6_rx_ready() {
+                core::hint::spin_loop();
+                continue;
+            }
             iface.poll(Instant::from_millis(t), &mut dev, &mut sockets);
+            next_poll = t + match iface.poll_delay(Instant::from_millis(t), &sockets) {
+                Some(d) => (d.total_millis() as i64).max(1),
+                None => 1_000,
+            };
         }
         // NET-ARP-1 emission witness (counted at the phy TxToken — wire-side of the seam).
         let (txn, arp_reply, dhcp) = crate::net_phy::tx_emission_counts();
@@ -5715,8 +5733,8 @@ mod metal {
     };
 
     /// ARMNET (B346): the poll gate's RX probe — the descriptor at `rx_cur` has OWN clear (the NIC handed it
-    /// back filled). A pure read: none of the armed-build scans `rx_frame_raw` runs on an empty ring.
-    #[cfg(feature = "net6")]
+    /// back filled). A pure read: none of the armed-build scans `rx_frame_raw` runs on an empty ring. The
+    /// bring-up DHCP window and the NET6 surface both gate on it.
     fn net6_rx_ready() -> bool {
         match NET4_DEVICE.lock().as_ref() {
             Some(n) => {

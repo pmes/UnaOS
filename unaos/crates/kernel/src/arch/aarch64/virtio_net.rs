@@ -446,10 +446,9 @@ use smoltcp::wire::{
 /// ICMP identifier stamped on the echo requests we originate. ASCII "VN".
 const PING_IDENT: u16 = 0x564e;
 const PING_PAYLOAD: &[u8] = b"unaos-vnet";
-/// Bounded poll-pump iterations for the witness (iteration-, not wall-clock-bounded — a slirp reply on
-/// the local link lands in a handful of iterations, so this only caps how long an unreachable target
-/// stalls the boot). Non-hanging by construction. Mirrors smolnet's `PUMP_ITERS` spirit, smaller.
-const PUMP_ITERS: i64 = 200_000;
+/// ARMNET (B346): the witness ping's WALL budget (it was 200,000 poll iterations of a fake +1 ms clock).
+/// Polled on the interface's own `poll_delay` or an RX arrival. Non-hanging by construction.
+const PUMP_MS: i64 = 2_000;
 
 /// Read the free-running counter (µs) for the RTT measurement. Readable at EL2 (the witness runs before
 /// the JC3 EL2→EL1 drop); `busy_delay_ms`/CAPSTONE already depend on CNTPCT being live here.
@@ -480,9 +479,9 @@ fn bind_and_ping() {
     // ── DHCP first: acquire a lease (slirp serves 10.0.2.15/24 gw 10.0.2.2), else fall back to the
     //    static bring-up addressing. The helper configures the interface in place; we ping the gateway
     //    of whichever config it settled on. ──
-    let now_ms = || (now_us() / 1000) as i64;
-    let netcfg = crate::net_phy::dhcp_or_static(
-        PV, &mut iface, &mut dev, &now_ms, DHCP_TIMEOUT_MS, OUR_IP, 24, GATEWAY_IP,
+    let now_ms = crate::clock::stack_ms; // ARMNET (B346): the one stack clock
+    let netcfg = crate::net_phy::dhcp_or_static_gated(
+        PV, &mut iface, &mut dev, &now_ms, DHCP_TIMEOUT_MS, OUR_IP, 24, GATEWAY_IP, Some(&net6_rx_ready),
     );
     let gw = netcfg.gw;
 
@@ -510,13 +509,22 @@ fn bind_and_ping() {
     let mut sent = 0u16;
     let mut received = 0u16;
     let mut seq = 0u16;
-    let mut clock: i64 = 0;
     let start = now_us();
     let mut first_reply_us = 0u64;
+    let t0 = now_ms();
+    let mut next_poll: i64 = 0;
 
-    while clock < PUMP_ITERS {
-        clock += 1;
-        iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
+    while now_ms() - t0 < PUMP_MS {
+        let t = now_ms();
+        if t < next_poll && !net6_rx_ready() {
+            core::hint::spin_loop();
+            continue;
+        }
+        iface.poll(Instant::from_millis(t), &mut dev, &mut sockets);
+        next_poll = t + match iface.poll_delay(Instant::from_millis(t), &sockets) {
+            Some(d) => (d.total_millis() as i64).max(1),
+            None => 1_000,
+        };
 
         let sock = sockets.get_mut::<icmp::Socket>(handle);
         if seq < COUNT && sock.can_send() {
@@ -527,6 +535,7 @@ fn bind_and_ping() {
                 let caps = dev.capabilities().checksum;
                 repr.emit(&mut pkt, &caps);
                 sent += 1;
+                next_poll = 0; // ARMNET: the echo goes out on the next pass
             }
         }
         if sock.can_recv() {
@@ -628,8 +637,7 @@ fn net6_mac() -> Option<[u8; 6]> {
 }
 
 /// ARMNET (B346): the poll gate's RX probe — the RX used-ring index moved past what this driver consumed.
-/// A pure read (no recycle, no notify).
-#[cfg(feature = "net6")]
+/// A pure read (no recycle, no notify). The bring-up DHCP/ping and the NET6 surface both gate on it.
 fn net6_rx_ready() -> bool {
     match VNET_DEVICE.lock().as_ref() {
         Some(n) => n.rx.used_idx() != n.rx.last_used,

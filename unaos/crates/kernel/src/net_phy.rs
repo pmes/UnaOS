@@ -346,6 +346,24 @@ pub fn dhcp_or_static<D: Device>(
     static_prefix: u8,
     static_gw: [u8; 4],
 ) -> NetConfig {
+    // ARMNET (B346): a NIC with no RX-ready probe (genet) polls on a 1 ms cadence floor, not every pass.
+    dhcp_or_static_gated(prefix, iface, dev, now_ms, timeout_ms, static_ip, static_prefix, static_gw, None)
+}
+
+/// ARMNET (B346): [`dhcp_or_static`] polled on the DHCP socket's own `poll_delay` (smoltcp's DISCOVER/REQUEST
+/// retransmit timers, now in real seconds) or when `rx_ready` says a frame is waiting — never once per loop
+/// pass. `rx_ready = None` caps the gap at 1 ms (a NIC with no probe still hears its OFFER).
+pub fn dhcp_or_static_gated<D: Device>(
+    prefix: &str,
+    iface: &mut Interface,
+    dev: &mut D,
+    now_ms: &dyn Fn() -> i64,
+    timeout_ms: i64,
+    static_ip: [u8; 4],
+    static_prefix: u8,
+    static_gw: [u8; 4],
+    rx_ready: Option<&dyn Fn() -> bool>,
+) -> NetConfig {
     let mut storage: [SocketStorage; 1] = Default::default();
     let mut sockets = SocketSet::new(&mut storage[..]);
     let handle = sockets.add(dhcpv4::Socket::new());
@@ -357,12 +375,25 @@ pub fn dhcp_or_static<D: Device>(
     // exact seam the QEMU `vnet` path leases through, so surfacing the poll count on BOTH outcomes lets
     // boot-14 compare the metal cadence against the known-good virtio lease directly.
     let mut polls: u64 = 0;
+    let mut next_poll: i64 = 0;
     loop {
         let t = now_ms();
-        iface.poll(Instant::from_millis(t), dev, &mut sockets);
-        polls += 1;
+        let due = t >= next_poll || rx_ready.map(|f| f()).unwrap_or(false);
+        if due {
+            iface.poll(Instant::from_millis(t), dev, &mut sockets);
+            polls += 1;
+            let after = now_ms();
+            next_poll = after
+                + match (rx_ready, iface.poll_delay(Instant::from_millis(after), &sockets)) {
+                    (None, _) => 1,
+                    (Some(_), Some(d)) => (d.total_millis() as i64).clamp(1, 1_000),
+                    (Some(_), None) => 1_000,
+                };
+        } else {
+            core::hint::spin_loop();
+        }
 
-        match sockets.get_mut::<dhcpv4::Socket>(handle).poll() {
+        match if due { sockets.get_mut::<dhcpv4::Socket>(handle).poll() } else { None } {
             Some(dhcpv4::Event::Configured(cfg)) => {
                 let ip = cfg.address.address().octets();
                 let prefix_len = cfg.address.prefix_len();
