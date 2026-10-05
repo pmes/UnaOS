@@ -33,7 +33,9 @@
 //!
 //! # Keys (namespace `system`)
 //!
-//! `display.brightness` (1..16; BRIGHTFLOOR clamps a stored 0 on load and save) · `display.idle_min` (minutes, 0 = never) · `display.wallpaper` (a path,
+//! The ranges are the schema's (`prefs_core::schema::SCHEMA`, docs/dev/PREFS-SCHEMA.md; PREFSKERNEL B345:
+//! every set clamps through `schema::check`, every load through `schema::clamp_tree`).
+//! `display.brightness` (1..16) · `display.idle_min` (minutes, 0 = never) · `display.wallpaper` (a path,
 //! empty = off) · `audio.volume` (0..16) · `audio.mute` (bool) · `pointer.speed` (0 slow, 1 normal, 2 fast)
 //! · `power.lowbat_shutdown_pct` (0 = off) · `dock.pins` (comma-joined app names — TOML arrays are outside
 //! the subset) · `settings.tab` (0..3). Defaults live with each consumer, as in Principia.
@@ -202,15 +204,28 @@ fn load() {
             _ => (PrefTree::new(), true),
         },
     };
+    // PREFSKERNEL M3 (B345): a value outside its schema range (a hand edit, a file older than the
+    // schema) is clamped ONCE, here, by the shared rule — and re-saved, so the file holds the clamp. A
+    // refused file is not touched (its saves are held).
+    let mut tree = tree;
+    let clamped = if ok { prefs_core::schema::clamp_tree(&mut tree) } else { 0 };
+    LOAD_CLAMPED.store(clamped as u32, Ordering::Relaxed);
+    serial_println!("[prefs] load clamped={}", clamped);
     HELD.store(!ok, Ordering::Release);
     LOADED_N.store(tree.len() as u32, Ordering::Relaxed);
     SAVED_N.store(0, Ordering::Relaxed);
     *TREE.lock() = tree;
     witness(ok);
+    if ok && clamped > 0 {
+        let _ = save();
+    }
     if ok {
         migrate();
     }
 }
+
+/// PREFSKERNEL M3: values the last load clamped into their schema range.
+static LOAD_CLAMPED: AtomicU32 = AtomicU32::new(0);
 
 /// Load once per login (and once with no session). Cheap when nothing changed.
 pub fn ensure_loaded() {
