@@ -5,7 +5,7 @@ use html_core::{parse_document, parse_fragment, Document, Namespace, NodeData, P
 #[test]
 fn navigation_and_query_hooks() {
     let doc = parse_document(
-        "<!DOCTYPE html><title>t</title><div id=a class='x  y'><p>one<p class=y>two</div><svg><circle r="1"/></svg>",
+        "<!DOCTYPE html><title>t</title><div id=a class='x  y'><p>one<p class=y>two</div><svg><circle r=\"1\"/></svg>",
         ParseOpts::default(),
     );
     assert_eq!(doc.quirks_mode, QuirksMode::NoQuirks);
