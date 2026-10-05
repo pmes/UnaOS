@@ -3782,6 +3782,9 @@ vein_core = { path = "../../libs/sys/vein_core" }
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).
 amber_core = { path = "../../libs/sys/amber_core", default-features = false }
+# CRYPTOCORE (LEDGER SR27): the cryptographic primitives UnaOS owns — `hash.rs` re-exports its SHA-256 /
+# HMAC-SHA256 / PBKDF2 (moved there from hash.rs). no_std, no alloc needed, zero deps; arch-neutral.
+crypto_core = { path = "../../libs/sys/crypto_core" }
 net = { path = "../net" }
 fdt = "0.1.5"
 # RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so

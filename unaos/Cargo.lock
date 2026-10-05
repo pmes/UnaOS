@@ -73,6 +73,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto_core"
+version = "0.1.0"
+
+[[package]]
 name = "fatfs"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -431,6 +435,7 @@ version = "0.1.0"
 dependencies = [
  "amber_core",
  "cfg-if",
+ "crypto_core",
  "fdt",
  "font8x8",
  "lazy_static",
