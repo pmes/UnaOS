@@ -793,6 +793,49 @@ fn detail(st: &StOut) {
         vr(w + W_USERD + USERD_GP_GET), vr(w + W_USERD + USERD_GP_PUT), vr(w + W_SEM),
         mr(c), mr(c + 4), mr(PMC_ENABLE), mr(PMC_PBDMA_ENABLE), mr(RUNLIST_BASE), mr(RUNLIST_SUBMIT)
     );
+    detail_host();
+}
+
+/// GPUBLIT2 M2: whether the host fetched at all, and who refused it. Reads only.
+/// PFIFO_INTR 0x2100 (nouveau gk104.c:658), SCHED_ERROR 0x256c (:624), runlist event 0x2a00 (:644),
+/// 0x2a04 (:740) and the USERD BAR1 base 0x2254 (:749) — both written by nouveau at fifo init, by us
+/// never —, the CE's engine status 0x2640 + eng*8 (:206), the runlist's pending word 0x2284 + rl*8 (:426);
+/// the channel's RAMFC GP_PUT/GP_GET/GP_FETCH at inst +0x00/+0x14/+0x50 (open-gpu-doc gv100
+/// dev_ram.ref.txt:448/453/468, the same layout as gk104's +0x08 USERD and +0x48 GP_BASE); per PBDMA i
+/// (0x204's bits): its runlist mask 0x2390 + i*4 (gk104.c:392), CHANNEL 0x040120, INTR_0 0x040108
+/// (gf100.c:315-318) and live GP_GET 0x040014 / GP_PUT 0x040000 (gv100 dev_pbdma.ref.txt:425/468),
+/// stride 0x2000.
+fn detail_host() {
+    let opt = |v: u32| -> alloc::string::String {
+        if v == NONE { "-".into() } else { alloc::format!("{}", v) }
+    };
+    let (idx, eng, rl, rst) = (CE_IDX.load(Relaxed), CE_ENG.load(Relaxed), CE_RL.load(Relaxed), CE_RESET.load(Relaxed));
+    let commit = COMMIT_US.load(Relaxed);
+    let inst = win() + W_INST;
+    let eng_stat = if eng < 32 { alloc::format!("{:08X}", mr(0x2640 + eng as usize * 8)) } else { "-".into() };
+    let rl_pend = if rl < 16 { alloc::format!("{:08X}", mr(RUNLIST_INFO + rl as usize * 8)) } else { "-".into() };
+    let mut pb = alloc::string::String::new();
+    let en = mr(PMC_PBDMA_ENABLE);
+    for i in 0..4usize {
+        if en & (1 << i) == 0 {
+            continue;
+        }
+        let b = 0x04_0000 + i * 0x2000;
+        let _ = core::fmt::Write::write_fmt(
+            &mut pb,
+            format_args!(
+                " pb{}={:08X}/{:08X}/{:08X}/{}/{}",
+                i, mr(0x2390 + i * 4), mr(b + 0x120), mr(b + 0x108), mr(b + 0x14), mr(b)
+            ),
+        );
+    }
+    serial_println!(
+        "[gpublit] host ce=ce{} eng={} rl={} reset={} pmc_pre={:08X} rl_pend={} commit_us={} pfifo_intr={:08X} sched={:08X} rl_ev={:08X} r2a04={:08X} userd_bar1={:08X} eng_stat={} ramfc_put={} ramfc_get={} ramfc_fetch={}{} (pbN=runm/chan/intr0/get/put)",
+        opt(idx), opt(eng), opt(rl), opt(rst), PMC_PRE.load(Relaxed), rl_pend,
+        if commit == NONE { "stuck".into() } else { opt(commit) },
+        mr(0x2100), mr(0x256c), mr(0x2a00), mr(0x2a04), mr(0x2254), eng_stat,
+        vr(inst), vr(inst + 0x14), vr(inst + 0x50), pb
+    );
 }
 
 // ---- M3 — `tests gpublit` ---------------------------------------------------------------------------
