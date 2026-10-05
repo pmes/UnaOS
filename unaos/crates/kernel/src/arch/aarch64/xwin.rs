@@ -541,6 +541,27 @@ fn place(b: &[u8]) -> Result<(usize, u64, u64, u32), &'static str> {
     if !entry_ok {
         return Err("entry not in an executable segment");
     }
+    // STORMFAULT (B351): the shared segment plan — the same `elf_core::plan` the x86 loader runs: overlapping
+    // segments, a segment or stack over the args page, a bss into the stack guard, each refused by NAME.
+    {
+        let mut v = [elf_core::Seg::default(); MAX_SEGS];
+        for (d, sg) in v.iter_mut().zip(&segs[..n]) {
+            *d = elf_core::Seg { vaddr: sg.vaddr, filesz: sg.filesz as u64, memsz: sg.memsz as u64, flags: sg.flags };
+        }
+        let w = elf_core::Window {
+            lo: XWIN_OFF as u64,
+            hi: top,
+            args: elf_core::Range { lo: una_abi::USER_ARGS_OFF, hi: una_abi::USER_ARGS_OFF + una_abi::USER_ARGS_BYTES as u64 },
+            elf: true,
+            refuse_overlap: true,
+            stack_default: una_abi::USER_STACK_DEFAULT,
+            stack_max: una_abi::USER_STACK_MAX,
+        };
+        if let Err(e) = elf_core::plan(&v[..n], stack_req as u64, &w) {
+            serial_println!(":: STORMFAULT: refused model=elf arch=aarch64 reason={} ::", e.word());
+            return Err(e.as_str());
+        }
+    }
     // Validated: claim the slot LAST, and unwind through the ordinary teardown on any failure.
     let s = super::uslots::alloc_user_slot().ok_or("no free address-space slot")?;
     let fail = |why: &'static str| -> Result<(usize, u64, u64, u32), &'static str> {
