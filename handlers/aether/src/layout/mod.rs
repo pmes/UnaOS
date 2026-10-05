@@ -167,7 +167,7 @@ fn publish_select_value(node: &NodeRef) {
 }
 
 /// Inline-level elements: they size to content and flow in wrapping rows.
-fn is_inline(name: &str) -> bool {
+pub(crate) fn is_inline(name: &str) -> bool {
     matches!(
         name,
         "a" | "span" | "b" | "strong" | "i" | "em" | "u" | "s" | "code" | "small" | "big"

@@ -18,7 +18,7 @@
 
 mod select;
 
-pub use select::{Selector, Selectors, Specificity};
+pub use select::{El, Selectors};
 
 use html_core::serialize::{self, SerializeOpts};
 use html_core::{Document, Namespace, NodeId, ParseOpts};
@@ -408,10 +408,17 @@ impl NodeRef {
     /// list does not compile.
     pub fn select(&self, selectors: &str) -> Result<std::vec::IntoIter<NodeDataRef<ElementData>>, ()> {
         let sels = Selectors::compile(selectors)?;
-        let out: Vec<NodeDataRef<ElementData>> = self
-            .inclusive_descendants()
-            .filter(|n| n.is_element() && sels.matches_node(n))
-            .filter_map(NodeRef::into_element_ref)
+        let ids: Vec<NodeId> = {
+            let d = self.doc.borrow();
+            let scope = d.element(self.id).map(|_| self.id);
+            std::iter::once(self.id)
+                .chain(d.descendants(self.id))
+                .filter(|&id| sels.matches_in(&d, id, scope))
+                .collect()
+        };
+        let out: Vec<NodeDataRef<ElementData>> = ids
+            .into_iter()
+            .filter_map(|id| NodeRef { doc: self.doc.clone(), id }.into_element_ref())
             .collect();
         Ok(out.into_iter())
     }
@@ -782,11 +789,20 @@ mod tests {
         assert_eq!(n("LI"), 3);
         assert_eq!(n("li:first-child, li:last-child"), 2);
         assert_eq!(n("input:hover"), 0);
-        assert!(doc.select("li::before").is_err());
-        assert!(doc.select("li:focus-visible").is_err());
-        assert!(doc.select("li:is(.a)").is_err());
+        // css_core (AETHERSTYLE): Selectors 4 compiles; pseudo-elements parse and never match an element.
+        assert_eq!(n("li::before"), 0);
+        assert_eq!(n("li:focus-visible"), 0);
+        assert_eq!(n("li:is(.a, .b)"), 2);
+        assert_eq!(n("li:where(.c)"), 1);
+        assert_eq!(n("ul:has(> li.b)"), 1);
+        assert_eq!(n("li:nth-child(odd of :not(.a))"), 1);
+        assert_eq!(n("input:disabled"), 1);
+        assert_eq!(n("input:enabled"), 0);
+        assert_eq!(n("li:not(.a, .b)"), 1);
+        assert!(doc.select("li:::x").is_err());
+        assert!(doc.select("").is_err());
         let s = Selectors::compile("#x, .y, z").unwrap();
-        assert!(s.0[0].specificity() > s.0[1].specificity());
-        assert!(s.0[1].specificity() > s.0[2].specificity());
+        assert!(s.0.0[0].specificity > s.0.0[1].specificity);
+        assert!(s.0.0[1].specificity > s.0.0[2].specificity);
     }
 }
