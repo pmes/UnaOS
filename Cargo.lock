@@ -96,6 +96,7 @@ version = "0.1.0"
 dependencies = [
  "aether",
  "bandy",
+ "facet",
  "quartzite",
  "tokio",
 ]
@@ -2388,11 +2389,24 @@ name = "facet"
 version = "0.1.0"
 dependencies = [
  "bandy",
- "euclase",
+ "image",
+ "log",
+ "tempfile",
+ "tokio",
+ "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
+name = "facet-view"
+version = "0.1.0"
+dependencies = [
+ "bandy",
+ "facet",
  "gneiss_pal",
  "log",
- "lux",
  "quartzite",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
