@@ -14,10 +14,12 @@
 //!   certificate** (`UnsecureProvider`; the trust store is owed), which is why `vein_core::prefs::plan`
 //!   sends the key over it only when the operator set `vein.tls = "insecure"`.
 //! * [`prefs`] — Principia reads (BUS_VERB_PREF_GET) and the whole Vein configuration in one call.
+//! * [`files`] (LUMENUX B348) — whole-file read / create / append over SYS_PATH_* or home-relative SYS_OPEN.
 //! * [`key`] — the key file: read only when it stats with an inode id (UnaFS); refused on FAT.
 //! * [`converse`] — one exchange end to end: resolve, connect, (TLS), encode, stream.
 #![no_std]
 
+pub mod files;
 pub mod key;
 pub mod net;
 pub mod prefs;
