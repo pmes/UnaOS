@@ -87,67 +87,152 @@ struct AnmfHeader {
 }
 
 /// Decode an animated WebP: `p` is just past the VP8X chunk, `end` the RIFF payload end, `(cw, ch)`
-/// the canvas from VP8X.
-fn decode_animated(b: &[u8], mut p: usize, end: usize, cw: u32, ch: u32) -> Result<Image, Error> {
-    let len = crate::rgba_len(cw, ch)?;
-    let (cwu, chu) = (cw as usize, ch as usize);
-    // Pass 1, the demuxer (libwebp `demux.c`): the chunk list. A chunk cut off by the end of the
-    // file ends the list there (the partial frame is dropped, as an incremental demuxer drops it);
-    // a complete frame whose rectangle leaves the canvas refuses the whole file, as libwebp's
-    // `IsValidExtendedFormat` does before any frame is decoded.
-    let mut loop_raw: Option<u16> = None;
-    let mut list: Vec<(AnmfHeader, &[u8])> = Vec::new();
-    while p + 8 <= end {
-        let fourcc = &b[p..p + 4];
-        let size = le32(b, p + 4) as usize;
-        let Some(data) = b.get(p + 8..p + 8 + size) else {
-            break;
-        };
-        p += 8 + size + (size & 1);
-        match fourcc {
-            b"ANIM" => {
-                if data.len() < 6 {
-                    return Err(Error::Truncated);
-                }
-                // Bytes 0..4: background colour (B, G, R, A) — ignored, as libwebp and Blink do.
-                loop_raw = Some(u16::from_le_bytes([data[4], data[5]]));
-            }
-            b"ANMF" => {
-                if loop_raw.is_none() {
-                    return Err(Error::Malformed("webp ANMF before ANIM"));
-                }
-                if data.len() < 16 {
-                    break;
-                }
-                let u24 = |i: usize| data[i] as u32 | (data[i + 1] as u32) << 8 | (data[i + 2] as u32) << 16;
-                let hd = AnmfHeader {
-                    x: 2 * u24(0) as usize,
-                    y: 2 * u24(3) as usize,
-                    w: u24(6) as usize + 1,
-                    h: u24(9) as usize + 1,
-                    duration: u24(12),
-                    blend: data[15] & 0x02 == 0,
-                    dispose_bg: data[15] & 0x01 != 0,
-                };
-                if hd.x + hd.w > cwu || hd.y + hd.h > chu {
-                    return Err(Error::Malformed("webp ANMF frame outside the canvas"));
-                }
-                list.push((hd, &data[16..]));
-            }
-            _ => {} // ICCP, EXIF, XMP and unknown chunks
-        }
-    }
-    if list.is_empty() {
-        return Err(Error::Malformed("webp animation without an ANMF frame"));
-    }
-    // Pass 2: decode and composite. A frame whose bitstream fails ends the animation at the frames
-    // already composited (Blink fails that frame and keeps the earlier ones); a failing FIRST frame
-    // refuses the file.
-    let mut canvas = crate::zeroed(len)?;
+/// the canvas from VP8X. Built on [`Stepper`], the compositor [`crate::Animation`] streams.
+fn decode_animated(b: &[u8], p: usize, end: usize, cw: u32, ch: u32) -> Result<Image, Error> {
+    let mut s = Stepper::new(b, p, end, cw, ch)?;
     let mut frames: Vec<Frame> = Vec::new();
-    // The previous frame's rectangle, disposal, and key-ness (libwebp `IsKeyFrame`).
-    let mut prev: Option<(AnmfHeader, bool)> = None;
-    for (hd, fd) in list {
+    while let Some(r) = s.step(b) {
+        let delay_ms = r?;
+        let mut snap = Vec::new();
+        snap.try_reserve_exact(s.canvas.len()).map_err(|_| Error::OutOfMemory)?;
+        snap.extend_from_slice(&s.canvas);
+        frames.push(Frame { delay_ms, rgba: snap });
+    }
+    let mut img = Image::still(cw, ch, frames[0].rgba.clone());
+    if frames.len() > 1 {
+        img.frames = Some(frames);
+        img.loop_count = s.loop_count();
+    }
+    Ok(img)
+}
+
+/// Where an animated WebP starts: `Some((p, end, cw, ch))` for [`Stepper::new`] when the VP8X chunk
+/// carries the Animation flag, `None` for a still (or anything [`decode`] would refuse).
+pub(crate) fn animation_start(b: &[u8]) -> Option<(usize, usize, u32, u32)> {
+    if b.len() < 20 || &b[0..4] != b"RIFF" || &b[8..12] != b"WEBP" {
+        return None;
+    }
+    let end = (8 + le32(b, 4) as usize).min(b.len());
+    let mut p = 12usize;
+    while p + 8 <= end {
+        let size = le32(b, p + 4) as usize;
+        let data = b.get(p + 8..p + 8 + size)?;
+        match &b[p..p + 4] {
+            b"VP8L" | b"VP8 " | b"ANIM" | b"ANMF" => return None,
+            b"VP8X" => {
+                if data.len() < 10 || data[0] & 0x02 == 0 {
+                    return None;
+                }
+                let w = (data[4] as u32 | (data[5] as u32) << 8 | (data[6] as u32) << 16) + 1;
+                let h = (data[7] as u32 | (data[8] as u32) << 8 | (data[9] as u32) << 16) + 1;
+                return Some((p + 8 + size + (size & 1), end, w, h));
+            }
+            _ => {}
+        }
+        p += 8 + size + (size & 1);
+    }
+    None
+}
+
+/// The animated-WebP compositor, one frame per [`Stepper::step`]: the demuxed frame list (headers +
+/// the byte ranges of their bitstreams — the bytes are passed to every call), ONE canvas, and the previous frame's rectangle / disposal / key-ness.
+pub struct Stepper {
+    list: Vec<(AnmfHeader, core::ops::Range<usize>)>,
+    loop_raw: u16,
+    cw: usize,
+    ch: usize,
+    pub(crate) canvas: Vec<u8>,
+    next: usize,
+    prev: Option<(usize, bool)>,
+    done: bool,
+}
+
+impl Stepper {
+    pub(crate) fn new(b: &[u8], mut p: usize, end: usize, cw: u32, ch: u32) -> Result<Self, Error> {
+        let len = crate::rgba_len(cw, ch)?;
+        let (cwu, chu) = (cw as usize, ch as usize);
+        // Pass 1, the demuxer (libwebp `demux.c`): the chunk list. A chunk cut off by the end of the
+        // file ends the list there (the partial frame is dropped, as an incremental demuxer drops it);
+        // a complete frame whose rectangle leaves the canvas refuses the whole file, as libwebp's
+        // `IsValidExtendedFormat` does before any frame is decoded.
+        let mut loop_raw: Option<u16> = None;
+        let mut list: Vec<(AnmfHeader, core::ops::Range<usize>)> = Vec::new();
+        while p + 8 <= end {
+            let fourcc = &b[p..p + 4];
+            let size = le32(b, p + 4) as usize;
+            let Some(data) = b.get(p + 8..p + 8 + size) else {
+                break;
+            };
+            let at = p + 8;
+            p += 8 + size + (size & 1);
+            match fourcc {
+                b"ANIM" => {
+                    if data.len() < 6 {
+                        return Err(Error::Truncated);
+                    }
+                    // Bytes 0..4: background colour (B, G, R, A) — ignored, as libwebp and Blink do.
+                    loop_raw = Some(u16::from_le_bytes([data[4], data[5]]));
+                }
+                b"ANMF" => {
+                    if loop_raw.is_none() {
+                        return Err(Error::Malformed("webp ANMF before ANIM"));
+                    }
+                    if data.len() < 16 {
+                        break;
+                    }
+                    let u24 = |i: usize| data[i] as u32 | (data[i + 1] as u32) << 8 | (data[i + 2] as u32) << 16;
+                    let hd = AnmfHeader {
+                        x: 2 * u24(0) as usize,
+                        y: 2 * u24(3) as usize,
+                        w: u24(6) as usize + 1,
+                        h: u24(9) as usize + 1,
+                        duration: u24(12),
+                        blend: data[15] & 0x02 == 0,
+                        dispose_bg: data[15] & 0x01 != 0,
+                    };
+                    if hd.x + hd.w > cwu || hd.y + hd.h > chu {
+                        return Err(Error::Malformed("webp ANMF frame outside the canvas"));
+                    }
+                    list.push((hd, at + 16..at + size));
+                }
+                _ => {} // ICCP, EXIF, XMP and unknown chunks
+            }
+        }
+        if list.is_empty() {
+            return Err(Error::Malformed("webp animation without an ANMF frame"));
+        }
+        let canvas = crate::zeroed(len)?;
+        Ok(Stepper { list, loop_raw: loop_raw.unwrap_or(0), cw: cwu, ch: chu, canvas, next: 0, prev: None, done: false })
+    }
+
+    /// Frames the demuxer listed (an upper bound: a frame whose bitstream fails ends the animation).
+    pub fn listed(&self) -> usize {
+        self.list.len()
+    }
+
+    /// [`Image::loop_count`]'s meaning of the ANIM loop count.
+    pub fn loop_count(&self) -> Option<u16> {
+        crate::loop_from_plays(self.loop_raw as u32)
+    }
+
+    /// Back to before frame 0.
+    pub fn reset(&mut self) {
+        self.canvas.fill(0);
+        self.next = 0;
+        self.prev = None;
+        self.done = false;
+    }
+
+    /// Decode and composite the next frame onto the canvas; its duration, or `None` at the end. A
+    /// frame whose bitstream fails ends the animation at the frames already composited (Blink fails
+    /// that frame and keeps the earlier ones); a failing FIRST frame refuses the file.
+    pub fn step(&mut self, b: &[u8]) -> Option<Result<u32, Error>> {
+        if self.done || self.next >= self.list.len() {
+            return None;
+        }
+        let i = self.next;
+        let (cwu, chu) = (self.cw, self.ch);
+        let (hd, fd) = (&self.list[i].0, &b[self.list[i].1.clone()]);
         let decoded = decode_frame_data(fd).and_then(|(fw, fh, px, a)| {
             if (fw as usize, fh as usize) != (hd.w, hd.h) {
                 Err(Error::Malformed("webp ANMF frame size differs from its bitstream"))
@@ -157,26 +242,34 @@ fn decode_animated(b: &[u8], mut p: usize, end: usize, cw: u32, ch: u32) -> Resu
         });
         let (px, has_alpha) = match decoded {
             Ok(v) => v,
-            Err(e) if frames.is_empty() => return Err(e),
-            Err(_) => break,
+            Err(e) if i == 0 => {
+                self.done = true;
+                return Some(Err(e));
+            }
+            Err(_) => {
+                self.done = true;
+                return None;
+            }
         };
         let full = hd.w == cwu && hd.h == chu;
+        let prev = self.prev.map(|(pi, pkey)| (&self.list[pi].0, pkey));
         // Inside the rectangle the previous frame disposed, the starting pixel is transparent
         // and libwebp/Blink do NOT blend there (`FindBlendRangeAtRow`): the frame is copied.
-        let disposed = match &prev {
+        let disposed = match prev {
             Some((ph, _)) if ph.dispose_bg => Some((ph.x, ph.y, ph.x + ph.w, ph.y + ph.h)),
             _ => None,
         };
-        let key = match &prev {
+        let key = match prev {
             None => true,
             Some((ph, pkey)) => {
-                ((!has_alpha || !hd.blend) && full) || (ph.dispose_bg && ((ph.w == cwu && ph.h == chu) || *pkey))
+                ((!has_alpha || !hd.blend) && full) || (ph.dispose_bg && ((ph.w == cwu && ph.h == chu) || pkey))
             }
         };
+        let canvas = &mut self.canvas;
         // Bring the canvas to this frame's starting state: the previous frame's disposal.
-        if let Some((ph, _)) = &prev {
+        if let Some((ph, _)) = prev {
             if ph.dispose_bg {
-                clear_rect(&mut canvas, cwu, ph.x, ph.y, ph.w, ph.h);
+                clear_rect(canvas, cwu, ph.x, ph.y, ph.w, ph.h);
             }
         }
         if key {
@@ -197,18 +290,11 @@ fn decode_animated(b: &[u8], mut p: usize, end: usize, cw: u32, ch: u32) -> Resu
                 canvas[d..d + 4].copy_from_slice(&out);
             }
         }
-        let mut snap = Vec::new();
-        snap.try_reserve_exact(len).map_err(|_| Error::OutOfMemory)?;
-        snap.extend_from_slice(&canvas);
-        frames.push(Frame { delay_ms: hd.duration, rgba: snap });
-        prev = Some((hd, key));
+        let delay = hd.duration;
+        self.prev = Some((i, key));
+        self.next += 1;
+        Some(Ok(delay))
     }
-    let mut img = Image::still(cw, ch, frames[0].rgba.clone());
-    if frames.len() > 1 {
-        img.frames = Some(frames);
-        img.loop_count = crate::loop_from_plays(loop_raw.unwrap_or(0) as u32);
-    }
-    Ok(img)
 }
 
 /// Zero (transparent black) the `w x h` rectangle at `(x, y)` of a `cw`-wide RGBA canvas.
