@@ -34,6 +34,9 @@ members = [
     "unaos/libs/web/html_core",
     # CSSCORE (SR47): CSS Syntax 3 + Selectors 4 + the cascade helpers, no_std, zero deps.
     "unaos/libs/web/css_core",
+    # HTTPCORE (SR51): the no_std HTTP client core (URL, HTTP/1.1, cookies, codings, h2) + its host transport.
+    "unaos/libs/net/http_core",
+
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",

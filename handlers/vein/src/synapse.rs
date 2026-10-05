@@ -14,8 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use gneiss_pal::api::http::{Error, RequestBuilder, Response};
 use gneiss_pal::api::retry::{RetryPolicy, send_with_backoff};
-use reqwest::{RequestBuilder, Response};
 use std::future::Future;
 
 /// The Synaptic Governor.
@@ -27,11 +27,11 @@ use std::future::Future;
 /// answered once the budget is spent.
 pub trait SynapticRetry {
     // Desugared to avoid `async fn` in trait warning and allow Send bounds.
-    fn fire_with_backoff(self) -> impl Future<Output = reqwest::Result<Response>> + Send;
+    fn fire_with_backoff(self) -> impl Future<Output = Result<Response, Error>> + Send;
 }
 
 impl SynapticRetry for RequestBuilder {
-    fn fire_with_backoff(self) -> impl Future<Output = reqwest::Result<Response>> + Send {
+    fn fire_with_backoff(self) -> impl Future<Output = Result<Response, Error>> + Send {
         async move { send_with_backoff(self, &RetryPolicy::default()).await }
     }
 }

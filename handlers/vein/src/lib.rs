@@ -85,15 +85,16 @@ async fn execute_upload(path: PathBuf, app_state: Arc<RwLock<AppState>>, synapse
         }
     };
 
-    let client = reqwest::Client::new();
+    // HTTPCORE (SR51): UnaOS's own client (http_core over tls_core), reqwest's shape.
+    let client = gneiss_pal::api::http::Client::new();
     let url = "https://vein-s9-upload-1035558613434.us-central1.run.app/upload";
 
-    let part = reqwest::multipart::Part::bytes(file_bytes)
+    let part = gneiss_pal::api::http::multipart::Part::bytes(file_bytes)
         .file_name(filename.clone())
         .mime_str("application/octet-stream")
         .expect("Failed to set mime type");
 
-    let form = reqwest::multipart::Form::new()
+    let form = gneiss_pal::api::http::multipart::Form::new()
         .part("file", part)
         .text("description", "Uploaded via Vein Client");
 

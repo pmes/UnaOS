@@ -92,17 +92,17 @@ replacement = "arc SVGCORE — `unaos/libs/media/svg_core` (SVG 1.1 static subse
 [chicken_wire.reqwest]
 capability = "HTTP client (HTTP/1.1 + HTTP/2, redirects, TLS via rustls)"
 verdict = "OWED"
-replacement = "arc HTTPCORE — `unaos/libs/net/http_core` (RFC 9112 client, no_std, over TLSCORE SR28; the kernel's B239 `fetch` is the seed)"
+replacement = "HTTPCORE SR51 — `unaos/libs/net/http_core` + `gneiss_pal::api::http` replaced it in gneiss_pal/vein/aether; only `tools/foreman` still links it (owed: foreman → gneiss_pal::api::http)"
 
 [chicken_wire.tokio-tungstenite]
 capability = "WebSocket client (RFC 6455)"
-verdict = "OWED"
-replacement = "arc HTTPCORE — RFC 6455 framing in `http_core::ws`"
+verdict = "CUT"
+replacement = "HTTPCORE SR51 — deleted: no live caller (Aether's api/websockets.rs is a stub); an RFC 6455 client in http_core is owed when a caller appears"
 
 [chicken_wire.octocrab]
 capability = "GitHub REST client (an HTTP client + API model)"
-verdict = "OWED"
-replacement = "arc HTTPCORE — Forge's few REST calls become `http_core` GETs/POSTs with serde_json bodies"
+verdict = "CUT"
+replacement = "HTTPCORE SR51 — gneiss_pal::forge speaks GET /user, /user/repos, /repos/{o}/{r}/contents over gneiss_pal::api::http"
 
 [chicken_wire.smoltcp]
 capability = "TCP/IP stack (kernel, x86 default net path)"

@@ -164,7 +164,7 @@ pub trait SseHandler: Send {
     fn done(&self) -> bool;
 }
 
-type ByteStream = std::pin::Pin<Box<dyn futures_core::Stream<Item = reqwest::Result<Vec<u8>>> + Send>>;
+type ByteStream = std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<Vec<u8>, super::http::Error>> + Send>>;
 
 struct SseState<H> {
     body: ByteStream,
@@ -175,8 +175,8 @@ struct SseState<H> {
 }
 
 /// Turn a successful `text/event-stream` response into a [`DeltaStream`].
-pub fn sse_stream<'a, H: SseHandler + 'a>(res: reqwest::Response, handler: H) -> DeltaStream<'a> {
-    let body: ByteStream = Box::pin(res.bytes_stream().map(|r| r.map(|b| b.to_vec())));
+pub fn sse_stream<'a, H: SseHandler + 'a>(res: super::http::Response, handler: H) -> DeltaStream<'a> {
+    let body: ByteStream = Box::pin(res.bytes_stream());
     let st = SseState { body, dec: SseDecoder::new(), pending: VecDeque::new(), handler, ended: false };
     Box::pin(futures_util::stream::unfold(st, |mut st| async move {
         loop {

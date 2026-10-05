@@ -27,7 +27,7 @@
 
 use std::time::Duration;
 
-use reqwest::{RequestBuilder, Response};
+use super::http::{self, RequestBuilder, Response};
 
 use super::provider::ProviderError;
 
@@ -74,8 +74,7 @@ pub fn is_retryable(status: u16) -> bool {
 /// The `retry-after` header as a wait, when it is a number of seconds.
 pub fn retry_after(res: &Response) -> Option<Duration> {
     res.headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
+        .get("retry-after")
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|s| s.is_finite() && *s >= 0.0)
         .map(Duration::from_secs_f64)
@@ -85,14 +84,11 @@ pub fn retry_after(res: &Response) -> Option<Duration> {
 /// connection errors under `policy`. Answers the last response, whatever its
 /// status, once the budget is spent — the caller classifies it. A connection
 /// error on the last attempt is returned as the `Err`.
-pub async fn send_with_backoff(template: RequestBuilder, policy: &RetryPolicy) -> reqwest::Result<Response> {
+pub async fn send_with_backoff(template: RequestBuilder, policy: &RetryPolicy) -> Result<Response, http::Error> {
     let mut attempt = 0u32;
     loop {
-        let req = match template.try_clone() {
-            Some(r) => r,
-            // A streaming body cannot be cloned: one shot, no retry.
-            None => return template.send().await,
-        };
+        // Bodies are owned bytes in api::http: every attempt resends the same request.
+        let req = template.clone();
         match req.send().await {
             Ok(res) => {
                 let status = res.status().as_u16();
