@@ -1,7 +1,7 @@
 //! The font database (AETHERFONT, SR61): every outline face under the host's font directories, read with
 //! `font_core` (sfnt + `name` + `OS/2`), indexed by family name, and the CSS Fonts 4 face selection over it.
 //!
-//! - Discovery: fontconfig's `<dir>`s ([`super::fontconfig::Config`]) walked for `.ttf/.otf/.ttc/.otc`; each
+//! - Discovery: fontconfig's `<dir>`s ([`crate::fontconfig::Config`]) walked for `.ttf/.otf/.ttc/.otc`; each
 //!   face of a collection is a record. Bitmap-only faces (no `glyf`/`CFF`, e.g. CBDT emoji) and Type 1 files
 //!   are not readable by font_core and are skipped.
 //! - Family lookup (Chromium on Linux, `FontCache::GetFontPlatformData` → Skia's fontconfig interface): an
@@ -19,7 +19,7 @@
 //!   applied in configuration order), which is the list `gfx::GetFontForCharacter` walks for a character
 //!   none of the CSS families covers.
 
-use super::fontconfig::{family_eq, Config};
+use crate::fontconfig::{family_eq, Config};
 use font_core::Font;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -337,7 +337,7 @@ impl FontDb {
 
 /// 0 when the face's file covers a–z (fontconfig's `en` orthography), else 1.
 fn latin_rank(f: &FaceInfo) -> usize {
-    let Some(face) = super::load_face(f) else { return 2 };
+    let Some(face) = crate::load_face(f) else { return 2 };
     if ('a'..='z').all(|c| face.font.glyph_index(c) != 0) {
         0
     } else {

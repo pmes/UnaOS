@@ -23,7 +23,8 @@ async-channel = "2.5"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ab_glyph = "0.2.32"
+# QUARTZFONT (SR64): the chrome's text on font_core through the shared host font stack (ab_glyph is gone).
+text_host = { path = "../text_host" }
 chrono = "0.4"
 tokio = { version = "1.53", features = ["rt", "macros"] }
 
