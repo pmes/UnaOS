@@ -476,7 +476,7 @@ fn repaint() {
         text(px, LX, 76, n.line(0), theme::ACCENT);
         text(px, LX, 100, n.line(1), theme::ACCENT);
         button(px, Ctl::AlertOk, b"OK", true, false);
-        text(px, LX, 186, b"Enter, Esc or OK", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, 186, if ALERT_PREV.load(Ordering::Relaxed) == 0 { b"OK, or it closes itself" as &[u8] } else { b"Enter, Esc or OK" }, theme::TITLE_TEXT_INACTIVE); // CONSOLEFIX M2: a session notice takes no keys
         drop(f);
         let id = WIN.load(Ordering::Relaxed);
         if id != wm::WIN_NONE {
@@ -641,6 +641,7 @@ pub fn open_create_user() {
 }
 
 fn open_as(state: State) {
+    if state != State::Alert && notice_nonmodal() { notice_yield(); } // CONSOLEFIX M2: a session notice never blocks the screen opening — it steps aside (requeued) and the form opens
     {
         let mut f = FORM.lock();
         if f.state == State::Open || f.state == State::SetPw || f.state == State::Alert || f.state == State::CreateUser {
@@ -695,12 +696,12 @@ fn open_as(state: State) {
         crate::splash::hold_release("first-screen");
         return;
     }
-    WIN.store(id, Ordering::Relaxed); wm::set_modal_top(id); // LOGINZ (B223): the screen and the alert are the ceiling — a later create or focus-raise cannot pass them (flight 15 §2: "the pw dialog got covered up")
+    let nonmodal = state == State::Alert && ALERT_PREV.load(Ordering::Relaxed) == 0; WIN.store(id, Ordering::Relaxed); if !nonmodal { wm::set_modal_top(id); } // CONSOLEFIX M2: a session notice is NOT pinned. LOGINZ (B223): the screen and the alert are the ceiling — a later create or focus-raise cannot pass them (flight 15 §2: "the pw dialog got covered up")
     wm::winid_register_holder(&WIN, "login");
     // Modal over the glass: the console keeps taking glyphs, serial keeps every line, but it stops
     // presenting until the session opens (instgui's rule and reason).
-    fbcon::console_present_suspend(true);
-    crate::bootlog_println!("[login] screen open window={} box={}x{} at ({},{}) modal=true", id, ow, oh, ox, oy);
+    if !nonmodal { fbcon::console_present_suspend(true); } // CONSOLEFIX M2: the console keeps presenting under a session notice
+    crate::bootlog_println!("[login] screen open window={} box={}x{} at ({},{}) modal={}", id, ow, oh, ox, oy, !nonmodal);
     repaint();
     crate::splash::hold_release("first-screen"); // SPLASH2 M3: the first real screen (setter / create-user / login) is PAINTED — the splash gives the glass up now
 }
@@ -760,7 +761,7 @@ pub fn reopen_after_logout() {
 }
 
 pub fn is_open() -> bool {
-    matches!(FORM.lock().state, State::Open | State::SetPw | State::Alert | State::CreateUser)
+    let s = FORM.lock().state; matches!(s, State::Open | State::SetPw | State::CreateUser) || (s == State::Alert && ALERT_PREV.load(Ordering::Relaxed) != 0) // CONSOLEFIX M2 (B365): a notice over the SESSION is not "the screen" — it takes no key, no press outside itself, and is not secret input
 }
 
 /// SO36 + SO44 — **the screen's answer to a PRESS, and it is the same answer everywhere.**
@@ -813,7 +814,7 @@ pub fn is_open() -> bool {
 /// edge, once, the grammar the close disc and every furniture arm already follow.
 pub fn press_swallow(x: i32, y: i32) -> bool {
     if !is_open() {
-        return false;
+        return notice_press(x, y); // CONSOLEFIX M2: a session notice answers only presses on its own row
     }
     // LOGINCLOSE — the same belt [`consume_key`] runs, for the same reason and one layer earlier: a
     // press routed into a screen that is not on the glass is a press into nothing, and the row's
@@ -1915,7 +1916,8 @@ pub fn notice_pump() {
     };
     NOTICE_SHOWN.fetch_add(1, Ordering::Relaxed);
     open_alert();
-    serial_println!(":: NOTICE-OPEN: title={} lines={} -> PASS ::", core::str::from_utf8(note.title()).unwrap_or("?"), note.lines());
+    let nm = notice_nonmodal(); NOTICE_DEADLINE.store(if nm { crate::arch::ms().saturating_add(NOTICE_TIMEOUT_MS).max(1) } else { 0 }, Ordering::Relaxed); // CONSOLEFIX M2
+    serial_println!(":: NOTICE-OPEN: title={} lines={} modal={} -> PASS ::", core::str::from_utf8(note.title()).unwrap_or("?"), note.lines(), if nm { "none" } else { "screen" });
 }
 
 /// `video::notice::show(title, text)`: `text` is up to two `\n`-separated lines. Opens now, or queues behind
@@ -2134,8 +2136,8 @@ pub fn logout_fixture(name: &[u8], password: &[u8]) {
     let d0 = NOTICE_DISMISSED.load(Ordering::Relaxed);
     refused_alert("no-users");
     let alert_up = FORM.lock().state == State::Alert;
-    let _ = consume_key(b'\n');
-    let alert_closed = !is_open() && NOTICE_DISMISSED.load(Ordering::Relaxed).wrapping_sub(d0) == 1;
+    let passes = !consume_key(b'\n'); alert_ok(); // CONSOLEFIX M2: the refusal is a session notice — Enter goes to the console, OK closes it
+    let alert_closed = passes && !is_open() && NOTICE_DISMISSED.load(Ordering::Relaxed).wrapping_sub(d0) == 1;
     FORM.lock().state = State::Closed;
     // 2 — the accepted Log Out round trip
     let _ = users::logout();
@@ -2181,4 +2183,133 @@ pub fn shot_release() -> bool {
     FORM.lock().state = State::Session;
     serial_println!("[login] shot lock released (the shot's own lock; the session never ended)");
     true
+}
+
+// ---------------------------------------------------------------------------
+// CONSOLEFIX M2 (rmbp-ledger B365) — A NOTICE NEVER TAKES THE CONSOLE'S KEYS
+// ---------------------------------------------------------------------------
+//
+// Flight 22: every notice was the login screen's `State::Alert`, and `is_open()` counted it, so every
+// route's `screen_key` handed the key to the screen ("[login] key taken by the screen"), the row was
+// pinned modal and the console stopped presenting. Four seat-typed lines vanished; the holocron client's
+// answer (queued) opened on the NEXT typed byte and that line's own `\r` closed it — "a flash".
+//
+// Now a notice raised over the SESSION (`ALERT_PREV == 0`) is NON-MODAL: `is_open()` leaves it out (so
+// `users::screen_up`/`secret_input` and every key route pass through to the console, which keeps its
+// input queue), `open_as` neither pins it nor suspends the console, a press is its own only on its row
+// (OK closes it), and it closes itself after `NOTICE_TIMEOUT_MS`. Queued notices open from
+// `notice_service` (the storage passes, beside `users::service`) without waiting for a key. A notice
+// over the login form or the setter keeps that screen's modality: the screen owns the keys anyway.
+
+/// How long a session notice stays on the glass before it closes itself.
+const NOTICE_TIMEOUT_MS: u64 = 8000;
+/// `arch::ms()` at which the session notice on the glass closes itself (`0` = none armed).
+static NOTICE_DEADLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A notice is on the glass over the session (not over the login form / setter): non-modal.
+pub fn notice_nonmodal() -> bool {
+    FORM.lock().state == State::Alert && ALERT_PREV.load(Ordering::Relaxed) == 0
+}
+
+/// Close the session notice on the glass (`by` = click / timeout) and open the next queued one.
+fn notice_close(by: &str) {
+    let t = notice_current();
+    NOTICE_DEADLINE.store(0, Ordering::Relaxed);
+    take_down();
+    FORM.lock().state = State::Session;
+    serial_println!("[notice] closed by={} title={}", by, core::str::from_utf8(t.title()).unwrap_or("?"));
+    notice_dismissed();
+}
+
+/// The screen is about to open a form over a session notice: the notice steps aside — its row goes,
+/// and it goes back to the HEAD of the queue so it shows again once the session is back.
+fn notice_yield() {
+    NOTICE_DEADLINE.store(0, Ordering::Relaxed);
+    take_down();
+    FORM.lock().state = State::Closed;
+    let mut g = NOTICES.lock();
+    if let Some(cur) = g.cur.take() {
+        let n = g.n.min(NQ_CAP - 1);
+        for i in (0..n).rev() {
+            g.q[i + 1] = g.q[i];
+        }
+        g.q[0] = cur;
+        g.n = n + 1;
+    }
+    drop(g);
+    serial_println!("[notice] yielded to the screen (requeued)");
+}
+
+/// A press while no form is up: the session notice's row answers presses ON it (OK closes it); every
+/// other press belongs to the desktop. `false` when no session notice is up.
+fn notice_press(x: i32, y: i32) -> bool {
+    if !notice_nonmodal() {
+        return false;
+    }
+    let Some((lx, ly)) = local_of(x, y) else { return false };
+    let (rx, ry, rw, rh) = ctl_rect(Ctl::AlertOk, false);
+    if lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32 {
+        notice_close("click");
+    }
+    true
+}
+
+/// The notice service (the storage passes, beside `users::service`): close a session notice whose time is
+/// up, and open a queued notice while no form is up. One relaxed load when nothing is armed.
+pub fn notice_service() {
+    let d = NOTICE_DEADLINE.load(Ordering::Relaxed);
+    if d != 0 && crate::arch::ms() >= d {
+        if notice_nonmodal() {
+            notice_close("timeout");
+        } else {
+            NOTICE_DEADLINE.store(0, Ordering::Relaxed);
+        }
+    }
+    if !is_open() && !notice_nonmodal() {
+        notice_pump();
+    }
+}
+
+/// `tests notice` (CONSOLEFIX M2): a notice opens over the session, a console line is typed THROUGH it on the
+/// route every key path asks first (`users::screen_key`), and the line must come back whole: nothing taken,
+/// nothing modal, the notice still up after the line's own `\r` and an Esc (no flash), then it closes
+/// itself on its timeout. Headless (no `wm` row), so it runs on any build that has the screen.
+pub fn notice_typing_fixture() {
+    let was = HEADLESS.swap(true, Ordering::Relaxed);
+    let prev_state = FORM.lock().state;
+    let prev_alert = ALERT_PREV.load(Ordering::Relaxed);
+    let saved = { let mut g = NOTICES.lock(); let c = (g.cur.take(), g.q, g.n); g.n = 0; c };
+    FORM.lock().state = State::Session;
+    notice_show(b"Program stopped", b"fixture.elf");
+    let up = FORM.lock().state == State::Alert && notice_nonmodal();
+    let modal = users::screen_up() || users::secret_input();
+    const LINE: &[u8] = b"echo typed-through-notice\r\x1b";
+    let mut got = [0u8; 32];
+    let mut n = 0usize;
+    for &b in LINE {
+        if !users::screen_key(b) && n < got.len() {
+            got[n] = b;
+            n += 1;
+        }
+    }
+    let typed = &got[..n] == LINE;
+    let flash = !(FORM.lock().state == State::Alert && NOTICES.lock().cur.is_some());
+    NOTICE_DEADLINE.store(1, Ordering::Relaxed); // its time is up
+    notice_service();
+    let timed_out = FORM.lock().state == State::Session && NOTICES.lock().cur.is_none();
+    {
+        let mut g = NOTICES.lock();
+        g.cur = saved.0;
+        g.q = saved.1;
+        g.n = saved.2;
+    }
+    FORM.lock().state = prev_state;
+    ALERT_PREV.store(prev_alert, Ordering::Relaxed);
+    HEADLESS.store(was, Ordering::Relaxed);
+    serial_println!("[notice] fixture up={} typed={}/{} timeout_close={}", up, n, LINE.len(), timed_out);
+    let ok = up && !modal && typed && !flash && timed_out;
+    serial_println!(
+        ":: NOTICE: typed_through={} modal={} flash={} -> {} ::",
+        if typed { "ok" } else { "lost" }, if modal { "screen" } else { "none" }, if flash { "yes" } else { "none" }, if ok { "PASS" } else { "FAIL" }
+    );
 }
