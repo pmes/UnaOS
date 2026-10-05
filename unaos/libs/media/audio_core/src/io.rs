@@ -6,7 +6,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 /// A forward-only byte source (the kernel implements it over the VFS, the host over a file or a slice).
-pub trait Read {
+pub trait Read: Send {
     /// Fill as much of `buf` as is available; `Ok(0)` is end of stream.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 }

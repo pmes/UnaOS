@@ -15,6 +15,7 @@ synthesis engine with no file decoding. Nothing in the tree decoded FLAC, Ogg, O
 
 ```rust
 pub fn sniff(head: &[u8]) -> Format;              // Wav | Aiff | Flac | Ogg | Mp3 | Adts | Mp4 | Unknown
+// Read and Source are `Send`: a decoder can move to an audio thread (host) or live in the kernel's player state
 pub trait AudioDecoder {
     fn open(src: Box<dyn Read>) -> Result<Self>;  // forward-only no_std reader; Decoder::open_bytes(Vec<u8>)
     fn info(&self) -> Info;                       // rate, channels, bits, frames: Option<u64>, format, codec, float
@@ -27,6 +28,15 @@ pub fn decode_all(bytes: &[u8]) -> Result<(Info, Vec<f32>)>;   // + decode_all_i
 `Decoder` is the concrete type (`open` sniffs and picks the codec); every codec is a `Source`
 (`info` + `block(&mut Pcm)`), so a demuxer that already has packets (PLAYBACK's MP4/WebM) can wrap a codec
 source directly with `Decoder::from_source`.
+
+**Per-packet entry points** (for a demuxer that already holds packets — PLAYBACK's `dsp::audio_track`
+registry, which today reports compressed tracks `Unsupported` until such a seam exists):
+`opus::OpusDecoder::new(ch)` + `decode(Some(pkt), &mut [i16], frame_size)`; `vorbis::Setup::parse(ident,
+setup)` + `VorbisDecoder::decode(pkt, &mut planes)`; `aac::Asc::parse(esds_dsi)` → `AacDecoder::new(sf_index,
+layout)` + `decode_block(&mut BitReader::new(au), 0)` (1024 frames in `out`); `mp3::Header::parse` +
+`Mp3Decoder::decode_frame`. Wiring them into `audio_decoder_for` is the PLAYBACK×AUDIOCODEC fold's job; note
+both branches create `libs/gneiss_pal/src/dsp/mod.rs` — the fold takes the union (`audio`, `audio_track`,
+`avsync`, `video`).
 
 **Sample rule (documented, no dither anywhere).** Integer source of depth `b` → f32 `s / 2^(b-1)` (exact for
 `b ≤ 24`); → i32 left-justified, so `>> 16` is 16-bit for any source. Float → i32 `round(clamp(x)·2^31)`.
@@ -279,3 +289,52 @@ after the mdat; fragmented; plain), 792 KB with faad's 16-bit decodes stored as 
 
 Owed: SBR and PS (HE-AAC v1/v2: today the LC core at half rate), AAC Main prediction, LTP, CCE application,
 960-sample frames, ER/LD/ELD, Opus/FLAC/ALAC in MP4.
+
+## M5 — the kernel's `play <file>` decodes through audio_core
+
+`unaos/crates/kernel` links audio_core by path, **optional, pulled in by `hda-tone` only** (the feature that
+already gates `drivers/hda_play.rs`), so a build without the player does not compile it.
+
+* `drivers/hda_play.rs` — five same-line folds, line count unchanged up to the old tail (code first, comments
+  after): `open_wav`'s refusal arm becomes `return open_coded(path, r)`, so anything the native WAV parse
+  refuses (every non-RIFF file, and 24/32-bit, float, EXTENSIBLE or > 2-channel WAVs) goes to audio_core;
+  `service()` gains `coded_pump()` / `coded_report()` beside `wav_pump()` / `report()`; `stop()` drops the
+  coded player with the WAV one; the usage line names the formats. Tail-appended: `VfsSrc` (audio_core's
+  `Read` over the VFS, 32 KiB forward reads — files stream, nothing is loaded whole except MP4), the
+  `Coded` state, `open_coded` (sniff + open + `start(rate/decim, ≤2 ch, 16)`), `coded_pump` (up to four
+  4096-frame blocks per tick into the existing `feed()` ring, held back while the FIFO is full; integer
+  only: `next_i32` → Q15 downmix to ≤ 2 channels, integer decimation to ≤ 48 kHz, so 88.2/96 kHz play at
+  44.1/48), the `:: PLAYCODEC: path= format= codec= rate= frames= lpib_moved= done= -> PASS|FAIL ::`
+  witness (frames fed = frames the ring consumed, decoder error-free, frames decoded = the container's
+  stated count when it states one, no underrun, LPIB moved, ring drained), and `tests play [fmt]`.
+* `tests play` (registered beside `playwav`, same-line in `arch/x86_64/syscall.rs`) plays `TEST.FLAC`,
+  `TEST.OPUS`, `TEST.OGG` (Vorbis), `TEST.MP3`, `TEST.AAC`, `TEST.M4A`, `TEST.AIF` from the user's home,
+  `/home` or `/`; a missing file prints `:: PLAYCODEC: fmt=<fmt> path=- reason=no-file … -> SKIP ::`.
+  `tests play flac` runs one format: `tests.rs` keeps the word after the fixture name (`tests::arg()`,
+  one same-line fold in `shell_verb` + a tail accessor).
+* x86 metal shape, once, from `unaos/crates/kernel`: `cargo +nightly check --release --target
+  ../../x86_64-unaos.json -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
+  -Z json-target-spec --features "wc,quarry,ftdirx,login,loginst,nvidia-kepler-vblank,smc,usbnet,hda,hda-tone,
+  facet,beam,sdw,sdwrite,sdhcblk,selfhost,linuxabi,ahci,unafs,busreg,lumen,netring3,prefs_reset,census,
+  installdemo,instgui,witness"` → **rc=0**, audio_core checked for the kernel target, no warning in any file
+  this arc touched (the 75 warnings are pre-existing, elsewhere); target deleted.
+* Not flown: no metal or QEMU run in this arc. The kernel target is `+soft-float` (SSE off), so in the kernel
+  FLAC, WAV/AIFF and Opus (the fixed-point decoder) are integer end to end, while MP3, AAC and Vorbis run
+  their float maths through compiler-builtins soft-float — whether they keep up in real time inside the
+  service tick is the first thing a metal flight must measure (`under=` on the PLAYCODEC line).
+
+`tools/audio-check <file> [--out pcm.wav]` (host): sniff, decode, print what it is (format, codec, rate,
+channels, frames vs stated, peak/RMS, decode speed) and write the PCM as a float WAV (the "ears" path —
+Chromium can play it back).
+
+## Ceiling and what is owed (whole arc)
+
+Decodes today: WAV (PCM 8–32, float 32/64, A-law/µ-law, EXTENSIBLE), AIFF/AIFF-C, FLAC (native + Ogg), Ogg
+Opus (SILK/CELT/hybrid, PLC, FEC; mapping family 0), Ogg Vorbis (floors 0/1, residues 0/1/2), MP3 (MPEG-1/2/2.5
+Layer III, ID3v2, Xing/LAME gapless), AAC-LC (ADTS; MP4 plain/fragmented, edit list/iTunSMPB), MP3 in MP4.
+
+Owed: SBR and PS (HE-AAC v1/v2 decode as their LC core at half rate today), AAC Main prediction / LTP / CCE
+application / 960-sample frames / ER profiles; Opus multistream (mapping families 1/255, i.e. > 2 channels);
+MPEG Layer I/II; ALAC; Opus/FLAC/ALAC in MP4; Ogg chained streams beyond the first logical stream; a
+sample-rate change mid-stream (MP3) is handed out at the first rate; speed work (every float codec is
+unoptimised: 37–170x realtime on the host); the kernel leg's metal flight (soft-float real-time margin).

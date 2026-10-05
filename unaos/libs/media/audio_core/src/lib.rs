@@ -184,8 +184,9 @@ pub fn f32_to_i32(x: f32) -> i32 {
     if v >= 2147483647.0 { i32::MAX } else if v <= -2147483648.0 { i32::MIN } else { v as i32 }
 }
 
-/// What every codec implements internally: produce the next block.
-pub trait Source {
+/// What every codec implements internally: produce the next block. `Send`, so a decoder can move to an audio
+/// thread (host) or sit in the kernel's player state.
+pub trait Source: Send {
     fn info(&self) -> Info;
     /// Decode the next block into `pcm`; `Ok(false)` at end of stream. A block may hold zero frames.
     fn block(&mut self, pcm: &mut Pcm) -> Result<bool>;
