@@ -11,6 +11,7 @@ pub(crate) mod joining;
 pub(crate) mod linebreak;
 pub(crate) mod norm;
 pub(crate) mod script;
+pub(crate) mod vowel_constraints;
 
 /// Binary search a sorted, non-overlapping range table.
 #[inline]
@@ -55,6 +56,11 @@ pub enum Gc {
 
 pub fn general_category(c: char) -> Gc {
     lookup(gc::GC, c as u32).unwrap_or(Gc::Cn)
+}
+
+/// Default_Ignorable_Code_Point.
+pub fn is_default_ignorable(c: char) -> bool {
+    in_set(gc::DEFAULT_IGNORABLE, c as u32)
 }
 
 /// Whether `c` is a combining mark (General_Category M*).

@@ -142,3 +142,10 @@ pub fn vector_file(name: &str, url: &str, sha: &str) -> Option<Vec<u8>> {
 
 /// The unicodetools repository's UCD 17.0.0 directory (www.unicode.org is refused by this host's egress proxy).
 pub const UCD_BASE: &str = "https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/";
+
+/// The Noto fonts the FONTBIDI oracles use (notofonts.github.io, unhinted TTF), fetched at test time and pinned.
+pub fn noto_font(name: &str, sha: &str) -> Option<Vec<u8>> {
+    let family = name.split('-').next()?;
+    let url = format!("https://raw.githubusercontent.com/notofonts/notofonts.github.io/main/fonts/{family}/unhinted/ttf/{name}");
+    vector_file(name, &url, sha)
+}

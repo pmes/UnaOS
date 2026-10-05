@@ -1,12 +1,22 @@
-//! The shaper for Latin, Greek and Cyrillic: script itemization, cmap lookup, GSUB single + ligature
-//! substitution for the default features (`ccmp`, `locl`, `rlig`, `liga`, `clig`, `calt` — only their type
-//! 1/4 lookups; contextual types 5/6 are owed), GPOS pair kerning (`kern`) with the legacy `kern` table as the
-//! fallback exactly when GPOS has no `kern` feature for the script (HarfBuzz's rule), measuring, UAX #14
-//! line layout and drawing through the glyph cache.
+//! The shaper. `shape` runs UAX #9 over the text, splits each level run into script runs (Scripts.txt +
+//! Script_Extensions), and shapes every run in its direction through one OpenType pipeline: font-aware
+//! normalization (decompose what the font lacks, reorder marks by — modified — combining class, recompose what the
+//! font has), the script's complex shaper (Arabic joining from ArabicShaping.txt; Indic syllables, reph and matra
+//! reordering for Devanagari from IndicSyllabicCategory / IndicPositionalCategory; Thai SARA AM decomposition),
+//! RTL mirroring (Bidi_Mirroring_Glyph), GSUB features in staged order with per-glyph masks, GPOS (kerning, marks,
+//! cursive) with the legacy `kern` table as the fallback exactly when GPOS has no `kern` feature, mark advance
+//! zeroing and attachment propagation, default-ignorable hiding. Glyphs come out in VISUAL order (left to right)
+//! with `cluster` naming the source byte offset — what `draw_text`, `measure` and svg_core's `<text>` consume.
 
+use crate::bidi::{BidiInfo, Direction};
 use crate::cache::{split_position, GlyphCache};
-use crate::layout::{ligature_subst, pair_adjust, single_subst, Gdef, LayoutTable, Tag};
+use crate::complex;
+use crate::layout::{LayoutTable, Tag};
 use crate::linebreak::{breaks, Break};
+use crate::normalize;
+use crate::ot::{self, Apply, GlyphInfo, GlyphPosition, LookupReq, IGN_NONE, IGN_OTHER, IGN_ZWJ, IGN_ZWNJ};
+use crate::script::{self, Script};
+use crate::ucd::{self, Gc};
 use crate::Font;
 use alloc::vec::Vec;
 
@@ -33,176 +43,585 @@ impl Default for ShapeOptions {
     }
 }
 
-/// OpenType script of a character (`None` for script-neutral characters: spaces, digits, punctuation).
-pub fn char_script(c: char) -> Option<Tag> {
-    let cp = c as u32;
-    match cp {
-        0x0370..=0x03FF | 0x1F00..=0x1FFF => Some(*b"grek"),
-        0x0400..=0x052F | 0x1C80..=0x1C8F | 0x2DE0..=0x2DFF | 0xA640..=0xA69F => Some(*b"cyrl"),
-        0x41..=0x5A | 0x61..=0x7A | 0xAA | 0xBA | 0xC0..=0xD6 | 0xD8..=0xF6 | 0xF8..=0x24F | 0x1E00..=0x1EFF
-        | 0xA720..=0xA7FF | 0xFB00..=0xFB06 => Some(*b"latn"),
-        _ => None,
+/// Split text into (byte start, byte end, ISO 15924 script) runs — [`script::itemize`].
+pub fn itemize(text: &str) -> Vec<(usize, usize, Script)> {
+    script::itemize(text)
+}
+
+// ---------------------------------------------------------------------------------------------------------- plan
+
+pub(crate) const F_GLOBAL: u8 = 1;
+pub(crate) const F_MANUAL_ZWJ: u8 = 2;
+pub(crate) const F_MANUAL_ZWNJ: u8 = 4;
+pub(crate) const F_PER_SYLLABLE: u8 = 8;
+pub(crate) const F_MANUAL_JOINERS: u8 = F_MANUAL_ZWJ | F_MANUAL_ZWNJ;
+
+/// What runs between GSUB stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pause {
+    None,
+    IndicInitial,
+    IndicFinal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shaper {
+    Default,
+    Arabic,
+    Indic,
+    Thai,
+    Hebrew,
+}
+
+impl Shaper {
+    fn for_script(s: Script) -> Shaper {
+        match &s {
+            b"Arab" | b"Syrc" | b"Nkoo" | b"Mong" | b"Phag" | b"Mand" | b"Mani" | b"Adlm" | b"Rohg" | b"Sogd"
+            | b"Chrs" | b"Ougr" => Shaper::Arabic,
+            b"Deva" => Shaper::Indic,
+            b"Thai" | b"Laoo" => Shaper::Thai,
+            b"Hebr" => Shaper::Hebrew,
+            _ => Shaper::Default,
+        }
     }
 }
 
-/// Split text into (byte range, script) runs; neutral characters join the run before them (or after, at start).
-pub fn itemize(text: &str) -> Vec<(usize, usize, Tag)> {
-    let mut runs: Vec<(usize, usize, Tag)> = Vec::new();
-    let mut cur: Option<Tag> = None;
-    let mut run_start = 0usize;
-    for (i, c) in text.char_indices() {
-        if let Some(s) = char_script(c) {
-            match cur {
-                None => cur = Some(s), // leading neutrals join the first run (run_start stays 0)
-                Some(t) if t != s => {
-                    runs.push((run_start, i, t));
-                    cur = Some(s);
-                    run_start = i;
+struct FeatureReq {
+    tag: Tag,
+    flags: u8,
+    stage: usize,
+}
+
+/// A compiled shaping plan for (font, script, direction, options).
+pub(crate) struct Plan {
+    pub script_tags: Vec<Tag>,
+    pub shaper: Shaper,
+    /// GSUB lookups per stage, sorted by lookup index.
+    pub gsub: Vec<Vec<LookupReq>>,
+    /// Callback after each stage.
+    pub pauses: Vec<Pause>,
+    pub gpos: Vec<LookupReq>,
+    /// (feature tag, mask bit) for masked features.
+    pub masks: Vec<(Tag, u32)>,
+    pub apply_kern_table: bool,
+}
+
+pub(crate) const GLOBAL_MASK: u32 = 1;
+
+impl Plan {
+    pub fn mask(&self, tag: Tag) -> u32 {
+        self.masks.iter().find(|m| m.0 == tag).map_or(0, |m| m.1)
+    }
+
+    fn new(font: &Font, script: Script, rtl: bool, opts: &ShapeOptions) -> Plan {
+        let shaper = Shaper::for_script(script);
+        let mut script_tags = script::ot_script_tags(script);
+        // Indic: the font may only carry the old tag; Default shapers fall back inside lookups_for.
+        script_tags.dedup();
+        let mut feats: Vec<FeatureReq> = Vec::new();
+        let mut stage = 0usize;
+        let mut pauses: Vec<Pause> = Vec::new();
+        let add = |feats: &mut Vec<FeatureReq>, stage: usize, tag: &[u8; 4], flags: u8| {
+            feats.push(FeatureReq { tag: *tag, flags, stage });
+        };
+        macro_rules! pause {
+            ($p:expr) => {{
+                pauses.push($p);
+                stage += 1;
+            }};
+        }
+        add(&mut feats, stage, b"rvrn", F_GLOBAL);
+        pause!(Pause::None);
+        if rtl {
+            add(&mut feats, stage, b"rtla", F_GLOBAL);
+            add(&mut feats, stage, b"rtlm", 0);
+        } else {
+            add(&mut feats, stage, b"ltra", F_GLOBAL);
+            add(&mut feats, stage, b"ltrm", F_GLOBAL);
+        }
+        match shaper {
+            Shaper::Arabic => {
+                add(&mut feats, stage, b"stch", F_GLOBAL);
+                pause!(Pause::None);
+                add(&mut feats, stage, b"ccmp", F_GLOBAL | F_MANUAL_ZWJ);
+                add(&mut feats, stage, b"locl", F_GLOBAL | F_MANUAL_ZWJ);
+                pause!(Pause::None);
+                for t in [b"isol", b"fina", b"fin2", b"fin3", b"medi", b"med2", b"init"] {
+                    add(&mut feats, stage, t, F_MANUAL_ZWJ);
+                    pause!(Pause::None);
                 }
+                pause!(Pause::None);
+                add(&mut feats, stage, b"rlig", F_GLOBAL | F_MANUAL_ZWJ);
+                pause!(Pause::None);
+                add(&mut feats, stage, b"calt", F_GLOBAL | F_MANUAL_ZWJ);
+                if font.gsub.is_none_or(|g| g.0.feature_lookups(&script_tags, *b"rclt").is_none()) {
+                    pause!(Pause::None);
+                }
+                add(&mut feats, stage, b"liga", F_GLOBAL | F_MANUAL_ZWJ);
+                add(&mut feats, stage, b"clig", F_GLOBAL | F_MANUAL_ZWJ);
+                add(&mut feats, stage, b"mset", F_GLOBAL | F_MANUAL_ZWJ);
+            }
+            Shaper::Indic => {
+                pause!(Pause::None);
+                add(&mut feats, stage, b"locl", F_GLOBAL | F_PER_SYLLABLE);
+                add(&mut feats, stage, b"ccmp", F_GLOBAL | F_PER_SYLLABLE);
+                pause!(Pause::IndicInitial);
+                for (t, g) in [
+                    (b"nukt", true),
+                    (b"akhn", true),
+                    (b"rphf", false),
+                    (b"rkrf", true),
+                    (b"pref", false),
+                    (b"blwf", false),
+                    (b"abvf", false),
+                    (b"half", false),
+                    (b"pstf", false),
+                    (b"vatu", true),
+                    (b"cjct", true),
+                ] {
+                    add(&mut feats, stage, t, F_MANUAL_JOINERS | F_PER_SYLLABLE | if g { F_GLOBAL } else { 0 });
+                    pause!(Pause::None);
+                }
+                pause!(Pause::IndicFinal);
+                add(&mut feats, stage, b"init", F_MANUAL_JOINERS | F_PER_SYLLABLE);
+                for t in [b"pres", b"abvs", b"blws", b"psts", b"haln"] {
+                    add(&mut feats, stage, t, F_GLOBAL | F_MANUAL_JOINERS | F_PER_SYLLABLE);
+                }
+            }
+            _ => {}
+        }
+        for t in [b"abvm", b"blwm", b"ccmp", b"locl", b"rlig"] {
+            add(&mut feats, stage, t, F_GLOBAL);
+        }
+        for t in [b"mark", b"mkmk"] {
+            add(&mut feats, stage, t, F_GLOBAL | F_MANUAL_JOINERS);
+        }
+        for t in [b"calt", b"clig", b"curs", b"dist", b"kern", b"liga", b"rclt"] {
+            add(&mut feats, stage, t, F_GLOBAL);
+        }
+        // Disabled features: Indic turns `liga` off; options turn off ligatures / kerning.
+        let mut disabled: Vec<Tag> = Vec::new();
+        if shaper == Shaper::Indic {
+            disabled.push(*b"liga");
+        }
+        if !opts.ligatures {
+            disabled.extend([*b"liga", *b"clig"]);
+        }
+        if !opts.kerning {
+            disabled.push(*b"kern");
+        }
+        feats.retain(|f| !disabled.contains(&f.tag));
+        // Merge duplicate tags: earliest stage, union of globality, union of flags.
+        let mut merged: Vec<FeatureReq> = Vec::new();
+        for f in feats {
+            if let Some(m) = merged.iter_mut().find(|m| m.tag == f.tag) {
+                m.stage = m.stage.min(f.stage);
+                m.flags |= f.flags;
+            } else {
+                merged.push(f);
+            }
+        }
+        let nstages = stage + 1;
+        // Masks: global features share bit 0; each masked feature gets its own bit.
+        let mut masks: Vec<(Tag, u32)> = Vec::new();
+        let mut bit = 1u32;
+        for f in &merged {
+            let m = if f.flags & F_GLOBAL != 0 {
+                GLOBAL_MASK
+            } else {
+                let m = 1u32 << bit;
+                bit += 1;
+                m
+            };
+            masks.push((f.tag, m));
+        }
+        let mut gsub: Vec<Vec<LookupReq>> = (0..nstages).map(|_| Vec::new()).collect();
+        let mut gpos: Vec<LookupReq> = Vec::new();
+        let collect = |t: &LayoutTable, out: &mut Vec<LookupReq>, f: &FeatureReq, mask: u32| {
+            if let Some(ls) = t.feature_lookups(&script_tags, f.tag) {
+                for li in ls {
+                    out.push(LookupReq {
+                        index: li,
+                        mask,
+                        auto_zwj: f.flags & F_MANUAL_ZWJ == 0,
+                        auto_zwnj: f.flags & F_MANUAL_ZWNJ == 0,
+                        per_syllable: f.flags & F_PER_SYLLABLE != 0,
+                    });
+                }
+            }
+        };
+        for (f, &(_, mask)) in merged.iter().zip(masks.iter()) {
+            if let Some(g) = font.gsub {
+                collect(&g.0, &mut gsub[f.stage], f, mask);
+            }
+            if let Some(g) = font.gpos {
+                collect(&g.0, &mut gpos, f, mask);
+            }
+        }
+        let finish = |v: &mut Vec<LookupReq>| {
+            v.sort_by_key(|l| l.index);
+            let mut out: Vec<LookupReq> = Vec::new();
+            for l in v.drain(..) {
+                if let Some(last) = out.last_mut() {
+                    if last.index == l.index {
+                        last.mask |= l.mask;
+                        last.auto_zwj &= l.auto_zwj;
+                        last.auto_zwnj &= l.auto_zwnj;
+                        last.per_syllable |= l.per_syllable;
+                        continue;
+                    }
+                }
+                out.push(l);
+            }
+            *v = out;
+        };
+        for s in gsub.iter_mut() {
+            finish(s);
+        }
+        finish(&mut gpos);
+        pauses.push(Pause::None);
+        let has_gpos_kern = opts.kerning
+            && font.gpos.is_some_and(|g| g.0.feature_lookups(&script_tags, *b"kern").is_some());
+        let apply_kern_table = opts.kerning && !has_gpos_kern && font.kern.is_some() && font.gpos.is_none_or(|_| true);
+        Plan { script_tags, shaper, gsub, pauses, gpos, masks, apply_kern_table }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------- run
+
+/// The glyph for `cp` (0 when the font has none).
+fn nominal(font: &Font, cp: u32) -> u16 {
+    char::from_u32(cp).map_or(0, |c| font.glyph_index(c))
+}
+
+fn has_glyph(font: &Font, cp: u32) -> bool {
+    nominal(font, cp) != 0
+}
+
+/// HarfBuzz's modified combining classes (traditional mark orders for Hebrew, Arabic, Thai, Lao, Tibetan).
+pub(crate) fn modified_ccc(c: char) -> u8 {
+    let ccc = normalize::ccc(c);
+    match ccc {
+        10 => 22,
+        11 => 15,
+        12 => 16,
+        13 => 17,
+        14 => 23,
+        15 => 18,
+        16 => 19,
+        17 => 20,
+        18 => 21,
+        19 => 14,
+        20 => 24,
+        21 => 12,
+        22 => 25,
+        23 => 13,
+        24 => 10,
+        25 => 11,
+        26 => 26,
+        27 => 28,
+        28 => 29,
+        29 => 30,
+        30 => 31,
+        31 => 32,
+        32 => 33,
+        33 => 27,
+        34 => 34,
+        35 => 35,
+        36 => 36,
+        84 => 4,
+        91 => 5,
+        103 => 3,
+        130 => 132,
+        132 => 131,
+        x => x,
+    }
+}
+
+fn ignorable_kind(c: char) -> u8 {
+    if c == '\u{200C}' {
+        IGN_ZWNJ
+    } else if c == '\u{200D}' {
+        IGN_ZWJ
+    } else if ucd::is_default_ignorable(c) {
+        if matches!(c as u32, 0x180B..=0x180D | 0x180F | 0xE0020..=0xE007F | 0x034F) {
+            ot::IGN_HIDDEN
+        } else {
+            IGN_OTHER
+        }
+    } else {
+        IGN_NONE
+    }
+}
+
+/// Decompose `cp` as far as the font needs (HarfBuzz's `decompose`): returns the parts when it decomposed.
+fn decompose_for_font(font: &Font, cp: u32, shortest: bool, out: &mut Vec<u32>) -> bool {
+    let Some(c) = char::from_u32(cp) else { return false };
+    let parts: Vec<u32> = if (0xAC00..0xAC00 + 11172).contains(&cp) {
+        normalize::nfd_chars(c.encode_utf8(&mut [0; 4])).iter().map(|&x| x as u32).collect()
+    } else {
+        match normalize::decomposition(c) {
+            Some(d) => d.to_vec(),
+            None => return false,
+        }
+    };
+    let (a, rest) = (parts[0], &parts[1..]);
+    if rest.iter().any(|&b| !has_glyph(font, b)) {
+        return false;
+    }
+    let has_a = has_glyph(font, a);
+    if shortest && has_a {
+        out.push(a);
+        out.extend_from_slice(rest);
+        return true;
+    }
+    let mut tmp = Vec::new();
+    if decompose_for_font(font, a, shortest, &mut tmp) {
+        out.extend(tmp);
+        out.extend_from_slice(rest);
+        return true;
+    }
+    if has_a {
+        out.push(a);
+        out.extend_from_slice(rest);
+        return true;
+    }
+    false
+}
+
+/// Font-aware normalization (HarfBuzz's three rounds) over (char, cluster) pairs.
+fn normalize_run(font: &Font, chars: &mut Vec<(u32, usize)>, short_circuit: bool, shaper: Shaper) {
+    let _ = shaper;
+    // Round 1: decompose.
+    let mut out: Vec<(u32, usize)> = Vec::with_capacity(chars.len());
+    for &(cp, cl) in chars.iter() {
+        if short_circuit && has_glyph(font, cp) {
+            out.push((cp, cl));
+            continue;
+        }
+        let mut parts = Vec::new();
+        if decompose_for_font(font, cp, short_circuit, &mut parts) {
+            out.extend(parts.into_iter().map(|p| (p, cl)));
+        } else {
+            out.push((cp, cl));
+        }
+    }
+    // Round 2: reorder marks by modified combining class, then the shaper's mark tweaks.
+    let mut mcc: Vec<u8> = out.iter().map(|x| char::from_u32(x.0).map_or(0, modified_ccc)).collect();
+    let mut i = 0;
+    while i < out.len() {
+        if mcc[i] == 0 {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < out.len() && mcc[i] != 0 {
+            i += 1;
+        }
+        if i - s > 1 && i - s <= 32 {
+            let mut seg: Vec<((u32, usize), u8)> = out[s..i].iter().copied().zip(mcc[s..i].iter().copied()).collect();
+            seg.sort_by_key(|x| x.1);
+            for (k, (o, m)) in seg.into_iter().enumerate() {
+                out[s + k] = o;
+                mcc[s + k] = m;
+            }
+            match shaper {
+                Shaper::Hebrew => complex::reorder_marks_hebrew(&mut out, &mcc, s, i),
+                Shaper::Arabic => complex::reorder_marks_arabic(&mut out, &mut mcc, s, i),
                 _ => {}
             }
         }
     }
-    runs.push((run_start, text.len(), cur.unwrap_or(*b"latn")));
-    if text.is_empty() {
-        runs.clear();
-    }
-    runs
-}
-
-const GSUB_FEATURES: [Tag; 6] = [*b"ccmp", *b"locl", *b"rlig", *b"liga", *b"clig", *b"calt"];
-const GSUB_FEATURES_NOLIGA: [Tag; 4] = [*b"ccmp", *b"locl", *b"rlig", *b"calt"];
-
-fn skipped(gdef: Option<&Gdef>, flag: u16, g: u16) -> bool {
-    gdef.is_some_and(|d| d.skips(flag, g))
-}
-
-fn apply_gsub(font: &Font, t: &LayoutTable, script: Tag, opts: &ShapeOptions, buf: &mut Vec<GlyphPos>) {
-    let feats: &[Tag] = if opts.ligatures { &GSUB_FEATURES } else { &GSUB_FEATURES_NOLIGA };
-    let gdef = font.gdef.as_ref();
-    for li in t.lookups_for(script, feats) {
-        let Some(l) = t.lookup(li) else { continue };
-        match l.kind {
-            1 => {
-                for gp in buf.iter_mut() {
-                    if skipped(gdef, l.flag, gp.glyph) {
+    let cc_at = |mcc: &[u8], k: usize| mcc[k];
+    // Round 3: recompose marks onto their starter when the font has the composite.
+    if out.len() > 1 {
+        let mut res: Vec<(u32, usize)> = Vec::with_capacity(out.len());
+        let mut rcc: Vec<u8> = Vec::with_capacity(out.len());
+        let mut starter: Option<usize> = None;
+        for (k, &(cp, cl)) in out.iter().enumerate() {
+            let c = char::from_u32(cp).unwrap_or('\0');
+            let cc = cc_at(&mcc, k);
+            if ucd::is_mark(c) {
+                if let Some(st) = starter {
+                    let last = res.len() - 1;
+                    let unblocked = st == last || rcc[last] < cc;
+                    let composed = if unblocked {
+                        char::from_u32(res[st].0)
+                            .and_then(|a| normalize::compose_pair(a, c))
+                            .filter(|&p| has_glyph(font, p as u32))
+                    } else {
+                        None
+                    };
+                    if let Some(p) = composed {
+                        res[st].0 = p as u32;
+                        res[st].1 = res[st].1.min(cl);
+                        rcc[st] = modified_ccc(p);
                         continue;
                     }
-                    for st in &l.subtables {
-                        if let Some(g) = single_subst(st, gp.glyph) {
-                            gp.glyph = g;
-                            break;
-                        }
+                    if st < last && rcc[last] > cc {
+                        starter = None;
                     }
                 }
             }
-            4 => {
-                let mut i = 0;
-                while i < buf.len() {
-                    if skipped(gdef, l.flag, buf[i].glyph) {
-                        i += 1;
-                        continue;
-                    }
-                    // Positions of the following non-skipped glyphs.
-                    let mut follow: Vec<usize> = Vec::new();
-                    let mut k = i + 1;
-                    while k < buf.len() && follow.len() < 16 {
-                        if !skipped(gdef, l.flag, buf[k].glyph) {
-                            follow.push(k);
-                        }
-                        k += 1;
-                    }
-                    let mut hit = None;
-                    for st in &l.subtables {
-                        let r = ligature_subst(st, buf[i].glyph, |j| follow.get(j - 1).map(|&p| buf[p].glyph));
-                        if r.is_some() {
-                            hit = r;
-                            break;
-                        }
-                    }
-                    if let Some((lig, n)) = hit {
-                        buf[i].glyph = lig;
-                        // Remove the consumed components (back to front keeps indices valid).
-                        for &p in follow[..n - 1].iter().rev() {
-                            buf.remove(p);
-                        }
-                    }
-                    i += 1;
-                }
+            res.push((cp, cl));
+            rcc.push(cc);
+            if cc == 0 {
+                starter = Some(res.len() - 1);
             }
-            _ => {} // contextual / multiple / alternate substitutions: owed
         }
+        out = res;
     }
+    *chars = out;
 }
 
-fn apply_kerning(font: &Font, script: Tag, buf: &mut [GlyphPos]) {
-    let gdef = font.gdef.as_ref();
-    let gpos_kern = font.gpos.map(|g| g.0.lookups_for(script, &[*b"kern"])).unwrap_or_default();
-    if !gpos_kern.is_empty() {
-        let t = font.gpos.unwrap().0;
-        for li in gpos_kern {
-            let Some(l) = t.lookup(li) else { continue };
-            if l.kind != 2 {
-                continue; // only pair adjustment is implemented
-            }
-            let mut i = 0;
-            while i < buf.len() {
-                if skipped(gdef, l.flag, buf[i].glyph) {
-                    i += 1;
-                    continue;
-                }
-                let mut j = i + 1;
-                while j < buf.len() && skipped(gdef, l.flag, buf[j].glyph) {
-                    j += 1;
-                }
-                if j >= buf.len() {
-                    break;
-                }
-                let mut next = j;
-                for st in &l.subtables {
-                    if let Some((v1, v2, has2)) = pair_adjust(st, buf[i].glyph, buf[j].glyph) {
-                        buf[i].x_advance += v1.x_advance as i32;
-                        buf[i].x_offset += v1.x_placement as i32;
-                        buf[i].y_offset += v1.y_placement as i32;
-                        buf[j].x_advance += v2.x_advance as i32;
-                        buf[j].x_offset += v2.x_placement as i32;
-                        buf[j].y_offset += v2.y_placement as i32;
-                        if has2 {
-                            next = j + 1;
-                        }
-                        break;
-                    }
-                }
-                i = next;
-            }
-        }
-    } else if let Some(k) = font.kern {
-        for i in 0..buf.len().saturating_sub(1) {
-            buf[i].x_advance += k.pair(buf[i].glyph, buf[i + 1].glyph) as i32;
+/// Shape one run (single script, single direction). `start..end` is a byte range of `text`; clusters are byte
+/// offsets into `text`. Returns glyphs in visual order.
+pub fn shape_run(font: &Font, text: &str, start: usize, end: usize, script: Script, rtl: bool, opts: &ShapeOptions) -> Vec<GlyphPos> {
+    let plan = Plan::new(font, script, rtl, opts);
+    let mut chars: Vec<(u32, usize)> = text[start..end].char_indices().map(|(i, c)| (c as u32, start + i)).collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    // Clusters: a combining mark continues its base's cluster (grapheme-level clusters).
+    for k in 1..chars.len() {
+        if chars[k].0 == 0x200D || char::from_u32(chars[k].0).is_some_and(ucd::is_mark) {
+            chars[k].1 = chars[k - 1].1;
         }
     }
-}
-
-/// Shape `text` into positioned glyphs (font units).
-pub fn shape(font: &Font, text: &str, opts: &ShapeOptions) -> Vec<GlyphPos> {
-    let mut out = Vec::new();
-    for (s, e, script) in itemize(text) {
-        let mut buf: Vec<GlyphPos> = text[s..e]
-            .char_indices()
-            .map(|(i, c)| GlyphPos { glyph: font.glyph_index(c), cluster: s + i, x_advance: 0, x_offset: 0, y_offset: 0 })
-            .collect();
+    if plan.shaper == Shaper::Thai {
+        complex::thai_preprocess(&mut chars);
+    }
+    complex::vowel_constraints(&mut chars);
+    normalize_run(font, &mut chars, plan.shaper != Shaper::Indic, plan.shaper);
+    let mut info: Vec<GlyphInfo> = chars
+        .iter()
+        .map(|&(cp, cl)| GlyphInfo {
+            cp,
+            cluster: cl,
+            mask: GLOBAL_MASK,
+            ignorable: char::from_u32(cp).map_or(IGN_NONE, ignorable_kind),
+            ..Default::default()
+        })
+        .collect();
+    match plan.shaper {
+        Shaper::Arabic => complex::arabic_setup_masks(&plan, &mut info),
+        Shaper::Indic => complex::indic_setup(font, &plan, &mut info),
+        _ => {}
+    }
+    // Mirroring (L4) for RTL runs, else the `rtlm` mask.
+    if rtl {
+        let rtlm = plan.mask(*b"rtlm");
+        for g in info.iter_mut() {
+            match char::from_u32(g.cp).and_then(crate::bidi::mirrored) {
+                Some(m) if has_glyph(font, m as u32) => g.cp = m as u32,
+                _ => g.mask |= rtlm,
+            }
+        }
+    }
+    for g in info.iter_mut() {
+        g.glyph = nominal(font, g.cp);
+        let c = char::from_u32(g.cp).unwrap_or('\0');
+        let synth_mark = ucd::general_category(c) == Gc::Mn && g.ignorable == IGN_NONE;
+        g.props = ot::glyph_props(font, g.glyph, synth_mark);
+    }
+    let mut pos: Vec<GlyphPosition> = alloc::vec![GlyphPosition::default(); info.len()];
+    // GSUB.
+    let mut lig_id = 1u8;
+    for (s, stage) in plan.gsub.iter().enumerate() {
         if let Some(g) = font.gsub {
-            apply_gsub(font, &g.0, script, opts, &mut buf);
+            let mut a = Apply::new(font, g.0, false, &mut info, &mut pos, rtl, lig_id);
+            for l in stage {
+                a.apply_lookup(l);
+            }
+            lig_id = a.next_lig_id();
         }
-        for gp in buf.iter_mut() {
-            gp.x_advance = font.advance(gp.glyph) as i32;
+        match plan.pauses.get(s).copied().unwrap_or(Pause::None) {
+            Pause::IndicInitial => complex::indic_initial_reordering(font, &plan, &mut info),
+            Pause::IndicFinal => complex::indic_final_reordering(font, &plan, &mut info),
+            Pause::None => {}
         }
-        if opts.kerning {
-            apply_kerning(font, script, &mut buf);
+    }
+    pos.resize(info.len(), GlyphPosition::default());
+    // GPOS.
+    for (g, p) in info.iter().zip(pos.iter_mut()) {
+        *p = GlyphPosition { x_advance: font.advance(g.glyph) as i32, ..Default::default() };
+    }
+    let zero_marks = plan.shaper != Shaper::Indic;
+    if let Some(gp) = font.gpos {
+        let mut a = Apply::new(font, gp.0, true, &mut info, &mut pos, rtl, lig_id);
+        for l in &plan.gpos {
+            a.apply_lookup(l);
         }
-        out.extend(buf);
+    }
+    if plan.apply_kern_table {
+        if let Some(k) = font.kern {
+            // Legacy `kern`: adjacent non-mark pairs.
+            let idx: Vec<usize> = (0..info.len()).filter(|&i| !info[i].is_mark()).collect();
+            for w in idx.windows(2) {
+                pos[w[0]].x_advance += k.pair(info[w[0]].glyph, info[w[1]].glyph) as i32;
+            }
+        }
+    }
+    if zero_marks {
+        let adjust = font.gpos.is_none() && !rtl;
+        for (g, p) in info.iter().zip(pos.iter_mut()) {
+            if g.is_mark() {
+                if adjust {
+                    p.x_offset -= p.x_advance;
+                }
+                p.x_advance = 0;
+                p.y_advance = 0;
+            }
+        }
+    }
+    // Default ignorables: zero width, invisible (the space glyph), as engines hide them.
+    let space = font.glyph_index(' ');
+    for (g, p) in info.iter_mut().zip(pos.iter_mut()) {
+        if g.ignorable != IGN_NONE && g.subst & ot::ST_SUBSTITUTED == 0 {
+            p.x_advance = 0;
+            p.x_offset = 0;
+            p.y_offset = 0;
+            g.glyph = space;
+        }
+    }
+    ot::propagate_attachments(&mut pos, rtl);
+    let mut out: Vec<GlyphPos> = info
+        .iter()
+        .zip(pos.iter())
+        .map(|(g, p)| GlyphPos { glyph: g.glyph, cluster: g.cluster, x_advance: p.x_advance, x_offset: p.x_offset, y_offset: p.y_offset })
+        .collect();
+    if rtl {
+        out.reverse();
     }
     out
+}
+
+/// Shape `text` with an explicit paragraph direction: bidi runs in visual order, each split into script runs.
+pub fn shape_dir(font: &Font, text: &str, opts: &ShapeOptions, dir: Direction) -> Vec<GlyphPos> {
+    let mut out = Vec::new();
+    if text.is_empty() {
+        return out;
+    }
+    let bidi = BidiInfo::new(text, dir);
+    for &(ps, pe, _) in &bidi.paragraphs {
+        for (rs, re, level) in bidi.visual_runs(ps, pe) {
+            let (bs, be) = (bidi.offsets[rs], bidi.offsets[re]);
+            let rtl = level & 1 == 1;
+            let mut runs = script::itemize(&text[bs..be]);
+            if rtl {
+                runs.reverse();
+            }
+            for (s, e, sc) in runs {
+                out.extend(shape_run(font, text, bs + s, bs + e, sc, rtl, opts));
+            }
+        }
+    }
+    out
+}
+
+/// Shape `text` into positioned glyphs (font units), visual order, paragraph direction by UAX #9 P2/P3.
+pub fn shape(font: &Font, text: &str, opts: &ShapeOptions) -> Vec<GlyphPos> {
+    shape_dir(font, text, opts, Direction::Auto)
 }
 
 /// Advance width of `text` at `size` px (fractional, unhinted — what Chromium's measureText reports with

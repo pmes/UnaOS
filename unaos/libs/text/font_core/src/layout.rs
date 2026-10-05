@@ -85,7 +85,7 @@ pub fn class_of(d: &[u8], gid: u16) -> u16 {
     inner(d, gid).unwrap_or(0)
 }
 
-fn sub(d: &[u8], base: usize, off_at: usize) -> Option<&[u8]> {
+pub(crate) fn sub(d: &[u8], base: usize, off_at: usize) -> Option<&[u8]> {
     let off = u16_at(d, off_at)? as usize;
     if off == 0 {
         return None;
@@ -98,6 +98,8 @@ fn sub(d: &[u8], base: usize, off_at: usize) -> Option<&[u8]> {
 pub struct Lookup<'a> {
     pub kind: u16,
     pub flag: u16,
+    /// MarkFilteringSet (meaningful when `flag & LOOKUP_USE_MARK_FILTERING_SET`).
+    pub mark_set: u16,
     pub subtables: Vec<&'a [u8]>,
 }
 
@@ -114,6 +116,9 @@ pub struct LayoutTable<'a> {
 pub const LOOKUP_IGNORE_BASE: u16 = 0x0002;
 pub const LOOKUP_IGNORE_LIGATURES: u16 = 0x0004;
 pub const LOOKUP_IGNORE_MARKS: u16 = 0x0008;
+pub const LOOKUP_RIGHT_TO_LEFT: u16 = 0x0001;
+pub const LOOKUP_USE_MARK_FILTERING_SET: u16 = 0x0010;
+pub const LOOKUP_MARK_ATTACHMENT_TYPE: u16 = 0xFF00;
 
 impl<'a> LayoutTable<'a> {
     fn parse(data: &'a [u8], ext_kind: u16) -> Option<Self> {
@@ -195,6 +200,48 @@ impl<'a> LayoutTable<'a> {
         out
     }
 
+    /// The LangSys (default language) for the first of `scripts` present, falling back to `DFLT`, `dflt`, `latn`.
+    fn lang_sys(&self, scripts: &[Tag]) -> Option<&'a [u8]> {
+        let s = scripts
+            .iter()
+            .find_map(|&t| self.find_script(t))
+            .or_else(|| self.find_script(*b"DFLT"))
+            .or_else(|| self.find_script(*b"dflt"))
+            .or_else(|| self.find_script(*b"latn"))?;
+        sub(s, 0, 0)
+    }
+
+    /// Whether any of `scripts` is present (no fallback).
+    pub fn has_script(&self, scripts: &[Tag]) -> bool {
+        scripts.iter().any(|&t| self.find_script(t).is_some())
+    }
+
+    /// The lookup indices of `feature` in the default LangSys of the first matching script (None if the feature is
+    /// not in that LangSys). The required feature counts under its own tag.
+    pub fn feature_lookups(&self, scripts: &[Tag], feature: Tag) -> Option<Vec<u16>> {
+        let ls = self.lang_sys(scripts)?;
+        let req = u16_at(ls, 2).unwrap_or(0xFFFF);
+        let n = u16_at(ls, 4).unwrap_or(0) as usize;
+        let nf = u16_at(self.features, 0).unwrap_or(0);
+        let mut found = false;
+        let mut out = Vec::new();
+        let idxs = (0..n).filter_map(|i| u16_at(ls, 6 + 2 * i)).chain((req != 0xFFFF).then_some(req));
+        for fi in idxs {
+            if fi >= nf {
+                continue;
+            }
+            let rec = 2 + 6 * fi as usize;
+            if self.features.get(rec..rec + 4) != Some(&feature[..]) {
+                continue;
+            }
+            found = true;
+            let Some(f) = sub(self.features, 0, rec + 4) else { continue };
+            let cnt = u16_at(f, 2).unwrap_or(0) as usize;
+            out.extend((0..cnt).filter_map(|k| u16_at(f, 4 + 2 * k)));
+        }
+        found.then_some(out)
+    }
+
     pub fn lookup_count(&self) -> usize {
         u16_at(self.lookups, 0).unwrap_or(0) as usize
     }
@@ -208,6 +255,7 @@ impl<'a> LayoutTable<'a> {
         let is_ext = kind == self.ext_kind;
         let flag = u16_at(l, 2)?;
         let n = u16_at(l, 4)? as usize;
+        let mark_set = if flag & LOOKUP_USE_MARK_FILTERING_SET != 0 { u16_at(l, 6 + 2 * n).unwrap_or(0) } else { 0 };
         let mut subtables = Vec::with_capacity(n);
         for k in 0..n {
             let Some(st) = sub(l, 0, 6 + 2 * k) else { continue };
@@ -225,7 +273,7 @@ impl<'a> LayoutTable<'a> {
                 subtables.push(st);
             }
         }
-        Some(Lookup { kind, flag, subtables })
+        Some(Lookup { kind, flag, mark_set, subtables })
     }
 }
 
@@ -303,11 +351,11 @@ pub struct Value {
     pub y_advance: i16,
 }
 
-fn value_size(fmt: u16) -> usize {
+pub(crate) fn value_size(fmt: u16) -> usize {
     (fmt & 0xFF).count_ones() as usize * 2
 }
 
-fn read_value(d: &[u8], off: usize, fmt: u16) -> Option<Value> {
+pub(crate) fn read_value(d: &[u8], off: usize, fmt: u16) -> Option<Value> {
     let mut v = Value::default();
     let mut p = off;
     if fmt & 1 != 0 {
@@ -377,10 +425,13 @@ pub fn pair_adjust(st: &[u8], first: u16, second: u16) -> Option<(Value, Value, 
     }
 }
 
-/// `GDEF` glyph classes (1 base, 2 ligature, 3 mark, 4 component).
+/// `GDEF`: glyph classes (1 base, 2 ligature, 3 mark, 4 component), mark attachment classes and (v1.2+) mark
+/// glyph sets.
 #[derive(Clone, Copy, Debug)]
 pub struct Gdef<'a> {
     glyph_classes: Option<&'a [u8]>,
+    mark_attach: Option<&'a [u8]>,
+    mark_sets: Option<&'a [u8]>,
 }
 
 impl<'a> Gdef<'a> {
@@ -388,10 +439,31 @@ impl<'a> Gdef<'a> {
         if u16_at(d, 0)? != 1 {
             return None;
         }
-        Some(Gdef { glyph_classes: sub(d, 0, 4) })
+        let minor = u16_at(d, 2)?;
+        let mark_sets = if minor >= 2 { sub(d, 0, 12) } else { None };
+        Some(Gdef { glyph_classes: sub(d, 0, 4), mark_attach: sub(d, 0, 10), mark_sets })
+    }
+    pub fn has_glyph_classes(&self) -> bool {
+        self.glyph_classes.is_some()
     }
     pub fn glyph_class(&self, gid: u16) -> u16 {
         self.glyph_classes.map_or(0, |c| class_of(c, gid))
+    }
+    pub fn mark_attach_class(&self, gid: u16) -> u16 {
+        self.mark_attach.map_or(0, |c| class_of(c, gid))
+    }
+    /// Whether mark glyph set `set` (MarkGlyphSetsDef) covers `gid`.
+    pub fn mark_set_covers(&self, set: u16, gid: u16) -> bool {
+        let Some(m) = self.mark_sets else { return false };
+        if u16_at(m, 0) != Some(1) {
+            return false;
+        }
+        let n = u16_at(m, 2).unwrap_or(0);
+        if set >= n {
+            return false;
+        }
+        let Some(off) = u32_at(m, 4 + 4 * set as usize) else { return false };
+        m.get(off as usize..).and_then(|c| coverage_index(c, gid)).is_some()
     }
     /// Whether a lookup with `flag` skips `gid`.
     pub fn skips(&self, flag: u16, gid: u16) -> bool {
