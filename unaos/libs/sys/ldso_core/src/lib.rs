@@ -127,6 +127,7 @@ struct Sysv {
 }
 
 /// One loaded object.
+#[derive(Clone)]
 pub struct Obj<F> {
     /// The path it was opened by.
     pub path: Vec<u8>,
@@ -207,6 +208,7 @@ pub struct Stats {
 }
 
 /// The loader: the objects, the global scope, the trampoline and its arena.
+#[derive(Clone)]
 pub struct Loader<F> {
     pub objs: Vec<Obj<F>>,
     /// Lookup order (indices; the loader's own table precedes it).
