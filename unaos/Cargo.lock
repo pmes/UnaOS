@@ -71,6 +71,10 @@ name = "crypto_core"
 version = "0.1.0"
 
 [[package]]
+name = "demux_core"
+version = "0.1.0"
+
+[[package]]
 name = "diag_core"
 version = "0.1.0"
 
@@ -430,6 +434,7 @@ dependencies = [
  "audio_core",
  "cfg-if",
  "crypto_core",
+ "demux_core",
  "diag_core",
  "elf_core",
  "fdt",

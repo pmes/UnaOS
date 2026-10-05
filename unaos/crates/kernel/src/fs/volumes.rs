@@ -170,4 +170,5 @@ pub fn testf_selftest() {
         dir,
         if manifest { "yes" } else { "no" }
     );
+    crate::fs::filetype::openers_witness(dir, &TESTF_CLAIMED); // OPENERS (B379): every sample typed and routed
 }

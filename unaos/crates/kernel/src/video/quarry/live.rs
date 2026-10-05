@@ -708,6 +708,12 @@ fn kind_token(mime: &str) -> &'static str {
         ft::AUDIO_WAV => "wav",
         ft::APP_JSON => "json", // QUARRY2 (B336)
         ft::IMAGE_GIF => "gif", // QUARRY2 (B336)
+        ft::IMAGE_JPEG => "jpeg", // OPENERS (B379)
+        ft::IMAGE_BMP => "bmp", // OPENERS (B379)
+        ft::IMAGE_WEBP => "webp", // OPENERS (B379)
+        ft::IMAGE_QOI => "qoi", // OPENERS (B379)
+        m if m.starts_with("audio/") => "audio", // OPENERS (B379)
+        m if m.starts_with("video/") => "video", // OPENERS (B379)
         m if m.starts_with("text/") => "text",
         _ => "unknown",
     }
