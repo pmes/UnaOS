@@ -94,7 +94,7 @@ On the first desktop service pass: `[ui] metrics ppi=221 scale=2.5 s2=5 bar=85 t
 chrome=23x50 cell=18x40 glyph=2 win=1300x1120 consts=0 asserts=ok`. `tests metrics`:
 `[ui] metrics fixture latched=true check=ok native=<n> live=<n> chrome=23x50 win=1300x1120 disc=60 gap=30 frame=13` then
 `:: UIMETRICS: ppi=221 scale=2.5 bar=85 title=85 cell=18x40 magnified=0 consts=0 -> PASS ::`. A Settings › Display
-font size `+` -> `[kfont] restyle … font_size=14 …` and `[kfont] regrid console cell=20x44 grid=<c>x<r> was=<c>x<r>`.
+font size `+` -> `[kfont] restyle … font_size=14 …` and `[kfont] regrid console cell=19x44 grid=<c>x<r> was=<c>x<r>`.
 `[settings] open`, `[quarry] open … face=dejavu-mono|dejavu-sans cell=…` with `box=` the surface plus 2x13 / 85+2x13.
 
 ### Stays owed
