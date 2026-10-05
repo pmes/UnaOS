@@ -71,3 +71,50 @@ fn opus_mutations_never_panic() {
     }
     eprintln!("{} mutated Opus packets decoded without a panic", n);
 }
+
+/// Vorbis: setup headers with flipped bits must be rejected or accepted, never panic; audio packets
+/// bit-flipped / truncated / garbage-filled through a live decoder — never a panic.
+#[test]
+fn vorbis_mutations_never_panic() {
+    use audio_core::ogg::OggReader;
+    use audio_core::vorbis::{Setup, VorbisDecoder};
+    use audio_core::{ByteStream, VecReader};
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/vorbis");
+    let mut seed = 0x9abc_def1u32;
+    let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; seed };
+    let (mut nsetup, mut npk) = (0, 0);
+    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    files.sort();
+    for f in files {
+        let mut r = OggReader::new(ByteStream::new(Box::new(VecReader::new(std::fs::read(&f).unwrap()))));
+        let id = r.next_packet().unwrap().unwrap().data;
+        let _ = r.next_packet().unwrap();
+        let setup = r.next_packet().unwrap().unwrap().data;
+        for k in 0..60 {
+            let mut s = setup.clone();
+            if k % 3 == 0 { s.truncate(rnd() as usize % s.len()); } else {
+                for _ in 0..1 + rnd() % 4 { let i = 7 + rnd() as usize % (s.len() - 7); s[i] ^= 1 << (rnd() % 8); }
+            }
+            let _ = std::panic::catch_unwind(|| Setup::parse(&id, &s)).expect("setup parse panicked");
+            nsetup += 1;
+        }
+        let mut d = VorbisDecoder::new(Setup::parse(&id, &setup).unwrap());
+        let mut out = vec![];
+        let mut k = 0u32;
+        while let Some(p) = r.next_packet().unwrap() {
+            let mut pk = p.data.clone();
+            k += 1;
+            if !pk.is_empty() {
+                match k % 4 {
+                    0 => { let i = rnd() as usize % (pk.len() * 8); pk[i / 8] ^= 1 << (i % 8); }
+                    1 => { let c = rnd() as usize % pk.len(); pk.truncate(c); }
+                    2 => { for b in pk.iter_mut().skip(1) { *b = rnd() as u8; } }
+                    _ => {}
+                }
+            }
+            let _ = d.decode(&pk, &mut out);
+            npk += 1;
+        }
+    }
+    eprintln!("{} mutated Vorbis setup headers, {} mutated audio packets: no panic", nsetup, npk);
+}

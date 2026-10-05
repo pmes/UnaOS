@@ -91,3 +91,5 @@ lossless d0e06b3a5cd099d0ebe5178b2c922c503083c6f4cde1e298647c3d662509dd6f pcm/ge
 lossy c074407b7126060972b5e9eb4081e04e35c88857d7125151cbb9e5d9a1191dae lossy/chromium-bear-opus.ogg https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-opus.ogg
 lossy 97020fece49ef9176f4e0ad83ef8cda0a0415691080d2c41859ba2673c2f1834 lossy/chromium-sfx-opus.ogg https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx-opus.ogg
 lossy 74b4ccc4506e5a410e0593cfc0201c1340930583c21e7ec6fb30fff1f956d701 lossy/chromium-opus-trimming-test.ogg https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/opus-trimming-test.ogg
+lossy d38a6edbd595aafa08cef3f1749acdeafb4f471cb4fc4b37679292936ca6d89c lossy/chromium-sfx.ogg https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.ogg
+lossy a7b04eba1fa3699384d7183e01d7cf7218f20496b52a22a346c6daaf609c50bf lossy/chromium-9ch.ogg https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/9ch.ogg

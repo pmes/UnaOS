@@ -14,6 +14,7 @@
 //! | FLAC (native and Ogg) | RFC 9639 | [`flac`] |
 //! | Ogg container | RFC 3533 | [`ogg`] |
 //! | Opus (SILK, CELT, hybrid; Ogg mapping) | RFC 6716 + RFC 8251, RFC 7845 | [`opus`] |
+//! | Vorbis (floors 0/1, residues 0/1/2; Ogg mapping) | Xiph Vorbis I specification | [`vorbis`] |
 //!
 //! One API: [`sniff`] names the format from the first bytes, [`Decoder::open`] picks the codec, and the
 //! [`AudioDecoder`] trait hands out interleaved PCM either as `f32` or as left-justified `i32`.
@@ -43,6 +44,7 @@ pub mod math;
 pub mod md5;
 pub mod ogg;
 pub mod opus;
+pub mod vorbis;
 pub mod wav;
 
 pub use io::{ByteStream, Read, VecReader};

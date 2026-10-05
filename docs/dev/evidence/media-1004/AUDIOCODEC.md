@@ -153,3 +153,39 @@ reference, and the gap is the reference's own: `opus_demo` fixed vs `opus_demo` 
 the bit-exact KAT is the proof.
 
 Decode speed (release, host, loaded 4-core box): 160 kb/s stereo CELT 47x realtime, SILK WB 166x realtime.
+
+## M3 — Vorbis (Xiph Vorbis I specification)
+
+`src/vorbis/` is written from the specification (2020-07-04 revision), floating point:
+* §4.2 headers: identification (blocksizes 64–8192), comment (skipped), setup — codebooks (§3: ordered,
+  sparse and dense length lists, the codeword assignment, VQ lookup types 1 and 2 with `float32_unpack`
+  and `lookup1_values`, single-entry books), time-domain placeholders, floors 0 and 1, residues 0/1/2,
+  mappings (submaps, coupling steps, mux), modes, framing bit. Hostile values are bounded (VQ tables,
+  floor1 points, book indices) before anything is allocated.
+* §4.3 audio packets: mode and window flags, floor decode per channel with the end-of-packet rule (an EOP
+  inside a floor zeroes the channel; inside a residue it ends the residue), nonzero propagation through
+  coupling, residue decode (type 2 interleaved), inverse polar coupling, floor 1 curve synthesis (§7.2.4:
+  amplitude prediction, `render_line`, `floor1_inverse_dB_table`), floor 0 (§6: LSP curve over the bark
+  map), the power-sine windows with long/short transitions, the inverse MDCT (an N/2 DCT-IV through an
+  N/4-point complex FFT, unit-tested against the definition), overlap-add.
+* §A Ogg mapping: the first page's granule (samples to discard at the start, except when the first page is
+  also the last — then the end is cut, as the spec and libvorbis say), end trimming to the last granule.
+* Channel order: the API hands out WAVE/SMPTE order for 3–8 channels (the §4.3.9 Vorbis order L,C,R,…
+  remapped), the order every other format here and FFmpeg/Chromium use.
+
+**Vectors.** Ten streams made with libvorbis 1.3.7-git (`oracle/gen-vorbis.sh`, 334 KB in
+`tests/data/vorbis/`): 8 k–96 kHz, mono/stereo/3/6 channels, VBR quality −0.1…1.0 and a managed 64 kb/s
+stream; plus Chromium's `sfx.ogg` (a single-page stream: first page = last page) and `9ch.ogg`.
+
+**Oracle.** Against libvorbis's own float decoder (`vdec`, vorbisfile `ov_read_float`): **12/12 streams,
+identical frame counts, SNR 135.3–136.3 dB, max |d| ≤ 3.6e-7** (float rounding; the MDCTs differ in
+algorithm). Against Chromium (`tests/lossy_oracle.rs`): **11/11 at SNR 136.2–137.7 dB**; Chromium does not
+apply the Vorbis end trim (it returns every decoded sample — 15,936 for `sfx.ogg` where libvorbis and the
+spec give 15,435), so for Vorbis the frame rule is "equal to libvorbis, not longer than Chromium";
+Chromium refuses `9ch.ogg`, which is proven against libvorbis alone. Robustness: 600 mutated setup headers
+and 1,581 mutated audio packets, no panic.
+
+Ceiling: floor 0 is implemented from §6 but no available encoder produces it (libvorbis has written floor 1
+since 2001), so it is untested. Start trimming follows the spec (all the extra samples are discarded);
+libvorbis only discards what lies in the last packet of the first page — a deliberate divergence on cut
+streams. Speed: 37x (6 ch) – 99x (stereo) realtime on this host; not yet optimised.

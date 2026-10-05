@@ -127,7 +127,7 @@ pub fn open(s: ByteStream) -> Result<Box<dyn Source>> {
         return Ok(Box::new(OggFlac::new(r, &first.data)?));
     }
     if d.starts_with(b"OpusHead") { let d = first.data.clone(); return Ok(Box::new(crate::opus::OggOpus::new(r, &d)?)); }
-    if d.len() >= 7 && d[0] == 1 && &d[1..7] == b"vorbis" { return Err(Error::Unsupported("Ogg Vorbis (owed, M3)")); }
+    if d.len() >= 7 && d[0] == 1 && &d[1..7] == b"vorbis" { let d = first.data.clone(); return Ok(Box::new(crate::vorbis::OggVorbis::new(r, &d)?)); }
     Err(Error::Unsupported("Ogg stream of an unknown codec"))
 }
 
