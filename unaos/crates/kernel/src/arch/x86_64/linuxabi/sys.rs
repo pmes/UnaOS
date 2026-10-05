@@ -71,7 +71,7 @@ fn install(p: &mut LinuxProc, d: Arc<Desc>, min: usize, cloexec: bool) -> i64 {
 
 // ---- namespace helpers (DIRNS: the mount table) ----
 
-fn home_prefix() -> String {
+pub fn home_prefix() -> String {
     #[cfg(feature = "login")]
     {
         let mut b = [0u8; crate::fs::users::NAME_MAX];
@@ -946,7 +946,7 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
         10 => mprotect(p, a[0], a[1], a[2]),
         11 => munmap(p, a[0], a[1]),
         12 => brk(p, a[0]),
-        13 | 14 => 0, // rt_sigaction / rt_sigprocmask: accepted, never delivered
+        13 | 14 => super::sys2::sigs(p, nr, a), // rt_sigaction / rt_sigprocmask: accepted, never delivered (SELFBUILD1: old values written)
         16 => {
             // ioctl: TCGETS / TIOCGWINSZ on the console say "tty"; everything else is -ENOTTY
             let is_con = get(p, a[0]).is_some_and(|d| matches!(&*fd::lk(&d.k), Kind::Console));
@@ -1042,7 +1042,7 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
         84 => do_unlink(p, AT_FDCWD, a[0], true),
         87 => do_unlink(p, AT_FDCWD, a[0], false),
         263 => do_unlink(p, a[0] as i64, a[1], a[2] & AT_REMOVEDIR != 0),
-        89 | 267 => -EINVAL, // readlink: no symlinks exist (EINVAL = "not a symlink")
+        89 | 267 => super::sys2::readlink(p, nr, a), // readlink: no symlinks exist (EINVAL = "not a symlink"); SELFBUILD1: /proc/self/exe
         95 => {
             let old = p.umask;
             p.umask = (a[0] & 0o777) as u32;
@@ -1110,9 +1110,12 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
         }
         102 | 104 | 107 | 108 | 105 | 106 | 113 | 114 => 0,
         74 | 75 => 0, // fsync / fdatasync: writes are already write-through
-        _ => {
-            super::note_enosys(nr);
-            -ENOSYS
-        }
+        _ => match super::sys2::handle(p, info, nr, a) {
+            Some(r) => r,
+            None => {
+                super::note_enosys(nr);
+                -ENOSYS
+            }
+        },
     }
 }
