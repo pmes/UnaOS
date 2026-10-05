@@ -47,7 +47,12 @@ pub const fn step(level: u8, up: bool) -> u8 {
 /// (BRIGHTFLOOR: clamped to the floor — Down at level 1 stays at 1) and the desktop pass writes it.
 pub fn key(act: Action) {
     let up = matches!(act, Action::BrightnessUp);
-    let lv = crate::video::backlight::stage(step(crate::video::backlight::level(), up));
+    // GLASSLAG M3 (B370): the step is judged against the register's known value — a Down that would not
+    // darken (the panel already at or below the floor) writes nothing; see `backlight::next_level`.
+    let Some(lv) = crate::video::backlight::stage_step(up) else {
+        status::bright_show(crate::video::backlight::level());
+        return;
+    };
     PENDING.store(if up { 2 } else { 1 }, Ordering::Release);
     status::bright_show(lv);
 }
@@ -55,6 +60,7 @@ pub fn key(act: Action) {
 /// Desktop service pass: apply a pending step through THE backlight writer and witness it. R80: the
 /// boot fixture that used to run on the first call is now part of `tests brightfloor` ([`selftest`]).
 pub fn service() {
+    crate::video::backlight::seed_from_hw(); // GLASSLAG M3 (B370): once — the panel's own level, before the first step
     apply(true);
 }
 
