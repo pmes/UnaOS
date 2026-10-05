@@ -10,14 +10,12 @@ mod table;
 
 use alloc::vec::Vec;
 
-/// Line_Break property values that occur in the supported ranges.
+/// Line_Break property values (all of Unicode 17.0's).
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lb {
-    AI, AL, B2, BA, BB, BK, CL, CM, CP, CR, EX, GL, HH, HY, IN, IS, LF, NL, NS, NU, OP, PO, PR, QU, SP, SY,
-    WJ, XX, ZW, ZWJ,
-    /// Hebrew letter — never produced by the table (no Hebrew yet) but named by LB21a/LB28.
-    HL,
+    AI, AK, AL, AP, AS, B2, BA, BB, BK, CB, CJ, CL, CM, CP, CR, EB, EM, EX, GL, H2, H3, HH, HL, HY, ID, IN, IS, JL,
+    JT, JV, LF, NL, NS, NU, OP, PO, PR, QU, RI, SA, SG, SP, SY, VF, VI, WJ, XX, ZW, ZWJ,
 }
 
 /// Raw Line_Break class of a code point (`XX` outside the supported ranges).

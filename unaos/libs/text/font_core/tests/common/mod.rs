@@ -108,3 +108,37 @@ pub fn signed_area(cmds: &[PathCmd]) -> f64 {
     }
     a
 }
+
+/// A UCD / test-vector file by name: `$FONTBIDI_UCD_DIR/<name>` if set, else a cached copy under the cargo target
+/// tmpdir, else fetched with `curl` from `url`. The sha256 must match. `None` (the caller prints SKIP) when offline.
+pub fn vector_file(name: &str, url: &str, sha: &str) -> Option<Vec<u8>> {
+    let check = |d: Vec<u8>| if sha256_hex(&d) == sha { Some(d) } else { eprintln!("{name}: sha256 mismatch"); None };
+    if let Ok(dir) = std::env::var("FONTBIDI_UCD_DIR") {
+        if let Ok(d) = std::fs::read(std::path::Path::new(&dir).join(name)) {
+            return check(d);
+        }
+    }
+    let cache = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("fontbidi-vectors");
+    let _ = std::fs::create_dir_all(&cache);
+    let p = cache.join(name);
+    if let Ok(d) = std::fs::read(&p) {
+        if let Some(d) = check(d) {
+            return Some(d);
+        }
+    }
+    let ok = std::process::Command::new("curl")
+        .args(["-sSfL", "--max-time", "120", "-o"])
+        .arg(&p)
+        .arg(url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("SKIP {name}: could not fetch {url}");
+        return None;
+    }
+    check(std::fs::read(&p).ok()?)
+}
+
+/// The unicodetools repository's UCD 17.0.0 directory (www.unicode.org is refused by this host's egress proxy).
+pub const UCD_BASE: &str = "https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/";

@@ -7,3 +7,23 @@ https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/dat
 # Table oracle: fontTools 4.66.1 (pip), oracle/gen_kat.py -> tests/data/kat_data.rs.
 # Pixel/width/line oracle: headless Chromium 1194 (/opt/pw-browsers), oracle/chromium_oracle.js, oracle/chromium_lines.js,
 #   frozen slices via oracle/capture_kats.py -> tests/data/chrome_kats.rs and tests/data/chrome_lines.tsv.
+# FONTBIDI (SR56) UCD 17.0.0 inputs — oracle/gen_ucd.py -> src/ucd/*.rs (data only); conformance files fetched at test time (tests/common vector_file, SKIP offline).
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/UnicodeData.txt  2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/PropertyValueAliases.txt  64e9a5f76f7a1e8b5a47d6a1f9a26522a251208f5276bdfa1559dac7cf2e827a
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/extracted/DerivedBidiClass.txt  4867b4b7f0731ed1bfcd34cc6251211ff1542541fce0734b6fbda139ee80b3a4
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/BidiBrackets.txt  dadbaf38a0d0246e5b805bf8725cb81b7c621f93d030595635f5ba2c2f179428
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/BidiMirroring.txt  a2f16fb873ab4fcdf3221cb1a8a85a134ddd6ed03603181823ff5206af3741ce
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/auxiliary/GraphemeBreakProperty.txt  d6b51d1d2ae5c33b451b7ed994b48f1f4dc62b2272a5831e7fd418514a6bae89
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/emoji/emoji-data.txt  2cb2bb9455cda83e8481541ecf5b6dfda66a3bb89efa3fa7c5297eccf607b72b
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/DerivedCoreProperties.txt  24c7fed1195c482faaefd5c1e7eb821c5ee1fb6de07ecdbaa64b56a99da22c08
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/Scripts.txt  9f5e50d3abaee7d6ce09480f325c706f485ae3240912527e651954d2d6b035bf
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/ScriptExtensions.txt  ec2107e58825a1586acee8e0911ce18260394ac8b87e535ca325f1ccbeb06bc6
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/DerivedNormalizationProps.txt  71fd6a206a2c0cdd41feb6b7f656aa31091db45e9cedc926985d718397f9e488
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/ArabicShaping.txt  39afa01e680e27d0fd10b67a9b27be13fbaa3d0efecfb5be45991de9a0d267d0
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/IndicSyllabicCategory.txt  3fc122f4cf58b0c19268d5f810263b04ab4e1e67743386ec0e0ada9c76aec5be
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/IndicPositionalCategory.txt  68cedc29a7e57f984d90fe2c7712f2e6d0c717e253db219607daea8997d6c480
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/EastAsianWidth.txt  ea7ce50f3444a050333448dffef1cadd9325af55cbb764b4a2280faf52170a33
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/BidiTest.txt  888bdfc8090652272d1f859cdb00ae659e2dc6c26740be61ef1d03998a687620
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/BidiCharacterTest.txt  a3e6e905ab5afbe318a96df5401d0372a04cd73ef139ab5e3cf0ae241c255488
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/auxiliary/GraphemeBreakTest.txt  e2d134d2c52919bace503ebb6a551c1855fe1a1faec18478c78fff254a1793ec
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/NormalizationTest.txt  5019ffd530751a741900c849c0e010332f142a3612234639bd200b82138a87db

@@ -21,6 +21,7 @@
 
 extern crate alloc;
 
+pub mod bidi;
 pub mod cache;
 pub mod cff;
 mod cff_strings;
@@ -35,6 +36,7 @@ mod post_names;
 pub mod raster;
 mod reader;
 pub mod shape;
+pub mod ucd;
 
 pub use cache::GlyphCache;
 pub use font::{Error, Font, Os2, Outlines, Post};
