@@ -531,10 +531,7 @@ const PRELUDE: &str = r#"
 
     function XMLSerializer() {}
     XMLSerializer.prototype.serializeToString = function (node) {
-        if (!node) { return ''; }
-        if (node.outerHTML !== undefined && node.outerHTML !== null) { return node.outerHTML; }
-        if (node.documentElement) { return node.documentElement.outerHTML || ''; }
-        return node.innerHTML || '';
+        return __xml_serialize(node);
     };
     globalThis.XMLSerializer = XMLSerializer;
 })();

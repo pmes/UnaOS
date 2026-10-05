@@ -335,6 +335,8 @@ pub fn normalize_value(prop: &str, v: &[CV]) -> Option<String> {
 // =================================================================================================
 
 const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+const BORDER_IMAGE: [&str; 5] =
+    ["border-image-source", "border-image-slice", "border-image-width", "border-image-outset", "border-image-repeat"];
 
 /// The longhands of a shorthand this binding expands.
 fn longhands(sh: &str) -> Option<Vec<String>> {
@@ -349,12 +351,16 @@ fn longhands(sh: &str) -> Option<Vec<String>> {
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
             Some(["width", "style", "color"].iter().map(|k| format!("{sh}-{k}")).collect())
         }
+        // Blink's `border` also resets border-image (css-backgrounds-3 §4.4: "border … resets
+        // border-image to its initial value").
         "border" => Some(
             ["width", "style", "color"]
                 .iter()
                 .flat_map(|k| SIDES.iter().map(move |s| format!("border-{s}-{k}")))
+                .chain(BORDER_IMAGE.iter().map(|s| s.to_string()))
                 .collect(),
         ),
+        "border-image" => v(&BORDER_IMAGE),
         "gap" => v(&["row-gap", "column-gap"]),
         "overflow" => v(&["overflow-x", "overflow-y"]),
         "flex" => v(&["flex-grow", "flex-shrink", "flex-basis"]),
@@ -490,6 +496,11 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
                     out.push((format!("border-{sd}-{k}"), val));
                 }
             }
+            if prop == "border" {
+                for b in BORDER_IMAGE {
+                    out.push((b.to_string(), "initial".to_string()));
+                }
+            }
             Ok(out)
         }
         "outline" => {
@@ -573,6 +584,11 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
 /// The shorthands that may stand for longhand `p` in serialization, in preference order.
 fn shorthands_of(p: &str) -> Vec<&'static str> {
     let mut out = Vec::new();
+    if p.starts_with("border-image-") {
+        out.push("border");
+        out.push("border-image");
+        return out;
+    }
     if p.starts_with("border-") && (p.ends_with("-width") || p.ends_with("-style") || p.ends_with("-color")) && !p.contains("radius") {
         out.push("border");
         if p.ends_with("-width") {
@@ -649,7 +665,16 @@ fn serialize_shorthand(block: &Block, sh: &str) -> Option<(String, bool)> {
     if CSS_WIDE.contains(&vals[0]) {
         return vals.iter().all(|v| *v == vals[0]).then(|| (vals[0].to_string(), important));
     }
-    if vals.iter().any(|v| CSS_WIDE.contains(v)) {
+    // `border` serializes only while its border-image part is still the reset value.
+    let checked = if sh == "border" {
+        if !vals[12..].iter().all(|v| *v == "initial") {
+            return None;
+        }
+        &vals[..12]
+    } else {
+        &vals[..]
+    };
+    if checked.iter().any(|v| CSS_WIDE.contains(v)) {
         return None;
     }
     let side = |w: &str, s: &str, c: &str| {
@@ -1178,6 +1203,11 @@ fn initial_value(p: &str) -> &'static str {
 /// A computed value: AETHERSTYLE's report for its 20 properties, else the inline value, else the
 /// initial value (ledgered — no number is invented for a property Aether does not compute).
 pub fn computed_value(el: usize, prop: &str) -> String {
+    // An element that is not in the document has no computed style: every property reads "" (CSSOM
+    // §9 "getComputedStyle": the declarations are empty when the element is not connected).
+    if !dom::is_connected(el) {
+        return String::new();
+    }
     if let Some(i) = crate::css::REPORT_PROPS.iter().position(|p| *p == prop) {
         let v = with_layout(|f| f.report.get(&NodeId(el)).map(|r| r[i].clone()));
         // An element without a box (detached, display:none ancestor) reports what the report says
@@ -1326,18 +1356,54 @@ fn box_metric(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         "clientHeight" | "scrollHeight" => h - bt - bb,
         "clientTop" => bt,
         "clientLeft" => bl,
-        "offsetTop" => {
-            let p = offset_parent(el).and_then(|p| with_layout(|f| f.boxes.get(&NodeId(p)).and_then(|v| v.first().copied())));
-            y - p.map(|r| r.1).unwrap_or(0.0)
-        }
-        "offsetLeft" => {
-            let p = offset_parent(el).and_then(|p| with_layout(|f| f.boxes.get(&NodeId(p)).and_then(|v| v.first().copied())));
-            x - p.map(|r| r.0).unwrap_or(0.0)
+        // CSSOM View §7: relative to the offsetParent's padding edge, or to the initial containing
+        // block when the offsetParent is the body (or there is none).
+        "offsetTop" | "offsetLeft" => {
+            let top = which == "offsetTop";
+            let parent = offset_parent(el);
+            let is_body = parent.is_some_and(|p| with_doc(|d| dom::is_html_tag(d, p, "body")));
+            match parent.filter(|_| !is_body) {
+                Some(p) => {
+                    let pr = with_layout(|f| f.boxes.get(&NodeId(p)).and_then(|v| v.first().copied()));
+                    let pb = border_of(p);
+                    match pr {
+                        Some(r) => {
+                            if top {
+                                y - r.1 - pb.0
+                            } else {
+                                x - r.0 - pb.1
+                            }
+                        }
+                        None => {
+                            if top {
+                                y
+                            } else {
+                                x
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if top {
+                        y
+                    } else {
+                        x
+                    }
+                }
+            }
         }
         _ => 0.0,
     };
     // CSSOM View rounds these integer-typed metrics.
     Ok(num((v as f64).round()))
+}
+
+/// (top, left) border widths of `el`'s box.
+fn border_of(el: usize) -> (f32, f32) {
+    with_layout(|f| {
+        let t = f.tree.node_map.iter().find(|(_, n)| n.id() == NodeId(el)).map(|(t, _)| *t);
+        t.and_then(|t| f.tree.taffy.layout(t).ok()).map(|l| (l.border.top, l.border.left)).unwrap_or((0.0, 0.0))
+    })
 }
 
 /// CSSOM View "offsetParent": the nearest positioned ancestor, `td`/`th`/`table`, or the body.

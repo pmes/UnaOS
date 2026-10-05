@@ -233,6 +233,10 @@ pub(crate) struct PageState {
     pub last_click_canceled: bool,
     /// Script elements whose "force async" flag was cleared by an `async` IDL write.
     pub async_cleared: HashSet<usize>,
+    /// The timer nesting level of the running timer task (None outside timer tasks).
+    pub timer_nesting: Option<u32>,
+    /// Each armed timer's nesting level, by id.
+    pub timer_levels: HashMap<u32, u32>,
 }
 
 thread_local! {
@@ -287,15 +291,30 @@ pub fn take_script_navigation() -> Option<String> {
     page(|p| p.pending_nav.take())
 }
 
+/// Whether `node` belongs to the page whose script state this thread holds (layout and tests also
+/// run over documents no script ever saw).
+fn is_page_node(p: &PageState, node: &NodeRef) -> bool {
+    p.doc.as_ref().is_some_and(|d| d.same_document(node))
+}
+
 /// The dirty form-control value of `node`, when script or the user set one (else the `value`
 /// content attribute applies) — what rendering and form submission read.
 pub fn control_value(node: &NodeRef) -> Option<String> {
-    page(|p| p.values.get(&node.id().0).cloned())
+    page(|p| if is_page_node(p, node) { p.values.get(&node.id().0).cloned() } else { None })
+}
+
+/// Script-set selectedness of an `<option>` (`option.selected`, `select.value`), if any.
+pub fn option_selectedness(node: &NodeRef) -> Option<bool> {
+    page(|p| if is_page_node(p, node) { p.checked.get(&node.id().0).copied() } else { None })
 }
 
 /// Records a user edit of a text control's value (sets its dirty value).
 pub fn set_control_value(node: &NodeRef, value: String) {
-    page(|p| p.values.insert(node.id().0, value));
+    page(|p| {
+        if is_page_node(p, node) {
+            p.values.insert(node.id().0, value);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -384,6 +403,16 @@ pub(crate) fn invoke_callback(vm: &mut Vm, label: &str, f: &Value, args: &[Value
 /// A string timer handler: compiled and run as a classic script.
 pub(crate) fn run_timer_source(vm: &mut Vm, src: &str) -> Result<Value, Value> {
     run_classic(vm, src, "timer-source")
+}
+
+/// The nesting level a firing timer's task runs at (`keep`: an interval stays armed, so its level
+/// record stays too).
+pub(crate) fn timer_level(id: u32, keep: bool) -> u32 {
+    page(|p| if keep { p.timer_levels.get(&id).copied() } else { p.timer_levels.remove(&id) }).unwrap_or(1)
+}
+
+pub(crate) fn set_timer_nesting(level: Option<u32>) {
+    page(|p| p.timer_nesting = level);
 }
 
 /// Whether the last user click was canceled by a listener (no default action follows).

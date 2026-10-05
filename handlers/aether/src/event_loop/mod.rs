@@ -30,8 +30,9 @@ pub const BOOT_PASS_MS: u64 = 16;
 thread_local! {
     /// Monotonic origin for this thread.
     static CLOCK_BASE: Instant = Instant::now();
-    /// Virtual time added to the real elapsed time (boot drain frames, tests).
-    static CLOCK_OFFSET: Cell<u64> = const { Cell::new(0) };
+    /// Virtual time added to the real elapsed time (boot drain frames, tests); signed so a thaw can
+    /// rebase the clock under the real one.
+    static CLOCK_OFFSET: Cell<i64> = const { Cell::new(0) };
     /// When set, the clock reads exactly CLOCK_OFFSET and only [`advance_clock`] moves it.
     static CLOCK_FROZEN: Cell<bool> = const { Cell::new(false) };
     /// Mirror of the armed timer count (for diagnostics without the VM at hand).
@@ -42,22 +43,38 @@ thread_local! {
 pub fn now_ms() -> u64 {
     let offset = CLOCK_OFFSET.with(Cell::get);
     if CLOCK_FROZEN.with(Cell::get) {
-        offset
+        offset.max(0) as u64
     } else {
-        CLOCK_BASE.with(|b| b.elapsed().as_millis() as u64) + offset
+        (CLOCK_BASE.with(|b| b.elapsed().as_millis() as i64) + offset).max(0) as u64
     }
 }
 
 /// Moves the clock forward by `ms`.
 pub fn advance_clock(ms: u64) {
-    CLOCK_OFFSET.with(|o| o.set(o.get().saturating_add(ms)));
+    CLOCK_OFFSET.with(|o| o.set(o.get().saturating_add(ms as i64)));
 }
 
 /// Stops the clock at its current reading; only [`advance_clock`] moves it after this.
 pub fn freeze_clock() {
     let now = now_ms();
     CLOCK_FROZEN.with(|f| f.set(true));
-    CLOCK_OFFSET.with(|o| o.set(now));
+    CLOCK_OFFSET.with(|o| o.set(now as i64));
+}
+
+/// Lets a frozen clock run again from its current reading (real time resumes from there).
+pub fn thaw_clock() {
+    if !CLOCK_FROZEN.with(Cell::get) {
+        return;
+    }
+    let now = now_ms() as i64;
+    CLOCK_FROZEN.with(|f| f.set(false));
+    let elapsed = CLOCK_BASE.with(|b| b.elapsed().as_millis() as i64);
+    CLOCK_OFFSET.with(|o| o.set(now - elapsed));
+}
+
+/// Whether the clock is frozen.
+pub fn clock_frozen() -> bool {
+    CLOCK_FROZEN.with(Cell::get)
 }
 
 /// Rewinds the clock for a new page (timers die with the previous page's VM).
@@ -114,6 +131,8 @@ pub fn fire_due_timers(vm: &mut Vm) -> usize {
         };
         set_armed(vm.timers.len());
         ran += 1;
+        let level = crate::js::timer_level(id, vm.timers.iter().any(|t| t.id == id));
+        crate::js::set_timer_nesting(Some(level));
         match &callback {
             Value::String(src) => {
                 let _ = crate::js::run_timer_source(vm, &src.to_rust());
@@ -122,6 +141,7 @@ pub fn fire_due_timers(vm: &mut Vm) -> usize {
                 crate::js::invoke_callback(vm, "timer-callback", f, &args);
             }
         }
+        crate::js::set_timer_nesting(None);
         if crate::js::engine_poisoned() {
             break;
         }

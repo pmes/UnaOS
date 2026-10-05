@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>07 character data</title></head>
+<body>
+<p id="p">Hello</p>
+<ul id="log"></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var t = document.getElementById('p').firstChild;
+t.appendData(' world');
+t.insertData(0, '>> ');
+t.deleteData(3, 1);
+t.replaceData(0, 2, '<<');
+log('data: ' + t.data + ' length=' + t.length + ' substring=' + t.substringData(2, 5));
+var e = null; try { t.substringData(99, 1); } catch (x) { e = x.name; }
+log('index error: ' + e);
+var emoji = document.createTextNode('a😀b');
+log('utf16 length: ' + emoji.length + ' sub=' + emoji.substringData(1, 2).length);
+document.getElementById('p').appendChild(emoji);
+var tail = t.splitText(5);
+log('splitText: [' + t.data + '] [' + tail.data + '] siblings=' + document.getElementById('p').childNodes.length + ' whole=' + tail.wholeText.length);
+var p2 = document.createElement('p');
+p2.id = 'p2';
+p2.appendChild(document.createTextNode('one'));
+p2.appendChild(document.createTextNode(''));
+p2.appendChild(document.createTextNode('two'));
+p2.appendChild(document.createElement('br'));
+p2.appendChild(document.createTextNode('three'));
+document.body.insertBefore(p2, document.getElementById('log'));
+log('before normalize: ' + p2.childNodes.length);
+p2.normalize();
+log('after normalize: ' + p2.childNodes.length + ' first=' + p2.firstChild.data);
+var c = document.createComment('note');
+c.data = 'changed -- comment';
+document.body.insertBefore(c, document.getElementById('log'));
+log('comment: ' + c.data + ' ' + c.nodeValue + ' ' + c.textContent);
+var tx = new Text('constructed');
+var cm = new Comment('built');
+log('constructors: ' + tx.data + ' ' + cm.data + ' ' + (tx instanceof CharacterData) + ' ' + (tx.ownerDocument === document));
+t.nodeValue = 'via nodeValue';
+log('nodeValue: ' + document.getElementById('p').firstChild.data + ' el.nodeValue=' + document.body.nodeValue);
+t.textContent = 'via textContent';
+log('textContent: ' + t.data);
+t.before('B4:');
+t.after(':AF');
+log('childnode on text: ' + document.getElementById('p').textContent.slice(0, 30));
+</script>
+</body></html>

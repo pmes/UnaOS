@@ -297,6 +297,15 @@ fn set_handler(vm: &mut Vm, t: TargetKey, ty: &str, v: Value) {
             page(|p| p.handlers.insert(key.clone(), r));
         }
     }
+    if !non_null {
+        // HTML "deactivate an event handler": its listener leaves the list (a later activation
+        // registers it again, at the end).
+        page(|p| {
+            if let Some(ls) = p.listeners.get_mut(&t) {
+                ls.retain(|l| !(l.handler && l.ty == ty));
+            }
+        });
+    }
     if non_null {
         let registered = page(|p| p.listeners.get(&t).is_some_and(|ls| ls.iter().any(|l| l.handler && l.ty == ty)));
         if !registered {
@@ -374,6 +383,11 @@ fn handler_value(vm: &mut Vm, t: TargetKey, ty: &str) -> Value {
             None => Value::Null,
         };
         crate::ledger::record_dom("inline-handler-scope-chain-approximated");
+        // The internal raw uncompiled handler's function is named for the handler ("onclick").
+        if let Value::Object(fo) = &f {
+            let name = format!("on{ty}");
+            vm.heap.get_mut(*fo).props.insert(PropertyKey::from_str("name"), Prop::data(s(&name), C));
+        }
         vm.host_roots[r] = f.clone();
         return f;
     }

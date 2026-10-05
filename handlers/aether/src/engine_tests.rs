@@ -866,8 +866,11 @@ mod tests {
         );
         // From here the clock only moves when we move it: each tick must add
         // exactly one generation, no matter how eagerly the callback re-arms.
+        // (Past nesting level 5 HTML clamps the re-arm to 4 ms, so each tick
+        // first moves the clock by that much.)
         crate::event_loop::freeze_clock();
         for i in 1..=5 {
+            crate::event_loop::advance_clock(4);
             engine.tick();
             assert_eq!(
                 js_num(&mut engine, "window.__n"),
@@ -1779,10 +1782,13 @@ mod tests {
         assert_eq!(f[8], "s1", "and it is THAT script, identified by its own attrs");
         assert_eq!(f[9], "/x", "own properties still win over the prototype");
         let later = doc.select("#later").unwrap().next().expect("microtask must run");
+        // HTML "execute the script element" keeps currentScript set through "clean up after running
+        // script", so microtasks the script queued see the element — what Chromium does too
+        // (script oracle page 16).
         assert_eq!(
             later.as_node().text_contents(),
-            "null",
-            "currentScript is null outside a running script"
+            "[object HTMLScriptElement]",
+            "a microtask queued by a running script runs in its checkpoint, currentScript still set"
         );
     }
 
@@ -1935,15 +1941,18 @@ mod tests {
             }
         }
 
-        // The selected option must reach the control paint/submit path.
+        // The selected option reaches the control paint/submit path — read from the options, never
+        // written into the document (AETHERJS: layout used to insert `value`/`data-aether-label`
+        // attributes, which then showed in the serialized DOM and in script).
         let select = document.select_first("select").unwrap();
-        let attrs = select.attributes.borrow();
-        assert_eq!(attrs.get("value"), Some("en"), "select submits the selected option's value");
         assert_eq!(
-            attrs.get("data-aether-label"),
-            Some("English"),
-            "select paints the selected option's text"
+            layout::select_selected_option(select.as_node()),
+            Some(("en".to_string(), "English".to_string())),
+            "select submits the selected option's value and paints its text"
         );
+        let attrs = select.attributes.borrow();
+        assert_eq!(attrs.get("value"), None, "layout does not mutate the DOM");
+        assert_eq!(attrs.get("data-aether-label"), None, "layout does not mutate the DOM");
     }
 
     // -----------------------------------------------------------------------

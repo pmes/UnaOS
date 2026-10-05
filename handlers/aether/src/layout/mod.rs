@@ -246,12 +246,14 @@ fn is_non_rendered(name: &str) -> bool {
     )
 }
 
-/// The (submit value, display label) of a `<select>`'s selected option:
-/// the first option carrying `selected`, else the first option at all.
-/// Value is the option's `value` attribute, falling back to its text —
-/// the HTML rule. Label is always the option's text.
-fn select_selected_option(select: &NodeRef) -> Option<(String, String)> {
+/// The (submit value, display label) of a `<select>`'s selected option (HTML §4.10.7 selectedness):
+/// the last option whose selectedness is set — script-set selectedness (`option.selected`,
+/// `select.value`) first, else the `selected` attribute — else the first option. Value is the
+/// option's `value` attribute, falling back to its text; label is the option's text. Layout only
+/// reads: it never writes attributes into the document.
+pub(crate) fn select_selected_option(select: &NodeRef) -> Option<(String, String)> {
     let mut first: Option<(String, String)> = None;
+    let mut chosen: Option<(String, String)> = None;
     for desc in select.descendants() {
         let Some(el) = desc.as_element() else { continue };
         if el.name.local.as_ref() != "option" {
@@ -259,40 +261,22 @@ fn select_selected_option(select: &NodeRef) -> Option<(String, String)> {
         }
         let label = desc.text_contents().split_whitespace().collect::<Vec<_>>().join(" ");
         let attrs = el.attributes.borrow();
-        let selected = attrs.get("selected").is_some();
+        let attr_selected = attrs.get("selected").is_some();
         let value = attrs
             .get("value")
             .map(|v| v.to_string())
             .unwrap_or_else(|| label.clone());
         drop(attrs);
+        let selected = crate::js::option_selectedness(&desc).unwrap_or(attr_selected);
         let pair = (value, label);
         if selected {
-            return Some(pair);
+            chosen = Some(pair.clone());
         }
         if first.is_none() {
             first = Some(pair);
         }
     }
-    first
-}
-
-/// Publishes a `<select>`'s effective value onto the element, so the paint
-/// path (which draws a control's `value` attribute) and form submission
-/// (which reads the same attribute) both see the selected option rather
-/// than nothing. `data-aether-label` carries the human-visible text, which
-/// differs from the submit value whenever the option has a `value` attr
-/// (`<option value=en>English</option>`).
-fn publish_select_value(node: &NodeRef) {
-    let Some(el) = node.as_element() else { return };
-    if el.name.local.as_ref() != "select" {
-        return;
-    }
-    let Some((value, label)) = select_selected_option(node) else { return };
-    let mut attrs = el.attributes.borrow_mut();
-    if attrs.get("value").is_none_or(|v| v.is_empty()) {
-        attrs.insert("value", value);
-    }
-    attrs.insert("data-aether-label", label);
+    chosen.or(first)
 }
 
 /// Inline-level elements: they size to content and flow in wrapping rows.
@@ -482,10 +466,6 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         let replaced_media = dom_node
             .as_element()
             .is_some_and(|el| matches!(el.name.local.as_ref(), "video" | "audio"));
-
-        // A <select> keeps its box but not its options: publish the selected
-        // option onto the element so the control paints/submits a value.
-        publish_select_value(dom_node);
 
         let mut kids: Vec<(taffy::NodeId, bool)> = Vec::new();
         // A textarea's text is its VALUE, painted inside the control, not

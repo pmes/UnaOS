@@ -1627,9 +1627,17 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 _ if crate::layout::is_inline(tag) => "inline",
                 _ => "block",
             };
-            let position = match spec.as_ref().and_then(|s| s.position) {
-                Some(taffy::style::Position::Absolute) => "absolute",
-                _ => "static",
+            // AETHERJS: the five position kinds Aether paints (relative/sticky offsets, fixed to the
+            // viewport) — the report used to fold everything but absolute into static.
+            let position = match paint.position_kind {
+                Some(1) => "relative",
+                Some(2) => "absolute",
+                Some(3) => "fixed",
+                Some(4) => "sticky",
+                _ => match spec.as_ref().and_then(|s| s.position) {
+                    Some(taffy::style::Position::Absolute) => "absolute",
+                    _ => "static",
+                },
             };
             let flex_direction = match spec.as_ref().and_then(|s| s.flex_direction) {
                 Some(FlexDirection::Column) => "column",

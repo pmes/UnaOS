@@ -30,8 +30,15 @@ fn timer_common(vm: &mut Vm, ctx: &CallCtx, repeat: bool) -> JsResult<Value> {
         delay = delay.max(4.0);
     }
     let args: Vec<Value> = (2..ctx.argc).map(|i| arg(vm, ctx, i)).collect();
+    // HTML §8.6 timer nesting: a timer armed by a timer task is one level deeper, and past level 5 a
+    // timeout under 4 ms is clamped to 4 ms (a zero-delay re-arming chain cannot spin a frozen clock).
+    let level = page(|p| p.timer_nesting).unwrap_or(0);
+    if level > 5 && delay < 4.0 {
+        delay = 4.0;
+    }
     vm.timer_seq = vm.timer_seq.wrapping_add(1).max(1);
     let id = vm.timer_seq;
+    page(|p| p.timer_levels.insert(id, level + 1));
     let now = crate::event_loop::now_ms() as f64;
     vm.timers.push(Timer { id, due: now + delay, seq: id as u64, callback, args, interval: if repeat { Some(delay) } else { None } });
     crate::event_loop::set_armed(vm.timers.len());
@@ -52,6 +59,7 @@ fn clear_timer(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if id.is_finite() && id > 0.0 {
         let id = id as u32;
         vm.timers.retain(|t| t.id != id);
+        page(|p| p.timer_levels.remove(&id));
         crate::event_loop::set_armed(vm.timers.len());
     }
     Ok(Value::Undefined)

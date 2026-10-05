@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>08 inline style</title></head>
+<body>
+<div id="a" style="color: red; display: none; max-height: 0px; background-color: rgb(0, 255, 136);">a</div>
+<div id="b" style="border-width: 3px 3px 3px 5px; border-style: solid; border-color: rgb(239, 71, 111); border-image: initial; padding: 8px 4px; margin: 1px 2px 3px;">b</div>
+<div id="c" style="margin: 0px auto; opacity: 0.5 !important; --brand: #123;">c</div>
+<div id="d" style="width: 10px; height: 20px; font-weight: bold; z-index: 3; font-size: 1.5em; float: left;">d</div>
+<div id="e" style="color: rgb(1, 2, 3); background: yellow; flex: 1 1 0%; overflow: hidden auto;">e</div>
+<ul id="log"><li>a: color: red; display: none; max-height: 0px; background-color: rgb(0, 255, 136); | red 4</li><li>b: border: 3px solid rgb(239, 71, 111); padding: 8px 4px; margin: 1px 2px 3px; | top=rgb(239, 71, 111) pad-left=4px mb=3px</li><li>b split: border-width: 3px 3px 3px 5px; border-style: solid; border-color: rgb(239, 71, 111); border-image: initial; padding: 8px 4px; margin: 1px 2px 3px;</li><li>c parsed: blue auto 0px auto</li><li>c: margin: 0px auto; color: blue; opacity: 0.5 !important; --brand: #123; | prio=important custom=#123</li><li>removeProperty: blue -&gt; margin: 0px auto; opacity: 0.5 !important; --brand: #123;</li><li>d: width: 10px; height: 20px; font-weight: bold; z-index: 3; font-size: 1.5em; float: left; | float=left left</li><li>e: color: rgb(1, 2, 3); background: yellow; flex: 1 1 0%; overflow: hidden auto; | bg=yellow fg=1 0%</li><li>item(0): color hsl: color: rgb(0, 128, 0); outline-color: rgba(10, 20, 30, 0.5);</li><li>empty removes: []</li></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var a = document.getElementById('a');
+a.style.display = 'none';
+a.style.maxHeight = '0';
+a.style.backgroundColor = '#0f8';
+log('a: ' + a.getAttribute('style') + ' | ' + a.style.color + ' ' + a.style.length);
+var b = document.getElementById('b');
+b.style.border = '3px solid #ef476f';
+b.style.padding = '8px 4px';
+b.style.margin = '1px 2px 3px';
+log('b: ' + b.style.cssText + ' | top=' + b.style.borderTopColor + ' pad-left=' + b.style.paddingLeft + ' mb=' + b.style.marginBottom);
+b.style.borderLeftWidth = '5px';
+log('b split: ' + b.getAttribute('style'));
+var c = document.getElementById('c');
+log('c parsed: ' + c.style.color + ' ' + c.style.marginLeft + ' ' + c.style.margin);
+c.style.setProperty('opacity', '0.50', 'important');
+c.style.setProperty('--brand', ' #123 ');
+log('c: ' + c.getAttribute('style') + ' | prio=' + c.style.getPropertyPriority('opacity') + ' custom=' + c.style.getPropertyValue('--brand'));
+log('removeProperty: ' + c.style.removeProperty('color') + ' -> ' + c.style.cssText);
+var d = document.getElementById('d');
+d.style.cssText = 'width: 10px; height: 20PX; font-weight: bold; z-index: 3';
+d.style.width = 'banana';
+d.style['font-size'] = '1.50em';
+d.style.cssFloat = 'left';
+log('d: ' + d.style.cssText + ' | float=' + d.style.cssFloat + ' ' + d.style.getPropertyValue('float'));
+var e = document.getElementById('e');
+e.style = 'color: rgb(1, 2, 3); background: yellow';
+e.style.flex = '1';
+e.style.overflow = 'hidden auto';
+log('e: ' + e.getAttribute('style') + ' | bg=' + e.style.backgroundColor + ' fg=' + e.style.flexGrow + ' ' + e.style.flexBasis);
+log('item(0): ' + e.style.item(0) + ' hsl: ' + (function () { var x = document.createElement('i'); x.style.color = 'hsl(120, 100%, 25%)'; x.style.outlineColor = 'rgba(10, 20, 30, 0.5)'; return x.style.cssText; })());
+log('empty removes: ' + (function () { var x = document.createElement('i'); x.style.color = 'red'; x.style.color = ''; return '[' + x.getAttribute('style') + ']'; })());
+</script>
+
+</body></html>

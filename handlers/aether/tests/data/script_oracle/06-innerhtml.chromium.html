@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>06 markup</title></head>
+<body>
+<div id="box"><p class="x">One &amp; <b>two</b></p><!-- c --><script>window.__ran = true;</script>text &lt;3</div>
+<table id="tbl"><tbody id="tb"><tr><td>1</td><td>2</td></tr><tr><td colspan="2">3</td></tr></tbody></table>
+<div id="adj"><i>bb</i><hr><span id="mid"><i>ab</i>mid<i>be</i></span> &lt;txt&gt; <i>ae</i></div>
+<template id="tpl"><li class="row">templated <b>row</b></li></template>
+<ul id="from-template"><li class="row">templated <b>row</b></li><li class="row">templated <b>row</b></li></ul>
+<div id="outer"><p id="new1">new one</p><p id="new2">new two</p></div>
+<ul id="log"><li>innerHTML get: &lt;p class="x"&gt;One &amp;amp; &lt;b&gt;two&lt;/b&gt;&lt;/p&gt;&lt;!-- c --&gt;&lt;script&gt;window.__ran = true;&lt;/script&gt;text &amp;lt;3</li><li>script via innerHTML ran: false children=4</li><li>table context rows: [object HTMLCollection] 2 3</li><li>adjacent: &lt;i&gt;bb&lt;/i&gt;&lt;span id="mid"&gt;&lt;i&gt;ab&lt;/i&gt;mid&lt;i&gt;be&lt;/i&gt;&lt;/span&gt;&lt;i&gt;ae&lt;/i&gt;</li><li>adjacent text/element: &lt;i&gt;bb&lt;/i&gt;&lt;hr&gt;&lt;span id="mid"&gt;&lt;i&gt;ab&lt;/i&gt;mid&lt;i&gt;be&lt;/i&gt;&lt;/span&gt; &amp;lt;txt&amp;gt; &lt;i&gt;ae&lt;/i&gt;</li><li>template content: #document-fragment 1 0 inner=&lt;li class="row"&gt;templated &lt;b&gt;row&lt;/b&gt;&lt;/li&gt;</li><li>instantiated: 2</li><li>outerHTML set: &lt;p id="new1"&gt;new one&lt;/p&gt;&lt;p id="new2"&gt;new two&lt;/p&gt; victim gone=true</li><li>outerHTML get: &lt;p id="new1"&gt;new one&lt;/p&gt;</li><li>outerHTML on root: NoModificationAllowedError</li><li>select context: 2 b</li><li>foreign: http://www.w3.org/2000/svg http://www.w3.org/2000/svg http://www.w3.org/1999/xhtml</li><li>serialize escapes: &lt;p title="a&amp;quot;b&amp;lt;c&amp;amp;d"&gt;&amp;lt;&amp;amp;&amp;gt;&amp;nbsp;&lt;/p&gt;</li></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var box = document.getElementById('box');
+box.innerHTML = '<p class="x">One &amp; <b>two</b></p><!-- c --><script>window.__ran = true;<\/script>text &lt;3';
+log('innerHTML get: ' + box.innerHTML);
+log('script via innerHTML ran: ' + (window.__ran === true) + ' children=' + box.childNodes.length);
+document.getElementById('tb').innerHTML = '<tr><td>1</td><td>2</td></tr><tr><td colspan="2">3</td></tr>';
+log('table context rows: ' + document.getElementById('tbl').rows + ' ' + document.querySelectorAll('#tb tr').length + ' ' + document.querySelectorAll('#tb td').length);
+var adj = document.getElementById('mid');
+adj.insertAdjacentHTML('beforebegin', '<i>bb</i>');
+adj.insertAdjacentHTML('afterbegin', '<i>ab</i>');
+adj.insertAdjacentHTML('beforeend', '<i>be</i>');
+adj.insertAdjacentHTML('afterend', '<i>ae</i>');
+log('adjacent: ' + document.getElementById('adj').innerHTML);
+adj.insertAdjacentText('afterend', ' <txt> ');
+adj.insertAdjacentElement('beforebegin', document.createElement('hr'));
+log('adjacent text/element: ' + document.getElementById('adj').innerHTML);
+var tpl = document.getElementById('tpl');
+log('template content: ' + tpl.content.nodeName + ' ' + tpl.content.childNodes.length + ' ' + tpl.childNodes.length + ' inner=' + tpl.innerHTML);
+for (var i = 0; i < 2; i++) document.getElementById('from-template').appendChild(document.importNode(tpl.content, true));
+log('instantiated: ' + document.querySelectorAll('#from-template .row').length);
+document.getElementById('victim').outerHTML = '<p id="new1">new one</p><p id="new2">new two</p>';
+log('outerHTML set: ' + document.getElementById('outer').innerHTML + ' victim gone=' + (document.getElementById('victim') === null));
+log('outerHTML get: ' + document.getElementById('new1').outerHTML);
+var e = null; try { document.documentElement.outerHTML = '<p>x</p>'; } catch (x) { e = x.name; }
+log('outerHTML on root: ' + e);
+var sel = document.createElement('select');
+sel.innerHTML = '<option>a</option><option selected>b</option>';
+log('select context: ' + sel.options.length + ' ' + sel.value);
+var div = document.createElement('div');
+div.innerHTML = '<svg><circle r="1"/><foreignObject><p>html in svg</p></foreignObject></svg>';
+log('foreign: ' + div.firstChild.namespaceURI + ' ' + div.querySelector('circle').namespaceURI + ' ' + div.querySelector('p').namespaceURI);
+log('serialize escapes: ' + (function () { var p = document.createElement('p'); p.setAttribute('title', 'a"b<c&d'); p.textContent = '<&> '; return p.outerHTML; })());
+</script>
+
+</body></html>

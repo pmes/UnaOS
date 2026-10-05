@@ -144,6 +144,11 @@ pub fn load(url: &str, html: &str, pre: Prefetched, viewport: (f32, f32), extern
         }
     }
 
+    // Virtual time stands still while the document loads (scripts take no page time, as under
+    // Chromium's virtual time): a timer a script arms fires on the page clock's next advance — after
+    // `load` unless it is already due — whatever the host's speed. The clock runs again after load.
+    let was_frozen = crate::event_loop::clock_frozen();
+    crate::event_loop::freeze_clock();
     let tb = TreeBuilder::new(crate::dom::parse_opts());
     let tz = Tokenizer::from_str(html, TokenizerOpts { processing_instructions: false });
     let mut ctx = Box::new(ParserCtx { tb, tz, blocking: None, deferred: Vec::new(), asap: Vec::new(), nesting: 0 });
@@ -151,7 +156,7 @@ pub fn load(url: &str, html: &str, pre: Prefetched, viewport: (f32, f32), extern
     doc_to_parser(&mut ctx);
     put_ctx(ctx);
     parse_until_eof(&mut engine.vm);
-    the_end(&mut engine);
+    the_end(&mut engine, was_frozen);
     (doc, engine)
 }
 
@@ -295,6 +300,10 @@ fn prepare_parser_script(vm: &mut Vm, el: usize) {
                 // A script document.write wrote: it becomes the pending parsing-blocking script.
                 with_ctx(|c| c.blocking = Some(el));
             } else {
+                // §13.2.6.4.8: the parser waits for the pending parsing-blocking script — "spin the
+                // event loop until … ready": the tasks and timers already due get their turns while
+                // the script's fetch is outstanding.
+                spin_event_loop(vm);
                 run_script_now(vm, el);
             }
         }
@@ -305,6 +314,27 @@ fn prepare_parser_script(vm: &mut Vm, el: usize) {
             with_ctx(|c| c.deferred.push(el));
         }
     }
+}
+
+/// One turn of the event loop while the parser waits: queued tasks, then the timers due now.
+fn spin_event_loop(vm: &mut Vm) {
+    let batch: Vec<super::Task> = page(|p| p.tasks.drain(..).collect());
+    for t in batch {
+        match t {
+            super::Task::Script(id) => run_script_now(vm, id),
+            super::Task::Event(target, ty, bubbles) => {
+                super::events::fire_simple(vm, target, &ty, bubbles, false);
+            }
+            super::Task::Callback(r) => {
+                let f = super::idl::rooted(vm, r);
+                super::idl::unroot(vm, r);
+                super::invoke(vm, "task", &f, &Value::Undefined, &[]);
+            }
+        }
+        super::checkpoint(vm);
+    }
+    crate::event_loop::fire_due_timers(vm);
+    super::checkpoint(vm);
 }
 
 /// Fetches (when needed) and executes a prepared script, firing `load`/`error` for external ones.
@@ -341,14 +371,14 @@ fn run_script_now(vm: &mut Vm, el: usize) {
                 c.nesting += 1;
             })
             .is_some();
-            let r = super::run_classic_no_checkpoint(vm, &src, "script");
+            // HTML "execute the script element": currentScript stays set through "run the classic
+            // script", whose "clean up after running script" performs the microtask checkpoint — so
+            // microtasks the script queued still see it (Chromium agrees: oracle page 16).
+            let r = super::run_classic(vm, &src, "script");
             if nest {
                 with_ctx(|c| c.nesting -= 1);
             }
             page(|p| p.current_script = prev);
-            if super::stack_empty() {
-                super::checkpoint(vm);
-            }
             r.map(|_| ())
         }
         ScriptKind::Module => run_module(vm, el, &rec, &src),
@@ -431,7 +461,7 @@ fn run_module(vm: &mut Vm, el: usize, rec: &ScriptRec, src: &str) -> Result<(), 
 }
 
 /// HTML §13.2.7 "the end", then the boot event-loop drain.
-fn the_end(engine: &mut Engine) {
+fn the_end(engine: &mut Engine, was_frozen: bool) {
     let vm = &mut engine.vm;
     let Some(ctx) = take_ctx() else { return };
     let deferred = ctx.deferred.clone();
@@ -451,9 +481,17 @@ fn the_end(engine: &mut Engine) {
         run_script_now(vm, el);
         super::checkpoint(vm);
     }
-    // Tasks the scripts queued (dynamically inserted scripts, messages) and the zero-delay timers get
-    // their turns before the load event, bounded.
-    crate::event_loop::boot_drain(engine);
+    // "Spin the event loop until … nothing delays the load event": the tasks the scripts queued
+    // (dynamically inserted scripts — which do delay load — and messages) run, and timers already due
+    // on the page clock fire; the clock is not advanced, so a 20 ms timer still fires after `load`, as
+    // in Chromium (script oracle page 12).
+    for _ in 0..64 {
+        let n = engine.run_tasks() + crate::event_loop::fire_due_timers(&mut engine.vm);
+        engine.checkpoint();
+        if n == 0 && !engine.has_tasks() {
+            break;
+        }
+    }
     let vm = &mut engine.vm;
     page(|p| p.ready_state = "complete");
     super::events::fire_simple(vm, TargetKey::Node(doc), "readystatechange", false, false);
@@ -461,6 +499,9 @@ fn the_end(engine: &mut Engine) {
     super::events::fire_simple(vm, TargetKey::Window, "load", false, false);
     super::checkpoint(vm);
     crate::event_loop::boot_drain(engine);
+    if !was_frozen {
+        crate::event_loop::thaw_clock();
+    }
     engine.drain_raf();
     crate::event_loop::boot_drain(engine);
 }

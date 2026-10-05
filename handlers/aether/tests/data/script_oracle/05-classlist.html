@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>05 classList</title></head>
+<body>
+<p id="p" class="  a b   a c ">para</p>
+<p id="q">no class</p>
+<ul id="log"></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var p = document.getElementById('p'), cl = p.classList;
+log('initial: ' + cl.length + ' [' + cl.value + '] item1=' + cl.item(1) + ' [2]=' + cl[2] + ' oob=' + cl.item(7) + ' contains b=' + cl.contains('b'));
+cl.add('d', 'a');
+log('add: ' + p.className);
+cl.remove('a', 'zzz');
+log('remove: ' + p.className);
+log('toggle: ' + cl.toggle('b') + ' ' + cl.toggle('e') + ' ' + cl.toggle('e', true) + ' ' + cl.toggle('f', false) + ' -> ' + p.className);
+log('replace: ' + cl.replace('c', 'x') + ' ' + cl.replace('nope', 'y') + ' -> ' + p.className);
+var arr = []; for (var t of cl) arr.push(t);
+log('iterate: ' + arr.join('/') + ' ' + Array.from(cl.keys()).join(',') + ' same=' + (p.classList === cl));
+var e1 = null, e2 = null;
+try { cl.add(''); } catch (x) { e1 = x.name; }
+try { cl.add('a b'); } catch (x) { e2 = x.name; }
+log('errors: ' + e1 + ' ' + e2);
+var q = document.getElementById('q');
+q.classList.remove('x');
+log('no attribute created: ' + q.hasAttribute('class'));
+q.classList.toggle('on');
+q.classList.value = 'one two';
+log('value set: ' + q.className + ' ' + q.classList.length + ' ' + String(q.classList));
+p.classList = 'assigned via PutForwards';
+log('putforwards: ' + p.className);
+log('toString tag: ' + Object.prototype.toString.call(cl));
+</script>
+</body></html>

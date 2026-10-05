@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>13 tasks and microtasks</title></head>
+<body>
+<ol id="log"><li>script-start async-start executor script-end micro-1 qm async-after-await then caught:handled micro-2 all:1+2 timeout-0a micro-in-timeout timeout-0b async-after-timer iv1 args:xy string-handler iv2 nested-outer nested-inner iv3</li><li></li></ol>
+<script>
+var seq = [];
+function done() { var li = document.createElement('li'); li.textContent = seq.join(' '); document.getElementById('log').appendChild(li); var l2 = document.createElement('li'); l2.textContent = rafs.join(' '); document.getElementById('log').appendChild(l2); }
+seq.push('script-start');
+setTimeout(function () { seq.push('timeout-0a'); Promise.resolve().then(function () { seq.push('micro-in-timeout'); }); }, 0);
+setTimeout(function () { seq.push('timeout-0b'); }, 0);
+Promise.resolve().then(function () { seq.push('micro-1'); }).then(function () { seq.push('micro-2'); });
+queueMicrotask(function () { seq.push('qm'); });
+(async function () { seq.push('async-start'); await null; seq.push('async-after-await'); await new Promise(function (r) { setTimeout(r, 5); }); seq.push('async-after-timer'); })();
+var n = 0;
+var iv = setInterval(function () { seq.push('iv' + (++n)); if (n === 3) { clearInterval(iv); } }, 11);
+var cancelled = setTimeout(function () { seq.push('never'); }, 1);
+clearTimeout(cancelled);
+setTimeout(function (a, b) { seq.push('args:' + a + b); }, 15, 'x', 'y');
+setTimeout("seq.push('string-handler')", 16);
+var rafs = [];
+requestAnimationFrame(function (ts) { rafs.push('raf:' + (typeof ts)); });
+setTimeout(function () { seq.push('nested-outer'); setTimeout(function () { seq.push('nested-inner'); }, 0); }, 30);
+new Promise(function (resolve) { seq.push('executor'); resolve(); }).then(function () { seq.push('then'); });
+Promise.reject(new Error('handled')).catch(function (e) { seq.push('caught:' + e.message); });
+Promise.all([1, Promise.resolve(2)]).then(function (v) { seq.push('all:' + v.join('+')); });
+seq.push('script-end');
+setTimeout(done, 100);
+</script>
+
+</body></html>

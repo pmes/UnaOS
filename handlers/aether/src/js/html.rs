@@ -1150,8 +1150,7 @@ fn select_selected_index_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 fn select_options(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
-    let ids = options_of(el);
-    Ok(dom::static_node_list(vm, ids))
+    Ok(dom::cached(vm, el, 35, |vm| dom::make_collection(vm, dom::CK_DOCFILTER, el, "options", "")))
 }
 
 fn select_length(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -1447,6 +1446,156 @@ fn script_async_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Undefined)
 }
 
+// ---- tables (HTML §4.9)
+
+fn table_coll(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let which = callee_str(vm, ctx);
+    let so = match which.as_str() {
+        "rows" => 30,
+        "tbodies" => 31,
+        "srows" => 32,
+        "cells" => 33,
+        _ => 34,
+    };
+    Ok(dom::cached(vm, el, so, |vm| dom::make_collection(vm, dom::CK_DOCFILTER, el, &which, "")))
+}
+
+fn first_child_tag(el: usize, tag: &str) -> Option<usize> {
+    with_doc(|d| d.children(NodeId(el)).find(|c| d.element(*c).is_some_and(|e| e.is_html(tag))).map(|c| c.0))
+}
+
+fn table_part(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let which = callee_str(vm, ctx);
+    let hit = first_child_tag(el, &which);
+    Ok(dom::wrap_opt(vm, hit))
+}
+
+fn index_in(parent_list: Vec<usize>, el: usize) -> f64 {
+    parent_list.iter().position(|x| *x == el).map(|i| i as f64).unwrap_or(-1.0)
+}
+
+fn row_index(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let which = callee_str(vm, ctx);
+    let parent = dom::parent_of(el);
+    let Some(parent) = parent else { return Ok(num(-1.0)) };
+    if which == "section" {
+        let rows: Vec<usize> = with_doc(|d| d.children(NodeId(parent)).filter(|c| d.element(*c).is_some_and(|e| e.is_html("tr"))).map(|c| c.0).collect());
+        return Ok(num(index_in(rows, el)));
+    }
+    // rowIndex: the index in the nearest table's rows collection.
+    let table = with_doc(|d| {
+        let mut cur = Some(NodeId(parent));
+        while let Some(c) = cur {
+            if d.element(c).is_some_and(|e| e.is_html("table")) {
+                return Some(c.0);
+            }
+            cur = d.parent(c);
+        }
+        None
+    });
+    let Some(t) = table else { return Ok(num(-1.0)) };
+    let coll = dom::make_collection(vm, dom::CK_DOCFILTER, t, "rows", "");
+    let len = vm.get(coll, &PropertyKey::from_str("length"))?;
+    let n = vm.to_number(&len)? as usize;
+    for i in 0..n {
+        let v = vm.get(coll, &PropertyKey::Index(i as u32))?;
+        if dom::node_of(vm, &v) == Some(el) {
+            return Ok(num(i as f64));
+        }
+    }
+    Ok(num(-1.0))
+}
+
+fn cell_index(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let Some(parent) = dom::parent_of(el) else { return Ok(num(-1.0)) };
+    let cells: Vec<usize> = with_doc(|d| d.children(NodeId(parent)).filter(|c| d.element(*c).is_some_and(|e| e.is_html("td") || e.is_html("th"))).map(|c| c.0).collect());
+    Ok(num(index_in(cells, el)))
+}
+
+fn insert_child_tag(vm: &mut Vm, parent: usize, tag: &str, kids: Vec<usize>, index: i32) -> JsResult<Value> {
+    if index < -1 || index > kids.len() as i32 {
+        return throw_dom(vm, "IndexSizeError", &format!("The index provided ({index}) is outside the range [-1, {}].", kids.len()));
+    }
+    let new = dom::create_element(dom::node_document(parent), Namespace::Html, tag);
+    let reference = if index == -1 || index as usize == kids.len() { None } else { Some(kids[index as usize]) };
+    let p = match reference {
+        Some(r) => dom::parent_of(r).unwrap_or(parent),
+        None => parent,
+    };
+    dom::insert(vm, new, p, reference);
+    Ok(wrap(vm, new))
+}
+
+fn insert_row(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let i = arg(vm, ctx, 0);
+    let index = if i.is_undefined() { -1 } else { vm.to_int32(&i)? };
+    let is_table = with_doc(|d| dom::is_html_tag(d, el, "table"));
+    if is_table {
+        let coll = dom::make_collection(vm, dom::CK_DOCFILTER, el, "rows", "");
+        let lv = vm.get(coll, &PropertyKey::from_str("length"))?;
+        let len = vm.to_number(&lv)? as usize;
+        let mut rows = Vec::new();
+        for k in 0..len {
+            let v = vm.get(coll, &PropertyKey::Index(k as u32))?;
+            if let Some(n) = dom::node_of(vm, &v) {
+                rows.push(n);
+            }
+        }
+        if rows.is_empty() && (index == -1 || index == 0) {
+            // A new row goes into the last tbody, or a new tbody.
+            let tbody = with_doc(|d| d.children(NodeId(el)).filter(|c| d.element(*c).is_some_and(|e| e.is_html("tbody"))).last().map(|c| c.0));
+            let tb = match tbody {
+                Some(t) => t,
+                None => {
+                    let t = dom::create_element(dom::node_document(el), Namespace::Html, "tbody");
+                    dom::insert(vm, t, el, None);
+                    t
+                }
+            };
+            return insert_child_tag(vm, tb, "tr", Vec::new(), -1);
+        }
+        return insert_child_tag(vm, el, "tr", rows, index);
+    }
+    let rows: Vec<usize> = with_doc(|d| d.children(NodeId(el)).filter(|c| d.element(*c).is_some_and(|e| e.is_html("tr"))).map(|c| c.0).collect());
+    insert_child_tag(vm, el, "tr", rows, index)
+}
+
+fn insert_cell(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let i = arg(vm, ctx, 0);
+    let index = if i.is_undefined() { -1 } else { vm.to_int32(&i)? };
+    let cells: Vec<usize> = with_doc(|d| d.children(NodeId(el)).filter(|c| d.element(*c).is_some_and(|e| e.is_html("td") || e.is_html("th"))).map(|c| c.0).collect());
+    insert_child_tag(vm, el, "td", cells, index)
+}
+
+fn delete_child_at(vm: &mut Vm, ctx: &CallCtx, tags: &[&str]) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let index = vm.to_int32(&arg(vm, ctx, 0))?;
+    let kids: Vec<usize> = with_doc(|d| d.children(NodeId(el)).filter(|c| d.element(*c).is_some_and(|e| tags.iter().any(|t| e.is_html(t)))).map(|c| c.0).collect());
+    let i = if index == -1 { kids.len() as i32 - 1 } else { index };
+    if i < 0 || i as usize >= kids.len() {
+        if index == -1 {
+            return Ok(Value::Undefined);
+        }
+        return throw_dom(vm, "IndexSizeError", &format!("The index provided ({index}) is outside the range."));
+    }
+    dom::remove(vm, kids[i as usize]);
+    Ok(Value::Undefined)
+}
+
+fn delete_row(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    delete_child_at(vm, ctx, &["tr"])
+}
+
+fn delete_cell(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    delete_child_at(vm, ctx, &["td", "th"])
+}
+
 fn template_content(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
     let t = with_doc(|d| d.element(NodeId(el)).and_then(|e| e.template_contents).map(|t| t.0));
@@ -1594,6 +1743,13 @@ fn media_play(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
     let pc = vm.intr().promise_ctor;
     let (p, resolve, reject) = js_core::builtins::promise::new_capability(vm, &Value::Object(pc))?;
+    // No src and no <source>: the resource selection algorithm waits (networkState NETWORK_EMPTY), and
+    // the play promise stays pending until a source appears (HTML §4.8.11.5).
+    let has_source = attr_value(el, "src").is_some()
+        || with_doc(|d| d.children(NodeId(el)).any(|c| d.element(c).is_some_and(|e| e.is_html("source"))));
+    if !has_source {
+        return Ok(Value::Object(p));
+    }
     match media_entry(el) {
         Some(e) if !matches!(e.state, crate::media::State::Error(_)) => {
             let was_paused = !matches!(e.state, crate::media::State::Playing);
@@ -1830,6 +1986,25 @@ pub fn install(vm: &mut Vm) {
     attr(vm, scr, "text", script_text_get, Some(script_text_set));
     attr(vm, scr, "async", script_async_get, Some(script_async_set));
     attr(vm, iface("HTMLTemplateElement").unwrap().proto, "content", template_content, None);
+    let tbl = iface("HTMLTableElement").unwrap().proto;
+    attr_with(vm, tbl, "rows", table_coll, None, s("rows"));
+    attr_with(vm, tbl, "tBodies", table_coll, None, s("tbodies"));
+    attr_with(vm, tbl, "caption", table_part, None, s("caption"));
+    attr_with(vm, tbl, "tHead", table_part, None, s("thead"));
+    attr_with(vm, tbl, "tFoot", table_part, None, s("tfoot"));
+    op(vm, tbl, "insertRow", 0, insert_row);
+    op(vm, tbl, "deleteRow", 1, delete_row);
+    let sec = iface("HTMLTableSectionElement").unwrap().proto;
+    attr_with(vm, sec, "rows", table_coll, None, s("srows"));
+    op(vm, sec, "insertRow", 0, insert_row);
+    op(vm, sec, "deleteRow", 1, delete_row);
+    let tr = iface("HTMLTableRowElement").unwrap().proto;
+    attr_with(vm, tr, "cells", table_coll, None, s("cells"));
+    attr_with(vm, tr, "rowIndex", row_index, None, s("table"));
+    attr_with(vm, tr, "sectionRowIndex", row_index, None, s("section"));
+    op(vm, tr, "insertCell", 0, insert_cell);
+    op(vm, tr, "deleteCell", 1, delete_cell);
+    attr(vm, iface("HTMLTableCellElement").unwrap().proto, "cellIndex", cell_index, None);
     let img = iface("HTMLImageElement").unwrap().proto;
     attr(vm, img, "complete", img_complete, None);
     attr(vm, img, "currentSrc", img_current_src, None);

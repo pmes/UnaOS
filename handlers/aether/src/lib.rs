@@ -408,7 +408,11 @@ impl AetherEngine {
         let mut form = forms::Form::new(resolved, method);
         if let Ok(inputs) = form_node.select("input, textarea, select") {
             for input in inputs {
-                let dirty = js::control_value(input.as_node());
+                let dirty = js::control_value(input.as_node()).or_else(|| {
+                    (&*input.name.local == "select")
+                        .then(|| layout::select_selected_option(input.as_node()).map(|(v, _)| v))
+                        .flatten()
+                });
                 let attrs = input.attributes.borrow();
                 let Some(name) = attrs.get("name") else { continue };
                 let value = dirty.unwrap_or_else(|| attrs.get("value").unwrap_or("").to_string());

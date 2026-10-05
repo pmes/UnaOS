@@ -2078,6 +2078,104 @@ pub fn mark_script_started_if_script(id: usize) {
     }
 }
 
+/// DOM Parsing §3.2 "XML serialization" (the XMLSerializer path): namespace declarations where an
+/// element's namespace differs from its context's, `/>` for empty non-HTML elements and ` />` for HTML
+/// void elements, `&amp; &lt; &gt;` (and `&quot;` in attributes) escaping.
+pub fn xml_serialize(id: usize) -> String {
+    fn esc(s: &str, attr: bool) -> String {
+        let mut o = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '&' => o.push_str("&amp;"),
+                '<' => o.push_str("&lt;"),
+                '>' => o.push_str("&gt;"),
+                '"' if attr => o.push_str("&quot;"),
+                c => o.push(c),
+            }
+        }
+        o
+    }
+    fn walk(d: &Document, id: usize, ctx_ns: Option<&str>, out: &mut String) {
+        match d.data(NodeId(id)) {
+            NodeData::Document | NodeData::DocumentFragment => {
+                for c in d.children(NodeId(id)) {
+                    walk(d, c.0, ctx_ns, out);
+                }
+            }
+            NodeData::Doctype { name, public_id, system_id } => {
+                out.push_str("<!DOCTYPE ");
+                out.push_str(name);
+                if !public_id.is_empty() {
+                    out.push_str(&format!(" PUBLIC \"{public_id}\""));
+                }
+                if !system_id.is_empty() {
+                    if public_id.is_empty() {
+                        out.push_str(" SYSTEM");
+                    }
+                    out.push_str(&format!(" \"{system_id}\""));
+                }
+                out.push('>');
+            }
+            NodeData::Text(t) => out.push_str(&esc(t, false)),
+            NodeData::Comment(t) => out.push_str(&format!("<!--{t}-->")),
+            NodeData::ProcessingInstruction { target, data } => out.push_str(&format!("<?{target} {data}?>")),
+            NodeData::Element(e) => {
+                let (ns, prefix) = element_ns(d, id);
+                let q = match &prefix {
+                    Some(p) => format!("{p}:{}", e.local),
+                    None => e.local.clone(),
+                };
+                out.push('<');
+                out.push_str(&q);
+                let ns_opt = if ns.is_empty() { None } else { Some(ns.as_str()) };
+                if ns_opt != ctx_ns && prefix.is_none() && !e.attrs.iter().any(|a| a.ns == Namespace::Xmlns && a.local == "xmlns") {
+                    out.push_str(&format!(" xmlns=\"{}\"", esc(ns_opt.unwrap_or(""), true)));
+                }
+                for a in &e.attrs {
+                    out.push(' ');
+                    out.push_str(&attr_qname(a));
+                    out.push_str("=\"");
+                    out.push_str(&esc(&a.value, true));
+                    out.push('"');
+                }
+                let kids: Vec<NodeId> = match e.template_contents {
+                    Some(t) => d.children(t).collect(),
+                    None => d.children(NodeId(id)).collect(),
+                };
+                let html = ns == Namespace::Html.url();
+                if kids.is_empty() {
+                    if html && html_core::serialize::serializes_as_void(&e.local) {
+                        out.push_str(" />");
+                        return;
+                    }
+                    if !html {
+                        out.push_str("/>");
+                        return;
+                    }
+                }
+                out.push('>');
+                for k in kids {
+                    walk(d, k.0, ns_opt, out);
+                }
+                out.push_str(&format!("</{q}>"));
+            }
+        }
+    }
+    with_doc(|d| {
+        let mut out = String::new();
+        walk(d, id, None, &mut out);
+        out
+    })
+}
+
+fn xml_serialize_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let v = arg(vm, ctx, 0);
+    match node_of(vm, &v) {
+        Some(n) => Ok(s(&xml_serialize(n))),
+        None => vm.throw_type("Failed to execute 'serializeToString' on 'XMLSerializer': parameter 1 is not of type 'Node'."),
+    }
+}
+
 pub fn serialize_inner(id: usize) -> String {
     with_doc(|d| html_core::serialize::inner_html(d, NodeId(id), html_core::serialize::SerializeOpts { scripting: true }))
 }
@@ -2923,6 +3021,47 @@ fn coll_items(vm: &Vm, t: Obj) -> Vec<usize> {
             .filter(|&i| d.element(i).is_some_and(|e| e.ns == Namespace::Html && e.attr("name") == Some(a.as_str())))
             .map(|i| i.0)
             .collect(),
+        CK_DOCFILTER if a == "rows" => {
+            // HTMLTableElement.rows (HTML §4.9.1): thead rows, then tbody/direct rows in tree order, then
+            // tfoot rows.
+            let html_child = |p: NodeId, tag: &str| -> Vec<NodeId> {
+                d.children(p).filter(|c| d.element(*c).is_some_and(|e| e.is_html(tag))).collect()
+            };
+            let mut out = Vec::new();
+            for h in html_child(NodeId(root), "thead") {
+                out.extend(html_child(h, "tr").into_iter().map(|x| x.0));
+            }
+            for c in d.children(NodeId(root)) {
+                if d.element(c).is_some_and(|e| e.is_html("tbody")) {
+                    out.extend(html_child(c, "tr").into_iter().map(|x| x.0));
+                } else if d.element(c).is_some_and(|e| e.is_html("tr")) {
+                    out.push(c.0);
+                }
+            }
+            for f in html_child(NodeId(root), "tfoot") {
+                out.extend(html_child(f, "tr").into_iter().map(|x| x.0));
+            }
+            out
+        }
+        CK_DOCFILTER if matches!(a.as_str(), "srows" | "cells" | "tbodies") => d
+            .children(NodeId(root))
+            .filter(|c| {
+                d.element(*c).is_some_and(|e| {
+                    e.ns == Namespace::Html
+                        && match a.as_str() {
+                            "srows" => e.local == "tr",
+                            "cells" => e.local == "td" || e.local == "th",
+                            _ => e.local == "tbody",
+                        }
+                })
+            })
+            .map(|c| c.0)
+            .collect(),
+        CK_DOCFILTER if a == "options" => d
+            .descendants(NodeId(root))
+            .filter(|i| d.element(*i).is_some_and(|e| e.is_html("option")))
+            .map(|i| i.0)
+            .collect(),
         CK_DOCFILTER => d
             .descendants(NodeId(root))
             .filter(|&i| {
@@ -3703,6 +3842,10 @@ pub fn install(vm: &mut Vm) {
     let ts = vm.make_native("toString", 0, tokens_value_get, false);
     vm.heap.get_mut(tp).props.insert(PropertyKey::from_str("toString"), Prop::data(Value::Object(ts), WEC));
     iterable_methods(vm, tp);
+
+    let g = vm.realm().global;
+    let xs = vm.make_native("__xml_serialize", 1, xml_serialize_native, false);
+    vm.heap.get_mut(g).props.insert(PropertyKey::from_str("__xml_serialize"), Prop::data(Value::Object(xs), WC));
 
     // ---- DOMImplementation
     let dimpl = interface(vm, "DOMImplementation", None, None);
