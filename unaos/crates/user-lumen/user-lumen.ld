@@ -1,79 +1,51 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright (C) 2026 The Architect & Una
 
-   LUMENBIN link script for the static ELF64 EL0 chat window (crates/user-lumen). Same shape as the
-   ELFHELLO link (user-elf.ld): the link product is kept AS AN ELF and handed to the kernel's aarch64 ELF
-   loader. We declare TWO PT_LOAD program headers via PHDRS so the loader has distinct segments to map
-   with distinct permissions:
+   RING3ABI2 M5 (rmbp-ledger B333) link script for the aarch64 LUMEN.ELF — the user-big shape on the
+   aarch64 ELF window: linked at the ABSOLUTE EL0 VA 0x7840200000 = una_abi::USER_XWIN_VA_ARM (the slot's
+   extension GiB, L1 entry 481, + USER_XWIN_OFF 2 MiB). The aarch64 loader reads "lowest PT_LOAD >=
+   USER_XWIN_VA_ARM" as the elf model (arch/aarch64/xwin.rs): every segment mapped at its p_vaddr from heap
+   frames, BSS zeroed, the stack at the window top sized by PT_GNU_STACK from `-z stack-size=`, SYS_SBRK
+   from the page after the last segment. Was the LUMENBIN two-PHDR script linked at VA 0 in the 16 KiB
+   classic window, whose `data+bss <= 0x3800` assert the vein_core/vein_ring3 build no longer met.
 
-     text  PT_LOAD FLAGS(5)  =  PF_R | PF_X  -> mapped to an EL0-RX / EL1-RO code page
-     data  PT_LOAD FLAGS(6)  =  PF_R | PF_W  -> mapped to an EL0+EL1-RW, never-executable data page
+   The FB landmarks (info page +0x4000, surface +0x5000) hang off the CLASSIC window base, which an
+   elf-model program cannot derive from `_start`: main.rs reads it from the args page
+   (`una_abi::args().window_base()`), so the old `_start == 0` assert has nothing left to guard.
 
-   Link at VA 0: the loader computes a load bias = (slot user-window base) - (min PT_LOAD p_vaddr), so
-   p_vaddr are treated as offsets from the window base. .data is forced onto its own 4 KiB page so the
-   two segments never share a page (per-page leaf permissions are the granularity the kernel enforces).
-   The program is position-independent (byte-granular `adr`), so the link VA is immaterial to
-   correctness — the bias shifts both segments uniformly and preserves their relative distance. */
+   NO PHDRS clause (with one, lld leaves PT_GNU_STACK's p_memsz 0 — measured by RING3WIN). lld lays out
+   R / R+X / R+W PT_LOADs on separate pages itself, and emits a PT_NOTE for `.note.unaos.app` (EXECNAME's
+   app note, flags bit0 = windowed), which is therefore KEPT, not discarded. */
 
 ENTRY(_start)
 
-PHDRS
-{
-    text PT_LOAD FLAGS(5);   /* R + X */
-    data PT_LOAD FLAGS(6);   /* R + W */
-    note PT_NOTE FLAGS(4);   /* R — EXECNAME: the .note.unaos.app launch declaration */
-}
-
 SECTIONS
 {
-    . = 0x0;
-
-    /* Segment 1 (R+X): the entry routine. `_start` is forced first so e_entry points at its first
-       instruction (the loader enters at bias + e_entry). */
+    . = 0x7840200000;
     .text : {
         KEEP(*(.text.entry))
         *(.text .text.*)
-        *(.rodata .rodata.*)
-    } :text
+    }
+    ASSERT(_start == 0x7840200000, "user-lumen (aarch64): _start must open the ELF window (the kernel's model test reads the lowest PT_LOAD)")
 
-    /* EXECNAME (B322, R82): the program's launch declaration (una_abi::AppNote), KEPT here — ahead of the
-       /DISCARD/ *(.note*) line below, and the first matching rule wins — inside the text segment and under
-       its own PT_NOTE header, so the shell finds it by program header after --strip-all. */
-    .note.unaos.app : { KEEP(*(.note.unaos.app)) } :text :note
+    /* EXECNAME (B322, R82): the launch declaration (una_abi::AppNote), KEPT ahead of the DISCARD rule below
+       (the first matching rule wins); lld gives an allocated SHT_NOTE output section its own PT_NOTE. */
+    .note.unaos.app : { KEEP(*(.note.unaos.app)) }
 
-    /* LDPIN (WINX-8 class, commit 442f1cfa; provenance: the sibling linker-script audit,
-       ~/.claude/plans/unaos/review/pi4-sibling-ld-audit.md): the sibling user-pulse main.rs derives the window base as
-       `_start`'s own address, and every fixed landmark (info page +0x4000, surface +0x5000) hangs
-       off that base — correct only while e_entry stays 0. WINX-8 proved that a layout change which
-       moves e_entry (user-vug-x86's FILEHDR PHDRS moved it to 0xb0) skews every landmark silently.
-       This ASSERT allocates nothing and turns that silent skew into a link failure. */
-    ASSERT(_start == 0, "user-lumen: e_entry moved off 0 -- the main.rs base derivation assumes _start IS the window base (WINX-8 class)")
-
-    /* Force the data segment onto its own page so text/data never share a leaf. */
     . = ALIGN(0x1000);
-
-    /* Segment 2 (R+W): the sampler state + any .bss. A non-empty .bss (p_memsz > p_filesz) exercises
-       the loader's zero-the-tail path. */
+    .rodata : {
+        *(.rodata .rodata.*)
+    }
+    . = ALIGN(0x1000);
     .data : {
-        /* LUMENBIN: the witness block FIRST, so it sits at the RW segment's p_vaddr — the kernel's
-           `tests lumen` fixture reads it there (crates/kernel/src/lumen.rs), finding p_vaddr from the
-           same ELF bytes it loaded. */
-        KEEP(*(.data.lumenwit))
         *(.data .data.*)
-    } :data
+    }
     .bss : {
         *(.bss .bss.*)
-    } :data
-    /* LUMENBIN: the whole program window is 16 KiB (code + data + bss + the main stack, which grows
-       down from +0x4000). The bus receive buffer alone is BUS_FRAME_MAX = 4148 bytes, so the stack's
-       headroom is asserted at link time rather than discovered as a ring-3 fault on metal. */
-    ASSERT(. <= 0x3800, "user-lumen: data+bss end past 0x3800 -- under 2 KiB left for the main stack in the 16 KiB window")
+        *(COMMON)
+    }
 
-    /* Drop metadata/unwind/dynamic/PLT/GOT — a static, loader-less program needs none, and a stray
-       GOT/PLT would imply an unsatisfiable relocation. */
     /DISCARD/ : {
-        *(.comment) *(.note*) *(.eh_frame*) *(.eh_frame_hdr)
-        *(.interp) *(.dynamic) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash)
-        *(.got) *(.got.plt) *(.plt) *(.igot*) *(.iplt*)
+        *(.eh_frame*) *(.comment) *(.note.gnu*) *(.note.GNU*) *(.dynamic) *(.dynsym) *(.dynstr) *(.gnu.hash) *(.hash) *(.rela*) *(.got*) *(.plt*)
     }
 }

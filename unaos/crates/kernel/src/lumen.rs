@@ -44,14 +44,15 @@ fn session() -> (&'static str, KeyState) {
         }
     };
     let prov = lit("provider");
-    let tls = lit("tls");
+    // VEINTLS (SR36): the program's `TlsSetup::verify` over the kernel's view — a trust store on the volume and a set clock (the provider is linked or the image does not build).
+    let verify = if crate::fs::attrsys::do_stat(b"/system/trust/roots.pem", crate::fs::vfs::KERNEL_PRINCIPAL, &mut alloc::vec::Vec::new()) != 0 { rules::Verify::NoTrustStore } else if crate::clock::unix_now().map_or(true, |t| (t as i64) < 1_790_985_600) { rules::Verify::NoClock } else { rules::Verify::Ready };
     let ep_s = s("endpoint");
     let ep = match ep_s.as_deref() {
         None | Some("") => Some(rules::DEFAULT_ENDPOINT),
         Some(u) => rules::parse_endpoint(u),
     };
-    // The program cannot verify certificates yet (vein_ring3::VERIFIES_CERTS = false); same input here.
-    let plan = rules::plan(rules::provider_pref(prov.as_deref().map(str::as_bytes)), ep.as_ref(), key, rules::tls_policy(tls.as_deref().map(str::as_bytes)), false);
+    // Same rule, same inputs as the program (vein_ring3::TlsSetup::verify; floor = vein_ring3::tls::CLOCK_FLOOR).
+    let plan = rules::plan(rules::provider_pref(prov.as_deref().map(str::as_bytes)), ep.as_ref(), key, verify);
     (if matches!(plan, Plan::Claude { .. }) { "claude" } else { "echo" }, key)
 }
 

@@ -13,7 +13,8 @@
 //! * [`http`] — HTTP/1.1 request head, response head parser, chunked transfer decoder.
 //! * [`client`] — the [`client::Transport`] trait and [`client::exchange`]: one request → streamed deltas.
 //! * [`prefs`] — the resolution rules: Principia values (`vein.provider`, `vein.model`, `vein.endpoint`,
-//!   `vein.tls`, `vein.key_file`) + the key's state → which provider runs and whether the key may be sent.
+//!   `vein.key_file`) + the key's state + whether the server can be verified → which provider runs and
+//!   whether the key may be sent (only over a verified TLS connection, VEINTLS SR36).
 //! * [`provider`] — the offline `Echo` provider (no key, no network: the window still answers).
 //! * [`json`] — the minimal no-alloc JSON string escape/scan the above share.
 //! * [`model`] / [`context`] (feature `alloc`) — the conversation model and the pure context assembler.

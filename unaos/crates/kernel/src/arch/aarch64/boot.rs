@@ -914,6 +914,7 @@ pub unsafe fn teardown_user_slot(asid: u64) {
     // never draws — having never been hidden at all. Both bits are per-ASID and ASIDs are recycled, so
     // both are cleared here, before the slot is released for reuse below.
     super::syscall::clear_hidden(asid);
+    unsafe { super::xwin::slot_free((asid - 1) as usize) }; // RING3ABI2 M5 (B333): the ELF window's frames go back to the heap and the extension GiB is uninstalled — after the ASID flush, before the slot is claimable
     SLOT_USED[(asid - 1) as usize].store(false, Ordering::Release);
 }
 

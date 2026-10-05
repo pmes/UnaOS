@@ -528,5 +528,19 @@ pub fn fat_stamp() -> (u16, u16) {
 /// SRCEXTRACT: milliseconds since boot from the free-running counter (`None` where the arch has no
 /// calibrated counter). The ms twin of [`uptime_secs`], for a verb that reports its own elapsed time.
 pub fn uptime_ms() -> Option<u64> {
-    monotonic().map(|(ticks, freq)| ticks.saturating_mul(1000) / freq.max(1))
+    monotonic().map(|(ticks, freq)| { let f = freq.max(1); (ticks / f) * 1000 + (ticks % f) * 1000 / f }) // ARMNET: split so it never saturates (`ticks*1000` overflowed after ~4 days at 54 MHz)
+}
+
+/// ARMNET (B346) / NETCLOCK (B335): THE network-stack clock, the one millisecond source every smoltcp interface
+/// on either arch is polled at. [`uptime_ms`] (aarch64: the generic timer CNTPCT/CNTFRQ; x86: the calibrated
+/// invariant TSC); before calibration the raw cycle counter over the `hw_wait_budget` rate (a 2 s budget).
+/// Clamped so it never steps back. Never per poll: smoltcp's ARP, DHCP and TCP timers run in real seconds.
+static STACK_MS_LAST: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+pub fn stack_ms() -> i64 {
+    let raw = match uptime_ms() {
+        Some(m) => m as i64,
+        None => (crate::arch::now_cycles() / (crate::arch::hw_wait_budget() / 2000).max(1)) as i64,
+    };
+    let prev = STACK_MS_LAST.fetch_max(raw, core::sync::atomic::Ordering::Relaxed);
+    raw.max(prev)
 }

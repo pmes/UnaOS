@@ -37,7 +37,7 @@ pub const RTWIT: u32 = 1 << 10;
 pub const PTRINSTALL: u32 = 1 << 11;
 pub const SERTX: u32 = 1 << 12;
 pub const USBNET: u32 = 1 << 13;
-pub const SDHCWR: u32 = 1 << 14;
+pub const SDHCWR: u32 = 1 << 14; pub const NET6: u32 = 1 << 15; // ARMNET (B346): the aarch64 NIC rollup (same-line fold)
 
 /// `(name, bit, what it samples)` — the verb's table and `census list`'s rows.
 pub const NAMES: &[(&str, u32, &str)] = &[
@@ -55,10 +55,10 @@ pub const NAMES: &[(&str, u32, &str)] = &[
     ("ptrinstall", PTRINSTALL, "pointer-install ledger"),
     ("sertx", SERTX, "`[sertx]` serial transmit cost"),
     ("usbnet", USBNET, "USB NIC rx/tx counters"),
-    ("sdhcwr", SDHCWR, "`:: SDHCWR:` SD write-burst census"),
+    ("sdhcwr", SDHCWR, "`:: SDHCWR:` SD write-burst census"), ("net6", NET6, "aarch64 NIC polls/tx/rx rollup"), // ARMNET (B346): same-line fold
 ];
 
-const ALL: u32 = (1 << 15) - 1;
+const ALL: u32 = (1 << 16) - 1;
 
 static ON: AtomicU32 = AtomicU32::new(if cfg!(feature = "census") { ALL } else { 0 });
 

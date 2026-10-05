@@ -1412,6 +1412,11 @@ fn reach_d11(bus: u8, dev: u8, func: u8, bar0: u64, d: &D11, pre_win2: u32, w: &
         }
     }
 
+    // WIFI1 (B338): the d11 core is reached, its identity cross-checked and its enable rule
+    // satisfied — record it so the `wifi` verb and `tests wifi` can report `d11=up` without
+    // re-touching the device (status.rs is READ by the shell, WRITTEN once here).
+    super::status::set_d11_up(true);
+
     // ── R7: the upload. ─────────────────────────────────────────────────────────────────────────
     upload_gate(bar0, macctl, w);
     // ── R9: WIFI-4 / S5(a)+(b). Placed HERE and not inside `upload_gate` on purpose: every one of
@@ -1636,6 +1641,67 @@ fn fnv1a_word(fnv: u32, word: u32) -> u32 {
         h = (h ^ b as u32).wrapping_mul(FNV_PRIME);
     }
     h
+}
+
+/// Write a u16 into the mapped BAR0 window — the 16-bit initvals writes (WIFI1). Same covenant as
+/// [`w32`]: the caller has mapped the window and established cfg:0x80 is on the d11 core.
+///
+/// # Safety
+/// As [`w32`].
+#[cfg(feature = "wifi3")]
+unsafe fn w16_u(base: u64, off: u64, val: u16) {
+    core::ptr::write_volatile((base + off) as *mut u16, val);
+}
+
+/// WIFI1 — apply the initvals + band-switch initvals as per-register MMIO writes into the d11 core
+/// window, AFTER the microcode reports Ready (`bcm4331.md` §S4-W5 fact 6, `[SPEC-V3 InitialValues]`,
+/// ordered at ChipInit step 8). The record FRAMING is the tree's W3-pinned, host-tested
+/// `wifi_core::fw::records`; the window is still on the d11 base from [`reach_d11`]. Every write is
+/// read back; the return is `(wrote, mismatch)`. A set that does not re-parse as records is a refusal,
+/// not a blind push.
+///
+/// This is a real device-write rung and lives ONLY on the already-destructive `wifi3` path (the
+/// resident image is gone by here); it is counted in [`Writes::core_regs`] at its write sites.
+#[cfg(feature = "wifi3")]
+fn apply_initvals(bar0: u64, w: &mut Writes) -> (u32, u32) {
+    let mut wrote = 0u32;
+    let mut mismatch = 0u32;
+    for role in ["initvals", "bsinitvals"] {
+        let parsed = super::firmware::with_staged(role, |data| wifi_core::fw::records(data));
+        match parsed {
+            Some(Ok(recs)) => {
+                for r in &recs {
+                    let off = r.offset as u64;
+                    if r.wide {
+                        unsafe { w32(bar0, off, r.value) };
+                        w.core_regs += 1;
+                        let back = unsafe { r32(bar0, off) };
+                        if back != r.value { mismatch += 1; }
+                    } else {
+                        unsafe { w16_u(bar0, off, r.value as u16) };
+                        w.core_regs += 1;
+                        let back = unsafe { r16(bar0, off) };
+                        if back != r.value as u16 { mismatch += 1; }
+                    }
+                    wrote += 1;
+                }
+                serial_println!(
+                    ":: wifi2: initvals {} applied records={} mismatch={} — per-register MMIO into the d11 window ([SPEC-V3 InitialValues], fact 6; framing by wifi_core::fw host-tested) ::",
+                    role, recs.len(), mismatch
+                );
+            }
+            Some(Err(e)) => serial_println!(
+                ":: wifi2: initvals {} REFUSED reason={} — the staged record-stream does not re-parse; no register is written from it ::",
+                role, e.token()
+            ),
+            None => serial_println!(
+                ":: wifi2: initvals {} ABSENT from the staged set — not applied ::",
+                role
+            ),
+        }
+    }
+    super::status::set_initvals(wrote);
+    (wrote, mismatch)
 }
 
 /// What the pre-pass learned about the staged ucode stream, BEFORE any device write.
@@ -2032,7 +2098,17 @@ fn upload_ucode(bar0: u64, macctl: u32, w: &mut Writes) {
         None
     };
     match fail {
-        None => upload_verdict(wrote_words, wrote_fnv, psm_run as u8, rev, "UPLOADED", ""),
+        None => {
+            // WIFI1: the microcode is up — record it (date word id[2]) for the `wifi` verb, then
+            // apply the initvals (fact 6, after Ready).
+            super::status::set_ucode(true, rev, id[2]);
+            let (iw, imm) = apply_initvals(bar0, w);
+            serial_println!(
+                ":: wifi2: initvals total wrote={} mismatch={} — bring-up complete past the ucode handshake ::",
+                iw, imm
+            );
+            upload_verdict(wrote_words, wrote_fnv, psm_run as u8, rev, "UPLOADED", "");
+        }
         Some(why) => {
             serial_println!(
                 ":: wifi2: upload FAILED reason={} — the §S4 predicate did not hold. No unwind exists past the prologue (the resident image is gone, stated at BEGIN); the only way out is forward or a reboot, and bringup_once's R8 window-restore still runs unconditionally ::",

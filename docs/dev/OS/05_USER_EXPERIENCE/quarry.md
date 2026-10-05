@@ -1387,3 +1387,17 @@ allocation are all sized off that read, so a wrong answer there is a wrong windo
 **Leg 12 and QSCROLL are untouched** — no click-grammar or wheel-semantics change is in this arc. The
 `:: QUARRY: … +wheel … :: PASS ::` line is byte-identical, and printed on all seven armed runs.
 `scheduler.md` §POSFIX carries the full gate table, including the `pal::cursor::POS` half.
+
+## 15. QUARRY2 — columns, sort, and the owed types (2026-10-04, B336)
+
+The list view is NAME · SIZE · MODIFIED · TYPE, plus ORIGIN inside the session user's Trash
+(`video/quarry/columns.rs`). TYPE is the type's short name from `fs::filetype` + `fs::assoc` (the
+`una:type` attribute on UnaFS, else the extension table, else a bounded sniff); ORIGIN is
+`fs::trash::entries()` (TRASHTIME's attribute or the FAT index). A header press sorts by NAME, SIZE,
+MODIFIED or TYPE (again = reverse) with a `^`/`v` chevron; folders stay first; the sort is stable.
+`s` cycles the sort, `[`/`]` narrow/widen the sorted column (TYPE when sorting by name). Widths and
+the sort are Principia preferences in namespace `quarry` (`col.size` `col.modified` `col.type`
+`col.origin` `sort.key` `sort.desc`), written on the service pass. `text/markdown` and
+`application/json` open in the viewer rendered (`video/richtext.rs`); `image/gif` opens in Facet,
+whose frame stepping waits on the PIXELCORE adapter (`video/facet_anim.rs`). Witness `tests quarry2`;
+design `docs/dev/evidence/rmbp-1005/QUARRY2.md`.

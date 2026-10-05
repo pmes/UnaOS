@@ -1,0 +1,52 @@
+[package]
+name = "tls_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "UnaOS's own TLS 1.3 client (RFC 8446) and X.509 path validation (RFC 5280) — no_std + alloc, crypto behind a trait."
+
+# TLSCORE (LEDGER SR28). `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`. The protocol — record layer, key
+# schedule, handshake state machine, DER/X.509 parsing, chain building, hostname matching, PEM trust store — is
+# written here from RFC 8446 / 5280 / 6125 with NO third-party crate under it. Every cryptographic primitive is
+# reached through `trait CryptoProvider` (src/crypto.rs); the product provider is CRYPTOCORE
+# (unaos/libs/sys/crypto_core, SR27), implemented for it at the fold.
+#
+# Feature `test-provider` (TEST OPERAND ONLY): `tls_core::test_provider::RustCryptoProvider`, a CryptoProvider over
+# the latest stable RustCrypto crates (rsa: the 0.10 pre-release, the only line built on the same digest/signature
+# generation as the latest stable sha2/p256 — R83's pre-release clause). It exists so the state machine is proven
+# against the RFC 8448 traces and a live OpenSSL server NOW, before crypto_core lands. It is NEVER linked into a
+# product binary: nothing outside this crate's own tests may enable `test-provider`.
+#
+# Feature `cryptocore` (VEINTLS, SR36): the PRODUCT provider, `tls_core::cryptocore_provider::CryptoCoreProvider`
+# over crypto_core (in-tree, zero third-party crates). The module is CRYPTOCORE's fold file
+# (crypto_core/adapters/tls_core_provider.rs), copied verbatim to src/cryptocore_provider.rs at the VEINTLS fold
+# (exec-sec-crypto ed49c387: P-256/P-384 ECDSA, Ed25519, RSASSA-PSS + PKCS#1 v1.5 verify, AES-GCM, ChaCha20-
+# Poly1305, X25519, ChaCha20 DRBG). `cryptocore-std` adds the host `new()` over /dev/urandom.
+#
+# Non-dev dependencies: none, unless `cryptocore` (then crypto_core, in-tree).
+
+[features]
+default = []
+cryptocore = ["dep:crypto_core"]
+cryptocore-std = ["cryptocore", "crypto_core/std"]
+test-provider = [
+  "dep:sha2", "dep:hmac", "dep:aes-gcm", "dep:chacha20poly1305", "dep:x25519-dalek",
+  "dep:p256", "dep:p384", "dep:ed25519-dalek", "dep:rsa", "dep:getrandom",
+]
+
+[dependencies]
+crypto_core = { path = "../crypto_core", optional = true, default-features = false, features = ["alloc"] }
+sha2 = { version = "0.11.0", optional = true, default-features = false }
+hmac = { version = "0.13.0", optional = true }
+aes-gcm = { version = "0.11.1", optional = true, default-features = false, features = ["aes", "alloc"] }
+chacha20poly1305 = { version = "0.11.0", optional = true, default-features = false, features = ["alloc"] }
+x25519-dalek = { version = "3.0.0", optional = true, default-features = false, features = ["static_secrets"] }
+p256 = { version = "0.14.0", optional = true, default-features = false, features = ["ecdsa", "ecdh", "arithmetic"] }
+p384 = { version = "0.14.0", optional = true, default-features = false, features = ["ecdsa", "arithmetic"] }
+ed25519-dalek = { version = "3.0.0", optional = true, default-features = false }
+rsa = { version = "0.10.0-rc.18", optional = true, default-features = false, features = ["sha2"] }
+getrandom = { version = "0.4.3", optional = true }
+
+[dev-dependencies]
+# Turns the test operand on for this crate's own integration tests (tests/*.rs) and nothing else.
+tls_core = { path = ".", features = ["test-provider"] }

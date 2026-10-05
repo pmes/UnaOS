@@ -18,6 +18,25 @@ use std::process::{Command, Stdio};
 
 mod vm_image;
 
+/// VEINTLS (SR36): copy the pinned trust bundle to `<volume>/system/trust/roots.pem`. `false` = no bundle
+/// (nothing staged, said on the console); a sha256 that is not the pin panics (the build stops).
+fn stage_trust(src: &std::path::Path, volume: &std::path::Path) -> bool {
+    let Ok(pem) = std::fs::read(src) else {
+        println!("   TRUST: system/trust/roots.pem absent — run tools/trust-bundle; LUMEN/NET will refuse TLS (no trust store)");
+        return false;
+    };
+    let pin_file = src.with_file_name("roots.pem.sha256");
+    let pin = std::fs::read_to_string(&pin_file).unwrap_or_default();
+    let pin = pin.split_whitespace().next().unwrap_or("").to_string();
+    let have: String = crypto_core::sha2::sha256(&pem).iter().map(|b| format!("{:02x}", b)).collect();
+    assert!(have == pin, "system/trust/roots.pem sha256 {} != pin {} ({}): re-run tools/trust-bundle", have, pin, pin_file.display());
+    let dir = volume.join("system/trust");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("roots.pem"), &pem).unwrap();
+    println!("   TRUST: staged system/trust/roots.pem into {} ({} B, sha256 {} = pin)", volume.display(), pem.len(), have);
+    true
+}
+
 fn main() {
     let workspace_dir = std::fs::canonicalize("..").unwrap();
     let target_dir = workspace_dir.join("target");
@@ -33,7 +52,11 @@ fn main() {
         .arg("--target").arg("../../x86_64-unaos.json")
         .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z").arg("build-std-features=compiler-builtins-mem")
-        .arg("-Z").arg("json-target-spec");
+        .arg("-Z").arg("json-target-spec")
+        // PROFILE2 (rmbp-ledger B340, M1): frame pointers, so `prof`'s sampler walks real stacks. The SAME
+        // string as arroyo's KERNEL_FP_RUSTFLAGS (RUSTFLAGS replaces the crate config's rustflags, hence the
+        // restated `-C panic=abort`). Set on THIS command only: the bootloader build below is untouched.
+        .env("RUSTFLAGS", "-C panic=abort -C force-frame-pointers=yes");
     // RTCCLOCK: UNAOS_TZ_MIN is an `option_env!` value knob read by clock.rs — no cargo feature, nothing to push here.
     // Optional kernel features from env knobs: UNAOS_SKIP_XHCI=1 (disable xHCI/USB bring-up),
     // UNAOS_BOOTLOG=1 (hold the boot log on screen instead of the GUI), UNAOS_USBDEBUG=1 (run the
@@ -310,6 +333,9 @@ fn main() {
     // Default OFF => no ATA write opcode is linked (`WRITE-DMA-EXT-0x35` is 0 hits on the ELF) and
     // media are byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
     if std::env::var("UNAOS_AHCI_WRITE").is_ok() { feats.push("ahci-write"); }
+    // AHCIROOT (rmbp-ledger B332): the SSD UnaFS root + the kernel-held SATA write grant. Implies ahci-write,
+    // unafs, installdemo in Cargo.toml. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
+    if std::env::var("UNAOS_AHCIROOT").is_ok() { feats.push("ahciroot"); }
     // SELFINSTALL M3 (SH-3): UNAOS_ROOT_PREFER=ahci|sdhc picks the bootdisk root when both the card and the SSD carry
     // UnaOS (cargo features root-prefer-ahci / root-prefer-sdhc). Default OFF => first-found. Kept in sync with arroyo.
     match std::env::var("UNAOS_ROOT_PREFER").as_deref() {
@@ -741,6 +767,8 @@ fn main() {
     if std::env::var("UNAOS_LUMEN").is_ok() { feats.push("lumen"); }
     // NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM / SYS_RESOLVE and `tests net`. Kept in sync with arroyo.
     if std::env::var("UNAOS_NETRING3").is_ok() { feats.push("netring3"); }
+    // SELFDIAG (B324): UNAOS_SELFDIAG=1 arms the boot log on disk, SYS_PATH_READ/WRITE and `tests selfdiag`. Kept in sync with arroyo.
+    if std::env::var("UNAOS_SELFDIAG").is_ok() { feats.push("selfdiag"); }
     // BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* at every login (safe-mode knob). Kept in sync with arroyo.
     if std::env::var("UNAOS_PREFS_RESET").is_ok() { feats.push("prefs_reset"); }
     // KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the copy-engine blitter (cpu until KBLIT binds its channel). Kept in sync with arroyo.
@@ -959,6 +987,12 @@ fn main() {
         // LINUXABI3: an OPERATOR-supplied static musl busybox dropped at target/BUSYBOX.LNX (nothing builds it; absent = skipped,
         // `tests linuxabi3` then reports busybox=skip) — `linux /apps/BUSYBOX.LNX ls /`.
         ("BUSYBOX.LNX", "BUSYBOX.LNX"),
+        // SELFBUILD1 (B344): the static tcc (upstream tinycc, LGPL — binary only, built by arroyo's build_selfbuild_x86), the
+        // one-file C program it compiles on UnaOS, the syscall KAT and the busybox probe — `tests selfbuild`, `tests linuxabi`.
+        ("TCC.LNX", "TCC.LNX"),
+        ("HELLO.C", "HELLO.C"),
+        ("SYSKAT.LNX", "SYSKAT.LNX"),
+        ("PROBE.LNX", "PROBE.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
@@ -1026,6 +1060,32 @@ fn main() {
     } else {
         println!("   NET: target/NET-X86.ELF absent — ESP has no NET.ELF (run via ./arroyo esp-x86)");
     }
+    // SELFDIAG M2 (B324, R82): the diagnosis program (crates/user-diag, built by arroyo's build_user_diag_x86 to
+    // target/DIAG-X86.ELF), staged as APPS/DIAG.ELF — a bare `diag` runs it in the foreground (console, app
+    // note flags 0) — and the witness OWNERS table (scripts/witness-owners.py → target/witness-owners.txt),
+    // staged as system/witness-owners.txt: the program pairs each FAIL line with the file that prints it.
+    let diag_elf = target_dir.join("DIAG-X86.ELF");
+    if diag_elf.exists() {
+        std::fs::copy(&diag_elf, esp_apps.join("DIAG.ELF")).unwrap();
+        println!("   DIAG: copied DIAG.ELF into APPS/ on the ESP (diag)");
+    } else {
+        println!("   DIAG: target/DIAG-X86.ELF absent — ESP has no DIAG.ELF (run via ./arroyo esp-x86)");
+    }
+    let owners_txt = target_dir.join("witness-owners.txt");
+    if owners_txt.exists() {
+        std::fs::create_dir_all(esp_dir.join("system")).unwrap();
+        std::fs::copy(&owners_txt, esp_dir.join("system").join("witness-owners.txt")).unwrap();
+        println!("   DIAG: copied witness-owners.txt into system/ on the ESP");
+    }
+
+    // VEINTLS (LEDGER SR36): the trust store. `tools/trust-bundle` writes the Mozilla CA bundle to
+    // <repo>/system/trust/roots.pem (gitignored, 240 KB) and its pin to roots.pem.sha256 (committed);
+    // ring 3 (vein_ring3::trust, LUMEN.ELF / NET.ELF) opens /system/trust/roots.pem. Staged on the ESP
+    // here and on the DATA volume below (the one the running kernel reads). A bundle that does not match
+    // its pin stops the build; an absent bundle is staged as nothing and LUMEN says so (Echo, "no trust
+    // store") — never a TLS connection without verification.
+    let trust_src = workspace_dir.join("../system/trust/roots.pem");
+    let trust_ok = stage_trust(&trust_src, &esp_dir);
 
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
@@ -1092,11 +1152,23 @@ fn main() {
         (target_dir.join("NET-X86.ELF"), "NET.ELF"),
         // RING3WIN (B316): the ELF-window proof program — `tests ring3win` reads /apps/BIG.ELF there.
         (target_dir.join("BIG-X86.ELF"), "BIG.ELF"),
+        // SELFDIAG M2 (B324): the diagnosis program rides the DATA volume too — `diag` reads it there.
+        (target_dir.join("DIAG-X86.ELF"), "DIAG.ELF"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();
             staged_data.push(dst);
         }
+    }
+    // SELFDIAG M2 (B324): the owners table rides the DATA volume too (system/witness-owners.txt).
+    if target_dir.join("witness-owners.txt").exists() {
+        std::fs::create_dir_all(data_dir.join("system")).unwrap();
+        std::fs::copy(target_dir.join("witness-owners.txt"), data_dir.join("system").join("witness-owners.txt")).unwrap();
+        staged_data.push("system/witness-owners.txt");
+    }
+    if trust_ok {
+        stage_trust(&trust_src, &data_dir);
+        staged_data.push("system/trust/roots.pem");
     }
     // `hello.txt` rides along so the operator has a trivial `cat hello.txt` probe that proves the
     // kernel is reading THIS volume — the one-command answer to "did I write the right stick?".
@@ -2198,4 +2270,28 @@ fn build_default_medium(workspace_dir: &std::path::Path) -> Result<std::path::Pa
         .map_err(|e| format!("cannot flush {}: {}", out.display(), e))?;
     let _ = std::fs::remove_file(&fs_img);
     Ok(out)
+}
+
+#[cfg(test)]
+mod veintls_tests {
+    /// The real bundle (when fetched) stages byte-identical and matches its pin; a tampered copy panics.
+    #[test]
+    fn trust_bundle_stages_and_pin_holds() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../system/trust/roots.pem");
+        if !src.exists() {
+            println!("SKIP: system/trust/roots.pem absent (tools/trust-bundle)");
+            return;
+        }
+        let out = std::env::temp_dir().join(format!("veintls-stage-{}", std::process::id()));
+        assert!(super::stage_trust(&src, &out));
+        assert_eq!(std::fs::read(out.join("system/trust/roots.pem")).unwrap(), std::fs::read(&src).unwrap());
+        let bad = out.join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        let mut pem = std::fs::read(&src).unwrap();
+        pem[100] ^= 1;
+        std::fs::write(bad.join("roots.pem"), pem).unwrap();
+        std::fs::copy(src.with_file_name("roots.pem.sha256"), bad.join("roots.pem.sha256")).unwrap();
+        assert!(std::panic::catch_unwind(|| super::stage_trust(&bad.join("roots.pem"), &out.join("x"))).is_err());
+        let _ = std::fs::remove_dir_all(&out);
+    }
 }
