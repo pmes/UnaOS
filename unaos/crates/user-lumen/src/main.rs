@@ -36,7 +36,7 @@
 // Cmd-V pastes. Ctrl-K or Cmd-K starts a new conversation; Esc cancels an answer in flight and NEVER
 // closes the window (R24). Commands: /new /list /open N /copy /help.
 //
-// WIRE. `:: LUMEN: start provider=<claude|echo> model=<m> key=<unafs|none|fat-refused> transport=<tls|http|none>
+// WIRE. `:: LUMEN: start provider=<claude|echo> model=<m> key=<holocron|unafs|none|fat-refused> [holocron=<no-fulfiller|not-found|refused>] transport=<tls|http|none>
 // trust=<roots|none> clock=<set|unset> history=<N|off> files=<path|open|off> ::` once, then per answer `:: LUMEN: reply provider=<p>
 // first_token_ms=<n> bytes=<n> stop=<s> [transport=tls verified=<issuer CN>] in=<n> out=<n> ::` or `:: LUMEN: fail stage=<s>
 // code=<n> [tls=<why>] ::`; `:: LUMEN: clip set=<n> ::` per copy; history failures as `:: LUMEN: history <op> code=<n> ::`.
@@ -1395,8 +1395,17 @@ pub extern "C" fn _start() -> ! {
     let cfg = vein_ring3::prefs::Config::read();
     let keybuf = unsafe { &mut *core::ptr::addr_of_mut!(KEY) };
     let mut kpath = [0u8; 128];
-    let kfile = match cfg.key_file() { Some(k) => Some(k), None => vein_ring3::key::default_path(&mut kpath) }; // RING3ABI2 M3 (B333): unset preference = `<home>/.config/unaos/vein.key`, `<home>` from SYS_WHOAMI
-    let (key, key_n) = vein_ring3::key::read(kfile, keybuf);
+    // HOLOCRON2 M2 (B355): Holocron first (`vein/claude.api_key`, keysource::decide); the key file only on
+    // NotFound or no fulfiller; LOCKED / DENIED / CORRUPT refuse and the window names the fix.
+    let hk = vein_ring3::holocron::claude_key(keybuf);
+    let (key, key_n) = match hk {
+        vein_ring3::holocron::KeyFrom::Holocron(n) => (KeyState::UnaFs, n),
+        vein_ring3::holocron::KeyFrom::Refuse(_) => (KeyState::None, 0),
+        vein_ring3::holocron::KeyFrom::Fallback(_) => {
+            let kfile = match cfg.key_file() { Some(k) => Some(k), None => vein_ring3::key::default_path(&mut kpath) }; // RING3ABI2 M3 (B333): unset preference = `<home>/.config/unaos/vein.key`, `<home>` from SYS_WHOAMI
+            vein_ring3::key::read(kfile, keybuf)
+        }
+    };
     let tls = vein_ring3::TlsSetup::load(); // VEINTLS (SR36)
     let plan = cfg.plan(key, tls.verify());
     let sess = Session { plan, key, key_n, cfg, tls };
@@ -1406,7 +1415,12 @@ pub extern "C" fn _start() -> ! {
     hist_init();
 
     let mut l = Line::new(b":: LUMEN: start provider=");
-    l.put(sess.provider()).put(b" model=").put(sess.model()).put(b" key=").put(key.as_str().as_bytes()).put(b" transport=").put(sess.transport());
+    l.put(sess.provider()).put(b" model=").put(sess.model()).put(b" key=").put(match hk { vein_ring3::holocron::KeyFrom::Holocron(_) => b"holocron" as &[u8], _ => key.as_str().as_bytes() }).put(b" transport=").put(sess.transport());
+    match hk { // HOLOCRON2 M2 (B355): why the key did not come from Holocron
+        vein_ring3::holocron::KeyFrom::Fallback(w) => { l.put(b" holocron=").put(w.as_bytes()); }
+        vein_ring3::holocron::KeyFrom::Refuse(_) => { l.put(b" holocron=refused"); }
+        vein_ring3::holocron::KeyFrom::Holocron(_) => {}
+    }
     match sess.tls.report {
         Some(r) => l.put(b" trust=").dec(r.loaded as i64),
         None => l.put(b" trust=none"),
@@ -1458,6 +1472,12 @@ pub extern "C" fn _start() -> ! {
         }
         if key == KeyState::OnFat {
             a.note(KeyState::OnFat.as_str().as_bytes());
+        }
+        match hk { // HOLOCRON2 M2 (B355): the window names where the key came from
+            vein_ring3::holocron::KeyFrom::Holocron(_) => a.note(b"key: from Holocron (vein/claude.api_key)."),
+            vein_ring3::holocron::KeyFrom::Refuse(why) => { a.note(b"key: Holocron refused: "); a.add(why.as_bytes()); }
+            vein_ring3::holocron::KeyFrom::Fallback(w) if key == KeyState::UnaFs => { a.note(b"key: from the key file (Holocron: "); a.add(w.as_bytes()); a.add(b")."); }
+            vein_ring3::holocron::KeyFrom::Fallback(_) => {}
         }
         if let Files::None(_) = a.hist.f {
             a.note(b"history off: this kernel offers ring 3 no file surface (SYS_PATH_* or the storage service).");
