@@ -37,7 +37,7 @@
 // closes the window (R24). Commands: /new /list /open N /copy /help.
 //
 // WIRE. `:: LUMEN: start provider=<claude|echo> model=<m> key=<holocron|unafs|none|fat-refused> [holocron=<no-fulfiller|not-found|refused>] transport=<tls|http|none>
-// trust=<roots|none> clock=<set|unset> history=<N|off> files=<path|open|off> ::` once, then per answer `:: LUMEN: reply provider=<p>
+// trust=<roots|none> clock=<set|unset> history=<N|off> files=<path|open|off> font=<dejavu-sans font_kib=<n>|font8x8 font_why=<w>> ::` once (KERNELFONT2), then per answer `:: LUMEN: reply provider=<p>
 // first_token_ms=<n> bytes=<n> stop=<s> [transport=tls verified=<issuer CN>] in=<n> out=<n> ::` or `:: LUMEN: fail stage=<s>
 // code=<n> [tls=<why>] ::`; `:: LUMEN: clip set=<n> ::` per copy; history failures as `:: LUMEN: history <op> code=<n> ::`.
 // The window's footer shows the provider and the first token's latency.
@@ -56,6 +56,9 @@ use vein_ring3::files::{self, Files, Home};
 use vein_ring3::sys::{now_ms, sleep_ms, sys, write};
 
 extern crate alloc;
+
+mod txt;
+use txt::Kind;
 
 /// VEINTLS (SR36): tls_core allocates (records, transcript, the parsed trust store); the size-class heap
 /// over SYS_SBRK frees and reuses, so a long streamed answer stays inside the ELF window.
@@ -77,7 +80,7 @@ const ACTION_BOTTOM: u64 = 25;
 const KEY_CTRL_N: u8 = 0x0e;
 const KEY_CTRL_P: u8 = 0x10;
 
-const SYSTEM: &str = "You are Claude, talking with the person through Lumen, the chat window of UnaOS. The window renders markdown (headings, bold, italic, bullet and numbered lists, fenced code, inline code, links) in a 35-column ASCII monospace font: keep lines short, and use no tables, images or non-ASCII symbols.";
+const SYSTEM: &str = "You are Claude, talking with the person through Lumen, the chat window of UnaOS. The window renders markdown (headings, bold, italic, bullet and numbered lists, fenced code, inline code, links) in a narrow window (about 40 characters a line, DejaVu Sans; code in DejaVu Sans Mono): keep lines short, and use no tables, images or non-ASCII symbols.";
 
 fn exit(code: u64) -> ! {
     sys(SYS_EXIT, code, 0, 0, 0);
@@ -143,7 +146,44 @@ impl Line {
 const MAX_W: i32 = 288;
 const MAX_H: i32 = 288;
 const STRIDE: usize = MAX_W as usize * 4;
-const LH: i32 = 10;
+/// KERNELFONT2: the line box is the face's ([`txt::LH_TT`]) or the font8x8 grid's ([`txt::LH_BITMAP`]); see [`lh`].
+static mut TXT: Option<txt::Txt> = None;
+/// The loaded faces (KERNELFONT2), `None` on the font8x8 grid. Single-threaded, as [`app`].
+fn tt() -> Option<&'static mut txt::Txt> {
+    unsafe { (*core::ptr::addr_of_mut!(TXT)).as_mut() }
+}
+fn lh() -> i32 {
+    if tt().is_some() { txt::LH_TT } else { txt::LH_BITMAP }
+}
+/// The advance of display byte `c` drawn as `k`, px (8 on the font8x8 grid).
+fn adv(c: u8, k: Kind) -> f32 {
+    tt().map_or(8.0, |t| t.adv(c, k))
+}
+fn width(s: &[u8], k: Kind) -> f32 {
+    s.iter().map(|&c| adv(c, k)).sum()
+}
+/// How many leading bytes of `s` fit in `max` px.
+fn fit(s: &[u8], k: Kind, max: f32) -> usize {
+    let mut x = 0f32;
+    for (i, &c) in s.iter().enumerate() {
+        x += adv(c, k);
+        if x > max + 0.01 {
+            return i;
+        }
+    }
+    s.len()
+}
+/// What a rendered byte is drawn with: (kind, ink, italic, code ground).
+fn style_at(spans: &[Span], i: usize, fence: bool) -> (Kind, u32, bool, bool) {
+    for sp in spans {
+        if (sp.start as usize) <= i && i < sp.end as usize {
+            let code = sp.tint == Tint::Code;
+            let k = if code || fence { Kind::Mono } else if sp.bold || sp.tint == Tint::Heading { Kind::Bold } else { Kind::Sans };
+            return (k, tint_ink(sp.tint), sp.italic, code);
+        }
+    }
+    (if fence { Kind::Mono } else { Kind::Sans }, INK, false, false)
+}
 /// The transcript: every turn of the conversation as shown and saved (oldest turns drop first).
 const LOG_CAP: usize = 1 << 20;
 /// The scrollback ring: rendered rows (12 bytes each). LUMENUX M1's measured budget (LUMENUX.md).
@@ -176,7 +216,7 @@ const QUOTE_INK: u32 = 0xFFB8_B0C8;
 const LINK_INK: u32 = 0xFF7F_C8FF;
 const SEL_BAR: u32 = 0xFFB0_8CFF;
 
-static FONT: [[u8; 8]; 128] = font8x8::legacy::BASIC_LEGACY;
+static FONT: [[u8; 8]; 128] = font8x8::legacy::BASIC_LEGACY; // the grid when no face is on the volume (KERNELFONT2)
 
 /// Where the last laid source line starts, and the layout state there (relayout resumes from it).
 #[derive(Clone, Copy)]
@@ -416,8 +456,9 @@ impl App {
     }
 
     // ---- M1: layout into the ring -------------------------------------------------------------
+    /// KERNELFONT2: the wrap width in px (the field keeps its name: a change re-lays the transcript).
     fn cols_for(&self) -> usize {
-        ((self.w - 8 - 4) / 8).max(8) as usize
+        (self.w - 8 - 4).max(64) as usize
     }
 
     /// Lay the transcript into the ring: incrementally from the last laid source line, or from the start.
@@ -479,16 +520,19 @@ impl App {
             *fence = st.fence;
             let text = &rt()[..l.len];
             let block = l.block as u8;
-            let hang = l.hang.min(cols / 2);
+            let fence_row = matches!(l.block, Block::Code | Block::Fence);
+            let spans = &rs()[..l.spans];
+            let hang = l.hang.min(text.len()).min(u8::MAX as usize);
+            let hang_px = (0..hang).map(|i| adv(text[i], style_at(spans, i, fence_row).0)).sum::<f32>();
             let ring = &mut self.ring;
-            md::wrap(text, cols, hang, &mut |a, b, first| {
+            md::wrap_px(text, cols as f32, hang_px, &|i| adv(text[i], style_at(spans, i, fence_row).0), &mut |a, b, first| {
                 ring.push(Rec { src: p as u32, dofs: a as u16, len: (b - a) as u16, role, block, hang: if first { 0 } else { hang as u8 }, flags: fbit | lead(first) });
             });
         } else {
             let e = e.min(p + u16::MAX as usize);
             let text = &self.log[p..e];
             let ring = &mut self.ring;
-            md::wrap(text, cols.saturating_sub(2), 0, &mut |a, b, first| {
+            md::wrap_px(text, cols as f32 - 16.0, 0.0, &|i| adv(text[i], Kind::Sans), &mut |a, b, first| {
                 ring.push(Rec { src: p as u32, dofs: a as u16, len: (b - a) as u16, role, block: 0, hang: 0, flags: lead(first) });
             });
         }
@@ -1193,11 +1237,30 @@ impl Surf {
             y += 1;
         }
     }
-    /// Text in one colour; bold = a double strike, italic = the top half sheared one pixel right.
-    fn styled(&self, x: i32, y: i32, s: &[u8], c: u32, bold: bool, italic: bool) {
-        for (k, &ch) in s.iter().enumerate() {
+    fn get(&self, x: i32, y: i32) -> u32 {
+        unsafe { (self.p.add(y as usize * STRIDE) as *const u32).add(x as usize).read_volatile() }
+    }
+    /// Text in one colour with its line box's top at `y` (KERNELFONT2: through the faces when they loaded, the
+    /// font8x8 glyph's top row otherwise). Bold = the bold face (font8x8: a double strike), italic = the top half
+    /// sheared one pixel right. `fx` is the pen in px; returns the pen after the text.
+    fn styled_k(&self, fx: f32, y: i32, s: &[u8], c: u32, k: Kind, italic: bool) -> f32 {
+        if let Some(t) = tt() {
+            let (w, h) = (self.w, self.h);
+            return t.draw(fx, y, s, k, italic, c, &mut |gx, gy, cov| {
+                if gx >= 0 && gy >= 0 && gx < w && gy < h {
+                    let bg = self.get(gx, gy);
+                    let px = 0xFF00_0000 | font_core::ui::blend(bg & 0x00FF_FFFF, c & 0x00FF_FFFF, cov);
+                    unsafe { (self.p.add(gy as usize * STRIDE) as *mut u32).add(gx as usize).write_volatile(px) };
+                }
+            });
+        }
+        let x = fx as i32;
+        let bold = k == Kind::Bold;
+        // the font8x8 grid: the 8-row glyph sits one row down in its 10-row box (the pre-KERNELFONT2 placement)
+        let y = y + 1;
+        for (n, &ch) in s.iter().enumerate() {
             let g = &FONT[(ch & 0x7f) as usize];
-            let gx = x + k as i32 * 8;
+            let gx = x + n as i32 * 8;
             for (r, &bits) in g.iter().enumerate() {
                 let sh = if italic && r < 4 { 1 } else { 0 };
                 let mut col = 0;
@@ -1209,9 +1272,10 @@ impl Surf {
                 }
             }
         }
+        fx + s.len() as f32 * 8.0
     }
-    fn text(&self, x: i32, y: i32, s: &[u8], c: u32) {
-        self.styled(x, y, s, c, false, false);
+    fn text(&self, x: i32, y: i32, s: &[u8], c: u32) -> f32 {
+        self.styled_k(x as f32, y, s, c, Kind::Sans, false)
     }
 }
 
@@ -1226,38 +1290,47 @@ fn tint_ink(t: Tint) -> u32 {
     }
 }
 
-/// Draw `text[a..b]` of a rendered line at (x, y), styled by `spans`.
-fn draw_spans(s: &Surf, x: i32, y: i32, text: &[u8], spans: &[Span], a: usize, b: usize) {
+/// Draw `text[a..b]` of a rendered line with its box top at `y`, pen at `x`, styled by `spans` (a fence row is
+/// all mono).
+fn draw_spans(s: &Surf, x: f32, y: i32, text: &[u8], spans: &[Span], a: usize, b: usize, fence: bool) {
     let mut i = a;
-    let mut k = 0;
+    let mut pen = x;
     while i < b {
-        while k < spans.len() && (spans[k].end as usize) <= i {
-            k += 1;
+        let (k, ink, italic, code) = style_at(spans, i, fence);
+        let mut e = i + 1;
+        while e < b && style_at(spans, e, fence) == (k, ink, italic, code) {
+            e += 1;
         }
-        let (e, ink, bold, italic, code) = match spans.get(k) {
-            Some(sp) if (sp.start as usize) <= i => ((sp.end as usize).min(b), tint_ink(sp.tint), sp.bold, sp.italic, sp.tint == Tint::Code),
-            Some(sp) => ((sp.start as usize).min(b), INK, false, false, false),
-            None => (b, INK, false, false, false),
-        };
-        let px = x + (i - a) as i32 * 8;
         if code {
-            s.fill(px, y - 1, (e - i) as i32 * 8, LH, CODE_BG);
+            s.fill(pen as i32, y, width(&text[i..e], k).ceil_px(), lh(), CODE_BG);
         }
-        s.styled(px, y, &text[i..e], ink, bold, italic);
+        pen = s.styled_k(pen, y, &text[i..e], ink, k, italic);
         i = e;
+    }
+}
+
+trait CeilPx {
+    fn ceil_px(self) -> i32;
+}
+impl CeilPx for f32 {
+    fn ceil_px(self) -> i32 {
+        let t = self as i32;
+        if (t as f32) < self { t + 1 } else { t }
     }
 }
 
 /// Draw the window; returns (visible transcript rows, the largest scroll) for the next event.
 fn render(a: &App, s: &Surf) -> (i32, i32) {
     let (w, h) = (a.w, a.h);
+    let lh = lh();
     s.fill(0, 0, w, h, BG);
-    let cols = ((w - 8) / 8).max(4) as usize;
+    let tw = (w - 8) as f32; // the text width, px
     // the footer: two status rows
-    let fy2 = h - LH - 2;
-    let fy1 = fy2 - LH;
+    let fy2 = h - lh - 2;
+    let fy1 = fy2 - lh;
     s.fill(0, fy1 - 3, w, 1, RULE);
-    s.text(4, fy1, &a.st1[..a.st1_n.min(cols)], OK_INK);
+    let st1 = &a.st1[..a.st1_n];
+    s.text(4, fy1, &st1[..fit(st1, Kind::Sans, tw)], OK_INK);
     let (sc, st): (u32, &[u8]) = if a.busy {
         (CARET, b"... answering (Esc cancels)")
     } else if a.flash_n > 0 && now_ms() < a.flash_until {
@@ -1265,32 +1338,46 @@ fn render(a: &App, s: &Surf) -> (i32, i32) {
     } else {
         (NOTE_INK, &a.st2[..a.st2_n])
     };
-    s.text(4, fy2, &st[..st.len().min(cols)], sc);
-    // the input
-    let iw = cols.saturating_sub(2).max(1);
-    let total = a.inp_n / iw + 1;
+    s.text(4, fy2, &st[..fit(st, Kind::Sans, tw)], sc);
+    // the input: broken into rows of at most `iw` px (by character, not word: it is being typed)
+    let iw = (tw - 16.0).max(16.0);
+    let mut starts: alloc::vec::Vec<usize> = alloc::vec![0];
+    {
+        let mut x = 0f32;
+        for (i, &c) in a.inp[..a.inp_n].iter().enumerate() {
+            let d = adv(c, Kind::Sans);
+            if x + d > iw && i > *starts.last().unwrap_or(&0) {
+                starts.push(i);
+                x = 0.0;
+            }
+            x += d;
+        }
+    }
+    let total = starts.len();
     let shown = total.min(3);
-    let crow = a.caret / iw;
+    let crow = starts.iter().rposition(|&st| st <= a.caret).unwrap_or(0);
+    let crow = if crow + 1 < total && starts[crow + 1] == a.caret { crow + 1 } else { crow };
     let top = (crow + 1).saturating_sub(shown);
-    let iy = fy1 - 6 - shown as i32 * LH;
+    let iy = fy1 - 6 - shown as i32 * lh;
     s.fill(0, iy - 3, w, 1, RULE);
     let mut r = 0;
     while r < shown {
         let row = top + r;
-        let y = iy + r as i32 * LH;
+        let y = iy + r as i32 * lh;
         if row == 0 {
             s.text(4, y, b">", USER_INK);
         }
-        let lo = (row * iw).min(a.inp_n);
-        let hi = ((row + 1) * iw).min(a.inp_n);
+        let lo = starts[row].min(a.inp_n);
+        let hi = starts.get(row + 1).copied().unwrap_or(a.inp_n).min(a.inp_n);
         s.text(4 + 16, y, &a.inp[lo..hi], INK);
         if row == crow {
-            s.fill(4 + 16 + (a.caret % iw) as i32 * 8, y - 1, 2, 10, CARET);
+            let cx = 4 + 16 + width(&a.inp[lo..a.caret.clamp(lo, hi)], Kind::Sans) as i32;
+            s.fill(cx, y, 2, lh, CARET);
         }
         r += 1;
     }
     // the transcript: the ring's rows, scrolled back `scroll` from the bottom
-    let rows = ((iy - 6 - 4) / LH).max(1) as usize;
+    let rows = ((iy - 6 - 4) / lh).max(1) as usize;
     let n = a.ring.len();
     let maxs = n.saturating_sub(rows);
     let sc = (a.scroll.max(0) as usize).min(maxs);
@@ -1299,7 +1386,7 @@ fn render(a: &App, s: &Surf) -> (i32, i32) {
     let mut i = first;
     while i < n && i < first + rows {
         let Some(rec) = a.ring.get(i) else { break };
-        let y = 4 + (i - first) as i32 * LH;
+        let y = 3 + (i - first) as i32 * lh;
         let p = rec.src as usize;
         let selected = a.sel.is_some_and(|(ss, se)| rec.role == ROLE_AI && ss < rec.src && rec.src < se);
         match rec.role {
@@ -1312,22 +1399,27 @@ fn render(a: &App, s: &Surf) -> (i32, i32) {
                     (cache_src, cache_len, cache_spans) = (rec.src, l.len, l.spans);
                 }
                 let block = Block::from_u8(rec.block);
-                if matches!(block, Block::Code | Block::Fence) {
-                    s.fill(2, y - 1, w - 8, LH, CODE_BG);
+                let fence = matches!(block, Block::Code | Block::Fence);
+                if fence {
+                    s.fill(2, y, w - 8, lh, CODE_BG);
                 }
                 if block == Block::Rule {
-                    s.fill(4, y + 3, (cols as i32) * 8, 1, RULE);
+                    s.fill(4, y + lh / 2, w - 12, 1, RULE);
                 } else {
+                    let text = &rt()[..cache_len];
+                    let spans = &rs()[..cache_spans];
                     let a0 = (rec.dofs as usize).min(cache_len);
                     let b0 = (a0 + rec.len as usize).min(cache_len);
-                    draw_spans(s, 4 + rec.hang as i32 * 8, y, &rt()[..cache_len], &rs()[..cache_spans], a0, b0);
+                    let hang = (rec.hang as usize).min(cache_len);
+                    let hx: f32 = (0..hang).map(|k| adv(text[k], style_at(spans, k, fence).0)).sum();
+                    draw_spans(s, 4.0 + hx, y, text, spans, a0, b0, fence);
                 }
             }
             role => {
                 let e = a.line_end(p);
                 let a0 = (p + rec.dofs as usize).min(e);
                 let b0 = (a0 + rec.len as usize).min(e);
-                let (ink, mark): (u32, &[u8]) = if role == ROLE_USER { (USER_INK, b"> ") } else { (NOTE_INK, b"* ") };
+                let (ink, mark): (u32, &[u8]) = if role == ROLE_USER { (USER_INK, b">") } else { (NOTE_INK, b"*") };
                 if rec.flags & F_TURN != 0 && rec.flags & F_LEAD != 0 {
                     s.text(4, y, mark, ink);
                 }
@@ -1335,16 +1427,16 @@ fn render(a: &App, s: &Surf) -> (i32, i32) {
             }
         }
         if selected {
-            s.fill(0, y - 1, 2, LH, SEL_BAR);
+            s.fill(0, y, 2, lh, SEL_BAR);
         }
         i += 1;
     }
     // M1: the position indicator — a scrollbar on the right edge when there is more than a screen
     if n > rows {
-        let track = rows as i32 * LH;
+        let track = rows as i32 * lh;
         let thumb = (track * rows as i32 / n as i32).max(6);
-        let ty = 4 + ((track - thumb) as i64 * first as i64 / maxs.max(1) as i64) as i32;
-        s.fill(w - 3, 4, 2, track, RULE);
+        let ty = 3 + ((track - thumb) as i64 * first as i64 / maxs.max(1) as i64) as i32;
+        s.fill(w - 3, 3, 2, track, RULE);
         s.fill(w - 3, ty, 2, thumb, CARET);
     }
     (rows as i32, maxs as i32)
@@ -1414,6 +1506,17 @@ pub extern "C" fn _start() -> ! {
     // M4: the newest conversation comes back.
     hist_init();
 
+    // KERNELFONT2 (B363): the faces on the volume, into the heap the 64 MiB window holds; else the font8x8 grid.
+    let font_why = match txt::load() {
+        Ok(t) => {
+            unsafe { *core::ptr::addr_of_mut!(TXT) = Some(t) };
+            let a = app();
+            (a.layout_full, a.layout_dirty, a.dirty) = (true, true, true);
+            None
+        }
+        Err(w) => Some(w),
+    };
+
     let mut l = Line::new(b":: LUMEN: start provider=");
     l.put(sess.provider()).put(b" model=").put(sess.model()).put(b" key=").put(match hk { vein_ring3::holocron::KeyFrom::Holocron(_) => b"holocron" as &[u8], _ => key.as_str().as_bytes() }).put(b" transport=").put(sess.transport());
     match hk { // HOLOCRON2 M2 (B355): why the key did not come from Holocron
@@ -1444,6 +1547,23 @@ pub extern "C" fn _start() -> ! {
     }
     if sess.cfg.bus_err != 0 {
         l.put(b" prefs=").dec(sess.cfg.bus_err);
+    }
+    match (tt(), &font_why) {
+        (Some(t), _) => {
+            l.put(b" font=").put(t.name().as_bytes()).put(b" font_kib=").dec((t.bytes / 1024) as i64);
+        }
+        (None, Some(w)) => {
+            l.put(b" font=font8x8 font_why=");
+            w.put(&mut |s, c| {
+                l.put(s);
+                if let Some(c) = c {
+                    l.put(b" font_code=").dec(c);
+                }
+            });
+        }
+        (None, None) => {
+            l.put(b" font=font8x8");
+        }
     }
     l.put(b" ::");
     l.wire();

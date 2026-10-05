@@ -664,3 +664,16 @@ fn apply_direct(op: Op) {
 pub fn home_dir() -> String {
     home_prefix().unwrap_or_else(|| String::from("/home/"))
 }
+
+/// KERNELFONT2 (B363) M4: the faces loaded or were restyled — repaint the open window once (no window: nothing).
+pub fn font_repaint() {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE {
+        return;
+    }
+    let mut g = STATE.lock();
+    let Some(st) = g.as_mut() else { return };
+    paint(st);
+    drop(g);
+    let _ = wm::present(id);
+}

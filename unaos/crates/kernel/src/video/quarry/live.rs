@@ -2878,6 +2878,10 @@ pub fn service() {
     crate::video::textedit::service();
     // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.
     crate::video::activity::service();
+    // KERNELFONT2 (B363) M4 — the faces loaded or were restyled since the last pass: every kernel window that caches
+    // its own pixels repaints once (the login screen, Quarry, Settings, Activity, the viewer/editor, the installer)
+    // and the console repaints its screenful from its cell store. See `font_repaint_pass` at this file's tail.
+    font_repaint_pass();
     columns::service(); // QUARRY2 (B336): the latched column-width / sort preference write
 }
 
@@ -4205,4 +4209,35 @@ pub mod columns;
 /// GLASSEYES (B343): Quarry's row, or `wm::WIN_NONE` — the state-shot mask places its volatile columns from it.
 pub fn win_id() -> wm::WinId {
     WIN.load(Ordering::Relaxed)
+}
+
+// ── KERNELFONT2 (rmbp-ledger B363) M4 — repaint once when the faces load ───────────────────────────────────────────
+// A window's surface is cached RAM its owner paints; the wm only re-composites it. So when `video::text` loads the
+// faces (the first service pass that finds the volume) or restyles them, a damage of the panel shows the OLD pixels
+// again. The epoch `video::text` bumps is compared here, on the pass that loaded them, and each owner repaints.
+static FONT_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn font_repaint_pass() {
+    let e = crate::video::text::epoch();
+    if e == 0 || FONT_SEEN.swap(e, Ordering::AcqRel) == e {
+        return;
+    }
+    repaint();
+    crate::video::settings::font_repaint();
+    crate::video::activity::font_repaint();
+    crate::video::fileview::font_repaint();
+    crate::video::textedit::font_repaint();
+    #[cfg(feature = "login")]
+    crate::video::crystal::login::font_repaint();
+    #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+    crate::video::instgui::font_repaint();
+    let rows = crate::video::fbcon::font_repaint();
+    serial_println!(
+        "[kfont] repaint epoch={} console_rows={} windows=quarry,settings,activity,fileview,textedit{}{} face={}",
+        e,
+        rows,
+        if cfg!(feature = "login") { ",login" } else { "" },
+        if cfg!(all(target_arch = "x86_64", feature = "wc", feature = "instgui")) { ",instgui" } else { "" },
+        crate::video::text::face_name(crate::video::text::Face::Ui)
+    );
 }

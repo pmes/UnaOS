@@ -165,7 +165,7 @@ impl<const N: usize> OpList<N> {
 /// aarch64 console, any pre-takeover x86 print) this is the font8x8 path, byte for byte.
 fn draw_glyph(surf: &FrameBuffer, ch: u8, cx: usize, cy: usize, fg: u32, bg: u32, s: usize, aa: bool) {
     if aa {
-        crate::video::text::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false, crate::video::text::Face::Body);
+        crate::video::text::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false, crate::video::text::Face::Grid); // KERNELFONT2 (B363): the console cell is the dpi-scaled grid
         return;
     }
     let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
@@ -1777,8 +1777,8 @@ pub fn panel_console_resume() -> usize {
             // reversing it is `video::font::SIZE` (one constant) rather than this scale.
             c.scale = 1;
             c.aa = true;
-            c.cell_w = crate::video::font::CELL_W;
-            c.cell_h = crate::video::font::CELL_H;
+            c.cell_w = crate::video::text::arm_grid(c.fb.info().width).0; // KERNELFONT2 (B363): the dpi-scaled grid cell (7x16 x ppi/96 at the half pixel); latches video::dpi
+            c.cell_h = crate::video::text::grid_cell().1;
             let info = c.fb.info();
             c.cols = (info.width / c.cell_w).max(1);
             c.rows = (info.height / c.cell_h).max(1);
@@ -2303,8 +2303,8 @@ pub fn panel_console_face_arm() -> Option<(usize, usize)> {
             // magnified alpha raster is not what any of this wants.
             c.scale = 1;
             c.aa = true;
-            c.cell_w = crate::video::font::CELL_W;
-            c.cell_h = crate::video::font::CELL_H;
+            c.cell_w = crate::video::text::arm_grid(c.fb.info().width).0; // KERNELFONT2 (B363): the dpi-scaled grid cell, as the x86 seam
+            c.cell_h = crate::video::text::grid_cell().1;
             // The grid follows the cell. If the console is subsequently routed into a window,
             // `panel_console_window_open` recomputes both against the WINDOW's extent; until then
             // these are the panel's, which is the surface the console is still drawing on.
@@ -2686,7 +2686,7 @@ pub fn orin_face_arm() {
             seen = Some((c.aa, c.cell_w, c.cell_h, c.cols, c.rows, info.width, info.height));
         }
     });
-    let want = (crate::video::font::CELL_W, crate::video::font::CELL_H);
+    let want = crate::video::text::grid_cell(); // KERNELFONT2 (B363): the armed cell is the dpi-scaled grid (font::CELL_W x CELL_H at scale 1.0)
     match (asked, seen) {
         (None, _) => serial_println!(
             "[conface] DECLINE reason=console-not-ready runs={} armed={} want={}x{} (panel_console_face_arm answered None — the console was not ready or FBCON was contended; the console keeps font8x8 at scale 1 and nothing else about this boot changes)",
@@ -3462,4 +3462,75 @@ fn cells_remint(
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn panel_console_live() -> bool {
     PANEL_CONSOLE.load(Ordering::Relaxed)
+}
+
+/// KERNELFONT2 (rmbp-ledger B363) M4 — **the faces just loaded (or were restyled): repaint the routed console's
+/// screenful from its cell store**, so the boot log printed in the bitmap atlas before the volume was up turns into
+/// DejaVu Sans Mono once, instead of only as it scrolls away. One CELL ROW per masked `FBCON` hold (the row back to
+/// the ground, then its glyphs from the engine's warm cache — the same order of work as printing one line), so a
+/// print on another core or from an interrupt is serialised against every row and never sees a half-repainted one;
+/// interrupts are re-enabled between rows. The whole box is presented once, lock released and unmasked
+/// (`route_present`'s contract). Returns the rows repainted: 0 when the console is not routed into a window, has
+/// no store, or the lock stayed contended.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub fn font_repaint() -> usize {
+    let mut row = 0usize;
+    let mut repainted = 0usize;
+    let mut misses = 0u32;
+    loop {
+        // None = contended; Some(None) = nothing (left) to paint; Some(Some(more)) = this row painted
+        let mut step: Option<Option<bool>> = None;
+        crate::arch::without_interrupts(|| {
+            let Some(mut c) = FBCON.try_lock() else { return };
+            if c.win_store.is_none() || c.win_cells.is_none() || row >= c.cell_rows || c.cell_cols == 0 {
+                step = Some(None);
+                return;
+            }
+            let (cols, cw, ch, fg, bg, scale, aa) = (c.cell_cols, c.cell_w, c.cell_h, c.fg, c.bg, c.scale, c.aa);
+            let y = row * ch;
+            let mut line = [0u8; 512];
+            let n = cols.min(line.len());
+            if let Some(k) = c.win_cells.as_ref() {
+                for (i, b) in line[..n].iter_mut().enumerate() {
+                    *b = k.get(row * cols + i).copied().unwrap_or(0);
+                }
+            }
+            {
+                let surf = c.draw_fb();
+                surf.fill_rows(y, y + ch, bg);
+                for (i, &b) in line[..n].iter().enumerate() {
+                    if b != 0 {
+                        draw_glyph(surf, b, i * cw, y, fg, bg, scale, aa);
+                    }
+                }
+            }
+            c.mark_rows(y, y + ch);
+            step = Some(Some(row + 1 < c.cell_rows));
+        });
+        match step {
+            Some(Some(more)) => {
+                repainted += 1;
+                misses = 0;
+                if !more {
+                    break;
+                }
+                row += 1;
+            }
+            Some(None) => break,
+            None => {
+                misses += 1;
+                if misses > 64 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+    if repainted > 0 {
+        route_present();
+    }
+    repainted
 }
