@@ -1,0 +1,12 @@
+[package]
+name = "font_core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "FONTCORE (SR48): OpenType/TrueType/CFF parsing, outlines, an exact-area scanline rasterizer, a glyph cache and a Latin/Greek/Cyrillic shaper with UAX #14 line breaking — from the specifications, no_std + alloc, zero dependencies."
+
+# FONTCORE (LEDGER SR48, R83): the standalone text core, shaped like the other shared cores under unaos/libs.
+# `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies (not even dev-dependencies). A member of the
+# ROOT host workspace so `cargo test --release -p font_core` runs the KATs over the container's DejaVu / Liberation /
+# Loma (CFF) files. The Aether swap (font-kit/ab_glyph -> font_core) and the kernel desktop fonts are follow-ons.
+[dependencies]
