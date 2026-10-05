@@ -1360,3 +1360,20 @@ pub fn usbnet7_selftest() {
 fn nf_stack_poll() { let _ = crate::smolnet::usbnet7_poll(); }
 #[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
 fn nf_stack_poll() { let mut b = [0u8; FRAME_CAP]; while raw_rx(&mut b).is_some() {} }
+
+// ── USBNET8 (rmbp-ledger B381) ──────────────────────────────────────────────────────────────────────
+// Flight 23 read: 43 of 52 bulk-IN completions arrived with no rung before them; the NETFRAME ladder fired on every 2 s of
+// silence (82 kicks, 74 resets in six minutes). These make the next flight decide instead of the seat guessing: the arm's
+// own TRB on the wire (M2), and whether each rung was NEEDED — a completion within `U8_NEEDED_MS` of the rung means the
+// data was already there and the controller had not been told (a missed doorbell); later means the wire was quiet (M3).
+static U8_ARMS: AtomicU64 = AtomicU64::new(0);
+/// One bulk-IN arm: `[usbnet] rx arm trb=<idx> cycle=<c> buf=<pa> len=<n> cross64k=<0|1>` at arms 1, 2 and every power of
+/// two. `cross64k` is xHCI 1.2 §4.11.7.1's test on the ONE Normal TRB the arm posts (the buffer is 64 KiB aligned: 0).
+pub fn note_arm_trb(trb_phys: u64, ring_base: u64, cycle: bool, buf: u64, len: usize) {
+    let n = U8_ARMS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 2 || n.is_power_of_two() {
+        let cross = len != 0 && (buf >> 16) != ((buf + len as u64 - 1) >> 16);
+        serial_println!("[usbnet] rx arm trb={} cycle={} buf={:#x} len={} cross64k={} n={}",
+            trb_phys.wrapping_sub(ring_base) / 16, cycle as u8, buf, len, cross as u8, n);
+    }
+}
