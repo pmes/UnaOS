@@ -35,6 +35,7 @@ pub mod fmath;
 pub mod font;
 pub mod glyf;
 pub mod grapheme;
+pub mod hint;
 pub mod layout;
 pub mod linebreak;
 pub mod name;
