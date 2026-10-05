@@ -8,6 +8,10 @@ license = "LGPL-3.0-or-later"
 default = ["std"]
 std = ["reqwest", "octocrab", "tokio", "futures-core", "futures-util"]
 # EMBED (B317): the in-process local embedder (all-MiniLM-L6-v2 on candle, CPU).
+# PLAYBACK (SR26): AVCODEC's AV1 decoder (`unaos/libs/media/av1_core`, LEDGER SR24) behind
+# `dsp::video::av1`. Today the module is a stub that refuses with Unsupported (so the registry
+# arm compiles and is exercised); the fold adds the av1_core dependency and the real body.
+av1 = []
 local-embed = ["std", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:unicode-normalization"]
 
 [dependencies]
@@ -29,6 +33,9 @@ candle-core = { version = "0.11", optional = true }
 candle-nn = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
+
+# PLAYBACK (SR26): the container core `dsp::demux` re-exports (`no_std`, no dependencies).
+demux_core = { path = "../../unaos/libs/media/demux_core" }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "macros", "time"] }
