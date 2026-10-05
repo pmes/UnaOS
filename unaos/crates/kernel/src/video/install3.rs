@@ -713,3 +713,99 @@ pub(super) fn paint(px: &mut [u32]) -> bool {
     }
     true
 }
+
+// -------------------------------------------------------------- the fixture --
+
+/// `tests instgui` — the five screens, synthetic keys, the DRY-RUN path:
+/// `:: INSTALL3: screens=census,layout,confirm,progress,result grant=<issued|refused> dry_run=1 -> PASS ::`
+pub fn selftest() {
+    let was = ACTIVE.load(Ordering::Acquire);
+    if was {
+        serial_println!(":: INSTALL3: screens=none grant=none dry_run=1 -> SKIP (the operator has the SSD screens open) ::");
+        return;
+    }
+    TEST.store(true, Ordering::Release);
+    let st = super::State::Choose;
+    // `i` on the chooser opens the census (the test opens it DRY directly: same entry, dry set).
+    enter(true);
+    super::repaint();
+    let feed = |c: u8| {
+        let _ = key(st, c);
+    };
+    let snap = || M.lock().as_ref().map(|m| (m.screen, m.disk().map(|d| (d.kind, d.port, String::from(d.confirm_name()), d.name.clone()))));
+    let census_ok = matches!(snap(), Some((Screen::Census, Some((_, Some(_), _, _)))));
+    // CENSUS -> LAYOUT
+    feed(b'\r');
+    let layout_ok = matches!(snap(), Some((Screen::Layout, _))) && M.lock().as_ref().is_some_and(|m| m.plan().is_ok());
+    // every layout key, then back to the defaults: e cycles the ESP sizes, s/w step the UnaFS size
+    for c in [b'e', b'e', b'e', b's', b's', b'w', b'w'] {
+        feed(c);
+    }
+    let defaults = M.lock().as_ref().is_some_and(|m| m.esp_ix == ESP_DEFAULT.load(Ordering::Relaxed) as usize && m.ufs_ix == 0);
+    // LAYOUT -> CONFIRM
+    feed(b'\r');
+    let (kind, name, disk) = match snap() {
+        Some((Screen::Confirm, Some((k, _, n, d)))) => (Some(k), n, d),
+        _ => (None, String::new(), String::new()),
+    };
+    let mut negative_ok = true;
+    if kind.is_some_and(|k| k.typed()) {
+        // the negative leg: a wrong name issues nothing and stays on CONFIRM
+        for &c in b"not-this-disk" {
+            feed(c);
+        }
+        feed(b'\r');
+        negative_ok = matches!(snap(), Some((Screen::Confirm, _))) && M.lock().as_ref().is_some_and(|m| m.mismatch_seen && m.outcome.is_none());
+        for _ in 0..13 {
+            feed(0x7f);
+        }
+        for c in name.bytes() {
+            feed(c.to_ascii_lowercase());
+        }
+    }
+    // CONFIRM -> PROGRESS -> RESULT (the judgment, DRY)
+    feed(b'\r');
+    let (result_ok, grant, pass, reason, stages_dry, offered) = match M.lock().as_ref() {
+        Some(m) => (
+            m.screen == Screen::Result,
+            m.outcome.as_ref().is_some_and(|o| o.0),
+            m.outcome.as_ref().is_some_and(|o| o.1),
+            m.outcome.as_ref().map_or(String::new(), |o| o.2.clone()),
+            // nothing past the grant ran: every later stage that was reported is `dry`
+            m.stages.iter().filter(|(n, _)| matches!(n.as_str(), "snapshot" | "gpt" | "esp" | "unafs" | "fsck")).all(|(_, w)| w.starts_with("dry") || w.starts_with("fail (plan")),
+            m.offered_reboot,
+        ),
+        None => (false, false, false, String::new(), false, false),
+    };
+    // `r` on the result screen is refused under the fixture; Esc gives the chooser back.
+    feed(b'r');
+    let (visited, painted) = M.lock().as_ref().map_or((0, 0), |m| (m.visited, m.painted));
+    feed(0x1b);
+    let left = !ACTIVE.load(Ordering::Acquire);
+    TEST.store(false, Ordering::Release);
+    super::repaint();
+    // The expectation is the verdict's: empty / ours / typed-foreign are issued; boot, live root,
+    // unreadable and the synthetic stand-in (no disk on its port) are refused.
+    let expect_issued = kind.is_some_and(|k| !k.refused()) && disk != "synthetic";
+    let screens: Vec<&str> = ALL.iter().filter(|s| visited & painted & s.bit() != 0).map(|s| s.tag()).collect();
+    let all5 = screens.len() == 5;
+    let pass_all = census_ok && layout_ok && defaults && negative_ok && result_ok && offered && left && stages_dry && all5 && grant == expect_issued && (!grant || pass);
+    serial_println!(
+        "[install3] disk={} verdict={} confirmation={} negative={} layout_defaults={} stages_dry={} reboot_offered={} outcome={} ({})",
+        disk,
+        kind.map_or("none", |k| k.tag()),
+        if kind.is_some_and(|k| k.typed()) { "typed-name" } else { "one-press" },
+        if kind.is_some_and(|k| k.typed()) { if negative_ok { "refused" } else { "ADMITTED" } } else { "n/a" },
+        defaults as u8,
+        stages_dry as u8,
+        offered as u8,
+        if pass { "pass" } else { "no" },
+        reason
+    );
+    serial_println!(
+        ":: INSTALL3: screens={} grant={} dry_run=1 -> {} ::",
+        if screens.is_empty() { alloc::string::String::from("none") } else { screens.join(",") },
+        if grant { "issued" } else { "refused" },
+        if pass_all { "PASS" } else { "FAIL" }
+    );
+}
