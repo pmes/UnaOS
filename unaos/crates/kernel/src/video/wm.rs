@@ -18089,7 +18089,7 @@ fn occ_clip(rows: &[Window], i: usize, shell: u32, pw: usize, ph: usize) -> OccC
             if b.2 == 0 || b.3 == 0 || !boxes_overlap(me, b) {
                 continue;
             }
-            c.boxes[c.n] = b;
+            c.boxes.push(b); // PANICOCC (flight 24): WINDOWCAP-2 made `boxes` a Vec but left this indexed write — `OccClip::none()` is EMPTY, so the first window under another panicked `index out of bounds: the len is 0` (Peter: the console tile press)
             c.n += 1;
         }
         // WCK5 — the strip, admitted for every subject it meets. No `(z, id)`, for the reason in the
