@@ -13,8 +13,12 @@
 //! - [`raster`]: exact-area, nonzero, 256-level scanline rasterizer with subpixel origins, no hinting.
 //! - [`cache`]: glyph bitmaps keyed by (font, glyph, size, subpixel x/y).
 //! - [`layout`]: OpenType Layout common tables, GSUB single/ligature, GPOS pair, GDEF, legacy `kern`.
-//! - [`shape`]: Latin/Greek/Cyrillic shaping, measuring, line layout, drawing.
-//! - [`linebreak`]: UAX #14 for the scripts above, checked against LineBreakTest-17.0.0.
+//! - [`shape`]: bidi-aware shaping for every script the OpenType engine ([`ot`]: GSUB 1–8, GPOS 1–9) and the
+//!   complex shapers (Arabic joining, Devanagari, Thai, Hebrew) cover; font fallback stacks; measuring, line
+//!   layout, drawing. Glyph- and cluster-identical to HarfBuzz on the FONTBIDI KATs.
+//! - [`bidi`] (UAX #9), [`grapheme`] (UAX #29), [`script`] (Scripts + Script_Extensions itemizer),
+//!   [`normalize`] (UAX #15 NFC/NFD), [`linebreak`] (UAX #14, every class) — tables generated from UCD 17.0.0
+//!   ([`ucd`]) and proven on Unicode's conformance files in full (FONTBIDI, SR56).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -48,4 +52,4 @@ pub use font::{Error, Font, Os2, Outlines, Post};
 pub use path::{OutlineSink, Path, PathCmd};
 pub use raster::{rasterize_glyph, rasterize_glyph_mode, GlyphBitmap, RenderMode};
 pub use bidi::Direction;
-pub use shape::{draw_text, layout_lines, measure, shape, shape_dir, shape_run, Canvas, GlyphPos, Line, ShapeOptions};
+pub use shape::{draw_text, layout_lines, measure, shape, shape_dir, shape_fallback, shape_run, Canvas, GlyphPos, Line, ShapeOptions};

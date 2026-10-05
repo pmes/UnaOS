@@ -619,6 +619,53 @@ pub fn shape_dir(font: &Font, text: &str, opts: &ShapeOptions, dir: Direction) -
     out
 }
 
+/// Shape `text` over a font fallback list: bidi runs in visual order, split into script runs, each split again into
+/// segments of grapheme clusters by the first font whose cmap covers the whole cluster (font 0 when none does) —
+/// how a browser falls back per cluster. Returns (font index, glyph) pairs in visual order; advances are in that
+/// font's units.
+pub fn shape_fallback(fonts: &[&Font], text: &str, opts: &ShapeOptions, dir: Direction) -> Vec<(usize, GlyphPos)> {
+    let mut out = Vec::new();
+    if text.is_empty() || fonts.is_empty() {
+        return out;
+    }
+    let pick = |s: usize, e: usize| -> usize {
+        let need = |c: char| !ucd::is_default_ignorable(c);
+        fonts
+            .iter()
+            .position(|f| text[s..e].chars().filter(|&c| need(c)).all(|c| f.glyph_index(c) != 0))
+            .unwrap_or(0)
+    };
+    let bidi = BidiInfo::new(text, dir);
+    for &(ps, pe, _) in &bidi.paragraphs {
+        for (rs, re, level) in bidi.visual_runs(ps, pe) {
+            let (bs, be) = (bidi.offsets[rs], bidi.offsets[re]);
+            let rtl = level & 1 == 1;
+            let mut runs = script::itemize(&text[bs..be]);
+            if rtl {
+                runs.reverse();
+            }
+            for (s, e, sc) in runs {
+                let (s, e) = (bs + s, bs + e);
+                let mut segs: Vec<(usize, usize, usize)> = Vec::new();
+                for (cs, ce) in crate::grapheme::clusters(&text[s..e]) {
+                    let f = pick(s + cs, s + ce);
+                    match segs.last_mut() {
+                        Some(last) if last.2 == f => last.1 = s + ce,
+                        _ => segs.push((s + cs, s + ce, f)),
+                    }
+                }
+                if rtl {
+                    segs.reverse();
+                }
+                for (a, b, f) in segs {
+                    out.extend(shape_run(fonts[f], text, a, b, sc, rtl, opts).into_iter().map(|g| (f, g)));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Shape `text` into positioned glyphs (font units), visual order, paragraph direction by UAX #9 P2/P3.
 pub fn shape(font: &Font, text: &str, opts: &ShapeOptions) -> Vec<GlyphPos> {
     shape_dir(font, text, opts, Direction::Auto)

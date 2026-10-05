@@ -28,6 +28,8 @@ fn complex_scripts_match_harfbuzz() {
                     std::fs::read(format!("/usr/share/fonts/truetype/dejavu/{}", f[0]))
                         .ok()
                         .filter(|d| common::sha256_hex(d) == f[1])
+                } else if let Some(d) = std::env::var_os("FONTBIDI_FONT_DIR").filter(|_| !f[0].starts_with("Noto")) {
+                    std::fs::read(std::path::Path::new(&d).join(f[0])).ok()
                 } else {
                     noto_font(f[0], f[1])
                 }

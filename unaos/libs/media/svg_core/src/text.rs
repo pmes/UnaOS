@@ -311,23 +311,33 @@ pub fn layout(r: &Renderer, node: usize, ctx: &Ctx, parent: &Style) -> Option<La
             v
         };
         let opts = ShapeOptions { kerning: st0.kerning, ligatures: st0.letter_spacing == 0.0 };
-        let glyphs = font_core::shape(&font, &text, &opts);
+        // font_core returns glyphs in VISUAL order (UAX #9 + per-run direction). Only the run's first LOGICAL
+        // character can carry an absolute x/y (the run is cut there), so it positions the run's start before any
+        // glyph is placed; dx/dy of the others apply as their clusters come by.
+        // The paragraph direction is CSS `direction` (initial ltr), not UAX #9 P2/P3 — as in a browser.
+        let dir = if st0.rtl { font_core::Direction::Rtl } else { font_core::Direction::Ltr };
+        let glyphs = font_core::shape_dir(&font, &text, &opts, dir);
+        {
+            let c = &chars[i];
+            if c.x.is_some() || c.y.is_some() {
+                if let Some(x) = c.x {
+                    px = x;
+                }
+                if let Some(y) = c.y {
+                    py = y;
+                }
+                if !placed.is_empty() {
+                    chunk += 1;
+                }
+            }
+            px += c.dx;
+            py += c.dy;
+        }
         for (gi, g) in glyphs.iter().enumerate() {
             let ci = i + byte_to_char[g.cluster.min(text.len())];
             let cluster_start = gi == 0 || glyphs[gi - 1].cluster != g.cluster;
-            if cluster_start {
+            if cluster_start && ci != i {
                 let c = &chars[ci];
-                if c.x.is_some() || c.y.is_some() {
-                    if let Some(x) = c.x {
-                        px = x;
-                    }
-                    if let Some(y) = c.y {
-                        py = y;
-                    }
-                    if !placed.is_empty() {
-                        chunk += 1;
-                    }
-                }
                 px += c.dx;
                 py += c.dy;
             }
