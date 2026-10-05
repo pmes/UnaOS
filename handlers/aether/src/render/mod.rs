@@ -1008,7 +1008,17 @@ pub fn canvas_background(layout: &LayoutTree) -> Option<(u8, u8, u8)> {
         }
         None
     };
-    let bg = |id: Option<NodeId>| id.and_then(|i| layout.paint_map.get(&i)).and_then(|p| p.background);
+    let bg = |id: Option<NodeId>| {
+        let p = id.and_then(|i| layout.paint_map.get(&i))?;
+        let c = p.background?;
+        let a = p.bg_alpha.unwrap_or(1.0);
+        if a <= 0.0 {
+            return None;
+        }
+        // Over the white the UA canvas starts as.
+        let mix = |v: u8| (v as f32 * a + 255.0 * (1.0 - a)).round() as u8;
+        Some((mix(c.0), mix(c.1), mix(c.2)))
+    };
     bg(find("html")).or_else(|| bg(find("body")))
 }
 
@@ -1501,21 +1511,26 @@ pub fn render_frame(
                     let radii = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
                     effects::paint_shadows(sh, box_sx, box_sy, bw, bh, radii, width, height, &boxpaint::sdf, &mut blend_at);
                 }
-                if fancy && mask.is_none() && spec.background.is_some() {
+                // css-color-4: a translucent background composites source-over.
+                let bga = spec.bg_alpha.unwrap_or(1.0).clamp(0.0, 1.0);
+                let background = spec.background.filter(|_| bga > 0.0);
+                if fancy && mask.is_none() && background.is_some() {
+                    let mut blend_a = |x: u32, y: u32, c: (u8, u8, u8), a: f32| blend_at(x, y, c, a * bga);
                     boxpaint::paint(
                         box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
-                        [None; 4], spec.background, width, height, &mut blend_at,
+                        [None; 4], background, width, height, &mut blend_a,
                     );
-                } else if let Some(bg) = spec.background {
+                } else if let Some(bg) = background {
+                    let ba = (bga * 255.0).round() as u32;
                     for y in y_start..end_y {
                         for x in x_start..end_x {
                             if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
                                 continue;
                             }
-                            match mask_alpha(x, y) {
+                            match mask_alpha(x, y) as u32 * ba / 255 {
                                 0 => {}
                                 255 => put_px(surface, width, x, y, bg),
-                                a => blend_px(surface, width, x, y, bg, a),
+                                a => blend_px(surface, width, x, y, bg, a as u8),
                             }
                         }
                     }
@@ -1568,6 +1583,34 @@ pub fn render_frame(
                             }
                         }
                     }
+                }
+
+                // Inset box shadows (§7.1.3): over the background, under the
+                // border and content, inside the padding box.
+                if let Some(sh) = spec.shadows.as_ref().filter(|s| s.iter().any(|s| s.inset)) {
+                    let (bl, bt) = (layout_box.border.left, layout_box.border.top);
+                    let (br, bb) = (layout_box.border.right, layout_box.border.bottom);
+                    let outer = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
+                    let inner = [
+                        (outer[0] - bl.max(bt)).max(0.0),
+                        (outer[1] - br.max(bt)).max(0.0),
+                        (outer[2] - br.max(bb)).max(0.0),
+                        (outer[3] - bl.max(bb)).max(0.0),
+                    ];
+                    let mut blend_i = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                        if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                            return;
+                        }
+                        if a >= 0.999 {
+                            put_px(surface, width, x, y, c);
+                        } else if a > 0.0 {
+                            blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                        }
+                    };
+                    effects::paint_inset_shadows(
+                        sh, box_sx + bl, box_sy + bt, (bw - bl - br).max(0.0), (bh - bt - bb).max(0.0), inner,
+                        width, height, &boxpaint::sdf, &mut blend_i,
+                    );
                 }
 
                 if tag == "img" {
@@ -1784,7 +1827,9 @@ pub fn render_frame(
                     for i in 0..4 {
                         bs[i] = sides[i].filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
                     }
+                    let bda = spec.border_alpha.unwrap_or(1.0);
                     let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                        let a = a * bda;
                         if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
                             return;
                         }
@@ -1811,6 +1856,7 @@ pub fn render_frame(
                     // bottom border across the last visible row.
                     let (bx0, by0) = (box_sx, box_sy);
                     let (bx1, by1) = (box_sx + bw, box_sy + bh);
+                    let bda = (spec.border_alpha.unwrap_or(1.0).clamp(0.0, 1.0) * 255.0).round() as u8;
                     let mut stroke = |x0: f32, y0: f32, x1: f32, y1: f32, color: (u8, u8, u8)| {
                         let x0 = x0.max(0.0) as u32;
                         let y0 = y0.max(0.0) as u32;
@@ -1819,7 +1865,11 @@ pub fn render_frame(
                         for y in y0..y1 {
                             for x in x0..x1 {
                                 if in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
-                                    put_px(surface, width, x, y, color);
+                                    if bda == 255 {
+                                        put_px(surface, width, x, y, color);
+                                    } else if bda > 0 {
+                                        blend_px(surface, width, x, y, color, bda);
+                                    }
                                 }
                             }
                         }
@@ -1961,6 +2011,45 @@ pub fn render_frame(
         } else {
             clip
         };
+        // overflow clipping to a ROUNDED box (css-backgrounds-3 §5.3): the
+        // children paint against the rectangular clip, then every pixel of
+        // the box outside its rounded padding box returns to the backdrop
+        // (mixed by coverage at the curve) — exact for the corners.
+        let round_clip = layout
+            .paint_map
+            .get(&node_id)
+            .filter(|p| p.clip.unwrap_or(false) && p.radius.is_some_and(|r| r.iter().any(|&v| v != 0.0)))
+            .map(|p| {
+                let (bw, bh) = (layout_box.size.width, layout_box.size.height);
+                let outer = boxpaint::used_radii(p.radius.unwrap_or([0.0; 4]), bw, bh);
+                let b = layout_box.border;
+                let inner = [
+                    (outer[0] - b.left.max(b.top)).max(0.0),
+                    (outer[1] - b.right.max(b.top)).max(0.0),
+                    (outer[2] - b.right.max(b.bottom)).max(0.0),
+                    (outer[3] - b.left.max(b.bottom)).max(0.0),
+                ];
+                let (x0, y0) = (current_x - sx as f32 + b.left, current_y - sy as f32 + b.top);
+                ((x0, y0, x0 + bw - b.left - b.right, y0 + bh - b.top - b.bottom), inner, surface.to_vec())
+            });
+        let finish_round_clip = |surface: &mut [u8]| {
+            if let Some(((x0, y0, x1, y1), r, snap)) = &round_clip {
+                let (ax, ay) = (x0.floor().max(0.0) as u32, y0.floor().max(0.0) as u32);
+                let (bx, by) = ((x1.ceil().max(0.0) as u32).min(width), (y1.ceil().max(0.0) as u32).min(height));
+                for y in ay..by {
+                    for x in ax..bx {
+                        let cov = (0.5 - boxpaint::sdf(x as f32 + 0.5, y as f32 + 0.5, *x0, *y0, *x1, *y1, *r)).clamp(0.0, 1.0);
+                        if cov >= 1.0 {
+                            continue;
+                        }
+                        let i = ((y * width + x) * 4) as usize;
+                        for k in 0..3 {
+                            surface[i + k] = (snap[i + k] as f32 * (1.0 - cov) + surface[i + k] as f32 * cov).round() as u8;
+                        }
+                    }
+                }
+            }
+        };
         // A stacking context (Appendix E): its layers, collected through the
         // boxes it paints in normal flow; negative z-index under that flow.
         let mut layers: Vec<Layer> = Vec::new();
@@ -1980,6 +2069,7 @@ pub fn render_frame(
         paint_layers(&layers[..split], surface);
         if child_clip.2 <= child_clip.0 || child_clip.3 <= child_clip.1 {
             paint_layers(&layers[split..], surface);
+            finish_round_clip(surface);
             return; // fully clipped out — nothing below can paint
         }
         if let Some(ifc) = ifc {
@@ -2095,7 +2185,12 @@ pub fn render_frame(
                         }
                         let rounded = radius.iter().any(|&r| r != 0.0)
                             || sides.iter().any(|s| s.is_some_and(|s| s.2 != 0));
+                        let bga = spec.bg_alpha.unwrap_or(1.0);
+                        let bda = spec.border_alpha.unwrap_or(1.0);
+                        let bg_rgb = spec.background;
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                            // Background and border colours composite at their alpha.
+                            let a = a * if Some(c) == bg_rgb { bga } else { bda };
                             if !in_damage(x, y, damage_rects) || !in_clip(x, y, child_clip) {
                                 return;
                             }
@@ -2194,6 +2289,7 @@ pub fn render_frame(
         // Steps 6-7: z-index auto/0 positioned boxes in tree order, then
         // positive z-index ascending.
         paint_layers(&layers[split..], surface);
+        finish_round_clip(surface);
     }
 
     let root_inherited = Inherited {

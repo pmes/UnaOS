@@ -133,6 +133,10 @@ pub struct PaintStyle {
     pub opacity: Option<f32>,
     /// table-layout: fixed (true) / auto (false). On tables.
     pub table_fixed: Option<bool>,
+    /// Alpha of the background colour (css-color-4; absent = opaque).
+    pub bg_alpha: Option<f32>,
+    /// Alpha of the border colour(s) (absent = opaque).
+    pub border_alpha: Option<f32>,
     /// How `font_size` was specified: (0, f) = f x the parent's font-size
     /// (em, %, smaller/larger), (1, f) = f x the root's (rem), (2, _) =
     /// absolute (font_size as is).

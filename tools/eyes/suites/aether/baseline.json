@@ -11,9 +11,9 @@
       "ssim": 0.9877
     },
     "03-card-gallery": {
-      "mismatch": 0.64,
+      "mismatch": 0.6,
       "missing": 0,
-      "ssim": 0.9935
+      "ssim": 0.9947
     },
     "04-sticky-nav": {
       "mismatch": 3.04,
@@ -109,6 +109,11 @@
       "mismatch": 1.11,
       "missing": 0,
       "ssim": 0.9871
+    },
+    "21-paint-effects": {
+      "mismatch": 0.01,
+      "missing": 0,
+      "ssim": 0.9996
     }
   },
   "thresholds": {

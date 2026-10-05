@@ -419,21 +419,32 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             other => crate::ledger::record_css(&format!("justify-content-value:{}", other)),
         },
         "background-color" => {
-            if !is_neutral_keyword(value) {
-                match parse_color_str(value) {
-                    Some(c) => style.paint.background = Some(c),
+            if value.eq_ignore_ascii_case("transparent") {
+                style.paint.bg_alpha = Some(0.0);
+            } else if !is_neutral_keyword(value) {
+                match crate::render::effects::parse_color_alpha(value) {
+                    // css-color-4 §4.2: an rgba()/#rrggbbaa background is
+                    // composited source-over, not painted opaque.
+                    Some((c, a)) => {
+                        style.paint.background = Some(c);
+                        style.paint.bg_alpha = Some(a);
+                    }
                     None => crate::ledger::record_css(&format!("background-value:{}", clip(value))),
                 }
             }
         }
-        "background-image" if value.to_ascii_lowercase().contains("linear-gradient(") => {
-            style.paint.bg_gradient = crate::render::effects::parse_linear_gradient(value).map(Some);
+        "background-image" if value.to_ascii_lowercase().contains("-gradient(") => {
+            style.paint.bg_gradient = crate::render::effects::parse_gradient(value).map(Some);
         }
-        "background" if value.to_ascii_lowercase().contains("linear-gradient(") => {
-            // A gradient layer (css-images-3 §3.1) plus any colour outside it.
-            style.paint.bg_gradient = crate::render::effects::parse_linear_gradient(value).map(Some);
+        "background" if value.to_ascii_lowercase().contains("-gradient(") => {
+            // A gradient layer (css-images-3 §3.1, §3.2) plus any colour outside it.
+            style.paint.bg_gradient = crate::render::effects::parse_gradient(value).map(Some);
             let lower = value.to_ascii_lowercase();
-            let start = lower.find("repeating-linear-gradient(").or_else(|| lower.find("linear-gradient(")).unwrap_or(0);
+            let start = ["repeating-linear-gradient(", "repeating-radial-gradient(", "linear-gradient(", "radial-gradient("]
+                .iter()
+                .filter_map(|n| lower.find(n))
+                .min()
+                .unwrap_or(0);
             let mut depth = 0;
             let mut end = lower.len();
             for (i, c) in lower[start..].char_indices() {
@@ -453,6 +464,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             for part in split_top_level(&rest) {
                 if let Some(c) = parse_color_str(part) {
                     style.paint.background = Some(c);
+                    style.paint.bg_alpha = Some(color_alpha(part));
                 }
             }
         }
@@ -524,14 +536,20 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 }
                 if let Some(c) = parse_color_str(part) {
                     style.paint.background = Some(c);
+                    style.paint.bg_alpha = Some(color_alpha(part));
                     got_color = true;
                     break;
                 }
             }
             // Function colors with spaces (rgb(1, 2, 3)) survive as whole-value.
-            if !got_color && !is_neutral_keyword(value) && style.paint.bg_image.is_none() {
-                match parse_color_str(value) {
-                    Some(c) => style.paint.background = Some(c),
+            if !got_color && value.trim().eq_ignore_ascii_case("transparent") {
+                style.paint.bg_alpha = Some(0.0);
+            } else if !got_color && !is_neutral_keyword(value) && style.paint.bg_image.is_none() {
+                match crate::render::effects::parse_color_alpha(value) {
+                    Some((c, a)) => {
+                        style.paint.background = Some(c);
+                        style.paint.bg_alpha = Some(a);
+                    }
                     None => crate::ledger::record_css(&format!("background-value:{}", clip(value))),
                 }
             }
@@ -716,7 +734,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             let mut width = 1.0f32;
             let mut color = (128, 128, 128);
             let mut got_any = false;
-            for part in v.split_whitespace() {
+            for part in split_top_level(v) {
                 if let Some(px) = parse_px(part).filter(|_| part.ends_with("px") || is_font_relative(part)) {
                     width = px;
                     got_any = true;
@@ -728,6 +746,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 } else if let Some(c) = parse_color_str(part) {
                     color = c;
                     got_any = true;
+                    style.paint.border_alpha = Some(color_alpha(part));
                 }
             }
             if got_any {
@@ -913,7 +932,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             let mut width = 1.0f32;
             let mut color = (128, 128, 128);
             let mut got_any = false;
-            for part in v.split_whitespace() {
+            for part in split_top_level(v) {
                 if let Some(px) = parse_px(part).filter(|_| part.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '.')) {
                     width = px;
                     got_any = true;
@@ -923,6 +942,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 } else if let Some(c) = parse_color_str(part) {
                     color = c;
                     got_any = true;
+                    style.paint.border_alpha = Some(color_alpha(part));
                 }
             }
             if got_any {
@@ -961,6 +981,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 return;
             }
             if let Some(c) = parse_color_str(value) {
+                style.paint.border_alpha = Some(color_alpha(value));
                 let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
                 for side in sides.iter_mut() {
                     let w = side.map(|(w, _)| w).unwrap_or(1.0);
@@ -2006,7 +2027,7 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
-        list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed,
+        list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
     );
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
@@ -2609,6 +2630,11 @@ thread_local! {
 /// parsed next; returns the previous one.
 pub(crate) fn set_font_ctx(ctx: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
     FONT_CTX.with(|c| c.replace(ctx))
+}
+
+/// The alpha of a colour value (1 for opaque or unparsable colours).
+fn color_alpha(v: &str) -> f32 {
+    crate::render::effects::parse_color_alpha(v).map(|c| c.1).unwrap_or(1.0)
 }
 
 /// The current font-relative basis (em, rem, ex, ch).

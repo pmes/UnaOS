@@ -1,5 +1,5 @@
-//! Paint effects: linear gradients (css-images-3 §3.1) and outer box
-//! shadows (css-backgrounds-3 §7.1). Parsing lives here too, next to the
+//! Paint effects: linear and radial gradients (css-images-3 §3.1, §3.2)
+//! and outer and inset box shadows (css-backgrounds-3 §7.1). Parsing lives here too, next to the
 //! painter, because both are pure value -> pixels functions.
 
 /// A colour with alpha (0..1).
@@ -72,6 +72,182 @@ pub struct Gradient {
     pub angle: f32,
     pub stops: Vec<(Rgba, Option<StopPos>)>,
     pub repeating: bool,
+    /// A radial gradient (css-images-3 §3.2) instead of a linear one.
+    pub radial: Option<Radial>,
+}
+
+/// The ending shape of a radial gradient.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Radial {
+    pub circle: bool,
+    /// Size keyword: 0 farthest-corner (initial), 1 closest-side,
+    /// 2 closest-corner, 3 farthest-side, 4 explicit (`radii`).
+    pub size: u8,
+    /// Explicit radii (rx, ry) — px when >= 0, a fraction of the box
+    /// width/height when < 0 (−0.5 = 50%).
+    pub radii: (f32, f32),
+    /// Centre position: px when >= 0 … stored as (value, is_fraction).
+    pub at: ((f32, bool), (f32, bool)),
+}
+
+/// Parses whichever gradient comes first in a background value.
+pub fn parse_gradient(value: &str) -> Option<Gradient> {
+    let lower = value.to_ascii_lowercase();
+    match (lower.find("radial-gradient("), lower.find("linear-gradient(")) {
+        (Some(r), Some(l)) if l < r => parse_linear_gradient(value),
+        (Some(_), _) => parse_radial_gradient(value),
+        _ => parse_linear_gradient(value),
+    }
+}
+
+/// The argument list of the first `name(` call (after `start`).
+fn call_args<'a>(lower: &'a str, open: usize) -> Option<&'a str> {
+    let mut depth = 1;
+    for (i, c) in lower[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&lower[open..open + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One `<position>` component: keyword, percentage or length.
+fn position_component(t: &str, horizontal: bool) -> Option<(f32, bool)> {
+    match t {
+        "center" => Some((0.5, true)),
+        "left" if horizontal => Some((0.0, true)),
+        "right" if horizontal => Some((1.0, true)),
+        "top" if !horizontal => Some((0.0, true)),
+        "bottom" if !horizontal => Some((1.0, true)),
+        _ => {
+            if let Some(p) = t.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+                Some((p / 100.0, true))
+            } else {
+                crate::css::parse_px(t).map(|px| (px, false))
+            }
+        }
+    }
+}
+
+/// Parses `radial-gradient([<shape> || <size>] [at <position>], stops)` and
+/// its repeating form (css-images-3 §3.2.1).
+pub fn parse_radial_gradient(value: &str) -> Option<Gradient> {
+    let lower = value.to_ascii_lowercase();
+    let (open, repeating) = match lower.find("repeating-radial-gradient(") {
+        Some(i) => (i + "repeating-radial-gradient(".len(), true),
+        None => (lower.find("radial-gradient(")? + "radial-gradient(".len(), false),
+    };
+    let args = split_commas(call_args(&lower, open)?);
+    let mut r = Radial { circle: false, size: 0, radii: (0.0, 0.0), at: ((0.5, true), (0.5, true)) };
+    let mut first = 0;
+    if let Some(a) = args.first() {
+        let (shape_part, at_part) = match a.find("at ") {
+            Some(i) if i == 0 || a[..i].ends_with(' ') => (&a[..i], Some(&a[i + 3..])),
+            _ => (&a[..], None),
+        };
+        let toks: Vec<&str> = shape_part.split_whitespace().collect();
+        let is_shape = at_part.is_some()
+            || toks.iter().all(|t| {
+                matches!(*t, "circle" | "ellipse" | "closest-side" | "closest-corner" | "farthest-side" | "farthest-corner")
+                    || crate::css::parse_px(t).is_some()
+                    || t.ends_with('%')
+            }) && !toks.is_empty();
+        if is_shape {
+            first = 1;
+            let mut lens: Vec<f32> = Vec::new();
+            for t in &toks {
+                match *t {
+                    "circle" => r.circle = true,
+                    "ellipse" => r.circle = false,
+                    "closest-side" => r.size = 1,
+                    "closest-corner" => r.size = 2,
+                    "farthest-side" => r.size = 3,
+                    "farthest-corner" => r.size = 0,
+                    t => {
+                        if let Some(p) = t.strip_suffix('%').and_then(|n| n.parse::<f32>().ok()) {
+                            lens.push(-p / 100.0);
+                        } else if let Some(px) = crate::css::parse_px(t) {
+                            lens.push(px.max(0.0));
+                        }
+                    }
+                }
+            }
+            if !lens.is_empty() {
+                r.size = 4;
+                if lens.len() == 1 && !toks.contains(&"ellipse") {
+                    r.circle = true;
+                }
+                r.radii = (lens[0], *lens.get(1).unwrap_or(&lens[0]));
+            }
+            if let Some(at) = at_part {
+                let p: Vec<&str> = at.split_whitespace().collect();
+                // One value: the other axis centres; a vertical keyword first swaps.
+                let (h, v) = match p.as_slice() {
+                    [x] if matches!(*x, "top" | "bottom") => ("center", *x),
+                    [x] => (*x, "center"),
+                    [x, y] if matches!(*x, "top" | "bottom") || matches!(*y, "left" | "right") => (*y, *x),
+                    [x, y, ..] => (*x, *y),
+                    [] => ("center", "center"),
+                };
+                r.at = (position_component(h, true)?, position_component(v, false)?);
+            }
+        }
+    }
+    let stops = parse_stops(&args[first..]);
+    (stops.len() >= 2).then_some(Gradient { angle: 180.0, stops, repeating, radial: Some(r) })
+}
+
+fn parse_stops(args: &[&str]) -> Vec<(Rgba, Option<StopPos>)> {
+    let mut stops = Vec::new();
+    for s in args {
+        let parts = crate::css::split_top_level(s);
+        let Some(c) = parts.first().and_then(|c| parse_color_alpha(c)) else { continue };
+        let pos = |p: &str| -> Option<StopPos> {
+            if let Some(f) = p.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+                Some(StopPos::Fraction(f / 100.0))
+            } else {
+                crate::css::parse_px(p).map(StopPos::Px)
+            }
+        };
+        let positions: Vec<StopPos> = parts[1..].iter().filter_map(|p| pos(p)).collect();
+        if positions.is_empty() {
+            stops.push((c, None));
+        }
+        for p in positions {
+            stops.push((c, Some(p)));
+        }
+    }
+    stops
+}
+
+/// The ending-shape radii (rx, ry) of a radial gradient centred at (cx, cy)
+/// in a w x h box (css-images-3 §3.2.2).
+fn radial_radii(r: &Radial, cx: f32, cy: f32, w: f32, h: f32) -> (f32, f32) {
+    let (dl, dr, dt, db) = (cx.abs(), (w - cx).abs(), cy.abs(), (h - cy).abs());
+    let (side_x_min, side_x_max) = (dl.min(dr), dl.max(dr));
+    let (side_y_min, side_y_max) = (dt.min(db), dt.max(db));
+    let res = |v: f32, basis: f32| if v < 0.0 { -v * basis } else { v };
+    match (r.size, r.circle) {
+        (4, true) => (res(r.radii.0, w), res(r.radii.0, w)),
+        (4, false) => (res(r.radii.0, w), res(r.radii.1, h)),
+        (1, true) => { let m = side_x_min.min(side_y_min); (m, m) }
+        (1, false) => (side_x_min, side_y_min),
+        (3, true) => { let m = side_x_max.max(side_y_max); (m, m) }
+        (3, false) => (side_x_max, side_y_max),
+        (2, true) => { let d = side_x_min.hypot(side_y_min); (d, d) }
+        (0, true) => { let d = side_x_max.hypot(side_y_max); (d, d) }
+        // Ellipses through a corner keep the closest/farthest-side aspect
+        // ratio, scaled by sqrt(2) (§3.2.2).
+        (2, false) => (side_x_min * std::f32::consts::SQRT_2, side_y_min * std::f32::consts::SQRT_2),
+        _ => (side_x_max * std::f32::consts::SQRT_2, side_y_max * std::f32::consts::SQRT_2),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -126,27 +302,8 @@ pub fn parse_linear_gradient(value: &str) -> Option<Gradient> {
             first = 1;
         }
     }
-    let mut stops = Vec::new();
-    for s in &args[first..] {
-        // colour [pos [pos]]: the colour may hold spaces inside ().
-        let parts = crate::css::split_top_level(s);
-        let Some(c) = parts.first().and_then(|c| parse_color_alpha(c)) else { continue };
-        let pos = |p: &str| -> Option<StopPos> {
-            if let Some(f) = p.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
-                Some(StopPos::Fraction(f / 100.0))
-            } else {
-                crate::css::parse_px(p).map(StopPos::Px)
-            }
-        };
-        let positions: Vec<StopPos> = parts[1..].iter().filter_map(|p| pos(p)).collect();
-        if positions.is_empty() {
-            stops.push((c, None));
-        }
-        for p in positions {
-            stops.push((c, Some(p)));
-        }
-    }
-    (stops.len() >= 2).then_some(Gradient { angle, stops, repeating })
+    let stops = parse_stops(&args[first..]);
+    (stops.len() >= 2).then_some(Gradient { angle, stops, repeating, radial: None })
 }
 
 fn parse_angle(a: &str) -> Option<f32> {
@@ -227,6 +384,36 @@ pub fn paint_gradient(
     g: &Gradient, x0: f32, y0: f32, w: f32, h: f32, screen_w: u32, screen_h: u32,
     coverage: &dyn Fn(f32, f32) -> f32, blend: &mut dyn FnMut(u32, u32, (u8, u8, u8), f32),
 ) {
+    if let Some(r) = &g.radial {
+        let cx = if r.at.0 .1 { r.at.0 .0 * w } else { r.at.0 .0 };
+        let cy = if r.at.1 .1 { r.at.1 .0 * h } else { r.at.1 .0 };
+        let (rx, ry) = radial_radii(r, cx, cy, w, h);
+        // The gradient ray runs from the centre to the ending shape: stop
+        // lengths resolve against rx (§3.2.3).
+        let stops = resolve_stops(g, rx);
+        let (first, last) = (stops[0].0, stops[stops.len() - 1].0);
+        let sx0 = x0.floor().max(0.0) as u32;
+        let sy0 = y0.floor().max(0.0) as u32;
+        let sx1 = ((x0 + w).ceil().max(0.0) as u32).min(screen_w);
+        let sy1 = ((y0 + h).ceil().max(0.0) as u32).min(screen_h);
+        for py in sy0..sy1 {
+            for px in sx0..sx1 {
+                let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                let cov = coverage(fx, fy);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let (dx, dy) = (fx - x0 - cx, fy - y0 - cy);
+                let mut t = if rx > 0.0 && ry > 0.0 { ((dx / rx).powi(2) + (dy / ry).powi(2)).sqrt() } else { 1.0 };
+                if g.repeating && last > first {
+                    t = first + (t - first).rem_euclid(last - first);
+                }
+                let (col, a) = color_at(&stops, t);
+                blend(px, py, col, a * cov);
+            }
+        }
+        return;
+    }
     let rad = g.angle.to_radians();
     let (s, c) = (rad.sin(), rad.cos());
     // §3.1.1: the gradient line passes through the centre; its length makes
@@ -264,9 +451,11 @@ pub struct Shadow {
     pub blur: f32,
     pub spread: f32,
     pub color: Rgba,
+    /// An inner shadow (painted inside the padding box, §7.1.3).
+    pub inset: bool,
 }
 
-/// Parses `box-shadow` (outer shadows; `inset` ones are skipped).
+/// Parses `box-shadow`: every layer, outer and `inset`.
 pub fn parse_box_shadow(value: &str) -> Vec<Shadow> {
     let mut out = Vec::new();
     if value.trim().eq_ignore_ascii_case("none") {
@@ -274,14 +463,14 @@ pub fn parse_box_shadow(value: &str) -> Vec<Shadow> {
     }
     for layer in split_commas(value) {
         let parts = crate::css::split_top_level(layer);
-        if parts.iter().any(|p| p.eq_ignore_ascii_case("inset")) {
-            continue;
-        }
+        let inset = parts.iter().any(|p| p.eq_ignore_ascii_case("inset"));
         let mut lens = Vec::new();
         let mut color = ((0, 0, 0), 1.0);
         for p in parts {
             if let Some(l) = crate::css::parse_px(p).filter(|_| p.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '.')) {
                 lens.push(l);
+            } else if p.eq_ignore_ascii_case("inset") {
+                // the layer kind, not a colour
             } else if let Some(c) = parse_color_alpha(p) {
                 color = c;
             }
@@ -293,6 +482,7 @@ pub fn parse_box_shadow(value: &str) -> Vec<Shadow> {
                 blur: lens.get(2).copied().unwrap_or(0.0).max(0.0),
                 spread: lens.get(3).copied().unwrap_or(0.0),
                 color,
+                inset,
             });
         }
     }
@@ -318,7 +508,7 @@ pub fn paint_shadows(
     sdf: &dyn Fn(f32, f32, f32, f32, f32, f32, [f32; 4]) -> f32,
     blend: &mut dyn FnMut(u32, u32, (u8, u8, u8), f32),
 ) {
-    for s in shadows.iter().rev() {
+    for s in shadows.iter().rev().filter(|s| !s.inset) {
         let sigma = s.blur / 2.0;
         let (bx0, by0) = (x0 + s.dx - s.spread, y0 + s.dy - s.spread);
         let (bx1, by1) = (x0 + w + s.dx + s.spread, y0 + h + s.dy + s.spread);
@@ -350,6 +540,51 @@ pub fn paint_shadows(
     }
 }
 
+/// Paints inset shadows (§7.1.3) inside the padding box (x0, y0, w, h, inner
+/// radii): the shadow is everything inside the padding box OUTSIDE the
+/// shape made by offsetting the padding box by (dx, dy) and shrinking it by
+/// the spread, blurred by a Gaussian of sigma = blur / 2.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_inset_shadows(
+    shadows: &[Shadow], x0: f32, y0: f32, w: f32, h: f32, radii: [f32; 4], screen_w: u32, screen_h: u32,
+    sdf: &dyn Fn(f32, f32, f32, f32, f32, f32, [f32; 4]) -> f32,
+    blend: &mut dyn FnMut(u32, u32, (u8, u8, u8), f32),
+) {
+    let sx0 = x0.floor().max(0.0) as u32;
+    let sy0 = y0.floor().max(0.0) as u32;
+    let sx1 = ((x0 + w).ceil().max(0.0) as u32).min(screen_w);
+    let sy1 = ((y0 + h).ceil().max(0.0) as u32).min(screen_h);
+    for s in shadows.iter().rev().filter(|s| s.inset) {
+        let sigma = s.blur / 2.0;
+        let (ix0, iy0) = (x0 + s.dx + s.spread, y0 + s.dy + s.spread);
+        let (ix1, iy1) = (x0 + w + s.dx - s.spread, y0 + h + s.dy - s.spread);
+        let r = radii.map(|v| if v > 0.0 { (v - s.spread).max(0.0) } else { 0.0 });
+        for py in sy0..sy1 {
+            for px in sx0..sx1 {
+                let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                let inside_pad = (0.5 - sdf(fx, fy, x0, y0, x0 + w, y0 + h, radii)).clamp(0.0, 1.0);
+                if inside_pad <= 0.0 {
+                    continue;
+                }
+                let a = if ix1 <= ix0 || iy1 <= iy0 {
+                    1.0
+                } else {
+                    let d = sdf(fx, fy, ix0, iy0, ix1, iy1, r);
+                    if sigma > 0.0 {
+                        0.5 * (1.0 + erf(d / (sigma * std::f32::consts::SQRT_2)))
+                    } else {
+                        (0.5 + d).clamp(0.0, 1.0)
+                    }
+                };
+                let a = a * s.color.1 * inside_pad;
+                if a > 0.002 {
+                    blend(px, py, s.color.0, a);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,12 +607,37 @@ mod tests {
     }
 
     #[test]
+    fn radial_gradient_kat() {
+        // css-images-3 §3.2.2: an ellipse at farthest-corner through the
+        // corners of a 200x100 box centred: radii = (100, 50) x sqrt 2.
+        let g = parse_gradient("radial-gradient(#fff, #000)").unwrap();
+        let r = g.radial.as_ref().unwrap();
+        let (rx, ry) = radial_radii(r, 100.0, 50.0, 200.0, 100.0);
+        assert!((rx - 141.42).abs() < 0.01 && (ry - 70.71).abs() < 0.01);
+        // circle closest-side at 25% 50%: 50px.
+        let g = parse_gradient("radial-gradient(circle closest-side at 25% 50%, red, blue)").unwrap();
+        let r = g.radial.as_ref().unwrap();
+        assert!(r.circle && r.size == 1 && r.at.0 == (0.25, true));
+        assert_eq!(radial_radii(r, 50.0, 50.0, 200.0, 100.0), (50.0, 50.0));
+        // An explicit circle radius; linear still parses as linear.
+        let g = parse_gradient("radial-gradient(20px at 10px 10px, red, blue)").unwrap();
+        assert_eq!(radial_radii(g.radial.as_ref().unwrap(), 10.0, 10.0, 50.0, 50.0), (20.0, 20.0));
+        assert!(parse_gradient("linear-gradient(red, blue)").unwrap().radial.is_none());
+        // Painted: the centre is the first stop, past the shape the last.
+        let mut px = std::collections::HashMap::new();
+        let g = parse_gradient("radial-gradient(circle 10px at 10px 10px, #ff0000, #0000ff)").unwrap();
+        paint_gradient(&g, 0.0, 0.0, 30.0, 30.0, 30, 30, &|_, _| 1.0, &mut |x, y, c, _| { px.insert((x, y), c); });
+        assert!(px[&(10, 10)].0 > 220 && px[&(25, 25)].2 > 240, "{:?} {:?}", px[&(10, 10)], px[&(25, 25)]);
+    }
+
+    #[test]
     fn box_shadow_parse_kat() {
         let s = parse_box_shadow("0 1px 4px rgba(0,0,0,.2)");
         assert_eq!(s.len(), 1);
         assert_eq!((s[0].dx, s[0].dy, s[0].blur, s[0].spread), (0.0, 1.0, 4.0, 0.0));
         assert!((s[0].color.1 - 0.2).abs() < 1e-6);
-        assert!(parse_box_shadow("inset 0 0 3px red").is_empty());
+        let i = parse_box_shadow("inset 0 0 3px red");
+        assert!(i.len() == 1 && i[0].inset && i[0].blur == 3.0);
         assert!((erf(1.0) - 0.842_700_8).abs() < 1e-5);
     }
 }

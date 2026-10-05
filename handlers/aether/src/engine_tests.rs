@@ -2539,6 +2539,34 @@ mod tests {
         assert_eq!(x, 30.0, "the line box is shortened by the float");
     }
 
+    /// css-color-4 / css-backgrounds-3 known answers: a 50% black background
+    /// over white is mid grey (source-over), a transparent one paints
+    /// nothing; an inset 0-blur shadow fills its offset band inside the
+    /// padding box; overflow:hidden with a radius hides a child's corner.
+    #[test]
+    fn test_paint_effects_kat() {
+        let t = laid_out(
+            r#"<html><body>
+            <div style="height:20px;background:rgba(0,0,0,0.5)"></div>
+            <div style="height:20px;background:#ff0000;background-color:transparent"></div>
+            <div style="height:40px;background:#ffffff;box-shadow:inset 10px 0 0 #0000ff"></div>
+            <div style="height:60px;width:60px;border-radius:30px;overflow:hidden;background:#00ff00"><div style="height:60px;background:#ff0000"></div></div>
+            </body></html>"#,
+            "body{margin:0}",
+        );
+        let (w, h) = (100u32, 160u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; (surface[i + 2], surface[i + 1], surface[i]) };
+        let g = px(50, 10);
+        assert!((g.0 as i32 - 128).abs() <= 2 && g.0 == g.1, "rgba(0,0,0,.5) over white: {g:?}");
+        assert_eq!(px(50, 30), (255, 255, 255), "transparent overrides the earlier colour");
+        assert_eq!(px(5, 60), (0, 0, 255), "inset shadow band at the left inside edge");
+        assert_eq!(px(50, 60), (255, 255, 255), "inside the shadow's inner shape: the background");
+        assert_eq!(px(2, 82), (255, 255, 255), "the rounded clip hides the child's corner");
+        assert_eq!(px(30, 110), (255, 0, 0), "the child paints inside the rounded box");
+    }
+
     /// CSS 2.2 §17.5.2 / §17.2.1 known answers: a rowspan cell covers its
     /// column in the rows below (their first cell starts in the next
     /// column) and is as tall as the rows it spans; a narrow table never
