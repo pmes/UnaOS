@@ -190,6 +190,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f102c477fd4ec864c149803bf606ecc23bc9329602ec0f99073a728abf454abc"
 
 [[package]]
+name = "pixel_core"
+version = "0.1.0"
+dependencies = [
+ "vp8_core",
+]
+
+[[package]]
 name = "prefs_core"
 version = "0.1.0"
 
@@ -470,6 +477,7 @@ dependencies = [
  "midden_core",
  "net",
  "noto-sans-mono-bitmap",
+ "pixel_core",
  "prefs_core",
  "rast",
  "smoltcp",
@@ -516,6 +524,10 @@ name = "volatile"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af8ca9a5d4debca0633e697c88269395493cebf2e10db21ca2dbde37c1356452"
+
+[[package]]
+name = "vp8_core"
+version = "0.1.0"
 
 [[package]]
 name = "wifi_core"

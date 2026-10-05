@@ -170,6 +170,39 @@ pub enum SMessage {
     /// absent or undecodable icon simply fires nothing.
     BrowserFaviconChanged { width: u32, height: u32, rgba: Vec<u8> },
 
+    // --- STRIA (A/V playback; PLAYBACK, LEDGER SR26) ---
+    // A session is keyed by the media `url` the request named (the same string `PlayMedia`
+    // carried), so a requester correlates replies without a handle round trip. Requests:
+    // `PlayMedia` (open + play), `MediaPoster` (open, present the first frame, stay paused),
+    // `MediaPause`, `MediaResume`, `MediaSeek`, `MediaStop`. Stria answers with `MediaOpened`
+    // once, `MediaFrame` per presented frame, then `MediaEnded` — or `MediaError`.
+    /// Open `url` and present its first frame only (a `<video>` poster), paused.
+    MediaPoster { url: String },
+    MediaPause { url: String },
+    MediaResume { url: String },
+    /// Seek to `position_ns` (lands on the last keyframe at or before it, then decodes forward).
+    MediaSeek { url: String, position_ns: u64 },
+    MediaStop { url: String },
+    /// Stria → requester: the stream is open. `video` / `audio` name the codecs ("" when the
+    /// track is absent); `real_video` is false when the frames are the labelled test-pattern
+    /// stand-in (no decoder for the codec yet); `audio_clock` is true when audio is playing and
+    /// is the master clock.
+    MediaOpened {
+        url: String,
+        duration_ns: u64,
+        width: u32,
+        height: u32,
+        video: String,
+        audio: String,
+        real_video: bool,
+        audio_clock: bool,
+    },
+    /// Stria → requester: a frame went on glass at `pts_ns`; tightly packed 8-bit RGBA.
+    MediaFrame { url: String, pts_ns: i64, width: u32, height: u32, rgba: Vec<u8> },
+    /// Stria → requester: playback reached the end (or was stopped).
+    MediaEnded { url: String, presented: u64, dropped: u64 },
+    MediaError { url: String, error: String },
+
     // --- EDITOR (The Code Pane) ---
     /// Load a document into the active editor pane. Fired when a file is
     /// selected for editing; the macOS `MacOSSpline` router pushes `content`
