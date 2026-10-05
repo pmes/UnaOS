@@ -208,6 +208,20 @@ impl RefMap {
         self.block_count.div_ceil(REFS_PER_LEAF)
     }
 
+    /// BOOT80 (rmbp B350): is leaf `idx` unchanged since the last commit — every count it holds
+    /// equal in the current and frozen views? The frozen view IS the persisted map (mount adopts both
+    /// from disk; `freeze` copies current after the commit that serialized it; nothing else writes
+    /// `frozen` except `try_grow`, whose new leaves the commit treats as new), so a clean leaf's
+    /// committed block already holds exactly the bytes [`leaf_bytes`](Self::leaf_bytes) would write.
+    pub fn leaf_clean(&self, idx: u64) -> bool {
+        let lo = (idx * REFS_PER_LEAF) as usize;
+        if lo >= self.current.len() {
+            return true;
+        }
+        let hi = core::cmp::min(self.current.len(), lo + REFS_PER_LEAF as usize);
+        self.current[lo..hi] == self.frozen[lo..hi]
+    }
+
     /// Serialize leaf `idx` of the CURRENT view into a 4096 B block image.
     pub fn leaf_bytes(&self, idx: u64) -> Vec<u8> {
         let mut buf = alloc::vec![0u8; crate::storage::BLOCK_SIZE as usize];

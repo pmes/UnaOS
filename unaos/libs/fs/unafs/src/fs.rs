@@ -631,8 +631,26 @@ impl<D: BlockDevice> UnaFS<D> {
         for b in core::mem::take(&mut self.imap_blocks) {
             self.refmap.decref(b);
         }
-        for b in core::mem::take(&mut self.refmap_blocks) {
-            self.refmap.decref(b);
+        // BOOT80 (rmbp B350): the committed refmap's LEAF blocks are candidates for reuse — a leaf
+        // whose counts this transaction did not change keeps its committed block (it is not
+        // rewritten, so nothing is overwritten in place). Before BOOT80 every commit rewrote ALL
+        // leaves: 128 blocks on a 512 MiB volume, ~1050 single-sector writes per transaction on the
+        // rMBP card. Reuse needs the committed shape to be this commit's shape (same leaf count,
+        // same one/two-level index); otherwise (format, a grow, a lagging grow) every leaf is new.
+        let old_refmap = core::mem::take(&mut self.refmap_blocks);
+        let leaves_now = self.refmap.leaf_count();
+        let ppi = BLOCK_SIZE / 8;
+        let mids_now = if leaves_now > ppi { leaves_now.div_ceil(ppi) } else { 0 };
+        let mut reuse: Vec<Option<u64>> = Vec::new();
+        if !old_refmap.is_empty() && old_refmap.len() as u64 == 1 + mids_now + leaves_now {
+            for &b in &old_refmap[..1 + mids_now as usize] {
+                self.refmap.decref(b); // index + mids are rewritten every commit (they hold pointers)
+            }
+            reuse.extend(old_refmap[1 + mids_now as usize..].iter().map(|&b| Some(b)));
+        } else {
+            for b in old_refmap {
+                self.refmap.decref(b);
+            }
         }
 
         // 2. Inode map → fresh leaves + fresh index block.
@@ -687,8 +705,36 @@ impl<D: BlockDevice> UnaFS<D> {
             ref_mid_blocks.push(self.alloc_block()?);
         }
         let mut ref_leaf_blocks = Vec::with_capacity(refmap_leaves as usize);
-        for _ in 0..refmap_leaves {
-            ref_leaf_blocks.push(self.alloc_block()?);
+        let mut fresh_leaf = alloc::vec![true; refmap_leaves as usize];
+        if reuse.len() as u64 == refmap_leaves {
+            // BOOT80: a FIXPOINT over the candidates. Retiring a dirty leaf's old block and
+            // allocating its fresh one change counts in (possibly other) leaves, which may dirty a
+            // candidate that was clean a moment ago; each candidate converts at most once, so this
+            // ends after at most `refmap_leaves` rounds. On exit every remaining candidate is clean
+            // against the FINAL counts — its committed bytes are exactly what would be written.
+            for (l, r) in reuse.iter().enumerate() {
+                ref_leaf_blocks.push(r.unwrap_or(0));
+                fresh_leaf[l] = false;
+            }
+            loop {
+                let mut moved = false;
+                for l in 0..refmap_leaves as usize {
+                    if fresh_leaf[l] || self.refmap.leaf_clean(l as u64) {
+                        continue;
+                    }
+                    self.refmap.decref(ref_leaf_blocks[l]);
+                    ref_leaf_blocks[l] = self.alloc_block()?;
+                    fresh_leaf[l] = true;
+                    moved = true;
+                }
+                if !moved {
+                    break;
+                }
+            }
+        } else {
+            for _ in 0..refmap_leaves {
+                ref_leaf_blocks.push(self.alloc_block()?);
+            }
         }
         // Every allocation is done: the counts are final. Serialize.
         let mut ref_index = alloc::vec![0u8; BLOCK_SIZE as usize];
@@ -696,6 +742,9 @@ impl<D: BlockDevice> UnaFS<D> {
             // Leaves first, then each mid block carries its slice of leaf
             // pointers, then the top block carries the mid pointers.
             for (l, &leaf_block) in ref_leaf_blocks.iter().enumerate() {
+                if !fresh_leaf[l] {
+                    continue; // BOOT80: unchanged — its committed block stays
+                }
                 let leaf = self.refmap.leaf_bytes(l as u64);
                 self.write_fresh(leaf_block, &leaf)?;
             }
@@ -712,6 +761,9 @@ impl<D: BlockDevice> UnaFS<D> {
         } else {
             for (l, &leaf_block) in ref_leaf_blocks.iter().enumerate() {
                 ref_index[l * 8..l * 8 + 8].copy_from_slice(&leaf_block.to_le_bytes());
+                if !fresh_leaf[l] {
+                    continue; // BOOT80: unchanged — its committed block stays
+                }
                 let leaf = self.refmap.leaf_bytes(l as u64);
                 self.write_fresh(leaf_block, &leaf)?;
             }
@@ -2174,7 +2226,8 @@ impl<D: BlockDevice> UnaFS<D> {
     /// exactly one refcount per referencing root, so drop frees a block iff no
     /// remaining root reaches it). Refcount- and refmap-map blocks are NOT
     /// included: a snapshot retains the DATA tree, not the allocator (the live
-    /// refmap is rewritten every commit and is never snapshotted).
+    /// refmap is never snapshotted; BOOT80: its unchanged leaves are re-pointed, the changed ones
+    /// rewritten, every commit).
     ///
     /// Bounded against the volume span (the on-disk imap is untrusted input);
     /// a pointer out of range is a `CorruptVolume` error, never a slice panic,

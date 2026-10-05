@@ -125,6 +125,9 @@ pub struct SdSectorDevice {
     /// Which registry handle this device reads, writes and is sized from — the single name.
     handle: block::BlockHandle,
     sectors: u64,
+    /// BOOT80 (B350): the read-ahead window (one multi-block command's worth of sectors) — armed on
+    /// the SD card's handle only, where a command costs what a sector does; window 0 elsewhere.
+    ra: unafs::readahead::ReadAheadCache,
 }
 
 /// SDSEAM: the live geometry row for `handle`.
@@ -255,7 +258,7 @@ impl SdSectorDevice {
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
             block::BlockHandle::SdMmc => dev.num_blocks, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => dev.num_blocks, // UNAFSX86: a dedicated per-port row
         };
-        Ok(Self { handle, sectors })
+        Ok(Self { handle, sectors, ra: unafs::readahead::ReadAheadCache::new(ra_window(handle)) })
     }
 
     /// The handle this device reads, writes and was sized from. Exposed so a caller that built a
@@ -272,6 +275,9 @@ impl SectorDevice for SdSectorDevice {
                 "read buffer {} != sector size 512",
                 buf.len()
             )));
+        }
+        if self.ra.window_sectors() > 1 {
+            return self.read_sectors(lba, buf); // BOOT80: through the read-ahead window
         }
         match handle_read(self.handle, lba, buf) {
             Ok(512) => Ok(()),
@@ -298,7 +304,9 @@ impl SectorDevice for SdSectorDevice {
                 buf.len()
             )));
         }
-        match handle_write(self.handle, lba, buf) {
+        let r = handle_write(self.handle, lba, buf);
+        match &r { Ok(()) => self.ra.write_through(lba, buf), Err(_) => self.ra.invalidate() } // BOOT80: the window stays true to the medium
+        match r {
             Ok(()) => Ok(()),
             Err(BlockError::BadLba) => Err(SectorError::OutOfBounds(lba)),
             Err(e) => {
@@ -313,6 +321,41 @@ impl SectorDevice for SdSectorDevice {
 
     fn sector_count(&self) -> u64 {
         self.sectors
+    }
+
+    /// BOOT80 (B350): a 4 KiB block in one call. On the SD card: served from the read-ahead window, or
+    /// ONE multi-block read (CMD18) of the window that holds it; elsewhere the per-sector loop.
+    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+        if self.ra.window_sectors() <= 1 {
+            for (i, c) in buf.chunks_mut(512).enumerate() {
+                let at = lba.checked_add(i as u64).ok_or(SectorError::OutOfBounds(lba))?;
+                match handle_read(self.handle, at, c) {
+                    Ok(512) => {}
+                    Ok(n) => return Err(SectorError::Io(format!("short sector read: {n} bytes"))),
+                    Err(BlockError::BadLba) => return Err(SectorError::OutOfBounds(at)),
+                    Err(e) => {
+                        note_sector_busy(&e);
+                        return Err(SectorError::Io(format!("block layer: {e:?}")));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let handle = self.handle;
+        let sectors = self.sectors;
+        self.ra.read(lba, buf, sectors, |start, b| handle_read_multi(handle, start, b))
+    }
+
+    /// BOOT80 (B350): the write twin — ONE multi-block write (CMD25) on the SD card, synchronous to the
+    /// medium like the single-sector path (the K8a ordering note on `flush` below holds unchanged);
+    /// the read-ahead window is refreshed with what landed, and dropped if the write failed part-way.
+    fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
+        let r = handle_write_multi(self.handle, lba, buf);
+        match &r {
+            Ok(()) => self.ra.write_through(lba, buf),
+            Err(_) => self.ra.invalidate(),
+        }
+        r
     }
 
     /// LOAD-BEARING CONTRACT (K8a commit ordering — lens B, 2026-07-16):
@@ -2748,4 +2791,80 @@ pub fn unafsx86_selftest() {
         w(create), w(write), w(reread), w(owner), w(unlink),
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// =================================================================================================
+// BOOT80 (rmbp-ledger B350) — multi-block I/O and the read-ahead window for the one mount's device.
+// Boot 21's 60 s: every 4 KiB block was eight single-sector commands, and every commit rewrote the
+// whole refcount map. The crate now hands the device a block per call (`read_sectors` /
+// `write_sectors`) and writes only dirty map leaves; this is the device's half.
+// =================================================================================================
+
+/// The read-ahead window for `handle`, in sectors: the SD card's multi-block bound, clamped to the block
+/// layer's per-op cap; 0 (off) on every other handle.
+fn ra_window(handle: block::BlockHandle) -> u64 {
+    match handle {
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        block::BlockHandle::Sdhc => (crate::drivers::sdhc::MB_MAX_BLOCKS as u64).min(block::MAX_BLOCKS_PER_OP as u64),
+        _ => 0,
+    }
+}
+
+fn map_block_err(at: u64, e: BlockError) -> SectorError {
+    match e {
+        BlockError::BadLba => SectorError::OutOfBounds(at),
+        e => {
+            note_sector_busy(&e);
+            SectorError::Io(format!("block layer: {e:?}"))
+        }
+    }
+}
+
+/// `buf.len() / 512` consecutive sectors from `lba`: one counted read per block-layer op on the SD card,
+/// the per-sector loop elsewhere.
+fn handle_read_multi(handle: block::BlockHandle, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    if let block::BlockHandle::Sdhc = handle {
+        let per = block::MAX_BLOCKS_PER_OP * 512;
+        for (i, c) in buf.chunks_mut(per).enumerate() {
+            let at = lba + (i * block::MAX_BLOCKS_PER_OP) as u64;
+            block::read_blocks_sdhc(at, c).map_err(|e| map_block_err(at, e))?;
+        }
+        return Ok(());
+    }
+    for (i, c) in buf.chunks_mut(512).enumerate() {
+        let at = lba + i as u64;
+        match handle_read(handle, at, c) {
+            Ok(512) => {}
+            Ok(n) => return Err(SectorError::Io(format!("short sector read: {n} bytes"))),
+            Err(e) => return Err(map_block_err(at, e)),
+        }
+    }
+    Ok(())
+}
+
+/// The write twin of [`handle_read_multi`]: `write_blocks_sdhc` (one CMD25 under `sdw`) on the SD card.
+fn handle_write_multi(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
+    if buf.len() % 512 != 0 {
+        return Err(SectorError::Io(format!("write span {} not whole sectors", buf.len())));
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    if let block::BlockHandle::Sdhc = handle {
+        let per = block::MAX_BLOCKS_PER_OP * 512;
+        for (i, c) in buf.chunks(per).enumerate() {
+            let at = lba + (i * block::MAX_BLOCKS_PER_OP) as u64;
+            block::write_blocks_sdhc(at, c).map_err(|e| map_block_err(at, e))?;
+        }
+        return Ok(());
+    }
+    for (i, c) in buf.chunks(512).enumerate() {
+        let at = lba + i as u64;
+        handle_write(handle, at, c).map_err(|e| map_block_err(at, e))?;
+    }
+    Ok(())
+}
+
+/// BOOT80: the read-ahead window the bound handle's device runs with (0 = none; the `tests boot80` line).
+pub fn ra_window_bound() -> u64 {
+    mount_bound_handle().map(ra_window).unwrap_or(0)
 }
