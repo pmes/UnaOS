@@ -25,17 +25,19 @@
 //!
 //! The provider is built exactly as Vein builds it (`ProviderConfig::from_prefs`
 //! + `build_provider`), with the flags standing in for the `vein` preferences.
-//! `--turns 2` sends a follow-up in the same conversation; for `claudecode` the
-//! second turn must report `resumed: true` (one CLI session). Exit 0 = every
-//! turn streamed a reply; 1 = a provider error (printed verbatim); 2 = usage.
+//! `--turns N` sends follow-ups in the same conversation, built the way Vein
+//! builds it (VEINTURNS SR42: a `Thread` — every turn its own message). For
+//! `claudecode` every turn after the first must report `resumed: true` and the
+//! SAME session id (one CLI session); the run ends with a `session:` summary
+//! and exits 1 if the id changed. Exit 0 = every turn streamed a reply; 1 = a
+//! provider error (printed verbatim) or a broken session; 2 = usage.
 
 use std::process::ExitCode;
 
 use bandy::PrefValue;
 use futures_util::StreamExt;
 use gneiss_pal::api::{
-    ChatDelta, ChatMessage, ChatRequest, ClaudeCodeProvider, ModelProvider, Part, ProviderConfig, ProviderKind, Role,
-    build_provider,
+    ChatDelta, ClaudeCodeProvider, ModelProvider, Part, ProviderConfig, ProviderKind, Thread, build_provider,
 };
 
 fn usage() -> ExitCode {
@@ -118,17 +120,19 @@ fn main() -> ExitCode {
         }
     };
     let first = prompt.unwrap_or_else(|| "Reply with one short sentence: which model are you?".into());
-    let mut req = ChatRequest {
-        system,
-        messages: vec![ChatMessage::user_text(first)],
-        max_tokens: cfg.max_tokens,
-        temperature: cfg.temperature,
-    };
+    let mut thread = Thread::new();
+    let mut ids: Vec<String> = Vec::new();
     for turn in 1..=turns {
-        if turn > 1 {
-            req.messages.push(ChatMessage::user_text("Repeat your previous reply word for word, then add: (turn two)."));
-        }
-        println!("── turn {turn} ──");
+        let text = if turn == 1 {
+            first.clone()
+        } else {
+            format!("Repeat your previous reply word for word, then add: (turn {turn}).")
+        };
+        let user = vec![Part::text(text)];
+        let mut req = thread.request(system.clone(), user.clone());
+        req.max_tokens = cfg.max_tokens;
+        req.temperature = cfg.temperature;
+        println!("── turn {turn} ({} messages) ──", req.messages.len());
         let reply = rt.block_on(async {
             let mut s = provider.stream(&req).await?;
             let mut text = String::new();
@@ -160,12 +164,24 @@ fn main() -> ExitCode {
                         info.total_cost_usd.unwrap_or(0.0)
                     );
                 }
-                req.messages.push(ChatMessage { role: Role::Assistant, parts: vec![Part::text(text)] });
+                if let Some(s) = provider.session() {
+                    ids.push(s.id);
+                }
+                thread.record(user, &text);
             }
             Err(e) => {
                 println!("\nvein-check: {} :: {e}", provider.name());
                 return ExitCode::from(1);
             }
+        }
+    }
+    if !ids.is_empty() {
+        ids.dedup();
+        if ids.len() == 1 {
+            println!("session: one id across {turns} turns: {}", ids[0]);
+        } else {
+            println!("session: BROKEN — {} ids across {turns} turns: {}", ids.len(), ids.join(", "));
+            return ExitCode::from(1);
         }
     }
     ExitCode::SUCCESS

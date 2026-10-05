@@ -188,7 +188,67 @@ pub trait ModelProvider: Send + Sync {
     /// [`ChatDelta::Text`] then one [`ChatDelta::Stop`].
     fn stream<'a>(&'a self, req: &'a ChatRequest) -> BoxFuture<'a, Result<DeltaStream<'a>, ProviderError>>;
 
+    /// VEINTURNS (SR42): the session the provider keeps across requests, as of
+    /// its last completed request. `None` for a stateless provider (the HTTP
+    /// APIs: every request carries the whole conversation).
+    fn session(&self) -> Option<SessionInfo> {
+        None
+    }
+
+    /// VEINTURNS (SR42): forget any kept session; the next request starts a
+    /// fresh one (`/new`). A no-op for a stateless provider.
+    fn reset_session(&self) {}
+
     // EMBED (B317): no `embed` here — the embedder is its own seam (`super::embed::Embedder`).
+}
+
+/// A provider-kept session (VEINTURNS, SR42): its id and whether the last
+/// request continued it (`resumed`) or opened it (`new`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub id: String,
+    pub resumed: bool,
+}
+
+impl SessionInfo {
+    /// `session=resumed` / `session=new` — the status-row word.
+    pub fn label(&self) -> &'static str {
+        if self.resumed { "session=resumed" } else { "session=new" }
+    }
+}
+
+/// The provider's status line as the console and the Settings surface show it
+/// (VEINTURNS, SR42): `ONLINE (<name> / <model>)`, or `NO PROVIDER :: <why>`.
+pub fn provider_status(state: Result<(&str, &str), &str>) -> String {
+    match state {
+        Ok((name, model)) => format!("ONLINE ({name} / {model})"),
+        Err(why) => format!("NO PROVIDER :: {why}"),
+    }
+}
+
+/// Build the provider the preferences describe (exactly as Vein does) and
+/// answer its status line — what a Settings surface shows after a write.
+pub fn probe_provider(get: impl Fn(&str) -> Option<PrefValue>, env: impl Fn(&str) -> Option<String>) -> String {
+    match ProviderConfig::from_prefs(get).and_then(|cfg| build_provider_with_env(&cfg, env)) {
+        Ok(p) => provider_status(Ok((p.name(), p.model()))),
+        Err(e) => provider_status(Err(&e.to_string())),
+    }
+}
+
+/// A [`model_menu`] label (`"<model> (<provider>)"`) as the two `vein`
+/// preferences it selects: `provider` and `model` (VEINTURNS, SR42 — the
+/// Settings dropdown writes both, so a provider never runs with another
+/// provider's model id). `None` for a label not in that shape.
+pub fn menu_choice_prefs(label: &str) -> Option<[(&'static str, PrefValue); 2]> {
+    let label = label.trim();
+    let open = label.rfind(" (")?;
+    let provider = label[open + 2..].strip_suffix(')')?.trim();
+    let model = label[..open].trim();
+    let kind = ProviderKind::parse(provider)?;
+    if model.is_empty() {
+        return None;
+    }
+    Some([("provider", PrefValue::Str(kind.as_str().into())), ("model", PrefValue::Str(model.into()))])
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +582,30 @@ mod tests {
         assert!(!c.claude_fallbacks);
         assert_eq!(c.max_tokens, 4096);
         assert_eq!(c.temperature, Some(0.25));
+    }
+
+    /// VEINTURNS (SR42): every menu label maps back to the two prefs it
+    /// selects; the status line is the console's.
+    #[test]
+    fn menu_labels_are_pref_writes_and_the_status_line_is_shared() {
+        let (labels, _) = model_menu(None);
+        for (label, (p, m)) in labels.iter().zip(MODEL_CHOICES) {
+            let [(k1, v1), (k2, v2)] = menu_choice_prefs(label).unwrap();
+            assert_eq!((k1, v1, k2, v2), ("provider", PrefValue::Str(p.to_string()), "model", PrefValue::Str(m.to_string())));
+        }
+        assert_eq!(
+            menu_choice_prefs("default (claudecode)").unwrap()[0].1,
+            PrefValue::Str("claudecode".into())
+        );
+        assert!(menu_choice_prefs("no-provider-here").is_none());
+        assert!(menu_choice_prefs("m (nonsense)").is_none());
+        assert_eq!(provider_status(Ok(("claudecode", "default"))), "ONLINE (claudecode / default)");
+        let get = |k: &str| (k == "provider").then(|| PrefValue::Str("claudecode".into()));
+        assert_eq!(probe_provider(get, |_| None), "ONLINE (claudecode / default)");
+        assert_eq!(
+            probe_provider(|_| None, |_| None),
+            "NO PROVIDER :: set ANTHROPIC_API_KEY, or choose a provider in Settings"
+        );
     }
 
     #[test]
