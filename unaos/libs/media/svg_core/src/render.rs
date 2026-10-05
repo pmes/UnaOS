@@ -252,23 +252,25 @@ impl<'a> Renderer<'a> {
         };
         // SVG 2 / CSS Transforms: `transform-origin` (percentages against the initial containing block).
         if let Some(o) = get(&self.props[node], "transform-origin") {
-            let mut it = o.split_whitespace();
-            let comp = |v: Option<&str>, axis: Axis| -> f64 {
-                let Some(v) = v else { return if axis == Axis::X { 0.0 } else { 0.0 } };
-                let base = if axis == Axis::X { self.icb.0 } else { self.icb.1 };
+            let comp = |v: &str, horiz: bool| -> f64 {
+                let base = if horiz { self.icb.0 } else { self.icb.1 };
                 match v {
                     "left" | "top" => 0.0,
                     "center" => base / 2.0,
                     "right" | "bottom" => base,
-                    _ => parse_length(v).map(|l| resolve(l, axis, base, base, 16.0)).unwrap_or(0.0),
+                    _ => parse_length(v).map(|l| resolve(l, Axis::X, base, base, 16.0)).unwrap_or(0.0),
                 }
             };
-            let (a, b) = (it.next(), it.next());
-            let (mut ox, mut oy) = (comp(a, Axis::X), comp(b.or(Some("center")).filter(|_| b.is_some()).or(Some("50%")), Axis::Y));
-            if matches!(a, Some("top") | Some("bottom")) {
-                oy = comp(a, Axis::Y);
-                ox = comp(b.or(Some("center")), Axis::X);
-            }
+            let toks: Vec<&str> = o.split_whitespace().collect();
+            let vertical = |w: &str| w == "top" || w == "bottom";
+            let (xs, ys) = match toks.len() {
+                0 => return t,
+                1 if vertical(toks[0]) => ("center", toks[0]),
+                1 => (toks[0], "center"),
+                _ if vertical(toks[0]) || toks[1] == "left" || toks[1] == "right" => (toks[1], toks[0]),
+                _ => (toks[0], toks[1]),
+            };
+            let (ox, oy) = (comp(xs, true), comp(ys, false));
             if ox != 0.0 || oy != 0.0 {
                 return Transform::translate(ox, oy).mul(&t).mul(&Transform::translate(-ox, -oy));
             }
@@ -1470,10 +1472,11 @@ impl<'a> Renderer<'a> {
                 return;
             }
             // The image's own viewBox (or its intrinsic size) maps into (x, y, w, h) with the referenced
-            // document's own preserveAspectRatio (Chromium ignores the <image> element's for SVG images).
+            // document's own preserveAspectRatio — Chromium honours the <image> element's value for SVG images
+            // only when it is `none` (stretch).
             let vb = sub.view_box.unwrap_or(Rect::new(0.0, 0.0, iw, ih));
-            let _ = par;
-            let t = ctx.ts.mul(&view_box_transform(&vb, &sub.par, x, y, w, h));
+            let ipar = if par.align.is_none() { par } else { sub.par };
+            let t = ctx.ts.mul(&view_box_transform(&vb, &ipar, x, y, w, h));
             let mut layer = Pixmap::new(self.w, self.h);
             let mut r = Renderer::new(&sub.doc, &sub.props, self.opts, self.w, self.h);
             r.depth = self.depth + 4;

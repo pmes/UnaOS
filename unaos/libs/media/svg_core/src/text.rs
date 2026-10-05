@@ -142,6 +142,19 @@ pub struct Run {
     pub style: usize,
     pub path: Path,
     pub decorations: Vec<(u8, usize, Path)>,
+    deco_segs: Vec<DecoSeg>,
+}
+
+#[derive(Clone, Copy)]
+struct DecoSeg {
+    bit: u8,
+    style: usize,
+    x0: f64,
+    x1: f64,
+    y: f64,
+    y0: f64,
+    y1: f64,
+    rot: f64,
 }
 
 pub struct Layout {
@@ -382,37 +395,50 @@ pub fn layout(r: &Renderer, node: usize, ctx: &Ctx, parent: &Style) -> Option<La
         let run = match runs.last_mut() {
             Some(r) if r.style == ch.style => r,
             _ => {
-                runs.push(Run { style: ch.style, path: Path::new(), decorations: Vec::new() });
+                runs.push(Run { style: ch.style, path: Path::new(), decorations: Vec::new(), deco_segs: Vec::new() });
                 runs.last_mut().unwrap()
             }
         };
         run.path.extend(&sink.path);
         if ch.decor != 0 {
+            // Chromium's decoration metrics (measured): thickness font-size/10; underline centred on the
+            // font's underline position; overline sitting on the ascent line; line-through centred at 2/3
+            // of the x-height.
             let dst = &styles[ch.decor_style];
             let ds = dst.font_size / font.units_per_em as f64;
-            let ut = font.post.map(|p| p.underline_thickness as f64).filter(|&v| v > 0.0).unwrap_or(font.units_per_em as f64 / 14.0) * ds;
+            let t = dst.font_size / 10.0;
             let up = font.post.map(|p| p.underline_position as f64).unwrap_or(-(font.units_per_em as f64) / 10.0) * ds;
+            let xh = font.os2.and_then(|o| o.x_height).filter(|&v| v > 0).unwrap_or(asc / 2) as f64 * ds;
             let lines: [(u8, f64); 3] = [
                 (style::DECOR_UNDERLINE, -up),
-                (style::DECOR_OVERLINE, -(asc as f64) * ds),
-                (style::DECOR_LINE_THROUGH, -(font.os2.and_then(|o| o.x_height).unwrap_or(asc / 2) as f64) * ds / 2.0),
+                (style::DECOR_OVERLINE, -(asc as f64) * ds - t / 2.0),
+                (style::DECOR_LINE_THROUGH, -xh * 2.0 / 3.0),
             ];
             for (bit, off) in lines {
                 if ch.decor & bit == 0 {
                     continue;
                 }
-                let base = Transform::translate(p.x, p.y).mul(&rot);
-                let mut d = Path::new();
-                let (y0, y1) = (off - ut / 2.0, off + ut / 2.0);
-                let pts = [(0.0, y0), (p.advance, y0), (p.advance, y1), (0.0, y1)];
-                let q: Vec<(f64, f64)> = pts.iter().map(|&(x, y)| base.apply(x, y)).collect();
-                d.move_to(q[0].0, q[0].1);
-                d.line_to(q[1].0, q[1].1);
-                d.line_to(q[2].0, q[2].1);
-                d.line_to(q[3].0, q[3].1);
-                d.close();
-                run.decorations.push((bit, ch.decor_style, d));
+                let seg = DecoSeg { bit, style: ch.decor_style, x0: p.x, x1: p.x + p.advance, y: p.y, y0: off - t / 2.0, y1: off + t / 2.0, rot: ch.rotate };
+                // Merge with the previous segment when it continues it (one rectangle per decorated run).
+                match run.deco_segs.iter_mut().rev().find(|d| d.bit == bit) {
+                    Some(d) if d.style == seg.style && d.rot == 0.0 && seg.rot == 0.0 && d.y == seg.y && d.y0 == seg.y0 && (d.x1 - seg.x0).abs() < 1e-6 => d.x1 = seg.x1,
+                    _ => run.deco_segs.push(seg),
+                }
             }
+        }
+    }
+    for run in runs.iter_mut() {
+        for d in core::mem::take(&mut run.deco_segs) {
+            let base = Transform::translate(d.x0, d.y).mul(&Transform::rotate(d.rot));
+            let w = d.x1 - d.x0;
+            let q: Vec<(f64, f64)> = [(0.0, d.y0), (w, d.y0), (w, d.y1), (0.0, d.y1)].iter().map(|&(x, y)| base.apply(x, y)).collect();
+            let mut path = Path::new();
+            path.move_to(q[0].0, q[0].1);
+            path.line_to(q[1].0, q[1].1);
+            path.line_to(q[2].0, q[2].1);
+            path.line_to(q[3].0, q[3].1);
+            path.close();
+            run.decorations.push((d.bit, d.style, path));
         }
     }
     Some(Layout { styles, runs, bbox: if any { bounds.rect() } else { None } })
