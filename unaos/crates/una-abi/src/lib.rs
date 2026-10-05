@@ -1596,3 +1596,18 @@ pub mod prof {
         }
     }
 }
+// LUMENUX (rmbp-ledger B348) — the ring-3 CLIPBOARD, the two verbs `video/clipboard.rs` named and did not build.
+// Over the kernel's one session-owned text buffer (`video::clipboard::set`/`get`): text only (printable ASCII,
+// `\n`, `\t`), at most [`CLIP_CAP`] bytes, refused rather than truncated. OWNERSHIP (the question clipboard.rs
+// left open): only the program holding KEYBOARD FOCUS may set or read it (`-EACCES` otherwise), so a background
+// program can neither overwrite nor read what the operator copied. 59..=62 are taken on exec-rmbp-merge12
+// (SELFDIAG's SYS_PATH_READ/WRITE, RING3ABI2's SYS_WHOAMI, PROFILE2's SYS_PROF, VEINTLS's SYS_TIME is 63), hence 64/65. x86 dispatches
+// them; elsewhere they fall to the unknown-syscall default. Appended at the file tail so no existing line moves.
+/// `SYS_CLIP_SET(ptr, len) -> len / -errno` — replace the clipboard. `-EINVAL` a non-text byte or
+/// `len > CLIP_CAP`, `-EACCES` not the focused program, `-EFAULT` a bad buffer. `len == 0` clears it.
+pub const SYS_CLIP_SET: u64 = 64; // merge12 fold: 63 is VEINTLS's SYS_TIME
+/// `SYS_CLIP_GET(ptr, cap) -> len / -errno` — copy the clipboard out. `-ERANGE` when `cap` is shorter than
+/// the content (nothing is copied: ask again with `CLIP_CAP`), `-EACCES` not the focused program.
+pub const SYS_CLIP_GET: u64 = 65;
+/// The clipboard's capacity (the kernel's `video::clipboard::CLIP_CAP`; `tests lumen` asserts they agree).
+pub const CLIP_CAP: usize = 4096;
