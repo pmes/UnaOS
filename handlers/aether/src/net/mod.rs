@@ -289,15 +289,13 @@ pub fn favicon_url(base_url: &str, html: &str) -> Option<String> {
 /// (`None`): a missing `/favicon.ico` is the overwhelmingly common case, not an
 /// error worth a ledger line.
 ///
-/// ICO is handled by the `image` crate's ico decoder (it picks the largest
-/// contained image); PNG/JPEG/GIF/WebP/BMP go through the same decoder, and an
-/// SVG icon falls back to the rasterizer the page images use.
+/// PNG/JPEG/GIF/BMP/QOI/WebP (lossless and lossy) go through
+/// `images::decode_raster` (UnaOS's own pixel_core + vp8_core); ICO falls back to
+/// the `image` crate behind it (it picks the largest contained image), and an SVG
+/// icon falls back to the rasterizer the page images use.
 pub async fn fetch_favicon(url: &str) -> Option<(u32, u32, Vec<u8>)> {
     let bytes = fetch_image_bytes(url).await.ok()?;
-    let decoded = image::load_from_memory(&bytes)
-        .ok()
-        .map(|i| i.to_rgba8())
-        .or_else(|| crate::images::decode_svg(&bytes))?;
+    let decoded = crate::images::decode_raster(&bytes).or_else(|| crate::images::decode_svg(&bytes))?;
     let (w, h) = decoded.dimensions();
     if w == 0 || h == 0 {
         return None;
@@ -592,10 +590,7 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     for (result, img_url, key) in img_results {
         match result {
             Ok(bytes) => {
-                let decoded = image::load_from_memory(&bytes)
-                    .ok()
-                    .map(|i| i.to_rgba8())
-                    .or_else(|| crate::images::decode_svg(&bytes));
+                let decoded = crate::images::decode_raster(&bytes).or_else(|| crate::images::decode_svg(&bytes));
                 match decoded {
                     Some(img) => {
                         if key != img_url {
