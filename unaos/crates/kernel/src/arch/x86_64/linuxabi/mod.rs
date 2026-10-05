@@ -967,7 +967,7 @@ pub fn selftest() {
     match run_path(P, &[P], 5_000, false, &mut |_| {}) {
         Ok(r) => serial_println!("{}", r.witness(P)),
         Err(e) if e.contains("-ENOENT") => {
-            serial_println!(":: LINUXABI: path={} exit=? syscalls=0 enosys=[] ms=0 -> SKIP (fixture not staged) ::", P)
+            serial_println!(":: LINUXABI: path={} exit=? syscalls=0 enosys=[] ms=0 -> SKIP reason=fixture-not-staged ::", P)
         }
         Err(e) => serial_println!(":: LINUXABI: path={} exit=? syscalls=0 enosys=[] ms=0 -> FAIL ({}) ::", P, e),
     }
@@ -1000,7 +1000,7 @@ pub fn selftest2() {
         }
     }
     if missing(&r1) || missing(&r2) {
-        serial_println!(":: LINUXABI2: fork_ok=0 pipe_ok=0 dents=0 stdin=0 -> SKIP (fixtures not staged) ::");
+        serial_println!(":: LINUXABI2: fork_ok=0 pipe_ok=0 dents=0 stdin=0 -> SKIP reason=fixtures-not-staged ::");
         return;
     }
     let (mut fork_ok, mut pipe_ok) = (false, false);
@@ -1044,7 +1044,7 @@ pub fn selftest3() {
         cap.push('\n');
     });
     if matches!(&r, Err(e) if e.contains("-ENOENT")) {
-        serial_println!(":: LINUXABI3: cr4=? save=fx sse_lnx=skip fork_fp=skip busybox=skip -> SKIP (fixture not staged) ::");
+        serial_println!(":: LINUXABI3: cr4=? save=fx sse_lnx=skip fork_fp=skip busybox=skip -> SKIP reason=fixture-not-staged ::");
         return;
     }
     let (mut sse_ok, mut fork_fp) = (false, false);

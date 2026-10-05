@@ -6924,7 +6924,7 @@ pub fn flush_pending_dirent_by(by: &str) {
     let had = PEND_VALID.load(Ordering::Acquire);
     pend_write_locked();
     PEND_LOCK.store(false, Ordering::Release);
-    if had { serial_println!("[fs] dirent flushed by={}", by); }
+    if had { crate::bootlog_println!("[fs] dirent flushed by={}", by); }
 }
 
 /// `flush_pending_dirent_by("close")` — for a writer that has produced its last span.

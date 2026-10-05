@@ -10114,7 +10114,7 @@ fn ptrinstall_rollup() {
             installs, reports, lag, coalesced, drains, folds, fold_age, drain_gap, panel_busy
         );
     }
-    if unaos_kernel::arch::ms() >= PTRI_LATE_MS && !PTRI_LATE_DONE.swap(true, Relaxed) {
+    if unaos_kernel::arch::ms() >= PTRI_LATE_MS && unaos_kernel::census::on(unaos_kernel::census::PTRINSTALL) && !PTRI_LATE_DONE.swap(true, Relaxed) { // QUIETBOOT3 (B352, R80): the late rollup is the `ptrinstall` census too.
         serial_println!(
             ":: PTRINSTALL: installs={} reports={} folds={} lag_max_ms={} coalesced={} drains={} ::",
             installs, reports, folds, lag, coalesced, drains

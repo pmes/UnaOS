@@ -761,7 +761,7 @@ fn edge(vline: u32) {
     // edge is the only moment at which "a bounded number of vblanks" is a measurable quantity, and
     // because this is the one place per frame that is already off the fast path (`note`'s compare
     // returns before reaching `edge` on every non-edge iteration).
-    ladder_tick(n);
+    ladder_tick(n); if !crate::census::on(crate::census::KEPLER) { return; } // QUIETBOOT3 (B352, R80): the 1 Hz census prints only under `census start kepler`; the ladder (KVBLANK2/8/9 rungs) above still runs and prints.
     let prints = VB_PRINTS.load(Ordering::Relaxed);
     let due = if prints < FAST_PRINTS { FAST_MS } else { SLOW_MS };
     let ms = crate::arch::ms();
