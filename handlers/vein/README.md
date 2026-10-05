@@ -61,7 +61,7 @@ Every provider sends through the one backoff (`gneiss_pal::api::retry`, which `S
 **The embedder is its own setting, independent of the chat provider** (R81, Peter 2026-10-04). Every vector the vault stores comes from `gneiss_pal::api::Embedder` (`embed(texts)`, `dims`, `name`, `model`); the chat trait has no `embed`. Three embedders:
 
 - **`gemini`** — `GeminiEmbedder`: Gemini's embedding model, Vertex `predict` under gcloud ADC or `embedContent` under an API key (the same `vein.gemini.*` auth keys the chat provider uses).
-- **`local`** — `LocalEmbedder` (gneiss_pal feature `local-embed`, on in Vein by default): all-MiniLM-L6-v2 (BERT, 384 dims, mean-pooled, L2-normalised) run in-process on the CPU by candle — no network. The model files are not in the repository: `tools/una-models fetch all-MiniLM-L6-v2` puts them in `~/.cache/unaos/models/all-MiniLM-L6-v2/` (sha256-pinned; `tools/una-models verify <name>` re-checks). A missing model is an in-chat line naming that command, never a panic.
+- **`local`** — `LocalEmbedder` (gneiss_pal feature `local-embed`, on in Vein by default): all-MiniLM-L6-v2 (BERT, 384 dims, mean-pooled, L2-normalised) run in-process on the CPU by UnaOS's own `infer_core` (INFERCORE, SR57: `no_std`, zero dependencies; HF-exact tokenizer) — no network. The model files are not in the repository: `tools/una-models fetch all-MiniLM-L6-v2` puts them in `~/.cache/unaos/models/all-MiniLM-L6-v2/` (sha256-pinned; `tools/una-models verify <name>` re-checks). A missing model is an in-chat line naming that command, never a panic.
 - **`off`** — `NoEmbedder` (dims 0): every store writes no vector and recall is OFF, said in-chat: `:: BRAIN :: RECALL OFF :: no embedder — set vein.embed.provider`.
 
 | Key | Values | Default |
