@@ -1150,6 +1150,34 @@ fn main() {
     } else {
         println!("   SELFBUILD5: target/LIB/rust absent — ESP has no APPS/LIB/rust (tests selfbuild5 reports lld=skip)");
     }
+    // SELFBUILD6 (B360): target/LIB/dyn (libc.so + libgcc_s.so.1 relinked from the Rust musl target's self-contained archives —
+    // the kernel loader's search dir — and the dyn probe) and, with UNAOS_SELFBUILD6_RUSTC=1, target/LIB/rustc (the musl-host
+    // rustc tree: bin/rustc, the stripped librustc_driver, rust-lld, the musl std rlibs, hello.rs, pm/), both built and
+    // host-proven under `ldrun` by arroyo's build_selfbuild6_x86. They ride the APPS/LIB copy above; staged here on their own
+    // when the musl LIB was not built. Absent = `tests selfbuild6` reports skip.
+    for (sub, probe, what) in [("dyn", "hello", "libc.so, libgcc_s.so.1, the dyn probe"), ("rustc", "bin/rustc", "the musl-host rustc tree")] {
+        let from = musl_lib.join(sub);
+        if from.join(probe).exists() {
+            let to = esp_apps.join("LIB").join(sub);
+            if !to.join(probe).exists() {
+                fn copy_all(from: &std::path::Path, to: &std::path::Path) {
+                    std::fs::create_dir_all(to).unwrap();
+                    for e in std::fs::read_dir(from).unwrap() {
+                        let e = e.unwrap();
+                        if e.file_type().unwrap().is_dir() {
+                            copy_all(&e.path(), &to.join(e.file_name()));
+                        } else {
+                            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+                        }
+                    }
+                }
+                copy_all(&from, &to);
+            }
+            println!("   SELFBUILD6: APPS/LIB/{sub} staged ({what})");
+        } else {
+            println!("   SELFBUILD6: target/LIB/{sub} absent — ESP has no APPS/LIB/{sub} (tests selfbuild6 reports skip)");
+        }
+    }
 
     // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
     // target/PULSE-X86.ELF), staged as PULSE.ELF exactly like STAT.ELF/VUG.ELF above and for the same
