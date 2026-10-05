@@ -1,6 +1,7 @@
 # HOLOCRON1 — Holocron gets a keyring, a bus surface, an SSH agent, and its first consumer
 
 LEDGER SR33 · branch `exec-host-holocron1` · cut from `676ca0e9` · host first · CODEX §2 Holocron ("The Key").
+CRYPTOCORE (SR27, `exec-sec-crypto` ed49c387) is MERGED into this branch (39c52809) and is the default suite (8fc3baf8).
 
 ## Finding
 
@@ -12,8 +13,8 @@ for a secret, no per-user keyring on UnaFS, and no agent.
 
 | piece | where | what |
 |---|---|---|
-| keyring core | `unaos/libs/sys/holocron_core` (`no_std` + `alloc`, **zero dependencies**) | v1 secret and ring file formats, the `Sealer`/`Signer`/`Entropy` seam, the INSECURE test suite, the ring (Argon2id key from the login password, session-held, `lock` wipes), the bus codec, the dispatcher (owner-only, rate-limited unlock, `Store` seam), the SSH-agent framing, the consumer rule |
-| CRYPTOCORE adapter | `holocron_core/src/cc.rs`, feature `crypto_core` | Argon2id (RFC 9106) + HKDF-SHA-256 (RFC 5869) + ChaCha20-Poly1305 (RFC 8439) + Ed25519 (RFC 8032) from `crypto_core`; stubbed until SR27 folds (the dependency line is commented) |
+| keyring core | `unaos/libs/sys/holocron_core` (`no_std` + `alloc`, one dependency: CRYPTOCORE) | v1 secret and ring file formats, the `Sealer`/`Signer`/`Entropy` seam, the INSECURE test suite (feature `test-suite`, tests only), the ring (Argon2id key from the login password, session-held, `lock` wipes), the bus codec, the dispatcher (owner-only, rate-limited unlock, `Store` seam), the SSH-agent framing, the consumer rule |
+| production suite | `holocron_core/src/cc.rs` | `CryptoCore`: Argon2id (RFC 9106) + HKDF-SHA-256 (RFC 5869) + ChaCha20-Poly1305 (RFC 8439) + Ed25519 (RFC 8032); `DrbgEntropy`: CRYPTOCORE's ChaCha20 DRBG over a fallible source — the host daemon's entropy |
 | host handler | `handlers/holocron` | `DirStore` (`~/.holocron`, 0700/0600, atomic replace, no symlinks), `UnaFsStore` (same layout on a UnaFS volume, metadata as typed attributes), SO_PEERCRED principal, daemon (bus socket + agent socket, idle lock), client |
 | CLI | `tools/holocron` (package `holocron-cli`, binary `holocron`) | `daemon`, `init`, `unlock`, `lock`, `status`, `put`, `get`, `list`, `delete`, `keygen`, `sign`, `agent-env` |
 | first consumer | `handlers/vein/src/provider.rs` | `ProviderSlot::load` asks Holocron for `vein/claude.api_key` first |
@@ -34,7 +35,15 @@ pub trait Signer {
     fn sign(&self, seed: &[u8; 32], msg: &[u8]) -> [u8; 64];
     fn verify(&self, public: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool;
 }
+pub trait Entropy {
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), EntropyError>;
+}
 ```
+
+`Entropy` is FALLIBLE: an `Err` refuses the operation — `Ring::create` and `seal_secret` return
+`RingError::Entropy`, the bus answers `IO` (-5), a minted SSH key is never minted, nothing reaches the store.
+`DrbgEntropy::new` fails when the source cannot seed the DRBG, and the daemon then refuses to start
+(`tests/cc.rs::cc_entropy_failure_refuses_to_seal`).
 
 `derive_key` = Argon2id v0x13, 32-byte tag; `subkey` = HKDF-SHA-256 → 32 bytes; `seal`/`open` =
 ChaCha20-Poly1305 returning `ct || tag16`. `Signer` = RFC 8032 PureEdDSA over a 32-byte seed.
@@ -72,9 +81,9 @@ body mints the seed from Holocron's entropy. A test-signer key's comment carries
 | formats | header KATs written field by field from the layout table (not from the encoder), parser refusals per field | 5 KATs, 18 refusal cases green |
 | bus bodies | body KATs written from the verb table | green |
 | agent bytes | blob/signature/frame KATs written from RFC 8709 and the agent draft | green |
-| agent over a real socket | `tools/holocron/tests/agent_oracle.py`: an independent agent client; signature checked by RFC 8032 §6's own Python reference verifier (self-tested on §7.1 TEST 2 before trusting it) | **ED25519-VERIFIED(rfc8032-ref)** under the fold build; blob/shape-only under the test signer |
+| agent over a real socket | `tools/holocron/tests/agent_oracle.py`: an independent agent client; signature checked by RFC 8032 §6's own Python reference verifier (self-tested on §7.1 TEST 2 before trusting it) | **ED25519-VERIFIED(rfc8032-ref)** on the production suite; blob/shape-only under the test signer |
 | `ssh-add -l` | OpenSSH | SKIPPED: OpenSSH is not installed in this container; the e2e test runs it when present |
-| the fold | scratch copy of holocron_core + handler + CLI with `crypto_core` pointed at `/home/user/exec/sec-crypto` (66c835b7 plus its uncommitted argon2.rs) | **every test green**, including RFC 8032 §7.1 TEST 1 and TEST 2 through `Signer`, TEST 1's signature through the agent and the `Sign` verb byte for byte, a real Argon2id (19 MiB, t=2) ring with wrong-password, tamper and cross-suite refusals |
+| the real primitives | CRYPTOCORE merged; `cargo test -p holocron_core -p holocron -p holocron-cli` (before the merge, the same from a scratch copy against 66c835b7) | **every test green**, including RFC 8032 §7.1 TEST 1 and TEST 2 through `Signer`, TEST 1's signature through the agent and the `Sign` verb byte for byte, a real Argon2id (19 MiB, t=2) ring with wrong-password, tamper and cross-suite refusals |
 
 (pyca/cryptography was the first choice of oracle; the distro copy panics on import in its pyo3 binding, so the
 RFC's reference code, which has no dependency, is the oracle.)
@@ -84,20 +93,21 @@ Mutation (go-red): disabling the owner check in `Holocron::authorise` turns `own
 
 ## Tests
 
-`cargo test -p holocron_core -p holocron -p holocron-cli`: holocron_core 1 unit + 12 kat + 9 bus + 3 agent
-(+3 `cc` under the feature); holocron 4 m1_store + 3 m2_bus; holocron-cli 1 e2e. Vein: 3 new provider tests
-(Holocron wins / fallback / refuse, and a live daemon end to end).
+`cargo test -p holocron_core -p holocron -p holocron-cli` on the real primitives: **37 pass, 0 fail** —
+holocron_core 1 unit + 12 kat + 9 bus + 3 agent + 4 cc (RFC 8032 TEST 1/2, the agent signing TEST 1, a real
+Argon2id ring, the entropy refusal); holocron 4 m1_store + 3 m2_bus; holocron-cli 1 e2e (the daemon on the
+production suite, Argon2id 64 MiB/t=3, `ED25519-VERIFIED(rfc8032-ref)` from the independent agent client).
+The store/socket/bus tests use the test suite deliberately (fast KDF); the cc and e2e tests are the real
+ones. Vein: 3 new provider tests (Holocron wins / fallback / refuse, and a live daemon end to end).
 
 ## Third-party crates
 
-holocron_core: none. holocron: none of its own; through `unafs` (default features off) it links UnaFS's own
+holocron_core: none (CRYPTOCORE is UnaOS's own). holocron: none of its own; through `unafs` (default features off) it links UnaFS's own
 utilities bincode 2.0.1, serde 1.0.229, thiserror 2.0.21, libm 0.2.16 — none does Holocron's work. holocron-cli:
 none. Vein: no new crate. The cryptography is CRYPTOCORE's (UnaOS-built), never a crate.
 
 ## Honest ceiling
 
-* **The host build seals with the TEST suite** until SR27 folds — it is not cryptography, and the daemon says so
-  on every start (`suite=TEST-INSECURE (0xFE)`). The fold is proven, not landed.
 * No metal fulfiller: HOLOCRON.ELF (register verbs 144..=151 with BUS_VERB_REGISTER, store through
   SYS_OPEN/SYS_ATTR_SET, entropy from SYS_GETRANDOM) is owed. The metal Vein (`unaos/crates/user-vein`, the
   ring-3 VEIN.BIN) holds no credential today (its providers are echo and relay; the relay's key is consumed
@@ -112,7 +122,7 @@ none. Vein: no new crate. The cryptography is CRYPTOCORE's (UnaOS-built), never 
 
 ## Owed
 
-1. SR27 fold: uncomment the `crypto_core` line in `holocron_core/Cargo.toml`, `crypto_core = ["dep:crypto_core"]`, flip the host default (`handlers/holocron` feature), re-run `cargo test --release --features holocron-cli/crypto_core`.
+1. CRYPTOCORE's own fold to a track lands with or before this branch (it is merged here, not on trunk).
 2. HOLOCRON.ELF (metal fulfiller) and the kernel's verb registration; LOGIN hands it the password at session start.
 3. Seat: CODEX §2 entry for Holocron's bus verbs and `tools/holocron`; `docs/dev/exec-branches.txt` line at the fold.
 4. `ssh-add -l` / `ssh -T git@…` on a bench with OpenSSH.
@@ -129,7 +139,6 @@ on the agent socket. The arithmetic is CRYPTOCORE's.
 ## How a future executor continues
 
 Read this file, then `holocron_core/src/lib.rs` (module table). The core has no I/O: a new transport brings a
-`Store` and calls `Holocron::handle(caller, verb, body, now_ms, now_unix)`. The fold proof recipe: copy the three
-crates into a scratch workspace, point `crypto_core` at the CRYPTOCORE tree, `cargo test --release
---features holocron-cli/crypto_core -p holocron_core -p holocron -p holocron-cli -- --nocapture` and look for
-`ED25519-VERIFIED(rfc8032-ref)` in the e2e output.
+`Store`, an `Entropy` (on the metal: `DrbgEntropy` over crypto_core's `GetrandomEntropy`) and calls
+`Holocron::handle(caller, verb, body, now_ms, now_unix)`. `cargo test -p holocron_core -p holocron -p
+holocron-cli -- --nocapture` and look for `ED25519-VERIFIED(rfc8032-ref)` in the e2e output.

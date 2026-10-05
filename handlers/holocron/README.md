@@ -4,12 +4,13 @@ CODEX §2: keyring, SSH agent, wallet, biometric auth. HOLOCRON1 (LEDGER SR33) b
 surface, the SSH agent and the first consumer (Vein's Claude API key). Design, formats, oracles and the honest
 ceiling: [`docs/dev/evidence/host-1004/HOLOCRON1.md`](../../docs/dev/evidence/host-1004/HOLOCRON1.md).
 
-> **Until CRYPTOCORE (SR27) folds, the host build seals with the TEST suite (0xFE), which is not
-> cryptography.** The daemon says so on every start. `--features crypto_core` is the production suite.
+The suite is CRYPTOCORE's (SR27): Argon2id + HKDF-SHA-256 + ChaCha20-Poly1305, Ed25519, its ChaCha20 DRBG
+for entropy (a failing source refuses to seal). The INSECURE test suite exists only behind the `test-suite`
+dev feature.
 
 ## Layout
 
-* `unaos/libs/sys/holocron_core` — `no_std`, zero dependencies: formats, ring, bus codec, dispatcher, agent
+* `unaos/libs/sys/holocron_core` — `no_std`, one dependency (CRYPTOCORE): formats, ring, bus codec, dispatcher, agent
   framing, consumer rule. Shared with the metal.
 * this crate — the host's I/O: `store` (`~/.holocron`), `unafs_store` (typed attributes), `principal`
   (SO_PEERCRED), `daemon` (bus + agent sockets), `client`.
