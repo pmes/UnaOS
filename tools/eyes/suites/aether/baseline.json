@@ -94,6 +94,11 @@
       "mismatch": 2.77,
       "missing": 0,
       "ssim": 0.9802
+    },
+    "18-stacking": {
+      "mismatch": 0.44,
+      "missing": 0,
+      "ssim": 0.9959
     }
   },
   "thresholds": {

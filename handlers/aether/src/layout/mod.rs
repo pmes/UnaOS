@@ -129,6 +129,8 @@ pub struct PaintStyle {
     pub vertical_align: Option<(u8, f32)>,
     /// float: 0 none, 1 left, 2 right.
     pub float: Option<u8>,
+    /// opacity in [0, 1] (0 also sets `hidden`).
+    pub opacity: Option<f32>,
 }
 
 pub struct LayoutTree {

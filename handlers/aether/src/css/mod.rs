@@ -631,8 +631,14 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             // has to be able to un-hide what an earlier opacity:0 rule hid,
             // and that only works if the winning declaration merges a value
             // instead of leaving the field unspecified.
-            if let Ok(a) = value.parse::<f32>() {
+            let a = match value.strip_suffix('%') {
+                Some(p) => p.trim().parse::<f32>().ok().map(|p| p / 100.0),
+                None => value.parse::<f32>().ok(),
+            };
+            if let Some(a) = a {
+                let a = a.clamp(0.0, 1.0);
                 style.paint.hidden = Some(a == 0.0);
+                style.paint.opacity = Some(a);
             }
         }
         "line-height" => {
@@ -1966,7 +1972,7 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
-        list_item, list_style, vertical_align, float,
+        list_item, list_style, vertical_align, float, opacity,
     );
     clone!(pct_math, bg_gradient, shadows);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);

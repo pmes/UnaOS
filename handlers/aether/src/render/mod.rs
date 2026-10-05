@@ -585,6 +585,40 @@ fn draw_glyph_run(
     }
 }
 
+/// Positioned (relative/absolute/fixed/sticky) with an integer z-index,
+/// fixed/sticky, a flex item with an integer z-index, or opacity < 1:
+/// the box forms a stacking context (CSS 2.2 §9.9.1, css-position-3 §8,
+/// css-flexbox-1 §4.3, css-color-4 §15).
+pub(crate) fn is_stacking_context(layout: &LayoutTree, id: NodeId) -> bool {
+    let Some(p) = layout.paint_map.get(&id) else { return false };
+    let kind = p.position_kind.unwrap_or(0);
+    let z = p.z_index.flatten();
+    if matches!(kind, 3 | 4) || (kind != 0 && z.is_some()) {
+        return true;
+    }
+    if p.opacity.is_some_and(|o| o < 1.0) {
+        return true;
+    }
+    z.is_some()
+        && layout
+            .taffy
+            .parent(id)
+            .and_then(|par| layout.paint_map.get(&par))
+            .and_then(|pp| pp.flex_container)
+            == Some(true)
+}
+
+/// Painted as a layer of its stacking context rather than in normal flow.
+fn is_layered(layout: &LayoutTree, id: NodeId) -> bool {
+    layout.paint_map.get(&id).and_then(|p| p.position_kind).is_some_and(|k| k != 0)
+        || is_stacking_context(layout, id)
+}
+
+/// The layer's z: its integer z-index, else 0 (auto paints at 0).
+fn z_of(layout: &LayoutTree, id: NodeId) -> i32 {
+    layout.paint_map.get(&id).and_then(|p| p.z_index).flatten().unwrap_or(0)
+}
+
 /// Text decoration lines of one run.
 #[derive(Clone, Copy, Default)]
 struct Deco {
@@ -1146,8 +1180,162 @@ pub fn render_frame(
     let sy = scroll_y as i32;
     let sx = scroll_x as i32;
 
+    /// css-color-4 / css-masking: `opacity` < 1 paints the subtree as a
+    /// GROUP and composites it once. Painting the group straight onto the
+    /// backdrop and then mixing with a snapshot of the backdrop by the
+    /// opacity is exact: per pixel, `b(1-a) + a(g·ga + b(1-ga))` =
+    /// `b(1 - a·ga) + a·ga·g`, which is source-over of the group at a·ga.
     #[allow(clippy::too_many_arguments)]
     fn draw_node(
+        node_id: NodeId,
+        abs_x: f32,
+        abs_y: f32,
+        inherited: Inherited,
+        layout: &LayoutTree,
+        font: &Option<Arc<Font>>,
+        font_bold: &Option<Arc<Font>>,
+        surface: &mut [u8],
+        width: u32,
+        height: u32,
+        sx: i32,
+        sy: i32,
+        damage_rects: &[(u32, u32, u32, u32)],
+        clip: Clip,
+    ) {
+        let op = layout.paint_map.get(&node_id).and_then(|p| p.opacity).unwrap_or(1.0);
+        if op > 0.0 && op < 1.0 {
+            let snap = surface.to_vec();
+            draw_node_inner(
+                node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
+                damage_rects, clip,
+            );
+            let a = (op * 256.0).round() as u32;
+            for (o, b) in surface.chunks_exact_mut(4).zip(snap.chunks_exact(4)) {
+                if o[..3] != b[..3] {
+                    for i in 0..3 {
+                        o[i] = ((b[i] as u32 * (256 - a) + o[i] as u32 * a) >> 8) as u8;
+                    }
+                }
+            }
+        } else {
+            draw_node_inner(
+                node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
+                damage_rects, clip,
+            );
+        }
+    }
+
+    /// One layer of a stacking context (CSS 2.2 Appendix E): a positioned or
+    /// stacking-context-forming descendant, hoisted out of normal-flow
+    /// painting with what `draw_node` needs to paint it later.
+    #[derive(Clone, Copy)]
+    struct Layer {
+        z: i32,
+        order: usize,
+        node: NodeId,
+        abs_x: f32,
+        abs_y: f32,
+        inh: Inherited,
+        clip: Clip,
+    }
+
+    /// Collects the layers of the stacking context rooted at `node` (whose
+    /// border box sits at `cur`): every positioned / z-indexed descendant
+    /// reached through normal-flow boxes and through positioned z-index:auto
+    /// boxes (whose positioned descendants belong to THIS context, §9.9.1),
+    /// but not inside a nested stacking context (it paints its own).
+    #[allow(clippy::too_many_arguments)]
+    fn collect_layers(
+        layout: &LayoutTree,
+        node: NodeId,
+        cur: (f32, f32),
+        inh: Inherited,
+        clip: Clip,
+        sx: i32,
+        sy: i32,
+        out: &mut Vec<Layer>,
+    ) {
+        let Ok(lb) = layout.taffy.layout(node) else { return };
+        // The children with the parent origin draw_node expects for each.
+        let mut kids: Vec<(NodeId, f32, f32, Inherited)> = Vec::new();
+        if let Some(il) = layout.inline.get(&node) {
+            let cx = cur.0 + lb.border.left + lb.padding.left;
+            let cy = cur.1 + lb.border.top + lb.padding.top;
+            for f in &il.frags {
+                if let crate::layout::inline::Frag::Atomic { node: a, x, y } = f {
+                    let loc = layout.taffy.layout(*a).map(|l| l.location).unwrap_or(taffy::Point { x: 0.0, y: 0.0 });
+                    kids.push((*a, cx + x - loc.x, cy + y - loc.y, inline_inherited(layout, node, *a, inh)));
+                }
+            }
+            for c in layout.taffy.children(node).unwrap_or_default() {
+                if matches!(layout.paint_map.get(&c).and_then(|p| p.position_kind), Some(2 | 3)) {
+                    kids.push((c, cur.0, cur.1, inh));
+                }
+            }
+        } else {
+            for c in layout.taffy.children(node).unwrap_or_default() {
+                kids.push((c, cur.0, cur.1, inh));
+            }
+        }
+        for (c, ax, ay, ci) in kids {
+            let p = layout.paint_map.get(&c);
+            if p.and_then(|p| p.hidden).unwrap_or(false)
+                || layout.taffy.style(c).map(|s| s.display == taffy::style::Display::None).unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(cl) = layout.taffy.layout(c) else { continue };
+            let ccur = (ax + cl.location.x, ay + cl.location.y);
+            let mut cinh = ci;
+            if let Some(n) = layout.node_map.get(&c) {
+                if let Some(el) = n.as_element() {
+                    let spec = p.cloned().unwrap_or_default();
+                    inherit_element(&mut cinh, el.name.local.as_ref(), &spec, n);
+                }
+            }
+            let cclip = if p.and_then(|p| p.clip).unwrap_or(false) {
+                let (bx0, by0) = (ccur.0 - sx as f32, ccur.1 - sy as f32);
+                (clip.0.max(bx0), clip.1.max(by0), clip.2.min(bx0 + cl.size.width), clip.3.min(by0 + cl.size.height))
+            } else {
+                clip
+            };
+            if is_layered(layout, c) {
+                out.push(Layer { z: z_of(layout, c), order: out.len(), node: c, abs_x: ax, abs_y: ay, inh: ci, clip });
+                if is_stacking_context(layout, c) {
+                    continue;
+                }
+            }
+            collect_layers(layout, c, ccur, cinh, cclip, sx, sy, out);
+        }
+    }
+
+    /// The inherited state at `child` (an atomic inline of the IFC rooted at
+    /// `root`), applying the inline boxes between them.
+    fn inline_inherited(layout: &LayoutTree, root: NodeId, child: NodeId, root_inh: Inherited) -> Inherited {
+        let mut path = Vec::new();
+        let mut n = layout.taffy.parent(child);
+        while let Some(p) = n {
+            if p == root {
+                break;
+            }
+            path.push(p);
+            n = layout.taffy.parent(p);
+        }
+        let mut inh = root_inh;
+        for p in path.into_iter().rev() {
+            if let Some(dn) = layout.node_map.get(&p) {
+                if let Some(el) = dn.as_element() {
+                    let spec = layout.paint_map.get(&p).cloned().unwrap_or_default();
+                    inherit_element(&mut inh, el.name.local.as_ref(), &spec, dn);
+                }
+            }
+        }
+        inh.shift_y = 0.0;
+        inh
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_node_inner(
         node_id: NodeId,
         abs_x: f32,
         abs_y: f32,
@@ -1751,7 +1939,25 @@ pub fn render_frame(
         } else {
             clip
         };
+        // A stacking context (Appendix E): its layers, collected through the
+        // boxes it paints in normal flow; negative z-index under that flow.
+        let mut layers: Vec<Layer> = Vec::new();
+        if node_id == layout.root_node || is_stacking_context(layout, node_id) {
+            collect_layers(layout, node_id, (current_x, current_y), inherited, child_clip, sx, sy, &mut layers);
+            layers.sort_by_key(|l| (l.z, l.order));
+        }
+        let paint_layers = |layers: &[Layer], surface: &mut [u8]| {
+            for l in layers {
+                draw_node(
+                    l.node, l.abs_x, l.abs_y, l.inh, layout, font, font_bold, surface, width, height, sx, sy,
+                    damage_rects, l.clip,
+                );
+            }
+        };
+        let split = layers.iter().position(|l| l.z >= 0).unwrap_or(layers.len());
+        paint_layers(&layers[..split], surface);
         if child_clip.2 <= child_clip.0 || child_clip.3 <= child_clip.1 {
+            paint_layers(&layers[split..], surface);
             return; // fully clipped out — nothing below can paint
         }
         if let Some(ifc) = ifc {
@@ -1934,7 +2140,7 @@ pub fn render_frame(
                         );
                     }
                     crate::layout::inline::Frag::Atomic { node, x, y } => {
-                        if skip.contains(node) {
+                        if skip.contains(node) || is_layered(layout, *node) {
                             continue;
                         }
                         let i = inh.get(node).copied().unwrap_or(inherited);
@@ -1947,45 +2153,22 @@ pub fn render_frame(
                 }
             }
         }
-        if let Ok(children) = layout.taffy.children(node_id) {
-            // In an inline formatting context only out-of-flow children are
-            // painted from their own (taffy) positions; the rest were above.
-            let children: Vec<NodeId> = if ifc.is_some() {
-                children
-                    .into_iter()
-                    .filter(|c| matches!(layout.paint_map.get(c).and_then(|p| p.position_kind), Some(2 | 3)))
-                    .collect()
-            } else {
-                children
-            };
-            // CSS 2.2 Appendix E, per parent: negative z-index, then the
-            // in-flow boxes, then positioned boxes with z-index auto/0 in
-            // tree order, then positive z-index in ascending order (stable).
-            // (Positioned descendants are ordered among their siblings,
-            // not hoisted to the enclosing stacking context.)
-            let mut order: Vec<(i32, i32, usize, NodeId)> = children
-                .iter()
-                .enumerate()
-                .map(|(i, &c)| {
-                    let p = layout.paint_map.get(&c);
-                    let positioned = p.and_then(|p| p.position_kind).is_some_and(|k| k != 0);
-                    let z = p.and_then(|p| p.z_index).flatten().filter(|_| positioned);
-                    match z {
-                        Some(z) if z < 0 => (0, z, i, c),
-                        Some(z) if z > 0 => (3, z, i, c),
-                        _ if positioned => (2, 0, i, c),
-                        _ => (1, 0, i, c),
-                    }
-                })
-                .collect();
-            order.sort_by_key(|o| (o.0, o.1, o.2));
-            for (_, _, _, child) in order {
+        if ifc.is_none() {
+            // Normal flow (Appendix E steps 3-5), tree order; positioned and
+            // stacking-context boxes were hoisted into their context's layers.
+            for child in layout.taffy.children(node_id).unwrap_or_default() {
+                if is_layered(layout, child) {
+                    continue;
+                }
                 draw_node(
                     child, current_x, current_y, inherited, layout, font, font_bold, surface,
                     width, height, sx, sy, damage_rects, child_clip,
                 );
             }
         }
+        // Steps 6-7: z-index auto/0 positioned boxes in tree order, then
+        // positive z-index ascending.
+        paint_layers(&layers[split..], surface);
     }
 
     let root_inherited = Inherited {

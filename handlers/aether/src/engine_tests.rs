@@ -2539,6 +2539,43 @@ mod tests {
         assert_eq!(x, 30.0, "the line box is shortened by the float");
     }
 
+    /// CSS 2.2 Appendix E / §9.9.1 known answers: a z-index inside a
+    /// z-indexed parent never rises above the parent's context (z100 in z1
+    /// stays under a z2 sibling); positioned descendants of a z-index:auto
+    /// parent are hoisted into the root context (z3 under an auto parent
+    /// beats a later z2); a negative z-index paints under in-flow content of
+    /// the root context but over the canvas; opacity 0.5 composites the
+    /// group once (an overlap of two opaque children shows only the top one,
+    /// half mixed with white).
+    #[test]
+    fn test_stacking_context_kat() {
+        let t = laid_out(
+            r#"<html><body>
+            <div style="position:relative;height:100px">
+              <div style="position:relative;z-index:1"><div style="position:absolute;left:0;top:0;width:40px;height:40px;background:#ff0000;z-index:100"></div></div>
+              <div style="position:absolute;left:20px;top:20px;width:40px;height:40px;background:#00ff00;z-index:2"></div>
+              <div style="position:relative"><div style="position:absolute;left:100px;top:0;width:40px;height:40px;background:#0000ff;z-index:3"></div></div>
+              <div style="position:absolute;left:120px;top:20px;width:40px;height:40px;background:#ffff00;z-index:2"></div>
+            </div>
+            <div style="height:40px;width:100px;background:#ff00ff"><div style="position:absolute;z-index:-1;left:0;top:0;width:200px;height:40px;background:#00ffff"></div></div>
+            <div style="opacity:0.5;position:relative;height:60px"><div style="position:absolute;left:0;top:0;width:40px;height:40px;background:#ff0000"></div><div style="position:absolute;left:20px;top:20px;width:40px;height:40px;background:#0000ff"></div></div>
+            </body></html>"#,
+            "body{margin:0}",
+        );
+        let (w, h) = (200u32, 220u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; (surface[i + 2], surface[i + 1], surface[i]) }; // BGRA
+        assert_eq!(px(30, 30), (0, 255, 0), "z100 inside a z1 context stays under the z2 sibling");
+        assert_eq!(px(130, 30), (0, 0, 255), "z3 under a z-index:auto parent is hoisted over the later z2");
+        assert_eq!(px(10, 110), (255, 0, 255), "in-flow background over the negative z-index box");
+        assert_eq!(px(150, 110), (0, 255, 255), "the negative z-index box over the canvas beside the flow");
+        let ov = px(30, 170);
+        assert!(ov.0 < 140 && ov.1 > 110 && ov.1 < 145 && ov.2 > 240, "group opacity: only the top box, half mixed: {ov:?}");
+        let red = px(5, 145);
+        assert!(red.0 > 240 && red.1 > 110 && red.1 < 145, "red at half opacity over white: {red:?}");
+    }
+
     /// CSS 2.2 Appendix E: a higher z-index paints over a later sibling;
     /// position: fixed with bottom: 0 sits at the viewport's bottom edge.
     #[test]
