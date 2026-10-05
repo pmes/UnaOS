@@ -184,8 +184,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         vbox.append(&Label::new(Some("Model")));
         // VEINPROV (B303): the menu is the provider seam's model list, preselected on the
         // provider/model the person configured in Principia's `vein` namespace (no hardcoded list).
-        let store = principia::prefs::PrefStore::load(principia::default_prefs_path()).ok();
-        let pref = |k: &str| store.as_ref().and_then(|s| s.get(gneiss_pal::api::PREF_NS, k));
+        let store = Rc::new(principia::prefs::PrefStore::load(principia::default_prefs_path()).ok());
+        let pref = |k: &str| store.as_ref().as_ref().and_then(|s| s.get(gneiss_pal::api::PREF_NS, k));
         let configured = gneiss_pal::api::ProviderConfig::from_prefs(pref).ok();
         // EMBED (B317): the embedder is its own setting (R81); the label names both halves.
         let embed_cfg = gneiss_pal::api::EmbedConfig::from_prefs(pref, |k| std::env::var(k).ok()).ok();
@@ -200,6 +200,34 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
             embed_cfg.as_ref(),
         );
         vbox.append(&Label::new(Some(provider_label.as_str())));
+        // VEINTURNS (SR42): choosing a provider WRITES it — `vein.provider` and `vein.model`
+        // as Principia `PrefSet`s on the bus (Vein forwards the UI channel's PrefSet; Principia
+        // validates against the schema, persists, broadcasts PrefChanged; Vein rebuilds its
+        // provider) — and the line under it shows that provider's status, built exactly as
+        // Vein builds it (`ONLINE (claudecode / default)` or `NO PROVIDER :: <fix>`).
+        let status_label = Label::new(Some(
+            gneiss_pal::api::probe_provider(&pref, |k| std::env::var(k).ok()).as_str(),
+        ));
+        vbox.append(&status_label);
+        let tx_pref = tx_node_create.clone();
+        let store_for_probe = store.clone();
+        dropdown.connect_selected_notify(move |dd| {
+            let Some(label) = dd.selected_item().and_then(|o| o.downcast::<StringObject>().ok()) else { return };
+            let Some(writes) = gneiss_pal::api::menu_choice_prefs(label.string().as_str()) else { return };
+            for (key, value) in writes.iter().cloned() {
+                let _ = tx_pref.send_blocking(bandy::SMessage::Principia(bandy::PrincipiaCommand::PrefSet {
+                    ns: gneiss_pal::api::PREF_NS.to_string(),
+                    key: key.to_string(),
+                    value,
+                }));
+            }
+            let chosen = |k: &str| {
+                writes.iter().find(|(wk, _)| *wk == k).map(|(_, v)| v.clone()).or_else(|| {
+                    store_for_probe.as_ref().as_ref().and_then(|s| s.get(gneiss_pal::api::PREF_NS, k))
+                })
+            };
+            status_label.set_text(gneiss_pal::api::probe_provider(chosen, |k| std::env::var(k).ok()).as_str());
+        });
 
         let hbox_hist = Box::new(Orientation::Horizontal, 12);
         hbox_hist.append(&Label::new(Some("Enable History")));

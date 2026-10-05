@@ -1,0 +1,49 @@
+# DEPS (SR31, R83): rows that MUST wait behind crates.io's latest stable.
+#
+# `tools/deps-audit/run.py --check` fails on every dependency behind latest stable (policy `any`)
+# EXCEPT the crates pinned here. Each pin carries:
+#   crate    the crates.io name
+#   reason   why it cannot move yet (one sentence, it lands in docs/dev/DEPS.md)
+#   ledger   the ledger row that owns the wait (the pin dies with that row)
+#   until    optional: the newest stable this pin anticipated; a newer release re-opens the gate
+#   consumers optional: the pin covers only these consumers; any other lagging consumer re-opens it
+#
+# A pin whose row has become current is reported as stale by --check: delete it.
+
+[[pin]]
+crate = "bincode"
+reason = "bincode 3.0.0 is a tombstone release (its whole lib.rs is `compile_error!(\"https://xkcd.com/2347/\")`), so 2.0.x is the newest bincode that compiles; the dependency dies with arc UNAFSCODEC (hand-packed LE codec in `unafs::codec`)"
+ledger = "SR31"
+until = "3.0.0"
+
+[[pin]]
+crate = "cxx-qt"
+reason = "Quartzite's optional `qt` embassy: 0.9 -> 0.10 changes the bridge macros and cxx-qt-build runs qmake, and no Qt 6 SDK exists in the audit container to prove the callers; the bump is owed on a Qt-equipped host"
+ledger = "SR31"
+until = "0.10.0"
+
+[[pin]]
+crate = "cxx-qt-lib"
+reason = "moves with cxx-qt (Quartzite `qt` embassy; no Qt 6 SDK to prove the callers here)"
+ledger = "SR31"
+until = "0.10.0"
+
+[[pin]]
+crate = "cxx-qt-build"
+reason = "moves with cxx-qt (Quartzite `qt` embassy build script runs qmake; no Qt 6 SDK here)"
+ledger = "SR31"
+until = "0.10.0"
+
+[[pin]]
+crate = "gtk4"
+consumers = ["vug"]
+reason = "Vug is outside every workspace (commented out of the root members, no lockfile) so cargo cannot build it to prove a 0.10 -> 0.11 caller move; its manifest moves when Vug rejoins the workspace"
+ledger = "SR31"
+until = "0.11.5"
+
+[[pin]]
+crate = "glib"
+consumers = ["vug"]
+reason = "moves with gtk4 in Vug (outside every workspace; unbuildable as declared)"
+ledger = "SR31"
+until = "0.22.10"

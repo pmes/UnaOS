@@ -208,7 +208,7 @@ fn read_boot_volume_serial() -> (u32, &'static str) {
         },
         Err(_) => return (0, "LoadedImage protocol unavailable"),
     };
-    let bio = match unsafe {
+    let mut bio = match unsafe {
         boot::open_protocol::<BlockIO>(
             OpenProtocolParams { handle: device, agent: image, controller: None },
             OpenProtocolAttributes::GetProtocol,
@@ -217,8 +217,11 @@ fn read_boot_volume_serial() -> (u32, &'static str) {
         Ok(p) => p,
         Err(_) => return (0, "no BlockIO on the loaded-image device"),
     };
+    // uefi 0.41: `read_blocks` takes `&mut self` (the firmware updates the media struct during the
+    // call), so the three media facts are copied out before the borrow of `media()` ends.
     let media = bio.media();
     let bs = media.block_size() as usize;
+    let media_id = media.media_id();
     if !media.is_media_present() {
         return (0, "no media present");
     }
@@ -226,7 +229,7 @@ fn read_boot_volume_serial() -> (u32, &'static str) {
         return (0, "unsupported block size");
     }
     let mut buf = Buf([0u8; 4096]);
-    if bio.read_blocks(media.media_id(), 0, &mut buf.0[..bs]).is_err() {
+    if bio.read_blocks(media_id, 0, &mut buf.0[..bs]).is_err() {
         return (0, "LBA 0 read failed");
     }
     let sec = &buf.0[..bs];
