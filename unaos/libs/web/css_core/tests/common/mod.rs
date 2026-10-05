@@ -1,5 +1,6 @@
 //! Shared test plumbing: pinned vector fetch (curl + crypto_core SHA-256) and the JSON reader.
 #![allow(dead_code)]
+pub mod dom;
 pub mod json;
 
 use std::path::PathBuf;

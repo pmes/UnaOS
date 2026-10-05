@@ -2,6 +2,8 @@
 //!
 //! * [`tokenizer`] / [`parser`] — CSS Syntax Module Level 3 (§4 tokenization, §5 parsing, error recovery).
 //! * [`anb`] / [`urange`] — the An+B (§6) and `<urange>` (§7.1) microsyntaxes.
+//! * [`selectors`] — Selectors Level 4 grammar and specificity; [`matching`] — the matcher over the
+//!   abstract [`matching::Element`] trait.
 //!
 //! `no_std` + `alloc`, no dependencies, no `unsafe`.
 #![no_std]
@@ -10,7 +12,9 @@
 extern crate alloc;
 
 pub mod anb;
+pub mod matching;
 pub mod parser;
+pub mod selectors;
 pub mod tokenizer;
 pub mod urange;
 
