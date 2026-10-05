@@ -156,7 +156,7 @@ fn fd_meta(p: &LinuxProc, fdn: u64) -> Result<(u32, u64, u64), i64> {
     let k = fd::lk(&d.k);
     Ok(match &*k {
         Kind::Console => (0o020620, 0, 1),
-        Kind::File { data, path, .. } => (0o100644, data.len() as u64, sys::ino_of(path)),
+        Kind::File { path, .. } => (0o100644, sys::fsize(path), sys::ino_of(path)),
         Kind::Dir { path, .. } => (0o040755, 0, sys::ino_of(path)),
         Kind::PipeR(pp) | Kind::PipeW(pp) => (0o010600, fd::lk(&pp.buf).len() as u64, 2),
         Kind::Ext(x) => (mode(x), 0, 3),
@@ -257,9 +257,10 @@ fn ftruncate(p: &mut LinuxProc, fdn: u64, len: i64) -> i64 {
     let Some(d) = sys::get(p, fdn) else { return -EBADF };
     let mut k = fd::lk(&d.k);
     match &mut *k {
-        Kind::File { path, data, write: true, .. } => {
+        Kind::File { path, write: true, .. } => {
             let path = path.clone();
-            set_len(&path, len as u64, data)
+            let mut cur = prefix(&path, len as u64); // SELFBUILD3: no slurped copy — the kept prefix from the VFS
+            set_len(&path, len as u64, &mut cur)
         }
         Kind::File { .. } => -EINVAL, // not open for writing
         _ => -EINVAL,
@@ -276,7 +277,8 @@ fn truncate_path(p: &mut LinuxProc, path_va: u64, len: i64) -> i64 {
     };
     let mt = crate::shell::vfs_mount_table();
     let Ok(st) = mt.stat(&full) else { return -ENOENT };
-    let mut cur = if (len as u64) < st.size { mt.read(&full, 0, st.size as usize).unwrap_or_default() } else { alloc::vec![0u8; st.size as usize] };
+    let _ = (mt, st);
+    let mut cur = prefix(&full, len as u64);
     set_len(&full, len as u64, &mut cur)
 }
 
@@ -294,12 +296,14 @@ fn fallocate(p: &mut LinuxProc, fdn: u64, mode: u64, off: i64, len: i64) -> i64 
     let Some(d) = sys::get(p, fdn) else { return -EBADF };
     let mut k = fd::lk(&d.k);
     match &mut *k {
-        Kind::File { path, data, write: true, .. } => {
-            if end <= data.len() as u64 {
+        Kind::File { path, write: true, .. } => {
+            let path = path.clone();
+            let size = sys::fsize(&path);
+            if end <= size {
                 return 0;
             }
-            let path = path.clone();
-            set_len(&path, end, data)
+            let mut cur = prefix(&path, end);
+            set_len(&path, end, &mut cur)
         }
         Kind::File { .. } => -EBADF,
         _ => -EINVAL,
@@ -511,11 +515,12 @@ fn sendfile(p: &mut LinuxProc, out: u64, inp: u64, offp: u64, count: u64) -> i64
         return -EFAULT;
     }
     let (chunk, start) = match &*fd::lk(&din.k) {
-        Kind::File { data, pos, read: true, .. } => {
+        Kind::File { path, pos, read: true, .. } => {
             let start = if offp != 0 { u64::from_le_bytes(off) } else { *pos };
-            let s = (start as usize).min(data.len());
-            let e = s.saturating_add(cnt).min(data.len());
-            (data[s..e].to_vec(), start)
+            match sys::file_read(path, start, cnt) {
+                Ok(v) => (v, start), // SELFBUILD3: from the VFS, not a slurped copy
+                Err(e) => return e,
+            }
         }
         Kind::File { .. } => return -EBADF,
         _ => return -EINVAL,
@@ -570,4 +575,15 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, nr: u64, a: [u64; 6]) -> 
         40 => sendfile(p, a[0], a[1], a[2], a[3]),
         _ => return None,
     })
+}
+
+/// SELFBUILD3: what `set_len` needs to know of the file — its bytes up to `len` when shrinking (the prefix a rewrite keeps), else a
+/// zero buffer of the current size (only its LENGTH is read on the grow path).
+fn prefix(path: &str, len: u64) -> Vec<u8> {
+    let size = sys::fsize(path);
+    if len < size {
+        sys::file_read(path, 0, size as usize).unwrap_or_default()
+    } else {
+        alloc::vec![0u8; size as usize]
+    }
 }

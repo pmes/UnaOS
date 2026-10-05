@@ -24,7 +24,8 @@ pub struct Pipe {
 pub enum Kind {
     /// The shell window: reads pop a line from [`STDIN`], writes go to serial + [`OUT`].
     Console,
-    File { path: String, data: Vec<u8>, pos: u64, read: bool, write: bool },
+    /// SELFBUILD3: no slurped copy — every read/write/mmap goes to the VFS by `path` (all descriptions see one file).
+    File { path: String, pos: u64, read: bool, write: bool },
     Dir { path: String, ents: Vec<(String, bool)>, pos: usize },
     PipeR(Arc<Pipe>),
     PipeW(Arc<Pipe>),
