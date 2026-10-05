@@ -106,6 +106,12 @@ pub struct PaintStyle {
     pub position_kind: Option<u8>,
     /// z-index: Some(None) = auto, Some(Some(z)) = an integer.
     pub z_index: Option<Option<i32>>,
+    /// display: list-item (true) / any other display (false).
+    pub list_item: Option<bool>,
+    /// list-style-type: 0 none, 1 disc, 2 circle, 3 square, 4 decimal,
+    /// 5 lower-alpha, 6 upper-alpha, 7 lower-roman, 8 upper-roman,
+    /// 9 decimal-leading-zero. Inherited.
+    pub list_style: Option<u8>,
 }
 
 pub struct LayoutTree {

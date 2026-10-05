@@ -2505,4 +2505,16 @@ mod tests {
         let bar = px(100, h - 5);
         assert!(bar.1 > 200 && bar.0 < 50, "fixed bar at the viewport bottom: {bar:?}");
     }
+
+    /// css-counter-styles-3 predefined styles as list markers.
+    #[test]
+    fn test_marker_text_kat() {
+        use crate::render::marker_text;
+        assert_eq!(marker_text(4, 3), "3. ");
+        assert_eq!(marker_text(5, 28), "ab. ");
+        assert_eq!(marker_text(6, 1), "A. ");
+        assert_eq!(marker_text(7, 1994), "mcmxciv. ");
+        assert_eq!(marker_text(8, 4), "IV. ");
+        assert_eq!(marker_text(9, 7), "07. ");
+    }
 }

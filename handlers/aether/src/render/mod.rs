@@ -25,6 +25,8 @@ struct Inherited {
     line_through: bool,
     /// vertical-align super/sub: paint-time baseline shift in px.
     shift_y: f32,
+    /// list-style-type in effect (layout::PaintStyle::list_style codes).
+    list_style: u8,
     family: u8, // 0 sans, 1 serif, 2 mono
     /// The image-replacement idiom: this subtree's text is off-box, but
     /// its boxes and backgrounds still paint.
@@ -522,6 +524,110 @@ fn draw_lines(
     }
 }
 
+/// The ordinal of a list item: its `value`, else the list's `start` (1)
+/// plus the number of preceding items (`reversed` counts down).
+fn list_ordinal(li: &kuchiki::NodeRef) -> i64 {
+    let attr_num = |n: &kuchiki::NodeRef, a: &str| {
+        n.as_element().and_then(|e| e.attributes.borrow().get(a).and_then(|v| v.trim().parse::<i64>().ok()))
+    };
+    if let Some(v) = attr_num(li, "value") {
+        return v;
+    }
+    let is_li = |n: &kuchiki::NodeRef| n.as_element().is_some_and(|e| e.name.local.as_ref() == "li");
+    let before = li.preceding_siblings().filter(|n| is_li(n)).count() as i64;
+    let parent = li.parent();
+    let reversed = parent.as_ref().and_then(|p| p.as_element().map(|e| e.attributes.borrow().get("reversed").is_some())).unwrap_or(false);
+    if reversed {
+        let total = parent.as_ref().map(|p| p.children().filter(|n| is_li(n)).count() as i64).unwrap_or(1);
+        parent.as_ref().and_then(|p| attr_num(p, "start")).unwrap_or(total) - before
+    } else {
+        parent.as_ref().and_then(|p| attr_num(p, "start")).unwrap_or(1) + before
+    }
+}
+
+fn roman(mut n: i64) -> String {
+    if n <= 0 || n >= 4000 {
+        return n.to_string();
+    }
+    let table = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")];
+    let mut s = String::new();
+    for (v, r) in table {
+        while n >= v {
+            s.push_str(r);
+            n -= v;
+        }
+    }
+    s
+}
+
+fn alpha(n: i64) -> String {
+    if n <= 0 {
+        return n.to_string();
+    }
+    let mut n = n;
+    let mut s = Vec::new();
+    while n > 0 {
+        n -= 1;
+        s.push((b'a' + (n % 26) as u8) as char);
+        n /= 26;
+    }
+    s.iter().rev().collect()
+}
+
+/// The marker text of a counter style (css-counter-styles-3 §6-7 for the
+/// predefined styles): "3. ", "c. ", "iv. ", "03. ".
+pub(crate) fn marker_text(style: u8, n: i64) -> String {
+    let body = match style {
+        5 => alpha(n),
+        6 => alpha(n).to_uppercase(),
+        7 => roman(n),
+        8 => roman(n).to_uppercase(),
+        9 if (0..10).contains(&n) => format!("0{n}"),
+        _ => n.to_string(),
+    };
+    format!("{body}. ")
+}
+
+/// Paints an outside list marker. Bullets are Blink's shapes — a disc,
+/// circle or square of about a third of the em, centred ~0.27em above the
+/// baseline, its left edge one em before the content edge; counters are
+/// the marker text in the item's font, ending at the content edge.
+#[allow(clippy::too_many_arguments)]
+fn paint_marker(
+    li: &kuchiki::NodeRef, style: u8, content_x: f32, baseline: f32, font: &Font, key: u8, fs: f32,
+    color: (u8, u8, u8), surface: &mut [u8], width: u32, height: u32,
+    damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    if (1..=3).contains(&style) {
+        let d = (fs * 0.31).round().max(3.0);
+        let x = (content_x - fs).round();
+        let cy = baseline - (fs * 0.27).round();
+        let y = (cy - d / 2.0).round();
+        let mut blend_at = |px: u32, py: u32, c: (u8, u8, u8), a: f32| {
+            if !in_damage(px, py, damage_rects) || !in_clip(px, py, clip) {
+                return;
+            }
+            if a >= 0.999 {
+                put_px(surface, width, px, py, c);
+            } else if a > 0.0 {
+                blend_px(surface, width, px, py, c, (a * 255.0).round() as u8);
+            }
+        };
+        match style {
+            1 => boxpaint::paint(x, y, d, d, [d / 2.0; 4], [None; 4], Some(color), width, height, &mut blend_at),
+            2 => boxpaint::paint(x, y, d, d, [d / 2.0; 4], [Some((1.0, color, 0)); 4], None, width, height, &mut blend_at),
+            _ => boxpaint::paint(x, y, d, d, [0.0; 4], [None; 4], Some(color), width, height, &mut blend_at),
+        }
+        return;
+    }
+    let text = marker_text(style, list_ordinal(li));
+    let adv = crate::fonts::lines::Advancer::new(font, key, fs, 0.0);
+    let w = adv.str(&text);
+    let mode = crate::fonts::lines::TextMode { white_space: 2, ..Default::default() };
+    let top = baseline - crate::fonts::baseline_offset(font, fs, 0.0);
+    draw_lines(&text, content_x - w, top, f32::MAX, font, key, fs, 0.0, color, &mode, Deco::default(), surface, width, height, damage_rects, clip);
+}
+
 /// A checkbox or radio at Chromium's control-theme look: 13x13, a 1px
 /// #767676 frame (radius 2, or a circle) on white; checked, a #0075ff fill
 /// with a white tick, or a #0075ff ring around a #0075ff dot.
@@ -852,6 +958,22 @@ pub fn render_frame(
                 inherited.line_through = spec
                     .line_through
                     .unwrap_or_else(|| crate::layout::default_line_through(tag, inherited.line_through));
+                // html.css list styles: ul disc (circle one level down,
+                // square deeper), ol decimal; inherited into the items.
+                match tag {
+                    "ul" | "menu" | "dir" => {
+                        let depth = dom_node
+                            .ancestors()
+                            .filter(|a| a.as_element().is_some_and(|e| matches!(e.name.local.as_ref(), "ul" | "ol" | "menu" | "dir")))
+                            .count();
+                        inherited.list_style = [1, 2, 3][depth.min(2)];
+                    }
+                    "ol" => inherited.list_style = 4,
+                    _ => {}
+                }
+                if let Some(ls) = spec.list_style {
+                    inherited.list_style = ls;
+                }
                 // Blink: super raises by parent-size/3 + 1, sub lowers by
                 // parent-size/5 + 1.
                 match tag {
@@ -1244,6 +1366,20 @@ pub fn render_frame(
                         stroke(bx1 - px(w), by0, bx1, by1, c);
                     }
                 }
+                // css-lists-3 §3.1: an outside ::marker for a list item,
+                // its first line's baseline, ending at the content edge.
+                let is_item = spec.list_item.unwrap_or(tag == "li");
+                if is_item && inherited.list_style != 0 && !inherited.text_hidden {
+                    if let Some(f) = crate::fonts::face(inherited.family, inherited.bold, inherited.italic) {
+                        let fs = inherited.font_size;
+                        let base = content_y + crate::fonts::baseline_offset(&f, fs, inherited.line_height);
+                        paint_marker(
+                            dom_node, inherited.list_style, content_x, base, &f,
+                            crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
+                            fs, inherited.color, surface, width, height, damage_rects, clip,
+                        );
+                    }
+                }
             } else if dom_node.as_text().is_some() && !inherited.text_hidden {
                 // The same face the measurer wrapped this run with
                 // (fonts::face): family x weight x style. The preloaded sans
@@ -1392,6 +1528,7 @@ pub fn render_frame(
         letter_spacing: 0.0,
         line_through: false,
         shift_y: 0.0,
+        list_style: 1,
         family: 0,
         text_hidden: false,
         text_transform: 0,

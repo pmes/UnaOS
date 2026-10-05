@@ -154,7 +154,32 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 "none" | "inherit" | "initial" | "unset" | "revert" => None,
                 _ => Some(1),
             };
+            if !matches!(value, "inherit" | "initial" | "unset" | "revert") {
+                style.paint.list_item = Some(value == "list-item");
+            }
             apply_display(value, style);
+        }
+        // css-lists-3 §3: the marker style (inherited); `list-style` takes
+        // its type keyword (position/image parts are not painted).
+        "list-style-type" | "list-style" => {
+            for part in value.split_whitespace() {
+                let code = match part {
+                    "none" => Some(0),
+                    "disc" => Some(1),
+                    "circle" => Some(2),
+                    "square" => Some(3),
+                    "decimal" => Some(4),
+                    "lower-alpha" | "lower-latin" => Some(5),
+                    "upper-alpha" | "upper-latin" => Some(6),
+                    "lower-roman" => Some(7),
+                    "upper-roman" => Some(8),
+                    "decimal-leading-zero" => Some(9),
+                    _ => None,
+                };
+                if code.is_some() {
+                    style.paint.list_style = code;
+                }
+            }
         }
         "flex-direction" => match value {
             "row" => style.flex_direction = Some(FlexDirection::Row),
@@ -1879,6 +1904,7 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         mask_repeat, text_align, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
+        list_item, list_style,
     );
     clone!(pct_math);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
