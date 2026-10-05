@@ -176,6 +176,9 @@ pub struct Page {
     /// fetches collapse), so the ordinal is what lets the loader hand
     /// `document.currentScript` the element a running script came from.
     pub script_nodes: Vec<usize>,
+    /// Parallel to `scripts`: the absolute URL an external script was fetched from ("" for inline).
+    /// The loader runs scripts as the parser reaches them; it takes external sources from here by URL.
+    pub script_urls: Vec<String>,
     /// Absolute URL of the page's favicon ([`favicon_url`]), resolved at parse
     /// time but NOT fetched here — the shell fetches it after the page is
     /// delivered so chrome decoration never delays a load.
@@ -189,6 +192,8 @@ pub struct Page {
 pub struct ScriptSlot {
     pub ordinal: usize,
     pub text: Option<String>,
+    /// The absolute `src` URL of an external script.
+    pub url: Option<String>,
 }
 
 /// Collects the page's scripts in document order: inline text directly,
@@ -221,15 +226,15 @@ pub fn collect_scripts(base_url: &str, html: &str) -> (Vec<ScriptSlot>, Vec<(usi
                         crate::ledger::record_js("script-fetch-cap-reached");
                         continue;
                     }
-                    external.push((slots.len(), abs));
-                    slots.push(ScriptSlot { ordinal, text: None });
+                    external.push((slots.len(), abs.clone()));
+                    slots.push(ScriptSlot { ordinal, text: None, url: Some(abs) });
                 }
                 continue;
             }
             drop(attrs);
             let text = script.as_node().text_contents();
             if !text.trim().is_empty() {
-                slots.push(ScriptSlot { ordinal, text: Some(text) });
+                slots.push(ScriptSlot { ordinal, text: Some(text), url: None });
             }
         }
     }
@@ -662,14 +667,16 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     }
     let mut scripts = Vec::new();
     let mut script_nodes = Vec::new();
+    let mut script_urls = Vec::new();
     for slot in slots {
         if let Some(text) = slot.text {
             scripts.push(text);
             script_nodes.push(slot.ordinal);
+            script_urls.push(slot.url.unwrap_or_default());
         }
     }
     let favicon = favicon_url(&base, &html);
-    Ok(Page { base_url: base, html, sheets, images, scripts, script_nodes, favicon })
+    Ok(Page { base_url: base, html, sheets, images, scripts, script_nodes, script_urls, favicon })
 }
 
 #[cfg(test)]

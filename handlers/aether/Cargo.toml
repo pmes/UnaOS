@@ -19,8 +19,8 @@ image-fallback = ["image/default-formats"]
 svg = ["dep:resvg"]
 
 [dependencies]
-boa_engine = "0.22"
-boa_gc = "0.22"
+# AETHERJS (SR63): pages run on UnaOS's own ECMAScript engine (JSCORE, SR55) — boa_engine/boa_gc are gone.
+js_core = { path = "../../unaos/libs/web/js_core" }
 # AETHERDOM (SR49): the document model is UnaOS's own WHATWG parser + arena DOM (HTMLCORE, SR46).
 html_core = { path = "../../unaos/libs/web/html_core" }
 # AETHERSTYLE (SR54): CSS parsing, selector matching, @media/@supports/@layer, the cascade sort, var() and

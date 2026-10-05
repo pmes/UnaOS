@@ -1828,6 +1828,9 @@ pub fn render_frame(
                     let face = crate::fonts::face(&inherited.sel());
                     if let Some(font) = face.or(*font) {
                         let adv = inherited.advancer();
+                        // A value script (or the user) set is the control's value (the dirty value
+                        // flag, HTML §4.10.5.4); the attribute is only its default.
+                        let dirty = crate::js::control_value(dom_node);
                         let attrs = el.attributes.borrow();
                         // A <select> paints the SELECTED OPTION'S TEXT, not
                         // its submit value: layout publishes the visible label
@@ -1837,6 +1840,7 @@ pub fn render_frame(
                             .then(|| attrs.get("data-aether-label"))
                             .flatten()
                             .filter(|v| !v.is_empty())
+                            .or_else(|| dirty.as_deref())
                             .or_else(|| attrs.get("value"))
                             .filter(|v| !v.is_empty());
                         let is_placeholder = shown.is_none();

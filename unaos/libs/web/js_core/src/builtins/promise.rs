@@ -67,6 +67,9 @@ fn settle(vm: &mut Vm, p: Obj, v: Value, fulfill: bool) {
     };
     if !fulfill && !handled {
         vm.host.promise_rejection(p, 0);
+        if vm.track_rejections {
+            vm.rejected_unhandled.push(p);
+        }
     }
     let realm = vm.cur_realm;
     for r in reactions {
@@ -215,6 +218,9 @@ pub fn perform_then(vm: &mut Vm, p: Obj, on_ok: Value, on_err: Value, cap: Optio
         PromiseState::Rejected => {
             if !handled {
                 vm.host.promise_rejection(p, 1);
+                if vm.track_rejections {
+                    vm.rejected_unhandled.retain(|&q| q != p);
+                }
             }
             vm.jobs.push_back(Job::Reaction { handler: on_err, argument: res, capability: cap, fulfill: false, realm })
         }

@@ -11,59 +11,23 @@
 //! `crate::ledger::record_js`, so a page that leaned on the missing part
 //! shows up as a gap rather than as silence.
 
-use boa_engine::{
-    Context, JsValue,
-    native_function::NativeFunction,
-    object::{ObjectInitializer, builtins::JsArray},
-    property::Attribute,
-};
+use crate::js::idl;
+use js_core::vm::*;
 
-fn str_arg(args: &[JsValue], i: usize, ctx: &mut Context) -> String {
-    args.get(i)
-        .cloned()
-        .unwrap_or_default()
-        .to_string(ctx)
-        .map(|s| s.to_std_string_escaped())
-        .unwrap_or_default()
+fn str_arg(vm: &mut Vm, ctx: &CallCtx, i: usize) -> JsResult<String> {
+    let v = vm.arg(ctx, i);
+    Ok(vm.to_string(&v)?.to_rust())
 }
 
-/// Serialises a parsed `Url` into the component bag the JS `URL` class
-/// reads. Every field is what the `url` crate actually computed — none of
-/// them are reconstructed by string surgery in JS.
-fn components(u: &url::Url, ctx: &mut Context) -> JsValue {
-    let s = |x: &str| boa_engine::string::JsString::from(x);
-    let port = u.port().map(|p| p.to_string()).unwrap_or_default();
-    let origin = match u.origin() {
-        url::Origin::Tuple(..) => u.origin().ascii_serialization(),
-        url::Origin::Opaque(_) => "null".to_string(),
-    };
-    let host = match (u.host_str(), u.port()) {
-        (Some(h), Some(p)) => format!("{h}:{p}"),
-        (Some(h), None) => h.to_string(),
-        (None, _) => String::new(),
-    };
-    let o = ObjectInitializer::new(ctx)
-        .property(s("href"), s(u.as_str()), Attribute::all())
-        .property(s("protocol"), s(&format!("{}:", u.scheme())), Attribute::all())
-        .property(s("username"), s(u.username()), Attribute::all())
-        .property(s("password"), s(u.password().unwrap_or("")), Attribute::all())
-        .property(s("host"), s(&host), Attribute::all())
-        .property(s("hostname"), s(u.host_str().unwrap_or("")), Attribute::all())
-        .property(s("port"), s(&port), Attribute::all())
-        .property(s("pathname"), s(u.path()), Attribute::all())
-        .property(
-            s("search"),
-            s(&u.query().map(|q| format!("?{q}")).unwrap_or_default()),
-            Attribute::all(),
-        )
-        .property(
-            s("hash"),
-            s(&u.fragment().map(|f| format!("#{f}")).unwrap_or_default()),
-            Attribute::all(),
-        )
-        .property(s("origin"), s(&origin), Attribute::all())
-        .build();
-    o.into()
+/// Serialises a parsed `Url` into the component bag the JS `URL` class reads. Every field is what the
+/// `url` crate actually computed — none of them are reconstructed by string surgery in JS.
+fn components(u: &url::Url, vm: &mut Vm) -> JsResult<Value> {
+    let o = vm.new_plain_object();
+    for part in ["href", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash", "origin"] {
+        let v = crate::js::html::url_part(u, part);
+        vm.create_data_property(o, PropertyKey::from_str(part), idl::s(&v))?;
+    }
+    Ok(Value::Object(o))
 }
 
 /// Reads `n` bytes from the OS entropy pool. `/dev/urandom` is the real
@@ -100,121 +64,84 @@ fn entropy(n: usize) -> Vec<u8> {
     out
 }
 
-pub fn init(context: &mut Context) {
-    // __url_parse(input, base) -> components | null. Relative resolution is
-    // the `url` crate's, so `new URL('../a', 'https://h/x/y/z')` lands
-    // exactly where the network stack would fetch it from.
-    let parse = NativeFunction::from_fn_ptr(|_this, args, ctx| {
-        let input = str_arg(args, 0, ctx);
-        let base = args.get(1).cloned().unwrap_or_default();
-        let parsed = if base.is_undefined() || base.is_null() {
-            url::Url::parse(&input)
-        } else {
-            let base = str_arg(args, 1, ctx);
-            match url::Url::parse(&base) {
-                Ok(b) => b.join(&input),
-                Err(e) => Err(e),
-            }
-        };
-        match parsed {
-            Ok(u) => Ok(components(&u, ctx)),
-            Err(_) => Ok(JsValue::null()),
-        }
-    });
-    let _ = context.register_global_callable("__url_parse".into(), 2, parse);
+/// `__url_parse(input, base)` → components | null. Relative resolution is the `url` crate's, so
+/// `new URL('../a', 'https://h/x/y/z')` lands exactly where the network stack would fetch it from.
+fn url_parse(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let input = str_arg(vm, ctx, 0)?;
+    let base = vm.arg(ctx, 1);
+    let parsed = if base.is_nullish() {
+        url::Url::parse(&input)
+    } else {
+        let base = str_arg(vm, ctx, 1)?;
+        url::Url::parse(&base).and_then(|b| b.join(&input))
+    };
+    match parsed {
+        Ok(u) => components(&u, vm),
+        Err(_) => Ok(Value::Null),
+    }
+}
 
-    // __url_set(href, part, value) -> components | null. Component writes
-    // go through the crate's own setters, which re-normalise the whole URL
-    // (a `hostname` write re-serialises the authority, a `protocol` write
-    // is refused when the scheme change is not permitted) instead of being
-    // spliced into the href string.
-    let set = NativeFunction::from_fn_ptr(|_this, args, ctx| {
-        let href = str_arg(args, 0, ctx);
-        let part = str_arg(args, 1, ctx);
-        let value = str_arg(args, 2, ctx);
-        let Ok(mut u) = url::Url::parse(&href) else { return Ok(JsValue::null()) };
-        let ok = match part.as_str() {
-            "protocol" => u.set_scheme(value.trim_end_matches(':')).is_ok(),
-            "username" => u.set_username(&value).is_ok(),
-            "password" => u
-                .set_password(if value.is_empty() { None } else { Some(&value) })
-                .is_ok(),
-            "hostname" => u.set_host(if value.is_empty() { None } else { Some(&value) }).is_ok(),
-            "host" => {
-                let (h, p) = match value.rsplit_once(':') {
-                    Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()),
-                    None => (value.clone(), None),
-                };
-                u.set_host(if h.is_empty() { None } else { Some(&h) }).is_ok() && u.set_port(p).is_ok()
-            }
-            "port" => u.set_port(value.parse::<u16>().ok()).is_ok(),
-            "pathname" => {
-                u.set_path(&value);
-                true
-            }
-            "search" => {
-                let q = value.trim_start_matches('?');
-                u.set_query(if q.is_empty() { None } else { Some(q) });
-                true
-            }
-            "hash" => {
-                let f = value.trim_start_matches('#');
-                u.set_fragment(if f.is_empty() { None } else { Some(f) });
-                true
-            }
-            _ => false,
-        };
-        if !ok {
-            // A refused component write is exactly what a browser does
-            // (silently), but it is worth seeing when a page depended on it.
-            crate::ledger::record_js(&format!("URL-set-refused:{part}"));
-        }
-        Ok(components(&u, ctx))
-    });
-    let _ = context.register_global_callable("__url_set".into(), 3, set);
+/// `__url_set(href, part, value)` → components | null. Component writes go through the crate's own
+/// setters, which re-normalise the whole URL.
+fn url_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let href = str_arg(vm, ctx, 0)?;
+    let part = str_arg(vm, ctx, 1)?;
+    let value = str_arg(vm, ctx, 2)?;
+    let Ok(mut u) = url::Url::parse(&href) else { return Ok(Value::Null) };
+    let before = u.to_string();
+    crate::js::html::set_url_part(&mut u, &part, &value);
+    if u.as_str() == before && !value.is_empty() && part != "search" && part != "hash" {
+        crate::ledger::record_js(&format!("URL-set-refused:{part}"));
+    }
+    components(&u, vm)
+}
 
-    // __random_bytes(n) -> array of n bytes from the OS entropy pool.
-    let rand = NativeFunction::from_fn_ptr(|_this, args, ctx| {
-        let n = args
-            .first()
-            .cloned()
-            .unwrap_or_default()
-            .to_number(ctx)
-            .unwrap_or(0.0)
-            .max(0.0)
-            .min(65536.0) as usize;
-        let bytes = entropy(n);
-        let arr = JsArray::from_iter(bytes.into_iter().map(|b| JsValue::from(b as u32)), ctx);
-        Ok(arr.into())
-    });
-    let _ = context.register_global_callable("__random_bytes".into(), 1, rand);
+/// `__random_bytes(n)` → array of n bytes from the OS entropy pool.
+fn random_bytes(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let v = vm.arg(ctx, 0);
+    let n = vm.to_number(&v)?.clamp(0.0, 65536.0) as usize;
+    let vals: Vec<Value> = entropy(n).into_iter().map(|b| Value::Number(b as f64)).collect();
+    Ok(Value::Object(vm.new_array(vals)))
+}
 
-    // __parse_document(html) -> wrapped document node. Same parser, same
-    // node wrapper, same query bindings as the live tree: a DOMParser
-    // document supports querySelector/getElementById/textContent for real.
-    let parse_doc = NativeFunction::from_fn_ptr(|_this, args, ctx| {
-        let html = str_arg(args, 0, ctx);
-        let doc = crate::dom::parse_html(&html);
-        let mut extras: Vec<(&str, crate::dom::NodeRef)> = Vec::new();
-        for (prop, sel) in [("documentElement", "html"), ("body", "body"), ("head", "head")] {
-            if let Ok(mut m) = doc.select(sel) {
-                if let Some(el) = m.next() {
-                    extras.push((prop, el.as_node().clone()));
-                }
-            }
-        }
-        let wrapped = crate::js::Engine::wrap_node(ctx, doc);
-        if let Some(obj) = wrapped.as_object() {
-            for (prop, node) in extras {
-                let w = crate::js::Engine::wrap_node(ctx, node);
-                let _ = obj.set(boa_engine::string::JsString::from(prop), w, false, ctx);
-            }
-        }
-        Ok(wrapped)
-    });
-    let _ = context.register_global_callable("__parse_document".into(), 1, parse_doc);
+/// `__parse_document(html)` → a new Document (HTML §8.5.1 DOMParser): parsed by html_core, imported
+/// whole into the page arena as its own document (scripts marked already started — they never run).
+fn parse_document(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let html = str_arg(vm, ctx, 0)?;
+    let parsed = html_core::parse_document(&html, crate::dom::parse_opts());
+    let url = crate::js::page_url();
+    let doc = crate::js::dom::new_document(true, "text/html", &url);
+    let top: Vec<html_core::NodeId> = parsed.children(html_core::Document::ROOT).collect();
+    for t in top {
+        let id = crate::js::dom::with_doc_mut(|d| crate::dom::import_tree(d, &parsed, t, false).0);
+        crate::js::dom::with_doc_mut(|d| d.append(html_core::NodeId(doc), html_core::NodeId(id)));
+    }
+    let ids: Vec<usize> = crate::js::dom::with_doc(|d| d.descendants(html_core::NodeId(doc)).map(|i| i.0).collect());
+    for i in ids {
+        crate::js::dom::set_node_doc(i, doc);
+        crate::js::dom::mark_script_started_if_script(i);
+    }
+    Ok(crate::js::dom::wrap(vm, doc))
+}
 
-    let _ = context.eval(boa_engine::Source::from_bytes(PRELUDE));
+pub fn init(vm: &mut Vm) {
+    let g = vm.realm().global;
+    for (name, len, f) in [
+        ("__url_parse", 2, url_parse as NativeFn),
+        ("__url_set", 3, url_set),
+        ("__random_bytes", 1, random_bytes),
+        ("__parse_document", 1, parse_document),
+    ] {
+        let fo = vm.make_native(name, len, f, false);
+        vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
+    }
+    for (label, src) in [("platform", PRELUDE), ("compat", COMPAT)] {
+        if let Err(e) = vm.run_script_str(src) {
+            let m = vm.error_string(&e);
+            crate::ledger::record_js(&format!("{label}-prelude-failed:{m}"));
+            eprintln!("[aether] {label} prelude failed: {m}");
+        }
+    }
 }
 
 /// The WHATWG object shapes over the natives above.
@@ -659,5 +586,91 @@ const PRELUDE: &str = r#"
         });
     }
     globalThis.crypto = crypto;
+})();
+"#;
+
+
+/// Platform pieces with honest, self-reporting approximations: Web Storage (in memory, per page),
+/// MessageChannel over the timer queue, the observer families (register, never deliver),
+/// `structuredClone` over the JSON-representable graph, `requestIdleCallback`.
+const COMPAT: &str = r#"
+(function () {
+    var mkStorage = function () {
+        var m = Object.create(null);
+        var keys = [];
+        var s = {
+            getItem: function (k) { k = String(k); return k in m ? m[k] : null; },
+            setItem: function (k, v) { k = String(k); if (!(k in m)) { keys.push(k); } m[k] = String(v); },
+            removeItem: function (k) { k = String(k); if (k in m) { delete m[k]; keys.splice(keys.indexOf(k), 1); } },
+            clear: function () { m = Object.create(null); keys = []; },
+            key: function (i) { return i >= 0 && i < keys.length ? keys[i] : null; },
+        };
+        Object.defineProperty(s, 'length', { get: function () { return keys.length; } });
+        return s;
+    };
+    var ls = mkStorage(), ss = mkStorage();
+    Object.defineProperty(globalThis, 'localStorage', { get: function () { return ls; }, configurable: true, enumerable: true });
+    Object.defineProperty(globalThis, 'sessionStorage', { get: function () { return ss; }, configurable: true, enumerable: true });
+
+    globalThis.MessageChannel = function MessageChannel() {
+        var mk = function () {
+            return {
+                onmessage: null, _l: [],
+                addEventListener: function (ev, cb) { if (ev === 'message') this._l.push(cb); },
+                removeEventListener: function (ev, cb) {
+                    if (ev === 'message') { var i = this._l.indexOf(cb); if (i >= 0) this._l.splice(i, 1); }
+                },
+                start: function () {}, close: function () {},
+            };
+        };
+        var a = mk(), b = mk();
+        var wire = function (from, to) {
+            from.postMessage = function (data) {
+                setTimeout(function () {
+                    var e = new MessageEvent('message', { data: data });
+                    if (typeof to.onmessage === 'function') { to.onmessage(e); }
+                    for (var i = 0; i < to._l.length; i++) { to._l[i](e); }
+                }, 0);
+            };
+        };
+        wire(a, b); wire(b, a);
+        this.port1 = a; this.port2 = b;
+    };
+
+    var mkObserver = function (kind) {
+        var C = function (cb) {
+            this._cb = cb;
+            this.root = null; this.rootMargin = '0px'; this.thresholds = [0];
+        };
+        C.prototype.observe = function () { __ledger('observer-never-delivers:' + kind); };
+        C.prototype.unobserve = function () {};
+        C.prototype.disconnect = function () {};
+        C.prototype.takeRecords = function () { return []; };
+        try { Object.defineProperty(C, 'name', { value: kind }); } catch (e) {}
+        return C;
+    };
+    globalThis.MutationObserver = mkObserver('MutationObserver');
+    globalThis.IntersectionObserver = mkObserver('IntersectionObserver');
+    globalThis.ResizeObserver = mkObserver('ResizeObserver');
+    globalThis.PerformanceObserver = mkObserver('PerformanceObserver');
+
+    globalThis.structuredClone = function (v) {
+        try { return v === undefined ? undefined : JSON.parse(JSON.stringify(v)); }
+        catch (e) { __ledger('structuredClone-nonjson'); return v; }
+    };
+
+    globalThis.requestIdleCallback = function (cb) {
+        return setTimeout(function () {
+            cb({ didTimeout: false, timeRemaining: function () { return 50; } });
+        }, 0);
+    };
+    globalThis.cancelIdleCallback = function (id) { clearTimeout(id); };
+
+    globalThis.customElements = {
+        define: function (name) { __ledger('customElements.define-not-upgrading:' + name); },
+        get: function () { return undefined; },
+        whenDefined: function () { return new Promise(function () {}); },
+        upgrade: function () {},
+    };
 })();
 "#;

@@ -176,8 +176,11 @@ impl AetherEngine {
     /// `select!` loop cannot service navigation while it is inside one.
     pub fn tick(&mut self) -> bool {
         if let Some(js) = &mut self.js_engine {
-            event_loop::fire_due_timers(&mut js.context);
-            let _ = js.context.run_jobs();
+            js.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
+            js.tick();
+        }
+        if let Some(url) = js::take_script_navigation() {
+            self.pending_nav = Some(forms::OpenDocument { url, method: forms::HttpMethod::Get, body: None });
         }
         if js::take_mutated() {
             self.relayout();
@@ -318,10 +321,17 @@ impl AetherEngine {
                 if let Some(node) = self.hit_test(x, y) {
                     // Script click handlers run first (bubbling); a handled
                     // click still follows links, matching default behavior.
+                    let mut canceled = false;
                     if let Some(js_engine) = &mut self.js_engine {
-                        if js::dispatch_event(&mut js_engine.context, &node, "click") {
+                        js_engine.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
+                        js_engine.click(&node);
+                        canceled = js::last_click_canceled();
+                        if js::take_mutated() {
                             self.relayout();
                         }
+                    }
+                    if canceled {
+                        return;
                     }
                     // A click on (or inside) a media element toggles it:
                     // play (PlayMedia toward Stria — the page's own stream,
@@ -398,9 +408,10 @@ impl AetherEngine {
         let mut form = forms::Form::new(resolved, method);
         if let Ok(inputs) = form_node.select("input, textarea, select") {
             for input in inputs {
+                let dirty = js::control_value(input.as_node());
                 let attrs = input.attributes.borrow();
                 let Some(name) = attrs.get("name") else { continue };
-                let value = attrs.get("value").unwrap_or("").to_string();
+                let value = dirty.unwrap_or_else(|| attrs.get("value").unwrap_or("").to_string());
                 form.add_input(name.to_string(), value);
             }
         }
@@ -504,7 +515,7 @@ impl AetherEngine {
             &page.base_url,
             &page.html,
             &page.sheets,
-            Some((&page.scripts, &page.script_nodes)),
+            Some((&page.scripts, &page.script_urls)),
             add_history,
         );
     }
@@ -514,18 +525,9 @@ impl AetherEngine {
         url: &str,
         html: &str,
         external_css: &[String],
-        scripts_override: Option<(&[String], &[usize])>,
+        scripts_override: Option<(&[String], &[String])>,
         add_history: bool,
     ) {
-        let document = dom::parse_html(html);
-        
-        self.title = "Aether Browser".to_string();
-        if let Ok(mut titles) = document.select("title") {
-            if let Some(title_node) = titles.next() {
-                self.title = title_node.as_node().text_contents();
-            }
-        }
-        
         if add_history {
             // Drop any forward entries beyond the current position, then
             // append. (Truncating AT the index wiped the current entry too —
@@ -538,128 +540,41 @@ impl AetherEngine {
         }
         
         // The previous document's media stop; this one's register below.
-        media::reset(&self.title);
+        media::reset("Aether Browser");
 
-        let mut js_engine = js::Engine::new(document.clone());
-        js_engine.set_location(url);
-        // UNAOS_JSDEBUG=1: trace each script's index/head/outcome to stderr
-        // (which script kills a page's boot is otherwise invisible).
-        let js_debug = std::env::var("UNAOS_JSDEBUG").is_ok();
-        // UNAOS_JSDUMP=<dir>: write every script's full source to
-        // <dir>/script-<NNN>.js before running it. A minified bundle's text is
-        // otherwise unreachable from outside (inline scripts never hit the
-        // network, and the fetched ones are concatenated in document order),
-        // so the only way to read the expression a stack trace points at is to
-        // dump exactly what the engine was handed.
-        let js_dump = std::env::var("UNAOS_JSDUMP").ok();
-        // UNAOS_JSPRELUDE=<file>: evaluate a script of our own *before* the
-        // page's, in the same realm. `UNAOS_JSEVAL` only reaches post-boot
-        // state, which is useless when boot itself throws — a prelude can wrap
-        // a global a bundle is about to install and report what flowed through
-        // it. Diagnostic only; never set in normal operation.
-        if let Ok(path) = std::env::var("UNAOS_JSPRELUDE") {
-            match std::fs::read_to_string(&path) {
-                Ok(src) => {
-                    if let Err(e) = js_engine.execute(&src) {
-                        eprintln!("[jsprelude] ERR: {}", e);
-                    }
-                }
-                Err(e) => eprintln!("[jsprelude] cannot read {}: {}", path, e),
-            }
-        }
-        // The `<script>` elements of THIS parse, in document order. The
-        // fetched script list carries, per source text, the ordinal of the
-        // element it came from (the two lists are not aligned — non-JS
-        // types, the fetch cap and failed fetches all drop entries), so this
-        // is what gives `document.currentScript` a real element to report.
-        let script_elements: Vec<crate::dom::NodeRef> = document
-            .select("script")
-            .map(|m| m.map(|el| el.as_node().clone()).collect())
-            .unwrap_or_default();
-        match scripts_override {
-            Some((scripts, script_nodes)) => {
-                for (i, text) in scripts.iter().enumerate() {
-                    js::set_current_script(
-                        script_nodes.get(i).and_then(|o| script_elements.get(*o)).cloned(),
-                    );
-                    if let Some(dir) = &js_dump {
-                        let _ = std::fs::create_dir_all(dir);
-                        let _ = std::fs::write(format!("{}/script-{:03}.js", dir, i), text);
-                    }
-                    let head: String = text.chars().take(60).filter(|c| !c.is_control()).collect();
-                    match js_engine.execute(text) {
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if js_debug {
-                                // Full message + stack: the ledger keeps a
-                                // 64-char digest, but a truncated stack names
-                                // no frames, which is the whole point here.
-                                eprintln!("[jsdebug] script {} ERR: {}\n  | head: {}", i, msg, head);
-                            }
-                            ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
-                        }
-                        Ok(_) if js_debug => eprintln!("[jsdebug] script {} ok | head: {}", i, head),
-                        Ok(_) => {}
-                    }
-                }
-            }
-            None => {
-                for script_node in &script_elements {
-                    let text = script_node.text_contents();
-                    if !text.trim().is_empty() {
-                        js::set_current_script(Some(script_node.clone()));
-                        if let Err(e) = js_engine.execute(&text) {
-                            let msg = e.to_string();
-                            ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
-                        }
-                    }
+        // AETHERJS (SR63): the document is parsed with its scripts executing in HTML §4.12.1 order
+        // (parser-blocking, defer, async, module; document.write during parse), then "the end"
+        // (DOMContentLoaded, load) and the bounded boot drain — all before first layout.
+        let mut pre = js::loader::Prefetched::default();
+        if let Some((scripts, urls)) = scripts_override {
+            for (text, url) in scripts.iter().zip(urls.iter()) {
+                if !url.is_empty() {
+                    pre.scripts.insert(url.clone(), text.clone());
                 }
             }
         }
-        // Out of the script list: everything after this — lifecycle events,
-        // timer and rAF drains, promise jobs — must see currentScript null,
-        // which is what the spec requires of those contexts anyway.
-        js::set_current_script(None);
+        let (document, mut js_engine) =
+            js::loader::load(url, html, pre, (self.width as f32, self.height as f32), external_css.to_vec());
+        self.title = "Aether Browser".to_string();
+        if let Ok(mut titles) = document.select("title") {
+            if let Some(title_node) = titles.next() {
+                self.title = title_node.as_node().text_contents();
+            }
+        }
 
-        // Drain zero-delay boot timers, then fire queued rAF callbacks in
-        // bounded passes (framework render paths), then drain the promise
-        // work they spawned — all before first layout.
-        //
-        // `boot_drain` is the bounded form of what used to be a bare
-        // `run_jobs()`: a fixed number of passes, each advancing the timer
-        // clock one frame and firing only what is due, so a boot timer that
-        // re-arms itself costs N passes instead of the whole load.
-        event_loop::boot_drain(&mut js_engine.context);
-        // Lifecycle events pages gate init on, then the rAF passes, then
-        // the promise work all of it spawned. readyState advances with the
-        // events rather than sitting at one value, so the
-        // `readyState === 'loading' ? wait : run now` fork every bundle
-        // writes takes the branch it would take in a browser.
-        let _ = js_engine.execute("document.readyState = 'interactive';");
-        js::dispatch_event(&mut js_engine.context, &document, "readystatechange");
-        js::dispatch_event(&mut js_engine.context, &document, "DOMContentLoaded");
-        let _ = js_engine.execute("document.readyState = 'complete';");
-        js::dispatch_event(&mut js_engine.context, &document, "readystatechange");
-        js::dispatch_event(&mut js_engine.context, &document, "load");
-        event_loop::boot_drain(&mut js_engine.context);
-        js::drain_raf(&mut js_engine.context);
-        event_loop::boot_drain(&mut js_engine.context);
+        media::set_title(&self.title);
 
-        // UNAOS_JSEVAL=<expr>: evaluate one expression against the booted page
-        // and print its value. The post-boot DOM/JS state is otherwise opaque
-        // from outside; this is the probe for "did that global/class land?".
+        // UNAOS_JSEVAL=<expr>: evaluate one expression against the booted page and print its value.
         if let Ok(expr) = std::env::var("UNAOS_JSEVAL") {
-            match js_engine.execute(&expr) {
-                Ok(v) => {
-                    let s = v
-                        .to_string(&mut js_engine.context)
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_else(|_| "<unprintable>".to_string());
-                    eprintln!("[jseval] {}", s);
-                }
+            match js_engine.eval_string(&expr) {
+                Ok(v) => eprintln!("[jseval] {}", v),
                 Err(e) => eprintln!("[jseval] ERR: {}", e),
             }
         }
+        if let Some(nav) = js::take_script_navigation() {
+            self.pending_nav = Some(forms::OpenDocument { url: nav, method: forms::HttpMethod::Get, body: None });
+        }
+        js::take_mutated();
 
         let mut sheets: Vec<String> = Vec::new();
         if let Ok(styles) = document.select("style") {
