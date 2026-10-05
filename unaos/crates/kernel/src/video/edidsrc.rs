@@ -73,6 +73,7 @@ pub fn offer_aux(block: &[u8; 128]) {
         (Some(_), Some(f)) if f == *block => "same",
         (Some(_), Some(_)) => "differs",
     };
+    #[allow(unused_mut)]
     let mut con = (0usize, 0usize);
     let (verdict, before, after) = if !(hdr_ok && sum_ok) {
         ("refused", 0, 0)
@@ -81,6 +82,7 @@ pub fn offer_aux(block: &[u8; 128]) {
         super::EDID_OK.store(true, Ordering::Release);
         set(SRC_AUX);
         let (b, a) = super::dpi::relatch_edid();
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
         if a != 0 {
             con = super::fbcon::regrid_panel().map_or((0, 0), |(_, _, c, r)| (c, r)); // the panel console follows
         }

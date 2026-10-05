@@ -3594,7 +3594,9 @@ pub fn regrid() -> Option<(usize, usize, usize, usize)> {
 /// panel's EDID arrived over AUX after `arm_grid` latched with none). The glyphs draw at `grid_cell()`, so the
 /// grid they are placed on follows it here: cell, cols and rows re-taken, the cursor clamped, the panel cleared
 /// unless the splash holds it. The windowed console is `regrid`'s. `None` when there was nothing to move or
-/// FBCON was contended. Returns `(old cols, old rows, new cols, new rows)`.
+/// FBCON was contended. Returns `(old cols, old rows, new cols, new rows)`. x86 compositing builds only (the AUX
+/// lane is x86's; `win_store` exists only there and on the Pi's desktop).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn regrid_panel() -> Option<(usize, usize, usize, usize)> {
     let (gw, gh) = crate::video::text::grid_cell();
     if gw == 0 || gh == 0 {
