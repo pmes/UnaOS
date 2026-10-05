@@ -92,3 +92,121 @@ ContentCompression are refused or reported as `Codec::Other`; Matroska Cues are 
 walks the in-memory table); Matroska dts = pts (exact for AV1/VP8/VP9/Opus/Vorbis, not for AVC
 B-frames in Matroska); remux of Matroska-sourced VP9/Opus to MP4 is refused (CodecPrivate is not
 the MP4 record).
+
+M1 also gained PCM (in M2's commit, because the player needed a decodable audio track):
+`Codec::Pcm { bits, float, big_endian }` from MP4 `sowt`/`twos` (AudioSampleEntry samplesize) and
+`ipcm`/`fpcm` (ISO/IEC 23003-5 `pcmC`), Matroska `A_PCM/INT/LIT`, `A_PCM/INT/BIG`,
+`A_PCM/FLOAT/IEEE` (Audio/BitDepth `0x6264`); the writers emit samplesize / BitDepth and
+`build::pcm16_track`. KAT `pcm_tracks_in_both_containers` (16 KATs in total now).
+
+## M2 — `libs/gneiss_pal/src/dsp` (the host pipeline; Stria owns the player)
+
+- `dsp::demux` — re-export of `demux_core`.
+- `dsp::avsync` — `TimeSource` (`SystemTime`, `ManualTime`); `WallClock` (play/pause/seek/rate
+  in ppm); `AudioClock` (media time = start + (frames the device consumed − latency) / rate,
+  interpolated with the time source for at most one callback period, never backwards; a stalled
+  device freezes it); `MasterClock::select` (audio when an audio track decodes and an output
+  exists, else wall); `Scheduler::decide` → Wait / Present / Drop (present when pts ≤ now +
+  early; drop when the next frame is already due) and `on_display_tick` counting repeats;
+  `DriftMeter` (offset, least-squares slope in ppm, worst excursion, per-frame |pts − clock|).
+- `dsp::video` — the `VideoDecoder` seam AVCODEC fills (`decode(&Packet) -> Option<Frame>`,
+  `flush`, `reset`, `is_real`), `Frame` (RGBA or I420 with BT.601 limited-range conversion),
+  `decoder_for`, `TestPattern` (colour bars + 6-digit counter, `render` / `read_counter`; real
+  for `utp1`, a labelled stand-in — counter = round(pts / frame duration) — for codecs with no
+  decoder). `video::av1` (feature `av1`) is a STUB: it names av1_core's entry point
+  (`image::decode_obus(data, config_obus, filters)`) and how the fold wires it, and refuses with
+  `Unsupported`, so `--features av1` compiles today and plays the stand-in.
+- `dsp::audio_track` — the per-packet audio seam (`AudioTrackDecoder` → interleaved f32 +
+  pts); `PcmDecoder` built in (8/16/24/32-bit int either order, f32/f64). Compressed audio is
+  AUDIOCODEC's `dsp::audio` (its decoders are file-oriented today; a packet entry point adds an arm).
+- `resonance::nodes::stream::StreamSource` — the graph node media audio rides: a lock-free ring
+  fed by `StreamFeed`, exact integer-phase linear resampling to the graph rate, and an atomic
+  count of source samples consumed (what `AudioClock` is built on; starved = silence, no count).
+
+Synthetic-timeline KATs (`cargo test -p gneiss_pal --release --lib dsp`: 14 green): 30 fps on
+60 Hz is 2:2 with 30 repeats; 24 on 60 is 3:2 with every frame within half a period; 60 on 30
+presents 30, drops 29, all even; pause freezes / seek jumps / rate 2.0; the audio clock tracks
+played frames, interpolates and freezes on a stall; an audio device 100 ppm fast is measured at
+100 ± 2 ppm and 6 ms over 60 s while video follows it within half a period; the wall master
+has zero drift; counter round trip at six sizes; bars; `utp1` ordinals; unsupported codec named
+and stand-in labelled; BT.601 known answers; PCM bit-exact through both containers; PCM layout
+KATs. resonance: `same_rate_is_bit_exact_and_counted`, `upsampling_interpolates_and_counts…`.
+
+## M3 — Stria's VIDEO track (`handlers/stria/src/media.rs`, `media_bus.rs`)
+
+`Player::open(bytes, time, audio_out, display_hz)` → `tick(&mut dyn FrameSink)` once per
+display refresh: demux → decode (≤ 4 frames ahead, pts-sorted queue; audio ≤ 0.5 s ahead) →
+schedule → sink gets RGBA with its presentation ordinal; audio is decoded, downmixed to mono
+(resonance's graph is mono) and pushed into a `StreamFeed`; each tick forwards the device's
+consumption to the audio clock. `seek` lands on the keyframe at or before the target and decodes
+forward silently; `pause` freezes the clock, so a paused tick presents exactly the poster frame.
+`resonance_out(rate)` opens a one-node resonance graph on the default device (None headless).
+
+Bus verbs (`bandy::SMessage`, STRIA section, golden KATs + completeness guard updated):
+`PlayMedia` (existing) and new `MediaPoster`, `MediaPause`, `MediaResume`, `MediaSeek`,
+`MediaStop` in; `MediaOpened`, `MediaFrame` (RGBA per presented frame), `MediaEnded`,
+`MediaError` out; keyed by url. `MediaService::spawn` runs every session on one thread at the
+display cadence (cpal streams are not `Send` everywhere).
+
+Tests (`cargo test -p stria --release`: 8 unit + 5 media, green): a 2 s `utp1` + 48 kHz PCM
+stream in MP4 and WebM played with a real resonance graph pulled 800 samples per 60 Hz refresh
+as the device: audio master, all 50 frames shown once in order with counter == ordinal == pts/40
+ms, each within half a period of the audio clock, and the samples resonance produced equal the
+source sample for sample (go-red proven: not forwarding device consumption fails it); seek to
+1 s shows frame 25 with ordinal 25; poster = frame 0 while paused; VP9 without a decoder plays
+the labelled stand-in with counters 0..9; the bus service answers poster → play → ended (every
+frame presented or dropped, counters match pts) and a missing file with `MediaError`.
+
+## M4 — the faces
+
+**Headless face: `tools/play-check`** (no third-party crates; its PNG writer — stored DEFLATE,
+CRC-32, Adler-32 — is in `src/png.rs` with known answers). `play-check <file> [--frame N --out
+f.png] [--hz 60] [--oracle chromium-oracle.jsonl]`, `play-check --make-utp <out> [n] [fps]`.
+
+| check | result |
+|---|---|
+| `utp1` WebM and MP4 (our writer), frame N → PNG, counter read back | N ∈ {0, 1, 42, 89}: counter == N, 90/90 presented, 0 dropped |
+| Chromium decodes play-check's PNGs (`oracle/png-oracle.js`) | FNV-1a of Chromium's RGBA == ours for all 4 PNGs (b2930985, fbe34985) — pixel exact |
+| av1.mp4 (stand-in) pts vs Chromium mediaTime | 10/10 frames, max diff 0.000 ms (one frame = 100 ms) |
+| vp9.mp4 (stand-in) | 10/10, 0.000 ms |
+| test-1s.webm VP9+Opus (stand-in, Opus silent → wall clock) | 30/30, 0.000 ms (one frame = 33.2 ms) |
+| test-av-…-10kfr.webm VP8+Vorbis (stand-in, wall clock) | 60/60, 0.000 ms |
+
+The pts numbers prove container timing + scheduling against Chromium, not pixels: no real codec
+decodes in this tree yet, and the frame-5 PNGs of the real vectors are the stand-in card
+reading 5. `cargo test -p play-check --release` runs both checks (vectors skipped loudly when
+not fetched).
+
+**GUI face — deferred, deliberately.** phonolite is the tone vessel and its only backend is
+quartzite's macOS AppKit tone panel; this container cannot build or run it, and a video pane
+written blind would be chicken wire by another name. The playback surface is the bus:
+`MediaFrame` carries RGBA a vessel blits (aether-shell already blits `SurfaceBlit`). The
+recommendation for the fold: phonolite grows a quartzite image view fed by `MediaFrame` (one
+vessel = Stria's face, tone and screen), rather than a new vessel.
+
+**Aether.** Its `<video>`/`<audio>` click already stages `PlayMedia`, which Stria now serves.
+Owed: Aether firing `MediaPoster` for each `<video>` on load and painting `MediaFrame` into the
+element's box (touches Aether's layout/paint, the AETHERSEE executor's lane).
+
+## Third-party crates
+
+None added. demux_core, dsp, play-check: no dependencies. resonance's `ringbuf 0.5` (existing,
+a utility: the lock-free ring) carries the media audio; `cpal 0.18` (existing, device I/O,
+utility). Chromium/Playwright are the test oracle, not linked.
+
+## What plays today, exactly
+
+`utp1` test-pattern streams in MP4/fMP4/WebM/Matroska play for real (pixel-exact frames, counter
+== N). PCM audio in those containers plays through resonance as the master clock. AV1/VP9/VP8
+video plays the labelled stand-in with Chromium-matching timing; Opus/Vorbis/AAC/FLAC audio is
+reported unsupported and the player runs silent on the wall clock.
+
+## Ceiling and owed
+
+AV1 frames (AVCODEC's fold: replace `dsp::video::av1`'s body, add the av1_core dependency);
+compressed audio (AUDIOCODEC packet entry point → `dsp::audio_track` arm; Opus pre-skip /
+CodecDelay trimming then applies); output latency unknown to `AudioClock` (0 today; cpal does
+not report it portably); a seek with audio leaves up to the ring (0.5 s) of stale samples, so the
+audio clock is offset by that much after a seek until a ring flush is added to `StreamFeed`;
+stereo is downmixed to mono (resonance graph); urls are local files only; the GUI face and
+Aether's poster/paint as above; whole-file-in-memory (M1 ceiling).
