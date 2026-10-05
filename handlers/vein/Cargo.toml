@@ -28,6 +28,8 @@ quartzite = { path = "../../libs/quartzite" }
 matrix = { path = "../../handlers/matrix" }
 # VEINPROV (B303): the provider choice is a preference — read from Principia's store, namespace `vein`.
 principia = { path = "../../handlers/principia" }
+# HOLOCRON1 (SR33): the Claude API key is asked of Holocron first (SecretGet vein/claude.api_key).
+holocron = { path = "../holocron" }
 syn = { version = "3.0", features = ["full", "extra-traits"] }
 quote = "1.0"
 

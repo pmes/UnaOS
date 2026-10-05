@@ -8776,6 +8776,7 @@ dependencies = [
  "elessar",
  "futures",
  "gneiss_pal",
+ "holocron",
  "log",
  "matrix",
  "principia",
