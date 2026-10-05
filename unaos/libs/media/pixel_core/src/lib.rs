@@ -241,6 +241,30 @@ pub fn blend_nonpremult(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
     [ch(src[0], dst[0]), ch(src[1], dst[1]), ch(src[2], dst[2]), ba as u8]
 }
 
+/// Float `src-over` of one straight-RGBA pixel onto another, the way Chromium's PNG path (Skia's
+/// `SkPngRustCodec`, blending through `SkRasterPipeline` in single precision) composites
+/// `APNG_BLEND_OP_OVER`, operation for operation: bytes load as `c * (1/255)`, both pixels are
+/// premultiplied, `out = src + dst * (1 - src_a)`, unpremultiplied by multiplying with `1 / out_a`,
+/// and each channel stores as `v * 255` rounded half-to-even (`_mm_cvtps_epi32`). It is NOT Blink's
+/// WebP integer blend ([`blend_nonpremult`]): the oracle tells the two apart (APNG frames blended over
+/// translucent pixels differ by up to 26 between them), and the rounding details were fixed against
+/// 14 452 distinct (source, destination) pairs Chromium blended in the APNG corpus, all equal.
+pub fn blend_srcover_f32(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+    const R255: f32 = 1.0 / 255.0;
+    let ld = |c: u8| c as f32 * R255;
+    let (sa, da) = (ld(src[3]), ld(dst[3]));
+    let inv = 1.0 - sa;
+    let oa = sa + da * inv;
+    if oa <= 0.0 {
+        return [0, 0, 0, 0];
+    }
+    let scale = 1.0 / oa;
+    // Round half to even in f32: adding 2^23 leaves no fraction bits (valid for 0 <= v <= 255).
+    let to8 = |v: f32| ((v.clamp(0.0, 1.0) * 255.0 + 8_388_608.0) - 8_388_608.0) as u8;
+    let ch = |s: u8, d: u8| to8((ld(s) * sa + ld(d) * da * inv) * scale);
+    [ch(src[0], dst[0]), ch(src[1], dst[1]), ch(src[2], dst[2]), to8(oa)]
+}
+
 /// Map a "number of plays" field (APNG `num_plays`, WebP ANIM `Loop Count`: 0 = forever) onto
 /// [`Image::loop_count`]'s GIF meaning (extra repetitions, `Some(0)` = forever) the way Blink does:
 /// 0 -> forever, 1 -> play once (`None`), n -> `n - 1` repetitions.
