@@ -52,15 +52,26 @@ words), and per PBDMA its runlist mask (`0x2390 + i*4`, gk104.c:392), channel (`
 
 ## Witness (metal)
 
-Unchanged: `:: GPUBLIT: selftest=ok ce_us=<n> cpu_us=<n> -> blitter=gpu ::`. On a timeout the
-`[gpublit]` line now ends `... ce=ce0 eng=<n> rl=<n> reset=<n> rl_pend=<word> commit_us=<n|stuck>
+Unchanged: `:: GPUBLIT: selftest=ok ce_us=<n> cpu_us=<n> -> blitter=gpu ::`. On a non-ok verdict the
+`[gpublit] chid=2 runlist=<rl> ...` line keeps its words (its `chan=` hi word should now carry `<rl>` in
+bits 16..19), and a SECOND line follows:
+`[gpublit] host ce=ce<n> eng=<n> rl=<n> reset=<n> pmc_pre=<w> rl_pend=<w> commit_us=<n|stuck>
 pfifo_intr=<w> sched=<w> rl_ev=<w> r2a04=<w> userd_bar1=<w> eng_stat=<w> ramfc_put=<n> ramfc_get=<n>
-ramfc_fetch=<n> pb0=<runm>/<chid>/<intr0>/<get>/<put> pb1=... pb2=...` and `chan=` hi reads
-`1<rl>...` in bits 16..19. Reading: `ramfc_get`/`pbN get` > 0 = the fetch started (then the CE or the
-semaphore is the wall); `rl_pend` stuck or `sched` != 0 = the runlist itself is refused; a PBDMA whose
-`runm` lacks bit `rl` = no PBDMA serves the CE's runlist.
+ramfc_fetch=<n> pb0=<runm>/<chan>/<intr0>/<get>/<put> pb1=... pb2=... (pbN=runm/chan/intr0/get/put)`.
+A PTOP with no CE0/CE1 prints `:: GPUBLIT: selftest=refused(ptop-no-ce) ...`. Reading: `ramfc_get` or a
+`pbN` get > 0 = the fetch started (then the sysmem PTE below, the CE or the semaphore is the wall);
+`commit_us=stuck` or `sched` != 0 = the runlist itself is refused; no `pbN` whose runm has bit `rl` = no
+PBDMA serves the CE's runlist; `pfifo_intr` bit 28 or so set = read the fault, not the fetch.
+
+**Builds:** x86 metal feature line (verbatim, no new feature) `cargo check` exit 0; aarch64 legs: the
+module is `cfg(target_arch = "x86_64")`, untouched there.
 
 ## Owed (the next one-change candidates, read from nouveau, NOT applied this boot)
+
+- The sysmem PTE: nouveau vmmgf100.c:314-318/327 puts VOL at PTE bit 32 and the aperture at bits
+  33.. (HOST = 2), so a coherent-sysmem PTE's high word is 5; ours writes 2 (aperture 1). VRAM PTEs
+  (high word 0) are right, and the GPFIFO and pushbuffers are VRAM, so it cannot stop the fetch; it is
+  the self-test's NEXT wall (its source is a heap buffer through the sysmem window).
 
 - RAMFC vs `gk104_chan_ramfc_write` (gk104.c:88-102): ours ORs `0x80000000` into USERD_HI (`+0x0c`;
   nouveau writes the upper address bits only), writes `+0x94 = 0x30000000` without `devm` (`0xfff`),
