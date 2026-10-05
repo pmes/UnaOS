@@ -3777,24 +3777,47 @@ _selfbuild_fetch() { # dir url rev
     [ -d "$1/.git" ] && [ "$(git -C "$1" rev-parse HEAD 2>/dev/null)" = "$3" ] && return 0
     rm -rf "$1" && mkdir -p "$1" && git -C "$1" init -q && git -C "$1" fetch -q --depth 1 "$2" "$3" && git -C "$1" checkout -q FETCH_HEAD
 }
+# SMALLFIX (B380): flight 23's bench staged no APPS/LIB, TCC.LNX, SYSKAT.LNX, LIB/dyn, LIB/rustc or LLD.LNX and no line said WHY
+# (no clang; the rustc fetch never ran because LIB/dyn gates it). Every selfbuild product that is not staged now prints ONE line,
+#   SELFBUILD<n>: not staged <product> reason=<tool missing: X | musl target missing | fetch failed <url> | sha256 mismatch <url> |
+#                                             build failed <step> | host proof failed <step> | needs <product> | UNAOS_…=0>
+# and build_selfbuild_x86 ends with `SELFBUILD: staged=[…] not_staged=[…]`, so the image's build log names the cause.
+_sb_skip() { # n product reason
+    echo "   SELFBUILD$1: not staged $2 reason=$3"
+}
+_sb_missing() { # tool… — prints "tool missing: <first absent>" and succeeds when one is absent; fails (prints nothing) when all are present
+    local t; for t in "$@"; do command -v "$t" >/dev/null 2>&1 || { echo "tool missing: $t"; return 0; }; done; return 1
+}
+_sb_musl_selfc() { echo "$(rustc +nightly --print sysroot 2>/dev/null)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"; }
+_sb_fetch_why() { # dir url rev step tool… — why a fetch-then-build product is absent: a missing tool, the fetch, or the build step
+    local d="$1" u="$2" r="$3" st="$4"; shift 4
+    _sb_missing git "$@" && return 0
+    if [ -d "$d/.git" ] && [ "$(git -C "$d" rev-parse HEAD 2>/dev/null)" = "$r" ]; then echo "build failed $st"; else echo "fetch failed $u"; fi
+}
+_sb_kat_why() { # binary — a freestanding KAT: gcc absent, the gcc build, or the host-kernel run
+    _sb_missing gcc && return 0
+    if [ -x "$1" ]; then echo "host proof failed (the KAT's own fail line: run $1 on the host)"; else echo "build failed gcc -static -nostdlib"; fi
+}
 build_selfbuild_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c"
     mkdir -p "$sb"
     cp "$c/hello.c" "${WORKSPACE_DIR}/target/HELLO.C"
+    rm -f "$sb/SYSKAT.LNX"
     if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -o "$sb/SYSKAT.LNX" "$c/syskat.c" \
         && "$sb/SYSKAT.LNX" >/dev/null; then
         cp "$sb/SYSKAT.LNX" "${WORKSPACE_DIR}/target/SYSKAT.LNX"
     else
-        echo "   SELFBUILD1: SYSKAT.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT.LNX"
+        _sb_skip 1 SYSKAT.LNX "$(_sb_kat_why "$sb/SYSKAT.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT.LNX"
     fi
     # SELFBUILD2 (B349): the threaded KAT — 4 clone/clone3 threads on a futex mutex, futex ops, eventfd+epoll, statx, ftruncate/
     # fallocate/flock, socketpair, sendfile, one signal through rt_sigreturn. Proven on the host kernel (args: a file, its size,
     # a scratch path — UnaOS passes /apps/HELLO.C, the size its loader sees, <home>/kat2.tmp) before it is staged.
+    rm -f "$sb/SYSKAT2.LNX"
     if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT2.LNX" "$c/syskat2.c" \
         && "$sb/SYSKAT2.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; then
         cp "$sb/SYSKAT2.LNX" "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
     else
-        echo "   SELFBUILD2: SYSKAT2.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
+        _sb_skip 2 SYSKAT2.LNX "$(_sb_kat_why "$sb/SYSKAT2.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
     fi
     # SELFBUILD3 (B353): the musl libc as DATA under /apps/LIB (crt1.o crti.o crtn.o libc.a + include/), built before tcc so tcc's
     # libtcc1.a can be compiled against it. No egress = no LIB = `tests selfbuild3` reports libc=none tcc_libc=skip.
@@ -3807,7 +3830,7 @@ build_selfbuild_x86() {
                 && cp -r "$sb/musl-out/include/." "$lib/include/" \
                 && printf 'musl 1.2.5 (%s, MIT) built by arroyo build_selfbuild_x86 for tcc: TCC.LNX -static -o prog prog.c\n' "$SELFBUILD_MUSL_REV" > "$lib/MUSL.TXT"
         else
-            echo "   SELFBUILD3: musl fetch/build failed — /apps/LIB absent, tests selfbuild3 reports libc=none"; rm -rf "$lib"
+            _sb_skip 3 LIB "$(_sb_fetch_why "$sb/musl" "$SELFBUILD_MUSL_URL" "$SELFBUILD_MUSL_REV" "musl configure/make" make gcc)"; rm -rf "$lib"
         fi
     fi
     # SELFBUILD1 tcc; SELFBUILD3 configures its search paths onto the volume: tccdir /apps/LIB/tcc ({B}), crt + libs {B}/.. = /apps/LIB,
@@ -3823,10 +3846,10 @@ build_selfbuild_x86() {
                 cp "$sb/tinycc/include/"*.h "$lib/tcc/include/" \
                     && ( cd "$sb/tinycc" && rm -f libtcc1.a && make -s libtcc1.a XFLAGS="-B$lib/tcc" >/dev/null 2>&1; [ -f libtcc1.a ] ) \
                     && cp "$sb/tinycc/libtcc1.a" "$lib/tcc/" \
-                    || { echo "   SELFBUILD3: libtcc1.a did not build — /apps/LIB not staged"; rm -rf "$lib"; }
+                    || { _sb_skip 3 LIB "build failed tinycc libtcc1.a against the staged musl"; rm -rf "$lib"; }
             fi
         else
-            echo "   SELFBUILD1: tinycc fetch/build failed — TCC.LNX absent, tests selfbuild will SKIP"
+            _sb_skip 1 TCC.LNX "$(_sb_fetch_why "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" "tinycc configure/make" make gcc strip)"
         fi
     fi
     # SELFBUILD3 host proof: the staged TCC.LNX compiles PRINTF.C against the staged musl and the output prints, or LIB is not staged.
@@ -3836,16 +3859,17 @@ build_selfbuild_x86() {
             && "$sb/hellop" | grep -qx "hello printf from tcc+musl on unaos 42"; then
             ( cd "$lib" && sha256sum libc.a crt1.o crti.o crtn.o tcc/libtcc1.a | sed 's/^/   SELFBUILD3: sha256 LIB\//' )
         else
-            echo "   SELFBUILD3: TCC.LNX + staged musl did not build a working printf hello on the host — /apps/LIB not staged"; rm -rf "$lib"
+            _sb_skip 3 LIB "host proof failed TCC.LNX + musl printf hello"; rm -rf "$lib"
         fi
     fi
     # SELFBUILD3: the lazy-memory KAT (mmap of files private/shared, 256 MiB anon touched sparsely + mincore, PROT_NONE, brk 128 MiB,
     # madvise), proven on the host kernel before it is staged.
+    rm -f "$sb/SYSKAT3.LNX"
     if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT3.LNX" "$c/syskat3.c" \
         && "$sb/SYSKAT3.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; then
         cp "$sb/SYSKAT3.LNX" "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     else
-        echo "   SELFBUILD3: SYSKAT3.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
+        _sb_skip 3 SYSKAT3.LNX "$(_sb_kat_why "$sb/SYSKAT3.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     fi
     if [ ! -f "${WORKSPACE_DIR}/target/PROBE.LNX" ]; then
         if _selfbuild_fetch "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" \
@@ -3854,13 +3878,18 @@ build_selfbuild_x86() {
                  && (yes "" | make -s oldconfig >/dev/null 2>&1) && make -s -j"$(nproc)" >/dev/null 2>&1 ); then
             cp "$sb/busybox/busybox" "${WORKSPACE_DIR}/target/PROBE.LNX"
         else
-            echo "   SELFBUILD1: busybox fetch/build failed — PROBE.LNX absent (probe=none)"
+            _sb_skip 1 PROBE.LNX "$(_sb_fetch_why "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" "busybox make" make gcc)"
         fi
     fi
     build_selfbuild4_x86   # SELFBUILD4 (B356): SYSKAT4.LNX + RUST.LNX
     build_selfbuild5_x86   # SELFBUILD5 (B357): SYSKAT5.LNX + LLD.LNX + LIB/rust (RUST.LNX's objects, std rlibs, musl crt)
     build_selfbuild6_x86   # SELFBUILD6 (B360): LIB/dyn (libc.so, libgcc_s.so.1, the dyn probe) + LIB/rustc (default on, R87; UNAOS_SELFBUILD6_RUSTC=0 opts out)
     ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
+    local _p _st="" _ns=""   # SMALLFIX (B380): one summary line; each not_staged entry has its own `not staged … reason=` line above
+    for _p in SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX SYSKAT5.LNX TCC.LNX PROBE.LNX RUST.LNX LLD.LNX LIB/libc.a LIB/rust LIB/dyn LIB/rustc; do
+        if [ -e "${WORKSPACE_DIR}/target/$_p" ]; then _st="$_st${_st:+,}$_p"; else _ns="$_ns${_ns:+,}$_p"; fi
+    done
+    echo "   SELFBUILD: staged=[$_st] not_staged=[$_ns]"
 }
 
 # SELFBUILD4 (B356): the first Rust program on UnaOS and the process-memory KAT, both proven on the HOST kernel before staging.
@@ -3872,21 +3901,29 @@ build_selfbuild_x86() {
 build_selfbuild4_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
     mkdir -p "$sb"
+    rm -f "$sb/SYSKAT4.LNX"
     if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT4.LNX" "$c/syskat4.c" \
         && "$sb/SYSKAT4.LNX" "$sb/kat4.tmp" | grep -q "^syskat4 ok cow=ok cow_kernel=ok cow_prot=ok shared_fork=ok exec_lazy=ok sigbus=ok "; then
         cp "$sb/SYSKAT4.LNX" "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
     else
-        echo "   SELFBUILD4: SYSKAT4.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
+        _sb_skip 4 SYSKAT4.LNX "$(_sb_kat_why "$sb/SYSKAT4.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
     fi
     rustup +nightly target list --installed 2>/dev/null | grep -qx x86_64-unknown-linux-musl \
         || rustup +nightly target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
     local bin="$sb/rust/x86_64-unknown-linux-musl/release/rust-probe"
+    rm -f "$bin"
     if ( cd "$rs" && CARGO_TARGET_DIR="$sb/rust" cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
         && [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" = "2" ] \
         && "$bin" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; then
         strip -o "${WORKSPACE_DIR}/target/RUST.LNX" "$bin"
     else
-        echo "   SELFBUILD4: RUST.LNX did not build (musl target?), is not ET_EXEC, or failed on the host kernel — not staged"
+        local why4
+        if why4="$(_sb_missing strip)"; then :
+        elif [ ! -f "$(_sb_musl_selfc)/libc.a" ]; then why4="musl target missing (rustup +nightly target add x86_64-unknown-linux-musl refused)"
+        elif [ ! -f "$bin" ]; then why4="build failed cargo crates/user-linux-rust --target x86_64-unknown-linux-musl"
+        elif [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" != "2" ]; then why4="build failed not ET_EXEC"
+        else why4="host proof failed rust-probe"; fi
+        _sb_skip 4 RUST.LNX "$why4"
         rm -f "${WORKSPACE_DIR}/target/RUST.LNX"
     fi
 }
@@ -3910,11 +3947,12 @@ SELFBUILD_LLVM_SHA256="922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a
 build_selfbuild5_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
     mkdir -p "$sb"
+    rm -f "$sb/SYSKAT5.LNX"
     if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT5.LNX" "$c/syskat5.c" \
         && "$sb/SYSKAT5.LNX" | grep -q "^syskat5 ok grow=ok move=ok fixed=ok dontunmap=ok errors=ok altstack=ok small=ok "; then
         cp "$sb/SYSKAT5.LNX" "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
     else
-        echo "   SELFBUILD5: SYSKAT5.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
+        _sb_skip 5 SYSKAT5.LNX "$(_sb_kat_why "$sb/SYSKAT5.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
     fi
     # LLD.LNX: STATIC-PIE (WINDOW2, B361, R85 "relinked as PIE"): ET_DYN, no PT_INTERP, no DT_NEEDED — the shim places it at its
     # PIE base above the low window (a 68 MB ET_EXEC at 0x400000 overlays the kernel's low identity map), glibc's own
@@ -3944,7 +3982,15 @@ build_selfbuild5_x86() {
             && ninja -C "$ld/build" lld >/dev/null; then
             strip -o "$lld" "$ld/build/bin/lld"
         fi
-        _sb5_lld_ok "$lld" || { echo "   SELFBUILD5: static ld.lld did not build (egress? cmake/ninja?) — LLD.LNX absent, tests selfbuild5 reports lld=skip"; rm -f "$lld"; }
+        if ! _sb5_lld_ok "$lld"; then
+            local why5
+            if why5="$(_sb_missing curl cmake ninja g++ gcc strip readelf)"; then :
+            elif [ ! -f "$ld/src.tar.xz" ]; then why5="fetch failed $SELFBUILD_LLVM_URL"
+            elif ! echo "${SELFBUILD_LLVM_SHA256}  $ld/src.tar.xz" | sha256sum -c --quiet - 2>/dev/null; then why5="sha256 mismatch $SELFBUILD_LLVM_URL"
+            elif [ ! -f "$ld/build/bin/lld" ]; then why5="build failed cmake/ninja lld (static-PIE)"
+            else why5="build failed the binary is not a static-PIE LLD ${SELFBUILD_LLVM_VER}"; fi
+            _sb_skip 5 LLD.LNX "$why5"; rm -f "$lld"
+        fi
     fi
     # LIB/rust: record RUST.LNX's link through a wrapper around rust-lld, then stage its inputs and the response file.
     local out="${WORKSPACE_DIR}/target/LIB/rust" rec="$sb/rust5rec" tgt="$sb/rust5"
@@ -4016,10 +4062,15 @@ PY
             && "$rec/rust2" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; then
             echo "   SELFBUILD5: LIB/rust staged ($(ls "$out" | wc -l) files, $(du -sk "$out" | cut -f1) KiB); host relink by $(basename "$hl") runs"
         else
-            echo "   SELFBUILD5: the staged inputs did not relink into a running program on the host — LIB/rust not staged"; rm -rf "$out"
+            _sb_skip 5 LIB/rust "host proof failed relink by $(basename "$hl")"; rm -rf "$out"
         fi
     else
-        echo "   SELFBUILD5: RUST.LNX link not recorded (musl target? rust-lld?) — LIB/rust not staged"; rm -rf "$out"
+        local whyr
+        if [ ! -x "$rlld" ]; then whyr="tool missing: rust-lld ($rlld)"
+        elif [ ! -d "$selfc" ]; then whyr="musl target missing"
+        elif [ ! -s "$rec/args" ]; then whyr="build failed cargo crates/user-linux-rust through the recording linker"
+        else whyr="build failed python3 staging of the recorded link"; fi
+        _sb_skip 5 LIB/rust "$whyr"; rm -rf "$out"
     fi
     ( cd "${WORKSPACE_DIR}/target" && sha256sum SYSKAT5.LNX LLD.LNX LIB/rust/link.rsp 2>/dev/null | sed 's/^/   SELFBUILD5: sha256 /' )
 }
@@ -4053,28 +4104,35 @@ build_selfbuild6_x86() {
     rm -rf "$dyn"
     # The host runner (the R78 execution proof).
     if ! ( cd "$WORKSPACE_DIR/.." && CARGO_TARGET_DIR="$sb/host" cargo +nightly build --release --quiet -p ldso_core --bin ldrun ); then  # the ROOT workspace
-        echo "   SELFBUILD6: ldrun did not build — nothing staged (tests selfbuild6 SKIPs)"; return 0
+        _sb_skip 6 LIB/dyn "build failed ldso_core ldrun"; _sb_skip 6 LIB/rustc "needs LIB/dyn"; return 0
     fi
     local ldrun="$sb/host/release/ldrun"
+    rm -f "$sb/dyn/hello"
     if [ -f "$selfc/libc.a" ] && sh "$core/fixtures/dyn/build.sh" "$selfc" "$sb/dyn" \
         && "$ldrun" "$sb/dyn/hello" | grep -q "^dyn=ok objects=3 after_dlopen=4 "; then
         mkdir -p "$dyn"
         ( cd "$sb/dyn" && cp hello libdyn.so libplug.so libc.so libgcc_s.so.1 "$dyn/" && cp libgcc_s.so.1 "$dyn/libgcc_s.so" )
         echo "   SELFBUILD6: LIB/dyn staged (libc.so, libgcc_s.so.1, the dyn probe); host: dyn=ok under ldrun"
     else
-        echo "   SELFBUILD6: the dyn probe did not build (musl target? clang/ld.lld?) or failed under ldrun — LIB/dyn not staged"
+        local why6
+        if [ ! -f "$selfc/libc.a" ]; then why6="musl target missing"
+        elif why6="$(_sb_missing clang ld.lld gcc)"; then :
+        elif [ ! -f "$sb/dyn/hello" ]; then why6="build failed ldso_core/fixtures/dyn/build.sh"
+        else why6="host proof failed dyn probe under ldrun"; fi
+        _sb_skip 6 LIB/dyn "$why6"
+        _sb_skip 6 LIB/rustc "needs LIB/dyn"   # R87's default: the rustc fetch is gated on LIB/dyn (its host proofs run under ldrun -L LIB/dyn)
         return 0
     fi
     rm -rf "$rlib"
     if [ "${UNAOS_SELFBUILD6_RUSTC:-1}" = "0" ]; then
-        echo "   SELFBUILD6: UNAOS_SELFBUILD6_RUSTC=0 — LIB/rustc not staged (tests selfbuild6 reports the rustc probes skip)"
+        _sb_skip 6 LIB/rustc "UNAOS_SELFBUILD6_RUSTC=0"
         return 0
     fi
     local tar="$sb/rustc.tar.xz"
     if [ ! -f "$tar" ] || ! echo "$SELFBUILD6_RUSTC_SHA256  $tar" | sha256sum -c --quiet 2>/dev/null; then
-        curl -sSfL -o "$tar" "$SELFBUILD6_RUSTC_URL" || { echo "   SELFBUILD6: rustc fetch failed (egress?) — LIB/rustc not staged"; rm -f "$tar"; return 0; }
+        curl -sSfL -o "$tar" "$SELFBUILD6_RUSTC_URL" || { _sb_skip 6 LIB/rustc "$(_sb_missing curl || echo "fetch failed $SELFBUILD6_RUSTC_URL")"; rm -f "$tar"; return 0; }
     fi
-    echo "$SELFBUILD6_RUSTC_SHA256  $tar" | sha256sum -c --quiet || { echo "   SELFBUILD6: rustc sha256 mismatch — LIB/rustc not staged"; return 0; }
+    echo "$SELFBUILD6_RUSTC_SHA256  $tar" | sha256sum -c --quiet || { _sb_skip 6 LIB/rustc "sha256 mismatch $SELFBUILD6_RUSTC_URL"; return 0; }
     rm -rf "$sb/x" && mkdir -p "$sb/x" && tar -xJf "$tar" -C "$sb/x" --strip-components=2 rustc-nightly-x86_64-unknown-linux-musl/rustc/bin rustc-nightly-x86_64-unknown-linux-musl/rustc/lib
     local tri="lib/rustlib/x86_64-unknown-linux-musl"
     mkdir -p "$rlib/bin" "$rlib/$tri/bin" "$rlib/pm"
@@ -4091,7 +4149,7 @@ build_selfbuild6_x86() {
         local stdt="$sb/std.tar.xz"
         curl -sSfL -o "$stdt" "$SELFBUILD6_STD_URL" && echo "$SELFBUILD6_STD_SHA256  $stdt" | sha256sum -c --quiet \
             && tar -xJf "$stdt" -C "$sb" && cp -r "$sb/rust-std-nightly-x86_64-unknown-linux-musl/rust-std-x86_64-unknown-linux-musl/$tri/lib" "$rlib/$tri/lib" \
-            || { echo "   SELFBUILD6: the matching musl std is unavailable — LIB/rustc not staged"; rm -rf "$rlib"; return 0; }
+            || { _sb_skip 6 LIB/rustc "fetch failed $SELFBUILD6_STD_URL (or its sha256)"; rm -rf "$rlib"; return 0; }
         rm -rf "$sb/rust-std-nightly-x86_64-unknown-linux-musl" "$stdt"
     fi
     # Trim what a plain compile never reads: the sanitizer runtimes and the profiler (about 75 MB of the 222 MB). The stand-alone
@@ -4116,7 +4174,7 @@ build_selfbuild6_x86() {
         echo "   SELFBUILD6: LIB/rustc staged ($(du -sk "$rlib" | cut -f1) KiB); host: rustc --version, hello and the proc-macro crate run under ldrun"
         ( cd "$rlib" && sha256sum bin/rustc "lib/$drv" "$tri/bin/rust-lld" pm/libpm.so | sed 's/^/   SELFBUILD6: sha256 /' )
     else
-        echo "   SELFBUILD6: a rustc host proof failed under ldrun — LIB/rustc not staged"; rm -rf "$rlib"
+        _sb_skip 6 LIB/rustc "$(_sb_missing ld.lld || echo "host proof failed rustc under ldrun")"; rm -rf "$rlib"
     fi
 }
 
