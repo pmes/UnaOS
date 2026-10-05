@@ -4,8 +4,8 @@
 //! vein_core's Messages encoder, HTTP/1.1 framing and SSE decoder) runs over a std TCP socket against a server
 //! that is NOT ours — Python `ssl` = OpenSSL, TLS 1.3 only, on 127.0.0.1 — with a CA + intermediate + leaf
 //! generated per run by tls_core's oracle script (openssl CLI). Offline; skipped with a message when python3 or
-//! openssl is missing. Crypto: tls_core's `test-provider` (CRYPTOCORE's provider lacks RSA/P-384 until SR27
-//! lands them; the handshake here is P-256 so the provider choice is the only stand-in).
+//! openssl is missing. Crypto: the PRODUCT provider — CRYPTOCORE's `CryptoCoreProvider` (tls_core feature
+//! `cryptocore-std`: the ChaCha20 DRBG over /dev/urandom); no third-party crypto anywhere in this test.
 //!
 //! Proven: a verified handshake (issuer CN reported), the POST reaching the server with the key, version
 //! header, Content-Length and a `stream: true` body, the chunked SSE answer decoded to the exact text and stop
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use tls_core::test_provider::RustCryptoProvider;
+use tls_core::cryptocore_provider::CryptoCoreProvider;
 use tls_core::x509::{Clock, FixedClock, TrustStore};
 use vein_core::claude::{Event, Msg, Params, Stop};
 use vein_core::prefs::Endpoint;
@@ -100,8 +100,12 @@ const USER: &str = "is this connection verified?";
 
 /// One full exchange: returns (result, collected text, stop, the server's line).
 fn run(dir: &Path, trust: &TrustStore, clock: &dyn Clock, host: &str) -> (Result<vein_ring3::Sent, Stage>, String, Option<Stop>, String) {
-    let srv = Server::start(dir, "p256");
-    let provider = RustCryptoProvider::new();
+    run_leaf(dir, "p256", trust, clock, host)
+}
+
+fn run_leaf(dir: &Path, leaf: &str, trust: &TrustStore, clock: &dyn Clock, host: &str) -> (Result<vein_ring3::Sent, Stage>, String, Option<Stop>, String) {
+    let srv = Server::start(dir, leaf);
+    let provider = CryptoCoreProvider::new();
     let ctx = TlsContext { provider: &provider, store: trust, clock };
     let ep = Endpoint { tls: true, host, port: srv.port, path: "/v1/messages" };
     let mut bufs = Box::new(Buffers::new());
@@ -265,7 +269,7 @@ fn public_api_anthropic_com() {
     let attempt = |trust: &TrustStore| -> Option<(Result<vein_ring3::Sent, Stage>, Vec<String>)> {
         let s = TcpStream::connect_timeout(&addr, Duration::from_secs(8)).ok()?;
         s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        let provider = RustCryptoProvider::new();
+        let provider = CryptoCoreProvider::new();
         let ctx = TlsContext { provider: &provider, store: trust, clock: &SystemClock };
         let ep = vein_core::prefs::DEFAULT_ENDPOINT;
         let mut bufs = Box::new(Buffers::new());
@@ -302,4 +306,20 @@ fn public_api_anthropic_com() {
     println!("egress CAs ({} anchors, reported separately): VERIFIED issuer={} status={} error={:?}", rep.loaded, sent.verified.unwrap().issuer(), sent.out.status, errs);
     assert_eq!(sent.out.status, 401, "no key was sent; the API must refuse");
     assert!(!errs.is_empty(), "the API's error body is decoded");
+}
+
+/// The RSA and Ed25519 leaves (CertificateVerify rsa_pss_rsae_sha256 / ed25519) through CRYPTOCORE's provider.
+#[test]
+fn rsa_and_ed25519_leaves_verify() {
+    let Some(dir) = pki("leaves") else { return };
+    let trust = store(&dir);
+    for leaf in ["rsa", "ed25519"] {
+        let (r, text, stop, srv) = run_leaf(&dir, leaf, &trust, &SystemClock, "tlscore.test");
+        let sent = r.unwrap_or_else(|e| panic!("{leaf}: {e:?} / {srv}"));
+        println!("{leaf}: verified={} status={} stop={:?} server: {}", sent.verified.unwrap().issuer(), sent.out.status, stop, &srv[..60.min(srv.len())]);
+        assert_eq!(sent.out.status, 200);
+        assert_eq!(stop, Some(Stop::EndTurn));
+        assert!(text.starts_with("Verified hello"));
+        assert!(srv.contains(&format!("key={KEY}")));
+    }
 }

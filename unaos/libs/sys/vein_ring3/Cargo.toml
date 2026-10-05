@@ -10,14 +10,13 @@
 # VEINTLS (LEDGER SR36, R83): TLS 1.3 is UnaOS's OWN `tls_core` (TLSCORE, SR28) — `embedded-tls`,
 # `embedded-io` and `rand_core` are gone from this crate and from the tree. Every connection is verified
 # against /system/trust/roots.pem at SYS_TIME; there is no insecure mode. Crypto: CRYPTOCORE's provider
-# behind feature `cryptocore` (ring-3 programs turn it on); until CRYPTOCORE's fold file is on the branch the
-# feature stops the build at tls_core's `cryptocore_provider.rs` with the exact list of what is missing.
+# behind feature `cryptocore` (ring-3 programs turn it on; seeded from SYS_GETRANDOM through crypto_core's DRBG).
 # Needs `alloc`: a program declares `vein_ring3::heap::Heap` as its `#[global_allocator]`.
 #
 # A member of the ROOT host workspace since VEINTLS (so `cargo test -p vein_ring3` runs the offline
 # handshake + Messages round trip on the host); still a path dependency of each user-* crate (each its own
-# workspace root) for the ring-3 targets. Third-party crates: none (dev: none either — the test provider
-# is tls_core's own feature).
+# workspace root) for the ring-3 targets. Third-party crates: none, dev-dependencies included — the host tests
+# run on the PRODUCT provider (CRYPTOCORE via tls_core/cryptocore-std, /dev/urandom), not a test operand.
 [package]
 name = "vein_ring3"
 version = "0.1.0"
@@ -36,6 +35,4 @@ tls_core = { path = "../tls_core" }
 crypto_core = { path = "../crypto_core", optional = true, default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
-# TEST OPERAND ONLY (R83, TLSCORE's rule extended to this crate's own tests by the VEINTLS brief): tls_core's
-# RustCrypto `test-provider` stands in for CRYPTOCORE until RSA verify and P-384 land there.
-tls_core = { path = "../tls_core", features = ["test-provider"] }
+tls_core = { path = "../tls_core", features = ["cryptocore-std"] }

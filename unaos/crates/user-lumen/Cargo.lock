@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "crypto_core"
+version = "0.1.0"
+
+[[package]]
 name = "font8x8"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11,6 +15,9 @@ checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 [[package]]
 name = "tls_core"
 version = "0.1.0"
+dependencies = [
+ "crypto_core",
+]
 
 [[package]]
 name = "una-abi"
@@ -34,6 +41,7 @@ version = "0.1.0"
 name = "vein_ring3"
 version = "0.1.0"
 dependencies = [
+ "crypto_core",
  "tls_core",
  "una-abi",
  "vein_core",
