@@ -1,9 +1,9 @@
 {
   "cases": {
     "01-blog-article": {
-      "mismatch": 3.95,
+      "mismatch": 2.81,
       "missing": 0,
-      "ssim": 0.9351
+      "ssim": 0.9712
     },
     "02-flex-two-column": {
       "mismatch": 1.66,
@@ -16,14 +16,14 @@
       "ssim": 0.9935
     },
     "04-sticky-nav": {
-      "mismatch": 3.15,
+      "mismatch": 3.04,
       "missing": 0,
-      "ssim": 0.972
+      "ssim": 0.9733
     },
     "05-form": {
-      "mismatch": 1.62,
+      "mismatch": 1.34,
       "missing": 0,
-      "ssim": 0.9357
+      "ssim": 0.9506
     },
     "06-table-zebra": {
       "mismatch": 0.99,
@@ -36,9 +36,9 @@
       "ssim": 0.9369
     },
     "08-inline-wrap": {
-      "mismatch": 2.56,
+      "mismatch": 2.54,
       "missing": 0,
-      "ssim": 0.9794
+      "ssim": 0.9774
     },
     "09-media-queries": {
       "mismatch": 0.79,
@@ -73,7 +73,7 @@
     "13-ua-defaults": {
       "mismatch": 1.88,
       "missing": 0,
-      "ssim": 0.9532
+      "ssim": 0.9526
     },
     "14-boxes": {
       "mismatch": 1.73,
@@ -81,14 +81,19 @@
       "ssim": 0.9356
     },
     "15-landing": {
-      "mismatch": 1.61,
+      "mismatch": 0.97,
       "missing": 0,
-      "ssim": 0.9545
+      "ssim": 0.99
     },
     "16-positioned": {
       "mismatch": 0.39,
       "missing": 0,
       "ssim": 0.9971
+    },
+    "17-inline-continue": {
+      "mismatch": 2.77,
+      "missing": 0,
+      "ssim": 0.9802
     }
   },
   "thresholds": {

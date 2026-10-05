@@ -2486,6 +2486,59 @@ mod tests {
         assert!(pb.3 >= pa.3 + 2.0, "line box grows: {pa:?} -> {pb:?}");
     }
 
+    fn node_by_id(t: &layout::LayoutTree, want: &str) -> Option<taffy::NodeId> {
+        t.node_map.iter().find_map(|(id, n)| {
+            n.as_element().filter(|e| e.attributes.borrow().get("id") == Some(want)).map(|_| *id)
+        })
+    }
+
+    /// CSS 2.2 §9.4.2 / §10.8 / css-break-3 slice known answers on a
+    /// monospace face (every glyph the same advance): a span that wraps is
+    /// one fragment per line (inline-start edge on the first, inline-end on
+    /// the last); the text after it continues on its last line; each line
+    /// box is `line-height` tall; text-align centres each line; a taller
+    /// inline-block grows its line around the shared baseline; a float
+    /// shortens the line boxes beside it.
+    #[test]
+    fn test_inline_formatting_context_kat() {
+        use crate::layout::inline::Frag;
+        if crate::fonts::face(2, false, false).is_none() {
+            return;
+        }
+        let css = "body{margin:0} p{margin:0;font:10px monospace;line-height:2;width:100px}";
+        let t = laid_out(r#"<html><body><p id=p>aaaa <span id=s style="padding:0 3px">bb cc dd ee ff</span> gg</p></body></html>"#, css);
+        let (p, sp) = (node_by_id(&t, "p").unwrap(), node_by_id(&t, "s").unwrap());
+        let il = &t.inline[&p];
+        let boxes: Vec<_> = il.frags.iter().filter_map(|f| match f { Frag::Box { node, x, w, first, last, .. } if *node == sp => Some((*x, *w, *first, *last)), _ => None }).collect();
+        assert_eq!(boxes.len(), 2, "the span is split into two line fragments: {boxes:?}");
+        assert!(boxes[0].2 && !boxes[0].3 && !boxes[1].2 && boxes[1].3, "slice: start edge first, end edge last");
+        assert_eq!(boxes[1].0, 0.0, "the continuation fragment starts at the line start");
+        assert_eq!(il.lines.len(), 2);
+        assert!(il.lines.iter().all(|l| l.1 == 20.0), "line-height: 2 x 10px: {:?}", il.lines);
+        assert_eq!(rect_by_id(&t, "p").unwrap().3, 40.0, "the paragraph is two line boxes tall");
+        let gg = il.frags.iter().find_map(|f| match f { Frag::Text { text, x, baseline, .. } if text.contains("gg") => Some((*x, *baseline)), _ => None }).unwrap();
+        assert_eq!(gg.1, il.lines[1].2, "text after the span continues on the span's last line");
+        assert!(gg.0 >= boxes[1].0 + boxes[1].1 - 0.5, "after the span's end edge: {gg:?} {boxes:?}");
+
+        // text-align: center — the one line's content is centred.
+        let t = laid_out(r#"<html><body><p id=p style="text-align:center">abcd</p></body></html>"#, css);
+        let p = node_by_id(&t, "p").unwrap();
+        let (x, w) = t.inline[&p].frags.iter().find_map(|f| match f { Frag::Text { x, width, .. } => Some((*x, *width)), _ => None }).unwrap();
+        assert!((x - (100.0 - w) / 2.0).abs() <= 0.5, "centred (to the whole pixel): x {x} w {w}");
+
+        // A 50px inline-block on the baseline: the line grows to hold it.
+        let t = laid_out(r#"<html><body><p id=p>ab <span style="display:inline-block;width:10px;height:50px"></span> cd</p></body></html>"#, css);
+        let p = node_by_id(&t, "p").unwrap();
+        let l = t.inline[&p].lines[0];
+        assert!(l.1 > 50.0 && l.2 >= 50.0, "line holds the inline-block above its baseline: {l:?}");
+
+        // float: left 30px wide and 30px tall: the first line starts after it.
+        let t = laid_out(r#"<html><body><p id=p><span style="float:left;width:30px;height:30px"></span>ab cd</p></body></html>"#, css);
+        let p = node_by_id(&t, "p").unwrap();
+        let x = t.inline[&p].frags.iter().find_map(|f| match f { Frag::Text { x, .. } => Some(*x), _ => None }).unwrap();
+        assert_eq!(x, 30.0, "the line box is shortened by the float");
+    }
+
     /// CSS 2.2 Appendix E: a higher z-index paints over a later sibling;
     /// position: fixed with bottom: 0 sits at the viewport's bottom edge.
     #[test]

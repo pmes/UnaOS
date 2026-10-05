@@ -104,26 +104,62 @@ impl<'a> Advancer<'a> {
 
 /// Breaks `text` into lines no wider than `max_width` (when the mode wraps).
 pub fn break_lines(adv: &Advancer, text: &str, mode: &TextMode, max_width: f32) -> Vec<Line> {
+    break_lines_from(adv, text, mode, max_width, 0.0, false)
+}
+
+/// The line being filled: its text so far, plus what earlier inline items
+/// already put on it (`offset` px of advance, `prior` = real content).
+struct Cur {
+    line: Line,
+    offset: f32,
+    prior: bool,
+    /// The next word continues the previous item's word (no space between
+    /// the items): there is no break opportunity before it (css-text-3 §5.1).
+    glued: bool,
+}
+
+impl Cur {
+    fn push(&mut self, out: &mut Vec<Line>) {
+        out.push(std::mem::replace(&mut self.line, Line { text: String::new(), width: 0.0 }));
+        self.offset = 0.0;
+        self.prior = false;
+        self.glued = false;
+    }
+}
+
+/// Breaks one text run of an inline formatting context whose current line
+/// already holds `start_x` px of earlier items (`prior` = some of it is
+/// content, so a break may come before this run's first word). The first
+/// returned line is what joins the current line (its `text` may be empty
+/// when even the first word must move down); each further line is a new
+/// line box. `break_lines` is the `start_x = 0` case.
+pub fn break_lines_from(adv: &Advancer, text: &str, mode: &TextMode, max_width: f32, start_x: f32, prior: bool) -> Vec<Line> {
     let max = if mode.wraps() { max_width.max(0.0) } else { f32::MAX };
     let mut out: Vec<Line> = Vec::new();
     // Forced breaks split the run into paragraphs first.
     let paragraphs: Vec<&str> = if mode.forced_breaks() { text.split('\n').collect() } else { vec![text] };
     let n_par = paragraphs.len();
+    let starts_space = text.starts_with(|c: char| c.is_ascii_whitespace());
+    let mut cur = Cur {
+        line: Line { text: String::new(), width: 0.0 },
+        offset: start_x,
+        prior,
+        glued: prior && !mode.lead && !(starts_space && !mode.collapses()),
+    };
     for (pi, para) in paragraphs.into_iter().enumerate() {
-        let mut cur = Line { text: String::new(), width: 0.0 };
         if mode.collapses() {
             let words: Vec<&str> = para.split_whitespace().collect();
             let lead = pi == 0 && mode.lead;
             if lead {
-                cur.text.push(' ');
-                cur.width += adv.char(' ');
+                cur.line.text.push(' ');
+                cur.line.width += adv.char(' ');
             }
             for word in &words {
                 place_word(adv, word, mode, max, &mut cur, &mut out, true);
             }
             if pi == n_par - 1 && mode.trail && !words.is_empty() {
-                cur.text.push(' ');
-                cur.width += adv.char(' ');
+                cur.line.text.push(' ');
+                cur.line.width += adv.char(' ');
             }
         } else {
             // Preserved: spaces are content; tabs advance to 8-space stops.
@@ -139,8 +175,8 @@ pub fn break_lines(adv: &Advancer, text: &str, mode: &TextMode, max_width: f32) 
                 }
             }
             if !mode.wraps() {
-                cur.width = adv.str(&expanded);
-                cur.text = expanded;
+                cur.line.width = adv.str(&expanded);
+                cur.line.text = expanded;
             } else {
                 // pre-wrap: break after space runs.
                 let mut word = String::new();
@@ -156,62 +192,66 @@ pub fn break_lines(adv: &Advancer, text: &str, mode: &TextMode, max_width: f32) 
                 }
             }
         }
-        out.push(cur);
+        if pi + 1 < n_par {
+            cur.push(&mut out);
+        }
     }
-    if out.is_empty() {
-        out.push(Line { text: String::new(), width: 0.0 });
-    }
+    out.push(cur.line);
     out
 }
 
 /// Appends one word to the current line, wrapping or breaking it as the
 /// mode allows. `spaced` = collapsible mode: a space separates words.
-fn place_word(adv: &Advancer, word: &str, mode: &TextMode, max: f32, cur: &mut Line, out: &mut Vec<Line>, spaced: bool) {
-    let has_content = !cur.text.trim().is_empty() || (!spaced && !cur.text.is_empty());
-    let gap = if spaced && has_content { adv.char(' ') } else { 0.0 };
+fn place_word(adv: &Advancer, word: &str, mode: &TextMode, max: f32, cur: &mut Cur, out: &mut Vec<Line>, spaced: bool) {
+    let own = !cur.line.text.trim().is_empty() || (!spaced && !cur.line.text.is_empty());
+    let glued = std::mem::take(&mut cur.glued) && cur.line.text.is_empty();
+    let has_content = (own || cur.prior) && !glued;
+    let gap = if spaced && own { adv.char(' ') } else { 0.0 };
     let w = adv.str(word);
+    let used = cur.offset + cur.line.width;
     if mode.word_break == 1 {
         // break-all: fill the line character by character.
         if gap > 0.0 {
-            if cur.width + gap < max {
-                cur.text.push(' ');
-                cur.width += gap;
+            if used + gap < max {
+                cur.line.text.push(' ');
+                cur.line.width += gap;
             } else {
-                out.push(std::mem::replace(cur, Line { text: String::new(), width: 0.0 }));
+                cur.push(out);
             }
         }
         for c in word.chars() {
             let cw = adv.char(c);
-            if cur.width + cw > max && !cur.text.trim().is_empty() {
-                out.push(std::mem::replace(cur, Line { text: String::new(), width: 0.0 }));
+            let filled = !cur.line.text.trim().is_empty() || cur.prior;
+            if cur.offset + cur.line.width + cw > max && filled {
+                cur.push(out);
             }
-            cur.text.push(c);
-            cur.width += cw;
+            cur.line.text.push(c);
+            cur.line.width += cw;
         }
         return;
     }
-    if has_content && cur.width + gap + w > max {
-        out.push(std::mem::replace(cur, Line { text: String::new(), width: 0.0 }));
+    if has_content && used + gap + w > max {
+        cur.push(out);
         return place_word(adv, word, mode, max, cur, out, spaced);
     }
     if gap > 0.0 {
-        cur.text.push(' ');
-        cur.width += gap;
+        cur.line.text.push(' ');
+        cur.line.width += gap;
     }
-    if cur.width + w > max && mode.overflow_wrap == 1 && max < f32::MAX {
+    if cur.offset + cur.line.width + w > max && mode.overflow_wrap == 1 && max < f32::MAX && !glued {
         // overflow-wrap: the word cannot fit even on its own line.
         for c in word.chars() {
             let cw = adv.char(c);
-            if cur.width + cw > max && !cur.text.trim().is_empty() {
-                out.push(std::mem::replace(cur, Line { text: String::new(), width: 0.0 }));
+            if cur.offset + cur.line.width + cw > max && (!cur.line.text.trim().is_empty() || cur.prior) {
+                cur.push(out);
             }
-            cur.text.push(c);
-            cur.width += cw;
+            cur.line.text.push(c);
+            cur.line.width += cw;
         }
         return;
     }
-    cur.text.push_str(word);
-    cur.width += w;
+    cur.line.text.push_str(word);
+    cur.line.width += w;
 }
 
 #[cfg(test)]
@@ -265,6 +305,23 @@ mod tests {
             // ...and fills every line under word-break: break-all.
             let l = break_lines(a, "ab abcdefgh", &TextMode { word_break: 1, ..m }, cw * 4.0);
             assert_eq!(texts(&l), vec!["ab a", "bcde", "fgh"]);
+        });
+    }
+
+    #[test]
+    fn continuation_kat() {
+        adv_test(|a| {
+            let cw = a.char('x');
+            let m = TextMode::default();
+            // 6 chars already on a 10-char line: "bb" joins it, "cccc" wraps.
+            let l = break_lines_from(a, "bb cccc dd", &TextMode { lead: true, ..m }, cw * 10.0, cw * 6.0, true);
+            assert_eq!(texts(&l), vec![" bb", "cccc dd"]);
+            // Even the first word does not fit: the joining line is empty.
+            let l = break_lines_from(a, "bbbbb", &TextMode { lead: true, ..m }, cw * 10.0, cw * 8.0, true);
+            assert_eq!(texts(&l), vec![" ", "bbbbb"]);
+            // No space between the items: no break opportunity before "bbbbb".
+            let l = break_lines_from(a, "bbbbb cc", &m, cw * 10.0, cw * 8.0, true);
+            assert_eq!(texts(&l), vec!["bbbbb", "cc"]);
         });
     }
 

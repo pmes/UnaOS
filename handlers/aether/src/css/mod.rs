@@ -335,16 +335,33 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         // Float approximation: no real float layout (text does not wrap
         // around the box), but a floated box sizes to content and hugs its
         // edge instead of stretching full width.
+        "vertical-align" => {
+            style.paint.vertical_align = match value {
+                "baseline" => Some((0, 0.0)),
+                "sub" => Some((1, 0.0)),
+                "super" => Some((2, 0.0)),
+                "middle" => Some((3, 0.0)),
+                "text-top" => Some((4, 0.0)),
+                "text-bottom" => Some((5, 0.0)),
+                "top" => Some((6, 0.0)),
+                "bottom" => Some((7, 0.0)),
+                v if v.ends_with('%') => v.trim_end_matches('%').trim().parse::<f32>().ok().map(|p| (9, p / 100.0)),
+                v => parse_px(v).map(|px| (8, px)),
+            };
+        }
         "float" => match value {
             "left" => {
                 style.width = Some(Dimension::auto());
                 style.align_self = Some(taffy::style::AlignSelf::START);
+                style.paint.float = Some(1);
             }
             "right" => {
                 style.width = Some(Dimension::auto());
                 style.align_self = Some(taffy::style::AlignSelf::END);
+                style.paint.float = Some(2);
             }
-            "none" | "inherit" | "initial" | "unset" => {}
+            "none" => style.paint.float = Some(0),
+            "inherit" | "initial" | "unset" => {}
             other => crate::ledger::record_css(&format!("float:{}", other)),
         },
         // The image-replacement idiom: a huge negative text-indent pushes
@@ -1949,7 +1966,7 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
-        list_item, list_style,
+        list_item, list_style, vertical_align, float,
     );
     clone!(pct_math, bg_gradient, shadows);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);

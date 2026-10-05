@@ -75,3 +75,7 @@ page = "corpus/15-landing.html"
 [[case]]
 name = "16-positioned"
 page = "corpus/16-positioned.html"
+
+[[case]]
+name = "17-inline-continue"
+page = "corpus/17-inline-continue.html"

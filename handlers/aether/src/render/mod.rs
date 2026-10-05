@@ -443,6 +443,148 @@ fn draw_text(
     );
 }
 
+/// The inherited paint state of an element's subtree: font, colour,
+/// decorations, white-space, list style, super/sub shift (CSS 2.2 §6.2,
+/// with the html.css UA defaults by tag).
+fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle, dom_node: &kuchiki::NodeRef) {
+    let parent_font_size = inherited.font_size;
+    let own_family = spec
+        .family
+        .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
+    inherited.font_size = spec.font_size.unwrap_or_else(|| {
+        crate::layout::ua_font_size(tag, inherited.font_size, inherited.family, own_family)
+    });
+    inherited.bold = spec.bold.unwrap_or_else(|| crate::layout::default_bold(tag, inherited.bold));
+    inherited.italic =
+        spec.italic.unwrap_or_else(|| crate::layout::default_italic(tag, inherited.italic));
+    inherited.family = spec
+        .family
+        .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
+    if let Some(lh) = spec.line_height {
+        inherited.line_height = lh;
+    }
+    if let Some(tt) = spec.text_transform {
+        inherited.text_transform = tt;
+    }
+
+    if tag == "a" || tag == "u" {
+        inherited.underline = true;
+    }
+    if let Some(u) = spec.underline {
+        inherited.underline = u;
+    }
+    if let Some(nw) = spec.nowrap {
+        inherited.nowrap = nw;
+    }
+    inherited.white_space = spec
+        .white_space
+        .unwrap_or_else(|| crate::layout::default_white_space(tag, inherited.white_space));
+    if let Some(v) = spec.word_break { inherited.word_break = v; }
+    if let Some(v) = spec.overflow_wrap { inherited.overflow_wrap = v; }
+    if let Some(v) = spec.letter_spacing { inherited.letter_spacing = v; }
+    inherited.line_through = spec
+        .line_through
+        .unwrap_or_else(|| crate::layout::default_line_through(tag, inherited.line_through));
+    // html.css list styles: ul disc (circle one level down,
+    // square deeper), ol decimal; inherited into the items.
+    match tag {
+        "ul" | "menu" | "dir" => {
+            let depth = dom_node
+                .ancestors()
+                .filter(|a| a.as_element().is_some_and(|e| matches!(e.name.local.as_ref(), "ul" | "ol" | "menu" | "dir")))
+                .count();
+            inherited.list_style = [1, 2, 3][depth.min(2)];
+        }
+        "ol" => inherited.list_style = 4,
+        _ => {}
+    }
+    if let Some(ls) = spec.list_style {
+        inherited.list_style = ls;
+    }
+    // Blink: super raises by parent-size/3 + 1, sub lowers by
+    // parent-size/5 + 1.
+    match tag {
+        "sup" => inherited.shift_y -= parent_font_size / 3.0 + 1.0,
+        "sub" => inherited.shift_y += parent_font_size / 5.0 + 1.0,
+        _ => {}
+    }
+    if spec.text_hidden == Some(true) {
+        inherited.text_hidden = true;
+    }
+    inherited.color = spec.color.unwrap_or(if tag == "a" {
+        (0, 0, 238) // UA default link blue
+    } else {
+        inherited.color
+    });
+}
+
+/// Draws one line's worth of text with its baseline at `baseline_y` — an
+/// inline formatting context's text fragment (layout::inline).
+#[allow(clippy::too_many_arguments)]
+fn draw_glyph_run(
+    text: &str,
+    origin_x: f32,
+    baseline_y: f32,
+    font: &Font,
+    font_key: u8,
+    font_size: f32,
+    letter_spacing: f32,
+    color: (u8, u8, u8),
+    deco: Deco,
+    surface: &mut [u8],
+    width: u32,
+    height: u32,
+    damage_rects: &[(u32, u32, u32, u32)],
+    clip: Clip,
+) {
+    let adv = crate::fonts::lines::Advancer::new(font, font_key, font_size, letter_spacing);
+    let mut pen_x = 0.0f32;
+    for c in text.chars() {
+        let advance = adv.char(c);
+        if c != ' ' {
+            if let Some(glyph_id) = font.glyph_for_char(c) {
+                if rasterize_glyph_cached(font, font_key, glyph_id, font_size).is_some() {
+                    blit_cached_glyph(
+                        font_key, glyph_id, font_size, origin_x + pen_x, baseline_y, color, surface, width, height,
+                        damage_rects, clip,
+                    );
+                }
+            }
+        }
+        pen_x += advance;
+    }
+    if !(deco.underline || deco.line_through) {
+        return;
+    }
+    let (a_px, _, _) = crate::fonts::line_metrics(font, font_size);
+    let thick = (font_size / 16.0).round().max(1.0) as i32;
+    // The fragment's spaces are inside its inline box (the line's hanging
+    // spaces were already removed by layout), so the decoration spans them.
+    let (x0, x1) = (origin_x, origin_x + pen_x);
+    let mut hline = |y: f32| {
+        let yi = y.round() as i32;
+        for dy in 0..thick {
+            let yy = yi + dy;
+            if yy < 0 || yy as u32 >= height {
+                continue;
+            }
+            let xa = x0.max(0.0).round() as u32;
+            let xb = (x1.max(0.0).round() as u32).min(width);
+            for x in xa..xb {
+                if in_damage(x, yy as u32, damage_rects) && in_clip(x, yy as u32, clip) {
+                    put_px(surface, width, x, yy as u32, color);
+                }
+            }
+        }
+    };
+    if deco.underline && x1 > x0 {
+        hline(baseline_y + (font_size / 9.0).max(1.0));
+    }
+    if deco.line_through && x1 > x0 {
+        hline(baseline_y - a_px * 0.3);
+    }
+}
+
 /// Text decoration lines of one run.
 #[derive(Clone, Copy, Default)]
 struct Deco {
@@ -766,6 +908,14 @@ pub fn dump_layout(layout: &LayoutTree) {
                 p.and_then(|p| p.hidden), p.and_then(|p| p.clip),
                 indent = depth * 2,
             );
+            if let Some(il) = layout.inline.get(&id) {
+                for (t, h, b) in &il.lines {
+                    eprintln!("{:indent$}| line y={t:.2} h={h:.2} baseline={b:.2}", "", indent = depth * 2 + 2);
+                }
+                for f in &il.frags {
+                    eprintln!("{:indent$}| {f:?}", "", indent = depth * 2 + 2);
+                }
+            }
         }
         if depth >= max_depth {
             return;
@@ -1071,75 +1221,7 @@ pub fn render_frame(
 
             if let Some(el) = dom_node.as_element() {
                 let tag = el.name.local.as_ref();
-                let parent_font_size = inherited.font_size;
-                let own_family = spec
-                    .family
-                    .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
-                inherited.font_size = spec.font_size.unwrap_or_else(|| {
-                    crate::layout::ua_font_size(tag, inherited.font_size, inherited.family, own_family)
-                });
-                inherited.bold = spec.bold.unwrap_or_else(|| crate::layout::default_bold(tag, inherited.bold));
-                inherited.italic =
-                    spec.italic.unwrap_or_else(|| crate::layout::default_italic(tag, inherited.italic));
-                inherited.family = spec
-                    .family
-                    .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
-                if let Some(lh) = spec.line_height {
-                    inherited.line_height = lh;
-                }
-                if let Some(tt) = spec.text_transform {
-                    inherited.text_transform = tt;
-                }
-
-                if tag == "a" || tag == "u" {
-                    inherited.underline = true;
-                }
-                if let Some(u) = spec.underline {
-                    inherited.underline = u;
-                }
-                if let Some(nw) = spec.nowrap {
-                    inherited.nowrap = nw;
-                }
-                inherited.white_space = spec
-                    .white_space
-                    .unwrap_or_else(|| crate::layout::default_white_space(tag, inherited.white_space));
-                if let Some(v) = spec.word_break { inherited.word_break = v; }
-                if let Some(v) = spec.overflow_wrap { inherited.overflow_wrap = v; }
-                if let Some(v) = spec.letter_spacing { inherited.letter_spacing = v; }
-                inherited.line_through = spec
-                    .line_through
-                    .unwrap_or_else(|| crate::layout::default_line_through(tag, inherited.line_through));
-                // html.css list styles: ul disc (circle one level down,
-                // square deeper), ol decimal; inherited into the items.
-                match tag {
-                    "ul" | "menu" | "dir" => {
-                        let depth = dom_node
-                            .ancestors()
-                            .filter(|a| a.as_element().is_some_and(|e| matches!(e.name.local.as_ref(), "ul" | "ol" | "menu" | "dir")))
-                            .count();
-                        inherited.list_style = [1, 2, 3][depth.min(2)];
-                    }
-                    "ol" => inherited.list_style = 4,
-                    _ => {}
-                }
-                if let Some(ls) = spec.list_style {
-                    inherited.list_style = ls;
-                }
-                // Blink: super raises by parent-size/3 + 1, sub lowers by
-                // parent-size/5 + 1.
-                match tag {
-                    "sup" => inherited.shift_y -= parent_font_size / 3.0 + 1.0,
-                    "sub" => inherited.shift_y += parent_font_size / 5.0 + 1.0,
-                    _ => {}
-                }
-                if spec.text_hidden == Some(true) {
-                    inherited.text_hidden = true;
-                }
-                inherited.color = spec.color.unwrap_or(if tag == "a" {
-                    (0, 0, 238) // UA default link blue
-                } else {
-                    inherited.color
-                });
+                inherit_element(&mut inherited, tag, &spec, dom_node);
 
                 let bw = layout_box.size.width.max(0.0);
                 let bh = layout_box.size.height.max(0.0);
@@ -1557,7 +1639,10 @@ pub fn render_frame(
                 if is_item && inherited.list_style != 0 && !inherited.text_hidden {
                     if let Some(f) = crate::fonts::face(inherited.family, inherited.bold, inherited.italic) {
                         let fs = inherited.font_size;
-                        let base = content_y + crate::fonts::baseline_offset(&f, fs, inherited.line_height);
+                        let base = match layout.inline.get(&node_id).and_then(|l| l.first_baseline) {
+                            Some(b) => content_y + b,
+                            None => content_y + crate::fonts::baseline_offset(&f, fs, inherited.line_height),
+                        };
                         paint_marker(
                             dom_node, inherited.list_style, content_x, base, &f,
                             crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
@@ -1648,6 +1733,7 @@ pub fn render_frame(
         }
 
         // overflow != visible: children clip to this box's screen rect.
+        let ifc = layout.inline.get(&node_id);
         let child_clip = if layout
             .paint_map
             .get(&node_id)
@@ -1668,7 +1754,210 @@ pub fn render_frame(
         if child_clip.2 <= child_clip.0 || child_clip.3 <= child_clip.1 {
             return; // fully clipped out — nothing below can paint
         }
+        if let Some(ifc) = ifc {
+            // An inline formatting context: its line-box fragments, in tree
+            // order (CSS 2.2 Appendix E step 7: each inline box's background
+            // and borders, then its text; atomic inlines as whole boxes).
+            let content_x = current_x + layout_box.border.left + layout_box.padding.left;
+            let content_y = current_y + layout_box.border.top + layout_box.padding.top;
+            // Text baselines snap to whole pixels from the EXACT (unrounded)
+            // position, as Skia rounds a glyph run's fractional origin; the
+            // box tree's rounded block positions can be up to half a pixel
+            // off it. (Box decorations stay on the rounded geometry.)
+            let exact_content_y = {
+                // The rounding error along the box's ancestor chain.
+                let mut err = 0.0f32;
+                let mut n = node_id;
+                loop {
+                    err += layout.taffy.unrounded_layout(n).location.y
+                        - layout.taffy.layout(n).map(|l| l.location.y).unwrap_or(0.0);
+                    match layout.taffy.parent(n) {
+                        Some(p) => n = p,
+                        None => break,
+                    }
+                }
+                let u = layout.taffy.unrounded_layout(node_id);
+                content_y + err + (u.border.top + u.padding.top) - (layout_box.border.top + layout_box.padding.top)
+            };
+            // The inherited state of every inline box in the context.
+            let mut inh: std::collections::HashMap<NodeId, Inherited> = std::collections::HashMap::new();
+            let mut skip: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+            fn walk_inh(
+                layout: &LayoutTree,
+                id: NodeId,
+                parent: Inherited,
+                hidden: bool,
+                inh: &mut std::collections::HashMap<NodeId, Inherited>,
+                skip: &mut std::collections::HashSet<NodeId>,
+            ) {
+                for k in layout.taffy.children(id).unwrap_or_default() {
+                    let mut i = parent;
+                    let spec = layout.paint_map.get(&k).cloned().unwrap_or_default();
+                    let hid = hidden || spec.hidden.unwrap_or(false);
+                    if hid {
+                        skip.insert(k);
+                    }
+                    let mut recurse = false;
+                    if let Some(n) = layout.node_map.get(&k) {
+                        if let Some(el) = n.as_element() {
+                            let tag = el.name.local.as_ref();
+                            // Atomic boxes compute their own state in draw_node.
+                            inh.insert(k, parent);
+                            if !crate::layout::inline::is_atomic_pub(layout, k) {
+                                inherit_element(&mut i, tag, &spec, n);
+                                i.shift_y = 0.0;
+                                inh.insert(k, i);
+                                recurse = true;
+                            }
+                        } else {
+                            inh.insert(k, parent);
+                        }
+                    } else {
+                        inh.insert(k, parent);
+                    }
+                    if recurse {
+                        walk_inh(layout, k, i, hid, inh, skip);
+                    }
+                }
+            }
+            let mut root_inh = inherited;
+            root_inh.shift_y = 0.0;
+            walk_inh(layout, node_id, root_inh, false, &mut inh, &mut skip);
+            for frag in &ifc.frags {
+                match frag {
+                    crate::layout::inline::Frag::Box { node, x, y, w, h, first, last } => {
+                        if skip.contains(node) {
+                            continue;
+                        }
+                        let Some(spec) = layout.paint_map.get(node) else { continue };
+                        let fx = content_x + x - sx as f32;
+                        let fy = content_y + y - sy as f32;
+                        let mut sides: [boxpaint::Side; 4] = [None; 4];
+                        if let Some(b) = spec.border {
+                            let styles = spec.border_style.unwrap_or([0; 4]);
+                            for i in 0..4 {
+                                let mut side = b[i];
+                                if let (Some(ws), Some((_, c))) = (spec.border_width.as_ref(), side) {
+                                    if let Some(w) = ws[i] {
+                                        side = Some((w, c));
+                                    }
+                                }
+                                sides[i] = side.filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
+                            }
+                        }
+                        // box-decoration-break: slice — the inline-start edge
+                        // only on the first fragment, the end on the last.
+                        if !*first {
+                            sides[3] = None;
+                        }
+                        if !*last {
+                            sides[1] = None;
+                        }
+                        let mut radius = spec.radius.unwrap_or([0.0; 4]);
+                        if !*first {
+                            radius[0] = 0.0;
+                            radius[3] = 0.0;
+                        }
+                        if !*last {
+                            radius[1] = 0.0;
+                            radius[2] = 0.0;
+                        }
+                        let rounded = radius.iter().any(|&r| r != 0.0)
+                            || sides.iter().any(|s| s.is_some_and(|s| s.2 != 0));
+                        let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, child_clip) {
+                                return;
+                            }
+                            if a >= 0.999 {
+                                put_px(surface, width, x, y, c);
+                            } else if a > 0.0 {
+                                blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                            }
+                        };
+                        if rounded {
+                            boxpaint::paint(fx, fy, *w, *h, radius, sides, spec.background, width, height, &mut blend_at);
+                        } else {
+                            // Pixel-snapped rectangles, as Blink snaps box decorations.
+                            let (x0, y0) = (fx.round(), fy.round());
+                            let (x1, y1) = ((fx + w).round(), (fy + h).round());
+                            let mut fill = |ax: f32, ay: f32, bx: f32, by: f32, c: (u8, u8, u8)| {
+                                let (ax, ay) = (ax.max(0.0) as u32, ay.max(0.0) as u32);
+                                let (bx, by) = ((bx.max(0.0) as u32).min(width), (by.max(0.0) as u32).min(height));
+                                for yy in ay..by {
+                                    for xx in ax..bx {
+                                        blend_at(xx, yy, c, 1.0);
+                                    }
+                                }
+                            };
+                            if let Some(bg) = spec.background {
+                                fill(x0, y0, x1, y1, bg);
+                            }
+                            if let Some((bw, c, _)) = sides[0] {
+                                fill(x0, y0, x1, y0 + bw.round().max(1.0), c);
+                            }
+                            if let Some((bw, c, _)) = sides[2] {
+                                fill(x0, y1 - bw.round().max(1.0), x1, y1, c);
+                            }
+                            if let Some((bw, c, _)) = sides[3] {
+                                fill(x0, y0, x0 + bw.round().max(1.0), y1, c);
+                            }
+                            if let Some((bw, c, _)) = sides[1] {
+                                fill(x1 - bw.round().max(1.0), y0, x1, y1, c);
+                            }
+                        }
+                    }
+                    crate::layout::inline::Frag::Text { node, text, x, baseline, .. } => {
+                        if skip.contains(node) {
+                            continue;
+                        }
+                        let Some(i) = inh.get(node).copied() else { continue };
+                        if i.text_hidden {
+                            continue;
+                        }
+                        let Some(face) = crate::fonts::face(i.family, i.bold, i.italic) else { continue };
+                        let key = crate::fonts::face_key(i.family, i.bold, i.italic);
+                        draw_glyph_run(
+                            text,
+                            content_x + x - sx as f32,
+                            (exact_content_y + baseline).round() - sy as f32,
+                            &face,
+                            key,
+                            i.font_size,
+                            i.letter_spacing,
+                            i.color,
+                            Deco { underline: i.underline, line_through: i.line_through },
+                            surface,
+                            width,
+                            height,
+                            damage_rects,
+                            child_clip,
+                        );
+                    }
+                    crate::layout::inline::Frag::Atomic { node, x, y } => {
+                        if skip.contains(node) {
+                            continue;
+                        }
+                        let i = inh.get(node).copied().unwrap_or(inherited);
+                        let loc = layout.taffy.layout(*node).map(|l| l.location).unwrap_or(taffy::Point { x: 0.0, y: 0.0 });
+                        draw_node(
+                            *node, content_x + x - loc.x, content_y + y - loc.y, i, layout, font, font_bold, surface,
+                            width, height, sx, sy, damage_rects, child_clip,
+                        );
+                    }
+                }
+            }
+        }
         if let Ok(children) = layout.taffy.children(node_id) {
+            // In an inline formatting context only out-of-flow children are
+            // painted from their own (taffy) positions; the rest were above.
+            let children: Vec<NodeId> = if ifc.is_some() {
+                children
+                    .into_iter()
+                    .filter(|c| matches!(layout.paint_map.get(c).and_then(|p| p.position_kind), Some(2 | 3)))
+                    .collect()
+            } else {
+                children
+            };
             // CSS 2.2 Appendix E, per parent: negative z-index, then the
             // in-flow boxes, then positioned boxes with z-index auto/0 in
             // tree order, then positive z-index in ascending order (stable).

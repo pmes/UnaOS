@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 mod blockwidth;
 mod collapse;
+pub mod inline;
 mod table;
 
 /// Specified paint properties for one box. `None` = not specified here;
@@ -122,6 +123,12 @@ pub struct PaintStyle {
     pub bg_gradient: Option<Option<crate::render::effects::Gradient>>,
     /// Outer box shadows (empty = none).
     pub shadows: Option<Vec<crate::render::effects::Shadow>>,
+    /// vertical-align (CSS 2.2 §10.8.1): (kind, value) — 0 baseline, 1 sub,
+    /// 2 super, 3 middle, 4 text-top, 5 text-bottom, 6 top, 7 bottom,
+    /// 8 a length in px (raise), 9 a percentage of line-height (fraction).
+    pub vertical_align: Option<(u8, f32)>,
+    /// float: 0 none, 1 left, 2 right.
+    pub float: Option<u8>,
 }
 
 pub struct LayoutTree {
@@ -132,6 +139,9 @@ pub struct LayoutTree {
     /// Viewport this tree lays out against (media queries + wrap width).
     pub viewport: (f32, f32),
     pub dirty: bool,
+    /// Inline formatting contexts (CSS 2.2 §9.4.2) by their root box: the
+    /// line-box fragments render paints in place of the root's children.
+    pub inline: HashMap<taffy::NodeId, inline::InlineLayout>,
 }
 
 impl LayoutTree {
@@ -148,6 +158,7 @@ impl LayoutTree {
         self.root_node = new_tree.root_node;
         self.node_map = new_tree.node_map;
         self.paint_map = new_tree.paint_map;
+        self.inline = new_tree.inline;
         self.dirty = false;
     }
 }
@@ -666,6 +677,7 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         paint_map,
         viewport: (vw, vh),
         dirty: false,
+        inline: HashMap::new(),
     }
 }
 
@@ -1047,7 +1059,7 @@ fn collapse_inline_whitespace(tree: &mut LayoutTree) {
                 let tag = el.name.local.as_ref();
                 ws = tree.paint_map.get(&id).and_then(|p| p.white_space).unwrap_or_else(|| default_white_space(tag, ws));
                 block = is_block_level(tree, id);
-                if !block && matches!(tag, "img" | "input" | "button" | "select" | "textarea" | "br" | "svg" | "canvas" | "video") {
+                if !block && (tag == "br" || inline::is_atomic(tree, id)) {
                     // Atomic inline: content that is not a space.
                     ifc.prev_space = tag == "br";
                     ifc.last_text = None;
@@ -1336,8 +1348,12 @@ pub fn remeasure(tree: &mut LayoutTree) {
         imgs: &mut HashMap<taffy::NodeId, (f32, f32)>,
         media: &mut HashMap<taffy::NodeId, (f32, f32, f32)>,
         sizes: &mut HashMap<taffy::NodeId, f32>,
+        elems: &mut HashMap<taffy::NodeId, TextRun>,
     ) {
         let mut size = inherited.clone();
+        if let Some(ta) = tree.paint_map.get(&node_id).and_then(|p| p.text_align) {
+            size.text_align = ta;
+        }
         if let Some(dom_node) = tree.node_map.get(&node_id) {
             if let Some(el) = dom_node.as_element() {
                 let paint = tree.paint_map.get(&node_id);
@@ -1421,15 +1437,19 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 out.insert(node_id, TextRun { text, mode, ..inherited.clone() });
             }
         }
+        if tree.node_map.get(&node_id).is_none_or(|n| n.as_text().is_none()) {
+            elems.insert(node_id, size.clone());
+        }
         if let Ok(children) = tree.taffy.children(node_id) {
             for child in children {
-                resolve(child, size.clone(), tree, out, imgs, media, sizes);
+                resolve(child, size.clone(), tree, out, imgs, media, sizes, elems);
             }
         }
     }
     let root = TextRun { font_size: 16.0, ..Default::default() };
     let mut sizes: HashMap<taffy::NodeId, f32> = HashMap::new();
-    resolve(tree.root_node, root, tree, &mut text_info, &mut img_info, &mut media_info, &mut sizes);
+    let mut elem_info: HashMap<taffy::NodeId, TextRun> = HashMap::new();
+    resolve(tree.root_node, root, tree, &mut text_info, &mut img_info, &mut media_info, &mut sizes, &mut elem_info);
     rescale_ua_margins(tree, &sizes);
     // A replaced media box with an auto width is its own (attribute / intrinsic) width — not
     // stretched across a column container the way an auto-width block is. Height follows when
@@ -1477,30 +1497,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
         .collect();
     let has_tables = !table::tables(tree).is_empty();
     let passes = if pct_nodes.is_empty() && !has_tables { 1 } else { 2 };
-    for pass in 0..passes {
-    if pass == 1 && has_tables {
-        // Column grid from the first pass's max-content cell widths.
-        table::apply(tree);
-    }
-    if pass == 1 {
-        // Containing-block widths are known now: resolve the % math.
-        for (id, m) in &pct_nodes {
-            let Some(parent) = tree.taffy.parent(*id) else { continue };
-            let Ok(pl) = tree.taffy.layout(parent) else { continue };
-            let cb = pl.size.width - pl.padding.left - pl.padding.right - pl.border.left - pl.border.right;
-            let Ok(st) = tree.taffy.style(*id) else { continue };
-            let mut st = st.clone();
-            for (i, e) in m.iter().enumerate() {
-                let Some(v) = e.as_deref().and_then(|e| crate::css::eval_length(e, Some(cb))) else { continue };
-                match i {
-                    0 => st.size.width = Dimension::length(v),
-                    1 => st.min_size.width = LengthPercentageAuto::length(v),
-                    _ => st.max_size.width = LengthPercentageAuto::length(v),
-                }
-            }
-            let _ = tree.taffy.set_style(*id, st);
-        }
-    }
+    let run_pass = |tree: &mut LayoutTree| {
     let _ = tree.taffy.compute_layout_with_measure(
         tree.root_node,
         viewport,
@@ -1541,6 +1538,76 @@ pub fn remeasure(tree: &mut LayoutTree) {
             }
         }),
     );
+    };
+    for pass in 0..passes {
+    if pass == 1 && has_tables {
+        // Column grid from the first pass's max-content cell widths.
+        table::apply(tree);
+    }
+    if pass == 1 {
+        // Containing-block widths are known now: resolve the % math.
+        for (id, m) in &pct_nodes {
+            let Some(parent) = tree.taffy.parent(*id) else { continue };
+            let Ok(pl) = tree.taffy.layout(parent) else { continue };
+            let cb = pl.size.width - pl.padding.left - pl.padding.right - pl.border.left - pl.border.right;
+            let Ok(st) = tree.taffy.style(*id) else { continue };
+            let mut st = st.clone();
+            for (i, e) in m.iter().enumerate() {
+                let Some(v) = e.as_deref().and_then(|e| crate::css::eval_length(e, Some(cb))) else { continue };
+                match i {
+                    0 => st.size.width = Dimension::length(v),
+                    1 => st.min_size.width = LengthPercentageAuto::length(v),
+                    _ => st.max_size.width = LengthPercentageAuto::length(v),
+                }
+            }
+            let _ = tree.taffy.set_style(*id, st);
+        }
+    }
+    run_pass(tree);
+    }
+    // Inline formatting contexts (CSS 2.2 §9.4.2): line boxes at the widths
+    // the block pass settled; each root's height becomes the sum of its
+    // line boxes, and the tree is laid out again until heights are stable
+    // (an inline-block's height feeds the line that holds it).
+    let mut saved_heights: Vec<(taffy::NodeId, Dimension)> = Vec::new();
+    for _ in 0..4 {
+        let heights = inline::layout_all(tree, &text_info, &elem_info);
+        let mut changed = false;
+        for (id, h) in heights {
+            let Ok(st) = tree.taffy.style(id) else { continue };
+            let saved = saved_heights.iter().find(|(s, _)| *s == id).map(|(_, d)| *d);
+            let orig = saved.unwrap_or(st.size.height);
+            if orig != Dimension::auto() {
+                continue;
+            }
+            let Ok(l) = tree.taffy.layout(id) else { continue };
+            let edges = l.padding.top + l.padding.bottom + l.border.top + l.border.bottom;
+            let want = if st.box_sizing == taffy::style::BoxSizing::BorderBox { h + edges } else { h };
+            let content_now = l.size.height - edges;
+            if st.size.height == Dimension::length(want) && (content_now - h).abs() < 0.01 {
+                continue;
+            }
+            if saved.is_none() {
+                saved_heights.push((id, st.size.height));
+            }
+            let mut st = st.clone();
+            st.size.height = Dimension::length(want);
+            let _ = tree.taffy.set_style(id, st);
+            if (content_now - h).abs() >= 0.01 {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        run_pass(tree);
+    }
+    for (id, d) in saved_heights {
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            st.size.height = d;
+            let _ = tree.taffy.set_style(id, st);
+        }
     }
     collapse::restore(tree, collapsed);
     blockwidth::restore(tree, widths);
@@ -1560,6 +1627,8 @@ struct TextRun {
     bold: bool,
     italic: bool,
     text_transform: u8,
+    /// Inherited text-align: 0 start, 1 center, 2 end.
+    text_align: u8,
 }
 
 /// Measures a text run: (widest line, lines x line height), through the
