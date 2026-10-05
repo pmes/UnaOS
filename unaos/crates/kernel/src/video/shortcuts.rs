@@ -198,7 +198,7 @@ pub fn open() -> bool {
         (i.width, i.height)
     };
     let (lines, rows) = layout();
-    let (cw, ch) = (menubar::BAR_CELL_W, menubar::BAR_CELL_H);
+    let (cw, ch) = (menubar::BAR_CELL_W(), menubar::BAR_CELL_H());
     let lh = ch + 4;
     let colw = lines.iter().map(|l| l.text.len()).max().unwrap_or(0) * cw;
     let pad = 16usize;

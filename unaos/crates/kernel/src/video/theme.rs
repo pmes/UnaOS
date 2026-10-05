@@ -298,37 +298,37 @@ pub const GLOSS_BOTTOM_ALPHA_Q16: u32 = 0;
 // ---------------------------------------------------------------------------
 
 /// `metrics.frame` = `5` @ `0787ba9f` — frame thickness, px.
-pub const FRAME: usize = 5;
+#[allow(non_snake_case)] #[inline] pub fn FRAME() -> usize { crate::ui::px(crate::ui::base::FRAME) } // UIMETRICS: was `const` 5 device px
 
 /// `metrics.bevel` = `1` @ `0787ba9f` — bevel thickness, px. Iteration 3 makes the
 /// bevel a true hairline.
-pub const BEVEL: usize = 1;
+#[allow(non_snake_case)] #[inline] pub fn BEVEL() -> usize { crate::ui::px(crate::ui::base::BEVEL) } // UIMETRICS: was `const` 1
 
 /// `metrics.title_height` = `34` @ `0787ba9f` — title bar height, px.
-pub const TITLE_HEIGHT: usize = 34;
+#[allow(non_snake_case)] #[inline] pub fn TITLE_HEIGHT() -> usize { crate::ui::px(crate::ui::base::TITLE_HEIGHT) } // UIMETRICS: was `const` 34
 
 /// `metrics.corner_radius` = `12` @ `0787ba9f` — radius of the two *top* corners, px.
-pub const CORNER_RADIUS: usize = 12;
+#[allow(non_snake_case)] #[inline] pub fn CORNER_RADIUS() -> usize { crate::ui::px(crate::ui::base::CORNER_RADIUS) } // UIMETRICS: was `const` 12
 
 /// `metrics.widget_radius` = `8` @ `0787ba9f` — corner radius for widgets (buttons and
 /// other raised controls), px. New in iteration 3.
-pub const WIDGET_RADIUS: usize = 8;
+#[allow(non_snake_case)] #[inline] pub fn WIDGET_RADIUS() -> usize { crate::ui::px(crate::ui::base::WIDGET_RADIUS) } // UIMETRICS: was `const` 8
 
 /// `metrics.well_radius` = `15` @ `0787ba9f` — corner radius for wells (recessed
 /// regions, e.g. a scroll trough or a content sink), px. New in iteration 3.
-pub const WELL_RADIUS: usize = 15;
+#[allow(non_snake_case)] #[inline] pub fn WELL_RADIUS() -> usize { crate::ui::px(crate::ui::base::WELL_RADIUS) } // UIMETRICS: was `const` 15
 
 /// `metrics.scrollbar_width` = `12` @ `0787ba9f` — scrollbar width, px.
-pub const SCROLLBAR_WIDTH: usize = 12;
+#[allow(non_snake_case)] #[inline] pub fn SCROLLBAR_WIDTH() -> usize { crate::ui::px(crate::ui::base::SCROLLBAR_WIDTH) } // UIMETRICS: was `const` 12
 
 /// `metrics.button_height` = `28` @ `0787ba9f` — button height, px.
-pub const BUTTON_HEIGHT: usize = 28;
+#[allow(non_snake_case)] #[inline] pub fn BUTTON_HEIGHT() -> usize { crate::ui::px(crate::ui::base::BUTTON_HEIGHT) } // UIMETRICS: was `const` 28
 
 /// `metrics.button_pad_x` = `18` @ `0787ba9f` — horizontal padding inside a button, px.
-pub const BUTTON_PAD_X: usize = 18;
+#[allow(non_snake_case)] #[inline] pub fn BUTTON_PAD_X() -> usize { crate::ui::px(crate::ui::base::BUTTON_PAD_X) } // UIMETRICS: was `const` 18
 
 /// `metrics.gap` = `12` @ `0787ba9f` — standard gap between controls, px.
-pub const GAP: usize = 12;
+#[allow(non_snake_case)] #[inline] pub fn GAP() -> usize { crate::ui::px(crate::ui::base::GAP) } // UIMETRICS: was `const` 12
 
 /// The title-bar control's extent, px — read as a DIAMETER, the controls being circles.
 ///
@@ -373,14 +373,14 @@ pub const GAP: usize = 12;
 /// `TITLE_HEIGHT` to ~44 (clearance 10) or ~48 (clearance 12) is the fix, and it is a **taste-gate
 /// question** — it changes every window's proportions and the caption's centring — so it is put on
 /// the record here and NOT taken by this arc. The const-assert below still holds with room.
-pub const CONTROL_BOX: usize = 24;
+#[allow(non_snake_case)] #[inline] pub fn CONTROL_BOX() -> usize { crate::ui::px(crate::ui::base::CONTROL_BOX) } // UIMETRICS: was `const` 24 (the kit's 12 at 2x in device px; the kit's 12 x the dpi scale now)
 
 /// Radius of a circular title-bar control, px — `CONTROL_BOX / 2`, derived here rather
 /// than lifted, because the json expresses the control's size only as `control_box`.
-pub const CONTROL_RADIUS: usize = CONTROL_BOX / 2;
+#[allow(non_snake_case)] #[inline] pub fn CONTROL_RADIUS() -> usize { CONTROL_BOX() / 2 } // UIMETRICS: was `const`
 
 /// `metrics.text_px` = `15` @ `0787ba9f` — nominal text size, px.
-pub const TEXT_PX: usize = 15;
+#[allow(non_snake_case)] #[inline] pub fn TEXT_PX() -> usize { crate::ui::px(crate::ui::base::TEXT_PX) } // UIMETRICS: was `const` 15
 
 /// `metrics.line_height_pct` = `165` @ `0787ba9f` — line height as a percent of `TEXT_PX`.
 pub const LINE_HEIGHT_PCT: usize = 165;
@@ -393,43 +393,43 @@ pub const LINE_HEIGHT_PCT: usize = 165;
 // ---------------------------------------------------------------------------
 
 /// Metrics that must be strictly positive for any chrome to be drawable.
-const _: () = {
-    assert!(FRAME > 0);
-    assert!(BEVEL > 0);
-    assert!(TITLE_HEIGHT > 0);
-    assert!(SCROLLBAR_WIDTH > 0);
-    assert!(BUTTON_HEIGHT > 0);
-    assert!(BUTTON_PAD_X > 0);
-    assert!(GAP > 0);
-    assert!(CONTROL_BOX > 0);
-    assert!(TEXT_PX > 0);
+#[allow(dead_code)] pub(crate) fn uimetrics_assert_positive() {
+    assert!(FRAME() > 0);
+    assert!(BEVEL() > 0);
+    assert!(TITLE_HEIGHT() > 0);
+    assert!(SCROLLBAR_WIDTH() > 0);
+    assert!(BUTTON_HEIGHT() > 0);
+    assert!(BUTTON_PAD_X() > 0);
+    assert!(GAP() > 0);
+    assert!(CONTROL_BOX() > 0);
+    assert!(TEXT_PX() > 0);
     assert!(LINE_HEIGHT_PCT > 0);
     // The three radii (`corner_radius`, `widget_radius`, `well_radius`) may each
     // legitimately be 0 (a square head, a square widget, a square well), so they are
     // bounded below rather than required positive.
-};
+}
 
 /// Relationships the json's own numbers imply, and that the chrome geometry relies on.
-const _: () = {
+#[allow(dead_code)] pub(crate) fn uimetrics_assert_relations() {
     // The bevel is drawn inside the frame.
-    assert!(BEVEL < FRAME);
+    assert!(BEVEL() < FRAME());
     // The rounded head must fit inside the title bar: 12 < 34.
-    assert!(CORNER_RADIUS < TITLE_HEIGHT);
+    assert!(CORNER_RADIUS() < TITLE_HEIGHT());
     // Title-bar controls must fit inside the title bar: 24 < 34 since the size ruling.
-    assert!(CONTROL_BOX < TITLE_HEIGHT);
+    assert!(CONTROL_BOX() < TITLE_HEIGHT());
     // …and must leave a real clearance band, not merely fit. `(34 - 24)/2` = 5 px each side, which
     // is tight (see the note on `CONTROL_BOX`: raising `TITLE_HEIGHT` is a proposed taste-gate
     // question). One bevel of clearance is the floor below which the disc would touch the frame.
-    assert!(TITLE_HEIGHT >= CONTROL_BOX + 2 * BEVEL);
+    assert!(TITLE_HEIGHT() >= CONTROL_BOX() + 2 * BEVEL());
     // A circular control needs a non-degenerate radius, or it cannot be drawn round.
-    assert!(CONTROL_RADIUS > 0);
+    assert!(CONTROL_RADIUS() > 0);
     // Both of a widget's corners must fit within its own height: 2*8 <= 28.
-    assert!(2 * WIDGET_RADIUS <= BUTTON_HEIGHT);
+    assert!(2 * WIDGET_RADIUS() <= BUTTON_HEIGHT());
     // A well's corner is a chrome-scale radius, not a window-scale one.
-    assert!(WELL_RADIUS < TITLE_HEIGHT);
+    assert!(WELL_RADIUS() < TITLE_HEIGHT());
     // A line of text is taller than the glyph box.
     assert!(LINE_HEIGHT_PCT > 100);
-};
+}
 
 /// Every colour is a packed `0x00RRGGBB`: the alpha byte is zero, because the json
 /// palette carries no per-colour alpha. If a future kit adds alpha, this block is

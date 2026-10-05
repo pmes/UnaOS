@@ -101,7 +101,7 @@ pub enum Edge {
 
 /// The margin a centred strip keeps off its edge, and the padding tenants lay out inside themselves —
 /// [`theme::GAP`], the kit's one "standard gap between controls".
-pub const PAD: usize = theme::GAP;
+#[allow(non_snake_case)] #[inline] pub fn PAD() -> usize { theme::GAP() }
 
 /// The widest strip this module will compose, in panel pixels — the scratch row's length.
 ///
@@ -125,12 +125,12 @@ pub fn frame_centred(edge: Edge, w: usize, h: usize, pw: usize, ph: usize) -> Op
     if w == 0 || h == 0 || w > MAX_STRIP_W {
         return None;
     }
-    if ph < h + 2 * PAD || w + 2 * PAD > pw {
+    if ph < h + 2 * PAD() || w + 2 * PAD() > pw {
         return None;
     }
     let y = match edge {
-        Edge::Top => PAD,
-        Edge::Bottom => ph - PAD - h,
+        Edge::Top => PAD(),
+        Edge::Bottom => ph - PAD() - h,
     };
     Some(((pw - w) / 2, y, w, h))
 }
@@ -806,7 +806,7 @@ pub fn key_escape(ev: crate::pal::Event) -> bool {
 // Compile-time sanity
 // ---------------------------------------------------------------------------
 
-const _: () = {
+#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
     // A registry with no room for the tenants declared above is a registry that silently drops one.
     assert!(STRIP_MAX >= 1);
     // Every named slot must be inside the registry, or a witness indexes past its own tenant table.
@@ -817,8 +817,8 @@ const _: () = {
     // returns the panel's full width, so this is the panel bound the painter declines above.
     assert!(MAX_STRIP_W >= 2048);
     // A margin of zero would make `frame_centred` and `frame_flush` the same function.
-    assert!(PAD > 0);
-};
+    assert!(PAD() > 0);
+}
 
 // ---------------------------------------------------------------------------
 // TEARSCOPE — the BAR's own census

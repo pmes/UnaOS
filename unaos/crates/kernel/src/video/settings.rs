@@ -760,8 +760,8 @@ fn repaint() {
 pub fn open() -> Result<(), String> {
     let pi = crate::video::panel_info_nonblocking().ok_or_else(|| String::from("panel busy"))?;
     let (pw, ph) = (pi.width, pi.height);
-    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
-    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
+    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER()).max(1));
+    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
     if w < WIN_W || h < WIN_H { return Err(String::from("window below floor")); }
     let len = w * h;
     let mut surf: Vec<u32> = Vec::new();
@@ -778,7 +778,7 @@ pub fn open() -> Result<(), String> {
     let mut st = State { sel: tab_ctrls(tab0).first().copied().unwrap_or(0), strip: true, u: UsersUi::new(), w, h, surf };
     paint(&mut st, &CUR.lock().clone());
     let base = st.surf.as_ptr() as usize;
-    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, b"Settings", ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, b"Settings", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE { return Err(String::from("window create failed")); }
     *STATE.lock() = Some(st);
     WIN.store(id, Ordering::Relaxed);

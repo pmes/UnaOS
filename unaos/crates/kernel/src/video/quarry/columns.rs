@@ -451,7 +451,7 @@ pub(super) fn after_show(m: &mut Model) {
 pub(super) fn header_press(m: &mut Model, sx: usize) -> bool {
     let g = m.geom;
     let li = g.list_pane().inner();
-    let lsb = if m.list.len() > m.list_visible() { super::SBW } else { 0 };
+    let lsb = if m.list.len() > m.list_visible() { super::SBW() } else { 0 };
     let mut st = COLS.lock();
     load(&mut st);
     let c = layout(&g, li, lsb, &st.widths, st.trash);

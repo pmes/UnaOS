@@ -207,10 +207,10 @@ fn rw_publish_seat(id: wm::WinId) {
         return;
     };
     let (cw, ch) = (i.w.saturating_mul(i.scale), i.h.saturating_mul(i.scale));
-    let ox = i.x.saturating_sub(wm::BORDER);
-    let oy = i.y.saturating_sub(wm::TITLE_H + wm::BORDER);
-    let ow = cw.saturating_add(2 * wm::BORDER);
-    let oh = ch.saturating_add(wm::TITLE_H + 2 * wm::BORDER);
+    let ox = i.x.saturating_sub(wm::BORDER());
+    let oy = i.y.saturating_sub(wm::TITLE_H() + wm::BORDER());
+    let ow = cw.saturating_add(2 * wm::BORDER());
+    let oh = ch.saturating_add(wm::TITLE_H() + 2 * wm::BORDER());
     for (slot, val) in [i.x, i.y, cw, ch, ox, oy, ow, oh].iter().enumerate() {
         RW_SEAT[slot].store(*val, Ordering::Relaxed);
     }
@@ -441,7 +441,7 @@ pub fn run(_screen: &mut crate::video::Screen) {
     // here is the drag handle answering and not merely "some pixel of the box". `hit_test` skips
     // `owner_asid == 0` and rows at or below the shell floor, so this leg measures exactly the pair
     // of properties `RW_OWNER` was chosen for.
-    let (hx, hy) = (win.ox + win.ow / 2, win.oy + wm::TITLE_H / 2);
+    let (hx, hy) = (win.ox + win.ow / 2, win.oy + wm::TITLE_H() / 2);
     let hit = wm::hit_test(hx as i32, hy as i32);
     let hit_ok = matches!(hit, Some((hid, howner, _)) if hid == win.id && howner == RW_OWNER);
     // The damage leg: the band presented per frame never exceeded the surface, and the total is
@@ -577,8 +577,8 @@ impl RwWin {
             h as u32,
             stride as u32,
             RW_TITLE,
-            ox + wm::BORDER,
-            oy + wm::TITLE_H + wm::BORDER,
+            ox + wm::BORDER(),
+            oy + wm::TITLE_H() + wm::BORDER(),
         );
         if id == wm::WIN_NONE {
             serial_println!("[rastwin] {} open DECLINE reason=create-refused", tag);

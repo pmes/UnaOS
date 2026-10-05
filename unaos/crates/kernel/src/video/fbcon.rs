@@ -1863,12 +1863,12 @@ fn win_content_extent(pw: usize, ph: usize, wbot: usize, cell_w: usize, cell_h: 
     let wtop = crate::ui_status::top_chrome_h(pw, ph); let avail_h = ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).max(1); // ⚠ SAME-LINE fold, line-NEUTRAL (PARITY.md §5.3): unchanged expression, `wtop` merely named because the cap below needs it too.
     // CASCADEFIT — THE HEIGHT CAP, and deliberately ONLY the height: the tallest CONTENT whose outer box still ends above the keep-out published by a boot window below (`wbot` = [`console_work_bottom`], this file's tail).
     // ⚠ It is applied AFTER the budget loop, at the return, and NOT folded into `avail_h` above — the loop shrinks both axes together, so a shorter work area handed in at the top would make it terminate earlier and the console would come out WIDER and somewhere else in `x`: a placement fix that moved the axis it was not about. Capped afterwards, `w` is derived from the panel exactly as before and only the height can move. MEASURED (`UNAOS_PIDESK=1 ./arroyo kernel8-test`, this arc): at 1920x1200 the cap is 868 content rows against a console that wants 736, so it does not bind and the whole correction is in the centring below; at 640x480 it is 176 against 352, and it binds.
-    let cap = wbot.saturating_sub(wtop).saturating_sub(wm::TITLE_H + 2 * wm::BORDER); // Never negative: saturating, and `.max(1)` at the return keeps at least one glyph row.
+    let cap = wbot.saturating_sub(wtop).saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()); // Never negative: saturating, and `.max(1)` at the return keeps at least one glyph row.
     let mut w = (pw * 7 / 8).max(cell_w);
     let mut h = (avail_h * 7 / 8).max(cell_h);
     // Outer box = content + chrome. Budget the box, not the content: the box is what gets staged.
     let box_px = |w: usize, h: usize| {
-        (w + 2 * wm::BORDER).saturating_mul(h + wm::TITLE_H + 2 * wm::BORDER)
+        (w + 2 * wm::BORDER()).saturating_mul(h + wm::TITLE_H() + 2 * wm::BORDER())
     };
     while box_px(w, h) > WIN_BOX_BUDGET_PX && w > cell_w && h > cell_h {
         w = (w * 15 / 16).max(cell_w);
@@ -1992,8 +1992,8 @@ pub fn panel_console_window_open() -> wm::WinId {
         ch as u32,
         stride as u32,
         b"Console",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[wc-x] console-window DECLINE reason=create-failed");

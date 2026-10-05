@@ -29,10 +29,10 @@
 //!   ([`latch`]), so every metric derived from it agrees for the whole boot; a reader before that gets the value
 //!   computed from the live panel without latching it.
 //!
-//! What follows the scale today: the console's character cell and grid (`video::text::Face::Grid`, armed by
-//! `fbcon` at the takeover seam) and the `font_size` the console's face is sized from. The furniture (the bar and
-//! title strip, the control discs, `theme::GAP`) is `const` device px across `wm.rs`'s assertions and is owed
-//! (KERNELFONT2.md §Owed).
+//! What follows the scale: the console's character cell and grid (`video::text::Face::Grid`, armed by
+//! `fbcon` at the takeover seam), the `font_size` the faces are sized from, and — UIMETRICS (B372) — every
+//! furniture length through `ui::Metrics` (the bar and title strip, the frame, the control discs, the gap,
+//! the chrome text cell, the dock and the crystal menu) and the native kernel windows.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -133,4 +133,41 @@ pub const fn px_at(n: usize, s2: u32) -> usize {
 /// The scale as the wire prints it: `2.5`.
 pub fn scale_str(s2: u32) -> alloc::string::String {
     alloc::format!("{}.{}", s2 / 2, if s2 % 2 == 1 { 5 } else { 0 })
+}
+
+/// UIMETRICS (B372): `(scale x2, ppi)` for `ui::Metrics::panel` — the latched pair; before the latch, latch
+/// now when the panel's width can be read without blocking, else answer the live computation unlatched
+/// (a reader under the writer's lock gets the native-width answer, which is the latched one at the
+/// panel's native mode).
+pub fn metrics_scale() -> (u32, u32) {
+    let s = S2.load(Ordering::Acquire);
+    if s != 0 {
+        return (s, PPI.load(Ordering::Relaxed));
+    }
+    match crate::video::panel_info_nonblocking() {
+        Some(i) if i.width > 0 => {
+            let s2 = latch(i.width);
+            (s2, PPI.load(Ordering::Relaxed))
+        }
+        _ => {
+            let (ppi, s2) = compute(0);
+            (s2, ppi)
+        }
+    }
+}
+
+/// UIMETRICS: has the scale been latched for this boot?
+pub fn latched() -> bool {
+    S2.load(Ordering::Acquire) != 0
+}
+
+/// UIMETRICS: the scale x2 on the furniture's hot path — one relaxed load once latched (the compositor's
+/// ignition latches it), [`metrics_scale`] before that.
+#[inline]
+pub fn s2() -> u32 {
+    let s = S2.load(Ordering::Relaxed);
+    if s != 0 {
+        return s;
+    }
+    metrics_scale().0
 }

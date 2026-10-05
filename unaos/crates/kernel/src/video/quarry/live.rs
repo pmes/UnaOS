@@ -282,7 +282,7 @@ const PAD: usize = 4;
 const BASE_CELL: usize = 8;
 /// Scrollbar gutter width — [`theme::SCROLLBAR_WIDTH`], the role that has existed since the theme
 /// table landed and has never had a consumer. Quarry is the first.
-const SBW: usize = theme::SCROLLBAR_WIDTH;
+#[allow(non_snake_case)] #[inline] fn SBW() -> usize { theme::SCROLLBAR_WIDTH() }
 /// Shortest thumb we will draw, so a 10 000-row directory still leaves something to aim at.
 const THUMB_MIN: usize = 16;
 
@@ -349,7 +349,7 @@ impl Geom {
     #[inline]
     fn tree_w(&self) -> usize {
         let want = self.w * 5 / 16;
-        let lo = (10 * self.cell_w() + 2 * PAD + SBW).min(self.w / 2);
+        let lo = (10 * self.cell_w() + 2 * PAD + SBW()).min(self.w / 2);
         want.clamp(lo, self.w / 2)
     }
     /// `(x, y, w, h)` of the tree pane, in source pixels.
@@ -403,8 +403,8 @@ fn geometry(pw: usize, ph: usize) -> Option<Geom> {
     let (cell_w, cell_h) = (face.cell_w(), face.cell_h());
     // Leave the chrome room. `wm` draws the title strip above the content and a border around it, and
     // a window whose OUTER box does not fit is a window the tiler will fight.
-    let avail_w = pw.saturating_sub(2 * wm::BORDER);
-    let avail_h = ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER);
+    let avail_w = pw.saturating_sub(2 * wm::BORDER());
+    let avail_h = ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER());
     // THE TWO AXES ROUND SEPARATELY, and that is the whole of what the face split costs here: the
     // surface still holds a whole number of glyph cells, but a glyph cell is no longer square.
     let w = (pw * 3 / 5).min(CEIL_W).min(avail_w) / cell_w * cell_w;
@@ -1707,9 +1707,9 @@ fn paint_scrollbar(
     // shorter than its header unreachable, but a painter that can underflow on a geometry change is a
     // painter that will, and the cost of not being able to is nothing.
     let track = Rect {
-        x: inner.x + inner.w.saturating_sub(SBW),
+        x: inner.x + inner.w.saturating_sub(SBW()),
         y: top,
-        w: SBW,
+        w: SBW(),
         h: (inner.y + inner.h).saturating_sub(top),
     };
     fill(px, g, track.x, track.y, track.w, track.h, theme::SCROLL_TRACK);
@@ -1750,7 +1750,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     fill(px, g, tp.x, tp.y, tp.w, tp.h, theme::CONTENT_FILL);
     keyline(px, g, tp, theme::FRAME_LINE);
     let tvis = m.tree_visible();
-    let tsb = if m.tree.len() > tvis { SBW } else { 0 };
+    let tsb = if m.tree.len() > tvis { SBW() } else { 0 };
     for r in 0..tvis {
         let i = m.tree_scroll + r;
         if i >= m.tree.len() {
@@ -1794,7 +1794,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     fill(px, g, lp.x, lp.y, lp.w, lp.h, theme::CONTENT_FILL);
     keyline(px, g, lp, theme::FRAME_LINE);
     let lvis = m.list_visible();
-    let lsb = if m.list.len() > lvis { SBW } else { 0 };
+    let lsb = if m.list.len() > lvis { SBW() } else { 0 };
     let body_y = columns::paint_list(m, px, li, lsb, lvis); // QUARRY2 (B336): the header (sortable, with a chevron) and the NAME SIZE MODIFIED TYPE ORIGIN columns
     paint_scrollbar(px, g, li, body_y, m.list.len(), lvis, m.list_scroll);
     ops::paint_overlay(m, px); // QUARRYOPS — the context menu and the inline edit field, over the finished frame
@@ -2006,8 +2006,8 @@ pub fn open() {
         g.h as u32,
         (g.w * 4) as u32,
         b"Quarry",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[quarry] DECLINE reason=create-failed");
@@ -2570,7 +2570,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         // it is the only scroll a wheel-less mouse has and the only one that crosses a
         // thousand-entry directory in a gesture a wrist can complete. The two share this pane's one
         // offset and the same selection pull, so neither can drift from the other.
-        if sb && sx >= ti.x + ti.w - SBW {
+        if sb && sx >= ti.x + ti.w - SBW() {
             let (ty, th) = thumb(ti.h, m.tree.len(), tvis, m.tree_scroll).unwrap_or((0, 0));
             let rel = sy.saturating_sub(ti.y);
             if rel < ty {
@@ -2624,7 +2624,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         let sb = m.list.len() > lvis;
         m.focus = Pane::List;
         let body_y = li.y + row_h;
-        if sb && sx >= li.x + li.w - SBW && sy >= body_y {
+        if sb && sx >= li.x + li.w - SBW() && sy >= body_y {
             let track_h = li.y + li.h - body_y;
             let (ty, th) = thumb(track_h, m.list.len(), lvis, m.list_scroll).unwrap_or((0, 0));
             let rel = sy - body_y;
@@ -2873,7 +2873,7 @@ pub fn service() {
     #[cfg(feature = "facet")]
     crate::video::facet::service();
     // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
-    crate::video::fileview::service(); crate::video::settings::service(); crate::video::text::service();
+    crate::video::fileview::service(); crate::video::settings::service(); crate::video::text::service(); crate::video::metrics::ignite(); // UIMETRICS (B372): the furniture's runtime asserts on the latched metrics + `[ui] metrics`, once, on the first desktop service pass
     // TEXTEDIT — the editor's latch drains on the same pass.
     crate::video::textedit::service();
     // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.

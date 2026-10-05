@@ -234,8 +234,8 @@ fn open_inner(path: &str, text: Vec<u8>, spans: Vec<richtext::Span>, n_bytes: us
     }
     let pi = crate::video::panel_info_nonblocking().ok_or_else(|| String::from("panel busy"))?;
     let (pw, ph) = (pi.width, pi.height);
-    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
-    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
+    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER()).max(1));
+    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
     let face = super::text::Face::Body;
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let cols = w.saturating_sub(2 * PAD + 6) / cw;
@@ -275,7 +275,7 @@ fn open_inner(path: &str, text: Vec<u8>, spans: Vec<richtext::Span>, n_bytes: us
     let base = st.surf.as_ptr() as usize;
     let title = title_of(path);
     // The Vec<u32> lives in STATE for the window's life; `close` drops the row before the buffer.
-    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, title.as_bytes(), ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, title.as_bytes(), ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         return Err(String::from("window create failed"));
     }

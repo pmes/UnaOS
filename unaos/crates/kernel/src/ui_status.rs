@@ -593,7 +593,7 @@ pub const PERMILLE_FULL: u32 = 1000;
 /// not of the type size — so this is a panel fraction, and it yields 92 px at 1200 rows (Peter's
 /// "~20mm" on the bench panel) and 36 px on the 640x480 QEMU surface.
 pub fn band_h(ph: usize) -> usize {
-    let m = crate::ui::Metrics::for_height(ph);
+    let m = crate::ui::Metrics::panel();
     // The `cell_h * 8` floor is what makes the 640x480 gate surface work: a thirteenth of 480 is 36 px,
     // which splits four ways into 9 px rows that cannot hold a glyph. Eight cells (64 px there) gives
     // every core a row taller than the type beside it. On the bench panel the fraction is the larger
@@ -607,7 +607,7 @@ pub fn band_h(ph: usize) -> usize {
 /// computed in exactly one place — a second copy of this arithmetic is how a reserved region and the
 /// thing reserving it drift apart.
 pub fn chrome_h(ph: usize) -> usize {
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if crate::video::desktop_scene_owns_backdrop() { return crate::video::dock_reserve_h(); } let m = crate::ui::Metrics::for_height(ph); // REALDESK — a retired band reserves nothing of its own; what stays is the DOCK's floor, because `wm::occ_clip` is `OccClip::none` on this arch (PARITY §6.2) so an unreserved dock would be blitted over. See `video::dock_reserve_h`. Line-neutral fold, PARITY §5.3.
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if crate::video::desktop_scene_owns_backdrop() { return crate::video::dock_reserve_h(); } let m = crate::ui::Metrics::panel(); // REALDESK — a retired band reserves nothing of its own; what stays is the DOCK's floor, because `wm::occ_clip` is `OccClip::none` on this arch (PARITY §6.2) so an unreserved dock would be blitted over. See `video::dock_reserve_h`. Line-neutral fold, PARITY §5.3.
     band_h(ph).saturating_add(m.line_h)
 }
 
@@ -688,7 +688,7 @@ fn free_span(pw: usize, ph: usize, y0: usize, y1: usize) -> (usize, usize) {
 /// The pulse instrument's box on a `pw` x `ph` panel: `(x, y, w, h)`, seated directly above the status
 /// band and horizontally clear of WC-F. `w == 0` means the panel cannot seat the instrument at all.
 pub fn panel_geometry(pw: usize, ph: usize) -> (usize, usize, usize, usize) {
-    let m = crate::ui::Metrics::for_height(ph);
+    let m = crate::ui::Metrics::panel();
     let bh = band_h(ph);
     let y = ph.saturating_sub(m.line_h).saturating_sub(bh);
     let (x0, x1) = free_span(pw, ph, y, y + bh);

@@ -7895,10 +7895,10 @@ pub fn clickroute_selftest() {
     // with `move_to` against the tiler; the span is read back from the row the compositor actually
     // made, so the spacing tracks the panel's own scale rule rather than a number kept in sync here.
     let ox = pw / 3;
-    let oy = ph / 4 + wm::TITLE_H + wm::BORDER;
+    let oy = ph / 4 + wm::TITLE_H() + wm::BORDER();
     wm::move_to(wa, ox, oy);
     let scale = wm::info(wa).map(|i| i.scale).unwrap_or(1);
-    let span = 8 * scale + 2 * wm::BORDER + wm::TITLE_H + 8;
+    let span = 8 * scale + 2 * wm::BORDER() + wm::TITLE_H() + 8;
     let (bxo, kxo) = (ox + span, ox + 2 * span);
     wm::move_to(wb, bxo, oy);
     wm::move_to(wk, kxo, oy);
@@ -8221,11 +8221,11 @@ pub fn wmdirect_selftest() {
         return;
     }
     let saved_focus = user_input_active();
-    let (ox, oy) = (pw / 3, ph / 3 + wm::TITLE_H + wm::BORDER);
+    let (ox, oy) = (pw / 3, ph / 3 + wm::TITLE_H() + wm::BORDER());
     wm::move_to(w, ox, oy);
     // Disjoint from the probe row by a whole panel third, so no raise can make `wo` own a probe point
     // and turn the "different window" legs into "already focused" ones.
-    wm::move_to(wo, pw / 3, ph / 3 * 2 + wm::TITLE_H + wm::BORDER);
+    wm::move_to(wo, pw / 3, ph / 3 * 2 + wm::TITLE_H() + wm::BORDER());
     // Read the placement back rather than assuming it: `move_to` CLAMPS to the live panel.
     let Some(inf) = wm::info(w) else {
         serial_println!("[wm-act] direct -> SKIP (row vanished)");
@@ -8239,7 +8239,7 @@ pub fn wmdirect_selftest() {
     // whole `GAP` short of the first disc, so it is still unambiguously drag. A content point:
     // inside the surface.
     let tpx = (inf.x + 1) as i32;
-    let tpy = (inf.y - wm::TITLE_H / 2 - wm::BORDER) as i32;
+    let tpy = (inf.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32;
     let cpx = (inf.x + 1) as i32;
     let cpy = (inf.y + 1) as i32;
 
@@ -8316,7 +8316,7 @@ pub fn wmdirect_selftest() {
     // with the level left DOWN) the tail merely steers and `drag_active()` still names the window.
     let level_ok = match wm::info(w) {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
             // The press publishes the level the same way a real pad does; the grab itself is the
@@ -8345,7 +8345,7 @@ pub fn wmdirect_selftest() {
     // leg 7's grab, then one `Event::Key(0x09)` through `wc_focus_key` — the real chain's first arm.
     let tabcancel_ok = match wm::info(w) {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
             crate::pal::cursor::set_button_level(true);
@@ -8400,7 +8400,7 @@ pub fn wmdirect_selftest() {
         wm::info(w)
     } {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
             // No edge in flight to begin with: the counter is global and a previous leg's routed
@@ -8589,7 +8589,7 @@ pub fn wmdirect_selftest() {
         wm::info(w)
     } {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
             for _ in 0..8 {
@@ -8822,7 +8822,7 @@ pub fn wmdirect_selftest() {
     // needs a row, and its own `wm::close` is the teardown it is asserting about.
     let dragdead_ok = match wm::info(w) {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
             let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
             wm::close(w);
             grabbed && wm::drag_active() == wm::WIN_NONE
@@ -29726,15 +29726,15 @@ pub fn winresize_selftest() {
     let saved_focus = user_input_active();
     user_input_set_active(OWNER);
     wm::focus_changed(OWNER);
-    wm::move_to(w, pw / 4, ph / 4 + wm::TITLE_H + wm::BORDER);
+    wm::move_to(w, pw / 4, ph / 4 + wm::TITLE_H() + wm::BORDER());
     let Some(i0) = wm::info(w) else {
         serial_println!(":: WINRESIZE: -> SKIP (row vanished) ::");
         return;
     };
     let sc = i0.scale.max(1) as i64;
     let (cw, ch) = ((i0.w * i0.scale) as i32, (i0.h * i0.scale) as i32);
-    let (ox, oy) = (i0.x as i32 - wm::BORDER as i32, i0.y as i32 - (wm::TITLE_H + wm::BORDER) as i32);
-    let (ow, oh) = (cw + 2 * wm::BORDER as i32, ch + (wm::TITLE_H + 2 * wm::BORDER) as i32);
+    let (ox, oy) = (i0.x as i32 - wm::BORDER() as i32, i0.y as i32 - (wm::TITLE_H() + wm::BORDER()) as i32);
+    let (ow, oh) = (cw + 2 * wm::BORDER() as i32, ch + (wm::TITLE_H() + 2 * wm::BORDER()) as i32);
     // Leg 1 — the eight zones, each probe distinct and nonzero.
     let probes = [
         (ox + 1, i0.y as i32 + ch / 2, wm::RS_L),
@@ -29753,7 +29753,7 @@ pub fn winresize_selftest() {
         }
     }
     // The title strip's drag handle must NOT be a zone (the `wm-act` fixture's grab point).
-    let strip_clear = wm::resize_zone_at(w, i0.x as i32 + 1, i0.y as i32 - (wm::TITLE_H / 2 + wm::BORDER) as i32) == 0;
+    let strip_clear = wm::resize_zone_at(w, i0.x as i32 + 1, i0.y as i32 - (wm::TITLE_H() / 2 + wm::BORDER()) as i32) == 0;
     let (brx, bry) = (ox + ow - 2, oy + oh - 2);
     // One routed drag: press at the zone, move, release through the router. Returns (w, h) after.
     let drag = |fx: i32, fy: i32, tx: i32, ty: i32| -> Option<(usize, usize)> {
@@ -29777,20 +29777,20 @@ pub fn winresize_selftest() {
     // Leg 3 — past the panel edge: clamps inside the panel and inside the 400x300 slot.
     let c0 = wm::RS_CLAMPED.load(Relaxed);
     let i1 = wm::info(w);
-    let (bx1, by1) = i1.map(|i| ((i.x + i.w * i.scale + wm::BORDER) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER) as i32 - 2)).unwrap_or((brx, bry));
+    let (bx1, by1) = i1.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 - 2)).unwrap_or((brx, bry));
     let r3 = drag(bx1, by1, pw as i32 + 400, ph as i32 + 400);
     let clamp_ok = match (r3, wm::info(w)) {
-        (Some((w3, h3)), Some(i)) => w3 <= WRZ_CW && h3 <= WRZ_CH && i.x + w3 * i.scale + wm::BORDER <= pw && i.y + h3 * i.scale + wm::BORDER <= ph && wm::RS_CLAMPED.load(Relaxed) > c0,
+        (Some((w3, h3)), Some(i)) => w3 <= WRZ_CW && h3 <= WRZ_CH && i.x + w3 * i.scale + wm::BORDER() <= pw && i.y + h3 * i.scale + wm::BORDER() <= ph && wm::RS_CLAMPED.load(Relaxed) > c0,
         _ => false,
     };
     // Leg 4 — toward the origin: stops at the minimum.
     let i2 = wm::info(w);
-    let (bx2, by2) = i2.map(|i| ((i.x + i.w * i.scale + wm::BORDER) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER) as i32 - 2)).unwrap_or((brx, bry));
+    let (bx2, by2) = i2.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 - 2)).unwrap_or((brx, bry));
     let min_ok = drag(bx2, by2, 0, 0) == Some((wm::RS_MIN_W, wm::RS_MIN_H));
     // Leg 5 — Shift keeps the aspect (from the minimum, grow width only).
     crate::video::keymap::note_mods(crate::drivers::xhci::HID_MOD_SHIFT);
     let a0 = wm::info(w);
-    let (bx3, by3) = a0.map(|i| ((i.x + i.w * i.scale + wm::BORDER) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER) as i32 - 2)).unwrap_or((brx, bry));
+    let (bx3, by3) = a0.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 - 2)).unwrap_or((brx, bry));
     let ar = drag(bx3, by3, bx3 + 60 * sc as i32, by3);
     crate::video::keymap::note_mods(0);
     let aspect_ok = match (a0, ar) {

@@ -403,7 +403,7 @@ fn bevel(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, raised: bool) {
     } else {
         (theme::BEVEL_SHADOW, theme::BEVEL_LIGHT)
     };
-    for i in 0..theme::BEVEL {
+    for i in 0..theme::BEVEL() {
         fill(px, x + i, y + i, w - 2 * i, 1, lt);
         fill(px, x + i, y + i, 1, h - 2 * i, lt);
         fill(px, x + i, y + h - 1 - i, w - 2 * i, 1, rb);
@@ -444,7 +444,7 @@ fn fmt_size(buf: &mut [u8; 16], bytes: u64) -> &[u8] {
 }
 
 fn button(px: &mut [u32], x: usize, y: usize, w: usize, label: &[u8], primary: bool) {
-    let h = theme::BUTTON_HEIGHT + 6;
+    let h = theme::BUTTON_HEIGHT() + 6;
     fill(px, x, y, w, h, if primary { theme::BUTTON_FACE } else { theme::CHROME_FACE });
     bevel(px, x, y, w, h, true);
     let tx = x + (w.saturating_sub(label.len() * CELL_W)) / 2;
@@ -473,10 +473,10 @@ fn repaint() {
     super::paper::fill_rect(
         px,
         W,
-        4 + theme::BEVEL,
-        4 + theme::BEVEL,
-        W - 8 - 2 * theme::BEVEL,
-        H - 8 - 2 * theme::BEVEL,
+        4 + theme::BEVEL(),
+        4 + theme::BEVEL(),
+        W - 8 - 2 * theme::BEVEL(),
+        H - 8 - 2 * theme::BEVEL(),
     );
 
     let lx = 24; #[cfg(feature = "ahciroot")] if install3::paint(px) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } if st == State::Choose && plan_view_paint(px, lx) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } // SELFINSTALL2 M3: the SSD plan view (key `i`), see the file tail
@@ -771,8 +771,8 @@ pub fn open() {
         H as u32,
         (W * 4) as u32,
         b"Install UnaOS",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[wc-x] instgui DECLINE reason=create-failed");

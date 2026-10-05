@@ -82,6 +82,7 @@ impl Face {
     pub fn cell_w(self) -> usize {
         match self {
             Face::Grid => grid_cell().0,
+            Face::Chrome => chrome_cell().0, // UIMETRICS (B372): the chrome cell x the dpi scale
             _ => self.bitmap().cell_w(),
         }
     }
@@ -90,6 +91,7 @@ impl Face {
     pub fn cell_h(self) -> usize {
         match self {
             Face::Grid => grid_cell().1,
+            Face::Chrome => chrome_cell().1,
             _ => self.bitmap().cell_h(),
         }
     }
@@ -145,6 +147,36 @@ pub fn draw_text(px: &mut [u32], stride: usize, clip_w: usize, clip_h: usize, x:
     if let Some(p) = tt::draw_text(px, stride, clip_w, clip_h, x, y, s, ink, bold, face.index()) {
         return p;
     }
+    if let Some((k, ox, oy)) = blowup(face) {
+        // UIMETRICS: no face yet and a scaled cell — the atlas glyph at the scale's integer part, centred in the cell.
+        let (cw, ch) = (face.cell_w(), face.cell_h());
+        if y + ch > clip_h {
+            return x;
+        }
+        let mut cx = x;
+        for &b in s {
+            if cx + cw > clip_w {
+                break;
+            }
+            for (ry, row) in font::glyph(b, bold, face.bitmap()).iter().enumerate() {
+                for (rx, &a) in row.iter().enumerate() {
+                    if a == 0 {
+                        continue;
+                    }
+                    for dy in 0..k {
+                        let i = (y + oy + ry * k + dy) * stride + cx + ox + rx * k;
+                        for dx in 0..k {
+                            if let Some(p) = px.get_mut(i + dx) {
+                                *p = font::blend(*p, ink, a);
+                            }
+                        }
+                    }
+                }
+            }
+            cx += cw;
+        }
+        return cx;
+    }
     font::draw_text(px, stride, clip_w, clip_h, x, y, s, ink, bold, face.bitmap())
 }
 
@@ -155,6 +187,30 @@ pub fn draw_text(px: &mut [u32], stride: usize, clip_w: usize, clip_h: usize, x:
 pub fn draw_row(out: &mut [u32], w: usize, s: &[u8], x0: usize, sy: usize, ink: u32, bold: bool, face: Face) {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     if tt::draw_row(out, w, s, x0, sy, ink, bold, face.index()) {
+        return;
+    }
+    if let Some((k, ox, oy)) = blowup(face) {
+        // UIMETRICS: the scaled cell's row `sy` is atlas row `(sy - oy) / k`, each atlas pixel k wide.
+        if sy < oy || (sy - oy) / k >= face.bitmap().cell_h() {
+            return;
+        }
+        let (ry, cw) = ((sy - oy) / k, face.cell_w());
+        for (n, &b) in s.iter().enumerate() {
+            let cx = x0 + n * cw + ox;
+            if let Some(row) = font::glyph(b, bold, face.bitmap()).get(ry) {
+                for (rx, &a) in row.iter().enumerate() {
+                    if a == 0 {
+                        continue;
+                    }
+                    for dx in 0..k {
+                        let i = cx + rx * k + dx;
+                        if i < w && i < out.len() {
+                            out[i] = font::blend(out[i], ink, a);
+                        }
+                    }
+                }
+            }
+        }
         return;
     }
     font::draw_row(out, w, s, x0, sy, ink, bold, face.bitmap())
@@ -169,12 +225,10 @@ pub fn draw_glyph_fb(fb: &FrameBuffer, ch: u8, cx: usize, cy: usize, ink: u32, b
     if tt::draw_cell(ch, cx, cy, ink, bold, face.index(), &mut |x, y, a| fb.put_pixel(x, y, font::blend(bg, ink, a))) {
         return;
     }
-    if face == Face::Grid && grid_cell() != (font::CELL_W, font::CELL_H) {
-        // KERNELFONT2: no face yet — the atlas glyph at the scale's integer part, centred in the scaled cell.
-        let (gw, gh) = grid_cell();
-        let k = (crate::video::dpi::scale_x2() as usize / 2).max(1);
-        let (ox, oy) = (cx + gw.saturating_sub(font::CELL_W * k) / 2, cy + gh.saturating_sub(font::CELL_H * k) / 2);
-        for (ry, row) in font::glyph(ch, bold, font::Face::Body).iter().enumerate() {
+    if let Some((k, ox, oy)) = blowup(face) {
+        // KERNELFONT2 / UIMETRICS: no face yet — the atlas glyph at the scale's integer part, centred in the scaled cell.
+        let (ox, oy) = (cx + ox, cy + oy);
+        for (ry, row) in font::glyph(ch, bold, face.bitmap()).iter().enumerate() {
             for (rx, &a) in row.iter().enumerate() {
                 if a != 0 {
                     let c = font::blend(bg, ink, a);
@@ -202,6 +256,7 @@ pub fn draw_with(s: &[u8], bold: bool, face: Face, x: usize, y: isize, max_w: us
         return p;
     }
     let (bf, cw) = (face.bitmap(), face.cell_w());
+    let (k, ox, oy) = blowup(face).unwrap_or((1, 0, 0)); // UIMETRICS: the atlas glyph blown up inside a scaled cell
     let mut cx = x;
     for &b in s {
         if cx + cw > x + max_w {
@@ -210,13 +265,37 @@ pub fn draw_with(s: &[u8], bold: bool, face: Face, x: usize, y: isize, max_w: us
         for (ry, row) in font::glyph(b, bold, bf).iter().enumerate() {
             for (rx, &a) in row.iter().enumerate() {
                 if a != 0 {
-                    put((cx + rx) as isize, y + ry as isize, a);
+                    for dy in 0..k {
+                        for dx in 0..k {
+                            put((cx + ox + rx * k + dx) as isize, y + (oy + ry * k + dy) as isize, a);
+                        }
+                    }
                 }
             }
         }
         cx += cw;
     }
     cx
+}
+
+/// UIMETRICS (B372): the chrome cell (captions, the bar, the crystal menu, dock labels) — the chrome atlas cell x
+/// `video::dpi`'s scale, each side rounded up (9x20 -> 23x50 at 2.5). `wm::TITLE_CELL_W/H` are this.
+pub fn chrome_cell() -> (usize, usize) {
+    let s2 = crate::video::dpi::s2();
+    (crate::video::dpi::px_at(font::CHROME_CELL_W, s2), crate::video::dpi::px_at(font::CHROME_CELL_H, s2))
+}
+
+/// UIMETRICS: how the BITMAP fallback draws `face` inside its scaled cell — `(k, ox, oy)`: the atlas glyph
+/// magnified by the scale's integer part `k`, offset to the cell's centre. `None` when the face's cell IS the
+/// atlas cell (scale 1.0, or a face that does not scale): draw the atlas as it is.
+fn blowup(face: Face) -> Option<(usize, usize, usize)> {
+    let bf = face.bitmap();
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    if (cw, ch) == (bf.cell_w(), bf.cell_h()) {
+        return None;
+    }
+    let k = (crate::video::dpi::s2() as usize / 2).max(1);
+    Some((k, cw.saturating_sub(bf.cell_w() * k) / 2, ch.saturating_sub(bf.cell_h() * k) / 2))
 }
 
 /// The width `s` takes in `face`, in whole px (the shaped advance when a face is loaded, else
@@ -358,7 +437,7 @@ mod tt {
     /// The layout cell of face index `face` (KERNELFONT2: index 3 is the console's dpi-scaled grid).
     fn cell(face: usize) -> (usize, usize) {
         match face {
-            1 => (font::CHROME_CELL_W, font::CHROME_CELL_H),
+            1 => super::chrome_cell(), // UIMETRICS (B372)
             3 => super::grid_cell(),
             _ => (font::CELL_W, font::CELL_H),
         }
@@ -461,7 +540,8 @@ mod tt {
         let fam = if eng.has(t.family) { t.family } else { Role::Sans };
         let mono = if eng.has(Role::Mono) { Role::Mono } else { Role::Sans };
         let body = eng.fit_size(mono, Some(font::CELL_W as f32), font::CELL_H as f32).unwrap_or(11.0);
-        let chrome = eng.fit_size_mean(fam, true, font::CHROME_CELL_W as f32, font::CHROME_CELL_H as f32).unwrap_or(14.0);
+        let (ccw, cch) = super::chrome_cell(); // UIMETRICS (B372): the chrome face fits the dpi-scaled chrome cell
+        let chrome = eng.fit_size_mean(fam, true, ccw as f32, cch as f32).unwrap_or(14.0);
         let ui_fit = eng.fit_size(fam, None, font::CELL_H as f32).unwrap_or(12.0);
         let ui = device_px(t.css_px as f32, t.ppi).min(ui_fit).max(6.0);
         // KERNELFONT2: the console grid — mono at font_size x ppi / 96, capped by the dpi-scaled cell.
@@ -469,7 +549,7 @@ mod tt {
         let grid_fit = eng.fit_size(mono, Some(gw as f32), gh as f32).unwrap_or(body);
         let grid = device_px(t.css_px as f32, t.ppi).min(grid_fit).max(6.0);
         let mk = |role: Role, size: f32, cell: usize| (Style { role, bold: false, size }, eng.baseline_in_cell(role, size, cell as f32));
-        t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, font::CHROME_CELL_H), mk(fam, ui, font::CELL_H), mk(mono, grid, gh)];
+        t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, cch), mk(fam, ui, font::CELL_H), mk(mono, grid, gh)];
         let nm = |r: Role| match r {
             Role::Mono => "dejavu-mono",
             Role::Serif => "dejavu-serif",

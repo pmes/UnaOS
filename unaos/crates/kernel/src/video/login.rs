@@ -688,7 +688,7 @@ fn open_as(state: State) {
     // boot, against a control row that differs only here.
     let nt = notice_current(); // NOTICE: the alert's window is titled by the notice
     let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::CreateUser { b"Create account" } else if state == State::Alert { nt.title() } else { b"Log in" };
-    let id = wm::create_at(OWNER, surf, W * H * 4, W as u32, H as u32, (W * 4) as u32, title, ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    let id = wm::create_at(OWNER, surf, W * H * 4, W as u32, H as u32, (W * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
         serial_println!("[login] screen open window=no (create refused — headless form)");
@@ -1312,13 +1312,13 @@ fn close_leg() -> (&'static str, bool) {
         FORM.lock().state = State::Closed;
         return ("no-window", false);
     };
-    let bx = info.x.saturating_sub(wm::BORDER);
-    let by = info.y.saturating_sub(wm::TITLE_H + wm::BORDER);
-    let bw = info.w.saturating_mul(info.scale).saturating_add(2 * wm::BORDER);
+    let bx = info.x.saturating_sub(wm::BORDER());
+    let by = info.y.saturating_sub(wm::TITLE_H() + wm::BORDER());
+    let bw = info.w.saturating_mul(info.scale).saturating_add(2 * wm::BORDER());
     let bh = info
         .h
         .saturating_mul(info.scale)
-        .saturating_add(wm::TITLE_H + 2 * wm::BORDER);
+        .saturating_add(wm::TITLE_H() + 2 * wm::BORDER());
     // 1 — nothing is drawn to press.
     let no_cluster = wm::close_box_rect(win).is_none()
         && wm::control_disc_rect(win, wm::Ctrl::Minimise).is_none()

@@ -154,14 +154,14 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // ---------------------------------------------------------------------------
 
 /// The bar's height — [`theme::TITLE_HEIGHT`]. The same strip a window head is, for the same job.
-const BAR_H: usize = theme::TITLE_HEIGHT;
+#[allow(non_snake_case)] #[inline] fn BAR_H() -> usize { theme::TITLE_HEIGHT() }
 
 /// The glyph advance and cell height text is drawn at — [`wm::TITLE_CELL_W`]/[`wm::TITLE_CELL_H`],
 /// the same face metrics the window caption and the dock tile resolve to. One definition, so a
 /// face change moves all three together. FONT (GR27): the cell stopped being square when the
 /// 1-bit bitmap gave way to the shared anti-aliased face, so the two axes are named separately.
-const CELL_W: usize = wm::TITLE_CELL_W;
-const CELL_H: usize = wm::TITLE_CELL_H;
+#[allow(non_snake_case)] #[inline] fn CELL_W() -> usize { wm::TITLE_CELL_W() }
+#[allow(non_snake_case)] #[inline] fn CELL_H() -> usize { wm::TITLE_CELL_H() }
 
 /// FONT-METRIC — the atlas those metrics come from. Named once so the cell constants above and the
 /// glyph calls below can never disagree about which face the bar is drawing.
@@ -183,9 +183,9 @@ const BOLD: bool = true;
 /// which type the drop-down was set in instead of leaving it to be inferred from pixels.
 pub const BAR_FACE: super::text::Face = FACE;
 /// SO2 — the bar's glyph advance, px. See [`BAR_FACE`].
-pub const BAR_CELL_W: usize = CELL_W;
+#[allow(non_snake_case)] #[inline] pub fn BAR_CELL_W() -> usize { CELL_W() }
 /// SO2 — the bar's glyph cell height, px. See [`BAR_FACE`].
-pub const BAR_CELL_H: usize = CELL_H;
+#[allow(non_snake_case)] #[inline] pub fn BAR_CELL_H() -> usize { CELL_H() }
 /// SO2 — the bar's text weight. See [`BAR_FACE`].
 pub const BAR_BOLD: bool = BOLD;
 /// SO2 — the bar's type, named for the wire. See [`BAR_FACE`].
@@ -223,17 +223,17 @@ const TITLE_GLYPHS: usize = wm::MAX_TITLE;
 /// The battery cell's body width, px — [`theme::CONTROL_BOX`], so the item reads as the same
 /// size-family as the crystal and the window controls. No new metric is invented; the kit's one
 /// control dimension is the source for all three.
-const BATT_BODY_W: usize = theme::CONTROL_BOX;
+#[allow(non_snake_case)] #[inline] fn BATT_BODY_W() -> usize { theme::CONTROL_BOX() }
 /// The cell's body height, px — half the control box. A battery reads WIDER than tall, which is
 /// [`CRYSTAL_W`]'s proportion rule applied to a lying-down shape.
-const BATT_BODY_H: usize = theme::CONTROL_BOX / 2;
+#[allow(non_snake_case)] #[inline] fn BATT_BODY_H() -> usize { theme::CONTROL_BOX() / 2 }
 /// The positive terminal's nub, px — the columns past the body's right edge that make the outline
 /// read as a battery rather than as a progress bar.
-const BATT_CAP_W: usize = 2;
+#[allow(non_snake_case)] #[inline] fn BATT_CAP_W() -> usize { crate::ui::px(2) }
 /// The nub's height, px — a third of the body, centred on it.
-const BATT_CAP_H: usize = BATT_BODY_H / 3;
+#[allow(non_snake_case)] #[inline] fn BATT_CAP_H() -> usize { BATT_BODY_H() / 3 }
 /// The whole drawn glyph's width, px: body plus nub.
-const BATT_GLYPH_W: usize = BATT_BODY_W + BATT_CAP_W;
+#[allow(non_snake_case)] #[inline] fn BATT_GLYPH_W() -> usize { BATT_BODY_W() + BATT_CAP_W() }
 /// The percent text's slot, in glyphs — `100%` is the longest string it can hold, and the text is
 /// RIGHT-ALIGNED inside it (`  5%`, ` 82%`, `100%`). The fixed slot is why the glyph's x never moves
 /// when the charge crosses 10 % or 100 %: a status item that shifted its own parts every time a
@@ -241,18 +241,18 @@ const BATT_GLYPH_W: usize = BATT_BODY_W + BATT_CAP_W;
 const BATT_PCT_GLYPHS: usize = 4;
 /// The gap between the glyph and its percent, px — half a [`strip::PAD`]. They are ONE item, so the
 /// space inside it must read as smaller than the PAD separating the item from the clock.
-const BATT_GAP: usize = strip::PAD / 2;
+#[allow(non_snake_case)] #[inline] fn BATT_GAP() -> usize { strip::PAD() / 2 }
 /// The whole item's width, px. The number the layout is built from and the number the ledger records.
-const BATT_ITEM_W: usize = BATT_GLYPH_W + BATT_GAP + BATT_PCT_GLYPHS * CELL_W;
+#[allow(non_snake_case)] #[inline] fn BATT_ITEM_W() -> usize { BATT_GLYPH_W() + BATT_GAP() + BATT_PCT_GLYPHS * CELL_W() }
 
 /// The charging mark's box, px.
-const BOLT_W: usize = 5;
+#[allow(non_snake_case)] #[inline] fn BOLT_W() -> usize { crate::ui::px(5) }
 /// See [`BOLT_W`].
-const BOLT_H: usize = 8;
+#[allow(non_snake_case)] #[inline] fn BOLT_H() -> usize { crate::ui::px(8) }
 /// The charging mark — a lightning bolt, 5x8, MSB leftmost. Drawn as the INVERSE of whatever is
 /// under it (see [`draw_battery_glyph`]), which is the one rule that keeps it legible at 3 % and at
 /// 97 % without inventing a third ink for it.
-const BOLT: [u8; BOLT_H] = [
+const BOLT: [u8; 8] = [
     0b00011, //
     0b00110, //
     0b01100, //
@@ -281,15 +281,15 @@ const BOLT: [u8; BOLT_H] = [
 /// so the brand mark and the window's traffic-light controls read as one size family. `-2` gives the
 /// gem a touch more clearance in the bar than the disc has in a title bar (the disc's is the "tight"
 /// 5 px `theme.rs` flags; the crystal's is 6).
-const CRYSTAL_H: usize = theme::CONTROL_BOX - 2;
+#[allow(non_snake_case)] #[inline] fn CRYSTAL_H() -> usize { theme::CONTROL_BOX() - crate::ui::px(2) }
 
 /// The crystal's width, px — two-thirds of the control-disc diameter. A gem reads TALLER than wide, so
 /// the mark is narrower than the round controls at the same height family; `2/3` of 24 is 16.
-const CRYSTAL_W: usize = theme::CONTROL_BOX * 2 / 3;
+#[allow(non_snake_case)] #[inline] fn CRYSTAL_W() -> usize { theme::CONTROL_BOX() * 2 / 3 }
 
 /// The crown's height, px — the upper region above the girdle, drawn as the two bright table facets;
 /// the pavilion (the rest) tapers to the point. Two-fifths, the classic brilliant-cut proportion.
-const CRYSTAL_CROWN_H: usize = CRYSTAL_H * 2 / 5;
+#[allow(non_snake_case)] #[inline] fn CRYSTAL_CROWN_H() -> usize { CRYSTAL_H() * 2 / 5 }
 
 /// **The crystal's LEFT SLOT**, and the whole of the geometry rule this constant carries.
 ///
@@ -315,12 +315,12 @@ const CRYSTAL_CROWN_H: usize = CRYSTAL_H * 2 / 5;
 /// `menu_rect` rather than derived from it, which is what makes the two positions independently
 /// settable at all. This slot is therefore the glyph's outside PAD, the glyph, and one PAD of
 /// clearance on its INNER (right) side separating the mark from the caption beside it.
-const CRYSTAL_SLOT: usize = strip::PAD + CRYSTAL_W + strip::PAD;
+#[allow(non_snake_case)] #[inline] fn CRYSTAL_SLOT() -> usize { strip::PAD() + CRYSTAL_W() + strip::PAD() }
 
 /// The title's left inset: past the crystal's whole slot, which is [`CRYSTAL_SLOT`] — the glyph's
 /// outside PAD, the glyph, and its one PAD of inner clearance. macOS puts the apple leftmost and the
 /// app menus to its right; the caption takes that same slot here.
-const TITLE_X0: usize = CRYSTAL_SLOT;
+#[allow(non_snake_case)] #[inline] fn TITLE_X0() -> usize { CRYSTAL_SLOT() }
 
 /// WINMENU (R21) — **where the window's menus begin WHEN THE BAR NAMES NO APP.**
 ///
@@ -345,7 +345,7 @@ const TITLE_X0: usize = CRYSTAL_SLOT;
 /// what is left of the old one: the anchor for a bar with no caption to follow. It is [`TITLE_X0`] —
 /// where the name WOULD have been — so a window with menus and no name puts them where a named
 /// window's name starts, rather than 153 px into empty chrome.
-const MENUS_X0: usize = TITLE_X0;
+#[allow(non_snake_case)] #[inline] fn MENUS_X0() -> usize { TITLE_X0() }
 
 /// The panel height below which the bar declines.
 ///
@@ -354,7 +354,7 @@ const MENUS_X0: usize = TITLE_X0;
 /// `BAR_H` off the top before the dock ever gets to lay out. So a panel that can host both is at
 /// least their sum, and one that cannot host both hosts the DOCK — the dock is the console's only way
 /// back and the bar is a convenience, so the bar is the one that yields.
-const FLOOR_H: usize = BAR_H + super::dock::STRIP_H + 2 * strip::PAD;
+#[allow(non_snake_case)] #[inline] fn FLOOR_H() -> usize { BAR_H() + super::dock::STRIP_H() + 2 * strip::PAD() }
 
 /// The panel width below which the bar declines: the insets, the clock, the crystal's slot, and at
 /// least one glyph of title. Below it the bar would be a strip with nothing legible on it.
@@ -365,54 +365,54 @@ const FLOOR_H: usize = BAR_H + super::dock::STRIP_H + 2 * strip::PAD;
 /// separately here are the title-to-clock gap and the clock's own right inset. Still far below every
 /// suite panel, so no gate declines — [`FLOOR_W`] is asserted `<= 640` below, which is the claim that
 /// matters.
-const FLOOR_W: usize = 2 * strip::PAD + CRYSTAL_SLOT + (CLOCK_GLYPHS + 1) * CELL_W;
+#[allow(non_snake_case)] #[inline] fn FLOOR_W() -> usize { 2 * strip::PAD() + CRYSTAL_SLOT() + (CLOCK_GLYPHS + 1) * CELL_W() }
 
-const _: () = {
+#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
     // The caption must fit inside the bar it is centred in, or there is nothing to draw.
-    assert!(CELL_H <= BAR_H);
+    assert!(CELL_H() <= BAR_H());
     // The bevel is drawn under the bar's top edge and must not reach its keyline.
-    assert!(theme::BEVEL < BAR_H);
+    assert!(theme::BEVEL() < BAR_H());
     // A bar that declines on every panel this kernel drives would be an inert file pretending to be a
     // feature. QEMU's raspi4b 640x480 is the smallest panel in the suites; the floors must admit it.
-    assert!(FLOOR_W <= 640);
-    assert!(FLOOR_H <= 480);
+    assert!(FLOOR_W() <= 640);
+    assert!(FLOOR_H() <= 480);
     // The title must be representable in what `wm` actually stores.
     assert!(TITLE_GLYPHS <= wm::MAX_TITLE);
 
     // The crystal must fit inside the bar with a bevel of clearance each side — the disc's own floor.
-    assert!(CRYSTAL_H + 2 * theme::BEVEL <= BAR_H);
+    assert!(CRYSTAL_H() + 2 * theme::BEVEL() <= BAR_H());
     // A gem needs a non-degenerate silhouette: a crown above the girdle and a pavilion below it, both
     // with real height, and a width the facet split can halve.
-    assert!(CRYSTAL_CROWN_H > 0);
-    assert!(CRYSTAL_CROWN_H < CRYSTAL_H);
-    assert!(CRYSTAL_W >= 4);
+    assert!(CRYSTAL_CROWN_H() > 0);
+    assert!(CRYSTAL_CROWN_H() < CRYSTAL_H());
+    assert!(CRYSTAL_W() >= 4);
     // The crystal and the clock must not collide on the SMALLEST panel the bar draws on. The crystal
     // owns `[PAD, PAD + CRYSTAL_W)` — one PAD in from the left, render9's ruling — and the clock
     // `[FLOOR_W - PAD - CLOCK_GLYPHS*CELL_W, FLOOR_W - PAD)`; this is the gap between them staying
     // positive, so a future metric change that would overlap them fails the BUILD rather than painting
     // the gem over the time.
-    assert!(strip::PAD + CRYSTAL_W < FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
+    assert!(strip::PAD() + CRYSTAL_W() < FLOOR_W() - strip::PAD() - CLOCK_GLYPHS * CELL_W());
     // The title, shifted past the crystal's slot, must still leave room for at least one glyph before
     // the clock on the floor panel.
-    assert!(TITLE_X0 + CELL_W <= FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
+    assert!(TITLE_X0() + CELL_W() <= FLOOR_W() - strip::PAD() - CLOCK_GLYPHS * CELL_W());
     // FITTS-CORNER: the press cell (`crystal_corner_abs`, CRYSTAL_SLOT wide by the bar's height, at the
     // bar's LEFT end) must CONTAIN the painted glyph box, or a press on the visible mark could miss its
     // own menu. The horizontal half is the load-bearing one; vertical containment is the bevel assert.
     // The cell starts at 0 and the glyph at PAD, so the glyph's RIGHT edge is what must fit.
-    assert!(strip::PAD + CRYSTAL_W <= CRYSTAL_SLOT);
+    assert!(strip::PAD() + CRYSTAL_W() <= CRYSTAL_SLOT());
 
     // MENUSTAT — the status item's silhouette must be drawable inside the bar it sits in, and the
     // charging mark inside the cell it sits in. These are build-time because they are statements
     // about CONSTANTS: a metric change that would draw the cell through the bar's keyline, or the
     // bolt through the cell's outline, fails the build rather than painting it once on the glass.
-    assert!(BATT_BODY_H + 2 * theme::BEVEL <= BAR_H);
-    assert!(BATT_BODY_H >= 4); // an outline, a fill row and an outline
-    assert!(BATT_CAP_H > 0 && BATT_CAP_H < BATT_BODY_H);
+    assert!(BATT_BODY_H() + 2 * theme::BEVEL() <= BAR_H());
+    assert!(BATT_BODY_H() >= 4); // an outline, a fill row and an outline
+    assert!(BATT_CAP_H() > 0 && BATT_CAP_H() < BATT_BODY_H());
     // The bolt lives INSIDE the 1-px outline on all four sides, so it can never erase the cell's
     // own edge — the falsifier for the "inverse of whatever is under it" rule, which is only safe
     // while "under it" is fill or face and never outline.
-    assert!(BOLT_H + 2 <= BATT_BODY_H);
-    assert!(BOLT_W + 2 <= BATT_BODY_W);
+    assert!(BOLT_H() + 2 <= BATT_BODY_H());
+    assert!(BOLT_W() + 2 <= BATT_BODY_W());
     // `100%` must fit the slot the percent is right-aligned in, or a full pack would be truncated.
     assert!(BATT_PCT_GLYPHS >= 4);
     // ⛔ THE FLOORS ARE NOT WIDENED: the item is NOT part of `FLOOR_W`. This asserts the consequence
@@ -420,8 +420,8 @@ const _: () = {
     // WITHOUT the item, which is the state `batt_slot` declines into rather than shrinking anything.
     // If a future edit folds `BATT_ITEM_W` into `FLOOR_W`, this assert stops meaning what it says and
     // the reader is sent to `batt_slot` to find out which rule changed.
-    assert!(FLOOR_W == 2 * strip::PAD + CRYSTAL_SLOT + (CLOCK_GLYPHS + 1) * CELL_W);
-};
+    assert!(FLOOR_W() == 2 * strip::PAD() + CRYSTAL_SLOT() + (CLOCK_GLYPHS + 1) * CELL_W());
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -584,7 +584,7 @@ fn occ_precondition(
 ) -> (strip::Rect, strip::Rect, bool, u64) {
     // `strip::Rect` IS `(x, y, w, h)`.
     let bar = rect.unwrap_or((0, 0, 0, 0));
-    let win = (pw / 4, 0usize, pw / 2, (BAR_H * 4).min(ph));
+    let win = (pw / 4, 0usize, pw / 2, (BAR_H() * 4).min(ph));
     let crossed = bar.2 != 0
         && bar.3 != 0
         && win.2 != 0
@@ -802,10 +802,10 @@ pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
 /// The geometry alone, with the enable gate removed — so the floor can be tested for a panel the
 /// fixture is not running on, and so a caller asking *"would it fit"* is not answered *"it is off"*.
 pub fn geometry(pw: usize, ph: usize) -> Option<strip::Rect> {
-    if pw < FLOOR_W {
+    if pw < FLOOR_W() {
         return None;
     }
-    strip::frame_flush(strip::Edge::Top, BAR_H, FLOOR_H, pw, ph)
+    strip::frame_flush(strip::Edge::Top, BAR_H(), FLOOR_H(), pw, ph)
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,7 +1128,7 @@ pub fn compose() -> bool {
     };
     LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
     LEDGER.tick("menubar", format_args!("press=crystal crystal={}x{} clob={} toggles={} off_passes={}",
-        CRYSTAL_W, CRYSTAL_H, CLOBBERS.load(Ordering::Relaxed),
+        CRYSTAL_W(), CRYSTAL_H(), CLOBBERS.load(Ordering::Relaxed),
         TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
     // MENUSTAT — the status area's own line, beside the cost ledger's and on its cadence. A SIBLING
     // line rather than terms appended to the one above, for the reason PTRINSTALL records at
@@ -1590,7 +1590,7 @@ fn firstpaint_restore(prev: (u64, u64)) {
 /// — see [`CRYSTAL_SLOT`] for the three-state history.
 #[inline]
 fn crystal_offset(h: usize) -> (usize, usize) {
-    (strip::PAD, (h - CRYSTAL_H) / 2)
+    (strip::PAD(), (h - CRYSTAL_H()) / 2)
 }
 
 /// The crystal's rect on the PANEL, for the witness — `(x, y, w, h)`, absolute. A function of the bar
@@ -1599,7 +1599,7 @@ fn crystal_offset(h: usize) -> (usize, usize) {
 fn crystal_box(r: strip::Rect) -> (usize, usize, usize, usize) {
     let (rx, ry, _w, h) = r;
     let (ox, oy) = crystal_offset(h);
-    (rx + ox, ry + oy, CRYSTAL_W, CRYSTAL_H)
+    (rx + ox, ry + oy, CRYSTAL_W(), CRYSTAL_H())
 }
 
 /// **The crystal's absolute rect on a `pw` x `ph` panel, or `None`** when the bar is absent (disabled
@@ -1635,7 +1635,7 @@ pub fn crystal_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
 /// a press with no bar still falls through to the arms below.
 pub fn crystal_corner_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
     let (bx, by, bw, bh) = strip_rect(pw, ph)?;
-    Some((bx, by, CRYSTAL_SLOT.min(bw), bh))
+    Some((bx, by, CRYSTAL_SLOT().min(bw), bh))
 }
 
 /// WINMENU (R21) / MENUOWN — **where the focused window's menu titles begin when the bar names no
@@ -1645,7 +1645,7 @@ pub fn crystal_corner_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
 /// app title box, one box gap after the name, and never a fixed column.
 #[inline]
 pub fn menus_x0() -> usize {
-    MENUS_X0
+    MENUS_X0()
 }
 
 /// SO3 — **where the CAPTION's glyphs begin**, as an offset from the bar's own origin: [`TITLE_X0`],
@@ -1658,7 +1658,7 @@ pub fn menus_x0() -> usize {
 /// duplicated for the reason `crystal_box_abs` records for the brand mark.
 #[inline]
 pub fn caption_x0() -> usize {
-    TITLE_X0
+    TITLE_X0()
 }
 
 /// WINMENU (R21) — **the panel-absolute x the menu titles must stop before**: the clock's left edge,
@@ -1671,7 +1671,7 @@ pub fn caption_x0() -> usize {
 /// the clock at all answers its own left edge, which lays out no titles.
 pub fn menus_right_limit(bar: strip::Rect) -> usize {
     let (bx, _by, bw, _bh) = bar;
-    let need = 2 * strip::PAD + CLOCK_GLYPHS * CELL_W;
+    let need = 2 * strip::PAD() + CLOCK_GLYPHS * CELL_W();
     // MENUSTAT — the limit is the STATUS AREA's left edge, not the clock's. This function's own
     // rule is that "a title can never be laid out under the time"; the battery item is the same
     // claim about the same rows, and the moment a second item exists the clock stops being the
@@ -1684,7 +1684,7 @@ pub fn menus_right_limit(bar: strip::Rect) -> usize {
     // absent repaints the bar and re-lays the titles in the same pass.
     if super::status::bar_item().is_some() {
         if let Some(x0) = batt_slot(bw) {
-            return bx + x0.saturating_sub(strip::PAD);
+            return bx + x0.saturating_sub(strip::PAD());
         }
     }
     bx + bw.saturating_sub(need)
@@ -1700,8 +1700,8 @@ pub fn menus_right_limit(bar: strip::Rect) -> usize {
 /// two places at once.
 #[inline]
 fn clock_slot(w: usize) -> Option<usize> {
-    let cw = CLOCK_GLYPHS * CELL_W;
-    if w > cw + strip::PAD { Some(w - strip::PAD - cw) } else { None }
+    let cw = CLOCK_GLYPHS * CELL_W();
+    if w > cw + strip::PAD() { Some(w - strip::PAD() - cw) } else { None }
 }
 
 /// The clock's rect on the PANEL — `(x, y, w, h)`, absolute — or `None` when no clock is drawn.
@@ -1714,7 +1714,7 @@ fn clock_slot(w: usize) -> Option<usize> {
 fn clock_rect(r: strip::Rect) -> Option<(usize, usize, usize, usize)> {
     let (rx, ry, w, h) = r;
     let x0 = clock_slot(w)?;
-    Some((rx + x0, ry + (h - CELL_H) / 2, CLOCK_GLYPHS * CELL_W, CELL_H))
+    Some((rx + x0, ry + (h - CELL_H()) / 2, CLOCK_GLYPHS * CELL_W(), CELL_H()))
 }
 
 /// MENUSTAT — **the battery item's left inset inside a bar `w` px wide**, or `None` when the bar
@@ -1735,8 +1735,8 @@ fn clock_rect(r: strip::Rect) -> Option<(usize, usize, usize, usize)> {
 /// [`menus_right_limit`] pair it with [`super::status::bar_item`], so "no source" and "no room" stay
 /// two separate facts with two separate answers.
 fn batt_slot(w: usize) -> Option<usize> {
-    let x0 = clock_slot(w)?.checked_sub(strip::PAD + BATT_ITEM_W)?;
-    if x0 < TITLE_X0 + CELL_W {
+    let x0 = clock_slot(w)?.checked_sub(strip::PAD() + BATT_ITEM_W())?;
+    if x0 < TITLE_X0() + CELL_W() {
         return None;
     }
     Some(x0)
@@ -1744,8 +1744,8 @@ fn batt_slot(w: usize) -> Option<usize> {
 
 /// BRIGHTKEYS — x of the transient level item: left of the battery's (always reserved) item.
 fn bright_slot(w: usize) -> Option<usize> {
-    let x0 = clock_slot(w)?.checked_sub(strip::PAD + BATT_ITEM_W + strip::PAD + 9 * CELL_W)?;
-    if x0 < TITLE_X0 + CELL_W {
+    let x0 = clock_slot(w)?.checked_sub(strip::PAD() + BATT_ITEM_W() + strip::PAD() + 9 * CELL_W())?;
+    if x0 < TITLE_X0() + CELL_W() {
         return None;
     }
     Some(x0)
@@ -1775,13 +1775,13 @@ pub fn open_dropdown_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
 /// interpolation, no float — the same discipline the disc and knurl idioms use.
 #[inline]
 fn crystal_half(v: usize) -> usize {
-    let table = CRYSTAL_W / 4;
-    let girdle = CRYSTAL_W / 2;
-    if v < CRYSTAL_CROWN_H {
-        table + (girdle - table) * v / CRYSTAL_CROWN_H
+    let table = CRYSTAL_W() / 4;
+    let girdle = CRYSTAL_W() / 2;
+    if v < CRYSTAL_CROWN_H() {
+        table + (girdle - table) * v / CRYSTAL_CROWN_H()
     } else {
-        let pav = CRYSTAL_H - CRYSTAL_CROWN_H;
-        girdle * (CRYSTAL_H - v) / pav
+        let pav = CRYSTAL_H() - CRYSTAL_CROWN_H();
+        girdle * (CRYSTAL_H() - v) / pav
     }
 }
 
@@ -1795,16 +1795,16 @@ fn crystal_half(v: usize) -> usize {
 /// centred on column 8 of 16: the girdle's right tip clipped by the box, the crown split 4 dark to 5 lit).
 #[inline]
 fn crystal_facet(u: usize, v: usize) -> Option<u32> {
-    if v >= CRYSTAL_H || u >= CRYSTAL_W {
+    if v >= CRYSTAL_H() || u >= CRYSTAL_W() {
         return None;
     }
-    let cx = CRYSTAL_W / 2; // the facet seam: columns `< cx` are the shadowed face, `>= cx` the lit one
+    let cx = CRYSTAL_W() / 2; // the facet seam: columns `< cx` are the shadowed face, `>= cx` the lit one
     let half = crystal_half(v);
-    let d2 = (2 * u + 1).abs_diff(CRYSTAL_W); // CRYSTAL2 — distance from the box's centre line, in HALF px
+    let d2 = (2 * u + 1).abs_diff(CRYSTAL_W()); // CRYSTAL2 — distance from the box's centre line, in HALF px
     if d2 > (2 * half).saturating_sub(1).max(1) {
         return None;
     }
-    Some(if v < CRYSTAL_CROWN_H {
+    Some(if v < CRYSTAL_CROWN_H() {
         if u < cx { theme::CONTROL_CLOSE } else { theme::CONTROL_ZOOM }
     } else {
         theme::CONTROL_MID
@@ -1836,8 +1836,8 @@ fn crystal_facet(u: usize, v: usize) -> Option<u32> {
 /// [`BOLT_W`]/[`BOLT_H`] keep it strictly inside the outline, which is what makes "whatever is under
 /// it" mean fill-or-face and never the cell's own edge.
 fn draw_battery_glyph(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, it: super::status::BarItem) {
-    let by0 = (h - BATT_BODY_H) / 2;
-    if j < by0 || j >= by0 + BATT_BODY_H {
+    let by0 = (h - BATT_BODY_H()) / 2;
+    if j < by0 || j >= by0 + BATT_BODY_H() {
         return;
     }
     let v = j - by0;
@@ -1846,11 +1846,11 @@ fn draw_battery_glyph(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, 
     // The fill, in columns of the cell's INTERIOR (the outline takes one column each side). Integer
     // arithmetic, no float — the crystal's discipline. `percent` is already clamped at the decode
     // (`status::decode`), so this can never exceed the interior.
-    let inner = BATT_BODY_W - 2;
+    let inner = BATT_BODY_W() - 2;
     let fill = inner * (it.percent.min(100) as usize) / 100;
-    let edge_row = v == 0 || v + 1 == BATT_BODY_H;
-    for u in 0..BATT_BODY_W {
-        let c = if edge_row || u == 0 || u + 1 == BATT_BODY_W {
+    let edge_row = v == 0 || v + 1 == BATT_BODY_H();
+    for u in 0..BATT_BODY_W() {
+        let c = if edge_row || u == 0 || u + 1 == BATT_BODY_W() {
             outline
         } else if u - 1 < fill {
             ink
@@ -1863,10 +1863,10 @@ fn draw_battery_glyph(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, 
         }
     }
     // The positive terminal's nub, centred on the body.
-    let ny = (BATT_BODY_H - BATT_CAP_H) / 2;
-    if v >= ny && v < ny + BATT_CAP_H {
-        for u in 0..BATT_CAP_W {
-            let i = x0 + BATT_BODY_W + u;
+    let ny = (BATT_BODY_H() - BATT_CAP_H()) / 2;
+    if v >= ny && v < ny + BATT_CAP_H() {
+        for u in 0..BATT_CAP_W() {
+            let i = x0 + BATT_BODY_W() + u;
             if i < w {
                 out[i] = outline;
             }
@@ -1875,14 +1875,14 @@ fn draw_battery_glyph(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, 
     if !it.charging {
         return;
     }
-    let bx = (BATT_BODY_W - BOLT_W) / 2;
-    let byy = (BATT_BODY_H - BOLT_H) / 2;
-    if v < byy || v >= byy + BOLT_H {
+    let bx = (BATT_BODY_W() - BOLT_W()) / 2;
+    let byy = (BATT_BODY_H() - BOLT_H()) / 2;
+    if v < byy || v >= byy + BOLT_H() {
         return;
     }
-    let row = BOLT[v - byy];
-    for u in 0..BOLT_W {
-        if row & (1 << (BOLT_W - 1 - u)) == 0 {
+    let row = BOLT[(v - byy) * 8 / BOLT_H()]; // UIMETRICS: the 5x8 mark sampled at its scaled size
+    for u in 0..BOLT_W() {
+        if row & (1 << (4 - u * 5 / BOLT_W())) == 0 {
             continue;
         }
         let cell = bx + u;
@@ -1904,7 +1904,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // The material is anchored to the STRIP, not to the panel: index ceramic by the row's offset
     // inside the box, exactly as the window chrome indexes it by the row's offset inside the window.
     let face = ceramic::shade(theme::CHROME_FACE, j);
-    let fill = if j < theme::BEVEL {
+    let fill = if j < theme::BEVEL() {
         theme::BEVEL_LIGHT
     } else if j + 1 == h {
         // The bar's ONE keyline: the bottom edge, where it meets the desktop. The other three edges
@@ -1921,9 +1921,9 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // text early-return because the gem spans more rows than the glyph cell does — it is centred in
     // the whole bar, not the band.
     let (cx0, cy0) = crystal_offset(h);
-    if j >= cy0 && j < cy0 + CRYSTAL_H {
+    if j >= cy0 && j < cy0 + CRYSTAL_H() {
         let v = j - cy0;
-        for u in 0..CRYSTAL_W {
+        for u in 0..CRYSTAL_W() {
             if let Some(c) = crystal_facet(u, v) {
                 let i = cx0 + u;
                 if i < w {
@@ -1944,7 +1944,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     }
 
     // The two texts share a baseline: vertically centred in the bar.
-    let ty0 = (h - CELL_H) / 2;
+    let ty0 = (h - CELL_H()) / 2;
 
     // WINMENU (R21) — **the focused window's MENU TITLES, in the bar.** Peter: *"menus belong in the
     // menu bar"*. Overlaid here, in the bar's own single paint, rather than composited as a second
@@ -1957,7 +1957,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // band (`ty0`) rather than recomputing it, so a title's baseline cannot drift from the caption's.
     super::winmenu::draw_bar_row(out, w, &m.menus, j, ty0);
 
-    if j < ty0 || j >= ty0 + CELL_H {
+    if j < ty0 || j >= ty0 + CELL_H() {
         return;
     }
     let sy = j - ty0;
@@ -1978,7 +1978,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // `draw_bar_row` deliberately does not redraw them.
     let cols = m.title_len.min(TITLE_GLYPHS);
     let cap_ink = if m.menus.app_open() { theme::BEVEL_LIGHT } else { theme::TITLE_TEXT_ACTIVE };
-    super::text::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, cap_ink, BOLD, FACE);
+    super::text::draw_row(out, w, &m.title[..cols], TITLE_X0(), sy, cap_ink, BOLD, FACE);
 
     // MENUSTAT — the battery's PERCENT, right-aligned in its fixed [`BATT_PCT_GLYPHS`] slot so the
     // cell beside it never moves when a digit appears or goes. Secondary ink, the clock's: the
@@ -1998,8 +1998,8 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         } else {
             pct[BATT_PCT_GLYPHS - 2] = b'0' + p as u8;
         }
-        let tx = bx0 + BATT_GLYPH_W + BATT_GAP;
-        super::text::draw_row(out, w, &pct, (tx + BATT_PCT_GLYPHS * CELL_W).saturating_sub(super::text::advance(&pct, false, FACE)), sy, theme::TITLE_TEXT_INACTIVE, false, FACE); // KERNELFONT: right-aligned in its slot by the shaped width
+        let tx = bx0 + BATT_GLYPH_W() + BATT_GAP();
+        super::text::draw_row(out, w, &pct, (tx + BATT_PCT_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&pct, false, FACE)), sy, theme::TITLE_TEXT_INACTIVE, false, FACE); // KERNELFONT: right-aligned in its slot by the shaped width
     }
 
     // BRIGHTKEYS — the transient `BRT nn/16` item, one PAD left of the battery's slot (which is
@@ -2022,7 +2022,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // at once. Same arithmetic, same guard, one definition — and it is the definition the fixture's
     // `clock=` term and [`batt_slot`] both read.
     if let (c, Some(cx)) = (m.clock.unwrap_or(*b"--:--"), clock_slot(w)) {
-        super::text::draw_row(out, w, &c, (cx + CLOCK_GLYPHS * CELL_W).saturating_sub(super::text::advance(&c, false, FACE)), sy, theme::TITLE_TEXT_INACTIVE, false, FACE); clockbar_paint(out, w, sy, cx, m.clock.is_some(), &c); #[cfg(feature = "sntp6")] if m.clock.is_some() { barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W, CELL_H))); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
+        super::text::draw_row(out, w, &c, (cx + CLOCK_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&c, false, FACE)), sy, theme::TITLE_TEXT_INACTIVE, false, FACE); clockbar_paint(out, w, sy, cx, m.clock.is_some(), &c); #[cfg(feature = "sntp6")] if m.clock.is_some() { barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W(), CELL_H()))); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
     }
 }
 
@@ -2035,8 +2035,8 @@ pub fn rollup(scope: &str) {
         scope,
         format_args!(
             "press=crystal crystal={}x{} clob={} toggles={} off_passes={}",
-            CRYSTAL_W,
-            CRYSTAL_H,
+            CRYSTAL_W(),
+            CRYSTAL_H(),
             CLOBBERS.load(Ordering::Relaxed),
             TOGGLES.load(Ordering::Relaxed),
             OFF_PASSES.load(Ordering::Relaxed)
@@ -2124,15 +2124,15 @@ pub fn selftest() {
     // Legs 3-4 — present when enabled, and in the clip.
     set_enabled(true);
     let r = strip_rect(pw, ph);
-    let flush = r == Some((0, 0, pw, BAR_H));
+    let flush = r == Some((0, 0, pw, BAR_H()));
     let n_on = strip::rects(pw, ph, &mut slots);
     let member = slots[strip::MENUBAR_SLOT] == r && r.is_some() && n_on == n_off + 1;
 
     // Leg 5 — the floor declines, both ways. Synthetic panels, so the leg does not depend on the one
     // the fixture happens to be running on.
-    let floor_declines = geometry(pw.max(FLOOR_W), FLOOR_H - 1).is_none()
-        && geometry(FLOOR_W - 1, ph.max(FLOOR_H)).is_none();
-    let floor_admits = geometry(FLOOR_W, FLOOR_H).is_some();
+    let floor_declines = geometry(pw.max(FLOOR_W()), FLOOR_H() - 1).is_none()
+        && geometry(FLOOR_W() - 1, ph.max(FLOOR_H())).is_none();
+    let floor_admits = geometry(FLOOR_W(), FLOOR_H()).is_some();
 
     // Leg 6 — dismissal is complete. Paint once with the bar on, then turn it off and compose again;
     // the slot must come back to "nothing painted".
@@ -2151,14 +2151,14 @@ pub fn selftest() {
     let (cbx, cby, cbw, cbh) = r.map(crystal_box).unwrap_or((0, 0, 0, 0));
     let crystal_ok = match r {
         Some((brx, bry, brw, brh)) => {
-            cbw == CRYSTAL_W
-                && cbh == CRYSTAL_H
+            cbw == CRYSTAL_W()
+                && cbh == CRYSTAL_H()
                 && cbx >= brx
                 && cbx + cbw <= brx + brw
                 && cby >= bry
                 && cby + cbh <= bry + brh
-                && cbx == brx + strip::PAD // one PAD in from the bar's LEFT edge, never flush
-                && cbx + cbw <= brx + TITLE_X0 // and left of where the title begins
+                && cbx == brx + strip::PAD() // one PAD in from the bar's LEFT edge, never flush
+                && cbx + cbw <= brx + TITLE_X0() // and left of where the title begins
         }
         None => false,
     };
@@ -2176,7 +2176,7 @@ pub fn selftest() {
         ":: MENUBAR: bar={}x{}+{}+{} panel={}x{} floor={}x{} strips={}->{} owned={:#x} clock={} \
          crystal={}x{}+{}+{} initial={} press=crystal default_off={} clip_clean={} flush={} \
          member={} floor={}/{} dismissed={} crystal_ok={} :: {} ::",
-        rw, rh, rx, ry, pw, ph, FLOOR_W, FLOOR_H, n_off, n_on, owned, clock,
+        rw, rh, rx, ry, pw, ph, FLOOR_W(), FLOOR_H(), n_off, n_on, owned, clock,
         cbw, cbh, cbx, cby, initial,
         default_off, clip_clean, flush, member, floor_declines, floor_admits, dismissed, crystal_ok,
         if ok { "PASS" } else { "FAIL" }
@@ -2367,7 +2367,7 @@ pub fn battery_selftest(pw: usize, ph: usize) {
     let slot = batt_slot(bw);
     let clock_x = clock_slot(bw).unwrap_or(0);
     let seat_ok = match slot {
-        Some(x0) => x0 + BATT_ITEM_W + strip::PAD == clock_x && x0 >= TITLE_X0 + CELL_W,
+        Some(x0) => x0 + BATT_ITEM_W() + strip::PAD() == clock_x && x0 >= TITLE_X0() + CELL_W(),
         None => false,
     };
 
@@ -2406,15 +2406,15 @@ pub fn battery_selftest(pw: usize, ph: usize) {
         ga,
         F11_B0ST.unwrap_or([0, 0])[0],
         F11_B0ST.unwrap_or([0, 0])[1],
-        BATT_ITEM_W,
-        BATT_GLYPH_W,
-        BATT_BODY_H,
-        BATT_GAP,
+        BATT_ITEM_W(),
+        BATT_GLYPH_W(),
+        BATT_BODY_H(),
+        BATT_GAP(),
         BATT_PCT_GLYPHS,
         match slot { Some(x) => x as i64, None => -1 },
         cw2, ch, cx, cy,
         cap_b,
-        FLOOR_W, FLOOR_H,
+        FLOOR_W(), FLOOR_H(),
         red_pct,
         decode_ok, gone_red, absent_ok, layout_ok, seat_ok,
         jitter_paint, change_paint, damage_ok,
@@ -2543,7 +2543,7 @@ pub fn firstpaint_selftest(pw: usize, ph: usize) {
         },
         if recorded { GEM_WORDS[gemc as usize] } else { "unread" },
         rw, rh,
-        CRYSTAL_W, CRYSTAL_H, crystal_offset(rh.max(CRYSTAL_H)).0, crystal_offset(rh.max(CRYSTAL_H)).1,
+        CRYSTAL_W(), CRYSTAL_H(), crystal_offset(rh.max(CRYSTAL_H())).0, crystal_offset(rh.max(CRYSTAL_H())).1,
         red_after, settle_a.1, settle_b.1, settle_a.2, settle_b.2, settle_a.3 + settle_b.3,
         unstamped, stamped, painted, recorded, bounded, gone_red,
         if !painted || !red_painted { "SKIP" } else if ok { "PASS" } else { "FAIL" }
@@ -2740,10 +2740,10 @@ const _: () = {
     // The caption starts at a constant that does not mention the clock, and it is allowed the whole
     // stored title either way — so no clock state can move or shorten it.
     assert!(TITLE_GLYPHS <= wm::MAX_TITLE);
-    assert!(TITLE_X0 > 0);
+    assert!(TITLE_X0() > 0);
     // And the clock's slot is RESERVED in the width floor whether or not a clock is drawn, which is
     // the mechanism that keeps the above true: an unsynced bar does not hand the title that space.
-    assert!(FLOOR_W >= (CLOCK_GLYPHS + 1) * CELL_W);
+    assert!(FLOOR_W() >= (CLOCK_GLYPHS + 1) * CELL_W());
 };
 
 /// Report the bar's clock state ONCE per state per boot. `Some((x, y, w, h))` is the rect the clock
@@ -2880,10 +2880,10 @@ fn crystal_readback(r: strip::Rect) -> Option<(u32, u32, u32, bool)> {
     let fb = super::panel_snapshot()?;
     let (bx, by, _, _) = crystal_box(r);
     let (mut matched, mut want, mut stray, mut sym) = (0u32, 0u32, 0u32, true);
-    for v in 0..CRYSTAL_H {
+    for v in 0..CRYSTAL_H() {
         // 0 = not a gem ink, 1 = CLOSE (shadowed crown face), 2 = MID (pavilion), 3 = ZOOM (lit face).
-        let mut cls = [0u8; CRYSTAL_W];
-        for u in 0..CRYSTAL_W {
+        let mut cls = alloc::vec![0u8; CRYSTAL_W()];
+        for u in 0..CRYSTAL_W() {
             let px = fb.read_pixel(bx + u, by + v);
             cls[u] = match px {
                 Some(theme::CONTROL_CLOSE) => 1,
@@ -2907,8 +2907,8 @@ fn crystal_readback(r: strip::Rect) -> Option<(u32, u32, u32, bool)> {
         }
         // The mirror of a shadowed face is the lit one; the pavilion and the bar's face mirror to
         // themselves.
-        for u in 0..CRYSTAL_W / 2 {
-            if cls[CRYSTAL_W - 1 - u] != [0u8, 3, 2, 1][cls[u] as usize] {
+        for u in 0..CRYSTAL_W() / 2 {
+            if cls[CRYSTAL_W() - 1 - u] != [0u8, 3, 2, 1][cls[u] as usize] {
                 sym = false;
             }
         }
@@ -3087,13 +3087,13 @@ fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: boo
     if PERSIST_MODEL.load(Ordering::Relaxed) != 0 {
         return;
     }
-    if anchored && w >= CLOCKBAR_WIDE_CELLS * CELL_W {
+    if anchored && w >= CLOCKBAR_WIDE_CELLS * CELL_W() {
         if let Some(secs) = crate::clock::try_unix_now() {
-            let dw = CLOCKBAR_DATE_GLYPHS * CELL_W;
+            let dw = CLOCKBAR_DATE_GLYPHS * CELL_W();
             // The status item (battery) sits one PAD left of the clock; when the date shares the row
             // it goes one PAD left of that slot's left edge, so the two never overlap.
             let right = batt_slot(w).unwrap_or(cx);
-            if let Some(dx) = right.checked_sub(strip::PAD + dw) {
+            if let Some(dx) = right.checked_sub(strip::PAD() + dw) {
                 let date = clockbar_date(secs);
                 super::text::draw_row(out, w, &date, dx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
             }
@@ -3123,7 +3123,7 @@ pub fn batt_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
     super::status::bar_item()?;
     let (rx, ry, w, h) = strip_rect(pw, ph)?;
     let x0 = batt_slot(w)?;
-    Some((rx + x0, ry, BATT_ITEM_W, h))
+    Some((rx + x0, ry, BATT_ITEM_W(), h))
 }
 
 /// GLASSEYES (B343) — the bar's VOLATILE rects on the panel, absolute `(x, y, w, h)`, for the state-shot mask:
@@ -3134,7 +3134,7 @@ pub fn batt_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
 pub fn volatile_rects(pw: usize, ph: usize) -> (Option<strip::Rect>, Option<strip::Rect>) {
     let Some((rx, ry, w, h)) = strip_rect(pw, ph) else { return (None, None) };
     let Some(cx) = clock_slot(w) else { return (None, None) };
-    let clock = Some((rx + cx, ry, (CLOCK_GLYPHS * CELL_W).min(w - cx), h));
+    let clock = Some((rx + cx, ry, (CLOCK_GLYPHS * CELL_W()).min(w - cx), h));
     let gx = bright_slot(w).or_else(|| batt_slot(w));
     let glyphs = gx.map(|x0| (rx + x0, ry, cx.saturating_sub(x0), h));
     (clock, glyphs)

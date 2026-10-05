@@ -321,8 +321,8 @@ pub fn open() -> Result<(), &'static str> {
     }
     let pi = crate::video::panel_info_nonblocking().ok_or("panel busy")?;
     let (pw, ph) = (pi.width, pi.height);
-    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
-    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
+    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER()).max(1));
+    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
     if w < 200 || h < 120 {
         return Err("window below floor");
     }
@@ -350,7 +350,7 @@ pub fn open() -> Result<(), &'static str> {
     { st.last_migr = crate::arch::sched::migrations_total(); }
     repaint(&mut st, crate::arch::ms());
     let base = st.surf.as_ptr() as usize;
-    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, b"Activity", ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, b"Activity", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         return Err("window create failed");
     }
