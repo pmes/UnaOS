@@ -82,6 +82,12 @@ fn main() {
         core::ignite(cortex_vault, core_synapse, shutdown_rx_core).await;
     });
 
+    // 5.4 VEINTURNS (SR42): Principia serves the preference verbs on this process's
+    // Synapse, so the Settings dropdown's `PrefSet vein.provider` is validated,
+    // persisted and broadcast as `PrefChanged` — which rebuilds Vein's provider.
+    let principia_rx = synapse.subscribe();
+    let principia_handle = rt.spawn(principia::serve(synapse.clone(), principia_rx, principia::Principia::new()));
+
     // 5.5 Ignite the Vein Semantic Vault Storage Rune
     let vault_synapse = synapse.clone();
     let vault_path = vein_storage.clone();
@@ -262,5 +268,6 @@ fn main() {
         let _ = core_handle.await;
         matrix_handle.abort();
         vault_handle.abort();
+        principia_handle.abort();
     });
 }

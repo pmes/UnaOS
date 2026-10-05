@@ -5,6 +5,57 @@ use font_kit::font::Font;
 use std::sync::Arc;
 use taffy::prelude::*;
 
+/// Cache key of one face: family class (0 sans, 1 serif, 2 mono) x bold x italic.
+pub fn face_key(family: u8, bold: bool, italic: bool) -> u8 {
+    family.min(2) * 4 + (bold as u8) * 2 + italic as u8
+}
+
+/// THE face for a text run — the text measurer (layout::remeasure) and the
+/// painter (render::draw_node) both call this, so a run is wrapped with
+/// exactly the advances it is drawn with. Loaded once per thread per face;
+/// a missing bold/italic face falls back to the family's regular face, a
+/// missing family to sans.
+pub fn face(family: u8, bold: bool, italic: bool) -> Option<Arc<Font>> {
+    use font_kit::properties::{Style, Weight};
+    thread_local! {
+        static FACES: std::cell::RefCell<[Option<Option<Arc<Font>>>; 12]> =
+            const { std::cell::RefCell::new([const { None }; 12]) };
+    }
+    let key = face_key(family, bold, italic) as usize;
+    if let Some(f) = FACES.with(|f| f.borrow()[key].clone()) {
+        return f;
+    }
+    // Generic families resolve the way browsers resolve them: web content is
+    // authored against the Times New Roman / Arial metrics, so those faces
+    // (or their metric-compatible Liberation clones) come first, then the
+    // system's own generic. Monospace keeps the system generic — Chromium's
+    // default fixed font on Linux is "Monospace" too.
+    let named = |names: &[&str]| -> Vec<FamilyName> {
+        names.iter().map(|n| FamilyName::Title(n.to_string())).collect()
+    };
+    let (mut names, generic) = match family.min(2) {
+        1 => (named(&["Times New Roman", "Liberation Serif", "Tinos"]), FamilyName::Serif),
+        2 => (Vec::new(), FamilyName::Monospace),
+        _ => (named(&["Arial", "Liberation Sans", "Arimo", "Helvetica"]), FamilyName::SansSerif),
+    };
+    names.push(generic);
+    let name = names;
+    let mut props = Properties::new();
+    if bold {
+        props.weight(Weight::BOLD);
+    }
+    if italic {
+        props.style(Style::Italic);
+    }
+    let engine = FontEngine::new();
+    let loaded = engine
+        .load_font(&name, &props)
+        .or_else(|| engine.load_font(&name, &Properties::new()))
+        .or_else(|| engine.load_font(&[FamilyName::SansSerif], &Properties::new()));
+    FACES.with(|f| f.borrow_mut()[key] = Some(loaded.clone()));
+    loaded
+}
+
 pub struct FontEngine {
     source: SystemSource,
 }

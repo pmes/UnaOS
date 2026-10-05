@@ -116,13 +116,26 @@ impl<D: BlockDevice> UnaFS<D> {
             .filter(|&id| self.imap_ref().get(id as usize).copied().unwrap_or(0) == 0)
             .collect();
 
+        // UNAFSMAP: walk the map LEAF by leaf (a leaf with no in-use entry —
+        // every hole — is skipped without a read; pages go through the
+        // bounded cache).
         let mut leaked_blocks = Vec::new();
         let mut blocks_in_use = 0u64;
-        for block in 0..block_count {
-            if self.refmap_ref().is_used(block) {
-                blocks_in_use += 1;
-                if !reach.contains(&block) {
-                    leaked_blocks.push(block);
+        {
+            let (rm, dev) = self.refmap_and_device();
+            for leaf in 0..rm.leaf_count() {
+                if rm.leaf_used(leaf) == 0 {
+                    continue;
+                }
+                let base = leaf * crate::refmap::REFS_PER_LEAF;
+                for (i, c) in rm.leaf_counts(dev, leaf)?.into_iter().enumerate() {
+                    let block = base + i as u64;
+                    if c != 0 && block < block_count {
+                        blocks_in_use += 1;
+                        if !reach.contains(&block) {
+                            leaked_blocks.push(block);
+                        }
+                    }
                 }
             }
         }
@@ -164,27 +177,12 @@ impl<D: BlockDevice> UnaFS<D> {
         // would under-count shared blocks and a later snapshot drop could then
         // free a block another root still lives on).
         let count_map = self.reachability_counts()?;
-        // Fallible: this vec is 4 B/block and fsck is kernel-reachable
-        // (`recover`) — same rule as the RefMap views (SHELLWIN-OOM).
-        let n = usize::try_from(block_count)
-            .map_err(|_| crate::storage::Error::AllocRefused(block_count))?;
-        let mut counts: Vec<u32> = Vec::new();
-        counts
-            .try_reserve_exact(n)
-            .map_err(|_| crate::storage::Error::AllocRefused(n as u64 * 4))?;
-        counts.resize(n, 0);
-        for (&b, &n) in &count_map {
-            if let Some(c) = counts.get_mut(b as usize) {
-                *c = n;
-            }
-        }
-        let mut reclaimed = 0u64;
-        for block in 0..block_count {
-            if self.refmap_ref().is_used(block) && !count_map.contains_key(&block) {
-                reclaimed += 1;
-            }
-        }
-        self.refmap_mut().set_counts(&counts);
+        // UNAFSMAP: leaf by leaf, touching (and pinning) only the leaves whose
+        // counts differ from the truth — no 4 B/block vector.
+        let reclaimed = {
+            let (rm, dev) = self.refmap_and_device();
+            rm.rebuild_from(dev, &count_map)?
+        };
         report.reclaimed_blocks = reclaimed;
         self.commit()?;
 
