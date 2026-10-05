@@ -29,6 +29,10 @@ pub fn init(vm: &mut Vm) {
         ("some", 1, some),
         ("every", 1, every),
         ("find", 1, find),
+        ("chunks", 1, chunks),
+        ("windows", 1, windows),
+        ("includes", 1, includes),
+        ("join", 1, join),
     ] {
         method(vm, ip, n, l, f);
     }
@@ -175,6 +179,23 @@ fn close_with<T>(vm: &mut Vm, it: &Value, e: Value) -> JsResult<T> {
     Err(e)
 }
 
+/// `this` must be an Object (before any argument is examined).
+fn this_iter(vm: &mut Vm, this: &Value) -> JsResult<Value> {
+    if !this.is_object() {
+        return vm.throw_type("Iterator.prototype method called on non-object");
+    }
+    Ok(this.clone())
+}
+
+/// Validate a callback argument (closing the receiver on failure), then GetIteratorDirect.
+fn callable_then_direct(vm: &mut Vm, ctx: &CallCtx) -> JsResult<(Value, Value, Value)> {
+    let it = this_iter(vm, &ctx.this)?;
+    let f = vm.arg(ctx, 0);
+    require_callable(vm, &it, &f)?;
+    let (it, next) = direct(vm, &it)?;
+    Ok((it, next, f))
+}
+
 fn require_callable(vm: &mut Vm, it: &Value, f: &Value) -> JsResult<()> {
     if !vm.is_callable(f) {
         let e = vm.type_error("argument is not a function");
@@ -187,21 +208,17 @@ fn make_helper(vm: &mut Vm, kind: u8, it: Value, next: Value, func: Value, remai
     let hp = vm.intr().iterator_helper_proto;
     let h = vm.alloc(ObjectData::new(
         Some(hp),
-        Kind::Iterator(Box::new(IterData::Helper(Box::new(HelperData { kind, iter: it, next, func, counter: 0.0, remaining, inner: None, state: 0 })))),
+        Kind::Iterator(Box::new(IterData::Helper(Box::new(HelperData { kind, iter: it, next, func, counter: 0.0, remaining, inner: None, state: 0, buf: Vec::new() })))),
     ));
     Value::Object(h)
 }
 
 fn map(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let (it, next) = direct(vm, &ctx.this)?;
-    let f = vm.arg(ctx, 0);
-    require_callable(vm, &it, &f)?;
+    let (it, next, f) = callable_then_direct(vm, ctx)?;
     Ok(make_helper(vm, 0, it, next, f, 0.0))
 }
 fn filter(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let (it, next) = direct(vm, &ctx.this)?;
-    let f = vm.arg(ctx, 0);
-    require_callable(vm, &it, &f)?;
+    let (it, next, f) = callable_then_direct(vm, ctx)?;
     Ok(make_helper(vm, 1, it, next, f, 0.0))
 }
 fn limit_arg(vm: &mut Vm, ctx: &CallCtx, it: &Value) -> JsResult<f64> {
@@ -215,8 +232,8 @@ fn limit_arg(vm: &mut Vm, ctx: &CallCtx, it: &Value) -> JsResult<f64> {
         return close_with(vm, it, e);
     }
     let i = crate::vm::ops::integer_or_infinity(n);
-    if i < 0.0 {
-        let e = vm.range_error("limit must be non-negative");
+    if i < 0.0 || (i.is_finite() && i > 9007199254740991.0) {
+        let e = vm.range_error("limit is out of range");
         return close_with(vm, it, e);
     }
     Ok(i)
@@ -240,9 +257,7 @@ fn drop(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(make_helper(vm, 3, it, next, Value::Undefined, n))
 }
 fn flat_map(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let (it, next) = direct(vm, &ctx.this)?;
-    let f = vm.arg(ctx, 0);
-    require_callable(vm, &it, &f)?;
+    let (it, next, f) = callable_then_direct(vm, ctx)?;
     Ok(make_helper(vm, 4, it, next, f, 0.0))
 }
 
@@ -344,6 +359,61 @@ fn helper_step(vm: &mut Vm, o: Obj) -> JsResult<Option<Value>> {
             }
             vm.iterator_step_value(&it, &next)
         }
+        5 => {
+            // chunks: up to `remaining` elements per step; a final partial chunk is yielded.
+            let size = with_helper(vm, o, |h| h.remaining) as usize;
+            let mut chunk = Vec::new();
+            while chunk.len() < size {
+                match vm.iterator_step_value(&it, &next)? {
+                    Some(v) => {
+                        vm.root(&v);
+                        chunk.push(v);
+                    }
+                    None => break,
+                }
+            }
+            if chunk.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(Value::Object(vm.new_array(chunk))))
+        }
+        6 => {
+            // windows: sliding windows of `remaining` elements; counter 1 = allow-partial.
+            let size = with_helper(vm, o, |h| h.remaining) as usize;
+            let partial = with_helper(vm, o, |h| h.counter) == 1.0;
+            loop {
+                let have = with_helper(vm, o, |h| h.buf.len());
+                if have == size && with_helper(vm, o, |h| h.func.is_null()) {
+                    // A window was already yielded: slide by one.
+                    with_helper(vm, o, |h| {
+                        h.buf.remove(0);
+                    });
+                }
+                match vm.iterator_step_value(&it, &next)? {
+                    Some(v) => {
+                        with_helper(vm, o, |h| h.buf.push(v));
+                        if with_helper(vm, o, |h| h.buf.len()) == size {
+                            let w = with_helper(vm, o, |h| {
+                                h.func = Value::Null;
+                                h.buf.clone()
+                            });
+                            return Ok(Some(Value::Object(vm.new_array(w))));
+                        }
+                    }
+                    None => {
+                        let (n, yielded) = with_helper(vm, o, |h| (h.buf.len(), h.func.is_null()));
+                        if partial && !yielded && n > 0 && n < size {
+                            let w = with_helper(vm, o, |h| {
+                                h.func = Value::Null;
+                                core::mem::take(&mut h.buf)
+                            });
+                            return Ok(Some(Value::Object(vm.new_array(w))));
+                        }
+                        return Ok(None);
+                    }
+                }
+            }
+        }
         _ => loop {
             let inner = with_helper(vm, o, |h| h.inner.clone());
             if let Some((ii, inext)) = inner {
@@ -399,9 +469,7 @@ fn helper_return(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 }
 
 fn reduce(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let (it, next) = direct(vm, &ctx.this)?;
-    let f = vm.arg(ctx, 0);
-    require_callable(vm, &it, &f)?;
+    let (it, next, f) = callable_then_direct(vm, ctx)?;
     let mut counter;
     let mut acc = if ctx.argc < 2 {
         match vm.iterator_step_value(&it, &next)? {
@@ -440,9 +508,7 @@ fn to_array(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 }
 
 fn for_each(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let (it, next) = direct(vm, &ctx.this)?;
-    let f = vm.arg(ctx, 0);
-    require_callable(vm, &it, &f)?;
+    let (it, next, f) = callable_then_direct(vm, ctx)?;
     let mut c = 0.0;
     while let Some(v) = vm.iterator_step_value(&it, &next)? {
         if let Err(e) = vm.call(&f, &Value::Undefined, &[v, Value::Number(c)]) {
@@ -455,9 +521,7 @@ fn for_each(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 /// some / every / find: mode 0 some, 1 every, 2 find
 fn predicate_walk(vm: &mut Vm, ctx: &CallCtx, mode: u8) -> JsResult<Value> {
-    let (it, next) = direct(vm, &ctx.this)?;
-    let f = vm.arg(ctx, 0);
-    require_callable(vm, &it, &f)?;
+    let (it, next, f) = callable_then_direct(vm, ctx)?;
     let mut c = 0.0;
     while let Some(v) = vm.iterator_step_value(&it, &next)? {
         let r = match vm.call(&f, &Value::Undefined, &[v.clone(), Value::Number(c)]) {
@@ -552,4 +616,117 @@ fn array_iter_next(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         }
     };
     Ok(Value::Object(vm.iter_result(r, false)))
+}
+
+/// Validate a chunk / window size: an integral Number in [1, 2^32 - 1] (no coercion).
+fn size_arg(vm: &mut Vm, it: &Value, v: &Value, what: &str) -> JsResult<f64> {
+    let n = match v {
+        Value::Number(n) if n.is_finite() && crate::numconv::libm_floor(*n) == *n => *n,
+        _ => {
+            let e = vm.type_error(&alloc::format!("{} must be an integral Number", what));
+            return close_with(vm, it, e);
+        }
+    };
+    if !(1.0..=4294967295.0).contains(&n) {
+        let e = vm.range_error(&alloc::format!("{} is out of range", what));
+        return close_with(vm, it, e);
+    }
+    Ok(n)
+}
+
+fn chunks(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let it = this_iter(vm, &ctx.this)?;
+    let a = vm.arg(ctx, 0);
+    let n = size_arg(vm, &it, &a, "chunkSize")?;
+    let (it, next) = direct(vm, &it)?;
+    Ok(make_helper(vm, 5, it, next, Value::Undefined, n))
+}
+
+fn windows(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let it = this_iter(vm, &ctx.this)?;
+    let a = vm.arg(ctx, 0);
+    let n = size_arg(vm, &it, &a, "windowSize")?;
+    let u = vm.arg(ctx, 1);
+    let partial = match &u {
+        Value::Undefined => false,
+        Value::String(s) if s.eq_str("only-full") => false,
+        Value::String(s) if s.eq_str("allow-partial") => true,
+        _ => {
+            let e = vm.type_error("undersized must be \"only-full\" or \"allow-partial\"");
+            return close_with(vm, &it, e);
+        }
+    };
+    let (it, next) = direct(vm, &it)?;
+    let h = make_helper(vm, 6, it, next, Value::Undefined, n);
+    if partial {
+        with_helper(vm, h.as_object().unwrap(), |h| h.counter = 1.0);
+    }
+    Ok(h)
+}
+
+fn includes(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let it = this_iter(vm, &ctx.this)?;
+    let target = vm.arg(ctx, 0);
+    let sk = vm.arg(ctx, 1);
+    let skip = match &sk {
+        Value::Undefined => 0.0,
+        Value::Number(n) if *n == f64::INFINITY => f64::INFINITY,
+        Value::Number(n) if *n == f64::NEG_INFINITY => {
+            let e = vm.range_error("skippedElements is out of range");
+            return close_with(vm, &it, e);
+        }
+        Value::Number(n) if n.is_finite() && crate::numconv::libm_floor(*n) == *n => {
+            if *n < 0.0 || *n > 9007199254740991.0 {
+                let e = vm.range_error("skippedElements is out of range");
+                return close_with(vm, &it, e);
+            }
+            *n
+        }
+        _ => {
+            let e = vm.type_error("skippedElements must be an integral Number");
+            return close_with(vm, &it, e);
+        }
+    };
+    let (it, next) = direct(vm, &it)?;
+    let mut skipped = 0.0;
+    while let Some(v) = vm.iterator_step_value(&it, &next)? {
+        if skipped < skip {
+            skipped += 1.0;
+            continue;
+        }
+        if v.same_value_zero(&target) {
+            vm.iterator_close(&it)?;
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn join(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let it = this_iter(vm, &ctx.this)?;
+    let sv = vm.arg(ctx, 0);
+    let sep = if sv.is_undefined() {
+        JsStr::from_str(",")
+    } else {
+        match vm.to_string(&sv) {
+            Ok(s) => s,
+            Err(e) => return close_with(vm, &it, e),
+        }
+    };
+    let (it, next) = direct(vm, &it)?;
+    let mut out: Vec<u16> = Vec::new();
+    let mut first = true;
+    while let Some(v) = vm.iterator_step_value(&it, &next)? {
+        if !first {
+            out.extend_from_slice(sep.units());
+        }
+        first = false;
+        if !v.is_nullish() {
+            match vm.to_string(&v) {
+                Ok(s) => out.extend_from_slice(s.units()),
+                Err(e) => return close_with(vm, &it, e),
+            }
+        }
+    }
+    Ok(Value::String(JsStr::from_units(out)))
 }

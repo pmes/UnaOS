@@ -263,6 +263,8 @@ pub struct HelperData {
     pub remaining: f64,
     pub inner: Option<(Value, Value)>,
     pub state: u8,
+    /// chunks / windows: the pending elements.
+    pub buf: Vec<Value>,
 }
 
 pub struct BufferData {
@@ -529,6 +531,9 @@ impl ObjectData {
                     if let Some((a, b)) = &h.inner {
                         v(a, out);
                         v(b, out);
+                    }
+                    for x in &h.buf {
+                        v(x, out);
                     }
                 }
                 _ => {}
