@@ -19,9 +19,9 @@ description = "UnaOS's own TLS 1.3 client (RFC 8446) and X.509 path validation (
 #
 # Feature `cryptocore` (VEINTLS, SR36): the PRODUCT provider, `tls_core::cryptocore_provider::CryptoCoreProvider`
 # over crypto_core (in-tree, zero third-party crates). The module is CRYPTOCORE's fold file
-# (crypto_core/adapters/tls_core_provider.rs); until CRYPTOCORE lands it on this branch, src/cryptocore_provider.rs
-# is a stub whose `compile_error!` names exactly what is missing. `cryptocore-std` adds the host `new()` over
-# /dev/urandom (the adapter's own header names both features).
+# (crypto_core/adapters/tls_core_provider.rs), copied verbatim to src/cryptocore_provider.rs at the VEINTLS fold
+# (exec-sec-crypto ed49c387: P-256/P-384 ECDSA, Ed25519, RSASSA-PSS + PKCS#1 v1.5 verify, AES-GCM, ChaCha20-
+# Poly1305, X25519, ChaCha20 DRBG). `cryptocore-std` adds the host `new()` over /dev/urandom.
 #
 # Non-dev dependencies: none, unless `cryptocore` (then crypto_core, in-tree).
 

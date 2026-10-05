@@ -23,6 +23,8 @@
 //! | [`x25519`] | X25519 | RFC 7748 |
 //! | [`ed25519`] | Ed25519 | RFC 8032 |
 //! | [`p256`] | P-256 ECDH + ECDSA | SP 800-186, FIPS 186-5, RFC 6979, SEC 1 |
+//! | [`p384`] | P-384 ECDH + ECDSA | SP 800-186, FIPS 186-5, RFC 6979, SEC 1 |
+//! | [`rsa`] | RSASSA-PSS + RSASSA-PKCS1-v1_5 VERIFY | RFC 8017 (PKCS #1 v2.2) |
 //! | [`blake2b`], [`argon2`] | BLAKE2b, Argon2id/i/d | RFC 7693, RFC 9106 |
 //! | [`drbg`] | ChaCha20 fast-key-erasure DRBG over a [`drbg::Entropy`] | this crate (documented) |
 //! | [`ct`] | `ct_eq`, `ct_select`, [`ct::Zeroize`] | — |
@@ -61,9 +63,12 @@ pub mod x25519;
 pub mod ed25519;
 mod bigint;
 pub mod p256;
-// M-later pub mod blake2b;
-// M-later pub mod argon2;
-// M-later pub mod drbg;
+mod bignum;
+pub mod p384;
+pub mod rsa;
+pub mod blake2b;
+pub mod argon2;
+pub mod drbg;
 
 pub use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 
