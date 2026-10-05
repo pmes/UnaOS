@@ -65,3 +65,37 @@ hunks=<h>` then `:: SELFDIAG: provider=echo fails=1 asked=1 patched=1 refused=0 
 path-write grant (any ring-3 program may write the selfhost tree today — the grant is path-scoped, not
 program-scoped; Holocron/installer identity); the aarch64 DIAG image (no ELF window there); the metal boot
 (R78); certificate verification (inherited from LUMENAPP).
+
+## Results (2026-10-05)
+
+Commits on `exec-rmbp-selfdiag`: M1 `5263133e` (boot log on disk + diag_core), M2a `db1db9ab` (SYS_PATH_READ/WRITE
+fulfiller + `tests selfdiag` with the Echo fixture), M2+M3 `a8b4a90c` (DIAG.ELF, witness-owners.py, arroyo, builder),
+this doc commit.
+
+**As built.** `crates/kernel/src/selfdiag.rs` (CHARTER: Kernel — fulfiller): `path_fulfil` (the two syscalls over the
+VFS), `principal_for` (kernel authority on `/SRC`, `/boot/SRC`, `/system`, `/boot/system`, `/var/log/diag.*`; the
+caller's principal elsewhere), `selftest` (`tests selfdiag`: lays `unaos/sdfix.rs` under `/var/tmp/selfdiag` on a UnaFS
+root, `/boot/SDFIX` on FAT, and runs witness → FAIL → owner → prompt → Echo → parse → resolve (the canned hunk is one
+line late: the fuzz path) → emit to `~dgn` → copy back → byte compare → record → `record::next_boot` on a PASS line).
+The temp suffix is `~dgn`, not `.dgn` (GATE-CHARTER's dotfile rule). `crates/user-diag` (DIAG.ELF, app note flags 0,
+ELF window: 144216 B file, span 620264, stack 262144, need 886504 of 4194304; ELFENTRY PASS). The owners table:
+529 tags, 4471 sites on this tree (target/witness-owners.txt, about 243 KiB, streamed 32 KiB at a time by the program).
+EXECNAME's table gains `diag` (flags 0): `tests exec` reads 5/5 on an image staged by esp-x86.
+
+**Wire a metal boot should print** (UNAOS_SELFDIAG=1 UNAOS_UNAFS=1, then `tests selfdiag`):
+`[selfdiag] bootlog state=written boot=<n> kept=<k> lost=0 tree=<path|none>`,
+`[selfdiag] fx root=unafs dir=/var/tmp/selfdiag prompt=<b> answer=<b> hunks=1 next=fixed`,
+`:: SELFDIAG: provider=echo fails=1 patched=1 asked=1 refused=0 next=fixed bootlog=written -> PASS ::`
+(on a FAT root: `root=fat dir=/boot/SDFIX … bootlog=fat-root`). Then `diag`: `:: SELFDIAG: start provider=echo
+boot=<n> tree=<…> owners=/boot/system/witness-owners.txt ::`, one `[selfdiag] fail tag=… owner=…` per FAIL line,
+`[selfdiag] ask provider=echo prompt=<b> answer=<b> outcome=no-patch`, `[selfdiag] recorded /var/log/diag.<n>.md`, and
+`:: SELFDIAG: fails=<n> asked=<min(n,4)> patched=0 refused=0 -> PASS ::` (the Echo provider has a canned answer only
+for the fixture line; a key on the UnaFS volume and `vein.tls = "insecure"` make it ask Claude).
+
+**Legs.** x86 metal shape + `selfdiag`: exit 0. aarch64 `login,loginst,virt_el0,selfdiag`: exit 0. user-diag (its
+arroyo line): exit 0, window check and elf-entry-check exit 0. builder `cargo check`: exit 0. `cargo test -p
+diag_core`: 10 passed. charter-check: exit 0. No QEMU (R78).
+
+**Still owed.** SH-5 (on-metal rebuild + reboot, so `diag --loop`; the program prints the bench command); an argv for
+programs; program-scoped identity for the tree grant; the aarch64 DIAG image; certificate verification (LUMENAPP);
+the GPU rungs as the first real case need a key on the volume; the metal boot.

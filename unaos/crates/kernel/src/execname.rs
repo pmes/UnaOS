@@ -15,7 +15,7 @@
 //!
 //! PASS = every name resolves to `/apps/<NAME>.ELF` and every declaration matches the table below
 //! (LUMEN windowed, PREFS resident, NET and BIG console with a note present). VEIN left this table at the
-//! merge11 fold: LUMENAPP (B323, R82) retired the chat daemon, so the line reads 4/4.
+//! merge11 fold: LUMENAPP (B323, R82) retired the chat daemon; SELFDIAG (B324) added DIAG (console), so the line reads 5/5.
 
 /// (bare name, expected flags — `None` = not checked).
 const STAGED: &[(&str, Option<u32>)] = &[
