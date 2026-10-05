@@ -6576,6 +6576,7 @@ name = "pixel_core"
 version = "0.1.0"
 dependencies = [
  "image",
+ "svg_core",
  "vp8_core",
 ]
 
@@ -8357,6 +8358,7 @@ name = "svg_core"
 version = "0.1.0"
 dependencies = [
  "font_core",
+ "pixel_core",
 ]
 
 [[package]]

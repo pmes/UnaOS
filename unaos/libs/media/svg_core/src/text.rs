@@ -219,7 +219,7 @@ fn baseline_offset(st: &Style, font: &font_core::Font) -> f64 {
     let (asc, desc, _) = font.line_metrics();
     let (asc, desc) = (asc as f64 * s, desc as f64 * s);
     let xh = font.os2.and_then(|o| o.x_height).map(|v| v as f64 * s).unwrap_or(asc * 0.5);
-    let mut y = match st.dominant_baseline.as_deref() {
+    let y = match st.dominant_baseline.as_deref() {
         Some("middle") => xh / 2.0,
         Some("central") => (asc + desc) / 2.0,
         Some("hanging") => asc * 0.8,

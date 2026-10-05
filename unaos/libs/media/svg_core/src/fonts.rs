@@ -4,7 +4,9 @@
 //! the CSS Fonts 4 §5.2 font matching algorithm for `font-style` then `font-weight`, with generic families
 //! mapped to configurable names.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
+#[cfg(feature = "std")]
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use font_core::Font;
 

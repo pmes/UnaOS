@@ -39,6 +39,8 @@ pub mod inflate;
 pub mod jpeg;
 pub mod png;
 pub mod qoi;
+#[cfg(feature = "svg")]
+pub mod svg;
 pub mod webp;
 
 pub use anim::{Animation, FrameInfo, decode_first_frame};
@@ -124,6 +126,9 @@ pub enum Format {
     Bmp,
     Qoi,
     WebP,
+    /// SVG markup, rendered by svg_core (feature `svg`).
+    #[cfg(feature = "svg")]
+    Svg,
 }
 
 /// Identify a format by its magic bytes.
@@ -141,6 +146,10 @@ pub fn sniff(bytes: &[u8]) -> Option<Format> {
     } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         Some(Format::WebP)
     } else {
+        #[cfg(feature = "svg")]
+        if svg_core::sniff_svg(bytes) {
+            return Some(Format::Svg);
+        }
         None
     }
 }
@@ -154,6 +163,8 @@ pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
         Format::Bmp => decode_bmp(bytes),
         Format::Qoi => decode_qoi(bytes),
         Format::WebP => decode_webp(bytes),
+        #[cfg(feature = "svg")]
+        Format::Svg => svg::decode(bytes),
     }
 }
 

@@ -22,4 +22,4 @@ std = []
 # dev-dependency is not linked into the library, so pixel_core's own optional dependency on svg_core does
 # not form a cycle.
 [dev-dependencies]
-pixel_core = { path = "../pixel_core" }
+pixel_core = { path = "../pixel_core", features = ["svg"] }
