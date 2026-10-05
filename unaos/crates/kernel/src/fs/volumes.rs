@@ -19,7 +19,12 @@
 //!   [`testf_find`] is the one lookup (`/system/test-f`, then `/boot/system/test-f`); `tests play` asks it after
 //!   `/home`, and `tests testf` scores staged vs claimed.
 //!
-//! Witnesses: `:: VOLUMES: boot=efi-only root=unafs home_on_fat=0 shown=<list> -> PASS ::` and
+//! * **VOLUMES2 (B376, R89)** — Peter, flight 23: "it should only have the unaos and boot volumes and OBVIOUSLY it
+//!   should be boot/efi". `/volumes` holds exactly `UnaOS` and `boot`; the boot partition's EFI tree is published
+//!   as `boot/efi` ([`publish`], the one listing `shell::vfs_ls_collect` returns); another disk's EFI system
+//!   partition (flight 23: the internal SSD's, mounted by HOMESOIL at `/volumes/EFI`) is withdrawn on a native root.
+//!
+//! Witnesses: `:: VOLUMES: shown=UnaOS,boot efi=boot/efi -> PASS ::` and
 //! `:: TESTF: staged=<n>/<m> missing=<list> -> PASS ::`.
 
 use alloc::string::String;
@@ -34,6 +39,11 @@ pub const BOOT_POINT: &str = "/volumes/boot";
 pub const ROOT_POINT: &str = "/volumes/UnaOS";
 /// What Quarry shows of the boot partition: only its EFI tree.
 pub const BOOT_SHOWN: &str = "EFI";
+/// VOLUMES2 (B376, R89 "OBVIOUSLY it should be boot/efi"): the name the EFI tree is published under in `/volumes/boot`.
+/// FAT lookup is case-insensitive, so `/volumes/boot/efi/BOOT/BOOTX64.EFI` resolves on the medium's `EFI/BOOT/`.
+pub const BOOT_EFI_NAME: &str = "efi";
+/// VOLUMES2 (R89): the ONLY entries `/volumes` holds on a native root, in listing order.
+pub const SHOWN_R89: [&str; 2] = ["UnaOS", "boot"];
 
 /// `system/test-f`, on the root first (the card's UnaFS root, or a FAT root), then on the boot partition's data tree.
 pub const TESTF_DIRS: [&str; 2] = ["/system/test-f", "/boot/system/test-f"];
@@ -66,7 +76,7 @@ pub fn bind_aliases(mt: &mut MountTable, src: crate::fs::fat::BlockSource, annou
         mt.mount(BOOT_POINT, alloc::boxed::Box::new(FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src)));
         BOOT_ALIAS.store(true, Ordering::Relaxed);
         if say {
-            serial_println!("[vfs] volume alias /volumes/boot = fat boot volume source={} (Quarry shows EFI only) ::", src.name());
+            serial_println!("[vfs] volume alias /volumes/boot = fat boot volume source={} (Volumes shows boot/efi only) ::", src.name());
         }
     }
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
@@ -75,6 +85,9 @@ pub fn bind_aliases(mt: &mut MountTable, src: crate::fs::fat::BlockSource, annou
         if say {
             serial_println!("[vfs] volume alias /volumes/UnaOS = native unafs root source={} ::", src.name());
         }
+    }
+    if mt.volume_name("/").map(|n| n == "native").unwrap_or(false) {
+        withdraw_foreign_esp(mt, say);
     }
 }
 
@@ -89,9 +102,52 @@ pub fn view(path: &str, mut rows: Vec<DirEnt>, boot_under_volumes: bool) -> Vec<
     if path == "/" && boot_under_volumes {
         rows.retain(|e| e.name != "boot");
     } else if is_boot_root(path) {
-        rows.retain(|e| e.name.eq_ignore_ascii_case(BOOT_SHOWN));
+        rows = efi_only(rows);
     }
     rows
+}
+
+/// VOLUMES2 (B376, R89): the boot partition's root as Volumes shows it — its EFI tree only, named `efi`.
+fn efi_only(mut rows: Vec<DirEnt>) -> Vec<DirEnt> {
+    rows.retain(|e| e.name.eq_ignore_ascii_case(BOOT_SHOWN));
+    for e in rows.iter_mut() {
+        e.name = String::from(BOOT_EFI_NAME);
+    }
+    rows
+}
+
+/// VOLUMES2 (B376, R89): the ONE published listing of `/volumes/boot` — what `shell::vfs_ls_collect` returns, so
+/// the shell's `ls /volumes/boot`, Quarry, Quarry2 and `tests volumes` read the same rows (`efi`, nothing else).
+/// Every other path passes through untouched (`/boot` stays the whole medium for every verb and loader path).
+pub fn publish(path: &str, rows: Vec<DirEnt>) -> Vec<DirEnt> {
+    if path.trim_end_matches('/') == BOOT_POINT { efi_only(rows) } else { rows }
+}
+
+static WITHDRAWN: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+
+/// VOLUMES2 (B376, R89 "it should only have the unaos and boot volumes"): on a native UnaFS root, a non-root disk's
+/// FAT volume named `EFI` — another OS's firmware system partition (flight 23: the internal SSD's, `source=ahci0`)
+/// — is withdrawn from `/volumes`. HOMESOIL's mount of every other disk (sticks, the Pi/Orin cards) is unchanged.
+fn withdraw_foreign_esp(mt: &mut MountTable, say: bool) {
+    let foreign: Vec<String> = mt
+        .prefixes()
+        .iter()
+        .filter(|p| p.starts_with("/volumes/") && **p != BOOT_POINT && **p != ROOT_POINT)
+        .filter(|p| mt.volume_name(p).map(|n| n.eq_ignore_ascii_case(BOOT_SHOWN)).unwrap_or(false))
+        .map(|p| String::from(*p))
+        .collect();
+    for p in foreign {
+        if mt.unmount(&p) {
+            let leaf = String::from(p.trim_start_matches("/volumes/"));
+            if say {
+                serial_println!("[vfs] volume /volumes/{} withdrawn — another disk's EFI system partition is not a volume (R89: Volumes = UnaOS + boot) ::", leaf);
+            }
+            let mut w = WITHDRAWN.lock();
+            if !w.iter().any(|x| *x == leaf) {
+                w.push(leaf);
+            }
+        }
+    }
 }
 
 /// `tests play` and the viewer: `<dir>/<name>` in the first `system/test-f` that holds it.
@@ -106,48 +162,53 @@ fn names(path: &str, boot_under_volumes: bool) -> Option<Vec<String>> {
     }
 }
 
-/// `tests volumes` — the layout Peter asked for, read off the live table and Quarry's own view of it.
+/// `tests volumes` — R89's layout (VOLUMES2, B376), read off the live table through the one published listing:
+/// `/volumes` holds exactly `UnaOS` and `boot`, `/volumes/boot` holds exactly `efi`, and `boot/efi/BOOT` resolves on
+/// the medium. RED on any other list (the flight-23 gate passed `EFI,UnaOS,boot`; R89 ruled it wrong).
 pub fn selftest() {
     let mt = crate::shell::vfs_mount_table();
     let native = mt.volume_name("/").map(|n| n == "native").unwrap_or(false);
     let pure_ok = {
         let d = |n: &str| DirEnt { name: String::from(n), kind: crate::fs::vfs::NodeKind::Dir, size: 0, mtime: None };
-        let b = view("/volumes/boot", alloc::vec![d("APPS"), d("EFI"), d("HOME"), d("SYSTEM")], true);
+        let b = publish("/volumes/boot", alloc::vec![d("APPS"), d("EFI"), d("HOME"), d("SYSTEM")]);
         let r = view("/", alloc::vec![d("apps"), d("boot"), d("home")], true);
-        b.len() == 1 && b[0].name == "EFI" && r.len() == 2 && !r.iter().any(|e| e.name == "boot")
+        b.len() == 1 && b[0].name == BOOT_EFI_NAME && r.len() == 2 && !r.iter().any(|e| e.name == "boot")
     };
     if !native {
-        serial_println!(":: VOLUMES: boot=- root=fat home_on_fat=- shown=- -> SKIP reason=fat-root (homes live on the FAT by design) :: pure={} ::", pure_ok);
+        serial_println!(":: VOLUMES: shown=- efi=- -> SKIP reason=fat-root (homes live on the FAT by design) :: pure={} ::", pure_ok);
         return;
     }
     let under = boot_alias_bound();
-    let boot = names(BOOT_POINT, under);
-    let boot_tok = match &boot {
-        Some(v) if v.len() == 1 && v[0].eq_ignore_ascii_case(BOOT_SHOWN) => "efi-only",
-        Some(v) if v.is_empty() => "empty",
-        Some(_) => "more-than-efi",
-        None => "missing",
+    let efi_tok = match names(BOOT_POINT, under) {
+        Some(v) if v.len() == 1 && v[0] == BOOT_EFI_NAME => {
+            if mt.stat(&alloc::format!("{}/{}/BOOT", BOOT_POINT, BOOT_EFI_NAME)).is_ok() { String::from("boot/efi") } else { String::from("boot/efi-unresolved") }
+        }
+        Some(v) if v.is_empty() => String::from("empty"),
+        Some(v) => v.join("+"),
+        None => String::from("missing"),
     };
     let home_on_fat = ["/boot/HOME", "/boot/home"].iter().any(|p| mt.stat(p).is_ok()) as u32;
     let shown = names("/volumes", under).unwrap_or_default();
     let root = names("/", under).unwrap_or_default();
     let once = |w: &str| root.iter().filter(|n| n.eq_ignore_ascii_case(w)).count();
+    let withdrawn = WITHDRAWN.lock().join(",");
     let ok = pure_ok
-        && boot_tok == "efi-only"
+        && shown.len() == SHOWN_R89.len()
+        && shown.iter().zip(SHOWN_R89.iter()).all(|(a, b)| a == b)
+        && efi_tok == "boot/efi"
         && home_on_fat == 0
-        && shown.iter().any(|n| n == "boot")
-        && shown.iter().any(|n| alloc::format!("/volumes/{}", n) == ROOT_POINT)
         && once("apps") <= 1
         && once("system") <= 1
         && once("boot") == 0;
     serial_println!(
-        ":: VOLUMES: boot={} root=unafs home_on_fat={} shown={} -> {} :: root_view={} pure={} ::",
-        boot_tok,
-        home_on_fat,
+        ":: VOLUMES: shown={} efi={} -> {} :: root_view={} pure={} home_on_fat={} withdrawn={} ::",
         if shown.is_empty() { String::from("-") } else { shown.join(",") },
+        efi_tok,
         if ok { "PASS" } else { "FAIL" },
         root.join(","),
-        pure_ok
+        pure_ok,
+        home_on_fat,
+        if withdrawn.is_empty() { "-" } else { withdrawn.as_str() }
     );
 }
 
