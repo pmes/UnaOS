@@ -321,6 +321,9 @@ pub fn key_taken() {
 pub fn hid_pass() {
     let now = crate::arch::ms();
     let last = HID_LAST.swap(now, Ordering::AcqRel);
+    if last != 0 {
+        crate::video::lag::hid_gap(now.saturating_sub(last)); // INPUTSTALL M1 (B375): every gap, every phase, on the stall line
+    }
     if last != 0 && SCREEN_UP.load(Ordering::Acquire) && phase() != Phase::Desktop {
         HID_GAP_MAX.fetch_max(now.saturating_sub(last), Ordering::Relaxed);
     }

@@ -3380,7 +3380,7 @@ fn gui_try_recv_x86() -> Option<unaos_kernel::pal::Event> {
 /// same ledger and show it to the same witness.
 #[cfg(target_arch = "x86_64")]
 fn gui_recv_blocking_x86() -> unaos_kernel::pal::Event {
-    let ev = GUI_CHANNEL_X86.recv();
+    unaos_kernel::video::lag::render_idle(); let ev = GUI_CHANNEL_X86.recv(); // INPUTSTALL M1 (B375): the render task parks — its handler interval ends here, the park is not a stall (same-line fold).
     GUI_RECV_X86.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(all(feature = "usbdebug", feature = "wc"))]
     usbdebug_event_print(ev);
