@@ -2361,10 +2361,10 @@ static KEY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Silent when the window is not live: a board with no file manager on the glass owes no line per
 /// keystroke, and the SO9 question is not being asked there.
 fn key_witness(c: u8, focus: bool, took: bool) {
-    if KEY_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < KEY_LOG_MAX {
+    if !crate::pwwire::withhold() && KEY_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < KEY_LOG_MAX { // CONSOLEFIX M3 (B365): nothing while a secret is typed
         serial_println!(
-            "[quarry] key_route key={:#04x} focus={} took={}",
-            c,
+            "[quarry] key_route key={} focus={} took={}",
+            crate::pwwire::key_class(c), // CONSOLEFIX M3: a class, never the key (GLASSLAG: flight 22 printed 40+ raw codes)
             focus as u8,
             took as u8
         );
@@ -3492,7 +3492,7 @@ pub fn selftest() {
 /// pump, and the aarch64 QEMU targets emulate no HID to feed one. Those two folds are scoreable only
 /// from a metal capture, and SO9 gave that capture a better witness than the close line it used to
 /// name: every key `key_route` is asked about while the window is live now prints
-/// `[quarry] key_route key=0x.. focus=<0|1> took=<0|1>` ([`key_witness`]), so a bench seat scores the
+/// `[quarry] key_route key=<class> focus=<0|1> took=<0|1>` ([`key_witness`]), so a bench seat scores the
 /// aarch64 doors by pairing each `KEY 0x..` echo with its route line — `focus=0 took=0` beside a
 /// shell keystroke is SO9 fixed, and any `took=1` with `focus=0` is SO9 back. This leg says so on the
 /// wire rather than reporting a silent PASS that covered one arch.

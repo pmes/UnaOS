@@ -129,7 +129,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); crate::pwwire::ensure_tests(); // CONSOLEFIX (B365): `tests pwwire`, `tests notice`. LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
     ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); // RING3WIN, RING3ABI2 (merge12 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();

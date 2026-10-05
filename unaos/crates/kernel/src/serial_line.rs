@@ -395,7 +395,7 @@ fn line_note(b: &[u8]) {
     let opens = !MID.swap(!ends, Relaxed);
     if ends { LINES.fetch_add(1, Relaxed); }
     if opens { tag_note(b); }
-    if TAIL_ARM.load(Relaxed) { tail_note(b); }
+    if TAIL_ARM.load(Relaxed) { tail_note(b); } crate::pwwire::wire_note(b); // CONSOLEFIX M3 (B365): the `tests pwwire` tap
 }
 
 // ── QUIETBOOT3 (B352) — THE GLASS SAYS WHAT THE WIRE SAYS ─────────────────────────────────────────────────────

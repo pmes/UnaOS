@@ -294,3 +294,5 @@ pub mod keyring;
 pub mod window2;
 // INSTALLBARE (rmbp-ledger B364, R86): the boot's one phase gate (Setter / LoginScreen / Desktop), read by every starter. Tail statement, so no existing line moves.
 pub mod boot;
+// CONSOLEFIX (rmbp-ledger B365, R65): the tracer's and the raw-key echoes' redaction over `midden_core::secret_from`, the `tests pwwire` wire tap. Tail statement, so no existing line moves.
+pub mod pwwire;

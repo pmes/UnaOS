@@ -298,20 +298,9 @@ pub fn logts_now() -> (Option<u64>, Option<u64>) {
     (mono_ms, unix)
 }
 
-/// Remove the civil anchor entirely — witness-only, and it exists for exactly one caller: the
-/// `sntp-x86` fixture, whose live `set_anchor` test used to leave a CANNED July-22 anchor installed
-/// for the rest of the boot. That lie was load-bearing twice over: every FAT timestamp after ~1 s
-/// of uptime carried the canned date, and every `logts` prefix flipped to 1-second civil form —
-/// which is what degraded the GR16 s73 kepler breakdown to whole seconds. A fixture must not leave
-/// global state it fabricated; this is its cleanup path, not a general API.
-#[cfg(feature = "witness")]
-pub fn witness_clear_anchor() {
-    *UNIX_ANCHOR.lock() = None;
-}
-
 /// Anchor the civil clock to `unix_secs` (UTC), pairing it with `mono_now` (a `mono_ticks()` reading
 /// captured at the same instant) and tagging it with `source`. The ONLY writer of `UNIX_ANCHOR`
-/// (the witness-gated [`witness_clear_anchor`] above removes, never writes).
+/// (CONSOLEFIX M1: a fixture never calls this — it plants a [`FixtureClock`]).
 /// Re-anchoring simply replaces the anchor — a fresh sync or operator correction wins.
 pub fn set_anchor(unix_secs: u64, mono_now: u64, source: ClockSource) {
     *UNIX_ANCHOR.lock() = Some(UnixAnchor { base_unix: unix_secs, anchor_ticks: mono_now, source });
@@ -543,4 +532,73 @@ pub fn stack_ms() -> i64 {
     };
     let prev = STACK_MS_LAST.fetch_max(raw, core::sync::atomic::Ordering::Relaxed);
     raw.max(prev)
+}
+
+// =============================================================================
+// CONSOLEFIX M1 (rmbp-ledger B365) — A FIXTURE NEVER SETS THE LIVE CLOCK.
+//
+// Flight 22: `tests sntp` planted its canned 2026-07-22T15:30:45Z on `UNIX_ANCHOR`; the RTC (R75) had
+// anchored the clock first, so the old cleanup ("never destroy an anchor the fixture did not plant")
+// left the CANNED value standing — the stamps jumped 05:13 -> 15:30 and the bar read "wed 22 jul". The
+// live anchor is written by a real SNTP reply, `setdate`/`date -s` and the RTC, nothing else. A fixture
+// plants an [`AnchorSink`] of its own: a [`FixtureClock`], the SAME `UnixAnchor` and the same
+// arithmetic, living on the fixture's stack. The live SNTP client plants [`LiveClock`], so both go
+// through the one path (`smolnet::sntp_apply`) and the fixture proves the code the live clock runs.
+// =============================================================================
+
+/// Where a parsed time is planted: the live clock or a fixture's.
+pub trait AnchorSink {
+    fn plant(&mut self, unix_secs: u64, mono_now: u64, source: ClockSource);
+}
+
+/// The live clock (`UNIX_ANCHOR`). Only a real reply, the operator and the RTC plant here.
+pub struct LiveClock;
+
+impl AnchorSink for LiveClock {
+    fn plant(&mut self, unix_secs: u64, mono_now: u64, source: ClockSource) {
+        set_anchor(unix_secs, mono_now, source);
+    }
+}
+
+/// A fixture's clock: the live clock's anchor and arithmetic, owned by the fixture, gone with it.
+pub struct FixtureClock {
+    a: Option<UnixAnchor>,
+}
+
+impl FixtureClock {
+    pub const fn new() -> Self {
+        FixtureClock { a: None }
+    }
+    /// The non-extrapolated pair, as [`raw_anchor`] reads the live one.
+    pub fn raw_anchor(&self) -> Option<(u64, ClockSource)> {
+        self.a.as_ref().map(|a| (a.base_unix, a.source))
+    }
+    /// [`unix_now`]'s arithmetic over this clock's anchor.
+    pub fn unix_now(&self) -> Option<u64> {
+        let a = self.a.as_ref()?;
+        let elapsed = match monotonic() {
+            Some((ticks, freq)) => ticks.wrapping_sub(a.anchor_ticks) / freq,
+            None => 0,
+        };
+        Some(a.base_unix.saturating_add(elapsed))
+    }
+    pub fn clear(&mut self) {
+        self.a = None;
+    }
+}
+
+impl AnchorSink for FixtureClock {
+    fn plant(&mut self, unix_secs: u64, mono_now: u64, source: ClockSource) {
+        self.a = Some(UnixAnchor { base_unix: unix_secs, anchor_ticks: mono_now, source });
+    }
+}
+
+/// The word the wire uses for a source (`unset`, `manual`, `sntp`, `rtc`).
+pub fn source_word(s: ClockSource) -> &'static str {
+    match s {
+        ClockSource::Unset => "unset",
+        ClockSource::Manual => "manual",
+        ClockSource::Sntp { .. } => "sntp",
+        ClockSource::Rtc => "rtc",
+    }
 }
