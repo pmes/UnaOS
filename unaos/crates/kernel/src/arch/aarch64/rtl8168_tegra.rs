@@ -5540,14 +5540,10 @@ mod metal {
 
     /// Monotonic millisecond clock from the free-running counter (CNTPCT). Readable at EL2, where
     /// `net4_bringup` runs (before the JC3 EL2→EL1 drop); drives both smoltcp time and the DHCP timeout.
+    /// ARMNET (B346): `clock::stack_ms`, the one stack clock (CNTPCT/CNTFRQ; it wrapped here after ~4 days).
     #[inline]
     fn now_ms() -> i64 {
-        let (cnt, frq): (u64, u64);
-        unsafe {
-            core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt, options(nomem, nostack, preserves_flags));
-            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
-        }
-        if frq == 0 { 0 } else { (cnt.wrapping_mul(1_000) / frq) as i64 }
+        crate::clock::stack_ms()
     }
 
     // ── Raw L2 accessors over the NET4_DEVICE registry (the shared smoltcp Device seam) ──
@@ -5713,9 +5709,23 @@ mod metal {
         tx: raw_tx,
         mac: net6_mac,
         link_up: link_up,
+        rx_ready: net6_rx_ready,
         // SUBSYSTEM-named, never board-named (R16): this string reaches shared witness lines.
         name: "rtl8168",
     };
+
+    /// ARMNET (B346): the poll gate's RX probe — the descriptor at `rx_cur` has OWN clear (the NIC handed it
+    /// back filled). A pure read: none of the armed-build scans `rx_frame_raw` runs on an empty ring.
+    #[cfg(feature = "net6")]
+    fn net6_rx_ready() -> bool {
+        match NET4_DEVICE.lock().as_ref() {
+            Some(n) => {
+                dma_rmb();
+                unsafe { read_volatile(n.rx_ring.add(n.rx_cur)) }.opts1 & DESC_OWN == 0
+            }
+            None => false,
+        }
+    }
 
     /// The station MAC for the NET6 adapter (`None` if bring-up never registered a NIC).
     #[cfg(feature = "net6")]

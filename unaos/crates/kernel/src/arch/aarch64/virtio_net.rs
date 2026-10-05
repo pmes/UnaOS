@@ -616,6 +616,7 @@ static NET6_OPS: crate::net_phy::net6::NicOps = crate::net_phy::net6::NicOps {
     tx: raw_tx,
     mac: net6_mac,
     link_up: net6_link_up,
+    rx_ready: net6_rx_ready,
     // SUBSYSTEM-named, never board-named (R16): this string reaches shared witness lines.
     name: "virtio-net",
 };
@@ -624,6 +625,16 @@ static NET6_OPS: crate::net_phy::net6::NicOps = crate::net_phy::net6::NicOps {
 #[cfg(feature = "net6")]
 fn net6_mac() -> Option<[u8; 6]> {
     VNET_DEVICE.lock().as_ref().map(|n| n.mac)
+}
+
+/// ARMNET (B346): the poll gate's RX probe — the RX used-ring index moved past what this driver consumed.
+/// A pure read (no recycle, no notify).
+#[cfg(feature = "net6")]
+fn net6_rx_ready() -> bool {
+    match VNET_DEVICE.lock().as_ref() {
+        Some(n) => n.rx.used_idx() != n.rx.last_used,
+        None => false,
+    }
 }
 
 /// Link state for the NET6 witness lines. virtio-net has no PHY to interrogate: the transport either
