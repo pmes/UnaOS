@@ -122,11 +122,12 @@ fn seek_lands_on_the_frame_and_ordinal() {
 /// the position), paused, with its own ordinal — not the next frame later. AETHERVIDEO.
 #[test]
 fn seek_inside_a_frame_shows_the_covering_frame() {
-    // 25 fps = 40 ms frames; 1.030 s is inside frame 25 [1.000, 1.040).
+    // 25 fps = 40 ms frames; 1.030 s is inside frame 25 [1.000, 1.040). (A target within the
+    // scheduler's early window — half a display period — of the next frame presents that one.)
     let file = build::mkv(&[build::test_pattern_track(1, 160, 120, 25, 100, 10)], &MkvOptions::default());
     let time = ManualTime::new();
     let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
-    for (target, frame) in [(1_030_000_000i64, 25u32), (1_000_000_000, 25), (39_000_000, 0), (3_999_000_000, 99), (9_000_000_000, 99)] {
+    for (target, frame) in [(1_030_000_000i64, 25u32), (1_000_000_000, 25), (25_000_000, 0), (3_999_000_000, 99), (9_000_000_000, 99)] {
         p.seek(target);
         let mut rec = Rec::default();
         for _ in 0..3 {
