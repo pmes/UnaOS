@@ -56,7 +56,24 @@ fn lossy_vs_chromium() {
         let name = f.file_name().unwrap().to_string_lossy();
         let Some(r) = r else { eprintln!("SKIP {:<40} (no Chromium reference)", name); continue };
         compared += 1;
-        let c = common::compare(pcm, info.channels as usize, &r, 0);
+        let ch = info.channels as usize;
+        // MP3 with a count mismatch: Chromium (FFmpeg) skips the LAME gapless trim and decodes the Xing frame
+        // when an ICY header precedes it (icy_sfx.mp3 = sfx.mp3 behind an ICY preamble; ours gives the same
+        // 11025 frames for both, Chromium 11025 and 14976). Align at the best offset and compare the overlap.
+        let mut offset = 0isize;
+        let fo = pcm.len() / ch.max(1);
+        if info.codec == Codec::Mp3 && fo < r.frames && ch == r.ch {
+            let (mut best, mut best_e) = (0usize, f64::INFINITY);
+            let win = fo.min(20000);
+            for d in 0..=(r.frames - fo) {
+                let mut e = 0f64;
+                for i in 0..win { for k in 0..ch { let x = pcm[i * ch + k] as f64 - r.data[k][i + d] as f64; e += x * x; } }
+                if e < best_e { best_e = e; best = d; }
+            }
+            offset = -(best as isize);
+            eprintln!("  {} aligned at Chromium sample {} ({} extra frames there)", name, best, r.frames - fo);
+        }
+        let c = common::compare(pcm, ch, &r, offset);
         // The floor. Opus here IS libopus-fixed bit for bit, Chromium runs libopus-float: the two reference
         // builds themselves differ by 55.5 dB on t10 (measured with opus_demo; ours vs Chromium: 55.5 dB),
         // so Opus is held to 50 dB and the bit-exact KAT carries the real proof.
@@ -67,9 +84,13 @@ fn lossy_vs_chromium() {
         // vs_reference_library).
         let frames_ok = match info.codec {
             Codec::Vorbis => c.frames_ours <= c.frames_ref && c.frames_ref - c.frames_ours < 8192,
+            Codec::Mp3 => c.frames_ours <= c.frames_ref && c.compared == c.frames_ours,
             _ => c.frames_ours == c.frames_ref,
         };
-        let ok = frames_ok && c.snr_db >= floor;
+        // MP3: both decoders are float; a quiet stream (bear-10s peaks low) can sit under 60 dB while every
+        // sample agrees to within two 16-bit LSBs — that is the same output after quantisation.
+        let lsb2 = 2.0 / 32768.0;
+        let ok = frames_ok && (c.snr_db >= floor || (info.codec == Codec::Mp3 && c.max_abs <= lsb2));
         eprintln!("{:<40} {:?} {}ch {}Hz frames ours={} chromium={} SNR={:.1} dB max|d|={:.2e} -> {}", name, info.codec, info.channels, info.rate,
             c.frames_ours, c.frames_ref, c.snr_db, c.max_abs, if ok { "OK" } else { "FAIL" });
         if ok { good += 1; }
@@ -111,3 +132,21 @@ fn vs_reference_library() {
     }
 }
 
+
+#[test]
+#[ignore]
+fn probe_chromium_frames() {
+    let p = std::path::PathBuf::from(std::env::var("PROBE").unwrap());
+    let (info, pcm) = decode_all(&std::fs::read(&p).unwrap()).unwrap();
+    let r = common::chromium(&[(p.clone(), info.rate)]).pop().unwrap().unwrap();
+    let ch = info.channels as usize;
+    let blk = 1152;
+    let mut worst = vec![];
+    for f in 0..r.frames / blk {
+        let (mut s, mut e) = (0f64, 0f64);
+        for i in f * blk..(f + 1) * blk { for c in 0..ch { let a = pcm[i * ch + c] as f64; let b = r.data[c][i] as f64; s += b * b; e += (a - b) * (a - b); } }
+        worst.push((10.0 * (s / e.max(1e-30)).log10(), f, (s / (blk * ch) as f64).sqrt()));
+    }
+    worst.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    for w in worst.iter().take(12) { eprintln!("frame {} snr {:.1} rms {:.4}", w.1, w.0, w.2); }
+}

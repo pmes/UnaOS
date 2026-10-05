@@ -189,3 +189,48 @@ Ceiling: floor 0 is implemented from §6 but no available encoder produces it (l
 since 2001), so it is untested. Start trimming follows the spec (all the extra samples are discarded);
 libvorbis only discards what lies in the last packet of the first page — a deliberate divergence on cut
 streams. Speed: 37x (6 ch) – 99x (stereo) realtime on this host; not yet optimised.
+
+## M4a — MP3 (ISO/IEC 11172-3 and 13818-3 Layer III)
+
+`src/mp3/` — a float Layer III decoder written against the ISO text, laid out like FFmpeg's
+`mpegaudiodec_template.c` (Huffman lengths/symbols and the synthesis window `ff_mpa_enwindow` are the
+only tables taken from there, as data; codes are assigned from the lengths). MPEG-1, MPEG-2 LSF and
+MPEG-2.5; free format; CRC skipped; the bit reservoir (main_data_begin across frames).
+
+* Stream layer (`Mp3Stream`): ID3v2 skip (with footer), strict resync — a header found while out of sync
+  counts only when the next header, a trailing tag (ID3v1 `TAG`, `APETAGEX`) or EOF confirms it;
+  Xing/Info frame skipped, its LAME/Lavf tag gives gapless trimming (skip = delay + 529, total =
+  frames·spf − delay − max(pad, 529)); channel look-ahead (ISO lets the mode change per frame: stereo if
+  any of the first frames is, mono frames duplicated). Unknown-format input (ICY preambles, junk) falls
+  back to the MP3 sync scan.
+* Rules that were not where one would first look, each found by a failing ISO vector:
+  - mixed blocks: the two lowest subbands are long-window (window 0) whatever the block type;
+  - LSF intensity stereo: the illegal position is 2^slen − 1 per band (FFmpeg's fixed 16 is wrong for
+    small slen), bands with slen 0 are legal at position 0;
+  - the top scalefactor band (21 long / 12 short) takes band 20/11's intensity position when that band is
+    intensity-coded, else the default (MPEG-1: 3 — no IS; LSF: 0), as ISO and minimp3 do;
+  - MS-only frames scale the global gain by 2^−½ (gain − 2);
+  - reservoir underflow at stream start: granules whose data lies before what we hold are zeroed (the
+    overlap still runs) and decoding resumes at the first whole granule — FFmpeg's rule, and the one that
+    took `bear-audio-10s` from 33.1 dB to sample agreement with Chromium;
+  - invalid side info (big_values > 288, part2_3 past the frame) drops that granule, never panics.
+
+**Vectors.** The ISO/IEC 11172-4 / 13818-4 Layer III conformance streams (22 bit/pcm pairs: l3-compl,
+hecommon, he_32/44/48 kHz, he_free, he_mode, si/si_block/si_huff, sin1k0db, M2L3 bitrate/compl24/noise,
+the id3v1/apetag variants), fetched from minimp3's mirror by sha256 (`vectors.txt`, kind `mp3iso`), and
+Chromium's `sfx.mp3`, `bear-audio-10s-CBR-has-TOC.mp3`, `id3_png_test.mp3`, `icy_sfx.mp3`,
+`midstream_config_change.mp3`.
+
+**Results.** `tests/mp3_iso.rs`: **22/22 streams within 1 LSB of the ISO reference PCM** (RMS ≤ 0.12 LSB;
+the reference files omit each stream's last frame, so ours may be one frame longer). Against Chromium
+(`lossy_vs_chromium`): `sfx.mp3` 90.1 dB with equal frames; `id3_png_test` bit-identical; `bear-10s` equal
+frames, max |d| 3.4e-5 (≈1.1 LSB at 16 bit) — 56.5 dB SNR only because the clip is quiet (rms −41.7 dBFS),
+so MP3 passes on SNR ≥ 60 dB **or** every sample within 2 LSB; `icy_sfx` is `sfx.mp3` behind an ICY
+preamble — ours gives the same 11,025 frames for both, Chromium gives 14,976 there because it then decodes
+the Xing frame and skips the LAME trim; aligned at Chromium sample 2257 (= 1152 + 576 + 529, exactly the
+Xing frame plus the gapless skip) it is 90.1 dB. `midstream_config_change` (37 mono frames, then a joint-stereo
+one) is refused by Chromium; ours hands it out as stereo (mono duplicated) and its per-frame peaks match
+minimp3's, including the stream's own +9 dBFS overs in frames 16–17. Owed: a sample-rate change
+mid-stream is handed out at the first rate (no rate-change event in the trait yet).
+Robustness: 324 damaged streams (bit flips, truncation, garbage runs) over 27 files, no panic.
+Speed: 64x realtime on stereo 44.1 kHz, unoptimised (float IMDCT/polyphase straight from the definitions).

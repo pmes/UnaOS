@@ -118,3 +118,35 @@ fn vorbis_mutations_never_panic() {
     }
     eprintln!("{} mutated Vorbis setup headers, {} mutated audio packets: no panic", nsetup, npk);
 }
+
+#[test]
+fn mp3_mutations_never_panic() {
+    // Whole-stream damage on the ISO/Chromium MP3 vectors (fetched; skipped offline): bit flips across
+    // headers, side info and main data, random truncation, garbage runs. decode_all must return, never panic.
+    let mut seed = 0x1357_9bdfu32;
+    let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; seed };
+    let mut files = vec![];
+    for kind in ["mp3iso", "lossy"] {
+        for v in common::vectors(kind) {
+            let n = v.path.to_string_lossy().to_string();
+            if (n.ends_with(".bit") || n.ends_with(".mp3")) && common::fetch(&v).is_some() { files.push(v.path.clone()); }
+        }
+    }
+    let mut runs = 0;
+    for f in &files {
+        let orig = std::fs::read(f).unwrap();
+        for k in 0..12 {
+            let mut b = orig.clone();
+            match k % 4 {
+                0 => { for _ in 0..1 + rnd() % 64 { let i = rnd() as usize % (b.len() * 8); b[i / 8] ^= 1 << (i % 8); } }
+                1 => { let c = rnd() as usize % b.len(); b.truncate(c); }
+                2 => { let s = rnd() as usize % b.len(); let e = (s + 1 + rnd() as usize % 4096).min(b.len()); for x in &mut b[s..e] { *x = rnd() as u8; } }
+                _ => { for _ in 0..1 + rnd() % 256 { let i = rnd() as usize % b.len(); b[i] = rnd() as u8; } }
+            }
+            let r = std::panic::catch_unwind(|| { let _ = audio_core::decode_all(&b); });
+            assert!(r.is_ok(), "{}: mutation {} panicked", f.display(), k);
+            runs += 1;
+        }
+    }
+    eprintln!("mp3 mutations: {} damaged streams over {} files, no panic", runs, files.len());
+}
