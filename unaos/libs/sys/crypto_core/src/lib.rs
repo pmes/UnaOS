@@ -17,6 +17,8 @@
 //! | [`sha2`] | SHA-224/256/384/512 | FIPS 180-4 |
 //! | [`hmac`] | HMAC over any [`Digest`] | RFC 2104 / FIPS 198-1 |
 //! | [`hkdf`] | HKDF extract/expand | RFC 5869 |
+//! | [`tls12_prf`] | the TLS 1.2 PRF (P_SHA256 / P_SHA384) | RFC 5246 §5 |
+//! | [`sha1`] | SHA-1 — OCSP CertID matching only, never a signature | FIPS 180-4 §6.1 |
 //! | [`pbkdf2`] | PBKDF2-HMAC | RFC 8018 §5.2 |
 //! | [`chacha20`], [`poly1305`], [`chacha20poly1305`] | ChaCha20, Poly1305, the AEAD | RFC 8439 |
 //! | [`aes`], [`gcm`] | AES-128/256 (bitsliced), GCM/GMAC | FIPS 197, SP 800-38D |
@@ -52,6 +54,8 @@ pub mod ct;
 pub mod sha2;
 pub mod hmac;
 pub mod hkdf;
+pub mod tls12_prf;
+pub mod sha1;
 pub mod pbkdf2;
 pub mod chacha20;
 pub mod poly1305;

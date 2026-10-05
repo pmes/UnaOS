@@ -97,6 +97,8 @@ pub fn describe(e: &TlsError) -> &'static str {
             CertError::NotCa => "cert-not-ca",
             CertError::PathLenExceeded => "cert-path-len",
             CertError::KeyUsage => "cert-key-usage",
+            CertError::Revoked => "cert-revoked",
+            CertError::BadOcspResponse(_) => "cert-ocsp-response-bad",
             CertError::NameConstraint => "cert-name-constraint",
             CertError::UnknownCriticalExtension => "cert-unknown-critical-extension",
             CertError::NameMismatch => "cert-name-mismatch",
@@ -151,6 +153,13 @@ impl ServerCertVerifier for IssuerVerifier<'_> {
         let cn = chain.first().and_then(|d| Certificate::parse(d).ok()).and_then(|c| c.issuer_cn());
         self.issuer.set(Some(Verified::new(cn.as_deref().unwrap_or("?"))));
         Ok(key)
+    }
+    /// TLSCORE2: the stapled OCSP response and SCTs go through the Web PKI verifier too.
+    fn verify_server_cert_full(&self, p: &dyn CryptoProvider, peer: &tls_core::x509::PeerCertificates<'_>, name: Option<&str>) -> Result<tls_core::x509::CertVerdict, TlsError> {
+        let v = self.web.verify_server_cert_full(p, peer, name)?;
+        let cn = peer.chain.first().and_then(|d| Certificate::parse(d).ok()).and_then(|c| c.issuer_cn());
+        self.issuer.set(Some(Verified::new(cn.as_deref().unwrap_or("?"))));
+        Ok(v)
     }
 }
 
@@ -209,6 +218,7 @@ pub fn with_session<T: Transport + ?Sized, R>(t: &mut T, host: &str, ctx: &TlsCo
     }
     let verifier = IssuerVerifier { web: WebPkiVerifier { store: ctx.store, clock: ctx.clock }, issuer: Cell::new(None) };
     let mut cfg = ClientConfig::new(Some(host), &verifier);
+    cfg.enable_tls12(); // TLSCORE2 (SR58): a TLS-1.2-only relay is reachable; 1.3 stays preferred (downgrade-sentinel guarded)
     cfg.alpn = alloc::vec![b"http/1.1".to_vec()];
     let sock = Cell::new(0i64);
     let c = Client::connect(ctx.provider, &cfg, Io { t, err: &sock }).map_err(|e| fail_of(&e, sock.get()))?;

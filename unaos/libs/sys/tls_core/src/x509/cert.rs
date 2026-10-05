@@ -70,6 +70,13 @@ pub struct Certificate {
     pub unknown_critical: bool,
     /// Subject commonName (diagnostics only).
     pub subject_cn: Option<String>,
+    /// The subjectPublicKey BIT STRING contents (what an OCSP CertID's issuerKeyHash hashes, RFC 6960 §4.1.1).
+    pub key_bits: Vec<u8>,
+    /// authorityInfoAccess (RFC 5280 §4.2.2.1): caIssuers and OCSP URIs — reported, never fetched here.
+    pub aia_ca_issuers: Vec<String>,
+    pub aia_ocsp: Vec<String>,
+    /// The embedded SignedCertificateTimestampList (RFC 6962 §3.3, extension 1.3.6.1.4.1.11129.2.4.2).
+    pub sct_list: Option<Vec<u8>>,
 }
 
 impl Certificate {
@@ -137,6 +144,7 @@ impl Certificate {
         let subject_cn = common_name(subject_tlv.value);
         let spki = tbs.expect(tag::SEQUENCE)?;
         let public_key = parse_spki(spki.value)?;
+        let key_bits = spki_key_bits(spki.value)?.to_vec();
         // issuerUniqueID [1], subjectUniqueID [2]: skipped.
         tbs.optional(tag::context_primitive(1))?;
         tbs.optional(tag::context_primitive(2))?;
@@ -162,6 +170,10 @@ impl Certificate {
             subject_key_id: None,
             unknown_critical: false,
             subject_cn,
+            key_bits,
+            aia_ca_issuers: Vec::new(),
+            aia_ocsp: Vec::new(),
+            sct_list: None,
         };
         if let Some(exts) = tbs.optional(tag::context_constructed(3))? {
             if version != 3 {
@@ -189,6 +201,42 @@ impl Certificate {
     }
 
     fn parse_extension(&mut self, id: &[u8], critical: bool, value: &[u8]) -> Result<(), CertError> {
+        if id == oid::PE_AUTHORITY_INFO_ACCESS {
+            // AuthorityInfoAccessSyntax ::= SEQUENCE OF AccessDescription { accessMethod OID, accessLocation GeneralName }
+            let mut d = Der::new(value);
+            let mut s = d.sequence()?;
+            d.expect_end()?;
+            while !s.is_empty() {
+                let mut ad = s.sequence()?;
+                let method = ad.oid()?;
+                let loc = ad.tlv()?;
+                ad.expect_end()?;
+                if loc.tag == 0x86 {
+                    let uri = ascii(loc.value)?;
+                    if method == oid::AD_CA_ISSUERS {
+                        self.aia_ca_issuers.push(uri);
+                    } else if method == oid::AD_OCSP {
+                        self.aia_ocsp.push(uri);
+                    }
+                }
+            }
+            if critical {
+                // RFC 5280 §4.2.2.1: MUST be non-critical.
+                return Err(bad("critical authorityInfoAccess"));
+            }
+            return Ok(());
+        }
+        if id == oid::CT_PRECERT_SCTS {
+            // RFC 6962 §3.3: extnValue OCTET STRING wraps an OCTET STRING holding the TLS-encoded list.
+            let mut d = Der::new(value);
+            let list = d.expect(tag::OCTET_STRING)?.value;
+            d.expect_end()?;
+            self.sct_list = Some(list.to_vec());
+            if critical {
+                self.unknown_critical = true;
+            }
+            return Ok(());
+        }
         if id.len() != 3 || &id[..2] != oid::ID_CE {
             if critical {
                 self.unknown_critical = true;
@@ -245,7 +293,17 @@ impl Certificate {
                             }
                             self.san.ip.push(gn.value.to_vec())
                         }
-                        _ => {}
+                        0x81 => self.san.email.push(ascii(gn.value)?),
+                        0x86 => self.san.uri.push(ascii(gn.value)?),
+                        // directoryName [4] EXPLICIT Name: keep the Name's full encoding.
+                        0xa4 => {
+                            let mut n = Der::new(gn.value);
+                            let name = n.expect(tag::SEQUENCE)?;
+                            n.expect_end()?;
+                            self.san.dir.push(name.raw.to_vec());
+                        }
+                        // otherName [0], x400Address [3], ediPartyName [5], registeredID [8]: present, not parsed.
+                        t => self.san.other_types |= super::name::general_name_bit(t & 0x1f),
                     }
                 }
             }
@@ -295,6 +353,7 @@ fn ascii(v: &[u8]) -> Result<String, CertError> {
 }
 
 fn parse_subtrees(v: &[u8], nc: &mut NameConstraints, permitted: bool) -> Result<(), CertError> {
+    use super::name::Subtree;
     let mut d = Der::new(v);
     while !d.is_empty() {
         let mut st = d.sequence()?;
@@ -330,7 +389,20 @@ fn parse_subtrees(v: &[u8], nc: &mut NameConstraints, permitted: bool) -> Result
                     nc.excluded_ip.push(base.value.to_vec());
                 }
             }
-            _ => nc.unenforced += 1,
+            0x81 => nc.push(Subtree::Email(ascii(base.value)?), permitted),
+            0x86 => nc.push(Subtree::Uri(ascii(base.value)?), permitted),
+            0xa4 => {
+                let mut n = Der::new(base.value);
+                let name = n.expect(tag::SEQUENCE)?;
+                n.expect_end()?;
+                nc.push(Subtree::Dir(name.raw.to_vec()), permitted);
+            }
+            t => {
+                // otherName / x400Address / ediPartyName / registeredID: we cannot evaluate these, so a certificate
+                // below that CARRIES such a name is refused (RFC 5280 §6.1.3 (b)/(c) cannot be applied).
+                nc.unenforced += 1;
+                nc.unenforced_types |= super::name::general_name_bit(t & 0x1f);
+            }
         }
     }
     Ok(())
@@ -416,6 +488,15 @@ fn parse_pss_params(v: &[u8]) -> Result<SignatureAlgorithm, CertError> {
         (Some(h), Some(m)) if h == m => Ok(SignatureAlgorithm::RsaPss { hash: h, salt_len }),
         _ => Ok(SignatureAlgorithm::Unsupported),
     }
+}
+
+/// SubjectPublicKeyInfo contents → the subjectPublicKey BIT STRING's bytes.
+pub fn spki_key_bits(v: &[u8]) -> Result<&[u8], CertError> {
+    let mut d = Der::new(v);
+    d.sequence()?;
+    let key = d.bit_string_bytes()?;
+    d.expect_end()?;
+    Ok(key)
 }
 
 /// SubjectPublicKeyInfo contents → PublicKey.

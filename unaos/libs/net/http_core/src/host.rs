@@ -1,5 +1,5 @@
 //! The host transport (feature `host`, std): HTTP/1.1 over a std `TcpStream`, plain for `http://` and under
-//! UnaOS's own TLS 1.3 (`tls_core`, crypto from CRYPTOCORE) for `https://`, every certificate verified against
+//! UnaOS's own TLS 1.3 / 1.2 (`tls_core`, crypto from CRYPTOCORE) for `https://`, every certificate verified against
 //! a PEM trust store at the system clock and the host name matched (RFC 6125) — the same verifier VEINTLS runs
 //! on the metal. ALPN offers `http/1.1`. HTTP CONNECT proxies (`HTTPS_PROXY`/`HTTP_PROXY`, `NO_PROXY`) are
 //! honoured as every other client on the machine honours them.
@@ -46,6 +46,108 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn now(&self) -> i64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    }
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------- TLS 1.3 tickets (TLSCORE2)
+
+/// TLS 1.3 session tickets (tls_core's `TicketStore` seam, TLSCORE2 / SR58) shared by every connection thread of
+/// an [`Agent`] — and by every Agent holding the same `Arc` — so a NEW connection to a host this process (or, with
+/// [`SharedTicketStore::file`], an earlier process) already talked to resumes with PSK + (EC)DHE instead of a full
+/// handshake. Each ticket is used once; at most 4 are kept per host. The file holds resumption PSKs: it is written
+/// 0600, atomically (temp + rename).
+pub struct SharedTicketStore {
+    inner: Mutex<Vec<tls_core::resumption::Ticket>>,
+    path: Option<std::path::PathBuf>,
+}
+
+const TICKET_FILE_MAGIC: &[u8; 4] = b"UTKS";
+const TICKETS_PER_HOST: usize = 4;
+
+impl SharedTicketStore {
+    /// In memory only (the [`AgentConfig`] default).
+    pub fn memory() -> Self {
+        SharedTicketStore { inner: Mutex::new(Vec::new()), path: None }
+    }
+
+    /// Backed by `path`: loaded now (a missing or malformed file is an empty store), rewritten on every change.
+    pub fn file(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        let mut v = Vec::new();
+        if let Ok(b) = std::fs::read(&path) {
+            if b.len() >= 4 && &b[..4] == TICKET_FILE_MAGIC {
+                let mut at = 4;
+                while at + 4 <= b.len() {
+                    let n = u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize;
+                    at += 4;
+                    let Some(rec) = b.get(at..at + n) else { break };
+                    if let Some(t) = tls_core::resumption::Ticket::from_bytes(rec) {
+                        v.push(t);
+                    }
+                    at += n;
+                }
+            }
+        }
+        SharedTicketStore { inner: Mutex::new(v), path: Some(path) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|v| v.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn save(&self, v: &[tls_core::resumption::Ticket]) {
+        let Some(path) = &self.path else { return };
+        let now = SystemClock.now_ms();
+        let mut out = TICKET_FILE_MAGIC.to_vec();
+        for t in v.iter().filter(|t| t.usable_at(now)) {
+            let b = t.to_bytes();
+            out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+            out.extend_from_slice(&b);
+        }
+        let tmp = path.with_extension("tmp");
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        if let Ok(mut f) = opts.open(&tmp) {
+            if f.write_all(&out).is_ok() && f.sync_all().is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+}
+
+impl tls_core::resumption::TicketStore for SharedTicketStore {
+    fn put(&self, ticket: tls_core::resumption::Ticket) {
+        let Ok(mut v) = self.inner.lock() else { return };
+        let host = ticket.server_name.clone();
+        v.insert(0, ticket);
+        let mut seen = 0;
+        v.retain(|t| {
+            if t.server_name != host {
+                return true;
+            }
+            seen += 1;
+            seen <= TICKETS_PER_HOST
+        });
+        self.save(&v);
+    }
+    fn take(&self, server_name: &str) -> Option<tls_core::resumption::Ticket> {
+        let mut v = self.inner.lock().ok()?;
+        let i = v.iter().position(|t| t.server_name == server_name)?;
+        let t = v.remove(i);
+        self.save(&v);
+        Some(t)
     }
 }
 
@@ -345,6 +447,9 @@ pub struct AgentConfig {
     pub alpn: Vec<Vec<u8>>,
     /// Name → address overrides consulted before DNS (curl's `--resolve`): tests, split-horizon setups.
     pub resolve: Vec<(String, SocketAddr)>,
+    /// TLS 1.3 resumption tickets (TLSCORE2). Default: an in-memory store per Agent; `None` turns resumption off;
+    /// [`SharedTicketStore::file`] persists them across processes.
+    pub tickets: Option<Arc<SharedTicketStore>>,
 }
 
 impl Default for AgentConfig {
@@ -361,6 +466,7 @@ impl Default for AgentConfig {
             cookies: None,
             alpn: vec![b"http/1.1".to_vec()],
             resolve: Vec::new(),
+            tickets: Some(Arc::new(SharedTicketStore::memory())),
         }
     }
 }
@@ -669,7 +775,12 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job) {
         let verifier = WebPkiVerifier { store: &store, clock: &SystemClock };
         let name = key.host.trim_start_matches('[').trim_end_matches(']').to_string();
         let mut tcfg = ClientConfig::new(Some(&name), &verifier);
+        tcfg.enable_tls12(); // TLSCORE2 (SR58): TLS 1.3 preferred, 1.2 (ECDHE + AEAD, EMS) for the long tail
         tcfg.alpn = cfg.alpn.clone();
+        tcfg.resumption = cfg
+            .tickets
+            .as_ref()
+            .map(|t| tls_core::resumption::Resumption { store: &**t, clock: &SystemClock });
         let client = match TlsClient::connect(&provider, &tcfg, t) {
             Ok(c) => c,
             Err(e) => {
