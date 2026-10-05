@@ -2873,7 +2873,7 @@ pub fn service() {
     #[cfg(feature = "facet")]
     crate::video::facet::service();
     // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
-    crate::video::fileview::service(); crate::video::settings::service();
+    crate::video::fileview::service(); crate::video::settings::service(); crate::video::text::service();
     // TEXTEDIT — the editor's latch drains on the same pass.
     crate::video::textedit::service();
     // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.

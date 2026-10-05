@@ -3830,6 +3830,9 @@ crypto_core = { path = "../../libs/sys/crypto_core" }
 # inflater + the SHOTZIP PNG encoder, moved here from `selfhost/inflate.rs` and `video/png.rs` (both now
 # re-exports). no_std + alloc, zero deps; arch-neutral; the same crate Aether (via gneiss_pal) links.
 pixel_core = { path = "../../libs/media/pixel_core" }
+# KERNELFONT (B359): the text core (OpenType, shaping, rasterizer) and its desktop engine `font_core::ui`, behind
+# `video::text`. no_std + alloc, zero deps; only the desktop images reference it, so no other image links it.
+font_core = { path = "../../libs/text/font_core" }
 net = { path = "../net" }
 fdt = "0.1.5"
 # RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so

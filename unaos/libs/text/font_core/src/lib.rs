@@ -45,6 +45,7 @@ pub mod raster;
 mod reader;
 pub mod script;
 pub mod shape;
+pub mod ui;
 pub mod ucd;
 
 pub use cache::GlyphCache;
