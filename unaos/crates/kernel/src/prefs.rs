@@ -490,10 +490,10 @@ fn mirror_attr(ns: &str, k: &str, v: &PrefValue) {
     let _ = (ns, k, v);
 }
 
-/// Split `ns.key` (the verb's and the bus's address form) and validate both halves.
+/// Split `ns.key` (the verb's and the bus's address form) and validate both halves — the shared
+/// `prefs_core::wire::split_addr` (PREFSKERNEL, B345).
 pub fn split_addr(a: &str) -> Option<(&str, &str)> {
-    let (ns, k) = a.split_once('.')?;
-    (prefs_core::validate_ns(ns).is_ok() && prefs_core::validate_key(k).is_ok()).then_some((ns, k))
+    prefs_core::wire::split_addr(a)
 }
 
 // ── The `pref` verb ──────────────────────────────────────────────────────────────────────────
@@ -544,84 +544,72 @@ pub fn verb(args: &[&str], out: &mut dyn FnMut(&str)) {
 
 // ── Bus (M3): PREF_GET / PREF_SET / PREF_LIST ─────────────────────────────────────────────────
 
-const ENOENT: i64 = -2;
-const E2BIG: i64 = -7;
-const EIO: i64 = -5;
-const EACCES: i64 = -13;
-const EINVAL: i64 = -22;
+// PREFSKERNEL (B345): the bodies, the statuses and the fulfiller are `prefs_core::wire`'s — ONE
+// implementation for both rings (Principia on the host answers through the same `fulfil`). What stays
+// here is the kernel's `Store`: the tree behind `set_applied` (= `wire::persisted_set` + the swap).
 
-/// PREF_GET body: `<ns>.<key>` (ASCII). PREF_LIST body: `<ns>` or empty (every namespace). PREF_SET body:
-/// `<ns>.<key>` NUL `<TOML scalar literal>`. Pure; `None` = BadBody (-EINVAL).
+/// PREF_GET body: `<ns>.<key>`. Pure; `None` = BadBody (-EINVAL). (`prefs_core::wire::parse_get`.)
 pub fn get_body_parse(body: &[u8]) -> Option<(&str, &str)> {
-    split_addr(core::str::from_utf8(body).ok()?)
+    prefs_core::wire::parse_get(body)
 }
+/// PREF_SET body: `<ns>.<key>` NUL `<TOML scalar literal>`. (`prefs_core::wire::parse_set`.)
 pub fn set_body_parse(body: &[u8]) -> Option<(&str, &str, PrefValue)> {
-    let z = body.iter().position(|&b| b == 0)?;
-    let (ns, k) = get_body_parse(&body[..z])?;
-    let lit = core::str::from_utf8(&body[z + 1..]).ok()?;
-    Some((ns, k, PrefValue::from_literal(lit).ok()?))
+    prefs_core::wire::parse_set(body)
 }
+/// PREF_LIST body: `<ns>` or empty (every namespace). (`prefs_core::wire::parse_list`.)
 pub fn list_body_parse(body: &[u8]) -> Option<Option<&str>> {
-    if body.is_empty() {
-        return Some(None);
-    }
-    let ns = core::str::from_utf8(body).ok()?;
-    prefs_core::validate_ns(ns).is_ok().then_some(Some(ns))
+    prefs_core::wire::parse_list(body)
 }
+
+/// The kernel's store as the shared wire sees it: reads are the tree, a write is [`set_applied`].
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+struct KernelStore;
+
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+impl prefs_core::wire::Store for KernelStore {
+    fn get(&self, ns: &str, k: &str) -> Option<PrefValue> {
+        get(ns, k)
+    }
+    fn set(&mut self, ns: &str, k: &str, v: PrefValue) -> Result<prefs_core::schema::Applied, prefs_core::wire::SetFail> {
+        set_applied(ns, k, v).map_err(|e| match e {
+            SetError::Refused(r) => prefs_core::wire::SetFail::Refused(r),
+            SetError::Name(n) => prefs_core::wire::SetFail::Name(n),
+            SetError::Io(_) => prefs_core::wire::SetFail::Io,
+        })
+    }
+    fn list(&self, ns: &str) -> Vec<(String, PrefValue)> {
+        list(ns)
+    }
+    fn namespaces(&self) -> Vec<String> {
+        namespaces()
+    }
+}
+
+// The shared wire's numbers are the kernel bus's (prefs_core's dev-test pins them to una-abi too).
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+const _: () = assert!(
+    prefs_core::wire::BODY_MAX == crate::bus::BUS_BODY_MAX
+        && prefs_core::wire::VERB_GET == una_abi::BUS_VERB_PREF_GET
+        && prefs_core::wire::VERB_SET == una_abi::BUS_VERB_PREF_SET
+        && prefs_core::wire::VERB_LIST == una_abi::BUS_VERB_PREF_LIST
+        && prefs_core::wire::VERB_CHANGED == una_abi::BUS_VERB_PREF_CHANGED
+);
 
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold)
-/// Fulfil one PREF verb. `in_session`: the caller runs in the open session (the transport decides, from
-/// the stamped principal). Reply body into `text`; returns the status (0 or a negative errno).
-/// GET: the value as a TOML literal, -ENOENT unset. SET: empty, -EACCES outside the session, -EIO when the
-/// save failed or is held. LIST: `<ns>.<key> = <literal>` lines, -E2BIG past the 4 KiB body ceiling.
+/// Fulfil one PREF verb — PREFSKERNEL (B345): a thin call into `prefs_core::wire::fulfil` over the kernel
+/// store, the function Principia answers with on the host. `in_session`: the caller runs in the open
+/// session (the transport decides, from the stamped principal). Reply body into `text`; returns the status.
+/// GET: the literal, -ENOENT unset. SET: empty, or `<stored>` NUL `clamped=true` when the schema clamped;
+/// -EACCES outside the session; -EINVAL malformed or refused by the schema; -EIO collision / save failed
+/// or held. LIST: `<ns>.<key> = <literal>` lines, -E2BIG past the 4 KiB body ceiling.
 pub fn bus_fulfil(verb: u8, body: &[u8], in_session: bool, text: &mut Vec<u8>) -> i64 {
     ensure_loaded();
-    match verb {
-        una_abi::BUS_VERB_PREF_GET => match get_body_parse(body) {
-            Some((ns, k)) => match get(ns, k) {
-                Some(v) => {
-                    text.extend_from_slice(v.to_literal().as_bytes());
-                    0
-                }
-                None => ENOENT,
-            },
-            None => EINVAL,
-        },
-        una_abi::BUS_VERB_PREF_SET => match set_body_parse(body) {
-            Some((ns, k, v)) => {
-                if !in_session {
-                    serial_println!("[prefs] set {}.{} refused: caller is not the session user", ns, k);
-                    EACCES
-                } else if set(ns, k, v).is_ok() {
-                    0
-                } else {
-                    EIO
-                }
-            }
-            None => EINVAL,
-        },
-        una_abi::BUS_VERB_PREF_LIST => match list_body_parse(body) {
-            Some(which) => {
-                let nss = match which {
-                    Some(ns) => alloc::vec![String::from(ns)],
-                    None => namespaces(),
-                };
-                for ns in nss {
-                    for (k, v) in list(&ns) {
-                        text.extend_from_slice(alloc::format!("{}.{} = {}\n", ns, k, v).as_bytes());
-                    }
-                }
-                if text.len() > crate::bus::BUS_BODY_MAX {
-                    text.clear();
-                    E2BIG
-                } else {
-                    0
-                }
-            }
-            None => EINVAL,
-        },
-        _ => EINVAL,
+    if verb == prefs_core::wire::VERB_SET && !in_session {
+        if let Some((ns, k, _)) = prefs_core::wire::parse_set(body) {
+            serial_println!("[prefs] set {}.{} refused: caller is not the session user", ns, k);
+        }
     }
+    prefs_core::wire::fulfil(&mut KernelStore, verb, body, in_session, text)
 }
 
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold)
