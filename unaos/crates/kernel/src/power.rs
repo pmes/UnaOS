@@ -56,8 +56,6 @@
 /// platform resets, or the failure witness prints and the core parks in `hlt_loop`.
 pub fn reboot() -> ! {
     crate::bootlog_println!("[pwrreboot] reboot verb invoked — dispatching the platform mechanism");
-    prelude("reboot"); // POWERMENU M1
-    serial_println!("[pwrreboot] reboot verb invoked — dispatching the platform mechanism");
     prelude("reboot"); #[cfg(feature = "selfdiag")] crate::bootwit::flush("reboot"); // POWERMENU M1. SELFDIAG M1 (B324): the boot log reaches the disk before the reset
     crate::fs::fat::flush_pending_dirent_by("shutdown"); // SDHCMULTI2 M2: a deferred dir entry must not die with the power
     platform_reboot()
