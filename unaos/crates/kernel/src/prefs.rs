@@ -444,7 +444,7 @@ pub fn set_sys(k: &str, v: PrefValue) {
 /// (the PREF_SET request body, unsolicited). Also the ATTRSURF hook: the key is mirrored as an attribute
 /// on the preferences file once the VFS can set one ([`mirror_attr`]).
 fn changed(ns: &str, k: &str, v: &PrefValue) {
-    serial_println!("[prefs] changed {}.{}", ns, k);
+    serial_println!("[prefs] changed {}.{}", ns, k); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] crate::prefs_client::on_changed(ns, k, v); // SETTINGSBUS (B337): the verb-19 frame to the kernel's subscribers
     mirror_attr(ns, k, v);
 }
 

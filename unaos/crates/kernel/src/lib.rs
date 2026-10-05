@@ -274,3 +274,6 @@ pub mod lumen;
 pub mod execname;
 // PROFILE (rmbp-ledger B331): the sampling profiler (`prof` verb, `tests prof`). Runtime-armed, off by default; tail statement, so no existing line moves.
 pub mod prof;
+// SETTINGSBUS (rmbp-ledger B337): the kernel's preference CLIENT — the desktop speaks Principia's bus verbs (relayed to PREFS.ELF when it owns them, else the kernel fulfiller), PrefChanged to the window. The bus cfg. Tail statement, so no existing line moves.
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+pub mod prefs_client;
