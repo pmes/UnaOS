@@ -141,7 +141,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println(&format!("{} deferred, {} ran at boot", deferred_count(), AT_BOOT.load(Ordering::Relaxed)));
         return;
     }
-    let name = args.first().copied();
+    let name = args.first().copied(); *ARG.lock() = args.get(1).map(|a| alloc::string::String::from(*a)); // AUDIOCODEC (SR30): `tests play <fmt>` reads its <fmt> via `arg()`
     let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
     let ran = run(name);
     let (p, f) = (PASS.load(Ordering::Relaxed).wrapping_sub(p0), FAIL.load(Ordering::Relaxed).wrapping_sub(f0));
@@ -320,6 +320,7 @@ fn ensure_usbnet() {
     }
 }
 
+<<<<<<< HEAD
 /// WIFI1 (B338): register `tests wifi` — the BCM4331 bring-up verdict (`ucode=<ok|refused>
 /// d11=<up|down> scan=<n>`) exactly once on a `wifi` build; no radio / no firmware prints SKIP.
 fn ensure_wifi() {
@@ -451,3 +452,9 @@ fn console_verdicts(console: &mut Console) {
         console.println_styled(c, &format!("{} -> {}", n, tail));
     }
 }
+=======
+/// AUDIOCODEC (SR30): the word after the fixture name in `tests <name> <arg>` (e.g. `tests play flac`), for fixtures
+/// that take one; `None` from a bare `tests <name>`, from `tests` (all) and at boot.
+static ARG: spin::Mutex<Option<alloc::string::String>> = spin::Mutex::new(None);
+pub fn arg() -> Option<alloc::string::String> { ARG.lock().clone() }
+>>>>>>> exec-media-audio

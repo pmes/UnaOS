@@ -18,6 +18,7 @@
 #![allow(deprecated)]
 
 pub mod api;
+pub mod dsp;
 pub mod forge;
 #[cfg(feature = "std")]
 pub mod io;

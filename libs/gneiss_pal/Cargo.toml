@@ -22,6 +22,8 @@ futures-core = { version = "0.3", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 chrono = { version = "0.4", default-features = false }
 bandy = { version = "0.1.0", path = "../bandy", default-features = false }
+# AUDIOCODEC (SR30): `dsp::audio` re-exports the no_std audio decoders the kernel links too.
+audio_core = { path = "../../unaos/libs/media/audio_core" }
 # EMBED (B317): the local embedder — candle on the CPU (BERT), NFD for the WordPiece normaliser.
 candle-core = { version = "0.11", optional = true }
 candle-nn = { version = "0.11", optional = true }

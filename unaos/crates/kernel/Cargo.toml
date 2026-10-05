@@ -3648,7 +3648,7 @@ hda = []
 #
 # Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs`.
 # See docs/dev/OS/11_AUDIO/hda.md.
-hda-tone = ["hda"]
+hda-tone = ["hda", "dep:audio_core"]
 # HDASIE (rmbp-ledger B207): `UNAOS_HDASIE=1` — the one-knob flight B130 left open. Sets `INTCTL.SIE[n]`
 # for the tone's ONE descriptor right before RUN and restores it after STOP (GIE/CIE untouched, so no
 # interrupt reaches the CPU) to ask whether SIE gates the `SDnSTS.BCIS` LATCH on the 7-series PCH the
@@ -3800,6 +3800,7 @@ midden_core = { path = "../../libs/sys/midden_core", default-features = false }
 # PREFS (rmbp-ledger B300): Principia's shared preference core — value model + TOML subset codec, the
 # same crate `handlers/principia` links. no_std + alloc, zero deps; arch-neutral.
 prefs_core = { path = "../../libs/sys/prefs_core" }
+<<<<<<< HEAD
 # LUMENAPP (B323): Vein's shared no_std core — `tests lumen` applies the SAME provider/key rule the ring-3
 # LUMEN.ELF applies (vein_core::prefs::plan). Zero deps; only under feature `lumen`.
 vein_core = { path = "../../libs/sys/vein_core", default-features = false, optional = true }
@@ -3809,6 +3810,16 @@ wifi_core = { path = "../../libs/sys/wifi_core", default-features = false, optio
 # SELFDIAG (B324): the diagnosis core — witness grammar, owners table, prompt, diff parser + hunk locator +
 # streaming emitter, record, Echo fixture — the SAME crate APPS/DIAG.ELF links. no_std, zero deps.
 diag_core = { path = "../../libs/sys/diag_core", optional = true }
+=======
+# VEINCORE (B304): Vein's shared no_std core — the chat bus codec the `vein` shell verb and `tests vein`
+# use (the same crate VEIN.BIN and handlers/vein link). Zero deps; only reached under feature `vein`.
+vein_core = { path = "../../libs/sys/vein_core" }
+# AUDIOCODEC (SR30): the audio decoders UnaOS owns — WAV/AIFF/FLAC/Ogg/Opus/Vorbis/MP3/AAC/MP4, from the
+# specifications, no_std + alloc, zero deps — the same crate `gneiss_pal::dsp::audio` and `tools/audio-check` link.
+# `play <file>` (drivers/hda_play.rs) decodes through it. Optional, pulled in by `hda-tone` only, so a build
+# without the player does not compile it.
+audio_core = { path = "../../libs/media/audio_core", optional = true }
+>>>>>>> exec-media-audio
 # SELFINSTALL2 (rmbp-ledger B310): Amber Bytes' shared disk-layout core — GPT encode/decode, the partition
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).
