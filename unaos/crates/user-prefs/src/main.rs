@@ -207,23 +207,28 @@ const PROBE_KEY: &[u8] = b"system.pointer.speed";
 /// The PRIN_KERNEL_REPLY kind every kernel reply carries.
 const PRIN_KERNEL_REPLY: u8 = 4;
 
-// Frame buffers live in .bss (a whole-frame receive buffer has no business on the stack).
-static mut RX: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
-static mut TX: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
+// ONE frame buffer in .bss (a whole-frame buffer has no business on the stack). IMAGE 15 (boot 23) did not
+// build: three 4148-byte statics (RX, TX, OUT) pushed PREFS to span 20748 > its fixed 16 KiB window. The
+// program is strictly half-duplex — it receives, works on the body in place, then builds and sends its
+// reply — so one frame serves as RX, TX and the OUT body (`outb()` = the body region after the header).
+// `build()` and `forward()` know the aliasing and never copy a slice onto itself.
+static mut FRAME: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
 
 #[allow(static_mut_refs)]
 fn rx() -> &'static mut [u8; BUS_FRAME_MAX] {
-    unsafe { &mut RX }
+    unsafe { &mut FRAME }
 }
 #[allow(static_mut_refs)]
 fn tx() -> &'static mut [u8; BUS_FRAME_MAX] {
-    unsafe { &mut TX }
+    unsafe { &mut FRAME }
 }
 
 /// Build a frame into TX; returns its length (body truncated to the TX buffer, never past it).
 fn build(kind: u8, verb: u8, corr: u32, status: i32, body: &[u8]) -> usize {
+    // Read the body's address and length BEFORE taking the frame: the body may be the frame's own body
+    // region (`outb()`), and the header writes below never overlap it.
+    let (bp, bl) = (body.as_ptr(), if status != 0 { 0 } else { core::cmp::min(body.len(), BUS_FRAME_MAX - BUS_HDR_LEN) });
     let t = tx();
-    let body = if status != 0 { &[][..] } else { &body[..core::cmp::min(body.len(), t.len() - BUS_HDR_LEN)] };
     t[0..4].copy_from_slice(&BUS_MAGIC);
     t[4] = BUS_VERSION;
     t[5] = kind;
@@ -234,9 +239,13 @@ fn build(kind: u8, verb: u8, corr: u32, status: i32, body: &[u8]) -> usize {
     for b in &mut t[16..48] {
         *b = 0; // the kernel stamps; a caller-supplied principal is refused
     }
-    t[48..52].copy_from_slice(&(body.len() as u32).to_le_bytes());
-    t[BUS_HDR_LEN..BUS_HDR_LEN + body.len()].copy_from_slice(body);
-    BUS_HDR_LEN + body.len()
+    t[48..52].copy_from_slice(&(bl as u32).to_le_bytes());
+    // In place when the body IS the frame's body region; a raw non-overlapping copy otherwise.
+    let dst = t[BUS_HDR_LEN..].as_mut_ptr();
+    if bl != 0 && bp != dst as *const u8 {
+        unsafe { core::ptr::copy_nonoverlapping(bp, dst, bl) };
+    }
+    BUS_HDR_LEN + bl
 }
 
 fn send(n: usize) -> i64 {
@@ -355,10 +364,10 @@ fn serve(h: &Hdr) -> i32 {
     status
 }
 
-static mut OUT: [u8; BUS_FRAME_MAX - BUS_HDR_LEN] = [0; BUS_FRAME_MAX - BUS_HDR_LEN];
+/// The reply/work body: the frame's own body region (see FRAME above).
 #[allow(static_mut_refs)]
-fn outb() -> &'static mut [u8; BUS_FRAME_MAX - BUS_HDR_LEN] {
-    unsafe { &mut OUT }
+fn outb() -> &'static mut [u8] {
+    unsafe { &mut FRAME[BUS_HDR_LEN..] }
 }
 static mut FWD_CORR: u32 = 1000;
 
@@ -380,7 +389,7 @@ fn forward(verb: u8, body: &[u8]) -> (i32, usize) {
         let Some(h) = hdr(recv()) else { return (-5, 0) };
         if h.kind == BUS_KIND_REPLY && h.corr == corr {
             let bl = core::cmp::min(h.body_len, outb().len());
-            outb()[..bl].copy_from_slice(&rx()[BUS_HDR_LEN..BUS_HDR_LEN + bl]);
+            // The reply body already sits in the frame's body region = outb(): nothing to copy.
             return (h.status, if h.status == 0 { bl } else { 0 });
         }
         if h.kind == BUS_KIND_REQUEST {
