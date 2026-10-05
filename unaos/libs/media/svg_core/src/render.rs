@@ -65,9 +65,12 @@ pub struct Renderer<'a> {
     pub opts: &'a Options<'a>,
     pub w: usize,
     pub h: usize,
-    depth: usize,
+    pub(crate) depth: usize,
     /// Elements currently being instantiated (use targets, patterns, clip paths, masks, markers): cycle guard.
     active: Vec<usize>,
+    /// Elements whose filter is being evaluated: one rendered again inside its own filter (feImage) renders
+    /// unfiltered there (Chromium breaks the cycle at the inner reference).
+    pub filtering: Vec<usize>,
     /// Root element font size and line height (for `rem`/`rlh`), and the initial containing block in CSS px
     /// (for viewport units).
     pub root_font: f64,
@@ -150,7 +153,7 @@ fn parse_css_transform(s: &str) -> Option<Transform> {
 
 impl<'a> Renderer<'a> {
     pub fn new(doc: &'a Document, props: &'a [Props], opts: &'a Options<'a>, w: usize, h: usize) -> Self {
-        Renderer { doc, props, opts, w, h, depth: 0, active: Vec::new(), root_font: 16.0, root_lh: 16.0 * 1.2, icb: (w as f64, h as f64) }
+        Renderer { doc, props, opts, w, h, depth: 0, active: Vec::new(), filtering: Vec::new(), root_font: 16.0, root_lh: 16.0 * 1.2, icb: (w as f64, h as f64) }
     }
 
     /// Elements being instantiated (the cycle guard), for resources rendered out of place (feImage).
@@ -166,7 +169,7 @@ impl<'a> Renderer<'a> {
 
     /// A renderer for an offscreen raster of another size (one level deeper).
     pub fn sub(&self, w: usize, h: usize) -> Renderer<'a> {
-        Renderer { doc: self.doc, props: self.props, opts: self.opts, w, h, depth: self.depth + 1, active: self.active.clone(), root_font: self.root_font, root_lh: self.root_lh, icb: self.icb }
+        Renderer { doc: self.doc, props: self.props, opts: self.opts, w, h, depth: self.depth + 1, active: self.active.clone(), filtering: self.filtering.clone(), root_font: self.root_font, root_lh: self.root_lh, icb: self.icb }
     }
 
     /// The computed style of `node` as its document ancestors give it (for resources rendered out of place).

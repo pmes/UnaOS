@@ -281,13 +281,16 @@ pub fn render_filtered_bbox<'a, F>(r: &mut Renderer<'a>, node: usize, bbox: Opti
 where
     F: FnOnce(&mut Renderer<'a>, &Ctx, &mut Pixmap),
 {
+    if r.filtering.contains(&node) {
+        return Outcome::Unfiltered;
+    }
     let st = &ectx.style;
     let Some(ops) = parse_filter(value, st.font_size, ectx.vw, ectx.vh, st.color) else { return Outcome::Unfiltered };
     // Unresolvable references are skipped.
     let ops: Vec<FilterFn> = ops
         .into_iter()
         .filter(|o| match o {
-            FilterFn::Url(id) => r.doc.by_id(id).map(|n| r.doc.nodes[n].is_svg("filter")).unwrap_or(false),
+            FilterFn::Url(id) => r.doc.by_id(id).map(|f| r.doc.nodes[f].is_svg("filter")).unwrap_or(false),
             _ => true,
         })
         .collect();
@@ -334,7 +337,7 @@ where
         let cctx = Ctx { ts: wft, ..ectx.clone() };
         f(&mut sub, &cctx, &mut src);
     }
-    r.active_push(node);
+    r.filtering.push(node);
     let mut cur = src;
     for op in &ops {
         let next = match op {
@@ -347,12 +350,12 @@ where
         match next {
             Some(n) => cur = n,
             None => {
-                r.active_pop();
+                r.filtering.pop();
                 return Outcome::Nothing;
             }
         }
     }
-    r.active_pop();
+    r.filtering.pop();
     // Into device space.
     let mut layer = Pixmap::new(r.w, r.h);
     if axis {
@@ -388,6 +391,38 @@ where
     Outcome::Layer(layer)
 }
 
+/// How a CSS `filter` value resolves on a layer that is not part of an SVG document (Aether's boxes).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CssFilterContext {
+    /// Layer pixels per CSS px (device pixel ratio × zoom).
+    pub scale: f64,
+    /// The element's computed `font-size` (for `em` in `blur()` / `drop-shadow()`).
+    pub font_size: f64,
+    /// The viewport in CSS px (for `vw` / `vh`).
+    pub viewport: (f64, f64),
+    /// The element's `color` (`currentColor`, and drop-shadow's default colour).
+    pub current_color: color::Color,
+}
+
+/// The CSS `filter` property on an arbitrary premultiplied layer: the library API Aether calls for HTML
+/// boxes (Filter Effects 1 §13 — the same primitives an SVG filter runs, in sRGB, with an unbounded region).
+/// The caller renders the box into `layer` with enough transparent margin for blurs and shadows to spread.
+/// `url()` entries are skipped (there is no SVG document to resolve them in). `None` when the value is
+/// invalid (the declaration is ignored) or `none`.
+pub fn apply_css_filter(layer: &Pixmap, value: &str, cx: &CssFilterContext) -> Option<Pixmap> {
+    let ops = parse_filter(value, cx.font_size, cx.viewport.0, cx.viewport.1, cx.current_color)?;
+    let ops: Vec<FilterFn> = ops.into_iter().filter(|o| !matches!(o, FilterFn::Url(_))).collect();
+    if ops.is_empty() {
+        return None;
+    }
+    let t = Transform::scale(cx.scale, cx.scale);
+    let mut cur = layer.clone();
+    for op in &ops {
+        cur = run_function(op, t, cur);
+    }
+    Some(cur)
+}
+
 /// A CSS filter function on the whole working raster, in sRGB.
 fn run_function(op: &FilterFn, wft: Transform, src: Pixmap) -> Pixmap {
     let b = IRect { x0: 0, y0: 0, x1: src.w, y1: src.h };
@@ -418,19 +453,10 @@ fn drop_shadow(src: &Pixmap, in_b: &IRect, b: &IRect, sx: f64, sy: f64, dx: f64,
     out
 }
 
-/// The `<filter>` element and the filters it references by `href`: the region and unit attributes inherit
-/// along the chain; the primitives do not (Chromium: a filter without children renders nothing).
-fn filter_chain(r: &Renderer, f: usize) -> Vec<usize> {
-    let mut chain = vec![f];
-    let mut cur = f;
-    while let Some(h) = r.doc.nodes[cur].href().and_then(|h| h.strip_prefix('#')).and_then(|id| r.doc.by_id(id)) {
-        if !r.doc.nodes[h].is_svg("filter") || chain.contains(&h) {
-            break;
-        }
-        chain.push(h);
-        cur = h;
-    }
-    chain
+/// The `<filter>` element's attribute sources. Chromium does not follow `href` on `<filter>` (Filter Effects 1
+/// dropped it): neither the region attributes nor the primitives inherit, so the chain is the element alone.
+fn filter_chain(_r: &Renderer, f: usize) -> Vec<usize> {
+    vec![f]
 }
 
 fn chain_attr<'d>(r: &'d Renderer, chain: &[usize], a: &str) -> Option<&'d str> {
@@ -991,8 +1017,9 @@ impl Run<'_, '_> {
             // divisor="0" is ignored (Chromium), like an absent one.
             Some(v) if v.trim().parse::<f64>().ok().filter(|d| *d != 0.0).is_some() => v.trim().parse::<f64>().unwrap(),
             _ => {
-                let s: f64 = kernel.iter().sum();
-                if s == 0.0 { 1.0 } else { s }
+                // The kernel sum, or 1 when it is zero (up to float rounding: 8 × 0.1 − 0.8 is not 0.0).
+                let s: f32 = kernel.iter().map(|&k| k as f32).sum();
+                if s == 0.0 { 1.0 } else { s as f64 }
             }
         };
         let tgt = |a: &str, ord: usize| -> Option<usize> {
@@ -1075,7 +1102,7 @@ impl Run<'_, '_> {
         if let Some(id) = href.strip_prefix('#') {
             let target = self.r.doc.by_id(id)?;
             let tn = &self.r.doc.nodes[target];
-            if !tn.is_svg_element() || self.r.is_active(target) {
+            if !tn.is_svg_element() || self.r.is_active(target) || self.r.depth > 24 {
                 return None;
             }
             // Chromium: translate to the subregion origin, or map the viewport onto it for relative lengths.
@@ -1089,7 +1116,6 @@ impl Run<'_, '_> {
             let style = self.r.doc_style(parent);
             let ctx = Ctx { ts: self.ft.mul(&t), vw: self.vctx.vw, vh: self.vctx.vh, style, ctx_fill: None, ctx_stroke: None, ctx_elem: None };
             let mut sub_r = self.r.sub(self.w, self.h);
-            sub_r.active_push(target);
             sub_r.render(target, &ctx, &mut out);
             return Some(out);
         }
@@ -1165,5 +1191,32 @@ mod tests {
         assert_eq!(p("drop-shadow(blue 3% 4% 5%)"), None);
         assert_eq!(p("drop-shadow()"), None);
         assert_eq!(angle("45grad"), Some(40.5));
+    }
+
+    #[test]
+    fn css_filter_api_on_a_layer() {
+        let cx = CssFilterContext { scale: 2.0, font_size: 16.0, viewport: (100.0, 100.0), current_color: color::Color::BLACK };
+        let mut layer = Pixmap::new(4, 1);
+        layer.data.copy_from_slice(&[255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 0, 0, 0, 0]);
+        // grayscale(1): luminance 0.2126 / 0.7152 / 0.0722 of red, green, blue.
+        let g = apply_css_filter(&layer, "grayscale(1)", &cx).unwrap();
+        assert_eq!(&g.data[0..4], &[54, 54, 54, 255]);
+        assert_eq!(&g.data[4..8], &[182, 182, 182, 255]);
+        assert_eq!(&g.data[8..12], &[18, 18, 18, 255]);
+        assert_eq!(&g.data[12..16], &[0, 0, 0, 0]);
+        // invert(1) then opacity(50%): cyan at half alpha (the table truncates 127.5); transparent stays.
+        let i = apply_css_filter(&layer, "invert(1) opacity(50%)", &cx).unwrap();
+        assert_eq!(&i.data[0..4], &[0, 127, 127, 127]);
+        assert_eq!(&i.data[12..16], &[0, 0, 0, 0]);
+        // Invalid or url-only values are ignored.
+        assert!(apply_css_filter(&layer, "blur(4)", &cx).is_none());
+        assert!(apply_css_filter(&layer, "url(#x)", &cx).is_none());
+        // drop-shadow(2px 0 currentColor) at scale 2: shifted 4 layer pixels, under the source.
+        let mut dot = Pixmap::new(8, 1);
+        dot.data[3] = 255;
+        let d = apply_css_filter(&dot, "drop-shadow(2px 0)", &cx).unwrap();
+        assert_eq!(&d.data[16..20], &[0, 0, 0, 255]);
+        assert_eq!(&d.data[0..4], &[0, 0, 0, 255]);
+        assert_eq!(d.data[4 * 2 + 3], 0);
     }
 }

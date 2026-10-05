@@ -926,20 +926,24 @@ pub fn convolve(src: &Pixmap, src_b: &IRect, b: &IRect, k: &Convolve) -> Pixmap 
         }
         f
     };
-    let gain = 1.0 / k.divisor;
-    let bias = k.bias * 255.0;
+    // Single-precision like Skia's convolution (a near-zero divisor amplifies its rounding the same way).
+    let gain = 1.0 / k.divisor as f32;
+    let bias = (k.bias * 255.0) as f32;
+    let kern: Vec<f32> = k.kernel.iter().map(|&v| v as f32).collect();
     for y in b.y0..b.y1 {
         for x in b.x0..b.x1 {
-            let mut s = [0f64; 4];
+            let mut s = [0f32; 4];
             for j in 0..oy {
                 for i in 0..ox {
                     let p = fetch(x as i64 - k.target.0 as i64 + i as i64, y as i64 - k.target.1 as i64 + j as i64);
-                    let kv = k.kernel[(oy - 1 - j) * ox + (ox - 1 - i)];
+                    let kv = kern[(oy - 1 - j) * ox + (ox - 1 - i)];
                     for c in 0..4 {
-                        s[c] += p[c] as f64 * kv;
+                        s[c] += p[c] * kv;
                     }
                 }
             }
+            let s = [s[0] as f64, s[1] as f64, s[2] as f64, s[3] as f64];
+            let (gain, bias) = (gain as f64, bias as f64);
             let o = if k.preserve_alpha {
                 let a = px(src, x, y)[3];
                 if !src_b.contains(x, y) {
