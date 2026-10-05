@@ -565,6 +565,156 @@ pub fn dump_layout(layout: &LayoutTree) {
     walk(layout, layout.root_node, 0.0, 0.0, 0, max_depth);
 }
 
+/// Paint a `<video>`/`<audio>` box (AETHERVIDEO, LEDGER SR39): the picture (poster or the
+/// frame on glass) placed by `object-fit`/`object-position` inside the content box and clipped
+/// to it, bilinear-sampled at pixel centres (exact at 1:1); Stria's error text when the stream
+/// failed; and, with `controls`, a play/pause + progress + time strip along the bottom.
+#[allow(clippy::too_many_arguments)]
+fn paint_media(
+    media: &crate::media::Paint,
+    spec: &crate::layout::PaintStyle,
+    content: (f32, f32, f32, f32),
+    font: &Option<Arc<Font>>,
+    surface: &mut [u8],
+    width: u32,
+    height: u32,
+    damage_rects: &[(u32, u32, u32, u32)],
+    clip: Clip,
+) {
+    let (cx, cy, cw, ch) = content;
+    if cw <= 0.0 || ch <= 0.0 {
+        return;
+    }
+    // The content box, in clamped screen pixels, intersected with the clip.
+    let span = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        let x0 = x0.max(cx).max(clip.0).max(0.0);
+        let y0 = y0.max(cy).max(clip.1).max(0.0);
+        let x1 = x1.min(cx + cw).min(clip.2).min(width as f32);
+        let y1 = y1.min(cy + ch).min(clip.3).min(height as f32);
+        (x0.round() as u32, y0.round() as u32, (x1.round().max(0.0)) as u32, (y1.round().max(0.0)) as u32)
+    };
+
+    if let Some(err) = &media.error {
+        let (x0, y0, x1, y1) = span(cx, cy, cx + cw, cy + ch);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if in_damage(x, y, damage_rects) {
+                    put_px(surface, width, x, y, (32, 32, 32));
+                }
+            }
+        }
+        if let Some(font) = font {
+            let fs = 13.0;
+            draw_text(
+                err, cx + 8.0, centered_line_origin_y(font, fs, cy + ch.min(40.0) / 2.0), (cw - 16.0).max(1.0),
+                font, 0, fs, 1.2, (255, 255, 255), false, surface, width, height, damage_rects,
+                (cx.max(clip.0), cy.max(clip.1), (cx + cw).min(clip.2), (cy + ch).min(clip.3)),
+            );
+        }
+    } else if let Some(pic) = &media.picture {
+        let (sw, sh) = (pic.width() as f32, pic.height() as f32);
+        let fit = spec.object_fit.unwrap_or(1);
+        let pos = spec.object_position.as_deref().map(crate::media::parse_object_position).unwrap_or((0.5, 0.5));
+        let (rx, ry, rw, rh) = crate::media::object_fit_rect(fit, pos, cw, ch, sw, sh);
+        let (dx, dy) = (cx + rx, cy + ry);
+        let (x0, y0, x1, y1) = span(dx, dy, dx + rw, dy + rh);
+        let (sx_scale, sy_scale) = (sw / rw, sh / rh);
+        let (iw, ih) = (pic.width() as i32, pic.height() as i32);
+        let raw = pic.as_raw();
+        let at = |u: i32, v: i32| {
+            let o = ((v.clamp(0, ih - 1) * iw + u.clamp(0, iw - 1)) * 4) as usize;
+            [raw[o] as f32, raw[o + 1] as f32, raw[o + 2] as f32, raw[o + 3] as f32]
+        };
+        for y in y0..y1 {
+            let fv = (y as f32 + 0.5 - dy) * sy_scale - 0.5;
+            let v0 = fv.floor();
+            let ty = fv - v0;
+            for x in x0..x1 {
+                if !in_damage(x, y, damage_rects) {
+                    continue;
+                }
+                let fu = (x as f32 + 0.5 - dx) * sx_scale - 0.5;
+                let u0 = fu.floor();
+                let tx = fu - u0;
+                let (u0, v0i) = (u0 as i32, v0 as i32);
+                let (p00, p10, p01, p11) = (at(u0, v0i), at(u0 + 1, v0i), at(u0, v0i + 1), at(u0 + 1, v0i + 1));
+                let mut c = [0u8; 4];
+                for k in 0..4 {
+                    let top = p00[k] + (p10[k] - p00[k]) * tx;
+                    let bot = p01[k] + (p11[k] - p01[k]) * tx;
+                    c[k] = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u8;
+                }
+                if c[3] == 255 {
+                    put_px(surface, width, x, y, (c[0], c[1], c[2]));
+                } else if c[3] > 0 {
+                    blend_px(surface, width, x, y, (c[0], c[1], c[2]), c[3]);
+                }
+            }
+        }
+    }
+
+    if media.controls {
+        // The strip: 32px (an <audio> box is all strip), translucent black.
+        let sh = if media.kind == crate::media::Kind::Audio { ch } else { ch.min(32.0) };
+        let top = cy + ch - sh;
+        let (x0, y0, x1, y1) = span(cx, top, cx + cw, cy + ch);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if in_damage(x, y, damage_rects) {
+                    blend_px(surface, width, x, y, (0, 0, 0), 160);
+                }
+            }
+        }
+        let mid = top + sh / 2.0;
+        let white = (255, 255, 255);
+        let fill = |surface: &mut [u8], fx0: f32, fy0: f32, fx1: f32, fy1: f32, test: &dyn Fn(f32, f32) -> bool, color: (u8, u8, u8)| {
+            let (x0, y0, x1, y1) = span(fx0, fy0, fx1, fy1);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if in_damage(x, y, damage_rects) && test(x as f32 + 0.5, y as f32 + 0.5) {
+                        put_px(surface, width, x, y, color);
+                    }
+                }
+            }
+        };
+        let bx = cx + 10.0;
+        if media.playing {
+            // Pause: two bars.
+            fill(surface, bx, mid - 7.0, bx + 4.0, mid + 7.0, &|_, _| true, white);
+            fill(surface, bx + 8.0, mid - 7.0, bx + 12.0, mid + 7.0, &|_, _| true, white);
+        } else {
+            // Play: a right-pointing triangle.
+            fill(surface, bx, mid - 7.0, bx + 12.0, mid + 7.0, &|x, y| (y - mid).abs() <= 7.0 * (1.0 - (x - bx) / 12.0), white);
+        }
+        // Time text and progress track.
+        let label = format!(
+            "{} / {}",
+            crate::media::clock_text(media.pts_ns),
+            crate::media::clock_text(media.duration_ns as i64)
+        );
+        let mut track_x0 = bx + 22.0;
+        if let Some(font) = font {
+            let fs = 12.0;
+            let tw = measure_text_width(&label, font, fs);
+            if cw > tw + 80.0 {
+                draw_text(
+                    &label, track_x0, centered_line_origin_y(font, fs, mid), tw + 2.0, font, 0, fs, 1.2,
+                    white, false, surface, width, height, damage_rects, clip,
+                );
+                track_x0 += tw + 10.0;
+            }
+        }
+        let track_x1 = cx + cw - 10.0;
+        if track_x1 > track_x0 + 4.0 {
+            fill(surface, track_x0, mid - 2.0, track_x1, mid + 2.0, &|_, _| true, (110, 110, 110));
+            if media.duration_ns > 0 {
+                let f = (media.pts_ns.max(0) as f32 / media.duration_ns as f32).clamp(0.0, 1.0);
+                fill(surface, track_x0, mid - 2.0, track_x0 + (track_x1 - track_x0) * f, mid + 2.0, &|_, _| true, white);
+            }
+        }
+    }
+}
+
 pub fn render_frame(
     layout: &LayoutTree,
     surface: &mut [u8],
@@ -815,6 +965,19 @@ pub fn render_frame(
                                 }
                             }
                         }
+                    }
+                }
+
+                if tag == "video" || tag == "audio" {
+                    if let Some(media) = crate::media::paint_for(dom_node) {
+                        let (pad, bord) = (layout_box.padding, layout_box.border);
+                        let content = (
+                            box_sx + pad.left + bord.left,
+                            box_sy + pad.top + bord.top,
+                            (bw - pad.left - bord.left - pad.right - bord.right).max(0.0),
+                            (bh - pad.top - bord.top - pad.bottom - bord.bottom).max(0.0),
+                        );
+                        paint_media(&media, &spec, content, font, surface, width, height, damage_rects, clip);
                     }
                 }
 

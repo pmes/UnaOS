@@ -15,6 +15,7 @@ pub mod workers;
 pub mod event_loop;
 pub mod fonts;
 pub mod api;
+pub mod media;
 
 #[cfg(test)]
 mod engine_tests;
@@ -36,8 +37,6 @@ pub struct AetherEngine {
     /// All stylesheet text applied to the current document (document
     /// <style> blocks + external sheets), kept for script-driven relayout.
     pub stylesheets: Vec<String>,
-    /// Play request staged by a media-element click: (url, title, mime).
-    pending_media: Option<(String, String, String)>,
     /// Navigation staged by a link click or form submit. The SHELL performs
     /// it asynchronously: the engine thread runs a current-thread runtime,
     /// where tokio::task::block_in_place panics — the old inline block here
@@ -63,7 +62,6 @@ impl AetherEngine {
             focused_node: None,
             surface: vec![255; 800 * 600 * 4],
             stylesheets: Vec::new(),
-            pending_media: None,
             pending_nav: None,
         }
     }
@@ -72,11 +70,96 @@ impl AetherEngine {
     /// the page's stylesheets. The M3 mutation→relayout half-loop.
     pub fn relayout(&mut self) {
         let Some(document) = self.document.clone() else { return };
+        // A script may have inserted media elements: register them (poster requests queue).
+        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+        media::scan(&document, &base);
         let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
         css::apply_stylesheets(&mut layout_tree, &self.stylesheets);
         self.layout_tree = Some(layout_tree);
         self.needs_repaint = true;
         self.damage_rects.push((0, 0, self.width, self.height));
+    }
+
+    /// Requests for Stria queued by the page's media elements (posters on layout, play/pause
+    /// on click, stops on navigation). The shell fires each on the bus.
+    pub fn take_media_requests(&mut self) -> Vec<bandy::SMessage> {
+        media::take_outbox()
+    }
+
+    /// Feed one of Stria's replies (`MediaOpened` / `MediaFrame` / `MediaEnded` /
+    /// `MediaError`) to the page. Returns true when the page needs a repaint (the element's
+    /// box is pushed as damage; a changed intrinsic size relayouts).
+    pub fn on_media_message(&mut self, msg: &bandy::SMessage) -> bool {
+        let fx = media::on_message(msg);
+        if !fx.handled {
+            return false;
+        }
+        if fx.relayout {
+            self.relayout();
+            return true;
+        }
+        for node in &fx.repaint {
+            if let Some(r) = self.screen_rect_of(node) {
+                self.damage_rects.push(r);
+                self.needs_repaint = true;
+            }
+        }
+        self.needs_repaint
+    }
+
+    /// The page's media elements and what Aether knows of each.
+    pub fn media_elements(&self) -> Vec<media::Element> {
+        media::snapshot()
+    }
+
+    /// Play the `i`th media element (document order). False when there is none.
+    pub fn media_play(&mut self, i: usize) -> bool {
+        media::snapshot().get(i).is_some_and(|e| media::play(&e.node))
+    }
+
+    /// Pause the `i`th media element.
+    pub fn media_pause(&mut self, i: usize) -> bool {
+        media::snapshot().get(i).is_some_and(|e| media::pause(&e.node))
+    }
+
+    /// Seek the `i`th media element to `position_ns`.
+    pub fn media_seek(&mut self, i: usize, position_ns: u64) -> bool {
+        media::snapshot().get(i).is_some_and(|e| media::seek(&e.node, position_ns))
+    }
+
+    /// Absolute (document) border box of `node`'s layout box: (x, y, w, h).
+    pub fn box_of(&self, node: &kuchiki::NodeRef) -> Option<(f32, f32, f32, f32)> {
+        let layout = self.layout_tree.as_ref()?;
+        fn walk(
+            id: taffy::prelude::NodeId,
+            cx: f32,
+            cy: f32,
+            layout: &layout::LayoutTree,
+            want: &kuchiki::NodeRef,
+        ) -> Option<(f32, f32, f32, f32)> {
+            let l = layout.taffy.layout(id).ok()?;
+            let (nx, ny) = (cx + l.location.x, cy + l.location.y);
+            if layout.node_map.get(&id) == Some(want) {
+                return Some((nx, ny, l.size.width, l.size.height));
+            }
+            for c in layout.taffy.children(id).ok()? {
+                if let Some(r) = walk(c, nx, ny, layout, want) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        walk(layout.root_node, 0.0, 0.0, layout, node)
+    }
+
+    /// `node`'s box as a damage rect in viewport pixels, clamped; None when off screen.
+    fn screen_rect_of(&self, node: &kuchiki::NodeRef) -> Option<(u32, u32, u32, u32)> {
+        let (x, y, w, h) = self.box_of(node)?;
+        let x0 = (x as f64 - self.scroll_x).floor().max(0.0) as u32;
+        let y0 = (y as f64 - self.scroll_y).floor().max(0.0) as u32;
+        let x1 = ((x + w) as f64 - self.scroll_x).ceil().clamp(0.0, self.width as f64) as u32;
+        let y1 = ((y + h) as f64 - self.scroll_y).ceil().clamp(0.0, self.height as f64) as u32;
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
     }
 
     pub fn surface(&self) -> &[u8] {
@@ -240,22 +323,10 @@ impl AetherEngine {
                             self.relayout();
                         }
                     }
-                    // A click on (or inside) a media element is a play
-                    // request: stage the resolved stream for the shell to
-                    // hand to Stria (PlayMedia passthrough, no site code).
-                    let mut cur = Some(node.clone());
-                    while let Some(n) = cur {
-                        if let Some(el) = n.as_element() {
-                            let tag = el.name.local.as_ref();
-                            if tag == "video" || tag == "audio" {
-                                if let Some((src, mime)) = self.media_source_for(&n) {
-                                    self.pending_media = Some((src, self.title.clone(), mime));
-                                }
-                                break;
-                            }
-                        }
-                        cur = n.parent();
-                    }
+                    // A click on (or inside) a media element toggles it:
+                    // play (PlayMedia toward Stria — the page's own stream,
+                    // no site code) when not playing, MediaPause when it is.
+                    media::toggle(&node);
                     // The hit is the DEEPEST box — usually the text run
                     // inside the link — so walk ancestors for the <a>.
                     let mut cur = Some(node.clone());
@@ -401,84 +472,20 @@ impl AetherEngine {
         self.pending_nav.take()
     }
 
-    /// The staged play request from the last media-element click, if any.
-    /// The shell consumes this and fires SMessage::PlayMedia toward Stria.
+    /// The staged play request from the last media-element click, if any:
+    /// (url, title, mime). Removes that `PlayMedia` from the media outbox, so
+    /// a shell uses either this or [`Self::take_media_requests`], not both.
     pub fn take_pending_media(&mut self) -> Option<(String, String, String)> {
-        self.pending_media.take()
+        media::take_play_request()
     }
 
-    /// Resolves one media element's playable source: its own src, else the
-    /// first <source> child's. Returns (absolute url, mime).
-    fn media_source_for(&self, node: &kuchiki::NodeRef) -> Option<(String, String)> {
-        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
-        let pick = |el: &kuchiki::ElementData| -> Option<(String, String)> {
-            let attrs = el.attributes.borrow();
-            let src = attrs.get("src").filter(|s| !s.is_empty())?.to_string();
-            let abs = images::resolve(&base, &src);
-            let mime = attrs
-                .get("type")
-                .map(str::to_string)
-                .unwrap_or_else(|| Self::mime_for(&abs).to_string());
-            Some((abs, mime))
-        };
-        if let Some(el) = node.as_element() {
-            if let Some(found) = pick(el) {
-                return Some(found);
-            }
-        }
-        for child in node.children() {
-            if let Some(el) = child.as_element() {
-                if el.name.local.as_ref() == "source" {
-                    if let Some(found) = pick(el) {
-                        return Some(found);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn mime_for(url: &str) -> &'static str {
-        match url.rsplit('.').next() {
-            Some("mp4") => "video/mp4",
-            Some("webm") => "video/webm",
-            Some("mp3") => "audio/mpeg",
-            Some("ogg") => "audio/ogg",
-            Some("wav") => "audio/wav",
-            _ => "application/octet-stream",
-        }
-    }
-
-    /// Media the current page references, ready to hand to Stria. We own the
-    /// browser and the OS, so a `<video>`/`<audio>` source the page already
-    /// resolved is ours to play — same passthrough as audio, no site-specific
-    /// resolver. Returns (absolute src, mime) for each playable element.
+    /// Media the current page references: each `<video>`/`<audio>` element's
+    /// selected source (see `media::source_for`). Returns (absolute src, mime).
     pub fn media_sources(&self) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        let Some(doc) = &self.document else { return out };
+        let Some(doc) = &self.document else { return Vec::new() };
         let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
-        let Ok(media) = doc.select("video, audio, source") else { return out };
-        for el in media {
-            let attrs = el.attributes.borrow();
-            let Some(src) = attrs.get("src") else { continue };
-            if src.is_empty() {
-                continue;
-            }
-            let abs = images::resolve(&base, src);
-            let mime = attrs.get("type").map(str::to_string).unwrap_or_else(|| {
-                match abs.rsplit('.').next() {
-                    Some("mp4") => "video/mp4",
-                    Some("webm") => "video/webm",
-                    Some("mp3") => "audio/mpeg",
-                    Some("ogg") => "audio/ogg",
-                    Some("wav") => "audio/wav",
-                    _ => "application/octet-stream",
-                }
-                .to_string()
-            });
-            out.push((abs, mime));
-        }
-        out
+        let Ok(found) = doc.select("video, audio") else { return Vec::new() };
+        found.filter_map(|el| media::source_for(el.as_node(), &base)).collect()
     }
 
     /// Like `load_html`, with pre-fetched external stylesheets (see
@@ -530,6 +537,9 @@ impl AetherEngine {
             self.history_idx = self.history.len() - 1;
         }
         
+        // The previous document's media stop; this one's register below.
+        media::reset(&self.title);
+
         let mut js_engine = js::Engine::new(document.clone());
         js_engine.set_location(url);
         // UNAOS_JSDEBUG=1: trace each script's index/head/outcome to stderr
@@ -658,6 +668,10 @@ impl AetherEngine {
             }
         }
         sheets.extend(external_css.iter().cloned());
+
+        // Register the page's <video>/<audio> elements: each video's poster request
+        // (MediaPoster) queues now, so its first frame is on the way as layout lands.
+        media::scan(&document, url);
 
         let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
         css::apply_stylesheets(&mut layout_tree, &sheets);
