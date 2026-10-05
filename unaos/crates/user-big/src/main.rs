@@ -10,9 +10,13 @@
 //   2. stack  — four nested frames of 32 KiB each (128 KiB live) on the 256 KiB stack this image
 //      declares in PT_GNU_STACK; the default 64 KiB would fault, which is the point of the note.
 //   3. heap   — a global allocator over SYS_SBRK (58), and a 100 KiB `Vec<u8>` filled and re-read.
-//   4. cap    — SYS_SBRK of 8 MiB must be refused -ENOMEM (the 4 MiB window cap).
+//   4. cap    — SYS_SBRK of the whole window (USER_WINDOW_BYTES, 64 MiB since WINDOW2) must be refused
+//      -ENOMEM: the image and stack already sit in it. (RING3WIN asked 8 MiB of a 4 MiB window.)
+//   5. alloc48m (WINDOW2, B361) — SYS_SBRK of 48 MiB (una_abi::WINDOW2_ALLOC_BYTES), one word written and read
+//      back on EVERY page, then handed back (the break returns to where it was).
 //
-// Exit status: low byte = the pass bits (0x0F = all four), bits 8..30 = the checksum's bits 8..30.
+// Exit status: low byte = the pass bits (0x1F = all five; `tests ring3win` reads 0x0F, `tests window` 0x10),
+// bits 8..30 = the checksum's bits 8..30.
 // One line to the console says the same in words.
 extern crate alloc;
 
@@ -109,7 +113,7 @@ fn deep(n: u32) -> u32 {
 }
 
 struct Line {
-    b: [u8; 160],
+    b: [u8; 200],
     n: usize,
 }
 impl Line {
@@ -167,12 +171,33 @@ pub extern "C" fn _start() -> ! {
     if heap_ok && b0 > 0 && grown >= 100 * 1024 {
         bits |= 4;
     }
-    // 4. the cap: 8 MiB past a 4 MiB window is refused.
-    let big = sbrk(8 << 20);
+    // 5. WINDOW2: 48 MiB of heap, every page touched and read back, then given back.
+    let want = una_abi::WINDOW2_ALLOC_BYTES as i64;
+    let before = sbrk(0);
+    let a = sbrk(want);
+    let mut touched = 0u64;
+    if a > 0 {
+        let base = ((a as u64) + 4095) & !4095;
+        let pages = (want as u64 - 4096) / 4096;
+        for i in 0..pages {
+            unsafe { core::ptr::write_volatile((base + i * 4096) as *mut u64, i ^ 0x5749_4E44_4F57_3200) };
+        }
+        for i in 0..pages {
+            if unsafe { core::ptr::read_volatile((base + i * 4096) as *const u64) } == i ^ 0x5749_4E44_4F57_3200 {
+                touched += 1;
+            }
+        }
+        let back = sbrk(-want);
+        if touched == pages && back == a + want && sbrk(0) == before {
+            bits |= 0x10;
+        }
+    }
+    // 4. the cap: the whole window again is refused (the image and stack already live in it).
+    let big = sbrk(una_abi::USER_WINDOW_BYTES as i64);
     if big == ENOMEM {
         bits |= 8;
     }
-    let mut l = Line { b: [0; 160], n: 0 };
+    let mut l = Line { b: [0; 200], n: 0 };
     l.put(b"BIG: static=");
     l.put(if bits & 1 != 0 { b"ok".as_slice() } else { b"bad".as_slice() });
     l.put(b" fnv=");
@@ -183,6 +208,10 @@ pub extern "C" fn _start() -> ! {
     l.dec(grown.max(0) as u64);
     l.put(b" cap=");
     l.put(if bits & 8 != 0 { b"refused".as_slice() } else { b"bad".as_slice() });
+    l.put(b" alloc48m=");
+    l.put(if bits & 0x10 != 0 { b"ok".as_slice() } else { b"bad".as_slice() });
+    l.put(b" pages=");
+    l.dec(touched);
     l.put(b"\n");
     write(&l.b[..l.n]);
     exit(((ck as u64) & 0x7FFF_FF00) | bits)

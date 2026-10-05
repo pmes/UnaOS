@@ -1193,7 +1193,7 @@ fn main() {
     if big_elf.exists() {
         // The ring-3 image cap — una_abi::USER_WINDOW_BYTES; scripts/window-parity.sh holds this literal,
         // arroyo's USER_WINDOW_BYTES and the una-abi constant to one number.
-        const USER_WINDOW_BYTES: u64 = 4194304;
+        const USER_WINDOW_BYTES: u64 = 67108864; // WINDOW2 (B361): 64 MiB
         let n = std::fs::metadata(&big_elf).unwrap().len();
         assert!(n <= USER_WINDOW_BYTES, "BIG-X86.ELF {} bytes > USER_WINDOW_BYTES {}", n, USER_WINDOW_BYTES);
         std::fs::copy(&big_elf, esp_apps.join("BIG.ELF")).unwrap();

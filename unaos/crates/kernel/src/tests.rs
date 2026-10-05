@@ -245,7 +245,7 @@ fn ensure_ring3win() {
     #[cfg(target_arch = "x86_64")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); register("window", crate::window2::selftest); } // WINDOW2 (B361): `tests window`
     }
 }
 

@@ -6,7 +6,8 @@
 # mailbox. The policy, formats and codec are `holocron_core` (the same crate the host daemon links); this
 # program brings the metal's I/O: the store over SYS_PATH_READ/WRITE under `<home>/.config/unaos/holocron/`
 # (UnaFS only), entropy from SYS_GETRANDOM through CRYPTOCORE's DRBG, the owner from SYS_WHOAMI, the ring
-# KDF through SYS_KDF (Argon2id does not fit the 4 MiB window). Linked in the ELF window. x86_64 only.
+# KDF in ring 3 (WINDOW2, B361: Argon2id over SYS_SBRK memory in the 64 MiB window; SYS_KDF only for a ring that does
+# not fit). Linked in the ELF window. x86_64 only.
 #
 # The empty [workspace] table makes this crate its OWN workspace root.
 [workspace]

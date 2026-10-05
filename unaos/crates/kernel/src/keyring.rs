@@ -9,9 +9,12 @@
 //! secret or answers a verb:
 //!
 //! 1. [`kdf`] — the body of `SYS_KDF` (66): Argon2id with CRYPTOCORE's `crypto_core::argon2`, the exact call
-//!    `holocron_core::cc::CryptoCore::derive_key` makes, because the ring key's memory (19..=64 MiB) does
-//!    not fit the 4 MiB ring-3 window. The blocks come from the kernel heap FALLIBLY (`-ENOMEM`, never a
-//!    panic) and are zeroed before they go back.
+//!    `holocron_core::cc::CryptoCore::derive_key` makes. HOLOCRON2 needed it because the ring key's memory
+//!    (19..=64 MiB) did not fit the 4 MiB ring-3 window; WINDOW2 (B361, R85) raised the window to 64 MiB and
+//!    HOLOCRON.ELF derives in ring 3 again — SYS_KDF STAYS as a kernel service (and `tests window`'s
+//!    reference computation), used by Holocron only to unlock a ring whose recorded memory the window cannot
+//!    hold. The blocks come from the kernel heap FALLIBLY (`-ENOMEM`, never a panic) and are zeroed before
+//!    they go back.
 //! 2. [`after_login`] — the login path's launch: when the user's ring file exists
 //!    (`<home>/.config/unaos/holocron/.ring`) and `/apps/HOLOCRON.ELF` is staged, the fulfiller starts in
 //!    the new session (locked; `holocron unlock <pw>` opens it). The session's end ends it (SECLOGIN).

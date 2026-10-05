@@ -4005,3 +4005,20 @@ counters), the slot's teardown, and a fresh mount showing neither name left on t
 
 **Still owed.** x86 metal for the whole STOR-1/STOR-2 arc; knob-on this now includes STOR2-MV.
 Persisting created files to disk across a boot remains U11 M2's work.
+
+## The ring-3 ELF window (RING3WIN B316 → WINDOW2 B361)
+
+`una_abi::USER_WINDOW_BYTES` = **64 MiB** (67108864; RING3WIN shipped 4 MiB, WINDOW2 raised it under R85).
+Every UnaOS ring-3 address space carries the ELF window at `base + USER_XWIN_OFF` (2 MiB) for
+`USER_WINDOW_BYTES`: x86 `USER_XWIN_VA_X86` = 0x10000200000 (PD entries 1..=32 of the slot's own PD);
+aarch64 `USER_XWIN_VA_ARM` = 481 GiB + 2 MiB (L2 entries 1..=32 of the slot's extension GiB). An image
+linked there gets image span + stack (PT_GNU_STACK, default 64 KiB, max 1 MiB) + one guard page within
+the window and a `SYS_SBRK` (58) heap from its last segment to the guard; an image linked at 0 keeps the
+16 KiB fixed window and gets the whole ELF window as heap. The page tables behind the window are heap
+frames wired on the first touch of each 2 MiB and freed at teardown (no `.bss` per slot; 32 tables per
+slot at most), as are the data frames. The launcher's file cap is the window on x86 and a quarter of the
+48 MiB kernel heap (12 MiB) on aarch64 (`xwin::IMAGE_CAP`). One number: `unaos/scripts/window-parity.sh`
+holds una-abi, the kernel, arroyo and the builder to it. Linux ABI (x86 `linuxabi/elf.rs`): a static
+ET_EXEC may load in `0x10000..64 MiB` (`IMAGE_LIMIT`, checked to be free RAM outside the kernel heap; the
+user frame pool starts above it); a static-PIE ET_DYN loads at `PIE_BASE` in the process's private
+PML4[2] half. Design and numbers: `docs/dev/evidence/rmbp-1005/WINDOW2.md`.

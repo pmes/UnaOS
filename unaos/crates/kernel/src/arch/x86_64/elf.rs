@@ -301,7 +301,7 @@ fn validate_elf_model(
             ":: RING3WIN: refused image span={} stack={} cap={} -ENOMEM ::",
             max_end - min_vaddr, stack, memory::XWIN_BYTES
         );
-        return Err("RING3WIN: image + stack exceed the 4 MiB ELF window (-ENOMEM)");
+        return Err("RING3WIN: image + stack exceed the ELF window (USER_WINDOW_BYTES, -ENOMEM)");
     }
     if !entry_in_exec {
         return Err("entry not in an executable segment");
