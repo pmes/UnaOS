@@ -2191,6 +2191,7 @@ pub fn font_repaint() {
     if is_open() {
         repaint();
     }
+}
 
 // ── INSTALLBARE (rmbp-ledger B364, R86) ─────────────────────────────────────────────────────────────────────────
 
