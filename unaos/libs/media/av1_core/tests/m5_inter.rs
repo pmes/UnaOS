@@ -215,3 +215,22 @@ fn invalid_streams_never_panic() {
     }
     eprintln!("invalid corpus: {fed} temporal units fed without a panic");
 }
+
+#[test]
+fn layered_avif_decodes_its_top_layer() {
+    // Xiph's two-layer AVIF: the 1296x864 top layer is inter-predicted (with reference scaling)
+    // from the base layer, and the stream uses segmentation. Chromium oracle: 43.75 dB RGB
+    // (luma 56.3 dB in 2x2-averaged Y'CbCr; the blue channel carries clipped saturated chroma).
+    let Some(f) = fetch("fruits_2layer_thumbsize") else { return };
+    let p = decode_avif_planes(&f, Filters::default()).unwrap();
+    assert_eq!((p.width, p.height), (1296, 864));
+    assert!(p.stats.inter_blocks > 0 && p.stats.scaled_ref_blocks > 0 && p.stats.segmentation && p.stats.tiles_exit_bad == 0);
+    let h = fnv64(&[&p.y, &p.u, &p.v]);
+    if std::env::var("AV1_PRINT_PINS").is_ok() {
+        println!("PIN_FRUITS = 0x{h:016x}");
+        return;
+    }
+    assert_eq!(h, PIN_FRUITS, "fruits_2layer planes changed (0x{h:016x})");
+}
+
+const PIN_FRUITS: u64 = 0x1e177e20c3ebc4a6;

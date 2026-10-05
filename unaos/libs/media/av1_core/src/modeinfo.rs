@@ -128,6 +128,7 @@ impl<'a, 'f> Dec<'a, 'f> {
                 let ctx = self.left_seg_pred_context[self.mi_row] as usize + self.above_seg_pred_context[self.mi_col] as usize;
                 let seg_id_predicted = sym!(self, self.cdf.segment_id_predicted[ctx]);
                 if seg_id_predicted != 0 {
+                    self.fs.stats.seg_id_predicted += 1;
                     self.segment_id = predicted_segment_id;
                 } else {
                     self.read_segment_id();

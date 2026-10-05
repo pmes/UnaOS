@@ -617,6 +617,24 @@ fn ivf_mode(args: &[String]) -> ExitCode {
     if failed || (!md5ref.is_empty() && matched != md5ref.len()) { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }
 
+fn p3_to_srgb(rgba: &mut [u8]) {
+    let lin = |c: f64| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    let enc = |c: f64| {
+        let c = c.clamp(0.0, 1.0);
+        if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+    };
+    const M: [[f64; 3]; 3] = [[1.2249401, -0.2249404, 0.0], [-0.0420569, 1.0420571, 0.0], [-0.0196376, -0.0786361, 1.0982735]];
+    for px in rgba.chunks_mut(4) {
+        let r = lin(px[0] as f64 / 255.0);
+        let g = lin(px[1] as f64 / 255.0);
+        let b = lin(px[2] as f64 / 255.0);
+        for k in 0..3 {
+            let v = M[k][0] * r + M[k][1] * g + M[k][2] * b;
+            px[k] = (enc(v) * 255.0 + 0.5) as u8;
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1].ends_with(".ivf") {
@@ -708,7 +726,14 @@ fn main() -> ExitCode {
         }
         std::fs::write(path, raw).expect("write yuv");
     }
-    let img = planes_to_rgba_with(&planes, up, conv);
+    let mut img = planes_to_rgba_with(&planes, up, conv);
+    if planes.color_primaries == 12 && planes.transfer_characteristics == 13 {
+        // ORACLE ONLY: Chromium colour-manages Display P3 content into the sRGB output profile;
+        // do the same (sRGB EOTF, P3-D65 -> sRGB linear matrix, sRGB OETF) so the comparison
+        // measures the decoder, not the gamut.
+        p3_to_srgb(&mut img.rgba);
+        println!("oracle: Display P3 -> sRGB gamut conversion applied to the PNG");
+    }
     std::fs::write(&args[2], png_rgba(img.w, img.h, &img.rgba)).expect("write png");
     ExitCode::SUCCESS
 }

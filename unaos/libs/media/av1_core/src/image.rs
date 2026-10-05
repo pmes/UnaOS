@@ -423,9 +423,24 @@ pub fn decode_avif_planes(file: &[u8], filters: Filters) -> Result<Planes> {
     let cfg = item.av1c.as_ref().map(|c| c.config_obus.as_slice()).unwrap_or(&[]);
     let mut p = decode_obus(&item.data, cfg, filters)?;
     if item.width != 0 && (item.width != p.width || item.height != p.height) {
-        // e.g. a layered image (a1lx/lsel) whose base layer is smaller than the image: the upper
-        // layers are predicted from the base (inter prediction) — owed, never silently downsized.
-        return Err(Error::Unsupported("image size differs from the first frame (layered AVIF needs inter)"));
+        // A layered image (a1lx / a1op / lsel): the item holds several frames, the upper spatial
+        // layers predicted from the lower ones. Decode them all (operating point 0) and present the
+        // highest layer — the last shown frame at the image's own size (ispe).
+        let mut d = Decoder::new();
+        d.filters = filters;
+        if !cfg.is_empty() {
+            for o in split_obus(cfg)? {
+                if o.obu_type == OBU_SEQUENCE_HEADER_T {
+                    d.seq = Some(SequenceHeader::parse(o.payload)?);
+                }
+            }
+        }
+        let frames = d.decode(&item.data, false)?;
+        p = frames
+            .into_iter()
+            .filter(|f| f.width == item.width && f.height == item.height)
+            .next_back()
+            .ok_or(Error::Unsupported("no layer of the image's size (ispe)"))?;
     }
     if let Some(n) = item.nclx {
         // The container's nclx box is authoritative for presentation (AVIF §2.2.1).

@@ -146,6 +146,10 @@ pub struct ToolStats {
     pub temporal_mvs: bool,
     /// Film grain was synthesised on this output frame (§7.18.3).
     pub film_grain: bool,
+    /// Superblocks that read delta_lf (§5.11.13).
+    pub delta_lf_reads: u32,
+    /// Blocks whose segment id came from the temporal prediction (seg_id_predicted = 1).
+    pub seg_id_predicted: u32,
 }
 
 impl FrameState {
@@ -1450,6 +1454,7 @@ impl<'a, 'f> Dec<'a, 'f> {
             return;
         }
         if self.read_deltas && self.hdr.delta_lf_present {
+            self.fs.stats.delta_lf_reads += 1;
             let mut frame_lf_count = 1;
             if self.hdr.delta_lf_multi {
                 frame_lf_count = if self.fs.num_planes > 1 { FRAME_LF_COUNT } else { FRAME_LF_COUNT - 2 };
