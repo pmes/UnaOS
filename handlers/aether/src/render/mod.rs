@@ -84,7 +84,7 @@ fn blend_px(surface: &mut [u8], width: u32, x: u32, y: u32, (r, g, b): (u8, u8, 
 /// (bold, glyph id, quarter-px font size); holds the coverage bitmap and
 /// its raster-bounds origin. Cleared implicitly by process lifetime —
 /// glyphs are font-global, not page-scoped.
-type GlyphKey = (u8, u32, u32); // (fonts::face_key, glyph, quarter-px size)
+type GlyphKey = (u8, u32, u32, u8); // (fonts::face_key, glyph, quarter-px size, subpixel x phase)
 struct CachedGlyph {
     origin: (i32, i32),
     w: i32,
@@ -96,13 +96,40 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// Horizontal subpixel phases a glyph is rasterized at: glyph origins keep
+/// their fractional pen position to a quarter pixel, as Skia positions text
+/// on Linux without hinting (measured on EYES: 0.981 -> 0.983 mean).
+const SUBPX_STEPS: u8 = 4;
+
+/// Draws one glyph with its origin at (x, baseline): the integer pixel
+/// plus a quantized subpixel phase rasterized into the glyph.
+#[allow(clippy::too_many_arguments)]
+fn draw_glyph(
+    font: &Font, font_key: u8, glyph_id: u32, font_size: f32, x: f32, baseline_y: f32, color: (u8, u8, u8),
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    let steps = SUBPX_STEPS;
+    let mut ix = x.floor();
+    let mut sub = ((x - ix) * steps as f32).round() as u8;
+    if sub >= steps {
+        sub = 0;
+        ix += 1.0;
+    }
+    if rasterize_glyph_cached(font, font_key, glyph_id, font_size, sub).is_some() {
+        blit_cached_glyph(font_key, glyph_id, font_size, sub, ix, baseline_y, color, surface, width, height, damage_rects, clip);
+    }
+}
+
 fn rasterize_glyph_cached(
     font: &Font,
     font_key: u8,
     glyph_id: u32,
     font_size: f32,
+    sub: u8,
 ) -> Option<(i32, i32, i32, i32)> {
-    let key = (font_key, glyph_id, (font_size * 4.0) as u32);
+    let key = (font_key, glyph_id, (font_size * 4.0) as u32, sub);
+    let steps = SUBPX_STEPS;
+    let shift = Transform2F::from_translation(pathfinder_geometry::vector::Vector2F::new(sub as f32 / steps as f32, 0.0));
     GLYPHS.with(|g| {
         if !g.borrow().contains_key(&key) {
             let computed = (|| {
@@ -110,7 +137,7 @@ fn rasterize_glyph_cached(
                     .raster_bounds(
                         glyph_id,
                         font_size,
-                        Transform2F::default(),
+                        shift,
                         HintingOptions::None,
                         RasterizationOptions::GrayscaleAa,
                     )
@@ -123,16 +150,17 @@ fn rasterize_glyph_cached(
                     &mut canvas,
                     glyph_id,
                     font_size,
-                    Transform2F::from_translation(-bounds.origin().to_f32()),
+                    Transform2F::from_translation(-bounds.origin().to_f32()) * shift,
                     HintingOptions::None,
                     RasterizationOptions::GrayscaleAa,
                 )
                 .ok()?;
+                let cov = canvas.pixels;
                 Some(CachedGlyph {
                     origin: (bounds.origin().x(), bounds.origin().y()),
                     w: bounds.size().x(),
                     h: bounds.size().y(),
-                    cov: canvas.pixels,
+                    cov,
                 })
             })();
             g.borrow_mut().insert(key, computed);
@@ -150,6 +178,7 @@ fn blit_cached_glyph(
     font_key: u8,
     glyph_id: u32,
     font_size: f32,
+    sub: u8,
     origin_x: f32,
     baseline_y: f32,
     color: (u8, u8, u8),
@@ -159,7 +188,7 @@ fn blit_cached_glyph(
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let key = (font_key, glyph_id, (font_size * 4.0) as u32);
+    let key = (font_key, glyph_id, (font_size * 4.0) as u32, sub);
     GLYPHS.with(|g| {
         let g = g.borrow();
         let Some(Some(c)) = g.get(&key) else { return };
@@ -542,12 +571,14 @@ fn draw_glyph_run(
     for c in text.chars() {
         let advance = adv.char(c);
         if c != ' ' {
-            if let Some(glyph_id) = font.glyph_for_char(c) {
-                if rasterize_glyph_cached(font, font_key, glyph_id, font_size).is_some() {
-                    blit_cached_glyph(
-                        font_key, glyph_id, font_size, origin_x + pen_x, baseline_y, color, surface, width, height,
-                        damage_rects, clip,
-                    );
+            if let Some(glyph_id) = font.glyph_for_char(c).filter(|&g| g != 0) {
+                draw_glyph(
+                    font, font_key, glyph_id, font_size, origin_x + pen_x, baseline_y, color, surface, width, height,
+                    damage_rects, clip,
+                );
+            } else if let Some((ff, fk)) = crate::fonts::fallback_for(c, crate::fonts::key_is_bold(font_key)) {
+                if let Some(g) = ff.glyph_for_char(c) {
+                    draw_glyph(&ff, fk, g, font_size, origin_x + pen_x, baseline_y, color, surface, width, height, damage_rects, clip);
                 }
             }
         }
@@ -697,13 +728,14 @@ fn draw_lines(
         for c in line.text.chars() {
             let advance = adv.char(c);
             if c != ' ' {
-                if let Some(glyph_id) = font.glyph_for_char(c) {
-                    if rasterize_glyph_cached(font, font_key, glyph_id, font_size).is_some() {
-                        blit_cached_glyph(
-                            font_key, glyph_id, font_size,
-                            origin_x + pen_x, baseline_y,
-                            color, surface, width, height, damage_rects, clip,
-                        );
+                if let Some(glyph_id) = font.glyph_for_char(c).filter(|&g| g != 0) {
+                    draw_glyph(
+                        font, font_key, glyph_id, font_size, origin_x + pen_x, baseline_y, color, surface, width,
+                        height, damage_rects, clip,
+                    );
+                } else if let Some((ff, fk)) = crate::fonts::fallback_for(c, crate::fonts::key_is_bold(font_key)) {
+                    if let Some(g) = ff.glyph_for_char(c) {
+                        draw_glyph(&ff, fk, g, font_size, origin_x + pen_x, baseline_y, color, surface, width, height, damage_rects, clip);
                     }
                 }
             }

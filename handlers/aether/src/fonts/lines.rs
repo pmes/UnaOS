@@ -82,20 +82,29 @@ impl<'a> Advancer<'a> {
         if c == ' ' {
             return self.space + self.ls;
         }
-        let units = ADVANCES.with(|m| {
+        // Cached in em (advance / units-per-em), so a fallback face with
+        // its own units per em measures right.
+        let em = ADVANCES.with(|m| {
             if let Some(a) = m.borrow().get(&(self.key, c)) {
                 return *a;
             }
-            let a = self
-                .font
-                .glyph_for_char(c)
-                .and_then(|g| self.font.advance(g).ok())
-                .map(|a| a.x())
-                .unwrap_or(0.0);
+            let upem = self.font.metrics().units_per_em as f32;
+            let a = match self.font.glyph_for_char(c).filter(|&g| g != 0) {
+                Some(g) => self.font.advance(g).map(|a| a.x() / upem).unwrap_or(0.0),
+                // The glyph comes from the fallback face (fonts::fallback_for),
+                // drawn with ITS advance.
+                None => super::fallback_for(c, super::key_is_bold(self.key))
+                    .and_then(|(f, _)| {
+                        let g = f.glyph_for_char(c)?;
+                        let u = f.metrics().units_per_em as f32;
+                        f.advance(g).ok().map(|a| a.x() / u)
+                    })
+                    .unwrap_or(0.0),
+            };
             m.borrow_mut().insert((self.key, c), a);
             a
         });
-        units * self.scale + self.ls
+        em * self.scale * self.font.metrics().units_per_em as f32 + self.ls
     }
     pub fn str(&self, s: &str) -> f32 {
         s.chars().map(|c| self.char(c)).sum()

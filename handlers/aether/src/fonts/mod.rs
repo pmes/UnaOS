@@ -12,6 +12,61 @@ pub fn face_key(family: u8, bold: bool, italic: bool) -> u8 {
     family.min(2) * 4 + (bold as u8) * 2 + italic as u8
 }
 
+/// The system fallback chain for characters the run's face lacks: the
+/// order fontconfig sorts `sans-serif` on the reference machine (DejaVu
+/// Sans, then WenQuanYi Zen Hei for CJK, ...), which is what Chromium's
+/// per-character fallback (FontCache::GetFontForCharacter, fontconfig)
+/// resolves to.
+const FALLBACK: &[&str] = &["DejaVu Sans", "WenQuanYi Zen Hei", "Loma", "IPAGothic", "FreeSans", "FreeSerif", "Unifont"];
+
+/// The first fallback face holding a glyph for `c`, with its glyph-cache key
+/// (64 + 2 x chain index + bold). None when no face has it.
+pub fn fallback_for(c: char, bold: bool) -> Option<(Arc<Font>, u8)> {
+    use font_kit::properties::Weight;
+    thread_local! {
+        static FACES: std::cell::RefCell<std::collections::HashMap<(usize, bool), Option<Arc<Font>>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+        static PICK: std::cell::RefCell<std::collections::HashMap<(char, bool), Option<usize>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let load = |i: usize| -> Option<Arc<Font>> {
+        FACES.with(|f| {
+            if let Some(x) = f.borrow().get(&(i, bold)) {
+                return x.clone();
+            }
+            let mut props = Properties::new();
+            if bold {
+                props.weight(Weight::BOLD);
+            }
+            let name = [FamilyName::Title(FALLBACK[i].to_string())];
+            let src = SystemSource::new();
+            let face = src
+                .select_best_match(&name, &props)
+                .ok()
+                .and_then(|h| h.load().ok())
+                .filter(|f| f.family_name().eq_ignore_ascii_case(FALLBACK[i]) || f.family_name().starts_with(FALLBACK[i].split(' ').next().unwrap_or("")))
+                .map(Arc::new);
+            f.borrow_mut().insert((i, bold), face.clone());
+            face
+        })
+    };
+    let idx = PICK.with(|p| p.borrow().get(&(c, bold)).copied());
+    let idx = match idx {
+        Some(i) => i,
+        None => {
+            let found = (0..FALLBACK.len()).find(|&i| load(i).is_some_and(|f| f.glyph_for_char(c).is_some_and(|g| g != 0)));
+            PICK.with(|p| p.borrow_mut().insert((c, bold), found));
+            found
+        }
+    }?;
+    load(idx).map(|f| (f, 64 + 2 * idx as u8 + bold as u8))
+}
+
+/// Whether the face key's face is bold (keys from `face_key`).
+pub fn key_is_bold(key: u8) -> bool {
+    key < 64 && key & 2 != 0
+}
+
 /// THE face for a text run — the text measurer (layout::remeasure) and the
 /// painter (render::draw_node) both call this, so a run is wrapped with
 /// exactly the advances it is drawn with. Loaded once per thread per face;
