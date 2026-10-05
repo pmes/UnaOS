@@ -311,3 +311,26 @@ pub fn drbg_fill(out: &mut [u8]) -> &'static str {
     d.key = h.finalize();
     seed_source()
 }
+
+// =================================================================================================
+// CRYPTOCORE (LEDGER SR27): this pool as a `crypto_core::drbg::Entropy`, so kernel code can run the
+// shared ChaCha20 fast-key-erasure DRBG (`crypto_core::drbg::ChaChaDrbg::new(KernelEntropy, b"..")`)
+// instead of growing a second generator. Each 32-byte chunk is one `fill` draw (RDRAND / RNDR / jitter,
+// the source SAID as above). Appended at the tail so no `panic::Location` above moves. No consumer yet:
+// the SYS_GETRANDOM DRBG above stays as it is until a gated arc swaps it.
+// =================================================================================================
+
+/// The kernel entropy pool as a CRYPTOCORE entropy source.
+pub struct KernelEntropy;
+
+impl crypto_core::drbg::Entropy for KernelEntropy {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), crypto_core::Error> {
+        for chunk in out.chunks_mut(32) {
+            let mut b = [0u8; 32];
+            fill(&mut b);
+            chunk.copy_from_slice(&b[..chunk.len()]);
+            crypto_core::ct::Zeroize::zeroize(&mut b);
+        }
+        Ok(())
+    }
+}

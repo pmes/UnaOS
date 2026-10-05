@@ -1445,6 +1445,10 @@ dependencies = [
  "serdect",
  "subtle",
  "zeroize",
+name = "crypto-check"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
 ]
 
 [[package]]
@@ -1475,6 +1479,13 @@ checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
 dependencies = [
  "crypto-bigint 0.7.5",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "crypto_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
 ]
 
 [[package]]
