@@ -915,10 +915,10 @@ fn note_ethertype(f: &[u8]) {
     let et = u16::from_be_bytes([f[12], f[13]]);
     let _ = FIRST_ETYPE.compare_exchange(0, et, Ordering::Relaxed, Ordering::Relaxed); NF_LAST_ETYPE.store(et, Ordering::Relaxed); // NETFRAME: the newest frame's ethertype, for `tests usbnet7`
     match et {
-        0x0806 => { RX_ARP.fetch_add(1, Ordering::Relaxed); }
+        0x0806 => { RX_ARP.fetch_add(1, Ordering::Relaxed); u8_arp_seen(f); } // USBNET8: the txprobe's answer
         0x86dd => { RX_V6.fetch_add(1, Ordering::Relaxed); }
         0x0800 => {
-            RX_V4.fetch_add(1, Ordering::Relaxed);
+            RX_V4.fetch_add(1, Ordering::Relaxed); u8_v4_seen(f); // USBNET8: a LAN peer for the txprobe
             let ihl = ((f.get(14).copied().unwrap_or(0) & 0x0f) as usize) * 4;
             if f.len() >= 14 + ihl + 4 && f[23] == 17 && u16::from_be_bytes([f[14 + ihl], f[15 + ihl]]) == 67 { RX_DHCP.fetch_add(1, Ordering::Relaxed); }
         }
@@ -1338,6 +1338,7 @@ pub fn usbnet7_selftest() {
     }
     let (f0, v40, d0) = (RX_FRAMES.load(Ordering::Relaxed), RX_V4.load(Ordering::Relaxed), RX_DHCP.load(Ordering::Relaxed));
     let t0 = crate::arch::ms();
+    let probe = u8_txprobe_send(t0); // USBNET8 M5: does our TX reach the LAN at all? (an ARP probe for a peer we have heard)
     let mut first_ms: Option<u64> = None;
     let mut first_et = 0u16;
     while crate::arch::ms().saturating_sub(t0) < NF_WINDOW_MS {
@@ -1360,6 +1361,7 @@ pub fn usbnet7_selftest() {
         ":: USBNET7: rx_ok={} frames={} first_frame_ms={} ethertype={} dhcp={} kicks={} resets={} idle_rungs={} -> {} ::",
         RX_OK.load(Ordering::Relaxed), frames, fms, et, if offer { "offer" } else { "none" }, u8_needed().0, u8_needed().1, u8_needed().2, if pass { "PASS" } else { "FAIL" }
     );
+    u8_txprobe_report(probe);
     if !pass { netframe_rxlog(); }
 }
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
@@ -1417,4 +1419,54 @@ fn u8_needed() -> (u64, u64, u64) {
 fn u8_first_frame_ms() -> Option<u64> {
     let (a, f) = (U8_FIRST_ARM_AT.load(Ordering::Relaxed), FIRST_FRAME_AT.load(Ordering::Relaxed));
     if a == 0 || f == 0 { None } else { Some(f.saturating_sub(a)) }
+}
+
+// ── USBNET8 M5: the TX question ─────────────────────────────────────────────────────────────────────
+// Flight 23: 33 IPv4 frames reached the ring, not one from UDP port 67, across six minutes of DISCOVERs whose OUT TDs all
+// completed (tx=58). Nothing we ever sent has drawn an answer, so nothing says our frames reach the LAN. Under
+// `tests usbnet7` only (R80): one ARP probe (RFC 5227: sender IP 0.0.0.0, so no peer's cache is touched) for the newest
+// IPv4 source the census heard, and whether that peer answers our MAC.
+static U8_PEER_V4: AtomicU32 = AtomicU32::new(0);
+static U8_PROBE_IP: AtomicU32 = AtomicU32::new(0);
+static U8_PROBE_AT: AtomicU64 = AtomicU64::new(0);
+static U8_PROBE_REPLY_AT: AtomicU64 = AtomicU64::new(0);
+/// An IPv4 frame on the ring: remember its source (not 0.0.0.0, not a multicast/broadcast source, not our own MAC's).
+fn u8_v4_seen(f: &[u8]) {
+    if f.len() < 34 || f[6..12] == mac() { return; }
+    let ip = u32::from_be_bytes([f[26], f[27], f[28], f[29]]);
+    if ip != 0 && f[26] < 224 && ip != u32::MAX { U8_PEER_V4.store(ip, Ordering::Relaxed); }
+}
+/// An ARP frame on the ring: a reply (op 2) from the probed address to our MAC answers the probe.
+fn u8_arp_seen(f: &[u8]) {
+    let want = U8_PROBE_IP.load(Ordering::Relaxed);
+    if want == 0 || f.len() < 42 || u16::from_be_bytes([f[20], f[21]]) != 2 { return; }
+    if u32::from_be_bytes([f[28], f[29], f[30], f[31]]) == want && f[32..38] == mac() {
+        let _ = U8_PROBE_REPLY_AT.compare_exchange(0, crate::arch::ms().max(1), Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+/// Queue the probe (the data pass issues it). Returns the target, 0 when no IPv4 peer has been heard yet.
+fn u8_txprobe_send(now: u64) -> u32 {
+    let ip = U8_PEER_V4.load(Ordering::Relaxed);
+    U8_PROBE_REPLY_AT.store(0, Ordering::Relaxed);
+    U8_PROBE_IP.store(ip, Ordering::Relaxed);
+    if ip == 0 { return 0; }
+    let m = mac();
+    let mut fr = [0u8; 60]; // 42 bytes of ARP, zero-padded to the Ethernet minimum
+    fr[0..6].copy_from_slice(&[0xff; 6]);
+    fr[6..12].copy_from_slice(&m);
+    fr[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    fr[14..22].copy_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01]); // Ethernet, IPv4, request
+    fr[22..28].copy_from_slice(&m); // sender MAC; sender IP 28..32 stays 0.0.0.0 (a probe)
+    fr[38..42].copy_from_slice(&ip.to_be_bytes()); // target IP; target MAC 32..38 stays zero
+    U8_PROBE_AT.store(now.max(1), Ordering::Relaxed);
+    raw_tx(&fr);
+    ip
+}
+/// `[usbnet] txprobe arp who_has=<ip> sent=<0|1> reply_ms=<n|none> tx=<completions>`.
+fn u8_txprobe_report(ip: u32) {
+    let o = ip.to_be_bytes();
+    let (at, rep) = (U8_PROBE_AT.load(Ordering::Relaxed), U8_PROBE_REPLY_AT.load(Ordering::Relaxed));
+    let rms = if ip != 0 && rep != 0 { alloc::format!("{}", rep.saturating_sub(at)) } else { alloc::string::String::from("none") };
+    serial_println!("[usbnet] txprobe arp who_has={}.{}.{}.{} sent={} reply_ms={} tx={}", o[0], o[1], o[2], o[3], (ip != 0) as u8, rms, TX_FRAMES.load(Ordering::Relaxed));
+    U8_PROBE_IP.store(0, Ordering::Relaxed);
 }
