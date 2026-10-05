@@ -1380,3 +1380,159 @@ mod holocron2_tests {
         assert_eq!(launch_mode(APP_FLAG_RESIDENT), LaunchMode::Detach);
     }
 }
+
+// =============================================================================
+// CONSOLEFIX M3 (rmbp-ledger B365, R65) — A PASSWORD NEVER REACHES THE WIRE
+// =============================================================================
+//
+// Flight 22: `:: [midden] cmd="holocron init qwerty peter" -> Exec holocron.elf ::` — the kernel's
+// command tracer echoed the line verbatim, and `holocron put vein claude.api_key sk-…` went out the same
+// way. R65's rule (a password is never on the wire) covers the console verbs. THIS table is the one
+// answer to "where does the secret start on this line?", for both rings: the kernel's tracer and its
+// raw-key echoes, `handlers/midden`'s history, anything that prints a typed line.
+//
+// A shape is `(word, subwords, kept)`: the line's first word (canonical, path and `.elf` stripped), the
+// second word it requires (`&[]` = any), and how many words stay readable. Everything after the kept
+// words is the secret.
+
+/// `(program or verb, required second word (empty = any), words kept readable)`.
+pub const SECRET_SHAPES: &[(&str, &[&str], usize)] = &[
+    ("holocron", &["init", "unlock", "put"], 2),
+    ("login", &[], 2),
+    ("adduser", &[], 2),
+    ("passwd", &[], 1),
+    ("su", &[], 1),
+];
+
+/// The first word as the table reads it: last path component, ASCII-lowercased, a trailing `.elf` cut.
+fn secret_word(tok: &str) -> String {
+    let leaf = tok.rsplit('/').next().unwrap_or(tok);
+    let w = canon_verb(leaf);
+    match w.strip_suffix(".elf") {
+        Some(b) => b.to_string(),
+        None => w,
+    }
+}
+
+/// The byte offset where the secret begins on `line`, or `None` when the line is not secret-shaped (yet).
+///
+/// It is a PREFIX question too, which is what the raw-key echoes need while a line is being typed:
+/// `"holocron init"` is `None` (the next byte may be `\r`), `"holocron init "` is `Some(14)` — every byte
+/// typed from here on is secret — and `"holocron init qwerty"` is `Some(14)`.
+pub fn secret_from(line: &str) -> Option<usize> {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    let mut words: [(usize, usize); 3] = [(0, 0); 3];
+    let mut nw = 0usize;
+    while nw < 3 {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        let s = i;
+        while i < b.len() && !b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        words[nw] = (s, i);
+        nw += 1;
+    }
+    if nw == 0 {
+        return None;
+    }
+    let first = secret_word(&line[words[0].0..words[0].1]);
+    let (_, subs, kept) = SECRET_SHAPES.iter().find(|(w, _, _)| *w == first)?;
+    if !subs.is_empty() {
+        if nw < 2 {
+            return None;
+        }
+        let sub = canon_verb(&line[words[1].0..words[1].1]);
+        if !subs.iter().any(|s| *s == sub) {
+            return None;
+        }
+    }
+    if nw < *kept {
+        return None;
+    }
+    let end = words[*kept - 1].1;
+    // The kept words must be FINISHED: whitespace after the last one, or a later word.
+    let rest = &b[end..];
+    if rest.first().is_some_and(|c| c.is_ascii_whitespace()) {
+        let mut j = end;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        Some(j)
+    } else {
+        None
+    }
+}
+
+/// `line` as it may be printed: the kept words and ` ***` when anything follows them; `None` = print the
+/// line as typed (not secret-shaped, or nothing secret on it yet).
+pub fn redact(line: &str) -> Option<String> {
+    let at = secret_from(line)?;
+    if line[at..].trim().is_empty() {
+        return None;
+    }
+    Some(format!("{} ***", line[..at].trim()))
+}
+
+/// The KAT both rings run (the host in `cargo test`, the kernel in `tests pwwire`): `(line, expected)`.
+/// `None` = printed as typed.
+pub const REDACT_KAT: &[(&str, Option<&str>)] = &[
+    ("holocron init qwerty peter", Some("holocron init ***")),
+    ("holocron unlock hunter2", Some("holocron unlock ***")),
+    ("holocron put vein claude.api_key sk-ant-xyz", Some("holocron put ***")),
+    ("  HOLOCRON.ELF   init  pw ", Some("HOLOCRON.ELF   init ***")),
+    ("/apps/holocron.elf unlock pw", Some("/apps/holocron.elf unlock ***")),
+    ("holocron get vein claude.api_key", None),
+    ("holocron init", None),
+    ("login peter qwerty", Some("login peter ***")),
+    ("login peter", None),
+    ("passwd s3cret", Some("passwd ***")),
+    ("adduser peter pw", Some("adduser peter ***")),
+    ("ls /home/peter", None),
+];
+
+/// Run [`REDACT_KAT`] plus the prefix rule; returns `(passed, total)`.
+pub fn redact_kat() -> (usize, usize) {
+    let mut ok = 0usize;
+    let mut n = 0usize;
+    for (line, want) in REDACT_KAT {
+        n += 1;
+        if redact(line).as_deref() == *want {
+            ok += 1;
+        }
+    }
+    for (line, want) in [("holocron init", None), ("holocron init ", Some(14usize)), ("holocron init q", Some(14)), ("passwd", None), ("passwd ", Some(7))] {
+        n += 1;
+        if secret_from(line) == want {
+            ok += 1;
+        }
+    }
+    (ok, n)
+}
+
+#[cfg(test)]
+mod consolefix_tests {
+    use super::*;
+
+    #[test]
+    fn redact_kat_passes() {
+        for (line, want) in REDACT_KAT {
+            assert_eq!(redact(line).as_deref(), *want, "{line}");
+        }
+        let (ok, n) = redact_kat();
+        assert_eq!(ok, n);
+    }
+
+    #[test]
+    fn a_secret_never_survives_redaction() {
+        for line in ["holocron init qwerty peter", "holocron put vein k sk-ant-flight22-bench-key", "login peter qwerty"] {
+            let r = redact(line).unwrap();
+            assert!(!r.contains("qwerty") && !r.contains("sk-ant"), "{r}");
+        }
+    }
+}

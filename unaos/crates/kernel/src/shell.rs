@@ -5086,9 +5086,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     // nothing prints `len=0` rather than a plausible number.
     match &plan {
         midden_core::Plan::Nothing => {}
-        midden_core::Plan::Say(msg) => serial_println!(
-            ":: [midden] cmd=\"{}\" -> {} len={} ::",
-            cmd_line.trim(), msg.kind(), msg.len()
+        midden_core::Plan::Say(msg) => crate::pwwire::trace( // CONSOLEFIX M3 (B365, R65): THE tracer — redacts `holocron init/unlock/put` and login/passwd-shaped arguments
+            cmd_line,
+            format_args!("{} len={}", msg.kind(), msg.len())
         ),
         // LAUNCH-AR: `cmd=`-shaped, like its three siblings, and NOT the fixture's wording.
         //
@@ -5099,11 +5099,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         // `TerminalError` two thousand lines later. A witness that cannot be told apart from a
         // fixture is not a witness. Same `cmd="<line>" ->` prefix as `Say`/`Host` now, so the
         // operator's dispatch is greppable as one family and the disposition is the tail.
-        midden_core::Plan::Exec { name, .. } => serial_println!(
-            ":: [midden] cmd=\"{}\" -> Exec {} ::", cmd_line.trim(), name
+        midden_core::Plan::Exec { name, .. } => crate::pwwire::trace(
+            cmd_line, format_args!("Exec {}", name)
         ),
-        midden_core::Plan::Host { verb, .. } => serial_println!(
-            ":: [midden] cmd=\"{}\" -> Host verb={} ::", cmd_line.trim(), verb
+        midden_core::Plan::Host { verb, .. } => crate::pwwire::trace(
+            cmd_line, format_args!("Host verb={}", verb)
         ),
     }
 

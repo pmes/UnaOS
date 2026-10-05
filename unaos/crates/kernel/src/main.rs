@@ -1211,7 +1211,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
             // because which pass a given build reaches depends on its knobs.
             #[cfg(feature = "holocron")]
-            unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — the user store loads once the root volume answers and the M1 fixture runs once; same pass, same reason as holocron. ⚠ LINE-NEUTRAL append.
+            unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); unaos_kernel::pwwire::refresh(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ /* CONSOLEFIX M3: the raw-key echoes' cached LOGIN13 state */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — the user store loads once the root volume answers and the M1 fixture runs once; same pass, same reason as holocron. ⚠ LINE-NEUTRAL append.
             // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
             // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
             // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -1335,7 +1335,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 match event {
                     unaos_kernel::pal::Event::Key(c) => {
                         let ch = c as char;
-                        #[cfg(feature = "login")] let hide = unaos_kernel::fs::users::secret_input(); #[cfg(not(feature = "login"))] let hide = false; if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' }); } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
+                        let hide = unaos_kernel::pwwire::withhold_fresh(); /* CONSOLEFIX M3 (B365): the login screen, an adduser prompt, or a console line in its secret part (`holocron init `) */ if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' }); } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
                     }
                     unaos_kernel::pal::Event::Mouse { x, y } => {
                         serial_println!("USB-DEBUG: MOUSE relative dx={} dy={}", x, y);
@@ -1701,7 +1701,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
         // because which pass a given build reaches depends on its knobs.
         #[cfg(feature = "holocron")]
-        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
+        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); unaos_kernel::pwwire::refresh(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ /* CONSOLEFIX M3: the raw-key echoes' cached LOGIN13 state */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
         // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
         // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
         // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -2755,7 +2755,7 @@ fn handle_key(
 ) -> bool {
     console.snap_for_key(c); /* SCROLLBACK (R75) — a typing key snaps a scrolled-up view back to the live bottom */ #[cfg(feature = "login")] match unaos_kernel::fs::users::prompt_key(c, console) { 0 => {} 1 => return false, _ => { console.draw(pal); return false; } } if c == b'\n' || c == b'\r' { console.sel.on_edit(c, console.current_input.len()); // TERMSEL2 — the edit rule now splits: CR/LF drops any selection here (and parks the caret at the end of the empty line it leaves), and the two edit arms below go through `LineSel::type_byte`, which REPLACES a selection on the line instead of dropping it — the rule TERMSEL had to defer for want of a caret. // TERMSEL — THE EDIT RULE, ahead of every edit this function makes: a typed byte, BS/DEL and CR/LF drop a live selection first (`video::termsel::LineSel::on_edit`, which prints `[termsel] none … by=edit` only when one was live and ignores bytes that edit nothing, e.g. the arrow byte a `Shift+←` pushes just ahead of its `SelectLeft`). The editor has no caret, so a selection cannot be REPLACED by what is typed; keeping it across the edit would paint the band over cells that moved. A paste types through this same function, so it drops the selection the same way. Runs on every surface that calls `handle_key`; where no selection can be made (no `Event::Action` consumer) it is a no-op. ⚠ FOLDED onto the existing `if` — `main.rs` embeds `panic::Location` line numbers (PARITY §5.3); CODE FIRST (A10FIX).
         let cmd = console.current_input.clone();
-        console.current_input.clear();
+        console.current_input.clear(); unaos_kernel::pwwire::note_line(""); // CONSOLEFIX M3: the line is submitted — the next byte is not secret
         // GUI-CLICK-2: mark the screen app-owned across the (possibly long-running, full-screen)
         // command so the Pi USB pump leaves input in EVENT_QUEUE for the command's own pump_and_poll
         // (vug/pulse) instead of forwarding it into a GUI_CHANNEL that render_service — blocked HERE
@@ -2765,7 +2765,7 @@ fn handle_key(
         unaos_kernel::gui_watchdog::on_app_enter();
         let took_screen = unaos_kernel::shell::dispatch_command(&cmd, console, pal);
         unaos_kernel::gui_watchdog::on_app_exit();
-        SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+        SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed); unaos_kernel::pwwire::refresh(); // CONSOLEFIX M3: a verb may have opened a password prompt or the screen
         // TERM_RING (MIDDEN_CONVERGENCE §3, M2): THE DRAIN SITE. `dispatch_command` has returned, so
         // the render task owns the view again — the exclusive-drainer contract `termring::drain`
         // requires — and this is the first moment a record staged by a producer that is NOT this task
@@ -2781,11 +2781,11 @@ fn handle_key(
             console.draw(pal);
         }
         return took_screen;
-    } else if unaos_kernel::shellux::wants(c) { let r = unaos_kernel::shellux::console_key(c, console); console.repaint(r, pal); } else if c == 8 || c == 0x7F { // SHELLUX (R75) — Up/Down history, Tab completion, Ctrl-C/L/A/E/U/W reach the line editor; line-neutral fold.
-        let r = console.sel.type_byte(c, &mut console.current_input); // TERMSEL2 M3 — the edit happens AT THE CARET (`LineSel::type_byte`): Backspace deletes the byte before it, and with a selection on the line deletes the selection.
+    } else if unaos_kernel::shellux::wants(c) { let r = unaos_kernel::shellux::console_key(c, console); unaos_kernel::pwwire::note_line(&console.current_input); console.repaint(r, pal); } else if c == 8 || c == 0x7F { // SHELLUX (R75) — Up/Down history, Tab completion, Ctrl-C/L/A/E/U/W reach the line editor; line-neutral fold.
+        let r = console.sel.type_byte(c, &mut console.current_input); unaos_kernel::pwwire::note_line(&console.current_input); // TERMSEL2 M3 — the edit happens AT THE CARET (`LineSel::type_byte`): Backspace deletes the byte before it, and with a selection on the line deletes the selection.
         console.repaint(r, pal);
     } else if c >= 32 && c <= 126 {
-        let r = console.sel.type_byte(c, &mut console.current_input); // TERMSEL2 M3 — a printable byte is INSERTED at the caret, and REPLACES a selection on the line; a scrollback selection is dropped first (repaint 2).
+        let r = console.sel.type_byte(c, &mut console.current_input); unaos_kernel::pwwire::note_line(&console.current_input); // CONSOLEFIX M3 (B365): the line editor publishes whether the line has reached its secret. TERMSEL2 M3 — a printable byte is INSERTED at the caret, and REPLACES a selection on the line; a scrollback selection is dropped first (repaint 2).
         console.repaint(r, pal);
     }
     false
@@ -3580,7 +3580,7 @@ fn usbdebug_event_print(raw: unaos_kernel::pal::Event) {
         unaos_kernel::pal::Event::Key(c) => {
             usbdebug_ptr_rollup_flush();
             let ch = c as char;
-            #[cfg(feature = "login")] let hide = unaos_kernel::fs::users::secret_input(); #[cfg(not(feature = "login"))] let hide = false; if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' }); } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
+            let hide = unaos_kernel::pwwire::withhold_fresh(); /* CONSOLEFIX M3 (B365): the login screen, an adduser prompt, or a console line in its secret part (`holocron init `) */ if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' }); } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
         }
         unaos_kernel::pal::Event::Mouse { x, y } => {
             // The bounded verbatim prologue: the old line, unchanged, for the first reports of the
@@ -5962,7 +5962,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
         // because which pass a given build reaches depends on its knobs.
         #[cfg(feature = "holocron")]
-        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
+        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); unaos_kernel::pwwire::refresh(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ /* CONSOLEFIX M3: the raw-key echoes' cached LOGIN13 state */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
         // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
         // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
         // than in a driver: the HID decoders detect the key edge while holding their controller
