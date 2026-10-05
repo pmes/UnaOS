@@ -29,7 +29,8 @@ pub enum Shader {
     Solid([f32; 4]),
     Linear { inv: Transform, p1: (f64, f64), p2: (f64, f64), stops: Vec<Stop>, spread: Spread },
     Radial { inv: Transform, c: (f64, f64), r: f64, f: (f64, f64), fr: f64, stops: Vec<Stop>, spread: Spread },
-    Image { inv: Transform, pix: Pixmap, smooth: bool, repeat: bool },
+    /// `smooth`: bilinear (else nearest); `cubic`: a (B, C) bicubic kernel instead (upscaled photos).
+    Image { inv: Transform, pix: Pixmap, smooth: bool, repeat: bool, cubic: Option<(f32, f32)> },
 }
 
 pub fn premul(c: [f32; 4]) -> [f32; 4] {
@@ -75,14 +76,8 @@ fn stops_at(stops: &[Stop], t: f64) -> [f32; 4] {
 
 fn sample(pix: &Pixmap, x: i64, y: i64, repeat: bool) -> [f32; 4] {
     let (w, h) = (pix.w as i64, pix.h as i64);
-    let (x, y) = if repeat {
-        (x.rem_euclid(w), y.rem_euclid(h))
-    } else {
-        if x < 0 || y < 0 || x >= w || y >= h {
-            return [0.0; 4];
-        }
-        (x, y)
-    };
+    // Tiles wrap; a placed image clamps to its edge pixels (the drawn rectangle bounds it).
+    let (x, y) = if repeat { (x.rem_euclid(w), y.rem_euclid(h)) } else { (x.clamp(0, w - 1), y.clamp(0, h - 1)) };
     let i = ((y * w + x) * 4) as usize;
     let d = &pix.data[i..i + 4];
     [d[0] as f32 / 255.0, d[1] as f32 / 255.0, d[2] as f32 / 255.0, d[3] as f32 / 255.0]
@@ -140,10 +135,33 @@ impl Shader {
                 };
                 stops_at(stops, spread_t(t, *spread))
             }
-            Shader::Image { inv, pix, smooth, repeat } => {
+            Shader::Image { inv, pix, smooth, repeat, cubic } => {
                 let (u, v) = inv.apply(x, y);
                 if !*smooth {
                     return sample(pix, floor(u) as i64, floor(v) as i64, *repeat);
+                }
+                if let Some((b, c)) = *cubic {
+                    let (fu, fv) = (u - 0.5, v - 0.5);
+                    let (x0, y0) = (floor(fu), floor(fv));
+                    let (tx, ty) = ((fu - x0) as f32, (fv - y0) as f32);
+                    let k = |t: f32| -> [f32; 4] { [mitchell(t + 1.0, b, c), mitchell(t, b, c), mitchell(1.0 - t, b, c), mitchell(2.0 - t, b, c)] };
+                    let (wx, wy) = (k(tx), k(ty));
+                    let mut o = [0f32; 4];
+                    for (j, wyj) in wy.iter().enumerate() {
+                        for (i, wxi) in wx.iter().enumerate() {
+                            let p = sample(pix, x0 as i64 - 1 + i as i64, y0 as i64 - 1 + j as i64, *repeat);
+                            let wgt = wxi * wyj;
+                            for ch in 0..4 {
+                                o[ch] += p[ch] * wgt;
+                            }
+                        }
+                    }
+                    // Keep premultiplied colour valid after negative lobes.
+                    o[3] = o[3].clamp(0.0, 1.0);
+                    for ch in 0..3 {
+                        o[ch] = o[ch].clamp(0.0, o[3]);
+                    }
+                    return o;
                 }
                 let (fu, fv) = (u - 0.5, v - 0.5);
                 let (x0, y0) = (floor(fu), floor(fv));
@@ -162,6 +180,18 @@ impl Shader {
                 o
             }
         }
+    }
+}
+
+/// The Mitchell–Netravali family (B, C) cubic filter weight at distance |t|.
+fn mitchell(t: f32, b: f32, c: f32) -> f32 {
+    let t = t.abs();
+    if t < 1.0 {
+        ((12.0 - 9.0 * b - 6.0 * c) * t * t * t + (-18.0 + 12.0 * b + 6.0 * c) * t * t + (6.0 - 2.0 * b)) / 6.0
+    } else if t < 2.0 {
+        ((-b - 6.0 * c) * t * t * t + (6.0 * b + 30.0 * c) * t * t + (-12.0 * b - 48.0 * c) * t + (8.0 * b + 24.0 * c)) / 6.0
+    } else {
+        0.0
     }
 }
 

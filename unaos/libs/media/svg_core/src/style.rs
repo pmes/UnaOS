@@ -27,7 +27,7 @@ pub const PRESENTATION: &[&str] = &[
 ];
 
 /// Properties that may be set from CSS but are not presentation attributes (geometry properties etc.).
-const CSS_ONLY_OK: &[&str] = &["font", "marker", "transform", "x", "y", "cx", "cy", "r", "rx", "ry", "width", "height", "d"];
+const CSS_ONLY_OK: &[&str] = &["font", "marker", "transform", "background-color", "x", "y", "cx", "cy", "r", "rx", "ry", "width", "height", "d"];
 
 pub type Props = Vec<(String, String)>;
 
@@ -674,7 +674,12 @@ impl Style {
                 "color-interpolation" => s.linear_rgb_interp = v == "linearRGB",
                 "paint-order" => {
                     let words: Vec<&str> = v.split_whitespace().collect();
-                    if words == ["normal"] || words.is_empty() {
+                    let valid = words == ["normal"]
+                        || (!words.is_empty() && words.len() <= 3 && words.iter().all(|w| matches!(*w, "fill" | "stroke" | "markers"))
+                            && (1..words.len()).all(|i| !words[..i].contains(&words[i])));
+                    if !valid {
+                        // An invalid value is dropped (the inherited order stays).
+                    } else if words == ["normal"] {
                         s.stroke_first = false;
                         s.markers_first = false;
                     } else {
@@ -730,6 +735,8 @@ impl Style {
             "stop-opacity" => self.stop_opacity = p.stop_opacity,
             "overflow" => self.overflow_visible = p.overflow_visible,
             "display" => self.display_none = p.display_none,
+            "baseline-shift" => self.baseline_shift = p.baseline_shift.clone(),
+            "dominant-baseline" | "alignment-baseline" => self.dominant_baseline = p.dominant_baseline.clone(),
             _ => {} // inherited properties already hold the parent's value
         }
     }
@@ -775,6 +782,7 @@ mod tests {
         assert_eq!(child.font_size, 32.0);
         assert_eq!(parse_length("1in").map(|l| resolve(l, Axis::X, 0.0, 0.0, 16.0)), Some(96.0));
         assert_eq!(parse_length("10%").map(|l| resolve(l, Axis::Y, 50.0, 200.0, 16.0)), Some(20.0));
-        assert!(parse_length("10q").is_none());
+        assert!(parse_length("10qq").is_none());
+        assert_eq!(parse_length("10vw"), Some(Length { v: 10.0, unit: Unit::Vw }));
     }
 }

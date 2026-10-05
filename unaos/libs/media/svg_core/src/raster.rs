@@ -179,6 +179,12 @@ pub fn fill_coverage(path: &Path, rule: FillRule, w: usize, h: usize, aa: bool) 
 }
 
 pub fn fill_polys(polys: &[(Vec<(f64, f64)>, bool)], rule: FillRule, w: usize, h: usize, aa: bool) -> Option<Coverage> {
+    fill_polys_mode(polys, rule, w, h, aa, false)
+}
+
+/// [`fill_polys`] with font_core's Skia-analytic-AA mode (edge y snapped to quarter pixels), which is how
+/// Chromium rasterizes glyph masks.
+pub fn fill_polys_mode(polys: &[(Vec<(f64, f64)>, bool)], rule: FillRule, w: usize, h: usize, aa: bool, skia_aaa: bool) -> Option<Coverage> {
     let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     for (pts, _) in polys {
         for p in pts {
@@ -205,6 +211,9 @@ pub fn fill_polys(polys: &[(Vec<(f64, f64)>, bool)], rule: FillRule, w: usize, h
     let (cw, ch) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
     let mut r = Rasterizer::new(cw, ch);
     r.snap_26_6 = false;
+    if skia_aaa {
+        r.mode = font_core::RenderMode::SkiaAaa;
+    }
     let (ox, oy) = (bx0 as f64, by0 as f64);
     for (pts, _) in polys {
         if pts.len() < 2 {

@@ -26,6 +26,8 @@ struct Ch {
     rotate: f64,
     decor: u8,
     decor_style: usize,
+    /// Accumulated baseline-shift of the enclosing text content elements (px, positive = down).
+    bshift: f64,
 }
 
 struct Frame {
@@ -54,7 +56,7 @@ impl Collector<'_, '_> {
             .unwrap_or_default()
     }
 
-    fn push_char(&mut self, c: char, style: usize, decor: u8, decor_style: usize) {
+    fn push_char(&mut self, c: char, style: usize, decor: u8, decor_style: usize, bshift: f64) {
         let (mut x, mut y, mut dx, mut dy, mut rot) = (None, None, None, None, None);
         for f in self.frames.iter().rev() {
             let k = f.count;
@@ -77,10 +79,10 @@ impl Collector<'_, '_> {
         for f in self.frames.iter_mut() {
             f.count += 1;
         }
-        self.chars.push(Ch { c, style, x, y, dx: dx.unwrap_or(0.0), dy: dy.unwrap_or(0.0), rotate: rot.unwrap_or(0.0), decor, decor_style });
+        self.chars.push(Ch { c, style, x, y, dx: dx.unwrap_or(0.0), dy: dy.unwrap_or(0.0), rotate: rot.unwrap_or(0.0), decor, decor_style, bshift });
     }
 
-    fn walk(&mut self, node: usize, parent_style: &Style, decor: u8, decor_style: usize, preserve_parent: bool) {
+    fn walk(&mut self, node: usize, parent_style: &Style, decor: u8, decor_style: usize, preserve_parent: bool, bshift: f64) {
         let n = &self.r.doc.nodes[node];
         let st = Style::compute(parent_style, &self.r.props[node]);
         if st.display_none {
@@ -88,6 +90,7 @@ impl Collector<'_, '_> {
         }
         let preserve = st.preserve_space || (preserve_parent && style::get(&self.r.props[node], "xml:space").is_none());
         let sidx = self.styles.len();
+        let bshift = bshift + baseline_shift(self.r, &st);
         self.styles.push(st.clone());
         let (decor, decor_style) = if st.decoration != 0 { (st.decoration | decor, sidx) } else { (decor, decor_style) };
         let frame = Frame {
@@ -118,13 +121,13 @@ impl Collector<'_, '_> {
                                 _ => {}
                             }
                         }
-                        self.push_char(c, sidx, decor, decor_style);
+                        self.push_char(c, sidx, decor, decor_style, bshift);
                     }
                 }
                 Kind::Element { .. } => {
                     let kn = &self.r.doc.nodes[k];
                     if kn.is_svg("tspan") || kn.is_svg("a") {
-                        self.walk(k, &st, decor, decor_style, preserve);
+                        self.walk(k, &st, decor, decor_style, preserve, bshift);
                     }
                 }
                 _ => {}
@@ -187,6 +190,30 @@ struct Placed {
     chunk: usize,
 }
 
+/// `baseline-shift` of one element (CSS Inline 3 / SVG 1.1 §10.9.2), positive = down. `sub`/`super` move by
+/// half the font's ascent + descent — what Chromium does (measured against its rendering).
+fn baseline_shift(r: &Renderer, st: &Style) -> f64 {
+    let half = || {
+        r.opts
+            .fonts
+            .and_then(|fs| fs.select(&st.font_family, st.font_weight, st.italic).and_then(|i| fs.faces[i].font().map(|f| {
+                let (a, d, _) = f.line_metrics();
+                (a as f64 - d as f64) / 2.0 / f.units_per_em as f64 * st.font_size
+            })))
+            .unwrap_or(st.font_size * 0.6)
+    };
+    match st.baseline_shift.as_deref() {
+        Some("sub") => half(),
+        Some("super") => -half(),
+        Some("baseline") | None => 0.0,
+        Some(v) => match style::parse_length(v) {
+            Some(l) if l.unit == style::Unit::Percent => -l.v / 100.0 * st.font_size,
+            Some(l) => -style::resolve(l, Axis::X, 0.0, 0.0, st.font_size),
+            None => 0.0,
+        },
+    }
+}
+
 fn baseline_offset(st: &Style, font: &font_core::Font) -> f64 {
     let s = st.font_size / font.units_per_em as f64;
     let (asc, desc, _) = font.line_metrics();
@@ -201,24 +228,13 @@ fn baseline_offset(st: &Style, font: &font_core::Font) -> f64 {
         Some("text-after-edge") | Some("text-bottom") | Some("after-edge") | Some("ideographic") => desc,
         _ => 0.0,
     };
-    match st.baseline_shift.as_deref() {
-        Some("sub") => y += st.font_size / 5.0 + 1.0,
-        Some("super") => y -= st.font_size / 3.0 + 1.0,
-        Some("baseline") | None => {}
-        Some(v) => {
-            if let Some(l) = style::parse_length(v) {
-                let d = if l.unit == style::Unit::Percent { l.v / 100.0 * st.font_size } else { style::resolve(l, Axis::X, 0.0, 0.0, st.font_size) };
-                y -= d;
-            }
-        }
-    }
     y
 }
 
 pub fn layout(r: &Renderer, node: usize, ctx: &Ctx, parent: &Style) -> Option<Layout> {
     let fonts: &FontSet = r.opts.fonts?;
     let mut col = Collector { r, ctx, styles: Vec::new(), chars: Vec::new(), frames: Vec::new() };
-    col.walk(node, parent, 0, 0, false);
+    col.walk(node, parent, 0, 0, false, 0.0);
     // Trailing space (default white-space handling).
     let root_preserve = col.styles.first().map(|s| s.preserve_space).unwrap_or(false);
     if !root_preserve {
@@ -249,47 +265,30 @@ pub fn layout(r: &Renderer, node: usize, ctx: &Ctx, parent: &Style) -> Option<La
         let f = if has || ch.c == ' ' || ch.c.is_control() { p } else { fonts.fallback_for(ch.c, st.font_weight, st.italic, p).unwrap_or(p) };
         faces.push(f);
     }
-    // Runs: same style + face, no explicit positioning except on the first character.
+    // Shaping runs: consecutive characters with the same face and the same spacing/size parameters are shaped
+    // together (kerning and ligatures cross tspan boundaries); x/y/dx/dy then adjust each cluster (SVG 2 §11.8).
     let mut placed: Vec<Placed> = Vec::new();
     let (mut px, mut py) = (0.0f64, 0.0f64);
     let mut chunk = 0usize;
-    let mut chunk_starts: Vec<(usize, f64)> = Vec::new(); // (first placed index, start x)
+    let key = |c: &Ch, f: usize| {
+        let st = &styles[c.style];
+        (f, st.font_size.to_bits(), st.letter_spacing.to_bits(), st.word_spacing.to_bits(), st.kerning)
+    };
     let mut i = 0;
     while i < chars.len() {
+        let k0 = key(&chars[i], faces[i]);
         let mut j = i + 1;
-        while j < chars.len()
-            && chars[j].style == chars[i].style
-            && faces[j] == faces[i]
-            && chars[j].x.is_none()
-            && chars[j].y.is_none()
-            && chars[j].dx == 0.0
-            && chars[j].dy == 0.0
-            && chars[j].rotate == chars[i].rotate
-        {
+        // An absolute x or y starts a new text chunk: Chromium does not shape (kern) across it; dx/dy it does.
+        while j < chars.len() && key(&chars[j], faces[j]) == k0 && chars[j].x.is_none() && chars[j].y.is_none() {
             j += 1;
         }
-        let first = &chars[i];
-        if first.x.is_some() || first.y.is_some() || i == 0 {
-            if let Some(x) = first.x {
-                px = x;
-            }
-            if let Some(y) = first.y {
-                py = y;
-            }
-            if i != 0 {
-                chunk += 1;
-            }
-            chunk_starts.push((placed.len(), px));
-        }
-        px += first.dx;
-        py += first.dy;
-        let st = &styles[first.style];
         let face = &fonts.faces[faces[i]];
         let Some(font) = face.font() else {
             i = j;
             continue;
         };
-        let scale = st.font_size / font.units_per_em as f64;
+        let st0 = &styles[chars[i].style];
+        let scale = st0.font_size / font.units_per_em as f64;
         let text: String = chars[i..j].iter().map(|c| c.c).collect();
         let byte_to_char: Vec<usize> = {
             let mut v = alloc::vec![0usize; text.len() + 1];
@@ -298,18 +297,36 @@ pub fn layout(r: &Renderer, node: usize, ctx: &Ctx, parent: &Style) -> Option<La
             }
             v
         };
-        let opts = ShapeOptions { kerning: st.kerning, ligatures: st.letter_spacing == 0.0 };
+        let opts = ShapeOptions { kerning: st0.kerning, ligatures: st0.letter_spacing == 0.0 };
         let glyphs = font_core::shape(&font, &text, &opts);
-        let bo = baseline_offset(st, &font);
         for (gi, g) in glyphs.iter().enumerate() {
             let ci = i + byte_to_char[g.cluster.min(text.len())];
+            let cluster_start = gi == 0 || glyphs[gi - 1].cluster != g.cluster;
+            if cluster_start {
+                let c = &chars[ci];
+                if c.x.is_some() || c.y.is_some() {
+                    if let Some(x) = c.x {
+                        px = x;
+                    }
+                    if let Some(y) = c.y {
+                        py = y;
+                    }
+                    if !placed.is_empty() {
+                        chunk += 1;
+                    }
+                }
+                px += c.dx;
+                py += c.dy;
+            }
+            let cst = &styles[chars[ci].style];
+            let bo = baseline_offset(cst, &font) + chars[ci].bshift;
             // Letter spacing once per cluster (after its last glyph).
             let cluster_end = glyphs.get(gi + 1).map(|n| n.cluster != g.cluster).unwrap_or(true);
             let mut adv = g.x_advance as f64 * scale;
             if cluster_end {
-                adv += st.letter_spacing;
+                adv += st0.letter_spacing;
                 if chars[ci].c == ' ' {
-                    adv += st.word_spacing;
+                    adv += st0.word_spacing;
                 }
             }
             placed.push(Placed { ch: ci, face: faces[i], glyph: g.glyph, x: px + g.x_offset as f64 * scale, y: py - g.y_offset as f64 * scale + bo, advance: adv, chunk });
@@ -333,7 +350,6 @@ pub fn layout(r: &Renderer, node: usize, ctx: &Ctx, parent: &Style) -> Option<La
         chunk_begin[c] = chunk_begin[c].min(p.x);
         chunk_end[c] = chunk_end[c].max(p.x + p.advance);
     }
-    let _ = chunk_starts;
     for p in placed.iter_mut() {
         let c = p.chunk;
         let w = chunk_end[c] - chunk_begin[c];
@@ -421,9 +437,9 @@ pub fn render_text(r: &mut Renderer, node: usize, ctx: &Ctx, parent: &Style, can
         let rs = rs.clone();
         if rs.stroke_first {
             r.stroke_path(&run.path, &rs, bbox, ctx, canvas);
-            r.fill_path(&run.path, &rs, bbox, ctx, canvas);
+            r.fill_path_ex(&run.path, &rs, bbox, ctx, canvas, true);
         } else {
-            r.fill_path(&run.path, &rs, bbox, ctx, canvas);
+            r.fill_path_ex(&run.path, &rs, bbox, ctx, canvas, true);
             r.stroke_path(&run.path, &rs, bbox, ctx, canvas);
         }
         for (bit, ds, d) in &run.decorations {

@@ -16,6 +16,23 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 const MAX_DEPTH: usize = 48;
+const TEXT_AAA: bool = true;
+/// Measured against Chromium: bilinear beats Mitchell (1/3, 1/3) and Catmull-Rom on the image corpus, so
+/// the cubic path stays off.
+const IMAGE_CUBIC: Option<(f32, f32)> = None;
+const TEXT_GAMMA: bool = false;
+
+/// Skia's A8 glyph-mask pre-blend for dark text as Chromium on Linux configures it (contrast 0.2, gamma 1.2;
+/// measured by FONTCORE SR48 against Chromium).
+fn text_gamma(v: u8) -> u8 {
+    if v == 0 || v == 255 {
+        return v;
+    }
+    let a = v as f64 / 255.0;
+    let c = (a + 0.2 * a * (1.0 - a)).min(1.0);
+    let o = 1.0 - crate::fmath::powf(1.0 - c, 1.0 / 1.2);
+    (o * 255.0 + 0.5) as u8
+}
 
 /// Coordinate context: the user→device transform and the nearest viewport's size (for percentages).
 #[derive(Clone, Debug)]
@@ -154,7 +171,8 @@ impl<'a> Renderer<'a> {
                 if get(&self.props[i], "display").map(|v| v.trim() == "none").unwrap_or(false) {
                     return true;
                 }
-                if !conditions_pass(nd, &self.opts.languages) {
+                // Conditional attributes on the resource itself are ignored; on an ancestor they hide it.
+                if i != node && !conditions_pass(nd, &self.opts.languages) {
                     return true;
                 }
             }
@@ -211,13 +229,38 @@ impl<'a> Renderer<'a> {
     /// The `transform` presentation attribute, or the CSS `transform` property when a style sets it (CSS
     /// Transforms 1: lengths in px, angles in deg/rad/grad/turn; `transform-origin` defaults to 0 0 in SVG).
     pub fn element_transform(&self, node: usize) -> Transform {
-        if let Some(css) = get(&self.props[node], "transform") {
+        let t = if let Some(css) = get(&self.props[node], "transform") {
             if css.trim() == "none" {
                 return Transform::IDENTITY;
             }
-            return parse_css_transform(css).filter(|t| t.is_finite()).unwrap_or(Transform::IDENTITY);
+            parse_css_transform(css).filter(|t| t.is_finite()).unwrap_or(Transform::IDENTITY)
+        } else {
+            self.doc.nodes[node].attr("transform").and_then(parse_transform).filter(|t| t.is_finite()).unwrap_or(Transform::IDENTITY)
+        };
+        // SVG 2 / CSS Transforms: `transform-origin` (percentages against the initial containing block).
+        if let Some(o) = get(&self.props[node], "transform-origin") {
+            let mut it = o.split_whitespace();
+            let comp = |v: Option<&str>, axis: Axis| -> f64 {
+                let Some(v) = v else { return if axis == Axis::X { 0.0 } else { 0.0 } };
+                let base = if axis == Axis::X { self.icb.0 } else { self.icb.1 };
+                match v {
+                    "left" | "top" => 0.0,
+                    "center" => base / 2.0,
+                    "right" | "bottom" => base,
+                    _ => parse_length(v).map(|l| resolve(l, axis, base, base, 16.0)).unwrap_or(0.0),
+                }
+            };
+            let (a, b) = (it.next(), it.next());
+            let (mut ox, mut oy) = (comp(a, Axis::X), comp(b.or(Some("center")).filter(|_| b.is_some()).or(Some("50%")), Axis::Y));
+            if matches!(a, Some("top") | Some("bottom")) {
+                oy = comp(a, Axis::Y);
+                ox = comp(b.or(Some("center")), Axis::X);
+            }
+            if ox != 0.0 || oy != 0.0 {
+                return Transform::translate(ox, oy).mul(&t).mul(&Transform::translate(-ox, -oy));
+            }
         }
-        self.doc.nodes[node].attr("transform").and_then(parse_transform).filter(|t| t.is_finite()).unwrap_or(Transform::IDENTITY)
+        t
     }
 
     // ------------------------------------------------------------------ geometry
@@ -396,7 +439,7 @@ impl<'a> Renderer<'a> {
                 let y = self.attr_len(node, "y", Axis::Y, ctx, &st, 0.0);
                 let mut c = ctx.clone();
                 c.style = st;
-                let tt = t.mul(&Transform::translate(x, y)).mul(&self.element_transform(target));
+                let tt = if self.doc.nodes[target].is_svg("symbol") { t.mul(&Transform::translate(x, y)) } else { t.mul(&Transform::translate(x, y)).mul(&self.element_transform(target)) };
                 self.active.push(target);
                 self.depth += 1;
                 let r = if self.doc.nodes[target].is_svg("symbol") {
@@ -685,7 +728,7 @@ impl<'a> Renderer<'a> {
         }
         let inv_p = p.invert()?;
         let inv = Transform::scale(kx, ky).mul(&Transform::translate(-x, -y)).mul(&inv_p);
-        Some(Shader::Image { inv, pix: tile, smooth: true, repeat: true })
+        Some(Shader::Image { inv, pix: tile, smooth: true, repeat: true, cubic: None })
     }
 
     // ------------------------------------------------------------------ clip & mask
@@ -695,8 +738,8 @@ impl<'a> Renderer<'a> {
             return ClipResult::Ignore;
         };
         if self.active.contains(&cp) || self.depth > MAX_DEPTH {
-            // A self-referencing clip path is an error: the element is not rendered.
-            return ClipResult::Nothing;
+            // A self-referencing clip path: Chromium ignores the recursive reference.
+            return ClipResult::Ignore;
         }
         // Chromium treats a clipPath with `display: none` as an invalid reference (renders unclipped).
         if self.resource_hidden(cp) {
@@ -808,7 +851,8 @@ impl<'a> Renderer<'a> {
             return ClipResult::Ignore;
         };
         if self.active.contains(&mk) || self.depth > MAX_DEPTH {
-            return ClipResult::Nothing;
+            // A mask referencing itself (directly or through its content) is an invalid reference there.
+            return ClipResult::Ignore;
         }
         let mn = &self.doc.nodes[mk];
         let obb = mn.attr("maskUnits").map(|v| v.trim() != "userSpaceOnUse").unwrap_or(true);
@@ -915,9 +959,21 @@ impl<'a> Renderer<'a> {
         // `display: none` on the root of an SVG image is ignored (Chromium renders it).
         let st = Style { display_none: false, ..Style::compute(&ctx.style, &self.props[node]) };
         self.root_font = st.font_size;
+        // CSS `background-color` on the root element paints the canvas (the image's own background).
+        if let Some(bg) = get(&self.props[node], "background-color").and_then(crate::color::parse_color) {
+            let c = premul([bg.r as f32 / 255.0, bg.g as f32 / 255.0, bg.b as f32 / 255.0, bg.a]);
+            for y in 0..self.h {
+                for x in 0..self.w {
+                    canvas.blend(x, y, c, 1.0);
+                }
+            }
+        }
         self.root_lh = self.font_metrics(&st).3 * st.font_size;
         let ectx = Ctx { style: st.clone(), ..ctx.clone() };
-        self.with_effects(node, ctx, &ectx, &st, canvas, |r, c, l| r.children(node, c, l));
+        // Clip paths and masks on the outermost svg resolve in its CSS box (canvas pixels), not the viewBox.
+        let box_ctx = Ctx { ts: Transform::IDENTITY, vw: self.w as f64, vh: self.h as f64, ..ectx.clone() };
+        let pctx = ctx.clone();
+        self.with_effects_in(node, &pctx, &box_ctx, &ectx, &st, canvas, |r, c, l| r.children(node, c, l));
     }
 
     /// Render one element (and its subtree) in context `ctx` (whose style is the parent's computed style).
@@ -943,7 +999,7 @@ impl<'a> Renderer<'a> {
         if st.display_none {
             return;
         }
-        let ts = if name == "svg" { ctx.ts } else { ctx.ts.mul(&self.element_transform(node)) };
+        let ts = ctx.ts.mul(&self.element_transform(node));
         if !ts.is_finite() || ts.det() == 0.0 && name != "svg" {
             return;
         }
@@ -1059,11 +1115,25 @@ impl<'a> Renderer<'a> {
     }
 
     pub fn fill_path(&mut self, path: &Path, st: &Style, bbox: Option<Rect>, ctx: &Ctx, canvas: &mut Pixmap) {
+        self.fill_path_ex(path, st, bbox, ctx, canvas, false);
+    }
+
+    /// Fill; `text` selects glyph rasterization (nonzero always — fill-rule does not apply to text — and
+    /// Chromium's glyph-mask treatment, see [`crate::text`]).
+    pub fn fill_path_ex(&mut self, path: &Path, st: &Style, bbox: Option<Rect>, ctx: &Ctx, canvas: &mut Pixmap, text: bool) {
         if matches!(st.fill, Paint::None) {
             return;
         }
         let Some(sh) = self.shader(&st.fill.clone(), st, bbox, ctx) else { return };
-        if let Some(c) = fill_coverage(&path.transform(&ctx.ts), st.fill_rule, self.w, self.h, st.aa) {
+        let rule = if text { FillRule::NonZero } else { st.fill_rule };
+        let polys = path.transform(&ctx.ts).flatten(crate::raster::FLATTEN_TOL);
+        let aa = if text { st.text_aa } else { st.aa };
+        if let Some(mut c) = crate::raster::fill_polys_mode(&polys, rule, self.w, self.h, aa, text && TEXT_AAA) {
+            if text && TEXT_GAMMA {
+                for v in c.data.iter_mut() {
+                    *v = text_gamma(*v);
+                }
+            }
             self.paint_coverage(canvas, &c, &sh, st.fill_opacity as f32);
         }
     }
@@ -1171,7 +1241,8 @@ impl<'a> Renderer<'a> {
             if !tst.display_none || tn.is_svg("symbol") {
                 // symbol is display:none by UA style only outside of use; its own display property applies.
                 let tst = if tn.is_svg("symbol") { Style { display_none: false, ..tst } } else { tst };
-                let tts = cctx.ts.mul(&self.element_transform(target));
+                // A transform on <symbol> is ignored (Chromium); on an <svg> target it applies (SVG 2).
+                let tts = if tn.is_svg("symbol") { cctx.ts } else { cctx.ts.mul(&self.element_transform(target)) };
                 let tctx = Ctx { ts: tts, ..cctx.clone() };
                 // Group effects on the symbol/svg itself.
                 let tst2 = tst.clone();
@@ -1185,6 +1256,12 @@ impl<'a> Renderer<'a> {
 
     /// Run `f` with the opacity / clip-path / mask of `node` applied.
     fn with_effects(&mut self, node: usize, pctx: &Ctx, ctx: &Ctx, st: &Style, canvas: &mut Pixmap, f: impl FnOnce(&mut Self, &Ctx, &mut Pixmap)) {
+        self.with_effects_in(node, pctx, ctx, ctx, st, canvas, f)
+    }
+
+    /// `ectx`: the coordinate system clip paths and masks resolve in (for the root: its CSS box, unscaled).
+    #[allow(clippy::too_many_arguments)]
+    fn with_effects_in(&mut self, node: usize, pctx: &Ctx, ectx: &Ctx, ctx: &Ctx, st: &Style, canvas: &mut Pixmap, f: impl FnOnce(&mut Self, &Ctx, &mut Pixmap)) {
         let p = &self.props[node];
         let clip = get(p, "clip-path").and_then(parse_func_iri);
         let mask = get(p, "mask").and_then(parse_func_iri);
@@ -1193,8 +1270,14 @@ impl<'a> Renderer<'a> {
             return;
         }
         let bbox = self.bbox(node, pctx, &Transform::IDENTITY);
+        // The bbox is in the content's user space; re-express it in the effects' space.
+        let bbox = match ectx.ts.invert() {
+            Some(inv) if ectx.ts != ctx.ts => bbox.map(|b| b.transform(&ctx.ts).transform(&inv)),
+            _ => bbox,
+        };
         let mut layer = Pixmap::new(self.w, self.h);
         f(self, ctx, &mut layer);
+        let ctx = ectx;
         if let Some(id) = clip {
             match self.clip_mask(&id, bbox, ctx) {
                 ClipResult::Mask(m) => layer.apply_mask(&m),
@@ -1236,9 +1319,11 @@ impl<'a> Renderer<'a> {
             if !(w > 0.0 && h > 0.0) {
                 return;
             }
-            // The image's own viewBox (or its intrinsic size) maps into (x, y, w, h) with the image element's pAR.
+            // The image's own viewBox (or its intrinsic size) maps into (x, y, w, h) with the referenced
+            // document's own preserveAspectRatio (Chromium ignores the <image> element's for SVG images).
             let vb = sub.view_box.unwrap_or(Rect::new(0.0, 0.0, iw, ih));
-            let t = ctx.ts.mul(&view_box_transform(&vb, &par, x, y, w, h));
+            let _ = par;
+            let t = ctx.ts.mul(&view_box_transform(&vb, &sub.par, x, y, w, h));
             let mut layer = Pixmap::new(self.w, self.h);
             let mut r = Renderer::new(&sub.doc, &sub.props, self.opts, self.w, self.h);
             r.depth = self.depth + 4;
@@ -1292,7 +1377,9 @@ impl<'a> Renderer<'a> {
         r.line_to(x1, y1);
         r.line_to(x0, y1);
         r.close();
-        let sh = Shader::Image { inv, pix, smooth: st.image_smooth, repeat: false };
+        // Upscaled raster images: a cubic filter (IMAGE_CUBIC), as Chromium's high-quality image drawing does.
+        let up = ctx.ts.mul(&it).mean_scale() > 1.0;
+        let sh = Shader::Image { inv, pix, smooth: st.image_smooth, repeat: false, cubic: if up { IMAGE_CUBIC } else { None } };
         if let Some(c) = fill_coverage(&r.transform(&ctx.ts), FillRule::NonZero, self.w, self.h, true) {
             self.paint_coverage(canvas, &c, &sh, 1.0);
         }
