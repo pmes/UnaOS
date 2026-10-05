@@ -19,6 +19,8 @@ members = [
     "unaos/libs/sys/elf_core", # STORMFAULT (B351): the ring-3 ELF segment plan both loaders share
     # VEINTLS (SR36): the ring-3 Vein library joins the host workspace so its offline TLS + Messages test runs here.
     "unaos/libs/sys/vein_ring3",
+    # HTMLCORE (SR46): the no_std WHATWG HTML parser + arena DOM + serializer (Aether swaps kuchiki for it later).
+    "unaos/libs/web/html_core",
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",
