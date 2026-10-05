@@ -17,13 +17,26 @@
 //!
 //! NOT applied: gAMA, cHRM, sRGB, iCCP (colour management, §12) — the samples are returned as stored.
 //! A browser that colour-manages will show a file carrying gAMA != 1/2.2 differently; the oracle
-//! compares with those chunks stripped. sBIT is ignored (it is advisory). APNG (acTL/fcTL/fdAT) is
-//! OWED: an APNG decodes as its default image, which is what the spec requires of a non-APNG decoder.
+//! compares with those chunks stripped. sBIT is ignored (it is advisory).
+//!
+//! APNG (ANIMWEBP, the APNG specification — PNG 3rd edition §11.3.6 / the Mozilla APNG 1.0 text):
+//! `acTL` (frame count, plays), `fcTL` (sequence number, frame rectangle, delay fraction, dispose_op,
+//! blend_op), `fdAT` (sequence number + frame data, possibly split across chunks). The default image
+//! is frame 0 when an `fcTL` precedes the first `IDAT`, else it is not shown and the animation is the
+//! `fdAT` frames alone (Blink shows the first of those). Every frame is decoded with the IHDR's colour
+//! type, depth, interlace, PLTE and tRNS at its own size, then composited onto a transparent canvas:
+//! `APNG_BLEND_OP_SOURCE` copies the rectangle, `APNG_BLEND_OP_OVER` blends it with
+//! [`crate::blend_nonpremult`] (a transparent destination takes the source as is, as Blink's
+//! `BlendRGBARaw` does); dispose `NONE` keeps, `BACKGROUND` clears the rectangle to transparent black,
+//! `PREVIOUS` restores the canvas as it was before the frame (on frame 0: `BACKGROUND`, per the spec).
+//! Delays are `round(1000 * num / den)` ms with `den = 0` read as 100. A sequence-number break, a
+//! frame outside the canvas, or a frame that fails to decode ends the animation at the frames before
+//! it (a broken FIRST frame falls back to the default image).
 
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::{Error, Image, be32, crc};
+use crate::{Error, Frame, Image, be32, crc};
 
 const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -38,6 +51,7 @@ const ADAM7: [(usize, usize, usize, usize); 7] = [
     (0, 1, 1, 2),
 ];
 
+#[derive(Clone)]
 struct Header {
     width: usize,
     height: usize,
@@ -89,6 +103,12 @@ pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
     let mut seen_idat = false;
     let mut idat_done = false;
     let mut seen_iend = false;
+    // APNG state: acTL (frames, plays), the fcTL frames with their fdAT data, the next sequence number.
+    let mut actl: Option<u32> = None;
+    let mut afr: Vec<ApngFrame> = Vec::new();
+    let mut default_is_frame = false;
+    let mut next_seq = 0u32;
+    let mut anim_broken = false;
 
     while pos + 12 <= bytes.len() {
         let len = be32(bytes, pos) as usize;
@@ -182,6 +202,41 @@ pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
                 seen_idat = true;
                 idat.extend_from_slice(data);
             }
+            b"acTL" => {
+                if len == 8 && actl.is_none() && !seen_idat && be32(data, 0) > 0 {
+                    actl = Some(be32(data, 4));
+                }
+            }
+            b"fcTL" => {
+                let Some(h) = hdr.as_ref() else { continue };
+                if anim_broken {
+                    continue;
+                }
+                match parse_fctl(data, h, next_seq, !seen_idat && afr.is_empty()) {
+                    Some(fr) => {
+                        if !seen_idat {
+                            default_is_frame = true;
+                        }
+                        afr.push(fr);
+                        next_seq += 1;
+                    }
+                    None => anim_broken = true,
+                }
+            }
+            b"fdAT" => {
+                if anim_broken || len < 4 {
+                    continue;
+                }
+                // fdAT belongs to the last fcTL, which must be a frame after the IDAT.
+                let ok = be32(data, 0) == next_seq && seen_idat && !(default_is_frame && afr.len() == 1);
+                match afr.last_mut() {
+                    Some(fr) if ok => {
+                        fr.data.extend_from_slice(&data[4..]);
+                        next_seq += 1;
+                    }
+                    _ => anim_broken = true,
+                }
+            }
             b"IEND" => {
                 seen_iend = true;
                 break;
@@ -202,6 +257,19 @@ pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
         return Err(Error::Malformed("indexed image without PLTE"));
     }
 
+    // An APNG: composite its frames; a still (or an APNG whose animation is unusable) is the IDAT.
+    if let Some(plays) = actl {
+        if let Some(img) = composite_apng(&h, &palette, &trns, &idat, default_is_frame, afr, plays)? {
+            return Ok(img);
+        }
+    }
+    let rgba = decode_pixels(&h, &palette, &trns, &idat)?;
+    Ok(Image::still(h.width as u32, h.height as u32, rgba))
+}
+
+/// Decode one image's zlib stream (the IDAT, or one APNG frame's fdAT data) at the size `h` states,
+/// to straight RGBA8.
+fn decode_pixels(h: &Header, palette: &[[u8; 4]], trns: &Trns, idat: &[u8]) -> Result<Vec<u8>, Error> {
     // The exact filtered-stream size the header implies.
     let mut raw_len = 0usize;
     if h.interlace {
@@ -252,7 +320,123 @@ pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
             expand_row(&h, &palette, &trns, &raw[y * rb + 1..(y + 1) * rb], h.width, out);
         }
     }
-    Ok(Image::still(h.width as u32, h.height as u32, rgba))
+    Ok(rgba)
+}
+
+
+/// One APNG frame: its fcTL and (after the IDAT) its concatenated fdAT data.
+struct ApngFrame {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    delay_ms: u32,
+    dispose: u8,
+    blend_over: bool,
+    data: Vec<u8>,
+}
+
+/// Parse an fcTL (26 bytes): `None` when the sequence number is out of order or the rectangle is
+/// empty, leaves the canvas, or (for a default-image frame) is not the whole canvas at (0, 0).
+fn parse_fctl(d: &[u8], h: &Header, seq: u32, is_default: bool) -> Option<ApngFrame> {
+    if d.len() < 26 || be32(d, 0) != seq {
+        return None;
+    }
+    let (w, ht, x, y) = (be32(d, 4) as usize, be32(d, 8) as usize, be32(d, 12) as usize, be32(d, 16) as usize);
+    if w == 0 || ht == 0 || x.checked_add(w)? > h.width || y.checked_add(ht)? > h.height {
+        return None;
+    }
+    if is_default && (x, y, w, ht) != (0, 0, h.width, h.height) {
+        return None;
+    }
+    let num = u16::from_be_bytes([d[20], d[21]]) as u32;
+    let den = match u16::from_be_bytes([d[22], d[23]]) as u32 {
+        0 => 100,
+        n => n,
+    };
+    let (dispose, blend) = (d[24], d[25]);
+    if dispose > 2 || blend > 1 {
+        return None;
+    }
+    Some(ApngFrame { x, y, w, h: ht, delay_ms: (num * 1000 + den / 2) / den, dispose, blend_over: blend == 1, data: Vec::new() })
+}
+
+/// Composite the APNG frames onto the canvas. `Ok(None)` = no usable frame: show the default image.
+fn composite_apng(
+    h: &Header,
+    palette: &[[u8; 4]],
+    trns: &Trns,
+    idat: &[u8],
+    default_is_frame: bool,
+    afr: Vec<ApngFrame>,
+    plays: u32,
+) -> Result<Option<Image>, Error> {
+    let (cw, ch) = (h.width, h.height);
+    let len = cw * ch * 4;
+    let mut canvas = crate::zeroed(len)?;
+    let mut frames: Vec<Frame> = Vec::new();
+    // The canvas before the previous frame was drawn (for dispose PREVIOUS), and that frame.
+    let mut saved: Option<Vec<u8>> = None;
+    let mut prev: Option<(usize, usize, usize, usize, u8)> = None;
+    for (i, fr) in afr.iter().enumerate() {
+        let sub = Header { width: fr.w, height: fr.h, ..h.clone() };
+        let px = if i == 0 && default_is_frame {
+            decode_pixels(&sub, palette, trns, idat)?
+        } else {
+            match decode_pixels(&sub, palette, trns, &fr.data) {
+                Ok(px) => px,
+                Err(e) if frames.is_empty() && !default_is_frame => {
+                    let _ = e;
+                    return Ok(None);
+                }
+                Err(_) => break,
+            }
+        };
+        // The previous frame's disposal brings the canvas to this frame's starting state.
+        if let Some((x, y, w, ht, dispose)) = prev {
+            match dispose {
+                1 => crate::webp::clear_rect(&mut canvas, cw, x, y, w, ht),
+                2 => {
+                    if let Some(s) = saved.take() {
+                        canvas = s;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Dispose PREVIOUS on the first frame acts as BACKGROUND (the canvas before it is clear).
+        let dispose = if frames.is_empty() && fr.dispose == 2 { 1 } else { fr.dispose };
+        saved = if dispose == 2 { Some(canvas.clone()) } else { None };
+        for row in 0..fr.h {
+            for col in 0..fr.w {
+                let s = (row * fr.w + col) * 4;
+                let d = ((fr.y + row) * cw + fr.x + col) * 4;
+                let src = [px[s], px[s + 1], px[s + 2], px[s + 3]];
+                let out = if !fr.blend_over || src[3] == 255 || canvas[d + 3] == 0 {
+                    src
+                } else if src[3] == 0 {
+                    [canvas[d], canvas[d + 1], canvas[d + 2], canvas[d + 3]]
+                } else {
+                    crate::blend_srcover_f32(src, [canvas[d], canvas[d + 1], canvas[d + 2], canvas[d + 3]])
+                };
+                canvas[d..d + 4].copy_from_slice(&out);
+            }
+        }
+        let mut snap = Vec::new();
+        snap.try_reserve_exact(len).map_err(|_| Error::OutOfMemory)?;
+        snap.extend_from_slice(&canvas);
+        frames.push(Frame { delay_ms: fr.delay_ms, rgba: snap });
+        prev = Some((fr.x, fr.y, fr.w, fr.h, dispose));
+    }
+    if frames.is_empty() {
+        return Ok(None);
+    }
+    let mut img = Image::still(cw as u32, ch as u32, frames[0].rgba.clone());
+    if frames.len() > 1 {
+        img.frames = Some(frames);
+        img.loop_count = crate::loop_from_plays(plays);
+    }
+    Ok(Some(img))
 }
 
 /// Pixel dimensions of one Adam7 pass (§8.2).
@@ -393,3 +577,4 @@ fn expand_row(h: &Header, pal: &[[u8; 4]], trns: &Trns, line: &[u8], w: usize, o
         }
     }
 }
+

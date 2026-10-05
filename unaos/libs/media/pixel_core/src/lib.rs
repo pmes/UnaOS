@@ -16,7 +16,7 @@
 //! | WebP | RFC 9649 — the VP8L lossless bitstream; lossy VP8 + ALPH through `vp8_core` (RFC 6386) | [`webp`] |
 //!
 //! Output is always straight (non-premultiplied) 8-bit RGBA, row-major, top-down. Animated formats
-//! (GIF) additionally carry every fully composited canvas in [`Image::frames`].
+//! (GIF, animated WebP, APNG) additionally carry every fully composited canvas in [`Image::frames`].
 //!
 //! `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, no dependencies: the kernel links this crate by
 //! path (its `video/png.rs` and `selfhost/inflate.rs` are re-exports of [`png::encode`] and [`inflate`]),
@@ -57,7 +57,8 @@ pub struct Image {
     pub height: u32,
     /// `width * height * 4` straight RGBA bytes (for an animation: the FIRST composited frame).
     pub rgba: Vec<u8>,
-    /// Every composited frame of an animation (GIF with more than one frame), else `None`.
+    /// Every composited frame of an animation (GIF, animated WebP or APNG with more than one frame),
+    /// else `None`.
     pub frames: Option<Vec<Frame>>,
     /// Animation loop count: `Some(0)` = loop forever (NETSCAPE2.0 with count 0), `Some(n)` = play
     /// `n` extra times, `None` = no loop extension (play once). Always `None` for stills.
@@ -220,6 +221,58 @@ impl Image {
             core::mem::swap(&mut self.width, &mut self.height);
         }
         self.orientation = 1;
+    }
+}
+
+/// Integer non-premultiplied `src-over` of one straight-RGBA pixel onto another — libwebp
+/// `anim_decode.c` `BlendPixelNonPremult` and Blink `ImageFrame::BlendSrcOverDstRaw`, bit for bit:
+/// `dst_factor = dst_a * (256 - src_a) >> 8`, `out_a = src_a + dst_factor`, each colour channel
+/// `(src * src_a + dst * dst_factor) * floor(2^24 / out_a) >> 24`. A fully transparent source leaves
+/// the destination as it is. Shared by animated WebP (`ANMF` blend) and APNG (`APNG_BLEND_OP_OVER`).
+pub fn blend_nonpremult(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+    let sa = src[3] as u32;
+    if sa == 0 {
+        return dst;
+    }
+    let dfa = (dst[3] as u32 * (256 - sa)) >> 8;
+    let ba = sa + dfa;
+    let scale = (1u32 << 24) / ba;
+    let ch = |s: u8, d: u8| (((s as u32 * sa + d as u32 * dfa) as u64 * scale as u64) >> 24) as u8;
+    [ch(src[0], dst[0]), ch(src[1], dst[1]), ch(src[2], dst[2]), ba as u8]
+}
+
+/// Float `src-over` of one straight-RGBA pixel onto another, the way Chromium's PNG path (Skia's
+/// `SkPngRustCodec`, blending through `SkRasterPipeline` in single precision) composites
+/// `APNG_BLEND_OP_OVER`, operation for operation: bytes load as `c * (1/255)`, both pixels are
+/// premultiplied, `out = src + dst * (1 - src_a)`, unpremultiplied by multiplying with `1 / out_a`,
+/// and each channel stores as `v * 255` rounded half-to-even (`_mm_cvtps_epi32`). It is NOT Blink's
+/// WebP integer blend ([`blend_nonpremult`]): the oracle tells the two apart (APNG frames blended over
+/// translucent pixels differ by up to 26 between them), and the rounding details were fixed against
+/// 14 452 distinct (source, destination) pairs Chromium blended in the APNG corpus, all equal.
+pub fn blend_srcover_f32(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+    const R255: f32 = 1.0 / 255.0;
+    let ld = |c: u8| c as f32 * R255;
+    let (sa, da) = (ld(src[3]), ld(dst[3]));
+    let inv = 1.0 - sa;
+    let oa = sa + da * inv;
+    if oa <= 0.0 {
+        return [0, 0, 0, 0];
+    }
+    let scale = 1.0 / oa;
+    // Round half to even in f32: adding 2^23 leaves no fraction bits (valid for 0 <= v <= 255).
+    let to8 = |v: f32| ((v.clamp(0.0, 1.0) * 255.0 + 8_388_608.0) - 8_388_608.0) as u8;
+    let ch = |s: u8, d: u8| to8((ld(s) * sa + ld(d) * da * inv) * scale);
+    [ch(src[0], dst[0]), ch(src[1], dst[1]), ch(src[2], dst[2]), to8(oa)]
+}
+
+/// Map a "number of plays" field (APNG `num_plays`, WebP ANIM `Loop Count`: 0 = forever) onto
+/// [`Image::loop_count`]'s GIF meaning (extra repetitions, `Some(0)` = forever) the way Blink does:
+/// 0 -> forever, 1 -> play once (`None`), n -> `n - 1` repetitions.
+pub(crate) fn loop_from_plays(plays: u32) -> Option<u16> {
+    match plays {
+        0 => Some(0),
+        1 => None,
+        n => Some((n - 1).min(u16::MAX as u32) as u16),
     }
 }
 
