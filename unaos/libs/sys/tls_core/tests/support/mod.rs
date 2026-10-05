@@ -341,6 +341,16 @@ pub struct SServer {
 
 impl SServer {
     pub fn start(dir: &Path, leaf: &str, extra: &[&str]) -> SServer {
+        let cert = dir.join(format!("{leaf}.pem")).display().to_string();
+        let key = dir.join(format!("{leaf}.key")).display().to_string();
+        let chain = dir.join("inter.pem").display().to_string();
+        let mut args: Vec<String> = ["-cert", &cert, "-key", &key, "-cert_chain", &chain].iter().map(|s| s.to_string()).collect();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        Self::start_args(&args)
+    }
+
+    /// `openssl s_server -accept 127.0.0.1:<port> <args…>`.
+    pub fn start_args(args: &[String]) -> SServer {
         let port = {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
@@ -349,13 +359,7 @@ impl SServer {
             .arg("s_server")
             .arg("-accept")
             .arg(format!("127.0.0.1:{port}"))
-            .arg("-cert")
-            .arg(dir.join(format!("{leaf}.pem")))
-            .arg("-key")
-            .arg(dir.join(format!("{leaf}.key")))
-            .arg("-cert_chain")
-            .arg(dir.join("inter.pem"))
-            .args(extra)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
