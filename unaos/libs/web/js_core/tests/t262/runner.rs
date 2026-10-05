@@ -49,7 +49,12 @@ pub fn collect(root: &Path, filters: &[String]) -> Vec<PathBuf> {
                     continue;
                 }
                 let rel = p.strip_prefix(&test).unwrap().to_string_lossy().to_string();
-                if filters.is_empty() || filters.iter().any(|f| rel.contains(f.as_str())) {
+                // A filter `!x` excludes paths containing x; the others select (any match).
+                let (neg, pos): (Vec<&String>, Vec<&String>) = filters.iter().partition(|f| f.starts_with('!'));
+                if neg.iter().any(|f| rel.contains(&f[1..])) {
+                    continue;
+                }
+                if pos.is_empty() || pos.iter().any(|f| rel.contains(f.as_str())) {
                     out.push(p);
                 }
             }
