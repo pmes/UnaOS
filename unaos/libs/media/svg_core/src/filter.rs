@@ -11,12 +11,20 @@
 //!
 //! **What Chromium does that the spec leaves open** (each measured against the oracle):
 //! * an unresolvable `url()` is skipped (alone: the element renders unfiltered); a filter with no primitives,
-//!   or a region with zero/negative size, renders nothing;
-//! * an `in` naming an unknown result means "the previous result" (SourceGraphic for the first primitive);
+//!   or a region with zero/negative size, renders nothing; `href` on `<filter>` is not followed;
+//! * SourceGraphic is not clipped to the filter region (only results are cropped, each to its subregion);
+//!   a zero/negative subregion width or height removes the crop altogether;
+//! * an `in` naming an unknown result (FillPaint, BackgroundImage… included) means "the previous result";
 //! * `feImage` referencing an element renders it translated to the subregion origin (or, for an element with
-//!   relative lengths, with the viewport mapped onto the subregion);
+//!   relative lengths, with the viewport mapped onto the subregion); an element met again inside its own
+//!   filter renders unfiltered there;
+//! * lighting maps `surfaceScale` and light z into the working space by the mean axis scale; turbulence
+//!   samples half a user unit off the pixel centre, truncates the seed and ignores primitiveUnits;
 //! * CSS filter functions run in sRGB with an unbounded region; `blur()` needs a unit, `drop-shadow()` takes
 //!   unitless lengths (the presentation attribute's quirk); an invalid function voids the whole list.
+//!
+//! [`apply_css_filter`] is the same machinery as a library call on any premultiplied layer, for Aether's
+//! CSS `filter` on HTML boxes.
 
 use crate::color::{self, ParsedColor};
 use crate::fe::{self, BlendMode, CompositeOp, EdgeMode, IRect, Light, Lighting, TransferFn};
@@ -187,9 +195,6 @@ fn parse_fn(name: &str, args: &str, font_size: f64, vw: f64, vh: f64, current: c
             let mut lens = Vec::new();
             for (k, t) in toks.iter().enumerate() {
                 if let Some(l) = css_len(t, true, font_size, vw, vh) {
-                    if col.is_some() && k != 0 && lens.is_empty() {
-                        // colour first, then lengths: fine
-                    }
                     lens.push(l);
                 } else {
                     let c = match color::parse(t)? {
@@ -320,10 +325,11 @@ where
     };
     // The raster: the canvas plus a margin (content outside a filter region still feeds its primitives).
     let wr = round_out(&limit);
-    if let [FilterFn::Url(id)] = ops.as_slice() {
-        if filter_region(r, r.doc.by_id(id).unwrap(), bbox, ectx).is_none() {
-            return Outcome::Nothing;
-        }
+    // A lone url() filter whose region is empty (or needs a missing bbox) renders nothing.
+    if let [FilterFn::Url(id)] = ops.as_slice()
+        && filter_region(r, r.doc.by_id(id).unwrap(), bbox, ectx).is_none()
+    {
+        return Outcome::Nothing;
     }
     if wr.2 <= wr.0 || wr.3 <= wr.1 {
         return Outcome::Nothing;
