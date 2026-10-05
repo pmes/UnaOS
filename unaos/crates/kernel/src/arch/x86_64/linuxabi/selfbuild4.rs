@@ -11,7 +11,7 @@
 //! 2. `RUST.LNX /apps/HELLO.C` (crates/user-linux-rust, `x86_64-unknown-linux-musl`, static, non-PIE): std::thread x4 on a
 //!    Mutex<u64> to 400000, a HashMap, std::fs::read_to_string, env::args, println!, Instant, a caught panic.
 //! 3. `PROBE.LNX sh -c 'sh -c "echo a; echo b" | cat'` — busybox ash forks both sides of a pipe; `a` then `b` come out.
-//! 4. `PROBE.LNX sh -c "/apps/TCC.LNX -static -o <home>hello4.lnx /apps/PRINTF.C && <home>hello4.lnx"` — ash forks, execs tcc
+//! 4. `PROBE.LNX sh -c "/apps/TCC.LNX -static -o <home>hello4.lnx -x c /apps/PRINTF.C && <home>hello4.lnx"` — ash forks, execs tcc
 //!    (lazily), waits, execs the output: `hello printf from tcc+musl on unaos 42`. Needs `/apps/LIB` (SELFBUILD3); else skip.
 //!
 //! Wire: `:: SELFBUILD4: rust=ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 fork=ok pipe=ok exec_lazy=1
@@ -178,7 +178,7 @@ fn tcc_run() -> String {
     }
     let out = alloc::format!("{}hello4.lnx", super::sys::home_prefix());
     let _ = crate::shell::vfs_mount_table().unlink(&crate::shell::vfs_path(&out), crate::fs::vfs::KERNEL_PRINCIPAL);
-    let line = alloc::format!("{} -static -o {} {} && {}", tcc, out, super::selfbuild3::PRINTF_C, out);
+    let line = alloc::format!("{} -static -o {} -x c {} && {}", tcc, out, super::selfbuild3::PRINTF_C, out);
     serial_println!("[selfbuild4] linux {} sh -c \"{}\"", super::selfbuild::PROBE, line);
     let (r, cap) = run_cap(super::selfbuild::PROBE, &["sh", "-c", line.as_str()], 90_000);
     for l in cap.lines().take(8) {
