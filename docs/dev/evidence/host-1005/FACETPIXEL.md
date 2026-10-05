@@ -2,7 +2,7 @@
 
 Branch `exec-host-facetpixel`, cut at `bdd6c550`, `exec-host-merge1` merged first (`32b4487b`).
 Builds on FACET (SR29, `docs/dev/evidence/host-1004/FACET.md`) and PIXELCORE (SR25,
-`docs/dev/evidence/host-1004/PIXELCORE.md`).
+`docs/dev/evidence/media-1004/PIXELCORE.md`).
 
 ## Finding
 
@@ -99,10 +99,13 @@ All green. `bus.rs` and `oracles.rs` no longer hide behind a feature.
 
 ## Honest ceiling
 
-Facet decodes exactly what pixel_core decodes: PNG (all colour types/depths, interlace), JPEG
-(baseline + progressive Huffman, 8-bit), GIF (animated, composited), BMP (BITMAPINFOHEADER family),
-QOI, WebP lossless (VP8L). Refused by name: lossy and animated WebP, arithmetic-coded / 12-bit /
-lossless JPEG, TIFF, ICO/CUR, AVIF/HEIF, JPEG XL, JPEG 2000, PSD, PNM, SVG.
+Facet decodes exactly what pixel_core decodes (its ceiling is PIXELCORE.md's): PNG, JPEG (baseline +
+progressive Huffman, 8-bit), GIF (animated, composited), BMP (BITMAPINFOHEADER family), QOI, WebP
+lossless (VP8L). Refused by name: lossy and animated WebP; arithmetic-coded / lossless /
+hierarchical / 12-bit / DNL JPEG, and a truncated progressive JPEG (refused rather than shown
+partial); TIFF, ICO/CUR, AVIF/HEIF, JPEG XL, JPEG 2000, PSD, PNM, SVG. Embedded ICC profiles are
+reported by Facet's meta reader but applied by nobody (colour management is owed in Facet and
+pixel_core alike) — the suite's fixtures are untagged/sRGB, which is why they match Chromium.
 
 ## Owed
 
