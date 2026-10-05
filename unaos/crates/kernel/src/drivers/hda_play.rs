@@ -559,11 +559,13 @@ pub fn selftest_codecs() {
                 let mut stalled = false;
                 let (mut last, mut gap) = (crate::arch::ms(), 0u64); // MP3HANG: this loop's longest pass (MP3GUARD keys_alive)
                 while ACTIVE.load(Ordering::Acquire) {
+                    let armed0 = DEC_ARMED.load(Ordering::Acquire);
                     service();
                     let (_done, _moved, st) = progress();
                     if st { stalled = true; break; }
                     delay_us(2_000);
-                    let now = crate::arch::ms(); gap = gap.max(now.saturating_sub(last)); last = now;
+                    // the one pass that arms the stream runs the HDA bring-up (`start()`), not a decoder: not counted
+                    let now = crate::arch::ms(); if armed0 == DEC_ARMED.load(Ordering::Acquire) { gap = gap.max(now.saturating_sub(last)); } last = now;
                 }
                 if stalled {
                     let (lp, run_bit, fifo) = { let s = ST.lock(); (s.lpib_last, s.run_bit as u8, s.fifo.len()) };

@@ -52,3 +52,32 @@
   block, so a slow decode underruns rather than wedges — the underrun count is on the PLAYCODEC line.
 - The render task still runs every other `tests` verb on 32 KiB; a stack-room assertion at `dispatch_command`
   is the general cure (out of this arc's files).
+
+## Built (M1 f047d4e4.., M2/M3 on exec-rmbp-mp3hang)
+- M1 measured on the kernel target after the change (`-Z emit-stack-sizes`, release): `Decoder::open` 184 B (was
+  92504), `open_arm::mp3` 568, `Mp3Stream::new` 536 (was 32872), `Mp3Decoder::decode_frame` 5384 (was 16488),
+  `next_i32` 216. Largest frame left in the crate: `OggOpus::new` 9352 (unchanged; Opus flew clean). Host:
+  `cargo test -p audio_core` — every MP3/Opus/Vorbis/AAC/FLAC KAT and oracle passes; `aac_kat` needed a one-line
+  fix of a debug-only underflow in the AAC fill element (`15 + esc - 1`); `tests/robust.rs` FLAC mutation cases
+  still panic on a debug-build overflow in `flac.rs:211` (LPC predictor, mutated input) — untouched here, owed.
+- M2/M3: `drivers/hda_play.rs` tail (`dec_*`). `open_coded`/`coded_pump`/`coded_report` keep their names and
+  delegate. No new knob: everything rides `hda-tone` (in the metal line).
+
+## The wire a metal boot should print for `tests play mp3`
+```
+:: TESTS: run play ::
+[play] dec spawn path=/system/test-f/TEST.MP3 jid=<n> stack=65536 cpu=<n>
+[play] arm sd=0 … want_rate=44100 …
+[play] open path=/system/test-f/TEST.MP3 format=mp3 codec=Mp3 rate=44100 ch=1 bits=0 frames=Some(11025) decim=1 out_ch=1 eff_rate=44100 resampled=0
+[play] mp3 frames=11025 calls=<n> ms=<n> eos=1
+[play] dec exit jid=<n> why=eos stage=synth calls=<n> stack high=<n> of 65536
+[play] run … / [play] t=… (the ring, as before)
+[play] done … play_ms=<n>
+:: PLAYCODEC: path=/system/test-f/TEST.MP3 format=mp3 codec=Mp3 rate=44100 frames=11025 lpib_moved=1 done=1 -> PASS :: …
+:: MP3GUARD: stall=none keys_alive=1 sink_alive=1 -> PASS :: gap_ms=<n> beats=1 dec_stack_high=<n> of 65536 task=play-dec ::
+```
+A decoder that stops: `[play] mp3 stall stage=<demux|frame|synth> frame=<n> calls=<n> ms=<n> -> ABORT`, then
+`:: PLAYCODEC: fmt=mp3 path=… reason=decoder-stall stage=… -> FAIL ::` and `:: MP3GUARD: stall=<stage> … -> FAIL`;
+the shell answers the next line. `keys_alive` = the waiting (shell/render) task's longest loop pass ≤ 250 ms,
+excluding the one pass that runs `start()`'s HDA bring-up; `sink_alive` = the decoder's heartbeat lines reached
+the wire. `dec_stack_high` is the next flight's check on the 64 KiB.
