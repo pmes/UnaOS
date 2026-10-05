@@ -264,7 +264,7 @@ fi
 bc_table() {
 cat <<'TABLE'
 witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|!baremetal,!bootlog,!usbdebug@except:x86_64+wc,!tegra|measured(1)
-wc|[wc-x] desktop-app|-|measured(1)
+wc|[wc-x] activate bare|-|measured(1)
 linuxabi|:: LINUXABI: path=|-|measured(1)
 busreg|:: BANDY3: registered=|-|measured
 wcg-paygo| paygo win|witness|measured
