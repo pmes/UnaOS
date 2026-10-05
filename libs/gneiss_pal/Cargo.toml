@@ -7,8 +7,6 @@ license = "LGPL-3.0-or-later"
 [features]
 default = ["std"]
 std = ["dep:http_core", "tokio", "futures-core", "futures-util"]
-# EMBED (B317): the in-process local embedder (all-MiniLM-L6-v2 on candle, CPU).
-std = ["reqwest", "octocrab", "tokio", "futures-core", "futures-util"]
 # EMBED (B317): the in-process local embedder (all-MiniLM-L6-v2 on the CPU) — since INFERCORE (SR57)
 # run by UnaOS's own `infer_core` (no_std, zero deps); the candle crates are gone.
 
