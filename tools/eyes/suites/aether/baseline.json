@@ -26,9 +26,9 @@
       "ssim": 0.9506
     },
     "06-table-zebra": {
-      "mismatch": 0.99,
+      "mismatch": 0.96,
       "missing": 0,
-      "ssim": 0.9861
+      "ssim": 0.9879
     },
     "07-images-svg": {
       "mismatch": 3.07,
@@ -104,6 +104,11 @@
       "mismatch": 0.61,
       "missing": 0,
       "ssim": 0.9932
+    },
+    "20-table-spans": {
+      "mismatch": 1.11,
+      "missing": 0,
+      "ssim": 0.9871
     }
   },
   "thresholds": {

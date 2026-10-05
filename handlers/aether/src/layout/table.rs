@@ -176,8 +176,9 @@ fn layout_table(tree: &mut LayoutTree, table: NodeId, min_content: &dyn Fn(&Layo
     for line in &grid {
         for &(c, col, span) in line {
             if span == 1 {
-                maxw[col] = maxw[col].max(cell_w(tree, c));
-                minw[col] = minw[col].max(min_content(tree, c).min(cell_w(tree, c)));
+                let mn = min_content(tree, c);
+                maxw[col] = maxw[col].max(cell_w(tree, c)).max(mn);
+                minw[col] = minw[col].max(mn);
             }
         }
     }

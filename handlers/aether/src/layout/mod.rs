@@ -1729,11 +1729,40 @@ pub fn remeasure(tree: &mut LayoutTree) {
     // line boxes, and the tree is laid out again until heights are stable
     // (an inline-block's height feeds the line that holds it).
     let mut saved_heights: Vec<(taffy::NodeId, Dimension)> = Vec::new();
+    let mut saved_min: Vec<(taffy::NodeId, LengthPercentageAuto)> = Vec::new();
+    let is_cell = |tree: &LayoutTree, id: taffy::NodeId| {
+        tree.node_map.get(&id).and_then(|n| n.as_element().map(|e| matches!(e.name.local.as_ref(), "td" | "th"))).unwrap_or(false)
+    };
     for _ in 0..4 {
         let heights = inline::layout_all(tree, &text_info, &elem_info);
         let mut changed = false;
         for (id, h) in heights {
             let Ok(st) = tree.taffy.style(id) else { continue };
+            if is_cell(tree, id) {
+                // A table cell stretches to its row (§17.5.3): its line boxes
+                // set a MINIMUM height; vertical-align places them inside.
+                let Ok(l) = tree.taffy.layout(id).cloned() else { continue };
+                let edges = l.padding.top + l.padding.bottom + l.border.top + l.border.bottom;
+                let want = if st.box_sizing == taffy::style::BoxSizing::BorderBox { h + edges } else { h };
+                let orig = saved_min.iter().find(|(s, _)| *s == id).map(|(_, d)| *d).unwrap_or(st.min_size.height);
+                let author = match orig.into_raw().tag() {
+                    taffy::style::CompactLength::LENGTH_TAG => orig.into_raw().value(),
+                    _ => 0.0,
+                };
+                let target = LengthPercentageAuto::length(want.max(author));
+                if st.min_size.height != target {
+                    if !saved_min.iter().any(|(s, _)| *s == id) {
+                        saved_min.push((id, st.min_size.height));
+                    }
+                    let mut st = st.clone();
+                    st.min_size.height = target;
+                    let _ = tree.taffy.set_style(id, st);
+                    if (l.size.height - edges - h).abs() >= 0.01 {
+                        changed = true;
+                    }
+                }
+                continue;
+            }
             let saved = saved_heights.iter().find(|(s, _)| *s == id).map(|(_, d)| *d);
             let orig = saved.unwrap_or(st.size.height);
             if orig != Dimension::auto() {
@@ -1760,6 +1789,13 @@ pub fn remeasure(tree: &mut LayoutTree) {
             break;
         }
         run_pass(tree);
+    }
+    for (id, d) in saved_min {
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            st.min_size.height = d;
+            let _ = tree.taffy.set_style(id, st);
+        }
     }
     for (id, d) in saved_heights {
         if let Ok(st) = tree.taffy.style(id) {

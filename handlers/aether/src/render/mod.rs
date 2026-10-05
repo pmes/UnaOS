@@ -619,6 +619,28 @@ fn z_of(layout: &LayoutTree, id: NodeId) -> i32 {
     layout.paint_map.get(&id).and_then(|p| p.z_index).flatten().unwrap_or(0)
 }
 
+/// The vertical offset of a table cell's content (CSS 2.2 §17.5.4): middle
+/// (the UA default) centres the line boxes in the content box, bottom puts
+/// them at its end, top/baseline leave them at the top.
+fn cell_valign_offset(layout: &LayoutTree, id: NodeId, content_h: f32) -> f32 {
+    let is_cell = layout
+        .node_map
+        .get(&id)
+        .and_then(|n| n.as_element().map(|e| matches!(e.name.local.as_ref(), "td" | "th")))
+        .unwrap_or(false);
+    if !is_cell {
+        return 0.0;
+    }
+    let Ok(l) = layout.taffy.layout(id) else { return 0.0 };
+    let inner = l.size.height - l.padding.top - l.padding.bottom - l.border.top - l.border.bottom;
+    let free = (inner - content_h).max(0.0);
+    match layout.paint_map.get(&id).and_then(|p| p.vertical_align).map(|v| v.0) {
+        Some(0 | 6) => 0.0,
+        Some(7) => free,
+        _ => (free / 2.0).floor(),
+    }
+}
+
 /// Text decoration lines of one run.
 #[derive(Clone, Copy, Default)]
 struct Deco {
@@ -1965,7 +1987,10 @@ pub fn render_frame(
             // order (CSS 2.2 Appendix E step 7: each inline box's background
             // and borders, then its text; atomic inlines as whole boxes).
             let content_x = current_x + layout_box.border.left + layout_box.padding.left;
-            let content_y = current_y + layout_box.border.top + layout_box.padding.top;
+            // A table cell's vertical-align places its lines in the cell
+            // (§17.5.4; html.css: middle).
+            let valign_off = cell_valign_offset(layout, node_id, ifc.height);
+            let content_y = current_y + layout_box.border.top + layout_box.padding.top + valign_off;
             // Text baselines snap to whole pixels from the EXACT (unrounded)
             // position, as Skia rounds a glyph run's fractional origin; the
             // box tree's rounded block positions can be up to half a pixel

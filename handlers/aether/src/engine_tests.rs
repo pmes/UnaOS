@@ -2539,6 +2539,31 @@ mod tests {
         assert_eq!(x, 30.0, "the line box is shortened by the float");
     }
 
+    /// CSS 2.2 §17.5.2 / §17.2.1 known answers: a rowspan cell covers its
+    /// column in the rows below (their first cell starts in the next
+    /// column) and is as tall as the rows it spans; a narrow table never
+    /// shrinks a column below its min-content; table-layout: fixed takes the
+    /// first row's width and splits the rest equally.
+    #[test]
+    fn test_table_spans_kat() {
+        let css = "body{margin:0;font:14px monospace} table{border-spacing:0} td{padding:0}";
+        let t = laid_out(
+            r#"<html><body><table><tr><td id=s rowspan=2>ab</td><td id=a>x</td></tr><tr><td id=b>y</td></tr></table>
+            <table style="width:40px"><tr><td id=w>abcdefghij</td><td>k l</td></tr></table>
+            <table style="table-layout:fixed;width:300px"><tr><td id=f1 style="width:60px">a</td><td id=f2>b</td><td id=f3>c</td></tr></table></body></html>"#,
+            css,
+        );
+        let (s, a, b) = (rect_by_id(&t, "s").unwrap(), rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(a.0, b.0, "the second row's cell sits in column 2 under the first row's: {a:?} {b:?}");
+        assert!((s.3 - (a.3 + b.3)).abs() < 0.5, "the spanning cell is both rows tall: {s:?} {a:?} {b:?}");
+        let w = rect_by_id(&t, "w").unwrap();
+        let cw = crate::fonts::face(2, false, false).map(|f| crate::fonts::lines::Advancer::new(&f, 2, 14.0, 0.0).char('a')).unwrap_or(0.0);
+        assert!(w.2 >= cw * 10.0 - 0.5, "min-content: the unbreakable word keeps its width: {w:?} cw {cw}");
+        let (f1, f2, f3) = (rect_by_id(&t, "f1").unwrap(), rect_by_id(&t, "f2").unwrap(), rect_by_id(&t, "f3").unwrap());
+        assert_eq!(f1.2, 60.0, "fixed: the first row's 60px column");
+        assert!((f2.2 - 120.0).abs() < 0.5 && (f3.2 - 120.0).abs() < 0.5, "fixed: the rest shared equally: {f2:?} {f3:?}");
+    }
+
     /// css-values-4 §6.1 / css-fonts-4 §2.5 / CSS 2.2 §10.8.1 known answers:
     /// em lengths are of the element's own font-size, a font-size in em of
     /// the parent's, rem of the root's; a line-height number inherits as the
