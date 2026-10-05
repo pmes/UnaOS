@@ -167,3 +167,6 @@ pub mod attrsys;
 pub mod filetype;
 /// FILETYPE M2 (B307): the type database — type → opener as attributes on `/system/types/*`.
 pub mod assoc;
+/// UNAFSGROW (B347): `tests unafsgrow` — the unafs crate's `UnaFS::grow` on a scratch image.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub mod unafsgrow;

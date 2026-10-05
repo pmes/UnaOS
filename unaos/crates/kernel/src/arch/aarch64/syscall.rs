@@ -25918,6 +25918,8 @@ fn sys_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
 #[cfg(feature = "busreg")]
 pub fn busreg_ops() -> &'static crate::bus_route::Ops {
     &BUSREG_OPS
+}
+
 // =================================================================================================
 // RING3ABI2 (rmbp-ledger B333) — the argv-less launchers every older caller uses, and SYS_WHOAMI.
 // =================================================================================================

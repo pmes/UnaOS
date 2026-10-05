@@ -125,6 +125,13 @@ enum Commands {
         #[arg(long)]
         repair: bool,
     },
+    /// Grow the volume in place to BLOCKS 4 KiB blocks (UNAFSGROW): the image
+    /// file is extended first, then the refcount map, then block 0 (the
+    /// superblock, last). Refuses a shrink and a size the map cannot address.
+    Grow {
+        img: String,
+        blocks: u64,
+    },
     /// List retained snapshots (the on-disk snapshot index).
     Snaps {
         #[arg(short, long, default_value = "unafs.img")]
@@ -781,6 +788,38 @@ async fn main() -> Result<()> {
             })?;
 
             println!("✅ [OPERATOR] Removed attribute '{}' from '{}'", key, path);
+        }
+        Commands::Grow { img, blocks } => {
+            let want = blocks
+                .checked_mul(unafs::BLOCK_SIZE)
+                .context("block count overflows a byte size")?;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(img)
+                .context("Failed to open image")?;
+            let len = file.metadata().context("Failed to stat image")?.len();
+            if want > len {
+                file.set_len(want).context("Failed to extend image")?;
+            }
+            drop(file);
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let (mut fs, r) = unafs::grow(device, *blocks)
+                .map_err(|e| anyhow::anyhow!("grow failed: {}", e))?;
+            let rep = fs
+                .fsck(false)
+                .map_err(|e| anyhow::anyhow!("fsck after grow failed: {:?}", e))?;
+            println!(
+                "grow '{}': from={} to={} free {} -> {} fsck={}",
+                img,
+                r.from,
+                r.to,
+                r.free_before,
+                r.free_after,
+                if rep.is_clean() { "ok" } else { "NOT-CLEAN" }
+            );
+            if !rep.is_clean() {
+                anyhow::bail!("the grown volume is not clean");
+            }
         }
         Commands::Fsck { img, repair } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
