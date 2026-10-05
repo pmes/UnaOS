@@ -339,6 +339,47 @@ kat!(
     r#"{"BrowserFaviconChanged":{"width":1,"height":1,"rgba":[255,0,0,255]}}"#
 );
 
+// --- STRIA (A/V playback) ---
+
+kat!(kat_media_poster, SMessage::MediaPoster { url: "file:///v.webm".to_string() }, r#"{"MediaPoster":{"url":"file:///v.webm"}}"#);
+kat!(kat_media_pause, SMessage::MediaPause { url: "u".to_string() }, r#"{"MediaPause":{"url":"u"}}"#);
+kat!(kat_media_resume, SMessage::MediaResume { url: "u".to_string() }, r#"{"MediaResume":{"url":"u"}}"#);
+kat!(
+    kat_media_seek,
+    SMessage::MediaSeek { url: "u".to_string(), position_ns: 1_500_000_000 },
+    r#"{"MediaSeek":{"url":"u","position_ns":1500000000}}"#
+);
+kat!(kat_media_stop, SMessage::MediaStop { url: "u".to_string() }, r#"{"MediaStop":{"url":"u"}}"#);
+kat!(
+    kat_media_opened,
+    SMessage::MediaOpened {
+        url: "u".to_string(),
+        duration_ns: 1_000_000_000,
+        width: 320,
+        height: 240,
+        video: "av01".to_string(),
+        audio: "".to_string(),
+        real_video: false,
+        audio_clock: false,
+    },
+    r#"{"MediaOpened":{"url":"u","duration_ns":1000000000,"width":320,"height":240,"video":"av01","audio":"","real_video":false,"audio_clock":false}}"#
+);
+kat!(
+    kat_media_frame,
+    SMessage::MediaFrame { url: "u".to_string(), pts_ns: 40_000_000, width: 1, height: 1, rgba: vec![1, 2, 3, 255] },
+    r#"{"MediaFrame":{"url":"u","pts_ns":40000000,"width":1,"height":1,"rgba":[1,2,3,255]}}"#
+);
+kat!(
+    kat_media_ended,
+    SMessage::MediaEnded { url: "u".to_string(), presented: 10, dropped: 0 },
+    r#"{"MediaEnded":{"url":"u","presented":10,"dropped":0}}"#
+);
+kat!(
+    kat_media_error,
+    SMessage::MediaError { url: "u".to_string(), error: "no such file".to_string() },
+    r#"{"MediaError":{"url":"u","error":"no such file"}}"#
+);
+
 // --- EDITOR (The Code Pane) ---
 
 kat!(
@@ -776,6 +817,15 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserUrlChanged(_) => "BrowserUrlChanged",
         SMessage::BrowserTitleChanged(_) => "BrowserTitleChanged",
         SMessage::BrowserFaviconChanged { .. } => "BrowserFaviconChanged",
+        SMessage::MediaPoster { .. } => "MediaPoster",
+        SMessage::MediaPause { .. } => "MediaPause",
+        SMessage::MediaResume { .. } => "MediaResume",
+        SMessage::MediaSeek { .. } => "MediaSeek",
+        SMessage::MediaStop { .. } => "MediaStop",
+        SMessage::MediaOpened { .. } => "MediaOpened",
+        SMessage::MediaFrame { .. } => "MediaFrame",
+        SMessage::MediaEnded { .. } => "MediaEnded",
+        SMessage::MediaError { .. } => "MediaError",
         SMessage::EditorLoad { .. } => "EditorLoad",
         SMessage::EditorEdited { .. } => "EditorEdited",
         SMessage::EditorSaveRequest => "EditorSaveRequest",
