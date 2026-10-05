@@ -66,6 +66,14 @@ pub trait RawNic {
     fn transmit(frame: &[u8]);
     /// The station MAC, or `None` if no NIC is registered.
     fn mac() -> Option<[u8; 6]>;
+    /// NETCLOCK (B335): room for one more frame right now. A NIC whose transmit is asynchronous (the USB
+    /// dongle's bounded TX ring) answers `false` while full, and [`SmoltcpPhy`]'s `transmit` then returns
+    /// `None` — smoltcp's back-pressure: the packet stays in its socket and goes on a later poll. Default
+    /// `true` (the synchronous rings), so every existing NIC compiles to the old datapath.
+    #[inline(always)]
+    fn tx_ready() -> bool {
+        true
+    }
 }
 
 /// An observer run on every frame the phy receives, BEFORE the RX/TX tokens are minted. The default
@@ -216,6 +224,9 @@ impl<N: RawNic, O: RxObserver> Device for SmoltcpPhy<N, O> {
     }
 
     fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
+        if !N::tx_ready() {
+            return None; // NETCLOCK: the NIC's TX ring is full — smoltcp retries on a later poll
+        }
         Some(PhyTxToken { buf: &mut self.tx, _nic: PhantomData })
     }
 
@@ -335,6 +346,24 @@ pub fn dhcp_or_static<D: Device>(
     static_prefix: u8,
     static_gw: [u8; 4],
 ) -> NetConfig {
+    // ARMNET (B346): a NIC with no RX-ready probe (genet) polls on a 1 ms cadence floor, not every pass.
+    dhcp_or_static_gated(prefix, iface, dev, now_ms, timeout_ms, static_ip, static_prefix, static_gw, None)
+}
+
+/// ARMNET (B346): [`dhcp_or_static`] polled on the DHCP socket's own `poll_delay` (smoltcp's DISCOVER/REQUEST
+/// retransmit timers, now in real seconds) or when `rx_ready` says a frame is waiting — never once per loop
+/// pass. `rx_ready = None` caps the gap at 1 ms (a NIC with no probe still hears its OFFER).
+pub fn dhcp_or_static_gated<D: Device>(
+    prefix: &str,
+    iface: &mut Interface,
+    dev: &mut D,
+    now_ms: &dyn Fn() -> i64,
+    timeout_ms: i64,
+    static_ip: [u8; 4],
+    static_prefix: u8,
+    static_gw: [u8; 4],
+    rx_ready: Option<&dyn Fn() -> bool>,
+) -> NetConfig {
     let mut storage: [SocketStorage; 1] = Default::default();
     let mut sockets = SocketSet::new(&mut storage[..]);
     let handle = sockets.add(dhcpv4::Socket::new());
@@ -346,12 +375,25 @@ pub fn dhcp_or_static<D: Device>(
     // exact seam the QEMU `vnet` path leases through, so surfacing the poll count on BOTH outcomes lets
     // boot-14 compare the metal cadence against the known-good virtio lease directly.
     let mut polls: u64 = 0;
+    let mut next_poll: i64 = 0;
     loop {
         let t = now_ms();
-        iface.poll(Instant::from_millis(t), dev, &mut sockets);
-        polls += 1;
+        let due = t >= next_poll || rx_ready.map(|f| f()).unwrap_or(false);
+        if due {
+            iface.poll(Instant::from_millis(t), dev, &mut sockets);
+            polls += 1;
+            let after = now_ms();
+            next_poll = after
+                + match (rx_ready, iface.poll_delay(Instant::from_millis(after), &sockets)) {
+                    (None, _) => 1,
+                    (Some(_), Some(d)) => (d.total_millis() as i64).clamp(1, 1_000),
+                    (Some(_), None) => 1_000,
+                };
+        } else {
+            core::hint::spin_loop();
+        }
 
-        match sockets.get_mut::<dhcpv4::Socket>(handle).poll() {
+        match if due { sockets.get_mut::<dhcpv4::Socket>(handle).poll() } else { None } {
             Some(dhcpv4::Event::Configured(cfg)) => {
                 let ip = cfg.address.address().octets();
                 let prefix_len = cfg.address.prefix_len();
@@ -831,6 +873,9 @@ pub mod net6 {
         pub mac: fn() -> Option<[u8; 6]>,
         /// PHY link state, for the witness lines.
         pub link_up: fn() -> bool,
+        /// ARMNET (B346): a received frame is waiting (virtio: used-ring index moved; rtl8168: the descriptor at
+        /// `rx_cur` has OWN clear). A pure read with no side effects: the poll gate's RX half.
+        pub rx_ready: fn() -> bool,
         /// A SUBSYSTEM name for the wire (`"virtio-net"`, `"rtl8168"`) — never a board name (R16).
         pub name: &'static str,
     }
@@ -888,14 +933,10 @@ pub mod net6 {
     /// bring-ups already depend on CNTPCT being live), so it is the one clock every NET6 witness uses
     /// — and it is REAL time, which is why an RTT printed here is a duration and not an iteration
     /// count. `0` if CNTFRQ reads zero (no trustworthy counter), which renders as `rtt_ms=0`.
+    /// ARMNET (B346): `clock::stack_ms`, the one stack clock (CNTPCT here), also the smoltcp clock below.
     #[inline]
     pub fn now_ms() -> i64 {
-        let (cnt, frq): (u64, u64);
-        unsafe {
-            core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt, options(nomem, nostack, preserves_flags));
-            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
-        }
-        if frq == 0 { 0 } else { (cnt.wrapping_mul(1_000) / frq) as i64 }
+        crate::clock::stack_ms()
     }
 
     // ── Static storage for the persistent stack (BSS; no heap anywhere in this module) ────────────
@@ -924,10 +965,17 @@ pub mod net6 {
     /// Per-slot generation counter — bumped on every close, so a stale handle carrying the old
     /// `(gen, sid)` can never rebind to a first-fit-reused slot (the SOCK-3 fence, U11x discipline).
     static SOCK_GEN: [AtomicU32; NSOCK] = [const { AtomicU32::new(0) }; NSOCK];
-    /// Monotonic poll clock fed to `iface.poll`, bumped per poll across ALL callers so smoltcp's
-    /// neighbour/retransmit timers advance consistently. Iteration-driven (the real clock is only
-    /// used for RTTs), exactly as SOCK-2's is.
-    static POLL_CLOCK: AtomicI64 = AtomicI64::new(1);
+    /// ARMNET (B346): when smoltcp next asked to be polled (`now_ms` scale; 0 = now). Written by
+    /// [`poll_now`] from `Interface::poll_delay`; [`kick`] brings it forward. This replaces `POLL_CLOCK`,
+    /// the per-poll +1 ms counter that ran smoltcp's ARP/TCP timers as fast as the CPU polled.
+    static NEXT_POLL_MS: AtomicI64 = AtomicI64::new(0);
+    /// Polls of the persistent interface this boot (`tests netclock`, the census rollup).
+    static POLLS: AtomicU32 = AtomicU32::new(0);
+    /// Nothing scheduled (`poll_delay` = None): look again once a second. Never closer than 1 ms.
+    const IDLE_POLL_MS: i64 = 1_000;
+    const MIN_POLL_MS: i64 = 1;
+    /// DNS transaction-id sequence (the id was the poll clock's low half).
+    static DNS_SEQ: AtomicU32 = AtomicU32::new(0);
     /// Next ephemeral source port for an active open.
     static EPHEMERAL: AtomicU32 = AtomicU32::new(49152);
 
@@ -960,15 +1008,12 @@ pub mod net6 {
 
     static STACK: spin::Mutex<Option<Stack>> = spin::Mutex::new(None);
 
-    /// Pump budgets, in poll iterations. Iteration- not clock-bounded (the SOCK-2 discipline): a reply
-    /// on a local link lands in a handful of iterations, so these only cap how long an unreachable
-    /// peer stalls the caller, and every one of them terminates by construction.
-    const SEND_PUMP: i64 = 20_000;
-    const RECV_PUMP: i64 = 400_000;
-    const CONNECT_PUMP: i64 = 400_000;
-    /// Iterations per lock hold — the lock is released between chunks so a concurrent socket syscall
-    /// on another core is never starved for a whole pump.
-    const CHUNK: i64 = 4_000;
+    /// ARMNET (B346): pump budgets in WALL milliseconds (they were poll counts: 400k polls = 400 smoltcp
+    /// seconds). recv/connect = the x86 NETHANG cap. A send flushes until its socket's queue is empty,
+    /// capped: aarch64 has no idle service to carry a queued packet out later.
+    const SEND_MS: i64 = 200;
+    const RECV_MS: i64 = 2_000;
+    const CONNECT_MS: i64 = 2_000;
 
     /// Build the persistent stack once (idempotent), ADOPTING the config the bring-up settled on.
     /// `false` if no adapter registered yet. Called under the `STACK` lock.
@@ -1063,14 +1108,91 @@ pub mod net6 {
         Some(c.dns.unwrap_or(c.gw))
     }
 
-    /// Drive `iters` poll iterations against the persistent interface. Split-borrows the fields so
-    /// `iface.poll` gets `&mut dev` + `&mut sockets` disjointly. Reads the RX ring directly through
-    /// the adapter, so it drives ARP, egress and inbound delivery with no interrupt required.
-    fn pump(stack: &mut Stack, iters: i64) {
+    /// ARMNET (B346): is a received frame waiting on the registered NIC? (the adapter's pure probe)
+    fn rx_ready() -> bool {
+        match nic() {
+            Some(n) => (n.rx_ready)(),
+            None => false,
+        }
+    }
+
+    /// ARMNET: the poll gate — smoltcp's own `poll_delay` has run out, or a frame arrived.
+    fn poll_due() -> bool {
+        now_ms() >= NEXT_POLL_MS.load(Ordering::Relaxed) || rx_ready()
+    }
+
+    /// ARMNET: a socket just queued data or opened a connection — the next gated poll is due now.
+    fn kick() {
+        NEXT_POLL_MS.store(0, Ordering::Relaxed);
+    }
+
+    /// ARMNET: THE poll of the persistent interface: at the real clock, counted, the next one scheduled
+    /// from smoltcp's `poll_delay`. Split-borrows the fields so `iface.poll` gets `&mut dev` + `&mut
+    /// sockets` disjointly. Reads the RX ring through the adapter (no interrupt required).
+    fn poll_now(stack: &mut Stack) {
         let Stack { iface, sockets, dev, .. } = stack;
-        for _ in 0..iters {
-            let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
-            iface.poll(Instant::from_millis(now), dev, sockets);
+        let now = now_ms();
+        iface.poll(Instant::from_millis(now), dev, sockets);
+        POLLS.fetch_add(1, Ordering::Relaxed);
+        let after = now_ms();
+        let delay = match iface.poll_delay(Instant::from_millis(after), sockets) {
+            Some(d) => (d.total_millis() as i64).max(MIN_POLL_MS),
+            None => IDLE_POLL_MS,
+        };
+        NEXT_POLL_MS.store(after + delay, Ordering::Relaxed);
+        census_tick(after);
+    }
+
+    /// ARMNET: drive the persistent stack until `check` answers or `budget_ms` of wall time passes.
+    /// `STACK` is held for ONE gated poll plus the check and released between iterations, so another
+    /// core's socket syscall gets it between any two polls. `check` runs on the first pass even when no
+    /// poll is due (a reply may already be buffered) and after every poll. `None` = budget spent / no stack.
+    fn pump_until<T>(budget_ms: i64, mut check: impl FnMut(&mut Stack) -> Option<T>) -> Option<T> {
+        let deadline = now_ms() + budget_ms;
+        let mut first = true;
+        loop {
+            let due = poll_due();
+            if first || due {
+                let mut g = STACK.lock();
+                let stack = g.as_mut()?;
+                if due {
+                    poll_now(stack);
+                }
+                if let Some(v) = check(stack) {
+                    return Some(v);
+                }
+            }
+            first = false;
+            if now_ms() >= deadline {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// ARMNET: the idle service — one poll when smoltcp asked for one or a frame waits, never per pass.
+    /// Never spins on `STACK` (a socket syscall on another core may hold it: next call). `tests netclock`
+    /// drives it; an aarch64 main-loop call site is owed to the arm tracks (aarch64 has no `service_net`).
+    pub fn service_poll() {
+        if !poll_due() {
+            return;
+        }
+        let Some(mut g) = STACK.try_lock() else { return };
+        let Some(stack) = g.as_mut() else { return };
+        poll_now(stack);
+    }
+
+    /// Polls of the persistent interface so far this boot.
+    pub fn polls() -> u32 {
+        POLLS.load(Ordering::Relaxed)
+    }
+
+    /// ARMNET: a throwaway interface's next-poll delay (the `ping`/`arp` verbs): its `poll_delay`, 1 ms floor,
+    /// 1 s when nothing is scheduled. The same rule as [`poll_now`].
+    fn gate_delay(iface: &mut Interface, sockets: &SocketSet<'_>, now: i64) -> i64 {
+        match iface.poll_delay(Instant::from_millis(now), sockets) {
+            Some(d) => (d.total_millis() as i64).max(MIN_POLL_MS),
+            None => IDLE_POLL_MS,
         }
     }
 
@@ -1224,7 +1346,7 @@ pub mod net6 {
             // sender outright), and the sink is dropped on return: this observer exists for its side
             // effect on the table.
             let mut sink = None;
-            snoop_arp(frame, [0, 0, 0, 0], &mut sink);
+            snoop_arp(frame, [0, 0, 0, 0], &mut sink); RX_FRAMES.fetch_add(1, Ordering::Relaxed); // ARMNET (B346): frames the persistent stack received
         }
     }
 
@@ -1297,14 +1419,20 @@ pub mod net6 {
         let remote = IpAddress::v4(target[0], target[1], target[2], target[3]);
         let (mut sent, mut received, mut seq) = (0u16, 0u16, 0u16);
         let mut first_rtt = 0i64;
-        let mut clock = 0i64;
+        let mut next_poll = 0i64; // ARMNET: this interface's own `poll_delay` gate (was `clock += 1` per pass)
         let t0 = now_ms();
         // One outstanding echo at a time, so a reply's RTT belongs to a KNOWN request. `sent_at` is
         // the real-time stamp of the request in flight; `0` = nothing outstanding.
         let mut sent_at = 0i64;
         while now_ms().saturating_sub(t0) < VERB_BUDGET_MS && received < count {
-            clock += 1;
-            iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
+            let now = now_ms();
+            if now >= next_poll || rx_ready() {
+                iface.poll(Instant::from_millis(now), &mut dev, &mut sockets);
+                POLLS.fetch_add(1, Ordering::Relaxed);
+                next_poll = now + gate_delay(&mut iface, &sockets, now);
+            } else {
+                core::hint::spin_loop();
+            }
             let sock = sockets.get_mut::<icmp::Socket>(handle);
             if sent_at == 0 && seq < count && sock.can_send() {
                 seq += 1;
@@ -1315,6 +1443,7 @@ pub mod net6 {
                     repr.emit(&mut Icmpv4Packet::new_unchecked(buf), &caps);
                     sent += 1;
                     sent_at = now_ms().max(1);
+                    next_poll = 0; // the echo goes out on the next pass
                 }
             }
             let sock = sockets.get_mut::<icmp::Socket>(handle);
@@ -1425,12 +1554,18 @@ pub mod net6 {
             .get_mut::<icmp::Socket>(handle)
             .bind(icmp::Endpoint::Ident(PING_IDENT));
         let remote = IpAddress::v4(target[0], target[1], target[2], target[3]);
-        let mut clock = 0i64;
+        let mut next_poll = 0i64; // ARMNET: own `poll_delay` gate (was `clock += 1` per pass)
         let t0 = now_ms();
         let mut armed = false;
         while now_ms().saturating_sub(t0) < VERB_BUDGET_MS && dev.obs.mac.is_none() {
-            clock += 1;
-            iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
+            let now = now_ms();
+            if now < next_poll && !rx_ready() {
+                core::hint::spin_loop();
+                continue;
+            }
+            iface.poll(Instant::from_millis(now), &mut dev, &mut sockets);
+            POLLS.fetch_add(1, Ordering::Relaxed);
+            next_poll = now + gate_delay(&mut iface, &sockets, now);
             if !armed {
                 let sock = sockets.get_mut::<icmp::Socket>(handle);
                 if sock.can_send() {
@@ -1440,6 +1575,7 @@ pub mod net6 {
                         let caps = dev.capabilities().checksum;
                         repr.emit(&mut Icmpv4Packet::new_unchecked(buf), &caps);
                         armed = true;
+                        next_poll = 0;
                     }
                 }
             }
@@ -1555,7 +1691,7 @@ pub mod net6 {
         // The transaction id is the poll clock's low half: two lookups in one boot never collide, and
         // `parse_a` REJECTS a datagram whose id does not match, so a late reply to a previous query
         // can never be read as the answer to this one.
-        let txid = (POLL_CLOCK.load(Ordering::Relaxed) as u16) ^ 0x4e36;
+        let txid = ((now_ms() as u32).wrapping_add(DNS_SEQ.fetch_add(0x9e37, Ordering::Relaxed)) as u16) ^ 0x4e36;
         let Some(qlen) = crate::net_dns::build_query(&mut qbuf, txid, host) else {
             return DnsVerdict::BadName;
         };
@@ -1739,32 +1875,34 @@ pub mod net6 {
             }
             sock.send_slice(payload, ep).map_err(|_| ())?;
         }
-        pump(stack, SEND_PUMP);
+        drop(g);
+        kick();
+        // ARMNET: flush until the datagram left (ARP included), bounded by the wall.
+        let _ = pump_until(SEND_MS, |stack| {
+            let h = row(stack, sid, Kind::Udp)?;
+            if stack.sockets.get_mut::<udp::Socket>(h).send_queue() == 0 { Some(()) } else { None }
+        });
         Ok(payload.len())
     }
 
     /// Non-blocking receive on UDP socket `sid`: pump a bounded loop, then return the first datagram
     /// `(src_ip, src_port, len)` copied into `out`, or `None` (→ `-EAGAIN`). NEVER blocks.
     pub fn recvfrom(sid: usize, out: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
-        let mut spent = 0i64;
-        while spent < RECV_PUMP {
-            let mut g = STACK.lock();
-            let stack = g.as_mut()?;
-            let handle = row(stack, sid, Kind::Udp)?;
-            pump(stack, CHUNK);
+        // ARMNET: wall-bounded; `pump_until` releases `STACK` between polls. A vanished row ends it.
+        let got = pump_until(RECV_MS, |stack| {
+            let Some(handle) = row(stack, sid, Kind::Udp) else { return Some(None) };
             let sock = stack.sockets.get_mut::<udp::Socket>(handle);
             if sock.can_recv() {
                 if let Ok((data, meta)) = sock.recv() {
                     let n = data.len().min(out.len());
                     out[..n].copy_from_slice(&data[..n]);
                     let IpAddress::Ipv4(v4) = meta.endpoint.addr;
-                    return Some((v4.octets(), meta.endpoint.port, n));
+                    return Some(Some((v4.octets(), meta.endpoint.port, n)));
                 }
             }
-            drop(g); // release BETWEEN chunks — never spin another core for a whole pump
-            spent += CHUNK;
-        }
-        None
+            None
+        });
+        got.flatten()
     }
 
     /// The ring-3 poll model for an active open.
@@ -1801,23 +1939,20 @@ pub mod net6 {
                 }
             }
         }
-        let mut spent = 0i64;
-        while spent < CONNECT_PUMP {
-            let mut g = STACK.lock();
-            let Some(stack) = g.as_mut() else { return ConnectOutcome::Refused };
-            let Some(handle) = row(stack, sid, Kind::Tcp) else { return ConnectOutcome::Refused };
-            pump(stack, CHUNK);
+        kick();
+        // ARMNET: chase the handshake for at most CONNECT_MS of wall time, `STACK` released between polls.
+        pump_until(CONNECT_MS, |stack| {
+            let Some(handle) = row(stack, sid, Kind::Tcp) else { return Some(ConnectOutcome::Refused) };
             let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
             if sock.state() == tcp::State::Established {
-                return ConnectOutcome::Established;
+                return Some(ConnectOutcome::Established);
             }
             if !sock.is_active() {
-                return ConnectOutcome::Refused; // fell out of SYN-SENT (RST / refused)
+                return Some(ConnectOutcome::Refused); // fell out of SYN-SENT (RST / refused)
             }
-            drop(g);
-            spent += CHUNK;
-        }
-        ConnectOutcome::InProgress
+            None
+        })
+        .unwrap_or(ConnectOutcome::InProgress)
     }
 
     /// Stream-send on TCP socket `sid`. `Ok(n)` = bytes queued; `Err(true)` = would-block (tx ring
@@ -1837,50 +1972,39 @@ pub mod net6 {
                 Err(_) => return Err(false),
             }
         };
-        let mut spent = 0i64;
-        while spent < SEND_PUMP {
-            let mut g = STACK.lock();
-            let Some(stack) = g.as_mut() else { break };
-            if row(stack, sid, Kind::Tcp).is_none() {
-                break;
-            }
-            pump(stack, CHUNK);
-            drop(g);
-            spent += CHUNK;
-        }
+        kick();
+        // ARMNET: flush until the segment left the queue (or was acked), bounded by the wall.
+        let _ = pump_until(SEND_MS, |stack| {
+            let Some(h) = row(stack, sid, Kind::Tcp) else { return Some(()) };
+            if stack.sockets.get_mut::<tcp::Socket>(h).send_queue() == 0 { Some(()) } else { None }
+        });
         Ok(queued)
     }
 
     /// Non-blocking stream-recv on TCP socket `sid`.
     pub fn recv(sid: usize, out: &mut [u8]) -> RecvOutcome {
-        let mut spent = 0i64;
-        loop {
-            {
-                let mut g = STACK.lock();
-                let Some(stack) = g.as_mut() else { return RecvOutcome::Eof };
-                let Some(handle) = row(stack, sid, Kind::Tcp) else { return RecvOutcome::Eof };
-                let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
-                match sock.recv_slice(out) {
-                    Ok(0) => {
-                        if !sock.is_open() {
-                            return RecvOutcome::Eof;
-                        }
-                    }
-                    Ok(n) => return RecvOutcome::Data(n),
-                    Err(tcp::RecvError::Finished) => return RecvOutcome::Eof,
-                    Err(tcp::RecvError::InvalidState) => {
-                        if !sock.is_open() {
-                            return RecvOutcome::Eof;
-                        }
-                    }
-                }
-                if spent >= RECV_PUMP {
-                    return RecvOutcome::WouldBlock;
-                }
-                pump(stack, CHUNK);
-            }
-            spent += CHUNK;
+        if STACK.lock().is_none() {
+            return RecvOutcome::Eof;
         }
+        // ARMNET: wall-bounded (RECV_MS), `STACK` released between polls; WouldBlock at the deadline.
+        pump_until(RECV_MS, |stack| {
+            let Some(handle) = row(stack, sid, Kind::Tcp) else { return Some(RecvOutcome::Eof) };
+            let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+            match sock.recv_slice(out) {
+                Ok(0) => {
+                    if !sock.is_open() {
+                        return Some(RecvOutcome::Eof);
+                    }
+                    None
+                }
+                Ok(n) => Some(RecvOutcome::Data(n)),
+                Err(tcp::RecvError::Finished) => Some(RecvOutcome::Eof),
+                Err(tcp::RecvError::InvalidState) => {
+                    if !sock.is_open() { Some(RecvOutcome::Eof) } else { None }
+                }
+            }
+        })
+        .unwrap_or(RecvOutcome::WouldBlock)
     }
 
     // ── The QEMU `virt` fixture: the runtime proof that this surface works ────────────────────────
@@ -2106,5 +2230,74 @@ pub mod net6 {
         }
         close(sid);
         ok
+    }
+
+    // ── ARMNET (B346) M3: the census rollup and `tests netclock` ──────────────────────────────────
+
+    /// Frames the persistent stack received (counted in the `Learn` observer, every inbound frame).
+    static RX_FRAMES: AtomicU32 = AtomicU32::new(0);
+    /// The census rollup's last print (`now_ms` scale).
+    static CENSUS_LAST_MS: AtomicI64 = AtomicI64::new(0);
+    const CENSUS_EVERY_MS: i64 = 5_000;
+
+    /// `census start net6`: `:: NET6: polls= tx= rx= arp_reply= dhcp= nic= ::`, at most once per 5 s, from the
+    /// poll site (so an idle stack prints nothing — there is nothing to roll up). Cumulative counters.
+    fn census_tick(now: i64) {
+        if !crate::census::on(crate::census::NET6) {
+            return;
+        }
+        let last = CENSUS_LAST_MS.load(Ordering::Relaxed);
+        if now - last < CENSUS_EVERY_MS
+            || CENSUS_LAST_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+        {
+            return;
+        }
+        let (tx, arp, dhcp) = super::tx_emission_counts();
+        serial_println!(
+            "{} polls={} tx={} rx={} arp_reply={} dhcp={} nic={} ::",
+            P6, polls(), tx, RX_FRAMES.load(Ordering::Relaxed), arp, dhcp, nic_name()
+        );
+    }
+
+    /// `tests netclock` idle window and bounds — the x86 NETCLOCK numbers (polls <= 50/s, tx <= 5/s).
+    const NETCLOCK_WINDOW_MS: i64 = 5_000;
+    const NETCLOCK_POLLS_MAX: u64 = 50;
+    const NETCLOCK_TX_MAX: u64 = 5;
+
+    /// ARMNET M3 — `tests netclock` on aarch64: 5 s of idle on the persistent stack, driven by
+    /// [`service_poll`] the way a main loop would (the shell holds the loop while it runs), counting what
+    /// the stack does on its own. `:: NETCLOCK: polls_per_s=<n> tx_per_s=<n> nic=<name> rx_ok=<n> -> PASS|FAIL ::`.
+    /// No NIC registered / no PHY link / no stack -> `-> SKIP reason=no-nic|no-link|no-stack`.
+    pub fn netclock_selftest() {
+        let skip = match nic() {
+            None => Some("no-nic"),
+            Some(n) if !(n.link_up)() => Some("no-link"),
+            _ => None,
+        };
+        if skip.is_none() && !ensure(&mut STACK.lock()) {
+            serial_println!(":: NETCLOCK: polls_per_s=0 tx_per_s=0 nic={} rx_ok=0 -> SKIP reason=no-stack ::", nic_name());
+            return;
+        }
+        if let Some(why) = skip {
+            serial_println!(":: NETCLOCK: polls_per_s=0 tx_per_s=0 nic={} rx_ok=0 -> SKIP reason={} ::", nic_name(), why);
+            return;
+        }
+        let p0 = polls() as u64;
+        let t0 = super::tx_emission_counts().0 as u64;
+        let start = now_ms();
+        while now_ms() - start < NETCLOCK_WINDOW_MS {
+            service_poll();
+            for _ in 0..256 {
+                core::hint::spin_loop();
+            }
+        }
+        let el = (now_ms() - start).max(1) as u64;
+        let polls_ps = (polls() as u64 - p0) * 1000 / el;
+        let tx_ps = (super::tx_emission_counts().0 as u64 - t0) * 1000 / el;
+        let ok = polls_ps <= NETCLOCK_POLLS_MAX && tx_ps <= NETCLOCK_TX_MAX;
+        serial_println!(
+            ":: NETCLOCK: polls_per_s={} tx_per_s={} nic={} rx_ok={} -> {} ::",
+            polls_ps, tx_ps, nic_name(), RX_FRAMES.load(Ordering::Relaxed), if ok { "PASS" } else { "FAIL" }
+        );
     }
 }

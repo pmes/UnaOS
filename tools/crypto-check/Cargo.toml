@@ -1,0 +1,14 @@
+[package]
+name = "crypto-check"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "CRYPTOCORE (SR27): runs every crypto_core known-answer set and prints the counts."
+
+[[bin]]
+name = "crypto-check"
+path = "src/main.rs"
+
+# Zero third-party crates: the harness (kat/) is crypto_core's own, included by path.
+[dependencies]
+crypto_core = { path = "../../unaos/libs/sys/crypto_core", features = ["std"] }

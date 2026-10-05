@@ -640,112 +640,17 @@ pub fn init(gpu: &GpuInfo) {
             }
         }
 
-        // GEN7-3D rung R1 — read-only render-engine reconnaissance (UNAOS_IVB3D).
-        // Placed HERE, above `bring_up_blt_ring`, deliberately: the rung's GGTT census must
-        // see FIRMWARE's page tables, not ours. `bring_up_blt_ring` writes a GGTT PTE when
-        // it does not refuse, and a census taken after it would be reading our own footprint
-        // and calling it a finding. Read-only, and it cannot black the panel: it writes
-        // nothing. (Precisely: reads only. It does touch ONE display-block offset —
-        // PCH_PP_CONTROL, read as a control-frame witness because the PPS sits outside the
-        // GT power well — and it never writes it.)
+        // GEN7-3D — the Ivy Bridge ladder R1..R8 (UNAOS_IVB3D). GPUTESTS M1 (B334, R80): nothing runs at
+        // boot but the boot, so the rungs moved behind `tests gen7` (gen7.rs `mod ladder`). What stays HERE
+        // is the one input that cannot be read later: R1's GGTT census must see FIRMWARE's page tables,
+        // and `bring_up_blt_ring` below writes a GGTT PTE when it does not refuse. `bank` READS R1's
+        // twelve sample PTEs and the panel geometry, stores BAR0/BDF, writes nothing and prints nothing.
         //
         // The cfg is `all(target_arch = "x86_64", feature = "gen7")`, not `feature` alone:
         // that pair is what makes "gen7 emits not one byte of aarch64 code" a property of
         // the SOURCE, and it is what `arroyo`'s `arm_features` strip comment asserts.
         #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
-        super::gen7::recon(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
-
-        // GEN7-3D rung R2 — the wake (UNAOS_IVB3D). The FIRST write in the ladder: three MMIO
-        // writes to the IVB Sync-Flush workaround path (INSTPM 0x2050, RCS_WAKE 0x2700), a
-        // bounded poll of 0x22AC, then re-park INSTPM to 0x00010000 on every exit path. Placed
-        // AFTER `recon` — so the R1 GGTT census still read firmware's page tables, not a
-        // post-wake state — and BEFORE `bring_up_blt_ring`. It writes no GGTT entry, no ring
-        // register and no display register; the panel is the Kepler's, and the wake write is
-        // reversed in-rung, so R2 cannot black Peter's screen. Its proof is the same
-        // 17-register GT battery R1 read dark reading structured/varying afterward.
-        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
-        super::gen7::wake(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
-
-        // GEN7-3D rung R3 — the forcewake acquire (UNAOS_IVB3D). R2 flew on Boot D and came
-        // back `gt-still-dark`: its poll passed on iteration zero because a power-gated window
-        // reads zero and the pass condition was `== 0`, and not one of the fourteen ring
-        // registers moved. So R3 goes at the power well itself — the two forcewake
-        // request/ack pairs Intel actually published (0x0A188/0x130044 [BDW], 0x1300B0/0x1300B4
-        // [CHV]) — one candidate at a time, each request released in-rung AND the release
-        // verified against the register's entry dword, with the same 17-register battery read
-        // under each hold. Placed AFTER `wake` (which re-parks INSTPM on every exit path, so R3
-        // starts from firmware's state) and still BEFORE `bring_up_blt_ring`. It writes at most
-        // two GT power-management registers, no ring register, no GGTT entry and no display
-        // register; the panel is the Kepler's, so R3 cannot black Peter's screen. R3 returns
-        // its wake verdict as a `GtWake` so R4 branches on real evidence.
-        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
-        let gt_wake = super::gen7::forcewake(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
-
-        // GEN7-3D rung R4 — the GGTT claim (UNAOS_IVB3D). It reads R3's `GtWake` verdict and
-        // branches on TWO gates. The read-only recon (RCS ring registers + GGTT window census)
-        // runs on any reachable wake. The ONE reversible PTE round-trip (write, read back the
-        // 0->pte transition, verify no neighbour smeared, restore the whole neighbourhood to zero
-        // and re-read) is attempted ONLY on a CONFIRMED wake (`Woke`/`LiveAlready`): an ack-less
-        // `WokeNoAck` gets the recon but the write is withheld (`claim-gated-on-ack`), and a
-        // `Dark` GT gets the recon and writes nothing (`gated-on-wake`) — the outcome Boot D's
-        // `gt-still-dark` makes most likely. Placed AFTER `forcewake` and still BEFORE
-        // `bring_up_blt_ring`. On the confirmed-wake branch it touches at most three GGTT PTE
-        // slots, all in a window it first read as zero and all restored to zero, and frees its
-        // scratch page only once that reversal verifies; it writes no ring register and no
-        // display register, so R4 cannot black Peter's screen either.
-        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
-        super::gen7::claim(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
-
-        // GEN7-3D rung R5 — the first EXECUTED command (UNAOS_IVB3D). It reads R3's `GtWake`
-        // verdict and self-gates on the same `write_ok()` evidence R4's PTE round-trip uses. On a
-        // CONFIRMED wake it claims TWO GGTT slots via the R4b path (a ring page + a target page),
-        // maps a minimal RCS ring, submits one MI_STORE_DATA_IMM (IVB-V1P3 §1.2.17 p.186) that
-        // stores a sentinel to the target page's GGTT address, and proves execution by reading the
-        // sentinel back through the target page's own CPU mapping. Then it disables the ring
-        // (proven by CTL readback), restores both PTEs and their neighbours to their entry images
-        // and re-reads, and LEAKS both pages (no GGTT TLB-invalidation rung exists yet — the R4b
-        // rule). On a `Dark`/`WokeNoAck` wake it runs the read-only recon and writes nothing
-        // (`gated-on-wake` / `exec-gated-on-ack`) — the outcome Boot D's `gt-still-dark` makes most
-        // likely. Placed AFTER `claim` and still BEFORE `bring_up_blt_ring`. It writes at most two
-        // GGTT PTEs (pinned uncached-coherent encoding, clflushed) and the four RCS ring registers
-        // (drained to idle, disabled with the disable proven by readback, then restored to their
-        // captured entry images — never unmapped under a live ring), no display register, so R5
-        // cannot black Peter's screen; a GT fault parks the CS, it does not touch scanout.
-        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
-        super::gen7::execute(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
-
-        // GEN7-3D rung R6 — the wake that makes RING_CTL latch (UNAOS_IVB3D). R5 flew three boot
-        // legs and came back `enable-void`: the GGTT PTEs landed, the four RCS submission
-        // registers were programmed, RING_CTL was written 0x00000001 and read back 0x00000000.
-        // R3 releases its forcewake acquire inside its own rung, so nothing was held when R5
-        // armed the ring — which R5's own `next=` named as the suspect. R6 is that experiment:
-        // it acquires a forcewake candidate (MT 0x0A188/0x130044 [BDW-ONLY] first — the only
-        // [PINNED]-adjacent pair, and the one R3's now-retired preheld guard skipped on metal —
-        // then RENFW [CHV-ONLY], then GTFORCEAWAKE), KEEPS the hold across the ring arm, the
-        // MI_STORE_DATA_IMM submit, the drain, the disable and the register restore, and only
-        // then releases it. It stops at the first candidate whose RING_CTL enable reads back
-        // set. It also closes R5's two-page-per-run leak: a GGTT TLB-invalidation rung with its
-        // own verdict, and a reclaim gated on that verdict OR on the proof that no engine access
-        // was ever issued through either GGTT address. Placed AFTER `execute` and still BEFORE
-        // `bring_up_blt_ring`. Same write envelope as R5, not one inch wider — the Dark branch
-        // writes nothing, every write is captured/restored/re-read on every exit path, the GGTT
-        // claim only enters a proven-unowned window, and no display register is touched — so R6
-        // cannot black Peter's screen either.
-        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
-        super::gen7::rearm(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
-
-        // GEN7-3D rung R7 — the BCS blitter ring (UNAOS_IVB3D). R6 asked whether ANY ring's
-        // RING_CTL latches under a held wake and whether the RCS retires a bare store; R7 keeps
-        // that whole envelope (same R6_CANDS holds, same fw_acquire-across-the-arm, same
-        // proven-unowned GGTT window, full capture/restore/re-read) and moves it to the BCS with a
-        // real XY_SRC_COPY_BLT — a 16x16x32bpp pixel copy plus an MI_STORE_DATA_IMM sentinel, so
-        // the copy and the retirement are two independent witnesses. Placed AFTER `rearm` and
-        // still BEFORE `bring_up_blt_ring`. Same write envelope as R6 plus one GGTT slot: the Dark
-        // branch writes nothing, every write is captured/restored/re-read on every exit path, the
-        // claim only enters a proven-unowned window, the PTEs are never unmapped under a live
-        // ring, and no display register is touched — so R7 cannot black Peter's screen either.
-        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
-        super::gen7::blit(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
+        super::gen7::bank(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func);
 
         // BLT ring bring-up. SEAT FIXUP (review round 2): an ACCELERATOR must degrade, never kill
         // the boot — every refusal below breaks out of this block, the ring simply never comes up,
@@ -2789,4 +2694,10 @@ pub fn gmux_get_brightness() -> Option<u32> {
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 pub fn gmux_max_brightness() -> Option<u32> {
     gmux_index_read32(0x70).map(|v| v & 0x00FF_FFFF).filter(|&m| m != 0 && m != 0x00FF_FFFF)
+}
+
+/// GPUTESTS M1 (B334): `true` once `bring_up_blt_ring` armed this driver's own BCS ring. `tests gen7`
+/// refuses R1..R8 then: R5..R8 arm the BCS themselves and must never do it under a live ring.
+pub fn blt_ring_live() -> bool {
+    BLT_RING.lock().is_some()
 }

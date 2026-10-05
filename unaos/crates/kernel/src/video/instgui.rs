@@ -479,7 +479,7 @@ fn repaint() {
         H - 8 - 2 * theme::BEVEL,
     );
 
-    let lx = 24; if st == State::Choose && plan_view_paint(px, lx) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } // SELFINSTALL2 M3: the SSD plan view (key `i`), see the file tail
+    let lx = 24; #[cfg(feature = "ahciroot")] if install3::paint(px) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } if st == State::Choose && plan_view_paint(px, lx) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } // SELFINSTALL2 M3: the SSD plan view (key `i`), see the file tail
     match st {
         State::Choose => {
             text(px, lx, 20, b"Install UnaOS", theme::CONTENT_TEXT);
@@ -810,7 +810,7 @@ pub fn close() {
     *PENDING.lock() = None;
     // INSTALLVERB: the census dies with the dialog. It is a SNAPSHOT of one disk at one instant,
     // and a snapshot kept across a close would be the stalest possible thing to reopen onto.
-    *PARTS.lock() = alloc::vec::Vec::new();
+    *PARTS.lock() = alloc::vec::Vec::new(); #[cfg(feature = "ahciroot")] install3::leave_silent();
     WHOLE_OK.store(false, Ordering::Relaxed);
     HAS_GPT.store(false, Ordering::Relaxed);
     // The console gets the glass back and repaints everything it accumulated.
@@ -924,7 +924,7 @@ pub fn consume_key(c: u8) -> bool {
     if st == State::Closed {
         return false;
     }
-    // Halt is offered from every screen: an installer must always be leaveable.
+    #[cfg(feature = "ahciroot")] if install3::key(st, c) { return true; } // INSTALL3 (B342): the SSD screens take the keys while up (`i` on the chooser opens them); halt is offered from every screen: an installer must always be leaveable.
     if c == b'q' && st != State::Running {
         crate::census_println!("[wc-x] instgui halt requested — powering the machine off");
         close();
@@ -1220,3 +1220,12 @@ fn plan_view_paint(px: &mut [u32], lx: usize) -> bool {
     text(px, lx, H - 52 + CELL_H + 4, b"`install ssd --write` in the shell", theme::TITLE_TEXT_INACTIVE);
     true
 }
+
+// ------------------------------------------------------------------ INSTALL3 --
+//
+// rmbp-ledger B342: the SSD install's five screens (census, layout, confirm, progress, result) over
+// AHCIROOT's grant. A child module so it paints with this file's helpers into this file's surface;
+// gated as its consumers are (`ahciroot` ⇒ `ahci-write` + `unafs` + `installdemo`).
+#[cfg(feature = "ahciroot")]
+#[path = "install3.rs"]
+pub mod install3;

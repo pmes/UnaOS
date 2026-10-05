@@ -61,10 +61,6 @@ const PING_PAYLOAD: &[u8] = b"unaos-ping";
 /// ICMP socket ring capacities (packets / payload bytes). Our echoes are ~18 bytes; 512 is ample.
 const ICMP_META: usize = 8;
 const ICMP_PAYLOAD: usize = 512;
-/// Bounded poll-pump iterations per blocking op. Iteration- (not wall-clock-) bounded to stay
-/// clock-free; a reply on a local link lands in a handful of iterations, so this only caps how long
-/// an unreachable target stalls the caller. Mirrors the hand-rolled `PUMP_ITERS`.
-const PUMP_ITERS: i64 = 2_000_000;
 
 // --- the Device adapter over the e1000e rings (the shared `crate::net_phy` adapter) ---
 
@@ -87,6 +83,14 @@ impl RawNic for E1000Nic {
     }
     fn mac() -> Option<[u8; 6]> {
         e1000::hw_addr().map(|(mac, _, _)| mac)
+    }
+    /// NETCLOCK M3: the USB dongle's TX ring is bounded and drained asynchronously; full = back-pressure.
+    fn tx_ready() -> bool {
+        #[cfg(feature = "usbnet")]
+        if !e1000::nic_present() {
+            return crate::drivers::xhci::usbnet::tx_room();
+        }
+        true
     }
 }
 
@@ -188,11 +192,25 @@ fn pump(mac: [u8; 6], our_ip: [u8; 4], target: [u8; 4], count: u16, stop_on_arp:
     let mut sent = 0u16;
     let mut received = 0u16;
     let mut seq = 0u16;
-    let mut clock: i64 = 0;
+    // NETCLOCK M2: real clock, polled when this interface's `poll_delay` runs out or a frame waits; capped by the wall.
+    let deadline = now_ms() + (PING_BASE_MS + PING_PER_MS * count as i64).min(PING_MAX_MS);
+    let mut next_poll: i64 = 0;
 
-    while clock < PUMP_ITERS {
-        clock += 1;
-        iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
+    loop {
+        let now = now_ms();
+        if now >= deadline {
+            break;
+        }
+        if now < next_poll && !rx_ready(true) {
+            core::hint::spin_loop();
+            continue;
+        }
+        iface.poll(Instant::from_millis(now), &mut dev, &mut sockets);
+        crate::net_tick::note_poll();
+        next_poll = now + match iface.poll_delay(Instant::from_millis(now), &sockets) {
+            Some(d) => (d.total_millis() as i64).max(MIN_POLL_MS),
+            None => IDLE_POLL_MS,
+        };
 
         if stop_on_arp && dev.obs.snoop.is_some() {
             break;
@@ -207,6 +225,7 @@ fn pump(mac: [u8; 6], our_ip: [u8; 4], target: [u8; 4], count: u16, stop_on_arp:
                 let caps = dev.capabilities().checksum;
                 repr.emit(&mut pkt, &caps);
                 sent += 1;
+                next_poll = 0; // queued: egress on the next pass
             }
         }
         if sock.can_recv() {
@@ -360,31 +379,25 @@ const TCP_BUF: usize = 2048;
 /// Largest stream chunk a single `sys_send`/`sys_recv` moves (bounds the user copy per call —
 /// a stream is resumable, so ring 3 loops for more).
 pub const TCP_MAX_CHUNK: usize = TCP_BUF;
-/// Bounded poll-pump budgets (iteration-bounded to stay clock-free; a slirp reply lands
-/// in a handful of iterations, so these only cap how long an unreachable peer stalls the
-/// IF-masked caller — never a hang). `send` just needs to kick ARP + egress; `recv`
-/// pumps long enough to complete ARP → egress → reply capture in one call.
-const SEND_PUMP: i64 = 20_000;
-const RECV_PUMP: i64 = 400_000;
-/// SOCK-3 TCP pump budgets. A single `sys_connect` call pumps up to `CONNECT_PUMP` chasing the
-/// 3-way handshake (multi-RTT, but slirp's RTT is microseconds), returning `-EINPROGRESS` if the
-/// SYN-ACK has not landed yet so a ring-3 poll loop can re-drive it. `recv`/`send` reuse the UDP
-/// budgets' spirit. Every TCP pump releases the `STACK` lock BETWEEN chunks (see `tcp_pump_chunked`).
-const CONNECT_PUMP: i64 = 400_000;
-/// SOCK-6: bounded poll budget for one `stack_accept` call. Smaller than `CONNECT_PUMP` because accept
-/// is a POLL for an inbound handshake whose arrival time the guest does not control — a ring-3 caller (or
-/// the witness) re-drives `sys_accept` repeatedly, so each call need only be long enough to catch a
-/// handshake already in flight, not to wait out a silent peer. Kept modest so the perpetual-listen
-/// witness pumps cheaply every `service_net` pass while awaiting the injector.
-const ACCEPT_PUMP: i64 = 40_000;
-/// The chunk size a lock-released TCP pump advances before dropping + re-acquiring `STACK` — short
-/// enough that a concurrent socket syscall on another CPU never spins on `STACK.lock()` for a full pump.
-const TCP_CHUNK: i64 = 4_000;
-/// SOCK-5: bounded poll budget for the one-shot boot DHCP acquisition (iteration-bounded, clock-free
-/// like every other pump). slirp's DHCP server answers a DISCOVER in a handful of frames, so the full
-/// DISCOVER → OFFER → REQUEST → ACK exchange settles well inside this; the budget only caps how long a
-/// silent server stalls the (large-stack) builder before we fall back to the static lease.
-const DHCP_PUMP: i64 = 400_000;
+/// NETCLOCK (B335) M2: every pump is bounded by the WALL (`now_ms`), never by an iteration count — an
+/// iteration costs a controller pass on the USB dongle, so a count bounded nothing (boot 20: >=1M polls/s).
+/// `recv`/`connect` wait up to the NETHANG cap for ARP -> egress -> reply; `send` only kicks one poll (the
+/// frame leaves on the next due poll); `accept` is ONE gated poll (ring 3 and the SOCK-6 witness re-drive it).
+const RECV_MS: i64 = 2_000;
+const CONNECT_MS: i64 = 2_000;
+const ACCEPT_MS: i64 = 0;
+/// On an e1000 the hand-rolled stack's `nic.poll()` drains the SAME RX ring at the top of every
+/// `service_net` pass (the module header's two-drains race), so a zero-length accept would almost never see
+/// the injector's SYN; the e1000 listener keeps a short window. Polls inside it are still gated.
+const ACCEPT_E1000_MS: i64 = 20;
+const SEND_MS: i64 = 0;
+/// SOCK-5 / NETCLOCK: one DHCP try waits this long for a lease on the main loop; a lease that lands later
+/// (smoltcp retransmits DISCOVER on its own 10 s timer) is applied by `service_poll`.
+const DHCP_WAIT_MS: i64 = 2_000;
+/// NETCLOCK: the throwaway ICMP pump's cap (`ping`/`arp`/SOCK-1): base + per echo, at most 5 s.
+const PING_BASE_MS: i64 = 1_000;
+const PING_PER_MS: i64 = 500;
+const PING_MAX_MS: i64 = 5_000;
 
 /// SOCK-5: one-shot latch — the DHCP acquisition (and its witness line) runs exactly once, from the
 /// first `init()` call (review fix: never from a lazy `ensure_stack` first-touch).
@@ -414,9 +427,22 @@ static mut TCP_TX_DATA: [[u8; TCP_BUF]; NSOCK] = [[0u8; TCP_BUF]; NSOCK];
 /// arc) safe by construction, and closes the UAF the moment a socket outlives its registry slot.
 static SOCK_GEN: [AtomicU32; NSOCK] = [const { AtomicU32::new(0) }; NSOCK];
 
-/// Monotonic millisecond clock fed to `iface.poll` — bumped per poll across ALL callers
-/// so smoltcp's neighbor/ARP timers advance consistently. Iteration-driven, clock-free.
-static POLL_CLOCK: AtomicI64 = AtomicI64::new(1);
+/// NETCLOCK (B335) M2: the stack's clock — REAL milliseconds. It was a counter bumped once per poll
+/// ("iteration-driven, clock-free"), so at ~1M polls/s on the USB dongle smoltcp's ARP and DHCP timers ran
+/// ~1000x the wall and the link carried a DISCOVER/ARP storm (boot 20: tx=58380, 269/s, nothing received).
+/// `clock::uptime_ms` is the TSC-backed monotonic (it advances with IF clear, unlike the APIC tick); the
+/// raw TSC over the `hw_wait_budget` rate stands in before calibration. Clamped never to step back.
+/// ARMNET (B346): the body moved to `clock::stack_ms`, the one stack clock both arches share.
+fn now_ms() -> i64 {
+    crate::clock::stack_ms()
+}
+/// NETCLOCK M2: when smoltcp next asked to be polled (`now_ms` scale; 0 = now). Written by `poll_now`
+/// from `Interface::poll_delay`; `kick` brings it forward after a socket enqueue.
+static NEXT_POLL_MS: AtomicI64 = AtomicI64::new(0);
+/// Nothing scheduled (`poll_delay` = None): look again once a second. Never closer than 1 ms (a TX ring
+/// in back-pressure keeps `poll_delay` at 0 until the controller drains it).
+const IDLE_POLL_MS: i64 = 1_000;
+const MIN_POLL_MS: i64 = 1;
 
 /// Which transport a registry slot backs. A UDP handle handed to a stream syscall (or vice versa)
 /// is rejected on this tag BEFORE any `get_mut::<T>` (smoltcp's typed accessor PANICS on a mismatch).
@@ -563,67 +589,17 @@ fn dhcp_acquire() {
     if DHCP_ATTEMPTED.swap(true, Ordering::AcqRel) {
         return;
     }
-    let mut leased: Option<Ipv4Cidr> = None;
-    let mut router: Option<Ipv4Address> = None;
-    // SOCK-8: the first DHCP-provided DNS server, captured alongside the address/router so the resolver can
-    // query the real nameserver instead of falling back to the gateway.
-    let mut dns_srv: Option<Ipv4Address> = None;
-    let mut spent = 0i64;
-    'acquire: while spent < DHCP_PUMP {
-        let mut g = STACK.lock();
-        let Some(stack) = g.as_mut() else { return };
-        let Some(dhcp_handle) = stack.dhcp else { return };
-        for _ in 0..TCP_CHUNK {
-            {
-                // Split-borrow so `iface.poll` gets `&mut dev` + `&mut sockets` disjointly (the DHCP
-                // socket egresses/ingresses through the ordinary interface poll, like any socket).
-                let SmolStack { iface, sockets, dev, .. } = stack;
-                let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
-                iface.poll(Instant::from_millis(now), dev, sockets);
-            }
-            spent += 1;
-            // The lease is delivered as a DHCP socket event; `address`/`router` are Copy, so extract
-            // them and leave the apply to the post-loop section (one config point, fresh lock).
-            match stack.sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
-                Some(dhcpv4::Event::Configured(cfg)) => {
-                    leased = Some(cfg.address);
-                    router = cfg.router;
-                    dns_srv = cfg.dns_servers.first().copied();
-                    break 'acquire;
-                }
-                Some(dhcpv4::Event::Deconfigured) | None => {}
-            }
-            if spent >= DHCP_PUMP {
-                break;
-            }
-        }
-        // Release BETWEEN chunks (the TCP_CHUNK discipline) — the guard drops here, letting a
-        // concurrent socket syscall acquire `STACK` before the next chunk.
-        drop(g);
-    }
+    // NETCLOCK: a wall-bounded wait (STACK released between polls); the DISCOVER goes out on the first due
+    // poll and is retransmitted on smoltcp's own timer in REAL seconds, not once per 10k loop iterations.
+    DHCP_RUNNING.store(true, Ordering::Release);
+    kick();
+    let got = pump_until(DHCP_WAIT_MS, dhcp_event);
+    DHCP_RUNNING.store(false, Ordering::Release);
 
     let mut g = STACK.lock();
     let Some(stack) = g.as_mut() else { return };
-    if let Some(cidr) = leased {
-        let gw = router.unwrap_or(Ipv4Address::new(
-            GATEWAY_IP[0],
-            GATEWAY_IP[1],
-            GATEWAY_IP[2],
-            GATEWAY_IP[3],
-        ));
-        apply_ipv4_config(stack, cidr, gw);
-        LEASED.store(true, Ordering::Relaxed);
-        // SOCK-8: record the leased DNS server (if any) so the resolver targets the real nameserver.
-        if let Some(d) = dns_srv {
-            let o = d.octets();
-            CURRENT_DNS.store(u32::from_be_bytes([o[0], o[1], o[2], o[3]]), Ordering::Relaxed);
-        }
-        let addr = cidr.address().octets();
-        serial_println!(
-            ":: SOCK-5: smoltcp dhcpv4 lease {}.{}.{}.{}/{} gw {} — witness OK ::",
-            addr[0], addr[1], addr[2], addr[3], cidr.prefix_len(),
-            e1000::fmt_ip(&gw.octets())
-        );
+    if let Some((cidr, router, dns_srv)) = got {
+        dhcp_apply(stack, cidr, router, dns_srv);
     } else {
         // The build-time static config stands untouched; report it honestly.
         let (addr, plen) = match stack.iface.ip_addrs().first() {
@@ -638,25 +614,129 @@ fn dhcp_acquire() {
     }
 }
 
-/// Drive `iters` poll iterations against the persistent interface (bounded, clock-free).
-/// Split-borrows the `SmolStack` fields so `iface.poll` gets `&mut dev` + `&mut sockets`
-/// disjointly. Reads the RX ring directly (`raw_rx` in the Device), so it drives ARP,
-/// egress of queued datagrams, and inbound delivery — no interrupts required.
-fn stack_pump(stack: &mut SmolStack, iters: i64) {
+/// SOCK-5: apply a lease (address + router replace the static config; the DNS server is recorded) and
+/// print the lease witness. From `dhcp_acquire`, or from `service_poll` when the lease lands later.
+fn dhcp_apply(stack: &mut SmolStack, cidr: Ipv4Cidr, router: Option<Ipv4Address>, dns_srv: Option<Ipv4Address>) {
+    let gw = router.unwrap_or(Ipv4Address::new(
+        GATEWAY_IP[0],
+        GATEWAY_IP[1],
+        GATEWAY_IP[2],
+        GATEWAY_IP[3],
+    ));
+    apply_ipv4_config(stack, cidr, gw);
+    LEASED.store(true, Ordering::Relaxed);
+    // SOCK-8: record the leased DNS server (if any) so the resolver targets the real nameserver.
+    if let Some(d) = dns_srv {
+        let o = d.octets();
+        CURRENT_DNS.store(u32::from_be_bytes([o[0], o[1], o[2], o[3]]), Ordering::Relaxed);
+    }
+    let addr = cidr.address().octets();
+    serial_println!(
+        ":: SOCK-5: smoltcp dhcpv4 lease {}.{}.{}.{}/{} gw {} — witness OK ::",
+        addr[0], addr[1], addr[2], addr[3], cidr.prefix_len(),
+        e1000::fmt_ip(&gw.octets())
+    );
+}
+
+/// NETCLOCK M2: a socket just queued data or opened a connection — the next gated poll is due now.
+fn kick() {
+    NEXT_POLL_MS.store(0, Ordering::Relaxed);
+}
+
+/// NETCLOCK M2: is a received frame waiting? e1000: the next RX descriptor's DD bit. USB: the RX ring, and
+/// with `drive` (a pump, where the main loop's controller pass is not running) one paced controller pass first.
+fn rx_ready(drive: bool) -> bool {
+    if e1000::rx_ready() {
+        return true;
+    }
+    #[cfg(feature = "usbnet")]
+    if crate::drivers::xhci::usbnet::rx_ready(drive) {
+        return true;
+    }
+    let _ = drive;
+    false
+}
+
+/// NETCLOCK M2: the poll gate — smoltcp's own `poll_delay` has run out, or a frame arrived.
+fn poll_due(drive: bool) -> bool {
+    now_ms() >= NEXT_POLL_MS.load(Ordering::Relaxed) || rx_ready(drive)
+}
+
+/// NETCLOCK M2: THE poll of the persistent interface: at the real clock, counted, and the next one
+/// scheduled from smoltcp's `poll_delay`. Split-borrows the `SmolStack` fields so `iface.poll` gets
+/// `&mut dev` + `&mut sockets` disjointly. Callers hold `STACK` and decided the poll is due (or kicked).
+fn poll_now(stack: &mut SmolStack) {
     let SmolStack { iface, sockets, dev, .. } = stack;
-    // NETHANG: a wall-clock cap beside the iteration count. On the USB dongle every poll can drive a
-    // controller pass (`usbnet::raw_rx`/`raw_tx` -> `drive()`), so the cost of an iteration is no
-    // longer a ring read. The cap keeps one call's hold of `STACK` (and of the xHCI loan, per pass)
-    // bounded whatever the link does. Checked every 256 iterations; the TSC advances with IF clear.
-    let t0 = crate::arch::now_cycles();
-    let cap = crate::arch::hw_wait_budget();
-    for i in 0..iters {
-        let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
-        iface.poll(Instant::from_millis(now), dev, sockets);
-        if i & 0xFF == 0xFF && crate::arch::now_cycles().wrapping_sub(t0) >= cap {
-            PUMP_CAPPED.fetch_add(1, Ordering::Relaxed);
-            break;
+    let now = now_ms();
+    iface.poll(Instant::from_millis(now), dev, sockets);
+    crate::net_tick::note_poll();
+    let after = now_ms();
+    let delay = match iface.poll_delay(Instant::from_millis(after), sockets) {
+        Some(d) => (d.total_millis() as i64).max(MIN_POLL_MS),
+        None => IDLE_POLL_MS,
+    };
+    NEXT_POLL_MS.store(after + delay, Ordering::Relaxed);
+}
+
+/// NETCLOCK M2/M4: drive the persistent stack until `check` answers or `budget_ms` of wall time passes.
+/// `STACK` is held for ONE gated poll plus the check and RELEASED between iterations (M4: every TCP and UDP
+/// pump, not only `stack_recvfrom`), so the main loop's `net_tick` and another core's socket syscall get it
+/// between any two polls. `check` runs on the first pass even when no poll is due (a reply may already be
+/// buffered) and after every poll. Between polls the caller spins (`spin_loop`) — the TSC clock advances
+/// with IF clear, so the deadline holds in a masked syscall. `None` = budget spent (or no stack).
+fn pump_until<T>(budget_ms: i64, mut check: impl FnMut(&mut SmolStack) -> Option<T>) -> Option<T> {
+    let deadline = now_ms() + budget_ms;
+    let mut first = true;
+    loop {
+        let due = poll_due(true);
+        if first || due {
+            let mut g = STACK.lock();
+            let stack = g.as_mut()?;
+            if due {
+                poll_now(stack);
+            }
+            if let Some(v) = check(stack) {
+                return Some(v);
+            }
         }
+        first = false;
+        if now_ms() >= deadline {
+            if budget_ms > ACCEPT_E1000_MS {
+                PUMP_CAPPED.fetch_add(1, Ordering::Relaxed); // a real wait ran out (not the per-pass accept window)
+            }
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// NETCLOCK M2: the idle service, once per main-loop pass (`e1000::service_net`). One poll when smoltcp
+/// asked for one or a frame is waiting — never per pass — and a DHCP lease that lands after `dhcp_acquire`
+/// gave up is applied here. Never spins on `STACK` (another core's syscall may hold it: next pass).
+pub fn service_poll() {
+    if !poll_due(false) {
+        return;
+    }
+    let Some(mut g) = STACK.try_lock() else { return };
+    let Some(stack) = g.as_mut() else { return };
+    poll_now(stack);
+    if LEASED.load(Ordering::Relaxed) || DHCP_RUNNING.load(Ordering::Relaxed) || !DHCP_ATTEMPTED.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some((cidr, router, dns)) = dhcp_event(stack) {
+        dhcp_apply(stack, cidr, router, dns);
+    }
+}
+
+/// NETCLOCK: a `dhcp_acquire` is pumping (it owns the DHCP socket's events until it returns).
+static DHCP_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// The DHCP socket's lease event, if one is pending: (address, router, first DNS server).
+fn dhcp_event(stack: &mut SmolStack) -> Option<(Ipv4Cidr, Option<Ipv4Address>, Option<Ipv4Address>)> {
+    let h = stack.dhcp?;
+    match stack.sockets.get_mut::<dhcpv4::Socket>(h).poll() {
+        Some(dhcpv4::Event::Configured(cfg)) => Some((cfg.address, cfg.router, cfg.dns_servers.first().copied())),
+        Some(dhcpv4::Event::Deconfigured) | None => None,
     }
 }
 
@@ -763,7 +843,11 @@ fn stack_sendto_inner(sid: usize, ip: [u8; 4], port: u16, payload: &[u8]) -> Res
         }
         sock.send_slice(payload, ep).map_err(|_| ())?;
     }
-    stack_pump(stack, SEND_PUMP);
+    // NETCLOCK: the datagram is queued; one poll now egresses it (or starts ARP). The rest rides the
+    // gated polls of `stack_recvfrom` / `service_poll` — no 20k-iteration send pump.
+    kick();
+    poll_now(stack);
+    let _ = SEND_MS;
     Ok(payload.len())
 }
 
@@ -786,37 +870,25 @@ pub fn stack_recvfrom(sid: usize, out: &mut [u8]) -> Option<([u8; 4], u16, usize
 /// The BSP main loop's `net_tick` can take `STACK` between two chunks. Before, one IF-masked syscall
 /// held it for all `RECV_PUMP` polls.
 fn stack_recvfrom_bounded(sid: usize, out: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
-    let t0 = crate::arch::now_cycles();
-    let cap = crate::arch::hw_wait_budget();
-    let mut spent = 0i64;
-    while spent < RECV_PUMP {
-        {
-            let mut g = STACK.lock();
-            let stack = g.as_mut()?;
-            // Re-validated every chunk: the lock was released, so the slot may have been closed.
-            let (handle, _, kind) = *stack.reg.get(sid).and_then(|s| s.as_ref())?;
-            if kind != SockKind::Udp {
-                return None; // a TCP handle routed to sys_recvfrom — reject before the typed accessor panics
-            }
-            stack_pump(stack, TCP_CHUNK);
-            let sock = stack.sockets.get_mut::<udp::Socket>(handle);
-            if sock.can_recv() {
-                if let Ok((data, meta)) = sock.recv() {
-                    let n = data.len().min(out.len());
-                    out[..n].copy_from_slice(&data[..n]);
-                    let IpAddress::Ipv4(v4) = meta.endpoint.addr;
-                    return Some((v4.octets(), meta.endpoint.port, n));
-                }
+    // NETCLOCK M2/M4: `pump_until` — gated polls, `STACK` released between every two, the wall the bound.
+    pump_until(RECV_MS, |stack| {
+        // Re-validated every pass: the lock was released, so the slot may have been closed.
+        let Some(&Some((handle, _, kind))) = stack.reg.get(sid) else { return Some(None) };
+        if kind != SockKind::Udp {
+            return Some(None); // a TCP handle routed to sys_recvfrom — reject before the typed accessor panics
+        }
+        let sock = stack.sockets.get_mut::<udp::Socket>(handle);
+        if sock.can_recv() {
+            if let Ok((data, meta)) = sock.recv() {
+                let n = data.len().min(out.len());
+                out[..n].copy_from_slice(&data[..n]);
+                let IpAddress::Ipv4(v4) = meta.endpoint.addr;
+                return Some(Some((v4.octets(), meta.endpoint.port, n)));
             }
         }
-        spent += TCP_CHUNK;
-        if crate::arch::now_cycles().wrapping_sub(t0) >= cap {
-            PUMP_CAPPED.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        core::hint::spin_loop();
-    }
-    None
+        None
+    })
+    .flatten()
 }
 
 /// NETHANG: how many pumps hit the wall-clock cap rather than their iteration budget.
@@ -1076,29 +1148,16 @@ fn tcp_handle(stack: &SmolStack, sid: usize) -> Option<SocketHandle> {
 /// (concurrent teardown), returns `on_gone`.
 fn tcp_pump_chunked<T>(
     sid: usize,
-    budget: i64,
+    budget_ms: i64,
     on_gone: T,
     mut check: impl FnMut(&mut tcp::Socket) -> Option<T>,
 ) -> Option<T> {
-    let mut spent = 0i64;
-    while spent < budget {
-        let mut g = STACK.lock();
-        let Some(stack) = g.as_mut() else { return Some(on_gone) };
-        let Some(handle) = tcp_handle(stack, sid) else { return Some(on_gone) };
-        {
-            let SmolStack { iface, sockets, dev, .. } = stack;
-            for _ in 0..TCP_CHUNK {
-                let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
-                iface.poll(Instant::from_millis(now), dev, sockets);
-            }
-            if let Some(out) = check(sockets.get_mut::<tcp::Socket>(handle)) {
-                return Some(out);
-            }
-        }
-        drop(g); // release BETWEEN chunks so another CPU's socket syscall can make progress
-        spent += TCP_CHUNK;
-    }
-    None
+    // NETCLOCK M4: one gated poll per `STACK` hold (was a 4000-poll chunk), the wall the bound.
+    let mut gone = Some(on_gone);
+    pump_until(budget_ms, |stack| {
+        let Some(handle) = tcp_handle(stack, sid) else { return gone.take() };
+        check(stack.sockets.get_mut::<tcp::Socket>(handle))
+    })
 }
 
 /// Active-open TCP socket `sid` to `ip:port`. NON-BLOCKING (ring-3 poll model): issues the SYN if the
@@ -1120,10 +1179,11 @@ pub fn stack_connect(sid: usize, ip: [u8; 4], port: u16) -> ConnectOutcome {
             if sock.connect(iface.context(), remote, le).is_err() {
                 return ConnectOutcome::Refused;
             }
+            kick(); // NETCLOCK: the SYN is queued — poll now
         }
     }
     // (2) Pump chunked (lock released between chunks) chasing ESTABLISHED.
-    let out = tcp_pump_chunked(sid, CONNECT_PUMP, ConnectOutcome::Refused, |sock| {
+    let out = tcp_pump_chunked(sid, CONNECT_MS, ConnectOutcome::Refused, |sock| {
         if sock.state() == tcp::State::Established {
             Some(ConnectOutcome::Established)
         } else if !sock.is_active() {
@@ -1156,7 +1216,8 @@ pub fn stack_send(sid: usize, data: &[u8]) -> Result<usize, bool> {
         }
     };
     // Kick egress (lock released between chunks); the socket vanishing mid-pump is harmless here.
-    let _ = tcp_pump_chunked(sid, SEND_PUMP, (), |_sock| None);
+    kick(); // NETCLOCK: data queued — one poll egresses it
+    let _ = tcp_pump_chunked(sid, SEND_MS, (), |_sock| None);
     Ok(queued)
 }
 
@@ -1194,7 +1255,7 @@ pub fn stack_recv(sid: usize, out: &mut [u8]) -> RecvOutcome {
         }
     }
     // Then pump chunked (lock released between chunks) until data / EOF / budget.
-    tcp_pump_chunked(sid, RECV_PUMP, RecvOutcome::Eof, |sock| try_recv(sock, out))
+    tcp_pump_chunked(sid, RECV_MS, RecvOutcome::Eof, |sock| try_recv(sock, out))
         .unwrap_or(RecvOutcome::WouldBlock)
 }
 
@@ -1254,31 +1315,21 @@ pub fn stack_listen(sid: usize, port: u16) -> Result<(), ()> {
 /// wrong-kind. NEVER blocks. The listener socket-id + generation are unchanged, so the caller's listener
 /// handle survives across unbounded accepts.
 pub fn stack_accept(sid: usize) -> AcceptOutcome {
-    let mut spent = 0i64;
-    while spent < ACCEPT_PUMP {
-        let mut g = STACK.lock();
-        let Some(stack) = g.as_mut() else { return AcceptOutcome::NotListening };
-        let Some(handle) = tcp_handle(stack, sid) else { return AcceptOutcome::NotListening };
-        // Pump one chunk against the whole interface (drives ARP + this listener's handshake).
-        {
-            let SmolStack { iface, sockets, dev, .. } = stack;
-            for _ in 0..TCP_CHUNK {
-                let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
-                iface.poll(Instant::from_millis(now), dev, sockets);
-            }
-        }
+    // NETCLOCK M2: ONE gated poll (the SOCK-6 witness calls this every `service_net` pass and ring 3
+    // re-drives `sys_accept`; it was 40,000 polls = 40 smoltcp-seconds per pass, the boot-20 DISCOVER storm).
+    let budget = if e1000::nic_present() { ACCEPT_E1000_MS } else { ACCEPT_MS };
+    pump_until(budget, |stack| {
+        let Some(handle) = tcp_handle(stack, sid) else { return Some(AcceptOutcome::NotListening) };
         match stack.sockets.get_mut::<tcp::Socket>(handle).state() {
             // Still waiting for a SYN, or mid-handshake (SYN received, ACK pending) — keep pumping.
-            tcp::State::Listen | tcp::State::SynReceived => {}
+            tcp::State::Listen | tcp::State::SynReceived => None,
             // Never armed / listener closed without connecting — not an accept-able socket.
-            tcp::State::Closed => return AcceptOutcome::NotListening,
+            tcp::State::Closed => Some(AcceptOutcome::NotListening),
             // ESTABLISHED (or past it) — a peer connected; peel the connection + re-arm the listener.
-            _ => return peel_and_rearm(stack, sid),
+            _ => Some(peel_and_rearm(stack, sid)),
         }
-        drop(g); // release BETWEEN chunks so another CPU's socket syscall can make progress
-        spent += TCP_CHUNK;
-    }
-    AcceptOutcome::Pending // budget exhausted still LISTENING -> caller re-drives
+    })
+    .unwrap_or(AcceptOutcome::Pending) // budget spent still LISTENING -> caller re-drives
 }
 
 /// SOCK-7: the listener socket at reg slot `lsid` has reached ESTABLISHED — a peer connected. PEEL the
@@ -2084,4 +2135,70 @@ pub fn dhcp_link_tick() {
     }
     DHCP_ATTEMPTED.store(false, Ordering::Release);
     dhcp_acquire();
+}
+
+// =============================================================================
+// NETCLOCK (B335) M5: `tests netclock` — the idle clock on a live USB link, measured.
+// =============================================================================
+
+/// Idle bounds (per second, over the 5 s window) and the stack-side loan hold bound.
+#[cfg(feature = "usbnet")]
+const NETCLOCK_POLLS_MAX: u64 = 50;
+#[cfg(feature = "usbnet")]
+const NETCLOCK_TX_MAX: u64 = 5;
+#[cfg(feature = "usbnet")]
+const NETCLOCK_LOAN_MAX_US: u64 = 500;
+#[cfg(feature = "usbnet")]
+const NETCLOCK_WINDOW_MS: i64 = 5_000;
+
+/// `tests netclock`: 5 s of idle on a live USB link. The shell holds the main loop while a fixture runs, so
+/// the fixture runs the main loop's two net calls itself — the xHCI pass (`usbnet::main_pass`: event drain,
+/// FTDI drain, the full `service_usbnet`) and `service_poll` — and counts what the stack does on its own:
+/// `polls_per_s` (every `iface.poll`), `tx_per_s` (bulk-OUT completions), `loan_held_max_us` (the longest
+/// stack-side controller hold, `usbnet::drive`), `rx_ok` (frames received this boot).
+/// `:: NETCLOCK: polls_per_s=<n> tx_per_s=<n> loan_held_max_us=<n> rx_ok=<n> -> PASS|FAIL ::`, PASS at
+/// polls <= 50/s, tx <= 5/s, loan <= 500 us. No dongle / no PHY link / an e1000 link -> SKIP with the reason.
+#[cfg(feature = "usbnet")]
+pub fn netclock_selftest() {
+    use crate::drivers::xhci::usbnet;
+    let skip = if e1000::nic_present() {
+        Some("e1000-link")
+    } else if !usbnet::is_up() {
+        Some("no-dongle")
+    } else if usbnet::kind() == usbnet::KIND_AX88179 && !usbnet::link_up() {
+        Some("no-link")
+    } else {
+        None
+    };
+    if let Some(why) = skip {
+        serial_println!(":: NETCLOCK: polls_per_s=0 tx_per_s=0 loan_held_max_us=0 rx_ok={} -> SKIP reason={} ::", usbnet::rx_ok(), why);
+        return;
+    }
+    {
+        let mut g = STACK.lock();
+        if !ensure_stack(&mut g) {
+            serial_println!(":: NETCLOCK: polls_per_s=0 tx_per_s=0 loan_held_max_us=0 rx_ok=0 -> SKIP reason=no-stack ::");
+            return;
+        }
+    }
+    let p0 = crate::net_tick::polls();
+    let t0 = usbnet::tx_frames();
+    usbnet::loan_reset();
+    let start = now_ms();
+    while now_ms() - start < NETCLOCK_WINDOW_MS {
+        usbnet::main_pass();
+        service_poll();
+        for _ in 0..256 {
+            core::hint::spin_loop();
+        }
+    }
+    let el = (now_ms() - start).max(1) as u64;
+    let polls_ps = (crate::net_tick::polls() - p0) * 1000 / el;
+    let tx_ps = (usbnet::tx_frames() - t0) * 1000 / el;
+    let loan = usbnet::loan_held_max_us();
+    let ok = polls_ps <= NETCLOCK_POLLS_MAX && tx_ps <= NETCLOCK_TX_MAX && loan <= NETCLOCK_LOAN_MAX_US;
+    serial_println!(
+        ":: NETCLOCK: polls_per_s={} tx_per_s={} loan_held_max_us={} rx_ok={} -> {} ::",
+        polls_ps, tx_ps, loan, usbnet::rx_ok(), if ok { "PASS" } else { "FAIL" }
+    );
 }

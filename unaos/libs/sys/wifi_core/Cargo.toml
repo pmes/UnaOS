@@ -1,0 +1,13 @@
+[package]
+name = "wifi_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "WiFi core: the firmware container codec and the IEEE 802.11 management/data frame codec — shared by Ring 0 and the host tests."
+
+# WIFI1 (rmbp-ledger B338, R79): the shared core of the BCM4331 driver — the midden_core shape:
+# `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies, a member of the ROOT host
+# workspace (so `cargo test -p wifi_core` runs) and a path dep of the kernel under `wifi`.
+# Sources: IEEE 802.11 frame formats ([PUBLIC]) and the tree's own metal pins for the container
+# (bcm4331.md §S4, W3 ANSWERED on metal). NO Linux driver source was read for this crate.
+[dependencies]

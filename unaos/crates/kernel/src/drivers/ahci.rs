@@ -527,7 +527,7 @@ fn issue(p: &AhciPort, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool)
         // DW0: CFL in DWORDs (bits 4:0) — a Register H2D FIS is 20 bytes = 5 DWORDs; W (bit 6) is
         // the direction, 0 for a device-to-host transfer; PRDTL in bits 31:16.
         let hdr = p.clb as *mut u32;
-        let dw0: u32 = 5 | (if write { 1 << 6 } else { 0 }) | (1u32 << 16);
+        let dw0: u32 = 5 | (if write { 1 << 6 } else { 0 }) | (((bytes != 0) as u32) << 16); // AHCIROOT (B332): PRDTL 0 for a non-data command (FLUSH CACHE EXT)
         hdr.add(0).write_volatile(dw0);
         hdr.add(1).write_volatile(0); // PRDBC — the controller writes the byte count back here
         let ctba = bus_addr(p.ctba);
@@ -545,7 +545,7 @@ fn issue(p: &AhciPort, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool)
 
     pw32(abar, port, P_CI, 1);
 
-    let done = wait_ms(T_CMD_MS, || {
+    let done = wait_ms(if cmd == ATA_FLUSH_CACHE_EXT { T_FLUSH_MS } else { T_CMD_MS }, || { // AHCIROOT (B332): a flush drains the cache, so it gets its own bound
         pr32(abar, port, P_CI) & 1 == 0 || pr32(abar, port, P_IS) & PIS_TFES != 0
     });
 
@@ -563,8 +563,8 @@ fn issue(p: &AhciPort, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool)
     }
     if is & PIS_TFES != 0 || tfd & TFD_ERR != 0 {
         serial_println!(
-            "[ahci] port {} command {:#04x} task-file error (PxIS={:#010x} PxTFD={:#010x} err={:#04x} PxSERR={:#010x})",
-            port, cmd, is, tfd, (tfd >> 8) & 0xFF, pr32(abar, port, P_SERR)
+            "[ahci] port {} command {:#04x} task-file error (PxIS={:#010x} PxTFD={:#010x} err={:#04x} [{}] PxSERR={:#010x})",
+            port, cmd, is, tfd, (tfd >> 8) & 0xFF, ata_error_names(((tfd >> 8) & 0xFF) as u8), pr32(abar, port, P_SERR)
         );
         return Err(());
     }
@@ -652,32 +652,15 @@ fn decode_identity(buf: &[u8; SECTOR_BYTES]) -> Identity {
 /// really lives at LBA 1. This function only ever sees LBA 0, so it decides GPT from the protective
 /// MBR's type byte, which is what a GPT disk is required to carry.
 fn sector0_kind(buf: &[u8; SECTOR_BYTES]) -> &'static str {
-    if buf[510] != 0x55 || buf[511] != 0xAA {
-        return "none";
+    // AHCIROOT (rmbp-ledger B332): the rule below is amber_core's `classify_sector0` now — the ONE copy.
+    // BOTH fields of an entry are read (type AND size), which is what stops a FAT SUPERFLOPPY — a BPB
+    // with 0x55AA at offset 510 and boot code where a table would be — from being called an MBR; a
+    // superfloppy reads `none`: "LBA 0 carries a boot signature and no partition table".
+    match amber_core::gpt::classify_sector0(buf) {
+        amber_core::gpt::Sector0::Protective => "GPT",
+        amber_core::gpt::Sector0::Mbr => "MBR",
+        amber_core::gpt::Sector0::None => "none",
     }
-    // MBR partition table: four 16-byte entries at 0x1BE; the type byte is at entry offset 4 and the
-    // sector count is the little-endian u32 at entry offset 12.
-    //
-    // BOTH fields are read, and that is not belt-and-braces — it is what stops a FAT SUPERFLOPPY
-    // from being called an MBR. A superfloppy's LBA 0 is a BPB, which carries the same 0x55AA at
-    // offset 510 and has ordinary boot code or padding where the partition table would be, so a
-    // signature-only test reports `MBR` on a disk that has no partition table at all. Requiring one
-    // entry with a non-zero TYPE and a non-zero SIZE makes the verdict a statement about a table
-    // that exists. A superfloppy then reads `none`, which is the honest answer this arc can give:
-    // "LBA 0 carries a boot signature and no partition table".
-    let mut real_entry = false;
-    for e in 0..4 {
-        let base = 0x1BE + e * 16;
-        let ptype = buf[base + 4];
-        let psize = u32::from_le_bytes([buf[base + 12], buf[base + 13], buf[base + 14], buf[base + 15]]);
-        if ptype == 0xEE && psize != 0 {
-            return "GPT";
-        }
-        if ptype != 0 && psize != 0 {
-            real_entry = true;
-        }
-    }
-    if real_entry { "MBR" } else { "none" }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1007,4 +990,49 @@ pub(crate) fn write_block_at(port_ix: usize, lba: u64, buf: &[u8]) -> Result<(),
         core::ptr::copy_nonoverlapping(buf.as_ptr(), p.dma as *mut u8, SECTOR_BYTES);
     }
     issue(&p, ATA_WRITE_DMA_EXT, lba, 1, SECTOR_BYTES, true)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// AHCIROOT (rmbp-ledger B332) — FLUSH CACHE EXT and the error-register decode.
+//
+// ATA8-ACS `FLUSH CACHE EXT` (0xEA) is a NON-DATA command: no PRDT entry (PRDTL 0, set in [`issue`]
+// from `bytes == 0`), no LBA, completion when the device has written its volatile cache to the
+// medium. It is the barrier UnaFS's commit needs before its root flip (`fs::unafs::SdSectorDevice::
+// flush`) and what a dropped grant issues. It writes no user data, so it is compiled ungated in the
+// opcode set the `issue` timeout names; it is only ISSUED under `ahciroot`.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ATA8-ACS `FLUSH CACHE EXT`.
+const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
+
+/// A flush may legitimately take as long as the drive needs to drain its cache; a spinning disk with
+/// a full cache needs seconds. Ten seconds is a deadline, not an expectation.
+const T_FLUSH_MS: u64 = 10_000;
+
+/// ATA8-ACS §6.2 error register bits, named — so a failed write says WHY rather than a hex byte.
+fn ata_error_names(err: u8) -> &'static str {
+    match err {
+        0 => "none",
+        e if e & 0x80 != 0 => "ICRC interface-CRC",
+        e if e & 0x40 != 0 => "UNC uncorrectable-data",
+        e if e & 0x10 != 0 => "IDNF id-not-found (LBA out of range)",
+        e if e & 0x04 != 0 => "ABRT command-aborted",
+        e if e & 0x02 != 0 => "EOM/NM",
+        _ => "other",
+    }
+}
+
+/// AHCIROOT: `FLUSH CACHE EXT` on the disk at registry index `port_ix`. Bounded by [`T_FLUSH_MS`];
+/// a failure is printed by [`issue`] with the error register decoded.
+#[cfg(feature = "ahciroot")]
+pub(crate) fn flush_at(port_ix: usize) -> Result<(), ()> {
+    if port_ix >= MAX_AHCI_DISKS {
+        return Err(());
+    }
+    let guard = PORTS.lock();
+    let p = match guard[port_ix] {
+        Some(p) => p,
+        None => return Err(()),
+    };
+    issue(&p, ATA_FLUSH_CACHE_EXT, 0, 0, 0, false)
 }
