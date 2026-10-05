@@ -45,6 +45,8 @@ pub struct PropMap {
     entries: Vec<Option<(PropertyKey, Prop)>>,
     table: Vec<u32>,
     live: usize,
+    /// Number of integer-index keys (lets array fast paths skip prototypes without indexed properties).
+    nindex: u32,
 }
 
 const EMPTY: u32 = u32::MAX;
@@ -56,6 +58,9 @@ impl PropMap {
     }
     pub fn len(&self) -> usize {
         self.live
+    }
+    pub fn has_index_keys(&self) -> bool {
+        self.nindex > 0
     }
     pub fn is_empty(&self) -> bool {
         self.live == 0
@@ -138,6 +143,9 @@ impl PropMap {
             self.entries[i].as_mut().unwrap().1 = p;
             return;
         }
+        if matches!(key, PropertyKey::Index(_)) {
+            self.nindex += 1;
+        }
         let idx = self.entries.len();
         if !self.table.is_empty() {
             if (self.entries.len() + 1) * 2 > self.table.len() {
@@ -165,8 +173,11 @@ impl PropMap {
 
     pub fn remove(&mut self, key: &PropertyKey) -> Option<Prop> {
         let i = self.find(key)?;
-        let (_, p) = self.entries[i].take().unwrap();
+        let (k, p) = self.entries[i].take().unwrap();
         self.live -= 1;
+        if matches!(k, PropertyKey::Index(_)) {
+            self.nindex -= 1;
+        }
         if !self.table.is_empty() {
             let mask = self.table.len() - 1;
             let mut h = key.hash32() as usize & mask;

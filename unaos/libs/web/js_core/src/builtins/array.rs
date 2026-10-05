@@ -620,7 +620,7 @@ fn push(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if len + ctx.argc as f64 > MAX_SAFE {
         return vm.throw_type("Pushing would exceed the maximum array length");
     }
-    let dense_ok = matches!(&vm.heap.get(o).kind, Kind::Array(a) if a.dense && a.len_writable) && vm.heap.get(o).extensible;
+    let dense_ok = matches!(&vm.heap.get(o).kind, Kind::Array(a) if a.dense && a.len_writable) && vm.heap.get(o).extensible && !protos_have_indices(vm, o);
     if dense_ok {
         let args = vm.args(ctx);
         if let Kind::Array(a) = &mut vm.heap.get_mut(o).kind {
@@ -1109,3 +1109,26 @@ fn with(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 }
 
 pub fn _unused(_d: PropDesc) {}
+
+/// Whether any prototype of `o` could observe integer-indexed [[Set]] (indexed own properties or an exotic
+/// object): array fast paths that append elements directly must not bypass such properties.
+pub fn protos_have_indices(vm: &Vm, o: Obj) -> bool {
+    let mut cur = vm.heap.get(o).proto;
+    while let Some(p) = cur {
+        let d = vm.heap.get(p);
+        match &d.kind {
+            Kind::Ordinary | Kind::Function(_) | Kind::Native(_) => {}
+            Kind::Array(a) => {
+                if !a.dense || a.elems.iter().any(|v| !v.is_empty()) {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+        if d.props.has_index_keys() {
+            return true;
+        }
+        cur = d.proto;
+    }
+    false
+}

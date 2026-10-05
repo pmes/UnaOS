@@ -140,7 +140,8 @@ pub fn sqrt(x: f64) -> f64 {
     // Normalise r to 54 bits (53 + guard) then round half even using the sticky bit.
     let rb = 128 - r.leading_zeros() as i64;
     let shift = rb - 54;
-    let mut res_exp = exp / 2 - 32 + shift;
+    // x = mm * 2^(exp - 52), so sqrt(x) = r * 2^(-32) * 2^((exp - 52) / 2).
+    let mut res_exp = exp / 2 - 26 - 32 + shift;
     let sticky = rem_nonzero || (shift > 0 && (r & ((1u128 << shift) - 1)) != 0);
     if shift > 0 {
         r >>= shift;

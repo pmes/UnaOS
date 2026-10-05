@@ -175,6 +175,13 @@ pub fn top_functions(stmts: &[Stmt]) -> Vec<Rc<Function>> {
     for s in stmts {
         let f = match s {
             Stmt::Function(f) => Some(f),
+            Stmt::Export(e) => match &**e {
+                ExportDecl::Decl(d) => match d {
+                    Stmt::Function(f) => Some(f),
+                    _ => None,
+                },
+                _ => None,
+            },
             Stmt::Labeled(_, b, _) => {
                 let mut b = &**b;
                 while let Stmt::Labeled(_, x, _) = b {

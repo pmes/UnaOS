@@ -399,21 +399,21 @@ fn try_static(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if !c.is_object() {
         return vm.throw_type("Promise.try called on non-object");
     }
-    let (p, res, rej) = new_capability(vm, &c)?;
     let f = vm.arg(ctx, 0);
     let args: Vec<Value> = if ctx.argc > 1 { vm.stack[ctx.args_base + 1..ctx.args_base + ctx.argc].to_vec() } else { Vec::new() };
     match vm.call(&f, &Value::Undefined, &args) {
-        Ok(v) => {
-            vm.call(&res, &Value::Undefined, &[v])?;
-        }
+        // A normal completion goes through PromiseResolve (a promise of this constructor is returned as is).
+        Ok(v) => Ok(Value::Object(promise_resolve(vm, &c, v)?)),
         Err(e) => {
             if vm.terminated {
                 return Err(e);
             }
+            vm.root(&e);
+            let (p, _res, rej) = new_capability(vm, &c)?;
             vm.call(&rej, &Value::Undefined, &[e])?;
+            Ok(Value::Object(p))
         }
     }
-    Ok(Value::Object(p))
 }
 
 fn with_resolvers(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {

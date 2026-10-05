@@ -400,6 +400,13 @@ pub fn precision_digits(v: f64, p: usize) -> (Vec<u8>, i32) {
             e -= 1;
             continue;
         }
+        // The shortest form may have rounded up across a power of ten (1e-21 is really 9.99…e-22): prefer the
+        // finer exponent whenever it still yields exactly p digits.
+        let n2 = round_scaled(v, p as i32 - e);
+        let d2 = n2.to_string_radix(10);
+        if d2.len() == p {
+            return (d2, e - 1);
+        }
         return (digits, e);
     }
 }

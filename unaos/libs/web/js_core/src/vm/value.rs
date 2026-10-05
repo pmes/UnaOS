@@ -189,7 +189,7 @@ impl PropertyKey {
         }
     }
     pub fn from_f64(v: f64) -> PropertyKey {
-        if v >= 0.0 && v < 4294967295.0 && (v as u32) as f64 == v && !(v == 0.0 && v.is_sign_negative()) {
+        if v >= 0.0 && v < 4294967295.0 && (v as u32) as f64 == v {
             PropertyKey::Index(v as u32)
         } else {
             PropertyKey::Str(JsStr::from_str(&crate::numconv::f64_to_js_string(v)))
