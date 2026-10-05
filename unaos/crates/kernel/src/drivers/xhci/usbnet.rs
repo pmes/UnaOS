@@ -1237,27 +1237,53 @@ impl core::fmt::Display for HexRun<'_> {
 fn netframe_note_xfer(n: usize) {
     let now = crate::arch::ms().max(1);
     NF_RX_LAST.store(now, Ordering::Relaxed);
+    if NF_STALLED.swap(false, Ordering::Relaxed) {
+        NF_RESUMED.store(true, Ordering::Relaxed);
+        serial_println!("[usbnet] rx resumed len={} kicks={} resets={}", n, NF_KICKS.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed));
+    }
     let i = NF_N.fetch_add(1, Ordering::Relaxed) as usize;
     if i < NF_LOG {
         NF_LENS[i].store(n as u32, Ordering::Relaxed);
         NF_MS[i].store(now, Ordering::Relaxed);
     }
 }
-/// M3: the data pass asks this when the IN TD is still outstanding; true = ring the IN doorbell again now.
-pub fn rx_kick_due() -> bool {
+/// M3: the data pass asks this when the IN TD is still outstanding. 0 = nothing; 1 = rung one, ring the IN doorbell
+/// again (the TD has waited `NF_KICK_MS` since its arm); 2 = rung two, the kick drew no completion within a further
+/// `NF_KICK_MS`: Stop Endpoint + Set TR Dequeue Pointer on the IN endpoint, then re-arm (`usbnet_rx_reset`).
+pub fn rx_stall_action() -> u8 {
     if !ARMED.load(Ordering::Relaxed) || DONE.load(Ordering::Relaxed) || (kind() == KIND_AX88179 && !link_up()) {
-        return false;
+        return 0;
     }
     let now = crate::arch::ms();
-    let since = now.saturating_sub(NF_ARM_AT.load(Ordering::Relaxed).max(NF_KICK_AT.load(Ordering::Relaxed)));
-    if since < NF_KICK_MS { return false; }
-    NF_KICK_AT.store(now.max(1), Ordering::Relaxed);
-    let k = NF_KICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if k <= 2 || k.is_power_of_two() {
-        serial_println!("[usbnet] rx kick n={} pending_ms={} xfers={} rx_ok={}", k, now.saturating_sub(NF_ARM_AT.load(Ordering::Relaxed)), RX_XFERS.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed));
+    let arm_at = NF_ARM_AT.load(Ordering::Relaxed);
+    let kick_at = NF_KICK_AT.load(Ordering::Relaxed);
+    if kick_at <= arm_at {
+        if now.saturating_sub(arm_at) < NF_KICK_MS { return 0; }
+        NF_KICK_AT.store(now.max(arm_at + 1), Ordering::Relaxed);
+        NF_STALLED.store(true, Ordering::Relaxed);
+        let k = NF_KICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if k <= 2 || k.is_power_of_two() {
+            serial_println!("[usbnet] rx kick n={} pending_ms={} xfers={} rx_ok={} resets={}", k, now.saturating_sub(arm_at), RX_XFERS.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed));
+        }
+        return 1;
     }
-    true
+    if now.saturating_sub(kick_at) < NF_KICK_MS { return 0; }
+    2
 }
+/// Rung two's outcome, from the controller (`usbnet_rx_reset`): the stranded TD is abandoned and the next data pass
+/// posts a fresh one. `[usbnet] rx reset n= stop_cc= deq_cc= in_state=` on the first two and every power of two.
+pub fn note_rx_reset(stop_cc: u8, deq_cc: u8, in_state: u8) {
+    let r = NF_RESETS.fetch_add(1, Ordering::Relaxed) + 1;
+    if r <= 2 || r.is_power_of_two() {
+        serial_println!("[usbnet] rx reset n={} stop_cc={} deq_cc={} in_state={} kicks={} xfers={} rx_ok={}", r, stop_cc, deq_cc, in_state, NF_KICKS.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed));
+    }
+    reset_arm(); // a Stopped transfer event the commands drained may have set DONE (code 26): not a frame, not an error
+}
+/// True once after RX completes again following a kick or a reset (the DHCP link tries re-arm on it).
+pub fn take_rx_resumed() -> bool { NF_RESUMED.swap(false, Ordering::Relaxed) }
+static NF_RESETS: AtomicU64 = AtomicU64::new(0);
+static NF_STALLED: AtomicBool = AtomicBool::new(false);
+static NF_RESUMED: AtomicBool = AtomicBool::new(false);
 /// M2: `[usbnet] rxlog n=<completions> lens=[…] ms=[…] last_ms=<n> tx_last_ms=<n> now_ms=<n> kicks=<n>`.
 fn netframe_rxlog() {
     let n = NF_N.load(Ordering::Relaxed);
@@ -1270,9 +1296,9 @@ fn netframe_rxlog() {
         let _ = core::fmt::Write::write_fmt(&mut ms, format_args!("{}", NF_MS[i].load(Ordering::Relaxed)));
     }
     serial_println!(
-        "[usbnet] rxlog n={} lens=[{}] ms=[{}] last_ms={} tx_last_ms={} now_ms={} kicks={} tx_stuck={}",
+        "[usbnet] rxlog n={} lens=[{}] ms=[{}] last_ms={} tx_last_ms={} now_ms={} kicks={} resets={} tx_stuck={}",
         n, lens, ms, NF_RX_LAST.load(Ordering::Relaxed), NF_TX_LAST.load(Ordering::Relaxed), crate::arch::ms(),
-        NF_KICKS.load(Ordering::Relaxed), TX_STUCK.load(Ordering::Relaxed)
+        NF_KICKS.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed), TX_STUCK.load(Ordering::Relaxed)
     );
     match crate::drivers::xhci::claim() {
         Ok(x) => match x.usbnet_stall_probe() {
