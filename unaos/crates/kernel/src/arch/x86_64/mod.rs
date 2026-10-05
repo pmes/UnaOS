@@ -7,7 +7,7 @@ pub mod acpi;
 pub mod acpi_power;
 pub mod percpu;
 pub mod smp;
-pub mod sched;
+pub mod sched; pub mod stackguard; // SMALLFIX M6 (STACKGUARD, B380): the unmapped guard page under every kernel task stack
 pub mod syscall;
 pub mod pci;
 pub mod memory;

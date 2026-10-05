@@ -4409,3 +4409,101 @@ pub fn selfbuild3_usable_ram() -> alloc::vec::Vec<(u64, u64)> {
     }
     v
 }
+
+// =================================================================================================
+// SMALLFIX M6 — STACKGUARD (rmbp-ledger B380; flight 23's MP3HANG). The page-table half of the UNMAPPED
+// guard under every x86 kernel task stack (`arch/x86_64/stackguard.rs` owns the policy and the fault side).
+// Flight 23: the render task's 32 KiB stack met audio_core's 92,504-byte open frame, whose stack probes wrote
+// zeros every 4 KiB THROUGH the poisoned guard span into the heap below — no fault, a silent hang that took
+// the console and input. A probe that lands on a NOT-PRESENT page faults at the first touch.
+//
+// What this does about RENDSTACK's three reasons (`sched.rs`, `STACK_GUARD`): (1) the allocator's free-list
+// node — the page is made PRESENT again before the slab is freed (`Task`'s drop); (2) the 2 MiB / 1 GiB
+// identity leaves — the leaf covering the page is SPLIT into an identical-mapping table (same PA, same
+// WXN_LEAF_CARRY bits, PAT moved to its 4 KiB position — the WXN-M2 rule), so the device-visible PA map is
+// unchanged and only the one 4 KiB entry's P bit moves; (3) the kernel shootdown — this core `invlpg`s, the
+// others drop their global entries at their next timer tick (`stackguard::tlb_sync`, a generation compare).
+// A stale remote entry can only ever MAP the page (never fault a live one), so the lag costs detection on
+// that core for at most one tick, never correctness. Splits are permanent (the table frames are leaked,
+// like every page-table frame here).
+// =================================================================================================
+
+/// Set the PRESENT bit of the 4 KiB kernel identity leaf for `page` (4 KiB-aligned), splitting a covering
+/// 1 GiB / 2 MiB leaf first. `spare` supplies up to two zeroed 4 KiB frames for the splits (an entry is set
+/// to 0 when consumed). `Err` = the page is not mapped through this root (left untouched).
+pub fn stack_guard_page(page: u64, present: bool, spare: &mut [u64; 2]) -> Result<u32, &'static str> {
+    let mut splits = 0u32;
+    let mut res: Result<u32, &'static str> = Ok(0);
+    with_page_tables_writable(|| unsafe {
+        let root = kernel_cr3() as *mut u64;
+        let pml4e = root.add(pml4_index(page));
+        if *pml4e & PTE_PRESENT == 0 {
+            res = Err("pml4-absent");
+            return;
+        }
+        let pdpte = ((*pml4e & PTE_ADDR) as *mut u64).add(pdpt_index(page));
+        if *pdpte & PTE_PRESENT == 0 {
+            res = Err("pdpt-absent");
+            return;
+        }
+        if *pdpte & PTE_HUGE != 0 {
+            let f = core::mem::take(&mut spare[0]);
+            if f == 0 {
+                res = Err("no-frame");
+                return;
+            }
+            let leaf = *pdpte;
+            let pd = f as *mut u64;
+            for i in 0..512u64 {
+                *pd.add(i as usize) = ((leaf & PTE_ADDR_1G) + (i << 21)) | (leaf & WXN_LEAF_CARRY) | PTE_HUGE | (leaf & PTE_PAT_HUGE);
+            }
+            *pdpte = (f & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | (leaf & PTE_USER);
+            splits += 1;
+        }
+        let pde = ((*pdpte & PTE_ADDR) as *mut u64).add(pd_index(page));
+        if *pde & PTE_PRESENT == 0 {
+            res = Err("pd-absent");
+            return;
+        }
+        if *pde & PTE_HUGE != 0 {
+            let f = core::mem::take(&mut spare[1]);
+            if f == 0 {
+                res = Err("no-frame");
+                return;
+            }
+            let leaf = *pde;
+            let pt = f as *mut u64;
+            let pat = if leaf & PTE_PAT_HUGE != 0 { PTE_PAT_4K } else { 0 };
+            for i in 0..512u64 {
+                *pt.add(i as usize) = ((leaf & PTE_ADDR_2M) + (i << 12)) | (leaf & WXN_LEAF_CARRY) | pat;
+            }
+            *pde = (f & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | (leaf & PTE_USER);
+            splits += 1;
+        }
+        let pte = ((*pde & PTE_ADDR) as *mut u64).add(pt_index(page));
+        if *pte & PTE_ADDR != page & PTE_ADDR {
+            res = Err("not-identity");
+            return;
+        }
+        if present {
+            *pte |= PTE_PRESENT;
+        } else {
+            *pte &= !PTE_PRESENT;
+        }
+        res = Ok(splits);
+    });
+    unsafe { invlpg(page) };
+    res
+}
+
+/// One zeroed 4 KiB page-table frame for [`stack_guard_page`]'s splits (`alloc_page_frame`'s source).
+pub fn stack_guard_frame() -> u64 {
+    alloc_page_frame()
+}
+
+/// Return an unconsumed [`stack_guard_frame`] to the heap (same layout it was allocated with).
+pub fn stack_guard_frame_free(f: u64) {
+    if f != 0 {
+        unsafe { alloc::alloc::dealloc(f as *mut u8, Layout::from_size_align(4096, 4096).expect("page layout")) };
+    }
+}

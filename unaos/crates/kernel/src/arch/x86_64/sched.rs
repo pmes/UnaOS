@@ -115,7 +115,7 @@ const TASK_STACK_SIZE: usize = 16 * 1024;
 /// page: filled with [`GUARD_FILL`], and read by [`guard_state`] at two bytes — the span's TOP
 /// byte (the first thing a dipping SP touches) and its BOTTOM byte (the guard exhausted). It is
 /// UNGATED: it is the protection, not the instrument, so it is present in every x86 image.
-pub const STACK_GUARD: usize = 4096;
+pub const STACK_GUARD: usize = 8192; // SMALLFIX M6 (STACKGUARD, B380): TWO pages, so a whole page-aligned 4 KiB page always lies inside the span whatever the allocator's alignment — that page is UNMAPPED (`stackguard.rs`; the three reasons above are answered there and in `memory::stack_guard_page`), the rest stays the poisoned absorber. Usable sizes unchanged.
 
 /// RENDSTACK — the guard byte. Arbitrary, but must not be a plausible zeroed-frame byte (0x00) or
 /// a plausible pointer byte, so a partially-overwritten guard cannot read as intact. Same value as
@@ -2409,7 +2409,7 @@ fn spawn_inner(
     // the guard and (under `witness`) the high-water poison; `build_initial_frame` is handed the
     // usable span ONLY, so no frame can be built inside the guard.
     let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes + STACK_GUARD].into_boxed_slice();
-    paint_stack(&mut stack);
+    paint_stack(&mut stack); super::stackguard::arm(stack.as_ptr() as u64, stack.len(), name); // SMALLFIX M6 (STACKGUARD): the guard page goes NOT-PRESENT after the paint. ⚠ SAME-LINE fold, line-neutral.
     let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], task_trampoline);
 
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed); crate::prof::note_task(id, name);
@@ -2697,7 +2697,7 @@ fn spawn_user_inner(
     assert!(target_cpu < MAX_CPUS, "spawn_user: target_cpu out of range");
     // RENDSTACK: guard span below the usable stack, same shape as `spawn_inner`'s.
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_GUARD].into_boxed_slice();
-    paint_stack(&mut stack);
+    paint_stack(&mut stack); super::stackguard::arm(stack.as_ptr() as u64, stack.len(), name); // SMALLFIX M6 (STACKGUARD): the guard page goes NOT-PRESENT after the paint. ⚠ SAME-LINE fold, line-neutral.
     let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed); crate::prof::note_user_task(id, name);
     let task = Box::new(Task {
@@ -2951,7 +2951,7 @@ pub fn spawn_user_thread(
 
     // RENDSTACK: guard span below the usable stack, same shape as `spawn_inner`'s.
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_GUARD].into_boxed_slice();
-    paint_stack(&mut stack);
+    paint_stack(&mut stack); super::stackguard::arm(stack.as_ptr() as u64, stack.len(), name); // SMALLFIX M6 (STACKGUARD): the guard page goes NOT-PRESENT after the paint. ⚠ SAME-LINE fold, line-neutral.
     let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed); crate::prof::note_thread(id, name);
     let task = Box::new(Task {
@@ -5586,7 +5586,7 @@ pub fn run_bsp(cpu: usize) -> ! {
     // is worthless; if it reads `c0=--` and so does everything else, the APs are not being accounted
     // either. Cheap enough to be unconditional (one line, once per boot) and it is the assertion the
     // survey's Arc-0 anti-witness names.
-    emit_load_witness("-prejoin");
+    super::stackguard::boot_line(); emit_load_witness("-prejoin"); // SMALLFIX M6: `[stack] guards armed tasks=<n> page=4096`, once
     run()
 }
 
@@ -7542,7 +7542,7 @@ fn stack_guard_check(cpu: usize, raw: *mut Task) {
     // SAFETY: `raw` is this core's just-switched-back task; the `Box::from_raw` that may free it is
     // below this call in `run()`. Fields are read, never written.
     let task = unsafe { &*raw };
-    let st = guard_state(&task.stack[..STACK_GUARD]);
+    let st = guard_state(&task.stack[super::stackguard::absorber_lo(task.stack.as_ptr() as u64)..STACK_GUARD]); // SMALLFIX M6: only the ABSORBER above the unmapped page is read (its bytes are mapped).
     if st == 0 {
         return;
     }
@@ -7761,4 +7761,66 @@ pub fn current_stack_bounds() -> Option<(u64, u64)> {
 pub fn other_dispatching_cpu() -> usize {
     let here = percpu::this_cpu().cpu_index as usize;
     (0..MAX_CPUS).find(|&c| c != here && cpu_dispatching(c)).unwrap_or(CPU_AUTO)
+}
+
+// ── SMALLFIX M6 — STACKGUARD (B380): the scheduler's half of the unmapped guard page (`stackguard.rs`) ──────
+
+impl Drop for Task {
+    /// The guard page is made PRESENT again before the slab goes back to the heap: the allocator writes its
+    /// free-list node at the block's start, which may be inside the guard page.
+    fn drop(&mut self) {
+        super::stackguard::disarm(self.stack.as_ptr() as u64);
+    }
+}
+
+/// `(slab base, slab len)` of the task current on `cpu` (the caller's own core, IF=0: the fault path).
+pub fn current_slab(cpu: usize) -> Option<(u64, usize)> {
+    current_named_slab(cpu).map(|(_, b, l)| (b, l))
+}
+
+/// `(name, slab base, slab len)` of the task current on `cpu`.
+pub fn current_named_slab(cpu: usize) -> Option<(&'static str, u64, usize)> {
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: this core's own current task; nothing frees it while it is current.
+    let t = unsafe { &*raw };
+    Some((t.name, t.stack.as_ptr() as u64, t.stack.len()))
+}
+
+/// Re-lay [`GUARD_FILL`] over the current task's absorber (the overflow path, before `exit`).
+pub fn stack_repaint_absorber(cpu: usize) {
+    if let Some((_, base, len)) = current_named_slab(cpu) {
+        let lo = super::stackguard::absorber_lo(base);
+        if lo < STACK_GUARD && STACK_GUARD <= len {
+            // SAFETY: the absorber is mapped and belongs to the task being abandoned (we run at its slab's top).
+            unsafe { core::ptr::write_bytes((base as *mut u8).add(lo), GUARD_FILL, STACK_GUARD - lo) };
+        }
+    }
+}
+
+/// High mark of a slab's usable span (the `witness` paint), or `None` in a build without it.
+pub fn slab_high(base: u64, len: usize) -> Option<usize> {
+    #[cfg(feature = "witness")]
+    {
+        let usable = len.saturating_sub(STACK_GUARD);
+        let mut untouched = 0usize;
+        // SAFETY: the caller holds the guard registry lock, so the slab cannot be freed under the scan.
+        unsafe {
+            let p = (base as *const u8).add(STACK_GUARD);
+            while untouched < usable && core::ptr::read_volatile(p.add(untouched)) == STACK_POISON {
+                untouched += 1;
+            }
+        }
+        Some(usable - untouched)
+    }
+    #[cfg(not(feature = "witness"))]
+    {
+        let _ = (base, len);
+        None
+    }
 }

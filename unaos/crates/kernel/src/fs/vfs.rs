@@ -1893,12 +1893,12 @@ impl VfsBackend for NativeBackend {
             }
             // A shrink (including to 0) would DROP the per-object ACL if done by
             // unlink+recreate — the one thing the native volume must never lose.
-            // UnaFS carries no in-place shrink primitive this arc, so a native
-            // shrink is honestly Unsupported (a caller that wants smaller content
-            // creates a fresh object and writes it). This is a DELIBERATE
-            // asymmetry with the FAT backend (which truncates-to-0 by
-            // delete+recreate — FAT has no per-object ACL to preserve).
-            Err(VfsError::Unsupported)
+            // SMALLFIX (B380): the shared UnaFS core now carries the in-place
+            // shrink (`truncate_data`: same inode, blocks past the end released,
+            // the tail block CoW'd zeroed) — flight 23's SYSKAT2 check 19 was a
+            // native shrink refused here and EIO'd by the Linux shim's fallback.
+            fs.truncate_data(id, size).map_err(|_| VfsError::Backend("unafs-truncate"))?;
+            Ok(())
         })
         .map_err(unafs_err)?
     }

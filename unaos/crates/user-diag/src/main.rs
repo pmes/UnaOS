@@ -34,7 +34,9 @@ static HEAP: vein_ring3::heap::Heap = vein_ring3::heap::Heap::sbrk();
 //
 // I/O is SYS_PATH_READ (59) / SYS_PATH_WRITE (60), fulfilled by the kernel over the VFS (UNAOS_SELFDIAG=1).
 //
-// WIRE. `:: SELFDIAG: start provider=<claude|echo> boot=<n|none> tree=<path|none> owners=<path|none> ::`, per
+// WIRE. `[diag] wait on=<prefs|key|boot-last+tree|owners-probe|boot-log|owners+sections|tls-load> ms=<n>` per step
+// (SMALLFIX, B380), `:: SELFDIAG: start provider=<claude|echo> boot=<n|none> tree=<path|none> owners=<path|none>
+// tls=<deferred|unneeded> ::`, per
 // FAIL line `[selfdiag] fail tag=<T> owner=<path>:<line>|none`, `[selfdiag] ask prompt=<b> answer=<b>
 // outcome=<o>`, then `:: SELFDIAG: fails=<n> asked=<n> patched=<n> refused=<n> -> PASS ::` (SKIP: no boot log;
 // FAIL: an I/O or provider failure, with `stage=`).
@@ -203,6 +205,16 @@ fn verdict(fails: usize, asked: usize, patched: usize, refused: usize, word: &st
     exit(if word == "FAIL" { 1 } else { 0 })
 }
 
+/// SMALLFIX (B380): `[diag] wait on=<what> ms=<n>` — what the step just finished waited on, and how long. Returns now.
+fn waited(on: &str, t0: u64) -> u64 {
+    let now = vein_ring3::sys::now_ms();
+    let mut b = [0u8; 96];
+    let mut o = Out::new(&mut b);
+    o.s("[diag] wait on=").s(on).s(" ms=").dec(now.saturating_sub(t0));
+    say(&o);
+    now
+}
+
 fn note(parts: &[&str]) {
     let mut b = [0u8; 512];
     let mut o = Out::new(&mut b);
@@ -265,11 +277,19 @@ pub extern "C" fn _start() -> ! {
     let m = unsafe { &mut *core::ptr::addr_of_mut!(MEM) };
 
     // The provider: Principia's `vein` namespace and the key file, the LUMENAPP rule.
+    // SMALLFIX (B380): every step before the start line names its wait (`[diag] wait on=<what> ms=<n>`) —
+    // flight 23's bare `diag` printed NOTHING for its 7 s foreground bound. The TLS setup (the crypto
+    // provider's DRBG seed + the roots bundle + the CCADB intermediates, merge12's VEINTLS fold — the one
+    // step DIAG.ELF gained since flight 22's 0.1 s PASS) is DEFERRED to the ask: it is loaded only when the
+    // boot has a FAIL line to ask about AND the plan would send the key over TLS; Echo never needs it.
+    let mut t = vein_ring3::sys::now_ms();
     let cfg = vein_ring3::prefs::Config::read();
+    t = waited("prefs", t);
     let (key, key_n) = vein_ring3::key::read(cfg.key_file(), &mut m.key);
-    let tls = vein_ring3::TlsSetup::load(); // VEINTLS (SR36, merge12 fold): the key crosses only a verified connection
-    let plan = cfg.plan(key, tls.verify());
-    let provider = match plan {
+    t = waited("key", t);
+    let mut plan = cfg.plan(key, vein_core::prefs::Verify::Ready); // the plan as if TLS verifies; checked at the ask
+    let needs_tls = matches!(plan, Plan::Claude { send_key: true });
+    let mut provider = match plan {
         Plan::Claude { .. } => "claude",
         Plan::Echo(_) => "echo",
     };
@@ -290,10 +310,12 @@ pub extern "C" fn _start() -> ! {
         let mut one = [0u8; 1];
         pread(t, 0, &mut one) == una_abi::EISDIR
     });
+    t = waited("boot-last+tree", t);
     let owners_path = OWNERS.iter().copied().find(|p| {
         let mut one = [0u8; 1];
         pread(p, 0, &mut one) >= 0
     });
+    t = waited("owners-probe", t);
     {
         let mut b = [0u8; 256];
         let mut o = Out::new(&mut b);
@@ -306,7 +328,7 @@ pub extern "C" fn _start() -> ! {
                 o.s("none");
             }
         }
-        o.s(" tree=").s(tree.unwrap_or("none")).s(" owners=").s(owners_path.unwrap_or("none")).s(" ::");
+        o.s(" tree=").s(tree.unwrap_or("none")).s(" owners=").s(owners_path.unwrap_or("none")).s(if needs_tls { " tls=deferred" } else { " tls=unneeded" }).s(" ::");
         say(&o);
     }
     let Some(boot) = boot else {
@@ -331,6 +353,7 @@ pub extern "C" fn _start() -> ! {
             verdict(0, 0, 0, 0, "FAIL", core::str::from_utf8(&b[..n]).unwrap_or(""))
         }
     };
+    t = waited("boot-log", t);
     let wit = match core::str::from_utf8(&m.wit[..wn]) {
         Ok(s) => s,
         Err(e) => unsafe { core::str::from_utf8_unchecked(&m.wit[..e.valid_up_to()]) },
@@ -397,7 +420,20 @@ pub extern "C" fn _start() -> ! {
     };
     let ptext = core::str::from_utf8(&m.prompt[..plen]).unwrap_or("");
 
-    // 4. Ask.
+    // 4. Ask. The TLS setup happens HERE, only when the key would cross a TLS connection (SMALLFIX, B380).
+    t = waited("owners+sections", t);
+    let tls = if needs_tls {
+        let tls = vein_ring3::TlsSetup::load(); // VEINTLS (SR36, merge12 fold): the key crosses only a verified connection
+        let _ = waited("tls-load", t);
+        plan = cfg.plan(key, tls.verify());
+        if let Plan::Echo(_) = plan {
+            provider = "echo";
+            note(&["TLS cannot verify at the ask: the echo provider answers"]);
+        }
+        Some(tls)
+    } else {
+        None
+    };
     let mut an = 0usize;
     let mut failed: Option<(&'static str, i64)> = None;
     match plan {
@@ -421,7 +457,7 @@ pub extern "C" fn _start() -> ! {
                     an += k;
                 }
             };
-            let ctx = tls.context(); // VEINTLS (merge12 fold)
+            let ctx = tls.as_ref().and_then(|t| t.context()); // VEINTLS (merge12 fold); None off a TLS endpoint
             match vein_ring3::prepare(&ep, &p, msgs, keystr, bufs).and_then(|req| vein_ring3::send(&ep, req, bufs, ctx.as_ref(), &mut on)) {
                 Ok(o) if o.out.status == 200 => {}
                 Ok(o) => failed = Some(("http-status", o.out.status as i64)),

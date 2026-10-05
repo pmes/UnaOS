@@ -512,6 +512,7 @@ extern "x86-interrupt" fn page_fault_handler(
             );
         }
     }
+    super::stackguard::on_kernel_fault(cr2, stack_frame.instruction_pointer.as_u64(), false); // SMALLFIX M6 (STACKGUARD): a CPL-0 #PF in the current task's guard page halts THAT task (never returns); anything else falls through.
     // CPL-0 page fault: a kernel bug — fatal.
     // PFWIRE: this core is about to `hlt` forever with IF=0 (interrupt gate), so it can never be
     // the next `SERIAL1` holder to drain the staging ring. If the fault was taken while this core
@@ -690,6 +691,7 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
+    if !from_ring3(&stack_frame) { super::stackguard::on_kernel_fault(x86_64::registers::control::Cr2::read_raw(), stack_frame.instruction_pointer.as_u64(), true); } // SMALLFIX M6 (STACKGUARD): the #PF on an exhausted stack cannot push its frame and arrives HERE (IST); a CR2 in the current task's guard page halts that task.
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 
@@ -715,7 +717,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     }
     // Local APIC timer tick. Lock-free. This CPU's own tick counter (each core's timer fires
     // independently at the calibrated 1 kHz) drives the per-CPU `sleep_ticks` deadlines.
-    crate::arch::percpu::note_tick(); crate::prof::sample_tick(stack_frame.instruction_pointer.as_u64(), from_user);
+    crate::arch::percpu::note_tick(); crate::prof::sample_tick(stack_frame.instruction_pointer.as_u64(), from_user); super::stackguard::tlb_sync(); // SMALLFIX M6: drop a stale global leaf over a newly unmapped guard page
     // The GLOBAL millisecond clock (`APIC_TICKS`, read by `ticks()`/`ms()`) is advanced by ONE core
     // only — the BSP (logical cpu 0). Every core ticks at 1 kHz, so summing all of them would run
     // the "ms since boot" clock at (core-count) kHz — 8× fast on the 8-core rMBP. The BSP is always
