@@ -29,6 +29,7 @@ fn audio_track(id: u32, n: usize, size_of: impl Fn(usize) -> usize) -> MediaTrac
             height: 0,
             sample_rate: 48_000,
             channels: 2,
+            bit_depth: 0,
             default_duration_ns: 20_000_000,
         },
         samples: (0..n)
@@ -422,4 +423,32 @@ fn refusals_are_errors_not_panics() {
         x[i] ^= 0xFF;
         let _ = Demuxer::open(x);
     }
+}
+
+// ----------------------------------------------------------------- PCM
+
+#[test]
+fn pcm_tracks_in_both_containers() {
+    let pcm: Vec<i16> = (0..4800).map(|i| ((i * 37) % 65536 - 32768) as i16).collect();
+    let t = build::pcm16_track(2, 48_000, 2, &pcm, 480);
+    for file in [build::mp4(&[t.clone()], &Mp4Options::default()), build::mkv(&[t.clone()], &MkvOptions::default())] {
+        let mut d = Demuxer::open(file).unwrap();
+        let tr = d.tracks()[0].clone();
+        assert_eq!(tr.codec, Codec::Pcm { bits: 16, float: false, big_endian: false }, "{}", tr.codec_name);
+        assert_eq!((tr.sample_rate, tr.channels), (48_000, 2));
+        let p = all(&mut d);
+        assert_eq!(p.len(), 5);
+        assert_eq!(p.iter().map(|x| tr.to_ns(x.pts)).collect::<Vec<_>>(), vec![0, 10_000_000, 20_000_000, 30_000_000, 40_000_000]);
+        let bytes: Vec<u8> = p.iter().flat_map(|x| x.data.clone()).collect();
+        assert_eq!(bytes, pcm.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+    }
+    // 24-bit big-endian in Matroska and `twos` in MP4 map their depth and byte order.
+    let mut t24 = t.clone();
+    t24.spec.codec_id = "A_PCM/INT/BIG";
+    t24.spec.bit_depth = 24;
+    let d = Demuxer::open(build::mkv(&[t24.clone()], &MkvOptions::default())).unwrap();
+    assert_eq!(d.tracks()[0].codec, Codec::Pcm { bits: 24, float: false, big_endian: true });
+    t24.spec.fourcc = *b"twos";
+    let d = Demuxer::open(build::mp4(&[t24], &Mp4Options::default())).unwrap();
+    assert_eq!(d.tracks()[0].codec, Codec::Pcm { bits: 24, float: false, big_endian: true });
 }

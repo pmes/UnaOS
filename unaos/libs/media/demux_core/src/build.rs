@@ -69,6 +69,8 @@ pub struct TrackSpec {
     pub height: u16,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Audio bits per sample (MP4 AudioSampleEntry samplesize; Matroska BitDepth when non-zero).
+    pub bit_depth: u16,
     /// Matroska DefaultDuration in ns (0 = omit).
     pub default_duration_ns: u64,
 }
@@ -103,9 +105,44 @@ impl TrackSpec {
             height,
             sample_rate: 0,
             channels: 0,
+            bit_depth: 0,
             default_duration_ns: 1_000_000_000 / fps as u64,
         }
     }
+}
+
+/// 16-bit little-endian interleaved PCM (`sowt` in MP4, `A_PCM/INT/LIT` in Matroska), cut into
+/// packets of `frames_per_packet` sample frames; timescale = the sample rate.
+pub fn pcm16_track(id: u32, sample_rate: u32, channels: u16, pcm: &[i16], frames_per_packet: usize) -> MediaTrack {
+    let ch = channels.max(1) as usize;
+    let fpp = frames_per_packet.max(1);
+    let spec = TrackSpec {
+        id,
+        kind: TrackKind::Audio,
+        fourcc: *b"sowt",
+        config_box: None,
+        codec_id: "A_PCM/INT/LIT",
+        config: Vec::new(),
+        timescale: sample_rate,
+        width: 0,
+        height: 0,
+        sample_rate,
+        channels,
+        bit_depth: 16,
+        default_duration_ns: 0,
+    };
+    let samples = pcm
+        .chunks(fpp * ch)
+        .enumerate()
+        .map(|(i, c)| SampleSpec {
+            data: c.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            dts: (i * fpp) as i64,
+            pts: (i * fpp) as i64,
+            duration: (c.len() / ch) as u32,
+            keyframe: true,
+        })
+        .collect();
+    MediaTrack { spec, samples }
 }
 
 /// `n` test-pattern frames at `fps`, a keyframe every `gop` frames, pts == dts.
@@ -197,7 +234,7 @@ fn sample_entry(t: &TrackSpec) -> Vec<u8> {
         TrackKind::Audio => {
             e.extend_from_slice(&[0u8; 8]);
             e.u16b(t.channels);
-            e.u16b(16);
+            e.u16b(if t.bit_depth == 0 { 16 } else { t.bit_depth });
             e.u32b(0);
             e.u32b(t.sample_rate << 16);
         }
@@ -664,7 +701,10 @@ pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
             let v = cat(&[&el_uint(0xB0, s.width as u64), &el_uint(0xBA, s.height as u64)]);
             e.extend_from_slice(&el(0xE0, &v));
         } else {
-            let a = cat(&[&el_f64(0xB5, s.sample_rate as f64), &el_uint(0x9F, s.channels as u64)]);
+            let mut a = cat(&[&el_f64(0xB5, s.sample_rate as f64), &el_uint(0x9F, s.channels as u64)]);
+            if s.bit_depth != 0 {
+                a.extend_from_slice(&el_uint(0x6264, s.bit_depth as u64));
+            }
             e.extend_from_slice(&el(0xE1, &a));
         }
         tr.extend_from_slice(&el(0xAE, &e));
@@ -812,6 +852,7 @@ pub fn remux_tracks(d: &crate::Demuxer) -> Option<Vec<MediaTrack>> {
             Codec::Vp8 => (*b"vp08", Some(*b"vpcC"), "V_VP8"),
             Codec::Opus => (*b"Opus", Some(*b"dOps"), "A_OPUS"),
             Codec::TestPattern => (*b"utp1", None, "V_UNAOS/TESTPATTERN"),
+            Codec::Pcm { bits: 16, float: false, big_endian: false } => (*b"sowt", None, "A_PCM/INT/LIT"),
             _ => return None,
         };
         // Writer timescale: the MP4 media timescale, or 1 GHz-ns for Matroska input (reduced to
@@ -845,6 +886,7 @@ pub fn remux_tracks(d: &crate::Demuxer) -> Option<Vec<MediaTrack>> {
                 height: t.height as u16,
                 sample_rate: t.sample_rate,
                 channels: t.channels,
+                bit_depth: match t.codec { Codec::Pcm { bits, .. } => bits, _ => 0 },
                 default_duration_ns: 0,
             },
             samples,

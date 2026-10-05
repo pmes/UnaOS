@@ -98,6 +98,9 @@ pub enum Codec {
     Opus,
     Vorbis,
     Flac,
+    /// Uncompressed integer or IEEE-float PCM, interleaved (MP4 `sowt`/`twos`/`ipcm`/`fpcm`,
+    /// Matroska `A_PCM/INT/LIT`, `A_PCM/INT/BIG`, `A_PCM/FLOAT/IEEE`).
+    Pcm { bits: u16, float: bool, big_endian: bool },
     /// UnaOS's deterministic test-pattern stream (`utp1` / `V_UNAOS/TESTPATTERN`): each packet is
     /// a [`build::TestPatternPacket`]. Lets playback be proven before a real decoder exists.
     TestPattern,

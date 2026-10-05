@@ -279,6 +279,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHeader, track: &mut Track) -> Result<(), Er
     r.skip(6)?; // reserved
     r.skip(2)?; // data_reference_index
     let child_start;
+    let mut sample_size = 16u16;
     match &fourcc {
         b"av01" | b"avc1" | b"avc3" | b"hvc1" | b"hev1" | b"vp08" | b"vp09" | b"utp1" | b"encv" => {
             r.skip(16)?; // pre_defined, reserved, pre_defined[3]
@@ -288,11 +289,11 @@ fn parse_stsd(data: &[u8], stsd: &BoxHeader, track: &mut Track) -> Result<(), Er
             // pre_defined 2  → VisualSampleEntry is 78 bytes after the box header.
             child_start = e.body + 78;
         }
-        b"mp4a" | b"Opus" | b"fLaC" | b"enca" | b"ac-3" | b"ec-3" => {
+        b"mp4a" | b"Opus" | b"fLaC" | b"enca" | b"ac-3" | b"ec-3" | b"sowt" | b"twos" | b"ipcm" | b"fpcm" => {
             let version = r.u16()?;
             r.skip(6)?; // revision, vendor
             track.channels = r.u16()?;
-            r.skip(2)?; // samplesize
+            sample_size = r.u16()?;
             r.skip(4)?; // pre_defined, reserved
             track.sample_rate = r.u32()? >> 16;
             // QuickTime sound description v1/v2 extensions.
@@ -341,6 +342,18 @@ fn parse_stsd(data: &[u8], stsd: &BoxHeader, track: &mut Track) -> Result<(), Er
         b"fLaC" => {
             track.config = cfg(b"dfLa").unwrap_or_default();
             Codec::Flac
+        }
+        // QuickTime uncompressed: `sowt` little-endian, `twos` big-endian (8-bit is signed),
+        // bit depth from the AudioSampleEntry samplesize.
+        b"sowt" => Codec::Pcm { bits: sample_size, float: false, big_endian: false },
+        b"twos" => Codec::Pcm { bits: sample_size, float: false, big_endian: true },
+        // ISO/IEC 23003-5: `pcmC` = FullBox { format_flags(8) bit 0 little-endian,
+        // PCM_sample_size(8) }.
+        b"ipcm" | b"fpcm" => {
+            let c = cfg(b"pcmC").unwrap_or_default();
+            let (le, bits) = if c.len() >= 6 { (c[4] & 1 != 0, c[5] as u16) } else { (false, sample_size) };
+            track.config = c;
+            Codec::Pcm { bits, float: &fourcc == b"fpcm", big_endian: !le }
         }
         b"mp4a" => match child(&kids, b"esds") {
             Some(b) => {

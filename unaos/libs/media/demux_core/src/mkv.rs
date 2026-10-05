@@ -46,6 +46,7 @@ const ID_PIXEL_HEIGHT: u32 = 0xBA;
 const ID_AUDIO: u32 = 0xE1;
 const ID_SAMPLING_FREQ: u32 = 0xB5;
 const ID_CHANNELS: u32 = 0x9F;
+const ID_BIT_DEPTH: u32 = 0x6264;
 const ID_CONTENT_ENCODINGS: u32 = 0x6D80;
 const ID_CONTENT_ENCODING: u32 = 0x6240;
 const ID_CONTENT_COMPRESSION: u32 = 0x5034;
@@ -281,6 +282,7 @@ fn parse_track(data: &[u8], te: &El) -> Result<TrackState, Error> {
     };
     let mut default_duration = 0u64;
     let mut sample_rate = 8000.0f64;
+    let mut bit_depth = 0u16;
     for c in kids(data, te.body, te.end)? {
         match c.id {
             ID_TRACK_NUMBER => t.id = uint(data, &c)? as u32,
@@ -309,6 +311,7 @@ fn parse_track(data: &[u8], te: &El) -> Result<TrackState, Error> {
                     match a.id {
                         ID_SAMPLING_FREQ => sample_rate = float(data, &a)?,
                         ID_CHANNELS => t.channels = uint(data, &a)? as u16,
+                        ID_BIT_DEPTH => bit_depth = uint(data, &a)? as u16,
                         _ => {}
                     }
                 }
@@ -359,6 +362,10 @@ fn parse_track(data: &[u8], te: &El) -> Result<TrackState, Error> {
         "A_OPUS" => Codec::Opus,
         "A_VORBIS" => Codec::Vorbis,
         "A_FLAC" => Codec::Flac,
+        // RFC 9559 §5.1.4.1.28 codec mappings: PCM bit depth from Audio/BitDepth (16 if absent).
+        "A_PCM/INT/LIT" => Codec::Pcm { bits: if bit_depth == 0 { 16 } else { bit_depth }, float: false, big_endian: false },
+        "A_PCM/INT/BIG" => Codec::Pcm { bits: if bit_depth == 0 { 16 } else { bit_depth }, float: false, big_endian: true },
+        "A_PCM/FLOAT/IEEE" => Codec::Pcm { bits: if bit_depth == 0 { 32 } else { bit_depth }, float: true, big_endian: false },
         s if s.starts_with("A_AAC") => Codec::Aac,
         s => Codec::Other(String::from(s)),
     };
