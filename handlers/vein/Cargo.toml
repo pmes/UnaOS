@@ -12,7 +12,7 @@ license = "LGPL-3.0-or-later"
 
 [features]
 # EMBED (B317): the in-process local embedder (recall with no network).
-default = [] # merge10 fold: the local embedder is OPT-IN — `--features local-embed`; since INFERCORE (SR57) it runs on UnaOS's own infer_core (no_std, zero deps; candle is gone); see docs/dev/evidence/ml-1005/INFERCORE.md
+default = ["local-embed"] # R85 (17): the local embedder is ON by default; since INFERCORE (SR57) it runs on UnaOS's own infer_core (no_std, zero deps; candle is gone); see docs/dev/evidence/ml-1005/INFERCORE.md
 local-embed = ["gneiss_pal/local-embed"]
 
 [dependencies]
