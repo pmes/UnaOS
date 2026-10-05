@@ -130,7 +130,7 @@ on their last subtest (15/16), and the six `NodeList-static-length-getter-tamper
 `Document-characterSet-normalization` files (very long loops / encoding labels) do not complete in the harness
 budget. The test asserts covered ≥ 80 % as its floor.
 
-**`cargo test -p aether`**: green (lib 152, dom_oracle, script_oracle 20/20, style_oracle, text_oracle, style_time);
+**`cargo test -p aether`**: green (lib 152, dom_oracle 1, script_oracle 1 (20/20 pages), style_oracle 1, style_time 3, text_oracle 2; wpt_dom skips in a debug build);
 the boa-era engine tests are re-pointed (`eval_number`/`eval_string`), with new KATs for stack overflow, runaway
 loops, prefetched-script `currentScript`, select selectedness and the timer clamp. `cargo test -p html_core` and
 `-p js_core` green (JS_OFFLINE=1).
@@ -155,6 +155,6 @@ global scope rather than the element/form/document scope chain; `getComputedStyl
 
 MutationObserver (microtask-queued records from the mutation algorithms in `dom.rs`) is the largest WPT block
 excluded; Range and NodeIterator/TreeWalker next. Arbitrary namespaces need an html_core `Namespace::Other(atom)`.
-Rerun: `cargo test --release -p aether --test wpt_dom -- --nocapture` (`AETHER_WPT_ONLY=a,b` filters by file name, `AETHER_WPT_VERBOSE=1` prints failing subtests),
+Rerun: `cargo test --release -p aether --test wpt_dom -- --nocapture` (a debug `cargo test -p aether` skips it unless `AETHER_WPT=1`) (`AETHER_WPT_ONLY=a,b` filters by file name, `AETHER_WPT_VERBOSE=1` prints failing subtests),
 `cargo test -p aether --test script_oracle` (`AETHER_ORACLE_RECORD=1` re-records with Chromium), `tools/eyes/run.sh
 aether`.

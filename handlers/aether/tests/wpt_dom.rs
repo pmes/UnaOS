@@ -15,8 +15,9 @@
 //! Reported: pass/total of subtests over every `.html`/`.htm`/`.window.js` file of `dom/nodes`, and over
 //! "the subset Aether's surface covers" — the same files minus those that need a feature this binding
 //! does not have (listed with the reason in [`excluded`]). XML documents (`.xhtml`, `.svg`, `.xml`) are
-//! not run: Aether parses HTML only. Per-file results go to `target/wpt-dom-nodes.tsv`.
-//! `AETHER_WPT_ONLY=<substring>` runs matching files; `AETHER_WPT_VERBOSE=1` prints failing subtests.
+//! not run: Aether parses HTML only. Run it with `cargo test --release -p aether --test wpt_dom -- --nocapture`;
+//! a debug build skips it unless `AETHER_WPT=1` (or `AETHER_WPT_ONLY`) is set. Per-file results go to `target/wpt-dom-nodes.tsv`.
+//! `AETHER_WPT_ONLY=<a,b,…>` runs files whose names contain any of the substrings; `AETHER_WPT_VERBOSE=1` prints failing subtests.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -229,6 +230,12 @@ fn run_file(rt: &tokio::runtime::Runtime, port: u16, rel: &str) -> FileResult {
 
 #[test]
 fn wpt_dom_nodes() {
+    // The whole directory takes ~12 min in a release build; an unoptimized `cargo test -p aether` runs it
+    // only when asked (`AETHER_WPT=1`) or for a filtered subset.
+    if cfg!(debug_assertions) && std::env::var("AETHER_WPT").is_err() && std::env::var("AETHER_WPT_ONLY").is_err() {
+        println!("wpt dom/nodes: skipped in a debug build (run with --release, or set AETHER_WPT=1)");
+        return;
+    }
     let Some(root) = locate() else {
         println!("wpt dom/nodes: skipped (no checkout, offline)");
         return;
