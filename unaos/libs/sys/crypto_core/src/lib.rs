@@ -15,6 +15,7 @@
 //! | module | primitive | specification |
 //! |---|---|---|
 //! | [`sha2`] | SHA-224/256/384/512 | FIPS 180-4 |
+//! | [`sha1`] | SHA-1 (git object ids only — broken for collisions) | FIPS 180-4 |
 //! | [`hmac`] | HMAC over any [`Digest`] | RFC 2104 / FIPS 198-1 |
 //! | [`hkdf`] | HKDF extract/expand | RFC 5869 |
 //! | [`tls12_prf`] | the TLS 1.2 PRF (P_SHA256 / P_SHA384) | RFC 5246 §5 |
@@ -52,6 +53,7 @@ extern crate std;
 
 pub mod ct;
 pub mod sha2;
+pub mod sha1;
 pub mod hmac;
 pub mod hkdf;
 pub mod tls12_prf;
@@ -74,6 +76,7 @@ pub mod blake2b;
 pub mod argon2;
 pub mod drbg;
 
+pub use sha1::Sha1;
 pub use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 
 /// The one error type: what failed, never why in secret-dependent detail (an AEAD that fails to

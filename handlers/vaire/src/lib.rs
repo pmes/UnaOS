@@ -46,10 +46,9 @@ use gtk4::prelude::*;
 #[cfg(feature = "gtk")]
 use gtk4::{Align, Box, Label, Orientation, Widget};
 
-// Gix (Gitoxide) Imports
-use gix::discover;
-use gix::object::tree::diff::Action;
-use gix::object::tree::diff::Change;
+// GITCORE (SR59): UnaOS's own git — discovery, HEAD, status and tree diff.
+use git_core::diff::{self as gdiff, ObjectSource};
+use git_core::Repository;
 
 // UnaFS: the vault-probe rides its fail-closed mount check (read-only).
 use unafs::{FileDevice, UnaFS};
@@ -110,7 +109,7 @@ impl CrystalColor {
 /// The kind of managed unit a [`Bolt`] wraps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoltKind {
-    /// A Git repository (status via `gix`).
+    /// A Git repository (status via git_core, SR59).
     GitRepo,
     /// A UnaFS semantic vault (status via the fail-closed read-only mount probe).
     Vault,
@@ -244,23 +243,17 @@ impl Vaire {
     /// Inspect the repository discovered at (or above) `path`. Path-parameterized
     /// so callers — and tests — need not depend on the process working directory.
     pub fn look_at<P: AsRef<Path>>(path: P) -> Result<GitStatus> {
-        // 1. OPEN THE REPOSITORY (Finds .git automatically walking up)
-        let repo = discover(path).context("No repository found")?;
-        let head = repo.head()?;
+        // 1. OPEN THE REPOSITORY (finds .git walking up; linked worktrees and bare repos too)
+        let repo = Repository::discover(path).map_err(|e| anyhow::anyhow!("{e}")).context("No repository found")?;
+        let (branch, head) = repo.head().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let branch = branch.unwrap_or_else(|| "DETACHED".to_string());
+        let commit_id = head.context("Head has no commit")?;
+        let commit = commit_id.to_hex().chars().take(7).collect();
 
-        let branch = head
-            .referent_name()
-            .map(|n| n.as_bstr().to_string())
-            .unwrap_or_else(|| "DETACHED".to_string());
-
-        let commit_id = head.id().context("Head has no commit")?;
-        let commit = commit_id.to_hex().to_string().chars().take(7).collect();
-
-        // Real dirty check: gix compares the working tree against the index and
-        // the index against HEAD's tree. (Untracked files do not flip this,
-        // matching `git status` porcelain's tracked-change notion of "dirty".)
-        // This replaces the historical `false` stub — a documented lie.
-        let is_dirty = repo.is_dirty().context("dirty-state check failed")?;
+        // Real dirty check: the worktree against the index and the index against HEAD's tree.
+        // (Untracked files do not flip this, matching `git status` porcelain's tracked-change
+        // notion of "dirty".)
+        let is_dirty = repo.is_dirty().map_err(|e| anyhow::anyhow!("{e}")).context("dirty-state check failed")?;
 
         Ok(GitStatus {
             branch,
@@ -284,40 +277,30 @@ impl Vaire {
         }
     }
 
-    /// Generates a unified diff between two commits using pure-Rust gix.
+    /// The tree changes between two revisions (renames detected as `git diff` does), one line
+    /// per path, through git_core.
     fn get_diff(rev_a: &str, rev_b: &str) -> Result<String> {
-        let repo = discover(".")?;
-
-        // Resolve revisions to Objects -> Trees
-        let a = repo.rev_parse_single(rev_a.as_bytes())?;
-        let b = repo.rev_parse_single(rev_b.as_bytes())?;
-
-        let tree_a = a.object()?.peel_to_tree()?;
-        let tree_b = b.object()?.peel_to_tree()?;
+        let g = |e: git_core::Error| anyhow::anyhow!("{e}");
+        let repo = Repository::discover(".").map_err(g)?;
+        let tree_of = |rev: &str| -> Result<git_core::ObjectId> {
+            let id = repo.rev_parse(&format!("{rev}^{{tree}}")).map_err(g)?;
+            let _ = repo.read_object(&id).map_err(g)?;
+            Ok(id)
+        };
+        let (ta, tb) = (tree_of(rev_a)?, tree_of(rev_b)?);
+        let pairs = gdiff::tree_changes(&repo, Some(&ta), Some(&tb)).map_err(g)?;
+        let pairs = gdiff::detect_renames(&repo, pairs, &gdiff::RenameOptions::default()).map_err(g)?;
 
         let mut diff_payload = String::with_capacity(1024);
-
-        // Execute the pure-Rust tree diff provided by `gix`.
-        // We use tree_a.changes().for_each_to_obtain_tree(&tree_b, ...)
-        tree_a
-            .changes()?
-            .for_each_to_obtain_tree(&tree_b, |change| {
-                match change {
-                    Change::Addition { location, .. } => {
-                        diff_payload.push_str(&format!("+ Added: {:?}\n", location));
-                    }
-                    Change::Deletion { location, .. } => {
-                        diff_payload.push_str(&format!("- Deleted: {:?}\n", location));
-                    }
-                    Change::Modification { location, .. } => {
-                        diff_payload.push_str(&format!("~ Modified: {:?}\n", location));
-                    }
-                    Change::Rewrite { location, .. } => {
-                        diff_payload.push_str(&format!("* Rewritten: {:?}\n", location));
-                    }
-                }
-                Ok(Action::Continue(())) // infallible; gix 0.88 types the callback error as gix_error::Exn
-            })?;
+        for p in &pairs {
+            let path = |f: &Option<gdiff::FileSpec>| String::from_utf8_lossy(&f.as_ref().unwrap().path).into_owned();
+            match (&p.old, &p.new, p.rename_score) {
+                (None, Some(_), _) => diff_payload.push_str(&format!("+ Added: {:?}\n", path(&p.new))),
+                (Some(_), None, _) => diff_payload.push_str(&format!("- Deleted: {:?}\n", path(&p.old))),
+                (Some(_), Some(_), Some(_)) => diff_payload.push_str(&format!("* Rewritten: {:?}\n", path(&p.new))),
+                _ => diff_payload.push_str(&format!("~ Modified: {:?}\n", path(&p.new))),
+            }
+        }
 
         if diff_payload.is_empty() {
             diff_payload.push_str("No changes detected.");

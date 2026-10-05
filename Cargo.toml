@@ -36,6 +36,8 @@ members = [
     "unaos/libs/web/css_core",
     # HTTPCORE (SR51): the no_std HTTP client core (URL, HTTP/1.1, cookies, codings, h2) + its host transport.
     "unaos/libs/net/http_core",
+    # GITCORE (SR59): the no_std git core (objects, deflate encoder, packs, index, refs, diff, smart HTTP).
+    "unaos/libs/vcs/git_core",
 
     # INFERCORE (SR57): the no_std inference core (safetensors/ONNX readers, BERT tokenizer + encoder), zero deps.
     "unaos/libs/ml/infer_core",
