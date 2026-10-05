@@ -2625,7 +2625,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), #[cfg(feature = "netring3")] una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), // RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block. ⚠ SAME-LINE fold.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), // RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
         // so the dispatch match is byte-identical there and an unknown number falls to the default.
@@ -30071,4 +30071,53 @@ pub fn bus_notice_to(row: usize, body: &[u8]) -> i64 {
         return EAGAIN;
     }
     busx_reply_enqueue(row, 0, crate::bus::BUS_VERB_NOTICE, 0, body)
+}
+
+// LUMENUX (rmbp-ledger B348) — the ring-3 CLIPBOARD (`SYS_CLIP_SET` 63 / `SYS_CLIP_GET` 64), the two verbs
+// `video/clipboard.rs` named and did not build, fulfilled over its `set`/`get` (text only, CLIP_CAP, the
+// session-epoch ownership and its `[clip]` witnesses unchanged). The ownership question it left open is
+// answered here: only the program holding KEYBOARD FOCUS (`USER_INPUT_ACTIVE`, the WINX-7 router's word) may
+// set or read it, so a background program can neither overwrite nor sniff what the operator copied. The bytes
+// cross through a heap buffer, never a 4 KiB kernel-stack array (U7STK).
+fn clip_focus_ok() -> bool {
+    match crate::arch::x86_64::memory::current_slot() {
+        Some(slot) => USER_INPUT_ACTIVE.load(Ordering::Acquire) == slot as u64 + 1,
+        None => false,
+    }
+}
+
+/// `SYS_CLIP_SET(ptr, len) -> len / -errno`.
+fn sys_clip_set(ptr: u64, len: u64) -> i64 {
+    let n = len as usize;
+    if n > crate::video::clipboard::CLIP_CAP {
+        return EINVAL;
+    }
+    if !clip_focus_ok() {
+        return EACCES;
+    }
+    if n == 0 {
+        crate::video::clipboard::clear("ring3-set-empty");
+        return 0;
+    }
+    let mut b = alloc::vec![0u8; n];
+    if let Err(e) = copy_from_user(&mut b, ptr) {
+        return e;
+    }
+    if crate::video::clipboard::set(&b) { n as i64 } else { EINVAL }
+}
+
+/// `SYS_CLIP_GET(ptr, cap) -> len / -errno` (`-ERANGE` when `cap` is shorter than the content).
+fn sys_clip_get(ptr: u64, cap: u64) -> i64 {
+    if !clip_focus_ok() {
+        return EACCES;
+    }
+    let mut b = alloc::vec![0u8; crate::video::clipboard::CLIP_CAP];
+    let n = crate::video::clipboard::get(&mut b);
+    if n > cap as usize {
+        return una_abi::ERANGE;
+    }
+    match copy_to_user(ptr, &b[..n]) {
+        Ok(()) => n as i64,
+        Err(e) => e,
+    }
 }
