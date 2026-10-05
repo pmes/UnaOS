@@ -248,7 +248,7 @@ pub fn activate() -> bool {
              (the console's minimise disc would have no way back) — the bar is unaffected and follows",
             pw,
             ph,
-            wm::MAX_WINDOWS
+            super::wincap::dock_rows(pw, ph)
         );
         wm::WIN_NONE
     } else {

@@ -1629,7 +1629,7 @@ pub fn compose() -> bool {
     // CLOBBER-REPAIR — the dropdown's signature is a function of its rect and its content, so a
     // window that painted over the open menu changes nothing this test can see. The bar's and the
     // SHARD menu's condition, asked the same way: one bounded table scan, only while open.
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows = super::dock::ModelBuf::take(); // WINDOWCAP-2: a warm, growable model buffer
     let (_, clobbered) = wm::dock_scan(&mut rows, SLOT.rect());
     let sig = drop_sig(&s, r);
     if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(Some(r)) && !clobbered {

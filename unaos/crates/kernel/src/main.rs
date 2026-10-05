@@ -8498,7 +8498,7 @@ fn tegra_desk_furn() -> bool {
     // measured floor and not merely the first one that said no.
     serial_println!(
         "[deskfurn] floors panel={}x{}x{} stage={} rect={:?} table={} bar-was={} owned-was={} rows={}",
-        pw, ph, info.bytes_per_pixel, staged, rect, live, was_enabled, owned_before, wm::MAX_WINDOWS
+        pw, ph, info.bytes_per_pixel, staged, rect, live, was_enabled, owned_before, wm::slots()
     );
 
     if rect.is_none() {

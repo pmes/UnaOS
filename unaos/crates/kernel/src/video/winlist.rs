@@ -39,23 +39,24 @@ pub const ID_WIN_BASE: u32 = 0x200;
 pub const FIXED_ROWS: usize = 7;
 #[cfg(not(target_arch = "x86_64"))]
 pub const FIXED_ROWS: usize = 5;
-const CAP: usize = FIXED_ROWS + wm::MAX_WINDOWS;
+// WINDOWCAP-2: no `CAP` — the rows and their label bytes are growable (one row per live app window).
 
 struct Store {
-    rows: UnsafeCell<[MenuItem; CAP]>,
-    labels: UnsafeCell<[[u8; MENU_LABEL_MAX]; wm::MAX_WINDOWS]>,
+    rows: UnsafeCell<alloc::vec::Vec<MenuItem>>,
+    labels: UnsafeCell<alloc::vec::Vec<[u8; MENU_LABEL_MAX]>>,
 }
 // SAFETY: written only by `rebuild` from the bar's open path (task context); every reader runs on that same
 // input path after it, so a read never overlaps a write.
 unsafe impl Sync for Store {}
 const BLANK: MenuItem = MenuItem { id: 0, label: "", flags: 0 };
-static STORE: Store = Store { rows: UnsafeCell::new([BLANK; CAP]), labels: UnsafeCell::new([[0; MENU_LABEL_MAX]; wm::MAX_WINDOWS]) };
+static STORE: Store = Store { rows: UnsafeCell::new(alloc::vec::Vec::new()), labels: UnsafeCell::new(alloc::vec::Vec::new()) }; // WINDOWCAP-2: growable; `BLANK` kept for the type's zero row
+#[allow(dead_code)] const _BLANK_KEPT: MenuItem = BLANK;
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Show Desktop is holding windows down.
 static SD_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Bit `id-1` = window `id` was minimised by Show Desktop.
-static SD_MASK: AtomicU64 = AtomicU64::new(0);
+static SD_MASK: spin::Mutex<alloc::vec::Vec<wm::WinId>> = spin::Mutex::new(alloc::vec::Vec::new()); // WINDOWCAP-2: the ids Show Desktop moved (was a u64 bit per id)
 /// The owner that held focus when Show Desktop went down.
 static SD_FOCUS: AtomicU64 = AtomicU64::new(0);
 
@@ -66,9 +67,10 @@ pub fn desktop_hidden() -> bool {
 
 /// The rows the Window dropdown shows (as of the last [`rebuild`]).
 pub fn rows() -> &'static [MenuItem] {
-    let n = COUNT.load(Ordering::Acquire).min(CAP);
     // SAFETY: see `Store`.
-    unsafe { &(&*STORE.rows.get())[..n] }
+    let r = unsafe { &*STORE.rows.get() };
+    let n = COUNT.load(Ordering::Acquire).min(r.len());
+    &r[..n]
 }
 
 fn set_active(owner: u64) {
@@ -83,14 +85,15 @@ pub fn rebuild() {
     // SAFETY: see `Store`.
     let rows = unsafe { &mut *STORE.rows.get() };
     let labels = unsafe { &mut *STORE.labels.get() };
-    let mut wr = [wm::WlRow { id: 0, owner: 0, minimised: false, title: [0; wm::MAX_TITLE], len: 0 }; wm::MAX_WINDOWS];
+    let mut wr: alloc::vec::Vec<wm::WlRow> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let live = wm::wl_rows(&mut wr);
+    COUNT.store(0, Ordering::Release); rows.clear(); rows.reserve(FIXED_ROWS + live); labels.clear(); labels.resize(live, [0; MENU_LABEL_MAX]); // WINDOWCAP-2: sized BEFORE any label pointer is taken, so no row can point into a buffer a later push reallocated
     let foc = wm::wl_focused();
     let has_focus = foc.is_some();
     let dis = if has_focus { 0 } else { FLAG_DISABLED };
     let mut n = 0usize;
     let mut push = |id: u32, label: &'static str, flags: u32| {
-        rows[n] = MenuItem { id, label, flags };
+        rows.push(MenuItem { id, label, flags });
         n += 1;
     };
     push(ID_MINIMIZE, "Minimize", dis);
@@ -140,7 +143,7 @@ pub fn minimise_focused(route: &str) -> bool {
     serial_println!("[wm-act] minimise win={} owner={:#x} route={} -> settle={}", id, owner, route, settle);
     let parked = settle.starts_with("parked");
     if parked {
-        let mut ord = [wm::WIN_NONE; wm::MAX_WINDOWS];
+        let mut ord: alloc::vec::Vec<wm::WinId> = alloc::vec::Vec::new(); // WINDOWCAP-2
         if wm::cycle_order(&mut ord) > 0 && wm::wl_focus(ord[0]) {
             if let Some((_, o)) = wm::wl_focused() {
                 set_active(o);
@@ -155,31 +158,31 @@ pub fn minimise_focused(route: &str) -> bool {
 /// Show Desktop: minimise every live app window (remembering which), or — when it already did — raise those
 /// back and give focus to the window that had it. Returns how many windows moved.
 pub fn show_desktop_toggle() -> usize {
-    let mut wr = [wm::WlRow { id: 0, owner: 0, minimised: false, title: [0; wm::MAX_TITLE], len: 0 }; wm::MAX_WINDOWS];
+    let mut wr: alloc::vec::Vec<wm::WlRow> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let live = wm::wl_rows(&mut wr);
     let mut moved = 0usize;
     if !SD_ACTIVE.load(Ordering::Relaxed) {
-        let mut mask = 0u64;
+        let mut mask: alloc::vec::Vec<wm::WinId> = alloc::vec::Vec::new();
         for r in wr[..live].iter().filter(|r| !r.minimised) {
             if wm::minimise(r.id).starts_with("parked") {
-                mask |= 1u64 << (r.id - 1);
+                mask.push(r.id);
                 moved += 1;
             }
         }
         if moved > 0 {
             SD_FOCUS.store(wm::focus_asid(), Ordering::Relaxed);
-            SD_MASK.store(mask, Ordering::Relaxed);
+            *SD_MASK.lock() = mask;
             SD_ACTIVE.store(true, Ordering::Release);
             set_active(0);
         }
         serial_println!("[winlist] show-desktop hide moved={} live={}", moved, live);
     } else {
-        let mask = SD_MASK.swap(0, Ordering::Relaxed);
+        let mask = core::mem::take(&mut *SD_MASK.lock());
         SD_ACTIVE.store(false, Ordering::Release);
         let focus = SD_FOCUS.load(Ordering::Relaxed);
         let mut top = wm::WIN_NONE;
         for r in wr[..live].iter() {
-            if mask & (1u64 << (r.id - 1)) != 0 && r.minimised && wm::raise_one(r.id) {
+            if mask.contains(&r.id) && r.minimised && wm::raise_one(r.id) {
                 moved += 1;
                 if r.owner == focus || top == wm::WIN_NONE {
                     top = r.id;
@@ -235,7 +238,7 @@ pub fn pick(id: u32) {
             // Picking a window while Show Desktop holds the rest down leaves the rest down (macOS), but the
             // toggle is over: the next Show Desktop minimises again.
             SD_ACTIVE.store(false, Ordering::Release);
-            SD_MASK.store(0, Ordering::Relaxed);
+            SD_MASK.lock().clear();
             let ok = wm::wl_focus(win);
             if let Some((_, o)) = wm::wl_focused() {
                 set_active(o);
@@ -300,7 +303,7 @@ pub fn selftest() {
     };
     let opened = winmenu::press_at(bx, by) && winmenu::is_open();
     let nrows = rows().len();
-    let mut wr = [wm::WlRow { id: 0, owner: 0, minimised: false, title: [0; wm::MAX_TITLE], len: 0 }; wm::MAX_WINDOWS];
+    let mut wr: alloc::vec::Vec<wm::WlRow> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let live = wm::wl_rows(&mut wr);
     let rows_ok = nrows == FIXED_ROWS + live && live >= 2;
     let pick_second = match winmenu::wl_row_center(ID_WIN_BASE + idb) {

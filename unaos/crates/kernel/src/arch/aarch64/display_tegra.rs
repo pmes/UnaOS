@@ -2636,7 +2636,7 @@ pub fn orin_conwin() -> bool {
     //    WINDOW and nothing else, because the law's own justification is about ONE control on ONE
     //    window. Nothing else on this boot is withheld by it — there is no bar here to follow.
     if !dock_ok {
-        serial_println!("[orinconwin] DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} (the console's minimise disc would have no way back — dock::Layout::for_panel returns None when the strip will not fit at MAX_WINDOWS, and the check is made against MAX_WINDOWS rather than the live count because it must hold for every table state this boot can reach)", pw, ph, crate::video::wincap::dock_rows(pw, ph));
+        serial_println!("[orinconwin] DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} (the console's minimise disc would have no way back — WINDOWCAP-2: dock::Layout::for_panel overflows extra rows into a +k group, so only a panel too narrow for one tile declines)", pw, ph, crate::video::wincap::dock_rows(pw, ph));
         return false;
     }
 
@@ -3650,7 +3650,7 @@ fn lad_now_freq() -> (u64, u64) {
 #[cfg(feature = "orinladder")]
 fn lad_console_info() -> Option<crate::video::wm::WindowInfo> {
     use crate::video::wm;
-    for id in 1..=(wm::MAX_WINDOWS as wm::WinId) {
+    for id in 1..=(wm::slots() as wm::WinId) { // WINDOWCAP-2: every row the table has
         if let Some(i) = wm::info(id) {
             if i.owner_asid == wm::KERNEL_OWNER_CONSOLE {
                 return Some(i);
@@ -4157,7 +4157,7 @@ pub fn orin_ladder_arm() {
         .as_ref()
         .and_then(|i| wm::control_disc_rect(i.id, wm::Ctrl::Minimise));
     let strip = dock::strip_rect(pw, ph);
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows: alloc::vec::Vec<wm::DockEntry> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let (tiles, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
 
     // The tri-state seed. `None` leaves it at 0 (no row seen), which is exactly right.
@@ -4260,7 +4260,7 @@ pub fn orin_ladder_census(tick: u64) {
         if was == 1 && now_vis == 2 {
             // PARK. Ask the dock's tile model for the way back AT THE MOMENT OF THE PARK — the
             // answer is what §6.1's rule is about, and asking later would let a table change hide it.
-            let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+            let mut rows: alloc::vec::Vec<wm::DockEntry> = alloc::vec::Vec::new(); // WINDOWCAP-2
             let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
             let tiled = rows[..n].iter().any(|r| r.id == i.id);
             LAD_PARKS.fetch_add(1, Ordering::Relaxed);
@@ -4336,7 +4336,7 @@ pub fn orin_ladder_census(tick: u64) {
         }
     };
     let strip = dock::strip_rect(pw, ph);
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows: alloc::vec::Vec<wm::DockEntry> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let (tiles, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
     let tiled = info
         .as_ref()

@@ -15,34 +15,28 @@
 //! This module is the limit and nothing else: no table, no store. `wm::create_inner` and the ring-3
 //! `sys_spawn` ASK it; the tables stay theirs.
 //!
-//! ## The limit is derived, never written down
-//! `windows = min(mem, dock, ids)`, `procs = min(asids, mem, windows)`:
+//! ## The limit is derived, never written down — and memory is its only term (WINDOWCAP-2)
+//! `windows = mem`, `procs = min(asids, mem, windows)`:
 //!   * `mem`  — half the kernel heap free at arming ÷ the per-row kernel cost ([`WIN_COST`], [`PROC_COST`]).
-//!   * `dock` — the most APP tiles the dock can host on THIS panel beside its pins ([`DOCK_PINS`]),
-//!     asked of `dock::Layout::for_panel` live, so the dock checks hold for every table state the limit
-//!     admits (they read [`dock_rows`]).
-//!   * `ids`  — the compositor's id space (`wm::MAX_WINDOWS`) less [`SYS_ROWS`] kept for the system's own
-//!     rows (owner 0: the login screen, the notice that SAYS the limit, the compat row).
-//!   * `asids`— the ring-3 process table (`arch::syscall::proc_table_rows`, itself the address-space pool
-//!     less its 2-slot reserve).
+//!   * `asids`— the ring-3 process table (`arch::syscall::proc_table_rows`), itself the address-space pool
+//!     less its 2-slot reserve: a program needs an address space, and that pool is the VA layout's.
 //!
-//! Only APP rows count (`wm`'s `dock_addressable`: used, not compat, owner ≠ 0); a system row is never
-//! refused by the limit, which is what lets the notice open when the limit is hit.
+//! There is no id-space term (the compositor table is a heap `Vec` with segment-doubling side storage,
+//! `video::rowstore`; the only bound is the `WinId` type, `wm::WIN_ID_SENTINEL_FLOOR`) and no dock term
+//! (a panel's width bounds what the dock SHOWS — it overflows the rest into a `+<k>` group — never what
+//! may be OPEN). Only APP rows count (`wm`'s `dock_addressable`: used, not compat, owner ≠ 0); a system
+//! row is never refused by the limit, which is what lets the notice open when the limit is hit.
 //!
 //! ## Wire
-//! * `[wm] limit windows=<n> procs=<n> from=mem:<MiB>,asids:<n>,dock:<n>,ids:<n> (R90)` — once, at arming.
-//! * `[wm] REFUSED create reason=limit|ids n=<n> (R90)` / `[wm] REFUSED spawn reason=limit n=<n> (R90)`.
-//! * `:: WINDOWCAP: fixed_cap=<none|ids:N> limit=<n> procs=<n> opens_refused=<k> -> PASS|FAIL ::` — at the
-//!   desktop ignition (`boot::ignite`), an arming line (R80), not a test.
+//! * `[wm] limit windows=<n> procs=<n> from=mem:<MiB>,asids:<n> (R90)` — once, at arming.
+//! * `[wm] REFUSED create reason=limit|heap n=<n> (R90)` / `[wm] REFUSED spawn reason=limit n=<n> (R90)`.
+//! * `:: WINDOWCAP: fixed_cap=none limit=<n> procs=<n> opens_refused=<k> -> PASS|FAIL ::` — at the desktop
+//!   ignition (`boot::ignite`), an arming line (R80), not a test.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
-/// Id-space rows kept for the system's own (owner-0 / compat) rows: the login screen and its control
-/// row, the notice, and the compat row. The limit counts app rows only, so these always find a slot.
-pub const SYS_ROWS: usize = 4;
-
-/// The dock's pinned tiles (`dock::pins_applied`: shell, console, Quarry, pulse) — the dock draws the
-/// app rows PLUS these, so the dock term leaves room for all four.
+/// The dock's pinned tiles (`dock::pins_applied`: shell, console, Quarry, pulse) — the live dock row
+/// count is the app rows PLUS these.
 pub const DOCK_PINS: usize = 4;
 
 /// The largest window surface the ABI hands out (CRYSTAL-HD: 288x288 ARGB8888, both arches).
@@ -51,7 +45,7 @@ const SURFACE_MAX: usize = 288 * 288 * 4;
 const _: () = assert!(SURFACE_MAX == crate::arch::x86_64::memory::FB_WIN_SLOT_SIZE);
 
 /// Per-window kernel heap cost: the pacer's shadow and the pass's mirror of the largest surface
-/// (`wm::PACE_SHADOW` / `PACE_MIRROR`), plus a page for the row's side state.
+/// (`wm::PACE_SHADOW` / `PACE_MIRROR`), plus a page for the row and its `rowstore` side state.
 pub const WIN_COST: usize = 2 * SURFACE_MAX + 4096;
 
 /// Per-process kernel heap cost: a program owns a window, plus its kernel task stacks and handle state.
@@ -67,14 +61,6 @@ static SPAWNS_REFUSED: AtomicU64 = AtomicU64::new(0);
 static NOTICE_UP: AtomicBool = AtomicBool::new(false);
 /// The ring-3 spawner's pause, doubled per refusal (50 ms .. 1.6 s), reset by an admitted spawn.
 static SPAWN_BACKOFF_MS: AtomicU64 = AtomicU64::new(0);
-/// The last measured dock term (`usize::MAX` until a panel answers).
-static DOCK_LAST: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-/// The `ids` term.
-#[inline]
-pub fn ids_term() -> usize {
-    super::wm::MAX_WINDOWS.saturating_sub(SYS_ROWS).max(1)
-}
 
 /// The `asids` term (0 where this build has no process table).
 #[inline]
@@ -89,55 +75,6 @@ pub fn asids_term() -> usize {
     }
 }
 
-/// The `dock` term: the most app tiles the dock can host on the live panel beside its pins, or `None`
-/// when no panel is attached (or no dock is built) — the term is then absent, not zero.
-pub fn dock_term() -> Option<usize> {
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-    {
-        // `try_lock`, never `lock`: a caller may already hold `WRITER` (or another core's pass does);
-        // then the last answer stands (`DOCK_LAST`, `usize::MAX` = never measured = absent).
-        let fb = match super::WRITER.try_lock() {
-            Some(g) => *g,
-            None => {
-                let last = DOCK_LAST.load(Relaxed);
-                return if last == usize::MAX { None } else { Some(last) };
-            }
-        };
-        if !fb.is_ready() {
-            return None;
-        }
-        let info = fb.info();
-        let d = dock_term_for(info.width, info.height);
-        DOCK_LAST.store(d, Relaxed);
-        Some(d)
-    }
-    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-    {
-        None
-    }
-}
-
-/// The `dock` term for an explicit panel — for callers that already hold the geometry (and may hold
-/// `WRITER`, so must not re-take it).
-pub fn dock_term_for(pw: usize, ph: usize) -> usize {
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-    {
-        let mut n = super::wm::MAX_WINDOWS;
-        while n > DOCK_PINS {
-            if super::dock::Layout::for_panel(n, pw, ph).is_some() {
-                return n - DOCK_PINS;
-            }
-            n -= 1;
-        }
-        0
-    }
-    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-    {
-        let _ = (pw, ph);
-        super::wm::MAX_WINDOWS
-    }
-}
-
 /// Arm the memory term once (idempotent) and print the limit line. Takes the heap lock (through
 /// `allocator::heap_census`), so never call it from inside an allocation.
 pub fn arm() {
@@ -149,20 +86,12 @@ pub fn arm() {
     MEM_MIB.store(free >> 20, Relaxed);
     MEM_WIN.store((budget / WIN_COST).max(1), Relaxed);
     MEM_PROC.store((budget / PROC_COST).max(1), Relaxed);
-    let dock = dock_term();
-    let mut dbuf = [0u8; 8];
-    let dock_s = match dock {
-        Some(d) => fmt_usize(d, &mut dbuf),
-        None => "none",
-    };
     serial_println!(
-        "[wm] limit windows={} procs={} from=mem:{},asids:{},dock:{},ids:{} (R90)",
+        "[wm] limit windows={} procs={} from=mem:{},asids:{} (R90)",
         win_limit(),
         proc_limit(),
         free >> 20,
-        asids_term(),
-        dock_s,
-        ids_term()
+        asids_term()
     );
 }
 
@@ -179,16 +108,12 @@ fn fmt_usize(mut v: usize, buf: &mut [u8; 8]) -> &str {
     core::str::from_utf8(&buf[i..]).unwrap_or("?")
 }
 
-/// The live window limit: app rows `wm` admits. Arms on first use.
+/// The live window limit: app rows `wm` admits — memory, and the `WinId` type. Arms on first use.
 pub fn win_limit() -> usize {
     if !ARMED.load(Relaxed) {
         arm();
     }
-    let mut n = ids_term().min(MEM_WIN.load(Relaxed));
-    if let Some(d) = dock_term() {
-        n = n.min(d.max(1));
-    }
-    n.max(1)
+    MEM_WIN.load(Relaxed).min(super::wm::WIN_ID_SENTINEL_FLOOR as usize - 1).max(1)
 }
 
 /// The live process limit: ring-3 programs `sys_spawn` admits (never more than the window limit — every
@@ -201,27 +126,22 @@ pub fn proc_limit() -> usize {
     a.min(MEM_PROC.load(Relaxed)).min(win_limit()).max(1)
 }
 
-/// The dock row count every "can the dock host the full table" check asks, for the panel the caller
-/// holds: the app limit on that panel plus the pins, never past the id space. Parametric on the LIVE
-/// limit, so it holds for every table state `wm` admits. Takes no `WRITER` (the callers hold the panel).
-pub fn dock_rows(pw: usize, ph: usize) -> usize {
-    if !ARMED.load(Relaxed) {
-        arm();
-    }
-    let d = dock_term_for(pw, ph);
-    DOCK_LAST.store(d, Relaxed);
-    let apps = ids_term().min(MEM_WIN.load(Relaxed)).min(d.max(1));
-    (apps + DOCK_PINS).min(super::wm::MAX_WINDOWS)
+/// The LIVE dock row count — the app rows open now plus the pins — which every "can the dock host the
+/// strip" check asks (`desktop_uefi`, `desktop_firmware`, `quarry::live`, `main`, `display_tegra`). Since
+/// WINDOWCAP-2 the dock overflows into a `+<k>` group, so `for_panel` answers for ANY count a panel can
+/// show one tile for; the panel arguments are kept for the callers' shape.
+pub fn dock_rows(_pw: usize, _ph: usize) -> usize {
+    super::wm::live_window_count() + DOCK_PINS
 }
 
-/// `wm::create_inner` refused an app row (`ids == true`: the id space itself, not the limit). Called AFTER
+/// `wm::create_inner` refused an app row (`heap == true`: the table could not grow — the heap said no). Called AFTER
 /// the table lock drops. One wire line per refusal (the first 16, then every 64th), one notice per burst.
-pub fn note_open_refused(apps: usize, ids: bool) {
+pub fn note_open_refused(apps: usize, heap: bool) {
     let k = OPENS_REFUSED.fetch_add(1, Relaxed) + 1;
     if k <= 16 || k % 64 == 0 {
         serial_println!(
             "[wm] REFUSED create reason={} n={} refused={} (R90)",
-            if ids { "ids" } else { "limit" },
+            if heap { "heap" } else { "limit" },
             apps,
             k
         );
@@ -290,9 +210,9 @@ pub fn note_spawn_admitted() {
     }
 }
 
-/// M4 — the witness, printed once at the desktop ignition. `fixed_cap` names the term that binds when
-/// it is a compile-time width (`ids:N`) rather than the machine (`none`). PASS: the eleventh window fits
-/// (`limit >= 11`) and nothing has been refused yet.
+/// M4 — the witness, printed once at the desktop ignition. `fixed_cap=none`: the limit is memory's (no id
+/// space, no dock width, no constant). PASS: the eleventh window fits (`limit >= 11`) and nothing has been
+/// refused yet.
 pub fn witness() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Relaxed) {
@@ -300,15 +220,13 @@ pub fn witness() {
     }
     let limit = win_limit();
     let refused = OPENS_REFUSED.load(Relaxed);
-    let ids_bind = limit == ids_term();
-    let mut ib = [0u8; 8];
-    let ids_s = fmt_usize(ids_term(), &mut ib);
+    let mem_bound = limit == MEM_WIN.load(Relaxed);
     serial_println!(
-        ":: WINDOWCAP: fixed_cap={}{} limit={} procs={} opens_refused={} -> {} ::",
-        if ids_bind { "ids:" } else { "none" },
-        if ids_bind { ids_s } else { "" },
+        ":: WINDOWCAP: fixed_cap={} limit={} procs={} from=mem:{} opens_refused={} -> {} ::",
+        if mem_bound { "none" } else { "type:u32" },
         limit,
         proc_limit(),
+        MEM_MIB.load(Relaxed),
         refused,
         if limit >= 11 && refused == 0 { "PASS" } else { "FAIL" }
     );

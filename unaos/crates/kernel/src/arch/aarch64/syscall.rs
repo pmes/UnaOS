@@ -3591,7 +3591,7 @@ const _: () = {
     // background row occupied. `< USER_SLOTS` alone would have permitted 7, which satisfies the letter
     // of "leaves slots free" while starving exactly the two callers that need one.
     assert!(MAX_PROCS <= super::uslots::USER_SLOTS - 2, "MAX_PROCS must leave 2 EL0 slots free");
-    assert!(MAX_PROCS <= crate::video::wm::MAX_WINDOWS, "every bg program must be able to own a window");
+    assert!(MAX_PROCS <= WIN_MAX, "every bg program must be able to own a window"); // WINDOWCAP-2: against the EL0 window table (the compositor's has no width)
     // The KILL table, which is coupled to this one in the FAILURE direction: a row that can be killed
     // needs a slot to be killed through, or `bg_kill` arms nothing, falls back to PORPHANED and parks
     // the row — recoverable then only via KILLBOUND's narrower quiescence witness. `sched.rs` cannot
@@ -12277,7 +12277,7 @@ fn present_surface_common(
 /// follow it. What is load-bearing is the SAFE direction, asserted here exactly as the x86 twin
 /// asserts it: a region slot is indexed per address space and a window id is global, so a region
 /// slot index must never be able to exceed the global table.
-const WIN_MAX: usize = 8;
+const WIN_MAX: usize = super::uslots::USER_SLOTS * super::uslots::FB_WIN_SLOTS; // WINDOWCAP-2 (B378, R90) — no literal: every EL0 window lives in an address-space slot's FB region, so the EL0 table is exactly (slots x windows per slot) wide — the VA layout's count, as on x86
 const _: () = assert!(super::uslots::FB_WIN_SLOTS <= WIN_MAX);
 /// WC-B: a `FB_WIN_MAX_W` × `FB_WIN_MAX_H` ARGB8888 surface must fit a window's VA slot exactly.
 const _: () = assert!(
@@ -13334,7 +13334,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
 /// feature gate — so it is armed in every leg that compiles this file, and so the knob-off byte-identity
 /// rule does not reach it: that rule protects "arming a knob does not change the knob-off image", and this
 /// is not a knob (SINKVALID's ruling one commit ago, same file, same reasoning).
-fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
+fn focus_ring_apps(out: &mut alloc::vec::Vec<u64>) -> usize { // WINDOWCAP-2: a growable ring
     let n = crate::video::wm::focus_ring(out);
     let mut k = 0usize;
     for i in 0..n {
@@ -13405,7 +13405,7 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // ahead of the only `TABLE` acquisition — `focus_ring_apps` filters the result of that same call
     // and takes no lock of its own — so the token's meaning is unchanged.
     crate::wedge2::mark("<F1>");
-    let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
+    let mut ring: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let n = focus_ring_apps(&mut ring);
     let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     // BGRUN-1 GUARD REWRITE (supersedes WC-TAB's shared `n < 2`, deliberately). The old guard was
@@ -13796,7 +13796,7 @@ pub fn tabring_selftest() {
     // The BASELINE ring, read before a single row is minted: what the table already held is what the
     // teardown must hand back, and it is also what stops the leak sweep below from convicting a real
     // console row this fixture never created.
-    let mut base = [0u64; wm::MAX_WINDOWS];
+    let mut base: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let nbase = wm::focus_ring(&mut base);
 
     // INTERLEAVED on purpose — app, band, app, band. `focus_ring` is in WINDOW-ID order and ids
@@ -13818,7 +13818,7 @@ pub fn tabring_selftest() {
     }
 
     // ---- leg 1: the raw ring really carries the band (the positive control) -------------------
-    let mut raw = [0u64; wm::MAX_WINDOWS];
+    let mut raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let nraw = wm::focus_ring(&mut raw);
     let rawband_ok = raw[..nraw].contains(&band_a)
         && raw[..nraw].contains(&band_b)
@@ -13826,15 +13826,15 @@ pub fn tabring_selftest() {
         && raw[..nraw].contains(&APP_B);
 
     // ---- leg 2: the filter is exactly the draining subset, in order ---------------------------
-    let mut want = [0u64; wm::MAX_WINDOWS];
+    let mut want: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let mut wn = 0usize;
     for i in 0..nraw {
         if key_sink_drains(raw[i]) {
-            want[wn] = raw[i];
+            want.push(raw[i]);
             wn += 1;
         }
     }
-    let mut apps = [0u64; wm::MAX_WINDOWS];
+    let mut apps: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let n = focus_ring_apps(&mut apps);
     let filter_ok = n == wn
         && apps[..n] == want[..wn]
@@ -13848,7 +13848,7 @@ pub fn tabring_selftest() {
     // real focus-to-shell leaves — this fixture must exercise the primitive, not tiptoe around it.
     user_input_set_active(0);
     let presses = n + 1;
-    let mut seq = [0u64; wm::MAX_WINDOWS + 1];
+    let mut seq = alloc::vec![0u64; presses]; // WINDOWCAP-2
     let mut consume_ok = true;
     let mut skip_ok = true;
     for slot in seq[..presses].iter_mut() {
@@ -13872,7 +13872,7 @@ pub fn tabring_selftest() {
     user_input_set_active(APP_A);
     wm::close(wa);
     wm::close(wb);
-    let mut after = [0u64; wm::MAX_WINDOWS];
+    let mut after: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let n_after = focus_ring_apps(&mut after);
     // The claim is a PROPERTY, not a position: it must MOVE, and it must land somewhere that drains.
     // Re-deriving the destination here would only restate the code under test. `n/a` when a row this
@@ -13934,7 +13934,7 @@ pub fn tabring_selftest() {
     }
     // LEAK GUARD, against the BASELINE and not against emptiness: a row this fixture minted must not
     // outlive it, and a row it found must not have been reaped by it. Either direction is a FAIL.
-    let mut end = [0u64; wm::MAX_WINDOWS];
+    let mut end: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let nend = wm::focus_ring(&mut end);
     let mut leak = false;
     for a in [APP_A, APP_B, band_a, band_b] {
@@ -14377,7 +14377,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                         );
                     }
                     hops += 1;
-                    if settle != "noproc-selftest" || hops >= crate::video::wm::MAX_WINDOWS {
+                    if settle != "noproc-selftest" || hops >= crate::video::wm::slots().max(1) { // WINDOWCAP-2: each hop removes a row, so the live table bounds it
                         break;
                     }
                     match crate::video::wm::hit_test(x, y) {
