@@ -63,3 +63,32 @@ Viewer wire: `[facet] anim path= frames= loop= w= h= decoder=pixel_core k=` on o
   frame 0" has nothing to bind to; whoever adds thumbnails calls `decode_first_frame`.
 * The wallpaper's PNG path is the streaming IDAT decoder: for an APNG whose IDAT is NOT frame 0 (no
   fcTL before it) the wallpaper shows the IDAT, not the first fdAT frame. Frame 0 of every other case.
+
+## Results
+
+* `cargo test --release -p pixel_core`: every suite ok (anim_kat 7, facetanim_kat 6, the rest
+  unchanged). `facetanim_kat`, all vectors fetched (`fetch-vectors.sh`, 301 files):
+
+  | set | files | animated | frames byte-equal to `decode` |
+  |---|---|---|---|
+  | ANIMWEBP oracle corpus (`anim_digests.txt`) | 66 decoded (2 refused by both faces) | 66 | 389 |
+  | `gif/*.gif` | 42 | 13 | 79 |
+  | `apng/*.png` | 52 | 38 | 253 |
+  | `anim/*.webp` | 14 | 14 | 136 |
+  | `webp/*.webp`, `pngsuite/*.png` | 19 + 103 | 0 | 122 |
+
+  Every frame of the stream equals `decode`'s frame, two passes (`rewind`), `buffers_held() <= 2`.
+  `chromium_pinned_animations` (the 68 Chromium-pinned digests) still passes on the refactored
+  compositors, and the refactored `decode` was diffed against the pre-refactor one (the merge tip,
+  built side by side): 306 of 306 vector and fixture files identical (pixels, frames, delays, loop
+  counts, refusal reasons).
+* Hand-built GIFs: disposal 3 holds the second buffer only while that frame is up; disposal 2; a
+  one-frame GIF is a still; a descriptor cut off after frame 0 — `decode` refuses the file (as before),
+  the stream shows frame 0 and then reports `Truncated`, `decode_first_frame` answers frame 0.
+* The three fixtures: generator output == committed bytes; frame 0 confirmed by the `image` crate.
+
+## Merge note
+
+`exec-rmbp-merge13` merged clean. One red in a file this arc does not own: `libs/gneiss_pal/src/dsp/mod.rs`
+carried `pub mod image;` twice (the keep-both fold of host-merge1 + merge13) — `cargo check -p gneiss_pal`
+failed E0428. Smallest fix: the second declaration (and its doc line) dropped.
