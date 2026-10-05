@@ -2791,29 +2791,29 @@ impl MathParser<'_> {
 fn apply_display(value: &str, style: &mut SpecifiedStyle) {
     match value {
         "none" => style.display = Some(Display::None),
-            // Real flex containers: CSS flex semantics (see fold_into).
-            "flex" | "inline-flex" | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex"
-            | "-webkit-inline-flex" | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(true);
-                style.paint.flex_container = Some(true);
-            }
-            // Column-flex approximations of block-ish display types.
-            "block" | "inline-block" | "inline" | "list-item"
-            | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
-            | "table-header-group" | "table-footer-group" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(false);
-                style.paint.flex_container = Some(false);
-            }
-            "table-row" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(false);
-                style.flex_direction = Some(FlexDirection::Row);
-            }
-            "inherit" | "initial" | "unset" | "revert" => {}
-            other => crate::ledger::record_css(&format!("display:{}", other)),
-            }
+        // Real flex containers: CSS flex semantics (see fold_into).
+        "flex" | "inline-flex" | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex"
+        | "-webkit-inline-flex" | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
+            style.display = Some(Display::Flex);
+            style.flex_container = Some(true);
+            style.paint.flex_container = Some(true);
+        }
+        // Column-flex approximations of block-ish display types.
+        "block" | "inline-block" | "inline" | "list-item"
+        | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
+        | "table-header-group" | "table-footer-group" => {
+            style.display = Some(Display::Flex);
+            style.flex_container = Some(false);
+            style.paint.flex_container = Some(false);
+        }
+        "table-row" => {
+            style.display = Some(Display::Flex);
+            style.flex_container = Some(false);
+            style.flex_direction = Some(FlexDirection::Row);
+        }
+        "inherit" | "initial" | "unset" | "revert" => {}
+        other => crate::ledger::record_css(&format!("display:{}", other)),
+    }
 }
 
 /// border-style keyword -> paint code (0 solid, 1 dashed, 2 dotted,
