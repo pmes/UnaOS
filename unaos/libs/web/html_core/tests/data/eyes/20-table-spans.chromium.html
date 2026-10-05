@@ -1,0 +1,27 @@
+<html><head><meta charset="utf-8"><title>Table spans</title>
+<style>
+body { font-family: sans-serif; font-size: 14px; margin: 20px; }
+table { border-collapse: collapse; margin-bottom: 16px; }
+td, th { border: 1px solid #888; padding: 4px 8px; }
+th { background: #dde; }
+.span { background: #fde2c8; }
+.narrow { width: 220px; }
+.fixed { table-layout: fixed; width: 400px; }
+</style></head><body>
+<table>
+<tbody><tr><th>Group</th><th>Item</th><th>Qty</th></tr>
+<tr><td class="span" rowspan="3">Fruit</td><td>Apple</td><td>3</td></tr>
+<tr><td>Banana</td><td>12</td></tr>
+<tr><td>Cherry</td><td>40</td></tr>
+<tr><td class="span" rowspan="2">Veg</td><td>Leek</td><td>1</td></tr>
+<tr><td>Onion</td><td>5</td></tr>
+</tbody></table>
+<table class="narrow">
+<tbody><tr><td>Supercalifragilistic</td><td>short words that can wrap freely here</td></tr>
+</tbody></table>
+<table class="fixed">
+<tbody><tr><td style="width:60px">60px</td><td>rest shared</td><td>equally</td></tr>
+<tr><td>a</td><td>a much longer cell that must wrap inside its fixed column</td><td>c</td></tr>
+</tbody></table>
+
+</body></html>

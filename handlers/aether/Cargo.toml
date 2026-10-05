@@ -40,8 +40,10 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 url = "2.5"
-font-kit = "0.14"
-pathfinder_geometry = "0.5"
+# AETHERFONT (SR61): text is UnaOS's own font_core (FONTCORE + FONTBIDI): font-kit + pathfinder_geometry are gone.
+font_core = { path = "../../unaos/libs/text/font_core" }
+# AETHERFONT: WOFF 1.0 tables inflate through PIXELCORE's zlib (in-tree).
+pixel_core = { path = "../../unaos/libs/media/pixel_core" }
 base64 = "0.23"
 resvg = { version = "0.48.1", optional = true }  # EYES bumped to latest stable (R83); PIXELCORE keeps it behind `svg`
 # HTTPCORE (SR51): tokio-tungstenite deleted — no live caller (api/websockets.rs is a stub); an RFC 6455 client is owed.

@@ -37,6 +37,7 @@ pub mod glyf;
 pub mod grapheme;
 pub mod layout;
 pub mod linebreak;
+pub mod name;
 pub mod normalize;
 pub mod ot;
 pub mod path;
