@@ -43,6 +43,8 @@ pub mod loose;
 pub mod refs;
 pub mod config;
 pub mod ignore;
+pub mod delta;
+pub mod pack;
 
 pub use hash::{HashKind, ObjectId};
 pub use object::{Kind, Commit, Tag, Tree, TreeEntry, Signature};
