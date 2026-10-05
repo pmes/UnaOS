@@ -16,7 +16,7 @@
 //! | WebP | RFC 9649 — the VP8L lossless bitstream; lossy VP8 + ALPH through `vp8_core` (RFC 6386) | [`webp`] |
 //!
 //! Output is always straight (non-premultiplied) 8-bit RGBA, row-major, top-down. Animated formats
-//! (GIF) additionally carry every fully composited canvas in [`Image::frames`].
+//! (GIF, animated WebP, APNG) additionally carry every fully composited canvas in [`Image::frames`].
 //!
 //! `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, no dependencies: the kernel links this crate by
 //! path (its `video/png.rs` and `selfhost/inflate.rs` are re-exports of [`png::encode`] and [`inflate`]),
@@ -57,7 +57,8 @@ pub struct Image {
     pub height: u32,
     /// `width * height * 4` straight RGBA bytes (for an animation: the FIRST composited frame).
     pub rgba: Vec<u8>,
-    /// Every composited frame of an animation (GIF with more than one frame), else `None`.
+    /// Every composited frame of an animation (GIF, animated WebP or APNG with more than one frame),
+    /// else `None`.
     pub frames: Option<Vec<Frame>>,
     /// Animation loop count: `Some(0)` = loop forever (NETSCAPE2.0 with count 0), `Some(n)` = play
     /// `n` extra times, `None` = no loop extension (play once). Always `None` for stills.
@@ -220,6 +221,34 @@ impl Image {
             core::mem::swap(&mut self.width, &mut self.height);
         }
         self.orientation = 1;
+    }
+}
+
+/// Integer non-premultiplied `src-over` of one straight-RGBA pixel onto another — libwebp
+/// `anim_decode.c` `BlendPixelNonPremult` and Blink `ImageFrame::BlendSrcOverDstRaw`, bit for bit:
+/// `dst_factor = dst_a * (256 - src_a) >> 8`, `out_a = src_a + dst_factor`, each colour channel
+/// `(src * src_a + dst * dst_factor) * floor(2^24 / out_a) >> 24`. A fully transparent source leaves
+/// the destination as it is. Shared by animated WebP (`ANMF` blend) and APNG (`APNG_BLEND_OP_OVER`).
+pub fn blend_nonpremult(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+    let sa = src[3] as u32;
+    if sa == 0 {
+        return dst;
+    }
+    let dfa = (dst[3] as u32 * (256 - sa)) >> 8;
+    let ba = sa + dfa;
+    let scale = (1u32 << 24) / ba;
+    let ch = |s: u8, d: u8| (((s as u32 * sa + d as u32 * dfa) as u64 * scale as u64) >> 24) as u8;
+    [ch(src[0], dst[0]), ch(src[1], dst[1]), ch(src[2], dst[2]), ba as u8]
+}
+
+/// Map a "number of plays" field (APNG `num_plays`, WebP ANIM `Loop Count`: 0 = forever) onto
+/// [`Image::loop_count`]'s GIF meaning (extra repetitions, `Some(0)` = forever) the way Blink does:
+/// 0 -> forever, 1 -> play once (`None`), n -> `n - 1` repetitions.
+pub(crate) fn loop_from_plays(plays: u32) -> Option<u16> {
+    match plays {
+        0 => Some(0),
+        1 => None,
+        n => Some((n - 1).min(u16::MAX as u32) as u16),
     }
 }
 

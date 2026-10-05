@@ -116,3 +116,20 @@ pub fn decode_key_frame(data: &[u8]) -> Result<Yuv420> {
     let pic = d.decode(data)?.ok_or(Error::Malformed("vp8: key frame not shown"))?;
     Ok(Yuv420::from_picture(&pic))
 }
+
+/// [`decode_key_frame`] under libwebp's contract (ANIMWEBP): a frame whose partition 0 or token
+/// partition runs out before the last macroblock is refused as [`Error::Truncated`], as libwebp
+/// refuses it ("Premature end-of-file encountered") and Blink then fails that WebP image or frame.
+pub fn decode_key_frame_strict(data: &[u8]) -> Result<Yuv420> {
+    let tag = parse_tag(data)?;
+    if !tag.key_frame {
+        return Err(Error::Malformed("vp8: not a key frame"));
+    }
+    let mut d = Decoder::new();
+    let pic = d.decode(data)?.ok_or(Error::Malformed("vp8: key frame not shown"))?;
+    let yuv = Yuv420::from_picture(&pic);
+    if d.overran() {
+        return Err(Error::Truncated);
+    }
+    Ok(yuv)
+}

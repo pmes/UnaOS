@@ -1,0 +1,19 @@
+# ANIMWEBP pinned animations: <vector> <WxH> <frames> <loop: inf | extra plays> <delays ms> <crc32 of every frame>
+# or <vector> REFUSED. Pinned only when oracle/chromium-anim-raw.cjs + pixel-check --compare-raw scored every frame
+# max_abs_diff=0 (and frame count, loop count, delays equal Chromium's). Regenerate: pixel-check --anim-digest.
+anim/count-down-color-test.webp 315x236 74 inf 960,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40,40 1b4356b7
+anim/invalid-animated-webp.webp REFUSED
+anim/invalid-animated-webp2.webp 640x400 7 inf 500,500,500,500,500,500,500 bb2a51a9
+anim/invalid-animated-webp3.webp REFUSED
+anim/invalid-animated-webp4.webp 32x32 2 inf 200,200 0b1e13e7
+anim/random_lossless.webp 64x63 3 inf 100,100,100 caa373eb
+anim/random_lossy.webp 99x87 4 inf 150,150,150,150 c2d1bdcb
+anim/webp-animated-icc-xmp.webp 60x29 13 31999 20,20,20,20,20,20,20,20,20,20,20,20,20 5c3c5f6a
+anim/webp-animated-large.webp 500x500 8 inf 30,30,30,30,30,30,30,30 09bbf9b1
+anim/webp-animated-no-blend.webp 94x87 4 inf 1000,1000,1000,1000 1e2a14b1
+anim/webp-animated-opaque.webp 94x87 4 inf 1000,1000,1000,1000 6aa4fe81
+anim/webp-animated-semitransparent1.webp 624x624 4 0 500,500,500,500 efe7351e
+anim/webp-animated-semitransparent2.webp 512x512 2 0 300,300 f2388135
+anim/webp-animated-semitransparent3.webp 624x624 4 0 500,500,500,500 b5095be9
+anim/webp-animated-semitransparent4.webp 400x400 4 0 1500,500,500,500 e926566d
+anim/webp-animated.webp 11x29 3 inf 1000,500,1000 8968c397

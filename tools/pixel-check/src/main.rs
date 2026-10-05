@@ -10,6 +10,8 @@
 //!                                            I420 Chromium's decoder produced (vp8_core/oracle/webp-raw.cjs)
 //! pixel-check --digest [--orient] <in>...   CRC-32 of the decoded RGBA (the tests' pinned KAT digest)
 //! pixel-check --frames <in> <dir>            write every composited animation frame as <dir>/fNNN.png
+//! pixel-check --anim-digest <in>...          ANIMWEBP: one `tests/anim_digests.txt` line per file — WxH,
+//!                                            frame count, loop count, per-frame delays, CRC-32 of every frame
 //! pixel-check --compare <in> <shot.png> <r,g,b> [--orient] [--frame N]
 //!                                            composite pixel_core's RGBA over the background r,g,b and
 //!                                            score it against a 1:1 Chromium screenshot of the same
@@ -112,6 +114,9 @@ fn run(args: &[String]) -> Result<(), String> {
             };
             let base = std::path::Path::new(input).file_name().unwrap().to_string_lossy().into_owned();
             let (mut exact_frames, mut maxd, mut diff_bytes, mut total) = (0usize, 0u8, 0usize, 0usize);
+            // ANIMWEBP: the SR44 bar is split — exact where Chromium's pixel is opaque, within 1 where
+            // it is translucent — so the two maxima are reported apart.
+            let (mut max_opaque, mut max_translucent) = (0u8, 0u8);
             let mut theirs_n = 0;
             while std::path::Path::new(&format!("{dir}/{base}.f{theirs_n:03}.rgba")).exists() {
                 theirs_n += 1;
@@ -131,6 +136,11 @@ fn run(args: &[String]) -> Result<(), String> {
                         let dd = p[c].abs_diff(q[c]);
                         maxd = maxd.max(dd);
                         fd += (dd != 0) as usize;
+                        if q[3] == 255 {
+                            max_opaque = max_opaque.max(dd);
+                        } else {
+                            max_translucent = max_translucent.max(dd);
+                        }
                     }
                     total += 4;
                 }
@@ -138,7 +148,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 exact_frames += (fd == 0) as usize;
             }
             println!(
-                "{input} {}x{} frames ours={} chromium={} exact_frames={} max_abs_diff={maxd} exact={:.3}%",
+                "{input} {}x{} frames ours={} chromium={} exact_frames={} max_abs_diff={maxd} opaque_max={max_opaque} translucent_max={max_translucent} exact={:.3}%",
                 img.width,
                 img.height,
                 frames.len(),
@@ -189,6 +199,25 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                     Err(e) => println!("{e} ERR"),
                 }
+            }
+            Ok(())
+        }
+        Some("--anim-digest") => {
+            // ANIMWEBP: the animation pin — geometry, frame count, Blink-style repetition count
+            // (`inf` = forever, else extra plays; 0 = play once), per-frame delays, and the CRC-32 of
+            // every composited frame concatenated (the same digest `--digest` prints).
+            for input in &args[1..] {
+                let img = decode(input)?;
+                let frames = img.frames.clone().unwrap_or_else(|| vec![pixel_core::Frame { delay_ms: 0, rgba: img.rgba.clone() }]);
+                let mut c = pixel_core::crc::Crc32::new();
+                frames.iter().for_each(|f| c.update(&f.rgba));
+                let lp = match img.loop_count {
+                    Some(0) => "inf".to_string(),
+                    Some(n) => n.to_string(),
+                    None => "0".to_string(),
+                };
+                let delays: Vec<String> = frames.iter().map(|f| f.delay_ms.to_string()).collect();
+                println!("{input} {}x{} {} {lp} {} {:08x}", img.width, img.height, frames.len(), delays.join(","), c.finish());
             }
             Ok(())
         }

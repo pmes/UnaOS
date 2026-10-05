@@ -7,6 +7,11 @@
 //! role of the spec's two-byte `value` compared against `split << 8` (the comparison only ever looks
 //! at the high byte, so a wider window is the same arithmetic with fewer refills). Reading past the
 //! end of the partition feeds zero bytes, as the reference decoder does.
+//!
+//! [`BoolDecoder::eof`] (ANIMWEBP) records libwebp's `eof_`: set the first time a read needs a byte
+//! the partition does not have (fewer than 8 real bits left in the window at the start of a read),
+//! or at once for an empty partition. libvpx ignores it; libwebp turns it into "Premature end-of-file"
+//! — `decode_key_frame_strict` is that WebP contract.
 
 pub struct BoolDecoder<'a> {
     data: &'a [u8],
@@ -14,11 +19,12 @@ pub struct BoolDecoder<'a> {
     value: u64,
     bits: i32,
     range: u32,
+    eof: bool,
 }
 
 impl<'a> BoolDecoder<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        let mut d = BoolDecoder { data, pos: 0, value: 0, bits: 0, range: 255 };
+        let mut d = BoolDecoder { data, pos: 0, value: 0, bits: 0, range: 255, eof: data.is_empty() };
         d.fill();
         d
     }
@@ -40,6 +46,10 @@ impl<'a> BoolDecoder<'a> {
         if self.bits < 8 {
             self.fill();
         }
+        // libwebp's `bits_ < 0` load point with no byte left: the zero padding is about to be read.
+        if self.bits - 8 * (self.pos.saturating_sub(self.data.len()) as i32) < 8 {
+            self.eof = true;
+        }
         let big = (split as u64) << 56;
         let bit = if self.value >= big {
             self.range -= split;
@@ -54,6 +64,11 @@ impl<'a> BoolDecoder<'a> {
         self.value <<= shift;
         self.bits -= shift as i32;
         bit
+    }
+
+    /// Whether any read so far reached past the end of the partition (libwebp's `eof_`).
+    pub fn eof(&self) -> bool {
+        self.eof
     }
 
     #[inline]

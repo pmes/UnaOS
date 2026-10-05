@@ -205,6 +205,8 @@ pub struct Decoder {
     altref: usize,
     shown: usize,
     sign_bias: [bool; 4],
+    /// The last decoded frame read past the end of partition 0 or of a token partition.
+    overran: bool,
 }
 
 impl Default for Decoder {
@@ -276,7 +278,15 @@ impl Decoder {
             altref: NO_BUF,
             shown: NO_BUF,
             sign_bias: [false; 4],
+            overran: false,
         }
+    }
+
+    /// Whether the last [`Decoder::decode`] read past the end of partition 0 or of a token
+    /// partition (zero padding stood in for the missing bytes). A video decoder (libvpx) carries
+    /// on; libwebp calls the same condition "Premature end-of-file" and refuses the image.
+    pub fn overran(&self) -> bool {
+        self.overran
     }
 
     /// Forget every reference (after a seek: the next frame must be a key frame).
@@ -352,6 +362,7 @@ impl Decoder {
         let cur = self.free_buffer();
         let mut fb = core::mem::take(&mut self.bufs[cur]);
         let lf = self.decode_macroblocks(&mut bd, &mut parts, &h, tag.version, &mut fb);
+        self.overran = bd.eof() || parts.iter().any(|p| p.eof());
         if h.filter_level > 0 {
             self.loop_filter(&mut fb, &h, &lf);
         }
