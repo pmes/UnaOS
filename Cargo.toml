@@ -30,6 +30,7 @@ members = [
     # "handlers/vug",
     "tools/vertex",
     "tools/play-check",
+    "tools/aethervideo-check",
     "tools/unafs",
     "tools/una-card",
     "tools/unafs_bench",

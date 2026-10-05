@@ -45,6 +45,10 @@ fn coalesce(batch: Vec<SMessage>) -> Vec<SMessage> {
 
 fn main() {
     let synapse = Synapse::new();
+    // Stria's media service on the shell's bus: it answers the engine's `MediaPoster` /
+    // `PlayMedia` / ... with `MediaOpened` / `MediaFrame` / `MediaEnded` / `MediaError`
+    // (AETHERVIDEO, LEDGER SR39). Kept alive for the life of the process.
+    let _stria_media = stria::media_bus::MediaService::spawn(synapse.clone(), 60, true);
     
     let engine_tx = synapse.clone();
     let mut engine_rx = synapse.subscribe();
@@ -164,11 +168,14 @@ fn main() {
                                 SMessage::BrowserClick(x, y) => {
                                     engine.handle_event(aether::api::events::Event::MouseDown(x, y));
                                     engine.handle_event(aether::api::events::Event::MouseUp(x, y));
-                                    // A media-element click stages a play request:
-                                    // hand the page's own stream to Stria.
-                                    if let Some((url, title, mime)) = engine.take_pending_media() {
-                                        engine_tx.fire(SMessage::PlayMedia { url, title, mime });
-                                    }
+                                }
+                                // Stria's replies for the page's <video>/<audio>: a frame
+                                // marks its box damaged; the next tick paints and blits it.
+                                ref m @ (SMessage::MediaOpened { .. }
+                                | SMessage::MediaFrame { .. }
+                                | SMessage::MediaEnded { .. }
+                                | SMessage::MediaError { .. }) => {
+                                    engine.on_media_message(m);
                                 }
                                 SMessage::BrowserResize(w, h) => {
                                     engine.handle_event(aether::api::events::Event::Resize(w, h));
@@ -206,6 +213,11 @@ fn main() {
                             }
                         }
                     }
+                }
+                // Media requests the turn queued (posters on load, play/pause on a click,
+                // stops on navigation) go to Stria — the page's own streams, no site code.
+                for req in engine.take_media_requests() {
+                    engine_tx.fire(req);
                 }
                 // One choke point for the address bar: whatever the last turn
                 // of the loop did — link click, form submit, Back, Forward,

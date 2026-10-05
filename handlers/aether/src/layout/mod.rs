@@ -56,6 +56,12 @@ pub struct PaintStyle {
     /// remeasure walks it down the box tree and turns it into the flex
     /// alignment of each descendant's own formatting context.
     pub text_align: Option<u8>,
+    /// object-fit (replaced content: `<video>` frames and posters, see `media::object_fit_rect`):
+    /// 0 fill, 1 contain, 2 cover, 3 none, 4 scale-down. None = the element's default
+    /// (contain for video).
+    pub object_fit: Option<u8>,
+    /// object-position, as written.
+    pub object_position: Option<String>,
 }
 
 pub struct LayoutTree {
@@ -156,6 +162,7 @@ fn is_inline(name: &str) -> bool {
         name,
         "a" | "span" | "b" | "strong" | "i" | "em" | "u" | "s" | "code" | "small" | "big"
             | "sup" | "sub" | "label" | "abbr" | "cite" | "q" | "time" | "img" | "wbr" | "br"
+            | "video" | "audio"
             | "td" | "th" | "button" | "input" | "select"
     )
 }
@@ -291,19 +298,28 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             {
                 return None;
             }
+            // <audio> without `controls` is display:none in the UA sheet.
+            if el.name.local.as_ref() == "audio" && attrs.get("controls").is_none() {
+                return None;
+            }
         } else if dom_node.as_text().is_some() {
             // Whitespace-only text produces no box.
             if dom_node.text_contents().trim().is_empty() {
                 return None;
             }
         }
+        // <video>/<audio> are replaced elements: their <source>/<track>
+        // children and fallback content never render.
+        let replaced_media = dom_node
+            .as_element()
+            .is_some_and(|el| matches!(el.name.local.as_ref(), "video" | "audio"));
 
         // A <select> keeps its box but not its options: publish the selected
         // option onto the element so the control paints/submits a value.
         publish_select_value(dom_node);
 
         let mut kids: Vec<(taffy::NodeId, bool)> = Vec::new();
-        for child in dom_node.children() {
+        for child in dom_node.children().filter(|_| !replaced_media) {
             if let Some(id) = build_taffy_tree(&child, taffy, node_map, paint_map, quirks) {
                 kids.push((id, is_inline_node(&child)));
             }
@@ -619,12 +635,16 @@ pub fn remeasure(tree: &mut LayoutTree) {
     // intrinsic sizes for images.
     let mut text_info: HashMap<taffy::NodeId, (String, f32, f32, bool, u8)> = HashMap::new();
     let mut img_info: HashMap<taffy::NodeId, (f32, f32)> = HashMap::new();
+    // Replaced media boxes: (width, height) with the intrinsic aspect ratio, so a box sized on
+    // one axis by CSS derives the other (CSS 2 §10.3.2 / §10.6.2 for replaced elements).
+    let mut media_info: HashMap<taffy::NodeId, (f32, f32, f32)> = HashMap::new();
     fn resolve(
         node_id: taffy::NodeId,
         inherited: (f32, f32, bool, u8), // (font size, line-height; 0=natural, nowrap, family)
         tree: &LayoutTree,
         out: &mut HashMap<taffy::NodeId, (String, f32, f32, bool, u8)>,
         imgs: &mut HashMap<taffy::NodeId, (f32, f32)>,
+        media: &mut HashMap<taffy::NodeId, (f32, f32, f32)>,
     ) {
         let mut size = inherited;
         if let Some(dom_node) = tree.node_map.get(&node_id) {
@@ -642,6 +662,19 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 size.3 = paint
                     .and_then(|p| p.family)
                     .unwrap_or_else(|| default_family(el.name.local.as_ref(), inherited.3));
+                if let Some((iw, ih)) = crate::media::intrinsic_size(dom_node) {
+                    // width/height attributes win, the other axis keeps the intrinsic ratio.
+                    let attrs = el.attributes.borrow();
+                    let attr_px = |name: &str| attrs.get(name).and_then(|v| v.trim().parse::<f32>().ok());
+                    let ratio = if ih > 0.0 { iw / ih } else { 2.0 };
+                    let (w, h) = match (attr_px("width"), attr_px("height")) {
+                        (Some(w), Some(h)) => (w, h),
+                        (Some(w), None) => (w, w / ratio),
+                        (None, Some(h)) => (h * ratio, h),
+                        (None, None) => (iw, ih),
+                    };
+                    media.insert(node_id, (w, h, ratio));
+                }
                 if el.name.local.as_ref() == "img" {
                     let attrs = el.attributes.borrow();
                     // width/height attributes win; else intrinsic dimensions.
@@ -667,16 +700,33 @@ pub fn remeasure(tree: &mut LayoutTree) {
         }
         if let Ok(children) = tree.taffy.children(node_id) {
             for child in children {
-                resolve(child, size, tree, out, imgs);
+                resolve(child, size, tree, out, imgs, media);
             }
         }
     }
-    resolve(tree.root_node, (16.0, 0.0, false, 0), tree, &mut text_info, &mut img_info);
+    resolve(tree.root_node, (16.0, 0.0, false, 0), tree, &mut text_info, &mut img_info, &mut media_info);
+    // A replaced media box with an auto width is its own (attribute / intrinsic) width — not
+    // stretched across a column container the way an auto-width block is. Height follows when
+    // both axes are auto; with only the width specified the measure keeps the aspect ratio.
+    for (&id, &(w, h, _)) in &media_info {
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            let wa = st.size.width == Dimension::auto();
+            let ha = st.size.height == Dimension::auto();
+            if wa {
+                st.size.width = Dimension::length(w);
+                if ha {
+                    st.size.height = Dimension::length(h);
+                }
+                let _ = tree.taffy.set_style(id, st);
+            }
+        }
+    }
 
     // Taffy caches leaf measurements; a cascade pass can change resolved
     // font sizes without touching the leaf's style, so stale cached sizes
     // survive set_style dirtying. Invalidate every measured leaf.
-    for node_id in text_info.keys().chain(img_info.keys()) {
+    for node_id in text_info.keys().chain(img_info.keys()).chain(media_info.keys()) {
         let _ = tree.taffy.mark_dirty(*node_id);
     }
 
@@ -694,6 +744,14 @@ pub fn remeasure(tree: &mut LayoutTree) {
         tree.root_node,
         viewport,
         |known, avail, node_id, _ctx, _style| {
+            if let Some(&(w, h, ratio)) = media_info.get(&node_id) {
+                return match (known.width, known.height) {
+                    (Some(kw), Some(kh)) => Size { width: kw, height: kh },
+                    (Some(kw), None) => Size { width: kw, height: kw / ratio },
+                    (None, Some(kh)) => Size { width: kh * ratio, height: kh },
+                    (None, None) => Size { width: w, height: h },
+                };
+            }
             if let Some(&(w, h)) = img_info.get(&node_id) {
                 return Size {
                     width: known.width.unwrap_or(w),

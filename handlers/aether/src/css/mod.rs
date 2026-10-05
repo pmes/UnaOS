@@ -537,6 +537,18 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 style.paint.bg_repeat = Some(r);
             }
         }
+        // Replaced-content fitting (CSS Images 3 §5.5–5.6): how a <video>
+        // frame or poster sits in the element's content box.
+        "object-fit" => {
+            if let Some(f) = crate::media::parse_object_fit(value) {
+                style.paint.object_fit = Some(f);
+            }
+        }
+        "object-position" => {
+            if !is_neutral_keyword(value) {
+                style.paint.object_position = Some(value.to_string());
+            }
+        }
         // mask-image (and the -webkit- alias) turns the box's background
         // paint into a stencil: the mask's alpha decides where the fill
         // lands. The icon-font-replacement idiom (a solid background-color
@@ -1670,9 +1682,9 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
     copy!(
         background, color, font_size, bold, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
-        mask_repeat, text_align,
+        mask_repeat, text_align, object_fit,
     );
-    clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
+    clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
 }
 
 /// Applies a set of stylesheets as ONE cascade — rules from every sheet
@@ -2122,6 +2134,7 @@ fn property_supported(prop: &str) -> bool {
             | "font" | "align-items" | "align-content"
             | "background-color" | "background" | "background-image" | "color"
             | "background-size" | "background-position" | "background-repeat"
+            | "object-fit" | "object-position"
             // Alpha-stencil masks really are implemented (render::draw_node),
             // so the component idiom `@supports (mask-image: none)` must take
             // the mask branch, not the background-image fallback branch.

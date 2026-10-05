@@ -118,6 +118,28 @@ fn seek_lands_on_the_frame_and_ordinal() {
     assert_eq!(rec.shown[0].1, 1_000_000_000);
 }
 
+/// A seek INSIDE a frame's interval shows that frame (HTML: the frame whose interval holds
+/// the position), paused, with its own ordinal — not the next frame later. AETHERVIDEO.
+#[test]
+fn seek_inside_a_frame_shows_the_covering_frame() {
+    // 25 fps = 40 ms frames; 1.030 s is inside frame 25 [1.000, 1.040).
+    let file = build::mkv(&[build::test_pattern_track(1, 160, 120, 25, 100, 10)], &MkvOptions::default());
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    for (target, frame) in [(1_030_000_000i64, 25u32), (1_000_000_000, 25), (39_000_000, 0), (3_999_000_000, 99), (9_000_000_000, 99)] {
+        p.seek(target);
+        let mut rec = Rec::default();
+        for _ in 0..3 {
+            let clock = p.clock_ns();
+            p.tick(&mut RecSink { rec: &mut rec, clock });
+            time.advance(16_666_667);
+        }
+        assert_eq!(rec.shown.len(), 1, "paused: exactly one frame after the seek to {target}");
+        assert_eq!((rec.shown[0].0, rec.shown[0].2), (frame as u64, frame), "seek {target}");
+        assert_eq!(rec.shown[0].1, frame as i64 * 40_000_000);
+    }
+}
+
 #[test]
 fn poster_is_frame_zero_while_paused() {
     let file = build::mkv(&[build::test_pattern_track(1, 160, 120, 30, 30, 30)], &MkvOptions::default());

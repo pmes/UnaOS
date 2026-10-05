@@ -133,6 +133,11 @@ pub struct Player {
     next_ordinal: u64,
     /// Frames with pts below this are decoded but not shown (after a seek).
     discard_before: i64,
+    /// After a seek to a time inside a frame's interval: the latest frame decoded with pts
+    /// below the target — the frame that COVERS the target (HTML seeks show the frame whose
+    /// interval holds the new position; AETHERVIDEO found the gap). Shown first when the next
+    /// decoded frame starts after the target, or at end of stream.
+    held: Option<Frame>,
     on_glass: Option<i64>,
     eof: bool,
     info: MediaInfo,
@@ -208,6 +213,7 @@ impl Player {
             queue: VecDeque::new(),
             next_ordinal: 0,
             discard_before: i64::MIN,
+            held: None,
             on_glass: None,
             eof: false,
             info,
@@ -250,6 +256,7 @@ impl Player {
         }
         self.eof = false;
         self.discard_before = ns;
+        self.held = None;
         // Ordinals stay presentation indices: the first frame shown after the seek is preceded
         // by every video sample whose pts is earlier.
         let vt = &self.vtrack;
@@ -261,12 +268,29 @@ impl Player {
 
     fn insert_frame(&mut self, f: Frame) {
         if f.pts_ns < self.discard_before {
+            if self.held.as_ref().is_none_or(|h| h.pts_ns < f.pts_ns) {
+                self.held = Some(f);
+            }
             return;
+        }
+        if f.pts_ns > self.discard_before {
+            self.release_held();
+        } else {
+            self.held = None;
         }
         // Presentation order: insert by pts (a reordering decoder already emits in order; the
         // stand-in decodes B-frame streams in decode order).
         let pos = self.queue.iter().position(|q| q.pts_ns > f.pts_ns).unwrap_or(self.queue.len());
         self.queue.insert(pos, f);
+    }
+
+    /// Queue the held pre-target frame (see `held`): it precedes every queued frame, and its
+    /// ordinal is one below the first frame at or after the target.
+    fn release_held(&mut self) {
+        if let Some(h) = self.held.take() {
+            self.next_ordinal = self.next_ordinal.saturating_sub(1);
+            self.queue.push_front(h);
+        }
     }
 
     fn route(&mut self, p: Packet) {
@@ -308,6 +332,10 @@ impl Player {
                     self.eof = true;
                     for f in self.vdec.flush() {
                         self.insert_frame(f);
+                    }
+                    // A seek past the last frame's start still shows the last frame.
+                    if self.queue.is_empty() {
+                        self.release_held();
                     }
                 }
             }
