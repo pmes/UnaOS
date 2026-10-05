@@ -72,32 +72,39 @@ EDITS: --crop X,Y,W,H  --turn N  --mirror h|v  --resize WxH  --adjust B,C
 ```
 
 `render` is the EYES subject: `tools/eyes/run.sh facet` renders every case of
-`tools/eyes/suites/facet/suite.toml` and scores it against the checked-in goldens.
+`tools/eyes/suites/facet/cases/` and scores it against the checked-in goldens (`facet.toml`) and
+against Chromium live (`chromium.toml`), gated on `baseline.json`.
 
 ## The decoder seam — `ImageSource`
 
-`src/source.rs` defines the one trait Facet reads pixels through, written to the shape of
-PIXELCORE's `gneiss_pal::dsp::image` (`unaos/libs/media/pixel_core`, SR25): `sniff`,
-`decode → Decoded { width, height, rgba, frames, loop_count, orientation }`. Today the
-`image` crate stands behind it — **chicken wire** (R83): a third-party crate doing decoding
-UnaOS claims. It is confined to `source.rs`, behind the default `chicken-wire-image` feature,
-and decodes pixels only; orientation and every other declaration come from Facet's own readers.
-When PIXELCORE is on trunk, a `PixelCoreSource` replaces it and the feature goes.
+`src/source.rs` defines the one trait Facet reads pixels through, in PIXELCORE's shape:
+`sniff`, `decode → Decoded { width, height, rgba, frames, loop_count, orientation }`.
+**`PixelCoreSource` stands behind it** — `unaos/libs/media/pixel_core` (SR25), UnaOS's own PNG,
+JPEG, GIF, BMP, QOI and lossless-WebP decoders, written from the specifications, `no_std`, zero
+dependencies (FACETPIXEL, SR43). There is no fallback: what pixel_core does not decode is an
+`ImageError` naming the format — `webp: unsupported: webp lossy (VP8)` until VP8CORE (SR40);
+`tiff`, `ico`, `avif`, `heif`, `jpeg xl`, `psd`, `svg`, ... as "no UnaOS decoder reads X yet".
+Orientation and every other declaration come from Facet's own readers (`src/meta.rs`); for JPEG
+a test asserts they agree with pixel_core's EXIF reader. The `image` crate is a dev-dependency
+only — the second-opinion oracle in `tests/oracles.rs`; `cargo tree -p facet -e normal` has none.
 
 ## Proof
 
 `cargo test -p facet`: known-answer tests for every orientation, turn, flip, crop, the resize
-filter, the CSS adjust, the view rules, CRC-32/Adler-32/zlib/Paeth and the PNG layout; the PNG
-writer round-tripped through an independent decoder; the triangle filter against the `image`
-crate's; EXIF fixtures; the bus round trip; and the eyes goldens — themselves proven against
-Chromium (`tools/eyes/suites/facet/oracle.mjs`): 9 of 11 cases pixel-exact, the two JPEG cases
-within 2 levels (decoder IDCT), the resize case recorded at 30 dB (Chromium uses another filter).
-Design doc and numbers: `docs/dev/evidence/host-1004/FACET.md`.
+filter, the CSS adjust, the view rules, CRC-32/Adler-32/zlib/Paeth and the PNG layout; the
+refusals by name; the PNG writer round-tripped through an independent decoder and pixel_core;
+pixel_core against the `image` crate; the two EXIF readers' agreement; the triangle filter against
+the `image` crate's; the bus round trip; and the eyes goldens — themselves proven against
+Chromium (`tools/eyes/suites/facet/oracle.mjs`): 10 of 11 cases pixel-exact (the two EXIF-JPEG
+cases included, since pixel_core's JPEG matches Chromium's), the resize case recorded at 30 dB
+(Chromium uses another filter). Design docs: `docs/dev/evidence/host-1004/FACET.md`,
+`docs/dev/evidence/host-1005/FACETPIXEL.md`.
 
 ## Status
 
 **Live on the host as a library + CLI, served over the bus; `vessels/facet-view` is its window.**
-Owed: `PixelCoreSource` (retires the chicken wire), JPEG export, colour management (declared
+Decodes through UnaOS's own pixel_core (no chicken wire). Owed: lossy WebP (VP8CORE, SR40),
+TIFF/ICO/AVIF decoders (pixel_core's ceiling), PNG `eXIf`/WebP `EXIF` in pixel_core, JPEG export, colour management (declared
 spaces are reported, not converted), vector (SVG) — CODEX's "Vector" half of the charter — and
 GPU texture editing.
 
