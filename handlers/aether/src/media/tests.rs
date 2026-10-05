@@ -331,12 +331,15 @@ fn autoplay_policy_muted_runs_bare_does_not() {
         .map(|m| match m {
             SMessage::PlayMedia { url, .. } => format!("play {}", url.rsplit('/').next().unwrap()),
             SMessage::MediaPoster { url } => format!("poster {}", url.rsplit('/').next().unwrap()),
+            SMessage::MediaMute { url, muted } => format!("mute={muted} {}", url.rsplit('/').next().unwrap()),
             other => format!("{other:?}"),
         })
         .collect();
-    assert_eq!(names, vec!["play a.webm", "poster b.webm", "play d.wav"]);
+    // AUDIOTRACK: an <audio> asks for its metadata like a <video> (Chromium's default
+    // preload); a muted element's opening request is followed by MediaMute.
+    assert_eq!(names, vec!["play a.webm", "mute=true a.webm", "poster b.webm", "poster c.wav", "play d.wav", "mute=true d.wav"]);
     let st: Vec<State> = e.media_elements().iter().map(|e| e.state.clone()).collect();
-    assert_eq!(st, vec![State::Playing, State::Loading, State::Idle, State::Playing]);
+    assert_eq!(st, vec![State::Playing, State::Loading, State::Loading, State::Playing]);
 }
 
 /// A `<video>` whose source is a `<source>` child is still an inline replaced box sized by its
@@ -372,10 +375,10 @@ fn source_selection_skips_types_stria_cannot_play() {
 
 #[test]
 fn navigation_stops_the_previous_pages_sessions() {
-    let mut e = engine_with(r#"<html><body><video src="clip.webm"></video><audio src="idle.wav"></audio></body></html>"#);
+    let mut e = engine_with(r#"<html><body><video src="clip.webm"></video><audio src="idle.wav" preload="none"></audio></body></html>"#);
     let _ = e.take_media_requests();
     e.load_html_styled("file:///page/next.html", "<html><body><p>next</p></body></html>", &[], true);
-    // The idle <audio> never opened a session, so only the video stops.
+    // The idle (preload="none") <audio> never opened a session, so only the video stops.
     assert_eq!(format!("{:?}", e.take_media_requests()), format!("{:?}", vec![SMessage::MediaStop { url: "file:///page/clip.webm".into() }]));
     assert!(e.media_elements().is_empty());
 }
@@ -436,4 +439,200 @@ fn controls_strip_paints_play_then_pause() {
     e.render_frame();
     let pause_px = strip_white(&e);
     assert_eq!(pause_px, 2 * 4 * 14, "two 4x14 pause bars");
+}
+
+// ------------------------------------------------------------------------------------------
+// AUDIOTRACK (LEDGER SR45): <audio controls>, mute, http(s) media through the cache.
+
+fn audio_opened(url: &str, duration_ns: u64) -> SMessage {
+    SMessage::MediaOpened { url: url.into(), duration_ns, width: 0, height: 0, video: String::new(), audio: "wav".into(), real_video: false, audio_clock: true }
+}
+
+/// RGB at (x, y) of the engine surface (BGRA).
+fn px(e: &AetherEngine, x: u32, y: u32) -> (u8, u8, u8) {
+    let o = ((y * e.width + x) * 4) as usize;
+    let p = &e.surface()[o..o + 4];
+    (p[2], p[1], p[0])
+}
+
+#[test]
+fn audio_controls_asks_for_metadata_paints_chromiums_control_and_follows_the_meters() {
+    let mut e = engine_with(r#"<html><body style="margin:0"><audio controls src="a.wav"></audio></body></html>"#);
+    assert_eq!(format!("{:?}", e.take_media_requests()), format!("{:?}", vec![SMessage::MediaPoster { url: "file:///page/a.wav".into() }]));
+    assert_eq!(video_box(&e, 0), (0, 0, 300, 54), "Chromium's 300x54 audio control box");
+    e.on_media_message(&audio_opened("file:///page/a.wav", 2_500_000_000));
+    // an audio-only session's meter frame: no pixels, peak L/R per 50 ms
+    e.on_media_message(&SMessage::MediaFrame { url: "file:///page/a.wav".into(), pts_ns: 1_000_000_000, width: 0, height: 0, rgba: vec![], levels: vec![[0.25, 0.5], [0.5, 0.75]] });
+    let el = &e.media_elements()[0];
+    assert_eq!((el.state.clone(), el.duration_ns, el.pts_ns, el.levels), (State::Paused, 2_500_000_000, 1_100_000_000, [0.5, 0.75]));
+    assert!(el.frame.is_none() && el.natural.is_none(), "a meter frame is not a picture");
+    e.damage_rects.push((0, 0, e.width, e.height));
+    e.render_frame();
+    // The pill (rgb 241,243,244), its rounded end leaving the page white in the corner, the
+    // black play triangle, the timeline (played part dark, the rest grey), speaker and dots.
+    assert_eq!(px(&e, 150, 8), (241, 243, 244));
+    assert_eq!(px(&e, 0, 0), (255, 255, 255));
+    assert_eq!(px(&e, 25, 27), (0, 0, 0), "play triangle");
+    let f = 1.1 / 2.5;
+    let split = 129.0 + (209.0 - 129.0) * f;
+    assert_eq!(px(&e, split as u32 - 4, 27), (11, 11, 11), "played timeline");
+    assert_eq!(px(&e, split as u32 + 4, 27), (88, 89, 89), "unplayed timeline");
+    assert_eq!(px(&e, 236, 27), (0, 0, 0), "speaker");
+    assert_eq!(px(&e, 272, 27), (0, 0, 0), "menu dot");
+    // playing: the pause bars replace the triangle
+    assert!(e.media_play(0));
+    e.damage_rects.push((0, 0, e.width, e.height));
+    e.render_frame();
+    assert_eq!(px(&e, 23, 27), (0, 0, 0), "left pause bar");
+    assert_eq!(px(&e, 27, 27), (241, 243, 244), "the gap between the bars");
+}
+
+#[test]
+fn preload_none_waits_for_play_and_mute_follows_the_opening_request() {
+    let mut e = engine_with(r#"<html><body><audio src="a.mp3" preload="none" muted></audio></body></html>"#);
+    assert!(e.take_media_requests().is_empty());
+    assert!(e.media_play(0));
+    let r = e.take_media_requests();
+    assert!(matches!(&r[..], [SMessage::PlayMedia { url, .. }, SMessage::MediaMute { url: u2, muted: true }] if url == "file:///page/a.mp3" && u2 == url), "{r:?}");
+    assert!(media::can_play_type("audio/mpeg") && media::can_play_type("audio/ogg; codecs=opus") && media::can_play_type("audio/wav; codecs=1"));
+}
+
+/// A tiny HTTP/1.1 server for the cache tests: serves `body` at any path but `/missing`
+/// (404); with `ranges` it answers `Range: bytes=a-b` with 206 + Content-Range, else 200.
+/// Records each request's Range header ("" when none).
+struct MiniHttp {
+    port: u16,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+impl MiniHttp {
+    fn start(body: Vec<u8>, ranges: bool) -> MiniHttp {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut rd = BufReader::new(c.try_clone().unwrap());
+                let mut first = String::new();
+                if rd.read_line(&mut first).is_err() {
+                    continue;
+                }
+                let mut range = String::new();
+                loop {
+                    let mut h = String::new();
+                    if rd.read_line(&mut h).is_err() || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("range:") {
+                        range = v.trim().to_string();
+                    }
+                }
+                log.lock().unwrap().push(range.clone());
+                if first.contains("/missing") {
+                    let _ = c.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                let n = body.len();
+                let span = range.strip_prefix("bytes=").and_then(|r| r.split_once('-')).and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok().unwrap_or(n - 1))));
+                match (ranges, span) {
+                    (true, Some((a, _))) if a >= n => {
+                        let _ = c.write_all(format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{n}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+                    }
+                    (true, Some((a, b))) => {
+                        let b = b.min(n - 1);
+                        let _ = c.write_all(format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/{n}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b + 1 - a).as_bytes());
+                        let _ = c.write_all(&body[a..=b]);
+                    }
+                    _ => {
+                        let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n").as_bytes());
+                        let _ = c.write_all(&body);
+                    }
+                }
+            }
+        });
+        MiniHttp { port, seen }
+    }
+}
+
+fn blob(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i * 7919 % 251) as u8).collect()
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("aether-media-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[test]
+fn fetch_uses_byte_ranges_resumes_a_partial_file_and_falls_back_to_one_get() {
+    let body = blob(2500);
+    let dir = scratch("fetch");
+    // ranges honoured: 3 × 1000-byte requests
+    let s = MiniHttp::start(body.clone(), true);
+    let url = format!("http://127.0.0.1:{}/v.webm", s.port);
+    let rep = media::fetch_to_cache(&url, &dir.join("a"), 1000).unwrap();
+    assert_eq!((rep.bytes, rep.ranged, rep.requests, rep.resumed_from), (2500, true, 3, 0));
+    assert_eq!(std::fs::read(dir.join("a")).unwrap(), body);
+    assert_eq!(*s.seen.lock().unwrap(), vec!["bytes=0-999", "bytes=1000-1999", "bytes=2000-2999"]);
+    // resume: a partial file of 1200 bytes → the fetch continues at byte 1200
+    std::fs::write(dir.join("b.part"), &body[..1200]).unwrap();
+    s.seen.lock().unwrap().clear();
+    let rep = media::fetch_to_cache(&url, &dir.join("b"), 1000).unwrap();
+    assert_eq!((rep.bytes, rep.ranged, rep.requests, rep.resumed_from), (2500, true, 2, 1200));
+    assert_eq!(std::fs::read(dir.join("b")).unwrap(), body);
+    assert_eq!(*s.seen.lock().unwrap(), vec!["bytes=1200-2199", "bytes=2200-3199"]);
+    // no range support: the whole body from one 200, a stale partial file discarded
+    let s2 = MiniHttp::start(body.clone(), false);
+    std::fs::write(dir.join("c.part"), b"stale").unwrap();
+    let rep = media::fetch_to_cache(&format!("http://127.0.0.1:{}/v.webm", s2.port), &dir.join("c"), 1000).unwrap();
+    assert_eq!((rep.bytes, rep.ranged, rep.requests), (2500, false, 1));
+    assert_eq!(std::fs::read(dir.join("c")).unwrap(), body);
+    // a 404 is an error and leaves no cache file
+    assert!(media::fetch_to_cache(&format!("http://127.0.0.1:{}/missing", s2.port), &dir.join("d"), 1000).is_err());
+    assert!(!dir.join("d").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn http_media_is_cached_then_handed_to_stria_as_a_file_and_a_failure_paints() {
+    let body = blob(5000);
+    let s = MiniHttp::start(body.clone(), true);
+    let dir = scratch("cache");
+    media::set_cache_dir(&dir);
+    let src = format!("http://127.0.0.1:{}/clip.webm", s.port);
+    let missing = format!("http://127.0.0.1:{}/missing.webm", s.port);
+    let mut e = engine_with(&format!(r#"<html><body><video src="{src}"></video><video src="{missing}"></video></body></html>"#));
+    let key = format!("file://{}", media::cache_path(&src).display());
+    let el = &e.media_elements()[0];
+    assert_eq!((el.src.as_str(), el.url.as_str(), el.fetching), (src.as_str(), key.as_str(), true));
+    assert!(media::cache_path(&src).starts_with(&dir));
+    let name = media::cache_path(&src).file_name().unwrap().to_string_lossy().to_string();
+    assert_eq!(name.len(), 64, "the cache file is named by the url's SHA-256");
+    // nothing goes to Stria until the bytes are local
+    let mut reqs = e.take_media_requests();
+    let t0 = Instant::now();
+    while reqs.len() < 2 && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(5));
+        reqs.extend(e.take_media_requests());
+    }
+    let key2 = format!("file://{}", media::cache_path(&missing).display());
+    assert!(reqs.iter().any(|r| matches!(r, SMessage::MediaPoster { url } if *url == key)), "{reqs:?}");
+    assert!(reqs.iter().any(|r| matches!(r, SMessage::MediaError { url, error } if *url == key2 && error.contains("404"))), "{reqs:?}");
+    assert_eq!(std::fs::read(media::cache_path(&src)).unwrap(), body);
+    // the error comes back over the bus like Stria's and paints in the box
+    for r in &reqs {
+        e.on_media_message(r);
+    }
+    assert!(matches!(&e.media_elements()[1].state, State::Error(t) if t.contains("404")));
+    // a second page on the same url finds the cache: its poster goes out at once
+    // (the registry is per engine thread: loading it stops the first page's sessions first)
+    let e2 = &mut engine_with(&format!(r#"<html><body><video src="{src}"></video></body></html>"#));
+    let r2 = e2.take_media_requests();
+    assert_eq!(format!("{:?}", r2.last()), format!("{:?}", Some(SMessage::MediaPoster { url: key.clone() })), "{r2:?}");
+    assert!(!e2.media_elements()[0].fetching);
+    let _ = std::fs::remove_dir_all(&dir);
 }

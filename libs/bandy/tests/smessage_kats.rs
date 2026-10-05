@@ -350,6 +350,7 @@ kat!(
     r#"{"MediaSeek":{"url":"u","position_ns":1500000000}}"#
 );
 kat!(kat_media_stop, SMessage::MediaStop { url: "u".to_string() }, r#"{"MediaStop":{"url":"u"}}"#);
+kat!(kat_media_mute, SMessage::MediaMute { url: "u".to_string(), muted: true }, r#"{"MediaMute":{"url":"u","muted":true}}"#);
 kat!(
     kat_media_opened,
     SMessage::MediaOpened {
@@ -828,6 +829,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::MediaResume { .. } => "MediaResume",
         SMessage::MediaSeek { .. } => "MediaSeek",
         SMessage::MediaStop { .. } => "MediaStop",
+        SMessage::MediaMute { .. } => "MediaMute",
         SMessage::MediaOpened { .. } => "MediaOpened",
         SMessage::MediaFrame { .. } => "MediaFrame",
         SMessage::MediaEnded { .. } => "MediaEnded",

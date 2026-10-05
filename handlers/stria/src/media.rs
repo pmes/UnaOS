@@ -207,6 +207,8 @@ pub struct Player {
     level_acc: Option<(i64, f32, f32)>,
     levels: VecDeque<(i64, [f32; 2])>,
     audio_eof: bool,
+    /// Muted: zeros go to the device in place of the samples (the clock keeps running).
+    muted: bool,
     consumed_seen: u64,
     /// Device consumption at the last open/seek, and frames pushed to the device since: the
     /// audio-only end is when the device has played every pushed frame.
@@ -379,6 +381,7 @@ impl Player {
             level_acc: None,
             levels: VecDeque::new(),
             audio_eof: false,
+            muted: false,
             consumed_seen: 0,
             consumed_base: 0,
             pushed_frames: 0,
@@ -424,6 +427,12 @@ impl Player {
         if let Some(o) = self.aout.as_mut() {
             o.set_paused(true);
         }
+    }
+
+    /// Mute / unmute: the device plays zeros in place of the stream (already-queued samples
+    /// in the device ring, ≤ ½ s, play out first). Meters keep measuring the stream.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
     }
 
     /// Seek: land on the keyframe at or before `ns`, decode forward silently to `ns`. The
@@ -643,7 +652,7 @@ impl Player {
                 self.pending.make_contiguous();
                 continue;
             }
-            let took = out.push(chunk);
+            let took = if self.muted { out.push(&vec![0.0; chunk.len()]) } else { out.push(chunk) };
             if took == 0 {
                 break;
             }

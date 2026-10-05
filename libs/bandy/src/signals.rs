@@ -183,6 +183,9 @@ pub enum SMessage {
     /// Seek to `position_ns` (lands on the last keyframe at or before it, then decodes forward).
     MediaSeek { url: String, position_ns: u64 },
     MediaStop { url: String },
+    /// AUDIOTRACK (SR45): silence (`muted`) or restore the session's audio. The clock keeps
+    /// running on the device — a muted `<video>` stays in sync — only the samples are zeroed.
+    MediaMute { url: String, muted: bool },
     /// Stria → requester: the stream is open. `video` / `audio` name the codecs ("" when the
     /// track is absent); `real_video` is false when the frames are the labelled test-pattern
     /// stand-in (no decoder for the codec yet); `audio_clock` is true when audio is playing and

@@ -653,8 +653,10 @@ fn paint_media(
         }
     }
 
-    if media.controls {
-        // The strip: 32px (an <audio> box is all strip), translucent black.
+    if media.controls && media.kind == crate::media::Kind::Audio {
+        paint_audio_controls(media, content, font, surface, width, height, damage_rects, clip);
+    } else if media.controls {
+        // The strip: 32px, translucent black.
         let sh = if media.kind == crate::media::Kind::Audio { ch } else { ch.min(32.0) };
         let top = cy + ch - sh;
         let (x0, y0, x1, y1) = span(cx, top, cx + cw, cy + ch);
@@ -712,6 +714,129 @@ fn paint_media(
                 fill(surface, track_x0, mid - 2.0, track_x0 + (track_x1 - track_x0) * f, mid + 2.0, &|_, _| true, white);
             }
         }
+    }
+}
+
+/// `<audio controls>` as Chromium draws its default audio control (AUDIOTRACK, LEDGER SR45),
+/// geometry measured from Chromium's own rendering of a 300×54 control: a pill of
+/// rgb(241,243,244) with fully rounded ends; a play triangle (pause bars while playing) — the
+/// Material icons at 20 px, at x+16; the `m:ss / m:ss` time at x+47, 13 px; the timeline
+/// x+129 … right−91, 4 px tall with round caps, played part rgb(11,11,11), the rest
+/// rgb(88,89,89); the speaker (Material `volume_up`, 24 px) at right−69; the overflow dots
+/// (`more_vert`, 20 px) at right−37.5. Shapes are coverage-antialiased (4×4 samples per
+/// pixel). Stria's meter frames move the time while it plays.
+#[allow(clippy::too_many_arguments)]
+fn paint_audio_controls(
+    media: &crate::media::Paint,
+    content: (f32, f32, f32, f32),
+    font: &Option<Arc<Font>>,
+    surface: &mut [u8],
+    width: u32,
+    height: u32,
+    damage_rects: &[(u32, u32, u32, u32)],
+    clip: Clip,
+) {
+    let (cx, cy, cw, ch) = content;
+    let lim = (cx.max(clip.0).max(0.0), cy.max(clip.1).max(0.0), (cx + cw).min(clip.2).min(width as f32), (cy + ch).min(clip.3).min(height as f32));
+    // Fill `inside` over the rectangle with 4×4-sample coverage.
+    let cover = |surface: &mut [u8], r: (f32, f32, f32, f32), inside: &dyn Fn(f32, f32) -> bool, color: (u8, u8, u8)| {
+        let x0 = r.0.max(lim.0).floor().max(0.0) as u32;
+        let y0 = r.1.max(lim.1).floor().max(0.0) as u32;
+        let x1 = r.2.min(lim.2).ceil().max(0.0) as u32;
+        let y1 = r.3.min(lim.3).ceil().max(0.0) as u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if !in_damage(x, y, damage_rects) {
+                    continue;
+                }
+                let mut n = 0u32;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        if inside(x as f32 + (sx as f32 + 0.5) / 4.0, y as f32 + (sy as f32 + 0.5) / 4.0) {
+                            n += 1;
+                        }
+                    }
+                }
+                match n {
+                    0 => {}
+                    16 => put_px(surface, width, x, y, color),
+                    _ => blend_px(surface, width, x, y, color, (n * 255 / 16) as u8),
+                }
+            }
+        }
+    };
+    let mid = cy + ch / 2.0;
+    let right = cx + cw;
+    // the pill
+    let rad = (ch / 2.0).min(cw / 2.0);
+    let pill = |x: f32, y: f32| {
+        let qx = if x < cx + rad { cx + rad - x } else if x > right - rad { x - (right - rad) } else { 0.0 };
+        let qy = ((y - mid).abs() - (ch / 2.0 - rad)).max(0.0);
+        qx * qx + qy * qy <= rad * rad && y >= cy && y <= cy + ch
+    };
+    cover(surface, (cx, cy, right, cy + ch), &pill, (241, 243, 244));
+    let black = (0, 0, 0);
+    // play / pause: Material play_arrow / pause at 20 px (scale 5/6), origin (x+16⅓, mid−10)
+    let (ox, oy, k) = (cx + 16.0 + 1.0 / 3.0, mid - 10.0, 20.0 / 24.0);
+    if media.playing {
+        let bars = move |x: f32, y: f32| {
+            let (u, v) = ((x - ox) / k, (y - oy) / k);
+            (5.0..=19.0).contains(&v) && ((6.0..=10.0).contains(&u) || (14.0..=18.0).contains(&u))
+        };
+        cover(surface, (ox, oy, ox + 20.0, oy + 20.0), &bars, black);
+    } else {
+        let tri = move |x: f32, y: f32| {
+            let (u, v) = ((x - ox) / k, (y - oy) / k);
+            u >= 8.0 && u <= 19.0 && (v - 12.0).abs() <= 7.0 * (19.0 - u) / 11.0
+        };
+        cover(surface, (ox, oy, ox + 20.0, oy + 20.0), &tri, black);
+    }
+    // the time
+    let label = format!("{} / {}", crate::media::clock_text(media.pts_ns), crate::media::clock_text(media.duration_ns as i64));
+    if let Some(font) = font {
+        let fs = 13.0;
+        let tw = measure_text_width(&label, font, fs);
+        draw_text(&label, cx + 47.0, centered_line_origin_y(font, fs, mid), tw + 2.0, font, 0, fs, 1.2, (31, 31, 31), false, surface, width, height, damage_rects, lim);
+    }
+    // the timeline
+    let (t0, t1) = (cx + 129.0, right - 91.0);
+    if t1 > t0 + 4.0 {
+        let cap = move |x: f32, y: f32| {
+            let dx = if x < t0 + 2.0 { t0 + 2.0 - x } else if x > t1 - 2.0 { x - (t1 - 2.0) } else { 0.0 };
+            dx * dx + (y - mid) * (y - mid) <= 4.0 && x >= t0 && x <= t1
+        };
+        let f = if media.duration_ns > 0 { (media.pts_ns.max(0) as f32 / media.duration_ns as f32).clamp(0.0, 1.0) } else { 0.0 };
+        let split = t0 + (t1 - t0) * f;
+        cover(surface, (t0, mid - 2.0, t1, mid + 2.0), &move |x, y| cap(x, y) && x >= split, (88, 89, 89));
+        if f > 0.0 {
+            cover(surface, (t0, mid - 2.0, split, mid + 2.0), &move |x, y| cap(x, y) && x < split, (11, 11, 11));
+        }
+    }
+    // the speaker: Material volume_up at 24 px, origin (right−69, mid−12)
+    let (sx, sy) = (right - 69.0, mid - 12.0);
+    if sx > t1 {
+        let body = move |x: f32, y: f32| {
+            let (u, v) = (x - sx, y - sy);
+            let rect = (3.0..=7.0).contains(&u) && (9.0..=15.0).contains(&v);
+            let cone = (7.0..=12.0).contains(&u) && (v - 12.0).abs() <= 3.0 + (u - 7.0);
+            rect || cone
+        };
+        cover(surface, (sx, sy, sx + 24.0, sy + 24.0), &body, black);
+        let waves = move |x: f32, y: f32| {
+            let (u, v) = (x - sx, y - sy);
+            let r = ((u - 12.0) * (u - 12.0) + (v - 12.0) * (v - 12.0)).sqrt();
+            u >= 14.0 && (r <= 4.5 || (7.0..=9.0).contains(&r))
+        };
+        cover(surface, (sx, sy, sx + 24.0, sy + 24.0), &waves, black);
+    }
+    // the overflow menu: Material more_vert at 20 px, dots r 5/3 at (10, 5|10|15)
+    let (mx, my) = (right - 37.5, mid - 10.5);
+    if mx > t1 {
+        let dots = move |x: f32, y: f32| {
+            let (u, v) = (x - mx - 10.0, y - my);
+            [5.0f32, 10.0, 15.0].iter().any(|c| u * u + (v - c) * (v - c) <= (5.0f32 / 3.0) * (5.0 / 3.0))
+        };
+        cover(surface, (mx, my, mx + 20.0, my + 20.0), &dots, black);
     }
 }
 

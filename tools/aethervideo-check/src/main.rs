@@ -6,7 +6,7 @@
 //! ```text
 //! aethervideo-check make <dir> [frames] [fps] [w] [h]   test-pattern streams + raw frames
 //! aethervideo-check mux <chunks.bin> <out.webm> <w> <h> <fps>   VP9 chunks → WebM (demux_core)
-//! aethervideo-check render <page.html> <out.png> --frame N --fps F [--width W --height H]
+//! aethervideo-check render <page.html> <out.png> --frame N --fps F [--width W --height H] [--cache DIR]
 //! aethervideo-check compare <aether.png> <chromium.png> <x,y,w,h> [--counter N] [--min-psnr dB]
 //! ```
 //!
@@ -14,6 +14,9 @@
 //! keyframe) and `frames.rgba` (the same frames, raw RGBA) for `oracle/encode.cjs`, which has
 //! Chromium's WebCodecs VP9 encoder turn them into `chunks.bin` at quantizer 0 (VP9 lossless);
 //! `mux` writes those chunks into `pattern-vp9.webm` with demux_core's own Matroska writer.
+//! AUDIOTRACK (SR45): `make` also writes `tone.wav` (2.5 s, 48 kHz stereo, a different tone per
+//! channel) for the page's `<audio controls>`; `render --cache DIR` points Aether's http(s) media
+//! cache at DIR (the page's http `<video>` is fetched there and handed to Stria as a file).
 //!
 //! `render` is Aether headless with Stria's media service on a real bandy bus: load the page,
 //! fire the engine's media requests, feed Stria's replies back, wait for every `<video>`'s
@@ -71,7 +74,37 @@ fn make(args: &[String]) {
         raw.extend_from_slice(&TestPattern::render(w, h, i));
     }
     std::fs::write(dir.join("frames.rgba"), raw).unwrap();
+    std::fs::write(dir.join("tone.wav"), tone_wav(48_000, 120_000)).unwrap();
     std::fs::write(dir.join("meta.json"), format!("{{\"frames\":{n},\"fps\":{fps},\"width\":{w},\"height\":{h}}}\n")).unwrap();
+}
+
+/// A 16-bit stereo WAV: 440 Hz left, 660 Hz right, half scale.
+fn tone_wav(rate: u32, frames: u32) -> Vec<u8> {
+    let mut w = Vec::new();
+    let data = frames * 4;
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + data).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    for v in [16u32] {
+        w.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [1u16, 2] {
+        w.extend_from_slice(&v.to_le_bytes());
+    }
+    w.extend_from_slice(&rate.to_le_bytes());
+    w.extend_from_slice(&(rate * 4).to_le_bytes());
+    for v in [4u16, 16] {
+        w.extend_from_slice(&v.to_le_bytes());
+    }
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&data.to_le_bytes());
+    for i in 0..frames {
+        let t = i as f64 / rate as f64;
+        for f in [440.0, 660.0] {
+            w.extend_from_slice(&(((t * f * std::f64::consts::TAU).sin() * 16384.0) as i16).to_le_bytes());
+        }
+    }
+    w
 }
 
 /// `chunks.bin`: repeated `[u32 LE length][u8 keyframe][payload]` in presentation order.
@@ -142,6 +175,9 @@ fn render(args: &[String]) {
     let fps: u64 = arg(args, "--fps").and_then(|s| s.parse().ok()).unwrap_or(10);
     let width: u32 = arg(args, "--width").and_then(|s| s.parse().ok()).unwrap_or(640);
     let height: u32 = arg(args, "--height").and_then(|s| s.parse().ok()).unwrap_or(400);
+    if let Some(dir) = arg(args, "--cache") {
+        aether::media::set_cache_dir(Path::new(dir));
+    }
     let path = std::fs::canonicalize(page).unwrap_or_else(|e| die(format!("{page}: {e}")));
     let html = std::fs::read_to_string(&path).unwrap();
 
@@ -154,11 +190,18 @@ fn render(args: &[String]) {
     engine.handle_event(aether::api::events::Event::Resize(width, height));
     engine.load_html(&format!("file://{}", path.display()), &html, true);
     let n = engine.media_elements().len();
-    // Every video's poster (MediaOpened + first MediaFrame), or an error.
+    // Every video's poster (MediaOpened + first MediaFrame), every audio's duration, or an error
+    // (an http source first has to land in the media cache).
     let ready = |e: &AetherEngine| {
-        e.media_elements().iter().all(|m| m.kind != aether::media::Kind::Video || m.frame.is_some() || matches!(m.state, aether::media::State::Error(_)))
+        e.media_elements().iter().all(|m| {
+            let landed = match m.kind {
+                aether::media::Kind::Video => m.frame.is_some(),
+                aether::media::Kind::Audio => m.duration_ns > 0,
+            };
+            landed || matches!(m.state, aether::media::State::Error(_))
+        })
     };
-    if !pump(&mut engine, &syn, &mut rx, Duration::from_secs(10), ready) {
+    if !pump(&mut engine, &syn, &mut rx, Duration::from_secs(20), ready) {
         die("timed out waiting for posters".into());
     }
     // Seek every video to the middle of frame N (the same target the Chromium script sets).
@@ -194,8 +237,8 @@ fn render(args: &[String]) {
             _ => "null".into(),
         };
         println!(
-            "{{\"url\":\"{}\",\"box\":[{},{},{},{}],\"pts_ns\":{},\"real_video\":{},\"state\":\"{:?}\",\"counter\":{}}}",
-            m.url, b.0, b.1, b.2, b.3, m.pts_ns, m.real_video, m.state, counter
+            "{{\"url\":\"{}\",\"src\":\"{}\",\"kind\":\"{:?}\",\"box\":[{},{},{},{}],\"pts_ns\":{},\"duration_ns\":{},\"real_video\":{},\"state\":\"{:?}\",\"counter\":{}}}",
+            m.url, m.src, m.kind, b.0, b.1, b.2, b.3, m.pts_ns, m.duration_ns, m.real_video, m.state, counter
         );
     }
 }

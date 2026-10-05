@@ -363,3 +363,23 @@ fn bus_audio_only_session_opens_without_a_picture_meters_and_ends() {
     assert_eq!(meters.iter().map(|m| m.1).sum::<usize>(), 10, "0.5 s = ten 50 ms windows, each sent once");
     assert!(meters.windows(2).all(|w| w[0].0 < w[1].0));
 }
+
+#[test]
+fn mute_zeroes_the_device_while_the_clock_runs_on() {
+    let (wav, _) = wav_stereo(48_000, 48_000);
+    let mut rig = Rig::new(wav, 48_000);
+    rig.p.set_muted(true);
+    rig.p.play();
+    let mut m = Meters::default();
+    for _ in 0..30 {
+        rig.step(&mut m, 48_000);
+    }
+    assert!(rig.l.iter().chain(&rig.r).all(|&x| x == 0.0), "muted: the device hears zeros");
+    assert!((rig.p.clock_ns() - 500_000_000).abs() < 30_000_000, "the clock ran: {}", rig.p.clock_ns());
+    assert!(m.windows.iter().any(|w| w.1[0] > 0.1), "the meters still measure the stream");
+    rig.p.set_muted(false);
+    for _ in 0..40 {
+        rig.step(&mut m, 48_000);
+    }
+    assert!(rig.l.iter().any(|&x| x != 0.0), "unmuted: sound (after the ring's queued zeros)");
+}

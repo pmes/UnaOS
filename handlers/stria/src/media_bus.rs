@@ -13,6 +13,7 @@
 //! | `MediaPoster { url }` | open, present the first frame, stay paused | `MediaOpened`, one `MediaFrame` |
 //! | `MediaPause` / `MediaResume` | freeze / run the session's clock | frames stop / resume |
 //! | `MediaSeek { url, position_ns }` | keyframe at or before, decode forward | the frame at the target |
+//! | `MediaMute { url, muted }` | zero / restore the samples sent to the device (clock runs on) | |
 //! | `MediaStop { url }` | close the session | `MediaEnded` |
 //!
 //! A stream with no video track is an AUDIO-ONLY session (AUDIOTRACK, SR45): `MediaOpened`
@@ -219,6 +220,11 @@ fn handle(synapse: &Synapse, sessions: &mut HashMap<String, Session>, msg: SMess
             if let Some(s) = sessions.get_mut(&url) {
                 s.player.seek(position_ns as i64);
                 s.ended = false;
+            }
+        }
+        SMessage::MediaMute { url, muted } => {
+            if let Some(s) = sessions.get_mut(&url) {
+                s.player.set_muted(muted);
             }
         }
         SMessage::MediaStop { url } => {
