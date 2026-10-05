@@ -1,8 +1,9 @@
 # Keep the LineBreakTest-17.0.0.txt lines whose code points all lie in FONTCORE's supported ranges
-# (src/linebreak/table.rs RANGES), dropping comments. Usage: python3 filter_lbtest.py LineBreakTest.txt > tests/data/lbtest_subset.txt
-import sys, re
-src = open('src/linebreak/table.rs').read()
-ranges = [(int(a, 16), int(b, 16)) for a, b in re.findall(r'\(0x([0-9A-F]+), 0x([0-9A-F]+)\),\n', src.split('pub static TABLE')[0])]
+# (the FONTCORE-era table ranges below), dropping comments. Usage: python3 filter_lbtest.py LineBreakTest.txt > tests/data/lbtest_subset.txt
+# Since FONTBIDI (SR56) the line breaker covers every code point (src/ucd/linebreak.rs from oracle/gen_ucd.py) and
+# tests/linebreak.rs also runs the full file; this committed subset stays as the offline gate.
+import sys
+ranges = [(0x0000,0x052F),(0x1C80,0x1C8F),(0x1D00,0x1DFF),(0x1E00,0x1FFF),(0x2000,0x206F),(0x20A0,0x20A8),(0x20AA,0x20C1),(0x2DE0,0x2DFF),(0xA640,0xA69F),(0xA720,0xA7FF),(0xFB00,0xFB06),(0xFEFF,0xFEFF)]
 ok = lambda c: any(a <= c <= b for a, b in ranges)
 n = k = 0
 print("# Subset of LineBreakTest-17.0.0.txt (sha256 e69884e0dde6a8724873f885d68c52dc14518abf9ae4ca9e2283b8773db3b752):")
