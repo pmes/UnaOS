@@ -1,265 +1,219 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-//! `facet` — the UnaOS image vessel: a decoded picture given a window.
+//! `facet-view` — the UnaOS image vessel: a window over the Facet handler.
 //!
-//! Like every vessel, this binary is wiring and lifecycle only. It opens the
-//! image file named on the command line, decodes it through `libs/lux`
-//! (`decode` dispatches on the container's magic bytes: PNG/JPEG/ARW), packs
-//! the linear `RgbBuffer` down to 8-bit sRGB RGBA, and hands those pixels to a
-//! native Quartzite window that draws them aspect-fit. Decoding and the sRGB
-//! OETF live here, in the vessel; the quartzite image view is a dumb blitter.
+//! Like every vessel this binary is wiring and lifecycle only. It starts a Synapse, serves the
+//! Images handler on it (`facet::serve`), and runs the [`facet_view::Viewer`] controller between
+//! the window and Facet: window input becomes Facet requests, Facet's rendered frames become
+//! `SurfaceBlit`s. On macOS the window is quartzite's image surface (`bootstrap_image_surface`,
+//! which forwards keys, wheel and resizes over the bus); everywhere, the headless witness drives
+//! the very same controller from a key script and writes the last frame as a PNG:
 //!
-//! The picture shows aspect-fit, right-side-up, and color-managed, and the
-//! quartzite view gives it hands: zoom about the cursor, drag-pan, reset-to-fit,
-//! and a live per-pixel readout (FACET-2).
-//!
-//! FACET-GPU: presentation defaults to the euclase textured quad — quartzite
-//! hosts a `CAMetalLayer` (pinned sRGB) and this vessel builds the wgpu side
-//! over it (`Cortex::ignite_layer_blocking` + `TexturedQuad`, frame uploaded
-//! `Rgba8UnormSrgb`), redrawn on demand with zoom/pan folded into the quad's
-//! `Mat4` uniform. If GPU init fails the vessel logs it and falls back to the
-//! CPU blit automatically; `FACET_CPU=1` forces the CPU path — the knob is the
-//! eye-witness A/B instrument (the two paths must be visually
-//! indistinguishable).
+//! ```text
+//! facet-view <image>                                    # the window (macOS)
+//! facet-view <image> --size 320x240 --keys "+r]x" --out shot.png   # headless witness
+//! ```
+//! Key script: one character per shortcut; `{Up}` `{Down}` `{Left}` `{Right}` for the arrows.
 
-use bandy::telemetry;
-use gneiss_pal::paths::UnaPaths;
-use lux::RgbBuffer;
+use bandy::signals::FacetCommand;
+use bandy::{Origin, SMessage, Synapse};
+use facet_view::Viewer;
+use std::time::Duration;
 
-/// The sRGB opto-electronic transfer function (linear → sRGB), the exact
-/// inverse of `lux::color::srgb_to_linear`. `lux` hands us *linear* f32 RGB;
-/// a display wants sRGB-encoded samples, so we encode here before packing.
-#[inline]
-fn linear_to_srgb(c: f32) -> f32 {
-    let c = c.clamp(0.0, 1.0);
-    if c <= 0.003_130_8 {
-        c * 12.92
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
-    }
+struct Cli {
+    path: String,
+    size: (u32, u32),
+    keys: Option<String>,
+    out: Option<String>,
 }
 
-/// The sRGB EOTF (sRGB → linear) at f64, for the GPU clear color: wgpu clear
-/// values are linear and the sRGB swapchain encodes on store, so feeding the
-/// linearized Moonstone triple reproduces the CPU path's field bytes exactly.
-#[cfg(target_os = "macos")]
-fn srgb8_to_linear_f64(v: u8) -> f64 {
-    let c = v as f64 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
+fn cli() -> Cli {
+    let mut a = std::env::args().skip(1);
+    let mut c = Cli { path: String::new(), size: (800, 600), keys: None, out: None };
+    while let Some(arg) = a.next() {
+        match arg.as_str() {
+            "--size" => {
+                let v = a.next().unwrap_or_default();
+                let (w, h) = v.split_once('x').unwrap_or(("", ""));
+                c.size = (w.parse().unwrap_or(800), h.parse().unwrap_or(600));
+            }
+            "--keys" => c.keys = a.next(),
+            "--out" => c.out = a.next(),
+            "--help" | "-h" => {
+                eprintln!("usage: facet-view <image> [--size WxH] [--keys SCRIPT] [--out shot.png]");
+                for (k, what) in facet_view::SHORTCUTS {
+                    eprintln!("  {k:<8} {what}");
+                }
+                std::process::exit(0);
+            }
+            _ => c.path = arg,
+        }
     }
+    if c.path.is_empty() {
+        eprintln!("facet-view: usage: facet-view <image> [--size WxH] [--keys SCRIPT] [--out shot.png]");
+        std::process::exit(2);
+    }
+    c
 }
 
-/// The console field the picture sits on (UnaOS Moonstone, `#2D2B55` —
-/// matching the quartzite CPU view's `FIELD`).
-#[cfg(target_os = "macos")]
-const FIELD_SRGB: (u8, u8, u8) = (0x2D, 0x2B, 0x55);
-
-/// Pack a linear `RgbBuffer` into tightly packed 8-bit sRGB RGBA (opaque),
-/// row-major, top row first — the format the quartzite image view expects.
-fn pack_srgba(buf: &RgbBuffer) -> Vec<u8> {
-    let px = buf.width as usize * buf.height as usize;
-    let mut out = Vec::with_capacity(px * 4);
-    // Guard against a short pixel vec: only iterate whole RGB triples we have.
-    let triples = buf.pixels.len() / 3;
-    let n = triples.min(px);
-    for i in 0..n {
-        let r = linear_to_srgb(buf.pixels[i * 3]);
-        let g = linear_to_srgb(buf.pixels[i * 3 + 1]);
-        let b = linear_to_srgb(buf.pixels[i * 3 + 2]);
-        out.push((r * 255.0).round().clamp(0.0, 255.0) as u8);
-        out.push((g * 255.0).round().clamp(0.0, 255.0) as u8);
-        out.push((b * 255.0).round().clamp(0.0, 255.0) as u8);
-        out.push(255);
-    }
-    // Any pixels the decoder under-delivered stay black+opaque.
-    out.resize(px * 4, 0);
-    for i in 0..px {
-        if i >= n {
-            out[i * 4 + 3] = 255;
+/// Split a key script into keys: single characters, or `{Name}` tokens.
+fn keys(script: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = script.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '{' {
+            let name: String = it.by_ref().take_while(|&c| c != '}').collect();
+            out.push(name);
+        } else {
+            out.push(c.to_string());
         }
     }
     out
 }
 
-/// Attempt the GPU presentation path: quartzite hosts the `CAMetalLayer`
-/// (already pinned sRGB), and this vessel builds the whole wgpu side over the
-/// layer pointer it hands back — a presentation-spec `Cortex` (vsync, no extra
-/// features), the `TexturedQuad`, and one `Rgba8UnormSrgb` upload of the same
-/// packed sRGB bytes the CPU path blits (the readout keeps consuming them on
-/// the view side). Returns `None` on any GPU-init failure so the caller can
-/// fall back to the CPU view.
-#[cfg(target_os = "macos")]
-fn bootstrap_gpu(
-    window: &quartzite::NativeWindow,
-    rgba: &[u8],
-    linear: &[f32],
-    w: u32,
-    h: u32,
-) -> Option<quartzite::NativeView> {
-    use euclase::cortex::{Cortex, CortexSpec};
-    use euclase::quad::{view_rect_to_ndc, TexturedQuad};
-    use quartzite::platforms::macos::gpu_view::{self, GpuFrameParams};
-
-    // The Moonstone field, linearized: the sRGB swapchain re-encodes on store,
-    // landing the exact CPU-path field bytes around an aspect-fit picture.
-    let clear = euclase::wgpu::Color {
-        r: srgb8_to_linear_f64(FIELD_SRGB.0),
-        g: srgb8_to_linear_f64(FIELD_SRGB.1),
-        b: srgb8_to_linear_f64(FIELD_SRGB.2),
-        a: 1.0,
-    };
-
-    gpu_view::bootstrap_gpu_view(window, rgba, linear, w, h, |layer, dw, dh| {
-        // SAFETY: `layer` is the view's retained CAMetalLayer; the returned
-        // closure (owning the Cortex and its Surface) is stored in the view's
-        // ivars, which drop before the view releases the layer — the layer
-        // outlives the Cortex<'static> (see gpu_view's module doc).
-        let mut cortex = match unsafe {
-            Cortex::ignite_layer_blocking(layer, dw, dh, CortexSpec::presentation())
-        } {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("[FACET] :: GPU cortex ignite failed: {e}");
-                return None;
+/// Fire `reqs` and settle every answer (and every follow-up it causes) through the viewer.
+/// Returns the newest frame the viewer asked to blit.
+async fn settle(
+    viewer: &mut Viewer,
+    synapse: &Synapse,
+    rx: &mut tokio::sync::broadcast::Receiver<SMessage>,
+    mut reqs: Vec<FacetCommand>,
+) -> Option<SMessage> {
+    let mut blit = None;
+    while !reqs.is_empty() {
+        let mut pending: Vec<u64> = reqs.iter().filter_map(|r| r.receipt_id()).collect();
+        for r in reqs.drain(..) {
+            synapse.fire(SMessage::Facet(r));
+        }
+        while !pending.is_empty() {
+            let msg = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
+            let Ok(Ok(SMessage::Facet(cmd))) = msg else {
+                if msg.is_err() {
+                    eprintln!("facet-view: Facet did not answer within 30 s");
+                    return blit;
+                }
+                continue;
+            };
+            if let Some(r) = cmd.receipt_id().filter(|_| !cmd.is_request()) {
+                pending.retain(|p| *p != r);
             }
-        };
-        log::info!(
-            "[FACET] :: GPU cortex up — {}x{} swapchain, format {:?}.",
-            cortex.config.width,
-            cortex.config.height,
-            cortex.config.format
-        );
-
-        // Linear filtering: closest to the CPU blit's AppKit look (nearest at
-        // high zoom stays an open eye-witness question).
-        let mut quad = TexturedQuad::forge(
-            &cortex.device,
-            cortex.config.format,
-            euclase::wgpu::FilterMode::Linear,
-        );
-        quad.upload_frame(&cortex.device, &cortex.queue, rgba, w, h);
-
-        Some(Box::new(move |p: &GpuFrameParams| {
-            if (cortex.config.width, cortex.config.height) != p.drawable {
-                cortex.resize(p.drawable.0, p.drawable.1);
+            let (more, b) = viewer.answer(&cmd);
+            reqs.extend(more);
+            if b.is_some() {
+                blit = b;
             }
-            quad.set_transform(&cortex.queue, &view_rect_to_ndc(p.dest, p.bounds));
-            if let Err(e) = quad.render(&cortex, clear) {
-                log::warn!("[FACET] :: GPU present failed: {e}");
-            }
-        }))
-    })
+        }
+    }
+    blit
 }
 
 fn main() {
-    // 1. Establish Base Camp + Telemetry (the shared vessel boot).
-    UnaPaths::awaken().expect("CRITICAL: Failed to awaken spatial paths");
-    telemetry::ignite(UnaPaths::root().join("logs"));
-    log::info!("Facet Boot Sequence Initiated.");
+    let cli = cli();
+    let principal = Origin::LocalUser(std::env::var("USER").unwrap_or_else(|_| "una".into()));
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    let synapse = Synapse::new();
+    {
+        let served = synapse.subscribe();
+        rt.spawn(facet::serve(synapse.clone(), served, facet::Facet::new()));
+    }
 
-    // 2. The subject: the image path is the one required argument.
-    let path = match std::env::args().nth(1) {
-        Some(p) => p,
-        None => {
-            eprintln!("facet: usage: facet <image-file>   (PNG, JPEG, or Sony ARW)");
-            log::error!("facet: no image path given");
+    // ---- The headless witness: the same controller, the same bus, frames to a PNG. ----
+    if cli.out.is_some() || cfg!(not(target_os = "macos")) {
+        let Some(out) = cli.out.clone() else {
+            eprintln!("facet-view: no native window backend on this platform yet (macOS first); use --out");
             std::process::exit(2);
-        }
-    };
+        };
+        let code = rt.block_on(async {
+            let mut rx = synapse.subscribe();
+            let mut v = Viewer::new(&cli.path, principal, cli.size);
+            let start = v.start();
+            let mut frame = settle(&mut v, &synapse, &mut rx, start).await;
+            for k in keys(cli.keys.as_deref().unwrap_or("")) {
+                let reqs = v.key(&k);
+                if let Some(f) = settle(&mut v, &synapse, &mut rx, reqs).await {
+                    frame = Some(f);
+                }
+            }
+            if let Some(e) = &v.last_error {
+                eprintln!("facet-view: {e}");
+            }
+            match frame {
+                Some(SMessage::SurfaceBlit { width, height, pixels, .. }) => {
+                    if let Err(e) = std::fs::write(&out, facet::png::encode(width, height, &pixels)) {
+                        eprintln!("facet-view: {out}: {e}");
+                        return 1;
+                    }
+                    println!("{} -> {out}", v.title());
+                    0
+                }
+                _ => {
+                    eprintln!("facet-view: no frame rendered");
+                    1
+                }
+            }
+        });
+        std::process::exit(code);
+    }
 
-    // 3. Read + decode via lux. Fail loudly, before opening any window.
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("facet: cannot read {path}: {e}");
-            log::error!("facet: read {path} failed: {e}");
-            std::process::exit(1);
-        }
-    };
-    let image = match lux::decode(&bytes) {
-        Ok(img) => img,
-        Err(e) => {
-            eprintln!("facet: cannot decode {path}: {e:?}");
-            log::error!("facet: decode {path} failed: {e:?}");
-            std::process::exit(1);
-        }
-    };
-    log::info!(
-        "[FACET] :: Decoded {} — {}x{} ({} linear samples).",
-        path,
-        image.width,
-        image.height,
-        image.pixels.len()
-    );
-
-    // 4. Pack linear → sRGB RGBA once, here in the vessel. Keep the source
-    //    linear RGB too — the image view surfaces it in the FACET-2 pixel
-    //    readout alongside the packed sRGB.
-    let (w, h) = (image.width, image.height);
-    let rgba = pack_srgba(&image);
-    let _linear = image.pixels;
-
-    // 5. The Window (macOS AppKit via quartzite; further backends follow
-    //    quartzite maturity).
+    // ---- The window (macOS AppKit via quartzite's image surface). ----
     #[cfg(target_os = "macos")]
     {
-        let title = std::path::Path::new(&path)
+        use gneiss_pal::paths::UnaPaths;
+        UnaPaths::awaken().expect("CRITICAL: Failed to awaken spatial paths");
+        bandy::telemetry::ignite(UnaPaths::root().join("logs"));
+        log::info!("[FACET-VIEW] :: boot — {}", cli.path);
+
+        // The controller loop: window input and Facet answers in, requests and blits out.
+        {
+            let synapse = synapse.clone();
+            let mut rx = synapse.subscribe();
+            let mut v = Viewer::new(&cli.path, principal, cli.size);
+            rt.spawn(async move {
+                for r in v.start() {
+                    synapse.fire(SMessage::Facet(r));
+                }
+                loop {
+                    match rx.recv().await {
+                        Ok(SMessage::Facet(cmd)) => {
+                            let (more, blit) = v.answer(&cmd);
+                            for r in more {
+                                synapse.fire(SMessage::Facet(r));
+                            }
+                            if let Some(b) = blit {
+                                synapse.fire(b);
+                            }
+                            if let Some(e) = v.last_error.take() {
+                                log::warn!("[FACET-VIEW] :: {e}");
+                            }
+                        }
+                        Ok(msg) => {
+                            for r in v.input(&msg) {
+                                synapse.fire(SMessage::Facet(r));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
+        let title = std::path::Path::new(&cli.path)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("facet")
             .to_string();
+        let surface_synapse = synapse.clone();
         quartzite::Backend::new_vessel(
             "org.unaos.facet",
             &format!("facet — {title}"),
-            (
-                (w as f64).clamp(240.0, 1600.0),
-                (h as f64).clamp(160.0, 1000.0),
-            ),
-            move |window| {
-                // GPU by default; FACET_CPU=1 is the eye-witness A/B knob.
-                let force_cpu = std::env::var("FACET_CPU").is_ok_and(|v| v == "1");
-                if force_cpu {
-                    log::info!("[FACET] :: FACET_CPU=1 — forcing the CPU blit path.");
-                } else if let Some(view) = bootstrap_gpu(window, &rgba, &linear, w, h) {
-                    log::info!(
-                        "[FACET] :: Presentation path: GPU (euclase textured quad on CAMetalLayer)."
-                    );
-                    return view;
-                } else {
-                    log::warn!(
-                        "[FACET] :: GPU presentation unavailable; falling back to the CPU blit."
-                    );
-                }
-                log::info!("[FACET] :: Presentation path: CPU (AppKit NSBitmapImageRep blit).");
-                quartzite::platforms::macos::image_view::bootstrap_image_view(
-                    window, &rgba, &linear, w, h,
-                )
+            (cli.size.0 as f64, cli.size.1 as f64),
+            move |_window| {
+                quartzite::platforms::macos::image_view::bootstrap_image_surface(facet_view::SURFACE, surface_synapse.clone())
             },
         )
         .run();
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (rgba, w, h);
-        eprintln!("facet: no native backend for this platform yet (macOS first).");
-        log::error!("facet: no native backend for this platform yet (macOS first).");
+        drop(rt);
     }
 }

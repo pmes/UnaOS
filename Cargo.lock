@@ -61,6 +61,7 @@ version = "0.1.0"
 dependencies = [
  "aether",
  "bandy",
+ "facet",
  "quartzite",
  "tokio",
 ]
@@ -2166,11 +2167,12 @@ name = "facet-view"
 version = "0.1.0"
 dependencies = [
  "bandy",
- "euclase",
+ "facet",
  "gneiss_pal",
  "log",
- "lux",
  "quartzite",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
