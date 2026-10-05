@@ -3788,6 +3788,10 @@ vein_core = { path = "../../libs/sys/vein_core", default-features = false, optio
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).
 amber_core = { path = "../../libs/sys/amber_core", default-features = false }
+# PIXELCORE (SR25): the still-image decoders UnaOS owns — PNG/JPEG/GIF/BMP/QOI/WebP-lossless — AND the one
+# inflater + the SHOTZIP PNG encoder, moved here from `selfhost/inflate.rs` and `video/png.rs` (both now
+# re-exports). no_std + alloc, zero deps; arch-neutral; the same crate Aether (via gneiss_pal) links.
+pixel_core = { path = "../../libs/media/pixel_core" }
 net = { path = "../net" }
 fdt = "0.1.5"
 # RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so
