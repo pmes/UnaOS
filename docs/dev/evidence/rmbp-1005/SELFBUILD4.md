@@ -80,7 +80,7 @@ shim answers. There is no `mremap` here either: the probe's allocations stay und
 
   Until a page is touched, the process's PML4[0] holds the kernel's identity map, which is present but not USER. The fault hook now
   treats that as not-present for a VMA page and flushes after backing it. A USER page already in the window refuses the load. For
-  RUST.LNX the numbers are 4 eager pages, about 120 lazy pages in 5 VMAs, and roughly 17 KB read at exec out of 499904. The 128 MiB
+  RUST.LNX: 5 eager pages, 119 lazy pages in 4 VMAs, 16874 bytes read at exec out of 499904 (computed from its headers). The 128 MiB
   whole-file cap no longer applies to execs.
 - **SIGBUS past EOF.** This was not hit, but it costs about 20 lines. `populate` refuses a file page whose offset is at or beyond the
   file's size (`Refuse::Bus`). The fault hook records `pid << 8 | 7`, and `note_fault` finishes the process with status 7 instead of
