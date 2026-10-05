@@ -4,7 +4,7 @@
 //! `syscall.rs` owns only the user copy; Holocron's users store answers who a program runs as)
 //!
 //! RING3ABI2 (rmbp-ledger B333): the arch-neutral bodies behind the ring-3 surface's loose ends —
-//! the `SYS_WHOAMI` (59) record and the `tests ring3abi` fixture. The args page itself is per-arch
+//! the `SYS_WHOAMI` (61) record and the `tests ring3abi` fixture. The args page itself is per-arch
 //! (x86 `memory.rs` tail, aarch64 `xwin.rs`), its layout is `una_abi::args_build`'s. Design and witness:
 //! `docs/dev/evidence/rmbp-1005/RING3ABI2.md`.
 

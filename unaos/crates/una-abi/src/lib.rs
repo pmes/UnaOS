@@ -1256,7 +1256,7 @@ const _: () = assert!(SYS_PATH_READ == SYS_SBRK + 1 && SYS_PATH_WRITE == SYS_PAT
 /// `SYS_WHOAMI(buf, len) -> bytes written / -errno` — who the CALLER runs as: `[WhoAmIHdr][name][home]`
 /// (see [`whoami_build`]). `-ENOENT` no session (an anonymous program), `-ERANGE` a buffer shorter than
 /// the record, `-EFAULT` a bad buffer. Both arches dispatch it.
-pub const SYS_WHOAMI: u64 = 59;
+pub const SYS_WHOAMI: u64 = 61; // merge12 fold: 59/60 are SELFDIAG's SYS_PATH_READ/WRITE; WHOAMI moved from 59
 /// Byte offset of the args page from the window base (x86) / the extension base (aarch64).
 pub const USER_ARGS_OFF: u64 = 0x1F_F000;
 /// The args page is one page.
