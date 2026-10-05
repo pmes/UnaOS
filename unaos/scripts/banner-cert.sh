@@ -346,6 +346,7 @@ unafs|:: UNAFSX86: root=|-|measured
 vein|:: VEINBUS:|-|measured
 lumen|:: LUMEN:|-|measured
 netring3|:: ENTROPY:|-|measured
+selfdiag|:: SELFDIAG:|-|measured
 TABLE
 }
 
