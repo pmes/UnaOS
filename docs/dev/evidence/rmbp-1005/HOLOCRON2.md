@@ -65,3 +65,39 @@ per verb `[holocron] <verb> -> <status>`; LUMEN: `:: LUMEN: start … key=holocr
 pinentry); LOGIN does not hand Holocron the login password. "Exit when the last client leaves" is
 approximated by session end (the kernel cannot tell a fulfiller its callers left). The SSH agent has no
 socket on the metal. `SYS_KDF` runs Argon2 synchronously in the caller's syscall (≈0.5 s at 64 MiB).
+
+## Results (compile legs; R78 — no QEMU, the metal boot is the seat's)
+
+Commits: M1a `4fd34750` (frame + host KAT, relay stamp, SYS_KDF, PATH_R_LIST, keyring) · M1 `5247b264`
+(user-holocron, arroyo, builder) · M2 `fb8f947b` (LUMEN asks Holocron first) · M3 `599d4148` (bare name in
+`tests exec` + midden_core) · M4 this doc.
+
+- x86 metal shape + `selfdiag,ahciroot,btc` (`wc,quarry,ftdirx,login,loginst,nvidia-kepler-vblank,smc,usbnet,
+  hda,hda-tone,facet,beam,sdw,sdwrite,sdhcblk,selfhost,linuxabi,ahci,unafs,busreg,lumen,netring3,prefs_reset,
+  census,installdemo,instgui,witness,selfdiag,ahciroot,btc`): exit 0.
+- aarch64 `login,loginst,virt_el0,lumen` (user blob rebuilt, head 280080d2): exit 0.
+- `build_user_holocron_x86` (the arroyo function, run verbatim): exit 0 — `HOLOCRON-X86.ELF: 70184 B file,
+  model=elf span=69936 stack=262144`, `:: ELFENTRY: HOLOCRON-X86.ELF entry=0x10000200000 … -> PASS ::`, PT_NOTE
+  `UnaOS` desc `02` (RESIDENT) kept.
+- `build_user_lumen_x86`: exit 0 — `LUMEN-X86.ELF: 215408 B file, model=elf span=3285184 stack=262144`, ELFENTRY
+  PASS; `holocron=` and `key: from Holocron` present in the image (`LC_ALL=C grep -a -o -F`).
+- `cargo test -p holocron_core -p holocron -p una-abi`: exit 0 (holocron_core + 3 frame tests; holocron +
+  `m3_metal_frame`: `:: HOLOCRON2-KAT: client-bytes=8 …`, `:: HOLOCRON2-KAT: daemon round trips=8 put=ok get=ok
+  locked=-37 notfound=-2 -> PASS ::`; `:: HOLOCRON2-ABI: kdf=66 path_r_list=8 verbs=144..=151 -> PASS ::`).
+  `cargo test -p vein_ring3`, `-p midden_core holocron2`: exit 0. `tools/prefs-schema-check.py`: PASS 29/29.
+- `charter-check.sh`: exit 0.
+
+**Wire a metal boot should print.** `tests holocron` (session open, UNAOS_LUMEN=1):
+`[holocron] fx kdf=argon2id m=19456KiB t=2 create=0 lock=0 lock-then-get=-37 ms=<n>` then
+`:: HOLOCRON: ring=<unafs|none> verbs=<0|8> owner=<user>#<uid> put=ok get=ok denied=1 corrupt=1 -> PASS ::`.
+`holocron init <pw>` (first, no ring): `[holocron] unlock -> ok (in this Holocron)` then
+`:: HOLOCRON: serve ring=unafs verbs=8 owner=<user> state=unlocked ::`; `holocron put vein claude.api_key <key>`:
+`[holocron] put -> ok (via the running Holocron)` and the fulfiller's `[holocron] relay verb=put caller=owner ->
+ok`; then `lumen`: `:: LUMEN: start provider=claude … key=holocron transport=tls …`. Next login with a ring:
+`[holocron] login user=<u> ring=unafs -> started pid=<p> slot=<s>`. `tests exec`: `resolved=6/6`.
+
+**Not finished / owed.** The metal boot. Password as argv (args page, shell line); LOGIN does not hand Holocron
+the login password. The fulfiller lives until the session ends (no "last client" signal from the kernel).
+SYS_KDF blocks its caller ≈0.5 s at 64 MiB/t 3/p 4. No SSH-agent socket on the metal; no UnaFS typed-attribute
+mirror (`created/kind/label`) on metal-written secrets; a secret is replaced by truncate+write (not atomic).
+user-holocron is not in arroyo's USER_CHECK_MATRIX type-check list. aarch64: SYS_KDF / PATH_R_LIST not dispatched.
