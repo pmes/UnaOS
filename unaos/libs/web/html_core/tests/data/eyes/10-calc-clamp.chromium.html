@@ -1,0 +1,16 @@
+<html><head><meta charset="utf-8"><title>Calc</title>
+<style>
+html { font-size: 16px; }
+body { margin: 0; font-family: sans-serif; }
+.a { width: calc(100% - 40px); margin: 10px 20px; background: #a2d2ff; height: 40px; }
+.b { width: clamp(200px, 50vw, 500px); background: #ffafcc; height: 40px; margin: 10px 20px; }
+.c { width: min(300px, 80%); background: #cdb4db; height: 40px; margin: 10px 20px; }
+.d { width: max(150px, 25vw); background: #bde0fe; height: 40px; margin: 10px 20px; }
+h1 { font-size: clamp(1.25rem, 4vw, 2.5rem); margin: 10px 20px; }
+.e { padding: calc(0.5rem + 1vw); background: #ffc8dd; margin: 10px 20px; font-size: 1.125rem; }
+</style></head><body>
+<h1>Fluid heading</h1>
+<div class="a"></div><div class="b"></div><div class="c"></div><div class="d"></div>
+<div class="e">Padding grows with the viewport.</div>
+
+</body></html>

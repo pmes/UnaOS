@@ -242,7 +242,7 @@ pub fn double_unescape(u: &[u16]) -> Vec<u16> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < u.len() {
-        if u[i] == b'\\' as u16 && i + 5 < u.len() + 0 && u[i + 1] == b'u' as u16 {
+        if u[i] == b'\\' as u16 && i + 5 < u.len() && u[i + 1] == b'u' as u16 {
             let h: String = u[i + 2..i + 6].iter().map(|&c| c as u8 as char).collect();
             if let Ok(v) = u16::from_str_radix(&h, 16) {
                 out.push(v);
@@ -255,3 +255,51 @@ pub fn double_unescape(u: &[u16]) -> Vec<u16> {
     }
     out
 }
+
+// ---- html5lib tree-construction .dat reader -----------------------------------------------------------------
+
+pub struct DatTest {
+    pub data: String,
+    pub fragment: Option<String>,
+    pub script: Option<bool>,
+    pub document: String,
+}
+
+/// Split a .dat file into tests.
+pub fn parse_dat(text: &str) -> Vec<DatTest> {
+    let mut out = Vec::new();
+    let body = text.strip_prefix("#data\n").unwrap_or(text);
+    for block in body.split("\n#data\n") {
+        let mut data = String::new();
+        let mut fragment = None;
+        let mut script = None;
+        let mut document = String::new();
+        let mut section = "data";
+        for line in block.split_inclusive('\n') {
+            let header = line.trim_end_matches('\n');
+            let is_header = section != "document"
+                && matches!(header, "#errors" | "#new-errors" | "#document-fragment" | "#script-off" | "#script-on" | "#document");
+            if is_header {
+                section = header.trim_start_matches('#');
+                match section {
+                    "script-off" => script = Some(false),
+                    "script-on" => script = Some(true),
+                    _ => {}
+                }
+                continue;
+            }
+            match section {
+                "data" => data.push_str(line),
+                "document-fragment" => fragment = Some(header.to_string()),
+                "document" => document.push_str(line),
+                _ => {}
+            }
+        }
+        if data.ends_with('\n') {
+            data.pop();
+        }
+        out.push(DatTest { data, fragment, script, document });
+    }
+    out
+}
+

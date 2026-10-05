@@ -5,54 +5,9 @@
 
 mod common;
 
-use common::{fetch, file_name, vectors};
+use common::{fetch, file_name, parse_dat, vectors, DatTest};
 use html_core::serialize::html5lib_dump;
 use html_core::{parse_document, parse_fragment, Document, Namespace, ParseOpts, QuirksMode};
-
-pub struct DatTest {
-    pub data: String,
-    pub fragment: Option<String>,
-    pub script: Option<bool>,
-    pub document: String,
-}
-
-/// Split a .dat file into tests.
-pub fn parse_dat(text: &str) -> Vec<DatTest> {
-    let mut out = Vec::new();
-    let body = text.strip_prefix("#data\n").unwrap_or(text);
-    for block in body.split("\n#data\n") {
-        let mut data = String::new();
-        let mut fragment = None;
-        let mut script = None;
-        let mut document = String::new();
-        let mut section = "data";
-        for line in block.split_inclusive('\n') {
-            let header = line.trim_end_matches('\n');
-            let is_header = section != "document"
-                && matches!(header, "#errors" | "#new-errors" | "#document-fragment" | "#script-off" | "#script-on" | "#document");
-            if is_header {
-                section = header.trim_start_matches('#');
-                match section {
-                    "script-off" => script = Some(false),
-                    "script-on" => script = Some(true),
-                    _ => {}
-                }
-                continue;
-            }
-            match section {
-                "data" => data.push_str(line),
-                "document-fragment" => fragment = Some(header.to_string()),
-                "document" => document.push_str(line),
-                _ => {}
-            }
-        }
-        if data.ends_with('\n') {
-            data.pop();
-        }
-        out.push(DatTest { data, fragment, script, document });
-    }
-    out
-}
 
 pub fn run_one(t: &DatTest) -> String {
     let opts = ParseOpts::default();

@@ -70,20 +70,83 @@ pub fn outer_html(doc: &Document, node: NodeId, opts: SerializeOpts) -> String {
     s
 }
 
-fn serialize_children(doc: &Document, node: NodeId, opts: SerializeOpts, s: &mut String) {
+/// The children whose serializations make up `node`'s inner HTML (template contents for a template).
+fn content_root(doc: &Document, node: NodeId) -> Option<NodeId> {
     if is_void_element(doc, node) {
-        return;
+        return None;
     }
-    let node = match doc.element(node) {
+    Some(match doc.element(node) {
         Some(e) if e.ns == Namespace::Html && e.local == "template" => e.template_contents.unwrap_or(node),
         _ => node,
-    };
-    for child in doc.children(node) {
-        serialize_node(doc, child, opts, s);
+    })
+}
+
+fn serialize_children(doc: &Document, node: NodeId, opts: SerializeOpts, s: &mut String) {
+    if let Some(root) = content_root(doc, node) {
+        walk(doc, doc.first_child(root), opts, s);
     }
 }
 
 fn serialize_node(doc: &Document, n: NodeId, opts: SerializeOpts, s: &mut String) {
+    match doc.data(n) {
+        NodeData::Document | NodeData::DocumentFragment => serialize_children(doc, n, opts, s),
+        _ => {
+            let mut stack: Vec<NodeId> = Vec::new();
+            emit(doc, n, opts, s, &mut stack);
+            drain(doc, opts, s, &mut stack);
+        }
+    }
+}
+
+/// Serialize a run of siblings starting at `first`, iteratively (no recursion: arbitrarily deep trees are fine).
+fn walk(doc: &Document, first: Option<NodeId>, opts: SerializeOpts, s: &mut String) {
+    let mut stack: Vec<NodeId> = Vec::new();
+    let mut cur = first;
+    while let Some(n) = cur {
+        emit(doc, n, opts, s, &mut stack);
+        drain(doc, opts, s, &mut stack);
+        cur = doc.next_sibling(n);
+    }
+}
+
+/// Finish every element `emit` left open on `stack` (start tag written): its children, then its end tag.
+fn drain(doc: &Document, opts: SerializeOpts, s: &mut String, stack: &mut Vec<NodeId>) {
+    // Each frame is an element whose start tag was written; walk its children, then close it.
+    let mut cursors: Vec<Option<NodeId>> = Vec::new();
+    let mut frames: Vec<NodeId> = Vec::new();
+    for f in stack.drain(..) {
+        let first = content_root(doc, f).and_then(|r| doc.first_child(r));
+        frames.push(f);
+        cursors.push(first);
+    }
+    // `frames`/`cursors` act as one explicit recursion stack.
+    while let Some(cursor) = cursors.last_mut() {
+        match *cursor {
+            Some(child) => {
+                *cursor = doc.next_sibling(child);
+                let mut pushed: Vec<NodeId> = Vec::new();
+                emit(doc, child, opts, s, &mut pushed);
+                for f in pushed {
+                    let first = content_root(doc, f).and_then(|r| doc.first_child(r));
+                    frames.push(f);
+                    cursors.push(first);
+                }
+            }
+            None => {
+                cursors.pop();
+                let el = frames.pop().expect("frame");
+                if let Some(e) = doc.element(el) {
+                    s.push_str("</");
+                    s.push_str(&e.local);
+                    s.push('>');
+                }
+            }
+        }
+    }
+}
+
+/// Write `n`'s own markup; for a non-void element write the start tag and push it so its children follow.
+fn emit(doc: &Document, n: NodeId, opts: SerializeOpts, s: &mut String, stack: &mut Vec<NodeId>) {
     match doc.data(n) {
         NodeData::Element(e) => {
             let tagname = e.local.as_str();
@@ -113,10 +176,7 @@ fn serialize_node(doc: &Document, n: NodeId, opts: SerializeOpts, s: &mut String
             if e.ns == Namespace::Html && serializes_as_void(tagname) {
                 return;
             }
-            serialize_children(doc, n, opts, s);
-            s.push_str("</");
-            s.push_str(tagname);
-            s.push('>');
+            stack.push(n);
         }
         NodeData::Text(t) => {
             let raw = doc.parent(n).and_then(|p| doc.element(p)).is_some_and(|pe| {
@@ -147,7 +207,14 @@ fn serialize_node(doc: &Document, n: NodeId, opts: SerializeOpts, s: &mut String
             s.push_str(name);
             s.push('>');
         }
-        NodeData::Document | NodeData::DocumentFragment => serialize_children(doc, n, opts, s),
+        NodeData::Document | NodeData::DocumentFragment => {
+            let mut cur = doc.first_child(n);
+            while let Some(c) = cur {
+                emit(doc, c, opts, s, stack);
+                drain(doc, opts, s, stack);
+                cur = doc.next_sibling(c);
+            }
+        }
     }
 }
 
