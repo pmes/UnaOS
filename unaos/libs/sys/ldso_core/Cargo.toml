@@ -1,0 +1,22 @@
+[package]
+name = "ldso_core"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "SELFBUILD6 (B360): the shared no_std dynamic loader core — the kernel's Linux ABI shim and the host runner both link it."
+
+# The core is `#![no_std]` + `alloc` with NO dependencies. The kernel pulls it as a path dep with
+# `default-features = false`; the default-on `host` feature only gates the Linux host runner binary
+# (`src/bin/ldrun.rs`), the R78 execution proof: it runs the same mapping, lookup, relocation and TLS code
+# on the real payload under the host's kernel.
+[dependencies]
+
+[features]
+default = ["host"]
+host = []
+
+[[bin]]
+name = "ldrun"
+path = "src/bin/ldrun.rs"
+required-features = ["host"]
+test = false
