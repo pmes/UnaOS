@@ -3723,6 +3723,53 @@ build_user_vug_x86() {
 build_user_linux_hello_x86() {
     mkdir -p "${WORKSPACE_DIR}/target"
     ( cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly run --release --quiet -- "${WORKSPACE_DIR}/target/HELLO.LNX" )
+    build_selfbuild_x86   # SELFBUILD1: TCC.LNX + HELLO.C + SYSKAT.LNX + PROBE.LNX
+}
+
+# SELFBUILD1 (B344): the static Linux binaries `tests selfbuild` / `tests linuxabi` run under the Linux ABI shim, built on the
+# HOST into target/ and staged into APPS/ by the builder. NOTHING here enters the tree: tinycc (LGPL-2.1) and busybox (GPL-2.0)
+# are fetched at a PINNED commit into target/selfbuild/, built static, and only the stripped binary is staged on the volume
+# (R52-style: a binary on the volume, its source upstream). Static libc = the host's glibc (`-static -no-pie`); musl-gcc is
+# absent here — glibc-static adds start-up syscalls (rseq, readlinkat /proc/self/exe, getrandom), which is measured data.
+# No egress / no gcc = the binary is absent and the tests SKIP. SYSKAT.LNX is our own freestanding C (crates/user-linux-hello/c),
+# checked on the host kernel before it is staged; HELLO.C is the one-file program tcc compiles on UnaOS.
+SELFBUILD_TCC_URL="https://github.com/TinyCC/tinycc.git"
+SELFBUILD_TCC_REV="43c7708b85681a2fd4451c8a541af4494a8919b2"
+SELFBUILD_BB_URL="https://github.com/mirror/busybox.git"
+SELFBUILD_BB_REV="371fe9f71d445d18be28c82a2a6d82115c8af19d"
+_selfbuild_fetch() { # dir url rev
+    [ -d "$1/.git" ] && [ "$(git -C "$1" rev-parse HEAD 2>/dev/null)" = "$3" ] && return 0
+    rm -rf "$1" && mkdir -p "$1" && git -C "$1" init -q && git -C "$1" fetch -q --depth 1 "$2" "$3" && git -C "$1" checkout -q FETCH_HEAD
+}
+build_selfbuild_x86() {
+    local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c"
+    mkdir -p "$sb"
+    cp "$c/hello.c" "${WORKSPACE_DIR}/target/HELLO.C"
+    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -o "$sb/SYSKAT.LNX" "$c/syskat.c" \
+        && "$sb/SYSKAT.LNX" >/dev/null; then
+        cp "$sb/SYSKAT.LNX" "${WORKSPACE_DIR}/target/SYSKAT.LNX"
+    else
+        echo "   SELFBUILD1: SYSKAT.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT.LNX"
+    fi
+    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ]; then
+        if _selfbuild_fetch "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" \
+            && ( cd "$sb/tinycc" && ./configure --cc=gcc --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" >/dev/null && make -s tcc >/dev/null 2>&1 ); then
+            strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
+        else
+            echo "   SELFBUILD1: tinycc fetch/build failed — TCC.LNX absent, tests selfbuild will SKIP"
+        fi
+    fi
+    if [ ! -f "${WORKSPACE_DIR}/target/PROBE.LNX" ]; then
+        if _selfbuild_fetch "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" \
+            && ( cd "$sb/busybox" && make -s defconfig >/dev/null 2>&1 \
+                 && sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/; s/^# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/; s/^# CONFIG_FEATURE_PREFER_APPLETS is not set/CONFIG_FEATURE_PREFER_APPLETS=y/' .config \
+                 && (yes "" | make -s oldconfig >/dev/null 2>&1) && make -s -j"$(nproc)" >/dev/null 2>&1 ); then
+            cp "$sb/busybox/busybox" "${WORKSPACE_DIR}/target/PROBE.LNX"
+        else
+            echo "   SELFBUILD1: busybox fetch/build failed — PROBE.LNX absent (probe=none)"
+        fi
+    fi
+    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX HELLO.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).

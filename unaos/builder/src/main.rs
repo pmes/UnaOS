@@ -959,6 +959,12 @@ fn main() {
         // LINUXABI3: an OPERATOR-supplied static musl busybox dropped at target/BUSYBOX.LNX (nothing builds it; absent = skipped,
         // `tests linuxabi3` then reports busybox=skip) — `linux /apps/BUSYBOX.LNX ls /`.
         ("BUSYBOX.LNX", "BUSYBOX.LNX"),
+        // SELFBUILD1 (B344): the static tcc (upstream tinycc, LGPL — binary only, built by arroyo's build_selfbuild_x86), the
+        // one-file C program it compiles on UnaOS, the syscall KAT and the busybox probe — `tests selfbuild`, `tests linuxabi`.
+        ("TCC.LNX", "TCC.LNX"),
+        ("HELLO.C", "HELLO.C"),
+        ("SYSKAT.LNX", "SYSKAT.LNX"),
+        ("PROBE.LNX", "PROBE.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
