@@ -79,7 +79,9 @@ pub fn fetch(name: &str) -> Option<Vec<u8>> {
     let v = vectors().into_iter().find(|v| v.name == name).unwrap_or_else(|| panic!("no vector {name}"));
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("av1_core_vectors");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("{name}.avif"));
+    // keep the URL's extension (.avif, .ivf, .md5, ...)
+    let ext = v.url.rsplit('/').next().and_then(|b| b.split_once('.')).map(|(_, e)| e.to_string()).unwrap_or_else(|| "bin".into());
+    let path = dir.join(format!("{name}.{ext}"));
     if !path.exists() {
         let ok = std::process::Command::new("curl")
             .args(["-sSfL", "--max-time", "60", "-o"])
@@ -98,6 +100,77 @@ pub fn fetch(name: &str) -> Option<Vec<u8>> {
     let got = hex(&sha256(&data));
     assert_eq!(got, v.sha256, "sha256 mismatch for {name} ({})", v.url);
     Some(data)
+}
+
+/// MD5 (RFC 1321) — the libaom test vectors publish one MD5 per decoded frame.
+pub fn md5(data: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4,
+        11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    let k: Vec<u32> = (0..64).map(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32).collect();
+    let (mut a0, mut b0, mut c0, mut d0) = (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    let mut msg = data.to_vec();
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_le_bytes());
+    for chunk in msg.chunks(64) {
+        let m: Vec<u32> = (0..16).map(|i| u32::from_le_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]])).collect();
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (mut f, g);
+            if i < 16 {
+                f = (b & c) | (!b & d);
+                g = i;
+            } else if i < 32 {
+                f = (d & b) | (!d & c);
+                g = (5 * i + 1) % 16;
+            } else if i < 48 {
+                f = b ^ c ^ d;
+                g = (3 * i + 5) % 16;
+            } else {
+                f = c ^ (b | !d);
+                g = (7 * i) % 16;
+            }
+            f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..].copy_from_slice(&d0.to_le_bytes());
+    out
+}
+
+/// Split an IVF file into its frame payloads (temporal units).
+pub fn ivf_frames(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    if data.len() < 32 || &data[0..4] != b"DKIF" {
+        return out;
+    }
+    let mut off = u16::from_le_bytes([data[6], data[7]]) as usize;
+    while off + 12 <= data.len() {
+        let sz = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+        off += 12;
+        if off + sz > data.len() {
+            break;
+        }
+        out.push(&data[off..off + sz]);
+        off += sz;
+    }
+    out
 }
 
 /// FNV-1a 64 over 16-bit samples — the regression fingerprint of decoded planes.

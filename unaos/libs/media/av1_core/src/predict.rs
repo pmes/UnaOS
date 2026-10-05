@@ -131,14 +131,17 @@ fn edge_upsample(buf: &mut [i32], num_px: usize, bit_depth: u32) {
 }
 
 impl<'a, 'f> Dec<'a, 'f> {
-    fn is_smooth(&self, row: usize, col: usize, plane: usize) -> bool {
+    pub(crate) fn is_smooth(&self, row: usize, col: usize, plane: usize) -> bool {
         let i = self.fs.mi(row, col);
+        if plane > 0 && self.fs.ref_frames[i][0] as i32 > INTRA_FRAME as i32 {
+            return false;
+        }
         let mode = if plane == 0 { self.fs.y_modes[i] as usize } else { self.fs.uv_modes[i] as usize };
         mode == SMOOTH_PRED || mode == SMOOTH_V_PRED || mode == SMOOTH_H_PRED
     }
 
     /// §7.11.2.8 get_filter_type
-    fn get_filter_type(&self, plane: usize) -> bool {
+    pub(crate) fn get_filter_type(&self, plane: usize) -> bool {
         let mut above_smooth = false;
         let mut left_smooth = false;
         let (ssx, ssy) = (self.fs.ss_x, self.fs.ss_y);
@@ -516,7 +519,7 @@ mod tests {
     use crate::obu::{FrameHeader, SequenceHeader};
     use crate::tables::*;
 
-    fn setup() -> (SequenceHeader, FrameHeader) {
+    pub(crate) fn setup() -> (SequenceHeader, FrameHeader) {
         let mut s = SequenceHeader::default();
         s.color_config.bit_depth = 8;
         s.color_config.num_planes = 1;
@@ -528,7 +531,7 @@ mod tests {
 
     /// Fill the row above (y = 7, x = 7..) and the column left (x = 7, y = 7..) of the 8x8 block
     /// at (8, 8); returns the predicted block.
-    fn run(mode: usize, above: impl Fn(usize) -> u16, left: impl Fn(usize) -> u16, corner: u16, fi: Option<usize>) -> [[u16; 8]; 8] {
+    pub(crate) fn run(mode: usize, above: impl Fn(usize) -> u16, left: impl Fn(usize) -> u16, corner: u16, fi: Option<usize>) -> [[u16; 8]; 8] {
         let (s, h) = setup();
         let mut fs = FrameState::new(&s, &h);
         for i in 0..24 {
@@ -536,7 +539,8 @@ mod tests {
             fs.planes[0].set(7, 8 + i, left(i));
         }
         fs.planes[0].set(7, 7, corner);
-        let mut d = Dec::new(&s, &h, &mut fs, crate::image::Filters::default());
+        let refs = crate::refs::RefStore::default();
+        let mut d = Dec::new(&s, &h, &mut fs, crate::image::Filters::default(), &refs, crate::cdf::CdfContext::new(0));
         d.mi_row = 2;
         d.mi_col = 2;
         if let Some(m) = fi {
@@ -554,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn dc_v_h_paeth_smooth() {
+    pub(crate) fn dc_v_h_paeth_smooth() {
         // DC: (8 * 100 + 8 * 50 + 8) / 16 = 75
         let p = run(DC_PRED, |_| 100, |_| 50, 0, None);
         assert!(p.iter().flatten().all(|&v| v == 75));
@@ -580,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn directional_45_is_a_diagonal_shift() {
+    pub(crate) fn directional_45_is_a_diagonal_shift() {
         // pAngle 45: dx = Dr_Intra_Derivative[45] = 64 -> pred[i][j] = AboveRow[i + j + 1]
         assert_eq!(DR_INTRA_DERIVATIVE[45], 64);
         let p = run(D45_PRED, |i| 3 * i as u16, |_| 0, 0, None);
@@ -593,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_intra_has_unit_gain() {
+    pub(crate) fn filter_intra_has_unit_gain() {
         // every Intra_Filter_Taps row sums to 16 (1.0 in INTRA_FILTER_SCALE_BITS), so flat edges
         // predict flat for all five recursive filter modes
         for m in 0..5 {

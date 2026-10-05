@@ -1,4 +1,4 @@
-//! AVCODEC — a from-specification AV1 decoder, intra first (AVIF still images), in `no_std` + `alloc`.
+//! AVCODEC — a from-specification AV1 decoder (AVIF still images and AV1 video), in `no_std` + `alloc`.
 //!
 //! Source of truth: *AV1 Bitstream & Decoding Process Specification*, v1.0.0 with Errata 1
 //! (AOMedia). Module names follow the spec's sections; function and variable names inside follow
@@ -10,8 +10,12 @@
 //! | [`obu`]       | §5.3–5.9 OBU, sequence header, frame header, tile info       |
 //! | [`avif`]      | AVIF / HEIF (ISO/IEC 23008-12) / ISOBMFF item extraction     |
 //! | [`symbol`]    | §8.2 symbol decoder with CDF adaptation                      |
-//! | [`cdf`]       | §7.20 / §9.4 default CDF contexts (tables generated)         |
+//! | [`cdf`]       | §6.8.2 every CDF array, load/save/frame-end update           |
 //! | [`decode`]    | §5.9–5.11 tile, partition, block, mode info, residual        |
+//! | [`modeinfo`]  | §5.11.18–33 inter frame mode info and its contexts           |
+//! | [`mvpred`]    | §7.9 motion field estimation, §7.10 MV prediction            |
+//! | [`inter`]     | §7.11.3 inter prediction (filters, scaling, warp, OBMC, masks) |
+//! | [`refs`]      | §7.20 / §7.21 the reference frame store                      |
 //! | [`predict`]   | §7.11.2 intra, §7.11.4 palette, §7.11.5 CfL                   |
 //! | [`transform`] | §7.12 dequant / reconstruct, §7.13 inverse transforms        |
 //! | [`loopfilter`]| §7.14 deblocking                                             |
@@ -19,9 +23,8 @@
 //! | [`restoration`]| §7.17 loop restoration (Wiener, self-guided)               |
 //! | [`image`]     | Y'CbCr → RGBA and the `decode_avif` entry point              |
 //!
-//! What is NOT decoded (owed, see docs/dev/evidence/media-1004/AVCODEC.md): inter frames
-//! (motion vectors, reference frames, warped/global motion, OBMC, compound), intra block copy,
-//! superres upscaling, film grain synthesis, AVIF grid/alpha/transform properties.
+//! What is NOT decoded yet (owed, see docs/dev/evidence/media-1004/AVCODEC2.md): superres
+//! upscaling, film grain synthesis, large-scale tile, AVIF grid/alpha/layers/transform properties.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -35,9 +38,13 @@ pub mod cdef;
 pub mod cdf;
 pub mod decode;
 pub mod image;
+pub mod inter;
 pub mod loopfilter;
+pub mod modeinfo;
+pub mod mvpred;
 pub mod obu;
 pub mod predict;
+pub mod refs;
 pub mod restoration;
 pub mod symbol;
 pub mod tables;

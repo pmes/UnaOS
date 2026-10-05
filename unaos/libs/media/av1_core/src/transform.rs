@@ -38,7 +38,7 @@ struct Tx<'t> {
 
 impl Tx<'_> {
     #[inline]
-    fn b(&mut self, a: usize, b: usize, angle: i32, flip: bool) {
+    pub(crate) fn b(&mut self, a: usize, b: usize, angle: i32, flip: bool) {
         let x = self.t[a] as i64 * cos128(angle) - self.t[b] as i64 * sin128(angle);
         let y = self.t[a] as i64 * sin128(angle) + self.t[b] as i64 * cos128(angle);
         self.t[a] = round2(x, 12) as i32;
@@ -48,7 +48,7 @@ impl Tx<'_> {
         }
     }
     #[inline]
-    fn h(&mut self, a: usize, b: usize, flip: bool) {
+    pub(crate) fn h(&mut self, a: usize, b: usize, flip: bool) {
         let (a, b) = if flip { (b, a) } else { (a, b) };
         let x = self.t[a] as i64;
         let y = self.t[b] as i64;
@@ -59,7 +59,7 @@ impl Tx<'_> {
     }
 
     /// §7.13.2.3 inverse DCT (includes the permutation of §7.13.2.2).
-    fn idct(&mut self, n: u32) {
+    pub(crate) fn idct(&mut self, n: u32) {
         let n0 = 1usize << n;
         let mut copy = [0i32; 64];
         copy[..n0].copy_from_slice(&self.t[..n0]);
@@ -229,7 +229,7 @@ impl Tx<'_> {
         }
     }
 
-    fn adst_in_perm(&mut self, n: u32) {
+    pub(crate) fn adst_in_perm(&mut self, n: u32) {
         let n0 = 1usize << n;
         let mut copy = [0i32; 16];
         copy[..n0].copy_from_slice(&self.t[..n0]);
@@ -238,7 +238,7 @@ impl Tx<'_> {
             self.t[i] = copy[idx];
         }
     }
-    fn adst_out_perm(&mut self, n: u32) {
+    pub(crate) fn adst_out_perm(&mut self, n: u32) {
         let n0 = 1usize << n;
         let mut copy = [0i32; 16];
         copy[..n0].copy_from_slice(&self.t[..n0]);
@@ -251,7 +251,7 @@ impl Tx<'_> {
             self.t[i] = if i & 1 != 0 { -copy[idx] } else { copy[idx] };
         }
     }
-    fn adst4(&mut self) {
+    pub(crate) fn adst4(&mut self) {
         const SINPI_1_9: i64 = 1321;
         const SINPI_2_9: i64 = 2482;
         const SINPI_3_9: i64 = 3344;
@@ -283,7 +283,7 @@ impl Tx<'_> {
         self.t[2] = round2(x2, 12) as i32;
         self.t[3] = round2(x3, 12) as i32;
     }
-    fn adst8(&mut self) {
+    pub(crate) fn adst8(&mut self) {
         self.adst_in_perm(3);
         for i in 0..4 {
             self.b(2 * i, 2 * i + 1, 60 - 16 * i as i32, true);
@@ -304,7 +304,7 @@ impl Tx<'_> {
         }
         self.adst_out_perm(3);
     }
-    fn adst16(&mut self) {
+    pub(crate) fn adst16(&mut self) {
         self.adst_in_perm(4);
         for i in 0..8 {
             self.b(2 * i, 2 * i + 1, 62 - 8 * i as i32, true);
@@ -336,14 +336,14 @@ impl Tx<'_> {
         }
         self.adst_out_perm(4);
     }
-    fn adst(&mut self, n: u32) {
+    pub(crate) fn adst(&mut self, n: u32) {
         match n {
             2 => self.adst4(),
             3 => self.adst8(),
             _ => self.adst16(),
         }
     }
-    fn identity(&mut self, n: u32) {
+    pub(crate) fn identity(&mut self, n: u32) {
         let n0 = 1usize << n;
         for i in 0..n0 {
             let v = self.t[i] as i64;
@@ -355,7 +355,7 @@ impl Tx<'_> {
             } as i32;
         }
     }
-    fn wht(&mut self, shift: u32) {
+    pub(crate) fn wht(&mut self, shift: u32) {
         let mut a = self.t[0] >> shift;
         let mut c = self.t[1] >> shift;
         let mut d = self.t[2] >> shift;
@@ -455,13 +455,13 @@ pub fn inverse_transform_2d(dequant: &[i32], residual: &mut [i32], tx_sz: usize,
 }
 
 impl<'a, 'f> Dec<'a, 'f> {
-    fn qidx(&self) -> i32 {
+    pub(crate) fn qidx(&self) -> i32 {
         self.hdr.get_qindex(false, self.segment_id, self.current_q_index)
     }
-    fn dc_q(&self, b: i32) -> i32 {
+    pub(crate) fn dc_q(&self, b: i32) -> i32 {
         DC_QLOOKUP[((self.fs.bit_depth - 8) >> 1) as usize][b.clamp(0, 255) as usize] as i32
     }
-    fn ac_q(&self, b: i32) -> i32 {
+    pub(crate) fn ac_q(&self, b: i32) -> i32 {
         AC_QLOOKUP[((self.fs.bit_depth - 8) >> 1) as usize][b.clamp(0, 255) as usize] as i32
     }
     pub fn get_dc_quant(&self, plane: usize) -> i32 {
@@ -546,7 +546,7 @@ mod tests {
     /// formula: x[n] = sum_k c_k X[k] cos(pi (2n+1) k / 2N), c_0 = 1/sqrt2, scaled by sqrt(2/N)*...
     /// AV1's network computes x = sum X[k] * cos(...) with DC weight 1/sqrt(2) and no 2/N scale).
     #[test]
-    fn idct_matches_float() {
+    pub(crate) fn idct_matches_float() {
         for n in 2..=6u32 {
             let len = 1usize << n;
             let mut input = [0i32; 64];
@@ -571,7 +571,7 @@ mod tests {
     /// ADST4 against its definition: x[n] = sum_k X[k] * sin(pi (n+1)(2k+1) / 9) * (2*sqrt2/3)
     /// with AV1's integer scaling (sinpi constants are 4096*2*sqrt(2)/3*sin(k*pi/9)).
     #[test]
-    fn adst4_matches_float() {
+    pub(crate) fn adst4_matches_float() {
         let input = [1000i32, -700, 300, 50];
         let mut t = [0i32; 64];
         t[..4].copy_from_slice(&input);
@@ -589,7 +589,7 @@ mod tests {
 
     /// WHT round trip on a lossless block: an all-DC input spreads evenly.
     #[test]
-    fn wht_dc() {
+    pub(crate) fn wht_dc() {
         let mut deq = [0i32; 64 * 64];
         deq[0] = 4 * 16; // pre-scale shift 2 on rows
         let mut res = [0i32; 64 * 64];

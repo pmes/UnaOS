@@ -74,11 +74,8 @@ fn intra_vectors_decode_to_pinned_planes() {
 
 #[test]
 fn honest_refusals() {
-    // Intra block copy (allow_intrabc) and layered AVIF (inter-predicted enhancement layers) are
-    // owed: they must be refused as Unsupported, never decoded wrongly.
-    if let Some(f) = fetch("Monochrome") {
-        assert_eq!(decode_avif_planes(&f, Filters::default()).unwrap_err(), Error::Unsupported("intra block copy"));
-    }
+    // Layered AVIF (inter-predicted enhancement layers in one item) is owed: it must be refused as
+    // Unsupported, never decoded wrongly. (Intra block copy decodes since AVCODEC2: tests/m5_inter.rs.)
     if let Some(f) = fetch("fruits_2layer_thumbsize") {
         assert!(matches!(decode_avif_planes(&f, Filters::default()).unwrap_err(), Error::Unsupported(_)));
     }

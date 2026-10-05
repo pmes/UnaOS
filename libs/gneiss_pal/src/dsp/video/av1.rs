@@ -9,9 +9,11 @@
 //! in `libs/gneiss_pal/Cargo.toml` set `av1 = ["dep:av1_core"]` and add
 //! `av1_core = { path = "../../unaos/libs/media/av1_core", optional = true, features = ["std"] }`.
 //!
-//! Honest ceiling: key frames and intra-only frames decode (oracle-proven against Chromium, see
-//! docs/dev/evidence/media-1004/AVCODEC.md); an inter frame returns
-//! `DecodeError::Unsupported` — inter prediction is owed. Frames leave as RGBA converted with
+//! Honest ceiling (AVCODEC2): key, intra-only, inter and switch frames, show_existing_frame,
+//! intra block copy and scalable (temporal / spatial layer) streams decode frame-exact against
+//! libaom's per-frame MD5s (docs/dev/evidence/media-1004/AVCODEC2.md); superres returns
+//! `DecodeError::Unsupported`, and film grain synthesis is reported in that doc. The decoder keeps
+//! the reference frames across packets; `reset()` (a seek) drops them. Frames leave as RGBA converted with
 //! the stream's own matrix / range (BT.601/709/2020, limited or full), any bit depth and
 //! subsampling, never a guessed BT.601.
 
@@ -41,7 +43,7 @@ impl Av1Decoder {
 
 impl VideoDecoder for Av1Decoder {
     fn name(&self) -> &'static str {
-        "av1 (AVCODEC, intra)"
+        "av1 (AVCODEC)"
     }
     fn decode(&mut self, pkt: &Packet) -> Result<Option<Frame>, DecodeError> {
         let planes = self.inner.decode_temporal_unit(&pkt.data).map_err(map_err)?;
