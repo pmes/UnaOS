@@ -1,0 +1,51 @@
+# AETHERFONT text oracle: family list \t font-weight \t font-style \t text. 50 strings x 12/16/24/48 px.
+Liberation Sans	400	normal	The quick brown fox jumps over the lazy dog
+Liberation Sans	400	normal	AVA Tobacco WAVY Type Yoga LT Wo Te
+Liberation Sans	400	normal	office affluent baffle flagship efficient
+Liberation Sans	400	normal	Pack my box with five dozen liquor jugs!
+Liberation Sans	400	normal	0123456789 +-×÷= $€£¥ %‰ (1/2) [3] {4}
+Liberation Sans	400	normal	“Quotes”, ‘apostrophes’ — dashes – and… ellipses
+Liberation Sans	400	normal	Accents: façade, naïve, Øresund, Ångström, Ærø
+Liberation Sans	700	normal	Bold Headline Text With Kerning AV Ty
+Liberation Sans	400	italic	Italic emphasis in a running sentence
+Liberation Sans	700	italic	Bold italic: Waffles & Yogurt
+Liberation Serif	400	normal	The quick brown fox jumps over the lazy dog
+Liberation Serif	400	normal	AVA Tobacco WAVY Type Yoga LT Wo Te
+Liberation Serif	400	normal	office affluent baffle flagship efficient
+Liberation Serif	400	normal	Sphinx of black quartz, judge my vow.
+Liberation Serif	700	normal	Bold Serif Heading: Victory Over Time
+Liberation Serif	400	italic	Italic serif: a journey of a thousand miles
+Liberation Serif	400	normal	1st 2nd 3rd 4th — 1984, 2026 & 3.14159
+Liberation Mono	400	normal	fn main() { let x = 42; println!("{x}"); }
+Liberation Mono	700	normal	SELECT * FROM fonts WHERE id = 7;
+DejaVu Sans	400	normal	DejaVu Sans: the quick brown fox
+DejaVu Sans	400	normal	Γειά σου Κόσμε, φτιάχνουμε πρόγραμμα
+DejaVu Sans	400	normal	Привет, мир! Мы строим браузер.
+DejaVu Sans	400	normal	שלום עולם
+DejaVu Sans	400	normal	مرحبا بالعالم
+DejaVu Sans	400	normal	Hebrew in Latin: abc שלום def
+DejaVu Sans	400	normal	Arabic 123 العربية 456 text
+DejaVu Sans	700	normal	DejaVu Bold: Ångström Ψ Ж
+DejaVu Sans	400	normal	Combining: é ä ñ ô
+DejaVu Sans	400	normal	Arrows → ← ↑ ↓ ⇒ ∞ ≠ ≤ ≥ √ ∑
+DejaVu Serif	400	normal	DejaVu Serif: Ελληνικά και Кириллица
+DejaVu Serif	700	normal	DejaVu Serif Bold Waffle
+DejaVu Sans Mono	400	normal	mono: 0O 1lI | {}[]() => !=
+sans-serif	400	normal	Japanese: こんにちは世界
+sans-serif	400	normal	Chinese: 你好，世界。
+sans-serif	400	normal	Mixed: Aether エーテル Эфир Αιθέρας
+sans-serif	400	normal	Thai: สวัสดีชาวโลก
+sans-serif	700	normal	Bold fallback: 世界 Ж Ω
+serif	400	normal	Serif generic: Times-like metrics
+serif	400	italic	Serif italic generic: Quixotic
+monospace	400	normal	Monospace generic: 0x1F600 == 128512
+sans-serif	400	normal	Sans generic: Arial-like metrics
+Helvetica, Arial, sans-serif	400	normal	Helvetica falls to Arial: Wallpaper
+"Times New Roman", serif	400	normal	Times New Roman alias: Journal
+"No Such Font"	400	normal	No such font: the standard font
+FreeSans	400	normal	FreeSans: another sans face, kerned AV
+FreeSerif	400	normal	FreeSerif: another serif face, fi fl
+Liberation Sans	400	normal	Tight letters: illiterate millimetre
+Liberation Sans	400	normal	Wide letters: MMMWWW mwmwmw
+Liberation Serif	400	normal	Question? Exclamation! Semicolon; Colon:
+DejaVu Sans	400	italic	DejaVu oblique: slanted words

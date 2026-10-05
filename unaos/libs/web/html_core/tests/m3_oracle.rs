@@ -2,7 +2,7 @@
 //!
 //! 1. Serializer known answers straight from §13.3 (escaping, void elements, raw-text parents, template contents,
 //!    namespaced attributes, deep trees).
-//! 2. The EYES corpus (16 pages = the 18 EYES cases): our `outerHTML` of the document element vs Chromium's
+//! 2. The EYES corpus (22 pages = the 24 EYES cases): our `outerHTML` of the document element vs Chromium's
 //!    (tests/data/eyes/*.chromium.html, produced by tests/oracle/outer_html.cjs with JavaScript disabled) —
 //!    byte-equal after whitespace normalization is the gate; raw byte equality is reported too.
 //! 3. Optional, live: every html5lib tree-construction document input through Chromium's DOMParser (a
@@ -96,7 +96,7 @@ fn chromium_oracle_eyes_corpus() {
         })
         .collect();
     pages.sort();
-    assert_eq!(pages.len(), 16, "the 16 EYES pages");
+    assert_eq!(pages.len(), 22, "the 22 EYES pages");
     let (mut norm_eq, mut raw_eq) = (0, 0);
     let mut fails = Vec::new();
     for p in &pages {
@@ -118,7 +118,7 @@ fn chromium_oracle_eyes_corpus() {
             fails.push(format!("{name}\n--- chromium\n{want}\n--- ours\n{got}"));
         }
     }
-    println!("oracle TOTAL normalized-equal {norm_eq}/16, raw byte-equal {raw_eq}/16");
+    println!("oracle TOTAL normalized-equal {norm_eq}/22, raw byte-equal {raw_eq}/22");
     for f in &fails {
         println!("{f}");
     }

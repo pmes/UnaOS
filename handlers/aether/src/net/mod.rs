@@ -446,6 +446,23 @@ pub fn collect_css_image_refs(
     }
 }
 
+/// The text of every `<style>` element in an HTML source (for the font prefetch; the cascade gets the
+/// sheets from the parsed DOM).
+fn inline_style_blocks(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(k) = lower[i..].find("<style") {
+        let open = i + k;
+        let Some(gt) = lower[open..].find('>') else { break };
+        let body = open + gt + 1;
+        let Some(end) = lower[body..].find("</style") else { break };
+        out.push(html[body..body + end].to_string());
+        i = body + end;
+    }
+    out
+}
+
 /// Fetches raw bytes (images etc), same limits as fetch_document.
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
     let response = client().get(url).send().await?;
@@ -606,6 +623,24 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
                 }
             }
             Err(e) => crate::ledger::record_dom(&format!("img-fetch-failed:{}: {e}", &img_url[..img_url.len().min(48)])),
+        }
+    }
+    // @font-face sources (AETHERFONT): every url() of the inline and external sheets, fetched through
+    // http_core beside the images, handed to the font registry by absolute URL.
+    let mut font_refs: Vec<String> = Vec::new();
+    for css in inline_style_blocks(&html) {
+        font_refs.extend(crate::fonts::webfont::font_urls(&css, &base));
+    }
+    for (sheet_url, css) in &sheet_sources {
+        font_refs.extend(crate::fonts::webfont::font_urls(css, sheet_url));
+    }
+    font_refs.dedup();
+    font_refs.truncate(32);
+    let font_results = futures_util::future::join_all(font_refs.into_iter().map(|u| async move { (fetch_bytes(&u).await, u) })).await;
+    for (result, url) in font_results {
+        match result {
+            Ok(bytes) => crate::fonts::webfont::store_bytes(&url, bytes),
+            Err(e) => crate::ledger::record_css(&format!("font-fetch-failed:{}: {e}", &url[..url.len().min(48)])),
         }
     }
     // Scripts: inline bodies fill their slots directly; externals fetch

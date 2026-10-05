@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# tools/trust-bundle — fetch the Mozilla CA bundle and stage it as system/trust/roots.pem (TLSCORE, SR28).
+# tools/trust-bundle — fetch the Mozilla CA bundle and stage it as system/trust/roots.pem (TLSCORE, SR28), plus
+# the CT log lists (CTCORE, SR60).
 #
 #   tools/trust-bundle            fetch https://curl.se/ca/cacert.pem (curl's extraction of Mozilla's certdata.txt)
 #   tools/trust-bundle --from F   use a local file or URL instead (e.g. an air-gapped copy)
@@ -8,6 +9,21 @@
 #   system/trust/roots.pem          the bundle, verbatim
 #   system/trust/roots.pem.sha256   "<sha256>  roots.pem"
 #   system/trust/SOURCE             where it came from, when, its sha256, and the bundle's own date line
+#   system/trust/ctlogs.jsn         CTCORE (SR60): Google's CT log list (v3 schema, log_list.json) — 8.3 name, the
+#                                   metal opens it as SYSTEM/TRUST/CTLOGS.JSN
+#   system/trust/ctapple.jsn        Apple's CT log list (current_log_list.json, same schema), when reachable
+#   system/trust/*.jsn.sha256       their pins (the builder refuses a mismatch); SOURCE records the provenance
+#   system/trust/inters.pem         Mozilla's CCADB intermediate set (PublicAllIntermediateCertsWithPEMCSV): an
+#                                   UNTRUSTED pool for servers that omit an intermediate (TrustStore.intermediates;
+#                                   8.3 name for the metal); pinned by inters.pem.sha256
+#   tools/trust-bundle --intermediates-from F   take the CCADB CSV (or a PEM bundle) from a local file instead
+#
+# The CT list: https://www.gstatic.com/ct/log_list/v3/log_list.json with its detached signature log_list.sig,
+# verified against Google's key log_list_pubkey.pem (RSASSA-PKCS1-v1_5/SHA-256; `openssl dgst -verify`, the same
+# check tls_core::ct::verify_list_signature makes). If gstatic is unreachable the list Chromium itself compiles in
+# is taken from the Chromium source tree (components/certificate_transparency/data/log_list.json via
+# raw.githubusercontent.com at the current main commit, recorded) — authenticated only by the git commit id, and
+# SOURCE says "signature: UNVERIFIED" so nobody mistakes it for the signed list.
 #
 # If curl.se is unreachable it tries the same Mozilla bundle as packaged by certifi on PyPI (recorded in SOURCE as
 # such) — never a distro store, which may carry local additions.
@@ -22,7 +38,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/system/trust"
 SRC_URL="https://curl.se/ca/cacert.pem"
 FROM=""
-if [[ "${1:-}" == "--from" ]]; then FROM="${2:?--from needs a file or URL}"; fi
+INTER_FROM=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from) FROM="${2:?--from needs a file or URL}"; shift 2 ;;
+    --intermediates-from) INTER_FROM="${2:?--intermediates-from needs a file}"; shift 2 ;;
+    *) echo "trust-bundle: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
 mkdir -p "$OUT"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
@@ -62,4 +85,81 @@ echo "$SUM  roots.pem" > "$OUT/roots.pem.sha256"
   echo "certs:   $N"
   grep -m1 -i 'Certificate data from Mozilla as of' "$OUT/roots.pem" | sed 's/^## */bundle:  /' || true
 } > "$OUT/SOURCE"
+
+# ---------------------------------------------------------------- CTCORE: CT log lists
+GS="https://www.gstatic.com/ct/log_list/v3"
+CT="$(mktemp -d)"
+trap 'rm -f "$TMP"; rm -rf "$CT"' EXIT
+ct_src=""
+if curl -sSfL --max-time 60 -o "$CT/log_list.json" "$GS/log_list.json" 2>/dev/null \
+   && curl -sSfL --max-time 60 -o "$CT/log_list.sig" "$GS/log_list.sig" \
+   && curl -sSfL --max-time 60 -o "$CT/pub.pem" "$GS/log_list_pubkey.pem"; then
+  if openssl dgst -sha256 -verify "$CT/pub.pem" -signature "$CT/log_list.sig" "$CT/log_list.json" >/dev/null; then
+    ct_src="$GS/log_list.json — signature VERIFIED (log_list.sig, log_list_pubkey.pem sha256 $(sha256sum "$CT/pub.pem" | cut -c1-64))"
+  else
+    echo "trust-bundle: log_list.sig does NOT verify — refusing the CT list" >&2; exit 1
+  fi
+else
+  echo "trust-bundle: $GS unreachable; taking the list Chromium compiles in from the Chromium source tree" >&2
+  REV="$(git ls-remote https://github.com/chromium/chromium refs/heads/main 2>/dev/null | cut -f1)"
+  if [[ -n "$REV" ]] && curl -sSfL --max-time 60 -o "$CT/log_list.json" \
+       "https://raw.githubusercontent.com/chromium/chromium/$REV/components/certificate_transparency/data/log_list.json"; then
+    ct_src="chromium/chromium@$REV components/certificate_transparency/data/log_list.json — signature: UNVERIFIED (gstatic unreachable; authenticated by the git commit only)"
+  fi
+fi
+if [[ -n "$ct_src" ]] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["operators"] and d["log_list_timestamp"]' "$CT/log_list.json"; then
+  cp "$CT/log_list.json" "$OUT/ctlogs.jsn" && chmod 644 "$OUT/ctlogs.jsn"
+  CSUM="$(sha256sum "$OUT/ctlogs.jsn" | cut -d' ' -f1)"
+  echo "$CSUM  ctlogs.jsn" > "$OUT/ctlogs.jsn.sha256"
+  {
+    echo "ct:      $ct_src"
+    echo "ct.sha:  $CSUM"
+    echo "ct.list: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("version", d.get("version"), "timestamp", d["log_list_timestamp"], "logs", sum(len(o.get("logs",[]))+len(o.get("tiled_logs",[])) for o in d["operators"]))' "$OUT/ctlogs.jsn")"
+  } >> "$OUT/SOURCE"
+else
+  echo "ct:      NOT STAGED — no CT log list reachable (tls_core reports ct=off)" >> "$OUT/SOURCE"
+fi
+if curl -sSfL --max-time 60 -o "$CT/apple.json" "https://valid.apple.com/ct/log_list/current_log_list.json" 2>/dev/null; then
+  cp "$CT/apple.json" "$OUT/ctapple.jsn" && chmod 644 "$OUT/ctapple.jsn"
+  ASUM="$(sha256sum "$OUT/ctapple.jsn" | cut -d' ' -f1)"
+  echo "$ASUM  ctapple.jsn" > "$OUT/ctapple.jsn.sha256"
+  echo "ct.apple: https://valid.apple.com/ct/log_list/current_log_list.json sha256 $ASUM (unsigned: Apple publishes no detached signature)" >> "$OUT/SOURCE"
+else
+  rm -f "$OUT/ctapple.jsn" "$OUT/ctapple.jsn.sha256"
+  echo "ct.apple: NOT STAGED — valid.apple.com unreachable" >> "$OUT/SOURCE"
+fi
+# ---------------------------------------------------------------- CTCORE: CCADB intermediates
+CCADB="https://ccadb.my.salesforce-sites.com/mozilla/PublicAllIntermediateCertsWithPEMCSV"
+inter_src=""
+if [[ -n "$INTER_FROM" ]]; then
+  cp "$INTER_FROM" "$CT/inters.raw" && inter_src="$INTER_FROM"
+elif curl -sSfL --max-time 120 -o "$CT/inters.raw" "$CCADB" 2>/dev/null; then
+  inter_src="$CCADB"
+fi
+if [[ -n "$inter_src" ]]; then
+  # The CSV's "PEM Info" column holds each certificate (quoted, PEM); a PEM bundle passes through.
+  python3 - "$CT/inters.raw" "$CT/inters.pem" <<'PY'
+import csv, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+pems = re.findall(r"-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+?-----END CERTIFICATE-----", raw)
+seen, out = set(), []
+for p in pems:
+    body = "".join(p.split("-----")[2].split())
+    if body not in seen:
+        seen.add(body)
+        out.append("-----BEGIN CERTIFICATE-----\n" + "\n".join(body[i:i+64] for i in range(0, len(body), 64)) + "\n-----END CERTIFICATE-----\n")
+open(sys.argv[2], "w").write("".join(out))
+print(len(out))
+PY
+  NI="$(grep -c 'BEGIN CERTIFICATE' "$CT/inters.pem" || true)"
+  if [[ "$NI" -gt 0 ]]; then
+    cp "$CT/inters.pem" "$OUT/inters.pem" && chmod 644 "$OUT/inters.pem"
+    ISUM="$(sha256sum "$OUT/inters.pem" | cut -d' ' -f1)"
+    echo "$ISUM  inters.pem" > "$OUT/inters.pem.sha256"
+    echo "inters:  $inter_src — $NI certificates (the CA ones join the untrusted pool), sha256 $ISUM" >> "$OUT/SOURCE"
+  fi
+else
+  rm -f "$OUT/inters.pem" "$OUT/inters.pem.sha256"
+  echo "inters:  NOT STAGED — CCADB ($CCADB) unreachable; no intermediate pool (pass --intermediates-from FILE)" >> "$OUT/SOURCE"
+fi
 cat "$OUT/SOURCE"

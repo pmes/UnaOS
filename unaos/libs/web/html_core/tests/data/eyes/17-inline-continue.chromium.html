@@ -1,0 +1,20 @@
+<html><head><meta charset="utf-8"><title>Inline continue</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 20px; width: 420px; }
+p { margin: 0 0 16px; line-height: 1.5; }
+.hl { background: #ffe08a; border: 2px solid #c98a00; padding: 0 4px; }
+.pill { background: #1d3557; color: #fff; padding: 2px 6px; border-radius: 6px; }
+.chip { display: inline-block; width: 40px; height: 30px; background: #e63946; }
+.mid { vertical-align: middle; }
+.top { vertical-align: top; }
+.fl { float: left; width: 80px; height: 60px; background: #a8dadc; margin-right: 10px; }
+.c { text-align: center; }
+big { font-size: 24px; }
+</style></head><body>
+<p>Plain text runs into <span class="hl">a highlighted inline box that is long enough to wrap onto the next line</span> and the sentence continues right after it on the same line.</p>
+<p>Short <span class="pill">pill one</span> then <span class="pill">pill number two wraps across the line edge</span> done.</p>
+<p>Baseline <span class="chip"></span> middle <span class="chip mid"></span> top <span class="chip top"></span> and <big>bigger text</big> share lines.</p>
+<p><span class="fl"></span>A floated box sits at the left and these words flow beside it, line after line, until they pass its bottom edge and return to the full width of the paragraph.</p>
+<p class="c">Centred first line<br>and a second after a break.</p>
+
+</body></html>

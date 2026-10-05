@@ -1,4 +1,4 @@
-//! AETHERDOM (SR49) proof: the DOM Aether builds for each of the 16 EYES pages serializes to exactly
+//! AETHERDOM (SR49) proof: the DOM Aether builds for each of the 22 EYES pages serializes to exactly
 //! what `html_core` produces stand-alone, and therefore to what Chromium produces.
 //!
 //! - subject: `aether::dom::parse_html(page)` (Aether's own document model, scripting flag on), the
@@ -7,7 +7,7 @@
 //! - oracle: `unaos/libs/web/html_core/tests/data/eyes/<page>.chromium.html`, Chromium's
 //!   `document.documentElement.outerHTML` (produced by HTMLCORE's `tests/oracle/outer_html.cjs`).
 //!
-//! None of the 16 pages has a `<noscript>`, the only construct where the scripting flag changes a parse.
+//! None of the 22 pages has a `<noscript>`, the only construct where the scripting flag changes a parse.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +25,7 @@ fn eyes_corpus_dom_equals_html_core_and_chromium() {
         .filter(|p| p.extension().is_some_and(|x| x == "html"))
         .collect();
     pages.sort();
-    assert_eq!(pages.len(), 16, "the 16 EYES pages");
+    assert_eq!(pages.len(), 22, "the 22 EYES pages (17-21: AETHERINLINE's cases, 22: AETHERFONT's)");
     let mut fails = Vec::new();
     for p in &pages {
         let name = p.file_stem().unwrap().to_string_lossy().to_string();

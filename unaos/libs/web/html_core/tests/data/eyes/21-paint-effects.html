@@ -1,0 +1,22 @@
+<!-- tests: paint effects: radial gradients (ellipse farthest-corner, circle closest-side at a position, repeating), inset box-shadows, rgba backgrounds and borders composited source-over, overflow:hidden clipping to the rounded border box -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Paint effects</title>
+<style>
+body { margin: 20px; font-family: sans-serif; background: #f4f4f4; }
+.row { display: flex; gap: 20px; margin-bottom: 20px; }
+.t { width: 160px; height: 100px; }
+.r1 { background: radial-gradient(#ffd166, #ef476f); }
+.r2 { background: radial-gradient(circle closest-side at 30% 40%, #06d6a0, #118ab2 80%, #073b4c); }
+.r3 { background: repeating-radial-gradient(circle, #fff 0, #fff 8px, #8338ec 8px, #8338ec 16px); }
+.i1 { background: #fff; box-shadow: inset 0 0 12px rgba(0,0,0,.6); }
+.i2 { background: #caf0f8; box-shadow: inset 6px 6px 0 #0077b6; border-radius: 16px; }
+.i3 { background: #fff; box-shadow: inset 0 0 0 8px #e76f51, 0 4px 8px rgba(0,0,0,.3); }
+.stripes { background: repeating-linear-gradient(90deg, #264653 0, #264653 10px, #e9c46a 10px, #e9c46a 20px); padding: 15px; }
+.glass { height: 70px; background: rgba(255,255,255,.6); border: 6px solid rgba(231,111,81,.5); }
+.clip { border-radius: 40px; overflow: hidden; background: #2a9d8f; }
+.clip div { height: 50px; background: #e63946; }
+</style></head><body>
+<div class="row"><div class="t r1"></div><div class="t r2"></div><div class="t r3"></div></div>
+<div class="row"><div class="t i1"></div><div class="t i2"></div><div class="t i3"></div></div>
+<div class="row"><div class="t stripes"><div class="glass"></div></div><div class="t clip"><div></div></div></div>
+</body></html>

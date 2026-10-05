@@ -366,6 +366,32 @@ impl NodeRef {
         self.snapshot(ids)
     }
 
+    /// Siblings before `self`, nearest first (kuchiki's order; a snapshot).
+    pub fn preceding_siblings(&self) -> std::vec::IntoIter<NodeRef> {
+        let d = self.doc.borrow();
+        let mut ids = Vec::new();
+        let mut cur = d.prev_sibling(self.id);
+        while let Some(c) = cur {
+            ids.push(c);
+            cur = d.prev_sibling(c);
+        }
+        drop(d);
+        self.snapshot(ids)
+    }
+
+    /// Siblings after `self`, in order (a snapshot).
+    pub fn following_siblings(&self) -> std::vec::IntoIter<NodeRef> {
+        let d = self.doc.borrow();
+        let mut ids = Vec::new();
+        let mut cur = d.next_sibling(self.id);
+        while let Some(c) = cur {
+            ids.push(c);
+            cur = d.next_sibling(c);
+        }
+        drop(d);
+        self.snapshot(ids)
+    }
+
     /// Descendants in tree order, excluding `self`.
     pub fn descendants(&self) -> std::vec::IntoIter<NodeRef> {
         let ids: Vec<NodeId> = self.doc.borrow().descendants(self.id).collect();

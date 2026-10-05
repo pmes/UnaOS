@@ -98,7 +98,12 @@ pub fn token(t: &Token, out: &mut String) {
         Token::Dimension(n, u) => {
             number(n, out);
             // a unit starting with e/E followed by a digit or sign would re-tokenize as an exponent
-            if u.starts_with(['e', 'E']) {
+            // (CSS Syntax 3 §4.3.12/§4.3.3); `em`/`ex` themselves serialize plain, as Chromium does
+            let b = u.as_bytes();
+            let digit_at = |i: usize| b.get(i).is_some_and(|c| c.is_ascii_digit());
+            let exponent_like = matches!(b.first(), Some(b'e' | b'E'))
+                && (digit_at(1) || (matches!(b.get(1), Some(b'+' | b'-')) && digit_at(2)));
+            if exponent_like {
                 out.push_str("\\65 ");
                 identifier(&u[1..], out);
             } else {
