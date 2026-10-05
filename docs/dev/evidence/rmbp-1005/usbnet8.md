@@ -59,15 +59,29 @@ for every ring. smoltcp stays with the NetStack seam open (R85).
 ## Witness (metal; boot with the dongle in, then `tests usbnet` and `tests usbnet7`)
 
 ```
-[usbnet] rx arm trb=0 cycle=1 buf=0x<pa> len=20480 cross64k=0
-[usbnet] rx resumed len=<n> kicks=<n> resets=<n> after_ms=<n> needed=0
-:: USBNET7: rx_ok=<n> first_frame_ms=<n> kicks=0 resets=0 idle_rungs=<n> -> PASS ::
-[usbnet] txprobe arp who_has=10.0.1.<x> sent=1 reply_ms=<n>
+[usbnet] rx arm trb=0 cycle=1 buf=0x<pa> len=20480 cross64k=0 n=1            (arms 1, 2 and every power of two)
+[usbnet] rx resumed len=<n> kicks=<n> resets=<n> after_ms=<n> needed=0        (needed=1 = a missed doorbell, the data was waiting)
+:: USBNET7: rx_ok=<n> first_frame_ms=<n> kicks=0 resets=0 idle_rungs=<n> ethertype=0x.... window_ms=<n|none> -> PASS ::   (tests usbnet)
+:: USBNET7: rx_ok=<n> frames=<n> first_frame_ms=<n> ethertype=0x0800 dhcp=offer kicks=0 resets=0 idle_rungs=<n> -> PASS ::  (tests usbnet7)
+[usbnet] txprobe arp who_has=10.0.1.<x> sent=1 reply_ms=<n> tx=<n>            (tests usbnet7)
 :: NETCLOCK: … lease=ok … -> PASS ::
 ```
+
+`kicks=`/`resets=` on the USBNET7 lines count NEEDED rungs only; `idle_rungs=` the rungs that fired on a quiet wire
+(the NETFRAME `rx kick`/`rx reset` lines keep their totals). `first_frame_ms` on the `tests usbnet` line is now the
+link's (first arm to the first frame of the boot), `window_ms` the fixture's own.
 
 ## Owed
 
 The lease itself is not proven fixed — nothing in the arm path or the delivery was found broken by reading, so this arc
 makes the next flight DECIDE: `needed=1` rungs = a real missed doorbell (then the M2 order is the first suspect, already
 fixed); `txprobe … reply_ms=none` = TX never reaches the LAN (the DHCP silence explained, next arc on the OUT side).
+
+## Result
+
+- M1 `7472e6d8` this finding. M2 `ring.rs::write_trb` writes parameter + status, `fence(SeqCst)`, then the control dword
+  (every ring: the one producer path); the arm line. M3 needed/idle rung split, `after_ms= needed=` on `rx resumed`,
+  the stall clock of a TD armed before link starts at link-up, both USBNET7 lines carry `kicks= resets= idle_rungs=`.
+  M4 two flight-23 KATs (`cargo test -p usbnet_core` exit 0, 11 tests). M5 the ARP txprobe under `tests usbnet7`.
+- No new knob, verb, file or dotfile. Legs: x86 metal shape exit 0; aarch64 `login,loginst,virt_el0,lumen,
+  desktop_firmware,quarry,facet,usbnet` exit 0; aarch64 `tegra,login,loginst,virt_el0` exit 0; charter-check exit 0.
