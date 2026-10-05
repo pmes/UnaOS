@@ -374,10 +374,20 @@ pub fn defer_fast(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
 
 /// NETCLOCK (B335): register `tests netclock` (5 s idle on a live USB link: polls/s, tx/s, the stack-side
 /// xHCI loan hold) exactly once on an x86 smolnet + usbnet build.
-fn ensure_netclock() {
+fn ensure_netclock() { ensure_netclock_arm();
     #[cfg(all(feature = "smolnet", feature = "usbnet", target_arch = "x86_64"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("netclock", crate::smolnet::netclock_selftest); }
+    }
+}
+
+/// ARMNET (B346): register `tests netclock` on an aarch64 NET6 build (the persistent stack's 5 s idle: polls/s,
+/// tx/s; SKIP with no NIC or no link). Called from `ensure_netclock` (same-line fold) so the x86 arm is untouched.
+fn ensure_netclock_arm() {
+    #[cfg(all(feature = "net6", target_arch = "aarch64"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("netclock", crate::net_phy::net6::netclock_selftest); }
     }
 }

@@ -1140,6 +1140,7 @@ pub mod net6 {
             None => IDLE_POLL_MS,
         };
         NEXT_POLL_MS.store(after + delay, Ordering::Relaxed);
+        census_tick(after);
     }
 
     /// ARMNET: drive the persistent stack until `check` answers or `budget_ms` of wall time passes.
@@ -1345,7 +1346,7 @@ pub mod net6 {
             // sender outright), and the sink is dropped on return: this observer exists for its side
             // effect on the table.
             let mut sink = None;
-            snoop_arp(frame, [0, 0, 0, 0], &mut sink);
+            snoop_arp(frame, [0, 0, 0, 0], &mut sink); RX_FRAMES.fetch_add(1, Ordering::Relaxed); // ARMNET (B346): frames the persistent stack received
         }
     }
 
@@ -2229,5 +2230,74 @@ pub mod net6 {
         }
         close(sid);
         ok
+    }
+
+    // ── ARMNET (B346) M3: the census rollup and `tests netclock` ──────────────────────────────────
+
+    /// Frames the persistent stack received (counted in the `Learn` observer, every inbound frame).
+    static RX_FRAMES: AtomicU32 = AtomicU32::new(0);
+    /// The census rollup's last print (`now_ms` scale).
+    static CENSUS_LAST_MS: AtomicI64 = AtomicI64::new(0);
+    const CENSUS_EVERY_MS: i64 = 5_000;
+
+    /// `census start net6`: `:: NET6: polls= tx= rx= arp_reply= dhcp= nic= ::`, at most once per 5 s, from the
+    /// poll site (so an idle stack prints nothing — there is nothing to roll up). Cumulative counters.
+    fn census_tick(now: i64) {
+        if !crate::census::on(crate::census::NET6) {
+            return;
+        }
+        let last = CENSUS_LAST_MS.load(Ordering::Relaxed);
+        if now - last < CENSUS_EVERY_MS
+            || CENSUS_LAST_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+        {
+            return;
+        }
+        let (tx, arp, dhcp) = super::tx_emission_counts();
+        serial_println!(
+            "{} polls={} tx={} rx={} arp_reply={} dhcp={} nic={} ::",
+            P6, polls(), tx, RX_FRAMES.load(Ordering::Relaxed), arp, dhcp, nic_name()
+        );
+    }
+
+    /// `tests netclock` idle window and bounds — the x86 NETCLOCK numbers (polls <= 50/s, tx <= 5/s).
+    const NETCLOCK_WINDOW_MS: i64 = 5_000;
+    const NETCLOCK_POLLS_MAX: u64 = 50;
+    const NETCLOCK_TX_MAX: u64 = 5;
+
+    /// ARMNET M3 — `tests netclock` on aarch64: 5 s of idle on the persistent stack, driven by
+    /// [`service_poll`] the way a main loop would (the shell holds the loop while it runs), counting what
+    /// the stack does on its own. `:: NETCLOCK: polls_per_s=<n> tx_per_s=<n> nic=<name> rx_ok=<n> -> PASS|FAIL ::`.
+    /// No NIC registered / no PHY link / no stack -> `-> SKIP reason=no-nic|no-link|no-stack`.
+    pub fn netclock_selftest() {
+        let skip = match nic() {
+            None => Some("no-nic"),
+            Some(n) if !(n.link_up)() => Some("no-link"),
+            _ => None,
+        };
+        if skip.is_none() && !ensure(&mut STACK.lock()) {
+            serial_println!(":: NETCLOCK: polls_per_s=0 tx_per_s=0 nic={} rx_ok=0 -> SKIP reason=no-stack ::", nic_name());
+            return;
+        }
+        if let Some(why) = skip {
+            serial_println!(":: NETCLOCK: polls_per_s=0 tx_per_s=0 nic={} rx_ok=0 -> SKIP reason={} ::", nic_name(), why);
+            return;
+        }
+        let p0 = polls() as u64;
+        let t0 = super::tx_emission_counts().0 as u64;
+        let start = now_ms();
+        while now_ms() - start < NETCLOCK_WINDOW_MS {
+            service_poll();
+            for _ in 0..256 {
+                core::hint::spin_loop();
+            }
+        }
+        let el = (now_ms() - start).max(1) as u64;
+        let polls_ps = (polls() as u64 - p0) * 1000 / el;
+        let tx_ps = (super::tx_emission_counts().0 as u64 - t0) * 1000 / el;
+        let ok = polls_ps <= NETCLOCK_POLLS_MAX && tx_ps <= NETCLOCK_TX_MAX;
+        serial_println!(
+            ":: NETCLOCK: polls_per_s={} tx_per_s={} nic={} rx_ok={} -> {} ::",
+            polls_ps, tx_ps, nic_name(), RX_FRAMES.load(Ordering::Relaxed), if ok { "PASS" } else { "FAIL" }
+        );
     }
 }
