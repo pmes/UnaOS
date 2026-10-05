@@ -143,6 +143,12 @@ impl SpecifiedStyle {
 /// Values arrive as raw strings so function values (rgb()...) parse uniformly.
 pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedStyle) {
     let value = value.trim();
+    if is_length_property(prop) {
+        // Kept in cascade order for the font-relative re-resolution.
+        let list = style.paint.font_rel.get_or_insert_with(Vec::new);
+        list.retain(|(p, _)| p != prop);
+        list.push((prop.to_string(), value.to_string()));
+    }
     match prop {
         "display" => {
             // Outer display type (css-display-3 §2.1) for the inline
@@ -611,8 +617,34 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             other => crate::ledger::record_css(&format!("align-items-value:{}", other)),
         },
         "font-size" => match parse_font_size(value) {
-            Some(px) => style.paint.font_size = Some(px),
-            None => crate::ledger::record_css(&format!("font-size-value:{}", clip(value))),
+            Some(px) => {
+                style.paint.font_size = Some(px);
+                // css-fonts-4 §2.5: em and % are of the PARENT's computed
+                // font-size, rem of the root's; `smaller`/`larger` scale the
+                // parent by 1.2 (Blink's ratio). Resolved in remeasure.
+                let v = value.trim().to_ascii_lowercase();
+                let num = |s: &str| s.trim().parse::<f32>().ok();
+                style.paint.font_size_rel = Some(if v.contains('(') {
+                    (2, 0.0)
+                } else if let Some(n) = v.strip_suffix("rem").and_then(num) {
+                    (1, n)
+                } else if let Some(n) = v.strip_suffix("em").and_then(num) {
+                    (0, n)
+                } else if let Some(n) = v.strip_suffix('%').and_then(num) {
+                    (0, n / 100.0)
+                } else if v == "smaller" {
+                    (0, 1.0 / 1.2)
+                } else if v == "larger" {
+                    (0, 1.2)
+                } else {
+                    (2, 0.0)
+                });
+            }
+            None => match value.trim() {
+                "smaller" => style.paint.font_size_rel = Some((0, 1.0 / 1.2)),
+                "larger" => style.paint.font_size_rel = Some((0, 1.2)),
+                _ => crate::ledger::record_css(&format!("font-size-value:{}", clip(value))),
+            },
         },
         "font-weight" => match parse_font_weight(value) {
             Some(b) => style.paint.bold = Some(b),
@@ -624,8 +656,8 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             "inherit" | "initial" | "unset" => {}
             other => crate::ledger::record_css(&format!("visibility:{}", other)),
         },
-        // Only full transparency is honored (no compositing): opacity:0
-        // hides like visibility:hidden; anything else paints normally.
+        // opacity:0 hides like visibility:hidden; a fraction paints the
+        // subtree as a group composited at that opacity (render::draw_node).
         "opacity" => {
             // Always specified, both ways: a higher-specificity opacity:1
             // has to be able to un-hide what an earlier opacity:0 rule hid,
@@ -642,25 +674,22 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             }
         }
         "line-height" => {
+            // CSS 2.2 §10.8.1: a <number> is inherited as the number (each
+            // element multiplies its own font-size); a <length> or
+            // <percentage> computes to an absolute length, inherited as is.
+            // Stored as > 0 multiplier, < 0 = -(px), 0 = normal.
             let v = value.trim();
-            let factor = if let Some(px) = v.strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok()) {
-                Some(px / 16.0)
-            } else if let Some(n) = v
-                .strip_suffix("rem")
-                .or_else(|| v.strip_suffix("em"))
-                .and_then(|n| n.trim().parse::<f32>().ok())
-            {
-                // 1.5rem = 24px against the 16px base = 1.5x (approximation:
-                // em treated like rem, not parent-relative).
-                Some(n)
+            let (em, ..) = FONT_CTX.with(|c| c.get());
+            let lh = if v == "normal" {
+                Some(0.0)
             } else if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
-                Some(pct / 100.0)
-            } else if v == "normal" {
-                Some(1.2)
+                Some(-(pct / 100.0 * em))
+            } else if let Ok(n) = v.parse::<f32>() {
+                Some(n.max(0.0))
             } else {
-                v.parse::<f32>().ok()
+                parse_px(v).map(|px| -px.max(0.0))
             };
-            match factor {
+            match lh {
                 Some(f) => style.paint.line_height = Some(f),
                 None => crate::ledger::record_css(&format!("line-height-value:{}", clip(value))),
             }
@@ -683,7 +712,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             let mut color = (128, 128, 128);
             let mut got_any = false;
             for part in v.split_whitespace() {
-                if let Some(px) = parse_px(part).filter(|_| part.ends_with("px") || part.ends_with("em")) {
+                if let Some(px) = parse_px(part).filter(|_| part.ends_with("px") || is_font_relative(part)) {
                     width = px;
                     got_any = true;
                 } else if let Some(k) = border_style_code(part) {
@@ -1972,8 +2001,15 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
-        list_item, list_style, vertical_align, float, opacity,
+        list_item, list_style, vertical_align, float, opacity, font_size_rel,
     );
+    if let Some(src_list) = &src.font_rel {
+        let list = dst.font_rel.get_or_insert_with(Vec::new);
+        for (p, v) in src_list {
+            list.retain(|(q, _)| q != p);
+            list.push((p.clone(), v.clone()));
+        }
+    }
     clone!(pct_math, bg_gradient, shadows);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
 }
@@ -2555,6 +2591,104 @@ pub fn is_neutral_keyword(value: &str) -> bool {
 
 const BASE_FONT_PX: f32 = 16.0;
 
+thread_local! {
+    /// The font-relative length basis (css-values-4 §6.1) in effect: (em,
+    /// rem, ex, ch) in px. The cascade parses at the initial 16px font;
+    /// `layout::remeasure` re-applies an element's font-relative
+    /// declarations with its own computed font-size, the root's, and its
+    /// face's x-height and `0` advance.
+    static FONT_CTX: std::cell::Cell<(f32, f32, f32, f32)> = const { std::cell::Cell::new((16.0, 16.0, 8.0, 8.0)) };
+}
+
+/// Sets the font-relative basis (em, rem, ex, ch) for the declarations
+/// parsed next; returns the previous one.
+pub(crate) fn set_font_ctx(ctx: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    FONT_CTX.with(|c| c.replace(ctx))
+}
+
+/// The current font-relative basis (em, rem, ex, ch).
+pub(crate) fn font_ctx() -> (f32, f32, f32, f32) {
+    FONT_CTX.with(|c| c.get())
+}
+
+/// Parses `decls` (property, value) in order into one specified style, at
+/// the current font basis.
+pub(crate) fn reapply_declarations(decls: &[(String, String)]) -> SpecifiedStyle {
+    let mut spec = SpecifiedStyle::default();
+    for (p, v) in decls {
+        apply_declaration(p, v, &mut spec);
+    }
+    spec
+}
+
+/// px per one `unit` for the font-relative units, from the current basis.
+fn font_unit_px(unit: &str) -> Option<f32> {
+    let (em, rem, ex, ch) = FONT_CTX.with(|c| c.get());
+    match unit {
+        "em" => Some(em),
+        "rem" => Some(rem),
+        "ex" => Some(ex),
+        "ch" => Some(ch),
+        _ => None,
+    }
+}
+
+/// A number with a font-relative unit, as a value in px at the current
+/// basis (`1.5em`, `2rem`, `3ex`, `10ch`).
+fn parse_font_relative(v: &str) -> Option<f32> {
+    for unit in ["rem", "em", "ex", "ch"] {
+        if let Some(n) = v.strip_suffix(unit) {
+            let n = n.trim();
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e')) {
+                if let (Ok(n), Some(px)) = (n.parse::<f32>(), font_unit_px(unit)) {
+                    return Some(n * px);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True when a value uses a font-relative unit anywhere (`1em`, `calc(2rem
+/// + 4px)`, `0 1.5ch`): its px depend on the element's font.
+pub(crate) fn is_font_relative(value: &str) -> bool {
+    let b = value.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() || (b[i] == b'.' && b.get(i + 1).is_some_and(|c| c.is_ascii_digit())) {
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            let start = i;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if matches!(&value[start..i], "em" | "rem" | "ex" | "ch") {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Properties whose value can be a length: their declarations are kept in
+/// cascade order (`PaintStyle::font_rel`) so the font-relative ones can be
+/// re-resolved against the element's own font.
+pub(crate) fn is_length_property(prop: &str) -> bool {
+    matches!(
+        prop,
+        "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" | "margin" | "margin-top"
+            | "margin-right" | "margin-bottom" | "margin-left" | "padding" | "padding-top" | "padding-right"
+            | "padding-bottom" | "padding-left" | "top" | "right" | "bottom" | "left" | "inset" | "gap" | "row-gap"
+            | "column-gap" | "flex-basis" | "flex" | "border" | "border-top" | "border-right" | "border-bottom"
+            | "border-left" | "border-width" | "border-top-width" | "border-right-width" | "border-bottom-width"
+            | "border-left-width" | "border-radius" | "letter-spacing" | "line-height" | "vertical-align"
+            | "border-spacing" | "outline" | "text-indent"
+    )
+}
+
 /// Parses a font-size string: px, em/rem (relative to the 16px UA base —
 /// approximation, not parent-relative), %, or absolute keywords.
 pub fn parse_font_size(value: &str) -> Option<f32> {
@@ -2618,12 +2752,8 @@ pub fn parse_px(value: &str) -> Option<f32> {
     if let Some(px) = parse_viewport_length(v) {
         return Some(px);
     }
-    if let Some(n) = v
-        .strip_suffix("rem")
-        .or_else(|| v.strip_suffix("em"))
-        .and_then(|n| n.trim().parse::<f32>().ok())
-    {
-        return Some(n * 16.0);
+    if let Some(px) = parse_font_relative(v) {
+        return Some(px);
     }
     v.strip_suffix("px").unwrap_or(v).trim().parse::<f32>().ok()
 }
@@ -2816,7 +2946,7 @@ impl MathParser<'_> {
         match unit.as_str() {
             "" | "px" => Some(n),
             "pt" => Some(n * 4.0 / 3.0),
-            "rem" | "em" => Some(n * 16.0),
+            "rem" | "em" | "ex" | "ch" => font_unit_px(&unit).map(|u| n * u),
             // `calc(100vh - 64px)` is the standard full-height idiom.
             u => parse_viewport_length(&format!("{}{}", n, u)),
         }

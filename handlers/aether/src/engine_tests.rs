@@ -2539,6 +2539,32 @@ mod tests {
         assert_eq!(x, 30.0, "the line box is shortened by the float");
     }
 
+    /// css-values-4 §6.1 / css-fonts-4 §2.5 / CSS 2.2 §10.8.1 known answers:
+    /// em lengths are of the element's own font-size, a font-size in em of
+    /// the parent's, rem of the root's; a line-height number inherits as the
+    /// number (re-multiplied by the child's font), a length as the length.
+    #[test]
+    fn test_font_relative_units_kat() {
+        let t = laid_out(
+            r#"<html><body><div id=a><div id=b>x</div><div id=c>y</div></div><div id=d>z</div>
+            <div id=n><span id=ns>n</span></div><div id=l><span id=ls>l</span></div></body></html>"#,
+            "html{font-size:10px} body{margin:0;font-family:monospace} #a{font-size:20px} \
+             #b{width:10em;padding-left:1em;box-sizing:content-box} #c{font-size:1.5em;width:2em} #d{width:5rem} \
+             #n{font-size:10px;line-height:2} #ns{font-size:20px} #l{font-size:10px;line-height:20px} #ls{font-size:30px}",
+        );
+        let b = rect_by_id(&t, "b").unwrap();
+        assert_eq!(b.2, 220.0, "10em + 1em padding at the element's 20px font: {b:?}");
+        let c = node_by_id(&t, "c").unwrap();
+        assert_eq!(t.paint_map[&c].used_font_size, Some(30.0), "1.5em of the parent's 20px");
+        assert_eq!(rect_by_id(&t, "c").unwrap().2, 60.0, "2em of its own 30px");
+        assert_eq!(rect_by_id(&t, "d").unwrap().2, 50.0, "5rem of the root's 10px");
+        let n = node_by_id(&t, "n").unwrap();
+        assert!(t.inline[&n].lines[0].1 >= 40.0, "number line-height re-multiplied by the 20px child: {:?}", t.inline[&n].lines);
+        let l = node_by_id(&t, "l").unwrap();
+        assert_eq!(t.inline[&l].lines[0].1.round(), 20.0f32.max(t.inline[&l].lines[0].1.round()), "length line-height inherited as 20px");
+        assert!(t.inline[&l].lines[0].1 < 40.0, "length line-height is not re-multiplied: {:?}", t.inline[&l].lines);
+    }
+
     /// CSS 2.2 Appendix E / §9.9.1 known answers: a z-index inside a
     /// z-indexed parent never rises above the parent's context (z100 in z1
     /// stays under a z2 sibling); positioned descendants of a z-index:auto

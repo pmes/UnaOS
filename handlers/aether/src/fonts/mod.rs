@@ -68,10 +68,12 @@ pub fn line_metrics(font: &Font, size: f32) -> (f32, f32, f32) {
     ((m.ascent * scale).round(), (-m.descent * scale).round(), (m.line_gap * scale).round())
 }
 
-/// The used line height: `mult` x size, or (0 = `normal`) the rounded
-/// metrics sum.
+/// The used line height: `mult` x size, `-mult` px when negative (a
+/// length), or (0 = `normal`) the rounded metrics sum.
 pub fn line_height(font: &Font, size: f32, mult: f32) -> f32 {
-    if mult > 0.0 {
+    if mult < 0.0 {
+        -mult // a <length>: absolute px (layout::PaintStyle::line_height)
+    } else if mult > 0.0 {
         size * mult
     } else {
         let (a, d, g) = line_metrics(font, size);

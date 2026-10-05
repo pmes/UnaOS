@@ -451,7 +451,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     let own_family = spec
         .family
         .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
-    inherited.font_size = spec.font_size.unwrap_or_else(|| {
+    inherited.font_size = spec.used_font_size.or(spec.font_size).unwrap_or_else(|| {
         crate::layout::ua_font_size(tag, inherited.font_size, inherited.family, own_family)
     });
     inherited.bold = spec.bold.unwrap_or_else(|| crate::layout::default_bold(tag, inherited.bold));

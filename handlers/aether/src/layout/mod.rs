@@ -131,6 +131,17 @@ pub struct PaintStyle {
     pub float: Option<u8>,
     /// opacity in [0, 1] (0 also sets `hidden`).
     pub opacity: Option<f32>,
+    /// How `font_size` was specified: (0, f) = f x the parent's font-size
+    /// (em, %, smaller/larger), (1, f) = f x the root's (rem), (2, _) =
+    /// absolute (font_size as is).
+    pub font_size_rel: Option<(u8, f32)>,
+    /// The element's computed font-size in px, written by remeasure (the
+    /// painter reads it instead of re-deriving the em chain).
+    pub used_font_size: Option<f32>,
+    /// Every length-valued declaration in cascade order (property, value):
+    /// remeasure re-applies them against the element's own font when any is
+    /// font-relative (em/rem/ex/ch, css-values-4 §6.1).
+    pub font_rel: Option<Vec<(String, String)>>,
 }
 
 pub struct LayoutTree {
@@ -1328,6 +1339,77 @@ fn rescale_ua_margins(tree: &mut LayoutTree, sizes: &HashMap<taffy::NodeId, f32>
     }
 }
 
+/// The computed font-size of an element (css-fonts-4 §2.5): an em/% value
+/// of the parent's size, rem of the root's (the rem basis in the font
+/// context), an absolute value as given, else the UA default for the tag.
+fn computed_font_size(paint: Option<&PaintStyle>, tag: &str, parent: f32, parent_family: u8, own_family: u8) -> f32 {
+    match paint.and_then(|p| p.font_size_rel) {
+        Some((0, f)) => parent * f,
+        Some((1, f)) => crate::css::font_ctx().1 * f,
+        _ => paint
+            .and_then(|p| p.font_size)
+            .unwrap_or_else(|| ua_font_size(tag, parent, parent_family, own_family)),
+    }
+}
+
+/// The root element's computed font-size (16px unless the author sizes
+/// `html`; a rem there is of the initial 16px).
+fn root_font_size(tree: &LayoutTree) -> f32 {
+    let html = tree.node_map.iter().find_map(|(id, n)| {
+        n.as_element().filter(|e| e.name.local.as_ref() == "html").map(|_| *id)
+    });
+    let Some(p) = html.and_then(|h| tree.paint_map.get(&h)) else { return 16.0 };
+    match p.font_size_rel {
+        Some((0 | 1, f)) => 16.0 * f,
+        _ => p.font_size.unwrap_or(16.0),
+    }
+}
+
+/// Re-applies the length declarations of every element that has a
+/// font-relative one, with the element's own font as the basis. Returns
+/// whether anything was re-applied.
+fn reresolve_font_relative(tree: &mut LayoutTree, elems: &HashMap<taffy::NodeId, TextRun>, root_fs: f32) -> bool {
+    let todo: Vec<(taffy::NodeId, Vec<(String, String)>)> = tree
+        .paint_map
+        .iter()
+        .filter_map(|(id, p)| {
+            let list = p.font_rel.as_ref()?;
+            list.iter()
+                .any(|(prop, v)| crate::css::is_font_relative(v) || (prop == "line-height" && v.trim_end().ends_with('%')))
+                .then(|| (*id, list.clone()))
+        })
+        .collect();
+    if todo.is_empty() {
+        return false;
+    }
+    for (id, decls) in todo {
+        let Some(run) = elems.get(&id) else { continue };
+        let fs = run.font_size;
+        let (ex, ch) = match crate::fonts::face(run.family, run.bold, run.italic) {
+            Some(f) => {
+                let m = f.metrics();
+                let ex = m.x_height * fs / m.units_per_em as f32;
+                let key = crate::fonts::face_key(run.family, run.bold, run.italic);
+                let ch = crate::fonts::lines::Advancer::new(&f, key, fs, 0.0).char('0');
+                (if ex > 0.0 { ex } else { fs * 0.5 }, ch)
+            }
+            None => (fs * 0.5, fs * 0.5),
+        };
+        crate::css::set_font_ctx((fs, root_fs, ex, ch));
+        let spec = crate::css::reapply_declarations(&decls);
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            spec.fold_into(&mut st);
+            let _ = tree.taffy.set_style(id, st);
+        }
+        if let Some(p) = tree.paint_map.get_mut(&id) {
+            crate::css::merge_paint(p, &spec.paint);
+        }
+    }
+    crate::css::set_font_ctx((16.0, root_fs, 8.0, 8.0));
+    true
+}
+
 /// Recomputes layout with real text measurement: resolves each text run's
 /// inherited font size, then lets taffy size text leaves by wrapped extent.
 /// Called after building the tree and after every cascade application.
@@ -1363,9 +1445,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 let own_family = paint
                     .and_then(|p| p.family)
                     .unwrap_or_else(|| default_family(tag, inherited.family));
-                size.font_size = paint
-                    .and_then(|p| p.font_size)
-                    .unwrap_or_else(|| ua_font_size(tag, inherited.font_size, inherited.family, own_family));
+                size.font_size = computed_font_size(paint, tag, inherited.font_size, inherited.family, own_family);
                 if paint.is_some_and(|p| p.ua_vmargin.is_some()) {
                     sizes.insert(node_id, size.font_size);
                 }
@@ -1451,7 +1531,30 @@ pub fn remeasure(tree: &mut LayoutTree) {
     let root = TextRun { font_size: 16.0, ..Default::default() };
     let mut sizes: HashMap<taffy::NodeId, f32> = HashMap::new();
     let mut elem_info: HashMap<taffy::NodeId, TextRun> = HashMap::new();
-    resolve(tree.root_node, root, tree, &mut text_info, &mut img_info, &mut media_info, &mut sizes, &mut elem_info);
+    // The rem basis: the root element's computed font-size.
+    let root_fs = root_font_size(tree);
+    let prev_ctx = crate::css::set_font_ctx((16.0, root_fs, 8.0, 8.0));
+    resolve(tree.root_node, root.clone(), tree, &mut text_info, &mut img_info, &mut media_info, &mut sizes, &mut elem_info);
+    // css-values-4 §6.1: lengths in em/ex/ch are of the element's own
+    // computed font (font-size: of the parent's), rem of the root's. The
+    // cascade parsed them at 16px; each element holding any re-applies its
+    // length declarations, in cascade order, against its real font.
+    if reresolve_font_relative(tree, &elem_info, root_fs) {
+        text_info.clear();
+        img_info.clear();
+        media_info.clear();
+        sizes.clear();
+        elem_info.clear();
+        resolve(tree.root_node, root, tree, &mut text_info, &mut img_info, &mut media_info, &mut sizes, &mut elem_info);
+    }
+    crate::css::set_font_ctx(prev_ctx);
+    for (id, run) in &elem_info {
+        if tree.node_map.get(id).is_some_and(|n| n.as_element().is_some()) {
+            if let Some(p) = tree.paint_map.get_mut(id) {
+                p.used_font_size = Some(run.font_size);
+            }
+        }
+    }
     rescale_ua_margins(tree, &sizes);
     // A replaced media box with an auto width is its own (attribute / intrinsic) width — not
     // stretched across a column container the way an auto-width block is. Height follows when

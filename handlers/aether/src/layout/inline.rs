@@ -193,7 +193,13 @@ fn metrics(run: &TextRun) -> Metrics {
             Metrics { a, d, lh, xh, off: crate::fonts::baseline_offset(&f, run.font_size, run.line_height) }
         }
         None => {
-            let lh = if run.line_height > 0.0 { run.font_size * run.line_height } else { run.font_size * 1.15 };
+            let lh = if run.line_height > 0.0 {
+                run.font_size * run.line_height
+            } else if run.line_height < 0.0 {
+                -run.line_height
+            } else {
+                run.font_size * 1.15
+            };
             Metrics { a: run.font_size * 0.8, d: run.font_size * 0.2, lh, xh: run.font_size * 0.5, off: run.font_size * 0.8 }
         }
     }
