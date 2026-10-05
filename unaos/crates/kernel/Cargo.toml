@@ -3770,6 +3770,9 @@ prefs_reset = []
 # pairs with UNAOS_WC=1. Off: the probe answers `feature-off` and nothing else changes. Kept in sync with
 # `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`. GPUTESTS M3 (B334): implies `wc` —
 # the blitter sits under the window compositor and is meaningless without it.
+# GPUBLIT (B371): INERT. The GPU blitter now keys on the takeover build (`nvidia-kepler` +
+# `nvidia-kepler-takeover`) and arms itself from the boot self-test — no knob. Kept declared so existing knob
+# lines still build; the seat retires it (Cargo, arroyo, builder, the k8-reach row) at the fold.
 wc_gpublit = ["wc"]
 
 [dependencies]
