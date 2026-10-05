@@ -6188,6 +6188,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "usbnet_core"
+version = "0.1.0"
+
+[[package]]
 name = "usvg"
 version = "0.48.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

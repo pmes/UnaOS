@@ -12,6 +12,7 @@ members = [
     "unaos/libs/sys/midden_core",
     "unaos/libs/sys/prefs_core",
     "unaos/libs/sys/wifi_core",
+    "unaos/libs/sys/usbnet_core", # NETFRAME (B368): the USB Ethernet rx framing core the kernel driver and the host KATs share
     "unaos/libs/sys/vein_core",
     "unaos/libs/sys/diag_core",
     "unaos/libs/sys/amber_core",
