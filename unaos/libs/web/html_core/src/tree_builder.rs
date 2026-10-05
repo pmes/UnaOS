@@ -81,7 +81,7 @@ fn is_ws(c: char) -> bool {
 }
 
 fn is_one_of(name: &str, list: &[&str]) -> bool {
-    list.iter().any(|&n| n == name)
+    list.contains(&name)
 }
 
 const IMPLIED_END: &[&str] = &["dd", "dt", "li", "optgroup", "option", "p", "rb", "rp", "rt", "rtc"];
@@ -565,21 +565,19 @@ impl TreeBuilder {
                 }
             }
         }
-        if let Some(e) = self.doc.element(target) {
-            if let Some(contents) = e.template_contents {
+        if let Some(e) = self.doc.element(target)
+            && let Some(contents) = e.template_contents {
                 return (contents, None);
             }
-        }
         (target, reference)
     }
 
     fn adjusted_location(&self, override_target: Option<NodeId>) -> (NodeId, Option<NodeId>) {
         let loc = self.appropriate_place(override_target);
-        if let Some(rt) = self.root_target {
-            if self.open.first() == Some(&loc.0) {
+        if let Some(rt) = self.root_target
+            && self.open.first() == Some(&loc.0) {
                 return (rt, None);
             }
-        }
         loc
     }
 
@@ -591,16 +589,14 @@ impl TreeBuilder {
                 if ns == Namespace::MathMl && local == "definitionurl" {
                     local = String::from("definitionURL");
                 }
-                if ns == Namespace::Svg {
-                    if let Some(&(_, fixed)) = SVG_ATTRS.iter().find(|(k, _)| *k == local) {
+                if ns == Namespace::Svg
+                    && let Some(&(_, fixed)) = SVG_ATTRS.iter().find(|(k, _)| *k == local) {
                         local = String::from(fixed);
                     }
-                }
-                if ns == Namespace::MathMl || ns == Namespace::Svg {
-                    if let Some(&(_, prefix, l, ans)) = FOREIGN_ATTRS.iter().find(|(k, ..)| *k == a.name) {
+                if (ns == Namespace::MathMl || ns == Namespace::Svg)
+                    && let Some(&(_, prefix, l, ans)) = FOREIGN_ATTRS.iter().find(|(k, ..)| *k == a.name) {
                         return Attribute { prefix, ns: ans, local: String::from(l), value: a.value.clone() };
                     }
-                }
                 Attribute { prefix: None, ns: Namespace::None, local, value: a.value.clone() }
             })
             .collect()
@@ -612,16 +608,14 @@ impl TreeBuilder {
         if ns == Namespace::Html && tag.name == "option" && tag.attr("selected").is_some() {
             self.selectedness.insert(id);
         }
-        if ns == Namespace::MathMl && tag.name == "annotation-xml" {
-            if let Some(enc) = tag.attr("encoding") {
+        if ns == Namespace::MathMl && tag.name == "annotation-xml"
+            && let Some(enc) = tag.attr("encoding") {
                 let enc = enc.to_ascii_lowercase();
-                if enc == "text/html" || enc == "application/xhtml+xml" {
-                    if let Some(e) = self.doc.element_mut(id) {
+                if (enc == "text/html" || enc == "application/xhtml+xml")
+                    && let Some(e) = self.doc.element_mut(id) {
                         e.html_integration_point = true;
                     }
-                }
             }
-        }
         id
     }
 
@@ -664,12 +658,11 @@ impl TreeBuilder {
             Some(r) => self.doc.prev_sibling(r),
             None => self.doc.last_child(target),
         };
-        if let Some(p) = prev {
-            if let NodeData::Text(t) = &mut self.doc.node_mut(p).data {
+        if let Some(p) = prev
+            && let NodeData::Text(t) = &mut self.doc.node_mut(p).data {
                 t.push(c);
                 return;
             }
-        }
         let mut s = String::new();
         s.push(c);
         let t = self.doc.create(NodeData::Text(s));
@@ -772,7 +765,7 @@ impl TreeBuilder {
         let e = self.doc.element(select).expect("select");
         let multiple = e.attr("multiple").is_some();
         let parsed = e.attr("size").and_then(|v| {
-            let v = v.trim_start_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0C' | '\r'));
+            let v = v.trim_start_matches([' ', '\t', '\n', '\x0C', '\r']);
             let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
             if digits.is_empty() { None } else { Some(digits.parse::<u64>().unwrap_or(u64::MAX)) }
         });
@@ -802,12 +795,11 @@ impl TreeBuilder {
                 first_enabled = Some(o);
             }
         }
-        if last_selected.is_none() && self.select_display_size_is_1(select) {
-            if let Some(f) = first_enabled {
+        if last_selected.is_none() && self.select_display_size_is_1(select)
+            && let Some(f) = first_enabled {
                 self.selectedness.insert(f);
                 changed = true;
             }
-        }
         changed
     }
 
@@ -885,13 +877,11 @@ impl TreeBuilder {
                 }
             }
             self.update_option_selectedcontents(el);
-        } else if self.is_html(el, "selectedcontent") {
-            if let Some(select) = self.selectedcontent_select(el) {
-                if self.doc.element(select).is_some_and(|e| e.attr("multiple").is_none()) {
+        } else if self.is_html(el, "selectedcontent")
+            && let Some(select) = self.selectedcontent_select(el)
+                && self.doc.element(select).is_some_and(|e| e.attr("multiple").is_none()) {
                     self.update_selectedcontent(select, el);
                 }
-            }
-        }
     }
 
     /// An element was popped off (or removed from) the stack of open elements.
@@ -1017,15 +1007,14 @@ impl TreeBuilder {
                     break;
                 }
                 let mut node_afe = self.afe_index_of(node);
-                if inner > 3 {
-                    if let Some(i) = node_afe {
+                if inner > 3
+                    && let Some(i) = node_afe {
                         self.afe.remove(i);
                         if i < bookmark {
                             bookmark -= 1;
                         }
                         node_afe = None;
                     }
-                }
                 let Some(ai) = node_afe else {
                     let removed = self.open.remove(node_idx);
                     self.popped(removed);
@@ -2548,11 +2537,10 @@ impl TreeBuilder {
             Token::StartTag(mut t) => {
                 let acn = self.adjusted_current().expect("adjusted current node");
                 let ns = self.ns(acn);
-                if ns == Namespace::Svg {
-                    if let Some(&(_, fixed)) = SVG_TAGS.iter().find(|(k, _)| *k == t.name) {
+                if ns == Namespace::Svg
+                    && let Some(&(_, fixed)) = SVG_TAGS.iter().find(|(k, _)| *k == t.name) {
                         t.name = String::from(fixed);
                     }
-                }
                 self.insert_foreign(&t, ns, false);
                 if t.self_closing {
                     self.pop();

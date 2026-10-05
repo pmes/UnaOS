@@ -350,7 +350,7 @@ impl Document {
     pub fn has_class(&self, id: NodeId, class: &str) -> bool {
         self.element(id)
             .and_then(|e| e.attr("class"))
-            .is_some_and(|v| v.split(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0C' | '\r')).any(|t| t == class))
+            .is_some_and(|v| v.split([' ', '\t', '\n', '\x0C', '\r']).any(|t| t == class))
     }
     /// `querySelector`-shaped: the first descendant element of `root` (tree order) matching `pred`.
     pub fn query_first(&self, root: NodeId, mut pred: impl FnMut(&Document, NodeId) -> bool) -> Option<NodeId> {

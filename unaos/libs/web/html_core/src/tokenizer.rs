@@ -290,7 +290,7 @@ impl Tokenizer {
         }
         self.input[at..at + n].iter().zip(s.chars()).all(|(&a, b)| {
             if ci {
-                a.to_ascii_lowercase() == b.to_ascii_lowercase()
+                a.eq_ignore_ascii_case(&b)
             } else {
                 a == b
             }
