@@ -136,6 +136,8 @@ impl core::fmt::Display for DecodeError {
     }
 }
 
+impl core::error::Error for DecodeError {}
+
 /// Error raised by the codec seam. Encoding is infallible (a record is
 /// always representable); only decoding refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
