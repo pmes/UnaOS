@@ -251,6 +251,12 @@ pub enum Op {
     BlockFnHoist(u32),
     /// Initialise a binding by name (script-level let/const/class, eval lexical): pops the value.
     InitName(u32),
+    /// Resolve a name now (assignment through a dynamic scope): pushes a reference token.
+    ResolveRef(u32),
+    /// [token] -> [token value]
+    GetRef(u32),
+    /// [token value] -> [value]
+    PutRef(u32),
     /// value thisRaw -> result (derived constructor return semantics)
     CheckDerivedReturn,
     /// iter next -> promise (async iterator close: calls return(), result to be awaited)

@@ -133,6 +133,133 @@ impl Vm {
         }
     }
 
+    /// Reference token for `name`: the environment record that holds it (Undefined = unresolvable).
+    pub fn resolve_ref(&mut self, name: &JsStr) -> JsResult<Value> {
+        let mut e = self.frames.last().and_then(|f| f.env);
+        while let Some(env) = e {
+            match self.lookup_in_env(env, name)? {
+                Some(true) => return Ok(Value::Object(env)),
+                Some(false) => e = self.env_parent(env),
+                None => return Ok(Value::Undefined),
+            }
+        }
+        Ok(Value::Undefined)
+    }
+
+    /// Does this single environment record hold `name`? Some(false) = look further; None = end of chain.
+    fn lookup_in_env(&mut self, env: Obj, name: &JsStr) -> JsResult<Option<bool>> {
+        enum S {
+            Decl(bool),
+            Obj(Obj, bool),
+            Global(Obj, bool),
+        }
+        let s = match &self.heap.get(env).kind {
+            Kind::Env(d) => S::Decl(d.info.find(name).is_some() || d.extra.as_ref().map(|x| x.get(&PropertyKey::Str(name.clone())).is_some()).unwrap_or(false)),
+            Kind::ObjEnv(d) => S::Obj(d.object, d.with),
+            Kind::GlobalEnv(g) => S::Global(g.object, g.lex.get(&PropertyKey::Str(name.clone())).is_some()),
+            _ => return Ok(None),
+        };
+        match s {
+            S::Decl(b) => Ok(Some(b)),
+            S::Global(o, lex) => {
+                if lex {
+                    return Ok(Some(true));
+                }
+                let key = PropertyKey::from_js(name.clone());
+                if self.has_property(o, &key)? {
+                    Ok(Some(true))
+                } else {
+                    Ok(None)
+                }
+            }
+            S::Obj(o, with) => {
+                let key = PropertyKey::from_js(name.clone());
+                if !self.has_property(o, &key)? {
+                    return Ok(Some(false));
+                }
+                if with {
+                    let us = self.wk.unscopables.clone();
+                    let u = self.get(o, &PropertyKey::Sym(us))?;
+                    if let Value::Object(uo) = u {
+                        let blocked = self.get(uo, &key)?;
+                        if self.to_boolean(&blocked) {
+                            return Ok(Some(false));
+                        }
+                    }
+                }
+                Ok(Some(true))
+            }
+        }
+    }
+
+    /// The NameRef of `name` within one specific environment record (from a reference token).
+    fn ref_in_env(&self, env: Obj, name: &JsStr) -> NameRef {
+        match &self.heap.get(env).kind {
+            Kind::Env(d) => match d.info.find(name) {
+                Some(i) => NameRef::Slot(env, i as u32),
+                None => NameRef::Extra(env),
+            },
+            Kind::ObjEnv(d) => NameRef::Object(d.object, d.with),
+            Kind::GlobalEnv(g) => {
+                if g.lex.get(&PropertyKey::Str(name.clone())).is_some() {
+                    NameRef::GlobalLex(env)
+                } else {
+                    NameRef::Object(g.object, false)
+                }
+            }
+            _ => NameRef::None,
+        }
+    }
+
+    pub fn get_ref(&mut self, token: &Value, name: &JsStr) -> JsResult<Value> {
+        match token {
+            Value::Object(env) => {
+                let r = self.ref_in_env(*env, name);
+                self.get_name_ref(name, r)
+            }
+            _ => Err(self.not_defined(name)),
+        }
+    }
+
+    pub fn put_ref(&mut self, token: &Value, name: &JsStr, v: Value, strict: bool) -> JsResult<()> {
+        let env = match token {
+            Value::Object(e) => *e,
+            _ => {
+                if strict {
+                    return Err(self.not_defined(name));
+                }
+                let g = self.realm().global;
+                self.set(g, PropertyKey::from_js(name.clone()), v, &Value::Object(g))?;
+                return Ok(());
+            }
+        };
+        match self.ref_in_env(env, name) {
+            NameRef::Object(o, _) => {
+                let key = PropertyKey::from_js(name.clone());
+                if strict && !self.has_property(o, &key)? {
+                    return Err(self.not_defined(name));
+                }
+                let ok = self.set(o, key, v, &Value::Object(o))?;
+                if !ok && strict {
+                    return self.throw_type(&alloc::format!("Cannot assign to read only property '{}'", name));
+                }
+                Ok(())
+            }
+            _ => {
+                // Declarative bindings never disappear (except eval vars): assign through the normal path.
+                let saved = self.frames.last().and_then(|f| f.env);
+                if let Some(f) = self.frames.last_mut() {
+                    f.env = Some(env);
+                }
+                let r = self.set_name(name, v, strict);
+                if let Some(f) = self.frames.last_mut() {
+                    f.env = saved;
+                }
+                r
+            }
+        }
+    }
+
     pub fn get_name(&mut self, name: &JsStr) -> JsResult<Value> {
         let r = self.lookup_name(name)?;
         if let NameRef::None = r {

@@ -253,6 +253,25 @@ impl Vm {
                     let strict = self.frames[fi].code.strict;
                     self.set_name(&name, v, strict)?;
                 }
+                Op::ResolveRef(k) => {
+                    let name = self.frames[fi].code.str(k).clone();
+                    let t = self.resolve_ref(&name)?;
+                    self.stack.push(t);
+                }
+                Op::GetRef(k) => {
+                    let name = self.frames[fi].code.str(k).clone();
+                    let t = self.top().clone();
+                    let v = self.get_ref(&t, &name)?;
+                    self.stack.push(v);
+                }
+                Op::PutRef(k) => {
+                    let name = self.frames[fi].code.str(k).clone();
+                    let v = self.pop();
+                    let t = self.pop();
+                    let strict = self.frames[fi].code.strict;
+                    self.put_ref(&t, &name, v.clone(), strict)?;
+                    self.stack.push(v);
+                }
                 Op::InitName(k) => {
                     let name = self.frames[fi].code.str(k).clone();
                     let v = self.pop();
@@ -1260,6 +1279,10 @@ impl Vm {
     }
 
     /// Call an async function: run it synchronously until its first await; return its promise.
+    pub fn call_async_at(&mut self, fo: Obj, code: Rc<Code>, base: usize, argc: usize) -> JsResult<Value> {
+        self.call_async(fo, code, base, argc)
+    }
+
     fn call_async(&mut self, fo: Obj, code: Rc<Code>, base: usize, argc: usize) -> JsResult<Value> {
         self.push_code_frame(fo, code, base, argc, Value::Undefined, false)?;
         let co = self.new_coroutine(CoroKind::Async);

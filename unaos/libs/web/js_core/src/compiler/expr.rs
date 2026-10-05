@@ -532,6 +532,22 @@ impl Gen {
     fn update(&mut self, inc: bool, prefix: bool, a: &Expr) {
         let opc = if inc { Op::Inc } else { Op::Dec };
         match a.unparen() {
+            Expr::Ident(i) if matches!(self.resolve(&i.name), Ref::Dynamic) => {
+                let k = self.str_const(&i.name);
+                self.emit(Op::ResolveRef(k));
+                self.emit(Op::GetRef(k));
+                self.emit(Op::ToNumeric);
+                if prefix {
+                    self.emit(opc);
+                    self.emit(Op::PutRef(k));
+                } else {
+                    self.emit(Op::Dup);
+                    self.emit(Op::Rot3);
+                    self.emit(opc);
+                    self.emit(Op::PutRef(k));
+                    self.emit(Op::Pop);
+                }
+            }
             Expr::Ident(i) => {
                 self.load_name(&i.name);
                 self.emit(Op::ToNumeric);
@@ -672,6 +688,16 @@ impl Gen {
     fn assign(&mut self, op: AssignOp, target: &Pat, value: &Expr) {
         match op {
             AssignOp::Assign => match target {
+                Pat::Ident(id) if matches!(self.resolve(&id.name), Ref::Dynamic) && self.import_index_pub(&id.name).is_none() => {
+                    let k = self.str_const(&id.name);
+                    self.emit(Op::ResolveRef(k));
+                    if value.is_anonymous_fn() {
+                        self.expr_named(value, &JsStr::from_str(&id.name));
+                    } else {
+                        self.expr(value);
+                    }
+                    self.emit(Op::PutRef(k));
+                }
                 Pat::Ident(id) => {
                     if value.is_anonymous_fn() {
                         self.expr_named(value, &JsStr::from_str(&id.name));
@@ -735,6 +761,7 @@ impl Gen {
         // Load current value with the reference parts left on the stack; `finish` stores.
         enum Kind {
             Name(String),
+            DynName(u32, String),
             Prop(u32),
             Elem,
             Private,
@@ -742,6 +769,12 @@ impl Gen {
             Invalid,
         }
         let kind = match target {
+            Pat::Ident(id) if matches!(self.resolve(&id.name), Ref::Dynamic) => {
+                let k = self.str_const(&id.name);
+                self.emit(Op::ResolveRef(k));
+                self.emit(Op::GetRef(k));
+                Kind::DynName(k, String::from(&*id.name))
+            }
             Pat::Ident(id) => {
                 self.load_name(&id.name);
                 Kind::Name(String::from(&*id.name))
@@ -793,7 +826,7 @@ impl Gen {
             return;
         }
         let name_for_fn = match &kind {
-            Kind::Name(n) => Some(JsStr::from_str(n)),
+            Kind::Name(n) | Kind::DynName(_, n) => Some(JsStr::from_str(n)),
             _ => None,
         };
         let mut short = None;
@@ -817,6 +850,9 @@ impl Gen {
                 let n = n.clone();
                 self.store_name(&n);
             }
+            Kind::DynName(k, _) => {
+                self.emit(Op::PutRef(*k));
+            }
             Kind::Prop(k) => {
                 self.emit(Op::SetProp(*k));
             }
@@ -837,6 +873,7 @@ impl Gen {
             // Short-circuited: drop the reference parts below the current value.
             let extra = match &kind {
                 Kind::Name(_) => 0,
+                Kind::DynName(..) => 1,
                 Kind::Prop(_) => 1,
                 Kind::Elem | Kind::Private => 2,
                 Kind::Super => 3,

@@ -562,6 +562,9 @@ impl Vm {
                 }
             }
             K::Code(code) => {
+                if code.is_async && !code.is_generator && !construct {
+                    return self.call_async_at(fo, code, base, argc);
+                }
                 self.push_code_frame(fo, code, base, argc, new_target, construct)?;
                 let depth = self.frames.len();
                 self.frames[depth - 1].entry = true;

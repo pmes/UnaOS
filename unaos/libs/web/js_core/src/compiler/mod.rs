@@ -417,6 +417,10 @@ impl Gen {
         None
     }
 
+    pub(crate) fn import_index_pub(&self, name: &str) -> Option<u32> {
+        self.import_index(name)
+    }
+
     fn import_index(&self, name: &str) -> Option<u32> {
         if !matches!(self.binding_kind(name), Some(BindKind::Import)) {
             return None;
