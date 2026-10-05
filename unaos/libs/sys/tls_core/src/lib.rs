@@ -29,6 +29,10 @@ pub mod x509;
 #[cfg(feature = "test-provider")]
 pub mod test_provider;
 
+/// The product provider over CRYPTOCORE (feature `cryptocore`). See `src/cryptocore_provider.rs`.
+#[cfg(feature = "cryptocore")]
+pub mod cryptocore_provider;
+
 pub use client::{Client, ClientConfig, Negotiated, ServerCertVerifier, Transport};
 pub use crypto::CryptoProvider;
 pub use error::{AlertDescription, CertError, TlsError};

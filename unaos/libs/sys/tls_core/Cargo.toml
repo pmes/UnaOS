@@ -17,16 +17,25 @@ description = "UnaOS's own TLS 1.3 client (RFC 8446) and X.509 path validation (
 # against the RFC 8448 traces and a live OpenSSL server NOW, before crypto_core lands. It is NEVER linked into a
 # product binary: nothing outside this crate's own tests may enable `test-provider`.
 #
-# Non-dev dependencies: none.
+# Feature `cryptocore` (VEINTLS, SR36): the PRODUCT provider, `tls_core::cryptocore_provider::CryptoCoreProvider`
+# over crypto_core (in-tree, zero third-party crates). The module is CRYPTOCORE's fold file
+# (crypto_core/adapters/tls_core_provider.rs); until CRYPTOCORE lands it on this branch, src/cryptocore_provider.rs
+# is a stub whose `compile_error!` names exactly what is missing. `cryptocore-std` adds the host `new()` over
+# /dev/urandom (the adapter's own header names both features).
+#
+# Non-dev dependencies: none, unless `cryptocore` (then crypto_core, in-tree).
 
 [features]
 default = []
+cryptocore = ["dep:crypto_core"]
+cryptocore-std = ["cryptocore", "crypto_core/std"]
 test-provider = [
   "dep:sha2", "dep:hmac", "dep:aes-gcm", "dep:chacha20poly1305", "dep:x25519-dalek",
   "dep:p256", "dep:p384", "dep:ed25519-dalek", "dep:rsa", "dep:getrandom",
 ]
 
 [dependencies]
+crypto_core = { path = "../crypto_core", optional = true, default-features = false, features = ["alloc"] }
 sha2 = { version = "0.11.0", optional = true, default-features = false }
 hmac = { version = "0.13.0", optional = true }
 aes-gcm = { version = "0.11.1", optional = true, default-features = false, features = ["aes", "alloc"] }

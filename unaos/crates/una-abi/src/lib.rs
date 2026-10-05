@@ -1197,3 +1197,13 @@ impl AppNote {
     }
 }
 const _: () = assert!(core::mem::size_of::<AppNote>() == 24);
+
+// VEINTLS (LEDGER SR36) — wall-clock time for ring 3. A TLS client checks every certificate's validity
+// window against NOW (RFC 5280 §6.1.3 (a)(2)), and ring 3 had only SYS_GETINFO's boot-relative ticks.
+// `SYS_TIME() -> UTC Unix seconds (>= 0) / -EAGAIN` — the kernel's civil clock (`clock::unix_now`: the
+// RTC or SNTP anchor plus the monotonic counter since). -EAGAIN while the clock has never been anchored
+// this boot: a caller that needs the time (certificate checks) must refuse rather than guess.
+// 59 is RING3ABI2's SYS_WHOAMI (B333, in flight on its own branch); this verb takes the next number.
+/// `SYS_TIME() -> unix seconds / -EAGAIN` (VEINTLS, SR36). Both arches, unconditional.
+pub const SYS_TIME: u64 = 60;
+const _: () = assert!(SYS_TIME == SYS_SBRK + 2);

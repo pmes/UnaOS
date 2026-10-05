@@ -2625,7 +2625,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), #[cfg(feature = "netring3")] una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), // RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block. ⚠ SAME-LINE fold.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_TIME => sys_time(), // RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block. VEINTLS (SR36): SYS_TIME, body at the FILE TAIL. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
         // so the dispatch match is byte-identical there and an unknown number falls to the default.
@@ -30071,4 +30071,13 @@ pub fn bus_notice_to(row: usize, body: &[u8]) -> i64 {
         return EAGAIN;
     }
     busx_reply_enqueue(row, 0, crate::bus::BUS_VERB_NOTICE, 0, body)
+}
+
+/// VEINTLS (LEDGER SR36): `SYS_TIME() -> UTC Unix seconds / -EAGAIN` — the civil clock for ring 3 (a TLS
+/// client's certificate validity check). `-EAGAIN` while `clock::unix_now` is unanchored: never a guess.
+fn sys_time() -> i64 {
+    match crate::clock::unix_now() {
+        Some(s) => s.min(i64::MAX as u64) as i64,
+        None => EAGAIN,
+    }
 }

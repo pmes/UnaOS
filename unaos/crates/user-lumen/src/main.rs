@@ -8,28 +8,32 @@
 //
 // WHAT IT IS. A window over a conversation that talks to the provider ITSELF: it links Vein as a library
 // (`vein_core`, the pure encoder/decoder/client/rules, and `vein_ring3`, the syscall transport), resolves
-// the endpoint (SYS_RESOLVE), opens TCP (the NETRING3 socket verbs), runs TLS 1.3 over it (embedded-tls),
+// the endpoint (SYS_RESOLVE), opens TCP (the NETRING3 socket verbs), runs TLS 1.3 over it (UnaOS's own
+// tls_core, every server VERIFIED against /system/trust/roots.pem at SYS_TIME — VEINTLS, SR36),
 // POSTs /v1/messages with `stream: true` and draws the deltas as they arrive. Nothing else runs: no
 // daemon, no bus chat verbs, no autostart. (LUMENBIN's two-program shape — this window relaying to a
 // VEIN.BIN service over bus verbs 130..133 — is retired.)
 //
 // CONFIGURATION is Principia's (BUS_VERB_PREF_GET, namespace `vein`): `vein.provider`, `vein.model`,
-// `vein.endpoint`, `vein.tls`, `vein.key_file`. The KEY is read only from a file on the UnaFS volume (it
-// stats with an inode id); on FAT it is refused with the reason in the window. With no key the Echo
-// provider answers, so the window works on the FAT card. `vein_core::prefs::plan` is the rule.
+// `vein.endpoint`, `vein.key_file`. The KEY is read only from a file on the UnaFS volume (it stats with an
+// inode id); on FAT it is refused with the reason in the window. With no key the Echo provider answers, so
+// the window works on the FAT card. `vein_core::prefs::plan` is the rule, and the key crosses the wire
+// ONLY on a verified TLS connection: no trust store, no clock or no crypto provider = Echo, with the
+// missing piece named in the window (there is no `vein.tls = "insecure"` any more).
 //
 // THE ELF MODEL. Linked at una_abi::USER_XWIN_VA_X86 (user-lumen-x86.ld, the user-big shape), so the
-// kernel maps it in the 4 MiB ELF window with a 256 KiB stack (`-z stack-size`): ~80 KiB of TLS code and
-// ~90 KiB of buffers cannot live in the 16 KiB fixed window. The window landmarks (info page, surface)
+// kernel maps it in the 4 MiB ELF window with a 256 KiB stack (`-z stack-size`): the TLS + X.509 code, the
+// ~70 KiB of exchange buffers and the heap (vein_ring3::heap over SYS_SBRK: TLS records, the parsed trust
+// store) cannot live in the 16 KiB fixed window. The window landmarks (info page, surface)
 // stay at the fixed USER_BASE_X86 + 0x4000 / + 0x5000.
 //
 // KEYS. Printable ASCII inserts at the caret; Backspace deletes; Left/Right (and the caret actions) move
 // it; Enter sends; Up/Down and the wheel scroll; Ctrl-K or Cmd-K (INPUT_EV_ACTION 41, ClearView) starts a
 // new conversation; Esc cancels an answer in flight and NEVER closes the window (R24).
 //
-// WIRE. `:: LUMEN: start provider=<claude|echo> model=<m> key=<unafs|none|fat-refused> transport=<tls|http|none> ::`
-// once, then per answer `:: LUMEN: reply provider=<p> first_token_ms=<n> bytes=<n> stop=<s> ::` or
-// `:: LUMEN: fail stage=<s> code=<n> ::`. The window's footer shows the provider and the first token's latency.
+// WIRE. `:: LUMEN: start provider=<claude|echo> model=<m> key=<unafs|none|fat-refused> transport=<tls|http|none>
+// trust=<roots|none> clock=<set|unset> ::` once, then per answer `:: LUMEN: reply provider=<p> first_token_ms=<n>
+// bytes=<n> stop=<s> [transport=tls verified=<issuer CN>] ::` or `:: LUMEN: fail stage=<s> code=<n> [tls=<why>] ::`. The window's footer shows the provider and the first token's latency.
 
 use una_abi::{
     input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_KEY_DOWN, INPUT_EV_WHEEL, INPUT_EV_WIN_RESIZE, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP,
@@ -39,6 +43,13 @@ use vein_core::claude::{Event, Msg, Params, Stop};
 use vein_core::prefs::{KeyState, Plan};
 use vein_core::Role;
 use vein_ring3::sys::{now_ms, sleep_ms, sys, write};
+
+extern crate alloc;
+
+/// VEINTLS (SR36): tls_core allocates (records, transcript, the parsed trust store); the size-class heap
+/// over SYS_SBRK frees and reuses, so a long streamed answer stays inside the ELF window.
+#[global_allocator]
+static HEAP: vein_ring3::heap::Heap = vein_ring3::heap::Heap::sbrk();
 
 
 const ACTION_CLEAR_VIEW: u64 = 41;
@@ -399,6 +410,8 @@ struct Session {
     key: KeyState,
     key_n: usize,
     cfg: vein_ring3::prefs::Config,
+    /// Provider + trust store + clock, gathered once (VEINTLS).
+    tls: vein_ring3::TlsSetup,
 }
 
 impl Session {
@@ -490,6 +503,7 @@ fn submit(sess: &Session) {
     };
 
     let mut stop: &[u8] = b"end_turn";
+    let mut verified: Option<vein_ring3::Verified> = None;
     match sess.plan {
         Plan::Echo(_) => {
             let text = core::str::from_utf8(&tmp[..n]).unwrap_or("");
@@ -504,9 +518,18 @@ fn submit(sess: &Session) {
                 let turns = Turns { log: &a.log[..a.log_n], i: 0 };
                 vein_ring3::prepare(&ep, &p, turns, sess.key(), bufs)
             };
-            let r = prepared.and_then(|req| vein_ring3::send(&ep, req, bufs, &mut on));
+            let ctx = sess.tls.context();
+            let r = prepared.and_then(|req| vein_ring3::send(&ep, req, bufs, ctx.as_ref(), &mut on));
             match r {
-                Ok(o) => {
+                Ok(sent) => {
+                    let o = sent.out;
+                    if let Some(v) = sent.verified {
+                        verified = Some(v);
+                        let mut l = Line::new(b"transport=tls verified=");
+                        l.put(v.issuer().as_bytes());
+                        let n = l.n;
+                        app().note(&l.b[..n]);
+                    }
                     stop = o.stop.map_or(if o.status == 200 { b"none" as &[u8] } else { b"http-error" }, |s| s.as_str().as_bytes());
                     if o.status != 200 {
                         let mut l = Line::new(b"HTTP ");
@@ -523,9 +546,8 @@ fn submit(sess: &Session) {
                     let a = app();
                     let mut l = Line::new(b":: LUMEN: fail stage=");
                     l.put(st.name().as_bytes()).put(b" code=").dec(st.code());
-                    #[cfg(target_arch = "x86_64")]
-                    if matches!(st, vein_ring3::Stage::Handshake(_)) {
-                        l.put(b" tls=").put(vein_ring3::tls::last_error().as_bytes());
+                    if let Some(why) = st.tls_why() {
+                        l.put(b" tls=").put(why.as_bytes());
                     }
                     l.put(b" ::");
                     l.wire();
@@ -534,6 +556,9 @@ fn submit(sess: &Session) {
                     } else {
                         let mut w = Line::new(b"could not reach the provider: ");
                         w.put(st.name().as_bytes()).put(b" (").dec(st.code()).put(b")");
+                        if let Some(why) = st.tls_why() {
+                            w.put(b" ").put(why.as_bytes());
+                        }
                         a.note(w.s());
                     }
                 }
@@ -545,7 +570,11 @@ fn submit(sess: &Session) {
     a.turn_open = false;
     footer(sess, first);
     let mut l = Line::new(b":: LUMEN: reply provider=");
-    l.put(sess.provider()).put(b" first_token_ms=").dec(first.map_or(-1, |m| m as i64)).put(b" bytes=").dec(bytes as i64).put(b" stop=").put(stop).put(b" ::");
+    l.put(sess.provider()).put(b" first_token_ms=").dec(first.map_or(-1, |m| m as i64)).put(b" bytes=").dec(bytes as i64).put(b" stop=").put(stop);
+    if let Some(v) = verified {
+        l.put(b" transport=tls verified=").put(v.issuer().as_bytes());
+    }
+    l.put(b" ::");
     l.wire();
     a.paint();
 }
@@ -679,12 +708,21 @@ pub extern "C" fn _start() -> ! {
     let cfg = vein_ring3::prefs::Config::read();
     let keybuf = unsafe { &mut *core::ptr::addr_of_mut!(KEY) };
     let (key, key_n) = vein_ring3::key::read(cfg.key_file(), keybuf);
-    let plan = cfg.plan(key);
-    let sess = Session { plan, key, key_n, cfg };
+    let tls = vein_ring3::TlsSetup::load();
+    let plan = cfg.plan(key, tls.verify());
+    let sess = Session { plan, key, key_n, cfg, tls };
     vein_ring3::net::set_tick(Some(tick));
 
     let mut l = Line::new(b":: LUMEN: start provider=");
     l.put(sess.provider()).put(b" model=").put(sess.model()).put(b" key=").put(key.as_str().as_bytes()).put(b" transport=").put(sess.transport());
+    match sess.tls.report {
+        Some(r) => l.put(b" trust=").dec(r.loaded as i64),
+        None => l.put(b" trust=none"),
+    };
+    l.put(if vein_ring3::clock::is_set() { b" clock=set" as &[u8] } else { b" clock=unset" });
+    if sess.tls.provider.is_none() {
+        l.put(b" crypto=").put(sess.tls.provider_why.as_bytes());
+    }
     if sess.cfg.bus_err != 0 {
         l.put(b" prefs=").dec(sess.cfg.bus_err);
     }
@@ -701,7 +739,7 @@ pub extern "C" fn _start() -> ! {
             }
             Plan::Claude { send_key } => {
                 if send_key && sess.transport() == b"tls" {
-                    a.note(b"TLS without certificate checks (vein.tls = insecure): the trust store is owed.");
+                    a.note(b"TLS 1.3, every server verified against /system/trust/roots.pem; the key goes only over a verified connection.");
                 } else if !send_key {
                     a.note(b"relay endpoint: the key stays on the relay.");
                 }

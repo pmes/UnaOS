@@ -82,6 +82,13 @@ impl Certificate {
     pub fn self_issued(&self) -> bool {
         self.issuer == self.subject
     }
+    /// The issuer's commonName, read out of the issuer Name (diagnostics: VEINTLS prints it as
+    /// `verified=<issuer CN>`; never used for a trust decision).
+    pub fn issuer_cn(&self) -> Option<String> {
+        let mut d = Der::new(&self.issuer);
+        let seq = d.expect(tag::SEQUENCE).ok()?;
+        common_name(seq.value)
+    }
 
     /// Parses `Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }`.
     pub fn parse(input: &[u8]) -> Result<Certificate, CertError> {

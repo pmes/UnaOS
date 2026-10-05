@@ -7,10 +7,16 @@
 //!
 //! Keys: `vein.provider` (`"claude"` | `"echo"`; unset = claude when it can run), `vein.model`,
 //! `vein.endpoint` (a URL; unset = `https://api.anthropic.com/v1/messages`; an `http://` URL is a relay
-//! that holds the key itself, so the key is never sent to it), `vein.tls` (`"verify"` default |
-//! `"insecure"`), `vein.key_file` (the absolute path of the key file on the UnaFS volume, conventionally
+//! that holds the key itself, so the key is never sent to it), `vein.key_file` (the absolute path of the
+//! key file on the UnaFS volume, conventionally
 //! `<home>/.config/unaos/vein.key`; a ring-3 program has no way to learn its home, so the path is a
 //! preference).
+//!
+//! THE KEY RULE (VEINTLS, SR36): the key crosses the wire ONLY on a verified TLS connection. There is no
+//! `vein.tls` and no insecure mode (the `"insecure"` value LUMENAPP carried while `embedded-tls` checked no
+//! certificate is deleted, not deprecated). [`Verify`] says whether this build and boot can verify a
+//! server at all (a crypto provider, a trust store, a set clock); when it cannot, Echo answers and the
+//! window says which of the three is missing.
 
 use crate::claude;
 
@@ -35,14 +41,17 @@ pub fn provider_pref(v: Option<&[u8]>) -> ProviderPref {
     }
 }
 
+/// Whether a TLS server can be verified here: the last input to [`plan`]. Anything but `Ready` keeps the
+/// key on the machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsPolicy {
-    Verify,
-    Insecure,
-}
-
-pub fn tls_policy(v: Option<&[u8]>) -> TlsPolicy {
-    if v.map(unquote) == Some(b"insecure") { TlsPolicy::Insecure } else { TlsPolicy::Verify }
+pub enum Verify {
+    Ready,
+    /// The build links no crypto provider able to verify (or it could not be seeded).
+    NoProvider,
+    /// No trust store (`/system/trust/roots.pem` absent, unreadable or empty).
+    NoTrustStore,
+    /// The wall clock is not set, so certificate validity cannot be judged.
+    NoClock,
 }
 
 /// Where the request goes.
@@ -124,7 +133,8 @@ pub enum Reason {
     Chosen,
     NoKey,
     KeyOnFat,
-    TlsUnverified,
+    /// The server could not be verified, so the key is not sent (never "sent anyway").
+    TlsUnverified(Verify),
     BadEndpoint,
 }
 
@@ -135,7 +145,10 @@ impl Reason {
             Reason::Chosen => "vein.provider = \"echo\"",
             Reason::NoKey => "no API key: set vein.key_file to your key file on the UnaFS volume",
             Reason::KeyOnFat => "key refused: the key file is on FAT (no owner, no mode); keep it on UnaFS",
-            Reason::TlsUnverified => "TLS certificate checks are owed (trust store); set vein.tls = \"insecure\" to send your key anyway, or use an http:// vein.endpoint relay",
+            Reason::TlsUnverified(Verify::NoTrustStore) => "key not sent: no trust store at /system/trust/roots.pem to verify the server (run tools/trust-bundle and rebuild the image), or use an http:// vein.endpoint relay",
+            Reason::TlsUnverified(Verify::NoClock) => "key not sent: the clock is not set, so the server's certificate cannot be checked (wait for SNTP or set the date)",
+            Reason::TlsUnverified(Verify::NoProvider) => "key not sent: this build has no crypto provider that can verify the server",
+            Reason::TlsUnverified(Verify::Ready) => "key not sent",
             Reason::BadEndpoint => "vein.endpoint is not an http:// or https:// URL",
         }
     }
@@ -149,8 +162,8 @@ pub enum Plan {
     Echo(Reason),
 }
 
-/// The rule. `verify_available` = this build can check the server's certificate chain.
-pub fn plan(p: ProviderPref, ep: Option<&Endpoint<'_>>, key: KeyState, tls: TlsPolicy, verify_available: bool) -> Plan {
+/// The rule. `verify` = whether this build and boot can check the server's certificate chain.
+pub fn plan(p: ProviderPref, ep: Option<&Endpoint<'_>>, key: KeyState, verify: Verify) -> Plan {
     if p == ProviderPref::Echo {
         return Plan::Echo(Reason::Chosen);
     }
@@ -163,8 +176,8 @@ pub fn plan(p: ProviderPref, ep: Option<&Endpoint<'_>>, key: KeyState, tls: TlsP
         KeyState::OnFat => return Plan::Echo(Reason::KeyOnFat),
         KeyState::UnaFs => {}
     }
-    if !verify_available && tls == TlsPolicy::Verify {
-        return Plan::Echo(Reason::TlsUnverified);
+    if verify != Verify::Ready {
+        return Plan::Echo(Reason::TlsUnverified(verify));
     }
     Plan::Claude { send_key: true }
 }
@@ -188,19 +201,26 @@ mod tests {
         let https = Some(&DEFAULT_ENDPOINT);
         let relay = parse_endpoint("http://relay:8080").unwrap();
         use KeyState::*;
-        assert_eq!(plan(ProviderPref::Echo, https, UnaFs, TlsPolicy::Insecure, true), Plan::Echo(Reason::Chosen));
-        assert_eq!(plan(ProviderPref::Unset, https, None, TlsPolicy::Verify, true), Plan::Echo(Reason::NoKey));
-        assert_eq!(plan(ProviderPref::Claude, https, OnFat, TlsPolicy::Verify, true), Plan::Echo(Reason::KeyOnFat));
-        assert_eq!(plan(ProviderPref::Claude, https, UnaFs, TlsPolicy::Verify, false), Plan::Echo(Reason::TlsUnverified));
-        assert_eq!(plan(ProviderPref::Claude, https, UnaFs, TlsPolicy::Insecure, false), Plan::Claude { send_key: true });
-        assert_eq!(plan(ProviderPref::Unset, https, UnaFs, TlsPolicy::Verify, true), Plan::Claude { send_key: true });
-        assert_eq!(plan(ProviderPref::Unset, Some(&relay), None, TlsPolicy::Verify, false), Plan::Claude { send_key: false });
-        assert_eq!(plan(ProviderPref::Claude, Option::None, UnaFs, TlsPolicy::Verify, true), Plan::Echo(Reason::BadEndpoint));
+        use Verify::{NoClock, NoProvider, NoTrustStore, Ready};
+        assert_eq!(plan(ProviderPref::Echo, https, UnaFs, Ready), Plan::Echo(Reason::Chosen));
+        assert_eq!(plan(ProviderPref::Unset, https, None, Ready), Plan::Echo(Reason::NoKey));
+        assert_eq!(plan(ProviderPref::Claude, https, OnFat, Ready), Plan::Echo(Reason::KeyOnFat));
+        // The key crosses the wire only when the server can be verified: each missing input keeps it home.
+        assert_eq!(plan(ProviderPref::Claude, https, UnaFs, NoTrustStore), Plan::Echo(Reason::TlsUnverified(NoTrustStore)));
+        assert_eq!(plan(ProviderPref::Claude, https, UnaFs, NoClock), Plan::Echo(Reason::TlsUnverified(NoClock)));
+        assert_eq!(plan(ProviderPref::Unset, https, UnaFs, NoProvider), Plan::Echo(Reason::TlsUnverified(NoProvider)));
+        assert_eq!(plan(ProviderPref::Unset, https, UnaFs, Ready), Plan::Claude { send_key: true });
+        // A plain-HTTP relay never gets the key, verified or not.
+        assert_eq!(plan(ProviderPref::Unset, Some(&relay), None, NoTrustStore), Plan::Claude { send_key: false });
+        assert_eq!(plan(ProviderPref::Unset, Some(&relay), UnaFs, Ready), Plan::Claude { send_key: false });
+        assert_eq!(plan(ProviderPref::Claude, Option::None, UnaFs, Ready), Plan::Echo(Reason::BadEndpoint));
+        for v in [NoClock, NoProvider, NoTrustStore] {
+            assert!(Reason::TlsUnverified(v).text().starts_with("key not sent"));
+            assert!(!Reason::TlsUnverified(v).text().contains("insecure"));
+        }
         assert_eq!(provider_pref(Some(b"\"echo\"")), ProviderPref::Echo);
         assert_eq!(provider_pref(Some(b"claude")), ProviderPref::Claude);
         assert_eq!(provider_pref(Some(b"\"relay\"")), ProviderPref::Unset);
-        assert_eq!(tls_policy(Some(b"\"insecure\"")), TlsPolicy::Insecure);
-        assert_eq!(tls_policy(Option::None), TlsPolicy::Verify);
     }
 
     #[test]
