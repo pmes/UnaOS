@@ -66,3 +66,25 @@ minute witness), `video/beam.rs` (pass budget, `capped=`, per-second census), `v
 folds: the `present` request, the re-run `while`, the trailing re-acquire; tail `inputstall_valve`),
 `main.rs` (one same-line fold: `render_idle` at the park), `boot.rs` (`hid_pass` feeds `lag::hid_gap`),
 `prof.rs` + `una-abi` (`SYS_PROF` op `OP_NOTE`, kind `NOTE_FRAME`), `user-vug` (`frame_note` per frame).
+
+## Seat's answers (2026-10-05) and M4b–M5
+(a) strand bound 1 %: kept. (b) **M4b**: before `phase=desktop` a stall second is counted, not printed; the first
+roll at the desktop prints ONE `[lag] stall boot_suppressed=<n> worst_stage=<s> worst_ms=<n>`. (c) M3 accepted.
+
+**M5 — input is never consumed by the task that runs handlers** (scoped to the two measured cases):
+- **Login submit** (`video/login.rs`): Enter/the button copies the form, paints "Working...", and hands the slow
+  half (`users::set_password_checked` / `installer_create_user` / `verify` / `login` / `login_root` — KDF,
+  adduser, UnaFS home) to a `login-submit` kernel task on `smp::worker_cpu(0)` (never the render core). The
+  worker only computes; its outcome is posted and the RENDER task applies it (same messages, take-down,
+  session, installer advance) from `submit_drain` — on the 250 ms pulse (`main.rs` same-line fold beside
+  `instgui::service`) or ahead of the next key. Keys during the submit are swallowed by the busy form; a
+  worker silent past 15 s releases the form with a message. Headless forms (the `loginst` fixtures) and
+  builds without a worker core run inline (`on=render`).
+  Witness: `[login] submit kdf_ms=<n> adduser_ms=<n> on=worker input_blocked_ms=0 kind=<root|user|setpw|create|unlock>`.
+- **Settings PrefSet** (`prefs_client.rs`, the seam — not `settings.rs`, which BRIGHTSLIDER owns on merge16):
+  `sys_set` called from the render task queues the write (latest value per key) and a `prefs-flush` task on
+  the worker core runs the PrefSets; `sys_get` answers a queued key from the queue (read-your-writes).
+  Witness: `[prefsbus] flush n=<keys> ms=<n> on=worker queued_ms=<n> (INPUTSTALL M5 …)`.
+- Owed (M6): the wm-stage clicks (`click→shown … wm=1445.6`), still inside `wc_route_event` on the render task.
+- Flight 24 reads: across a login, `:: INPUTSTALL: key_queue_max_ms=<50 …`; `[lag] key→echo` for the Enter no
+  longer carries the KDF (`comp=` ≈ one repaint).
