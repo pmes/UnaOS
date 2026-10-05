@@ -118,6 +118,11 @@ def refs_in(path, src, consts):
         yield g.group(1) + "." + g.group(2), line_of(g.start()), "R5"
     for g in re.finditer(r"(?<![\w])set\(\s*\"(" + SEG + r")\"\s*,\s*\"(" + KEY + r")\"", src):
         yield g.group(1) + "." + g.group(2), line_of(g.start()), "R5"
+    # R7 (VEINTLS, SR36): a ring-3 PREF_GET client asking by the dotted literal — vein_ring3's
+    # `get("vein.endpoint", …)` / `one("vein.key_file", …)` in a file that speaks BUS_VERB_PREF_GET.
+    if "BUS_VERB_PREF_GET" in src:
+        for g in re.finditer(r"(?<![\w.])(?:get|one)\(\s*\"(" + SEG + r")\.(" + KEY + r")\"\s*,", src):
+            yield g.group(1) + "." + g.group(2), line_of(g.start()), "R7"
     # R6
     if path.endswith(os.path.join("prefs_core", "src", "lib.rs")):
         md = re.search(r"pub mod display \{", src)
@@ -176,12 +181,14 @@ def selftest(keys):
         ("libs/x/src/a.rs", 'pub const PREF_NS: &str = "vein";\nfn from_prefs() { get("provider"); get("phantom.knob"); }\n'
          '#[cfg(test)]\nmod tests { fn t() { get("only.in_tests"); } }\n'),
         ("unaos/crates/user-x/src/main.rs", 'ask(BUS_VERB_PREF_GET, 1, b"vein.provider");\nask(BUS_VERB_PREF_SET, 2, b"quarry.view\\x00\\"list\\"");\n'),
+        # R7: the deleted `vein.tls` (VEINTLS) must go red if a ring-3 PREF_GET client asks for it again.
+        ("unaos/libs/sys/x_ring3/src/prefs.rs", 'use una_abi::BUS_VERB_PREF_GET;\nlet a = one("vein.model", &mut v, &mut e);\nlet b = one("vein.tls", &mut v, &mut e);\n'),
     ]
     files = [(p, strip_tests(s)) for p, s in fake]
     found = scan(files)
-    want_missing = {"system.display.ghost_key", "vein.phantom.knob", "quarry.view"}
+    want_missing = {"system.display.ghost_key", "vein.phantom.knob", "quarry.view", "vein.tls"}
     missing = {k for k in found if k not in keys}
-    ok = missing == want_missing and "vein.only.in_tests" not in found and "system.display.brightness" in found
+    ok = missing == want_missing and "vein.only.in_tests" not in found and "system.display.brightness" in found and "vein.model" in found
     print("prefs-schema-check selftest: found=%s missing=%s -> %s" % (sorted(found), sorted(missing), "PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

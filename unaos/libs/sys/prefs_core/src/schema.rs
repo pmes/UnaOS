@@ -211,6 +211,12 @@ pub static SCHEMA: &[Key] = &[
         doc: "Memories per re-embed pass.",
     },
     Key {
+        ns: "vein", key: "endpoint", kind: Kind::Str { max_len: 160, printable: true },
+        default: Default::Str("https://api.anthropic.com/v1/messages"),
+        writers: OP, reader: "vein_ring3 prefs (LUMEN.ELF); kernel tests lumen",
+        doc: "Where Vein's ring-3 client POSTs: an https:// URL (the key goes only over a verified TLS connection, VEINTLS) or an http:// relay that holds the key itself (never sent the key).",
+    },
+    Key {
         ns: "vein", key: "gemini.api_key_env", kind: NAME, default: Default::Str(GEMINI_DEFAULT_KEY_ENV),
         writers: OP, reader: "gneiss_pal ProviderConfig, EmbedConfig",
         doc: "NAME of the environment variable holding the Gemini key.",
@@ -241,6 +247,12 @@ pub static SCHEMA: &[Key] = &[
         ns: "vein", key: "gemini.region", kind: NAME, default: Default::Str("global"),
         writers: OP, reader: "gneiss_pal ProviderConfig",
         doc: "Vertex region for chat.",
+    },
+    Key {
+        ns: "vein", key: "key_file", kind: Kind::Str { max_len: 40, printable: true },
+        default: Default::Consumer("unset: no key, the Echo provider answers"),
+        writers: OP, reader: "vein_ring3 key (LUMEN.ELF); kernel tests lumen",
+        doc: "Absolute path of the API key file on the UnaFS volume (read only when it stats with an inode id; refused on FAT). At most 40 bytes: ring 3's SYS_OPEN name bound.",
     },
     Key {
         ns: "vein", key: "max_tokens", kind: Kind::Int { min: 1, max: u32::MAX as i64 }, default: Default::Int(16000),
