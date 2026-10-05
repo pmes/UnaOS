@@ -35,7 +35,7 @@ compositor never armed rung 3 — it paced on the poll source until an operator 
   `tests kvblank8` reports `:: KVBLANK8: rung3 armed_by=compositor|test|trace irq= … -> PASS|FAIL ::`.
 - **M4 — specs.** No spec REQUIREs a rung-1/2 line (searched `scripts/specs/*`); the two `vblank selftest`
   REQUIREs in `x86-witness.spec` are annotated tests-run (that spec's build already carries
-  `UNAOS_TESTS_AT_BOOT=1`); `x86-wc.spec` gains an OPTIONAL for the first-need line. `spec-roots.sh` and
+  `UNAOS_TESTS_AT_BOOT=1`); `x86-witness.spec` gains OPTIONALs for the first-need line and the `rung3 armed_by=` verdict. `spec-roots.sh` and
   `fixture-reachable.sh` exit 0.
 
 ## Witness (a metal boot of the x86 shape)
