@@ -48,3 +48,24 @@ same `write_ssd` body the shell verb runs (refactored to `write_ssd_inner`, whic
 **Owed.** The volume is not grown to the chosen partition; mouse/click (the screens are keyboard
 only — "one click" is one Enter); the whole-disk path still writes only the FIRST-listed layout of
 partitions (ESP + UnaFS); unflown (R78).
+
+## Results (unflown, R78)
+
+Commits: design 57e14aa2 · M1–M4 76313275 · M5 c832d0ec (on top of the AHCIROOT merge d81b1f78).
+
+- x86 metal shape + `instgui,installdemo,ahciroot`: exit 0 (no warning in the touched files).
+- x86 metal shape + `installdemo,ahciroot`, no `instgui`: exit 0.
+- charter-check: exit 0 (the new `video/install3.rs` carries `CHARTER: Kernel — wm`).
+- aarch64 not run: every touched file is x86-only (`selfinstall` is x86 + installdemo + ahci; `instgui` x86 + wc).
+
+Operator path (knobs `UNAOS_INSTGUI=1 UNAOS_AHCIROOT=1`): `i` on the chooser → CENSUS → Enter → LAYOUT
+→ Enter → CONFIRM → Enter (or the typed disk name + Enter) → PROGRESS → RESULT (`r` reboot). The confirm
+is NOT a dry run on the operator path: it is `install ssd --write`'s body.
+
+Expected wire on `tests instgui` (bench rMBP, Catalina's SSD on port 0):
+`[install3] census ahci0 model=<model> sectors=<n> gpt=GPT, <k> partitions verdict=foreign (foreign: macOS (APFS))`,
+`[install3] typed confirmation does not match the disk's name — no grant, nothing written`,
+`[install] stage=probe ok ahci:0 verdict=stranger` … `[install] stage=grant issued (dry run: minted, never held)` …
+`[install] stage=done dry run — nothing written`, then
+`:: INSTALL3: screens=census,layout,confirm,progress,result grant=issued dry_run=1 -> PASS ::`.
+A machine with no SATA disk: the synthetic row → `grant=refused … -> PASS`.
