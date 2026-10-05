@@ -108,6 +108,10 @@ the PNG and the ledger dump, and prints the surface size and the distinct
 missing-API count. Defaults: 800×600 viewport, `aether-render.png`,
 `aether-ledger.txt`, scroll 0. `--scroll` renders below the fold for audits.
 This is the oracle every gap pass and regression check is written against.
+`tools/eyes/run.sh aether` renders the 16-page corpus with it, scores every frame
+against Chromium (SSIM + pixel mismatch + a diff PNG) and gates against
+`tools/eyes/suites/aether/baseline.json`; see
+`docs/dev/evidence/aether-1004/EYES.md`.
 
 ### Debug knobs
 
@@ -129,7 +133,7 @@ One line of justification per direct dependency in `handlers/aether/Cargo.toml`:
 | --- | --- |
 | `boa_engine` | The JavaScript engine — pure Rust, embeddable, no JIT. |
 | `boa_gc` | `Trace`/`Finalize` derives for the native classes exposed to JS (`api/element.rs`). |
-| `html5ever` | **Unused direct dependency, flagged to the integrator for removal.** kuchiki carries its own (older) html5ever; the only mentions of the direct 0.39 dependency in this tree are comments explaining that version skew. |
+| `html5ever` | **Unused direct dependency, flagged to the integrator for removal.** kuchiki carries its own (older) html5ever; the only mentions of the direct 0.40 dependency in this tree are comments explaining that version skew. |
 | `kuchiki` | The DOM: HTML parsing, mutable node tree, and the servo selector matching engine the cascade compiles against. |
 | `taffy` | Block and flexbox layout over the box tree. |
 | `reqwest` | HTTP(S): async page and subresource fetches, a blocking client for sync paths, cookie-jar integration. |

@@ -1,0 +1,18 @@
+<!-- tests: positioning: relative container with absolute badge and corner, z-index stacking, position:fixed footer bar -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Positioned</title>
+<style>
+body { margin: 0; font-family: sans-serif; padding: 20px; }
+.card { position: relative; width: 320px; height: 160px; background: #e0fbfc; border: 1px solid #98c1d9; padding: 16px; box-sizing: border-box; }
+.badge { position: absolute; top: -10px; right: -10px; background: #ee6c4d; color: white; border-radius: 14px; padding: 4px 10px; font-size: 13px; }
+.corner { position: absolute; bottom: 8px; left: 8px; font-size: 12px; color: #3d5a80; }
+.stack { position: relative; height: 120px; margin-top: 30px; }
+.s1, .s2 { position: absolute; width: 120px; height: 80px; }
+.s1 { left: 0; top: 0; background: #3d5a80; z-index: 2; }
+.s2 { left: 60px; top: 30px; background: #ee6c4d; z-index: 1; }
+.bar { position: fixed; bottom: 0; left: 0; right: 0; background: #293241; color: white; padding: 10px 20px; }
+</style></head><body>
+<div class="card">Card with a badge<span class="badge">NEW</span><span class="corner">bottom-left note</span></div>
+<div class="stack"><div class="s1"></div><div class="s2"></div></div>
+<div class="bar">Fixed bar at the bottom of the viewport</div>
+</body></html>

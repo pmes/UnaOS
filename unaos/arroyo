@@ -3856,7 +3856,36 @@ build_selfbuild_x86() {
             echo "   SELFBUILD1: busybox fetch/build failed — PROBE.LNX absent (probe=none)"
         fi
     fi
-    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
+    build_selfbuild4_x86   # SELFBUILD4 (B356): SYSKAT4.LNX + RUST.LNX
+    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
+}
+
+# SELFBUILD4 (B356): the first Rust program on UnaOS and the process-memory KAT, both proven on the HOST kernel before staging.
+# RUST.LNX = crates/user-linux-rust (ours) built for x86_64-unknown-linux-musl — static, NON-PIE (the crate's .cargo/config.toml:
+# relocation-model=static + crt-static; the shim's loader takes ET_EXEC only), musl + libunwind from the Rust target's
+# self-contained objects, stripped. No musl target installed (rustup refused) = RUST.LNX absent = `tests selfbuild4` SKIPs.
+# SYSKAT4.LNX = crates/user-linux-hello/c/syskat4.c (copy-on-write fork, MAP_SHARED across fork, a lazily re-executed image,
+# SIGBUS past EOF).
+build_selfbuild4_x86() {
+    local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
+    mkdir -p "$sb"
+    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT4.LNX" "$c/syskat4.c" \
+        && "$sb/SYSKAT4.LNX" "$sb/kat4.tmp" | grep -q "^syskat4 ok cow=ok cow_kernel=ok cow_prot=ok shared_fork=ok exec_lazy=ok sigbus=ok "; then
+        cp "$sb/SYSKAT4.LNX" "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
+    else
+        echo "   SELFBUILD4: SYSKAT4.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
+    fi
+    rustup +nightly target list --installed 2>/dev/null | grep -qx x86_64-unknown-linux-musl \
+        || rustup +nightly target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
+    local bin="$sb/rust/x86_64-unknown-linux-musl/release/rust-probe"
+    if ( cd "$rs" && CARGO_TARGET_DIR="$sb/rust" cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
+        && [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" = "2" ] \
+        && "$bin" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; then
+        strip -o "${WORKSPACE_DIR}/target/RUST.LNX" "$bin"
+    else
+        echo "   SELFBUILD4: RUST.LNX did not build (musl target?), is not ET_EXEC, or failed on the host kernel — not staged"
+        rm -f "${WORKSPACE_DIR}/target/RUST.LNX"
+    fi
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).
@@ -3942,6 +3971,30 @@ build_user_lumen_x86() {
     [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
     user_elf_window_check "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" "LUMEN-X86.ELF"
     echo -e "${COLOR_GREEN}✅ x86 ring-3 Lumen app: LUMEN-X86.ELF${COLOR_RESET}"
+}
+
+# HOLOCRON2 (rmbp-ledger B355, R82): build HOLOCRON.ELF — Holocron, the metal's secrets handler (crates/user-holocron
+# linking holocron_core: verbs 144..=151 over the BANDY3 mailbox, the store over SYS_PATH_* on the UnaFS root, the
+# ring KDF through SYS_KDF) → target/HOLOCRON-X86.ELF, staged by the builder as APPS/HOLOCRON.ELF. The
+# build_user_diag_x86 shape, linked in the ELF window; app note RESIDENT (a bare `holocron …` detaches). Inert
+# until run (or launched by the login path when the user has a ring; UNAOS_LUMEN=1 arms that and SYS_KDF).
+build_user_holocron_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 secrets handler (crates/user-holocron → target/HOLOCRON-X86.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-holocron"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-holocron/user-holocron-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-holocron/target/x86_64-unknown-none/release/user-holocron" HOLOCRON  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-holocron/target/x86_64-unknown-none/release/user-holocron" \
+      "${WORKSPACE_DIR}/target/HOLOCRON-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/HOLOCRON-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: HOLOCRON-X86.ELF missing/empty — x86 HOLOCRON build failed${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/HOLOCRON-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: HOLOCRON-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/HOLOCRON-X86.ELF" "HOLOCRON-X86.ELF"
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 secrets handler: HOLOCRON-X86.ELF${COLOR_RESET}"
 }
 
 # VEINTLS (SR36): NET.ELF runs on vein_ring3 (the transport LUMEN uses: verified TLS 1.3 with tls_core), linked at
@@ -4062,6 +4115,7 @@ launch_x86_64() {
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
+    build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     build_kernel_x86_64
 
@@ -5031,6 +5085,7 @@ test_x86_64() {
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
+    build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     build_kernel_x86_64
 
@@ -8937,6 +8992,7 @@ esp_x86() {
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
+    build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
@@ -8999,6 +9055,7 @@ vm_image() {
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
+    build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
@@ -9045,6 +9102,7 @@ fat_img() {
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
+    build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"

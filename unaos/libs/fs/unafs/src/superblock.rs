@@ -61,7 +61,19 @@ pub const MAGIC: [u8; 5] = *b"UNAFS";
 ///   the catalog record as a flat list. v3–v5 volumes still mount read/write
 ///   on the flat catalog they were written with; `tools/unafs migrate` replays
 ///   one into a fresh v6 image ([`crate::legacy::migrate_k8_into`]).
-pub const VERSION: u32 = 6;
+/// * 7 — UNAFSMAP (B354): both persistent maps (refcount map and inode map)
+///   are PAGED TREES ([`crate::maptree`]): 255-way index nodes whose entries
+///   carry each child's checksum and non-zero count, all-zero subtrees as
+///   holes, and a commit that rewrites only dirty leaves and their paths. The
+///   refcount map is no longer held whole in RAM (a bounded leaf cache).
+///   INCOMPAT like every bump before it: a pre-v7 reader would take paged
+///   entries for raw pointers. A v6 volume mounts read/write and migrates on
+///   its first commit (root flag MIGRATE, resumable); v3–v5 volumes keep the
+///   legacy map shape (their catalogs predate v6).
+pub const VERSION: u32 = 7;
+
+/// First version whose maps are paged trees.
+pub const VERSION_PAGED_MAPS: u32 = 7;
 
 /// First version whose catalog is the B+tree pair and whose inode blocks carry
 /// the meta trailer (parent pointer + timestamps).
@@ -118,6 +130,11 @@ pub const MAX_BLOCK_COUNT_ONE_LEVEL: u64 =
 /// views) and the whole-map rewrite each commit grow linearly with the
 /// volume, so a third level should arrive together with an incremental map.
 pub const MAX_BLOCK_COUNT: u64 = REFMAP_LEAVES_PER_INDEX * MAX_BLOCK_COUNT_ONE_LEVEL;
+
+/// UNAFSMAP: the largest PAGED (v7) volume — 2^31 blocks = 8 TiB, three
+/// index levels (255³ leaves would reach 64 TiB; the bound keeps every
+/// subtree count inside the u32 an entry stores, top included).
+pub const MAX_BLOCK_COUNT_PAGED: u64 = 1 << 31;
 
 #[derive(Error, Debug)]
 pub enum SuperblockError {
@@ -249,7 +266,13 @@ impl Superblock {
         // MAX_BLOCK_COUNT blocks; a bigger volume must fail HERE, cleanly —
         // the commit path would otherwise run its refmap index tree off its
         // blocks.
-        if self.block_count > MAX_BLOCK_COUNT {
+        if self.version >= VERSION_PAGED_MAPS {
+            if self.block_count > MAX_BLOCK_COUNT_PAGED {
+                return Err(SuperblockError::Geometry(
+                    "volume exceeds the paged map structure (v7)",
+                ));
+            }
+        } else if self.block_count > MAX_BLOCK_COUNT {
             return Err(SuperblockError::Geometry(
                 "volume exceeds the refcount-map structure (two indirect levels)",
             ));

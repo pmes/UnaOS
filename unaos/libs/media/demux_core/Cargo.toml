@@ -1,0 +1,11 @@
+[package]
+name = "demux_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Stria's container core: ISOBMFF/MP4 (progressive and fragmented) and Matroska/WebM demuxers behind one Demuxer API, plus minimal writers for test media — shared by Ring 0 and Ring 3."
+
+# PLAYBACK (LEDGER SR26): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies — written
+# from ISO/IEC 14496-12 and the Matroska specification (RFC 9559). A member of the ROOT host workspace
+# (Stria links it); the kernel may link it by path.
+[dependencies]

@@ -9,7 +9,8 @@
 //                             MAGIC (`locate_unafs`), the type GUID is advisory.
 //
 // The GPT (protective MBR, both headers, both arrays, CRCs) is `amber_core::Plan::for_image` +
-// `Plan::gpt` — byte-for-byte the table the retired script wrote (the core's golden KAT pins it).
+// `Plan::gpt` — byte-for-byte the table the retired script wrote (the core's golden KAT pins it) —
+// laid by `amber_core::plan_apply::apply` (AMBER1), the same write list `amber plan` dry-runs.
 //
 // Usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N]
 //        una-card show IMG          (print the plan read back off an image)
@@ -140,18 +141,20 @@ fn main() {
         ],
     )
     .unwrap_or_else(|e| die(&e.to_string()));
-    let img = plan.gpt().unwrap_or_else(|e| die(&e.to_string()));
     let (p1, p2) = (&plan.parts[0], &plan.parts[1]);
 
     let tmp = out.with_extension("esp.fat.tmp");
     build_fat(&tmp, fat_sectors, &trees);
     let res = (|| -> io::Result<()> {
-        let mut o = File::create(&out)?;
-        o.set_len(plan.disk_sectors * SECTOR)?;
-        for (lba, bytes) in img.writes() {
-            o.seek(SeekFrom::Start(lba * SECTOR))?;
-            o.write_all(bytes)?;
+        File::create(&out)?.set_len(plan.disk_sectors * SECTOR)?;
+        // AMBER1 (SR34): the table goes down through `amber_core::plan_apply::apply` — the write
+        // list the `amber plan` dry run shows, issued, flushed and verified on read-back.
+        {
+            let mut blk = amber_core::file_block::FileBlock::open_rw(&out)?;
+            amber_core::plan_apply::apply(&plan, &mut blk, amber_core::plan_apply::Mode::Write)
+                .map_err(|e| io::Error::other(e.to_string()))?;
         }
+        let mut o = std::fs::OpenOptions::new().write(true).open(&out)?;
         copy_into(&mut o, &tmp, p1.first)?;
         copy_into(&mut o, &unafs, p2.first)?;
         o.sync_all()

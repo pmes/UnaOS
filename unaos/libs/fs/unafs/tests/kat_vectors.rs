@@ -113,11 +113,26 @@ fn kat_superblock_v5() {
 /// version byte moves (05 → 06); the superblock layout is unchanged.
 #[test]
 fn kat_superblock_v6() {
-    let sb = Superblock::new(4096);
-    assert_eq!(sb.version, 6);
+    let mut sb = Superblock::new(4096);
+    sb.version = 6; // the v6 golden is KEPT: v7 moved only this byte again
     kat(
         &sb,
         "554e4146530600000000100000001000000000000001000000000000000200000000000000",
+    );
+    assert_eq!(sb.to_bytes().unwrap(), enc(&sb));
+    assert!(sb.indexed());
+}
+
+/// v7 (UNAFSMAP, B354): the paged-maps bump. ONLY the version byte moves
+/// (06 → 07); the superblock layout is unchanged (the maps' shape lives
+/// below the root record).
+#[test]
+fn kat_superblock_v7() {
+    let sb = Superblock::new(4096);
+    assert_eq!(sb.version, 7);
+    kat(
+        &sb,
+        "554e4146530700000000100000001000000000000001000000000000000200000000000000",
     );
     assert_eq!(sb.to_bytes().unwrap(), enc(&sb));
     assert!(sb.indexed());

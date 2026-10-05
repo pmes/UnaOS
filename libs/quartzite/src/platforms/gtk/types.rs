@@ -14,7 +14,7 @@ pub enum GuiUpdate {
     EditorLoad(String),
     SidebarStatus(WolfpackState), // The Pulse
     Spectrum(Vec<f32>),
-    TokenUsage(i32, i32, i32), // Prompt, Candidates, Total
+    TokenUsage(i32, i32, i32, String), // Prompt, Candidates, Total, session status (VEINTURNS SR42)
     ActiveDirective(String),
     ReviewPayload(PreFlightPayload), // The Interceptor
     SynapseError(String),            // Discrete failure signal

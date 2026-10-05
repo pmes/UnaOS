@@ -1,0 +1,17 @@
+[package]
+name = "av1_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "AVCODEC (SR24): a from-spec AV1 decoder (intra / AVIF first) and the AVIF (ISOBMFF) container reader — shared by Ring 0 and Ring 3."
+
+# AVCODEC (ledger SR24): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, and NO dependencies —
+# written from the AV1 Bitstream & Decoding Process Specification v1.0.0 with Errata 1. The default
+# CDFs, scans, quantizer tables and filter taps are generated from the spec's own Markdown sources by
+# tools/gen_tables.py into src/tables.rs (one file, never hand-edited).
+[dependencies]
+
+[features]
+default = []
+# `std` only adds `std::error::Error` for `Error`; the decoder itself never needs it.
+std = []

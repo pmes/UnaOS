@@ -1,0 +1,20 @@
+<!-- tests: @media at two widths (rendered at 800x600 and 375x812): column switch, font-size and color change, display:none -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Media</title>
+<style>
+body { margin: 0; font-family: sans-serif; }
+.banner { background: #2b9348; color: white; padding: 20px; font-size: 26px; }
+.cols { display: flex; }
+.col { flex: 1; padding: 16px; }
+.col:nth-child(1) { background: #d8f3dc; } .col:nth-child(2) { background: #b7e4c7; } .col:nth-child(3) { background: #95d5b2; }
+.desktop-only { display: block; padding: 12px 20px; background: #ffd166; }
+@media (max-width: 600px) {
+  .banner { background: #9d0208; font-size: 20px; }
+  .cols { flex-direction: column; }
+  .desktop-only { display: none; }
+}
+</style></head><body>
+<div class="banner">Responsive banner</div>
+<div class="desktop-only">Only on wide screens.</div>
+<div class="cols"><div class="col">Column A has some text.</div><div class="col">Column B has some text.</div><div class="col">Column C has some text.</div></div>
+</body></html>
