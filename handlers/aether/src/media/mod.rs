@@ -189,6 +189,7 @@ fn content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
 /// when the server answers 206 (resuming whatever a previous attempt left in `.part`), else the
 /// whole body from one 200. Blocking: run it off the engine thread.
 pub fn fetch_to_cache(src: &str, dest: &Path, chunk: u64) -> Result<FetchReport, String> {
+    use gneiss_pal::api::http;
     use std::io::{Read, Write};
     if let Some(d) = dest.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -201,13 +202,19 @@ pub fn fetch_to_cache(src: &str, dest: &Path, chunk: u64) -> Result<FetchReport,
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&part).map_err(|e| format!("{}: {e}", part.display()))?;
     loop {
         let range = format!("bytes={}-{}", have, have + chunk - 1);
-        let mut resp = client.get(src).header(reqwest::header::RANGE, &range).send().map_err(|e| format!("{src}: {e}"))?;
+        // HTTPCORE (SR51): byte ranges count octets of the stored representation — ask for it uncoded.
+        let mut resp = client
+            .get(src)
+            .header(http::header::RANGE, &range)
+            .header(http::header::ACCEPT_ENCODING, "identity")
+            .send()
+            .map_err(|e| format!("{src}: {e}"))?;
         rep.requests += 1;
         let status = resp.status().as_u16();
         match status {
             206 => {
                 rep.ranged = true;
-                let cr = resp.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).and_then(content_range);
+                let cr = resp.headers().get(http::header::CONTENT_RANGE).and_then(content_range);
                 let Some((a, _b, total)) = cr else { return Err(format!("{src}: 206 without a Content-Range")) };
                 if a != have {
                     return Err(format!("{src}: asked for byte {have}, got a range from {a}"));

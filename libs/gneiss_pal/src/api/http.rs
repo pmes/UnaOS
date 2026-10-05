@@ -142,6 +142,21 @@ impl fmt::Display for StatusCode {
     }
 }
 
+/// Field-name constants (reqwest's `header::*` names, as lowercase strings — every lookup is case-insensitive).
+pub mod header {
+    pub const ACCEPT: &str = "accept";
+    pub const ACCEPT_ENCODING: &str = "accept-encoding";
+    pub const AUTHORIZATION: &str = "authorization";
+    pub const CONTENT_ENCODING: &str = "content-encoding";
+    pub const CONTENT_LENGTH: &str = "content-length";
+    pub const CONTENT_RANGE: &str = "content-range";
+    pub const CONTENT_TYPE: &str = "content-type";
+    pub const LOCATION: &str = "location";
+    pub const RANGE: &str = "range";
+    pub const RETRY_AFTER: &str = "retry-after";
+    pub const USER_AGENT: &str = "user-agent";
+}
+
 // ---------------------------------------------------------------- the async client
 
 /// A tokio channel as the connection thread's event sink (a plain std thread: `blocking_send` is safe there).
@@ -555,8 +570,8 @@ pub mod blocking {
     }
 
     impl RequestBuilder {
-        pub fn header(mut self, k: &str, v: &str) -> Self {
-            let _ = self.headers.set(k, v);
+        pub fn header(mut self, k: impl AsRef<str>, v: impl AsRef<str>) -> Self {
+            let _ = self.headers.set(k.as_ref(), v.as_ref());
             self
         }
         pub fn body(mut self, b: impl Into<Vec<u8>>) -> Self {
@@ -567,12 +582,39 @@ pub mod blocking {
             let url = self.url?;
             let req = host::Request { method: self.method, url, headers: self.headers, body: Arc::new(self.body) };
             let inner = self.agent.send(req)?;
-            Ok(Response { inner })
+            Ok(Response { inner, pending: Vec::new(), pos: 0 })
         }
     }
 
+    /// A blocking response; the body streams through [`std::io::Read`] (or `bytes`/`text`).
     pub struct Response {
         inner: host::Response,
+        pending: Vec<u8>,
+        pos: usize,
+    }
+
+    /// Reads the decoded body as it arrives; a transport/TLS/framing error mid-body is an `io::Error`
+    /// (truncation included — a short body never reads as a clean EOF).
+    impl std::io::Read for Response {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            while self.pos >= self.pending.len() {
+                match self.inner.chunk() {
+                    Ok(Some(c)) => {
+                        self.pending = c;
+                        self.pos = 0;
+                    }
+                    Ok(None) => return Ok(0),
+                    Err(e) => {
+                        let kind = if matches!(e, http_core::Error::Timeout) { std::io::ErrorKind::TimedOut } else { std::io::ErrorKind::Other };
+                        return Err(std::io::Error::new(kind, Error::from(e)));
+                    }
+                }
+            }
+            let n = buf.len().min(self.pending.len() - self.pos);
+            buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
     }
 
     impl Response {
@@ -585,11 +627,19 @@ pub mod blocking {
         pub fn url(&self) -> &Url {
             &self.inner.url
         }
-        pub fn bytes(self) -> Result<Vec<u8>, Error> {
-            self.inner.bytes().map_err(Error::from)
+        pub fn content_length(&self) -> Option<u64> {
+            self.inner.headers().get("content-length").and_then(|v| v.trim().parse().ok())
+        }
+        pub fn bytes(mut self) -> Result<Vec<u8>, Error> {
+            let mut all = self.pending.split_off(self.pos);
+            self.pending.clear();
+            while let Some(c) = self.inner.chunk()? {
+                all.extend_from_slice(&c);
+            }
+            Ok(all)
         }
         pub fn text(self) -> Result<String, Error> {
-            self.inner.text().map_err(Error::from)
+            self.bytes().map(|b| String::from_utf8_lossy(&b).into_owned())
         }
     }
 }

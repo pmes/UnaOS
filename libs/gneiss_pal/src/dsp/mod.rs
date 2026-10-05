@@ -21,13 +21,13 @@
 //!
 //! Nothing here owns a device, a window or the bus: Stria owns the player and its bus verbs.
 
+/// The audio core (AUDIOCODEC, SR30): `audio_core` re-exported — WAV/AIFF/FLAC/Ogg Opus/Vorbis/MP3/AAC-LC.
 pub mod audio;
 pub mod audio_track;
 pub mod avsync;
 /// The still-image core (PIXELCORE, SR25): `pixel_core` re-exported — PNG/JPEG/GIF/BMP/QOI/WebP (lossless + lossy + animated) and APNG.
 pub mod image;
 pub mod video;
-
 
 /// The container core, re-exported so pipeline users name one library.
 pub use demux_core as demux;
