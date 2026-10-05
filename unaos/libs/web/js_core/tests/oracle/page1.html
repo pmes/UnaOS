@@ -1,0 +1,59 @@
+<html><head><meta charset="utf-8"><title>js_core oracle 1: language and numbers</title></head><body><h1>Language</h1><pre id="out"></pre><script>
+var L = [];
+function log() { L.push(Array.prototype.join.call(arguments, " ")); }
+// Numbers and formatting
+log(0.1 + 0.2, 1 / 3, -0 === 0, Object.is(-0, 0), 2 ** 53 + 1, 1e21, 1e-7, 123.456e5);
+log((1234.5678).toFixed(2), (0.000001234).toPrecision(2), (255).toString(16), (255).toString(2), (-7.5).toString(3));
+log((1e21).toFixed(2), (123.456).toExponential(3), (1e-21).toPrecision(16), Number("0x1F"), Number("  12  "), Number("1_0"), parseFloat("3.14abc"), parseInt("08"));
+log(Math.max(), Math.min(1, 2, -3), Math.round(-2.5), Math.round(2.5), Math.trunc(-4.7), Math.sign(-0), Math.hypot(3, 4), Math.cbrt(27), Math.fround(5.5), Math.clz32(1));
+log(Math.sqrt(2), Math.exp(1), Math.log(10), Math.sin(1), Math.atan2(1, 2), Math.pow(2, 0.5), Math.expm1(1e-10), Math.log1p(1e-10), Math.sinh(1), Math.tanh(0.5));
+log(7 % -3, -7 % 3, 5.5 % 2, 2 ** -1074, Number.MAX_SAFE_INTEGER, Number.EPSILON, (25).toString(36), 0xff >>> 4, -1 >>> 28, 1 << 31);
+// BigInt
+log(2n ** 100n, -(7n / 2n), (-7n) % 3n, BigInt.asIntN(8, 255n), BigInt.asUintN(8, -1n), BigInt("0x1fffffffffffff") + 1n, (123n).toString(36), typeof 1n);
+// Strings
+var s = "Hello, Wörld! \u{1F600}";
+log(s.length, [...s].length, s.toUpperCase(), s.codePointAt(14), s.at(-1) === "\uDE00", s.normalize("NFD").length, "ﬀ".toUpperCase(), "İ".toLowerCase().length);
+log("abc".padStart(6, "12"), "abc".padEnd(5, "*"), " x ".trim() + "|", "a-b-c".split("-", 2), "aaa".replaceAll("a", "$&b"), "x".repeat(3), "abc".localeCompare === undefined);
+log(String.raw`a\nb${1 + 1}`, `t${[1, 2]}t`, "abc".substring(2, 0), "abcdef".slice(-3, -1), "mississippi".lastIndexOf("ss"), "😀".split("").length, escape === undefined ? "" : encodeURIComponent("a b&c/é"));
+// RegExp
+log("2024-01-15".replace(/(\d+)-(\d+)-(\d+)/, "$3/$2/$1"), /(?<y>\d{4})/.exec("in 1999 ok").groups.y, "aBc".match(/b/i).index, "a1b2c3".split(/\d/), JSON.stringify("x-y_z".match(/[-_]/g)));
+log([..."abcabc".matchAll(/b(c)/g)].map(m => m.index + m[1]), /^\p{Lu}+$/u.test("ÄÖÜ"), /(?<=\$)\d+/.exec("cost $42")[0], /a.c/s.test("a\nc"), /[\p{Script=Greek}--[α]]/v.test("β"), "aaa".lastIndexOf(""), /(a)|(b)/.exec("b"));
+log("The Quick Brown".replace(/\b(\w)(\w*)/g, (m, a, b) => b + a + "ay"), /\u{1F600}/u.source, new RegExp("/", "g").toString(), /x/dg.flags, "aaa".search(/a{2}/), /(?i:a)b/.test("Ab"));
+// Objects, classes, iteration order
+var o = { b: 1, a: 2, 1: "one", 0: "zero", [Symbol.toStringTag]: "Custom" };
+o.c = 3; delete o.b;
+log(Object.keys(o), JSON.stringify(o), String(o), Object.entries({ x: 1, y: [2] }).flat());
+class A { #p = 1; static s = "st"; get p() { return this.#p; } inc() { this.#p++; return this; } static { A.t = A.s + "!"; } }
+class B extends A { constructor() { super(); this.q = 2; } toString() { return "B" + this.p + this.q; } }
+log(String(new B().inc().inc()), A.t, Object.getOwnPropertyNames(B.prototype), new B() instanceof A, B.name, (class {}).name === "");
+var m = new Map([[3, "c"], [1, "a"]]); m.set(2, "b"); m.delete(3); m.set(3, "C");
+var st = new Set("hello");
+log([...m.keys()], [...m.values()].join(""), [...st].join(""), new Set([1, 2, 3]).union(new Set([3, 4])).size, Object.groupBy([1, 2, 3, 4], x => x % 2 ? "odd" : "even").odd);
+// Destructuring, spread, optional chaining, nullish
+var { a: aa = 5, ...rest } = { b: 2, c: 3 };
+var [x1, , x3 = 9, ...xs] = [1, 2, undefined, 4, 5];
+log(aa, JSON.stringify(rest), x1, x3, xs, o?.missing?.deep, o.missing ?? "dflt", 0 || "or", 0 ?? "nn", [1, 2, 3].findLast(v => v < 3));
+// Generators, iterators, labels
+function* fib() { var [p, q] = [0, 1]; for (;;) { yield p; [p, q] = [q, p + q]; } }
+var fs = []; for (var f of fib()) { if (f > 100) break; fs.push(f); }
+var it = fib().map(v => v * 2).filter(v => v % 3 == 0).take(4);
+outer: for (var i = 0; i < 3; i++) { for (var j = 0; j < 3; j++) { if (j == 2) continue outer; if (i == 2) break outer; fs.push(i * 10 + j); } }
+log(fs.join(","), [...it], Array.from({ length: 5 }, (_, k) => k * k), [3, 1, 10, 2].sort(), [3, 1, 10, 2].toSorted((p, q) => p - q));
+// Errors and exotic objects
+var errs = [];
+try { null.x; } catch (e) { errs.push(e instanceof TypeError); }
+try { undefinedVar; } catch (e) { errs.push(e.name); }
+try { new Array(-1); } catch (e) { errs.push(e.constructor.name); }
+try { JSON.parse("{bad"); } catch (e) { errs.push(e.name); }
+var px = new Proxy({}, { get: (t, k) => typeof k === "string" ? k.toUpperCase() : undefined, has: () => true });
+log(errs, px.hello, "anything" in px, Reflect.ownKeys({ [Symbol("s")]: 1, z: 2 }).length, typeof Symbol.iterator, Symbol("d").description);
+// Typed arrays and JSON
+var ta = new Float32Array([1.1, 2.5, -3]); var u8 = new Uint8Array(ta.buffer, 0, 4);
+var dv = new DataView(new ArrayBuffer(8)); dv.setFloat64(0, Math.PI); dv.setUint16(0, 0x4142);
+log(Array.from(ta), Array.from(u8), dv.getUint8(0), dv.getFloat64(0).toFixed(6), new Uint8ClampedArray([300, -5, 1.5, 2.5]).join(), new BigInt64Array([-1n])[0], Int16Array.from("123").join(""));
+log(JSON.stringify({ a: [1, { b: undefined, c: null }], d: new Date(0), e: " \ud800" }, null, 1).replace(/\n/g, "|"), JSON.stringify(JSON.parse('[1e3, -0, "\\u0041"]')), JSON.stringify({ k: 1 }, ["k"]), JSON.stringify(1n === 1n));
+// Dates (UTC only)
+var d = new Date(Date.UTC(2020, 1, 29, 23, 59, 59, 999));
+log(d.toISOString(), d.getUTCDay(), new Date(d.getTime() + 1).toISOString(), Date.UTC(1970, 0, 1), new Date("2000-01-01T00:00:00Z").valueOf(), new Date(8.64e15 + 1).getTime(), new Date(2020, 0).getFullYear());
+document.getElementById("out").textContent = L.join("\n");
+</script></body></html>

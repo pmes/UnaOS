@@ -1,0 +1,31 @@
+<html><head><meta charset="utf-8"><title>js_core oracle 3: async ordering</title></head><body><ol id="log"><li>sync 1</li><li>async start</li><li>executor runs sync</li><li>sync 2</li><li>then 1</li><li>queueMicrotask</li><li>after await 1</li><li>thenable then called</li><li>catch true</li><li>thenable value t</li><li>finally</li><li>then 2</li><li>timeout 0 (a)</li><li>micro inside timeout</li><li>timeout 0 (b)</li><li>after await 2: resolved by timer</li><li>for await g1</li><li>for await g2</li><li>caught RangeError</li><li>allSettled fulfilled,rejected,fulfilled</li><li>any first</li><li>interval 1</li><li>interval 2</li><li>timeout 25</li><li>race fast</li></ol><script>
+var olist = document.getElementById("log");
+function note(s) { var li = document.createElement("li"); li.textContent = s; olist.appendChild(li); }
+note("sync 1");
+setTimeout(function () { note("timeout 0 (a)"); Promise.resolve().then(function () { note("micro inside timeout"); }); }, 0);
+setTimeout(function () { note("timeout 0 (b)"); }, 0);
+setTimeout(function () { note("timeout 25"); }, 25);
+var iv = 0, ivh = setInterval(function () { note("interval " + (++iv)); if (iv === 2) clearInterval(ivh); }, 10);
+Promise.resolve(1).then(function (v) { note("then " + v); return Promise.resolve(2); }).then(function (v) { note("then " + v); });
+queueMicrotask(function () { note("queueMicrotask"); });
+(async function () {
+  note("async start");
+  await null;
+  note("after await 1");
+  var r = await new Promise(function (res) { setTimeout(function () { res("resolved by timer"); }, 1); });
+  note("after await 2: " + r);
+  for await (var x of (async function* () { yield "g1"; yield "g2"; })()) note("for await " + x);
+  try { await Promise.reject(new RangeError("x")); } catch (e) { note("caught " + e.name); }
+  var all = await Promise.allSettled([Promise.resolve(1), Promise.reject(2), 3]);
+  note("allSettled " + all.map(function (s) { return s.status; }).join(","));
+  var any = await Promise.any([Promise.reject(1), new Promise(function (res) { setTimeout(res, 100, "late"); }), Promise.resolve("first")]);
+  note("any " + any);
+  var race = await Promise.race([new Promise(function (res) { setTimeout(res, 80, "slow"); }), new Promise(function (res) { setTimeout(res, 50, "fast"); })]);
+  note("race " + race);
+})();
+var thenable = { then: function (res) { note("thenable then called"); res("t"); } };
+Promise.resolve(thenable).then(function (v) { note("thenable value " + v); });
+new Promise(function (res, rej) { note("executor runs sync"); rej(new Error("e")); }).catch(function (e) { note("catch " + (e instanceof Error)); }).finally(function () { note("finally"); });
+note("sync 2");
+</script>
+</body></html>
