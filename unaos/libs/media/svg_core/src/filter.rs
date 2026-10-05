@@ -417,6 +417,17 @@ fn round_i(v: f64) -> i64 {
 
 /// The `<filter>` element and the filters it references by `href` (attributes inherit along the chain).
 fn filter_chain(r: &Renderer, f: usize) -> Vec<usize> {
+    let chain = vec![f];
+    // Chromium no longer honours `href` on <filter> (SVG 2 dropped it): nothing is inherited.
+    if HONOUR_FILTER_HREF {
+        return href_chain(r, f);
+    }
+    chain
+}
+
+const HONOUR_FILTER_HREF: bool = false;
+
+fn href_chain(r: &Renderer, f: usize) -> Vec<usize> {
     let mut chain = vec![f];
     let mut cur = f;
     while let Some(h) = r.doc.nodes[cur].href().and_then(|h| h.strip_prefix('#')).and_then(|id| r.doc.by_id(id)) {
@@ -478,11 +489,11 @@ fn number_list_partial(s: &str) -> Vec<f64> {
             break;
         }
         let Some(v) = crate::geom::number(b, &mut i) else { break };
-        // A number must be followed by a separator or the end.
+        out.push(v);
+        // Garbage after a number ends the list (the number itself is kept).
         if i < b.len() && !(b[i].is_ascii_whitespace() || b[i] == b',') {
             break;
         }
-        out.push(v);
         crate::geom::comma_wsp(b, &mut i);
     }
     out
@@ -587,7 +598,7 @@ impl Run<'_, '_> {
         match a.map(|s| s.trim()) {
             Some("SourceGraphic") => In::Source,
             Some("SourceAlpha") => In::SourceAlpha,
-            Some("BackgroundImage") | Some("BackgroundAlpha") | Some("FillPaint") | Some("StrokePaint") => In::Empty,
+            Some("BackgroundImage") | Some("BackgroundAlpha") => In::Empty,
             Some(name) if !name.is_empty() => match self.names.iter().rev().find(|(n, _)| n == name) {
                 Some(&(_, i)) => In::Res(i),
                 None => prev,
@@ -885,9 +896,11 @@ impl Run<'_, '_> {
                 let seed = num_attr(self.r, n, "seed", 0.0);
                 if let Some((fx, fy)) = bf.filter(|f| f.0 >= 0.0 && f.1 >= 0.0) {
                     let inv = self.ft.invert().unwrap_or(Transform::IDENTITY);
+                    // The noise is sampled at the pixel centre in user space, plus half a user unit (measured:
+                    // Chromium's lattice sits half a unit off at every scale).
                     let map = |x: usize, y: usize| -> (f64, f64) {
                         let (u, v) = inv.apply(x as f64 + 0.5, y as f64 + 0.5);
-                        (floor(u), floor(v))
+                        (u + 0.5, v + 0.5)
                     };
                     let tile = if stitch {
                         let su = sub.transform(&inv);
@@ -895,13 +908,8 @@ impl Run<'_, '_> {
                     } else {
                         None
                     };
-                    let (fx, fy) = if self.obb {
-                        let b = self.bbox.unwrap_or(Rect::new(0.0, 0.0, 1.0, 1.0));
-                        (fx / b.w, fy / b.h)
-                    } else {
-                        (fx, fy)
-                    };
-                    fe::turbulence(&mut img, &px, &map, crate::fmath::round(seed) as i64, fx, fy, octaves.min(32), fractal, tile);
+                    // baseFrequency is not scaled by primitiveUnits (Chromium); the seed is truncated (spec).
+                    fe::turbulence(&mut img, &px, &map, seed as i64, fx, fy, octaves.min(32), fractal, tile);
                 }
                 self.push(n, img, linear, sub, px);
             }
@@ -975,8 +983,9 @@ impl Run<'_, '_> {
             return None;
         }
         let divisor = match nd.attr("divisor") {
-            Some(v) => v.trim().parse::<f64>().ok().filter(|d| *d != 0.0)?,
-            None => {
+            // divisor="0" is ignored (Chromium), like an absent one.
+            Some(v) if v.trim().parse::<f64>().ok().filter(|d| *d != 0.0).is_some() => v.trim().parse::<f64>().unwrap(),
+            _ => {
                 let s: f64 = kernel.iter().sum();
                 if s == 0.0 { 1.0 } else { s }
             }
@@ -1037,7 +1046,8 @@ impl Run<'_, '_> {
                 Light::Spot { pos: p, s, exponent, cos_outer }
             }
         };
-        let surface = num_attr(r, n, "surfaceScale", 1.0);
+        // The surface height is a z length: it maps into the working space like the lights' z (Skia).
+        let surface = num_attr(r, n, "surfaceScale", 1.0) * (self.ft.a.abs() + self.ft.d.abs()) / 2.0;
         let kind = if name == "feDiffuseLighting" {
             Lighting::Diffuse { kd: num_attr(r, n, "diffuseConstant", 1.0) }
         } else {
