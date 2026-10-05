@@ -33,7 +33,9 @@
 //!
 //! # Keys (namespace `system`)
 //!
-//! `display.brightness` (1..16; BRIGHTFLOOR clamps a stored 0 on load and save) · `display.idle_min` (minutes, 0 = never) · `display.wallpaper` (a path,
+//! The ranges are the schema's (`prefs_core::schema::SCHEMA`, docs/dev/PREFS-SCHEMA.md; PREFSKERNEL B345:
+//! every set clamps through `schema::check`, every load through `schema::clamp_tree`).
+//! `display.brightness` (1..16) · `display.idle_min` (minutes, 0 = never) · `display.wallpaper` (a path,
 //! empty = off) · `audio.volume` (0..16) · `audio.mute` (bool) · `pointer.speed` (0 slow, 1 normal, 2 fast)
 //! · `power.lowbat_shutdown_pct` (0 = off) · `dock.pins` (comma-joined app names — TOML arrays are outside
 //! the subset) · `settings.tab` (0..3). Defaults live with each consumer, as in Principia.
@@ -202,15 +204,28 @@ fn load() {
             _ => (PrefTree::new(), true),
         },
     };
+    // PREFSKERNEL M3 (B345): a value outside its schema range (a hand edit, a file older than the
+    // schema) is clamped ONCE, here, by the shared rule — and re-saved, so the file holds the clamp. A
+    // refused file is not touched (its saves are held).
+    let mut tree = tree;
+    let clamped = if ok { prefs_core::schema::clamp_tree(&mut tree) } else { 0 };
+    LOAD_CLAMPED.store(clamped as u32, Ordering::Relaxed);
+    serial_println!("[prefs] load clamped={}", clamped);
     HELD.store(!ok, Ordering::Release);
     LOADED_N.store(tree.len() as u32, Ordering::Relaxed);
     SAVED_N.store(0, Ordering::Relaxed);
     *TREE.lock() = tree;
     witness(ok);
+    if ok && clamped > 0 {
+        let _ = save();
+    }
     if ok {
         migrate();
     }
 }
+
+/// PREFSKERNEL M3: values the last load clamped into their schema range.
+static LOAD_CLAMPED: AtomicU32 = AtomicU32::new(0);
 
 /// Load once per login (and once with no session). Cheap when nothing changed.
 pub fn ensure_loaded() {
@@ -388,40 +403,73 @@ pub fn namespaces() -> Vec<String> {
     TREE.lock().namespaces().into_iter().map(String::from).collect()
 }
 
-/// Set `ns`/`key` and persist. An unchanged value is not re-written. On a refused name or a failed save
-/// the tree is rolled back (cache and file never disagree — Principia's rule). Prints the set line, and on
-/// success the PrefChanged stand-in.
-pub fn set(ns: &str, k: &str, v: PrefValue) -> Result<(), String> {
-    ensure_loaded();
-    let prev = TREE.lock().set(ns, k, v.clone());
-    let r = match prev {
-        Err(e) => Err(String::from(e.as_str())),
-        Ok(Some(ref old)) if *old == v => Ok(false),
-        Ok(old) => match save() {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                let mut t = TREE.lock();
-                match old {
-                    Some(o) => {
-                        let _ = t.set(ns, k, o);
-                    }
-                    None => {
-                        t.remove(ns, k);
-                    }
-                }
-                Err(e)
-            }
-        },
-    };
-    serial_println!("[prefs] set {}.{}={} ok={}", ns, k, v, r.is_ok() as u8);
-    match r {
-        Ok(true) => {
-            changed(ns, k, &v);
-            Ok(())
+/// Why a [`set_applied`] failed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SetError {
+    /// The schema refused the value (`prefs_core::schema::check`: wrong type, enum, length, NaN).
+    Refused(prefs_core::schema::Refusal),
+    /// A malformed name or a leaf collision.
+    Name(prefs_core::PrefError),
+    /// The save failed or is held; the tree was rolled back.
+    Io(String),
+}
+
+impl core::fmt::Display for SetError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SetError::Refused(r) => write!(f, "{}", r),
+            SetError::Name(e) => f.write_str(e.as_str()),
+            SetError::Io(e) => f.write_str(e),
         }
-        Ok(false) => Ok(()),
-        Err(e) => Err(e),
     }
+}
+
+/// PREFSKERNEL (B345): the kernel store as `prefs_core::wire::Persist` — the lock is `TREE`, held for the
+/// closure only (the save runs unlocked, as before); the save is [`save`]'s swap. Its error text is kept
+/// for the `[prefs] set` line.
+struct KernelPersist {
+    err: Option<String>,
+}
+
+impl prefs_core::wire::Persist for KernelPersist {
+    fn with_tree<R>(&mut self, f: impl FnOnce(&mut PrefTree) -> R) -> R {
+        f(&mut TREE.lock())
+    }
+    fn save(&mut self) -> Result<(), ()> {
+        save().map(|_| ()).map_err(|e| self.err = Some(e))
+    }
+}
+
+/// Set `ns`/`key` and persist — PRINCIPIA'S RULE, not a kernel copy of it (PREFSKERNEL, B345): this is
+/// `prefs_core::wire::persisted_set`, the function the host reference store runs: the name is validated,
+/// `prefs_core::schema::check` clamps (the CLAMP is stored and answered: `Applied { value, clamped }`) or
+/// refuses, an unchanged value is not re-written, and a failed save rolls the tree back (cache and file
+/// never disagree). Prints the set line, and on a change the PrefChanged (which carries `clamped`).
+pub fn set_applied(ns: &str, k: &str, v: PrefValue) -> Result<prefs_core::schema::Applied, SetError> {
+    ensure_loaded();
+    let mut kp = KernelPersist { err: None };
+    let r = prefs_core::wire::persisted_set(&mut kp, ns, k, v.clone());
+    match &r {
+        Ok(st) if st.applied.clamped => serial_println!("[prefs] set {}.{}={} ok=1 clamped=1 sent={}", ns, k, st.applied.value, v),
+        Ok(st) => serial_println!("[prefs] set {}.{}={} ok=1", ns, k, st.applied.value),
+        Err(e) => serial_println!("[prefs] set {}.{}={} ok=0 why={:?}", ns, k, v, e),
+    }
+    match r {
+        Ok(st) => {
+            if st.changed {
+                changed(ns, k, &st.applied);
+            }
+            Ok(st.applied)
+        }
+        Err(prefs_core::wire::SetFail::Refused(x)) => Err(SetError::Refused(x)),
+        Err(prefs_core::wire::SetFail::Name(e)) => Err(SetError::Name(e)),
+        Err(prefs_core::wire::SetFail::Io) => Err(SetError::Io(kp.err.unwrap_or_else(|| String::from("save failed")))),
+    }
+}
+
+/// [`set_applied`] for callers that only need accepted / refused (the refusal as text).
+pub fn set(ns: &str, k: &str, v: PrefValue) -> Result<(), String> {
+    set_applied(ns, k, v).map(|_| ()).map_err(|e| alloc::format!("{}", e))
 }
 
 /// Set a `system` key; a failure is already said on the serial line, so callers that only persist
@@ -439,12 +487,14 @@ pub fn set_sys(k: &str, v: PrefValue) {
 /// header: kind = REPLY (2), verb = BUS_VERB_PREF_CHANGED (19), corr = 0, status = 0,
 ///         principal = the kernel reply record, body_len = n
 /// body:   <ns> "." <key> NUL <value as a TOML literal (prefs_core::PrefValue::to_literal)>
+///         [NUL "clamped=true"]   (PREFSKERNEL: when the schema clamped the write; wire::changed_body_applied)
 /// ```
 ///
 /// (the PREF_SET request body, unsolicited). Also the ATTRSURF hook: the key is mirrored as an attribute
 /// on the preferences file once the VFS can set one ([`mirror_attr`]).
-fn changed(ns: &str, k: &str, v: &PrefValue) {
-    serial_println!("[prefs] changed {}.{}", ns, k);
+fn changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
+    let v = &a.value;
+    serial_println!("[prefs] changed {}.{}", ns, k); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] crate::prefs_client::on_changed(ns, k, a); // SETTINGSBUS (B337): the verb-19 frame to the kernel's subscribers. PREFSKERNEL (B345): it carries `clamped`.
     mirror_attr(ns, k, v);
 }
 
@@ -455,10 +505,10 @@ fn mirror_attr(ns: &str, k: &str, v: &PrefValue) {
     let _ = (ns, k, v);
 }
 
-/// Split `ns.key` (the verb's and the bus's address form) and validate both halves.
+/// Split `ns.key` (the verb's and the bus's address form) and validate both halves — the shared
+/// `prefs_core::wire::split_addr` (PREFSKERNEL, B345).
 pub fn split_addr(a: &str) -> Option<(&str, &str)> {
-    let (ns, k) = a.split_once('.')?;
-    (prefs_core::validate_ns(ns).is_ok() && prefs_core::validate_key(k).is_ok()).then_some((ns, k))
+    prefs_core::wire::split_addr(a)
 }
 
 // ── The `pref` verb ──────────────────────────────────────────────────────────────────────────
@@ -478,8 +528,9 @@ pub fn verb(args: &[&str], out: &mut dyn FnMut(&str)) {
         ["set", a, rest @ ..] if !rest.is_empty() => match split_addr(a) {
             Some((ns, k)) => {
                 let raw = rest.join(" ");
-                match set(ns, k, PrefValue::infer(&raw)) {
-                    Ok(()) => out(&alloc::format!("{} = {}", a, get(ns, k).map(|v| v.to_literal()).unwrap_or_default())),
+                match set_applied(ns, k, PrefValue::infer(&raw)) {
+                    Ok(ap) if ap.clamped => out(&alloc::format!("{} = {} (clamped to the schema's range)", a, ap.value.to_literal())),
+                    Ok(_) => out(&alloc::format!("{} = {}", a, get(ns, k).map(|v| v.to_literal()).unwrap_or_default())),
                     Err(e) => out(&alloc::format!("pref: {} refused: {}", a, e)),
                 }
             }
@@ -508,84 +559,71 @@ pub fn verb(args: &[&str], out: &mut dyn FnMut(&str)) {
 
 // ── Bus (M3): PREF_GET / PREF_SET / PREF_LIST ─────────────────────────────────────────────────
 
-const ENOENT: i64 = -2;
-const E2BIG: i64 = -7;
-const EIO: i64 = -5;
-const EACCES: i64 = -13;
-const EINVAL: i64 = -22;
+// PREFSKERNEL (B345): the bodies, the statuses and the fulfiller are `prefs_core::wire`'s — ONE
+// implementation for both rings (Principia on the host answers through the same `fulfil`). What stays
+// here is the kernel's `Store`: the tree behind `set_applied` (= `wire::persisted_set` + the swap).
 
-/// PREF_GET body: `<ns>.<key>` (ASCII). PREF_LIST body: `<ns>` or empty (every namespace). PREF_SET body:
-/// `<ns>.<key>` NUL `<TOML scalar literal>`. Pure; `None` = BadBody (-EINVAL).
+/// PREF_GET body: `<ns>.<key>`. Pure; `None` = BadBody (-EINVAL). (`prefs_core::wire::parse_get`.)
 pub fn get_body_parse(body: &[u8]) -> Option<(&str, &str)> {
-    split_addr(core::str::from_utf8(body).ok()?)
+    prefs_core::wire::parse_get(body)
 }
+/// PREF_SET body: `<ns>.<key>` NUL `<TOML scalar literal>`. (`prefs_core::wire::parse_set`.)
 pub fn set_body_parse(body: &[u8]) -> Option<(&str, &str, PrefValue)> {
-    let z = body.iter().position(|&b| b == 0)?;
-    let (ns, k) = get_body_parse(&body[..z])?;
-    let lit = core::str::from_utf8(&body[z + 1..]).ok()?;
-    Some((ns, k, PrefValue::from_literal(lit).ok()?))
+    prefs_core::wire::parse_set(body)
 }
+/// PREF_LIST body: `<ns>` or empty (every namespace). (`prefs_core::wire::parse_list`.)
 pub fn list_body_parse(body: &[u8]) -> Option<Option<&str>> {
-    if body.is_empty() {
-        return Some(None);
-    }
-    let ns = core::str::from_utf8(body).ok()?;
-    prefs_core::validate_ns(ns).is_ok().then_some(Some(ns))
+    prefs_core::wire::parse_list(body)
 }
+
+/// The kernel's store as the shared wire sees it: reads are the tree, a write is [`set_applied`].
+#[allow(dead_code)] // a no-bus, no-witness build has no caller
+struct KernelStore;
+
+impl prefs_core::wire::Store for KernelStore {
+    fn get(&self, ns: &str, k: &str) -> Option<PrefValue> {
+        get(ns, k)
+    }
+    fn set(&mut self, ns: &str, k: &str, v: PrefValue) -> Result<prefs_core::schema::Applied, prefs_core::wire::SetFail> {
+        set_applied(ns, k, v).map_err(|e| match e {
+            SetError::Refused(r) => prefs_core::wire::SetFail::Refused(r),
+            SetError::Name(n) => prefs_core::wire::SetFail::Name(n),
+            SetError::Io(_) => prefs_core::wire::SetFail::Io,
+        })
+    }
+    fn list(&self, ns: &str) -> Vec<(String, PrefValue)> {
+        list(ns)
+    }
+    fn namespaces(&self) -> Vec<String> {
+        namespaces()
+    }
+}
+
+// The shared wire's numbers are the kernel bus's (prefs_core's dev-test pins them to una-abi too).
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+const _: () = assert!(
+    prefs_core::wire::BODY_MAX == crate::bus::BUS_BODY_MAX
+        && prefs_core::wire::VERB_GET == una_abi::BUS_VERB_PREF_GET
+        && prefs_core::wire::VERB_SET == una_abi::BUS_VERB_PREF_SET
+        && prefs_core::wire::VERB_LIST == una_abi::BUS_VERB_PREF_LIST
+        && prefs_core::wire::VERB_CHANGED == una_abi::BUS_VERB_PREF_CHANGED
+);
 
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold)
-/// Fulfil one PREF verb. `in_session`: the caller runs in the open session (the transport decides, from
-/// the stamped principal). Reply body into `text`; returns the status (0 or a negative errno).
-/// GET: the value as a TOML literal, -ENOENT unset. SET: empty, -EACCES outside the session, -EIO when the
-/// save failed or is held. LIST: `<ns>.<key> = <literal>` lines, -E2BIG past the 4 KiB body ceiling.
+/// Fulfil one PREF verb — PREFSKERNEL (B345): a thin call into `prefs_core::wire::fulfil` over the kernel
+/// store, the function Principia answers with on the host. `in_session`: the caller runs in the open
+/// session (the transport decides, from the stamped principal). Reply body into `text`; returns the status.
+/// GET: the literal, -ENOENT unset. SET: empty, or `<stored>` NUL `clamped=true` when the schema clamped;
+/// -EACCES outside the session; -EINVAL malformed or refused by the schema; -EIO collision / save failed
+/// or held. LIST: `<ns>.<key> = <literal>` lines, -E2BIG past the 4 KiB body ceiling.
 pub fn bus_fulfil(verb: u8, body: &[u8], in_session: bool, text: &mut Vec<u8>) -> i64 {
     ensure_loaded();
-    match verb {
-        una_abi::BUS_VERB_PREF_GET => match get_body_parse(body) {
-            Some((ns, k)) => match get(ns, k) {
-                Some(v) => {
-                    text.extend_from_slice(v.to_literal().as_bytes());
-                    0
-                }
-                None => ENOENT,
-            },
-            None => EINVAL,
-        },
-        una_abi::BUS_VERB_PREF_SET => match set_body_parse(body) {
-            Some((ns, k, v)) => {
-                if !in_session {
-                    serial_println!("[prefs] set {}.{} refused: caller is not the session user", ns, k);
-                    EACCES
-                } else if set(ns, k, v).is_ok() {
-                    0
-                } else {
-                    EIO
-                }
-            }
-            None => EINVAL,
-        },
-        una_abi::BUS_VERB_PREF_LIST => match list_body_parse(body) {
-            Some(which) => {
-                let nss = match which {
-                    Some(ns) => alloc::vec![String::from(ns)],
-                    None => namespaces(),
-                };
-                for ns in nss {
-                    for (k, v) in list(&ns) {
-                        text.extend_from_slice(alloc::format!("{}.{} = {}\n", ns, k, v).as_bytes());
-                    }
-                }
-                if text.len() > crate::bus::BUS_BODY_MAX {
-                    text.clear();
-                    E2BIG
-                } else {
-                    0
-                }
-            }
-            None => EINVAL,
-        },
-        _ => EINVAL,
+    if verb == prefs_core::wire::VERB_SET && !in_session {
+        if let Some((ns, k, _)) = prefs_core::wire::parse_set(body) {
+            serial_println!("[prefs] set {}.{} refused: caller is not the session user", ns, k);
+        }
     }
+    prefs_core::wire::fulfil(&mut KernelStore, verb, body, in_session, text)
 }
 
 #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold)
@@ -644,6 +682,7 @@ pub fn selftest() {
     let p = path();
     let original = read_all(&p);
     let tree0 = TREE.lock().clone();
+    let load_clamped0 = LOAD_CLAMPED.load(Ordering::Relaxed);
     let held0 = HELD.load(Ordering::Acquire);
     let (loaded0, saved0) = (LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed));
     HELD.store(false, Ordering::Release);
@@ -666,6 +705,32 @@ pub fn selftest() {
         _ => false,
     };
     let no_temp = read_all(&alloc::format!("{}.new", p)).is_none();
+    // PREFSKERNEL (B345) — Leg C, the set clamp: an out-of-range write stores the schema's clamp and says
+    // so. The key is `power.lowbat_shutdown_pct` (0..=100): read by the power check only, so the fixture
+    // dims no panel and moves no window.
+    let lk = key::LOWBAT_PCT;
+    let clamp_ok = matches!(set_applied(NS, lk, PrefValue::Int(250)), Ok(ref a) if a.clamped && a.value == PrefValue::Int(100))
+        && get(NS, lk) == Some(PrefValue::Int(100))
+        && matches!(set_applied(NS, lk, PrefValue::Int(40)), Ok(ref a) if !a.clamped)
+        && set_applied(NS, lk, PrefValue::Str(String::from("loud"))).is_err()
+        && get(NS, lk) == Some(PrefValue::Int(40));
+    // Leg W, the wire is the shared one: the kernel's fulfiller and prefs_core's reference store answer the
+    // same clamped SET with the same status and the same bytes (`100` NUL `clamped=true`).
+    let wire_body: &[u8] = b"system.power.lowbat_shutdown_pct\x00250";
+    let mut kt = Vec::new();
+    #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] let ks = bus_fulfil(prefs_core::wire::VERB_SET, wire_body, true, &mut kt);
+    #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64")))] let ks = prefs_core::wire::fulfil(&mut KernelStore, prefs_core::wire::VERB_SET, wire_body, true, &mut kt);
+    let mut rt = Vec::new();
+    let rs = prefs_core::wire::fulfil(&mut prefs_core::wire::TreeStore::default(), prefs_core::wire::VERB_SET, wire_body, true, &mut rt);
+    let wire_ok = ks == 0 && ks == rs && kt == rt && kt == b"100\x00clamped=true";
+    // Leg L, the load clamp: a file holding an out-of-range value loads clamped, once, and is re-saved so.
+    let _ = write_all(&p, b"[system]\npower.lowbat_shutdown_pct = 250\n");
+    *LOADED_FOR.lock() = None;
+    ensure_loaded();
+    let refile = read_all(&p).and_then(|b| String::from_utf8(b).ok()).and_then(|t| PrefTree::parse(&t).ok());
+    let loadclamp_ok = LOAD_CLAMPED.load(Ordering::Relaxed) == 1
+        && get(NS, lk) == Some(PrefValue::Int(100))
+        && refile.as_ref().and_then(|t| t.get(NS, lk).cloned()) == Some(PrefValue::Int(100));
     // Leg 3 — a malformed file: refused with its line, nothing adopted, defaults hold, saves held.
     let bad = b"[system]\ndisplay.brightness = 3\nrecents = [\"a\"]\n";
     let _ = write_all(&p, bad);
@@ -688,11 +753,14 @@ pub fn selftest() {
     *TREE.lock() = tree0;
     HELD.store(held0, Ordering::Release);
     LOADED_N.store(loaded0, Ordering::Relaxed);
+    LOAD_CLAMPED.store(load_clamped0, Ordering::Relaxed);
     SAVED_N.store(saved0, Ordering::Relaxed);
     let restored = read_all(&p) == original;
-    let ok = codec && set_ok && file_ok && no_temp && refused && held && restored;
+    let rows = prefs_core::schema::SCHEMA.len();
+    let ok = codec && set_ok && file_ok && no_temp && refused && held && restored && loadclamp_ok && clamp_ok && wire_ok;
     serial_println!(
-        ":: PREFS-FIXTURE: codec={} types={} file={} temp_gone={} malformed_refused={} save_held={} restored={} -> {} ::",
-        codec as u8, set_ok as u8, file_ok as u8, no_temp as u8, refused as u8, held as u8, restored as u8, if ok { "PASS" } else { "FAIL" }
+        ":: PREFS-FIXTURE: codec={} types={} file={} temp_gone={} malformed_refused={} save_held={} restored={} loadclamp={} clamp={} wire={} schema_rows={} -> {} ::",
+        codec as u8, set_ok as u8, file_ok as u8, no_temp as u8, refused as u8, held as u8, restored as u8,
+        loadclamp_ok as u8, clamp_ok as u8, if wire_ok { "shared" } else { "diverged" }, rows, if ok { "PASS" } else { "FAIL" }
     );
 }

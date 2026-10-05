@@ -695,27 +695,21 @@ pub unsafe fn recon(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) 
             GTT_BASE + SLOTS * 4
         );
     }
-    let sample: [usize; 12] = [
-        0,
-        1,
-        2,
-        3,
-        16,
-        256,
-        4_096,
-        65_536,
-        131_072,
-        262_144,
-        SLOTS - 2,
-        SLOTS - 1,
-    ];
+    let sample: [usize; 12] = r1_ggtt_sample();
+    // GPUTESTS M1 (B334, R80): R1 runs under `tests gen7`, long after `bring_up_blt_ring` may have
+    // written its ring PTE. The census must still be FIRMWARE's, so the boot banked these twelve
+    // PTEs (`bank`, read-only, before the ring); the census answers from that bank when one exists.
+    let banked = ladder::r1_ggtt_bank();
+    if banked.is_some() {
+        serial_println!(":: gen7: ggtt source=boot-bank slots={} note=R1-census-reads-the-PTEs-banked-in-igpu-init-before-bring_up_blt_ring ::", sample.len());
+    }
     let mut valid = 0u32;
     let mut empty = 0u32;
     let mut ones = 0u32;
     let mut malformed = 0u32;
     let mut first_valid: i32 = -1;
     let mut first_valid_pte = 0u32;
-    for &s in sample.iter() {
+    for (si, &s) in sample.iter().enumerate() {
         let off = GTT_BASE + s * 4;
         // Bounds guard against the ACTUAL mapping length, not against the expected one.
         if off + 4 > bar0_size {
@@ -727,7 +721,7 @@ pub unsafe fn recon(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) 
             );
             continue;
         }
-        let pte = rd(bar0, off);
+        let pte = match banked { Some(b) => b[si], None => rd(bar0, off) };
         // The content invariant, and it is deliberately NOT `!= 0`: a Gen7 GGTT PTE is one
         // dword carrying `(phys & ~0xFFF) | valid` (draft G6, [EXT-UNPINNED], and the
         // shape the tree itself writes at `igpu.rs` ~835). So a PRESENT entry must have
@@ -5664,6 +5658,7 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     // GEN7R8 M2 (B320, R80): the call is now a STASH, not the rung. R8 is a test — it moved behind
     // `tests gen7` — so the boot records what R8 needs from THIS boot (BAR0, BDF, R3's wake, R7's
     // verdict, the panel geometry) and prints nothing; R19's dependency rides in the stash unchanged.
+    ladder::note_r7(match safety_override { Some(v) => v, None => exec_verdict }); // GPUTESTS M1: the ladder fixture's verdict
     #[cfg(feature = "gen7r8")]
     r8::stash(
         bar0,
@@ -6949,15 +6944,33 @@ mod r8 {
         wake: GtWake,
         r7_verdict: &'static str,
     ) {
-        let geo = match crate::video::WRITER.try_lock() {
+        // GPUTESTS M1: the geometry the boot banked in `igpu::init` (where flights 10-19 read `fb=panel`);
+        // R7 now runs under `tests gen7`, where the compositor may hold the writer.
+        if let Some(geo) = *BANKED_GEO.lock() {
+            *STASH.lock() = Some(Ctx { bar0, bar0_size, bus, slot, func, wake, r7: r7_verdict, geo });
+            return;
+        }
+        let geo = bank_geo_now();
+        *STASH.lock() = Some(Ctx { bar0, bar0_size, bus, slot, func, wake, r7: r7_verdict, geo });
+    }
+
+    static BANKED_GEO: spin::Mutex<Option<Geo>> = spin::Mutex::new(None);
+
+    /// GPUTESTS M1: bank the panel geometry at boot (`gen7::bank`). Prints nothing.
+    pub(super) fn bank_geo() {
+        let g = bank_geo_now();
+        *BANKED_GEO.lock() = Some(g);
+    }
+
+    fn bank_geo_now() -> Geo {
+        match crate::video::WRITER.try_lock() {
             Some(fb) if fb.is_ready() => {
                 let i = fb.info();
                 Geo { src: "panel", w: i.width, h: i.height, stride: i.stride, bpp: i.bytes_per_pixel, base: fb.base(), len: fb.len() }
             }
             Some(_) => Geo { src: "fallback-unattached", w: R8_FALLBACK_W, h: R8_RECT_H, stride: R8_FALLBACK_STRIDE, bpp: 4, base: 0, len: 0 },
             None => Geo { src: "fallback-locked", w: R8_FALLBACK_W, h: R8_RECT_H, stride: R8_FALLBACK_STRIDE, bpp: 4, base: 0, len: 0 },
-        };
-        *STASH.lock() = Some(Ctx { bar0, bar0_size, bus, slot, func, wake, r7: r7_verdict, geo });
+        }
     }
 
     fn print_witness(w: &Witness, replay: bool) -> &'static str {
@@ -7020,4 +7033,147 @@ mod r8 {
 #[cfg(feature = "gen7r8")]
 pub fn r8_test() {
     r8::test()
+}
+
+// =====================================================================================
+// GPUTESTS M1 (B334, R80) — the whole ladder behind `tests gen7`.
+// =====================================================================================
+//
+// R1..R7 ran inside `igpu::init` on every `UNAOS_IVB3D` boot. R80: nothing runs at boot but the boot.
+// The ordering argument GEN7R8 left owed: R1's GGTT census must read FIRMWARE's page tables, before
+// `bring_up_blt_ring` writes its ring PTE. So the boot keeps exactly one call, at the same spot above
+// `bring_up_blt_ring` — `bank` — which READS (no write) R1's twelve sample PTEs and the panel geometry,
+// stores BAR0/BDF, and prints nothing. `tests gen7` runs R1..R7 in their boot order from the bank: R1's
+// census answers from the banked PTEs, every other rung reads live (R4..R8's ownership guards must see
+// the GGTT as it is NOW, which is the safety argument, not a detail), then R8 under `gen7r8`.
+//
+// Once per boot: R5..R8 leak or hold GGTT pages by design (gen7.md §2.6), so a second run replays.
+// Refused when `igpu`'s own BLT ring came up: R7/R8 arm the BCS and would do it under a live ring.
+
+/// The twelve R1 sample slots (GGTT PTE indices), shared by the census and the boot bank.
+fn r1_ggtt_sample() -> [usize; 12] {
+    const SLOTS: usize = 524_288;
+    [0, 1, 2, 3, 16, 256, 4_096, 65_536, 131_072, 262_144, SLOTS - 2, SLOTS - 1]
+}
+
+/// GPUTESTS M1: the boot's only gen7 call (`igpu::init`, above `bring_up_blt_ring`). Reads, never writes.
+/// Prints nothing (R80).
+///
+/// # Safety
+/// `bar0` is the IGD BAR0 mapping `igpu::init` publishes, live for `bar0_size` bytes, never unmapped.
+pub unsafe fn bank(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
+    const GTT_BASE: usize = 0x200000; // igpu::regs::GTT_BASE — [EXT-UNPINNED], as R1 carries it
+    let mut ggtt = [0u32; 12];
+    let mut ok = true;
+    for (i, &s) in r1_ggtt_sample().iter().enumerate() {
+        let off = GTT_BASE + s * 4;
+        if off + 4 > bar0_size {
+            ok = false; // R1 prints its own SKIPPED line for this slot; the bank is then not used
+            continue;
+        }
+        ggtt[i] = rd(bar0, off);
+    }
+    *ladder::BANK.lock() = Some(ladder::Bank { bar0, bar0_size, bus, slot, func, ggtt, ggtt_ok: ok });
+    #[cfg(feature = "gen7r8")]
+    r8::bank_geo();
+}
+
+/// GPUTESTS M1: `tests gen7` — R1..R7 from the boot bank, then R8 (gen7r8), one witness line each.
+pub fn ladder_test() {
+    ladder::run();
+}
+
+mod ladder {
+    use super::GtWake;
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Bank {
+        pub(super) bar0: usize,
+        pub(super) bar0_size: usize,
+        pub(super) bus: u8,
+        pub(super) slot: u8,
+        pub(super) func: u8,
+        pub(super) ggtt: [u32; 12],
+        pub(super) ggtt_ok: bool,
+    }
+
+    pub(super) static BANK: spin::Mutex<Option<Bank>> = spin::Mutex::new(None);
+    static R7: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
+    /// `(wake name, r7 verdict, us)` of the run this boot already made.
+    static DONE: spin::Mutex<Option<(&'static str, &'static str, u64)>> = spin::Mutex::new(None);
+    /// True only while `run` drives the rungs, so R1 answers from the bank exactly then.
+    static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    pub(super) fn r1_ggtt_bank() -> Option<[u32; 12]> {
+        if !RUNNING.load(core::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        match *BANK.lock() {
+            Some(b) if b.ggtt_ok => Some(b.ggtt),
+            _ => None,
+        }
+    }
+
+    pub(super) fn note_r7(v: &'static str) {
+        *R7.lock() = Some(v);
+    }
+
+    fn us_since(t0: u64) -> u64 {
+        let hz = crate::arch::apic::tsc_hz();
+        let hz = if hz == 0 { 1_250_000_000 } else { hz };
+        crate::arch::now_cycles().saturating_sub(t0).saturating_mul(1_000_000) / hz
+    }
+
+    fn witness(wake: &str, r7: &str, us: u64, replay: bool) {
+        let pass = r7 == "r7-blit-verified";
+        serial_println!(
+            ":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={} -> {} ::",
+            wake, r7, us, replay as u32, if pass { "PASS" } else { "FAIL" }
+        );
+    }
+
+    pub(super) fn run() {
+        if let Some((w, r7, us)) = *DONE.lock() {
+            serial_println!(":: gen7: ladder replay=1 note=R1-R7-ran-once-this-boot-R5-R8-hold-GGTT-pages-a-second-run-would-hold-more ::");
+            witness(w, r7, us, true);
+            #[cfg(feature = "gen7r8")]
+            super::r8::test();
+            return;
+        }
+        let Some(b) = *BANK.lock() else {
+            serial_println!(":: GEN7LADDER: rungs=none ggtt=none wake=none r7=not-reached us=0 replay=0 -> SKIP (no boot bank: igpu::init never reached the IGD BAR0 on this boot) ::");
+            return;
+        };
+        if crate::drivers::gpu::igpu::blt_ring_live() {
+            serial_println!(":: GEN7LADDER: rungs=none ggtt=boot-bank wake=none r7=not-reached us=0 replay=0 -> SKIP (igpu's own BLT ring is live; R5-R8 would arm the BCS under it) ::");
+            return;
+        }
+        serial_println!(
+            ":: gen7: ladder begin rungs=R1-R7 bdf={}:{}.{} bar0_size={} ggtt_banked={} note=R80-the-boot-only-banked-these-inputs ::",
+            b.bus, b.slot, b.func, b.bar0_size, b.ggtt_ok as u32
+        );
+        *R7.lock() = None;
+        let t0 = crate::arch::now_cycles();
+        RUNNING.store(true, core::sync::atomic::Ordering::Release);
+        // SAFETY: `bar0` is the IGD BAR0 mapping `igpu::init` published and banked; it is never unmapped.
+        // The order is the boot order the rungs were written for (R1 read-only, R2/R3 reverse their own
+        // writes, R4..R7 gate on R3's wake and on proven-unowned GGTT windows read live).
+        let wake: GtWake = unsafe {
+            super::recon(b.bar0, b.bar0_size, b.bus, b.slot, b.func);
+            super::wake(b.bar0, b.bar0_size, b.bus, b.slot, b.func);
+            let w = super::forcewake(b.bar0, b.bar0_size, b.bus, b.slot, b.func);
+            super::claim(b.bar0, b.bar0_size, b.bus, b.slot, b.func, w);
+            super::execute(b.bar0, b.bar0_size, b.bus, b.slot, b.func, w);
+            super::rearm(b.bar0, b.bar0_size, b.bus, b.slot, b.func, w);
+            super::blit(b.bar0, b.bar0_size, b.bus, b.slot, b.func, w);
+            w
+        };
+        RUNNING.store(false, core::sync::atomic::Ordering::Release);
+        let us = us_since(t0);
+        let r7 = (*R7.lock()).unwrap_or("not-reached");
+        *DONE.lock() = Some((wake.name(), r7, us));
+        witness(wake.name(), r7, us, false);
+        #[cfg(feature = "gen7r8")]
+        super::r8::test();
+    }
 }

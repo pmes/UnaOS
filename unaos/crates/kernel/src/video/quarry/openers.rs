@@ -12,6 +12,7 @@
 //! | `facet` | `video::facet::request_open` (image viewer; `UNAOS_FACET`) |
 //! | `fileview` | `video::fileview::request_open` (read-only text viewer) |
 //! | `textedit` | `video::textedit::request_open` when the user may edit the file, else the viewer |
+//! | `markdown` `json` | `video::fileview::request_open_styled` — the viewer with that renderer (QUARRY2) |
 //! | `play` | `drivers::hda::play::request_open` (x86 `UNAOS_HDA` + `UNAOS_HDATONE`) |
 //! | `launch` | Quarry's `launch` — `arch::syscall::spawn_user_image_bg`, the seam `bg` takes |
 //! | `linux` | refused from the desktop: the Linux ABI runs a foreground session; the line names `linux <path>` |
@@ -30,6 +31,7 @@ use super::{Act, JOBS, MAX_JOBS};
 pub fn available(id: &str) -> bool {
     match id {
         "launch" | "fileview" | "textedit" => true,
+        "markdown" | "json" => true, // QUARRY2 (B336): the text viewer, rendered (`fileview::request_open_styled`)
         "facet" => cfg!(feature = "facet"),
         "play" => cfg!(all(target_arch = "x86_64", feature = "hda-tone")),
         "linux" => cfg!(all(target_arch = "x86_64", feature = "linuxabi")),
@@ -87,6 +89,13 @@ pub fn open(id: &str, path: &str, mime: &str) -> String {
                 crate::video::fileview::request_open(path);
                 serial_println!("[quarry] open TEXT path={} type={} -> fileview (latched for the render pass)", path, mime);
             }
+            alloc::format!("opening {}", leaf)
+        }
+        // QUARRY2 (B336): Markdown and JSON open in the read-only viewer with their renderer
+        // (`fileview::richtext`): headings bold and lists indented / pretty-printed and tinted.
+        "markdown" | "json" => {
+            crate::video::fileview::request_open_styled(path, id);
+            serial_println!("[quarry] open TEXT path={} type={} -> fileview render={} (latched for the render pass)", path, mime, id);
             alloc::format!("opening {}", leaf)
         }
         "play" => {

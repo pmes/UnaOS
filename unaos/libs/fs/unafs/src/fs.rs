@@ -240,6 +240,9 @@ pub struct UnaFS<D: BlockDevice> {
     stats: CommitStats,
     /// Blocks written by the in-flight transaction.
     txn_blocks: u64,
+    /// UNAFSGROW: the flags word the NEXT commit writes into the root record
+    /// ([`crate::root::ROOT_FLAG_GROW`] only while a grow is mid-flight).
+    root_flags: u64,
 }
 
 impl<D: BlockDevice> UnaFS<D> {
@@ -320,6 +323,7 @@ impl<D: BlockDevice> UnaFS<D> {
             autocommit: true,
             stats: CommitStats::default(),
             txn_blocks: 0,
+            root_flags: 0,
         };
 
         // The reserved system objects, in id order (1..=4).
@@ -377,6 +381,7 @@ impl<D: BlockDevice> UnaFS<D> {
             autocommit: true,
             stats: CommitStats::default(),
             txn_blocks: 0,
+            root_flags: 0,
         };
 
         // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
@@ -455,7 +460,15 @@ impl<D: BlockDevice> UnaFS<D> {
         // points at an index-of-indexes of MID blocks, each holding up to 512
         // leaf pointers.
         let expected_leaves = block_count.div_ceil(crate::refmap::REFS_PER_LEAF);
-        if root.refmap_leaves != expected_leaves {
+        // UNAFSGROW: a root written by a grow whose superblock rewrite did not
+        // land carries a map sized for the larger volume; it is read at block
+        // 0's size (counts past it are dropped below — they are all 0, and
+        // every pointer is still bounded by the old `block_count`).
+        let grow_lag = root.flags & crate::root::ROOT_FLAG_GROW != 0
+            && root.refmap_leaves > expected_leaves
+            && (superblock.version >= crate::superblock::VERSION_REFMAP_TREE
+                || root.refmap_leaves <= BLOCK_SIZE / 8);
+        if root.refmap_leaves != expected_leaves && !grow_lag {
             return Err(FileSystemError::CorruptVolume(
                 "refmap size inconsistent with block count",
             ));
@@ -733,7 +746,7 @@ impl<D: BlockDevice> UnaFS<D> {
             refmap_block: ref_index_block,
             refmap_leaves,
             free_blocks,
-            flags: 0,
+            flags: self.root_flags,
         };
         let slot = self.active_slot.other();
         crate::root::write_slot(&mut self.device, slot, &new_root)?;
@@ -3336,5 +3349,134 @@ impl<D: BlockDevice> UnaFS<D> {
             mtime: inode.mtime,
             atime: inode.atime,
         })
+    }
+}
+
+// =========================================================================
+// UNAFSGROW (rmbp-ledger B347): grow a volume in place to a larger block count.
+// =========================================================================
+
+/// What a grow did: the block counts before and after, and the free-block
+/// counts either side (the difference is the added blocks minus the refcount
+/// map's own growth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrowReport {
+    pub from: u64,
+    pub to: u64,
+    pub free_before: u64,
+    pub free_after: u64,
+}
+
+/// Mount the volume on `device` and grow it to `new_block_count` 4 KiB blocks
+/// ([`UnaFS::grow`]); returns the mounted, grown filesystem and the report.
+/// The one implementation behind `tools/unafs grow`, the kernel installer and
+/// `tests unafsgrow`.
+pub fn grow<D: BlockDevice>(
+    device: D,
+    new_block_count: u64,
+) -> Result<(UnaFS<D>, GrowReport), FileSystemError> {
+    let mut fs = UnaFS::mount(device)?;
+    let report = fs.grow(new_block_count)?;
+    Ok((fs, report))
+}
+
+impl<D: BlockDevice> UnaFS<D> {
+    /// GROW the volume to `new_block_count` blocks, in place, crash-safe.
+    ///
+    /// There is no bitmap and no inode table to extend under the CoW format:
+    /// allocation is the refcount map (its leaf count is a function of the
+    /// block count) and inodes hang from the inode map (sized by inode ids,
+    /// not by the volume). So the grow extends the map and rewrites block 0 —
+    /// NEW STRUCTURES FIRST, SUPERBLOCK LAST:
+    ///
+    /// 1. refuse a shrink, a size the map cannot address
+    ///    ([`Superblock::validate`]: past two map levels, or past one on a
+    ///    pre-v5 volume), and a device whose last block is not readable;
+    /// 2. extend the in-RAM map with the allocation ceiling at the OLD end;
+    /// 3. commit with [`ROOT_FLAG_GROW`](crate::root::ROOT_FLAG_GROW): the map
+    ///    for the new size lands in blocks below the old end, the root flips;
+    /// 4. rewrite block 0 with the new `block_count`, flush;
+    /// 5. lift the ceiling and commit again with the flag clear.
+    ///
+    /// A power cut before 3's flip leaves the old volume; between 3 and 4,
+    /// mount reads the volume at the old size (the flag admits the larger map)
+    /// and a re-run finishes the grow; after 4 the volume is the new size.
+    /// Growing to the current size is a no-op. Needs auto-commit on (no
+    /// transaction in flight).
+    pub fn grow(&mut self, new_block_count: u64) -> Result<GrowReport, FileSystemError> {
+        let from = self.superblock.block_count;
+        let free_before = self.refmap.free_blocks();
+        if new_block_count < from {
+            return Err(SuperblockError::Geometry("grow refuses a shrink").into());
+        }
+        if new_block_count == from {
+            return Ok(GrowReport { from, to: from, free_before, free_after: free_before });
+        }
+        if !self.autocommit || self.txn_blocks != 0 {
+            return Err(SuperblockError::Geometry("grow needs a committed volume (auto-commit on)").into());
+        }
+        let mut grown = self.superblock.clone();
+        grown.block_count = new_block_count;
+        grown.validate()?;
+        let sb_bytes = grown.to_bytes()?;
+        let dev_blocks = self.device.block_count();
+        if dev_blocks != 0 && dev_blocks < new_block_count {
+            return Err(SuperblockError::Geometry("grow past the end of the device").into());
+        }
+        // The device must reach the new last block (a short image file or a
+        // partition span that stops early is refused here, before any write).
+        let mut probe = alloc::vec![0u8; BLOCK_SIZE as usize];
+        self.device.read_block(new_block_count - 1, &mut probe)?;
+
+        // 2 + 3: the map for the new size, written below the old end.
+        self.refmap.try_grow(new_block_count, from)?;
+        self.root_flags = crate::root::ROOT_FLAG_GROW;
+        if let Err(e) = self.commit() {
+            self.root_flags = 0;
+            self.txn_unwind();
+            return Err(e);
+        }
+        // 4: the superblock, last.
+        let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
+        sb_block[..sb_bytes.len()].copy_from_slice(&sb_bytes);
+        let wrote = self
+            .device
+            .write_block(0, &sb_block)
+            .and_then(|_| self.device.flush());
+        if let Err(e) = wrote {
+            // On disk: the old superblock under a GROW root — mountable at the
+            // old size. Re-derive RAM from the disk the same way.
+            self.root_flags = 0;
+            self.txn_unwind();
+            return Err(e.into());
+        }
+        self.superblock = grown;
+        // 5: lift the ceiling, clear the flag.
+        self.refmap.set_limit(new_block_count);
+        self.root_flags = 0;
+        if let Err(e) = self.commit() {
+            self.txn_unwind();
+            return Err(e);
+        }
+        Ok(GrowReport {
+            from,
+            to: new_block_count,
+            free_before,
+            free_after: self.refmap.free_blocks(),
+        })
+    }
+
+    /// UNAFSGROW test seam: run a grow's steps 1–3 only (the GROW root flips,
+    /// block 0 is NOT rewritten) — exactly a power cut between the root flip
+    /// and the superblock write. The instance must be dropped afterwards.
+    #[doc(hidden)]
+    pub fn grow_interrupted_before_superblock(&mut self, new_block_count: u64) -> Result<(), FileSystemError> {
+        let from = self.superblock.block_count;
+        let mut grown = self.superblock.clone();
+        grown.block_count = new_block_count;
+        grown.validate()?;
+        self.refmap.try_grow(new_block_count, from)?;
+        self.root_flags = crate::root::ROOT_FLAG_GROW;
+        self.commit()
     }
 }

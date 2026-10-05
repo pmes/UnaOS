@@ -660,13 +660,13 @@ fn fourcc(guid: &[u8; 16]) -> [char; 4] {
 }
 
 fn print_census(idx: usize, addr: u8, c: &Census) {
-    serial_println!(
+    crate::census_println!(
         "[uvc] vc ctrl={} addr={} intf={} bcdUVC={:#06x} clock_hz={} vc_total_len={} in_collection={} iad first={} count={} sub={:#04x}",
         idx, addr, c.vc_intf, c.bcd_uvc, c.clock_hz, c.vc_total_len, c.in_collection,
         c.iad_first, c.iad_count, c.iad_subclass
     );
     if c.have_it {
-        serial_println!(
+        crate::census_println!(
             "[uvc] vc term=input id={} type={:#06x}{} ctrl_len={} ctrl={:#010x}",
             c.it_id, c.it_type,
             if c.it_type == ITT_CAMERA { " (camera)" } else { "" },
@@ -674,24 +674,24 @@ fn print_census(idx: usize, addr: u8, c: &Census) {
         );
     }
     if c.have_pu {
-        serial_println!(
+        crate::census_println!(
             "[uvc] vc unit=processing id={} src={} ctrl_len={} ctrl={:#010x}",
             c.pu_id, c.pu_src, c.pu_ctrl_len, c.pu_ctrl
         );
     }
     if c.have_ot {
-        serial_println!(
+        crate::census_println!(
             "[uvc] vc term=output id={} type={:#06x} src={}",
             c.ot_id, c.ot_type, c.ot_src
         );
     }
-    serial_println!(
+    crate::census_println!(
         "[uvc] vs intf={} ep={:#04x} terminal_link={} formats_declared={} formats_seen={}",
         c.vs_intf, c.vs_ep, c.vs_terminal_link, c.declared_formats, c.nfmt
     );
     for f in c.fmts[..c.nfmt].iter() {
         let cc = fourcc(&f.guid);
-        serial_println!(
+        crate::census_println!(
             "[uvc] vs fmt={} kind={} fourcc={}{}{}{} guid={:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} bpp={} default_frame={} frames={}/{}",
             f.index, kind_name(f.kind), cc[0], cc[1], cc[2], cc[3],
             f.guid[0], f.guid[1], f.guid[2], f.guid[3], f.guid[4], f.guid[5], f.guid[6], f.guid[7],
@@ -701,7 +701,7 @@ fn print_census(idx: usize, addr: u8, c: &Census) {
         for fr in f.frames[..f.nframes].iter() {
             // dwFrameInterval is in 100 ns units (Uncompressed payload §3.2): /10 is microseconds.
             if fr.interval_type == 0 {
-                serial_println!(
+                crate::census_println!(
                     "[uvc] frame fmt={} idx={} {}x{} default_us={} intervals=range min_us={} max_us={} step_us={}",
                     f.index, fr.index, fr.width, fr.height, fr.default_interval / 10,
                     fr.min_interval / 10, fr.max_interval / 10, fr.interval_step / 10
@@ -710,7 +710,7 @@ fn print_census(idx: usize, addr: u8, c: &Census) {
                 // A list, printed as a list — the census is evidence, not a summary. Up to
                 // MAX_INTERVALS of them; `n=` names the DECLARED count so a truncation shows.
                 let iv = &fr.intervals[..fr.n_intervals];
-                serial_println!(
+                crate::census_println!(
                     "[uvc] frame fmt={} idx={} {}x{} default_us={} intervals=list n={}/{} us=[{} {} {} {} {} {} {} {}]",
                     f.index, fr.index, fr.width, fr.height, fr.default_interval / 10,
                     fr.n_intervals, fr.interval_type,
@@ -727,13 +727,13 @@ fn print_census(idx: usize, addr: u8, c: &Census) {
         }
     }
     for a in c.alts[..c.nalt].iter() {
-        serial_println!(
+        crate::census_println!(
             "[uvc] alt={} ep=IN{} mps={} mult={} per_uframe={}",
             a.alt, a.ep, a.mps, a.mult, a.mps as u32 * a.mult as u32
         );
     }
     if c.ran_short || c.overflowed {
-        serial_println!(
+        crate::census_println!(
             "[uvc] census INCOMPLETE ran_short={} overflowed={} — the EP0 data buffer is 256 B (qh::Buf256) and a camera's configuration descriptor is routinely larger; the lines above are the wire truth for the WINDOW, not for the device",
             c.ran_short, c.overflowed
         );
@@ -1100,11 +1100,11 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
     // BEFORE the candidate gate on purpose: a boot with no camera on the bus is exactly the boot
     // where the parser is otherwise never exercised, and that is the boot this gate is for.
     if !SELFTEST_RUN.swap(true, Ordering::Relaxed) {
-        selftest();
+        if !crate::tests::defer("uvc", uvc_fixture) { selftest(); } // QUIETBOOT3 (B352, R80): a boot fixture — `tests uvc` fires it.
     }
 
     if !cfg_has_video_iad(cfg) {
-        serial_println!("[uvc] skip addr={} reason=no-video-iad", addr);
+        crate::bootlog_println!("[uvc] skip addr={} reason=no-video-iad", addr);
         return;
     }
 
@@ -1115,7 +1115,7 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
     // the device's own wTotalLength exceeded it, and NOTHING here pretends otherwise.
     let wtotal = if cfg.len() >= 4 { le16(cfg, 2) } else { 0 };
     let want = wtotal.min(256);
-    serial_println!(
+    crate::census_println!(
         "[uvc] candidate addr={} cfg_value={} wTotalLength={} reading={}{}",
         addr, config_value, wtotal, want,
         if wtotal > 256 { " (EP0 data buffer is 256 B — the tail of this descriptor is UNREAD)" } else { "" }
@@ -1144,7 +1144,7 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
     print_census(idx, addr, &c);
 
     if !c.have_vs {
-        serial_println!(
+        crate::bootlog_println!(
             "[uvc] probe skipped addr={} reason=no-videostreaming-interface-in-window read={} wTotalLength={}",
             addr, n, wtotal
         );
@@ -1166,7 +1166,7 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
             .find(|fr| fr.index == f.default_frame)
             .unwrap_or(&f.frames[0]);
         if fr.index != f.default_frame {
-            serial_println!(
+            crate::bootlog_println!(
                 "[uvc] note addr={} fmt={} bDefaultFrameIndex={} names no frame descriptor — falling back to idx={}",
                 addr, f.index, f.default_frame, fr.index
             );
@@ -1196,7 +1196,7 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
         );
         return;
     }
-    serial_println!("[uvc] configured addr={} cfg_value={} vs_intf={}", addr, config_value, c.vs_intf);
+    crate::bootlog_println!("[uvc] configured addr={} cfg_value={} vs_intf={}", addr, config_value, c.vs_intf);
 
     // GET_MIN / GET_MAX / GET_DEF, in that order (UVC 1.1 §4.3.1.1 — the negotiation reads the
     // bounds before it asks for anything). Each is ONE transfer; a stall is reported with its
@@ -1209,7 +1209,7 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
                 match parse_probe(b) {
                     Some(p) => {
                         blk_len = p.len;
-                        serial_println!(
+                        crate::census_println!(
                             "[uvc] probe stage={} req={:#04x} len={} bmHint={:#06x} bFormatIndex={} bFrameIndex={} dwFrameInterval={} dwMaxVideoFrameSize={} dwMaxPayloadTransferSize={}",
                             stage, req, p.len, p.hint, p.format_index, p.frame_index,
                             p.frame_interval, p.max_video_frame_size, p.max_payload_transfer_size
@@ -1242,7 +1242,7 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
     // the device's answer to the GET_CUR that follows is the whole product of this rung.
     let w = core::slice::from_raw_parts_mut(buf, blk_len);
     build_probe(w, fmt_i, frame_i, interval);
-    serial_println!(
+    crate::census_println!(
         "[uvc] probe stage=set req={:#04x} len={} asking bFormatIndex={} bFrameIndex={} dwFrameInterval={} ({} us)",
         RQ_SET_CUR, blk_len, fmt_i, frame_i, interval, interval / 10
     );
@@ -1297,4 +1297,9 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
     // kernel cannot then drain leaves the camera armed for a stream nobody reads, for the rest of
     // the boot, on the controller the keyboard is on.
     serial_println!("[uvc] commit=withheld reason=no-iso-pipe");
+}
+
+/// QUIETBOOT3 (rmbp-ledger B352, R80) — the parser self-test as a `tests uvc` fixture (the boot no longer runs it).
+fn uvc_fixture() {
+    let _ = selftest();
 }

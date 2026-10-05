@@ -1662,6 +1662,9 @@ FORBID \[hda\] amp .* fmt_match=0
 # --- KVBLANK (B179, UNAOS_KEPLER_VBLANK). The two self-test verdicts only (drivers/gpu/kepler_vblank.rs:
 # --- 1009, :1038); `GO-RED-FAILED` misses the second REQUIRE. The period values (`period_us=127022`,
 # --- then 38241 on a 60 Hz panel) are NOT pinned: they are the open finding, not a property.
+# --- KVBLANK9 (B341, R80): TESTS-RUN. The fixture left `beam::hold`; `tests kvblank` runs it, and this spec's build
+# --- carries UNAOS_TESTS_AT_BOOT=1 (header), which fires it at registration — so the two REQUIREs and the KVBLANK4
+# --- line below stay REQUIREs on the capture this spec scores. A quiet metal boot without that knob prints neither.
 REQUIRE :: kepler: vblank selftest arm=wait sim=timer .* :: PASS ::
 REQUIRE :: kepler: vblank selftest arm=wait sim=stuck .* :: GO-RED-OK ::
 # --- KVBLANK4 (B192's falsifier answered; R71): the ISR's ack re-arms the vblank bit on the same write, so a
@@ -1669,6 +1672,13 @@ REQUIRE :: kepler: vblank selftest arm=wait sim=stuck .* :: GO-RED-OK ::
 REQUIRE :: KVBLANK4: irq=\d+ vbl=62 ratio_pct=\d+ fixed_isr=rearm broken=1 rearm_written=00000001 vbwait_mode=poll -> PASS ::
 # KVBLANK5: the ISR books (isr_calls/acks/rearms/rearm_written/rearm_readback) print on the metal close + census lines only (QEMU has no Kepler); the fixture line carries rearm_written= so the field is pinned here.
 FORBID :: KVBLANK4: .* -> FAIL
+# --- KVBLANK9 M3 (B341): FIRST NEED. On a Kepler-takeover boot the compositor's first beam-held present arms rung 3
+# --- and says ONE line, irq on the 90 % delivery check or poll with the reason. OPTIONAL, not REQUIRE: a capture with
+# --- no GK107 head (iGPU path, QEMU) never needs the source. KVBLANK rungs 1-2 (`bdf-hunt`, `pmc-arm`, `vblank arm`,
+# --- `vblank-intr census`, `window open|close`) print only from `tests kvblank8` or `kvblank_trace`; no directive
+# --- here or in any spec REQUIREs them at boot.
+OPTIONAL \[wc-h\] vbl_src=(irq|poll) why=[a-z0-9-]+ irq=[0-9]+ vbl_delta=[0-9]+ ratio_pct=[0-9]+
+OPTIONAL :: KVBLANK8: rung3 armed_by=(compositor|test|trace) .* -> PASS ::
 #
 # --- THE NEGATIVE PINS THE FLIGHTS TAUGHT. `GATE STOLEN` and `REHOMED the render role` are already
 # --- FORBIDden above (SPECPINS, :1455/:1456), 0 hits on both flights; not repeated, a second copy

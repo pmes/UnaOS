@@ -82,7 +82,7 @@
 // -------------------------------------------------------------------------------------------------
 
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)] // RING3ABI2 (B333): was `forbid`; ONE `#[allow(unsafe_code)]` exists — `args()`, the ring-3 read of the fixed args page (target_os = "none" only, never on the host)
 // Every consumer imports a SUBSET. A shared ABI table whose unused half warns would push each caller
 // into `#[allow]`s or, worse, into re-declaring only what it needs — the thing this crate exists to
 // stop. The table is deliberately complete.
@@ -1197,3 +1197,417 @@ impl AppNote {
     }
 }
 const _: () = assert!(core::mem::size_of::<AppNote>() == 24);
+
+// SETTINGSBUS (rmbp-ledger B337) — Principia's ring-3 WRITE tag beside BANDY3's read pair. The kernel's
+// preference client (`prefs_client.rs`) offers every PREF_SET to whoever holds this tag (PREFS.ELF) before
+// the kernel fulfiller answers; body = the PREF_SET body (`<ns>.<key>` NUL `<TOML literal>`), reply empty
+// or an errno. Retires with the read pair when a ring-3 Principia takes 16..=19 over. Appended at the tail.
+pub const BUS_VERB_R3PREF_SET: u8 = 130;
+const _: () = assert!(BUS_VERB_R3PREF_SET >= BUS_VERB_FULFIL_MIN && BUS_VERB_R3PREF_SET != BUS_VERB_R3PREF_GET && BUS_VERB_R3PREF_SET != BUS_VERB_R3PREF_LIST);
+// SELFDIAG (rmbp-ledger B324, R82) — whole-path file I/O for ring 3, fulfilled by the kernel over the VFS
+// (the ATTRSURF pattern: one request buffer, the kernel resolves the path in the live namespace). The
+// diagnosis program (APPS/DIAG.ELF) reads the boot log, the owners table and the selfhost tree, and writes
+// its record and the patched tree. Under the kernel feature `selfdiag` (x86); off, the numbers fall to the
+// unknown-syscall default. Appended at the file tail so no existing line moves.
+//
+//   request  [path_len u16][flags u16][rsv u32 = 0][offset u64][path][data — WRITE only]
+//            path absolute, 1..=PATH_IO_PATH_MAX, no `..` component; data 0..=PATH_IO_MAX
+/// `SYS_PATH_READ(req_ptr, req_len, out_ptr, out_cap) -> bytes read / -errno` (0 = end of file). At most
+/// `PATH_IO_MAX` bytes per call from `offset`.
+pub const SYS_PATH_READ: u64 = 59;
+/// `SYS_PATH_WRITE(req_ptr, req_len) -> bytes written / -errno`. Writes `data` at `offset` (the file must
+/// exist and `offset <= size`), or with [`PATH_W_TRUNC`] creates-or-truncates first (offset must be 0).
+/// [`PATH_W_UNLINK`] removes the file (empty data). [`PATH_W_MKDIRS`] creates missing parent directories.
+pub const SYS_PATH_WRITE: u64 = 60;
+pub const PATH_W_TRUNC: u16 = 1 << 0;
+pub const PATH_W_MKDIRS: u16 = 1 << 1;
+pub const PATH_W_UNLINK: u16 = 1 << 2;
+/// Bytes of the request header.
+pub const PATH_IO_HDR_LEN: usize = 16;
+/// Path ceiling.
+pub const PATH_IO_PATH_MAX: usize = 255;
+/// Data ceiling per call (read or write).
+pub const PATH_IO_MAX: usize = 32 * 1024;
+const _: () = assert!(SYS_PATH_READ == SYS_SBRK + 1 && SYS_PATH_WRITE == SYS_PATH_READ + 1);
+// =================================================================================================
+// RING3ABI2 (rmbp-ledger B333) — the ring-3 surface's loose ends: argv/envp (the ARGS PAGE), who am I
+// (`SYS_WHOAMI`), and the aarch64 twin of the ELF window. Appended at the file tail; no line above moves.
+// Design: docs/dev/evidence/rmbp-1005/RING3ABI2.md.
+// =================================================================================================
+//
+// THE ARGS PAGE. Every address space a loader places carries one read-only page at a FIXED VA:
+// `USER_ARGS_VA` = (x86) `USER_BASE_X86 + USER_ARGS_OFF` — the last page of the slot's first 2 MiB,
+// above the FB hole and below the ELF window, the same VA in the fixed, flat and elf models — and
+// (aarch64) `USER_EXT_BASE_ARM + USER_ARGS_OFF`, the same offset in the slot's EXTENSION GiB (see
+// `USER_EXT_BASE_ARM`). The kernel writes it before the program's first instruction; ring 3 reads it
+// (it is never a legal syscall OUTPUT buffer; it IS a legal input, so `argv[i]` may be handed straight
+// to `SYS_OPEN`/`SYS_RESOLVE`). Layout, all little-endian, at most `USER_ARGS_BYTES`:
+//
+//     +0   u32  ARGS_MAGIC ("ARGS")
+//     +4   u32  argc (0..=ARGS_MAX; 0 = launched by a path that passes none, e.g. a kernel fixture)
+//     +8   u64  window_base — the classic window base VA (the FB landmarks hang off it: +0x4000 info
+//               page, +0x5000 surface slot 0). An elf-model program cannot derive it from `_start`.
+//     +16  u64  argv[0..argc] — ABSOLUTE ring-3 VAs of NUL-terminated strings inside this page
+//     ...  u64  0 (the argv terminator; envp is empty in v1 and follows as one more 0)
+//     ...  u8   the strings, NUL-joined, in argv order
+//
+// argv[0] is the word that named the program (`net`, or the path given to `run`/`bg`).
+
+/// `SYS_WHOAMI(buf, len) -> bytes written / -errno` — who the CALLER runs as: `[WhoAmIHdr][name][home]`
+/// (see [`whoami_build`]). `-ENOENT` no session (an anonymous program), `-ERANGE` a buffer shorter than
+/// the record, `-EFAULT` a bad buffer. Both arches dispatch it.
+pub const SYS_WHOAMI: u64 = 61; // merge12 fold: 59/60 are SELFDIAG's SYS_PATH_READ/WRITE; WHOAMI moved from 59
+/// Byte offset of the args page from the window base (x86) / the extension base (aarch64).
+pub const USER_ARGS_OFF: u64 = 0x1F_F000;
+/// The args page is one page.
+pub const USER_ARGS_BYTES: usize = 4096;
+/// The most argv words one launch passes.
+pub const ARGS_MAX: usize = 32;
+/// The args page's first word.
+pub const ARGS_MAGIC: u32 = u32::from_le_bytes(*b"ARGS");
+/// The fixed header before `argv[]`.
+pub const ARGS_HDR_LEN: usize = 16;
+/// aarch64: the EXTENSION base — L1 entry 481 of every slot's own TTBR0 table (1 GiB at 481 GiB). The
+/// classic aarch64 window has no fixed VA on the Pi (it is the identity PA of a kernel `.bss` anchor), so
+/// an image that LINKS at an absolute address needs a VA that is the same on every board and that no
+/// kernel mapping can reach: above every identity window (Pi RAM GiB 0..=3, Orin DRAM and PCIe below
+/// ~200 GiB, the Orin's own classic window at 480 GiB) and below the 512 GiB ceiling of the 39-bit
+/// TTBR0 VA (T0SZ = 25). Inside it the x86 offsets are reused verbatim: args page at +`USER_ARGS_OFF`,
+/// ELF window at +`USER_XWIN_OFF` for `USER_WINDOW_BYTES`.
+pub const USER_EXT_BASE_ARM: u64 = 481 << 30;
+/// aarch64: the ELF window's absolute VA — an elf-model aarch64 image links here.
+pub const USER_XWIN_VA_ARM: u64 = USER_EXT_BASE_ARM + USER_XWIN_OFF;
+/// x86_64: the args page VA.
+pub const USER_ARGS_VA_X86: u64 = USER_BASE_X86 + USER_ARGS_OFF;
+/// aarch64: the args page VA.
+pub const USER_ARGS_VA_ARM: u64 = USER_EXT_BASE_ARM + USER_ARGS_OFF;
+/// The args page VA on the arch this crate is built for.
+#[cfg(target_arch = "aarch64")]
+pub const USER_ARGS_VA: u64 = USER_ARGS_VA_ARM;
+#[cfg(not(target_arch = "aarch64"))]
+pub const USER_ARGS_VA: u64 = USER_ARGS_VA_X86;
+/// The ELF window VA on the arch this crate is built for.
+#[cfg(target_arch = "aarch64")]
+pub const USER_XWIN_VA: u64 = USER_XWIN_VA_ARM;
+#[cfg(not(target_arch = "aarch64"))]
+pub const USER_XWIN_VA: u64 = USER_XWIN_VA_X86;
+
+const _: () = assert!(USER_ARGS_OFF + USER_ARGS_BYTES as u64 <= USER_XWIN_OFF); // below the ELF window
+const _: () = assert!(USER_ARGS_OFF >= USER_FIXED_WINDOW_BYTES + 0x14_5000); // above the FB hole
+const _: () = assert!(USER_EXT_BASE_ARM % (1 << 30) == 0 && (USER_EXT_BASE_ARM >> 30) < 512);
+const _: () = assert!(ARGS_HDR_LEN + (ARGS_MAX + 2) * 8 < USER_ARGS_BYTES);
+const _: () = assert!(SYS_WHOAMI == SYS_SBRK + 3);
+
+/// Lay out the args page for `words` into `out` (>= `USER_ARGS_BYTES`, zeroed by the caller or not —
+/// every byte up to the returned length is written, the rest is zeroed). `page_va` is the VA the page
+/// is mapped at in ring 3 (the argv pointers are absolute). `None` = more than `ARGS_MAX` words or the
+/// strings do not fit; the kernel then refuses the launch rather than truncate a command line.
+pub fn args_build(page_va: u64, window_base: u64, words: &[&str], out: &mut [u8]) -> Option<usize> {
+    if words.len() > ARGS_MAX || out.len() < USER_ARGS_BYTES {
+        return None;
+    }
+    let out = &mut out[..USER_ARGS_BYTES];
+    for b in out.iter_mut() {
+        *b = 0;
+    }
+    out[0..4].copy_from_slice(&ARGS_MAGIC.to_le_bytes());
+    out[4..8].copy_from_slice(&(words.len() as u32).to_le_bytes());
+    out[8..16].copy_from_slice(&window_base.to_le_bytes());
+    let mut s = ARGS_HDR_LEN + (words.len() + 2) * 8; // argv[], its 0, envp's 0
+    for (i, w) in words.iter().enumerate() {
+        let b = w.as_bytes();
+        if b.contains(&0) {
+            return None;
+        }
+        let end = s.checked_add(b.len())?.checked_add(1)?;
+        if end > USER_ARGS_BYTES {
+            return None;
+        }
+        let p = ARGS_HDR_LEN + i * 8;
+        out[p..p + 8].copy_from_slice(&(page_va + s as u64).to_le_bytes());
+        out[s..s + b.len()].copy_from_slice(b);
+        s = end; // the NUL is already there
+    }
+    Some(s)
+}
+
+/// A parsed args page. Every read is bounds-checked against the page, so a corrupt page is `None`, never
+/// a fault.
+#[derive(Clone, Copy)]
+pub struct Args<'a> {
+    page: &'a [u8],
+    va: u64,
+}
+
+impl<'a> Args<'a> {
+    /// Parse `page` (the args page's bytes) mapped at `va`. `None` if the magic or the count is wrong.
+    pub fn parse(page: &'a [u8], va: u64) -> Option<Self> {
+        if page.len() < ARGS_HDR_LEN || page[0..4] != ARGS_MAGIC.to_le_bytes() {
+            return None;
+        }
+        let a = Args { page, va };
+        if a.argc() > ARGS_MAX {
+            return None;
+        }
+        Some(a)
+    }
+    fn u64_at(&self, o: usize) -> Option<u64> {
+        let s = self.page.get(o..o + 8)?;
+        Some(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+    }
+    /// The word count.
+    pub fn argc(&self) -> usize {
+        u32::from_le_bytes([self.page[4], self.page[5], self.page[6], self.page[7]]) as usize
+    }
+    /// The classic window base (the FB landmarks' anchor).
+    pub fn window_base(&self) -> u64 {
+        self.u64_at(8).unwrap_or(0)
+    }
+    /// Word `i` (without its NUL), or `None` past `argc` or for a pointer outside the page.
+    pub fn get(&self, i: usize) -> Option<&'a [u8]> {
+        if i >= self.argc().min(ARGS_MAX) {
+            return None;
+        }
+        let p = self.u64_at(ARGS_HDR_LEN + i * 8)?;
+        let off = p.checked_sub(self.va)? as usize;
+        let tail = self.page.get(off..)?;
+        let n = tail.iter().position(|&c| c == 0)?;
+        Some(&tail[..n])
+    }
+    /// The ring-3 VA of word `i` (to hand a syscall the string in place).
+    pub fn ptr(&self, i: usize) -> Option<u64> {
+        self.get(i)?;
+        self.u64_at(ARGS_HDR_LEN + i * 8)
+    }
+}
+
+/// RING 3 ONLY: this program's args page, read in place at [`USER_ARGS_VA`]. `None` when the page does
+/// not carry the magic (a loader that did not place one).
+///
+/// The ONE unsafe item in this crate. It is sound under the loader contract above: every address space
+/// a UnaOS loader places maps `USER_ARGS_BYTES` readable bytes at `USER_ARGS_VA`, read-only to ring 3
+/// and written only before the program's first instruction, so a `'static` shared slice over it is never
+/// aliased by a writer. Compiled only for `target_os = "none"` (the ring-3 and kernel targets); the host
+/// build of this crate has no such page and no such function.
+#[cfg(target_os = "none")]
+#[allow(unsafe_code)]
+pub fn args() -> Option<Args<'static>> {
+    // SAFETY: see the doc above — a mapped, read-only, never-rewritten page for the program's lifetime.
+    let page: &'static [u8] = unsafe { core::slice::from_raw_parts(USER_ARGS_VA as *const u8, USER_ARGS_BYTES) };
+    Args::parse(page, USER_ARGS_VA)
+}
+
+/// The `SYS_WHOAMI` record header: uid, gid (UnaOS has no group store; a user's group is its own uid),
+/// and the two lengths that follow it (`name` then `home`, no NULs).
+pub const WHOAMI_HDR_LEN: usize = 16;
+/// The longest record `SYS_WHOAMI` writes (a 255-byte name and a 255-byte home).
+pub const WHOAMI_MAX: usize = WHOAMI_HDR_LEN + 255 + 255;
+
+/// Encode a `SYS_WHOAMI` answer: `[uid u32][gid u32][name_len u16][home_len u16][rsvd u32][name][home]`.
+pub fn whoami_build(uid: u32, gid: u32, name: &[u8], home: &[u8], out: &mut [u8]) -> Option<usize> {
+    if name.len() > 255 || home.len() > 255 {
+        return None;
+    }
+    let n = WHOAMI_HDR_LEN + name.len() + home.len();
+    let o = out.get_mut(..n)?;
+    o[0..4].copy_from_slice(&uid.to_le_bytes());
+    o[4..8].copy_from_slice(&gid.to_le_bytes());
+    o[8..10].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    o[10..12].copy_from_slice(&(home.len() as u16).to_le_bytes());
+    o[12..16].copy_from_slice(&[0; 4]);
+    o[16..16 + name.len()].copy_from_slice(name);
+    o[16 + name.len()..n].copy_from_slice(home);
+    Some(n)
+}
+
+/// A decoded `SYS_WHOAMI` answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WhoAmI<'a> {
+    pub uid: u32,
+    pub gid: u32,
+    pub name: &'a [u8],
+    pub home: &'a [u8],
+}
+
+/// Decode the bytes `SYS_WHOAMI` wrote.
+pub fn whoami_parse(b: &[u8]) -> Option<WhoAmI<'_>> {
+    let h = b.get(..WHOAMI_HDR_LEN)?;
+    let uid = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+    let gid = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+    let nl = u16::from_le_bytes([h[8], h[9]]) as usize;
+    let hl = u16::from_le_bytes([h[10], h[11]]) as usize;
+    let name = b.get(WHOAMI_HDR_LEN..WHOAMI_HDR_LEN + nl)?;
+    let home = b.get(WHOAMI_HDR_LEN + nl..WHOAMI_HDR_LEN + nl + hl)?;
+    Some(WhoAmI { uid, gid, name, home })
+}
+
+#[cfg(test)]
+mod ring3abi2_tests {
+    extern crate std;
+    use super::*;
+    #[test]
+    fn args_page_roundtrip_and_refusals() {
+        let mut page = [0xAAu8; USER_ARGS_BYTES];
+        let n = args_build(USER_ARGS_VA_X86, USER_BASE_X86, &["net", "example.com"], &mut page).unwrap();
+        assert!(n < 128);
+        let a = Args::parse(&page, USER_ARGS_VA_X86).unwrap();
+        assert_eq!(a.argc(), 2);
+        assert_eq!(a.window_base(), USER_BASE_X86);
+        assert_eq!(a.get(0), Some(b"net".as_slice()));
+        assert_eq!(a.get(1), Some(b"example.com".as_slice()));
+        assert_eq!(a.get(2), None);
+        let p1 = a.ptr(1).unwrap();
+        assert!(p1 > USER_ARGS_VA_X86 && p1 < USER_ARGS_VA_X86 + USER_ARGS_BYTES as u64);
+        // argv terminator and the empty envp
+        assert_eq!(&page[ARGS_HDR_LEN + 16..ARGS_HDR_LEN + 32], &[0u8; 16]);
+        // zero words still carries the header (the window base)
+        args_build(USER_ARGS_VA_ARM, 0x4020_0000, &[], &mut page).unwrap();
+        let a = Args::parse(&page, USER_ARGS_VA_ARM).unwrap();
+        assert_eq!((a.argc(), a.window_base()), (0, 0x4020_0000));
+        // refusals: too many words, a word with a NUL, strings past the page, a bad magic
+        let many = ["x"; ARGS_MAX + 1];
+        assert!(args_build(USER_ARGS_VA_X86, 0, &many, &mut page).is_none());
+        assert!(args_build(USER_ARGS_VA_X86, 0, &["a\0b"], &mut page).is_none());
+        let big = std::string::String::from_utf8(std::vec![b'z'; 4000]).unwrap();
+        assert!(args_build(USER_ARGS_VA_X86, 0, &[big.as_str(), big.as_str()], &mut page).is_none());
+        let mut bad = page;
+        bad[0] = 0;
+        assert!(Args::parse(&bad, USER_ARGS_VA_X86).is_none());
+        // a pointer outside the page is None, never a panic
+        let mut evil = [0u8; USER_ARGS_BYTES];
+        args_build(USER_ARGS_VA_X86, 0, &["a"], &mut evil).unwrap();
+        evil[16..24].copy_from_slice(&(USER_ARGS_VA_X86 + 0x10_000).to_le_bytes());
+        assert_eq!(Args::parse(&evil, USER_ARGS_VA_X86).unwrap().get(0), None);
+        std::println!(":: RING3ABI2-ABI: args_va_x86={:#x} args_va_arm={:#x} xwin_arm={:#x} whoami={} -> PASS ::", USER_ARGS_VA_X86, USER_ARGS_VA_ARM, USER_XWIN_VA_ARM, SYS_WHOAMI);
+    }
+    #[test]
+    fn whoami_roundtrip() {
+        let mut b = [0u8; WHOAMI_MAX];
+        let n = whoami_build(7, 7, b"peter", b"/home/peter", &mut b).unwrap();
+        let w = whoami_parse(&b[..n]).unwrap();
+        assert_eq!(w, WhoAmI { uid: 7, gid: 7, name: b"peter", home: b"/home/peter" });
+        assert!(whoami_build(1, 1, b"x", b"/home/x", &mut [0u8; 8]).is_none());
+        assert!(whoami_parse(&b[..n - 1]).is_none());
+    }
+}
+// VEINTLS (LEDGER SR36) — wall-clock time for ring 3. A TLS client checks every certificate's validity
+// window against NOW (RFC 5280 §6.1.3 (a)(2)), and ring 3 had only SYS_GETINFO's boot-relative ticks.
+// `SYS_TIME() -> UTC Unix seconds (>= 0) / -EAGAIN` — the kernel's civil clock (`clock::unix_now`: the
+// RTC or SNTP anchor plus the monotonic counter since). -EAGAIN while the clock has never been anchored
+// this boot: a caller that needs the time (certificate checks) must refuse rather than guess.
+// merge12 fold: 59/60 are SELFDIAG's path verbs, 61 WHOAMI, 62 PROF; this verb is 63.
+/// `SYS_TIME() -> unix seconds / -EAGAIN` (VEINTLS, SR36). Both arches, unconditional.
+pub const SYS_TIME: u64 = 63; // merge12 fold: 59/60 SELFDIAG, 61 WHOAMI, 62 PROF (PROFILE2), 63 TIME
+const _: () = assert!(SYS_TIME == SYS_SBRK + 5);
+// =================================================================================================
+// PROFILE2 (rmbp-ledger B340, M5) — `SYS_PROF`: a program profiles itself. The kernel's sampler (the
+// `prof` verb's rings) is shared: `OP_START` arms it at the tick rate when idle (the caller then owns the
+// run), `OP_STOP` disarms a run the caller owns, `OP_READ` copies the caller's OWN samples (its tid, or
+// its program id) into `buf` as `Sample` records — a bounded copy, at most `READ_MAX` records and never
+// more than `len` bytes — and `OP_STATUS` returns how many the caller has. 62 sits clear of the numbers
+// other arcs of this wave hold (59..61).
+// =================================================================================================
+
+/// `SYS_PROF(op, buf, len) -> i64` — see [`prof`].
+pub const SYS_PROF: u64 = 62;
+
+/// The `SYS_PROF` vocabulary.
+pub mod prof {
+    /// Arm the sampler at the tick rate if idle; returns the armed rate in Hz.
+    pub const OP_START: u64 = 0;
+    /// Disarm a run the caller armed; returns 0, or 1 when the run is not the caller's (left armed).
+    pub const OP_STOP: u64 = 1;
+    /// Copy the caller's own samples into `buf` (at most `len / SAMPLE_BYTES`, at most `READ_MAX`);
+    /// returns the record count, or -14 (`EFAULT`) for a buffer the kernel could not write.
+    pub const OP_READ: u64 = 2;
+    /// The caller's sample count in the current (or last) run.
+    pub const OP_STATUS: u64 = 3;
+    /// Records one `OP_READ` copies at most.
+    pub const READ_MAX: usize = 512;
+    /// Bytes of one [`Sample`] on the wire.
+    pub const SAMPLE_BYTES: usize = 24;
+
+    /// One sample: the interrupted PC, the first caller the kernel's frame walk found (0 when none —
+    /// ring-3 samples are not walked), the task, its ring (0 or 3), CPU, walk depth and program id.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Sample {
+        pub rip: u64,
+        pub caller: u64,
+        pub tid: u32,
+        pub ring: u8,
+        pub cpu: u8,
+        pub depth: u8,
+        pub prog: u8,
+    }
+
+    impl Sample {
+        /// The little-endian wire form (`SAMPLE_BYTES`). `const fn`: this crate contributes no code.
+        pub const fn to_bytes(&self) -> [u8; SAMPLE_BYTES] {
+            let mut b = [0u8; SAMPLE_BYTES];
+            let (r, c, t) = (self.rip.to_le_bytes(), self.caller.to_le_bytes(), self.tid.to_le_bytes());
+            let mut i = 0;
+            while i < 8 {
+                b[i] = r[i];
+                b[8 + i] = c[i];
+                if i < 4 {
+                    b[16 + i] = t[i];
+                }
+                i += 1;
+            }
+            b[20] = self.ring;
+            b[21] = self.cpu;
+            b[22] = self.depth;
+            b[23] = self.prog;
+            b
+        }
+
+        /// Decode one record (`None` for a short slice).
+        pub const fn from_bytes(b: &[u8]) -> Option<Self> {
+            if b.len() < SAMPLE_BYTES {
+                return None;
+            }
+            Some(Self {
+                rip: u64::from_le_bytes(le8(b, 0)),
+                caller: u64::from_le_bytes(le8(b, 8)),
+                tid: u32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+                ring: b[20],
+                cpu: b[21],
+                depth: b[22],
+                prog: b[23],
+            })
+        }
+    }
+
+    const fn le8(b: &[u8], o: usize) -> [u8; 8] {
+        [b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7]]
+    }
+
+    const _: () = assert!(core::mem::size_of::<Sample>() == SAMPLE_BYTES);
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn sample_round_trips() {
+            let s = Sample { rip: 0x1000_0020_0040, caller: 0xffff_8000_0000_1234, tid: 77, ring: 3, cpu: 5, depth: 0, prog: 2 };
+            assert_eq!(Sample::from_bytes(&s.to_bytes()), Some(s));
+            assert_eq!(Sample::from_bytes(&[0u8; SAMPLE_BYTES - 1]), None);
+        }
+    }
+}
+// LUMENUX (rmbp-ledger B348) — the ring-3 CLIPBOARD, the two verbs `video/clipboard.rs` named and did not build.
+// Over the kernel's one session-owned text buffer (`video::clipboard::set`/`get`): text only (printable ASCII,
+// `\n`, `\t`), at most [`CLIP_CAP`] bytes, refused rather than truncated. OWNERSHIP (the question clipboard.rs
+// left open): only the program holding KEYBOARD FOCUS may set or read it (`-EACCES` otherwise), so a background
+// program can neither overwrite nor read what the operator copied. 59..=62 are taken on exec-rmbp-merge12
+// (SELFDIAG's SYS_PATH_READ/WRITE, RING3ABI2's SYS_WHOAMI, PROFILE2's SYS_PROF, VEINTLS's SYS_TIME is 63), hence 64/65. x86 dispatches
+// them; elsewhere they fall to the unknown-syscall default. Appended at the file tail so no existing line moves.
+/// `SYS_CLIP_SET(ptr, len) -> len / -errno` — replace the clipboard. `-EINVAL` a non-text byte or
+/// `len > CLIP_CAP`, `-EACCES` not the focused program, `-EFAULT` a bad buffer. `len == 0` clears it.
+pub const SYS_CLIP_SET: u64 = 64; // merge12 fold: 63 is VEINTLS's SYS_TIME
+/// `SYS_CLIP_GET(ptr, cap) -> len / -errno` — copy the clipboard out. `-ERANGE` when `cap` is shorter than
+/// the content (nothing is copied: ask again with `CLIP_CAP`), `-EACCES` not the focused program.
+pub const SYS_CLIP_GET: u64 = 65;
+/// The clipboard's capacity (the kernel's `video::clipboard::CLIP_CAP`; `tests lumen` asserts they agree).
+pub const CLIP_CAP: usize = 4096;

@@ -190,6 +190,33 @@ impl MemDevice {
     pub fn new() -> Self {
         Self { data: Vec::new() }
     }
+
+    /// UNAFSGROW: a zero-filled device of exactly `blocks` blocks (so
+    /// `block_count` reports the full span, not the high-water mark).
+    pub fn with_blocks(blocks: u64) -> Self {
+        Self { data: alloc::vec![0u8; (blocks * BLOCK_SIZE) as usize] }
+    }
+
+    /// UNAFSGROW: a device over an existing image (`bytes.len()` should be a
+    /// whole number of blocks; a partial tail block is unreadable).
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { data: bytes }
+    }
+
+    /// UNAFSGROW: extend (zero-fill) or truncate the device to `blocks`.
+    pub fn resize_blocks(&mut self, blocks: u64) {
+        self.data.resize((blocks * BLOCK_SIZE) as usize, 0);
+    }
+
+    /// The image bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The image bytes, by value.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.data
+    }
 }
 
 impl BlockDevice for MemDevice {

@@ -570,7 +570,7 @@ fn u32le(b: &[u8], off: usize) -> u32 {
 }
 
 #[inline]
-fn u64le(b: &[u8], off: usize) -> u64 {
+#[allow(dead_code)] fn u64le(b: &[u8], off: usize) -> u64 {
     (u32le(b, off) as u64) | ((u32le(b, off + 4) as u64) << 32)
 }
 
@@ -2055,58 +2055,58 @@ fn gpt_volume_spans(dev_blocks: u64, source: BlockSource) -> alloc::vec::Vec<(u6
     if dev_blocks < 3 {
         return out;
     }
-    let mut hdr = [0u8; SECTOR_SIZE];
-    if read_sector(source, 1, &mut hdr).is_err() {
-        return out;
-    }
-    if &hdr[0..8] != b"EFI PART" {
-        return out;
-    }
-    let entries_lba = u64le(&hdr, 72);
-    let num_entries = u32le(&hdr, 80);
-    let entry_size = u32le(&hdr, 84);
-    if !(entry_size == 128 || entry_size == 256) || entries_lba == 0 || entries_lba >= dev_blocks {
-        return out;
-    }
-    let num = num_entries.min(128); // bound the scan regardless of a corrupt count
-    let per_sec = SECTOR_SIZE as u32 / entry_size; // 4 or 2 — exact, no straddle
-    let mut buf = [0u8; SECTOR_SIZE];
-    let mut cur_sec = u64::MAX;
-    for i in 0..num {
-        let sec = entries_lba + (i / per_sec) as u64;
-        if sec >= dev_blocks {
-            break;
-        }
-        if sec != cur_sec {
-            if read_sector(source, sec, &mut buf).is_err() {
-                break;
+    // AHCIROOT (rmbp-ledger B332): THE reader is amber_core's (`gpt::read_table_with`) — header CRC and
+    // bounds, array CRC, every in-use entry inside the usable range — the same function the installer,
+    // the AHCI census and the host tools ask. A table that does not validate yields NO spans; before
+    // this the walk trusted an unchecked header and bounded a corrupt count at 128 by hand. Sectors are
+    // read one at a time through this file's own `read_sector`, so the source routing is unchanged.
+    let table = amber_core::gpt::read_table_with(dev_blocks, |lba, buf: &mut [u8]| {
+        let mut s = [0u8; SECTOR_SIZE];
+        for (i, chunk) in buf.chunks_mut(SECTOR_SIZE).enumerate() {
+            if read_sector(source, lba + i as u64, &mut s).is_err() {
+                return false;
             }
-            cur_sec = sec;
+            chunk.copy_from_slice(&s[..chunk.len()]);
         }
-        let off = ((i % per_sec) * entry_size) as usize;
-        // Unused entry: all-zero partition type GUID.
-        if buf[off..off + 16].iter().all(|&b| b == 0) {
-            continue;
-        }
-        let first_lba = u64le(&buf, off + 32);
-        if first_lba == 0 || first_lba >= dev_blocks {
-            continue;
-        }
+        true
+    });
+    let Ok(table) = table else { return out };
+    for (_slot, e) in table.entries.iter().take(128) {
         // PARTITION (GR9): `last_lba` is INCLUSIVE in the UEFI entry format, so the length is
-        // `last - first + 1`. Every step is checked: a reversed pair, an overflowing sum, or an
-        // extent past the medium drops the entry.
-        let last_lba = u64le(&buf, off + 40);
-        if last_lba < first_lba {
+        // `last - first + 1`. A reversed pair or an extent past the medium drops the entry, never a clamp.
+        let (first_lba, last_lba) = (e.first_lba, e.last_lba);
+        if first_lba == 0 || last_lba < first_lba {
             continue;
         }
-        let Some(sectors) = last_lba.checked_sub(first_lba).and_then(|d| d.checked_add(1)) else {
-            continue;
-        };
+        let sectors = last_lba - first_lba + 1;
         match first_lba.checked_add(sectors) {
             Some(end) if end <= dev_blocks => out.push((first_lba, sectors)),
             _ => continue,
         }
     }
+    // (AHCIROOT: line-count-neutral rewrite — fat.rs is a line-sensitive file; this padding keeps every
+    //  line below this function where it was.)
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
+    //
     out
 }
 
@@ -6924,7 +6924,7 @@ pub fn flush_pending_dirent_by(by: &str) {
     let had = PEND_VALID.load(Ordering::Acquire);
     pend_write_locked();
     PEND_LOCK.store(false, Ordering::Release);
-    if had { serial_println!("[fs] dirent flushed by={}", by); }
+    if had { crate::bootlog_println!("[fs] dirent flushed by={}", by); }
 }
 
 /// `flush_pending_dirent_by("close")` — for a writer that has produced its last span.

@@ -1860,7 +1860,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
     {
         let (r, src) = crate::drivers::gpu::kepler_vblank::vbl_isr_rate();
-        serial_println!("[wc-h] vbl win={} vbl_isr={} vbl_src={}", id, r, src);
+        crate::census_println!("[wc-h] vbl win={} vbl_isr={} vbl_src={}", id, r, src);
     }
     // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the time this
     // instrument occupies the composite path and not merely the gap between line starts. All three
@@ -2200,7 +2200,7 @@ pub fn erase_note(
         E_TAKEN.store(E_SAMPLES + 1, Ordering::Relaxed);
         return;
     }
-    serial_println!(
+    crate::census_println!(
         // `runs=` is the box's row count (the OWED extent, exact on aarch64 where no clip exists);
         // `spans=` is the number of `blit` calls actually issued — on x86 an occlusion-clipped fill
         // fragments rows, so `spans > runs` is the fragmentation tell. WCK4-D2: the two fields keep
@@ -4123,7 +4123,7 @@ pub fn end(
     // two snapshot box-counts, because both arches now withhold the pixels behind them.
     let occ_note = OccNote { occluded, n0: occ_before.count(), n1: occ_after.count() };
 
-    serial_println!(
+    crate::census_println!(
         // WC-G/M3 — `coverage=` is an INSERTION between `fbbad=` and `us=`, which is what the pi4
         // gate's `\[wc-g\] win=.* fbbad=.* slow=.* ->` permits: nothing renamed, nothing reordered,
         // the terminal still terminal. It is the empty string on every build but an x86 `wcg-paygo`

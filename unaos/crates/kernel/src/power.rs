@@ -56,7 +56,7 @@
 /// platform resets, or the failure witness prints and the core parks in `hlt_loop`.
 pub fn reboot() -> ! {
     crate::bootlog_println!("[pwrreboot] reboot verb invoked — dispatching the platform mechanism");
-    prelude("reboot"); // POWERMENU M1
+    prelude("reboot"); #[cfg(feature = "selfdiag")] crate::bootwit::flush("reboot"); // POWERMENU M1. SELFDIAG M1 (B324): the boot log reaches the disk before the reset
     crate::fs::fat::flush_pending_dirent_by("shutdown"); // SDHCMULTI2 M2: a deferred dir entry must not die with the power
     platform_reboot()
 }
@@ -66,7 +66,7 @@ pub fn reboot() -> ! {
 /// platform cuts power, or the failure witness prints and the core parks in `hlt_loop`.
 pub fn shutdown() -> ! {
     serial_println!("[pwrshutoff] shutdown verb invoked — dispatching the platform mechanism");
-    prelude("shutdown"); // POWERMENU M1
+    prelude("shutdown"); #[cfg(feature = "selfdiag")] crate::bootwit::flush("shutdown"); // POWERMENU M1. SELFDIAG M1 (B324): the boot log reaches the disk before S5
     #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
     crate::drivers::gpu::kepler_vblank::shutdown_census(); // KVBLANK6 — the kept-live vector's last census
     crate::fs::fat::flush_pending_dirent_by("shutdown"); // SDHCMULTI2 M2

@@ -28,9 +28,17 @@ codegen-units = 1
 
 # una-abi: the syscall numbers, the INPUT_EV_* layout, the window landmarks (zero bytes).
 # font8x8: the glyph table — the SAME crate the kernel links; only `legacy::BASIC_LEGACY` (1 KiB) is used.
-# vein_core / vein_ring3: Vein, linked as a library (the R82 shape).
+# vein_core / vein_ring3: Vein, linked as a library (the R82 shape); TLS is UnaOS's tls_core over crypto_core.
 [dependencies]
 una-abi = { path = "../una-abi" }
 font8x8 = { version = "0.3.1", default-features = false }
 vein_core = { path = "../../libs/sys/vein_core", default-features = false }
 vein_ring3 = { path = "../../libs/sys/vein_ring3" }
+
+# VEINTLS (SR36): `cryptocore` = CRYPTOCORE's provider under tls_core. The MEDIA build (arroyo's
+# build_user_lumen_x86) passes `--features cryptocore`; until CRYPTOCORE's fold file is on the branch that build
+# stops at tls_core's cryptocore_provider.rs with the list of what is missing. `./arroyo check` type-checks the
+# crate without it (everything but the provider), and an image built without it runs Echo with
+# `crypto=built without feature cryptocore` in its start line — never an unverified connection.
+[features]
+cryptocore = ["vein_ring3/cryptocore"]

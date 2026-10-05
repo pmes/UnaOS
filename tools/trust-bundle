@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# tools/trust-bundle — fetch the Mozilla CA bundle and stage it as system/trust/roots.pem (TLSCORE, SR28).
+#
+#   tools/trust-bundle            fetch https://curl.se/ca/cacert.pem (curl's extraction of Mozilla's certdata.txt)
+#   tools/trust-bundle --from F   use a local file or URL instead (e.g. an air-gapped copy)
+#
+# Writes, relative to the repo root:
+#   system/trust/roots.pem          the bundle, verbatim
+#   system/trust/roots.pem.sha256   "<sha256>  roots.pem"
+#   system/trust/SOURCE             where it came from, when, its sha256, and the bundle's own date line
+#
+# If curl.se is unreachable it tries the same Mozilla bundle as packaged by certifi on PyPI (recorded in SOURCE as
+# such) — never a distro store, which may carry local additions.
+#
+# The builder stages it (VEINTLS, SR36: unaos/builder/src/main.rs `stage_trust`) onto the ESP and the x86 DATA
+# volume as system/trust/roots.pem, after checking its sha256 against roots.pem.sha256 with crypto_core's
+# SHA-256 (a mismatch stops the build; an absent bundle is reported and nothing is staged). Ring 3 loads it with
+# vein_ring3::trust::load (SYS_OPEN /system/trust/roots.pem) -> tls_core::x509::TrustStore::from_pem.
+# Run before `./arroyo esp-x86`:   tools/trust-bundle   (re-run when the Mozilla bundle moves; commit the new pin)
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT="$ROOT/system/trust"
+SRC_URL="https://curl.se/ca/cacert.pem"
+FROM=""
+if [[ "${1:-}" == "--from" ]]; then FROM="${2:?--from needs a file or URL}"; fi
+mkdir -p "$OUT"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+
+fetch() { curl -sSfL --max-time 60 -o "$TMP" "$1"; }
+SOURCE=""
+if [[ -n "$FROM" ]]; then
+  if [[ -f "$FROM" ]]; then cp "$FROM" "$TMP"; else fetch "$FROM"; fi
+  SOURCE="$FROM"
+elif fetch "$SRC_URL"; then
+  SOURCE="$SRC_URL"
+else
+  echo "trust-bundle: $SRC_URL unreachable; trying certifi (Mozilla bundle repackaged) from PyPI" >&2
+  META="$(curl -sSf --max-time 30 https://pypi.org/pypi/certifi/json)"
+  WHEEL="$(printf '%s' "$META" | python3 -c 'import json,sys; d=json.load(sys.stdin); print([u["url"] for u in d["urls"] if u["filename"].endswith(".whl")][0])')"
+  VER="$(printf '%s' "$META" | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])')"
+  W="$(mktemp)"
+  curl -sSf --max-time 60 -o "$W" "$WHEEL"
+  python3 - "$W" "$TMP" <<'PY'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+open(sys.argv[2], "wb").write(z.read("certifi/cacert.pem"))
+PY
+  rm -f "$W"
+  SOURCE="certifi $VER ($WHEEL) — Mozilla bundle; curl.se was unreachable"
+fi
+
+N="$(grep -c 'BEGIN CERTIFICATE' "$TMP" || true)"
+if [[ "$N" -lt 100 ]]; then echo "trust-bundle: only $N certificates — refusing" >&2; exit 1; fi
+cp "$TMP" "$OUT/roots.pem" && chmod 644 "$OUT/roots.pem"
+SUM="$(sha256sum "$OUT/roots.pem" | cut -d' ' -f1)"
+echo "$SUM  roots.pem" > "$OUT/roots.pem.sha256"
+{
+  echo "source:  $SOURCE"
+  echo "fetched: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "sha256:  $SUM"
+  echo "certs:   $N"
+  grep -m1 -i 'Certificate data from Mozilla as of' "$OUT/roots.pem" | sed 's/^## */bundle:  /' || true
+} > "$OUT/SOURCE"
+cat "$OUT/SOURCE"

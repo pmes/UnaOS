@@ -7710,7 +7710,7 @@ fn wcdvalve_closed() -> bool {
             0
         };
         if WCDVALVE_READ_EPOCH.swap(epoch, Relaxed) != epoch {
-            serial_println!(
+            crate::census_println!(
                 "[wc-d] valve READ util~{}% wcd~{} span={}ms close_at=util{}%/wcd{}% state={} dwell_ms={}/{}",
                 util,
                 // WCDVALVE-LOOP — `?`, not `0%`, while CLOSED. See [`WcdRead`].
@@ -10374,7 +10374,7 @@ fn wcser_emit(scope: &str, span: u64) {
     } else {
         crate::arch::ms().saturating_sub(COMP_HOLD_T0_MS.load(Relaxed))
     };
-    serial_println!(
+    crate::census_println!(
         "[wcser] scope={} entered={} declined={} reruns={} declined_pct={} holder={} held_ms={} exbusy={} steals={} revenants={} span={}ms -> {}",
         scope,
         entered,
@@ -14137,7 +14137,7 @@ fn noatt_emit(scope: &str, span: u64) {
     } else {
         "UNATTRIBUTED"
     };
-    serial_println!(
+    crate::census_println!(
         "[noatt] scope={} passes={} seeds={} noatt={} noatt_kpx={} rate={}.{}/s taker={} span={}ms -> {}",
         scope, passes, seeds, rows, kpx, rate / 10, rate % 10, taker, span, verdict
     );
@@ -14432,7 +14432,7 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // and excludes a live window that was idle through it. `shown=3/10` therefore reads "ten slots
     // had traffic, three of them are itemised above" — and `shown=n/n` means the itemisation is
     // complete, whatever `wins=` says beside it.
-    serial_println!(
+    crate::census_println!(
         "[wcn] rollup scope={} wins={} shown={}/{} att={} comp={} hid={} bel={} stale={} passes={} aborted={} att_rate={}.{}/s comp_rate={}.{}/s span={}ms -> {}",
         scope,
         wins,
@@ -19281,7 +19281,7 @@ fn physwit_emit(tag: &str, cpu: i32, base: usize, len: usize) {
     let r = physwit_walk(base, len);
     let cost = crate::arch::now_cycles().saturating_sub(t0);
     match r {
-        Some(r) => serial_println!(
+        Some(r) => crate::census_println!(
             ":: STAGE-PHYS: buf={} cpu={} bytes={} pages={} runs={} unmapped={} run_min={} \
              run_med={} run_max={} largest_off={} cost_cyc={} ::",
             tag,
@@ -19296,7 +19296,7 @@ fn physwit_emit(tag: &str, cpu: i32, base: usize, len: usize) {
             r.largest_off,
             cost
         ),
-        None => serial_println!(
+        None => crate::census_println!(
             ":: STAGE-PHYS: buf={} cpu={} bytes={} pages=0 runs=0 unmapped=0 run_min=0 run_med=0 \
              run_max=0 largest_off=0 cost_cyc={} ::",
             tag,
@@ -30081,4 +30081,12 @@ pub fn prof_comp2() -> [u64; 5] {
         C2_COMPOSE_CYC.load(Relaxed),
         C2_PRESENT_CYC.load(Relaxed),
     ]
+}
+/// GLASSEYES (B343): the outer frame (title bar and border included) of row `id`, `(x, y, w, h)` in panel pixels, or `None` for a free or zero-sized row — the state-shot mask's window-relative regions.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn frame_of(id: WinId) -> Option<(usize, usize, usize, usize)> {
+    let t = table();
+    let r = t.rows.iter().find(|r| r.used && r.id == id)?;
+    let b = outer_box(r);
+    if b.2 == 0 || b.3 == 0 { None } else { Some(b) }
 }
