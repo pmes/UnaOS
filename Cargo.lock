@@ -4325,6 +4325,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "holocron"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+ "holocron_core",
+ "unafs",
+]
+
+[[package]]
+name = "holocron-cli"
+version = "0.1.0"
+dependencies = [
+ "holocron",
+]
+
+[[package]]
+name = "holocron_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+ "holocron_core",
+]
+
+[[package]]
 name = "html5ever"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9214,6 +9238,8 @@ dependencies = [
  "elessar",
  "futures",
  "gneiss_pal",
+ "holocron",
+ "holocron_core",
  "log",
  "matrix",
  "principia",

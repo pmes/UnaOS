@@ -15,12 +15,14 @@ members = [
     "unaos/libs/sys/amber_core",
     "unaos/libs/sys/tls_core",
     "unaos/libs/media/av1_core",
+    "unaos/libs/sys/holocron_core",
     "unaos/libs/sys/crypto_core",
     "unaos/libs/media/pixel_core",
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",
     "handlers/vein",
+    "handlers/holocron",
     "handlers/matrix",
     "handlers/comscan",
     "handlers/vaire",
@@ -41,6 +43,7 @@ members = [
     "tools/pixel-check",
     "tools/foreman",
     "tools/av1-check",
+    "tools/holocron",
     "tools/crypto-check",
     "vessels/lumen",
     "vessels/pulse",
@@ -82,3 +85,8 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.aether-shell]
 opt-level = 2
+
+# HOLOCRON1: the keyring runs Argon2id (64 MiB, t=3) on every unlock; CRYPTOCORE is a workspace member, so
+# the `"*"` rule above does not reach it. Optimised in dev too, or a debug `holocron unlock` takes seconds.
+[profile.dev.package.crypto_core]
+opt-level = 3
