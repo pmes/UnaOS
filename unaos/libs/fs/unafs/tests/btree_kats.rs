@@ -29,8 +29,8 @@ fn volume(blocks: u64) -> (MemDevice, RefMap) {
     for b in 0..blocks {
         dev.write_block(b, &zero).expect("size the volume");
     }
-    let mut rm = RefMap::try_new(blocks).expect("refmap");
-    rm.incref(0);
+    let mut rm = RefMap::try_new(blocks, unafs::maptree::Shape::Paged).expect("refmap");
+    rm.incref(&mut dev, 0);
     (dev, rm)
 }
 

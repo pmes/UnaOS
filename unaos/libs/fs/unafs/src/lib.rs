@@ -47,6 +47,7 @@ pub mod inode;
 #[cfg(feature = "std")]
 pub mod io;
 pub mod legacy;
+pub mod maptree;
 pub mod query;
 pub mod refmap;
 pub mod root;

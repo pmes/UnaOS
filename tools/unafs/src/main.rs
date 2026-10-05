@@ -132,6 +132,26 @@ enum Commands {
         img: String,
         blocks: u64,
     },
+    /// UNAFSMAP (B354) map bench: for each size, a SPARSE image under
+    /// OUT_DIR is formatted (`--version`: 7 = paged maps, 6 = legacy), given a
+    /// file, remounted (timed; peak heap of the mount), overwritten by one
+    /// block (blocks that commit wrote), and fsck'd (timed). `--files N` also
+    /// creates N empty files (batched) and times their fsck. Prints one table
+    /// row per size; the images are deleted.
+    BenchMap {
+        /// Directory for the throwaway sparse images.
+        #[arg(long, default_value = ".")]
+        out_dir: String,
+        /// Volume sizes in MiB, comma-separated.
+        #[arg(long, default_value = "1024,16384,1048576")]
+        sizes: String,
+        /// Format version (7 paged, 6 legacy whole-map).
+        #[arg(long, default_value = "7")]
+        version: u32,
+        /// Empty files to create before the fsck (0 = none).
+        #[arg(long, default_value = "0")]
+        files: u64,
+    },
     /// List retained snapshots (the on-disk snapshot index).
     Snaps {
         #[arg(short, long, default_value = "unafs.img")]
@@ -821,6 +841,9 @@ async fn main() -> Result<()> {
                 anyhow::bail!("the grown volume is not clean");
             }
         }
+        Commands::BenchMap { out_dir, sizes, version, files } => {
+            run_bench_map(out_dir, sizes, *version, *files)?;
+        }
         Commands::Fsck { img, repair } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
             let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
@@ -1056,5 +1079,116 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// =============================================================================
+// UNAFSMAP (B354) map bench (bench-map)
+// =============================================================================
+
+/// Live/peak heap counters for `bench-map` (a counting wrapper over the system
+/// allocator; costs two atomics per allocation for every verb).
+struct CountingAlloc;
+static HEAP_CUR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HEAP_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = unsafe { std::alloc::System.alloc(l) };
+        if !p.is_null() {
+            let now = HEAP_CUR.fetch_add(l.size(), Relaxed) + l.size();
+            HEAP_PEAK.fetch_max(now, Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, l) };
+        HEAP_CUR.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAlloc = CountingAlloc;
+
+fn heap_mark() -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = HEAP_CUR.load(Relaxed);
+    HEAP_PEAK.store(c, Relaxed);
+    c
+}
+fn heap_peak_since(mark: usize) -> usize {
+    HEAP_PEAK.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(mark)
+}
+
+fn run_bench_map(out_dir: &str, sizes: &str, version: u32, files: u64) -> Result<()> {
+    println!("| v | volume | blocks | format s | mount s | mount peak heap | 1-block write commit blocks | map blocks | files | fsck s | fsck peak heap |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
+    for size in sizes.split(',') {
+        let mib: u64 = size.trim().parse().context("size (MiB)")?;
+        let path = Path::new(out_dir).join(format!("bench-map-v{version}-{mib}.img"));
+        struct Rm(std::path::PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _rm = Rm(path.clone());
+        std::fs::File::create(&path)?.set_len(mib * 1024 * 1024)?;
+        let t = Instant::now();
+        {
+            let device = FileDevice::open(&path)?;
+            let mut fs = FileSystem::format_with_version(device, mib, version)
+                .map_err(|e| anyhow::anyhow!("format: {e}"))?;
+            let root = fs.superblock.root_inode;
+            let id = fs.create_file(root, "f".into()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            fs.write_data(id, 0, &[7u8; 4096]).map_err(|e| anyhow::anyhow!("{e}"))?;
+            if files > 0 {
+                let dir = fs.mkdir(root, "many".into()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let mut made = 0u64;
+                while made < files {
+                    let n = (files - made).min(50_000);
+                    let batch: Vec<BatchFile> = (0..n)
+                        .map(|i| BatchFile {
+                            name: format!("f{}", made + i),
+                            data: Vec::new(),
+                            attributes: BTreeMap::new(),
+                        })
+                        .collect();
+                    fs.create_files_batch(dir, batch).map_err(|e| anyhow::anyhow!("batch: {e}"))?;
+                    made += n;
+                }
+            }
+        }
+        let format_s = t.elapsed().as_secs_f64();
+        let mark = heap_mark();
+        let t = Instant::now();
+        let mut fs = FileSystem::mount(FileDevice::open(&path)?).map_err(|e| anyhow::anyhow!("mount: {e}"))?;
+        let mount_s = t.elapsed().as_secs_f64();
+        let mount_heap = heap_peak_since(mark);
+        let id = fs.resolve_path("/f").map_err(|e| anyhow::anyhow!("{e}"))?;
+        fs.write_data(id, 0, &[9u8; 4096]).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let commit_blocks = fs.commit_stats().last_commit_blocks;
+        let mark = heap_mark();
+        let t = Instant::now();
+        let rep = fs.fsck(false).map_err(|e| anyhow::anyhow!("fsck: {e}"))?;
+        let fsck_s = t.elapsed().as_secs_f64();
+        let fsck_heap = heap_peak_since(mark);
+        anyhow::ensure!(rep.is_clean(), "fsck not clean: {rep:?}");
+        println!(
+            "| {} | {} MiB | {} | {:.3} | {:.3} | {} KiB | {} | {} | {} | {:.3} | {} KiB |",
+            fs.superblock.version,
+            mib,
+            fs.superblock.block_count,
+            format_s,
+            mount_s,
+            mount_heap / 1024,
+            commit_blocks,
+            fs.map_block_total(),
+            files,
+            fsck_s,
+            fsck_heap / 1024
+        );
+    }
     Ok(())
 }
