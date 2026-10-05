@@ -18,7 +18,10 @@ fn corpus() -> Vec<(String, Vec<u8>)> {
     // Text: this crate's own sources.
     let mut text = Vec::new();
     for f in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap() {
-        text.extend(std::fs::read(f.unwrap().path()).unwrap());
+        let p = f.unwrap().path();
+        if p.is_file() {
+            text.extend(std::fs::read(p).unwrap());
+        }
     }
     v.push(("src-text".to_string(), text));
     // Low-entropy binary: random bytes from a 4-symbol alphabet with repeats.

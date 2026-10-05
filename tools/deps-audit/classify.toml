@@ -146,10 +146,8 @@ verdict = "OWED"
 replacement = "remove the dependency (no caller); any future Lumen record format gets an in-tree codec"
 
 # ---------------------------------------------------------------- git
-[chicken_wire.gix]
-capability = "git implementation (object store, refs, packfiles) under Vaire"
-verdict = "OWED"
-replacement = "arc GITCORE — `libs/git_core` (loose objects, packfile v2 + idx, refs; oracle: `git cat-file`) for Vaire"
+# `gix` (and its ~40 gix-* crates) left the tree with GITCORE (SR59): Vaire reads repositories through
+# `unaos/libs/vcs/git_core` (objects, loose + packs, index, refs, diff, smart HTTP), proven against the git CLI.
 
 # ---------------------------------------------------------------- ML inference
 [chicken_wire.candle-core]
