@@ -611,8 +611,13 @@ impl Vm {
                             crate::builtins::typedarray::ta_set_index(self, cur, idx, &v)?;
                             return Ok(true);
                         }
-                        if !crate::builtins::typedarray::ta_valid_index(self, cur, idx) {
-                            return Ok(true);
+                        match crate::builtins::typedarray::ta_get_index(self, cur, idx) {
+                            None => return Ok(true),
+                            Some(v) => {
+                                // OrdinarySet with the element as a writable data property.
+                                own_desc = Some(Prop::data(v, WEC));
+                                break;
+                            }
                         }
                     }
                 }

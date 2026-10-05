@@ -295,6 +295,9 @@ pub fn run(cfg: &Config) -> Report {
                 let m = parse_meta(&src);
                 let (o, d) = if m.features.iter().any(|f| OUT_OF_SCOPE.contains(&f.as_str())) {
                     (Outcome::Skip, String::from("out of scope feature"))
+                } else if m.has_flag("CanBlockIsTrue") {
+                    // This host's main agent has [[CanBlock]] false (INTERPRETING.md).
+                    (Outcome::Skip, String::from("host [[CanBlock]] is false"))
                 } else if parse_only {
                     match std::panic::catch_unwind(|| run_parse(&src, &m)) {
                         Ok(r) => r,

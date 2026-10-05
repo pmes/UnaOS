@@ -497,7 +497,7 @@ impl Parser {
                 T::Name(n) if self.tok.escaped && (&**n == "in" || &**n == "instanceof") => return self.err("keyword must not contain escapes"),
                 _ => break,
             };
-            if prec < min_prec || (prec == min_prec && prec != 11) {
+            if prec < min_prec {
                 break;
             }
             if prec == 11 {
