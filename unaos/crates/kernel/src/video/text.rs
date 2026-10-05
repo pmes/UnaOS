@@ -242,6 +242,16 @@ pub fn fit(s: &[u8], bold: bool, face: Face, max_w: usize) -> usize {
     n
 }
 
+/// KERNELFONT2 M4: bumped when the faces load and on every restyle (`system.display.font` / `font_size`); the
+/// desktop service pass (`quarry::live::service`) compares it with what it last saw and has every kernel window that
+/// caches its own pixels repaint once ([`epoch`]).
+static EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The face epoch (0 = no face has loaded yet).
+pub fn epoch() -> u32 {
+    EPOCH.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// KERNELFONT2: the console's cell — the body cell x `video::dpi`'s scale, each side rounded up to the pixel.
 pub fn grid_cell() -> (usize, usize) {
     let s2 = crate::video::dpi::scale_x2();
@@ -571,6 +581,7 @@ mod tt {
         );
         *TT.lock() = Some(t);
         READY.store(true, Ordering::Release);
+        super::EPOCH.fetch_add(1, Ordering::AcqRel); // KERNELFONT2 M4: the windows painted before this repaint once
         let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
     }
 
@@ -595,6 +606,7 @@ mod tt {
         .flatten();
         if let Some(line) = changed {
             serial_println!("[kfont] restyle {}", line);
+            super::EPOCH.fetch_add(1, Ordering::AcqRel); // KERNELFONT2 M4
             let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
         }
     }

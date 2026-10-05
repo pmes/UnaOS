@@ -488,3 +488,8 @@ pub fn selftest() {
         None => serial_println!(":: ACTIVITY: cpus=0 procs=0 heap_used=0 repaints=0 reason=open-refused -> FAIL ::"),
     }
 }
+
+/// KERNELFONT2 (B363) M4: the faces loaded or were restyled — repaint the open window once.
+pub fn font_repaint() {
+    let _ = repaint_now();
+}

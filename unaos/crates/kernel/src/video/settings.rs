@@ -12,6 +12,8 @@
 //! speed (TPSPEED divisors: slow / normal / fast) · 5 Wallpaper path (text field) · 6 Apply · 7 Off ·
 //! 8 Change Password (the login screen's set-password form for the session user). The Clock 24h/12h
 //! toggle is omitted: CLOCKBAR's glyph path is not a runtime switch.
+//! KERNELFONT2 (B363): 9 Font (sans / serif / mono) · 10 Font size (CSS px, - / +), both on the Display tab, written
+//! to `system.display.font` / `system.display.font_size`.
 //!
 //! Every change prints `[settings] <name>=<value> applied=<0|1>` and is persisted to PRINCIPIA'S store —
 //! `<home>/.config/unaos/preferences.toml`, namespace `system` (`crate::prefs`, PREFS B300; the private
@@ -41,8 +43,13 @@ pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 7;
 const _: () = assert!(OWNER != super::fileview::OWNER && OWNER != super::textedit::OWNER);
 
 /// Number of controls.
-pub const CONTROLS: usize = 9;
-const NAMES: [&str; CONTROLS] = ["brightness", "volume", "mute", "idle_min", "pointer", "wallpaper", "wallpaper-apply", "wallpaper-off", "password"];
+pub const CONTROLS: usize = 11;
+const NAMES: [&str; CONTROLS] = ["brightness", "volume", "mute", "idle_min", "pointer", "wallpaper", "wallpaper-apply", "wallpaper-off", "password", "font", "font_size"];
+/// KERNELFONT2 (B363) M4: the Display tab's Font picker — `system.display.font` (control 9, the schema's enum) and
+/// `system.display.font_size` (control 10, CSS px, the schema's 9..=32).
+const FONT_FAMS: [&str; 3] = ["sans", "serif", "mono"];
+const FONT_MIN: i64 = 9;
+const FONT_MAX: i64 = 32;
 /// Idle-minute steps the slider walks (0 = never).
 pub const IDLE_STEPS: [u32; 8] = [0, 1, 2, 5, 10, 15, 30, 60];
 const PTR_NAMES: [&str; 3] = ["slow", "normal", "fast"];
@@ -303,6 +310,8 @@ fn adjust(i: usize, d: isize) {
         2 => set(2, (d > 0) as usize),
         3 => set(3, step(idle_index(c.idle_min), IDLE_STEPS.len() - 1)),
         4 => set(4, step(c.ptr as usize, 2)),
+        9 => set_font(9, step(font_fam(), 2) as i64),
+        10 => set_font(10, (font_size() + d as i64).clamp(FONT_MIN, FONT_MAX)),
         _ => {}
     }
 }
@@ -379,12 +388,12 @@ pub fn service() {
 /// Control indices on `tab`, in keyboard order (BRIGHTFLOOR M5: General = volume, mute, pointer,
 /// wallpaper, apply, off, password; Display = brightness, idle blank; Users/About: none).
 fn tab_ctrls(tab: usize) -> &'static [usize] {
-    match tab { 0 => &[1, 2, 4, 5, 6, 7, 8], 2 => &[0, 3], _ => &[] }
+    match tab { 0 => &[1, 2, 4, 5, 6, 7, 8], 2 => &[0, 3, 9, 10], _ => &[] } // KERNELFONT2: 9 font, 10 font size
 }
 
 /// Row of control `i` on its tab (General: 1→0, 2→1, 4→2, 5→3, 6|7→4, 8→5; Display: 0→0, 3→1).
 const fn row_of(i: usize) -> usize {
-    match i { 0 => 0, 1 => 0, 2 => 1, 3 => 1, 4 => 2, 5 => 3, 6 | 7 => 4, _ => 5 }
+    match i { 0 => 0, 1 => 0, 2 => 1, 3 => 1, 4 => 2, 5 => 3, 6 | 7 => 4, 9 => 4, 10 => 5, _ => 5 }
 }
 
 fn fill(s: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize, c: u32) {
@@ -499,12 +508,32 @@ fn paint_display(st: &mut State, v: &Values) {
     txt(st, TRACK_X, 2, &alloc::format!("{}x - read-only, fixed at takeover", sc));
     txt(st, LABEL_X, 3, "Menubar clock");
     txt(st, TRACK_X, 3, "24h - fixed, no runtime switch");
-    // KERNELFONT M3 (B359): the face the desktop draws with, and a sample line IN that face. The family and size
-    // are Principia's `system.display.font` / `system.display.font_size` (`pref set system display.font serif`).
+    // KERNELFONT M3 (B359) -> KERNELFONT2 M4 (B363): the Font row is a PICKER — the family as three segments (the
+    // Pointer row's shape) and the size as - / + — writing Principia's `system.display.font` / `font_size`
+    // (`video::text` follows them within a second and every window repaints once); the faces drawing now and a
+    // sample line IN the UI face below.
+    let (w, h) = (st.w, st.h);
+    let face = super::text::Face::Ui;
+    let ch = face.cell_h();
     txt(st, LABEL_X, 4, "Font");
-    txt(st, TRACK_X, 4, &super::text::face_name(super::text::Face::Ui));
-    let (w, h, ch) = (st.w, st.h, super::text::Face::Ui.cell_h());
-    super::text::draw_text(&mut st.surf, w, w - 12, h, TRACK_X, TOP + 5 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, super::text::Face::Ui);
+    let (fam, size) = (font_fam(), font_size());
+    let seg = TRACK_W / 3;
+    for k in 0..3usize {
+        let c = if k == fam { theme::ACCENT } else { theme::SCROLL_TRACK };
+        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 4 * ROW_H + 6, seg - 2, ROW_H - 12, c);
+        super::text::draw_text(&mut st.surf, w, w, h, TRACK_X + k * seg + 8, TOP + 4 * ROW_H + (ROW_H - ch) / 2, FONT_FAMS[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+    }
+    txt(st, VAL_X, 4, &super::text::face_name(face));
+    txt(st, LABEL_X, 5, "Font size");
+    btn(st, 5, TRACK_X, "  -");
+    btn(st, 5, TRACK_X + BTN_W + 10, "  +");
+    txt(st, TRACK_X + 2 * BTN_W + 24, 5, &alloc::format!("{} px", size));
+    txt(st, LABEL_X, 6, "Console");
+    let (cw, chh) = super::text::grid_cell();
+    let s2 = super::dpi::scale_x2();
+    txt(st, TRACK_X, 6, &alloc::format!("{} in {}x{} cells, {} ppi x{}", super::text::face_name(super::text::Face::Grid), cw, chh, super::dpi::ppi(), super::dpi::scale_str(s2)));
+    super::text::draw_text(&mut st.surf, w, w - 12, h, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, face);
+    if !st.strip && st.sel == 10 { fill(&mut st.surf, w, TRACK_X, TOP + 5 * ROW_H + ROW_H - 8, 2 * BTN_W + 10, 2, theme::ACCENT); }
 }
 
 /// KERNELFONT M3: the Display tab's sample line.
@@ -803,7 +832,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     let tab = cur_tab();
     let form = tab == 1 && STATE.lock().as_ref().map(|x| x.u.form).unwrap_or(false);
     let ctrls = tab_ctrls(tab);
-    let horiz = !strip && ((tab == 0 && matches!(s, 1 | 2 | 4)) || (tab == 2 && matches!(s, 0 | 3))); // BRIGHTFLOOR M5: Brightness adjusts on the Display tab
+    let horiz = !strip && ((tab == 0 && matches!(s, 1 | 2 | 4)) || (tab == 2 && matches!(s, 0 | 3 | 9 | 10))); // BRIGHTFLOOR M5: Brightness adjusts on the Display tab; KERNELFONT2: the Font picker
     match ev {
         crate::pal::Event::Action(Action::CursorLeft) | crate::pal::Event::Action(Action::CursorRight) => {
             let d: isize = if matches!(ev, crate::pal::Event::Action(Action::CursorLeft)) { -1 } else { 1 };
@@ -938,6 +967,9 @@ pub fn press_route(x: i32, y: i32) -> bool {
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
             if row == 0 && on_track { select(0); set(0, bright_at(cx)); }
             if row == 1 && on_track { select(3); set(3, slider_at(cx, IDLE_STEPS.len() - 1)); }
+            if row == 4 && cx >= TRACK_X && cx < TRACK_X + TRACK_W { select(9); set_font(9, ((cx - TRACK_X) / (TRACK_W / 3)).min(2) as i64); } // KERNELFONT2: the family segments
+            if row == 5 && cx >= TRACK_X && cx < TRACK_X + BTN_W { select(10); set_font(10, (font_size() - 1).max(FONT_MIN)); } // KERNELFONT2: size −
+            if row == 5 && cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 { select(10); set_font(10, (font_size() + 1).min(FONT_MAX)); } // size +
         }
         _ => {}
     }
@@ -1200,4 +1232,42 @@ pub fn set_tab_named(name: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// KERNELFONT2 (B363) M4: the faces loaded or were restyled — repaint the open window once (no window: nothing).
+pub fn font_repaint() {
+    repaint();
+}
+
+// ── KERNELFONT2 (rmbp-ledger B363) M4 — the Font picker ────────────────────────────────────────────────────────────
+
+/// `system.display.font` as a [`FONT_FAMS`] index (sans when unset or unknown).
+fn font_fam() -> usize {
+    let f = crate::prefs::text(crate::prefs::key::FONT);
+    FONT_FAMS.iter().position(|&n| Some(n) == f.as_deref()).unwrap_or(0)
+}
+
+/// `system.display.font_size` in CSS px (the schema's default 13 when unset).
+fn font_size() -> i64 {
+    crate::prefs::int(crate::prefs::key::FONT_SIZE, FONT_MIN, FONT_MAX).unwrap_or(13)
+}
+
+/// Write control 9 (family index) or 10 (CSS px) through the bus like every other Settings write (SETTINGSBUS),
+/// print the change, repaint. `video::text` restyles on its next preference poll and bumps the face epoch, so the
+/// desktop's windows (this one included) repaint once more in the new face.
+fn set_font(i: usize, v: i64) {
+    use crate::prefs::{key, PrefValue as P};
+    let vtxt = if i == 9 {
+        let f = FONT_FAMS[(v.clamp(0, 2)) as usize];
+        crate::prefs_client::sys_set(key::FONT, P::Str(String::from(f)));
+        String::from(f)
+    } else {
+        let n = v.clamp(FONT_MIN, FONT_MAX);
+        crate::prefs_client::sys_set(key::FONT_SIZE, P::Int(n));
+        alloc::format!("{}", n)
+    };
+    say(NAMES[i], &vtxt, true);
+    let mut d = Values::DEFAULT;
+    SAVED_N.store(from_prefs(&mut d).1 as u32, Ordering::Relaxed);
+    repaint();
 }

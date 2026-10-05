@@ -3463,3 +3463,74 @@ fn cells_remint(
 pub fn panel_console_live() -> bool {
     PANEL_CONSOLE.load(Ordering::Relaxed)
 }
+
+/// KERNELFONT2 (rmbp-ledger B363) M4 — **the faces just loaded (or were restyled): repaint the routed console's
+/// screenful from its cell store**, so the boot log printed in the bitmap atlas before the volume was up turns into
+/// DejaVu Sans Mono once, instead of only as it scrolls away. One CELL ROW per masked `FBCON` hold (the row back to
+/// the ground, then its glyphs from the engine's warm cache — the same order of work as printing one line), so a
+/// print on another core or from an interrupt is serialised against every row and never sees a half-repainted one;
+/// interrupts are re-enabled between rows. The whole box is presented once, lock released and unmasked
+/// (`route_present`'s contract). Returns the rows repainted: 0 when the console is not routed into a window, has
+/// no store, or the lock stayed contended.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub fn font_repaint() -> usize {
+    let mut row = 0usize;
+    let mut repainted = 0usize;
+    let mut misses = 0u32;
+    loop {
+        // None = contended; Some(None) = nothing (left) to paint; Some(Some(more)) = this row painted
+        let mut step: Option<Option<bool>> = None;
+        crate::arch::without_interrupts(|| {
+            let Some(mut c) = FBCON.try_lock() else { return };
+            if c.win_store.is_none() || c.win_cells.is_none() || row >= c.cell_rows || c.cell_cols == 0 {
+                step = Some(None);
+                return;
+            }
+            let (cols, cw, ch, fg, bg, scale, aa) = (c.cell_cols, c.cell_w, c.cell_h, c.fg, c.bg, c.scale, c.aa);
+            let y = row * ch;
+            let mut line = [0u8; 512];
+            let n = cols.min(line.len());
+            if let Some(k) = c.win_cells.as_ref() {
+                for (i, b) in line[..n].iter_mut().enumerate() {
+                    *b = k.get(row * cols + i).copied().unwrap_or(0);
+                }
+            }
+            {
+                let surf = c.draw_fb();
+                surf.fill_rows(y, y + ch, bg);
+                for (i, &b) in line[..n].iter().enumerate() {
+                    if b != 0 {
+                        draw_glyph(surf, b, i * cw, y, fg, bg, scale, aa);
+                    }
+                }
+            }
+            c.mark_rows(y, y + ch);
+            step = Some(Some(row + 1 < c.cell_rows));
+        });
+        match step {
+            Some(Some(more)) => {
+                repainted += 1;
+                misses = 0;
+                if !more {
+                    break;
+                }
+                row += 1;
+            }
+            Some(None) => break,
+            None => {
+                misses += 1;
+                if misses > 64 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+    if repainted > 0 {
+        route_present();
+    }
+    repainted
+}

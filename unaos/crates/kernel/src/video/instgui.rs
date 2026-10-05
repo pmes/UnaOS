@@ -1229,3 +1229,10 @@ fn plan_view_paint(px: &mut [u32], lx: usize) -> bool {
 #[cfg(feature = "ahciroot")]
 #[path = "install3.rs"]
 pub mod install3;
+
+/// KERNELFONT2 (B363) M4: the faces loaded or were restyled — repaint the open installer window once.
+pub fn font_repaint() {
+    if is_open() {
+        repaint();
+    }
+}
