@@ -346,8 +346,10 @@ class Row:
             return
         for u in self.uses:
             where = f"{u.consumer} ({u.manifest})"
+            lo = _cmp_ver(*_partial(u.req.lstrip("^~=<>").split(",")[0])) if u.req.strip() not in ("", "*") else None
+            if lo is not None and lo.key() > self.stable.key():
+                continue  # declared AHEAD of latest stable: a pre-release on purpose (R83), not a lag
             if not req_matches(u.req, self.stable):
-                lo = _cmp_ver(*_partial(u.req.lstrip("^~=<>").split(",")[0]))
                 k = bump_kind(lo, self.stable) if lo else "major"
                 self.behind.append(f"{where}: requirement `{u.req}` does not admit {self.stable} ({k})")
                 self.lagging.add(u.consumer)

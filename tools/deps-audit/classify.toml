@@ -66,7 +66,7 @@ replacement = "arc FONTCORE — `font_core` loads and rasters; host font *discov
 [chicken_wire.image]
 capability = "image decoding (PNG, JPEG, GIF, WebP, BMP …)"
 verdict = "CUT"
-replacement = "PIXELCORE SR25 — `unaos/libs/media/pixel_core`; AVIF via AVCODEC SR24"
+replacement = "PIXELCORE SR25 — `unaos/libs/media/pixel_core` (PNG, JPEG, GIF, BMP, WebP; since the cut FACETPIXEL SR43 moved Facet and VP8CORE SR40 moved Aether's WebP onto pixel_core, Aether still declares image 0.25 at caf3c986); AVIF via AVCODEC SR24 `av1_core` (its default `avif` feature also drags rav1e, an AV1 ENCODER, into the lock — reachable only if headless `img.save` is handed a `.avif` path)"
 
 [chicken_wire.png]
 capability = "PNG decoding"
@@ -117,7 +117,7 @@ replacement = "TLSCORE SR28 — `unaos/libs/sys/tls_core` (TLS 1.3, RFC 8446)"
 [chicken_wire.embedded-tls]
 capability = "TLS 1.3 client (no_std; tls-spike / vein_ring3)"
 verdict = "CUT"
-replacement = "TLSCORE SR28 — `tls_core` replaces it under vein_ring3 by name"
+replacement = "TLSCORE SR28 — `tls_core` replaces it under vein_ring3 by name; DONE on the seat tip caf3c986 (VEINTLS SR36 removed embedded-tls, embedded-io and rand_core): row and the rand_core pin die at the fold"
 
 # ---------------------------------------------------------------- crypto
 [chicken_wire.sha2]
@@ -244,3 +244,52 @@ replacement = "the host's GL; Vug is outside the workspace"
 capability = "GPU API (Vulkan / Metal / DX12 / GL) for Euclase"
 verdict = "NOT WANTED"
 replacement = "on the host the GPU stack is the host's; on metal the kernel drives the GPU itself (Kepler, `wc`)"
+
+# ---------------------------------------------------------------- crypto test oracle (seat tip caf3c986, not yet on this branch)
+# tls_core's `test-provider` feature (TEST OPERAND ONLY, never linked into a product binary): the product
+# provider is crypto_core. An oracle crate is allowed by R83; it does no work UnaOS ships.
+
+[chicken_wire.hmac]
+capability = "HMAC — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.aes-gcm]
+capability = "AES-GCM AEAD — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.chacha20poly1305]
+capability = "ChaCha20-Poly1305 AEAD — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.x25519-dalek]
+capability = "X25519 key agreement — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.p256]
+capability = "P-256 ECDH/ECDSA — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.p384]
+capability = "P-384 ECDSA — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.ed25519-dalek]
+capability = "Ed25519 signatures — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.rsa]
+capability = "RSA signature verify (0.10 pre-release, R83 pre-release clause) — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.getrandom]
+capability = "OS randomness for the test provider — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
