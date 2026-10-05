@@ -224,20 +224,38 @@ fn fix_premul(img: &mut Pixmap, b: &IRect) {
 
 // ---------------------------------------------------------------- feOffset
 
-/// Shift by whole pixels (`dx`, `dy`), result clipped to `b`.
-pub fn offset(src: &Pixmap, b: &IRect, dx: i64, dy: i64) -> Pixmap {
+/// Shift by (`dx`, `dy`) pixels, result clipped to `b`. A fractional shift resamples bilinearly (Skia draws
+/// the offset image with a fractional translation and linear filtering).
+pub fn offset(src: &Pixmap, b: &IRect, dx: f64, dy: f64) -> Pixmap {
     let mut out = Pixmap::new(src.w, src.h);
-    for y in b.y0..b.y1 {
-        let sy = y as i64 - dy;
-        if sy < 0 || sy >= src.h as i64 {
-            continue;
+    let (fx, fy) = (dx - floor(dx), dy - floor(dy));
+    let (ix, iy) = (floor(dx) as i64, floor(dy) as i64);
+    let get = |x: i64, y: i64| -> [f32; 4] {
+        if x < 0 || y < 0 || x >= src.w as i64 || y >= src.h as i64 {
+            return [0.0; 4];
         }
+        let p = px(src, x as usize, y as usize);
+        [p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32]
+    };
+    let exact = fx < 1e-6 && fy < 1e-6;
+    let (wx, wy) = (fx as f32, fy as f32);
+    for y in b.y0..b.y1 {
         for x in b.x0..b.x1 {
-            let sx = x as i64 - dx;
-            if sx < 0 || sx >= src.w as i64 {
+            let (sx, sy) = (x as i64 - ix, y as i64 - iy);
+            if exact {
+                let p = get(sx, sy);
+                put(&mut out, x, y, [p[0] as u8, p[1] as u8, p[2] as u8, p[3] as u8]);
                 continue;
             }
-            put(&mut out, x, y, px(src, sx as usize, sy as usize));
+            // out(x) = (1 − f)·src(x − ⌊d⌋) + f·src(x − ⌊d⌋ − 1), per axis.
+            let (a, bb, c, d) = (get(sx, sy), get(sx - 1, sy), get(sx, sy - 1), get(sx - 1, sy - 1));
+            let mut o = [0u8; 4];
+            for k in 0..4 {
+                let top = a[k] * (1.0 - wx) + bb[k] * wx;
+                let bot = c[k] * (1.0 - wx) + d[k] * wx;
+                o[k] = (top * (1.0 - wy) + bot * wy + 0.5).clamp(0.0, 255.0) as u8;
+            }
+            put(&mut out, x, y, o);
         }
     }
     out

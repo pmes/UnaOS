@@ -272,6 +272,15 @@ pub fn render_filtered<'a, F>(r: &mut Renderer<'a>, node: usize, pctx: &Ctx, ect
 where
     F: FnOnce(&mut Renderer<'a>, &Ctx, &mut Pixmap),
 {
+    let bbox = r.bbox(node, pctx, &Transform::IDENTITY);
+    render_filtered_bbox(r, node, bbox, ectx, value, f)
+}
+
+/// [`render_filtered`] with the element's object bounding box given (e.g. a `<tspan>`'s glyphs).
+pub fn render_filtered_bbox<'a, F>(r: &mut Renderer<'a>, node: usize, bbox: Option<Rect>, ectx: &Ctx, value: &str, f: F) -> Outcome
+where
+    F: FnOnce(&mut Renderer<'a>, &Ctx, &mut Pixmap),
+{
     let st = &ectx.style;
     let Some(ops) = parse_filter(value, st.font_size, ectx.vw, ectx.vh, st.color) else { return Outcome::Unfiltered };
     // Unresolvable references are skipped.
@@ -285,7 +294,6 @@ where
     if ops.is_empty() {
         return Outcome::Unfiltered;
     }
-    let bbox = r.bbox(node, pctx, &Transform::IDENTITY);
     let t = ectx.ts;
     let (cw, ch) = (r.w as f64, r.h as f64);
     // Working space: device space for scale+translate, else the scale part (remainder applied when drawing).
@@ -307,13 +315,12 @@ where
         Some(inv) => limit_dev.transform(&inv),
         None => return Outcome::Nothing,
     };
-    let mut wr = round_out(&limit);
-    // A single url() filter: the raster is its region.
+    // The raster: the canvas plus a margin (content outside a filter region still feeds its primitives).
+    let wr = round_out(&limit);
     if let [FilterFn::Url(id)] = ops.as_slice() {
-        let fnode = r.doc.by_id(id).unwrap();
-        let Some(reg) = filter_region(r, fnode, bbox, ectx) else { return Outcome::Nothing };
-        let rr = round_out(&reg.transform(&ft));
-        wr = (wr.0.max(rr.0), wr.1.max(rr.1), wr.2.min(rr.2), wr.3.min(rr.3));
+        if filter_region(r, r.doc.by_id(id).unwrap(), bbox, ectx).is_none() {
+            return Outcome::Nothing;
+        }
     }
     if wr.2 <= wr.0 || wr.3 <= wr.1 {
         return Outcome::Nothing;
@@ -404,30 +411,16 @@ fn drop_shadow(src: &Pixmap, in_b: &IRect, b: &IRect, sx: f64, sy: f64, dx: f64,
     let all = IRect { x0: 0, y0: 0, x1: src.w, y1: src.h };
     fe::clip_to(&mut a, in_b);
     fe::blur(&mut a, &all, fe::box_size(sx), fe::box_size(sy));
-    let a = fe::offset(&a, &all, round_i(dx), round_i(dy));
+    let a = fe::offset(&a, &all, dx, dy);
     let mut out = fe::colorize(&a, c);
     fe::over_into(&mut out, src, &all);
     fe::clip_to(&mut out, b);
     out
 }
 
-fn round_i(v: f64) -> i64 {
-    crate::fmath::round(v) as i64
-}
-
-/// The `<filter>` element and the filters it references by `href` (attributes inherit along the chain).
+/// The `<filter>` element and the filters it references by `href`: the region and unit attributes inherit
+/// along the chain; the primitives do not (Chromium: a filter without children renders nothing).
 fn filter_chain(r: &Renderer, f: usize) -> Vec<usize> {
-    let chain = vec![f];
-    // Chromium no longer honours `href` on <filter> (SVG 2 dropped it): nothing is inherited.
-    if HONOUR_FILTER_HREF {
-        return href_chain(r, f);
-    }
-    chain
-}
-
-const HONOUR_FILTER_HREF: bool = false;
-
-fn href_chain(r: &Renderer, f: usize) -> Vec<usize> {
     let mut chain = vec![f];
     let mut cur = f;
     while let Some(h) = r.doc.nodes[cur].href().and_then(|h| h.strip_prefix('#')).and_then(|id| r.doc.by_id(id)) {
@@ -499,6 +492,9 @@ fn number_list_partial(s: &str) -> Vec<f64> {
     out
 }
 
+/// The subregion of a primitive without a crop.
+const UNBOUNDED: Rect = Rect { x: -1e9, y: -1e9, w: 2e9, h: 2e9 };
+
 /// A primitive's result.
 struct Res {
     img: Pixmap,
@@ -512,7 +508,6 @@ struct Res {
 enum In {
     Source,
     SourceAlpha,
-    Empty,
     Res(usize),
 }
 
@@ -560,23 +555,20 @@ fn run_filter(r: &mut Renderer, f: usize, bbox: Option<Rect>, ectx: &Ctx, ft: Tr
     let region_user = filter_region(r, f, bbox, ectx)?;
     let chain = filter_chain(r, f);
     let obb = chain_attr(r, &chain, "primitiveUnits").map(|v| v.trim() == "objectBoundingBox").unwrap_or(false);
-    // The primitives: this filter's children, else those of the first filter along the href chain with any.
-    let is_prim = |n: usize| -> bool {
-        let nd = &r.doc.nodes[n];
+    // The primitives: this filter's own children.
+    let prims: Vec<usize> = r.doc.elements(f).filter(|&c| {
+        let nd = &r.doc.nodes[c];
         nd.is_svg_element() && nd.name().starts_with("fe")
-    };
-    let holder = chain.iter().copied().find(|&c| r.doc.elements(c).any(is_prim)).unwrap_or(f);
-    let prims: Vec<usize> = r.doc.elements(holder).filter(|&c| is_prim(c)).collect();
+    }).collect();
     let region = region_user.transform(&ft);
     let all = IRect { x0: 0, y0: 0, x1: w, y1: h };
     let region_px = irect(&region, &all);
     if obb && bbox.map(|b| b.w <= 0.0 || b.h <= 0.0).unwrap_or(true) {
         return None;
     }
+    // SourceGraphic is not clipped to the region (a blur near the region's edge still sees the content
+    // outside it); only the filter's result is.
     let mut run = Run { r, w, h, ft, bbox, obb, region, region_px, vctx: ectx.clone(), source, results: Vec::new(), names: Vec::new() };
-    let mut source_clip = core::mem::replace(&mut run.source, Pixmap::new(0, 0));
-    fe::clip_to(&mut source_clip, &region_px);
-    run.source = source_clip;
     for &p in &prims {
         if !run.primitive(p) {
             // An unknown element name (fe*) is a filter error: the element renders nothing.
@@ -588,7 +580,7 @@ fn run_filter(r: &mut Renderer, f: usize, bbox: Option<Rect>, ectx: &Ctx, ft: Tr
     if last.linear {
         fe::convert(&mut img, false);
     }
-    fe::clip_to(&mut img, &region_px);
+    // Every result is already cropped to its subregion within the region (or, uncropped, unbounded).
     Some(img)
 }
 
@@ -598,7 +590,6 @@ impl Run<'_, '_> {
         match a.map(|s| s.trim()) {
             Some("SourceGraphic") => In::Source,
             Some("SourceAlpha") => In::SourceAlpha,
-            Some("BackgroundImage") | Some("BackgroundAlpha") => In::Empty,
             Some(name) if !name.is_empty() => match self.names.iter().rev().find(|(n, _)| n == name) {
                 Some(&(_, i)) => In::Res(i),
                 None => prev,
@@ -616,7 +607,6 @@ impl Run<'_, '_> {
         let (mut img, lin, px, sub) = match i {
             In::Source => (self.source.clone(), false, self.region_px, self.region),
             In::SourceAlpha => (fe::alpha_only(&self.source), false, self.region_px, self.region),
-            In::Empty => (Pixmap::new(self.w, self.h), linear, self.region_px, self.region),
             In::Res(k) => {
                 let r = &self.results[k];
                 (r.img.clone(), r.linear, r.px, r.sub)
@@ -668,12 +658,24 @@ impl Run<'_, '_> {
         };
         let x = val("x", Axis::X).unwrap_or(du.x);
         let y = val("y", Axis::Y).unwrap_or(du.y);
-        // A zero or negative width/height is ignored (Chromium), like an absent one.
-        let ww = val("width", Axis::X).filter(|v| *v > 0.0).unwrap_or(du.w);
-        let hh = val("height", Axis::Y).filter(|v| *v > 0.0).unwrap_or(du.h);
-        let u = Rect::new(x, y, ww.max(0.0), hh.max(0.0));
-        def = u.transform(&self.ft);
+        let ww = val("width", Axis::X).unwrap_or(du.w);
+        let hh = val("height", Axis::Y).unwrap_or(du.h);
+        if !(ww > 0.0 && hh > 0.0) {
+            // An empty subregion means no crop at all (Chromium): the primitive covers the whole raster,
+            // beyond the filter region too.
+            return UNBOUNDED;
+        }
+        def = Rect::new(x, y, ww, hh).transform(&self.ft);
         def
+    }
+
+    /// The pixel bounds a primitive writes: its subregion within the filter region.
+    fn px_of(&self, sub: &Rect) -> IRect {
+        if sub.w >= UNBOUNDED.w {
+            IRect { x0: 0, y0: 0, x1: self.w, y1: self.h }
+        } else {
+            irect(sub, &self.region_px)
+        }
     }
 
     /// A number in primitiveUnits → working pixels along x (signed) / y.
@@ -704,30 +706,33 @@ impl Run<'_, '_> {
             "feGaussianBlur" => {
                 let ins = one(self);
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (mut img, _, _) = self.image(ins[0], linear);
                 let sd = num_pair(self.r, n, "stdDeviation").unwrap_or(Some((0.0, 0.0))).unwrap_or((0.0, 0.0));
                 if sd.0 < 0.0 || sd.1 < 0.0 || (sd.0 == 0.0 && sd.1 == 0.0) {
                     // Disabled: the result is the input.
                 } else {
                     let (sx, sy) = (self.ux(sd.0).abs(), self.uy(sd.1).abs());
-                    fe::blur(&mut img, &all, fe::box_size(sx), fe::box_size(sy));
+                    let (dx, dy) = (fe::box_size(sx), fe::box_size(sy));
+                    // Blur only what can reach the subregion.
+                    let reach = |b: &IRect| IRect { x0: b.x0.saturating_sub(3 * dx), y0: b.y0.saturating_sub(3 * dy), x1: b.x1 + 3 * dx, y1: b.y1 + 3 * dy }.intersect(&all);
+                    fe::blur(&mut img, &reach(&px), dx, dy);
                 }
                 self.push(n, img, linear, sub, px);
             }
             "feOffset" => {
                 let ins = one(self);
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (img, _, _) = self.image(ins[0], linear);
                 let dx = self.ux(num_attr(self.r, n, "dx", 0.0));
                 let dy = self.uy(num_attr(self.r, n, "dy", 0.0));
-                let o = fe::offset(&img, &px, round_i(dx), round_i(dy));
+                let o = fe::offset(&img, &px, dx, dy);
                 self.push(n, o, linear, sub, px);
             }
             "feFlood" => {
                 let sub = self.subregion(n, &[], false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let mut img = Pixmap::new(self.w, self.h);
                 let c = st.flood_color;
                 fe::flood(&mut img, &px, fe::color_in_space([c.r, c.g, c.b], c.a * st.flood_opacity as f32, linear));
@@ -737,7 +742,7 @@ impl Run<'_, '_> {
                 let nodes: Vec<usize> = self.r.doc.elements(n).filter(|&k| self.r.doc.nodes[k].is_svg("feMergeNode")).collect();
                 let ins: Vec<In> = nodes.iter().map(|&k| self.input_of(k, "in")).collect();
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let mut acc = Pixmap::new(self.w, self.h);
                 for &i in &ins {
                     let (img, _, _) = self.image(i, linear);
@@ -748,7 +753,7 @@ impl Run<'_, '_> {
             "feComposite" | "feBlend" => {
                 let ins = [self.input_of(n, "in"), self.input_of(n, "in2")];
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (s, _, _) = self.image(ins[0], linear);
                 let (d, _, _) = self.image(ins[1], linear);
                 let nd = &self.r.doc.nodes[n];
@@ -775,7 +780,7 @@ impl Run<'_, '_> {
             "feColorMatrix" => {
                 let ins = one(self);
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (img, _, _) = self.image(ins[0], linear);
                 let nd = &self.r.doc.nodes[n];
                 let vals = nd.attr("values").and_then(number_list);
@@ -808,7 +813,7 @@ impl Run<'_, '_> {
             "feComponentTransfer" => {
                 let ins = one(self);
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (img, _, _) = self.image(ins[0], linear);
                 let mut fns = [TransferFn::Identity, TransferFn::Identity, TransferFn::Identity, TransferFn::Identity];
                 let kids: Vec<usize> = self.r.doc.elements(n).collect();
@@ -844,7 +849,7 @@ impl Run<'_, '_> {
             "feMorphology" => {
                 let ins = one(self);
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (img, ib, _) = self.image(ins[0], linear);
                 let dilate = self.r.doc.nodes[n].attr("operator").map(|s| s.trim() == "dilate").unwrap_or(false);
                 let rad = num_pair(self.r, n, "radius").unwrap_or(Some((0.0, 0.0))).unwrap_or((0.0, 0.0));
@@ -860,7 +865,7 @@ impl Run<'_, '_> {
             "feTile" => {
                 let ins = one(self);
                 let sub = self.subregion(n, &ins, true);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (img, ib, _) = self.image(ins[0], linear);
                 let o = fe::tile(&img, &ib, &px);
                 self.push(n, o, linear, sub, px);
@@ -868,7 +873,7 @@ impl Run<'_, '_> {
             "feDropShadow" => {
                 let ins = one(self);
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (img, ib, _) = self.image(ins[0], linear);
                 let sd = num_pair(self.r, n, "stdDeviation").unwrap_or(Some((2.0, 2.0))).unwrap_or((2.0, 2.0));
                 let (sx, sy) = if sd.0 < 0.0 || sd.1 < 0.0 { (0.0, 0.0) } else { (self.ux(sd.0).abs(), self.uy(sd.1).abs()) };
@@ -881,7 +886,7 @@ impl Run<'_, '_> {
             }
             "feTurbulence" => {
                 let sub = self.subregion(n, &[], false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let mut img = Pixmap::new(self.w, self.h);
                 let nd = &self.r.doc.nodes[n];
                 let bf = match nd.attr("baseFrequency").map(number_list) {
@@ -916,7 +921,7 @@ impl Run<'_, '_> {
             "feDisplacementMap" => {
                 let ins = [self.input_of(n, "in"), self.input_of(n, "in2")];
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (s, sb, _) = self.image(ins[0], linear);
                 let (m, _, _) = self.image(ins[1], linear);
                 let sel = |a: &str| match self.r.doc.nodes[n].attr(a).map(|s| s.trim()) {
@@ -932,7 +937,7 @@ impl Run<'_, '_> {
             "feConvolveMatrix" => {
                 let ins = one(self);
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (img, ib, _) = self.image(ins[0], linear);
                 let o = self.convolve(n, &img, &ib, &px).unwrap_or_else(|| Pixmap::new(self.w, self.h));
                 self.push(n, o, linear, sub, px);
@@ -940,14 +945,14 @@ impl Run<'_, '_> {
             "feDiffuseLighting" | "feSpecularLighting" => {
                 let ins = one(self);
                 let sub = self.subregion(n, &ins, false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let (img, _, _) = self.image(ins[0], linear);
                 let o = self.lighting(n, &name, &img, &px, &st, linear).unwrap_or_else(|| Pixmap::new(self.w, self.h));
                 self.push(n, o, linear, sub, px);
             }
             "feImage" => {
                 let sub = self.subregion(n, &[], false);
-                let px = irect(&sub, &self.region_px);
+                let px = self.px_of(&sub);
                 let img = self.fe_image(n, &sub).unwrap_or_else(|| Pixmap::new(self.w, self.h));
                 // The image is sRGB.
                 let mut img = img;
