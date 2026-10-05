@@ -40,8 +40,10 @@ ONE limit; `wm::create_inner` and the x86 `sys_spawn` ask it. No second table, n
   by `notice_service`); the x86 ring-3 `sys_spawn` at the limit prints `[wm] REFUSED spawn
   reason=limit n=<n> (R90)` and PAUSES THE SPAWNER (sleep with doubling backoff 50 ms → 1.6 s, reset on
   a successful spawn) before `-EAGAIN`, so a runaway spawner burns its own time, not the machine's.
-* **M4** — the witness at the desktop ignition: `:: WINDOWCAP: fixed_cap=<none|ids:32> limit=<n>
-  procs=<n> opens_refused=<k> -> PASS ::` (PASS iff `limit >= 11` and nothing refused yet).
+* **M4** — the witness at the desktop ignition (`boot::ignite`, hooked in M1): `:: WINDOWCAP:
+  fixed_cap=<none|ids:28> limit=<n> procs=<n> opens_refused=<k> -> PASS ::` (PASS iff `limit >= 11` and
+  nothing refused yet). `ids:28` = the 32-row id space less the 4 system rows; it is printed only when
+  that term is the one that binds.
 
 ## Witness lines (x86 metal shape — ungated by any knob; `video` + `boot::ignite` are always built)
 * `[wm] limit windows=<n> procs=<n> from=mem:<MiB>,asids:<n>,dock:<n>,ids:<n> (R90)` — once.
@@ -50,7 +52,7 @@ ONE limit; `wm::create_inner` and the x86 `sys_spawn` ask it. No second table, n
   when hit; then `:: NOTICE-OPEN: title=Too many windows …`.
 
 ## Owed (said, not hidden)
-* **`fixed_cap=ids:32` is printed when the id space, not memory, binds** (it will on the rMBP: 256 MiB
+* **`fixed_cap=ids:28` is printed when the id space, not memory, binds** (it will on the rMBP: 256 MiB
   heap ÷ ~650 KiB ≫ 32). Retiring the id space — the slab where each row carries its own pace stamps,
   shadow, title source and native bit instead of `[_; MAX_WINDOWS]` side tables and `u32` slot masks —
   is the next arc (WINDOWCAP-2).
@@ -60,3 +62,19 @@ ONE limit; `wm::create_inner` and the x86 `sys_spawn` ask it. No second table, n
   `MAX_KILL_REQS` mirrors it); its limit line prints the same derivation.
 * Stack: the remaining `[_; MAX_WINDOWS]` scratches grow 12 → 32 (DockEntry/WlRow rows ~1.5 KiB per
   scratch at 32). Unmeasured — the metal boot is the proof (R78).
+
+## Landed (exec-rmbp-windowcap)
+* M1 eb8d3cff, M2 34d3fe88, M3 714168b1 (+ this note). Compile legs, inline: x86 metal shape exit 0;
+  aarch64 `login,loginst,virt_el0,lumen,desktop_firmware,quarry,facet,usbnet` exit 0,
+  `tegra,login,loginst,virt_el0` exit 0, `login,loginst,virt_el0` exit 0. charter-check exit 0.
+* The glass copy is ASCII: `Too many windows open (<n>) - close one` (title `Too many windows`) — the
+  notice line is bytes through the kernel face; the em dash is not promised to render.
+* The dock's runtime metric proof (`dock::uimetrics_assert`) is now stated for the pins + eleven app
+  rows; a 32-row strip at scale 4 would exceed the 4096 px scratch, and `for_panel` refuses it, which
+  is exactly why the dock term is IN the limit.
+* What the next flight reads (rMBP, 2880x1800): `[wm] limit windows=<n> procs=10 from=mem:<MiB>,asids:10,
+  dock:<n|none>,ids:28 (R90)` once; `:: WINDOWCAP: fixed_cap=… limit=<n> procs=10 opens_refused=0 ->
+  PASS ::` beside `[boot] phase=desktop`; after `storm` + console + shell + STAT + lumen + quarry +
+  settings, the screenshot / TEST.MD / holocron prompt OPEN (no `create-failed`); a deliberate overrun
+  (`storm` repeated) prints `[wm] REFUSED create reason=limit n=<n>` and `:: NOTICE-OPEN: title=Too many
+  windows`, and a ring-3 spawner past the process limit prints `[wm] REFUSED spawn … paused_ms=50..1600`.
