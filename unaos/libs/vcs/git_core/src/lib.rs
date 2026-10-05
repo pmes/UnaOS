@@ -40,6 +40,9 @@ pub mod object;
 pub mod deflate;
 pub mod zlib;
 pub mod loose;
+pub mod refs;
+pub mod config;
+pub mod ignore;
 
 pub use hash::{HashKind, ObjectId};
 pub use object::{Kind, Commit, Tag, Tree, TreeEntry, Signature};
