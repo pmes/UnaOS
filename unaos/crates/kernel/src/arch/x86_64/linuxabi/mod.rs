@@ -44,6 +44,7 @@ pub mod sys;
 pub mod sys2;
 pub mod sys3;
 pub mod thread;
+pub mod selfbuild3; // SELFBUILD3 (B353): `tests selfbuild3`
 pub mod vm; // SELFBUILD3 (B353): lazy VMAs, the #PF hook, the resident budget, the user frame pool
 
 use alloc::collections::BTreeSet;
