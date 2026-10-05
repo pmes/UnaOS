@@ -19,7 +19,7 @@ jb8lever = []
 unaos_ivb = ["unaos-boot-info/unaos_ivb"]
 
 [dependencies]
-uefi = { version = "0.38.0", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
+uefi = { version = "0.41.0", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
 log = "0.4.21"
 xmas-elf = "0.10.0"
 unaos-boot-info = { path = "../boot-info" }

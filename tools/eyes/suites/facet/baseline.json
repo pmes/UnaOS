@@ -1,0 +1,96 @@
+{
+  "cases": {
+    "card-actual": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-actual@chromium": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-adjust": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-adjust@chromium": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-crop": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-crop@chromium": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-fit": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-fit@chromium": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-fliph": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-fliph@chromium": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-pan": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-pan@chromium": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-resize": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-resize@chromium": {
+      "mismatch": 0.0,
+      "ssim": 0.995
+    },
+    "card-rotate90": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-rotate90@chromium": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-zoom400": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "card-zoom400@chromium": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "photo-o5": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "photo-o5@chromium": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "photo-o6": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "photo-o6@chromium": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    }
+  },
+  "thresholds": {
+    "mismatch_rise": 2.0,
+    "ssim_drop": 0.02
+  }
+}

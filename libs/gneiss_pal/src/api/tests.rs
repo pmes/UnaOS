@@ -158,6 +158,47 @@ async fn claude_request_shape_golden() {
     assert!(c.json().get("thinking").is_none());
 }
 
+/// VEINTURNS (SR42): what Vein now sends — a [`Thread`] of two recorded
+/// exchanges plus the new turn — reaches the Messages API as FIVE messages with
+/// their roles, the system prompt alone in `system` (it used to be one message
+/// with the history folded into `system`).
+#[tokio::test]
+async fn claude_thread_is_n_messages_not_one() {
+    let (base, rx) = mock(vec![ok_json(&end_turn_body())]);
+    let mut t = Thread::new();
+    t.record(vec![Part::text("one".into())], "uno");
+    t.record(vec![Part::text("two".into())], "dos");
+    let r = t.request(Some("You are Una.".into()), vec![Part::text("three".into())]);
+    claude(&base, false).generate(&r).await.unwrap();
+    let body = rx.recv().unwrap().json();
+    let turn = |role: &str, text: &str| json!({"role": role, "content": [{"type": "text", "text": text}]});
+    assert_eq!(
+        body["messages"],
+        json!([turn("user", "one"), turn("assistant", "uno"), turn("user", "two"), turn("assistant", "dos"), turn("user", "three")])
+    );
+    assert_eq!(body["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(body["system"], json!("You are Una."));
+}
+
+/// VEINTURNS (SR42): the same thread is three Gemini `contents` (user / model /
+/// user), the system prompt in `systemInstruction`.
+#[test]
+fn gemini_thread_is_n_contents() {
+    let p = GeminiProvider::with_token(gemini_cfg(GeminiAuth::GcloudAdc), "tok".into()).unwrap();
+    let mut t = Thread::new();
+    t.record(vec![Part::text("q1".into())], "a1");
+    let body = p.build_body(&t.request(Some("sys".into()), vec![Part::text("q2".into())]));
+    assert_eq!(
+        body["contents"],
+        json!([
+            {"role": "user", "parts": [{"text": "q1"}]},
+            {"role": "model", "parts": [{"text": "a1"}]},
+            {"role": "user", "parts": [{"text": "q2"}]}
+        ])
+    );
+    assert_eq!(body["systemInstruction"], json!({"parts": [{"text": "sys"}]}));
+}
+
 #[tokio::test]
 async fn claude_fallbacks_off_sends_neither_header_nor_field() {
     let (base, rx) = mock(vec![ok_json(&end_turn_body())]);

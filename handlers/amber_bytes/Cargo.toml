@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 authors = ["pmes"]
-description = "Forensic data recovery and preservation tool"
+description = "The Block: partitioning (GPT), formatting (FAT32, UnaFS), block-level recovery, forensic imaging"
 
 [dependencies]
 # SAFETY FIRST: 'memmap2' allows safe, OS-level memory mapping.
@@ -30,3 +30,21 @@ rand = "0.10"
 
 # SELFINSTALL2 (B310): the shared disk-layout core (GPT encode/decode) the kernel installer links too.
 amber_core = { path = "../../unaos/libs/sys/amber_core" }
+
+# AMBER1 (SR34): the UnaFS format entry (`unafs::format`) — no_std core only, no host backends.
+unafs = { path = "../../unaos/libs/fs/unafs", default-features = false }
+
+# AMBER1 (SR34): the bus wire (JSON requests/responses) — utilities, latest stable at the time added.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "amber_bytes"
+path = "src/main.rs"
+
+[[bin]]
+name = "amber"
+path = "src/bin/amber.rs"

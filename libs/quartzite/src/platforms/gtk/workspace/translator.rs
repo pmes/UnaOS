@@ -64,7 +64,7 @@ pub fn spawn_translator(
                             h_delta,
                             l_delta,
                             st.review_payload.clone(),
-                            st.token_usage.clone(),
+                            (st.token_usage.0, st.token_usage.1, st.token_usage.2, st.session_status.clone()),
                             st.sidebar_status.clone(),
                             st.active_directive.clone(),
                             st.synapse_error.clone(),
@@ -88,7 +88,7 @@ pub fn spawn_translator(
                     if let Some(p) = payload {
                         let _ = tx_gui.send(GuiUpdate::ReviewPayload(p)).await;
                     }
-                    let _ = tx_gui.send(GuiUpdate::TokenUsage(tokens.0, tokens.1, tokens.2)).await;
+                    let _ = tx_gui.send(GuiUpdate::TokenUsage(tokens.0, tokens.1, tokens.2, tokens.3)).await;
                     let _ = tx_gui.send(GuiUpdate::SidebarStatus(sidebar)).await;
                     if !active_dir.is_empty() {
                         let _ = tx_gui.send(GuiUpdate::ActiveDirective(active_dir)).await;

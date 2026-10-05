@@ -268,6 +268,11 @@ pub fn build_embedder_with_env(
                     }
                 },
                 AuthMode::GcloudAdc => super::gemini::GeminiAuth::GcloudAdc,
+                AuthMode::Cli => {
+                    return Err(ProviderError::Config(
+                        "the Gemini embedder cannot authenticate through a CLI — set vein.gemini.auth".into(),
+                    ));
+                }
             };
             Ok(Box::new(super::gemini::GeminiEmbedder::new(auth, cfg.gemini.clone(), cfg.dims)?))
         }

@@ -27,6 +27,18 @@ pub mod gpt;
 pub mod kat;
 pub mod plan;
 
+// AMBER1 (SR34): the write half — the block seam, the MBR, plan → disk with an exact dry run, the
+// whole-table verify, backup-header recovery, the complete FAT32 format, and the write-path KATs.
+pub mod block;
+pub mod fat32_format;
+#[cfg(feature = "std")]
+pub mod file_block;
+pub mod kat_write;
+pub mod mbr;
+pub mod plan_apply;
+pub mod recover;
+pub mod verify;
+
 pub use clone::ClonePlan;
 pub use crc32::crc32;
 pub use plan::{Part, PartKind, PartReq, Plan, PlanError, Size};

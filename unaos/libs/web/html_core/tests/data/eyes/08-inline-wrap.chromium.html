@@ -1,0 +1,14 @@
+<html><head><meta charset="utf-8"><title>Inline</title>
+<style>
+body { font-family: sans-serif; padding: 20px; font-size: 16px; }
+.box { width: 300px; border: 1px solid #999; padding: 8px; margin-bottom: 12px; }
+.ow { overflow-wrap: break-word; }
+.wb { word-break: break-all; }
+mark { background: #ffeb3b; }
+</style></head><body>
+<p>This has <b>bold, <i>bold italic, <u>and underlined</u></i></b> text, <s>struck</s>, <mark>marked</mark>, E=mc<sup>2</sup>, H<sub>2</sub>O, <small>small print</small> and <a href="#">a <em>link</em></a>.</p>
+<div class="box ow">overflow-wrap: Supercalifragilisticexpialidociousandthensomemorelettersthatdonotfit in a narrow box.</div>
+<div class="box wb">word-break: https://example.org/a/very/long/path/that/keeps/going/and/going/forever.html</div>
+<div class="box">Normal wrapping of a long sentence in a fixed width box that must break between words at the right places.</div>
+
+</body></html>
