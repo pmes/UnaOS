@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "libs/gneiss_pal",
     "libs/quartzite",
+    "libs/text_host", # QUARTZFONT (SR64): the host font stack on font_core, shared by Aether and quartzite
     "libs/elessar",
     "libs/resonance",
     "unaos/libs/fs/unafs",

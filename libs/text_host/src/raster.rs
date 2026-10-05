@@ -12,7 +12,7 @@
 //!   ([`embolden`], FreeType's algorithm), advances unchanged; synthetic oblique as Blink sets it, a skew
 //!   of −1/4 (x += y/4 in font units).
 
-use super::Face;
+use crate::Face;
 use font_core::path::{OutlineSink, Path, PathCmd};
 use font_core::raster::{Rasterizer, RenderMode, Scaled};
 use std::collections::HashMap;
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn synthetic_bold_inks_more() {
-        let Some(f) = crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::SANS, 400, false)) else { return };
+        let Some(f) = crate::installed_face("Arial", crate::db::Style::default()) else { return };
         let gid = f.font.glyph_index('l');
         let plain = rasterize(f, gid, 32.0, 0).unwrap();
         let bold = Face {
