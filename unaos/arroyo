@@ -3754,7 +3754,7 @@ build_user_vug_x86() {
 build_user_linux_hello_x86() {
     mkdir -p "${WORKSPACE_DIR}/target"
     ( cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly run --release --quiet -- "${WORKSPACE_DIR}/target/HELLO.LNX" )
-    build_selfbuild_x86   # SELFBUILD1: TCC.LNX + HELLO.C + SYSKAT.LNX + PROBE.LNX
+    build_selfbuild_x86   # SELFBUILD1: TCC.LNX + HELLO.C + SYSKAT.LNX + PROBE.LNX; SELFBUILD2: SYSKAT2.LNX
 }
 
 # SELFBUILD1 (B344): the static Linux binaries `tests selfbuild` / `tests linuxabi` run under the Linux ABI shim, built on the
@@ -3782,6 +3782,15 @@ build_selfbuild_x86() {
     else
         echo "   SELFBUILD1: SYSKAT.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT.LNX"
     fi
+    # SELFBUILD2 (B349): the threaded KAT — 4 clone/clone3 threads on a futex mutex, futex ops, eventfd+epoll, statx, ftruncate/
+    # fallocate/flock, socketpair, sendfile, one signal through rt_sigreturn. Proven on the host kernel (args: a file, its size,
+    # a scratch path — UnaOS passes /apps/HELLO.C, the size its loader sees, <home>/kat2.tmp) before it is staged.
+    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT2.LNX" "$c/syskat2.c" \
+        && "$sb/SYSKAT2.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; then
+        cp "$sb/SYSKAT2.LNX" "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
+    else
+        echo "   SELFBUILD2: SYSKAT2.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
+    fi
     if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ]; then
         if _selfbuild_fetch "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" \
             && ( cd "$sb/tinycc" && ./configure --cc=gcc --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" >/dev/null && make -s tcc >/dev/null 2>&1 ); then
@@ -3800,7 +3809,7 @@ build_selfbuild_x86() {
             echo "   SELFBUILD1: busybox fetch/build failed — PROBE.LNX absent (probe=none)"
         fi
     fi
-    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX HELLO.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
+    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX HELLO.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).

@@ -993,6 +993,8 @@ fn main() {
         ("HELLO.C", "HELLO.C"),
         ("SYSKAT.LNX", "SYSKAT.LNX"),
         ("PROBE.LNX", "PROBE.LNX"),
+        // SELFBUILD2 (B349): the threaded syscall KAT (crates/user-linux-hello/c/syskat2.c) — `tests selfbuild2`.
+        ("SYSKAT2.LNX", "SYSKAT2.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {

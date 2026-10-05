@@ -50,11 +50,11 @@ fn page_up(v: u64) -> Option<u64> {
     v.checked_add(PAGE - 1).map(|x| x & !(PAGE - 1))
 }
 
-fn get(p: &LinuxProc, fd: u64) -> Option<Arc<Desc>> {
+pub fn get(p: &LinuxProc, fd: u64) -> Option<Arc<Desc>> {
     p.fds.get(fd as usize).and_then(|s| s.as_ref()).map(|e| e.d.clone())
 }
 
-fn install(p: &mut LinuxProc, d: Arc<Desc>, min: usize, cloexec: bool) -> i64 {
+pub fn install(p: &mut LinuxProc, d: Arc<Desc>, min: usize, cloexec: bool) -> i64 {
     let mut i = min;
     while i < MAX_FD {
         if i >= p.fds.len() {
@@ -132,7 +132,7 @@ fn mount_ancestor(mt: &crate::fs::vfs::MountTable, path: &str) -> bool {
 }
 
 /// `(is_dir, size)`.
-fn stat_full(path: &str) -> Result<(bool, u64), i64> {
+pub fn stat_full(path: &str) -> Result<(bool, u64), i64> {
     use crate::fs::vfs::NodeKind;
     let mt = crate::shell::vfs_mount_table();
     match mt.stat(path) {
@@ -254,7 +254,7 @@ fn put_stat(p: &LinuxProc, buf: u64, mode: u32, size: u64, ino: u64) -> i64 {
     if p.asp.copy_out(buf, &s, false) { 0 } else { -EFAULT }
 }
 
-fn ino_of(path: &str) -> u64 {
+pub fn ino_of(path: &str) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for b in path.bytes() {
         h = (h ^ b as u64).wrapping_mul(0x100000001b3);
@@ -280,6 +280,7 @@ fn fstat(p: &LinuxProc, fd: u64, buf: u64) -> i64 {
         Kind::File { data, path, .. } => (0o100644, data.len() as u64, ino_of(path)),
         Kind::Dir { path, .. } => (0o040755, 0, ino_of(path)),
         Kind::PipeR(pp) | Kind::PipeW(pp) => (0o010600, fd::lk(&pp.buf).len() as u64, 2),
+        Kind::Ext(x) => (super::sys3::mode(x), 0, 3), // SELFBUILD2
     };
     put_stat(p, buf, mode, size, ino)
 }
@@ -289,7 +290,7 @@ fn console_out(v: &[u8]) {
     fd::out_push(v);
 }
 
-fn do_read(p: &mut LinuxProc, fd: u64, buf: u64, cnt: u64, off: Option<u64>) -> i64 {
+pub fn do_read(p: &mut LinuxProc, fd: u64, buf: u64, cnt: u64, off: Option<u64>) -> i64 {
     let Some(d) = get(p, fd) else { return -EBADF };
     let cnt = cnt.min(1 << 20) as usize;
     if cnt == 0 {
@@ -336,14 +337,17 @@ fn do_read(p: &mut LinuxProc, fd: u64, buf: u64, cnt: u64, off: Option<u64>) -> 
                 b.drain(..n).collect()
             }
             Kind::PipeW(_) => return -EBADF,
+            Kind::Ext(x) => match super::sys3::read_ext(x, cnt, nb) {
+                Ok(v) => v, // SELFBUILD2: eventfd / socket
+                Err(e) => return e,
+            },
         }
     };
     p.asp.copy_out(buf, &data, false);
     data.len() as i64
 }
 
-fn do_write(p: &mut LinuxProc, fd: u64, buf: u64, cnt: u64, off: Option<u64>) -> i64 {
-    use crate::fs::vfs::KERNEL_PRINCIPAL;
+pub fn do_write(p: &mut LinuxProc, fd: u64, buf: u64, cnt: u64, off: Option<u64>) -> i64 {
     let Some(d) = get(p, fd) else { return -EBADF };
     let cnt = cnt.min(1 << 20) as usize;
     if cnt == 0 {
@@ -353,6 +357,13 @@ fn do_write(p: &mut LinuxProc, fd: u64, buf: u64, cnt: u64, off: Option<u64>) ->
     if !p.asp.copy_in(buf, &mut v) {
         return -EFAULT;
     }
+    write_desc(&d, &v, off)
+}
+
+/// SELFBUILD2: the body of `write` on a description, from kernel bytes (`sendfile` shares it).
+pub fn write_desc(d: &Desc, v: &[u8], off: Option<u64>) -> i64 {
+    use crate::fs::vfs::KERNEL_PRINCIPAL;
+    let cnt = v.len();
     let nb = d.nonblock();
     let append = d.flags.load(Ordering::Relaxed) & O_APPEND != 0;
     let mut k = fd::lk(&d.k);
@@ -404,6 +415,7 @@ fn do_write(p: &mut LinuxProc, fd: u64, buf: u64, cnt: u64, off: Option<u64>) ->
             b.extend(v[..n].iter().copied());
             n as i64
         }
+        Kind::Ext(x) => super::sys3::write_ext(x, v, nb), // SELFBUILD2
         _ => -EBADF,
     }
 }
@@ -475,7 +487,7 @@ fn do_lseek(p: &mut LinuxProc, fd: u64, off: i64, whence: u64) -> i64 {
     let Some(d) = get(p, fd) else { return -EBADF };
     let mut k = fd::lk(&d.k);
     match &mut *k {
-        Kind::Console | Kind::PipeR(_) | Kind::PipeW(_) => -ESPIPE,
+        Kind::Console | Kind::PipeR(_) | Kind::PipeW(_) | Kind::Ext(_) => -ESPIPE,
         Kind::Dir { pos, .. } => {
             if off == 0 && whence == 0 {
                 *pos = 0;
@@ -571,7 +583,7 @@ fn do_fcntl(p: &mut LinuxProc, fd: u64, cmd: u64, arg: u64) -> i64 {
 }
 
 /// poll revents for one description.
-fn poll_ready(d: &Desc, events: i16) -> i16 {
+pub fn poll_ready(d: &Desc, events: i16) -> i16 {
     const IN: i16 = 1;
     const OUT: i16 = 4;
     const ERR: i16 = 8;
@@ -599,6 +611,7 @@ fn poll_ready(d: &Desc, events: i16) -> i16 {
                 r |= OUT;
             }
         }
+        Kind::Ext(x) => r |= super::sys3::ready(x), // SELFBUILD2
     }
     r & (events | ERR | HUP)
 }
@@ -946,7 +959,8 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
         10 => mprotect(p, a[0], a[1], a[2]),
         11 => munmap(p, a[0], a[1]),
         12 => brk(p, a[0]),
-        13 | 14 => super::sys2::sigs(p, nr, a), // rt_sigaction / rt_sigprocmask: accepted, never delivered (SELFBUILD1: old values written)
+        13 => super::signal::sigaction(p, info, a), // SELFBUILD2: a per-process handler table (SELFBUILD1 accepted, never delivered)
+        14 => super::signal::sigprocmask(p, info, a), // SELFBUILD2: a real blocked mask
         16 => {
             // ioctl: TCGETS / TIOCGWINSZ on the console say "tty"; everything else is -ENOTTY
             let is_con = get(p, a[0]).is_some_and(|d| matches!(&*fd::lk(&d.k), Kind::Console));
@@ -989,7 +1003,14 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
         }
         35 => do_sleep(p, a[0]),
         230 => do_sleep(p, a[2]),
-        39 | 186 | 218 => info.pid as i64,
+        39 => info.pid as i64,
+        186 => super::thread::gettid(info), // SELFBUILD2: tid != tgid in a threaded process
+        218 => super::thread::set_tid_address(info, a[0]),
+        15 => super::signal::sigreturn(p, info, ktop), // SELFBUILD2 M3
+        130 => super::signal::sigsuspend(p, info, a),
+        34 => RETRY, // pause: until a caught signal ends it (-EINTR from the dispatch loop)
+        202 => super::thread::futex(p, info, a), // SELFBUILD2 M1
+        435 => super::thread::clone3(p, info, ktop, a),
         110 => info.ppid.load(Ordering::Acquire) as i64,
         56 => proc::clone(p, info, ktop, a),
         57 | 58 => proc::fork(p, info, ktop, 0),
@@ -1082,14 +1103,15 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
                     return -EINVAL;
                 }
                 p.fs_base = a[1];
-                super::fs_tab_set(info.pml4, a[1]);
+                super::fs_tab_set(super::thread::key_for(info.pml4), a[1]); // SELFBUILD2: per-thread FS_BASE
                 if let Ok(v) = x86_64::VirtAddr::try_new(a[1]) {
                     x86_64::registers::model_specific::FsBase::write(v);
                 }
                 0
             }
             0x1003 => {
-                if p.asp.copy_out(a[1], &p.fs_base.to_le_bytes(), false) { 0 } else { -EFAULT }
+                let fs = super::fs_tab_get(super::thread::key_for(info.pml4)).unwrap_or(p.fs_base); // SELFBUILD2
+                if p.asp.copy_out(a[1], &fs.to_le_bytes(), false) { 0 } else { -EFAULT }
             }
             _ => -EINVAL,
         },

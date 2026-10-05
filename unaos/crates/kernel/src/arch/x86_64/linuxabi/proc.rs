@@ -93,6 +93,8 @@ pub fn reset_session() {
     FORKS.store(0, Ordering::Release);
     CHILD_EXIT_OK.store(0, Ordering::Release);
     with_table(|t| t.clear());
+    super::thread::reset(); // SELFBUILD2
+    super::signal::reset();
 }
 
 pub fn register(i: Arc<ProcInfo>) {
@@ -128,16 +130,17 @@ pub fn make_info(
 pub fn gc() {
     let now = crate::arch::ticks();
     for i in snapshot() {
-        if i.is_live() && i.kill.is_reaped() {
+        if i.is_live() && super::thread::proc_reaped(&i) { // SELFBUILD2: with threads, every task gone
             let sig = i.killsig.load(Ordering::Acquire);
             i.finish(if sig == 0 { 9 } else { sig as i64 });
         }
-        if !i.is_live() && !i.freed.load(Ordering::Acquire) && now >= i.exit_tick.load(Ordering::Acquire) + 50 {
+        if !i.is_live() && !i.freed.load(Ordering::Acquire) && now >= i.exit_tick.load(Ordering::Acquire) + 50 && super::thread::all_gone(i.pid) {
             if let Some(mut lp) = i.lp.try_lock() {
                 lp.fds.clear(); // pipe EOF for the peers
                 lp.asp.free_frames();
                 super::fs_tab_clear(i.pml4);
                 super::fpu::release_slot(i.pml4); // LINUXABI3
+                super::thread::release_all(i.pid, i.pml4); // SELFBUILD2
                 i.freed.store(true, Ordering::Release);
             }
         }
@@ -173,6 +176,7 @@ pub fn exit_current(info: &Arc<ProcInfo>, code: u64, group: bool) -> ! {
         CHILD_EXIT_OK.fetch_add(1, Ordering::AcqRel);
     }
     info.finish(exit_status_for(code));
+    super::signal::post(info.ppid.load(Ordering::Acquire), 17); // SELFBUILD2: SIGCHLD to a parent that catches it
     if is_root {
         super::root_exited(code, group);
     }
@@ -214,6 +218,7 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
     let kill = Arc::new(crate::arch::sched::KillSwitch::new());
     let fds = p.fds.clone();
     let (brk, brk_mapped, mmap_next, fs_base, cwd, umask) = (p.brk, p.brk_mapped, p.mmap_next, p.fs_base, p.cwd.clone(), p.umask);
+    let fs_base = super::fs_tab_get(super::thread::key_for(info.pml4)).unwrap_or(fs_base); // SELFBUILD2: the calling thread's FS
     let exe = p.exe.clone();
     let cinfo = make_info(pid, info.pid, info.pgid.load(Ordering::Acquire), casp, kill.clone(), |asp| LinuxProc {
         asp,
@@ -230,7 +235,8 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
     let pml4 = cinfo.pml4;
     register(cinfo);
     super::fs_tab_set(pml4, fs_base);
-    super::push_fork_regs(pml4, regs);
+    super::push_fork_regs(pml4, &regs);
+    super::signal::fork_copy(info.pid, pid); // SELFBUILD2: handlers + mask inherited
     let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
     let _ = crate::arch::sched::spawn_user_preemptible(TASK_NAME, rip, usp, cpu, pml4, kill);
     FORKS.fetch_add(1, Ordering::AcqRel);
@@ -243,8 +249,11 @@ pub fn clone(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, a: [u64; 6]) ->
     const CLONE_THREAD: u64 = 0x10000;
     const CLONE_VFORK: u64 = 0x4000;
     let flags = a[0];
-    if flags & CLONE_THREAD != 0 || (flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0) {
-        return -38; // real threads / shared-VM clones: not in rung 2
+    if flags & CLONE_THREAD != 0 {
+        return super::thread::clone_thread(p, info, ktop, flags, a[1], a[2], a[3], a[4], a); // SELFBUILD2 M1
+    }
+    if flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0 {
+        return -38; // a shared-VM clone that is not a thread (nor vfork): not answered
     }
     let pid = fork(p, info, ktop, a[1]);
     super::sys2::clone_settid(p, flags, a, pid); // SELFBUILD1: CLONE_PARENT_SETTID / CLONE_CHILD_SETTID (glibc's fork asks for the latter)
@@ -318,7 +327,9 @@ pub fn execve(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, path_va: u64, 
     p.mmap_next = MMAP_BASE;
     p.fs_base = 0;
     p.exe = full.clone();
-    super::fs_tab_clear(info.pml4);
+    super::fs_tab_clear(super::thread::key_for(info.pml4)); // SELFBUILD2: the calling thread's key
+    super::thread::exec_kill_others(info); // SELFBUILD2: exec de-threads the process
+    super::signal::exec_reset(info.pid); // caught signals back to SIG_DFL
     super::fpu::exec_reset(); // LINUXABI3: the new image starts from the Linux initial x87/SSE state
     for s in p.fds.iter_mut() {
         if s.as_ref().is_some_and(|e| e.cloexec) {
@@ -432,7 +443,7 @@ pub fn kill(me: &Arc<ProcInfo>, pid: i64, sig: u64) -> i64 {
         return -EINVAL;
     }
     let targets: Vec<Arc<ProcInfo>> = if pid > 0 {
-        match find(pid as u32) {
+        match find(pid as u32).or_else(|| super::thread::tgid_of(pid as u32).and_then(find)) { // SELFBUILD2: a tid names its process
             Some(t) if t.is_live() => alloc::vec![t],
             _ => return -ESRCH,
         }
@@ -445,10 +456,14 @@ pub fn kill(me: &Arc<ProcInfo>, pid: i64, sig: u64) -> i64 {
     if targets.is_empty() {
         return -ESRCH;
     }
-    if sig != 0 && fatal_sig(sig) {
-        for t in targets {
+    for t in targets {
+        if super::signal::post(t.pid, sig) {
+            continue; // SELFBUILD2 M3: caught (queued for its handler) or ignored — not the default action
+        }
+        if sig != 0 && fatal_sig(sig) {
             t.killsig.store(sig as u32, Ordering::Release);
             t.kill.request(); // ends the task at its next kill boundary; gc turns it into a signalled zombie
+            super::thread::kill_group(t.pid); // SELFBUILD2: every thread of it
         }
     }
     0

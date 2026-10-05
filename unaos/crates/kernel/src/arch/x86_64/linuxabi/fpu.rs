@@ -155,6 +155,7 @@ pub fn dispatch(cpu: usize, cr3: u64, name: &str, ring3: bool) {
     if cpu >= MAX_CPUS {
         return;
     }
+    let cr3 = if name == super::TASK_NAME { super::thread::key_for(cr3) } else { cr3 }; // SELFBUILD2: one slot per THREAD key
     if cr3 != 0 && name == super::TASK_NAME && super::ACTIVE.load(Ordering::Acquire) && supported() {
         if let Some(i) = claim(cr3, &INIT) {
             core_init(cpu);
@@ -221,4 +222,38 @@ pub fn release_slot(cr3: u64) {
 /// Slots in use (the `tests linuxabi3` leak check reads it after the session).
 pub fn in_use() -> usize {
     TAB.iter().filter(|s| s.key.load(Ordering::Acquire) != 0).count()
+}
+
+/// SELFBUILD2 (signal delivery): the CURRENT Linux task's x87/SSE file — live in the registers while it runs in the kernel — as
+/// an FXSAVE image. `false` = no Linux FP state is live on this core.
+pub fn save_live(out: &mut [u8; 512]) -> bool {
+    let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+    if cpu >= MAX_CPUS || LIVE_KEY[cpu].load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let mut a = Area([0; 512]);
+    unsafe { fxsave(&mut a) };
+    out.copy_from_slice(&a.0);
+    true
+}
+
+/// SELFBUILD2 (`rt_sigreturn`): load a user-supplied FXSAVE image into the current Linux task's registers. MXCSR is masked to
+/// what this CPU accepts first — a reserved MXCSR bit makes `fxrstor` #GP at CPL 0.
+pub fn restore_live(img: &[u8; 512]) -> bool {
+    let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+    if cpu >= MAX_CPUS || LIVE_KEY[cpu].load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let mut cur = Area([0; 512]);
+    unsafe { fxsave(&mut cur) };
+    let mut mask = u32::from_le_bytes([cur.0[28], cur.0[29], cur.0[30], cur.0[31]]);
+    if mask == 0 {
+        mask = 0xFFBF; // the architectural default MXCSR_MASK
+    }
+    let mut a = Area(*img);
+    let mx = u32::from_le_bytes([a.0[24], a.0[25], a.0[26], a.0[27]]) & mask;
+    a.0[24..28].copy_from_slice(&mx.to_le_bytes());
+    a.0[28..32].copy_from_slice(&[0; 4]);
+    unsafe { fxrstor(&a) };
+    true
 }
