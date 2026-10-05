@@ -211,7 +211,7 @@ fn this_node_id(this: &JsValue, ctx: &mut Context) -> i32 {
 /// The `QualName` is cloned off an element that already exists in the
 /// document and retargeted at `local`, rather than written out with
 /// `ns!(html)`: kuchiki 0.8 builds on html5ever 0.25, while this crate's own
-/// `html5ever` dependency is 0.39, so the 0.39 `QualName`/`ns!` types are a
+/// `html5ever` dependency is 0.40, so the 0.40 `QualName`/`ns!` types are a
 /// different type from the one `NodeRef::new_element` accepts and cannot be
 /// passed to it. Cloning keeps the namespace exactly right by construction.
 /// Any local name works, including unknown and custom tags.

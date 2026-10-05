@@ -7,7 +7,7 @@ license = "LGPL-3.0-or-later"
 [dependencies]
 boa_engine = "0.21"
 boa_gc = "0.21"
-html5ever = "0.39"
+html5ever = "0.40"
 kuchiki = "0.8"
 taffy = "0.14"
 reqwest = { version = "0.12", features = ["json", "stream", "blocking", "cookies"] }
