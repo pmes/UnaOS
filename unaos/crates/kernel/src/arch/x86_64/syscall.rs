@@ -30084,6 +30084,8 @@ pub fn bus_notice_to(row: usize, body: &[u8]) -> i64 {
 #[cfg(feature = "busreg")]
 pub fn busreg_ops() -> &'static crate::bus_route::Ops {
     &BUSREG_OPS
+}
+
 // =================================================================================================
 // SELFDIAG (rmbp-ledger B324, R82) — `SYS_PATH_READ` (59) / `SYS_PATH_WRITE` (60): whole-path file I/O for
 // ring 3, fulfilled over the VFS by `crate::selfdiag::path_fulfil` (layouts in una-abi's SELFDIAG block).
@@ -30110,6 +30112,10 @@ fn sys_pathio(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
             }
             ret
         }
+        Err(e) => e,
+    }
+}
+
 // =================================================================================================
 // RING3ABI2 (rmbp-ledger B333) — argv for the launchers, and SYS_WHOAMI. Design and witness:
 // docs/dev/evidence/rmbp-1005/RING3ABI2.md.
