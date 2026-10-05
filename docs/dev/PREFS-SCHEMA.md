@@ -10,10 +10,11 @@ or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keep
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
 operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
 
-Rows: 25.
+Rows: 29.
 
 | key | type | default | writers | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- |
+| `system.audio.amp_holdoff_ms` | int `0..=600000` | consumer: `hda_amp::AMP_HOLDOFF_MS`, 5000 ms | operator | kernel HDA amp (`drivers/hda_amp.rs`) | Milliseconds of silence before the speaker amp powers down (PREFSKERNEL: declared from the kernel scan). |
 | `system.audio.mute` | bool | `false` | settings, keys | kernel settings (audio) | Output muted. |
 | `system.audio.volume` | int `0..=16` | `12` | settings, keys | kernel settings (audio) | Output level in sixteenths. |
 | `system.display.brightness` | int `1..=16` | `12` | settings, keys | kernel settings, backlight | Panel level in sixteenths; never 0 (BRIGHTFLOOR: the backlight's OFF belongs to the idle blank). |
@@ -29,16 +30,19 @@ Rows: 25.
 | `vein.embed.model` | string ≤128 printable | consumer: `gemini.embed_model` for gemini, `all-MiniLM-L6-v2` for local | operator | gneiss_pal EmbedConfig | The embedding model. |
 | `vein.embed.provider` | enum `gemini \| local \| off` | rule `embedder` | operator | gneiss_pal EmbedConfig | The embedder, its own setting independent of the chat provider (R81); off = recall disabled, said in-chat. |
 | `vein.embed.reembed_batch` | int `1..=100000` | `16` | operator | vein reembed | Memories per re-embed pass. |
+| `vein.endpoint` | string ≤256 printable | consumer: Anthropic's messages endpoint (`vein_core::prefs::DEFAULT_ENDPOINT`); empty = that | operator | kernel lumen, user-lumen (`vein_core::prefs::parse_endpoint`) | The chat endpoint URL on the metal: https:// direct, or an http:// relay. |
 | `vein.gemini.api_key_env` | string ≤128 printable | `"GEMINI_API_KEY"` | operator | gneiss_pal ProviderConfig, EmbedConfig | NAME of the environment variable holding the Gemini key. |
 | `vein.gemini.auth` | enum `gcloud \| api_key \| apikey \| key \| adc \| gcloud_adc` | `"gcloud"` | operator | gneiss_pal ProviderConfig, EmbedConfig | Gemini authentication: gcloud ADC or an API key from `gemini.api_key_env`. |
 | `vein.gemini.embed_model` | string ≤128 printable | `"text-embedding-004"` | operator | gneiss_pal ProviderConfig, EmbedConfig | Gemini's embedding model. |
 | `vein.gemini.embed_region` | string ≤128 printable | `"us-central1"` | operator | gneiss_pal ProviderConfig, EmbedConfig | Vertex region for embeddings. |
 | `vein.gemini.project` | string ≤128 printable | consumer: none: gcloud auth refuses without one | operator | gneiss_pal ProviderConfig, EmbedConfig | Google Cloud project for Vertex. |
 | `vein.gemini.region` | string ≤128 printable | `"global"` | operator | gneiss_pal ProviderConfig | Vertex region for chat. |
+| `vein.key_file` | string ≤256 printable | consumer: none: no key, so the metal runs the echo provider | operator | kernel lumen, user-lumen | Absolute path of the API key FILE on the UnaFS volume (the key itself is never a preference; a key on FAT is refused). |
 | `vein.max_tokens` | int `1..=4294967295` | `16000` | operator | gneiss_pal ProviderConfig | Output token cap per reply. |
 | `vein.model` | string ≤128 printable | rule `chat-model` | operator | gneiss_pal ProviderConfig | The chat model. |
 | `vein.provider` | enum `claude \| gemini \| echo \| relay` | `"claude"` | operator | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired). |
 | `vein.temperature` | float `0.0..=2.0` | consumer: the provider's own | operator | gneiss_pal ProviderConfig | Sampling temperature. |
+| `vein.tls` | enum `verify \| insecure` | `"verify"` | operator | kernel lumen, user-lumen (`vein_core::prefs::tls_policy`) | TLS certificate policy on the metal; insecure sends the key without certificate checks (the trust store is owed). |
 
 ## Rules (derived defaults)
 

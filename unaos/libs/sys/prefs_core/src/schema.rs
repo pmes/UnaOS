@@ -126,6 +126,12 @@ pub const GEMINI_DEFAULT_KEY_ENV: &str = "GEMINI_API_KEY";
 pub static SCHEMA: &[Key] = &[
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     Key {
+        ns: "system", key: "audio.amp_holdoff_ms", kind: Kind::Int { min: 0, max: 600_000 },
+        default: Default::Consumer("`hda_amp::AMP_HOLDOFF_MS`, 5000 ms"),
+        writers: OP, reader: "kernel HDA amp (`drivers/hda_amp.rs`)",
+        doc: "Milliseconds of silence before the speaker amp powers down (PREFSKERNEL: declared from the kernel scan).",
+    },
+    Key {
         ns: "system", key: "audio.mute", kind: Kind::Bool, default: Default::Bool(false),
         writers: &[Writer::Settings, Writer::Keys], reader: "kernel settings (audio)",
         doc: "Output muted.",
@@ -211,6 +217,12 @@ pub static SCHEMA: &[Key] = &[
         doc: "Memories per re-embed pass.",
     },
     Key {
+        ns: "vein", key: "endpoint", kind: Kind::Str { max_len: 256, printable: true },
+        default: Default::Consumer("Anthropic's messages endpoint (`vein_core::prefs::DEFAULT_ENDPOINT`); empty = that"),
+        writers: OP, reader: "kernel lumen, user-lumen (`vein_core::prefs::parse_endpoint`)",
+        doc: "The chat endpoint URL on the metal: https:// direct, or an http:// relay.",
+    },
+    Key {
         ns: "vein", key: "gemini.api_key_env", kind: NAME, default: Default::Str(GEMINI_DEFAULT_KEY_ENV),
         writers: OP, reader: "gneiss_pal ProviderConfig, EmbedConfig",
         doc: "NAME of the environment variable holding the Gemini key.",
@@ -243,6 +255,12 @@ pub static SCHEMA: &[Key] = &[
         doc: "Vertex region for chat.",
     },
     Key {
+        ns: "vein", key: "key_file", kind: Kind::Str { max_len: 256, printable: true },
+        default: Default::Consumer("none: no key, so the metal runs the echo provider"),
+        writers: OP, reader: "kernel lumen, user-lumen",
+        doc: "Absolute path of the API key FILE on the UnaFS volume (the key itself is never a preference; a key on FAT is refused).",
+    },
+    Key {
         ns: "vein", key: "max_tokens", kind: Kind::Int { min: 1, max: u32::MAX as i64 }, default: Default::Int(16000),
         writers: OP, reader: "gneiss_pal ProviderConfig",
         doc: "Output token cap per reply.",
@@ -263,6 +281,11 @@ pub static SCHEMA: &[Key] = &[
         default: Default::Consumer("the provider's own"),
         writers: OP, reader: "gneiss_pal ProviderConfig",
         doc: "Sampling temperature.",
+    },
+    Key {
+        ns: "vein", key: "tls", kind: Kind::Enum(&["verify", "insecure"]), default: Default::Str("verify"),
+        writers: OP, reader: "kernel lumen, user-lumen (`vein_core::prefs::tls_policy`)",
+        doc: "TLS certificate policy on the metal; insecure sends the key without certificate checks (the trust store is owed).",
     },
 ];
 

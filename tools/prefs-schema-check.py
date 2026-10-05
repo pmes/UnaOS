@@ -22,8 +22,16 @@
 #   R4 a PREF_GET / PREF_SET bus body literal `b"<ns>.<key>..."`                      -> <ns>.<key>
 #   R5 `PrefGet|PrefSet { ns: "<ns>", key: "<key>"` and `set("<ns>", "<key>"`        -> <ns>.<key>
 #   R6 a `"display.<...>"` literal in prefs_core's `display` module                   -> system.<key>
-# The user-prefs fixture TABLE (BANDY3's R3PREF demo verbs 128/129) is not Principia's store and is not
-# scanned.
+# The kernel's own shapes (PREFSKERNEL, rmbp-ledger B345 — the gate covers unaos/crates/kernel/src):
+#   R7 `prefs::get|set|set_applied("<ns>", "<key>"`                                    -> <ns>.<key>
+#   R8 a closure `let f = |k: &str| …prefs::get("<ns>", k)…` and every `f("<key>")` call in that file
+#                                                                                      -> <ns>.<key>
+#   R9 `prefs::int|peek_int|flag|text(` or `sys_int|sys_flag|sys_text|sys_get|sys_set(` (prefs_client)
+#      on a `"<key>"` literal, or on a `CONST` the same file declares `const CONST: &str = "<key>"`
+#                                                                                      -> system.<key>
+#   R4 also reads Principia's ring-3 tags (`BUS_VERB_R3PREF_GET|SET`).
+#   R10 the user-prefs demo TABLE rows `(b"<ns>.<key>", b"<value>")` (crates/user-prefs): its keys are
+#      schema keys since PREFSKERNEL (its five namespace-less demo keys drifted from the schema).
 import os
 import re
 import sys
@@ -111,13 +119,33 @@ def refs_in(path, src, consts):
             if ns:
                 yield ns + "." + g.group(1), line_of(g.start()), "R3"
     # R4
-    for g in re.finditer(r"BUS_VERB_PREF_(?:GET|SET)\s*,\s*\w+\s*,\s*b\"(" + SEG + r")\.(" + KEY + r")", src):
+    for g in re.finditer(r"BUS_VERB_(?:R3)?PREF_(?:GET|SET)\s*,\s*\w+\s*,\s*b\"(" + SEG + r")\.(" + KEY + r")", src):
         yield g.group(1) + "." + g.group(2), line_of(g.start()), "R4"
     # R5
     for g in re.finditer(r"Pref(?:Get|Set)\s*\{\s*ns:\s*\"(" + SEG + r")\"[^}]*?key:\s*\"(" + KEY + r")\"", src):
         yield g.group(1) + "." + g.group(2), line_of(g.start()), "R5"
     for g in re.finditer(r"(?<![\w])set\(\s*\"(" + SEG + r")\"\s*,\s*\"(" + KEY + r")\"", src):
         yield g.group(1) + "." + g.group(2), line_of(g.start()), "R5"
+    # R7
+    for g in re.finditer(r"prefs::(?:get|set|set_applied)\(\s*\"(" + SEG + r")\"\s*,\s*\"(" + KEY + r")\"", src):
+        yield g.group(1) + "." + g.group(2), line_of(g.start()), "R7"
+    # R8
+    for c in re.finditer(r"let (\w+) = \|(\w+): &str\|[^;\n]*?prefs::get\(\s*\"(" + SEG + r")\"\s*,\s*\2\s*\)", src):
+        name, ns = c.group(1), c.group(3)
+        for g in re.finditer(r"(?<![\w.])" + re.escape(name) + r"\(\s*\"(" + KEY + r")\"\s*\)", src):
+            yield ns + "." + g.group(1), line_of(g.start()), "R8"
+    # R9
+    local = {m.group(1): m.group(2) for m in re.finditer(r"const (\w+): &str = \"(" + KEY + r")\"", src)}
+    for g in re.finditer(r"(?:prefs::(?:int|peek_int|flag|text)|(?<![\w])sys_(?:int|flag|text|get|set))\(\s*(\"(" + KEY + r")\"|[A-Z][A-Z0-9_]*)\s*[,)]", src):
+        key = g.group(2) if g.group(2) else local.get(g.group(1))
+        if key:
+            yield "system." + key, line_of(g.start()), "R9"
+    # R10
+    if path.replace(os.sep, "/").endswith("crates/user-prefs/src/main.rs"):
+        mt = re.search(r"const TABLE: [^=]*= &\[(.*?)\];", src, re.S)
+        if mt:
+            for g in re.finditer(r"\(b\"(" + SEG + r")\.(" + KEY + r")\"\s*,", mt.group(1)):
+                yield g.group(1) + "." + g.group(2), line_of(mt.start(1) + g.start()), "R10"
     # R6
     if path.endswith(os.path.join("prefs_core", "src", "lib.rs")):
         md = re.search(r"pub mod display \{", src)
@@ -176,12 +204,20 @@ def selftest(keys):
         ("libs/x/src/a.rs", 'pub const PREF_NS: &str = "vein";\nfn from_prefs() { get("provider"); get("phantom.knob"); }\n'
          '#[cfg(test)]\nmod tests { fn t() { get("only.in_tests"); } }\n'),
         ("unaos/crates/user-x/src/main.rs", 'ask(BUS_VERB_PREF_GET, 1, b"vein.provider");\nask(BUS_VERB_PREF_SET, 2, b"quarry.view\\x00\\"list\\"");\n'),
+        # PREFSKERNEL: the kernel shapes R7..R9 and the user-prefs table R10.
+        ("unaos/crates/kernel/src/drivers/x.rs",
+         'pub const PREF_KEY: &str = "audio.ghost_ms";\nfn a() { crate::prefs::peek_int(PREF_KEY, 0, 9); crate::prefs::int("audio.volume", 0, 16); }\n'
+         'fn b() { crate::prefs::get("vein", "ghost_url"); let s = |k: &str| crate::prefs::get("vein", k).map(|v| v); s("phantom_tls"); s("provider"); }\n'),
+        ("unaos/crates/user-prefs/src/main.rs", 'const TABLE: &[(&[u8], &[u8])] = &[\n    (b"system.audio.volume", b"12"),\n    (b"ui.theme", b"dark"),\n];\n'
+         'fn c() { ask(BUS_VERB_R3PREF_GET, 1, b"ui.font_scale"); }\n'),
     ]
     files = [(p, strip_tests(s)) for p, s in fake]
     found = scan(files)
-    want_missing = {"system.display.ghost_key", "vein.phantom.knob", "quarry.view"}
+    want_missing = {"system.display.ghost_key", "vein.phantom.knob", "quarry.view",
+                    "system.audio.ghost_ms", "vein.ghost_url", "vein.phantom_tls", "ui.theme", "ui.font_scale"}
     missing = {k for k in found if k not in keys}
-    ok = missing == want_missing and "vein.only.in_tests" not in found and "system.display.brightness" in found
+    ok = (missing == want_missing and "vein.only.in_tests" not in found and "system.display.brightness" in found
+          and "system.audio.volume" in found and "vein.provider" in found)
     print("prefs-schema-check selftest: found=%s missing=%s -> %s" % (sorted(found), sorted(missing), "PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

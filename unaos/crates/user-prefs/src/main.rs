@@ -12,7 +12,7 @@
 //   1. probe  — asks PrefGet BEFORE registering: with no fulfiller the kernel answers -ENOENT (no hang).
 //   2. register PrefGet + PrefList (BUS_VERB_REGISTER) — 0.
 //   3. register LS — refused -EEXIST: a kernel-owned verb cannot be taken over (kernel fulfilment wins).
-//   4. self_get — asks PrefGet `ui.theme` of ITSELF through the kernel: the relayed request arrives in
+//   4. self_get — asks PrefGet `system.pointer.speed` (PROBE_KEY) of ITSELF through the kernel: the relayed request arrives in
 //      its own mailbox carrying a KERNEL-stamped principal (never the caller's claim), it answers it, and
 //      the answer comes back as a KERNEL-stamped reply with the original corr.
 //   then prints ONE line and SERVES forever: every relayed request is answered from the table below.
@@ -189,14 +189,20 @@ fn exit(code: i32) -> ! {
     }
 }
 
-/// The v1 answer table — Principia's dotted keys, TOML scalar text. OWED: `prefs_core` replaces it.
+/// The fallback answer table — `<ns>.<key>` and the TOML literal of its schema default. PREFSKERNEL
+/// (B345): these are SCHEMA keys (`prefs_core::schema::SCHEMA`, docs/dev/PREFS-SCHEMA.md) answering their
+/// declared static defaults; the five namespace-less v1 demo keys (`ui.theme`, `ui.font_scale`,
+/// `input.pointer_speed`, `power.idle_blank_secs`, `audio.volume`) drifted from the schema and are gone.
+/// `tools/prefs-schema-check.py` scans this table (R10), so a row with no schema key fails the gate.
 const TABLE: &[(&[u8], &[u8])] = &[
-    (b"ui.theme", b"dark"),
-    (b"ui.font_scale", b"1"),
-    (b"input.pointer_speed", b"5"),
-    (b"power.idle_blank_secs", b"300"),
-    (b"audio.volume", b"70"),
+    (b"system.audio.mute", b"false"),
+    (b"system.audio.volume", b"12"),
+    (b"system.display.brightness", b"12"),
+    (b"system.display.idle_min", b"10"),
+    (b"system.pointer.speed", b"1"),
 ];
+/// The key the self-get probes (a schema key; its fallback is the table's default).
+const PROBE_KEY: &[u8] = b"system.pointer.speed";
 
 /// The PRIN_KERNEL_REPLY kind every kernel reply carries.
 const PRIN_KERNEL_REPLY: u8 = 4;
@@ -269,12 +275,17 @@ fn ask(verb: u8, corr: u32, body: &[u8]) -> i64 {
     }
 }
 
+/// Does a LIST body (`<ns>.<key> = <literal>` lines) carry `key`?
+fn lists_key(list: &[u8], key: &[u8]) -> bool {
+    list.split(|&b| b == b'\n').any(|l| l.len() > key.len() + 2 && l.starts_with(key) && &l[key.len()..key.len() + 3] == b" = ")
+}
+
 /// Answer the relayed request sitting in RX. Returns the status it answered with.
 ///
 /// SETTINGSBUS (B337): Principia's answers come from the ONE store — each relayed request is asked of the
 /// kernel's store verbs (PREF_GET / PREF_SET / PREF_LIST, 16..=18) from HERE, under THIS program's own
 /// session principal (a fulfiller never acts as its caller). The fixed v1 `TABLE` stays as the fallback
-/// for its own demo keys (an unset `ui.theme` still answers `dark`).
+/// for its schema keys (an unset `system.pointer.speed` answers its default `1`).
 fn serve(h: &Hdr) -> i32 {
     // The relayed request is copied out of RX first: the forward below receives into RX.
     let mut req = [0u8; 1024];
@@ -307,8 +318,12 @@ fn serve(h: &Hdr) -> i32 {
                     len = n;
                 }
             }
+            let listed = len;
             for (k, v) in TABLE.iter().filter(|(k, _)| k.starts_with(body)) {
-                for part in [*k, b"=".as_slice(), *v, b"\n".as_slice()] {
+                if lists_key(&outb()[..listed], k) {
+                    continue; // the store holds it: its value, not the default, is the answer
+                }
+                for part in [*k, b" = ".as_slice(), *v, b"\n".as_slice()] {
                     if len + part.len() <= outb().len() {
                         outb()[len..len + part.len()].copy_from_slice(part);
                         len += part.len();
@@ -419,7 +434,7 @@ impl Line {
 pub extern "C" fn _start() -> ! {
     // 1. probe: no fulfiller yet -> -ENOENT, an answer and not a hang. (Knob off: the tag is refused at
     //    SYS_MSEND with -EINVAL, and the program says so and exits — nothing to serve.)
-    let probe = ask(BUS_VERB_R3PREF_GET, 1, b"ui.theme");
+    let probe = ask(BUS_VERB_R3PREF_GET, 1, PROBE_KEY);
     // 2. register Principia's two read verbs.
     let register = ask(BUS_VERB_REGISTER, 2, &[BUS_VERB_R3PREF_GET, BUS_VERB_R3PREF_LIST, BUS_VERB_R3PREF_SET]); // SETTINGSBUS: + the write tag
     // 3. a kernel-owned verb cannot be taken over.
@@ -429,7 +444,20 @@ pub extern "C" fn _start() -> ! {
     let mut stamp_kernel = false;
     let mut stamped_caller = false;
     if register == 0 {
-        let n = build(BUS_KIND_REQUEST, BUS_VERB_R3PREF_GET, 4, 0, b"ui.theme");
+        // PREFSKERNEL: the answer the self-get must return — the store's value, else the table default.
+        let mut want = [0u8; 64];
+        let wl = match forward(BUS_VERB_PREF_GET, PROBE_KEY) {
+            (0, n) if n <= want.len() => {
+                want[..n].copy_from_slice(&outb()[..n]);
+                n
+            }
+            _ => {
+                let d = TABLE.iter().find(|(k, _)| *k == PROBE_KEY).map(|(_, v)| *v).unwrap_or(b"");
+                want[..d.len()].copy_from_slice(d);
+                d.len()
+            }
+        };
+        let n = build(BUS_KIND_REQUEST, BUS_VERB_R3PREF_GET, 4, 0, PROBE_KEY);
         if send(n) == 0 {
             if let Some(h) = hdr(recv()) {
                 if h.kind == BUS_KIND_REQUEST && h.verb == BUS_VERB_R3PREF_GET {
@@ -438,7 +466,7 @@ pub extern "C" fn _start() -> ! {
                     if let Some(r) = hdr(recv()) {
                         let x = rx();
                         stamp_kernel = r.kind == BUS_KIND_REPLY && r.corr == 4 && x[16] == PRIN_KERNEL_REPLY && x[17..48].iter().all(|&b| b == 0);
-                        self_get = if r.status == 0 && &x[BUS_HDR_LEN..BUS_HDR_LEN + r.body_len] == b"dark" { 0 } else { r.status as i64 };
+                        self_get = if r.status == 0 && &x[BUS_HDR_LEN..BUS_HDR_LEN + r.body_len] == &want[..wl] { 0 } else { r.status as i64 };
                     }
                 }
             }
