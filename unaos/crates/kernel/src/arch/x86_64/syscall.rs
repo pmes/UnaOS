@@ -30072,3 +30072,10 @@ pub fn bus_notice_to(row: usize, body: &[u8]) -> i64 {
     }
     busx_reply_enqueue(row, 0, crate::bus::BUS_VERB_NOTICE, 0, body)
 }
+
+// SETTINGSBUS (rmbp-ledger B337): the router's view of this arch's mailboxes, for the kernel's preference
+// client (`prefs_client.rs` relays a desktop request to the ring-3 Principia through `bus_route` with it).
+#[cfg(feature = "busreg")]
+pub fn busreg_ops() -> &'static crate::bus_route::Ops {
+    &BUSREG_OPS
+}

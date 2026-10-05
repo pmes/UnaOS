@@ -3309,13 +3309,13 @@ pub fn dp_render(mask: u32) -> alloc::string::String {
 fn dp_write(mask: u32) -> Result<usize, alloc::string::String> {
     let v = dp_render(mask);
     let n = v.len();
-    crate::prefs::set(crate::prefs::NS, crate::prefs::key::DOCK_PINS, crate::prefs::PrefValue::Str(v)).map(|_| n)
+    crate::prefs_client::pref_set(crate::prefs::NS, crate::prefs::key::DOCK_PINS, crate::prefs::PrefValue::Str(v)).map(|_| n).map_err(|e| alloc::format!("bus status {}", e)) // SETTINGSBUS (B337): a PrefSet over the bus
 }
 
 /// Read `system.dock.pins` into the mask. Unset or no known name = the default set. Returns names loaded (0 = default).
 fn dp_load() -> u32 {
-    crate::prefs::ensure_loaded();
-    match crate::prefs::text(crate::prefs::key::DOCK_PINS) {
+    // SETTINGSBUS (B337): the pins are read with a PrefGet over the bus (the store loads on its first verb).
+    match crate::prefs_client::sys_text(crate::prefs::key::DOCK_PINS) {
         Some(t) => {
             let (m, c) = dp_parse(t.as_bytes());
             if c == 0 { DP_MASK.store(DP_ALL, Ordering::Release); 0 } else { DP_MASK.store(m, Ordering::Release); c }

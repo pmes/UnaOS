@@ -1197,3 +1197,10 @@ impl AppNote {
     }
 }
 const _: () = assert!(core::mem::size_of::<AppNote>() == 24);
+
+// SETTINGSBUS (rmbp-ledger B337) — Principia's ring-3 WRITE tag beside BANDY3's read pair. The kernel's
+// preference client (`prefs_client.rs`) offers every PREF_SET to whoever holds this tag (PREFS.ELF) before
+// the kernel fulfiller answers; body = the PREF_SET body (`<ns>.<key>` NUL `<TOML literal>`), reply empty
+// or an errno. Retires with the read pair when a ring-3 Principia takes 16..=19 over. Appended at the tail.
+pub const BUS_VERB_R3PREF_SET: u8 = 130;
+const _: () = assert!(BUS_VERB_R3PREF_SET >= BUS_VERB_FULFIL_MIN && BUS_VERB_R3PREF_SET != BUS_VERB_R3PREF_GET && BUS_VERB_R3PREF_SET != BUS_VERB_R3PREF_LIST);
