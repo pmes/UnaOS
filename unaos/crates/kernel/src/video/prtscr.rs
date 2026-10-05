@@ -1214,13 +1214,14 @@ impl Job {
 
         // 3. PRTSCR-HOME — the user's own folder, created if absent, on THIS volume. One witness
         //    line per capture (`ensure_capture_dir` prints it), never one per slice.
-        let (dir_cluster, dir) = ensure_capture_dir(&fs, &plan)?;
+        let native = native_capture_dir(&plan); // VOLUMES (B366) M1: on a native root the folder is made through the mount table, never on the FAT
+        let (dir_cluster, dir) = match native { Some(r) => (NATIVE_DIR, r?), None => ensure_capture_dir(&fs, &plan)? };
 
         // 4. A name nothing else owns, IN THAT DIRECTORY.
         // SCRSHOT-DESKTOP (R60): `choose_name`, not `next_free_name` — the clock stamp when there is
         // a clock, the ladder when there is not, and a token saying which. Same never-overwrite
         // contract in both arms; see the naming block above `clock_name`.
-        let (name, name_from) = if let Some((_, n)) = &named { (named_replace(&fs, dir_cluster, &plan, n)?, "named") } else if kind != 0 { (shot_name(&fs, dir_cluster)?, if shot_clock_name().is_some() { "clock" } else { "clock-unset" }) } else { choose_name(&fs, dir_cluster)? };
+        let (name, name_from) = if dir_cluster == NATIVE_DIR { native_pick(&fs, &dir, &named, kind)? } else if let Some((_, n)) = &named { (named_replace(&fs, dir_cluster, &plan, n)?, "named") } else if kind != 0 { (shot_name(&fs, dir_cluster)?, if shot_clock_name().is_some() { "clock" } else { "clock-unset" }) } else { choose_name(&fs, dir_cluster)? };
 
         // PRTSCR2: name it on the wire BEFORE it can exist on the medium. From here every exit is
         // one of `-> OK`, a `— capture skipped` refusal, or a boot that ended inside this capture.
@@ -1397,6 +1398,9 @@ impl Job {
                             .is_ok();
                         if vfs_ok {
                             self.routed = Some(RoutedMt(mt));
+                        } else if self.dir_cluster == NATIVE_DIR {
+                            // VOLUMES (B366) M1: the folder is on the native root; there is no FAT twin to fall back to.
+                            return Err(Refusal::Fat(vol_id(&self.fs), "create (native home)", FatError::Io));
                         } else {
                             let dc = self.dir_cluster;
                             match busy_retry(|| self.fs.create_in_dir(dc, &self.name, 0x20)) {
@@ -1626,6 +1630,7 @@ pub fn selftest_once() {
     // cannot pass all three, because the size is the directory's own and the IEND is at the end.
     // PRTSCR-HOME: read back from the CAPTURE DIRECTORY the shot names, not the root — which is
     // itself part of what this selftest now proves. A file that landed anywhere else fails here.
+    if shot.dir_cluster == NATIVE_DIR { native_readback(&shot); return; } // VOLUMES (B366) M1: a native-root shot reads back through the mount table
     let (de, _, _) = match fs.locate_in_dir(shot.dir_cluster, &shot.name) {
         Ok(hit) => hit,
         Err(e) => {
@@ -2419,4 +2424,96 @@ pub fn capture_named(leaf: &'static str, name: &str) -> Result<Shot, Refusal> {
 /// GLASSEYES — the open session's home (`/home/<name>`), or the same refusal a capture would give.
 pub fn session_home() -> Result<String, Refusal> {
     live_plan().map(|p| String::from(p.home_str()))
+}
+
+// ── VOLUMES (rmbp-ledger B366) M1 — the capture folder lives where `/home` lives ─────────────────
+//
+// Flight 22 (Peter, item 4): "a duplicate home dir is created on the fat boot partition". The wire
+// named the creator: `PRTSCR-DIR … path=home/una/Desktop created=3` then `SHOTMOUNT: via=fat … -> FAIL`.
+// [`ensure_capture_dir`] walks the FAT capture TARGET (the boot partition) and mints `HOME/<u>/Desktop`
+// there, while the session's `/home/<u>` is on the UnaFS root — so the mount-table create of
+// `/home/<u>/Desktop/<name>` had no parent and the bytes fell back to the FAT copy. The user store
+// already decides the home's medium through the mount table (`users::ensure_home_native`); the capture
+// now asks the same question the same way: on a native root the folder is created THROUGH THE MOUNT
+// TABLE, the name is chosen against that directory, and the FAT is never walked. A FAT-only card keeps
+// the walk below verbatim.
+
+/// The [`Shot::dir_cluster`] of a capture whose folder is on the native root (no FAT cluster exists).
+pub const NATIVE_DIR: u32 = u32::MAX;
+
+/// `None` = the root is not the native volume (the FAT walk answers). `Some(Ok(dir))` = the capture
+/// folder `<home>/<leaf>` exists on the volume the mount table puts `/home` on.
+fn native_capture_dir(plan: &DirPlan) -> Option<Result<String, Refusal>> {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
+    let mt = crate::shell::vfs_mount_table();
+    if mt.volume_name("/").ok()? != "native" {
+        return None;
+    }
+    let dir = alloc::format!("{}/{}", plan.home_str(), cur_leaf().0);
+    let mut created = 0u32;
+    let mut at = String::new();
+    for c in dir.split('/').filter(|c| !c.is_empty()) {
+        at.push('/');
+        at.push_str(c);
+        match mt.stat(&at) {
+            Ok(st) if matches!(st.kind, NodeKind::Dir) => {}
+            Ok(_) => {
+                dir_refused(plan, &at, c, "a file is in the way (native)");
+                return Some(Err(Refusal::NoSession(WHY_BAD_HOME)));
+            }
+            Err(_) => {
+                if mt.create(&at, NodeKind::Dir, KERNEL_PRINCIPAL).is_err() {
+                    dir_refused(plan, &at, c, "native create");
+                    return Some(Err(Refusal::NoSession(WHY_BAD_HOME)));
+                }
+                created += 1;
+            }
+        }
+    }
+    serial_println!(
+        ":: PRTSCR-DIR: theme={} user={} home={} dir={} path={} created={} volume=unafs reason=session -> RESOLVED ::",
+        crate::video::theme::NAME,
+        plan.user_str(),
+        plan.home_str(),
+        dir,
+        dir,
+        created
+    );
+    Some(Ok(dir))
+}
+
+/// The file name for a native-root capture, by the same rules as [`choose_name`] / [`shot_name`] /
+/// [`named_replace`] — asked of the mount table's directory, never of a FAT cluster.
+fn native_pick(fs: &FatFs, dir: &str, named: &Option<(&'static str, String)>, kind: u32) -> Result<(String, &'static str), Refusal> {
+    let mt = crate::shell::vfs_mount_table();
+    let free = |n: &str| mt.stat(&alloc::format!("{}/{}", dir, n)).is_err();
+    if let Some((_, n)) = named {
+        let _ = mt.unlink(&alloc::format!("{}/{}", dir, n), crate::fs::vfs::KERNEL_PRINCIPAL);
+        return if free(n) { Ok((n.clone(), "named")) } else { Err(Refusal::AllTaken(vol_id(fs))) };
+    }
+    let ladder = |stem: &str| -> Option<String> { (0..MAX_CAPTURES).map(|i| alloc::format!("{}{}.PNG", stem, i)).find(|n| free(n)) };
+    if kind != 0 {
+        if let Some(n) = shot_clock_name() {
+            if free(&n) {
+                return Ok((n, "clock"));
+            }
+        }
+        let from = if shot_clock_name().is_some() { "clock" } else { "clock-unset" };
+        return ladder("SHOT").map(|n| (n, from)).ok_or(Refusal::AllTaken(vol_id(fs)));
+    }
+    let from = match clock_name() {
+        Some(n) if free(&n) => return Ok((n, "clock")),
+        Some(_) => "clock-taken",
+        None => "clock-unset",
+    };
+    ladder("SCREEN").map(|n| (n, from)).ok_or(Refusal::AllTaken(vol_id(fs)))
+}
+
+/// VOLUMES M1 — PRTSCR-ST's read-back for a native-root shot: the size the mount table holds.
+#[allow(dead_code)] // reached from PRTSCR-ST, whose caller is feature-gated
+fn native_readback(shot: &Shot) -> bool {
+    let p = alloc::format!("{}/{}", shot.dir, shot.name);
+    let ok = crate::shell::vfs_mount_table().stat(&p).map(|s| s.size as usize == shot.bytes).unwrap_or(false);
+    serial_println!(":: PRTSCR-ST: native read-back path={} bytes={} -> {} ::", p, shot.bytes, if ok { "PASS" } else { "FAIL" });
+    ok
 }

@@ -138,6 +138,93 @@ fn kfont_dirs_env() -> Vec<std::path::PathBuf> {
     std::env::var("UNAOS_FONT_DIRS").map(|v| v.split(':').filter(|s| !s.is_empty()).map(std::path::PathBuf::from).collect()).unwrap_or_default()
 }
 
+/// VOLUMES (rmbp-ledger B366) M3: the generated rows of `builder/testf.list` — formats whose sample is made here
+/// rather than fetched (CC0-1.0). Pure, so the test pins the bytes' shape.
+fn testf_generated(name: &str) -> Option<Vec<u8>> {
+    let text = |s: &str| Some(s.as_bytes().to_vec());
+    match name {
+        "TEST.QOI" => {
+            // QOI (qoiformat.org): 64x64 RGBA gradient; QOI_OP_RUN for repeats, QOI_OP_RGBA otherwise; the 8-byte end marker.
+            let (w, h) = (64u32, 64u32);
+            let mut out = b"qoif".to_vec();
+            out.extend_from_slice(&w.to_be_bytes());
+            out.extend_from_slice(&h.to_be_bytes());
+            out.extend_from_slice(&[4, 0]);
+            let (mut prev, mut run) = ([0u8, 0, 0, 255], 0u8);
+            for y in 0..h {
+                for x in 0..w {
+                    let px = [(x * 4) as u8, (y * 4) as u8, if (x / 16 + y / 16) % 2 == 0 { 0xC0 } else { 0x40 }, 255];
+                    if px == prev {
+                        run += 1;
+                        if run == 62 { out.push(0xC0 | (run - 1)); run = 0; }
+                        continue;
+                    }
+                    if run > 0 { out.push(0xC0 | (run - 1)); run = 0; }
+                    out.push(0xFF);
+                    out.extend_from_slice(&px);
+                    prev = px;
+                }
+            }
+            if run > 0 { out.push(0xC0 | (run - 1)); }
+            out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+            Some(out)
+        }
+        "TEST.SVG" => text("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"128\" height=\"128\" viewBox=\"0 0 128 128\">\n  <rect x=\"8\" y=\"8\" width=\"112\" height=\"112\" rx=\"16\" fill=\"#2b6cb0\"/>\n  <circle cx=\"64\" cy=\"64\" r=\"36\" fill=\"#f6e05e\" stroke=\"#1a202c\" stroke-width=\"4\"/>\n  <path d=\"M40 88 L64 40 L88 88 Z\" fill=\"none\" stroke=\"#c53030\" stroke-width=\"6\"/>\n</svg>\n"),
+        "TEST.TXT" => text("UnaOS test-f: plain text sample.\nLine two, with UTF-8: café, naïve, 日本語, emoji-free.\n\tA tab-indented line.\n"),
+        "TEST.MD" => text("# UnaOS test-f\n\nA **Markdown** sample with *emphasis*, `code`, and a [link](https://example.org).\n\n- one\n- two\n\n```\nfenced block\n```\n\n| col | val |\n| --- | --- |\n| a   | 1   |\n"),
+        "TEST.JSON" => text("{\n  \"name\": \"UnaOS test-f\",\n  \"formats\": [\"wav\", \"flac\", \"opus\", \"png\"],\n  \"nested\": { \"ok\": true, \"n\": 42, \"pi\": 3.14159, \"none\": null }\n}\n"),
+        "TEST.CSV" => text("format,kind,container\nwav,audio,riff\nflac,audio,flac\nopus,audio,ogg\npng,image,png\n\"quoted, field\",text,csv\n"),
+        _ => None,
+    }
+}
+
+/// VOLUMES (rmbp-ledger B366) M3: stage `builder/testf.list` into `<volume>/system/test-f/` with a MANIFEST.txt
+/// (name bytes sha256 licence source). A fetched row comes from `cache` (filled by `curl` on a miss) and is staged
+/// ONLY when its sha256 is the pin; a row that cannot be fetched or does not match is named and skipped — the
+/// kernel's `tests testf` names it again as missing. `UNAOS_TESTF=0` stages nothing. Returns the files staged.
+fn stage_testf(list: &std::path::Path, cache: &std::path::Path, volume: &std::path::Path) -> Vec<String> {
+    if std::env::var("UNAOS_TESTF").map(|v| v == "0").unwrap_or(false) {
+        println!("   TEST-F: UNAOS_TESTF=0 — system/test-f not staged");
+        return Vec::new();
+    }
+    let Ok(rows) = std::fs::read_to_string(list) else {
+        println!("   TEST-F: {} absent — system/test-f not staged", list.display());
+        return Vec::new();
+    };
+    let out = volume.join("system/test-f");
+    std::fs::create_dir_all(&out).unwrap();
+    let hex = |b: &[u8]| -> String { crypto_core::sha2::sha256(b).iter().map(|x| format!("{:02x}", x)).collect() };
+    let mut manifest = String::from("# VOLUMES (B366): free format samples staged by the builder (builder/testf.list)\n# name bytes sha256 licence source\n");
+    let (mut staged, mut skipped) = (Vec::new(), Vec::new());
+    for line in rows.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 4 { continue; }
+        let (name, pin, lic, src) = (f[0], f[1], f[2], f[3]);
+        let bytes = if pin == "-" {
+            testf_generated(name)
+        } else {
+            let hit = cache.join(name);
+            if !hit.is_file() || std::fs::read(&hit).map(|b| hex(&b) != pin).unwrap_or(true) {
+                std::fs::create_dir_all(cache).unwrap();
+                let _ = Command::new("curl").args(["-sSfL", "--max-time", "60", "-o"]).arg(&hit).arg(src)
+                    .stdout(Stdio::null()).status();
+            }
+            std::fs::read(&hit).ok().filter(|b| hex(b) == pin)
+        };
+        let Some(bytes) = bytes else {
+            skipped.push(name.to_string());
+            continue;
+        };
+        std::fs::write(out.join(name), &bytes).unwrap();
+        manifest.push_str(&format!("{} {} {} {} {}\n", name, bytes.len(), hex(&bytes), lic, src));
+        staged.push(name.to_string());
+    }
+    std::fs::write(out.join("MANIFEST.txt"), manifest).unwrap();
+    println!("   TEST-F: staged {} sample(s) into {}/system/test-f{}", staged.len(), volume.display(),
+        if skipped.is_empty() { String::new() } else { format!(" — NOT staged (offline or sha != pin): {}", skipped.join(", ")) });
+    staged
+}
+
 fn main() {
     let workspace_dir = std::fs::canonicalize("..").unwrap();
     let target_dir = workspace_dir.join("target");
@@ -1379,6 +1466,10 @@ fn main() {
     if !stage_fonts(&kfont_dirs_env(), &data_dir).is_empty() {
         staged_data.push("system/fonts/*");
     }
+    // VOLUMES (B366) M3: the free format samples (`builder/testf.list`) ride the DATA volume at system/test-f.
+    if !stage_testf(&workspace_dir.join("builder/testf.list"), &target_dir.join("testf-cache"), &data_dir).is_empty() {
+        staged_data.push("system/test-f/*");
+    }
     // FACETANIM (B358): the three 8x8 3-frame animations `tests facetanim` opens (/apps/ANIM3.GIF,
     // /apps/ANIM3.WEBP, /apps/ANIM3.PNG) — committed beside pixel_core's KATs, which pin their bytes.
     for leaf in ["ANIM3.GIF", "ANIM3.WEBP", "ANIM3.PNG"] {
@@ -2552,6 +2643,28 @@ mod kernelfont_tests {
         assert!(out.join("system/fonts/LICENSES/noto.txt").is_file());
         if staged.iter().any(|f| f == "DejaVuSans.ttf") {
             assert_eq!(staged.len(), super::KFONT_FACES.len(), "faces=10/10 wanted: {staged:?}");
+        }
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// VOLUMES (B366) M3: the generated rows stage offline with a MANIFEST row each; the QOI is well-formed
+    /// (header, 64x64x4 pixels' worth of ops, end marker); the shipped list claims every format the row names.
+    #[test]
+    fn testf_generated_rows_stage() {
+        let out = std::env::temp_dir().join(format!("testf-{}", std::process::id()));
+        let list = out.join("list");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(&list, "TEST.QOI - CC0-1.0 generated:qoi\nTEST.CSV - CC0-1.0 generated:csv\n").unwrap();
+        let staged = super::stage_testf(&list, &out.join("cache"), &out.join("vol"));
+        assert_eq!(staged, vec!["TEST.QOI".to_string(), "TEST.CSV".to_string()]);
+        let qoi = std::fs::read(out.join("vol/system/test-f/TEST.QOI")).unwrap();
+        assert_eq!(&qoi[..4], b"qoif");
+        assert_eq!(&qoi[qoi.len() - 8..], &[0, 0, 0, 0, 0, 0, 0, 1]);
+        let m = std::fs::read_to_string(out.join("vol/system/test-f/MANIFEST.txt")).unwrap();
+        assert!(m.lines().any(|l| l.starts_with("TEST.QOI ")) && m.lines().any(|l| l.starts_with("TEST.CSV ")));
+        let shipped = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testf.list")).unwrap();
+        for want in ["TEST.WAV", "TEST.FLAC", "TEST.OPUS", "TEST.OGG", "TEST.MP3", "TEST.AAC", "TEST.M4A", "TEST.AIF", "TEST.PNG", "APNG.PNG", "TEST.JPG", "TEST.GIF", "LOSSLESS.WEBP", "LOSSY.WEBP", "ANIM.WEBP", "TEST.BMP", "TEST.QOI", "TEST.SVG", "TEST.TXT", "TEST.MD", "TEST.JSON", "TEST.CSV", "TEST.WEBM", "TEST.MP4"] {
+            assert!(shipped.lines().any(|l| l.starts_with(&format!("{want} "))), "{want} not in testf.list");
         }
         let _ = std::fs::remove_dir_all(&out);
     }
