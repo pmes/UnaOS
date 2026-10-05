@@ -51,3 +51,8 @@ fn m4_argon2_drbg_ct() {
 fn m5_p384() {
     run(&["p384/"]);
 }
+
+#[test]
+fn m6_rsa_verify() {
+    run(&["rsa/"]);
+}

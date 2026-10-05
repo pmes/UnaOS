@@ -29,17 +29,19 @@
 //! ring 3: `drbg::GetrandomEntropy` wrapping SYS_GETRANDOM; host: `drbg::OsEntropy`). A test pool replays
 //! fixed bytes so the RFC 8448 traces reproduce exactly.
 //!
-//! What it does NOT have (default `Unsupported` bodies stay in force, and `supports_signature` keeps the
-//! trait's baseline so no server is invited to pick them): ECDSA P-384, RSASSA-PSS, RSASSA-PKCS1-v1_5.
+//! Coverage: every primitive the trait names — ECDSA P-256 and P-384, Ed25519, RSASSA-PSS and
+//! RSASSA-PKCS1-v1_5 verification (1024..=8192-bit moduli; a TLS floor such as 2048 bits is policy and
+//! belongs to the verifier), so `supports_signature` answers true for all nine schemes.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use crypto_core::drbg::{ChaChaDrbg, Entropy};
-use crypto_core::{chacha20poly1305, ed25519, gcm, hmac::Hmac, p256, x25519, Sha256, Sha384, Sha512};
+use crypto_core::{chacha20poly1305, ed25519, gcm, hmac::Hmac, p256, p384, rsa, x25519, Sha256, Sha384, Sha512};
 
 use crate::crypto::{AeadAlg, CryptoError, CryptoProvider, Digest, EcCurve, HashAlg, KxPrivate};
+use crate::msgs::SignatureScheme;
 
 /// A boxed entropy source, so the provider is one concrete (object-safe) type.
 struct DynEntropy(Box<dyn Entropy>);
@@ -247,7 +249,12 @@ impl CryptoProvider for CryptoCoreProvider {
                 let digest = self.hash(hash, &[msg]);
                 p256::verify_prehashed(&key, digest.as_bytes(), &sig).map_err(|_| CryptoError::BadSignature)
             }
-            EcCurve::P384 => Err(CryptoError::Unsupported("ECDSA P-384 verify: CRYPTOCORE has no P-384 yet (owed)")),
+            EcCurve::P384 => {
+                let key = p384::PublicKey::from_sec1(public_key).map_err(|_| CryptoError::BadKey)?;
+                let sig = p384::signature_from_der(sig_der).map_err(|_| CryptoError::BadSignature)?;
+                let digest = self.hash(hash, &[msg]);
+                p384::verify_prehashed(&key, digest.as_bytes(), &sig).map_err(|_| CryptoError::BadSignature)
+            }
         }
     }
 
@@ -259,6 +266,31 @@ impl CryptoProvider for CryptoCoreProvider {
             Err(crypto_core::Error::Encoding) if ed25519_point_bad(&pk) => Err(CryptoError::BadKey),
             Err(_) => Err(CryptoError::BadSignature),
         }
+    }
+
+    fn rsa_pss_verify(&self, hash: HashAlg, n: &[u8], e: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), CryptoError> {
+        let key = rsa::PublicKey::new(n, e).map_err(|_| CryptoError::BadKey)?;
+        let h = rsa_hash(hash);
+        // RFC 8446 §4.2.3: MGF1 with the same hash, salt length = hash length.
+        rsa::verify_pss(&key, h, h.len(), msg, sig).map_err(|_| CryptoError::BadSignature)
+    }
+
+    fn rsa_pkcs1_verify(&self, hash: HashAlg, n: &[u8], e: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), CryptoError> {
+        let key = rsa::PublicKey::new(n, e).map_err(|_| CryptoError::BadKey)?;
+        rsa::verify_pkcs1v15(&key, rsa_hash(hash), msg, sig).map_err(|_| CryptoError::BadSignature)
+    }
+
+    fn supports_signature(&self, scheme: SignatureScheme) -> bool {
+        let _ = scheme;
+        true
+    }
+}
+
+fn rsa_hash(h: HashAlg) -> rsa::Hash {
+    match h {
+        HashAlg::Sha256 => rsa::Hash::Sha256,
+        HashAlg::Sha384 => rsa::Hash::Sha384,
+        HashAlg::Sha512 => rsa::Hash::Sha512,
     }
 }
 
