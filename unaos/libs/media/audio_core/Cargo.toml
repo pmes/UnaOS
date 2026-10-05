@@ -1,0 +1,14 @@
+[package]
+name = "audio_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "AUDIOCODEC (SR30): the audio decoders UnaOS owns — WAV, AIFF, FLAC, Ogg, Opus, Vorbis, MP3, AAC-LC — written from the specifications, no_std + alloc, shared by Ring 0 and Ring 3."
+
+# AUDIOCODEC (SR30, R83): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, and NO dependencies — the
+# prefs_core/pixel_core shape: a member of the ROOT host workspace (gneiss_pal::dsp::audio and
+# tools/audio-check link it) and a path dep of the kernel (`drivers/hda_play.rs` decodes through it).
+# No dev-dependencies either: the KATs are fetched files + their published checksums, the MD5 that
+# proves a FLAC decode is our own (src/md5.rs), and the reference PCM comes from Chromium (oracle/) — for
+# AAC, which this Chromium lacks, from faad2, stored as FLAC beside each stream (oracle/gen-aac.sh).
+[dependencies]

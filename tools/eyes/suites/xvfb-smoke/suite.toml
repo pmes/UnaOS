@@ -1,0 +1,9 @@
+# EYES suite: proves the generic subject kinds. UnaOS vessels open windows through quartzite's
+# macOS AppKit backend or its `gtk` feature (GTK 4: libgtk-4-dev, libgtksourceview-5-dev,
+# libspelling-1-dev, libadwaita-1-dev on the host). Two GUI processes under Xvfb: a real vessel
+# (aether-shell) against its accepted golden, and Chromium in kiosk mode against headless Chromium.
+build = ["cargo build --release -q -p aether-shell --features gtk"]
+
+[defaults]
+width = 640
+height = 400

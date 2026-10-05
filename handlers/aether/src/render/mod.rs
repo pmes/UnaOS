@@ -72,7 +72,7 @@ fn blend_px(surface: &mut [u8], width: u32, x: u32, y: u32, (r, g, b): (u8, u8, 
 /// (bold, glyph id, quarter-px font size); holds the coverage bitmap and
 /// its raster-bounds origin. Cleared implicitly by process lifetime —
 /// glyphs are font-global, not page-scoped.
-type GlyphKey = (u8, u32, u32); // (family*2+bold, glyph, quarter-px size)
+type GlyphKey = (u8, u32, u32); // (fonts::face_key, glyph, quarter-px size)
 struct CachedGlyph {
     origin: (i32, i32),
     w: i32,
@@ -383,7 +383,7 @@ pub(crate) fn test_bg_geometry(
 }
 
 /// Transforms text based on text-transform property: 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize.
-fn transform_text(text: &str, transform: u8) -> String {
+pub(crate) fn transform_text(text: &str, transform: u8) -> String {
     match transform {
         1 => text.to_uppercase(),
         2 => text.to_lowercase(),
@@ -565,6 +565,33 @@ pub fn dump_layout(layout: &LayoutTree) {
     walk(layout, layout.root_node, 0.0, 0.0, 0, max_depth);
 }
 
+/// The colour that fills the whole canvas: `html`'s background-color, or,
+/// when the root has none, `body`'s. None = no author background (white).
+pub fn canvas_background(layout: &LayoutTree) -> Option<(u8, u8, u8)> {
+    let find = |tag: &str| -> Option<NodeId> {
+        // html and body sit within the top three levels of the box tree.
+        let mut level = vec![layout.root_node];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for id in level {
+                let is_tag = layout
+                    .node_map
+                    .get(&id)
+                    .and_then(|n| n.as_element().map(|e| e.name.local.as_ref() == tag))
+                    .unwrap_or(false);
+                if is_tag {
+                    return Some(id);
+                }
+                next.extend(layout.taffy.children(id).unwrap_or_default());
+            }
+            level = next;
+        }
+        None
+    };
+    let bg = |id: Option<NodeId>| id.and_then(|i| layout.paint_map.get(&i)).and_then(|p| p.background);
+    bg(find("html")).or_else(|| bg(find("body")))
+}
+
 pub fn render_frame(
     layout: &LayoutTree,
     surface: &mut [u8],
@@ -579,13 +606,16 @@ pub fn render_frame(
     }
     dump_layout(layout);
 
-    // Clear damaged regions to the page background.
+    // Clear damaged regions to the CANVAS background: the root element's
+    // background, else body's (CSS Backgrounds §2.11.2 — the root/body
+    // background propagates to the whole canvas, not just their boxes).
+    let canvas = canvas_background(layout).unwrap_or((255, 255, 255));
     for &(dx, dy, dw, dh) in damage_rects {
         let ex = (dx + dw).min(width);
         let ey = (dy + dh).min(height);
         for y in dy..ey {
             for x in dx..ex {
-                put_px(surface, width, x, y, (255, 255, 255));
+                put_px(surface, width, x, y, canvas);
             }
         }
     }
@@ -653,13 +683,9 @@ pub fn render_frame(
                 let tag = el.name.local.as_ref();
                 inherited.font_size =
                     spec.font_size.unwrap_or_else(|| default_font_size(tag, inherited.font_size));
-                inherited.bold = spec.bold.unwrap_or(
-                    inherited.bold
-                        || matches!(tag, "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th"),
-                );
-                inherited.italic = spec.italic.unwrap_or(
-                    inherited.italic || matches!(tag, "i" | "em"),
-                );
+                inherited.bold = spec.bold.unwrap_or_else(|| crate::layout::default_bold(tag, inherited.bold));
+                inherited.italic =
+                    spec.italic.unwrap_or_else(|| crate::layout::default_italic(tag, inherited.italic));
                 inherited.family = spec
                     .family
                     .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
@@ -973,16 +999,12 @@ pub fn render_frame(
                     }
                 }
             } else if dom_node.as_text().is_some() && !inherited.text_hidden {
-                // Family font first (serif/mono), falling back to the
-                // preloaded sans pair; bold uses the sans-bold face for
-                // non-sans families (approximation).
-                let fam_font = if inherited.family != 0 && !inherited.bold {
-                    crate::layout::family_font(inherited.family)
-                } else {
-                    None
-                };
-                let font = if fam_font.is_some() {
-                    &fam_font
+                // The same face the measurer wrapped this run with
+                // (fonts::face): family x weight x style. The preloaded sans
+                // pair is only the fallback when no face loads at all.
+                let face = crate::fonts::face(inherited.family, inherited.bold, inherited.italic);
+                let font = if face.is_some() {
+                    &face
                 } else if inherited.bold {
                     font_bold
                 } else {
@@ -1019,7 +1041,7 @@ pub fn render_frame(
                             ty,
                             max_w,
                             font,
-                            inherited.family * 2 + if inherited.bold { 1 } else { 0 },
+                            crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
                             inherited.font_size,
                             inherited.line_height,
                             inherited.color,
