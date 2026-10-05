@@ -3606,7 +3606,8 @@ build_user_hello_x86() {
 # it, the builder carries the same literal; `scripts/window-parity.sh` (run by `check` beside
 # knob-parity) reds when any of the four disagree. aarch64 is untouched — its asserts below still read
 # USER_REGION_SIZE (16384).
-USER_WINDOW_BYTES=4194304
+# WINDOW2 (B361, R85): 64 MiB (RING3WIN shipped 4 MiB).
+USER_WINDOW_BYTES=67108864
 USER_XWIN_VA_X86=$((0x10000200000))
 # user_elf_window_check <file> <label> — the x86 user-ELF gate every build_user_*_x86 step calls (it
 # replaced four copies of `[ size -le 16384 ]`). It reads the PT_LOAD layout, not just the file size:

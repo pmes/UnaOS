@@ -4044,9 +4044,11 @@ pub fn fb_wc_witness() {
 // `USER_BASE` cannot grow in place: the FB hole above it (`+0x4000` info page, `+0x5000` surface slot 0)
 // is ABI every shipped binary hangs off its `_start`. So each slot carries a SECOND window, clear of the
 // first 2 MiB, at `USER_BASE + XWIN_OFF` for `XWIN_BYTES` — PD entries 1..=XWIN_PTS of the slot's own PD,
-// with the PTs static per slot (`.bss`, 4 KiB each) and the FRAMES taken on demand from the kernel heap
-// (4 KiB-aligned `alloc_zeroed`, the same allocator `linuxabi::AddrSpace` and `alloc_page_frame` use) and
-// returned to it at teardown (`xwin_free`, called by `free_user_space_by_cr3` beside `clear_slot_fb`).
+// with the FRAMES taken on demand from the kernel heap (4 KiB-aligned `alloc_zeroed`, the same allocator
+// `linuxabi::AddrSpace` and `alloc_page_frame` use) and returned to it at teardown (`xwin_free`, called by
+// `free_user_space_by_cr3` beside `clear_slot_fb`). WINDOW2 (B361): the window is 64 MiB = 32 PTs per slot,
+// so the PTs are heap frames too (wired on first touch of their 2 MiB, freed by `xwin_free`) — RING3WIN's
+// static `.bss` PTs would have cost 12 x 32 x 4 KiB = 1.5 MiB whether any program asked or not.
 //
 // Who uses it: an elf-model image (lowest PT_LOAD `p_vaddr >= XWIN_OFF`, see `elf.rs`) maps its segments,
 // its stack (top of the window, one unmapped guard page below) and its heap here; a fixed-model image
@@ -4067,8 +4069,8 @@ const XWIN_PTS: usize = XWIN_BYTES / (512 * 4096);
 const _: () = assert!(XWIN_OFF >= USER_STATIC_SIZE && XWIN_OFF % (512 * 4096) == 0);
 const _: () = assert!(XWIN_PTS >= 1 && XWIN_OFF / (512 * 4096) + XWIN_PTS <= 512);
 
-static mut SLOT_XPT: [[PageTable; XWIN_PTS]; USER_SLOTS] =
-    [const { [const { PageTable::zeroed() }; XWIN_PTS] }; USER_SLOTS];
+/// WINDOW2: PT frames (heap) wired into ELF windows across every slot right now.
+static XWIN_PT_LIVE: AtomicU64 = AtomicU64::new(0);
 /// Frames each slot holds in its ELF window right now.
 static XWIN_PAGES: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
 /// Frames held across ALL slots — the number `tests ring3win` watches return after an exit.
@@ -4084,9 +4086,17 @@ static XWIN_LAST_HEAP: AtomicU64 = AtomicU64::new(0);
 /// Serialises `SYS_SBRK` (sibling ELF-2 threads share one slot's break).
 static XWIN_SBRK_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
+/// WINDOW2: the PT behind window PT index `i` of slot `s` (a heap frame, identity-addressed), or null when
+/// that 2 MiB was never touched.
 #[inline]
 fn xwin_pt_ptr(s: usize, i: usize) -> *mut u64 {
-    unsafe { (&raw mut SLOT_XPT[s][i]).cast::<u64>() }
+    let va = super::syscall::USER_BASE + (XWIN_OFF + i * 512 * 4096) as u64;
+    let pde = unsafe { *slot_pd_ptr(s).add(pd_index(va)) };
+    if pde & PTE_PRESENT == 0 { core::ptr::null_mut() } else { (pde & PTE_ADDR) as *mut u64 }
+}
+/// WINDOW2: PT frames held by ELF windows (all slots).
+pub fn xwin_pt_live() -> u64 {
+    XWIN_PT_LIVE.load(Ordering::Acquire)
 }
 
 /// RING3WIN: frames held in ELF windows across every slot.
@@ -4105,20 +4115,21 @@ pub fn xwin_contains(ptr: u64, end: u64) -> bool {
 }
 
 /// Leaf slot for window offset `off` (`XWIN_OFF <= off < XWIN_OFF + XWIN_BYTES`) in slot `s`, wiring the
-/// PD entry to the slot's static PT on first use.
+/// PD entry to a fresh zeroed heap PT on first use (WINDOW2). Null = the heap has no frame for the PT.
 unsafe fn xwin_leaf(s: usize, off: usize) -> *mut u64 {
-    let rel = off - XWIN_OFF;
-    let i = rel / (512 * 4096);
     let va = super::syscall::USER_BASE + off as u64;
     let pd = slot_pd_ptr(s);
-    let pt = xwin_pt_ptr(s, i);
     unsafe {
         let pde = pd.add(pd_index(va));
         if *pde & PTE_PRESENT == 0 {
-            core::ptr::write_bytes(pt, 0, 512);
+            let pt = alloc_zeroed(Layout::from_size_align_unchecked(4096, 4096)) as *mut u64;
+            if pt.is_null() {
+                return core::ptr::null_mut();
+            }
+            XWIN_PT_LIVE.fetch_add(1, Ordering::AcqRel);
             *pde = (table_pa(pt) & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
         }
-        pt.add(pt_index(va))
+        ((*pde & PTE_ADDR) as *mut u64).add(pt_index(va))
     }
 }
 
@@ -4134,6 +4145,9 @@ pub unsafe fn xwin_map_page(s: usize, off: usize, writable: bool, exec: bool) ->
     let va = super::syscall::USER_BASE + off as u64;
     unsafe {
         let leaf = xwin_leaf(s, off);
+        if leaf.is_null() {
+            return Err(()); // WINDOW2: no heap frame for the PT
+        }
         let old = *leaf;
         let (w, x, frame) = if old & PTE_PRESENT != 0 {
             (writable || old & PTE_WRITABLE != 0, exec || old & PTE_NX == 0, old & PTE_ADDR)
@@ -4234,7 +4248,10 @@ pub unsafe fn xwin_free(s: usize) {
         for l in 0..512 {
             unsafe { xwin_unmap_page(s, XWIN_OFF + i * 512 * 4096 + l * 4096) };
         }
+        let pt = unsafe { *pde } & PTE_ADDR;
         unsafe { *pde = 0 };
+        unsafe { alloc::alloc::dealloc(pt as *mut u8, Layout::from_size_align_unchecked(4096, 4096)) }; // WINDOW2: the PT is a heap frame
+        XWIN_PT_LIVE.fetch_sub(1, Ordering::AcqRel);
     }
     XWIN_BRK[s].store(0, Ordering::Release);
     XWIN_BRK_LO[s].store(0, Ordering::Release);

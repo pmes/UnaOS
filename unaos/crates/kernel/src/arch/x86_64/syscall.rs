@@ -16885,7 +16885,7 @@ fn bg_kill_forget(pid: u64) {
 /// row must therefore be valid at spawn time, not at store time.
 fn load_program_common(bytes: &[u8]) -> Result<(super::elf::Mapped, usize), &'static str> {
     if bytes.len() > user_image_cap() {
-        return Err("image larger than the 4 MiB user image cap (RING3WIN)");
+        return Err("image larger than the user image cap (USER_WINDOW_BYTES)");
     }
     let Some(pi) = proc_reserve() else {
         // PROCREAP: `proc_reserve` has already run the BGRUN-SCAV sweep, so this refusal names what is
@@ -29989,7 +29989,7 @@ fn sys_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
 }
 
 /// RING3WIN (B316): the largest program IMAGE a reader may hand the loader — the ELF window
-/// (`una_abi::USER_WINDOW_BYTES`, 4 MiB). The loader then decides fixed vs elf model from the PT_LOAD
+/// (`una_abi::USER_WINDOW_BYTES`, 64 MiB since WINDOW2). The loader then decides fixed vs elf model from the PT_LOAD
 /// layout; a fixed-model image still has to fit `user_window_size()` (16 KiB) span-wise.
 pub fn user_image_cap() -> usize {
     super::memory::XWIN_BYTES
@@ -30051,7 +30051,7 @@ pub fn ring3win_selftest() {
         Some(s) => (s & 0xFF, s & 0x7FFF_FF00 == want & 0x7FFF_FF00),
         None => (0, false),
     };
-    let big_ok = bits == 0x0F && ck_ok;
+    let big_ok = bits & 0x0F == 0x0F && ck_ok; // WINDOW2: bit 0x10 is `tests window`'s alloc48m
     let freed = live1 == live0 && freed_pages > 0;
     serial_println!(
         "[ring3win] status={:?} bits={:#x} fnv_want={:#x} ck_ok={} live0={} live1={} freed_pages={} heap={}",

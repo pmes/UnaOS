@@ -1124,8 +1124,11 @@ pub const USER_BASE_X86: u64 = 0x0000_0100_0000_0000;
 /// linker script): its p_vaddr are real addresses, so absolute pointers in its data (vtables, `&str` in
 /// statics, `core::fmt`) are correct with no relocation — the linuxabi shape (fixed vaddrs).
 pub const USER_XWIN_VA_X86: u64 = USER_BASE_X86 + USER_XWIN_OFF;
-/// The ELF window size = the per-program cap (image span + stack + guard, or heap): 4 MiB.
-pub const USER_WINDOW_BYTES: u64 = 4 << 20;
+/// The ELF window size = the per-program cap (image span + stack + guard, or heap): 64 MiB. WINDOW2
+/// (rmbp-ledger B361, R85 "the window will need to be raised, might as well do it now") raised it from
+/// RING3WIN's 4 MiB: Holocron's Argon2id runs in ring 3 again, Lumen gets a real face beside TLS. The page
+/// tables behind it are taken on demand (x86: one PT per 2 MiB touched; aarch64: one L3), never `.bss`.
+pub const USER_WINDOW_BYTES: u64 = 64 << 20;
 /// The stack an elf-model program gets when its ELF declares none (no PT_GNU_STACK or p_memsz 0).
 pub const USER_STACK_DEFAULT: u64 = 64 << 10;
 /// The largest stack an elf-model program may declare.
@@ -1144,7 +1147,7 @@ mod ring3win_tests {
     #[test]
     fn ring3win_window_constants() {
         assert_eq!(SYS_SBRK, 58);
-        assert_eq!(USER_WINDOW_BYTES, 4_194_304);
+        assert_eq!(USER_WINDOW_BYTES, 67_108_864); // WINDOW2 (B361): 64 MiB
         assert!(USER_XWIN_OFF >= USER_FIXED_WINDOW_BYTES + 0x14_5000); // clear of the FB hole
         assert_eq!(USER_XWIN_VA_X86, 0x0000_0100_0020_0000);
         std::println!(":: RING3WIN-ABI: sbrk={} window={} xwin_off={:#x} -> PASS ::", SYS_SBRK, USER_WINDOW_BYTES, USER_XWIN_OFF);
@@ -1698,5 +1701,41 @@ mod holocron2_tests {
         let n = kdf_request(1 << 17, 3, 1, b"pw", &[7u8; 16], &mut b).unwrap();
         assert_eq!(kdf_parse(&b[..n]), None, "over the ceiling");
         std::println!(":: HOLOCRON2-ABI: kdf={} path_r_list={} verbs={}..={} -> PASS ::", SYS_KDF, PATH_R_LIST, BUS_VERB_HOLOCRON_FIRST, BUS_VERB_HOLOCRON_LAST);
+    }
+}
+// =================================================================================================
+// WINDOW2 (rmbp-ledger B361, R85) — the ring-3 window raised to 64 MiB (`USER_WINDOW_BYTES` above). The KDF
+// known-answer pair `tests window` uses: HOLOCRON.ELF `--kdf-selftest` derives Argon2id over these inputs IN
+// RING 3 at Holocron's metal parameters (48 MiB, t 3, p 4 — the memory the window holds beside image, heap
+// and stack) and the kernel recomputes the same key through SYS_KDF's body; the exit status carries 23 bits.
+// =================================================================================================
+
+/// WINDOW2: Holocron's metal ring parameters — Argon2id memory in KiB (48 MiB).
+pub const WINDOW2_KDF_M_KIB: u32 = 48 * 1024;
+/// WINDOW2: passes.
+pub const WINDOW2_KDF_T: u32 = 3;
+/// WINDOW2: lanes.
+pub const WINDOW2_KDF_P: u32 = 4;
+/// WINDOW2: the KAT password (not a secret).
+pub const WINDOW2_KAT_PW: &[u8] = b"window2-kat";
+/// WINDOW2: the KAT salt.
+pub const WINDOW2_KAT_SALT: [u8; 16] = *b"UnaOS-WINDOW2-16";
+/// WINDOW2: the heap a ring-3 program must be able to touch (`tests window` `alloc48m`).
+pub const WINDOW2_ALLOC_BYTES: u64 = 48 << 20;
+const _: () = assert!((WINDOW2_KDF_M_KIB as u64) * 1024 + (8 << 20) <= USER_WINDOW_BYTES);
+const _: () = assert!(WINDOW2_ALLOC_BYTES + (8 << 20) <= USER_WINDOW_BYTES);
+
+#[cfg(test)]
+mod window2_tests {
+    extern crate std;
+    use super::*;
+    #[test]
+    fn window2_constants() {
+        assert_eq!(USER_WINDOW_BYTES, 67_108_864);
+        assert_eq!(USER_XWIN_OFF / (2 << 20) + USER_WINDOW_BYTES / (2 << 20), 33); // PD/L2 entries 1..=32
+        let mut b = [0u8; KDF_HDR_LEN + KDF_PW_MAX + KDF_SALT_MAX];
+        let n = kdf_request(WINDOW2_KDF_M_KIB, WINDOW2_KDF_T, WINDOW2_KDF_P, WINDOW2_KAT_PW, &WINDOW2_KAT_SALT, &mut b).unwrap();
+        assert!(kdf_parse(&b[..n]).is_some(), "the KAT parameters are inside SYS_KDF's bounds");
+        std::println!(":: WINDOW2-ABI: bytes={} kdf_m_kib={} alloc={} -> PASS ::", USER_WINDOW_BYTES, WINDOW2_KDF_M_KIB, WINDOW2_ALLOC_BYTES);
     }
 }

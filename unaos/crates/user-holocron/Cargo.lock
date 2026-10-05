@@ -39,6 +39,7 @@ version = "0.1.0"
 name = "vein_ring3"
 version = "0.1.0"
 dependencies = [
+ "holocron_core",
  "tls_core",
  "una-abi",
  "vein_core",
