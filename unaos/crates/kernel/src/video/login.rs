@@ -130,9 +130,9 @@ const H: usize = 240;
 /// shared anti-aliased face (`video/font.rs`, the one Quarry took in QUARRYFONT), not font8x8 at 2x. The
 /// vertical rhythm stays 16 px (`Face::Body.cell_h()` is `CELL_H` = 16, what the 2x cell was); the
 /// horizontal arithmetic moves to the face's own advance, as `font::draw_text`'s doc says a conversion must.
-const FACE: font::Face = font::Face::Body;
+const FACE: crate::video::text::Face = crate::video::text::Face::Ui; // KERNELFONT (B359): the login screen's text is DejaVu Sans (proportional) through `video::text`; the bitmap face is its fallback
 const CELL: usize = font::Face::Body.cell_h();
-const CW: usize = font::Face::Body.cell_w();
+#[allow(dead_code)] const CW: usize = font::Face::Body.cell_w(); // KERNELFONT: layout measures with `text::advance` now; the bitmap advance kept for the fallback's docs
 const FIELD_MAX: usize = 32;
 
 /// LOGINCLOSE — **the owner band the screen's row is minted in, and the whole of why the screen has no
@@ -412,7 +412,7 @@ fn rect(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
 
 fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
     // LOGINFONT: the shared face, clipped to the surface; all-or-nothing per glyph (its contract).
-    let _ = font::draw_text(px, W, W, H, x, y, s, fg, false, FACE);
+    let _ = crate::video::text::draw_text(px, W, W, H, x, y, s, fg, false, FACE);
 }
 
 fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: bool, secret: bool) {
@@ -426,7 +426,7 @@ fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: 
         text(px, x + 6, y + 4, content, theme::CONTENT_TEXT);
     }
     if focused {
-        let cx = x + 6 + n * CW; // LOGINFONT: the caret sits at the face's advance, not the old square cell
+        let cx = x + 6 + if secret { crate::video::text::advance(&[b'*'; FIELD_MAX][..n], false, FACE) } else { crate::video::text::advance(&content[..n], false, FACE) }; // KERNELFONT: the caret sits at the shaped advance. LOGINFONT: the caret sits at the face's advance, not the old square cell
         fill(px, cx, y + 4, 2, CELL, theme::CONTENT_TEXT);
     }
 }
@@ -439,7 +439,7 @@ fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
     let (x, y, w, h) = ctl_rect(c, setpw);
     fill(px, x, y, w, h, if primary { theme::ACCENT } else { theme::BUTTON_FACE });
     rect(px, x, y, w, h, theme::FRAME_LINE);
-    let tw = label.len() * CW; // LOGINFONT
+    let tw = crate::video::text::advance(label, false, FACE); // KERNELFONT: the shaped width. LOGINFONT
     let tx = x + w.saturating_sub(tw) / 2;
     let ty = y + h.saturating_sub(CELL) / 2;
     text(px, tx, ty, label, if primary { theme::BEVEL_LIGHT } else { theme::BUTTON_TEXT });
@@ -454,7 +454,7 @@ fn user_row(px: &mut [u32], i: usize, name: &[u8], picked: bool) {
     let (x, y, w, h) = ctl_rect(Ctl::User(i), false);
     fill(px, x, y, w, h, if picked { theme::ACCENT } else { theme::CONTENT_FILL });
     rect(px, x, y, w, h, if picked { theme::ACCENT } else { theme::FRAME_LINE });
-    let max = (w - 12) / CW; // LOGINFONT
+    let max = crate::video::text::fit(name, false, FACE, w - 12); // KERNELFONT: whole glyphs that fit. LOGINFONT
     let n = name.len().min(max);
     text(px, x + 6, y + 4, &name[..n], if picked { theme::BEVEL_LIGHT } else { theme::CONTENT_TEXT });
 }
@@ -569,8 +569,8 @@ fn repaint() {
         let fy = H.saturating_sub(font::CHROME_CELL_H + 4);
         const LONG: &[u8] = b"hold Shift after login to reset display settings";
         const SHORT: &[u8] = b"Shift after login: reset display";
-        let msg = if LX + LONG.len() * font::CHROME_CELL_W <= W { LONG } else { SHORT };
-        let _ = font::draw_text(px, W, W, H, LX, fy, msg, theme::TITLE_TEXT_INACTIVE, false, font::Face::Chrome);
+        let msg = if LX + crate::video::text::advance(LONG, false, crate::video::text::Face::Chrome) <= W { LONG } else { SHORT };
+        let _ = crate::video::text::draw_text(px, W, W, H, LX, fy, msg, theme::TITLE_TEXT_INACTIVE, false, crate::video::text::Face::Chrome);
     }
     drop(f);
     let id = WIN.load(Ordering::Relaxed);

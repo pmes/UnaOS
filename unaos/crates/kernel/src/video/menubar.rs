@@ -165,7 +165,7 @@ const CELL_H: usize = wm::TITLE_CELL_H;
 
 /// FONT-METRIC — the atlas those metrics come from. Named once so the cell constants above and the
 /// glyph calls below can never disagree about which face the bar is drawing.
-const FACE: super::font::Face = super::font::Face::Chrome;
+const FACE: super::text::Face = super::text::Face::Chrome;
 
 /// SO2 — **the caption's WEIGHT.** The bar draws its app name bold (macOS's rule, recorded at the
 /// `draw_row` call in [`compose_row`]) and its clock regular. It is a `const` rather than a literal
@@ -181,7 +181,7 @@ const BOLD: bool = true;
 /// the weight. These four name the bar's own type so a client draws the BAR'S text by construction,
 /// and [`BAR_FONT_NAME`] is what the `[winmenu] open … font=` witness prints, so a capture states
 /// which type the drop-down was set in instead of leaving it to be inferred from pixels.
-pub const BAR_FACE: super::font::Face = FACE;
+pub const BAR_FACE: super::text::Face = FACE;
 /// SO2 — the bar's glyph advance, px. See [`BAR_FACE`].
 pub const BAR_CELL_W: usize = CELL_W;
 /// SO2 — the bar's glyph cell height, px. See [`BAR_FACE`].
@@ -1978,7 +1978,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // `draw_bar_row` deliberately does not redraw them.
     let cols = m.title_len.min(TITLE_GLYPHS);
     let cap_ink = if m.menus.app_open() { theme::BEVEL_LIGHT } else { theme::TITLE_TEXT_ACTIVE };
-    super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, cap_ink, BOLD, FACE);
+    super::text::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, cap_ink, BOLD, FACE);
 
     // MENUSTAT — the battery's PERCENT, right-aligned in its fixed [`BATT_PCT_GLYPHS`] slot so the
     // cell beside it never moves when a digit appears or goes. Secondary ink, the clock's: the
@@ -1999,7 +1999,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
             pct[BATT_PCT_GLYPHS - 2] = b'0' + p as u8;
         }
         let tx = bx0 + BATT_GLYPH_W + BATT_GAP;
-        super::font::draw_row(out, w, &pct, tx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
+        super::text::draw_row(out, w, &pct, (tx + BATT_PCT_GLYPHS * CELL_W).saturating_sub(super::text::advance(&pct, false, FACE)), sy, theme::TITLE_TEXT_INACTIVE, false, FACE); // KERNELFONT: right-aligned in its slot by the shaped width
     }
 
     // BRIGHTKEYS — the transient `BRT nn/16` item, one PAD left of the battery's slot (which is
@@ -2010,7 +2010,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         t[4] = b'0' + l / 10;
         t[5] = b'0' + l % 10;
         if l < 10 { t[4] = b' '; }
-        super::font::draw_row(out, w, &t, bx0, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
+        super::text::draw_row(out, w, &t, bx0, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
     }
 
     // Clock, right, at one PAD from the far edge — the crystal holds the LEFT corner, so nothing of
@@ -2022,7 +2022,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // at once. Same arithmetic, same guard, one definition — and it is the definition the fixture's
     // `clock=` term and [`batt_slot`] both read.
     if let (c, Some(cx)) = (m.clock.unwrap_or(*b"--:--"), clock_slot(w)) {
-        super::font::draw_row(out, w, &c, cx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE); clockbar_paint(out, w, sy, cx, m.clock.is_some(), &c); #[cfg(feature = "sntp6")] if m.clock.is_some() { barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W, CELL_H))); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
+        super::text::draw_row(out, w, &c, (cx + CLOCK_GLYPHS * CELL_W).saturating_sub(super::text::advance(&c, false, FACE)), sy, theme::TITLE_TEXT_INACTIVE, false, FACE); clockbar_paint(out, w, sy, cx, m.clock.is_some(), &c); #[cfg(feature = "sntp6")] if m.clock.is_some() { barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W, CELL_H))); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
     }
 }
 
@@ -3095,7 +3095,7 @@ fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: boo
             let right = batt_slot(w).unwrap_or(cx);
             if let Some(dx) = right.checked_sub(strip::PAD + dw) {
                 let date = clockbar_date(secs);
-                super::font::draw_row(out, w, &date, dx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
+                super::text::draw_row(out, w, &date, dx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
             }
         }
     }

@@ -130,7 +130,7 @@ impl Vm {
     }
 
     /// First fit of `len` bytes in `[lo, hi)`.
-    fn gap(&self, len: u64, lo: u64, hi: u64) -> Option<u64> {
+    pub(super) fn gap(&self, len: u64, lo: u64, hi: u64) -> Option<u64> {
         let mut cur = lo;
         for v in self.vmas.iter().filter(|v| v.end > lo && v.start < hi) {
             if v.start >= cur && v.start - cur >= len {
@@ -301,6 +301,9 @@ pub fn alloc_frame(heap_ok: bool) -> Option<u64> {
 
 /// Give a data frame back to whichever allocator it came from.
 pub fn free_frame(f: u64) {
+    if super::cow::unshare(f) {
+        return; // SELFBUILD4: another address space still holds this frame (copy-on-write fork)
+    }
     let pooled = x86_64::instructions::interrupts::without_interrupts(|| {
         let mut p = POOL.lock();
         if p.ready && pool_contains(&p, f) {
@@ -333,6 +336,8 @@ pub enum Refuse {
     NoVma,
     Prot,
     Budget,
+    /// SELFBUILD4: a file page wholly past EOF (SIGBUS).
+    Bus,
 }
 
 impl AddrSpace {
@@ -413,6 +418,12 @@ impl AddrSpace {
         }
         let bits = Self::prot_bits(v.r, v.w, v.x);
         let file = v.file.clone().map(|p| (p, v.foff + (va - v.start)));
+        if let Some((path, off)) = &file {
+            // SELFBUILD4: a page wholly past EOF is SIGBUS (Linux), not zeroes; the page holding EOF reads zero past it.
+            if crate::shell::vfs_mount_table().stat(path).is_ok_and(|s| *off >= s.size) {
+                return Err(Refuse::Bus);
+            }
+        }
         let f = self.take_frame(va)?;
         if let Some((path, off)) = file {
             // Fill BEFORE the PTE goes live: no other thread of the process can see a half-read page.
@@ -497,7 +508,11 @@ impl AddrSpace {
     /// Rewrite a resident leaf's protection (keeps its frame and dirty bit).
     fn reprotect(&self, va: u64, e: u64, r: bool, w: bool, x: bool) {
         let slot = self.leaf_slot(va);
-        unsafe { *slot = (e & ADDR) | (e & DIRTY) | Self::prot_bits(r, w, x) };
+        let mut b = Self::prot_bits(r, w, x);
+        if e & super::cow::COW != 0 {
+            b = super::cow::cowify(b); // SELFBUILD4: a shared page stays copy-on-write (W goes to CW)
+        }
+        unsafe { *slot = (e & ADDR) | (e & DIRTY) | b };
     }
 
     /// Write MAP_SHARED dirty pages in `[lo, hi)` back to their files. `clear` = clear the dirty bits (msync).
@@ -561,20 +576,37 @@ pub fn fault(cr2: u64, err: u64) -> bool {
     let Some(p) = info.lp.try_lock() else { return true };
     let va = cr2 & !(PAGE - 1);
     let (write, fetch) = (err & 2 != 0, err & 16 != 0);
+    let mut low = false;
     if err & 1 != 0 {
         // Protection fault on a present page: legal only if the PTE already allows it (a stale TLB entry).
         if let Some((_, e)) = p.asp.user_page(va) {
+            if write && e & super::cow::COW != 0 && e & super::cow::CW != 0 {
+                return p.asp.cow_break(va).is_some(); // SELFBUILD4: copy-on-write
+            }
             if (!write || e & W != 0) && (!fetch || e & NX == 0) {
                 flush();
                 return true;
             }
+            return false;
         }
-        return false;
+        // SELFBUILD4: present but not USER = the kernel's identity map under a lazy ELF page (PML4[0]): back it below.
+        if p.asp.vm.find(va).is_none() {
+            return false;
+        }
+        low = true;
     }
     match p.asp.populate(va, write, fetch) {
-        Ok(_) => true,
+        Ok(_) => {
+            if low {
+                flush(); // the supervisor translation (and the split huge entry) may be cached
+            }
+            true
+        }
         Err(r) => {
-            if r != Refuse::Budget {
+            if r == Refuse::Bus {
+                FAULT_SIG.store(((info.pid as u64) << 8) | 7, Ordering::Release);
+                serial_println!("[linuxabi] fault va={:#x} err={:#x} -> Bus (SIGBUS: file page past EOF)", cr2, err);
+            } else if r != Refuse::Budget {
                 serial_println!("[linuxabi] fault va={:#x} err={:#x} -> {:?} (SIGSEGV)", cr2, err, r);
             }
             false
@@ -582,17 +614,31 @@ pub fn fault(cr2: u64, err: u64) -> bool {
     }
 }
 
-fn flush() {
+/// SELFBUILD4: the signal a ring-3 fault ends the process with — `pid << 8 | sig`, set by [`fault`] for SIGBUS.
+pub static FAULT_SIG: AtomicU64 = AtomicU64::new(0);
+
+/// The wait status for process `pid`'s fatal fault: 7 (SIGBUS) when [`fault`] said so, else 11 (SIGSEGV).
+pub fn take_fault_sig(pid: u32) -> i64 {
+    let v = FAULT_SIG.load(Ordering::Acquire);
+    if v != 0 && v >> 8 == pid as u64 {
+        FAULT_SIG.store(0, Ordering::Release);
+        return (v & 0xff) as i64;
+    }
+    11
+}
+
+pub(super) fn flush() {
     unsafe { memory::load_cr3(memory::current_cr3()) };
 }
 
-fn page_up(v: u64) -> Option<u64> {
+pub(super) fn page_up(v: u64) -> Option<u64> {
     v.checked_add(PAGE - 1).map(|x| x & !(PAGE - 1))
 }
 
 /// May a `MAP_FIXED` range live at `[lo, hi)`? (the two mmap windows; never the brk, the stack, the trampoline or PML4[0])
-fn fixed_ok(lo: u64, hi: u64) -> bool {
-    (lo >= MMAP_BASE && hi <= STACK_LAZY_LO) || (lo >= MMAP2_BASE && hi <= MMAP2_LIMIT)
+pub(super) fn fixed_ok(lo: u64, hi: u64) -> bool {
+    // SELFBUILD4: the brk range too — musl's mallocng puts a PROT_NONE guard page at the brk start with MAP_FIXED.
+    (lo >= MMAP_BASE && hi <= STACK_LAZY_LO) || (lo >= MMAP2_BASE && hi <= MMAP2_LIMIT) || (lo >= BRK_BASE && hi <= MMAP_BASE)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -661,7 +707,7 @@ pub fn mmap(p: &mut LinuxProc, addr: u64, len: u64, prot: u64, flags: u64, fd: u
 }
 
 /// Write back, unmap and forget `[lo, hi)`.
-fn unmap_range(p: &mut LinuxProc, lo: u64, hi: u64) {
+pub(super) fn unmap_range(p: &mut LinuxProc, lo: u64, hi: u64) {
     p.asp.writeback(lo, hi, false);
     for (va, _) in p.asp.leaf_range(lo, hi) {
         p.asp.drop_page(va);
@@ -773,6 +819,9 @@ pub fn brk(p: &mut LinuxProc, want: u64) -> i64 {
     }
     let Some(end) = page_up(want) else { return p.brk as i64 };
     let cur_end = p.brk_mapped;
+    if end > cur_end && p.asp.vm.overlaps(cur_end, end) {
+        return p.brk as i64; // SELFBUILD4: a MAP_FIXED mapping sits where the heap would grow (Linux refuses too)
+    }
     if end > cur_end {
         p.asp.vm.remove(BRK_BASE, cur_end);
         p.asp.vm.insert(Vma::anon(BRK_BASE, end, true));

@@ -21766,33 +21766,33 @@ fn draw_title(
     strip_y0: isize,
     focused: bool,
 ) {
-    let cols = max_w / TITLE_CELL_W;
-    for (i, &b) in r.title[..r.title_len].iter().enumerate() {
-        if i >= cols {
-            break;
+    // KERNELFONT (B359): the caption goes through `video::text` (DejaVu Sans bold when the faces are loaded,
+    // the bitmap atlas otherwise), each covered pixel blended against the strip's OWN colour at its row —
+    // computed, never read, so every write stays write-only (WC/UC included). Glyphs end at `max_w`.
+    let _ = super::text::draw_with(&r.title[..r.title_len], true, super::text::Face::Chrome, x, y, max_w, ink, &mut |px, dy, a| {
+        // WC-M's clip, per row: a row landing above the band is dropped independently.
+        if dy < 0 || px < 0 {
+            return;
         }
-        for (ry, row) in super::font::glyph(b, true, super::font::Face::Chrome).iter().enumerate() {
-            // WC-M's clip, per row: a row landing above the band is dropped independently.
-            let dy = y + ry as isize;
-            if dy < 0 {
-                continue;
-            }
-            // The strip pixel this row sits on. Rows past the strip's height keep the last
-            // gradient stop — the glyph cell is const-asserted shorter than the strip, so this
-            // arm is form rather than expectation.
-            let j = (dy - strip_y0).max(0) as usize;
-            let bg = super::ceramic::shade(
-                title_row_color(j.min(TITLE_H - 1), TITLE_H, focused),
-                BORDER + j.min(TITLE_H - 1),
-            );
-            for (rx, &a) in row.iter().enumerate() {
-                if a != 0 {
-                    fb.put_pixel(x + i * TITLE_CELL_W + rx, dy as usize, super::font::blend(bg, ink, a));
-                }
-            }
-        }
-    }
+        // The strip pixel this row sits on. Rows past the strip's height keep the last gradient stop.
+        let j = (dy - strip_y0).max(0) as usize;
+        let bg = super::ceramic::shade(
+            title_row_color(j.min(TITLE_H - 1), TITLE_H, focused),
+            BORDER + j.min(TITLE_H - 1),
+        );
+        fb.put_pixel(px as usize, dy as usize, super::font::blend(bg, ink, a));
+    });
 }
+
+
+
+
+
+
+
+
+
+
 
 // ---- FOCUS-VIS witness -------------------------------------------------------------------------
 

@@ -1,0 +1,23 @@
+<!-- tests: a two-column flex layout: fixed sidebar + fluid main, header and footer, gap, padding, backgrounds -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Two column</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; font-family: sans-serif; font-size: 15px; }
+header { background: #1e3a5f; color: white; padding: 14px 20px; font-size: 20px; font-weight: bold; }
+.wrap { display: flex; gap: 20px; padding: 20px; }
+aside { flex: 0 0 200px; background: #eef2f7; padding: 12px; border-radius: 6px; }
+aside a { display: block; color: #1e3a5f; padding: 6px 0; }
+main { flex: 1; background: #fff; border: 1px solid #ddd; padding: 16px; }
+main h2 { margin-top: 0; color: #333; }
+footer { background: #333; color: #ccc; padding: 10px 20px; font-size: 13px; }
+</style></head><body>
+<header>Dashboard</header>
+<div class="wrap">
+<aside><a href="#">Overview</a><a href="#">Reports</a><a href="#">Settings</a><a href="#">Help</a></aside>
+<main><h2>Overview</h2>
+<p>The main column takes the remaining space. It should be wide and fluid, while the sidebar keeps a fixed basis of two hundred pixels regardless of the viewport.</p>
+<p>A second paragraph shows that block flow continues inside a flex item exactly as it would anywhere else.</p></main>
+</div>
+<footer>Footer text, copyright nobody.</footer>
+</body></html>

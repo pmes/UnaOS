@@ -1,0 +1,27 @@
+# =====================================================================
+# CRATE: vessels/facet-view/Cargo.toml
+# DESCRIPTION: The Image Vessel. A window over the Facet handler
+#              (handlers/facet, The Canvas): the vessel sends Facet's
+#              bus verbs and blits the frames it renders. It decodes,
+#              edits and scales nothing itself.
+# =====================================================================
+
+[package]
+name = "facet-view"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+bandy = { path = "../../libs/bandy" }
+facet = { path = "../../handlers/facet" }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+log = "0.4"
+
+# The window: quartzite's AppKit image surface (macOS first; other backends follow quartzite).
+[target.'cfg(target_os = "macos")'.dependencies]
+quartzite = { path = "../../libs/quartzite", default-features = false }
+gneiss_pal = { path = "../../libs/gneiss_pal" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

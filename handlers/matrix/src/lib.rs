@@ -926,6 +926,7 @@ pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<Pa
     // scanner; it is a browse capability layered ON the genesis tree, not a
     // replacement for it.
     let finder = finder::Finder::new((*absolute_workspace_root).clone());
+    let mut facet_receipts: u64 = 0;
     println!("[MATRIX] Spatial Anchor Established via Brain Loop: {:?}", absolute_workspace_root);
 
     loop {
@@ -975,7 +976,13 @@ pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<Pa
                     log::info!("[MATRIX] Finder request from {:?}", principal);
                 }
                 for out in finder.dispatch(ev) {
+                    // SR29: an opened image is Facet's — delegate, after the Finder's own answer.
+                    let delegate = finder::facet_delegation(finder.root(), &out, finder::FACET_RECEIPT_TAG | facet_receipts);
                     synapse.fire_async(SMessage::Matrix(out)).await;
+                    if let Some(open) = delegate {
+                        facet_receipts += 1;
+                        synapse.fire_async(SMessage::Facet(open)).await;
+                    }
                 }
             }
             Ok(_) => {}

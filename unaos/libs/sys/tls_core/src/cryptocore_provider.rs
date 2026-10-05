@@ -158,6 +158,24 @@ impl CryptoProvider for CryptoCoreProvider {
         }
     }
 
+    fn tls12_prf(&self, alg: HashAlg, secret: &[u8], label: &[u8], seed: &[&[u8]], out: &mut [u8]) -> Result<(), CryptoError> {
+        match alg {
+            HashAlg::Sha256 => crypto_core::tls12_prf::prf::<Sha256>(secret, label, seed, out),
+            HashAlg::Sha384 => crypto_core::tls12_prf::prf::<Sha384>(secret, label, seed, out),
+            HashAlg::Sha512 => crypto_core::tls12_prf::prf::<Sha512>(secret, label, seed, out),
+        }
+        Ok(())
+    }
+
+    fn sha1(&self, parts: &[&[u8]]) -> Result<[u8; 20], CryptoError> {
+        use crypto_core::Digest as _;
+        let mut h = <crypto_core::sha1::Sha1 as crypto_core::Digest>::new();
+        for p in parts {
+            h.update(p);
+        }
+        Ok(h.finalize())
+    }
+
     fn aead_seal(&self, alg: AeadAlg, key: &[u8], nonce: &[u8; 12], aad: &[u8], in_out: &mut Vec<u8>) -> Result<(), CryptoError> {
         if key.len() != alg.key_len() {
             return Err(CryptoError::BadKey);

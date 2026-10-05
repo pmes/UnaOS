@@ -17,7 +17,7 @@
 //! CONSTANT-TIME: not required and not claimed — every input of a verification (key, message, signature)
 //! is public. The code still has no secret to leak.
 //!
-//! Hashes: SHA-224/256/384/512 (this crate carries no SHA-1; SHA-1 signatures are refused as
+//! Hashes: SHA-224/256/384/512 (SHA-1 exists in this crate for git object ids only; SHA-1 signatures are refused as
 //! `Error::Param`, which a caller reports as unsupported).
 
 use crate::sha2::{Digest, Sha224, Sha256, Sha384, Sha512};

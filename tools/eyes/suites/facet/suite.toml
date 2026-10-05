@@ -1,0 +1,17 @@
+# EYES suite: Facet (handlers/facet), The Canvas — views and edits rendered by `facet render`.
+#   cases/facet.toml    — against golden PNGs, each proven against Chromium (pages/<case>.html,
+#                         screenshotted by oracle.mjs) before it was checked in; `note` says how close.
+#   cases/chromium.toml — the same subjects against Chromium itself, live (`<case>@chromium`).
+# Placeholders: {repo} {suite} {outdir} {case} {out} {ref} {w} {h} {page} {url}
+build = ["cargo build --release -q -p facet --bin facet"]
+
+[defaults]
+width = 0   # the subject sizes itself (facet render sizes the viewport to the view)
+height = 0
+
+[defaults.subject]
+kind = "cmd"
+
+[defaults.oracle]
+kind = "golden"
+path = "goldens/{case}.png"
