@@ -1,0 +1,15 @@
+[package]
+name = "usbnet_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "USB Ethernet receive framing core (AX88179 trailing header block, RTL8153 leading rx descriptor) — shared by Ring 0 and the host tests."
+
+# NETFRAME (rmbp-ledger B368). `#![no_std]`, `#![forbid(unsafe_code)]`, NO dependencies, no alloc.
+# Same shape as `unaos/libs/sys/wifi_core`: a member of the ROOT host workspace (`cargo test -p
+# usbnet_core`), pulled by the kernel as an optional path dep behind its `usbnet` feature.
+[dependencies]
+
+[features]
+default = ["std"]
+std = []

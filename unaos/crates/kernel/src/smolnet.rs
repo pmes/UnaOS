@@ -1716,14 +1716,22 @@ pub fn sntp_sync_once(server: [u8; 4]) -> Option<(u64, u8)> {
     let got = stack_recvfrom(sid, &mut buf);
     stack_close(sid);
     let (_src, _port, n) = got?;
-    match crate::net_sntp::parse(&buf[..n]) {
+    sntp_apply(&buf[..n], &mut crate::clock::LiveClock) // CONSOLEFIX M1: the one datagram -> clock path; THIS caller is the only one that names the live clock
+}
+
+/// CONSOLEFIX M1 (B365): THE path from an SNTP datagram to a clock. Parses with the shared
+/// `crate::net_sntp` parser and, on a usable reply only, plants `(unix, mono, Sntp{stratum})` on `sink`,
+/// capturing the monotonic tick "in the same breath" (the CLOCK-1 seam). KoD / malformed / short plant
+/// nothing. The live client passes `clock::LiveClock`; `sntp_x86_gate` passes a `clock::FixtureClock`,
+/// so the fixture runs the live code and never touches the live anchor.
+pub fn sntp_apply(pkt: &[u8], sink: &mut dyn crate::clock::AnchorSink) -> Option<(u64, u8)> {
+    match crate::net_sntp::parse(pkt) {
         crate::net_sntp::Sntp::Ok { unix_secs, stratum } => {
-            // Capture the monotonic tick "in the same breath" as the anchor, per the CLOCK-1 seam.
             let mono = crate::clock::mono_ticks().unwrap_or(0);
-            crate::clock::set_anchor(unix_secs, mono, crate::clock::ClockSource::Sntp { stratum });
+            sink.plant(unix_secs, mono, crate::clock::ClockSource::Sntp { stratum });
             Some((unix_secs, stratum))
         }
-        _ => None, // KoD / malformed / short — do not touch the clock
+        _ => None,
     }
 }
 
@@ -1870,50 +1878,54 @@ pub fn sntp_x86_gate() {
         if rej_alarm { "malformed PASS" } else { "FAIL" }
     );
 
-    // 0x10 — the live anchor path: parse a canned reply and set the shared clock, then assert the
-    // deterministic (non-extrapolated) anchor renders exactly INJ_ISO and is tagged Sntp{2}. Uses
-    // `raw_anchor` so the free-running TSC never races the assertion.
-    // The set-clock leg plants a CANNED anchor to prove the live path. It must not stay planted:
-    // left in place it dated every FAT write July 22 and flipped every logts prefix to 1-second
-    // civil form for the rest of the boot — the s73 kepler breakdown lost its ms resolution to
-    // exactly this line. Snapshot whether a REAL anchor existed first (it cannot this early on
-    // x86, but a fixture that clobbers an operator's date -s would be the same defect again).
-    let had_real_anchor = crate::clock::raw_anchor().is_some();
-    let set_ok = match net_sntp::parse(&good) {
-        Sntp::Ok { unix_secs, stratum } => {
-            let mono = crate::clock::mono_ticks().unwrap_or(0);
-            crate::clock::set_anchor(unix_secs, mono, crate::clock::ClockSource::Sntp { stratum });
-            match crate::clock::raw_anchor() {
-                Some((anchor_unix, crate::clock::ClockSource::Sntp { stratum: s })) => {
-                    let mut iso = [0u8; 24];
-                    let n = crate::clock::render_iso8601(anchor_unix, &mut iso);
-                    s == 2 && core::str::from_utf8(&iso[..n]) == Ok(INJ_ISO)
-                }
-                _ => false,
+    // 0x10 — the anchor path, on a FIXTURE clock (CONSOLEFIX M1, B365). Flight 22: this leg planted its canned
+    // July-22 value on the LIVE anchor; the RTC had anchored first, so the old cleanup left the canned value
+    // standing for the rest of the boot (stamps 05:13 -> 15:30, the bar "wed 22 jul"). It now plants a
+    // `clock::FixtureClock` through `sntp_apply` — the function the live client calls — and asserts the
+    // deterministic (non-extrapolated) anchor renders exactly INJ_ISO and is tagged Sntp{2}.
+    // 0x20 — the live clock did not move: `raw_anchor` before == after (source and base second).
+    let before = crate::clock::raw_anchor();
+    let mut fixture = crate::clock::FixtureClock::new();
+    let set_ok = match sntp_apply(&good, &mut fixture) {
+        Some((unix_secs, 2)) if unix_secs == INJ_UNIX => match fixture.raw_anchor() {
+            Some((anchor_unix, crate::clock::ClockSource::Sntp { stratum: 2 })) => {
+                let mut iso = [0u8; 24];
+                let n = crate::clock::render_iso8601(anchor_unix, &mut iso);
+                core::str::from_utf8(&iso[..n]) == Ok(INJ_ISO) && fixture.unix_now().is_some()
             }
-        }
+            _ => false,
+        },
         _ => false,
     };
-    if set_ok {
+    // A KoD datagram must plant nothing, on the fixture either.
+    let mut kod_clock = crate::clock::FixtureClock::new();
+    let kod_inert = sntp_apply(&kod, &mut kod_clock).is_none() && kod_clock.raw_anchor().is_none();
+    fixture.clear();
+    if set_ok && kod_inert {
         w |= 0x10;
     }
     serial_println!(
-        ":: [sntp-x86] canned reply sets clock => {} ::",
-        if set_ok { "2026-07-22T15:30:45Z PASS" } else { "FAIL" }
+        ":: [sntp-x86] canned reply anchors the FIXTURE clock => {} ::",
+        if set_ok && kod_inert { "2026-07-22T15:30:45Z PASS" } else { "FAIL" }
     );
-    if had_real_anchor {
-        // Defensive: never destroy an anchor the fixture did not plant. Say so instead.
-        serial_println!(":: [sntp-x86] pre-existing anchor left in place (canned value overwrote it — operator should re-setdate) ::");
-    } else {
-        crate::clock::witness_clear_anchor();
-        serial_println!(":: [sntp-x86] canned anchor cleared — clock unanchored again ::");
+    let after = crate::clock::raw_anchor();
+    let untouched = before == after;
+    if untouched {
+        w |= 0x20;
+    }
+    let src = after.map(|(_, s)| crate::clock::source_word(s)).unwrap_or("unset");
+    match (before, after) {
+        (Some((b, _)), Some((a, _))) => serial_println!(":: [sntp-x86] live clock untouched source={} before={} after={} => {} ::", src, b, a, if untouched { "PASS" } else { "FAIL" }),
+        (None, None) => serial_println!(":: [sntp-x86] live clock untouched source=unset before=none after=none => PASS ::"),
+        _ => serial_println!(":: [sntp-x86] live clock untouched source={} before={} after={} => FAIL ::", src, before.is_some() as u8, after.is_some() as u8),
     }
 
-    let pass = w == 0x1f;
+    let pass = w == 0x3f;
     serial_println!(
-        ":: SNTP-X86-GATE: x86 sntp client battery {} [w=0x{:x}] (parse-ok+iso|reject-short|kod|reject-alarm|set-clock) ::",
+        ":: SNTP-X86-GATE: x86 sntp client battery {} [w=0x{:x}] (parse-ok+iso|reject-short|kod|reject-alarm|fixture-clock|live-untouched) -> {} ::",
         if pass { "PASS" } else { "FAIL" },
-        w
+        w,
+        if pass { "PASS" } else { "FAIL" }
     );
 }
 
@@ -2124,6 +2136,9 @@ pub fn dhcp_link_tick() {
     if !usbnet::is_up() || (usbnet::kind() == usbnet::KIND_AX88179 && !usbnet::link_up()) {
         return;
     }
+    if usbnet::take_rx_resumed() && DHCP_LINK_TRIES.swap(0, Ordering::Relaxed) >= DHCP_LINK_MAX {
+        serial_println!("[usbnet] dhcp link tries re-armed (rx resumed after a stall)"); // NETFRAME (B368)
+    }
     if DHCP_LINK_TRIES.fetch_add(1, Ordering::Relaxed) >= DHCP_LINK_MAX {
         return;
     }
@@ -2181,6 +2196,13 @@ pub fn netclock_selftest() {
             return;
         }
     }
+    // CONSOLEFIX M1 (B365): flight 22 PASSed this on a stack that never got a lease (`SOCK-5: dhcpv4 no offer —
+    // static fallback stands 10.0.2.15/24`, `[sntp] target=0.0.0.0 from=none`). The poll budget of a stack with
+    // no lease says nothing about time arriving: no lease, an honest SKIP.
+    if !leased() {
+        serial_println!(":: NETCLOCK: polls_per_s=0 tx_per_s=0 loan_held_max_us=0 rx_ok={} lease=none clock={} -> SKIP reason=no-lease ::", usbnet::rx_ok(), crate::clock::source_word(crate::clock::source()));
+        return;
+    }
     let p0 = crate::net_tick::polls();
     let t0 = usbnet::tx_frames();
     usbnet::loan_reset();
@@ -2198,7 +2220,21 @@ pub fn netclock_selftest() {
     let loan = usbnet::loan_held_max_us();
     let ok = polls_ps <= NETCLOCK_POLLS_MAX && tx_ps <= NETCLOCK_TX_MAX && loan <= NETCLOCK_LOAN_MAX_US;
     serial_println!(
-        ":: NETCLOCK: polls_per_s={} tx_per_s={} loan_held_max_us={} rx_ok={} -> {} ::",
-        polls_ps, tx_ps, loan, usbnet::rx_ok(), if ok { "PASS" } else { "FAIL" }
+        ":: NETCLOCK: polls_per_s={} tx_per_s={} loan_held_max_us={} rx_ok={} lease=yes gw={} dns={} clock={} -> {} ::",
+        polls_ps, tx_ps, loan, usbnet::rx_ok(), e1000::fmt_ip(&sntp_target()), e1000::fmt_ip(&dns_server()), crate::clock::source_word(crate::clock::source()), if ok { "PASS" } else { "FAIL" }
     );
+}
+
+/// NETFRAME (B368): `tests usbnet7` runs the stack's poll itself (the shell holds the main loop while a fixture
+/// runs): build the stack if needed (its DHCP client then retransmits on smoltcp's own timer), one `service_poll`.
+#[cfg(feature = "usbnet")]
+pub fn usbnet7_poll() -> bool {
+    {
+        let mut g = STACK.lock();
+        if !ensure_stack(&mut g) {
+            return false;
+        }
+    }
+    service_poll();
+    true
 }

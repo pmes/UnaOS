@@ -1,5 +1,5 @@
 //! The scanline rasterizer: exact-area coverage accumulation with nonzero winding, 256 coverage levels,
-//! subpixel origin offsets, no hinting.
+//! subpixel origin offsets. Hinting happens before it: [`rasterize_glyph_hinted`] grid-fits the outline first.
 //!
 //! Method (the signed-area accumulation that FreeType's "smooth" rasterizer and font-rs both use): every
 //! line segment, clipped to a pixel row and split at every pixel column it crosses, deposits into an
@@ -316,6 +316,54 @@ pub fn rasterize_glyph_mode(
     }
     let data = r.finish();
     Some(trim(GlyphBitmap { left: x0, top: y0, width: w as u32, height: h as u32, data }))
+}
+
+/// Rasterize a path given in PIXELS (y up, origin at the pen position) — e.g. a hinted outline from
+/// [`crate::hint::Outline::to_path_26_6`] — with the origin at subpixel offset (`sub_x`, `sub_y`).
+pub fn rasterize_path_px(path: &crate::Path, sub_x: f32, sub_y: f32, mode: RenderMode) -> Option<GlyphBitmap> {
+    if path.is_empty() {
+        return None;
+    }
+    let x0 = floor(sub_x + path.x_min) as i32 - 1;
+    let x1 = ceil(sub_x + path.x_max) as i32 + 1;
+    let y0 = floor(sub_y - path.y_max) as i32 - 1;
+    let y1 = ceil(sub_y - path.y_min) as i32 + 1;
+    let w = (x1 - x0).max(1) as usize;
+    let h = (y1 - y0).max(1) as usize;
+    if w * h > 1 << 22 {
+        return None;
+    }
+    let mut r = Rasterizer::new(w, h);
+    r.mode = mode;
+    {
+        let mut s = Scaled { r: &mut r, scale: 1.0, ox: sub_x - x0 as f32, oy: sub_y - y0 as f32 };
+        path.replay(&mut s);
+    }
+    let data = r.finish();
+    Some(trim(GlyphBitmap { left: x0, top: y0, width: w as u32, height: h as u32, data }))
+}
+
+/// [`rasterize_glyph_mode`] with a [`Hinting`](crate::hint::Hinting) mode. `Slight` hints TrueType outlines with
+/// the light auto-hinter (`hinter` is the face's [`AutoHinter`](crate::hint::autofit::AutoHinter)); other outline
+/// formats, and `None`, rasterize unhinted.
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_glyph_hinted(
+    font: &crate::Font,
+    hinter: &mut crate::hint::autofit::AutoHinter,
+    gid: u16,
+    size: f32,
+    sub_x: f32,
+    sub_y: f32,
+    mode: RenderMode,
+    hinting: crate::hint::Hinting,
+) -> Option<GlyphBitmap> {
+    if hinting == crate::hint::Hinting::None || !hinter.hintable {
+        return rasterize_glyph_mode(font, gid, size, sub_x, sub_y, mode);
+    }
+    match hinter.hint(font, gid, size) {
+        Some(o) => rasterize_path_px(&o.to_path_26_6(), sub_x, sub_y, mode),
+        None => rasterize_glyph_mode(font, gid, size, sub_x, sub_y, mode),
+    }
 }
 
 /// Drop all-zero border rows/columns.

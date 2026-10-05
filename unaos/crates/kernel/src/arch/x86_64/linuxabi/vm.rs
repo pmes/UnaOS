@@ -18,7 +18,7 @@
 //!   `STACK_TOP` plus a lazy VMA down to [`STACK_LAZY_LO`] (8 MiB in all); `mmap` is first-fit over two windows — the
 //!   original [`super::MMAP_BASE`]..[`super::MMAP_LIMIT`] (768 MiB) and [`MMAP2_BASE`]..[`MMAP2_LIMIT`] (448 GiB, above
 //!   the stack and the signal trampoline) — so `munmap`'d address space is reused and nothing collides with the ELF
-//!   window (which stays below 16 MiB in PML4[0], never handed to `mmap`).
+//!   window (which stays below 64 MiB in PML4[0] since WINDOW2, never handed to `mmap`; a static-PIE sits at `elf::PIE_BASE`).
 //! * The per-process cap is a budget on RESIDENT pages: [`HEAP_SHARE`] (the old 96 MiB cap, served from the kernel heap as
 //!   before) plus every frame of the machine's Usable RAM above 16 MiB outside the heap window that the identity map
 //!   reaches (the user frame POOL, [`pool_alloc`]). A refusal prints `[linuxabi] resident limit: …` with both numbers.
@@ -169,7 +169,7 @@ impl Vm {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The user frame pool: Usable RAM above 16 MiB, outside the kernel heap, reachable through the identity map.
+// The user frame pool: Usable RAM above the fixed-image window (64 MiB since WINDOW2), outside the kernel heap, reachable through the identity map.
 // ---------------------------------------------------------------------------------------------
 
 struct Pool {
@@ -194,7 +194,7 @@ fn pool_init(p: &mut Pool) {
     let (hs, hl) = memory::selfbuild3_heap_window();
     let mut cut: Vec<(u64, u64)> = Vec::new();
     for (s, e) in memory::selfbuild3_usable_ram() {
-        let s = ((s.max(16 << 20)) + PAGE - 1) & !(PAGE - 1);
+        let s = ((s.max(super::elf::IMAGE_LIMIT)) + PAGE - 1) & !(PAGE - 1); // WINDOW2: above the 64 MiB fixed-image window (was 16 MiB) — a pooled frame there would be shadowed by a process's image
         let e = e.min(POOL_CEIL) & !(PAGE - 1);
         if s >= e {
             continue;

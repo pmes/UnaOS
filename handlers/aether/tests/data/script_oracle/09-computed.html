@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>09 computed style</title>
+<style>
+body { margin: 8px; font-family: sans-serif; }
+.card { color: #336699; background-color: rgb(250, 240, 230); padding: 12px; border: 2px solid #333; position: relative; }
+.card em { font-style: italic; font-weight: 700; color: inherit; }
+.hidden { visibility: hidden; }
+.row { display: flex; flex-direction: column; white-space: nowrap; }
+.gone { display: none; }
+.deco { text-decoration: underline; }
+</style></head>
+<body>
+<div class="card" id="card"><em id="em">emphasis</em> <span id="sp" class="deco">deco</span></div>
+<div class="row" id="row"><span id="h" class="hidden">h</span></div>
+<p id="g" class="gone">gone</p>
+<ul id="log"></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+function cs(id, props) { var s = getComputedStyle(document.getElementById(id)); return id + ': ' + props.map(function (p) { return p + '=' + s.getPropertyValue(p); }).join('; '); }
+log(cs('card', ['color', 'background-color', 'padding-top', 'border-top-width', 'border-top-style', 'position', 'font-weight', 'visibility']));
+log(cs('em', ['font-style', 'font-weight', 'color']));
+log(cs('sp', ['text-decoration-line', 'color']));
+log(cs('row', ['display', 'flex-direction', 'white-space']));
+log(cs('h', ['visibility', 'white-space']));
+log(cs('g', ['display']));
+var card = document.getElementById('card');
+card.style.color = 'rgb(10, 20, 30)';
+card.classList.add('hidden');
+var s = getComputedStyle(card);
+log('after mutation: ' + s.color + ' ' + s.visibility + ' camel=' + s.backgroundColor + ' fontStyle=' + s.fontStyle);
+var e = null; try { s.color = 'red'; } catch (x) { e = x.name; }
+log('readonly: ' + e + ' cssText=[' + s.cssText + ']');
+var detached = document.createElement('div');
+log('detached display: [' + getComputedStyle(detached).display + ']');
+</script>
+</body></html>

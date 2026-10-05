@@ -43,6 +43,10 @@ struct Collector<'r, 'a> {
     r: &'r Renderer<'a>,
     ctx: &'r Ctx,
     styles: Vec<Style>,
+    /// Per style: the element it belongs to and the enclosing element's style index.
+    nodes: Vec<usize>,
+    parents: Vec<Option<usize>>,
+    stack: Vec<usize>,
     chars: Vec<Ch>,
     frames: Vec<Frame>,
 }
@@ -92,6 +96,9 @@ impl Collector<'_, '_> {
         let sidx = self.styles.len();
         let bshift = bshift + baseline_shift(self.r, &st);
         self.styles.push(st.clone());
+        self.nodes.push(node);
+        self.parents.push(self.stack.last().copied());
+        self.stack.push(sidx);
         let (decor, decor_style) = if st.decoration != 0 { (st.decoration | decor, sidx) } else { (decor, decor_style) };
         let frame = Frame {
             xs: self.lens(node, "x", Axis::X, &st),
@@ -134,6 +141,7 @@ impl Collector<'_, '_> {
             }
         }
         self.frames.pop();
+        self.stack.pop();
     }
 }
 
@@ -159,6 +167,9 @@ struct DecoSeg {
 
 pub struct Layout {
     pub styles: Vec<Style>,
+    /// Per style index: its element and the enclosing element's style index.
+    pub nodes: Vec<usize>,
+    pub parents: Vec<Option<usize>>,
     pub runs: Vec<Run>,
     pub bbox: Option<Rect>,
 }
@@ -246,7 +257,7 @@ fn baseline_offset(st: &Style, font: &font_core::Font) -> f64 {
 
 pub fn layout(r: &Renderer, node: usize, ctx: &Ctx, parent: &Style) -> Option<Layout> {
     let fonts: &FontSet = r.opts.fonts?;
-    let mut col = Collector { r, ctx, styles: Vec::new(), chars: Vec::new(), frames: Vec::new() };
+    let mut col = Collector { r, ctx, styles: Vec::new(), nodes: Vec::new(), parents: Vec::new(), stack: Vec::new(), chars: Vec::new(), frames: Vec::new() };
     col.walk(node, parent, 0, 0, false, 0.0);
     // Trailing space (default white-space handling).
     let root_preserve = col.styles.first().map(|s| s.preserve_space).unwrap_or(false);
@@ -256,9 +267,10 @@ pub fn layout(r: &Renderer, node: usize, ctx: &Ctx, parent: &Style) -> Option<La
         }
     }
     let styles = col.styles;
+    let (nodes, parents) = (col.nodes, col.parents);
     let chars = col.chars;
     if chars.is_empty() {
-        return Some(Layout { styles, runs: Vec::new(), bbox: None });
+        return Some(Layout { styles, nodes, parents, runs: Vec::new(), bbox: None });
     }
     // Font face per character (with fallback).
     let mut faces = Vec::with_capacity(chars.len());
@@ -451,39 +463,91 @@ pub fn layout(r: &Renderer, node: usize, ctx: &Ctx, parent: &Style) -> Option<La
             run.decorations.push((d.bit, d.style, path));
         }
     }
-    Some(Layout { styles, runs, bbox: if any { bounds.rect() } else { None } })
+    Some(Layout { styles, nodes, parents, runs, bbox: if any { bounds.rect() } else { None } })
 }
 
 pub fn render_text(r: &mut Renderer, node: usize, ctx: &Ctx, parent: &Style, canvas: &mut Pixmap) {
     let Some(lay) = layout(r, node, ctx, parent) else { return };
-    let bbox = lay.bbox;
-    for run in &lay.runs {
-        let rs = &lay.styles[run.style];
-        if !rs.visible {
+    // Runs inside a <tspan> with a `filter` (SVG 2) render together through it: group the runs by their
+    // innermost filtered tspan, each group drawn where its first run falls in document order.
+    let owner = |mut s: usize| -> Option<usize> {
+        loop {
+            let n = lay.nodes[s];
+            if n != node && style::get(&r.props[n], "filter").map(|v| !v.trim().is_empty() && v.trim() != "none").unwrap_or(false) {
+                return Some(s);
+            }
+            s = lay.parents[s]?;
+        }
+    };
+    let mut groups: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
+    for (i, run) in lay.runs.iter().enumerate() {
+        let o = owner(run.style);
+        match groups.iter_mut().find(|g| o.is_some() && g.0 == o) {
+            Some(g) => g.1.push(i),
+            None => groups.push((o, alloc::vec![i])),
+        }
+    }
+    for (o, runs) in &groups {
+        let Some(o) = *o else {
+            for &i in runs {
+                draw_run(r, &lay, i, ctx, canvas);
+            }
             continue;
-        }
-        // Underline and overline under the text, line-through over it (CSS Text Decoration 3 §3).
-        for (bit, ds, d) in &run.decorations {
-            if *bit != style::DECOR_LINE_THROUGH {
-                let dst = lay.styles[*ds].clone();
-                r.fill_path(d, &dst, bbox, ctx, canvas);
-                r.stroke_path(d, &dst, bbox, ctx, canvas);
+        };
+        let onode = lay.nodes[o];
+        let fv = String::from(style::get(&r.props[onode], "filter").unwrap_or(""));
+        let mut gb: Option<Rect> = None;
+        for &i in runs {
+            if let Some(b) = lay.runs[i].path.bbox() {
+                gb = Some(gb.map(|a| a.union(&b)).unwrap_or(b));
             }
         }
-        let rs = rs.clone();
-        if rs.stroke_first {
-            r.stroke_path(&run.path, &rs, bbox, ctx, canvas);
-            r.fill_path_ex(&run.path, &rs, bbox, ctx, canvas, true);
-        } else {
-            r.fill_path_ex(&run.path, &rs, bbox, ctx, canvas, true);
-            r.stroke_path(&run.path, &rs, bbox, ctx, canvas);
-        }
-        for (bit, ds, d) in &run.decorations {
-            if *bit == style::DECOR_LINE_THROUGH {
-                let dst = lay.styles[*ds].clone();
-                r.fill_path(d, &dst, bbox, ctx, canvas);
-                r.stroke_path(d, &dst, bbox, ctx, canvas);
+        let ectx = Ctx { style: lay.styles[o].clone(), ..ctx.clone() };
+        let lay_ref = &lay;
+        match crate::filter::render_filtered_bbox(r, onode, gb, &ectx, &fv, |r2, c, l| {
+            for &i in runs {
+                draw_run(r2, lay_ref, i, c, l);
             }
+        }) {
+            crate::filter::Outcome::Layer(l) => canvas.draw_pixmap(&l, 1.0, None),
+            crate::filter::Outcome::Nothing => {}
+            crate::filter::Outcome::Unfiltered => {
+                for &i in runs {
+                    draw_run(r, &lay, i, ctx, canvas);
+                }
+            }
+        }
+    }
+}
+
+fn draw_run(r: &mut Renderer, lay: &Layout, i: usize, ctx: &Ctx, canvas: &mut Pixmap) {
+    let bbox = lay.bbox;
+    let run = &lay.runs[i];
+    let rs = &lay.styles[run.style];
+    if !rs.visible {
+        return;
+    }
+    // Underline and overline under the text, line-through over it (CSS Text Decoration 3 §3).
+    for (bit, ds, d) in &run.decorations {
+        if *bit != style::DECOR_LINE_THROUGH {
+            let dst = lay.styles[*ds].clone();
+            r.fill_path(d, &dst, bbox, ctx, canvas);
+            r.stroke_path(d, &dst, bbox, ctx, canvas);
+        }
+    }
+    let rs = rs.clone();
+    if rs.stroke_first {
+        r.stroke_path(&run.path, &rs, bbox, ctx, canvas);
+        r.fill_path_ex(&run.path, &rs, bbox, ctx, canvas, true);
+    } else {
+        r.fill_path_ex(&run.path, &rs, bbox, ctx, canvas, true);
+        r.stroke_path(&run.path, &rs, bbox, ctx, canvas);
+    }
+    for (bit, ds, d) in &run.decorations {
+        if *bit == style::DECOR_LINE_THROUGH {
+            let dst = lay.styles[*ds].clone();
+            r.fill_path(d, &dst, bbox, ctx, canvas);
+            r.stroke_path(d, &dst, bbox, ctx, canvas);
         }
     }
 }

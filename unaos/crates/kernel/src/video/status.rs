@@ -409,6 +409,9 @@ fn board_raw() -> Option<Battery> {
 /// handshakes, and `strip::compose_all` runs masked. The one call site is
 /// [`super::desktop_uefi::desktop_app_service`].
 pub fn poll() {
+    if !crate::boot::services_gate("status") {
+        return; // INSTALLBARE (R86): the bar's status poll is furniture's — nothing polls the SMC under the setter / the login screen
+    }
     let now = crate::arch::ms();
     let last = LAST_POLL_MS.load(Ordering::Relaxed);
     if last != 0 && now.wrapping_sub(last) < POLL_MS {

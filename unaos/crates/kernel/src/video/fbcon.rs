@@ -165,7 +165,7 @@ impl<const N: usize> OpList<N> {
 /// aarch64 console, any pre-takeover x86 print) this is the font8x8 path, byte for byte.
 fn draw_glyph(surf: &FrameBuffer, ch: u8, cx: usize, cy: usize, fg: u32, bg: u32, s: usize, aa: bool) {
     if aa {
-        crate::video::text::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false, crate::video::text::Face::Body);
+        crate::video::text::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false, crate::video::text::Face::Grid); // KERNELFONT2 (B363): the console cell is the dpi-scaled grid
         return;
     }
     let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
@@ -1777,8 +1777,8 @@ pub fn panel_console_resume() -> usize {
             // reversing it is `video::font::SIZE` (one constant) rather than this scale.
             c.scale = 1;
             c.aa = true;
-            c.cell_w = crate::video::font::CELL_W;
-            c.cell_h = crate::video::font::CELL_H;
+            c.cell_w = crate::video::text::arm_grid(c.fb.info().width).0; // KERNELFONT2 (B363): the dpi-scaled grid cell (7x16 x ppi/96 at the half pixel); latches video::dpi
+            c.cell_h = crate::video::text::grid_cell().1;
             let info = c.fb.info();
             c.cols = (info.width / c.cell_w).max(1);
             c.rows = (info.height / c.cell_h).max(1);
@@ -1863,12 +1863,12 @@ fn win_content_extent(pw: usize, ph: usize, wbot: usize, cell_w: usize, cell_h: 
     let wtop = crate::ui_status::top_chrome_h(pw, ph); let avail_h = ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).max(1); // ⚠ SAME-LINE fold, line-NEUTRAL (PARITY.md §5.3): unchanged expression, `wtop` merely named because the cap below needs it too.
     // CASCADEFIT — THE HEIGHT CAP, and deliberately ONLY the height: the tallest CONTENT whose outer box still ends above the keep-out published by a boot window below (`wbot` = [`console_work_bottom`], this file's tail).
     // ⚠ It is applied AFTER the budget loop, at the return, and NOT folded into `avail_h` above — the loop shrinks both axes together, so a shorter work area handed in at the top would make it terminate earlier and the console would come out WIDER and somewhere else in `x`: a placement fix that moved the axis it was not about. Capped afterwards, `w` is derived from the panel exactly as before and only the height can move. MEASURED (`UNAOS_PIDESK=1 ./arroyo kernel8-test`, this arc): at 1920x1200 the cap is 868 content rows against a console that wants 736, so it does not bind and the whole correction is in the centring below; at 640x480 it is 176 against 352, and it binds.
-    let cap = wbot.saturating_sub(wtop).saturating_sub(wm::TITLE_H + 2 * wm::BORDER); // Never negative: saturating, and `.max(1)` at the return keeps at least one glyph row.
+    let cap = wbot.saturating_sub(wtop).saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()); // Never negative: saturating, and `.max(1)` at the return keeps at least one glyph row.
     let mut w = (pw * 7 / 8).max(cell_w);
     let mut h = (avail_h * 7 / 8).max(cell_h);
     // Outer box = content + chrome. Budget the box, not the content: the box is what gets staged.
     let box_px = |w: usize, h: usize| {
-        (w + 2 * wm::BORDER).saturating_mul(h + wm::TITLE_H + 2 * wm::BORDER)
+        (w + 2 * wm::BORDER()).saturating_mul(h + wm::TITLE_H() + 2 * wm::BORDER())
     };
     while box_px(w, h) > WIN_BOX_BUDGET_PX && w > cell_w && h > cell_h {
         w = (w * 15 / 16).max(cell_w);
@@ -1992,8 +1992,8 @@ pub fn panel_console_window_open() -> wm::WinId {
         ch as u32,
         stride as u32,
         b"Console",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[wc-x] console-window DECLINE reason=create-failed");
@@ -2303,8 +2303,8 @@ pub fn panel_console_face_arm() -> Option<(usize, usize)> {
             // magnified alpha raster is not what any of this wants.
             c.scale = 1;
             c.aa = true;
-            c.cell_w = crate::video::font::CELL_W;
-            c.cell_h = crate::video::font::CELL_H;
+            c.cell_w = crate::video::text::arm_grid(c.fb.info().width).0; // KERNELFONT2 (B363): the dpi-scaled grid cell, as the x86 seam
+            c.cell_h = crate::video::text::grid_cell().1;
             // The grid follows the cell. If the console is subsequently routed into a window,
             // `panel_console_window_open` recomputes both against the WINDOW's extent; until then
             // these are the panel's, which is the surface the console is still drawing on.
@@ -2686,7 +2686,7 @@ pub fn orin_face_arm() {
             seen = Some((c.aa, c.cell_w, c.cell_h, c.cols, c.rows, info.width, info.height));
         }
     });
-    let want = (crate::video::font::CELL_W, crate::video::font::CELL_H);
+    let want = crate::video::text::grid_cell(); // KERNELFONT2 (B363): the armed cell is the dpi-scaled grid (font::CELL_W x CELL_H at scale 1.0)
     match (asked, seen) {
         (None, _) => serial_println!(
             "[conface] DECLINE reason=console-not-ready runs={} armed={} want={}x{} (panel_console_face_arm answered None — the console was not ready or FBCON was contended; the console keeps font8x8 at scale 1 and nothing else about this boot changes)",
@@ -3462,4 +3462,130 @@ fn cells_remint(
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn panel_console_live() -> bool {
     PANEL_CONSOLE.load(Ordering::Relaxed)
+}
+
+/// KERNELFONT2 (rmbp-ledger B363) M4 — **the faces just loaded (or were restyled): repaint the routed console's
+/// screenful from its cell store**, so the boot log printed in the bitmap atlas before the volume was up turns into
+/// DejaVu Sans Mono once, instead of only as it scrolls away. One CELL ROW per masked `FBCON` hold (the row back to
+/// the ground, then its glyphs from the engine's warm cache — the same order of work as printing one line), so a
+/// print on another core or from an interrupt is serialised against every row and never sees a half-repainted one;
+/// interrupts are re-enabled between rows. The whole box is presented once, lock released and unmasked
+/// (`route_present`'s contract). Returns the rows repainted: 0 when the console is not routed into a window, has
+/// no store, or the lock stayed contended.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub fn font_repaint() -> usize {
+    let mut row = 0usize;
+    let mut repainted = 0usize;
+    let mut misses = 0u32;
+    loop {
+        // None = contended; Some(None) = nothing (left) to paint; Some(Some(more)) = this row painted
+        let mut step: Option<Option<bool>> = None;
+        crate::arch::without_interrupts(|| {
+            let Some(mut c) = FBCON.try_lock() else { return };
+            if c.win_store.is_none() || c.win_cells.is_none() || row >= c.cell_rows || c.cell_cols == 0 {
+                step = Some(None);
+                return;
+            }
+            let (cols, cw, ch, fg, bg, scale, aa) = (c.cell_cols, c.cell_w, c.cell_h, c.fg, c.bg, c.scale, c.aa);
+            let y = row * ch;
+            let mut line = [0u8; 512];
+            let n = cols.min(line.len());
+            if let Some(k) = c.win_cells.as_ref() {
+                for (i, b) in line[..n].iter_mut().enumerate() {
+                    *b = k.get(row * cols + i).copied().unwrap_or(0);
+                }
+            }
+            {
+                let surf = c.draw_fb();
+                surf.fill_rows(y, y + ch, bg);
+                for (i, &b) in line[..n].iter().enumerate() {
+                    if b != 0 {
+                        draw_glyph(surf, b, i * cw, y, fg, bg, scale, aa);
+                    }
+                }
+            }
+            c.mark_rows(y, y + ch);
+            step = Some(Some(row + 1 < c.cell_rows));
+        });
+        match step {
+            Some(Some(more)) => {
+                repainted += 1;
+                misses = 0;
+                if !more {
+                    break;
+                }
+                row += 1;
+            }
+            Some(None) => break,
+            None => {
+                misses += 1;
+                if misses > 64 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+    if repainted > 0 {
+        route_present();
+    }
+    repainted
+}
+
+/// UIMETRICS (rmbp-ledger B372; the B363 seat's "yes" to KERNELFONT2.md owed item 3) — **the console REGRIDS on a
+/// `font_size` restyle.** `video::text::grid_cell` follows `system.display.font_size` (the 18x40 cell at 2.5 x
+/// `font_size / 13`), and the restyle calls this once the engine's lock is released: the routed console window
+/// keeps its surface (the window does not move or resize) and re-derives its grid on it — the cell store is
+/// carried cell-for-cell into the new grid (columns and rows past the new extent are dropped, the cursor is
+/// clamped: `cells_remint`'s rule), the surface is cleared and [`font_repaint`] redraws every row in the new
+/// cell. `Some((old cols, old rows, new cols, new rows))` when it regridded; `None` when the console is not
+/// routed into its window, the cell did not change, or the lock was contended (the next restyle retries).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn regrid() -> Option<(usize, usize, usize, usize)> {
+    let (gw, gh) = crate::video::text::grid_cell();
+    if gw == 0 || gh == 0 {
+        return None;
+    }
+    let mut out = None;
+    crate::arch::without_interrupts(|| {
+        let Some(mut c) = FBCON.try_lock() else { return };
+        if c.win_store.is_none() || c.win_cells.is_none() || (c.cell_w, c.cell_h) == (gw, gh) {
+            return;
+        }
+        let info = c.win_fb.info();
+        let (nc, nr) = ((info.width / gw).max(1), (info.height / gh).max(1));
+        let (oc, or) = (c.cell_cols, c.cell_rows);
+        let mut new: Vec<u8> = Vec::new();
+        if new.try_reserve_exact(nc * nr).is_err() {
+            return;
+        }
+        new.resize(nc * nr, 0);
+        if let Some(old) = c.win_cells.as_ref() {
+            for r in 0..or.min(nr) {
+                for col in 0..oc.min(nc) {
+                    new[r * nc + col] = old.get(r * oc + col).copied().unwrap_or(0);
+                }
+            }
+        }
+        c.win_cells = Some(new);
+        c.cell_w = gw;
+        c.cell_h = gh;
+        c.cols = nc;
+        c.rows = nr;
+        c.cell_cols = nc;
+        c.cell_rows = nr;
+        c.col = c.col.min(nc - 1);
+        c.row = c.row.min(nr - 1);
+        let bg = c.bg;
+        c.draw_fb().fill_rows(0, info.height, bg);
+        c.mark_rows(0, info.height);
+        out = Some((oc, or, nc, nr));
+    });
+    if out.is_some() {
+        font_repaint();
+    }
+    out
 }

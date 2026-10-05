@@ -163,6 +163,60 @@ struct Private<'a> {
     subrs: Index<'a>,
     default_width: f32,
     nominal_width: f32,
+    hint: HintPrivate,
+}
+
+/// The Private DICT values the Adobe-style CFF hinter reads (FONTHINT SR62), as FreeType's CFF loader stores them:
+/// blue arrays de-delta'd to integers (a real operand floors), BlueScale × 1000 in 16.16.
+#[derive(Clone, Copy, Debug)]
+pub struct HintPrivate {
+    pub blue_values: [i32; 14],
+    pub num_blue_values: u8,
+    pub other_blues: [i32; 10],
+    pub num_other_blues: u8,
+    pub family_blues: [i32; 14],
+    pub num_family_blues: u8,
+    pub family_other_blues: [i32; 10],
+    pub num_family_other_blues: u8,
+    /// BlueScale × 1000, 16.16 (`cff_parse_fixed_scaled(…, 3)`).
+    pub blue_scale_1000: i32,
+    pub blue_shift: i32,
+    pub blue_fuzz: i32,
+    pub language_group: i32,
+}
+
+impl Default for HintPrivate {
+    fn default() -> Self {
+        HintPrivate {
+            blue_values: [0; 14],
+            num_blue_values: 0,
+            other_blues: [0; 10],
+            num_other_blues: 0,
+            family_blues: [0; 14],
+            num_family_blues: 0,
+            family_other_blues: [0; 10],
+            num_family_other_blues: 0,
+            blue_scale_1000: 2_596_864, // 0.039625 × 1000 × 65536
+            blue_shift: 7,
+            blue_fuzz: 1,
+            language_group: 0,
+        }
+    }
+}
+
+fn dict_num(v: f64) -> i32 {
+    // cff_parse_num: an integer as is, a real truncated through 16.16 (>> 16 floors)
+    crate::fmath::floor(v as f32) as i32
+}
+
+fn delta_array<const N: usize>(ops: &[f64], out: &mut [i32; N], count: &mut u8) {
+    let mut acc = 0i32;
+    let n = ops.len().min(N);
+    for i in 0..n {
+        acc = acc.wrapping_add(dict_num(ops[i]));
+        out[i] = acc;
+    }
+    *count = n as u8;
 }
 
 fn parse_private<'a>(cff: &'a [u8], size: usize, off: usize) -> Option<Private<'a>> {
@@ -181,6 +235,14 @@ fn parse_private<'a>(cff: &'a [u8], size: usize, off: usize) -> Option<Private<'
             }
             20 if n >= 1 => p.default_width = ops[0] as f32,
             21 if n >= 1 => p.nominal_width = ops[0] as f32,
+            6 => delta_array(&ops[..n], &mut p.hint.blue_values, &mut p.hint.num_blue_values),
+            7 => delta_array(&ops[..n], &mut p.hint.other_blues, &mut p.hint.num_other_blues),
+            8 => delta_array(&ops[..n], &mut p.hint.family_blues, &mut p.hint.num_family_blues),
+            9 => delta_array(&ops[..n], &mut p.hint.family_other_blues, &mut p.hint.num_family_other_blues),
+            1209 if n >= 1 => p.hint.blue_scale_1000 = (ops[0] * 1000.0 * 65536.0 + 0.5) as i32,
+            1210 if n >= 1 => p.hint.blue_shift = dict_num(ops[0]),
+            1211 if n >= 1 => p.hint.blue_fuzz = dict_num(ops[0]),
+            1217 if n >= 1 => p.hint.language_group = dict_num(ops[0]),
             _ => {}
         }
     }
@@ -371,6 +433,17 @@ impl<'a> Cff<'a> {
             }
         }
         Some(Private::default())
+    }
+
+    /// What the CFF hinter needs for `gid`: its charstring, the local and global subroutines, the Private DICT
+    /// hint values and nominalWidthX.
+    pub fn hint_source(&self, gid: u16) -> Option<(&'a [u8], Index<'a>, Index<'a>, HintPrivate)> {
+        if gid >= self.num_glyphs.max(self.charstrings.len() as u16) {
+            return None;
+        }
+        let cs = self.charstrings.get(gid as usize)?;
+        let p = self.private_for(gid)?;
+        Some((cs, p.subrs, self.gsubrs, p.hint))
     }
 
     /// Emit the outline of `gid`; returns the charstring's advance width (font units) on success.

@@ -2995,13 +2995,13 @@ pub fn desktop_allowed() -> bool {
         }
         stage_publish(BootStage::Desktop, "no-store");
     }
-    boot_stage() == BootStage::Desktop
+    crate::boot::desktop() // INSTALLBARE (R86): the LOGIN SCREEN is not the Desktop either — the one phase gate answers
 }
 
 /// The furniture (bar, dock, strip) is HELD: the stage is known and it is not the Desktop. Unresolved is
 /// not held (the first ~400 ms of a metal boot paint as before; the resolution then takes it down).
 pub fn furniture_held() -> bool {
-    stage_resolved() && (boot_stage() != BootStage::Desktop || stage_name() == "login-screen") // LOGINFLOW2 M1 — boot 2's screen stands over an EMPTY desktop: no furniture paints until a session opens
+    !crate::boot::desktop() || crate::boot::shot_bare_held() || (stage_resolved() && (boot_stage() != BootStage::Desktop || stage_name() == "login-screen")) // INSTALLBARE (R86): held while UNRESOLVED too (the taskbar's shadow) and while a GLASSEYES bare shot composes // LOGINFLOW2 M1 — boot 2's screen stands over an EMPTY desktop: no furniture paints until a session opens
 }
 
 fn stage_witness(why: &str) {
@@ -3019,16 +3019,21 @@ fn stage_witness(why: &str) {
 
 fn stage_publish(st: BootStage, why: &str) {
     use core::sync::atomic::Ordering;
+    if st == BootStage::Desktop && why != "store-has-users" { crate::boot::ignite(if why == "user-created" { "user-created" } else { "stage" }); } // INSTALLBARE M3 (R86): the Desktop phase begins BEFORE the stage word moves, so the ignition reads the phase it ends
     let prev = STAGE.swap(st as u8, Ordering::AcqRel);
     if prev == st as u8 {
         return;
     }
     stage_witness(why);
+    if why == "store-has-users" {
+        serial_println!("[login] installer: stage=login-screen (R86: the login dialog only; the desktop ignites at the first login)"); // INSTALLBARE: was the stray `stage=desktop` at boot 2's login screen
+    } else {
     serial_println!("[login] installer: stage={} (R77: {})", st.word(), match st {
         BootStage::Installer => "no root password — the setter is the whole glass; no desktop, no programs, no fixtures",
         BootStage::CreateUser => "root's password is set and there is no user — the create-user form",
         BootStage::Desktop => "the desktop ignites",
     });
+    }
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         if st != BootStage::Desktop {
@@ -3036,7 +3041,7 @@ fn stage_publish(st: BootStage, why: &str) {
                 BAR_HELD.store(true, Ordering::Release);
             }
             crate::video::crystal::login::installer_sweep();
-        } else if BAR_HELD.swap(false, Ordering::AcqRel) {
+        } else if why != "store-has-users" && BAR_HELD.swap(false, Ordering::AcqRel) { // INSTALLBARE: boot 2's login screen keeps the bar owed — the first login releases it (`bar_release`)
             let _ = crate::video::menubar::set_enabled(true);
             crate::video::wm::composite();
         }
@@ -3054,9 +3059,9 @@ pub fn stage_resolve(why: &str) {
     // LOGINFLOW2 M1 — BOOT 2: a store with root's password AND users resolves to the LOGIN SCREEN, over an empty desktop (R64/R65;
     // R77 "root is not the assumed login"). `user-created` is the installer's own advance (the form already logged that user in).
     let boot2 = st == BootStage::Desktop && why == "store-loaded" && user_count() > 0;
+    if boot2 { BOOT2.store(true, core::sync::atomic::Ordering::Release); } // INSTALLBARE (R86): BOOT2 BEFORE the stage — no reader of `boot::phase` may see "Desktop without the login screen"
     stage_publish(st, if boot2 { "store-has-users" } else { why });
     if boot2 {
-        BOOT2.store(true, core::sync::atomic::Ordering::Release);
         if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
             screen_boot2();
         } else {
@@ -3297,5 +3302,24 @@ pub fn boot80_store_probe() -> &'static str {
     match store_mount() {
         Ok(fs) => if read_root_file(&fs, USERS_FILE).is_some() || read_root_file(&fs, USERS_TMP_FILE).is_some() { "dat" } else { "none" },
         Err(_) => "nomount",
+    }
+}
+
+/// INSTALLBARE (R86): this boot resolved to the login screen (boot 2) — `boot::phase` reads it (pure).
+pub fn boot2_resolved() -> bool {
+    BOOT2.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// INSTALLBARE (R86): the takeover did not enable the bar (the phase was not Desktop) — the first Desktop advance owes it.
+pub fn bar_owed() {
+    BAR_HELD.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// INSTALLBARE (R86): a session opened (`login::close_into_session`) — turn the owed bar on (boot 2's first login).
+pub fn bar_release() {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    if BAR_HELD.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        let _ = crate::video::menubar::set_enabled(true);
+        crate::video::wm::composite();
     }
 }

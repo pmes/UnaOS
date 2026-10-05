@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::Entry;
+use super::glyph::GlyphEntry;
 use crate::NativeView;
 use bandy::{SMessage, Synapse};
 use crate::tetra::TextAction;
@@ -9,10 +9,9 @@ pub fn bootstrap_text_field(
     text_action: TextAction,
     synapse: Synapse,
 ) -> NativeView {
-    let entry = Entry::builder()
-        .placeholder_text(placeholder)
-        .hexpand(true)
-        .build();
+    // QUARTZFONT (SR64): the field is quartzite's own editor, its text measured and painted by font_core.
+    let entry = GlyphEntry::new(placeholder);
+    entry.set_hexpand(true);
     
     let syn = synapse.clone();
     entry.connect_activate(move |e| {

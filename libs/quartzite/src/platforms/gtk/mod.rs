@@ -205,6 +205,7 @@ impl Backend {
 pub mod tetra_eval;
 pub mod button;
 pub mod text_field;
+pub mod glyph;
 pub mod image_view;
 pub mod console_view;
 // pub mod spline;

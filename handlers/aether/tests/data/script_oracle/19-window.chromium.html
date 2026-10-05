@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Changed title</title></head>
+<body>
+<div id="named">named element</div>
+<ul id="log"><li>globals: true true true true true 0</li><li>named access: named named element true undefined</li><li>prototype chain: true true [object Window]</li><li>location: http: 19-window.html true true search=[]</li><li>hash set sync: #first events so far=0</li><li>pushState: ?page=2 state={"a":1} length&gt;1=true</li><li>replaceState: ?page=3#h state=null</li><li>document: loading CSS1Compat UTF-8 text/html true title=19 window, location, history</li><li>title set: Changed title hidden=false visible</li><li>btoa/atob: aGVsbG8sIHdvcmxk hello InvalidCharacterError InvalidCharacterError</li><li>matchMedia: true false true false</li><li>timing: number true</li><li>URL: https://example.com/a/x/y?z=1#w 1 1+3</li><li>JSON/structuredClone: {"n":[1,{"m":"x"}]}</li><li>TextEncoder: 195,169,226,130,172 €</li><li>hashchange events: first&lt;</li></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+log('globals: ' + (window === self) + ' ' + (window.window === window) + ' ' + (globalThis === window) + ' ' + (window.top === window) + ' ' + (window.parent === window) + ' ' + window.frames.length);
+log('named access: ' + named.id + ' ' + window.named.textContent + ' ' + ('named' in window) + ' ' + typeof window.nonexistentThing);
+log('prototype chain: ' + (window instanceof Window) + ' ' + (window instanceof EventTarget) + ' ' + Object.prototype.toString.call(window));
+log('location: ' + location.protocol + ' ' + location.pathname.split('/').pop() + ' ' + (location.href === document.URL) + ' ' + (location === document.location) + ' search=[' + location.search + ']');
+var hashes = [];
+window.addEventListener('hashchange', function (e) { hashes.push(e.newURL.split('#')[1] + '<' + (e.oldURL.split('#')[1] || '')); });
+location.hash = 'first';
+log('hash set sync: ' + location.hash + ' events so far=' + hashes.length);
+history.pushState({ a: 1 }, '', '?page=2');
+log('pushState: ' + location.search + ' state=' + JSON.stringify(history.state) + ' length>1=' + (history.length > 1));
+history.replaceState(null, '', location.pathname.split('/').pop() + '?page=3#h');
+log('replaceState: ' + location.search + location.hash + ' state=' + history.state);
+log('document: ' + document.readyState + ' ' + document.compatMode + ' ' + document.characterSet + ' ' + document.contentType + ' ' + (document.defaultView === window) + ' title=' + document.title);
+document.title = 'Changed title';
+log('title set: ' + document.querySelector('title').textContent + ' hidden=' + document.hidden + ' ' + document.visibilityState);
+log('btoa/atob: ' + btoa('hello, world') + ' ' + atob('aGVsbG8=') + ' ' + (function () { try { btoa('Ā'); } catch (e) { return e.name; } })() + ' ' + (function () { try { atob('a'); } catch (e) { return e.name; } })());
+log('matchMedia: ' + matchMedia('(min-width: 500px)').matches + ' ' + matchMedia('(max-width: 100px)').matches + ' ' + matchMedia('screen').matches + ' ' + matchMedia('print').matches);
+log('timing: ' + (typeof performance.now()) + ' ' + (performance.now() >= 0));
+var u = new URL('../x/y?z=1#w', 'https://example.com/a/b/c');
+log('URL: ' + u.href + ' ' + u.searchParams.get('z') + ' ' + new URLSearchParams('a=1&b=2&a=3').getAll('a').join('+'));
+log('JSON/structuredClone: ' + JSON.stringify(structuredClone({ n: [1, { m: 'x' }] })));
+log('TextEncoder: ' + new TextEncoder().encode('é€').join(',') + ' ' + new TextDecoder().decode(new Uint8Array([226, 130, 172])));
+setTimeout(function () { log('hashchange events: ' + hashes.join(',')); }, 20);
+</script>
+
+</body></html>

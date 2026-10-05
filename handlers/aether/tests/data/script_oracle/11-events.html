@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>11 events</title></head>
+<body>
+<div id="outer"><div id="mid"><button id="btn">go</button></div></div>
+<ul id="log"></ul>
+<script>
+var lines = [];
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var outer = document.getElementById('outer'), mid = document.getElementById('mid'), btn = document.getElementById('btn');
+function rec(tag) { return function (e) { lines.push(tag + ':' + e.eventPhase + ':' + e.currentTarget.id); }; }
+outer.addEventListener('ping', rec('oc'), true);
+outer.addEventListener('ping', rec('ob'));
+mid.addEventListener('ping', rec('mc'), { capture: true });
+mid.addEventListener('ping', rec('mb'));
+btn.addEventListener('ping', rec('tb'));
+btn.addEventListener('ping', rec('tc'), true);
+window.addEventListener('ping', rec('w'));
+document.addEventListener('ping', function (e) { lines.push('doc:' + e.eventPhase); });
+var ev = new Event('ping', { bubbles: true, cancelable: true });
+var r = btn.dispatchEvent(ev);
+log('order: ' + lines.join(' '));
+log('after: ' + r + ' phase=' + ev.eventPhase + ' target=' + ev.target.id + ' current=' + ev.currentTarget + ' trusted=' + ev.isTrusted);
+lines = [];
+var stopper = function (e) { lines.push('stop'); e.stopPropagation(); };
+mid.addEventListener('ping', stopper);
+btn.dispatchEvent(new Event('ping', { bubbles: true }));
+log('stopPropagation: ' + lines.join(' '));
+mid.removeEventListener('ping', stopper);
+lines = [];
+btn.addEventListener('imm', function () { lines.push('1'); });
+btn.addEventListener('imm', function (e) { lines.push('2'); e.stopImmediatePropagation(); });
+btn.addEventListener('imm', function () { lines.push('3'); });
+btn.dispatchEvent(new Event('imm'));
+log('stopImmediatePropagation: ' + lines.join(','));
+var count = 0, h = function () { count++; };
+btn.addEventListener('once', h, { once: true });
+btn.addEventListener('once', h);
+btn.addEventListener('once', h);
+btn.dispatchEvent(new Event('once')); btn.dispatchEvent(new Event('once'));
+log('once+dedupe: ' + count);
+var obj = { n: 0, handleEvent: function (e) { this.n++; lines.push('obj:' + e.type); } };
+lines = [];
+btn.addEventListener('h', obj);
+btn.dispatchEvent(new Event('h'));
+log('handleEvent: ' + obj.n + ' ' + lines.join(','));
+var pd = new Event('cancel-me', { cancelable: true });
+btn.addEventListener('cancel-me', function (e) { e.preventDefault(); });
+log('preventDefault: ' + btn.dispatchEvent(pd) + ' ' + pd.defaultPrevented + ' ' + pd.returnValue);
+var nc = new Event('cancel-me');
+log('not cancelable: ' + btn.dispatchEvent(nc) + ' ' + nc.defaultPrevented);
+var passive = new Event('p', { cancelable: true });
+btn.addEventListener('p', function (e) { e.preventDefault(); }, { passive: true });
+log('passive: ' + btn.dispatchEvent(passive));
+var ce = new CustomEvent('custom', { detail: { k: [1, 2] }, bubbles: true });
+outer.addEventListener('custom', function (e) { log('CustomEvent detail: ' + JSON.stringify(e.detail) + ' path=' + e.composedPath().length); });
+btn.dispatchEvent(ce);
+var e2 = null; try { btn.dispatchEvent(ev); } catch (x) { e2 = x.name; }
+var dispatching = new Event('re');
+btn.addEventListener('re', function () { try { btn.dispatchEvent(dispatching); } catch (x) { log('re-dispatch: ' + x.name); } });
+btn.dispatchEvent(dispatching);
+log('redispatch ok after: ' + e2);
+var legacy = document.createEvent('Event');
+log('createEvent: ' + legacy.type + '|' + legacy.bubbles);
+legacy.initEvent('leg', true, true);
+outer.addEventListener('leg', function (e) { log('initEvent: ' + e.type + ' bubbles=' + e.bubbles + ' target=' + e.target.id); });
+btn.dispatchEvent(legacy);
+var et = new EventTarget();
+et.addEventListener('x', function (e) { log('EventTarget: ' + e.type + ' ' + (e.target === et)); });
+et.dispatchEvent(new Event('x'));
+var me = new MouseEvent('click', { clientX: 5, button: 1, ctrlKey: true });
+log('MouseEvent: ' + me.clientX + ' ' + me.button + ' ' + me.ctrlKey + ' ' + me.shiftKey + ' ' + (me instanceof UIEvent) + ' ' + me.detail);
+var ke = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter' });
+log('KeyboardEvent: ' + ke.key + ' ' + ke.code + ' ' + ke.repeat);
+log('constants: ' + Event.NONE + Event.CAPTURING_PHASE + Event.AT_TARGET + Event.BUBBLING_PHASE);
+</script>
+</body></html>

@@ -86,3 +86,9 @@ pub mod detect;
 /// either). Kept in sync with `arroyo` and `crates/kernel/Cargo.toml`.
 #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
 pub mod kepler_vblank;
+/// GPUBLIT (B371) — the copy-engine channel that arms ITSELF at the display takeover (64x64 self-test,
+/// byte-for-byte against the CPU blit) and carries KCOMP's window present. NO KNOB: it rides every
+/// build that takes the panel (`nvidia-kepler-takeover` does not imply `nvidia-kepler` in Cargo, so
+/// both are named), and it is NOT behind the recon knob `nvidia-kepler-ce` (QUIETBOOT keeps that off).
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
+pub mod kepler_gpublit;

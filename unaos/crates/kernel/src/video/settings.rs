@@ -12,6 +12,8 @@
 //! speed (TPSPEED divisors: slow / normal / fast) · 5 Wallpaper path (text field) · 6 Apply · 7 Off ·
 //! 8 Change Password (the login screen's set-password form for the session user). The Clock 24h/12h
 //! toggle is omitted: CLOCKBAR's glyph path is not a runtime switch.
+//! KERNELFONT2 (B363): 9 Font (sans / serif / mono) · 10 Font size (CSS px, - / +), both on the Display tab, written
+//! to `system.display.font` / `system.display.font_size`.
 //!
 //! Every change prints `[settings] <name>=<value> applied=<0|1>` and is persisted to PRINCIPIA'S store —
 //! `<home>/.config/unaos/preferences.toml`, namespace `system` (`crate::prefs`, PREFS B300; the private
@@ -34,15 +36,20 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::video::{font, theme, wm};
+use crate::video::{theme, wm};
 
 /// Kernel-furniture owner slot (`+ 7`, after TEXTEDIT's `+ 6`).
 pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 7;
 const _: () = assert!(OWNER != super::fileview::OWNER && OWNER != super::textedit::OWNER);
 
 /// Number of controls.
-pub const CONTROLS: usize = 9;
-const NAMES: [&str; CONTROLS] = ["brightness", "volume", "mute", "idle_min", "pointer", "wallpaper", "wallpaper-apply", "wallpaper-off", "password"];
+pub const CONTROLS: usize = 11;
+const NAMES: [&str; CONTROLS] = ["brightness", "volume", "mute", "idle_min", "pointer", "wallpaper", "wallpaper-apply", "wallpaper-off", "password", "font", "font_size"];
+/// KERNELFONT2 (B363) M4: the Display tab's Font picker — `system.display.font` (control 9, the schema's enum) and
+/// `system.display.font_size` (control 10, CSS px, the schema's 9..=32).
+const FONT_FAMS: [&str; 3] = ["sans", "serif", "mono"];
+const FONT_MIN: i64 = 9;
+const FONT_MAX: i64 = 32;
 /// Idle-minute steps the slider walks (0 = never).
 pub const IDLE_STEPS: [u32; 8] = [0, 1, 2, 5, 10, 15, 30, 60];
 const PTR_NAMES: [&str; 3] = ["slow", "normal", "fast"];
@@ -303,6 +310,8 @@ fn adjust(i: usize, d: isize) {
         2 => set(2, (d > 0) as usize),
         3 => set(3, step(idle_index(c.idle_min), IDLE_STEPS.len() - 1)),
         4 => set(4, step(c.ptr as usize, 2)),
+        9 => set_font(9, step(font_fam(), 2) as i64),
+        10 => set_font(10, (font_size() + d as i64).clamp(FONT_MIN, FONT_MAX)),
         _ => {}
     }
 }
@@ -379,45 +388,42 @@ pub fn service() {
 /// Control indices on `tab`, in keyboard order (BRIGHTFLOOR M5: General = volume, mute, pointer,
 /// wallpaper, apply, off, password; Display = brightness, idle blank; Users/About: none).
 fn tab_ctrls(tab: usize) -> &'static [usize] {
-    match tab { 0 => &[1, 2, 4, 5, 6, 7, 8], 2 => &[0, 3], _ => &[] }
+    match tab { 0 => &[1, 2, 4, 5, 6, 7, 8], 2 => &[0, 3, 9, 10], _ => &[] } // KERNELFONT2: 9 font, 10 font size
 }
 
 /// Row of control `i` on its tab (General: 1→0, 2→1, 4→2, 5→3, 6|7→4, 8→5; Display: 0→0, 3→1).
 const fn row_of(i: usize) -> usize {
-    match i { 0 => 0, 1 => 0, 2 => 1, 3 => 1, 4 => 2, 5 => 3, 6 | 7 => 4, _ => 5 }
+    match i { 0 => 0, 1 => 0, 2 => 1, 3 => 1, 4 => 2, 5 => 3, 6 | 7 => 4, 9 => 4, 10 => 5, _ => 5 }
 }
 
 fn fill(s: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize, c: u32) {
-    for yy in y..y + rh {
-        for xx in x..(x + rw).min(w) {
-            if let Some(p) = s.get_mut(yy * w + xx) { *p = c; }
-        }
-    }
+    // UIMETRICS (B372): `w` and the rect are LOGICAL px; the surface is the native (physical) one.
+    super::metrics::fill(s, super::metrics::size(w), x, y, rw, rh, c);
 }
 
 fn txt(st: &mut State, x: usize, r: usize, t: &str) {
     let face = super::text::Face::Ui; // KERNELFONT: labels in the UI face
-    let (w, h, ch) = (st.w, st.h, face.cell_h());
-    super::text::draw_text(&mut st.surf, w, w, h, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
+    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
 }
 
 fn btn(st: &mut State, r: usize, x: usize, t: &str) {
     let face = super::text::Face::Ui; // KERNELFONT: button captions in the UI face
-    let (w, h, ch) = (st.w, st.h, face.cell_h());
+    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
     let y = TOP + r * ROW_H + (ROW_H - BTN_H) / 2;
     fill(&mut st.surf, w, x, y, BTN_W, BTN_H, theme::BUTTON_FACE);
     fill(&mut st.surf, w, x, y, BTN_W, 1, theme::FRAME_LINE);
     fill(&mut st.surf, w, x, y + BTN_H - 1, BTN_W, 1, theme::FRAME_LINE);
-    super::text::draw_text(&mut st.surf, w, w, h, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::BUTTON_TEXT, false, face);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::BUTTON_TEXT, false, face);
 }
 
 fn field(st: &mut State, r: usize, t: &str, focus: bool) {
     let face = super::text::Face::Body;
-    let (w, h, ch) = (st.w, st.h, face.cell_h());
+    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
     fill(&mut st.surf, w, TRACK_X, TOP + r * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::BUTTON_FACE);
     let mut shown = String::from(t);
     if focus { shown.push('_'); }
-    super::text::draw_text(&mut st.surf, w, w - 14, h, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::BUTTON_TEXT, false, face);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 14, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::BUTTON_TEXT, false, face);
 }
 
 fn slider(st: &mut State, r: usize, pos: usize, max: usize) {
@@ -433,13 +439,13 @@ fn paint(st: &mut State, v: &Values) {
     let (w, h) = (st.w, st.h);
     for p in st.surf.iter_mut() { *p = theme::CONTENT_FILL; }
     let face = super::text::Face::Ui; // KERNELFONT: tab names in the UI face
-    let ch = face.cell_h();
+    let ch = super::metrics::lcell_h(face);
     // The tab strip.
     let tw = w / TABS;
     for k in 0..TABS {
         let on = k == v.tab as usize;
         fill(&mut st.surf, w, k * tw, 0, tw - 2, TAB_H, if on { theme::ACCENT } else { theme::SCROLL_TRACK });
-        super::text::draw_text(&mut st.surf, w, w, h, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
     }
     if st.strip { fill(&mut st.surf, w, 0, TAB_H - 3, w, 2, theme::ACCENT); }
     match v.tab {
@@ -456,7 +462,7 @@ fn paint(st: &mut State, v: &Values) {
 }
 
 fn paint_general(st: &mut State, v: &Values) {
-    let (w, h, ch) = (st.w, st.h, font::Face::Body.cell_h());
+    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(super::text::Face::Body));
     let face = super::text::Face::Body;
     // BRIGHTFLOOR M5: Brightness moved to the Display tab; every General row moved up one.
     txt(st, LABEL_X, 0, "Volume");
@@ -471,7 +477,7 @@ fn paint_general(st: &mut State, v: &Values) {
     for k in 0..3usize {
         let c = if k as u8 == v.ptr { theme::ACCENT } else { theme::SCROLL_TRACK };
         fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 2 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        super::text::draw_text(&mut st.surf, w, w, h, TRACK_X + k * seg + 8, TOP + 2 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 2 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
     }
     txt(st, LABEL_X, 3, "Wallpaper");
     let (focus, wall) = (!st.strip && st.sel == 5, v.wall.clone());
@@ -494,17 +500,36 @@ fn paint_display(st: &mut State, v: &Values) {
     let it = if v.idle_min == 0 { String::from("never") } else { alloc::format!("{} min", v.idle_min) };
     txt(st, VAL_X, 1, &it);
     txt(st, LABEL_X, 2, "UI scale");
-    let id = WIN.load(Ordering::Relaxed);
-    let sc = wm::info(id).map(|i| i.scale).unwrap_or(1);
-    txt(st, TRACK_X, 2, &alloc::format!("{}x - read-only, fixed at takeover", sc));
+    let m = crate::ui::Metrics::panel(); // UIMETRICS (B372): the panel's dpi scale, not a window magnification
+    txt(st, TRACK_X, 2, &alloc::format!("{}x ({} ppi) - follows the panel", super::dpi::scale_str(m.s2), m.ppi));
     txt(st, LABEL_X, 3, "Menubar clock");
     txt(st, TRACK_X, 3, "24h - fixed, no runtime switch");
-    // KERNELFONT M3 (B359): the face the desktop draws with, and a sample line IN that face. The family and size
-    // are Principia's `system.display.font` / `system.display.font_size` (`pref set system display.font serif`).
+    // KERNELFONT M3 (B359) -> KERNELFONT2 M4 (B363): the Font row is a PICKER — the family as three segments (the
+    // Pointer row's shape) and the size as - / + — writing Principia's `system.display.font` / `font_size`
+    // (`video::text` follows them within a second and every window repaints once); the faces drawing now and a
+    // sample line IN the UI face below.
+    let (w, h) = (st.w, st.h);
+    let face = super::text::Face::Ui;
+    let ch = super::metrics::lcell_h(face);
     txt(st, LABEL_X, 4, "Font");
-    txt(st, TRACK_X, 4, &super::text::face_name(super::text::Face::Ui));
-    let (w, h, ch) = (st.w, st.h, super::text::Face::Ui.cell_h());
-    super::text::draw_text(&mut st.surf, w, w - 12, h, TRACK_X, TOP + 5 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, super::text::Face::Ui);
+    let (fam, size) = (font_fam(), font_size());
+    let seg = TRACK_W / 3;
+    for k in 0..3usize {
+        let c = if k == fam { theme::ACCENT } else { theme::SCROLL_TRACK };
+        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 4 * ROW_H + 6, seg - 2, ROW_H - 12, c);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 4 * ROW_H + (ROW_H - ch) / 2, FONT_FAMS[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+    }
+    txt(st, VAL_X, 4, &super::text::face_name(face));
+    txt(st, LABEL_X, 5, "Font size");
+    btn(st, 5, TRACK_X, "  -");
+    btn(st, 5, TRACK_X + BTN_W + 10, "  +");
+    txt(st, TRACK_X + 2 * BTN_W + 24, 5, &alloc::format!("{} px", size));
+    txt(st, LABEL_X, 6, "Console");
+    let (cw, chh) = super::text::grid_cell();
+    let s2 = super::dpi::scale_x2();
+    txt(st, TRACK_X, 6, &alloc::format!("{} in {}x{} cells, {} ppi x{}", super::text::face_name(super::text::Face::Grid), cw, chh, super::dpi::ppi(), super::dpi::scale_str(s2)));
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 12, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, face);
+    if !st.strip && st.sel == 10 { fill(&mut st.surf, w, TRACK_X, TOP + 5 * ROW_H + ROW_H - 8, 2 * BTN_W + 10, 2, theme::ACCENT); }
 }
 
 /// KERNELFONT M3: the Display tab's sample line.
@@ -731,17 +756,19 @@ fn repaint() {
 pub fn open() -> Result<(), String> {
     let pi = crate::video::panel_info_nonblocking().ok_or_else(|| String::from("panel busy"))?;
     let (pw, ph) = (pi.width, pi.height);
-    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
-    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
-    if w < WIN_W || h < WIN_H { return Err(String::from("window below floor")); }
-    let len = w * h;
+    // UIMETRICS (B372): a NATIVE window — the layout stays WIN_W x WIN_H logical px, the surface is that at the
+    // panel's dpi scale, drawn at scale 1 (never magnified by the compositor).
+    let (w, h) = (WIN_W, WIN_H);
+    let (sw, sh) = (super::metrics::size(w), super::metrics::size(h));
+    if sw > pw.saturating_sub(2 * wm::BORDER()) || sh > ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()) { return Err(String::from("window below floor")); }
+    let len = sw * sh;
     let mut surf: Vec<u32> = Vec::new();
     if surf.try_reserve_exact(len).is_err() { return Err(String::from("out of memory")); }
     surf.resize(len, theme::CONTENT_FILL);
     if is_open() { close(); }
     // Pick up the file's values (and apply them) if the login hook has not yet.
     if user_name().is_some() && LOADED_FOR.lock().is_empty() { service(); }
-    let (_s, ow, oh) = wm::spawn_geometry(w, h).ok_or_else(|| String::from("geometry unavailable"))?;
+    let (_s, ow, oh) = wm::spawn_geometry_native(sw, sh).ok_or_else(|| String::from("geometry unavailable"))?;
     let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
@@ -749,7 +776,7 @@ pub fn open() -> Result<(), String> {
     let mut st = State { sel: tab_ctrls(tab0).first().copied().unwrap_or(0), strip: true, u: UsersUi::new(), w, h, surf };
     paint(&mut st, &CUR.lock().clone());
     let base = st.surf.as_ptr() as usize;
-    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, b"Settings", ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    let id = wm::create_at_native(OWNER, base, len * 4, sw as u32, sh as u32, (sw * 4) as u32, b"Settings", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE { return Err(String::from("window create failed")); }
     *STATE.lock() = Some(st);
     WIN.store(id, Ordering::Relaxed);
@@ -803,7 +830,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     let tab = cur_tab();
     let form = tab == 1 && STATE.lock().as_ref().map(|x| x.u.form).unwrap_or(false);
     let ctrls = tab_ctrls(tab);
-    let horiz = !strip && ((tab == 0 && matches!(s, 1 | 2 | 4)) || (tab == 2 && matches!(s, 0 | 3))); // BRIGHTFLOOR M5: Brightness adjusts on the Display tab
+    let horiz = !strip && ((tab == 0 && matches!(s, 1 | 2 | 4)) || (tab == 2 && matches!(s, 0 | 3 | 9 | 10))); // BRIGHTFLOOR M5: Brightness adjusts on the Display tab; KERNELFONT2: the Font picker
     match ev {
         crate::pal::Event::Action(Action::CursorLeft) | crate::pal::Event::Action(Action::CursorRight) => {
             let d: isize = if matches!(ev, crate::pal::Event::Action(Action::CursorLeft)) { -1 } else { 1 };
@@ -921,11 +948,12 @@ pub fn press_route(x: i32, y: i32) -> bool {
     let Some(info) = wm::info(id) else { return false };
     if x < info.x as i32 || y < info.y as i32 { return false; }
     let sc = info.scale.max(1);
-    let (cx, cy) = ((x as usize - info.x) / sc, (y as usize - info.y) / sc);
-    if cx >= info.w || cy >= info.h { return false; }
+    let (cx, cy) = (super::metrics::to_logical((x as usize - info.x) / sc), super::metrics::to_logical((y as usize - info.y) / sc)); // UIMETRICS: a native surface's physical px -> the logical layout
+    let lw = super::metrics::to_logical(info.w);
+    if cx >= lw || cy >= super::metrics::to_logical(info.h) { return false; }
     wm::focus_changed(OWNER);
     if cy < TAB_H {
-        let t = (cx / (info.w / TABS).max(1)).min(TABS - 1);
+        let t = (cx / (lw / TABS).max(1)).min(TABS - 1);
         if t != cur_tab() { switch_tab(t); } else { if let Some(st) = STATE.lock().as_mut() { st.strip = true; } repaint(); }
         return true;
     }
@@ -938,6 +966,9 @@ pub fn press_route(x: i32, y: i32) -> bool {
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
             if row == 0 && on_track { select(0); set(0, bright_at(cx)); }
             if row == 1 && on_track { select(3); set(3, slider_at(cx, IDLE_STEPS.len() - 1)); }
+            if row == 4 && cx >= TRACK_X && cx < TRACK_X + TRACK_W { select(9); set_font(9, ((cx - TRACK_X) / (TRACK_W / 3)).min(2) as i64); } // KERNELFONT2: the family segments
+            if row == 5 && cx >= TRACK_X && cx < TRACK_X + BTN_W { select(10); set_font(10, (font_size() - 1).max(FONT_MIN)); } // KERNELFONT2: size −
+            if row == 5 && cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 { select(10); set_font(10, (font_size() + 1).min(FONT_MAX)); } // size +
         }
         _ => {}
     }
@@ -1200,4 +1231,42 @@ pub fn set_tab_named(name: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// KERNELFONT2 (B363) M4: the faces loaded or were restyled — repaint the open window once (no window: nothing).
+pub fn font_repaint() {
+    repaint();
+}
+
+// ── KERNELFONT2 (rmbp-ledger B363) M4 — the Font picker ────────────────────────────────────────────────────────────
+
+/// `system.display.font` as a [`FONT_FAMS`] index (sans when unset or unknown).
+fn font_fam() -> usize {
+    let f = crate::prefs::text(crate::prefs::key::FONT);
+    FONT_FAMS.iter().position(|&n| Some(n) == f.as_deref()).unwrap_or(0)
+}
+
+/// `system.display.font_size` in CSS px (the schema's default 13 when unset).
+fn font_size() -> i64 {
+    crate::prefs::int(crate::prefs::key::FONT_SIZE, FONT_MIN, FONT_MAX).unwrap_or(13)
+}
+
+/// Write control 9 (family index) or 10 (CSS px) through the bus like every other Settings write (SETTINGSBUS),
+/// print the change, repaint. `video::text` restyles on its next preference poll and bumps the face epoch, so the
+/// desktop's windows (this one included) repaint once more in the new face.
+fn set_font(i: usize, v: i64) {
+    use crate::prefs::{key, PrefValue as P};
+    let vtxt = if i == 9 {
+        let f = FONT_FAMS[(v.clamp(0, 2)) as usize];
+        crate::prefs_client::sys_set(key::FONT, P::Str(String::from(f)));
+        String::from(f)
+    } else {
+        let n = v.clamp(FONT_MIN, FONT_MAX);
+        crate::prefs_client::sys_set(key::FONT_SIZE, P::Int(n));
+        alloc::format!("{}", n)
+    };
+    say(NAMES[i], &vtxt, true);
+    let mut d = Values::DEFAULT;
+    SAVED_N.store(from_prefs(&mut d).1 as u32, Ordering::Relaxed);
+    repaint();
 }

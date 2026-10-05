@@ -289,3 +289,10 @@ pub mod ring3abi;
 // HOLOCRON2 (rmbp-ledger B355): the kernel's small part of the metal secrets handler — SYS_KDF's body, the login launch of APPS/HOLOCRON.ELF, `tests holocron`. Tail statement, so no existing line moves.
 #[cfg(feature = "lumen")]
 pub mod keyring;
+// WINDOW2 (rmbp-ledger B361, R85): `tests window` — the 64 MiB ring-3 window, the 64 MiB fixed-image window, the static-PIE LLD.LNX, Argon2id in ring 3. Tail statement, so no existing line moves.
+#[cfg(target_arch = "x86_64")]
+pub mod window2;
+// INSTALLBARE (rmbp-ledger B364, R86): the boot's one phase gate (Setter / LoginScreen / Desktop), read by every starter. Tail statement, so no existing line moves.
+pub mod boot;
+// CONSOLEFIX (rmbp-ledger B365, R65): the tracer's and the raw-key echoes' redaction over `midden_core::secret_from`, the `tests pwwire` wire tap. Tail statement, so no existing line moves.
+pub mod pwwire;

@@ -29,6 +29,8 @@
 //! | [`p384`] | P-384 ECDH + ECDSA | SP 800-186, FIPS 186-5, RFC 6979, SEC 1 |
 //! | [`rsa`] | RSASSA-PSS + RSASSA-PKCS1-v1_5 VERIFY | RFC 8017 (PKCS #1 v2.2) |
 //! | [`blake2b`], [`argon2`] | BLAKE2b, Argon2id/i/d | RFC 7693, RFC 9106 |
+//! | [`sha3`] | SHA3-224/256/384/512, SHAKE128/256 | FIPS 202 |
+//! | [`mlkem`] | ML-KEM-512/768/1024 (KeyGen, Encaps, Decaps; K-PKE, NTT) | FIPS 203 |
 //! | [`drbg`] | ChaCha20 fast-key-erasure DRBG over a [`drbg::Entropy`] | this crate (documented) |
 //! | [`ct`] | `ct_eq`, `ct_select`, [`ct::Zeroize`] | — |
 //!
@@ -74,6 +76,8 @@ pub mod rsa;
 pub mod blake2b;
 pub mod argon2;
 pub mod drbg;
+pub mod sha3;
+pub mod mlkem;
 
 pub use sha1::Sha1;
 pub use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};

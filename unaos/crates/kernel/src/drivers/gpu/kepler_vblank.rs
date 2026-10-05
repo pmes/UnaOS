@@ -1047,7 +1047,7 @@ fn rung3_arm(bar0: usize, head: usize, n: u64) {
     WIN_PMC_OR.store(0, Ordering::Relaxed);
     WIN_LINE_OR.store(0, Ordering::Relaxed);
     IRQ_STORMED.store(false, Ordering::Relaxed);
-    IRQ_LIVE.store(true, Ordering::Release);
+    IRQ_LIVE.store(true, Ordering::Release); kv10_arm(bar0); // KVBLANK10 M1: MSI re-armed through the BAR0 mirror BEFORE the line comes up (nouveau nvkm_pci_init), cap cached first
     // Order: the source first, then the one-source mask, then the line enable LAST, so the line
     // can only come up once exactly one source can drive it.
     let (en_armed, mask_armed) = unsafe {
@@ -1790,10 +1790,11 @@ pub fn shutdown_census() {
     }
 }
 
-/// `tests kvblank` — re-run the fixture only (the hardware ladder is untouched).
+/// `tests kvblank` — re-run the fixture, then the KVBLANK10 live MSI ladder (`kv10_ladder`; SKIP without a GK107 head).
 pub fn selftest_rerun() {
     SELFTEST_DONE.store(false, Ordering::Release);
     selftest_once();
+    kv10_ladder(); // KVBLANK10 M2: the live MSI ladder (SKIPs with no GK107 head)
 }
 
 #[cfg(feature = "login")]
@@ -2341,6 +2342,11 @@ static KV8_MSI_CAP: AtomicU32 = AtomicU32::new(0);
 fn kv8_isr_enter(bar0: usize) {
     let entry = IRQ_PMC_ENTRY.load(Ordering::Relaxed);
     unsafe { mmio_write(bar0, regs::NV_PMC_INTR_EN, entry & !PMC_ENABLE_HOST_HW) };
+    // KVBLANK10 M1 — nouveau `core/intr.c` `nvkm_intr()`: unarm, then re-arm MSI FIRST, before any handler.
+    if IRQ_WIRE.load(Ordering::Relaxed) == 1 {
+        kv10_msi_rearm(bar0);
+        KV10_ENTRY_REARMS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// ISR exit (after the acks and the head re-arm): read what is still asserted, re-arm MSI through the mirror, bound the
@@ -2479,7 +2485,7 @@ pub fn kvblank8_selftest() {
         REARM_READBACK.load(Ordering::Relaxed), KV8_PMC_REARMS.load(Ordering::Relaxed),
         KV8_PMC_REARM_RB.load(Ordering::Relaxed), KV8_EOI_MISS.load(Ordering::Relaxed),
     );
-    IRQ_LIVE.store(true, Ordering::Release);
+    IRQ_LIVE.store(true, Ordering::Release); kv10_arm(bar0); // KVBLANK10 M1: MSI re-armed through the BAR0 mirror BEFORE the line comes up (nouveau nvkm_pci_init), cap cached first
     unsafe {
         mmio_write(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head), en_entry | vb);
         mmio_write(bar0, PMC_INTR_MASK_HOST, pd);
@@ -2854,5 +2860,241 @@ pub fn first_need() {
     KV9_FN_AT_MS.store(crate::arch::ms(), Ordering::Relaxed);
     if kv9_take(KV9_BY_COMPOSITOR) {
         let _ = KV9_FN.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+// ── KVBLANK10 (B369) — the nouveau MSI re-arm, and the `tests kvblank` live ladder ─────────────────────────────────
+//
+// Flight 22's snap read every stage right (cap 0x68 64-bit, `FEE02000`/`0044`, LAPIC 2 == here, PMC bit 26 raised and
+// routed, head vblank enabled) and `isr_calls=1 mirror_rearms=0`: ONE message arrived, then nothing. A GK104-family
+// function's MSI logic is one-shot until re-armed. nouveau (data only, `nvkm/subdev/pci/gk104.c`: `.cfg.addr =
+// 0x088000`, `.msi_rearm = nv40_pci_msi_rearm`; `nvkm/subdev/pci/nv40.c`: `nvkm_pci_wr08(pci, 0x0068, 0xff)`) writes
+// the BYTE 0xFF to BAR0 0x088068 — the config-space MIRROR, not a CF8 cycle — at init (`nvkm_pci_init`, "already
+// pending" case) and at the top of every interrupt, right after the PMC unarm (`nvkm/core/intr.c` `nvkm_intr`).
+// KVBLANK7's re-arm was a CF8 cycle; KVBLANK8's mirror write was gated on a cap cache filled AFTER the arm, and the arm
+// fires the ISR at once (latch pending), so the one ISR skipped it and the function stayed latched for the boot.
+// See docs/dev/evidence/rmbp-1005/KVBLANK10.md.
+
+/// nouveau `nv40_pci_msi_rearm`'s offset inside the BAR0 PCI-config mirror (`gk104_pci_func.cfg.addr` = 0x088000).
+const KV10_MSI_REARM: usize = 0x088000 + 0x68;
+static KV10_ARM_REARMS: AtomicU64 = AtomicU64::new(0);
+static KV10_ENTRY_REARMS: AtomicU64 = AtomicU64::new(0);
+
+/// The re-arm itself: one byte, MMIO only, safe from the ISR.
+#[inline]
+fn kv10_msi_rearm(bar0: usize) {
+    unsafe { core::ptr::write_volatile((bar0 + KV10_MSI_REARM) as *mut u8, 0xFF) };
+}
+
+/// At every arm, after the MSI enable and BEFORE the PMC line enable: cache the MSI cap offset (so `kv8_isr_exit`'s
+/// mirror write is never skipped by an ISR that fires during the arm) and re-arm once, as `nvkm_pci_init` does.
+fn kv10_arm(bar0: usize) {
+    let bdf1 = VB_BDF1.load(Ordering::Acquire);
+    if bdf1 != 0 {
+        let bdf = bdf1 - 1;
+        KV8_MSI_CAP.store(kv8_msi_cap((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8) as u32, Ordering::Relaxed);
+    }
+    if IRQ_WIRE.load(Ordering::Relaxed) == 1 && bar0 != 0 {
+        kv10_msi_rearm(bar0);
+        KV10_ARM_REARMS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// What the MSI capability holds, read back.
+#[derive(Clone, Copy, Default)]
+struct Kv10Msi {
+    cap: u8,
+    msgctl: u16,
+    is64: bool,
+    addr_lo: u32,
+    addr_hi: u32,
+    data: u16,
+    /// Per-vector mask bits (only when MsgCtl bit 8 says capable).
+    pvm: Option<u32>,
+}
+
+fn kv10_msi_read(bus: u8, slot: u8, func: u8) -> Kv10Msi {
+    let mut m = Kv10Msi::default();
+    m.cap = kv8_msi_cap(bus, slot, func);
+    if m.cap == 0 {
+        return m;
+    }
+    unsafe {
+        let c = m.cap;
+        m.msgctl = (crate::arch::pci::read_config_32(bus, slot, func, c) >> 16) as u16;
+        m.is64 = m.msgctl & (1 << 7) != 0;
+        m.addr_lo = crate::arch::pci::read_config_32(bus, slot, func, c + 4);
+        if m.is64 {
+            m.addr_hi = crate::arch::pci::read_config_32(bus, slot, func, c + 8);
+            m.data = crate::arch::pci::read_config_32(bus, slot, func, c + 12) as u16;
+        } else {
+            m.data = crate::arch::pci::read_config_32(bus, slot, func, c + 8) as u16;
+        }
+        if m.msgctl & (1 << 8) != 0 {
+            m.pvm = Some(crate::arch::pci::read_config_32(bus, slot, func, c + if m.is64 { 0x10 } else { 0x0C }));
+        }
+    }
+    m
+}
+
+/// Arm the PMC + head enables (nouveau's order: source, then the one-source allow in 0x640, the line enable 0x140
+/// LAST), wait `ms`, and count ISR entries against `HEAD_STAT.VERT[31:16]` vblanks. Returns
+/// `(pmc_ok, pdisp_ok, isr, vbl)`; the enables stay as written (the caller restores or keeps).
+fn kv10_window(bar0: usize, head: usize, pmc_entry: u32, en_entry: u32, ms: u64) -> (bool, bool, u64, u64) {
+    let vb = 1u32 << DISP_INTR_HEAD_BIT_VBLANK;
+    let pd = 1u32 << PMC_INTR_BIT_PDISPLAY;
+    let vert = regs::NV_PDISPLAY_BASE + 0x6000 + head * DISP_HEAD_STRIDE + 0x340;
+    IRQ_PMC_ENTRY.store(pmc_entry & !PMC_ENABLE_HOST_HW, Ordering::Relaxed);
+    WIN_EN_ENTRY.store(en_entry & !vb, Ordering::Relaxed);
+    IRQ_HEAD.store(head as u32, Ordering::Relaxed);
+    IRQ_STORMED.store(false, Ordering::Relaxed);
+    KV8_SAME_FRAME.store(0, Ordering::Relaxed);
+    IRQ_LIVE.store(true, Ordering::Release);
+    kv10_arm(bar0);
+    let (pmc_ok, pdisp_ok) = unsafe {
+        mmio_write(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head), en_entry | vb);
+        mmio_write(bar0, PMC_INTR_MASK_HOST, pd);
+        mmio_write(bar0, regs::NV_PMC_INTR_EN, pmc_entry | PMC_ENABLE_HOST_HW);
+        (
+            mmio_read(bar0, regs::NV_PMC_INTR_EN) & PMC_ENABLE_HOST_HW != 0 && mmio_read(bar0, PMC_INTR_MASK_HOST) & pd != 0,
+            mmio_read(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head)) & vb != 0,
+        )
+    };
+    // Counted from AFTER the arm: the latched vblank's immediate message is the arm's, not the window's.
+    crate::arch::sched::sleep_ms(20);
+    let (i0, f0) = (ISR_CALLS.load(Ordering::Relaxed), unsafe { mmio_read(bar0, vert) } >> 16);
+    crate::arch::sched::sleep_ms(ms);
+    let (i1, f1) = (ISR_CALLS.load(Ordering::Relaxed), unsafe { mmio_read(bar0, vert) } >> 16);
+    (pmc_ok, pdisp_ok, i1 - i0, (f1.wrapping_sub(f0) & 0xFFFF) as u64)
+}
+
+fn kv10_restore(bar0: usize, head: usize, pmc_entry: u32, mask_entry: u32, en_entry: u32) {
+    unsafe {
+        mmio_write(bar0, regs::NV_PMC_INTR_EN, pmc_entry);
+        mmio_write(bar0, PMC_INTR_MASK_HOST, mask_entry);
+        mmio_write(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head), en_entry);
+    }
+}
+
+/// `tests kvblank` (after the sim fixture): the live MSI path, stage by stage in signal order, the FIRST failing stage
+/// named; the INTx-through-IOAPIC stage when MSI is absent or delivers nothing. PASS keeps the source live (as
+/// `tests kvblank8` PASS does); FAIL restores every register written.
+pub fn kv10_ladder() {
+    let bar0 = VB_BAR0.load(Ordering::Acquire);
+    let bdf1 = VB_BDF1.load(Ordering::Acquire);
+    let head1 = VB_HEAD1.load(Ordering::Acquire);
+    if bar0 == 0 || bdf1 == 0 || head1 == 0 {
+        serial_println!(":: KVBLANK10: first_fail=- -> SKIP (no GK107 head armed: bar0={} bdf={} head={}) ::", (bar0 != 0) as u32, (bdf1 != 0) as u32, head1);
+        return;
+    }
+    if LADDER.load(Ordering::Acquire) == LADDER_IRQ_RUN || kv8_hold() {
+        serial_println!(":: KVBLANK10: first_fail=- -> SKIP (rung 3 window open) ::");
+        return;
+    }
+    let head = (head1 - 1) as usize;
+    let bdf = bdf1 - 1;
+    let (bus, slot, func) = ((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8);
+    let Some(vec) = ensure_vector() else {
+        serial_println!(":: KVBLANK10: vector=none first_fail=vector -> FAIL (vectors::alloc refused kepler-vblank) ::");
+        return;
+    };
+    let pc = crate::arch::percpu::this_cpu();
+    let (lapic, cpu) = (crate::arch::x86_64::apic::apic_id_u32(), pc.cpu_index);
+    let if_on = x86_64::instructions::interrupts::are_enabled();
+    let msg_addr = 0xFEE0_0000u32 | ((lapic & 0xFF) << 12);
+    let (was_live, was_kept, was_wire) = (IRQ_LIVE.load(Ordering::Acquire), IRQ_KEPT.load(Ordering::Acquire), IRQ_WIRE.load(Ordering::Relaxed));
+    let (pmc_entry, mask_entry, en_entry) = unsafe {
+        (
+            mmio_read(bar0, regs::NV_PMC_INTR_EN),
+            mmio_read(bar0, PMC_INTR_MASK_HOST),
+            mmio_read(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head)),
+        )
+    };
+
+    // Stage msi_cap / msi_en: program for THIS core, read the capability back.
+    let pre = kv10_msi_read(bus, slot, func);
+    let msi_ok = pre.cap != 0 && crate::drivers::pci::PciScanner::enable_msi(bus, slot, func, msg_addr, vec as u32);
+    let m = if msi_ok { kv10_msi_read(bus, slot, func) } else { pre };
+    let addr_match = m.cap != 0 && m.addr_lo == msg_addr && m.addr_hi == 0 && m.data == vec as u16;
+    let msi_en = m.msgctl & 1 != 0 && (m.msgctl >> 4) & 7 == 0 && m.pvm.map_or(true, |b| b & 1 == 0);
+    // Stage vector: the class above TPR/PPR, the in-service bit not stuck.
+    let (l_isr, _l_irr, tpr, ppr) = crate::arch::x86_64::apic::vector_state(vec);
+    let class = (vec as u32) >> 4;
+    let vector_ok = class > (tpr >> 4) && class > (ppr >> 4) && !l_isr;
+    // Stage lapic_id: the destination field is this core (and the ladder waits on it with IF on).
+    let dest = (m.addr_lo >> 12) & 0xFF;
+    let lapic_ok = dest == (lapic & 0xFF) && if_on;
+    let mut first = if m.cap == 0 { "msi_cap" } else if !addr_match { "msi_cap" } else if !msi_en { "msi_en" } else if !vector_ok { "vector" } else if !lapic_ok { "lapic_id" } else { "none" };
+
+    let (mut pmc_ok, mut pdisp_ok, mut isr, mut vbl) = (false, false, 0u64, 0u64);
+    if first == "none" {
+        IRQ_WIRE.store(1, Ordering::Relaxed);
+        KV8_DEST1.store((lapic & 0xFF) + 1, Ordering::Release);
+        let r = kv10_window(bar0, head, pmc_entry, en_entry, 500);
+        pmc_ok = r.0;
+        pdisp_ok = r.1;
+        isr = r.2;
+        vbl = r.3;
+        first = if !pmc_ok { "pmc_en" } else if !pdisp_ok { "pdisp_en" } else if vbl == 0 || isr * 100 < vbl * 90 { "isr" } else { "none" };
+    }
+    let pass = first == "none";
+    serial_println!(
+        ":: KVBLANK10: msi_cap={:#04x}/{} addr={:08X}:{:08X} data={:04X} match={} msi_en={} mme={} pvm={} vector={:#04x} tpr={:02X} ppr={:02X} lapic_id={} dest={} cpu={} if={} pmc_en={} pdisp_en={} arm_rearms={} entry_rearms={} isr={}/{} ratio_pct={} wire=msi first_fail={} -> {} :: — KVBLANK10 (B369): signal order cap -> enable -> vector -> lapic -> PMC 0x140/0x640 -> PDISP 0x6100c0 -> ISR; MSI re-armed through BAR0 0x088068 (nouveau nv40_pci_msi_rearm) at the arm and at ISR entry",
+        m.cap, if m.is64 { 64 } else { 32 }, m.addr_hi, m.addr_lo, m.data, addr_match as u32, msi_en as u32,
+        (m.msgctl >> 4) & 7, m.pvm.map_or(0, |b| b & 1), vec, tpr, ppr, lapic, dest, cpu, if_on as u32,
+        pmc_ok as u32, pdisp_ok as u32, KV10_ARM_REARMS.load(Ordering::Relaxed), KV10_ENTRY_REARMS.load(Ordering::Relaxed),
+        isr, vbl, if vbl == 0 { 0 } else { isr * 100 / vbl }, first, if pass { "PASS" } else { "FAIL" },
+    );
+    if pass {
+        IRQ_KEPT.store(true, Ordering::Release);
+        IRQ_MODE.store(true, Ordering::Release);
+        IRQ_DEMOTED.store(false, Ordering::Release);
+        return;
+    }
+    kv10_restore(bar0, head, pmc_entry, mask_entry, en_entry);
+
+    // The INTx fallback: only when MSI was absent or programmed but silent (not when the CPU side refused).
+    if !matches!(first, "msi_cap" | "msi_en" | "isr") {
+        IRQ_LIVE.store(was_live, Ordering::Release);
+        IRQ_KEPT.store(was_kept, Ordering::Release);
+        IRQ_WIRE.store(was_wire, Ordering::Relaxed);
+        return;
+    }
+    if m.cap != 0 {
+        // MSI off, so the function signals on its INTx pin again (PCI 3.0 §6.8.1.3).
+        unsafe {
+            let mc = crate::arch::pci::read_config_16(bus, slot, func, m.cap + 2);
+            crate::arch::pci::write_config_16(bus, slot, func, m.cap + 2, mc & !1);
+        }
+    }
+    IRQ_WIRE.store(2, Ordering::Relaxed);
+    match crate::arch::x86_64::ioapic_route_intx_why(bus, slot, func, vec) {
+        Err(why) => {
+            serial_println!(":: KVBLANK10: intx gsi=- route={} isr=0/0 ratio_pct=0 -> REFUSED :: — the IOAPIC line printed its own reason above", why);
+            IRQ_LIVE.store(was_live, Ordering::Release);
+            IRQ_KEPT.store(was_kept, Ordering::Release);
+            IRQ_WIRE.store(0, Ordering::Relaxed);
+        }
+        Ok(gsi) => {
+            let (p, d, i, v) = kv10_window(bar0, head, pmc_entry, en_entry, 500);
+            let ok = p && d && v != 0 && i * 100 >= v * 90 && !IRQ_STORMED.load(Ordering::Relaxed);
+            serial_println!(
+                ":: KVBLANK10: intx gsi={} route=ok pmc_en={} pdisp_en={} isr={}/{} ratio_pct={} stormed={} -> {} ::",
+                gsi, p as u32, d as u32, i, v, if v == 0 { 0 } else { i * 100 / v }, IRQ_STORMED.load(Ordering::Relaxed) as u32,
+                if ok { "PASS" } else { "FAIL" },
+            );
+            if ok {
+                IRQ_KEPT.store(true, Ordering::Release);
+                IRQ_MODE.store(true, Ordering::Release);
+                IRQ_DEMOTED.store(false, Ordering::Release);
+            } else {
+                kv10_restore(bar0, head, pmc_entry, mask_entry, en_entry);
+                #[cfg(feature = "ioapic")]
+                let _ = crate::arch::x86_64::ioapic::set_mask(gsi, true);
+                IRQ_LIVE.store(was_live, Ordering::Release);
+                IRQ_KEPT.store(was_kept, Ordering::Release);
+                IRQ_WIRE.store(0, Ordering::Relaxed);
+            }
+        }
     }
 }

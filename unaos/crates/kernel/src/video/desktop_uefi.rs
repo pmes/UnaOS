@@ -524,8 +524,19 @@ pub fn activate_on(desc: SurfaceDesc) {
     // RULED — the console becomes a window. Opened FIRST, so the desktop app launched below carries
     // the higher z when its own `SYS_WIN_CREATE` lands.
     // Its own witness lines (`[wc-x] console-window …`) report the geometry and the panic fallback.
-    let cwin = super::fbcon::panel_console_window_open();
-    if cwin == wm::WIN_NONE {
+    // INSTALLBARE (rmbp-ledger B364, R86): NOTHING is constructed but the setter / the login dialog until the boot's phase is
+    // Desktop — no console window, no bar (the taskbar's shadow Peter saw both times was these two, painted and swept). fbcon
+    // stops writing the panel (`detach`: the compositor alone owns the glass), and the furniture is OWED: the first Desktop
+    // advance (`installer_release`) or the first login (`close_into_session`) mints console + shell and turns the bar on.
+    let bare = !crate::boot::desktop();
+    if bare {
+        super::fbcon::detach();
+        #[cfg(feature = "login")]
+        super::crystal::login::furniture_owed();
+        serial_println!("[wc-x] activate bare phase={} console=owed bar=owed (R86: nothing but the setter / the login dialog)", crate::boot::phase().word());
+    }
+    let cwin = if bare { wm::WIN_NONE } else { super::fbcon::panel_console_window_open() };
+    if cwin == wm::WIN_NONE && !bare {
         ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
         crate::census_println!("[wc-x] activate DECLINE reason=console-window-declined latch=released");
         return;
@@ -553,7 +564,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     // The bar's own witness (`[menubar] rollup …`) reports what it then paints; this line is the
     // decision, so a capture separates "the shell never asked" from "the shell asked and the bar
     // declined the panel" (`geometry` answers `None` below its floors, and says so there).
-    let bar_was = super::menubar::set_enabled(true);
+    let bar_was = if bare { #[cfg(feature = "login")] crate::fs::users::bar_owed(); false } else { super::menubar::set_enabled(true) };
     crate::census_println!(
         "[wc-x] menubar ENABLED panel={}x{} rect={:?} was={} (the desktop scene owns the top of the glass)",
         pw,
@@ -731,6 +742,7 @@ pub fn desktop_app_service() {
     if !crate::fs::users::desktop_allowed() {
         return;
     }
+    crate::boot::note_start("stat"); // INSTALLBARE: the census — a STAT launch before the Desktop is a FAIL of `tests installbare`
     // The same storage gate `fat::probe_once` uses, for the same reason: `mount()` on a boot whose
     // xHCI has not yet enumerated a stick is a "no volume" that means "not yet", not "not ever", and
     // consuming the one-shot on it would refuse a launch the media could have served.
@@ -1011,8 +1023,8 @@ fn move_vacate_probe(pw: usize, ph: usize) {
         8,
         32,
         b"vacate",
-        ax + wm::BORDER,
-        ay + wm::TITLE_H + wm::BORDER,
+        ax + wm::BORDER(),
+        ay + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         crate::census_println!("[wc-x] move-vacate SKIP (create declined)");
@@ -1021,11 +1033,11 @@ fn move_vacate_probe(pw: usize, ph: usize) {
     wm::present(id);
 
     let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
-    let (cx, cy) = (ax + wm::BORDER, ay + wm::TITLE_H + wm::BORDER);
+    let (cx, cy) = (ax + wm::BORDER(), ay + wm::TITLE_H() + wm::BORDER());
     let painted = read(cx + 1, cy + 1) == PROBE_COL;
 
     // The move. Same verb an app's `WIN_MOVE` takes, so the path under test is the real one.
-    wm::move_to(id, bx + wm::BORDER, ay + wm::TITLE_H + wm::BORDER);
+    wm::move_to(id, bx + wm::BORDER(), ay + wm::TITLE_H() + wm::BORDER());
 
     // Five points inside the box just vacated: content origin, two content diagonals, the title
     // strip and the lower border — `vacate_selftest`'s sample set, for the same reason (a fill that
@@ -1034,7 +1046,7 @@ fn move_vacate_probe(pw: usize, ph: usize) {
         (cx + 1, cy + 1),
         (cx + 2, cy + 2),
         (cx + 5, cy + 5),
-        (ax + ow / 2, ay + wm::TITLE_H / 2),
+        (ax + ow / 2, ay + wm::TITLE_H() / 2),
         (ax + ow / 2, ay + oh - 1),
     ];
     let mut clean = 0usize;

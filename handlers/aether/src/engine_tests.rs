@@ -828,8 +828,7 @@ mod tests {
     /// Reads `expr` off a booted page as a number.
     fn js_num(engine: &mut crate::AetherEngine, expr: &str) -> f64 {
         let js = engine.js_engine.as_mut().expect("page must have booted");
-        let v = js.execute(expr).expect("probe must evaluate");
-        v.to_number(&mut js.context).expect("probe must be numeric")
+        js.eval_number(expr).expect("probe must evaluate to a number")
     }
 
     /// THE incident regression: a `setTimeout` callback that re-arms itself
@@ -867,8 +866,11 @@ mod tests {
         );
         // From here the clock only moves when we move it: each tick must add
         // exactly one generation, no matter how eagerly the callback re-arms.
+        // (Past nesting level 5 HTML clamps the re-arm to 4 ms, so each tick
+        // first moves the clock by that much.)
         crate::event_loop::freeze_clock();
         for i in 1..=5 {
+            crate::event_loop::advance_clock(4);
             engine.tick();
             assert_eq!(
                 js_num(&mut engine, "window.__n"),
@@ -1045,7 +1047,7 @@ mod tests {
                     document.getElementById('x').setAttribute('data-n', String(j.n) + j.method);
                 });
         "#).expect("fetch chain must run");
-        let _ = js.context.run_jobs();
+        js.checkpoint();
         let doc = engine.document.clone().unwrap();
         let x = doc.select("#x").unwrap().next().unwrap();
         assert_eq!(x.attributes.borrow().get("data-n"), Some("7POST"),
@@ -1266,7 +1268,12 @@ mod tests {
             if let Some(el) = dom_node.as_element() {
                 let paint = layout_tree.paint_map.get(node_id).cloned().unwrap_or_default();
                 if el.attributes.borrow().get("id") == Some("g") {
-                    assert_eq!(paint.family, Some(1), "Georgia maps to serif");
+                    let fam = paint.family.expect("a family list");
+                    assert_eq!(crate::fonts::serialize_family_list(&crate::fonts::family_list(fam)), "Georgia, serif");
+                    // Georgia is not installed: the generic serif (Times New Roman → Liberation Serif) is used
+                    let face = crate::fonts::face(&crate::fonts::FontSel::new(fam, 400, false)).map(|f| f.family.clone());
+                    let serif = crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::SERIF, 400, false)).map(|f| f.family.clone());
+                    assert_eq!(face, serif, "Georgia, serif resolves through serif");
                 }
                 continue;
             }
@@ -1775,52 +1782,46 @@ mod tests {
         assert_eq!(f[8], "s1", "and it is THAT script, identified by its own attrs");
         assert_eq!(f[9], "/x", "own properties still win over the prototype");
         let later = doc.select("#later").unwrap().next().expect("microtask must run");
+        // HTML "execute the script element" keeps currentScript set through "clean up after running
+        // script", so microtasks the script queued see the element — what Chromium does too
+        // (script oracle page 16).
         assert_eq!(
             later.as_node().text_contents(),
-            "null",
-            "currentScript is null outside a running script"
+            "[object HTMLScriptElement]",
+            "a microtask queued by a running script runs in its checkpoint, currentScript still set"
         );
     }
 
-    /// The fetched-page path: the collected source list is NOT aligned with
-    /// the document's `<script>` elements (a non-JS type sits between them
-    /// here), so `currentScript` has to follow the per-slot ordinal rather
-    /// than the slot index. Getting that wrong hands a script the wrong
-    /// element, which is worse than handing it none.
+    /// The fetched-page path: external sources the shell pre-fetched are found by URL when the parser
+    /// reaches their `<script src>`, inline scripts run from the document's own text, and each sees
+    /// its OWN element as `document.currentScript` (a non-JS script between them takes no turn).
     #[test]
-    fn current_script_follows_the_slot_ordinal_not_the_slot_index() {
+    fn prefetched_external_scripts_run_in_document_order_with_their_own_current_script() {
         let html = r#"<html><body>
-            <script id="s0">A()</script>
+            <script id="s0" src="/a.js"></script>
             <script type="application/ld+json">{"not":"js"}</script>
-            <script id="s2">B()</script>
+            <script id="s1">window.__seen.push(document.currentScript.id);</script>
+            <script id="s2" src="https://cdn.example.com/b.js"></script>
         </body></html>"#;
         let (slots, external) = crate::net::collect_scripts("https://example.com/", html);
-        assert!(external.is_empty());
-        let scripts: Vec<String> = vec![
-            "window.__seen = [document.currentScript.id];".to_string(),
-            "window.__seen.push(document.currentScript.id);".to_string(),
-        ];
-        let script_nodes: Vec<usize> = slots.iter().map(|s| s.ordinal).collect();
-        assert_eq!(script_nodes, vec![0, 2]);
+        assert_eq!(external.len(), 2);
+        assert_eq!(slots.iter().map(|s| s.ordinal).collect::<Vec<_>>(), vec![0, 2, 3]);
         let page = crate::net::Page {
             base_url: "https://example.com/".to_string(),
             html: html.to_string(),
-            sheets: Vec::new(),
-            images: Vec::new(),
-            scripts,
-            script_nodes,
-            favicon: None,
+            scripts: vec![
+                "window.__seen = [document.currentScript.id];".to_string(),
+                "window.__seen.push(document.currentScript.id);".to_string(),
+            ],
+            script_urls: vec!["https://example.com/a.js".to_string(), "https://cdn.example.com/b.js".to_string()],
+            script_nodes: vec![0, 3],
+            ..Default::default()
         };
         let mut engine = crate::AetherEngine::new();
         engine.load_page(page, true);
         let js = engine.js_engine.as_mut().unwrap();
-        let seen = js
-            .execute("window.__seen.join(',')")
-            .unwrap()
-            .to_string(&mut js.context)
-            .unwrap()
-            .to_std_string_escaped();
-        assert_eq!(seen, "s0,s2", "each script saw its OWN element");
+        let seen = js.eval_string("window.__seen.join(',')").unwrap();
+        assert_eq!(seen, "s0,s1,s2", "each script saw its OWN element, in document order");
     }
 
     /// Every decode path must hand the renderer straight-alpha RGBA in the
@@ -1940,30 +1941,30 @@ mod tests {
             }
         }
 
-        // The selected option must reach the control paint/submit path.
+        // The selected option reaches the control paint/submit path — read from the options, never
+        // written into the document (AETHERJS: layout used to insert `value`/`data-aether-label`
+        // attributes, which then showed in the serialized DOM and in script).
         let select = document.select_first("select").unwrap();
-        let attrs = select.attributes.borrow();
-        assert_eq!(attrs.get("value"), Some("en"), "select submits the selected option's value");
         assert_eq!(
-            attrs.get("data-aether-label"),
-            Some("English"),
-            "select paints the selected option's text"
+            layout::select_selected_option(select.as_node()),
+            Some(("en".to_string(), "English".to_string())),
+            "select submits the selected option's value and paints its text"
         );
+        let attrs = select.attributes.borrow();
+        assert_eq!(attrs.get("value"), None, "layout does not mutate the DOM");
+        assert_eq!(attrs.get("data-aether-label"), None, "layout does not mutate the DOM");
     }
 
     // -----------------------------------------------------------------------
     // Process survival: no page may kill the browser
     // -----------------------------------------------------------------------
 
-    /// boa's `RuntimeLimit` error has no opaque JS form: the moment it reaches
-    /// a promise reaction, boa's own `to_opaque` PANICS
-    /// (`new_promise_reaction_job`). That killed the whole process on roughly
-    /// two google-search loads in five. The engine must survive it: the panic
-    /// is caught at the job boundary, the context is poisoned, and the DOM
-    /// stands. The VM ceiling is squeezed here to make the trip deterministic
-    /// — a real page reaches the same code by being large.
+    /// A page that overflows the call stack inside a promise reaction: js_core throws a RangeError
+    /// (catchable, as in every browser), the reaction's derived promise rejects, the chain stops, and
+    /// the engine is neither poisoned nor the process ended. The VM's call-depth ceiling is squeezed to
+    /// make the trip cheap — a real page reaches the same path by recursing deeper.
     #[test]
-    fn test_runtime_limit_in_promise_reaction_does_not_kill_the_process() {
+    fn test_stack_overflow_in_promise_reaction_rejects_the_chain() {
         let mut engine = crate::AetherEngine::new();
         engine.load_html_styled(
             "https://example.com/",
@@ -1973,56 +1974,31 @@ mod tests {
         );
         {
             let js = engine.js_engine.as_mut().unwrap();
-            js.context.runtime_limits_mut().set_stack_size_limit(64);
+            js.vm.max_depth = 64;
             js.execute(
-                "window.__settled = 0;
+                "window.__settled = 0; window.__err = '';
                  Promise.resolve().then(function () {
                      function f(n) { return n <= 0 ? 0 : f(n - 1) + 1; }
                      return f(100000);
-                 }).then(function () { window.__settled = 1; });",
+                 }).then(function () { window.__settled = 1; },
+                         function (e) { window.__err = e.name; });",
             )
             .expect("arming the reaction must run clean");
+            js.vm.max_depth = 1800;
         }
-        assert!(!crate::js::engine_poisoned(), "not poisoned before the job runs");
-
-        // boa 0.21 PANICKED in here; reaching the next line at all is the test.
         engine.tick();
-
-        // boa 0.22 made `into_opaque` fallible, so the limit now comes back to
-        // the job runner as an ordinary `Err` instead of a panic. Either way
-        // the process lives: a caught panic poisons the context (and script is
-        // refused), an ordinary `Err` leaves the engine running — and in both
-        // the reaction chain never reaches its second step.
-        {
-            let js = engine.js_engine.as_mut().unwrap();
-            if crate::js::engine_poisoned() {
-                assert!(
-                    js.execute("1 + 1").is_err(),
-                    "a poisoned engine refuses further script instead of running it on a broken VM"
-                );
-            } else {
-                let settled = js.execute("window.__settled").expect("an unpoisoned engine keeps running script");
-                assert_eq!(settled.as_number(), Some(0.0), "the limit must stop the chain, got {settled:?}");
-            }
-        }
-        // The DOM built before the panic is still intact and still renders.
+        assert!(!crate::js::engine_poisoned(), "a stack overflow is an exception, not an engine panic");
+        let js = engine.js_engine.as_mut().unwrap();
+        assert_eq!(js.eval_number("window.__settled").unwrap(), 0.0, "the overflow must stop the chain");
+        assert_eq!(js.eval_string("window.__err").unwrap(), "RangeError", "the rejection carries a RangeError");
         let document = engine.document.as_ref().expect("document survives");
-        assert!(
-            document.select_first("#x").is_ok(),
-            "the DOM must render as it stands after the limit trips"
-        );
-        crate::js::clear_poison();
+        assert!(document.select_first("#x").is_ok(), "the DOM is intact");
     }
 
-    /// The other half of the same story. `RuntimeLimit` is *uncatchable* in JS
-    /// (boa 0.21 `JsNativeErrorKind::is_catchable`), so a page's own `catch`
-    /// never sees it and it propagates straight out to whichever Rust caller
-    /// is nearest. Where that caller is ours — the timer dispatcher — it is an
-    /// ordinary `Err`: ledgered, generation continues, nothing poisoned. Only
-    /// boa's internal promise-job caller turns it into a panic, which is why
-    /// the guard exists and why it must not fire here.
+    /// A stack overflow inside a timer callback is an ordinary, catchable RangeError (the page's own
+    /// catch sees it), and the rest of the timer generation still runs.
     #[test]
-    fn test_runtime_limit_in_timer_callback_is_an_ordinary_error() {
+    fn test_stack_overflow_in_timer_callback_is_catchable() {
         let mut engine = crate::AetherEngine::new();
         engine.load_html_styled(
             "https://example.com/",
@@ -2033,35 +2009,51 @@ mod tests {
         crate::event_loop::freeze_clock();
         {
             let js = engine.js_engine.as_mut().unwrap();
-            js.context.runtime_limits_mut().set_stack_size_limit(64);
             js.execute(
                 "window.__caught = 0; window.__after = 0;
                  setTimeout(function () {
                      try {
                          (function f(n) { return n <= 0 ? 0 : f(n - 1) + 1; })(100000);
-                     } catch (e) { window.__caught = 1; }
+                     } catch (e) { window.__caught = e instanceof RangeError ? 1 : 2; }
                  }, 10);
                  setTimeout(function () { window.__after = 1; }, 10);",
             )
             .expect("arming must run clean");
         }
         crate::event_loop::advance_clock(10);
-
         engine.tick();
+        assert!(!crate::js::engine_poisoned(), "no engine panic");
+        assert_eq!(js_num(&mut engine, "window.__caught"), 1.0, "the page's own catch sees the RangeError");
+        assert_eq!(js_num(&mut engine, "window.__after"), 1.0, "the generation continues");
+    }
 
+    /// A runaway task (`while (true) {}`) is terminated by the per-task instruction budget: reported in
+    /// the ledger, uncatchable by the page, and the next task still runs on a live engine.
+    #[test]
+    fn test_runaway_task_is_terminated_by_the_budget() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled("https://example.com/", "<html><body>a</body></html>", &[], true);
+        crate::event_loop::freeze_clock();
+        crate::ledger::reset();
+        {
+            let js = engine.js_engine.as_mut().unwrap();
+            js.execute(
+                "window.__caught = 0; window.__after = 0;
+                 setTimeout(function () { try { while (true) {} } catch (e) { window.__caught = 1; } }, 5);
+                 setTimeout(function () { window.__after = 1; }, 5);",
+            )
+            .unwrap();
+        }
+        crate::event_loop::advance_clock(5);
+        crate::js::set_task_budget(2_000_000);
+        engine.tick();
+        crate::js::set_task_budget(crate::js::TASK_BUDGET);
+        assert!(!crate::js::engine_poisoned());
+        assert_eq!(js_num(&mut engine, "window.__caught"), 0.0, "termination is uncatchable");
+        assert_eq!(js_num(&mut engine, "window.__after"), 1.0, "the next task runs");
         assert!(
-            !crate::js::engine_poisoned(),
-            "a limit trip our own dispatcher catches is an error, not an engine panic"
-        );
-        assert_eq!(
-            js_num(&mut engine, "window.__caught"),
-            0.0,
-            "RuntimeLimit is uncatchable in JS: the page's own catch must not see it"
-        );
-        assert_eq!(
-            js_num(&mut engine, "window.__after"),
-            1.0,
-            "one callback hitting the ceiling must not stop the rest of the generation"
+            crate::ledger::snapshot().contains(crate::ledger::ApiCategory::Js, "js-task-terminated:timer-callback"),
+            "the termination is ledgered"
         );
     }
 
@@ -2127,7 +2119,7 @@ mod tests {
                  })();",
             )
             .expect("registration must run clean");
-            crate::js::drain_raf(&mut js.context);
+            js.drain_raf();
         }
         assert_eq!(
             js_num(&mut engine, "window.__n"),
@@ -2197,7 +2189,7 @@ mod tests {
         assert_eq!(paint("a").font_size, Some(20.0), ":is() must distribute");
         assert_eq!(paint("n").color, Some((1, 2, 3)), ":where() must distribute");
         assert_eq!(paint("a").color, None, ":focus-visible/:has must not match");
-        assert_eq!(paint("a").bold, Some(true), ":not(:focus-visible) is a tautology");
+        assert_eq!(paint("a").weight, Some(crate::layout::FontWeight::Abs(700)), ":not(:focus-visible) is a tautology");
     }
 
     /// AETHERSEE helper: the layout box of the element with this id.
@@ -2302,12 +2294,391 @@ mod tests {
         let (r, b, u) = (box_by_id(&tree, "r"), box_by_id(&tree, "b"), box_by_id(&tree, "u"));
         assert!(b.size.width > r.size.width, "bold run measured with the bold face ({} vs {})", b.size.width, r.size.width);
         assert!(u.size.width > r.size.width, "uppercase run measured after its transform");
-        // One resolver: the key distinguishes every face the painter can pick.
-        use crate::fonts::face_key;
-        let keys: std::collections::HashSet<u8> = (0..3u8)
-            .flat_map(|f| [(f, false, false), (f, true, false), (f, false, true), (f, true, true)])
-            .map(|(f, b, i)| face_key(f, b, i))
+        // One resolver: every family x weight x style the painter can pick is its own face.
+        let ids: std::collections::HashSet<u32> = (0..3u16)
+            .flat_map(|f| [(f, 400, false), (f, 700, false), (f, 400, true), (f, 700, true)])
+            .filter_map(|(f, w, i)| crate::fonts::face(&crate::fonts::FontSel::new(f, w, i)).map(|x| x.id))
             .collect();
-        assert_eq!(keys.len(), 12);
+        assert_eq!(ids.len(), 12);
+    }
+
+    /// Absolute (page) rect of the first element with `id`, after a cascade.
+    fn rect_by_id(tree: &layout::LayoutTree, want: &str) -> Option<(f32, f32, f32, f32)> {
+        fn walk(t: &layout::LayoutTree, n: taffy::NodeId, x: f32, y: f32, want: &str) -> Option<(f32, f32, f32, f32)> {
+            let l = t.taffy.layout(n).ok()?;
+            let (ax, ay) = (x + l.location.x, y + l.location.y);
+            if let Some(el) = t.node_map.get(&n).and_then(|d| d.as_element()) {
+                if el.attributes.borrow().get("id") == Some(want) {
+                    return Some((ax, ay, l.size.width, l.size.height));
+                }
+            }
+            for k in t.taffy.children(n).unwrap_or_default() {
+                if let Some(r) = walk(t, k, ax, ay, want) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        walk(tree, tree.root_node, 0.0, 0.0, want)
+    }
+
+    fn laid_out(html: &str, css: &str) -> layout::LayoutTree {
+        let mut tree = layout::compute_layout(&dom::parse_html(html));
+        css::apply_css(&mut tree, css);
+        tree
+    }
+
+    /// CSS 2.2 §8.3.1 known answers: adjoining sibling margins collapse to
+    /// the larger; a negative joins as max-positive + min-negative; a first
+    /// child's top margin escapes a parent with no border/padding (and the
+    /// body), but not one with padding; an empty block collapses through.
+    #[test]
+    fn test_margin_collapsing_kat() {
+        let css = "body{margin:0} div{height:10px}";
+        // Siblings: 16 and 24 collapse to 24 (not 40).
+        let t = laid_out(r#"<html><body><div id=a style="margin-bottom:16px"></div><div id=b style="margin-top:24px"></div></body></html>"#, css);
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(b.1 - (a.1 + a.3), 24.0, "sibling margins collapse to the max");
+        // Positive and negative: 20 + (-8) = 12.
+        let t = laid_out(r#"<html><body><div id=a style="margin-bottom:20px"></div><div id=b style="margin-top:-8px"></div></body></html>"#, css);
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(b.1 - (a.1 + a.3), 12.0, "max positive + min negative");
+        // Parent/first child: the child's 30px escapes the wrapper (and body).
+        let t = laid_out(r#"<html><body><section id=w style="display:block"><p id=c style="margin:30px 0;height:10px"></p></section></body></html>"#, "body{margin:0}");
+        let (w, c) = (rect_by_id(&t, "w").unwrap(), rect_by_id(&t, "c").unwrap());
+        assert_eq!(c.1, 30.0, "first child's margin collapses through");
+        assert_eq!(w.1, 30.0, "the wrapper starts where the collapsed margin ends");
+        // Padding separates: the child's margin stays inside.
+        let t = laid_out(r#"<html><body><section id=w style="padding-top:1px"><p id=c style="margin:30px 0;height:10px"></p></section></body></html>"#, "body{margin:0}");
+        let (w, c) = (rect_by_id(&t, "w").unwrap(), rect_by_id(&t, "c").unwrap());
+        assert_eq!(w.1, 0.0);
+        assert_eq!(c.1, 31.0, "padding blocks the collapse");
+        // Empty block between siblings: 10, (12/14 empty), 8 → one 14 gap.
+        let t = laid_out(r#"<html><body><div id=a style="margin-bottom:10px"></div><section style="margin:12px 0 14px"></section><div id=b style="margin-top:8px"></div></body></html>"#, css);
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(b.1 - (a.1 + a.3), 14.0, "an empty block collapses through");
+        // The specified margins survive the layout run (restore).
+        let id = t.node_map.iter().find(|(_, n)| n.as_element().is_some_and(|e| e.attributes.borrow().get("id") == Some("b"))).map(|(i, _)| *i).unwrap();
+        assert_eq!(t.taffy.style(id).unwrap().margin.top, taffy::style::LengthPercentageAuto::length(8.0));
+    }
+
+    /// html.css UA margins: h1 0.67em of 32px, p 1em, a margin longhand
+    /// replaces only its own side.
+    #[test]
+    fn test_ua_margins_and_longhands() {
+        let t = laid_out(r#"<html><body><div id=top style="height:1px"></div><h1 id=h>T</h1><p id=p>x</p></body></html>"#, "body{margin:0} h1{margin-bottom:4px}");
+        let (top, h, p) = (rect_by_id(&t, "top").unwrap(), rect_by_id(&t, "h").unwrap(), rect_by_id(&t, "p").unwrap());
+        assert!((h.1 - (top.1 + top.3) - 21.44).abs() <= 1.0, "h1 keeps its UA top margin: {:?}", h);
+        assert!((p.1 - (h.1 + h.3) - 16.0).abs() <= 1.0, "max(4, 16) between h1 and p: {:?} {:?}", h, p);
+    }
+
+    /// CSS 2.2 §10.3.3: an auto-width block fills its container minus its
+    /// margins, border and padding (content-box); `margin: 0 auto` under a
+    /// max-width centres the clamped box.
+    #[test]
+    fn test_block_width_kat() {
+        let t = laid_out(
+            r#"<html><body><div style="width:400px"><div id=a style="margin:0 10px;padding:0 12px;border:2px solid red">x</div><div id=b style="max-width:200px;margin:0 auto;padding:0 10px">y</div></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!((a.0, a.2), (10.0, 380.0), "fills 400 - 2x10 margin, border-box");
+        assert_eq!((b.0, b.2), (90.0, 220.0), "content 200 + padding 20, centred {b:?}");
+    }
+
+    /// CSS 2.2 §10.8: `line-height: normal` is the rounded ascent + descent
+    /// + gap (Liberation Sans/Arial 16px = 18, not 18.4), and the baseline
+    /// sits half the leading below the line top.
+    #[test]
+    fn test_line_metrics_kat() {
+        let Some(f) = crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::SANS, 400, false)) else { return };
+        let (a, d, g) = crate::fonts::line_metrics(f, 16.0);
+        assert_eq!(crate::fonts::line_height(&f, 16.0, 0.0), a + d + g);
+        assert_eq!(crate::fonts::baseline_offset(&f, 16.0, 0.0), (g / 2.0).floor() + a);
+        assert_eq!(crate::fonts::baseline_offset(&f, 16.0, 2.0), ((32.0 - a - d) / 2.0).floor() + a);
+        let sp = crate::fonts::space_advance(&f, 16.0);
+        assert!(sp > 3.0 && sp < 5.0, "space advance {sp}");
+    }
+
+    /// Chromium control metrics: a text field is one 13.333px line + 1px/2px
+    /// padding + 2px border (21px tall at UA padding; author padding and
+    /// border-box work on top), a checkbox 13x13.
+    #[test]
+    fn test_form_control_metrics_kat() {
+        let t = laid_out(
+            r#"<html><body><input id=f><input id=g style="box-sizing:border-box;padding:6px;width:200px"><input id=c type=checkbox></body></html>"#,
+            "body{margin:0}",
+        );
+        let (f, g, c) = (rect_by_id(&t, "f").unwrap(), rect_by_id(&t, "g").unwrap(), rect_by_id(&t, "c").unwrap());
+        let lh = crate::fonts::face(&crate::fonts::FontSel::new(crate::layout::control_family(), 400, false))
+            .map(|x| crate::fonts::line_height(x, 13.333, 0.0))
+            .unwrap_or(15.0);
+        assert_eq!(f.3, lh + 2.0 + 4.0, "field: line + padding + border");
+        assert_eq!((g.2, g.3), (200.0, lh + 12.0 + 4.0), "border-box width, padding 6");
+        assert_eq!((c.2, c.3), (13.0, 13.0));
+    }
+
+    /// CSS 2.2 §9.2.1.1: an inline tag made `display: block` splits its
+    /// parent's line into block boxes (label above input, not beside it).
+    #[test]
+    fn test_display_block_on_inline_tag() {
+        let t = laid_out(
+            r#"<html><body><form><label id=l>Name</label><input id=i> <label id=m>Mail</label><input id=j></form></body></html>"#,
+            "body{margin:0} label{display:block} input{width:100px}",
+        );
+        let (l, i, m) = (rect_by_id(&t, "l").unwrap(), rect_by_id(&t, "i").unwrap(), rect_by_id(&t, "m").unwrap());
+        assert_eq!(l.0, 0.0);
+        assert!(i.1 >= l.1 + l.3, "input below its block label: {l:?} {i:?}");
+        assert!(m.1 >= i.1 + i.3 && m.0 == 0.0, "next label on its own line: {m:?}");
+    }
+
+    /// html.css heading sizes are em of the parent: h2 in a 14px body is 21px.
+    #[test]
+    fn test_heading_em_sizes() {
+        assert_eq!(layout::default_font_size("h2", 14.0), 21.0);
+        assert_eq!(layout::default_font_size("h1", 16.0), 32.0);
+    }
+
+    /// css-values-4: clamp()/min() with % resolve against the containing
+    /// block after layout; math in a box shorthand is one component;
+    /// clamp() font sizes.
+    #[test]
+    fn test_css_math_kat() {
+        assert_eq!(css::split_top_level("calc(0.5rem + 1vw) 4px"), vec!["calc(0.5rem + 1vw)", "4px"]);
+        assert_eq!(css::parse_font_size("clamp(10px, 50px, 20px)"), Some(20.0));
+        let t = laid_out(
+            r#"<html><body><div style="width:500px"><div id=a style="width:min(300px, 80%);height:1px"></div><div id=b style="width:max(10px, 50%);height:1px;padding:calc(2px + 3px)"></div></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(a.2, 300.0);
+        assert_eq!(b.2, 250.0 + 10.0, "50% of 500 + padding 5+5");
+    }
+
+    /// CSS 2.2 §17.5.2.2 / §17.6: columns line up across rows, a 100% wide
+    /// table widens its columns in proportion, collapsed borders overlap.
+    #[test]
+    fn test_table_layout_kat() {
+        let t = laid_out(
+            r#"<html><body><table style="width:400px;border-collapse:collapse"><tr><td id=a style="border:1px solid red">x</td><td id=b style="border:1px solid red">yyyyyyyy</td></tr><tr><td id=c style="border:1px solid red">zzzz zzzz</td><td id=d style="border:1px solid red">1</td></tr></table></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b, c, d) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap(), rect_by_id(&t, "c").unwrap(), rect_by_id(&t, "d").unwrap());
+        assert_eq!(a.2, c.2, "column 1 cells share a width");
+        assert_eq!(b.0, d.0, "column 2 starts at one x");
+        assert_eq!(b.0, a.0 + a.2 - 1.0, "collapsed: the shared border overlaps by 1px");
+        assert!((d.0 + d.2 - a.0 - 400.0).abs() <= 1.0, "the columns fill the 400px table: {a:?} {d:?}");
+        assert_eq!(c.1, a.1 + a.3 - 1.0, "rows overlap by the shared border");
+    }
+
+    /// vertical-align: super grows its line box by Blink's shift
+    /// (parent/3 + 1 = 6.33px at 16px, less the smaller sup glyph box).
+    #[test]
+    fn test_sup_grows_line_box() {
+        let a = laid_out(r#"<html><body><p id=p>E=mc2 x</p></body></html>"#, "body{margin:0} p{margin:0}");
+        let b = laid_out(r#"<html><body><p id=p>E=mc<sup>2</sup> x</p></body></html>"#, "body{margin:0} p{margin:0}");
+        let (pa, pb) = (rect_by_id(&a, "p").unwrap(), rect_by_id(&b, "p").unwrap());
+        assert!(pb.3 >= pa.3 + 2.0, "line box grows: {pa:?} -> {pb:?}");
+    }
+
+    fn node_by_id(t: &layout::LayoutTree, want: &str) -> Option<taffy::NodeId> {
+        t.node_map.iter().find_map(|(id, n)| {
+            n.as_element().filter(|e| e.attributes.borrow().get("id") == Some(want)).map(|_| *id)
+        })
+    }
+
+    /// CSS 2.2 §9.4.2 / §10.8 / css-break-3 slice known answers on a
+    /// monospace face (every glyph the same advance): a span that wraps is
+    /// one fragment per line (inline-start edge on the first, inline-end on
+    /// the last); the text after it continues on its last line; each line
+    /// box is `line-height` tall; text-align centres each line; a taller
+    /// inline-block grows its line around the shared baseline; a float
+    /// shortens the line boxes beside it.
+    #[test]
+    fn test_inline_formatting_context_kat() {
+        use crate::layout::inline::Frag;
+        if crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::MONO, 400, false)).is_none() {
+            return;
+        }
+        let css = "body{margin:0} p{margin:0;font:10px monospace;line-height:2;width:100px}";
+        let t = laid_out(r#"<html><body><p id=p>aaaa <span id=s style="padding:0 3px">bb cc dd ee ff</span> gg</p></body></html>"#, css);
+        let (p, sp) = (node_by_id(&t, "p").unwrap(), node_by_id(&t, "s").unwrap());
+        let il = &t.inline[&p];
+        let boxes: Vec<_> = il.frags.iter().filter_map(|f| match f { Frag::Box { node, x, w, first, last, .. } if *node == sp => Some((*x, *w, *first, *last)), _ => None }).collect();
+        assert_eq!(boxes.len(), 2, "the span is split into two line fragments: {boxes:?}");
+        assert!(boxes[0].2 && !boxes[0].3 && !boxes[1].2 && boxes[1].3, "slice: start edge first, end edge last");
+        assert_eq!(boxes[1].0, 0.0, "the continuation fragment starts at the line start");
+        assert_eq!(il.lines.len(), 2);
+        assert!(il.lines.iter().all(|l| l.1 == 20.0), "line-height: 2 x 10px: {:?}", il.lines);
+        assert_eq!(rect_by_id(&t, "p").unwrap().3, 40.0, "the paragraph is two line boxes tall");
+        let gg = il.frags.iter().find_map(|f| match f { Frag::Text { text, x, baseline, .. } if text.contains("gg") => Some((*x, *baseline)), _ => None }).unwrap();
+        assert_eq!(gg.1, il.lines[1].2, "text after the span continues on the span's last line");
+        assert!(gg.0 >= boxes[1].0 + boxes[1].1 - 0.5, "after the span's end edge: {gg:?} {boxes:?}");
+
+        // text-align: center — the one line's content is centred.
+        let t = laid_out(r#"<html><body><p id=p style="text-align:center">abcd</p></body></html>"#, css);
+        let p = node_by_id(&t, "p").unwrap();
+        let (x, w) = t.inline[&p].frags.iter().find_map(|f| match f { Frag::Text { x, width, .. } => Some((*x, *width)), _ => None }).unwrap();
+        assert!((x - (100.0 - w) / 2.0).abs() <= 0.5, "centred (to the whole pixel): x {x} w {w}");
+
+        // A 50px inline-block on the baseline: the line grows to hold it.
+        let t = laid_out(r#"<html><body><p id=p>ab <span style="display:inline-block;width:10px;height:50px"></span> cd</p></body></html>"#, css);
+        let p = node_by_id(&t, "p").unwrap();
+        let l = t.inline[&p].lines[0];
+        assert!(l.1 > 50.0 && l.2 >= 50.0, "line holds the inline-block above its baseline: {l:?}");
+
+        // float: left 30px wide and 30px tall: the first line starts after it.
+        let t = laid_out(r#"<html><body><p id=p><span style="float:left;width:30px;height:30px"></span>ab cd</p></body></html>"#, css);
+        let p = node_by_id(&t, "p").unwrap();
+        let x = t.inline[&p].frags.iter().find_map(|f| match f { Frag::Text { x, .. } => Some(*x), _ => None }).unwrap();
+        assert_eq!(x, 30.0, "the line box is shortened by the float");
+    }
+
+    /// css-color-4 / css-backgrounds-3 known answers: a 50% black background
+    /// over white is mid grey (source-over), a transparent one paints
+    /// nothing; an inset 0-blur shadow fills its offset band inside the
+    /// padding box; overflow:hidden with a radius hides a child's corner.
+    #[test]
+    fn test_paint_effects_kat() {
+        let t = laid_out(
+            r#"<html><body>
+            <div style="height:20px;background:rgba(0,0,0,0.5)"></div>
+            <div style="height:20px;background:#ff0000;background-color:transparent"></div>
+            <div style="height:40px;background:#ffffff;box-shadow:inset 10px 0 0 #0000ff"></div>
+            <div style="height:60px;width:60px;border-radius:30px;overflow:hidden;background:#00ff00"><div style="height:60px;background:#ff0000"></div></div>
+            </body></html>"#,
+            "body{margin:0}",
+        );
+        let (w, h) = (100u32, 160u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; (surface[i + 2], surface[i + 1], surface[i]) };
+        let g = px(50, 10);
+        assert!((g.0 as i32 - 128).abs() <= 2 && g.0 == g.1, "rgba(0,0,0,.5) over white: {g:?}");
+        assert_eq!(px(50, 30), (255, 255, 255), "transparent overrides the earlier colour");
+        assert_eq!(px(5, 60), (0, 0, 255), "inset shadow band at the left inside edge");
+        assert_eq!(px(50, 60), (255, 255, 255), "inside the shadow's inner shape: the background");
+        assert_eq!(px(2, 82), (255, 255, 255), "the rounded clip hides the child's corner");
+        assert_eq!(px(30, 110), (255, 0, 0), "the child paints inside the rounded box");
+    }
+
+    /// CSS 2.2 §17.5.2 / §17.2.1 known answers: a rowspan cell covers its
+    /// column in the rows below (their first cell starts in the next
+    /// column) and is as tall as the rows it spans; a narrow table never
+    /// shrinks a column below its min-content; table-layout: fixed takes the
+    /// first row's width and splits the rest equally.
+    #[test]
+    fn test_table_spans_kat() {
+        let css = "body{margin:0;font:14px monospace} table{border-spacing:0} td{padding:0}";
+        let t = laid_out(
+            r#"<html><body><table><tr><td id=s rowspan=2>ab</td><td id=a>x</td></tr><tr><td id=b>y</td></tr></table>
+            <table style="width:40px"><tr><td id=w>abcdefghij</td><td>k l</td></tr></table>
+            <table style="table-layout:fixed;width:300px"><tr><td id=f1 style="width:60px">a</td><td id=f2>b</td><td id=f3>c</td></tr></table></body></html>"#,
+            css,
+        );
+        let (s, a, b) = (rect_by_id(&t, "s").unwrap(), rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(a.0, b.0, "the second row's cell sits in column 2 under the first row's: {a:?} {b:?}");
+        assert!((s.3 - (a.3 + b.3)).abs() < 0.5, "the spanning cell is both rows tall: {s:?} {a:?} {b:?}");
+        let w = rect_by_id(&t, "w").unwrap();
+        let cw = crate::fonts::lines::Advancer::new(crate::fonts::FontSel::new(crate::fonts::MONO, 400, false), 14.0, 0.0).char('a');
+        assert!(w.2 >= cw * 10.0 - 0.5, "min-content: the unbreakable word keeps its width: {w:?} cw {cw}");
+        let (f1, f2, f3) = (rect_by_id(&t, "f1").unwrap(), rect_by_id(&t, "f2").unwrap(), rect_by_id(&t, "f3").unwrap());
+        assert_eq!(f1.2, 60.0, "fixed: the first row's 60px column");
+        assert!((f2.2 - 120.0).abs() < 0.5 && (f3.2 - 120.0).abs() < 0.5, "fixed: the rest shared equally: {f2:?} {f3:?}");
+    }
+
+    /// css-values-4 §6.1 / css-fonts-4 §2.5 / CSS 2.2 §10.8.1 known answers:
+    /// em lengths are of the element's own font-size, a font-size in em of
+    /// the parent's, rem of the root's; a line-height number inherits as the
+    /// number (re-multiplied by the child's font), a length as the length.
+    #[test]
+    fn test_font_relative_units_kat() {
+        let t = laid_out(
+            r#"<html><body><div id=a><div id=b>x</div><div id=c>y</div></div><div id=d>z</div>
+            <div id=n><span id=ns>n</span></div><div id=l><span id=ls>l</span></div></body></html>"#,
+            "html{font-size:10px} body{margin:0;font-family:monospace} #a{font-size:20px} \
+             #b{width:10em;padding-left:1em;box-sizing:content-box} #c{font-size:1.5em;width:2em} #d{width:5rem} \
+             #n{font-size:10px;line-height:2} #ns{font-size:20px} #l{font-size:10px;line-height:20px} #ls{font-size:30px}",
+        );
+        let b = rect_by_id(&t, "b").unwrap();
+        assert_eq!(b.2, 220.0, "10em + 1em padding at the element's 20px font: {b:?}");
+        let c = node_by_id(&t, "c").unwrap();
+        assert_eq!(t.paint_map[&c].used_font_size, Some(30.0), "1.5em of the parent's 20px");
+        assert_eq!(rect_by_id(&t, "c").unwrap().2, 60.0, "2em of its own 30px");
+        assert_eq!(rect_by_id(&t, "d").unwrap().2, 50.0, "5rem of the root's 10px");
+        let n = node_by_id(&t, "n").unwrap();
+        assert!(t.inline[&n].lines[0].1 >= 40.0, "number line-height re-multiplied by the 20px child: {:?}", t.inline[&n].lines);
+        let l = node_by_id(&t, "l").unwrap();
+        assert_eq!(t.inline[&l].lines[0].1.round(), 20.0f32.max(t.inline[&l].lines[0].1.round()), "length line-height inherited as 20px");
+        assert!(t.inline[&l].lines[0].1 < 40.0, "length line-height is not re-multiplied: {:?}", t.inline[&l].lines);
+    }
+
+    /// CSS 2.2 Appendix E / §9.9.1 known answers: a z-index inside a
+    /// z-indexed parent never rises above the parent's context (z100 in z1
+    /// stays under a z2 sibling); positioned descendants of a z-index:auto
+    /// parent are hoisted into the root context (z3 under an auto parent
+    /// beats a later z2); a negative z-index paints under in-flow content of
+    /// the root context but over the canvas; opacity 0.5 composites the
+    /// group once (an overlap of two opaque children shows only the top one,
+    /// half mixed with white).
+    #[test]
+    fn test_stacking_context_kat() {
+        let t = laid_out(
+            r#"<html><body>
+            <div style="position:relative;height:100px">
+              <div style="position:relative;z-index:1"><div style="position:absolute;left:0;top:0;width:40px;height:40px;background:#ff0000;z-index:100"></div></div>
+              <div style="position:absolute;left:20px;top:20px;width:40px;height:40px;background:#00ff00;z-index:2"></div>
+              <div style="position:relative"><div style="position:absolute;left:100px;top:0;width:40px;height:40px;background:#0000ff;z-index:3"></div></div>
+              <div style="position:absolute;left:120px;top:20px;width:40px;height:40px;background:#ffff00;z-index:2"></div>
+            </div>
+            <div style="height:40px;width:100px;background:#ff00ff"><div style="position:absolute;z-index:-1;left:0;top:0;width:200px;height:40px;background:#00ffff"></div></div>
+            <div style="opacity:0.5;position:relative;height:60px"><div style="position:absolute;left:0;top:0;width:40px;height:40px;background:#ff0000"></div><div style="position:absolute;left:20px;top:20px;width:40px;height:40px;background:#0000ff"></div></div>
+            </body></html>"#,
+            "body{margin:0}",
+        );
+        let (w, h) = (200u32, 220u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; (surface[i + 2], surface[i + 1], surface[i]) }; // BGRA
+        assert_eq!(px(30, 30), (0, 255, 0), "z100 inside a z1 context stays under the z2 sibling");
+        assert_eq!(px(130, 30), (0, 0, 255), "z3 under a z-index:auto parent is hoisted over the later z2");
+        assert_eq!(px(10, 110), (255, 0, 255), "in-flow background over the negative z-index box");
+        assert_eq!(px(150, 110), (0, 255, 255), "the negative z-index box over the canvas beside the flow");
+        let ov = px(30, 170);
+        assert!(ov.0 < 140 && ov.1 > 110 && ov.1 < 145 && ov.2 > 240, "group opacity: only the top box, half mixed: {ov:?}");
+        let red = px(5, 145);
+        assert!(red.0 > 240 && red.1 > 110 && red.1 < 145, "red at half opacity over white: {red:?}");
+    }
+
+    /// CSS 2.2 Appendix E: a higher z-index paints over a later sibling;
+    /// position: fixed with bottom: 0 sits at the viewport's bottom edge.
+    #[test]
+    fn test_z_index_and_fixed_kat() {
+        let t = laid_out(
+            r#"<html><body><div style="position:relative;height:100px"><div style="position:absolute;left:0;top:0;width:50px;height:50px;background:#ff0000;z-index:2"></div><div style="position:absolute;left:25px;top:25px;width:50px;height:50px;background:#0000ff;z-index:1"></div></div><div style="position:fixed;left:0;right:0;bottom:0;height:10px;background:#00ff00"></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (w, h) = (200u32, 300u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; (surface[i + 2], surface[i + 1], surface[i]) }; // BGRA
+        let red = px(40, 40);
+        assert!(red.0 > 200 && red.2 < 50, "z-index 2 over z-index 1: {red:?}");
+        let blue = px(60, 60);
+        assert!(blue.2 > 200, "the lower box shows outside the overlap: {blue:?}");
+        let bar = px(100, h - 5);
+        assert!(bar.1 > 200 && bar.0 < 50, "fixed bar at the viewport bottom: {bar:?}");
+    }
+
+    /// css-counter-styles-3 predefined styles as list markers.
+    #[test]
+    fn test_marker_text_kat() {
+        use crate::render::marker_text;
+        assert_eq!(marker_text(4, 3), "3. ");
+        assert_eq!(marker_text(5, 28), "ab. ");
+        assert_eq!(marker_text(6, 1), "A. ");
+        assert_eq!(marker_text(7, 1994), "mcmxciv. ");
+        assert_eq!(marker_text(8, 4), "IV. ");
+        assert_eq!(marker_text(9, 7), "07. ");
     }
 }

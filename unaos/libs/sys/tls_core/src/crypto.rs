@@ -295,6 +295,23 @@ pub trait CryptoProvider {
     }
 
     /// Does the provider implement this AEAD? Default: all three TLS 1.3 AEADs.
+    /// CTCORE: an ML-KEM-768 key pair (FIPS 203 ML-KEM.KeyGen): (decapsulation key dk 2400 B, encapsulation key ek
+    /// 1184 B). Default: unsupported (the hybrid group is then not offered).
+    fn mlkem768_keypair(&self) -> Result<(KxPrivate, Vec<u8>), CryptoError> {
+        Err(CryptoError::Unsupported("ML-KEM-768"))
+    }
+
+    /// CTCORE: ML-KEM-768 Decaps (FIPS 203 Alg 21, implicit rejection) of a 1088-byte ciphertext.
+    fn mlkem768_decaps(&self, dk: &KxPrivate, ct: &[u8]) -> Result<[u8; 32], CryptoError> {
+        let _ = (dk, ct);
+        Err(CryptoError::Unsupported("ML-KEM-768"))
+    }
+
+    /// Whether this provider can do a key exchange in `group` (the client offers only those).
+    fn supports_group(&self, group: crate::msgs::NamedGroup) -> bool {
+        !group.is_hybrid()
+    }
+
     fn supports_aead(&self, alg: AeadAlg) -> bool {
         let _ = alg;
         true

@@ -7866,7 +7866,7 @@ pub fn run_user_image_argv(
     // Fail-closed backstop (the caller also bounds): the whole image must fit the slot window. The mapper
     // re-bounds the flat path to one code page and each ELF segment to the window.
     if bytes.len() > super::xwin::IMAGE_CAP { // RING3ABI2 M5: the 4 MiB ELF window; the mapper still bounds a classic image to 16 KiB
-        return Err("image larger than the 4 MiB user image cap");
+        return Err("image larger than the user image cap (USER_WINDOW_BYTES)");
     }
     if !super::xwin::argv_fits(argv) {
         return Err("the command line does not fit the 4 KiB args page (32 words max, RING3ABI2)");
@@ -8340,7 +8340,7 @@ pub enum BgPoll {
 /// publish order — and diverges only where the contract block above says it does.
 pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
     if bytes.len() > super::xwin::IMAGE_CAP { // RING3ABI2 M5: the 4 MiB ELF window
-        return Err("image larger than the 4 MiB user image cap");
+        return Err("image larger than the user image cap (USER_WINDOW_BYTES)");
     }
     if !super::xwin::argv_fits(argv) {
         return Err("the command line does not fit the 4 KiB args page (32 words max, RING3ABI2)");

@@ -246,6 +246,40 @@ impl Tokenizer {
         Tokenizer::new(preprocess(input), opts)
     }
 
+    /// The input position (in preprocessed characters) the tokenizer will read next.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// `document.write` (HTML §8.4.3): insert `s` (preprocessed here) into the input stream at the
+    /// current position — the insertion point while a parser-inserted script runs — and return the
+    /// position just past it, the limit up to which the parser is then spun.
+    pub fn insert_at_cursor(&mut self, s: &str) -> usize {
+        let chars = preprocess(s);
+        let n = chars.len();
+        let at = self.pos.min(self.input.len());
+        self.input.splice(at..at, chars);
+        at + n
+    }
+
+    /// Like [`Tokenizer::next_token`], but stops (returning `None`) once the input position reaches
+    /// `limit` with no token pending: the tokenizer keeps its state and resumes from there on the next
+    /// call. Lookahead (markup declarations, character references) may read past `limit`.
+    pub fn next_token_until(&mut self, limit: usize) -> Option<Token> {
+        loop {
+            if let Some(t) = self.queue.pop_front() {
+                return Some(t);
+            }
+            if self.done {
+                return Some(Token::Eof);
+            }
+            if self.pos >= limit {
+                return None;
+            }
+            self.step();
+        }
+    }
+
     /// The next token. After `Token::Eof` every call returns `Token::Eof`.
     pub fn next_token(&mut self) -> Token {
         loop {

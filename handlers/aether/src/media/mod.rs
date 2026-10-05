@@ -390,6 +390,11 @@ fn find(r: &Registry, node: &NodeRef) -> Option<usize> {
     r.elements.iter().position(|e| &e.node == node)
 }
 
+/// The page title PlayMedia requests carry (set once the document's title is known).
+pub fn set_title(title: &str) {
+    MEDIA.with(|m| m.borrow_mut().title = title.to_string());
+}
+
 /// Forget the previous document's media. Every url that had a Stria session gets a
 /// `MediaStop` in the (new) outbox, so navigating away stops playback.
 pub fn reset(title: &str) {
@@ -652,6 +657,22 @@ pub fn toggle(node: &NodeRef) -> bool {
     }
 }
 
+/// Set `node`'s element muted or not (HTMLMediaElement.muted from script): the registry's flag, and
+/// `MediaMute` toward Stria when a session is open.
+pub fn set_muted(node: &NodeRef, muted: bool) -> bool {
+    MEDIA.with(|m| {
+        let mut r = m.borrow_mut();
+        let Some(i) = find(&r, node) else { return false };
+        let open = !matches!(r.elements[i].state, State::Idle);
+        r.elements[i].muted = muted;
+        if open {
+            let url = r.elements[i].url.clone();
+            r.outbox.push(SMessage::MediaMute { url, muted });
+        }
+        true
+    })
+}
+
 /// Seek `node`'s element to `position_ns` (clears the show-poster flag, as HTML's seek does).
 pub fn seek(node: &NodeRef, position_ns: u64) -> bool {
     MEDIA.with(|m| {
@@ -672,7 +693,17 @@ pub fn seek(node: &NodeRef, position_ns: u64) -> bool {
 /// has finished fetching (their held-back opening request, or a `MediaError` for the key when
 /// the fetch failed: it comes back over the bus and paints in the box).
 pub fn take_outbox() -> Vec<SMessage> {
-    let done: Vec<(String, Result<(), String>)> = std::mem::take(&mut *FETCHED.lock().unwrap());
+    // FETCHED is process-wide while the elements are this thread's page: take only the results this
+    // page is waiting for, so another engine (another test thread) draining its own outbox cannot
+    // swallow them (the AETHERFONT join found that race in the parallel test run).
+    let mine: HashSet<String> =
+        MEDIA.with(|m| m.borrow().elements.iter().filter(|e| e.fetching).map(|e| e.src.clone()).collect());
+    let done: Vec<(String, Result<(), String>)> = {
+        let mut f = FETCHED.lock().unwrap();
+        let (take, keep): (Vec<_>, Vec<_>) = f.drain(..).partition(|(src, _)| mine.contains(src));
+        *f = keep;
+        take
+    };
     MEDIA.with(|m| {
         let mut r = m.borrow_mut();
         let title = r.title.clone();

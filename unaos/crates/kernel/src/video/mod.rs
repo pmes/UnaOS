@@ -772,7 +772,7 @@ pub fn desktop_scene_owns_backdrop() -> bool {
 /// is no arm in which the panel has a desktop and no dock to keep clear.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn dock_reserve_h() -> usize {
-    strip::PAD + dock::STRIP_H
+    strip::PAD() + dock::STRIP_H()
 }
 
 // ── PANELREFUSE — the panel REFUSES a write once the machine is dying ────────────────────────────
@@ -1179,3 +1179,7 @@ pub mod shotmask;
 // atlases as the fallback). Unconditional: fbcon and the boot label call it on every image; the engine half
 // inside it is desktop-gated, so no other image links font_core.
 pub mod text;
+// KERNELFONT2 (B363, R85 item 11): `video::dpi` — the panel's effective ppi and the half-pixel scale the console
+// grid (and, owed, the rest of the theme) follows. Unconditional: fbcon arms the grid on every image; without the
+// desktop engine it answers 1.0.
+pub mod dpi; pub mod metrics; pub mod lag; // GLASSLAG M1 (B370): the per-event [lag] latency + the 5 s :: LAG: rollup; // UIMETRICS (B372): the ui::Metrics ignition check, witness and `tests metrics` — folded onto the `dpi` line, code first (module root, LEDGER P7).

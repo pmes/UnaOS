@@ -75,3 +75,27 @@ page = "corpus/15-landing.html"
 [[case]]
 name = "16-positioned"
 page = "corpus/16-positioned.html"
+
+[[case]]
+name = "17-inline-continue"
+page = "corpus/17-inline-continue.html"
+
+[[case]]
+name = "18-stacking"
+page = "corpus/18-stacking.html"
+
+[[case]]
+name = "19-em-units"
+page = "corpus/19-em-units.html"
+
+[[case]]
+name = "20-table-spans"
+page = "corpus/20-table-spans.html"
+
+[[case]]
+name = "21-paint-effects"
+page = "corpus/21-paint-effects.html"
+
+[[case]]
+name = "22-fonts"
+page = "corpus/22-fonts.html"

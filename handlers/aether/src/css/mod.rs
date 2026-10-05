@@ -27,8 +27,11 @@ pub(crate) struct SpecifiedStyle {
     pub max_height: Option<Dimension>,
     pub min_width: Option<Dimension>,
     pub min_height: Option<Dimension>,
-    pub padding: Option<Rect<LengthPercentage>>,
-    pub margin: Option<Rect<LengthPercentageAuto>>,
+    /// Per side [top, right, bottom, left]: a longhand (`margin-top`)
+    /// specifies ONE side and must leave the other three to the cascade
+    /// and the UA defaults (CSS Cascade §6: each longhand cascades alone).
+    pub padding: [Option<LengthPercentage>; 4],
+    pub margin: [Option<LengthPercentageAuto>; 4],
     pub position: Option<taffy::style::Position>,
     pub inset_top: Option<LengthPercentageAuto>,
     pub inset_left: Option<LengthPercentageAuto>,
@@ -91,12 +94,16 @@ impl SpecifiedStyle {
         }
         if let Some(v) = self.min_width { node_style.min_size.width = lpa(v); }
         if let Some(v) = self.min_height { node_style.min_size.height = lpa(v); }
-        if let Some(p) = self.padding {
-            node_style.padding = p;
-        }
-        if let Some(m) = self.margin {
-            node_style.margin = m;
-        }
+        let [pt, pr, pb, pl] = self.padding;
+        if let Some(v) = pt { node_style.padding.top = v; }
+        if let Some(v) = pr { node_style.padding.right = v; }
+        if let Some(v) = pb { node_style.padding.bottom = v; }
+        if let Some(v) = pl { node_style.padding.left = v; }
+        let [mt, mr, mb, ml] = self.margin;
+        if let Some(v) = mt { node_style.margin.top = v; }
+        if let Some(v) = mr { node_style.margin.right = v; }
+        if let Some(v) = mb { node_style.margin.bottom = v; }
+        if let Some(v) = ml { node_style.margin.left = v; }
         if let Some(pos) = self.position {
             node_style.position = pos;
         }
@@ -135,30 +142,50 @@ impl SpecifiedStyle {
 /// Values arrive as raw strings so function values (rgb()...) parse uniformly.
 pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedStyle) {
     let value = value.trim();
+    if is_length_property(prop) {
+        // Kept in cascade order for the font-relative re-resolution.
+        let list = style.paint.font_rel.get_or_insert_with(Vec::new);
+        list.retain(|(p, _)| p != prop);
+        list.push((prop.to_string(), value.to_string()));
+    }
     match prop {
-        "display" => match value {
-            "none" => style.display = Some(Display::None),
-            // Real flex containers: CSS flex semantics (see fold_into).
-            "flex" | "inline-flex" | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex"
-            | "-webkit-inline-flex" | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(true);
+        "display" => {
+            // Outer display type (css-display-3 §2.1) for the inline
+            // whitespace pass: 0 inline, 1 block-level, 2 inline-level box.
+            style.paint.display_kind = match value {
+                "inline" | "contents" => Some(0),
+                "inline-block" | "inline-flex" | "inline-grid" | "inline-table"
+                | "-webkit-inline-box" | "-webkit-inline-flex" | "-ms-inline-flexbox" => Some(2),
+                "none" | "inherit" | "initial" | "unset" | "revert" => None,
+                _ => Some(1),
+            };
+            if !matches!(value, "inherit" | "initial" | "unset" | "revert") {
+                style.paint.list_item = Some(value == "list-item");
             }
-            // Column-flex approximations of block-ish display types.
-            "block" | "inline-block" | "inline" | "list-item"
-            | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
-            | "table-header-group" | "table-footer-group" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(false);
+            apply_display(value, style);
+        }
+        // css-lists-3 §3: the marker style (inherited); `list-style` takes
+        // its type keyword (position/image parts are not painted).
+        "list-style-type" | "list-style" => {
+            for part in value.split_whitespace() {
+                let code = match part {
+                    "none" => Some(0),
+                    "disc" => Some(1),
+                    "circle" => Some(2),
+                    "square" => Some(3),
+                    "decimal" => Some(4),
+                    "lower-alpha" | "lower-latin" => Some(5),
+                    "upper-alpha" | "upper-latin" => Some(6),
+                    "lower-roman" => Some(7),
+                    "upper-roman" => Some(8),
+                    "decimal-leading-zero" => Some(9),
+                    _ => None,
+                };
+                if code.is_some() {
+                    style.paint.list_style = code;
+                }
             }
-            "table-row" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(false);
-                style.flex_direction = Some(FlexDirection::Row);
-            }
-            "inherit" | "initial" | "unset" | "revert" => {}
-            other => crate::ledger::record_css(&format!("display:{}", other)),
-        },
+        }
         "flex-direction" => match value {
             "row" => style.flex_direction = Some(FlexDirection::Row),
             "column" => style.flex_direction = Some(FlexDirection::Column),
@@ -223,11 +250,43 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             }
             None => crate::ledger::record_css(&format!("flex-value:{}", clip(value))),
         },
-        "width" => style.width = parse_dimension_str(value),
+        "width" | "min-width" | "max-width" => {
+            let d = parse_dimension_str(value);
+            let i = match prop { "width" => 0, "min-width" => 1, _ => 2 };
+            // css-values-4 §10: a math function mixing % with lengths
+            // resolves against the containing block's width — known only
+            // after layout, so it is kept as an expression for remeasure.
+            let mut m = style.paint.pct_math.clone().unwrap_or_default();
+            m[i] = (d.is_none() && value.contains('(') && value.contains('%')).then(|| value.to_string());
+            if d.is_some() || m[i].is_some() {
+                style.paint.pct_math = Some(m);
+            }
+            if i == 0 {
+                style.paint.has_width = Some(!matches!(value, "auto"));
+            }
+            match i {
+                0 => style.width = d,
+                1 => style.min_width = d,
+                _ => style.max_width = d,
+            }
+        }
         "height" => style.height = parse_dimension_str(value),
-        "max-width" => style.max_width = parse_dimension_str(value),
         "max-height" => style.max_height = parse_dimension_str(value),
-        "min-width" => style.min_width = parse_dimension_str(value),
+        "table-layout" => match value {
+            "fixed" => style.paint.table_fixed = Some(true),
+            "auto" => style.paint.table_fixed = Some(false),
+            _ => {}
+        },
+        "border-collapse" => match value {
+            "collapse" => style.paint.border_collapse = Some(true),
+            "separate" => style.paint.border_collapse = Some(false),
+            _ => {}
+        },
+        "border-spacing" => {
+            if let Some(px) = split_top_level(value).first().and_then(|v| parse_px(v)) {
+                style.paint.border_spacing = Some(px.max(0.0));
+            }
+        }
         "min-height" => style.min_height = parse_dimension_str(value),
         // overflow hidden/clip/auto/scroll all CLIP paint here (no inner
         // scrollbars yet — clipping is the honest approximation; visible
@@ -237,47 +296,48 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             "visible" => style.paint.clip = Some(false),
             _ => {}
         },
-        "padding" => style.padding = parse_sides(value, |v| parse_length_percentage_str(v)),
+        "padding" => {
+            if let Some(r) = parse_sides(value, |v| parse_length_percentage_str(v)) {
+                style.padding = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
+            }
+        }
         "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
             if let Some(v) = parse_length_percentage_str(value) {
-                let mut p = style.padding.unwrap_or(Rect {
-                    left: LengthPercentage::length(0.0),
-                    right: LengthPercentage::length(0.0),
-                    top: LengthPercentage::length(0.0),
-                    bottom: LengthPercentage::length(0.0),
-                });
-                match prop {
-                    "padding-top" => p.top = v,
-                    "padding-right" => p.right = v,
-                    "padding-bottom" => p.bottom = v,
-                    _ => p.left = v,
-                }
-                style.padding = Some(p);
+                style.padding[side_index(prop)] = Some(v);
             }
         }
-        "margin" => style.margin = parse_sides(value, |v| parse_length_percentage_auto_str(v)),
+        "margin" => {
+            if let Some(r) = parse_sides(value, |v| parse_length_percentage_auto_str(v)) {
+                style.margin = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
+            }
+        }
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
             if let Some(v) = parse_length_percentage_auto_str(value) {
-                let mut m = style.margin.unwrap_or(Rect {
-                    left: LengthPercentageAuto::length(0.0),
-                    right: LengthPercentageAuto::length(0.0),
-                    top: LengthPercentageAuto::length(0.0),
-                    bottom: LengthPercentageAuto::length(0.0),
-                });
-                match prop {
-                    "margin-top" => m.top = v,
-                    "margin-right" => m.right = v,
-                    "margin-bottom" => m.bottom = v,
-                    _ => m.left = v,
-                }
-                style.margin = Some(m);
+                style.margin[side_index(prop)] = Some(v);
             }
         }
-        "position" => match value {
-            "absolute" | "fixed" => style.position = Some(taffy::style::Position::Absolute),
-            "static" | "relative" | "sticky" => style.position = Some(taffy::style::Position::Relative),
-            other => crate::ledger::record_css(&format!("position:{}", other)),
-        },
+        "position" => {
+            style.paint.position_kind = match value {
+                "static" => Some(0),
+                "relative" => Some(1),
+                "absolute" => Some(2),
+                "fixed" => Some(3),
+                "sticky" => Some(4),
+                _ => None,
+            };
+            match value {
+                "absolute" | "fixed" => style.position = Some(taffy::style::Position::Absolute),
+                "static" | "relative" | "sticky" => style.position = Some(taffy::style::Position::Relative),
+                other => crate::ledger::record_css(&format!("position:{}", other)),
+            }
+        }
+        "z-index" => {
+            if value == "auto" {
+                style.paint.z_index = Some(None);
+            } else if let Ok(z) = value.parse::<i32>() {
+                style.paint.z_index = Some(Some(z));
+            }
+        }
         "top" => style.inset_top = parse_length_percentage_auto_str(value),
         "left" => style.inset_left = parse_length_percentage_auto_str(value),
         "right" => style.inset_right = parse_length_percentage_auto_str(value),
@@ -285,16 +345,33 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         // Float approximation: no real float layout (text does not wrap
         // around the box), but a floated box sizes to content and hugs its
         // edge instead of stretching full width.
+        "vertical-align" => {
+            style.paint.vertical_align = match value {
+                "baseline" => Some((0, 0.0)),
+                "sub" => Some((1, 0.0)),
+                "super" => Some((2, 0.0)),
+                "middle" => Some((3, 0.0)),
+                "text-top" => Some((4, 0.0)),
+                "text-bottom" => Some((5, 0.0)),
+                "top" => Some((6, 0.0)),
+                "bottom" => Some((7, 0.0)),
+                v if v.ends_with('%') => v.trim_end_matches('%').trim().parse::<f32>().ok().map(|p| (9, p / 100.0)),
+                v => parse_px(v).map(|px| (8, px)),
+            };
+        }
         "float" => match value {
             "left" => {
                 style.width = Some(Dimension::auto());
                 style.align_self = Some(taffy::style::AlignSelf::START);
+                style.paint.float = Some(1);
             }
             "right" => {
                 style.width = Some(Dimension::auto());
                 style.align_self = Some(taffy::style::AlignSelf::END);
+                style.paint.float = Some(2);
             }
-            "none" | "inherit" | "initial" | "unset" => {}
+            "none" => style.paint.float = Some(0),
+            "inherit" | "initial" | "unset" => {}
             other => crate::ledger::record_css(&format!("float:{}", other)),
         },
         // The image-replacement idiom: a huge negative text-indent pushes
@@ -319,11 +396,21 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 style.justify = Some(taffy::style::JustifyContent::CENTER);
                 style.paint.text_align = Some(1);
             }
-            "right" | "end" => {
+            // codes: 0 start, 1 center, 2 right, 3 end, 4 left — start/end resolve against `direction`
+            // (css-text-3 §6.1) where lines are placed (layout::inline).
+            "right" => {
                 style.justify = Some(taffy::style::JustifyContent::END);
                 style.paint.text_align = Some(2);
             }
-            "left" | "start" | "justify" => {
+            "end" => {
+                style.justify = Some(taffy::style::JustifyContent::END);
+                style.paint.text_align = Some(3);
+            }
+            "left" => {
+                style.justify = Some(taffy::style::JustifyContent::START);
+                style.paint.text_align = Some(4);
+            }
+            "start" | "justify" => {
                 style.justify = Some(taffy::style::JustifyContent::START);
                 style.paint.text_align = Some(0);
             }
@@ -341,12 +428,57 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             other => crate::ledger::record_css(&format!("justify-content-value:{}", other)),
         },
         "background-color" => {
-            if !is_neutral_keyword(value) {
-                match parse_color_str(value) {
-                    Some(c) => style.paint.background = Some(c),
+            if value.eq_ignore_ascii_case("transparent") {
+                style.paint.bg_alpha = Some(0.0);
+            } else if !is_neutral_keyword(value) {
+                match crate::render::effects::parse_color_alpha(value) {
+                    // css-color-4 §4.2: an rgba()/#rrggbbaa background is
+                    // composited source-over, not painted opaque.
+                    Some((c, a)) => {
+                        style.paint.background = Some(c);
+                        style.paint.bg_alpha = Some(a);
+                    }
                     None => crate::ledger::record_css(&format!("background-value:{}", clip(value))),
                 }
             }
+        }
+        "background-image" if value.to_ascii_lowercase().contains("-gradient(") => {
+            style.paint.bg_gradient = crate::render::effects::parse_gradient(value).map(Some);
+        }
+        "background" if value.to_ascii_lowercase().contains("-gradient(") => {
+            // A gradient layer (css-images-3 §3.1, §3.2) plus any colour outside it.
+            style.paint.bg_gradient = crate::render::effects::parse_gradient(value).map(Some);
+            let lower = value.to_ascii_lowercase();
+            let start = ["repeating-linear-gradient(", "repeating-radial-gradient(", "linear-gradient(", "radial-gradient("]
+                .iter()
+                .filter_map(|n| lower.find(n))
+                .min()
+                .unwrap_or(0);
+            let mut depth = 0;
+            let mut end = lower.len();
+            for (i, c) in lower[start..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = start + i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let rest = format!("{} {}", &value[..start], &value[end..]);
+            for part in split_top_level(&rest) {
+                if let Some(c) = parse_color_str(part) {
+                    style.paint.background = Some(c);
+                    style.paint.bg_alpha = Some(color_alpha(part));
+                }
+            }
+        }
+        "box-shadow" | "-webkit-box-shadow" => {
+            style.paint.shadows = Some(crate::render::effects::parse_box_shadow(value));
         }
         "background-image" => match extract_css_url(value) {
             Some(u) => style.paint.bg_image = Some(u),
@@ -413,14 +545,20 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 }
                 if let Some(c) = parse_color_str(part) {
                     style.paint.background = Some(c);
+                    style.paint.bg_alpha = Some(color_alpha(part));
                     got_color = true;
                     break;
                 }
             }
             // Function colors with spaces (rgb(1, 2, 3)) survive as whole-value.
-            if !got_color && !is_neutral_keyword(value) && style.paint.bg_image.is_none() {
-                match parse_color_str(value) {
-                    Some(c) => style.paint.background = Some(c),
+            if !got_color && value.trim().eq_ignore_ascii_case("transparent") {
+                style.paint.bg_alpha = Some(0.0);
+            } else if !got_color && !is_neutral_keyword(value) && style.paint.bg_image.is_none() {
+                match crate::render::effects::parse_color_alpha(value) {
+                    Some((c, a)) => {
+                        style.paint.background = Some(c);
+                        style.paint.bg_alpha = Some(a);
+                    }
                     None => crate::ledger::record_css(&format!("background-value:{}", clip(value))),
                 }
             }
@@ -433,18 +571,40 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 }
             }
         }
-        "font-family" => {
-            let v = value.to_ascii_lowercase();
-            let fam = if v.contains("monospace") || v.contains("courier") || v.contains("menlo") || v.contains("consolas") || v.contains("mono") {
-                2
-            } else if v.contains("sans") {
-                0
-            } else if v.contains("serif") || v.contains("georgia") || v.contains("times") || v.contains("libertine") {
-                1
-            } else {
-                0
-            };
-            style.paint.family = Some(fam);
+        // css-fonts-4 §2.1: the family list, interned (fonts::family_list); matched per family at layout.
+        "font-family" => match crate::fonts::parse_family_list(value) {
+            Some(list) => style.paint.family = Some(crate::fonts::intern_family_list(list)),
+            None => {
+                if !is_neutral_keyword(value) {
+                    crate::ledger::record_css(&format!("font-family-value:{}", clip(value)));
+                }
+            }
+        },
+        // css-fonts-4 §2.3
+        "font-stretch" => {
+            if let Some(p) = parse_font_stretch(value) {
+                style.paint.stretch = Some(p);
+            }
+        }
+        // css-text-3 §7.1
+        "word-spacing" => {
+            if value == "normal" {
+                style.paint.word_spacing = Some(0.0);
+            } else if let Some(px) = parse_px(value) {
+                style.paint.word_spacing = Some(px);
+            }
+        }
+        // css-writing-modes-4 §2.1 (the `dir` attribute maps onto it through the UA sheet)
+        "direction" => match value {
+            "rtl" => style.paint.rtl = Some(true),
+            "ltr" => style.paint.rtl = Some(false),
+            _ => {}
+        },
+        // css-text-decor-3 §4: offset-x offset-y [blur] && [color], comma-separated layers.
+        "text-shadow" => {
+            let layers: Vec<crate::render::effects::Shadow> =
+                crate::render::effects::parse_box_shadow(value).into_iter().filter(|s| !s.inset).collect();
+            style.paint.text_shadows = Some(layers);
         }
         // The `font` shorthand: [style] [weight] size[/line-height] family.
         // Legacy pages set their controls entirely through it
@@ -466,13 +626,12 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 let h = head.trim().to_ascii_lowercase();
                 if h == "italic" || h == "oblique" {
                     style.paint.italic = Some(true);
-                } else if h == "normal" || h == "small-caps" || h.starts_with("ultra")
-                    || h.starts_with("extra") || h == "condensed" || h == "expanded"
-                    || h == "semi-condensed" || h == "semi-expanded"
-                {
+                } else if h == "normal" || h == "small-caps" {
                     // no effect here, but still part of the prefix
-                } else if let Some(b) = parse_font_weight(&h) {
-                    style.paint.bold = Some(b);
+                } else if let Some(p) = parse_font_stretch(&h).filter(|_| !h.ends_with('%')) {
+                    style.paint.stretch = Some(p);
+                } else if let Some(w) = parse_font_weight(&h) {
+                    style.paint.weight = Some(w);
                 } else {
                     break;
                 }
@@ -511,11 +670,37 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             other => crate::ledger::record_css(&format!("align-items-value:{}", other)),
         },
         "font-size" => match parse_font_size(value) {
-            Some(px) => style.paint.font_size = Some(px),
-            None => crate::ledger::record_css(&format!("font-size-value:{}", clip(value))),
+            Some(px) => {
+                style.paint.font_size = Some(px);
+                // css-fonts-4 §2.5: em and % are of the PARENT's computed
+                // font-size, rem of the root's; `smaller`/`larger` scale the
+                // parent by 1.2 (Blink's ratio). Resolved in remeasure.
+                let v = value.trim().to_ascii_lowercase();
+                let num = |s: &str| s.trim().parse::<f32>().ok();
+                style.paint.font_size_rel = Some(if v.contains('(') {
+                    (2, 0.0)
+                } else if let Some(n) = v.strip_suffix("rem").and_then(num) {
+                    (1, n)
+                } else if let Some(n) = v.strip_suffix("em").and_then(num) {
+                    (0, n)
+                } else if let Some(n) = v.strip_suffix('%').and_then(num) {
+                    (0, n / 100.0)
+                } else if v == "smaller" {
+                    (0, 1.0 / 1.2)
+                } else if v == "larger" {
+                    (0, 1.2)
+                } else {
+                    (2, 0.0)
+                });
+            }
+            None => match value.trim() {
+                "smaller" => style.paint.font_size_rel = Some((0, 1.0 / 1.2)),
+                "larger" => style.paint.font_size_rel = Some((0, 1.2)),
+                _ => crate::ledger::record_css(&format!("font-size-value:{}", clip(value))),
+            },
         },
         "font-weight" => match parse_font_weight(value) {
-            Some(b) => style.paint.bold = Some(b),
+            Some(w) => style.paint.weight = Some(w),
             None => crate::ledger::record_css(&format!("font-weight-value:{}", clip(value))),
         },
         "visibility" => match value {
@@ -524,37 +709,40 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             "inherit" | "initial" | "unset" => {}
             other => crate::ledger::record_css(&format!("visibility:{}", other)),
         },
-        // Only full transparency is honored (no compositing): opacity:0
-        // hides like visibility:hidden; anything else paints normally.
+        // opacity:0 hides like visibility:hidden; a fraction paints the
+        // subtree as a group composited at that opacity (render::draw_node).
         "opacity" => {
             // Always specified, both ways: a higher-specificity opacity:1
             // has to be able to un-hide what an earlier opacity:0 rule hid,
             // and that only works if the winning declaration merges a value
             // instead of leaving the field unspecified.
-            if let Ok(a) = value.parse::<f32>() {
+            let a = match value.strip_suffix('%') {
+                Some(p) => p.trim().parse::<f32>().ok().map(|p| p / 100.0),
+                None => value.parse::<f32>().ok(),
+            };
+            if let Some(a) = a {
+                let a = a.clamp(0.0, 1.0);
                 style.paint.hidden = Some(a == 0.0);
+                style.paint.opacity = Some(a);
             }
         }
         "line-height" => {
+            // CSS 2.2 §10.8.1: a <number> is inherited as the number (each
+            // element multiplies its own font-size); a <length> or
+            // <percentage> computes to an absolute length, inherited as is.
+            // Stored as > 0 multiplier, < 0 = -(px), 0 = normal.
             let v = value.trim();
-            let factor = if let Some(px) = v.strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok()) {
-                Some(px / 16.0)
-            } else if let Some(n) = v
-                .strip_suffix("rem")
-                .or_else(|| v.strip_suffix("em"))
-                .and_then(|n| n.trim().parse::<f32>().ok())
-            {
-                // 1.5rem = 24px against the 16px base = 1.5x (approximation:
-                // em treated like rem, not parent-relative).
-                Some(n)
+            let (em, ..) = FONT_CTX.with(|c| c.get());
+            let lh = if v == "normal" {
+                Some(0.0)
             } else if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
-                Some(pct / 100.0)
-            } else if v == "normal" {
-                Some(1.2)
+                Some(-(pct / 100.0 * em))
+            } else if let Ok(n) = v.parse::<f32>() {
+                Some(n.max(0.0))
             } else {
-                v.parse::<f32>().ok()
+                parse_px(v).map(|px| -px.max(0.0))
             };
-            match factor {
+            match lh {
                 Some(f) => style.paint.line_height = Some(f),
                 None => crate::ledger::record_css(&format!("line-height-value:{}", clip(value))),
             }
@@ -576,15 +764,19 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             let mut width = 1.0f32;
             let mut color = (128, 128, 128);
             let mut got_any = false;
-            for part in v.split_whitespace() {
-                if let Some(px) = parse_px(part).filter(|_| part.ends_with("px") || part.ends_with("em")) {
+            for part in split_top_level(v) {
+                if let Some(px) = parse_px(part).filter(|_| part.ends_with("px") || is_font_relative(part)) {
                     width = px;
                     got_any = true;
-                } else if matches!(part, "solid" | "dotted" | "dashed" | "double" | "groove" | "ridge" | "inset" | "outset") {
+                } else if let Some(k) = border_style_code(part) {
                     got_any = true;
+                    let mut bs = style.paint.border_style.unwrap_or([0; 4]);
+                    bs[side] = k;
+                    style.paint.border_style = Some(bs);
                 } else if let Some(c) = parse_color_str(part) {
                     color = c;
                     got_any = true;
+                    style.paint.border_alpha = Some(color_alpha(part));
                 }
             }
             if got_any {
@@ -598,13 +790,47 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 style.paint.underline = Some(true);
             } else if v.starts_with("none") {
                 style.paint.underline = Some(false);
+                style.paint.line_through = Some(false);
+            }
+            if v.contains("line-through") {
+                style.paint.line_through = Some(true);
             }
         }
-        "white-space" => match value {
-            "nowrap" | "pre" => style.paint.nowrap = Some(true),
-            "normal" | "pre-wrap" | "pre-line" | "break-spaces" => style.paint.nowrap = Some(false),
+        "white-space" | "white-space-collapse" => {
+            let code = match value {
+                "normal" => Some(0),
+                "nowrap" => Some(1),
+                "pre" => Some(2),
+                "pre-wrap" => Some(3),
+                "pre-line" => Some(4),
+                "break-spaces" => Some(5),
+                _ => None,
+            };
+            if let Some(c) = code {
+                style.paint.white_space = Some(c);
+                style.paint.nowrap = Some(matches!(c, 1 | 2));
+            }
+        }
+        "word-break" => match value {
+            "normal" => style.paint.word_break = Some(0),
+            "break-all" => style.paint.word_break = Some(1),
+            "keep-all" => style.paint.word_break = Some(2),
+            // Legacy: word-break: break-word = overflow-wrap: anywhere.
+            "break-word" => style.paint.overflow_wrap = Some(1),
             _ => {}
         },
+        "overflow-wrap" | "word-wrap" => match value {
+            "normal" => style.paint.overflow_wrap = Some(0),
+            "break-word" | "anywhere" => style.paint.overflow_wrap = Some(1),
+            _ => {}
+        },
+        "letter-spacing" => {
+            if value == "normal" {
+                style.paint.letter_spacing = Some(0.0);
+            } else if let Some(px) = parse_px(value) {
+                style.paint.letter_spacing = Some(px);
+            }
+        }
         "box-sizing" => match value {
             "border-box" => style.box_sizing = Some(taffy::style::BoxSizing::BorderBox),
             "content-box" => style.box_sizing = Some(taffy::style::BoxSizing::ContentBox),
@@ -697,8 +923,36 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         }
         // border-radius: parsed but not rendered (taffy doesn't support it yet).
         // At minimum, stops the property from appearing in unsupported ledgers.
-        "border-radius" | "border-top-left-radius" | "border-top-right-radius"
-        | "border-bottom-left-radius" | "border-bottom-right-radius" => {} // silently ignore; taffy limitation
+        // css-backgrounds-3 §5.1: 1-4 corner radii (the elliptical `/`
+        // part takes its horizontal radii), or one corner's longhand.
+        "border-radius" => {
+            let horiz = value.split('/').next().unwrap_or(value);
+            let parts: Option<Vec<f32>> = horiz.split_whitespace().map(parse_radius).collect();
+            if let Some(p) = parts {
+                let r = match p.as_slice() {
+                    [a] => [*a; 4],
+                    [a, b] => [*a, *b, *a, *b],
+                    [a, b, c] => [*a, *b, *c, *b],
+                    [a, b, c, d] => [*a, *b, *c, *d],
+                    _ => return,
+                };
+                style.paint.radius = Some(r);
+            }
+        }
+        "border-top-left-radius" | "border-top-right-radius"
+        | "border-bottom-right-radius" | "border-bottom-left-radius" => {
+            if let Some(v) = value.split_whitespace().next().and_then(parse_radius) {
+                let i = match prop {
+                    "border-top-left-radius" => 0,
+                    "border-top-right-radius" => 1,
+                    "border-bottom-right-radius" => 2,
+                    _ => 3,
+                };
+                let mut r = style.paint.radius.unwrap_or([0.0; 4]);
+                r[i] = v;
+                style.paint.radius = Some(r);
+            }
+        }
         "border" | "outline" => {
             let v = value.trim();
             if v == "none" || v == "0" {
@@ -708,15 +962,17 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             let mut width = 1.0f32;
             let mut color = (128, 128, 128);
             let mut got_any = false;
-            for part in v.split_whitespace() {
+            for part in split_top_level(v) {
                 if let Some(px) = parse_px(part).filter(|_| part.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '.')) {
                     width = px;
                     got_any = true;
-                } else if matches!(part, "solid" | "dotted" | "dashed" | "double" | "groove" | "ridge" | "inset" | "outset") {
+                } else if let Some(k) = border_style_code(part) {
                     got_any = true;
+                    style.paint.border_style = Some([k; 4]);
                 } else if let Some(c) = parse_color_str(part) {
                     color = c;
                     got_any = true;
+                    style.paint.border_alpha = Some(color_alpha(part));
                 }
             }
             if got_any {
@@ -729,6 +985,20 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             // A styleless border draws nothing, whatever its width says.
             if matches!(value.trim(), "none" | "hidden") {
                 style.paint.border = Some([None; 4]);
+            } else if let Some(r) = parse_sides(value, border_style_code) {
+                style.paint.border_style = Some([r.top, r.right, r.bottom, r.left]);
+            }
+        }
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            let side = side_index(prop.trim_end_matches("-style"));
+            if let Some(k) = border_style_code(value) {
+                let mut bs = style.paint.border_style.unwrap_or([0; 4]);
+                bs[side] = k;
+                style.paint.border_style = Some(bs);
+            } else if matches!(value, "none" | "hidden") {
+                let mut sides = style.paint.border.unwrap_or_default();
+                sides[side] = None;
+                style.paint.border = Some(sides);
             }
         }
         "border-color" => {
@@ -741,6 +1011,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 return;
             }
             if let Some(c) = parse_color_str(value) {
+                style.paint.border_alpha = Some(color_alpha(value));
                 let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
                 for side in sides.iter_mut() {
                     let w = side.map(|(w, _)| w).unwrap_or(1.0);
@@ -976,7 +1247,7 @@ fn ledger_rules(rules: &[css_core::stylesheet::CssRule]) {
             CssRule::Media(_, inner) | CssRule::Supports(_, inner) | CssRule::LayerBlock(_, inner) => ledger_rules(inner),
             CssRule::LayerStatement(_) => {}
             CssRule::Import(_) => crate::ledger::record_css("at-rule:@import"),
-            CssRule::FontFace(_) => crate::ledger::record_css("at-rule:@font-face"),
+            CssRule::FontFace(_) => {}
             CssRule::Keyframes(_) => crate::ledger::record_css("at-rule:@keyframes"),
             CssRule::Other(a) => crate::ledger::record_css(&format!("at-rule:@{}", a.name.to_ascii_lowercase())),
         }
@@ -1024,7 +1295,7 @@ fn apply_spec_to_node(
 /// Overlays `src`'s specified paint fields onto `dst`. ONE list, used by
 /// every cascade path — a field missing here is a declaration that parses
 /// and then never reaches the renderer.
-fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
+pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
     macro_rules! copy {
         ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
@@ -1032,10 +1303,23 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* };
     }
     copy!(
-        background, color, font_size, bold, border, line_height, hidden, clip, underline,
+        background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
-        mask_repeat, text_align, object_fit,
+        mask_repeat, text_align, object_fit, flex_container, border_style, radius,
+        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
+        ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
+        list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
+        stretch, word_spacing, rtl,
     );
+    clone!(text_shadows);
+    if let Some(src_list) = &src.font_rel {
+        let list = dst.font_rel.get_or_insert_with(Vec::new);
+        for (p, v) in src_list {
+            list.retain(|(q, _)| q != p);
+            list.push((p.clone(), v.clone()));
+        }
+    }
+    clone!(pct_math, bg_gradient, shadows);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
 }
 
@@ -1096,8 +1380,13 @@ fn cascade_document(
             continue;
         }
         let uses_var = decls.iter().any(|d| contains_var(&d.value));
+        // The share key is the winning declarations' addresses in the rule set. A style attribute's
+        // declarations live in `inline`, which is freed at the end of this iteration, so the next
+        // element's attribute can reuse the same addresses: an element with a style attribute never
+        // shares (the AETHERFONT join found two inline-styled siblings folded into one style).
+        let shareable = !uses_var && inline.is_empty();
         let key: Vec<usize> = decls.iter().map(|d| *d as *const _ as usize).collect();
-        let style = match (!uses_var).then(|| shared.get(&key)).flatten() {
+        let style = match shareable.then(|| shared.get(&key)).flatten() {
             Some(s) => s.clone(),
             None => {
                 let mut s = SpecifiedStyle::default();
@@ -1113,7 +1402,7 @@ fn cascade_document(
                     }
                 }
                 let s = Rc::new(s);
-                if !uses_var {
+                if shareable {
                     shared.insert(key, s.clone());
                 }
                 s
@@ -1137,6 +1426,8 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     for s in &parsed {
         ledger_rules(&s.rules);
     }
+    // css-fonts-4 §4: the document's @font-face faces (AETHERFONT); a changed set bumps the font caches.
+    crate::fonts::webfont::apply_rules(&parsed, &crate::images::page_base());
     let env = media_environment(vw, vh);
     let supports = |d: &css_core::parser::Declaration| property_supported(&d.name.to_ascii_lowercase());
     let import = |_: &str| -> Option<&css_core::stylesheet::Stylesheet> { None };
@@ -1245,9 +1536,9 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     struct Inh {
         color: (u8, u8, u8),
         font_size: f32,
-        bold: bool,
+        weight: u16,
         italic: bool,
-        family: u8,
+        family: u16,
         line_height: f32,
         text_align: u8,
         underline: bool,
@@ -1290,7 +1581,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     let last = LAST_CASCADE.with(|l| l.borrow().clone());
     any.with_doc(|doc, _| {
         let root = Inh {
-            color: (0, 0, 0), font_size: 16.0, bold: false, italic: false, family: 0, line_height: 0.0,
+            color: (0, 0, 0), font_size: 16.0, weight: 400, italic: false, family: crate::fonts::STANDARD, line_height: 0.0,
             text_align: 0, underline: false, nowrap: false, hidden: false,
         };
         let mut inh: HashMap<html_core::NodeId, Inh> = HashMap::new();
@@ -1303,7 +1594,10 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             let spec = tid.and_then(|t| last.get(&t)).cloned();
             let mut me = parent.clone();
             me.font_size = paint.font_size.unwrap_or_else(|| crate::layout::default_font_size(tag, parent.font_size));
-            me.bold = paint.bold.unwrap_or_else(|| crate::layout::default_bold(tag, parent.bold));
+            me.weight = paint
+                .weight
+                .map(|w| w.resolve(parent.weight))
+                .unwrap_or_else(|| crate::layout::default_weight(tag, parent.weight));
             me.italic = paint.italic.unwrap_or_else(|| crate::layout::default_italic(tag, parent.italic));
             me.family = paint.family.unwrap_or_else(|| crate::layout::default_family(tag, parent.family));
             if let Some(lh) = paint.line_height {
@@ -1333,9 +1627,17 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 _ if crate::layout::is_inline(tag) => "inline",
                 _ => "block",
             };
-            let position = match spec.as_ref().and_then(|s| s.position) {
-                Some(taffy::style::Position::Absolute) => "absolute",
-                _ => "static",
+            // AETHERJS: the five position kinds Aether paints (relative/sticky offsets, fixed to the
+            // viewport) — the report used to fold everything but absolute into static.
+            let position = match paint.position_kind {
+                Some(1) => "relative",
+                Some(2) => "absolute",
+                Some(3) => "fixed",
+                Some(4) => "sticky",
+                _ => match spec.as_ref().and_then(|s| s.position) {
+                    Some(taffy::style::Position::Absolute) => "absolute",
+                    _ => "static",
+                },
             };
             let flex_direction = match spec.as_ref().and_then(|s| s.flex_direction) {
                 Some(FlexDirection::Column) => "column",
@@ -1352,11 +1654,11 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 rgb(me.color),
                 paint.background.map(rgb).unwrap_or_else(|| "rgba(0, 0, 0, 0)".to_string()),
                 px(me.font_size),
-                if me.bold { "700" } else { "400" }.to_string(),
+                me.weight.to_string(),
                 if me.italic { "italic" } else { "normal" }.to_string(),
-                match me.family { 1 => "serif", 2 => "monospace", _ => "sans-serif" }.to_string(),
+                crate::fonts::serialize_family_list(&crate::fonts::family_list(me.family)),
                 lh,
-                match me.text_align { 1 => "center", 2 => "right", _ => "start" }.to_string(),
+                match me.text_align { 1 => "center", 2 => "right", 3 => "end", 4 => "left", _ => "start" }.to_string(),
                 if me.underline { "underline" } else { "none" }.to_string(),
                 if me.nowrap { "nowrap" } else { "normal" }.to_string(),
                 if me.hidden { "hidden" } else { "visible" }.to_string(),
@@ -1507,7 +1809,11 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     macro_rules! take {
         ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
-    take!(display, flex_direction, width, height, padding, margin, position,
+    for i in 0..4 {
+        if src.padding[i].is_some() { dst.padding[i] = src.padding[i]; }
+        if src.margin[i].is_some() { dst.margin[i] = src.margin[i]; }
+    }
+    take!(display, flex_direction, width, height, position,
           inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_self,
           max_width, max_height, min_width, min_height, box_sizing,
           flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis);
@@ -1540,7 +1846,8 @@ fn property_supported(prop: &str) -> bool {
             | "border-top" | "border-right" | "border-bottom" | "border-left"
             | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width"
             | "text-decoration" | "text-decoration-line" | "text-transform" | "white-space" | "box-sizing"
-            | "font-family"
+            | "font-family" | "font-style" | "font-stretch" | "letter-spacing" | "word-spacing" | "direction"
+            | "text-shadow"
             | "flex" | "flex-grow" | "flex-shrink" | "flex-basis" | "flex-wrap" | "flex-flow"
             | "gap" | "row-gap" | "column-gap"
     )
@@ -1594,10 +1901,118 @@ pub fn is_neutral_keyword(value: &str) -> bool {
 
 const BASE_FONT_PX: f32 = 16.0;
 
+thread_local! {
+    /// The font-relative length basis (css-values-4 §6.1) in effect: (em,
+    /// rem, ex, ch) in px. The cascade parses at the initial 16px font;
+    /// `layout::remeasure` re-applies an element's font-relative
+    /// declarations with its own computed font-size, the root's, and its
+    /// face's x-height and `0` advance.
+    static FONT_CTX: std::cell::Cell<(f32, f32, f32, f32)> = const { std::cell::Cell::new((16.0, 16.0, 8.0, 8.0)) };
+}
+
+/// Sets the font-relative basis (em, rem, ex, ch) for the declarations
+/// parsed next; returns the previous one.
+pub(crate) fn set_font_ctx(ctx: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    FONT_CTX.with(|c| c.replace(ctx))
+}
+
+/// The alpha of a colour value (1 for opaque or unparsable colours).
+fn color_alpha(v: &str) -> f32 {
+    crate::render::effects::parse_color_alpha(v).map(|c| c.1).unwrap_or(1.0)
+}
+
+/// The current font-relative basis (em, rem, ex, ch).
+pub(crate) fn font_ctx() -> (f32, f32, f32, f32) {
+    FONT_CTX.with(|c| c.get())
+}
+
+/// Parses `decls` (property, value) in order into one specified style, at
+/// the current font basis.
+pub(crate) fn reapply_declarations(decls: &[(String, String)]) -> SpecifiedStyle {
+    let mut spec = SpecifiedStyle::default();
+    for (p, v) in decls {
+        apply_declaration(p, v, &mut spec);
+    }
+    spec
+}
+
+/// px per one `unit` for the font-relative units, from the current basis.
+fn font_unit_px(unit: &str) -> Option<f32> {
+    let (em, rem, ex, ch) = FONT_CTX.with(|c| c.get());
+    match unit {
+        "em" => Some(em),
+        "rem" => Some(rem),
+        "ex" => Some(ex),
+        "ch" => Some(ch),
+        _ => None,
+    }
+}
+
+/// A number with a font-relative unit, as a value in px at the current
+/// basis (`1.5em`, `2rem`, `3ex`, `10ch`).
+fn parse_font_relative(v: &str) -> Option<f32> {
+    for unit in ["rem", "em", "ex", "ch"] {
+        if let Some(n) = v.strip_suffix(unit) {
+            let n = n.trim();
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e')) {
+                if let (Ok(n), Some(px)) = (n.parse::<f32>(), font_unit_px(unit)) {
+                    return Some(n * px);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True when a value uses a font-relative unit anywhere (`1em`, `calc(2rem
+/// + 4px)`, `0 1.5ch`): its px depend on the element's font.
+pub(crate) fn is_font_relative(value: &str) -> bool {
+    let b = value.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() || (b[i] == b'.' && b.get(i + 1).is_some_and(|c| c.is_ascii_digit())) {
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            let start = i;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if matches!(&value[start..i], "em" | "rem" | "ex" | "ch") {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Properties whose value can be a length: their declarations are kept in
+/// cascade order (`PaintStyle::font_rel`) so the font-relative ones can be
+/// re-resolved against the element's own font.
+pub(crate) fn is_length_property(prop: &str) -> bool {
+    matches!(
+        prop,
+        "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" | "margin" | "margin-top"
+            | "margin-right" | "margin-bottom" | "margin-left" | "padding" | "padding-top" | "padding-right"
+            | "padding-bottom" | "padding-left" | "top" | "right" | "bottom" | "left" | "inset" | "gap" | "row-gap"
+            | "column-gap" | "flex-basis" | "flex" | "border" | "border-top" | "border-right" | "border-bottom"
+            | "border-left" | "border-width" | "border-top-width" | "border-right-width" | "border-bottom-width"
+            | "border-left-width" | "border-radius" | "letter-spacing" | "line-height" | "vertical-align"
+            | "border-spacing" | "outline" | "text-indent"
+    )
+}
+
 /// Parses a font-size string: px, em/rem (relative to the 16px UA base —
 /// approximation, not parent-relative), %, or absolute keywords.
 pub fn parse_font_size(value: &str) -> Option<f32> {
     let v = value.trim().to_ascii_lowercase();
+    // css-values-4 math (`clamp(1.25rem, 4vw, 2.5rem)`); % is of the
+    // (approximated 16px) parent size.
+    if v.contains('(') {
+        return eval_length(&v, Some(BASE_FONT_PX));
+    }
     if let Some(px) = v.strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok()) {
         return Some(px);
     }
@@ -1632,13 +2047,33 @@ pub fn parse_font_size(value: &str) -> Option<f32> {
 }
 
 /// Parses a font-weight into "bold or not".
-pub fn parse_font_weight(value: &str) -> Option<bool> {
+pub fn parse_font_weight(value: &str) -> Option<crate::layout::FontWeight> {
+    use crate::layout::FontWeight;
     let v = value.trim().to_ascii_lowercase();
     match v.as_str() {
-        "bold" | "bolder" => Some(true),
-        "normal" | "lighter" => Some(false),
-        _ => v.parse::<f32>().ok().map(|n| n >= 600.0),
+        "bold" => Some(FontWeight::Abs(700)),
+        "normal" => Some(FontWeight::Abs(400)),
+        "bolder" => Some(FontWeight::Bolder),
+        "lighter" => Some(FontWeight::Lighter),
+        _ => v.parse::<f32>().ok().filter(|n| (1.0..=1000.0).contains(n)).map(|n| FontWeight::Abs(n.round() as u16)),
     }
+}
+
+/// css-fonts-4 §2.3 `font-stretch`: a keyword or a percentage, in percent.
+pub fn parse_font_stretch(value: &str) -> Option<u16> {
+    let v = value.trim().to_ascii_lowercase();
+    Some(match v.as_str() {
+        "normal" => 100,
+        "ultra-condensed" => 50,
+        "extra-condensed" => 63,
+        "condensed" => 75,
+        "semi-condensed" => 88,
+        "semi-expanded" => 113,
+        "expanded" => 125,
+        "extra-expanded" => 150,
+        "ultra-expanded" => 200,
+        p => p.strip_suffix('%')?.trim().parse::<f32>().ok().filter(|x| *x >= 0.0)?.round() as u16,
+    })
 }
 
 /// Parses a length into pixels: px, rem/em (16px base — em is not
@@ -1652,12 +2087,8 @@ pub fn parse_px(value: &str) -> Option<f32> {
     if let Some(px) = parse_viewport_length(v) {
         return Some(px);
     }
-    if let Some(n) = v
-        .strip_suffix("rem")
-        .or_else(|| v.strip_suffix("em"))
-        .and_then(|n| n.trim().parse::<f32>().ok())
-    {
-        return Some(n * 16.0);
+    if let Some(px) = parse_font_relative(v) {
+        return Some(px);
     }
     v.strip_suffix("px").unwrap_or(v).trim().parse::<f32>().ok()
 }
@@ -1850,17 +2281,96 @@ impl MathParser<'_> {
         match unit.as_str() {
             "" | "px" => Some(n),
             "pt" => Some(n * 4.0 / 3.0),
-            "rem" | "em" => Some(n * 16.0),
+            "rem" | "em" | "ex" | "ch" => font_unit_px(&unit).map(|u| n * u),
             // `calc(100vh - 64px)` is the standard full-height idiom.
             u => parse_viewport_length(&format!("{}{}", n, u)),
         }
     }
 }
 
+/// `display` value -> Aether's box approximation (flex-backed).
+fn apply_display(value: &str, style: &mut SpecifiedStyle) {
+    match value {
+        "none" => style.display = Some(Display::None),
+        // Real flex containers: CSS flex semantics (see fold_into).
+        "flex" | "inline-flex" | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex"
+        | "-webkit-inline-flex" | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
+            style.display = Some(Display::Flex);
+            style.flex_container = Some(true);
+            style.paint.flex_container = Some(true);
+        }
+        // Column-flex approximations of block-ish display types.
+        "block" | "inline-block" | "inline" | "list-item"
+        | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
+        | "table-header-group" | "table-footer-group" => {
+            style.display = Some(Display::Flex);
+            style.flex_container = Some(false);
+            style.paint.flex_container = Some(false);
+        }
+        "table-row" => {
+            style.display = Some(Display::Flex);
+            style.flex_container = Some(false);
+            style.flex_direction = Some(FlexDirection::Row);
+        }
+        "inherit" | "initial" | "unset" | "revert" => {}
+        other => crate::ledger::record_css(&format!("display:{}", other)),
+    }
+}
+
+/// border-style keyword -> paint code (0 solid, 1 dashed, 2 dotted,
+/// 3 double); the 3D styles paint solid in their colour.
+fn border_style_code(v: &str) -> Option<u8> {
+    match v.trim() {
+        "solid" | "groove" | "ridge" | "inset" | "outset" => Some(0),
+        "dashed" => Some(1),
+        "dotted" => Some(2),
+        "double" => Some(3),
+        _ => None,
+    }
+}
+
+/// One radius: px (>= 0) or a percentage as a negative width fraction.
+fn parse_radius(v: &str) -> Option<f32> {
+    if let Some(p) = v.trim().strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+        return Some(-(p / 100.0).max(0.0));
+    }
+    parse_px(v).map(|x| x.max(0.0))
+}
+
+/// Splits a value on whitespace outside parentheses: `calc(1rem + 2px) 4px`
+/// is two components, not four.
+pub(crate) fn split_top_level(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, None::<usize>);
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if c.is_whitespace() && depth == 0 {
+            if let Some(st) = start.take() {
+                out.push(&value[st..i]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        out.push(&value[st..]);
+    }
+    out
+}
+
+/// [top, right, bottom, left] index of a `*-top`/`*-right`/... longhand.
+fn side_index(prop: &str) -> usize {
+    if prop.ends_with("-top") { 0 } else if prop.ends_with("-right") { 1 } else if prop.ends_with("-bottom") { 2 } else { 3 }
+}
+
 /// Parses a 1-4 value box shorthand ("10px", "0 auto", "1px 2px 3px 4px")
 /// into a sides rect using CSS's top/right/bottom/left expansion.
 fn parse_sides<T: Copy>(value: &str, parse_one: impl Fn(&str) -> Option<T>) -> Option<Rect<T>> {
-    let parts: Vec<T> = value.split_whitespace().map(|p| parse_one(p)).collect::<Option<_>>()?;
+    let parts: Vec<T> = split_top_level(value).into_iter().map(|p| parse_one(p)).collect::<Option<_>>()?;
     let (t, r, b, l) = match parts.as_slice() {
         [a] => (*a, *a, *a, *a),
         [v, h] => (*v, *h, *v, *h),
@@ -2000,9 +2510,17 @@ mod tests {
         assert_eq!(parse_font_size("110%"), Some(17.6));
         assert_eq!(parse_font_size("medium"), Some(16.0));
         assert_eq!(parse_font_size("banana"), None);
-        assert_eq!(parse_font_weight("bold"), Some(true));
-        assert_eq!(parse_font_weight("400"), Some(false));
-        assert_eq!(parse_font_weight("700"), Some(true));
+        use crate::layout::FontWeight;
+        assert_eq!(parse_font_weight("bold"), Some(FontWeight::Abs(700)));
+        assert_eq!(parse_font_weight("400"), Some(FontWeight::Abs(400)));
+        assert_eq!(parse_font_weight("650"), Some(FontWeight::Abs(650)));
+        assert_eq!(parse_font_weight("bolder"), Some(FontWeight::Bolder));
+        assert_eq!(FontWeight::Bolder.resolve(400), 700);
+        assert_eq!(FontWeight::Bolder.resolve(700), 900);
+        assert_eq!(FontWeight::Lighter.resolve(700), 400);
+        assert_eq!(FontWeight::Lighter.resolve(400), 100);
+        assert_eq!(parse_font_stretch("condensed"), Some(75));
+        assert_eq!(parse_font_stretch("120%"), Some(120));
         assert!(is_neutral_keyword("transparent"));
         assert!(is_neutral_keyword("Inherit"));
         assert!(!is_neutral_keyword("red"));

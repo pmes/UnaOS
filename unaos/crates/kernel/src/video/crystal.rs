@@ -170,8 +170,8 @@ struct Row {
 /// face change moves all of them together. FONT (GR27): the shared anti-aliased face's cell is not
 /// square, so the two axes are named separately (the old square `CELL` and its `SCALE` are retired
 /// with the 1-bit bitmap they described).
-const CELL_W: usize = wm::TITLE_CELL_W;
-const CELL_H: usize = wm::TITLE_CELL_H;
+#[allow(non_snake_case)] #[inline] fn CELL_W() -> usize { wm::TITLE_CELL_W() }
+#[allow(non_snake_case)] #[inline] fn CELL_H() -> usize { wm::TITLE_CELL_H() }
 
 /// FONT-METRIC — the atlas those metrics come from, named once so the layout constants and the
 /// glyph call can never disagree about which face the menu is drawing.
@@ -181,17 +181,17 @@ const FACE: super::text::Face = super::text::Face::Chrome;
 /// glyph sits with 4 px of air above and below. DERIVED from the cell, so when FONT-METRIC moved
 /// the chrome face from 16 to 20 px the row moved from 24 to 28 with it and the air stayed 4 —
 /// which is the whole point of writing it as an expression. Bounded, not pinned, below.
-const ITEM_H: usize = CELL_H + 8;
+#[allow(non_snake_case)] #[inline] fn ITEM_H() -> usize { CELL_H() + crate::ui::px(8) }
 
 /// A separator row's height, px — a thin band carrying one keyline, centred.
-const SEP_H: usize = 7;
+#[allow(non_snake_case)] #[inline] fn SEP_H() -> usize { crate::ui::px(7) }
 
 /// The menu's 1 px keyline border, all four sides — the same [`theme::FRAME_LINE`] the window frame
 /// and the bar keyline use.
 const BORDER: usize = 1;
 
 /// The horizontal inset of item text from the menu's inner edge — one [`strip::PAD`], the kit's gap.
-const PADX: usize = strip::PAD;
+#[allow(non_snake_case)] #[inline] fn PADX() -> usize { strip::PAD() }
 
 /// The longest item label in glyphs, walked at compile time so the menu width is a function of the
 /// tree rather than a magic number that a relabelled item could silently overflow.
@@ -209,21 +209,21 @@ const fn max_label_glyphs() -> usize {
 }
 
 /// The menu's total height, walked at compile time from the row heights plus the two borders.
-const fn menu_height() -> usize {
+fn menu_height() -> usize {
     let mut h = 2 * BORDER;
     let mut i = 0;
     while i < ROWS.len() {
-        h += if ROWS[i].verb.is_some() { ITEM_H } else { SEP_H };
+        h += if ROWS[i].verb.is_some() { ITEM_H() } else { SEP_H() };
         i += 1;
     }
     h
 }
 
 /// The menu's width, px: both borders, both insets, and the widest label.
-const MENU_W: usize = 2 * BORDER + 2 * PADX + max_label_glyphs() * CELL_W;
+#[allow(non_snake_case)] #[inline] fn MENU_W() -> usize { 2 * BORDER + 2 * PADX() + max_label_glyphs() * CELL_W() }
 
 /// The menu's height, px.
-const MENU_H: usize = menu_height();
+#[allow(non_snake_case)] #[inline] fn MENU_H() -> usize { menu_height() }
 
 /// How many pickable ITEMS the tree carries (separators excluded) — for the witness `items=` term.
 const fn item_count() -> usize {
@@ -255,15 +255,15 @@ const ITEM_COUNT: usize = item_count();
 /// WINMENU — the dropdown's keyline border, px. See the block above.
 pub const DROP_BORDER: usize = BORDER;
 /// WINMENU — an item row's height, px.
-pub const DROP_ITEM_H: usize = ITEM_H;
+#[allow(non_snake_case)] #[inline] pub fn DROP_ITEM_H() -> usize { ITEM_H() }
 /// WINMENU — a separator band's height, px.
-pub const DROP_SEP_H: usize = SEP_H;
+#[allow(non_snake_case)] #[inline] pub fn DROP_SEP_H() -> usize { SEP_H() }
 /// WINMENU — the horizontal inset of item text from the inner edge, px.
-pub const DROP_PADX: usize = PADX;
+#[allow(non_snake_case)] #[inline] pub fn DROP_PADX() -> usize { PADX() }
 /// WINMENU — the glyph advance the dropdown draws at.
-pub const DROP_CELL_W: usize = CELL_W;
+#[allow(non_snake_case)] #[inline] pub fn DROP_CELL_W() -> usize { CELL_W() }
 /// WINMENU — the glyph cell height the dropdown draws at.
-pub const DROP_CELL_H: usize = CELL_H;
+#[allow(non_snake_case)] #[inline] pub fn DROP_CELL_H() -> usize { CELL_H() }
 /// WINMENU — the atlas the dropdown draws from.
 pub const DROP_FACE: super::text::Face = FACE;
 
@@ -278,22 +278,22 @@ pub fn is_open() -> bool {
     OPEN.load(Ordering::Relaxed)
 }
 
-const _: () = {
+#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
     // The row height must clear the glyph it centres, or the label is cut.
-    assert!(ITEM_H >= CELL_H);
+    assert!(ITEM_H() >= CELL_H());
     // FONT-METRIC — was `ITEM_H == 24`, a pin on the 16 px face's arithmetic that a face change is
     // SUPPOSED to move. What actually has to hold is the clearance the row was designed around: 4 px
     // of air above and below the cell, exactly, whatever the cell is.
-    assert!(ITEM_H == CELL_H + 8 && (ITEM_H - CELL_H) % 2 == 0);
+    assert!(ITEM_H() == CELL_H() + crate::ui::px(8) && (ITEM_H() - CELL_H()) % 2 == 0);
     // The separator band must hold its keyline with air either side.
-    assert!(SEP_H >= 3);
+    assert!(SEP_H() >= 3);
     // A menu with no pickable item would be a surface with nothing to pick.
     assert!(ITEM_COUNT >= 1);
     // The menu must fit the strip painter's scratch, exactly as any strip must.
-    assert!(MENU_W <= strip::MAX_STRIP_W);
+    assert!(MENU_W() <= strip::MAX_STRIP_W);
     // The widest label must be representable — a sanity floor, not a real bound.
     assert!(max_label_glyphs() >= 1);
-};
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -397,13 +397,13 @@ fn menu_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     let (_cx, _cy, _cw, _ch) = menubar::crystal_box_abs(pw, ph)?;
     let (_bx, by, _bw, bh) = menubar::strip_rect(pw, ph)?;
     let my = by + bh; // flush under the bar
-    if MENU_W > pw || my + MENU_H > ph {
+    if MENU_W() > pw || my + MENU_H() > ph {
         return None; // panel cannot host the menu below the bar
     }
     // PANEL-LEFT-FLUSH: the literal 0 is the whole ruling. It is written here rather than derived
     // from the glyph precisely so that moving the mark can never move the menu again.
     let mx = 0;
-    Some((mx, my, MENU_W, MENU_H))
+    Some((mx, my, MENU_W(), MENU_H()))
 }
 
 /// MENUFIT — **the dropdown's LIVE extent: its rect while the menu is open, `None` while it is not.**
@@ -485,7 +485,7 @@ fn row_top(idx: usize) -> usize {
     let mut y = BORDER;
     let mut i = 0;
     while i < idx {
-        y += if ROWS[i].verb.is_some() { ITEM_H } else { SEP_H };
+        y += if ROWS[i].verb.is_some() { ITEM_H() } else { SEP_H() };
         i += 1;
     }
     y
@@ -494,12 +494,12 @@ fn row_top(idx: usize) -> usize {
 /// Which row, if any, the menu-local vertical offset `ly` falls inside. Borders and out-of-range
 /// answer `None`.
 fn row_at(ly: usize) -> Option<usize> {
-    if ly < BORDER || ly >= MENU_H - BORDER {
+    if ly < BORDER || ly >= MENU_H() - BORDER {
         return None;
     }
     for i in 0..ROWS.len() {
         let top = row_top(i);
-        let h = if ROWS[i].verb.is_some() { ITEM_H } else { SEP_H };
+        let h = if ROWS[i].verb.is_some() { ITEM_H() } else { SEP_H() };
         if ly >= top && ly < top + h {
             return Some(i);
         }
@@ -543,7 +543,7 @@ fn open(pw: usize, ph: usize) {
 /// whether the consumed press hit the painted glyph itself (`crystal-glyph`), the widened corner
 /// cell around it (`corner-zone` — the new pixels this arc claims, so a capture can tell a flick
 /// into the corner from an aimed click), or no press at all (`fixture-direct`).
-fn open_via(pw: usize, ph: usize, via: &str) {
+fn open_via(pw: usize, ph: usize, via: &str) { crate::video::lag::menu_opened(); // GLASSLAG M1 (B370)
     if OPEN.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -982,12 +982,12 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
     }
 
     if super::powerui::panel_open() { // POWERMENU M2: one text line per ITEM_H band
-        let li = (j - BORDER) / ITEM_H;
-        let sy = (j - BORDER) % ITEM_H;
-        if sy >= (ITEM_H - CELL_H) / 2 && sy < (ITEM_H - CELL_H) / 2 + CELL_H {
+        let li = (j - BORDER) / ITEM_H();
+        let sy = (j - BORDER) % ITEM_H();
+        if sy >= (ITEM_H() - CELL_H()) / 2 && sy < (ITEM_H() - CELL_H()) / 2 + CELL_H() {
             let mut buf = [0u8; 48];
             let n = super::powerui::panel_line(li, &mut buf);
-            super::text::draw_row(out, w, &buf[..n], BORDER + PADX, sy - (ITEM_H - CELL_H) / 2, theme::TITLE_TEXT_ACTIVE, false, FACE);
+            super::text::draw_row(out, w, &buf[..n], BORDER + PADX(), sy - (ITEM_H() - CELL_H()) / 2, theme::TITLE_TEXT_ACTIVE, false, FACE);
         }
         return;
     }
@@ -999,17 +999,17 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
     match ROWS[row].verb {
         // A separator: one keyline centred in the band, inset from the side borders by PADX.
         None => {
-            if j == top + SEP_H / 2 {
-                for i in (BORDER + PADX)..(w - BORDER - PADX) {
+            if j == top + SEP_H() / 2 {
+                for i in (BORDER + PADX())..(w - BORDER - PADX()) {
                     out[i] = theme::FRAME_LINE;
                 }
             }
         }
         // An item: its label, vertically centred in the row, at PADX from the inner edge.
         Some(_) => {
-            let vpad = (ITEM_H - CELL_H) / 2;
+            let vpad = (ITEM_H() - CELL_H()) / 2;
             let gtop = top + vpad;
-            if j < gtop || j >= gtop + CELL_H {
+            if j < gtop || j >= gtop + CELL_H() {
                 return;
             }
             let sy = j - gtop;
@@ -1017,7 +1017,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
             // painted (RAM scratch — the blend's read is cached). Regular weight: menu items are
             // body text, not a caption.
             let label = match ROWS[row].verb { Some(Verb::Restart) => super::powerui::armed_label(1), Some(Verb::ShutDown) => super::powerui::armed_label(2), _ => None }.unwrap_or(ROWS[row].label).as_bytes(); // POWERMENU M1: the armed row re-reads
-            super::text::draw_row(out, w, label, BORDER + PADX, sy, theme::TITLE_TEXT_ACTIVE, false, FACE);
+            super::text::draw_row(out, w, label, BORDER + PADX(), sy, theme::TITLE_TEXT_ACTIVE, false, FACE);
         }
     }
 }
@@ -1110,7 +1110,7 @@ pub fn selftest() {
     if let Some(r) = mr {
         for row in 0..ROWS.len() {
             if let Some(want) = ROWS[row].verb {
-                let cy = r.1 + row_top(row) + ITEM_H / 2;
+                let cy = r.1 + row_top(row) + ITEM_H() / 2;
                 let cx = r.0 + r.2 / 2;
                 if item_at(r, cx, cy) != Some(want) {
                     resolve_ok = false;
@@ -1130,7 +1130,7 @@ pub fn selftest() {
         let mut ok = false;
         for row in 0..ROWS.len() {
             if ROWS[row].verb == Some(verb) {
-                let cy = r.1 + row_top(row) + ITEM_H / 2;
+                let cy = r.1 + row_top(row) + ITEM_H() / 2;
                 let cx = r.0 + r.2 / 2;
                 let consumed = press_at(cx as i32, cy as i32);
                 ok = consumed && !OPEN.load(Ordering::Acquire);
@@ -1367,8 +1367,8 @@ pub fn logout_row_fire() -> bool {
         serial_println!(":: LOGIN-LOGOUT: no Log Out row in the SHARD tree -> FAIL — ::");
         return false;
     };
-    let r: strip::Rect = (0, 0, MENU_W, MENU_H);
-    let resolves = item_at(r, MENU_W / 2, row_top(row) + ITEM_H / 2) == Some(Verb::LogOut);
+    let r: strip::Rect = (0, 0, MENU_W(), MENU_H());
+    let resolves = item_at(r, MENU_W() / 2, row_top(row) + ITEM_H() / 2) == Some(Verb::LogOut);
     let real = Verb::LogOut.real();
     let sep_above = row > 0 && ROWS[row - 1].verb.is_none();
     fire(Verb::LogOut);
@@ -1389,8 +1389,8 @@ pub fn logout_row_fire() -> bool {
 /// The panel's rect: right-flush under the bar (the battery item lives at the bar's right), one text line per ITEM_H.
 fn panel_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     let (_bx, by, _bw, bh) = menubar::strip_rect(pw, ph)?;
-    let w = 2 * BORDER + 2 * PADX + super::powerui::PANEL_GLYPHS * CELL_W;
-    let h = 2 * BORDER + super::powerui::panel_rows().max(1) * ITEM_H;
+    let w = 2 * BORDER + 2 * PADX() + super::powerui::PANEL_GLYPHS * CELL_W();
+    let h = 2 * BORDER + super::powerui::panel_rows().max(1) * ITEM_H();
     let my = by + bh;
     if w > pw || my + h > ph { return None; }
     Some((pw - w, my, w, h))
@@ -1418,7 +1418,7 @@ pub fn power_panel_selftest() -> bool {
         open_battery_panel(pw, ph);
         let rect = menu_rect(pw, ph);
         let mut row = [0u32; 512];
-        let drew = rect.map(|r| { let mut any = false; if r.2 <= row.len() { compose_row(&mut row, r, BORDER + (ITEM_H - CELL_H) / 2 + CELL_H / 2); any = row[BORDER + PADX..r.2 - BORDER].iter().any(|&c| c != theme::CHROME_FACE); } any }).unwrap_or(false);
+        let drew = rect.map(|r| { let mut any = false; if r.2 <= row.len() { compose_row(&mut row, r, BORDER + (ITEM_H() - CELL_H()) / 2 + CELL_H() / 2); any = row[BORDER + PADX()..r.2 - BORDER].iter().any(|&c| c != theme::CHROME_FACE); } any }).unwrap_or(false);
         ok = ok && OPEN.load(Ordering::Relaxed) && super::powerui::panel_open() && rect.is_some() && drew;
         dismiss("fixture");
         ok = ok && !OPEN.load(Ordering::Relaxed) && !super::powerui::panel_open();

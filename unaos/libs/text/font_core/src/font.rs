@@ -8,6 +8,7 @@ use crate::layout::{Gdef, Gpos, Gsub, Kern};
 use crate::path::{OutlineSink, Path};
 use crate::reader::{i16_at, slice, u16_at, u32_at};
 use alloc::string::String;
+use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -241,6 +242,24 @@ impl<'a> Font<'a> {
             return st.glyph(0xF000 | cp).unwrap_or(0);
         }
         0
+    }
+
+    /// Every (code point, glyph) pair of the Unicode cmap, sorted by code point (empty when the face has no
+    /// Unicode cmap). The auto-hinter assigns glyphs to scripts from it.
+    pub fn unicode_map(&self) -> Vec<(u32, u16)> {
+        let mut v = Vec::new();
+        if let Some(st) = self.best_cmap {
+            if st.platform_id == 0 || (st.platform_id == 3 && (st.encoding_id == 1 || st.encoding_id == 10)) {
+                st.for_each(|cp, g| {
+                    if g != 0 {
+                        v.push((cp, g))
+                    }
+                });
+            }
+        }
+        v.sort_unstable();
+        v.dedup_by_key(|e| e.0);
+        v
     }
 
     /// Advance width in font units.

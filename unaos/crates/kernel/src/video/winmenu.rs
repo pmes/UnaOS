@@ -648,7 +648,7 @@ pub fn is_open() -> bool {
 /// The gap either side of a title's label inside its press/paint box. Half the kit's
 /// [`strip::PAD`]: a bar title is a dense target sitting shoulder to shoulder with its neighbours,
 /// where the kit's full gap is the spacing between unrelated things.
-const TPAD: usize = strip::PAD / 2;
+#[allow(non_snake_case)] #[inline] fn TPAD() -> usize { strip::PAD() / 2 }
 
 /// SO2 — **the type this file draws in, taken from the BAR.**
 ///
@@ -660,8 +660,8 @@ const TPAD: usize = strip::PAD / 2;
 /// menu item font"*. Sourced from the bar now, weight included, so a client of the bar draws the
 /// BAR'S text by construction; the file's foot asserts the cell still matches the dropdown's row
 /// metrics, which are imported from `crystal` and are what [`ITEM_H`] is built on.
-const CELL_W: usize = menubar::BAR_CELL_W;
-const CELL_H: usize = menubar::BAR_CELL_H;
+#[allow(non_snake_case)] #[inline] fn CELL_W() -> usize { menubar::BAR_CELL_W() }
+#[allow(non_snake_case)] #[inline] fn CELL_H() -> usize { menubar::BAR_CELL_H() }
 const FACE: super::text::Face = menubar::BAR_FACE;
 /// SO2 — the bar's weight, for the titles AND the drop-down's rows. See [`CELL_W`].
 const BOLD: bool = menubar::BAR_BOLD;
@@ -760,7 +760,7 @@ impl BarSnapshot {
     /// the word the operator pressed, so the word's first pixel column is the anchor.
     #[inline]
     fn text_x(&self, k: usize) -> usize {
-        self.x[k] + TPAD
+        self.x[k] + TPAD()
     }
 
     /// The label of box `k`, as bytes.
@@ -892,8 +892,8 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
     // the glyphs it frames come from one fact.
     let (name, name_len) = app_name();
     if app_owner != wm::WIN_NONE && name_len > 0 {
-        let x0 = (bx + menubar::caption_x0()).saturating_sub(TPAD);
-        let w = name_len * CELL_W + 2 * TPAD;
+        let x0 = (bx + menubar::caption_x0()).saturating_sub(TPAD());
+        let w = name_len * CELL_W() + 2 * TPAD();
         if x0 + w <= limit && x0 + w <= bx + bw {
             s.x[0] = x0;
             s.w[0] = w;
@@ -934,11 +934,11 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
         let mut x = if s.app {
             s.x[0] + s.w[0]
         } else {
-            (bx + menubar::menus_x0()).saturating_sub(TPAD)
+            (bx + menubar::menus_x0()).saturating_sub(TPAD())
         };
         for t in tree.titles.iter().take(MENU_TITLES_MAX) {
             let l = t.label.as_bytes();
-            let w = l.len() * CELL_W + 2 * TPAD;
+            let w = l.len() * CELL_W() + 2 * TPAD();
             if x + w > limit || x + w > bx + bw {
                 break; // no room before the clock: decline this title and every one after it
             }
@@ -954,8 +954,8 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
     // WINDOWLIST — the Window menu is the LAST box: after the app name (and any tenant titles) whenever a window is
     // named on the bar, or while Show Desktop holds every window down (the way back must stay reachable).
     if (s.app || super::winlist::desktop_hidden()) && s.n < BAR_BOXES_MAX {
-        let w = super::winlist::LABEL.len() * CELL_W + 2 * TPAD;
-        let x = if s.n > 0 { s.x[s.n - 1] + s.w[s.n - 1] } else { (bx + menubar::menus_x0()).saturating_sub(TPAD) };
+        let w = super::winlist::LABEL.len() * CELL_W() + 2 * TPAD();
+        let x = if s.n > 0 { s.x[s.n - 1] + s.w[s.n - 1] } else { (bx + menubar::menus_x0()).saturating_sub(TPAD()) };
         if x + w <= limit && x + w <= bx + bw {
             let k = s.n;
             s.x[k] = x;
@@ -991,9 +991,9 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
 /// of "how tall is a menu row" is two things that can drift, and they would drift SILENTLY — the only
 /// symptom is a pick landing one row off.
 const BORDER: usize = crystal::DROP_BORDER;
-const ITEM_H: usize = crystal::DROP_ITEM_H;
-const SEP_H: usize = crystal::DROP_SEP_H;
-const PADX: usize = crystal::DROP_PADX;
+#[allow(non_snake_case)] #[inline] fn ITEM_H() -> usize { crystal::DROP_ITEM_H() }
+#[allow(non_snake_case)] #[inline] fn SEP_H() -> usize { crystal::DROP_SEP_H() }
+#[allow(non_snake_case)] #[inline] fn PADX() -> usize { crystal::DROP_PADX() }
 
 /// The check column, in glyphs: a mark and a space. Reserved on every row so the labels of a menu
 /// with one marked item still line up with each other.
@@ -1032,16 +1032,16 @@ fn drop_extent(items: &[MenuItem], name_len: usize) -> (usize, usize) {
     let mut h = 2 * BORDER;
     for it in items.iter() {
         if it.flags & FLAG_SEPARATOR != 0 {
-            h += SEP_H;
+            h += SEP_H();
             continue;
         }
-        h += ITEM_H;
+        h += ITEM_H();
         let g = item_glyphs(it, name_len);
         if g > widest {
             widest = g;
         }
     }
-    let w = 2 * BORDER + 2 * PADX + (widest + CHECK_GLYPHS) * CELL_W;
+    let w = 2 * BORDER + 2 * PADX() + (widest + CHECK_GLYPHS) * CELL_W();
     (w, h)
 }
 
@@ -1098,7 +1098,7 @@ fn menu_of(s: &BarSnapshot, k: usize, site: &str) -> Menu {
 fn item_top(items: &[MenuItem], i: usize) -> usize {
     let mut y = BORDER;
     for it in items.iter().take(i) {
-        y += if it.flags & FLAG_SEPARATOR != 0 { SEP_H } else { ITEM_H };
+        y += if it.flags & FLAG_SEPARATOR != 0 { SEP_H() } else { ITEM_H() };
     }
     y
 }
@@ -1110,7 +1110,7 @@ fn item_at_row(items: &[MenuItem], ly: usize, mh: usize) -> Option<usize> {
     }
     for i in 0..items.len() {
         let top = item_top(items, i);
-        let h = if items[i].flags & FLAG_SEPARATOR != 0 { SEP_H } else { ITEM_H };
+        let h = if items[i].flags & FLAG_SEPARATOR != 0 { SEP_H() } else { ITEM_H() };
         if ly >= top && ly < top + h {
             return Some(i);
         }
@@ -1201,7 +1201,7 @@ fn republish_open_rect(pw: usize, ph: usize, s: &BarSnapshot) -> Option<strip::R
 // ---------------------------------------------------------------------------
 
 /// Drop title `k` (0-based) of the bar owner's tree.
-fn open_title(k: usize, s: &BarSnapshot) {
+fn open_title(k: usize, s: &BarSnapshot) { crate::video::lag::menu_opened(); // GLASSLAG M1 (B370)
     let is_app = s.is_app_box(k);
     let is_win = s.is_win_box(k); // WINDOWLIST — rows are rebuilt from the live table at every open
     if is_win {
@@ -1526,7 +1526,7 @@ pub fn draw_bar_row(out: &mut [u32], w: usize, s: &BarSnapshot, j: usize, ty0: u
                 out[i] = theme::ACCENT;
             }
         }
-        if j < ty0 || j >= ty0 + CELL_H {
+        if j < ty0 || j >= ty0 + CELL_H() {
             continue;
         }
         // SO3 — box 0 is the APP MENU, and its glyphs are the BAR'S caption: `menubar::compose_row`
@@ -1539,7 +1539,7 @@ pub fn draw_bar_row(out: &mut [u32], w: usize, s: &BarSnapshot, j: usize, ty0: u
         }
         let ink = if open { theme::BEVEL_LIGHT } else { theme::TITLE_TEXT_ACTIVE };
         // SO2 — the BAR'S weight. See [`BOLD`].
-        super::text::draw_row(out, w, s.label_of(k), x0 + TPAD, j - ty0, ink, BOLD, FACE);
+        super::text::draw_row(out, w, s.label_of(k), x0 + TPAD(), j - ty0, ink, BOLD, FACE);
     }
 }
 
@@ -1718,16 +1718,16 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     let it = items[idx];
     let top = item_top(items, idx);
     if it.flags & FLAG_SEPARATOR != 0 {
-        if j == top + SEP_H / 2 {
-            for i in (BORDER + PADX)..(w - BORDER - PADX) {
+        if j == top + SEP_H() / 2 {
+            for i in (BORDER + PADX())..(w - BORDER - PADX()) {
                 out[i] = theme::FRAME_LINE;
             }
         }
         return;
     }
-    let vpad = (ITEM_H - CELL_H) / 2;
+    let vpad = (ITEM_H() - CELL_H()) / 2;
     let gtop = top + vpad;
-    if j < gtop || j >= gtop + CELL_H {
+    if j < gtop || j >= gtop + CELL_H() {
         return;
     }
     let sy = j - gtop;
@@ -1739,9 +1739,9 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     // SO2 — every glyph on this surface is now drawn at the BAR'S weight, the check mark included:
     // the drop-down is the bar's own text hanging below the bar, not a second typeface.
     if it.flags & FLAG_CHECKED != 0 {
-        super::text::draw_row(out, w, CHECK_MARK, BORDER + PADX, sy, ink, BOLD, FACE);
+        super::text::draw_row(out, w, CHECK_MARK, BORDER + PADX(), sy, ink, BOLD, FACE);
     }
-    let lx = BORDER + PADX + CHECK_GLYPHS * CELL_W;
+    let lx = BORDER + PADX() + CHECK_GLYPHS * CELL_W();
     super::text::draw_row(out, w, it.label.as_bytes(), lx, sy, ink, BOLD, FACE);
     // SO3 — `About <app>`. The suffix is composed HERE, at paint time, from the caption the bar
     // published, because a `MenuItem`'s label is `&'static str` and the registry allocates nothing.
@@ -1751,7 +1751,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     }
     // SHORTCUTS M3 — the row's chord, right-aligned inside the padding.
     if let Some(c) = item_chord(&it) {
-        let cx = w.saturating_sub(BORDER + PADX + super::text::advance(c.as_bytes(), BOLD, FACE)); // KERNELFONT: right-aligned by the shaped width
+        let cx = w.saturating_sub(BORDER + PADX() + super::text::advance(c.as_bytes(), BOLD, FACE)); // KERNELFONT: right-aligned by the shaped width
         super::text::draw_row(out, w, c.as_bytes(), cx, sy, theme::TITLE_TEXT_INACTIVE, BOLD, FACE);
     }
 }
@@ -1992,7 +1992,7 @@ pub fn selftest() {
     let _ = strip::press_route(px, py);
     let leg_quit = match (is_open(), open_rect(pw, ph)) {
         (true, Some((mx, my, mw, _mh))) => {
-            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H / 2;
+            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H() / 2;
             let consumed = strip::press_route((mx + mw / 2) as i32, qy as i32);
             consumed && !is_open() && wm::info(win).is_none()
         }
@@ -2103,7 +2103,7 @@ pub fn selftest() {
 // Compile-time sanity
 // ---------------------------------------------------------------------------
 
-const _: () = {
+#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
     // A registry with no slots would be a registry that refuses every publisher.
     assert!(WINMENU_MAX >= 1);
     // The bar cannot lay out more titles than the snapshot can carry.
@@ -2112,15 +2112,15 @@ const _: () = {
     assert!(MENU_LABEL_MAX >= 1 && MENU_ITEMS_MAX >= 1 && MENU_DEPTH_MAX == 2);
     // The row must clear the glyph it centres, or a label is cut — the crystal's own assert, on the
     // metrics this file imported from it, so an import that ever stops agreeing fails the BUILD.
-    assert!(ITEM_H >= CELL_H && (ITEM_H - CELL_H) % 2 == 0);
-    assert!(SEP_H >= 3);
+    assert!(ITEM_H() >= CELL_H() && (ITEM_H() - CELL_H()) % 2 == 0);
+    assert!(SEP_H() >= 3);
     // A title box must be wider than its own padding.
-    assert!(TPAD * 2 < CELL_W * MENU_LABEL_MAX);
+    assert!(TPAD() * 2 < CELL_W() * MENU_LABEL_MAX);
     // SO2 — the cell now comes from the BAR and the row metrics still come from the crystal
     // dropdown, so the two sources must agree or `ITEM_H`'s clearance assert above is testing one
     // face against another's rows. This is the assert that keeps the re-sourcing honest.
-    assert!(CELL_W == crystal::DROP_CELL_W);
-    assert!(CELL_H == crystal::DROP_CELL_H);
+    assert!(CELL_W() == crystal::DROP_CELL_W());
+    assert!(CELL_H() == crystal::DROP_CELL_H());
     // SO3 — the caption is carried in two `u64`s, so the window title must fit in sixteen bytes.
     assert!(wm::MAX_TITLE <= 16);
     // SO3 — the snapshot must hold the app box AND the tenant's full complement of titles.
@@ -2129,7 +2129,7 @@ const _: () = {
     assert!(APP_MENU_DEFAULT.len() <= MENU_ITEMS_MAX);
     // SO3 — `Quit` and `About` must be distinguishable, or `app_pick` cannot route.
     assert!(APP_ITEM_QUIT != APP_ITEM_ABOUT);
-};
+}
 
 // ---------------------------------------------------------------------------
 // PULSEQUIT — A30's gate (TAIL-APPENDED: nothing above this line moved)
@@ -2301,7 +2301,7 @@ pub fn pulsequit_selftest() {
         (true, Some((mx, my, mw, _mh))) => {
             // `Quit` is `APP_MENU_DEFAULT`'s index 2, its vertical middle, taken from the same
             // `item_top`/`ITEM_H` the painter and the hit-test use — leg 5's idiom.
-            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H / 2;
+            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H() / 2;
             let hit = strip::press_route((mx + mw / 2) as i32, qy as i32);
             let (_, c, sl) = pulsewin::close_census();
             (hit, sl, c)
@@ -2552,7 +2552,7 @@ fn deliver_quit(pw: usize, ph: usize, s: &BarSnapshot, w: wm::WinId, bar_named: 
         (true, Some((mx, my, mw, _mh))) => {
             // `Quit` is `APP_MENU_DEFAULT`'s index 2, its vertical middle, taken from the same
             // `item_top`/`ITEM_H` the painter and the hit-test use — leg 5's idiom.
-            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H / 2;
+            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H() / 2;
             strip::press_route((mx + mw / 2) as i32, qy as i32)
         }
         _ => false,
@@ -2843,10 +2843,10 @@ pub fn shotmenu_selftest() {
     // `draw_bar_row` so the two baselines cannot drift), and the row's band is `(ITEM_H - CELL_H) / 2`
     // past `item_top` (`compose_item_row`'s `vpad`/`gtop`).
     let bar_gx = title_x;
-    let bar_gy = by + (bh - CELL_H) / 2;
+    let bar_gy = by + (bh - CELL_H()) / 2;
     // `About` is 5 glyphs and the painter puts the name one cell past it.
-    let menu_gx = mx + BORDER + PADX + CHECK_GLYPHS * CELL_W + 6 * CELL_W;
-    let menu_gy = my + item_top(APP_MENU_DEFAULT, 0) + (ITEM_H - CELL_H) / 2;
+    let menu_gx = mx + BORDER + PADX() + CHECK_GLYPHS * CELL_W() + 6 * CELL_W();
+    let menu_gy = my + item_top(APP_MENU_DEFAULT, 0) + (ITEM_H() - CELL_H()) / 2;
 
     serial_println!(
         "[winmenu] drop x={} title_x={} y={} bar_h={} font={} -> {}",
@@ -2859,7 +2859,7 @@ pub fn shotmenu_selftest() {
     serial_println!(
         "[winmenu] shotmenu name=Glass cell={}x{} bar_glyph=({},{}) menu_glyph=({},{}) \
          drop={}x{}+{}+{} ::",
-        CELL_W, CELL_H, bar_gx, bar_gy, menu_gx, menu_gy, mw, mh, mx, my
+        CELL_W(), CELL_H(), bar_gx, bar_gy, menu_gx, menu_gy, mw, mh, mx, my
     );
     let ok = named && consumed && is_open() && r.is_some() && aligned;
     serial_println!(
@@ -2898,5 +2898,5 @@ pub fn wl_row_center(id: u32) -> Option<(i32, i32)> {
     let (mx, my, mw, _mh) = open_rect(0, 0)?;
     let items = super::winlist::rows();
     let i = items.iter().position(|it| it.id == id)?;
-    Some(((mx + mw / 2) as i32, (my + item_top(items, i) + ITEM_H / 2) as i32))
+    Some(((mx + mw / 2) as i32, (my + item_top(items, i) + ITEM_H() / 2) as i32))
 }

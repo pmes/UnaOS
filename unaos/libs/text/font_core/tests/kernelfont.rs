@@ -329,3 +329,67 @@ fn login_mock_vs_chromium_rasters() {
     eprintln!("KERNELFONT raster all: {tg} glyphs, within-8 {share:.1} %");
     assert!(share >= 90.0, "within-8 share {share:.1} % < 90 %");
 }
+
+// ── KERNELFONT2 (rmbp-ledger B363, R85) ─────────────────────────────────────────────────────────────────────────
+
+/// `video::dpi::s2_for` / `px_at` and `video::text::grid_cell` + `restyle`'s console arm, same arithmetic.
+fn s2_for(ppi: u32) -> u32 {
+    if ppi == 0 { 2 } else { ((ppi * 2 + 48) / 96).clamp(2, 8) }
+}
+fn px_at(n: usize, s2: u32) -> usize {
+    (n * s2 as usize + 1) / 2
+}
+
+#[test]
+fn kernelfont2_console_grid_follows_ppi_and_font_size() {
+    let Some(e) = engine(1 << 20) else { return eprintln!("SKIP: DejaVu not installed") };
+    assert_eq!((s2_for(0), s2_for(96), s2_for(120), s2_for(144), s2_for(221), s2_for(227), s2_for(500)), (2, 2, 3, 3, 5, 5, 8));
+    for (ppi, pw, ph, want_cell, want_grid) in [(221u32, 2880usize, 1800usize, (18, 40), (160, 45)), (227, 2560, 1600, (18, 40), (142, 40)), (227, 1440, 900, (18, 40), (80, 22)), (0, 1280, 800, (7, 16), (182, 50))] {
+        let s2 = s2_for(ppi);
+        let cell = (px_at(7, s2), px_at(16, s2));
+        assert_eq!(cell, want_cell, "@{ppi}");
+        assert_eq!((pw / cell.0, ph / cell.1), want_grid, "@{ppi} {pw}x{ph}");
+        let cap = e.fit_size(Role::Mono, Some(cell.0 as f32), cell.1 as f32).unwrap();
+        let mut sizes = Vec::new();
+        for css in [9.0f32, 11.0, 12.0, 13.0, 16.0] {
+            let got = device_px(css, ppi).min(cap).max(6.0);
+            sizes.push(got);
+        }
+        // font_size takes effect: strictly increasing until the cell caps it
+        assert!(sizes[0] < sizes[1] && sizes[1] < sizes[2], "@{ppi}: {sizes:?}");
+        eprintln!(
+            "KERNELFONT2 console @{ppi} ppi {pw}x{ph}: scale={}.{} cell={}x{} grid={}x{} cap={cap:.2} font_size 9/11/12/13/16 -> {:.2}/{:.2}/{:.2}/{:.2}/{:.2} px",
+            s2 / 2, if s2 % 2 == 1 { 5 } else { 0 }, cell.0, cell.1, pw / cell.0, ph / cell.1, sizes[0], sizes[1], sizes[2], sizes[3], sizes[4]
+        );
+    }
+    let s2 = s2_for(227);
+    let cap = e.fit_size(Role::Mono, Some(px_at(7, s2) as f32), px_at(16, s2) as f32).unwrap();
+    assert_eq!(cap, 29.75, "the 18x40 cell holds DejaVu Sans Mono at 29.75 px");
+}
+
+/// The four Noto script faces fonts-noto-core puts on the builder host parse, and through the kernel's stack
+/// (DejaVu first, the Noto faces as `Role::Script` fallbacks) every script draws real glyphs — DejaVu has no Thai
+/// or Devanagari, so `scripts_missing=none` is what makes those two legible on the desktop.
+#[test]
+fn kernelfont2_noto_script_faces_draw() {
+    let Some(mut e) = engine(1 << 20) else { return eprintln!("SKIP: DejaVu not installed") };
+    let dirs = ["/usr/share/fonts/truetype/noto", concat!(env!("CARGO_MANIFEST_DIR"), "/../../../target/fonts-noto")];
+    let mut n = 0;
+    for (f, name) in [("NotoSansArabic-Regular.ttf", "noto-arabic"), ("NotoSansHebrew-Regular.ttf", "noto-hebrew"), ("NotoSansDevanagari-Regular.ttf", "noto-devanagari"), ("NotoSansThai-Regular.ttf", "noto-thai")] {
+        let Some(d) = dirs.iter().find_map(|d| std::fs::read(format!("{d}/{f}")).ok()) else { continue };
+        let d: &'static [u8] = Box::leak(d.into_boxed_slice());
+        e.add_face(name, Role::Script, false, Font::parse(d).expect(f));
+        n += 1;
+    }
+    if n == 0 {
+        return eprintln!("SKIP: fonts-noto-core not installed");
+    }
+    assert_eq!(n, 4, "a partial Noto set");
+    let st = Style { role: Role::Sans, bold: false, size: 30.0 };
+    for (label, text) in [("thai", "สวัสดี"), ("devanagari", "नमस्ते"), ("arabic", "مرحبا"), ("hebrew", "שלום")] {
+        let p = e.placed(text.as_bytes(), st);
+        let names: Vec<&str> = p.iter().map(|g| e.slots()[g.face as usize].name).collect();
+        assert!(!p.is_empty() && p.iter().all(|g| g.glyph != 0), "{label}: .notdef in {p:?}");
+        eprintln!("KERNELFONT2 script {label}: {} glyphs from {:?}", p.len(), { let mut v = names.clone(); v.dedup(); v });
+    }
+}

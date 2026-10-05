@@ -316,17 +316,17 @@ fn content_extent(pw: usize, ph: usize) -> Option<(usize, usize)> {
     // recursion (`ch` needs the metric, the metric needs `ch`) has a fixed point of scale 1 because
     // `ch` is a menu line plus `ncpu` three-cell rows and cannot approach `ui::SCALE_STEP`; the guard
     // below turns "cannot" into a decline rather than a comment.
-    let m = crate::ui::Metrics::for_height(1);
+    let m = crate::ui::Metrics::panel(); // UIMETRICS (B372): a NATIVE window — the panel's dpi metrics, drawn at scale 1
     let ncpu = PSTRIP_MAX_CPUS.min(crate::arch::sched::meter_cpu_count()).max(1);
     let work_h = ph
         .saturating_sub(ui_status::top_chrome_h(pw, ph))
         .saturating_sub(ui_status::chrome_h(ph));
-    let cw = (pw * 2 / 3).min(pw.saturating_sub(2 * wm::BORDER));
+    let cw = (pw * 2 / 3).min(pw.saturating_sub(2 * wm::BORDER()));
     let ch = menu_h(&m) + 2 * pad(&m) + ncpu * row_target(&m);
     // The OUTER box has to fit the work area, chrome included, or the tiler would seat a window the
     // operator cannot reach the controls of. Decline rather than squeeze — the strip constructors' rule.
-    let (ow, oh) = (cw + 2 * wm::BORDER, ch + wm::TITLE_H + 2 * wm::BORDER);
-    if cw < 2 * FLOOR_CELLS * m.cell_w || ow > pw || oh > work_h || ch >= crate::ui::SCALE_STEP {
+    let (ow, oh) = (cw + 2 * wm::BORDER(), ch + wm::TITLE_H() + 2 * wm::BORDER());
+    if cw < 2 * FLOOR_CELLS * m.cell_w || ow > pw || oh > work_h {
         return None;
     }
     Some((cw, ch))
@@ -395,7 +395,7 @@ impl GneissPal for SurfacePal {
         // SAFETY: as `draw_pixel`. Cached kernel RAM, never the write-only panel.
         Some(unsafe { core::ptr::read_volatile((self.base as *const u32).add(y * self.w + x)) })
     }
-    fn poll_event(&mut self) -> crate::pal::Event {
+    fn metrics(&self) -> crate::ui::Metrics { crate::ui::Metrics::panel() } fn poll_event(&mut self) -> crate::pal::Event { // UIMETRICS (B372): a NATIVE window (never magnified), so its metrics are the panel's dpi ones — the same `m` `content_extent` sized the surface with
         crate::pal::Event::None // the window has no event source of its own; presses arrive routed
     }
     fn render(&mut self) {} // the present is `wm`'s and is issued explicitly by `paint`
@@ -463,7 +463,7 @@ pub fn open() -> wm::WinId {
     // SPAWN-PLACE — the outer box is centred in the WORK AREA and the row is created THERE, pinned, so
     // no pixel of this window is ever presented at a position it will not occupy. `fbcon`'s console
     // window learned this on the metal; there is no reason to relearn it.
-    let (_scale, ow, oh) = match wm::spawn_geometry(cw, ch) {
+    let (_scale, ow, oh) = match wm::spawn_geometry_native(cw, ch) {
         Some(g) => g,
         None => {
             serial_println!("[pulsewin] open DECLINE reason=geometry-unavailable");
@@ -500,7 +500,7 @@ pub fn open() -> wm::WinId {
     SURF_LEN.store(len, Ordering::Relaxed);
     SURF_W.store(cw, Ordering::Relaxed);
     SURF_H.store(ch, Ordering::Relaxed);
-    let id = wm::create_at(
+    let id = wm::create_at_native(
         OWNER,
         base,
         len,
@@ -508,8 +508,8 @@ pub fn open() -> wm::WinId {
         ch as u32,
         stride as u32,
         b"Pulse",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         SURF.store(0, Ordering::Release);
@@ -948,7 +948,7 @@ pub fn is_open() -> bool {
 /// on a panel too short to seat it below; it can only raise `oy`, never make it negative.
 fn place(pw: usize, ph: usize, ow: usize, oh: usize) -> (usize, usize) {
     let wtop = ui_status::top_chrome_h(pw, ph);
-    let gap = wm::BORDER * 2;
+    let gap = wm::BORDER() * 2;
     let ox = gap.min(pw.saturating_sub(ow));
     let oy = ph
         .saturating_sub(ui_status::chrome_h(ph))
@@ -984,7 +984,7 @@ pub fn boot_box(pw: usize, ph: usize) -> Option<(usize, usize, usize, usize)> {
         return None;
     }
     let (cw, ch) = content_extent(pw, ph)?;
-    let (_scale, ow, oh) = wm::spawn_geometry(cw, ch)?;
+    let (_scale, ow, oh) = wm::spawn_geometry_native(cw, ch)?;
     let (ox, oy) = place(pw, ph, ow, oh);
     Some((ox, oy, ow, oh))
 }
@@ -997,5 +997,5 @@ pub fn boot_box(pw: usize, ph: usize) -> Option<(usize, usize, usize, usize)> {
 /// just clear each other are separated by the desktop's own gutter and not by a hairline.
 pub fn boot_keepout_top(pw: usize, ph: usize) -> Option<usize> {
     let (_ox, oy, _ow, _oh) = boot_box(pw, ph)?;
-    Some(oy.saturating_sub(wm::BORDER * 2))
+    Some(oy.saturating_sub(wm::BORDER() * 2))
 }

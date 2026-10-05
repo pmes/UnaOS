@@ -65,15 +65,16 @@ const CELL_H: usize = font::CELL_H;
 /// prose sized by how much of it must fit, not a piece of furniture sized by the theme's bar.
 const FACE: super::text::Face = super::text::Face::Body;
 
-#[repr(align(64))]
-struct Surf([u32; W * H]);
+/// UIMETRICS (B372): the dialog is a NATIVE window — `W x H` (and every coordinate the painter writes, the theme's
+/// `ui::base` lengths among them) is LOGICAL px; the surface is that at the panel's dpi scale, allocated once.
+static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// SAFETY: written only from `repaint`, which runs on the BSP main loop (the
 /// same thread that calls `consume_key`), and read by `wm`'s composite. The
 /// window is created after the first full paint; later paints are racy against
 /// a composite read only in the benign present-tear sense every app surface
 /// shares (`wm` copies rows; a mid-paint read shows a mixed frame, corrected by
 /// the follow-up present).
-static mut SURF: Surf = Surf([0; W * H]);
+fn surf() -> &'static mut [u32] { let n = super::metrics::size(W) * super::metrics::size(H); let mut p = SURF_AT.load(Ordering::Acquire); if p == 0 { let b: &'static mut [u32] = alloc::boxed::Box::leak(alloc::vec![0u32; n].into_boxed_slice()); p = match SURF_AT.compare_exchange(0, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire) { Ok(_) => b.as_mut_ptr() as usize, Err(won) => won }; } unsafe { core::slice::from_raw_parts_mut(p as *mut u32, n) } }
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -379,12 +380,9 @@ fn step_part(cur: usize, dir: isize) -> usize {
 // ---------------------------------------------------------------- painting --
 
 fn fill(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
-    for row in y..(y + h).min(H) {
-        let base = row * W;
-        for col in x..(x + w).min(W) {
-            px[base + col] = c;
-        }
-    }
+    // UIMETRICS (B372): LOGICAL rect, clipped to the logical W x H, onto the physical surface.
+    let (w, h) = (w.min(W.saturating_sub(x)), h.min(H.saturating_sub(y)));
+    super::metrics::fill(px, super::metrics::size(W), x, y, w, h, c);
 }
 
 /// One-pixel-line rectangle outline (the theme's FRAME_LINE weight is drawn by
@@ -403,7 +401,7 @@ fn bevel(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, raised: bool) {
     } else {
         (theme::BEVEL_SHADOW, theme::BEVEL_LIGHT)
     };
-    for i in 0..theme::BEVEL {
+    for i in 0..crate::ui::base::BEVEL {
         fill(px, x + i, y + i, w - 2 * i, 1, lt);
         fill(px, x + i, y + i, 1, h - 2 * i, lt);
         fill(px, x + i, y + h - 1 - i, w - 2 * i, 1, rb);
@@ -420,7 +418,7 @@ fn bevel(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, raised: bool) {
 /// surface and any other that adopts the seam truncate identically.
 fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
     let n = s.iter().position(|&c| c == b'\n').unwrap_or(s.len());
-    super::text::draw_text(px, W, W, H, x, y, &s[..n], fg, false, FACE);
+    super::metrics::text(px, super::metrics::size(W), super::metrics::size(H), W, x, y, &s[..n], fg, false, FACE); // UIMETRICS: logical origin, the dpi-sized grid face
 }
 
 /// Format a byte count as whole gibibytes/mebibytes into `buf`, returning the slice.
@@ -444,7 +442,7 @@ fn fmt_size(buf: &mut [u8; 16], bytes: u64) -> &[u8] {
 }
 
 fn button(px: &mut [u32], x: usize, y: usize, w: usize, label: &[u8], primary: bool) {
-    let h = theme::BUTTON_HEIGHT + 6;
+    let h = crate::ui::base::BUTTON_HEIGHT + 6;
     fill(px, x, y, w, h, if primary { theme::BUTTON_FACE } else { theme::CHROME_FACE });
     bevel(px, x, y, w, h, true);
     let tx = x + (w.saturating_sub(label.len() * CELL_W)) / 2;
@@ -457,7 +455,7 @@ fn button(px: &mut [u32], x: usize, y: usize, w: usize, label: &[u8], primary: b
 fn repaint() {
     let st = *STATE.lock();
     // SAFETY: see `SURF`.
-    let px = unsafe { &mut (*core::ptr::addr_of_mut!(SURF)).0 };
+    let px = surf();
 
     // Chrome-adjacent frame: wm draws the real title strip; inside, the CRISPY
     // content well — sunken bevel around the content surface.
@@ -473,10 +471,10 @@ fn repaint() {
     super::paper::fill_rect(
         px,
         W,
-        4 + theme::BEVEL,
-        4 + theme::BEVEL,
-        W - 8 - 2 * theme::BEVEL,
-        H - 8 - 2 * theme::BEVEL,
+        4 + crate::ui::base::BEVEL,
+        4 + crate::ui::base::BEVEL,
+        W - 8 - 2 * crate::ui::base::BEVEL,
+        H - 8 - 2 * crate::ui::base::BEVEL,
     );
 
     let lx = 24; #[cfg(feature = "ahciroot")] if install3::paint(px) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } if st == State::Choose && plan_view_paint(px, lx) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } // SELFINSTALL2 M3: the SSD plan view (key `i`), see the file tail
@@ -747,7 +745,7 @@ pub fn open() {
         SEL.store(first_selectable(&devs, n).unwrap_or(0) as u8, Ordering::Relaxed);
     }
     repaint(); // full first paint BEFORE the window names the surface
-    let (_s, ow, oh) = match wm::spawn_geometry(W, H) {
+    let (_s, ow, oh) = match wm::spawn_geometry_native(super::metrics::size(W), super::metrics::size(H)) {
         Some(g) => g,
         None => {
             crate::census_println!("[wc-x] instgui DECLINE reason=geometry-unavailable");
@@ -762,17 +760,18 @@ pub fn open() {
     };
     let ox = (pw.saturating_sub(ow)) / 2;
     let oy = (ph.saturating_sub(oh)) / 3; // upper-third center: reads as a dialog
-    let surf = core::ptr::addr_of_mut!(SURF) as usize;
-    let id = wm::create_at(
+    let (sw, sh) = (super::metrics::size(W), super::metrics::size(H));
+    let surf = surf().as_mut_ptr() as usize;
+    let id = wm::create_at_native(
         0,
         surf,
-        W * H * 4,
-        W as u32,
-        H as u32,
-        (W * 4) as u32,
+        sw * sh * 4,
+        sw as u32,
+        sh as u32,
+        (sw * 4) as u32,
         b"Install UnaOS",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[wc-x] instgui DECLINE reason=create-failed");
@@ -1229,3 +1228,10 @@ fn plan_view_paint(px: &mut [u32], lx: usize) -> bool {
 #[cfg(feature = "ahciroot")]
 #[path = "install3.rs"]
 pub mod install3;
+
+/// KERNELFONT2 (B363) M4: the faces loaded or were restyled — repaint the open installer window once.
+pub fn font_repaint() {
+    if is_open() {
+        repaint();
+    }
+}

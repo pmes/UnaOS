@@ -2274,10 +2274,10 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 /// BOOTSLOW — `probe()` once, from a device-service pass, after the root pass's verdict.
 pub fn probe_after_root() {
     #[cfg(feature = "hda-tone")] play::service(); static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); // PLAYWAV (R75): the stream's refill tick (idle = one atomic load), LINE-NEUTRAL fold
-    if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || { #[cfg(feature = "login")] { !crate::fs::users::desktop_allowed() } #[cfg(not(feature = "login"))] { false } } { // FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
+    if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || !crate::boot::services_gate("hda") { // FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
         return;
     }
-    if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+    crate::boot::note_start("hda"); if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
         return;
     }
     serial_println!(

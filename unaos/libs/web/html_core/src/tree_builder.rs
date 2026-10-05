@@ -304,6 +304,21 @@ pub struct TreeBuilder {
     selectedness: BTreeSet<NodeId>,
     /// `option` → cached nearest ancestor `select`.
     option_select: BTreeMap<NodeId, NodeId>,
+    /// Set when a `</script>` end tag popped an HTML `script` element in the "text" insertion mode
+    /// (§13.2.6.4.8): the element a scripting embedding must now prepare. The driver takes it.
+    pub script_ready: Option<NodeId>,
+}
+
+/// What one [`TreeBuilder::step_token`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// A token was processed.
+    Token,
+    /// The end of the input was processed (the stack of open elements is still intact; call
+    /// [`TreeBuilder::finish`]).
+    Eof,
+    /// The tokenizer reached the given input limit (a `document.write` insertion point) mid-stream.
+    Suspended,
 }
 
 impl TreeBuilder {
@@ -328,6 +343,7 @@ impl TreeBuilder {
             tokenizer_state: None,
             selectedness: BTreeSet::new(),
             option_select: BTreeMap::new(),
+            script_ready: None,
         }
     }
 
@@ -374,18 +390,33 @@ impl TreeBuilder {
 
     /// Feed every token of `tz` through the tree builder until EOF.
     pub fn run(&mut self, tz: &mut Tokenizer) {
-        loop {
-            tz.allow_cdata = self.adjusted_current().is_some_and(|n| self.ns(n) != Namespace::Html);
-            let tok = tz.next_token();
-            let eof = tok == Token::Eof;
-            self.process_token(tok);
-            if let Some(s) = self.tokenizer_state.take() {
-                tz.state = s;
-            }
-            if eof {
-                break;
-            }
+        while self.step_token(tz, None) != Step::Eof {}
+        self.finish();
+    }
+
+    /// One turn of the tree-construction driver: take the next token (stopping short of input
+    /// position `limit`, when given — the end of a `document.write` insertion), process it, and apply
+    /// any tokenizer state switch it requested. An embedding that runs scripts drives the parse with
+    /// this and checks [`TreeBuilder::script_ready`] after each token.
+    pub fn step_token(&mut self, tz: &mut Tokenizer, limit: Option<usize>) -> Step {
+        tz.allow_cdata = self.adjusted_current().is_some_and(|n| self.ns(n) != Namespace::Html);
+        let tok = match limit {
+            Some(l) => match tz.next_token_until(l) {
+                Some(t) => t,
+                None => return Step::Suspended,
+            },
+            None => tz.next_token(),
+        };
+        let eof = tok == Token::Eof;
+        self.process_token(tok);
+        if let Some(s) = self.tokenizer_state.take() {
+            tz.state = s;
         }
+        if eof { Step::Eof } else { Step::Token }
+    }
+
+    /// §13.2.7 "the end", step 3: pop all the nodes off the stack of open elements.
+    pub fn finish(&mut self) {
         while self.pop().is_some() {}
     }
 
@@ -1949,9 +1980,16 @@ impl TreeBuilder {
                 self.mode = self.orig_mode;
                 Res::Reprocess(Token::Eof)
             }
-            Token::EndTag(_) => {
+            Token::EndTag(t) => {
+                let cur = self.current();
                 self.pop();
                 self.mode = self.orig_mode;
+                // §13.2.6.4.8 "An end tag whose tag name is script": the script element is popped and the
+                // parser hands it to the embedding to *prepare* (HTML §4.12.1.1) — the point where a
+                // scripting host runs (or schedules) it. A parser without a host never reads this.
+                if t.name == "script" && self.is_html(cur, "script") {
+                    self.script_ready = Some(cur);
+                }
                 Res::Done
             }
             _ => Res::Done,

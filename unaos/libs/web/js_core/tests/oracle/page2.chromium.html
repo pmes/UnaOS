@@ -1,0 +1,42 @@
+<html><head><meta charset="utf-8"><title>js_core oracle 2: DOM building</title></head><body><div id="app" class="root"><p id="intro">Items: 3</p><p id="summary">{"even":2,"odd":1} first=1 last=alpha (3) children=3</p><ul id="list"><li data-n="1" class="even">beta &amp; &lt;gamma&gt; (1)</li><li data-n="2" class="odd">delta "quoted" (2)</li><li data-n="3" class="even">alpha (3)</li></ul><table><tr><td>1</td><td>2</td><td class="fizz">3</td><td>4</td></tr><tr><td>2</td><td>4</td><td class="fizz">6</td><td>8</td></tr><tr><td class="fizz">3</td><td class="fizz">6</td><td class="fizz">9</td><td class="fizz">12</td></tr></table></div><script>
+var app = document.getElementById("app");
+var list = document.createElement("ul");
+list.setAttribute("id", "list");
+var data = [{ name: "alpha", n: 3 }, { name: "beta & <gamma>", n: 1 }, { name: "delta \"quoted\"", n: 2 }];
+data.sort(function (a, b) { return a.n - b.n; });
+for (var i = 0; i < data.length; i++) {
+  var li = document.createElement("li");
+  li.setAttribute("data-n", String(data[i].n));
+  li.className = i % 2 ? "odd" : "even";
+  li.appendChild(document.createTextNode(data[i].name + " (" + data[i].n + ")"));
+  list.appendChild(li);
+}
+app.appendChild(list);
+var intro = document.getElementById("intro");
+intro.textContent = intro.textContent + " " + data.length;
+var table = document.createElement("table");
+for (var r = 1; r <= 3; r++) {
+  var tr = document.createElement("tr");
+  for (var c = 1; c <= 4; c++) {
+    var td = document.createElement("td");
+    td.textContent = String(r * c);
+    if ((r * c) % 3 === 0) td.setAttribute("class", "fizz");
+    tr.appendChild(td);
+  }
+  table.appendChild(tr);
+}
+app.appendChild(table);
+var counts = {};
+var lis = list.getElementsByTagName("li");
+for (var k = 0; k < lis.length; k++) { var cl = lis[k].className; counts[cl] = (counts[cl] || 0) + 1; }
+var summary = document.createElement("p");
+summary.setAttribute("id", "summary");
+summary.textContent = JSON.stringify(counts) + " first=" + list.firstChild.getAttribute("data-n") + " last=" + list.lastChild.textContent + " children=" + app.children.length;
+app.insertBefore(summary, list);
+var old = document.createElement("span"); old.textContent = "to remove"; app.appendChild(old); app.removeChild(old);
+var fizz = document.querySelectorAll(".fizz");
+var footer = document.createElement("footer");
+footer.textContent = "fizz cells: " + fizz.length + "; root class: " + document.querySelector("#app").className + "; tag: " + table.tagName + "; has list: " + (document.getElementById("list") === list);
+document.body.appendChild(footer);
+</script><footer>fizz cells: 6; root class: root; tag: TABLE; has list: true</footer>
+</body></html>

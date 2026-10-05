@@ -242,6 +242,21 @@ impl NodeRef {
         NodeRef { doc: self.doc.clone(), id }
     }
 
+    /// Another node of this node's arena, by id.
+    pub fn node_at(&self, id: NodeId) -> NodeRef {
+        self.at(id)
+    }
+
+    /// The arena this node lives in.
+    pub fn arena(&self) -> &Arena {
+        &self.doc
+    }
+
+    /// A handle on node `id` of `doc`.
+    pub fn from_arena(doc: Arena, id: NodeId) -> NodeRef {
+        NodeRef { doc, id }
+    }
+
     fn nav(&self, f: impl FnOnce(&Document) -> Option<NodeId>) -> Option<NodeRef> {
         let id = f(&self.doc.borrow());
         id.map(|i| self.at(i))
@@ -363,6 +378,32 @@ impl NodeRef {
     /// Children, in order (a snapshot: safe to mutate while iterating).
     pub fn children(&self) -> std::vec::IntoIter<NodeRef> {
         let ids: Vec<NodeId> = self.doc.borrow().children(self.id).collect();
+        self.snapshot(ids)
+    }
+
+    /// Siblings before `self`, nearest first (kuchiki's order; a snapshot).
+    pub fn preceding_siblings(&self) -> std::vec::IntoIter<NodeRef> {
+        let d = self.doc.borrow();
+        let mut ids = Vec::new();
+        let mut cur = d.prev_sibling(self.id);
+        while let Some(c) = cur {
+            ids.push(c);
+            cur = d.prev_sibling(c);
+        }
+        drop(d);
+        self.snapshot(ids)
+    }
+
+    /// Siblings after `self`, in order (a snapshot).
+    pub fn following_siblings(&self) -> std::vec::IntoIter<NodeRef> {
+        let d = self.doc.borrow();
+        let mut ids = Vec::new();
+        let mut cur = d.next_sibling(self.id);
+        while let Some(c) = cur {
+            ids.push(c);
+            cur = d.next_sibling(c);
+        }
+        drop(d);
         self.snapshot(ids)
     }
 
@@ -585,6 +626,60 @@ impl NodeRef {
 }
 
 /// Deep-copies `src`'s subtree at `id` into `dst` (template contents included); returns the copy.
+/// Deep-copies `src`'s subtree at `id` into `dst` WITHOUT recursion (tree depth is unbounded — a
+/// page's markup decides it), returning the detached copy. A Document root copies as a Document node
+/// when `keep_document` (a `DOMParser` result imported whole), else as a DocumentFragment.
+pub fn import_tree(dst: &mut Document, src: &Document, id: NodeId, keep_document: bool) -> NodeId {
+    fn copy_one(dst: &mut Document, src: &Document, id: NodeId, keep_document: bool) -> NodeId {
+        match src.data(id) {
+            html_core::NodeData::Element(e) => {
+                let c = dst.create_element(e.ns, &e.local, e.attrs.clone());
+                if let Some(el) = dst.element_mut(c) {
+                    el.html_integration_point = e.html_integration_point;
+                }
+                c
+            }
+            html_core::NodeData::Document if keep_document => dst.create(html_core::NodeData::Document),
+            html_core::NodeData::Document => dst.create(html_core::NodeData::DocumentFragment),
+            other => dst.create(other.clone()),
+        }
+    }
+    let root = copy_one(dst, src, id, keep_document);
+    // (source node, destination parent) work list; template contents ride along as their own roots.
+    let mut work: Vec<(NodeId, NodeId)> = Vec::new();
+    let push_children = |work: &mut Vec<(NodeId, NodeId)>, s: NodeId, d: NodeId| {
+        let kids: Vec<NodeId> = src.children(s).collect();
+        for k in kids.into_iter().rev() {
+            work.push((k, d));
+        }
+    };
+    let mut pending: Vec<(NodeId, NodeId)> = vec![(id, root)];
+    while let Some((s, d)) = pending.pop() {
+        if let (Some(st), Some(dt)) = (
+            src.element(s).and_then(|e| e.template_contents),
+            dst.element(d).and_then(|e| e.template_contents),
+        ) {
+            pending.push((st, dt));
+        }
+        push_children(&mut work, s, d);
+        while let Some((k, parent)) = work.pop() {
+            let c = copy_one(dst, src, k, false);
+            dst.append(parent, c);
+            if let (Some(st), Some(dt)) = (
+                src.element(k).and_then(|e| e.template_contents),
+                dst.element(c).and_then(|e| e.template_contents),
+            ) {
+                pending.push((st, dt));
+            }
+            let kids: Vec<NodeId> = src.children(k).collect();
+            for kk in kids.into_iter().rev() {
+                work.push((kk, c));
+            }
+        }
+    }
+    root
+}
+
 fn import_subtree(dst: &mut Document, src: &Document, id: NodeId) -> NodeId {
     let copy = match src.data(id) {
         html_core::NodeData::Element(e) => {

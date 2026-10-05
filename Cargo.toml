@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "libs/gneiss_pal",
     "libs/quartzite",
+    "libs/text_host", # QUARTZFONT (SR64): the host font stack on font_core, shared by Aether and quartzite
     "libs/elessar",
     "libs/resonance",
     "unaos/libs/fs/unafs",
@@ -12,6 +13,7 @@ members = [
     "unaos/libs/sys/midden_core",
     "unaos/libs/sys/prefs_core",
     "unaos/libs/sys/wifi_core",
+    "unaos/libs/sys/usbnet_core", # NETFRAME (B368): the USB Ethernet rx framing core the kernel driver and the host KATs share
     "unaos/libs/sys/vein_core",
     "unaos/libs/sys/diag_core",
     "unaos/libs/sys/amber_core",
@@ -19,7 +21,10 @@ members = [
     "unaos/libs/sys/crypto_core",
     # FONTCORE (SR48): the no_std font core (OpenType/TrueType/CFF, rasterizer, shaper, UAX #14).
     "unaos/libs/text/font_core",
+    "unaos/libs/web/js_core", # JSCORE (SR55): ECMAScript 2025 from the specification, no_std, zero deps
+
     "unaos/libs/sys/elf_core", # STORMFAULT (B351): the ring-3 ELF segment plan both loaders share
+    "unaos/libs/sys/ldso_core", # SELFBUILD6 (B360): the dynamic loader core the kernel shim and the host runner share
     # VEINTLS (SR36): the ring-3 Vein library joins the host workspace so its offline TLS + Messages test runs here.
     "unaos/libs/sys/vein_ring3",
     "unaos/libs/media/audio_core",

@@ -18,10 +18,13 @@
 //!
 //! ```text
 //!   ext + 0x1FF000           the args page (RO, never executable)        XL3[s][0] leaf 511
-//!   ext + 0x200000 .. +4 MiB  the ELF window (image, heap, guard, stack)   XL3[s][1..=2]
+//!   ext + 0x200000 .. +64 MiB the ELF window (image, heap, guard, stack)   heap L3s, L2[1..=32]
 //! ```
 //!
-//! One static L2 and three static L3s per slot (`.bss`); window frames come from the kernel heap
+//! One static L2 and one static L3 (the args page) per slot (`.bss`). WINDOW2 (B361): the window is
+//! 64 MiB = 32 L3s, so those are heap frames wired on first touch of their 2 MiB and freed by `slot_free`
+//! (static they would cost 8 x 32 x 4 KiB = 1 MiB of `.bss` on a Pi whose `.bss` has a hard ceiling at the
+//! hand-placed 32 MiB heap). Window frames come from the kernel heap
 //! (4 KiB-aligned `alloc_zeroed`, identity-mapped, the frames `linuxabi` and x86's XWIN use) and go back
 //! at the slot's LAST teardown (`slot_free`, called by both backends' `teardown_user_slot` after the
 //! ASID flush). The args page frame is static per slot.
@@ -46,8 +49,10 @@ const ARGS_OFF: usize = una_abi::USER_ARGS_OFF as usize;
 pub const XWIN_OFF: usize = una_abi::USER_XWIN_OFF as usize;
 pub const XWIN_BYTES: usize = una_abi::USER_WINDOW_BYTES as usize;
 const XWIN_PTS: usize = XWIN_BYTES / (512 * 4096);
-/// The largest program image a launcher may hand the loader (the window).
-pub const IMAGE_CAP: usize = XWIN_BYTES;
+/// The largest program image a launcher may hand the loader: the window, bounded by a quarter of the
+/// kernel heap (WINDOW2: the launcher reads the whole file into the heap and the window's frames come from
+/// it too, so on aarch64's 48 MiB heap the 64 MiB window's file cap is 12 MiB — the VA span stays 64 MiB).
+pub const IMAGE_CAP: usize = if XWIN_BYTES < crate::allocator::HEAP_SIZE / 4 { XWIN_BYTES } else { crate::allocator::HEAP_SIZE / 4 };
 const _: () = assert!(EXT_L1 < 512 && EXT_L1 != 480); // 480 is the Orin's classic window
 const _: () = assert!(ARGS_OFF / (512 * 4096) == 0 && XWIN_OFF % (512 * 4096) == 0);
 const _: () = assert!(XWIN_OFF / (512 * 4096) + XWIN_PTS < 512);
@@ -85,8 +90,10 @@ struct Table([u64; 512]);
 struct Page([u8; 4096]);
 
 static mut XL2: [Table; USER_SLOTS] = [const { Table([0; 512]) }; USER_SLOTS];
-/// `[s][0]` covers ext+0 .. ext+2 MiB (the args page); `[s][1..]` the ELF window.
-static mut XL3: [[Table; 1 + XWIN_PTS]; USER_SLOTS] = [const { [const { Table([0; 512]) }; 1 + XWIN_PTS] }; USER_SLOTS];
+/// Covers ext+0 .. ext+2 MiB (the args page). The ELF window's L3s are heap frames (WINDOW2).
+static mut XL3: [Table; USER_SLOTS] = [const { Table([0; 512]) }; USER_SLOTS];
+/// WINDOW2: window L3 frames (heap) wired across every slot right now.
+static L3_LIVE: AtomicU64 = AtomicU64::new(0);
 static mut ARGS: [Page; USER_SLOTS] = [const { Page([0; 4096]) }; USER_SLOTS];
 
 static PAGES: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
@@ -101,8 +108,18 @@ static SBRK_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 fn xl2(s: usize) -> *mut u64 {
     unsafe { (&raw mut XL2[s]).cast::<u64>() }
 }
-fn xl3(s: usize, i: usize) -> *mut u64 {
-    unsafe { (&raw mut XL3[s][i]).cast::<u64>() }
+/// The args-page L3 of slot `s`.
+fn xl3(s: usize) -> *mut u64 {
+    unsafe { (&raw mut XL3[s]).cast::<u64>() }
+}
+/// WINDOW2: the window L3 behind L2 index `i` of slot `s` (a heap frame, identity-addressed), or null.
+fn wl3(s: usize, i: usize) -> *mut u64 {
+    let e = unsafe { xl2(s).add(i).read_volatile() };
+    if e & 1 == 0 { core::ptr::null_mut() } else { (e & ADDR) as *mut u64 }
+}
+/// WINDOW2: window L3 frames held (all slots).
+pub fn l3_live() -> u64 {
+    L3_LIVE.load(Ordering::Acquire)
 }
 fn args_ptr(s: usize) -> *mut u8 {
     unsafe { (&raw mut ARGS[s]).cast::<u8>() }
@@ -155,11 +172,9 @@ pub fn slot_placed(s: usize, window_base: u64) -> bool {
     unsafe {
         slot_free(s); // a recycled slot holds nothing; this is the defensive reset
         core::ptr::write_bytes(xl2(s), 0, 512);
-        for i in 0..1 + XWIN_PTS {
-            core::ptr::write_bytes(xl3(s, i), 0, 512);
-        }
-        xl3(s, 0).add(ARGS_OFF >> 12).write_volatile(page_desc(args_ptr(s) as u64, false, false));
-        xl2(s).add(0).write_volatile(table_desc(xl3(s, 0) as u64));
+        core::ptr::write_bytes(xl3(s), 0, 512);
+        xl3(s).add(ARGS_OFF >> 12).write_volatile(page_desc(args_ptr(s) as u64, false, false));
+        xl2(s).add(0).write_volatile(table_desc(xl3(s) as u64));
         publish();
         l1.add(EXT_L1).write_volatile(mine);
     }
@@ -208,17 +223,22 @@ fn set_heap(s: usize, lo: u64, max: u64) {
     BRK[s].store(lo, Ordering::Release);
 }
 
-/// The leaf for ext offset `off` (inside the ELF window), wiring its L2 entry on first use.
+/// The leaf for ext offset `off` (inside the ELF window), wiring its L2 entry to a fresh zeroed heap L3 on
+/// first use (WINDOW2). Null = the heap has no frame for the table.
 unsafe fn leaf(s: usize, off: usize) -> *mut u64 {
     let i = off / (512 * 4096); // L2 index (1..=XWIN_PTS for the window)
-    let t = i - XWIN_OFF / (512 * 4096) + 1;
     unsafe {
         let l2e = xl2(s).add(i);
         if l2e.read_volatile() == 0 {
-            core::ptr::write_bytes(xl3(s, t), 0, 512);
-            l2e.write_volatile(table_desc(xl3(s, t) as u64));
+            let t = alloc_zeroed(Layout::from_size_align_unchecked(4096, 4096));
+            if t.is_null() {
+                return core::ptr::null_mut();
+            }
+            L3_LIVE.fetch_add(1, Ordering::AcqRel);
+            publish(); // the zeroed table is visible to the walker before the entry that names it
+            l2e.write_volatile(table_desc(t as u64));
         }
-        xl3(s, t).add((off >> 12) & 0x1FF)
+        wl3(s, i).add((off >> 12) & 0x1FF)
     }
 }
 fn in_window(off: usize) -> bool {
@@ -233,6 +253,9 @@ unsafe fn map_page(s: usize, off: usize, w: bool, x: bool) -> Result<(), ()> {
     }
     unsafe {
         let l = leaf(s, off);
+        if l.is_null() {
+            return Err(()); // WINDOW2: no heap frame for the L3
+        }
         let old = l.read_volatile();
         let (w, x, pa) = if old & 1 != 0 {
             let old_x = old & DESC_UXN == 0;
@@ -262,13 +285,11 @@ fn frame_ptr(s: usize, off: usize) -> Option<*mut u8> {
     if !in_window(off) {
         return None;
     }
-    let i = off / (512 * 4096);
-    let e = unsafe { xl2(s).add(i).read_volatile() };
-    if e == 0 {
+    let t = wl3(s, off / (512 * 4096));
+    if t.is_null() {
         return None;
     }
-    let t = i - XWIN_OFF / (512 * 4096) + 1;
-    let l = unsafe { xl3(s, t).add((off >> 12) & 0x1FF).read_volatile() };
+    let l = unsafe { t.add((off >> 12) & 0x1FF).read_volatile() };
     if l & 1 == 0 { None } else { Some((l & ADDR) as *mut u8) }
 }
 
@@ -285,12 +306,11 @@ fn copy_in(s: usize, off: usize, src: &[u8]) -> bool {
 }
 
 unsafe fn unmap_page(s: usize, off: usize, live: bool) {
-    let i = off / (512 * 4096);
-    if unsafe { xl2(s).add(i).read_volatile() } == 0 {
+    let t = wl3(s, off / (512 * 4096));
+    if t.is_null() {
         return;
     }
-    let t = i - XWIN_OFF / (512 * 4096) + 1;
-    let l = unsafe { xl3(s, t).add((off >> 12) & 0x1FF) };
+    let l = unsafe { t.add((off >> 12) & 0x1FF) };
     let e = unsafe { l.read_volatile() };
     if e & 1 == 0 {
         return;
@@ -318,7 +338,11 @@ pub unsafe fn slot_free(s: usize) {
         for l in 0..512 {
             unsafe { unmap_page(s, i * 512 * 4096 + l * 4096, false) };
         }
+        let t = wl3(s, i);
         unsafe { xl2(s).add(i).write_volatile(0) };
+        publish();
+        unsafe { dealloc(t as *mut u8, Layout::from_size_align_unchecked(4096, 4096)) }; // WINDOW2: the L3 is a heap frame
+        L3_LIVE.fetch_sub(1, Ordering::AcqRel);
     }
     if PLACED[s].swap(0, Ordering::AcqRel) != 0 {
         let l1 = slot_l1(s);
@@ -401,12 +425,11 @@ pub fn range_ok(va: u64, len: usize, write: bool) -> bool {
     let mut p = va & !0xFFF;
     while p < end {
         let off = (p - EXT_BASE) as usize;
-        let i = off / (512 * 4096);
-        if unsafe { xl2(s).add(i).read_volatile() } == 0 {
+        let t = wl3(s, off / (512 * 4096));
+        if t.is_null() {
             return false;
         }
-        let t = i - XWIN_OFF / (512 * 4096) + 1;
-        let e = unsafe { xl3(s, t).add((off >> 12) & 0x1FF).read_volatile() };
+        let e = unsafe { t.add((off >> 12) & 0x1FF).read_volatile() };
         if e & 1 == 0 || (write && e & AP_RO_ALL != AP_EL0) {
             return false;
         }
@@ -536,7 +559,7 @@ fn place(b: &[u8]) -> Result<(usize, u64, u64, u32), &'static str> {
     }
     if min_va < XWIN_OFF as u64 || max_end > limit {
         serial_println!(":: RING3ABI2: refused image span={} stack={} cap={} -ENOMEM ::", max_end.saturating_sub(min_va), stack, XWIN_BYTES);
-        return Err("image + stack exceed the 4 MiB ELF window (-ENOMEM)");
+        return Err("image + stack exceed the ELF window (USER_WINDOW_BYTES, -ENOMEM)");
     }
     if !entry_ok {
         return Err("entry not in an executable segment");
@@ -621,13 +644,14 @@ fn place(b: &[u8]) -> Result<(usize, u64, u64, u32), &'static str> {
 pub fn selftest_probe() -> Option<bool> {
     let s = super::uslots::alloc_user_slot()?;
     let live0 = live_pages();
+    let l3_0 = l3_live();
     let placed = slot_placed(s, super::uslots::user_region().0);
     let off = XWIN_OFF + XWIN_BYTES / 2;
     let mapped = placed && unsafe { map_page(s, off, true, false) }.is_ok();
     let rw = mapped && copy_in(s, off, b"RING3ABI2") && frame_ptr(s, off).is_some_and(|f| unsafe { core::slice::from_raw_parts(f, 9) } == b"RING3ABI2");
     unsafe { super::uslots::teardown_user_slot(asid_of(s)) };
-    let freed = live_pages() == live0;
-    serial_println!("[ring3abi] arm ext_l1={} placed={} mapped={} rw={} freed={}", EXT_L1, placed, mapped, rw, freed);
+    let freed = live_pages() == live0 && l3_live() == l3_0; // WINDOW2: the heap L3 goes back too
+    serial_println!("[ring3abi] arm ext_l1={} placed={} mapped={} rw={} freed={} l3_live={}", EXT_L1, placed, mapped, rw, freed, l3_live());
     Some(placed && mapped && rw && freed)
 }
 

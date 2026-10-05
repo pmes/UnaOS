@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>18 form controls</title></head>
+<body>
+<form id="f" action="/submit" method="POST">
+<input id="t" name="t" value="default">
+<input id="cb" type="checkbox" name="cb">
+<input id="r1" type="radio" name="grp" value="1" checked><input id="r2" type="radio" name="grp" value="2">
+<select id="s" name="s"><option value="a">A</option><option>B text</option><option value="c" selected>C</option></select>
+<textarea id="ta" name="ta">initial text</textarea>
+<button id="btn" type="bogus">go</button>
+<input id="weird" type="NoSuchType">
+</form>
+<ul id="log"></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var t = document.getElementById('t');
+t.value = 'typed\nvalue';
+log('input: ' + t.value + ' attr=' + t.getAttribute('value') + ' default=' + t.defaultValue);
+t.defaultValue = 'new default';
+log('after defaultValue set: ' + t.value + ' attr=' + t.getAttribute('value'));
+var cb = document.getElementById('cb');
+var changes = [];
+cb.addEventListener('change', function () { changes.push('change:' + cb.checked); });
+cb.addEventListener('input', function () { changes.push('input'); });
+cb.click();
+log('checkbox click: ' + cb.checked + ' attr=' + cb.hasAttribute('checked') + ' events=' + changes.join(','));
+cb.addEventListener('click', function (e) { e.preventDefault(); }, { once: true });
+cb.click();
+log('canceled click reverts: ' + cb.checked);
+var r2 = document.getElementById('r2');
+r2.checked = true;
+log('radio group: ' + document.getElementById('r1').checked + ' ' + r2.checked);
+var s = document.getElementById('s');
+log('select: ' + s.value + ' ' + s.selectedIndex + ' ' + s.options.length + ' ' + s.type + ' opt1 value=' + s.options[1].value + ' text=' + s.options[1].text);
+s.value = 'a';
+log('select set value: ' + s.selectedIndex + ' ' + s.options[0].selected + ' ' + s.options[2].selected);
+s.selectedIndex = 1;
+log('select set index: ' + s.value);
+var ta = document.getElementById('ta');
+ta.value = 'edited';
+log('textarea: ' + ta.value + ' default=' + ta.defaultValue + ' text=' + ta.textContent);
+log('button type: ' + document.getElementById('btn').type + ' input type: ' + document.getElementById('weird').type);
+var f = document.getElementById('f');
+log('form: ' + f.method + ' ' + f.action.split('/').pop() + ' elements=' + f.elements.length + ' ' + (t.form === f));
+t.disabled = true;
+log('disabled: ' + t.disabled + ' ' + t.getAttribute('disabled') + ' matches=' + t.matches(':disabled'));
+var o = new Option('opt text', 'optval', false, true);
+s.appendChild(o);
+log('Option ctor: ' + o.value + ' ' + o.text + ' ' + o.selected + ' ' + s.value);
+</script>
+</body></html>

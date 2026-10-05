@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>06 markup</title></head>
+<body>
+<div id="box">old</div>
+<table id="tbl"><tbody id="tb"></tbody></table>
+<div id="adj"><span id="mid">mid</span></div>
+<template id="tpl"><li class="row">templated <b>row</b></li></template>
+<ul id="from-template"></ul>
+<div id="outer"><p id="victim">victim</p></div>
+<ul id="log"></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var box = document.getElementById('box');
+box.innerHTML = '<p class="x">One &amp; <b>two</b></p><!-- c --><script>window.__ran = true;<\/script>text &lt;3';
+log('innerHTML get: ' + box.innerHTML);
+log('script via innerHTML ran: ' + (window.__ran === true) + ' children=' + box.childNodes.length);
+document.getElementById('tb').innerHTML = '<tr><td>1</td><td>2</td></tr><tr><td colspan="2">3</td></tr>';
+log('table context rows: ' + document.getElementById('tbl').rows + ' ' + document.querySelectorAll('#tb tr').length + ' ' + document.querySelectorAll('#tb td').length);
+var adj = document.getElementById('mid');
+adj.insertAdjacentHTML('beforebegin', '<i>bb</i>');
+adj.insertAdjacentHTML('afterbegin', '<i>ab</i>');
+adj.insertAdjacentHTML('beforeend', '<i>be</i>');
+adj.insertAdjacentHTML('afterend', '<i>ae</i>');
+log('adjacent: ' + document.getElementById('adj').innerHTML);
+adj.insertAdjacentText('afterend', ' <txt> ');
+adj.insertAdjacentElement('beforebegin', document.createElement('hr'));
+log('adjacent text/element: ' + document.getElementById('adj').innerHTML);
+var tpl = document.getElementById('tpl');
+log('template content: ' + tpl.content.nodeName + ' ' + tpl.content.childNodes.length + ' ' + tpl.childNodes.length + ' inner=' + tpl.innerHTML);
+for (var i = 0; i < 2; i++) document.getElementById('from-template').appendChild(document.importNode(tpl.content, true));
+log('instantiated: ' + document.querySelectorAll('#from-template .row').length);
+document.getElementById('victim').outerHTML = '<p id="new1">new one</p><p id="new2">new two</p>';
+log('outerHTML set: ' + document.getElementById('outer').innerHTML + ' victim gone=' + (document.getElementById('victim') === null));
+log('outerHTML get: ' + document.getElementById('new1').outerHTML);
+var e = null; try { document.documentElement.outerHTML = '<p>x</p>'; } catch (x) { e = x.name; }
+log('outerHTML on root: ' + e);
+var sel = document.createElement('select');
+sel.innerHTML = '<option>a</option><option selected>b</option>';
+log('select context: ' + sel.options.length + ' ' + sel.value);
+var div = document.createElement('div');
+div.innerHTML = '<svg><circle r="1"/><foreignObject><p>html in svg</p></foreignObject></svg>';
+log('foreign: ' + div.firstChild.namespaceURI + ' ' + div.querySelector('circle').namespaceURI + ' ' + div.querySelector('p').namespaceURI);
+log('serialize escapes: ' + (function () { var p = document.createElement('p'); p.setAttribute('title', 'a"b<c&d'); p.textContent = '<&> '; return p.outerHTML; })());
+</script>
+</body></html>

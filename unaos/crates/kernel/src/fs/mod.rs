@@ -172,3 +172,5 @@ pub mod bootstep;
 /// UNAFSGROW (B347): `tests unafsgrow` — the unafs crate's `UnaFS::grow` on a scratch image.
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 pub mod unafsgrow;
+/// VOLUMES (B366): the Volumes view (`/volumes/boot`, `/volumes/UnaOS`), `tests volumes`, `system/test-f` and `tests testf`.
+pub mod volumes;

@@ -1444,6 +1444,7 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     // `bind_root` is about. It also puts this mount after the home-soil loop above, which is what
     // lets its guard see a real card that already claimed the point.
     bind_data(mt, found.source, announce);
+    crate::fs::volumes::bind_aliases(mt, found.source, announce); // VOLUMES (B366) M2: /volumes/boot and /volumes/UnaOS
 }
 
 /// UNAFSROOT (orin 24): the ROOT DISK's three mounts, as a function of ONE fact — the

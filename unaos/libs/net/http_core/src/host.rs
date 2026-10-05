@@ -197,13 +197,54 @@ pub fn system_trust() -> Result<(Arc<TrustStore>, String), Error> {
         for c in candidates {
             if std::path::Path::new(&c).is_file() {
                 if let Ok(s) = load_pem(&c) {
-                    return Ok((s, c));
+                    return Ok((with_staged_extras(s, &c), c));
                 }
             }
         }
         Err(Error::Tls("no trust bundle found (set SSL_CERT_FILE)".into()))
     })
     .clone()
+}
+
+/// CTCORE (SR60): beside a staged `system/trust/roots.pem`, the CCADB intermediate pool `inters.pem` (pinned by
+/// `inters.pem.sha256`) and the CT log list.
+fn with_staged_extras(store: Arc<TrustStore>, roots_path: &str) -> Arc<TrustStore> {
+    let mut store = store;
+    if let Some(dir) = roots_path.strip_suffix("roots.pem").filter(|_| roots_path.ends_with("system/trust/roots.pem")) {
+        let inters = format!("{dir}inters.pem");
+        if let (Ok(text), Ok(pin)) = (std::fs::read(&inters), std::fs::read_to_string(format!("{inters}.sha256"))) {
+            let p = CryptoCoreProvider::new();
+            let have: String = tls_core::CryptoProvider::hash(&p, tls_core::crypto::HashAlg::Sha256, &[&text]).as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            if pin.split_whitespace().next() == Some(have.as_str()) {
+                let mut s = (*store).clone();
+                s.add_intermediates_pem(&String::from_utf8_lossy(&text));
+                store = Arc::new(s);
+            }
+        }
+    }
+    with_ct_logs(store, roots_path)
+}
+
+/// CTCORE (SR60): attach a CT log list to the store — `$UNAOS_CT_LOGS`, else `ctlogs.jsn` beside a staged
+/// `system/trust/roots.pem` (checked against its `ctlogs.jsn.sha256` pin). `$UNAOS_CT=strict` refuses chains that
+/// miss Chrome's CT policy; otherwise the verdict is only reported (`Negotiated::ct`). No list → `ct=off`.
+fn with_ct_logs(store: Arc<TrustStore>, roots_path: &str) -> Arc<TrustStore> {
+    let path = std::env::var("UNAOS_CT_LOGS").ok().or_else(|| {
+        roots_path.strip_suffix("roots.pem").filter(|_| roots_path.ends_with("system/trust/roots.pem")).map(|d| format!("{d}ctlogs.jsn"))
+    });
+    let Some(path) = path else { return store };
+    let Ok(bytes) = std::fs::read(&path) else { return store };
+    let p = CryptoCoreProvider::new();
+    let pin = std::fs::read_to_string(format!("{path}.sha256")).ok();
+    let have: String = tls_core::CryptoProvider::hash(&p, tls_core::crypto::HashAlg::Sha256, &[&bytes]).as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    if pin.as_deref().and_then(|p| p.split_whitespace().next()).is_some_and(|p| p != have) {
+        return store; // a list that is not the pinned one is not used
+    }
+    let Ok(list) = tls_core::ct::LogList::parse_v3(&p, &bytes, tls_core::ct::LIST_GOOGLE) else { return store };
+    let mode = if std::env::var("UNAOS_CT").as_deref() == Ok("strict") { tls_core::ct::CtMode::Strict } else { tls_core::ct::CtMode::Report };
+    let mut s = (*store).clone();
+    s.ct = Some(tls_core::ct::CtConfig { list, mode });
+    Arc::new(s)
 }
 
 fn resolve_trust(t: &Trust) -> Result<Arc<TrustStore>, Error> {
@@ -450,6 +491,10 @@ pub struct AgentConfig {
     /// TLS 1.3 resumption tickets (TLSCORE2). Default: an in-memory store per Agent; `None` turns resumption off;
     /// [`SharedTicketStore::file`] persists them across processes.
     pub tickets: Option<Arc<SharedTicketStore>>,
+    /// CTCORE (SR60): when a server omits an intermediate, fetch the certificate's authorityInfoAccess
+    /// caIssuers URI (http:// only — never https, which could recurse) through a fresh Agent with this one's
+    /// proxy and resolve settings, at most 4 per handshake, 64 KiB each (tls_core::x509::aia). Default on.
+    pub aia: bool,
 }
 
 impl Default for AgentConfig {
@@ -467,7 +512,54 @@ impl Default for AgentConfig {
             alpn: vec![b"http/1.1".to_vec()],
             resolve: Vec::new(),
             tickets: Some(Arc::new(SharedTicketStore::memory())),
+            aia: true,
         }
+    }
+}
+
+/// The host's caIssuers fetcher (tls_core::x509::aia::IssuerFetcher) over http_core itself.
+pub struct HttpIssuerFetcher {
+    agent: Agent,
+}
+
+/// The largest caIssuers body accepted (a certificate or a small certs-only CMS bundle).
+pub const AIA_MAX_BYTES: usize = 64 * 1024;
+
+impl HttpIssuerFetcher {
+    pub fn new(cfg: &AgentConfig) -> Self {
+        HttpIssuerFetcher {
+            agent: Agent::new(AgentConfig {
+                timeout: Some(Duration::from_secs(10)),
+                connect_timeout: Duration::from_secs(10),
+                max_redirects: 2,
+                proxy: cfg.proxy.clone(),
+                resolve: cfg.resolve.clone(),
+                user_agent: cfg.user_agent.clone(),
+                tickets: None,
+                aia: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+impl tls_core::x509::aia::IssuerFetcher for HttpIssuerFetcher {
+    fn fetch(&self, uri: &str) -> Option<Vec<u8>> {
+        if !uri.starts_with("http://") {
+            return None;
+        }
+        let mut r = self.agent.get(uri).ok()?;
+        if r.status() != 200 {
+            return None;
+        }
+        let mut body = Vec::new();
+        while let Some(c) = r.chunk().ok()? {
+            body.extend_from_slice(&c);
+            if body.len() > AIA_MAX_BYTES {
+                return None;
+            }
+        }
+        Some(body)
     }
 }
 
@@ -772,9 +864,12 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job) {
             Err(e) => return fail(first, e),
         };
         let provider = CryptoCoreProvider::new();
-        let verifier = WebPkiVerifier { store: &store, clock: &SystemClock };
+        let web = WebPkiVerifier { store: &store, clock: &SystemClock };
+        let fetcher = HttpIssuerFetcher::new(&cfg);
+        let aia = tls_core::x509::aia::AiaVerifier::new(WebPkiVerifier { store: &store, clock: &SystemClock }, &fetcher);
+        let verifier: &dyn tls_core::ServerCertVerifier = if cfg.aia { &aia } else { &web };
         let name = key.host.trim_start_matches('[').trim_end_matches(']').to_string();
-        let mut tcfg = ClientConfig::new(Some(&name), &verifier);
+        let mut tcfg = ClientConfig::new(Some(&name), verifier);
         tcfg.enable_tls12(); // TLSCORE2 (SR58): TLS 1.3 preferred, 1.2 (ECDHE + AEAD, EMS) for the long tail
         tcfg.alpn = cfg.alpn.clone();
         tcfg.resumption = cfg

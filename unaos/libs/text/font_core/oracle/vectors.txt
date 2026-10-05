@@ -37,3 +37,11 @@ https://raw.githubusercontent.com/harfbuzz/harfbuzz/main/src/ms-use/IndicShaping
 # Glyph-level shaping oracle: HarfBuzz 14.5.0 via uharfbuzz 0.56.2 (pip, test-time only) -> oracle/gen_shape_kat.py -> tests/data/hb_shape_kat.tsv
 # Synthetic font tests/data/fontbidi_synth.ttf (20 KB, DejaVu Sans subset + feaLib features): oracle/make_synthetic_font.py (fontTools 4.66.1)
 # Paragraph oracle: Chromium 1194 -> oracle/run_fontbidi.sh -> tests/data/fontbidi_chrome.tsv (measureText + grapheme visual order)
+# FONTHINT (SR62): FreeType 2.13.2 source (the freetype2/ tree inside the freetype-sys 0.20.1 crate) — read as the
+#   reference for the light auto-hinter; oracle/gen_autofit.py reads its src/autofit/{afblue.dat,afscript.h,afranges.c,
+#   afstyles.h} -> src/hint/autofit_tables.rs (data only: blue strings, reference characters, Unicode ranges, style order).
+https://static.crates.io/crates/freetype-sys/freetype-sys-0.20.1.crate  0e7edc5b9669349acfda99533e9e0bcf26a51862ab43b08ee7745c55d28eb134  oracle/gen_autofit.py -> src/hint/autofit_tables.rs
+# Per-glyph hinting oracle: freetype-py 2.5.1 (pip; bundles FreeType 2.13.2 built with HarfBuzz), oracle/ft_hint_oracle.py,
+#   FT_LOAD_TARGET_LIGHT — tests/hint_oracle.rs (SKIP without it).
+# Point KATs: oracle/gen_hint_kat.py (freetype-py 2.5.1 / FreeType 2.13.2, FT_LOAD_TARGET_LIGHT) -> tests/data/hint_kat.tsv
+#   (199 glyph outlines in 26.6, each line keyed by the face file's sha256; a face whose file differs SKIPs).

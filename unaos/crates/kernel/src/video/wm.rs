@@ -95,14 +95,14 @@ pub const MAX_TITLE: usize = 16;
 /// The name is kept because it is load-bearing across four modules (`wm`, `desktop_uefi`, `fbcon`,
 /// `instgui`) and the x86 syscall selftests — every one of them derives its geometry from this
 /// symbol, so re-pointing it at the table moves all of them at once and leaves no stale literal.
-pub const TITLE_H: usize = super::theme::TITLE_HEIGHT;
+#[allow(non_snake_case)] #[inline] pub fn TITLE_H() -> usize { super::theme::TITLE_HEIGHT() }
 
 /// Width in panel pixels of the kernel-drawn window frame.
 ///
 /// CRISPYWIRE — **this is `theme::FRAME`.** WC-A's invented `1` is gone. The frame is now thick
 /// enough to carry what Crispy puts in it: an outer keyline, a bevel hairline, and the chrome face
 /// between them. See [`paint_window`] for the layering.
-pub const BORDER: usize = super::theme::FRAME;
+#[allow(non_snake_case)] #[inline] pub fn BORDER() -> usize { super::theme::FRAME() }
 
 /// FONT (GR27) — the caption glyph's ADVANCE, in panel pixels: [`font::CELL_W`], the mono face's
 /// own metric. The unit every width budget (the caption painter's, [`controls`]'s decline
@@ -120,14 +120,14 @@ pub const BORDER: usize = super::theme::FRAME;
 /// rather than a size anybody wrote down; raising the bar raises the caption with it. This one
 /// constant is the whole propagation: `menubar`, `crystal` and `dock` all define their own
 /// `CELL_W`/`CELL_H` as this, and their layout constants are expressions over those.
-pub const TITLE_CELL_W: usize = super::font::CHROME_CELL_W;
+#[allow(non_snake_case)] #[inline] pub fn TITLE_CELL_W() -> usize { crate::ui::px(super::font::CHROME_CELL_W) } // UIMETRICS (B372): the chrome atlas cell x the dpi scale
 
 /// FONT (GR27) — the caption glyph cell's HEIGHT, in panel pixels: [`font::CHROME_CELL_H`].
 /// FONT-METRIC: derived from [`TITLE_H`], see [`TITLE_CELL_W`].
-pub const TITLE_CELL_H: usize = super::font::CHROME_CELL_H;
+#[allow(non_snake_case)] #[inline] pub fn TITLE_CELL_H() -> usize { crate::ui::px(super::font::CHROME_CELL_H) } // UIMETRICS (B372): see TITLE_CELL_W
 // REVIEW (GR27 fonts): back the draw_title comment's "cell shorter than the strip" claim on every
 // arch (menubar's CELL_H<=BAR_H assert is x86+wc-only). draw_title clamps anyway, but assert it.
-const _: () = assert!(TITLE_CELL_H <= TITLE_H, "title glyph cell must fit the caption strip");
+#[allow(dead_code)] pub(crate) fn uimetrics_assert_title_cell() { assert!(TITLE_CELL_H() <= TITLE_H(), "title glyph cell must fit the caption strip"); }
 
 /// CRISPYWIRE-REVIEW — the strip width the three-disc control cluster RESERVES, measured from the
 /// inner edge of the LEFT frame (WMCTRL, Peter 2026-08-09: the cluster is left-aligned, macOS-side;
@@ -157,7 +157,7 @@ const _: () = assert!(TITLE_CELL_H <= TITLE_H, "title glyph cell must fit the ca
 /// a real change to layout policy, reaching well outside what this arc is about, to buy back 36 px
 /// of caption on one window. If a future arc wants it, the honest shape is a `reserve_for(r)`
 /// beside [`ctrls_for`] with the fixtures' assertions re-derived from it, not an adjustment here.
-const CTRL_RESERVE: usize = 3 * super::theme::CONTROL_BOX + 4 * GAP;
+#[allow(non_snake_case)] #[inline] fn CTRL_RESERVE() -> usize { 3 * super::theme::CONTROL_BOX() + 4 * GAP() }
 
 /// **The smallest SOURCE width whose window carries a control cluster at scale 1** — and therefore
 /// at every scale, since `spawn_geometry`'s box width `w * scale + 2 * BORDER` is monotone in
@@ -173,7 +173,7 @@ const CTRL_RESERVE: usize = 3 * super::theme::CONTROL_BOX + 4 * GAP;
 /// behind it, turning a close-control gate into a silent SKIP (CRISPYWIRE sized one from 8 to 32,
 /// CRISPYWIRE-REVIEW from 96 to 128). Every fixture that needs a cluster sizes itself against this
 /// constant with a `const` assertion, so the third move fails the BUILD instead of the gate.
-pub const CLUSTER_MIN_SRC_W: usize = GAP + CTRL_RESERVE + TITLE_CELL_W;
+#[allow(non_snake_case)] #[inline] pub fn CLUSTER_MIN_SRC_W() -> usize { GAP() + CTRL_RESERVE() + TITLE_CELL_W() }
 
 /// A window identifier. Ids are `1..=MAX_WINDOWS`; `0` is never a valid window and is the
 /// fail-closed return for every operation that could not be satisfied.
@@ -1250,7 +1250,7 @@ pub fn create(
         stride as usize,
         title,
         false,
-        None,
+        None, false,
     )
 }
 
@@ -1272,9 +1272,9 @@ pub fn spawn_geometry(w: usize, h: usize) -> Option<(usize, usize, usize)> {
     let scale = place_scale(info.width, info.height, w, h);
     Some((
         scale,
-        w.saturating_mul(scale).saturating_add(2 * BORDER),
+        w.saturating_mul(scale).saturating_add(2 * BORDER()),
         h.saturating_mul(scale)
-            .saturating_add(TITLE_H + 2 * BORDER),
+            .saturating_add(TITLE_H() + 2 * BORDER()),
     ))
 }
 
@@ -1312,7 +1312,7 @@ pub fn create_at(
         stride as usize,
         title,
         false,
-        Some((x, y)),
+        Some((x, y)), false,
     )
 }
 
@@ -1369,7 +1369,7 @@ pub(super) fn compat_present(
         let _claim = COMPAT_CREATE.lock();
         let mut id = COMPAT_WIN.load(Ordering::Relaxed);
         if id == WIN_NONE || !is_compat_row(id) {
-            id = create_inner(0, surf, surf_len, w, h, stride, b"", true, None);
+            id = create_inner(0, surf, surf_len, w, h, stride, b"", true, None, false);
             if id == WIN_NONE {
                 return;
             }
@@ -2406,10 +2406,10 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
                 // focus trap, so this bound refuses to create one. `max_y` takes the same floor
                 // because `clamp` PANICS when `min > max` and a small enough panel could otherwise
                 // invert the two.
-                let min_y = work_top(info.width, info.height) + TITLE_H + BORDER;
-                let max_x = info.width.saturating_sub(cw + BORDER).max(BORDER);
-                let max_y = info.height.saturating_sub(ch + BORDER).max(min_y);
-                r.x = x.clamp(BORDER, max_x);
+                let min_y = work_top(info.width, info.height) + TITLE_H() + BORDER();
+                let max_x = info.width.saturating_sub(cw + BORDER()).max(BORDER());
+                let max_y = info.height.saturating_sub(ch + BORDER()).max(min_y);
+                r.x = x.clamp(BORDER(), max_x);
                 r.y = y.clamp(min_y, max_y);
                 r.pinned = true;
                 r.damage_all();
@@ -4813,7 +4813,7 @@ fn owedtail_emit() {
     );
 }
 
-pub fn composite() { if let Some(term) = super::panel_refuse_term() { super::note_panel_write_refused(super::REFUSE_TIER_PASS, term, "wm::composite"); return; } // PANELREFUSE Tier 1 — THE WHOLE PASS DECLINES once the machine is dying. Sited at the TOP OF THE FUNCTION, above the arch split on the two lines below, and that siting is the design's central finding rather than convenience: `composite_pass_half` calls `strip::compose_all` AFTER `composite_inner` returns, and the furniture (dock/menubar/crystal) reaches the glass through its OWN blocking `*WRITER.lock()` without ever consulting `panel_snapshot`. A refusal placed at `panel_snapshot` instead would therefore produce a PARTIAL PAINT — windows suppressed, furniture stamped across the panic backdrop — a screen state no boot has ever produced and no capture in the corpus describes. Refusing above the fork declines `composite_once` -> `composite_pass_half` -> `composite_inner` AND `strip::compose_all` in one place, on both arches: the non-x86 arm below is a bare `composite_once()` with no gate and no decline path of its own, so a check inside the x86 `COMP_GATE` block would leave aarch64 uncovered. It takes NO gate (this is before `COMP_GATE`), holds nothing, clears nothing, and deliberately does NOT set `COMP_PENDING` — nothing is coming to service the damage, and arming a re-drive on a dying machine is a futile wake, not tidiness. Damage stays on the table. LOCKFIX: two atomic loads, no acquire of any kind, so a refused pass cannot leak a hold into a preemption. ⚠ SAME-LINE fold, line-NEUTRAL — `wm.rs` is ~21k lines and a line added here would renumber every panic `Location` below it; the reviewing seat required that cost be CHOSEN, and this is the choice not to pay it. Idiom: `video/fbcon.rs`'s `⚠ SAME-LINE fold` markers.
+pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = super::panel_refuse_term() { super::note_panel_write_refused(super::REFUSE_TIER_PASS, term, "wm::composite"); return; } // PANELREFUSE Tier 1 — THE WHOLE PASS DECLINES once the machine is dying. Sited at the TOP OF THE FUNCTION, above the arch split on the two lines below, and that siting is the design's central finding rather than convenience: `composite_pass_half` calls `strip::compose_all` AFTER `composite_inner` returns, and the furniture (dock/menubar/crystal) reaches the glass through its OWN blocking `*WRITER.lock()` without ever consulting `panel_snapshot`. A refusal placed at `panel_snapshot` instead would therefore produce a PARTIAL PAINT — windows suppressed, furniture stamped across the panic backdrop — a screen state no boot has ever produced and no capture in the corpus describes. Refusing above the fork declines `composite_once` -> `composite_pass_half` -> `composite_inner` AND `strip::compose_all` in one place, on both arches: the non-x86 arm below is a bare `composite_once()` with no gate and no decline path of its own, so a check inside the x86 `COMP_GATE` block would leave aarch64 uncovered. It takes NO gate (this is before `COMP_GATE`), holds nothing, clears nothing, and deliberately does NOT set `COMP_PENDING` — nothing is coming to service the damage, and arming a re-drive on a dying machine is a futile wake, not tidiness. Damage stays on the table. LOCKFIX: two atomic loads, no acquire of any kind, so a refused pass cannot leak a hold into a preemption. ⚠ SAME-LINE fold, line-NEUTRAL — `wm.rs` is ~21k lines and a line added here would renumber every panic `Location` below it; the reviewing seat required that cost be CHOSEN, and this is the choice not to pay it. Idiom: `video/fbcon.rs`'s `⚠ SAME-LINE fold` markers.
     #[cfg(not(target_arch = "x86_64"))]
     comp_gate_pass(); // COMPGATE — NO LONGER A BARE PASS. The non-x86 arm now runs under this module's own gate: a second entrant on any core FOLDS (its damage stays on the table and is serviced by the holder's re-run) or WAITS bounded, and can never reach `draw_window`'s direct, unclipped, per-pixel front-buffer path. The gate, its preemption hold, its witnesses and its nested-present fixture are at the FILE TAIL — see the COMPGATE ledger there for the mechanism (`decl_lock=73` is same-core re-entrancy by construction, because `STAGE` is per core) and for why the hold is a switch decline rather than an interrupt mask. ⚠ SAME-LINE fold, line-NEUTRAL, on the identical argument the PANELREFUSE fold above states: `wm.rs` is ~25k lines and a line added here renumbers every panic `Location` below it. x86 is untouched — the arm below is byte-for-byte what it was.
     #[cfg(target_arch = "x86_64")]
@@ -7766,7 +7766,7 @@ fn wcdvalve_closed() -> bool {
     }
     if WCDVALVE_SHUT.load(Relaxed) {
         let k = WCDVALVE_SUSPENDED.fetch_add(1, Relaxed) + 1;
-        if !WCDVALVE_SAID.swap(true, Relaxed) {
+        if !WCDVALVE_SAID.swap(true, Relaxed) { crate::boot::note_valve(); // INSTALLBARE: the pre-Desktop census. SAME-LINE fold
             serial_println!(
                 "[wc-d] valve CLOSED util~{}% wcd~{}% suspended={}",
                 WCDVALVE_UTIL.load(Relaxed),
@@ -7819,7 +7819,7 @@ fn verify_reference(
     // blinded — the battery stays owed and is paid the ordinary way once the valve reopens. See the
     // ledger above [`wcdvalve_closed`]. Compiled out entirely without the `wcdvalve` knob.
     #[cfg(all(target_arch = "x86_64", feature = "wcdvalve"))]
-    if wcdvalve_closed() {
+    if !crate::boot::services_up() || wcdvalve_closed() { // INSTALLBARE (R86): no WC-D read-back — so no valve episode — before the Desktop's services (flight 22: CLOSED 29 027 ms under the setter)
         return None;
     }
     let (step, running) = wcd_admit(r.id, i)?;
@@ -14599,12 +14599,12 @@ fn crispy_witness() {
     use super::theme;
     crate::bootlog_println!(
         "[crispy] theme=us-crispy-modern@0787ba9f frame={} bevel={} title_h={} radius={} ctrl={} gap={} face={:#08x} keyline={:#08x} bevels={:#08x}/{:#08x} title_act={:#08x}->{:#08x} title_ina={:#08x}->{:#08x} ink={:#08x}/{:#08x} ctrls={:#08x}/{:#08x}/{:#08x} gloss_q16={}/{}/{} desktop={:#08x}",
-        theme::FRAME,
-        theme::BEVEL,
-        theme::TITLE_HEIGHT,
-        theme::CORNER_RADIUS,
-        theme::CONTROL_BOX,
-        theme::GAP,
+        theme::FRAME(),
+        theme::BEVEL(),
+        theme::TITLE_HEIGHT(),
+        theme::CORNER_RADIUS(),
+        theme::CONTROL_BOX(),
+        theme::GAP(),
         theme::CHROME_FACE,
         theme::FRAME_LINE,
         theme::BEVEL_LIGHT,
@@ -14628,10 +14628,10 @@ fn crispy_witness() {
     // stop with the full gloss over it; row `TITLE_H-1` is the bottom stop with none.
     crate::bootlog_println!(
         "[crispy] ramp act row0={:#08x} rowN={:#08x} ina row0={:#08x} rowN={:#08x}",
-        title_row_color(0, theme::TITLE_HEIGHT, true),
-        title_row_color(theme::TITLE_HEIGHT - 1, theme::TITLE_HEIGHT, true),
-        title_row_color(0, theme::TITLE_HEIGHT, false),
-        title_row_color(theme::TITLE_HEIGHT - 1, theme::TITLE_HEIGHT, false),
+        title_row_color(0, theme::TITLE_HEIGHT(), true),
+        title_row_color(theme::TITLE_HEIGHT() - 1, theme::TITLE_HEIGHT(), true),
+        title_row_color(0, theme::TITLE_HEIGHT(), false),
+        title_row_color(theme::TITLE_HEIGHT() - 1, theme::TITLE_HEIGHT(), false),
     );
 }
 
@@ -14849,7 +14849,7 @@ fn outside_top_corner(r: &Window, px: usize, py: usize) -> bool {
         return false; // no chrome, no corners
     }
     let (bx, by, bw, bh) = outer_box(r);
-    let rad = super::theme::CORNER_RADIUS.min(bw / 2).min(bh / 2);
+    let rad = super::theme::CORNER_RADIUS().min(bw / 2).min(bh / 2);
     if rad == 0 || py < by || py >= by.saturating_add(rad) {
         return false;
     }
@@ -14877,10 +14877,10 @@ pub(super) fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
         (r.x, r.y, cw, ch)
     } else {
         (
-            r.x.saturating_sub(BORDER),
-            r.y.saturating_sub(TITLE_H + BORDER),
-            cw.saturating_add(2 * BORDER),
-            ch.saturating_add(TITLE_H + 2 * BORDER),
+            r.x.saturating_sub(BORDER()),
+            r.y.saturating_sub(TITLE_H() + BORDER()),
+            cw.saturating_add(2 * BORDER()),
+            ch.saturating_add(TITLE_H() + 2 * BORDER()),
         )
     }
 }
@@ -15179,7 +15179,7 @@ const fn ctrls_for(_r: &Window) -> &'static [Ctrl] {
 /// `position` lookup over a three-element list, on a path that already takes a table lock.
 fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
     let slot = ctrls_for(r).iter().position(|&c| c == which)?;
-    controls(r).map(|(cbx, cy, d)| (cbx + slot * (d + GAP), cy, d))
+    controls(r).map(|(cbx, cy, d)| (cbx + slot * (d + GAP()), cy, d))
 }
 
 /// CTRLWIT — the outer-box width at which [`controls`] starts drawing a cluster, as a name.
@@ -15205,7 +15205,7 @@ fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
 /// surface, 3.8x the bound, and the bench panels are 1920 and 2880. It is recorded because it is an
 /// assumption the floor CREATED — before it, a narrow panel simply got narrow windows — and a future
 /// embedded surface under 170 px wide would break the tiler rather than the clamp.
-pub const CLUSTER_MIN_BOX_W: usize = 2 * BORDER + CLUSTER_MIN_SRC_W;
+#[allow(non_snake_case)] #[inline] pub fn CLUSTER_MIN_BOX_W() -> usize { 2 * BORDER() + CLUSTER_MIN_SRC_W() }
 
 /// CTRLWIT — the decline witness's per-window state. `UNSEEN -> PENDING -> SPOKEN`, and the id is
 /// the index (ids are `1..=MAX_WINDOWS`, so slot 0 is never touched).
@@ -15301,7 +15301,7 @@ fn controls_declined_drain() {
                 i,
                 CTRL_DECL_OWNER[i].load(Relaxed),
                 CTRL_DECL_BW[i].load(Relaxed),
-                CLUSTER_MIN_BOX_W
+                CLUSTER_MIN_BOX_W()
             );
         }
     }
@@ -15464,7 +15464,7 @@ fn controls(r: &Window) -> Option<(usize, usize, usize)> {
         return None;
     }
     let (bx, by, bw, _bh) = outer_box(r);
-    let d = super::theme::CONTROL_BOX;
+    let d = super::theme::CONTROL_BOX();
     // Cluster: three discs at a `GAP` pitch, one `GAP` clear of the LEFT frame, and enough strip
     // left over for one glyph of caption plus its own `GAP`. Anything narrower declines.
     //
@@ -15479,7 +15479,7 @@ fn controls(r: &Window) -> Option<(usize, usize, usize)> {
     // The reserve is unchanged in SIZE and only changes SIDE: `CTRL_RESERVE` is still the strip the
     // cluster costs the caption, and the caption is still one `GAP` clear of the far frame. See
     // [`CTRL_RESERVE`] and `paint_window`, which subtract exactly this.
-    if bw < CLUSTER_MIN_BOX_W {
+    if bw < CLUSTER_MIN_BOX_W() {
         // CTRLWIT — and the window SAYS SO, once. This is the decline that is not deliberate: the
         // furniture arm above is policy (kernel chrome is not closeable, and that is the design),
         // but this one is a live ring-3 window that asked for a surface, got a frame, and silently
@@ -15553,8 +15553,8 @@ fn controls(r: &Window) -> Option<(usize, usize, usize)> {
         return None;
     }
     // Vertically centred in the strip; `TITLE_H > CONTROL_BOX` is a const-assert in `theme.rs`.
-    let cy = by + BORDER + (TITLE_H - d) / 2;
-    Some((bx + BORDER + GAP, cy, d))
+    let cy = by + BORDER() + (TITLE_H() - d) / 2;
+    Some((bx + BORDER() + GAP(), cy, d))
 }
 
 /// CLOSE-BOX — does panel point `(x, y)` land in window `id`'s close box? The router's second
@@ -15797,7 +15797,7 @@ pub fn zoom(id: WinId) -> &'static str {
     let (vacated, outcome) = match row_mut(&mut t, id) {
         None => return "norow",
         Some(r) => {
-            if r.compat || r.owner_asid == 0 {
+            if r.compat || r.owner_asid == 0 || native_slot((r.id as usize).wrapping_sub(1)) { // UIMETRICS (B372): zoom magnifies; a native window has no magnified form
                 return "declined";
             }
             let before = outer_box(r);
@@ -15812,11 +15812,11 @@ pub fn zoom(id: WinId) -> &'static str {
                     let s = zoom_scale(pw, usable_h, ph, r.w, r.h);
                     r.zoom_saved = Some((r.x, r.y, r.scale));
                     r.scale = s;
-                    let ow = r.w.saturating_mul(s).saturating_add(2 * BORDER);
+                    let ow = r.w.saturating_mul(s).saturating_add(2 * BORDER());
                     let oh = r
                         .h
                         .saturating_mul(s)
-                        .saturating_add(TITLE_H + 2 * BORDER);
+                        .saturating_add(TITLE_H() + 2 * BORDER());
                     // Centre the OUTER box in the work area, then step in to the content origin —
                     // the coordinate the row actually stores. `saturating_sub` handles a surface
                     // whose chrome-inclusive box is larger than the work area (possible only when
@@ -15826,8 +15826,8 @@ pub fn zoom(id: WinId) -> &'static str {
                     // MENUFIT — "the work area's top-left", not the panel's: the centring offset is
                     // taken inside the work area and then translated down by `wtop`. At `wtop == 0`
                     // this is the pre-MENUFIT expression unchanged.
-                    r.x = pw.saturating_sub(ow) / 2 + BORDER;
-                    r.y = wtop + usable_h.saturating_sub(oh) / 2 + TITLE_H + BORDER;
+                    r.x = pw.saturating_sub(ow) / 2 + BORDER();
+                    r.y = wtop + usable_h.saturating_sub(oh) / 2 + TITLE_H() + BORDER();
                     // The tiler must leave it alone, exactly as an explicit `move_to` pins it.
                     r.pinned = true;
                     "zoomed"
@@ -15951,10 +15951,10 @@ pub fn title_bar_hit(id: WinId, x: i32, y: i32) -> bool {
     }
     let (bx, by, bw, _bh) = outer_box(r);
     let strip = (
-        bx.saturating_add(BORDER),
-        by.saturating_add(BORDER),
-        bw.saturating_sub(2 * BORDER),
-        TITLE_H,
+        bx.saturating_add(BORDER()),
+        by.saturating_add(BORDER()),
+        bw.saturating_sub(2 * BORDER()),
+        TITLE_H(),
     );
     if !in_box(px, py, strip) {
         return false;
@@ -20455,16 +20455,16 @@ fn paint_window(
         // `BORDER + j`, the strip row's offset inside the box, so the title's grain is continuous
         // with the frame's around it rather than restarting at the strip.
         comp_mark(r.id, mk + PW_STRIP);
-        let strip_w = bw.saturating_sub(2 * BORDER);
-        for j in 0..TITLE_H {
-            comp_mark_row(BORDER + j);
+        let strip_w = bw.saturating_sub(2 * BORDER());
+        for j in 0..TITLE_H() {
+            comp_mark_row(BORDER() + j);
             fill_rect_v(
                 dst,
-                lbx + BORDER,
-                lby + (BORDER + j) as isize,
+                lbx + BORDER(),
+                lby + (BORDER() + j) as isize,
                 strip_w,
                 1,
-                super::ceramic::shade(title_row_color(j, TITLE_H, focused), BORDER + j),
+                super::ceramic::shade(title_row_color(j, TITLE_H(), focused), BORDER() + j),
             );
         }
         // CRISPYWIRE — the frame's own structure, laid over the face fill at the box edges: a
@@ -20481,7 +20481,7 @@ fn paint_window(
         // is machined. If the taste gate wants the edges machined too, it is one `shade` call on
         // each of `kl`, `bl` and `bs`.
         comp_mark(r.id, mk + PW_FRAME);
-        let bev = super::theme::BEVEL;
+        let bev = super::theme::BEVEL();
         let kl = super::theme::FRAME_LINE;
         // CRISPYWIRE-REVIEW — the keyline's THICKNESS is `theme::BEVEL` too, not a literal `1`.
         // `metrics.bevel` is the kit's hairline metric ("iteration 3 makes the bevel a true
@@ -20544,7 +20544,7 @@ fn paint_window(
         // The arc keyline below is one pixel per row by construction — it is the boundary of the
         // filled span, not a rect edge, so it has no thickness to take from `kw`.
         comp_mark(r.id, mk + PW_CORNER);
-        let rad = super::theme::CORNER_RADIUS.min(bw / 2).min(bh / 2);
+        let rad = super::theme::CORNER_RADIUS().min(bw / 2).min(bh / 2);
         for j in 0..rad {
             comp_mark_row(j);
             let dy = lby + j as isize;
@@ -20668,7 +20668,7 @@ fn paint_window(
                 // a long title truncates BESIDE the controls, never under them. CRISPYWIRE-REVIEW:
                 // this is `CTRL_RESERVE`, the same constant `controls` declines against, instead of
                 // a second copy of the sum that disagreed with it by one `GAP`.
-                CTRL_RESERVE
+                CTRL_RESERVE()
             }
             None => 0,
         };
@@ -20687,15 +20687,15 @@ fn paint_window(
         // the width budget below is unchanged: the caption still ends one `GAP` inside the far
         // frame. A row with no cluster (`ctrl_w == 0`) keeps the plain `BORDER + GAP` inset it had.
         comp_mark(r.id, mk + PW_CAPTION);
-        let cap_x = lbx + BORDER + if ctrl_w > 0 { CTRL_RESERVE } else { GAP };
+        let cap_x = lbx + BORDER() + if ctrl_w > 0 { CTRL_RESERVE() } else { GAP() };
         draw_title(
             dst,
             r,
             cap_x,
-            lby + BORDER as isize + (TITLE_H.saturating_sub(TITLE_CELL_H) / 2) as isize,
-            bw.saturating_sub(2 * BORDER + GAP + ctrl_w),
+            lby + BORDER() as isize + (TITLE_H().saturating_sub(TITLE_CELL_H()) / 2) as isize,
+            bw.saturating_sub(2 * BORDER() + GAP() + ctrl_w),
             title_ink(focused),
-            lby + BORDER as isize,
+            lby + BORDER() as isize,
             focused,
         );
     }
@@ -21777,8 +21777,8 @@ fn draw_title(
         // The strip pixel this row sits on. Rows past the strip's height keep the last gradient stop.
         let j = (dy - strip_y0).max(0) as usize;
         let bg = super::ceramic::shade(
-            title_row_color(j.min(TITLE_H - 1), TITLE_H, focused),
-            BORDER + j.min(TITLE_H - 1),
+            title_row_color(j.min(TITLE_H() - 1), TITLE_H(), focused),
+            BORDER() + j.min(TITLE_H() - 1),
         );
         fb.put_pixel(px as usize, dy as usize, super::font::blend(bg, ink, a));
     });
@@ -21881,7 +21881,7 @@ pub fn focusvis_selftest() {
     // One origin for both, upper-middle: WC-F's reserved boxes hug the bottom edge, and the tiler is
     // disarmed for these rows by `move_to`'s pin.
     let ox = info.width / 3;
-    let oy = info.height / 4 + TITLE_H + BORDER;
+    let oy = info.height / 4 + TITLE_H() + BORDER();
     move_to(wa, ox, oy);
     move_to(wb, ox, oy);
     // The rows carry content from creation (static surfaces), so a present is the honest way to say
@@ -22038,7 +22038,7 @@ pub fn reopen_selftest() {
         return;
     }
     // Two distinct origins, upper-middle, clear of WC-F's bottom-edge probe boxes and of each other.
-    let oy = info.height / 4 + TITLE_H + BORDER;
+    let oy = info.height / 4 + TITLE_H() + BORDER();
     let (ax, bx) = (info.width / 4, info.width / 2);
     move_to(wa, ax, oy);
     move_to(wb, bx, oy);
@@ -22131,7 +22131,7 @@ pub fn vacate_selftest() {
     let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
 
     // Upper-middle, clear of WC-F's bottom-edge reserved probe boxes, as the sibling witnesses are.
-    let oy = info.height / 4 + TITLE_H + BORDER;
+    let oy = info.height / 4 + TITLE_H() + BORDER();
     let ox = info.width / 4;
 
     // One leg: place a window at (ox, oy), prove it owns its box, close it by `f`, and count how many
@@ -22158,7 +22158,7 @@ pub fn vacate_selftest() {
             (ox + 1, oy + 1),
             (ox + 2, oy + 2),
             (ox + 5, oy + 5),
-            (b.0 + b.2 / 2, b.1 + TITLE_H / 2),
+            (b.0 + b.2 / 2, b.1 + TITLE_H() / 2),
             (b.0 + b.2 / 2, b.1 + b.3 - 1),
         ];
         // FURNITURE-OCC — the reclaim is judged per point against whoever owns that point NOW; see
@@ -22256,7 +22256,7 @@ fn movevacate_selftest() {
     let a_col = FV_SURF_A[0];
     let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
 
-    let oy = info.height / 4 + TITLE_H + BORDER;
+    let oy = info.height / 4 + TITLE_H() + BORDER();
     let ox = info.width / 4;
 
     let w = create(ASID_MV, sa, len, 8, 8, 32, b"mv-a");
@@ -22303,7 +22303,7 @@ fn movevacate_selftest() {
     // Half 1b — and the window is genuinely THERE, at the new origin, rather than the panel having
     // simply gone quiet. Content and kernel-drawn chrome both, since the move re-lays both.
     let new_window = read(ox + STEP + 1, oy + STEP + 1) == a_col
-        && read(new.0 + new.2 / 2, new.1 + TITLE_H / 2) != DESKTOP_BG;
+        && read(new.0 + new.2 / 2, new.1 + TITLE_H() / 2) != DESKTOP_BG;
 
     // Half 2 — the erase the panel path actually PERFORMED, read back from the record
     // `move_note_erase` wrote at the erase call site. `MOVE_LAST_WIN` rejects cross-talk: if a
@@ -22467,7 +22467,7 @@ pub fn dragperf_selftest() {
     };
     // Edge to edge, with the chrome kept on the panel at both ends — `move_to` clamps, and a run that
     // spent half its steps against a clamp would be measuring the cheap-skip rather than the move.
-    let span = pinfo.width.saturating_sub(bw + BORDER * 2);
+    let span = pinfo.width.saturating_sub(bw + BORDER() * 2);
     if span < STEPS * 2 {
         close(w);
         serial_println!("[dragperf] -> SKIP (panel too narrow for a {}px box)", bw);
@@ -22491,14 +22491,14 @@ pub fn dragperf_selftest() {
     let desk_before = super::screen::desk_present_snapshot();
     let mut moves_b = 0usize;
     for i in 0..STEPS {
-        if move_to(w, BORDER + i * step, oy) {
+        if move_to(w, BORDER() + i * step, oy) {
             moves_b += 1;
         }
     }
     // Back the other way, so the sweep is symmetric and the count is doubled without the window
     // walking off the panel and spending its second half against the clamp.
     for i in 0..STEPS {
-        if move_to(w, BORDER + (STEPS - 1 - i) * step, oy) {
+        if move_to(w, BORDER() + (STEPS - 1 - i) * step, oy) {
             moves_b += 1;
         }
     }
@@ -22578,8 +22578,8 @@ pub fn dragperf_selftest() {
         let aimed = match (info(w), info_box(w)) {
             (Some(i), Some((bx, by, bw2, _))) => {
                 let nx = i.x as i64 + (cx as i64 - (bx + bw2 / 2) as i64);
-                let ny = i.y as i64 + (cy as i64 - (by + TITLE_H / 2) as i64);
-                if nx >= BORDER as i64 && ny >= (TITLE_H + BORDER) as i64 {
+                let ny = i.y as i64 + (cy as i64 - (by + TITLE_H() / 2) as i64);
+                if nx >= BORDER() as i64 && ny >= (TITLE_H() + BORDER()) as i64 {
                     move_to(w, nx as usize, ny as usize);
                     title_bar_hit(w, cx, cy)
                 } else {
@@ -22620,7 +22620,7 @@ pub fn dragperf_selftest() {
     // the row used to be misses `title_bar_hit`, `drag_begin` declines, and the whole half silently
     // measures nothing. It did exactly that on its first run.
     let (gx, gy) = match info_box(w) {
-        Some((bx, by, bw2, _)) => ((bx + bw2 / 2) as i32, (by + TITLE_H / 2) as i32),
+        Some((bx, by, bw2, _)) => ((bx + bw2 / 2) as i32, (by + TITLE_H() / 2) as i32),
         None => (0, 0),
     };
     let (adm, coal) = if drag_begin(w, gx, gy) {
@@ -22751,8 +22751,8 @@ pub fn dragwedge_selftest() {
     let aimed = match (info(w), info_box(w)) {
         (Some(i), Some((bx, by, bw2, _))) => {
             let nx = i.x as i64 + (cx as i64 - (bx + bw2 / 2) as i64);
-            let ny = i.y as i64 + (cy as i64 - (by + TITLE_H / 2) as i64);
-            if nx >= BORDER as i64 && ny >= (TITLE_H + BORDER) as i64 {
+            let ny = i.y as i64 + (cy as i64 - (by + TITLE_H() / 2) as i64);
+            if nx >= BORDER() as i64 && ny >= (TITLE_H() + BORDER()) as i64 {
                 move_to(w, nx as usize, ny as usize);
                 title_bar_hit(w, cx, cy)
             } else {
@@ -22782,7 +22782,7 @@ pub fn dragwedge_selftest() {
     // runs. That is not a contrivance — it is the wire's own state, reproduced by the cheapest means
     // that reaches it, and on the PA41 image every leg below hangs the gate instead of failing it.
     let (gx, gy) = match info_box(w) {
-        Some((bx, by, bw2, _)) => ((bx + bw2 / 2) as i32, (by + TITLE_H / 2) as i32),
+        Some((bx, by, bw2, _)) => ((bx + bw2 / 2) as i32, (by + TITLE_H() / 2) as i32),
         None => (0, 0),
     };
     let g0 = MOVE_DRAIN_GIVEUP.load(Relaxed);
@@ -23032,7 +23032,7 @@ fn closeiso_selftest() {
     let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
     // The content origin of a row, one pixel in, from its CURRENT outer box.
     let probe = |id: WinId| -> Option<(usize, usize)> {
-        info_box(id).map(|b| (b.0 + BORDER + 1, b.1 + TITLE_H + BORDER + 1))
+        info_box(id).map(|b| (b.0 + BORDER() + 1, b.1 + TITLE_H() + BORDER() + 1))
     };
     let sample = |id: WinId| -> u32 { probe(id).map(|(x, y)| read(x, y)).unwrap_or(0) };
 
@@ -23355,7 +23355,7 @@ fn retile_selftest() {
     // the content's first row BY COINCIDENCE. At Crispy's `FRAME = 5` the same expression lands
     // four rows up, inside the frame, and the leg reported `painted=false live=false` against a
     // compositor that was painting correctly. The x term was right all along (`+ BORDER` explicit).
-    let (bx0, by0) = (before.0 + BORDER, before.1 + TITLE_H + BORDER);
+    let (bx0, by0) = (before.0 + BORDER(), before.1 + TITLE_H() + BORDER());
     let painted = read(bx0 + 1, by0 + 1) == b_col;
 
     close(wa);
@@ -23363,7 +23363,7 @@ fn retile_selftest() {
     let after = info_box(wb).unwrap_or(before);
     let moved = after != before;
     // The survivor still reaches the panel at its NEW box...
-    let live_ok = read(after.0 + BORDER + 1, after.1 + TITLE_H + BORDER + 1) == b_col;
+    let live_ok = read(after.0 + BORDER() + 1, after.1 + TITLE_H() + BORDER() + 1) == b_col;
     // ...and its OLD box is RECLAIMED. Three points inside the abandoned content area — desktop
     // where the desktop still owns them, and provably no longer B's paint where furniture does.
     // FURNITURE-OCC: see [`vacated_points`] for why that is the same rule stated for a panel that
@@ -23479,11 +23479,11 @@ fn create_inner(
     stride: usize,
     title: &[u8],
     compat: bool,
-    at: Option<(usize, usize)>,
+    at: Option<(usize, usize)>, native: bool,
 ) -> WinId {
-    if surf == 0 || w == 0 || h == 0 || stride == 0 || surf_len == 0 {
+    crate::video::lag::window_shown(); if surf == 0 || w == 0 || h == 0 || stride == 0 || surf_len == 0 { // GLASSLAG M1 (B370): a launch's [lag] app stage ends at the mint (same-line fold).
         return WIN_NONE;
-    }
+    } crate::boot::note_window(owner_asid); // INSTALLBARE (R86): the pre-Desktop census — a window minted under the setter / the login screen (owner ≠ the screen's 0). SAME-LINE fold
     // F1 — the surface-extent contract. A row must fit its stride and the rows must fit the slot;
     // saturating arithmetic so a hostile `h`/`stride` overflows into a rejection, not a wrap (the
     // kernel builds with overflow checks off, so `h * stride` alone could wrap to something small).
@@ -23505,17 +23505,17 @@ fn create_inner(
             return None;
         }
         let info = fb.info();
-        let scale = place_scale(info.width, info.height, w, h);
+        let scale = if native { 1 } else { place_scale(info.width, info.height, w, h) }; // UIMETRICS (B372): a native kernel window is drawn at its real pixel size, never magnified
         // The same clamp `move_to` applies, for the same reason (F5: the kernel builds without
         // overflow checks, so an unclamped origin would wrap in the geometry arithmetic).
         let cw = w.saturating_mul(scale);
         let ch = h.saturating_mul(scale);
         // MENUFIT — and the same top bound, for the same reason: a `create_at` that lands a pinned
         // row under the menu bar strands it exactly as a `move_to` would. See `move_to_inner`.
-        let min_y = work_top(info.width, info.height) + TITLE_H + BORDER;
-        let max_x = info.width.saturating_sub(cw + BORDER).max(BORDER);
-        let max_y = info.height.saturating_sub(ch + BORDER).max(min_y);
-        Some((x.clamp(BORDER, max_x), y.clamp(min_y, max_y), scale, info.width, info.height))
+        let min_y = work_top(info.width, info.height) + TITLE_H() + BORDER();
+        let max_x = info.width.saturating_sub(cw + BORDER()).max(BORDER());
+        let max_y = info.height.saturating_sub(ch + BORDER()).max(min_y);
+        Some((x.clamp(BORDER(), max_x), y.clamp(min_y, max_y), scale, info.width, info.height))
     });
     let mut t = table();
     let slot = match t.rows.iter().position(|r| !r.used) {
@@ -23524,7 +23524,7 @@ fn create_inner(
     };
     let z = t.next_z;
     t.next_z = t.next_z.wrapping_add(1).max(1);
-    let id = (slot + 1) as WinId;
+    let id = (slot + 1) as WinId; native_slot_store(slot, native); // UIMETRICS (B372): the slot's native bit is (re)written on EVERY create, so a recycled slot never inherits it
     // WPACE-TEXT — a re-issued slot must not inherit the dead tenant's shadow: the validity bit
     // comes down here, under the same table lock that publishes the row, which is the single point
     // every close path funnels through on its way to reuse. The buffer itself is not touched: it is
@@ -23577,7 +23577,7 @@ fn create_inner(
     // draw no chrome, `controls` declines them by policy, and `compat_present` overwrites this
     // field with the caller's own scale in its second critical section.
     if !compat {
-        row.scale = cluster_min_scale(w);
+        row.scale = if native { 1 } else { cluster_min_scale(w) }; // UIMETRICS: a native row is born at scale 1
     }
     // WINTITLE — the row is born with the MINTED title, never the caller's bytes. See `TitleSource`.
     row.title_len = minted_len;
@@ -23722,7 +23722,7 @@ fn create_inner(
 /// Gap in panel pixels between tiled windows (and from the panel edge).
 ///
 /// CRISPYWIRE — `theme::GAP`, the kit's `metrics.gap`. WC-A's invented `8` is gone.
-const GAP: usize = super::theme::GAP;
+#[allow(non_snake_case)] #[inline] fn GAP() -> usize { super::theme::GAP() }
 
 /// WC-SCALE — the LEGIBILITY CEILING on a window's integer upscale, for a panel `ph` pixels tall.
 ///
@@ -23757,7 +23757,7 @@ const GAP: usize = super::theme::GAP;
 /// already wide enough at the cap and are untouched. See [`min_width_scale`].
 fn legibility_cap(ph: usize) -> usize {
     crate::ui::SCALE_MAX
-        .saturating_mul(crate::ui::Metrics::for_height(ph).scale)
+        .saturating_mul(crate::ui::Metrics::panel().scale)
         .max(1)
 }
 
@@ -23854,8 +23854,8 @@ fn scale_in(pw: usize, ph: usize, usable_h: usize, w: usize, h: usize, cap: usiz
 /// question answered ("how big may this window get before it leaves the glass?") and a second copy of
 /// it would be a second chance for the two to disagree.
 fn fit_scale(pw: usize, usable_h: usize, w: usize, h: usize) -> usize {
-    let sw = pw.saturating_sub(2 * BORDER) / w.max(1);
-    let sh = usable_h.saturating_sub(TITLE_H + 2 * BORDER) / h.max(1);
+    let sw = pw.saturating_sub(2 * BORDER()) / w.max(1);
+    let sh = usable_h.saturating_sub(TITLE_H() + 2 * BORDER()) / h.max(1);
     sw.min(sh).max(1)
 }
 
@@ -23866,7 +23866,7 @@ fn fit_scale(pw: usize, usable_h: usize, w: usize, h: usize) -> usize {
 /// scale 4 gives a 128-px content strip, 20 px short of [`CLUSTER_MIN_SRC_W`]. Rounding down here
 /// would leave the window one step inside the very band this exists to close.
 fn cluster_min_scale(w: usize) -> usize {
-    CLUSTER_MIN_SRC_W.div_ceil(w.max(1)).max(1)
+    CLUSTER_MIN_SRC_W().div_ceil(w.max(1)).max(1)
 }
 
 /// WMMINW — **the MINIMUM WINDOW WIDTH, as a scale floor.** Peter's ruling, 2026-08-11: no window is
@@ -23924,8 +23924,8 @@ fn min_width_scale(pw: usize, usable_h: usize, w: usize, h: usize) -> usize {
 /// Costs one pass over the table (`MAX_WINDOWS` rows of integer arithmetic) and takes no locks: the
 /// caller already holds the table.
 fn flow_fits(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize, cap: usize) -> bool {
-    let mut cx = GAP;
-    let mut cy = wtop + GAP + TITLE_H + BORDER;
+    let mut cx = GAP();
+    let mut cy = wtop + GAP() + TITLE_H() + BORDER();
     let mut row_h = 0usize;
     for i in 0..MAX_WINDOWS {
         let r = &t.rows[i];
@@ -23933,20 +23933,20 @@ fn flow_fits(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize, cap:
             continue;
         }
         let (w, h) = (r.w.max(1), r.h.max(1));
-        let scale = scale_in(pw, ph, usable_h, w, h, cap);
-        let bw = w.saturating_mul(scale).saturating_add(2 * BORDER);
+        let scale = if native_slot(i) { 1 } else { scale_in(pw, ph, usable_h, w, h, cap) }; // UIMETRICS (B372)
+        let bw = w.saturating_mul(scale).saturating_add(2 * BORDER());
         let bh = h
             .saturating_mul(scale)
-            .saturating_add(TITLE_H + 2 * BORDER);
-        if cx.saturating_add(bw) > pw && cx > GAP {
-            cx = GAP;
-            cy = cy.saturating_add(row_h).saturating_add(GAP);
+            .saturating_add(TITLE_H() + 2 * BORDER());
+        if cx.saturating_add(bw) > pw && cx > GAP() {
+            cx = GAP();
+            cy = cy.saturating_add(row_h).saturating_add(GAP());
             row_h = 0;
         }
         let py = glassfix3_clear(t, r.z, r.id, cx, cy, bw, bh); if py > wtop.saturating_add(usable_h.saturating_sub(bh)) { // GLASSFIX3 — ⚠ SAME-LINE fold, line-NEUTRAL: `py` is `place`'s pushed origin, so this answers for the layout `place` will publish.
             return false;
         }
-        cx = cx.saturating_add(bw).saturating_add(GAP);
+        cx = cx.saturating_add(bw).saturating_add(GAP());
         row_h = row_h.max(bh + py.saturating_sub(cy));
     }
     true
@@ -23984,7 +23984,7 @@ fn fit_cap(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize) -> usi
         if !r.used || r.compat || r.pinned {
             continue;
         }
-        natural = natural.max(scale_in(pw, ph, usable_h, r.w.max(1), r.h.max(1), usize::MAX));
+        natural = natural.max(if native_slot(i) { 1 } else { scale_in(pw, ph, usable_h, r.w.max(1), r.h.max(1), usize::MAX) }); // UIMETRICS (B372)
     }
     let mut cap = natural;
     while cap > 1 {
@@ -24043,7 +24043,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
                 "[wm] tile-top top={} usable_h={} cy0={} panel={}x{}",
                 wtop,
                 usable_h,
-                wtop + GAP + TITLE_H + BORDER,
+                wtop + GAP() + TITLE_H() + BORDER(),
                 pw,
                 ph
             );
@@ -24067,10 +24067,10 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
     let mut flow_rows = 1usize;
     let mut smax = 0usize;
     let mut clamped = 0usize;
-    let mut cx = GAP;
+    let mut cx = GAP();
     // MENUFIT — the first row's CONTENT origin starts one full chrome below the work area's top, so
     // its OUTER box begins at `wtop + GAP`: a whole title bar, discs included, below the strip.
-    let mut cy = wtop + GAP + TITLE_H + BORDER;
+    let mut cy = wtop + GAP() + TITLE_H() + BORDER();
     let mut row_h = 0usize;
     for i in 0..MAX_WINDOWS {
         let r = &t.rows[i];
@@ -24078,15 +24078,15 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
             continue;
         }
         let (w, h) = (r.w.max(1), r.h.max(1));
-        let scale = scale_in(pw, ph, usable_h, w, h, cap);
+        let scale = if native_slot(i) { 1 } else { scale_in(pw, ph, usable_h, w, h, cap) }; // UIMETRICS (B372): native rows are never magnified
         // F5 — saturating throughout; `w`/`h` come from the caller via `create`.
-        let bw = w.saturating_mul(scale).saturating_add(2 * BORDER);
+        let bw = w.saturating_mul(scale).saturating_add(2 * BORDER());
         let bh = h
             .saturating_mul(scale)
-            .saturating_add(TITLE_H + 2 * BORDER);
-        if cx.saturating_add(bw) > pw && cx > GAP {
-            cx = GAP;
-            cy = cy.saturating_add(row_h).saturating_add(GAP);
+            .saturating_add(TITLE_H() + 2 * BORDER());
+        if cx.saturating_add(bw) > pw && cx > GAP() {
+            cx = GAP();
+            cy = cy.saturating_add(row_h).saturating_add(GAP());
             row_h = 0;
             flow_rows += 1;
         }
@@ -24125,7 +24125,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
                 let cand = ceiling
                     .saturating_sub(k.saturating_mul(step))
                     .max(wtop);
-                let by = cand.saturating_sub(TITLE_H + BORDER);
+                let by = cand.saturating_sub(TITLE_H() + BORDER());
                 if !placed[..np].contains(&(cx, by, bw, bh)) {
                     ry = cand;
                     break;
@@ -24140,7 +24140,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         // reclaimed by `reclaim` at every `place` call site.
         let before = outer_box(r);
         r.scale = scale;
-        r.x = cx + BORDER;
+        r.x = cx + BORDER();
         // PULSE-2 — the last-resort clamp. The scale rule already keeps a single row inside
         // `usable_h`, but rows STACK: enough windows and `cy` walks off the bottom. When that happens
         // the window is pulled back up so its box ends at the reservation; a window over the
@@ -24165,7 +24165,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         placed[np] = now;
         pids[np] = (r.id, r.owner_asid);
         np += 1;
-        cx = cx.saturating_add(bw).saturating_add(GAP);
+        cx = cx.saturating_add(bw).saturating_add(GAP());
         row_h = row_h.max(bh + ry.saturating_sub(cy));
     }
 
@@ -24463,7 +24463,7 @@ static HT_SURF: [u32; FIX_W * FIX_H] = [0x0020_C080; FIX_W * FIX_H];
 /// fixture window carries a control cluster at scale 1 and therefore at every scale. 160 is the
 /// next multiple of 32 above the floor, i.e. 12 px of margin against the next metric nudge.
 #[cfg(feature = "witness")]
-pub const FIX_W: usize = 160;
+pub const FIX_W: usize = 160; // UIMETRICS (B372): unchanged — it clears the cluster floor at scale 1.0 (105 px with the kit's 12-px disc); at a larger dpi scale an UNPINNED fixture row is floored by `min_width_scale` like any row, and the two fixtures that PIN scale 1 (CTRLDECLINE, DMGOVLP) take `fix_pin_w()` on `HT_WIDE` (file tail)
 
 /// The fixture surfaces' SOURCE height. Unchanged: nothing about the control cluster is a function
 /// of height, and 8 rows keeps the surfaces small.
@@ -24477,7 +24477,7 @@ pub const FIX_STRIDE: usize = FIX_W * 4;
 /// **The tripwire the last three re-sizings needed and did not have.** If a theme metric ever
 /// raises `controls`'s floor past the fixture width again, this fails the build.
 #[cfg(feature = "witness")]
-const _: () = assert!(FIX_W >= CLUSTER_MIN_SRC_W);
+const _: () = { let m = crate::ui::Metrics::at(2, 0); assert!(FIX_W >= 5 * m.gap + 3 * m.ctrl_box + m.chrome_cw); }; // UIMETRICS: `CLUSTER_MIN_SRC_W` at scale 1.0, proven at compile time (the scale-pinning fixtures' proof at 4.0 is `HT_WIDE`'s, file tail)
 
 /// CLICK-ROUTE — the HIT-TEST witness: does [`hit_test`] name the window an operator would say they
 /// clicked on?
@@ -24809,7 +24809,7 @@ fn clickplain_leg(_owner: u64, _other: u64, _surf: usize, _len: usize) -> Option
 fn aim_close_control(w: WinId, cx: i32, cy: i32) -> bool {
     // A provisional placement that is legal by construction: the origin must clear the chrome the
     // window carries above and to the left of its content.
-    move_to(w, BORDER, TITLE_H + BORDER);
+    move_to(w, BORDER(), TITLE_H() + BORDER());
     let Some((bx, by, d)) = close_box_rect(w) else {
         return false; // the strip declined the control (too narrow for the cluster plus a caption)
     };
@@ -24818,7 +24818,7 @@ fn aim_close_control(w: WinId, cx: i32, cy: i32) -> bool {
     // is exact — no search, no iteration.
     let nx = i.x as i64 + (cx as i64 - (bx + d / 2) as i64);
     let ny = i.y as i64 + (cy as i64 - (by + d / 2) as i64);
-    if nx < BORDER as i64 || ny < (TITLE_H + BORDER) as i64 {
+    if nx < BORDER() as i64 || ny < (TITLE_H() + BORDER()) as i64 {
         return false; // the window would need to start off the panel
     }
     move_to(w, nx as usize, ny as usize);
@@ -24971,7 +24971,7 @@ fn corner_leg(wa: WinId, wb: WinId) -> Option<bool> {
         let t = table();
         let r = row(&t, wb)?;
         let (bx, by, bw, bh) = outer_box(r);
-        let rad = super::theme::CORNER_RADIUS.min(bw / 2).min(bh / 2);
+        let rad = super::theme::CORNER_RADIUS().min(bw / 2).min(bh / 2);
         (bx, by, bw, rad)
     };
     // The table lock is released above: `hit_test` and `chrome_hit` take it themselves.
@@ -25038,7 +25038,7 @@ pub fn hittest_selftest() {
     // One origin for both (so exactly one can own the probe point), upper-middle, clear of WC-F's
     // reserved boxes at the bottom edge. `move_to` pins the rows against the tiler below.
     let ox = info.width / 3;
-    let oy = info.height / 4 + TITLE_H + BORDER;
+    let oy = info.height / 4 + TITLE_H() + BORDER();
     // The outer box the probe rows WILL be given, from the tiler's own scale rule — asked before any
     // row exists, so the miss-point search below can run against the panel as it stands.
     let (scale, bw, bh) = match spawn_geometry(8, 8) {
@@ -25048,7 +25048,7 @@ pub fn hittest_selftest() {
             return;
         }
     };
-    let (bx, by) = (ox.saturating_sub(BORDER), oy.saturating_sub(TITLE_H + BORDER));
+    let (bx, by) = (ox.saturating_sub(BORDER()), oy.saturating_sub(TITLE_H() + BORDER()));
 
     // CLICK-X86 fallout — the MISS point is FOUND on the live table, never derived from a constant.
     // Until kernel furniture had an owner, `hit_test` skipped every owner-0 row, so everything but an
@@ -25066,7 +25066,7 @@ pub fn hittest_selftest() {
     // asking `hit_test`, and the search runs BEFORE the probe rows exist — so the only thing it can
     // reject is a point a REAL window owns, and the leg's own claim (still a miss with both probes
     // up) stays a claim about the probe rows rather than a restatement of the search.
-    let diag = (8 * scale + BORDER + 4) as i32;
+    let diag = (8 * scale + BORDER() + 4) as i32;
     let (pw, ph) = (info.width as i32, info.height as i32);
     let in_probe_box = |x: i32, y: i32| {
         x >= bx as i32 && y >= by as i32 && x < (bx + bw) as i32 && y < (by + bh) as i32
@@ -25501,20 +25501,20 @@ pub fn ctrldecline_selftest() {
     /// band ASID keeps that alarm honest.
     const ASID_F: u64 = KERNEL_OWNER_BASE + 0x40;
     /// One source pixel under the floor: `bw = UNDER_W + 2*BORDER = CLUSTER_MIN_BOX_W - 1`.
-    const UNDER_W: usize = CLUSTER_MIN_SRC_W - 1;
+    #[allow(non_snake_case)] #[inline] fn UNDER_W() -> usize { CLUSTER_MIN_SRC_W() - 1 }
     /// Exactly the floor: `bw = CLUSTER_MIN_BOX_W`.
-    const AT_W: usize = CLUSTER_MIN_SRC_W;
+    #[allow(non_snake_case)] #[inline] fn AT_W() -> usize { CLUSTER_MIN_SRC_W() }
     // The fixture surface must be able to SUPPLY both widths, or the rows would be re-pinned to a
     // width their own surface does not cover.
-    const _: () = assert!(AT_W <= FIX_W && UNDER_W >= 1);
+    const _: () = { let m = crate::ui::Metrics::at(crate::video::dpi::S2_MAX, 0); assert!(5 * m.gap + 3 * m.ctrl_box + m.chrome_cw <= FIX_WIDE_W); }; // UIMETRICS: AT_W (the floor) <= the WIDE surface at every scale; UNDER_W >= 1 since the floor is > 1
     const _: () = assert!(is_kernel_owner(ASID_F));
     const _: () = assert!(ASID_F != KERNEL_OWNER_CONSOLE && ASID_F != KERNEL_OWNER_DESKTOP);
 
-    let s = &raw const HT_SURF as usize;
-    let len = core::mem::size_of_val(&HT_SURF);
-    let wn = create(ASID_N, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"cd-n");
-    let ww = create(ASID_W, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"cd-w");
-    let wf = create(ASID_F, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"cd-f");
+    let s = &raw const HT_WIDE as usize; // UIMETRICS: the wide surface — the rows are pinned at AT_W, which scales
+    let len = core::mem::size_of_val(&HT_WIDE);
+    let wn = create(ASID_N, s, len, fix_pin_w() as u32, FIX_H as u32, FIX_WIDE_STRIDE as u32, b"cd-n");
+    let ww = create(ASID_W, s, len, fix_pin_w() as u32, FIX_H as u32, FIX_WIDE_STRIDE as u32, b"cd-w");
+    let wf = create(ASID_F, s, len, fix_pin_w() as u32, FIX_H as u32, FIX_WIDE_STRIDE as u32, b"cd-f");
     if wn == WIN_NONE || ww == WIN_NONE || wf == WIN_NONE {
         serial_println!(
             ":: WMCTRL: controls-declined — SKIP (window table full: n={} w={} f={}) ::",
@@ -25558,7 +25558,7 @@ pub fn ctrldecline_selftest() {
         // therefore load-bearing rather than incidental — pinned under the floor, this row would
         // legitimately arm a decline line and the `quiet` leg would red, which is the correct
         // behaviour and is why the width is stated here rather than inherited from `FIX_W`.
-        for (id, w) in [(wn, UNDER_W), (ww, AT_W), (wf, AT_W)] {
+        for (id, w) in [(wn, UNDER_W()), (ww, AT_W()), (wf, AT_W())] {
             if let Some(r) = row_mut(&mut t, id) {
                 r.w = w;
                 r.scale = 1;
@@ -25660,12 +25660,12 @@ pub fn ctrldecline_selftest() {
         // `dockbuild=` says WHICH contract was in force, so a reader can tell a no-dock build's
         // `minzoom=true` (correctly no cluster) from x86's (minimise and zoom both present).
         ":: WMCTRL: controls-declined — floor={} under bw={} none={} fired={} rl={} atfloor bw={} some={} furniture close={} minzoom={} packed={}/{:?} dockbuild={} silent={} reaped={} :: {} ::",
-        CLUSTER_MIN_BOX_W,
-        UNDER_W + 2 * BORDER,
+        CLUSTER_MIN_BOX_W(),
+        UNDER_W() + 2 * BORDER(),
         under_none,
         fired,
         after_rl,
-        AT_W + 2 * BORDER,
+        AT_W() + 2 * BORDER(),
         at_some,
         furn_close,
         furn_ctrls,
@@ -25873,8 +25873,8 @@ pub fn dmgovlp_selftest() {
     // Outer boxes at scale 1: the fixture pins the scale itself, so these are exact, not layout
     // guesses. All coordinates below are OUTER-BOX coordinates; content origins (what `move_to`
     // takes) are derived at the pin loop.
-    let bw = FIX_W + 2 * BORDER; // 170 at the shipping theme
-    let bh = FIX_H + TITLE_H + 2 * BORDER; // 52 at the shipping theme
+    let bw = fix_pin_w() + 2 * BORDER(); // 170 at the shipping theme (UIMETRICS: 160 + 10 at 1.0; 263 + 26 at 2.5)
+    let bh = FIX_H + TITLE_H() + 2 * BORDER(); // 52 at the shipping theme
     let (qx, qy) = (bw / 4, bh / 4);
     let top = work_top(pw, ph);
     let x0 = 8usize;
@@ -25892,7 +25892,7 @@ pub fn dmgovlp_selftest() {
     ];
     // Defensive fit check — the 512x400 floor above covers the shipping theme; this covers a
     // future chrome resize without letting `move_to`'s clamp silently shear the overlap geometry.
-    let need_w = x0 + 2 * (bw - 8) + bw + BORDER;
+    let need_w = x0 + 2 * (bw - 8) + bw + BORDER();
     let need_h = yb + 2 * qy + bh + 8;
     if need_w > pw || need_h > ph {
         serial_println!(
@@ -25903,12 +25903,12 @@ pub fn dmgovlp_selftest() {
     }
 
     // ---- rows: create, then pin at scale 1, then place --------------------------------------
-    let s = &raw const HT_SURF as usize;
-    let len = core::mem::size_of_val(&HT_SURF);
+    let s = &raw const HT_WIDE as usize; // UIMETRICS: pinned at scale 1, so the width is fix_pin_w() on the wide surface
+    let len = core::mem::size_of_val(&HT_WIDE);
     let mut w = [WIN_NONE; 6];
     let titles: [&[u8]; 6] = [b"ov0", b"ov1", b"ov2", b"ov3", b"ov4", b"ov5"];
     for i in 0..6 {
-        w[i] = create(OWNERS[i], s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, titles[i]);
+        w[i] = create(OWNERS[i], s, len, fix_pin_w() as u32, FIX_H as u32, FIX_WIDE_STRIDE as u32, titles[i]);
     }
     if w.iter().any(|&id| id == WIN_NONE) {
         serial_println!(
@@ -25939,7 +25939,7 @@ pub fn dmgovlp_selftest() {
     let mut placed = true;
     for i in 0..6 {
         let (bx, by) = boxes[i];
-        let (cx, cy) = (bx + BORDER, by + TITLE_H + BORDER);
+        let (cx, cy) = (bx + BORDER(), by + TITLE_H() + BORDER());
         move_to(w[i], cx, cy);
         placed &= info(w[i]).map(|inf| (inf.x, inf.y)) == Some((cx, cy));
     }
@@ -27233,7 +27233,7 @@ pub fn closemin_selftest() {
 /// [`minimise`]'s shape, without the erase (a raise vacates nothing).
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn raise_one(id: WinId) -> bool {
-    let mut t = table();
+    crate::video::lag::window_shown(); let mut t = table(); // GLASSLAG M1 (B370): a tile raise ends a launch's [lag] app stage (same-line fold).
     let z = t.next_z;
     let ok = match row_mut(&mut t, id) {
         Some(r) if !r.compat => {
@@ -28356,7 +28356,7 @@ pub fn glassfix2_selftest() {
 
     // ---- SO5: one cursor, one size, everywhere ------------------------------------------------
     // Each module's own expression, RESTATED rather than borrowed — see the header.
-    let s = crate::ui::Metrics::for_height(ph).scale;
+    let s = crate::ui::Metrics::panel().scale;
     let comp = (crate::ui::BASE_CELL + 1) * s;
     let back = 9 * (s + 1);
     // Over a window the back buffer is subtracted, so the compositor's arrow is the only one that
@@ -28380,7 +28380,7 @@ pub fn glassfix2_selftest() {
         (a.1 + a.3).min(b.1 + b.3).saturating_sub(a.1.max(b.1))
     };
     let title_band =
-        |b: (usize, usize, usize, usize)| (b.0, b.1, b.2, (TITLE_H + BORDER).min(b.3));
+        |b: (usize, usize, usize, usize)| (b.0, b.1, b.2, (TITLE_H() + BORDER()).min(b.3));
     // Every live, non-compat row's outer box, snapshotted with the lock RELEASED before any serial
     // write (`tile-fit`'s discipline).
     // GLASSFIX3 — and each row's STACKING KEY, `(z, id)`: the compositor's own paint order
@@ -28451,8 +28451,8 @@ pub fn glassfix2_selftest() {
     let mut pins = [WIN_NONE; 3];
     if let Some((_s, ow, oh)) = spawn_geometry(FIX_W, FIX_H) {
         let wtop = work_top(pw, ph);
-        let px = pw.saturating_sub(ow) / 2 + BORDER;
-        let py = wtop + work_h(pw, ph).saturating_sub(oh) / 2 + TITLE_H + BORDER;
+        let px = pw.saturating_sub(ow) / 2 + BORDER();
+        let py = wtop + work_h(pw, ph).saturating_sub(oh) / 2 + TITLE_H() + BORDER();
         for i in 0..3 {
             pins[i] = create_at(
                 PIN_OWNERS[i],
@@ -28500,7 +28500,7 @@ pub fn glassfix2_selftest() {
         // row below its top, which is inside the band by construction (`TITLE_H` is 34 and the
         // step is `BORDER` = 5).
         let victim = bx[0];
-        if move_to(w[3], victim.0 + BORDER, victim.1 + TITLE_H + BORDER + 1) {
+        if move_to(w[3], victim.0 + BORDER(), victim.1 + TITLE_H() + BORDER() + 1) {
             let mut cbx = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
             let mut cbid = [WIN_NONE; MAX_WINDOWS];
             let mut cbz = [(0u32, WIN_NONE); MAX_WINDOWS];
@@ -28559,7 +28559,7 @@ pulse_over_console={} -> {} ::",
         pinned,
         n,
         control as u8,
-        TITLE_H,
+        TITLE_H(),
         cascade_step(),
         pw,
         ph,
@@ -29100,8 +29100,8 @@ pub fn wcd_skip_latch_check() { if crate::tests::defer("wcdskip", wcd_skip_latch
 
 /// GLASSFIX3 — the cascade offset: one title band, `TITLE_H + BORDER` (39 px at the shipping theme,
 /// on every panel — the strip is not scaled with `ui::Metrics::scale`).
-pub(super) const fn cascade_step() -> usize {
-    TITLE_H + BORDER
+pub(super) fn cascade_step() -> usize {
+    TITLE_H() + BORDER()
 }
 
 /// GLASSFIX3 — rows of `b` under `a`, half-open, x first (GLASSFIX2's `rows_over`, restated so the
@@ -29115,7 +29115,7 @@ fn glassfix3_rows(a: (usize, usize, usize, usize), b: (usize, usize, usize, usiz
 
 /// GLASSFIX3 — an outer box's title band: its top `TITLE_H + BORDER` rows.
 fn glassfix3_band(b: (usize, usize, usize, usize)) -> (usize, usize, usize, usize) {
-    (b.0, b.1, b.2, (TITLE_H + BORDER).min(b.3))
+    (b.0, b.1, b.2, (TITLE_H() + BORDER()).min(b.3))
 }
 
 /// GLASSFIX3 — the content origin a `create_at` row of `cw` x `ch` content pixels is actually given,
@@ -29130,17 +29130,17 @@ fn glassfix3_cascade(
     ph: usize,
 ) -> (usize, usize) {
     let step = cascade_step();
-    let min_y = work_top(pw, ph) + TITLE_H + BORDER;
+    let min_y = work_top(pw, ph) + TITLE_H() + BORDER();
     let bottom = work_top(pw, ph) + work_h(pw, ph);
-    let max_x = pw.saturating_sub(cw + BORDER).max(BORDER);
-    let max_y = bottom.saturating_sub(ch + BORDER).max(min_y);
+    let max_x = pw.saturating_sub(cw + BORDER()).max(BORDER());
+    let max_y = bottom.saturating_sub(ch + BORDER()).max(min_y);
     let (mut cx, mut cy) = (x, y);
     for _ in 0..2 * MAX_WINDOWS {
         let bx = (
-            cx.saturating_sub(BORDER),
-            cy.saturating_sub(TITLE_H + BORDER),
-            cw.saturating_add(2 * BORDER),
-            ch.saturating_add(TITLE_H + 2 * BORDER),
+            cx.saturating_sub(BORDER()),
+            cy.saturating_sub(TITLE_H() + BORDER()),
+            cw.saturating_add(2 * BORDER()),
+            ch.saturating_add(TITLE_H() + 2 * BORDER()),
         );
         let hit = t.rows.iter().find(|r| {
             r.used && !r.compat && r.z != PARKED_Z && glassfix3_rows(bx, glassfix3_band(outer_box(r))) > 0
@@ -29150,7 +29150,7 @@ fn glassfix3_cascade(
         };
         let nx = r.x.saturating_add(step);
         let ny = r.y.saturating_add(step);
-        cx = if nx > max_x { BORDER } else { nx };
+        cx = if nx > max_x { BORDER() } else { nx };
         cy = if ny > max_y { min_y } else { ny };
     }
     (cx, cy)
@@ -29161,7 +29161,7 @@ fn glassfix3_cascade(
 /// nor sits with its own band under a higher pinned row. Identity when nothing obstructs it, which is
 /// every layout with no pinned row in it.
 fn glassfix3_clear(t: &Table, z: u32, id: WinId, ox: usize, y: usize, bw: usize, bh: usize) -> usize {
-    let mut top = y.saturating_sub(TITLE_H + BORDER);
+    let mut top = y.saturating_sub(TITLE_H() + BORDER());
     for _ in 0..2 * MAX_WINDOWS {
         let me = (ox, top, bw, bh);
         let mut moved = false;
@@ -29189,7 +29189,7 @@ fn glassfix3_clear(t: &Table, z: u32, id: WinId, ox: usize, y: usize, bw: usize,
             break;
         }
     }
-    top + TITLE_H + BORDER
+    top + TITLE_H() + BORDER()
 }
 
 // ── LOGINZ (rmbp-ledger B223; flight 15 §2, the boot-1 blocker) ────────────────────────────────────
@@ -29558,7 +29558,7 @@ pub fn close_all_furniture_except(keep: WinId) -> usize {
 /// `surf` is a `w * h * 4` xRGB buffer that must outlive the row. Returns [`WIN_NONE`] on refusal.
 pub fn splash_open(surf: usize, surf_len: usize, w: usize, h: usize) -> WinId {
     let stride = w.saturating_mul(4);
-    let id = create_inner(0, surf, surf_len, w, h, stride, b"", true, None);
+    let id = create_inner(0, surf, surf_len, w, h, stride, b"", true, None, false);
     if id == WIN_NONE {
         return WIN_NONE;
     }
@@ -29731,7 +29731,7 @@ pub fn rs_solve(zone: u8, dx: i64, dy: i64, g: (i64, i64, i64, i64, i64), cap: (
     let (x0, y0, w0, h0, sc) = g;
     let sc = sc.max(1);
     let (pw, ph, top) = pan;
-    let (b, th) = (BORDER as i64, TITLE_H as i64);
+    let (b, th) = (BORDER() as i64, TITLE_H() as i64);
     let (minw, minh) = ((RS_MIN_W as i64).min(cap.0), (RS_MIN_H as i64).min(cap.1));
     let horiz = zone & (RS_L | RS_R) != 0;
     let vert = zone & (RS_T | RS_B) != 0;
@@ -30089,4 +30089,102 @@ pub fn frame_of(id: WinId) -> Option<(usize, usize, usize, usize)> {
     let r = t.rows.iter().find(|r| r.used && r.id == id)?;
     let b = outer_box(r);
     if b.2 == 0 || b.3 == 0 { None } else { Some(b) }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// UIMETRICS (rmbp-ledger B372, R85 item 11) — NATIVE kernel windows.
+//
+// A native row is drawn at its real pixel size: its surface is laid out by the painter with `ui::Metrics`
+// (`ui::px`, `text::Face::Ui` at `font_size x ppi / 96`), so the compositor's integer window scale — the
+// MAGNIFY path — never applies to it: `create_inner` seeds and places it at scale 1, `place` / `flow_fits` /
+// the capacity search answer 1 for it, and `zoom` declines it (zoom IS magnification). The magnify path
+// stays for ring-3 surfaces, whose small surface is the ask. One bit per slot, (re)written under the table
+// lock by EVERY create, so a recycled slot never inherits a dead tenant's bit.
+// ---------------------------------------------------------------------------------------------------
+
+static NATIVE_SLOTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Record whether slot `slot`'s new tenant is native (called by `create_inner` for every create).
+fn native_slot_store(slot: usize, native: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if slot >= 32 {
+        return;
+    }
+    if native {
+        NATIVE_SLOTS.fetch_or(1 << slot, Relaxed);
+    } else {
+        NATIVE_SLOTS.fetch_and(!(1u32 << slot), Relaxed);
+    }
+}
+
+/// Is slot `slot`'s tenant a native (never magnified) window?
+fn native_slot(slot: usize) -> bool {
+    slot < 32 && NATIVE_SLOTS.load(core::sync::atomic::Ordering::Relaxed) & (1 << slot) != 0
+}
+
+/// UIMETRICS: [`create_at`] for a NATIVE kernel window — the surface is `w x h` real panel pixels and the row
+/// is never magnified. The kernel windows (Settings, Activity, login, Quarry, the viewer and the editor, the
+/// installer GUI) create through this.
+#[allow(clippy::too_many_arguments)]
+pub fn create_at_native(owner_asid: u64, surf: usize, surf_len: usize, w: u32, h: u32, stride: u32, title: &[u8], x: usize, y: usize) -> WinId {
+    create_inner(owner_asid, surf, surf_len, w as usize, h as usize, stride as usize, title, false, Some((x, y)), true)
+}
+
+/// UIMETRICS: [`spawn_geometry`] for a native window — scale 1, the outer box is the surface plus the chrome.
+pub fn spawn_geometry_native(w: usize, h: usize) -> Option<(usize, usize, usize)> {
+    if !super::WRITER.lock().is_ready() {
+        return None;
+    }
+    Some((1, w.saturating_add(2 * BORDER()), h.saturating_add(TITLE_H() + 2 * BORDER())))
+}
+
+/// UIMETRICS (seat, B372): Facet's window scale IS its image zoom — a magnified Facet row is content, not furniture,
+/// and is not counted in `magnified=`.
+fn uimetrics_zoom_owner(owner: u64) -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    #[cfg(feature = "facet")]
+    if owner == super::facet::OWNER {
+        return true;
+    }
+    let _ = owner;
+    false
+}
+
+/// UIMETRICS: `tests metrics`' census of the live table — `(kernel rows magnified, native rows, live rows)`. A
+/// kernel row is one whose owner is in the kernel band or the login/installer owner `0`; magnified = drawn at
+/// window scale > 1 (compat rows excluded: they are the legacy full-panel present).
+pub fn uimetrics_census() -> (usize, usize, usize) {
+    let t = table();
+    let (mut mag, mut nat, mut live) = (0, 0, 0);
+    for (i, r) in t.rows.iter().enumerate() {
+        if !r.used || r.compat {
+            continue;
+        }
+        live += 1;
+        if native_slot(i) {
+            nat += 1;
+        } else if (is_kernel_owner(r.owner_asid) || r.owner_asid == 0) && r.scale > 1 && !uimetrics_zoom_owner(r.owner_asid) {
+            mag += 1;
+        }
+    }
+    (mag, nat, live)
+}
+
+
+// UIMETRICS (B372, the seat's item 3) — the surface for the two fixtures that PIN their rows at scale 1
+// (CTRLDECLINE pins `r.w` at the cluster floor, DMGOVLP lays boxes out at scale 1). The floor scales with the
+// panel's dpi, so their row width is `fix_pin_w()` — `FIX_W` at 1.0 (byte-identical to before), the floor
+// itself at a larger scale (263 at 2.5) — on a surface wide enough for the floor at EVERY scale (proof below).
+#[cfg(feature = "witness")]
+pub const FIX_WIDE_W: usize = 448;
+#[cfg(feature = "witness")]
+pub const FIX_WIDE_STRIDE: usize = FIX_WIDE_W * 4;
+#[cfg(feature = "witness")]
+static HT_WIDE: [u32; FIX_WIDE_W * FIX_H] = [0x0020_C080; FIX_WIDE_W * FIX_H];
+#[cfg(feature = "witness")]
+const _: () = { let m = crate::ui::Metrics::at(crate::video::dpi::S2_MAX, 0); assert!(FIX_WIDE_W >= 5 * m.gap + 3 * m.ctrl_box + m.chrome_cw && FIX_WIDE_W >= FIX_W); };
+/// The width a scale-pinned fixture row uses: `FIX_W`, or the cluster floor when the dpi scale has raised it past.
+#[cfg(feature = "witness")]
+fn fix_pin_w() -> usize {
+    FIX_W.max(CLUSTER_MIN_SRC_W())
 }

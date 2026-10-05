@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>03 selectors and collections</title></head>
+<body>
+<main id="m">
+  <article class="post featured" data-k="1"><h3>One</h3><p class="lead">a</p><p>b</p></article>
+  <article class="post" data-k="2"><h3>Two</h3><p class="lead">c</p></article>
+  <aside><a href="#x" class="post">link</a><input type="checkbox" checked><input type="text" disabled></aside>
+</main>
+<ul id="log"></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+function ids(list) { var o = []; for (var i = 0; i < list.length; i++) o.push(list[i].tagName.toLowerCase() + (list[i].className ? '.' + list[i].className.split(' ').join('.') : '')); return o.join(' '); }
+var m = document.getElementById('m');
+log('qsa article.post: ' + document.querySelectorAll('article.post').length);
+log('qsa > p.lead: ' + ids(m.querySelectorAll('article > p.lead')));
+log('first-child/nth: ' + ids(document.querySelectorAll('article p:nth-child(2), article h3:first-child')));
+log('attr: ' + ids(document.querySelectorAll('[data-k="2"], [data-k^="1"]')));
+log(':not/:is: ' + ids(m.querySelectorAll('.post:not(article)')) + ' | ' + ids(m.querySelectorAll(':is(h3, a)')));
+log(':has: ' + ids(m.querySelectorAll('article:has(p + p)')));
+log(':checked/:disabled: ' + document.querySelectorAll('input:checked').length + ' ' + document.querySelectorAll('input:disabled').length);
+log(':scope: ' + ids(m.querySelector('article').querySelectorAll(':scope > p')));
+log('querySelector: ' + m.querySelector('.lead').textContent + ' ' + m.querySelector('nope'));
+var e = null; try { document.querySelector('##bad'); } catch (x) { e = x; }
+log('bad selector: ' + (e && e.name) + ' ' + (e && e.code));
+var byTag = document.getElementsByTagName('article'), byClass = document.getElementsByClassName('post'), byTwo = document.getElementsByClassName('post featured');
+log('live before: ' + byTag.length + ' ' + byClass.length + ' ' + byTwo.length);
+var art = document.createElement('article'); art.className = 'post'; m.appendChild(art);
+log('live after: ' + byTag.length + ' ' + byClass.length + ' ' + byTwo.length);
+var stat = document.querySelectorAll('article');
+m.removeChild(art);
+log('static stays: ' + stat.length + ' live: ' + byTag.length);
+log('getElementById: ' + document.getElementById('m').tagName + ' ' + document.getElementById('none'));
+var a = document.querySelector('a');
+log('matches/closest: ' + a.matches('aside > .post') + ' ' + a.matches('article *') + ' ' + a.closest('main').id + ' ' + a.closest('article'));
+log('webkitMatchesSelector: ' + a.webkitMatchesSelector('a[href]'));
+log('tag case: ' + document.getElementsByTagName('ARTICLE').length + ' all: ' + (document.getElementsByTagName('*').length > 10));
+log('getElementsByName: ' + document.getElementsByName('x').length);
+</script>
+</body></html>

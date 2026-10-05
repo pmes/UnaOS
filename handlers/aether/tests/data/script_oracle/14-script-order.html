@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>14 script order</title>
+<script>
+window.order = [];
+function note(s) { window.order.push(s + '@' + document.readyState); }
+document.addEventListener('readystatechange', function () { window.order.push('rsc:' + document.readyState); });
+document.addEventListener('DOMContentLoaded', function () { note('DOMContentLoaded'); });
+window.addEventListener('load', function () {
+  note('load');
+  var ol = document.getElementById('log');
+  window.order.forEach(function (s) { var li = document.createElement('li'); li.textContent = s; ol.appendChild(li); });
+});
+note('head-inline');
+</script>
+<script src="14-blocking.js"></script>
+<script defer src="14-defer1.js"></script>
+<script async src="14-async.js"></script>
+<script type="module">note('module-inline'); import('./14-dyn.mjs').then(function (m) { document.getElementById('dyn').textContent = 'dynamic import: ' + m.value; });</script>
+<script type="module" src="14-module.mjs"></script>
+<script defer src="14-defer2.js"></script>
+<script nomodule>note('nomodule-ran');</script>
+<script type="text/plain">note('data-block-ran');</script>
+</head>
+<body>
+<p id="p">paragraph</p>
+<script>note('body-inline:' + (document.getElementById('p') !== null) + ':' + (document.getElementById('after') === null));</script>
+<p id="after">after</p>
+<ol id="log"></ol>
+<div id="async-target"></div>
+<div id="dyn"></div>
+</body></html>

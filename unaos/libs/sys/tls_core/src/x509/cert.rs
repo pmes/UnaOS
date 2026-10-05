@@ -40,6 +40,7 @@ pub enum SignatureAlgorithm {
 pub mod key_usage {
     pub const DIGITAL_SIGNATURE: u16 = 1 << 0;
     pub const KEY_CERT_SIGN: u16 = 1 << 5;
+    pub const CRL_SIGN: u16 = 1 << 6;
 }
 
 /// A parsed certificate. Owns its DER.
@@ -77,6 +78,16 @@ pub struct Certificate {
     pub aia_ocsp: Vec<String>,
     /// The embedded SignedCertificateTimestampList (RFC 6962 §3.3, extension 1.3.6.1.4.1.11129.2.4.2).
     pub sct_list: Option<Vec<u8>>,
+    /// The full SubjectPublicKeyInfo encoding (CTCORE: an embedded SCT signs SHA-256 of the ISSUER's SPKI,
+    /// RFC 6962 §3.2 `issuer_key_hash`; a CT log id is SHA-256 of the log's SPKI).
+    pub spki: Vec<u8>,
+    /// RFC 7633 TLS Feature (1.3.6.1.5.5.7.1.24) features listed in the certificate, e.g. 5 = status_request
+    /// ("must-staple"). Empty when the extension is absent.
+    pub tls_features: Vec<u16>,
+    /// cRLDistributionPoints fullName URIs (RFC 5280 §4.2.1.13) — where a caller fetches a CRL; never fetched here.
+    pub crl_dp: Vec<String>,
+    /// freshestCRL (RFC 5280 §4.2.1.15) present: delta CRLs exist for this certificate's scope.
+    pub freshest_crl: bool,
 }
 
 impl Certificate {
@@ -88,6 +99,48 @@ impl Certificate {
     }
     pub fn self_issued(&self) -> bool {
         self.issuer == self.subject
+    }
+    /// RFC 7633: the certificate demands a stapled OCSP response (TLS Feature status_request = 5).
+    pub fn must_staple(&self) -> bool {
+        self.tls_features.contains(&5)
+    }
+    /// The tbsCertificate re-encoded WITHOUT the extension `ext_oid` (RFC 6962 §3.2: the precertificate TBS that
+    /// an embedded SCT signs is the final certificate's TBS minus the SCT list extension). `None` if the TBS has
+    /// no such extension; the extensions field is dropped entirely if it was the only one.
+    pub fn tbs_without_extension(&self, ext_oid: &[u8]) -> Option<Vec<u8>> {
+        let mut outer = Der::new(self.tbs());
+        let tbs = outer.expect(tag::SEQUENCE).ok()?;
+        let mut d = Der::new(tbs.value);
+        let mut body = Vec::with_capacity(tbs.value.len());
+        let mut removed = false;
+        while !d.is_empty() {
+            let el = d.tlv().ok()?;
+            if el.tag != tag::context_constructed(3) {
+                body.extend_from_slice(el.raw);
+                continue;
+            }
+            let mut w = Der::new(el.value);
+            let list = w.expect(tag::SEQUENCE).ok()?;
+            let mut l = Der::new(list.value);
+            let mut kept = Vec::with_capacity(list.value.len());
+            while !l.is_empty() {
+                let ext = l.expect(tag::SEQUENCE).ok()?;
+                let id = Der::new(ext.value).oid().ok()?;
+                if id == ext_oid {
+                    removed = true;
+                } else {
+                    kept.extend_from_slice(ext.raw);
+                }
+            }
+            if !kept.is_empty() {
+                let seq = der::encode_tlv(tag::SEQUENCE, &kept);
+                body.extend_from_slice(&der::encode_tlv(tag::context_constructed(3), &seq));
+            }
+        }
+        if !removed {
+            return None;
+        }
+        Some(der::encode_tlv(tag::SEQUENCE, &body))
     }
     /// The issuer's commonName, read out of the issuer Name (diagnostics: VEINTLS prints it as
     /// `verified=<issuer CN>`; never used for a trust decision).
@@ -144,6 +197,7 @@ impl Certificate {
         let subject_cn = common_name(subject_tlv.value);
         let spki = tbs.expect(tag::SEQUENCE)?;
         let public_key = parse_spki(spki.value)?;
+        let spki_raw = spki.raw.to_vec();
         let key_bits = spki_key_bits(spki.value)?.to_vec();
         // issuerUniqueID [1], subjectUniqueID [2]: skipped.
         tbs.optional(tag::context_primitive(1))?;
@@ -174,6 +228,10 @@ impl Certificate {
             aia_ca_issuers: Vec::new(),
             aia_ocsp: Vec::new(),
             sct_list: None,
+            spki: spki_raw,
+            tls_features: Vec::new(),
+            crl_dp: Vec::new(),
+            freshest_crl: false,
         };
         if let Some(exts) = tbs.optional(tag::context_constructed(3))? {
             if version != 3 {
@@ -234,6 +292,17 @@ impl Certificate {
             self.sct_list = Some(list.to_vec());
             if critical {
                 self.unknown_critical = true;
+            }
+            return Ok(());
+        }
+        if id == oid::PE_TLS_FEATURE {
+            // Features ::= SEQUENCE OF INTEGER (RFC 7633 §4.1). Non-critical in practice; understood either way.
+            let mut d = Der::new(value);
+            let mut s = d.sequence()?;
+            d.expect_end()?;
+            while !s.is_empty() {
+                let f = s.small_uint()?;
+                self.tls_features.push(u16::try_from(f).map_err(|_| bad("TLS Feature value"))?);
             }
             return Ok(());
         }
@@ -330,7 +399,17 @@ impl Certificate {
             }
             // Recognised, not enforced: policy processing and CRL distribution are outside this core's ceiling,
             // and both are non-critical in the Web PKI.
-            oid::CE_CERTIFICATE_POLICIES | oid::CE_CRL_DISTRIBUTION_POINTS | oid::CE_ISSUER_ALT_NAME => {
+            oid::CE_CRL_DISTRIBUTION_POINTS => {
+                // CRLDistributionPoints ::= SEQUENCE OF DistributionPoint { distributionPoint [0] { fullName [0]
+                // GeneralNames } ... }: keep the URIs (reported, fetched by the caller — CTCORE M2).
+                self.crl_dp = parse_crl_dp_uris(value).unwrap_or_default();
+                return Ok(());
+            }
+            oid::CE_FRESHEST_CRL => {
+                self.freshest_crl = true;
+                return Ok(());
+            }
+            oid::CE_CERTIFICATE_POLICIES | oid::CE_ISSUER_ALT_NAME => {
                 return Ok(());
             }
             _ => {
@@ -343,6 +422,29 @@ impl Certificate {
         d.expect_end()?;
         Ok(())
     }
+}
+
+/// The URIs in a cRLDistributionPoints value (fullName form only; nameRelativeToCRLIssuer is not a URI).
+fn parse_crl_dp_uris(value: &[u8]) -> Result<Vec<String>, CertError> {
+    let mut out = Vec::new();
+    let mut d = Der::new(value);
+    let mut dps = d.sequence()?;
+    while !dps.is_empty() {
+        let mut dp = dps.sequence()?;
+        if let Some(name) = dp.optional(tag::context_constructed(0))? {
+            let mut n = Der::new(name.value);
+            if let Some(full) = n.optional(tag::context_constructed(0))? {
+                let mut g = Der::new(full.value);
+                while !g.is_empty() {
+                    let gn = g.tlv()?;
+                    if gn.tag == 0x86 {
+                        out.push(ascii(gn.value)?);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn ascii(v: &[u8]) -> Result<String, CertError> {

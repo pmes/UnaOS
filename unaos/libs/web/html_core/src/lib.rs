@@ -24,4 +24,5 @@ pub mod tokenizer;
 pub mod tree_builder;
 
 pub use dom::{Attribute, Document, Element, Namespace, Node, NodeData, NodeId, QuirksMode};
-pub use tree_builder::{parse_document, parse_fragment, ParseOpts};
+pub use tree_builder::{parse_document, parse_fragment, ParseOpts, Step, TreeBuilder};
+pub use tokenizer::{Tokenizer, TokenizerOpts};

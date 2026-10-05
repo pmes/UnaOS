@@ -14,7 +14,48 @@ use core::sync::atomic::{AtomicBool, Ordering};
 static WITNESSED: AtomicBool = AtomicBool::new(false);
 
 /// Drive the SNTP client for this arch; cheap and idempotent once settled. Not for interrupt context.
+///
+/// GLASSLAG M2 (rmbp-ledger B370): on x86 the caller is the RENDER service's ~5 s clock (main.rs), and the
+/// body is not cheap until it settles: `dhcp_link_tick` -> `dhcp_acquire` pumps the stack for up to
+/// `DHCP_WAIT_MS` (2 s) waiting for an offer, and `witness_tick_sntp` waits on an NTP reply. Flight 22
+/// printed `SOCK-5: … no offer` every ~5 s, seven times per boot — 2 s of a parked compositor each time,
+/// under Peter's "delay in interactivity". The render clock now only STARTS the `net-tick` task (once) and
+/// returns; that task, off the compositor, runs [`tick_body`] on the same 5 s cadence.
 pub fn service_tick() {
+    if !crate::boot::services_gate("net-tick") {
+        return; // INSTALLBARE (R86): no lease, no SNTP before the Desktop's services
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !NET_TASK.swap(true, Ordering::AcqRel) {
+            let cpu = crate::arch::smp::service_cpu().unwrap_or(0);
+            crate::arch::sched::spawn("net-tick", net_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+            serial_println!("[net] tick task=net-tick cpu={} cadence_ms={} (GLASSLAG: off the render service)", cpu, NET_TICK_MS);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    tick_body()
+}
+
+/// GLASSLAG M2: the `net-tick` task has been started (x86).
+#[cfg(target_arch = "x86_64")]
+static NET_TASK: AtomicBool = AtomicBool::new(false);
+/// GLASSLAG M2: the task's cadence — the render clock's own 5 s.
+#[cfg(target_arch = "x86_64")]
+const NET_TICK_MS: u64 = 5_000;
+
+/// GLASSLAG M2: the `net-tick` task body (x86) — the old render-thread tick, on its own task.
+#[cfg(target_arch = "x86_64")]
+fn net_task(_: usize) {
+    loop {
+        tick_body();
+        crate::arch::sched::sleep_ms(NET_TICK_MS);
+    }
+}
+
+/// The tick itself (the body `service_tick` ran inline before GLASSLAG M2).
+fn tick_body() {
     #[cfg(all(feature = "smolnet", feature = "usbnet", target_arch = "x86_64"))]
     crate::smolnet::dhcp_link_tick(); // USBNET6 M3: the dongle's lease is asked for once its PHY has link (no-op once leased / with an e1000)
     if WITNESSED.load(Ordering::Relaxed) {

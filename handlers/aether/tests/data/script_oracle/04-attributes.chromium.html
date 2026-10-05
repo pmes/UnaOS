@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>04 attributes</title></head>
+<body>
+<div id="renamed" data-user-id="42" aria-label="x &amp; &quot;y&quot;" open="" data-made="yes" data-new-thing="n" class="a b">target</div>
+<svg id="s" width="10" height="10"><a id="sa" xlink:href="#target"></a></svg>
+<ul id="log"><li>get: note note null has=true</li><li>toggle: true true false false true</li><li>attributes: id=t | data-user-id=42 | data-x-y=z | role=note | aria-label=x &amp; "y" | open=</li><li>getAttributeNames: id,data-user-id,data-x-y,role,aria-label,open</li><li>Attr: role note true null true true</li><li>Attr live: region</li><li>Attr detached: null region</li><li>setAttributeNode: yes true</li><li>dataset: 42 z userId,xY,made</li><li>dataset after: n false true</li><li>reflect: renamed a b a b</li><li>NS: #target true #target</li><li>invalid name: InvalidCharacterError</li><li>hasAttributes: true false</li><li>anchor: page.html?q=1#frag page.html ?q=1 #frag http:</li></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var t = document.getElementById('t');
+t.setAttribute('Role', 'note');
+t.setAttribute('aria-label', 'x & "y"');
+t.removeAttribute('title');
+log('get: ' + t.getAttribute('role') + ' ' + t.getAttribute('ROLE') + ' ' + t.getAttribute('title') + ' has=' + t.hasAttribute('aria-label'));
+log('toggle: ' + t.toggleAttribute('hidden') + ' ' + t.hasAttribute('hidden') + ' ' + t.toggleAttribute('hidden') + ' ' + t.toggleAttribute('open', false) + ' ' + t.toggleAttribute('open', true));
+var names = [];
+for (var i = 0; i < t.attributes.length; i++) names.push(t.attributes[i].name + '=' + t.attributes[i].value);
+log('attributes: ' + names.join(' | '));
+log('getAttributeNames: ' + t.getAttributeNames().join(','));
+var at = t.getAttributeNode('role');
+log('Attr: ' + at.name + ' ' + at.value + ' ' + (at.ownerElement === t) + ' ' + at.namespaceURI + ' ' + (t.attributes.role === at) + ' ' + (t.attributes.getNamedItem('role') === at));
+at.value = 'region';
+log('Attr live: ' + t.getAttribute('role'));
+t.removeAttribute('role');
+log('Attr detached: ' + at.ownerElement + ' ' + at.value);
+var na = document.createAttribute('data-made');
+na.value = 'yes';
+t.setAttributeNode(na);
+log('setAttributeNode: ' + t.getAttribute('data-made') + ' ' + (na.ownerElement === t));
+log('dataset: ' + t.dataset.userId + ' ' + t.dataset.xY + ' ' + Object.keys(t.dataset).join(','));
+t.dataset.newThing = 'n';
+delete t.dataset.xY;
+log('dataset after: ' + t.getAttribute('data-new-thing') + ' ' + t.hasAttribute('data-x-y') + ' ' + ('userId' in t.dataset));
+t.id = 'renamed'; t.className = 'a b';
+log('reflect: ' + t.id + ' ' + t.className + ' ' + t.getAttribute('class'));
+var s = document.getElementById('sa');
+s.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', '#target');
+log('NS: ' + s.getAttributeNS('http://www.w3.org/1999/xlink', 'href') + ' ' + s.hasAttributeNS('http://www.w3.org/1999/xlink', 'href') + ' ' + s.getAttribute('xlink:href'));
+var e = null; try { t.setAttribute('bad name', 'x'); } catch (x) { e = x; }
+log('invalid name: ' + (e && e.name));
+log('hasAttributes: ' + t.hasAttributes() + ' ' + document.createElement('i').hasAttributes());
+var a = document.createElement('a'); a.href = 'page.html?q=1#frag';
+log('anchor: ' + a.getAttribute('href') + ' ' + a.pathname.split('/').pop() + ' ' + a.search + ' ' + a.hash + ' ' + a.protocol);
+var inp = document.createElement('input'); inp.maxLength = 5; inp.disabled = true; inp.size = 0;
+log('reflect types: ' + inp.getAttribute('maxlength') + ' ' + inp.getAttribute('disabled') + ' ' + inp.size + ' ' + inp.readOnly);
+document.body.appendChild(inp);
+</script>
+
+</body></html>
