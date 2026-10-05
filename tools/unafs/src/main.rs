@@ -1144,10 +1144,15 @@ fn run_bench_map(out_dir: &str, sizes: &str, version: u32, files: u64) -> Result
             let id = fs.create_file(root, "f".into()).map_err(|e| anyhow::anyhow!("{e}"))?;
             fs.write_data(id, 0, &[7u8; 4096]).map_err(|e| anyhow::anyhow!("{e}"))?;
             if files > 0 {
-                let dir = fs.mkdir(root, "many".into()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                // 1,000 files per directory (a directory's entry list is one
+                // decoded object with a bounded budget).
+                let top = fs.mkdir(root, "many".into()).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let mut made = 0u64;
                 while made < files {
-                    let n = (files - made).min(50_000);
+                    let n = (files - made).min(1_000);
+                    let dir = fs
+                        .mkdir(top, format!("d{}", made / 1_000))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let batch: Vec<BatchFile> = (0..n)
                         .map(|i| BatchFile {
                             name: format!("f{}", made + i),
