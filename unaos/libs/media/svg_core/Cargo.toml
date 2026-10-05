@@ -1,0 +1,19 @@
+[package]
+name = "svg_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "SVGCORE (SR52): SVG 1.1/2 parsing and rendering written from the specifications — XML, path data, transforms, the painting model, gradients, patterns, clipping and masking, text through font_core — onto an anti-aliased RGBA canvas. no_std + alloc."
+
+# SVGCORE (LEDGER SR52, R83): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`. Its one dependency is UnaOS's
+# own font_core (SR48): glyph outlines, shaping, and the exact-area scanline rasterizer this crate fills paths
+# with (one rasterizer, two users). Raster images inside an SVG (`<image>`) are decoded by a caller-supplied
+# hook, so pixel_core can link svg_core (its `svg` format) without a dependency cycle.
+[dependencies]
+font_core = { path = "../../text/font_core" }
+
+[features]
+default = []
+# Host convenience: `std` lets `FontSet::system()` load the fonts under /usr/share/fonts. The renderer never
+# needs it; a no_std caller hands its own font bytes to `FontSet::add`.
+std = []
