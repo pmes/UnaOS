@@ -6,10 +6,9 @@
 //!
 //! Measured, not guessed: `strace` of the staged binaries on the host (tcc 0.9.28rc on glibc 2.39 static, busybox 1.37 on
 //! glibc 2.39 static) named the surface; this file answers what `sys.rs` did not. `sys::handle`'s fall-through arm asks
-//! [`handle`] before it says `-ENOSYS`, and its `rt_sigaction`/`rt_sigprocmask`/`readlink*` arms route here.
-//! Signals are ACCEPTED, never delivered (no signal frames in this layer): the old values written back say "default action,
-//! nothing blocked, no alternate stack", the truth for a process that is never signalled. `rseq` and `clone3` answer `-ENOSYS`
-//! ON PURPOSE (the kernels before 4.18 / 5.3 did; glibc then falls back to no-rseq / `clone`), so they are not noted as gaps.
+//! [`handle`] before it says `-ENOSYS`, and its `readlink*` arms route here. (SELFBUILD2 moved `rt_sigaction`/`rt_sigprocmask`
+//! to `signal.rs`, which delivers, and `clone3` to `thread.rs`.) `rseq` answers `-ENOSYS` ON PURPOSE (the kernels before 4.18
+//! did; glibc then runs without rseq), so it is not noted as a gap.
 
 use super::proc::ProcInfo;
 use super::LinuxProc;
@@ -50,31 +49,6 @@ pub fn readlink(p: &mut LinuxProc, nr: u64, a: [u64; 6]) -> i64 {
         }
         Err(e) => e,
     }
-}
-
-/// `rt_sigaction(sig, act, oact, sz)` (13) / `rt_sigprocmask(how, set, oset, sz)` (14): accepted, never delivered.
-pub fn sigs(p: &mut LinuxProc, nr: u64, a: [u64; 6]) -> i64 {
-    if a[3] != 8 {
-        return -EINVAL; // the kernel's sigset_t is 8 bytes on x86_64
-    }
-    if nr == 13 {
-        let sig = a[0];
-        if sig == 0 || sig > 64 || (a[1] != 0 && (sig == 9 || sig == 19)) {
-            return -EINVAL; // SIGKILL/SIGSTOP cannot be caught
-        }
-        // struct kernel_sigaction { handler, flags, restorer, mask } = 32 bytes: SIG_DFL, no flags.
-        if a[2] != 0 && !p.asp.copy_out(a[2], &[0u8; 32], false) {
-            return -EFAULT;
-        }
-        return 0;
-    }
-    if a[1] != 0 && a[0] > 2 {
-        return -EINVAL; // how: SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK
-    }
-    if a[2] != 0 && !p.asp.copy_out(a[2], &[0u8; 8], false) {
-        return -EFAULT;
-    }
-    0
 }
 
 fn put(p: &LinuxProc, va: u64, b: &[u8]) -> i64 {
@@ -121,7 +95,7 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, nr: u64, a: [u64; 6]) -> 
             }
             0
         }
-        334 | 435 => -ENOSYS, // rseq / clone3: deliberate (see the module note), never noted as a gap
+        334 => -ENOSYS, // rseq: deliberate (see the module note), never noted as a gap; clone3 is SELFBUILD2's (`sys.rs` -> `thread.rs`)
         // sched_getaffinity(pid, len, mask): one CPU — every Linux process is pinned to the verb's core.
         204 => {
             if a[1] < 8 || a[1] & 7 != 0 {
@@ -182,6 +156,6 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, nr: u64, a: [u64; 6]) -> 
             // getsockname / getpeername: no descriptor of this layer is a socket
             if p.fds.get(a[0] as usize).is_some_and(|s| s.is_some()) { -ENOTSOCK } else { -EBADF }
         }
-        _ => return None,
+        _ => return super::sys3::handle(p, info, nr, a), // SELFBUILD2 M2: statx, ftruncate, flock, eventfd/epoll, socketpair, sendfile
     })
 }
