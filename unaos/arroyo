@@ -3894,7 +3894,7 @@ build_selfbuild4_x86() {
 # * SYSKAT5.LNX = crates/user-linux-hello/c/syskat5.c (mremap grow/move/FIXED/DONTUNMAP, the alternate signal stack at delivery,
 #   getcpu, madvise(MADV_HUGEPAGE), sched_yield).
 # * LLD.LNX = LLVM's `lld` at the toolchain's own LLVM release (rustc +nightly -vV: LLVM 22.1.8), built here from the release source
-#   tarball (sha256 pinned below) as ONE static, non-PIE binary (glibc -static: the host has no musl C++ runtime; no zlib/zstd, no
+#   tarball (sha256 pinned below) as ONE static-PIE binary (WINDOW2/R85: -fPIE + -static-pie; glibc: the host has no musl C++ runtime; no zlib/zstd, no
 #   plugins, X86 only), stripped. It is a multi-flavour driver: `LLD.LNX -flavor gnu …` is ld.lld. Built ONCE (target/LLD.LNX is
 #   kept; ~1960 ninja steps, about an hour on 4 idle cores). `UNAOS_LLD_LNX=<path>` stages an operator-supplied static ld.lld
 #   instead; no egress / no cmake+ninja = LLD.LNX absent = `tests selfbuild5` reports lld=skip.
@@ -3915,8 +3915,11 @@ build_selfbuild5_x86() {
     else
         echo "   SELFBUILD5: SYSKAT5.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
     fi
-    # LLD.LNX: static, ET_EXEC (the shim's loader takes no PIE), no PT_INTERP.
-    _sb5_lld_ok() { [ -s "$1" ] && [ "$(od -An -t u2 -j 16 -N 2 "$1" | tr -d ' ')" = "2" ] && ! readelf -lW "$1" 2>/dev/null | grep -q INTERP && "$1" -flavor gnu --version 2>/dev/null | grep -q "LLD ${SELFBUILD_LLVM_VER}"; }
+    # LLD.LNX: STATIC-PIE (WINDOW2, B361, R85 "relinked as PIE"): ET_DYN, no PT_INTERP, no DT_NEEDED — the shim places it at its
+    # PIE base above the low window (a 68 MB ET_EXEC at 0x400000 overlays the kernel's low identity map), glibc's own
+    # _dl_relocate_static_pie applies its RELATIVE/IRELATIVE relocations. CMAKE_SKIP_RPATH: glibc's static-PIE start-up asserts on a
+    # DT_RUNPATH (LLVM's `$ORIGIN/../lib`), so a static-PIE with one dies in _dl_relocate_static_pie before main (measured).
+    _sb5_lld_ok() { [ -s "$1" ] && [ "$(od -An -t u2 -j 16 -N 2 "$1" | tr -d ' ')" = "3" ] && ! readelf -lW "$1" 2>/dev/null | grep -q INTERP && ! readelf -dW "$1" 2>/dev/null | grep -q NEEDED && "$1" -flavor gnu --version 2>/dev/null | grep -q "LLD ${SELFBUILD_LLVM_VER}"; }
     local lld="${WORKSPACE_DIR}/target/LLD.LNX"
     if [ -n "${UNAOS_LLD_LNX:-}" ] && [ -f "${UNAOS_LLD_LNX}" ]; then
         cp "$UNAOS_LLD_LNX" "$lld"
@@ -3932,11 +3935,11 @@ build_selfbuild5_x86() {
                    "llvm-project-${SELFBUILD_LLVM_VER}.src/llvm" "llvm-project-${SELFBUILD_LLVM_VER}.src/lld" "llvm-project-${SELFBUILD_LLVM_VER}.src/cmake" \
                    "llvm-project-${SELFBUILD_LLVM_VER}.src/third-party" "llvm-project-${SELFBUILD_LLVM_VER}.src/libunwind/include"; } \
             && cmake -G Ninja -S "$src/llvm" -B "$ld/build" -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS=lld -DLLVM_TARGETS_TO_BUILD=X86 \
-                 -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DLLVM_BUILD_STATIC=ON -DLLVM_ENABLE_PIC=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=OFF \
-                 -DCMAKE_C_FLAGS=-fno-pie -DCMAKE_CXX_FLAGS=-fno-pie -DCMAKE_EXE_LINKER_FLAGS="-static -no-pie" -DLLVM_ENABLE_PLUGINS=OFF \
+                 -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DLLVM_BUILD_STATIC=OFF -DLLVM_ENABLE_PIC=ON -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+                 -DCMAKE_C_FLAGS=-fPIE -DCMAKE_CXX_FLAGS=-fPIE -DCMAKE_EXE_LINKER_FLAGS="-static-pie" -DLLVM_ENABLE_PLUGINS=OFF \
                  -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_LIBPFM=OFF \
                  -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DLLVM_ENABLE_BINDINGS=OFF \
-                 -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_BUILD_TOOLS=OFF -DLLVM_ENABLE_RTTI=OFF -DLLVM_APPEND_VC_REV=OFF >/dev/null \
+                 -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_BUILD_TOOLS=OFF -DLLVM_ENABLE_RTTI=OFF -DLLVM_APPEND_VC_REV=OFF -DCMAKE_SKIP_RPATH=ON >/dev/null \
             && ninja -C "$ld/build" lld >/dev/null; then
             strip -o "$lld" "$ld/build/bin/lld"
         fi
