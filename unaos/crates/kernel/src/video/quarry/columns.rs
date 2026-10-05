@@ -256,7 +256,7 @@ pub(super) struct Cols {
 /// and TYPE only while the name keeps [`NAME_FLOOR_WIDE`] columns. Pure.
 pub(super) fn layout(g: &Geom, li: Rect, lsb: usize, w: &Widths, trash: bool) -> Cols {
     let cell_w = g.cell_w().max(1);
-    let total = li.w.saturating_sub(lsb).saturating_sub(2 * PAD) / cell_w;
+    let total = li.w.saturating_sub(lsb).saturating_sub(2 * PAD()) / cell_w;
     let prio: &[Col] = if trash { &[Col::Size, Col::Modified, Col::Origin, Col::Type] } else { &[Col::Size, Col::Modified, Col::Type] };
     let mut chosen = [false; 5];
     let mut used = 0usize;
@@ -273,7 +273,7 @@ pub(super) fn layout(g: &Geom, li: Rect, lsb: usize, w: &Widths, trash: bool) ->
         }
     }
     let name_cols = if used == 0 { total.saturating_sub(2) } else { total.saturating_sub(used) };
-    let name_x = li.x + PAD;
+    let name_x = li.x + PAD();
     let mut x = name_x + (name_cols + 1) * cell_w;
     let mut cols = Vec::new();
     for c in [Col::Size, Col::Modified, Col::Type, Col::Origin] {

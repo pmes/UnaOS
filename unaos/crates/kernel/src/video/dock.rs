@@ -361,8 +361,8 @@ const MAX_STRIP_W: usize = strip::MAX_STRIP_W;
 /// The layout cannot ask for a strip the scratch cannot hold. A `const` proof rather than a runtime
 /// clamp, so a future `LABEL_MAX` or `MAX_WINDOWS` raise fails the BUILD.
 #[allow(dead_code)] pub(crate) fn uimetrics_assert() {
-    assert!(2 * PAD() + wm::MAX_WINDOWS * (2 * PAD() + LABEL_MAX * CELL_W()) + (wm::MAX_WINDOWS - 1) * PAD()
-        <= MAX_STRIP_W);
+    assert!(2 * PAD() + wm::MAX_WINDOWS * (2 * PAD() + CELL_W()) + (wm::MAX_WINDOWS - 1) * PAD()
+        <= MAX_STRIP_W); // UIMETRICS (B372): ONE-glyph tiles — at a large scale `Layout::for_panel` steps the caption down to fit, so the full-caption worst case (3318 px at 2.5) is no longer the bound; a full table of one-glyph tiles is
     // The caption must fit inside the tile it is centred in, or there is nothing to draw.
     assert!(CELL_H() <= TILE_H());
     // The indicator must fit in the padding band below the tile.

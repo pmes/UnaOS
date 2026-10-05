@@ -24463,7 +24463,7 @@ static HT_SURF: [u32; FIX_W * FIX_H] = [0x0020_C080; FIX_W * FIX_H];
 /// fixture window carries a control cluster at scale 1 and therefore at every scale. 160 is the
 /// next multiple of 32 above the floor, i.e. 12 px of margin against the next metric nudge.
 #[cfg(feature = "witness")]
-pub const FIX_W: usize = 448; // UIMETRICS (B372): was 160 — the cluster floor now scales with the panel (263 px at 2.5, 420 at 4.0); 448 clears it at EVERY scale (the proof below)
+pub const FIX_W: usize = 576; // UIMETRICS (B372): was 160 — the cluster floor now scales with the panel (353 px at 2.5, 564 at 4.0); 576 clears it at EVERY scale (the proof below)
 
 /// The fixture surfaces' SOURCE height. Unchanged: nothing about the control cluster is a function
 /// of height, and 8 rows keeps the surfaces small.

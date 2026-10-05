@@ -159,3 +159,86 @@ pub fn ensure_tests() {
         crate::tests::register("metrics", fixture);
     }
 }
+
+// ── Native windows: logical layout, physical pixels ──────────────────────────────────────────────────────────
+//
+// A kernel window's painter keeps its layout in LOGICAL px (96-ppi CSS px — the numbers it always had) and
+// paints a surface of PHYSICAL px (`ui::px` of its logical size) that the compositor shows at scale 1. The
+// helpers below are the one conversion: a coordinate EDGE is `floor(v x s2 / 2)` (adjacent rects tile with no
+// gap or overlap), a size is `ui::px` (rounded up), text is drawn at the edge of its logical origin in the
+// dpi-sized faces (`Face::Ui` proportional, `Face::Grid` for the body/mono face, `Face::Chrome`), and a press
+// at a physical surface pixel maps back with [`to_logical`]. Nothing is magnified: every pixel is drawn.
+
+/// The latched scale x2 (2 = 1.0).
+#[inline]
+pub fn s2() -> usize {
+    crate::video::dpi::s2() as usize
+}
+
+/// A logical coordinate's physical edge.
+#[inline]
+pub fn edge(v: usize) -> usize {
+    v * s2() / 2
+}
+
+/// A logical length's physical size (rounded up) — a native surface's extent.
+#[inline]
+pub fn size(v: usize) -> usize {
+    crate::ui::px(v)
+}
+
+/// A physical surface coordinate (a press) back to logical px.
+#[inline]
+pub fn to_logical(p: usize) -> usize {
+    p * 2 / s2().max(1)
+}
+
+/// The face a native window draws `face` with: the 7x16 body atlas becomes the dpi-sized mono grid face.
+#[inline]
+pub fn native_face(face: crate::video::text::Face) -> crate::video::text::Face {
+    match face {
+        crate::video::text::Face::Body => crate::video::text::Face::Grid,
+        f => f,
+    }
+}
+
+/// `face`'s cell height in LOGICAL px (what a logical layout centres a line with).
+#[inline]
+pub fn lcell_h(face: crate::video::text::Face) -> usize {
+    to_logical(native_face(face).cell_h())
+}
+
+/// `face`'s cell advance in LOGICAL px.
+#[inline]
+pub fn lcell_w(face: crate::video::text::Face) -> usize {
+    to_logical(native_face(face).cell_w())
+}
+
+/// The width `s` takes in `face`, in LOGICAL px (rounded up).
+pub fn ladvance(s: &[u8], bold: bool, face: crate::video::text::Face) -> usize {
+    let p = crate::video::text::advance(s, bold, native_face(face));
+    (p * 2).div_ceil(s2().max(1))
+}
+
+/// Fill the logical rect `(x, y, w, h)` of a native surface `px` whose PHYSICAL stride (and width) is `pw`.
+pub fn fill(px: &mut [u32], pw: usize, x: usize, y: usize, w: usize, h: usize, c: u32) {
+    let (x0, x1, y0, y1) = (edge(x), edge(x + w).min(pw), edge(y), edge(y + h));
+    if x0 >= x1 {
+        return;
+    }
+    for yy in y0..y1 {
+        let r = yy * pw;
+        if r + x1 > px.len() {
+            break;
+        }
+        px[r + x0..r + x1].fill(c);
+    }
+}
+
+/// Draw `s` with its line top at the logical `(x, y)` on a native surface (`pw` x `ph` physical, stride `pw`),
+/// clipped at the LOGICAL width `clip_w` (and the surface); returns the logical pen x after the last glyph.
+#[allow(clippy::too_many_arguments)]
+pub fn text(px: &mut [u32], pw: usize, ph: usize, clip_w: usize, x: usize, y: usize, s: &[u8], ink: u32, bold: bool, face: crate::video::text::Face) -> usize {
+    let pen = crate::video::text::draw_text(px, pw, size(clip_w).min(pw), ph, edge(x), edge(y), s, ink, bold, native_face(face));
+    to_logical(pen)
+}

@@ -295,7 +295,7 @@ static EDIT: spin::Mutex<Option<Edit>> = spin::Mutex::new(None);
 static CLIP: spin::Mutex<Option<String>> = spin::Mutex::new(None);
 
 fn menu_w(g: &Geom) -> usize {
-    22 * g.cell_w() + 2 * PAD
+    22 * g.cell_w() + 2 * PAD()
 }
 fn menu_h(g: &Geom) -> usize {
     ITEMS.len() * g.row_h() + 2
@@ -322,14 +322,14 @@ pub fn paint_overlay(m: &Model, px: &mut [u32]) {
         s.extend_from_slice(label.as_bytes());
         s.extend_from_slice(e.buf.as_bytes());
         s.push(b'_');
-        text(px, g, x + PAD, y + g.ts, &s, x + w, theme::CONTENT_TEXT);
+        text(px, g, x + PAD(), y + g.ts, &s, x + w, theme::CONTENT_TEXT);
     }
     if let Some(mn) = MENU.lock().as_ref() {
         let (w, h) = (menu_w(g), menu_h(g));
         fill(px, g, mn.x, mn.y, w, h, theme::BUTTON_FACE);
         keyline(px, g, Rect { x: mn.x, y: mn.y, w, h }, theme::FRAME_LINE);
         for (i, it) in ITEMS.iter().enumerate() {
-            text(px, g, mn.x + PAD, mn.y + 1 + i * g.row_h() + g.ts, it.label().as_bytes(), mn.x + w, theme::BUTTON_TEXT);
+            text(px, g, mn.x + PAD(), mn.y + 1 + i * g.row_h() + g.ts, it.label().as_bytes(), mn.x + w, theme::BUTTON_TEXT);
         }
     }
 }

@@ -36,9 +36,9 @@ const _: () = assert!(OWNER != wm::KERNEL_OWNER_CONSOLE && OWNER != wm::KERNEL_O
 /// Read ceiling, bytes.
 pub const MAX_BYTES: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
-const WIN_W: usize = 720;
-const WIN_H: usize = 480;
-const PAD: usize = 6;
+#[allow(non_snake_case)] #[inline] fn WIN_W() -> usize { crate::ui::px(720) } // UIMETRICS (B372): a NATIVE window — physical px at the panel's dpi scale, drawn at scale 1
+#[allow(non_snake_case)] #[inline] fn WIN_H() -> usize { crate::ui::px(480) }
+#[allow(non_snake_case)] #[inline] fn PAD() -> usize { crate::ui::px(6) }
 const WHEEL_ROWS: usize = 3;
 const TAIL: &str = "...truncated";
 
@@ -234,12 +234,12 @@ fn open_inner(path: &str, text: Vec<u8>, spans: Vec<richtext::Span>, n_bytes: us
     }
     let pi = crate::video::panel_info_nonblocking().ok_or_else(|| String::from("panel busy"))?;
     let (pw, ph) = (pi.width, pi.height);
-    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER()).max(1));
-    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
-    let face = super::text::Face::Body;
+    let w = WIN_W().min(pw.saturating_sub(2 * wm::BORDER()).max(1));
+    let h = WIN_H().min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
+    let face = super::text::Face::Grid; // UIMETRICS: the dpi-sized mono grid face
     let (cw, ch) = (face.cell_w(), face.cell_h());
-    let cols = w.saturating_sub(2 * PAD + 6) / cw;
-    let vis = h.saturating_sub(2 * PAD) / ch;
+    let cols = w.saturating_sub(2 * PAD() + crate::ui::px(6)) / cw;
+    let vis = h.saturating_sub(2 * PAD()) / ch;
     if cols < 8 || vis < 2 {
         return Err(String::from("window below floor"));
     }
@@ -254,7 +254,7 @@ fn open_inner(path: &str, text: Vec<u8>, spans: Vec<richtext::Span>, n_bytes: us
     if is_open() {
         close();
     }
-    let (_s, ow, oh) = wm::spawn_geometry(w, h).ok_or_else(|| String::from("geometry unavailable"))?;
+    let (_s, ow, oh) = wm::spawn_geometry_native(w, h).ok_or_else(|| String::from("geometry unavailable"))?;
     let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
@@ -275,7 +275,7 @@ fn open_inner(path: &str, text: Vec<u8>, spans: Vec<richtext::Span>, n_bytes: us
     let base = st.surf.as_ptr() as usize;
     let title = title_of(path);
     // The Vec<u32> lives in STATE for the window's life; `close` drops the row before the buffer.
-    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, title.as_bytes(), ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
+    let id = wm::create_at_native(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, title.as_bytes(), ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         return Err(String::from("window create failed"));
     }
@@ -304,7 +304,7 @@ pub fn close() {
 
 /// Repaint `st.surf` for `st.top`.
 fn paint(st: &mut State) {
-    let face = super::text::Face::Body;
+    let face = super::text::Face::Grid; // UIMETRICS: the dpi-sized mono grid face
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let _ = cw;
     let (w, h) = (st.w, st.h);
@@ -314,16 +314,16 @@ fn paint(st: &mut State) {
     for r in 0..st.vis {
         let Some(&(a, b)) = st.rows.get(st.top + r) else { break };
         if !st.spans.is_empty() {
-            paint_styled_row(st, a as usize, b as usize, PAD + r * ch); // QUARRY2 (B336)
+            paint_styled_row(st, a as usize, b as usize, PAD() + r * ch); // QUARRY2 (B336)
             continue;
         }
         let s = &st.text[a as usize..b as usize];
-        super::text::draw_text(&mut st.surf, w, w - 6, h, PAD, PAD + r * ch, s, theme::CONTENT_TEXT, false, face);
+        super::text::draw_text(&mut st.surf, w, w - crate::ui::px(6), h, PAD(), PAD() + r * ch, s, theme::CONTENT_TEXT, false, face);
     }
     // Scroll thumb on the right edge (proportional; full height when everything fits).
     let total = st.rows.len().max(1);
-    let (x0, x1) = (w - 5, w - 1);
-    let th = if total <= st.vis { h } else { (h * st.vis / total).max(8) };
+    let (x0, x1) = (w - crate::ui::px(5), w - crate::ui::px(1));
+    let th = if total <= st.vis { h } else { (h * st.vis / total).max(crate::ui::px(8)) };
     let ty = if total <= st.vis { 0 } else { (h - th) * st.top / (total - st.vis) };
     for y in 0..h {
         let c = if y >= ty && y < ty + th { theme::SCROLL_THUMB } else { theme::SCROLL_TRACK };
@@ -489,7 +489,7 @@ fn tint_ink(t: richtext::Tint) -> u32 {
 
 /// Draw display row `a..b` of `st.text` at `y`, cut at span edges (monospace: x = column).
 fn paint_styled_row(st: &mut State, a: usize, b: usize, y: usize) {
-    let face = super::text::Face::Body;
+    let face = super::text::Face::Grid; // UIMETRICS: the dpi-sized mono grid face
     let cw = face.cell_w();
     let (w, h) = (st.w, st.h);
     let mut p = a;
@@ -501,7 +501,7 @@ fn paint_styled_row(st: &mut State, a: usize, b: usize, y: usize) {
             None => (b, theme::CONTENT_TEXT, false),
         };
         let end = end.max(p + 1);
-        super::text::draw_text(&mut st.surf, w, w - 6, h, PAD + (p - a) * cw, y, &st.text[p..end], ink, bold, face);
+        super::text::draw_text(&mut st.surf, w, w - crate::ui::px(6), h, PAD() + (p - a) * cw, y, &st.text[p..end], ink, bold, face);
         p = end;
     }
 }

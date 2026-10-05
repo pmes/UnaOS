@@ -43,8 +43,8 @@ pub const SCALE_MAX: usize = 4;
 /// crispy kit's `metrics.*` read as 96-ppi CSS px. Every furniture length on the glass is one of these
 /// times `video::dpi`'s scale (`dpi::px_at`, rounded up to the whole pixel). This table is the ONLY place
 /// a furniture pixel count is written; `theme`, `wm`, `menubar`, `dock`, `crystal`, `strip` and `winmenu`
-/// read [`Metrics`]. (`CONTROL_BOX` is the kit's 12 again: the 24 that overrode it was the kit's 12 at
-/// a 2x Retina panel in device px, which the scale now does by itself — 30 px at 2.5.)
+/// read [`Metrics`]. At scale 1.0 every length is the `const` it replaced, byte for byte (no EDID, QEMU, a
+/// 96-ppi panel: the desktop is exactly what it was); at 2.5 (the 221-ppi bench) each is 2.5x.
 pub mod base {
     /// `metrics.frame` — frame thickness.
     pub const FRAME: usize = 5;
@@ -66,8 +66,10 @@ pub mod base {
     pub const BUTTON_PAD_X: usize = 18;
     /// `metrics.gap` — the standard gap between controls (and the strips' `PAD`).
     pub const GAP: usize = 12;
-    /// `metrics.control_box` — the title-bar disc's DIAMETER.
-    pub const CONTROL_BOX: usize = 12;
+    /// The title-bar disc's DIAMETER — Peter's 24 (2026-08-09, "window buttons are very small"), kept as the
+    /// base so every proportion at 1.0 is unchanged (the battery and the crystal are sized off it too). Read
+    /// against the ruling it was 12 pt at 2x; at 2.5 it is 60 px — a taste question named in UIMETRICS.md.
+    pub const CONTROL_BOX: usize = 24;
     /// `metrics.text_px` — nominal text size.
     pub const TEXT_PX: usize = 15;
     /// The default size of a kernel window's content (Settings' 520x448 logical box).

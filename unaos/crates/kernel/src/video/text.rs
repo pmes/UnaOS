@@ -83,6 +83,7 @@ impl Face {
         match self {
             Face::Grid => grid_cell().0,
             Face::Chrome => chrome_cell().0, // UIMETRICS (B372): the chrome cell x the dpi scale
+            Face::Ui => grid_cell().0, // UIMETRICS (B372): the native windows' text cell — the body cell x the dpi scale
             _ => self.bitmap().cell_w(),
         }
     }
@@ -92,6 +93,7 @@ impl Face {
         match self {
             Face::Grid => grid_cell().1,
             Face::Chrome => chrome_cell().1,
+            Face::Ui => grid_cell().1,
             _ => self.bitmap().cell_h(),
         }
     }
@@ -331,17 +333,35 @@ pub fn epoch() -> u32 {
     EPOCH.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// KERNELFONT2: the console's cell — the body cell x `video::dpi`'s scale, each side rounded up to the pixel.
+/// KERNELFONT2: the console's cell — the body cell x `video::dpi`'s scale, each side rounded up to the pixel;
+/// UIMETRICS (B372): and x `font_size / 13` when `system.display.font_size` is not the default, so the console
+/// REGRIDS on a restyle (the face then fills the cell it is sized for instead of being capped by the 13-px one).
 pub fn grid_cell() -> (usize, usize) {
-    let s2 = crate::video::dpi::scale_x2();
-    (crate::video::dpi::px_at(font::CELL_W, s2), crate::video::dpi::px_at(font::CELL_H, s2))
+    grid_cell_at(crate::video::dpi::scale_x2())
+}
+
+/// The CSS px the grid cell is sized for (0 = the default 13), written by the restyle under the engine's lock.
+static GRID_CSS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// KERNELFONT2's default `font_size` — the size the 18x40 (at 2.5) cell was built for.
+pub const GRID_BASE_CSS: u32 = 13;
+
+fn grid_cell_at(s2: u32) -> (usize, usize) {
+    let fs = match GRID_CSS.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => GRID_BASE_CSS,
+        f => f,
+    } as usize;
+    if fs == GRID_BASE_CSS as usize {
+        return (crate::video::dpi::px_at(font::CELL_W, s2), crate::video::dpi::px_at(font::CELL_H, s2));
+    }
+    let k = 2 * GRID_BASE_CSS as usize;
+    ((font::CELL_W * s2 as usize * fs).div_ceil(k).max(1), (font::CELL_H * s2 as usize * fs).div_ceil(k).max(1))
 }
 
 /// KERNELFONT2: arm the console's grid on a framebuffer `fb_w` px wide — latches `video::dpi`'s scale (first call
 /// wins), returns [`grid_cell`]. Called by `fbcon` where the console takes the face.
 pub fn arm_grid(fb_w: usize) -> (usize, usize) {
     let s2 = crate::video::dpi::latch(fb_w);
-    (crate::video::dpi::px_at(font::CELL_W, s2), crate::video::dpi::px_at(font::CELL_H, s2))
+    grid_cell_at(s2)
 }
 
 /// The engine half, compiled only where a desktop exists (no other image links `font_core`).
@@ -438,7 +458,7 @@ mod tt {
     fn cell(face: usize) -> (usize, usize) {
         match face {
             1 => super::chrome_cell(), // UIMETRICS (B372)
-            3 => super::grid_cell(),
+            2 | 3 => super::grid_cell(), // UIMETRICS: Ui lays out on the dpi-scaled cell (the native windows)
             _ => (font::CELL_W, font::CELL_H),
         }
     }
@@ -542,14 +562,18 @@ mod tt {
         let body = eng.fit_size(mono, Some(font::CELL_W as f32), font::CELL_H as f32).unwrap_or(11.0);
         let (ccw, cch) = super::chrome_cell(); // UIMETRICS (B372): the chrome face fits the dpi-scaled chrome cell
         let chrome = eng.fit_size_mean(fam, true, ccw as f32, cch as f32).unwrap_or(14.0);
-        let ui_fit = eng.fit_size(fam, None, font::CELL_H as f32).unwrap_or(12.0);
-        let ui = device_px(t.css_px as f32, t.ppi).min(ui_fit).max(6.0);
-        // KERNELFONT2: the console grid — mono at font_size x ppi / 96, capped by the dpi-scaled cell.
+        // KERNELFONT2: the console grid — mono at font_size x ppi / 96, capped by the dpi-scaled cell; UIMETRICS: the
+        // cell itself follows font_size (the console regrids, `fbcon::regrid`, after this restyle lands).
+        super::GRID_CSS.store(t.css_px.clamp(1, 64) as u32, Ordering::Relaxed);
         let (gw, gh) = super::grid_cell();
+        // UIMETRICS (B372): the UI face (the native kernel windows) is font_size x ppi / 96 capped by the dpi-scaled
+        // cell's height — 40 px at 2.5, so the default 13 CSS px draws its 29.9 px (KERNELFONT's 13.5-px cap is gone).
+        let ui_fit = eng.fit_size(fam, None, gh as f32).unwrap_or(12.0);
+        let ui = device_px(t.css_px as f32, t.ppi).min(ui_fit).max(6.0);
         let grid_fit = eng.fit_size(mono, Some(gw as f32), gh as f32).unwrap_or(body);
         let grid = device_px(t.css_px as f32, t.ppi).min(grid_fit).max(6.0);
         let mk = |role: Role, size: f32, cell: usize| (Style { role, bold: false, size }, eng.baseline_in_cell(role, size, cell as f32));
-        t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, cch), mk(fam, ui, font::CELL_H), mk(mono, grid, gh)];
+        t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, cch), mk(fam, ui, gh), mk(mono, grid, gh)];
         let nm = |r: Role| match r {
             Role::Mono => "dejavu-mono",
             Role::Serif => "dejavu-serif",
@@ -661,6 +685,7 @@ mod tt {
         );
         *TT.lock() = Some(t);
         READY.store(true, Ordering::Release);
+        regrid_console(); // UIMETRICS (B372): a non-default font_size at load regrids the console too
         super::EPOCH.fetch_add(1, Ordering::AcqRel); // KERNELFONT2 M4: the windows painted before this repaint once
         let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
     }
@@ -686,8 +711,17 @@ mod tt {
         .flatten();
         if let Some(line) = changed {
             serial_println!("[kfont] restyle {}", line);
+            regrid_console(); // UIMETRICS (B372): the console's cell follows font_size
             super::EPOCH.fetch_add(1, Ordering::AcqRel); // KERNELFONT2 M4
             let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+        }
+    }
+
+    /// UIMETRICS (B372): re-derive the console's grid from the restyled cell and say so (no lock held here).
+    fn regrid_console() {
+        if let Some((oc, or, nc, nr)) = crate::video::fbcon::regrid() {
+            let (gw, gh) = super::grid_cell();
+            serial_println!("[kfont] regrid console cell={}x{} grid={}x{} was={}x{}", gw, gh, nc, nr, oc, or);
         }
     }
 

@@ -194,12 +194,8 @@ fn take_census(prev_pres: &mut [u32; NPRES], dt_ms: u64) -> Census {
 // ── The painter ─────────────────────────────────────────────────────────────────────────────────
 
 fn rect(surf: &mut [u32], stride: usize, h: usize, x: usize, y: usize, w: usize, rh: usize, c: u32) {
-    for yy in y..(y + rh).min(h) {
-        let row = yy * stride;
-        for xx in x..(x + w).min(stride) {
-            surf[row + xx] = c;
-        }
-    }
+    // UIMETRICS (B372): `stride`, `h` and the rect are LOGICAL px; the surface is the native (physical) one.
+    super::metrics::fill(surf, super::metrics::size(stride), x, y, w, rh.min(h.saturating_sub(y)), c);
 }
 
 fn bar_color(pct: i16) -> u32 {
@@ -208,15 +204,15 @@ fn bar_color(pct: i16) -> u32 {
 
 fn paint(st: &mut State) {
     let face = super::text::Face::Body;
-    let ch = face.cell_h() + 2;
-    let cw = face.cell_w();
+    let ch = super::metrics::lcell_h(face) + 2; // UIMETRICS: the logical line of the dpi-sized face
+    let cw = super::metrics::lcell_w(face);
     let (w, h) = (st.w, st.h);
     let c = st.cen;
     for p in st.surf.iter_mut() { *p = theme::CONTENT_FILL; }
     let ink = theme::CONTENT_TEXT;
     let mut y = PAD;
     let line = |surf: &mut [u32], y: &mut usize, b: &Buf, color: u32| {
-        super::text::draw_text(surf, w, w, h, PAD, *y, b.bytes(), color, false, face);
+        super::metrics::text(surf, super::metrics::size(w), super::metrics::size(h), w, PAD, *y, b.bytes(), color, false, face);
         *y += ch;
     };
     // Header.
@@ -235,7 +231,7 @@ fn paint(st: &mut State) {
     for i in 0..c.n_cpu {
         let mut b = Buf::new();
         let _ = write!(b, "cpu{}", i);
-        super::text::draw_text(&mut st.surf, w, w, h, PAD, y, b.bytes(), ink, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, PAD, y, b.bytes(), ink, false, face);
         rect(&mut st.surf, w, h, bx, y + 1, BAR_W, ch - 4, theme::SCROLL_TRACK);
         let pct = c.busy[i];
         let mut t = Buf::new();
@@ -245,7 +241,7 @@ fn paint(st: &mut State) {
         } else {
             let _ = write!(t, " --   q={}", c.runq[i]);
         }
-        super::text::draw_text(&mut st.surf, w, w, h, bx + BAR_W + 8, y, t.bytes(), ink, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, bx + BAR_W + 8, y, t.bytes(), ink, false, face);
         y += ch;
     }
     y += 4;
@@ -287,7 +283,7 @@ fn paint(st: &mut State) {
     let fy = h.saturating_sub(ch + 2);
     let mut b = Buf::new();
     let _ = write!(b, "q close   up/down select   k kill{}{}", if st.verdict.is_empty() { "" } else { "   -> " }, st.verdict);
-    super::text::draw_text(&mut st.surf, w, w, h, PAD, fy, b.bytes(), ink, false, face);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, PAD, fy, b.bytes(), ink, false, face);
 }
 
 /// Take a census and repaint (in place). Does NOT present.
@@ -321,18 +317,21 @@ pub fn open() -> Result<(), &'static str> {
     }
     let pi = crate::video::panel_info_nonblocking().ok_or("panel busy")?;
     let (pw, ph) = (pi.width, pi.height);
-    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER()).max(1));
-    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
+    // UIMETRICS (B372): a NATIVE window — WIN_W x WIN_H logical px (less what the panel lacks), drawn at its
+    // physical size at scale 1.
+    let w = WIN_W.min(super::metrics::to_logical(pw.saturating_sub(2 * wm::BORDER())).max(1));
+    let h = WIN_H.min(super::metrics::to_logical(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER())).max(1));
     if w < 200 || h < 120 {
         return Err("window below floor");
     }
-    let len = w * h;
+    let (sw, sh) = (super::metrics::size(w), super::metrics::size(h));
+    let len = sw * sh;
     let mut surf: Vec<u32> = Vec::new();
     if surf.try_reserve_exact(len).is_err() {
         return Err("out of memory");
     }
     surf.resize(len, theme::CONTENT_FILL);
-    let (_s, ow, oh) = wm::spawn_geometry(w, h).ok_or("geometry unavailable")?;
+    let (_s, ow, oh) = wm::spawn_geometry_native(sw, sh).ok_or("geometry unavailable")?;
     let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
@@ -350,7 +349,7 @@ pub fn open() -> Result<(), &'static str> {
     { st.last_migr = crate::arch::sched::migrations_total(); }
     repaint(&mut st, crate::arch::ms());
     let base = st.surf.as_ptr() as usize;
-    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, b"Activity", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
+    let id = wm::create_at_native(OWNER, base, len * 4, sw as u32, sh as u32, (sw * 4) as u32, b"Activity", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         return Err("window create failed");
     }

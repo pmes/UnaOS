@@ -3534,3 +3534,58 @@ pub fn font_repaint() -> usize {
     }
     repainted
 }
+
+/// UIMETRICS (rmbp-ledger B372; the B363 seat's "yes" to KERNELFONT2.md owed item 3) — **the console REGRIDS on a
+/// `font_size` restyle.** `video::text::grid_cell` follows `system.display.font_size` (the 18x40 cell at 2.5 x
+/// `font_size / 13`), and the restyle calls this once the engine's lock is released: the routed console window
+/// keeps its surface (the window does not move or resize) and re-derives its grid on it — the cell store is
+/// carried cell-for-cell into the new grid (columns and rows past the new extent are dropped, the cursor is
+/// clamped: `cells_remint`'s rule), the surface is cleared and [`font_repaint`] redraws every row in the new
+/// cell. `Some((old cols, old rows, new cols, new rows))` when it regridded; `None` when the console is not
+/// routed into its window, the cell did not change, or the lock was contended (the next restyle retries).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn regrid() -> Option<(usize, usize, usize, usize)> {
+    let (gw, gh) = crate::video::text::grid_cell();
+    if gw == 0 || gh == 0 {
+        return None;
+    }
+    let mut out = None;
+    crate::arch::without_interrupts(|| {
+        let Some(mut c) = FBCON.try_lock() else { return };
+        if c.win_store.is_none() || c.win_cells.is_none() || (c.cell_w, c.cell_h) == (gw, gh) {
+            return;
+        }
+        let info = c.win_fb.info();
+        let (nc, nr) = ((info.width / gw).max(1), (info.height / gh).max(1));
+        let (oc, or) = (c.cell_cols, c.cell_rows);
+        let mut new: Vec<u8> = Vec::new();
+        if new.try_reserve_exact(nc * nr).is_err() {
+            return;
+        }
+        new.resize(nc * nr, 0);
+        if let Some(old) = c.win_cells.as_ref() {
+            for r in 0..or.min(nr) {
+                for col in 0..oc.min(nc) {
+                    new[r * nc + col] = old.get(r * oc + col).copied().unwrap_or(0);
+                }
+            }
+        }
+        c.win_cells = Some(new);
+        c.cell_w = gw;
+        c.cell_h = gh;
+        c.cols = nc;
+        c.rows = nr;
+        c.cell_cols = nc;
+        c.cell_rows = nr;
+        c.col = c.col.min(nc - 1);
+        c.row = c.row.min(nr - 1);
+        let bg = c.bg;
+        c.draw_fb().fill_rows(0, info.height, bg);
+        c.mark_rows(0, info.height);
+        out = Some((oc, or, nc, nr));
+    });
+    if out.is_some() {
+        font_repaint();
+    }
+    out
+}
