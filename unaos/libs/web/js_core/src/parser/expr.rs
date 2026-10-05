@@ -98,6 +98,16 @@ impl Parser {
 
     /// AssignmentExpression.
     pub(crate) fn parse_assign(&mut self, allow_in: bool) -> PResult<Expr> {
+        self.depth += 1;
+        if self.depth > super::MAX_NESTING {
+            return self.err("expression nested too deeply");
+        }
+        let r = self.parse_assign_inner(allow_in);
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_assign_inner(&mut self, allow_in: bool) -> PResult<Expr> {
         let start = self.tok.start;
         // YieldExpression
         if self.is_kw("yield") && self.ctx.yield_kw {
@@ -535,6 +545,16 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
+        self.depth += 1;
+        if self.depth > super::MAX_NESTING {
+            return self.err("expression nested too deeply");
+        }
+        let r = self.parse_unary_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_unary_inner(&mut self) -> PResult<Expr> {
         let start = self.tok.start;
         let op = match &self.tok.t {
             T::Punct(P::Bang) => Some(UnaryOp::Not),

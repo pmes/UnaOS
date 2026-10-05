@@ -87,7 +87,12 @@ pub fn resolve_promise(vm: &mut Vm, p: Obj, resolution: Value) -> JsResult<()> {
             reject_promise(vm, p, e);
             return Ok(());
         }
+        // The getter may run user code (and collect): p and the resolution may be held only here.
+        let mark = vm.temp_roots.len();
+        vm.temp_roots.push(Value::Object(p));
+        vm.temp_roots.push(resolution.clone());
         let then = vm.get(*r, &PropertyKey::from_str("then"));
+        vm.temp_roots.truncate(mark);
         let then = match then {
             Ok(t) => t,
             Err(e) => {
@@ -220,7 +225,11 @@ pub fn perform_then(vm: &mut Vm, p: Obj, on_ok: Value, on_err: Value, cap: Optio
 pub fn promise_resolve_intrinsic(vm: &mut Vm, x: Value) -> JsResult<Obj> {
     let c = vm.intr().promise_ctor;
     if let Some(p) = is_promise(vm, &x) {
-        let xc = vm.get(p, &PropertyKey::from_str("constructor"))?;
+        let mark = vm.temp_roots.len();
+        vm.temp_roots.push(x.clone());
+        let xc = vm.get(p, &PropertyKey::from_str("constructor"));
+        vm.temp_roots.truncate(mark);
+        let xc = xc?;
         if matches!(xc, Value::Object(o) if o == c) {
             return Ok(p);
         }
@@ -367,7 +376,11 @@ pub fn promise_resolve(vm: &mut Vm, c: &Value, x: Value) -> JsResult<Obj> {
         return vm.throw_type("PromiseResolve called on non-object");
     }
     if let Some(p) = is_promise(vm, &x) {
-        let xc = vm.get(p, &PropertyKey::from_str("constructor"))?;
+        let mark = vm.temp_roots.len();
+        vm.temp_roots.push(x.clone());
+        let xc = vm.get(p, &PropertyKey::from_str("constructor"));
+        vm.temp_roots.truncate(mark);
+        let xc = xc?;
         if xc.same_value(c) {
             return Ok(p);
         }

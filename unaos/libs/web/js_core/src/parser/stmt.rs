@@ -68,6 +68,16 @@ impl Parser {
     }
 
     pub(crate) fn parse_statement(&mut self) -> PResult<Stmt> {
+        self.depth += 1;
+        if self.depth > super::MAX_NESTING {
+            return self.err("statement nested too deeply");
+        }
+        let r = self.parse_statement_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_statement_inner(&mut self) -> PResult<Stmt> {
         let start = self.tok.start;
         match &self.tok.t {
             T::Punct(P::LBrace) => {

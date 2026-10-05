@@ -76,10 +76,14 @@ impl Vm {
         self.temp_roots.push(it.clone());
         self.temp_roots.push(next.clone());
         while let Some(x) = self.iterator_step_value(&it, &next)? {
-            self.root(&x);
+            self.temp_roots.push(x.clone());
             out.push(x);
         }
         self.temp_roots.truncate(mark);
+        // The caller now owns the values: inside a native they stay rooted for the rest of its call.
+        if self.in_native {
+            self.temp_roots.extend(out.iter().filter(|v| v.is_object()).cloned());
+        }
         Ok(out)
     }
 

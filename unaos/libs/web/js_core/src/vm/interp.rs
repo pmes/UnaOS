@@ -537,7 +537,7 @@ impl Vm {
                     if o.is_nullish() {
                         return self.throw_type(&alloc::format!("Cannot set properties of {}", if o.is_null() { "null" } else { "undefined" }));
                     }
-                    let key = self.to_property_key(&k)?;
+                    let key = self.key_rooted(&k, &[&o, &v])?;
                     let strict = self.frames[fi].code.strict;
                     self.put_value(&o, key, v.clone(), strict)?;
                     self.stack.push(v);
@@ -555,7 +555,7 @@ impl Vm {
                     if o.is_nullish() {
                         return self.throw_type("Cannot convert undefined or null to object");
                     }
-                    let key = self.to_property_key(&k)?;
+                    let key = self.key_rooted(&k, &[&o])?;
                     let strict = self.frames[fi].code.strict;
                     let r = self.delete_value(&o, key, strict)?;
                     self.stack.push(Value::Bool(r));
@@ -605,7 +605,7 @@ impl Vm {
                         Value::Object(o) => o,
                         _ => return self.throw_type("Cannot use 'in' operator to search for a key in a non-object"),
                     };
-                    let key = self.to_property_key(&k)?;
+                    let key = self.key_rooted(&k, &[&Value::Object(o)])?;
                     let r = self.has_property(o, &key)?;
                     self.stack.push(Value::Bool(r));
                 }
@@ -619,7 +619,7 @@ impl Vm {
                     let k = self.pop();
                     let f = self.pop();
                     let base = self.super_base(&f)?;
-                    let k = self.to_property_key(&k)?;
+                    let k = self.key_rooted(&k, &[&base])?;
                     self.stack.push(base);
                     self.stack.push(k.to_value());
                 }
@@ -1338,6 +1338,20 @@ impl Vm {
         self.stack.truncate(base);
         self.stack.push(r?);
         Ok(())
+    }
+
+    /// ToPropertyKey for an operand popped off the stack, keeping `keep` alive if the conversion runs user code.
+    fn key_rooted(&mut self, k: &Value, keep: &[&Value]) -> JsResult<PropertyKey> {
+        if !matches!(k, Value::Object(_)) {
+            return self.to_property_key(k);
+        }
+        let mark = self.temp_roots.len();
+        for v in keep {
+            self.temp_roots.push((*v).clone());
+        }
+        let r = self.to_property_key(k);
+        self.temp_roots.truncate(mark);
+        r
     }
 
     /// Return from the current frame. Some(c) when the entry frame completed.

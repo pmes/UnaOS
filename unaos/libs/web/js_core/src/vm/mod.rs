@@ -109,6 +109,8 @@ pub struct Vm {
     pub tz: Option<crate::tz::PosixTz>,
     /// Longest string (in UTF-16 code units) the engine builds; longer results throw a RangeError.
     pub max_string_len: usize,
+    /// Collect at every safepoint (testing the exactness of the root set).
+    pub gc_stress: bool,
     /// Set when the live heap exceeded `max_cells`: execution is terminated like an exhausted budget.
     pub out_of_memory: bool,
     /// Timers of the built-in event loop (used when the host does not take them).
@@ -172,6 +174,7 @@ impl Vm {
             tz: None,
             max_string_len: (1 << 29) - 24,
             out_of_memory: false,
+            gc_stress: false,
             timers: Vec::new(),
             timer_seq: 0,
             loop_now: 0.0,
@@ -308,7 +311,7 @@ impl Vm {
 
     #[inline]
     pub fn maybe_gc(&mut self) {
-        if self.heap.should_collect() {
+        if self.heap.should_collect() || self.gc_stress {
             self.collect_garbage();
             if self.heap.live > self.max_cells {
                 // Terminate at the next instruction, like an exhausted budget.
@@ -316,6 +319,20 @@ impl Vm {
                 self.budget = Some(0);
             }
         }
+    }
+
+    /// Charge one unit of the instruction budget for work done inside built-ins (property loops over huge
+    /// lengths), so a budgeted run cannot spin forever in native code.
+    #[inline]
+    pub fn tick(&mut self) -> JsResult<()> {
+        if let Some(b) = &mut self.budget {
+            if *b == 0 {
+                self.terminated = true;
+                return Err(Value::str(if self.out_of_memory { "out of memory" } else { "execution budget exhausted" }));
+            }
+            *b -= 1;
+        }
+        Ok(())
     }
 
     /// RangeError when a string of `len` code units would exceed `max_string_len`.
@@ -539,6 +556,19 @@ impl Vm {
     /// Invoke the function at stack[base] with this at base+1 and argc args after. Runs to completion
     /// (a nested interpreter loop for bytecode functions). The caller truncates the stack.
     pub fn call_at(&mut self, base: usize, argc: usize, new_target: Value, construct: bool) -> JsResult<Value> {
+        let r = self.call_at_inner(base, argc, new_target, construct);
+        // A value handed back to native code must stay rooted for the rest of that native call (the callee's
+        // own temporary roots were released when it returned).
+        if self.in_native {
+            match &r {
+                Ok(v @ Value::Object(_)) | Err(v @ Value::Object(_)) => self.temp_roots.push(v.clone()),
+                _ => {}
+            }
+        }
+        r
+    }
+
+    fn call_at_inner(&mut self, base: usize, argc: usize, new_target: Value, construct: bool) -> JsResult<Value> {
         if self.frames.len() + self.native_depth >= self.max_depth {
             return self.throw_range("Maximum call stack size exceeded");
         }
@@ -725,8 +755,9 @@ impl Vm {
         self.stack[ctx.args_base..ctx.args_base + ctx.argc].to_vec()
     }
 
+    /// Keep `v` alive until the current native call returns (no-op outside natives: nothing would release it).
     pub fn root(&mut self, v: &Value) {
-        if let Value::Object(_) = v {
+        if let (true, Value::Object(_)) = (self.in_native, v) {
             self.temp_roots.push(v.clone());
         }
     }
@@ -746,6 +777,35 @@ impl Vm {
     }
 
     pub fn run_job(&mut self, job: Job) -> JsResult<()> {
+        // The job left the queue (a root): keep everything it holds alive while it runs.
+        let mark = self.temp_roots.len();
+        match &job {
+            Job::Reaction { handler, argument, capability, .. } => {
+                self.temp_roots.push(handler.clone());
+                self.temp_roots.push(argument.clone());
+                if let Some((p, a, b)) = capability {
+                    self.temp_roots.push(Value::Object(*p));
+                    self.temp_roots.push(a.clone());
+                    self.temp_roots.push(b.clone());
+                }
+            }
+            Job::Thenable { promise, thenable, then, .. } => {
+                self.temp_roots.push(Value::Object(*promise));
+                self.temp_roots.push(thenable.clone());
+                self.temp_roots.push(then.clone());
+            }
+            Job::Call { func, this, args } => {
+                self.temp_roots.push(func.clone());
+                self.temp_roots.push(this.clone());
+                self.temp_roots.extend(args.iter().cloned());
+            }
+        }
+        let r = self.run_job_inner(job);
+        self.temp_roots.truncate(mark);
+        r
+    }
+
+    fn run_job_inner(&mut self, job: Job) -> JsResult<()> {
         match job {
             Job::Reaction { handler, argument, capability, fulfill, realm } => {
                 let saved = self.cur_realm;

@@ -138,17 +138,30 @@ impl Vm {
     /// Run static fields and static blocks in order with this = F.
     pub fn class_finish(&mut self, ctor: Obj) -> JsResult<()> {
         let statics = core::mem::take(&mut self.class_data_mut(ctor).statics);
-        self.root(&Value::Object(ctor));
-        for (fd, block) in statics {
-            match (fd, block) {
-                (Some(fd), _) => self.define_field(ctor, &fd)?,
-                (None, Some(b)) => {
-                    self.call(&Value::Object(b), &Value::Object(ctor), &[])?;
-                }
-                _ => {}
+        // The static elements left the class record: root their functions while they run.
+        let mark = self.temp_roots.len();
+        self.temp_roots.push(Value::Object(ctor));
+        for (fd, block) in &statics {
+            if let Some(Some(i)) = fd.as_ref().map(|f| f.init) {
+                self.temp_roots.push(Value::Object(i));
+            }
+            if let Some(b) = block {
+                self.temp_roots.push(Value::Object(*b));
             }
         }
-        Ok(())
+        let mut r = Ok(());
+        for (fd, block) in statics {
+            r = match (fd, block) {
+                (Some(fd), _) => self.define_field(ctor, &fd),
+                (None, Some(b)) => self.call(&Value::Object(b), &Value::Object(ctor), &[]).map(|_| ()),
+                _ => Ok(()),
+            };
+            if r.is_err() {
+                break;
+            }
+        }
+        self.temp_roots.truncate(mark);
+        r
     }
 
     fn define_field(&mut self, o: Obj, fd: &FieldDef) -> JsResult<()> {

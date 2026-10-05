@@ -11,7 +11,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let stress = args.first().map(|a| a == "--gc-stress").unwrap_or(false);
+    if stress {
+        args.remove(0);
+    }
     let (src, base) = if args.first().map(|s| s.as_str()) == Some("-e") {
         (args.get(1).cloned().unwrap_or_default(), std::path::PathBuf::from("."))
     } else {
@@ -21,6 +25,7 @@ fn main() {
     let out = Rc::new(RefCell::new(String::new()));
     let mut vm = Vm::new(Box::new(host::TestHost { out: out.clone(), base }));
     host::install(&mut vm);
+    vm.gc_stress = stress;
     js_core::builtins::host::install_host_globals(&mut vm);
     let units: Vec<u16> = src.encode_utf16().collect();
     let r = vm.run_script(&units).and_then(|_| vm.run_event_loop(10_000_000));

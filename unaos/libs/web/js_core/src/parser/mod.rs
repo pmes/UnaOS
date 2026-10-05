@@ -113,6 +113,8 @@ pub(crate) struct ClassPriv {
 }
 
 pub struct Parser {
+    /// Current syntactic nesting (expressions + statements); bounded so recursion cannot exhaust the stack.
+    pub(crate) depth: u32,
     pub(crate) lx: Lexer,
     pub(crate) tok: Token,
     pub(crate) prev_end: u32,
@@ -188,6 +190,7 @@ impl Parser {
                 is_arrow: false,
             },
             flags: vec![FnFlags::default()],
+            depth: 0,
             scopes: Vec::new(),
             classes: Vec::new(),
             scope_counter: 0,
@@ -729,3 +732,7 @@ pub fn is_reserved(s: &str) -> bool {
 pub fn is_strict_reserved(s: &str) -> bool {
     matches!(s, "implements" | "interface" | "let" | "package" | "private" | "protected" | "public" | "static" | "yield")
 }
+
+/// Deepest syntactic nesting the parser accepts (each level costs a few KB of native stack in the parser and the
+/// compiler, which recurse over the tree).
+pub const MAX_NESTING: u32 = 1500;

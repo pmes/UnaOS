@@ -539,6 +539,7 @@ impl Vm {
     // ------------------------------------------------------------------------------------- [[HasProperty]] / [[Get]] / [[Set]] / [[Delete]]
 
     pub fn has_property(&mut self, o: Obj, key: &PropertyKey) -> JsResult<bool> {
+        self.tick()?;
         let mut cur = o;
         loop {
             match &self.heap.get(cur).kind {
@@ -571,6 +572,7 @@ impl Vm {
 
     /// [[Get]](P, Receiver)
     pub fn get_with_receiver(&mut self, o: Obj, key: &PropertyKey, receiver: &Value) -> JsResult<Value> {
+        self.tick()?;
         let mut cur = o;
         loop {
             match &self.heap.get(cur).kind {
@@ -913,6 +915,18 @@ impl Vm {
 
     /// InstanceofOperator (§13.10.2).
     pub fn instance_of(&mut self, v: &Value, target: &Value) -> JsResult<bool> {
+        // Operands popped off the stack are only held here: keep them alive across user code they trigger.
+        if matches!(v, Value::Object(_)) || matches!(target, Value::Object(_)) {
+            let mark = self.temp_roots.len();
+            self.temp_roots.push(v.clone()); self.temp_roots.push(target.clone()); 
+            let r = self.instance_of_inner(v, target);
+            self.temp_roots.truncate(mark);
+            return r;
+        }
+        self.instance_of_inner(v, target)
+    }
+
+    fn instance_of_inner(&mut self, v: &Value, target: &Value) -> JsResult<bool> {
         if !target.is_object() {
             return self.throw_type("Right-hand side of 'instanceof' is not an object");
         }

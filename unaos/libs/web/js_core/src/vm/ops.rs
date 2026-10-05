@@ -238,6 +238,18 @@ impl Vm {
 
     /// The + operator (§13.15.3 ApplyStringOrNumericBinaryOperator).
     pub fn add(&mut self, a: &Value, b: &Value) -> JsResult<Value> {
+        // Operands popped off the stack are only held here: keep them alive across user code they trigger.
+        if matches!(a, Value::Object(_)) || matches!(b, Value::Object(_)) {
+            let mark = self.temp_roots.len();
+            self.temp_roots.push(a.clone()); self.temp_roots.push(b.clone()); 
+            let r = self.add_inner(a, b);
+            self.temp_roots.truncate(mark);
+            return r;
+        }
+        self.add_inner(a, b)
+    }
+
+    fn add_inner(&mut self, a: &Value, b: &Value) -> JsResult<Value> {
         let pa = self.to_primitive(a, 0)?;
         let pb = self.to_primitive(b, 0)?;
         if matches!(pa, Value::String(_)) || matches!(pb, Value::String(_)) {
@@ -255,6 +267,18 @@ impl Vm {
     }
 
     pub fn arith(&mut self, op: Op, a: &Value, b: &Value) -> JsResult<Value> {
+        // Operands popped off the stack are only held here: keep them alive across user code they trigger.
+        if matches!(a, Value::Object(_)) || matches!(b, Value::Object(_)) {
+            let mark = self.temp_roots.len();
+            self.temp_roots.push(a.clone()); self.temp_roots.push(b.clone()); 
+            let r = self.arith_inner(op, a, b);
+            self.temp_roots.truncate(mark);
+            return r;
+        }
+        self.arith_inner(op, a, b)
+    }
+
+    fn arith_inner(&mut self, op: Op, a: &Value, b: &Value) -> JsResult<Value> {
         let na = self.to_numeric(a)?;
         let nb = self.to_numeric(b)?;
         match (na, nb) {
@@ -279,6 +303,18 @@ impl Vm {
 
     /// IsLooselyEqual (§7.2.14).
     pub fn loose_eq(&mut self, a: &Value, b: &Value) -> JsResult<bool> {
+        // Operands popped off the stack are only held here: keep them alive across user code they trigger.
+        if matches!(a, Value::Object(_)) || matches!(b, Value::Object(_)) {
+            let mark = self.temp_roots.len();
+            self.temp_roots.push(a.clone()); self.temp_roots.push(b.clone()); 
+            let r = self.loose_eq_inner(a, b);
+            self.temp_roots.truncate(mark);
+            return r;
+        }
+        self.loose_eq_inner(a, b)
+    }
+
+    fn loose_eq_inner(&mut self, a: &Value, b: &Value) -> JsResult<bool> {
         use Value::*;
         Ok(match (a, b) {
             (Undefined | Null, Undefined | Null) => true,
@@ -318,6 +354,18 @@ impl Vm {
     }
 
     pub fn compare_op(&mut self, op: Op, a: &Value, b: &Value) -> JsResult<bool> {
+        // Operands popped off the stack are only held here: keep them alive across user code they trigger.
+        if matches!(a, Value::Object(_)) || matches!(b, Value::Object(_)) {
+            let mark = self.temp_roots.len();
+            self.temp_roots.push(a.clone()); self.temp_roots.push(b.clone()); 
+            let r = self.compare_op_inner(op, a, b);
+            self.temp_roots.truncate(mark);
+            return r;
+        }
+        self.compare_op_inner(op, a, b)
+    }
+
+    fn compare_op_inner(&mut self, op: Op, a: &Value, b: &Value) -> JsResult<bool> {
         // IsLessThan with LeftFirst ordering of ToPrimitive.
         let (pa, pb) = match op {
             Op::Lt | Op::Ge => {
@@ -412,6 +460,18 @@ impl Vm {
     }
 
     pub fn get_elem(&mut self, o: &Value, k: &Value) -> JsResult<Value> {
+        // Operands popped off the stack are only held here: keep them alive across user code they trigger.
+        if matches!(o, Value::Object(_)) || matches!(k, Value::Object(_)) {
+            let mark = self.temp_roots.len();
+            self.temp_roots.push(o.clone()); self.temp_roots.push(k.clone()); 
+            let r = self.get_elem_inner(o, k);
+            self.temp_roots.truncate(mark);
+            return r;
+        }
+        self.get_elem_inner(o, k)
+    }
+
+    fn get_elem_inner(&mut self, o: &Value, k: &Value) -> JsResult<Value> {
         // Fast path: dense array index.
         if let (Value::Object(ob), Value::Number(n)) = (o, k) {
             let i = *n as u32;

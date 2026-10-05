@@ -125,6 +125,7 @@ pub fn run_one(h: &Harness, path: &Path, src: &str, m: &Meta, strict: bool) -> R
     let host = TestHost { out: out.clone(), base: path.parent().unwrap().to_path_buf() };
     let mut vm = Vm::new(Box::new(host));
     vm.budget = Some(400_000_000);
+    vm.gc_stress = std::env::var("JS_GC_STRESS").is_ok();
     install(&mut vm);
     let raw = m.has_flag("raw");
     let module = m.has_flag("module");

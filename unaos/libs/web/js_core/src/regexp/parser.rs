@@ -213,6 +213,7 @@ struct P<'a> {
     disj_counter: usize,
     /// Unicode + ignoreCase: WordCharacters gains U+017F and U+212A (§22.2.2.9.4).
     ui: bool,
+    depth: u32,
     _src: &'a [u16],
 }
 
@@ -250,6 +251,7 @@ pub fn parse(pattern: &[u16], flags: Flags) -> R<Regex> {
         path: Vec::new(),
         disj_counter: 0,
         ui: u && flags.i,
+        depth: 0,
         _src: pattern,
     };
     let node = p.disjunction()?;
@@ -343,6 +345,16 @@ impl P<'_> {
     }
 
     fn disjunction(&mut self) -> R<Node> {
+        self.depth += 1;
+        if self.depth > 500 {
+            return err("regular expression nested too deeply");
+        }
+        let r = self.disjunction_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn disjunction_inner(&mut self) -> R<Node> {
         let id = self.disj_counter;
         self.disj_counter += 1;
         let mut alts = Vec::new();
@@ -1091,6 +1103,16 @@ impl P<'_> {
 
     // v-mode (UnicodeSets) class contents.
     fn class_set_expression(&mut self) -> R<CharSet> {
+        self.depth += 1;
+        if self.depth > 500 {
+            return err("character class nested too deeply");
+        }
+        let r = self.class_set_expression_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn class_set_expression_inner(&mut self) -> R<CharSet> {
         if self.is(']') {
             return Ok(CharSet::new());
         }
