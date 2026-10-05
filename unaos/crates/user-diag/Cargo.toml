@@ -32,3 +32,7 @@ una-abi = { path = "../una-abi" }
 diag_core = { path = "../../libs/sys/diag_core" }
 vein_core = { path = "../../libs/sys/vein_core", default-features = false }
 vein_ring3 = { path = "../../libs/sys/vein_ring3" }
+
+[features]
+# VEINTLS (SR36) via vein_ring3: the product crypto provider under tls_core (merge12 fold, as LUMEN/NET).
+cryptocore = ["vein_ring3/cryptocore"]

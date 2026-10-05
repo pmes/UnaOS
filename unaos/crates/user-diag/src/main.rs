@@ -1,5 +1,12 @@
 #![no_std]
 #![no_main]
+
+extern crate alloc;
+
+/// VEINTLS via vein_ring3 (merge12 fold): tls_core allocates, so the binary carries the size-class heap over
+/// SYS_SBRK like LUMEN.ELF and NET.ELF.
+#[global_allocator]
+static HEAP: vein_ring3::heap::Heap = vein_ring3::heap::Heap::sbrk();
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
@@ -260,7 +267,8 @@ pub extern "C" fn _start() -> ! {
     // The provider: Principia's `vein` namespace and the key file, the LUMENAPP rule.
     let cfg = vein_ring3::prefs::Config::read();
     let (key, key_n) = vein_ring3::key::read(cfg.key_file(), &mut m.key);
-    let plan = cfg.plan(key);
+    let tls = vein_ring3::TlsSetup::load(); // VEINTLS (SR36, merge12 fold): the key crosses only a verified connection
+    let plan = cfg.plan(key, tls.verify());
     let provider = match plan {
         Plan::Claude { .. } => "claude",
         Plan::Echo(_) => "echo",
@@ -413,9 +421,10 @@ pub extern "C" fn _start() -> ! {
                     an += k;
                 }
             };
-            match vein_ring3::prepare(&ep, &p, msgs, keystr, bufs).and_then(|req| vein_ring3::send(&ep, req, bufs, &mut on)) {
-                Ok(o) if o.status == 200 => {}
-                Ok(o) => failed = Some(("http-status", o.status as i64)),
+            let ctx = tls.context(); // VEINTLS (merge12 fold)
+            match vein_ring3::prepare(&ep, &p, msgs, keystr, bufs).and_then(|req| vein_ring3::send(&ep, req, bufs, ctx.as_ref(), &mut on)) {
+                Ok(o) if o.out.status == 200 => {}
+                Ok(o) => failed = Some(("http-status", o.out.status as i64)),
                 Err(s) => failed = Some((s.name(), s.code())),
             }
         }

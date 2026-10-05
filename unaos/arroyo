@@ -3928,7 +3928,7 @@ build_user_diag_x86() {
     python3 "${WORKSPACE_DIR}/scripts/witness-owners.py" "${WORKSPACE_DIR}" "${WORKSPACE_DIR}/target/witness-owners.txt" || { echo -e "${COLOR_RED}ERROR: witness-owners.py produced no table${COLOR_RESET}"; exit 1; }
     cd "$WORKSPACE_DIR/crates/user-diag"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS via vein_ring3 (merge12 fold)
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-diag/target/x86_64-unknown-none/release/user-diag" \
