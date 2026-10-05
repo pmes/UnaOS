@@ -73,3 +73,39 @@ pub fn verify_tls_signature(
     };
     r.map_err(TlsError::Crypto)
 }
+
+/// Verifies a TLS 1.2 ServerKeyExchange signature (RFC 5246 §7.4.1.4.1, RFC 8422 §5.4, RFC 8446 §4.2.3 for
+/// the rsa_pss_rsae codes). In TLS 1.2 a SignatureAndHashAlgorithm names a hash and a signature KIND — the ECDSA
+/// curve is the certificate's, not the code's — and RSASSA-PKCS1-v1_5 is legal. `auth` is the suite's
+/// authentication (ECDHE_ECDSA takes an EC or Ed25519 key, ECDHE_RSA an RSA key).
+pub fn verify_tls12_signature(
+    p: &dyn CryptoProvider,
+    key: &PublicKey,
+    auth: crate::msgs::Auth12,
+    scheme: SignatureScheme,
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<(), TlsError> {
+    use crate::msgs::Auth12;
+    use SignatureScheme as S;
+    let mismatch = TlsError::Protocol(
+        crate::error::AlertDescription::IllegalParameter,
+        "ServerKeyExchange signature does not match the suite / certificate key",
+    );
+    let r = match (auth, scheme, key) {
+        (Auth12::Ecdsa, S::EcdsaSecp256r1Sha256, PublicKey::Ec { curve, point }) => p.ecdsa_verify(*curve, HashAlg::Sha256, point, msg, sig),
+        (Auth12::Ecdsa, S::EcdsaSecp384r1Sha384, PublicKey::Ec { curve, point }) => p.ecdsa_verify(*curve, HashAlg::Sha384, point, msg, sig),
+        (Auth12::Ecdsa, S::Ed25519, PublicKey::Ed25519(k)) => p.ed25519_verify(k, msg, sig),
+        (Auth12::Rsa, S::RsaPkcs1Sha256, PublicKey::Rsa { n, e }) => p.rsa_pkcs1_verify(HashAlg::Sha256, n, e, msg, sig),
+        (Auth12::Rsa, S::RsaPkcs1Sha384, PublicKey::Rsa { n, e }) => p.rsa_pkcs1_verify(HashAlg::Sha384, n, e, msg, sig),
+        (Auth12::Rsa, S::RsaPkcs1Sha512, PublicKey::Rsa { n, e }) => p.rsa_pkcs1_verify(HashAlg::Sha512, n, e, msg, sig),
+        (Auth12::Rsa, S::RsaPssRsaeSha256, PublicKey::Rsa { n, e }) => p.rsa_pss_verify(HashAlg::Sha256, n, e, msg, sig),
+        (Auth12::Rsa, S::RsaPssRsaeSha384, PublicKey::Rsa { n, e }) => p.rsa_pss_verify(HashAlg::Sha384, n, e, msg, sig),
+        (Auth12::Rsa, S::RsaPssRsaeSha512, PublicKey::Rsa { n, e }) => p.rsa_pss_verify(HashAlg::Sha512, n, e, msg, sig),
+        _ => return Err(mismatch),
+    };
+    r.map_err(|e| match e {
+        CryptoError::BadSignature => TlsError::Protocol(crate::error::AlertDescription::DecryptError, "ServerKeyExchange signature"),
+        other => TlsError::Crypto(other),
+    })
+}

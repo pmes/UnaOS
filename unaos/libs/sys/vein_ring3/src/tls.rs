@@ -209,6 +209,7 @@ pub fn with_session<T: Transport + ?Sized, R>(t: &mut T, host: &str, ctx: &TlsCo
     }
     let verifier = IssuerVerifier { web: WebPkiVerifier { store: ctx.store, clock: ctx.clock }, issuer: Cell::new(None) };
     let mut cfg = ClientConfig::new(Some(host), &verifier);
+    cfg.enable_tls12(); // TLSCORE2 (SR58): a TLS-1.2-only relay is reachable; 1.3 stays preferred (downgrade-sentinel guarded)
     cfg.alpn = alloc::vec![b"http/1.1".to_vec()];
     let sock = Cell::new(0i64);
     let c = Client::connect(ctx.provider, &cfg, Io { t, err: &sock }).map_err(|e| fail_of(&e, sock.get()))?;

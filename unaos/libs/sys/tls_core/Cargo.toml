@@ -48,5 +48,6 @@ rsa = { version = "0.10.0-rc.18", optional = true, default-features = false, fea
 getrandom = { version = "0.4.3", optional = true }
 
 [dev-dependencies]
-# Turns the test operand on for this crate's own integration tests (tests/*.rs) and nothing else.
-tls_core = { path = ".", features = ["test-provider"] }
+# Turns the test operand on for this crate's own integration tests (tests/*.rs) and nothing else. TLSCORE2's tests
+# (m5..m8) run on the PRODUCT provider (`cryptocore-std`: CRYPTOCORE over /dev/urandom), zero third-party crates.
+tls_core = { path = ".", features = ["test-provider", "cryptocore-std"] }

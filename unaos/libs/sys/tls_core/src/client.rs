@@ -12,6 +12,16 @@
 //! ```
 //!
 //! Blocking and allocation-light: `Client::connect` drives the whole handshake; then `send`/`recv`/`close`.
+//!
+//! TLS 1.2 (RFC 5246, `handshake12` below) is spoken when the configuration offers a 1.2 suite
+//! ([`ClientConfig::enable_tls12`]) and the ServerHello carries no supported_versions:
+//!
+//! ```text
+//!  ServerHello (EMS required, renegotiation_info empty, no downgrade sentinel if we offered 1.3)
+//!   → Certificate → [CertificateStatus] → ServerKeyExchange (ECDHE, signed) → [CertificateRequest] → ServerHelloDone
+//!   ← [Certificate(empty)] ClientKeyExchange, ChangeCipherSpec, Finished
+//!   → ChangeCipherSpec, Finished → CONNECTED (HelloRequest answered with a no_renegotiation warning)
+//! ```
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -24,6 +34,9 @@ use crate::msgs::{self, hs, CipherSuite, ContentType, NamedGroup, SignatureSchem
 use crate::record::{self, RecordProtection};
 use crate::transcript::Transcript;
 use crate::x509::{self, PublicKey};
+
+#[path = "client12.rs"]
+mod client12;
 
 /// A reliable, ordered byte stream (TCP, a pipe, a fake for tests).
 pub trait Transport {
@@ -70,6 +83,20 @@ pub struct ClientConfig<'a> {
     pub hello_overrides: Vec<Vec<u8>>,
 }
 
+impl ClientConfig<'_> {
+    /// Also offer TLS 1.2 (RFC 5246) with the ECDHE + AEAD suites ([`CipherSuite::TLS12`]): supported_versions
+    /// then lists 1.3 and 1.2, and the 1.2 extensions (extended_master_secret, ec_point_formats) and the
+    /// renegotiation SCSV are added. TLS 1.3 stays preferred; a 1.2 answer from a 1.3-capable server is caught by
+    /// the RFC 8446 §4.1.3 downgrade sentinel.
+    pub fn enable_tls12(&mut self) {
+        for s in CipherSuite::TLS12 {
+            if !self.cipher_suites.contains(&s) {
+                self.cipher_suites.push(s);
+            }
+        }
+    }
+}
+
 impl<'a> ClientConfig<'a> {
     pub fn new(server_name: Option<&str>, verifier: &'a dyn ServerCertVerifier) -> Self {
         ClientConfig {
@@ -89,6 +116,8 @@ impl<'a> ClientConfig<'a> {
 /// What the handshake negotiated.
 #[derive(Debug, Clone)]
 pub struct Negotiated {
+    /// 0x0304 (TLS 1.3) or 0x0303 (TLS 1.2).
+    pub version: u16,
     pub cipher_suite: CipherSuite,
     pub group: NamedGroup,
     pub signature_scheme: SignatureScheme,
@@ -96,6 +125,8 @@ pub struct Negotiated {
     pub hello_retry: bool,
     pub peer_chain_len: usize,
     pub client_cert_requested: bool,
+    /// TLS 1.2: the RFC 7627 extended master secret was negotiated (always true — it is required).
+    pub extended_master_secret: bool,
 }
 
 struct Share {
@@ -126,6 +157,12 @@ pub struct Client<'a, T: Transport> {
     failed: bool,
     pub key_updates_received: u32,
     sent_ccs: bool,
+    /// 0 until the ServerHello, then msgs::TLS13 or msgs::TLS12.
+    version: u16,
+    master12: Option<crate::tls12::MasterSecret>,
+    randoms: [u8; 64],
+    /// TLS 1.2: HelloRequests refused with a no_renegotiation warning.
+    pub renegotiations_refused: u32,
 }
 
 fn unexpected(msg: &'static str) -> TlsError {
@@ -159,6 +196,10 @@ impl<'a, T: Transport> Client<'a, T> {
             failed: false,
             key_updates_received: 0,
             sent_ccs: false,
+            version: 0,
+            master12: None,
+            randoms: [0; 64],
+            renegotiations_refused: 0,
         };
         match c.handshake() {
             Ok(()) => Ok(c),
@@ -179,7 +220,16 @@ impl<'a, T: Transport> Client<'a, T> {
         self.t
     }
     /// exporter_master_secret (RFC 8446 §7.5) — `export` uses it.
+    ///
+    /// TLS 1.2: RFC 5705 over the extended master secret, the context always present (possibly empty).
     pub fn export(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> Result<(), TlsError> {
+        if let Some(m) = &self.master12 {
+            let mut cr = [0u8; 32];
+            let mut sr = [0u8; 32];
+            cr.copy_from_slice(&self.randoms[..32]);
+            sr.copy_from_slice(&self.randoms[32..]);
+            return Ok(crate::tls12::export(self.p, self.hash, m, label, &cr, &sr, Some(context), out)?);
+        }
         Ok(key_schedule::export(self.p, self.hash, self.exporter.as_bytes(), label, context, out)?)
     }
     /// resumption_master_secret (kept for PSK resumption, which is owed).
@@ -228,7 +278,11 @@ impl<'a, T: Transport> Client<'a, T> {
     }
 
     fn send_alert(&mut self, a: AlertDescription) -> Result<(), TlsError> {
-        let level = if a == AlertDescription::CloseNotify || a == AlertDescription::UserCanceled { 1 } else { 2 };
+        let level = if matches!(a, AlertDescription::CloseNotify | AlertDescription::UserCanceled | AlertDescription::NoRenegotiation) {
+            1
+        } else {
+            2
+        };
         let body = [level, a as u8];
         if self.tx.is_some() {
             self.send_protected(ContentType::Alert, &body)
@@ -255,7 +309,8 @@ impl<'a, T: Transport> Client<'a, T> {
         self.fill(record::HEADER_LEN)?;
         let mut header = [0u8; 5];
         header.copy_from_slice(&self.rbuf[..5]);
-        let len = record::check_header(&header)?;
+        let max = if self.version == msgs::TLS12 { record::MAX_CIPHERTEXT12 } else { record::MAX_CIPHERTEXT };
+        let len = record::check_header_max(&header, max)?;
         self.fill(5 + len)?;
         let payload = self.rbuf[5..5 + len].to_vec();
         self.rbuf.drain(..5 + len);
@@ -269,6 +324,13 @@ impl<'a, T: Transport> Client<'a, T> {
             let rec = self.read_record()?;
             let outer = ContentType::from_u8(rec.ty).ok_or(unexpected("record type"))?;
             if outer == ContentType::ChangeCipherSpec {
+                if self.version == msgs::TLS12 {
+                    // RFC 5246 §7.1: exactly one CCS, before the server's Finished, while reads are unprotected.
+                    if handshaking && self.rx.is_none() && rec.payload == [1] {
+                        return Ok((ContentType::ChangeCipherSpec, rec.payload));
+                    }
+                    return Err(unexpected("change_cipher_spec"));
+                }
                 // §5: a single 0x01 CCS between the first ClientHello and the peer's Finished is dropped.
                 if handshaking && rec.payload == [1] {
                     continue;
@@ -277,6 +339,7 @@ impl<'a, T: Transport> Client<'a, T> {
             }
             let (ty, content) = match &mut self.rx {
                 None => (outer, rec.payload),
+                Some(rx) if rx.is_tls12() => rx.open(self.p, &rec.header, &rec.payload)?,
                 Some(rx) => {
                     if outer != ContentType::ApplicationData {
                         if outer == ContentType::Alert {
@@ -294,6 +357,12 @@ impl<'a, T: Transport> Client<'a, T> {
             if ty == ContentType::Alert {
                 if content.len() != 2 {
                     return Err(TlsError::Decode("alert length"));
+                }
+                // TLS 1.2 (RFC 5246 §7.2): a warning-level alert other than close_notify does not end the
+                // connection (servers send e.g. a warning unrecognized_name). TLS 1.3 treats every alert but
+                // close_notify / user_canceled as fatal whatever its level (§6).
+                if self.version == msgs::TLS12 && content[0] == 1 && content[1] != AlertDescription::CloseNotify as u8 {
+                    continue;
                 }
                 match AlertDescription::from_u8(content[1]) {
                     Some(AlertDescription::CloseNotify) => {
@@ -335,6 +404,7 @@ impl<'a, T: Transport> Client<'a, T> {
             match ty {
                 ContentType::Handshake => self.hs_buf.extend_from_slice(&content),
                 ContentType::Alert => return Err(TlsError::UnexpectedEof),
+                ContentType::ChangeCipherSpec => return Err(unexpected("change_cipher_spec inside a handshake flight")),
                 _ => return Err(unexpected("application data during handshake")),
             }
         }
@@ -412,18 +482,38 @@ impl<'a, T: Transport> Client<'a, T> {
         let suites = self.offered_suites();
         let schemes = self.offered_schemes();
         let sni = self.cfg.server_name.as_deref().and_then(msgs::sni_name);
+        let (v13, v12) = self.offered_versions();
         let shares = [(share.group, share.public.as_slice())];
+        let mut versions = Vec::new();
+        if v13 {
+            versions.push(msgs::TLS13);
+            if v12 {
+                versions.push(msgs::TLS12);
+            }
+        }
         msgs::encode_client_hello(&msgs::ClientHelloParams {
             random: *random,
             session_id,
             cipher_suites: &suites,
             server_name: sni.as_deref(),
             groups: &self.cfg.groups,
-            key_shares: &shares,
+            key_shares: if v13 { &shares } else { &[] },
             signature_schemes: &schemes,
             alpn: &self.cfg.alpn,
             cookie,
+            versions: &versions,
+            tls12: v12,
+            status_request: false,
+            sct: false,
+            psk_dhe_mode: false,
+            psk: None,
         })
+    }
+
+    /// (TLS 1.3 offered, TLS 1.2 offered) — decided by which suites the configuration (and provider) allow.
+    fn offered_versions(&self) -> (bool, bool) {
+        let s = self.offered_suites();
+        (s.iter().any(|c| c.is_tls13()), s.iter().any(|c| !c.is_tls13()))
     }
 
     fn handshake(&mut self) -> Result<(), TlsError> {
@@ -440,7 +530,7 @@ impl<'a, T: Transport> Client<'a, T> {
         let mut share = self.make_share(self.cfg.groups[0])?;
         let ch1 = self.build_hello(0, &random, &session_id, &share, None);
         let mut offered = msgs::parse_client_hello(&ch1)?;
-        if offered.key_share_groups.first() != Some(&share.group.code()) {
+        if self.offered_versions().0 && offered.key_share_groups.first() != Some(&share.group.code()) {
             return Err(TlsError::State("ClientHello key_share does not match the generated share"));
         }
         let mut transcript = Transcript::new();
@@ -484,7 +574,14 @@ impl<'a, T: Transport> Client<'a, T> {
                 return Err(unexpected("second HelloRetryRequest"));
             }
         }
+        if !hello_retry && sh.selected_version.is_none() && self.offered_versions().1 {
+            // No supported_versions: a TLS 1.2 (or older) ServerHello.
+            let offered13 = self.offered_versions().0;
+            drop(share);
+            return self.handshake12(transcript, &offered, &sh, &sh_msg, offered13);
+        }
         self.check_sh_common(&sh, &offered)?;
+        self.version = msgs::TLS13;
         let suite = CipherSuite::from_code(sh.cipher_suite).ok_or(illegal("cipher suite"))?;
         if let Some(s) = hrr_suite {
             if s != suite {
@@ -609,6 +706,8 @@ impl<'a, T: Transport> Client<'a, T> {
             hello_retry,
             peer_chain_len: chain.len(),
             client_cert_requested: cert_request_ctx.is_some(),
+            extended_master_secret: false,
+            version: msgs::TLS13,
         });
         Ok(())
     }
@@ -624,6 +723,9 @@ impl<'a, T: Transport> Client<'a, T> {
         }
         if !offered.cipher_suites.contains(&sh.cipher_suite) {
             return Err(illegal("cipher suite not offered"));
+        }
+        if !CipherSuite::from_code(sh.cipher_suite).is_some_and(|c| c.is_tls13()) {
+            return Err(illegal("TLS 1.2 cipher suite in a TLS 1.3 ServerHello"));
         }
         for e in &sh.extensions {
             // §4.1.4: a HelloRetryRequest may carry a cookie the client never offered.
@@ -703,6 +805,18 @@ impl<'a, T: Transport> Client<'a, T> {
             return Ok(None);
         }
         let msg: Vec<u8> = self.hs_buf.drain(..4 + len).collect();
+        if self.version == msgs::TLS12 {
+            // RFC 5746 / RFC 5246 §7.4.1.1: renegotiation is never performed. A HelloRequest gets a warning
+            // no_renegotiation and the connection carries on; any other handshake message is a protocol error.
+            if msg[0] == hs::HELLO_REQUEST && msg.len() == 4 {
+                self.renegotiations_refused += 1;
+                if !self.we_closed {
+                    self.send_alert(AlertDescription::NoRenegotiation)?;
+                }
+                return Ok(Some(()));
+            }
+            return Err(unexpected("handshake message after the TLS 1.2 handshake"));
+        }
         match msg[0] {
             hs::NEW_SESSION_TICKET => {
                 let t = msgs::parse_new_session_ticket(&msg[4..])?;
@@ -736,6 +850,9 @@ impl<'a, T: Transport> Client<'a, T> {
     /// Sends KeyUpdate (RFC 8446 §4.6.3) and switches our sending keys. `request_peer` asks the server to update its
     /// keys too.
     pub fn send_key_update(&mut self, request_peer: bool) -> Result<(), TlsError> {
+        if self.version != msgs::TLS13 {
+            return Err(TlsError::State("KeyUpdate is TLS 1.3 only"));
+        }
         let m = msgs::handshake_message(hs::KEY_UPDATE, &[request_peer as u8]);
         self.send_protected(ContentType::Handshake, &m)?;
         self.c_ap = key_schedule::next_traffic_secret(self.p, self.hash, self.c_ap.as_bytes())?;

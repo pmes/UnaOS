@@ -169,6 +169,7 @@ fn oracle_local_openssl_server() {
             CipherSuite::Aes128GcmSha256 => "TLS_AES_128_GCM_SHA256",
             CipherSuite::Aes256GcmSha384 => "TLS_AES_256_GCM_SHA384",
             CipherSuite::ChaCha20Poly1305Sha256 => "TLS_CHACHA20_POLY1305_SHA256",
+            other => panic!("TLS 1.2 suite {other:?} from a TLS 1.3-only server"), // TLSCORE2: the enum grew
         };
         assert!(verdict.contains(ossl_name), "both ends agree on the suite: {verdict}");
         if c.suites.len() == 1 {

@@ -3,7 +3,8 @@
 (OpenSSL, TLS 1.3 ONLY, ALPN http/1.1). It is NOT ours, which is the point: http_core's host client must speak
 to it byte-correctly.
 
-usage: http_server.py <certdir|-> [leaf]     prints the port, then serves until killed.
+usage: http_server.py <certdir|-> [leaf] [tls13|tls12|any]     prints the port, then serves until killed.
+(TLSCORE2: `tls12` pins TLSv1.2, `any` allows 1.2 and 1.3; /stats also counts TLS 1.3 resumed connections.)
 
 Routes: /hello (Content-Length), /chunked (awkward chunks + a trailer), /gzip and /deflate (Content-Encoding,
 chunked), /redirect (302 + Set-Cookie) -> /final (echoes Cookie), /redirect307 (POST kept), /echo (any method:
@@ -13,7 +14,7 @@ Chromium oracle page: gzip when asked).
 import gzip, hashlib, json, ssl, sys, threading, time, zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-STATS = {"connections": 0, "alpn": None, "version": None}
+STATS = {"connections": 0, "alpn": None, "version": None, "reused": 0, "cipher": None}
 LOCK = threading.Lock()
 BIG = ("".join(f"line {i:05d}: the quick brown fox jumps over the lazy dog\n" for i in range(2000))).encode()
 PAGE = (b"<!doctype html><html><head><meta charset=utf-8><title>HTTPCORE oracle</title></head><body>"
@@ -34,6 +35,9 @@ class H(BaseHTTPRequestHandler):
             if isinstance(self.connection, ssl.SSLSocket):
                 STATS["alpn"] = self.connection.selected_alpn_protocol()
                 STATS["version"] = self.connection.version()
+                STATS["cipher"] = self.connection.cipher()[0]
+                if self.connection.session_reused:
+                    STATS["reused"] += 1
 
     def body(self):
         n = int(self.headers.get("content-length", "0") or 0)
@@ -135,8 +139,9 @@ srv.daemon_threads = True
 if sys.argv[1] != "-":
     d, leaf = sys.argv[1], sys.argv[2]
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-    ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    mode = sys.argv[3] if len(sys.argv) > 3 else "tls13"
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2 if mode in ("tls12", "any") else ssl.TLSVersion.TLSv1_3
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2 if mode == "tls12" else ssl.TLSVersion.TLSv1_3
     ctx.load_cert_chain(f"{d}/{leaf}_chain.pem", f"{d}/{leaf}.key")
     ctx.set_alpn_protocols(["http/1.1"])
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=True)

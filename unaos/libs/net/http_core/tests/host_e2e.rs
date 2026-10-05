@@ -44,11 +44,15 @@ struct Server {
 }
 impl Server {
     fn start(certdir: Option<&Path>) -> Server {
+        Self::start_mode(certdir, "tls13")
+    }
+    /// TLSCORE2: `mode` = tls13 | tls12 | any (http_server.py's third argument).
+    fn start_mode(certdir: Option<&Path>, mode: &str) -> Server {
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/oracle/http_server.py");
         let mut cmd = Command::new("python3");
         cmd.arg(script);
         match certdir {
-            Some(d) => cmd.arg(d).arg("p256"),
+            Some(d) => cmd.arg(d).arg("p256").arg(mode),
             None => cmd.arg("-"),
         };
         let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
@@ -85,6 +89,8 @@ mod serde_like {
         pub connections: u64,
         pub alpn: String,
         pub version: String,
+        pub reused: u64,
+        pub cipher: String,
     }
     fn field<'a>(s: &'a str, k: &str) -> &'a str {
         let i = s.find(&format!("\"{k}\": ")).map(|i| i + k.len() + 4).unwrap_or(0);
@@ -93,7 +99,13 @@ mod serde_like {
         rest[..end].trim().trim_matches('"')
     }
     pub fn parse(s: &str) -> Stats {
-        Stats { connections: field(s, "connections").parse().unwrap_or(0), alpn: field(s, "alpn").into(), version: field(s, "version").into() }
+        Stats {
+            connections: field(s, "connections").parse().unwrap_or(0),
+            alpn: field(s, "alpn").into(),
+            version: field(s, "version").into(),
+            reused: field(s, "reused").parse().unwrap_or(0),
+            cipher: field(s, "cipher").into(),
+        }
     }
 }
 
@@ -102,6 +114,10 @@ fn big() -> Vec<u8> {
 }
 
 fn suite(a: &Agent, base: &str, tls: bool) {
+    suite_v(a, base, tls, "TLSv1.3")
+}
+
+fn suite_v(a: &Agent, base: &str, tls: bool, version: &str) {
     // Content-Length.
     let r = a.get(&format!("{base}/hello")).unwrap();
     assert_eq!(r.status(), 200);
@@ -155,7 +171,7 @@ fn suite(a: &Agent, base: &str, tls: bool) {
     println!("{} connections={} alpn={} version={} first-sse-chunk={first:?} total={total:?}", if tls { "https" } else { "http" }, s.connections, s.alpn, s.version);
     assert_eq!(s.connections, 1, "keep-alive: every request on one connection");
     if tls {
-        assert_eq!((s.alpn.as_str(), s.version.as_str()), ("http/1.1", "TLSv1.3"));
+        assert_eq!((s.alpn.as_str(), s.version.as_str()), ("http/1.1", version));
     }
 }
 
@@ -168,6 +184,21 @@ fn https_against_python_ssl() {
     // The name in the certificate is checked: 127.0.0.1 is in its SAN, tlscore-wrong.test is not.
     let ip = a.get(&format!("https://127.0.0.1:{}/hello", srv.port)).unwrap();
     assert_eq!(ip.status(), 200);
+}
+
+/// TLSCORE2 (SR58): the same suite against the same server pinned to TLS 1.2 — http_core's host transport offers
+/// 1.2 beside 1.3, so Aether keeps the TLS-1.2-only long tail. Everything (chunked, gzip, redirects with cookies,
+/// 1 MiB PUT, paced SSE, keep-alive on ONE connection) runs over tls_core's TLS 1.2 record layer.
+#[test]
+fn https_tls12_against_python_ssl() {
+    let Some(dir) = pki("e2e12") else { return };
+    let srv = Server::start_mode(Some(&dir), "tls12");
+    let a = agent(Trust::PemFile(dir.join("root.pem").display().to_string()));
+    let base = format!("https://localhost:{}", srv.port);
+    suite_v(&a, &base, true, "TLSv1.2");
+    let s = stats(&a, &base);
+    println!("https TLS 1.2: cipher={} version={}", s.cipher, s.version);
+    assert!(s.cipher.starts_with("ECDHE-"), "an ECDHE suite: {}", s.cipher);
 }
 
 #[test]

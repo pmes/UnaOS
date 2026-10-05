@@ -26,6 +26,8 @@ pub enum AlertDescription {
     InternalError = 80,
     InappropriateFallback = 86,
     UserCanceled = 90,
+    /// TLS 1.2 (RFC 5246 §7.2.2): our warning answer to a HelloRequest.
+    NoRenegotiation = 100,
     MissingExtension = 109,
     UnsupportedExtension = 110,
     UnrecognizedName = 112,
@@ -59,6 +61,7 @@ impl AlertDescription {
             80 => InternalError,
             86 => InappropriateFallback,
             90 => UserCanceled,
+            100 => NoRenegotiation,
             109 => MissingExtension,
             110 => UnsupportedExtension,
             112 => UnrecognizedName,

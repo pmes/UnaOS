@@ -1,5 +1,5 @@
 //! The host transport (feature `host`, std): HTTP/1.1 over a std `TcpStream`, plain for `http://` and under
-//! UnaOS's own TLS 1.3 (`tls_core`, crypto from CRYPTOCORE) for `https://`, every certificate verified against
+//! UnaOS's own TLS 1.3 / 1.2 (`tls_core`, crypto from CRYPTOCORE) for `https://`, every certificate verified against
 //! a PEM trust store at the system clock and the host name matched (RFC 6125) — the same verifier VEINTLS runs
 //! on the metal. ALPN offers `http/1.1`. HTTP CONNECT proxies (`HTTPS_PROXY`/`HTTP_PROXY`, `NO_PROXY`) are
 //! honoured as every other client on the machine honours them.
@@ -669,6 +669,7 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job) {
         let verifier = WebPkiVerifier { store: &store, clock: &SystemClock };
         let name = key.host.trim_start_matches('[').trim_end_matches(']').to_string();
         let mut tcfg = ClientConfig::new(Some(&name), &verifier);
+        tcfg.enable_tls12(); // TLSCORE2 (SR58): TLS 1.3 preferred, 1.2 (ECDHE + AEAD, EMS) for the long tail
         tcfg.alpn = cfg.alpn.clone();
         let client = match TlsClient::connect(&provider, &tcfg, t) {
             Ok(c) => c,
