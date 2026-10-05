@@ -30082,3 +30082,11 @@ pub fn prof_comp2() -> [u64; 5] {
         C2_PRESENT_CYC.load(Relaxed),
     ]
 }
+/// GLASSEYES (B343): the outer frame (title bar and border included) of row `id`, `(x, y, w, h)` in panel pixels, or `None` for a free or zero-sized row — the state-shot mask's window-relative regions.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn frame_of(id: WinId) -> Option<(usize, usize, usize, usize)> {
+    let t = table();
+    let r = t.rows.iter().find(|r| r.used && r.id == id)?;
+    let b = outer_box(r);
+    if b.2 == 0 || b.3 == 0 { None } else { Some(b) }
+}

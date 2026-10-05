@@ -1092,6 +1092,7 @@ pub fn service() {
     if DRAG_ON.load(Ordering::Relaxed) {
         drag_poll();
     }
+    anim::tick(); // QUARRY2 (B336): step an animated image's frames
 }
 
 /// Is Facet's window live?
@@ -1366,11 +1367,8 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
     if st.size == 0 || st.size > MAX_FILE {
         return Err(FacetError::Size(st.size));
     }
+    if let Some(d) = anim::probe(path) { close(); return anim::open_frames(path, st.size, d); } // QUARRY2 (B336): frames from the decoder adapter (None today: PNG is a still)
     let (ihdr, spans, palette) = index_chunks(&mt, path, st.size)?;
-    let pi = crate::video::panel_info_nonblocking().ok_or(FacetError::NoWindow("panel-busy"))?;
-    let (pw, ph) = (pi.width, pi.height);
-    let win_w = CEIL_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
-    let win_h = CEIL_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
     let (k, bw, bh) = fit(ihdr.width, ihdr.height, BASE_W, BASE_H).ok_or(FacetError::NoWindow("fit"))?;
     if ihdr.interlaced && k != 1 {
         return Err(FacetError::Interlaced);
@@ -1404,6 +1402,17 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
     }
     d?;
 
+    open_base(path, st.size, ihdr, k, bw, bh, px) // QUARRY2 (B336): the window body, shared with the animated-frame open (`anim::open_frames`)
+}
+
+/// The window body over a decoded BASE image (`bw x bh`, reduction `k` against the file): fit, mint,
+/// present. Split out of [`open_inner`] by QUARRY2 so an animated image's frame 0 opens through the
+/// same body.
+fn open_base(path: &str, bytes: u64, ihdr: Ihdr, k: usize, bw: usize, bh: usize, px: Vec<u32>) -> Result<Opened, FacetError> {
+    let pi = crate::video::panel_info_nonblocking().ok_or(FacetError::NoWindow("panel-busy"))?;
+    let (pw, ph) = (pi.width, pi.height);
+    let win_w = CEIL_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
+    let win_h = CEIL_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
     // Fit-to-window: reduce when larger than the window, never enlarge on open; the window takes the
     // fitted shape (floor 32x32, the only place a letterbox can appear on open).
     let zf = ((win_w * 100 / bw).min(win_h * 100 / bh).min(100)).max(1) as u32;
@@ -1428,7 +1437,7 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
         src_w: ihdr.width,
         src_h: ihdr.height,
         ihdr,
-        bytes: st.size,
+        bytes,
         mtime,
         vw,
         vh,
@@ -2022,3 +2031,8 @@ pub fn imgview_selftest() {
         pa, zoom, fitted as u8, n, pal_ok as u8, junk_ok as u8, if ok { "PASS" } else { "FAIL" }
     );
 }
+
+// QUARRY2 (B336): animated frames behind a local decoder trait (the PIXELCORE fold is one adapter) —
+// a child module, so no `video/mod.rs` line.
+#[path = "facet_anim.rs"]
+pub mod anim;

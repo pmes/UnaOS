@@ -214,6 +214,7 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
     let kill = Arc::new(crate::arch::sched::KillSwitch::new());
     let fds = p.fds.clone();
     let (brk, brk_mapped, mmap_next, fs_base, cwd, umask) = (p.brk, p.brk_mapped, p.mmap_next, p.fs_base, p.cwd.clone(), p.umask);
+    let exe = p.exe.clone();
     let cinfo = make_info(pid, info.pid, info.pgid.load(Ordering::Acquire), casp, kill.clone(), |asp| LinuxProc {
         asp,
         brk,
@@ -224,6 +225,7 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
         cwd,
         umask,
         sleep_until: None,
+        exe,
     });
     let pml4 = cinfo.pml4;
     register(cinfo);
@@ -244,7 +246,9 @@ pub fn clone(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, a: [u64; 6]) ->
     if flags & CLONE_THREAD != 0 || (flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0) {
         return -38; // real threads / shared-VM clones: not in rung 2
     }
-    fork(p, info, ktop, a[1])
+    let pid = fork(p, info, ktop, a[1]);
+    super::sys2::clone_settid(p, flags, a, pid); // SELFBUILD1: CLONE_PARENT_SETTID / CLONE_CHILD_SETTID (glibc's fork asks for the latter)
+    pid
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -277,7 +281,7 @@ fn read_strv(p: &LinuxProc, mut va: u64, max_n: usize, max_bytes: usize) -> Resu
 }
 
 pub fn execve(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, path_va: u64, argv_va: u64, envp_va: u64) -> i64 {
-    let full = match sys::resolve(p, sys::AT_FDCWD, path_va) {
+    let full = match if super::sys2::is_self_exe(p, path_va) { Ok(p.exe.clone()) } else { sys::resolve(p, sys::AT_FDCWD, path_va) } { // SELFBUILD1: execve("/proc/self/exe") = this image (busybox applets)
         Ok(f) => f,
         Err(e) => return e,
     };
@@ -313,6 +317,7 @@ pub fn execve(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, path_va: u64, 
     p.brk_mapped = BRK_BASE;
     p.mmap_next = MMAP_BASE;
     p.fs_base = 0;
+    p.exe = full.clone();
     super::fs_tab_clear(info.pml4);
     super::fpu::exec_reset(); // LINUXABI3: the new image starts from the Linux initial x87/SSE state
     for s in p.fds.iter_mut() {

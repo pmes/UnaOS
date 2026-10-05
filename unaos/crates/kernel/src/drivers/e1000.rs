@@ -1204,7 +1204,7 @@ pub fn service_net() {
     // across passes). Awaits an inbound connect from scripts/net-inject.py under UNAOS_NET=socket;
     // hermetic slirp never connects in, so it prints an honest PENDING note and keeps listening cheaply.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-    crate::smolnet::witness_tick6();
+    crate::smolnet::witness_tick6(); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] crate::smolnet::service_poll(); // NETCLOCK (B335): the stack's idle service — one poll when smoltcp's `poll_delay` ran out or a frame waits, never per pass; LINE-NEUTRAL same-line append
     // SOCK-8 (knob-on): the smoltcp DNS client — one-shot, resolves `pool.ntp.org` via the DHCP-provided
     // DNS server (gateway fallback). Runs before the SNTP witness (which reuses the resolver). Same
     // post-guard discipline (its UDP pump short-locks NET_DEVICE per ring op). Under slirp the resolve may
@@ -1311,4 +1311,15 @@ pub fn fmt_ip(ip: &[u8; 4]) -> alloc::string::String {
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 pub fn nic_present() -> bool {
     NET_DEVICE.lock().is_some()
+}
+
+/// NETCLOCK (B335): is a received frame waiting in the RX ring? Reads the next descriptor's DD bit only —
+/// nothing is consumed (the smolnet poll gate asks this before deciding to poll). `false` with no e1000.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub fn rx_ready() -> bool {
+    NET_DEVICE
+        .lock()
+        .as_ref()
+        .map(|n| unsafe { read_volatile(n.rx_ring.add(n.rx_cur)) }.status & RX_STATUS_DD != 0)
+        .unwrap_or(false)
 }

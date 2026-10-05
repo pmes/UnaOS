@@ -185,13 +185,14 @@ pub fn read_table<T: InstallTarget>(t: &T) -> Result<GptTable, InstallError> {
     if total_sectors < 2 + GPT_ARRAY_SECTORS + 1 {
         return Err(InstallError::TooSmall);
     }
-    let mut h = [0u8; SECTOR];
-    t.read_sectors(1, &mut h)?;
-    let hd = Header::decode(&h, total_sectors).map_err(|_| InstallError::VerifyFailed)?;
-    let mut raw = alloc::vec![0u8; (hd.array_sectors() as usize) * SECTOR];
-    t.read_sectors(hd.entries_lba, &mut raw)?;
-    let ents = core_gpt::decode_array(&raw, &hd).map_err(|_| InstallError::VerifyFailed)?;
-    let entries = ents
+    // AHCIROOT (B332): the core's one reader (`read_table_with`); a refused read stays `Io`.
+    let tb = core_gpt::read_table_with(total_sectors, |lba, buf| t.read_sectors(lba, buf).is_ok()).map_err(|e| match e {
+        GptError::Io => InstallError::Io,
+        _ => InstallError::VerifyFailed,
+    })?;
+    let hd = tb.header;
+    let entries = tb
+        .entries
         .into_iter()
         .map(|(index, e)| GptEntryView { index, type_guid: e.type_guid, first_lba: e.first_lba, last_lba: e.last_lba })
         .collect();

@@ -12,7 +12,7 @@ use unaos_boot_info::BootInfo;
 #[unsafe(no_mangle)]
 #[cfg(target_arch = "x86_64")]
 pub extern "sysv64" fn _start(boot_info: &'static mut BootInfo) -> ! {
-    kernel_main(boot_info)
+    unaos_kernel::prof::note_boot_stack(); kernel_main(boot_info)
 }
 
 // UEFI aarch64 entry (default): the bootloader hands us a BootInfo with the MMU already on.
@@ -1211,7 +1211,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
             // because which pass a given build reaches depends on its knobs.
             #[cfg(feature = "holocron")]
-            unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); // LOGIN M1 — the user store loads once the root volume answers and the M1 fixture runs once; same pass, same reason as holocron. ⚠ LINE-NEUTRAL append.
+            unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — the user store loads once the root volume answers and the M1 fixture runs once; same pass, same reason as holocron. ⚠ LINE-NEUTRAL append.
             // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
             // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
             // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -1281,7 +1281,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG (usbdebug metal
             // boot benefits from an on-disk log too). Gated on storage; throttled; never blocks boot.
             #[cfg(target_arch = "x86_64")]
-            unaos_kernel::flight_recorder::service();
+            unaos_kernel::flight_recorder::service(); #[cfg(feature = "selfdiag")] unaos_kernel::bootwit::service(); // SELFDIAG M1 (B324): the armed desktop-ready boot-log write (same-line fold)
             // U2 (x86): also run the FAT loader HERE so its lines are VISIBLE on the serial-less
             // metal boot — the usbdebug view keeps fbcon attached (unlike the GUI loop, which detaches
             // it before U2 runs). Same one-shot gate; loads HELLO.BIN + prints `hello from disk` + the
@@ -1701,7 +1701,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
         // because which pass a given build reaches depends on its knobs.
         #[cfg(feature = "holocron")]
-        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); // LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
+        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
         // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
         // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
         // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -1767,7 +1767,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // a consumer who booted the vm-image (no serial capture) can copy the log off afterward.
         // Gated on storage internally; re-flushes on growth, throttled; never blocks boot.
         #[cfg(target_arch = "x86_64")]
-        unaos_kernel::flight_recorder::service();
+        unaos_kernel::flight_recorder::service(); #[cfg(feature = "selfdiag")] unaos_kernel::bootwit::service(); // SELFDIAG M1 (B324): the armed desktop-ready boot-log write (same-line fold)
         // WITSWEEP (SERWIT-2 reachability): on x86 the mirror-tap announcement + one-shot verdict ride
         // `flight_recorder::service()` (its first statement). That function is x86-only, so on aarch64
         // the whole `[mirror]`/`:: SERWIT-2 ::` block never reached the wire and the TSTE tap-drop
@@ -5962,7 +5962,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
         // because which pass a given build reaches depends on its knobs.
         #[cfg(feature = "holocron")]
-        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); // LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
+        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
         // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
         // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
         // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -6030,7 +6030,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // trailing band waits for the next print. Paced, not forced; free on a clean ledger.
         unaos_kernel::video::fbcon::console_service();
         // FLIGHT-RECORDER: flush the captured serial boot log to UNAOS.LOG on the FAT volume.
-        unaos_kernel::flight_recorder::service();
+        unaos_kernel::flight_recorder::service(); #[cfg(feature = "selfdiag")] unaos_kernel::bootwit::service(); // SELFDIAG M1 (B324): the armed desktop-ready boot-log write (same-line fold)
         // U2/U4x/U5x/U6x/U6bx (witness knob): the ring-3 fixture ladder, each one-shot and gated on
         // storage. These used to run on the BSP; they now run inside a kernel task, which is strictly
         // better for them — `spawn_user`'s target-core choice and the bounded `ticks()` waits are

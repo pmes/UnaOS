@@ -38,6 +38,10 @@ pub const BUILTIN: &[(&str, &str, &str, &str)] = &[
     (ft::GZIP, "none", "archive", "gzip archive"),
     (ft::TAR, "none", "archive", "tar archive"),
     (ft::OCTET, "none", "file", "Binary data"),
+    // QUARRY2 (B336): the two text types with their own openers (the viewer, rendered), and GIF.
+    (ft::TEXT_MARKDOWN, "markdown", "doc", "Markdown"),
+    (ft::APP_JSON, "json", "doc", "JSON"),
+    (ft::IMAGE_GIF, "facet", "image", "GIF image"),
 ];
 
 /// The builtin row for `mime`, if any. Pure.

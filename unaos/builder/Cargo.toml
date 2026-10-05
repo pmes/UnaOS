@@ -10,3 +10,6 @@ license = "GPL-3.0-or-later"
 # hand-written (vm_image.rs) so the disk/partition GUIDs are DETERMINISTIC from the git hash.
 fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 crc32fast = "1"
+# VEINTLS (SR36): the trust bundle's sha256 is checked against its pin with UnaOS's own SHA-256 (in-tree,
+# zero third-party crates) before system/trust/roots.pem is staged.
+crypto_core = { path = "../libs/sys/crypto_core" }

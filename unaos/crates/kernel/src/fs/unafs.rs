@@ -327,6 +327,7 @@ impl SectorDevice for SdSectorDevice {
     /// otherwise the root flip can reach the medium before the tree it points
     /// at, and commit ordering silently breaks.
     fn flush(&mut self) -> Result<(), SectorError> {
+        #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let block::BlockHandle::Ahci { port } = self.handle { return block::flush_ahci_port(port).map_err(|_| SectorError::Io(alloc::string::String::from("ahci: FLUSH CACHE EXT failed"))); } // AHCIROOT (B332): a SATA SSD HAS a write cache — this is the real drain the note above demands
         Ok(())
     }
 }
@@ -618,6 +619,7 @@ pub fn mount_bound_handle() -> Option<block::BlockHandle> {
 /// The successful bind prints the `[unafsbind]` witness: `mount=native` (the native volume's VFS
 /// name of record — vfs.rs mounts `NativeBackend::new("native")`), `handle=` the disk it rode.
 fn bind_mount() -> Result<BoundMount, MountError> {
+    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let Some(port) = crate::install::ahciroot::root_port() { if let Ok(fs) = mount_on(block::BlockHandle::Ahci { port }) { return Ok(BoundMount { handle: block::BlockHandle::Ahci { port }, fs }); } } // AHCIROOT (B332) M4: the root-granted SSD binds FIRST — SSD root over card root; silent (the UNAFSX86 line names it)
     let global_err = match mount_on(block::BlockHandle::Global) {
         Ok(fs) => {
             serial_println!(
