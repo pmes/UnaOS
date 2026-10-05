@@ -98,6 +98,9 @@ pub enum Codec {
     Opus,
     Vorbis,
     Flac,
+    /// MPEG-1/2 Audio Layer III (MP4 ObjectTypeIndication 0x69/0x6B or `.mp3`; Matroska
+    /// `A_MPEG/L3`) — AUDIOTRACK (SR45): one packet is one frame.
+    Mp3,
     /// Uncompressed integer or IEEE-float PCM, interleaved (MP4 `sowt`/`twos`/`ipcm`/`fpcm`,
     /// Matroska `A_PCM/INT/LIT`, `A_PCM/INT/BIG`, `A_PCM/FLOAT/IEEE`).
     Pcm { bits: u16, float: bool, big_endian: bool },
@@ -156,6 +159,12 @@ pub struct Track {
     pub duration_ns: u64,
     /// Matroska header stripping: bytes prepended to every frame of this track.
     pub frame_prefix: Vec<u8>,
+    /// AUDIOTRACK (SR45) gapless facts the edit list alone does not carry, in ns of presentation:
+    /// leading priming to discard when no edit list already shifted it (Apple `iTunSMPB`), and
+    /// the presented length (the media edit's segment duration, or `iTunSMPB`'s total) — the
+    /// decoder discards what lies past it. Zero / `None` when the file says nothing.
+    pub trim_start_ns: u64,
+    pub play_ns: Option<u64>,
 }
 
 impl Track {
@@ -173,6 +182,9 @@ pub struct Packet {
     pub duration: u64,
     pub keyframe: bool,
     pub data: Vec<u8>,
+    /// Matroska `DiscardPadding` in ns (audio to drop at the end of this packet's output); 0
+    /// elsewhere.
+    pub discard_ns: u64,
 }
 
 /// A sample-table entry: where a packet lives, without its bytes.
@@ -186,6 +198,9 @@ pub struct Sample {
     pub dts: i64,
     pub duration: u64,
     pub keyframe: bool,
+    /// Matroska BlockGroup `DiscardPadding` (ns of decoded audio to drop at this frame's end;
+    /// RFC 9559 §5.1.3.5.6); 0 elsewhere.
+    pub discard_ns: u64,
 }
 
 /// What a format parser hands back: tracks plus each track's samples in decode order.
@@ -290,7 +305,7 @@ impl Demuxer {
         let mut data = Vec::with_capacity(t.frame_prefix.len() + body.len());
         data.extend_from_slice(&t.frame_prefix);
         data.extend_from_slice(body);
-        Packet { track: t.id, pts: s.pts, dts: s.dts, duration: s.duration, keyframe: s.keyframe, data }
+        Packet { track: t.id, pts: s.pts, dts: s.dts, duration: s.duration, keyframe: s.keyframe, data, discard_ns: s.discard_ns }
     }
     pub fn next_packet(&mut self) -> Option<Packet> {
         let s = *self.order.get(self.pos)?;

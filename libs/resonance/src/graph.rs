@@ -37,6 +37,10 @@ pub struct AudioGraph {
     /// outputs[node_id.0] is the buffer written to by node_id.
     outputs: Vec<[Sample; BLOCK_SIZE]>,
 
+    /// The right-channel output buffers (AUDIOTRACK, SR45): written by stereo nodes, a copy
+    /// of `outputs` for mono ones. `outputs` is the left channel.
+    outputs_r: Vec<[Sample; BLOCK_SIZE]>,
+
     /// A silent buffer used for unconnected inputs or as a default reference.
     silence: [Sample; BLOCK_SIZE],
 
@@ -51,6 +55,7 @@ impl AudioGraph {
             nodes: Vec::new(),
             connections: Vec::new(),
             outputs: Vec::new(),
+            outputs_r: Vec::new(),
             silence: [0.0; BLOCK_SIZE],
             context: GraphContext::new(sample_rate),
         }
@@ -63,6 +68,7 @@ impl AudioGraph {
         let id = NodeId(self.nodes.len());
         self.nodes.push(node);
         self.outputs.push([0.0; BLOCK_SIZE]);
+        self.outputs_r.push([0.0; BLOCK_SIZE]);
         self.connections.push(Vec::new());
         id
     }
@@ -123,6 +129,26 @@ impl AudioGraph {
     /// Iterates through nodes in the order they were added (topological order is expected).
     /// Returns a reference to the output buffer of the last node in the chain.
     pub fn process(&mut self) -> &[Sample; BLOCK_SIZE] {
+        self.run();
+        // Return the last buffer or silence if graph is empty
+        if let Some(last) = self.outputs.last() {
+            last
+        } else {
+            &self.silence
+        }
+    }
+
+    /// Processes one block and returns the last node's (left, right) buffers — the stereo
+    /// face the engine plays (AUDIOTRACK, SR45). For a mono last node both are the same signal.
+    pub fn process_stereo(&mut self) -> (&[Sample; BLOCK_SIZE], &[Sample; BLOCK_SIZE]) {
+        self.run();
+        match (self.outputs.last(), self.outputs_r.last()) {
+            (Some(l), Some(r)) => (l, r),
+            _ => (&self.silence, &self.silence),
+        }
+    }
+
+    fn run(&mut self) {
         // Iterate through every node by index
         for id in 0..self.nodes.len() {
             // Split outputs into past (inputs) and current (output).
@@ -164,16 +190,15 @@ impl AudioGraph {
             // We need to pass a slice of mutable outputs, even though we only have one.
             // The trait expects `&mut [&mut [Sample; BLOCK_SIZE]]`.
             // We construct a temporary array of mutable references on the stack.
-            let mut output_refs = [output_buffer];
-
-            self.nodes[id].process(inputs_slice, &mut output_refs, &self.context);
-        }
-
-        // Return the last buffer or silence if graph is empty
-        if let Some(last) = self.outputs.last() {
-            last
-        } else {
-            &self.silence
+            let right = &mut self.outputs_r[id];
+            if self.nodes[id].channels() == 2 {
+                let mut output_refs = [output_buffer, right];
+                self.nodes[id].process(inputs_slice, &mut output_refs, &self.context);
+            } else {
+                let mut output_refs = [output_buffer];
+                self.nodes[id].process(inputs_slice, &mut output_refs, &self.context);
+                right.copy_from_slice(output_refs[0]);
+            }
         }
     }
 }

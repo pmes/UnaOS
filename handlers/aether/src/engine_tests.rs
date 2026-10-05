@@ -1096,7 +1096,7 @@ mod tests {
     fn test_media_click_stages_playmedia() {
         let mut engine = crate::AetherEngine::new();
         engine.load_html_styled(
-            "https://example.com/watch/",
+            "file:///site/watch/",
             r#"<html><body>
                 <video style="width: 300px; height: 150px">
                     <source src="/media/clip.webm" type="video/webm">
@@ -1111,13 +1111,15 @@ mod tests {
         engine.handle_event(crate::api::events::Event::MouseDown(50.0, 50.0));
         engine.handle_event(crate::api::events::Event::MouseUp(50.0, 50.0));
         let staged = engine.take_pending_media().expect("click must stage media");
-        assert_eq!(staged.0, "https://example.com/media/clip.webm");
+        assert_eq!(staged.0, "file:///media/clip.webm");
         assert_eq!(staged.2, "video/webm");
         assert!(engine.take_pending_media().is_none(), "take must consume");
 
         // media_sources still reports the page's streams for enumeration.
         let sources = engine.media_sources();
-        assert_eq!(sources, vec![("https://example.com/media/clip.webm".to_string(), "video/webm".to_string())]);
+        assert_eq!(sources, vec![("file:///media/clip.webm".to_string(), "video/webm".to_string())]);
+        // (an http(s) page's media is fetched into the cache first and staged as that file —
+        // AUDIOTRACK M4, `media::tests::http_media_is_cached_then_handed_to_stria_as_a_file…`)
     }
 
     /// History: load A, B, C → back lands on B then A; a new load from B

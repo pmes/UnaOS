@@ -353,6 +353,7 @@ kat!(
     r#"{"MediaSeek":{"url":"u","position_ns":1500000000}}"#
 );
 kat!(kat_media_stop, SMessage::MediaStop { url: "u".to_string() }, r#"{"MediaStop":{"url":"u"}}"#);
+kat!(kat_media_mute, SMessage::MediaMute { url: "u".to_string(), muted: true }, r#"{"MediaMute":{"url":"u","muted":true}}"#);
 kat!(
     kat_media_opened,
     SMessage::MediaOpened {
@@ -369,8 +370,14 @@ kat!(
 );
 kat!(
     kat_media_frame,
-    SMessage::MediaFrame { url: "u".to_string(), pts_ns: 40_000_000, width: 1, height: 1, rgba: vec![1, 2, 3, 255] },
+    SMessage::MediaFrame { url: "u".to_string(), pts_ns: 40_000_000, width: 1, height: 1, rgba: vec![1, 2, 3, 255], levels: vec![] },
     r#"{"MediaFrame":{"url":"u","pts_ns":40000000,"width":1,"height":1,"rgba":[1,2,3,255]}}"#
+);
+// AUDIOTRACK (SR45): an audio-only session's meter frame — no pixels, peak L/R per 50 ms.
+kat!(
+    kat_media_frame_levels,
+    SMessage::MediaFrame { url: "u".to_string(), pts_ns: 50_000_000, width: 0, height: 0, rgba: vec![], levels: vec![[0.5, 0.25], [1.0, 0.0]] },
+    r#"{"MediaFrame":{"url":"u","pts_ns":50000000,"width":0,"height":0,"rgba":[],"levels":[[0.5,0.25],[1.0,0.0]]}}"#
 );
 kat!(
     kat_media_ended,
@@ -1022,6 +1029,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::MediaResume { .. } => "MediaResume",
         SMessage::MediaSeek { .. } => "MediaSeek",
         SMessage::MediaStop { .. } => "MediaStop",
+        SMessage::MediaMute { .. } => "MediaMute",
         SMessage::MediaOpened { .. } => "MediaOpened",
         SMessage::MediaFrame { .. } => "MediaFrame",
         SMessage::MediaEnded { .. } => "MediaEnded",

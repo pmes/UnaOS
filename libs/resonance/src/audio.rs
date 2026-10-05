@@ -171,7 +171,8 @@ impl AudioEngine {
         // We move the graph into the closure.
         // We need a cursor to track where we are in the current block.
         let mut block_offset = BLOCK_SIZE;
-        let mut current_block = [0.0; BLOCK_SIZE];
+        // [left, right] (AUDIOTRACK, SR45: the graph is stereo-capable).
+        let mut current_block = [[0.0; BLOCK_SIZE]; 2];
 
         let cb_active = active.clone();
         let cb_level = level.clone();
@@ -271,7 +272,7 @@ fn write_output_f32(
     output: &mut [f32],
     channels: usize,
     graph: &mut AudioGraph,
-    current_block: &mut [Sample; BLOCK_SIZE],
+    current_block: &mut [[Sample; BLOCK_SIZE]; 2],
     block_offset: &mut usize,
     consumer: &mut impl Consumer<Item = AudioCommand>,
     active: &AtomicBool,
@@ -291,18 +292,20 @@ fn write_output_f32(
             // processed while stopped, so its state (oscillator phase)
             // freezes until resume.
             if active.load(Ordering::Acquire) {
-                let processed = graph.process();
-                // Copy to our local cache because 'processed' is a reference to graph internal memory
-                current_block.copy_from_slice(processed);
+                let (l, r) = graph.process_stereo();
+                // Copy to our local cache because the buffers are graph internal memory
+                current_block[0].copy_from_slice(l);
+                current_block[1].copy_from_slice(r);
             } else {
-                current_block.fill(0.0);
+                current_block[0].fill(0.0);
+                current_block[1].fill(0.0);
             }
 
             // 3. Publish the block peak — one atomic store per block — so
             // control threads can meter the output without touching the
             // graph.
             let mut peak: Sample = 0.0;
-            for &s in current_block.iter() {
+            for &s in current_block[0].iter().chain(current_block[1].iter()) {
                 let a = s.abs();
                 if a > peak {
                     peak = a;
@@ -313,14 +316,19 @@ fn write_output_f32(
             *block_offset = 0;
         }
 
-        // Get sample from current block
-        // Convert f64 -> f32
-        let sample = current_block[*block_offset] as f32;
+        // Get the frame from the current block (f64 -> f32). A mono device gets the average of
+        // left and right; a stereo-or-wider device gets left on even and right on odd channels
+        // (a mono graph's right IS its left, so it still reaches every channel as before).
+        let l = current_block[0][*block_offset] as f32;
+        let r = current_block[1][*block_offset] as f32;
         *block_offset += 1;
 
-        // Write to all channels in the frame
-        for sample_out in frame.iter_mut() {
-            *sample_out = sample;
+        if frame.len() == 1 {
+            frame[0] = (l + r) * 0.5;
+        } else {
+            for (c, sample_out) in frame.iter_mut().enumerate() {
+                *sample_out = if c % 2 == 0 { l } else { r };
+            }
         }
     }
 }
@@ -470,7 +478,7 @@ mod tests {
         // Two blocks of stereo frames, pre-filled with garbage the callback
         // must overwrite with silence.
         let mut output = [1.0f32; BLOCK_SIZE * 2 * 2];
-        let mut current_block = [0.7; BLOCK_SIZE];
+        let mut current_block = [[0.7; BLOCK_SIZE]; 2];
         let mut block_offset = BLOCK_SIZE; // force a fresh block immediately
 
         write_output_f32(
@@ -507,7 +515,7 @@ mod tests {
         // so the in-block peak reaches the full amplitude (sin peaks at the
         // quarter cycle): 1.0 * gain 0.1.
         let mut output = [0.0f32; BLOCK_SIZE * 2];
-        let mut current_block = [0.0; BLOCK_SIZE];
+        let mut current_block = [[0.0; BLOCK_SIZE]; 2];
         let mut block_offset = BLOCK_SIZE;
 
         write_output_f32(
@@ -538,7 +546,7 @@ mod tests {
         producer.try_push(AudioCommand::Stop).unwrap();
 
         let mut output = [0.0f32; BLOCK_SIZE * 2];
-        let mut current_block = [0.0; BLOCK_SIZE];
+        let mut current_block = [[0.0; BLOCK_SIZE]; 2];
         let mut block_offset = BLOCK_SIZE;
 
         // Block 1: consumed the Stop — silence.

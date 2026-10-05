@@ -82,6 +82,11 @@ pub async fn ignite(synapse: Synapse) -> Result<()> {
                 // engine.tick() — NOT a bare run_jobs(): page timers live in
                 // the event_loop timer queue now, and only tick() fires them
                 // (bounded to one generation per turn).
+                // An http(s) media source that finished caching releases its request here
+                // (AUDIOTRACK M4), even when no bus message arrived this turn.
+                for req in engine.take_media_requests() {
+                    synapse.fire(req);
+                }
                 if engine.tick() {
                     // We let the shells handle repaint, so the handler mode doesn't need to do surface blits here,
                     // but we will keep this loop alive for JS timers/jobs.

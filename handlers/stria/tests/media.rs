@@ -12,7 +12,7 @@ use bandy::{SMessage, Synapse};
 use gneiss_pal::dsp::avsync::ManualTime;
 use gneiss_pal::dsp::demux::build::{self, MkvOptions, Mp4Options};
 use gneiss_pal::dsp::video::{Frame, TestPattern};
-use resonance::{AudioGraph, BLOCK_SIZE, stream_pair};
+use resonance::{AudioGraph, BLOCK_SIZE, stream_pair_channels};
 use stria::media::{AudioOut, FrameSink, Player, Tick};
 use stria::media_bus::MediaService;
 
@@ -34,11 +34,17 @@ impl FrameSink for RecSink<'_> {
 /// A resonance StreamFeed shared with the test's "device" loop.
 struct SharedFeed(Arc<Mutex<resonance::StreamFeed>>);
 impl AudioOut for SharedFeed {
-    fn push(&mut self, mono: &[f32]) -> usize {
-        self.0.lock().unwrap().push(mono)
+    fn push(&mut self, stereo: &[f32]) -> usize {
+        self.0.lock().unwrap().push(stereo)
     }
     fn consumed(&self) -> u64 {
         self.0.lock().unwrap().consumed()
+    }
+    fn flush(&mut self) {
+        self.0.lock().unwrap().flush()
+    }
+    fn set_paused(&mut self, paused: bool) {
+        self.0.lock().unwrap().set_paused(paused)
     }
 }
 
@@ -54,7 +60,7 @@ fn utp1_with_pcm_audio_plays_through_resonance_on_the_audio_clock() {
     let audio = build::pcm16_track(2, 48_000, 1, &pcm, 960);
     for file in [build::mp4(&[video.clone(), audio.clone()], &Mp4Options::default()), build::mkv(&[video.clone(), audio.clone()], &MkvOptions::default())] {
         let time = ManualTime::new();
-        let (src, feed) = stream_pair(48_000, 24_000);
+        let (src, feed) = stream_pair_channels(48_000, 2, 24_000);
         let feed = Arc::new(Mutex::new(feed));
         let mut graph = AudioGraph::new(48_000.0);
         graph.add_node(Box::new(src));
@@ -77,7 +83,9 @@ fn utp1_with_pcm_audio_plays_through_resonance_on_the_audio_clock() {
             time.advance(16_666_667);
             owed += 800;
             while owed >= BLOCK_SIZE {
-                out.extend(graph.process().iter().map(|&x| x as f32));
+                let (l, r) = graph.process_stereo();
+                assert_eq!(l, r, "a mono source plays on both channels");
+                out.extend(l.iter().map(|&x| x as f32));
                 owed -= BLOCK_SIZE;
             }
         }
@@ -89,7 +97,8 @@ fn utp1_with_pcm_audio_plays_through_resonance_on_the_audio_clock() {
             // Presented within half a display period of the audio clock.
             assert!((pts - clock).abs() <= 8_333_334, "frame {i}: pts {pts} clock {clock}");
         }
-        // Audio: what resonance played is the source, sample for sample (same rate, mono).
+        // Audio: what resonance played is the source, sample for sample (same rate, mono
+        // duplicated to stereo).
         let first = out.iter().position(|&x| x != 0.0).unwrap();
         let played: Vec<i32> = out[first..].iter().map(|&x| (x * 32768.0).round() as i32).take(90_000).collect();
         let want: Vec<i32> = pcm[first..first + played.len()].iter().map(|&x| x as i32).collect();

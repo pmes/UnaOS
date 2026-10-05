@@ -69,6 +69,7 @@ dependencies = [
  "boa_engine",
  "boa_gc",
  "clap",
+ "crypto_core",
  "cssparser 0.38.0",
  "directories",
  "font-kit",
