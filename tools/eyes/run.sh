@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
-# EYES runner STUB (tools/eyes's documented shape: `run.sh <suite> [--accept]`; exit 0 green, 1 regressed,
-# 2 harness error). The full harness (chromium/xvfb oracles, SSIM, baselines) lives on the AETHERSEE
-# branch; this stub runs `cmd` subjects against `golden` oracles with `facet diff`, and is replaced by it.
+# EYES — see what a program draws, score it against a reference, gate on regression.
+#   tools/eyes/run.sh <suite>             # build, render subjects + oracles, score, gate vs baseline.json
+#   tools/eyes/run.sh <suite> --accept    # same, then rewrite the suite's baseline.json from this run
+#   extra flags pass to `eyes run`: --only SUBSTR, --all (include optional/network cases), --refresh-ref
+# Exit: 0 green, 1 regressed past baseline, 2 harness error.
 set -euo pipefail
-repo="$(cd "$(dirname "$0")/../.." && pwd)"; suite="${1:?usage: run.sh <suite> [--accept]}"; accept="${2:-}"
-cd "$repo" && exec python3 - "$repo" "$suite" "$accept" <<'PY'
-import sys, tomllib, subprocess, shutil, pathlib
-repo, name, accept = sys.argv[1], sys.argv[2], sys.argv[3] == "--accept"
-sd = pathlib.Path(repo, "tools/eyes/suites", name); od = pathlib.Path(repo, "tools/eyes/out", name); od.mkdir(parents=True, exist_ok=True)
-s = tomllib.loads((sd / "suite.toml").read_text()); fails = 0
-for b in s.get("build", []): subprocess.run(b, shell=True, check=True)
-for c in s["case"]:
-    v = {"repo": repo, "suite": str(sd), "outdir": str(od), "case": c["name"], "out": str(od / f"{c['name']}.subject.png")}
-    v["ref"] = str(sd / s["defaults"]["oracle"]["path"].format(**v)); run = c["subject"]["run"].format(**v)
-    if subprocess.run(run, shell=True).returncode: print(f"FAIL {c['name']}: subject failed"); fails += 1; continue
-    if accept: shutil.copy(v["out"], v["ref"])
-    d = subprocess.run([f"{repo}/target/release/facet", "diff", v["out"], v["ref"], "--max-delta", str(c.get("max_delta", 0))], capture_output=True, text=True)
-    print(("ok  " if d.returncode == 0 else "FAIL") + f" {c['name']:<14} " + d.stdout.replace("\n", "  ").strip()); fails += d.returncode != 0
-sys.exit(1 if fails else 0)
-PY
+here="$(cd "$(dirname "$0")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
+suite="${1:?usage: run.sh <suite> [--accept] [--only X] [--all]}"; shift
+accept=""; pass=()
+for a in "$@"; do if [[ "$a" == "--accept" ]]; then accept="--accept"; else pass+=("$a"); fi; done
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/opt/pw-browsers}"
+cd "$repo"
+cargo build --release -q -p eyes
+"$repo/target/release/eyes" run "$suite" ${pass[@]+"${pass[@]}"}
+"$repo/target/release/eyes" gate "$suite" $accept

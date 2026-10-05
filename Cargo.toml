@@ -46,6 +46,7 @@ members = [
     "tools/av1-check",
     "tools/holocron",
     "tools/crypto-check",
+    "tools/eyes",
     "vessels/lumen",
     "vessels/pulse",
     "vessels/phonolite",
