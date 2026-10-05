@@ -20,7 +20,7 @@ pub mod media;
 #[cfg(test)]
 mod engine_tests;
 pub struct AetherEngine {
-    pub document: Option<kuchiki::NodeRef>,
+    pub document: Option<crate::dom::NodeRef>,
     pub layout_tree: Option<layout::LayoutTree>,
     pub js_engine: Option<js::Engine>,
     pub needs_repaint: bool,
@@ -32,7 +32,7 @@ pub struct AetherEngine {
     pub width: u32,
     pub height: u32,
     pub title: String,
-    pub focused_node: Option<kuchiki::NodeRef>,
+    pub focused_node: Option<crate::dom::NodeRef>,
     pub surface: Vec<u8>,
     /// All stylesheet text applied to the current document (document
     /// <style> blocks + external sheets), kept for script-driven relayout.
@@ -128,14 +128,14 @@ impl AetherEngine {
     }
 
     /// Absolute (document) border box of `node`'s layout box: (x, y, w, h).
-    pub fn box_of(&self, node: &kuchiki::NodeRef) -> Option<(f32, f32, f32, f32)> {
+    pub fn box_of(&self, node: &crate::dom::NodeRef) -> Option<(f32, f32, f32, f32)> {
         let layout = self.layout_tree.as_ref()?;
         fn walk(
             id: taffy::prelude::NodeId,
             cx: f32,
             cy: f32,
             layout: &layout::LayoutTree,
-            want: &kuchiki::NodeRef,
+            want: &crate::dom::NodeRef,
         ) -> Option<(f32, f32, f32, f32)> {
             let l = layout.taffy.layout(id).ok()?;
             let (nx, ny) = (cx + l.location.x, cy + l.location.y);
@@ -153,7 +153,7 @@ impl AetherEngine {
     }
 
     /// `node`'s box as a damage rect in viewport pixels, clamped; None when off screen.
-    fn screen_rect_of(&self, node: &kuchiki::NodeRef) -> Option<(u32, u32, u32, u32)> {
+    fn screen_rect_of(&self, node: &crate::dom::NodeRef) -> Option<(u32, u32, u32, u32)> {
         let (x, y, w, h) = self.box_of(node)?;
         let x0 = (x as f64 - self.scroll_x).floor().max(0.0) as u32;
         let y0 = (y as f64 - self.scroll_y).floor().max(0.0) as u32;
@@ -188,7 +188,7 @@ impl AetherEngine {
         needs_repaint
     }
     
-    fn hit_test(&self, x: f64, y: f64) -> Option<kuchiki::NodeRef> {
+    fn hit_test(&self, x: f64, y: f64) -> Option<crate::dom::NodeRef> {
         let layout = self.layout_tree.as_ref()?;
         let abs_x = x + self.scroll_x;
         let abs_y = y + self.scroll_y;
@@ -201,7 +201,7 @@ impl AetherEngine {
             abs_x: f64, 
             abs_y: f64, 
             layout: &layout::LayoutTree,
-            hit: &mut Option<kuchiki::NodeRef>
+            hit: &mut Option<crate::dom::NodeRef>
         ) {
             if let Ok(l) = layout.taffy.layout(node_id) {
                 let nx = cx + l.location.x;
@@ -361,7 +361,7 @@ impl AetherEngine {
 
     /// Builds a form submission from the focused control's enclosing <form>:
     /// collects named inputs, resolves the action against the current page.
-    fn build_form_submission(&self, control: &kuchiki::NodeRef) -> Option<forms::OpenDocument> {
+    fn build_form_submission(&self, control: &crate::dom::NodeRef) -> Option<forms::OpenDocument> {
         // Walk up to the enclosing form.
         let mut cur = Some(control.clone());
         let form_node = loop {
@@ -572,7 +572,7 @@ impl AetherEngine {
         // element it came from (the two lists are not aligned — non-JS
         // types, the fetch cap and failed fetches all drop entries), so this
         // is what gives `document.currentScript` a real element to report.
-        let script_elements: Vec<kuchiki::NodeRef> = document
+        let script_elements: Vec<crate::dom::NodeRef> = document
             .select("script")
             .map(|m| m.map(|el| el.as_node().clone()).collect())
             .unwrap_or_default();

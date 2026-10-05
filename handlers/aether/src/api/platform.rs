@@ -1,8 +1,8 @@
 //! Platform APIs that are *real*, not shaped-like-real: `URL` /
 //! `URLSearchParams` over the same `url` crate the network stack parses
 //! with, UTF-8 `TextEncoder`/`TextDecoder`, the `AbortController` object
-//! graph, `DOMParser` over the same `kuchiki::parse_html` the `innerHTML`
-//! setter uses, and `crypto` seeded from the OS entropy pool.
+//! graph, `DOMParser` over the same `html_core` parser (`dom::parse_html`) the
+//! `innerHTML` setter uses, and `crypto` seeded from the OS entropy pool.
 //!
 //! The split follows `api::fetch`: anything that needs engine truth (URL
 //! resolution, HTML parsing, entropy) is a small native; the WHATWG object
@@ -17,7 +17,6 @@ use boa_engine::{
     object::{ObjectInitializer, builtins::JsArray},
     property::Attribute,
 };
-use kuchiki::traits::*;
 
 fn str_arg(args: &[JsValue], i: usize, ctx: &mut Context) -> String {
     args.get(i)
@@ -195,8 +194,8 @@ pub fn init(context: &mut Context) {
     // document supports querySelector/getElementById/textContent for real.
     let parse_doc = NativeFunction::from_fn_ptr(|_this, args, ctx| {
         let html = str_arg(args, 0, ctx);
-        let doc = kuchiki::parse_html().one(html);
-        let mut extras: Vec<(&str, kuchiki::NodeRef)> = Vec::new();
+        let doc = crate::dom::parse_html(&html);
+        let mut extras: Vec<(&str, crate::dom::NodeRef)> = Vec::new();
         for (prop, sel) in [("documentElement", "html"), ("body", "body"), ("head", "head")] {
             if let Ok(mut m) = doc.select(sel) {
                 if let Some(el) = m.next() {

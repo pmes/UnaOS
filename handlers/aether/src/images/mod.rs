@@ -200,7 +200,7 @@ pub fn pick_srcset(srcset: &str) -> Option<String> {
 }
 
 /// The effective source of an <img>: srcset choice first, else src.
-pub fn effective_img_src(attrs: &kuchiki::Attributes) -> Option<String> {
+pub fn effective_img_src(attrs: &crate::dom::Attributes) -> Option<String> {
     if let Some(srcset) = attrs.get("srcset") {
         if let Some(u) = pick_srcset(srcset) {
             return Some(u);

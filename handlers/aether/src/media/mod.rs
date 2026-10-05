@@ -25,7 +25,7 @@
 //! [`on_message`] (`AetherEngine::on_media_message`).
 
 use bandy::SMessage;
-use kuchiki::NodeRef;
+use crate::dom::NodeRef;
 use std::cell::RefCell;
 use std::rc::Rc;
 

@@ -973,13 +973,13 @@ fn clip_n(v: &str, n: usize) -> &str {
 /// A rule with `!important` declarations is split in two — the important
 /// half carries `important: true` and applies in a later cascade tier.
 struct Rule {
-    selector: kuchiki::Selector,
+    selector: crate::dom::Selector,
     style: std::rc::Rc<SpecifiedStyle>,
     important: bool,
     /// Cascade weight. Normally the compiled selector's own specificity;
     /// a selector recovered by lowering carries the specificity of the
     /// ORIGINAL construct instead (`:where()`'s arguments weigh nothing).
-    specificity: kuchiki::Specificity,
+    specificity: crate::dom::Specificity,
     key: RuleKey,
     plan: MatchPlan,
     /// Every depth-0 `.class`/`#id` in the selector: ALL must exist
@@ -1656,7 +1656,7 @@ fn rewrite_once((text, spec): &Candidate) -> Option<Vec<Candidate>> {
 
 /// Salvages one selector-list member servo rejected, pushing whatever
 /// compiles onto `out` with the specificity the cascade should charge it.
-fn lower_member(part: &str, out: &mut Vec<(kuchiki::Selector, kuchiki::Specificity)>) {
+fn lower_member(part: &str, out: &mut Vec<(crate::dom::Selector, crate::dom::Specificity)>) {
     // Bounded: a pathological nest of groups must not explode. Real pages
     // sit far under this (`:is()` lists are short and rarely nested).
     const BUDGET: usize = 48;
@@ -1669,7 +1669,7 @@ fn lower_member(part: &str, out: &mut Vec<(kuchiki::Selector, kuchiki::Specifici
             crate::ledger::record_css("selector-lower-budget");
             break;
         }
-        if kuchiki::Selectors::compile(&cand.0).is_ok() {
+        if crate::dom::Selectors::compile(&cand.0).is_ok() {
             done.push(cand);
             continue;
         }
@@ -1692,8 +1692,8 @@ fn lower_member(part: &str, out: &mut Vec<(kuchiki::Selector, kuchiki::Specifici
         crate::ledger::record_css("selector-lowered");
     }
     for (text, spec) in done {
-        let Ok(sels) = kuchiki::Selectors::compile(&text) else { continue };
-        let charged = kuchiki::Selectors::compile(&spec)
+        let Ok(sels) = crate::dom::Selectors::compile(&text) else { continue };
+        let charged = crate::dom::Selectors::compile(&spec)
             .ok()
             .and_then(|s| s.0.first().map(|sel| sel.specificity()));
         for sel in sels.0 {
@@ -1714,10 +1714,10 @@ fn lower_member(part: &str, out: &mut Vec<(kuchiki::Selector, kuchiki::Specifici
 /// headers and nav bars never got their layout properties. Recompiling
 /// member-by-member keeps the supported ones; lowering (above) recovers
 /// most of the rest; only what is left is ledgered.
-fn compile_selector_list(prelude: &str) -> Vec<(kuchiki::Selector, kuchiki::Specificity)> {
+fn compile_selector_list(prelude: &str) -> Vec<(crate::dom::Selector, crate::dom::Specificity)> {
     let mut out = Vec::new();
     // Fast path: the whole list parses, no salvage machinery runs at all.
-    if let Ok(s) = kuchiki::Selectors::compile(prelude) {
+    if let Ok(s) = crate::dom::Selectors::compile(prelude) {
         for sel in s.0 {
             let spec = sel.specificity();
             out.push((sel, spec));
@@ -1725,7 +1725,7 @@ fn compile_selector_list(prelude: &str) -> Vec<(kuchiki::Selector, kuchiki::Spec
         return out;
     }
     for part in split_selector_list(prelude) {
-        match kuchiki::Selectors::compile(part) {
+        match crate::dom::Selectors::compile(part) {
             Ok(s) => {
                 for sel in s.0 {
                     let spec = sel.specificity();
@@ -1822,7 +1822,7 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     // selector engine (whose has_class re-split class strings on every
     // test — the profiled hot path).
     struct ElemInfo {
-        el_ref: kuchiki::NodeDataRef<kuchiki::ElementData>,
+        el_ref: crate::dom::NodeDataRef<crate::dom::ElementData>,
         tag: String,
         id_attr: Option<String>,
         classes: std::collections::HashSet<String>,
@@ -2075,7 +2075,7 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
             crate::ledger::record_css("pseudo-element-rule");
             continue;
         }
-        // Compile with kuchiki's real selector engine (servo selectors),
+        // Compile with the real selector engine (servo selectors over html_core, dom::select),
         // salvaging modern syntax it rejects (see `lower_member`).
         let selectors = compile_selector_list(&prelude);
         if selectors.is_empty() {
