@@ -64,3 +64,31 @@ whether the device stopped (port U0, endpoint Running, kicks did nothing) or the
 The stall's root cause is unproven (R78: metal only). The kick is a recovery candidate, not a proven fix. The
 RTL8153 parser is linked but not wired: this driver reaches an RTL8153 only through its CDC-ECM
 configuration, which has no descriptor framing.
+
+## Result (M4)
+
+- `5817bf49` M1 — `unaos/libs/sys/usbnet_core` (CHARTER: Kernel — shared-core), root-workspace member;
+  `cargo test -p usbnet_core` exit 0, 9 KATs (AX88179: flight-22 one-frame-plus-dummy shape, 3-frame 8-byte
+  stride, CRC/drop flags skip one packet only, no-IPE, refusals, trailer fields; RTL8153: 2 frames with
+  descriptor + FCS stripped, zero tail and runts; and an AX completion read as RTL disagrees).
+- `c90e37d8` M2 + M3 — `drivers/xhci/usbnet.rs` (`deliver_ax` on the core, `rx0` dump, `rxlog`, `rx_kick_due`,
+  `usbnet7_selftest`), `drivers/xhci/mod.rs` (one same-line `else if` kick in `usbnet_data_pass`; tail
+  `usbnet_stall_probe`), `smolnet.rs` tail `usbnet7_poll`, `tests.rs` same-line `usbnet7` registration, the
+  kernel's `usbnet` feature now `["dep:usbnet_core"]`. No new knob, no new verb, no new dotfile.
+- Legs: x86 metal shape + `smolnet,selfdiag,ahciroot,btc` `cargo check` exit 0; aarch64
+  `login,loginst,virt_el0,usbnet` exit 0; charter-check exit 0.
+
+What the next flight reads (boot with the dongle in, then `tests usbnet7`):
+
+```
+[usbnet] rx0 len=<n> hdr=0x<off><cnt> pkt_cnt=2 hdr_off=<n> bytes=<48 bytes hex> tail=<16 bytes hex>
+[usbnet] rx kick n=1 pending_ms=<n> xfers=<n> rx_ok=<n>          (only if a TD stalls past 2 s)
+:: USBNET7: rx_ok=<n> frames=<n> first_frame_ms=<n> ethertype=0x0800 dhcp=offer -> PASS ::
+```
+
+On FAIL: `[usbnet] rxlog n= lens=[…] ms=[…] last_ms= tx_last_ms= now_ms= kicks= tx_stuck=` and
+`[usbnet] stall portsc= ccs= ped= pls= speed= in_state= out_state= pending=`. Reading them: kicks>0 and RX
+resumed after (`n` grows past the stall) = a missed doorbell, the kick is the fix; `pls` not 0 (U0) = the USB3
+link left U0 (power management) — next arc is the port's U1/U2 handling; `pls=0`, endpoint Running, kicks
+without effect, `last_ms` near `tx_last_ms` = the AX88179 itself stopped delivering — next arc is the chip's RX
+path (the QCTRL / PAUSE / CLK_SELECT readbacks that disagree with their writes).
