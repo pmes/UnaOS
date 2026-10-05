@@ -49,3 +49,25 @@ Branch `exec-rmbp-smallfix`, cut from a60219de. No new kernel file (no CHARTER l
   start line reports `trust=`), a LUMEN arc. A bench with CCADB reachable stages an 8 MiB `inters.pem` that every TLS load parses.
 - FAT `truncate` to a non-zero smaller size is still `Unsupported` in the VFS (the shim's rewrite fallback covers it).
 - The ctapple / inters pins are not committed, so they still prove only the fetch (said `pin=uncommitted`).
+
+## M6 STACKGUARD (added by the seat from MP3HANG's finding)
+- **Finding**: every x86 kernel stack is a heap `Box<[u8]>` with a 4 KiB POISONED guard (RENDSTACK), not an unmapped page.
+  audio_core's 92,504-byte open frame on the render task's 32 KiB stack: the stack probes stepped every 4 KiB straight
+  through the poison into the heap below — no fault, flight 23's silent MP3HANG.
+- **Seam**: kernel-by-ruling (scheduler + paging). New file `arch/x86_64/stackguard.rs` (CHARTER: Kernel — driver);
+  `memory::stack_guard_page` splits the covering 1 GiB / 2 MiB identity leaf into an identical-mapping table (same PA,
+  WXN_LEAF_CARRY bits, PAT moved to its 4 KiB bit) and clears ONE 4 KiB entry's P bit. RENDSTACK's three reasons:
+  the page is re-mapped in `Task`'s drop before the slab is freed (the allocator's free-list node); the split keeps the
+  device-visible map identical; remote cores drop global entries at their next timer tick (`tlb_sync`, a generation
+  compare) — a stale remote entry can only map the page, never fault a live one.
+- `STACK_GUARD` 4096 -> 8192 (usable sizes unchanged): a whole page-aligned page always lies inside the span; the rest
+  stays the poisoned absorber `guard_state` reads (only the absorber is read now).
+- Fault side: a CPL-0 #PF with CR2 in the current task's guard page, or the #DF it escalates to when the frame cannot be
+  pushed (IST), prints `[stack] OVERFLOW task=<name> stack=<lo>..<top> fault=<addr> rip=<addr> via=<pf|df> -> task halted`,
+  re-lays the absorber and `sched::exit`s the task on a fresh frame at its slab's top. Serial: a bounded wait for the
+  lock, then the lock-free panic-mode path if the dead task held it.
+- Boot: `[stack] guards armed tasks=<n> page=4096` once at the BSP's join; `tests stackroom` prints
+  `[stack] room task=<name> high=<n> of <size> left=<n> guard=<page>` per live task and
+  `:: STACKROOM: tasks=<n> armed=<n> live=<n> failed=0 page=4096 -> PASS ::`.
+- **Owed**: AP boot stacks (static array in smp.rs), the BSP firmware stack and the IST stacks are not guarded; a task
+  that overflows while holding a lock still holds it (the line names the task); remote detection lags up to one tick.
