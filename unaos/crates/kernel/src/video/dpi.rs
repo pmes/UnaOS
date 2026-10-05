@@ -171,3 +171,23 @@ pub fn s2() -> u32 {
     }
     metrics_scale().0
 }
+
+/// KFONTPPI (B382): the EDID arrived AFTER the latch. A scale latched while no EDID existed (ppi 0 — on the rMBP
+/// the console grid latches at the splash takeover, before the PCI probes reach the iGPU lane's AUX read) is
+/// re-latched once from the live panel; a latch that already had a ppi is never moved, and an unlatched scale is
+/// left for its first reader. Returns `(scale x2 before, after)`, `(0, 0)` when nothing was re-latched. The math
+/// is [`compute`]'s, unchanged.
+pub fn relatch_edid() -> (u32, u32) {
+    let before = S2.load(Ordering::Acquire);
+    if before == 0 || PPI.load(Ordering::Relaxed) != 0 {
+        return (0, 0);
+    }
+    let w = crate::video::panel_info_nonblocking().map_or(0, |i| i.width);
+    let (ppi, s2) = compute(w);
+    if ppi == 0 {
+        return (0, 0);
+    }
+    PPI.store(ppi, Ordering::Relaxed);
+    S2.store(s2, Ordering::Release);
+    (before, s2)
+}

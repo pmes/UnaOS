@@ -3629,3 +3629,42 @@ pub fn console_takes_glyphs() -> bool {
 pub fn console_present_suspended() -> bool {
     CONSOLE_PRESENT_SUSPENDED.load(Ordering::Relaxed)
 }
+
+/// KFONTPPI (B382): the full-screen panel console's cell after `video::dpi::relatch_edid` moved the scale (the
+/// panel's EDID arrived over AUX after `arm_grid` latched with none). The glyphs draw at `grid_cell()`, so the
+/// grid they are placed on follows it here: cell, cols and rows re-taken, the cursor clamped, the panel cleared
+/// unless the splash holds it. The windowed console is `regrid`'s. `None` when there was nothing to move or
+/// FBCON was contended. Returns `(old cols, old rows, new cols, new rows)`. x86 compositing builds only (the AUX
+/// lane is x86's; `win_store` exists only there and on the Pi's desktop).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn regrid_panel() -> Option<(usize, usize, usize, usize)> {
+    let (gw, gh) = crate::video::text::grid_cell();
+    if gw == 0 || gh == 0 {
+        return None;
+    }
+    let mut out = None;
+    crate::arch::without_interrupts(|| {
+        let Some(mut c) = FBCON.try_lock() else { return };
+        if c.win_store.is_some() || !c.aa || (c.cell_w, c.cell_h) == (gw, gh) {
+            return;
+        }
+        let info = c.fb.info();
+        let (nc, nr) = ((info.width / gw).max(1), (info.height / gh).max(1));
+        let (oc, or) = (c.cols, c.rows);
+        c.cell_w = gw;
+        c.cell_h = gh;
+        c.cols = nc;
+        c.rows = nr;
+        c.col = c.col.min(nc - 1);
+        c.row = c.row.min(nr - 1);
+        if !PANEL_MIRROR_HOLD.load(Ordering::Relaxed) {
+            let bg = c.bg;
+            c.full_fb().fill_screen(bg);
+            c.full_fb().flush_all();
+            c.col = 0;
+            c.row = 0;
+        }
+        out = Some((oc, or, nc, nr));
+    });
+    out
+}

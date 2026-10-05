@@ -683,6 +683,7 @@ mod tt {
             family_name(family), css_px, t.names[0], t.styles[0].0.size, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size, t.names[3], t.styles[3].0.size,
             crate::arch::ms().saturating_sub(t0)
         );
+        crate::video::edidsrc::witness(ppi); // KFONTPPI (B382): edid_src, ppi, scale, cell, grid — one line
         *TT.lock() = Some(t);
         READY.store(true, Ordering::Release);
         regrid_console(); // UIMETRICS (B372): a non-default font_size at load regrids the console too
