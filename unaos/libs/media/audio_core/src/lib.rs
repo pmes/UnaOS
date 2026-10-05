@@ -357,3 +357,24 @@ mod open_arm {
         if is_adts { adts(s) } else { mp3(s) }
     }
 }
+
+/// OPENERS (rmbp-ledger B379) — the MIME type of an audio file, from its first bytes, for the kernel's type table
+/// (`fs/filetype.rs`) and any ring-3 caller: [`sniff`]'s answer, so the type and the decoder cannot disagree.
+/// Returns `(mime, strong)`. `strong` is a magic the format defines (`RIFF…WAVE`, `FORM…AIFF`, `fLaC`, `OggS`,
+/// `ID3`); a bare frame-sync guess (an MPEG audio frame header, an ADTS header, a FLAC frame header) is WEAK, and
+/// the caller lets a file's name overrule it. ISO-BMFF answers `None`: whether an `ftyp` file is `audio/mp4` or
+/// `video/mp4` is the container core's question (`demux_core::mime_of`). An Ogg stream is `audio/ogg` whatever
+/// codec it carries (RFC 5334 §10.3: Opus, Vorbis and FLAC in Ogg are all `audio/ogg`). Pure.
+pub fn mime_of(d: &[u8]) -> Option<(&'static str, bool)> {
+    let strong_mp3 = d.len() >= 3 && &d[..3] == b"ID3";
+    let strong_flac = d.len() >= 4 && &d[..4] == b"fLaC";
+    Some(match sniff(d) {
+        Format::Wav => ("audio/wav", true),
+        Format::Aiff => ("audio/aiff", true),
+        Format::Flac => ("audio/flac", strong_flac),
+        Format::Ogg => ("audio/ogg", true),
+        Format::Mp3 => ("audio/mpeg", strong_mp3),
+        Format::Adts => ("audio/aac", false),
+        Format::Mp4 | Format::Unknown => return None,
+    })
+}

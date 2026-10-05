@@ -3648,7 +3648,7 @@ hda = []
 #
 # Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs`.
 # See docs/dev/OS/11_AUDIO/hda.md.
-hda-tone = ["hda", "dep:audio_core"]
+hda-tone = ["hda"]
 # HDASIE (rmbp-ledger B207): `UNAOS_HDASIE=1` — the one-knob flight B130 left open. Sets `INTCTL.SIE[n]`
 # for the tone's ONE descriptor right before RUN and restores it after STOP (GIE/CIE untouched, so no
 # interrupt reaches the CPU) to ask whether SIE gates the `SDnSTS.BCIS` LATCH on the 7-series PCH the
@@ -3817,9 +3817,13 @@ usbnet_core = { path = "../../libs/sys/usbnet_core", default-features = false, o
 diag_core = { path = "../../libs/sys/diag_core", optional = true }
 # AUDIOCODEC (SR30): the audio decoders UnaOS owns — WAV/AIFF/FLAC/Ogg/Opus/Vorbis/MP3/AAC/MP4, from the
 # specifications, no_std + alloc, zero deps — the same crate `gneiss_pal::dsp::audio` and `tools/audio-check` link.
-# `play <file>` (drivers/hda_play.rs) decodes through it. Optional, pulled in by `hda-tone` only, so a build
-# without the player does not compile it.
-audio_core = { path = "../../libs/media/audio_core", optional = true }
+# `play <file>` (drivers/hda_play.rs) decodes through it. OPENERS (B379): NOT optional any more — `fs/filetype.rs`
+# types audio files through `audio_core::mime_of` (the decoder's own sniff), and a file's type must not change with
+# a knob; `hda-tone` still gates the player.
+audio_core = { path = "../../libs/media/audio_core" }
+# OPENERS (B379): Stria's container core — `fs/filetype.rs` types ISO-BMFF (audio/mp4 vs video/mp4: the brands, then
+# the moov's hdlr) and Matroska/WebM (the EBML DocType) through `demux_core::mime`. no_std + alloc, zero deps.
+demux_core = { path = "../../libs/media/demux_core" }
 # SELFINSTALL2 (rmbp-ledger B310): Amber Bytes' shared disk-layout core — GPT encode/decode, the partition
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).

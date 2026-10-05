@@ -43,6 +43,21 @@ pub const OCTET: &str = "application/octet-stream";
 pub const TEXT_MARKDOWN: &str = "text/markdown";
 pub const APP_JSON: &str = "application/json";
 pub const IMAGE_GIF: &str = "image/gif";
+/// OPENERS (B379): the types the decoders already in the tree read — named by the cores that own the formats
+/// (`pixel_core::mime_of`, `audio_core::mime_of`, `demux_core::mime::mime_of`), so these strings are theirs.
+pub const IMAGE_JPEG: &str = "image/jpeg";
+pub const IMAGE_BMP: &str = "image/bmp";
+pub const IMAGE_WEBP: &str = "image/webp";
+pub const IMAGE_QOI: &str = "image/qoi";
+pub const AUDIO_FLAC: &str = "audio/flac";
+pub const AUDIO_OGG: &str = "audio/ogg";
+pub const AUDIO_MPEG: &str = "audio/mpeg";
+pub const AUDIO_AAC: &str = "audio/aac";
+pub const AUDIO_AIFF: &str = "audio/aiff";
+pub const AUDIO_MP4: &str = demux_core::mime::AUDIO_MP4;
+pub const VIDEO_MP4: &str = demux_core::mime::VIDEO_MP4;
+pub const VIDEO_WEBM: &str = demux_core::mime::VIDEO_WEBM;
+pub const VIDEO_MATROSKA: &str = demux_core::mime::VIDEO_MATROSKA;
 
 /// How many leading bytes the sniff reads (`ustar` sits at 257..262, so a tar needs 263).
 pub const SNIFF_LEN: usize = 512;
@@ -94,6 +109,28 @@ pub const EXT_TABLE: &[(&str, &str)] = &[
     ("tgz", GZIP),
     ("gz", GZIP),
     ("tar", TAR),
+    // OPENERS (B379): the image, audio and container extensions — used only when the bytes say nothing
+    // (an empty file, a head no core recognises).
+    ("jpg", IMAGE_JPEG),
+    ("jpeg", IMAGE_JPEG),
+    ("bmp", IMAGE_BMP),
+    ("webp", IMAGE_WEBP),
+    ("qoi", IMAGE_QOI),
+    ("flac", AUDIO_FLAC),
+    ("ogg", AUDIO_OGG),
+    ("oga", AUDIO_OGG),
+    ("opus", AUDIO_OGG),
+    ("mp3", AUDIO_MPEG),
+    ("aac", AUDIO_AAC),
+    ("m4a", AUDIO_MP4),
+    ("m4b", AUDIO_MP4),
+    ("aif", AUDIO_AIFF),
+    ("aiff", AUDIO_AIFF),
+    ("aifc", AUDIO_AIFF),
+    ("mp4", VIDEO_MP4),
+    ("m4v", VIDEO_MP4),
+    ("webm", VIDEO_WEBM),
+    ("mkv", VIDEO_MATROSKA),
 ];
 
 /// The extension of `name` (without the dot), or `None`. Pure.
@@ -161,6 +198,27 @@ pub fn looks_text(b: &[u8]) -> bool {
 
 /// The sniff over a file's leading bytes. `None` = nothing recognised (the table decides). Pure.
 pub fn sniff(b: &[u8]) -> Option<&'static str> {
+    sniff_strength(b).map(|(m, _)| m)
+}
+
+/// OPENERS (B379) — [`sniff`] with its STRENGTH: `true` for a magic a format defines, `false` for a shape a file
+/// of another kind could have by accident (the Markdown/JSON heads, a bare MPEG-audio/ADTS/FLAC frame sync, an
+/// ISO box type other than `ftyp`/`moov` at offset 4). [`type_of_in`] lets a name the table types otherwise
+/// overrule a weak answer. Pure.
+pub fn sniff_strength(b: &[u8]) -> Option<(&'static str, bool)> {
+    if let Some(m) = sniff_core(b) {
+        let weak = matches!(m, TEXT_MARKDOWN | APP_JSON);
+        return Some((m, !weak));
+    }
+    // Weak, and only for bytes that are not text: an ISO-BMFF head that opens with `free`/`mdat`/…, a bare frame sync.
+    if let Some(m) = demux_core::mime::mime_of(b) {
+        return Some((m, false));
+    }
+    audio_core::mime_of(b).map(|(m, _)| (m, false))
+}
+
+/// The pre-OPENERS sniff with the cores' strong magics inserted before the text heuristic. Pure.
+fn sniff_core(b: &[u8]) -> Option<&'static str> {
     if b.len() >= 8 && b[..8] == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a] {
         return Some(IMAGE_PNG);
     }
@@ -178,6 +236,19 @@ pub fn sniff(b: &[u8]) -> Option<&'static str> {
     }
     if b.len() >= 6 && (&b[..6] == b"GIF87a" || &b[..6] == b"GIF89a") {
         return Some(IMAGE_GIF);
+    }
+    // OPENERS (B379): the cores' own magics — images (JPEG, BMP by its DIB header, QOI, WebP), containers (an
+    // `ftyp`/`moov` at offset 4, the EBML magic), audio (`fLaC` `OggS` `ID3` `FORM…AIFF`).
+    if let Some(m) = pixel_core::mime_of(b) {
+        return Some(m);
+    }
+    if (b.len() >= 8 && matches!(&b[4..8], b"ftyp" | b"moov")) || b.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        if let Some(m) = demux_core::mime::mime_of(b) {
+            return Some(m);
+        }
+    }
+    if let Some((m, true)) = audio_core::mime_of(b) {
+        return Some(m);
     }
     if looks_text(b) {
         if looks_json(b) {
@@ -249,10 +320,16 @@ pub fn type_of_in(mt: &MountTable, path: &str) -> (String, Source) {
         if s.size > 0 {
             let want = core::cmp::min(s.size, SNIFF_LEN as u64) as usize;
             if let Ok(head) = mt.read(path, 0, want) {
-                if let Some(m) = sniff(&head) {
+                if let Some((m, strong)) = sniff_strength(&head) {
                     // QUARRY2 (B336): the Markdown/JSON shapes are WEAK (a `# comment` config is not a
-                    // document) — a name the table types otherwise keeps its table type.
-                    if let (TEXT_MARKDOWN | APP_JSON, Some(e)) = (m, by_extension(path)) { if e != m { return (String::from(e), Source::Extension); } }
+                    // document) — a name the table types otherwise keeps its table type. OPENERS (B379): so is
+                    // every weak shape `sniff_strength` names (a bare frame sync, an ISO head without `ftyp`).
+                    if let (false, Some(e)) = (strong, by_extension(path)) { if e != m { return (String::from(e), Source::Extension); } }
+                    // OPENERS (B379): an ISO-BMFF file's `moov` may lie past the sniff window (after the `mdat`):
+                    // walk the top-level boxes to it so its tracks decide audio/mp4 against video/mp4.
+                    if matches!(m, AUDIO_MP4 | VIDEO_MP4) {
+                        return (String::from(iso_walk(mt, path, s.size).unwrap_or(m)), Source::Sniffed);
+                    }
                     return (String::from(m), Source::Sniffed);
                 }
             }
@@ -493,5 +570,117 @@ pub fn selftest() {
         dir,
         if attrs { "unafs" } else { "none(fat)" },
         if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+/// OPENERS (B379) — the ISO-BMFF type of `path` from its `ftyp` and `moov` wherever they lie: one 16-byte read
+/// per top-level box (at most [`ISO_WALK_BOXES`]), then the `moov` payload whole if it is at most
+/// [`ISO_MOOV_CAP`]; `demux_core::mime::iso_mime` decides. `None` (the head's answer stands) when the walk
+/// breaks. The media (`mdat`) is never read.
+fn iso_walk(mt: &MountTable, path: &str, size: u64) -> Option<&'static str> {
+    let (mut ftyp, mut moov): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
+    let mut off = 0u64;
+    for _ in 0..ISO_WALK_BOXES {
+        if off + 8 > size {
+            break;
+        }
+        let hdr = mt.read(path, off, core::cmp::min(16, size - off) as usize).ok()?;
+        let (ty, bsize, hl) = demux_core::mime::iso_box_header(&hdr)?;
+        let end = if bsize == 0 { size } else { off.checked_add(bsize)? };
+        let body_len = end.min(size).saturating_sub(off + hl as u64);
+        match &ty {
+            b"ftyp" if body_len <= 1024 => ftyp = mt.read(path, off + hl as u64, body_len as usize).ok(),
+            b"moov" if body_len <= ISO_MOOV_CAP => {
+                moov = mt.read(path, off + hl as u64, body_len as usize).ok();
+                break;
+            }
+            b"moov" => break,
+            _ => {}
+        }
+        off = end;
+    }
+    if ftyp.is_none() && moov.is_none() {
+        return None;
+    }
+    Some(demux_core::mime::iso_mime(ftyp.as_deref(), moov.as_deref()))
+}
+
+/// How many top-level boxes [`iso_walk`] reads past before giving up.
+const ISO_WALK_BOXES: usize = 64;
+/// The largest `moov` payload [`iso_walk`] reads (sample tables of a long film run to a few MiB).
+const ISO_MOOV_CAP: u64 = 4 << 20;
+
+/// OPENERS (B379) — the witness `tests testf` prints after its TESTF line: for every claimed sample in `dir`,
+/// its type (and the leg that decided), its opener (and that opener's source), the handler that would run in
+/// THIS build, and whether the core that handler decodes with recognises the bytes. One line per sample, then
+///
+/// `:: OPENERS: test_f=<present> typed=<n> unhandled=<n> -> PASS :: opened=<n> cores=<ok>/<n> owed=<list> ::`
+///
+/// `unhandled` = a file with no type (`application/octet-stream`), or whose opener is not compiled into this
+/// build. A type the database itself gives `none` (video: no player in this tree) is OWED, named on the line,
+/// and does not count as unhandled — it is typed, and the gap is the tree's, said by name. R80: a test, run
+/// only when asked.
+pub fn openers_witness(dir: &str, names: &[&str]) {
+    let mt = crate::shell::vfs_mount_table();
+    let (mut present, mut typed, mut unhandled, mut opened, mut cores_ok, mut cores_n) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut owed: Vec<String> = Vec::new();
+    for n in names {
+        let path = alloc::format!("{}/{}", dir, n);
+        let Ok(st) = mt.stat(&path) else { continue };
+        present += 1;
+        let (m, src) = type_of_in(&mt, &path);
+        let (op, osrc) = crate::fs::assoc::opener_for_in(&mt, &path, &m);
+        #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+        let handler = crate::video::quarry::live::openers::effective(&op, &path);
+        #[cfg(not(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+        let handler = op.clone();
+        let is_typed = m != OCTET;
+        typed += is_typed as u32;
+        let is_owed = is_typed && op == "none";
+        let is_unhandled = !is_typed || (!is_owed && handler == "none");
+        unhandled += is_unhandled as u32;
+        if is_owed {
+            owed.push(alloc::format!("{}({})", n, m));
+        }
+        // The decoding core the handler uses must recognise the bytes (the type and the decoder agree).
+        let head = mt.read(&path, 0, core::cmp::min(st.size, SNIFF_LEN as u64) as usize).unwrap_or_default();
+        let core: Option<(&str, bool)> = match handler.as_str() {
+            "facet" => Some(("pixel_core", pixel_core::sniff(&head).is_some())),
+            "play" => Some(("audio_core", audio_core::sniff(&head) != audio_core::Format::Unknown)),
+            "textedit" | "fileview" | "markdown" | "json" => Some(("text", looks_text(&head))),
+            _ => None,
+        };
+        if handler != "none" {
+            opened += 1;
+        }
+        if let Some((_, ok)) = core {
+            cores_n += 1;
+            cores_ok += ok as u32;
+        }
+        serial_println!(
+            "[openers] {} type={} src={} opener={}({}) handler={} core={}{}",
+            n,
+            m,
+            src.name(),
+            op,
+            osrc,
+            handler,
+            core.map_or("-", |c| c.0),
+            match core { Some((_, true)) => "=ok", Some((_, false)) => "=REFUSED", None => "" }
+        );
+    }
+    let pass = present as usize == names.len() && typed == present && unhandled == 0 && cores_ok == cores_n;
+    serial_println!(
+        ":: OPENERS: test_f={} typed={} unhandled={} -> {} :: opened={} cores={}/{} owed={}{} dir={} ::",
+        present,
+        typed,
+        unhandled,
+        if pass { "PASS" } else { "FAIL" },
+        opened,
+        cores_ok,
+        cores_n,
+        if owed.is_empty() { String::from("-") } else { owed.join(",") },
+        if owed.is_empty() { "" } else { " reason=no-opener-in-this-tree(video: Stria's player, SR26)" },
+        dir
     );
 }

@@ -370,3 +370,27 @@ pub(crate) fn le32(b: &[u8], i: usize) -> u32 {
 pub(crate) fn le16(b: &[u8], i: usize) -> u16 {
     u16::from_le_bytes([b[i], b[i + 1]])
 }
+
+/// OPENERS (rmbp-ledger B379) — the MIME type of an image file, from its bytes, for the kernel's type table
+/// (`fs/filetype.rs`) and any ring-3 caller: the SAME magic [`sniff`] decodes by, so the type and the decoder
+/// cannot disagree. BMP is held to more than its two-byte `BM`: the BITMAPFILEHEADER's two reserved words are zero
+/// and the DIB header that follows has a size the format defines (BITMAPCOREHEADER 12, OS/2 2.x 16 and 64,
+/// BITMAPINFOHEADER 40, V2 52, V3 56, V4 108, V5 124) — a text file that starts "BM" is not an image. Pure.
+pub fn mime_of(bytes: &[u8]) -> Option<&'static str> {
+    Some(match sniff(bytes)? {
+        Format::Png => "image/png",
+        Format::Jpeg => "image/jpeg",
+        Format::Gif => "image/gif",
+        Format::Bmp => {
+            let dib = bytes.get(14..18).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))?;
+            if bytes.get(6..10)? != [0, 0, 0, 0] || !matches!(dib, 12 | 16 | 40 | 52 | 56 | 64 | 108 | 124) {
+                return None;
+            }
+            "image/bmp"
+        }
+        Format::Qoi => "image/qoi",
+        Format::WebP => "image/webp",
+        #[cfg(feature = "svg")]
+        Format::Svg => "image/svg+xml",
+    })
+}
