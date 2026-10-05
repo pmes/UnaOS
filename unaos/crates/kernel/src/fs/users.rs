@@ -3289,3 +3289,12 @@ fn boot80_root_and_seed() {
     let made = crate::fs::assoc::seed_once();
     s.end(&alloc::format!("created={}", made));
 }
+
+/// BOOT80 (`tests boot80`): re-read the users store from its volume — `dat` when `USERS.DAT` (or the
+/// interrupted swap's `USERS.NEW`) is there, `none` when the volume has neither, `nomount` when it does not mount.
+pub fn boot80_store_probe() -> &'static str {
+    match store_mount() {
+        Ok(fs) => if read_root_file(&fs, USERS_FILE).is_some() || read_root_file(&fs, USERS_TMP_FILE).is_some() { "dat" } else { "none" },
+        Err(_) => "nomount",
+    }
+}

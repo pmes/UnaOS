@@ -204,7 +204,7 @@ fn ensure_unafsx86() {
     #[cfg(feature = "unafs")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); register("boot80", crate::fs::bootstep::boot80_selftest); }
     }
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {

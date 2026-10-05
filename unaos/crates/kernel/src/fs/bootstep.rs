@@ -128,3 +128,42 @@ impl Step {
         (ms, d)
     }
 }
+
+/// BOOT80 M3 — `tests boot80`: the falsifier. Drops the one UnaFS mount and re-mounts it COLD from the
+/// card (the refcount map, the inode map and the roots read again through the read-ahead window), then
+/// resolves what the stage waits on — the users store (`USERS.DAT`, re-read from its volume), the stage,
+/// and the type database (`/system/types`, through the directory index) — and prints ONE line:
+///
+/// `:: BOOT80: mount_ms=<n> mount_blocks=<n> mount_cmds=<n> blocks_read=<n> cmds=<n> ms=<n> users_store=<dat|none|nomount> stage=<s> types=<n> ra_window=<n> -> PASS|FAIL ::`
+///
+/// Bound (B350): `blocks_read <= 64` for the resolve and `ms <= 2000` for mount + resolve. The cold
+/// mount's own blocks are said separately: by format it reads the whole refcount map (128 leaves on the
+/// card's 512 MiB volume), which BOOT80 makes cheap per command but does not shrink.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub fn boot80_selftest() {
+    let t0 = crate::arch::ms();
+    let io0 = io();
+    crate::fs::unafs::force_remount();
+    let mounted = crate::fs::unafs::with_unafs(|fs| fs.root_generation()).is_ok();
+    let mount_ms = crate::arch::ms().saturating_sub(t0);
+    let mio = io().since(io0);
+    let t1 = crate::arch::ms();
+    let io1 = io();
+    #[cfg(feature = "login")]
+    let (store, stage) = (crate::fs::users::boot80_store_probe(), crate::fs::users::stage_name());
+    #[cfg(not(feature = "login"))]
+    let (store, stage) = ("none", "no-login");
+    let types = crate::fs::unafs::with_unafs(|fs| {
+        fs.resolve_path(crate::fs::assoc::TYPES_DIR).and_then(|id| fs.ls(id)).map(|v| v.len()).unwrap_or(0)
+    })
+    .unwrap_or(0);
+    let rms = crate::arch::ms().saturating_sub(t1);
+    let rio = io().since(io1);
+    let total = mount_ms + rms;
+    let ok = mounted && rio.blocks_read() <= 64 && total <= 2000;
+    serial_println!(
+        ":: BOOT80: mount_ms={} mount_blocks={} mount_cmds={} blocks_read={} cmds={} ms={} users_store={} stage={} types={} ra_window={} -> {} ::",
+        mount_ms, mio.blocks_read(), mio.cmds(), rio.blocks_read(), rio.cmds(), total, store, stage, types,
+        crate::fs::unafs::ra_window_bound(), if ok { "PASS" } else { "FAIL" }
+    );
+}
