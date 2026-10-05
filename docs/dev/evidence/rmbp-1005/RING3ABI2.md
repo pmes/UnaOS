@@ -61,3 +61,38 @@ in-kernel probe of the extension GiB).
 **Stays owed.** The metal boot (R78). One `crate::elf` validator for x86, aarch64 and linuxabi (the aarch64
 elf-model validator is a third copy, flagged). TLS on aarch64 (embedded-tls is an x86-only dep of
 vein_ring3; the aarch64 LUMEN image links with the echo provider). envp is reserved (empty) in the layout.
+
+## Results (compile legs; R78 — no QEMU, the metal boot is the seat's)
+
+Commits: M1 `087496dc` · M2+M3+M5 kernel `ac454415` · M4 + NET argv `32db44da` · M3/M5 user halves
+`681aa9d2` · M6 `c284a295`.
+
+- x86 metal shape (`wc,quarry,ftdirx,login,loginst,nvidia-kepler-vblank,smc,usbnet,hda,hda-tone,facet,
+  beam,sdw,sdwrite,sdhcblk,selfhost,linuxabi,ahci,unafs,busreg,lumen,netring3,prefs_reset,census,
+  installdemo,instgui,witness`): exit 0.
+- x86 base without netring3 (`wc,quarry,ftdirx,login,loginst,nvidia-kepler-vblank,smc,usbnet,hda,hda-tone,
+  facet,beam,sdw,selfhost,linuxabi,ahci,unafs,busreg`): exit 0.
+- aarch64 `login,loginst,virt_el0,lumen,netring3,busreg`: exit 0. aarch64 `login,loginst,baremetal,lumen,
+  netring3,busreg` (the Pi slot backend, `boot.rs`): exit 0.
+- User crates via their arroyo functions: `build_user_net_x86` exit 0 (`NET-X86.ELF: 9048 B file,
+  model=elf span=4588 stack=65536`, `:: ELFENTRY: NET-X86.ELF entry=0x10000200000 … -> PASS ::`, PT_NOTE
+  owner UnaOS kept); `build_user_big_x86` exit 0 (`model=elf`, ELFENTRY PASS); `build_user_lumen_x86`
+  exit 0 (`model=elf span=257264 stack=262144`, ELFENTRY PASS). aarch64 user-lumen `cargo build` with the
+  USER_CHECK_MATRIX flags: exit 0 — it LINKS: entry 0x7840200000, PT_LOADs R+X / R / R+W at the aarch64
+  ELF window, PT_GNU_STACK 256 KiB, PT_NOTE kept.
+- `cargo test -p midden_core -p una-abi`: exit 0 (`:: RING3ABI2-ABI: … -> PASS ::`).
+- `charter-check.sh`: exit 0.
+
+**Wire a metal boot should print** (`tests ring3abi` with a session open, NET.ELF and BIG.ELF staged):
+`:: RING3ABI2: getrandom=1 args=2 whoami=<user> net_window=elf big_window=elf arm_sbrk=skip -> PASS ::`
+(aarch64: `arm_sbrk=1`, windows `skip`). `net example.com` prints
+`:: NETRING3: host=example.com argc=2 rand=32 resolve=<ip> connect=0 … ::`; a bare-name detach prints
+`:: BAREXEC: … argc=<n> DETACHED … ::`; a Quarry double-click on a console program prints
+`:: QUARRY-LAUNCH: <path> — note flags=0 -> foreground: the shell window runs `run <path>` ::` then the
+`run` lines in the shell.
+
+**Not finished / owed.** The metal boot. The shell-line seam is drained only by the x86 render body
+(`dock::LINE_LAUNCH_DRAINED`): aarch64 Quarry keeps detaching console programs. A console program whose
+path holds a space is refused by Quarry (the `run` line splits on whitespace). TLS on aarch64 (the
+aarch64 LUMEN links with the echo provider only). One shared ELF validator (xwin.rs is the third copy).
+envp reserved, empty.
