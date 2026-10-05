@@ -49,6 +49,8 @@ pub mod vm; // SELFBUILD3 (B353): lazy VMAs, the #PF hook, the resident budget, 
 pub mod cow; // SELFBUILD4 (B356): copy-on-write fork
 pub mod exec; // SELFBUILD4 (B356): lazy execve images
 pub mod selfbuild4; // SELFBUILD4 (B356): `tests selfbuild4`
+pub mod remap; // SELFBUILD5 (B357): mremap, sigaltstack at delivery, getcpu
+pub mod selfbuild5; // SELFBUILD5 (B357): `tests selfbuild5`
 
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -644,6 +646,7 @@ pub fn sys_name(nr: u64) -> &'static str {
         34 => "pause", 40 => "sendfile", 44 => "sendto", 45 => "recvfrom", 53 => "socketpair", 73 => "flock", 76 => "truncate",
         77 => "ftruncate", 130 => "rt_sigsuspend", 232 => "epoll_wait", 233 => "epoll_ctl", 281 => "epoll_pwait", 285 => "fallocate",
         284 => "eventfd", 290 => "eventfd2", 291 => "epoll_create1", 213 => "epoll_create", // SELFBUILD2
+        25 => "mremap", 309 => "getcpu", 28 => "madvise", // SELFBUILD5
         _ => "?",
     }
 }

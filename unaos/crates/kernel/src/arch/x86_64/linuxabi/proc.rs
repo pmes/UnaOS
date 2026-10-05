@@ -236,6 +236,7 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
     super::fs_tab_set(pml4, fs_base);
     super::push_fork_regs(pml4, &regs);
     super::signal::fork_copy(info.pid, pid); // SELFBUILD2: handlers + mask inherited
+    super::remap::fork_copy(info, pid, pml4); // SELFBUILD5: the calling thread's alternate stack is inherited
     let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
     let _ = crate::arch::sched::spawn_user_preemptible(TASK_NAME, rip, usp, cpu, pml4, kill);
     FORKS.fetch_add(1, Ordering::AcqRel);

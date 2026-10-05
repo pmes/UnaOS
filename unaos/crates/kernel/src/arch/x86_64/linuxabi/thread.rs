@@ -257,6 +257,7 @@ pub fn clone_thread(
     let used: Vec<u64> = with(|v| v.iter().filter(|t| t.pid == info.pid && t.key_live.load(Ordering::Acquire)).map(|t| t.key).collect());
     let Some(idx) = (1..32u64).find(|i| !used.contains(&(info.pml4 + i))) else { return -EAGAIN };
     let key = info.pml4 + idx;
+    super::remap::forget_key(key); // SELFBUILD5: a new thread starts with no alternate stack
     let fs = if flags & SETTLS != 0 { tls } else { super::fs_tab_get(key_for(info.pml4)).unwrap_or(p.fs_base) };
     super::fs_tab_set(key, fs);
     if super::fs_tab_get(key) != Some(fs) {

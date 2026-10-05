@@ -3857,6 +3857,7 @@ build_selfbuild_x86() {
         fi
     fi
     build_selfbuild4_x86   # SELFBUILD4 (B356): SYSKAT4.LNX + RUST.LNX
+    build_selfbuild5_x86   # SELFBUILD5 (B357): SYSKAT5.LNX + LLD.LNX + LIB/rust (RUST.LNX's objects, std rlibs, musl crt)
     ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
 }
 
@@ -3886,6 +3887,136 @@ build_selfbuild4_x86() {
         echo "   SELFBUILD4: RUST.LNX did not build (musl target?), is not ET_EXEC, or failed on the host kernel — not staged"
         rm -f "${WORKSPACE_DIR}/target/RUST.LNX"
     fi
+}
+
+# SELFBUILD5 (B357): UnaOS LINKS a Rust program. Three products, each proven on the HOST kernel before it is staged:
+# * SYSKAT5.LNX = crates/user-linux-hello/c/syskat5.c (mremap grow/move/FIXED/DONTUNMAP, the alternate signal stack at delivery,
+#   getcpu, madvise(MADV_HUGEPAGE), sched_yield).
+# * LLD.LNX = LLVM's `lld` at the toolchain's own LLVM release (rustc +nightly -vV: LLVM 22.1.8), built here from the release source
+#   tarball (sha256 pinned below) as ONE static, non-PIE binary (glibc -static: the host has no musl C++ runtime; no zlib/zstd, no
+#   plugins, X86 only), stripped. It is a multi-flavour driver: `LLD.LNX -flavor gnu …` is ld.lld. Built ONCE (target/LLD.LNX is
+#   kept; ~1960 ninja steps, about an hour on 4 idle cores). `UNAOS_LLD_LNX=<path>` stages an operator-supplied static ld.lld
+#   instead; no egress / no cmake+ninja = LLD.LNX absent = `tests selfbuild5` reports lld=skip.
+# * target/LIB/rust (staged as /apps/LIB/rust): RUST.LNX's own objects from a rebuild of crates/user-linux-rust whose linker is a
+#   recording wrapper around the toolchain's rust-lld, the std rlibs it links (lib.rmeta dropped, --strip-debug), the musl crt
+#   objects + libc.a + libunwind.a from the target's self-contained dir, and link.rsp = that exact ld.lld line with /apps/LIB/rust
+#   paths (`-flavor` and `-o` left to the caller). Host proof: LLD.LNX links the SAME response file (host paths) into a binary that
+#   prints `rust ok …`, or LIB/rust is not staged.
+SELFBUILD_LLVM_VER="22.1.8"
+SELFBUILD_LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${SELFBUILD_LLVM_VER}/llvm-project-${SELFBUILD_LLVM_VER}.src.tar.xz"
+SELFBUILD_LLVM_SHA256="922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a9965888"
+build_selfbuild5_x86() {
+    local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
+    mkdir -p "$sb"
+    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT5.LNX" "$c/syskat5.c" \
+        && "$sb/SYSKAT5.LNX" | grep -q "^syskat5 ok grow=ok move=ok fixed=ok dontunmap=ok errors=ok altstack=ok small=ok "; then
+        cp "$sb/SYSKAT5.LNX" "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
+    else
+        echo "   SELFBUILD5: SYSKAT5.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
+    fi
+    # LLD.LNX: static, ET_EXEC (the shim's loader takes no PIE), no PT_INTERP.
+    _sb5_lld_ok() { [ -s "$1" ] && [ "$(od -An -t u2 -j 16 -N 2 "$1" | tr -d ' ')" = "2" ] && ! readelf -lW "$1" 2>/dev/null | grep -q INTERP && "$1" -flavor gnu --version 2>/dev/null | grep -q "LLD ${SELFBUILD_LLVM_VER}"; }
+    local lld="${WORKSPACE_DIR}/target/LLD.LNX"
+    if [ -n "${UNAOS_LLD_LNX:-}" ] && [ -f "${UNAOS_LLD_LNX}" ]; then
+        cp "$UNAOS_LLD_LNX" "$lld"
+    fi
+    if ! _sb5_lld_ok "$lld"; then
+        rm -f "$lld"
+        local ld="$sb/lld" src="$sb/lld/llvm-project-${SELFBUILD_LLVM_VER}.src"
+        mkdir -p "$ld"
+        echo "   SELFBUILD5: building static ld.lld ${SELFBUILD_LLVM_VER} (once; target/LLD.LNX is kept)"
+        if { [ -f "$ld/src.tar.xz" ] || curl -fsSL -o "$ld/src.tar.xz" "$SELFBUILD_LLVM_URL"; } \
+            && echo "${SELFBUILD_LLVM_SHA256}  $ld/src.tar.xz" | sha256sum -c --quiet - \
+            && { [ -d "$src/lld" ] || tar xJf "$ld/src.tar.xz" -C "$ld" --exclude='*/test/*' --exclude='*/unittests/*' \
+                   "llvm-project-${SELFBUILD_LLVM_VER}.src/llvm" "llvm-project-${SELFBUILD_LLVM_VER}.src/lld" "llvm-project-${SELFBUILD_LLVM_VER}.src/cmake" \
+                   "llvm-project-${SELFBUILD_LLVM_VER}.src/third-party" "llvm-project-${SELFBUILD_LLVM_VER}.src/libunwind/include"; } \
+            && cmake -G Ninja -S "$src/llvm" -B "$ld/build" -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS=lld -DLLVM_TARGETS_TO_BUILD=X86 \
+                 -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DLLVM_BUILD_STATIC=ON -DLLVM_ENABLE_PIC=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=OFF \
+                 -DCMAKE_C_FLAGS=-fno-pie -DCMAKE_CXX_FLAGS=-fno-pie -DCMAKE_EXE_LINKER_FLAGS="-static -no-pie" -DLLVM_ENABLE_PLUGINS=OFF \
+                 -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_LIBPFM=OFF \
+                 -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DLLVM_ENABLE_BINDINGS=OFF \
+                 -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_BUILD_TOOLS=OFF -DLLVM_ENABLE_RTTI=OFF -DLLVM_APPEND_VC_REV=OFF >/dev/null \
+            && ninja -C "$ld/build" lld >/dev/null; then
+            strip -o "$lld" "$ld/build/bin/lld"
+        fi
+        _sb5_lld_ok "$lld" || { echo "   SELFBUILD5: static ld.lld did not build (egress? cmake/ninja?) — LLD.LNX absent, tests selfbuild5 reports lld=skip"; rm -f "$lld"; }
+    fi
+    # LIB/rust: record RUST.LNX's link through a wrapper around rust-lld, then stage its inputs and the response file.
+    local out="${WORKSPACE_DIR}/target/LIB/rust" rec="$sb/rust5rec" tgt="$sb/rust5"
+    local sysroot; sysroot="$(rustc +nightly --print sysroot)"
+    local rlld="$sysroot/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/rust-lld"
+    local selfc="$sysroot/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"
+    rm -rf "$out" "$rec" && mkdir -p "$rec/objs"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/args"\nfor a in "$@"; do case "$a" in *.o) cp "$a" "%s/objs/" ;; esac; done\n[ "$1" = "-flavor" ] && exec "%s" "$@"\nexec "%s" -flavor gnu "$@"\n' \
+        "$rec" "$rec" "$rlld" "$rlld" > "$rec/lldwrap" && chmod +x "$rec/lldwrap"
+    if [ -x "$rlld" ] && [ -d "$selfc" ] \
+        && ( cd "$rs" && rm -rf "$tgt" && CARGO_TARGET_DIR="$tgt" RUSTFLAGS="-C relocation-model=static -C target-feature=+crt-static -C linker=$rec/lldwrap -C linker-flavor=ld.lld -C link-self-contained=yes" \
+               cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
+        && [ -s "$rec/args" ] \
+        && python3 - "$rec" "$out" <<'PY'
+import os, shutil, subprocess, sys
+rec, out = sys.argv[1], sys.argv[2]
+os.makedirs(out, exist_ok=True)
+args = open(os.path.join(rec, "args")).read().split("\n")[:-1]
+if args[:2] == ["-flavor", "gnu"]:
+    args = args[2:]
+rsp, skip, n = [], False, 0
+for i, a in enumerate(args):
+    if skip:
+        skip = False
+        continue
+    if a == "-o":
+        skip = True
+        continue
+    if a == "-L":
+        skip = True
+        if "-L" not in rsp:
+            rsp += ["-L", "@LIB@"]
+        continue
+    if a.endswith(".o") and os.path.isfile(os.path.join(rec, "objs", os.path.basename(a))):
+        b = os.path.basename(a)
+        if b.startswith("crt"):
+            name = b
+        elif b == "symbols.o":
+            name = "probe-sym.o"
+        else:
+            name = "probe-%d.o" % n
+            n += 1
+        shutil.copy(os.path.join(rec, "objs", b), os.path.join(out, name))
+        rsp.append("@LIB@/" + name)
+        continue
+    if a.endswith(".rlib") and os.path.isfile(a):
+        name = os.path.basename(a).split("-")[0] + ".rlib"
+        dst = os.path.join(out, name)
+        shutil.copy(a, dst)
+        subprocess.run(["ar", "d", dst, "lib.rmeta"], check=False, stderr=subprocess.DEVNULL)
+        subprocess.run(["strip", "--strip-debug", dst], check=True)
+        rsp.append("@LIB@/" + name)
+        continue
+    if a.startswith("/"):
+        sys.exit("unmapped input " + a)
+    rsp.append(a)
+open(os.path.join(out, "link.rsp.in"), "w").write("\n".join(rsp) + "\n")
+PY
+    then
+        cp "$selfc/libc.a" "$selfc/libunwind.a" "$out/" && strip --strip-debug "$out/libc.a" "$out/libunwind.a"
+        sed "s|@LIB@|/apps/LIB/rust|g" "$out/link.rsp.in" > "$out/link.rsp"
+        sed "s|@LIB@|$out|g" "$out/link.rsp.in" > "$rec/host.rsp"
+        rm -f "$out/link.rsp.in"
+        printf 'RUST.LNX objects + std rlibs (rustc %s, x86_64-unknown-linux-musl; rmeta dropped, --strip-debug) + musl crt/libc.a/libunwind.a\nfrom the Rust target self-contained dir, for LLD.LNX -flavor gnu @/apps/LIB/rust/link.rsp -o <out> (SELFBUILD5, B357)\n' \
+            "$(rustc +nightly -V | awk '{print $2, $3, $4}')" > "$out/RUST.TXT"
+        # Host proof: the staged linker (or rust-lld when LLD.LNX is absent) links the staged inputs into a program that runs.
+        local hl="$lld"; [ -f "$hl" ] || hl="$rlld"
+        if "$hl" -flavor gnu "@$rec/host.rsp" -o "$rec/rust2" && [ "$(od -An -t u2 -j 16 -N 2 "$rec/rust2" | tr -d ' ')" = "2" ] \
+            && "$rec/rust2" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; then
+            echo "   SELFBUILD5: LIB/rust staged ($(ls "$out" | wc -l) files, $(du -sk "$out" | cut -f1) KiB); host relink by $(basename "$hl") runs"
+        else
+            echo "   SELFBUILD5: the staged inputs did not relink into a running program on the host — LIB/rust not staged"; rm -rf "$out"
+        fi
+    else
+        echo "   SELFBUILD5: RUST.LNX link not recorded (musl target? rust-lld?) — LIB/rust not staged"; rm -rf "$out"
+    fi
+    ( cd "${WORKSPACE_DIR}/target" && sha256sum SYSKAT5.LNX LLD.LNX LIB/rust/link.rsp 2>/dev/null | sed 's/^/   SELFBUILD5: sha256 /' )
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).

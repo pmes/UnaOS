@@ -999,6 +999,10 @@ fn main() {
         // musl, non-PIE) — `tests selfbuild4`. Built and host-proven by arroyo's build_selfbuild4_x86; absent = SKIP.
         ("SYSKAT4.LNX", "SYSKAT4.LNX"),
         ("RUST.LNX", "RUST.LNX"),
+        // SELFBUILD5 (B357): the mremap / alternate-stack KAT (syskat5.c) and a static ld.lld at the toolchain's LLVM release
+        // (built from the pinned source by arroyo's build_selfbuild5_x86) — `tests selfbuild5` links RUST.LNX's objects with it.
+        ("SYSKAT5.LNX", "SYSKAT5.LNX"),
+        ("LLD.LNX", "LLD.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
@@ -1043,6 +1047,22 @@ fn main() {
         println!("   SELFBUILD3: staged APPS/LIB ({n} files: musl crt + libc.a + headers, tcc's libtcc1.a + headers)");
     } else {
         println!("   SELFBUILD3: target/LIB absent — ESP has no APPS/LIB (musl not built: no egress at build time?)");
+    }
+    // SELFBUILD5 (B357): target/LIB/rust (RUST.LNX's objects, the std rlibs, the musl crt + libc.a + libunwind.a, link.rsp) rides
+    // the APPS/LIB copy above; staged here on its own when the musl LIB was not built.
+    let rust_lib = musl_lib.join("rust");
+    if rust_lib.join("link.rsp").exists() {
+        let to = esp_apps.join("LIB").join("rust");
+        if !to.join("link.rsp").exists() {
+            std::fs::create_dir_all(&to).unwrap();
+            for e in std::fs::read_dir(&rust_lib).unwrap() {
+                let e = e.unwrap();
+                std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        }
+        println!("   SELFBUILD5: APPS/LIB/rust staged (LLD.LNX -flavor gnu @/apps/LIB/rust/link.rsp)");
+    } else {
+        println!("   SELFBUILD5: target/LIB/rust absent — ESP has no APPS/LIB/rust (tests selfbuild5 reports lld=skip)");
     }
 
     // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
