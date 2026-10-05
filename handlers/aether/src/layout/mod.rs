@@ -131,6 +131,8 @@ pub struct PaintStyle {
     pub float: Option<u8>,
     /// opacity in [0, 1] (0 also sets `hidden`).
     pub opacity: Option<f32>,
+    /// table-layout: fixed (true) / auto (false). On tables.
+    pub table_fixed: Option<bool>,
     /// How `font_size` was specified: (0, f) = f x the parent's font-size
     /// (em, %, smaller/larger), (1, f) = f x the root's (rem), (2, _) =
     /// absolute (font_size as is).
@@ -1339,16 +1341,56 @@ fn rescale_ua_margins(tree: &mut LayoutTree, sizes: &HashMap<taffy::NodeId, f32>
     }
 }
 
+/// The min-content width of a box's border box (css-sizing-3 §5.1): the
+/// widest unbreakable piece of its content — a text run broken at every
+/// opportunity, an atomic box's width — plus its own padding and border.
+fn min_content_width(tree: &LayoutTree, id: taffy::NodeId, text: &HashMap<taffy::NodeId, TextRun>) -> f32 {
+    if let Some(run) = text.get(&id) {
+        let face = crate::fonts::face(run.family, run.bold, run.italic);
+        let key = crate::fonts::face_key(run.family, run.bold, run.italic);
+        return measure_text_run(face.as_deref(), key, run, 0.0).0;
+    }
+    let Ok(l) = tree.taffy.layout(id) else { return 0.0 };
+    let edges = l.padding.left + l.padding.right + l.border.left + l.border.right;
+    let kids = tree.taffy.children(id).unwrap_or_default();
+    if kids.is_empty() {
+        // A leaf: replaced/control boxes keep their width; empty boxes are 0
+        // unless the author sized them.
+        return if tree.paint_map.get(&id).and_then(|p| p.has_width) == Some(true)
+            || tree.node_map.get(&id).and_then(|n| n.as_element().map(|e| matches!(e.name.local.as_ref(), "img" | "input" | "select" | "button" | "textarea" | "video" | "svg" | "canvas"))).unwrap_or(false)
+        {
+            l.size.width
+        } else {
+            edges
+        };
+    }
+    let inner = kids
+        .iter()
+        .map(|&k| {
+            let m = tree.taffy.layout(k).map(|l| l.margin.left.max(0.0) + l.margin.right.max(0.0)).unwrap_or(0.0);
+            min_content_width(tree, k, text) + m
+        })
+        .fold(0.0f32, f32::max);
+    if tree.paint_map.get(&id).and_then(|p| p.has_width) == Some(true) {
+        return l.size.width.max(inner + edges);
+    }
+    inner + edges
+}
+
 /// The computed font-size of an element (css-fonts-4 §2.5): an em/% value
 /// of the parent's size, rem of the root's (the rem basis in the font
 /// context), an absolute value as given, else the UA default for the tag.
-fn computed_font_size(paint: Option<&PaintStyle>, tag: &str, parent: f32, parent_family: u8, own_family: u8) -> f32 {
+fn computed_font_size(paint: Option<&PaintStyle>, tag: &str, parent: f32, parent_family: u8, own_family: u8, parent_absolute: bool) -> f32 {
     match paint.and_then(|p| p.font_size_rel) {
         Some((0, f)) => parent * f,
         Some((1, f)) => crate::css::font_ctx().1 * f,
-        _ => paint
-            .and_then(|p| p.font_size)
-            .unwrap_or_else(|| ua_font_size(tag, parent, parent_family, own_family)),
+        _ => paint.and_then(|p| p.font_size).unwrap_or_else(|| {
+            if parent_absolute {
+                default_font_size(tag, parent)
+            } else {
+                ua_font_size(tag, parent, parent_family, own_family)
+            }
+        }),
     }
 }
 
@@ -1445,7 +1487,13 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 let own_family = paint
                     .and_then(|p| p.family)
                     .unwrap_or_else(|| default_family(tag, inherited.family));
-                size.font_size = computed_font_size(paint, tag, inherited.font_size, inherited.family, own_family);
+                size.font_size = computed_font_size(paint, tag, inherited.font_size, inherited.family, own_family, inherited.fs_absolute);
+                match paint.and_then(|p| p.font_size_rel) {
+                    Some((0, _)) => {}
+                    Some(_) => size.fs_absolute = true,
+                    None if paint.and_then(|p| p.font_size).is_some() => size.fs_absolute = true,
+                    None => {}
+                }
                 if paint.is_some_and(|p| p.ua_vmargin.is_some()) {
                     sizes.insert(node_id, size.font_size);
                 }
@@ -1646,8 +1694,10 @@ pub fn remeasure(tree: &mut LayoutTree) {
     };
     for pass in 0..passes {
     if pass == 1 && has_tables {
-        // Column grid from the first pass's max-content cell widths.
-        table::apply(tree);
+        // Column grid from the first pass's max-content cell widths and
+        // each cell's min-content width.
+        let min_content = |t: &LayoutTree, id: taffy::NodeId| min_content_width(t, id, &text_info);
+        table::apply(tree, &min_content);
     }
     if pass == 1 {
         // Containing-block widths are known now: resolve the % math.
@@ -1669,6 +1719,10 @@ pub fn remeasure(tree: &mut LayoutTree) {
         }
     }
     run_pass(tree);
+    }
+    // Row-spanning cells take the height of the rows they span.
+    if has_tables && table::fix_rowspans(tree) {
+        run_pass(tree);
     }
     // Inline formatting contexts (CSS 2.2 §9.4.2): line boxes at the widths
     // the block pass settled; each root's height becomes the sum of its
@@ -1734,6 +1788,10 @@ struct TextRun {
     text_transform: u8,
     /// Inherited text-align: 0 start, 1 center, 2 end.
     text_align: u8,
+    /// The font-size still derives from the initial `medium` keyword (no
+    /// absolute size up the chain): only then does switching to monospace
+    /// scale it by 13/16 (Blink's fixed-pitch default).
+    fs_absolute: bool,
 }
 
 /// Measures a text run: (widest line, lines x line height), through the

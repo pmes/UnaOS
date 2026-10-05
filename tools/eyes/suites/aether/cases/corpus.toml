@@ -83,3 +83,7 @@ page = "corpus/17-inline-continue.html"
 [[case]]
 name = "18-stacking"
 page = "corpus/18-stacking.html"
+
+[[case]]
+name = "19-em-units"
+page = "corpus/19-em-units.html"

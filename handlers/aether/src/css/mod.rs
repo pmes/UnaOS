@@ -273,6 +273,11 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         }
         "height" => style.height = parse_dimension_str(value),
         "max-height" => style.max_height = parse_dimension_str(value),
+        "table-layout" => match value {
+            "fixed" => style.paint.table_fixed = Some(true),
+            "auto" => style.paint.table_fixed = Some(false),
+            _ => {}
+        },
         "border-collapse" => match value {
             "collapse" => style.paint.border_collapse = Some(true),
             "separate" => style.paint.border_collapse = Some(false),
@@ -2001,7 +2006,7 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
-        list_item, list_style, vertical_align, float, opacity, font_size_rel,
+        list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed,
     );
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);

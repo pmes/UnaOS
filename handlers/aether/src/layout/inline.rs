@@ -413,7 +413,7 @@ pub(super) fn layout_root(tree: &LayoutTree, ctx: &Ctx, root: NodeId) -> InlineL
         let mut content_w = cur_x;
         for p in pcs.iter_mut().rev() {
             match p {
-                Piece::Text { node, text, x, w, .. } => {
+                Piece::Text { node, text, w, .. } => {
                     let trimmed_len = text.trim_end_matches(' ').len();
                     if trimmed_len != text.len() && !matches!(run_of(ctx, *node, default_run).mode.white_space, 2 | 3 | 5) {
                         let adv_w = trailing_space_width(ctx, *node, default_run, text.len() - trimmed_len);
