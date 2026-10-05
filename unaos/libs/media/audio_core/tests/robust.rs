@@ -35,3 +35,39 @@ fn flac_mutations_never_panic() {
     let n = mutate_all("flac", 6);
     eprintln!("flac: {} mutated decodes, no panic", n);
 }
+
+/// Opus: every packet of the twelve KAT streams bit-flipped, truncated and garbage-filled, decoded through
+/// a live decoder (so the corruption also hits the inter-frame state) — Ok or a named Err, never a panic.
+#[test]
+fn opus_mutations_never_panic() {
+    use audio_core::opus::OpusDecoder;
+    let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/opus");
+    let mut seed = 0x1234_5678u32;
+    let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; seed };
+    let mut n = 0usize;
+    for name in ["t01", "t02", "t03", "t04", "t05", "t06", "t07", "t08", "t09", "t10", "t11", "t12"] {
+        let bits = std::fs::read(data.join(format!("{}.bit", name))).unwrap();
+        let mut dec = OpusDecoder::new(2);
+        let mut pcm = vec![0i16; 5760 * 2];
+        let mut p = 0;
+        let mut k = 0;
+        while p + 8 <= bits.len() {
+            let len = u32::from_be_bytes(bits[p..p + 4].try_into().unwrap()) as usize;
+            let mut pk = bits[p + 8..p + 8 + len].to_vec();
+            p += 8 + len;
+            k += 1;
+            if !pk.is_empty() {
+                match k % 4 {
+                    0 => { let i = rnd() as usize % (pk.len() * 8); pk[i / 8] ^= 1 << (i % 8); }
+                    1 => { let cut = rnd() as usize % pk.len(); pk.truncate(cut.max(1)); }
+                    2 => { for b in pk.iter_mut().skip(1) { *b = rnd() as u8; } }
+                    _ => { let i = 1 + rnd() as usize % pk.len().max(2); if i < pk.len() { pk[i] = !pk[i]; } }
+                }
+            }
+            let _ = dec.decode(Some(&pk), &mut pcm, 5760);
+            if k % 7 == 0 { let _ = dec.decode(None, &mut pcm, 960); }
+            n += 1;
+        }
+    }
+    eprintln!("{} mutated Opus packets decoded without a panic", n);
+}

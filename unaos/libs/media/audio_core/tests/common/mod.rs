@@ -3,6 +3,7 @@
 //! offline → the vector is skipped, never failed.
 #![allow(dead_code)]
 pub mod synth;
+pub mod oggmux;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

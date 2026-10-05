@@ -98,3 +98,58 @@ KATs (`cargo test -p audio_core --release`):
 `tools/audio-check <file> [--out pcm.wav]` prints the stream facts, peak/RMS and decode speed and writes WAV.
 Speed today (release, host): the 8-channel 192 kHz 24-bit testbench file 44 decodes at 6x realtime (23 M
 samples in 2.5 s, MD5 included); 44.1 kHz stereo is several hundred times realtime.
+
+## M2 — Opus (RFC 6716, RFC 8251; Ogg Opus RFC 7845)
+
+**The specification is the reference code.** RFC 6716 §1 makes the reference implementation normative
+(the prose is informative), so `src/opus/` is a Rust rendering of libopus 1.5.2's FIXED-POINT decoder —
+the build whose output is integer and deterministic, which is what the kernel wants and what lets the KAT
+be bit-exact. Every fixed-point macro is reproduced with its casts (`celt/fixed.rs`, `silk/macros.rs`:
+the 16-bit truncation inside `MULT16_16`, `ADD16`'s wrap, the 64-bit-host `OPUS_FAST_INT64` forms); the
+tables (CELT static mode, SILK codebooks) are extracted verbatim from the reference sources by a script.
+No dependency.
+
+* `range.rs` — §4.1 range decoder, raw end bits, `ec_tell`/`ec_tell_frac`, final range.
+* `silk/` — §4.2: LBRR and VAD flags, stereo predictor and mid-only flag, frame-type/gain/NLSF
+  (two-stage VQ, residual dequant, stabilisation, NLSF→LPC with the 16-bit fit and the inverse-prediction-
+  gain bandwidth expansion), pitch lags and contours, LTP codebooks and scaling, shell-coded pulses with
+  LSB extension and signs, the excitation/LTP/LPC synthesis (`decode_core`), mid/side→L/R with predictor
+  interpolation, the SILK PLC (pitch-repeating, energy-matched glue) and comfort-noise generation, and the
+  output resampler (2x all-pass + 12-phase FIR, 8/12/16 kHz → 48 kHz).
+* `celt/` — §4.3: silence/post-filter/transient/intra flags, Laplace coarse energy with prediction, fine
+  and final energy, TF changes, spreading, dynamic allocation boosts, trim, the full bit allocator with band
+  skipping and intensity/dual-stereo signalling, PVQ codeword decoding (`cwrs`), the spreading rotation,
+  recursive band splitting with the theta angle, stereo merge/inversion, Haar/Hadamard time-frequency
+  reshaping, folding with the hybrid special case, anti-collapse, denormalisation, the KISS FFT (radix
+  2/3/4/5) and inverse MDCT with TDAC, the pitch pre/post comb filter, de-emphasis (with SILK accumulation),
+  and both PLCs (pitch-based with LPC extrapolation; noise-based).
+* `decoder.rs` — §3/§4.5: TOC, frame packing codes 0–3 with padding, SILK/hybrid/CELT dispatch, the
+  5 ms redundant CELT frames on mode switches, smooth cross-fades, CELT→SILK silence fade, transition PLC,
+  in-band FEC (`decode_ext(.., fec)`), decode gain, final range.
+* `mod.rs` — RFC 7845: `OpusHead`, `OpusTags`, pre-skip, output gain, the granule of sample 0 taken from
+  the first page (streams may start at a granule > 0 — Chromium's `bear-opus.ogg` does) and end trimming
+  from the last page's granule. Channel mapping family 0 only (mono/stereo); multistream is owed.
+
+**KATs (bit-exact).** The RFC 8251 `opus_testvectors` are only hosted on opus-codec.org, which this
+container cannot reach, so the vectors were made the way those were: the reference encoder's own
+conformance modes (`opus_demo -silk8k_test … -celt_hq_test`, bitrate sweeps, random frame sizes,
+restricted-lowdelay 2.5 ms, FEC+DTX), recipe in `oracle/gen-opus.sh`, the twelve `.bit` streams (530 KB)
+committed in `tests/data/opus/`, the expected PCM of the libopus 1.5.2 fixed-point decoder recorded by MD5.
+* `tests/opus_kat.rs::opus_vectors_bit_exact` — **12/12 streams, 7,330 packets: every packet's final range
+  equals the encoder's (the RFC 6716 §6 conformance check), and all PCM is bit-identical** (MD5) to
+  `opus_demo -d 48000 2` (SILK NB/MB/WB 10–60 ms mono/stereo, hybrid SWB/FB, CELT 2.5–20 ms at 64 and
+  160 kb/s, code-3 multi-frame packets up to 120 ms, live mode switching with redundancy and transitions).
+* `opus_packet_loss_bit_exact` — six of the streams with a fixed 12 % loss pattern (`loss_a.txt`) decoded
+  the way `opus_demo -lossfile` does: **6/6 bit-identical**, 417 concealed frames (SILK PLC, CELT pitch and
+  noise PLC, transition PLC) and 19 frames rebuilt from in-band FEC.
+* `tests/robust.rs::opus_mutations_never_panic` — 7,330 packets bit-flipped / truncated / garbage-filled
+  through live decoders: never a panic.
+
+**Chromium oracle (SNR).** `tests/lossy_oracle.rs` muxes the twelve streams into Ogg Opus (pre-skip 312,
+end trim 101) and fetches Chromium's `bear-opus.ogg`, `sfx-opus.ogg`, `opus-trimming-test.ogg`: **15/15
+frame counts equal, SNR 55.5–93.4 dB**. Chromium runs libopus in floating point; ours is the fixed-point
+reference, and the gap is the reference's own: `opus_demo` fixed vs `opus_demo` float on t10 measures
+55.51 dB, exactly what ours shows against Chromium (t06: 67.57 vs 67.6). The Opus floor is therefore 50 dB;
+the bit-exact KAT is the proof.
+
+Decode speed (release, host, loaded 4-core box): 160 kb/s stereo CELT 47x realtime, SILK WB 166x realtime.

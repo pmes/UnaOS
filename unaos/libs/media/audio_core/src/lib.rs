@@ -13,6 +13,7 @@
 //! | AIFF / AIFF-C (`NONE`, `sowt`, `fl32`, `fl64`) | Apple AIFF 1.3 / AIFF-C | [`aiff`] |
 //! | FLAC (native and Ogg) | RFC 9639 | [`flac`] |
 //! | Ogg container | RFC 3533 | [`ogg`] |
+//! | Opus (SILK, CELT, hybrid; Ogg mapping) | RFC 6716 + RFC 8251, RFC 7845 | [`opus`] |
 //!
 //! One API: [`sniff`] names the format from the first bytes, [`Decoder::open`] picks the codec, and the
 //! [`AudioDecoder`] trait hands out interleaved PCM either as `f32` or as left-justified `i32`.
@@ -41,6 +42,7 @@ pub mod io;
 pub mod math;
 pub mod md5;
 pub mod ogg;
+pub mod opus;
 pub mod wav;
 
 pub use io::{ByteStream, Read, VecReader};
@@ -120,8 +122,8 @@ pub enum Codec {
 pub struct Info {
     pub rate: u32,
     pub channels: u16,
-    /// Source sample depth: the integer width of a PCM/lossless source, 32/64 for float PCM, and 0 for the
-    /// lossy codecs (they decode to float).
+    /// Source sample depth: the integer width of a PCM/lossless source, 32/64 for float PCM, 16 for Opus
+    /// (the fixed-point reference decoder's output), and 0 for the float lossy codecs.
     pub bits: u16,
     /// Total frames (samples per channel) when the container states it.
     pub frames: Option<u64>,

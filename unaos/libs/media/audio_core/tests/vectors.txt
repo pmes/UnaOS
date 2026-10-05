@@ -87,3 +87,7 @@ lossless 483ad021cb3abdce25f75d3bb5d6e2f80f69d3f122492d34f168323f6d1094e0 pcm/ge
 lossless e65dc666bdca20a73647463495b464891fa7b341fe1160f9787ea8cf1a8d9356 pcm/gecko-flac-s24.flac https://raw.githubusercontent.com/mozilla/gecko-dev/master/dom/media/test/flac-s24.flac
 lossless 96a9e163b097ab401e5b301524d76715228155d5049d64d1a7e6cae3ab4b498a pcm/gecko-flac-noheader-s16.flac https://raw.githubusercontent.com/mozilla/gecko-dev/master/dom/media/test/flac-noheader-s16.flac
 lossless d0e06b3a5cd099d0ebe5178b2c922c503083c6f4cde1e298647c3d662509dd6f pcm/gecko-sin-441-1s-44100.flac https://raw.githubusercontent.com/mozilla/gecko-dev/master/dom/media/test/sin-441-1s-44100.flac
+# lossy: fetched Opus/Vorbis/MP3 samples, compared with Chromium's decodeAudioData by SNR (tests/lossy_oracle.rs).
+lossy c074407b7126060972b5e9eb4081e04e35c88857d7125151cbb9e5d9a1191dae lossy/chromium-bear-opus.ogg https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-opus.ogg
+lossy 97020fece49ef9176f4e0ad83ef8cda0a0415691080d2c41859ba2673c2f1834 lossy/chromium-sfx-opus.ogg https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx-opus.ogg
+lossy 74b4ccc4506e5a410e0593cfc0201c1340930583c21e7ec6fb30fff1f956d701 lossy/chromium-opus-trimming-test.ogg https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/opus-trimming-test.ogg
