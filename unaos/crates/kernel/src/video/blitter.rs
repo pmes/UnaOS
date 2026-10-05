@@ -17,11 +17,12 @@
 //! frame and counts `gpu_fallback` — the glass never goes dark because an engine stalled (A1 /
 //! BAR1WEDGE: a wedged engine must not take the panel with it).
 //!
-//! SELECTION. `UNAOS_WC_BLITTER=gpu` arms feature `wc_gpublit` (default OFF, x86 only). [`ignite`] runs at
-//! compositor ignition (x86: `desktop_uefi`, task context, beside `wcpar::start`; elsewhere lazily),
-//! once, asks [`GpuBlitter::probe`], and prints
-//! `[wc] blitter=<cpu|gpu> reason=<…>` once. With the feature off, or on with no KBLIT channel, the
-//! answer is cpu.
+//! SELECTION. GPUBLIT (B371): NO KNOB. The copy engine arms itself at the Kepler display takeover
+//! (`drivers/gpu/kepler_gpublit.rs`, a 64x64 self-test compared byte for byte with the CPU blit, one
+//! `:: GPUBLIT:` line); [`ignite`] runs at compositor ignition (x86: `desktop_uefi`, task context, beside
+//! `wcpar::start`; elsewhere lazily), once, asks [`GpuBlitter::probe`] — which answers from that self-test
+//! — and prints `[wc] blitter=<cpu|gpu> reason=<…>` once. `wc_gpublit` (`UNAOS_WC_BLITTER=gpu`) is inert
+//! since GPUBLIT; the seat retires it.
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
 
 use super::FrameBuffer;
@@ -223,34 +224,69 @@ impl GpuBlitter {
     /// `Ok` only when KBLIT's copy-engine channel is bound (its `tests kblit` PASS state). Until then the
     /// reason the compositor selects the CPU, as printed on `[wc] blitter=cpu reason=`.
     pub fn probe(&self) -> Result<(), &'static str> {
-        #[cfg(all(target_arch = "x86_64", feature = "wc_gpublit"))]
+        #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
         {
-            // KBLIT fills: `crate::drivers::gpu::kepler_ce::channel_ready()` -> Ok(()).
-            Err("kblit-channel-absent")
+            // GPUBLIT (B371): the boot self-test's answer (`selftest-ok`, or why not).
+            use crate::drivers::gpu::kepler_gpublit as ce;
+            if ce::armed() { Ok(()) } else { Err(ce::reason()) }
         }
-        #[cfg(not(all(target_arch = "x86_64", feature = "wc_gpublit")))]
+        #[cfg(not(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover")))]
         {
-            Err("feature-off")
+            Err("no-kepler-takeover")
         }
     }
 }
 
 impl Blitter for GpuBlitter {
     fn blit(&self, job: &BlitJob) -> Result<Fence, BlitErr> {
-        // THE SEAM KBLIT FILLS — once `tests kblit` proves a CE copy with checksum, this body becomes
-        //     crate::drivers::gpu::kepler_ce::blit(job)        // brief: `kepler::ce::blit(job) -> Fence`
-        // which builds the CE method stream for each rect (src/dst GPU VA, pitches, w*bpp x h) and
-        // returns the semaphore sequence as the Fence. A source the channel's VM cannot address
-        // (`Mem::Ram` with no sysmem mapping of the staging band) is `BlitErr::Unsupported` — a
-        // fallback, never a dark frame.
-        let _ = job;
-        Err(BlitErr::Unavailable)
+        // GPUBLIT (B371) — the seam KBLIT named, filled: every rect of the job in ONE pushbuffer with ONE
+        // semaphore release on the copy engine (`kepler_gpublit::copy_wait`), synchronous inside the
+        // per-job budget. Busy/unarmed is `Unavailable`, an endpoint the channel's VM cannot address is
+        // `Unsupported`, a stall is `Timeout` (and demotes the selection) — each one a CPU fallback this
+        // frame through `run_on`, never a dark frame. Straight copies only: a blend is not idempotent.
+        #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
+        {
+            use crate::drivers::gpu::kepler_gpublit as ce;
+            let (si, di) = (job.src.fb.info(), job.dst.fb.info());
+            let bpp = di.bytes_per_pixel;
+            if job.op != Op::Copy || bpp == 0 || si.bytes_per_pixel != bpp || si.pixel_format != di.pixel_format {
+                return Err(BlitErr::Unsupported);
+            }
+            if job.rects.len() > ce::MAX_RECTS {
+                return Err(BlitErr::Unsupported);
+            }
+            if !ce::armed() {
+                return Err(BlitErr::Unavailable);
+            }
+            let mut rs = [ce::CeRect { src_off: 0, src_pitch: 0, dst_off: 0, dst_pitch: 0, row_bytes: 0, rows: 0 }; ce::MAX_RECTS];
+            for (i, r) in job.rects.iter().enumerate() {
+                let (s0, spitch, d0, dpitch, rb, _span) = geom(job, r, bpp)?;
+                if d0 + (r.h.max(1) - 1) * dpitch + rb > job.dst.fb.len() || job.dst.fb.base_addr() == 0 {
+                    return Err(BlitErr::Bounds);
+                }
+                rs[i] = ce::CeRect { src_off: s0, src_pitch: spitch, dst_off: d0, dst_pitch: dpitch, row_bytes: rb, rows: if rb == 0 { 0 } else { r.h } };
+            }
+            return match ce::copy_wait(job.src.fb.base_addr(), job.dst.fb.base_addr(), &rs[..job.rects.len()], ce::BUDGET_US) {
+                Ok(_) => Ok(Fence::DONE),
+                Err(ce::CeErr::Unavailable) => Err(BlitErr::Unavailable),
+                Err(ce::CeErr::Unsupported) => Err(BlitErr::Unsupported),
+                Err(ce::CeErr::Timeout) => {
+                    SEL_GPU.store(false, Release); // demoted: later frames go straight to the CPU
+                    Err(BlitErr::Timeout)
+                }
+            };
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = job;
+            Err(BlitErr::Unavailable)
+        }
     }
 
-    fn wait(&self, f: Fence, timeout_us: u32) -> Result<(), BlitErr> {
-        // KBLIT fills: poll the CE semaphore for `f.0` up to `timeout_us`; expiry -> `BlitErr::Timeout`.
-        let _ = (f, timeout_us);
-        Err(BlitErr::Unavailable)
+    fn wait(&self, _f: Fence, _timeout_us: u32) -> Result<(), BlitErr> {
+        // `blit` waited on the CE's semaphore inside its own budget (a fallback needs the answer before
+        // the staging band is reused), so a returned fence is already signalled.
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -275,7 +311,7 @@ pub fn ignite() {
     let reason = match GPU.probe() {
         Ok(()) => {
             SEL_GPU.store(true, Release);
-            "kblit-channel-bound"
+            "selftest-ok"
         }
         Err(r) => r,
     };
@@ -350,6 +386,8 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, AcqRel) {
         crate::tests::register("blitter", selftest);
+        #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
+        crate::tests::register("gpublit", crate::drivers::gpu::kepler_gpublit::tests_gpublit); // GPUBLIT (B371)
     }
 }
 
@@ -427,11 +465,21 @@ pub fn selftest() {
     let (rc, fell_c) = run_on(&CPU, &job_c);
     let cpu_us = cycles_to_us(crate::arch::now_cycles().saturating_sub(t1));
 
+    // GPUBLIT (B371): with the copy engine armed the GPU leg is a DIRECT copy on the CE (heap -> heap
+    // through the channel's sysmem window), timed as `gpu_us`, and the fallback leg is a job the CE must
+    // refuse (`CopyAlpha`). Unarmed, the legs are KCOMP's: `Unavailable`, the fallback taken and counted.
+    let armed = GPU.probe().is_ok();
     let fb0 = gpu_fallbacks();
-    let gpu_direct = GPU.blit(&job_c);
     let job_g = BlitJob { src: Surface::ram(sfb), dst: Surface::ram(fg), rects: &rect, op: Op::Copy };
     let t2 = crate::arch::now_cycles();
-    let (rg, fell_g) = run_on(&GPU, &job_g);
+    let (gpu_direct, rg, fell_g) = if armed {
+        let d = GPU.blit(&job_g);
+        (d, d.map(|_| ()), false)
+    } else {
+        let d = GPU.blit(&job_c);
+        let (rg, fell) = run_on(&GPU, &job_g);
+        (d, rg, fell)
+    };
     let gpu_path_us = cycles_to_us(crate::arch::now_cycles().saturating_sub(t2));
     let counted = gpu_fallbacks().wrapping_sub(fb0);
 
@@ -445,18 +493,25 @@ pub fn selftest() {
     let bad = [Rect { sx: 0, sy: 1, dx: 0, dy: 0, w: W, h: H }];
     let bounds_ok = CPU.blit(&BlitJob { src: Surface::ram(sfb), dst: Surface::ram(fc), rects: &bad, op: Op::Copy }) == Err(BlitErr::Bounds);
     let cpu_eq = rc.is_ok() && !fell_c && cc == ci && ci != blank;
-    let fallback_ok = rg.is_ok() && fell_g && counted == 1 && cg == ci;
+    let (fallback_ok, gpu_ok) = if armed {
+        let refused = GPU.blit(&BlitJob { src: Surface::ram(sfb), dst: Surface::ram(fc), rects: &rect, op: Op::CopyAlpha }) == Err(BlitErr::Unsupported);
+        (refused, rg.is_ok() && cg == ci)
+    } else {
+        (rg.is_ok() && fell_g && counted == 1 && cg == ci, gpu_word == "unavailable")
+    };
     serial_println!(
         "[kcomp] w={} h={} inline_us={} cpu_us={} gpu_path_us={} cks_inline={:#018x} cks_cpu={:#018x} cks_gpu={:#018x} blank={:#018x} par={} gpu_direct={} fallback_counted={} bounds_refused={}",
         W, H, inline_us, cpu_us, gpu_path_us, ci, cc, cg, blank, par as u8, gpu_word, counted, bounds_ok as u8
     );
-    let ok = cpu_eq && fallback_ok && bounds_ok && gpu_word == "unavailable";
+    let ok = cpu_eq && fallback_ok && bounds_ok && gpu_ok;
+    let gpu_us = if armed { alloc::format!("{}", gpu_path_us) } else { alloc::string::String::from("-") };
     serial_println!(
-        ":: KCOMP: blitter={} census={} hot={} cpu_us={} gpu={} fallback_ok={} -> {} ::",
+        ":: KCOMP: blitter={} census={} hot={} cpu_us={} gpu_us={} gpu={} fallback_ok={} -> {} ::",
         selected().name(),
         CENSUS_PATHS,
         HOT_PATH,
         cpu_us,
+        gpu_us,
         gpu_word,
         fallback_ok as u8,
         if ok { "PASS" } else { "FAIL" }
