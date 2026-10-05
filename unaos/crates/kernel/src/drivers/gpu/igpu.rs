@@ -2054,6 +2054,7 @@ pub unsafe fn gmux_igd_switch() {
             for b in row { serial_print!("{:02X} ", b); }
             serial_println!("::");
         }
+        crate::video::edidsrc::offer_aux(&edid); // KFONTPPI (B382): the panel's own EDID into video::EDID_BLOCK when the firmware carried none
     } else {
         serial_println!(":: igpu: [AUX] EDID Dump: (n/a) ::");
     }

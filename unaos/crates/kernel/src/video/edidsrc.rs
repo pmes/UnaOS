@@ -50,3 +50,56 @@ pub fn name() -> &'static str {
         _ => "none",
     }
 }
+
+/// The iGPU display lane's AUX-read EDID base block (I2C-over-AUX at 0x50, eight 16-byte reads). Published to
+/// `video::EDID_BLOCK` with `src=aux` only when the firmware's block is absent or BAD and these 128 bytes pass
+/// the header and the checksum; when both are good and differ, the firmware's is kept and the finding printed.
+/// Prints one line, always:
+/// `:: video: edid-aux hdr=<OK|BAD> sum=<OK|BAD> native=<w>x<h> ppi=<n> fw=<absent|bad|same|differs> -> <published|kept-fw|refused> relatch=<none|a->b> [console=<c>x<r>, 0x0 = not moved] ::`
+pub fn offer_aux(block: &[u8; 128]) {
+    let hdr_ok = block[0..8] == super::EDID_HEADER;
+    let sum_ok = block.iter().fold(0u8, |acc, b| acc.wrapping_add(*b)) == 0;
+    let d = &block[54..72];
+    let pclk = (d[0] as u32) | ((d[1] as u32) << 8);
+    let (nat_w, nat_h) = if pclk == 0 {
+        (0u32, 0u32)
+    } else {
+        ((d[2] as u32) | (((d[4] as u32) >> 4) << 8), (d[5] as u32) | (((d[7] as u32) >> 4) << 8))
+    };
+    let raw = super::edid_block_raw();
+    let fw = match (raw, super::edid_block()) {
+        (None, _) => "absent",
+        (Some(_), None) => "bad",
+        (Some(_), Some(f)) if f == *block => "same",
+        (Some(_), Some(_)) => "differs",
+    };
+    let mut con = (0usize, 0usize);
+    let (verdict, before, after) = if !(hdr_ok && sum_ok) {
+        ("refused", 0, 0)
+    } else if fw == "absent" || fw == "bad" {
+        *super::EDID_BLOCK.lock() = Some(*block);
+        super::EDID_OK.store(true, Ordering::Release);
+        set(SRC_AUX);
+        let (b, a) = super::dpi::relatch_edid();
+        if a != 0 {
+            con = super::fbcon::regrid_panel().map_or((0, 0), |(_, _, c, r)| (c, r)); // the panel console follows
+        }
+        ("published", b, a)
+    } else {
+        ("kept-fw", 0, 0)
+    };
+    let yn = |b: bool| if b { "OK" } else { "BAD" };
+    let ppi = super::dpi::edid_native().map_or(0, |(_, p)| p);
+    if before == 0 {
+        serial_println!(
+            ":: video: edid-aux hdr={} sum={} native={}x{} ppi={} fw={} -> {} relatch=none ::",
+            yn(hdr_ok), yn(sum_ok), nat_w, nat_h, ppi, fw, verdict
+        );
+    } else {
+        serial_println!(
+            ":: video: edid-aux hdr={} sum={} native={}x{} ppi={} fw={} -> {} relatch={}->{} console={}x{} ::",
+            yn(hdr_ok), yn(sum_ok), nat_w, nat_h, ppi, fw, verdict,
+            super::dpi::scale_str(before), super::dpi::scale_str(after), con.0, con.1
+        );
+    }
+}
