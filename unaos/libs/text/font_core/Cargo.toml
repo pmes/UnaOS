@@ -3,7 +3,7 @@ name = "font_core"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "FONTCORE (SR48): OpenType/TrueType/CFF parsing, outlines, an exact-area scanline rasterizer, a glyph cache and a Latin/Greek/Cyrillic shaper with UAX #14 line breaking — from the specifications, no_std + alloc, zero dependencies."
+description = "FONTCORE (SR48): OpenType/TrueType/CFF parsing, outlines, an exact-area scanline rasterizer, a glyph cache, UAX #9 bidi, UAX #29/#15/#14, and an OpenType shaper for complex scripts (GSUB 1-8, GPOS 1-9, Arabic, Indic, Thai, Hebrew) — from the specifications, no_std + alloc, zero dependencies."
 
 # FONTCORE (LEDGER SR48, R83): the standalone text core, shaped like the other shared cores under unaos/libs.
 # `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies (not even dev-dependencies). A member of the

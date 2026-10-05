@@ -54,6 +54,10 @@ fn exercise(data: &[u8]) -> usize {
     let _ = shape(&f, text, &o);
     let _ = measure(&f, text, 16.0, &o);
     let _ = layout_lines(&f, text, 16.0, 60.0, &o);
+    // FONTBIDI: the complex-script paths (bidi, joining, Indic reordering, Thai, contextual lookups, marks).
+    let text2 = "مرحبا بالعالم لَا שָׁלוֹם עוֹלָם क्षत्रिय र्कि ि ภาษาไทย น้ำ (abc ١٢٣) ـّـ\u{200D}\u{200C}";
+    let _ = shape(&f, text2, &o);
+    let _ = layout_lines(&f, text2, 16.0, 60.0, &o);
     let mut cache = GlyphCache::new(64);
     let mut canvas = font_core::Canvas::new(200, 40);
     font_core::draw_text(&mut cache, 1, &f, text, 14.0, 2.0, 20.0, &mut canvas, &o);
