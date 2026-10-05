@@ -3,8 +3,6 @@
 //
 //! Facet on a live Synapse: every request answered by receipt, every failure an ImageError.
 
-#![cfg(feature = "chicken-wire-image")]
-
 use bandy::signals::{FacetCommand, FacetEdit, FacetFormat, FacetView, FacetZoom};
 use bandy::{Origin, SMessage, Synapse};
 use std::time::Duration;
