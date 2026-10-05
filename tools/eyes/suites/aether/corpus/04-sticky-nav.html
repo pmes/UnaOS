@@ -1,0 +1,18 @@
+<!-- tests: a nav bar with position: sticky, inline-block nav links, hover-less link colors, long content beneath -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Sticky nav</title>
+<style>
+body { margin: 0; font-family: sans-serif; }
+.hero { background: linear-gradient(#5b2a86, #3a1c5a); background-color: #4a2270; color: white; padding: 40px 24px; font-size: 28px; }
+nav { position: sticky; top: 0; background: #111; padding: 0 16px; }
+nav a { display: inline-block; color: #eee; text-decoration: none; padding: 12px 14px; font-size: 15px; }
+nav a.active { background: #e63946; }
+section { padding: 16px 24px; }
+section p { line-height: 1.6; }
+</style></head><body>
+<div class="hero">Sticky navigation</div>
+<nav><a class="active" href="#">Home</a><a href="#">Products</a><a href="#">About</a><a href="#">Contact</a></nav>
+<section><h2>Section one</h2><p>Scroll down and the bar should stick to the top of the viewport. At scroll zero it sits in normal flow directly under the hero banner.</p>
+<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.</p>
+<h2>Section two</h2><p>Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.</p></section>
+</body></html>
