@@ -31,3 +31,28 @@ pub fn crc32(data: &[u8]) -> u32 {
     }
     c ^ 0xFFFF_FFFF
 }
+
+/// Streaming CRC-32/ISO-HDLC (AMBER1: a zero run's CRC without allocating it).
+/// `Crc32::new().update(a).update(b).finish() == crc32(a ++ b)`.
+pub struct Crc32(u32);
+
+impl Crc32 {
+    pub fn new() -> Self {
+        Self(0xFFFF_FFFF)
+    }
+    pub fn update(&mut self, data: &[u8]) -> &mut Self {
+        for &b in data {
+            self.0 = TABLE[((self.0 ^ b as u32) & 0xFF) as usize] ^ (self.0 >> 8);
+        }
+        self
+    }
+    pub fn finish(&self) -> u32 {
+        self.0 ^ 0xFFFF_FFFF
+    }
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}

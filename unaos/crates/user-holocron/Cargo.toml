@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# HOLOCRON2 (rmbp-ledger B355): `APPS/HOLOCRON.ELF` — Holocron ("The Key", CODEX §2) on the metal: the ONE
+# resident fulfiller R82 allows (it serves EVERY caller), registering verbs 144..=151 over the BANDY3 ring-3
+# mailbox. The policy, formats and codec are `holocron_core` (the same crate the host daemon links); this
+# program brings the metal's I/O: the store over SYS_PATH_READ/WRITE under `<home>/.config/unaos/holocron/`
+# (UnaFS only), entropy from SYS_GETRANDOM through CRYPTOCORE's DRBG, the owner from SYS_WHOAMI, the ring
+# KDF through SYS_KDF (Argon2id does not fit the 4 MiB window). Linked in the ELF window. x86_64 only.
+#
+# The empty [workspace] table makes this crate its OWN workspace root.
+[workspace]
+
+[package]
+name = "user-holocron"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-holocron"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[dependencies]
+una-abi = { path = "../una-abi" }
+holocron_core = { path = "../../libs/sys/holocron_core" }
+crypto_core = { path = "../../libs/sys/crypto_core", default-features = false, features = ["alloc"] }
+vein_ring3 = { path = "../../libs/sys/vein_ring3" }

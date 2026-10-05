@@ -8,7 +8,7 @@
 
 use alloc::string::String;
 
-use crate::schema::{self, CLAUDE_DEFAULT_MODEL, GEMINI_DEFAULT_KEY_ENV, GEMINI_DEFAULT_MODEL, LOCAL_EMBED_MODEL};
+use crate::schema::{self, CLAUDECODE_DEFAULT_MODEL, CLAUDE_DEFAULT_MODEL, GEMINI_DEFAULT_KEY_ENV, GEMINI_DEFAULT_MODEL, LOCAL_EMBED_MODEL};
 use crate::PrefValue;
 
 /// What a rule may look at.
@@ -53,7 +53,7 @@ impl Rule {
     pub const fn describe(self) -> &'static str {
         match self {
             Rule::Embedder => "`vein.embed.provider`: `gemini` when `vein.gemini.api_key_env` (default `GEMINI_API_KEY`) names a set, non-blank environment variable; else `local` when the local model `all-MiniLM-L6-v2` is installed (every file of the `tools/una-models` manifest in `${XDG_CACHE_HOME:-$HOME/.cache}/unaos/models/all-MiniLM-L6-v2/`); else `off` (R81).",
-            Rule::ChatModel => "`vein.model`: `claude-opus-5-5` when `vein.provider` is `claude` (its default), `gemini-3.1-pro-preview` when `gemini`; none for `echo` / `relay` (R81).",
+            Rule::ChatModel => "`vein.model`: `claude-opus-5-5` when `vein.provider` is `claude` (its default), `gemini-3.1-pro-preview` when `gemini`; `default` (the CLI's own model) when `claudecode`; none for `echo` / `relay` (R81).",
         }
     }
 
@@ -79,6 +79,7 @@ impl Rule {
                 match provider.trim() {
                     "claude" => Some(PrefValue::Str(String::from(CLAUDE_DEFAULT_MODEL))),
                     "gemini" => Some(PrefValue::Str(String::from(GEMINI_DEFAULT_MODEL))),
+                    "claudecode" => Some(PrefValue::Str(String::from(CLAUDECODE_DEFAULT_MODEL))),
                     _ => None,
                 }
             }
@@ -179,6 +180,8 @@ pub(crate) mod tests {
         assert_eq!(default_of("vein", "model", &env), Some((s(CLAUDE_DEFAULT_MODEL), Source::Rule(Rule::ChatModel))));
         let g = Env::default().with("vein", "provider", s("gemini"));
         assert_eq!(default_of("vein", "model", &g).unwrap().0, s(GEMINI_DEFAULT_MODEL));
+        let c = Env::default().with("vein", "provider", s("claudecode"));
+        assert_eq!(default_of("vein", "model", &c).unwrap().0, s(CLAUDECODE_DEFAULT_MODEL));
         let e = Env::default().with("vein", "provider", s("echo"));
         assert_eq!(default_of("vein", "model", &e), None);
         // A Gemini key alone does not move the CHAT provider (R81: never a hardwired Gemini default).

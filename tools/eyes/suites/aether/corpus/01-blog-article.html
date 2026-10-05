@@ -1,0 +1,29 @@
+<!-- tests: a blog article: headings, paragraphs, lists, blockquote, inline code and a pre code block, default UA styles -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Blog article</title>
+<style>
+body { font-family: serif; max-width: 680px; margin: 24px auto; padding: 0 16px; color: #222; line-height: 1.5; }
+h1 { font-size: 32px; margin-bottom: 4px; }
+.meta { color: #777; font-size: 14px; }
+blockquote { border-left: 4px solid #c33; margin: 16px 0; padding: 4px 16px; color: #555; font-style: italic; }
+code { font-family: monospace; background: #f2f2f2; padding: 1px 4px; }
+pre { background: #272822; color: #f8f8f2; padding: 12px; }
+</style></head><body>
+<h1>On Building a Browser from Scratch</h1>
+<p class="meta">Posted October 4 by the Aether team</p>
+<p>Every browser starts with a parser. The parser turns bytes into a tree, and the tree is the thing every later stage reads. Styles attach to it, layout measures it, and paint walks it.</p>
+<h2>Three stages</h2>
+<ol>
+<li>Parse the document into a DOM.</li>
+<li>Resolve styles through the cascade.</li>
+<li>Lay out boxes and paint them.</li>
+</ol>
+<blockquote>A page that looks wrong should arrive with a list of why.</blockquote>
+<h3>What we skip</h3>
+<ul><li>Hardware compositing</li><li>Process isolation</li></ul>
+<p>The entry point is <code>render_frame()</code>, which paints the damage rects:</p>
+<pre><code>fn main() {
+    let engine = Engine::new();
+    engine.render_frame();
+}</code></pre>
+</body></html>

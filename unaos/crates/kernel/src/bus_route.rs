@@ -517,3 +517,9 @@ pub fn selftest(fx: &Fixture) {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
 }
+
+/// HOLOCRON2 (rmbp-ledger B355): does `verb` have a registration right now? (Generation not checked: a row
+/// that died since is reaped at the next REGISTER; `tests holocron` and the login launch only read it.)
+pub fn registered(verb: u8) -> bool {
+    locked(|| REGS.lock().iter().flatten().any(|r| r.verb == verb))
+}

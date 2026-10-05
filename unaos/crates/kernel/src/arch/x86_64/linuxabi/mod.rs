@@ -46,6 +46,9 @@ pub mod sys3;
 pub mod thread;
 pub mod selfbuild3; // SELFBUILD3 (B353): `tests selfbuild3`
 pub mod vm; // SELFBUILD3 (B353): lazy VMAs, the #PF hook, the resident budget, the user frame pool
+pub mod cow; // SELFBUILD4 (B356): copy-on-write fork
+pub mod exec; // SELFBUILD4 (B356): lazy execve images
+pub mod selfbuild4; // SELFBUILD4 (B356): `tests selfbuild4`
 
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -282,7 +285,7 @@ impl AddrSpace {
         // Validate the whole range first so a bad pointer writes nothing (SELFBUILD3: backing lazy pages on the way).
         let mut a = va & !(PAGE - 1);
         while a < end {
-            match self.user_page(a).or_else(|| self.fault_in(a, true)) {
+            match self.page_for_store(a) { // SELFBUILD4: a copy-on-write page is broken for the store
                 Some((_, e)) if force || e & W != 0 => {}
                 _ => return false,
             }
@@ -328,7 +331,7 @@ impl AddrSpace {
         }
         let mut a = va & !(PAGE - 1);
         while a < end {
-            match self.user_page(a).or_else(|| self.fault_in(a, true)) {
+            match self.page_for_store(a) { // SELFBUILD4: a copy-on-write page is broken for the store
                 Some((_, e)) if e & W != 0 => {}
                 _ => return false,
             }
@@ -340,6 +343,7 @@ impl AddrSpace {
     /// LINUXABI2 fork: a new address space holding a byte-for-byte EAGER copy of every RESIDENT private data page (same
     /// perms; SELFBUILD3: PROT_NONE-resident pages too) and the same VMA list, so unbacked pages stay lazy in the child.
     /// No copy-on-write: this kernel's page-fault path has no hook to resolve a write fault on a shared read-only page.
+    #[allow(dead_code)] // SELFBUILD4: fork shares frames copy-on-write now (`cow.rs` `fork_cow`)
     pub fn fork_copy(&self) -> Option<AddrSpace> {
         let list: Vec<(u64, u64)> = {
             let frames = &self.m.borrow().frames;
@@ -546,7 +550,7 @@ pub fn note_fault(vec: u8, _err: u64, cr2: u64) {
             FAULT_CR2.store(cr2, Ordering::Release);
             FAULT.store(vec as u64 + 1, Ordering::Release);
         }
-        i.finish(11);
+        i.finish(vm::take_fault_sig(i.pid)); // SELFBUILD4: SIGBUS for a file page past EOF, else SIGSEGV
         thread::fault_current(&i); // SELFBUILD2: a fault takes the whole thread group
     }
 }
@@ -690,6 +694,7 @@ impl Report {
     }
 }
 
+#[allow(dead_code)] // SELFBUILD4: `linux` and execve load lazily now (exec.rs); the whole-file read stays for the record
 pub(crate) fn read_image(path: &str) -> Result<(String, Vec<u8>), String> {
     use crate::fs::vfs::NodeKind;
     let full = crate::shell::vfs_path(path);
@@ -775,10 +780,11 @@ fn pump_keys(edit: &mut String, pend: &mut String, out: &mut dyn FnMut(&str)) ->
 }
 
 fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out: &mut dyn FnMut(&str)) -> Result<Report, String> {
-    let (full, bytes) = read_image(path)?;
-    let plan = elf::parse(&bytes).map_err(String::from)?;
+    let img = exec::image(path)?; // SELFBUILD4: the head only; the image pages in through file VMAs (exec.rs)
+    let (full, plan) = (img.full.clone(), &img.plan);
     let mut asp = AddrSpace::new();
-    if let Err(e) = elf::load(&mut asp, &bytes, &plan) {
+    exec::begin(&img);
+    if let Err(e) = exec::load(&mut asp, &img) {
         asp.free_frames();
         return Err(String::from(e));
     }
