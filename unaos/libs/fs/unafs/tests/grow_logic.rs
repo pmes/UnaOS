@@ -105,8 +105,13 @@ fn grow_to_four_n_on_an_image_file() {
     let (fs, r) = unafs::grow(img.dev(), 4 * N).unwrap();
     assert_eq!((r.from, r.to), (N, 4 * N));
     assert_eq!(r.free_before, free_before);
-    // Single-level map either side: the map grows by its extra leaves only.
-    let map_growth = leaves(4 * N) - leaves(N);
+    // Single-level map either side: a legacy map grows by its extra leaves;
+    // a paged (v7, UNAFSMAP) map's new leaves are holes — it owns no new block.
+    let map_growth = if fs.map_shape() == unafs::maptree::Shape::Legacy {
+        leaves(4 * N) - leaves(N)
+    } else {
+        0
+    };
     assert_eq!(r.free_after, free_before + 3 * N - map_growth);
     drop(fs);
 

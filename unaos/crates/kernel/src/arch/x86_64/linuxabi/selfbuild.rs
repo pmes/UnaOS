@@ -95,8 +95,8 @@ pub fn selftest() {
     }
     // A stale output from an earlier run must not pass for a fresh one.
     let _ = crate::shell::vfs_mount_table().unlink(&crate::shell::vfs_path(&out), crate::fs::vfs::KERNEL_PRINCIPAL);
-    let argv: Vec<&str> = alloc::vec!["tcc", "-nostdlib", "-static", "-o", out.as_str(), SRC];
-    serial_println!("[selfbuild] linux {} -nostdlib -static -o {} {}", TCC, out, SRC);
+    let argv: Vec<&str> = alloc::vec!["tcc", "-nostdlib", "-static", "-o", out.as_str(), "-x", "c", SRC]; // SELFBUILD4: `-x c` — tcc types a file by its extension and the volume's name ends in upper-case `.C` (host-proven: `unrecognized file type` without it)
+    serial_println!("[selfbuild] linux {} -nostdlib -static -o {} -x c {}", TCC, out, SRC);
     let (r, cap) = run_cap(TCC, &argv, 30_000);
     for l in cap.lines().take(8) {
         serial_println!("[selfbuild] tcc: {}", l);

@@ -8,6 +8,10 @@ license = "LGPL-3.0-or-later"
 default = ["std"]
 std = ["reqwest", "octocrab", "tokio", "futures-core", "futures-util"]
 # EMBED (B317): the in-process local embedder (all-MiniLM-L6-v2 on candle, CPU).
+# PLAYBACK (SR26): AVCODEC's AV1 decoder (`unaos/libs/media/av1_core`, LEDGER SR24) behind
+# `dsp::video::av1`. Today the module is a stub that refuses with Unsupported (so the registry
+# arm compiles and is exercised); the fold adds the av1_core dependency and the real body.
+av1 = []
 local-embed = ["std", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:unicode-normalization"]
 
 [dependencies]
@@ -22,11 +26,20 @@ futures-core = { version = "0.3", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 chrono = { version = "0.4", default-features = false }
 bandy = { version = "0.1.0", path = "../bandy", default-features = false }
+# AUDIOCODEC (SR30): `dsp::audio` re-exports the no_std audio decoders the kernel links too.
+audio_core = { path = "../../unaos/libs/media/audio_core" }
+# PIXELCORE (SR25): the still-image decoders UnaOS owns (no_std, zero deps) — re-exported as `dsp::image`.
+pixel_core = { path = "../../unaos/libs/media/pixel_core" }
 # EMBED (B317): the local embedder — candle on the CPU (BERT), NFD for the WordPiece normaliser.
 candle-core = { version = "0.11", optional = true }
 candle-nn = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
+
+# PLAYBACK (SR26): the container core `dsp::demux` re-exports (`no_std`, no dependencies).
+demux_core = { path = "../../unaos/libs/media/demux_core" }
+# VP8CORE (SR40): the from-spec VP8 decoder behind `dsp::video::vp8` (`no_std`, no dependencies).
+vp8_core = { path = "../../unaos/libs/media/vp8_core" }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "macros", "time"] }
