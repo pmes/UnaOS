@@ -105,6 +105,8 @@ pub struct Vm {
     pub wk: WellKnown,
     pub host: Box<dyn Host>,
     pub max_depth: usize,
+    /// Local time zone rule (POSIX TZ data); None defers LocalTZA to the host.
+    pub tz: Option<crate::tz::PosixTz>,
     /// Instruction budget (fuzzing / watchdog); None = unlimited.
     pub budget: Option<u64>,
     pub terminated: bool,
@@ -158,6 +160,7 @@ impl Vm {
             wk,
             host,
             max_depth: 1800,
+            tz: None,
             budget: None,
             terminated: false,
             kept_alive: Vec::new(),

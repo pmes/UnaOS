@@ -106,6 +106,12 @@ impl Vm {
             }
             return Ok(r);
         }
+        self.ordinary_to_primitive(o, hint)
+    }
+
+    /// OrdinaryToPrimitive (§7.1.1.1): hint 2 = string, otherwise number.
+    pub fn ordinary_to_primitive(&mut self, o: Obj, hint: u8) -> JsResult<Value> {
+        let v = &Value::Object(o);
         let order = if hint == 2 { ["toString", "valueOf"] } else { ["valueOf", "toString"] };
         for name in order {
             let m = self.get(o, &PropertyKey::from_str(name))?;

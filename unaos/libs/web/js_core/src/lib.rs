@@ -16,6 +16,7 @@ pub mod numconv;
 pub mod parser;
 pub mod regexp;
 pub mod string;
+pub mod tz;
 pub mod unicode;
 pub mod builtins;
 pub mod bytecode;
