@@ -166,6 +166,10 @@ impl<'a, T: Transport> Client<'a, T> {
             return Err(illegal("ServerKeyExchange curve not offered"));
         }
         let group = NamedGroup::from_code(ske.group).ok_or(illegal("ServerKeyExchange curve"))?;
+        if group.is_hybrid() {
+            // CTCORE: X25519MLKEM768 is a TLS 1.3 group; a 1.2 ServerKeyExchange may name ECDHE curves only.
+            return Err(illegal("ServerKeyExchange names a TLS 1.3-only hybrid group"));
+        }
         let scheme = SignatureScheme::from_code(ske.scheme)
             .filter(|s| offered.signature_schemes.contains(&s.code()))
             .ok_or(illegal("ServerKeyExchange signature scheme not offered"))?;
