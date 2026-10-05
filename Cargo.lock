@@ -4811,6 +4811,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+]
+
+[[package]]
 name = "inout"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

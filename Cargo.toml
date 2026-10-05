@@ -36,6 +36,9 @@ members = [
     # CSSCORE (SR47): CSS Syntax 3 + Selectors 4 + the cascade helpers, no_std, zero deps.
     "unaos/libs/web/css_core",
 
+    # INFERCORE (SR57): the no_std inference core (safetensors/ONNX readers, BERT tokenizer + encoder), zero deps.
+    "unaos/libs/ml/infer_core",
+
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",
