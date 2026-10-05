@@ -235,28 +235,21 @@ impl AudioDecoder for Decoder {
     fn open(src: Box<dyn Read>) -> Result<Decoder> {
         let mut s = ByteStream::new(src);
         s.fill(64)?;
+        // MP3HANG (rmbp B373): each arm is an OUTLINED call, so this frame is the largest arm's, not the sum of
+        // every constructor inlined into it (92504 bytes on the kernel target — three times a 32 KiB kernel stack;
+        // flight 23's `tests play mp3` wrote through the guard). The arms are the same calls as before.
         let source: Box<dyn Source> = match sniff(s.data()) {
-            Format::Wav => Box::new(wav::WavDecoder::new(s)?),
-            Format::Aiff => Box::new(aiff::AiffDecoder::new(s)?),
-            Format::Flac => Box::new(flac::FlacDecoder::new(s)?),
-            Format::Ogg => ogg::open(s)?,
-            Format::Mp3 => {
-                // an ID3v2 tag can front ADTS as well as MP3: look past it
-                let d = s.data();
-                let mut adts = false;
-                if d.len() >= 10 && &d[0..3] == b"ID3" {
-                    let size = ((d[6] as usize & 127) << 21) | ((d[7] as usize & 127) << 14) | ((d[8] as usize & 127) << 7) | (d[9] as usize & 127);
-                    let at = 10 + size + if d[5] & 0x10 != 0 { 10 } else { 0 };
-                    if s.fill(at + 2)? >= at + 2 { let d = s.data(); adts = d[at] == 0xFF && d[at + 1] & 0xF6 == 0xF0; }
-                }
-                if adts { Box::new(aac::AdtsStream::new(s)?) } else { Box::new(mp3::Mp3Stream::new(s)?) }
-            }
-            Format::Adts => Box::new(aac::AdtsStream::new(s)?),
-            Format::Mp4 => mp4::open(s)?,
+            Format::Wav => open_arm::wav(s)?,
+            Format::Aiff => open_arm::aiff(s)?,
+            Format::Flac => open_arm::flac(s)?,
+            Format::Ogg => open_arm::ogg(s)?,
+            Format::Mp3 => open_arm::mp3_or_adts(s)?,
+            Format::Adts => open_arm::adts(s)?,
+            Format::Mp4 => open_arm::mp4(s)?,
             // Not recognisable from the first bytes: an MP3 can still start after junk (an ICY header, a
             // truncated tag) — the frame sync scan verifies every candidate against the next header.
-            Format::Unknown => match mp3::Mp3Stream::new(s) {
-                Ok(m) => Box::new(m),
+            Format::Unknown => match open_arm::mp3(s) {
+                Ok(m) => m,
                 Err(_) => return Err(Error::Unsupported("unrecognised format")),
             },
         };
@@ -338,4 +331,29 @@ pub fn decode_all_i32(bytes: &[u8]) -> Result<(Info, Vec<i32>)> {
         out.extend_from_slice(&buf[..n * ch]);
     }
     Ok((d.info(), out))
+}
+
+/// MP3HANG (rmbp B373): `Decoder::open`'s arms, one outlined function each, every codec state boxed at once —
+/// the open frame is bounded by the deepest single arm (see the note in `open`).
+mod open_arm {
+    use super::*;
+    #[inline(never)] pub fn wav(s: ByteStream) -> Result<Box<dyn Source>> { Ok(Box::new(wav::WavDecoder::new(s)?)) }
+    #[inline(never)] pub fn aiff(s: ByteStream) -> Result<Box<dyn Source>> { Ok(Box::new(aiff::AiffDecoder::new(s)?)) }
+    #[inline(never)] pub fn flac(s: ByteStream) -> Result<Box<dyn Source>> { Ok(Box::new(flac::FlacDecoder::new(s)?)) }
+    #[inline(never)] pub fn ogg(s: ByteStream) -> Result<Box<dyn Source>> { ogg::open(s) }
+    #[inline(never)] pub fn adts(s: ByteStream) -> Result<Box<dyn Source>> { Ok(Box::new(aac::AdtsStream::new(s)?)) }
+    #[inline(never)] pub fn mp4(s: ByteStream) -> Result<Box<dyn Source>> { mp4::open(s) }
+    #[inline(never)] pub fn mp3(s: ByteStream) -> Result<Box<dyn Source>> { Ok(Box::new(mp3::Mp3Stream::new(s)?)) }
+    /// An ID3v2 tag can front ADTS as well as MP3: look past it.
+    #[inline(never)]
+    pub fn mp3_or_adts(mut s: ByteStream) -> Result<Box<dyn Source>> {
+        let d = s.data();
+        let mut is_adts = false;
+        if d.len() >= 10 && &d[0..3] == b"ID3" {
+            let size = ((d[6] as usize & 127) << 21) | ((d[7] as usize & 127) << 14) | ((d[8] as usize & 127) << 7) | (d[9] as usize & 127);
+            let at = 10 + size + if d[5] & 0x10 != 0 { 10 } else { 0 };
+            if s.fill(at + 2)? >= at + 2 { let d = s.data(); is_adts = d[at] == 0xFF && d[at + 1] & 0xF6 == 0xF0; }
+        }
+        if is_adts { adts(s) } else { mp3(s) }
+    }
 }
