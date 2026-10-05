@@ -478,8 +478,8 @@ unsafe fn ring3_fault_kill(vec: u8, err: u64, rip: u64, cr2: u64) -> ! {
         crate::hlt_loop();
     };
     serial_println!(
-        ":: RING-3 FAULT: task '{}' KILLED — vec={} err={:#x} rip={:#x} cr2={:#x} ::",
-        name, vec, err, rip, cr2
+        ":: RING-3 FAULT: task '{}' KILLED — vec={} err={:#x} rip={:#x} cr2={:#x} seg={} ::", // STORMFAULT (B351): seg= names what cr2 hit (bss|stack|none)
+        name, vec, err, rip, cr2, if vec == 14 { super::elf::fault_seg(cr2) } else { "none" }
     );
     #[cfg(feature = "lumen")] crate::lumen::note_ring3_fault(vec, rip); // LUMENCRASH M3 (B326): the faulting task's pid, vector and rip, for `tests lumen`'s spawn step
     crate::arch::syscall::record_ring3_kill(name, vec, err, cr2); if !(name.len() > 1 && name.as_bytes()[0] == b'u' && name.as_bytes()[1].is_ascii_digit()) { #[cfg(feature = "login")] crate::fs::users::screen_notice(b"Program stopped", name.as_bytes()); } // NOTICE: queue only (fixtures u1.. u4x are silent)
@@ -497,6 +497,13 @@ extern "x86-interrupt" fn page_fault_handler(
         // Ring-3 #PF: restore per-CPU GS, then kill the offending task (never returns).
         unsafe {
             core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            // SELFBUILD3 (B353): a Linux task's lazy page (anonymous zero-fill or a file page through the VFS) is backed here
+            // and the instruction re-executed; GS goes back to the user's before the iretq.
+            #[cfg(feature = "linuxabi")]
+            if crate::arch::linuxabi::vm::fault(cr2, error_code.bits()) {
+                core::arch::asm!("swapgs", options(nostack, preserves_flags));
+                return;
+            }
             ring3_fault_kill(
                 VEC_PF,
                 error_code.bits(),

@@ -64,8 +64,8 @@ pub use btree::{
 };
 pub use catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 pub use fs::{
-    BatchFile, CommitStats, DirEntry, QueryHit, ReclaimEntry, SNAPSHOT_CAP, SnapshotEntry,
-    SnapshotView, Stat, UnaFS, cosine_similarity,
+    BatchFile, CommitStats, DirEntry, GrowReport, QueryHit, ReclaimEntry, SNAPSHOT_CAP, SnapshotEntry,
+    SnapshotView, Stat, UnaFS, cosine_similarity, grow,
 };
 pub use index::CatalogRecord;
 pub use fsck::FsckReport;

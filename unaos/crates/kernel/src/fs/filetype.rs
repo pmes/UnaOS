@@ -39,6 +39,10 @@ pub const DIRECTORY: &str = "inode/directory";
 pub const GZIP: &str = "application/gzip";
 pub const TAR: &str = "application/x-tar";
 pub const OCTET: &str = "application/octet-stream";
+/// QUARRY2 (B336): the two text types FILETYPE owed, and the animated-image type PIXELCORE decodes.
+pub const TEXT_MARKDOWN: &str = "text/markdown";
+pub const APP_JSON: &str = "application/json";
+pub const IMAGE_GIF: &str = "image/gif";
 
 /// How many leading bytes the sniff reads (`ustar` sits at 257..262, so a tar needs 263).
 pub const SNIFF_LEN: usize = 512;
@@ -77,14 +81,16 @@ pub const EXT_TABLE: &[(&str, &str)] = &[
     ("png", IMAGE_PNG),
     ("wav", AUDIO_WAV),
     ("txt", TEXT_PLAIN),
-    ("md", TEXT_PLAIN),
+    ("md", TEXT_MARKDOWN),
+    ("markdown", TEXT_MARKDOWN),
     ("log", TEXT_PLAIN),
     ("spec", TEXT_PLAIN),
     ("sha", TEXT_PLAIN),
     ("cfg", TEXT_PLAIN),
     ("ini", TEXT_PLAIN),
     ("toml", TEXT_PLAIN),
-    ("json", TEXT_PLAIN),
+    ("json", APP_JSON),
+    ("gif", IMAGE_GIF),
     ("tgz", GZIP),
     ("gz", GZIP),
     ("tar", TAR),
@@ -170,10 +176,59 @@ pub fn sniff(b: &[u8]) -> Option<&'static str> {
     if b.len() >= 262 && &b[257..262] == b"ustar" {
         return Some(TAR);
     }
+    if b.len() >= 6 && (&b[..6] == b"GIF87a" || &b[..6] == b"GIF89a") {
+        return Some(IMAGE_GIF);
+    }
     if looks_text(b) {
+        if looks_json(b) {
+            return Some(APP_JSON);
+        }
+        if looks_markdown(b) {
+            return Some(TEXT_MARKDOWN);
+        }
         return Some(TEXT_PLAIN);
     }
     None
+}
+
+/// QUARRY2 (B336) — the type the text editor stamps on a save: `text/markdown` / `application/json` when
+/// the name says so (a `.md` saved from the editor stays Markdown), else `text/plain`. Pure.
+pub fn saved_text_type(path: &str) -> &'static str {
+    match by_extension(path) {
+        Some(m @ (TEXT_MARKDOWN | APP_JSON)) => m,
+        _ => TEXT_PLAIN,
+    }
+}
+
+/// QUARRY2 (B336) — a Markdown head: an ATX heading `# ` (any level up to six `#`) on the first line,
+/// or YAML front matter (`---` alone on the first line). Pure.
+pub fn looks_markdown(b: &[u8]) -> bool {
+    let b = b.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(b);
+    let line = b.split(|&c| c == b'\n').next().unwrap_or(b);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line == b"---" {
+        return true;
+    }
+    let hashes = line.iter().take_while(|&&c| c == b'#').count();
+    (1..=6).contains(&hashes) && line.get(hashes) == Some(&b' ')
+}
+
+/// QUARRY2 (B336) — a JSON head: after whitespace, `{` followed by `"` or `}`, or `[` followed by a
+/// value's first byte (`"` `{` `[` `]` `-` a digit `t` `f` `n`). Valid FIRST TOKENS, not a parse: the
+/// renderer validates the whole document and says so when it is not one. Pure.
+pub fn looks_json(b: &[u8]) -> bool {
+    let ws = |c: &u8| matches!(*c, b' ' | b'\t' | b'\r' | b'\n');
+    let mut it = b.iter().skip_while(|c| ws(*c));
+    let first = match it.next() {
+        Some(&c) => c,
+        None => return false,
+    };
+    let next = it.find(|c| !ws(*c)).copied();
+    match (first, next) {
+        (b'{', Some(b'"')) | (b'{', Some(b'}')) => true,
+        (b'[', Some(c)) => matches!(c, b'"' | b'{' | b'[' | b']' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n'),
+        _ => false,
+    }
 }
 
 /// [`type_of`] against a mount table the caller already holds (Quarry asks inside its model lock and
@@ -195,6 +250,9 @@ pub fn type_of_in(mt: &MountTable, path: &str) -> (String, Source) {
             let want = core::cmp::min(s.size, SNIFF_LEN as u64) as usize;
             if let Ok(head) = mt.read(path, 0, want) {
                 if let Some(m) = sniff(&head) {
+                    // QUARRY2 (B336): the Markdown/JSON shapes are WEAK (a `# comment` config is not a
+                    // document) — a name the table types otherwise keeps its table type.
+                    if let (TEXT_MARKDOWN | APP_JSON, Some(e)) = (m, by_extension(path)) { if e != m { return (String::from(e), Source::Extension); } }
                     return (String::from(m), Source::Sniffed);
                 }
             }
@@ -298,6 +356,9 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("filetype", selftest);
+        // QUARRY2 (B336): `tests quarry2` rides this registration (no tests.rs line).
+        #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+        crate::video::quarry::live::columns::ensure_tests();
     }
 }
 

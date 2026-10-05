@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "crypto_core"
+version = "0.1.0"
+
+[[package]]
+name = "tls_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+]
+
+[[package]]
 name = "una-abi"
 version = "0.1.0"
 
@@ -11,4 +22,20 @@ name = "user-net"
 version = "0.1.0"
 dependencies = [
  "una-abi",
+ "vein_core",
+ "vein_ring3",
+]
+
+[[package]]
+name = "vein_core"
+version = "0.1.0"
+
+[[package]]
+name = "vein_ring3"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+ "tls_core",
+ "una-abi",
+ "vein_core",
 ]

@@ -107,6 +107,7 @@ fn map_blk(e: crate::drivers::block::BlockError) -> InstallError {
         // context can hold the loan.) If this path ever grows a retry, `Busy` is the one error worth
         // retrying — see the reaper's requeue arm in `arch::aarch64::syscall::free_orphan_chain`.
         crate::drivers::block::BlockError::Busy => InstallError::Io,
+        crate::drivers::block::BlockError::Denied => InstallError::Io, // AHCIROOT (B332): SATA-only variant; unreachable on the Pi
     }
 }
 
@@ -117,7 +118,7 @@ fn classify_sector0(buf: &[u8; SECTOR]) -> &'static str {
     let fat_jump = buf[0] == 0xeb || buf[0] == 0xe9;
     let fat_str = &buf[0x36..0x39] == b"FAT" || &buf[0x52..0x55] == b"FAT";
     if sig_55aa {
-        if buf[450] == 0xee {
+        if amber_core::gpt::protective_slot(buf) == Some(0) { // AHCIROOT (B332): the shared reader decides 0xEE in entry 1
             return "GPT-protective MBR (0xEE partition; GPT header at LBA 1)";
         }
         if fat_jump && fat_str {

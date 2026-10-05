@@ -129,6 +129,8 @@
 pub mod bringup;
 pub mod bus;
 pub mod firmware;
+pub mod status;
+pub mod verb;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 

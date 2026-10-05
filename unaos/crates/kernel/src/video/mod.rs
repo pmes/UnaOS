@@ -469,7 +469,7 @@ pub const PANEL_BG: u32 = 0x001E_1E1E;
 pub fn init_panel(base: usize, len: usize, info: FrameBufferInfo) {
     crate::bootlog_println!(":: FB Init ::");
     crate::bootlog_println!(":: FB Size: {}x{} (stride {}) ::", info.width, info.height, info.stride);
-    serial_println!(":: FB Format: {:?} ::", info.pixel_format);
+    crate::bootlog_println!(":: FB Format: {:?} ::", info.pixel_format);
 
     let mut surface = FrameBuffer::new();
     surface.init(base, len, info);
@@ -1171,3 +1171,7 @@ pub mod backlight;
 // KCOMP (B321): the compositor's one blitter interface — CpuBlitter (WCPAR inside) today, the Kepler
 // copy engine's GpuBlitter when KBLIT lands. Every compositing build; see the module head.
 pub mod blitter;
+// GLASSEYES (B343): `shot <state>` — compose a named state, settle, capture through PRTSCR, write the state's mask;
+// and `tests shot`. Desktop family only (it opens desktop windows); nothing at boot.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod shotmask;

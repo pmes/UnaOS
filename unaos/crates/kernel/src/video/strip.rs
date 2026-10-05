@@ -553,7 +553,7 @@ impl Ledger {
         let paints = self.paints.load(Ordering::Relaxed);
         let scan = self.scan_cyc.load(Ordering::Relaxed) / passes;
         let paint = self.paint_cyc.load(Ordering::Relaxed) / paints.max(1);
-        serial_println!(
+        crate::census_println!(
             "[{}] {} passes={} paints={} rate={}/1k scan={}cyc/{}us paint={}cyc/{}us px/paint={} {}",
             name,
             scope,
@@ -1437,7 +1437,7 @@ fn bar_rollup_one(k: usize) {
         "CLEAN"
     };
     let minp = c.minpaint_us.load(Ordering::Relaxed);
-    serial_println!(
+    crate::census_println!(
         "[strip] rollup tenant={} scope=bar emit={} age_ms={} rect={}x{}+{}+{} scene={} pop=all-paints paints={} paint_px={} torn={} beam={} beamobs={} beamwait_us={} beamcross_ppk={} maxpaint_us={} minpaint_us={} rectscan_us={} declines={} decl_lock={} decl_ready={} decl_word={} decl_geom={} pop=vacates vacates={} uncovered={} uncovered_px={} unerased={} unerased_px={} forgotten={} flat={} flat_px={} restored={} restored_px={} pop=constant frame_us={} -> {}",
         BAR_NAMES[k],
         emit,

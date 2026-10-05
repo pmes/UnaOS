@@ -907,7 +907,7 @@ fn x200_witness(op_base: usize, tag: &str, val: u64) {
         let cmd = core::ptr::read_volatile(op_base as *const u32);
         let sts = core::ptr::read_volatile((op_base + 0x04) as *const u32);
         let crcr = core::ptr::read_volatile((op_base + 0x18) as *const u32);
-        serial_println!(
+        crate::census_println!(
             ":: X200: {}={:#x} (RS={} HCH={} CRR={}) ::",
             tag, val, cmd & 1, sts & 1, (crcr >> 3) & 1
         );
@@ -17154,10 +17154,10 @@ pub fn bot_residue_disagrees(data_len: u32, data_moved: u32, residue: u32) -> bo
 // Everything the link needs from the controller, at the file tail and `#[cfg]`-gated: the post-walk
 // arm (take the candidate / ask for the other configuration), a full-length configuration request by
 // INDEX, the Configure-Endpoint completion test, and the per-pass service — class bring-up once, then
-// bulk-IN arm/claim/deliver and bulk-OUT staging of queued frames. The synchronous OUT stage reuses
-// `ftdi_pending` + `pump_until_ftdi_done`: that pair is "one outstanding bulk-OUT TD on (slot, dci),
-// completed by the event ring" and nothing FTDI-specific, and the link runs on the same pass right
-// after `drain_ftdi` has consumed its own. See `xhci/usbnet.rs` for the device half and the wire.
+// bulk-IN arm/claim/deliver and bulk-OUT staging of queued frames. NETCLOCK (B335): the OUT stage is
+// ASYNCHRONOUS — one TD in flight, issued by `usbnet_data_pass`, its completion claimed by `usbnet::claim`
+// on the event-ring line and reaped by the next pass (it no longer borrows `ftdi_pending` and waits).
+// See `xhci/usbnet.rs` for the device half and the wire.
 #[cfg(feature = "usbnet")]
 impl XhciController {
     /// After the descriptor walk of a non-storage, non-FTDI device: configure the ECM bulk pair, or
@@ -17230,6 +17230,21 @@ impl XhciController {
             return;
         }
         if usbnet::kind() == usbnet::KIND_AX88179 { self.usbnet_ax_poll(slot); }
+        self.usbnet_data_pass();
+    }
+
+    /// NETCLOCK (B335): the link's DATA pass — RX reap/deliver/arm (USBNET7's, unchanged) and asynchronous TX:
+    /// reap the in-flight OUT TD's completion, then issue the next queued frame (stage, TRB, doorbell) and
+    /// RETURN. Nothing waits on the wire (was `usbnet_tx_stage` on `pump_until_ftdi_done`, the loan held across
+    /// every frame). Also the stack-side `usbnet::drive`, which is why it carries no PHY poll and no bring-up.
+    pub fn usbnet_data_pass(&mut self) {
+        if !usbnet::is_up() {
+            return;
+        }
+        let slot = usbnet::slot();
+        if slot == 0 {
+            return;
+        }
         let (in_ep, out_ep, data_phys) = {
             let s = &self.slots[slot as usize];
             let dp = match s.scsi_data_buffer { Some(p) => p as u64, None => return };
@@ -17271,35 +17286,39 @@ impl XhciController {
             self.ring_doorbell(slot, in_dci as u32);
         }
 
-        // ── TX: drain the frame ring, one synchronous TD per frame, at most one ring's worth per pass. ──
-        let mut sent = 0;
-        while sent < 8 && usbnet::tx_pending() {
-            let ax = usbnet::kind() == usbnet::KIND_AX88179;
-            let n = {
-                let buf = unsafe { core::slice::from_raw_parts_mut(tx_phys as *mut u8, usbnet::FRAME_CAP + usbnet::ax::TX_HDR_LEN) };
-                if ax {
-                    // 8-byte header ahead of the frame: [len][flags], the pad flag when the transfer
-                    // would end exactly on a max packet (the part then pads instead of a ZLP).
-                    match usbnet::next_tx(&mut buf[usbnet::ax::TX_HDR_LEN..]) {
-                        Some(n) => {
-                            let mps = usbnet::out_mps() as usize;
-                            let flags = if mps != 0 && (n + usbnet::ax::TX_HDR_LEN) % mps == 0 { usbnet::ax::TX_PAD_FLAG } else { 0 };
-                            buf[0..4].copy_from_slice(&(n as u32).to_le_bytes());
-                            buf[4..8].copy_from_slice(&flags.to_le_bytes());
-                            n + usbnet::ax::TX_HDR_LEN
-                        }
-                        None => break,
-                    }
-                } else {
-                    match usbnet::next_tx(buf) { Some(n) => n, None => break }
-                }
-            };
-            match self.usbnet_tx_stage(slot, out_dci, tx_phys, n as u32, !ax) {
-                Ok(1) | Ok(13) => usbnet::note_tx_done(),
-                Ok(code) => { usbnet::note_error(code); break; }
-                Err(()) => { usbnet::note_error(0); break; }
+        // ── TX (NETCLOCK M3): reap the in-flight TD, then issue at most one more; asynchronous, one TD in flight. ──
+        if let Some(code) = usbnet::tx_take_done() {
+            match code {
+                1 | 13 => usbnet::note_tx_done(),
+                c => usbnet::note_error(c),
             }
-            sent += 1;
+        }
+        if usbnet::tx_inflight() || !usbnet::tx_pending() {
+            return;
+        }
+        let ax = usbnet::kind() == usbnet::KIND_AX88179;
+        let n = {
+            let buf = unsafe { core::slice::from_raw_parts_mut(tx_phys as *mut u8, usbnet::FRAME_CAP + usbnet::ax::TX_HDR_LEN) };
+            if ax {
+                // 8-byte header ahead of the frame: [len][flags], the pad flag when the transfer
+                // would end exactly on a max packet (the part then pads instead of a ZLP).
+                match usbnet::next_tx(&mut buf[usbnet::ax::TX_HDR_LEN..]) {
+                    Some(n) => {
+                        let mps = usbnet::out_mps() as usize;
+                        let flags = if mps != 0 && (n + usbnet::ax::TX_HDR_LEN) % mps == 0 { usbnet::ax::TX_PAD_FLAG } else { 0 };
+                        buf[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+                        buf[4..8].copy_from_slice(&flags.to_le_bytes());
+                        n + usbnet::ax::TX_HDR_LEN
+                    }
+                    None => return,
+                }
+            } else {
+                match usbnet::next_tx(buf) { Some(n) => n, None => return }
+            }
+        };
+        match self.usbnet_tx_issue(slot, out_dci, tx_phys, n as u32, !ax) {
+            Ok(trb) => usbnet::tx_arm(out_dci, trb),
+            Err(()) => usbnet::note_error(0),
         }
     }
 
@@ -17500,10 +17519,11 @@ impl XhciController {
         usbnet::set_up(slot, phy_ok, None); // USBNET6 M1: the per-register `[usbnet] reg` lines above replace the bring-up `regs` dump
     }
 
-    /// One frame as one TD on the bulk-OUT ring, awaited. A frame whose length is a multiple of the
-    /// OUT max packet size gets a chained zero-length TRB so the device sees the short packet that
-    /// ends an ECM frame. Uses the `ftdi_pending` one-outstanding-OUT mechanism (see the block comment).
-    fn usbnet_tx_stage(&mut self, slot_id: u8, out_dci: u8, data_phys: u64, len: u32, zlp_ok: bool) -> Result<u8, ()> {
+    /// NETCLOCK M3: one frame as one TD on the bulk-OUT ring, ISSUED (not awaited): returns the physical address
+    /// of the TD's IOC TRB, which `usbnet::claim` matches on the completion event. A frame whose length is a
+    /// multiple of the OUT max packet size gets a chained zero-length TRB (ECM) so the device sees the short
+    /// packet that ends the frame. No `ftdi_pending`, no pump: the loan is held for the enqueue only.
+    fn usbnet_tx_issue(&mut self, slot_id: u8, out_dci: u8, data_phys: u64, len: u32, zlp_ok: bool) -> Result<u64, ()> {
         dma_coherency::clean(data_phys as usize, len as usize);
         let mps = usbnet::out_mps() as u32;
         let zlp = zlp_ok && mps != 0 && len % mps == 0; // ECM: a chained ZLP; AX88179: its header's pad flag instead
@@ -17520,12 +17540,8 @@ impl XhciController {
                 base + (idx as u64) * 16
             }
         };
-        self.ftdi_pending = Some(FtdiPending { slot_id, out_dci, wait_trb_phys, done: false, completion_code: 0 });
         self.ring_doorbell(slot_id, out_dci as u32);
-        let pump = self.pump_until_ftdi_done();
-        let pending = self.ftdi_pending.take();
-        pump?;
-        Ok(pending.ok_or(())?.completion_code)
+        Ok(wait_trb_phys)
     }
 }
 

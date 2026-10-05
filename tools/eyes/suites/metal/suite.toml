@@ -1,0 +1,16 @@
+# EYES suite `metal` (GLASSEYES, rmbp-ledger B343): the KERNEL's own frames. Each case's SUBJECT is a PNG the
+# kernel's `shot <state>` verb wrote to /home/<u>/Shots/ on the card (pulled off by the bench), its ORACLE the
+# golden of that state under golden/, its mask the `<STEM>.MSK` PNG the kernel wrote beside it (white = masked).
+# Placeholders: {from} = the directory given to `run.sh metal --from <dir>`, {suite} = this directory.
+# No build step: nothing here renders, it only scores what the metal drew.
+build = []
+
+[defaults]
+# The rMBP panel. A subject of another size is scored on the golden's canvas (EYES's rule) and noted.
+width = 2880
+height = 1800
+
+[gate]
+# A state fails the gate when more than this % of its UNMASKED pixels differ (channel delta > 40, EYES's
+# PIXEL_TOL). The golden IS the baseline for this suite, so the gate is a threshold, not a baseline delta.
+max_mismatch = 0.5

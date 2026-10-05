@@ -57,6 +57,8 @@ struct State {
     w: usize,
     h: usize,
     surf: Vec<u32>,
+    /// QUARRY2 (B336): styled ranges of `text` from a renderer (`richtext`); empty = plain text.
+    spans: Vec<richtext::Span>,
 }
 
 /// What [`layout`] found.
@@ -138,8 +140,43 @@ pub fn request_open(path: &str) {
     *PENDING.lock() = Some(String::from(path));
 }
 
+/// QUARRY2 (B336): latch `path` to open with renderer `kind` (`"markdown"` / `"json"`).
+pub fn request_open_styled(path: &str, kind: &str) {
+    *PENDING_STYLED.lock() = Some((String::from(path), String::from(kind)));
+}
+static PENDING_STYLED: spin::Mutex<Option<(String, String)>> = spin::Mutex::new(None);
+
+/// QUARRY2 (B336): open `path` rendered by `kind` — read, sanitise, render, then the one window body.
+pub fn open_styled(path: &str, kind: &str) -> Result<(usize, usize, usize, usize), String> {
+    let (raw, trunc) = read_capped(path)?;
+    let clean = sanitize(&raw);
+    let r = richtext::render(kind, &clean);
+    let mut text: Vec<u8> = Vec::new();
+    let mut spans = r.spans;
+    if let Some(why) = r.note {
+        let head = alloc::format!("({} shown as written: {})\n", kind, why);
+        let n = head.len() as u32;
+        for sp in spans.iter_mut() {
+            sp.start += n;
+            sp.end += n;
+        }
+        spans.insert(0, richtext::Span { start: 0, end: n - 1, tint: richtext::Tint::Dim, bold: false });
+        text.extend_from_slice(head.as_bytes());
+    }
+    text.extend_from_slice(&r.text);
+    serial_println!("[fileview] render path={} kind={} spans={} note={}", path, kind, spans.len(), r.note.unwrap_or("-"));
+    open_inner(path, text, spans, raw.len(), trunc)
+}
+
 /// Drain the latch. Chained from `quarry::live::service`.
 pub fn service() {
+    let styled = PENDING_STYLED.lock().take();
+    if let Some((p, k)) = styled {
+        match open_styled(&p, &k) {
+            Ok(_) => serial_println!("[quarry] open TEXT consumed=viewer render={} path={}", k, p),
+            Err(e) => serial_println!("[fileview] refuse path={} render={} reason={}", p, k, e),
+        }
+    }
     let want = PENDING.lock().take();
     if let Some(p) = want {
         match open(&p) {
@@ -183,8 +220,12 @@ pub fn open(path: &str) -> Result<(usize, usize, usize, usize), String> {
 
 /// [`open`]'s body over bytes already in hand (also the fixture's fallback door).
 pub fn open_bytes(path: &str, raw: &[u8], truncated: bool) -> Result<(usize, usize, usize, usize), String> {
-    let mut text = sanitize(raw);
-    let n_bytes = raw.len();
+    open_inner(path, sanitize(raw), Vec::new(), raw.len(), truncated)
+}
+
+/// The one window body over drawable text (and its styled ranges, QUARRY2).
+fn open_inner(path: &str, text: Vec<u8>, spans: Vec<richtext::Span>, n_bytes: usize, truncated: bool) -> Result<(usize, usize, usize, usize), String> {
+    let mut text = text;
     if truncated {
         if !text.is_empty() && *text.last().unwrap() != b'\n' {
             text.push(b'\n');
@@ -228,6 +269,7 @@ pub fn open_bytes(path: &str, raw: &[u8], truncated: bool) -> Result<(usize, usi
         w,
         h,
         surf,
+        spans,
     };
     paint(&mut st);
     let base = st.surf.as_ptr() as usize;
@@ -271,6 +313,10 @@ fn paint(st: &mut State) {
     }
     for r in 0..st.vis {
         let Some(&(a, b)) = st.rows.get(st.top + r) else { break };
+        if !st.spans.is_empty() {
+            paint_styled_row(st, a as usize, b as usize, PAD + r * ch); // QUARRY2 (B336)
+            continue;
+        }
         let s = &st.text[a as usize..b as usize];
         font::draw_text(&mut st.surf, w, w - 6, h, PAD, PAD + r * ch, s, theme::CONTENT_TEXT, false, face);
     }
@@ -425,3 +471,41 @@ pub fn selftest() {
 pub fn open_text(title: &str, text: &str) -> Result<(usize, usize, usize, usize), String> {
     open_bytes(title, text.as_bytes(), false)
 }
+
+// ── QUARRY2 (B336): styled rows ─────────────────────────────────────────────────────────────────
+
+/// The colour of a renderer tint (`richtext` names what a range IS; the theme says how it looks).
+fn tint_ink(t: richtext::Tint) -> u32 {
+    use richtext::Tint;
+    match t {
+        Tint::Plain | Tint::Punct => theme::CONTENT_TEXT,
+        Tint::Heading | Tint::Key => theme::ACCENT,
+        Tint::Dim | Tint::Quote => theme::TITLE_TEXT_INACTIVE,
+        Tint::Code | Tint::Str => 0x0020_8040,
+        Tint::Num => 0x00B0_5000,
+        Tint::Lit => 0x0080_30A0,
+    }
+}
+
+/// Draw display row `a..b` of `st.text` at `y`, cut at span edges (monospace: x = column).
+fn paint_styled_row(st: &mut State, a: usize, b: usize, y: usize) {
+    let face = font::Face::Body;
+    let cw = face.cell_w();
+    let (w, h) = (st.w, st.h);
+    let mut p = a;
+    while p < b {
+        let k = st.spans.partition_point(|s| (s.end as usize) <= p);
+        let (end, ink, bold) = match st.spans.get(k) {
+            Some(s) if (s.start as usize) <= p => ((s.end as usize).min(b), tint_ink(s.tint), s.bold),
+            Some(s) => ((s.start as usize).min(b), theme::CONTENT_TEXT, false),
+            None => (b, theme::CONTENT_TEXT, false),
+        };
+        let end = end.max(p + 1);
+        font::draw_text(&mut st.surf, w, w - 6, h, PAD + (p - a) * cw, y, &st.text[p..end], ink, bold, face);
+        p = end;
+    }
+}
+
+// QUARRY2 (B336): the Markdown and JSON renderers — a child module (no `video/mod.rs` line).
+#[path = "richtext.rs"]
+pub mod richtext;

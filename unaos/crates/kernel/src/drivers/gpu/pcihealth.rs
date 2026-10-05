@@ -320,7 +320,7 @@ fn census_line(tag: &str, bus: u8, slot: u8, func: u8, cap: u8, aer: bool) {
             crate::arch::pci::read_config_16(bus, slot, func, cap + 0x0A),
         )
     };
-    serial_println!(
+    crate::census_println!(
         "[pcih] {} bdf={}:{}.{} lnkcap={:08x} lnkctl={:04x} lnksta={:04x} devctl={:04x} devsta={:04x} aspm_en={} aer={}",
         tag, bus, slot, func, lnkcap, lnkctl, lnksta, devctl, devsta,
         aspm_str(lnkctl), if aer { "y" } else { "n" }
@@ -502,7 +502,7 @@ pub fn census(ep_bus: u8, ep_slot: u8, ep_func: u8) {
     // still idling in the scheduler. The novel exposure was the ~1 kHz runtime path, and that is
     // what this closes.
     if rp_ecam == 0 {
-        serial_println!(
+        crate::census_println!(
             "[pcih] rp {}:{}.{} — no verified ecam page; wedge sampler NOT armed (it will not \
              fall back to unlocked CF8/CFC from a non-BSP core)",
             rb, rs, rf

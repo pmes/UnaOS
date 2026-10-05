@@ -136,7 +136,7 @@ pub fn start() {
     }
     WORKERS.store(n, Release);
     READY.store(n > 0, Release);
-    serial_println!(
+    crate::census_println!(
         "[wcpar] pool={} workers={} cpus_online={} reason={}",
         n + 1,
         n,

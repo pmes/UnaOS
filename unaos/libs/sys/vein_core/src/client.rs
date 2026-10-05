@@ -38,6 +38,9 @@ pub struct Outcome {
     pub text_bytes: usize,
     pub retry_after: Option<u32>,
     pub fail: Option<Fail>,
+    /// LUMENUX M5: the stream's usage counts (`None` when the stream carried none).
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
 }
 
 enum Body<'b> {
@@ -48,7 +51,7 @@ enum Body<'b> {
 /// Run one request. `rx` is the receive buffer (it must hold the whole response head; 2 KiB is ample),
 /// `line` the stream decoder's line buffer (also the error body's buffer on a non-200).
 pub fn exchange<T: Transport + ?Sized>(t: &mut T, head: &[u8], body: &[u8], rx: &mut [u8], line: &mut [u8], on: &mut dyn FnMut(Event<'_>)) -> Outcome {
-    let mut out = Outcome { status: 0, stop: None, text_bytes: 0, retry_after: None, fail: None };
+    let mut out = Outcome { status: 0, stop: None, text_bytes: 0, retry_after: None, fail: None, input_tokens: None, output_tokens: None };
     if let Err(e) = t.send_all(head).and_then(|_| t.send_all(body)) {
         out.fail = Some(Fail::Send(e));
         return out;
@@ -126,6 +129,8 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, head: &[u8], body: &[u8], rx: 
             d.finish(on);
             out.stop = d.stop;
             out.text_bytes = d.text_bytes;
+            out.input_tokens = d.input_tokens;
+            out.output_tokens = d.output_tokens;
             if out.fail.is_none() {
                 out.fail = if framing_bad {
                     Some(Fail::Framing)
@@ -207,7 +212,7 @@ mod tests {
             assert_eq!(sent, b"HEADBODY");
             assert_eq!(text, "Hi from Claude", "step {step}");
             assert!(errs.is_empty());
-            assert_eq!(o, Outcome { status: 200, stop: Some(Stop::EndTurn), text_bytes: 14, retry_after: None, fail: None });
+            assert_eq!(o, Outcome { status: 200, stop: Some(Stop::EndTurn), text_bytes: 14, retry_after: None, fail: None, input_tokens: None, output_tokens: None });
         }
     }
 

@@ -91,6 +91,9 @@ pub struct ElfPlan {
     pub stack: usize,
     /// RING3WIN: the elf model's highest segment end (window offset) — the heap starts at the next page.
     pub max_end: u64,
+    /// STORMFAULT (B351): the `elf_core` plan's fault map (bss tails, stack + guard; window offsets) — what
+    /// the ring-3 fault line names `seg=` from once the image is placed.
+    pub fmap: elf_core::FaultMap,
 }
 
 /// RING3WIN: `PT_GNU_STACK` — its p_memsz (set by `-z stack-size=`) is the elf model's stack request.
@@ -255,7 +258,8 @@ pub fn validate_elf(b: &[u8], win_size: usize) -> Result<ElfPlan, &'static str> 
     if !entry_in_exec {
         return Err("entry not in an executable segment");
     }
-    Ok(ElfPlan { entry: e_entry, min_vaddr, segs, nsegs, model_elf: false, stack: 0, max_end: 0 })
+    let fmap = stormfault_plan(&segs[..nsegs], min_vaddr, stack_req, false)?;
+    Ok(ElfPlan { entry: e_entry, min_vaddr, segs, nsegs, model_elf: false, stack: 0, max_end: 0, fmap })
 }
 
 /// RING3WIN: the elf-model half of [`validate_elf`] — every segment (p_vaddr = absolute VA in the ELF
@@ -302,7 +306,8 @@ fn validate_elf_model(
     if !entry_in_exec {
         return Err("entry not in an executable segment");
     }
-    Ok(ElfPlan { entry: e_entry, min_vaddr, segs, nsegs, model_elf: true, stack, max_end })
+    let fmap = stormfault_plan(&segs[..nsegs], 0, stack_req, true)?;
+    Ok(ElfPlan { entry: e_entry, min_vaddr, segs, nsegs, model_elf: true, stack, max_end, fmap })
 }
 
 /// The result of [`map_image_into_slot`]: the ring-3 run parameters.
@@ -420,6 +425,7 @@ pub fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
             (base, 1, false)
         }
     };
+    seg_map_set(slot, elf_plan.as_ref().map_or(elf_core::FaultMap::NONE, |p| p.fmap)); // STORMFAULT: flat = no map
     // RING3WIN: a fixed-model program's heap is the whole ELF window (its stack stays in the classic one).
     unsafe { memory::xwin_free(slot) };
     memory::xwin_set_heap(slot, memory::XWIN_OFF as u64, (memory::XWIN_OFF + memory::XWIN_BYTES) as u64);
@@ -480,6 +486,7 @@ fn map_elf_model(bytes: &[u8], plan: &ElfPlan) -> Result<Mapped, MapErr> {
     }
     let heap_lo = (plan.max_end + pg - 1) & !(pg - 1);
     memory::xwin_set_heap(slot, heap_lo, stack_lo - pg);
+    seg_map_set(slot, plan.fmap); // STORMFAULT
     serial_println!(
         ":: RING3WIN: model=elf slot={} segs={} span={} stack={} heap=[{:#x},{:#x}) frames={} ::",
         slot, plan.nsegs, plan.max_end - plan.min_vaddr, plan.stack, base + heap_lo, base + stack_lo - pg,
@@ -515,3 +522,192 @@ const _: () = assert!(
         && midden_core::APP_FLAG_RESIDENT == una_abi::APP_FLAG_RESIDENT
         && midden_core::APP_NOTE_NAME.len() == una_abi::APP_NOTE_NAME.len()
 );
+
+// =================================================================================================
+// STORMFAULT (rmbp-ledger B351): the segment plan and the fault line's `seg=` word.
+//
+// Both models already map every PT_LOAD's full p_memsz zero-filled (the fixed model scrubs the classic
+// window and zeroes each memsz; the elf model maps every page of [vaddr, vaddr+memsz) from zeroed heap
+// frames) and the elf model honours PT_GNU_STACK. What this adds, through `elf_core::plan` (the shared
+// core the host tests run over VUG.ELF's and LUMEN.ELF's real headers): the refusals the per-model checks
+// above do not make — segments overlapping each other, a segment or stack over the args page, a fixed-model
+// PT_GNU_STACK that would land on the bss — each a NAMED error and a `:: STORMFAULT: refused` line instead of
+// a ring-3 fault; and the per-slot fault map, so a ring-3 #PF names what it hit. Design + witness:
+// docs/dev/evidence/rmbp-1005/STORMFAULT.md.
+// =================================================================================================
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+// The core restates these (it takes no dependencies); they ARE the ABI's, or this does not build.
+const _: () = assert!(elf_core::PT_GNU_STACK == PT_GNU_STACK && elf_core::PF_W == PF_W && elf_core::PF_X == PF_X && elf_core::MAX_SEGS == MAX_LOAD_SEGS);
+
+/// Run the shared plan over validated segments. `rebase` is subtracted from each vaddr (the fixed model's
+/// min_vaddr; 0 for the elf model, whose segments are already window offsets).
+fn stormfault_plan(segs: &[ElfSeg], rebase: u64, stack_req: usize, elf: bool) -> Result<elf_core::FaultMap, &'static str> {
+    let mut v = [elf_core::Seg::default(); MAX_LOAD_SEGS];
+    for (d, s) in v.iter_mut().zip(segs) {
+        *d = elf_core::Seg { vaddr: s.vaddr - rebase, filesz: s.filesz as u64, memsz: s.memsz as u64, flags: s.flags };
+    }
+    let w = elf_core::Window {
+        lo: if elf { memory::XWIN_OFF as u64 } else { 0 },
+        hi: if elf { (memory::XWIN_OFF + memory::XWIN_BYTES) as u64 } else { super::syscall::user_window_size() as u64 },
+        args: elf_core::Range { lo: una_abi::USER_ARGS_OFF, hi: una_abi::USER_ARGS_OFF + una_abi::USER_ARGS_BYTES as u64 },
+        elf,
+        refuse_overlap: elf,
+        stack_default: una_abi::USER_STACK_DEFAULT,
+        stack_max: una_abi::USER_STACK_MAX,
+    };
+    match elf_core::plan(&v[..segs.len()], stack_req as u64, &w) {
+        Ok(p) => {
+            static LINES: AtomicU64 = AtomicU64::new(0);
+            if LINES.fetch_add(1, Ordering::Relaxed) < 32 {
+                serial_println!(
+                    ":: STORMFAULT: plan model={} segs={} bss={} stack=[{:#x},{:#x}) guard={} ::",
+                    if elf { "elf" } else { "fixed" }, segs.len(), p.bss_bytes(), p.stack.lo, p.stack.hi, !p.guard.is_empty()
+                );
+            }
+            Ok(p.fault_map())
+        }
+        Err(e) => {
+            serial_println!(":: STORMFAULT: refused model={} reason={} ::", if elf { "elf" } else { "fixed" }, e.word());
+            Err(e.as_str())
+        }
+    }
+}
+
+const SEGMAP_WORDS: usize = 6;
+#[allow(clippy::declare_interior_mutable_const)]
+const Z: AtomicU64 = AtomicU64::new(0);
+#[allow(clippy::declare_interior_mutable_const)]
+const ZROW: [AtomicU64; SEGMAP_WORDS] = [Z; SEGMAP_WORDS];
+/// Per slot: bss0 lo/hi, bss1 lo/hi, stack lo/hi (window offsets). All-zero = nothing to name.
+static SEGMAP: [[AtomicU64; SEGMAP_WORDS]; memory::USER_SLOTS] = [ZROW; memory::USER_SLOTS];
+
+fn seg_map_set(slot: usize, m: elf_core::FaultMap) {
+    let Some(row) = SEGMAP.get(slot) else { return };
+    let w = [m.bss[0].lo, m.bss[0].hi, m.bss[1].lo, m.bss[1].hi, m.stack.lo, m.stack.hi];
+    for (a, v) in row.iter().zip(w) {
+        a.store(v, Ordering::Release);
+    }
+}
+
+/// STORMFAULT: forget a slot's map (its teardown; a fixture that builds a slot by hand names nothing).
+pub fn seg_map_clear(slot: usize) {
+    seg_map_set(slot, elf_core::FaultMap::NONE);
+}
+
+/// STORMFAULT: the `seg=` word for a ring-3 fault at `cr2` in the CURRENT slot: `bss`, `stack` (guard
+/// included), or `none`. Lock-free (the fault handler's context): reads the live CR3's slot and six atomics.
+pub fn fault_seg(cr2: u64) -> &'static str {
+    let Some(slot) = memory::current_slot() else { return "none" };
+    let Some(off) = cr2.checked_sub(super::syscall::user_base()) else { return "none" };
+    let r = &SEGMAP[slot];
+    let g = |i: usize| r[i].load(Ordering::Acquire);
+    let m = elf_core::FaultMap {
+        bss: [elf_core::Range { lo: g(0), hi: g(1) }, elf_core::Range { lo: g(2), hi: g(3) }],
+        stack: elf_core::Range { lo: g(4), hi: g(5) },
+    };
+    elf_core::classify(&m, off).as_str()
+}
+
+/// STORMFAULT: the `tests elfbss` image — an elf-model ELF64 built in place (no staging): a text page at
+/// the ELF window base, a 64 KiB `.bss` (filesz 0, memsz 64 KiB) one page above it, and PT_GNU_STACK 64 KiB.
+/// The program writes 0x5A to the LAST bss byte, reads it back, reads the first and middle bss bytes (zero
+/// iff the loader zero-filled), and exits with `first | middle | (last ^ 0x5A)` — 0 is the only pass.
+fn elfbss_image(bss: u64) -> alloc::vec::Vec<u8> {
+    const CODE_OFF: usize = 0x100;
+    let xwin = una_abi::USER_XWIN_VA_X86;
+    let (first, mid, last) = (xwin + 0x1000, xwin + 0x1000 + bss / 2, xwin + 0x1000 + bss - 1);
+    let mut code: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, last
+    code.extend_from_slice(&last.to_le_bytes());
+    code.extend_from_slice(&[0xC6, 0x00, 0x5A]); // mov byte [rax], 0x5A
+    code.extend_from_slice(&[0x48, 0xB9]); // movabs rcx, first
+    code.extend_from_slice(&first.to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0xB6, 0x39]); // movzx edi, byte [rcx]
+    code.extend_from_slice(&[0x48, 0xB9]); // movabs rcx, mid
+    code.extend_from_slice(&mid.to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0xB6, 0x11]); // movzx edx, byte [rcx]
+    code.extend_from_slice(&[0x09, 0xD7]); // or edi, edx
+    code.extend_from_slice(&[0x0F, 0xB6, 0x10]); // movzx edx, byte [rax]
+    code.extend_from_slice(&[0x83, 0xF2, 0x5A]); // xor edx, 0x5A
+    code.extend_from_slice(&[0x09, 0xD7]); // or edi, edx
+    code.extend_from_slice(&[0xB8]); // mov eax, SYS_EXIT
+    code.extend_from_slice(&(una_abi::SYS_EXIT as u32).to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0x05, 0x0F, 0x0B]); // syscall; ud2
+    let tlen = CODE_OFF + code.len();
+    let mut img = alloc::vec![0u8; tlen];
+    img[0..4].copy_from_slice(&ELF_MAGIC);
+    img[4] = ELFCLASS64;
+    img[5] = ELFDATA2LSB;
+    img[6] = 1;
+    img[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+    img[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+    img[20..24].copy_from_slice(&1u32.to_le_bytes());
+    img[24..32].copy_from_slice(&(xwin + CODE_OFF as u64).to_le_bytes());
+    img[32..40].copy_from_slice(&(EHDR_SIZE as u64).to_le_bytes());
+    img[52..54].copy_from_slice(&(EHDR_SIZE as u16).to_le_bytes());
+    img[54..56].copy_from_slice(&(PHDR_SIZE as u16).to_le_bytes());
+    img[56..58].copy_from_slice(&3u16.to_le_bytes());
+    let mut ph = |i: usize, t: u32, f: u32, va: u64, fs: u64, ms: u64| {
+        let p = EHDR_SIZE + i * PHDR_SIZE;
+        img[p..p + 4].copy_from_slice(&t.to_le_bytes());
+        img[p + 4..p + 8].copy_from_slice(&f.to_le_bytes());
+        img[p + 16..p + 24].copy_from_slice(&va.to_le_bytes());
+        img[p + 24..p + 32].copy_from_slice(&va.to_le_bytes());
+        img[p + 32..p + 40].copy_from_slice(&fs.to_le_bytes());
+        img[p + 40..p + 48].copy_from_slice(&ms.to_le_bytes());
+        img[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    };
+    ph(0, PT_LOAD, 5, xwin, tlen as u64, tlen as u64);
+    ph(1, PT_LOAD, 6, xwin + 0x1000, 0, bss);
+    ph(2, PT_GNU_STACK, 6, 0, 0, 64 << 10);
+    img[CODE_OFF..].copy_from_slice(&code);
+    img
+}
+
+/// STORMFAULT `tests elfbss` (rmbp-ledger B351): the 64 KiB-bss program runs to `exit 0` through the real
+/// launcher; its plan names the last bss byte `bss`; a window-leaving bss and a fixed-model PT_GNU_STACK on
+/// top of the bss are refused by name. Verdict:
+/// `:: STORMFAULT: elfbss bss=65536 exit=<n|fault|timeout> seg_last=<..> refuse_window=<0|1> refuse_stack=<0|1> -> PASS|FAIL ::`.
+pub fn elfbss_selftest() {
+    const BSS: u64 = 64 << 10;
+    let img = elfbss_image(BSS);
+    let seg_last = match validate_elf(&img, super::syscall::user_window_size()) {
+        Ok(p) => elf_core::classify(&p.fmap, memory::XWIN_OFF as u64 + 0x1000 + BSS - 1).as_str(),
+        Err(e) => {
+            serial_println!(":: STORMFAULT: elfbss image refused: {} -> FAIL ::", e);
+            return;
+        }
+    };
+    let exit = match super::syscall::run_user_image_argv("elfbss", &img, 2000, &["elfbss"]) {
+        Ok((super::syscall::RunOutcome::Exited(s), _)) => Some(s),
+        Ok((super::syscall::RunOutcome::Faulted, _)) => { serial_println!("[elfbss] run: fault"); None }
+        Ok((super::syscall::RunOutcome::Timeout, _)) => { serial_println!("[elfbss] run: timeout"); None }
+        Err(e) => { serial_println!("[elfbss] run refused: {}", e); None }
+    };
+    // A bss that runs past the window's end.
+    let refuse_window = validate_elf(&elfbss_image(memory::XWIN_BYTES as u64), super::syscall::user_window_size()).is_err();
+    // A fixed-model image (linked at 0) whose PT_GNU_STACK would cover its own bss: text page, bss
+    // [0x1000, 0x3800), stack request 0x1000 -> sp_lo 0x3000 < 0x3800.
+    let mut fixed = elfbss_image(0x2800);
+    let xwin = una_abi::USER_XWIN_VA_X86;
+    for i in 0..3 {
+        let p = EHDR_SIZE + i * PHDR_SIZE + 16;
+        let va = u64::from_le_bytes(fixed[p..p + 8].try_into().unwrap_or([0; 8]));
+        if va >= xwin {
+            fixed[p..p + 8].copy_from_slice(&(va - xwin).to_le_bytes());
+        }
+    }
+    let e = u64::from_le_bytes(fixed[24..32].try_into().unwrap_or([0; 8])) - xwin;
+    fixed[24..32].copy_from_slice(&e.to_le_bytes());
+    let gs = EHDR_SIZE + 2 * PHDR_SIZE + 40;
+    fixed[gs..gs + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+    let refuse_stack = matches!(validate_elf(&fixed, super::syscall::user_window_size()), Err(m) if m == elf_core::PlanErr::StackOverlapsImage.as_str());
+    let pass = exit == Some(0) && seg_last == "bss" && refuse_window && refuse_stack;
+    let ex: alloc::string::String = match exit { Some(s) => alloc::format!("{}", s), None => "fault-or-timeout".into() };
+    serial_println!(
+        ":: STORMFAULT: elfbss bss={} exit={} seg_last={} refuse_window={} refuse_stack={} -> {} ::",
+        BSS, ex, seg_last, refuse_window as u8, refuse_stack as u8, if pass { "PASS" } else { "FAIL" }
+    );
+}
