@@ -1,0 +1,9 @@
+# INFERCORE (SR57) — external vectors, fetched at test time (never committed), sha256-pinned.
+# Tests skip (with a SKIP line) when offline. Fetched into <workspace>/target/infer_core-vectors/
+# (override: INFER_CORE_VECTORS=<dir>).
+#
+# name | url | sha256 | what
+minilm-onnx | https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz | 913d7300ceae3b2dbc2c50d1de4baacab4be7b9380491c27fab7418616a16ec3 | all-MiniLM-L6-v2 (sentence-transformers, Apache-2.0) as Chroma publishes it: model.onnx (f32 weights), tokenizer.json, vocab.txt, config.json — the same archive tools/una-models installs. huggingface.co is refused by this container's egress proxy (CONNECT 403), so the canonical model.safetensors cannot be pinned from here.
+minilm-f16 | https://registry.npmjs.org/@lat.md/embed-minilm-fp16/-/embed-minilm-fp16-0.1.0.tgz | 657e85d82d3cad4248d6a6727cd46e6003474cfbbc5c94e469c2e9a02057ee3b | the same model's HF-layout weights as an F16 model.safetensors (npm @lat.md/embed-minilm-fp16 0.1.0, Apache-2.0); tests/oracle.rs proves every F16 tensor equals the round-to-nearest-even of the ONNX f32 weight, so its provenance is checked, not trusted.
+ucd-8.0.0 | https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/8.0.0-Update/UnicodeData.txt | 38b17e1118206489a7e0ab5d29d7932212d38838df7d3ec025ecb58e8798ec20 | input of tools/gen_unicode.py (general categories)
+ucd-9.0.0 | https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/9.0.0-Update/UnicodeData.txt | 68dfc414d28257b9b5d6ddbb8b466c768c00ebdf6cbf7784364a9b6cad55ee8f | input of tools/gen_unicode.py (NFD)

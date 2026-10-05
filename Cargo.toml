@@ -37,6 +37,9 @@ members = [
     # HTTPCORE (SR51): the no_std HTTP client core (URL, HTTP/1.1, cookies, codings, h2) + its host transport.
     "unaos/libs/net/http_core",
 
+    # INFERCORE (SR57): the no_std inference core (safetensors/ONNX readers, BERT tokenizer + encoder), zero deps.
+    "unaos/libs/ml/infer_core",
+
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",

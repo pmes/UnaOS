@@ -1,34 +1,23 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
 //! A minimal ONNX initializer reader (EMBED, B317).
 //!
 //! Reads the weight tensors (`GraphProto.initializer`) and the node list
 //! (`GraphProto.node`: op type, inputs, outputs) out of an ONNX `ModelProto`
 //! with a hand-written protobuf walk — no `protoc`, no generated code (the
-//! reason: `candle-onnx` needs `protoc` at build time). `core` + `alloc`
-//! shaped (a byte slice in, owned values out) so the metal forward pass can
-//! reuse it.
+//! reason: `candle-onnx` needs `protoc` at build time). A byte slice in,
+//! owned values out. Moved here from gneiss_pal (EMBED, B317) by INFERCORE.
 //!
 //! Fields read (onnx.proto3): ModelProto.graph = 7; GraphProto.node = 1,
 //! initializer = 5; NodeProto.input = 1, output = 2, op_type = 4;
 //! TensorProto.dims = 1, data_type = 2 (1 = FLOAT), float_data = 4,
 //! name = 8, raw_data = 9, data_location = 14 (1 = EXTERNAL: refused).
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use alloc::{format, vec};
 
 /// A float tensor: row-major `data` with shape `dims`.
 #[derive(Debug, Clone, PartialEq)]
@@ -161,8 +150,8 @@ fn parse_tensor(b: &[u8]) -> Result<Option<(String, Tensor)>, String> {
         Some(s) => s.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
         None => floats,
     };
-    let want: usize = dims.iter().product();
-    if data.len() != want {
+    let want = dims.iter().try_fold(1usize, |a, &d| a.checked_mul(d));
+    if want != Some(data.len()) {
         return Err(format!("tensor {name}: {} values for shape {dims:?}", data.len()));
     }
     Ok(Some((name, Tensor { dims, data })))
@@ -239,6 +228,7 @@ pub fn name_linear_weights(g: &mut Graph) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn key(field: u64, wire: u64) -> u8 {
         ((field << 3) | wire) as u8

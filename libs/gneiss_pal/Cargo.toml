@@ -8,10 +8,14 @@ license = "LGPL-3.0-or-later"
 default = ["std"]
 std = ["dep:http_core", "tokio", "futures-core", "futures-util"]
 # EMBED (B317): the in-process local embedder (all-MiniLM-L6-v2 on candle, CPU).
+std = ["reqwest", "octocrab", "tokio", "futures-core", "futures-util"]
+# EMBED (B317): the in-process local embedder (all-MiniLM-L6-v2 on the CPU) — since INFERCORE (SR57)
+# run by UnaOS's own `infer_core` (no_std, zero deps); the candle crates are gone.
+
 # PLAYBACK (SR26): AVCODEC's AV1 decoder (`unaos/libs/media/av1_core`, LEDGER SR24) behind
 # `dsp::video::av1` (folded on host-merge1: the real adapter, key + intra-only frames today).
 av1 = ["dep:av1_core"]
-local-embed = ["std", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:unicode-normalization"]
+local-embed = ["std", "dep:infer_core"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -34,11 +38,9 @@ audio_core = { path = "../../unaos/libs/media/audio_core" }
 av1_core = { path = "../../unaos/libs/media/av1_core", optional = true, features = ["std"] }
 # PIXELCORE (SR25): the still-image decoders UnaOS owns (no_std, zero deps) — re-exported as `dsp::image`.
 pixel_core = { path = "../../unaos/libs/media/pixel_core" }
-# EMBED (B317): the local embedder — candle on the CPU (BERT), NFD for the WordPiece normaliser.
-candle-core = { version = "0.11", optional = true }
-candle-nn = { version = "0.11", optional = true }
-candle-transformers = { version = "0.11", optional = true }
-unicode-normalization = { version = "0.1", optional = true }
+# INFERCORE (SR57): the local embedder's inference core — safetensors/ONNX readers, the BERT tokenizer
+# and encoder, written in UnaOS (`no_std`, zero dependencies).
+infer_core = { path = "../../unaos/libs/ml/infer_core", optional = true, features = ["std"] }
 
 # PLAYBACK (SR26): the container core `dsp::demux` re-exports (`no_std`, no dependencies).
 demux_core = { path = "../../unaos/libs/media/demux_core" }
