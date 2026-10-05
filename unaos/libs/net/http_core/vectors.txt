@@ -13,3 +13,8 @@ http-state https://raw.githubusercontent.com/abarth/http-state/155e45c6168e6de2e
 # idna: the same WPT commit's url/resources/IdnaTestV2.json (UTS #46 conformance through the URL parser) — a
 # MEASURE of the IDNA ceiling (the full mapping table / NFC / Bidi are owed), floor-gated at today's count.
 idna https://raw.githubusercontent.com/web-platform-tests/wpt/564b9b1eb1387ef42456f1cba77d2d38599fad61/url/resources/IdnaTestV2.json 84de621e5239676e59e5a3e68ef3e2b1acde9da5480a633d2ef446ef03238b76
+# hpack: http2jp/hpack-test-case 8a1406e7d14bfcb6c046021f13cc15cfb162726d — the 159 story files named in
+# tests/hpack.list (nghttp2, go-hpack, nghttp2-change-table-size, swift-nio-hpack-plain-text, python-hpack:
+# five independent encoders, Huffman and plain, table-size changes), ~20 MB, fetched one by one from this base;
+# sha256 over "<path>\n<bytes>" in list order.
+hpack https://raw.githubusercontent.com/http2jp/hpack-test-case/8a1406e7d14bfcb6c046021f13cc15cfb162726d/ eafd9dbc5cf8bb225e48ea6dfc66ad2f07fa08971f0cf4f9ca6a1fff6d6aef4f

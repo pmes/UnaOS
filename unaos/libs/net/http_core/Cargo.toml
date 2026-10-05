@@ -28,3 +28,11 @@ tls_core = { path = "../../sys/tls_core", optional = true, features = ["cryptoco
 [[test]]
 name = "host_e2e"
 required-features = ["host"]
+
+[[test]]
+name = "h2_kats"
+required-features = ["h2"]
+
+[[test]]
+name = "h2_e2e"
+required-features = ["h2", "host"]
