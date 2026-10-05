@@ -695,7 +695,7 @@ fn open_as(state: State) {
         crate::splash::hold_release("first-screen");
         return;
     }
-    WIN.store(id, Ordering::Relaxed); wm::set_modal_top(id); // LOGINZ (B223): the screen and the alert are the ceiling — a later create or focus-raise cannot pass them (flight 15 §2: "the pw dialog got covered up")
+    WIN.store(id, Ordering::Relaxed); crate::boot::note_screen(true); wm::set_modal_top(id); // LOGINZ (B223): the screen and the alert are the ceiling — a later create or focus-raise cannot pass them (flight 15 §2: "the pw dialog got covered up")
     wm::winid_register_holder(&WIN, "login");
     // Modal over the glass: the console keeps taking glyphs, serial keeps every line, but it stops
     // presenting until the session opens (instgui's rule and reason).
@@ -709,7 +709,7 @@ fn take_down() {
     LOCKED.store(false, Ordering::Relaxed); // SCREENLOCK: the locked mode ends with the row, whichever way it ends
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id != wm::WIN_NONE {
-        wm::clear_modal_top(id); wm::close(id); // LOGINZ (B223): the ceiling goes with the row
+        crate::boot::note_screen(false); wm::clear_modal_top(id); wm::close(id); // LOGINZ (B223): the ceiling goes with the row
         fbcon::console_present_suspend(false);
     }
     let mut f = FORM.lock();
@@ -722,6 +722,7 @@ fn take_down() {
 
 fn close_into_session() {
     take_down();
+    crate::boot::session_opened(); users::bar_release(); // INSTALLBARE M3 (R86): the Desktop phase begins here — the furniture is re-minted below FIRST; the services open when the shell has launched (or the bound)
     if SWEPT.swap(false, Ordering::AcqRel) {
         super::super::dock::relaunch_furniture(); // LOGOUTDESK: the sweep emptied the desktop — this login's fresh session gets a fresh console and shell (the render bodies drain the latches)
         REIGNITED.fetch_add(1, Ordering::Relaxed);
@@ -933,6 +934,7 @@ pub fn consume_key(c: u8) -> bool {
     // is a key typed into nothing. See [`heal_if_row_gone`]; on every ordinary press this is one
     // mutex take and one relaxed load, and it answers `false`.
     heal_if_row_gone();
+    crate::boot::key_taken(); // INSTALLBARE M2 (R86): `[login] key latency ms=` — the EHCI decode's stamp to here
     if !KEY_SAID.swap(true, Ordering::Relaxed) {
         serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
     }
@@ -2189,4 +2191,53 @@ pub fn font_repaint() {
     if is_open() {
         repaint();
     }
+
+// ── INSTALLBARE (rmbp-ledger B364, R86) ─────────────────────────────────────────────────────────────────────────
+
+/// INSTALLBARE M1: the takeover minted NO furniture (the phase was not Desktop) — owe it, exactly as a sweep does, so
+/// the first Desktop advance (`installer_release`) or the first login (`close_into_session`) mints console + shell.
+pub fn furniture_owed() {
+    SWEPT.store(true, Ordering::Release);
+}
+
+/// INSTALLBARE M4 (GLASSEYES `shot setter` / `shot login`): which form the bare shot put up, so [`shot_bare_close`]
+/// only ever takes down a screen IT opened.
+static SHOT_BARE_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// INSTALLBARE M4: open the setter (`setter = true`: "Set password" for root, as boot 1 shows it) or the login form
+/// ("Log in", as boot 2 shows it) over the session for one capture. `false` when a screen is already up. Typed keys go
+/// into the form and are discarded with it; Enter on the setter would try root's FIRST password, which is refused once
+/// root has one.
+pub fn shot_bare_open(setter: bool) -> bool {
+    if is_open() {
+        return false;
+    }
+    FORM.lock().state = State::Closed;
+    if setter {
+        open_set_password(users::ROOT_NAME, false);
+    } else {
+        open_as(State::Open);
+        repaint();
+    }
+    let ok = is_open();
+    SHOT_BARE_OPEN.store(ok, Ordering::Release);
+    ok
+}
+
+/// INSTALLBARE M4: take the shot's form down, back onto the same session (no login, no logout happened).
+pub fn shot_bare_close() -> bool {
+    if !SHOT_BARE_OPEN.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+    take_down();
+    FORM.lock().state = State::Session;
+    serial_println!("[login] shot form released (the bare shot's own form; the session never ended)");
+    true
+}
+
+/// INSTALLBARE M4: the password field's panel rectangle while the form is up (masked in the golden: the caret blinks).
+pub fn field_rect_panel() -> Option<(usize, usize, usize, usize)> {
+    let (x, y, w, h) = wm::frame_of(WIN.load(Ordering::Relaxed))?;
+    let top = wm::TITLE_H.min(h);
+    Some((x, y + top + (h - top) / 3, w, (h - top) / 3))
 }

@@ -22,6 +22,9 @@ static WITNESSED: AtomicBool = AtomicBool::new(false);
 /// under Peter's "delay in interactivity". The render clock now only STARTS the `net-tick` task (once) and
 /// returns; that task, off the compositor, runs [`tick_body`] on the same 5 s cadence.
 pub fn service_tick() {
+    if !crate::boot::services_gate("net-tick") {
+        return; // INSTALLBARE (R86): no lease, no SNTP before the Desktop's services
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if !NET_TASK.swap(true, Ordering::AcqRel) {

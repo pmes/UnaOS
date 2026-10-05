@@ -1590,6 +1590,9 @@ pub fn app_launched(app: PinnedApp, id: wm::WinId, by: &'static str, tries: u32)
         tries
     );
     APP_LAUNCHES[app.slot()].fetch_add(1, Ordering::Release);
+    if app == PinnedApp::Shell {
+        crate::boot::furniture_ready(); // INSTALLBARE M3 (R86): the shell window is the last furniture the first login mints — the services may start now
+    }
 }
 
 /// APPPIN — **a launch found the app already live and raised it instead** (the scan-to-press race).

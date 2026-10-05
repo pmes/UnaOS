@@ -281,6 +281,9 @@ fn now_ms() -> u64 {
 ///
 ///   `S_PARKED` — returns immediately, forever. Never panics, never blocks boot.
 pub fn service() {
+    if !crate::boot::services_gate("wifi") {
+        return; // INSTALLBARE (R86): no radio probe under the setter or the login screen
+    }
     match STATE.load(Ordering::Relaxed) {
         S_PARKED => (),
         S_START => {

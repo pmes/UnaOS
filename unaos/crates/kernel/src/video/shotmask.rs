@@ -38,7 +38,7 @@ use super::png::PngEncoder;
 use crate::console::Console;
 
 /// The state names `shot` takes (the `settings` state takes a tab after it).
-pub const STATES: [&str; 5] = ["login", "desktop", "quarry", "settings", "lumen"];
+pub const STATES: [&str; 6] = ["login", "desktop", "quarry", "settings", "lumen", "setter"]; // INSTALLBARE M4 (R86): `setter` — and `login` is now the BARE login form, not the lock over the session
 /// The leaf under the session's home the shots land in. 5 characters: a legal 8.3 directory name as written.
 pub const SHOTS_DIR: &str = "Shots";
 /// Settings tabs, in strip order, and their 8.3 stems.
@@ -65,6 +65,8 @@ pub enum State {
     Quarry,
     Settings(usize),
     Lumen,
+    /// INSTALLBARE M4: boot 1's root password setter over an empty desktop.
+    Setter,
 }
 
 /// One masked rectangle, panel pixels, with the kind the witness names.
@@ -91,6 +93,7 @@ pub fn stem(s: State) -> &'static str {
         State::Quarry => "QUARRY",
         State::Settings(t) => TABS.get(t).map(|p| p.1).unwrap_or("SETGEN"),
         State::Lumen => "LUMEN",
+        State::Setter => "SETTER",
     }
 }
 
@@ -102,6 +105,7 @@ pub fn label(s: State) -> String {
         State::Quarry => String::from("quarry"),
         State::Settings(t) => format!("settings-{}", TABS.get(t).map(|p| p.0).unwrap_or("general")),
         State::Lumen => String::from("lumen"),
+        State::Setter => String::from("setter"),
     }
 }
 
@@ -117,6 +121,7 @@ pub fn parse(args: &[&str]) -> Result<State, String> {
         "desktop" => Ok(State::Desktop),
         "quarry" => Ok(State::Quarry),
         "lumen" => Ok(State::Lumen),
+        "setter" => Ok(State::Setter),
         "settings" => {
             let t = args.get(1).copied().unwrap_or("general");
             match TABS.iter().position(|p| p.0.eq_ignore_ascii_case(t)) {
@@ -124,7 +129,7 @@ pub fn parse(args: &[&str]) -> Result<State, String> {
                 None => Err(format!("shot settings: no tab `{}` (general | users | display | about)", t)),
             }
         }
-        _ => Err(String::from("usage: shot <login | desktop | quarry | settings <general|users|display|about> | lumen>")),
+        _ => Err(String::from("usage: shot <login | setter | desktop | quarry | settings <general|users|display|about> | lumen>")),
     }
 }
 
@@ -150,6 +155,13 @@ pub fn mask_table(s: State, pw: usize, ph: usize) -> Vec<MaskRect> {
     }
     if let Some((x, y, w, h)) = super::cursor::live_box_relaxed() {
         push("cursor", (x.saturating_sub(CURSOR_PAD), y.saturating_sub(CURSOR_PAD), w + 2 * CURSOR_PAD, h + 2 * CURSOR_PAD));
+    }
+    // INSTALLBARE M4: the bare forms mask their password field (the caret blinks; the dots are whatever was typed).
+    #[cfg(feature = "login")]
+    if matches!(s, State::Login | State::Setter) {
+        if let Some(r) = super::crystal::login::field_rect_panel() {
+            push("field", r);
+        }
     }
     match s {
         // Quarry lists the home folder: sizes and dates move with every shot written into it. The right 45 % of
@@ -276,9 +288,34 @@ fn wait_until(f: impl Fn() -> bool) -> bool {
 enum Undo {
     None,
     #[cfg(feature = "login")]
+    #[allow(dead_code)] // INSTALLBARE M4: `shot login` composes the bare form now; the lock path stays for a future `shot lock`
     Unlock,
     #[cfg(all(target_arch = "x86_64", feature = "lumen"))]
     Kill(u64, u64),
+    /// INSTALLBARE M4: the bare scene — the windows the shot parked (restored front-most last) and the bar's prior state.
+    #[cfg(feature = "login")]
+    Bare(Vec<super::wm::WinId>, bool),
+}
+
+/// INSTALLBARE M4 (R86): the BARE scene `shot setter` / `shot login` capture — what boot 1 / boot 2 show before any
+/// session: every window parked (minimised, restored after), the bar off and the dock held (`boot::shot_bare`), and
+/// the real form opened over the empty desktop.
+#[cfg(feature = "login")]
+fn bare_compose(setter: bool) -> Result<Undo, String> {
+    let mut parked: Vec<super::wm::WinId> = Vec::new();
+    for id in 1..=super::wm::MAX_WINDOWS as super::wm::WinId {
+        if !super::wm::wl_is_minimised(id) && super::wm::minimise(id).starts_with("parked") {
+            parked.push(id);
+        }
+    }
+    crate::boot::shot_bare(true);
+    let bar = super::menubar::set_enabled(false);
+    super::wm::composite();
+    if !super::crystal::login::shot_bare_open(setter) {
+        undo(Undo::Bare(parked, bar));
+        return Err(String::from("the form refused to open (a screen is already up)"));
+    }
+    Ok(Undo::Bare(parked, bar))
 }
 
 /// The kernel's own windows a state shot closes first, so every state starts from the same desktop.
@@ -316,14 +353,11 @@ fn compose(s: State) -> Result<Undo, String> {
         #[cfg(not(feature = "quarry"))]
         State::Quarry => Err(String::from("quarry is not built (UNAOS_QUARRY=1)")),
         #[cfg(feature = "login")]
-        State::Login => {
-            if !super::crystal::login::shot_lock() {
-                return Err(String::from("the lock screen refused (no session, or the session user has no password)"));
-            }
-            Ok(Undo::Unlock)
-        }
+        State::Login => bare_compose(false), // INSTALLBARE M4 (R86): the golden is boot 2's login form alone (was the lock over the session; `Undo::Unlock` stays for the lock path)
+        #[cfg(feature = "login")]
+        State::Setter => bare_compose(true),
         #[cfg(not(feature = "login"))]
-        State::Login => Err(String::from("login is not built (UNAOS_LOGIN=1)")),
+        State::Login | State::Setter => Err(String::from("login is not built (UNAOS_LOGIN=1)")),
         #[cfg(all(target_arch = "x86_64", feature = "lumen"))]
         State::Lumen => {
             let fs = crate::fs::fat::mount_program_source().map_err(|_| String::from("no program volume"))?;
@@ -353,6 +387,16 @@ fn undo(u: Undo) {
         #[cfg(all(target_arch = "x86_64", feature = "lumen"))]
         Undo::Kill(pid, slot) => {
             let _ = crate::arch::syscall::bg_kill(pid, slot);
+        }
+        #[cfg(feature = "login")]
+        Undo::Bare(parked, bar) => {
+            let _ = super::crystal::login::shot_bare_close();
+            let _ = super::menubar::set_enabled(bar);
+            crate::boot::shot_bare(false);
+            for id in parked.iter() {
+                let _ = super::wm::wl_focus(*id);
+            }
+            super::wm::composite();
         }
     }
 }

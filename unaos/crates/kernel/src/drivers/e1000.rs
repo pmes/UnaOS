@@ -1187,6 +1187,9 @@ pub fn service_net() {
         nic.selftest_tick();
         nic.tcp_tick();
     }
+    if !crate::boot::services_gate("net") {
+        return; // INSTALLBARE (R86): no smoltcp witness, dhcp or idle poll under the setter / the login screen (flight 22: 39 `[net]` lines, 2 s masked recvfroms)
+    }
     // SOCK-1 (knob-on): the smoltcp boot connectivity witness. Runs AFTER the NET_DEVICE guard
     // above is dropped — its blocking ICMP pump short-locks NET_DEVICE per ring op, so holding the
     // lock here would deadlock (spin::Mutex is not reentrant). One-shot; no-op knob-off / no NIC.
