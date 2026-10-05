@@ -21,7 +21,6 @@
 
 pub mod audio_track;
 pub mod avsync;
-pub mod image;
 pub mod video;
 
 /// The still-image core (PIXELCORE, SR25): `pixel_core` re-exported — PNG/JPEG/GIF/BMP/QOI/WebP-lossless.

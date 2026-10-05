@@ -98,6 +98,19 @@ dependencies = [
  "bandy",
  "facet",
  "quartzite",
+ "stria",
+ "tokio",
+]
+
+[[package]]
+name = "aethervideo-check"
+version = "0.1.0"
+dependencies = [
+ "aether",
+ "bandy",
+ "gneiss_pal",
+ "image",
+ "stria",
  "tokio",
 ]
 
