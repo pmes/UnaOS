@@ -428,7 +428,16 @@ pub fn stack(sel: &FontSel) -> std::rc::Rc<Vec<&'static Face>> {
     for fam in family_list(sel.family) {
         match fam {
             Family::Generic(g) => push(&mut faces, named_face(g.family_name(), want)),
-            Family::Named(n) => push(&mut faces, named_face(&n, want)),
+            Family::Named(n) => {
+                // an author family contributes every face of its unicode-range subsets
+                let web = webfont::select_all(&n, want);
+                if web.is_empty() {
+                    push(&mut faces, named_face(&n, want));
+                }
+                for f in web {
+                    push(&mut faces, Some(f));
+                }
+            }
         }
     }
     push(&mut faces, named_face(Generic::Serif.family_name(), want));

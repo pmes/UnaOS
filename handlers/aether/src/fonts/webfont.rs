@@ -34,8 +34,13 @@ pub struct WebFace {
     key: String,
 }
 
+thread_local! {
+    /// The document's author faces. Page state is per engine thread in Aether (like `images` and `media`),
+    /// so two engines never see each other's `@font-face` families.
+    static FACES: std::cell::RefCell<Vec<WebFace>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 struct Registry {
-    faces: Vec<WebFace>,
     /// Font bytes fetched by the page loader, by absolute URL.
     bytes: HashMap<String, std::sync::Arc<Vec<u8>>>,
     /// Decoded data: URLs and files, by URL (sfnt bytes leaked once).
@@ -44,7 +49,7 @@ struct Registry {
 
 fn reg() -> &'static Mutex<Registry> {
     static R: OnceLock<Mutex<Registry>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(Registry { faces: Vec::new(), bytes: HashMap::new(), loaded: HashMap::new() }))
+    R.get_or_init(|| Mutex::new(Registry { bytes: HashMap::new(), loaded: HashMap::new() }))
 }
 
 static GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -63,35 +68,53 @@ pub fn store_bytes(url: &str, bytes: Vec<u8>) {
 
 /// Drops every author face (a new document).
 pub fn clear() {
-    if let Ok(mut r) = reg().lock() {
-        if !r.faces.is_empty() {
-            r.faces.clear();
+    FACES.with(|f| {
+        let mut f = f.borrow_mut();
+        if !f.is_empty() {
+            f.clear();
             GENERATION.fetch_add(1, Ordering::Relaxed);
         }
-    }
+    });
 }
 
-/// The best author face of `family` for `want` (None when no `@font-face` declares that family).
-pub fn select(family: &str, want: Style) -> Option<&'static Face> {
-    let r = reg().lock().ok()?;
-    let cands: Vec<&WebFace> = r.faces.iter().filter(|f| f.family.eq_ignore_ascii_case(family)).collect();
+/// The author faces of `family` for `want` (empty when no `@font-face` declares that family): §5.2 picks the
+/// best descriptor set, and every rule with that same set is returned, the LAST declared first (css-fonts-4
+/// §4.5: overlapping `unicode-range`s are checked in reverse order), so a family split into unicode-range
+/// subsets falls back across its subsets per character.
+pub fn select_all(family: &str, want: Style) -> Vec<&'static Face> {
+    let all = FACES.with(|f| f.borrow().clone());
+    let cands: Vec<&WebFace> = all.iter().filter(|f| f.family.eq_ignore_ascii_case(family)).collect();
     if cands.is_empty() {
-        return None;
+        return Vec::new();
     }
     // §5.2 over ranges: a face whose range contains the wanted value matches it exactly; otherwise the
     // range's nearest end stands for it.
     let clamp = |v: f32, (lo, hi): (f32, f32)| v.clamp(lo, hi);
     let styles: Vec<Style> = cands
         .iter()
-        .map(|f| Style { weight: clamp(want.weight, f.weight), slant: f.slant, stretch: clamp(want.stretch, f.stretch) })
+        .map(|f| Style {
+            weight: clamp(want.weight, f.weight),
+            slant: f.slant,
+            stretch: clamp(want.stretch, f.stretch),
+        })
         .collect();
-    let k = match_style(&styles, want)?;
-    let face = cands[k].face;
-    let (b, o) = synthesis(Style { weight: styles[k].weight, ..face.style }, want);
-    if b == face.synth_bold && o == face.synth_oblique {
-        return Some(face);
+    let Some(k) = match_style(&styles, want) else { return Vec::new() };
+    let chosen = (cands[k].weight, cands[k].slant, cands[k].stretch);
+    let mut out = Vec::new();
+    for (i, c) in cands.iter().enumerate().rev() {
+        if (c.weight, c.slant, c.stretch) != chosen {
+            continue;
+        }
+        let face = c.face;
+        let (b, o) = synthesis(Style { weight: styles[i].weight, ..face.style }, want);
+        out.push(if b == face.synth_bold && o == face.synth_oblique { face } else { synth_variant(face, b, o) });
     }
-    Some(synth_variant(face, b, o))
+    out
+}
+
+/// The first face [`select_all`] gives.
+pub fn select(family: &str, want: Style) -> Option<&'static Face> {
+    select_all(family, want).into_iter().next()
 }
 
 fn synth_variant(face: &'static Face, bold: bool, oblique: bool) -> &'static Face {
@@ -114,7 +137,10 @@ fn synth_variant(face: &'static Face, bold: bool, oblique: bool) -> &'static Fac
 fn format_supported(fmt: Option<&str>) -> bool {
     match fmt.map(|f| f.to_ascii_lowercase()) {
         None => true,
-        Some(f) => matches!(f.as_str(), "truetype" | "opentype" | "woff" | "collection" | "truetype-variations" | "opentype-variations"),
+        Some(f) => matches!(
+            f.as_str(),
+            "truetype" | "opentype" | "woff" | "collection" | "truetype-variations" | "opentype-variations"
+        ),
     }
 }
 
@@ -160,7 +186,8 @@ pub fn woff1_to_sfnt(d: &[u8]) -> Option<Vec<u8>> {
     for i in 0..num {
         let e = 44 + 20 * i;
         let tag: [u8; 4] = d.get(e..e + 4)?.try_into().ok()?;
-        let (off, comp, orig, cksum) = (be32(d, e + 4)? as usize, be32(d, e + 8)? as usize, be32(d, e + 12)? as usize, be32(d, e + 16)?);
+        let (off, comp, orig, cksum) =
+            (be32(d, e + 4)? as usize, be32(d, e + 8)? as usize, be32(d, e + 12)? as usize, be32(d, e + 16)?);
         let raw = d.get(off..off.checked_add(comp)?)?;
         let data = if comp < orig {
             let mut sink = VecSink(Vec::with_capacity(orig), orig);
@@ -333,7 +360,9 @@ pub fn apply_rules(sheets: &[css_core::stylesheet::Stylesheet], base: &str) -> u
         for r in rules {
             match r {
                 CssRule::FontFace(f) => out.push(f),
-                CssRule::Media(_, inner) | CssRule::Supports(_, inner) | CssRule::LayerBlock(_, inner) => walk(inner, out),
+                CssRule::Media(_, inner) | CssRule::Supports(_, inner) | CssRule::LayerBlock(_, inner) => {
+                    walk(inner, out)
+                }
                 _ => {}
             }
         }
@@ -356,7 +385,9 @@ pub fn apply_rules(sheets: &[css_core::stylesheet::Stylesheet], base: &str) -> u
         let stretch = stretch_desc(&text(ff.descriptor("font-stretch")));
         let unicode_range: Vec<(u32, u32)> = ff
             .descriptor("unicode-range")
-            .map(|v| css_core::urange::parse_urange_list(&css_core::serialize::to_css(v)).into_iter().flatten().collect())
+            .map(|v| {
+                css_core::urange::parse_urange_list(&css_core::serialize::to_css(v)).into_iter().flatten().collect()
+            })
             .unwrap_or_default();
         let mut chosen: Option<(&'static Face, String)> = None;
         for src in ff.sources() {
@@ -395,20 +426,22 @@ pub fn apply_rules(sheets: &[css_core::stylesheet::Stylesheet], base: &str) -> u
         let key = format!("{family}|{weight:?}|{slant:?}|{stretch:?}|{unicode_range:?}|{src_key}");
         wanted.push(WebFace { family, face, weight, slant, stretch, unicode_range, key });
     }
-    let mut r = reg().lock().unwrap();
-    let same = r.faces.len() == wanted.len() && r.faces.iter().zip(&wanted).all(|(a, b)| a.key == b.key);
-    if !same {
-        // keep the already-loaded Face of an unchanged rule (ids stay stable for the caches)
-        let old: HashMap<String, &'static Face> = r.faces.iter().map(|f| (f.key.clone(), f.face)).collect();
-        for w in wanted.iter_mut() {
-            if let Some(f) = old.get(&w.key) {
-                w.face = f;
+    FACES.with(|cell| {
+        let mut faces = cell.borrow_mut();
+        let same = faces.len() == wanted.len() && faces.iter().zip(&wanted).all(|(a, b)| a.key == b.key);
+        if !same {
+            // keep the already-loaded Face of an unchanged rule (ids stay stable for the caches)
+            let old: HashMap<String, &'static Face> = faces.iter().map(|f| (f.key.clone(), f.face)).collect();
+            for w in wanted.iter_mut() {
+                if let Some(f) = old.get(&w.key) {
+                    w.face = f;
+                }
             }
+            *faces = wanted;
+            GENERATION.fetch_add(1, Ordering::Relaxed);
         }
-        r.faces = wanted;
-        GENERATION.fetch_add(1, Ordering::Relaxed);
-    }
-    r.faces.len()
+        faces.len()
+    })
 }
 
 /// The `url()` sources of every `@font-face` in a CSS text, resolved against `base` (for the loader).
@@ -488,12 +521,60 @@ mod tests {
         assert_eq!(sink.0, payload);
     }
 
+    /// @font-face through the cascade's own path: two rules of one family (data: URIs of an OpenType/CFF face
+    /// and its bold), §5.2 selection between them, synthesis, local(), and the stack putting the author family
+    /// before installed ones.
+    #[test]
+    fn font_face_rules_kat() {
+        use base64::Engine as _;
+        let (Ok(reg_b), Ok(bold_b)) = (
+            std::fs::read("/usr/share/fonts/opentype/tlwg/Loma.otf"),
+            std::fs::read("/usr/share/fonts/opentype/tlwg/Loma-Bold.otf"),
+        ) else {
+            return;
+        };
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let css = format!(
+            "@font-face {{ font-family: KatFace; src: url(data:font/otf;base64,{}) format('opentype'); }}\n\
+             @font-face {{ font-family: KatFace; font-weight: 700; src: url(data:font/otf;base64,{}); }}\n\
+             @font-face {{ font-family: KatLocal; src: local(\"DejaVu Sans Bold\"), url(nowhere.woff2) format('woff2'); }}",
+            b64(&reg_b),
+            b64(&bold_b)
+        );
+        let sheet = css_core::stylesheet::parse_stylesheet(&css);
+        let n = apply_rules(std::slice::from_ref(&sheet), "file:///");
+        assert!(n >= 2, "registered {n}");
+        let want = |w: f32, slant: Slant| Style { weight: w, slant, stretch: 100.0 };
+        let r = select("KatFace", want(400.0, Slant::Normal)).unwrap();
+        assert_eq!((r.style.weight, r.synth_bold, r.synth_oblique), (400.0, false, false));
+        let b = select("katface", want(700.0, Slant::Normal)).unwrap();
+        assert_eq!((b.style.weight, b.synth_bold), (700.0, false));
+        let i = select("KatFace", want(400.0, Slant::Italic)).unwrap();
+        assert!(i.synth_oblique && !i.synth_bold, "no italic rule: synthetic oblique");
+        if crate::fonts::db::db().resolve_family("DejaVu Sans").is_some() {
+            let l = select("KatLocal", want(400.0, Slant::Normal)).unwrap();
+            assert_eq!(font_core::name::family(&l.font).as_deref(), Some("DejaVu Sans"));
+        }
+        // the author family heads the stack
+        let id = crate::fonts::intern_family_list(vec![
+            crate::fonts::Family::Named("KatFace".into()),
+            crate::fonts::Family::Generic(crate::fonts::Generic::SansSerif),
+        ]);
+        let f = crate::fonts::face(&crate::fonts::FontSel::new(id, 700, false)).unwrap();
+        assert_eq!(f.family, "KatFace");
+        assert!(select("NotDeclared", want(400.0, Slant::Normal)).is_none());
+    }
+
     #[test]
     fn descriptors_kat() {
         assert_eq!(weight_desc("bold"), (700.0, 700.0));
         assert_eq!(weight_desc("300 600"), (300.0, 600.0));
         assert_eq!(stretch_desc("condensed"), (75.0, 75.0));
         assert_eq!(stretch_desc("50% 200%"), (50.0, 200.0));
-        assert!(format_supported(Some("woff")) && !format_supported(Some("woff2")) && !format_supported(Some("embedded-opentype")));
+        assert!(
+            format_supported(Some("woff"))
+                && !format_supported(Some("woff2"))
+                && !format_supported(Some("embedded-opentype"))
+        );
     }
 }

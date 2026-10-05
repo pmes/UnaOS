@@ -149,9 +149,21 @@ pub fn match_style(cands: &[Style], want: Style) -> Option<usize> {
     // font-stretch: ≤ 100% prefers narrower (closest first), then wider; > 100% the reverse.
     let pick_stretch = |idx: &[usize]| -> f32 {
         let w = want.stretch;
-        let narrower = idx.iter().map(|&i| cands[i].stretch).filter(|&s| s <= w).fold(None, |a: Option<f32>, s| Some(a.map_or(s, |a| a.max(s))));
-        let wider = idx.iter().map(|&i| cands[i].stretch).filter(|&s| s > w).fold(None, |a: Option<f32>, s| Some(a.map_or(s, |a| a.min(s))));
-        if w <= 100.0 { narrower.or(wider).unwrap() } else { wider.or(narrower).unwrap() }
+        let narrower = idx
+            .iter()
+            .map(|&i| cands[i].stretch)
+            .filter(|&s| s <= w)
+            .fold(None, |a: Option<f32>, s| Some(a.map_or(s, |a| a.max(s))));
+        let wider = idx
+            .iter()
+            .map(|&i| cands[i].stretch)
+            .filter(|&s| s > w)
+            .fold(None, |a: Option<f32>, s| Some(a.map_or(s, |a| a.min(s))));
+        if w <= 100.0 {
+            narrower.or(wider).unwrap()
+        } else {
+            wider.or(narrower).unwrap()
+        }
     };
     let s = pick_stretch(&idx);
     idx.retain(|&i| cands[i].stretch == s);
@@ -260,9 +272,7 @@ impl FontDb {
     }
 
     fn installed(&self, family: &str) -> Option<String> {
-        self.faces
-            .iter()
-            .find_map(|f| f.families.iter().find(|n| family_eq(n, family)).cloned())
+        self.faces.iter().find_map(|f| f.families.iter().find(|n| family_eq(n, family)).cloned())
     }
 
     /// The installed family a CSS family NAME resolves to (see the module comment), or None when Chromium
@@ -314,7 +324,8 @@ impl FontDb {
                 .map(|(i, f)| {
                     let r = rank(f);
                     // inside one family the regular face first (the pattern asks for weight 400, roman)
-                    let st = (f.style.weight - 400.0).abs() as usize + if f.style.slant == Slant::Normal { 0 } else { 1000 };
+                    let st =
+                        (f.style.weight - 400.0).abs() as usize + if f.style.slant == Slant::Normal { 0 } else { 1000 };
                     (r, if r == usize::MAX { latin_rank(f) } else { 0 }, st, i)
                 })
                 .collect();
@@ -327,7 +338,11 @@ impl FontDb {
 /// 0 when the face's file covers a–z (fontconfig's `en` orthography), else 1.
 fn latin_rank(f: &FaceInfo) -> usize {
     let Some(face) = super::load_face(f) else { return 2 };
-    if ('a'..='z').all(|c| face.font.glyph_index(c) != 0) { 0 } else { 1 }
+    if ('a'..='z').all(|c| face.font.glyph_index(c) != 0) {
+        0
+    } else {
+        1
+    }
 }
 
 /// The process-wide database, discovered on first use.
@@ -348,7 +363,8 @@ mod tests {
     #[test]
     fn match_style_kat() {
         let n = Slant::Normal;
-        let fam = [st(300.0, n, 100.0), st(400.0, n, 100.0), st(500.0, n, 100.0), st(700.0, n, 100.0), st(900.0, n, 100.0)];
+        let fam =
+            [st(300.0, n, 100.0), st(400.0, n, 100.0), st(500.0, n, 100.0), st(700.0, n, 100.0), st(900.0, n, 100.0)];
         let pick = |w: f32| fam[match_style(&fam, st(w, n, 100.0)).unwrap()].weight;
         assert_eq!(pick(400.0), 400.0);
         assert_eq!(pick(450.0), 500.0, "400..500: heavier up to 500 first");
@@ -404,7 +420,9 @@ mod tests {
         assert_eq!(db.resolve_family("Helvetica Neue"), None, "a non-equivalent substitute is refused");
         assert_eq!(db.resolve_family("NoSuchFamily"), None);
         // fc-match -s sans-serif is the oracle for the fallback order (skipped without fontconfig's tools).
-        let Ok(out) = std::process::Command::new("fc-match").args(["-s", "--format", "%{file}#%{index}\\n", "sans-serif"]).output()
+        let Ok(out) = std::process::Command::new("fc-match")
+            .args(["-s", "--format", "%{file}#%{index}\\n", "sans-serif"])
+            .output()
         else {
             return;
         };
@@ -413,11 +431,18 @@ mod tests {
             .filter(|l| db.faces.iter().any(|f| format!("{}#{}", f.path.display(), f.index) == *l))
             .map(str::to_string)
             .collect();
-        let ours: Vec<String> =
-            db.fallback_order().iter().map(|&i| format!("{}#{}", db.faces[i].path.display(), db.faces[i].index)).collect();
+        let ours: Vec<String> = db
+            .fallback_order()
+            .iter()
+            .map(|&i| format!("{}#{}", db.faces[i].path.display(), db.faces[i].index))
+            .collect();
         let n = 6.min(want.len());
         let fam = |s: &str| {
-            db.faces.iter().find(|f| format!("{}#{}", f.path.display(), f.index) == s).map(|f| f.families[0].clone()).unwrap_or_default()
+            db.faces
+                .iter()
+                .find(|f| format!("{}#{}", f.path.display(), f.index) == s)
+                .map(|f| f.families[0].clone())
+                .unwrap_or_default()
         };
         let wf: Vec<String> = want.iter().take(n).map(|s| fam(s)).collect();
         let mut of: Vec<String> = Vec::new();

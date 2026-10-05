@@ -44,7 +44,7 @@ struct Contour {
 fn contours_of(p: &Path) -> Vec<Contour> {
     let mut out: Vec<Contour> = Vec::new();
     let mut cur: Option<Contour> = None;
-    let mut flush = |c: &mut Option<Contour>, out: &mut Vec<Contour>| {
+    let flush = |c: &mut Option<Contour>, out: &mut Vec<Contour>| {
         if let Some(mut k) = c.take() {
             // a closing point equal to the start is the same FreeType point
             if k.pts.len() > 1 && k.pts.last() == k.pts.first() && k.tags.last() == Some(&0) {
@@ -327,7 +327,15 @@ pub fn preblend(ink: (u8, u8, u8)) -> Rc<[u8; 256]> {
 
 /// Draws one glyph with its pen origin at (`x`, `baseline`): `put(px, py, alpha)` for every covered pixel,
 /// alpha already through the ink's pre-blend.
-pub fn draw_glyph(face: &Face, gid: u16, size: f32, x: f32, baseline: f32, lut: &[u8; 256], put: &mut dyn FnMut(i32, i32, u8)) {
+pub fn draw_glyph(
+    face: &Face,
+    gid: u16,
+    size: f32,
+    x: f32,
+    baseline: f32,
+    lut: &[u8; 256],
+    put: &mut dyn FnMut(i32, i32, u8),
+) {
     let (ix, sub) = split_x(x);
     let Some(g) = glyph(face, gid, size, sub) else { return };
     let iy = baseline.round() as i32;
@@ -376,7 +384,11 @@ mod tests {
     fn embolden_and_skew_kat() {
         let sq = |cw: bool| {
             let mut p = Path::new();
-            let pts: [(f32, f32); 4] = if cw { [(0.0, 0.0), (0.0, 100.0), (100.0, 100.0), (100.0, 0.0)] } else { [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)] };
+            let pts: [(f32, f32); 4] = if cw {
+                [(0.0, 0.0), (0.0, 100.0), (100.0, 100.0), (100.0, 0.0)]
+            } else {
+                [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+            };
             p.move_to(pts[0].0, pts[0].1);
             for q in &pts[1..] {
                 p.line_to(q.0, q.1);
@@ -398,7 +410,14 @@ mod tests {
         let Some(f) = crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::SANS, 400, false)) else { return };
         let gid = f.font.glyph_index('l');
         let plain = rasterize(f, gid, 32.0, 0).unwrap();
-        let bold = Face { id: u32::MAX, font: f.font, synth_bold: true, synth_oblique: false, family: f.family.clone(), style: f.style };
+        let bold = Face {
+            id: u32::MAX,
+            font: f.font,
+            synth_bold: true,
+            synth_oblique: false,
+            family: f.family.clone(),
+            style: f.style,
+        };
         let b = rasterize(&bold, gid, 32.0, 0).unwrap();
         let ink = |m: &GlyphMask| m.data.iter().map(|&v| v as u32).sum::<u32>() as f32 / 255.0;
         // the stem widens by ppem/24 = 1.33 px over its height
