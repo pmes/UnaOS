@@ -22,5 +22,8 @@ pub mod audio_track;
 pub mod avsync;
 pub mod video;
 
+/// The still-image core (PIXELCORE, SR25): `pixel_core` re-exported — PNG/JPEG/GIF/BMP/QOI/WebP-lossless.
+pub mod image;
+
 /// The container core, re-exported so pipeline users name one library.
 pub use demux_core as demux;

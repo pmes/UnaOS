@@ -3791,6 +3791,10 @@ amber_core = { path = "../../libs/sys/amber_core", default-features = false }
 # CRYPTOCORE (LEDGER SR27): the cryptographic primitives UnaOS owns — `hash.rs` re-exports its SHA-256 /
 # HMAC-SHA256 / PBKDF2 (moved there from hash.rs). no_std, no alloc needed, zero deps; arch-neutral.
 crypto_core = { path = "../../libs/sys/crypto_core" }
+# PIXELCORE (SR25): the still-image decoders UnaOS owns — PNG/JPEG/GIF/BMP/QOI/WebP-lossless — AND the one
+# inflater + the SHOTZIP PNG encoder, moved here from `selfhost/inflate.rs` and `video/png.rs` (both now
+# re-exports). no_std + alloc, zero deps; arch-neutral; the same crate Aether (via gneiss_pal) links.
+pixel_core = { path = "../../libs/media/pixel_core" }
 net = { path = "../net" }
 fdt = "0.1.5"
 # RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so

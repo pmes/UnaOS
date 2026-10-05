@@ -1,0 +1,14 @@
+[package]
+name = "pixel-check"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "PIXELCORE's eyes: decode any image with pixel_core and write it as a PNG; or score pixel_core against a Chromium screenshot of the same file."
+
+[[bin]]
+name = "pixel-check"
+path = "src/main.rs"
+
+# pixel_core only — no third-party crates (R83: built in UnaOS).
+[dependencies]
+pixel_core = { path = "../../unaos/libs/media/pixel_core" }
