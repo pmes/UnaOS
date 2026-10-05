@@ -389,7 +389,7 @@ fn write_ssd_inner(out: &mut dyn FnMut(&str), force: bool, _confirm: Option<&str
     if dry {
         // INSTALL3 (B342): the glass's DRY RUN — the judgment above ran in full, the grant is minted from
         // the verdict exactly as below and dropped unheld; no stage past this one touches the disk.
-        if AhciDisk::new(sel, &p.verdict).is_err() {
+        if AhciDisk::new_quiet(sel, &p.verdict).is_err() {
             stage("grant", "refused (boot device, or the disk is too small)");
             return oc(false, false, "the write grant was refused");
         }
@@ -406,7 +406,7 @@ fn write_ssd_inner(out: &mut dyn FnMut(&str), force: bool, _confirm: Option<&str
                 return oc(true, false, "the SSD is too small for the plan");
             }
         }
-        for s in ["snapshot", "gpt", "esp", "unafs", "fsck"] {
+        for s in ["snapshot", "gpt", "esp", "unafs", "fsck", "grow"] {
             stage(s, "dry (not run)");
         }
         stage("done", "dry run — nothing written");
@@ -504,6 +504,7 @@ fn write_ssd_inner(out: &mut dyn FnMut(&str), force: bool, _confirm: Option<&str
     #[cfg(feature = "ahciroot")] let (cloned_mib, fsck_tag, unafs_ok) = if unafs_src.is_none() { fresh_unafs(&mut disk, &plan, port, out) } else { (cloned_mib, fsck_tag, unafs_ok) }; // AHCIROOT (B332) M3
     stage("unafs", if unafs_ok { "ok" } else { "fail" });
     stage("fsck", fsck_tag);
+    #[cfg(feature = "unafs")] let unafs_ok = if unafs_ok && fsck_tag == "ok" { drop(tree); let (what, ok) = grow_unafs(&mut disk, &plan); stage("grow", &what); ok } else { stage("grow", "skip (the volume did not fsck clean)"); unafs_ok }; // UNAFSGROW (B347) M2: the volume grows to p2 (the snapshot buffer is freed first: the grown map needs the heap)
     let ms = crate::arch::ticks().wrapping_sub(t0);
     let pass = w.files > 0 && w.verified == w.files && unafs_ok;
     serial_println!(
@@ -823,4 +824,54 @@ pub fn mirror_source_sectors() -> Option<u64> {
     return super::unafsmirror::source().filter(|s| !s.is_ahci()).map(|s| s.sectors());
     #[cfg(not(feature = "unafs"))]
     return None;
+}
+
+// ---------------------------------------------------------------------------------------------
+// UNAFSGROW (rmbp-ledger B347) M2 — the copied (or fresh) volume grows to its partition. File tail.
+// ---------------------------------------------------------------------------------------------
+
+/// The largest volume the installer grows to: 16 GiB of 4 KiB blocks. The unafs refcount map lives in
+/// RAM at 8 bytes per block across its two views and every commit rewrites it whole, so on the 256 MiB
+/// x86 heap and the one-sector AHCI write path a whole-SSD volume would be unmountable or unusable;
+/// past this the partition keeps free tail space until the map is incremental (owed, B347).
+pub const GROW_CAP_BLOCKS: u64 = 16 * 1024 * 1024 * 1024 / 4096;
+
+/// The block count the installer grows p2's volume to: the partition minus the scratch tail, in whole
+/// 4 KiB blocks, capped at [`GROW_CAP_BLOCKS`]. Pure; `tests unafsgrow` prints it for a synthetic plan.
+pub fn grow_target_blocks(p2_sectors: u64) -> u64 {
+    (p2_sectors.saturating_sub(PLAN_SCRATCH) / 8).min(GROW_CAP_BLOCKS)
+}
+
+/// `--write`'s grow leg, after the volume was copied (or formatted) and fsck'd clean: grow it to
+/// [`grow_target_blocks`] through the held grant and fsck it again. Returns the stage text and whether
+/// the volume is still trustworthy (a refused grow writes nothing and keeps the old size: still `true`).
+#[cfg(all(feature = "unafs", feature = "ahci-write"))]
+fn grow_unafs(disk: &mut AhciDisk, plan: &amber_core::Plan) -> (String, bool) {
+    let Some(dst) = plan.part(amber_core::PartKind::UnaFS) else { return (String::from("skip (no UnaFS partition)"), true) };
+    let want = grow_target_blocks(dst.sectors());
+    match super::unafsmirror::grow_target(disk, dst.first, dst.sectors() / 8, want) {
+        Ok((from, to, true)) => {
+            serial_println!("[install] unafs grow: from={} to={} blocks ({} MiB -> {} MiB) fsck=ok", from, to, from / 256, to / 256);
+            (alloc::format!("from={} to={} ok", from, to), true)
+        }
+        Ok((from, to, false)) => {
+            serial_println!("[install] unafs grow: from={} to={} fsck NOT clean", from, to);
+            (alloc::format!("from={} to={} fail (fsck not clean)", from, to), false)
+        }
+        Err(why) => {
+            serial_println!("[install] unafs grow: {} — the volume keeps its size", why);
+            (alloc::format!("from=? to={} fail ({}; the volume keeps its size)", want, why), true)
+        }
+    }
+}
+
+/// UNAFSGROW (B347) M3: the dry run's grant — the same judgment as [`AhciDisk::new`], minted silently
+/// (`partition::mint_disk_grant_quiet`) and dropped by the caller unheld.
+#[cfg(feature = "ahci-write")]
+impl AhciDisk {
+    pub fn new_quiet(sel: BlockDeviceId, v: &Verdict) -> Result<Self, InstallError> {
+        let rd = super::BlockTarget::bind_id(sel)?;
+        let grant = partition::mint_disk_grant_quiet(sel, rd.capacity_sectors(), v).ok_or(InstallError::NotBlank)?;
+        Ok(Self { rd, grant })
+    }
 }

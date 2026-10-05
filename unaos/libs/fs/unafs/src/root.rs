@@ -41,6 +41,12 @@ pub const ROOT_BLOCK: u64 = 1;
 pub const ROOT_MAGIC: [u8; 8] = *b"UNAFSRT1";
 /// The exact packed size of a [`RootRecord`] on disk (bytes).
 pub const ROOT_RECORD_SIZE: usize = 80;
+/// UNAFSGROW (B347): bit 0 of [`RootRecord::flags`] — this root was written
+/// by a GROW whose superblock rewrite may not have landed. Mount then accepts
+/// a refcount map sized for a LARGER volume than block 0 declares and reads
+/// the volume at block 0's (old) size; every block the root reaches lies
+/// below the old end by construction. Any other mismatch stays corruption.
+pub const ROOT_FLAG_GROW: u64 = 1;
 /// The atomicity unit of record: one 512 B sector.
 pub const ROOT_SECTOR_SIZE: usize = 512;
 
@@ -94,7 +100,7 @@ pub struct RootRecord {
     pub refmap_leaves: u64,
     /// Free blocks at commit time (refcount == 0 in the committed map).
     pub free_blocks: u64,
-    /// Reserved for future flags (0 today).
+    /// Flags: [`ROOT_FLAG_GROW`] (bit 0); every other bit reserved (0).
     pub flags: u64,
 }
 

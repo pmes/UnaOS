@@ -150,3 +150,17 @@ pub fn fsck_target<T: InstallTarget>(t: &mut T, first_lba: u64, block_count: u64
     let r = fs.fsck(false).map_err(|_| "fsck errored")?;
     Ok(r.is_clean())
 }
+
+/// UNAFSGROW (rmbp-ledger B347) M2: grow the volume at `first_lba` on the target — inside a partition
+/// span of `span_blocks` 4 KiB blocks — to `want` blocks (never below its current size: a volume
+/// already that large is left as it is), through the unafs crate's own `UnaFS::grow` (the function
+/// `tools/unafs grow` calls), then `fsck(false)` the result. Returns `(from, to, clean)`.
+pub fn grow_target<T: InstallTarget>(t: &mut T, first_lba: u64, span_blocks: u64, want: u64) -> Result<(u64, u64, bool), &'static str> {
+    let span = PartitionSpan { base_lba: first_lba, block_count: span_blocks };
+    let adapter = BlockAdapter::for_partition(TargetSectors(t), &span);
+    let mut fs = ::unafs::UnaFS::mount(adapter).map_err(|_| "the volume did not mount")?;
+    let from = fs.superblock.block_count;
+    let r = fs.grow(want.max(from)).map_err(|_| "the grow was refused")?;
+    let clean = fs.fsck(false).map(|rep| rep.is_clean()).unwrap_or(false);
+    Ok((from, r.to, clean))
+}
