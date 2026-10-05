@@ -48,3 +48,11 @@ also polls on every pass. Each driver reads CNTPCT itself with `cnt*1000/frq`, w
 - The aarch64 main-loop call to `net6::service_poll()` (aarch64 has no `service_net`; between syscalls nothing polls, so an
   inbound ARP request waits for the next socket call). It exists and is gated; the call site is for the arm tracks.
 - genet (Pi 4) has no RX-ready probe yet. Its `dhcp_or_static` runs on the 1 ms floor, not on a probe.
+
+## Results
+- merge `exec-rmbp-netclock` 47a63c7d (tests.rs keep-both: `defer_fast`, then `ensure_netclock`). M1 4bf3632f, M2 40bdbfcd, M3 22eb63f1, M4 e62d21ef.
+- The ping/arp throwaway-interface gate landed in M1 with the rest of `net6`, not M2. `dhcp_or_static_gated` takes `rx_ready: Option<&dyn Fn() -> bool>`.
+- Compile legs (inline, from `unaos/crates/kernel`, sequential, target removed after each):
+  aarch64 `login,loginst,virt_el0,vnet,net6` exit 0; aarch64 `login,loginst,tegradesk,desktop_firmware,tegra_el0,tegra,tegrasmp,net4,pcie3,pcie2,net6,sntp6`
+  exit 0; x86 metal shape + `smolnet` (the builder's default) exit 0. No warnings in the touched files.
+  charter-check exit 0. Not compiled: the Pi `genet` shape (its `dhcp_or_static` signature is unchanged).
