@@ -198,6 +198,21 @@ impl<'a> Engine<'a> {
         Some(floor(size * 4.0) / 4.0)
     }
 
+    /// [`Engine::fit_size`] for a PROPORTIONAL face laid on a grid that was built for a mono cell: also caps
+    /// the size so the mean advance of `a`..=`z` (of the `bold` face when loaded) fits `cell_w`, so a caller
+    /// whose budgets are `len * cell_w` keeps holding on average.
+    pub fn fit_size_mean(&self, role: Role, bold: bool, cell_w: f32, cell_h: f32) -> Option<f32> {
+        let size = self.fit_size(role, None, cell_h)?;
+        let f = &self.slots[self.primary(role, bold)?].font;
+        let upem = f.units_per_em.max(1) as f32;
+        let sum: u32 = ('a'..='z').map(|c| f.advance(f.glyph_index(c)) as u32).sum();
+        let mean = sum as f32 / 26.0 / upem;
+        if mean <= 0.0 {
+            return Some(size);
+        }
+        Some(floor(size.min(cell_w / mean) * 4.0) / 4.0)
+    }
+
     /// The baseline's row inside a `cell_h` cell, the line box centred in it.
     pub fn baseline_in_cell(&self, role: Role, size: f32, cell_h: f32) -> f32 {
         match self.line_metrics(role, size) {

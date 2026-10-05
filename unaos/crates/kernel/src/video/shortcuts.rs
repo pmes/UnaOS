@@ -184,7 +184,7 @@ pub fn is_open() -> bool {
 /// Open the overlay (idempotent). `false` on refusal (no panel, allocation, window table).
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn open() -> bool {
-    use crate::video::{font, menubar, theme};
+    use crate::video::{menubar, theme};
     use core::sync::atomic::Ordering;
     if is_open() {
         return true;
@@ -221,7 +221,7 @@ pub fn open() -> bool {
         for sy in 0..ch {
             let y = top + sy;
             if y < h {
-                font::draw_row(&mut buf[y * w..(y + 1) * w], w, text, x, sy, theme::TITLE_TEXT_ACTIVE, bold, menubar::BAR_FACE);
+                super::text::draw_row(&mut buf[y * w..(y + 1) * w], w, text, x, sy, theme::TITLE_TEXT_ACTIVE, bold, menubar::BAR_FACE);
             }
         }
     };

@@ -77,6 +77,14 @@ impl Face {
     pub const fn cell_h(self) -> usize {
         self.bitmap().cell_h()
     }
+    /// The face's family name for witnesses (`dejavu-sans` …) when a face is loaded, else the bitmap atlas's.
+    pub fn name(self) -> &'static str {
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+        if let Some(n) = tt::with(|t| t.names[self.index()]) {
+            return n;
+        }
+        self.bitmap().name()
+    }
     const fn index(self) -> usize {
         match self {
             Face::Body => 0,
@@ -385,7 +393,7 @@ mod tt {
         let fam = if eng.has(t.family) { t.family } else { Role::Sans };
         let mono = if eng.has(Role::Mono) { Role::Mono } else { Role::Sans };
         let body = eng.fit_size(mono, Some(font::CELL_W as f32), font::CELL_H as f32).unwrap_or(11.0);
-        let chrome = eng.fit_size(fam, None, font::CHROME_CELL_H as f32).unwrap_or(14.0);
+        let chrome = eng.fit_size_mean(fam, true, font::CHROME_CELL_W as f32, font::CHROME_CELL_H as f32).unwrap_or(14.0);
         let ui_fit = eng.fit_size(fam, None, font::CELL_H as f32).unwrap_or(12.0);
         let ui = device_px(t.css_px as f32, t.ppi).min(ui_fit).max(6.0);
         let mk = |role: Role, size: f32, cell: usize| (Style { role, bold: false, size }, eng.baseline_in_cell(role, size, cell as f32));
