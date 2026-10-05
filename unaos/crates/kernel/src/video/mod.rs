@@ -611,7 +611,7 @@ pub fn edid_total_len() -> u16 {
 /// content, which is what this function is here to check.
 pub fn init_edid(block: &[u8; 128], valid: bool, total_len: u16) {
     if !valid {
-        crate::bootlog_println!(":: video: edid present=0 hdr=- sum=- native=- len=0 ::");
+        serial_println!(":: video: edid present=0 hdr=- sum=- native=- len=0 ::"); // KFONTPPI (B382): every build
         return;
     }
 
@@ -636,9 +636,12 @@ pub fn init_edid(block: &[u8; 128], valid: bool, total_len: u16) {
     *EDID_BLOCK.lock() = Some(*block);
     EDID_OK.store(hdr_ok && sum_ok, Ordering::Relaxed);
     EDID_TOTAL_LEN.store(total_len, Ordering::Relaxed);
+    if hdr_ok && sum_ok {
+        edidsrc::set(edidsrc::SRC_FW); // KFONTPPI (B382): the published block's source
+    }
 
     let yn = |b: bool| if b { "OK" } else { "BAD" };
-    crate::bootlog_println!(
+    serial_println!( // KFONTPPI (B382): every build, one line — the next wire says what the firmware carried
         ":: video: edid present=1 hdr={} sum={} native={}x{} pclk_khz={} ext={} len={} ::",
         yn(hdr_ok),
         yn(sum_ok),
@@ -1184,3 +1187,6 @@ pub mod text;
 // desktop engine it answers 1.0.
 pub mod dpi; pub mod metrics; pub mod lag; // GLASSLAG M1 (B370): the per-event [lag] latency + the 5 s :: LAG: rollup; // UIMETRICS (B372): the ui::Metrics ignition check, witness and `tests metrics` — folded onto the `dpi` line, code first (module root, LEDGER P7).
 pub mod wincap; // WINDOWCAP (B378, R90): the one dynamic limit on running apps — windows and ring-3 processes (new file, tail-neutral)
+// KFONTPPI (B382): `video::edidsrc` — the EDID carry's source tag (fw / aux / none), the iGPU lane's AUX offer
+// into `EDID_BLOCK`, and the `:: KFONTPPI:` witness. Unconditional; at the tail so no line above moves.
+pub mod edidsrc;

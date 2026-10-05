@@ -352,6 +352,9 @@ pub fn pref_list(ns: Option<&str>) -> Result<Vec<(String, String, PrefValue)>, i
 
 /// `system.<k>` over the bus.
 pub fn sys_get(k: &str) -> Option<PrefValue> {
+    if let Some(v) = deferred_value(k) {
+        return Some(v); // INPUTSTALL M5: read-your-writes while the set is still on its way to the store
+    }
     pref_get(crate::prefs::NS, k).ok()
 }
 /// `system.<k>` as an integer in `lo..=hi` (unset, another type or out of range = `None`).
@@ -369,6 +372,7 @@ pub fn sys_text(k: &str) -> Option<String> {
 /// Set `system.<k>`; a refusal is already on the serial line (`[prefsbus] set …`), so callers that only
 /// persist ignore it.
 pub fn sys_set(k: &str, v: PrefValue) {
+    let Some(v) = defer_set(k, v) else { return }; // INPUTSTALL M5: from the render task the PrefSet goes to a worker
     let _ = pref_set(crate::prefs::NS, k, v);
 }
 
@@ -475,4 +479,98 @@ pub fn selftest() {
         ":: SETTINGSBUS: via={} set={} get={} changed={} direct_writers={} -> {} ::",
         via, set_ok as u8, if get_eq { "eq" } else { "ne" }, changed, DIRECT_WRITERS, if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// ── INPUTSTALL M5 (rmbp-ledger B375, R88): a PrefSet never runs on the render task ─────────────────────
+//
+// FLIGHT 23: a Settings slider press ran its PrefSet over the bus — a UnaFS write — inside the press handler
+// on the RENDER task, the one consumer of the input channel: `[lag] click→shown ms=1478.0 … wm=1471.4`, six
+// presses in a row, each ~1.3–1.5 s with every key and press behind it. `sys_set` is fire-and-forget (its
+// callers persist and ignore the answer), so from the render task it now QUEUES the write (the latest value
+// per key wins — a drag of the slider is one write, not twenty) and a `prefs-flush` kernel task on a worker
+// core (`smp::worker_cpu(0)`, never the render core) runs the PrefSets. `sys_get` answers a queued key from
+// the queue (read-your-writes), so a caller that reads back right after its set sees what it set. Off the
+// render task, off x86, or with no worker core, `sys_set` is the synchronous PrefSet it always was.
+//
+// Witness per flush: `[prefsbus] flush n=<keys> ms=<n> on=worker queued_ms=<oldest wait> (INPUTSTALL M5)`.
+// This is the seam, not `settings.rs`: every kernel `sys_set` caller on the render task is covered.
+
+static DEFERRED: spin::Mutex<Vec<(String, PrefValue)>> = spin::Mutex::new(Vec::new());
+#[cfg(target_arch = "x86_64")]
+static FLUSHER: AtomicBool = AtomicBool::new(false);
+static DEFER_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The worker core a deferred PrefSet runs on, when the caller is the render task (x86). `None` = run inline.
+fn defer_core() -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !matches!(crate::arch::sched::current_name(), Some(n) if n.starts_with("render")) {
+            return None;
+        }
+        crate::arch::smp::worker_cpu(0)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        None
+    }
+}
+
+/// Queue `system.<k> = v` for the worker; `Some(v)` back = the caller runs it inline.
+fn defer_set(k: &str, v: PrefValue) -> Option<PrefValue> {
+    let Some(cpu) = defer_core() else { return Some(v) };
+    {
+        let mut q = DEFERRED.lock();
+        if q.is_empty() {
+            DEFER_T0_MS.store(crate::arch::ms(), Ordering::Relaxed);
+        }
+        match q.iter_mut().find(|(key, _)| key == k) {
+            Some(slot) => slot.1 = v,
+            None => q.push((String::from(k), v)),
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if !FLUSHER.swap(true, Ordering::AcqRel) {
+        crate::arch::sched::spawn("prefs-flush", prefs_flush, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = cpu;
+    None
+}
+
+/// A queued value for `system.<k>`, if one is waiting.
+fn deferred_value(k: &str) -> Option<PrefValue> {
+    let q = DEFERRED.lock();
+    q.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
+}
+
+/// `prefs-flush`: run every queued PrefSet (in order, latest value per key), then exit; a set queued while
+/// it was finishing re-arms it.
+#[cfg(target_arch = "x86_64")]
+fn prefs_flush(_: usize) {
+    loop {
+        let (batch, t0) = {
+            let q = DEFERRED.lock();
+            (q.clone(), DEFER_T0_MS.load(Ordering::Relaxed))
+        };
+        if batch.is_empty() {
+            FLUSHER.store(false, Ordering::Release);
+            if DEFERRED.lock().is_empty() || FLUSHER.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            continue;
+        }
+        let start = crate::arch::ms();
+        for (k, v) in &batch {
+            let _ = pref_set(crate::prefs::NS, k, v.clone());
+            // Drop the key from the queue only if nobody re-set it meanwhile (else the newer value flushes next).
+            let mut q = DEFERRED.lock();
+            if let Some(i) = q.iter().position(|(key, qv)| key == k && qv == v) {
+                q.remove(i);
+            }
+        }
+        serial_println!(
+            "[prefsbus] flush n={} ms={} on=worker queued_ms={} (INPUTSTALL M5: the PrefSet ran off the render task)",
+            batch.len(), crate::arch::ms().saturating_sub(start), start.saturating_sub(t0)
+        );
+    }
 }

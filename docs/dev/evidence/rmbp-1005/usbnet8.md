@@ -85,3 +85,55 @@ fixed); `txprobe … reply_ms=none` = TX never reaches the LAN (the DHCP silence
   M4 two flight-23 KATs (`cargo test -p usbnet_core` exit 0, 11 tests). M5 the ARP txprobe under `tests usbnet7`.
 - No new knob, verb, file or dotfile. Legs: x86 metal shape exit 0; aarch64 `login,loginst,virt_el0,lumen,
   desktop_firmware,quarry,facet,usbnet` exit 0; aarch64 `tegra,login,loginst,virt_el0` exit 0; charter-check exit 0.
+
+## M7 / M8 — the seat's second dispatch (TX by reading; the fixture taps)
+
+Seat rulings: (a) rung two stays this flight, `needed=` judges it; (b) 50 ms stands, and `rx resumed` now carries
+`pass_ms=<longest data-pass interval since the rung>` when the answer came later than 50 ms and a pass took longer than
+that (an undercount is visible); (c) the fixture taps.
+
+**M7 — the TX side against Linux `drivers/net/usb/ax88179_178a.c` + `usbnet.c`:**
+1. *TX header.* `ax88179_tx_fixup`: `tx_hdr1 = skb->len`, `tx_hdr2 = gso_size` (0) `| 0x80008000` when `(len + 8) %
+   maxpacket == 0`, both `put_unaligned_le32`, 8 bytes pushed ahead. Ours matched. `usbnet_start_xmit`: the AX88179
+   `driver_info` has no `FLAG_SEND_ZLP`, so an exact multiple of maxpacket gets ONE extra zero byte (a short packet ends
+   the transfer); ours sent no byte and no ZLP — an exact-multiple frame (1016 B, 2040 B) would have left the OUT TD's
+   transfer unterminated. Not the DISCOVER's case (342 + 8 = 350). Now the shared core's `usbnet_core::ax88179_tx::header`
+   (KATs: 342 -> `56 01 00 00 00 00 00 00`, 350 bytes; 1016 -> pad flag, 1025 bytes), which the data pass calls.
+2. *MEDIUM_STATUS_MODE* 0x013f written, 0x0133 read: the bits that do not stick are 0x0008 = `AX_MEDIUM_EN_125MHZ` and
+   0x0004, which mainline names nothing (the `ALWAYS_ONE` name is not in mainline; I cannot verify the vendor driver
+   here). 0x0133 is EXACTLY what Linux `ax88179_reset` writes before any link (RECEIVE_EN | TXFLOW_CTRLEN |
+   RXFLOW_CTRLEN | FULL_DUPLEX | GIGAMODE). `ax88179_link_reset` (after link, from PHYSR) writes RECEIVE_EN | TXFLOW |
+   RXFLOW, + GIGAMODE | EN_125MHZ for 1000, + FULL_DUPLEX = 0x013b. Our bring-up wrote 0x013f before link (now 0x0133);
+   our link-up wrote PHYSR-derived 0x013f (now 0x013b, bit 2 dropped). Whether EN_125MHZ sticks after the Linux-order
+   link-up is on the next wire (`reg MEDIUM_STATUS_MODE=0x013b/…`); at gigabit the MAC sources the TX clock (GTX_CLK), so
+   a missing EN_125MHZ is a TX-only fault that fits "RX works, nothing we send is answered".
+3. *ORDER after link-up.* Linux `ax88179_link_reset`: loop (<= HZ/10) { RX_CTL = 0; RX_CTL = rxctl; read 4 bytes,
+   vendor request 0x81, wValue 0x8c — "check the usb device control TX FIFO full or empty" } while bit 30 is set; then
+   PHYSR; QCTRL; MEDIUM. Ours: MEDIUM, QCTRL, RX_CTL — and the TX FIFO was never looked at. FIXED to Linux's order
+   (`usbnet_ax_link_reset`), one line: `[usbnet] link reset order=linux rxctl=0x028a/<rb> txfifo=<hex> tries=<n> ms=<n>
+   medium=0x013b ok=1`.
+4. *RX_CTL* 0x03aa written, 0x02aa read: the bit that does not stick is 0x0100 = `AX_RX_CTL_DROPCRCERR`. 0x03aa
+   (DROPCRCERR | IPE | START | AP | AB | AMALL) is Linux `ax88179_reset`'s own value; after open and on every link reset
+   Linux writes `rxctl` = START | AB | IPE (+ AM/AMALL/PRO from `set_rx_mode`). Link-up now writes 0x028a (AMALL in place
+   of AM + the hash filter this driver does not program). (`AP` is 0x0020, not promiscuous; `PRO` 0x0001 is.)
+5. *TX on the wire:* `[usbnet] tx done n= len= cc= residual=` for the first three OUT TDs and every non-success
+   (cc 0 = abandoned by the stuck valve), plus M5's ARP probe.
+
+**M8 — the fixture taps.** `tests usbnet` drove `raw_rx` itself and kept up to 4 frames for up to 5 s. It now runs the
+main pass + the stack poll and counts frames as they are pushed. Flight 23 check: the fixture ran 09:15:09–09:15:14
+(`USBNET6` at 09:15:14); the DHCP tries (2 s each, `DHCP_WAIT_MS`, on the 5 s net tick) ended 09:14:16 (link tries
+exhausted) and the next started on the 09:15:26 re-arm — NO overlap, and the shell holds the main loop during `tests`, so
+no try could run inside the window. The fixture did not steal an offer on flight 23; there was none to steal
+(`dhcp_replies=0` counts at the push, before any pop).
+
+Wire added for flight 24:
+```
+[usbnet] reg MEDIUM_STATUS_MODE=0x0133/<rb>                                   (bring-up, Linux reset value)
+[usbnet] reg MEDIUM_STATUS_MODE=0x013b/<rb>                                   (link-up, from PHYSR)
+[usbnet] link reset order=linux rxctl=0x028a/0x028a txfifo=0x........ tries=1 ms=<n> medium=0x013b ok=1
+[usbnet] tx done n=1 len=<n> cc=1 residual=0
+[usbnet] rx resumed len=<n> kicks=<n> resets=<n> after_ms=<n> needed=0[ pass_ms=<n>]
+```
+Reading: `txfifo` bit 30 set after 100 ms = the dongle's TX FIFO is stuck (TX never leaves the chip); `tx done cc=1
+residual=0` + `txprobe reply_ms=none` = the controller delivered every byte and the dongle did not put it on the LAN
+(MEDIUM readback without 0x0008 points at EN_125MHZ); a reply = TX works and the DHCP silence is the DISCOVER itself.

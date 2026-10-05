@@ -10,7 +10,7 @@
  * argv: SYSKAT2.LNX <file> <size> <scratch>   — <file> is statx'd and must be <size> bytes (the loader's view of
  * /apps/HELLO.C on UnaOS); <scratch> is a writable path (created, truncated, locked, unlinked).
  * Prints "syskat2 ok threads=4 counter=400000 futex_waits=<n> epoll=ok statx=ok sigreturn=ok checks=<n>" and exits 0,
- * or prints "syskat2 fail <id>" and exits with the id of the first check that failed:
+ * or prints "syskat2 fail <id> <the same fields, ? where unproven> checks=<n>" and exits with the id of the first check that failed:
  *   1 clone(CLONE_THREAD) x2 + PARENT_SETTID   2 clone3(CLONE_THREAD) x2 (fn in rdx, arg in r8: glibc's shape)
  *   3 join: CHILD_CLEARTID zeroed + futex-woke  4 counter == 4 x 100000 under a futex mutex
  *   5 per-thread FS_BASE (CLONE_SETTLS)         6 gettid distinct per thread, main gettid == getpid
@@ -56,14 +56,31 @@ static void outn(u64 v)
     do { b[--i] = '0' + v % 10; v /= 10; } while (v);
     out(b + i);
 }
-static void fail(int id)
+/* SMALLFIX (B380): the fields as far as the run got, printed on failure too, so the wire names more than a number:
+ * "syskat2 fail <id> threads=<n|?> counter=<n|?> futex_waits=<n> epoll=<ok|?> statx=<ok|?> sigreturn=<ok|?> checks=<n>". */
+static int f_threads = -1, f_epoll, f_statx, f_sigret;
+static u64 counter;
+static int nwaits;
+static void okq(const char *k, int ok) { out(k); out(ok ? "ok" : "?"); }
+static void fail_at(int id, int checks)
 {
     out("syskat2 fail ");
     outn(id);
+    out(" threads=");
+    if (f_threads < 0) out("?"); else outn(f_threads);
+    out(" counter=");
+    if (f_threads < 0) out("?"); else outn(counter);
+    out(" futex_waits=");
+    outn(nwaits);
+    okq(" epoll=", f_epoll);
+    okq(" statx=", f_statx);
+    okq(" sigreturn=", f_sigret);
+    out(" checks=");
+    outn(checks);
     out("\n");
     S1(231, id);
 }
-#define CHECK(id, cond) do { if (!(cond)) fail(id); checks++; } while (0)
+#define CHECK(id, cond) do { if (!(cond)) fail_at(id, checks); checks++; } while (0)
 
 static u64 atou(const char *s) { u64 v = 0; while (*s >= '0' && *s <= '9') v = v * 10 + (u64)(*s++ - '0'); return v; }
 static i64 now_ms(void) { i64 t[2]; S2(228, 1, t); return t[0] * 1000 + t[1] / 1000000; }
@@ -78,7 +95,6 @@ static void sleep_ms(i64 ms) { i64 req[2] = { ms / 1000, (ms % 1000) * 1000000 }
 #define FUTEX_PRIVATE 128
 static i64 futex(int *u, int op, int val, i64 ts_or_val2, int *u2, int val3) { return S6(202, u, op, val, ts_or_val2, u2, val3); }
 
-static int nwaits;
 static void lock(int *m)
 {
     int c = 0;
@@ -127,7 +143,6 @@ struct targ {
 static struct targ ta[NT];
 
 static int mtx;
-static u64 counter;
 static void count_job(struct targ *t)
 {
     for (int i = 0; i < 100000; i++) {
@@ -249,6 +264,7 @@ void cmain(u64 *sp)
     CHECK(3, joined);
     CHECK(4, counter == 400000);
     CHECK(5, ta[0].tls_ok && ta[1].tls_ok && ta[2].tls_ok && ta[3].tls_ok);
+    f_threads = 4;
     CHECK(6, ta[0].tid == t0 && ta[1].tid == t1 && ta[2].tid == t2 && ta[3].tid == t3 && S0(186) == pid);
 
     /* ---- futex unit checks ---- */
@@ -299,6 +315,7 @@ void cmain(u64 *sp)
     u64 val = 0;
     CHECK(16, join(7) && ta[7].r == 8 && nev == 1 && (*(u32 *)ee & 1) && *(u64 *)(ee + 4) == 0x1234
               && S3(0, efd, &val, 8) == 8 && val == 1);
+    f_epoll = 1;
     S1(3, ep);
 
     /* ---- statx ---- */
@@ -310,6 +327,7 @@ void cmain(u64 *sp)
     u64 st[18];
     CHECK(18, ffd >= 0 && S2(5, ffd, st) == 0 && S5(332, ffd, "", 0x1000 /*AT_EMPTY_PATH*/, 0x7ff, stx) == 0
               && *(u64 *)(stx + 40) == st[6]);
+    f_statx = 1;
 
     /* ---- ftruncate / fallocate / flock on a scratch file ---- */
     S1(87, scratch);
@@ -355,6 +373,7 @@ void cmain(u64 *sp)
     int held = hits == 1;
     S4(14, 1 /*SIG_UNBLOCK*/, &set, 0, 8);
     CHECK(25, held && hits == 2);
+    f_sigret = 1;
 
     out("syskat2 ok threads=4 counter=");
     outn(counter);

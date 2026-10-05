@@ -173,7 +173,7 @@ pub fn selftest() {
 // ring-3 fault of its pid (`note_ring3_fault`, called by the x86 fault-kill path), then kills the job so the
 // fixture leaves no window and no network session behind.
 //
-// WITNESS. `:: LUMENCRASH: spawned=1 first_line=<ok|fault vec=N rip=+0x..|timeout> -> PASS|FAIL ::` (rip
+// WITNESS. `:: LUMENCRASH: spawned=1 first_line=<ms|fault vec=N rip=+0x..|timeout> -> PASS|FAIL ::` (rip
 // relative to the entry the loader reported); `spawned=0 … -> FAIL` with the loader's reason if the spawn is
 // refused.
 
@@ -201,7 +201,11 @@ pub fn note_ring3_fault(vec: u8, rip: u64) {
 fn spawn_step(img: &[u8]) {
     use core::sync::atomic::Ordering;
     const FIRST: &str = ":: LUMEN: start";
-    const WAIT_MS: u64 = 2_000;
+    // SMALLFIX (B380): flight 23's typed `lumen` printed its first line 8 s after the spawn (09:24:43 -> 09:24:51,
+    // six vugs storming): the program's `:: LUMEN: start` comes AFTER the window, Principia's prefs, the key, the
+    // VEINTLS setup (DRBG seed + the roots and CCADB bundles) and the 1.7 MiB font load. The probe's 2 s bound
+    // read that as `timeout`; it now waits for the REAL first line under a 20 s bound and says how long it took.
+    const WAIT_MS: u64 = 20_000;
     FAULT_PID.store(0, Ordering::Release);
     crate::serial_line::line_watch_arm(FIRST);
     let (pid, slot, entry) = match crate::arch::syscall::spawn_user_image_bg(img) {
@@ -213,7 +217,8 @@ fn spawn_step(img: &[u8]) {
             return;
         }
     };
-    let deadline = crate::arch::ticks() + WAIT_MS;
+    let t0 = crate::arch::ticks();
+    let deadline = t0 + WAIT_MS;
     let mut fault: Option<(u64, u64)> = None;
     let mut ok = false;
     while crate::arch::ticks() < deadline {
@@ -227,6 +232,7 @@ fn spawn_step(img: &[u8]) {
         }
         crate::arch::sched::yield_now();
     }
+    let took = crate::arch::ticks().saturating_sub(t0);
     crate::serial_line::line_watch_disarm();
     // A faulted task is already dead; a live one (PASS or timeout) is killed so the fixture leaves nothing.
     let killed = if fault.is_none() { crate::arch::syscall::bg_kill(pid, slot) } else { "faulted" };
@@ -237,8 +243,8 @@ fn spawn_step(img: &[u8]) {
             vec,
             rip.wrapping_sub(entry)
         ),
-        None if ok => serial_println!(":: LUMENCRASH: spawned=1 first_line=ok -> PASS ::"),
-        None => serial_println!(":: LUMENCRASH: spawned=1 first_line=timeout -> FAIL ::"),
+        None if ok => serial_println!(":: LUMENCRASH: spawned=1 first_line={} -> PASS :: bound_ms={}", took, WAIT_MS),
+        None => serial_println!(":: LUMENCRASH: spawned=1 first_line=timeout -> FAIL :: waited_ms={} bound_ms={}", took, WAIT_MS),
     }
 }
 

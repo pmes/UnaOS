@@ -8,7 +8,8 @@
 //! loader sees, ftruncate/fallocate/flock on a scratch file, socketpair, sendfile, a signal delivered once through
 //! rt_sigreturn), then the static glibc busybox `PROBE.LNX` running `sh -c "echo hi; cat /apps/HELLO.C"`.
 //!
-//! Witness: `:: LINUXABI-KAT2: threads=4 counter=400000 futex_waits=<n> epoll=ok statx=ok sigreturn=ok -> PASS ::` and
+//! Witness: `:: LINUXABI-KAT2: threads=4 counter=400000 futex_waits=<n> epoll=ok statx=ok sigreturn=ok checks=26 fail=0 -> PASS ::`
+//! (on a failure the same fields as far as the run got, `?` where unproven, `fail=<id> … scratch=<path>`) and
 //! `:: SELFBUILD2: kat2=<ok|fail(..)|skip> probe=<ok|fail(..)|skip> hi=<0|1> cat_lines=<n> probe_syscalls=<n> probe_missing=[..]
 //! -> PASS|FAIL|SKIP ::`. Absent fixtures = SKIP (staging is arroyo's `build_selfbuild_x86` + the builder).
 
@@ -80,23 +81,27 @@ fn kat2() -> String {
         signal::RETURNS.load(Ordering::Acquire)
     );
     let ok_line = cap.lines().find(|l| l.starts_with("syskat2 ok "));
-    let failed = cap.lines().find_map(|l| l.strip_prefix("syskat2 fail ")).map(|s| String::from(s.trim()));
+    let fail_line = cap.lines().find_map(|l| l.strip_prefix("syskat2 fail ")).map(|s| String::from(s.trim()));
+    // SMALLFIX (B380): the fail line carries the fields as far as the run got ("19 threads=4 … checks=18"); the id is its head.
+    let failed = fail_line.as_deref().map(|s| String::from(s.split_whitespace().next().unwrap_or("none")));
     match (ok_line, failed) {
         (Some(l), None) if rep.pass && rep.exit == "0" => {
             let g = |k| field(l, k).unwrap_or("?");
             let pass = g("threads") == "4" && g("counter") == "400000" && g("epoll") == "ok" && g("statx") == "ok" && g("sigreturn") == "ok";
             serial_println!(
-                ":: LINUXABI-KAT2: threads={} counter={} futex_waits={} epoll={} statx={} sigreturn={} -> {} ::",
-                g("threads"), g("counter"), g("futex_waits"), g("epoll"), g("statx"), g("sigreturn"),
+                ":: LINUXABI-KAT2: threads={} counter={} futex_waits={} epoll={} statx={} sigreturn={} checks={} fail=0 -> {} ::",
+                g("threads"), g("counter"), g("futex_waits"), g("epoll"), g("statx"), g("sigreturn"), g("checks"),
                 if pass { "PASS" } else { "FAIL" }
             );
             if pass { String::from("ok") } else { String::from("fail(fields)") }
         }
         (_, f) => {
             let id = f.unwrap_or_else(|| String::from("none"));
+            let fl = fail_line.as_deref().unwrap_or("");
+            let g = |k| field(fl, k).unwrap_or("?");
             serial_println!(
-                ":: LINUXABI-KAT2: threads=? counter=? futex_waits=? epoll=? statx=? sigreturn=? fail={} exit={} blocked={} -> FAIL ::",
-                id, rep.exit, rep.blocked
+                ":: LINUXABI-KAT2: threads={} counter={} futex_waits={} epoll={} statx={} sigreturn={} checks={} fail={} exit={} blocked={} scratch={} -> FAIL ::",
+                g("threads"), g("counter"), g("futex_waits"), g("epoll"), g("statx"), g("sigreturn"), g("checks"), id, rep.exit, rep.blocked, scratch
             );
             alloc::format!("fail({})", id)
         }

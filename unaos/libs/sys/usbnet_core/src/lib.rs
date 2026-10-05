@@ -124,6 +124,27 @@ pub mod ax88179 {
     }
 }
 
+/// AX88179 bulk-OUT framing (USBNET8, B381), as Linux `ax88179_178a.c` `ax88179_tx_fixup` builds it and `usbnet`'s
+/// `usbnet_start_xmit` sends it: 8 bytes prepended — `tx_hdr1` = the frame length, `tx_hdr2` = the TSO mss (0: no TSO)
+/// with `0x80008000` (padding) when `frame + 8` is an exact multiple of the bulk-OUT max packet; both little-endian.
+/// The driver declares no `FLAG_SEND_ZLP`, so on that exact multiple `usbnet` appends ONE zero byte to end the transfer
+/// on a short packet instead of a ZLP.
+pub mod ax88179_tx {
+    pub const HDR_LEN: usize = 8;
+    pub const PAD_FLAG: u32 = 0x8000_8000;
+    /// `(header, bytes to send)` for a frame of `frame_len` bytes on a bulk-OUT endpoint of max packet `mps`.
+    /// `bytes` = header + frame, + 1 trailing zero byte when that sum is an exact multiple of `mps`.
+    pub fn header(frame_len: usize, mps: usize) -> ([u8; HDR_LEN], usize) {
+        let total = frame_len + HDR_LEN;
+        let exact = mps != 0 && total % mps == 0;
+        let hdr2 = if exact { PAD_FLAG } else { 0 };
+        let mut h = [0u8; HDR_LEN];
+        h[..4].copy_from_slice(&(frame_len as u32).to_le_bytes());
+        h[4..].copy_from_slice(&hdr2.to_le_bytes());
+        (h, total + exact as usize)
+    }
+}
+
 pub mod rtl8153 {
     //! RTL8152/RTL8153 vendor-mode bulk-IN framing.
     //!
@@ -399,5 +420,25 @@ mod tests {
         assert_eq!(f[23], 17, "UDP");
         assert_eq!(&f[26..30], &[10, 0, 1, 2], "the LAN is 10.0.1.0: the source a USBNET8 ARP probe asks for");
         assert_eq!(u16::from_be_bytes([f[34], f[35]]), 5353);
+    }
+
+    #[test]
+    fn ax_tx_header_dhcp_discover_342() {
+        // smoltcp's DHCPDISCOVER: 14 Ethernet + 20 IPv4 + 8 UDP + 300 BOOTP = 342 bytes.
+        let (h, n) = ax88179_tx::header(342, 1024);
+        assert_eq!(h, [0x56, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], "tx_hdr1 = 342 LE, tx_hdr2 = 0");
+        assert_eq!(n, 350, "no pad byte: 350 is not a multiple of 1024 and ends on a short packet");
+    }
+
+    #[test]
+    fn ax_tx_header_exact_multiple_pads() {
+        let (h, n) = ax88179_tx::header(1016, 1024);
+        assert_eq!(&h[..4], &1016u32.to_le_bytes());
+        assert_eq!(&h[4..], &0x8000_8000u32.to_le_bytes());
+        assert_eq!(n, 1025, "usbnet appends one byte (no FLAG_SEND_ZLP)");
+        let (_, n2) = ax88179_tx::header(1016 + 1024, 1024);
+        assert_eq!(n2, 2049);
+        let (h3, n3) = ax88179_tx::header(60, 0);
+        assert_eq!((&h3[4..], n3), (&[0u8; 4][..], 68));
     }
 }

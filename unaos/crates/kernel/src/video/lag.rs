@@ -813,7 +813,25 @@ fn sec_roll(now_ms: u64) {
     let _ = w;
     let rw = if r[0] >= r[1] && r[0] >= r[2] { 0 } else if r[1] >= r[2] { 1 } else { 2 };
     let stall = w_ms >= STALL_MS || r[rw] / 1000 >= STALL_MS;
-    if stall {
+    // M4b (the seat, R86/QUIETBOOT): before `phase=desktop` a stall second is COUNTED, not printed; the first
+    // roll at the desktop says the count in one line. R80: a measurement kept, not a test run.
+    let desk = crate::boot::phase() == crate::boot::Phase::Desktop;
+    if stall && !desk {
+        BOOT_SUPPRESSED.fetch_add(1, Relaxed);
+        let bw = w_ms.max(r[rw] / 1000);
+        if bw >= BOOT_WORST_MS.load(Relaxed) {
+            BOOT_WORST_MS.store(bw, Relaxed);
+            BOOT_WORST_STAGE.store(if w_ms >= r[rw] / 1000 { stage_code(w_name) } else { 10 + rw as u8 }, Relaxed);
+        }
+    }
+    if desk && !BOOT_SAID.swap(true, Relaxed) {
+        let n = BOOT_SUPPRESSED.load(Relaxed);
+        serial_println!(
+            "[lag] stall boot_suppressed={} worst_stage={} worst_ms={}",
+            n, if n == 0 { "none" } else { stage_word(BOOT_WORST_STAGE.load(Relaxed)) }, BOOT_WORST_MS.load(Relaxed)
+        );
+    }
+    if stall && desk {
         let n = STALL_LINES.fetch_add(1, Relaxed);
         if n < STALL_LINES_FREE || n % 64 == 0 {
             let (dw, pr) = if split == 0 {
@@ -861,4 +879,28 @@ pub fn strand_pct(strands: u64, frames: u64) -> u64 {
 /// The INPUTSTALL verdict over one minute's maxima. Pure.
 pub fn verdict(key_queue_ms: u64, comp_ms: u64, hid_gap_ms: u64, strand_pct: u64) -> bool {
     key_queue_ms <= STALL_MS && comp_ms <= STALL_MS && hid_gap_ms <= STALL_MS && strand_pct <= STRAND_PCT_BOUND
+}
+
+// ── INPUTSTALL M4b (the seat): the bare boot stays quiet ─────────────────────────────────────────────
+static BOOT_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
+static BOOT_WORST_MS: AtomicU64 = AtomicU64::new(0);
+static BOOT_WORST_STAGE: AtomicU8 = AtomicU8::new(0);
+static BOOT_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A stall's stage as a byte: `0..5` the [`STAGES`], `5` the HID gap, `10..13` a render phase.
+fn stage_code(name: &str) -> u8 {
+    match STAGES.iter().position(|s| *s == name) {
+        Some(i) => i as u8,
+        None => 5,
+    }
+}
+
+fn stage_word(code: u8) -> &'static str {
+    match code {
+        0..=4 => STAGES[code as usize],
+        10 => "render-route",
+        11 => "render-handler",
+        12 => "render-composite",
+        _ => "hid",
+    }
 }
