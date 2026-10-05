@@ -960,6 +960,12 @@ fn rung2_run(bar0: usize, head: usize, n: u64) {
     LADDER.store(gt_after_window(), Ordering::Release); // GPUTESTS M2: rung 3 parks for `tests kvblank8` (R80) unless `kvblank_trace`
 }
 
+/// KVBLANK9 M3: rung 3's own lines print when the fixture or the knob armed it; under the compositor's first need
+/// they are quiet and its outcome is the one `[wc-h] vbl_src=` line (`kv9_r3_said`).
+macro_rules! r3_println {
+    ($($t:tt)*) => { if !kv9_quiet() { serial_println!($($t)*); } };
+}
+
 /// **§R3 — THE VECTOR.** Allocate `kepler-vblank` from the VECTORS allocator (B168), program the
 /// GK107 function with it through `enable_msi` — or route its INTx through the IOAPIC (B147) when
 /// MSI is refused — unmask PMC bit 26 and the per-head VBLANK enable, and open the window.
@@ -973,10 +979,11 @@ fn rung3_arm(bar0: usize, head: usize, n: u64) {
 
     let bdf1 = VB_BDF1.load(Ordering::Acquire);
     if bdf1 == 0 {
-        serial_println!(
+        r3_println!(
             ":: kepler: vblank-intr vector REFUSED reason=no-bdf — the BAR0 match at kepler::init named no NVIDIA function up to bus {}, so there is no config space to program and NOTHING was armed. mode={} ::",
             GK107_BUS_MAX, mode_str(),
         );
+        kv9_r3_said(false, "no-bdf", 0, 0); // KVBLANK9 M3
         LADDER.store(LADDER_DONE, Ordering::Release);
         return;
     }
@@ -986,11 +993,12 @@ fn rung3_arm(bar0: usize, head: usize, n: u64) {
     let vec = match ensure_vector() {
         Some(v) => v,
         None => {
-            serial_println!(
+            r3_println!(
                 ":: kepler: vblank-intr vector REFUSED reason=alloc — vectors::alloc(\"kepler-vblank\") answered None and has printed its own witness above. NOTHING was armed; mode stays {} ::",
                 mode_str(),
             );
-            LADDER.store(LADDER_DONE, Ordering::Release);
+            kv9_r3_said(false, "alloc", 0, 0); // KVBLANK9 M3
+        LADDER.store(LADDER_DONE, Ordering::Release);
             return;
         }
     };
@@ -1005,10 +1013,11 @@ fn rung3_arm(bar0: usize, head: usize, n: u64) {
     };
     IRQ_WIRE.store(wire, Ordering::Relaxed);
     if wire == 0 {
-        serial_println!(
+        r3_println!(
             ":: kepler: vblank-intr vector REFUSED reason=no-msi-no-intx bdf={}:{}.{} vector={:#04x} — this function offers no usable MSI capability and the IOAPIC would not take its INTx. The vector stays allocated (it is registered in the IDT and owned by name, which is the allocator's contract) and NOTHING on the GK107 was armed. mode stays {} ::",
             bus, slot, func, vec, mode_str(),
         );
+        kv9_r3_said(false, "no-msi-no-intx", 0, 0); // KVBLANK9 M3
         LADDER.store(LADDER_DONE, Ordering::Release);
         return;
     }
@@ -1049,7 +1058,7 @@ fn rung3_arm(bar0: usize, head: usize, n: u64) {
     };
     IRQ_EN_ARMED.store(en_armed, Ordering::Relaxed);
     IRQ_MASK_ARMED.store(mask_armed, Ordering::Relaxed);
-    serial_println!(
+    r3_println!(
         ":: kepler: vblank-intr vector armed bdf={}:{}.{} vector={:#04x} wire={} pmc_entry={:08X} pmc_bit={} en_entry={:08X} head={} window_vblanks={} storm_cap={} cmd={:04X} pmc_en_armed={:08X} pmc_mask_entry={:08X} pmc_mask_armed={:08X} :: — the vector came from interrupts::vectors::alloc (rmbp-ledger B168). wire=1 MSI, wire=2 INTx via IOAPIC (B147). KVBLANK3 (B192): PMC is armed on INTR_MASK_HOST 0x640 = ONLY bit {} (PDISPLAY) and INTR_ENABLE_HOST 0x140 |= bit 0 (hw enable) — envytools pmc.rst:45/:374-377 and :30/:345-349 — both READ BACK here; KVBLANK2 wrote bit 26 into 0x140, which has no bit 26. The ISR acknowledges by DISARMING at INTR_HOST_HEAD_EN (rnndb display/g80_pdisplay.xml:542) and NEVER by writing a status or trigger register, because rnndb names no ack protocol for them. writes=3 (head enable, PMC mask, PMC enable), all restored at window close ::",
         bus, slot, func, vec, wire, pmc_entry, PMC_INTR_BIT_PDISPLAY, en_entry, head,
         IRQ_WINDOW_VBLANKS, IRQ_STORM_CAP, cmd, en_armed, mask_entry, mask_armed, PMC_INTR_BIT_PDISPLAY,
@@ -1181,9 +1190,10 @@ fn rung3_run(bar0: usize, head: usize, n: u64) {
     // **THE MODE IS DECIDED HERE, BY THE WIRE.** Not by the knob, not by a `cfg`, not by whether
     // the registers were cited: by whether the GK107 delivered an interrupt to this kernel.
     IRQ_MODE.store(irq > 0, Ordering::Release);
+    kv9_r3_close(keep, irq, elapsed, reason); // KVBLANK9 M3: the 90 % verdict, as the fixture scores it
 
     let clean = keep || (pmc_back == pmc_entry && mask_back == mask_entry && en_back == en_entry);
-    serial_println!(
+    r3_println!(
         ":: kepler: vblank-intr vector close head={} irq={} vbl_delta={} rearms={} wire={} vector={:#04x} storm={} pmc_restored={:08X} pmc_readback={:08X} en_restored={:08X} en_readback={:08X} verdict={} mode={} deliver={} reason={} intr_or={:08X} line_or={:08X} mask_restored={:08X} mask_readback={:08X} :: — irq= is ISR ENTRIES and vbl_delta= is HEAD_STAT.VERT[31:16] vblanks over the same window, so irq/vbl_delta is the delivery ratio. deliver=/reason= (KVBLANK3, B192) name the FIRST broken link in the order the signal travels: wiring, bus master, PMC enable read-back, PMC mask read-back, INTR_0 bit 26 (PDISPLAY raised its input), INTR_LINE_HOST (the line asserted), delivery. writes=6 total (3 arm, 3 restore), all read back. mode= is set by irq= and by nothing else ::",
         head, irq, elapsed, ISR_REARMS.load(Ordering::Relaxed), IRQ_WIRE.load(Ordering::Relaxed),
         IRQ_VECTOR1.load(Ordering::Relaxed).saturating_sub(1), IRQ_STORMED.load(Ordering::Relaxed) as u32,
@@ -1193,7 +1203,7 @@ fn rung3_run(bar0: usize, head: usize, n: u64) {
     );
     // KVBLANK5 M1 — the ISR's books, once per close (`rearms=` above is now ISR_REARMS; the old
     // rung-3 poll re-arm count is `poll_rearms=` here).
-    serial_println!(
+    r3_println!(
         ":: kepler: vblank-isr books isr_calls={} acks={} rearms={} rearm_written={:08X} rearm_readback={} pending_pre={} stuck={} poll_rearms={} kept_live={} :: — KVBLANK5: acks = INTR_HOST_HEAD latch-ack writes; rearm_readback = re-arms whose HEAD_EN read back with the vblank bit; stuck = consecutive acks after which the vblank bit was still pending ::",
         ISR_CALLS.load(Ordering::Relaxed), ISR_ACKS.load(Ordering::Relaxed), ISR_REARMS.load(Ordering::Relaxed),
         REARM_WRITTEN.load(Ordering::Relaxed) as u32, REARM_READBACK.load(Ordering::Relaxed),
@@ -1719,11 +1729,13 @@ pub fn pump_spawn_once() {
         return;
     }
     // `desktop_allowed()` is NOT consulted: the pump reads one BAR0 word and the MSI vector needs no compositor.
-    serial_println!(
-        ":: kepler: vblank-intr rung3 scheduled=boot reason=ladder-fed-by-pump-not-by-compositor-presents stage_resolved={} pump_ms={} stale_ms={} :: — KVBLANK6: the ladder's edges came only from `beam::hold`; the pump task samples `scanout_beam()` when no compositor edge is newer than stale_ms ::",
-        stage_resolved_u32(),
-        PUMP_MS, PUMP_STALE_MS,
-    );
+    if cfg!(feature = "kvblank_trace") { // KVBLANK9 M3 (R80): rung 3 is scheduled by the compositor's first need; the knob keeps the line
+        serial_println!(
+            ":: kepler: vblank-intr rung3 scheduled=boot reason=ladder-fed-by-pump-not-by-compositor-presents stage_resolved={} pump_ms={} stale_ms={} :: — KVBLANK6: the ladder's edges came only from `beam::hold`; the pump task samples `scanout_beam()` when no compositor edge is newer than stale_ms ::",
+            stage_resolved_u32(),
+            PUMP_MS, PUMP_STALE_MS,
+        );
+    }
     crate::arch::sched::spawn("kvblank-pump", pump_task, 0, crate::arch::percpu::this_cpu().cpu_index as usize, crate::arch::sched::PRIO_NORMAL);
 }
 
@@ -2528,43 +2540,46 @@ static GT_R3_IRQ: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn gt_after_window() -> u32 {
-    if cfg!(feature = "kvblank_trace") { LADDER_IRQ_ARM } else { LADDER_IRQ_PARKED }
+    // KVBLANK9 M3: the knob arms rung 3 itself (`armed_by=trace`); a rung 3 that already ran this boot (first need,
+    // or an earlier `tests kvblank8`) is not re-armed by a test's rungs 1-2; otherwise rung 3 parks for first need.
+    if cfg!(feature = "kvblank_trace") {
+        let _ = KV9_ARMED_BY.compare_exchange(KV9_BY_NONE, KV9_BY_TRACE, Ordering::AcqRel, Ordering::Acquire);
+        return LADDER_IRQ_ARM;
+    }
+    if KV9_ARMED_BY.load(Ordering::Acquire) != KV9_BY_NONE { LADDER_DONE } else { LADDER_IRQ_PARKED }
 }
 
-/// Un-park rung 3 and wait (bounded) for its window to close on the edge driver; print the 90 % check.
+/// Report rung 3: armed by the compositor's first need (the usual case on a flown desktop), by the knob, or — when
+/// it is still parked — armed HERE and waited for (bounded) on the edge driver. Prints the 90 % check.
 fn gt_rung3_from_fixture() {
-    // Rungs 1-2 still own the ladder for ~4.5 s after the takeover: wait for the park, bounded 10 s.
+    // Rungs 1-2 (`kv9_rungs12`) own the ladder first: wait for them, bounded 10 s.
     let mut w = 0u32;
     while matches!(LADDER.load(Ordering::Acquire), LADDER_CENSUS | LADDER_WINDOW_ARM | LADDER_WINDOW_RUN) && w < 1_000 {
         crate::arch::sched::sleep_ms(10);
         w += 1;
     }
-    let st = LADDER.load(Ordering::Acquire);
-    if st != LADDER_IRQ_PARKED {
-        serial_println!(
-            ":: KVBLANK8: rung3 state={} note={} ::",
-            match st { LADDER_IRQ_ARM | LADDER_IRQ_RUN => "running", LADDER_DONE => "done", _ => "not-parked" },
-            if st == LADDER_DONE { "rung-3-already-ran-this-boot-its-close-line-above-is-the-window" } else { "rung-3-not-parked-the-instrument-waits-for-it" },
-        );
-        return;
+    if LADDER.load(Ordering::Acquire) == LADDER_IRQ_PARKED {
+        let _ = kv9_take(KV9_BY_TEST);
     }
-    if LADDER.compare_exchange(LADDER_IRQ_PARKED, LADDER_IRQ_ARM, Ordering::AcqRel, Ordering::Acquire).is_err() {
-        return;
-    }
-    // The arm runs on the next edge; the window is IRQ_WINDOW_VBLANKS edges (1 s at 60 Hz). Bounded 5 s.
+    // The arm runs on the next edge; the window is IRQ_WINDOW_VBLANKS edges (1 s at 60 Hz). Bounded 6 s, which also
+    // covers a first-need window that was still open when the test was typed.
     let mut w = 0u32;
-    while matches!(LADDER.load(Ordering::Acquire), LADDER_IRQ_ARM | LADDER_IRQ_RUN) && w < 500 {
+    while matches!(LADDER.load(Ordering::Acquire), LADDER_IRQ_ARM | LADDER_IRQ_RUN) && w < 600 {
         crate::arch::sched::sleep_ms(10);
         w += 1;
     }
     let (irq, vbl) = (GT_R3_IRQ.load(Ordering::Relaxed), GT_R3_VBL.load(Ordering::Relaxed));
     let kept = IRQ_KEPT.load(Ordering::Acquire);
-    let open = matches!(LADDER.load(Ordering::Acquire), LADDER_IRQ_ARM | LADDER_IRQ_RUN);
+    let st = LADDER.load(Ordering::Acquire);
+    let open = matches!(st, LADDER_IRQ_ARM | LADDER_IRQ_RUN);
+    let by = KV9_ARMED_BY.load(Ordering::Acquire);
     serial_println!(
-        ":: KVBLANK8: rung3 irq={} vbl_delta={} ratio_pct={} kept={} window={} -> {} ::",
-        irq, vbl, irq.saturating_mul(100) / vbl.max(1), kept as u32,
-        if open { "still-open-after-5s" } else { "closed" },
-        if kept && !open { "PASS" } else { "FAIL" },
+        ":: KVBLANK8: rung3 armed_by={} irq={} vbl_delta={} ratio_pct={} kept={} why={} first_need_said={} window={} -> {} ::",
+        kv9_by_str(by), irq, vbl, irq.saturating_mul(100) / vbl.max(1), kept as u32,
+        KV9_WHYS[(KV9_WHY.load(Ordering::Relaxed) as usize).min(KV9_WHYS.len() - 1)],
+        KV9_SAID.load(Ordering::Acquire) as u32,
+        if open { "still-open-after-6s" } else if st == LADDER_IRQ_PARKED { "never-armed" } else { "closed" },
+        if kept && !open && by != KV9_BY_NONE { "PASS" } else { "FAIL" },
     );
 }
 
@@ -2714,4 +2729,130 @@ fn kv9_rungs12(bar0: usize, head: usize) {
         if open { "still-open-after-10s" } else { "closed" }, w * 10,
         if open { "FAIL" } else { "PASS" },
     );
+}
+
+
+// ── KVBLANK9 M3 (B341) — FIRST NEED: the compositor arms rung 3 itself ─────────────────────────────────────────────
+//
+// GPUTESTS parked rung 3 for `tests kvblank8`, so a flown desktop paced on the poll source until an operator typed the
+// test. The vblank source is first NEEDED by the compositor's first beam-held present after the Kepler takeover's
+// head arm (`video::beam::hold`, once `scanout_beam()` answers). That present calls [`first_need`]: one CAS
+// PARKED -> IRQ_ARM, no wait on the present path. Rung 3 then runs unchanged on the edge driver (MSI or INTx, the
+// 60-vblank window, the 90 % keep check, the restore on failure) with its own lines quiet, and its close says ONE line:
+// `[wc-h] vbl_src=irq why=first-need …` or `[wc-h] vbl_src=poll why=<reason> …`. Bounded: a window that has not
+// closed 5 s after the arm is reported `vbl_src=poll why=window-timeout` from the next present.
+
+const KV9_BY_NONE: u32 = 0;
+const KV9_BY_COMPOSITOR: u32 = 1;
+const KV9_BY_TEST: u32 = 2;
+const KV9_BY_TRACE: u32 = 3;
+/// Who armed rung 3 this boot; the first CAS off NONE wins, and is the arm's lock.
+static KV9_ARMED_BY: AtomicU32 = AtomicU32::new(KV9_BY_NONE);
+/// First need: 0 not yet armed, 1 armed (window running), 2 said or nothing to say.
+static KV9_FN: AtomicU32 = AtomicU32::new(0);
+static KV9_FN_AT_MS: AtomicU64 = AtomicU64::new(0);
+/// The `[wc-h] vbl_src=` line is said once.
+static KV9_SAID: AtomicBool = AtomicBool::new(false);
+/// Index into [`KV9_WHYS`]: rung 3's outcome, whoever armed it.
+static KV9_WHY: AtomicU32 = AtomicU32::new(0);
+/// The first-need window's bound, from the arm.
+const KV9_FN_BOUND_MS: u64 = 5_000;
+const KV9_WHYS: [&str; 16] = [
+    "-", "first-need", "no-bdf", "alloc", "no-msi-no-intx", "storm", "below-90pct", "no-rearm", "window-timeout",
+    "no-bus-master", "intx-disabled-in-command", "pmc-enable-not-latched", "pmc-mask-not-latched",
+    "pdisplay-not-raised", "line-not-asserted", "line-asserted-not-delivered",
+];
+
+fn kv9_why_idx(why: &str) -> u32 {
+    KV9_WHYS.iter().position(|w| *w == why).unwrap_or(0) as u32
+}
+
+fn kv9_by_str(by: u32) -> &'static str {
+    match by {
+        KV9_BY_COMPOSITOR => "compositor",
+        KV9_BY_TEST => "test",
+        KV9_BY_TRACE => "trace",
+        _ => "none",
+    }
+}
+
+/// Rung 3's lines are quiet when first need armed it.
+#[inline]
+fn kv9_quiet() -> bool {
+    KV9_ARMED_BY.load(Ordering::Acquire) == KV9_BY_COMPOSITOR
+}
+
+/// Take the parked rung 3 for `by`: the arm lock first, then the ladder. `false` when someone else holds either.
+fn kv9_take(by: u32) -> bool {
+    if KV9_ARMED_BY.compare_exchange(KV9_BY_NONE, by, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return false;
+    }
+    if LADDER.compare_exchange(LADDER_IRQ_PARKED, LADDER_IRQ_ARM, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        KV9_ARMED_BY.store(KV9_BY_NONE, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+/// Rung 3's outcome: banked for `tests kvblank8`, and said once as `[wc-h] vbl_src=` when first need armed it.
+fn kv9_r3_said(irq_src: bool, why: &str, irq: u64, vbl: u64) {
+    KV9_WHY.store(kv9_why_idx(why), Ordering::Relaxed);
+    if !kv9_quiet() || KV9_SAID.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    KV9_FN.store(2, Ordering::Release);
+    serial_println!(
+        "[wc-h] vbl_src={} why={} irq={} vbl_delta={} ratio_pct={} wire={} armed_ms={}",
+        if irq_src { "irq" } else { "poll" }, why, irq, vbl, irq.saturating_mul(100) / vbl.max(1),
+        match IRQ_WIRE.load(Ordering::Relaxed) { 1 => "msi", 2 => "intx", _ => "none" },
+        crate::arch::ms().saturating_sub(KV9_FN_AT_MS.load(Ordering::Relaxed)),
+    );
+}
+
+/// Rung 3's close: the 90 % keep decision `rung3_run` took, named.
+fn kv9_r3_close(keep: bool, irq: u64, vbl: u64, reason: &str) {
+    let why = if keep {
+        "first-need"
+    } else if IRQ_STORMED.load(Ordering::Relaxed) {
+        "storm"
+    } else if irq == 0 {
+        reason
+    } else if ISR_REARMS.load(Ordering::Relaxed) == 0 {
+        "no-rearm"
+    } else {
+        "below-90pct"
+    };
+    kv9_r3_said(keep, why, irq, vbl);
+}
+
+/// FIRST NEED — called by `video::beam::hold` on every present that has a beam source. One atomic load once said;
+/// one CAS on the first call after the takeover's head arm; never waits.
+#[inline]
+pub fn first_need() {
+    match KV9_FN.load(Ordering::Acquire) {
+        2 => return,
+        1 => {
+            if !KV9_SAID.load(Ordering::Acquire)
+                && crate::arch::ms().saturating_sub(KV9_FN_AT_MS.load(Ordering::Relaxed)) > KV9_FN_BOUND_MS
+            {
+                kv9_r3_said(false, "window-timeout", IRQ_COUNT.load(Ordering::Relaxed), 0);
+            }
+            return;
+        }
+        _ => {}
+    }
+    if VB_BAR0.load(Ordering::Acquire) == 0 || VB_HEAD1.load(Ordering::Acquire) == 0 {
+        return; // no Kepler head armed (QEMU, the iGPU path): nothing to arm
+    }
+    if LADDER.load(Ordering::Acquire) != LADDER_IRQ_PARKED {
+        // A test's rungs 1-2 hold the ladder (retry on a later present), or the knob/test already armed rung 3.
+        if KV9_ARMED_BY.load(Ordering::Acquire) != KV9_BY_NONE {
+            KV9_FN.store(2, Ordering::Release);
+        }
+        return;
+    }
+    KV9_FN_AT_MS.store(crate::arch::ms(), Ordering::Relaxed);
+    if kv9_take(KV9_BY_COMPOSITOR) {
+        let _ = KV9_FN.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+    }
 }

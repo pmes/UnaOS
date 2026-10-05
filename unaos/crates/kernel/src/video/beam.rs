@@ -240,6 +240,11 @@ pub fn hold(y0: usize, y1: usize, panel_h: usize, slow: bool, record: bool) -> O
     // `nvidia-kepler-vblank` build; a `UNAOS_TESTS_AT_BOOT=1` lane still runs it at registration, which is how
     // `x86-witness.spec` keeps scoring its two verdicts). Nothing of it runs on the present path.
     let (v0, vt) = crate::arch::scanout_beam()?;
+    // KVBLANK9 M3 (B341): FIRST NEED. A beam source answering means the Kepler takeover's head arm ran; this present
+    // is the first that needs the vblank source, so it arms KVBLANK rung 3 (one CAS, no wait; the window runs on the
+    // edge driver and says one `[wc-h] vbl_src=` line). Once said, one atomic load per present.
+    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
+    crate::drivers::gpu::kepler_vblank::first_need();
     if vt == 0 || panel_h == 0 {
         return None;
     }
