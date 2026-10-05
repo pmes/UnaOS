@@ -155,3 +155,37 @@ RGBA PNG for eyes; `--frames` writes each composited frame; `--compare` / `--com
 Chromium oracles; `--digest` prints the pinned KAT digest.
 
 Not decoded: lossy VP8 (RFC 6386 intra decoder + ALPH) — OWED; animation (ANIM/ANMF) — OWED.
+
+## M5 — the host face (`gneiss_pal::dsp::image`) and Aether behind it
+
+* `libs/gneiss_pal/src/dsp/{mod,image}.rs`: Gneiss's DSP module (CODEX §2: "Audio and Video codecs") gets
+  its still-image face — `gneiss_pal::dsp::image` re-exports `pixel_core` whole (`decode`, `sniff`, the
+  per-format `decode_*`, `Image`/`Frame`/`Format`/`Error`, `MAX_DIM`/`MAX_PIXELS`). No wrapper types, no
+  second copy: the host and the kernel run the same code. `gneiss_pal` depends on `pixel_core` by path.
+* Aether (`handlers/aether`): every raster decode — page `<img>`s in `net::fetch_page`, `data:` URIs, the
+  favicon — goes through ONE function, `images::decode_raster`, which calls `gneiss_pal::dsp::image::decode`
+  and applies the EXIF orientation (CSS `image-orientation: from-image`, the browser default). The
+  third-party crates sit behind it, each behind a feature (all three on by default):
+  * `pixel-core` — UnaOS's decoders first. Off = the `image` crate in front for everything (reversible).
+  * `image-fallback` — enables the `image` crate's format decoders (`image/default-formats`), consulted ONLY
+    for what pixel_core refuses: lossy WebP, ICO (favicons), TIFF, AVIF, the formats pixel_core has not
+    reached, or a file it calls malformed. Without it the `image` crate is compiled with only its `png`
+    codec: the `RgbaImage` container the renderer holds and the PNG writer `headless` screenshots use.
+  * `svg` — `resvg` (SVG is vector, not pixel_core's domain). Without it `decode_svg` is a miss.
+* R83 bumps: `image` pinned to `0.25.10` (the latest stable on crates.io, 2026-10-04; it was `"0.25"`,
+  default features — now `default-features = false`, `rayon` dropped); `resvg` `0.47` → `0.48.1` (latest
+  stable).
+* Kernel: Facet's viewer already calls `pixel_core::decode` (M1, `video/facet.rs` `decode_foreign`; an
+  animated GIF shows frame 0) — the one call site, unchanged here. The PNG path stays the streaming
+  scale-while-decoding row sink (48 MiB heap: a PNG is never materialised), on the same inflater. EXIF
+  orientation is NOT applied in the kernel viewer yet: `Image::apply_orientation` allocates a second full
+  RGBA buffer infallibly, which the kernel heap must not risk; a fallible/in-place rotate is owed.
+* Sibling arc: `handlers/facet` (FACET, ledger SR29, branch `exec-host-facet`) is the host Images handler
+  CODEX §2 charters; it builds against THIS `gneiss_pal::dsp::image` shape (the `pixel_core` re-export, not
+  a wrapper), so a change to that surface is a change to its contract.
+* Fold note: `libs/gneiss_pal/src/dsp/mod.rs` and the `pub mod dsp;` line in `gneiss_pal/src/lib.rs` are
+  also created by the sibling media arcs (PLAYBACK: `avsync`, `video`, `demux`; the audio arc: `audio`).
+  The merge is a union of `pub mod` lines; this arc owns only `pub mod image;` and `dsp/image.rs`.
+* Proof: `cargo test --release -p pixel_core -p aether` — rc=0, 98 passed / 0 failed (aether 84 incl.
+  the engine image tests that encode PNG/JPEG fixtures and decode them through `decode_raster`; pixel_core
+  14 across the PNG/JPEG/M3/WebP/inflate KATs and the 89 pinned Chromium digests).
