@@ -10900,7 +10900,7 @@ pub fn await_u2_0a_verdict() {
 /// (the U1a/U1b demos, which ran earlier, are unaffected).
 pub fn u2_probe_once() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
     }
     // Gate: storage enumerated (same as fat::probe_once) AND a scheduled AP to run ring 3 on
@@ -15838,7 +15838,7 @@ pub fn u4x_launcher(demo_cpu: usize) {
 /// nothing until a block device and a scheduled AP exist; a missing HELLO.BIN skips the demo cleanly.
 pub fn u4x_probe_once() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
     }
     if crate::drivers::block::info().is_none() {
@@ -16154,7 +16154,7 @@ pub fn u6x_launcher(demo_cpu: usize) {
 /// I/O — the U5x fixture is an inline blob (unlike U2/U4x's disk-loaded child).
 pub fn u5x_probe_once() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
     }
     // U5x is an INLINE console-cap demo — it needs NO block device (its fixture is an inline blob; sys_write
@@ -16181,7 +16181,7 @@ pub fn u5x_probe_once() {
 /// skipped cleanly (no false FAIL) — exactly as U4x skips.
 pub fn u6x_probe_once() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
     }
     if crate::drivers::block::info().is_none() {
@@ -16380,7 +16380,7 @@ pub fn u6bx_probe_once() {
     // launchers' `U6BX_LAUNCH_DONE` gate orders the demos regardless of which probe fires first.
     u7x_probe_once();
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
     }
     if crate::drivers::block::info().is_none() {

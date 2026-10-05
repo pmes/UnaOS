@@ -343,7 +343,11 @@ pub fn configured(slot: u8) {
 
 /// Bring-up state for the controller's service pass.
 pub fn bringup_pending() -> Option<u8> {
-    if STATE.load(Ordering::Relaxed) == ST_CONFIGURED { Some(SLOT.load(Ordering::Relaxed)) } else { None }
+    if STATE.load(Ordering::Relaxed) != ST_CONFIGURED || !crate::boot::services_gate("usbnet") {
+        return None; // INSTALLBARE (R86): the class bring-up (the register walk, rx arm, link poll) waits for the Desktop's services; enumeration already ran
+    }
+    crate::boot::note_start("usbnet");
+    Some(SLOT.load(Ordering::Relaxed))
 }
 pub fn cfg_value() -> u8 { CFG_VALUE.load(Ordering::Relaxed) }
 pub fn ctrl_iface() -> u8 { CTRL_IFACE.load(Ordering::Relaxed) }

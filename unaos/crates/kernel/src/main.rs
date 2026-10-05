@@ -6434,7 +6434,7 @@ fn x86_render_service(cpu: usize) {
                 unaos_kernel::video::wm::WIN_NONE,
             )
         };
-        if desktop && !rescue {
+        if desktop && !rescue && unaos_kernel::boot::desktop() { // INSTALLBARE (R86): no shell window before the Desktop phase — the furniture is owed (`login::furniture_owed`) and the first login mints it. SAME-LINE fold.
             let info = front_fb.info();
             match open_shell_window(info.width, info.height) {
                 Some((store, fb, id)) => {

@@ -7766,7 +7766,7 @@ fn wcdvalve_closed() -> bool {
     }
     if WCDVALVE_SHUT.load(Relaxed) {
         let k = WCDVALVE_SUSPENDED.fetch_add(1, Relaxed) + 1;
-        if !WCDVALVE_SAID.swap(true, Relaxed) {
+        if !WCDVALVE_SAID.swap(true, Relaxed) { crate::boot::note_valve(); // INSTALLBARE: the pre-Desktop census. SAME-LINE fold
             serial_println!(
                 "[wc-d] valve CLOSED util~{}% wcd~{}% suspended={}",
                 WCDVALVE_UTIL.load(Relaxed),
@@ -7819,7 +7819,7 @@ fn verify_reference(
     // blinded — the battery stays owed and is paid the ordinary way once the valve reopens. See the
     // ledger above [`wcdvalve_closed`]. Compiled out entirely without the `wcdvalve` knob.
     #[cfg(all(target_arch = "x86_64", feature = "wcdvalve"))]
-    if wcdvalve_closed() {
+    if !crate::boot::services_up() || wcdvalve_closed() { // INSTALLBARE (R86): no WC-D read-back — so no valve episode — before the Desktop's services (flight 22: CLOSED 29 027 ms under the setter)
         return None;
     }
     let (step, running) = wcd_admit(r.id, i)?;
@@ -23483,7 +23483,7 @@ fn create_inner(
 ) -> WinId {
     if surf == 0 || w == 0 || h == 0 || stride == 0 || surf_len == 0 {
         return WIN_NONE;
-    }
+    } crate::boot::note_window(owner_asid); // INSTALLBARE (R86): the pre-Desktop census — a window minted under the setter / the login screen (owner ≠ the screen's 0). SAME-LINE fold
     // F1 — the surface-extent contract. A row must fit its stride and the rows must fit the slot;
     // saturating arithmetic so a hostile `h`/`stride` overflows into a rejection, not a wrap (the
     // kernel builds with overflow checks off, so `h * stride` alone could wrap to something small).
