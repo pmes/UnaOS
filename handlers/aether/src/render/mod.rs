@@ -2339,7 +2339,7 @@ pub fn render_frame(
         line_through: false,
         shift_y: 0.0,
         list_style: 1,
-        family: 0,
+        family: 1, // the default standard font is serif (Times New Roman)
         text_hidden: false,
         text_transform: 0,
         center_box: None,

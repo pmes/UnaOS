@@ -1580,7 +1580,9 @@ pub fn remeasure(tree: &mut LayoutTree) {
             }
         }
     }
-    let root = TextRun { font_size: 16.0, ..Default::default() };
+    // The initial font: Chromium's default standard font, Times New Roman
+    // (Liberation Serif) at 16px — an unstyled page is serif.
+    let root = TextRun { font_size: 16.0, family: 1, ..Default::default() };
     let mut sizes: HashMap<taffy::NodeId, f32> = HashMap::new();
     let mut elem_info: HashMap<taffy::NodeId, TextRun> = HashMap::new();
     // The rem basis: the root element's computed font-size.
