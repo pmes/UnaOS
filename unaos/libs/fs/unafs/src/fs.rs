@@ -191,6 +191,82 @@ pub struct ReclaimEntry {
     pub blocks: Vec<u64>,
 }
 
+// UNAFSCODEC (SR53): the spec §R encodings of the list records stored as
+// object data (docs/dev/OS/09_FILESYSTEM/unafs-records.md §R9, §R11, §R12).
+
+/// §R9 `DirEntry`: name string, `u64` logical inode id, [`FileKind`].
+impl crate::codec::Encode for DirEntry {
+    fn encode(&self, w: &mut crate::codec::Writer) {
+        w.str(&self.name);
+        w.u64(self.inode_id);
+        crate::codec::Encode::encode(&self.kind, w);
+    }
+}
+
+impl crate::codec::Decode for DirEntry {
+    const NAME: &'static str = "DirEntry";
+    const MIN_LEN: usize = 20;
+    fn decode(r: &mut crate::codec::Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(DirEntry {
+            name: r.string("DirEntry.name")?,
+            inode_id: r.u64("DirEntry.inode_id")?,
+            kind: FileKind::decode_field(r, "DirEntry.kind")?,
+        })
+    }
+}
+
+/// §R11 `SnapshotEntry`: three `u64`, two strings, one `u64`.
+impl crate::codec::Encode for SnapshotEntry {
+    fn encode(&self, w: &mut crate::codec::Writer) {
+        w.u64(self.generation);
+        w.u64(self.imap_block);
+        w.u64(self.imap_leaves);
+        w.str(&self.name);
+        w.str(&self.creator);
+        w.u64(self.timestamp);
+    }
+}
+
+impl crate::codec::Decode for SnapshotEntry {
+    const NAME: &'static str = "SnapshotEntry";
+    const MIN_LEN: usize = 48;
+    fn decode(r: &mut crate::codec::Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(SnapshotEntry {
+            generation: r.u64("SnapshotEntry.generation")?,
+            imap_block: r.u64("SnapshotEntry.imap_block")?,
+            imap_leaves: r.u64("SnapshotEntry.imap_leaves")?,
+            name: r.string("SnapshotEntry.name")?,
+            creator: r.string("SnapshotEntry.creator")?,
+            timestamp: r.u64("SnapshotEntry.timestamp")?,
+        })
+    }
+}
+
+/// §R12 `ReclaimEntry`: `u64` generation, then the block list.
+impl crate::codec::Encode for ReclaimEntry {
+    fn encode(&self, w: &mut crate::codec::Writer) {
+        w.u64(self.generation);
+        w.seq(&self.blocks);
+    }
+}
+
+impl crate::codec::Decode for ReclaimEntry {
+    const NAME: &'static str = "ReclaimEntry";
+    const MIN_LEN: usize = 16;
+    fn decode(r: &mut crate::codec::Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(ReclaimEntry {
+            generation: r.u64("ReclaimEntry.generation")?,
+            blocks: r.seq("ReclaimEntry.blocks")?,
+        })
+    }
+}
+
+crate::codec::list_name!(
+    DirEntry => "DirEntry",
+    SnapshotEntry => "SnapshotEntry",
+    ReclaimEntry => "ReclaimEntry",
+);
+
 /// Commit-path benchmark counters (vaire ruling: the numbers must exist).
 /// The kernel witness prints these next to a CNTPCT tick delta; the host
 /// bench reads them directly.

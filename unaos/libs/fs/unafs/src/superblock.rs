@@ -302,3 +302,30 @@ impl Superblock {
         Ok(())
     }
 }
+
+/// UNAFSCODEC §R2 `Superblock`: 37 bytes at the head of block 0.
+impl crate::codec::Encode for Superblock {
+    fn encode(&self, w: &mut crate::codec::Writer) {
+        w.raw(&self.magic);
+        w.u32(self.version);
+        w.u32(self.block_size);
+        w.u64(self.block_count);
+        w.u64(self.root_inode);
+        w.u64(self.catalog_inode);
+    }
+}
+
+impl crate::codec::Decode for Superblock {
+    const NAME: &'static str = "Superblock";
+    const MIN_LEN: usize = 37;
+    fn decode(r: &mut crate::codec::Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(Superblock {
+            magic: r.array("Superblock.magic")?,
+            version: r.u32("Superblock.version")?,
+            block_size: r.u32("Superblock.block_size")?,
+            block_count: r.u64("Superblock.block_count")?,
+            root_inode: r.u64("Superblock.root_inode")?,
+            catalog_inode: r.u64("Superblock.catalog_inode")?,
+        })
+    }
+}
