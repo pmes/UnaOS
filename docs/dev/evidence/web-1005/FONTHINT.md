@@ -142,6 +142,10 @@ the web-font page B359 used. That change is not made here because the row scopes
   `autohint=true` with `hintfull` (normal auto-hinting, both axes) is not modelled.
 * The FreeType gray rasterizer is not reproduced (bitmap exact 12 %). Skia's AAA is the target and is matched.
 
+## Licence (R87)
+
+The hinter is a reimplementation from FreeType 2.13.2 source (`src/autofit`, `src/psaux`). FreeType is dual-licensed FTL / GPLv2-or-later; Peter chose the GPL route ("yes for the 3 and GPL", 2026-10-05): the code is carried under font_core's GPL-3.0-or-later with the FreeType and Adobe copyright notices in `font_core/src/hint/mod.rs` and `docs/CREDITS.md`. No FTL attribution clause applies.
+
 ## How to reproduce
 
 ```

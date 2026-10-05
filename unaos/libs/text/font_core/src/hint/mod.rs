@@ -1,5 +1,12 @@
 //! FONTHINT (LEDGER SR62): hinting, the way Chromium on Linux asks FreeType for it.
 //!
+//! LICENCE (RULINGS R87): this module and its children (`autofit`, `autofit_tables`, `cff_hint`, `coverage`, `fixed`) are
+//! derived from FreeType 2.13.2 — `src/autofit` (the light auto-hinter: aflatin.c, afhints.c, afglobal.c, afcjk.c and the
+//! script tables) and `src/psaux` (the Adobe CFF hinting engine: psintrp.c, pshints.c, psblues.c). FreeType is dual-licensed
+//! under the FreeType Licence and the GNU GPL version 2 or later; this reimplementation takes the GPL option and is carried
+//! under font_core's GPL-3.0-or-later (this tree's licence). Copyright 1996-2023 David Turner, Robert Wilhelm and Werner
+//! Lemberg (FreeType); the Adobe CFF engine copyright 2006-2023 Adobe Systems Incorporated. See docs/CREDITS.md.
+//!
 //! The host's fontconfig gives every face `hintslight` (10-hinting-slight.conf, autohint false). Skia maps that to
 //! `SkFontHinting::kSlight`, which loads glyphs with `FT_LOAD_TARGET_LIGHT`. FreeType 2.13 then routes:
 //!

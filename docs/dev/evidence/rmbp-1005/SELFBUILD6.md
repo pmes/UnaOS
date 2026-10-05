@@ -202,7 +202,7 @@ the output runs. A failed probe while `vm::REFUSALS` grew reads `oom rss_mib=<n>
 
 **arroyo** `build_selfbuild6_x86` (called after `build_selfbuild5_x86`) + builder rows (APPS/LIB/dyn, APPS/LIB/rustc): see its
 comment. `LIB/dyn` is always built when the musl target exists. `LIB/rustc` (530 MB: the stripped driver 222 MiB, rust-lld
-157 MiB, the musl std 147 MiB after dropping the sanitizer runtimes and the profiler) only with `UNAOS_SELFBUILD6_RUSTC=1`, the
+157 MiB, the musl std 147 MiB after dropping the sanitizer runtimes and the profiler) by default since R87 (`UNAOS_SELFBUILD6_RUSTC=0` opts out; before R87 it was opt-in with `=1`), the
 rustc tarball fetched and sha-checked at image time, and staged only when rustc --version, hello and the proc-macro crate all
 run under ldrun. One run of the whole function took 27 s (the tarball cached). sha256 of that run: `bin/rustc`
 `8b29ba2ebb045e2beeba90c362c67892ecac63c4fd331444c28a91764679799d`, the stripped driver
@@ -210,7 +210,7 @@ run under ldrun. One run of the whole function took 27 s (the tarball cached). s
 `287f1ef844fec811560a5879b47db810d6446cc586c181d6902b934634a8d11b`, `pm/libpm.so`
 `5e36883b8f69fb4f69bd84820045edfee40e7206c35fd23e6f193b743a48c300` (one run; reproducibility not proven).
 
-**What a metal boot should print** (`UNAOS_SELFBUILD6_RUSTC=1 ./arroyo esp-x86`, metal shape with `linuxabi`, logged in):
+**What a metal boot should print** (`./arroyo esp-x86` — rustc staged by default since R87, metal shape with `linuxabi`, logged in):
 ```
 tests selfbuild6
 [selfbuild6] linux /apps/LIB/dyn/hello
@@ -230,7 +230,7 @@ tests selfbuild6
 [selfbuild6] kernel: loads=<n> dlopens=<n> dlsyms=<n> faults_file=<n> faults_anon=<n> refusals=<n> pool_peak=<n>
 :: SELFBUILD6: dyn=ok lld_dyn=skip rustc_version=ok rustc_hello=<ok|oom rss_mib=n> proc_macro=<ok|oom rss_mib=n> relocs=265481 ms=<n> -> PASS ::
 ```
-Without `UNAOS_SELFBUILD6_RUSTC=1`: `… lld_dyn=skip rustc_version=skip rustc_hello=skip proc_macro=skip relocs=0 … -> SKIP ::`
+With `UNAOS_SELFBUILD6_RUSTC=0`: `… lld_dyn=skip rustc_version=skip rustc_hello=skip proc_macro=skip relocs=0 … -> SKIP ::`
 (dyn still ran).
 
 **Reading a failure:** `dyn=fail(exit=<k>)` — `<k>` is the probe's check number above (1 constructors, 4 TLS, 7–9 threads, 11–13
@@ -271,6 +271,6 @@ SAME window refuses it until B361 relinks it PIE.
   which is what rustc and the driver ask for anyway).
 - The kernel's `lld_dyn` is `skip` by construction (the window); `rustc_hello` / `proc_macro` on the kernel also need a linker
   the shim can load (B361's LLD.LNX) and the frame pool (above).
-- The ESP payload with `UNAOS_SELFBUILD6_RUSTC=1` is 530 MB (opt-in; not in git). `LIB/dyn` is 1.9 MB.
+- The ESP payload with rustc is 530 MB (default since R87, Peter: "yes for the 3"; `UNAOS_SELFBUILD6_RUSTC=0` opts out; not in git). `LIB/dyn` is 1.9 MB.
 - FINDING for B357 (from M1, unchanged): `elf.rs` `IMAGE_LIMIT` refuses the 68 MB static LLD.LNX, so `tests selfbuild5` prints
   "segment outside the loadable window" on metal until B361.

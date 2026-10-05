@@ -3859,7 +3859,7 @@ build_selfbuild_x86() {
     fi
     build_selfbuild4_x86   # SELFBUILD4 (B356): SYSKAT4.LNX + RUST.LNX
     build_selfbuild5_x86   # SELFBUILD5 (B357): SYSKAT5.LNX + LLD.LNX + LIB/rust (RUST.LNX's objects, std rlibs, musl crt)
-    build_selfbuild6_x86   # SELFBUILD6 (B360): LIB/dyn (libc.so, libgcc_s.so.1, the dyn probe) + LIB/rustc (UNAOS_SELFBUILD6_RUSTC=1)
+    build_selfbuild6_x86   # SELFBUILD6 (B360): LIB/dyn (libc.so, libgcc_s.so.1, the dyn probe) + LIB/rustc (default on, R87; UNAOS_SELFBUILD6_RUSTC=0 opts out)
     ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
 }
 
@@ -4031,7 +4031,7 @@ PY
 #   link-time name) relinked -shared from the Rust musl target's self-contained libc.a (+ libgcc.a's complex-multiply helpers) and
 #   libunwind.a (+ fixtures/dyn/gcc_helpers.c), each with --eh-frame-hdr (without PT_GNU_EH_FRAME the unwinder cannot find its
 #   own frames and every rustc panic aborts); and the dyn probe (fixtures/dyn: hello PIE + libdyn.so + libplug.so).
-# * target/LIB/rustc (staged as /apps/LIB/rustc) ONLY with UNAOS_SELFBUILD6_RUSTC=1 (about 420 MB on the ESP): upstream's
+# * target/LIB/rustc (staged as /apps/LIB/rustc) BY DEFAULT (R87; UNAOS_SELFBUILD6_RUSTC=0 opts out; about 420 MB on the ESP): upstream's
 #   musl-host rustc for the pinned nightly (fetched here, sha256 pinned below; payload never in git), librustc_driver stripped of
 #   debug info and the static symbol table (301 MB -> 232 MB; the dynamic tables and relocations are untouched), the musl
 #   rust-lld, the x86_64-unknown-linux-musl std rlibs of the SAME build (the host toolchain's when its commit matches, else the
@@ -4066,8 +4066,8 @@ build_selfbuild6_x86() {
         return 0
     fi
     rm -rf "$rlib"
-    if [ "${UNAOS_SELFBUILD6_RUSTC:-0}" != "1" ]; then
-        echo "   SELFBUILD6: UNAOS_SELFBUILD6_RUSTC unset — LIB/rustc not staged (tests selfbuild6 reports the rustc probes skip)"
+    if [ "${UNAOS_SELFBUILD6_RUSTC:-1}" = "0" ]; then
+        echo "   SELFBUILD6: UNAOS_SELFBUILD6_RUSTC=0 — LIB/rustc not staged (tests selfbuild6 reports the rustc probes skip)"
         return 0
     fi
     local tar="$sb/rustc.tar.xz"

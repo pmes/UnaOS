@@ -34,6 +34,10 @@
 * **Linus Torvalds:** For giving the world a kernel.
 * **Dave Cutler (Microsoft):** For the NT Object Manager.
 
+### The Sources
+* **The FreeType Project (David Turner, Robert Wilhelm, Werner Lemberg) and Adobe Systems:** font_core's light auto-hinter and CFF hinting engine (`unaos/libs/text/font_core/src/hint/`) are reimplemented from FreeType 2.13.2 (`src/autofit`, `src/psaux`), taken under FreeType's GPL option and carried under this tree's GPL-3.0-or-later (RULINGS R87).
+* **The xdiff authors (Davide Libenzi; LibXDiff, Git):** GITCORE's diff (`unaos/libs/vcs/git_core`) carries xdiff's translation under this tree's GPL (RULINGS R85, R87).
+
 ## System Ratification
 
 **Architect's Log**
