@@ -104,3 +104,57 @@ fn bench_rows() {
         );
     }
 }
+
+/// UNAFSMAP M3: the kernel's shape — a 500 GB SSD root (the rMBP's p2) under
+/// the default 4 MiB leaf budget the kernel mount uses, against the x86
+/// kernel's 256 MiB heap. Mount, a 64 MiB file written in 1 MiB calls, 2,000
+/// small files, a full fsck: the peak heap the crate takes stays small.
+#[test]
+fn kernel_budget_heap_on_a_500_gb_root() {
+    const MIB: u64 = 500 * 1000 * 1000 * 1000 / (1024 * 1024);
+    let img = sparse("map-bench-500g.img", MIB);
+    drop(UnaFS::format(FileDevice::open(&img.0).unwrap(), MIB).unwrap());
+    let base = peak_reset();
+    let mut fs = UnaFS::mount(FileDevice::open(&img.0).unwrap()).unwrap();
+    let mount_peak = peak_since(base);
+    let root = fs.superblock.root_inode;
+    let big = fs.create_file(root, "big".into()).unwrap();
+    let chunk = vec![0x5au8; 1 << 20];
+    for i in 0..64u64 {
+        fs.write_data(big, i << 20, &chunk).unwrap();
+    }
+    let d = fs.mkdir(root, "many".into()).unwrap();
+    let batch: Vec<unafs::BatchFile> = (0..2000)
+        .map(|i| unafs::BatchFile {
+            name: format!("f{i}"),
+            data: vec![i as u8; 100],
+            attributes: Default::default(),
+        })
+        .collect();
+    fs.create_files_batch(d, batch).unwrap();
+    assert!(fs.fsck(false).unwrap().is_clean());
+    let peak = peak_since(base);
+    let s = fs.map_stats();
+    println!(
+        "[map-bench] 500 GB root: blocks={} mount_peak={} KiB work_peak={} KiB pages_peak={} page_reads={} leaves={} leaf_blocks={}",
+        fs.superblock.block_count,
+        mount_peak / 1024,
+        peak / 1024,
+        s.pages_peak,
+        s.page_reads,
+        s.leaves,
+        s.leaf_blocks
+    );
+    assert!(mount_peak < 8 << 20, "mount peak {mount_peak}");
+    assert!(peak < 32 << 20, "work peak {peak} (kernel heap is 256 MiB)");
+}
+
+/// The proof bounds of the ledger row on a 1 TiB sparse image.
+#[test]
+fn one_tib_mount_under_one_second_and_eight_mib() {
+    let (mount_s, peak, commit_blocks, _fsck_s, blocks) = row(1024 * 1024);
+    assert_eq!(blocks, 1 << 28);
+    assert!(mount_s < 1.0, "mount {mount_s} s");
+    assert!(peak < 8 << 20, "mount peak {peak}");
+    assert!(commit_blocks < 16, "commit {commit_blocks}");
+}
