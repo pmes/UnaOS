@@ -216,7 +216,7 @@ pub fn load(asp: &mut AddrSpace, full: &str) -> Result<elf::Plan, String> {
         );
     }
     LOADERS.lock().insert(pml4, l);
-    Ok(elf::Plan { entry: st.entry, segs: Vec::new(), phdr_va: st.phdr, phnum: st.phnum, phent: st.phent })
+    Ok(elf::Plan { entry: st.entry, segs: Vec::new(), phdr_va: st.phdr, phnum: st.phnum, phent: st.phent, pie: false }) // WINDOW2 (B361) added `pie`; ldso already placed and relocated every object, so the static-PIE path does not apply
 }
 
 /// A fork child inherits its parent's loader (same objects at the same addresses, copy-on-write).
