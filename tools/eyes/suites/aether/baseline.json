@@ -1,14 +1,14 @@
 {
   "cases": {
     "01-blog-article": {
-      "mismatch": 8.81,
+      "mismatch": 3.97,
       "missing": 0,
-      "ssim": 0.8037
+      "ssim": 0.9317
     },
     "02-flex-two-column": {
-      "mismatch": 4.8,
+      "mismatch": 1.66,
       "missing": 0,
-      "ssim": 0.8434
+      "ssim": 0.9877
     },
     "03-card-gallery": {
       "mismatch": 0.64,
@@ -16,29 +16,29 @@
       "ssim": 0.9719
     },
     "04-sticky-nav": {
-      "mismatch": 3.26,
+      "mismatch": 3.15,
       "missing": 2,
-      "ssim": 0.9614
+      "ssim": 0.968
     },
     "05-form": {
-      "mismatch": 4.15,
+      "mismatch": 1.62,
       "missing": 0,
-      "ssim": 0.73
+      "ssim": 0.9357
     },
     "06-table-zebra": {
-      "mismatch": 6.27,
+      "mismatch": 6.34,
       "missing": 1,
-      "ssim": 0.7924
+      "ssim": 0.7927
     },
     "07-images-svg": {
-      "mismatch": 11.91,
+      "mismatch": 3.07,
       "missing": 0,
-      "ssim": 0.8339
+      "ssim": 0.9369
     },
     "08-inline-wrap": {
-      "mismatch": 8.81,
-      "missing": 2,
-      "ssim": 0.7415
+      "mismatch": 5.79,
+      "missing": 0,
+      "ssim": 0.7824
     },
     "09-media-queries": {
       "mismatch": 0.79,
@@ -61,34 +61,34 @@
       "ssim": 0.767
     },
     "11-non-latin": {
-      "mismatch": 3.02,
+      "mismatch": 2.18,
       "missing": 0,
-      "ssim": 0.8861
+      "ssim": 0.9343
     },
     "12-js-mutation": {
-      "mismatch": 0.54,
+      "mismatch": 0.53,
       "missing": 0,
-      "ssim": 0.9928
+      "ssim": 0.993
     },
     "13-ua-defaults": {
-      "mismatch": 1.91,
+      "mismatch": 1.88,
       "missing": 0,
-      "ssim": 0.9506
+      "ssim": 0.9524
     },
     "14-boxes": {
-      "mismatch": 1.94,
+      "mismatch": 1.73,
       "missing": 0,
-      "ssim": 0.9304
+      "ssim": 0.9356
     },
     "15-landing": {
-      "mismatch": 3.39,
-      "missing": 1,
-      "ssim": 0.8988
+      "mismatch": 1.61,
+      "missing": 0,
+      "ssim": 0.9545
     },
     "16-positioned": {
-      "mismatch": 13.29,
+      "mismatch": 13.24,
       "missing": 1,
-      "ssim": 0.864
+      "ssim": 0.8651
     }
   },
   "thresholds": {

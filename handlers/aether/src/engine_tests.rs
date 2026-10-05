@@ -2406,4 +2406,41 @@ mod tests {
         let sp = crate::fonts::space_advance(&f, 16.0);
         assert!(sp > 3.0 && sp < 5.0, "space advance {sp}");
     }
+
+    /// Chromium control metrics: a text field is one 13.333px line + 1px/2px
+    /// padding + 2px border (21px tall at UA padding; author padding and
+    /// border-box work on top), a checkbox 13x13.
+    #[test]
+    fn test_form_control_metrics_kat() {
+        let t = laid_out(
+            r#"<html><body><input id=f><input id=g style="box-sizing:border-box;padding:6px;width:200px"><input id=c type=checkbox></body></html>"#,
+            "body{margin:0}",
+        );
+        let (f, g, c) = (rect_by_id(&t, "f").unwrap(), rect_by_id(&t, "g").unwrap(), rect_by_id(&t, "c").unwrap());
+        let lh = crate::fonts::face(0, false, false).map(|x| crate::fonts::line_height(&x, 13.333, 0.0)).unwrap_or(15.0);
+        assert_eq!(f.3, lh + 2.0 + 4.0, "field: line + padding + border");
+        assert_eq!((g.2, g.3), (200.0, lh + 12.0 + 4.0), "border-box width, padding 6");
+        assert_eq!((c.2, c.3), (13.0, 13.0));
+    }
+
+    /// CSS 2.2 §9.2.1.1: an inline tag made `display: block` splits its
+    /// parent's line into block boxes (label above input, not beside it).
+    #[test]
+    fn test_display_block_on_inline_tag() {
+        let t = laid_out(
+            r#"<html><body><form><label id=l>Name</label><input id=i> <label id=m>Mail</label><input id=j></form></body></html>"#,
+            "body{margin:0} label{display:block} input{width:100px}",
+        );
+        let (l, i, m) = (rect_by_id(&t, "l").unwrap(), rect_by_id(&t, "i").unwrap(), rect_by_id(&t, "m").unwrap());
+        assert_eq!(l.0, 0.0);
+        assert!(i.1 >= l.1 + l.3, "input below its block label: {l:?} {i:?}");
+        assert!(m.1 >= i.1 + i.3 && m.0 == 0.0, "next label on its own line: {m:?}");
+    }
+
+    /// html.css heading sizes are em of the parent: h2 in a 14px body is 21px.
+    #[test]
+    fn test_heading_em_sizes() {
+        assert_eq!(layout::default_font_size("h2", 14.0), 21.0);
+        assert_eq!(layout::default_font_size("h1", 16.0), 32.0);
+    }
 }

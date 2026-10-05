@@ -522,6 +522,71 @@ fn draw_lines(
     }
 }
 
+/// A checkbox or radio at Chromium's control-theme look: 13x13, a 1px
+/// #767676 frame (radius 2, or a circle) on white; checked, a #0075ff fill
+/// with a white tick, or a #0075ff ring around a #0075ff dot.
+#[allow(clippy::too_many_arguments)]
+fn paint_checkable(
+    x: f32, y: f32, w: f32, h: f32, radio: bool, checked: bool,
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    let mut blend_at = |px: u32, py: u32, c: (u8, u8, u8), a: f32| {
+        if !in_damage(px, py, damage_rects) || !in_clip(px, py, clip) {
+            return;
+        }
+        if a >= 0.999 {
+            put_px(surface, width, px, py, c);
+        } else if a > 0.0 {
+            blend_px(surface, width, px, py, c, (a * 255.0).round() as u8);
+        }
+    };
+    let blue = (0, 117, 255);
+    let grey = (118, 118, 118);
+    let r = if radio { [w.min(h) / 2.0; 4] } else { [2.0; 4] };
+    let frame = |c| [Some((1.0, c, 0u8)); 4];
+    if radio {
+        if checked {
+            boxpaint::paint(x, y, w, h, r, frame(blue), Some((255, 255, 255)), width, height, &mut blend_at);
+            let d = w.min(h) * 0.55;
+            boxpaint::paint(x + (w - d) / 2.0, y + (h - d) / 2.0, d, d, [d / 2.0; 4], [None; 4], Some(blue), width, height, &mut blend_at);
+        } else {
+            boxpaint::paint(x, y, w, h, r, frame(grey), Some((255, 255, 255)), width, height, &mut blend_at);
+        }
+        return;
+    }
+    if !checked {
+        boxpaint::paint(x, y, w, h, r, frame(grey), Some((255, 255, 255)), width, height, &mut blend_at);
+        return;
+    }
+    boxpaint::paint(x, y, w, h, r, [None; 4], Some(blue), width, height, &mut blend_at);
+    // The tick: (3, 6.5) -> (5.5, 9) -> (10, 4) in the 13px box, 1.5px thick.
+    let seg = |p: (f32, f32), q: (f32, f32), blend: &mut dyn FnMut(u32, u32, (u8, u8, u8), f32)| {
+        let (x0, y0, x1, y1) = (x + p.0 * w / 13.0, y + p.1 * h / 13.0, x + q.0 * w / 13.0, y + q.1 * h / 13.0);
+        let (minx, maxx) = (x0.min(x1).floor() - 1.0, x0.max(x1).ceil() + 1.0);
+        let (miny, maxy) = (y0.min(y1).floor() - 1.0, y0.max(y1).ceil() + 1.0);
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len2 = dx * dx + dy * dy;
+        let mut yy = miny;
+        while yy <= maxy {
+            let mut xx = minx;
+            while xx <= maxx {
+                let (cx, cy) = (xx + 0.5, yy + 0.5);
+                let t = (((cx - x0) * dx + (cy - y0) * dy) / len2).clamp(0.0, 1.0);
+                let (ex, ey) = (cx - (x0 + t * dx), cy - (y0 + t * dy));
+                let d = (ex * ex + ey * ey).sqrt();
+                let a = (1.25 - d).clamp(0.0, 1.0);
+                if a > 0.0 && xx >= 0.0 && yy >= 0.0 {
+                    blend(xx as u32, yy as u32, (255, 255, 255), a);
+                }
+                xx += 1.0;
+            }
+            yy += 1.0;
+        }
+    };
+    seg((3.0, 6.5), (5.5, 9.0), &mut blend_at);
+    seg((5.5, 9.0), (10.0, 4.0), &mut blend_at);
+}
+
 /// Single-line advance width of `text`, measured EXACTLY the way `draw_text`
 /// lays it out (per-glyph advances, one space-glyph advance between
 /// words). Centering a control label with any other measurement drifts.
@@ -928,7 +993,12 @@ pub fn render_frame(
 
                 // Form controls get a UA border and their value text.
                 let is_control = matches!(tag, "input" | "textarea" | "select" | "button");
-                let mut border = spec.border.or(if is_control {
+                let kind = crate::layout::control_kind(dom_node);
+                let checkable = matches!(kind, Some(crate::layout::Control::Checkbox | crate::layout::Control::Radio));
+                // Chromium's control theme paints a 1px #767676 frame at the
+                // outer edge of the (2px) UA border; checkboxes and radios
+                // are drawn whole below.
+                let mut border = spec.border.or(if is_control && !checkable {
                     Some([Some((1.0, (118, 118, 118))); 4])
                 } else {
                     None
@@ -972,25 +1042,71 @@ pub fn render_frame(
                     inherited.center_box = Some((content_x, content_y, content_w, content_h));
                 }
 
-                if is_control && tag != "button" {
-                    if let Some(font) = font {
+                if checkable {
+                    let checked = el.attributes.borrow().get("checked").is_some();
+                    let radio = kind == Some(crate::layout::Control::Radio);
+                    paint_checkable(box_sx, box_sy, bw, bh, radio, checked, surface, width, height, damage_rects, clip);
+                }
+                if kind == Some(crate::layout::Control::Select) {
+                    // The drop-down arrow: a 2px chevron 9px wide, centred
+                    // vertically, its right end 8px inside the right edge.
+                    let cx = box_sx + bw - 8.0 - 4.5;
+                    let cy = box_sy + bh / 2.0;
+                    for i in 0..=8 {
+                        let dx = i as f32 - 4.0;
+                        let y = cy - 2.0 + (4.0 - dx.abs());
+                        for t in 0..2 {
+                            let (x, yy) = ((cx + dx).round(), (y + t as f32).round());
+                            if x >= 0.0 && yy >= 0.0 && (x as u32) < width && (yy as u32) < height {
+                                let (xu, yu) = (x as u32, yy as u32);
+                                if in_damage(xu, yu, damage_rects) && in_clip(xu, yu, clip) {
+                                    put_px(surface, width, xu, yu, (0, 0, 0));
+                                }
+                            }
+                        }
+                    }
+                }
+                if tag == "textarea" {
+                    // The value: the element's text, pre-wrap, from the
+                    // content box's top-left, in the monospace control font.
+                    let text = dom_node.text_contents();
+                    let fs = inherited.font_size;
+                    if let Some(f) = crate::fonts::face(inherited.family, inherited.bold, inherited.italic) {
+                        let mode = crate::fonts::lines::TextMode { white_space: 3, ..Default::default() };
+                        draw_lines(
+                            text.trim_start_matches('\n'), content_x, content_y, content_w.max(1.0), &f,
+                            crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
+                            fs, 0.0, spec.color.unwrap_or((0, 0, 0)), &mode, Deco::default(),
+                            surface, width, height, damage_rects, clip,
+                        );
+                    }
+                }
+                if is_control && tag != "button" && !checkable && tag != "textarea" {
+                    let face = crate::fonts::face(inherited.family, inherited.bold, inherited.italic);
+                    if let Some(font) = face.as_ref().or(font.as_ref()) {
                         let attrs = el.attributes.borrow();
                         // A <select> paints the SELECTED OPTION'S TEXT, not
                         // its submit value: layout publishes the visible label
                         // as data-aether-label, so "English" shows where the
                         // value attribute would only say "en".
-                        let value = (tag == "select")
+                        let shown = (tag == "select")
                             .then(|| attrs.get("data-aether-label"))
                             .flatten()
                             .filter(|v| !v.is_empty())
                             .or_else(|| attrs.get("value"))
-                            .filter(|v| !v.is_empty())
-                            .or_else(|| attrs.get("placeholder"))
-                            .unwrap_or("")
-                            .to_string();
+                            .filter(|v| !v.is_empty());
+                        let is_placeholder = shown.is_none();
+                        let password = attrs.get("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("password"));
+                        let mut value = shown.or_else(|| attrs.get("placeholder")).unwrap_or("").to_string();
+                        if password && !is_placeholder {
+                            value = "\u{2022}".repeat(value.chars().count());
+                        }
                         drop(attrs);
+                        // Field text is black (FieldText), a placeholder
+                        // #757575 (html.css ::placeholder darkGray).
+                        let value_color = if is_placeholder { (117, 117, 117) } else { spec.color.unwrap_or((0, 0, 0)) };
                         if !value.is_empty() {
-                            let fs = inherited.font_size.min(14.0);
+                            let fs = inherited.font_size;
                             let text_w = measure_text_width(&value, font, fs);
                             // <input>/<select> are single-line by definition —
                             // their value rides the vertical middle however
@@ -1005,14 +1121,16 @@ pub fn render_frame(
                                     content_w.max(1.0),
                                 )
                             } else {
-                                let left = box_sx + inset_l.max(4.0);
-                                let max_w = (bw - inset_l.max(4.0) - inset_r.max(4.0)).max(1.0);
+                                // The value's line box is centred in the
+                                // content box (a single-line field).
+                                let lh = crate::fonts::line_height(font, fs, 0.0);
                                 let ty = if single_line {
-                                    centered_line_origin_y(font, fs, content_y + content_h / 2.0)
+                                    content_y + ((content_h - lh) / 2.0).floor()
                                 } else {
-                                    box_sy + pad.top + bord.top + 3.0
+                                    content_y
                                 };
-                                (left, ty, max_w)
+                                let left = if tag == "select" { content_x + 4.0 } else { content_x };
+                                (left, ty, f32::MAX)
                             };
                             draw_text(
                                 &value,
@@ -1020,10 +1138,10 @@ pub fn render_frame(
                                 ty,
                                 max_w,
                                 font,
-                                0,
+                                crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
                                 fs,
-                                inherited.line_height,
-                                (60, 60, 60),
+                                0.0,
+                                value_color,
                                 false,
                                 surface,
                                 width,

@@ -86,7 +86,7 @@ fn is_block_container(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
         Some(n) => {
             let Some(el) = n.as_element() else { return n.as_document().is_some() };
             let tag = el.name.local.as_ref();
-            !super::is_table_part(tag) && !super::is_inline_node(n)
+            !super::is_table_part(tag) && super::is_block_level(tree, id)
         }
         // Anonymous boxes are rows; a column without a DOM node is not ours.
         None => false,
@@ -112,7 +112,7 @@ fn in_flow_block(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
             if n.as_text().is_some() {
                 return false;
             }
-            !super::is_inline_node(n)
+            super::is_block_level(tree, id)
         }
         None => true, // anonymous block box around an inline run
     }

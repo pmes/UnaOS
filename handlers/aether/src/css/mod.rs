@@ -1822,7 +1822,7 @@ fn apply_spec_to_node(
 /// Overlays `src`'s specified paint fields onto `dst`. ONE list, used by
 /// every cascade path — a field missing here is a declaration that parses
 /// and then never reaches the renderer.
-fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
+pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
     macro_rules! copy {
         ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
@@ -1834,6 +1834,7 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
+        ua_vmargin,
     );
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
 }

@@ -87,6 +87,10 @@ pub struct PaintStyle {
     pub ws_trail: Option<bool>,
     /// Author outer display: 0 inline, 1 block-level, 2 inline-level box.
     pub display_kind: Option<u8>,
+    /// The UA vertical margin of this element in em of its own font size,
+    /// and the px it was built with (against the 16px default): remeasure
+    /// rescales an untouched UA margin to the element's real font size.
+    pub ua_vmargin: Option<(f32, f32)>,
 }
 
 pub struct LayoutTree {
@@ -361,7 +365,10 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         publish_select_value(dom_node);
 
         let mut kids: Vec<(taffy::NodeId, bool)> = Vec::new();
-        for child in dom_node.children() {
+        // A textarea's text is its VALUE, painted inside the control, not
+        // flow content (the control is a leaf with an intrinsic size).
+        let is_textarea = dom_node.as_element().is_some_and(|e| e.name.local.as_ref() == "textarea");
+        for child in dom_node.children().filter(|_| !is_textarea) {
             if let Some(id) = build_taffy_tree(&child, taffy, node_map, paint_map, quirks) {
                 kids.push((id, is_inline_node(&child)));
             }
@@ -492,26 +499,9 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
                 width: if inline { Dimension::auto() } else { Dimension::percent(1.0) },
                 height: Dimension::auto(),
             },
-            min_size: match tag.as_str() {
-                // UA default control sizes so empty controls are visible.
-                "input" | "select" => Size {
-                    width: LengthPercentageAuto::length(160.0),
-                    height: LengthPercentageAuto::length(24.0),
-                },
-                "textarea" => Size {
-                    width: LengthPercentageAuto::length(160.0),
-                    height: LengthPercentageAuto::length(60.0),
-                },
-                "button" => Size {
-                    width: LengthPercentageAuto::length(24.0),
-                    height: LengthPercentageAuto::length(24.0),
-                },
-                // Everything else: no UA minimum. An empty block box is
-                // zero-tall in CSS; a floor here compounds — pages mount
-                // dozens of empty container/portal divs, and 20px each
-                // pushed the real content below the fold.
-                _ => Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::auto() },
-            },
+            // No UA minimum: an empty block box is zero-tall in CSS (form
+            // controls get their intrinsic sizes in ua_control below).
+            min_size: Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::auto() },
             margin: {
                 let [t, r, b, l] = if inline { [0.0; 4] } else { ua_margin(&tag, nested_list(dom_node)) };
                 Rect {
@@ -535,6 +525,8 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             ..Default::default()
         };
 
+        ua_control(dom_node, &tag, &mut style);
+
         // <br>: a zero-height full-width item forces a wrap break in the
         // inline row without adding vertical space of its own.
         if tag == "br" {
@@ -545,6 +537,16 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
 
         // Inline style="..." — paint properties plus width/height.
         let mut paint = PaintStyle::default();
+        if !inline {
+            if let Some(k) = ua_margin_em(&tag, nested_list(dom_node)) {
+                let built = ua_margin(&tag, nested_list(dom_node))[0];
+                paint.ua_vmargin = Some((k, built));
+            }
+        }
+        if control_kind(dom_node) == Some(Control::Button) {
+            // Chromium's ButtonFace.
+            paint.background = Some((239, 239, 239));
+        }
         if tag == "mark" {
             // html.css: `mark { background-color: yellow; color: black }`.
             paint.background = Some((255, 255, 0));
@@ -608,6 +610,135 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
     }
 }
 
+/// The kind of form control a node is, by Chromium's UA rendering:
+/// text-like field, checkbox, radio, push button, select, textarea.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Control {
+    Field,
+    Checkbox,
+    Radio,
+    Button,
+    Select,
+    Textarea,
+}
+
+pub fn control_kind(node: &NodeRef) -> Option<Control> {
+    let el = node.as_element()?;
+    match el.name.local.as_ref() {
+        "button" => Some(Control::Button),
+        "select" => Some(Control::Select),
+        "textarea" => Some(Control::Textarea),
+        "input" => {
+            let a = el.attributes.borrow();
+            let t = a.get("type").unwrap_or("text").trim().to_ascii_lowercase();
+            Some(match t.as_str() {
+                "checkbox" => Control::Checkbox,
+                "radio" => Control::Radio,
+                "submit" | "reset" | "button" | "image" | "file" | "color" => Control::Button,
+                _ => Control::Field,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Chromium's control font: 13.333px (`font: -webkit-small-control`).
+pub const CONTROL_FONT_PX: f32 = 13.333;
+
+/// Single-line advance of `text` at `size` in the given family.
+fn text_advance(text: &str, family: u8, size: f32) -> f32 {
+    let Some(font) = crate::fonts::face(family, false, false) else { return text.len() as f32 * size * 0.5 };
+    let adv = crate::fonts::lines::Advancer::new(&font, crate::fonts::face_key(family, false, false), size, 0.0);
+    adv.str(text)
+}
+
+fn control_line_height(family: u8) -> f32 {
+    crate::fonts::face(family, false, false)
+        .map(|f| crate::fonts::line_height(&f, CONTROL_FONT_PX, 0.0))
+        .unwrap_or(15.0)
+}
+
+/// UA (html.css + Chromium's control theme) box metrics of form controls:
+/// text fields `padding: 1px 2px; border: 2px inset` with one line of the
+/// 13.333px control font and the `size=20` default width; checkbox and
+/// radio 13x13 with their 3px/4px (radio 3px 3px 0 5px) margins; buttons
+/// `padding: 1px 6px; border: 2px outset`; select a 1px border around its
+/// label and the arrow; textarea `padding: 2px; border: 1px` sized by
+/// rows x cols of the monospace control font.
+fn ua_control(node: &NodeRef, _tag: &str, style: &mut Style) {
+    let Some(kind) = control_kind(node) else { return };
+    let lp = LengthPercentage::length;
+    let rect = |t: f32, r: f32, b: f32, l: f32| Rect { top: lp(t), right: lp(r), bottom: lp(b), left: lp(l) };
+    match kind {
+        Control::Field => {
+            style.padding = rect(1.0, 2.0, 1.0, 2.0);
+            style.border = rect(2.0, 2.0, 2.0, 2.0);
+
+        }
+        Control::Checkbox | Control::Radio => {
+            style.size = Size { width: Dimension::length(13.0), height: Dimension::length(13.0) };
+            style.padding = rect(0.0, 0.0, 0.0, 0.0);
+            style.border = rect(0.0, 0.0, 0.0, 0.0);
+            let m = if kind == Control::Radio { [3.0, 3.0, 0.0, 5.0] } else { [3.0, 3.0, 3.0, 4.0] };
+            style.margin = Rect {
+                top: LengthPercentageAuto::length(m[0]),
+                right: LengthPercentageAuto::length(m[1]),
+                bottom: LengthPercentageAuto::length(m[2]),
+                left: LengthPercentageAuto::length(m[3]),
+            };
+            style.align_self = Some(taffy::style::AlignSelf::CENTER);
+        }
+        Control::Button => {
+            style.padding = rect(1.0, 6.0, 1.0, 6.0);
+            style.border = rect(2.0, 2.0, 2.0, 2.0);
+
+        }
+        Control::Select => {
+            style.padding = rect(0.0, 0.0, 0.0, 0.0);
+            style.border = rect(1.0, 1.0, 1.0, 1.0);
+
+        }
+        Control::Textarea => {
+            style.padding = rect(2.0, 2.0, 2.0, 2.0);
+            style.border = rect(1.0, 1.0, 1.0, 1.0);
+
+        }
+    }
+}
+
+/// Intrinsic CONTENT size of a leaf form control (taffy adds its padding
+/// and border, so author `box-sizing` works as in CSS): one control-font
+/// line by the `size=20` average-character width for a field, the label
+/// for a button-like input, the selected label plus the arrow for a
+/// select, rows x cols of the monospace control font for a textarea.
+fn control_intrinsic(node: &NodeRef) -> Option<(f32, f32)> {
+    let kind = control_kind(node)?;
+    let attr = |name: &str| node.as_element().and_then(|e| e.attributes.borrow().get(name).map(str::to_string));
+    let lh = control_line_height(0);
+    match kind {
+        Control::Field => {
+            let size = attr("size").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(20.0);
+            Some((size * 7.45, lh))
+        }
+        Control::Button if node.as_element().is_some_and(|e| e.name.local.as_ref() == "input") => {
+            let t = attr("type").unwrap_or_default().to_ascii_lowercase();
+            let label = attr("value").unwrap_or_else(|| if t == "reset" { "Reset".into() } else { "Submit".into() });
+            Some((text_advance(&label, 0, CONTROL_FONT_PX), lh))
+        }
+        Control::Select => {
+            let label = select_selected_option(node).map(|(_, l)| l).unwrap_or_default();
+            Some((text_advance(&label, 0, CONTROL_FONT_PX) + 4.0 + 20.0, lh + 2.0))
+        }
+        Control::Textarea => {
+            let rows = attr("rows").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(2.0);
+            let cols = attr("cols").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(20.0);
+            let cw = text_advance("0", 2, CONTROL_FONT_PX);
+            Some((cols * cw + 17.0, rows * control_line_height(2)))
+        }
+        _ => None,
+    }
+}
+
 /// Controls the UA sheet sizes as border-box: buttons, selects, and the
 /// button-like / checkable inputs.
 fn ua_border_box(node: &NodeRef, tag: &str) -> bool {
@@ -661,10 +792,26 @@ fn ua_margin(tag: &str, nested_list: bool) -> [f32; 4] {
     }
 }
 
+/// The em factor of an element's UA vertical margins (None = no em margin).
+fn ua_margin_em(tag: &str, nested_list: bool) -> Option<f32> {
+    match tag {
+        "p" | "dl" | "pre" | "listing" | "xmp" | "plaintext" | "blockquote" | "figure" | "h3" => Some(1.0),
+        "ul" | "ol" | "menu" | "dir" if !nested_list => Some(1.0),
+        "h1" => Some(0.67),
+        "h2" => Some(0.83),
+        "h4" => Some(1.33),
+        "h5" => Some(1.67),
+        "h6" => Some(2.33),
+        "hr" => Some(0.5),
+        _ => None,
+    }
+}
+
 /// UA default font FAMILY per element: code-ish tags are monospace.
 pub fn default_family(tag: &str, inherited: u8) -> u8 {
     match tag {
-        "code" | "pre" | "kbd" | "samp" | "tt" => 2,
+        "code" | "pre" | "kbd" | "samp" | "tt" | "textarea" => 2,
+        "input" | "select" | "button" => 0,
         _ => inherited,
     }
 }
@@ -726,22 +873,23 @@ pub fn default_italic(tag: &str, inherited: bool) -> bool {
 /// `<pre>`/`<code>` text is 13/16 of its surroundings.
 pub fn ua_font_size(tag: &str, inherited: f32, inherited_family: u8, own_family: u8) -> f32 {
     let s = default_font_size(tag, inherited);
-    if own_family == 2 && inherited_family != 2 { s * 13.0 / 16.0 } else { s }
+    let control = matches!(tag, "input" | "select" | "textarea" | "button");
+    if own_family == 2 && inherited_family != 2 && !control { s * 13.0 / 16.0 } else { s }
 }
 
 /// UA default font sizes per element (shared with the renderer).
 pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
     match tag {
         // html.css: h1 2em, h2 1.5em, h3 1.17em, h4 1em, h5 .83em, h6 .67em
-        // of a 16px root; `small` is `smaller` (16/1.2); the generic
-        // `monospace` family defaults to 13px (Chromium's fixed font size).
-        "h1" => 32.0,
-        "h2" => 24.0,
-        "h3" => 18.72,
-        "h4" => 16.0,
-        "h5" => 13.28,
-        "h6" => 10.72,
-        "small" => 13.33,
+        // of the PARENT's size; `small` is `smaller` (/1.2).
+        "h1" => inherited * 2.0,
+        "h2" => inherited * 1.5,
+        "h3" => inherited * 1.17,
+        "h4" => inherited,
+        "h5" => inherited * 0.83,
+        "h6" => inherited * 0.67,
+        "small" => inherited / 1.2,
+        "input" | "select" | "textarea" | "button" => CONTROL_FONT_PX,
         // vertical-align: super/sub with font-size: smaller (html.css).
         "sup" | "sub" => inherited / 1.2,
         _ => inherited,
@@ -904,10 +1052,198 @@ fn collapse_inline_whitespace(tree: &mut LayoutTree) {
     walk(tree, root, 0, &mut ifc);
 }
 
+/// Inline-level or block-level by the cascade (css-display-3 §2): the
+/// author's outer display when given, else the tag default.
+fn is_inline_level(tree: &LayoutTree, id: taffy::NodeId) -> bool {
+    let Some(n) = tree.node_map.get(&id) else { return false }; // anonymous block
+    if n.as_text().is_some() {
+        return true;
+    }
+    match tree.paint_map.get(&id).and_then(|p| p.display_kind) {
+        Some(k) => k != 1,
+        None => is_inline_node(n),
+    }
+}
+
+/// The box tree is built from TAG defaults before the cascade runs; an
+/// author `display` that changes a box's outer type (a `label` made
+/// `display: block`, an `li` made `inline-block`) changes its parent's
+/// formatting context (CSS 2.2 §9.2.1.1). This pass re-derives each
+/// affected container: all-inline children flow as a wrapping line row;
+/// mixed children make a block column whose inline runs are wrapped in
+/// anonymous block boxes. Only containers holding a child whose cascaded
+/// type contradicts its tag are touched; anonymous boxes count as block,
+/// so a second pass finds nothing to do.
+fn fix_display_contexts(tree: &mut LayoutTree) {
+    let ids: Vec<taffy::NodeId> = tree.node_map.keys().copied().collect();
+    for id in ids {
+        let Some(n) = tree.node_map.get(&id) else { continue };
+        let Some(el) = n.as_element() else { continue };
+        if is_table_part(el.name.local.as_ref()) {
+            continue;
+        }
+        if tree.paint_map.get(&id).and_then(|p| p.flex_container) == Some(true) {
+            continue;
+        }
+        let mut kids = tree.taffy.children(id).unwrap_or_default();
+        if kids.is_empty() {
+            continue;
+        }
+        // An anonymous line box the builder made around an inline run that
+        // now holds a block-level child is dissolved into this container.
+        let block_in = |tree: &LayoutTree, k: taffy::NodeId| {
+            tree.node_map.get(&k).is_some_and(|kn| {
+                kn.as_element().is_some()
+                    && tree.paint_map.get(&k).and_then(|p| p.display_kind) == Some(1)
+                    && is_inline_node(kn)
+            })
+        };
+        if kids.iter().any(|&k| !tree.node_map.contains_key(&k) && tree.taffy.children(k).unwrap_or_default().iter().any(|&g| block_in(tree, g))) {
+            let mut flat = Vec::new();
+            for &k in &kids {
+                let grand = tree.taffy.children(k).unwrap_or_default();
+                if !tree.node_map.contains_key(&k) && grand.iter().any(|&g| block_in(tree, g)) {
+                    let _ = tree.taffy.set_children(k, &[]);
+                    flat.extend(grand);
+                } else {
+                    flat.push(k);
+                }
+            }
+            let _ = tree.taffy.set_children(id, &flat);
+            kids = flat;
+        }
+        let contradicts = kids.iter().any(|&k| {
+            tree.node_map.get(&k).is_some_and(|kn| {
+                kn.as_element().is_some() && tree.paint_map.get(&k).and_then(|p| p.display_kind).is_some_and(|d| (d != 1) != is_inline_node(kn))
+            })
+        });
+        if !contradicts {
+            continue;
+        }
+        // The children's own boxes follow their new outer type.
+        for &k in &kids {
+            let Some(kn) = tree.node_map.get(&k) else { continue };
+            if kn.as_element().is_none() {
+                continue;
+            }
+            let Some(d) = tree.paint_map.get(&k).and_then(|p| p.display_kind) else { continue };
+            let Ok(st) = tree.taffy.style(k) else { continue };
+            let mut st = st.clone();
+            if d == 1 && is_inline_node(kn) && st.size.width == Dimension::auto() {
+                st.size.width = Dimension::percent(1.0);
+                st.flex_shrink = 1.0;
+            } else if d != 1 && !is_inline_node(kn) && st.size.width == Dimension::percent(1.0) {
+                st.size.width = Dimension::auto();
+                st.flex_shrink = 0.0;
+            }
+            let _ = tree.taffy.set_style(k, st);
+        }
+        let inline: Vec<bool> = kids.iter().map(|&k| is_inline_level(tree, k)).collect();
+        let Ok(st) = tree.taffy.style(id) else { continue };
+        let mut st = st.clone();
+        if inline.iter().all(|&i| i) {
+            st.flex_direction = FlexDirection::Row;
+            st.flex_wrap = taffy::style::FlexWrap::Wrap;
+            if st.align_items.is_none() {
+                st.align_items = Some(taffy::style::AlignItems::BASELINE);
+            }
+            let _ = tree.taffy.set_style(id, st);
+            continue;
+        }
+        st.flex_direction = FlexDirection::Column;
+        st.flex_wrap = taffy::style::FlexWrap::NoWrap;
+        if st.align_items == Some(taffy::style::AlignItems::BASELINE) {
+            st.align_items = None;
+        }
+        let _ = tree.taffy.set_style(id, st);
+        // Wrap each run of inline children (two or more, or any text) in
+        // an anonymous block box.
+        let mut out: Vec<taffy::NodeId> = Vec::new();
+        let mut run: Vec<taffy::NodeId> = Vec::new();
+        let flush = |run: &mut Vec<taffy::NodeId>, out: &mut Vec<taffy::NodeId>, tree: &mut LayoutTree| {
+            // Spaces at the edges of a run sit next to block boxes: they
+            // are in no line (§4.1.1) and must not make one.
+            let ws_only = |tree: &LayoutTree, k: &taffy::NodeId| {
+                tree.node_map.get(k).is_some_and(|n| n.as_text().is_some() && n.text_contents().trim().is_empty())
+            };
+            while run.first().is_some_and(|k| ws_only(tree, k)) {
+                let k = run.remove(0);
+                let _ = tree.taffy.remove_child(id, k);
+            }
+            while run.last().is_some_and(|k| ws_only(tree, k)) {
+                let k = run.pop().unwrap();
+                let _ = tree.taffy.remove_child(id, k);
+            }
+            let has_text = run.iter().any(|k| tree.node_map.get(k).is_some_and(|n| n.as_text().is_some()));
+            if run.len() < 2 && !has_text {
+                out.append(run);
+                return;
+            }
+            let anon = Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                flex_wrap: taffy::style::FlexWrap::Wrap,
+                align_items: Some(taffy::style::AlignItems::BASELINE),
+                size: Size { width: Dimension::percent(1.0), height: Dimension::auto() },
+                box_sizing: taffy::style::BoxSizing::ContentBox,
+                ..Default::default()
+            };
+            // Detach first: a taffy node has one parent.
+            for k in run.iter() {
+                let _ = tree.taffy.remove_child(id, *k);
+            }
+            if let Ok(a) = tree.taffy.new_with_children(anon, run) {
+                tree.paint_map.insert(a, PaintStyle::default());
+                out.push(a);
+            } else {
+                out.append(run);
+            }
+            run.clear();
+        };
+        for (i, &k) in kids.iter().enumerate() {
+            if inline[i] {
+                run.push(k);
+            } else {
+                flush(&mut run, &mut out, tree);
+                out.push(k);
+            }
+        }
+        flush(&mut run, &mut out, tree);
+        let _ = tree.taffy.set_children(id, &out);
+    }
+}
+
+/// UA margins are `em` of the element's own font size: the builder set
+/// them against 16px; once font sizes are resolved, a margin side still
+/// holding the built value (no author rule replaced it) is rescaled.
+fn rescale_ua_margins(tree: &mut LayoutTree, sizes: &HashMap<taffy::NodeId, f32>) {
+    for (&id, &fs) in sizes {
+        let Some((k, built)) = tree.paint_map.get(&id).and_then(|p| p.ua_vmargin) else { continue };
+        let want = k * fs;
+        let Ok(st) = tree.taffy.style(id) else { continue };
+        let b = LengthPercentageAuto::length(built);
+        if (st.margin.top != b && st.margin.bottom != b) || (want - built).abs() < 0.001 {
+            continue;
+        }
+        let mut st = st.clone();
+        if st.margin.top == b {
+            st.margin.top = LengthPercentageAuto::length(want);
+        }
+        if st.margin.bottom == b {
+            st.margin.bottom = LengthPercentageAuto::length(want);
+        }
+        let _ = tree.taffy.set_style(id, st);
+        if let Some(p) = tree.paint_map.get_mut(&id) {
+            p.ua_vmargin = Some((k, want));
+        }
+    }
+}
+
 /// Recomputes layout with real text measurement: resolves each text run's
 /// inherited font size, then lets taffy size text leaves by wrapped extent.
 /// Called after building the tree and after every cascade application.
 pub fn remeasure(tree: &mut LayoutTree) {
+    fix_display_contexts(tree);
     propagate_text_align(tree);
     collapse_inline_whitespace(tree);
     // Pass 1: resolve font size down the box tree for text leaves, and
@@ -920,6 +1256,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
         tree: &LayoutTree,
         out: &mut HashMap<taffy::NodeId, TextRun>,
         imgs: &mut HashMap<taffy::NodeId, (f32, f32)>,
+        sizes: &mut HashMap<taffy::NodeId, f32>,
     ) {
         let mut size = inherited.clone();
         if let Some(dom_node) = tree.node_map.get(&node_id) {
@@ -932,6 +1269,9 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 size.font_size = paint
                     .and_then(|p| p.font_size)
                     .unwrap_or_else(|| ua_font_size(tag, inherited.font_size, inherited.family, own_family));
+                if paint.is_some_and(|p| p.ua_vmargin.is_some()) {
+                    sizes.insert(node_id, size.font_size);
+                }
                 if let Some(lh) = paint.and_then(|p| p.line_height) {
                     size.line_height = lh;
                 }
@@ -952,6 +1292,9 @@ pub fn remeasure(tree: &mut LayoutTree) {
                     paint.and_then(|p| p.italic).unwrap_or_else(|| default_italic(tag, inherited.italic));
                 if let Some(tt) = paint.and_then(|p| p.text_transform) {
                     size.text_transform = tt;
+                }
+                if let Some(wh) = control_intrinsic(dom_node) {
+                    imgs.insert(node_id, wh);
                 }
                 if el.name.local.as_ref() == "img" {
                     let attrs = el.attributes.borrow();
@@ -982,12 +1325,14 @@ pub fn remeasure(tree: &mut LayoutTree) {
         }
         if let Ok(children) = tree.taffy.children(node_id) {
             for child in children {
-                resolve(child, size.clone(), tree, out, imgs);
+                resolve(child, size.clone(), tree, out, imgs, sizes);
             }
         }
     }
     let root = TextRun { font_size: 16.0, ..Default::default() };
-    resolve(tree.root_node, root, tree, &mut text_info, &mut img_info);
+    let mut sizes: HashMap<taffy::NodeId, f32> = HashMap::new();
+    resolve(tree.root_node, root, tree, &mut text_info, &mut img_info, &mut sizes);
+    rescale_ua_margins(tree, &sizes);
 
     // Taffy caches leaf measurements; a cascade pass can change resolved
     // font sizes without touching the leaf's style, so stale cached sizes
@@ -1087,5 +1432,5 @@ fn measure_text_run(font: Option<&font_kit::font::Font>, key: u8, run: &TextRun,
 fn apply_inline_style(inline: &str, style: &mut Style, paint: &mut PaintStyle) {
     let spec = crate::css::parse_declaration_block(inline);
     spec.fold_into(style);
-    *paint = spec.paint.clone();
+    crate::css::merge_paint(paint, &spec.paint);
 }
