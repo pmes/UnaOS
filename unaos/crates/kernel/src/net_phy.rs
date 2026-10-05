@@ -66,6 +66,14 @@ pub trait RawNic {
     fn transmit(frame: &[u8]);
     /// The station MAC, or `None` if no NIC is registered.
     fn mac() -> Option<[u8; 6]>;
+    /// NETCLOCK (B335): room for one more frame right now. A NIC whose transmit is asynchronous (the USB
+    /// dongle's bounded TX ring) answers `false` while full, and [`SmoltcpPhy`]'s `transmit` then returns
+    /// `None` — smoltcp's back-pressure: the packet stays in its socket and goes on a later poll. Default
+    /// `true` (the synchronous rings), so every existing NIC compiles to the old datapath.
+    #[inline(always)]
+    fn tx_ready() -> bool {
+        true
+    }
 }
 
 /// An observer run on every frame the phy receives, BEFORE the RX/TX tokens are minted. The default
@@ -216,6 +224,9 @@ impl<N: RawNic, O: RxObserver> Device for SmoltcpPhy<N, O> {
     }
 
     fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
+        if !N::tx_ready() {
+            return None; // NETCLOCK: the NIC's TX ring is full — smoltcp retries on a later poll
+        }
         Some(PhyTxToken { buf: &mut self.tx, _nic: PhantomData })
     }
 
