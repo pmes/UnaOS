@@ -44,6 +44,10 @@
 //!   holding (14 px with DejaVu Sans Bold on the 9x20 cell).
 //! * `Ui` — running text that is not a grid (the login form, Settings labels): the `system.display.font`
 //!   family at `system.display.font_size` CSS px x the panel's ppi / 96 (EDID), capped by the body cell.
+//! * `Grid` (KERNELFONT2, B363) — the CONSOLE's character cell: the body cell x `video::dpi`'s half-pixel scale
+//!   (7x16 -> 18x40 at 2.5 on the 220/227-ppi rMBP panels), DejaVu Sans Mono at `system.display.font_size` CSS px
+//!   x ppi / 96 capped by that cell — the face `font_size` takes effect on. Before the faces load the bitmap atlas
+//!   is drawn at the scale's integer part, centred in the same cell, so the grid never changes under the console.
 
 use super::font;
 use super::framebuffer::FrameBuffer;
@@ -60,6 +64,8 @@ pub enum Face {
     Body,
     Chrome,
     Ui,
+    /// KERNELFONT2: the console's dpi-scaled cell (see the module doc).
+    Grid,
 }
 
 impl Face {
@@ -73,13 +79,19 @@ impl Face {
     }
     /// The layout cell's advance (the grid a caller places on; a proportional face measures with [`advance`]).
     #[inline(always)]
-    pub const fn cell_w(self) -> usize {
-        self.bitmap().cell_w()
+    pub fn cell_w(self) -> usize {
+        match self {
+            Face::Grid => grid_cell().0,
+            _ => self.bitmap().cell_w(),
+        }
     }
     /// The layout cell's height.
     #[inline(always)]
-    pub const fn cell_h(self) -> usize {
-        self.bitmap().cell_h()
+    pub fn cell_h(self) -> usize {
+        match self {
+            Face::Grid => grid_cell().1,
+            _ => self.bitmap().cell_h(),
+        }
     }
     /// The face's family name for witnesses (`dejavu-sans` …) when a face is loaded, else the bitmap atlas's.
     pub fn name(self) -> &'static str {
@@ -94,6 +106,7 @@ impl Face {
             Face::Body => 0,
             Face::Chrome => 1,
             Face::Ui => 2,
+            Face::Grid => 3,
         }
     }
 }
@@ -156,6 +169,25 @@ pub fn draw_glyph_fb(fb: &FrameBuffer, ch: u8, cx: usize, cy: usize, ink: u32, b
     if tt::draw_cell(ch, cx, cy, ink, bold, face.index(), &mut |x, y, a| fb.put_pixel(x, y, font::blend(bg, ink, a))) {
         return;
     }
+    if face == Face::Grid && grid_cell() != (font::CELL_W, font::CELL_H) {
+        // KERNELFONT2: no face yet — the atlas glyph at the scale's integer part, centred in the scaled cell.
+        let (gw, gh) = grid_cell();
+        let k = (crate::video::dpi::scale_x2() as usize / 2).max(1);
+        let (ox, oy) = (cx + gw.saturating_sub(font::CELL_W * k) / 2, cy + gh.saturating_sub(font::CELL_H * k) / 2);
+        for (ry, row) in font::glyph(ch, bold, font::Face::Body).iter().enumerate() {
+            for (rx, &a) in row.iter().enumerate() {
+                if a != 0 {
+                    let c = font::blend(bg, ink, a);
+                    for dy in 0..k {
+                        for dx in 0..k {
+                            fb.put_pixel(ox + rx * k + dx, oy + ry * k + dy, c);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
     font::draw_glyph_fb(fb, ch, cx, cy, ink, bg, bold, face.bitmap())
 }
 
@@ -210,6 +242,19 @@ pub fn fit(s: &[u8], bold: bool, face: Face, max_w: usize) -> usize {
     n
 }
 
+/// KERNELFONT2: the console's cell — the body cell x `video::dpi`'s scale, each side rounded up to the pixel.
+pub fn grid_cell() -> (usize, usize) {
+    let s2 = crate::video::dpi::scale_x2();
+    (crate::video::dpi::px_at(font::CELL_W, s2), crate::video::dpi::px_at(font::CELL_H, s2))
+}
+
+/// KERNELFONT2: arm the console's grid on a framebuffer `fb_w` px wide — latches `video::dpi`'s scale (first call
+/// wins), returns [`grid_cell`]. Called by `fbcon` where the console takes the face.
+pub fn arm_grid(fb_w: usize) -> (usize, usize) {
+    let s2 = crate::video::dpi::latch(fb_w);
+    (crate::video::dpi::px_at(font::CELL_W, s2), crate::video::dpi::px_at(font::CELL_H, s2))
+}
+
 /// The engine half, compiled only where a desktop exists (no other image links `font_core`).
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 mod tt {
@@ -248,8 +293,8 @@ mod tt {
     pub struct Tt {
         pub eng: Engine<'static>,
         /// Per [`super::Face`] index: style and the baseline row inside the face's cell.
-        pub styles: [(Style, f32); 3],
-        pub names: [&'static str; 3],
+        pub styles: [(Style, f32); 4],
+        pub names: [&'static str; 4],
         pub family: Role,
         pub css_px: i64,
         pub ppi: u32,
@@ -300,6 +345,15 @@ mod tt {
         })
     }
 
+    /// The layout cell of face index `face` (KERNELFONT2: index 3 is the console's dpi-scaled grid).
+    fn cell(face: usize) -> (usize, usize) {
+        match face {
+            1 => (font::CHROME_CELL_W, font::CHROME_CELL_H),
+            3 => super::grid_cell(),
+            _ => (font::CELL_W, font::CELL_H),
+        }
+    }
+
     fn style(t: &Tt, face: usize, bold: bool) -> (Style, f32) {
         let (mut st, bl) = t.styles[face];
         st.bold = bold;
@@ -309,7 +363,7 @@ mod tt {
     #[allow(clippy::too_many_arguments)]
     pub fn draw_text(px: &mut [u32], stride: usize, clip_w: usize, clip_h: usize, x: usize, y: usize, s: &[u8], ink: u32, bold: bool, face: usize) -> Option<usize> {
         with(|t| {
-            let cell_h = [font::CELL_H, font::CHROME_CELL_H, font::CELL_H][face];
+            let cell_h = cell(face).1;
             if y + cell_h > clip_h {
                 return x;
             }
@@ -322,7 +376,7 @@ mod tt {
     #[allow(clippy::too_many_arguments)]
     pub fn draw_row(out: &mut [u32], w: usize, s: &[u8], x0: usize, sy: usize, ink: u32, bold: bool, face: usize) -> bool {
         with(|t| {
-            let cell_h = [font::CELL_H, font::CHROME_CELL_H, font::CELL_H][face];
+            let cell_h = cell(face).1;
             if sy >= cell_h {
                 return;
             }
@@ -339,7 +393,7 @@ mod tt {
 
     pub fn draw_cell(ch: u8, cx: usize, cy: usize, ink: u32, bold: bool, face: usize, put: &mut dyn FnMut(usize, usize, u8)) -> bool {
         with(|t| {
-            let (cw, chh) = [(font::CELL_W, font::CELL_H), (font::CHROME_CELL_W, font::CHROME_CELL_H), (font::CELL_W, font::CELL_H)][face];
+            let (cw, chh) = cell(face);
             let (st, bl) = style(t, face, bold);
             let c = if (0x20..0x7f).contains(&ch) { ch as char } else { ' ' };
             let (x0, y0) = (cx as i32, cy as i32);
@@ -400,14 +454,18 @@ mod tt {
         let chrome = eng.fit_size_mean(fam, true, font::CHROME_CELL_W as f32, font::CHROME_CELL_H as f32).unwrap_or(14.0);
         let ui_fit = eng.fit_size(fam, None, font::CELL_H as f32).unwrap_or(12.0);
         let ui = device_px(t.css_px as f32, t.ppi).min(ui_fit).max(6.0);
+        // KERNELFONT2: the console grid — mono at font_size x ppi / 96, capped by the dpi-scaled cell.
+        let (gw, gh) = super::grid_cell();
+        let grid_fit = eng.fit_size(mono, Some(gw as f32), gh as f32).unwrap_or(body);
+        let grid = device_px(t.css_px as f32, t.ppi).min(grid_fit).max(6.0);
         let mk = |role: Role, size: f32, cell: usize| (Style { role, bold: false, size }, eng.baseline_in_cell(role, size, cell as f32));
-        t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, font::CHROME_CELL_H), mk(fam, ui, font::CELL_H)];
+        t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, font::CHROME_CELL_H), mk(fam, ui, font::CELL_H), mk(mono, grid, gh)];
         let nm = |r: Role| match r {
             Role::Mono => "dejavu-mono",
             Role::Serif => "dejavu-serif",
             _ => "dejavu-sans",
         };
-        t.names = [nm(mono), nm(fam), nm(fam)];
+        t.names = [nm(mono), nm(fam), nm(fam), nm(mono)];
     }
 
     pub fn read_face(mt: &crate::fs::vfs::MountTable, p: &str) -> Result<Vec<u8>, &'static str> {
@@ -491,17 +549,24 @@ mod tt {
             serial_println!("[kfont] load faces={}/{} fallback=bitmap reason=no-sans missing={}", eng.face_count(), FACES.len(), missing);
             return;
         }
-        let ppi = panel_ppi();
+        let ppi = match crate::video::dpi::ppi() {
+            0 => panel_ppi(),
+            p => p, // KERNELFONT2: the framebuffer's effective ppi (EDID native x fb width / native width)
+        };
         let family = family_of(crate::prefs::text(FONT_KEY));
         let css_px = crate::prefs::int(FONT_SIZE_KEY, 9, 32).unwrap_or(DEFAULT_CSS_PX);
         let n = eng.face_count();
-        let mut t = Tt { eng, styles: [(Style { role: Role::Sans, bold: false, size: 12.0 }, 12.0); 3], names: ["", "", ""], family, css_px, ppi, font_bytes: bytes, missing, scripts_missing };
+        let mut t = Tt { eng, styles: [(Style { role: Role::Sans, bold: false, size: 12.0 }, 12.0); 4], names: ["", "", "", ""], family, css_px, ppi, font_bytes: bytes, missing, scripts_missing };
         restyle(&mut t);
         let fallback = if t.missing.is_empty() { String::from("none") } else { t.missing.clone() };
+        let s2 = crate::video::dpi::scale_x2();
+        let (gw, gh) = super::grid_cell();
+        let (pw, ph) = crate::video::panel_info_nonblocking().map_or((0, 0), |i| (i.width, i.height));
         serial_println!(
-            "[kfont] load dir={} faces={}/{} fallback={} scripts_missing={} font_kib={} cache_kib={} ppi={} font={} font_size={} body={}-{:.2} chrome={}-{:.2} ui={}-{:.2} ms={}",
+            "[kfont] load dir={} faces={}/{} fallback={} scripts_missing={} font_kib={} cache_kib={} ppi={} scale={} cell={}x{} grid={}x{} panel={}x{} font={} font_size={} body={}-{:.2} chrome={}-{:.2} ui={}-{:.2} console={}-{:.2} ms={}",
             dir, n, FACES.len(), fallback, if t.scripts_missing.is_empty() { "none" } else { t.scripts_missing.as_str() }, bytes / 1024, cap / 1024, ppi,
-            family_name(family), css_px, t.names[0], t.styles[0].0.size, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size,
+            crate::video::dpi::scale_str(s2), gw, gh, pw / gw.max(1), ph / gh.max(1), pw, ph,
+            family_name(family), css_px, t.names[0], t.styles[0].0.size, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size, t.names[3], t.styles[3].0.size,
             crate::arch::ms().saturating_sub(t0)
         );
         *TT.lock() = Some(t);
@@ -525,7 +590,7 @@ mod tt {
             t.family = family;
             t.css_px = css_px;
             restyle(t);
-            Some(alloc::format!("font={} font_size={} ppi={} chrome={}-{:.2} ui={}-{:.2}", family_name(family), css_px, t.ppi, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size))
+            Some(alloc::format!("font={} font_size={} ppi={} chrome={}-{:.2} ui={}-{:.2} console={}-{:.2}", family_name(family), css_px, t.ppi, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size, t.names[3], t.styles[3].0.size))
         })
         .flatten();
         if let Some(line) = changed {
@@ -581,9 +646,9 @@ pub fn fixture() {
                 let fallback = if missing.is_empty() { alloc::string::String::from("none") } else { missing };
                 let ok = faces >= 1 && fallback == "none" && drawn >= 1000 && mid && ink;
                 serial_println!(
-                    "[kfont] fixture font_kib={} cache_bytes={} hits={} misses={} flushes={} runs_shaped={} contended={} aa_mid={} ink={} body={} chrome={} ui={}",
+                    "[kfont] fixture font_kib={} cache_bytes={} hits={} misses={} flushes={} runs_shaped={} contended={} aa_mid={} ink={} body={} chrome={} ui={} console={}",
                     bytes / 1024, st.cache_bytes, st.hits, st.misses, st.flushes, st.runs_shaped, tt::CONTENDED.load(core::sync::atomic::Ordering::Relaxed), mid as u8, ink as u8,
-                    face_name(Face::Body), face_name(Face::Chrome), face_name(Face::Ui)
+                    face_name(Face::Body), face_name(Face::Chrome), face_name(Face::Ui), face_name(Face::Grid)
                 );
                 serial_println!(
                     ":: KERNELFONT: faces={} cache_kib={} evictions={} fallback={} glyphs_drawn={} ms_per_1000={} -> {} ::",

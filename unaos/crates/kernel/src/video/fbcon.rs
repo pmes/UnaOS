@@ -165,7 +165,7 @@ impl<const N: usize> OpList<N> {
 /// aarch64 console, any pre-takeover x86 print) this is the font8x8 path, byte for byte.
 fn draw_glyph(surf: &FrameBuffer, ch: u8, cx: usize, cy: usize, fg: u32, bg: u32, s: usize, aa: bool) {
     if aa {
-        crate::video::text::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false, crate::video::text::Face::Body);
+        crate::video::text::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false, crate::video::text::Face::Grid); // KERNELFONT2 (B363): the console cell is the dpi-scaled grid
         return;
     }
     let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
@@ -1777,8 +1777,8 @@ pub fn panel_console_resume() -> usize {
             // reversing it is `video::font::SIZE` (one constant) rather than this scale.
             c.scale = 1;
             c.aa = true;
-            c.cell_w = crate::video::font::CELL_W;
-            c.cell_h = crate::video::font::CELL_H;
+            c.cell_w = crate::video::text::arm_grid(c.fb.info().width).0; // KERNELFONT2 (B363): the dpi-scaled grid cell (7x16 x ppi/96 at the half pixel); latches video::dpi
+            c.cell_h = crate::video::text::grid_cell().1;
             let info = c.fb.info();
             c.cols = (info.width / c.cell_w).max(1);
             c.rows = (info.height / c.cell_h).max(1);
@@ -2303,8 +2303,8 @@ pub fn panel_console_face_arm() -> Option<(usize, usize)> {
             // magnified alpha raster is not what any of this wants.
             c.scale = 1;
             c.aa = true;
-            c.cell_w = crate::video::font::CELL_W;
-            c.cell_h = crate::video::font::CELL_H;
+            c.cell_w = crate::video::text::arm_grid(c.fb.info().width).0; // KERNELFONT2 (B363): the dpi-scaled grid cell, as the x86 seam
+            c.cell_h = crate::video::text::grid_cell().1;
             // The grid follows the cell. If the console is subsequently routed into a window,
             // `panel_console_window_open` recomputes both against the WINDOW's extent; until then
             // these are the panel's, which is the surface the console is still drawing on.
@@ -2686,7 +2686,7 @@ pub fn orin_face_arm() {
             seen = Some((c.aa, c.cell_w, c.cell_h, c.cols, c.rows, info.width, info.height));
         }
     });
-    let want = (crate::video::font::CELL_W, crate::video::font::CELL_H);
+    let want = crate::video::text::grid_cell(); // KERNELFONT2 (B363): the armed cell is the dpi-scaled grid (font::CELL_W x CELL_H at scale 1.0)
     match (asked, seen) {
         (None, _) => serial_println!(
             "[conface] DECLINE reason=console-not-ready runs={} armed={} want={}x{} (panel_console_face_arm answered None — the console was not ready or FBCON was contended; the console keeps font8x8 at scale 1 and nothing else about this boot changes)",
