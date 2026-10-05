@@ -36,7 +36,9 @@ pub mod elf;
 pub mod fd;
 pub mod fpu;
 pub mod proc;
+pub mod selfbuild;
 pub mod sys;
+pub mod sys2;
 
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -414,6 +416,8 @@ pub struct LinuxProc {
     pub umask: u32,
     /// nanosleep/poll deadline (ms) while a RETRY loop is waiting.
     pub sleep_until: Option<u64>,
+    /// SELFBUILD1: the image path as the VFS resolved it — what `readlink("/proc/self/exe")` answers.
+    pub exe: String,
 }
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -607,6 +611,7 @@ pub fn sys_name(nr: u64) -> &'static str {
         218 => "set_tid_address", 228 => "clock_gettime", 230 => "clock_nanosleep", 231 => "exit_group",
         234 => "tgkill", 247 => "waitid", 257 => "openat", 262 => "newfstatat", 267 => "readlinkat", 269 => "faccessat",
         273 => "set_robust_list", 293 => "pipe2", 302 => "prlimit64", 318 => "getrandom", 332 => "statx", 334 => "rseq",
+        131 => "sigaltstack", 157 => "prctl", 204 => "sched_getaffinity", 292 => "dup3", 52 => "getpeername", 435 => "clone3", // SELFBUILD1
         _ => "?",
     }
 }
@@ -792,6 +797,7 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
         cwd,
         umask: 0o022,
         sleep_until: None,
+        exe: full.clone(),
     });
     let pml4 = root.pml4;
     proc::register(root.clone());
@@ -930,6 +936,7 @@ pub fn selftest() {
         }
         Err(e) => serial_println!(":: LINUXABI: path={} exit=? syscalls=0 enosys=[] ms=0 -> FAIL ({}) ::", P, e),
     }
+    selfbuild::kat(); // SELFBUILD1 M2: the syscall known-answer tests (second witness, `:: LINUXABI-KAT:`)
 }
 
 /// `tests linuxabi2` — `PIPE.LNX` (fork + pipe + wait4) and `LS.LNX` (stdin line + getdents64 over `/`).
