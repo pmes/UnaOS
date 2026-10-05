@@ -57,7 +57,6 @@ pub mod sha1;
 pub mod hmac;
 pub mod hkdf;
 pub mod tls12_prf;
-pub mod sha1;
 pub mod pbkdf2;
 pub mod chacha20;
 pub mod poly1305;
