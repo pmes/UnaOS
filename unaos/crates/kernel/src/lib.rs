@@ -272,3 +272,6 @@ pub mod lumen;
 // EXECNAME (rmbp-ledger B322): `tests exec`, the bare-name resolve + launch-note witness over the staged x86 programs. Tail statement, so no existing line moves.
 #[cfg(target_arch = "x86_64")]
 pub mod execname;
+// SETTINGSBUS (rmbp-ledger B337): the kernel's preference CLIENT — the desktop speaks Principia's bus verbs (relayed to PREFS.ELF when it owns them, else the kernel fulfiller), PrefChanged to the window. The bus cfg. Tail statement, so no existing line moves.
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+pub mod prefs_client;

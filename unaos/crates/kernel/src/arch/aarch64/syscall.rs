@@ -25897,3 +25897,10 @@ fn sys_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
         Err(e) => e,
     }
 }
+
+// SETTINGSBUS (rmbp-ledger B337): the router's view of this arch's mailboxes, for the kernel's preference
+// client (`prefs_client.rs` relays a desktop request to the ring-3 Principia through `bus_route` with it).
+#[cfg(feature = "busreg")]
+pub fn busreg_ops() -> &'static crate::bus_route::Ops {
+    &BUSREG_OPS
+}
