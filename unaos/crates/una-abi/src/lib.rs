@@ -1490,3 +1490,12 @@ mod ring3abi2_tests {
         assert!(whoami_parse(&b[..n - 1]).is_none());
     }
 }
+// VEINTLS (LEDGER SR36) — wall-clock time for ring 3. A TLS client checks every certificate's validity
+// window against NOW (RFC 5280 §6.1.3 (a)(2)), and ring 3 had only SYS_GETINFO's boot-relative ticks.
+// `SYS_TIME() -> UTC Unix seconds (>= 0) / -EAGAIN` — the kernel's civil clock (`clock::unix_now`: the
+// RTC or SNTP anchor plus the monotonic counter since). -EAGAIN while the clock has never been anchored
+// this boot: a caller that needs the time (certificate checks) must refuse rather than guess.
+// merge12 fold: 59/60 are SELFDIAG's path verbs, 61 WHOAMI, 62 PROF; this verb is 63.
+/// `SYS_TIME() -> unix seconds / -EAGAIN` (VEINTLS, SR36). Both arches, unconditional.
+pub const SYS_TIME: u64 = 63; // merge12 fold: 59/60 SELFDIAG, 61 WHOAMI, 62 PROF (PROFILE2), 63 TIME
+const _: () = assert!(SYS_TIME == SYS_SBRK + 5);

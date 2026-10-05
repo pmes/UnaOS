@@ -3848,7 +3848,8 @@ build_user_prefs_x86() {
 }
 
 # LUMENAPP (B323, R82): build LUMEN.ELF — Lumen as ONE program that talks to the provider itself (crates/
-# user-lumen linking vein_core + vein_ring3: DNS, TCP, TLS 1.3, the Messages API). Linked at the ELF-window
+# user-lumen linking vein_core + vein_ring3: DNS, TCP, TLS 1.3 = tls_core verified against system/trust/roots.pem
+# (VEINTLS, SR36; `--features cryptocore` = CRYPTOCORE's provider), the Messages API). Linked at the ELF-window
 # VA (user-lumen-x86.ld, the user-big shape: no PHDRS, so lld fills PT_GNU_STACK from -z stack-size) — the
 # BIGAPPS relink RING3WIN owed for LUMEN. target/LUMEN-X86.ELF, staged by the builder as APPS/LUMEN.ELF.
 # Inert until launched (`lumen`); UNAOS_LUMEN=1 adds the dock pin and the `tests lumen` fixture.
@@ -3858,7 +3859,7 @@ build_user_lumen_x86() {
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-lumen"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): the product crypto provider under tls_core
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-lumen/target/x86_64-unknown-none/release/user-lumen" \
@@ -3870,6 +3871,8 @@ build_user_lumen_x86() {
     echo -e "${COLOR_GREEN}✅ x86 ring-3 Lumen app: LUMEN-X86.ELF${COLOR_RESET}"
 }
 
+# VEINTLS (SR36): NET.ELF runs on vein_ring3 (the transport LUMEN uses: verified TLS 1.3 with tls_core), linked at
+# the ELF window (RING3ABI2's user-net-x86.ld, taken verbatim) and built `--features cryptocore`.
 # NETRING3 M3 (B306): build the x86_64 static ELF64 ring-3 network client (crates/user-net → target/NET-X86.ELF),
 # staged as APPS/NET.ELF by the builder. The exact shape of build_user_prefs_x86 above. NET.ELF draws entropy,
 # resolves api.anthropic.com, connects :80 and prints the status line (UNAOS_NETRING3=1; knob off the two new
@@ -3879,8 +3882,8 @@ build_user_net_x86() {
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 network client static-ELF program (crates/user-net → target/NET-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-net"
-    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x10000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): vein_ring3's verified TLS, CRYPTOCORE's provider; 256 KiB stack as LUMEN
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-net/target/x86_64-unknown-none/release/user-net" \
@@ -5384,7 +5387,8 @@ test_x86_64() {
 #                  the per-arch `cfg` blocks around them — is still hand-written per crate and is
 #                  still exactly what these legs exist to catch.
 #   user-lumen     BOTH type-checked (LUMENBIN; LUMENAPP B323). x86 media only (LUMEN-X86.ELF, ELF window): the
-#                  aarch64 loader has no ELF window yet, and TLS (vein_ring3) is x86_64-only; aarch64 image owed.
+#                  aarch64 loader has no ELF window yet; aarch64 image owed. VEINTLS: TLS is tls_core (arch-neutral);
+#                  check runs without `--features cryptocore` (the provider), which the media build passes.
 #
 # Fields (whitespace-separated; the 4th field runs to end-of-line):
 #   1 crate dir under crates/
@@ -5415,9 +5419,8 @@ USER_CHECK_MATRIX=(
   "user-prefs    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-big      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
-  "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-diag     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
-  "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x10000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
   "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"

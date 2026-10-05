@@ -10,7 +10,7 @@ or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keep
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
 operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
 
-Rows: 25.
+Rows: 27.
 
 | key | type | default | writers | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -29,12 +29,14 @@ Rows: 25.
 | `vein.embed.model` | string ≤128 printable | consumer: `gemini.embed_model` for gemini, `all-MiniLM-L6-v2` for local | operator | gneiss_pal EmbedConfig | The embedding model. |
 | `vein.embed.provider` | enum `gemini \| local \| off` | rule `embedder` | operator | gneiss_pal EmbedConfig | The embedder, its own setting independent of the chat provider (R81); off = recall disabled, said in-chat. |
 | `vein.embed.reembed_batch` | int `1..=100000` | `16` | operator | vein reembed | Memories per re-embed pass. |
+| `vein.endpoint` | string ≤160 printable | `"https://api.anthropic.com/v1/messages"` | operator | vein_ring3 prefs (LUMEN.ELF); kernel tests lumen | Where Vein's ring-3 client POSTs: an https:// URL (the key goes only over a verified TLS connection, VEINTLS) or an http:// relay that holds the key itself (never sent the key). |
 | `vein.gemini.api_key_env` | string ≤128 printable | `"GEMINI_API_KEY"` | operator | gneiss_pal ProviderConfig, EmbedConfig | NAME of the environment variable holding the Gemini key. |
 | `vein.gemini.auth` | enum `gcloud \| api_key \| apikey \| key \| adc \| gcloud_adc` | `"gcloud"` | operator | gneiss_pal ProviderConfig, EmbedConfig | Gemini authentication: gcloud ADC or an API key from `gemini.api_key_env`. |
 | `vein.gemini.embed_model` | string ≤128 printable | `"text-embedding-004"` | operator | gneiss_pal ProviderConfig, EmbedConfig | Gemini's embedding model. |
 | `vein.gemini.embed_region` | string ≤128 printable | `"us-central1"` | operator | gneiss_pal ProviderConfig, EmbedConfig | Vertex region for embeddings. |
 | `vein.gemini.project` | string ≤128 printable | consumer: none: gcloud auth refuses without one | operator | gneiss_pal ProviderConfig, EmbedConfig | Google Cloud project for Vertex. |
 | `vein.gemini.region` | string ≤128 printable | `"global"` | operator | gneiss_pal ProviderConfig | Vertex region for chat. |
+| `vein.key_file` | string ≤40 printable | consumer: unset: no key, the Echo provider answers | operator | vein_ring3 key (LUMEN.ELF); kernel tests lumen | Absolute path of the API key file on the UnaFS volume (read only when it stats with an inode id; refused on FAT). At most 40 bytes: ring 3's SYS_OPEN name bound. |
 | `vein.max_tokens` | int `1..=4294967295` | `16000` | operator | gneiss_pal ProviderConfig | Output token cap per reply. |
 | `vein.model` | string ≤128 printable | rule `chat-model` | operator | gneiss_pal ProviderConfig | The chat model. |
 | `vein.provider` | enum `claude \| gemini \| echo \| relay` | `"claude"` | operator | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired). |

@@ -18,6 +18,25 @@ use std::process::{Command, Stdio};
 
 mod vm_image;
 
+/// VEINTLS (SR36): copy the pinned trust bundle to `<volume>/system/trust/roots.pem`. `false` = no bundle
+/// (nothing staged, said on the console); a sha256 that is not the pin panics (the build stops).
+fn stage_trust(src: &std::path::Path, volume: &std::path::Path) -> bool {
+    let Ok(pem) = std::fs::read(src) else {
+        println!("   TRUST: system/trust/roots.pem absent — run tools/trust-bundle; LUMEN/NET will refuse TLS (no trust store)");
+        return false;
+    };
+    let pin_file = src.with_file_name("roots.pem.sha256");
+    let pin = std::fs::read_to_string(&pin_file).unwrap_or_default();
+    let pin = pin.split_whitespace().next().unwrap_or("").to_string();
+    let have: String = crypto_core::sha2::sha256(&pem).iter().map(|b| format!("{:02x}", b)).collect();
+    assert!(have == pin, "system/trust/roots.pem sha256 {} != pin {} ({}): re-run tools/trust-bundle", have, pin, pin_file.display());
+    let dir = volume.join("system/trust");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("roots.pem"), &pem).unwrap();
+    println!("   TRUST: staged system/trust/roots.pem into {} ({} B, sha256 {} = pin)", volume.display(), pem.len(), have);
+    true
+}
+
 fn main() {
     let workspace_dir = std::fs::canonicalize("..").unwrap();
     let target_dir = workspace_dir.join("target");
@@ -1055,6 +1074,15 @@ fn main() {
         println!("   DIAG: copied witness-owners.txt into system/ on the ESP");
     }
 
+    // VEINTLS (LEDGER SR36): the trust store. `tools/trust-bundle` writes the Mozilla CA bundle to
+    // <repo>/system/trust/roots.pem (gitignored, 240 KB) and its pin to roots.pem.sha256 (committed);
+    // ring 3 (vein_ring3::trust, LUMEN.ELF / NET.ELF) opens /system/trust/roots.pem. Staged on the ESP
+    // here and on the DATA volume below (the one the running kernel reads). A bundle that does not match
+    // its pin stops the build; an absent bundle is staged as nothing and LUMEN says so (Echo, "no trust
+    // store") — never a TLS connection without verification.
+    let trust_src = workspace_dir.join("../system/trust/roots.pem");
+    let trust_ok = stage_trust(&trust_src, &esp_dir);
+
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
     //
@@ -1133,6 +1161,10 @@ fn main() {
         std::fs::create_dir_all(data_dir.join("system")).unwrap();
         std::fs::copy(target_dir.join("witness-owners.txt"), data_dir.join("system").join("witness-owners.txt")).unwrap();
         staged_data.push("system/witness-owners.txt");
+    }
+    if trust_ok {
+        stage_trust(&trust_src, &data_dir);
+        staged_data.push("system/trust/roots.pem");
     }
     // `hello.txt` rides along so the operator has a trivial `cat hello.txt` probe that proves the
     // kernel is reading THIS volume — the one-command answer to "did I write the right stick?".
@@ -2234,4 +2266,28 @@ fn build_default_medium(workspace_dir: &std::path::Path) -> Result<std::path::Pa
         .map_err(|e| format!("cannot flush {}: {}", out.display(), e))?;
     let _ = std::fs::remove_file(&fs_img);
     Ok(out)
+}
+
+#[cfg(test)]
+mod veintls_tests {
+    /// The real bundle (when fetched) stages byte-identical and matches its pin; a tampered copy panics.
+    #[test]
+    fn trust_bundle_stages_and_pin_holds() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../system/trust/roots.pem");
+        if !src.exists() {
+            println!("SKIP: system/trust/roots.pem absent (tools/trust-bundle)");
+            return;
+        }
+        let out = std::env::temp_dir().join(format!("veintls-stage-{}", std::process::id()));
+        assert!(super::stage_trust(&src, &out));
+        assert_eq!(std::fs::read(out.join("system/trust/roots.pem")).unwrap(), std::fs::read(&src).unwrap());
+        let bad = out.join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        let mut pem = std::fs::read(&src).unwrap();
+        pem[100] ^= 1;
+        std::fs::write(bad.join("roots.pem"), pem).unwrap();
+        std::fs::copy(src.with_file_name("roots.pem.sha256"), bad.join("roots.pem.sha256")).unwrap();
+        assert!(std::panic::catch_unwind(|| super::stage_trust(&bad.join("roots.pem"), &out.join("x"))).is_err());
+        let _ = std::fs::remove_dir_all(&out);
+    }
 }
