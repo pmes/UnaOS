@@ -29,7 +29,8 @@
 //! carries the previous committed tree — "old tree or new tree, never a
 //! hybrid" holds even against a tear inside the 512 B root write itself.
 //!
-//! The record is a HAND-PACKED little-endian layout (not bincode): its size
+//! The record is a HAND-PACKED little-endian layout (spec §R12, not the §R1
+//! record codec): its size
 //! is a compile-time constant, enforced ≤ 512 both by `const` assert and by
 //! the golden-vector KAT (`tests/kat_vectors.rs`).
 

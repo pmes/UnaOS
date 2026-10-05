@@ -35,7 +35,7 @@
 //! u64/u32 arrays (not bincode) and are covered by the recovery suite's
 //! remount round-trips.
 
-use serde::{Deserialize, Serialize};
+use unafs::codec::{Decode, Encode};
 use std::collections::BTreeMap;
 use unafs::catalog::{CatalogEntry, serialize_catalog};
 use unafs::inode::{AttributeValue, Extent, FileKind, Inode};
@@ -44,10 +44,10 @@ use unafs::superblock::Superblock;
 use unafs::{DirEntry, ReclaimEntry, RootRecord, SnapshotEntry};
 
 // ---- codec seam -----------------------------------------------------------
-fn enc<T: Serialize + ?Sized>(v: &T) -> Vec<u8> {
+fn enc<T: Encode + ?Sized>(v: &T) -> Vec<u8> {
     unafs::codec::serialize(v).expect("serialize")
 }
-fn dec<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> T {
+fn dec<T: Decode>(bytes: &[u8]) -> T {
     unafs::codec::deserialize(bytes).expect("deserialize")
 }
 
@@ -63,7 +63,7 @@ fn h(s: &str) -> Vec<u8> {
 /// Assert forward (serialize == golden) AND roundtrip (deserialize(golden) == value).
 fn kat<T>(value: &T, golden_hex: &str)
 where
-    T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    T: Encode + Decode + PartialEq + std::fmt::Debug,
 {
     let golden = h(golden_hex);
     let actual = enc(value);

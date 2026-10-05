@@ -54,7 +54,6 @@ use crate::superblock::{
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::catalog::hash_value;
@@ -125,7 +124,7 @@ pub enum FileSystemError {
 }
 
 /// A directory entry pointing to an inode (by stable LOGICAL id).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub struct DirEntry {
     pub name: String,
     pub inode_id: u64,
@@ -150,7 +149,7 @@ pub struct BatchFile {
 /// One retained root in the snapshot index (K8b populates these; the on-disk
 /// object exists — empty — from format time, so retention is a code change,
 /// never a format migration).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotEntry {
     /// The commit generation this snapshot retains.
     pub generation: u64,
@@ -183,13 +182,89 @@ impl SnapshotEntry {
 /// dropping call returns / before a mount completes); background mode later
 /// is the same queue drained by a worker. Crash-safe: the whole drain is one
 /// commit, so a power cut mid-drain resumes from the full queue on next mount.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReclaimEntry {
     /// The dropped root's generation (provenance).
     pub generation: u64,
     /// The blocks the dropped root held the last reference to.
     pub blocks: Vec<u64>,
 }
+
+// UNAFSCODEC (SR53): the spec §R encodings of the list records stored as
+// object data (docs/dev/OS/09_FILESYSTEM/unafs-records.md §R9, §R11, §R12).
+
+/// §R9 `DirEntry`: name string, `u64` logical inode id, [`FileKind`].
+impl crate::codec::Encode for DirEntry {
+    fn encode(&self, w: &mut crate::codec::Writer) {
+        w.str(&self.name);
+        w.u64(self.inode_id);
+        crate::codec::Encode::encode(&self.kind, w);
+    }
+}
+
+impl crate::codec::Decode for DirEntry {
+    const NAME: &'static str = "DirEntry";
+    const MIN_LEN: usize = 20;
+    fn decode(r: &mut crate::codec::Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(DirEntry {
+            name: r.string("DirEntry.name")?,
+            inode_id: r.u64("DirEntry.inode_id")?,
+            kind: FileKind::decode_field(r, "DirEntry.kind")?,
+        })
+    }
+}
+
+/// §R11 `SnapshotEntry`: three `u64`, two strings, one `u64`.
+impl crate::codec::Encode for SnapshotEntry {
+    fn encode(&self, w: &mut crate::codec::Writer) {
+        w.u64(self.generation);
+        w.u64(self.imap_block);
+        w.u64(self.imap_leaves);
+        w.str(&self.name);
+        w.str(&self.creator);
+        w.u64(self.timestamp);
+    }
+}
+
+impl crate::codec::Decode for SnapshotEntry {
+    const NAME: &'static str = "SnapshotEntry";
+    const MIN_LEN: usize = 48;
+    fn decode(r: &mut crate::codec::Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(SnapshotEntry {
+            generation: r.u64("SnapshotEntry.generation")?,
+            imap_block: r.u64("SnapshotEntry.imap_block")?,
+            imap_leaves: r.u64("SnapshotEntry.imap_leaves")?,
+            name: r.string("SnapshotEntry.name")?,
+            creator: r.string("SnapshotEntry.creator")?,
+            timestamp: r.u64("SnapshotEntry.timestamp")?,
+        })
+    }
+}
+
+/// §R12 `ReclaimEntry`: `u64` generation, then the block list.
+impl crate::codec::Encode for ReclaimEntry {
+    fn encode(&self, w: &mut crate::codec::Writer) {
+        w.u64(self.generation);
+        w.seq(&self.blocks);
+    }
+}
+
+impl crate::codec::Decode for ReclaimEntry {
+    const NAME: &'static str = "ReclaimEntry";
+    const MIN_LEN: usize = 16;
+    fn decode(r: &mut crate::codec::Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(ReclaimEntry {
+            generation: r.u64("ReclaimEntry.generation")?,
+            blocks: r.seq("ReclaimEntry.blocks")?,
+        })
+    }
+}
+
+crate::codec::list_name!(
+    DirEntry => "DirEntry",
+    SnapshotEntry => "SnapshotEntry",
+    ReclaimEntry => "ReclaimEntry",
+);
 
 /// Commit-path benchmark counters (vaire ruling: the numbers must exist).
 /// The kernel witness prints these next to a CNTPCT tick delta; the host
@@ -1040,7 +1115,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// writes the indirect blocks as a side effect (they join the transaction).
     fn encode_inode_block(&mut self, inode: &Inode) -> Result<Vec<u8>, FileSystemError> {
         // v6: the meta trailer (parent, name, times) rides right after the
-        // inode's unchanged bincode bytes. v3–v5: no trailer, bytes as before.
+        // inode's unchanged §R6 record bytes. v3–v5: no trailer, bytes as before.
         let meta = if self.superblock.indexed() {
             inode.meta_bytes()
         } else {

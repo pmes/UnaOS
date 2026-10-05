@@ -22,6 +22,8 @@ use std::path::Path;
 use std::time::Instant;
 use unafs::{AttributeValue, BatchFile, FileDevice, FileSystem, parse_value};
 
+mod dump;
+
 #[derive(Parser)]
 #[command(name = "unafs")]
 #[command(about = "The Operator Tool for the UnaOS Virtual Filesystem")]
@@ -112,6 +114,17 @@ enum Commands {
     Rmattr {
         path: String,
         key: String,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
+    /// Print the volume's on-disk records field by field, walked from the
+    /// byte-level spec (docs/dev/OS/09_FILESYSTEM/unafs-records.md)
+    Dump {
+        /// Every record: superblock, root slots, inodes + trailers, overflow
+        /// lists, large attribute values, directory lists, catalog, snapshot
+        /// index, reclaim queue.
+        #[arg(long)]
+        records: bool,
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
@@ -850,6 +863,10 @@ async fn main() -> Result<()> {
         }
         Commands::BenchMap { out_dir, sizes, version, files } => {
             run_bench_map(out_dir, sizes, *version, *files)?;
+        }
+        Commands::Dump { records, img } => {
+            anyhow::ensure!(*records, "dump: pass --records (the only view today)");
+            print!("{}", dump::dump_records(img)?);
         }
         Commands::Fsck { img, repair } => {
             let device = FileDevice::open(img).context("Failed to open device")?;

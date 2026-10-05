@@ -11,12 +11,6 @@
 # A pin whose row has become current is reported as stale by --check: delete it.
 
 [[pin]]
-crate = "bincode"
-reason = "bincode 3.0.0 is a tombstone release (its whole lib.rs is `compile_error!(\"https://xkcd.com/2347/\")`), so 2.0.x is the newest bincode that compiles; the dependency dies with arc UNAFSCODEC (hand-packed LE codec in `unafs::codec`)"
-ledger = "SR31"
-until = "3.0.0"
-
-[[pin]]
 crate = "cxx-qt"
 reason = "Quartzite's optional `qt` embassy: 0.9 -> 0.10 changes the bridge macros and cxx-qt-build runs qmake, and no Qt 6 SDK exists in the audit container to prove the callers; the bump is owed on a Qt-equipped host"
 ledger = "SR31"
