@@ -2,7 +2,8 @@
 
 Branch `exec-text-fonthint`, cut at `51b720ef`, joined with `exec-rmbp-merge14` (`097aee9a`).
 Crate: `unaos/libs/text/font_core` (`no_std` + `alloc`, `forbid(unsafe_code)`, still zero dependencies).
-Module: `src/hint/` (about 5,200 lines). Aether picks it up in `handlers/aether/src/fonts/`. The kernel keeps
+Module: `src/hint/` (about 5,200 lines). Aether and quartzite pick it up through `libs/text_host`, the host font stack QUARTZFONT (SR64) lifted out of
+Aether: `fontconfig.rs` (hint rules), `raster.rs` (hinted outlines) and `lib.rs` (`is_installed`). The kernel keeps
 `Hinting::None` for now; see the KERNELFONT2 section.
 
 ## Finding: under hintslight, Chromium uses the auto-hinter, not the TrueType interpreter
@@ -39,7 +40,7 @@ Three more Chromium render-parameter facts came out of matching the oracle page,
 | CJK writing system, light mode: both dimensions, CJK blues (fill/flat, delta clamp), `hint_normal_stem` light limits, serif and anchor logic | `afcjk.c` | `hint/autofit.rs` (`cjk_*`) |
 | Adobe CFF engine as FreeType applies it (darkening off): blues init and capture (`blueScale`/`blueShift`/`blueFuzz`, family blues), hint init (ghost hints −20/−21), hint map build (capture pass per map, then the rest; initial map plus synthetic zero edge), two-pass `adjustHints`, hintmask/cntrmask (`setAll` mutating the live mask), delayed hint replacement, flex, subrs, builder `>>10` to 26.6 | `cf2blues.c`, `cf2hints.c`, `cf2intrp.c`, `cf2ft.c` | `hint/cff_hint.rs`, `cff.rs` (`HintPrivate`, `hint_source`) |
 | `Hinting::{None, Slight}` on `rasterize_glyph_hinted` and in the glyph-cache key (`cache.rs`, `ui.rs` Engine) | — | `raster.rs`, `cache.rs`, `ui.rs` |
-| Aether: installed faces hinted unless fontconfig says `hintnone`/`hinting=false` (fontconfig `<match target="font">` rules on family + pixelsize, and the pattern-level `hintstyle` default); fallback faces and synthetic oblique stay unhinted; a hinted outline is drawn with Skia AAA plus the A8 pre-blend | — | `handlers/aether/src/fonts/{raster,mod,fontconfig}.rs` |
+| Aether: installed faces hinted unless fontconfig says `hintnone`/`hinting=false` (fontconfig `<match target="font">` rules on family + pixelsize, and the pattern-level `hintstyle` default); fallback faces and synthetic oblique stay unhinted; a hinted outline is drawn with Skia AAA plus the A8 pre-blend | — | `libs/text_host/src/{raster,lib,fontconfig}.rs`; fallback twins in `handlers/aether/src/fonts/mod.rs` |
 
 FreeType quirks reproduced because the oracle demands them: `sort_and_quantize` uses `sum / j`. In
 `af_glyph_hints_align_weak_points`, `first_touched > points` (a pointer comparison) is kept. The CJK blue
@@ -62,22 +63,31 @@ round-flag recompute loop is dead code in FreeType, so it is not reproduced. The
 
 ## Results
 
-FreeType per-glyph oracle, default corpus: 16 faces (DejaVu Sans/Bold/Serif/Serif-Bold/Mono, Liberation
-Sans/Serif/Mono/Sans-Italic, FreeSans/Serif/Mono, WenQuanYi Zen Hei, Loma and Loma-Bold as CFF) × 12/16/24 px,
-26,100 glyphs.
+FreeType per-glyph oracle, default corpus: 29 faces × 12/16/24 px, 38,007 glyphs. The faces:
+- DejaVu Sans/Bold/Serif/Serif-Bold/Mono
+- Liberation Sans/Serif/Mono/Sans-Italic
+- FreeSans/Serif/Mono
+- Noto Sans/Bold/Italic, Noto Serif/Bold, Noto Sans Mono
+- Noto Sans Arabic/Hebrew/Thai/Devanagari/Armenian/Georgian
+- IPA Gothic
+- WenQuanYi Zen Hei
+- Loma and Loma-Bold (CFF)
+
+The Noto faces and IPA Gothic were installed on the host during QUARTZFONT and are covered from the
+merge15 join on.
 
 | measure | share |
 |---|---:|
 | hinted points identical to FreeType (26.6) | **99.98 %** (every face 100 % except DejaVu Sans Bold 99.8 %: 2 Arabic glyphs) |
-| bitmap exact (font_core Exact raster vs FreeType gray raster) | 12.1 % |
-| bitmap max |Δ| ≤ 8 | 71.7 % |
+| bitmap exact (font_core Exact raster vs FreeType gray raster) | 10.8 % |
+| bitmap max |Δ| ≤ 8 | 67.0 % |
 | bitmap mean |Δ| ≤ 8 | 100.0 % |
 
 The outlines match. The bitmap columns measure rasterizers: FreeType's `gray` flattens and accumulates
 differently from font_core's, and Chromium draws with Skia anyway, which font_core matches in `SkiaAaa` mode.
 The CFF faces' low exact share comes from cubic flattening. Per face and size, this is printed by
-`cargo test --release -p font_core --test hint_oracle -- --nocapture`. The Noto faces are not on this host;
-only DejaVu, Liberation, Free*, WenQuanYi and Loma are.
+`cargo test --release -p font_core --test hint_oracle -- --nocapture`. Every Noto face and IPA Gothic is 100 %
+point-identical at every size.
 
 AETHERFONT text oracle, share of glyphs within 8 levels of Chromium:
 
@@ -91,6 +101,22 @@ Widths: 400/400 within 0.5 px (worst 0.023 px). **EYES aether: 0.991 → 0.993**
 GREEN, no case worse by more than 0.001. 01-blog 0.994 → 0.999, 04-sticky 0.993 → 0.999, 08 0.995 → 0.998,
 11-non-latin 0.990 → 0.993, 17 0.993 → 0.997, 22-fonts 0.992 → 0.997. 07-images-svg moved 0.940 → 0.939
 (svg_core text, not this path).
+
+## Join with QUARTZFONT (exec-rmbp-merge15)
+
+QUARTZFONT moved Aether's font discovery, face store and rasterizer into `libs/text_host`. The hinting now
+lives there, so quartzite's chrome text (the vessels: aether-shell under GTK) is hinted as well. That was
+QUARTZFONT's owed item.
+
+- Aether only keeps the Chromium-specific rule that platform-fallback faces are drawn through an unhinted twin.
+  A native fontconfig/Pango desktop hints fallback faces, so quartzite does not use the twin.
+- QUARTZFONT's oracle (`tools/eyes/suites/xvfb-smoke/quartzfont.py`) compared quartzite against Chromium drawing
+  the face as an `@font-face`, which Chromium never hints. With hinting on, that unchanged oracle scored
+  14/15. It now references a face by its installed family whenever fontconfig resolves that family to the
+  same file, so Chromium hints it too, and falls back to `@font-face` otherwise.
+- Result: **15/15 within 8**, with worst glyph mean |d| 1.4–2.9 (`C` 2.91, against 2.68 unhinted-vs-web-font
+  before).
+- The xvfb-smoke EYES suite stays GREEN (aether-shell 1.000, chromium-window 0.986, png 1.000).
 
 ## KERNELFONT2: the kernel's mode
 

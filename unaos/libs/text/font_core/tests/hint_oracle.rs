@@ -41,6 +41,20 @@ pub const FACES: &[&str] = &[
     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
     "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+    // Noto and IPA Gothic (installed on the host with QUARTZFONT; fontconfig's sans-serif is Noto Sans now)
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Italic.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansArmenian-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansGeorgian-Regular.ttf",
+    "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     // CFF: the Adobe engine's hint model (M3)
     "/usr/share/fonts/opentype/tlwg/Loma.otf",
@@ -62,6 +76,9 @@ pub fn corpus_chars() -> Vec<char> {
             (0x5D0, 0x5EA),
             (0x621, 0x64A),
             (0xE01, 0xE3A),
+            (0x531, 0x556),   // Armenian
+            (0x905, 0x939),   // Devanagari
+            (0x10D0, 0x10F0), // Georgian
             (0x2010, 0x2027), // punctuation (latn)
             (0x2190, 0x21FF), // arrows: no script — FreeType's fallback style (hani, CJK writing system)
             (0x2200, 0x22FF), // math operators (fallback)
