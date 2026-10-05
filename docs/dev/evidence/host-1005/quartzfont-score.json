@@ -1,0 +1,67 @@
+{
+ "within8": 15,
+ "glyphs": 15,
+ "share": 1.0,
+ "strings": [
+  {
+   "text": "<",
+   "face": "NotoSans-Regular.ttf",
+   "size": 13.3333,
+   "x": 21.0,
+   "baseline": 22.0,
+   "shift": [
+    0,
+    0
+   ],
+   "glyphs": 1,
+   "within8": 1,
+   "worst_mean_diff": 1.38,
+   "background": "#f7f6f5"
+  },
+  {
+   "text": ">",
+   "face": "NotoSans-Regular.ttf",
+   "size": 13.3333,
+   "x": 71.0,
+   "baseline": 22.0,
+   "shift": [
+    0,
+    0
+   ],
+   "glyphs": 1,
+   "within8": 1,
+   "worst_mean_diff": 1.37,
+   "background": "#f7f6f5"
+  },
+  {
+   "text": "C",
+   "face": "NotoSans-Regular.ttf",
+   "size": 13.3333,
+   "x": 120.0,
+   "baseline": 22.0,
+   "shift": [
+    0,
+    0
+   ],
+   "glyphs": 1,
+   "within8": 1,
+   "worst_mean_diff": 2.68,
+   "background": "#f7f6f5"
+  },
+  {
+   "text": "Enter URL...",
+   "face": "NotoSans-Regular.ttf",
+   "size": 13.3333,
+   "x": 159.0,
+   "baseline": 22.0,
+   "shift": [
+    0,
+    0
+   ],
+   "glyphs": 12,
+   "within8": 12,
+   "worst_mean_diff": 1.58,
+   "background": "#ffffff"
+  }
+ ]
+}
