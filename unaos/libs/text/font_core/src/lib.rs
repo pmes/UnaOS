@@ -39,5 +39,5 @@ pub mod shape;
 pub use cache::GlyphCache;
 pub use font::{Error, Font, Os2, Outlines, Post};
 pub use path::{OutlineSink, Path, PathCmd};
-pub use raster::{rasterize_glyph, GlyphBitmap};
+pub use raster::{rasterize_glyph, rasterize_glyph_mode, GlyphBitmap, RenderMode};
 pub use shape::{draw_text, layout_lines, measure, shape, Canvas, GlyphPos, Line, ShapeOptions};

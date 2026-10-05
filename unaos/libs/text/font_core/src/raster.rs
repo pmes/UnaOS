@@ -10,6 +10,11 @@
 //! over the pixel); nonzero fill is `min(1, |area|)`. Quadratic and cubic segments are flattened to lines
 //! adaptively (error below 1/32 px). Outline points are snapped to the 26.6 grid FreeType stores outlines on,
 //! and coverage is quantized the way FreeType's gray rasterizer does (`min(255, floor(area * 256))`).
+//!
+//! [`RenderMode::Exact`] is the rasterizer above. [`RenderMode::SkiaAaa`] additionally snaps every edge
+//! endpoint's y to the nearest 1/4 pixel before accumulation, which is what Skia's analytic AA scan converter
+//! (`SkScan_AAAPath.cpp`, `snapY`) does and therefore what Chromium on Linux draws (the M2 oracle measured
+//! it: Chromium's vertical edge coverage comes in exact quarters while horizontal coverage is continuous).
 
 use crate::fmath::{ceil, floor, round, sqrt};
 use crate::path::OutlineSink;
@@ -37,6 +42,16 @@ impl GlyphBitmap {
     }
 }
 
+/// How coverage is computed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RenderMode {
+    /// Exact signed area (the default).
+    #[default]
+    Exact,
+    /// Exact area after snapping edge y to 1/4 px — Skia analytic-AA (Chromium) compatible.
+    SkiaAaa,
+}
+
 /// Accumulation canvas.
 pub struct Rasterizer {
     w: usize,
@@ -46,13 +61,14 @@ pub struct Rasterizer {
     start: (f32, f32),
     /// Set when points are snapped to 1/64 px like a FreeType outline (default true).
     pub snap_26_6: bool,
+    pub mode: RenderMode,
 }
 
 const FLATTEN_TOL: f32 = 1.0 / 32.0;
 
 impl Rasterizer {
     pub fn new(w: usize, h: usize) -> Self {
-        Rasterizer { w, h, acc: vec![0.0; (w + 2) * h], cur: (0.0, 0.0), start: (0.0, 0.0), snap_26_6: true }
+        Rasterizer { w, h, acc: vec![0.0; (w + 2) * h], cur: (0.0, 0.0), start: (0.0, 0.0), snap_26_6: true, mode: RenderMode::Exact }
     }
 
     pub fn width(&self) -> usize {
@@ -71,6 +87,12 @@ impl Rasterizer {
         if !(p0.0.is_finite() && p0.1.is_finite() && p1.0.is_finite() && p1.1.is_finite()) {
             return;
         }
+        let (p0, p1) = if self.mode == RenderMode::SkiaAaa {
+            let q = |v: f32| round(v * 4.0) / 4.0;
+            ((p0.0, q(p0.1)), (p1.0, q(p1.1)))
+        } else {
+            (p0, p1)
+        };
         if p0.1 == p1.1 {
             return;
         }
@@ -176,6 +198,20 @@ impl Rasterizer {
         }
     }
 
+    /// The signed area covered in each pixel (the running sum of the accumulation row, before the nonzero
+    /// rule): its total is the outline's exact signed area in px², whatever the contours' overlap.
+    pub fn signed_area(&self) -> Vec<f32> {
+        let mut out = vec![0f32; self.w * self.h];
+        for y in 0..self.h {
+            let mut s = 0.0f32;
+            for x in 0..self.w {
+                s += self.acc[y * (self.w + 2) + x];
+                out[y * self.w + x] = s;
+            }
+        }
+        out
+    }
+
     /// Resolve the accumulation into coverage bytes (nonzero rule).
     pub fn finish(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.w * self.h];
@@ -245,6 +281,18 @@ impl OutlineSink for Scaled<'_> {
 /// Rasterize glyph `gid` of `font` at `size` pixels per em, with the origin at subpixel offset
 /// (`sub_x`, `sub_y`) in [0,1) px (y down). `None` when the glyph has no outline (e.g. space).
 pub fn rasterize_glyph(font: &crate::Font, gid: u16, size: f32, sub_x: f32, sub_y: f32) -> Option<GlyphBitmap> {
+    rasterize_glyph_mode(font, gid, size, sub_x, sub_y, RenderMode::Exact)
+}
+
+/// [`rasterize_glyph`] with an explicit [`RenderMode`].
+pub fn rasterize_glyph_mode(
+    font: &crate::Font,
+    gid: u16,
+    size: f32,
+    sub_x: f32,
+    sub_y: f32,
+    mode: RenderMode,
+) -> Option<GlyphBitmap> {
     let path = font.glyph_path(gid)?;
     if path.is_empty() || !(size > 0.0) || size > 4096.0 {
         return None;
@@ -261,6 +309,7 @@ pub fn rasterize_glyph(font: &crate::Font, gid: u16, size: f32, sub_x: f32, sub_
         return None;
     }
     let mut r = Rasterizer::new(w, h);
+    r.mode = mode;
     {
         let mut s = Scaled { r: &mut r, scale, ox: sub_x - x0 as f32, oy: sub_y - y0 as f32 };
         path.replay(&mut s);
@@ -357,6 +406,19 @@ mod tests {
         fill(&mut r, &[(0.0, 0.0), (3.0, 0.0), (3.0, 1.0), (0.0, 1.0)]);
         fill(&mut r, &[(1.0, 0.0), (1.0, 1.0), (2.0, 1.0), (2.0, 0.0)]);
         assert_eq!(r.finish(), vec![255, 0, 255]);
+    }
+
+    #[test]
+    fn skia_mode_snaps_edges_to_quarter_rows() {
+        // A bar from y=0.3 to 1.3: exact gives 0.7/0.3; Skia-AAA snaps to 0.25..1.25 → 0.75/0.25.
+        let pts = [(0.0, 0.3), (1.0, 0.3), (1.0, 1.3), (0.0, 1.3)];
+        let mut r = Rasterizer::new(1, 2);
+        fill(&mut r, &pts);
+        assert_eq!(r.finish(), vec![179, 76]);
+        let mut r = Rasterizer::new(1, 2);
+        r.mode = RenderMode::SkiaAaa;
+        fill(&mut r, &pts);
+        assert_eq!(r.finish(), vec![192, 64]);
     }
 
     #[test]
