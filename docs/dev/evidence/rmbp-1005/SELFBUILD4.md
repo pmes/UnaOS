@@ -136,7 +136,7 @@ tests selfbuild4
 :: LINUXABI-KAT4: cow=ok cow_kernel=ok cow_prot=ok shared_fork=ok exec_lazy=ok sigbus=ok fail=none exit=0 -> PASS ::
 [selfbuild4] linux /apps/RUST.LNX /apps/HELLO.C
 [linuxabi] thread pid=<p> tid=<t> key=+1 …            (x4)
-[selfbuild4] exec: path=/apps/RUST.LNX file_bytes=499904 read_at_exec=<~17000> lazy_pages=<~120> eager_pages=4 vmas=5
+[selfbuild4] exec: path=/apps/RUST.LNX file_bytes=499904 read_at_exec=16874 lazy_pages=119 eager_pages=5 vmas=4
 [selfbuild4] rust: rust: panic raised (expected; caught)
 [selfbuild4] rust: rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 args=2 file_bytes=<n> file_lines=23 cpus=1 ms=<n>
 :: LINUXABI: path=/apps/RUST.LNX exit=0 syscalls=<~160> enosys=[] ms=<n> -> PASS ::
