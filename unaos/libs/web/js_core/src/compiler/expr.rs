@@ -582,7 +582,7 @@ impl Gen {
                     }
                     MemberProp::Computed(x) => {
                         self.expr(x);
-                        self.emit(Op::ToPropertyKey);
+                        self.emit(Op::ToPropertyKeyChecked);
                         self.emit(Op::Dup2);
                         self.emit(Op::GetElem);
                         self.emit(Op::ToNumeric);
@@ -669,6 +669,7 @@ impl Gen {
         self.free_temp(t);
     }
 
+    /// Stack: this fn -> this base key. The key expression is evaluated, then GetSuperBase, then ToPropertyKey.
     pub(crate) fn super_key(&mut self, p: &MemberProp) {
         match p {
             MemberProp::Name(n) => {
@@ -677,12 +678,12 @@ impl Gen {
             }
             MemberProp::Computed(x) => {
                 self.expr(x);
-                self.emit(Op::ToPropertyKey);
             }
             MemberProp::Private(_) => {
                 self.emit(Op::Undef);
             }
         }
+        self.emit(Op::SuperBase);
     }
 
     fn assign(&mut self, op: AssignOp, target: &Pat, value: &Expr) {
@@ -791,7 +792,7 @@ impl Gen {
                         }
                         MemberProp::Computed(x) => {
                             self.expr(x);
-                            self.emit(Op::ToPropertyKey);
+                            self.emit(Op::ToPropertyKeyChecked);
                             self.emit(Op::Dup2);
                             self.emit(Op::GetElem);
                             Kind::Elem
@@ -1060,7 +1061,7 @@ impl Gen {
             self.emit(Op::Await);
         }
         let check = self.emit(Op::YieldStarCheck(0, 0));
-        self.emit(if is_async { Op::Yield } else { Op::YieldRaw });
+        self.emit(Op::YieldRaw);
         self.emit(Op::Jump(top as u32));
         // throw() missing: close the iterator, then TypeError.
         let t_throw = self.here() as u32;

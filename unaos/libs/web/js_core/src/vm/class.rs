@@ -269,19 +269,27 @@ impl Vm {
         }
     }
 
-    pub fn super_get(&mut self, this: &Value, f: &Value, key: &Value) -> JsResult<Value> {
+    /// GetSuperBase: the [[Prototype]] of the active function's [[HomeObject]] (null throws on use).
+    pub fn super_base(&mut self, f: &Value) -> JsResult<Value> {
+        Ok(match self.home_proto(f)? {
+            Some(p) => Value::Object(p),
+            None => Value::Null,
+        })
+    }
+
+    pub fn super_get(&mut self, this: &Value, base: &Value, key: &Value) -> JsResult<Value> {
         let k = self.to_property_key(key)?;
-        match self.home_proto(f)? {
-            Some(p) => self.get_with_receiver(p, &k, this),
-            None => self.throw_type(&alloc::format!("Cannot read properties of null (reading '{}')", k.to_js_string())),
+        match base {
+            Value::Object(p) => self.get_with_receiver(*p, &k, this),
+            _ => self.throw_type(&alloc::format!("Cannot read properties of null (reading '{}')", k.to_js_string())),
         }
     }
 
-    pub fn super_set(&mut self, this: &Value, f: &Value, key: &Value, v: Value) -> JsResult<()> {
+    pub fn super_set(&mut self, this: &Value, base: &Value, key: &Value, v: Value) -> JsResult<()> {
         let k = self.to_property_key(key)?;
-        let p = match self.home_proto(f)? {
-            Some(p) => p,
-            None => return self.throw_type(&alloc::format!("Cannot set properties of null (setting '{}')", k.to_js_string())),
+        let p = match base {
+            Value::Object(p) => *p,
+            _ => return self.throw_type(&alloc::format!("Cannot set properties of null (setting '{}')", k.to_js_string())),
         };
         let ok = self.set(p, k.clone(), v, this)?;
         let strict = self.frames.last().map(|f| f.code.strict).unwrap_or(true);

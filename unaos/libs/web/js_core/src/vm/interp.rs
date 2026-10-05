@@ -609,6 +609,24 @@ impl Vm {
                     let r = self.instance_of(&v, &t)?;
                     self.stack.push(Value::Bool(r));
                 }
+                Op::SuperBase => {
+                    let k = self.pop();
+                    let f = self.pop();
+                    let base = self.super_base(&f)?;
+                    let k = self.to_property_key(&k)?;
+                    self.stack.push(base);
+                    self.stack.push(k.to_value());
+                }
+                Op::ToPropertyKeyChecked => {
+                    let k = self.pop();
+                    let o = self.stack.last().unwrap();
+                    if o.is_nullish() {
+                        let msg = alloc::format!("Cannot read properties of {}", if o.is_null() { "null" } else { "undefined" });
+                        return self.throw_type(&msg).map(|_: ()| unreachable!());
+                    }
+                    let k = self.to_property_key(&k)?;
+                    self.stack.push(k.to_value());
+                }
                 Op::ToPropertyKey => {
                     let v = self.pop();
                     let k = self.to_property_key(&v)?;
@@ -1172,6 +1190,8 @@ impl Vm {
                 }
                 Op::YieldRaw => {
                     let v = self.pop();
+                    // A yield* delegation point: throw() resumes into YieldStarCall instead of unwinding here.
+                    self.frames[fi].resume_kind = 8;
                     if let Some(c) = self.suspend(v, true)? {
                         return Ok(c);
                     }

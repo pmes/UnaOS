@@ -114,6 +114,10 @@ pub enum Op {
     In,
     InstanceOf,
     ToPropertyKey,
+    /// fn key -> base key: GetSuperBase of fn's [[HomeObject]], then ToPropertyKey(key).
+    SuperBase,
+    /// obj key -> obj key': RequireObjectCoercible(obj), then ToPropertyKey(key) (GetValue order).
+    ToPropertyKeyChecked,
     ToNumeric,
     ToNumber,
     ToStringOp,

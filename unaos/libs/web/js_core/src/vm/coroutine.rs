@@ -172,10 +172,11 @@ impl Vm {
             self.handlers.push(h);
         }
         frame.entry = true;
-        frame.resume_kind = if kind == 2 { 2 } else { 0 };
+        let delegate = frame.resume_kind == 8;
+        frame.resume_kind = if kind == 2 || (delegate && kind == 1) { kind } else { 0 };
         self.cur_realm = frame.realm;
         self.frames.push(frame);
-        if kind == 1 {
+        if kind == 1 && !delegate {
             // Throw at the suspension point.
             return match self.unwind_from_resume(value)? {
                 Some(c) => Ok(c),
