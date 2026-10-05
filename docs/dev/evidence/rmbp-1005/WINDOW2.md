@@ -66,6 +66,58 @@ A leg whose fixture is not staged prints `skip(<why>)` and the verdict is SKIP (
 LLD.LNX; `fixed20m` writes its 4 KiB image to `<home>window2-fixed20m.lnx` and deletes it). `tests ring3win`
 keeps its own line (it reads only BIG's low four bits).
 
+## Static-PIE contract (for SELFBUILD6, B360, merging after this arc)
+
+* Constants in `linuxabi/elf.rs` (all `pub`): **`IMAGE_LIMIT`** = `una_abi::USER_WINDOW_BYTES` (64 MiB; was the
+  literal 16 MiB — SELFBUILD6's `ldso.rs` `EXEC_LIMIT` mirrors it and should become `elf::IMAGE_LIMIT`),
+  **`PIE_BASE`** = 0x17F00000000, **`PIE_SPAN`** = 1 GiB, `low_window_ok(lo, len)` (the RAM/heap check
+  `elf::load` and `exec::load` run for an ET_EXEC), `Plan.pie` / `is_pie(&Plan)`. The pool floor is
+  `vm.rs` `pool_init` (`s.max(elf::IMAGE_LIMIT)`). This arc does NOT touch `mod.rs` `run_inner` or `proc.rs`
+  execve: `parse_sized` biases the plan, so both paths load a static-PIE unchanged.
+* The loader does no relocation. `AT_PHDR` = the biased program-header VA, `AT_ENTRY` = the biased entry,
+  **`AT_BASE` = 0** — what Linux gives a static-PIE (`binfmt_elf`: AT_BASE is the interpreter's load address,
+  0 without one). musl's `rcrt1`/`_dlstart_c` with AT_BASE 0 finds its base as `_DYNAMIC - PT_DYNAMIC.p_vaddr`
+  from AT_PHDR; glibc's `_dl_relocate_static_pie` from `__ehdr_start`. Putting PIE_BASE in AT_BASE would make
+  musl skip that walk and is only right when the lowest PT_LOAD is at 0.
+* **Host proof** (`window2/pieload.c`: maps every PT_LOAD at PIE_BASE + (p_vaddr - lowest page), copies,
+  sets W^X perms, builds the System V stack with exactly the kernel's auxv, jumps): a musl static-PIE Rust
+  hello (`rustc --target x86_64-unknown-linux-musl -C relocation-model=pie -C target-feature=+crt-static`,
+  ET_DYN, no INTERP/NEEDED, 661 R_X86_64_RELATIVE) prints `spie ok sum=499500`, rc 0; a glibc static-PIE C++
+  program with a `thread_local std::string` prints `hix`, rc 0; LLD.LNX below.
+
+## Results (compile legs and host proofs; R78 — no QEMU, the metal boot is the seat's)
+
+* **LLD.LNX, static-PIE** — built from the pinned LLVM 22.1.8 source (tarball sha256 922f1817…, verified) with
+  arroyo's exact cmake line (`LLVM_BUILD_STATIC=OFF` — it adds `-static`, and `-static -static-pie` makes gcc
+  pick `crtbeginT.o`, which cannot link a PIE; `LLVM_ENABLE_PIC=ON`, `-fPIE`, `-static-pie`, `CMAKE_SKIP_RPATH=ON`
+  — with LLVM's `$ORIGIN/../lib` RUNPATH every static-PIE tool died in `_dl_relocate_static_pie` before main,
+  measured on `llvm-min-tblgen`). Stripped: **70800000 B, sha256 99e071d0d7998e2548d853076d28f91a70bd9d2452cb9796a71f4b919bd23813**;
+  ET_DYN, no PT_INTERP, no DT_NEEDED, FLAGS_1 NOW PIE, 4 PT_LOAD, span 0..0x4421868 (71.4 MB — past the 64 MiB
+  fixed window, inside PIE_SPAN). `LLD 22.1.8 (compatible with GNU linkers)` run directly and through
+  `pieload` at PIE_BASE.
+* **The host link proves the PIE** — `build_selfbuild5_x86` with `UNAOS_LLD_LNX=<that file>` (the function run
+  verbatim): `LIB/rust staged (31 files, 16028 KiB); host relink by LLD.LNX runs`, rc 0 (sha256 SYSKAT5.LNX
+  b4215177…, link.rsp 46f04434…). The same link with LLD.LNX loaded by `pieload` at 0x17F00000000: rc 0 in
+  136 ms, and the output prints `rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 …`.
+* **User images through arroyo's functions with the 64 MiB gate** (`user_elf_window_check`, all ELFENTRY PASS):
+
+| image | file B | model | span | stack | need | cap |
+|---|---|---|---|---|---|---|
+| VUG-X86.ELF | 12744 | fixed | 13588 | — | — | 16384 |
+| VUGC-X86.ELF | 12744 | fixed | 12540 | — | — | 16384 |
+| VUGX-X86.ELF | 12744 | fixed | 13588 | — | — | 16384 |
+| VUGK-X86.ELF | 12744 | fixed | 12832 | — | — | 16384 |
+| LUMEN-X86.ELF | 280976 | elf | 3350752 | 262144 | 3616992 | 67108864 |
+| NET-X86.ELF | 226136 | elf | 221736 | 262144 | 487976 | 67108864 |
+| DIAG-X86.ELF | 267360 | elf | 722856 | 262144 | 989096 | 67108864 |
+| HOLOCRON-X86.ELF | 86568 | elf | 86321 | 262144 | 352561 | 67108864 |
+| BIG-X86.ELF | 12720 | elf | 73744 | 262144 | 339984 | 67108864 |
+
+  LUMEN was at 86 % of the old 4 MiB window; it is at 5 % of the new one.
+* Kernel legs: x86 metal shape + `selfdiag,ahciroot,btc` (the brief's list incl. `lumen,linuxabi`) exit 0;
+  aarch64 `login,loginst,virt_el0,lumen` (user blob rebuilt, head 28 00 80 d2) exit 0; builder `cargo check`
+  exit 0; una-abi host tests 9 passed (`WINDOW2-ABI`, `RING3WIN-ABI`); `window-parity.sh` 0; charter-check 0.
+
 **Stays owed.** The metal boot. `IMAGE_LIMIT` at 64 MiB only helps an ET_EXEC whose range the firmware map calls
 Usable (the rMBP's low Usable map above 1 MiB is not in the flight logs — `fixed20m` will say). One
 `crate::elf` validator for x86, aarch64 and linuxabi (RING3WIN's owed fold, still owed). KERNELFONT's face in
