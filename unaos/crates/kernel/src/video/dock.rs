@@ -572,6 +572,7 @@ pub fn take_launch(app: PinnedApp) -> bool {
 /// launches — the SAME latches a pin-tile press posts, drained by the render bodies (`console_launch_service`;
 /// the shell's owning body, which clears its stale tuple when the row is gone and mints on `take_launch`).
 pub fn relaunch_furniture() {
+    crate::loginfurn::self_launch("furniture"); // LOGINFURN (R88): no caller is left on the login path; a regression is counted by `tests loginfurn`
     post_launch(PinnedApp::Console);
     post_launch(PinnedApp::Shell);
     dp_request_load(); // DOCKPIN — a fresh session reads ITS `system.dock.pins` (the service pass drains it).
