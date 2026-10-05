@@ -206,6 +206,11 @@ fn ensure_unafsx86() {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); }
     }
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        static GROW: AtomicBool = AtomicBool::new(false);
+        if !GROW.swap(true, Ordering::AcqRel) { register("unafsgrow", crate::fs::unafsgrow::selftest); } // UNAFSGROW (B347) M4: the native module's builds (aarch64 always, x86 under `unafs`)
+    }
 }
 
 /// ATTRSURF (B299): register `tests attr` exactly once, every build — the fixture decides PASS or an
