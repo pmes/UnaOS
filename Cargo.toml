@@ -14,6 +14,7 @@ members = [
     "unaos/libs/sys/vein_core",
     "unaos/libs/sys/amber_core",
     "unaos/libs/media/pixel_core",
+    "unaos/libs/media/vp8_core",
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",
