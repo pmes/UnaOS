@@ -39,21 +39,21 @@ impl SpecifiedStyle {
         if let Some(w) = self.width { node_style.size.width = w; }
         if let Some(h) = self.height {
             node_style.size.height = h;
-            node_style.min_size.height = h;
+            node_style.min_size.height = min_max(h);
         }
         // min wins over max in taffy, and blocks carry a UA min-height
         // default — a specified max must clear it (an explicit min-* below
         // still overrides, it folds after).
         if let Some(v) = self.max_width {
-            node_style.max_size.width = v;
-            node_style.min_size.width = Dimension::auto();
+            node_style.max_size.width = min_max(v);
+            node_style.min_size.width = LengthPercentageAuto::auto();
         }
         if let Some(v) = self.max_height {
-            node_style.max_size.height = v;
-            node_style.min_size.height = Dimension::auto();
+            node_style.max_size.height = min_max(v);
+            node_style.min_size.height = LengthPercentageAuto::auto();
         }
-        if let Some(v) = self.min_width { node_style.min_size.width = v; }
-        if let Some(v) = self.min_height { node_style.min_size.height = v; }
+        if let Some(v) = self.min_width { node_style.min_size.width = min_max(v); }
+        if let Some(v) = self.min_height { node_style.min_size.height = min_max(v); }
         if let Some(p) = self.padding {
             node_style.padding = p;
         }
@@ -2485,6 +2485,17 @@ fn parse_sides<T: Copy>(value: &str, parse_one: impl Fn(&str) -> Option<T>) -> O
         _ => return None,
     };
     Some(Rect { top: t, right: r, bottom: b, left: l })
+}
+
+/// taffy 0.14 types `min_size`/`max_size` as `LengthPercentageAuto` (no intrinsic keywords).
+/// aether's specified min/max/height values are only ever length, percent or auto
+/// (`parse_dimension_str`), so the narrowing is lossless; anything else folds to `auto`.
+pub(crate) fn min_max(d: Dimension) -> LengthPercentageAuto {
+    match d.expand() {
+        taffy::style::ExpandedDimension::Length(v) => LengthPercentageAuto::length(v),
+        taffy::style::ExpandedDimension::Percent(v) => LengthPercentageAuto::percent(v),
+        _ => LengthPercentageAuto::auto(),
+    }
 }
 
 fn parse_dimension_str(value: &str) -> Option<Dimension> {

@@ -408,22 +408,22 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             min_size: match tag.as_str() {
                 // UA default control sizes so empty controls are visible.
                 "input" | "select" => Size {
-                    width: Dimension::length(160.0),
-                    height: Dimension::length(24.0),
+                    width: LengthPercentageAuto::length(160.0),
+                    height: LengthPercentageAuto::length(24.0),
                 },
                 "textarea" => Size {
-                    width: Dimension::length(160.0),
-                    height: Dimension::length(60.0),
+                    width: LengthPercentageAuto::length(160.0),
+                    height: LengthPercentageAuto::length(60.0),
                 },
                 "button" => Size {
-                    width: Dimension::length(24.0),
-                    height: Dimension::length(24.0),
+                    width: LengthPercentageAuto::length(24.0),
+                    height: LengthPercentageAuto::length(24.0),
                 },
                 // Everything else: no UA minimum. An empty block box is
                 // zero-tall in CSS; a floor here compounds — pages mount
                 // dozens of empty container/portal divs, and 20px each
                 // pushed the real content below the fold.
-                _ => Size { width: Dimension::auto(), height: Dimension::auto() },
+                _ => Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::auto() },
             },
             margin: {
                 // UA default spacing: block gaps for paragraphs/headings,
@@ -460,7 +460,7 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         if tag == "br" {
             style.size.width = Dimension::percent(1.0);
             style.size.height = Dimension::length(0.0);
-            style.min_size = Size { width: Dimension::auto(), height: Dimension::length(0.0) };
+            style.min_size = Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::length(0.0) };
         }
 
         // Inline style="..." — paint properties plus width/height.
@@ -693,15 +693,20 @@ pub fn remeasure(tree: &mut LayoutTree) {
     let _ = tree.taffy.compute_layout_with_measure(
         tree.root_node,
         viewport,
-        |known, avail, node_id, _ctx, _style| {
+        // taffy 0.14: the measure function takes the whole `LayoutInput` and answers a
+        // `LayoutOutput`; aether reads the same two fields it always did.
+        |input, node_id, _ctx, _style| {
+            let known = input.known_dimensions;
+            let avail = input.available_space;
+            let out = |s: Size<f32>| taffy::tree::LayoutOutput::from_outer_size(s);
             if let Some(&(w, h)) = img_info.get(&node_id) {
-                return Size {
+                return out(Size {
                     width: known.width.unwrap_or(w),
                     height: known.height.unwrap_or(h),
-                };
+                });
             }
             let Some((text, font_size, line_mult, nowrap, family)) = text_info.get(&node_id) else {
-                return Size { width: known.width.unwrap_or(0.0), height: known.height.unwrap_or(0.0) };
+                return out(Size { width: known.width.unwrap_or(0.0), height: known.height.unwrap_or(0.0) });
             };
             let wrap_width = known.width.unwrap_or(match avail.width {
                 AvailableSpace::Definite(w) => w,
@@ -711,10 +716,10 @@ pub fn remeasure(tree: &mut LayoutTree) {
             let fam_font = family_font(*family);
             let use_font = fam_font.as_deref().or(font.as_deref());
             let (w, h) = measure_text_family(use_font, *family, text, *font_size, *line_mult, effective_wrap);
-            Size {
+            out(Size {
                 width: known.width.unwrap_or(w),
                 height: known.height.unwrap_or(h),
-            }
+            })
         },
     );
 }
