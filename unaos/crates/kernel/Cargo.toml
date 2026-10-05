@@ -3500,7 +3500,7 @@ ftdirx = []
 # configuration first, ECM second — the walk asks for configuration index 1). DEFAULT OFF => the module is
 # `#[cfg]`-erased and every site in xhci/mod.rs and e1000.rs is a same-line cfg-gated append or an
 # `#[inline(always)] false` helper: byte-identical. Kept in sync with arroyo and builder/src/main.rs.
-usbnet = []
+usbnet = ["dep:usbnet_core"] # NETFRAME (B368): the rx framing is the shared no_std core `usbnet_core` (host KATs); a `dep:` so a knob-off image carries none of it
 
 # AHCI (rmbp-ledger B89, first rung): `UNAOS_AHCI=1` arms `drivers/ahci.rs` — the SATA host
 # controller driver, READ-ONLY. It finds the controller by PCI class (0x01/0x06 progif 0x01, never
@@ -3808,6 +3808,7 @@ holocron_core = { path = "../../libs/sys/holocron_core", optional = true }
 # WIFI1 (B338, R79): the BCM4331 driver's shared no_std core — the firmware container codec and the
 # IEEE 802.11 frame codec, the same crate the host tests link. `optional`, pulled only by `wifi`.
 wifi_core = { path = "../../libs/sys/wifi_core", default-features = false, optional = true }
+usbnet_core = { path = "../../libs/sys/usbnet_core", default-features = false, optional = true } # NETFRAME (B368)
 # SELFDIAG (B324): the diagnosis core — witness grammar, owners table, prompt, diff parser + hunk locator +
 # streaming emitter, record, Echo fixture — the SAME crate APPS/DIAG.ELF links. no_std, zero deps.
 diag_core = { path = "../../libs/sys/diag_core", optional = true }

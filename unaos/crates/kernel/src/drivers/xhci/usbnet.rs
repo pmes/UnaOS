@@ -441,7 +441,7 @@ pub fn arm(dci: u8, trb_phys: u64) {
     DCI.store(dci, Ordering::Relaxed);
     TRB_PHYS.store(trb_phys, Ordering::Relaxed);
     DONE.store(false, Ordering::Relaxed);
-    ARMED.store(true, Ordering::Relaxed);
+    ARMED.store(true, Ordering::Relaxed); NF_ARM_AT.store(crate::arch::ms().max(1), Ordering::Relaxed); // NETFRAME M3: the stall clock starts at the arm
 }
 fn reset_arm() {
     ARMED.store(false, Ordering::Relaxed);
@@ -509,7 +509,7 @@ pub fn tx_pending() -> bool {
     !TXQ.lock().is_empty()
 }
 pub fn note_tx_done() {
-    TX_FRAMES.fetch_add(1, Ordering::Relaxed);
+    TX_FRAMES.fetch_add(1, Ordering::Relaxed); NF_TX_LAST.store(crate::arch::ms().max(1), Ordering::Relaxed); // NETFRAME M2
     rollup();
 }
 
@@ -666,48 +666,29 @@ pub fn deliver_ax(buf: &[u8]) {
     if n < 4 {
         return; // ZLP / nothing
     }
-    let rx_hdr = u32::from_le_bytes([buf[n - 4], buf[n - 3], buf[n - 2], buf[n - 1]]);
-    let pkt_cnt = (rx_hdr & 0xffff) as usize;
-    let hdr_off = ((rx_hdr >> 16) & 0xffff) as usize;
+    netframe_rx0(buf); // NETFRAME M2: the first non-empty completion's bytes, once, whatever the parse says
+    let (rx_hdr, pkt_cnt, hdr_off) = usbnet_core::ax88179::trailer(buf).unwrap_or((0, 0, 0));
     let first_hdr = if hdr_off + 4 <= n { u32::from_le_bytes([buf[hdr_off], buf[hdr_off + 1], buf[hdr_off + 2], buf[hdr_off + 3]]) } else { 0 };
-    // Linux ax88179_rx_fixup: the transfer must hold the header array; geometry failure drops the whole transfer.
-    if pkt_cnt == 0 || hdr_off + pkt_cnt * 4 > n || hdr_off + 4 > n {
+    // NETFRAME M3: the split is the shared core's (`usbnet_core::ax88179`, host KATs); verdicts and counters unchanged.
+    let split = usbnet_core::ax88179::split(buf, ax::RX_PAD, |p| match p {
+        usbnet_core::Pkt::Pad => { RX_PAD_HDR.fetch_add(1, Ordering::Relaxed); }
+        usbnet_core::Pkt::Flagged { hdr, crc, off, len } => {
+            if crc { RX_CRC.fetch_add(1, Ordering::Relaxed); } else { RX_CHIP_DROP.fetch_add(1, Ordering::Relaxed); }
+            RX_DROP.fetch_add(1, Ordering::Relaxed);
+            flagged_once(hdr, &buf[off..(off + len).min(off + 16)]);
+        }
+        usbnet_core::Pkt::Frame { off, len } => {
+            RX_OK.fetch_add(1, Ordering::Relaxed);
+            deliver(&buf[off..off + len]);
+        }
+    });
+    if let Some(r) = split.refused {
         RX_SHORT.fetch_add(1, Ordering::Relaxed);
         ERRORS.fetch_add(1, Ordering::Relaxed);
         RX_DROP.fetch_add(1, Ordering::Relaxed);
-        rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, first_hdr, "short-geometry");
-        return;
-    }
-    let mut off = 0usize;
-    for i in 0..pkt_cnt {
-        let h = hdr_off + i * 4;
-        let pkt_hdr = u32::from_le_bytes([buf[h], buf[h + 1], buf[h + 2], buf[h + 3]]);
-        let pkt_len = ((pkt_hdr >> 16) & 0x1fff) as usize;
-        // USBNET6 M2: pkt_len 0 is the part's alignment DUMMY header (flight 19: 0x80008000 after every real header),
-        // skipped exactly as Linux `ax88179_rx_fixup` does — never a drop. Was counted `rx_chip_drop` by USBNET5.
-        if pkt_len == 0 {
-            RX_PAD_HDR.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        // A DROP_ERR / CRC_ERR on a real-length packet is the chip's own verdict: counted, skipped, first three printed raw.
-        if pkt_hdr & (ax::RXHDR_DROP_ERR | ax::RXHDR_CRC_ERR) != 0 && off + pkt_len <= hdr_off {
-            if pkt_hdr & ax::RXHDR_DROP_ERR != 0 { RX_CHIP_DROP.fetch_add(1, Ordering::Relaxed); } else { RX_CRC.fetch_add(1, Ordering::Relaxed); }
-            RX_DROP.fetch_add(1, Ordering::Relaxed);
-            flagged_once(pkt_hdr, &buf[off..(off + pkt_len).min(off + 16)]);
-            off += (pkt_len + 7) & !7;
-            continue;
-        }
-        if pkt_len < ax::RX_PAD + 14 || off + pkt_len > hdr_off {
-            RX_SHORT.fetch_add(1, Ordering::Relaxed);
-            ERRORS.fetch_add(1, Ordering::Relaxed);
-            RX_DROP.fetch_add(1, Ordering::Relaxed);
-            rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, pkt_hdr, "pkt-len-bad");
-            return;
-        }
-        // Frame at pkt_start+2, length pkt_len-2 (Linux skb_pull(2) of a pkt_len-long clone).
-        RX_OK.fetch_add(1, Ordering::Relaxed);
-        deliver(&buf[off + ax::RX_PAD..off + pkt_len]);
-        off += (pkt_len + 7) & !7;
+        let why = match r { usbnet_core::Refusal::PktLen => "pkt-len-bad", _ => "short-geometry" };
+        let ph = if split.packets < pkt_cnt && hdr_off + split.packets * 4 + 4 <= n { let h = hdr_off + split.packets * 4; u32::from_le_bytes([buf[h], buf[h + 1], buf[h + 2], buf[h + 3]]) } else { first_hdr };
+        rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, ph, why);
     }
 }
 
@@ -928,7 +909,7 @@ fn flagged_once(pkt_hdr: u32, head: &[u8]) {
 fn note_ethertype(f: &[u8]) {
     if f.len() < 14 { return; }
     let et = u16::from_be_bytes([f[12], f[13]]);
-    let _ = FIRST_ETYPE.compare_exchange(0, et, Ordering::Relaxed, Ordering::Relaxed);
+    let _ = FIRST_ETYPE.compare_exchange(0, et, Ordering::Relaxed, Ordering::Relaxed); NF_LAST_ETYPE.store(et, Ordering::Relaxed); // NETFRAME: the newest frame's ethertype, for `tests usbnet7`
     match et {
         0x0806 => { RX_ARP.fetch_add(1, Ordering::Relaxed); }
         0x86dd => { RX_V6.fetch_add(1, Ordering::Relaxed); }
@@ -1042,6 +1023,7 @@ pub fn qctrl() -> [u8; 5] {
 pub fn note_xfer(n: usize) {
     RX_XFERS.fetch_add(1, Ordering::Relaxed);
     if n < 4 { RX_ZLP.fetch_add(1, Ordering::Relaxed); }
+    netframe_note_xfer(n); // NETFRAME M2: the completion log (length + ms) and the last completion's time
 }
 /// One bulk-IN TD posted. The first prints `[usbnet] rx_arm n=<queued> ep=<addr> mps=<n>` once (bring-up, not per frame).
 pub fn note_arm(queued: u32, ep: u8) {
@@ -1208,3 +1190,143 @@ pub fn main_pass() {
 fn stack_polls() -> u64 { crate::net_tick::polls() }
 #[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
 fn stack_polls() -> u64 { 0 }
+
+// ── NETFRAME (rmbp-ledger B368) ─────────────────────────────────────────────────────────────────────
+// Flight 22: `rx_ok=35 rx_pad=35` with `census ipv4=25 ipv6=10` — every completion parsed to one real frame plus the
+// alignment dummy, so the framing was right; then RX STOPPED (`xfers=35 arms=36 pending=1 ep_state=1`, no error event).
+// M2 makes the next flight show the framing AND the stall on the wire: the first completion's bytes once, a log of
+// the first completions (length + ms), the last RX / TX completion times, and on a stall the dongle's port link
+// state. M3: a TD pending past `NF_KICK_MS` with the PHY up gets its IN doorbell rung again (`kicks=`) — a
+// recovery candidate for a doorbell the controller missed, harmless on a Running endpoint (xHCI 1.2 §4.7) —
+// and `tests usbnet7`, which drives the main pass and the stack itself and asks for a frame, an IPv4 frame and a
+// DHCP server reply.
+const NF_LOG: usize = 16;
+/// A bulk-IN TD with no completion for this long (PHY link up) is kicked; again every `NF_KICK_MS`.
+const NF_KICK_MS: u64 = 2_000;
+/// `tests usbnet7` window.
+const NF_WINDOW_MS: u64 = 10_000;
+static NF_RX0: AtomicBool = AtomicBool::new(false);
+static NF_LENS: [AtomicU32; NF_LOG] = [const { AtomicU32::new(0) }; NF_LOG];
+static NF_MS: [AtomicU64; NF_LOG] = [const { AtomicU64::new(0) }; NF_LOG];
+static NF_N: AtomicU64 = AtomicU64::new(0);
+static NF_RX_LAST: AtomicU64 = AtomicU64::new(0);
+static NF_TX_LAST: AtomicU64 = AtomicU64::new(0);
+static NF_ARM_AT: AtomicU64 = AtomicU64::new(0);
+static NF_KICK_AT: AtomicU64 = AtomicU64::new(0);
+static NF_KICKS: AtomicU64 = AtomicU64::new(0);
+static NF_LAST_ETYPE: AtomicU16 = AtomicU16::new(0);
+
+/// M2: `[usbnet] rx0 len=<n> hdr=<trailer> pkt_cnt=<n> hdr_off=<n> bytes=<first 48> tail=<last 16>`, once per boot.
+fn netframe_rx0(buf: &[u8]) {
+    if NF_RX0.swap(true, Ordering::Relaxed) { return; }
+    let n = buf.len();
+    let (h, cnt, off) = usbnet_core::ax88179::trailer(buf).unwrap_or((0, 0, 0));
+    serial_println!(
+        "[usbnet] rx0 len={} hdr={:#010x} pkt_cnt={} hdr_off={} bytes={} tail={}",
+        n, h, cnt, off, HexRun(&buf[..n.min(48)]), HexRun(&buf[n.saturating_sub(16)..])
+    );
+}
+/// Bytes as one unbroken lowercase hex run (no `0x`, no separators — not a sha-length word in practice, and greppable).
+struct HexRun<'a>(&'a [u8]);
+impl core::fmt::Display for HexRun<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in self.0 { write!(f, "{:02x}", b)?; }
+        Ok(())
+    }
+}
+fn netframe_note_xfer(n: usize) {
+    let now = crate::arch::ms().max(1);
+    NF_RX_LAST.store(now, Ordering::Relaxed);
+    let i = NF_N.fetch_add(1, Ordering::Relaxed) as usize;
+    if i < NF_LOG {
+        NF_LENS[i].store(n as u32, Ordering::Relaxed);
+        NF_MS[i].store(now, Ordering::Relaxed);
+    }
+}
+/// M3: the data pass asks this when the IN TD is still outstanding; true = ring the IN doorbell again now.
+pub fn rx_kick_due() -> bool {
+    if !ARMED.load(Ordering::Relaxed) || DONE.load(Ordering::Relaxed) || (kind() == KIND_AX88179 && !link_up()) {
+        return false;
+    }
+    let now = crate::arch::ms();
+    let since = now.saturating_sub(NF_ARM_AT.load(Ordering::Relaxed).max(NF_KICK_AT.load(Ordering::Relaxed)));
+    if since < NF_KICK_MS { return false; }
+    NF_KICK_AT.store(now.max(1), Ordering::Relaxed);
+    let k = NF_KICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 2 || k.is_power_of_two() {
+        serial_println!("[usbnet] rx kick n={} pending_ms={} xfers={} rx_ok={}", k, now.saturating_sub(NF_ARM_AT.load(Ordering::Relaxed)), RX_XFERS.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed));
+    }
+    true
+}
+/// M2: `[usbnet] rxlog n=<completions> lens=[…] ms=[…] last_ms=<n> tx_last_ms=<n> now_ms=<n> kicks=<n>`.
+fn netframe_rxlog() {
+    let n = NF_N.load(Ordering::Relaxed);
+    let k = (n as usize).min(NF_LOG);
+    let mut lens = alloc::string::String::new();
+    let mut ms = alloc::string::String::new();
+    for i in 0..k {
+        if i > 0 { lens.push(','); ms.push(','); }
+        let _ = core::fmt::Write::write_fmt(&mut lens, format_args!("{}", NF_LENS[i].load(Ordering::Relaxed)));
+        let _ = core::fmt::Write::write_fmt(&mut ms, format_args!("{}", NF_MS[i].load(Ordering::Relaxed)));
+    }
+    serial_println!(
+        "[usbnet] rxlog n={} lens=[{}] ms=[{}] last_ms={} tx_last_ms={} now_ms={} kicks={} tx_stuck={}",
+        n, lens, ms, NF_RX_LAST.load(Ordering::Relaxed), NF_TX_LAST.load(Ordering::Relaxed), crate::arch::ms(),
+        NF_KICKS.load(Ordering::Relaxed), TX_STUCK.load(Ordering::Relaxed)
+    );
+    match crate::drivers::xhci::claim() {
+        Ok(x) => match x.usbnet_stall_probe() {
+            Some((portsc, in_st, out_st)) => serial_println!(
+                "[usbnet] stall portsc={:#010x} ccs={} ped={} pls={} speed={} in_state={} out_state={} pending={}",
+                portsc, portsc & 1, (portsc >> 1) & 1, (portsc >> 5) & 0xf, (portsc >> 10) & 0xf, in_st, out_st,
+                (ARMED.load(Ordering::Relaxed) && !DONE.load(Ordering::Relaxed)) as u8
+            ),
+            None => serial_println!("[usbnet] stall portsc=? (no slot)"),
+        },
+        Err(_) => serial_println!("[usbnet] stall portsc=? (controller busy)"),
+    }
+}
+
+/// M3 — `tests usbnet7`: up to 10 s of the main loop's two net calls run by the fixture (the shell holds the main
+/// loop): the xHCI pass (`main_pass`: events, FTDI, the full `service_usbnet`) and the stack's poll, which keeps the
+/// DHCP client retransmitting. Frames go to the STACK, not the fixture. PASS = a frame arrived, an IPv4 frame among
+/// them, and a DHCP server reply (UDP from port 67) or a lease.
+/// `:: USBNET7: rx_ok=<n> frames=<n> first_frame_ms=<n> ethertype=0x0800 dhcp=offer -> PASS ::`; otherwise FAIL with
+/// the `rxlog` + `stall` lines. No dongle / no PHY link -> SKIP.
+pub fn usbnet7_selftest() {
+    CENSUS.store(true, Ordering::Relaxed);
+    let skip = if !is_up() { Some("no-dongle") } else if kind() == KIND_AX88179 && !link_up() { Some("no-link") } else { None };
+    if let Some(r) = skip {
+        serial_println!(":: USBNET7: rx_ok={} frames=0 first_frame_ms=none ethertype=none dhcp=none -> SKIP reason={} ::", RX_OK.load(Ordering::Relaxed), r);
+        return;
+    }
+    let (f0, v40, d0) = (RX_FRAMES.load(Ordering::Relaxed), RX_V4.load(Ordering::Relaxed), RX_DHCP.load(Ordering::Relaxed));
+    let t0 = crate::arch::ms();
+    let mut first_ms: Option<u64> = None;
+    let mut first_et = 0u16;
+    while crate::arch::ms().saturating_sub(t0) < NF_WINDOW_MS {
+        main_pass();
+        nf_stack_poll();
+        if first_ms.is_none() && RX_FRAMES.load(Ordering::Relaxed) != f0 {
+            first_ms = Some(crate::arch::ms().saturating_sub(t0));
+            first_et = NF_LAST_ETYPE.load(Ordering::Relaxed);
+        }
+        if RX_V4.load(Ordering::Relaxed) != v40 && (RX_DHCP.load(Ordering::Relaxed) != d0 || leased()) { break; }
+        for _ in 0..256 { core::hint::spin_loop(); }
+    }
+    let frames = RX_FRAMES.load(Ordering::Relaxed) - f0;
+    let v4 = RX_V4.load(Ordering::Relaxed) - v40;
+    let offer = RX_DHCP.load(Ordering::Relaxed) != d0 || leased();
+    let et = if v4 > 0 { alloc::string::String::from("0x0800") } else if frames > 0 { alloc::format!("{:#06x}", first_et) } else { alloc::string::String::from("none") };
+    let fms = match first_ms { Some(m) => alloc::format!("{}", m), None => alloc::string::String::from("none") };
+    let pass = frames > 0 && v4 > 0 && offer;
+    serial_println!(
+        ":: USBNET7: rx_ok={} frames={} first_frame_ms={} ethertype={} dhcp={} -> {} ::",
+        RX_OK.load(Ordering::Relaxed), frames, fms, et, if offer { "offer" } else { "none" }, if pass { "PASS" } else { "FAIL" }
+    );
+    if !pass { netframe_rxlog(); }
+}
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn nf_stack_poll() { let _ = crate::smolnet::usbnet7_poll(); }
+#[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
+fn nf_stack_poll() { let mut b = [0u8; FRAME_CAP]; while raw_rx(&mut b).is_some() {} }

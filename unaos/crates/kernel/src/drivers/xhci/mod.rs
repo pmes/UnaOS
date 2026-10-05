@@ -17284,7 +17284,7 @@ impl XhciController {
             usbnet::arm(in_dci, wait_trb_phys);
             usbnet::note_arm(1, in_ep); // USBNET7: `[usbnet] rx_arm n= ep= mps=` once, then a counter
             self.ring_doorbell(slot, in_dci as u32);
-        }
+        } else if usbnet::rx_kick_due() { self.ring_doorbell(slot, in_dci as u32); } // NETFRAME M3 (B368): an IN TD outstanding past 2 s with the PHY up gets its doorbell rung again (flight 22: RX stopped at 35 completions, the 36th TD pending forever on a Running endpoint)
 
         // ── TX (NETCLOCK M3): reap the in-flight TD, then issue at most one more; asynchronous, one TD in flight. ──
         if let Some(code) = usbnet::tx_take_done() {
@@ -17581,5 +17581,20 @@ impl XhciController {
         let dci = ((s.bulk_in_ep & 0x0F) * 2) + 1;
         let r = s.bulk_in_ring.as_ref()?;
         Some((self.ep_ctx_deq(slot, dci), r.enqueue_index(), r.cycle_bit(), self.ep_state_of(slot, dci)))
+    }
+}
+
+/// NETFRAME M2 (B368): the dongle's root-port PORTSC and its bulk IN / OUT endpoint states, for the `tests usbnet7`
+/// stall dump — whether the link left U0 (PLS), the device dropped (CCS/PED), or an endpoint halted.
+#[cfg(feature = "usbnet")]
+impl XhciController {
+    pub fn usbnet_stall_probe(&self) -> Option<(u32, u8, u8)> {
+        let slot = usbnet::slot();
+        if slot == 0 { return None; }
+        let s = &self.slots[slot as usize];
+        if s.bulk_in_ep == 0 || s.port_id == 0 { return None; }
+        let in_dci = ((s.bulk_in_ep & 0x0F) * 2) + 1;
+        let out_dci = (s.bulk_out_ep & 0x0F) * 2;
+        Some((self.read_portsc(s.port_id), self.ep_state_of(slot, in_dci), if s.bulk_out_ep == 0 { 0xFF } else { self.ep_state_of(slot, out_dci) }))
     }
 }

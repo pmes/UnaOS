@@ -2202,3 +2202,17 @@ pub fn netclock_selftest() {
         polls_ps, tx_ps, loan, usbnet::rx_ok(), if ok { "PASS" } else { "FAIL" }
     );
 }
+
+/// NETFRAME (B368): `tests usbnet7` runs the stack's poll itself (the shell holds the main loop while a fixture
+/// runs): build the stack if needed (its DHCP client then retransmits on smoltcp's own timer), one `service_poll`.
+#[cfg(feature = "usbnet")]
+pub fn usbnet7_poll() -> bool {
+    {
+        let mut g = STACK.lock();
+        if !ensure_stack(&mut g) {
+            return false;
+        }
+    }
+    service_poll();
+    true
+}
