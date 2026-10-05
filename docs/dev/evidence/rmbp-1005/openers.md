@@ -34,11 +34,11 @@ dependencies so a file's type never depends on a knob.
 - M2 the kernel: `filetype` types (image/jpeg image/bmp image/webp image/qoi audio/flac audio/ogg audio/mpeg audio/aac
   audio/mp4 audio/aiff video/mp4 video/webm), the sniff through the cores, the extension rows; `assoc::BUILTIN` rows
   (images -> facet, audio -> play, video -> none: no video opener in this tree); Quarry's kind tokens.
-- M3 the witness at `tests testf`: one `[openers]` line per sample and
-  `:: OPENERS: test_f=24 typed=24 unhandled=0 -> PASS :: opened=22 cores=22/22 owed=TEST.WEBM(video/webm),TEST.MP4(video/mp4) reason=no-video-opener ::`
+- M3 the witness at `tests testf` (committed with M2: same file): one `[openers]` line per sample and
+  `:: OPENERS: test_f=24 typed=24 unhandled=0 -> PASS :: opened=22 cores=22/22 owed=TEST.WEBM(video/webm),TEST.MP4(video/mp4) reason=no-opener-in-this-tree(video: Stria's player, SR26) dir=/system/test-f ::`
 
 ## Witness (what flight 24 reads, x86 metal shape)
-- `tests testf` -> `:: TESTF: staged=24/24 …` then 24 `[openers] TEST.M4A type=audio/mp4 src=sniffed handler=play core=audio_core` lines and
+- `tests testf` -> `:: TESTF: staged=24/24 …` then 24 lines like `[openers] TEST.M4A type=audio/mp4 src=sniffed opener=play(db) handler=play core=audio_core=ok` and
   `:: OPENERS: test_f=24 typed=24 unhandled=0 -> PASS :: …`.
 - On the glass: double-click ANIM.WEBP -> `[quarry] … open kind=webp handler=facet`, facet animates; TEST.BMP ->
   `open kind=bmp handler=facet`, `[facet] open … pixel_core=127x64`; TEST.M4A -> `open kind=audio handler=play`,
@@ -49,3 +49,10 @@ dependencies so a file's type never depends on a knob.
   `none`, said by name on the witness. `unhandled` counts only files with no type, or with an opener this build lacks.
 - SVG stays `text/plain` (sniffed text) opening in the editor: the kernel links pixel_core without `svg`.
 - MP3 playback itself is MP3HANG's arc, not this one.
+
+## Built (a60219de -> M1 d2683b2c, M2+M3 21973414)
+Host: `cargo test -p pixel_core -p audio_core -p demux_core --test mime_testf` rc=0 with all 18 fetched samples present
+(TEST.M4A: AAC, 44100 Hz mono, 12701 frames decoded; 14 `stsz`/`stco` samples inside the file; TEST.BMP 127x64; ANIM.WEBP
+animates). The full audio_core suite has THREE failures that predate this arc (decoders that PANIC on input:
+`aac_fetched_streams` at `aac/decoder.rs:387` (usize underflow), `flac_mutations_never_panic` and
+`lossless_mutations_never_panic` at `flac.rs:211` (index out of range)) — the kernel's `play` links these decoders.
