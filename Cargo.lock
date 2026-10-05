@@ -2429,6 +2429,7 @@ dependencies = [
  "bandy",
  "image",
  "log",
+ "pixel_core",
  "tempfile",
  "tokio",
  "toml",

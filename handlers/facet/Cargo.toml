@@ -12,20 +12,20 @@ version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 
-[features]
-# CHICKEN WIRE (R83): the `image` crate is the TEMPORARY decoder behind `ImageSource`, until
-# PIXELCORE's `gneiss_pal::dsp::image` (unaos/libs/media/pixel_core, SR25) lands on trunk and
-# `PixelCoreSource` replaces it. Nothing outside `source.rs` names the crate.
-default = ["chicken-wire-image"]
-chicken-wire-image = ["dep:image"]
-
 [dependencies]
 bandy = { path = "../../libs/bandy" }
 tokio = { version = "1.53", features = ["rt", "sync", "macros"] }
 log = "0.4"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "qoi", "webp"], optional = true }
+# PIXELCORE (SR25): the decoders behind `PixelCoreSource` — UnaOS's own, from the specifications, no_std,
+# zero dependencies (FACETPIXEL, SR43). Linked by path, not via gneiss_pal (whose default `std` feature
+# pulls an HTTP stack); `gneiss_pal::dsp::image` re-exports this very crate.
+pixel_core = { path = "../../unaos/libs/media/pixel_core" }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tempfile = "3.27.0"
 toml = "1.1.6"
+# TEST ORACLE ONLY (FACETPIXEL, SR43): the `image` crate is an independent second opinion in
+# tests/oracles.rs (decodes Facet's PNG exports; its triangle filter checks Facet's resize). It is a
+# dev-dependency — never linked into Facet; `cargo tree -p facet -e normal` shows no `image`.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "qoi", "webp"] }

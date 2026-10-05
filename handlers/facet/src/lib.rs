@@ -11,8 +11,8 @@
 //! Aether, the kernel's Quarry twin) delegates to it instead of decoding on its own.
 //!
 //! The pieces, each its own module:
-//! - [`source`] — the [`source::ImageSource`] seam (PIXELCORE's `gneiss_pal::dsp::image` shape);
-//!   the `image` crate behind it is CHICKEN WIRE until PIXELCORE lands.
+//! - [`source`] — the [`source::ImageSource`] seam; [`source::PixelCoreSource`] (PIXELCORE, SR25:
+//!   UnaOS's own from-spec decoders) is the default, and what it refuses is refused by name.
 //! - [`meta`] — container metadata from the specifications (Facet's own reader).
 //! - [`raster`] — orientation, turns, flips, crop, the triangle resize, CSS brightness/contrast.
 //! - [`edit`] — the op list with whole-state undo/redo/reset.
@@ -126,7 +126,7 @@ impl Facet {
 
     /// Open already-read bytes; `path` labels them.
     pub fn open_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<(u64, FacetImageInfo), String> {
-        let format = self.source.sniff(bytes).ok_or_else(|| format!("{path}: not an image Facet knows"))?;
+        let format = self.source.sniff(bytes).ok_or_else(|| format!("{path}: {}", source::unrecognised(bytes)))?;
         let meta = meta::read(bytes, format);
         let decoded = self.source.decode(bytes).map_err(|e| format!("{path}: {e}"))?;
         if decoded.rgba.len() != decoded.width as usize * decoded.height as usize * 4 {
