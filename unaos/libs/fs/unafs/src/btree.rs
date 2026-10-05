@@ -330,12 +330,12 @@ impl<'a, D: BlockDevice> DeviceStore<'a, D> {
 
 impl<D: BlockDevice> NodeStore for DeviceStore<'_, D> {
     fn alloc(&mut self) -> Result<u64, BtreeError> {
-        let b = self.refmap.allocate().ok_or(BtreeError::NoSpace)?;
+        let b = self.refmap.allocate(self.device).ok_or(BtreeError::NoSpace)?;
         self.allocated = self.allocated.saturating_add(1);
         Ok(b)
     }
     fn release(&mut self, block: u64) {
-        self.refmap.decref(block);
+        self.refmap.decref(self.device, block);
         self.released = self.released.saturating_add(1);
     }
     fn read(&mut self, block: u64, buf: &mut [u8]) -> Result<(), BtreeError> {

@@ -43,6 +43,7 @@ use crate::btree::{Btree, BtreeError, DeviceStore, LexCmp};
 use crate::catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 use crate::index::{CatalogRecord, IndexFact, ReadStore};
 use crate::inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
+use crate::maptree::{Shape, Tree, block_sum, is_paged_node};
 use crate::refmap::RefMap;
 use crate::root::{ROOT_BLOCK, RootRecord, RootSlot};
 use crate::storage::{BLOCK_SIZE, BlockDevice, Error as StorageError};
@@ -65,8 +66,11 @@ use bandy::{BandyMember, SMessage};
 
 /// Inode-map entries (u64 physical-block pointers) per 4096 B leaf block.
 pub const IMAP_ENTRIES_PER_LEAF: u64 = BLOCK_SIZE / 8;
-/// Leaf pointers per index block — bounds the map at one indirect level.
+/// Leaf pointers per index block — bounds a LEGACY (v3–v6) map at one
+/// indirect level (262,144 inode ids).
 pub const IMAP_MAX_LEAVES: u64 = BLOCK_SIZE / 8;
+/// UNAFSMAP: the paged (v7) inode map's leaf cap — 2^22 leaves, 2^31 ids.
+pub const IMAP_MAX_LEAVES_PAGED: u64 = 1 << 22;
 
 /// v1 snapshot-retention POLICY cap (the structure is unbounded: the index is
 /// an ordinary growable UnaFS object; lifting the cap is a constant change).
@@ -213,9 +217,12 @@ struct LoadedState {
     root: RootRecord,
     active_slot: RootSlot,
     imap: Vec<u64>,
-    imap_blocks: Vec<u64>,
-    refmap_blocks: Vec<u64>,
+    imap_tree: Tree,
     refmap: RefMap,
+    /// A v6 volume: its maps migrate to the paged shape on the first commit.
+    migrate: bool,
+    /// The root is a GROW root whose superblock rewrite did not land.
+    grow_lag: bool,
 }
 
 pub struct UnaFS<D: BlockDevice> {
@@ -228,10 +235,9 @@ pub struct UnaFS<D: BlockDevice> {
     /// The last COMMITTED root record and the slot holding it.
     root: RootRecord,
     active_slot: RootSlot,
-    /// Blocks (index + leaves) holding the last committed inode map /
-    /// refcount map — decref'd when the next commit writes fresh ones.
-    imap_blocks: Vec<u64>,
-    refmap_blocks: Vec<u64>,
+    /// UNAFSMAP: the inode map's on-disk tree (pointers + dirty leaves); a
+    /// commit rewrites only the dirty leaves and their paths.
+    imap_tree: Tree,
     /// Commit automatically at the end of each public mutating op (default).
     /// The crash-simulation seam (`set_autocommit(false)`) leaves fresh
     /// blocks written but the root un-flipped — exactly a power cut before
@@ -243,6 +249,11 @@ pub struct UnaFS<D: BlockDevice> {
     /// UNAFSGROW: the flags word the NEXT commit writes into the root record
     /// ([`crate::root::ROOT_FLAG_GROW`] only while a grow is mid-flight).
     root_flags: u64,
+    /// UNAFSMAP: a v6 volume's maps migrate to the paged v7 shape on the next
+    /// commit (root flag MIGRATE, then block 0, then the flag clears).
+    migrate_pending: bool,
+    /// UNAFSMAP: the refcount map's leaf-page cache budget (bytes).
+    map_budget: usize,
 }
 
 impl<D: BlockDevice> UnaFS<D> {
@@ -296,10 +307,18 @@ impl<D: BlockDevice> UnaFS<D> {
         let zero = alloc::vec![0u8; BLOCK_SIZE as usize];
         device.write_block(ROOT_BLOCK, &zero)?;
 
-        let mut refmap = RefMap::try_new(block_count)?;
+        let shape = if version >= crate::superblock::VERSION_PAGED_MAPS {
+            Shape::Paged
+        } else {
+            Shape::Legacy
+        };
+        let mut refmap = RefMap::try_new(block_count, shape)?;
         // Pin the static blocks: superblock + root area.
-        refmap.incref(0);
-        refmap.incref(ROOT_BLOCK);
+        refmap.incref(&mut device, 0);
+        refmap.incref(&mut device, ROOT_BLOCK);
+        refmap.take_fault()?;
+        let mut imap_tree = Tree::empty(shape, 1)?;
+        imap_tree.dirty.insert(0);
 
         let mut fs = Self {
             device,
@@ -318,12 +337,13 @@ impl<D: BlockDevice> UnaFS<D> {
             },
             // Dummy: the format commit writes `other()` == slot A.
             active_slot: RootSlot::B,
-            imap_blocks: Vec::new(),
-            refmap_blocks: Vec::new(),
+            imap_tree,
             autocommit: true,
             stats: CommitStats::default(),
             txn_blocks: 0,
             root_flags: 0,
+            migrate_pending: false,
+            map_budget: crate::refmap::DEFAULT_CACHE_BYTES,
         };
 
         // The reserved system objects, in id order (1..=4).
@@ -376,12 +396,15 @@ impl<D: BlockDevice> UnaFS<D> {
             imap: loaded.imap,
             root: loaded.root,
             active_slot: loaded.active_slot,
-            imap_blocks: loaded.imap_blocks,
-            refmap_blocks: loaded.refmap_blocks,
+            imap_tree: loaded.imap_tree,
             autocommit: true,
             stats: CommitStats::default(),
             txn_blocks: 0,
-            root_flags: 0,
+            // A GROW root whose superblock did not land stays a GROW root
+            // until a grow re-run finishes it (its map is sized for the new end).
+            root_flags: if loaded.grow_lag { crate::root::ROOT_FLAG_GROW } else { 0 },
+            migrate_pending: loaded.migrate,
+            map_budget: crate::refmap::DEFAULT_CACHE_BYTES,
         };
 
         // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
@@ -404,8 +427,23 @@ impl<D: BlockDevice> UnaFS<D> {
         let (root, active_slot) = crate::root::read_active(device)?
             .ok_or(FileSystemError::CorruptVolume("no valid root record"))?;
 
+        // UNAFSMAP: the maps' shape. v7 is paged; a v6 volume whose root
+        // carries MIGRATE is paged too (the migration's superblock rewrite did
+        // not land yet); everything older is the legacy raw-pointer shape.
+        let migrating = root.flags & crate::root::ROOT_FLAG_MIGRATE != 0
+            && superblock.version == crate::superblock::VERSION_INDEXED;
+        let shape = if superblock.version >= crate::superblock::VERSION_PAGED_MAPS || migrating {
+            Shape::Paged
+        } else {
+            Shape::Legacy
+        };
+
         // ---- Inode map (bounded: the volume is untrusted input) ----
-        if root.imap_leaves == 0 || root.imap_leaves > IMAP_MAX_LEAVES {
+        let imap_cap = match shape {
+            Shape::Legacy => IMAP_MAX_LEAVES,
+            Shape::Paged => IMAP_MAX_LEAVES_PAGED,
+        };
+        if root.imap_leaves == 0 || root.imap_leaves > imap_cap {
             return Err(FileSystemError::CorruptVolume(
                 "imap leaf count out of range",
             ));
@@ -413,57 +451,27 @@ impl<D: BlockDevice> UnaFS<D> {
         if root.next_inode == 0 || root.next_inode > root.imap_leaves * IMAP_ENTRIES_PER_LEAF {
             return Err(FileSystemError::CorruptVolume("next inode out of range"));
         }
-        if root.imap_block == 0 || root.imap_block >= block_count {
-            return Err(FileSystemError::CorruptVolume("imap index out of bounds"));
+        if shape == Shape::Paged
+            && root.imap_leaves != root.next_inode.div_ceil(IMAP_ENTRIES_PER_LEAF).max(1)
+        {
+            return Err(FileSystemError::CorruptVolume("imap leaf count inconsistent with next inode"));
         }
-        let mut imap_blocks = alloc::vec![root.imap_block];
-        let mut index = alloc::vec![0u8; BLOCK_SIZE as usize];
-        device.read_block(root.imap_block, &mut index)?;
-        let imap_cap = usize::try_from(root.next_inode)
-            .map_err(|_| StorageError::AllocRefused(root.next_inode))?;
-        let mut imap: Vec<u64> = Vec::new();
-        imap.try_reserve_exact(imap_cap)
-            .map_err(|_| StorageError::AllocRefused(root.next_inode))?;
-        let mut leaf = alloc::vec![0u8; BLOCK_SIZE as usize];
-        for l in 0..root.imap_leaves {
-            let ptr = u64::from_le_bytes(
-                index[(l * 8) as usize..(l * 8 + 8) as usize]
-                    .try_into()
-                    .unwrap(),
-            );
-            if ptr == 0 || ptr >= block_count {
-                return Err(FileSystemError::CorruptVolume("imap leaf out of bounds"));
-            }
-            imap_blocks.push(ptr);
-            device.read_block(ptr, &mut leaf)?;
-            for e in 0..IMAP_ENTRIES_PER_LEAF {
-                if imap.len() as u64 >= root.next_inode {
-                    break;
-                }
-                let entry = u64::from_le_bytes(
-                    leaf[(e * 8) as usize..(e * 8 + 8) as usize]
-                        .try_into()
-                        .unwrap(),
-                );
-                if entry >= block_count {
-                    return Err(FileSystemError::CorruptVolume("imap entry out of bounds"));
-                }
-                imap.push(entry);
-            }
-        }
+        let (imap, imap_tree) = Self::load_imap_via(
+            device,
+            block_count,
+            root.imap_block,
+            root.imap_leaves,
+            Some(root.next_inode),
+            Some(shape),
+        )?;
 
         // ---- Refcount map ----
-        // The leaf count is a pure function of the geometry, and so is the
-        // index SHAPE: one block of leaf pointers up to 512 leaves (the only
-        // shape a v3/v4 volume can have — `Superblock::validate` caps their
-        // geometry at one level), a two-level tree past that (v5+): the root
-        // points at an index-of-indexes of MID blocks, each holding up to 512
-        // leaf pointers.
+        // The leaf count is a pure function of the geometry.
         let expected_leaves = block_count.div_ceil(crate::refmap::REFS_PER_LEAF);
         // UNAFSGROW: a root written by a grow whose superblock rewrite did not
         // land carries a map sized for the larger volume; it is read at block
-        // 0's size (counts past it are dropped below — they are all 0, and
-        // every pointer is still bounded by the old `block_count`).
+        // 0's size (every pointer is still bounded by the old `block_count`,
+        // and every count past it is 0).
         let grow_lag = root.flags & crate::root::ROOT_FLAG_GROW != 0
             && root.refmap_leaves > expected_leaves
             && (superblock.version >= crate::superblock::VERSION_REFMAP_TREE
@@ -476,89 +484,124 @@ impl<D: BlockDevice> UnaFS<D> {
         if root.refmap_block == 0 || root.refmap_block >= block_count {
             return Err(FileSystemError::CorruptVolume("refmap index out of bounds"));
         }
-        let ptrs_per_index = BLOCK_SIZE / 8;
-        if root.refmap_leaves > ptrs_per_index * ptrs_per_index {
+        let leaf_cap = match shape {
+            Shape::Legacy => (BLOCK_SIZE / 8) * (BLOCK_SIZE / 8),
+            Shape::Paged => crate::superblock::MAX_BLOCK_COUNT_PAGED.div_ceil(crate::refmap::REFS_PER_LEAF),
+        };
+        if root.refmap_leaves > leaf_cap {
             return Err(FileSystemError::CorruptVolume(
                 "refmap leaf count too large",
             ));
         }
-        // Gather the leaf pointers through one or two index levels. Bounded:
-        // expected_leaves ≤ 512² by the guard above (and by MAX_BLOCK_COUNT).
-        let leaves_cap = usize::try_from(root.refmap_leaves)
-            .map_err(|_| StorageError::AllocRefused(root.refmap_leaves))?;
-        let mut leaf_ptrs: Vec<u64> = Vec::new();
-        leaf_ptrs
-            .try_reserve_exact(leaves_cap)
-            .map_err(|_| StorageError::AllocRefused(root.refmap_leaves))?;
-        let mut refmap_blocks = alloc::vec![root.refmap_block];
-        device.read_block(root.refmap_block, &mut index)?;
-        let read_ptr = |buf: &[u8], i: u64| {
-            u64::from_le_bytes(
-                buf[(i * 8) as usize..(i * 8 + 8) as usize]
-                    .try_into()
-                    .unwrap(),
-            )
-        };
-        if root.refmap_leaves <= ptrs_per_index {
-            // Single level: the root's index block IS the leaf-pointer block.
-            for l in 0..root.refmap_leaves {
-                leaf_ptrs.push(read_ptr(&index, l));
-            }
-        } else {
-            // Two levels: the root's block holds MID pointers; each mid block
-            // holds this level's slice of leaf pointers.
-            let mids = root.refmap_leaves.div_ceil(ptrs_per_index);
-            let mut mid = alloc::vec![0u8; BLOCK_SIZE as usize];
-            for m in 0..mids {
-                let mp = read_ptr(&index, m);
-                if mp == 0 || mp >= block_count {
-                    return Err(FileSystemError::CorruptVolume(
-                        "refmap mid index out of bounds",
-                    ));
-                }
-                refmap_blocks.push(mp);
-                device.read_block(mp, &mut mid)?;
-                let lo = m * ptrs_per_index;
-                let hi = core::cmp::min(root.refmap_leaves, lo + ptrs_per_index);
-                for l in lo..hi {
-                    leaf_ptrs.push(read_ptr(&mid, l - lo));
-                }
-            }
-        }
-        let count_cap =
-            usize::try_from(block_count).map_err(|_| StorageError::AllocRefused(block_count))?;
-        let mut counts: Vec<u32> = Vec::new();
-        counts
-            .try_reserve_exact(count_cap)
-            .map_err(|_| StorageError::AllocRefused(block_count))?;
-        for &ptr in &leaf_ptrs {
-            if ptr == 0 || ptr >= block_count {
-                return Err(FileSystemError::CorruptVolume("refmap leaf out of bounds"));
-            }
-            refmap_blocks.push(ptr);
-            device.read_block(ptr, &mut leaf)?;
-            for e in 0..crate::refmap::REFS_PER_LEAF {
-                if counts.len() >= count_cap {
-                    break;
-                }
-                let c = u32::from_le_bytes(
-                    leaf[(e * 4) as usize..(e * 4 + 4) as usize]
-                        .try_into()
-                        .unwrap(),
-                );
-                counts.push(c);
-            }
-        }
-        let refmap = RefMap::try_from_counts(counts, block_count)?;
+        let tree = Tree::load(
+            device,
+            shape,
+            root.refmap_block,
+            root.refmap_leaves,
+            block_count,
+            crate::refmap::REFS_PER_LEAF,
+        )?;
+        let refmap = RefMap::load(device, tree, block_count)?;
 
         Ok(LoadedState {
             root,
             active_slot,
             imap,
-            imap_blocks,
-            refmap_blocks,
+            imap_tree,
             refmap,
+            migrate: superblock.version == crate::superblock::VERSION_INDEXED,
+            grow_lag,
         })
+    }
+
+    /// The inode map's leaf cap for this volume's map shape.
+    fn imap_max_leaves(&self) -> u64 {
+        match self.imap_tree.shape {
+            Shape::Legacy => IMAP_MAX_LEAVES,
+            Shape::Paged => IMAP_MAX_LEAVES_PAGED,
+        }
+    }
+
+    /// Load an inode map — its entries (indexed by logical id) and its tree —
+    /// from its top node. Shared by the mount (`next_inode` bounds the entry
+    /// vector, `shape` is the volume's) and the retained-root walks (`None`:
+    /// every leaf's entries, and the shape SNIFFED off the top node, since a
+    /// snapshot taken before a v6 → v7 migration keeps its legacy map).
+    /// Untrusted input: every pointer and entry is bounded by the volume, a
+    /// paged leaf's checksum and count are verified.
+    fn load_imap_via(
+        device: &mut D,
+        block_count: u64,
+        top: u64,
+        leaves: u64,
+        next_inode: Option<u64>,
+        shape: Option<Shape>,
+    ) -> Result<(Vec<u64>, Tree), FileSystemError> {
+        if top == 0 || top >= block_count {
+            return Err(FileSystemError::CorruptVolume("imap index out of bounds"));
+        }
+        let mut leaf = alloc::vec![0u8; BLOCK_SIZE as usize];
+        let shape = match shape {
+            Some(s) => s,
+            None => {
+                device.read_block(top, &mut leaf)?;
+                if is_paged_node(&leaf) { Shape::Paged } else { Shape::Legacy }
+            }
+        };
+        let cap = match shape {
+            Shape::Legacy => IMAP_MAX_LEAVES,
+            Shape::Paged => IMAP_MAX_LEAVES_PAGED,
+        };
+        if leaves == 0 || leaves > cap {
+            return Err(FileSystemError::CorruptVolume("imap leaf count out of range"));
+        }
+        let n_entries = next_inode.unwrap_or(leaves * IMAP_ENTRIES_PER_LEAF);
+        let want = usize::try_from(n_entries).map_err(|_| StorageError::AllocRefused(n_entries))?;
+        let mut imap: Vec<u64> = Vec::new();
+        imap.try_reserve_exact(want)
+            .map_err(|_| StorageError::AllocRefused(n_entries))?;
+        let mut tree = Tree::load(device, shape, top, leaves, block_count, IMAP_ENTRIES_PER_LEAF)?;
+        for l in 0..leaves {
+            let p = tree.leaves[l as usize];
+            if p.block == 0 {
+                // A paged hole: an all-zero leaf.
+                for _ in 0..IMAP_ENTRIES_PER_LEAF {
+                    if imap.len() < want {
+                        imap.push(0);
+                    }
+                }
+                continue;
+            }
+            device.read_block(p.block, &mut leaf)?;
+            if shape == Shape::Paged && block_sum(&leaf) != p.sum {
+                return Err(FileSystemError::CorruptVolume("imap leaf checksum mismatch"));
+            }
+            let mut used = 0u32;
+            for e in 0..IMAP_ENTRIES_PER_LEAF as usize {
+                let entry = u64::from_le_bytes(leaf[e * 8..e * 8 + 8].try_into().unwrap());
+                if entry >= block_count {
+                    return Err(FileSystemError::CorruptVolume("imap entry out of bounds"));
+                }
+                if entry != 0 {
+                    used += 1;
+                }
+                if imap.len() < want {
+                    imap.push(entry);
+                }
+            }
+            match shape {
+                Shape::Paged => {
+                    if used != p.used {
+                        return Err(FileSystemError::CorruptVolume("imap leaf count mismatch"));
+                    }
+                }
+                Shape::Legacy => {
+                    tree.leaves[l as usize].used = used;
+                    tree.leaves[l as usize].sum = block_sum(&leaf);
+                }
+            }
+        }
+        Ok((imap, tree))
     }
 
     // =====================================================================
@@ -591,18 +634,39 @@ impl<D: BlockDevice> UnaFS<D> {
     /// Blocks (index + leaves) holding the last committed inode map and
     /// refcount map — part of the fsck walk's system set.
     pub(crate) fn map_blocks(&self) -> impl Iterator<Item = u64> + '_ {
-        self.imap_blocks
-            .iter()
-            .chain(self.refmap_blocks.iter())
-            .copied()
+        self.imap_tree.blocks().chain(self.refmap.tree().blocks())
     }
 
-    pub(crate) fn refmap_ref(&self) -> &RefMap {
-        &self.refmap
+    /// The refcount map and the device together (fsck walks leaves).
+    pub(crate) fn refmap_and_device(&mut self) -> (&mut RefMap, &mut D) {
+        (&mut self.refmap, &mut self.device)
     }
 
-    pub(crate) fn refmap_mut(&mut self) -> &mut RefMap {
-        &mut self.refmap
+    /// UNAFSMAP: the refcount map's cache counters.
+    pub fn map_stats(&self) -> crate::refmap::MapStats {
+        self.refmap.stats()
+    }
+
+    /// UNAFSMAP: set the refcount map's leaf-page cache budget (bytes; at
+    /// least 16 pages). Kept across a failed-transaction reload.
+    pub fn set_map_cache_budget(&mut self, bytes: usize) {
+        self.map_budget = bytes;
+        self.refmap.set_budget(bytes);
+    }
+
+    /// UNAFSMAP: the on-disk shape the maps commit in.
+    pub fn map_shape(&self) -> Shape {
+        self.refmap.shape()
+    }
+
+    /// UNAFSMAP: blocks the persisted maps own (inode map + refcount map).
+    pub fn map_block_total(&self) -> u64 {
+        self.imap_tree.block_total() + self.refmap.tree().block_total()
+    }
+
+    /// Mark the inode-map leaf holding `id` dirty.
+    fn imap_touch(&mut self, id: u64) {
+        self.imap_tree.dirty.insert(id / IMAP_ENTRIES_PER_LEAF);
     }
 
     pub(crate) fn imap_ref(&self) -> &[u64] {
@@ -612,6 +676,7 @@ impl<D: BlockDevice> UnaFS<D> {
     pub(crate) fn imap_clear(&mut self, id: u64) {
         if let Some(e) = self.imap.get_mut(id as usize) {
             *e = 0;
+            self.imap_touch(id);
         }
     }
 
@@ -622,157 +687,145 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(())
     }
 
-    /// COMMIT: persist the inode map and refcount map to fresh blocks
-    /// (CoW, like everything else), barrier, then flip ONE 512 B root
-    /// sector — the transaction's single atomic point.
+    /// COMMIT: persist the inode map and refcount map (CoW, like everything
+    /// else: only their DIRTY leaves and the index paths above them go to
+    /// fresh blocks), barrier, then flip ONE 512 B root sector — the
+    /// transaction's single atomic point. On a v6 volume the first commit
+    /// also migrates both maps to the paged v7 shape (UNAFSMAP).
     pub fn commit(&mut self) -> Result<(), FileSystemError> {
-        // 1. Retire the previously committed maps (their blocks stay
-        //    protected by the frozen view until after the flip).
-        for b in core::mem::take(&mut self.imap_blocks) {
-            self.refmap.decref(b);
+        if !self.migrate_pending {
+            return self.commit_inner();
         }
-        // BOOT80 (rmbp B350): the committed refmap's LEAF blocks are candidates for reuse — a leaf
-        // whose counts this transaction did not change keeps its committed block (it is not
-        // rewritten, so nothing is overwritten in place). Before BOOT80 every commit rewrote ALL
-        // leaves: 128 blocks on a 512 MiB volume, ~1050 single-sector writes per transaction on the
-        // rMBP card. Reuse needs the committed shape to be this commit's shape (same leaf count,
-        // same one/two-level index); otherwise (format, a grow, a lagging grow) every leaf is new.
-        let old_refmap = core::mem::take(&mut self.refmap_blocks);
-        let leaves_now = self.refmap.leaf_count();
-        let ppi = BLOCK_SIZE / 8;
-        let mids_now = if leaves_now > ppi { leaves_now.div_ceil(ppi) } else { 0 };
-        let mut reuse: Vec<Option<u64>> = Vec::new();
-        if !old_refmap.is_empty() && old_refmap.len() as u64 == 1 + mids_now + leaves_now {
-            for &b in &old_refmap[..1 + mids_now as usize] {
-                self.refmap.decref(b); // index + mids are rewritten every commit (they hold pointers)
-            }
-            reuse.extend(old_refmap[1 + mids_now as usize..].iter().map(|&b| Some(b)));
-        } else {
-            for b in old_refmap {
-                self.refmap.decref(b);
-            }
+        self.migrate_pending = false;
+        let r = self.migrate_maps();
+        if r.is_err() {
+            self.root_flags &= !crate::root::ROOT_FLAG_MIGRATE;
+            self.txn_unwind();
         }
+        r
+    }
 
-        // 2. Inode map → fresh leaves + fresh index block.
+    /// UNAFSMAP: the v6 → v7 migration, resumable like a grow: (1) re-shape
+    /// both maps as paged (every leaf block is kept — a legacy leaf IS a paged
+    /// leaf — only the index nodes are new) and commit with root flag MIGRATE;
+    /// (2) rewrite block 0 as v7; (3) commit with the flag clear. A cut after
+    /// (1) mounts the v6 superblock over a MIGRATE root as paged and finishes
+    /// on the next commit; after (2) the volume is v7.
+    fn migrate_maps(&mut self) -> Result<(), FileSystemError> {
+        if self.refmap.shape() == Shape::Legacy {
+            self.refmap.convert_to_paged(&mut self.device)?;
+            for b in self.imap_tree.convert_to_paged()? {
+                self.refmap.decref(&mut self.device, b);
+            }
+            self.refmap.take_fault()?;
+        }
+        self.root_flags |= crate::root::ROOT_FLAG_MIGRATE;
+        self.commit_inner()?;
+        let mut sb = self.superblock.clone();
+        sb.version = crate::superblock::VERSION_PAGED_MAPS;
+        self.write_superblock(&sb)?;
+        self.superblock = sb;
+        self.root_flags &= !crate::root::ROOT_FLAG_MIGRATE;
+        self.commit_inner()
+    }
+
+    /// Rewrite block 0 (grow and migration only — the superblock is
+    /// otherwise written once) and flush.
+    fn write_superblock(&mut self, sb: &Superblock) -> Result<(), FileSystemError> {
+        let sb_bytes = sb.to_bytes()?;
+        let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
+        sb_block[..sb_bytes.len()].copy_from_slice(&sb_bytes);
+        self.device.write_block(0, &sb_block)?;
+        self.device.flush()?;
+        Ok(())
+    }
+
+    /// One commit; a failure re-derives RAM from the committed disk state
+    /// (the root never flipped), so a half-relocated map never leaks into
+    /// the next attempt.
+    fn commit_inner(&mut self) -> Result<(), FileSystemError> {
+        let r = self.commit_body();
+        if r.is_err() {
+            self.txn_unwind();
+        }
+        r
+    }
+
+    fn commit_body(&mut self) -> Result<(), FileSystemError> {
+        // 0. A leaf the transaction could not read means the in-RAM counts
+        //    are incomplete: refuse before writing anything.
+        self.refmap.take_fault()?;
+
+        // 1. Inode map: size it, then relocate its dirty leaves (and the index
+        //    paths above them) to fresh blocks, releasing the old ones. Its
+        //    allocations dirty refmap leaves, so it goes first.
         let next_inode = self.imap.len() as u64;
         let imap_leaves = next_inode.div_ceil(IMAP_ENTRIES_PER_LEAF).max(1);
-        if imap_leaves > IMAP_MAX_LEAVES {
+        if imap_leaves > self.imap_max_leaves() {
             return Err(FileSystemError::NoSpace);
         }
-        let mut new_imap_blocks = Vec::new();
-        let index_block = self.alloc_block()?;
-        let mut index = alloc::vec![0u8; BLOCK_SIZE as usize];
-        for l in 0..imap_leaves {
-            let leaf_block = self.alloc_block()?;
-            index[(l * 8) as usize..(l * 8 + 8) as usize]
-                .copy_from_slice(&leaf_block.to_le_bytes());
-            let mut leaf = alloc::vec![0u8; BLOCK_SIZE as usize];
-            let base = (l * IMAP_ENTRIES_PER_LEAF) as usize;
-            for e in 0..IMAP_ENTRIES_PER_LEAF as usize {
-                if let Some(&entry) = self.imap.get(base + e) {
-                    leaf[e * 8..e * 8 + 8].copy_from_slice(&entry.to_le_bytes());
-                }
+        let old_leaves = self.imap_tree.leaf_count();
+        if imap_leaves > old_leaves {
+            self.imap_tree.resize(imap_leaves)?;
+            for l in old_leaves..imap_leaves {
+                self.imap_tree.dirty.insert(l);
             }
-            self.write_fresh(leaf_block, &leaf)?;
-            new_imap_blocks.push(leaf_block);
+        }
+        let dirty: Vec<u64> = self.imap_tree.dirty.iter().copied().collect();
+        for l in dirty {
+            if l >= imap_leaves {
+                continue;
+            }
+            let lo = (l * IMAP_ENTRIES_PER_LEAF) as usize;
+            let hi = core::cmp::min(self.imap.len(), lo + IMAP_ENTRIES_PER_LEAF as usize);
+            let used = self.imap[lo.min(hi)..hi].iter().filter(|&&e| e != 0).count() as u32;
+            self.imap_tree.leaves[l as usize].used = used;
+        }
+        for (level, idx) in self.imap_tree.pending() {
+            let nb = if self.imap_tree.wants_block(level, idx) {
+                self.alloc_block()?
+            } else {
+                0
+            };
+            let old = self.imap_tree.relocate(level, idx, nb);
+            if old != 0 {
+                self.refmap.decref(&mut self.device, old);
+            }
         }
 
-        // 3. Refcount map: allocate ALL its blocks first (allocation mutates
-        //    the counts being persisted), then serialize. The leaf count is a
-        //    pure function of the volume geometry, so it cannot change under
-        //    us mid-step — and so is the index SHAPE: one block of leaf
-        //    pointers up to 512 leaves (the only shape v3/v4 geometry admits,
-        //    which keeps every pre-v5 volume byte-compatible), a two-level
-        //    tree past that (v5+; `Superblock::validate` version-gates the
-        //    geometry at format/mount).
-        let refmap_leaves = self.refmap.leaf_count();
-        let ptrs_per_index = BLOCK_SIZE / 8;
-        // Belt-and-braces twin of the imap guard above (and of
-        // `Superblock::validate`'s MAX_BLOCK_COUNT bound): never run the
-        // index tree off its blocks, error cleanly.
-        if refmap_leaves > ptrs_per_index * ptrs_per_index {
-            return Err(FileSystemError::NoSpace);
-        }
-        let two_level = refmap_leaves > ptrs_per_index;
-        let mids = if two_level {
-            refmap_leaves.div_ceil(ptrs_per_index)
-        } else {
-            0
-        };
-        let ref_index_block = self.alloc_block()?;
-        let mut ref_mid_blocks = Vec::with_capacity(mids as usize);
-        for _ in 0..mids {
-            ref_mid_blocks.push(self.alloc_block()?);
-        }
-        let mut ref_leaf_blocks = Vec::with_capacity(refmap_leaves as usize);
-        let mut fresh_leaf = alloc::vec![true; refmap_leaves as usize];
-        if reuse.len() as u64 == refmap_leaves {
-            // BOOT80: a FIXPOINT over the candidates. Retiring a dirty leaf's old block and
-            // allocating its fresh one change counts in (possibly other) leaves, which may dirty a
-            // candidate that was clean a moment ago; each candidate converts at most once, so this
-            // ends after at most `refmap_leaves` rounds. On exit every remaining candidate is clean
-            // against the FINAL counts — its committed bytes are exactly what would be written.
-            for (l, r) in reuse.iter().enumerate() {
-                ref_leaf_blocks.push(r.unwrap_or(0));
-                fresh_leaf[l] = false;
-            }
-            loop {
-                let mut moved = false;
-                for l in 0..refmap_leaves as usize {
-                    if fresh_leaf[l] || self.refmap.leaf_clean(l as u64) {
-                        continue;
+        // 2. Refcount map: relocate its own dirty leaves and paths until the
+        //    allocations that does stop dirtying unmoved leaves. After this,
+        //    nothing allocates: the counts are final.
+        self.refmap.relocate_own(&mut self.device)?;
+
+        // 3. Serialize: inode-map leaves, its index nodes, then the refcount
+        //    map's leaves and nodes (order among fresh blocks is immaterial —
+        //    none is reachable until the flip).
+        {
+            let device = &mut self.device;
+            let txn_blocks = &mut self.txn_blocks;
+            let stats = &mut self.stats;
+            let mut write = |b: u64, buf: &[u8]| -> Result<(), FileSystemError> {
+                device.write_block(b, buf)?;
+                *txn_blocks += 1;
+                stats.blocks_written += 1;
+                Ok(())
+            };
+            let mut leaf = alloc::vec![0u8; BLOCK_SIZE as usize];
+            for (l, b) in self.imap_tree.moved_leaves() {
+                leaf.fill(0);
+                let base = (l * IMAP_ENTRIES_PER_LEAF) as usize;
+                for e in 0..IMAP_ENTRIES_PER_LEAF as usize {
+                    if let Some(&entry) = self.imap.get(base + e) {
+                        leaf[e * 8..e * 8 + 8].copy_from_slice(&entry.to_le_bytes());
                     }
-                    self.refmap.decref(ref_leaf_blocks[l]);
-                    ref_leaf_blocks[l] = self.alloc_block()?;
-                    fresh_leaf[l] = true;
-                    moved = true;
                 }
-                if !moved {
-                    break;
-                }
+                write(b, &leaf)?;
+                self.imap_tree.set_leaf_sum(l, block_sum(&leaf));
             }
-        } else {
-            for _ in 0..refmap_leaves {
-                ref_leaf_blocks.push(self.alloc_block()?);
-            }
+            self.imap_tree.write_upper(&mut write)?;
+            self.refmap.write_own(&mut write)?;
         }
-        // Every allocation is done: the counts are final. Serialize.
-        let mut ref_index = alloc::vec![0u8; BLOCK_SIZE as usize];
-        if two_level {
-            // Leaves first, then each mid block carries its slice of leaf
-            // pointers, then the top block carries the mid pointers.
-            for (l, &leaf_block) in ref_leaf_blocks.iter().enumerate() {
-                if !fresh_leaf[l] {
-                    continue; // BOOT80: unchanged — its committed block stays
-                }
-                let leaf = self.refmap.leaf_bytes(l as u64);
-                self.write_fresh(leaf_block, &leaf)?;
-            }
-            for (m, &mid_block) in ref_mid_blocks.iter().enumerate() {
-                let mut mid = alloc::vec![0u8; BLOCK_SIZE as usize];
-                let lo = m * ptrs_per_index as usize;
-                let hi = core::cmp::min(ref_leaf_blocks.len(), lo + ptrs_per_index as usize);
-                for (i, &leaf_block) in ref_leaf_blocks[lo..hi].iter().enumerate() {
-                    mid[i * 8..i * 8 + 8].copy_from_slice(&leaf_block.to_le_bytes());
-                }
-                self.write_fresh(mid_block, &mid)?;
-                ref_index[m * 8..m * 8 + 8].copy_from_slice(&mid_block.to_le_bytes());
-            }
-        } else {
-            for (l, &leaf_block) in ref_leaf_blocks.iter().enumerate() {
-                ref_index[l * 8..l * 8 + 8].copy_from_slice(&leaf_block.to_le_bytes());
-                if !fresh_leaf[l] {
-                    continue; // BOOT80: unchanged — its committed block stays
-                }
-                let leaf = self.refmap.leaf_bytes(l as u64);
-                self.write_fresh(leaf_block, &leaf)?;
-            }
-        }
-        self.write_fresh(ref_index_block, &ref_index)?;
-        // (Written last among the fresh blocks so everything lands before
-        //  the barrier; order among fresh blocks is immaterial — none are
-        //  reachable until the flip.)
-        self.write_fresh(index_block, &index)?;
 
         let free_blocks = self.refmap.free_blocks();
 
@@ -792,11 +845,11 @@ impl<D: BlockDevice> UnaFS<D> {
         // 5. The atomic point: ONE 512 B write to the INACTIVE slot.
         let new_root = RootRecord {
             generation: self.root.generation + 1,
-            imap_block: index_block,
+            imap_block: self.imap_tree.top(),
             imap_leaves,
             next_inode,
-            refmap_block: ref_index_block,
-            refmap_leaves,
+            refmap_block: self.refmap.top(),
+            refmap_leaves: self.refmap.leaf_count(),
             free_blocks,
             flags: self.root_flags,
         };
@@ -810,13 +863,7 @@ impl<D: BlockDevice> UnaFS<D> {
         // 6. The new tree is the committed tree.
         self.root = new_root;
         self.active_slot = slot;
-        let mut blocks = new_imap_blocks;
-        blocks.insert(0, index_block);
-        self.imap_blocks = blocks;
-        let mut rblocks = alloc::vec![ref_index_block];
-        rblocks.extend_from_slice(&ref_mid_blocks);
-        rblocks.extend_from_slice(&ref_leaf_blocks);
-        self.refmap_blocks = rblocks;
+        self.imap_tree.finish_commit();
         self.refmap.freeze();
 
         self.stats.commits += 1;
@@ -832,7 +879,7 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 
     fn alloc_block(&mut self) -> Result<u64, FileSystemError> {
-        self.refmap.allocate().ok_or(FileSystemError::NoSpace)
+        self.refmap.allocate(&mut self.device).ok_or(FileSystemError::NoSpace)
     }
 
     /// Write a freshly allocated block, counting it for the bench.
@@ -981,9 +1028,10 @@ impl<D: BlockDevice> UnaFS<D> {
             // inode block itself — the standard CoW decref of the old record.
             let old_index = self.inode_index_extents_at(old)?;
             self.decref_extents(&old_index);
-            self.refmap.decref(old);
+            self.refmap.decref(&mut self.device, old);
         }
         self.imap[idx] = nb;
+        self.imap_touch(idx as u64);
         Ok(())
     }
 
@@ -1087,10 +1135,11 @@ impl<D: BlockDevice> UnaFS<D> {
         name: Option<&str>,
     ) -> Result<u64, FileSystemError> {
         let id = self.imap.len() as u64;
-        if (id + 1).div_ceil(IMAP_ENTRIES_PER_LEAF) > IMAP_MAX_LEAVES {
+        if (id + 1).div_ceil(IMAP_ENTRIES_PER_LEAF) > self.imap_max_leaves() {
             return Err(FileSystemError::NoSpace);
         }
         self.imap.push(0);
+        self.imap_touch(id);
         let mut inode = Inode::new(id, kind);
         inode.attributes = attributes;
         inode.parent = parent;
@@ -1240,7 +1289,7 @@ impl<D: BlockDevice> UnaFS<D> {
             let nb = self.alloc_block()?;
             self.write_fresh(nb, &buf)?;
             if old != 0 {
-                self.refmap.decref(old);
+                self.refmap.decref(&mut self.device, old);
             }
             map[idx as usize] = nb;
         }
@@ -1582,10 +1631,11 @@ impl<D: BlockDevice> UnaFS<D> {
         facts: &mut Vec<IndexFact>,
     ) -> Result<u64, FileSystemError> {
         let id = self.imap.len() as u64;
-        if (id + 1).div_ceil(IMAP_ENTRIES_PER_LEAF) > IMAP_MAX_LEAVES {
+        if (id + 1).div_ceil(IMAP_ENTRIES_PER_LEAF) > self.imap_max_leaves() {
             return Err(FileSystemError::NoSpace);
         }
         self.imap.push(0);
+        self.imap_touch(id);
 
         let mut inode = Inode::new(id, FileKind::File);
         inode.parent = parent_id;
@@ -1851,7 +1901,7 @@ impl<D: BlockDevice> UnaFS<D> {
             // would leak on unlink.
             let index = self.inode_index_extents_at(pb)?;
             self.decref_extents(&index);
-            self.refmap.decref(pb);
+            self.refmap.decref(&mut self.device, pb);
         }
         self.imap_clear(inode_id);
 
@@ -1956,7 +2006,7 @@ impl<D: BlockDevice> UnaFS<D> {
         if pb != 0 {
             let index = self.inode_index_extents_at(pb)?;
             self.decref_extents(&index);
-            self.refmap.decref(pb);
+            self.refmap.decref(&mut self.device, pb);
         }
         self.imap_clear(inode_id);
 
@@ -2131,45 +2181,8 @@ impl<D: BlockDevice> UnaFS<D> {
         imap_leaves: u64,
     ) -> Result<Vec<u64>, FileSystemError> {
         let block_count = self.superblock.block_count;
-        if imap_block == 0 || imap_block >= block_count {
-            return Err(FileSystemError::CorruptVolume("snapshot imap index out of bounds"));
-        }
-        if imap_leaves == 0 || imap_leaves > IMAP_MAX_LEAVES {
-            return Err(FileSystemError::CorruptVolume(
-                "snapshot imap leaf count out of range",
-            ));
-        }
-        let cap = usize::try_from(imap_leaves.saturating_mul(IMAP_ENTRIES_PER_LEAF))
-            .map_err(|_| StorageError::AllocRefused(imap_leaves))?;
-        let mut imap: Vec<u64> = Vec::new();
-        imap.try_reserve_exact(cap)
-            .map_err(|_| StorageError::AllocRefused(imap_leaves))?;
-
-        let mut index = alloc::vec![0u8; BLOCK_SIZE as usize];
-        self.device.read_block(imap_block, &mut index)?;
-        let mut leaf = alloc::vec![0u8; BLOCK_SIZE as usize];
-        for l in 0..imap_leaves {
-            let ptr = u64::from_le_bytes(
-                index[(l * 8) as usize..(l * 8 + 8) as usize]
-                    .try_into()
-                    .unwrap(),
-            );
-            if ptr == 0 || ptr >= block_count {
-                return Err(FileSystemError::CorruptVolume("snapshot imap leaf out of bounds"));
-            }
-            self.device.read_block(ptr, &mut leaf)?;
-            for e in 0..IMAP_ENTRIES_PER_LEAF {
-                let entry = u64::from_le_bytes(
-                    leaf[(e * 8) as usize..(e * 8 + 8) as usize]
-                        .try_into()
-                        .unwrap(),
-                );
-                if entry >= block_count {
-                    return Err(FileSystemError::CorruptVolume("snapshot imap entry out of bounds"));
-                }
-                imap.push(entry);
-            }
-        }
+        let (imap, _) =
+            Self::load_imap_via(&mut self.device, block_count, imap_block, imap_leaves, None, None)?;
         Ok(imap)
     }
 
@@ -2226,7 +2239,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// exactly one refcount per referencing root, so drop frees a block iff no
     /// remaining root reaches it). Refcount- and refmap-map blocks are NOT
     /// included: a snapshot retains the DATA tree, not the allocator (the live
-    /// refmap is never snapshotted; BOOT80: its unchanged leaves are re-pointed, the changed ones
+    /// refmap is never snapshotted; BOOT80/UNAFSMAP: its clean leaves keep their blocks, the dirty ones
     /// rewritten, every commit).
     ///
     /// Bounded against the volume span (the on-disk imap is untrusted input);
@@ -2238,34 +2251,13 @@ impl<D: BlockDevice> UnaFS<D> {
         imap_leaves: u64,
     ) -> Result<Vec<u64>, FileSystemError> {
         let block_count = self.superblock.block_count;
-        if imap_block == 0 || imap_block >= block_count {
-            return Err(FileSystemError::CorruptVolume("snapshot imap index out of bounds"));
-        }
-        if imap_leaves == 0 || imap_leaves > IMAP_MAX_LEAVES {
-            return Err(FileSystemError::CorruptVolume("snapshot imap leaf count out of range"));
-        }
-        let mut blocks = Vec::new();
-        blocks.push(imap_block);
-        let mut index = alloc::vec![0u8; BLOCK_SIZE as usize];
-        self.device.read_block(imap_block, &mut index)?;
-        let mut leaf = alloc::vec![0u8; BLOCK_SIZE as usize];
-        for l in 0..imap_leaves {
-            let ptr = u64::from_le_bytes(
-                index[(l * 8) as usize..(l * 8 + 8) as usize]
-                    .try_into()
-                    .unwrap(),
-            );
-            if ptr == 0 || ptr >= block_count {
-                return Err(FileSystemError::CorruptVolume("snapshot imap leaf out of bounds"));
-            }
-            blocks.push(ptr);
-            self.device.read_block(ptr, &mut leaf)?;
-            for e in 0..IMAP_ENTRIES_PER_LEAF {
-                let inode_pb = u64::from_le_bytes(
-                    leaf[(e * 8) as usize..(e * 8 + 8) as usize]
-                        .try_into()
-                        .unwrap(),
-                );
+        // UNAFSMAP: the retained map's own shape (a snapshot taken before a
+        // v6 → v7 migration keeps its legacy map) — sniffed off its top node.
+        let (imap, tree) =
+            Self::load_imap_via(&mut self.device, block_count, imap_block, imap_leaves, None, None)?;
+        let mut blocks: Vec<u64> = tree.blocks().collect();
+        {
+            for &inode_pb in &imap {
                 // Unallocated inode-map slots are zero (imap leaves are
                 // zero-filled beyond the last live id) — nothing to reach.
                 if inode_pb == 0 {
@@ -2391,7 +2383,7 @@ impl<D: BlockDevice> UnaFS<D> {
         // blocks at a refcount the snapshot still holds.
         let blocks = self.snapshot_blocks(imap_block, imap_leaves)?;
         for &b in &blocks {
-            self.refmap.incref(b);
+            self.refmap.incref(&mut self.device, b);
         }
 
         index.push(SnapshotEntry {
@@ -2435,16 +2427,19 @@ impl<D: BlockDevice> UnaFS<D> {
                 self.root = loaded.root;
                 self.active_slot = loaded.active_slot;
                 self.imap = loaded.imap;
-                self.imap_blocks = loaded.imap_blocks;
-                self.refmap_blocks = loaded.refmap_blocks;
+                self.imap_tree = loaded.imap_tree;
                 self.refmap = loaded.refmap;
+                self.refmap.set_budget(self.map_budget);
+                self.migrate_pending = loaded.migrate;
+                if loaded.grow_lag {
+                    self.root_flags |= crate::root::ROOT_FLAG_GROW;
+                }
             }
             Err(_) => {
                 crate::warnlog::warn(
                     "[UNAFS] :: txn unwind reload failed — allocator poisoned closed until remount",
                 );
-                let all_used = alloc::vec![u32::MAX; self.superblock.block_count as usize];
-                self.refmap.set_counts(&all_used);
+                self.refmap.poison();
             }
         }
         self.txn_blocks = 0;
@@ -2563,7 +2558,7 @@ impl<D: BlockDevice> UnaFS<D> {
         for entry in &queue {
             for &b in &entry.blocks {
                 if b > ROOT_BLOCK && b < self.superblock.block_count {
-                    self.refmap.decref(b);
+                    self.refmap.decref(&mut self.device, b);
                 }
             }
         }
@@ -2626,7 +2621,7 @@ impl<D: BlockDevice> UnaFS<D> {
                     Some(b) if b < self.superblock.block_count => b,
                     _ => break,
                 };
-                self.refmap.decref(block);
+                self.refmap.decref(&mut self.device, block);
             }
         }
     }
@@ -3468,6 +3463,11 @@ impl<D: BlockDevice> UnaFS<D> {
         if !self.autocommit || self.txn_blocks != 0 {
             return Err(SuperblockError::Geometry("grow needs a committed volume (auto-commit on)").into());
         }
+        // UNAFSMAP: a v6 volume migrates to the paged maps first (its first
+        // commit does), so the grow is sized against the v7 wall.
+        if self.migrate_pending {
+            self.commit()?;
+        }
         let mut grown = self.superblock.clone();
         grown.block_count = new_block_count;
         grown.validate()?;
@@ -3531,5 +3531,22 @@ impl<D: BlockDevice> UnaFS<D> {
         self.refmap.try_grow(new_block_count, from)?;
         self.root_flags = crate::root::ROOT_FLAG_GROW;
         self.commit()
+    }
+
+    /// UNAFSMAP test seam: run the v6 → v7 migration's first step only (the
+    /// paged maps commit under a MIGRATE root; block 0 is NOT rewritten) —
+    /// a power cut between the root flip and the superblock write. The
+    /// instance must be dropped afterwards.
+    #[doc(hidden)]
+    pub fn migrate_interrupted_before_superblock(&mut self) -> Result<(), FileSystemError> {
+        if self.refmap.shape() == Shape::Legacy {
+            self.refmap.convert_to_paged(&mut self.device)?;
+            for b in self.imap_tree.convert_to_paged()? {
+                self.refmap.decref(&mut self.device, b);
+            }
+        }
+        self.migrate_pending = false;
+        self.root_flags |= crate::root::ROOT_FLAG_MIGRATE;
+        self.commit_inner()
     }
 }
