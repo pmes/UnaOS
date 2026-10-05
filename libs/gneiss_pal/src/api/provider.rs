@@ -150,6 +150,10 @@ pub enum ProviderError {
     Malformed(String),
     /// The operation (or attachment) is not supported by this provider.
     Unsupported(String),
+    /// A local client process failed (CLAUDECODE, SR38: the Claude Code CLI
+    /// exited non-zero, or reported an error that is not an API status).
+    /// `code` is the exit code (`None`: killed by a signal, or no exit yet).
+    Cli { code: Option<i32>, message: String },
 }
 
 impl std::fmt::Display for ProviderError {
@@ -161,6 +165,8 @@ impl std::fmt::Display for ProviderError {
             ProviderError::Retryable { status, message } => write!(f, "provider unavailable ({status}): {message}"),
             ProviderError::Malformed(m) => write!(f, "malformed provider response: {m}"),
             ProviderError::Unsupported(m) => write!(f, "not supported by this provider: {m}"),
+            ProviderError::Cli { code: Some(c), message } => write!(f, "Claude Code CLI exited with status {c}: {message}"),
+            ProviderError::Cli { code: None, message } => write!(f, "Claude Code CLI failed: {message}"),
         }
     }
 }
@@ -169,7 +175,7 @@ impl std::error::Error for ProviderError {}
 
 /// The seam. Object-safe (`Arc<dyn ModelProvider>`), async via boxed futures.
 pub trait ModelProvider: Send + Sync {
-    /// The provider's stable name (`"claude"`, `"gemini"`). Never a credential.
+    /// The provider's stable name (`"claude"`, `"gemini"`, `"claudecode"`). Never a credential.
     fn name(&self) -> &str;
 
     /// The model this provider was configured with.
@@ -205,6 +211,7 @@ pub const GEMINI_DEFAULT_KEY_ENV: &str = "GEMINI_API_KEY";
 pub const MODEL_CHOICES: &[(&str, &str)] = &[
     ("claude", CLAUDE_DEFAULT_MODEL),
     ("gemini", GEMINI_DEFAULT_MODEL),
+    ("claudecode", super::claudecode::CLAUDECODE_DEFAULT_MODEL),
 ];
 
 /// The settings-surface menu: one label per [`MODEL_CHOICES`] entry
@@ -230,6 +237,9 @@ pub fn model_menu(configured: Option<&ProviderConfig>) -> (Vec<String>, u32) {
 pub enum ProviderKind {
     Claude,
     Gemini,
+    /// CLAUDECODE (SR38): the installed Claude Code CLI, logged into a
+    /// subscription — no API key.
+    ClaudeCode,
 }
 
 impl ProviderKind {
@@ -237,6 +247,7 @@ impl ProviderKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" | "anthropic" => Some(ProviderKind::Claude),
             "gemini" | "google" | "vertex" => Some(ProviderKind::Gemini),
+            "claudecode" | "claude-code" | "claude_code" => Some(ProviderKind::ClaudeCode),
             _ => None,
         }
     }
@@ -245,6 +256,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Claude => "claude",
             ProviderKind::Gemini => "gemini",
+            ProviderKind::ClaudeCode => "claudecode",
         }
     }
 }
@@ -257,6 +269,8 @@ pub enum AuthMode {
     /// Google application-default credentials (`gcloud auth
     /// application-default print-access-token`). Gemini only.
     GcloudAdc,
+    /// The Claude Code CLI holds its own login; Vein never sees a credential.
+    Cli,
 }
 
 /// Gemini-only settings.
@@ -298,6 +312,9 @@ pub struct ProviderConfig {
     /// default on).
     pub claude_fallbacks: bool,
     pub gemini: GeminiSettings,
+    /// Claude Code only: the CLI binary (`vein.claudecode.bin`, default
+    /// `claude` looked up on `PATH`).
+    pub claudecode_bin: String,
 }
 
 fn pref_str(v: Option<PrefValue>) -> Option<String> {
@@ -312,25 +329,29 @@ impl ProviderConfig {
     /// answers one key (`"provider"`, `"claude.api_key_env"`, ...). Defaults
     /// live here, with the consumer, never in the store.
     ///
-    /// Keys: `provider` (`claude`|`gemini`, default `claude`), `model`,
+    /// Keys: `provider` (`claude`|`gemini`|`claudecode`, default `claude`), `model`,
     /// `max_tokens`, `temperature`, `claude.api_key_env` (default
     /// `ANTHROPIC_API_KEY`), `claude.fallbacks` (default true),
     /// `gemini.project`, `gemini.region` (default `global`), `gemini.auth`
     /// (`gcloud`|`api_key`, default `gcloud`), `gemini.api_key_env` (default
-    /// `GEMINI_API_KEY`), `gemini.embed_model`, `gemini.embed_region`.
+    /// `GEMINI_API_KEY`), `gemini.embed_model`, `gemini.embed_region`,
+    /// `claudecode.bin` (default `claude` on `PATH`).
     pub fn from_prefs(get: impl Fn(&str) -> Option<PrefValue>) -> Result<Self, ProviderError> {
         let kind = match pref_str(get("provider")) {
             None => ProviderKind::Claude,
             Some(s) => ProviderKind::parse(&s).ok_or_else(|| {
                 ProviderError::Config(format!(
-                    "unknown provider \"{s}\" in vein.provider — choose \"claude\" or \"gemini\" in Settings"
+                    "unknown provider \"{s}\" in vein.provider — choose \"claude\", \"gemini\" or \"claudecode\" in Settings"
                 ))
             })?,
         };
         let model = pref_str(get("model")).unwrap_or_else(|| match kind {
             ProviderKind::Claude => CLAUDE_DEFAULT_MODEL.into(),
             ProviderKind::Gemini => GEMINI_DEFAULT_MODEL.into(),
+            ProviderKind::ClaudeCode => super::claudecode::CLAUDECODE_DEFAULT_MODEL.into(),
         });
+        let claudecode_bin =
+            pref_str(get("claudecode.bin")).unwrap_or_else(|| super::claudecode::CLAUDECODE_DEFAULT_BIN.into());
         let max_tokens = match get("max_tokens") {
             Some(PrefValue::Int(n)) if n > 0 => n.min(u32::MAX as i64) as u32,
             _ => DEFAULT_MAX_TOKENS,
@@ -366,20 +387,21 @@ impl ProviderConfig {
                     )));
                 }
             },
+            ProviderKind::ClaudeCode => AuthMode::Cli,
         };
         if kind == ProviderKind::Gemini && auth == AuthMode::GcloudAdc && gemini.project.is_none() {
             return Err(ProviderError::Config(
                 "Gemini via gcloud needs a Vertex project: set vein.gemini.project in Settings (or vein.gemini.auth = \"api_key\")".into(),
             ));
         }
-        Ok(ProviderConfig { kind, model, auth, max_tokens, temperature, claude_fallbacks, gemini })
+        Ok(ProviderConfig { kind, model, auth, max_tokens, temperature, claude_fallbacks, gemini, claudecode_bin })
     }
 
     /// The env var this config reads its key from, if it uses one.
     pub fn key_env(&self) -> Option<&str> {
         match &self.auth {
             AuthMode::ApiKeyEnv(v) => Some(v),
-            AuthMode::GcloudAdc => None,
+            AuthMode::GcloudAdc | AuthMode::Cli => None,
         }
     }
 }
@@ -405,7 +427,7 @@ pub fn build_provider_with_env(
                 )));
             }
         },
-        AuthMode::GcloudAdc => None,
+        AuthMode::GcloudAdc | AuthMode::Cli => None,
     };
     match cfg.kind {
         ProviderKind::Claude => {
@@ -423,6 +445,11 @@ pub fn build_provider_with_env(
                 settings: cfg.gemini.clone(),
                 temperature: cfg.temperature,
             })?))
+        }
+        // The CLI is spawned per request: a missing binary or a logged-out
+        // CLI is reported on the first message, verbatim, not here.
+        ProviderKind::ClaudeCode => {
+            Ok(Box::new(super::claudecode::ClaudeCodeProvider::new(cfg.claudecode_bin.clone(), cfg.model.clone())))
         }
     }
 }
@@ -513,6 +540,25 @@ mod tests {
         let (labels, i) = model_menu(Some(&c));
         assert_eq!(labels.len(), MODEL_CHOICES.len() + 1);
         assert_eq!(labels[i as usize], "a-typed-model (gemini)");
+    }
+
+    #[test]
+    fn claudecode_needs_no_key_and_reads_its_binary() {
+        let c = ProviderConfig::from_prefs(prefs(&[("provider", PrefValue::Str("claudecode".into()))])).unwrap();
+        assert_eq!((c.kind, c.auth.clone(), c.model.as_str(), c.claudecode_bin.as_str()), (ProviderKind::ClaudeCode, AuthMode::Cli, "default", "claude"));
+        assert_eq!(c.key_env(), None);
+        let p = build_provider_with_env(&c, |_| None).unwrap();
+        assert_eq!((p.name(), p.model()), ("claudecode", "default"));
+        let c = ProviderConfig::from_prefs(prefs(&[
+            ("provider", PrefValue::Str("claude-code".into())),
+            ("claudecode.bin", PrefValue::Str("/opt/node22/bin/claude".into())),
+            ("model", PrefValue::Str("opus".into())),
+        ]))
+        .unwrap();
+        assert_eq!((c.claudecode_bin.as_str(), c.model.as_str()), ("/opt/node22/bin/claude", "opus"));
+        let (labels, i) = model_menu(Some(&c));
+        assert_eq!(labels[i as usize], "opus (claudecode)");
+        assert!(labels.contains(&"default (claudecode)".to_string()));
     }
 
     #[test]

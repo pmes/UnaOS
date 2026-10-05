@@ -308,6 +308,31 @@ mod tests {
         assert_eq!(slot.status_line(), ":: BRAIN :: NO PROVIDER :: set MY_GEMINI, or choose a provider in Settings\n\n");
     }
 
+    /// CLAUDECODE (SR38): `vein.provider = "claudecode"` in Principia's file
+    /// selects the Claude Code CLI provider — no key needed — and a missing
+    /// binary reaches the chat verbatim, naming `vein.claudecode.bin`.
+    #[test]
+    fn claudecode_is_selected_by_the_pref_and_needs_no_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.toml");
+        let mut store = PrefStore::empty(&path);
+        store.set("vein", "provider", PrefValue::Str("claudecode".into())).unwrap();
+        let bin = dir.path().join("no-such-claude");
+        store.set("vein", "claudecode.bin", PrefValue::Str(bin.display().to_string())).unwrap();
+        let slot = ProviderSlot::load_from(&path, none);
+        assert_eq!(slot.status_line(), ":: BRAIN :: ONLINE (claudecode / default)\n\n");
+        assert_eq!(slot.chat_pair(), Some(("claudecode".into(), "default".into())));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let e = rt.block_on(slot.generate(&slot.request(None, vec![Part::text("hi".into())]))).unwrap_err();
+        assert_eq!(
+            e,
+            format!(
+                "claudecode :: Claude Code CLI not found: `{}` — install Claude Code, or set vein.claudecode.bin to the claude binary's path",
+                bin.display()
+            )
+        );
+    }
+
     #[test]
     fn claude_default_and_request_carries_config() {
         let slot = ProviderSlot::from_lookup(
