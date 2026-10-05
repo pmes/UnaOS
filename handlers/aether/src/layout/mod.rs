@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 mod blockwidth;
 mod collapse;
+mod table;
 
 /// Specified paint properties for one box. `None` = not specified here;
 /// color and font-size inherit down the tree at render time.
@@ -95,6 +96,12 @@ pub struct PaintStyle {
     /// lengths (`min(300px, 80%)`), resolved after a first layout against
     /// the containing block's content width. A plain value clears it.
     pub pct_math: Option<[Option<String>; 3]>,
+    /// border-collapse: collapse (true) / separate (false). On tables.
+    pub border_collapse: Option<bool>,
+    /// border-spacing in px (horizontal = vertical here). On tables.
+    pub border_spacing: Option<f32>,
+    /// The author gave this box a `width` (any value).
+    pub has_width: Option<bool>,
 }
 
 pub struct LayoutTree {
@@ -515,11 +522,16 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
                     left: LengthPercentageAuto::length(l),
                 }
             },
-            padding: Rect {
-                left: LengthPercentage::length(if !inline && matches!(tag.as_str(), "ul" | "ol" | "menu" | "dir") { 40.0 } else { 0.0 }),
-                right: LengthPercentage::length(0.0),
-                top: LengthPercentage::length(0.0),
-                bottom: LengthPercentage::length(0.0),
+            padding: if matches!(tag.as_str(), "td" | "th") {
+                // html.css: `td, th { padding: 1px }`.
+                Rect::length(1.0)
+            } else {
+                Rect {
+                    left: LengthPercentage::length(if !inline && matches!(tag.as_str(), "ul" | "ol" | "menu" | "dir") { 40.0 } else { 0.0 }),
+                    right: LengthPercentage::length(0.0),
+                    top: LengthPercentage::length(0.0),
+                    bottom: LengthPercentage::length(0.0),
+                }
             },
             border: if tag == "hr" {
                 Rect { left: LengthPercentage::length(1.0), right: LengthPercentage::length(1.0), top: LengthPercentage::length(1.0), bottom: LengthPercentage::length(1.0) }
@@ -1364,8 +1376,13 @@ pub fn remeasure(tree: &mut LayoutTree) {
         .iter()
         .filter_map(|(id, p)| p.pct_math.clone().filter(|m| m.iter().any(Option::is_some)).map(|m| (*id, m)))
         .collect();
-    let passes = if pct_nodes.is_empty() { 1 } else { 2 };
+    let has_tables = !table::tables(tree).is_empty();
+    let passes = if pct_nodes.is_empty() && !has_tables { 1 } else { 2 };
     for pass in 0..passes {
+    if pass == 1 && has_tables {
+        // Column grid from the first pass's max-content cell widths.
+        table::apply(tree);
+    }
     if pass == 1 {
         // Containing-block widths are known now: resolve the % math.
         for (id, m) in &pct_nodes {

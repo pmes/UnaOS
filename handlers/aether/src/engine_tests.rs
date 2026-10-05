@@ -2459,4 +2459,20 @@ mod tests {
         assert_eq!(a.2, 300.0);
         assert_eq!(b.2, 250.0 + 10.0, "50% of 500 + padding 5+5");
     }
+
+    /// CSS 2.2 §17.5.2.2 / §17.6: columns line up across rows, a 100% wide
+    /// table widens its columns in proportion, collapsed borders overlap.
+    #[test]
+    fn test_table_layout_kat() {
+        let t = laid_out(
+            r#"<html><body><table style="width:400px;border-collapse:collapse"><tr><td id=a style="border:1px solid red">x</td><td id=b style="border:1px solid red">yyyyyyyy</td></tr><tr><td id=c style="border:1px solid red">zzzz zzzz</td><td id=d style="border:1px solid red">1</td></tr></table></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b, c, d) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap(), rect_by_id(&t, "c").unwrap(), rect_by_id(&t, "d").unwrap());
+        assert_eq!(a.2, c.2, "column 1 cells share a width");
+        assert_eq!(b.0, d.0, "column 2 starts at one x");
+        assert_eq!(b.0, a.0 + a.2 - 1.0, "collapsed: the shared border overlaps by 1px");
+        assert!((d.0 + d.2 - a.0 - 400.0).abs() <= 1.0, "the columns fill the 400px table: {a:?} {d:?}");
+        assert_eq!(c.1, a.1 + a.3 - 1.0, "rows overlap by the shared border");
+    }
 }

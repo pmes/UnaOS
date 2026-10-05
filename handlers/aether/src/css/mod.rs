@@ -231,6 +231,9 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             if d.is_some() || m[i].is_some() {
                 style.paint.pct_math = Some(m);
             }
+            if i == 0 {
+                style.paint.has_width = Some(!matches!(value, "auto"));
+            }
             match i {
                 0 => style.width = d,
                 1 => style.min_width = d,
@@ -239,6 +242,16 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         }
         "height" => style.height = parse_dimension_str(value),
         "max-height" => style.max_height = parse_dimension_str(value),
+        "border-collapse" => match value {
+            "collapse" => style.paint.border_collapse = Some(true),
+            "separate" => style.paint.border_collapse = Some(false),
+            _ => {}
+        },
+        "border-spacing" => {
+            if let Some(px) = split_top_level(value).first().and_then(|v| parse_px(v)) {
+                style.paint.border_spacing = Some(px.max(0.0));
+            }
+        }
         "min-height" => style.min_height = parse_dimension_str(value),
         // overflow hidden/clip/auto/scroll all CLIP paint here (no inner
         // scrollbars yet — clipping is the honest approximation; visible
@@ -1848,7 +1861,7 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
-        ua_vmargin,
+        ua_vmargin, border_collapse, border_spacing, has_width,
     );
     clone!(pct_math);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
