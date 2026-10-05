@@ -18,9 +18,13 @@
 //!   is carried as `lead`/`trail` flags (set by the inline whitespace
 //!   collapsing pass across element boundaries, §4.1.1 phase I) so
 //!   "text <b>bold</b>, more" keeps its spaces and loses none to trimming.
-use font_kit::font::Font;
-use std::cell::RefCell;
-use std::collections::HashMap;
+//! - §5.1 / UAX #14 (AETHERFONT): inside a space-delimited word, the line
+//!   breaking algorithm's opportunities (after hyphens, between ideographs,
+//!   …; `font_core::linebreak`) are soft wrap points too; `keep-all` keeps
+//!   letters together.
+//! - Widths are SHAPED widths ([`Advancer`]: kerning, ligatures, fallback),
+//!   and a finished line's width is its whole text shaped, as painted.
+pub use super::shape::Advancer;
 
 /// The text properties line breaking depends on.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -33,6 +37,10 @@ pub struct TextMode {
     pub overflow_wrap: u8,
     /// Extra px after every character.
     pub letter_spacing: f32,
+    /// Extra px on every word separator (css-text-3 §7.1).
+    pub word_spacing: f32,
+    /// The paragraph direction is right-to-left (bidi base level 1).
+    pub rtl: bool,
     /// A collapsible space precedes the run's first word.
     pub lead: bool,
     /// A collapsible space follows the run's last word.
@@ -57,58 +65,6 @@ impl TextMode {
 pub struct Line {
     pub text: String,
     pub width: f32,
-}
-
-/// Per-character advance in px at `size` for the face `key`, cached in font
-/// units (taffy measures every leaf several times per layout).
-pub struct Advancer<'a> {
-    font: &'a Font,
-    key: u8,
-    scale: f32,
-    space: f32,
-    ls: f32,
-}
-
-thread_local! {
-    static ADVANCES: RefCell<HashMap<(u8, char), f32>> = RefCell::new(HashMap::new());
-}
-
-impl<'a> Advancer<'a> {
-    pub fn new(font: &'a Font, key: u8, size: f32, letter_spacing: f32) -> Self {
-        let scale = size / font.metrics().units_per_em as f32;
-        Advancer { font, key, scale, space: super::space_advance(font, size), ls: letter_spacing }
-    }
-    pub fn char(&self, c: char) -> f32 {
-        if c == ' ' {
-            return self.space + self.ls;
-        }
-        // Cached in em (advance / units-per-em), so a fallback face with
-        // its own units per em measures right.
-        let em = ADVANCES.with(|m| {
-            if let Some(a) = m.borrow().get(&(self.key, c)) {
-                return *a;
-            }
-            let upem = self.font.metrics().units_per_em as f32;
-            let a = match self.font.glyph_for_char(c).filter(|&g| g != 0) {
-                Some(g) => self.font.advance(g).map(|a| a.x() / upem).unwrap_or(0.0),
-                // The glyph comes from the fallback face (fonts::fallback_for),
-                // drawn with ITS advance.
-                None => super::fallback_for(c, super::key_is_bold(self.key))
-                    .and_then(|(f, _)| {
-                        let g = f.glyph_for_char(c)?;
-                        let u = f.metrics().units_per_em as f32;
-                        f.advance(g).ok().map(|a| a.x() / u)
-                    })
-                    .unwrap_or(0.0),
-            };
-            m.borrow_mut().insert((self.key, c), a);
-            a
-        });
-        em * self.scale * self.font.metrics().units_per_em as f32 + self.ls
-    }
-    pub fn str(&self, s: &str) -> f32 {
-        s.chars().map(|c| self.char(c)).sum()
-    }
 }
 
 /// Breaks `text` into lines no wider than `max_width` (when the mode wraps).
@@ -206,12 +162,55 @@ pub fn break_lines_from(adv: &Advancer, text: &str, mode: &TextMode, max_width: 
         }
     }
     out.push(cur.line);
+    // A line's width is its text shaped as one run, as the painter draws it (kerning across the
+    // word-separating spaces included).
+    for l in out.iter_mut() {
+        if !l.text.is_empty() {
+            l.width = adv.str(&l.text);
+        }
+    }
     out
 }
 
-/// Appends one word to the current line, wrapping or breaking it as the
-/// mode allows. `spaced` = collapsible mode: a space separates words.
+/// The UAX #14 soft-wrap pieces of one space-free word (a break opportunity before each piece but the
+/// first): "well-known" → ["well-", "known"], "世界" → ["世", "界"]. `keep_all` (css-text-3 §5.2) drops the
+/// opportunities between two letters, keeping punctuation ones.
+fn soft_pieces(word: &str, keep_all: bool) -> Vec<&str> {
+    if word.is_ascii() && !word.contains(['-', '/', '?', '!', '}', ')', ']', '%']) {
+        return vec![word]; // no opportunity can occur inside a plain ASCII letter/digit run
+    }
+    let b = font_core::linebreak::breaks(word);
+    let chars: Vec<(usize, char)> = word.char_indices().collect();
+    let mut out = Vec::new();
+    let mut start = 0;
+    for ci in 1..chars.len() {
+        let bo = chars[ci].0;
+        if keep_all && chars[ci - 1].1.is_alphanumeric() && chars[ci].1.is_alphanumeric() {
+            continue;
+        }
+        if b[ci] != font_core::linebreak::Break::None {
+            out.push(&word[start..bo]);
+            start = bo;
+        }
+    }
+    out.push(&word[start..]);
+    out
+}
+
+/// Appends one word to the current line, its UAX #14 pieces as separate
+/// wrap units (no space between them).
 fn place_word(adv: &Advancer, word: &str, mode: &TextMode, max: f32, cur: &mut Cur, out: &mut Vec<Line>, spaced: bool) {
+    if mode.word_break == 1 || !mode.wraps() {
+        return place_unit(adv, word, mode, max, cur, out, spaced);
+    }
+    for (k, piece) in soft_pieces(word, mode.word_break == 2).into_iter().enumerate() {
+        place_unit(adv, piece, mode, max, cur, out, spaced && k == 0);
+    }
+}
+
+/// Appends one wrap unit to the current line, wrapping or breaking it as the
+/// mode allows. `spaced` = collapsible mode: a space separates words.
+fn place_unit(adv: &Advancer, word: &str, mode: &TextMode, max: f32, cur: &mut Cur, out: &mut Vec<Line>, spaced: bool) {
     let own = !cur.line.text.trim().is_empty() || (!spaced && !cur.line.text.is_empty());
     let glued = std::mem::take(&mut cur.glued) && cur.line.text.is_empty();
     let has_content = (own || cur.prior) && !glued;
@@ -241,7 +240,7 @@ fn place_word(adv: &Advancer, word: &str, mode: &TextMode, max: f32, cur: &mut C
     }
     if has_content && used + gap + w > max {
         cur.push(out);
-        return place_word(adv, word, mode, max, cur, out, spaced);
+        return place_unit(adv, word, mode, max, cur, out, spaced);
     }
     if gap > 0.0 {
         cur.line.text.push(' ');
@@ -268,8 +267,10 @@ mod tests {
     use super::*;
 
     fn adv_test<R>(f: impl FnOnce(&Advancer) -> R) -> Option<R> {
-        let font = crate::fonts::face(2, false, false)?; // monospace: every char the same advance
-        let a = Advancer::new(&font, 200, 10.0, 0.0);
+        // monospace: every char the same advance
+        let sel = crate::fonts::FontSel::new(crate::fonts::MONO, 400, false);
+        crate::fonts::face(&sel)?;
+        let a = Advancer::new(sel, 10.0, 0.0);
         Some(f(&a))
     }
 
@@ -335,10 +336,29 @@ mod tests {
     }
 
     #[test]
+    fn uax14_soft_wraps_kat() {
+        adv_test(|a| {
+            let cw = a.char('x');
+            let m = TextMode::default();
+            // after the hyphen of a compound
+            let l = break_lines(a, "aa well-known", &m, cw * 8.0);
+            assert_eq!(texts(&l), vec!["aa well-", "known"]);
+            assert_eq!(soft_pieces("世界、こんにちは", false), vec!["世", "界、", "こ", "ん", "に", "ち", "は"]);
+            // keep-all keeps letters together, not the hyphen opportunity
+            assert_eq!(soft_pieces("世界、こんにちは", true), vec!["世界、", "こんにちは"]);
+            let l = break_lines(a, "aa well-known", &TextMode { word_break: 2, ..m }, cw * 8.0);
+            assert_eq!(texts(&l), vec!["aa well-", "known"]);
+        });
+    }
+
+    #[test]
     fn letter_spacing_kat() {
-        let Some(font) = crate::fonts::face(2, false, false) else { return };
-        let a0 = Advancer::new(&font, 201, 10.0, 0.0);
-        let a2 = Advancer::new(&font, 201, 10.0, 2.0);
+        let sel = crate::fonts::FontSel::new(crate::fonts::MONO, 400, false);
+        if crate::fonts::face(&sel).is_none() {
+            return;
+        }
+        let a0 = Advancer::new(sel, 10.0, 0.0);
+        let a2 = Advancer::new(sel, 10.0, 2.0);
         assert!((a2.str("abc") - a0.str("abc") - 6.0).abs() < 1e-3);
     }
 }

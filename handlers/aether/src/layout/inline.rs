@@ -184,13 +184,13 @@ struct Metrics {
 }
 
 fn metrics(run: &TextRun) -> Metrics {
-    match crate::fonts::face(run.family, run.bold, run.italic) {
+    match crate::fonts::face(&run.sel()) {
         Some(f) => {
-            let (a, d, _) = crate::fonts::line_metrics(&f, run.font_size);
-            let lh = crate::fonts::line_height(&f, run.font_size, run.line_height);
+            let (a, d, _) = crate::fonts::line_metrics(f, run.font_size);
+            let lh = crate::fonts::line_height(f, run.font_size, run.line_height);
             let m = f.metrics();
             let xh = m.x_height * run.font_size / m.units_per_em as f32;
-            Metrics { a, d, lh, xh, off: crate::fonts::baseline_offset(&f, run.font_size, run.line_height) }
+            Metrics { a, d, lh, xh, off: crate::fonts::baseline_offset(f, run.font_size, run.line_height) }
         }
         None => {
             let lh = if run.line_height > 0.0 {
@@ -261,8 +261,8 @@ fn atomic_box(tree: &LayoutTree, ctx: &Ctx, id: NodeId, fallback: &TextRun) -> (
             let run = run_of(ctx, id, fallback);
             let m = metrics(run);
             let content_h = l.size.height - l.padding.top - l.padding.bottom - l.border.top - l.border.bottom;
-            let lh = m.a + m.d + crate::fonts::face(run.family, run.bold, run.italic)
-                .map(|f| crate::fonts::line_metrics(&f, run.font_size).2)
+            let lh = m.a + m.d + crate::fonts::face(&run.sel())
+                .map(|f| crate::fonts::line_metrics(f, run.font_size).2)
                 .unwrap_or(0.0);
             l.margin.top + l.border.top + l.padding.top + ((content_h - lh) / 2.0).floor().max(0.0) + m.a
         }
@@ -556,13 +556,11 @@ pub(super) fn layout_root(tree: &LayoutTree, ctx: &Ctx, root: NodeId) -> InlineL
                     continue;
                 };
                 let mode = mode_of(run);
-                let face = crate::fonts::face(run.family, run.bold, run.italic);
-                let Some(font) = face.as_deref() else {
+                if crate::fonts::face(&run.sel()).is_none() {
                     idx += 1;
                     continue;
-                };
-                let key = crate::fonts::face_key(run.family, run.bold, run.italic);
-                let adv = crate::fonts::lines::Advancer::new(font, key, run.font_size, mode.letter_spacing);
+                }
+                let adv = run.advancer();
                 let lines = crate::fonts::lines::break_lines_from(&adv, &run.text, &mode, line_w, cur_x, has_content);
                 let preserved = matches!(mode.white_space, 2 | 3 | 5);
                 for (i, l) in lines.into_iter().enumerate() {
@@ -667,10 +665,10 @@ pub(super) fn layout_root(tree: &LayoutTree, ctx: &Ctx, root: NodeId) -> InlineL
 
 fn trailing_space_width(ctx: &Ctx, node: NodeId, fallback: &TextRun, n: usize) -> f32 {
     let run = run_of(ctx, node, fallback);
-    crate::fonts::face(run.family, run.bold, run.italic)
-        .map(|f| crate::fonts::space_advance(&f, run.font_size) + run.mode.letter_spacing)
-        .unwrap_or(run.font_size * 0.25)
-        * n as f32
+    if crate::fonts::face(&run.sel()).is_none() {
+        return run.font_size * 0.25 * n as f32;
+    }
+    run.advancer().char(' ') * n as f32
 }
 
 /// vertical-align shift (down = +) of an atomic box of margin height `h`

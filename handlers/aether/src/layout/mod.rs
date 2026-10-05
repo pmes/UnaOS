@@ -14,7 +14,8 @@ pub struct PaintStyle {
     pub background: Option<(u8, u8, u8)>,
     pub color: Option<(u8, u8, u8)>,
     pub font_size: Option<f32>,
-    pub bold: Option<bool>,
+    /// font-weight (css-fonts-4 §2.2): absolute, or relative to the parent's.
+    pub weight: Option<FontWeight>,
     /// Per-side borders [top, right, bottom, left]: (width px, color).
     /// None side = no stroke. Whole-Option None = unspecified.
     pub border: Option<[Option<(f32, (u8, u8, u8))>; 4]>,
@@ -31,8 +32,9 @@ pub struct PaintStyle {
     pub underline: Option<bool>,
     /// white-space:nowrap — text measures and draws on one line.
     pub nowrap: Option<bool>,
-    /// Font family class: 0 = sans (default), 1 = serif, 2 = monospace.
-    pub family: Option<u8>,
+    /// font-family: an interned family-list id (`fonts::family_list`; 0 sans-serif, 1 serif,
+    /// 2 monospace, 3 the standard font).
+    pub family: Option<u16>,
     /// Font style: 0 = normal, 1 = italic.
     pub italic: Option<bool>,
     /// Text transform: 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize.
@@ -148,6 +150,43 @@ pub struct PaintStyle {
     /// remeasure re-applies them against the element's own font when any is
     /// font-relative (em/rem/ex/ch, css-values-4 §6.1).
     pub font_rel: Option<Vec<(String, String)>>,
+    /// font-stretch in percent (css-fonts-4 §2.3).
+    pub stretch: Option<u16>,
+    /// word-spacing in px (css-text-3 §7.1).
+    pub word_spacing: Option<f32>,
+    /// direction: rtl (true) / ltr (false) (css-writing-modes-4 §2.1; `dir` maps onto it).
+    pub rtl: Option<bool>,
+    /// text-shadow (css-text-decor-3 §4): none = Some(empty).
+    pub text_shadows: Option<Vec<crate::render::effects::Shadow>>,
+}
+
+/// A `font-weight` value as specified (css-fonts-4 §2.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FontWeight {
+    Abs(u16),
+    Bolder,
+    Lighter,
+}
+
+impl FontWeight {
+    /// The computed weight against the parent's (the relative-weight table of §2.2).
+    pub fn resolve(self, parent: u16) -> u16 {
+        match self {
+            FontWeight::Abs(w) => w,
+            FontWeight::Bolder => match parent {
+                0..=349 => 400,
+                350..=549 => 700,
+                550..=899 => 900,
+                w => w,
+            },
+            FontWeight::Lighter => match parent {
+                0..=99 => parent,
+                100..=549 => 100,
+                550..=749 => 400,
+                _ => 700,
+            },
+        }
+    }
 }
 
 pub struct LayoutTree {
@@ -736,15 +775,17 @@ pub fn control_kind(node: &NodeRef) -> Option<Control> {
 pub const CONTROL_FONT_PX: f32 = 13.333;
 
 /// Single-line advance of `text` at `size` in the given family.
-fn text_advance(text: &str, family: u8, size: f32) -> f32 {
-    let Some(font) = crate::fonts::face(family, false, false) else { return text.len() as f32 * size * 0.5 };
-    let adv = crate::fonts::lines::Advancer::new(&font, crate::fonts::face_key(family, false, false), size, 0.0);
-    adv.str(text)
+fn text_advance(text: &str, family: u16, size: f32) -> f32 {
+    let sel = crate::fonts::FontSel::new(family, 400, false);
+    if crate::fonts::face(&sel).is_none() {
+        return text.len() as f32 * size * 0.5;
+    }
+    crate::fonts::lines::Advancer::new(sel, size, 0.0).str(text)
 }
 
-fn control_line_height(family: u8) -> f32 {
-    crate::fonts::face(family, false, false)
-        .map(|f| crate::fonts::line_height(&f, CONTROL_FONT_PX, 0.0))
+fn control_line_height(family: u16) -> f32 {
+    crate::fonts::face(&crate::fonts::FontSel::new(family, 400, false))
+        .map(|f| crate::fonts::line_height(f, CONTROL_FONT_PX, 0.0))
         .unwrap_or(15.0)
 }
 
@@ -897,37 +938,20 @@ fn ua_margin_em(tag: &str, nested_list: bool) -> Option<f32> {
     }
 }
 
-/// UA default font FAMILY per element: code-ish tags are monospace.
-pub fn default_family(tag: &str, inherited: u8) -> u8 {
+/// UA default font FAMILY per element (html.css): code-ish tags are `monospace`; form controls take
+/// Chromium's `-webkit-small-control` system font, whose computed family on Linux is `Arial`.
+pub fn default_family(tag: &str, inherited: u16) -> u16 {
     match tag {
-        "code" | "pre" | "kbd" | "samp" | "tt" | "textarea" => 2,
-        "input" | "select" | "button" => 0,
+        "code" | "pre" | "kbd" | "samp" | "tt" | "textarea" | "listing" | "xmp" | "plaintext" => crate::fonts::MONO,
+        "input" | "select" | "button" => control_family(),
         _ => inherited,
     }
 }
 
-/// Loads the (family, bold=false) fonts once per thread: [sans, serif, mono].
-pub fn family_font(family: u8) -> Option<std::sync::Arc<font_kit::font::Font>> {
-    thread_local! {
-        static FONTS: std::cell::RefCell<[Option<Option<std::sync::Arc<font_kit::font::Font>>>; 3]> =
-            const { std::cell::RefCell::new([None, None, None]) };
-    }
-    let idx = (family as usize).min(2);
-    FONTS.with(|f| {
-        let mut f = f.borrow_mut();
-        if f[idx].is_none() {
-            let name = match idx {
-                1 => font_kit::family_name::FamilyName::Serif,
-                2 => font_kit::family_name::FamilyName::Monospace,
-                _ => font_kit::family_name::FamilyName::SansSerif,
-            };
-            f[idx] = Some(
-                crate::fonts::FontEngine::new()
-                    .load_font(&[name], &font_kit::properties::Properties::new()),
-            );
-        }
-        f[idx].clone().flatten()
-    })
+/// The family-list id of `Arial` (the control font's computed family).
+pub fn control_family() -> u16 {
+    static ID: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| crate::fonts::intern_family_list(vec![crate::fonts::Family::Named("Arial".into())]))
 }
 
 /// UA default white-space per element (html.css): pre-ish elements
@@ -946,9 +970,25 @@ pub fn default_line_through(tag: &str, inherited: bool) -> bool {
     inherited || matches!(tag, "s" | "strike" | "del")
 }
 
-/// UA default bold per element, shared by the measurer and the painter.
-pub fn default_bold(tag: &str, inherited: bool) -> bool {
-    inherited || matches!(tag, "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th")
+/// UA default font-weight per element (html.css: `b, strong { font-weight: bolder }`, headings and
+/// `th` bold), shared by the measurer and the painter.
+pub fn default_weight(tag: &str, inherited: u16) -> u16 {
+    match tag {
+        "b" | "strong" => FontWeight::Bolder.resolve(inherited),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th" => 700,
+        _ => inherited,
+    }
+}
+
+/// The inherited direction unless the element's `dir` attribute sets it (HTML §3.2.6.4 → the UA sheet's
+/// `[dir=rtl] { direction: rtl }`).
+pub fn default_rtl(node: &NodeRef, inherited: bool) -> bool {
+    let Some(el) = node.as_element() else { return inherited };
+    match el.attributes.borrow().get("dir").map(|d| d.trim().to_ascii_lowercase()) {
+        Some(d) if d == "rtl" => true,
+        Some(d) if d == "ltr" => false,
+        _ => inherited,
+    }
 }
 
 /// UA default italic per element, shared by the measurer and the painter.
@@ -961,7 +1001,7 @@ pub fn default_italic(tag: &str, inherited: bool) -> bool {
 /// family switches to `monospace` from a proportional parent drops from
 /// the 16px default to 13px (Chromium's default fixed font size), so
 /// `<pre>`/`<code>` text is 13/16 of its surroundings.
-pub fn ua_font_size(tag: &str, inherited: f32, inherited_family: u8, own_family: u8) -> f32 {
+pub fn ua_font_size(tag: &str, inherited: f32, inherited_family: u16, own_family: u16) -> f32 {
     let s = default_font_size(tag, inherited);
     let control = matches!(tag, "input" | "select" | "textarea" | "button");
     if own_family == 2 && inherited_family != 2 && !control { s * 13.0 / 16.0 } else { s }
@@ -1350,9 +1390,7 @@ fn rescale_ua_margins(tree: &mut LayoutTree, sizes: &HashMap<taffy::NodeId, f32>
 /// opportunity, an atomic box's width — plus its own padding and border.
 fn min_content_width(tree: &LayoutTree, id: taffy::NodeId, text: &HashMap<taffy::NodeId, TextRun>) -> f32 {
     if let Some(run) = text.get(&id) {
-        let face = crate::fonts::face(run.family, run.bold, run.italic);
-        let key = crate::fonts::face_key(run.family, run.bold, run.italic);
-        return measure_text_run(face.as_deref(), key, run, 0.0).0;
+        return measure_text_run(run, 0.0).0;
     }
     let Ok(l) = tree.taffy.layout(id) else { return 0.0 };
     let edges = l.padding.left + l.padding.right + l.border.left + l.border.right;
@@ -1384,7 +1422,7 @@ fn min_content_width(tree: &LayoutTree, id: taffy::NodeId, text: &HashMap<taffy:
 /// The computed font-size of an element (css-fonts-4 §2.5): an em/% value
 /// of the parent's size, rem of the root's (the rem basis in the font
 /// context), an absolute value as given, else the UA default for the tag.
-fn computed_font_size(paint: Option<&PaintStyle>, tag: &str, parent: f32, parent_family: u8, own_family: u8, parent_absolute: bool) -> f32 {
+fn computed_font_size(paint: Option<&PaintStyle>, tag: &str, parent: f32, parent_family: u16, own_family: u16, parent_absolute: bool) -> f32 {
     match paint.and_then(|p| p.font_size_rel) {
         Some((0, f)) => parent * f,
         Some((1, f)) => crate::css::font_ctx().1 * f,
@@ -1431,12 +1469,11 @@ fn reresolve_font_relative(tree: &mut LayoutTree, elems: &HashMap<taffy::NodeId,
     for (id, decls) in todo {
         let Some(run) = elems.get(&id) else { continue };
         let fs = run.font_size;
-        let (ex, ch) = match crate::fonts::face(run.family, run.bold, run.italic) {
+        let (ex, ch) = match crate::fonts::face(&run.sel()) {
             Some(f) => {
                 let m = f.metrics();
                 let ex = m.x_height * fs / m.units_per_em as f32;
-                let key = crate::fonts::face_key(run.family, run.bold, run.italic);
-                let ch = crate::fonts::lines::Advancer::new(&f, key, fs, 0.0).char('0');
+                let ch = crate::fonts::lines::Advancer::new(run.sel(), fs, 0.0).char('0');
                 (if ex > 0.0 { ex } else { fs * 0.5 }, ch)
             }
             None => (fs * 0.5, fs * 0.5),
@@ -1519,12 +1556,20 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 if let Some(v) = paint.and_then(|p| p.word_break) { size.mode.word_break = v; }
                 if let Some(v) = paint.and_then(|p| p.overflow_wrap) { size.mode.overflow_wrap = v; }
                 if let Some(v) = paint.and_then(|p| p.letter_spacing) { size.mode.letter_spacing = v; }
+                if let Some(v) = paint.and_then(|p| p.word_spacing) { size.mode.word_spacing = v; }
                 size.family = paint
                     .and_then(|p| p.family)
                     .unwrap_or_else(|| default_family(tag, inherited.family));
-                size.bold = paint.and_then(|p| p.bold).unwrap_or_else(|| default_bold(tag, inherited.bold));
+                size.weight = paint
+                    .and_then(|p| p.weight)
+                    .map(|w| w.resolve(inherited.weight))
+                    .unwrap_or_else(|| default_weight(tag, inherited.weight));
                 size.italic =
                     paint.and_then(|p| p.italic).unwrap_or_else(|| default_italic(tag, inherited.italic));
+                if let Some(st) = paint.and_then(|p| p.stretch) {
+                    size.stretch = st;
+                }
+                size.mode.rtl = paint.and_then(|p| p.rtl).unwrap_or_else(|| default_rtl(dom_node, inherited.mode.rtl));
                 if let Some(tt) = paint.and_then(|p| p.text_transform) {
                     size.text_transform = tt;
                 }
@@ -1582,7 +1627,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
     }
     // The initial font: Chromium's default standard font, Times New Roman
     // (Liberation Serif) at 16px — an unstyled page is serif.
-    let root = TextRun { font_size: 16.0, family: 1, ..Default::default() };
+    let root = TextRun { font_size: 16.0, family: crate::fonts::STANDARD, weight: 400, stretch: 100, ..Default::default() };
     let mut sizes: HashMap<taffy::NodeId, f32> = HashMap::new();
     let mut elem_info: HashMap<taffy::NodeId, TextRun> = HashMap::new();
     // The rem basis: the root element's computed font-size.
@@ -1635,11 +1680,6 @@ pub fn remeasure(tree: &mut LayoutTree) {
         let _ = tree.taffy.mark_dirty(*node_id);
     }
 
-    let font = crate::fonts::FontEngine::new().load_font(
-        &[font_kit::family_name::FamilyName::SansSerif],
-        &font_kit::properties::Properties::new(),
-    );
-
     let viewport = Size {
         width: AvailableSpace::Definite(tree.viewport.0),
         height: AvailableSpace::Definite(tree.viewport.1),
@@ -1687,10 +1727,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 AvailableSpace::MinContent => 0.0,
                 AvailableSpace::MaxContent => vw_cap,
             });
-            let face = crate::fonts::face(run.family, run.bold, run.italic);
-            let use_font = face.as_deref().or(font.as_deref());
-            let key = crate::fonts::face_key(run.family, run.bold, run.italic);
-            let (w, h) = measure_text_run(use_font, key, run, wrap_width);
+            let (w, h) = measure_text_run(run, wrap_width);
             Size {
                 width: known.width.unwrap_or(w),
                 height: known.height.unwrap_or(h),
@@ -1824,9 +1861,13 @@ struct TextRun {
     line_height: f32,
     nowrap: bool,
     mode: crate::fonts::lines::TextMode,
-    family: u8,
-    bold: bool,
+    /// font-family list id (fonts::family_list).
+    family: u16,
+    /// Computed font-weight (1..=1000).
+    weight: u16,
     italic: bool,
+    /// font-stretch, percent.
+    stretch: u16,
     text_transform: u8,
     /// Inherited text-align: 0 start, 1 center, 2 end.
     text_align: u8,
@@ -1836,17 +1877,30 @@ struct TextRun {
     fs_absolute: bool,
 }
 
+impl TextRun {
+    /// The font selection of the run.
+    fn sel(&self) -> crate::fonts::FontSel {
+        crate::fonts::FontSel { family: self.family, weight: self.weight, italic: self.italic, stretch: self.stretch }
+    }
+    /// The run's measurer: its face stack, size, spacing and direction.
+    fn advancer(&self) -> crate::fonts::lines::Advancer {
+        crate::fonts::lines::Advancer::new(self.sel(), self.font_size, self.mode.letter_spacing)
+            .with_word_spacing(self.mode.word_spacing)
+            .with_dir(self.mode.rtl)
+    }
+}
+
 /// Measures a text run: (widest line, lines x line height), through the
 /// same line breaker the painter uses (fonts::lines).
-fn measure_text_run(font: Option<&font_kit::font::Font>, key: u8, run: &TextRun, max_width: f32) -> (f32, f32) {
-    let Some(font) = font else {
+fn measure_text_run(run: &TextRun, max_width: f32) -> (f32, f32) {
+    let Some(font) = crate::fonts::face(&run.sel()) else {
         return (max_width, run.font_size * 1.25);
     };
     let mut mode = run.mode;
     if run.nowrap && mode.white_space == 0 {
         mode.white_space = 1;
     }
-    let adv = crate::fonts::lines::Advancer::new(font, key, run.font_size, mode.letter_spacing);
+    let adv = run.advancer();
     let lines = crate::fonts::lines::break_lines(&adv, &run.text, &mode, max_width);
     let widest = lines.iter().map(|l| l.width).fold(0.0f32, f32::max);
     let lh = crate::fonts::line_height(font, run.font_size, run.line_height);

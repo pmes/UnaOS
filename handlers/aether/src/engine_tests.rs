@@ -1266,7 +1266,12 @@ mod tests {
             if let Some(el) = dom_node.as_element() {
                 let paint = layout_tree.paint_map.get(node_id).cloned().unwrap_or_default();
                 if el.attributes.borrow().get("id") == Some("g") {
-                    assert_eq!(paint.family, Some(1), "Georgia maps to serif");
+                    let fam = paint.family.expect("a family list");
+                    assert_eq!(crate::fonts::serialize_family_list(&crate::fonts::family_list(fam)), "Georgia, serif");
+                    // Georgia is not installed: the generic serif (Times New Roman → Liberation Serif) is used
+                    let face = crate::fonts::face(&crate::fonts::FontSel::new(fam, 400, false)).map(|f| f.family.clone());
+                    let serif = crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::SERIF, 400, false)).map(|f| f.family.clone());
+                    assert_eq!(face, serif, "Georgia, serif resolves through serif");
                 }
                 continue;
             }
@@ -2197,7 +2202,7 @@ mod tests {
         assert_eq!(paint("a").font_size, Some(20.0), ":is() must distribute");
         assert_eq!(paint("n").color, Some((1, 2, 3)), ":where() must distribute");
         assert_eq!(paint("a").color, None, ":focus-visible/:has must not match");
-        assert_eq!(paint("a").bold, Some(true), ":not(:focus-visible) is a tautology");
+        assert_eq!(paint("a").weight, Some(crate::layout::FontWeight::Abs(700)), ":not(:focus-visible) is a tautology");
     }
 
     /// AETHERSEE helper: the layout box of the element with this id.
@@ -2302,13 +2307,12 @@ mod tests {
         let (r, b, u) = (box_by_id(&tree, "r"), box_by_id(&tree, "b"), box_by_id(&tree, "u"));
         assert!(b.size.width > r.size.width, "bold run measured with the bold face ({} vs {})", b.size.width, r.size.width);
         assert!(u.size.width > r.size.width, "uppercase run measured after its transform");
-        // One resolver: the key distinguishes every face the painter can pick.
-        use crate::fonts::face_key;
-        let keys: std::collections::HashSet<u8> = (0..3u8)
-            .flat_map(|f| [(f, false, false), (f, true, false), (f, false, true), (f, true, true)])
-            .map(|(f, b, i)| face_key(f, b, i))
+        // One resolver: every family x weight x style the painter can pick is its own face.
+        let ids: std::collections::HashSet<u32> = (0..3u16)
+            .flat_map(|f| [(f, 400, false), (f, 700, false), (f, 400, true), (f, 700, true)])
+            .filter_map(|(f, w, i)| crate::fonts::face(&crate::fonts::FontSel::new(f, w, i)).map(|x| x.id))
             .collect();
-        assert_eq!(keys.len(), 12);
+        assert_eq!(ids.len(), 12);
     }
 
     /// Absolute (page) rect of the first element with `id`, after a cascade.
@@ -2400,8 +2404,8 @@ mod tests {
     /// sits half the leading below the line top.
     #[test]
     fn test_line_metrics_kat() {
-        let Some(f) = crate::fonts::face(0, false, false) else { return };
-        let (a, d, g) = crate::fonts::line_metrics(&f, 16.0);
+        let Some(f) = crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::SANS, 400, false)) else { return };
+        let (a, d, g) = crate::fonts::line_metrics(f, 16.0);
         assert_eq!(crate::fonts::line_height(&f, 16.0, 0.0), a + d + g);
         assert_eq!(crate::fonts::baseline_offset(&f, 16.0, 0.0), (g / 2.0).floor() + a);
         assert_eq!(crate::fonts::baseline_offset(&f, 16.0, 2.0), ((32.0 - a - d) / 2.0).floor() + a);
@@ -2419,7 +2423,9 @@ mod tests {
             "body{margin:0}",
         );
         let (f, g, c) = (rect_by_id(&t, "f").unwrap(), rect_by_id(&t, "g").unwrap(), rect_by_id(&t, "c").unwrap());
-        let lh = crate::fonts::face(0, false, false).map(|x| crate::fonts::line_height(&x, 13.333, 0.0)).unwrap_or(15.0);
+        let lh = crate::fonts::face(&crate::fonts::FontSel::new(crate::layout::control_family(), 400, false))
+            .map(|x| crate::fonts::line_height(x, 13.333, 0.0))
+            .unwrap_or(15.0);
         assert_eq!(f.3, lh + 2.0 + 4.0, "field: line + padding + border");
         assert_eq!((g.2, g.3), (200.0, lh + 12.0 + 4.0), "border-box width, padding 6");
         assert_eq!((c.2, c.3), (13.0, 13.0));
@@ -2504,7 +2510,7 @@ mod tests {
     #[test]
     fn test_inline_formatting_context_kat() {
         use crate::layout::inline::Frag;
-        if crate::fonts::face(2, false, false).is_none() {
+        if crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::MONO, 400, false)).is_none() {
             return;
         }
         let css = "body{margin:0} p{margin:0;font:10px monospace;line-height:2;width:100px}";
@@ -2587,7 +2593,7 @@ mod tests {
         assert_eq!(a.0, b.0, "the second row's cell sits in column 2 under the first row's: {a:?} {b:?}");
         assert!((s.3 - (a.3 + b.3)).abs() < 0.5, "the spanning cell is both rows tall: {s:?} {a:?} {b:?}");
         let w = rect_by_id(&t, "w").unwrap();
-        let cw = crate::fonts::face(2, false, false).map(|f| crate::fonts::lines::Advancer::new(&f, 2, 14.0, 0.0).char('a')).unwrap_or(0.0);
+        let cw = crate::fonts::lines::Advancer::new(crate::fonts::FontSel::new(crate::fonts::MONO, 400, false), 14.0, 0.0).char('a');
         assert!(w.2 >= cw * 10.0 - 0.5, "min-content: the unbreakable word keeps its width: {w:?} cw {cw}");
         let (f1, f2, f3) = (rect_by_id(&t, "f1").unwrap(), rect_by_id(&t, "f2").unwrap(), rect_by_id(&t, "f3").unwrap());
         assert_eq!(f1.2, 60.0, "fixed: the first row's 60px column");

@@ -561,18 +561,40 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 }
             }
         }
-        "font-family" => {
-            let v = value.to_ascii_lowercase();
-            let fam = if v.contains("monospace") || v.contains("courier") || v.contains("menlo") || v.contains("consolas") || v.contains("mono") {
-                2
-            } else if v.contains("sans") {
-                0
-            } else if v.contains("serif") || v.contains("georgia") || v.contains("times") || v.contains("libertine") {
-                1
-            } else {
-                0
-            };
-            style.paint.family = Some(fam);
+        // css-fonts-4 §2.1: the family list, interned (fonts::family_list); matched per family at layout.
+        "font-family" => match crate::fonts::parse_family_list(value) {
+            Some(list) => style.paint.family = Some(crate::fonts::intern_family_list(list)),
+            None => {
+                if !is_neutral_keyword(value) {
+                    crate::ledger::record_css(&format!("font-family-value:{}", clip(value)));
+                }
+            }
+        },
+        // css-fonts-4 §2.3
+        "font-stretch" => {
+            if let Some(p) = parse_font_stretch(value) {
+                style.paint.stretch = Some(p);
+            }
+        }
+        // css-text-3 §7.1
+        "word-spacing" => {
+            if value == "normal" {
+                style.paint.word_spacing = Some(0.0);
+            } else if let Some(px) = parse_px(value) {
+                style.paint.word_spacing = Some(px);
+            }
+        }
+        // css-writing-modes-4 §2.1 (the `dir` attribute maps onto it through the UA sheet)
+        "direction" => match value {
+            "rtl" => style.paint.rtl = Some(true),
+            "ltr" => style.paint.rtl = Some(false),
+            _ => {}
+        },
+        // css-text-decor-3 §4: offset-x offset-y [blur] && [color], comma-separated layers.
+        "text-shadow" => {
+            let layers: Vec<crate::render::effects::Shadow> =
+                crate::render::effects::parse_box_shadow(value).into_iter().filter(|s| !s.inset).collect();
+            style.paint.text_shadows = Some(layers);
         }
         // The `font` shorthand: [style] [weight] size[/line-height] family.
         // Legacy pages set their controls entirely through it
@@ -594,13 +616,12 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 let h = head.trim().to_ascii_lowercase();
                 if h == "italic" || h == "oblique" {
                     style.paint.italic = Some(true);
-                } else if h == "normal" || h == "small-caps" || h.starts_with("ultra")
-                    || h.starts_with("extra") || h == "condensed" || h == "expanded"
-                    || h == "semi-condensed" || h == "semi-expanded"
-                {
+                } else if h == "normal" || h == "small-caps" {
                     // no effect here, but still part of the prefix
-                } else if let Some(b) = parse_font_weight(&h) {
-                    style.paint.bold = Some(b);
+                } else if let Some(p) = parse_font_stretch(&h).filter(|_| !h.ends_with('%')) {
+                    style.paint.stretch = Some(p);
+                } else if let Some(w) = parse_font_weight(&h) {
+                    style.paint.weight = Some(w);
                 } else {
                     break;
                 }
@@ -669,7 +690,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             },
         },
         "font-weight" => match parse_font_weight(value) {
-            Some(b) => style.paint.bold = Some(b),
+            Some(w) => style.paint.weight = Some(w),
             None => crate::ledger::record_css(&format!("font-weight-value:{}", clip(value))),
         },
         "visibility" => match value {
@@ -1216,7 +1237,7 @@ fn ledger_rules(rules: &[css_core::stylesheet::CssRule]) {
             CssRule::Media(_, inner) | CssRule::Supports(_, inner) | CssRule::LayerBlock(_, inner) => ledger_rules(inner),
             CssRule::LayerStatement(_) => {}
             CssRule::Import(_) => crate::ledger::record_css("at-rule:@import"),
-            CssRule::FontFace(_) => crate::ledger::record_css("at-rule:@font-face"),
+            CssRule::FontFace(_) => {}
             CssRule::Keyframes(_) => crate::ledger::record_css("at-rule:@keyframes"),
             CssRule::Other(a) => crate::ledger::record_css(&format!("at-rule:@{}", a.name.to_ascii_lowercase())),
         }
@@ -1272,13 +1293,15 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* };
     }
     copy!(
-        background, color, font_size, bold, border, line_height, hidden, clip, underline,
+        background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
+        stretch, word_spacing, rtl,
     );
+    clone!(text_shadows);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {
@@ -1393,6 +1416,8 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     for s in &parsed {
         ledger_rules(&s.rules);
     }
+    // css-fonts-4 §4: the document's @font-face faces (AETHERFONT); a changed set bumps the font caches.
+    crate::fonts::webfont::apply_rules(&parsed, &crate::images::page_base());
     let env = media_environment(vw, vh);
     let supports = |d: &css_core::parser::Declaration| property_supported(&d.name.to_ascii_lowercase());
     let import = |_: &str| -> Option<&css_core::stylesheet::Stylesheet> { None };
@@ -1501,9 +1526,9 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     struct Inh {
         color: (u8, u8, u8),
         font_size: f32,
-        bold: bool,
+        weight: u16,
         italic: bool,
-        family: u8,
+        family: u16,
         line_height: f32,
         text_align: u8,
         underline: bool,
@@ -1546,7 +1571,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     let last = LAST_CASCADE.with(|l| l.borrow().clone());
     any.with_doc(|doc, _| {
         let root = Inh {
-            color: (0, 0, 0), font_size: 16.0, bold: false, italic: false, family: 0, line_height: 0.0,
+            color: (0, 0, 0), font_size: 16.0, weight: 400, italic: false, family: crate::fonts::STANDARD, line_height: 0.0,
             text_align: 0, underline: false, nowrap: false, hidden: false,
         };
         let mut inh: HashMap<html_core::NodeId, Inh> = HashMap::new();
@@ -1559,7 +1584,10 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             let spec = tid.and_then(|t| last.get(&t)).cloned();
             let mut me = parent.clone();
             me.font_size = paint.font_size.unwrap_or_else(|| crate::layout::default_font_size(tag, parent.font_size));
-            me.bold = paint.bold.unwrap_or_else(|| crate::layout::default_bold(tag, parent.bold));
+            me.weight = paint
+                .weight
+                .map(|w| w.resolve(parent.weight))
+                .unwrap_or_else(|| crate::layout::default_weight(tag, parent.weight));
             me.italic = paint.italic.unwrap_or_else(|| crate::layout::default_italic(tag, parent.italic));
             me.family = paint.family.unwrap_or_else(|| crate::layout::default_family(tag, parent.family));
             if let Some(lh) = paint.line_height {
@@ -1608,9 +1636,9 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 rgb(me.color),
                 paint.background.map(rgb).unwrap_or_else(|| "rgba(0, 0, 0, 0)".to_string()),
                 px(me.font_size),
-                if me.bold { "700" } else { "400" }.to_string(),
+                me.weight.to_string(),
                 if me.italic { "italic" } else { "normal" }.to_string(),
-                match me.family { 1 => "serif", 2 => "monospace", _ => "sans-serif" }.to_string(),
+                crate::fonts::serialize_family_list(&crate::fonts::family_list(me.family)),
                 lh,
                 match me.text_align { 1 => "center", 2 => "right", _ => "start" }.to_string(),
                 if me.underline { "underline" } else { "none" }.to_string(),
@@ -1800,7 +1828,8 @@ fn property_supported(prop: &str) -> bool {
             | "border-top" | "border-right" | "border-bottom" | "border-left"
             | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width"
             | "text-decoration" | "text-decoration-line" | "text-transform" | "white-space" | "box-sizing"
-            | "font-family"
+            | "font-family" | "font-style" | "font-stretch" | "letter-spacing" | "word-spacing" | "direction"
+            | "text-shadow"
             | "flex" | "flex-grow" | "flex-shrink" | "flex-basis" | "flex-wrap" | "flex-flow"
             | "gap" | "row-gap" | "column-gap"
     )
@@ -2000,13 +2029,33 @@ pub fn parse_font_size(value: &str) -> Option<f32> {
 }
 
 /// Parses a font-weight into "bold or not".
-pub fn parse_font_weight(value: &str) -> Option<bool> {
+pub fn parse_font_weight(value: &str) -> Option<crate::layout::FontWeight> {
+    use crate::layout::FontWeight;
     let v = value.trim().to_ascii_lowercase();
     match v.as_str() {
-        "bold" | "bolder" => Some(true),
-        "normal" | "lighter" => Some(false),
-        _ => v.parse::<f32>().ok().map(|n| n >= 600.0),
+        "bold" => Some(FontWeight::Abs(700)),
+        "normal" => Some(FontWeight::Abs(400)),
+        "bolder" => Some(FontWeight::Bolder),
+        "lighter" => Some(FontWeight::Lighter),
+        _ => v.parse::<f32>().ok().filter(|n| (1.0..=1000.0).contains(n)).map(|n| FontWeight::Abs(n.round() as u16)),
     }
+}
+
+/// css-fonts-4 §2.3 `font-stretch`: a keyword or a percentage, in percent.
+pub fn parse_font_stretch(value: &str) -> Option<u16> {
+    let v = value.trim().to_ascii_lowercase();
+    Some(match v.as_str() {
+        "normal" => 100,
+        "ultra-condensed" => 50,
+        "extra-condensed" => 63,
+        "condensed" => 75,
+        "semi-condensed" => 88,
+        "semi-expanded" => 113,
+        "expanded" => 125,
+        "extra-expanded" => 150,
+        "ultra-expanded" => 200,
+        p => p.strip_suffix('%')?.trim().parse::<f32>().ok().filter(|x| *x >= 0.0)?.round() as u16,
+    })
 }
 
 /// Parses a length into pixels: px, rem/em (16px base — em is not
@@ -2443,9 +2492,17 @@ mod tests {
         assert_eq!(parse_font_size("110%"), Some(17.6));
         assert_eq!(parse_font_size("medium"), Some(16.0));
         assert_eq!(parse_font_size("banana"), None);
-        assert_eq!(parse_font_weight("bold"), Some(true));
-        assert_eq!(parse_font_weight("400"), Some(false));
-        assert_eq!(parse_font_weight("700"), Some(true));
+        use crate::layout::FontWeight;
+        assert_eq!(parse_font_weight("bold"), Some(FontWeight::Abs(700)));
+        assert_eq!(parse_font_weight("400"), Some(FontWeight::Abs(400)));
+        assert_eq!(parse_font_weight("650"), Some(FontWeight::Abs(650)));
+        assert_eq!(parse_font_weight("bolder"), Some(FontWeight::Bolder));
+        assert_eq!(FontWeight::Bolder.resolve(400), 700);
+        assert_eq!(FontWeight::Bolder.resolve(700), 900);
+        assert_eq!(FontWeight::Lighter.resolve(700), 400);
+        assert_eq!(FontWeight::Lighter.resolve(400), 100);
+        assert_eq!(parse_font_stretch("condensed"), Some(75));
+        assert_eq!(parse_font_stretch("120%"), Some(120));
         assert!(is_neutral_keyword("transparent"));
         assert!(is_neutral_keyword("Inherit"));
         assert!(!is_neutral_keyword("red"));

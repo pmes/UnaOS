@@ -443,6 +443,43 @@ pub fn paint_gradient(
     }
 }
 
+/// Separable Gaussian blur of a coverage mask in place (kernel to 3σ, edges treated as zero) — the
+/// text-shadow blur (σ = blur radius / 2).
+pub fn gaussian_blur(mask: &mut [f32], w: usize, h: usize, sigma: f32) {
+    if sigma <= 0.0 || w == 0 || h == 0 {
+        return;
+    }
+    let r = (sigma * 3.0).ceil() as isize;
+    let k: Vec<f32> = (-r..=r).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
+    let sum: f32 = k.iter().sum();
+    let k: Vec<f32> = k.into_iter().map(|v| v / sum).collect();
+    let mut tmp = vec![0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0;
+            for (j, kv) in k.iter().enumerate() {
+                let xx = x as isize + j as isize - r;
+                if xx >= 0 && (xx as usize) < w {
+                    acc += mask[y * w + xx as usize] * kv;
+                }
+            }
+            tmp[y * w + x] = acc;
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0;
+            for (j, kv) in k.iter().enumerate() {
+                let yy = y as isize + j as isize - r;
+                if yy >= 0 && (yy as usize) < h {
+                    acc += tmp[yy as usize * w + x] * kv;
+                }
+            }
+            mask[y * w + x] = acc;
+        }
+    }
+}
+
 /// One outer box shadow: x/y offset, blur radius, spread, colour.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shadow {

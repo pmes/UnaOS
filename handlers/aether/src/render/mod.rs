@@ -1,11 +1,6 @@
+use crate::fonts::lines::Advancer;
+use crate::fonts::{Face as Font, FontSel};
 use crate::layout::LayoutTree;
-use font_kit::canvas::{Canvas, Format, RasterizationOptions};
-use font_kit::family_name::FamilyName;
-use font_kit::font::Font;
-use font_kit::hinting::HintingOptions;
-use font_kit::properties::Properties;
-use pathfinder_geometry::transform2d::Transform2F;
-use std::sync::Arc;
 use taffy::prelude::*;
 
 /// Inherited paint state carried down the box tree.
@@ -13,8 +8,16 @@ use taffy::prelude::*;
 struct Inherited {
     color: (u8, u8, u8),
     font_size: f32,
-    bold: bool,
+    /// Computed font-weight.
+    weight: u16,
     italic: bool,
+    /// font-stretch, percent.
+    stretch: u16,
+    word_spacing: f32,
+    /// direction: rtl
+    rtl: bool,
+    /// The box whose `text-shadow` is in effect (inherited; `PaintStyle::text_shadows` holds the layers).
+    text_shadow: Option<NodeId>,
     line_height: f32, // multiplier of font size
     underline: bool,
     nowrap: bool,
@@ -27,7 +30,7 @@ struct Inherited {
     shift_y: f32,
     /// list-style-type in effect (layout::PaintStyle::list_style codes).
     list_style: u8,
-    family: u8, // 0 sans, 1 serif, 2 mono
+    family: u16, // fonts::family_list id
     /// The image-replacement idiom: this subtree's text is off-box, but
     /// its boxes and backgrounds still paint.
     text_hidden: bool,
@@ -39,6 +42,27 @@ struct Inherited {
 }
 
 use crate::layout::default_font_size;
+
+impl Inherited {
+    fn sel(&self) -> FontSel {
+        FontSel { family: self.family, weight: self.weight, italic: self.italic, stretch: self.stretch }
+    }
+    /// The measurer/shaper of this text: face stack, size, spacing, direction.
+    fn advancer(&self) -> Advancer {
+        Advancer::new(self.sel(), self.font_size, self.letter_spacing).with_word_spacing(self.word_spacing).with_dir(self.rtl)
+    }
+    fn shadows<'a>(&self, layout: &'a LayoutTree) -> &'a [effects::Shadow] {
+        self.text_shadow
+            .and_then(|n| layout.paint_map.get(&n))
+            .and_then(|p| p.text_shadows.as_deref())
+            .unwrap_or(&[])
+    }
+}
+
+/// The sans-serif selection UI chrome text (media controls) is drawn in.
+fn ui_sel() -> FontSel {
+    FontSel::new(crate::fonts::SANS, 400, false)
+}
 
 /// Screen-space clip rect (x0, y0, x1, y1), already scroll-adjusted.
 type Clip = (f32, f32, f32, f32);
@@ -79,137 +103,123 @@ fn blend_px(surface: &mut [u8], width: u32, x: u32, y: u32, (r, g, b): (u8, u8, 
     }
 }
 
-/// Rasterized-glyph cache: font-kit rasterization dominated scroll
-/// repaints (every damage strip re-rendered every glyph). Keyed by
-/// (bold, glyph id, quarter-px font size); holds the coverage bitmap and
-/// its raster-bounds origin. Cleared implicitly by process lifetime —
-/// glyphs are font-global, not page-scoped.
-type GlyphKey = (u8, u32, u32, u8); // (fonts::face_key, glyph, quarter-px size, subpixel x phase)
-struct CachedGlyph {
-    origin: (i32, i32),
-    w: i32,
-    h: i32,
-    cov: Vec<u8>,
-}
-thread_local! {
-    static GLYPHS: std::cell::RefCell<std::collections::HashMap<GlyphKey, Option<CachedGlyph>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Horizontal subpixel phases a glyph is rasterized at: glyph origins keep
-/// their fractional pen position to a quarter pixel, as Skia positions text
-/// on Linux without hinting (measured on EYES: 0.981 -> 0.983 mean).
-const SUBPX_STEPS: u8 = 4;
-
-/// Draws one glyph with its origin at (x, baseline): the integer pixel
-/// plus a quantized subpixel phase rasterized into the glyph.
+/// Draws `text` shaped (font_core: bidi, fallback, kerning, ligatures) with its pen at
+/// (`origin_x`, `baseline_y`), glyphs at quarter-pixel x phases through Skia's A8 pre-blend for `color`
+/// (fonts::raster). Returns the advance drawn.
 #[allow(clippy::too_many_arguments)]
-fn draw_glyph(
-    font: &Font, font_key: u8, glyph_id: u32, font_size: f32, x: f32, baseline_y: f32, color: (u8, u8, u8),
+fn draw_shaped(
+    text: &str, adv: &Advancer, origin_x: f32, baseline_y: f32, color: (u8, u8, u8),
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) -> f32 {
+    let lut = crate::fonts::raster::preblend(color);
+    let placed = adv.place(text);
+    let mut end = 0.0f32;
+    for (g, x, dy) in &placed {
+        end = end.max(*x - g.dx * adv.size + g.adv * adv.size);
+        crate::fonts::raster::draw_glyph(g.face, g.gid, adv.size, origin_x + x, baseline_y + dy, &lut, &mut |px, py, a| {
+            if px < 0 || py < 0 {
+                return;
+            }
+            let (px, py) = (px as u32, py as u32);
+            if px < width && py < height && in_damage(px, py, damage_rects) && in_clip(px, py, clip) {
+                blend_px(surface, width, px, py, color, a);
+            }
+        });
+    }
+    adv.str(text).max(end)
+}
+
+/// css-text-decor-3 §4: each shadow layer is the text's glyph coverage offset by (dx, dy), blurred by a
+/// Gaussian of σ = blur/2 (Blink's `BlurRadiusToStdDev`), painted in the shadow colour beneath the text,
+/// the first layer topmost.
+#[allow(clippy::too_many_arguments)]
+fn draw_text_shadows(
+    text: &str, adv: &Advancer, origin_x: f32, baseline_y: f32, shadows: &[effects::Shadow],
     surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
 ) {
-    let steps = SUBPX_STEPS;
-    let mut ix = x.floor();
-    let mut sub = ((x - ix) * steps as f32).round() as u8;
-    if sub >= steps {
-        sub = 0;
-        ix += 1.0;
+    if shadows.is_empty() {
+        return;
     }
-    if rasterize_glyph_cached(font, font_key, glyph_id, font_size, sub).is_some() {
-        blit_cached_glyph(font_key, glyph_id, font_size, sub, ix, baseline_y, color, surface, width, height, damage_rects, clip);
-    }
-}
-
-fn rasterize_glyph_cached(
-    font: &Font,
-    font_key: u8,
-    glyph_id: u32,
-    font_size: f32,
-    sub: u8,
-) -> Option<(i32, i32, i32, i32)> {
-    let key = (font_key, glyph_id, (font_size * 4.0) as u32, sub);
-    let steps = SUBPX_STEPS;
-    let shift = Transform2F::from_translation(pathfinder_geometry::vector::Vector2F::new(sub as f32 / steps as f32, 0.0));
-    GLYPHS.with(|g| {
-        if !g.borrow().contains_key(&key) {
-            let computed = (|| {
-                let bounds = font
-                    .raster_bounds(
-                        glyph_id,
-                        font_size,
-                        shift,
-                        HintingOptions::None,
-                        RasterizationOptions::GrayscaleAa,
-                    )
-                    .ok()?;
-                if bounds.size().x() <= 0 || bounds.size().y() <= 0 {
-                    return None;
-                }
-                let mut canvas = Canvas::new(bounds.size(), Format::A8);
-                font.rasterize_glyph(
-                    &mut canvas,
-                    glyph_id,
-                    font_size,
-                    Transform2F::from_translation(-bounds.origin().to_f32()) * shift,
-                    HintingOptions::None,
-                    RasterizationOptions::GrayscaleAa,
-                )
-                .ok()?;
-                let cov = canvas.pixels;
-                Some(CachedGlyph {
-                    origin: (bounds.origin().x(), bounds.origin().y()),
-                    w: bounds.size().x(),
-                    h: bounds.size().y(),
-                    cov,
-                })
-            })();
-            g.borrow_mut().insert(key, computed);
+    let placed = adv.place(text);
+    for sh in shadows.iter().rev() {
+        let sigma = (sh.blur / 2.0).max(0.0);
+        let pad = (sigma * 3.0).ceil() as i32 + 1;
+        // the coverage mask of the run, in a box around its ink
+        let lw = adv.str(text);
+        let x0 = (origin_x + sh.dx).floor() as i32 - pad - 2;
+        let y0 = (baseline_y + sh.dy - adv.size * 1.5).floor() as i32 - pad;
+        let mw = (lw + adv.size).ceil() as i32 + 2 * pad + 4;
+        let mh = (adv.size * 2.5).ceil() as i32 + 2 * pad;
+        if mw <= 0 || mh <= 0 || mw as i64 * mh as i64 > 1 << 24 {
+            continue;
         }
-        g.borrow()
-            .get(&key)
-            .and_then(|o| o.as_ref())
-            .map(|c| (c.origin.0, c.origin.1, c.w, c.h))
-    })
-}
-
-/// Blends one cached glyph's coverage at (px_x baseline-relative already applied by caller).
-#[allow(clippy::too_many_arguments)]
-fn blit_cached_glyph(
-    font_key: u8,
-    glyph_id: u32,
-    font_size: f32,
-    sub: u8,
-    origin_x: f32,
-    baseline_y: f32,
-    color: (u8, u8, u8),
-    surface: &mut [u8],
-    width: u32,
-    height: u32,
-    damage_rects: &[(u32, u32, u32, u32)],
-    clip: Clip,
-) {
-    let key = (font_key, glyph_id, (font_size * 4.0) as u32, sub);
-    GLYPHS.with(|g| {
-        let g = g.borrow();
-        let Some(Some(c)) = g.get(&key) else { return };
-        for row in 0..c.h {
-            for col in 0..c.w {
-                let cov = c.cov[(row * c.w + col) as usize];
-                if cov == 0 {
+        let mut mask = vec![0f32; (mw * mh) as usize];
+        let ident: [u8; 256] = std::array::from_fn(|i| i as u8);
+        for (g, x, dy) in &placed {
+            crate::fonts::raster::draw_glyph(g.face, g.gid, adv.size, origin_x + sh.dx + x, baseline_y + sh.dy + dy, &ident, &mut |px, py, a| {
+                let (mx, my) = (px - x0, py - y0);
+                if mx >= 0 && my >= 0 && mx < mw && my < mh {
+                    let m = &mut mask[(my * mw + mx) as usize];
+                    *m = (*m + a as f32 / 255.0).min(1.0);
+                }
+            });
+        }
+        if sigma > 0.0 {
+            effects::gaussian_blur(&mut mask, mw as usize, mh as usize, sigma);
+        }
+        let c = sh.color.0;
+        for my in 0..mh {
+            for mx in 0..mw {
+                let a = mask[(my * mw + mx) as usize] * sh.color.1;
+                if a <= 0.0 {
                     continue;
                 }
-                let dst_x = origin_x + (c.origin.0 + col) as f32;
-                let dst_y = baseline_y + (c.origin.1 + row) as f32;
-                if dst_x < 0.0 || dst_y < 0.0 {
+                let (px, py) = (x0 + mx, y0 + my);
+                if px < 0 || py < 0 {
                     continue;
                 }
-                let (px, py) = (dst_x as u32, dst_y as u32);
+                let (px, py) = (px as u32, py as u32);
                 if px < width && py < height && in_damage(px, py, damage_rects) && in_clip(px, py, clip) {
-                    blend_px(surface, width, px, py, color, cov);
+                    blend_px(surface, width, px, py, c, (a * 255.0).round().min(255.0) as u8);
                 }
             }
         }
-    });
+    }
+}
+
+/// Text decoration lines of one painted span from `x0` to `x1` at `baseline` (css-text-decor-3 §2, the
+/// face's `post` metrics as Blink uses them: fonts::decoration_metrics).
+#[allow(clippy::too_many_arguments)]
+fn draw_decorations(
+    face: &Font, size: f32, deco: Deco, x0: f32, x1: f32, baseline: f32, color: (u8, u8, u8),
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    if !(deco.underline || deco.line_through) || x1 <= x0 {
+        return;
+    }
+    let m = crate::fonts::decoration_metrics(face, size);
+    let mut hline = |top: f32, thick: f32| {
+        let yi = top.round() as i32;
+        for dy in 0..thick.round().max(1.0) as i32 {
+            let yy = yi + dy;
+            if yy < 0 || yy as u32 >= height {
+                continue;
+            }
+            let xa = x0.max(0.0).round() as u32;
+            let xb = (x1.max(0.0).round() as u32).min(width);
+            for x in xa..xb {
+                if in_damage(x, yy as u32, damage_rects) && in_clip(x, yy as u32, clip) {
+                    put_px(surface, width, x, yy as u32, color);
+                }
+            }
+        }
+    };
+    if deco.underline {
+        hline(baseline + m.underline_offset, m.thickness);
+    }
+    if deco.line_through {
+        hline(baseline - m.line_through_offset, m.thickness);
+    }
 }
 
 /// How one background (or mask) layer maps onto a box: the painted image
@@ -453,9 +463,7 @@ fn draw_text(
     origin_x: f32,
     origin_y: f32,
     max_width: f32,
-    font: &Font,
-    font_key: u8,
-    font_size: f32,
+    adv: &Advancer,
     line_height_mult: f32,
     color: (u8, u8, u8),
     underline: bool,
@@ -467,15 +475,18 @@ fn draw_text(
 ) {
     let deco = Deco { underline, line_through: false };
     draw_lines(
-        text, origin_x, origin_y, max_width, font, font_key, font_size, line_height_mult, color,
-        &crate::fonts::lines::TextMode::default(), deco, surface, width, height, damage_rects, clip,
+        text, origin_x, origin_y, max_width, adv, line_height_mult, color,
+        &crate::fonts::lines::TextMode::default(), deco, &[], surface, width, height, damage_rects, clip,
     );
 }
 
 /// The inherited paint state of an element's subtree: font, colour,
 /// decorations, white-space, list style, super/sub shift (CSS 2.2 §6.2,
 /// with the html.css UA defaults by tag).
-fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle, dom_node: &crate::dom::NodeRef) {
+fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle, dom_node: &crate::dom::NodeRef, node: NodeId) {
+    if spec.text_shadows.is_some() {
+        inherited.text_shadow = Some(node);
+    }
     let parent_font_size = inherited.font_size;
     let own_family = spec
         .family
@@ -483,9 +494,19 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     inherited.font_size = spec.used_font_size.or(spec.font_size).unwrap_or_else(|| {
         crate::layout::ua_font_size(tag, inherited.font_size, inherited.family, own_family)
     });
-    inherited.bold = spec.bold.unwrap_or_else(|| crate::layout::default_bold(tag, inherited.bold));
+    inherited.weight = spec
+        .weight
+        .map(|w| w.resolve(inherited.weight))
+        .unwrap_or_else(|| crate::layout::default_weight(tag, inherited.weight));
     inherited.italic =
         spec.italic.unwrap_or_else(|| crate::layout::default_italic(tag, inherited.italic));
+    if let Some(st) = spec.stretch {
+        inherited.stretch = st;
+    }
+    if let Some(ws) = spec.word_spacing {
+        inherited.word_spacing = ws;
+    }
+    inherited.rtl = spec.rtl.unwrap_or_else(|| crate::layout::default_rtl(dom_node, inherited.rtl));
     inherited.family = spec
         .family
         .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
@@ -548,71 +569,29 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
 }
 
 /// Draws one line's worth of text with its baseline at `baseline_y` — an
-/// inline formatting context's text fragment (layout::inline).
+/// inline formatting context's text fragment (layout::inline): shadows,
+/// then the shaped glyphs, then decorations spanning the fragment.
 #[allow(clippy::too_many_arguments)]
 fn draw_glyph_run(
     text: &str,
     origin_x: f32,
     baseline_y: f32,
-    font: &Font,
-    font_key: u8,
-    font_size: f32,
-    letter_spacing: f32,
+    adv: &Advancer,
     color: (u8, u8, u8),
     deco: Deco,
+    shadows: &[effects::Shadow],
     surface: &mut [u8],
     width: u32,
     height: u32,
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let adv = crate::fonts::lines::Advancer::new(font, font_key, font_size, letter_spacing);
-    let mut pen_x = 0.0f32;
-    for c in text.chars() {
-        let advance = adv.char(c);
-        if c != ' ' {
-            if let Some(glyph_id) = font.glyph_for_char(c).filter(|&g| g != 0) {
-                draw_glyph(
-                    font, font_key, glyph_id, font_size, origin_x + pen_x, baseline_y, color, surface, width, height,
-                    damage_rects, clip,
-                );
-            } else if let Some((ff, fk)) = crate::fonts::fallback_for(c, crate::fonts::key_is_bold(font_key)) {
-                if let Some(g) = ff.glyph_for_char(c) {
-                    draw_glyph(&ff, fk, g, font_size, origin_x + pen_x, baseline_y, color, surface, width, height, damage_rects, clip);
-                }
-            }
-        }
-        pen_x += advance;
-    }
-    if !(deco.underline || deco.line_through) {
-        return;
-    }
-    let (a_px, _, _) = crate::fonts::line_metrics(font, font_size);
-    let thick = (font_size / 16.0).round().max(1.0) as i32;
-    // The fragment's spaces are inside its inline box (the line's hanging
-    // spaces were already removed by layout), so the decoration spans them.
-    let (x0, x1) = (origin_x, origin_x + pen_x);
-    let mut hline = |y: f32| {
-        let yi = y.round() as i32;
-        for dy in 0..thick {
-            let yy = yi + dy;
-            if yy < 0 || yy as u32 >= height {
-                continue;
-            }
-            let xa = x0.max(0.0).round() as u32;
-            let xb = (x1.max(0.0).round() as u32).min(width);
-            for x in xa..xb {
-                if in_damage(x, yy as u32, damage_rects) && in_clip(x, yy as u32, clip) {
-                    put_px(surface, width, x, yy as u32, color);
-                }
-            }
-        }
-    };
-    if deco.underline && x1 > x0 {
-        hline(baseline_y + (font_size / 9.0).max(1.0));
-    }
-    if deco.line_through && x1 > x0 {
-        hline(baseline_y - a_px * 0.3);
+    draw_text_shadows(text, adv, origin_x, baseline_y, shadows, surface, width, height, damage_rects, clip);
+    let w = draw_shaped(text, adv, origin_x, baseline_y, color, surface, width, height, damage_rects, clip);
+    if let Some(face) = crate::fonts::face(&adv.sel) {
+        // The fragment's spaces are inside its inline box (the line's hanging
+        // spaces were already removed by layout), so the decoration spans them.
+        draw_decorations(face, adv.size, deco, origin_x, origin_x + w, baseline_y, color, surface, width, height, damage_rects, clip);
     }
 }
 
@@ -687,71 +666,34 @@ fn draw_lines(
     origin_x: f32,
     origin_y: f32,
     max_width: f32,
-    font: &Font,
-    font_key: u8,
-    font_size: f32,
+    adv: &Advancer,
     line_height_mult: f32,
     color: (u8, u8, u8),
     mode: &crate::fonts::lines::TextMode,
     deco: Deco,
+    shadows: &[effects::Shadow],
     surface: &mut [u8],
     width: u32,
     height: u32,
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let ascent = crate::fonts::baseline_offset(font, font_size, line_height_mult);
-    let line_height = crate::fonts::line_height(font, font_size, line_height_mult);
-    let adv = crate::fonts::lines::Advancer::new(font, font_key, font_size, mode.letter_spacing);
-    let lines = crate::fonts::lines::break_lines(&adv, text, mode, max_width);
-    let (a_px, _, _) = crate::fonts::line_metrics(font, font_size);
-    let hline = |x0: f32, x1: f32, y: f32, thick: u32, surface: &mut [u8]| {
-        let yi = y.round() as i32;
-        for dy in 0..thick as i32 {
-            let yy = yi + dy;
-            if yy < 0 || yy as u32 >= height {
-                continue;
-            }
-            let x0 = x0.max(0.0).round() as u32;
-            let x1 = (x1.max(0.0).round() as u32).min(width);
-            for x in x0..x1 {
-                if in_damage(x, yy as u32, damage_rects) && in_clip(x, yy as u32, clip) {
-                    put_px(surface, width, x, yy as u32, color);
-                }
-            }
-        }
-    };
-    let thick = (font_size / 16.0).round().max(1.0) as u32;
+    let Some(font) = crate::fonts::face(&adv.sel) else { return };
+    let size = adv.size;
+    let ascent = crate::fonts::baseline_offset(font, size, line_height_mult);
+    let line_height = crate::fonts::line_height(font, size, line_height_mult);
+    let lines = crate::fonts::lines::break_lines(adv, text, mode, max_width);
     for (i, line) in lines.iter().enumerate() {
         let baseline_y = origin_y + i as f32 * line_height + ascent;
-        let mut pen_x = 0.0f32;
-        for c in line.text.chars() {
-            let advance = adv.char(c);
-            if c != ' ' {
-                if let Some(glyph_id) = font.glyph_for_char(c).filter(|&g| g != 0) {
-                    draw_glyph(
-                        font, font_key, glyph_id, font_size, origin_x + pen_x, baseline_y, color, surface, width,
-                        height, damage_rects, clip,
-                    );
-                } else if let Some((ff, fk)) = crate::fonts::fallback_for(c, crate::fonts::key_is_bold(font_key)) {
-                    if let Some(g) = ff.glyph_for_char(c) {
-                        draw_glyph(&ff, fk, g, font_size, origin_x + pen_x, baseline_y, color, surface, width, height, damage_rects, clip);
-                    }
-                }
-            }
-            pen_x += advance;
-        }
+        draw_text_shadows(&line.text, adv, origin_x, baseline_y, shadows, surface, width, height, damage_rects, clip);
+        draw_shaped(&line.text, adv, origin_x, baseline_y, color, surface, width, height, damage_rects, clip);
         // Decorations span the line's ink extent (leading/trailing
         // collapsible spaces excluded).
-        let lead_w: f32 = line.text.chars().take_while(|c| *c == ' ').map(|c| adv.char(c)).sum();
-        let trail_w: f32 = line.text.chars().rev().take_while(|c| *c == ' ').map(|c| adv.char(c)).sum();
+        let lead = &line.text[..line.text.len() - line.text.trim_start_matches(' ').len()];
+        let trail = &line.text[line.text.trim_end_matches(' ').len()..];
+        let (lead_w, trail_w) = (adv.str(lead), adv.str(trail));
         let (x0, x1) = (origin_x + lead_w, origin_x + (line.width - trail_w).max(lead_w));
-        if deco.underline && x1 > x0 {
-            hline(x0, x1, baseline_y + (font_size / 9.0).max(1.0), thick, surface);
-        }
-        if deco.line_through && x1 > x0 {
-            hline(x0, x1, baseline_y - a_px * 0.3, thick, surface);
-        }
+        draw_decorations(font, size, deco, x0, x1, baseline_y, color, surface, width, height, damage_rects, clip);
     }
 }
 
@@ -825,10 +767,11 @@ pub(crate) fn marker_text(style: u8, n: i64) -> String {
 /// the marker text in the item's font, ending at the content edge.
 #[allow(clippy::too_many_arguments)]
 fn paint_marker(
-    li: &crate::dom::NodeRef, style: u8, content_x: f32, baseline: f32, font: &Font, key: u8, fs: f32,
+    li: &crate::dom::NodeRef, style: u8, content_x: f32, baseline: f32, adv: &Advancer,
     color: (u8, u8, u8), surface: &mut [u8], width: u32, height: u32,
     damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
 ) {
+    let fs = adv.size;
     if (1..=3).contains(&style) {
         let d = (fs * 0.31).round().max(3.0);
         let x = (content_x - fs).round();
@@ -852,11 +795,8 @@ fn paint_marker(
         return;
     }
     let text = marker_text(style, list_ordinal(li));
-    let adv = crate::fonts::lines::Advancer::new(font, key, fs, 0.0);
     let w = adv.str(&text);
-    let mode = crate::fonts::lines::TextMode { white_space: 2, ..Default::default() };
-    let top = baseline - crate::fonts::baseline_offset(font, fs, 0.0);
-    draw_lines(&text, content_x - w, top, f32::MAX, font, key, fs, 0.0, color, &mode, Deco::default(), surface, width, height, damage_rects, clip);
+    draw_shaped(&text, adv, content_x - w, baseline, color, surface, width, height, damage_rects, clip);
 }
 
 /// A checkbox or radio at Chromium's control-theme look: 13x13, a 1px
@@ -925,24 +865,10 @@ fn paint_checkable(
 }
 
 /// Single-line advance width of `text`, measured EXACTLY the way `draw_text`
-/// lays it out (per-glyph advances, one space-glyph advance between
-/// words). Centering a control label with any other measurement drifts.
-fn measure_text_width(text: &str, font: &Font, font_size: f32) -> f32 {
-    let metrics = font.metrics();
-    let scale = font_size / metrics.units_per_em as f32;
-    let space = crate::fonts::space_advance(font, font_size);
-    let mut total = 0.0f32;
-    let mut words = 0u32;
-    for word in text.split_whitespace() {
-        total += word
-            .chars()
-            .filter_map(|c| font.glyph_for_char(c))
-            .filter_map(|g| font.advance(g).ok())
-            .map(|a| a.x() * scale)
-            .sum::<f32>();
-        words += 1;
-    }
-    total + space * words.saturating_sub(1) as f32
+/// lays it out (whitespace collapsed, shaped). Centering a control label
+/// with any other measurement drifts.
+fn measure_text_width(text: &str, adv: &Advancer) -> f32 {
+    adv.str(&text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// (ascent, descent) in pixels at `font_size` — descent is positive-down, so
@@ -1063,7 +989,7 @@ fn paint_media(
     media: &crate::media::Paint,
     spec: &crate::layout::PaintStyle,
     content: (f32, f32, f32, f32),
-    font: &Option<Arc<Font>>,
+    font: &Option<&'static Font>,
     surface: &mut [u8],
     width: u32,
     height: u32,
@@ -1096,7 +1022,7 @@ fn paint_media(
             let fs = 13.0;
             draw_text(
                 err, cx + 8.0, centered_line_origin_y(font, fs, cy + ch.min(40.0) / 2.0), (cw - 16.0).max(1.0),
-                font, 0, fs, 1.2, (255, 255, 255), false, surface, width, height, damage_rects,
+                &Advancer::new(ui_sel(), fs, 0.0), 1.2, (255, 255, 255), false, surface, width, height, damage_rects,
                 (cx.max(clip.0), cy.max(clip.1), (cx + cw).min(clip.2), (cy + ch).min(clip.3)),
             );
         }
@@ -1186,10 +1112,10 @@ fn paint_media(
         let mut track_x0 = bx + 22.0;
         if let Some(font) = font {
             let fs = 12.0;
-            let tw = measure_text_width(&label, font, fs);
+            let tw = measure_text_width(&label, &Advancer::new(ui_sel(), fs, 0.0));
             if cw > tw + 80.0 {
                 draw_text(
-                    &label, track_x0, centered_line_origin_y(font, fs, mid), tw + 2.0, font, 0, fs, 1.2,
+                    &label, track_x0, centered_line_origin_y(font, fs, mid), tw + 2.0, &Advancer::new(ui_sel(), fs, 0.0), 1.2,
                     white, false, surface, width, height, damage_rects, clip,
                 );
                 track_x0 += tw + 10.0;
@@ -1218,7 +1144,7 @@ fn paint_media(
 fn paint_audio_controls(
     media: &crate::media::Paint,
     content: (f32, f32, f32, f32),
-    font: &Option<Arc<Font>>,
+    font: &Option<&'static Font>,
     surface: &mut [u8],
     width: u32,
     height: u32,
@@ -1284,8 +1210,8 @@ fn paint_audio_controls(
     let label = format!("{} / {}", crate::media::clock_text(media.pts_ns), crate::media::clock_text(media.duration_ns as i64));
     if let Some(font) = font {
         let fs = 13.0;
-        let tw = measure_text_width(&label, font, fs);
-        draw_text(&label, cx + 47.0, centered_line_origin_y(font, fs, mid), tw + 2.0, font, 0, fs, 1.2, (31, 31, 31), false, surface, width, height, damage_rects, lim);
+        let tw = measure_text_width(&label, &Advancer::new(ui_sel(), fs, 0.0));
+        draw_text(&label, cx + 47.0, centered_line_origin_y(font, fs, mid), tw + 2.0, &Advancer::new(ui_sel(), fs, 0.0), 1.2, (31, 31, 31), false, surface, width, height, damage_rects, lim);
     }
     // the timeline
     let (t0, t1) = (cx + 129.0, right - 91.0);
@@ -1357,14 +1283,8 @@ pub fn render_frame(
         }
     }
 
-    let font_engine = crate::fonts::FontEngine::new();
-    let font = font_engine.load_font(&[FamilyName::SansSerif], &Properties::new());
-    let font_bold = font_engine
-        .load_font(
-            &[FamilyName::SansSerif],
-            Properties::new().weight(font_kit::properties::Weight::BOLD),
-        )
-        .or_else(|| font.clone());
+    let font = crate::fonts::face(&FontSel::new(crate::fonts::SANS, 400, false));
+    let font_bold = crate::fonts::face(&FontSel::new(crate::fonts::SANS, 700, false));
 
     let sy = scroll_y as i32;
     let sx = scroll_x as i32;
@@ -1381,8 +1301,8 @@ pub fn render_frame(
         abs_y: f32,
         inherited: Inherited,
         layout: &LayoutTree,
-        font: &Option<Arc<Font>>,
-        font_bold: &Option<Arc<Font>>,
+        font: &Option<&'static Font>,
+        font_bold: &Option<&'static Font>,
         surface: &mut [u8],
         width: u32,
         height: u32,
@@ -1479,7 +1399,7 @@ pub fn render_frame(
             if let Some(n) = layout.node_map.get(&c) {
                 if let Some(el) = n.as_element() {
                     let spec = p.cloned().unwrap_or_default();
-                    inherit_element(&mut cinh, el.name.local.as_ref(), &spec, n);
+                    inherit_element(&mut cinh, el.name.local.as_ref(), &spec, n, c);
                 }
             }
             let cclip = if p.and_then(|p| p.clip).unwrap_or(false) {
@@ -1515,7 +1435,7 @@ pub fn render_frame(
             if let Some(dn) = layout.node_map.get(&p) {
                 if let Some(el) = dn.as_element() {
                     let spec = layout.paint_map.get(&p).cloned().unwrap_or_default();
-                    inherit_element(&mut inh, el.name.local.as_ref(), &spec, dn);
+                    inherit_element(&mut inh, el.name.local.as_ref(), &spec, dn, p);
                 }
             }
         }
@@ -1530,8 +1450,8 @@ pub fn render_frame(
         abs_y: f32,
         inherited: Inherited,
         layout: &LayoutTree,
-        font: &Option<Arc<Font>>,
-        font_bold: &Option<Arc<Font>>,
+        font: &Option<&'static Font>,
+        font_bold: &Option<&'static Font>,
         surface: &mut [u8],
         width: u32,
         height: u32,
@@ -1598,7 +1518,7 @@ pub fn render_frame(
 
             if let Some(el) = dom_node.as_element() {
                 let tag = el.name.local.as_ref();
-                inherit_element(&mut inherited, tag, &spec, dom_node);
+                inherit_element(&mut inherited, tag, &spec, dom_node, node_id);
 
                 let bw = layout_box.size.width.max(0.0);
                 let bh = layout_box.size.height.max(0.0);
@@ -1896,19 +1816,18 @@ pub fn render_frame(
                     // content box's top-left, in the monospace control font.
                     let text = dom_node.text_contents();
                     let fs = inherited.font_size;
-                    if let Some(f) = crate::fonts::face(inherited.family, inherited.bold, inherited.italic) {
-                        let mode = crate::fonts::lines::TextMode { white_space: 3, ..Default::default() };
-                        draw_lines(
-                            text.trim_start_matches('\n'), content_x, content_y, content_w.max(1.0), &f,
-                            crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
-                            fs, 0.0, spec.color.unwrap_or((0, 0, 0)), &mode, Deco::default(),
-                            surface, width, height, damage_rects, clip,
-                        );
-                    }
+                    let _ = fs;
+                    let mode = crate::fonts::lines::TextMode { white_space: 3, ..Default::default() };
+                    draw_lines(
+                        text.trim_start_matches('\n'), content_x, content_y, content_w.max(1.0), &inherited.advancer(),
+                        0.0, spec.color.unwrap_or((0, 0, 0)), &mode, Deco::default(), &[],
+                        surface, width, height, damage_rects, clip,
+                    );
                 }
                 if is_control && tag != "button" && !checkable && tag != "textarea" {
-                    let face = crate::fonts::face(inherited.family, inherited.bold, inherited.italic);
-                    if let Some(font) = face.as_ref().or(font.as_ref()) {
+                    let face = crate::fonts::face(&inherited.sel());
+                    if let Some(font) = face.or(*font) {
+                        let adv = inherited.advancer();
                         let attrs = el.attributes.borrow();
                         // A <select> paints the SELECTED OPTION'S TEXT, not
                         // its submit value: layout publishes the visible label
@@ -1932,7 +1851,7 @@ pub fn render_frame(
                         let value_color = if is_placeholder { (117, 117, 117) } else { spec.color.unwrap_or((0, 0, 0)) };
                         if !value.is_empty() {
                             let fs = inherited.font_size;
-                            let text_w = measure_text_width(&value, font, fs);
+                            let text_w = measure_text_width(&value, &adv);
                             // <input>/<select> are single-line by definition —
                             // their value rides the vertical middle however
                             // tall the author makes the box, which is what
@@ -1962,9 +1881,7 @@ pub fn render_frame(
                                 tx,
                                 ty,
                                 max_w,
-                                font,
-                                crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
-                                fs,
+                                &adv,
                                 0.0,
                                 value_color,
                                 false,
@@ -2054,16 +1971,17 @@ pub fn render_frame(
                 // its first line's baseline, ending at the content edge.
                 let is_item = spec.list_item.unwrap_or(tag == "li");
                 if is_item && inherited.list_style != 0 && !inherited.text_hidden {
-                    if let Some(f) = crate::fonts::face(inherited.family, inherited.bold, inherited.italic) {
+                    if let Some(f) = crate::fonts::face(&inherited.sel()) {
                         let fs = inherited.font_size;
                         let base = match layout.inline.get(&node_id).and_then(|l| l.first_baseline) {
                             Some(b) => content_y + b,
-                            None => content_y + crate::fonts::baseline_offset(&f, fs, inherited.line_height),
+                            None => content_y + crate::fonts::baseline_offset(f, fs, inherited.line_height),
                         };
+                        // ::marker text is unaffected by the item's letter/word spacing
+                        let adv = Advancer::new(inherited.sel(), fs, 0.0).with_dir(inherited.rtl);
                         paint_marker(
-                            dom_node, inherited.list_style, content_x, base, &f,
-                            crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
-                            fs, inherited.color, surface, width, height, damage_rects, clip,
+                            dom_node, inherited.list_style, content_x, base.round(), &adv,
+                            inherited.color, surface, width, height, damage_rects, clip,
                         );
                     }
                 }
@@ -2071,14 +1989,8 @@ pub fn render_frame(
                 // The same face the measurer wrapped this run with
                 // (fonts::face): family x weight x style. The preloaded sans
                 // pair is only the fallback when no face loads at all.
-                let face = crate::fonts::face(inherited.family, inherited.bold, inherited.italic);
-                let font = if face.is_some() {
-                    &face
-                } else if inherited.bold {
-                    font_bold
-                } else {
-                    font
-                };
+                let face = crate::fonts::face(&inherited.sel());
+                let font = face.or(if inherited.weight >= 600 { *font_bold } else { *font });
                 if let Some(font) = font {
                     let text = dom_node.text_contents();
                     if !text.trim().is_empty() || inherited.white_space >= 2 || layout.paint_map.get(&node_id).and_then(|p| p.ws_lead) == Some(true) {
@@ -2089,9 +2001,12 @@ pub fn render_frame(
                             word_break: inherited.word_break,
                             overflow_wrap: inherited.overflow_wrap,
                             letter_spacing: inherited.letter_spacing,
+                            word_spacing: inherited.word_spacing,
+                            rtl: inherited.rtl,
                             lead: spec_t.and_then(|p| p.ws_lead).unwrap_or(false),
                             trail: spec_t.and_then(|p| p.ws_trail).unwrap_or(false),
                         };
+                        let adv = inherited.advancer();
                         if inherited.nowrap && mode.white_space == 0 {
                             mode.white_space = 1;
                         }
@@ -2100,9 +2015,7 @@ pub fn render_frame(
                         // content box — but only when the measured run fits on
                         // one line inside it, so a button wrapping rich or
                         // overflowing content keeps normal flow painting.
-                        let fkey = crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic);
                         let centered = inherited.center_box.and_then(|(cx, cy, cw, ch)| {
-                            let adv = crate::fonts::lines::Advancer::new(font, fkey, inherited.font_size, mode.letter_spacing);
                             let tw = crate::fonts::lines::break_lines(&adv, &text, &mode, f32::MAX)[0].width;
                             (tw <= cw && cw > 0.0).then(|| {
                                 (
@@ -2131,13 +2044,12 @@ pub fn render_frame(
                             tx,
                             ty,
                             max_w,
-                            font,
-                            fkey,
-                            inherited.font_size,
+                            &adv,
                             inherited.line_height,
                             inherited.color,
                             &mode,
                             Deco { underline: inherited.underline, line_through: inherited.line_through },
+                            inherited.shadows(layout),
                             surface,
                             width,
                             height,
@@ -2282,7 +2194,7 @@ pub fn render_frame(
                             // Atomic boxes compute their own state in draw_node.
                             inh.insert(k, parent);
                             if !crate::layout::inline::is_atomic_pub(layout, k) {
-                                inherit_element(&mut i, tag, &spec, n);
+                                inherit_element(&mut i, tag, &spec, n, k);
                                 i.shift_y = 0.0;
                                 inh.insert(k, i);
                                 recurse = true;
@@ -2397,18 +2309,14 @@ pub fn render_frame(
                         if i.text_hidden {
                             continue;
                         }
-                        let Some(face) = crate::fonts::face(i.family, i.bold, i.italic) else { continue };
-                        let key = crate::fonts::face_key(i.family, i.bold, i.italic);
                         draw_glyph_run(
                             text,
                             content_x + x - sx as f32,
                             (exact_content_y + baseline).round() - sy as f32,
-                            &face,
-                            key,
-                            i.font_size,
-                            i.letter_spacing,
+                            &i.advancer(),
                             i.color,
                             Deco { underline: i.underline, line_through: i.line_through },
+                            i.shadows(layout),
                             surface,
                             width,
                             height,
@@ -2452,8 +2360,12 @@ pub fn render_frame(
     let root_inherited = Inherited {
         color: (0, 0, 0),
         font_size: 16.0,
-        bold: false,
+        weight: 400,
         italic: false,
+        stretch: 100,
+        word_spacing: 0.0,
+        rtl: false,
+        text_shadow: None,
         line_height: 0.0, // natural
         underline: false,
         nowrap: false,
@@ -2464,7 +2376,7 @@ pub fn render_frame(
         line_through: false,
         shift_y: 0.0,
         list_style: 1,
-        family: 1, // the default standard font is serif (Times New Roman)
+        family: crate::fonts::STANDARD, // the default standard font (Times New Roman)
         text_hidden: false,
         text_transform: 0,
         center_box: None,

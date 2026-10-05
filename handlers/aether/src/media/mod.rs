@@ -672,7 +672,17 @@ pub fn seek(node: &NodeRef, position_ns: u64) -> bool {
 /// has finished fetching (their held-back opening request, or a `MediaError` for the key when
 /// the fetch failed: it comes back over the bus and paints in the box).
 pub fn take_outbox() -> Vec<SMessage> {
-    let done: Vec<(String, Result<(), String>)> = std::mem::take(&mut *FETCHED.lock().unwrap());
+    // FETCHED is process-wide while the elements are this thread's page: take only the results this
+    // page is waiting for, so another engine (another test thread) draining its own outbox cannot
+    // swallow them (the AETHERFONT join found that race in the parallel test run).
+    let mine: HashSet<String> =
+        MEDIA.with(|m| m.borrow().elements.iter().filter(|e| e.fetching).map(|e| e.src.clone()).collect());
+    let done: Vec<(String, Result<(), String>)> = {
+        let mut f = FETCHED.lock().unwrap();
+        let (take, keep): (Vec<_>, Vec<_>) = f.drain(..).partition(|(src, _)| mine.contains(src));
+        *f = keep;
+        take
+    };
     MEDIA.with(|m| {
         let mut r = m.borrow_mut();
         let title = r.title.clone();
