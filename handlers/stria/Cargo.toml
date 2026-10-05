@@ -14,6 +14,8 @@ license = "LGPL-3.0-or-later"
 [dependencies]
 bandy = { path = "../../libs/bandy" }
 resonance = { path = "../../libs/resonance" }
+# PLAYBACK (SR26): the A/V pipeline pieces (dsp::demux, dsp::video, dsp::avsync, dsp::audio_track).
+gneiss_pal = { path = "../../libs/gneiss_pal" }
 tokio = { version = "1.53", features = ["rt", "sync", "time", "macros"] }
 anyhow = "1.0"
 log = "0.4"

@@ -56,4 +56,11 @@ pub trait AudioNode {
     fn set_param(&mut self, _id: usize, _value: f64) {
         // Default implementation does nothing.
     }
+
+    /// Output channels this node writes: 1 (mono, the default) or 2 (stereo — AUDIOTRACK,
+    /// LEDGER SR45). A stereo node gets two output buffers, left then right; a mono node gets
+    /// one and the graph copies it to the right channel. Inputs stay mono (the left channel).
+    fn channels(&self) -> usize {
+        1
+    }
 }

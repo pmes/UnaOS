@@ -12,7 +12,7 @@ license = "LGPL-3.0-or-later"
 
 [features]
 # EMBED (B317): the in-process local embedder (recall with no network).
-default = [] # merge10 fold: the local embedder (candle, ~165 crates, a 23 GB debug target) is OPT-IN — `--features local-embed`; see docs/dev/evidence/rmbp-1004/EMBED.md
+default = [] # merge10 fold: the local embedder is OPT-IN — `--features local-embed`; since INFERCORE (SR57) it runs on UnaOS's own infer_core (no_std, zero deps; candle is gone); see docs/dev/evidence/ml-1005/INFERCORE.md
 local-embed = ["gneiss_pal/local-embed"]
 
 [dependencies]
@@ -28,6 +28,8 @@ quartzite = { path = "../../libs/quartzite" }
 matrix = { path = "../../handlers/matrix" }
 # VEINPROV (B303): the provider choice is a preference — read from Principia's store, namespace `vein`.
 principia = { path = "../../handlers/principia" }
+# HOLOCRON1 (SR33): the Claude API key is asked of Holocron first (SecretGet vein/claude.api_key).
+holocron = { path = "../holocron" }
 syn = { version = "3.0", features = ["full", "extra-traits"] }
 quote = "1.0"
 
@@ -38,7 +40,7 @@ async-channel = "2.5"
 futures = "0.3"
 
 # Networking & AI
-reqwest = { version = "0.13.4", features = ["json", "multipart", "stream"] }
+# HTTPCORE (SR51): HTTP goes through gneiss_pal::api::http (UnaOS's http_core + tls_core); reqwest is gone.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -51,3 +53,5 @@ rand = "0.10"
 [dev-dependencies]
 # Isolated temp dirs for the vault DiskManager fail-closed (AMBER-GUARD) tests.
 tempfile = "3"
+# HOLOCRON1: the INSECURE test suite for the provider-slot tests' in-process Holocron (fast KDF).
+holocron_core = { path = "../../unaos/libs/sys/holocron_core", features = ["test-suite"] }

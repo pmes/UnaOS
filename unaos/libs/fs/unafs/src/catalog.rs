@@ -17,11 +17,10 @@
 use crate::hash::{FnvHasher, hash_bytes};
 use crate::inode::AttributeValue;
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
 
 /// An entry in the Attribute Catalog.
 /// Maps a (Key, Value) pair to an Inode ID.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Copy)]
+#[derive(Debug, Clone, PartialEq, Copy)]
 pub struct CatalogEntry {
     pub key_hash: u64,
     pub val_hash: u64,
@@ -81,3 +80,26 @@ pub fn deserialize_catalog(data: &[u8]) -> Result<Vec<CatalogEntry>, crate::code
     }
     crate::codec::deserialize(data)
 }
+
+/// UNAFSCODEC §R10 `CatalogEntry` (the v3–v5 flat catalog): three `u64`.
+impl crate::codec::Encode for CatalogEntry {
+    fn encode(&self, w: &mut crate::codec::Writer) {
+        w.u64(self.key_hash);
+        w.u64(self.val_hash);
+        w.u64(self.inode_id);
+    }
+}
+
+impl crate::codec::Decode for CatalogEntry {
+    const NAME: &'static str = "CatalogEntry";
+    const MIN_LEN: usize = 24;
+    fn decode(r: &mut crate::codec::Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(CatalogEntry {
+            key_hash: r.u64("CatalogEntry.key_hash")?,
+            val_hash: r.u64("CatalogEntry.val_hash")?,
+            inode_id: r.u64("CatalogEntry.inode_id")?,
+        })
+    }
+}
+
+crate::codec::list_name!(CatalogEntry => "CatalogEntry");

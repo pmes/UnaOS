@@ -2677,7 +2677,7 @@ pub static ACL_PERSIST_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomi
 /// So on ANY card that boots THIS is the only check; every board, first mount attempt, pass or fail.
 ///
 /// `sb0` is `Some` only when the magic just verified on that same read, and that gate is
-/// load-bearing: the bincode-legacy `Superblock` encoding is all fixed-width, so a decode of
+/// load-bearing: the `Superblock` record (unafs-records.md §R2) is all fixed-width, so a decode of
 /// arbitrary bytes SUCCEEDS with garbage. A non-UnaFS or unreadable block 0 therefore yields
 /// `sb_blocks=? fits=?` and never a scream. The decode is prefix-only (trailing block padding is
 /// ignored) and deliberately skips `Superblock::from_bytes`, whose `validate` would also reject a

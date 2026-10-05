@@ -1,0 +1,20 @@
+{
+  "cases": {
+    "aether-shell": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
+    "chromium-window": {
+      "mismatch": 0.71,
+      "ssim": 0.9864
+    },
+    "png-vs-golden": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    }
+  },
+  "thresholds": {
+    "mismatch_rise": 2.0,
+    "ssim_drop": 0.02
+  }
+}

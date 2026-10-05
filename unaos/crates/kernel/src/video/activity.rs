@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::video::{font, theme, wm};
+use crate::video::{theme, wm};
 
 /// Kernel-furniture owner slot (`+ 7`, after TEXTEDIT's `+ 6`).
 pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 7;
@@ -207,7 +207,7 @@ fn bar_color(pct: i16) -> u32 {
 }
 
 fn paint(st: &mut State) {
-    let face = font::Face::Body;
+    let face = super::text::Face::Body;
     let ch = face.cell_h() + 2;
     let cw = face.cell_w();
     let (w, h) = (st.w, st.h);
@@ -216,7 +216,7 @@ fn paint(st: &mut State) {
     let ink = theme::CONTENT_TEXT;
     let mut y = PAD;
     let line = |surf: &mut [u32], y: &mut usize, b: &Buf, color: u32| {
-        font::draw_text(surf, w, w, h, PAD, *y, b.bytes(), color, false, face);
+        super::text::draw_text(surf, w, w, h, PAD, *y, b.bytes(), color, false, face);
         *y += ch;
     };
     // Header.
@@ -235,7 +235,7 @@ fn paint(st: &mut State) {
     for i in 0..c.n_cpu {
         let mut b = Buf::new();
         let _ = write!(b, "cpu{}", i);
-        font::draw_text(&mut st.surf, w, w, h, PAD, y, b.bytes(), ink, false, face);
+        super::text::draw_text(&mut st.surf, w, w, h, PAD, y, b.bytes(), ink, false, face);
         rect(&mut st.surf, w, h, bx, y + 1, BAR_W, ch - 4, theme::SCROLL_TRACK);
         let pct = c.busy[i];
         let mut t = Buf::new();
@@ -245,7 +245,7 @@ fn paint(st: &mut State) {
         } else {
             let _ = write!(t, " --   q={}", c.runq[i]);
         }
-        font::draw_text(&mut st.surf, w, w, h, bx + BAR_W + 8, y, t.bytes(), ink, false, face);
+        super::text::draw_text(&mut st.surf, w, w, h, bx + BAR_W + 8, y, t.bytes(), ink, false, face);
         y += ch;
     }
     y += 4;
@@ -287,7 +287,7 @@ fn paint(st: &mut State) {
     let fy = h.saturating_sub(ch + 2);
     let mut b = Buf::new();
     let _ = write!(b, "q close   up/down select   k kill{}{}", if st.verdict.is_empty() { "" } else { "   -> " }, st.verdict);
-    font::draw_text(&mut st.surf, w, w, h, PAD, fy, b.bytes(), ink, false, face);
+    super::text::draw_text(&mut st.surf, w, w, h, PAD, fy, b.bytes(), ink, false, face);
 }
 
 /// Take a census and repaint (in place). Does NOT present.

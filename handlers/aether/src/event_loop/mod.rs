@@ -371,7 +371,7 @@ impl JobExecutor for AetherJobExecutor {
                 let mut ready = Vec::new();
                 let mut keep = Vec::with_capacity(jobs.len());
                 for (due, job) in jobs.drain(..) {
-                    if job.is_cancelled() {
+                    if job.cancelled() {
                         continue;
                     }
                     if due <= now {

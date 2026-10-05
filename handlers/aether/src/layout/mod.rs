@@ -1,4 +1,4 @@
-use kuchiki::NodeRef;
+use crate::dom::NodeRef;
 use taffy::prelude::*;
 use std::collections::HashMap;
 
@@ -56,6 +56,12 @@ pub struct PaintStyle {
     /// remeasure walks it down the box tree and turns it into the flex
     /// alignment of each descendant's own formatting context.
     pub text_align: Option<u8>,
+    /// object-fit (replaced content: `<video>` frames and posters, see `media::object_fit_rect`):
+    /// 0 fill, 1 contain, 2 cover, 3 none, 4 scale-down. None = the element's default
+    /// (contain for video).
+    pub object_fit: Option<u8>,
+    /// object-position, as written.
+    pub object_position: Option<String>,
 }
 
 pub struct LayoutTree {
@@ -83,6 +89,16 @@ impl LayoutTree {
         self.node_map = new_tree.node_map;
         self.paint_map = new_tree.paint_map;
         self.dirty = false;
+    }
+}
+
+trait ExactlyOneText {
+    fn exactly_one_text(self) -> bool;
+}
+impl<I: Iterator<Item = NodeRef>> ExactlyOneText for I {
+    /// True when the iterator yields exactly one node and it is text.
+    fn exactly_one_text(mut self) -> bool {
+        matches!((self.next(), self.next()), (Some(n), None) if n.as_text().is_some())
     }
 }
 
@@ -151,11 +167,12 @@ fn publish_select_value(node: &NodeRef) {
 }
 
 /// Inline-level elements: they size to content and flow in wrapping rows.
-fn is_inline(name: &str) -> bool {
+pub(crate) fn is_inline(name: &str) -> bool {
     matches!(
         name,
         "a" | "span" | "b" | "strong" | "i" | "em" | "u" | "s" | "code" | "small" | "big"
             | "sup" | "sub" | "label" | "abbr" | "cite" | "q" | "time" | "img" | "wbr" | "br"
+            | "video" | "audio"
             | "td" | "th" | "button" | "input" | "select"
     )
 }
@@ -230,6 +247,11 @@ fn is_inline_node(node: &NodeRef) -> bool {
     if is_table_part(tag) {
         return true;
     }
+    // Replaced media elements are inline boxes whatever their (never rendered) <source>
+    // children are — testing those made a <video><source></video> a full-width block.
+    if matches!(tag, "video" | "audio") {
+        return true;
+    }
     // An inline element that CONTAINS block-level children is broken around
     // them by CSS; the practical approximation is to lay it out as a block.
     // Treated as inline it shrank to fit while its block children still
@@ -291,19 +313,28 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             {
                 return None;
             }
+            // <audio> without `controls` is display:none in the UA sheet.
+            if el.name.local.as_ref() == "audio" && attrs.get("controls").is_none() {
+                return None;
+            }
         } else if dom_node.as_text().is_some() {
             // Whitespace-only text produces no box.
             if dom_node.text_contents().trim().is_empty() {
                 return None;
             }
         }
+        // <video>/<audio> are replaced elements: their <source>/<track>
+        // children and fallback content never render.
+        let replaced_media = dom_node
+            .as_element()
+            .is_some_and(|el| matches!(el.name.local.as_ref(), "video" | "audio"));
 
         // A <select> keeps its box but not its options: publish the selected
         // option onto the element so the control paints/submits a value.
         publish_select_value(dom_node);
 
         let mut kids: Vec<(taffy::NodeId, bool)> = Vec::new();
-        for child in dom_node.children() {
+        for child in dom_node.children().filter(|_| !replaced_media) {
             if let Some(id) = build_taffy_tree(&child, taffy, node_map, paint_map, quirks) {
                 kids.push((id, is_inline_node(&child)));
             }
@@ -364,6 +395,27 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             kids.iter().map(|&(id, _)| id).collect()
         };
 
+        // A text run that is its box's ONLY child may shrink to the box's
+        // width and wrap inside it (its min-content is its widest word).
+        // With shrink 0 its flex base size was its max-content width capped
+        // at the VIEWPORT, so every paragraph narrower than the viewport
+        // painted past its own right edge. Runs that share a line with
+        // siblings keep shrink 0: shrunk side by side, each would wrap into
+        // its own column instead of flowing onto the next line.
+        if let [only] = child_ids.as_slice() {
+            let only_is_text = dom_node
+                .children()
+                .filter(|c| generates_box(c))
+                .exactly_one_text();
+            if only_is_text {
+                if let Ok(st) = taffy.style(*only) {
+                    let mut st = st.clone();
+                    st.flex_shrink = 1.0;
+                    let _ = taffy.set_style(*only, st);
+                }
+            }
+        }
+
         let tag = dom_node
             .as_element()
             .map(|el| el.name.local.as_ref().to_string())
@@ -408,22 +460,22 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             min_size: match tag.as_str() {
                 // UA default control sizes so empty controls are visible.
                 "input" | "select" => Size {
-                    width: Dimension::length(160.0),
-                    height: Dimension::length(24.0),
+                    width: LengthPercentageAuto::length(160.0),
+                    height: LengthPercentageAuto::length(24.0),
                 },
                 "textarea" => Size {
-                    width: Dimension::length(160.0),
-                    height: Dimension::length(60.0),
+                    width: LengthPercentageAuto::length(160.0),
+                    height: LengthPercentageAuto::length(60.0),
                 },
                 "button" => Size {
-                    width: Dimension::length(24.0),
-                    height: Dimension::length(24.0),
+                    width: LengthPercentageAuto::length(24.0),
+                    height: LengthPercentageAuto::length(24.0),
                 },
                 // Everything else: no UA minimum. An empty block box is
                 // zero-tall in CSS; a floor here compounds — pages mount
                 // dozens of empty container/portal divs, and 20px each
                 // pushed the real content below the fold.
-                _ => Size { width: Dimension::auto(), height: Dimension::auto() },
+                _ => Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::auto() },
             },
             margin: {
                 // UA default spacing: block gaps for paragraphs/headings,
@@ -460,7 +512,7 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         if tag == "br" {
             style.size.width = Dimension::percent(1.0);
             style.size.height = Dimension::length(0.0);
-            style.min_size = Size { width: Dimension::auto(), height: Dimension::length(0.0) };
+            style.min_size = Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::length(0.0) };
         }
 
         // Inline style="..." — paint properties plus width/height.
@@ -549,6 +601,16 @@ pub fn family_font(family: u8) -> Option<std::sync::Arc<font_kit::font::Font>> {
     })
 }
 
+/// UA default bold per element, shared by the measurer and the painter.
+pub fn default_bold(tag: &str, inherited: bool) -> bool {
+    inherited || matches!(tag, "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th")
+}
+
+/// UA default italic per element, shared by the measurer and the painter.
+pub fn default_italic(tag: &str, inherited: bool) -> bool {
+    inherited || matches!(tag, "i" | "em" | "cite" | "var" | "dfn" | "address")
+}
+
 /// UA default font sizes per element (shared with the renderer).
 pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
     match tag {
@@ -617,31 +679,55 @@ pub fn remeasure(tree: &mut LayoutTree) {
     propagate_text_align(tree);
     // Pass 1: resolve font size down the box tree for text leaves, and
     // intrinsic sizes for images.
-    let mut text_info: HashMap<taffy::NodeId, (String, f32, f32, bool, u8)> = HashMap::new();
+    let mut text_info: HashMap<taffy::NodeId, TextRun> = HashMap::new();
     let mut img_info: HashMap<taffy::NodeId, (f32, f32)> = HashMap::new();
+    // Replaced media boxes: (width, height) with the intrinsic aspect ratio, so a box sized on
+    // one axis by CSS derives the other (CSS 2 §10.3.2 / §10.6.2 for replaced elements).
+    let mut media_info: HashMap<taffy::NodeId, (f32, f32, f32)> = HashMap::new();
     fn resolve(
         node_id: taffy::NodeId,
-        inherited: (f32, f32, bool, u8), // (font size, line-height; 0=natural, nowrap, family)
+        inherited: TextRun, // `text` unused here: the inherited text properties
         tree: &LayoutTree,
-        out: &mut HashMap<taffy::NodeId, (String, f32, f32, bool, u8)>,
+        out: &mut HashMap<taffy::NodeId, TextRun>,
         imgs: &mut HashMap<taffy::NodeId, (f32, f32)>,
+        media: &mut HashMap<taffy::NodeId, (f32, f32, f32)>,
     ) {
-        let mut size = inherited;
+        let mut size = inherited.clone();
         if let Some(dom_node) = tree.node_map.get(&node_id) {
             if let Some(el) = dom_node.as_element() {
                 let paint = tree.paint_map.get(&node_id);
-                size.0 = paint
+                let tag = el.name.local.as_ref();
+                size.font_size = paint
                     .and_then(|p| p.font_size)
-                    .unwrap_or_else(|| default_font_size(el.name.local.as_ref(), inherited.0));
+                    .unwrap_or_else(|| default_font_size(tag, inherited.font_size));
                 if let Some(lh) = paint.and_then(|p| p.line_height) {
-                    size.1 = lh;
+                    size.line_height = lh;
                 }
                 if let Some(nw) = paint.and_then(|p| p.nowrap) {
-                    size.2 = nw;
+                    size.nowrap = nw;
                 }
-                size.3 = paint
+                size.family = paint
                     .and_then(|p| p.family)
-                    .unwrap_or_else(|| default_family(el.name.local.as_ref(), inherited.3));
+                    .unwrap_or_else(|| default_family(tag, inherited.family));
+                size.bold = paint.and_then(|p| p.bold).unwrap_or_else(|| default_bold(tag, inherited.bold));
+                size.italic =
+                    paint.and_then(|p| p.italic).unwrap_or_else(|| default_italic(tag, inherited.italic));
+                if let Some(tt) = paint.and_then(|p| p.text_transform) {
+                    size.text_transform = tt;
+                }
+                if let Some((iw, ih)) = crate::media::intrinsic_size(dom_node) {
+                    // width/height attributes win, the other axis keeps the intrinsic ratio.
+                    let attrs = el.attributes.borrow();
+                    let attr_px = |name: &str| attrs.get(name).and_then(|v| v.trim().parse::<f32>().ok());
+                    let ratio = if ih > 0.0 { iw / ih } else { 2.0 };
+                    let (w, h) = match (attr_px("width"), attr_px("height")) {
+                        (Some(w), Some(h)) => (w, h),
+                        (Some(w), None) => (w, w / ratio),
+                        (None, Some(h)) => (h * ratio, h),
+                        (None, None) => (iw, ih),
+                    };
+                    media.insert(node_id, (w, h, ratio));
+                }
                 if el.name.local.as_ref() == "img" {
                     let attrs = el.attributes.borrow();
                     // width/height attributes win; else intrinsic dimensions.
@@ -659,24 +745,44 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 }
             } else if dom_node.as_text().is_some() {
                 let text = dom_node.text_contents();
-                let text = text.trim().to_string();
+                let text = text.trim();
                 if !text.is_empty() {
-                    out.insert(node_id, (text, inherited.0, inherited.1, inherited.2, inherited.3));
+                    // Measured exactly as painted: transformed text, same face.
+                    let text = crate::render::transform_text(text, inherited.text_transform);
+                    out.insert(node_id, TextRun { text, ..inherited.clone() });
                 }
             }
         }
         if let Ok(children) = tree.taffy.children(node_id) {
             for child in children {
-                resolve(child, size, tree, out, imgs);
+                resolve(child, size.clone(), tree, out, imgs, media);
             }
         }
     }
-    resolve(tree.root_node, (16.0, 0.0, false, 0), tree, &mut text_info, &mut img_info);
+    let root = TextRun { font_size: 16.0, ..Default::default() };
+    resolve(tree.root_node, root, tree, &mut text_info, &mut img_info, &mut media_info);
+    // A replaced media box with an auto width is its own (attribute / intrinsic) width — not
+    // stretched across a column container the way an auto-width block is. Height follows when
+    // both axes are auto; with only the width specified the measure keeps the aspect ratio.
+    for (&id, &(w, h, _)) in &media_info {
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            let wa = st.size.width == Dimension::auto();
+            let ha = st.size.height == Dimension::auto();
+            if wa {
+                st.size.width = Dimension::length(w);
+                if ha {
+                    st.size.height = Dimension::length(h);
+                }
+                let _ = tree.taffy.set_style(id, st);
+            }
+        }
+    }
 
     // Taffy caches leaf measurements; a cascade pass can change resolved
     // font sizes without touching the leaf's style, so stale cached sizes
     // survive set_style dirtying. Invalidate every measured leaf.
-    for node_id in text_info.keys().chain(img_info.keys()) {
+    for node_id in text_info.keys().chain(img_info.keys()).chain(media_info.keys()) {
         let _ = tree.taffy.mark_dirty(*node_id);
     }
 
@@ -693,47 +799,66 @@ pub fn remeasure(tree: &mut LayoutTree) {
     let _ = tree.taffy.compute_layout_with_measure(
         tree.root_node,
         viewport,
-        |known, avail, node_id, _ctx, _style| {
+        |inputs, node_id, _ctx, style| taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
+            if let Some(&(w, h, ratio)) = media_info.get(&node_id) {
+                return match (known.width, known.height) {
+                    (Some(kw), Some(kh)) => Size { width: kw, height: kh },
+                    (Some(kw), None) => Size { width: kw, height: kw / ratio },
+                    (None, Some(kh)) => Size { width: kh * ratio, height: kh },
+                    (None, None) => Size { width: w, height: h },
+                };
+            }
             if let Some(&(w, h)) = img_info.get(&node_id) {
                 return Size {
                     width: known.width.unwrap_or(w),
                     height: known.height.unwrap_or(h),
                 };
             }
-            let Some((text, font_size, line_mult, nowrap, family)) = text_info.get(&node_id) else {
+            let Some(run) = text_info.get(&node_id) else {
                 return Size { width: known.width.unwrap_or(0.0), height: known.height.unwrap_or(0.0) };
             };
+            // Min-content (a flex item's automatic minimum size) is the
+            // widest unbreakable word: wrap at every opportunity. Without
+            // it a `flex: 1` column of text claimed its whole max-content
+            // width as its minimum and overflowed its container.
             let wrap_width = known.width.unwrap_or(match avail.width {
                 AvailableSpace::Definite(w) => w,
-                _ => vw_cap,
+                AvailableSpace::MinContent => 0.0,
+                AvailableSpace::MaxContent => vw_cap,
             });
-            let effective_wrap = if *nowrap { f32::MAX } else { wrap_width.max(1.0) };
-            let fam_font = family_font(*family);
-            let use_font = fam_font.as_deref().or(font.as_deref());
-            let (w, h) = measure_text_family(use_font, *family, text, *font_size, *line_mult, effective_wrap);
+            let effective_wrap = if run.nowrap { f32::MAX } else { wrap_width.max(1.0) };
+            let face = crate::fonts::face(run.family, run.bold, run.italic);
+            let use_font = face.as_deref().or(font.as_deref());
+            let key = crate::fonts::face_key(run.family, run.bold, run.italic);
+            let (w, h) = measure_text_family(use_font, key, &run.text, run.font_size, run.line_height, effective_wrap);
             Size {
                 width: known.width.unwrap_or(w),
                 height: known.height.unwrap_or(h),
             }
-        },
+        }),
     );
+}
+
+/// One text run's resolved text properties (inherited down the box tree the
+/// same way render::draw_node inherits them).
+#[derive(Clone, Default)]
+struct TextRun {
+    text: String,
+    font_size: f32,
+    /// Multiplier of font size; 0 = the face's natural line height.
+    line_height: f32,
+    nowrap: bool,
+    family: u8,
+    bold: bool,
+    italic: bool,
+    text_transform: u8,
 }
 
 /// Measures wrapped text: returns (widest line, total height). Mirrors the
 /// renderer's wrap algorithm so painted text fits its measured box.
-fn measure_text(
-    font: Option<&font_kit::font::Font>,
-    text: &str,
-    font_size: f32,
-    line_mult: f32,
-    max_width: f32,
-) -> (f32, f32) {
-    measure_text_family(font, 0, text, font_size, line_mult, max_width)
-}
-
 fn measure_text_family(
     font: Option<&font_kit::font::Font>,
-    family: u8,
+    family: u8, // the face key (fonts::face_key): advances are cached per face
     text: &str,
     font_size: f32,
     line_mult: f32,

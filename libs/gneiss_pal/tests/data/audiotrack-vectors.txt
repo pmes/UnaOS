@@ -1,0 +1,5 @@
+# AUDIOTRACK (SR45) vectors for tests/audio_track.rs, fetched at test time (never committed):
+# <name> <sha256> <url>. Offline = the case is SKIPPED loudly, never passed. The same files (and
+# hashes) AUDIOCODEC's tests/vectors.txt pins.
+sfx.mp3 46364ebce1b9b2f278b35a7dc05b10427a33c073cf085cfa1a4ab33f3d307565 https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.mp3
+sfx.flac 5f4d585500284beee09124fcc3fa2a45d5931f0241d089a817ae3940bbc90ad0 https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.flac

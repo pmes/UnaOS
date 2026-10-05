@@ -165,7 +165,7 @@ impl<const N: usize> OpList<N> {
 /// aarch64 console, any pre-takeover x86 print) this is the font8x8 path, byte for byte.
 fn draw_glyph(surf: &FrameBuffer, ch: u8, cx: usize, cy: usize, fg: u32, bg: u32, s: usize, aa: bool) {
     if aa {
-        crate::video::font::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false, crate::video::font::Face::Body);
+        crate::video::text::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false, crate::video::text::Face::Body);
         return;
     }
     let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
