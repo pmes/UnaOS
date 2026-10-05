@@ -3,9 +3,14 @@
 //! decoded Y'CbCr planes to 8-bit RGBA using the AVIF `colr`/nclx (or sequence header) matrix.
 
 use crate::avif::avif_payload;
+use crate::cdf::CdfContext;
 use crate::decode::{Dec, FrameState, ToolStats};
 use crate::obu::*;
+use crate::refs::{RefFrame, RefStore};
+use crate::tables::*;
 use crate::{Error, Result};
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -16,10 +21,12 @@ pub struct Filters {
     pub deblock: bool,
     pub cdef: bool,
     pub restoration: bool,
+    /// §7.18.3 film grain synthesis on the output frames (off = the intermediate frames of §7.18.2).
+    pub film_grain: bool,
 }
 impl Default for Filters {
     fn default() -> Self {
-        Filters { deblock: true, cdef: true, restoration: true }
+        Filters { deblock: true, cdef: true, restoration: true, film_grain: true }
     }
 }
 
@@ -62,26 +69,258 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
-/// Decode the first shown intra frame of an AV1 OBU stream. `config_obus` (from `av1C`) supply
+/// Decode the first shown frame of an AV1 OBU stream. `config_obus` (from `av1C`) supply
 /// the sequence header when the stream itself lacks one.
 pub fn decode_obus(data: &[u8], config_obus: &[u8], filters: Filters) -> Result<Planes> {
-    let mut seq: Option<SequenceHeader> = None;
+    let mut d = Decoder::new();
+    d.filters = filters;
     if !config_obus.is_empty() {
         for o in split_obus(config_obus)? {
             if o.obu_type == OBU_SEQUENCE_HEADER_T {
-                seq = Some(SequenceHeader::parse(o.payload)?);
+                d.seq = Some(SequenceHeader::parse(o.payload)?);
             }
         }
     }
-    decode_with_seq(data, &mut seq, filters)
+    let mut frames = d.decode(data, true)?;
+    if frames.is_empty() {
+        return Err(Error::Invalid("no shown frame"));
+    }
+    Ok(frames.swap_remove(0))
+}
+
+/// The general decoding process (§7.2) over a sequence of OBUs: the sequence header, the
+/// reference frame store, and every frame type (key, intra-only, inter, switch,
+/// show_existing_frame).
+#[derive(Clone, Default)]
+pub struct Decoder {
+    pub seq: Option<SequenceHeader>,
+    pub refs: RefStore,
+    pub filters: Filters,
+}
+
+impl Decoder {
+    pub fn new() -> Decoder {
+        Decoder { seq: None, refs: RefStore::default(), filters: Filters::default() }
+    }
+
+    /// Decode every OBU in `data`; returns the shown frames in output order. With
+    /// `first_only` it stops after the first shown frame.
+    pub fn decode(&mut self, data: &[u8], first_only: bool) -> Result<Vec<Planes>> {
+        let obus = split_obus(data)?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < obus.len() {
+            let o = obus[i];
+            i += 1;
+            match o.obu_type {
+                OBU_SEQUENCE_HEADER_T => {
+                    let s = SequenceHeader::parse(o.payload)?;
+                    self.seq = Some(s);
+                }
+                OBU_FRAME_T | OBU_FRAME_HEADER_T => {
+                    let s = self.seq.clone().ok_or(Error::Invalid("frame before sequence header"))?;
+                    if s.operating_point_idc != 0 && o.has_extension {
+                        let in_t = (s.operating_point_idc >> o.temporal_id) & 1;
+                        let in_s = (s.operating_point_idc >> (o.spatial_id + 8)) & 1;
+                        if in_t == 0 || in_s == 0 {
+                            continue;
+                        }
+                    }
+                    let hdr = parse_frame_header_with_refs(o.payload, &s, o.temporal_id, o.spatial_id, &mut self.refs)?;
+                    if hdr.show_existing_frame {
+                        out.push(self.show_existing(&s, &hdr)?);
+                        if first_only {
+                            return Ok(out);
+                        }
+                        continue;
+                    }
+                    // collect the tile groups of this frame
+                    let mut groups: Vec<&[u8]> = Vec::new();
+                    let mut done = false;
+                    if o.obu_type == OBU_FRAME_T {
+                        let g = &o.payload[hdr.header_bytes..];
+                        done = tile_group_ends_frame(g, &hdr)?;
+                        groups.push(g);
+                    }
+                    while !done {
+                        let t = obus.get(i).ok_or(Error::Truncated)?;
+                        i += 1;
+                        if t.obu_type == OBU_TILE_GROUP_T {
+                            done = tile_group_ends_frame(t.payload, &hdr)?;
+                            groups.push(t.payload);
+                        } else if t.obu_type == OBU_REDUNDANT_FRAME_HEADER_T || t.obu_type == OBU_METADATA_T || t.obu_type == OBU_PADDING_T {
+                            continue;
+                        } else {
+                            return Err(Error::Invalid("missing tile group"));
+                        }
+                    }
+                    if let Some(p) = self.decode_frame(&s, &hdr, &groups)? {
+                        out.push(p);
+                        if first_only {
+                            return Ok(out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// show_existing_frame (§7.21 when it is a key frame, then §7.20 and the output process).
+    fn show_existing(&mut self, seq: &SequenceHeader, hdr: &FrameHeader) -> Result<Planes> {
+        let idx = hdr.frame_to_show_map_idx as usize;
+        let f = self.refs.frames[idx].clone().ok_or(Error::Invalid("show_existing_frame of an empty slot"))?;
+        if hdr.frame_type == KEY_FRAME as u8 {
+            // reference frame loading process + update with refresh_frame_flags = allFrames
+            let order_hint = self.refs.order_hint[idx];
+            let frame_id = self.refs.frame_id[idx];
+            for i in 0..NUM_REF_FRAMES {
+                self.refs.valid[i] = true;
+                self.refs.order_hint[i] = order_hint;
+                self.refs.frame_id[i] = frame_id;
+                self.refs.frames[i] = Some(f.clone());
+            }
+        }
+        let mut fh = hdr.clone();
+        fh.upscaled_width = f.upscaled_width;
+        fh.frame_width = f.frame_width;
+        fh.frame_height = f.frame_height;
+        fh.render_width = f.render_width;
+        fh.render_height = f.render_height;
+        fh.order_hint = f.order_hint;
+        Ok(output_planes(seq, &fh, &f.planes, ToolStats::default(), self.filters))
+    }
+
+    /// Decode one frame (header already parsed) from its tile groups; returns the output if shown.
+    fn decode_frame(&mut self, seq: &SequenceHeader, hdr: &FrameHeader, groups: &[&[u8]]) -> Result<Option<Planes>> {
+        let mut fs = FrameState::new(seq, hdr);
+        // the frame CDFs: init_non_coeff_cdfs + init_coeff_cdfs, or load_cdfs(prev)
+        let frame_cdf = match hdr.prev_frame {
+            None => CdfContext::new(hdr.base_q_idx),
+            Some(prev) => {
+                let f = self.refs.frames[prev].as_ref().ok_or(Error::Invalid("primary_ref_frame slot empty"))?;
+                let mut c = (*f.cdfs).clone();
+                c.reset_counts();
+                c
+            }
+        };
+        // PrevSegmentIds: setup_past_independence / load_previous_segment_ids
+        if let Some(prev) = hdr.prev_frame {
+            let f = self.refs.frames[prev].as_ref().unwrap();
+            if hdr.segmentation_enabled && f.mi_cols == hdr.mi_cols && f.mi_rows == hdr.mi_rows {
+                fs.prev_segment_ids.copy_from_slice(&f.segment_ids);
+            }
+        }
+        if hdr.use_ref_frame_mvs {
+            crate::mvpred::motion_field_estimation(seq, hdr, &self.refs, &mut fs);
+        }
+        let saved_cdf;
+        {
+            let refs = &self.refs;
+            let mut dec = Dec::new(seq, hdr, &mut fs, self.filters, refs, frame_cdf.clone());
+            dec.init_lr();
+            for g in groups {
+                dec.decode_tile_group(g)?;
+            }
+            saved_cdf = dec.saved_cdf.take();
+        }
+        // frame_end_update_cdf (§7.4)
+        let final_cdf = if !hdr.disable_frame_end_update_cdf { saved_cdf.unwrap_or(frame_cdf) } else { frame_cdf };
+        // decode_frame_wrapup (§7.4): post filters
+        let lr = postfilter(hdr, &mut fs, self.filters);
+        // motion field motion vector storage (§7.19)
+        let n = fs.mi_rows * fs.mi_cols;
+        let mut mf_ref_frames = vec![NONE as i8; n];
+        let mut mf_mvs = vec![[0i32; 2]; n];
+        for k in 0..n {
+            for list in 0..2 {
+                let r = fs.ref_frames[k][list] as i32;
+                if r > INTRA_FRAME as i32 {
+                    let ref_idx = hdr.ref_frame_idx[r as usize - LAST_FRAME];
+                    let dist = get_relative_dist(seq, self.refs.order_hint[ref_idx], hdr.order_hint);
+                    if dist < 0 {
+                        let mv = fs.mvs[k][list];
+                        if mv[0].abs() <= REFMVS_LIMIT as i32 && mv[1].abs() <= REFMVS_LIMIT as i32 {
+                            mf_ref_frames[k] = r as i8;
+                            mf_mvs[k] = mv;
+                        }
+                    }
+                }
+            }
+        }
+        if hdr.segmentation_enabled && !hdr.segmentation_update_map {
+            fs.segment_ids.copy_from_slice(&fs.prev_segment_ids);
+        }
+        let cc = &seq.color_config;
+        let stats = fs.stats.clone();
+        let out = if hdr.show_frame { Some(output_planes(seq, hdr, &lr, stats, self.filters)) } else { None };
+        // reference frame update process (§7.20)
+        if hdr.refresh_frame_flags != 0 {
+            let rf = Arc::new(RefFrame {
+                frame_type: hdr.frame_type,
+                upscaled_width: hdr.upscaled_width,
+                frame_width: hdr.frame_width,
+                frame_height: hdr.frame_height,
+                render_width: hdr.render_width,
+                render_height: hdr.render_height,
+                mi_cols: hdr.mi_cols,
+                mi_rows: hdr.mi_rows,
+                subsampling_x: cc.subsampling_x,
+                subsampling_y: cc.subsampling_y,
+                bit_depth: cc.bit_depth,
+                order_hint: hdr.order_hint,
+                saved_order_hints: hdr.order_hints,
+                planes: lr,
+                mf_ref_frames,
+                mf_mvs,
+                gm_params: hdr.gm_params,
+                segment_ids: core::mem::take(&mut fs.segment_ids),
+                cdfs: Box::new(final_cdf),
+                film_grain: hdr.film_grain.clone(),
+                loop_filter_ref_deltas: hdr.loop_filter_ref_deltas,
+                loop_filter_mode_deltas: hdr.loop_filter_mode_deltas,
+                feature_enabled: hdr.feature_enabled,
+                feature_data: hdr.feature_data,
+                showable_frame: hdr.showable_frame,
+            });
+            for i in 0..NUM_REF_FRAMES {
+                if (hdr.refresh_frame_flags >> i) & 1 == 1 {
+                    self.refs.valid[i] = true;
+                    self.refs.frame_id[i] = hdr.current_frame_id;
+                    self.refs.order_hint[i] = hdr.order_hint;
+                    self.refs.frames[i] = Some(rf.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Whether a tile group's tg_end is the last tile (it then ends the frame, §5.11.1).
+fn tile_group_ends_frame(g: &[u8], hdr: &FrameHeader) -> Result<bool> {
+    let ti = &hdr.tile_info;
+    let num_tiles = ti.tile_cols * ti.tile_rows;
+    let mut r = crate::bits::BitReader::new(g);
+    let mut flag = false;
+    if num_tiles > 1 {
+        flag = r.flag()?;
+    }
+    let end = if num_tiles == 1 || !flag {
+        num_tiles - 1
+    } else {
+        let bits = ti.tile_cols_log2 + ti.tile_rows_log2;
+        r.f(bits)?;
+        r.f(bits)?
+    };
+    Ok(end == num_tiles - 1)
 }
 
 /// A decoder for a stream of temporal units (one per container packet), keeping the sequence
-/// header across them — the shape a video player's decoder seam needs. Key frames and intra-only
-/// frames decode; an inter frame returns `Err(Unsupported("inter frame"))` (owed, see the doc).
-#[derive(Debug, Clone, Default)]
+/// header and the reference frames across them — the shape a video player's decoder seam needs.
+#[derive(Clone, Default)]
 pub struct StreamDecoder {
-    seq: Option<SequenceHeader>,
+    pub dec: Decoder,
     pub filters: Filters,
 }
 
@@ -89,91 +328,55 @@ impl StreamDecoder {
     /// `av1c` is the container's AV1CodecConfigurationRecord body (MP4 `av1C`, Matroska
     /// CodecPrivate) or empty.
     pub fn new(av1c: &[u8]) -> Result<StreamDecoder> {
-        let mut d = StreamDecoder { seq: None, filters: Filters::default() };
+        let mut d = StreamDecoder { dec: Decoder::new(), filters: Filters::default() };
         if !av1c.is_empty() {
             let cfg = crate::avif::Av1Config::parse(av1c)?;
             for o in split_obus(&cfg.config_obus)? {
                 if o.obu_type == OBU_SEQUENCE_HEADER_T {
-                    d.seq = Some(SequenceHeader::parse(o.payload)?);
+                    d.dec.seq = Some(SequenceHeader::parse(o.payload)?);
                 }
             }
         }
         Ok(d)
     }
-    /// Decode one temporal unit; `Ok(planes)` for its shown frame.
+    /// Decode one temporal unit; `Ok(planes)` for its (last) shown frame.
     pub fn decode_temporal_unit(&mut self, tu: &[u8]) -> Result<Planes> {
-        decode_with_seq(tu, &mut self.seq, self.filters)
+        let mut v = self.decode_temporal_unit_all(tu)?;
+        v.pop().ok_or(Error::Invalid("temporal unit without a shown frame"))
     }
-    /// After a seek. Intra-only decoding keeps no reference frames, so there is nothing to drop
-    /// yet; the sequence header stays valid. (Inter will clear the reference slots here.)
-    pub fn reset(&mut self) {}
+    /// Decode one temporal unit; every shown frame in it (one per shown spatial layer).
+    pub fn decode_temporal_unit_all(&mut self, tu: &[u8]) -> Result<Vec<Planes>> {
+        self.dec.filters = self.filters;
+        self.dec.decode(tu, false)
+    }
+    /// After a seek: drop every reference frame (decoding resumes at the next key frame); the
+    /// sequence header stays valid.
+    pub fn reset(&mut self) {
+        self.dec.refs.clear();
+    }
 }
 
-fn decode_with_seq(data: &[u8], seq: &mut Option<SequenceHeader>, filters: Filters) -> Result<Planes> {
-    let obus = split_obus(data)?;
-    let mut i = 0;
-    while i < obus.len() {
-        let o = obus[i];
-        i += 1;
-        match o.obu_type {
-            OBU_SEQUENCE_HEADER_T => *seq = Some(SequenceHeader::parse(o.payload)?),
-            OBU_FRAME_T | OBU_FRAME_HEADER_T => {
-                let s = seq.as_ref().ok_or(Error::Invalid("frame before sequence header"))?;
-                if s.operating_point_idc != 0 && o.has_extension {
-                    let in_t = (s.operating_point_idc >> o.temporal_id) & 1;
-                    let in_s = (s.operating_point_idc >> (o.spatial_id + 8)) & 1;
-                    if in_t == 0 || in_s == 0 {
-                        continue;
-                    }
-                }
-                let hdr = parse_frame_header(o.payload, s, o.temporal_id, o.spatial_id)?;
-                if hdr.use_superres {
-                    return Err(Error::Unsupported("superres"));
-                }
-                let mut fs = FrameState::new(s, &hdr);
-                {
-                    let mut dec = Dec::new(s, &hdr, &mut fs, filters);
-                    dec.init_lr();
-                    let mut done = false;
-                    if o.obu_type == OBU_FRAME_T {
-                        done = dec.decode_tile_group(&o.payload[hdr.header_bytes..])?;
-                    }
-                    while !done {
-                        let t = obus.get(i).ok_or(Error::Truncated)?;
-                        i += 1;
-                        if t.obu_type == OBU_TILE_GROUP_T {
-                            done = dec.decode_tile_group(t.payload)?;
-                        } else if t.obu_type == OBU_REDUNDANT_FRAME_HEADER_T || t.obu_type == OBU_METADATA_T || t.obu_type == OBU_PADDING_T {
-                            continue;
-                        } else {
-                            return Err(Error::Invalid("missing tile group"));
-                        }
-                    }
-                }
-                let out = wrapup(s, &hdr, fs, filters);
-                if hdr.show_frame {
-                    return Ok(out);
-                }
-                // An unshown intra frame is only useful as a reference (inter: owed).
-            }
-            _ => {}
-        }
-    }
-    Err(Error::Invalid("no shown frame"))
-}
-
-/// decode_frame_wrapup (§7.4) for an intra frame followed by the output process (§7.18).
-fn wrapup(seq: &SequenceHeader, hdr: &FrameHeader, mut fs: FrameState, filters: Filters) -> Planes {
+/// decode_frame_wrapup (§7.4) steps 1–5: deblock → CDEF → superres upscaling → loop restoration.
+fn postfilter(hdr: &FrameHeader, fs: &mut FrameState, filters: Filters) -> [crate::decode::Plane; 3] {
     if filters.deblock && (hdr.loop_filter_level[0] != 0 || hdr.loop_filter_level[1] != 0) {
-        crate::loopfilter::loop_filter_frame(&mut fs, hdr);
+        crate::loopfilter::loop_filter_frame(fs, hdr);
     }
     let cdef_planes = if filters.cdef {
-        crate::cdef::cdef_frame(&fs, hdr)
+        crate::cdef::cdef_frame(fs, hdr)
     } else {
         [fs.planes[0].clone(), fs.planes[1].clone(), fs.planes[2].clone()]
     };
-    // (no superres: UpscaledCdefFrame = CdefFrame, UpscaledCurrFrame = CurrFrame)
-    let lr = if filters.restoration { crate::restoration::lr_frame(&fs, hdr, &cdef_planes) } else { cdef_planes };
+    let up_cdef = crate::superres::upscale(fs, hdr, &cdef_planes);
+    if filters.restoration && hdr.uses_lr {
+        let up_cur = crate::superres::upscale(fs, hdr, &fs.planes);
+        crate::restoration::lr_frame(fs, hdr, &up_cur, &up_cdef)
+    } else {
+        up_cdef
+    }
+}
+
+/// The output process (§7.18): crop the planes to UpscaledWidth x FrameHeight.
+fn output_planes(seq: &SequenceHeader, hdr: &FrameHeader, lr: &[crate::decode::Plane; 3], stats: ToolStats, filters: Filters) -> Planes {
     let cc = &seq.color_config;
     let w = hdr.upscaled_width;
     let h = hdr.frame_height;
@@ -186,6 +389,14 @@ fn wrapup(seq: &SequenceHeader, hdr: &FrameHeader, mut fs: FrameState, filters: 
         v
     };
     let (cw, ch) = ((w + ssx) >> ssx, (h + ssy) >> ssy);
+    let mut y = crop(&lr[0], w, h);
+    let mut u = if cc.mono_chrome { Vec::new() } else { crop(&lr[1], cw, ch) };
+    let mut v = if cc.mono_chrome { Vec::new() } else { crop(&lr[2], cw, ch) };
+    let mut stats = stats;
+    if seq.film_grain_params_present && hdr.film_grain.apply_grain && filters.film_grain {
+        crate::filmgrain::apply(&hdr.film_grain, cc.bit_depth, cc.mono_chrome, ssx, ssy, cc.matrix_coefficients, w as usize, h as usize, &mut y, &mut u, &mut v);
+        stats.film_grain = true;
+    }
     Planes {
         width: w,
         height: h,
@@ -193,16 +404,16 @@ fn wrapup(seq: &SequenceHeader, hdr: &FrameHeader, mut fs: FrameState, filters: 
         mono: cc.mono_chrome,
         ss_x: ssx,
         ss_y: ssy,
-        y: crop(&lr[0], w, h),
-        u: if cc.mono_chrome { Vec::new() } else { crop(&lr[1], cw, ch) },
-        v: if cc.mono_chrome { Vec::new() } else { crop(&lr[2], cw, ch) },
+        y,
+        u,
+        v,
         color_primaries: cc.color_primaries,
         transfer_characteristics: cc.transfer_characteristics,
         matrix_coefficients: cc.matrix_coefficients,
         full_range: cc.color_range,
         seq: seq.clone(),
         frame: hdr.clone(),
-        stats: fs.stats.clone(),
+        stats,
     }
 }
 
@@ -212,9 +423,24 @@ pub fn decode_avif_planes(file: &[u8], filters: Filters) -> Result<Planes> {
     let cfg = item.av1c.as_ref().map(|c| c.config_obus.as_slice()).unwrap_or(&[]);
     let mut p = decode_obus(&item.data, cfg, filters)?;
     if item.width != 0 && (item.width != p.width || item.height != p.height) {
-        // e.g. a layered image (a1lx/lsel) whose base layer is smaller than the image: the upper
-        // layers are predicted from the base (inter prediction) — owed, never silently downsized.
-        return Err(Error::Unsupported("image size differs from the first frame (layered AVIF needs inter)"));
+        // A layered image (a1lx / a1op / lsel): the item holds several frames, the upper spatial
+        // layers predicted from the lower ones. Decode them all (operating point 0) and present the
+        // highest layer — the last shown frame at the image's own size (ispe).
+        let mut d = Decoder::new();
+        d.filters = filters;
+        if !cfg.is_empty() {
+            for o in split_obus(cfg)? {
+                if o.obu_type == OBU_SEQUENCE_HEADER_T {
+                    d.seq = Some(SequenceHeader::parse(o.payload)?);
+                }
+            }
+        }
+        let frames = d.decode(&item.data, false)?;
+        p = frames
+            .into_iter()
+            .filter(|f| f.width == item.width && f.height == item.height)
+            .next_back()
+            .ok_or(Error::Unsupported("no layer of the image's size (ispe)"))?;
     }
     if let Some(n) = item.nclx {
         // The container's nclx box is authoritative for presentation (AVIF §2.2.1).

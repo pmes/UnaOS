@@ -33,8 +33,8 @@ impl Src<'_> {
     }
 }
 
-/// Returns LrFrame.
-pub fn lr_frame(fs: &FrameState, h: &FrameHeader, cdef: &[Plane; 3]) -> [Plane; 3] {
+/// Returns LrFrame from UpscaledCurrFrame (`cur`) and UpscaledCdefFrame (`cdef`).
+pub fn lr_frame(fs: &FrameState, h: &FrameHeader, cur: &[Plane; 3], cdef: &[Plane; 3]) -> [Plane; 3] {
     let mut out = [cdef[0].clone(), cdef[1].clone(), cdef[2].clone()];
     if !h.uses_lr {
         return out;
@@ -47,7 +47,7 @@ pub fn lr_frame(fs: &FrameState, h: &FrameHeader, cdef: &[Plane; 3]) -> [Plane; 
                 if h.frame_restoration_type[plane] != RESTORE_NONE as u32 {
                     let row = y >> MI_SIZE_LOG2;
                     let col = x >> MI_SIZE_LOG2;
-                    restore_block(fs, h, cdef, &mut out, plane, row, col);
+                    restore_block(fs, h, cur, cdef, &mut out, plane, row, col);
                 }
             }
             x += MI_SIZE;
@@ -57,7 +57,8 @@ pub fn lr_frame(fs: &FrameState, h: &FrameHeader, cdef: &[Plane; 3]) -> [Plane; 
     out
 }
 
-fn restore_block(fs: &FrameState, h: &FrameHeader, cdef: &[Plane; 3], out: &mut [Plane; 3], plane: usize, row: usize, col: usize) {
+#[allow(clippy::too_many_arguments)]
+fn restore_block(fs: &FrameState, h: &FrameHeader, cur: &[Plane; 3], cdef: &[Plane; 3], out: &mut [Plane; 3], plane: usize, row: usize, col: usize) {
     let luma_y = row * MI_SIZE;
     let stripe_num = (luma_y + 8) / 64;
     let (sub_x, sub_y) = if plane == 0 { (0, 0) } else { (fs.ss_x, fs.ss_y) };
@@ -79,7 +80,7 @@ fn restore_block(fs: &FrameState, h: &FrameHeader, cdef: &[Plane; 3], out: &mut 
     let hh = ((MI_SIZE >> sub_y) as isize).min(plane_end_y - y + 1) as usize;
     let ui = unit_row * unit_cols + unit_col;
     let r_type = fs.lr_type[plane][ui] as usize;
-    let src = Src { cur: &fs.planes[plane], cdef: &cdef[plane], stripe_start_y, stripe_end_y, plane_end_x, plane_end_y };
+    let src = Src { cur: &cur[plane], cdef: &cdef[plane], stripe_start_y, stripe_end_y, plane_end_x, plane_end_y };
     let bd = fs.bit_depth;
     if r_type == RESTORE_WIENER {
         wiener(&src, &mut out[plane], fs.lr_wiener[plane][ui], x, y, w, hh, bd);

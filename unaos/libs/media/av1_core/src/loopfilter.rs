@@ -46,7 +46,7 @@ fn edge(fs: &mut FrameState, h: &FrameHeader, plane: usize, pass: usize, row: us
     let tx_sz = fs.lf_tx_sizes[plane][(row >> sub_y) * fs.mi_cols + (col >> sub_x)] as usize;
     let plane_size = SUBSAMPLED_SIZE[mi_size][sub_x][sub_y] as usize;
     let skip = fs.skips[mi] != 0;
-    let is_intra = true; // RefFrames[row][col][0] <= INTRA_FRAME in an intra frame
+    let is_intra = fs.ref_frames[mi][0] as i32 <= INTRA_FRAME as i32;
     let prev_tx_sz = fs.lf_tx_sizes[plane][(prev_row >> sub_y) * fs.mi_cols + (prev_col >> sub_x)] as usize;
     let is_block_edge = if pass == 0 {
         xp % (4 * NUM_4X4_BLOCKS_WIDE[plane_size] as usize) == 0
@@ -88,7 +88,9 @@ fn edge(fs: &mut FrameState, h: &FrameHeader, plane: usize, pass: usize, row: us
 fn strength(fs: &FrameState, h: &FrameHeader, row: usize, col: usize, plane: usize, pass: usize) -> (i32, i32, i32, i32) {
     let mi = fs.mi(row, col);
     let segment = fs.segment_ids[mi] as usize;
-    let mode_type = 0; // intra modes
+    let rf = fs.ref_frames[mi][0] as i32;
+    let mode = fs.y_modes[mi] as usize;
+    let mode_type = if mode >= NEARESTMV && mode != GLOBALMV && mode != GLOBAL_GLOBALMV { 1 } else { 0 };
     let delta_lf = if !h.delta_lf_multi {
         fs.delta_lfs[mi][0] as i32
     } else {
@@ -104,9 +106,11 @@ fn strength(fs: &FrameState, h: &FrameHeader, row: usize, col: usize, plane: usi
     }
     if h.loop_filter_delta_enabled {
         let n_shift = lvl_seg >> 5;
-        // ref == INTRA_FRAME
-        lvl_seg += h.loop_filter_ref_deltas[INTRA_FRAME] << n_shift;
-        let _ = mode_type;
+        if rf <= INTRA_FRAME as i32 {
+            lvl_seg += h.loop_filter_ref_deltas[INTRA_FRAME] << n_shift;
+        } else {
+            lvl_seg += (h.loop_filter_ref_deltas[rf as usize] << n_shift) + (h.loop_filter_mode_deltas[mode_type] << n_shift);
+        }
         lvl_seg = lvl_seg.clamp(0, MAX_LOOP_FILTER as i32);
     }
     let lvl = lvl_seg;

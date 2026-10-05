@@ -9,7 +9,6 @@
 //! one of these hashes has changed decoded pixels and must be re-proven against the oracle.
 mod common;
 use av1_core::image::{decode_avif, decode_avif_planes, Filters};
-use av1_core::Error;
 use common::{fetch, fnv64};
 
 /// name, width, height, bit depth, FNV-1a 64 of Y‖U‖V.
@@ -70,18 +69,6 @@ fn intra_vectors_decode_to_pinned_planes() {
         checked += 1;
     }
     eprintln!("m3: {checked} vectors matched their pinned planes");
-}
-
-#[test]
-fn honest_refusals() {
-    // Intra block copy (allow_intrabc) and layered AVIF (inter-predicted enhancement layers) are
-    // owed: they must be refused as Unsupported, never decoded wrongly.
-    if let Some(f) = fetch("Monochrome") {
-        assert_eq!(decode_avif_planes(&f, Filters::default()).unwrap_err(), Error::Unsupported("intra block copy"));
-    }
-    if let Some(f) = fetch("fruits_2layer_thumbsize") {
-        assert!(matches!(decode_avif_planes(&f, Filters::default()).unwrap_err(), Error::Unsupported(_)));
-    }
 }
 
 #[test]

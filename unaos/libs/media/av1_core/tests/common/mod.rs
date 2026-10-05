@@ -79,7 +79,9 @@ pub fn fetch(name: &str) -> Option<Vec<u8>> {
     let v = vectors().into_iter().find(|v| v.name == name).unwrap_or_else(|| panic!("no vector {name}"));
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("av1_core_vectors");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("{name}.avif"));
+    // keep the URL's extension (.avif, .ivf, .md5, ...)
+    let ext = v.url.rsplit('/').next().and_then(|b| b.split_once('.')).map(|(_, e)| e.to_string()).unwrap_or_else(|| "bin".into());
+    let path = dir.join(format!("{name}.{ext}"));
     if !path.exists() {
         let ok = std::process::Command::new("curl")
             .args(["-sSfL", "--max-time", "60", "-o"])
@@ -98,6 +100,162 @@ pub fn fetch(name: &str) -> Option<Vec<u8>> {
     let got = hex(&sha256(&data));
     assert_eq!(got, v.sha256, "sha256 mismatch for {name} ({})", v.url);
     Some(data)
+}
+
+/// MD5 (RFC 1321) — the libaom test vectors publish one MD5 per decoded frame.
+pub fn md5(data: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4,
+        11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    let k: Vec<u32> = (0..64).map(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32).collect();
+    let (mut a0, mut b0, mut c0, mut d0) = (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    let mut msg = data.to_vec();
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_le_bytes());
+    for chunk in msg.chunks(64) {
+        let m: Vec<u32> = (0..16).map(|i| u32::from_le_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]])).collect();
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (mut f, g);
+            if i < 16 {
+                f = (b & c) | (!b & d);
+                g = i;
+            } else if i < 32 {
+                f = (d & b) | (!d & c);
+                g = (5 * i + 1) % 16;
+            } else if i < 48 {
+                f = b ^ c ^ d;
+                g = (3 * i + 5) % 16;
+            } else {
+                f = c ^ (b | !d);
+                g = (7 * i) % 16;
+            }
+            f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..].copy_from_slice(&d0.to_le_bytes());
+    out
+}
+
+/// Split an IVF file into its frame payloads (temporal units).
+pub fn ivf_frames(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    if data.len() < 32 || &data[0..4] != b"DKIF" {
+        return out;
+    }
+    let mut off = u16::from_le_bytes([data[6], data[7]]) as usize;
+    while off + 12 <= data.len() {
+        let sz = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+        off += 12;
+        if off + sz > data.len() {
+            break;
+        }
+        out.push(&data[off..off + sz]);
+        off += sz;
+    }
+    out
+}
+
+/// Matroska / WebM: read an EBML variable-length integer (ID keeps its marker bit).
+fn ebml_vint(d: &[u8], off: usize, keep_marker: bool) -> Option<(u64, usize)> {
+    let b = *d.get(off)?;
+    let len = b.leading_zeros() as usize + 1;
+    if len > 8 || off + len > d.len() {
+        return None;
+    }
+    let mut v = if keep_marker { b as u64 } else { (b as u64) & ((1u64 << (8 - len)) - 1) };
+    for i in 1..len {
+        v = (v << 8) | d[off + i] as u64;
+    }
+    Some((v, len))
+}
+
+/// The frames of the first video track of a Matroska/WebM file: (CodecPrivate, frames).
+/// Walks Segment > Cluster > SimpleBlock / BlockGroup > Block (no lacing).
+pub fn mkv_frames(data: &[u8]) -> Option<(Vec<u8>, Vec<&[u8]>)> {
+    const SEGMENT: u64 = 0x18538067;
+    const CLUSTER: u64 = 0x1F43B675;
+    const SIMPLEBLOCK: u64 = 0xA3;
+    const BLOCKGROUP: u64 = 0xA0;
+    const BLOCK: u64 = 0xA1;
+    const TRACKS: u64 = 0x1654AE6B;
+    const TRACKENTRY: u64 = 0xAE;
+    const TRACKNUMBER: u64 = 0xD7;
+    const TRACKTYPE: u64 = 0x83;
+    const CODECPRIVATE: u64 = 0x63A2;
+    let mut frames = Vec::new();
+    let mut codec_private = Vec::new();
+    let mut video_track = 0u64;
+    fn walk<'a>(d: &'a [u8], mut off: usize, end: usize, f: &mut dyn FnMut(u64, &'a [u8]) -> bool) {
+        while off < end {
+            let Some((id, il)) = ebml_vint(d, off, true) else { return };
+            let Some((size, sl)) = ebml_vint(d, off + il, false) else { return };
+            let start = off + il + sl;
+            let unknown = size == (1u64 << (7 * sl)) - 1;
+            let stop = if unknown { end } else { (start + size as usize).min(end) };
+            if f(id, &d[start..stop]) {
+                walk(d, start, stop, f);
+            }
+            off = stop;
+        }
+    }
+    let mut blocks: Vec<&[u8]> = Vec::new();
+    walk(data, 0, data.len(), &mut |id, body| match id {
+        SEGMENT | CLUSTER | BLOCKGROUP | TRACKS => true,
+        TRACKENTRY => {
+            let mut num = 0u64;
+            let mut typ = 0u64;
+            let mut cp: &[u8] = &[];
+            walk(body, 0, body.len(), &mut |id2, b2| {
+                match id2 {
+                    TRACKNUMBER => num = b2.iter().fold(0, |a, &x| (a << 8) | x as u64),
+                    TRACKTYPE => typ = b2.iter().fold(0, |a, &x| (a << 8) | x as u64),
+                    CODECPRIVATE => cp = b2,
+                    _ => {}
+                }
+                false
+            });
+            if typ == 1 && video_track == 0 {
+                video_track = num;
+                codec_private = cp.to_vec();
+            }
+            false
+        }
+        SIMPLEBLOCK | BLOCK => {
+            blocks.push(body);
+            false
+        }
+        _ => false,
+    });
+    for b in blocks {
+        let Some((track, tl)) = ebml_vint(b, 0, false) else { continue };
+        if track != video_track || b.len() < tl + 3 {
+            continue;
+        }
+        let flags = b[tl + 2];
+        if flags & 0x06 != 0 {
+            continue; // laced blocks are not used for video
+        }
+        frames.push(&b[tl + 3..]);
+    }
+    Some((codec_private, frames))
 }
 
 /// FNV-1a 64 over 16-bit samples — the regression fingerprint of decoded planes.
