@@ -158,7 +158,8 @@ impl Svg {
             if l.unit == style::Unit::Percent {
                 return None;
             }
-            Some(style::resolve(l, style::Axis::X, 0.0, 0.0, st.font_size))
+            // Zero or negative sizes are treated as auto (Chromium renders such an image unscaled).
+            Some(style::resolve(l, style::Axis::X, 0.0, 0.0, st.font_size)).filter(|&v| v > 0.0)
         };
         let (w, h) = (dim("width"), dim("height"));
         // Intrinsic size (SVG 2 §8.2 / CSS replaced elements): explicit width/height; a missing one from the
@@ -211,7 +212,7 @@ impl Svg {
 
     /// Render with an explicit user→device transform (for nesting, e.g. `<image href=x.svg>`).
     pub fn render_into(&self, r: &mut render::Renderer, t: Transform, vb: Rect, canvas: &mut Pixmap) {
-        let ctx = render::Ctx { ts: t, vw: vb.w, vh: vb.h, style: r.opts.root_style(), ctx_fill: None, ctx_stroke: None };
+        let ctx = render::Ctx { ts: t, vw: vb.w, vh: vb.h, style: r.opts.root_style(), ctx_fill: None, ctx_stroke: None, ctx_elem: None };
         r.render_root(self.root, &ctx, canvas);
     }
 

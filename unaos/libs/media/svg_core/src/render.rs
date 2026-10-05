@@ -13,6 +13,7 @@ use crate::style::{self, Axis, Length, Paint, Props, Style, get, parse_func_iri,
 use crate::xml::{Document, Kind};
 use crate::{Options, text};
 use alloc::boxed::Box;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 const MAX_DEPTH: usize = 48;
@@ -44,6 +45,18 @@ pub struct Ctx {
     /// Context element paints for `context-fill` / `context-stroke` (markers, use).
     pub ctx_fill: Option<Box<Paint>>,
     pub ctx_stroke: Option<Box<Paint>>,
+    /// The context element itself: its bbox, coordinate system and style, which paint servers referenced
+    /// through context-fill/context-stroke resolve against (SVG 2 §13.3).
+    pub ctx_elem: Option<Box<CtxElem>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CtxElem {
+    pub bbox: Option<Rect>,
+    pub ts: Transform,
+    pub vw: f64,
+    pub vh: f64,
+    pub style: Style,
 }
 
 pub struct Renderer<'a> {
@@ -511,6 +524,13 @@ impl<'a> Renderer<'a> {
 
     /// A shader for a paint, with `bbox` the user-space object bounding box. `None` = paint nothing.
     pub fn shader(&mut self, p: &Paint, st: &Style, bbox: Option<Rect>, ctx: &Ctx) -> Option<Shader> {
+        if matches!(p, Paint::ContextFill | Paint::ContextStroke) {
+            if let Some(e) = ctx.ctx_elem.clone() {
+                let rp = self.resolve_paint(p, ctx)?.clone();
+                let c2 = Ctx { ts: e.ts, vw: e.vw, vh: e.vh, style: e.style.clone(), ctx_fill: None, ctx_stroke: None, ctx_elem: None };
+                return self.shader(&rp, &e.style, e.bbox, &c2);
+            }
+        }
         let p = self.resolve_paint(p, ctx)?.clone();
         match p {
             Paint::None | Paint::ContextFill | Paint::ContextStroke => None,
@@ -720,6 +740,7 @@ impl<'a> Renderer<'a> {
                 style: cst,
                 ctx_fill: None,
                 ctx_stroke: None,
+                ctx_elem: None,
             };
             let kids: Vec<usize> = self.doc.elements(c).collect();
             for k in kids {
@@ -756,7 +777,7 @@ impl<'a> Renderer<'a> {
         let mut mask = Mask::new(self.w, self.h, 0);
         self.active.push(cp);
         self.depth += 1;
-        let base = Ctx { ts, vw: ctx.vw, vh: ctx.vh, style: cst.clone(), ctx_fill: None, ctx_stroke: None };
+        let base = Ctx { ts, vw: ctx.vw, vh: ctx.vh, style: cst.clone(), ctx_fill: None, ctx_stroke: None, ctx_elem: None };
         let kids: Vec<usize> = self.doc.elements(cp).collect();
         for k in kids {
             self.clip_child(k, &base, &mut mask);
@@ -846,6 +867,121 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// `clip-path: circle() | ellipse() | inset() | polygon()` with an optional reference box (`fill-box`,
+    /// `stroke-box`/`border-box` (the default), `view-box`), as a coverage mask. `None` when invalid.
+    fn basic_shape_mask(&self, v: &str, st: &Style, bbox: Option<Rect>, ctx: &Ctx) -> Option<Mask> {
+        let v = v.trim();
+        let open = v.find('(')?;
+        let close = v.rfind(')')?;
+        let func = v[..open].trim();
+        let args = &v[open + 1..close];
+        let boxkw = v[close + 1..].trim();
+        let r = match boxkw {
+            "view-box" => Rect::new(0.0, 0.0, ctx.vw, ctx.vh),
+            "fill-box" | "content-box" | "padding-box" => bbox?,
+            _ => {
+                let b = bbox?;
+                let sw = if matches!(st.stroke, Paint::None) { 0.0 } else { self.stroke_style(st, ctx).map(|s| s.width).unwrap_or(0.0) };
+                Rect::new(b.x - sw / 2.0, b.y - sw / 2.0, b.w + sw, b.h + sw)
+            }
+        };
+        let lp = |t: &str, base: f64| -> Option<f64> {
+            match t {
+                "left" | "top" => Some(0.0),
+                "center" => Some(base / 2.0),
+                "right" | "bottom" => Some(base),
+                _ => parse_length(t).map(|l| resolve(l, Axis::X, base, base, st.font_size)),
+            }
+        };
+        let mut p = Path::new();
+        match func {
+            "circle" | "ellipse" => {
+                let (radii, at) = match args.split_once(" at ") {
+                    Some((a, b)) => (a.trim(), Some(b.trim())),
+                    None if args.trim_start().starts_with("at ") => ("", Some(args.trim_start()[3..].trim())),
+                    None => (args.trim(), None),
+                };
+                let (cx, cy) = match at {
+                    Some(a) => {
+                        let mut it = a.split_whitespace();
+                        (lp(it.next()?, r.w)?, lp(it.next().unwrap_or("center"), r.h)?)
+                    }
+                    None => (r.w / 2.0, r.h / 2.0),
+                };
+                let side = |t: &str, horiz: bool, diag: bool| -> Option<f64> {
+                    let (dx, dy) = (cx.min(r.w - cx), cy.min(r.h - cy));
+                    let (fx, fy) = (cx.max(r.w - cx), cy.max(r.h - cy));
+                    Some(match t {
+                        "closest-side" => if diag { dx.min(dy) } else if horiz { dx } else { dy },
+                        "farthest-side" => if diag { fx.max(fy) } else if horiz { fx } else { fy },
+                        _ => {
+                            let base = if diag { sqrt((r.w * r.w + r.h * r.h) / 2.0) } else if horiz { r.w } else { r.h };
+                            lp(t, base)?
+                        }
+                    })
+                };
+                let toks: Vec<&str> = radii.split_whitespace().collect();
+                let (rx, ry) = if func == "circle" {
+                    let rr = side(toks.first().copied().unwrap_or("closest-side"), true, true)?;
+                    (rr, rr)
+                } else {
+                    (side(toks.first().copied().unwrap_or("closest-side"), true, false)?, side(toks.get(1).copied().unwrap_or("closest-side"), false, false)?)
+                };
+                let (cx, cy) = (r.x + cx, r.y + cy);
+                let k = 0.552_284_749_830_793_4;
+                p.move_to(cx + rx, cy);
+                p.cubic_to((cx + rx, cy + ry * k), (cx + rx * k, cy + ry), (cx, cy + ry));
+                p.cubic_to((cx - rx * k, cy + ry), (cx - rx, cy + ry * k), (cx - rx, cy));
+                p.cubic_to((cx - rx, cy - ry * k), (cx - rx * k, cy - ry), (cx, cy - ry));
+                p.cubic_to((cx + rx * k, cy - ry), (cx + rx, cy - ry * k), (cx + rx, cy));
+                p.close();
+            }
+            "inset" => {
+                let main = args.split(" round ").next().unwrap_or("");
+                let t: Vec<&str> = main.split_whitespace().collect();
+                let g = |i: usize, base: f64| -> Option<f64> { lp(t.get(i)?, base) };
+                let (top, right, bottom, left) = match t.len() {
+                    1 => (g(0, r.h)?, g(0, r.w)?, g(0, r.h)?, g(0, r.w)?),
+                    2 => (g(0, r.h)?, g(1, r.w)?, g(0, r.h)?, g(1, r.w)?),
+                    3 => (g(0, r.h)?, g(1, r.w)?, g(2, r.h)?, g(1, r.w)?),
+                    4 => (g(0, r.h)?, g(1, r.w)?, g(2, r.h)?, g(3, r.w)?),
+                    _ => return None,
+                };
+                let (x0, y0, x1, y1) = (r.x + left, r.y + top, r.right() - right, r.bottom() - bottom);
+                p.move_to(x0, y0);
+                p.line_to(x1, y0);
+                p.line_to(x1, y1);
+                p.line_to(x0, y1);
+                p.close();
+            }
+            "polygon" => {
+                let mut first = true;
+                for pt in args.split(',') {
+                    let pt = pt.trim();
+                    if pt == "nonzero" || pt == "evenodd" {
+                        continue;
+                    }
+                    let mut it = pt.split_whitespace();
+                    let x = r.x + lp(it.next()?, r.w)?;
+                    let y = r.y + lp(it.next()?, r.h)?;
+                    if first {
+                        p.move_to(x, y);
+                        first = false;
+                    } else {
+                        p.line_to(x, y);
+                    }
+                }
+                p.close();
+            }
+            _ => return None,
+        }
+        let mut m = Mask::new(self.w, self.h, 0);
+        if let Some(c) = fill_coverage(&p.transform(&ctx.ts), FillRule::NonZero, self.w, self.h, true) {
+            m.union_coverage(&c);
+        }
+        Some(m)
+    }
+
     pub fn mask_mask(&mut self, id: &str, bbox: Option<Rect>, ctx: &Ctx) -> ClipResult {
         let Some(mk) = self.doc.by_id(id).filter(|&c| self.doc.nodes[c].is_svg("mask") && !self.resource_hidden(c)) else {
             return ClipResult::Ignore;
@@ -892,7 +1028,7 @@ impl<'a> Renderer<'a> {
         let mut layer = Pixmap::new(self.w, self.h);
         self.active.push(mk);
         self.depth += 1;
-        let cctx = Ctx { ts: content_ts, vw: ctx.vw, vh: ctx.vh, style: mst.clone(), ctx_fill: None, ctx_stroke: None };
+        let cctx = Ctx { ts: content_ts, vw: ctx.vw, vh: ctx.vh, style: mst.clone(), ctx_fill: None, ctx_stroke: None, ctx_elem: None };
         let kids: Vec<usize> = self.doc.elements(mk).collect();
         for k in kids {
             self.render(k, &cctx, &mut layer);
@@ -1003,7 +1139,7 @@ impl<'a> Renderer<'a> {
         if !ts.is_finite() || ts.det() == 0.0 && name != "svg" {
             return;
         }
-        let ectx = Ctx { ts, vw: ctx.vw, vh: ctx.vh, style: st.clone(), ctx_fill: ctx.ctx_fill.clone(), ctx_stroke: ctx.ctx_stroke.clone() };
+        let ectx = Ctx { ts, vw: ctx.vw, vh: ctx.vh, style: st.clone(), ctx_fill: ctx.ctx_fill.clone(), ctx_stroke: ctx.ctx_stroke.clone(), ctx_elem: ctx.ctx_elem.clone() };
         let p = &self.props[node];
         let clip = get(p, "clip-path").filter(|v| v.trim() != "none").map(|v| parse_func_iri(v));
         let mask = get(p, "mask").filter(|v| v.trim() != "none").map(|v| parse_func_iri(v));
@@ -1025,8 +1161,13 @@ impl<'a> Renderer<'a> {
         self.content(node, &ectx, &st, &ctx.style, &mut layer);
         if let Some(c) = clip {
             match c {
-                // An unparsable value: ignored.
-                None => {}
+                // Not a url(): a CSS basic shape (CSS Masking §6.1 / CSS Shapes 1 §3), else ignored.
+                None => {
+                    let v = get(&self.props[node], "clip-path").unwrap_or("").to_string();
+                    if let Some(m) = self.basic_shape_mask(&v, &st, bbox, &ectx) {
+                        layer.apply_mask(&m);
+                    }
+                }
                 Some(id) => match self.clip_mask(&id, bbox, &ectx) {
                     ClipResult::Mask(m) => layer.apply_mask(&m),
                     ClipResult::Ignore => {}
@@ -1195,7 +1336,7 @@ impl<'a> Renderer<'a> {
             Some(_) => return,
             None => (Transform::translate(x, y), w, h),
         };
-        let cctx = Ctx { ts: ctx.ts.mul(&inner), vw, vh, style: st.clone(), ctx_fill: ctx.ctx_fill.clone(), ctx_stroke: ctx.ctx_stroke.clone() };
+        let cctx = Ctx { ts: ctx.ts.mul(&inner), vw, vh, style: st.clone(), ctx_fill: ctx.ctx_fill.clone(), ctx_stroke: ctx.ctx_stroke.clone(), ctx_elem: ctx.ctx_elem.clone() };
         let clip = !st.overflow_visible;
         let _ = is_symbol;
         if clip {
@@ -1230,6 +1371,10 @@ impl<'a> Renderer<'a> {
         cctx.ts = ctx.ts.mul(&Transform::translate(x, y));
         cctx.style = st.clone();
         // The use element is the context element of its shadow tree (SVG 2 §13.3 context-fill/stroke).
+        if !matches!(st.fill, Paint::ContextFill | Paint::ContextStroke) && !matches!(st.stroke, Paint::ContextFill | Paint::ContextStroke) {
+            let bb = self.bbox(node, &Ctx { style: self.doc_style(self.doc.nodes[node].parent.unwrap_or(0)), ..ctx.clone() }, &Transform::IDENTITY);
+            cctx.ctx_elem = Some(Box::new(CtxElem { bbox: bb, ts: ctx.ts, vw: ctx.vw, vh: ctx.vh, style: st.clone() }));
+        }
         cctx.ctx_fill = self.resolve_paint(&st.fill, ctx).cloned().map(Box::new);
         cctx.ctx_stroke = self.resolve_paint(&st.stroke, ctx).cloned().map(Box::new);
         self.active.push(target);
@@ -1307,15 +1452,20 @@ impl<'a> Renderer<'a> {
         let wa = get(&self.props[node], "width").or(n.attr("width")).filter(|v| v.trim() != "auto").and_then(parse_length);
         let ha = get(&self.props[node], "height").or(n.attr("height")).filter(|v| v.trim() != "auto").and_then(parse_length);
         let par = n.attr("preserveAspectRatio").map(parse_par).unwrap_or_default();
-        let is_svg = mime.contains("svg") || crate::sniff_svg(&data);
+        // Raster formats are sniffed; SVG needs its media type (Chromium refuses an untyped SVG data URL).
+        let is_svg = mime.contains("svg");
         if is_svg {
             if self.depth > 8 {
                 return;
             }
             let Ok(sub) = crate::Svg::parse(&data) else { return };
             let (iw, ih) = sub.size_f();
-            let w = wa.map(|l| self.len(l, Axis::X, ctx, st)).unwrap_or(iw);
-            let h = ha.map(|l| self.len(l, Axis::Y, ctx, st)).unwrap_or(ih);
+            let (w, h) = match (wa.map(|l| self.len(l, Axis::X, ctx, st)), ha.map(|l| self.len(l, Axis::Y, ctx, st))) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, w * ih / iw),
+                (None, Some(h)) => (h * iw / ih, h),
+                (None, None) => (iw, ih),
+            };
             if !(w > 0.0 && h > 0.0) {
                 return;
             }
@@ -1347,8 +1497,13 @@ impl<'a> Renderer<'a> {
             return;
         }
         let (iw, ih) = (img.width as f64, img.height as f64);
-        let w = wa.map(|l| self.len(l, Axis::X, ctx, st)).unwrap_or(iw);
-        let h = ha.map(|l| self.len(l, Axis::Y, ctx, st)).unwrap_or(ih);
+        // `auto` width/height (SVG 2 §12.3): the intrinsic size, or the other dimension times the aspect ratio.
+        let (w, h) = match (wa.map(|l| self.len(l, Axis::X, ctx, st)), ha.map(|l| self.len(l, Axis::Y, ctx, st))) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w * ih / iw),
+            (None, Some(h)) => (h * iw / ih, h),
+            (None, None) => (iw, ih),
+        };
         if !(w > 0.0 && h > 0.0) {
             return;
         }

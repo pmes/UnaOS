@@ -132,12 +132,12 @@ pub fn render_markers(r: &mut Renderer, path: &Path, node: usize, ctx: &Ctx, st:
         };
         let Some(id) = id else { continue };
         let Some(m) = r.doc.by_id(id).filter(|&m| r.doc.nodes[m].is_svg("marker")) else { continue };
-        draw_marker(r, m, v, is_start, sw, ctx, st, canvas);
+        draw_marker(r, m, v, is_start, sw, ctx, st, canvas, path);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_marker(r: &mut Renderer, m: usize, v: &Vertex, is_start: bool, sw: f64, ctx: &Ctx, st: &Style, canvas: &mut Pixmap) {
+fn draw_marker(r: &mut Renderer, m: usize, v: &Vertex, is_start: bool, sw: f64, ctx: &Ctx, st: &Style, canvas: &mut Pixmap, path: &Path) {
     let mn = r.doc.nodes[m].clone();
     let mst = r.doc_style(m);
     let lenv = |a: &str, def: f64, axis: Axis| mn.attr(a).and_then(parse_length).map(|l| r.len(l, axis, ctx, &mst)).unwrap_or(def);
@@ -157,8 +157,19 @@ fn draw_marker(r: &mut Renderer, m: usize, v: &Vertex, is_start: bool, sw: f64, 
             if is_start { a + PI } else { a }
         }
         o => {
-            let o = o.trim_end_matches("deg");
-            o.parse::<f64>().map(|d| d * PI / 180.0).unwrap_or(0.0)
+            // <angle>: deg (default), grad, rad, turn.
+            let (num, k) = if let Some(n) = o.strip_suffix("deg") {
+                (n, PI / 180.0)
+            } else if let Some(n) = o.strip_suffix("grad") {
+                (n, PI / 200.0)
+            } else if let Some(n) = o.strip_suffix("rad") {
+                (n, 1.0)
+            } else if let Some(n) = o.strip_suffix("turn") {
+                (n, 2.0 * PI)
+            } else {
+                (o, PI / 180.0)
+            };
+            num.trim().parse::<f64>().map(|d| d * k).unwrap_or(0.0)
         }
     };
     let vb = mn.attr("viewBox").and_then(parse_view_box);
@@ -191,6 +202,7 @@ fn draw_marker(r: &mut Renderer, m: usize, v: &Vertex, is_start: bool, sw: f64, 
         style: mst.clone(),
         ctx_fill: Some(Box::new(st.fill.clone())),
         ctx_stroke: Some(Box::new(st.stroke.clone())),
+        ctx_elem: Some(Box::new(crate::render::CtxElem { bbox: path.bbox(), ts: ctx.ts, vw: ctx.vw, vh: ctx.vh, style: st.clone() })),
     };
     let mut layer = Pixmap::new(r.w, r.h);
     let kids: Vec<usize> = r.doc.elements(m).collect();
