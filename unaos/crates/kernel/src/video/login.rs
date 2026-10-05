@@ -724,13 +724,9 @@ fn close_into_session() {
     take_down();
     crate::boot::session_opened(); users::bar_release(); // INSTALLBARE M3 (R86): the Desktop phase begins here — the furniture is re-minted below FIRST; the services open when the shell has launched (or the bound)
     if SWEPT.swap(false, Ordering::AcqRel) {
-        super::super::dock::relaunch_furniture(); // LOGOUTDESK: the sweep emptied the desktop — this login's fresh session gets a fresh console and shell (the render bodies drain the latches)
-        REIGNITED.fetch_add(1, Ordering::Relaxed);
-        // LOGINFLOW2 M3 — LOGOUTDESK-REIGNITE: a session opened over a swept desktop; the console's and the shell's launches are POSTED (the render bodies mint them on their next pass).
-        let closed = SWEPT_N.load(Ordering::Relaxed);
-        let (c, sh) = (super::super::dock::launch_posted(super::super::dock::PinnedApp::Console), super::super::dock::launch_posted(super::super::dock::PinnedApp::Shell));
-        serial_println!(":: LOGOUTDESK: windows_closed={} reignited={} console={} shell={} -> {} ::", closed, c as u32 + sh as u32, if c { "posted" } else { "NO" }, if sh { "posted" } else { "NO" }, if c && sh { "PASS" } else { "FAIL —" });
+        REIGNITED.fetch_add(1, Ordering::Relaxed); // LOGINFURN (R88): a session opened over a swept desktop — and it stays BARE: nothing is posted
     }
+    crate::loginfurn::desktop_bare("session"); // LOGINFURN (R88): no console, no shell, no STAT at login — the user opens what they want
     take_down(); #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::wallpaper::rearm(); // WALLPAPER — the session user's ~/Desktop/WALL.PNG is probed on the next desktop flush
     FORM.lock().state = State::Session;
 }
@@ -2080,8 +2076,7 @@ pub fn installer_sweep() {
 /// `close_into_session` already did.
 pub fn installer_release() {
     if SWEPT.swap(false, Ordering::AcqRel) {
-        super::super::dock::relaunch_furniture();
-        serial_println!("[login] installer: furniture swept n=0 re-minted=2 (console+shell posted, the LOGOUTDESK re-mint)");
+        crate::loginfurn::desktop_bare("installer"); // LOGINFURN (R88): the desktop is released BARE — was `dock::relaunch_furniture` (console+shell)
     }
 }
 
@@ -2116,10 +2111,10 @@ pub fn boot2_fixture(name: &[u8], password: &[u8]) {
     let wrong_refused = is_open() && users::whoami(&mut nb).is_none();
     feed(password); let _ = consume_key(b'\n');
     let opened = !is_open() && matches!(users::whoami(&mut nb), Some(n) if &nb[..n] == name) && !users::root_session();
-    let reignited = REIGNITED.load(Ordering::Relaxed).wrapping_sub(r0) == 1;
+    let reignited = REIGNITED.load(Ordering::Relaxed).wrapping_sub(r0) == 1 && crate::loginfurn::nothing_posted(); // LOGINFURN (R88): the session opened over the swept desktop BARE
     let ok = screen_first && root_refused && wrong_refused && opened && reignited;
     serial_println!(
-        ":: FIRSTBOOT-LOGIN: user={} screen_first={} root_wrong={} wrong={} opened={} furniture_reignited={} -> {} ::",
+        ":: FIRSTBOOT-LOGIN: user={} screen_first={} root_wrong={} wrong={} opened={} desktop_bare={} -> {} ::",
         core::str::from_utf8(name).unwrap_or("?"), screen_first, if root_refused { "refused" } else { "ACCEPTED" }, if wrong_refused { "refused" } else { "ACCEPTED" }, opened, reignited, if ok { "PASS" } else { "FAIL —" }
     );
 }
@@ -2149,14 +2144,14 @@ pub fn logout_fixture(name: &[u8], password: &[u8]) {
     let feed = |s: &[u8]| { for &b in s { let _ = consume_key(b); } };
     feed(name); let _ = consume_key(b'\t'); feed(password); let _ = consume_key(b'\n');
     let back_in = !is_open() && matches!(users::whoami(&mut nb), Some(n) if &nb[..n] == name);
-    let furniture = REIGNITED.load(Ordering::Relaxed).wrapping_sub(r0) == 1 && !SWEPT.load(Ordering::Relaxed);
+    let furniture = REIGNITED.load(Ordering::Relaxed).wrapping_sub(r0) == 1 && !SWEPT.load(Ordering::Relaxed) && crate::loginfurn::nothing_posted(); // LOGINFURN (R88): relogin is BARE too
     let _ = users::logout();
     take_down();
     FORM.lock().state = State::Closed;
     HEADLESS.store(was, Ordering::Relaxed);
     let ok = alert_up && alert_closed && in_ok && screen_back && back_in && furniture;
     serial_println!(
-        ":: LOGOUT: alert_open={} alert_ok_closes={} session={} screen_back_empty={} relogin={} furniture_back={} -> {} ::",
+        ":: LOGOUT: alert_open={} alert_ok_closes={} session={} screen_back_empty={} relogin={} desktop_bare={} -> {} ::",
         alert_up, alert_closed, in_ok, screen_back, back_in, furniture, if ok { "PASS" } else { "FAIL —" }
     );
 }
