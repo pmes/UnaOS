@@ -71,3 +71,12 @@ subscription and the window's shown value moved to it, then restores the operato
   128..130 retire when a ruling lets a ring-3 Principia take 16..19 over.
 - Read-only device-path peeks (`powerui` low-battery percent, `hda_amp` hold-off) stay try-lock reads of the cache
   (they run where no bus wait is allowed); lumen's `vein` reads likewise.
+
+## Results (compile legs, from `unaos/crates/kernel`, at the M4 tip + this doc)
+
+- x86 metal shape (`wc,quarry,ftdirx,login,loginst,nvidia-kepler-vblank,smc,usbnet,hda,hda-tone,facet,beam,sdw,sdwrite,sdhcblk,selfhost,linuxabi,ahci,unafs,busreg,lumen,netring3,prefs_reset,census,installdemo,instgui,witness`): exit 0.
+- aarch64 desktop shape (`login,loginst,virt_el0,desktop_firmware,busreg,facet,witness`): exit 0. aarch64 base (`login,loginst,virt_el0`): exit 0.
+- user-prefs (the `build_user_prefs_x86` cargo line): exit 0. charter-check: exit 0.
+- `DIRECT_WRITERS` is a const scan over ~2.5 MB of source per arch (this arch's syscall.rs only); rustc prints
+  "constant evaluation is taking a long time" for it (a warning; the shell.rs FATVERB scan is the precedent).
+- No knob: the client builds wherever the bus does; the relay leg rides `busreg`; the fixture rides `witness` + the desktop.
