@@ -1770,8 +1770,8 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
                 typematic::BOOT_REARMS.fetch_add(1, Ordering::Relaxed);
                 if n <= typematic::REARM_LOG_MAX {
                     serial_println!(
-                        "[keystat] typematic re-arm — key={:#04x} still held after a liveness lapse; repeat resumed at delay={}ms (hold re-arms={} boot re-arms={})",
-                        k,
+                        "[keystat] typematic re-arm — key={} still held after a liveness lapse; repeat resumed at delay={}ms (hold re-arms={} boot re-arms={})",
+                        crate::pwwire::key_class(k), // CONSOLEFIX M3: a class, never the key
                         typematic::DELAY_MS,
                         n,
                         typematic::BOOT_REARMS.load(Ordering::Relaxed)
@@ -1809,8 +1809,8 @@ fn typematic_hold_rollup() {
         return;
     }
     serial_println!(
-        "[keystat] typematic hold end — key={:#04x} repeats={} re-arms={} window={}ms (boot: repeats={} re-arms={})",
-        key.wrapping_sub(1) as u8,
+        "[keystat] typematic hold end — key={} repeats={} re-arms={} window={}ms (boot: repeats={} re-arms={})",
+        crate::pwwire::key_class(key.wrapping_sub(1) as u8), // CONSOLEFIX M3
         repeats,
         rearms,
         if typematic::STREAMS_WHILE_HELD.load(Ordering::Relaxed) != 0 {

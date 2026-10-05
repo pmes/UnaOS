@@ -44,6 +44,10 @@ integration). Stays out of INSTALLBARE's files (login/firstboot/service starters
 - M1 `tests sntp` on a fixture clock; `tests netclock` needs a real lease (`SKIP reason=no-lease`).
 - M2 notices non-modal; `tests notice`.
 - M3 tracer + key-echo redaction, KAT (`cargo test -p midden_core` + the kernel KAT inside `tests pwwire`), `tests pwwire`.
+- M3b (coordinator, GLASSLAG's neighbour): every per-key trace names a CLASS, never a value or scancode
+  (`pwwire::key_class`: printable/enter/backspace/tab/esc/control/nav) — EHCI/xHCI `KEY:`/`KEYUP`, `[hidkeys] keyup`,
+  `USB-DEBUG: KEY`, `[serialdoor] key=`, `[quarry] key_route key=` (silent altogether while `withhold()`), `[keystat]`,
+  `KEYREPEAT-X86`, tegra `JD2`/`JB2b`. `jetson-jd5.spec`'s `REQUIRE xHCI: KEY:` still matches (prefix kept).
 - M4 this doc's witness section.
 
 ## Witness (what a metal boot prints)
@@ -53,7 +57,13 @@ integration). Stays out of INSTALLBARE's files (login/firstboot/service starters
 - `:: NETCLOCK: … -> SKIP reason=no-lease ::` on the bench (no DHCP), `… lease=<ip> gw=<ip> clock=<src> -> PASS ::` with one.
 - `:: NOTICE: typed_through=ok modal=none flash=none -> PASS ::`
 - `:: [midden] cmd="holocron init ***" -> Exec holocron.elf ::`
-- `:: PWWIRE: kat=8/8 trace=redacted keys_withheld=<n>/<n> lines=<n> window=2000 hits=0 -> PASS ::`
+- `:: PWWIRE: kat=17/17 trace=redacted keytrace=class keys_withheld=21/21 lines=<n> window=2000 hits=0 -> PASS ::`
+- `EHCI-HID: KEY: class=printable` / `EHCI-HID: KEY withheld (a secret is being typed)` / `[quarry] key_route key=enter focus=1 took=1`
+- `:: NOTICE-OPEN: title=Program stopped lines=1 modal=none -> PASS ::`, `[notice] closed by=timeout|click title=…`
+
+## Compile legs (direct, inline)
+- x86 metal shape + selfdiag,ahciroot,btc,lumen (+ arroyo's default ehcihid,kbdwit,smolnet): exit 0; same + usbdebug: exit 0.
+- aarch64 `login,loginst,virt_el0,lumen`: exit 0. aarch64 `tegra` (the JD2/JB2b edits): exit 0. `cargo test -p midden_core`: 26 passed (2 new).
 
 ## Owed
 - The holocron CLIENT still raises its answer as a notice (`user-holocron`, HOLOCRON2's file): non-modal now, so harmless, but the

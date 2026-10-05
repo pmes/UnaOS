@@ -5187,7 +5187,7 @@ impl XhciController {
                                                 // cannot disagree about what a key types.
                                                 let ascii = hid_key_ascii(keycode, modifiers, caps);
                                                 if ascii != 0 {
-                                                    if !crate::pwwire::withhold() { serial_println!("xHCI: KEY: '{}' (scancode {:#x})", ascii as char, keycode); } // CONSOLEFIX M3 (R65): never a secret byte on the wire
+                                                    if !crate::pwwire::withhold() { serial_println!("xHCI: KEY: class={}", crate::pwwire::key_class(ascii)); } // CONSOLEFIX M3 (R65): never a secret byte on the wire
                                                     crate::pal::push_event(crate::pal::Event::Key(ascii));
                                                 }
                                             }
@@ -5229,7 +5229,7 @@ impl XhciController {
                                                 let ascii = hid_key_release_ascii(keycode, modifiers, caps);
                                                 if ascii != 0 {
                                                     #[cfg(feature = "usbdebug")]
-                                                    if !crate::pwwire::withhold() { serial_println!("[hidkeys] keyup '{}' (scancode {:#x}) slot={}", ascii as char, keycode, slot_id); } // CONSOLEFIX M3
+                                                    if !crate::pwwire::withhold() { serial_println!("[hidkeys] keyup class={} slot={}", crate::pwwire::key_class(ascii), slot_id); } // CONSOLEFIX M3
                                                     crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
                                                 }
                                             }

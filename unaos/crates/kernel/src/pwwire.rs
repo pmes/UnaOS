@@ -64,6 +64,25 @@ pub fn withhold_fresh() -> bool {
     withhold()
 }
 
+/// The per-key traces' vocabulary (CONSOLEFIX M3, GLASSLAG's finding: `[quarry] key_route key=0x..` printed
+/// 40+ raw codes on flight 22 — under a password field that IS the password). A per-key line names the CLASS
+/// of the key, never its value or scancode: EHCI/xHCI `KEY:`/`KEYUP`, `[hidkeys]`, `USB-DEBUG`, `[serialdoor]`,
+/// `[quarry] key_route`, `[keystat]`, `KEYREPEAT-X86`, the tegra `JD2`/`JB2b` markers.
+pub const KEY_CLASSES: &[&str] = &["printable", "enter", "backspace", "tab", "esc", "control", "nav"];
+
+/// The class of a key byte (see [`KEY_CLASSES`]).
+pub fn key_class(c: u8) -> &'static str {
+    match c {
+        b'\r' | b'\n' => "enter",
+        8 | 0x7f => "backspace",
+        b'\t' => "tab",
+        0x1b => "esc",
+        0x20..=0x7e => "printable",
+        0x80..=0xff => "nav",
+        _ => "control",
+    }
+}
+
 /// `line` as the wire may carry it (trimmed; `holocron init ***` when secret-shaped).
 pub fn shown(line: &str) -> Cow<'_, str> {
     let t = line.trim();
@@ -152,9 +171,12 @@ pub fn pwwire_fixture() {
     let lines = WIRE_LINES.load(Relaxed);
     let hit = LAST_HIT.load(Relaxed);
     let hits = (hit != 0 && lines.saturating_sub(hit) < WINDOW) as u32;
-    let ok = kat_ok == kat_n && shown_ok && leaked == 0 && early == 0 && withheld == secret_n && after_submit && hits == 0;
+    // The per-key sweep: every byte of the fixture line, through the per-key traces' one formatter, is a class
+    // word (no value, no glyph); `[quarry] key_route` and the edge lines print nothing while `withhold()` (above).
+    let classes_ok = line.bytes().all(|b| KEY_CLASSES.contains(&key_class(b))) && key_class(b'q') == "printable" && key_class(b'\r') == "enter";
+    let ok = classes_ok && kat_ok == kat_n && shown_ok && leaked == 0 && early == 0 && withheld == secret_n && after_submit && hits == 0;
     serial_println!(
-        ":: PWWIRE: kat={}/{} trace={} keys_withheld={}/{} lines={} window={} hits={} -> {} ::",
-        kat_ok, kat_n, if shown_ok { "redacted" } else { "LEAKED" }, withheld, secret_n, lines, WINDOW, hits, if ok { "PASS" } else { "FAIL" }
+        ":: PWWIRE: kat={}/{} trace={} keytrace={} keys_withheld={}/{} lines={} window={} hits={} -> {} ::",
+        kat_ok, kat_n, if shown_ok { "redacted" } else { "LEAKED" }, if classes_ok { "class" } else { "VALUE" }, withheld, secret_n, lines, WINDOW, hits, if ok { "PASS" } else { "FAIL" }
     );
 }

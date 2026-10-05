@@ -16721,7 +16721,7 @@ unsafe fn decode_boot_keyboard(
             restated_this_report += 1;
             continue;
         }
-        if !crate::pwwire::withhold() { serial_println!("EHCI-HID: KEY: '{}' (scancode {:#x})", ascii as char, keycode); } else { serial_println!("EHCI-HID: KEY withheld (a secret is being typed)"); } // CONSOLEFIX M3 (B365, R65): flight 22 printed the login password AND `holocron init`'s here, byte by byte
+        if !crate::pwwire::withhold() { serial_println!("EHCI-HID: KEY: class={}", crate::pwwire::key_class(ascii)); let _ = keycode; } else { serial_println!("EHCI-HID: KEY withheld (a secret is being typed)"); } // CONSOLEFIX M3 (B365, R65): flight 22 printed the login password AND `holocron init`'s here, byte by byte
         crate::pal::push_event(crate::pal::Event::Key(ascii));
         note_press_edge(ascii);
     }
@@ -16768,7 +16768,7 @@ unsafe fn decode_boot_keyboard(
         }
         let ascii = release_ascii_of(keycode);
         if ascii != 0 {
-            if !crate::pwwire::withhold() { serial_println!("EHCI-HID: KEYUP: '{}' (scancode {:#x})", ascii as char, keycode); } // CONSOLEFIX M3
+            if !crate::pwwire::withhold() { serial_println!("EHCI-HID: KEYUP: class={}", crate::pwwire::key_class(ascii)); } // CONSOLEFIX M3
             crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
         }
     }
