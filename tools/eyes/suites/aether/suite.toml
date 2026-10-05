@@ -1,0 +1,17 @@
+# EYES suite: Aether (handlers/aether), the from-scratch browser, against Chromium.
+# Placeholders: {repo} {suite} {outdir} {case} {out} {ref} {w} {h} {page} {url}
+build = ["cargo build --release -q -p aether --bin aether"]
+
+[defaults]
+width = 800
+height = 600
+
+[defaults.subject]
+kind = "cmd"
+run = "{repo}/target/release/aether render --html {page} --width {w} --height {h} --out {out} --ledger {outdir}/{case}.ledger.txt"
+# Aether's missing-API ledger: its distinct count and top 3 go into SCORE.md.
+ledger = "{outdir}/{case}.ledger.txt"
+
+[defaults.oracle]
+kind = "chromium"
+url = "file://{page}"

@@ -1,0 +1,98 @@
+{
+  "cases": {
+    "01-blog-article": {
+      "mismatch": 12.04,
+      "missing": 0,
+      "ssim": 0.6532
+    },
+    "02-flex-two-column": {
+      "mismatch": 8.59,
+      "missing": 0,
+      "ssim": 0.754
+    },
+    "03-card-gallery": {
+      "mismatch": 0.87,
+      "missing": 1,
+      "ssim": 0.9661
+    },
+    "04-sticky-nav": {
+      "mismatch": 6.91,
+      "missing": 2,
+      "ssim": 0.7219
+    },
+    "05-form": {
+      "mismatch": 4.63,
+      "missing": 0,
+      "ssim": 0.703
+    },
+    "06-table-zebra": {
+      "mismatch": 6.19,
+      "missing": 1,
+      "ssim": 0.7913
+    },
+    "07-images-svg": {
+      "mismatch": 12.02,
+      "missing": 0,
+      "ssim": 0.8292
+    },
+    "08-inline-wrap": {
+      "mismatch": 8.33,
+      "missing": 2,
+      "ssim": 0.7446
+    },
+    "09-media-queries": {
+      "mismatch": 1.29,
+      "missing": 0,
+      "ssim": 0.9772
+    },
+    "09-media-queries@375": {
+      "mismatch": 1.22,
+      "missing": 0,
+      "ssim": 0.9782
+    },
+    "10-calc-clamp": {
+      "mismatch": 26.0,
+      "missing": 1,
+      "ssim": 0.7182
+    },
+    "10-calc-clamp@375": {
+      "mismatch": 24.6,
+      "missing": 1,
+      "ssim": 0.7416
+    },
+    "11-non-latin": {
+      "mismatch": 4.1,
+      "missing": 0,
+      "ssim": 0.8111
+    },
+    "12-js-mutation": {
+      "mismatch": 8.38,
+      "missing": 0,
+      "ssim": 0.7726
+    },
+    "13-ua-defaults": {
+      "mismatch": 2.58,
+      "missing": 0,
+      "ssim": 0.8887
+    },
+    "14-boxes": {
+      "mismatch": 14.89,
+      "missing": 0,
+      "ssim": 0.5447
+    },
+    "15-landing": {
+      "mismatch": 3.56,
+      "missing": 1,
+      "ssim": 0.8869
+    },
+    "16-positioned": {
+      "mismatch": 13.34,
+      "missing": 1,
+      "ssim": 0.8623
+    }
+  },
+  "thresholds": {
+    "mismatch_rise": 2.0,
+    "ssim_drop": 0.02
+  }
+}

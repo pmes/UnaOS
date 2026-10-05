@@ -3736,7 +3736,7 @@ busreg = []
 # windowed app note; provider/key by vein_core's shared rule). The program itself (APPS/LUMEN.ELF,
 # crates/user-lumen, ONE program that talks to the provider) and the `lumen` verb exist on every build.
 # Kept in sync with `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
-lumen = ["dep:vein_core"]
+lumen = ["dep:vein_core", "dep:holocron_core"] # HOLOCRON2 (B355): + holocron_core — SYS_KDF (66), the login launch of APPS/HOLOCRON.ELF and `tests holocron` (crate::keyring)
 
 # SELFDIAG (rmbp-ledger B324, R82): UNAOS_SELFDIAG=1 arms the smart installer's diagnosis loop's kernel half —
 # the BOOT LOG ON DISK (crate::bootwit: every `:: TAG: ... -> PASS|FAIL|SKIP ::` line and the `:: BOOT:`
@@ -3803,6 +3803,8 @@ prefs_core = { path = "../../libs/sys/prefs_core" }
 # LUMENAPP (B323): Vein's shared no_std core — `tests lumen` applies the SAME provider/key rule the ring-3
 # LUMEN.ELF applies (vein_core::prefs::plan). Zero deps; only under feature `lumen`.
 vein_core = { path = "../../libs/sys/vein_core", default-features = false, optional = true }
+# HOLOCRON2 (rmbp-ledger B355): Holocron's keyring core (no_std, CRYPTOCORE only) — `tests holocron` runs its service on a RAM ring. Rides `lumen`.
+holocron_core = { path = "../../libs/sys/holocron_core", optional = true }
 # WIFI1 (B338, R79): the BCM4331 driver's shared no_std core — the firmware container codec and the
 # IEEE 802.11 frame codec, the same crate the host tests link. `optional`, pulled only by `wifi`.
 wifi_core = { path = "../../libs/sys/wifi_core", default-features = false, optional = true }

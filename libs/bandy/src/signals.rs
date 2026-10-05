@@ -253,6 +253,12 @@ pub enum SMessage {
     /// app surface adds one outer variant, not a spray of siblings.
     Logs(LogEvent),
 
+    // --- FACET (The Canvas — the Images handler, ledger SR29) ---
+    /// The Images handler's channel: open/inspect/render/edit/export a picture by handle, and the
+    /// "open image" association every other surface (Matrix's Finder, Quarry, Aether) delegates
+    /// through. Mirrors the [`SMessage::Principia`] / [`SMessage::Matrix`] sub-enum shape.
+    Facet(FacetCommand),
+
     // --- UI EVENTS (Migrated from gneiss_pal::types::Event) ---
     Input {
         target: String,
@@ -461,6 +467,210 @@ pub enum MatrixEvent {
         path: String,
         outcome: FsOutcome,
     },
+}
+
+/// FACET (SR29) — the Images handler's bus vocabulary (`handlers/facet`).
+///
+/// Every request carries a caller-chosen `receipt_id` that its answer echoes, so many callers can
+/// share one broadcast Synapse. Every request that fails is answered by
+/// [`FacetCommand::ImageError`] with the same receipt — never silence. Replies are inert as input:
+/// Facet hears its own answers on the bus and does not act on them.
+///
+/// The association: a surface that meets an image file (Matrix's Finder after a successful
+/// `FsVerb::Open`, the kernel's Quarry twin, Aether on an image navigation) fires
+/// [`FacetCommand::ImageOpen`] instead of opening the bytes itself; Facet decodes and answers
+/// [`FacetCommand::ImageOpened`], and a viewer (the `facet-view` vessel) presents that handle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FacetCommand {
+    /// Open and decode a file. `principal` stamps who asked (the message-security law the Finder
+    /// verbs follow). Answered by [`FacetCommand::ImageOpened`] or [`FacetCommand::ImageError`].
+    ImageOpen { receipt_id: u64, principal: Origin, path: String },
+    /// The answer to [`FacetCommand::ImageOpen`]: the handle every later verb names.
+    ImageOpened { receipt_id: u64, handle: u64, info: FacetImageInfo },
+    /// Ask for a handle's metadata. Answered by [`FacetCommand::ImageInfoIs`].
+    ImageInfo { receipt_id: u64, handle: u64 },
+    /// A handle's metadata (also the answer to every [`FacetCommand::ImageEdit`]).
+    ImageInfoIs { receipt_id: u64, handle: u64, info: FacetImageInfo },
+    /// Append one non-destructive edit to the handle's op list (or undo/redo/reset it). Answered
+    /// by [`FacetCommand::ImageInfoIs`] carrying the new dimensions and edit count.
+    ImageEdit { receipt_id: u64, handle: u64, edit: FacetEdit },
+    /// Render the edited image through `view` into a `width x height` viewport. Answered by
+    /// [`FacetCommand::ImageRendered`]. Facet refuses a viewport over 4096 x 4096.
+    ImageRender { receipt_id: u64, handle: u64, width: u32, height: u32, view: FacetView },
+    /// Straight 8-bit RGBA, `width * height * 4` bytes, row-major, top row first.
+    ImageRendered { receipt_id: u64, handle: u64, width: u32, height: u32, rgba: Vec<u8> },
+    /// Bake the op list and write the result to `path`. An existing file is refused unless
+    /// `overwrite` is set. Answered by [`FacetCommand::ImageExported`].
+    ImageExport { receipt_id: u64, handle: u64, path: String, format: FacetFormat, overwrite: bool },
+    /// The answer to [`FacetCommand::ImageExport`]: what was written, and how many bytes.
+    ImageExported { receipt_id: u64, handle: u64, path: String, bytes: u64 },
+    /// Release a handle (no answer; closing an unknown handle is a no-op).
+    ImageClose { handle: u64 },
+    /// A refused request, by receipt. `handle` is `None` when the request named none (an open).
+    ImageError { receipt_id: u64, handle: Option<u64>, message: String },
+}
+
+impl FacetCommand {
+    /// The "open image" association on the host: the MIME type Facet claims for `path`, judged by
+    /// its extension (case-insensitive), or `None` when the file is not Facet's. The host twin of
+    /// the kernel type database's `image/png -> facet` row (`fs/assoc.rs`): a surface that meets a
+    /// path this answers `Some` for fires [`FacetCommand::ImageOpen`] instead of opening it.
+    pub fn image_mime_for(path: &str) -> Option<&'static str> {
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+        Some(match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" | "jpe" | "jfif" => "image/jpeg",
+            "gif" => "image/gif",
+            "bmp" | "dib" => "image/bmp",
+            "qoi" => "image/qoi",
+            "webp" => "image/webp",
+            _ => return None,
+        })
+    }
+
+    /// The association for a NAVIGATION (Aether): the local path behind a `file://` URL (or a bare
+    /// absolute path) when Facet claims it, else `None` — remote images stay the page's business.
+    /// `%XX` escapes are decoded; a query or fragment is dropped.
+    pub fn local_image_path(url: &str) -> Option<String> {
+        let rest = match url.strip_prefix("file://") {
+            Some(r) => r.strip_prefix("localhost").unwrap_or(r),
+            None if url.starts_with('/') => url,
+            None => return None,
+        };
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        let raw = rest.as_bytes();
+        let mut out = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'%' && i + 2 < raw.len() {
+                if let Some(v) = std::str::from_utf8(&raw[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(raw[i]);
+            i += 1;
+        }
+        let path = String::from_utf8(out).ok()?;
+        (path.starts_with('/') && Self::image_mime_for(&path).is_some()).then_some(path)
+    }
+
+    /// The receipt this message carries (`None` for [`FacetCommand::ImageClose`]).
+    pub fn receipt_id(&self) -> Option<u64> {
+        match self {
+            FacetCommand::ImageOpen { receipt_id, .. }
+            | FacetCommand::ImageOpened { receipt_id, .. }
+            | FacetCommand::ImageInfo { receipt_id, .. }
+            | FacetCommand::ImageInfoIs { receipt_id, .. }
+            | FacetCommand::ImageEdit { receipt_id, .. }
+            | FacetCommand::ImageRender { receipt_id, .. }
+            | FacetCommand::ImageRendered { receipt_id, .. }
+            | FacetCommand::ImageExport { receipt_id, .. }
+            | FacetCommand::ImageExported { receipt_id, .. }
+            | FacetCommand::ImageError { receipt_id, .. } => Some(*receipt_id),
+            FacetCommand::ImageClose { .. } => None,
+        }
+    }
+
+    /// True for the requests Facet serves (the rest are its own answers, inert as input).
+    pub fn is_request(&self) -> bool {
+        matches!(
+            self,
+            FacetCommand::ImageOpen { .. }
+                | FacetCommand::ImageInfo { .. }
+                | FacetCommand::ImageEdit { .. }
+                | FacetCommand::ImageRender { .. }
+                | FacetCommand::ImageExport { .. }
+                | FacetCommand::ImageClose { .. }
+        )
+    }
+}
+
+impl Default for FacetView {
+    fn default() -> Self {
+        FacetView { zoom: FacetZoom::Fit, pan_x: 0, pan_y: 0, quarter_turns: 0, flip_h: false, flip_v: false }
+    }
+}
+
+/// What Facet knows about an open image.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FacetImageInfo {
+    pub path: String,
+    /// Container format (`"png"`, `"jpeg"`, `"gif"`, `"bmp"`, `"qoi"`, `"webp"`).
+    pub format: String,
+    /// Dimensions as stored in the file.
+    pub source_width: u32,
+    pub source_height: u32,
+    /// Dimensions after EXIF orientation and every edit in the op list.
+    pub width: u32,
+    pub height: u32,
+    /// The EXIF orientation found in the file (1..=8, 1 when absent). Facet APPLIES it.
+    pub orientation: u8,
+    /// The colour space the file declares, as Facet read it (`"sRGB chunk"`, `"ICC profile
+    /// 'Display P3' (536 bytes)"`, `"untagged (assumed sRGB)"`, ...). Noted, not managed.
+    pub colour: String,
+    /// Bits per sample as stored.
+    pub bit_depth: u8,
+    pub has_alpha: bool,
+    /// Animation frames (1 for a still).
+    pub frames: u32,
+    /// File size in bytes.
+    pub bytes: u64,
+    /// Ops currently in force in the edit list.
+    pub edits: u32,
+}
+
+/// One non-destructive edit. Coordinates are in the image as it stands after the previous ops.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FacetEdit {
+    Crop { x: u32, y: u32, width: u32, height: u32 },
+    /// Clockwise quarter turns (1 = 90 degrees).
+    Rotate { quarter_turns: u8 },
+    /// `horizontal: true` mirrors left/right; `false` mirrors top/bottom.
+    Flip { horizontal: bool },
+    /// Resample to exactly `width x height` with Facet's documented triangle filter.
+    Resize { width: u32, height: u32 },
+    /// CSS filter semantics, applied in that order: `brightness(b) contrast(c)`; 1.0 = identity.
+    Adjust { brightness: f32, contrast: f32 },
+    Undo,
+    Redo,
+    /// Drop the whole op list (undoable).
+    Reset,
+}
+
+/// How a render frames the image. View state is never baked into an export.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FacetView {
+    pub zoom: FacetZoom,
+    /// Displacement of the picture from its centred position, viewport pixels (clamped so no gap
+    /// opens on an axis where the picture is larger than the viewport).
+    pub pan_x: i32,
+    pub pan_y: i32,
+    /// Clockwise quarter turns of the view (display only).
+    pub quarter_turns: u8,
+    pub flip_h: bool,
+    pub flip_v: bool,
+}
+
+/// The view's zoom.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum FacetZoom {
+    /// Shrink to fit the viewport, never enlarge (the kernel viewer's rule).
+    Fit,
+    /// 100 %: one image pixel per viewport pixel.
+    Actual,
+    /// Percent of the image's size (1..=6400).
+    Percent(u32),
+}
+
+/// An export container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FacetFormat {
+    Png,
+    /// Owed: no UnaOS JPEG encoder exists yet; Facet answers `ImageError` naming the gap.
+    Jpeg,
 }
 
 /// Console log-viewer events (the macOS `Console.app` model): the app is a

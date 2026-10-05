@@ -1371,10 +1371,6 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
         return Err(FacetError::Size(st.size));
     }
     if let Some(d) = anim::probe(path) { close(); return anim::open_frames(path, st.size, d); } // QUARRY2 (B336): frames from the decoder adapter (None today: PNG is a still)
-    let pi = crate::video::panel_info_nonblocking().ok_or(FacetError::NoWindow("panel-busy"))?;
-    let (pw, ph) = (pi.width, pi.height);
-    let win_w = CEIL_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
-    let win_h = CEIL_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
     // PIXELCORE (SR25): a file whose first eight bytes are not the PNG signature goes to
     // `pixel_core::decode` whole (JPEG, GIF frame 0, BMP, QOI, WebP lossless) and is box-reduced into
     // the same base image; a PNG keeps the streaming path below unchanged.

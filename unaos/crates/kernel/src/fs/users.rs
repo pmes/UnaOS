@@ -856,6 +856,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
         core::str::from_utf8(&nb[..name.len()]).unwrap_or("?"),
         id
     );
+    #[cfg(feature = "lumen")] crate::keyring::after_login(name); // HOLOCRON2 (B355): the secrets handler starts with the session when the user has a ring
     Ok(())
 }
 

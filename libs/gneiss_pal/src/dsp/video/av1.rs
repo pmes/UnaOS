@@ -1,41 +1,56 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! The AV1 adapter seam (PLAYBACK M3) — STUBBED until AVCODEC (LEDGER SR24) folds.
+//! `dsp::video::av1` — the host face of AVCODEC (LEDGER SR24, `unaos/libs/media/av1_core`), the
+//! from-specification AV1 decoder, behind PLAYBACK's [`VideoDecoder`] seam (SR26).
 //!
-//! AVCODEC's core is `unaos/libs/media/av1_core` (branch `exec-media-av1`). Its frame entry
-//! point is `av1_core::image::decode_obus(data, config_obus, filters) -> Result<Planes>`, with
-//! `planes_to_rgba` for display. The fold replaces the body of [`Av1Decoder::decode`] with:
-//! `config_obus` = the `configOBUs` tail of the track's `av1C` record (`track.config[4..]`) for
-//! MP4, or the CodecPrivate tail for Matroska `V_AV1` (same record, RFC 9559 / AV1-ISOBMFF §2.3);
-//! each packet's `data` is a temporal unit (low-overhead OBUs, `obu_has_size_field` = 1); the
-//! frame is `Pixels::I420` from the planes (8-bit) stamped with `track.to_ns(pkt.pts)`; AV1 has
-//! no reorder delay at the container level (frames leave in pts order with `show_frame` /
-//! `show_existing_frame`), so `flush` returns nothing.
+//! Fold wiring (this file is written against PLAYBACK's `dsp/video.rs`, which declares
+//! `#[cfg(feature = "av1")] pub mod av1;` and the registry arm `Codec::Av1 => Av1Decoder::new`):
+//! in `libs/gneiss_pal/Cargo.toml` set `av1 = ["dep:av1_core"]` and add
+//! `av1_core = { path = "../../unaos/libs/media/av1_core", optional = true, features = ["std"] }`.
 //!
-//! Until then `new` refuses with [`DecodeError::Unsupported`] naming the missing fold, so a
-//! player built with `--features av1` behaves exactly like one without it (stand-in test pattern,
-//! labelled) instead of failing to compile.
+//! Honest ceiling (AVCODEC2): key, intra-only, inter and switch frames, show_existing_frame,
+//! intra block copy and scalable (temporal / spatial layer) streams decode frame-exact against
+//! libaom's per-frame MD5s (docs/dev/evidence/media-1004/AVCODEC2.md); superres returns
+//! `DecodeError::Unsupported`, and film grain synthesis is reported in that doc. The decoder keeps
+//! the reference frames across packets; `reset()` (a seek) drops them. Frames leave as RGBA converted with
+//! the stream's own matrix / range (BT.601/709/2020, limited or full), any bit depth and
+//! subsampling, never a guessed BT.601.
 
-use super::{DecodeError, Frame, VideoDecoder};
+use super::{DecodeError, Frame, Pixels, VideoDecoder};
 use crate::dsp::demux::{Packet, Track};
+use av1_core::image::{planes_to_rgba, StreamDecoder, Upsampling};
 
 pub struct Av1Decoder {
-    _config_obus: Vec<u8>,
+    inner: StreamDecoder,
+    timebase: crate::dsp::demux::Timebase,
+}
+
+fn map_err(e: av1_core::Error) -> DecodeError {
+    match e {
+        av1_core::Error::Unsupported(s) => DecodeError::Unsupported(format!("AV1 {s} (AVCODEC: owed)")),
+        other => DecodeError::Corrupt(format!("AV1: {other}")),
+    }
 }
 
 impl Av1Decoder {
+    /// `track.config` is the av1C record (MP4) or CodecPrivate (Matroska); empty is allowed when
+    /// the stream carries its own sequence header.
     pub fn new(track: &Track) -> Result<Av1Decoder, DecodeError> {
-        let _ = track.config.get(4..).map(|c| c.to_vec()).unwrap_or_default();
-        Err(DecodeError::Unsupported("AV1: av1_core (AVCODEC, LEDGER SR24) is not folded yet".into()))
+        Ok(Av1Decoder { inner: StreamDecoder::new(&track.config).map_err(map_err)?, timebase: track.timebase })
     }
 }
 
 impl VideoDecoder for Av1Decoder {
     fn name(&self) -> &'static str {
-        "av1 (stub)"
+        "av1 (AVCODEC)"
     }
-    fn decode(&mut self, _pkt: &Packet) -> Result<Option<Frame>, DecodeError> {
-        Err(DecodeError::Unsupported("AV1: av1_core not folded".into()))
+    fn decode(&mut self, pkt: &Packet) -> Result<Option<Frame>, DecodeError> {
+        let planes = self.inner.decode_temporal_unit(&pkt.data).map_err(map_err)?;
+        let img = planes_to_rgba(&planes, Upsampling::Bilinear);
+        Ok(Some(Frame { width: img.w, height: img.h, pts_ns: self.timebase.to_ns(pkt.pts), pixels: Pixels::Rgba(img.rgba) }))
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
     }
 }

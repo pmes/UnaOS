@@ -9,6 +9,8 @@ aether = { path = "../../handlers/aether" }
 tokio = { version = "1", features = ["full"] }
 quartzite = { path = "../../libs/quartzite" }
 bandy = { path = "../../libs/bandy" }
+# SR29: local image navigations are delegated to the Images handler.
+facet = { path = "../../handlers/facet" }
 
 [features]
 default = []

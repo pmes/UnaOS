@@ -226,7 +226,7 @@ fn ensure_lumen() {
     #[cfg(feature = "lumen")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("holocron", crate::keyring::selftest); }
     }
 }
 

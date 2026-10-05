@@ -1113,6 +1113,16 @@ fn main() {
     } else {
         println!("   DIAG: target/DIAG-X86.ELF absent — ESP has no DIAG.ELF (run via ./arroyo esp-x86)");
     }
+    // HOLOCRON2 (B355, R82): the metal's secrets handler (crates/user-holocron, built by arroyo's
+    // build_user_holocron_x86 to target/HOLOCRON-X86.ELF), staged as APPS/HOLOCRON.ELF — a bare `holocron …`
+    // detaches (RESIDENT note); the login path starts it when the user has a ring (UNAOS_LUMEN=1).
+    let holocron_elf = target_dir.join("HOLOCRON-X86.ELF");
+    if holocron_elf.exists() {
+        std::fs::copy(&holocron_elf, esp_apps.join("HOLOCRON.ELF")).unwrap();
+        println!("   HOLOCRON: copied HOLOCRON.ELF into APPS/ on the ESP (holocron)");
+    } else {
+        println!("   HOLOCRON: target/HOLOCRON-X86.ELF absent — ESP has no HOLOCRON.ELF (run via ./arroyo esp-x86)");
+    }
     let owners_txt = target_dir.join("witness-owners.txt");
     if owners_txt.exists() {
         std::fs::create_dir_all(esp_dir.join("system")).unwrap();
@@ -1196,6 +1206,8 @@ fn main() {
         (target_dir.join("BIG-X86.ELF"), "BIG.ELF"),
         // SELFDIAG M2 (B324): the diagnosis program rides the DATA volume too — `diag` reads it there.
         (target_dir.join("DIAG-X86.ELF"), "DIAG.ELF"),
+        // HOLOCRON2 (B355): the secrets handler rides the DATA volume too — the login launch and `holocron` read it there.
+        (target_dir.join("HOLOCRON-X86.ELF"), "HOLOCRON.ELF"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();

@@ -10,7 +10,7 @@ or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keep
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
 operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
 
-Rows: 28.
+Rows: 29.
 
 | key | type | default | writers | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -26,6 +26,7 @@ Rows: 28.
 | `system.settings.tab` | int `0..=3` | `0` | settings | kernel settings | The Settings window's open tab (General, Users, Display, About). |
 | `vein.claude.api_key_env` | string ≤128 printable | `"ANTHROPIC_API_KEY"` | operator | gneiss_pal ProviderConfig | NAME of the environment variable holding the Claude key (the key is never a preference). |
 | `vein.claude.fallbacks` | bool | `true` | operator | gneiss_pal ProviderConfig | Let the Claude client fall back to the next model on overload. |
+| `vein.claudecode.bin` | string ≤4096 printable | `"claude"` | operator | gneiss_pal ProviderConfig | The Claude Code CLI binary for provider claudecode: a path, or a name looked up on PATH (CLAUDECODE, SR38). |
 | `vein.embed.dims` | int `1..=65536` | consumer: the embedding model's known width | operator | gneiss_pal EmbedConfig | Embedding vector width. |
 | `vein.embed.model` | string ≤128 printable | consumer: `gemini.embed_model` for gemini, `all-MiniLM-L6-v2` for local | operator | gneiss_pal EmbedConfig | The embedding model. |
 | `vein.embed.provider` | enum `gemini \| local \| off` | rule `embedder` | operator | gneiss_pal EmbedConfig | The embedder, its own setting independent of the chat provider (R81); off = recall disabled, said in-chat. |
@@ -40,10 +41,10 @@ Rows: 28.
 | `vein.key_file` | string ≤40 printable | consumer: unset: no key, the Echo provider answers | operator | vein_ring3 key (LUMEN.ELF); kernel tests lumen | Absolute path of the API key file on the UnaFS volume (read only when it stats with an inode id; refused on FAT). At most 40 bytes: ring 3's SYS_OPEN name bound. |
 | `vein.max_tokens` | int `1..=4294967295` | `16000` | operator | gneiss_pal ProviderConfig | Output token cap per reply. |
 | `vein.model` | string ≤128 printable | rule `chat-model` | operator | gneiss_pal ProviderConfig | The chat model. |
-| `vein.provider` | enum `claude \| gemini \| echo \| relay` | `"claude"` | operator | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired). |
+| `vein.provider` | enum `claude \| gemini \| claudecode \| echo \| relay` | `"claude"` | operator | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired; claudecode = the installed Claude Code CLI on a subscription, host only, SR38). |
 | `vein.temperature` | float `0.0..=2.0` | consumer: the provider's own | operator | gneiss_pal ProviderConfig | Sampling temperature. |
 
 ## Rules (derived defaults)
 
 - `embedder` — `vein.embed.provider`: `gemini` when `vein.gemini.api_key_env` (default `GEMINI_API_KEY`) names a set, non-blank environment variable; else `local` when the local model `all-MiniLM-L6-v2` is installed (every file of the `tools/una-models` manifest in `${XDG_CACHE_HOME:-$HOME/.cache}/unaos/models/all-MiniLM-L6-v2/`); else `off` (R81).
-- `chat-model` — `vein.model`: `claude-opus-5-5` when `vein.provider` is `claude` (its default), `gemini-3.1-pro-preview` when `gemini`; none for `echo` / `relay` (R81).
+- `chat-model` — `vein.model`: `claude-opus-5-5` when `vein.provider` is `claude` (its default), `gemini-3.1-pro-preview` when `gemini`; `default` (the CLI's own model) when `claudecode`; none for `echo` / `relay` (R81).

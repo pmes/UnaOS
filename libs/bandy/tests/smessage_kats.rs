@@ -29,7 +29,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bandy::ontology::WeightedSkeleton;
-use bandy::signals::{LogEvent, MatrixEvent, PrefValue, PrincipiaCommand, SMessage};
+use bandy::signals::{
+    FacetCommand, FacetEdit, FacetFormat, FacetImageInfo, FacetView, FacetZoom, LogEvent, MatrixEvent, PrefValue,
+    PrincipiaCommand, SMessage,
+};
 use bandy::state::{
     BrowseEntry, BrowseKind, BrowseListing, DispatchRecord, FsOutcome, FsVerb, LogLine, LogSource,
 };
@@ -766,6 +769,203 @@ kat!(
     r#"{"Logs":{"LogTail":{"lines":[{"seq":1,"level":"info","source":"net","content":"link up"}],"dropped":2,"paused":false}}}"#
 );
 
+// --- FACET (SR29) ------------------------------------------------------------
+
+fn facet_info() -> FacetImageInfo {
+    FacetImageInfo {
+        path: "/una/a.png".to_string(),
+        format: "png".to_string(),
+        source_width: 4,
+        source_height: 2,
+        width: 2,
+        height: 4,
+        orientation: 6,
+        colour: "sRGB chunk".to_string(),
+        bit_depth: 8,
+        has_alpha: true,
+        frames: 1,
+        bytes: 99,
+        edits: 0,
+    }
+}
+
+kat!(
+    kat_facet_image_open,
+    SMessage::Facet(FacetCommand::ImageOpen {
+        receipt_id: 7,
+        principal: Origin::LocalUser("una".to_string()),
+        path: "/una/a.png".to_string(),
+    }),
+    r#"{"Facet":{"ImageOpen":{"receipt_id":7,"principal":{"LocalUser":"una"},"path":"/una/a.png"}}}"#
+);
+kat!(
+    kat_facet_image_opened,
+    SMessage::Facet(FacetCommand::ImageOpened { receipt_id: 7, handle: 1, info: facet_info() }),
+    r#"{"Facet":{"ImageOpened":{"receipt_id":7,"handle":1,"info":{"path":"/una/a.png","format":"png","source_width":4,"source_height":2,"width":2,"height":4,"orientation":6,"colour":"sRGB chunk","bit_depth":8,"has_alpha":true,"frames":1,"bytes":99,"edits":0}}}}"#
+);
+kat!(
+    kat_facet_image_info,
+    SMessage::Facet(FacetCommand::ImageInfo { receipt_id: 8, handle: 1 }),
+    r#"{"Facet":{"ImageInfo":{"receipt_id":8,"handle":1}}}"#
+);
+kat!(
+    kat_facet_image_info_is,
+    SMessage::Facet(FacetCommand::ImageInfoIs { receipt_id: 8, handle: 1, info: facet_info() }),
+    r#"{"Facet":{"ImageInfoIs":{"receipt_id":8,"handle":1,"info":{"path":"/una/a.png","format":"png","source_width":4,"source_height":2,"width":2,"height":4,"orientation":6,"colour":"sRGB chunk","bit_depth":8,"has_alpha":true,"frames":1,"bytes":99,"edits":0}}}}"#
+);
+kat!(
+    kat_facet_image_edit_crop,
+    SMessage::Facet(FacetCommand::ImageEdit {
+        receipt_id: 9,
+        handle: 1,
+        edit: FacetEdit::Crop { x: 1, y: 2, width: 3, height: 4 },
+    }),
+    r#"{"Facet":{"ImageEdit":{"receipt_id":9,"handle":1,"edit":{"Crop":{"x":1,"y":2,"width":3,"height":4}}}}}"#
+);
+kat!(
+    kat_facet_image_edit_adjust,
+    SMessage::Facet(FacetCommand::ImageEdit {
+        receipt_id: 10,
+        handle: 1,
+        edit: FacetEdit::Adjust { brightness: 1.5, contrast: 0.5 },
+    }),
+    r#"{"Facet":{"ImageEdit":{"receipt_id":10,"handle":1,"edit":{"Adjust":{"brightness":1.5,"contrast":0.5}}}}}"#
+);
+kat!(
+    kat_facet_image_edit_undo,
+    SMessage::Facet(FacetCommand::ImageEdit { receipt_id: 11, handle: 1, edit: FacetEdit::Undo }),
+    r#"{"Facet":{"ImageEdit":{"receipt_id":11,"handle":1,"edit":"Undo"}}}"#
+);
+kat!(
+    kat_facet_image_render,
+    SMessage::Facet(FacetCommand::ImageRender {
+        receipt_id: 12,
+        handle: 1,
+        width: 640,
+        height: 480,
+        view: FacetView {
+            zoom: FacetZoom::Percent(200),
+            pan_x: -3,
+            pan_y: 4,
+            quarter_turns: 1,
+            flip_h: true,
+            flip_v: false,
+        },
+    }),
+    r#"{"Facet":{"ImageRender":{"receipt_id":12,"handle":1,"width":640,"height":480,"view":{"zoom":{"Percent":200},"pan_x":-3,"pan_y":4,"quarter_turns":1,"flip_h":true,"flip_v":false}}}}"#
+);
+kat!(
+    kat_facet_image_render_fit,
+    SMessage::Facet(FacetCommand::ImageRender {
+        receipt_id: 13,
+        handle: 1,
+        width: 2,
+        height: 2,
+        view: FacetView::default(),
+    }),
+    r#"{"Facet":{"ImageRender":{"receipt_id":13,"handle":1,"width":2,"height":2,"view":{"zoom":"Fit","pan_x":0,"pan_y":0,"quarter_turns":0,"flip_h":false,"flip_v":false}}}}"#
+);
+kat!(
+    kat_facet_image_rendered,
+    SMessage::Facet(FacetCommand::ImageRendered {
+        receipt_id: 13,
+        handle: 1,
+        width: 1,
+        height: 1,
+        rgba: vec![1, 2, 3, 255],
+    }),
+    r#"{"Facet":{"ImageRendered":{"receipt_id":13,"handle":1,"width":1,"height":1,"rgba":[1,2,3,255]}}}"#
+);
+kat!(
+    kat_facet_image_export,
+    SMessage::Facet(FacetCommand::ImageExport {
+        receipt_id: 14,
+        handle: 1,
+        path: "/una/out.png".to_string(),
+        format: FacetFormat::Png,
+        overwrite: false,
+    }),
+    r#"{"Facet":{"ImageExport":{"receipt_id":14,"handle":1,"path":"/una/out.png","format":"Png","overwrite":false}}}"#
+);
+kat!(
+    kat_facet_image_exported,
+    SMessage::Facet(FacetCommand::ImageExported {
+        receipt_id: 14,
+        handle: 1,
+        path: "/una/out.png".to_string(),
+        bytes: 321,
+    }),
+    r#"{"Facet":{"ImageExported":{"receipt_id":14,"handle":1,"path":"/una/out.png","bytes":321}}}"#
+);
+kat!(
+    kat_facet_image_close,
+    SMessage::Facet(FacetCommand::ImageClose { handle: 1 }),
+    r#"{"Facet":{"ImageClose":{"handle":1}}}"#
+);
+kat!(
+    kat_facet_image_error,
+    SMessage::Facet(FacetCommand::ImageError {
+        receipt_id: 15,
+        handle: None,
+        message: "no such file".to_string(),
+    }),
+    r#"{"Facet":{"ImageError":{"receipt_id":15,"handle":null,"message":"no such file"}}}"#
+);
+
+fn facet_variant_name(c: &FacetCommand) -> &'static str {
+    match c {
+        FacetCommand::ImageOpen { .. } => "ImageOpen",
+        FacetCommand::ImageOpened { .. } => "ImageOpened",
+        FacetCommand::ImageInfo { .. } => "ImageInfo",
+        FacetCommand::ImageInfoIs { .. } => "ImageInfoIs",
+        FacetCommand::ImageEdit { .. } => "ImageEdit",
+        FacetCommand::ImageRender { .. } => "ImageRender",
+        FacetCommand::ImageRendered { .. } => "ImageRendered",
+        FacetCommand::ImageExport { .. } => "ImageExport",
+        FacetCommand::ImageExported { .. } => "ImageExported",
+        FacetCommand::ImageClose { .. } => "ImageClose",
+        FacetCommand::ImageError { .. } => "ImageError",
+    }
+}
+
+fn facet_edit_variant_name(e: &FacetEdit) -> &'static str {
+    match e {
+        FacetEdit::Crop { .. } => "Crop",
+        FacetEdit::Rotate { .. } => "Rotate",
+        FacetEdit::Flip { .. } => "Flip",
+        FacetEdit::Resize { .. } => "Resize",
+        FacetEdit::Adjust { .. } => "Adjust",
+        FacetEdit::Undo => "Undo",
+        FacetEdit::Redo => "Redo",
+        FacetEdit::Reset => "Reset",
+    }
+}
+
+#[test]
+fn facet_vocabulary_complete() {
+    assert_eq!(facet_variant_name(&FacetCommand::ImageClose { handle: 0 }), "ImageClose");
+    assert_eq!(facet_edit_variant_name(&FacetEdit::Reset), "Reset");
+    assert_eq!(FacetFormat::Jpeg, FacetFormat::Jpeg);
+}
+
+#[test]
+fn facet_open_image_association() {
+    assert_eq!(FacetCommand::image_mime_for("/a/b/Photo.JPG"), Some("image/jpeg"));
+    assert_eq!(FacetCommand::image_mime_for("x.png"), Some("image/png"));
+    assert_eq!(FacetCommand::image_mime_for("dir.png/readme"), None);
+    assert_eq!(FacetCommand::image_mime_for("anim.webp"), Some("image/webp"));
+    assert_eq!(FacetCommand::image_mime_for("notes.txt"), None);
+    assert_eq!(FacetCommand::image_mime_for("png"), None);
+    assert_eq!(FacetCommand::local_image_path("file:///home/una/My%20Photo.jpeg").as_deref(), Some("/home/una/My Photo.jpeg"));
+    assert_eq!(FacetCommand::local_image_path("file://localhost/a/b.png?x=1#f").as_deref(), Some("/a/b.png"));
+    assert_eq!(FacetCommand::local_image_path("/a/b.webp").as_deref(), Some("/a/b.webp"));
+    assert_eq!(FacetCommand::local_image_path("https://una.os/b.png"), None);
+    assert_eq!(FacetCommand::local_image_path("file:///a/b.html"), None);
+    assert_eq!(FacetCommand::local_image_path("file:///a/b%2.png").as_deref(), Some("/a/b%2.png"));
+    assert!(FacetCommand::ImageOpen { receipt_id: 1, principal: Origin::System("t".into()), path: "a".into() }.is_request());
+    assert!(!FacetCommand::ImageExported { receipt_id: 1, handle: 1, path: "a".into(), bytes: 0 }.is_request());
+}
+
 // --- COMPLETENESS GUARD ------------------------------------------------------
 //
 // Exhaustive matches over the message vocabulary, with NO wildcard arm.
@@ -839,6 +1039,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::Principia(_) => "Principia",
         SMessage::Matrix(_) => "Matrix",
         SMessage::Logs(_) => "Logs",
+        SMessage::Facet(_) => "Facet",
         SMessage::Input { .. } => "Input",
         SMessage::TemplateAction(_) => "TemplateAction",
         SMessage::NavSelect(_) => "NavSelect",

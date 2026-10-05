@@ -2624,7 +2624,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), // RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), // RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -25051,7 +25051,7 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
     if row >= BUSX_MBOX.len() || !busx_mbox_has_room(row) {
         return EAGAIN; // capacity BEFORE fulfillment — a side effect must never lose its reply
     }
-    let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new(); #[cfg(feature = "busreg")] { match crate::bus_route::route_request(&BUSREG_OPS, row, cgen, crate::bus_route::row_principal(row, cgen), &hdr, body) { crate::bus_route::Route::Kernel => {} crate::bus_route::Route::Relayed => return 0, crate::bus_route::Route::Reply(st) => return busx_reply_enqueue(row, hdr.corr, hdr.verb, st, &[]) } }
+    let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new(); #[cfg(feature = "busreg")] { match crate::bus_route::route_request(&BUSREG_OPS, row, cgen, busreg_caller_stamp(row, cgen), &hdr, body) { crate::bus_route::Route::Kernel => {} crate::bus_route::Route::Relayed => return 0, crate::bus_route::Route::Reply(st) => return busx_reply_enqueue(row, hdr.corr, hdr.verb, st, &[]) } }
     let status = match hdr.verb {
         crate::bus::BUS_VERB_LS => busx_ls(&mut text),
         crate::bus::BUS_VERB_CAT => match crate::bus::cat_body_parse(body) {
@@ -29878,7 +29878,7 @@ fn busreg_fx_pop(row: usize) -> Option<alloc::boxed::Box<[u8]>> {
 }
 #[cfg(feature = "busreg")]
 fn busreg_fx_stamp(row: usize) -> [u8; 32] {
-    crate::bus_route::row_principal(row, SLOT_GEN[row].load(Ordering::Acquire))
+    busreg_caller_stamp(row, SLOT_GEN[row].load(Ordering::Acquire)) // HOLOCRON2 (B355): the fixture expects the stamp production builds
 }
 #[cfg(feature = "busreg")]
 static BUSREG_FX: crate::bus_route::Fixture = crate::bus_route::Fixture {
@@ -30227,6 +30227,53 @@ fn sys_clip_get(ptr: u64, cap: u64) -> i64 {
     }
     match copy_to_user(ptr, &b[..n]) {
         Ok(()) => n as i64,
+        Err(e) => e,
+    }
+}
+
+// =================================================================================================
+// HOLOCRON2 (rmbp-ledger B355) — this arch's half of the metal secrets handler. (1) The BANDY3 relay stamp:
+// a caller running in the OPEN session is stamped with its user record (kind PRIN_USER = 5, value the
+// ATTRSURF principal `user:<name>#<uid>`, the string aarch64 mints and `holocron_core::wire::
+// principal_from_record` projects); every other caller keeps the `row:<r>/gen:<g>` identity. (2) SYS_KDF
+// (66): Argon2id for ring 3 through `crate::keyring::kdf` (holocron_core's CryptoCore). Design:
+// docs/dev/evidence/rmbp-1005/HOLOCRON2.md. Appended at the file tail.
+// =================================================================================================
+#[cfg(feature = "busreg")]
+fn busreg_caller_stamp(row: usize, rgen: u64) -> [u8; 32] {
+    let s = attrsurf_principal(row);
+    if s.starts_with("user:") && s.len() <= 30 {
+        let mut p = [0u8; 32];
+        p[0] = 5; // PRIN_USER
+        p[1] = s.len() as u8;
+        p[2..2 + s.len()].copy_from_slice(s.as_bytes());
+        return p;
+    }
+    crate::bus_route::row_principal(row, rgen)
+}
+
+/// HOLOCRON2: `SYS_KDF(req, req_len, out, out_len)` — the request layout is una-abi's HOLOCRON2 block.
+#[cfg(feature = "lumen")]
+fn sys_kdf(a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let n = a1 as usize;
+    if n < una_abi::KDF_HDR_LEN || n > una_abi::KDF_HDR_LEN + una_abi::KDF_PW_MAX + una_abi::KDF_SALT_MAX || a3 as usize != una_abi::KDF_OUT_LEN {
+        return EINVAL;
+    }
+    let mut inb = alloc::vec![0u8; n];
+    if let Err(e) = copy_from_user(&mut inb, a0) {
+        return e;
+    }
+    let r = crate::keyring::kdf(&inb);
+    crate::keyring::wipe(&mut inb);
+    match r {
+        Ok(mut key) => {
+            let w = copy_to_user(a2, &key);
+            crate::keyring::wipe(&mut key);
+            match w {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
         Err(e) => e,
     }
 }
