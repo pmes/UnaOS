@@ -18,5 +18,5 @@ FONTCONFIG_FILE="$out/fonts.conf" NODE_PATH=${NODE_PATH:-/opt/node22/lib/node_mo
   node "$here/chromium-svg.cjs" "$out/chrome" "$out/list.tsv" > "$out/chrome.log"
 cd "$root"
 SVGCORE_VECTORS="$vec" SVGCORE_ORACLE_DIR="$out/chrome" SVGCORE_ORACLE_OUT="$out/rows.tsv" \
-  cargo test --release -q -p svg_core --test oracle -- --nocapture 2>&1 | grep -E "^(category|[a-z-]+ +[0-9]|ALL)"
+  cargo test --release -q -p svg_core --test oracle -- --nocapture 2>&1 | grep -E "^(category|[A-Za-z-]+ +[0-9]|ALL)"
 echo "per-file scores: $out/rows.tsv"

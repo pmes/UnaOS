@@ -19,6 +19,7 @@
 //! | markers | SVG 2 §11.6 | [`marker`] |
 //! | text | SVG 1.1 §10 / SVG 2 §11 | [`text`], [`fonts`] |
 //! | `<image>` data: URLs | RFC 2397, RFC 4648 | [`image`] |
+//! | `filter`, `<filter>`, every `fe*` primitive, CSS filter functions | Filter Effects Module Level 1 | [`filter`], [`fe`] |
 //!
 //! ```ignore
 //! let svg = svg_core::Svg::parse(bytes)?;
@@ -33,6 +34,8 @@ extern crate alloc;
 
 pub mod color;
 pub mod css;
+pub mod fe;
+pub mod filter;
 pub mod fmath;
 pub mod fonts;
 pub mod geom;

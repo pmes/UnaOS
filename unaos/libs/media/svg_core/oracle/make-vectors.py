@@ -25,6 +25,13 @@ CATS = [
     ("use-symbol", ["structure/use", "structure/symbol", "structure/defs"]),
     ("structure", ["structure/g", "structure/svg", "structure/transform", "structure/style", "structure/style-attribute",
                    "structure/switch", "structure/systemLanguage", "structure/image", "structure/a"]),
+] + [
+    # SVGFILTERS (SR65): the filters/ category, one oracle category per primitive / property directory.
+    (d, ["filters/" + d]) for d in [
+        "filter", "filter-functions", "enable-background", "flood-color", "flood-opacity", "feBlend", "feColorMatrix",
+        "feComponentTransfer", "feComposite", "feConvolveMatrix", "feDiffuseLighting", "feDisplacementMap",
+        "feDistantLight", "feDropShadow", "feFlood", "feGaussianBlur", "feImage", "feMerge", "feMorphology", "feOffset",
+        "fePointLight", "feSpecularLighting", "feSpotLight", "feTile", "feTurbulence"]
 ]
 
 def png_size(p):
