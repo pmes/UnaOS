@@ -1,0 +1,8 @@
+The 16 EYES corpus pages (LEDGER SR23; 18 EYES cases = these 16 documents, two of them also rendered at 375 px —
+the parse is viewport-independent, so the parser oracle has 16 distinct inputs). Copied verbatim from branch
+exec-aether-see @ b530ccd0, tools/eyes/suites/aether/corpus/*.html.
+
+*.chromium.html are Chromium's `document.documentElement.outerHTML` for each page loaded from file:// with
+JavaScript disabled (so the parser runs with the scripting flag off, as html_core does), produced by
+tests/oracle/outer_html.cjs (Playwright 1.56.1, /opt/pw-browsers chromium-1194). Regenerate with:
+  NODE_PATH=$(npm root -g) PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers node tests/oracle/outer_html.cjs tests/data/eyes

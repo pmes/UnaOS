@@ -316,7 +316,7 @@ impl Vaire {
                         diff_payload.push_str(&format!("* Rewritten: {:?}\n", location));
                     }
                 }
-                Ok::<_, anyhow::Error>(Action::Continue(()))
+                Ok(Action::Continue(())) // infallible; gix 0.88 types the callback error as gix_error::Exn
             })?;
 
         if diff_payload.is_empty() {

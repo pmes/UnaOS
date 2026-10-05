@@ -662,7 +662,7 @@ const TPAD: usize = strip::PAD / 2;
 /// metrics, which are imported from `crystal` and are what [`ITEM_H`] is built on.
 const CELL_W: usize = menubar::BAR_CELL_W;
 const CELL_H: usize = menubar::BAR_CELL_H;
-const FACE: super::font::Face = menubar::BAR_FACE;
+const FACE: super::text::Face = menubar::BAR_FACE;
 /// SO2 — the bar's weight, for the titles AND the drop-down's rows. See [`CELL_W`].
 const BOLD: bool = menubar::BAR_BOLD;
 
@@ -1539,7 +1539,7 @@ pub fn draw_bar_row(out: &mut [u32], w: usize, s: &BarSnapshot, j: usize, ty0: u
         }
         let ink = if open { theme::BEVEL_LIGHT } else { theme::TITLE_TEXT_ACTIVE };
         // SO2 — the BAR'S weight. See [`BOLD`].
-        super::font::draw_row(out, w, s.label_of(k), x0 + TPAD, j - ty0, ink, BOLD, FACE);
+        super::text::draw_row(out, w, s.label_of(k), x0 + TPAD, j - ty0, ink, BOLD, FACE);
     }
 }
 
@@ -1739,20 +1739,20 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     // SO2 — every glyph on this surface is now drawn at the BAR'S weight, the check mark included:
     // the drop-down is the bar's own text hanging below the bar, not a second typeface.
     if it.flags & FLAG_CHECKED != 0 {
-        super::font::draw_row(out, w, CHECK_MARK, BORDER + PADX, sy, ink, BOLD, FACE);
+        super::text::draw_row(out, w, CHECK_MARK, BORDER + PADX, sy, ink, BOLD, FACE);
     }
     let lx = BORDER + PADX + CHECK_GLYPHS * CELL_W;
-    super::font::draw_row(out, w, it.label.as_bytes(), lx, sy, ink, BOLD, FACE);
+    super::text::draw_row(out, w, it.label.as_bytes(), lx, sy, ink, BOLD, FACE);
     // SO3 — `About <app>`. The suffix is composed HERE, at paint time, from the caption the bar
     // published, because a `MenuItem`'s label is `&'static str` and the registry allocates nothing.
     if it.flags & FLAG_APPNAME != 0 && !name.is_empty() {
-        let nx = lx + (it.label.len() + 1) * CELL_W;
-        super::font::draw_row(out, w, name, nx, sy, ink, BOLD, FACE);
+        let nx = lx + super::text::advance(it.label.as_bytes(), BOLD, FACE) + super::text::advance(b" ", BOLD, FACE); // KERNELFONT: the shaped width
+        super::text::draw_row(out, w, name, nx, sy, ink, BOLD, FACE);
     }
     // SHORTCUTS M3 — the row's chord, right-aligned inside the padding.
     if let Some(c) = item_chord(&it) {
-        let cx = w.saturating_sub(BORDER + PADX + c.len() * CELL_W);
-        super::font::draw_row(out, w, c.as_bytes(), cx, sy, theme::TITLE_TEXT_INACTIVE, BOLD, FACE);
+        let cx = w.saturating_sub(BORDER + PADX + super::text::advance(c.as_bytes(), BOLD, FACE)); // KERNELFONT: right-aligned by the shaped width
+        super::text::draw_row(out, w, c.as_bytes(), cx, sy, theme::TITLE_TEXT_INACTIVE, BOLD, FACE);
     }
 }
 

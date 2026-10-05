@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::video::keymap::Action;
-use crate::video::{font, theme, wm};
+use crate::video::{theme, wm};
 
 /// Kernel-furniture owner slot (`+ 6`, after FILEVIEW's `+ 5`).
 pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 6;
@@ -195,7 +195,7 @@ pub fn open(path: &str) -> Result<(usize, usize), String> {
     let (pw, ph) = (pi.width, pi.height);
     let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
     let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
-    let face = font::Face::Body;
+    let face = super::text::Face::Body;
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let cols = w.saturating_sub(2 * PAD + 6) / cw;
     let vis = h.saturating_sub(2 * PAD) / ch;
@@ -261,7 +261,7 @@ fn fill(st: &mut State, x: usize, y: usize, rw: usize, rh: usize, c: u32) {
 
 /// Repaint `st.surf`: FILEVIEW's row painter, plus the selection band and the caret.
 fn paint(st: &mut State) {
-    let face = font::Face::Body;
+    let face = super::text::Face::Body;
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let (w, h) = (st.w, st.h);
     for p in st.surf.iter_mut() {
@@ -281,7 +281,7 @@ fn paint(st: &mut State) {
                 fill(st, PAD + (lo - a) * cw, y, (hi - lo) * cw, ch, theme::ACCENT);
             }
         }
-        font::draw_text(&mut st.surf, w, w - 6, h, PAD, y, &st.text[a..b], theme::CONTENT_TEXT, false, face);
+        super::text::draw_text(&mut st.surf, w, w - 6, h, PAD, y, &st.text[a..b], theme::CONTENT_TEXT, false, face);
         if ri == crow {
             fill(st, PAD + (st.caret - a) * cw, y, 2, ch, theme::CONTENT_TEXT);
         }
@@ -594,7 +594,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         return false;
     }
     wm::focus_changed(OWNER);
-    let face = font::Face::Body;
+    let face = super::text::Face::Body;
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let pos = {
         let g = STATE.lock();

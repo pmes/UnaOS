@@ -1,0 +1,11 @@
+# AETHERSTYLE (SR54) style-time vectors, fetched at test time into $TMPDIR/unaos-aether-vectors (or
+# $AETHER_VECTORS_DIR), verified by sha256, skipped offline / when AETHER_OFFLINE is set. Nothing here is
+# committed: the files are 1 MB and 281 KB.
+#
+# A saved English Wikipedia article (Mozilla Readability's test page `wikipedia-2`, tag 0.6.0; ~9.9k
+# elements, its own inline <style> blocks; its skin CSS was a load.php link and is not in the file).
+FETCH wikipedia-2.html 2d49814707297841baa04e1332e19a9dc2aeb7a622c6f078960f27c37ed81f66 https://raw.githubusercontent.com/mozilla/readability/0.6.0/test/test-pages/wikipedia-2/source.html
+# A real ~2.7k-rule production stylesheet standing in for the missing skin CSS (en.wikipedia.org itself is
+# refused by this sandbox's egress policy): Bootstrap 5.3.3's dist build — class-heavy selectors, :is/:not,
+# custom properties, @media, the shape hashing has to scale on.
+FETCH bootstrap-5.3.3.css 18a105d7cb38e01e5ed0ca255c092992a2e211b39594a7fa57262bfc6fc4ea9c https://raw.githubusercontent.com/twbs/bootstrap/v5.3.3/dist/css/bootstrap.css

@@ -396,28 +396,28 @@ fn fill(s: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize, c: u3
 }
 
 fn txt(st: &mut State, x: usize, r: usize, t: &str) {
-    let face = font::Face::Body;
+    let face = super::text::Face::Ui; // KERNELFONT: labels in the UI face
     let (w, h, ch) = (st.w, st.h, face.cell_h());
-    font::draw_text(&mut st.surf, w, w, h, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
+    super::text::draw_text(&mut st.surf, w, w, h, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
 }
 
 fn btn(st: &mut State, r: usize, x: usize, t: &str) {
-    let face = font::Face::Body;
+    let face = super::text::Face::Ui; // KERNELFONT: button captions in the UI face
     let (w, h, ch) = (st.w, st.h, face.cell_h());
     let y = TOP + r * ROW_H + (ROW_H - BTN_H) / 2;
     fill(&mut st.surf, w, x, y, BTN_W, BTN_H, theme::BUTTON_FACE);
     fill(&mut st.surf, w, x, y, BTN_W, 1, theme::FRAME_LINE);
     fill(&mut st.surf, w, x, y + BTN_H - 1, BTN_W, 1, theme::FRAME_LINE);
-    font::draw_text(&mut st.surf, w, w, h, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::BUTTON_TEXT, false, face);
+    super::text::draw_text(&mut st.surf, w, w, h, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::BUTTON_TEXT, false, face);
 }
 
 fn field(st: &mut State, r: usize, t: &str, focus: bool) {
-    let face = font::Face::Body;
+    let face = super::text::Face::Body;
     let (w, h, ch) = (st.w, st.h, face.cell_h());
     fill(&mut st.surf, w, TRACK_X, TOP + r * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::BUTTON_FACE);
     let mut shown = String::from(t);
     if focus { shown.push('_'); }
-    font::draw_text(&mut st.surf, w, w - 14, h, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::BUTTON_TEXT, false, face);
+    super::text::draw_text(&mut st.surf, w, w - 14, h, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::BUTTON_TEXT, false, face);
 }
 
 fn slider(st: &mut State, r: usize, pos: usize, max: usize) {
@@ -432,14 +432,14 @@ fn slider(st: &mut State, r: usize, pos: usize, max: usize) {
 fn paint(st: &mut State, v: &Values) {
     let (w, h) = (st.w, st.h);
     for p in st.surf.iter_mut() { *p = theme::CONTENT_FILL; }
-    let face = font::Face::Body;
+    let face = super::text::Face::Ui; // KERNELFONT: tab names in the UI face
     let ch = face.cell_h();
     // The tab strip.
     let tw = w / TABS;
     for k in 0..TABS {
         let on = k == v.tab as usize;
         fill(&mut st.surf, w, k * tw, 0, tw - 2, TAB_H, if on { theme::ACCENT } else { theme::SCROLL_TRACK });
-        font::draw_text(&mut st.surf, w, w, h, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::text::draw_text(&mut st.surf, w, w, h, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
     }
     if st.strip { fill(&mut st.surf, w, 0, TAB_H - 3, w, 2, theme::ACCENT); }
     match v.tab {
@@ -457,7 +457,7 @@ fn paint(st: &mut State, v: &Values) {
 
 fn paint_general(st: &mut State, v: &Values) {
     let (w, h, ch) = (st.w, st.h, font::Face::Body.cell_h());
-    let face = font::Face::Body;
+    let face = super::text::Face::Body;
     // BRIGHTFLOOR M5: Brightness moved to the Display tab; every General row moved up one.
     txt(st, LABEL_X, 0, "Volume");
     slider(st, 0, v.vol as usize, 16);
@@ -471,7 +471,7 @@ fn paint_general(st: &mut State, v: &Values) {
     for k in 0..3usize {
         let c = if k as u8 == v.ptr { theme::ACCENT } else { theme::SCROLL_TRACK };
         fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 2 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        font::draw_text(&mut st.surf, w, w, h, TRACK_X + k * seg + 8, TOP + 2 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::text::draw_text(&mut st.surf, w, w, h, TRACK_X + k * seg + 8, TOP + 2 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
     }
     txt(st, LABEL_X, 3, "Wallpaper");
     let (focus, wall) = (!st.strip && st.sel == 5, v.wall.clone());
@@ -499,7 +499,16 @@ fn paint_display(st: &mut State, v: &Values) {
     txt(st, TRACK_X, 2, &alloc::format!("{}x - read-only, fixed at takeover", sc));
     txt(st, LABEL_X, 3, "Menubar clock");
     txt(st, TRACK_X, 3, "24h - fixed, no runtime switch");
+    // KERNELFONT M3 (B359): the face the desktop draws with, and a sample line IN that face. The family and size
+    // are Principia's `system.display.font` / `system.display.font_size` (`pref set system display.font serif`).
+    txt(st, LABEL_X, 4, "Font");
+    txt(st, TRACK_X, 4, &super::text::face_name(super::text::Face::Ui));
+    let (w, h, ch) = (st.w, st.h, super::text::Face::Ui.cell_h());
+    super::text::draw_text(&mut st.surf, w, w - 12, h, TRACK_X, TOP + 5 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, super::text::Face::Ui);
 }
+
+/// KERNELFONT M3: the Display tab's sample line.
+pub const SAMPLE: &str = "The quick brown fox jumps over the lazy dog 0123456789";
 
 fn paint_about(st: &mut State) {
     let ver = option_env!("UNAOS_GIT_SHA").unwrap_or("dev build");

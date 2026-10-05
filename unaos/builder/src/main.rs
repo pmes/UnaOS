@@ -37,6 +37,92 @@ fn stage_trust(src: &std::path::Path, volume: &std::path::Path) -> bool {
     true
 }
 
+/// KERNELFONT (rmbp-ledger B359): the UI faces the kernel's `video::text` loads from `/system/fonts/`, staged as
+/// DATA from the HOST's font packages (never vendored in the tree). (file, licence candidates). A face is staged
+/// only with its licence beside it (`system/fonts/LICENSES/<family>.txt`); `system/fonts/MANIFEST.txt` records
+/// file, bytes, sha256, source and licence. Search order: `UNAOS_FONT_DIRS` (colon-separated) first, then the
+/// Debian / Fedora / Arch package directories. A face not found is named on the console and skipped; the kernel
+/// names it again on the wire (`[kfont] load … fallback=` / `scripts_missing=`).
+const KFONT_FACES: &[(&str, &str)] = &[
+    ("DejaVuSans.ttf", "dejavu"),
+    ("DejaVuSans-Bold.ttf", "dejavu"),
+    ("DejaVuSansMono.ttf", "dejavu"),
+    ("DejaVuSansMono-Bold.ttf", "dejavu"),
+    ("DejaVuSerif.ttf", "dejavu"),
+    ("DejaVuSerif-Bold.ttf", "dejavu"),
+    ("NotoSansArabic-Regular.ttf", "noto"),
+    ("NotoSansHebrew-Regular.ttf", "noto"),
+    ("NotoSansDevanagari-Regular.ttf", "noto"),
+    ("NotoSansThai-Regular.ttf", "noto"),
+];
+const KFONT_DIRS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/noto",
+    "/usr/share/fonts/opentype/noto",
+    "/usr/share/fonts/dejavu-sans-fonts",
+    "/usr/share/fonts/dejavu-sans-mono-fonts",
+    "/usr/share/fonts/dejavu-serif-fonts",
+    "/usr/share/fonts/google-noto",
+    "/usr/share/fonts/TTF",
+    "/usr/share/fonts/noto",
+];
+fn kfont_licences(family: &str) -> &'static [&'static str] {
+    match family {
+        "dejavu" => &[
+            "/usr/share/doc/fonts-dejavu-core/copyright",
+            "/usr/share/doc/fonts-dejavu-mono/copyright",
+            "/usr/share/licenses/dejavu-sans-fonts/LICENSE",
+            "/usr/share/licenses/ttf-dejavu/LICENSE",
+        ],
+        _ => &[
+            "/usr/share/doc/fonts-noto-core/copyright",
+            "/usr/share/doc/fonts-noto/copyright",
+            "/usr/share/licenses/noto-fonts/LICENSE",
+            "/usr/share/licenses/google-noto-sans-fonts/OFL.txt",
+        ],
+    }
+}
+
+/// Stage the KERNELFONT faces into `<volume>/system/fonts/`; returns the files staged.
+fn stage_fonts(extra_dirs: &[std::path::PathBuf], volume: &std::path::Path) -> Vec<String> {
+    let mut dirs: Vec<std::path::PathBuf> = extra_dirs.to_vec();
+    dirs.extend(KFONT_DIRS.iter().map(std::path::PathBuf::from));
+    let out = volume.join("system/fonts");
+    let mut staged = Vec::new();
+    let mut manifest = String::from("# KERNELFONT (B359): faces staged by the builder from the host's font packages\n# file bytes sha256 source licence\n");
+    for &(file, family) in KFONT_FACES {
+        let Some(src) = dirs.iter().map(|d| d.join(file)).find(|p| p.is_file()) else {
+            println!("   FONTS: {} not found on this host (install the {} font package or set UNAOS_FONT_DIRS) — not staged", file, family);
+            continue;
+        };
+        let lic = src.parent().map(|d| d.join("LICENSE")).filter(|p| p.is_file())
+            .or_else(|| kfont_licences(family).iter().map(std::path::PathBuf::from).find(|p| p.is_file()));
+        let Some(lic) = lic else {
+            println!("   FONTS: {} found at {} but no licence file for it — NOT staged", file, src.display());
+            continue;
+        };
+        let bytes = std::fs::read(&src).unwrap();
+        std::fs::create_dir_all(out.join("LICENSES")).unwrap();
+        let lic_name = format!("LICENSES/{}.txt", family);
+        if !out.join(&lic_name).exists() {
+            std::fs::copy(&lic, out.join(&lic_name)).unwrap();
+        }
+        std::fs::write(out.join(file), &bytes).unwrap();
+        let sha: String = crypto_core::sha2::sha256(&bytes).iter().map(|b| format!("{:02x}", b)).collect();
+        manifest.push_str(&format!("{} {} {} {} {} (from {})\n", file, bytes.len(), sha, src.display(), lic_name, lic.display()));
+        staged.push(file.to_string());
+    }
+    if !staged.is_empty() {
+        std::fs::write(out.join("MANIFEST.txt"), manifest).unwrap();
+        println!("   FONTS: staged {} face(s) into {}/system/fonts: {}", staged.len(), volume.display(), staged.join(", "));
+    }
+    staged
+}
+
+fn kfont_dirs_env() -> Vec<std::path::PathBuf> {
+    std::env::var("UNAOS_FONT_DIRS").map(|v| v.split(':').filter(|s| !s.is_empty()).map(std::path::PathBuf::from).collect()).unwrap_or_default()
+}
+
 fn main() {
     let workspace_dir = std::fs::canonicalize("..").unwrap();
     let target_dir = workspace_dir.join("target");
@@ -995,6 +1081,14 @@ fn main() {
         ("PROBE.LNX", "PROBE.LNX"),
         // SELFBUILD2 (B349): the threaded syscall KAT (crates/user-linux-hello/c/syskat2.c) — `tests selfbuild2`.
         ("SYSKAT2.LNX", "SYSKAT2.LNX"),
+        // SELFBUILD4 (B356): the process-memory KAT (syskat4.c) and the first Rust program (crates/user-linux-rust, static
+        // musl, non-PIE) — `tests selfbuild4`. Built and host-proven by arroyo's build_selfbuild4_x86; absent = SKIP.
+        ("SYSKAT4.LNX", "SYSKAT4.LNX"),
+        ("RUST.LNX", "RUST.LNX"),
+        // SELFBUILD5 (B357): the mremap / alternate-stack KAT (syskat5.c) and a static ld.lld at the toolchain's LLVM release
+        // (built from the pinned source by arroyo's build_selfbuild5_x86) — `tests selfbuild5` links RUST.LNX's objects with it.
+        ("SYSKAT5.LNX", "SYSKAT5.LNX"),
+        ("LLD.LNX", "LLD.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
@@ -1039,6 +1133,22 @@ fn main() {
         println!("   SELFBUILD3: staged APPS/LIB ({n} files: musl crt + libc.a + headers, tcc's libtcc1.a + headers)");
     } else {
         println!("   SELFBUILD3: target/LIB absent — ESP has no APPS/LIB (musl not built: no egress at build time?)");
+    }
+    // SELFBUILD5 (B357): target/LIB/rust (RUST.LNX's objects, the std rlibs, the musl crt + libc.a + libunwind.a, link.rsp) rides
+    // the APPS/LIB copy above; staged here on its own when the musl LIB was not built.
+    let rust_lib = musl_lib.join("rust");
+    if rust_lib.join("link.rsp").exists() {
+        let to = esp_apps.join("LIB").join("rust");
+        if !to.join("link.rsp").exists() {
+            std::fs::create_dir_all(&to).unwrap();
+            for e in std::fs::read_dir(&rust_lib).unwrap() {
+                let e = e.unwrap();
+                std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        }
+        println!("   SELFBUILD5: APPS/LIB/rust staged (LLD.LNX -flavor gnu @/apps/LIB/rust/link.rsp)");
+    } else {
+        println!("   SELFBUILD5: target/LIB/rust absent — ESP has no APPS/LIB/rust (tests selfbuild5 reports lld=skip)");
     }
 
     // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
@@ -1109,6 +1219,16 @@ fn main() {
     } else {
         println!("   DIAG: target/DIAG-X86.ELF absent — ESP has no DIAG.ELF (run via ./arroyo esp-x86)");
     }
+    // HOLOCRON2 (B355, R82): the metal's secrets handler (crates/user-holocron, built by arroyo's
+    // build_user_holocron_x86 to target/HOLOCRON-X86.ELF), staged as APPS/HOLOCRON.ELF — a bare `holocron …`
+    // detaches (RESIDENT note); the login path starts it when the user has a ring (UNAOS_LUMEN=1).
+    let holocron_elf = target_dir.join("HOLOCRON-X86.ELF");
+    if holocron_elf.exists() {
+        std::fs::copy(&holocron_elf, esp_apps.join("HOLOCRON.ELF")).unwrap();
+        println!("   HOLOCRON: copied HOLOCRON.ELF into APPS/ on the ESP (holocron)");
+    } else {
+        println!("   HOLOCRON: target/HOLOCRON-X86.ELF absent — ESP has no HOLOCRON.ELF (run via ./arroyo esp-x86)");
+    }
     let owners_txt = target_dir.join("witness-owners.txt");
     if owners_txt.exists() {
         std::fs::create_dir_all(esp_dir.join("system")).unwrap();
@@ -1124,6 +1244,8 @@ fn main() {
     // store") — never a TLS connection without verification.
     let trust_src = workspace_dir.join("../system/trust/roots.pem");
     let trust_ok = stage_trust(&trust_src, &esp_dir);
+    // KERNELFONT (B359): the UI faces, on the ESP (single-stick boots) and on the DATA volume below.
+    let _ = stage_fonts(&kfont_dirs_env(), &esp_dir);
 
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
@@ -1192,6 +1314,8 @@ fn main() {
         (target_dir.join("BIG-X86.ELF"), "BIG.ELF"),
         // SELFDIAG M2 (B324): the diagnosis program rides the DATA volume too — `diag` reads it there.
         (target_dir.join("DIAG-X86.ELF"), "DIAG.ELF"),
+        // HOLOCRON2 (B355): the secrets handler rides the DATA volume too — the login launch and `holocron` read it there.
+        (target_dir.join("HOLOCRON-X86.ELF"), "HOLOCRON.ELF"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();
@@ -1207,6 +1331,19 @@ fn main() {
     if trust_ok {
         stage_trust(&trust_src, &data_dir);
         staged_data.push("system/trust/roots.pem");
+    }
+    // KERNELFONT (B359): the faces ride the DATA volume too — `video::text` reads /system/fonts there.
+    if !stage_fonts(&kfont_dirs_env(), &data_dir).is_empty() {
+        staged_data.push("system/fonts/*");
+    }
+    // FACETANIM (B358): the three 8x8 3-frame animations `tests facetanim` opens (/apps/ANIM3.GIF,
+    // /apps/ANIM3.WEBP, /apps/ANIM3.PNG) — committed beside pixel_core's KATs, which pin their bytes.
+    for leaf in ["ANIM3.GIF", "ANIM3.WEBP", "ANIM3.PNG"] {
+        let src = workspace_dir.join("libs/media/pixel_core/tests/fixtures/facetanim").join(leaf);
+        if src.exists() {
+            std::fs::copy(&src, data_apps.join(leaf)).unwrap();
+            staged_data.push(leaf);
+        }
     }
     // `hello.txt` rides along so the operator has a trivial `cat hello.txt` probe that proves the
     // kernel is reading THIS volume — the one-command answer to "did I write the right stick?".
@@ -2330,6 +2467,27 @@ mod veintls_tests {
         std::fs::write(bad.join("roots.pem"), pem).unwrap();
         std::fs::copy(src.with_file_name("roots.pem.sha256"), bad.join("roots.pem.sha256")).unwrap();
         assert!(std::panic::catch_unwind(|| super::stage_trust(&bad.join("roots.pem"), &out.join("x"))).is_err());
+        let _ = std::fs::remove_dir_all(&out);
+    }
+}
+
+#[cfg(test)]
+mod kernelfont_tests {
+    /// The host's DejaVu faces (when installed) stage byte-identical with a licence and a manifest row each.
+    #[test]
+    fn fonts_stage_with_licences() {
+        let out = std::env::temp_dir().join(format!("kfont-stage-{}", std::process::id()));
+        let staged = super::stage_fonts(&[], &out);
+        if !staged.iter().any(|f| f == "DejaVuSans.ttf") {
+            println!("SKIP: DejaVuSans.ttf not installed on this host");
+            return;
+        }
+        let m = std::fs::read_to_string(out.join("system/fonts/MANIFEST.txt")).unwrap();
+        for f in &staged {
+            assert!(m.lines().any(|l| l.starts_with(&format!("{} ", f))), "{f} has no manifest row");
+            assert!(out.join("system/fonts").join(f).is_file());
+        }
+        assert!(out.join("system/fonts/LICENSES/dejavu.txt").is_file());
         let _ = std::fs::remove_dir_all(&out);
     }
 }

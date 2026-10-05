@@ -1096,7 +1096,7 @@ mod tests {
     fn test_media_click_stages_playmedia() {
         let mut engine = crate::AetherEngine::new();
         engine.load_html_styled(
-            "https://example.com/watch/",
+            "file:///site/watch/",
             r#"<html><body>
                 <video style="width: 300px; height: 150px">
                     <source src="/media/clip.webm" type="video/webm">
@@ -1111,13 +1111,15 @@ mod tests {
         engine.handle_event(crate::api::events::Event::MouseDown(50.0, 50.0));
         engine.handle_event(crate::api::events::Event::MouseUp(50.0, 50.0));
         let staged = engine.take_pending_media().expect("click must stage media");
-        assert_eq!(staged.0, "https://example.com/media/clip.webm");
+        assert_eq!(staged.0, "file:///media/clip.webm");
         assert_eq!(staged.2, "video/webm");
         assert!(engine.take_pending_media().is_none(), "take must consume");
 
         // media_sources still reports the page's streams for enumeration.
         let sources = engine.media_sources();
-        assert_eq!(sources, vec![("https://example.com/media/clip.webm".to_string(), "video/webm".to_string())]);
+        assert_eq!(sources, vec![("file:///media/clip.webm".to_string(), "video/webm".to_string())]);
+        // (an http(s) page's media is fetched into the cache first and staged as that file —
+        // AUDIOTRACK M4, `media::tests::http_media_is_cached_then_handed_to_stria_as_a_file…`)
     }
 
     /// History: load A, B, C → back lands on B then A; a new load from B
@@ -1983,25 +1985,31 @@ mod tests {
         }
         assert!(!crate::js::engine_poisoned(), "not poisoned before the job runs");
 
-        // The panic happens in here. Reaching the next line at all is the test.
+        // boa 0.21 PANICKED in here; reaching the next line at all is the test.
         engine.tick();
 
-        assert!(
-            crate::js::engine_poisoned(),
-            "a caught engine panic must poison the context"
-        );
+        // boa 0.22 made `into_opaque` fallible, so the limit now comes back to
+        // the job runner as an ordinary `Err` instead of a panic. Either way
+        // the process lives: a caught panic poisons the context (and script is
+        // refused), an ordinary `Err` leaves the engine running — and in both
+        // the reaction chain never reaches its second step.
         {
             let js = engine.js_engine.as_mut().unwrap();
-            assert!(
-                js.execute("1 + 1").is_err(),
-                "a poisoned engine refuses further script instead of running it on a broken VM"
-            );
+            if crate::js::engine_poisoned() {
+                assert!(
+                    js.execute("1 + 1").is_err(),
+                    "a poisoned engine refuses further script instead of running it on a broken VM"
+                );
+            } else {
+                let settled = js.execute("window.__settled").expect("an unpoisoned engine keeps running script");
+                assert_eq!(settled.as_number(), Some(0.0), "the limit must stop the chain, got {settled:?}");
+            }
         }
         // The DOM built before the panic is still intact and still renders.
         let document = engine.document.as_ref().expect("document survives");
         assert!(
             document.select_first("#x").is_ok(),
-            "the DOM must render as it stands after the engine is poisoned"
+            "the DOM must render as it stands after the limit trips"
         );
         crate::js::clear_poison();
     }
@@ -2190,5 +2198,116 @@ mod tests {
         assert_eq!(paint("n").color, Some((1, 2, 3)), ":where() must distribute");
         assert_eq!(paint("a").color, None, ":focus-visible/:has must not match");
         assert_eq!(paint("a").bold, Some(true), ":not(:focus-visible) is a tautology");
+    }
+
+    /// AETHERSEE helper: the layout box of the element with this id.
+    fn box_by_id(tree: &layout::LayoutTree, id: &str) -> taffy::Layout {
+        for (node_id, dom_node) in &tree.node_map {
+            if let Some(el) = dom_node.as_element() {
+                if el.attributes.borrow().get("id") == Some(id) {
+                    return *tree.taffy.layout(*node_id).unwrap();
+                }
+            }
+        }
+        panic!("no element #{id}");
+    }
+
+    #[test]
+    fn aethersee_display_flex_is_a_row_with_flex_properties() {
+        // AETHERSEE fix 1 (corpus 02/03/09): display:flex was kept as
+        // Aether's internal column, and flex/gap/flex-wrap were ignored.
+        let html = r#"<!DOCTYPE html><html><body style="margin:0">
+            <div id="row"><div id="side">s</div><div id="main">m</div></div>
+            <div id="wrap"><div id="c1">a</div><div id="c2">b</div><div id="c3">c</div></div>
+        </body></html>"#;
+        let mut tree = layout::compute_layout_sized(&dom::parse_html(html), 800.0, 600.0);
+        css::apply_css(&mut tree, r#"
+            #row { display: flex; gap: 20px; }
+            #side { flex: 0 0 200px; }
+            #main { flex: 1; }
+            #wrap { display: flex; flex-wrap: wrap; gap: 10px; }
+            #wrap div { width: 300px; height: 50px; }
+        "#);
+        let (side, main) = (box_by_id(&tree, "side"), box_by_id(&tree, "main"));
+        assert_eq!(side.size.width, 200.0, "flex-basis 200px, no grow/shrink");
+        assert_eq!(side.location.y, main.location.y, "flex items share one row");
+        assert_eq!(main.location.x, 220.0, "column gap between items");
+        assert_eq!(main.size.width, 580.0, "flex:1 takes the remaining space");
+        let (c1, c2, c3) = (box_by_id(&tree, "c1"), box_by_id(&tree, "c2"), box_by_id(&tree, "c3"));
+        assert_eq!((c1.location.y, c2.location.y), (0.0, 0.0), "two 300px items fit a row");
+        assert_eq!(c2.location.x, 310.0);
+        assert_eq!(c3.location.y, 60.0, "third wraps below with the row gap");
+    }
+
+    #[test]
+    fn aethersee_flex_shorthand_grammar() {
+        use taffy::style::Dimension;
+        let f = css::parse_flex_shorthand;
+        assert_eq!(f("1"), Some((1.0, 1.0, Dimension::percent(0.0))));
+        assert_eq!(f("0 0 200px"), Some((0.0, 0.0, Dimension::length(200.0))));
+        assert_eq!(f("none"), Some((0.0, 0.0, Dimension::auto())));
+        assert_eq!(f("auto"), Some((1.0, 1.0, Dimension::auto())));
+        assert_eq!(f("2 30%"), Some((2.0, 1.0, Dimension::percent(0.3))));
+        assert_eq!(f("120px"), Some((1.0, 1.0, Dimension::length(120.0))));
+    }
+
+    #[test]
+    fn aethersee_sole_text_run_wraps_inside_its_box() {
+        // A paragraph narrower than the viewport: its only text run must
+        // wrap at the paragraph's width, not at the viewport's.
+        let html = r#"<!DOCTYPE html><html><body style="margin:0"><p id="p" style="width:200px;margin:0">
+            one two three four five six seven eight nine ten eleven twelve</p></body></html>"#;
+        let mut tree = layout::compute_layout_sized(&dom::parse_html(html), 800.0, 600.0);
+        css::apply_css(&mut tree, "");
+        for (node_id, dom_node) in &tree.node_map {
+            if dom_node.as_text().is_some_and(|t| t.borrow().contains("twelve")) {
+                let l = tree.taffy.layout(*node_id).unwrap();
+                assert!(l.size.width <= 200.0, "text run {} wide in a 200px box", l.size.width);
+                assert!(l.size.height > 30.0, "it wraps onto several lines");
+                return;
+            }
+        }
+        panic!("text run not found");
+    }
+
+    #[test]
+    fn aethersee_body_background_fills_the_canvas() {
+        // AETHERSEE fix 2 (corpus 15-landing): a body background painted
+        // only the body box; below the content the canvas stayed white.
+        let html = r#"<!DOCTYPE html><html><body style="margin:0"><p>short</p></body></html>"#;
+        let mut tree = layout::compute_layout_sized(&dom::parse_html(html), 100.0, 100.0);
+        css::apply_css(&mut tree, "body { background: #102030; }");
+        assert_eq!(render::canvas_background(&tree), Some((0x10, 0x20, 0x30)));
+        let mut surface = vec![0u8; 100 * 100 * 4];
+        render::render_frame(&tree, &mut surface, 100, 100, 0.0, 0.0, &[(0, 0, 100, 100)]);
+        let px = |x: usize, y: usize| surface[(y * 100 + x) * 4..(y * 100 + x) * 4 + 3].to_vec();
+        assert_eq!(px(50, 95), vec![0x30, 0x20, 0x10], "canvas below the content is body's colour (BGRA)");
+        // The root's own background wins over body's.
+        css::apply_css(&mut tree, "html { background: #ff0000; } body { background: #102030; }");
+        assert_eq!(render::canvas_background(&tree), Some((255, 0, 0)));
+    }
+
+    #[test]
+    fn aethersee_text_is_measured_with_the_face_it_is_painted_with() {
+        // AETHERSEE fix 3 (corpus 01-blog-article): the measurer always used
+        // the family's REGULAR face, the painter the bold face, so every bold
+        // heading painted wider than its box and overlapped the next block.
+        let html = r#"<!DOCTYPE html><html><body>
+            <div><span id="r">Three stages of a browser</span></div>
+            <div><b id="b">Three stages of a browser</b></div>
+            <div><span id="u" style="text-transform:uppercase">Three stages of a browser</span></div>
+        </body></html>"#;
+        let mut tree = layout::compute_layout_sized(&dom::parse_html(html), 800.0, 600.0);
+        css::apply_css(&mut tree, "");
+        let (r, b, u) = (box_by_id(&tree, "r"), box_by_id(&tree, "b"), box_by_id(&tree, "u"));
+        assert!(b.size.width > r.size.width, "bold run measured with the bold face ({} vs {})", b.size.width, r.size.width);
+        assert!(u.size.width > r.size.width, "uppercase run measured after its transform");
+        // One resolver: the key distinguishes every face the painter can pick.
+        use crate::fonts::face_key;
+        let keys: std::collections::HashSet<u8> = (0..3u8)
+            .flat_map(|f| [(f, false, false), (f, true, false), (f, false, true), (f, true, true)])
+            .map(|(f, b, i)| face_key(f, b, i))
+            .collect();
+        assert_eq!(keys.len(), 12);
     }
 }

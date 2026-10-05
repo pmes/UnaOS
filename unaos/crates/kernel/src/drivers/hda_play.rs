@@ -199,7 +199,7 @@ pub fn stop() {
     }
     super::amp::amp_release(super::amp::PLAY); // AUDIO8 (B329): idempotent — a stop with nothing armed still closes the owner bit
     ACTIVE.store(false, Ordering::Release);
-    *WAV.lock() = None; // after the ST guard drops: wav_pump takes WAV then ST, so never the other order
+    *WAV.lock() = None; *CODED.lock() = None; // after the ST guard drops: wav_pump takes WAV then ST, so never the other order
 }
 
 fn hw_stop(s: &mut St) {
@@ -306,7 +306,7 @@ fn parse(path: &str) -> Result<Wav, String> {
 pub fn open_wav(path: &str) -> Result<(), String> {
     let w = match parse(path) {
         Ok(w) => w,
-        Err(r) => { serial_println!(":: PLAYWAV: path={} reason={} -> REFUSED ::", path, r); return Err(r); }
+        Err(r) => { return open_coded(path, r); }
     };
     let eff = match start(w.rate, w.ch as u8, w.bits as u8) {
         Ok(e) => e,
@@ -354,10 +354,10 @@ pub fn service() {
     super::amp::tick(); // AUDIO8 (B329) M1: the amp's idle hold-off (idle cost: one atomic load)
     if !ACTIVE.load(Ordering::Acquire) { return; }
     if let Some(p) = PENDING.try_lock().and_then(|mut g| g.take()) { let _ = open_wav(&p); }
-    wav_pump();
+    wav_pump(); coded_pump();
     let fin = { let Some(mut s) = ST.try_lock() else { return }; ring_pump(&mut s); s.done && s.armed };
     if fin {
-        report();
+        report(); coded_report();
         let mut s = ST.lock();
         s.armed = false;
         ACTIVE.store(false, Ordering::Release);
@@ -370,7 +370,7 @@ pub fn request_open(path: &str) { *PENDING.lock() = Some(String::from(path)); AC
 /// `play <path.wav>` / `play stop`. `path` is the cwd-resolved argument.
 pub fn shell_verb(args: &[&str], path: &str, console: &mut crate::console::Console) {
     match args.first().copied() {
-        None => console.println("usage: play <path.wav> | play stop"),
+        None => console.println("usage: play <file: wav flac ogg opus mp3 aac m4a aiff> | play stop"),
         Some("stop") => { stop(); console.println("play: stopped"); }
         Some(_) => match open_wav(path) {
             Ok(()) => console.println(&alloc::format!("play: {} — streaming (watch the serial for :: PLAYWAV ::)", path)),
@@ -502,4 +502,146 @@ fn progress() -> (bool, bool, bool) {
     let stalled = s.armed && !s.done && ((s.running && now.saturating_sub(s.moved_ms) > 1000)
         || (!s.running && s.armed_ms != 0 && now.saturating_sub(s.armed_ms) > 2000));
     (s.done, s.lpib_moved, stalled)
+}
+
+// ── AUDIOCODEC (SR30) M5 — `play <any file>`: audio_core sniffs and decodes, `feed()` takes the 16-bit PCM ──────
+// Reached from `open_wav` when the WAV parse refuses a file (any non-RIFF file, and WAVs it does not take: 24/32-bit,
+// float, EXTENSIBLE, > 2 channels). Integer only on this side: the decoder hands out left-justified i32, the pump
+// downmixes to <= 2 channels with Q15 weights and decimates by an integer step to <= 48 kHz (88.2/96 kHz -> 2:1).
+// FLAC, WAV/AIFF and Opus (the fixed-point decoder) are integer inside too; MP3, AAC and Vorbis run on the
+// kernel target's soft-float (x86_64-unaos.json: +soft-float) — measured realtime on metal is owed.
+
+/// audio_core's byte source over the VFS: forward reads of at most 32 KiB.
+struct VfsSrc { path: String, off: u64 }
+impl audio_core::Read for VfsSrc {
+    fn read(&mut self, buf: &mut [u8]) -> audio_core::Result<usize> {
+        let want = buf.len().min(32 * 1024);
+        match crate::shell::vfs_mount_table().read(&self.path, self.off, want) {
+            Ok(d) => { let n = d.len().min(want); buf[..n].copy_from_slice(&d[..n]); self.off += n as u64; Ok(n) }
+            Err(_) => Err(audio_core::Error::Invalid("vfs read")),
+        }
+    }
+}
+
+struct Coded {
+    path: String, dec: audio_core::Decoder, info: audio_core::Info,
+    out_ch: usize, step: usize, phase: usize,
+    buf: Vec<i32>, pend: Vec<u8>,
+    decoded: u64, fed: u64, eos: bool, fed_end: bool, err: Option<audio_core::Error>,
+}
+static CODED: spin::Mutex<Option<Coded>> = spin::Mutex::new(None);
+
+/// Open `path` through audio_core (`wav_reason`: why the native WAV parse refused it). Prints the witness arm on refusal.
+fn open_coded(path: &str, wav_reason: String) -> Result<(), String> {
+    use audio_core::AudioDecoder;
+    let refuse = |r: String| -> Result<(), String> { serial_println!(":: PLAYWAV: path={} reason={} -> REFUSED ::", path, r); Err(r) };
+    let dec = match audio_core::Decoder::open(alloc::boxed::Box::new(VfsSrc { path: String::from(path), off: 0 })) {
+        Ok(d) => d,
+        Err(e) => return refuse(alloc::format!("{}; audio_core: {:?}", wav_reason, e)),
+    };
+    let info = dec.info();
+    let step = (info.rate as usize).div_ceil(48_000).max(1);
+    let rate = info.rate / step as u32;
+    let out_ch = if info.channels >= 2 { 2 } else { 1 };
+    let eff = match start(rate, out_ch as u8, 16) { Ok(e) => e, Err(r) => return refuse(alloc::format!("{} ({} Hz / {} ch from {})", r, rate, out_ch, info.format.name())) };
+    serial_println!("[play] open path={} format={} codec={:?} rate={} ch={} bits={} frames={:?} decim={} out_ch={} eff_rate={} resampled={}",
+        path, info.format.name(), info.codec, info.rate, info.channels, info.bits, info.frames, step, out_ch, eff, (eff != rate) as u8);
+    *CODED.lock() = Some(Coded { path: String::from(path), dec, info, out_ch, step, phase: 0, buf: Vec::new(), pend: Vec::new(),
+                                 decoded: 0, fed: 0, eos: false, fed_end: false, err: None });
+    ACTIVE.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Decode ahead into `feed()`: up to four 4096-frame blocks per tick, held back while the FIFO is full.
+fn coded_pump() {
+    use audio_core::AudioDecoder;
+    for _ in 0..4 {
+        let mut g = CODED.lock();
+        let Some(c) = g.as_mut() else { return };
+        if c.fed_end { return; }
+        if c.pend.is_empty() {
+            if c.eos { c.fed_end = true; drop(g); finish(); return; }
+            let ch = c.info.channels as usize;
+            c.buf.resize(4096 * c.step * ch, 0);
+            let n = match c.dec.next_i32(&mut c.buf) { Ok(n) => n, Err(e) => { c.err = Some(e); 0 } };
+            if n == 0 { c.eos = true; continue; }
+            c.decoded += n as u64;
+            // downmix: the first two channels carry, every further one adds half weight to both; scaled so a full
+            // scale input cannot clip (Q15)
+            let w0: i64 = if ch <= 2 { 32_768 } else { 65_536 / ch as i64 };
+            for i in 0..n {
+                let ph = c.phase; c.phase = (c.phase + 1) % c.step;
+                if ph != 0 { continue; }
+                let f = &c.buf[i * ch..i * ch + ch];
+                let v = |k: usize| (f[k] >> 16) as i64;
+                let (l, r) = if ch == 1 { (v(0), v(0)) } else if ch == 2 { (v(0), v(1)) } else {
+                    let rest: i64 = (2..ch).map(v).sum();
+                    ((v(0) * w0 + rest * w0 / 2) >> 15, (v(1) * w0 + rest * w0 / 2) >> 15)
+                };
+                let (l, r) = (l.clamp(-32_768, 32_767) as i16, r.clamp(-32_768, 32_767) as i16);
+                c.pend.extend_from_slice(&l.to_le_bytes());
+                if c.out_ch == 2 { c.pend.extend_from_slice(&r.to_le_bytes()); }
+                c.fed += 1;
+            }
+        }
+        if feed(&c.pend) == 0 { return; } // no room: retry next tick
+        c.pend.clear();
+    }
+}
+
+/// The coded player's verdict, once the ring has drained (`service()`, after `report()`).
+fn coded_report() {
+    let c = CODED.lock().take();
+    let Some(c) = c else { return };
+    let s = ST.lock();
+    let rate = c.info.rate / c.step as u32;
+    let stated_ok = c.info.frames.map(|f| f == c.decoded).unwrap_or(true);
+    let ok = s.in_frames == c.fed && c.err.is_none() && stated_ok && s.underruns == 0 && s.err == 0 && s.completed >= 1 && s.lpib_moved && s.done;
+    let ms = c.fed * 1000 / rate.max(1) as u64;
+    serial_println!("[play] done resampled={} eff_rate={} entries={} fifoe_dese={} run_bit={} lpib_moved={} level={}", s.resampled as u8, s.eff_rate, s.completed, s.err, s.run_bit as u8, s.lpib_moved as u8, s.level);
+    serial_println!(":: PLAYCODEC: path={} format={} codec={:?} rate={} frames={} lpib_moved={} done={} -> {} :: ch={} decoded={} stated={:?} decim={} err={:?} secs={}.{} under={} ::",
+        c.path, c.info.format.name(), c.info.codec, c.info.rate, s.in_frames, s.lpib_moved as u8, s.done as u8, if ok { "PASS" } else { "FAIL" },
+        c.info.channels, c.decoded, c.info.frames, c.step, c.err, ms / 1000, (ms % 1000) / 100, s.underruns);
+}
+
+/// `tests play [fmt]` (and `tests playflac` … through `crate::tests::arg()`): play `TEST.<EXT>` from the user's home,
+/// /home or / for each format; a format with no such file SKIPs. The completion is the ring's drain, as in `tests playwav`.
+pub fn selftest_codecs() {
+    const FMTS: [(&str, &str); 7] = [("flac", "FLAC"), ("opus", "OPUS"), ("vorbis", "OGG"), ("mp3", "MP3"), ("aac", "AAC"), ("m4a", "M4A"), ("aiff", "AIF")];
+    let want = crate::tests::arg();
+    let mt = crate::shell::vfs_mount_table();
+    for (fmt, ext) in FMTS {
+        if let Some(w) = want.as_deref() { if w != fmt && !w.eq_ignore_ascii_case(ext) { continue; } }
+        let mut cands: Vec<String> = Vec::new();
+        #[cfg(feature = "login")]
+        {
+            let mut b = [0u8; crate::fs::users::NAME_MAX];
+            if let Some(n) = crate::fs::users::whoami(&mut b) {
+                if let Ok(name) = core::str::from_utf8(&b[..n]) { cands.push(alloc::format!("/home/{}/TEST.{}", name, ext)); }
+            }
+        }
+        cands.push(alloc::format!("/home/TEST.{}", ext));
+        cands.push(alloc::format!("/TEST.{}", ext));
+        let Some(path) = cands.into_iter().find(|c| mt.stat(c).is_ok()) else {
+            serial_println!(":: PLAYCODEC: fmt={} path=- reason=no-file (put TEST.{} in /home or /) -> SKIP ::", fmt, ext);
+            continue;
+        };
+        match open_wav(&path) {
+            Ok(()) => {
+                let mut stalled = false;
+                while ACTIVE.load(Ordering::Acquire) {
+                    service();
+                    let (_done, _moved, st) = progress();
+                    if st { stalled = true; break; }
+                    delay_us(2_000);
+                }
+                if stalled {
+                    let (lp, run_bit, fifo) = { let s = ST.lock(); (s.lpib_last, s.run_bit as u8, s.fifo.len()) };
+                    stop();
+                    serial_println!(":: PLAYCODEC: fmt={} path={} reason=stalled lpib={} run_bit={} fifo={} -> FAIL ::", fmt, path, lp, run_bit, fifo);
+                }
+            }
+            Err(r) => serial_println!(":: PLAYCODEC: fmt={} path={} reason={} -> SKIP ::", fmt, path, r),
+        }
+    }
 }

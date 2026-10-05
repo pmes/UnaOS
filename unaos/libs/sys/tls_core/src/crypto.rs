@@ -197,6 +197,34 @@ pub trait CryptoProvider {
         self.hkdf_expand(alg, secret, &[&len, &full_label_len, b"tls13 ", label, &ctx_len, context], out)
     }
 
+    /// The TLS 1.2 PRF (RFC 5246 §5): `P_hash(secret, label + seed)` into `out`. A DEFAULT built on `hmac`, like
+    /// HKDF; CRYPTOCORE overrides it with `crypto_core::tls12_prf` (the same function, KAT-proven there).
+    fn tls12_prf(&self, alg: HashAlg, secret: &[u8], label: &[u8], seed: &[&[u8]], out: &mut [u8]) -> Result<(), CryptoError> {
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(seed.len() + 1);
+        parts.push(label);
+        parts.extend_from_slice(seed);
+        let mut a = self.hmac(alg, secret, &parts); // A(1)
+        let mut done = 0;
+        while done < out.len() {
+            let mut p2: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
+            p2.push(a.as_bytes());
+            p2.extend_from_slice(&parts);
+            let block = self.hmac(alg, secret, &p2);
+            let n = core::cmp::min(block.len(), out.len() - done);
+            out[done..done + n].copy_from_slice(&block.as_bytes()[..n]);
+            done += n;
+            a = self.hmac(alg, secret, &[a.as_bytes()]);
+        }
+        Ok(())
+    }
+
+    /// SHA-1 — ONLY to match an OCSP `CertID` (RFC 6960 §4.1.1), whose name/key hashes responders compute with
+    /// SHA-1. Never a signature. Default `Unsupported` (a CertID in SHA-256 still matches without it).
+    fn sha1(&self, parts: &[&[u8]]) -> Result<[u8; 20], CryptoError> {
+        let _ = parts;
+        Err(CryptoError::Unsupported("SHA-1 (OCSP CertID): this CryptoProvider has none"))
+    }
+
     /// AEAD seal in place: `in_out` holds the plaintext on entry and ciphertext || tag on return.
     fn aead_seal(
         &self,

@@ -7,6 +7,13 @@ name = "crypto_core"
 version = "0.1.0"
 
 [[package]]
+name = "holocron_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+]
+
+[[package]]
 name = "tls_core"
 version = "0.1.0"
 dependencies = [
@@ -35,6 +42,7 @@ name = "vein_ring3"
 version = "0.1.0"
 dependencies = [
  "crypto_core",
+ "holocron_core",
  "tls_core",
  "una-abi",
  "vein_core",

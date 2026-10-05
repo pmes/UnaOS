@@ -175,7 +175,7 @@ const CELL_H: usize = wm::TITLE_CELL_H;
 
 /// FONT-METRIC — the atlas those metrics come from, named once so the layout constants and the
 /// glyph call can never disagree about which face the menu is drawing.
-const FACE: super::font::Face = super::font::Face::Chrome;
+const FACE: super::text::Face = super::text::Face::Chrome;
 
 /// An item row's height, px: the glyph cell plus 8 px of clearance split top and bottom, so the
 /// glyph sits with 4 px of air above and below. DERIVED from the cell, so when FONT-METRIC moved
@@ -265,7 +265,7 @@ pub const DROP_CELL_W: usize = CELL_W;
 /// WINMENU — the glyph cell height the dropdown draws at.
 pub const DROP_CELL_H: usize = CELL_H;
 /// WINMENU — the atlas the dropdown draws from.
-pub const DROP_FACE: super::font::Face = FACE;
+pub const DROP_FACE: super::text::Face = FACE;
 
 /// WINMENU — **is the SHARD menu dropped?**
 ///
@@ -987,7 +987,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
         if sy >= (ITEM_H - CELL_H) / 2 && sy < (ITEM_H - CELL_H) / 2 + CELL_H {
             let mut buf = [0u8; 48];
             let n = super::powerui::panel_line(li, &mut buf);
-            super::font::draw_row(out, w, &buf[..n], BORDER + PADX, sy - (ITEM_H - CELL_H) / 2, theme::TITLE_TEXT_ACTIVE, false, FACE);
+            super::text::draw_row(out, w, &buf[..n], BORDER + PADX, sy - (ITEM_H - CELL_H) / 2, theme::TITLE_TEXT_ACTIVE, false, FACE);
         }
         return;
     }
@@ -1017,7 +1017,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
             // painted (RAM scratch — the blend's read is cached). Regular weight: menu items are
             // body text, not a caption.
             let label = match ROWS[row].verb { Some(Verb::Restart) => super::powerui::armed_label(1), Some(Verb::ShutDown) => super::powerui::armed_label(2), _ => None }.unwrap_or(ROWS[row].label).as_bytes(); // POWERMENU M1: the armed row re-reads
-            super::font::draw_row(out, w, label, BORDER + PADX, sy, theme::TITLE_TEXT_ACTIVE, false, FACE);
+            super::text::draw_row(out, w, label, BORDER + PADX, sy, theme::TITLE_TEXT_ACTIVE, false, FACE);
         }
     }
 }

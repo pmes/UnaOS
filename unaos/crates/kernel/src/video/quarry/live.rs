@@ -126,7 +126,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use crate::video::font;
+#[allow(unused_imports)] use crate::video::font; // KERNELFONT: the glyph calls moved to `video::text`; kept for the doc links
 use crate::video::theme;
 use crate::video::wm;
 use crate::fs::vfs::{DirEnt, NodeKind, VfsTime};
@@ -311,7 +311,7 @@ struct Geom {
     /// panel. This is fonts.md §6.2's end state: the panel predicate that used to pick a
     /// replication factor now picks a FACE, which is the only thing about it that was ever a
     /// legibility decision.
-    face: font::Face,
+    face: crate::video::text::Face,
 }
 
 impl Geom {
@@ -399,7 +399,7 @@ fn geometry(pw: usize, ph: usize) -> Option<Geom> {
     // ORNAMENT scale — the triangle's unit and the rows' vertical padding — because that is the one
     // job a replication factor was always right for.
     let ts = if pw >= 1280 { 2 } else { 1 };
-    let face = if pw >= 1280 { font::Face::Chrome } else { font::Face::Body };
+    let face = if pw >= 1280 { crate::video::text::Face::Chrome } else { crate::video::text::Face::Body };
     let (cell_w, cell_h) = (face.cell_w(), face.cell_h());
     // Leave the chrome room. `wm` draws the title strip above the content and a border around it, and
     // a window whose OUTER box does not fit is a window the tiler will fight.
@@ -1628,7 +1628,7 @@ fn keyline(px: &mut [u32], g: &Geom, r: Rect, c: u32) {
 /// priced in this commit's body rather than assumed, because `font.rs`'s tail rule says a face the
 /// optimizer cannot see through keeps every atlas in the image.
 fn text(px: &mut [u32], g: &Geom, x: usize, y: usize, s: &[u8], max_x: usize, fg: u32) -> usize {
-    font::draw_text(px, g.w, max_x.min(g.w), g.h, x, y, s, fg, false, g.face)
+    crate::video::text::draw_text(px, g.w, max_x.min(g.w), g.h, x, y, s, fg, false, g.face)
 }
 
 /// The disclosure marker: a right-pointing triangle when collapsed, down-pointing when expanded.
@@ -2873,7 +2873,7 @@ pub fn service() {
     #[cfg(feature = "facet")]
     crate::video::facet::service();
     // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
-    crate::video::fileview::service(); crate::video::settings::service();
+    crate::video::fileview::service(); crate::video::settings::service(); crate::video::text::service();
     // TEXTEDIT — the editor's latch drains on the same pass.
     crate::video::textedit::service();
     // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.
@@ -2902,7 +2902,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     }
     // QUARRYFONT — the panel predicate now answers a FACE, and the leg that used to pin the
     // replication factor pins that instead. Both claims are kept: `ts` is still the ornament unit.
-    if small.face != font::Face::Body || bench.face != font::Face::Chrome {
+    if small.face != crate::video::text::Face::Body || bench.face != crate::video::text::Face::Chrome {
         return Err("text face did not follow the panel");
     }
     // The two units are genuinely different numbers now — a doubled 1-bit cell was square and a

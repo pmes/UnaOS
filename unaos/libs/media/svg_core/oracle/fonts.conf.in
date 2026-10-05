@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<!-- The oracle's font world: ONLY the resvg test-suite fonts (the same files svg_core is handed), with the
+     generic families mapped the way the svg_core oracle test maps them. -->
+<fontconfig>
+  <dir>@FONTDIR@</dir>
+  <cachedir>@CACHEDIR@</cachedir>
+  <alias binding="same"><family>serif</family><prefer><family>Noto Serif</family></prefer></alias>
+  <alias binding="same"><family>Times New Roman</family><prefer><family>Noto Serif</family></prefer></alias>
+  <alias binding="same"><family>sans-serif</family><prefer><family>Noto Sans</family></prefer></alias>
+  <alias binding="same"><family>Arial</family><prefer><family>Noto Sans</family></prefer></alias>
+  <alias binding="same"><family>monospace</family><prefer><family>Noto Mono</family></prefer></alias>
+  <alias binding="same"><family>cursive</family><prefer><family>Yellowtail</family></prefer></alias>
+  <alias binding="same"><family>fantasy</family><prefer><family>Sedgwick Ave Display</family></prefer></alias>
+  <match target="pattern"><edit name="hinting" mode="assign"><bool>false</bool></edit></match>
+  <match target="font"><edit name="antialias" mode="assign"><bool>true</bool></edit><edit name="rgba" mode="assign"><const>none</const></edit><edit name="hinting" mode="assign"><bool>false</bool></edit></match>
+</fontconfig>

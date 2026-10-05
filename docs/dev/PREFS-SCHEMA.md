@@ -10,7 +10,7 @@ or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keep
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
 operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
 
-Rows: 28.
+Rows: 31.
 
 | key | type | default | writers | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -18,6 +18,8 @@ Rows: 28.
 | `system.audio.mute` | bool | `false` | settings, keys | kernel settings (audio) | Output muted. |
 | `system.audio.volume` | int `0..=16` | `12` | settings, keys | kernel settings (audio) | Output level in sixteenths. |
 | `system.display.brightness` | int `1..=16` | `12` | settings, keys | kernel settings, backlight | Panel level in sixteenths; never 0 (BRIGHTFLOOR: the backlight's OFF belongs to the idle blank). |
+| `system.display.font` | enum `sans \| serif \| mono` | `"sans"` | operator | kernel `video::text` (KERNELFONT) | The UI typeface family for captions, menus and running text: DejaVu Sans, Serif or Sans Mono (KERNELFONT B359; the console grid is always mono). |
+| `system.display.font_size` | int `9..=32` | `13` | operator | kernel `video::text` (KERNELFONT) | UI text size in CSS px; device px = size x the panel's ppi (EDID) / 96, capped by the 16 px text cell; captions keep the bar-derived size. |
 | `system.display.idle_min` | int `0..=1440` | `10` | settings | kernel settings (DIMIDLE) | Minutes before the idle blank; 0 = never. |
 | `system.display.wallpaper` | string ≤120 printable | `""` | settings, wallpaper-verb | kernel settings, wallpaper | Wallpaper image path; empty = off. |
 | `system.dock.pins` | string ≤256 printable | consumer: every pin the build carries (lumen only on a `lumen` build) | dock | kernel dock | Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen); TOML arrays are outside the subset. |
@@ -26,6 +28,7 @@ Rows: 28.
 | `system.settings.tab` | int `0..=3` | `0` | settings | kernel settings | The Settings window's open tab (General, Users, Display, About). |
 | `vein.claude.api_key_env` | string ≤128 printable | `"ANTHROPIC_API_KEY"` | operator | gneiss_pal ProviderConfig | NAME of the environment variable holding the Claude key (the key is never a preference). |
 | `vein.claude.fallbacks` | bool | `true` | operator | gneiss_pal ProviderConfig | Let the Claude client fall back to the next model on overload. |
+| `vein.claudecode.bin` | string ≤4096 printable | `"claude"` | operator | gneiss_pal ProviderConfig | The Claude Code CLI binary for provider claudecode: a path, or a name looked up on PATH (CLAUDECODE, SR38). |
 | `vein.embed.dims` | int `1..=65536` | consumer: the embedding model's known width | operator | gneiss_pal EmbedConfig | Embedding vector width. |
 | `vein.embed.model` | string ≤128 printable | consumer: `gemini.embed_model` for gemini, `all-MiniLM-L6-v2` for local | operator | gneiss_pal EmbedConfig | The embedding model. |
 | `vein.embed.provider` | enum `gemini \| local \| off` | rule `embedder` | operator | gneiss_pal EmbedConfig | The embedder, its own setting independent of the chat provider (R81); off = recall disabled, said in-chat. |
@@ -40,10 +43,10 @@ Rows: 28.
 | `vein.key_file` | string ≤40 printable | consumer: unset: no key, the Echo provider answers | operator | vein_ring3 key (LUMEN.ELF); kernel tests lumen | Absolute path of the API key file on the UnaFS volume (read only when it stats with an inode id; refused on FAT). At most 40 bytes: ring 3's SYS_OPEN name bound. |
 | `vein.max_tokens` | int `1..=4294967295` | `16000` | operator | gneiss_pal ProviderConfig | Output token cap per reply. |
 | `vein.model` | string ≤128 printable | rule `chat-model` | operator | gneiss_pal ProviderConfig | The chat model. |
-| `vein.provider` | enum `claude \| gemini \| echo \| relay` | `"claude"` | operator | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired). |
+| `vein.provider` | enum `claude \| gemini \| claudecode \| echo \| relay` | `"claude"` | operator | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired; claudecode = the installed Claude Code CLI on a subscription, host only, SR38). |
 | `vein.temperature` | float `0.0..=2.0` | consumer: the provider's own | operator | gneiss_pal ProviderConfig | Sampling temperature. |
 
 ## Rules (derived defaults)
 
 - `embedder` — `vein.embed.provider`: `gemini` when `vein.gemini.api_key_env` (default `GEMINI_API_KEY`) names a set, non-blank environment variable; else `local` when the local model `all-MiniLM-L6-v2` is installed (every file of the `tools/una-models` manifest in `${XDG_CACHE_HOME:-$HOME/.cache}/unaos/models/all-MiniLM-L6-v2/`); else `off` (R81).
-- `chat-model` — `vein.model`: `claude-opus-5-5` when `vein.provider` is `claude` (its default), `gemini-3.1-pro-preview` when `gemini`; none for `echo` / `relay` (R81).
+- `chat-model` — `vein.model`: `claude-opus-5-5` when `vein.provider` is `claude` (its default), `gemini-3.1-pro-preview` when `gemini`; `default` (the CLI's own model) when `claudecode`; none for `echo` / `relay` (R81).

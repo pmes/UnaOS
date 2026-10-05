@@ -341,7 +341,7 @@ const CELL_H: usize = wm::TITLE_CELL_H;
 
 /// FONT-METRIC — the atlas those metrics come from, named once so the tile's width budget and its
 /// glyph call can never disagree about which face the caption is drawn in.
-const FACE: super::font::Face = super::font::Face::Chrome;
+const FACE: super::text::Face = super::text::Face::Chrome;
 
 /// The longest caption a tile will ever show, in glyphs. Bounded by [`wm::MAX_TITLE`]; capped at 8
 /// because a dock is a row of many small things and a tile wide enough for a whole 16-byte title
@@ -1007,8 +1007,8 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         // FONT (GR27) — the shared anti-aliased face, alpha-composited over the tile face the row
         // loop above just painted (a RAM scratch row, so the blend's read is cached). Regular
         // weight: a dock label is a secondary surface beside the caption and the bar.
-        let cols = l.glyphs.min(r.title_len);
-        super::font::draw_row(out, l.w, &r.title[..cols], bx + PAD, sy, ink, false, FACE);
+        let cols = super::text::fit(&r.title[..l.glyphs.min(r.title_len)], false, FACE, l.glyphs * FACE.cell_w()); // KERNELFONT: whole glyphs inside the tile's budget
+        super::text::draw_row(out, l.w, &r.title[..cols], bx + PAD, sy, ink, false, FACE);
     }
 }
 
@@ -2985,7 +2985,7 @@ fn menu_row(out: &mut [u32], l: &Layout, g: Option<MenuGeo>, j: usize) {
     }
     let mut wbuf = [0u8; wm::MAX_TITLE];
     let label: &[u8] = if row == 0 { b"Quit" } else if row == 1 { if g.keep { b"Remove from Dock" } else { b"Keep in Dock" } } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3
-    if sy0 >= 0 { super::font::draw_row(out, l.w, label, bx + PAD, sy0 as usize, ink, false, FACE); }
+    if sy0 >= 0 { super::text::draw_row(out, l.w, label, bx + PAD, sy0 as usize, ink, false, FACE); }
 }
 
 /// The open menu's box (x, y, w, h), or `None` when closed. Same geometry the painter draws from.
