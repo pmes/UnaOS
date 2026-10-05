@@ -2240,7 +2240,7 @@ pub fn shot_bare_close() -> bool {
 /// INSTALLBARE M4: the password field's panel rectangle while the form is up (masked in the golden: the caret blinks).
 pub fn field_rect_panel() -> Option<(usize, usize, usize, usize)> {
     let (x, y, w, h) = wm::frame_of(WIN.load(Ordering::Relaxed))?;
-    let top = wm::TITLE_H.min(h);
+    let top = wm::TITLE_H().min(h);
     Some((x, y + top + (h - top) / 3, w, (h - top) / 3))
 }
 
