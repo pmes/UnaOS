@@ -24,3 +24,7 @@ h2 = []
 [dependencies]
 pixel_core = { path = "../../media/pixel_core" }
 tls_core = { path = "../../sys/tls_core", optional = true, features = ["cryptocore-std"] }
+
+[[test]]
+name = "host_e2e"
+required-features = ["host"]
