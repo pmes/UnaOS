@@ -656,8 +656,8 @@ pub fn sinh(x: f64) -> f64 {
         return xd.add(x2.mul(xd).div(DD::from(6.0))).add(x2.mul(x2).mul(xd).div(DD::from(120.0))).val();
     }
     let a = x.abs();
-    let e = exp_dd(DD::from(a - LN2.0)).sub(exp_dd(DD::from(-a - LN2.0)));
-    let v = e.val();
+    // (e^a - e^-a) / 2 in double-double; near overflow, e^(a - ln 2) with the subtraction in double-double too.
+    let v = if a < 700.0 { exp_dd(DD::from(a)).sub(exp_dd(DD::from(-a))).scale(-1).val() } else { exp_dd(DD::from(a).sub(LN2)).val() };
     if x < 0.0 {
         -v
     } else {
@@ -679,7 +679,7 @@ pub fn cosh(x: f64) -> f64 {
     if a > 710.5 {
         return f64::INFINITY;
     }
-    exp_dd(DD::from(a - LN2.0)).add(exp_dd(DD::from(-a - LN2.0))).val()
+    if a < 700.0 { exp_dd(DD::from(a)).add(exp_dd(DD::from(-a))).scale(-1).val() } else { exp_dd(DD::from(a).sub(LN2)).val() }
 }
 
 pub fn tanh(x: f64) -> f64 {
