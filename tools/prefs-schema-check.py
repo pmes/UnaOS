@@ -214,7 +214,8 @@ def selftest(keys):
          'pub const PREF_KEY: &str = "audio.ghost_ms";\nfn a() { crate::prefs::peek_int(PREF_KEY, 0, 9); crate::prefs::int("audio.volume", 0, 16); }\n'
          'fn b() { crate::prefs::get("vein", "ghost_url"); let s = |k: &str| crate::prefs::get("vein", k).map(|v| v); s("phantom_tls"); s("provider"); }\n'),
         ("unaos/crates/user-prefs/src/main.rs", 'const TABLE: &[(&[u8], &[u8])] = &[\n    (b"system.audio.volume", b"12"),\n    (b"ui.theme", b"dark"),\n];\n'
-        # R7: the deleted `vein.tls` (VEINTLS) must go red if a ring-3 PREF_GET client asks for it again.
+         'fn c() { ask(BUS_VERB_R3PREF_GET, 1, b"ui.font_scale"); }\n'),
+        # R11: the deleted `vein.tls` (VEINTLS) must go red if a ring-3 PREF_GET client asks for it again.
         ("unaos/libs/sys/x_ring3/src/prefs.rs", 'use una_abi::BUS_VERB_PREF_GET;\nlet a = one("vein.model", &mut v, &mut e);\nlet b = one("vein.tls", &mut v, &mut e);\n'),
     ]
     files = [(p, strip_tests(s)) for p, s in fake]
