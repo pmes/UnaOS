@@ -312,7 +312,18 @@ impl TransferRing {
     fn write_trb(&mut self, index: usize, trb: Trb) {
         unsafe {
             let p = self.trbs.add(index);
-            core::ptr::write_volatile(p, trb);
+            // USBNET8 (B381): THE CYCLE-BEARING DWORD LAST (xHCI 1.2 §4.9.1; Linux `queue_trb`: fields 0..2, `wmb()`,
+            // field 3). One `write_volatile` of the 16-byte packed struct leaves the order of its stores to the
+            // compiler, so the control dword (cycle bit) could land before the buffer pointer/length a controller
+            // re-reading the slot would then execute. Parameter and status first, a fence, then control alone.
+            // The ring is 64-byte aligned and every TRB 16 bytes, so each dword below is naturally aligned.
+            let b = p as *mut u8;
+            let (param, status, control) = (trb.parameter, trb.status, trb.control);
+            core::ptr::write_volatile(b as *mut u32, param as u32);
+            core::ptr::write_volatile(b.add(4) as *mut u32, (param >> 32) as u32);
+            core::ptr::write_volatile(b.add(8) as *mut u32, status);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            core::ptr::write_volatile(b.add(12) as *mut u32, control);
             // XHCI-COHERENCE: producer boundary — the controller (command ring or any transfer
             // ring) DMA-reads this TRB after its doorbell; clean the line to DRAM so a non-snooping
             // master sees it (cycle bit included). No-op on coherent x86_64.

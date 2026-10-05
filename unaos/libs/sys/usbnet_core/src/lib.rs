@@ -340,4 +340,64 @@ mod tests {
         let _ = ax88179::split(&b, 2, |p| ax.push(p));
         assert_ne!(rtl, ax);
     }
+
+    // USBNET8 (B381): flight 23's two `[usbnet] rx0` captures, through the split to the Ethernet frame the kernel pushes on
+    // the ring the stack drains (`deliver(&buf[off..off + len])`, census `note_ethertype` reads bytes 12..14). The wire
+    // printed the first 48 bytes and the last 16; the middle is zero here (no header of the split reads it).
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+    fn rx0(len: usize, head: &str, tail: &str) -> Vec<u8> {
+        let (h, t) = (hex(head), hex(tail));
+        let mut b = std::vec![0u8; len];
+        b[..h.len()].copy_from_slice(&h);
+        b[len - t.len()..].copy_from_slice(&t);
+        b
+    }
+    fn one_frame(b: &[u8]) -> (usize, usize) {
+        let (s, v) = ax_collect(b);
+        assert_eq!(s, Split { packets: 2, refused: None });
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1], Pkt::Pad, "the 0x80008000 dummy after the real header");
+        match v[0] { Pkt::Frame { off, len } => (off, len), p => panic!("not a frame: {:?}", p) }
+    }
+
+    #[test]
+    fn ax_flight23_boot1_rx0_mld_report_to_ipv6_frame() {
+        let b = rx0(128,
+            "eeee333300000016c8a362ec63b186dd600000000038000100000000000000000000000000000000ff02000000000000",
+            "00887000008000800000000002007000");
+        assert_eq!(ax88179::trailer(&b), Some((0x0070_0002, 2, 112)));
+        let (off, len) = one_frame(&b);
+        assert_eq!((off, len), (2, 110), "the 2-byte IPE pad is skipped; 112 - 2 bytes of frame");
+        let f = &b[off..off + len];
+        assert_eq!(&f[0..6], &[0x33, 0x33, 0x00, 0x00, 0x00, 0x16], "dst = the MLDv2 report group, not the pad's eeee");
+        assert_eq!(&f[6..12], &[0xc8, 0xa3, 0x62, 0xec, 0x63, 0xb1]);
+        assert_eq!(u16::from_be_bytes([f[12], f[13]]), 0x86dd);
+        assert_eq!(f[14] >> 4, 6);
+        let payload = u16::from_be_bytes([f[18], f[19]]) as usize;
+        assert_eq!(14 + 40 + payload, len, "IPv6 payload length 56 accounts for the whole frame");
+        // Without the pad the same bytes would read `eeee3333…` as the dst and 0x63b1 as the ethertype.
+        let mut raw = Vec::new();
+        let _ = ax88179::split(&b, 0, |p| raw.push(p));
+        let Pkt::Frame { off: o0, .. } = raw[0] else { panic!() };
+        assert_ne!(u16::from_be_bytes([b[o0 + 12], b[o0 + 13]]), 0x86dd);
+    }
+
+    #[test]
+    fn ax_flight23_boot2_rx0_mdns_to_ipv4_frame() {
+        let b = rx0(424,
+            "eeee01005e0000fbc8a362ec63b108004500018185bd4000ff1108b10a000102e00000fb14e914e9016dd5ad00000000",
+            "00889101008000800000000002009801");
+        assert_eq!(ax88179::trailer(&b), Some((0x0198_0002, 2, 408)));
+        let (off, len) = one_frame(&b);
+        assert_eq!((off, len), (2, 399));
+        let f = &b[off..off + len];
+        assert_eq!(&f[0..6], &[0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb]);
+        assert_eq!(u16::from_be_bytes([f[12], f[13]]), 0x0800);
+        assert_eq!(14 + u16::from_be_bytes([f[16], f[17]]) as usize, len, "IPv4 total length 385 + the 14-byte header");
+        assert_eq!(f[23], 17, "UDP");
+        assert_eq!(&f[26..30], &[10, 0, 1, 2], "the LAN is 10.0.1.0: the source a USBNET8 ARP probe asks for");
+        assert_eq!(u16::from_be_bytes([f[34], f[35]]), 5353);
+    }
 }
