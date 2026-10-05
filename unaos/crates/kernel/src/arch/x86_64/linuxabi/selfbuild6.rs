@@ -80,7 +80,7 @@ fn probe(tag: &str, path: &str, argv: &[&str], ms: u64, want: &str) -> Probe {
             };
         }
         Err(e) => {
-            serial_println!("[selfbuild6] {}: {}", path, e);
+            serial_println!("[selfbuild6] {}: load: {}", tag, e);
             p.verdict = if e.starts_with("skip(window)") || super::ldso::LAST_WINDOW_REFUSAL.load(Ordering::Relaxed) == 1 {
                 String::from("skip")
             } else if oom {
