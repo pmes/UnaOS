@@ -5568,7 +5568,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 console.println_styled(crate::video::theme::TERM_RED, "usage: wallpaper <path.png> | wallpaper off");
             } else {
                 let resolved = if arg == "off" { String::new() } else { vfs_path(arg) };
-                console.println(&crate::video::wallpaper::cmd(arg, &resolved)); if arg == "off" || crate::video::wallpaper::active() { crate::prefs::set_sys(crate::prefs::key::WALLPAPER, crate::prefs::PrefValue::Str(resolved.clone())); }
+                console.println(&crate::video::wallpaper::cmd(arg, &resolved)); if arg == "off" || crate::video::wallpaper::active() { crate::prefs_client::sys_set(crate::prefs::key::WALLPAPER, crate::prefs::PrefValue::Str(resolved.clone())); }
             }
         },
         #[cfg(all(target_arch = "x86_64", feature = "wc"))] "shot" => { let w = args.first().copied().unwrap_or(""); if w == "region" || w == "window" { if crate::video::shotsel::enter(w == "window") { console.println("shot: selection mode — drag (region) or click (window); Esc cancels"); } else { console.println("shot: no desktop panel"); } } else { console.println_styled(crate::video::theme::TERM_RED, "usage: shot region | shot window"); } }, "screenshot" => {
