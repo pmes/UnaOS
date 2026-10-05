@@ -465,7 +465,7 @@ pub fn init(gpu: &GpuInfo) {
     if PROBED.swap(true, Ordering::SeqCst) {
         return;
     }
-    serial_println!("[Intel iGPU] Initializing Ivy Bridge GT2 at BDF {}:{}:{}", gpu.bus, gpu.slot, gpu.func);
+    crate::census_println!("[Intel iGPU] Initializing Ivy Bridge GT2 at BDF {}:{}:{}", gpu.bus, gpu.slot, gpu.func);
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -500,8 +500,8 @@ pub fn init(gpu: &GpuInfo) {
             }
         }
 
-        serial_println!(":: igpu: REACHABILITY CENSUS (PCI Config Space) ::");
-        serial_println!(":: igpu: RAW: VID:DID=0x{:08X}, CMD=0x{:04X}, D-State={} ::", vid_did, cmd, d_state);
+        crate::census_println!(":: igpu: REACHABILITY CENSUS (PCI Config Space) ::");
+        crate::census_println!(":: igpu: RAW: VID:DID=0x{:08X}, CMD=0x{:04X}, D-State={} ::", vid_did, cmd, d_state);
 
         if vid_did == 0xFFFFFFFF {
             serial_println!(":: igpu: VERDICT: Device not present (Vendor/Device ID read 0xFFFFFFFF)");
@@ -538,13 +538,13 @@ pub fn init(gpu: &GpuInfo) {
     }
 
     // MILESTONE 1: Read-only instrumentation
-    serial_println!("[Intel iGPU] Milestone 1: Read-only probe (instrumentation phase)");
+    crate::census_println!("[Intel iGPU] Milestone 1: Read-only probe (instrumentation phase)");
 
     unsafe {
         if TRACES_VALID {
             let gmux3 = read_gmux_trace();
-            serial_println!(":: igpu: TEARDOWN HUNT TRACE ::");
-            serial_println!(":: igpu: Reg          | Point 0 (Boot)    | Point 1 (Pre-EBS) | Point 2 (Post-EBS)| Point 3 (Kernel) ::");
+            crate::census_println!(":: igpu: TEARDOWN HUNT TRACE ::");
+            crate::census_println!(":: igpu: Reg          | Point 0 (Boot)    | Point 1 (Pre-EBS) | Point 2 (Post-EBS)| Point 3 (Kernel) ::");
             let trace3 = [
                 mmio_read(bar0, regs::PIPEACONF),
                 mmio_read(bar0, regs::PIPEBCONF),
@@ -560,10 +560,10 @@ pub fn init(gpu: &GpuInfo) {
             ];
             let names = ["PIPEACONF", "PIPEBCONF", "PIPECCONF", "DSPACNTR", "DSPBCNTR", "DSPCCNTR", "DSPASURF", "DP_A", "PP_STATUS", "PP_CTRL", "DPLL_A"];
             for i in 0..11 {
-                serial_println!(":: igpu: {:<12} | 0x{:08X}        | 0x{:08X}        | 0x{:08X}        | 0x{:08X} ::",
+                crate::census_println!(":: igpu: {:<12} | 0x{:08X}        | 0x{:08X}        | 0x{:08X}        | 0x{:08X} ::",
                     names[i], TRACE_0[i], TRACE_1[i], TRACE_2[i], trace3[i]);
             }
-            serial_println!(":: igpu: GMUX TRACE ::");
+            crate::census_println!(":: igpu: GMUX TRACE ::");
 
             let boot_ver_ok = !(GMUX_0[0] == 0x00 && GMUX_0[1] == 0x00 && GMUX_0[2] == 0x00) &&
                               !(GMUX_0[0] == 0xFF && GMUX_0[1] == 0xFF && GMUX_0[2] == 0xFF) &&
@@ -573,31 +573,31 @@ pub fn init(gpu: &GpuInfo) {
                               !(gmux3[0] == gmux3[1] && gmux3[1] == gmux3[2]);
 
             if !boot_ver_ok || !kern_ver_ok {
-                serial_println!(":: igpu: PROTOCOL UNPROVEN (implausible version tuples)");
-                serial_println!(":: igpu: Boot Version: {}.{}.{} | Kernel Version: {}.{}.{}",
+                crate::census_println!(":: igpu: PROTOCOL UNPROVEN (implausible version tuples)");
+                crate::census_println!(":: igpu: Boot Version: {}.{}.{} | Kernel Version: {}.{}.{}",
                     GMUX_0[0], GMUX_0[1], GMUX_0[2], gmux3[0], gmux3[1], gmux3[2]);
-                serial_println!(":: igpu: Boot MAX_BRT: 0x{:08X} | Kernel MAX_BRT: 0x{:08X}", GMUX_0[6], gmux3[6]);
-                serial_println!(":: igpu: Raw SW_DISP: Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[3], gmux3[3]);
-                serial_println!(":: igpu: Raw SW_DDC : Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[4], gmux3[4]);
-                serial_println!(":: igpu: Raw POWER  : Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[5], gmux3[5]);
+                crate::census_println!(":: igpu: Boot MAX_BRT: 0x{:08X} | Kernel MAX_BRT: 0x{:08X}", GMUX_0[6], gmux3[6]);
+                crate::census_println!(":: igpu: Raw SW_DISP: Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[3], gmux3[3]);
+                crate::census_println!(":: igpu: Raw SW_DDC : Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[4], gmux3[4]);
+                crate::census_println!(":: igpu: Raw POWER  : Boot=0x{:02X}, Kern=0x{:02X}", GMUX_0[5], gmux3[5]);
             } else {
                 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
                 PROTOCOL_PROVEN.store(true, Ordering::SeqCst);
-                serial_println!(":: igpu: PROTOCOL PROVEN (version plausible)");
-                serial_println!(":: igpu: Version (Maj,Min,Rel) | {}.{}.{}             |                   |                   | {}.{}.{} ::",
+                crate::census_println!(":: igpu: PROTOCOL PROVEN (version plausible)");
+                crate::census_println!(":: igpu: Version (Maj,Min,Rel) | {}.{}.{}             |                   |                   | {}.{}.{} ::",
                     GMUX_0[0], GMUX_0[1], GMUX_0[2], gmux3[0], gmux3[1], gmux3[2]);
-                serial_println!(":: igpu: MAX_BRIGHTNESS        | 0x{:08X}        |                   |                   | 0x{:08X} ::",
+                crate::census_println!(":: igpu: MAX_BRIGHTNESS        | 0x{:08X}        |                   |                   | 0x{:08X} ::",
                     GMUX_0[6], gmux3[6]);
 
                 let decode_disp = |val: u32| match val { 2 => "IGD", 3 => "DIS", _ => "???" };
                 let decode_ddc = |val: u32| match val { 1 => "IGD", 2 => "DIS", _ => "???" };
                 let decode_pwr = |val: u32| if val != 0 { "ON " } else { "OFF" };
 
-                serial_println!(":: igpu: SW_DISPLAY            | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::",
+                crate::census_println!(":: igpu: SW_DISPLAY            | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::",
                     GMUX_0[3], decode_disp(GMUX_0[3]), gmux3[3], decode_disp(gmux3[3]));
-                serial_println!(":: igpu: SW_DDC                | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::",
+                crate::census_println!(":: igpu: SW_DDC                | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::",
                     GMUX_0[4], decode_ddc(GMUX_0[4]), gmux3[4], decode_ddc(gmux3[4]));
-                serial_println!(":: igpu: DISC_POWER            | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::",
+                crate::census_println!(":: igpu: DISC_POWER            | 0x{:02X} ({:<3})          |                   |                   | 0x{:02X} ({:<3}) ::",
                     GMUX_0[5], decode_pwr(GMUX_0[5]), gmux3[5], decode_pwr(gmux3[5]));
 
                 // GMUX-IGD: the arm block lives INSIDE the `PROTOCOL PROVEN` arm, not after the
@@ -608,11 +608,11 @@ pub fn init(gpu: &GpuInfo) {
                 // is only a gate if something is actually gated on it.
 
             }
-            serial_println!(":: igpu: TRACE END ::");
+            crate::census_println!(":: igpu: TRACE END ::");
         }
 
         let dp_a = mmio_read(bar0, regs::DP_A);
-        serial_println!("[Intel iGPU] DP_A: 0x{:08X} (Port A / eDP)", dp_a);
+        crate::census_println!("[Intel iGPU] DP_A: 0x{:08X} (Port A / eDP)", dp_a);
 
         // Check Pipes
         dump_pipe(bar0, 'A', regs::PIPEACONF, regs::PIPEASRC);
@@ -632,11 +632,11 @@ pub fn init(gpu: &GpuInfo) {
             let page_number = (surf >> 12) as usize;
             let gtt_offset = regs::GTT_BASE + (page_number * 4);
 
-            serial_println!("[Intel iGPU] GGTT Inspection for surface at 0x{:X}:", surf);
+            crate::census_println!("[Intel iGPU] GGTT Inspection for surface at 0x{:X}:", surf);
             for i in 0..4 {
                 let pte_offset = gtt_offset + (i * 4);
                 let pte = mmio_read(bar0, pte_offset);
-                serial_println!("[Intel iGPU] GGTT PTE[{}] (offset 0x{:X}): 0x{:08X}", page_number + i, pte_offset, pte);
+                crate::census_println!("[Intel iGPU] GGTT PTE[{}] (offset 0x{:X}): 0x{:08X}", page_number + i, pte_offset, pte);
             }
         }
 
@@ -659,36 +659,36 @@ pub fn init(gpu: &GpuInfo) {
 
         bring_up_blt_ring(bar0, active_surf);
 
-        serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers] On Ivy Bridge (Gen7 / Panther Point 7-Series PCH), the Display Engine is split.");
-        serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers, Section 1.1.2] eDP on Port A (DP_A) is CPU-attached (North Display Engine).");
-        serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, South Display Engine Registers] GMBUS and Panel Power Sequencer (PPS) are PCH-attached (South Display Engine).");
-        serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, South Display Engine Registers] Therefore, GMBUS is at PCH base 0xC5100 and PPS is at PCH base 0xC7200.");
-        serial_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers] Because eDP is CPU-attached, the FDI link (CPU-to-PCH) is bypassed for the internal panel.");
+        crate::census_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers] On Ivy Bridge (Gen7 / Panther Point 7-Series PCH), the Display Engine is split.");
+        crate::census_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers, Section 1.1.2] eDP on Port A (DP_A) is CPU-attached (North Display Engine).");
+        crate::census_println!(":: igpu: [CITATION: Intel PRM Vol 3, South Display Engine Registers] GMBUS and Panel Power Sequencer (PPS) are PCH-attached (South Display Engine).");
+        crate::census_println!(":: igpu: [CITATION: Intel PRM Vol 3, South Display Engine Registers] Therefore, GMBUS is at PCH base 0xC5100 and PPS is at PCH base 0xC7200.");
+        crate::census_println!(":: igpu: [CITATION: Intel PRM Vol 3, Display Registers] Because eDP is CPU-attached, the FDI link (CPU-to-PCH) is bypassed for the internal panel.");
 
-        serial_println!(":: igpu: --- ADDITIONAL CENSUS GAPS --- ::");
-        serial_println!(":: igpu: PP_STATUS_CPU:  0x{:08X} | PP_STATUS_PCH:  0x{:08X}", mmio_read(bar0, regs::PP_STATUS), mmio_read(bar0, regs::PCH_PP_STATUS));
-        serial_println!(":: igpu: PP_CONTROL_CPU: 0x{:08X} | PP_CONTROL_PCH: 0x{:08X}", mmio_read(bar0, regs::PP_CONTROL), mmio_read(bar0, regs::PCH_PP_CONTROL));
-        serial_println!(":: igpu: DP_B_CPU: 0x{:08X} | DP_B_PCH: 0x{:08X}", mmio_read(bar0, regs::DP_B), mmio_read(bar0, regs::PCH_DP_B));
-        serial_println!(":: igpu: DP_C_CPU: 0x{:08X} | DP_C_PCH: 0x{:08X}", mmio_read(bar0, regs::DP_C), mmio_read(bar0, regs::PCH_DP_C));
-        serial_println!(":: igpu: DP_D_CPU: 0x{:08X} | DP_D_PCH: 0x{:08X}", mmio_read(bar0, regs::DP_D), mmio_read(bar0, regs::PCH_DP_D));
-        serial_println!(":: igpu: FDI_RXA_CTL: 0x{:08X}", mmio_read(bar0, regs::FDI_RXA_CTL));
-        serial_println!(":: igpu: FDI_TXA_CTL: 0x{:08X}", mmio_read(bar0, regs::FDI_TXA_CTL));
-        serial_println!(":: igpu: FPA0: 0x{:08X}", mmio_read(bar0, regs::FPA0));
-        serial_println!(":: igpu: FPA1: 0x{:08X}", mmio_read(bar0, regs::FPA1));
+        crate::census_println!(":: igpu: --- ADDITIONAL CENSUS GAPS --- ::");
+        crate::census_println!(":: igpu: PP_STATUS_CPU:  0x{:08X} | PP_STATUS_PCH:  0x{:08X}", mmio_read(bar0, regs::PP_STATUS), mmio_read(bar0, regs::PCH_PP_STATUS));
+        crate::census_println!(":: igpu: PP_CONTROL_CPU: 0x{:08X} | PP_CONTROL_PCH: 0x{:08X}", mmio_read(bar0, regs::PP_CONTROL), mmio_read(bar0, regs::PCH_PP_CONTROL));
+        crate::census_println!(":: igpu: DP_B_CPU: 0x{:08X} | DP_B_PCH: 0x{:08X}", mmio_read(bar0, regs::DP_B), mmio_read(bar0, regs::PCH_DP_B));
+        crate::census_println!(":: igpu: DP_C_CPU: 0x{:08X} | DP_C_PCH: 0x{:08X}", mmio_read(bar0, regs::DP_C), mmio_read(bar0, regs::PCH_DP_C));
+        crate::census_println!(":: igpu: DP_D_CPU: 0x{:08X} | DP_D_PCH: 0x{:08X}", mmio_read(bar0, regs::DP_D), mmio_read(bar0, regs::PCH_DP_D));
+        crate::census_println!(":: igpu: FDI_RXA_CTL: 0x{:08X}", mmio_read(bar0, regs::FDI_RXA_CTL));
+        crate::census_println!(":: igpu: FDI_TXA_CTL: 0x{:08X}", mmio_read(bar0, regs::FDI_TXA_CTL));
+        crate::census_println!(":: igpu: FPA0: 0x{:08X}", mmio_read(bar0, regs::FPA0));
+        crate::census_println!(":: igpu: FPA1: 0x{:08X}", mmio_read(bar0, regs::FPA1));
 
-        serial_println!(":: igpu: PCH_PP_ON_DELAYS: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_ON_DELAYS));
-        serial_println!(":: igpu: PCH_PP_OFF_DELAYS: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_OFF_DELAYS));
-        serial_println!(":: igpu: PCH_PP_DIVISOR: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_DIVISOR));
+        crate::census_println!(":: igpu: PCH_PP_ON_DELAYS: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_ON_DELAYS));
+        crate::census_println!(":: igpu: PCH_PP_OFF_DELAYS: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_OFF_DELAYS));
+        crate::census_println!(":: igpu: PCH_PP_DIVISOR: 0x{:08X}", mmio_read(bar0, regs::PCH_PP_DIVISOR));
 
-        serial_println!(":: igpu: PCH_GMBUS0: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS0));
-        serial_println!(":: igpu: PCH_GMBUS1: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS1));
-        serial_println!(":: igpu: PCH_GMBUS2: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS2));
-        serial_println!(":: igpu: PCH_GMBUS3: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS3));
-        serial_println!(":: igpu: PCH_GMBUS4: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS4));
-        serial_println!(":: igpu: --- END CENSUS --- ::");
+        crate::census_println!(":: igpu: PCH_GMBUS0: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS0));
+        crate::census_println!(":: igpu: PCH_GMBUS1: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS1));
+        crate::census_println!(":: igpu: PCH_GMBUS2: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS2));
+        crate::census_println!(":: igpu: PCH_GMBUS3: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS3));
+        crate::census_println!(":: igpu: PCH_GMBUS4: 0x{:08X}", mmio_read(bar0, regs::PCH_GMBUS4));
+        crate::census_println!(":: igpu: --- END CENSUS --- ::");
     }
 
-    serial_println!(":: igpu: probe-complete ::");
+    crate::census_println!(":: igpu: probe-complete ::");
 }
 
 unsafe fn dump_pipe(bar0: usize, name: char, conf_reg: usize, src_reg: usize) {
@@ -696,7 +696,7 @@ unsafe fn dump_pipe(bar0: usize, name: char, conf_reg: usize, src_reg: usize) {
     let src = mmio_read(bar0, src_reg);
     let enabled = (conf & (1 << 31)) != 0;
 
-    serial_println!("[Intel iGPU] Pipe {}: CONF=0x{:08X} (Enabled: {}), SRC=0x{:08X}", name, conf, enabled, src);
+    crate::census_println!("[Intel iGPU] Pipe {}: CONF=0x{:08X} (Enabled: {}), SRC=0x{:08X}", name, conf, enabled, src);
 }
 
 unsafe fn dump_plane(bar0: usize, name: char, cntr_reg: usize, surf_reg: usize, stride_reg: usize, linoff_reg: usize, tileoff_reg: usize) -> Option<u32> {
@@ -709,12 +709,12 @@ unsafe fn dump_plane(bar0: usize, name: char, cntr_reg: usize, surf_reg: usize, 
     let linoff = mmio_read(bar0, linoff_reg);
     let tileoff = mmio_read(bar0, tileoff_reg);
 
-    serial_println!("[Intel iGPU] Plane {}: CNTR=0x{:08X} (Enabled: {}, Format: 0x{:X}, Tiled: {})", name, cntr, enabled, format, tiled);
-    serial_println!("[Intel iGPU] Plane {}: SURF=0x{:08X}, STRIDE=0x{:08X}, LINOFF=0x{:08X}, TILEOFF=0x{:08X}",
+    crate::census_println!("[Intel iGPU] Plane {}: CNTR=0x{:08X} (Enabled: {}, Format: 0x{:X}, Tiled: {})", name, cntr, enabled, format, tiled);
+    crate::census_println!("[Intel iGPU] Plane {}: SURF=0x{:08X}, STRIDE=0x{:08X}, LINOFF=0x{:08X}, TILEOFF=0x{:08X}",
         name, surf, stride, linoff, tileoff);
 
     if enabled {
-        serial_println!(":: igpu: FOX CROSS-CHECK - If Plane {} is enabled here but panel goes black, handoff/bootchain is the cause, not hardware! ::", name);
+        crate::census_println!(":: igpu: FOX CROSS-CHECK - If Plane {} is enabled here but panel goes black, handoff/bootchain is the cause, not hardware! ::", name);
         Some(surf)
     } else {
         None
@@ -881,7 +881,7 @@ unsafe fn bring_up_blt_ring(bar0: usize, active_surf: Option<u32>) {
         // structurally confined to boots where the iGPU owns a scanout (gmux switched, or
         // iGPU-only machines). This line makes that fact one awk away instead of an absence.
         let Some(surf) = active_surf else {
-            serial_println!(":: igpu-blt: ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes the panel elsewhere); CPU path carries the console ::");
+            crate::bootlog_println!(":: igpu-blt: ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes the panel elsewhere); CPU path carries the console ::");
             break 'ring;
         };
         {
@@ -892,7 +892,7 @@ unsafe fn bring_up_blt_ring(bar0: usize, active_surf: Option<u32>) {
             // the first cut programmed the virtual address into the PTE and worked only by
             // identity-map luck.
             let Some(phys_addr64) = crate::arch::memory::translate(ring_ptr as u64) else {
-                serial_println!(":: igpu-blt: ring=absent why=ring-virt-unmapped va=0x{:X} — CPU path carries the console ::", ring_ptr as usize);
+                crate::bootlog_println!(":: igpu-blt: ring=absent why=ring-virt-unmapped va=0x{:X} — CPU path carries the console ::", ring_ptr as usize);
                 break 'ring;
             };
             let phys_addr = phys_addr64 as usize;

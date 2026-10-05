@@ -99,7 +99,7 @@ pub fn run(name: Option<&str>) -> usize {
         return 0;
     }
     let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
-    *FAILED.lock() = [None; 16]; skip_reset();
+    *FAILED.lock() = [None; 16]; skip_reset(); RESULTS.lock().clear(); // QUIETBOOT3 (B352): same-line fold.
     let mut ran = 0usize;
     let mut i = 0usize;
     loop {
@@ -110,7 +110,7 @@ pub fn run(name: Option<&str>) -> usize {
         if let Some(want) = name { if want != n { continue; } }
         serial_println!(":: TESTS: run {} ::", n);
         *CUR.lock() = n;
-        let vb = verdicts(); f(); skip_note(n, vb);
+        crate::serial_line::tail_arm(); let vb = verdicts(); f(); skip_note(n, vb); verdict_note(n); // QUIETBOOT3 (B352): the fixture's own wire tail, for the glass.
         *CUR.lock() = "";
         ran += 1;
     }
@@ -150,7 +150,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     } else {
         let mut names = alloc::string::String::new();
         for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
-        console.println_styled(if f == 0 { crate::video::theme::TERM_GREEN } else { crate::video::theme::TERM_RED }, &format!("tests: ran={} pass={} fail={} failed=[{}] skipped=[{}]", ran, p, f, names, skipped_names()));
+        console_verdicts(console); if name.is_none() { console.println_styled(if f == 0 { crate::video::theme::TERM_GREEN } else { crate::video::theme::TERM_RED }, &format!("tests: ran={} pass={} fail={} failed=[{}] skipped=[{}]", ran, p, f, names, skipped_names())); } // QUIETBOOT3 (B352): one `<name> -> <wire tail>` line per fixture; the tally line only after the whole suite.
     }
 }
 
@@ -277,11 +277,11 @@ pub const QUIETBOOT_BOUND: u64 = 250; // QUIETBOOT2 (B325): the seat's bound (FL
 /// (`tests-at-boot` / `census` — the QEMU lanes), which is not the quiet boot being measured.
 pub fn quietboot_selftest() {
     let Some(n) = crate::bootpace::boot_lines() else {
-        serial_println!(":: QUIETBOOT: lines=- bound={} -> SKIP (no `:: BOOT:` line yet: no first-boot stage resolved) ::", QUIETBOOT_BOUND);
+        serial_println!(":: QUIETBOOT: lines=- bound={} -> SKIP reason=no-boot-line ::", QUIETBOOT_BOUND); // QUIETBOOT3 (B352): `SKIP reason=`, never a sentence.
         return;
     };
     if cfg!(feature = "tests-at-boot") || cfg!(feature = "census") {
-        serial_println!(":: QUIETBOOT: lines={} bound={} census={} -> SKIP (tests-at-boot/census build: not the quiet boot) ::", n, QUIETBOOT_BOUND, crate::census::bits());
+        serial_println!(":: QUIETBOOT: lines={} bound={} census={} -> SKIP reason=tests-at-boot-or-census-build ::", n, QUIETBOOT_BOUND, crate::census::bits()); // QUIETBOOT3 (B352): `SKIP reason=`.
         return;
     }
     let ok = n <= QUIETBOOT_BOUND;
@@ -413,5 +413,32 @@ fn ensure_ring3abi() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("ring3abi", crate::ring3abi::selftest); }
+    }
+}
+
+// QUIETBOOT3 (rmbp-ledger B352) — TAIL-APPENDED. THE GLASS SAYS WHAT THE WIRE SAYS. Boot 21: Peter read "nethang
+// failed" and "storm failed" off the glass where the wire said `NETHANG … -> PASS`; the console printed a tally
+// sentence (`tests: ran=1 pass=8 …`), not the verdict. Now each fixture's console line is `<name> -> <tail>`, the
+// tail being the wire's own text after the LAST `-> ` of the last verdict line the fixture printed
+// (`serial_line::verdict_tail`): `PASS`, `FAIL …`, `SKIP reason=…`. A fixture that printed no verdict gets a wire
+// line of its own, `:: TESTS: <name> -> SKIP reason=no-verdict ::`, and the glass prints that same tail.
+static RESULTS: spin::Mutex<alloc::vec::Vec<(&'static str, alloc::string::String)>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+fn verdict_note(n: &'static str) {
+    let tail = match crate::serial_line::tail_take() {
+        Some(t) => t,
+        None => {
+            serial_println!(":: TESTS: {} -> SKIP reason=no-verdict ::", n);
+            alloc::string::String::from("SKIP reason=no-verdict")
+        }
+    };
+    RESULTS.lock().push((n, tail));
+}
+
+fn console_verdicts(console: &mut Console) {
+    let rows = core::mem::take(&mut *RESULTS.lock());
+    for (n, tail) in rows.iter() {
+        let c = if tail.starts_with("PASS") { crate::video::theme::TERM_GREEN } else if tail.starts_with("FAIL") { crate::video::theme::TERM_RED } else { crate::video::theme::TERM_DIM };
+        console.println_styled(c, &format!("{} -> {}", n, tail));
     }
 }

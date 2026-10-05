@@ -7710,7 +7710,7 @@ fn wcdvalve_closed() -> bool {
             0
         };
         if WCDVALVE_READ_EPOCH.swap(epoch, Relaxed) != epoch {
-            serial_println!(
+            crate::census_println!(
                 "[wc-d] valve READ util~{}% wcd~{} span={}ms close_at=util{}%/wcd{}% state={} dwell_ms={}/{}",
                 util,
                 // WCDVALVE-LOOP — `?`, not `0%`, while CLOSED. See [`WcdRead`].
@@ -10374,7 +10374,7 @@ fn wcser_emit(scope: &str, span: u64) {
     } else {
         crate::arch::ms().saturating_sub(COMP_HOLD_T0_MS.load(Relaxed))
     };
-    serial_println!(
+    crate::census_println!(
         "[wcser] scope={} entered={} declined={} reruns={} declined_pct={} holder={} held_ms={} exbusy={} steals={} revenants={} span={}ms -> {}",
         scope,
         entered,
@@ -14137,7 +14137,7 @@ fn noatt_emit(scope: &str, span: u64) {
     } else {
         "UNATTRIBUTED"
     };
-    serial_println!(
+    crate::census_println!(
         "[noatt] scope={} passes={} seeds={} noatt={} noatt_kpx={} rate={}.{}/s taker={} span={}ms -> {}",
         scope, passes, seeds, rows, kpx, rate / 10, rate % 10, taker, span, verdict
     );
@@ -14432,7 +14432,7 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // and excludes a live window that was idle through it. `shown=3/10` therefore reads "ten slots
     // had traffic, three of them are itemised above" — and `shown=n/n` means the itemisation is
     // complete, whatever `wins=` says beside it.
-    serial_println!(
+    crate::census_println!(
         "[wcn] rollup scope={} wins={} shown={}/{} att={} comp={} hid={} bel={} stale={} passes={} aborted={} att_rate={}.{}/s comp_rate={}.{}/s span={}ms -> {}",
         scope,
         wins,
@@ -19281,7 +19281,7 @@ fn physwit_emit(tag: &str, cpu: i32, base: usize, len: usize) {
     let r = physwit_walk(base, len);
     let cost = crate::arch::now_cycles().saturating_sub(t0);
     match r {
-        Some(r) => serial_println!(
+        Some(r) => crate::census_println!(
             ":: STAGE-PHYS: buf={} cpu={} bytes={} pages={} runs={} unmapped={} run_min={} \
              run_med={} run_max={} largest_off={} cost_cyc={} ::",
             tag,
@@ -19296,7 +19296,7 @@ fn physwit_emit(tag: &str, cpu: i32, base: usize, len: usize) {
             r.largest_off,
             cost
         ),
-        None => serial_println!(
+        None => crate::census_println!(
             ":: STAGE-PHYS: buf={} cpu={} bytes={} pages=0 runs=0 unmapped=0 run_min=0 run_med=0 \
              run_max=0 largest_off=0 cost_cyc={} ::",
             tag,

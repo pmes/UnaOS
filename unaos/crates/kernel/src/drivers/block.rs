@@ -2335,14 +2335,14 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
     };
 
     // --- RAW, before decoding anything: the signature word and the four 16-byte entries verbatim.
-    serial_println!(
+    crate::census_println!(
         ":: PART: mbr-raw handle={} dev_blocks={} sig={:02x}{:02x} ::",
         name, dev_blocks, sec[MBR_SIG_OFF], sec[MBR_SIG_OFF + 1]
     );
     for i in 0..4 {
         let o = MBR_TABLE_OFF + i * MBR_ENTRY_LEN;
         let e = &sec[o..o + MBR_ENTRY_LEN];
-        serial_println!(
+        crate::census_println!(
             ":: PART: mbr-raw handle={} e{} = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
             name, i + 1,
             e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
@@ -2352,22 +2352,22 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
 
     // --- Decoded verdict, per slot, then the summary.
     let Some(t) = table else {
-        serial_println!(":: PART: mbr census handle={} sig=absent — not an MBR ::", name);
+        crate::census_println!(":: PART: mbr census handle={} sig=absent — not an MBR ::", name);
         return table;
     };
     for slot in 1..=4u8 {
         match (t.entry(slot), t.reject(slot)) {
-            (Some(p), _) => serial_println!(
+            (Some(p), _) => crate::census_println!(
                 ":: PART: mbr handle={} slot={} type=0x{:02x} boot=0x{:02x} start={} count={} end={} ACCEPT ::",
                 name, slot, p.type_byte, p.boot_flag, p.start_lba, p.sector_count, p.end_lba()
             ),
-            (None, Some(r)) => serial_println!(
+            (None, Some(r)) => crate::census_println!(
                 ":: PART: mbr handle={} slot={} REJECT {:?} ::", name, slot, r
             ),
             (None, None) => {}
         }
     }
-    serial_println!(
+    crate::census_println!(
         ":: PART: mbr census handle={} protective={} accepted={} rejected={} ::",
         name, t.protective as u8, t.accepted(), t.rejected()
     );

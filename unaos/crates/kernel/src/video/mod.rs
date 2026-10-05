@@ -469,7 +469,7 @@ pub const PANEL_BG: u32 = 0x001E_1E1E;
 pub fn init_panel(base: usize, len: usize, info: FrameBufferInfo) {
     crate::bootlog_println!(":: FB Init ::");
     crate::bootlog_println!(":: FB Size: {}x{} (stride {}) ::", info.width, info.height, info.stride);
-    serial_println!(":: FB Format: {:?} ::", info.pixel_format);
+    crate::bootlog_println!(":: FB Format: {:?} ::", info.pixel_format);
 
     let mut surface = FrameBuffer::new();
     surface.init(base, len, info);
