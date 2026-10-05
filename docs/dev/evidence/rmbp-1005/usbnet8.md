@@ -45,7 +45,7 @@ for every ring. smoltcp stays with the NetStack seam open (R85).
 - **M2** `ring.rs::write_trb`: the parameter and status dwords first, `fence(SeqCst)`, then the control dword (the one
   carrying the cycle bit) alone, then the line clean (Linux `queue_trb` order). The arm prints
   `[usbnet] rx arm trb=<idx> cycle=<c> buf=<pa> len=<n> cross64k=<0|1>` at arms 1, 2 and every power of two.
-- **M3** the ladder says what it found: a rung answered by a completion within 50 ms is a NEEDED rung (a missed
+- **M3** the ladder says what it found (and a TD armed before link-up starts its stall clock at link-up, so the bring-up TD is not kicked at the instant frames begin): a rung answered by a completion within 50 ms is a NEEDED rung (a missed
   doorbell's signature: the data was there); later than that it was silence. `rx resumed … after_ms=<n> needed=<0|1>`;
   the `tests usbnet` verdict becomes `:: USBNET7: rx_ok=<n> first_frame_ms=<n> kicks=<needed kicks>
   resets=<needed resets> idle_rungs=<n> -> PASS|FAIL ::` and PASS also needs `kicks=0 resets=0`.

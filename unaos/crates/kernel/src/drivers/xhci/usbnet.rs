@@ -827,7 +827,7 @@ pub fn link_seen(now_ms: u64, physr: Option<u16>, plsr: u8) -> Option<u16> {
         let mbps = match p & PHYSR_SMASK { PHYSR_GIGA => { m |= MEDIUM_GIGA; 1000 } PHYSR_100 => { m |= MEDIUM_PS; if plsr & 0x06 != 0 { m |= MEDIUM_125; } 100 } _ => 10 };
         if p & PHYSR_FULL != 0 { m |= MEDIUM_FULL; }
         SPEED_MBPS.store(mbps, Ordering::Relaxed);
-        LINK.store(true, Ordering::Relaxed);
+        LINK.store(true, Ordering::Relaxed); if ARMED.load(Ordering::Relaxed) { NF_ARM_AT.store(now_ms.max(1), Ordering::Relaxed); } // USBNET8: a TD armed before the PHY had link has waited on nothing; its stall clock starts at link-up (flight 23's first kick was the bring-up TD at link-up)
         serial_println!("[usbnet] link up speed={}M duplex={} physr={:#06x} usb_plsr={:#04x} medium={:#06x}", mbps, if p & PHYSR_FULL != 0 { "full" } else { "half" }, p, plsr, m);
         medium = Some(m);
     } else if !up && was {
@@ -1039,10 +1039,15 @@ pub fn note_arm(queued: u32, ep: u8) {
 /// `:: USBNET7: rx_ok=<n> first_frame_ms=<n> ethertype=<0x....> -> PASS|FAIL ::`; on FAIL the bulk-IN ring once.
 fn usbnet7_verdict(t0: u64, first_at: u64, first: Option<u16>) {
     let ms = if first_at != 0 { Some(first_at.saturating_sub(t0)) } else { None };
-    let pass = matches!(ms, Some(m) if m <= 3000);
-    let et = match first { Some(e) => alloc::format!("{:#06x}", e), None => alloc::string::String::from("none") };
-    let fms = match ms { Some(m) => alloc::format!("{}", m), None => alloc::string::String::from("none") };
-    serial_println!(":: USBNET7: rx_ok={} first_frame_ms={} ethertype={} -> {} ::", RX_OK.load(Ordering::Relaxed), fms, et, if pass { "PASS" } else { "FAIL" });
+    // USBNET8: `first_frame_ms` is the LINK's (first arm -> first frame of the boot): a quiet LAN during the fixture's
+    // window is not an RX fault (flight 23: rx_ok=59 on the ring, the window saw none). The window's own is `window_ms`.
+    let boot_ms = u8_first_frame_ms();
+    let (kn, rn, idle) = u8_needed();
+    let pass = (matches!(ms, Some(m) if m <= 3000) || boot_ms.is_some()) && kn == 0 && rn == 0;
+    let et = match first { Some(e) => alloc::format!("{:#06x}", e), None => alloc::format!("{:#06x}", FIRST_ETYPE.load(Ordering::Relaxed)) };
+    let wms = match ms { Some(m) => alloc::format!("{}", m), None => alloc::string::String::from("none") };
+    let fms = match boot_ms { Some(m) => alloc::format!("{}", m), None => alloc::string::String::from("none") };
+    serial_println!(":: USBNET7: rx_ok={} first_frame_ms={} kicks={} resets={} idle_rungs={} ethertype={} window_ms={} -> {} ::", RX_OK.load(Ordering::Relaxed), fms, kn, rn, idle, et, wms, if pass { "PASS" } else { "FAIL" });
     if pass { return; }
     let st = match crate::drivers::xhci::claim() { Ok(x) => x.usbnet_ring_state(), Err(_) => None };
     let pending = (ARMED.load(Ordering::Relaxed) && !DONE.load(Ordering::Relaxed)) as u8;
@@ -1243,7 +1248,8 @@ fn netframe_note_xfer(n: usize) {
     NF_RX_LAST.store(now, Ordering::Relaxed);
     if NF_STALLED.swap(false, Ordering::Relaxed) {
         NF_RESUMED.store(true, Ordering::Relaxed);
-        serial_println!("[usbnet] rx resumed len={} kicks={} resets={}", n, NF_KICKS.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed));
+        let (after, needed) = u8_answered(now); // USBNET8: a completion within U8_NEEDED_MS of the rung = the rung was needed
+        serial_println!("[usbnet] rx resumed len={} kicks={} resets={} after_ms={} needed={}", n, NF_KICKS.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed), after, needed as u8);
     }
     let i = NF_N.fetch_add(1, Ordering::Relaxed) as usize;
     if i < NF_LOG {
@@ -1265,7 +1271,7 @@ pub fn rx_stall_action() -> u8 {
         if now.saturating_sub(arm_at) < NF_KICK_MS { return 0; }
         NF_KICK_AT.store(now.max(arm_at + 1), Ordering::Relaxed);
         NF_STALLED.store(true, Ordering::Relaxed);
-        let k = NF_KICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        let k = NF_KICKS.fetch_add(1, Ordering::Relaxed) + 1; u8_rung(1, now); // USBNET8: when, and which rung
         if k <= 2 || k.is_power_of_two() {
             serial_println!("[usbnet] rx kick n={} pending_ms={} xfers={} rx_ok={} resets={}", k, now.saturating_sub(arm_at), RX_XFERS.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed));
         }
@@ -1277,7 +1283,7 @@ pub fn rx_stall_action() -> u8 {
 /// Rung two's outcome, from the controller (`usbnet_rx_reset`): the stranded TD is abandoned and the next data pass
 /// posts a fresh one. `[usbnet] rx reset n= stop_cc= deq_cc= in_state=` on the first two and every power of two.
 pub fn note_rx_reset(stop_cc: u8, deq_cc: u8, in_state: u8) {
-    let r = NF_RESETS.fetch_add(1, Ordering::Relaxed) + 1;
+    let r = NF_RESETS.fetch_add(1, Ordering::Relaxed) + 1; u8_rung(2, crate::arch::ms()); // USBNET8: when, and which rung
     if r <= 2 || r.is_power_of_two() {
         serial_println!("[usbnet] rx reset n={} stop_cc={} deq_cc={} in_state={} kicks={} xfers={} rx_ok={}", r, stop_cc, deq_cc, in_state, NF_KICKS.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed));
     }
@@ -1351,8 +1357,8 @@ pub fn usbnet7_selftest() {
     let fms = match first_ms { Some(m) => alloc::format!("{}", m), None => alloc::string::String::from("none") };
     let pass = frames > 0 && v4 > 0 && offer;
     serial_println!(
-        ":: USBNET7: rx_ok={} frames={} first_frame_ms={} ethertype={} dhcp={} -> {} ::",
-        RX_OK.load(Ordering::Relaxed), frames, fms, et, if offer { "offer" } else { "none" }, if pass { "PASS" } else { "FAIL" }
+        ":: USBNET7: rx_ok={} frames={} first_frame_ms={} ethertype={} dhcp={} kicks={} resets={} idle_rungs={} -> {} ::",
+        RX_OK.load(Ordering::Relaxed), frames, fms, et, if offer { "offer" } else { "none" }, u8_needed().0, u8_needed().1, u8_needed().2, if pass { "PASS" } else { "FAIL" }
     );
     if !pass { netframe_rxlog(); }
 }
@@ -1371,9 +1377,44 @@ static U8_ARMS: AtomicU64 = AtomicU64::new(0);
 /// two. `cross64k` is xHCI 1.2 §4.11.7.1's test on the ONE Normal TRB the arm posts (the buffer is 64 KiB aligned: 0).
 pub fn note_arm_trb(trb_phys: u64, ring_base: u64, cycle: bool, buf: u64, len: usize) {
     let n = U8_ARMS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 { U8_FIRST_ARM_AT.store(crate::arch::ms().max(1), Ordering::Relaxed); }
     if n <= 2 || n.is_power_of_two() {
         let cross = len != 0 && (buf >> 16) != ((buf + len as u64 - 1) >> 16);
         serial_println!("[usbnet] rx arm trb={} cycle={} buf={:#x} len={} cross64k={} n={}",
             trb_phys.wrapping_sub(ring_base) / 16, cycle as u8, buf, len, cross as u8, n);
     }
+}
+/// A completion within this long of a ladder rung means the data was already waiting: the rung was NEEDED.
+const U8_NEEDED_MS: u64 = 50;
+static U8_FIRST_ARM_AT: AtomicU64 = AtomicU64::new(0);
+static U8_RUNG_AT: AtomicU64 = AtomicU64::new(0);
+static U8_RUNG_KIND: AtomicU8 = AtomicU8::new(0);
+static U8_NEEDED_KICKS: AtomicU64 = AtomicU64::new(0);
+static U8_NEEDED_RESETS: AtomicU64 = AtomicU64::new(0);
+/// A ladder rung fired (1 = doorbell kick, 2 = Stop Endpoint + Set TR Dequeue).
+fn u8_rung(kind: u8, now: u64) {
+    U8_RUNG_AT.store(now.max(1), Ordering::Relaxed);
+    U8_RUNG_KIND.store(kind, Ordering::Relaxed);
+}
+/// The first completion after a stall: ms since the last rung, and whether that rung was needed (counted per kind).
+fn u8_answered(now: u64) -> (u64, bool) {
+    let at = U8_RUNG_AT.load(Ordering::Relaxed);
+    if at == 0 { return (0, false); }
+    let after = now.saturating_sub(at);
+    let needed = after <= U8_NEEDED_MS;
+    if needed {
+        if U8_RUNG_KIND.load(Ordering::Relaxed) == 2 { U8_NEEDED_RESETS.fetch_add(1, Ordering::Relaxed); } else { U8_NEEDED_KICKS.fetch_add(1, Ordering::Relaxed); }
+    }
+    (after, needed)
+}
+/// (needed kicks, needed resets, rungs that fired on a quiet wire).
+fn u8_needed() -> (u64, u64, u64) {
+    let (k, r) = (U8_NEEDED_KICKS.load(Ordering::Relaxed), U8_NEEDED_RESETS.load(Ordering::Relaxed));
+    let all = NF_KICKS.load(Ordering::Relaxed) + NF_RESETS.load(Ordering::Relaxed);
+    (k, r, all.saturating_sub(k + r))
+}
+/// The link's first frame, in ms after the first bulk-IN arm (None before one).
+fn u8_first_frame_ms() -> Option<u64> {
+    let (a, f) = (U8_FIRST_ARM_AT.load(Ordering::Relaxed), FIRST_FRAME_AT.load(Ordering::Relaxed));
+    if a == 0 || f == 0 { None } else { Some(f.saturating_sub(a)) }
 }
