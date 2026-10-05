@@ -320,7 +320,6 @@ fn ensure_usbnet() {
     }
 }
 
-<<<<<<< HEAD
 /// WIFI1 (B338): register `tests wifi` — the BCM4331 bring-up verdict (`ucode=<ok|refused>
 /// d11=<up|down> scan=<n>`) exactly once on a `wifi` build; no radio / no firmware prints SKIP.
 fn ensure_wifi() {
@@ -452,9 +451,7 @@ fn console_verdicts(console: &mut Console) {
         console.println_styled(c, &format!("{} -> {}", n, tail));
     }
 }
-=======
 /// AUDIOCODEC (SR30): the word after the fixture name in `tests <name> <arg>` (e.g. `tests play flac`), for fixtures
 /// that take one; `None` from a bare `tests <name>`, from `tests` (all) and at boot.
 static ARG: spin::Mutex<Option<alloc::string::String>> = spin::Mutex::new(None);
 pub fn arg() -> Option<alloc::string::String> { ARG.lock().clone() }
->>>>>>> exec-media-audio
