@@ -1,0 +1,25 @@
+[package]
+name = "git_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "GITCORE (SR59): UnaOS's own git implementation — objects, loose + pack storage, index, refs, config, ignore, diff, smart HTTP — no_std + alloc, written from git's format documentation, no third-party crates."
+
+# GITCORE (LEDGER SR59, R83). `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, zero third-party crates.
+# The core is pure: every format is bytes in, bytes out. Feature `std` adds the on-disk `Repository`
+# (discover/open, object store over loose + packs, refs, worktree status/checkout, commit creation);
+# feature `http` adds the smart-HTTP transport over http_core's host transport (SR51).
+#
+# Dependencies: UnaOS crates only — crypto_core (SHA-1, SHA-256), pixel_core (the inflater).
+# The DEFLATE ENCODER is this crate's own (src/deflate.rs, RFC 1951) — the first in the tree.
+# Proof: tests/ shells out to the `git` CLI as the oracle (fsck, verify-pack, diff, http-backend).
+
+[features]
+default = []
+std = []
+http = ["std", "dep:http_core"]
+
+[dependencies]
+crypto_core = { path = "../../sys/crypto_core" }
+pixel_core = { path = "../../media/pixel_core" }
+http_core = { path = "../../net/http_core", features = ["host"], optional = true }

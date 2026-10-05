@@ -2807,6 +2807,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "git_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+ "http_core",
+ "pixel_core",
+]
+
+[[package]]
 name = "gix"
 version = "0.88.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
