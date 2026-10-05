@@ -34,6 +34,8 @@ use crate::layout::default_font_size;
 /// Screen-space clip rect (x0, y0, x1, y1), already scroll-adjusted.
 type Clip = (f32, f32, f32, f32);
 
+mod boxpaint;
+
 fn in_clip(x: u32, y: u32, clip: Clip) -> bool {
     let (x0, y0, x1, y1) = clip;
     (x as f32) >= x0 && (x as f32) < x1 && (y as f32) >= y0 && (y as f32) < y1
@@ -425,10 +427,10 @@ fn draw_text(
 ) {
     let metrics = font.metrics();
     let scale = font_size / metrics.units_per_em as f32;
-    let ascent = metrics.ascent * scale;
-    let natural = (metrics.ascent - metrics.descent + metrics.line_gap) * scale;
-    // 0.0 = "normal": use the font's natural line height.
-    let line_height = if line_height_mult > 0.0 { font_size * line_height_mult } else { natural };
+    // Half-leading baseline and the rounded `normal` line height — the
+    // measurer (layout::measure_text_family) uses the same two numbers.
+    let ascent = crate::fonts::baseline_offset(font, font_size, line_height_mult);
+    let line_height = crate::fonts::line_height(font, font_size, line_height_mult);
 
     let mut pen_x = 0.0f32;
     let mut line = 0u32;
@@ -440,7 +442,7 @@ fn draw_text(
             .filter_map(|g| font.advance(g).ok())
             .map(|a| a.x() * scale)
             .sum();
-        let space = font_size * 0.3;
+        let space = crate::fonts::space_advance(font, font_size);
 
         if pen_x > 0.0 && pen_x + word_width > max_width {
             pen_x = 0.0;
@@ -481,12 +483,12 @@ fn draw_text(
 }
 
 /// Single-line advance width of `text`, measured EXACTLY the way `draw_text`
-/// lays it out (per-glyph advances, one `font_size * 0.3` space between
+/// lays it out (per-glyph advances, one space-glyph advance between
 /// words). Centering a control label with any other measurement drifts.
 fn measure_text_width(text: &str, font: &Font, font_size: f32) -> f32 {
     let metrics = font.metrics();
     let scale = font_size / metrics.units_per_em as f32;
-    let space = font_size * 0.3;
+    let space = crate::fonts::space_advance(font, font_size);
     let mut total = 0.0f32;
     let mut words = 0u32;
     for word in text.split_whitespace() {
@@ -767,7 +769,26 @@ pub fn render_frame(
                     crate::ledger::record_css("mask-image-unresolved");
                 }
 
-                if let Some(bg) = spec.background {
+                // Rounded corners or a patterned border: the shape painter
+                // (render/boxpaint.rs) owns the background and the border.
+                let fancy = spec.radius.is_some_and(|r| r.iter().any(|&v| v != 0.0))
+                    || spec.border_style.is_some_and(|s| s.iter().any(|&v| v != 0));
+                let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                    if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                        return;
+                    }
+                    if a >= 0.999 {
+                        put_px(surface, width, x, y, c);
+                    } else if a > 0.0 {
+                        blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                    }
+                };
+                if fancy && mask.is_none() && spec.background.is_some() {
+                    boxpaint::paint(
+                        box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
+                        [None; 4], spec.background, width, height, &mut blend_at,
+                    );
+                } else if let Some(bg) = spec.background {
                     for y in y_start..end_y {
                         for x in x_start..end_x {
                             if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
@@ -957,7 +978,27 @@ pub fn render_frame(
                     }
                 }
 
-                if let Some(sides) = border {
+                if let (true, Some(sides)) = (fancy, border) {
+                    let styles = spec.border_style.unwrap_or([0; 4]);
+                    let mut bs: [boxpaint::Side; 4] = [None; 4];
+                    for i in 0..4 {
+                        bs[i] = sides[i].filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
+                    }
+                    let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                        if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                            return;
+                        }
+                        if a >= 0.999 {
+                            put_px(surface, width, x, y, c);
+                        } else if a > 0.0 {
+                            blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                        }
+                    };
+                    boxpaint::paint(
+                        box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
+                        bs, None, width, height, &mut blend_at,
+                    );
+                } else if let Some(sides) = border {
                     // Same rule as the background/image spans: x_start..end_x
                     // is the CLAMPED screen span of the unclamped box origin
                     // (box_sx/box_sy). Re-deriving the end from a clamped

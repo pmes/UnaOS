@@ -63,6 +63,13 @@ pub struct PaintStyle {
     /// flex container's children are flex items: each establishes its own
     /// formatting context, so no margin collapses through them.
     pub flex_container: Option<bool>,
+    /// Per-side border-style [top, right, bottom, left]: 0 solid, 1 dashed,
+    /// 2 dotted, 3 double (groove/ridge/inset/outset paint solid).
+    pub border_style: Option<[u8; 4]>,
+    /// border-radius per corner [top-left, top-right, bottom-right,
+    /// bottom-left]: px when >= 0, a fraction of the box width when < 0
+    /// (-0.5 = 50%).
+    pub radius: Option<[f32; 4]>,
 }
 
 pub struct LayoutTree {
@@ -897,9 +904,8 @@ fn measure_text_family(
     };
     let metrics = font.metrics();
     let scale = font_size / metrics.units_per_em as f32;
-    let natural = (metrics.ascent - metrics.descent + metrics.line_gap) * scale;
-    let line_height = if line_mult > 0.0 { font_size * line_mult } else { natural };
-    let space = font_size * 0.3;
+    let line_height = crate::fonts::line_height(font, font_size, line_mult);
+    let space = crate::fonts::space_advance(font, font_size);
 
     // Advance cache: taffy's flexbox runs several measure passes per node
     // and the per-char glyph lookup was hot. Advances are in FONT UNITS

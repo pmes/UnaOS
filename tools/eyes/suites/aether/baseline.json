@@ -1,94 +1,94 @@
 {
   "cases": {
     "01-blog-article": {
-      "mismatch": 9.53,
+      "mismatch": 8.81,
       "missing": 0,
-      "ssim": 0.7786
+      "ssim": 0.8037
     },
     "02-flex-two-column": {
-      "mismatch": 5.19,
+      "mismatch": 4.8,
       "missing": 0,
-      "ssim": 0.8427
+      "ssim": 0.8434
     },
     "03-card-gallery": {
-      "mismatch": 0.87,
+      "mismatch": 0.64,
       "missing": 1,
-      "ssim": 0.9661
+      "ssim": 0.9719
     },
     "04-sticky-nav": {
-      "mismatch": 5.31,
+      "mismatch": 3.26,
       "missing": 2,
-      "ssim": 0.8238
+      "ssim": 0.9614
     },
     "05-form": {
-      "mismatch": 3.99,
+      "mismatch": 4.15,
       "missing": 0,
-      "ssim": 0.7409
+      "ssim": 0.73
     },
     "06-table-zebra": {
-      "mismatch": 6.19,
+      "mismatch": 6.27,
       "missing": 1,
-      "ssim": 0.7913
+      "ssim": 0.7924
     },
     "07-images-svg": {
-      "mismatch": 11.95,
+      "mismatch": 11.91,
       "missing": 0,
-      "ssim": 0.8317
+      "ssim": 0.8339
     },
     "08-inline-wrap": {
-      "mismatch": 8.84,
+      "mismatch": 8.81,
       "missing": 2,
-      "ssim": 0.7476
+      "ssim": 0.7415
     },
     "09-media-queries": {
-      "mismatch": 1.29,
+      "mismatch": 0.79,
       "missing": 0,
-      "ssim": 0.9772
+      "ssim": 0.9922
     },
     "09-media-queries@375": {
-      "mismatch": 1.22,
+      "mismatch": 0.97,
       "missing": 0,
-      "ssim": 0.9782
+      "ssim": 0.9887
     },
     "10-calc-clamp": {
-      "mismatch": 9.61,
+      "mismatch": 9.4,
       "missing": 1,
-      "ssim": 0.9054
+      "ssim": 0.9076
     },
     "10-calc-clamp@375": {
-      "mismatch": 12.97,
+      "mismatch": 12.89,
       "missing": 1,
-      "ssim": 0.7675
+      "ssim": 0.767
     },
     "11-non-latin": {
-      "mismatch": 3.41,
+      "mismatch": 3.02,
       "missing": 0,
-      "ssim": 0.8601
+      "ssim": 0.8861
     },
     "12-js-mutation": {
-      "mismatch": 1.78,
+      "mismatch": 0.54,
       "missing": 0,
-      "ssim": 0.9483
+      "ssim": 0.9928
     },
     "13-ua-defaults": {
-      "mismatch": 2.03,
+      "mismatch": 1.91,
       "missing": 0,
-      "ssim": 0.9432
+      "ssim": 0.9506
     },
     "14-boxes": {
-      "mismatch": 4.65,
+      "mismatch": 1.94,
       "missing": 0,
-      "ssim": 0.8381
+      "ssim": 0.9304
     },
     "15-landing": {
-      "mismatch": 3.49,
+      "mismatch": 3.39,
       "missing": 1,
-      "ssim": 0.8912
+      "ssim": 0.8988
     },
     "16-positioned": {
-      "mismatch": 13.34,
+      "mismatch": 13.29,
       "missing": 1,
-      "ssim": 0.8623
+      "ssim": 0.864
     }
   },
   "thresholds": {

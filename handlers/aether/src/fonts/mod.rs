@@ -56,6 +56,46 @@ pub fn face(family: u8, bold: bool, italic: bool) -> Option<Arc<Font>> {
     loaded
 }
 
+/// Pixel line metrics of `font` at `size`: (ascent, descent, line gap),
+/// each rounded to whole pixels the way Chromium's SimpleFontData rounds
+/// them — so `line-height: normal` is ascent + descent + gap in integers
+/// (Arial/Liberation Sans 16px: 14 + 3 + 1 = 18, not 18.4).
+pub fn line_metrics(font: &Font, size: f32) -> (f32, f32, f32) {
+    let m = font.metrics();
+    let scale = size / m.units_per_em as f32;
+    ((m.ascent * scale).round(), (-m.descent * scale).round(), (m.line_gap * scale).round())
+}
+
+/// The used line height: `mult` x size, or (0 = `normal`) the rounded
+/// metrics sum.
+pub fn line_height(font: &Font, size: f32, mult: f32) -> f32 {
+    if mult > 0.0 {
+        size * mult
+    } else {
+        let (a, d, g) = line_metrics(font, size);
+        a + d + g
+    }
+}
+
+/// Offset from a line box's top to its baseline: the half-leading model
+/// of CSS 2.2 §10.8.1 — the glyph area (A + D) is centred in the line
+/// box, so (line-height - (A + D)) / 2 sits above the ascent.
+pub fn baseline_offset(font: &Font, size: f32, mult: f32) -> f32 {
+    let (a, d, _) = line_metrics(font, size);
+    let lh = line_height(font, size, mult);
+    ((lh - (a + d)) / 2.0).floor() + a
+}
+
+/// Advance of the U+0020 space in px (word spacing as the font draws it).
+pub fn space_advance(font: &Font, size: f32) -> f32 {
+    let scale = size / font.metrics().units_per_em as f32;
+    font.glyph_for_char(' ')
+        .and_then(|g| font.advance(g).ok())
+        .map(|a| a.x() * scale)
+        .filter(|w| *w > 0.0)
+        .unwrap_or(size * 0.25)
+}
+
 pub struct FontEngine {
     source: SystemSource,
 }

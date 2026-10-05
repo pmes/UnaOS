@@ -574,8 +574,11 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 if let Some(px) = parse_px(part).filter(|_| part.ends_with("px") || part.ends_with("em")) {
                     width = px;
                     got_any = true;
-                } else if matches!(part, "solid" | "dotted" | "dashed" | "double" | "groove" | "ridge" | "inset" | "outset") {
+                } else if let Some(k) = border_style_code(part) {
                     got_any = true;
+                    let mut bs = style.paint.border_style.unwrap_or([0; 4]);
+                    bs[side] = k;
+                    style.paint.border_style = Some(bs);
                 } else if let Some(c) = parse_color_str(part) {
                     color = c;
                     got_any = true;
@@ -679,8 +682,36 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         }
         // border-radius: parsed but not rendered (taffy doesn't support it yet).
         // At minimum, stops the property from appearing in unsupported ledgers.
-        "border-radius" | "border-top-left-radius" | "border-top-right-radius"
-        | "border-bottom-left-radius" | "border-bottom-right-radius" => {} // silently ignore; taffy limitation
+        // css-backgrounds-3 §5.1: 1-4 corner radii (the elliptical `/`
+        // part takes its horizontal radii), or one corner's longhand.
+        "border-radius" => {
+            let horiz = value.split('/').next().unwrap_or(value);
+            let parts: Option<Vec<f32>> = horiz.split_whitespace().map(parse_radius).collect();
+            if let Some(p) = parts {
+                let r = match p.as_slice() {
+                    [a] => [*a; 4],
+                    [a, b] => [*a, *b, *a, *b],
+                    [a, b, c] => [*a, *b, *c, *b],
+                    [a, b, c, d] => [*a, *b, *c, *d],
+                    _ => return,
+                };
+                style.paint.radius = Some(r);
+            }
+        }
+        "border-top-left-radius" | "border-top-right-radius"
+        | "border-bottom-right-radius" | "border-bottom-left-radius" => {
+            if let Some(v) = value.split_whitespace().next().and_then(parse_radius) {
+                let i = match prop {
+                    "border-top-left-radius" => 0,
+                    "border-top-right-radius" => 1,
+                    "border-bottom-right-radius" => 2,
+                    _ => 3,
+                };
+                let mut r = style.paint.radius.unwrap_or([0.0; 4]);
+                r[i] = v;
+                style.paint.radius = Some(r);
+            }
+        }
         "border" | "outline" => {
             let v = value.trim();
             if v == "none" || v == "0" {
@@ -694,8 +725,9 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 if let Some(px) = parse_px(part).filter(|_| part.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '.')) {
                     width = px;
                     got_any = true;
-                } else if matches!(part, "solid" | "dotted" | "dashed" | "double" | "groove" | "ridge" | "inset" | "outset") {
+                } else if let Some(k) = border_style_code(part) {
                     got_any = true;
+                    style.paint.border_style = Some([k; 4]);
                 } else if let Some(c) = parse_color_str(part) {
                     color = c;
                     got_any = true;
@@ -711,6 +743,20 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             // A styleless border draws nothing, whatever its width says.
             if matches!(value.trim(), "none" | "hidden") {
                 style.paint.border = Some([None; 4]);
+            } else if let Some(r) = parse_sides(value, border_style_code) {
+                style.paint.border_style = Some([r.top, r.right, r.bottom, r.left]);
+            }
+        }
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            let side = side_index(prop.trim_end_matches("-style"));
+            if let Some(k) = border_style_code(value) {
+                let mut bs = style.paint.border_style.unwrap_or([0; 4]);
+                bs[side] = k;
+                style.paint.border_style = Some(bs);
+            } else if matches!(value, "none" | "hidden") {
+                let mut sides = style.paint.border.unwrap_or_default();
+                sides[side] = None;
+                style.paint.border = Some(sides);
             }
         }
         "border-color" => {
@@ -1765,7 +1811,7 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
     copy!(
         background, color, font_size, bold, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
-        mask_repeat, text_align, flex_container,
+        mask_repeat, text_align, flex_container, border_style, radius,
     );
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
 }
@@ -2607,6 +2653,26 @@ impl MathParser<'_> {
             u => parse_viewport_length(&format!("{}{}", n, u)),
         }
     }
+}
+
+/// border-style keyword -> paint code (0 solid, 1 dashed, 2 dotted,
+/// 3 double); the 3D styles paint solid in their colour.
+fn border_style_code(v: &str) -> Option<u8> {
+    match v.trim() {
+        "solid" | "groove" | "ridge" | "inset" | "outset" => Some(0),
+        "dashed" => Some(1),
+        "dotted" => Some(2),
+        "double" => Some(3),
+        _ => None,
+    }
+}
+
+/// One radius: px (>= 0) or a percentage as a negative width fraction.
+fn parse_radius(v: &str) -> Option<f32> {
+    if let Some(p) = v.trim().strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+        return Some(-(p / 100.0).max(0.0));
+    }
+    parse_px(v).map(|x| x.max(0.0))
 }
 
 /// [top, right, bottom, left] index of a `*-top`/`*-right`/... longhand.

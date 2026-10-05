@@ -2392,4 +2392,18 @@ mod tests {
         assert_eq!((a.0, a.2), (10.0, 380.0), "fills 400 - 2x10 margin, border-box");
         assert_eq!((b.0, b.2), (90.0, 220.0), "content 200 + padding 20, centred");
     }
+
+    /// CSS 2.2 §10.8: `line-height: normal` is the rounded ascent + descent
+    /// + gap (Liberation Sans/Arial 16px = 18, not 18.4), and the baseline
+    /// sits half the leading below the line top.
+    #[test]
+    fn test_line_metrics_kat() {
+        let Some(f) = crate::fonts::face(0, false, false) else { return };
+        let (a, d, g) = crate::fonts::line_metrics(&f, 16.0);
+        assert_eq!(crate::fonts::line_height(&f, 16.0, 0.0), a + d + g);
+        assert_eq!(crate::fonts::baseline_offset(&f, 16.0, 0.0), (g / 2.0).floor() + a);
+        assert_eq!(crate::fonts::baseline_offset(&f, 16.0, 2.0), ((32.0 - a - d) / 2.0).floor() + a);
+        let sp = crate::fonts::space_advance(&f, 16.0);
+        assert!(sp > 3.0 && sp < 5.0, "space advance {sp}");
+    }
 }
