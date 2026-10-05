@@ -484,6 +484,34 @@ impl FacetCommand {
         })
     }
 
+    /// The association for a NAVIGATION (Aether): the local path behind a `file://` URL (or a bare
+    /// absolute path) when Facet claims it, else `None` — remote images stay the page's business.
+    /// `%XX` escapes are decoded; a query or fragment is dropped.
+    pub fn local_image_path(url: &str) -> Option<String> {
+        let rest = match url.strip_prefix("file://") {
+            Some(r) => r.strip_prefix("localhost").unwrap_or(r),
+            None if url.starts_with('/') => url,
+            None => return None,
+        };
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        let raw = rest.as_bytes();
+        let mut out = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'%' && i + 2 < raw.len() {
+                if let Some(v) = std::str::from_utf8(&raw[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(raw[i]);
+            i += 1;
+        }
+        let path = String::from_utf8(out).ok()?;
+        (path.starts_with('/') && Self::image_mime_for(&path).is_some()).then_some(path)
+    }
+
     /// The receipt this message carries (`None` for [`FacetCommand::ImageClose`]).
     pub fn receipt_id(&self) -> Option<u64> {
         match self {

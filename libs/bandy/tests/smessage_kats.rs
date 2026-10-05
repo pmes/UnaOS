@@ -902,6 +902,12 @@ fn facet_open_image_association() {
     assert_eq!(FacetCommand::image_mime_for("anim.webp"), Some("image/webp"));
     assert_eq!(FacetCommand::image_mime_for("notes.txt"), None);
     assert_eq!(FacetCommand::image_mime_for("png"), None);
+    assert_eq!(FacetCommand::local_image_path("file:///home/una/My%20Photo.jpeg").as_deref(), Some("/home/una/My Photo.jpeg"));
+    assert_eq!(FacetCommand::local_image_path("file://localhost/a/b.png?x=1#f").as_deref(), Some("/a/b.png"));
+    assert_eq!(FacetCommand::local_image_path("/a/b.webp").as_deref(), Some("/a/b.webp"));
+    assert_eq!(FacetCommand::local_image_path("https://una.os/b.png"), None);
+    assert_eq!(FacetCommand::local_image_path("file:///a/b.html"), None);
+    assert_eq!(FacetCommand::local_image_path("file:///a/b%2.png").as_deref(), Some("/a/b%2.png"));
     assert!(FacetCommand::ImageOpen { receipt_id: 1, principal: Origin::System("t".into()), path: "a".into() }.is_request());
     assert!(!FacetCommand::ImageExported { receipt_id: 1, handle: 1, path: "a".into(), bytes: 0 }.is_request());
 }
