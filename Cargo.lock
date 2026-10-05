@@ -4049,6 +4049,7 @@ dependencies = [
  "demux_core",
  "futures-core",
  "futures-util",
+ "infer_core",
  "log",
  "octocrab",
  "pixel_core",

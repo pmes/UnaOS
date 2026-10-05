@@ -8,7 +8,8 @@
 //! L2 normalise, in f32 — sentence-transformers' recipe. 100 sentences (kat/sentences.txt).
 //! Gate: every sentence cosine ≥ 0.9999 and max |diff| ≤ 1e-4 (f32 weights). The f16 weight paths
 //! are measured and gated more loosely (the weights themselves differ by up to 2^-11 relative).
-//! The model is fetched at test time (vectors.txt), never committed; offline → SKIP.
+//! Second reference: `kat/minilm_candle.f32` (candle 0.11, the encoder EMBED B317 shipped, same
+//! ids), same gate. The model is fetched at test time (vectors.txt), never committed; offline → SKIP.
 
 mod common;
 
@@ -28,6 +29,14 @@ fn sentences() -> Vec<String> {
 
 fn reference() -> Vec<Vec<f32>> {
     let b = common::pinned("minilm_ort.f32", "8db514f130caff2090a34eb6d368fa4219bc0fd46ea6596aa7650dffa82628cf");
+    let f: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    f.chunks_exact(384).map(|c| c.to_vec()).collect()
+}
+
+/// candle 0.11's vectors for the same ids (EMBED B317's shipped encoder), recorded once by
+/// libs/gneiss_pal/tests/infer_core_vs_candle.rs before M4 removed candle.
+fn candle() -> Vec<Vec<f32>> {
+    let b = common::pinned("minilm_candle.f32", "b6a7ff257b5c29ae7d15315156ece1454f5426a27e48b7ce6f9c43ac7871882f");
     let f: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
     f.chunks_exact(384).map(|c| c.to_vec()).collect()
 }
@@ -86,6 +95,10 @@ fn minilm_matches_the_reference_on_100_sentences() {
     for (i, (g, r)) in single.iter().zip(&want).enumerate() {
         assert!(cos(g, r) >= 0.9999 && maxdiff(g, r) <= 1e-4, "sentence {i} {:?}: cos {} maxdiff {}", sents[i], cos(g, r), maxdiff(g, r));
     }
+
+    let (c, d) = compare(&single, &candle());
+    eprintln!("oracle f32 vs candle 0.11 (recorded): worst cosine {c:.9}, worst max|diff| {d:.3e}");
+    assert!(c >= 0.9999 && d <= 1e-4);
 
     // Batch 16: the same bits as batch 1.
     let t = Instant::now();

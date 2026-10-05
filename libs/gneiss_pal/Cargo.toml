@@ -43,4 +43,6 @@ demux_core = { path = "../../unaos/libs/media/demux_core" }
 vp8_core = { path = "../../unaos/libs/media/vp8_core" }
 
 [dev-dependencies]
+# INFERCORE (SR57) M3: the candle-vs-infer_core oracle test.
+infer_core = { path = "../../unaos/libs/ml/infer_core" }
 tokio = { version = "1.53", features = ["rt", "macros", "time"] }

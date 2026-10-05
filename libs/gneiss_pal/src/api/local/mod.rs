@@ -115,6 +115,36 @@ impl LocalEmbedder {
         self.tok.encode(text, MAX_TOKENS)
     }
 
+    /// INFERCORE (SR57) M3 oracle only: candle's sentence vectors for GIVEN ids — one padded
+    /// batch with the attention mask, masked mean, L2-normalised.
+    pub fn embed_ids_batch(&self, batch: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, ProviderError> {
+        let m = |e: candle_core::Error| ProviderError::Malformed(format!("local embedder: {e}"));
+        let n = batch.iter().map(Vec::len).max().unwrap_or(0);
+        let (mut ids, mut mask) = (Vec::new(), Vec::new());
+        for s in batch {
+            ids.extend(s.iter().copied().chain(std::iter::repeat_n(0, n - s.len())));
+            mask.extend(std::iter::repeat_n(1u32, s.len()).chain(std::iter::repeat_n(0, n - s.len())));
+        }
+        let b = batch.len();
+        let input = Tensor::from_vec(ids, (b, n), &self.device).map_err(m)?;
+        let types = Tensor::zeros((b, n), DType::U32, &self.device).map_err(m)?;
+        let maskt = Tensor::from_vec(mask, (b, n), &self.device).map_err(m)?;
+        let hidden = self.bert.forward(&input, &types, Some(&maskt)).map_err(m)?; // [b, n, d]
+        let mf = maskt.to_dtype(DType::F32).map_err(m)?.unsqueeze(2).map_err(m)?;
+        let summed = hidden.broadcast_mul(&mf).map_err(m)?.sum(1).map_err(m)?;
+        let counts = mf.sum(1).map_err(m)?;
+        let pooled = summed.broadcast_div(&counts).map_err(m)?;
+        let rows: Vec<Vec<f32>> = pooled.to_vec2().map_err(m)?;
+        Ok(rows
+            .into_iter()
+            .map(|mut v| {
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                v.iter_mut().for_each(|x| *x /= norm);
+                v
+            })
+            .collect())
+    }
+
     /// One normalised sentence vector, synchronously.
     pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, ProviderError> {
         let m = |e: candle_core::Error| ProviderError::Malformed(format!("local embedder: {e}"));
