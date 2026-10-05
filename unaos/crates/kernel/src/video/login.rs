@@ -2243,6 +2243,7 @@ pub fn field_rect_panel() -> Option<(usize, usize, usize, usize)> {
     let (x, y, w, h) = wm::frame_of(WIN.load(Ordering::Relaxed))?;
     let top = wm::TITLE_H.min(h);
     Some((x, y + top + (h - top) / 3, w, (h - top) / 3))
+}
 
 // ---------------------------------------------------------------------------
 // CONSOLEFIX M2 (rmbp-ledger B365) — A NOTICE NEVER TAKES THE CONSOLE'S KEYS
