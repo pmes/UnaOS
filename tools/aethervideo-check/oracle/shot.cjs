@@ -23,7 +23,13 @@ const [page_, n, fps, out, w, h] = process.argv.slice(2);
         setTimeout(() => ko(new Error('metadata timeout')), 10000);
       })));
       await Promise.all(vids.map(v => new Promise((ok) => {
-        v.addEventListener('seeked', () => (v.requestVideoFrameCallback ? v.requestVideoFrameCallback(() => ok()) : ok()), { once: true });
+        // A paused element's seek does not always run requestVideoFrameCallback in headless
+        // Chromium; `seeked` plus a bounded wait for the callback is the presented-frame gate.
+        v.addEventListener('seeked', () => {
+          let done = false; const fin = () => { if (!done) { done = true; ok(); } };
+          if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(fin);
+          setTimeout(fin, 500);
+        }, { once: true });
         v.currentTime = (n + 0.5) / fps;
       })));
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));

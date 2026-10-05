@@ -210,6 +210,18 @@ fn compare(args: &[String]) -> bool {
     let r: Vec<u32> = args.get(4).unwrap_or_else(|| die("compare needs <x,y,w,h>".into())).split(',').map(|v| v.trim().parse().unwrap_or_else(|_| die(format!("bad box {v}")))).collect();
     let (x, y, w, h) = (r[0], r[1], r[2], r[3]);
     let s = score(&a, &b, x, y, w, h);
+    if let Some(out) = arg(args, "--diff") {
+        // Per-pixel max channel difference ×4, grey; the box only.
+        let mut d = image::RgbaImage::new(w, h);
+        for yy in 0..h {
+            for xx in 0..w {
+                let (pa, pb) = (a.get_pixel(x + xx, y + yy).0, b.get_pixel(x + xx, y + yy).0);
+                let m = (0..3).map(|k| pa[k].abs_diff(pb[k])).max().unwrap_or(0).saturating_mul(4);
+                d.put_pixel(xx, yy, image::Rgba([m, m, m, 255]));
+            }
+        }
+        d.save(out).unwrap_or_else(|e| die(format!("{out}: {e}")));
+    }
     let mut ok = true;
     if let Some(min) = arg(args, "--min-psnr").and_then(|v| v.parse::<f64>().ok()) {
         ok &= s.psnr >= min;

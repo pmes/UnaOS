@@ -237,6 +237,11 @@ fn is_inline_node(node: &NodeRef) -> bool {
     if is_table_part(tag) {
         return true;
     }
+    // Replaced media elements are inline boxes whatever their (never rendered) <source>
+    // children are — testing those made a <video><source></video> a full-width block.
+    if matches!(tag, "video" | "audio") {
+        return true;
+    }
     // An inline element that CONTAINS block-level children is broken around
     // them by CSS; the practical approximation is to lay it out as a block.
     // Treated as inline it shrank to fit while its block children still

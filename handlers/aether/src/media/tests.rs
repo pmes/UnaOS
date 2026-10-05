@@ -338,6 +338,15 @@ fn autoplay_policy_muted_runs_bare_does_not() {
     assert_eq!(st, vec![State::Playing, State::Loading, State::Idle, State::Playing]);
 }
 
+/// A `<video>` whose source is a `<source>` child is still an inline replaced box sized by its
+/// attributes (the oracle found it laid out as a full-width block: the child made it "contain
+/// block content").
+#[test]
+fn video_with_source_children_keeps_its_attribute_size() {
+    let e = engine_with(r#"<html><body style="margin:0"><video width="320" height="240"><source src="a.webm"><source src="b.webm"></video></body></html>"#);
+    assert_eq!(video_box(&e, 0), (0, 0, 320, 240));
+}
+
 #[test]
 fn source_selection_skips_types_stria_cannot_play() {
     let mut e = engine_with(
