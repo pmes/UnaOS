@@ -496,6 +496,11 @@ pub fn fallback_for(c: char, sel: &FontSel) -> Option<&'static Face> {
         found = d.select(&fam, sel.style()).and_then(db_face).filter(|g| g.font.glyph_index(c) != 0).or(Some(f));
         break;
     }
+    // FONTHINT (SR62): Chromium draws a platform-fallback face with the default render params (hinting off
+    // under --font-render-hinting=none), not the face's fontconfig hintstyle — measured: Loma reached as the
+    // Thai fallback of `sans-serif` renders unhinted, the same face named directly renders hintslight. A distinct
+    // face id (not among the installed faces) carries that through the glyph caches.
+    let found = found.map(fallback_variant);
     FALLBACK.with(|m| {
         let mut m = m.borrow_mut();
         if m.0 != generation {
@@ -504,6 +509,23 @@ pub fn fallback_for(c: char, sel: &FontSel) -> Option<&'static Face> {
         m.1.insert(key, found);
     });
     found
+}
+
+/// The fallback-use twin of an installed face: same font and synthesis, its own id, never hinted.
+fn fallback_variant(face: &'static Face) -> &'static Face {
+    static V: OnceLock<Mutex<HashMap<u32, &'static Face>>> = OnceLock::new();
+    let m = V.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut m) = m.lock() else { return face };
+    m.entry(face.id).or_insert_with(|| {
+        Box::leak(Box::new(Face {
+            id: next_face_id(),
+            font: face.font,
+            synth_bold: face.synth_bold,
+            synth_oblique: face.synth_oblique,
+            family: face.family.clone(),
+            style: face.style,
+        }))
+    })
 }
 
 /// Whether a character needs a glyph at all (controls, default-ignorables and spaces are drawn by none).

@@ -218,7 +218,13 @@ pub fn rasterize(face: &Face, gid: u16, size: f32, sub: u8) -> Option<GlyphMask>
     // FONTHINT (SR62): installed faces get fontconfig's hintslight as Chromium applies it (FreeType
     // FT_LOAD_TARGET_LIGHT: font_core's light auto-hinter for TrueType, the Adobe hint model for CFF); the hinted
     // outline comes back in pixels. Skia drops hinting for skewed (synthetic oblique) text.
-    let hinted = if super::is_installed(face) && !face.synth_oblique { hinted_path(face, gid, size) } else { None };
+    // Faces fontconfig marks `hintnone` / `hinting=false` (WenQuanYi Zen Hei's 44-wqy-zenhei.conf) stay unhinted.
+    let fc = super::db::db().config.hint_mode(&face.family, size as f64);
+    let hinted = if super::is_installed(face) && !face.synth_oblique && fc.hinting && fc.hintstyle > 0 {
+        hinted_path(face, gid, size)
+    } else {
+        None
+    };
     let in_px = hinted.is_some();
     let (mut path, unit) = match hinted {
         Some(p) => (p, size / upem),
