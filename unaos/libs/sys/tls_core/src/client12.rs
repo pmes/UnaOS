@@ -63,6 +63,8 @@ impl<'a, T: Transport> Client<'a, T> {
         }
         let mut ems = false;
         let mut alpn = None;
+        let mut status_acked = false;
+        let mut sct_list: Option<Vec<u8>> = None;
         for (ty, data) in &sh.ext_data {
             let ty = *ty;
             // renegotiation_info is solicited by the SCSV (RFC 5746 §3.3), every other one by its extension.
@@ -102,6 +104,14 @@ impl<'a, T: Transport> Client<'a, T> {
                         return Err(illegal("server does not accept uncompressed points (RFC 8422 §5.2)"));
                     }
                 }
+                ext::STATUS_REQUEST => {
+                    // RFC 6066 §8: an empty extension promising a CertificateStatus message.
+                    if !data.is_empty() {
+                        return Err(TlsError::Decode("status_request ack must be empty"));
+                    }
+                    status_acked = true;
+                }
+                ext::SCT => sct_list = Some(data.clone()),
                 ext::KEY_SHARE | ext::SUPPORTED_VERSIONS | ext::PRE_SHARED_KEY | ext::COOKIE | ext::EARLY_DATA => {
                     return Err(illegal("TLS 1.3 extension in a TLS 1.2 ServerHello"));
                 }
@@ -125,10 +135,28 @@ impl<'a, T: Transport> Client<'a, T> {
             return Err(TlsError::Protocol(AlertDescription::DecodeError, "empty server Certificate"));
         }
         transcript.add(&m);
-        let leaf_key = self.cfg.verifier.verify_server_cert(self.p, &chain, self.cfg.server_name.as_deref())?;
+
+        // ---- CertificateStatus (RFC 6066 §8) — optional even when acknowledged
+        let mut m = self.next_handshake()?;
+        let mut ocsp = None;
+        if m[0] == hs::CERTIFICATE_STATUS {
+            if !status_acked {
+                return Err(unexpected("CertificateStatus without status_request"));
+            }
+            ocsp = Some(msgs::parse_certificate_status(&m[4..])?);
+            transcript.add(&m);
+            m = self.next_handshake()?;
+        }
+        let peer = x509::PeerCertificates {
+            chain: &chain,
+            ocsp: ocsp.as_deref(),
+            sct_list: sct_list.as_deref(),
+            ocsp_requested: offered.extensions.contains(&ext::STATUS_REQUEST),
+        };
+        let verdict = self.cfg.verifier.verify_server_cert_full(self.p, &peer, self.cfg.server_name.as_deref())?;
+        let leaf_key = verdict.key.clone();
 
         // ---- ServerKeyExchange (RFC 8422 §5.4)
-        let m = self.next_handshake()?;
         if m[0] != hs::SERVER_KEY_EXCHANGE {
             return Err(unexpected("expected ServerKeyExchange (ECDHE suites only)"));
         }
@@ -223,6 +251,9 @@ impl<'a, T: Transport> Client<'a, T> {
             client_cert_requested: cert_requested,
             extended_master_secret: true,
             resumed: false,
+            ocsp: verdict.ocsp,
+            scts: verdict.scts,
+            pool_intermediates: verdict.pool_intermediates,
         });
         Ok(())
     }

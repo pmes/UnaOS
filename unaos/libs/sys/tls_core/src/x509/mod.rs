@@ -4,12 +4,14 @@
 pub mod cert;
 pub mod der;
 pub mod name;
+pub mod ocsp;
 pub mod oid;
 pub mod pem;
+pub mod sct;
 pub mod verify;
 
 pub use cert::{Certificate, PublicKey, SignatureAlgorithm};
-pub use verify::{Clock, FixedClock, LoadReport, PinnedLeafVerifier, TrustAnchor, TrustStore, WebPkiVerifier};
+pub use verify::{CertVerdict, Clock, FixedClock, LoadReport, PeerCertificates, PinnedLeafVerifier, TrustAnchor, TrustStore, VerifiedPath, WebPkiVerifier};
 
 use crate::crypto::{CryptoError, CryptoProvider, EcCurve, HashAlg};
 use crate::error::{CertError, TlsError};
@@ -21,9 +23,19 @@ pub fn verify_certificate_signature(
     issuer_key: &PublicKey,
     cert: &Certificate,
 ) -> Result<(), CertError> {
-    let msg = cert.tbs();
-    let sig = &cert.signature;
-    let r = match (cert.signature_algorithm, issuer_key) {
+    verify_signed(p, issuer_key, cert.signature_algorithm, cert.tbs(), &cert.signature)
+}
+
+/// Verifies an X.509-style signature (`alg` from an AlgorithmIdentifier) over `msg` — certificates and OCSP
+/// responses alike.
+pub fn verify_signed(
+    p: &dyn CryptoProvider,
+    issuer_key: &PublicKey,
+    alg: SignatureAlgorithm,
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<(), CertError> {
+    let r = match (alg, issuer_key) {
         (SignatureAlgorithm::Ecdsa(h), PublicKey::Ec { curve, point }) => p.ecdsa_verify(*curve, h, point, msg, sig),
         (SignatureAlgorithm::Ed25519, PublicKey::Ed25519(k)) => p.ed25519_verify(k, msg, sig),
         (SignatureAlgorithm::RsaPkcs1(h), PublicKey::Rsa { n, e }) => p.rsa_pkcs1_verify(h, n, e, msg, sig),

@@ -106,6 +106,10 @@ pub enum CertError {
     PathTooLong,
     /// The verifier was configured to reject everything (e.g. empty trust store).
     NoTrustAnchors,
+    /// A verified stapled OCSP response says the leaf is revoked (RFC 6960).
+    Revoked,
+    /// A stapled OCSP response that does not verify for this leaf (the reason names the check).
+    BadOcspResponse(&'static str),
 }
 
 /// Every failure tls_core can report.
@@ -152,6 +156,8 @@ impl TlsError {
                 CertError::UnsupportedSignatureAlgorithm => AlertDescription::UnsupportedCertificate,
                 CertError::BadDer(_) => AlertDescription::BadCertificate,
                 CertError::NoCertificate => AlertDescription::DecodeError,
+                CertError::Revoked => AlertDescription::CertificateRevoked,
+                CertError::BadOcspResponse(_) => AlertDescription::BadCertificateStatusResponse,
                 _ => AlertDescription::BadCertificate,
             },
             TlsError::BadRecordMac => AlertDescription::BadRecordMac,

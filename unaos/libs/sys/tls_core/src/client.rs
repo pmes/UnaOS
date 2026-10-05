@@ -55,6 +55,25 @@ pub trait ServerCertVerifier {
         chain: &[Vec<u8>],
         server_name: Option<&str>,
     ) -> Result<PublicKey, TlsError>;
+
+    /// The full input — chain plus a stapled OCSP response and TLS-delivered SCTs (TLSCORE2). The default runs
+    /// `verify_server_cert` and reports a staple as `NotChecked`; [`x509::WebPkiVerifier`] verifies it.
+    fn verify_server_cert_full(
+        &self,
+        provider: &dyn CryptoProvider,
+        peer: &x509::PeerCertificates<'_>,
+        server_name: Option<&str>,
+    ) -> Result<x509::CertVerdict, TlsError> {
+        use x509::ocsp::OcspStatus;
+        let key = self.verify_server_cert(provider, peer.chain, server_name)?;
+        let ocsp = match (peer.ocsp, peer.ocsp_requested) {
+            (Some(_), _) => OcspStatus::NotChecked,
+            (None, true) => OcspStatus::NotStapled,
+            (None, false) => OcspStatus::NotRequested,
+        };
+        let scts = x509::verify::collect_scts(peer.chain.first().map(|v| v.as_slice()), peer.sct_list);
+        Ok(x509::CertVerdict { key, ocsp, scts, pool_intermediates: 0 })
+    }
 }
 
 /// Client configuration.
@@ -85,6 +104,10 @@ pub struct ClientConfig<'a> {
     /// connection to the same name offers one as a PSK with (EC)DHE. `None`: no psk_key_exchange_modes is sent
     /// and tickets are only parsed. 0-RTT is never offered (see `resumption`).
     pub resumption: Option<crate::resumption::Resumption<'a>>,
+    /// Ask for a stapled OCSP response (status_request, RFC 6066 §8); the verifier checks it when it comes.
+    pub request_ocsp: bool,
+    /// Ask for TLS-delivered SCTs (signed_certificate_timestamp, RFC 6962 §3.3.1).
+    pub request_sct: bool,
 }
 
 impl ClientConfig<'_> {
@@ -114,6 +137,8 @@ impl<'a> ClientConfig<'a> {
             padding: 0,
             hello_overrides: Vec::new(),
             resumption: None,
+            request_ocsp: true,
+            request_sct: true,
         }
     }
 }
@@ -135,6 +160,12 @@ pub struct Negotiated {
     /// TLS 1.3: the server accepted our ticket (PSK + (EC)DHE); no certificate was exchanged on this connection —
     /// the ticket came from a connection whose chain was verified for the same server name.
     pub resumed: bool,
+    /// The stapled OCSP verdict (RFC 6960).
+    pub ocsp: x509::ocsp::OcspStatus,
+    /// Certificate Transparency SCTs seen (embedded, TLS, OCSP) — parsed, not verified.
+    pub scts: Vec<x509::sct::Sct>,
+    /// Intermediates the verifier took from the trust store's pool because the server omitted them.
+    pub pool_intermediates: usize,
 }
 
 struct Share {
@@ -513,8 +544,8 @@ impl<'a, T: Transport> Client<'a, T> {
             cookie,
             versions: &versions,
             tls12: v12,
-            status_request: false,
-            sct: false,
+            status_request: self.cfg.request_ocsp,
+            sct: self.cfg.request_sct,
             psk_dhe_mode: v13 && self.cfg.resumption.is_some(),
             psk: psk.filter(|_| v13).map(|t| msgs::PskOffer {
                 identity: &t.ticket,
@@ -703,6 +734,7 @@ impl<'a, T: Transport> Client<'a, T> {
 
         // ---- resumed (PSK): no CertificateRequest, Certificate, CertificateVerify (§2.2, §4.3.2)
         let mut cert_request_ctx: Option<Vec<u8>> = None;
+        let mut cert_verdict: Option<x509::CertVerdict> = None;
         let (scheme, chain_len) = if resumed {
             let t = ticket.as_ref().expect("resumed implies a ticket");
             (SignatureScheme::from_code(t.signature_scheme).unwrap_or(SignatureScheme::EcdsaSecp256r1Sha256), 0)
@@ -720,11 +752,20 @@ impl<'a, T: Transport> Client<'a, T> {
             if m[0] != hs::CERTIFICATE {
                 return Err(unexpected("expected Certificate (PSK modes are not offered)"));
             }
-            let chain = msgs::parse_certificate(&m[4..])?;
+            let certs = msgs::parse_certificate_entries(&m[4..], &offered.extensions)?;
+            let chain = certs.chain;
             if chain.is_empty() {
                 return Err(TlsError::Protocol(AlertDescription::DecodeError, "empty server Certificate"));
             }
-            let leaf_key = self.cfg.verifier.verify_server_cert(self.p, &chain, self.cfg.server_name.as_deref())?;
+            let peer = x509::PeerCertificates {
+                chain: &chain,
+                ocsp: certs.ocsp.as_deref(),
+                sct_list: certs.sct_list.as_deref(),
+                ocsp_requested: offered.extensions.contains(&msgs::ext::STATUS_REQUEST),
+            };
+            let verdict = self.cfg.verifier.verify_server_cert_full(self.p, &peer, self.cfg.server_name.as_deref())?;
+            let leaf_key = verdict.key.clone();
+            cert_verdict = Some(verdict);
             transcript.add(&m);
 
             // ---- CertificateVerify
@@ -798,6 +839,9 @@ impl<'a, T: Transport> Client<'a, T> {
             extended_master_secret: false,
             version: msgs::TLS13,
             resumed,
+            ocsp: cert_verdict.as_ref().map(|v| v.ocsp.clone()).unwrap_or(x509::ocsp::OcspStatus::NotRequested),
+            scts: cert_verdict.as_ref().map(|v| v.scts.clone()).unwrap_or_default(),
+            pool_intermediates: cert_verdict.as_ref().map(|v| v.pool_intermediates).unwrap_or(0),
         });
         Ok(())
     }
