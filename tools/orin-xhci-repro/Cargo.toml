@@ -15,7 +15,7 @@ name = "orin-xhci-repro"
 path = "src/main.rs"
 
 [dependencies]
-# Same `uefi` crate + version the UnaOS bootloader already uses
+# Same `uefi` crate + version the UnaOS bootloader already uses (both 0.41.0 since DEPS SR31)
 # (unaos/crates/bootloader/Cargo.toml) — no exotic pin, just pinned for reproducibility.
-uefi = { version = "0.38.0", features = ["logger", "panic_handler"] }
+uefi = { version = "0.41.0", features = ["logger", "panic_handler"] }
 log = "0.4.21"

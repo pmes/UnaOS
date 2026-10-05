@@ -1,0 +1,293 @@
+# DEPS (SR31, R83): the CHICKEN-WIRE verdicts read by tools/deps-audit/run.py.
+#
+# A crate listed here does the work of a capability UnaOS claims (R83: "built in UnaOS whenever
+# possible ... NO CHICKEN WIRE"). Every crate NOT listed is a UTILITY (async runtime, CLI parsing,
+# error types, FFI glue, bit-twiddling, data tables ...).
+#
+#   capability   what the crate does that UnaOS claims
+#   verdict      CUT         — the UnaOS core that replaces it is an open arc (named in `replacement`)
+#                OWED        — no arc yet; `replacement` proposes the arc and the crate
+#                NOT WANTED  — UnaOS will not replace it on this ring; `replacement` says why
+#   replacement  the arc / crate / reason (one line, it is a table cell)
+
+# ---------------------------------------------------------------- web engine (Aether)
+[chicken_wire.boa_engine]
+capability = "JavaScript engine (ECMA-262 parser, bytecode VM, builtins)"
+verdict = "OWED"
+replacement = "arc JSCORE — `unaos/libs/web/js_core` (no_std ECMA-262 interpreter; oracle: test262 subset vs Chromium)"
+
+[chicken_wire.boa_gc]
+capability = "JavaScript engine garbage collector (boa's tracing GC)"
+verdict = "OWED"
+replacement = "arc JSCORE — goes with boa_engine (the GC lives inside `js_core`)"
+
+[chicken_wire.html5ever]
+capability = "HTML parser (WHATWG tokenizer + tree builder)"
+verdict = "OWED"
+replacement = "arc HTMLCORE — `unaos/libs/web/html_core` (WHATWG §13 tokenizer/tree builder + DOM arena; oracle: html5lib-tests, Chromium DOM dump)"
+
+[chicken_wire.kuchiki]
+capability = "DOM tree + CSS-selector queries over html5ever (unmaintained since 2020)"
+verdict = "OWED"
+replacement = "arc HTMLCORE — the DOM arena in `html_core` replaces it; kuchiki 0.8.1 is the last release and drags html5ever 0.25, selectors 0.22 and cssparser 0.27 into the lock"
+
+[chicken_wire.cssparser]
+capability = "CSS tokenizer/parser (CSS Syntax Level 3)"
+verdict = "OWED"
+replacement = "arc CSSCORE — `unaos/libs/web/css_core` (CSS Syntax 3 tokenizer, cascade; oracle: Chromium getComputedStyle)"
+
+[chicken_wire.selectors]
+capability = "CSS selector matching (Selectors Level 4)"
+verdict = "OWED"
+replacement = "arc CSSCORE — selector matching in `css_core`"
+
+[chicken_wire.taffy]
+capability = "CSS layout (block, flexbox, grid)"
+verdict = "OWED"
+replacement = "arc LAYOUTCORE — `unaos/libs/web/layout_core` (CSS2 block/inline, Flexbox, Grid; oracle: Chromium getBoundingClientRect)"
+
+[chicken_wire.url]
+capability = "URL parsing (WHATWG URL Standard)"
+verdict = "OWED"
+replacement = "arc HTMLCORE — WHATWG URL parser in `html_core::url` (oracle: WPT urltestdata.json)"
+
+# ---------------------------------------------------------------- fonts
+[chicken_wire.ab_glyph]
+capability = "font rasterisation (TrueType/OpenType outlines to coverage)"
+verdict = "OWED"
+replacement = "arc FONTCORE — `unaos/libs/media/font_core` (sfnt/glyf/CFF parse + scanline rasteriser, shared with the kernel's `rast`; oracle: Chromium text render)"
+
+[chicken_wire.font-kit]
+capability = "font loading + rasterisation (system font lookup, glyph raster)"
+verdict = "OWED"
+replacement = "arc FONTCORE — `font_core` loads and rasters; host font *discovery* (fontconfig/CoreText) stays the host's"
+
+# ---------------------------------------------------------------- images / vector
+[chicken_wire.image]
+capability = "image decoding (PNG, JPEG, GIF, WebP, BMP …)"
+verdict = "CUT"
+replacement = "PIXELCORE SR25 — `unaos/libs/media/pixel_core` (PNG, JPEG, GIF, BMP, WebP; since the cut FACETPIXEL SR43 moved Facet and VP8CORE SR40 moved Aether's WebP onto pixel_core, Aether still declares image 0.25 at caf3c986); AVIF via AVCODEC SR24 `av1_core` (its default `avif` feature also drags rav1e, an AV1 ENCODER, into the lock — reachable only if headless `img.save` is handed a `.avif` path)"
+
+[chicken_wire.png]
+capability = "PNG decoding"
+verdict = "CUT"
+replacement = "PIXELCORE SR25 — `pixel_core` PNG (moved out of the kernel's `video/png.rs`)"
+
+[chicken_wire.zune-jpeg]
+capability = "JPEG decoding"
+verdict = "CUT"
+replacement = "PIXELCORE SR25 — `pixel_core` JPEG baseline + progressive"
+
+[chicken_wire.zune-core]
+capability = "zune-jpeg's decoder options/colourspace support crate"
+verdict = "CUT"
+replacement = "PIXELCORE SR25 — leaves with zune-jpeg"
+
+[chicken_wire.resvg]
+capability = "SVG parsing + rendering"
+verdict = "OWED"
+replacement = "arc SVGCORE — `unaos/libs/media/svg_core` (SVG 1.1 static subset → pixel_core paths; owner Facet SR29; oracle: Chromium `<img src=svg>`)"
+
+# ---------------------------------------------------------------- network
+[chicken_wire.reqwest]
+capability = "HTTP client (HTTP/1.1 + HTTP/2, redirects, TLS via rustls)"
+verdict = "OWED"
+replacement = "HTTPCORE SR51 — `unaos/libs/net/http_core` + `gneiss_pal::api::http` replaced it in gneiss_pal/vein/aether; only `tools/foreman` still links it (owed: foreman → gneiss_pal::api::http)"
+
+[chicken_wire.tokio-tungstenite]
+capability = "WebSocket client (RFC 6455)"
+verdict = "CUT"
+replacement = "HTTPCORE SR51 — deleted: no live caller (Aether's api/websockets.rs is a stub); an RFC 6455 client in http_core is owed when a caller appears"
+
+[chicken_wire.octocrab]
+capability = "GitHub REST client (an HTTP client + API model)"
+verdict = "CUT"
+replacement = "HTTPCORE SR51 — gneiss_pal::forge speaks GET /user, /user/repos, /repos/{o}/{r}/contents over gneiss_pal::api::http"
+
+[chicken_wire.smoltcp]
+capability = "TCP/IP stack (kernel, x86 default net path)"
+verdict = "OWED"
+replacement = "arc NETCORE — the hand-rolled `unaos/crates/net` grown to replace it; NB ROADMAP §1b (Peter 2026-07-12) chose smoltcp, R83 (2026-10-04) says built-in first: the seat asks Peter"
+
+[chicken_wire.rustls]
+capability = "TLS 1.2/1.3 client"
+verdict = "CUT"
+replacement = "TLSCORE SR28 — `unaos/libs/sys/tls_core` (TLS 1.3, RFC 8446)"
+
+[chicken_wire.embedded-tls]
+capability = "TLS 1.3 client (no_std; tls-spike / vein_ring3)"
+verdict = "CUT"
+replacement = "TLSCORE SR28 — `tls_core` replaces it under vein_ring3 by name; DONE on the seat tip caf3c986 (VEINTLS SR36 removed embedded-tls, embedded-io and rand_core): row and the rand_core pin die at the fold"
+
+# ---------------------------------------------------------------- crypto
+[chicken_wire.sha2]
+capability = "SHA-2 hashing"
+verdict = "CUT"
+replacement = "CRYPTOCORE SR27 — `unaos/libs/sys/crypto_core` SHA-256/384/512"
+
+[chicken_wire.blake3]
+capability = "BLAKE3 hashing (sentinel file fingerprints)"
+verdict = "CUT"
+replacement = "CRYPTOCORE SR27 — add BLAKE3 to `crypto_core`'s set (or sentinel moves to SHA-256)"
+
+# ---------------------------------------------------------------- audio
+[chicken_wire.cpal]
+capability = "audio output (host audio API binding: ALSA / CoreAudio / WASAPI)"
+verdict = "NOT WANTED"
+replacement = "on the host the audio server is the host's; Ring 0 has its own HDA driver (`hda`); codecs are AUDIOCODEC SR30"
+
+# ---------------------------------------------------------------- serialisation of our own formats
+# `bincode` left the tree with UNAFSCODEC (SR53): UnaFS records are encoded by `unafs::codec` from
+# docs/dev/OS/09_FILESYSTEM/unafs-records.md. A crate that serialises our own formats is chicken wire.
+
+[chicken_wire.wincode]
+capability = "binary serialisation (declared by Lumen, no use in `vessels/lumen/src`)"
+verdict = "OWED"
+replacement = "remove the dependency (no caller); any future Lumen record format gets an in-tree codec"
+
+# ---------------------------------------------------------------- git
+[chicken_wire.gix]
+capability = "git implementation (object store, refs, packfiles) under Vaire"
+verdict = "OWED"
+replacement = "arc GITCORE — `libs/git_core` (loose objects, packfile v2 + idx, refs; oracle: `git cat-file`) for Vaire"
+
+# ---------------------------------------------------------------- ML inference
+[chicken_wire.candle-core]
+capability = "tensor runtime for the local embedder (B317 `local-embed`)"
+verdict = "OWED"
+replacement = "arc INFERCORE — `libs/infer_core` (f32 tensor ops + BERT-family encoder for all-MiniLM-L6-v2; oracle: the reference embeddings)"
+
+[chicken_wire.candle-nn]
+capability = "neural-net layers for the local embedder"
+verdict = "OWED"
+replacement = "arc INFERCORE — goes with candle-core"
+
+[chicken_wire.candle-transformers]
+capability = "transformer model (BERT) for the local embedder"
+verdict = "OWED"
+replacement = "arc INFERCORE — goes with candle-core"
+
+# ---------------------------------------------------------------- GUI toolkit / GPU bindings (host)
+[chicken_wire.gtk4]
+capability = "GUI toolkit binding (GTK 4)"
+verdict = "NOT WANTED"
+replacement = "Quartzite's host embassy: on a host desktop the toolkit is the host's; on UnaOS the compositor is the kernel's (`wc`)"
+
+[chicken_wire.glib]
+capability = "GUI toolkit binding (GLib main loop / GObject)"
+verdict = "NOT WANTED"
+replacement = "the host's toolkit runtime (goes with gtk4)"
+
+[chicken_wire.glib-sys]
+capability = "GUI toolkit binding (GLib FFI)"
+verdict = "NOT WANTED"
+replacement = "the host's toolkit runtime (goes with gtk4)"
+
+[chicken_wire.gobject-sys]
+capability = "GUI toolkit binding (GObject FFI)"
+verdict = "NOT WANTED"
+replacement = "the host's toolkit runtime (goes with gtk4)"
+
+[chicken_wire.glib-build-tools]
+capability = "GUI toolkit binding (GResource compiler, build-time)"
+verdict = "NOT WANTED"
+replacement = "the host's toolkit runtime (goes with gtk4)"
+
+[chicken_wire.libadwaita]
+capability = "GUI toolkit binding (GNOME Adwaita widgets)"
+verdict = "NOT WANTED"
+replacement = "the host's desktop look (Quartzite `gnome` embassy)"
+
+[chicken_wire.sourceview5]
+capability = "GUI toolkit binding (GtkSourceView text editor widget)"
+verdict = "NOT WANTED"
+replacement = "the host's widget (Tabula's GTK face); Tabula's own core is in-tree"
+
+[chicken_wire.libspelling]
+capability = "GUI toolkit binding (spell-check widget)"
+verdict = "NOT WANTED"
+replacement = "the host's widget (Tabula's GTK face)"
+
+[chicken_wire.cxx-qt]
+capability = "GUI toolkit binding (Qt 6)"
+verdict = "NOT WANTED"
+replacement = "Quartzite's `qt` embassy: the host's toolkit"
+
+[chicken_wire.cxx-qt-lib]
+capability = "GUI toolkit binding (Qt 6 types)"
+verdict = "NOT WANTED"
+replacement = "Quartzite's `qt` embassy: the host's toolkit"
+
+[chicken_wire.cxx-qt-build]
+capability = "GUI toolkit binding (Qt 6 build glue)"
+verdict = "NOT WANTED"
+replacement = "Quartzite's `qt` embassy: the host's toolkit"
+
+[chicken_wire.objc2-app-kit]
+capability = "GUI toolkit binding (AppKit)"
+verdict = "NOT WANTED"
+replacement = "Quartzite's `macos` embassy: the host's toolkit"
+
+[chicken_wire.epoxy]
+capability = "OpenGL loader (Vug's GTK GL area)"
+verdict = "NOT WANTED"
+replacement = "the host's GL; Vug is outside the workspace (commented out of the root members)"
+
+[chicken_wire.gl]
+capability = "OpenGL bindings (Vug)"
+verdict = "NOT WANTED"
+replacement = "the host's GL; Vug is outside the workspace"
+
+[chicken_wire.wgpu]
+capability = "GPU API (Vulkan / Metal / DX12 / GL) for Euclase"
+verdict = "NOT WANTED"
+replacement = "on the host the GPU stack is the host's; on metal the kernel drives the GPU itself (Kepler, `wc`)"
+
+# ---------------------------------------------------------------- crypto test oracle (seat tip caf3c986, not yet on this branch)
+# tls_core's `test-provider` feature (TEST OPERAND ONLY, never linked into a product binary): the product
+# provider is crypto_core. An oracle crate is allowed by R83; it does no work UnaOS ships.
+
+[chicken_wire.hmac]
+capability = "HMAC — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.aes-gcm]
+capability = "AES-GCM AEAD — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.chacha20poly1305]
+capability = "ChaCha20-Poly1305 AEAD — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.x25519-dalek]
+capability = "X25519 key agreement — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.p256]
+capability = "P-256 ECDH/ECDSA — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.p384]
+capability = "P-384 ECDSA — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.ed25519-dalek]
+capability = "Ed25519 signatures — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.rsa]
+capability = "RSA signature verify (0.10 pre-release, R83 pre-release clause) — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"
+
+[chicken_wire.getrandom]
+capability = "OS randomness for the test provider — tls_core `test-provider` oracle only"
+verdict = "NOT WANTED"
+replacement = "test operand, never in a product binary; the product primitive is CRYPTOCORE SR27 `crypto_core` (tls_core feature `cryptocore`)"

@@ -140,12 +140,21 @@ fn oversized_volume_fails_format_cleanly_not_panic() {
 
     // The boundary itself is representable arithmetic: exactly MAX is valid
     // geometry per validate(); one past it is refused.
-    assert!(Superblock::new(MAX_BLOCK_COUNT).validate().is_ok());
-    assert!(Superblock::new(MAX_BLOCK_COUNT + 1).validate().is_err());
+    // (A legacy-map v6 volume: the two-level raw-pointer wall.)
+    let mut v6_max = Superblock::new(MAX_BLOCK_COUNT);
+    v6_max.version = 6;
+    assert!(v6_max.validate().is_ok());
+    v6_max.block_count = MAX_BLOCK_COUNT + 1;
+    assert!(v6_max.validate().is_err());
+    // UNAFSMAP: a v7 (paged) volume's wall is MAX_BLOCK_COUNT_PAGED (8 TiB).
+    use unafs::superblock::MAX_BLOCK_COUNT_PAGED;
+    assert!(Superblock::new(MAX_BLOCK_COUNT + 1).validate().is_ok());
+    assert!(Superblock::new(MAX_BLOCK_COUNT_PAGED).validate().is_ok());
+    assert!(Superblock::new(MAX_BLOCK_COUNT_PAGED + 1).validate().is_err());
 
     // mount(): the same geometry planted in a superblock is refused too.
     let dev = valid_volume();
-    let hostile = with_corrupt_sb(&dev, |sb| sb.block_count = MAX_BLOCK_COUNT + 1);
+    let hostile = with_corrupt_sb(&dev, |sb| sb.block_count = MAX_BLOCK_COUNT_PAGED + 1);
     assert!(UnaFS::mount(hostile).is_err());
 
     // A PRE-v5 volume's format has only one refmap level: two-level geometry

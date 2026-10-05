@@ -7,6 +7,8 @@
 //! A picture smaller than the panel is centred and LETTERBOXED with `DESKTOP_BG` (the buffer is seeded
 //! with it); a picture larger than the panel is box-downscaled by `facet::fit`'s integer factor (never
 //! upscaled: the decoder is a downscaler). File is capped at 4 MB.
+//! FACETANIM (B358): a non-PNG picture goes through `pixel_core::decode_first_frame` — an animated GIF
+//! or WebP is its FIRST frame, and frames 1..N are never composited.
 //!
 //! LOOKUP: `/home/<user>/Desktop/WALL.PNG`, then the volume root `/WALL.PNG`, through the mount table.
 //! WHEN: [`poll`] runs from `Screen::flush` on the desktop layer (rate-limited, five tries) so the

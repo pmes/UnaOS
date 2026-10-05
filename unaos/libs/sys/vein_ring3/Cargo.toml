@@ -32,6 +32,9 @@ cryptocore = ["tls_core/cryptocore", "dep:crypto_core"]
 una-abi = { path = "../../../crates/una-abi" }
 vein_core = { path = "../vein_core", default-features = false }
 tls_core = { path = "../tls_core" }
+# HOLOCRON2 (rmbp-ledger B355): the key comes from Holocron first — its frame codec and the consumer rule
+# (`keysource::decide`), the SAME crate the host daemon and HOLOCRON.ELF link. no_std, CRYPTOCORE only.
+holocron_core = { path = "../holocron_core" }
 crypto_core = { path = "../crypto_core", optional = true, default-features = false, features = ["alloc"] }
 
 [dev-dependencies]

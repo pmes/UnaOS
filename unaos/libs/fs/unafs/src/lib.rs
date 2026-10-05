@@ -39,6 +39,7 @@ pub mod btree;
 pub mod clock;
 pub mod catalog;
 pub mod codec;
+pub mod format;
 pub mod fs;
 pub mod fsck;
 pub mod hash;
@@ -47,6 +48,7 @@ pub mod inode;
 #[cfg(feature = "std")]
 pub mod io;
 pub mod legacy;
+pub mod maptree;
 pub mod query;
 pub mod readahead;
 pub mod refmap;
@@ -69,6 +71,7 @@ pub use fs::{
     SnapshotView, Stat, UnaFS, cosine_similarity, grow,
 };
 pub use index::CatalogRecord;
+pub use format::{FormatParams, Formatted, format, format_partition};
 pub use fsck::FsckReport;
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
 pub use query::{Expr, Predicate, Query, QueryOp, parse_value};

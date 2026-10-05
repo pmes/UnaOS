@@ -9,8 +9,8 @@ license = "LGPL-3.0-or-later"
 # format + BlockDevice seam are no_std + alloc.
 gneiss_pal = { path = "../../../../libs/gneiss_pal", optional = true }
 bandy = { path = "../../../../libs/bandy", optional = true }
-serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
-bincode = { version = "2.0.0", default-features = false, features = ["serde", "alloc"] }
+# On-disk records are encoded by `unafs::codec` from the byte-level spec in
+# docs/dev/OS/09_FILESYSTEM/unafs-records.md (UNAFSCODEC, SR53): no serializer crate.
 thiserror = { version = "2.0", default-features = false }
 # Pure-Rust no_std float math for the query engine's cosine similarity. Used
 # unconditionally (std builds too) so host and kernel score along ONE code
@@ -29,7 +29,5 @@ std = [
     "dep:bandy",
     "dep:anyhow",
     "dep:memmap2",
-    "serde/std",
-    "bincode/std",
     "thiserror/std",
 ]
