@@ -122,6 +122,12 @@ SECTIONS
        ever changes SIZEOF_HEADERS, this trips instead of the skew coming back at a new width. */
     ASSERT(_start == SIZEOF_HEADERS, "user-vug-x86: e_entry moved off SIZEOF_HEADERS — update the 0xb0 base correction in main.rs `_start`")
 
+    /* STORMFAULT (B351): the ASSERT above pinned the wrong thing — it moved WITH the header count, so
+       EXECNAME's PT_NOTE took SIZEOF_HEADERS 0xb0 -> 0xe8 and it still held while main.rs's literal 0xb0
+       went stale (boot 21: six parents killed at window+0x56000). main.rs now takes the base from
+       `__ehdr_start`; this pins that the ELF header IS the window base. */
+    ASSERT(__ehdr_start == 0, "user-vug-x86: the ELF header must sit at vaddr 0 (main.rs derives the window base from __ehdr_start)")
+
     /* Force the data segment onto its own page so text/data never share a leaf. */
     . = ALIGN(0x1000);
 
