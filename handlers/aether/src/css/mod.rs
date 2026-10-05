@@ -220,11 +220,25 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             }
             None => crate::ledger::record_css(&format!("flex-value:{}", clip(value))),
         },
-        "width" => style.width = parse_dimension_str(value),
+        "width" | "min-width" | "max-width" => {
+            let d = parse_dimension_str(value);
+            let i = match prop { "width" => 0, "min-width" => 1, _ => 2 };
+            // css-values-4 §10: a math function mixing % with lengths
+            // resolves against the containing block's width — known only
+            // after layout, so it is kept as an expression for remeasure.
+            let mut m = style.paint.pct_math.clone().unwrap_or_default();
+            m[i] = (d.is_none() && value.contains('(') && value.contains('%')).then(|| value.to_string());
+            if d.is_some() || m[i].is_some() {
+                style.paint.pct_math = Some(m);
+            }
+            match i {
+                0 => style.width = d,
+                1 => style.min_width = d,
+                _ => style.max_width = d,
+            }
+        }
         "height" => style.height = parse_dimension_str(value),
-        "max-width" => style.max_width = parse_dimension_str(value),
         "max-height" => style.max_height = parse_dimension_str(value),
-        "min-width" => style.min_width = parse_dimension_str(value),
         "min-height" => style.min_height = parse_dimension_str(value),
         // overflow hidden/clip/auto/scroll all CLIP paint here (no inner
         // scrollbars yet — clipping is the honest approximation; visible
@@ -1836,6 +1850,7 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
         ua_vmargin,
     );
+    clone!(pct_math);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
 }
 
@@ -2419,6 +2434,11 @@ const BASE_FONT_PX: f32 = 16.0;
 /// approximation, not parent-relative), %, or absolute keywords.
 pub fn parse_font_size(value: &str) -> Option<f32> {
     let v = value.trim().to_ascii_lowercase();
+    // css-values-4 math (`clamp(1.25rem, 4vw, 2.5rem)`); % is of the
+    // (approximated 16px) parent size.
+    if v.contains('(') {
+        return eval_length(&v, Some(BASE_FONT_PX));
+    }
     if let Some(px) = v.strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok()) {
         return Some(px);
     }
@@ -2727,6 +2747,31 @@ fn parse_radius(v: &str) -> Option<f32> {
     parse_px(v).map(|x| x.max(0.0))
 }
 
+/// Splits a value on whitespace outside parentheses: `calc(1rem + 2px) 4px`
+/// is two components, not four.
+pub(crate) fn split_top_level(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, None::<usize>);
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if c.is_whitespace() && depth == 0 {
+            if let Some(st) = start.take() {
+                out.push(&value[st..i]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        out.push(&value[st..]);
+    }
+    out
+}
+
 /// [top, right, bottom, left] index of a `*-top`/`*-right`/... longhand.
 fn side_index(prop: &str) -> usize {
     if prop.ends_with("-top") { 0 } else if prop.ends_with("-right") { 1 } else if prop.ends_with("-bottom") { 2 } else { 3 }
@@ -2735,7 +2780,7 @@ fn side_index(prop: &str) -> usize {
 /// Parses a 1-4 value box shorthand ("10px", "0 auto", "1px 2px 3px 4px")
 /// into a sides rect using CSS's top/right/bottom/left expansion.
 fn parse_sides<T: Copy>(value: &str, parse_one: impl Fn(&str) -> Option<T>) -> Option<Rect<T>> {
-    let parts: Vec<T> = value.split_whitespace().map(|p| parse_one(p)).collect::<Option<_>>()?;
+    let parts: Vec<T> = split_top_level(value).into_iter().map(|p| parse_one(p)).collect::<Option<_>>()?;
     let (t, r, b, l) = match parts.as_slice() {
         [a] => (*a, *a, *a, *a),
         [v, h] => (*v, *h, *v, *h),

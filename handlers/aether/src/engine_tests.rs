@@ -2443,4 +2443,20 @@ mod tests {
         assert_eq!(layout::default_font_size("h2", 14.0), 21.0);
         assert_eq!(layout::default_font_size("h1", 16.0), 32.0);
     }
+
+    /// css-values-4: clamp()/min() with % resolve against the containing
+    /// block after layout; math in a box shorthand is one component;
+    /// clamp() font sizes.
+    #[test]
+    fn test_css_math_kat() {
+        assert_eq!(css::split_top_level("calc(0.5rem + 1vw) 4px"), vec!["calc(0.5rem + 1vw)", "4px"]);
+        assert_eq!(css::parse_font_size("clamp(10px, 50px, 20px)"), Some(20.0));
+        let t = laid_out(
+            r#"<html><body><div style="width:500px"><div id=a style="width:min(300px, 80%);height:1px"></div><div id=b style="width:max(10px, 50%);height:1px;padding:calc(2px + 3px)"></div></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(a.2, 300.0);
+        assert_eq!(b.2, 250.0 + 10.0, "50% of 500 + padding 5+5");
+    }
 }

@@ -51,14 +51,14 @@
       "ssim": 0.9887
     },
     "10-calc-clamp": {
-      "mismatch": 9.4,
-      "missing": 1,
-      "ssim": 0.9076
+      "mismatch": 0.29,
+      "missing": 0,
+      "ssim": 0.9981
     },
     "10-calc-clamp@375": {
-      "mismatch": 12.89,
-      "missing": 1,
-      "ssim": 0.767
+      "mismatch": 0.51,
+      "missing": 0,
+      "ssim": 0.9977
     },
     "11-non-latin": {
       "mismatch": 2.18,

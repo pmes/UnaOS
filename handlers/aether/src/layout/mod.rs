@@ -91,6 +91,10 @@ pub struct PaintStyle {
     /// and the px it was built with (against the 16px default): remeasure
     /// rescales an untouched UA margin to the element's real font size.
     pub ua_vmargin: Option<(f32, f32)>,
+    /// [width, min-width, max-width] given as a math function mixing % and
+    /// lengths (`min(300px, 80%)`), resolved after a first layout against
+    /// the containing block's content width. A plain value clears it.
+    pub pct_math: Option<[Option<String>; 3]>,
 }
 
 pub struct LayoutTree {
@@ -1355,6 +1359,32 @@ pub fn remeasure(tree: &mut LayoutTree) {
     // this layout run (CSS 2.2 §8.3.1); specified margins return after.
     let widths = blockwidth::apply(tree);
     let collapsed = collapse::apply(tree);
+    let pct_nodes: Vec<(taffy::NodeId, [Option<String>; 3])> = tree
+        .paint_map
+        .iter()
+        .filter_map(|(id, p)| p.pct_math.clone().filter(|m| m.iter().any(Option::is_some)).map(|m| (*id, m)))
+        .collect();
+    let passes = if pct_nodes.is_empty() { 1 } else { 2 };
+    for pass in 0..passes {
+    if pass == 1 {
+        // Containing-block widths are known now: resolve the % math.
+        for (id, m) in &pct_nodes {
+            let Some(parent) = tree.taffy.parent(*id) else { continue };
+            let Ok(pl) = tree.taffy.layout(parent) else { continue };
+            let cb = pl.size.width - pl.padding.left - pl.padding.right - pl.border.left - pl.border.right;
+            let Ok(st) = tree.taffy.style(*id) else { continue };
+            let mut st = st.clone();
+            for (i, e) in m.iter().enumerate() {
+                let Some(v) = e.as_deref().and_then(|e| crate::css::eval_length(e, Some(cb))) else { continue };
+                match i {
+                    0 => st.size.width = Dimension::length(v),
+                    1 => st.min_size.width = LengthPercentageAuto::length(v),
+                    _ => st.max_size.width = LengthPercentageAuto::length(v),
+                }
+            }
+            let _ = tree.taffy.set_style(*id, st);
+        }
+    }
     let _ = tree.taffy.compute_layout_with_measure(
         tree.root_node,
         viewport,
@@ -1387,6 +1417,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
             }
         }),
     );
+    }
     collapse::restore(tree, collapsed);
     blockwidth::restore(tree, widths);
 }
