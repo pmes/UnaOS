@@ -133,11 +133,10 @@ fn is_disabled<E: Element>(e: &E) -> bool {
         return true;
     }
     if e.local_name() == "option" {
-        if let Some(p) = e.parent_element() {
-            if p.local_name() == "optgroup" && p.has_attr("disabled") {
+        if let Some(p) = e.parent_element()
+            && p.local_name() == "optgroup" && p.has_attr("disabled") {
                 return true;
             }
-        }
         return false;
     }
     if !matches!(e.local_name(), "button" | "input" | "select" | "textarea" | "fieldset") {
@@ -396,11 +395,10 @@ fn match_pseudo<E: Element>(p: &PseudoClass, el: &E, cx: &MatchContext<E>) -> bo
         PseudoClass::Is(l) | PseudoClass::Where(l) => matches_list(l, el, cx),
         PseudoClass::Has(rels) => rels.iter().any(|r| has_match(r, el, cx)),
         PseudoClass::Nth { kind, a, b, of } => {
-            if let Some(l) = of {
-                if !matches_list(l, el, cx) {
+            if let Some(l) = of
+                && !matches_list(l, el, cx) {
                     return false;
                 }
-            }
             let idx = match kind {
                 NthKind::Child | NthKind::LastChild => {
                     let last = *kind == NthKind::LastChild;
