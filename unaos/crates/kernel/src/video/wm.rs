@@ -24463,7 +24463,7 @@ static HT_SURF: [u32; FIX_W * FIX_H] = [0x0020_C080; FIX_W * FIX_H];
 /// fixture window carries a control cluster at scale 1 and therefore at every scale. 160 is the
 /// next multiple of 32 above the floor, i.e. 12 px of margin against the next metric nudge.
 #[cfg(feature = "witness")]
-pub const FIX_W: usize = 576; // UIMETRICS (B372): was 160 — the cluster floor now scales with the panel (353 px at 2.5, 564 at 4.0); 576 clears it at EVERY scale (the proof below)
+pub const FIX_W: usize = 160; // UIMETRICS (B372): unchanged — it clears the cluster floor at scale 1.0 (105 px with the kit's 12-px disc); at a larger dpi scale an UNPINNED fixture row is floored by `min_width_scale` like any row, and the two fixtures that PIN scale 1 (CTRLDECLINE, DMGOVLP) take `fix_pin_w()` on `HT_WIDE` (file tail)
 
 /// The fixture surfaces' SOURCE height. Unchanged: nothing about the control cluster is a function
 /// of height, and 8 rows keeps the surfaces small.
@@ -24477,7 +24477,7 @@ pub const FIX_STRIDE: usize = FIX_W * 4;
 /// **The tripwire the last three re-sizings needed and did not have.** If a theme metric ever
 /// raises `controls`'s floor past the fixture width again, this fails the build.
 #[cfg(feature = "witness")]
-const _: () = { let m = crate::ui::Metrics::at(crate::video::dpi::S2_MAX, 0); assert!(FIX_W >= 5 * m.gap + 3 * m.ctrl_box + m.chrome_cw); }; // UIMETRICS: `CLUSTER_MIN_SRC_W` at the LARGEST scale (4.0), proven at compile time
+const _: () = { let m = crate::ui::Metrics::at(2, 0); assert!(FIX_W >= 5 * m.gap + 3 * m.ctrl_box + m.chrome_cw); }; // UIMETRICS: `CLUSTER_MIN_SRC_W` at scale 1.0, proven at compile time (the scale-pinning fixtures' proof at 4.0 is `HT_WIDE`'s, file tail)
 
 /// CLICK-ROUTE — the HIT-TEST witness: does [`hit_test`] name the window an operator would say they
 /// clicked on?
@@ -25506,15 +25506,15 @@ pub fn ctrldecline_selftest() {
     #[allow(non_snake_case)] #[inline] fn AT_W() -> usize { CLUSTER_MIN_SRC_W() }
     // The fixture surface must be able to SUPPLY both widths, or the rows would be re-pinned to a
     // width their own surface does not cover.
-    const _: () = { let m = crate::ui::Metrics::at(crate::video::dpi::S2_MAX, 0); assert!(5 * m.gap + 3 * m.ctrl_box + m.chrome_cw <= FIX_W); }; // UIMETRICS: AT_W (the floor) <= FIX_W at every scale; UNDER_W >= 1 since the floor is > 1
+    const _: () = { let m = crate::ui::Metrics::at(crate::video::dpi::S2_MAX, 0); assert!(5 * m.gap + 3 * m.ctrl_box + m.chrome_cw <= FIX_WIDE_W); }; // UIMETRICS: AT_W (the floor) <= the WIDE surface at every scale; UNDER_W >= 1 since the floor is > 1
     const _: () = assert!(is_kernel_owner(ASID_F));
     const _: () = assert!(ASID_F != KERNEL_OWNER_CONSOLE && ASID_F != KERNEL_OWNER_DESKTOP);
 
-    let s = &raw const HT_SURF as usize;
-    let len = core::mem::size_of_val(&HT_SURF);
-    let wn = create(ASID_N, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"cd-n");
-    let ww = create(ASID_W, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"cd-w");
-    let wf = create(ASID_F, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"cd-f");
+    let s = &raw const HT_WIDE as usize; // UIMETRICS: the wide surface — the rows are pinned at AT_W, which scales
+    let len = core::mem::size_of_val(&HT_WIDE);
+    let wn = create(ASID_N, s, len, fix_pin_w() as u32, FIX_H as u32, FIX_WIDE_STRIDE as u32, b"cd-n");
+    let ww = create(ASID_W, s, len, fix_pin_w() as u32, FIX_H as u32, FIX_WIDE_STRIDE as u32, b"cd-w");
+    let wf = create(ASID_F, s, len, fix_pin_w() as u32, FIX_H as u32, FIX_WIDE_STRIDE as u32, b"cd-f");
     if wn == WIN_NONE || ww == WIN_NONE || wf == WIN_NONE {
         serial_println!(
             ":: WMCTRL: controls-declined — SKIP (window table full: n={} w={} f={}) ::",
@@ -25873,7 +25873,7 @@ pub fn dmgovlp_selftest() {
     // Outer boxes at scale 1: the fixture pins the scale itself, so these are exact, not layout
     // guesses. All coordinates below are OUTER-BOX coordinates; content origins (what `move_to`
     // takes) are derived at the pin loop.
-    let bw = FIX_W + 2 * BORDER(); // 170 at the shipping theme
+    let bw = fix_pin_w() + 2 * BORDER(); // 170 at the shipping theme (UIMETRICS: 160 + 10 at 1.0; 263 + 26 at 2.5)
     let bh = FIX_H + TITLE_H() + 2 * BORDER(); // 52 at the shipping theme
     let (qx, qy) = (bw / 4, bh / 4);
     let top = work_top(pw, ph);
@@ -25903,12 +25903,12 @@ pub fn dmgovlp_selftest() {
     }
 
     // ---- rows: create, then pin at scale 1, then place --------------------------------------
-    let s = &raw const HT_SURF as usize;
-    let len = core::mem::size_of_val(&HT_SURF);
+    let s = &raw const HT_WIDE as usize; // UIMETRICS: pinned at scale 1, so the width is fix_pin_w() on the wide surface
+    let len = core::mem::size_of_val(&HT_WIDE);
     let mut w = [WIN_NONE; 6];
     let titles: [&[u8]; 6] = [b"ov0", b"ov1", b"ov2", b"ov3", b"ov4", b"ov5"];
     for i in 0..6 {
-        w[i] = create(OWNERS[i], s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, titles[i]);
+        w[i] = create(OWNERS[i], s, len, fix_pin_w() as u32, FIX_H as u32, FIX_WIDE_STRIDE as u32, titles[i]);
     }
     if w.iter().any(|&id| id == WIN_NONE) {
         serial_println!(
@@ -30138,6 +30138,18 @@ pub fn spawn_geometry_native(w: usize, h: usize) -> Option<(usize, usize, usize)
     Some((1, w.saturating_add(2 * BORDER()), h.saturating_add(TITLE_H() + 2 * BORDER())))
 }
 
+/// UIMETRICS (seat, B372): Facet's window scale IS its image zoom — a magnified Facet row is content, not furniture,
+/// and is not counted in `magnified=`.
+fn uimetrics_zoom_owner(owner: u64) -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    #[cfg(feature = "facet")]
+    if owner == super::facet::OWNER {
+        return true;
+    }
+    let _ = owner;
+    false
+}
+
 /// UIMETRICS: `tests metrics`' census of the live table — `(kernel rows magnified, native rows, live rows)`. A
 /// kernel row is one whose owner is in the kernel band or the login/installer owner `0`; magnified = drawn at
 /// window scale > 1 (compat rows excluded: they are the legacy full-panel present).
@@ -30151,9 +30163,28 @@ pub fn uimetrics_census() -> (usize, usize, usize) {
         live += 1;
         if native_slot(i) {
             nat += 1;
-        } else if (is_kernel_owner(r.owner_asid) || r.owner_asid == 0) && r.scale > 1 {
+        } else if (is_kernel_owner(r.owner_asid) || r.owner_asid == 0) && r.scale > 1 && !uimetrics_zoom_owner(r.owner_asid) {
             mag += 1;
         }
     }
     (mag, nat, live)
+}
+
+
+// UIMETRICS (B372, the seat's item 3) — the surface for the two fixtures that PIN their rows at scale 1
+// (CTRLDECLINE pins `r.w` at the cluster floor, DMGOVLP lays boxes out at scale 1). The floor scales with the
+// panel's dpi, so their row width is `fix_pin_w()` — `FIX_W` at 1.0 (byte-identical to before), the floor
+// itself at a larger scale (263 at 2.5) — on a surface wide enough for the floor at EVERY scale (proof below).
+#[cfg(feature = "witness")]
+pub const FIX_WIDE_W: usize = 448;
+#[cfg(feature = "witness")]
+pub const FIX_WIDE_STRIDE: usize = FIX_WIDE_W * 4;
+#[cfg(feature = "witness")]
+static HT_WIDE: [u32; FIX_WIDE_W * FIX_H] = [0x0020_C080; FIX_WIDE_W * FIX_H];
+#[cfg(feature = "witness")]
+const _: () = { let m = crate::ui::Metrics::at(crate::video::dpi::S2_MAX, 0); assert!(FIX_WIDE_W >= 5 * m.gap + 3 * m.ctrl_box + m.chrome_cw && FIX_WIDE_W >= FIX_W); };
+/// The width a scale-pinned fixture row uses: `FIX_W`, or the cluster floor when the dpi scale has raised it past.
+#[cfg(feature = "witness")]
+fn fix_pin_w() -> usize {
+    FIX_W.max(CLUSTER_MIN_SRC_W())
 }

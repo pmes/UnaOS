@@ -15,8 +15,10 @@ viewers) lay out on the 7x16 cell at a few hundred px and are blown up by the co
 
 **The seam.** `Kernel — wm` (the window manager's own geometry; no handler owns it). ONE runtime table,
 `ui::Metrics`, is a pure function of `video::dpi`'s latched scale (x2, 1.0..=4.0) and the theme's base numbers
-(the crispy kit's `metrics.*` and Peter's 24-px disc, read as 96-ppi CSS px — R85 (11) "the theme scales by
-DPI"; at 1.0 every length is the const it replaced, byte for byte). Every furniture
+(the crispy kit's `metrics.*`, read as 96-ppi CSS px — R85 (11) "the theme scales by DPI"; at 1.0 every length is the
+const it replaced, byte for byte, except the control disc: the seat on B372 put its base at the kit's 12 — Peter's 24 of
+2026-08-09 was the kit's 12 at a 2x panel in device px, which the dpi scale now supplies — and gave the menu bar's
+battery and crystal their own 24-px base so they keep their size). Every furniture
 length is `dpi::px_at(base, s2)`. The former `const`s keep their names as zero-argument `fn`s returning the
 Metrics field (same line, same token plus `()`: every fold stays line-neutral); the `const` assertions become
 (a) a compile-time proof over EVERY scale 1.0..=4.0 (`Metrics::at` is a `const fn`, the theme's relations are
@@ -49,7 +51,7 @@ check, the `[ui] metrics` witness, the native-window helpers, `tests metrics`.
 - **M4 doc** (this file's results).
 
 **Witness (metal).** On the first desktop service pass `[ui] metrics ppi=221 scale=2.5 s2=5 bar=85 title=85 frame=13
-gap=30 disc=60 chrome=23x50 cell=18x40 glyph=2 win=1300x1120 consts=0 asserts=ok`; `tests metrics` as above.
+gap=30 disc=30 chrome=23x50 cell=18x40 glyph=2 win=1300x1120 consts=0 asserts=ok`; `tests metrics` as above.
 
 **Stays owed (named before the build).** Ring-3 windows that would rather draw at scale 1 have no way to ask yet
 (a `SYS_WIN_CREATE` flag); Lumen (ring 3) keeps the magnify path. Facet / beam / the rast demo keep their own
@@ -71,11 +73,12 @@ surfaces. The metal boot (R78).
 | title strip / menu bar | 34 | 85 | 136 |
 | frame / bevel | 5 / 1 | 13 / 3 | 20 / 4 |
 | gap (strip PAD) | 12 | 30 | 48 |
-| control disc | 24 | 60 | 96 |
+| control disc (base 12, seat) | 24 -> 12 | 30 | 48 |
+| menu-bar battery / crystal (own base 24) | 24 | 60 | 96 |
 | chrome cell | 9x20 | 23x50 | 36x80 |
 | console / window grid cell | 7x16 | 18x40 | 28x64 |
 | dock tile height | 28 | 70 | 112 |
-| cluster floor (`CLUSTER_MIN_SRC_W`) | 141 | 353 | 564 (fixture `FIX_W` 160 -> 576) |
+| cluster floor (`CLUSTER_MIN_SRC_W`) | 141 -> 105 | 263 | 420 (fixture `FIX_W` stays 160; the scale-pinning fixtures use `HT_WIDE`, 448) |
 | Settings / login / Activity surface | 520x448 / 440x240 / 560x480 (magnified 2x..3x) | 1300x1120 / 1100x600 / 1400x1200 at scale 1 | — |
 | integer glyph scale (`Metrics::scale`, was `height/900`) | 1 | 2 (as 1800/900) | 4 |
 
@@ -90,9 +93,9 @@ surfaces. The metal boot (R78).
 
 ### The wire a metal boot should print
 
-On the first desktop service pass: `[ui] metrics ppi=221 scale=2.5 s2=5 bar=85 title=85 frame=13 gap=30 disc=60
+On the first desktop service pass: `[ui] metrics ppi=221 scale=2.5 s2=5 bar=85 title=85 frame=13 gap=30 disc=30
 chrome=23x50 cell=18x40 glyph=2 win=1300x1120 consts=0 asserts=ok`. `tests metrics`:
-`[ui] metrics fixture latched=true check=ok native=<n> live=<n> chrome=23x50 win=1300x1120 disc=60 gap=30 frame=13` then
+`[ui] metrics fixture latched=true check=ok native=<n> live=<n> chrome=23x50 win=1300x1120 disc=30 gap=30 frame=13` then
 `:: UIMETRICS: ppi=221 scale=2.5 bar=85 title=85 cell=18x40 magnified=0 consts=0 -> PASS ::`. A Settings › Display
 font size `+` -> `[kfont] restyle … font_size=14 …` and `[kfont] regrid console cell=19x44 grid=<c>x<r> was=<c>x<r>`.
 `[settings] open`, `[quarry] open … face=dejavu-mono|dejavu-sans cell=…` with `box=` the surface plus 2x13 / 85+2x13.
@@ -101,13 +104,36 @@ font size `+` -> `[kfont] restyle … font_size=14 …` and `[kfont] regrid cons
 
 1. **Ring-3 windows cannot ask for scale 1** (a `SYS_WIN_CREATE` flag): Lumen and every ring-3 app keep the magnify
    path, which is the row's rule (the magnify path for ring-3 windows that ask — a small surface is the ask).
-2. **Facet** (the image viewer, a kernel row) keeps the magnify path — its surface IS the image and the window scale
-   is its zoom; `tests metrics` counts it in `magnified=` if a Facet window is open when it runs.
+2. **Facet** (the image viewer, a kernel row) keeps the magnify path — the seat: its window scale IS its image zoom —
+   and `wm::uimetrics_census` does not count a Facet row in `magnified=`.
 3. The console window (fbcon) and the shell window (main.rs) were already scale 1 (panel-sized surfaces) and are not
    flagged native (no line in fbcon's mint or main.rs moved); `fbcon::regrid` re-derives the console's grid on its
    existing surface.
 4. Painter literals: the logical painters (settings, activity, login, instgui) scale every literal by construction;
    the physical ones (fileview, textedit, quarry, pulsewin) scale their named consts and the literals found in review
    (pads, caret, thumb); a stray 1-px keyline stays 1 device px by design.
-5. The metal boot (R78): the goldens re-bless at pin 2; `FIX_W` 576 moves every fixture surface that used 160 (the
-   control-cluster fixtures, WMD / winsnap / hit-test rows), whose QEMU-panel expectations were not re-run (R78).
+5. The metal boot (R78): the goldens re-bless at pin 2.
+
+## Seat follow-up (B372 answers, rides boot 25)
+
+1. **Disc base 12** (`ui::base::CONTROL_BOX`): 12 / 30 / 48 px at 1.0 / 2.5 / 4.0. The menu bar's battery body and crystal
+   read their own `ui::base::BATTERY_BOX` / `CRYSTAL_BOX` (24), so they keep their size; every relation the ignition
+   checks still holds at s2 2..=8 (bolt 20+2 <= body 30 at 2.5; crystal 55 + 2x3 <= bar 85; the `Metrics::check` proof).
+2. **Facet excluded** from `magnified=` (`wm::uimetrics_zoom_owner`, Facet's `OWNER`, cfg `facet`).
+3. **The fixtures, re-run host side at FIX_W 576** — `docs/dev/evidence/rmbp-1005/uimetrics/fixmodel.py` (`python3` it), a Python model of `place_scale` /
+   `min_width_scale` / `zoom_scale` / `move_to`'s clamp / each fixture's own validity predicate, with the menu bar on
+   and the dock reserve below, on 640x480, 1280x800, 1920x1200 at 1.0, 1440x900 at 1.5 and 2880x1800, 2560x1600 at 2.5:
+
+   | fixture | at FIX_W 576 | at FIX_W 160 + `HT_WIDE` (shipped) |
+   |---|---|---|
+   | WMD (`[wm-act] direct`, syscall.rs) | holds everywhere (box 586 at 1.0, 1178 at 2.5; the +24 drag still moves the row) | holds everywhere, identical to the pre-UIMETRICS tree at 1.0 (box 330 / 650) |
+   | WINSNAP | **moves: FAILS on 640x480** — the half/quarter zones are 320 px wide and a 586-px box cannot fit one | holds everywhere (zoom_scale picks a fitting scale; 1306-px box at 2.5 in a 1440 zone) |
+   | hit-test (`ht-x`, `ht-a`/`ht-b`, CLOSE-BOX legs 9/10/11) | rows place and carry a cluster everywhere | same, unchanged at 1.0 |
+   | CTRLDECLINE (pins `r.w` at the floor, scale 1) | AT_W 263 / 420 inside the surface | AT_W on `HT_WIDE` (448 >= 420 at 4.0, compile-time proof); rows minted at `fix_pin_w()` = 160 at 1.0, 263 at 2.5 |
+   | DMGOVLP (pins scale 1, lays 6 boxes) | **moves: SKIPs on 640x480, 1280x800 and 1440x900** (needs 1755 px of width) | runs everywhere: `bw = fix_pin_w() + 2*BORDER` = 170 at 1.0 (the doc's own number), 289 at 2.5 |
+
+   So 576 was not adopted: `FIX_W` stays 160 (cluster floor at 1.0 is 105, compile-time proof), an unpinned fixture
+   row at a larger scale is floored by `min_width_scale` like any row (scale 8 at 2.5 on 2880), and only the two fixtures
+   that PIN scale 1 take the floor's width, on the new wide surface (`FIX_WIDE_W` 448, `HT_WIDE`, `fix_pin_w()`, wm.rs
+   tail). Nothing a fixture asserts moved at 1.0; at 2.5 the only changed numbers are DMGOVLP's box (289) and
+   CTRLDECLINE's pinned widths (262 / 263).

@@ -373,7 +373,7 @@ pub const GLOSS_BOTTOM_ALPHA_Q16: u32 = 0;
 /// `TITLE_HEIGHT` to ~44 (clearance 10) or ~48 (clearance 12) is the fix, and it is a **taste-gate
 /// question** — it changes every window's proportions and the caption's centring — so it is put on
 /// the record here and NOT taken by this arc. The const-assert below still holds with room.
-#[allow(non_snake_case)] #[inline] pub fn CONTROL_BOX() -> usize { crate::ui::px(crate::ui::base::CONTROL_BOX) } // UIMETRICS: was `const` 24 (the base; x the dpi scale)
+#[allow(non_snake_case)] #[inline] pub fn CONTROL_BOX() -> usize { crate::ui::px(crate::ui::base::CONTROL_BOX) } // UIMETRICS: was `const` 24 (the kit's 12 at 2x); the kit's 12 x the dpi scale now (seat, B372)
 
 /// Radius of a circular title-bar control, px — `CONTROL_BOX / 2`, derived here rather
 /// than lifted, because the json expresses the control's size only as `control_box`.

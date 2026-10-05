@@ -43,8 +43,9 @@ pub const SCALE_MAX: usize = 4;
 /// crispy kit's `metrics.*` read as 96-ppi CSS px. Every furniture length on the glass is one of these
 /// times `video::dpi`'s scale (`dpi::px_at`, rounded up to the whole pixel). This table is the ONLY place
 /// a furniture pixel count is written; `theme`, `wm`, `menubar`, `dock`, `crystal`, `strip` and `winmenu`
-/// read [`Metrics`]. At scale 1.0 every length is the `const` it replaced, byte for byte (no EDID, QEMU, a
-/// 96-ppi panel: the desktop is exactly what it was); at 2.5 (the 221-ppi bench) each is 2.5x.
+/// read [`Metrics`]. At scale 1.0 every length is the `const` it replaced, byte for byte, EXCEPT the control
+/// disc (the seat, B372: the 24 was the kit's 12 at 2x in device px — the dpi scale now does that 2x, so the
+/// base is the kit's 12: 30 px at 2.5); the battery and the crystal keep their own 24 so they keep their size.
 pub mod base {
     /// `metrics.frame` — frame thickness.
     pub const FRAME: usize = 5;
@@ -66,10 +67,13 @@ pub mod base {
     pub const BUTTON_PAD_X: usize = 18;
     /// `metrics.gap` — the standard gap between controls (and the strips' `PAD`).
     pub const GAP: usize = 12;
-    /// The title-bar disc's DIAMETER — Peter's 24 (2026-08-09, "window buttons are very small"), kept as the
-    /// base so every proportion at 1.0 is unchanged (the battery and the crystal are sized off it too). Read
-    /// against the ruling it was 12 pt at 2x; at 2.5 it is 60 px — a taste question named in UIMETRICS.md.
-    pub const CONTROL_BOX: usize = 24;
+    /// `metrics.control_box` — the title-bar disc's DIAMETER: the kit's 12 (the seat on B372: Peter's 24 of
+    /// 2026-08-09 was the kit's 12 at a 2x panel in device px, and the dpi scale now supplies the 2x — 30 px at 2.5).
+    pub const CONTROL_BOX: usize = 12;
+    /// The menu bar's BATTERY body width (height is half) — the 24 it had when it was sized off the disc, kept.
+    pub const BATTERY_BOX: usize = 24;
+    /// The menu bar's CRYSTAL footprint — the 24 it had when it was sized off the disc, kept.
+    pub const CRYSTAL_BOX: usize = 24;
     /// `metrics.text_px` — nominal text size.
     pub const TEXT_PX: usize = 15;
     /// The default size of a kernel window's content (Settings' 520x448 logical box).

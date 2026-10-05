@@ -223,10 +223,10 @@ const TITLE_GLYPHS: usize = wm::MAX_TITLE;
 /// The battery cell's body width, px — [`theme::CONTROL_BOX`], so the item reads as the same
 /// size-family as the crystal and the window controls. No new metric is invented; the kit's one
 /// control dimension is the source for all three.
-#[allow(non_snake_case)] #[inline] fn BATT_BODY_W() -> usize { theme::CONTROL_BOX() }
+#[allow(non_snake_case)] #[inline] fn BATT_BODY_W() -> usize { crate::ui::px(crate::ui::base::BATTERY_BOX) }
 /// The cell's body height, px — half the control box. A battery reads WIDER than tall, which is
 /// [`CRYSTAL_W`]'s proportion rule applied to a lying-down shape.
-#[allow(non_snake_case)] #[inline] fn BATT_BODY_H() -> usize { theme::CONTROL_BOX() / 2 }
+#[allow(non_snake_case)] #[inline] fn BATT_BODY_H() -> usize { BATT_BODY_W() / 2 }
 /// The positive terminal's nub, px — the columns past the body's right edge that make the outline
 /// read as a battery rather than as a progress bar.
 #[allow(non_snake_case)] #[inline] fn BATT_CAP_W() -> usize { crate::ui::px(2) }
@@ -281,11 +281,11 @@ const BOLT: [u8; 8] = [
 /// so the brand mark and the window's traffic-light controls read as one size family. `-2` gives the
 /// gem a touch more clearance in the bar than the disc has in a title bar (the disc's is the "tight"
 /// 5 px `theme.rs` flags; the crystal's is 6).
-#[allow(non_snake_case)] #[inline] fn CRYSTAL_H() -> usize { theme::CONTROL_BOX() - crate::ui::px(2) }
+#[allow(non_snake_case)] #[inline] fn CRYSTAL_H() -> usize { crate::ui::px(crate::ui::base::CRYSTAL_BOX) - crate::ui::px(2) }
 
 /// The crystal's width, px — two-thirds of the control-disc diameter. A gem reads TALLER than wide, so
 /// the mark is narrower than the round controls at the same height family; `2/3` of 24 is 16.
-#[allow(non_snake_case)] #[inline] fn CRYSTAL_W() -> usize { theme::CONTROL_BOX() * 2 / 3 }
+#[allow(non_snake_case)] #[inline] fn CRYSTAL_W() -> usize { crate::ui::px(crate::ui::base::CRYSTAL_BOX) * 2 / 3 }
 
 /// The crown's height, px — the upper region above the girdle, drawn as the two bright table facets;
 /// the pavilion (the rest) tapers to the point. Two-fifths, the classic brilliant-cut proportion.
