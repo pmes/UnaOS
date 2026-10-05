@@ -73,9 +73,18 @@ fn style_on(style: u8, w: f32, along: f32, across: f32, len: f32) -> bool {
     match style {
         1 => fit(2.0 * w, w),
         2 => {
-            let n = ((len + w) / (2.0 * w)).round().max(1.0);
-            let period = (len + w) / n;
-            along.rem_euclid(period) < w
+            // Blink's dotted side, measured on EYES (14-boxes, 3px): the corner
+            // squares are solid and each extends one pixel into the side; the
+            // side between them runs gap, dot, gap, dot... (each w), a dot that
+            // would not fit before the far corner is dropped (its room joins
+            // the last gap).
+            let a = along.floor();
+            if a < w + 1.0 || a >= len - w - 1.0 {
+                return true;
+            }
+            let k = a - (w + 1.0);
+            let kk = k.rem_euclid(2.0 * w);
+            kk >= w && (k - (kk - w)) + w <= len - 2.0 * w - 2.0
         }
         3 => {
             let t = (w / 3.0).max(1.0);
@@ -180,10 +189,12 @@ mod tests {
     /// Chromium's mark distribution: a side starts and ends on a mark.
     #[test]
     fn dash_and_dot_fit_kat() {
-        // 3px dotted over 45px: n = round(48/6) = 8, period 6.
-        assert!(style_on(2, 3.0, 0.5, 1.0, 45.0));
-        assert!(!style_on(2, 3.0, 3.5, 1.0, 45.0));
-        assert!(style_on(2, 3.0, 44.5, 1.0, 45.0), "ends on a dot");
+        // 3px dotted over a 48px side, as Chromium paints 14-boxes' left side:
+        // marks 0-3, 7-9, 13-15 ... 37-39, gap 40-43, mark 44-47.
+        let on: Vec<bool> = (0..48).map(|a| style_on(2, 3.0, a as f32 + 0.5, 1.0, 48.0)).collect();
+        let marks: Vec<usize> = (0..48).filter(|&a| on[a]).collect();
+        assert_eq!(&marks[..7], &[0, 1, 2, 3, 7, 8, 9]);
+        assert!(on[37] && on[39] && !on[40] && !on[43] && on[44] && on[47]);
         // 3px dashed: dash 6, gap 3.
         assert!(style_on(1, 3.0, 5.5, 1.0, 744.0));
         assert!(!style_on(1, 3.0, 7.0, 1.0, 744.0));
