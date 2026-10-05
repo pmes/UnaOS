@@ -703,7 +703,7 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
                 match a.trim().to_ascii_lowercase().as_str() {
                     "center" | "middle" => paint.text_align = Some(1),
                     "right" => paint.text_align = Some(2),
-                    "left" => paint.text_align = Some(0),
+                    "left" => paint.text_align = Some(4),
                     _ => {}
                 }
             }
@@ -1039,7 +1039,7 @@ fn propagate_text_align(tree: &mut LayoutTree) {
             .get(&id)
             .and_then(|p| p.text_align)
             .or(inherited);
-        if let Some(align) = effective.filter(|&a| a != 0) {
+        if let Some(align) = effective.filter(|&a| a != 0 && a != 4) {
             if let Ok(st) = tree.taffy.style(id) {
                 let mut st = st.clone();
                 let row = matches!(

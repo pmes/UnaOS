@@ -554,15 +554,18 @@ pub struct DecoMetrics {
     pub thickness: f32,
 }
 
-/// css-text-decor-3 §2 with the face's `post` metrics as Blink uses them (`text-decoration-thickness:
-/// auto` and `text-underline-position: auto`): see the M3 calibration in AETHERFONT.md.
+/// css-text-decor-3/4 §2–3 as Blink paints `text-decoration-thickness: auto` and `text-underline-position:
+/// auto` (measured against Chromium on 6 faces × 12 sizes, AETHERFONT.md "decorations"): the thickness is
+/// max(1, size/10) — the face's `post` underline metrics are not consulted — painted as whole rows (floor);
+/// the underline's top sits max(1, ⌈thickness/2⌉) below the baseline; the line-through's top is
+/// round(−ascent/3 − thickness/2) from the baseline, with the ascent in whole pixels.
 pub fn decoration_metrics(face: &Face, size: f32) -> DecoMetrics {
-    let m = face.metrics();
-    let scale = size / m.units_per_em as f32;
-    let thickness = if m.underline_thickness > 0.0 { (m.underline_thickness * scale).round().max(1.0) } else { (size / 16.0).round().max(1.0) };
-    let underline_offset = (size / 9.0).max(1.0).round();
-    let (a, _, _) = line_metrics(face, size);
-    DecoMetrics { underline_offset, line_through_offset: (a * 0.3).round(), thickness }
+    let th = (size / 10.0).max(1.0);
+    let thickness = th.floor().max(1.0);
+    let underline_offset = (th / 2.0).ceil().max(1.0);
+    let (asc, _, _) = line_metrics(face, size);
+    let lt_top = (-(asc / 3.0) - th / 2.0 + 0.5).floor();
+    DecoMetrics { underline_offset, line_through_offset: -lt_top, thickness }
 }
 
 /// Advance of U+0020 in px (its advance in the face).
@@ -573,6 +576,23 @@ pub fn space_advance(font: &Face, size: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chromium's decoration rows (measured; AETHERFONT.md): Liberation Sans 16/28/48 px.
+    #[test]
+    fn decoration_metrics_kat() {
+        let Some(f) = face(&FontSel::new(SANS, 400, false)) else { return };
+        if f.family != "Liberation Sans" {
+            return;
+        }
+        let m = |s: f32| {
+            let d = decoration_metrics(f, s);
+            (d.underline_offset, d.thickness, -d.line_through_offset)
+        };
+        assert_eq!(m(16.0), (1.0, 1.0, -5.0));
+        assert_eq!(m(28.0), (2.0, 2.0, -10.0));
+        assert_eq!(m(48.0), (3.0, 4.0, -17.0));
+        assert_eq!(m(10.0), (1.0, 1.0, -3.0));
+    }
 
     #[test]
     fn family_list_parse_and_serialize_kat() {

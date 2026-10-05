@@ -1,59 +1,59 @@
 {
   "cases": {
     "01-blog-article": {
-      "mismatch": 1.98,
+      "mismatch": 1.11,
       "missing": 0,
-      "ssim": 0.9773
+      "ssim": 0.9939
     },
     "02-flex-two-column": {
-      "mismatch": 0.76,
+      "mismatch": 0.28,
       "missing": 0,
-      "ssim": 0.9915
+      "ssim": 0.9989
     },
     "03-card-gallery": {
-      "mismatch": 0.26,
+      "mismatch": 0.16,
+      "missing": 0,
+      "ssim": 0.9988
+    },
+    "04-sticky-nav": {
+      "mismatch": 1.17,
+      "missing": 0,
+      "ssim": 0.9931
+    },
+    "05-form": {
+      "mismatch": 1.01,
+      "missing": 0,
+      "ssim": 0.9546
+    },
+    "06-table-zebra": {
+      "mismatch": 0.69,
+      "missing": 0,
+      "ssim": 0.9941
+    },
+    "07-images-svg": {
+      "mismatch": 2.95,
+      "missing": 0,
+      "ssim": 0.9395
+    },
+    "08-inline-wrap": {
+      "mismatch": 1.2,
+      "missing": 0,
+      "ssim": 0.9946
+    },
+    "09-media-queries": {
+      "mismatch": 0.44,
       "missing": 0,
       "ssim": 0.9978
     },
-    "04-sticky-nav": {
-      "mismatch": 1.38,
-      "missing": 0,
-      "ssim": 0.99
-    },
-    "05-form": {
-      "mismatch": 1.0,
-      "missing": 0,
-      "ssim": 0.9544
-    },
-    "06-table-zebra": {
-      "mismatch": 0.7,
-      "missing": 0,
-      "ssim": 0.9937
-    },
-    "07-images-svg": {
-      "mismatch": 3.04,
-      "missing": 0,
-      "ssim": 0.9364
-    },
-    "08-inline-wrap": {
-      "mismatch": 1.26,
-      "missing": 0,
-      "ssim": 0.9904
-    },
-    "09-media-queries": {
-      "mismatch": 0.53,
-      "missing": 0,
-      "ssim": 0.9948
-    },
     "09-media-queries@375": {
-      "mismatch": 0.56,
+      "mismatch": 0.4,
       "missing": 0,
-      "ssim": 0.9924
+      "ssim": 0.9977
     },
     "10-calc-clamp": {
       "mismatch": 0.13,
       "missing": 0,
-      "ssim": 0.9989
+      "ssim": 0.9987
     },
     "10-calc-clamp@375": {
       "mismatch": 0.38,
@@ -61,59 +61,64 @@
       "ssim": 0.9986
     },
     "11-non-latin": {
-      "mismatch": 1.69,
+      "mismatch": 0.85,
       "missing": 0,
-      "ssim": 0.9727
+      "ssim": 0.9904
     },
     "12-js-mutation": {
       "mismatch": 0.27,
       "missing": 0,
-      "ssim": 0.9966
+      "ssim": 0.9965
     },
     "13-ua-defaults": {
-      "mismatch": 0.61,
+      "mismatch": 0.44,
       "missing": 0,
-      "ssim": 0.9917
+      "ssim": 0.9969
     },
     "14-boxes": {
-      "mismatch": 0.82,
+      "mismatch": 0.79,
       "missing": 0,
       "ssim": 0.9773
     },
     "15-landing": {
-      "mismatch": 0.95,
+      "mismatch": 0.79,
       "missing": 0,
-      "ssim": 0.9937
+      "ssim": 0.9957
     },
     "16-positioned": {
-      "mismatch": 0.16,
+      "mismatch": 0.17,
       "missing": 0,
-      "ssim": 0.9989
+      "ssim": 0.9988
     },
     "17-inline-continue": {
-      "mismatch": 1.89,
+      "mismatch": 1.7,
       "missing": 0,
-      "ssim": 0.9901
+      "ssim": 0.9925
     },
     "18-stacking": {
       "mismatch": 0.18,
       "missing": 0,
-      "ssim": 0.9988
+      "ssim": 0.999
     },
     "19-em-units": {
-      "mismatch": 0.39,
+      "mismatch": 0.3,
       "missing": 0,
-      "ssim": 0.995
+      "ssim": 0.9988
     },
     "20-table-spans": {
-      "mismatch": 0.73,
+      "mismatch": 0.74,
       "missing": 0,
-      "ssim": 0.9903
+      "ssim": 0.9906
     },
     "21-paint-effects": {
       "mismatch": 0.01,
       "missing": 0,
       "ssim": 0.9996
+    },
+    "22-fonts": {
+      "mismatch": 1.22,
+      "missing": 0,
+      "ssim": 0.9919
     }
   },
   "thresholds": {

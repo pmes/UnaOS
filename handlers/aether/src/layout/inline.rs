@@ -206,6 +206,36 @@ fn metrics(run: &TextRun) -> Metrics {
 }
 
 /// The text mode a run breaks with (`nowrap` folded into white-space).
+/// A text fragment's line-box contribution (CSS 2.2 §10.8.1 with Blink's `line-height: normal` rule,
+/// `NGInlineBoxState::AccumulateUsedFonts`): under `normal`, every face the fragment's glyphs were shaped with
+/// contributes its own ascent and descent, each with half its line gap, and the box takes the union — so a
+/// CJK or Hebrew fallback face makes the line as tall as Chromium makes it.
+fn text_metrics(run: &TextRun, text: &str) -> Metrics {
+    let m = metrics(run);
+    if run.line_height != 0.0 || text.trim().is_empty() {
+        return m;
+    }
+    let Some(primary) = crate::fonts::face(&run.sel()) else { return m };
+    let shaped = run.advancer().shape(text);
+    let mut seen: Vec<u32> = vec![primary.id];
+    let (_, _, g0) = crate::fonts::line_metrics(primary, run.font_size);
+    let mut up = m.a + (g0 / 2.0).floor();
+    let mut down = m.d + (g0 - (g0 / 2.0).floor());
+    for g in &shaped.glyphs {
+        if seen.contains(&g.face.id) {
+            continue;
+        }
+        seen.push(g.face.id);
+        let (a, d, gap) = crate::fonts::line_metrics(g.face, run.font_size);
+        up = up.max(a + (gap / 2.0).floor());
+        down = down.max(d + (gap - (gap / 2.0).floor()));
+    }
+    if seen.len() == 1 {
+        return m;
+    }
+    Metrics { lh: up + down, off: up, ..m }
+}
+
 fn mode_of(run: &TextRun) -> crate::fonts::lines::TextMode {
     let mut m = run.mode;
     if run.nowrap && m.white_space == 0 {
@@ -301,7 +331,12 @@ pub(super) fn layout_root(tree: &LayoutTree, ctx: &Ctx, root: NodeId) -> InlineL
     let mut cur_x = 0.0f32;
     let mut has_content = false;
     let mut forced = false;
-    let align = root_run.text_align;
+    // css-text-3 §6.1: start/end resolve against the paragraph direction → 0 left, 1 center, 2 right.
+    let align = match (root_run.text_align, root_run.mode.rtl) {
+        (1, _) => 1,
+        (2, _) | (0, true) | (3, false) => 2,
+        _ => 0,
+    };
 
     let edges = |floats: &[Float], y: f32| -> (f32, f32) {
         let mut l = 0.0f32;
@@ -380,8 +415,8 @@ pub(super) fn layout_root(tree: &LayoutTree, ctx: &Ctx, root: NodeId) -> InlineL
         }
         for p in &pcs {
             match p {
-                Piece::Text { node, parent, .. } => {
-                    let m = metrics(run_of(ctx, *node, default_run));
+                Piece::Text { node, parent, text, .. } => {
+                    let m = text_metrics(run_of(ctx, *node, default_run), text);
                     let s = shift.get(parent).copied().unwrap_or(0.0);
                     top = top.min(s - m.off);
                     bottom = bottom.max(s + m.lh - m.off);

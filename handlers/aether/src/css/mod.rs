@@ -396,11 +396,21 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 style.justify = Some(taffy::style::JustifyContent::CENTER);
                 style.paint.text_align = Some(1);
             }
-            "right" | "end" => {
+            // codes: 0 start, 1 center, 2 right, 3 end, 4 left — start/end resolve against `direction`
+            // (css-text-3 §6.1) where lines are placed (layout::inline).
+            "right" => {
                 style.justify = Some(taffy::style::JustifyContent::END);
                 style.paint.text_align = Some(2);
             }
-            "left" | "start" | "justify" => {
+            "end" => {
+                style.justify = Some(taffy::style::JustifyContent::END);
+                style.paint.text_align = Some(3);
+            }
+            "left" => {
+                style.justify = Some(taffy::style::JustifyContent::START);
+                style.paint.text_align = Some(4);
+            }
+            "start" | "justify" => {
                 style.justify = Some(taffy::style::JustifyContent::START);
                 style.paint.text_align = Some(0);
             }
@@ -1640,7 +1650,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 if me.italic { "italic" } else { "normal" }.to_string(),
                 crate::fonts::serialize_family_list(&crate::fonts::family_list(me.family)),
                 lh,
-                match me.text_align { 1 => "center", 2 => "right", _ => "start" }.to_string(),
+                match me.text_align { 1 => "center", 2 => "right", 3 => "end", 4 => "left", _ => "start" }.to_string(),
                 if me.underline { "underline" } else { "none" }.to_string(),
                 if me.nowrap { "nowrap" } else { "normal" }.to_string(),
                 if me.hidden { "hidden" } else { "visible" }.to_string(),

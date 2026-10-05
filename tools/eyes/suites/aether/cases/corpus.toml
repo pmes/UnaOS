@@ -95,3 +95,7 @@ page = "corpus/20-table-spans.html"
 [[case]]
 name = "21-paint-effects"
 page = "corpus/21-paint-effects.html"
+
+[[case]]
+name = "22-fonts"
+page = "corpus/22-fonts.html"
