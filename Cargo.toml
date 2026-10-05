@@ -31,6 +31,9 @@ members = [
     # HTMLCORE (SR46): the no_std WHATWG HTML parser + arena DOM + serializer (Aether swaps kuchiki for it later).
     "unaos/libs/web/html_core",
 
+    # CSSCORE (SR47): CSS Syntax 3 + Selectors 4 + the cascade helpers, no_std, zero deps.
+    "unaos/libs/web/css_core",
+
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",
