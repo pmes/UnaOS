@@ -60,7 +60,7 @@
 //! one.
 
 use spin::relax::Spin as SpinRelax;
-use spin::{Mutex, MutexGuard};
+use spin::{Mutex, MutexGuard}; use super::rowstore::{SegVec, SlotBits}; // WINDOWCAP-2: per-row side storage
 
 /// WC-A — the window table is fixed-size and statically allocated: the compositor runs from syscall
 /// context on a non-coherent scan-out path where a heap allocation (or a growable table) would be
@@ -81,7 +81,7 @@ use spin::{Mutex, MutexGuard};
 /// rows and moves no behaviour. The cost is the table itself and the fixed-size scratch arrays sized
 /// from it (`[Window; 12]` plus a handful of `[(usize,usize,usize,usize); 12]` stack scratches) —
 /// every one of them parametric, and every sweep already a bounded `0..MAX_WINDOWS` scan.
-pub const MAX_WINDOWS: usize = 32; // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold. 12 -> 32: no longer a policy cap; this is the ID SPACE (the width of the per-slot `u32` masks, asserted below at PACE_PENDING) and the live limit on app rows is `video::wincap::win_limit()` (mem/dock/ids, derived at boot). The two full-table stack copies moved to `RowsSnap` (file tail) so 16 KiB stacks do not pay 32 rows twice.
+// WINDOWCAP-2 (B378, R90 "no hardcoding!!!") — `MAX_WINDOWS` IS GONE. The table is a heap `Vec` grown on demand (ids = slot + 1 from a free-list-first allocator: the lowest free row, else a new one), every per-row side table is a `rowstore::SegVec`/`SlotBits` (segment-doubling, never moves), and the only limit is `video::wincap::win_limit()`, derived from memory at boot. `slots()` (file tail) is the live row count every former `0..MAX_WINDOWS` scan now walks.
 
 /// WC-A — maximum stored title length in bytes. Titles are kernel-owned byte strings (ASCII, not
 /// NUL-terminated); anything longer is truncated at [`create`] time, so a hostile length can never
@@ -342,13 +342,13 @@ impl Window {
 /// lock before touching the framebuffer, so a present can never hold this lock across a scan-out
 /// cache clean.
 struct Table {
-    rows: [Window; MAX_WINDOWS],
+    rows: alloc::vec::Vec<Window>, // WINDOWCAP-2: grown on demand, never shrunk (a freed row is reused first)
     /// Monotonic z allocator: each create/raise takes the next value, so "created later is in front".
     next_z: u32,
 }
 
 static TABLE: Mutex<Table> = Mutex::new(Table {
-    rows: [Window::empty(); MAX_WINDOWS],
+    rows: alloc::vec::Vec::new(),
     next_z: 1,
 });
 
@@ -558,8 +558,8 @@ pub fn shell_z() -> u32 {
 /// Sized to [`MAX_WINDOWS`] because a token is only ever consumed by a window create, so the table can
 /// hold no more pending owners than the compositor can hold windows. Full is fail-closed: the launch
 /// still happens, it simply does not carry a focus grant.
-static SPAWN_FOCUS: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+static SPAWN_FOCUS: Mutex<alloc::vec::Vec<u64>> = // WINDOWCAP-2: grown on demand (a cell is reused when 0)
+    Mutex::new(alloc::vec::Vec::new());
 
 /// SPAWN-FOCUS — arm `owner`'s one-shot focus token. Called from the arch spawn path, BEFORE the task
 /// can run. Returns whether a slot was taken (`false` = table full, or `owner == 0`).
@@ -576,18 +576,19 @@ pub fn spawn_focus_arm(owner: u64) -> bool {
     }
     // Already armed — nothing to do. Checked before claiming so the common relaunch case does not
     // consume a second cell for an owner that is still waiting for its first window.
-    if SPAWN_FOCUS.iter().any(|c| c.load(Ordering::Acquire) == owner) {
+    let _ = Ordering::Relaxed; let mut t = SPAWN_FOCUS.lock(); // WINDOWCAP-2: a leaf lock over a growable list
+    if t.iter().any(|&c| c == owner) {
         return true;
     }
-    for cell in SPAWN_FOCUS.iter() {
-        if cell
-            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    match t.iter().position(|&c| c == 0) {
+        Some(i) => t[i] = owner,
+        None => t.push(owner),
+    }
+    {
         {
             return true;
         }
     }
-    false
 }
 
 /// SPAWN-FOCUS — CONSUME `owner`'s token: `true` exactly once per arming, `false` ever after.
@@ -601,10 +602,11 @@ pub fn spawn_focus_take(owner: u64) -> bool {
     if owner == 0 {
         return false;
     }
-    SPAWN_FOCUS.iter().any(|cell| {
-        cell.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    })
+    let _ = Ordering::Relaxed; let mut t = SPAWN_FOCUS.lock();
+    match t.iter().position(|&c| c == owner) {
+        Some(i) => { t[i] = 0; true }
+        None => false,
+    }
 }
 
 /// SPAWN-FOCUS — drop `owner`'s token unconsumed, at slot teardown.
@@ -775,7 +777,7 @@ impl AppName {
 /// LOCK ORDER: this mutex is a LEAF. [`create_inner`] resolves the title before it takes `TABLE`,
 /// and nothing under it takes `WRITER`, so it can never participate in the WINDOWS ⊃ TABLE ⊃ WRITER
 /// order the rest of this module keeps.
-static APP_NAMES: Mutex<[AppName; MAX_WINDOWS]> = Mutex::new([AppName::EMPTY; MAX_WINDOWS]);
+static APP_NAMES: Mutex<alloc::vec::Vec<AppName>> = Mutex::new(alloc::vec::Vec::new()); // WINDOWCAP-2: grown on demand
 
 /// WINTITLE — the compositor `owner_asid` for the launch handle the arch spawn entry points return.
 ///
@@ -859,6 +861,7 @@ pub fn app_name_arm(owner: u64, path: &str) -> bool {
         .iter()
         .position(|e| e.owner == owner)
         .or_else(|| t.iter().position(|e| e.owner == 0));
+    let slot = match slot { Some(i) => Some(i), None => { t.push(AppName::EMPTY); Some(t.len() - 1) } }; // WINDOWCAP-2: never full
     let armed = match slot {
         Some(i) => {
             t[i].owner = owner;
@@ -918,12 +921,12 @@ fn app_name_adopt(owner: u64, name: &[u8]) -> usize {
 /// A closed id's cell is left as it was: it is rewritten by the next [`create_inner`] into that slot
 /// — the same "the id demonstrably names something new" point `controls_declined_rearm` and WC-D's
 /// latch use — so no reader can see a dead tenant's provenance under a live one's id.
-static TITLE_SRC: [core::sync::atomic::AtomicU32; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_WINDOWS];
+static TITLE_SRC: SegVec<core::sync::atomic::AtomicU32> = // WINDOWCAP-2: per-row, grown on demand
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WINTITLE-LATE — publish `id`'s title provenance. Called only where `id`'s caption is written.
 fn title_source_store(id: WinId, src: TitleSource) {
-    if let Some(cell) = TITLE_SRC.get((id as usize).wrapping_sub(1)) {
+    if id != WIN_NONE { let cell = TITLE_SRC.get(id as usize - 1);
         cell.store(src.code(), core::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -931,7 +934,7 @@ fn title_source_store(id: WinId, src: TitleSource) {
 /// WINTITLE-LATE — **why window `id` is called what it is called.** Lock-free; see [`TITLE_SRC`].
 /// An id outside `1..=MAX_WINDOWS` (including [`WIN_NONE`]) answers `Unnamed`, the fail-closed value.
 pub fn title_source_of(id: WinId) -> TitleSource {
-    match TITLE_SRC.get((id as usize).wrapping_sub(1)) {
+    match TITLE_SRC.peek((id as usize).wrapping_sub(1)) {
         Some(cell) => TitleSource::from_code(cell.load(core::sync::atomic::Ordering::Relaxed)),
         None => TitleSource::Unnamed,
     }
@@ -1191,8 +1194,8 @@ fn vugmin_publish(asid: u64, hidden: bool, _reason: &'static str) {
 /// it publish the departing owner's hide too, which CLICK-PLAIN removed); this function keeps the
 /// whole-table shape because "the shell took the top, everyone is under it" is genuinely whole-table,
 /// and it is now the ONLY place a hidden bit is ever SET.
-fn vugmin_scan(t: &Table, shell: u32, out: &mut [(u64, bool); MAX_WINDOWS]) -> usize {
-    let mut n = 0usize;
+fn vugmin_scan(t: &Table, shell: u32, out: &mut alloc::vec::Vec<(u64, bool)>) -> usize {
+    let mut n = 0usize; out.clear(); // WINDOWCAP-2: a growable list
     for r in t.rows.iter() {
         if !r.used || r.compat || r.owner_asid == 0 {
             continue;
@@ -1200,7 +1203,7 @@ fn vugmin_scan(t: &Table, shell: u32, out: &mut [(u64, bool); MAX_WINDOWS]) -> u
         if out[..n].iter().any(|&(a, _)| a == r.owner_asid) {
             continue;
         }
-        out[n] = (r.owner_asid, owner_hidden(t, r.owner_asid, shell));
+        out.push((r.owner_asid, owner_hidden(t, r.owner_asid, shell)));
         n += 1;
     }
     n
@@ -1848,18 +1851,17 @@ const PACE_FRAME_US: u64 = 16_667;
 /// (the WCSER ledger measured ~123 ms of loss in one syscall), and a pacer reading a stalled clock
 /// coalesces forever.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-static PACE_LAST_CYC: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+static PACE_LAST_CYC: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// WPACE-PANEL — one bit per slot: a present was coalesced and its damage has not yet been claimed
 /// by a pass this pacer knows about. The idle test [`pace_service`] runs at ~1 kHz is one relaxed
 /// load of this word. Over-set is safe (a drain that finds no damage is one gate probe and out);
 /// under-set is not, which is why the bit is set BEFORE the coalesced present returns.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-static PACE_PENDING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PACE_PENDING: SlotBits = SlotBits::new(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PACE_PENDING_ANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PACE_DUE: SlotBits = SlotBits::new(); // WINDOWCAP-2: the u32 mask became a growable bitset + an "any" word for the 1 kHz idle test; PACE_DUE is `pace_service`'s own (single-context) due set
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
-const _: () = assert!(MAX_WINDOWS <= 32); // PACE_PENDING is one u32 bitmask
+// WINDOWCAP-2: the `MAX_WINDOWS <= 32` tripwire is gone with the mask it guarded.
 
 /// WPACE-PANEL — the panel frame in rdtsc cycles, or `0` while the TSC is uncalibrated (pre-
 /// `apic::calibrate`, i.e. the first ~116 ms of boot), during which the pacer stands aside and
@@ -1888,7 +1890,7 @@ fn pace_admit(id: WinId, exempt: bool) -> bool {
         return true;
     }
     let slot = (id as usize).wrapping_sub(1);
-    if slot >= MAX_WINDOWS {
+    if id == WIN_NONE {
         return true;
     }
     let frame = pace_frame_cycles();
@@ -1896,26 +1898,26 @@ fn pace_admit(id: WinId, exempt: bool) -> bool {
         return true; // TSC uncalibrated: free mode, exactly the pre-pacer path
     }
     let now = crate::arch::now_cycles();
-    let last = PACE_LAST_CYC[slot].load(Relaxed);
+    let last = PACE_LAST_CYC.get(slot).load(Relaxed);
     if last == 0 || now.wrapping_sub(last) >= frame {
-        if PACE_LAST_CYC[slot]
+        if PACE_LAST_CYC.get(slot)
             .compare_exchange(last, now, Relaxed, Relaxed)
             .is_ok()
         {
             // This pass will carry any damage a coalesced present left behind, so the pending bit
             // comes down with it — cleared BEFORE the composite, so a present coalescing on another
             // core DURING our pass re-raises it and is re-drained rather than lost.
-            PACE_PENDING.fetch_and(!(1u32 << slot), Relaxed);
+            PACE_PENDING.clear(slot);
             #[cfg(feature = "witness")]
-            WPACE_PACED[slot].fetch_add(1, Relaxed);
+            WPACE_PACED.get(slot).fetch_add(1, Relaxed);
             return true;
         }
         // Lost the frame-edge race: a concurrent present of this same window claimed the frame and
         // its pass is (or will be) compositing the shared row. Fall through to coalesce.
     }
-    PACE_PENDING.fetch_or(1u32 << slot, Relaxed);
+    PACE_PENDING.set(slot); PACE_PENDING_ANY.store(true, Relaxed);
     #[cfg(feature = "witness")]
-    WPACE_COALESCED[slot].fetch_add(1, Relaxed);
+    WPACE_COALESCED.get(slot).fetch_add(1, Relaxed);
     false
 }
 
@@ -1940,23 +1942,23 @@ fn pace_admit(id: WinId, exempt: bool) -> bool {
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn pace_service() {
     use core::sync::atomic::Ordering::Relaxed;
-    let pend = PACE_PENDING.load(Relaxed);
-    if pend == 0 {
+    if !PACE_PENDING_ANY.swap(false, Relaxed) {
         return;
     }
     let frame = pace_frame_cycles();
     let now = crate::arch::now_cycles();
-    let mut due = 0u32;
-    for slot in 0..MAX_WINDOWS {
-        if pend & (1u32 << slot) == 0 {
+    let (mut due, mut waiting) = (0usize, false);
+    for slot in 0..PACE_PENDING.hwm() {
+        if !PACE_PENDING.test(slot) {
             continue;
         }
         // `frame == 0` (TSC lost calibration — cannot happen after boot, but the honest degraded
         // answer) drains immediately rather than never.
-        if frame == 0 || now.wrapping_sub(PACE_LAST_CYC[slot].load(Relaxed)) >= frame {
-            due |= 1u32 << slot;
-        }
+        if frame == 0 || now.wrapping_sub(PACE_LAST_CYC.get(slot).load(Relaxed)) >= frame {
+            PACE_DUE.set(slot); due += 1;
+        } else { waiting = true; }
     }
+    if waiting { PACE_PENDING_ANY.store(true, Relaxed); } // WINDOWCAP-2: a pending, not-yet-due slot keeps the drain armed
     if due == 0 {
         return; // the frame in flight has not ended; the next pass (~1 ms) re-asks
     }
@@ -1964,12 +1966,12 @@ pub fn pace_service() {
     // another core after this claim re-raises its bit and the NEXT pass drains it — one frame is
     // still one frame. The stamp is advanced too, so a due window that keeps presenting does not
     // double-composite at the drain and the frame edge within the same frame.
-    PACE_PENDING.fetch_and(!due, Relaxed);
-    for slot in 0..MAX_WINDOWS {
-        if due & (1u32 << slot) != 0 {
-            PACE_LAST_CYC[slot].store(now, Relaxed);
+    for slot in 0..PACE_DUE.hwm() {
+        if PACE_DUE.test(slot) {
+            PACE_PENDING.clear(slot);
+            PACE_LAST_CYC.get(slot).store(now, Relaxed);
             #[cfg(feature = "witness")]
-            WPACE_TAIL[slot].fetch_add(1, Relaxed);
+            WPACE_TAIL.get(slot).fetch_add(1, Relaxed);
         }
     }
     // One pass covers every due window: `composite` snapshots ALL damaged rows. A window whose
@@ -1994,14 +1996,14 @@ pub fn pace_service() {
     // One table acquisition at drain rate (≤ 60/s while anything coalesces), no framebuffer access.
     {
         let t = table();
-        let mut rearm = 0u32;
-        for slot in 0..MAX_WINDOWS {
-            if due & (1u32 << slot) != 0 && t.rows[slot].used && t.rows[slot].damaged {
-                rearm |= 1u32 << slot;
+        let mut rearm = false;
+        for slot in 0..PACE_DUE.hwm() {
+            if PACE_DUE.clear(slot) && slot < t.rows.len() && t.rows[slot].used && t.rows[slot].damaged {
+                PACE_PENDING.set(slot); rearm = true;
             }
         }
-        if rearm != 0 {
-            PACE_PENDING.fetch_or(rearm, Relaxed);
+        if rearm {
+            PACE_PENDING_ANY.store(true, Relaxed);
         }
     }
 }
@@ -2045,14 +2047,14 @@ pub fn pace_service() {
 /// WPACE-TEXT — the per-slot shadow buffers. All content access (fill and read) is under the
 /// per-slot lock, so a refresh can never realloc or write a buffer a pass is blitting from.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-static PACE_SHADOW: [Mutex<alloc::vec::Vec<u8>>; MAX_WINDOWS] =
-    [const { Mutex::new(alloc::vec::Vec::new()) }; MAX_WINDOWS]; #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PACE_MIRROR: [Mutex<alloc::vec::Vec<u8>>; MAX_WINDOWS] = [const { Mutex::new(alloc::vec::Vec::new()) }; MAX_WINDOWS]; #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static PACE_MIRROR_OOM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static PACE_PIN_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static PACE_PIN_FREE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static PACE_PIN_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static PACE_WIN_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); // VUGPERF (flight 11, 2026-09-22) — THE PASS'S OWN COPY, AND WHY THE SHADOW ALONE WAS NOT ENOUGH. W5SPIN bounded the REFRESH side at 500 us and flight 11 then spent that bound 1695 times: `[wcser] PRESENT-BANDED SPIN site=2 … -> GAVE-UP` on shadows 6..12 (the seven vugs and nothing else — 386/183/302/450/146/127/101, summing to the 1695 total), each one immediately followed by `site=1 waited_us=0 -> RELEASED`, i.e. the band update waited the WHOLE budget, gave up, cleared the validity bit, and the next present re-created the shadow with a full-extent refill. The bound was not too small; the critical section was too wide. `composite_inner`'s `_shadow_pin` lives for the WHOLE per-window iteration — `verify_reference` + `wcg::begin` + `draw_window` -> `stage_window`'s per-band { `paint_window` (the ONLY reader of these bytes) + `beam::hold`'s beam wait + the BAR1 blit loop + `flush_rect` } + `wcg::end` + `stage_flush` + `band_flush` + `verify_window` — and flight 11's `[comp2] pass_us=139751 max_us=250007 compose_us=60954 present_us=32066 util_pct=97` says that iteration is ~14 ms per window, 28x the presenter's entire budget, of which only `compose_us` reads the shadow at all: the residual ~46.5 ms/pass is `beam::hold` spinning (`[wc-h] win=8 beamwaits=4336 beamwait_us=10766899` = 2.48 ms mean, `win=2 beammaxwait_us=62007`) and 32.1 ms is the BAR1 blit, neither of which touches a shadow byte. So the presenter could not have won: the beam wait ALONE exceeds 500 us by 5x, deterministically. THE FIX IS THE SECOND BUFFER. The pass copies the shadow into its own per-slot mirror under the shadow lock — one `surf_len` memcpy, 288x288x4 = 324 KiB for a vug — releases the shadow there, and composites (and checksums) from the mirror, which nothing but the serialized pass ever touches. The critical section stops being the pass and becomes the memcpy; the presenter's 500 us bound stops being a coin-flip. Memory is the SHELLWIN-OOM rule again, doubled and no worse: MAX_WINDOWS fallible `try_reserve` buffers (12 x 324 KiB = 3.9 MiB against the x86 256 MiB heap), and a decline falls back to the pre-fix wide pin — correct, slow, counted in `PACE_MIRROR_OOM`, never a torn glyph. It also STRENGTHENS WC-G/WC-D: their pre/post checksums now read a buffer no refresh can write, instead of one whose stability rested on holding the lock across the blit.
+static PACE_SHADOW: SegVec<Mutex<alloc::vec::Vec<u8>>> =
+    SegVec::new(|| Mutex::new(alloc::vec::Vec::new())); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PACE_MIRROR: SegVec<Mutex<alloc::vec::Vec<u8>>> = SegVec::new(|| Mutex::new(alloc::vec::Vec::new())); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static PACE_MIRROR_OOM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static PACE_PIN_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static PACE_PIN_FREE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static PACE_PIN_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static PACE_WIN_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); // VUGPERF (flight 11, 2026-09-22) — THE PASS'S OWN COPY, AND WHY THE SHADOW ALONE WAS NOT ENOUGH. W5SPIN bounded the REFRESH side at 500 us and flight 11 then spent that bound 1695 times: `[wcser] PRESENT-BANDED SPIN site=2 … -> GAVE-UP` on shadows 6..12 (the seven vugs and nothing else — 386/183/302/450/146/127/101, summing to the 1695 total), each one immediately followed by `site=1 waited_us=0 -> RELEASED`, i.e. the band update waited the WHOLE budget, gave up, cleared the validity bit, and the next present re-created the shadow with a full-extent refill. The bound was not too small; the critical section was too wide. `composite_inner`'s `_shadow_pin` lives for the WHOLE per-window iteration — `verify_reference` + `wcg::begin` + `draw_window` -> `stage_window`'s per-band { `paint_window` (the ONLY reader of these bytes) + `beam::hold`'s beam wait + the BAR1 blit loop + `flush_rect` } + `wcg::end` + `stage_flush` + `band_flush` + `verify_window` — and flight 11's `[comp2] pass_us=139751 max_us=250007 compose_us=60954 present_us=32066 util_pct=97` says that iteration is ~14 ms per window, 28x the presenter's entire budget, of which only `compose_us` reads the shadow at all: the residual ~46.5 ms/pass is `beam::hold` spinning (`[wc-h] win=8 beamwaits=4336 beamwait_us=10766899` = 2.48 ms mean, `win=2 beammaxwait_us=62007`) and 32.1 ms is the BAR1 blit, neither of which touches a shadow byte. So the presenter could not have won: the beam wait ALONE exceeds 500 us by 5x, deterministically. THE FIX IS THE SECOND BUFFER. The pass copies the shadow into its own per-slot mirror under the shadow lock — one `surf_len` memcpy, 288x288x4 = 324 KiB for a vug — releases the shadow there, and composites (and checksums) from the mirror, which nothing but the serialized pass ever touches. The critical section stops being the pass and becomes the memcpy; the presenter's 500 us bound stops being a coin-flip. Memory is the SHELLWIN-OOM rule again, doubled and no worse: MAX_WINDOWS fallible `try_reserve` buffers (12 x 324 KiB = 3.9 MiB against the x86 256 MiB heap), and a decline falls back to the pre-fix wide pin — correct, slow, counted in `PACE_MIRROR_OOM`, never a torn glyph. It also STRENGTHENS WC-G/WC-D: their pre/post checksums now read a buffer no refresh can write, instead of one whose stability rested on holding the lock across the blit.
 
 /// WPACE-TEXT — one bit per slot: the shadow holds a full copy of the surface as of some present
 /// boundary. Set only by [`pace_shadow_refresh`] after a whole-surface fill; cleared when the slot
 /// is re-issued (see [`create_inner`]), which covers every close path with one line.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-static PACE_SHADOW_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PACE_SHADOW_WEDGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static WPACE_SHDW_SPIN: [core::sync::atomic::AtomicU64; MAX_WINDOWS] = [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS]; #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static WPACE_SHDW_WEDGE: [core::sync::atomic::AtomicU64; MAX_WINDOWS] = [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS]; #[cfg(all(target_arch = "x86_64", feature = "wc"))] fn pace_shadow_acquire(slot: usize, site: u32) -> Option<MutexGuard<'static, alloc::vec::Vec<u8>, SpinRelax>> { use core::sync::atomic::Ordering::Relaxed; let bit = 1u32 << slot; if let Some(g) = PACE_SHADOW[slot].try_lock() { if PACE_SHADOW_WEDGED.load(Relaxed) & bit != 0 { PACE_SHADOW_WEDGED.fetch_and(!bit, Relaxed); #[cfg(feature = "witness")] WPACE_SHDW_SPIN[slot].fetch_add(1, Relaxed); serial_println!(":: [wcser] PRESENT-BANDED SPIN site={} waited_us=0 on=shadow{} -> RELEASED ::", site, slot + 1); } return Some(g); } let hz = crate::arch::apic::tsc_hz(); let hz = if hz == 0 { 1_250_000_000u64 } else { hz }; let us = |dt: u64| dt.saturating_mul(1_000_000) / hz; let budget = if PACE_SHADOW_WEDGED.load(Relaxed) & bit != 0 { 0 } else { hz / 2_000 }; let t0 = crate::arch::now_cycles(); loop { core::hint::spin_loop(); if let Some(g) = PACE_SHADOW[slot].try_lock() { let us = us(crate::arch::now_cycles().saturating_sub(t0)); PACE_SHADOW_WEDGED.fetch_and(!bit, Relaxed); #[cfg(feature = "witness")] WPACE_SHDW_SPIN[slot].fetch_add(1, Relaxed); serial_println!(":: [wcser] PRESENT-BANDED SPIN site={} waited_us={} on=shadow{} -> RELEASED ::", site, us, slot + 1); return Some(g); } let waited = crate::arch::now_cycles().saturating_sub(t0); if waited >= budget { #[cfg(feature = "witness")] WPACE_SHDW_WEDGE[slot].fetch_add(1, Relaxed); if PACE_SHADOW_WEDGED.fetch_or(bit, Relaxed) & bit == 0 { serial_println!(":: [wcser] PRESENT-BANDED SPIN site={} waited_us={} on=shadow{} -> GAVE-UP ::", site, us(waited), slot + 1); } return None; } } } // W5SPIN (flight 10, three dead cores at `present_banded+0x462/+0x466`) — THE BOUND ON THE REFRESH-SIDE ACQUIRE. `pace_shadow_refresh`'s doc argued its `lock()` was "bounded" because "the only other holder is a composite pass blitting this same window's shadow". Metal falsified the premise, not the arithmetic: the pass pins the shadow across `draw_window` + WC-G/WC-D + the staged span-flush into the Kepler BAR1, which is milliseconds at best and, on a core PREEMPTED mid-pass, unbounded — and the gauges say the spinner IS the gate holder (the pass gauges are stamped by the holder and the gate is serial, so `win=10 phase=42 row=10` is c1's OWN breadcrumb while c1's rip is in this loop), i.e. the pass and the spinner are the SAME CORE and the pass can never be rescheduled behind a spinner that never yields. Then the 1.5 s steal declares that core DEAD and nothing ever resumes the pass, so the `MutexGuard` is never dropped and the byte stays 1 for the rest of the boot: every later present of that window spins forever and becomes the next dead core (c1 -> c2 -> c3 on flight 10). So: try once, then spin under a 500 us budget (`tsc_hz / 2_000`, with the same uncalibrated 1.25 GHz fallback `wcg::cycles_to_us` uses), and GIVE UP — the caller drops the window to the live-read path, which is the OOM degraded mode this block already documents and accepts. A give-up LATCHES the slot in `PACE_SHADOW_WEDGED`, and a latched slot takes the try-lock only (budget 0), so a genuinely dead holder costs one `cmpxchg` per present instead of 500 us; the first acquisition that succeeds clears the latch and says so. One line per TRANSITION, never per present: `RELEASED` when a spin (or a latched slot) actually got the lock, `GAVE-UP` once per latch. A healthy QEMU run never contends, so it prints neither and `[wpace] spin=0 wedge=0` is the positive reading.
+static PACE_SHADOW_OK: SlotBits = SlotBits::new(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PACE_SHADOW_WEDGED: SlotBits = SlotBits::new(); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static WPACE_SHDW_SPIN: SegVec<core::sync::atomic::AtomicU64> = SegVec::new(|| core::sync::atomic::AtomicU64::new(0)); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static WPACE_SHDW_WEDGE: SegVec<core::sync::atomic::AtomicU64> = SegVec::new(|| core::sync::atomic::AtomicU64::new(0)); #[cfg(all(target_arch = "x86_64", feature = "wc"))] fn pace_shadow_acquire(slot: usize, site: u32) -> Option<MutexGuard<'static, alloc::vec::Vec<u8>, SpinRelax>> { use core::sync::atomic::Ordering::Relaxed; let bit = slot; /* WINDOWCAP-2: the slot IS the SlotBits index */ if let Some(g) = PACE_SHADOW.get(slot).try_lock() { if PACE_SHADOW_WEDGED.test(bit) { PACE_SHADOW_WEDGED.clear(bit); #[cfg(feature = "witness")] WPACE_SHDW_SPIN.get(slot).fetch_add(1, Relaxed); serial_println!(":: [wcser] PRESENT-BANDED SPIN site={} waited_us=0 on=shadow{} -> RELEASED ::", site, slot + 1); } return Some(g); } let hz = crate::arch::apic::tsc_hz(); let hz = if hz == 0 { 1_250_000_000u64 } else { hz }; let us = |dt: u64| dt.saturating_mul(1_000_000) / hz; let budget = if PACE_SHADOW_WEDGED.test(bit) { 0 } else { hz / 2_000 }; let t0 = crate::arch::now_cycles(); loop { core::hint::spin_loop(); if let Some(g) = PACE_SHADOW.get(slot).try_lock() { let us = us(crate::arch::now_cycles().saturating_sub(t0)); PACE_SHADOW_WEDGED.clear(bit); #[cfg(feature = "witness")] WPACE_SHDW_SPIN.get(slot).fetch_add(1, Relaxed); serial_println!(":: [wcser] PRESENT-BANDED SPIN site={} waited_us={} on=shadow{} -> RELEASED ::", site, us, slot + 1); return Some(g); } let waited = crate::arch::now_cycles().saturating_sub(t0); if waited >= budget { #[cfg(feature = "witness")] WPACE_SHDW_WEDGE.get(slot).fetch_add(1, Relaxed); if !PACE_SHADOW_WEDGED.set(bit) { serial_println!(":: [wcser] PRESENT-BANDED SPIN site={} waited_us={} on=shadow{} -> GAVE-UP ::", site, us(waited), slot + 1); } return None; } } } // W5SPIN (flight 10, three dead cores at `present_banded+0x462/+0x466`) — THE BOUND ON THE REFRESH-SIDE ACQUIRE. `pace_shadow_refresh`'s doc argued its `lock()` was "bounded" because "the only other holder is a composite pass blitting this same window's shadow". Metal falsified the premise, not the arithmetic: the pass pins the shadow across `draw_window` + WC-G/WC-D + the staged span-flush into the Kepler BAR1, which is milliseconds at best and, on a core PREEMPTED mid-pass, unbounded — and the gauges say the spinner IS the gate holder (the pass gauges are stamped by the holder and the gate is serial, so `win=10 phase=42 row=10` is c1's OWN breadcrumb while c1's rip is in this loop), i.e. the pass and the spinner are the SAME CORE and the pass can never be rescheduled behind a spinner that never yields. Then the 1.5 s steal declares that core DEAD and nothing ever resumes the pass, so the `MutexGuard` is never dropped and the byte stays 1 for the rest of the boot: every later present of that window spins forever and becomes the next dead core (c1 -> c2 -> c3 on flight 10). So: try once, then spin under a 500 us budget (`tsc_hz / 2_000`, with the same uncalibrated 1.25 GHz fallback `wcg::cycles_to_us` uses), and GIVE UP — the caller drops the window to the live-read path, which is the OOM degraded mode this block already documents and accepts. A give-up LATCHES the slot in `PACE_SHADOW_WEDGED`, and a latched slot takes the try-lock only (budget 0), so a genuinely dead holder costs one `cmpxchg` per present instead of 500 us; the first acquisition that succeeds clears the latch and says so. One line per TRANSITION, never per present: `RELEASED` when a spin (or a latched slot) actually got the lock, `GAVE-UP` once per latch. A healthy QEMU run never contends, so it prints neither and `[wpace] spin=0 wedge=0` is the positive reading.
 
 /// WPACE-TEXT witness — shadow creations declined for want of heap. A nonzero count means some
 /// window is on the live-read (tearing-text) path; the wire says so instead of the operator's eyes.
@@ -2065,16 +2067,16 @@ static WPACE_SHDW_OOM: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// moved bytes — a degenerate empty band ([`pace_shadow_refresh`]'s `off1 <= off0`) does not
 /// tick it, so `shdw` stays comparable to `paced + coalesced`.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
-static WPACE_SHDW: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+static WPACE_SHDW: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// WPACE-TEXT witness — passes DEFERRED for a contended shadow lock, per slot, on the `[wpace]`
 /// line as `defer=`. The MAJOR-1 residual made visible: a nonzero count is the drain and the
 /// owner's next present colliding on one window's shadow, each collision costing one window one
 /// extra ~1 ms frame — never a torn glyph, never a live read.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
-static WPACE_SHDW_DEFER: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+static WPACE_SHDW_DEFER: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// WPACE-TEXT — refresh window `id`'s shadow from its (quiescent) surface. Called from
 /// [`present_banded`] only, i.e. with the owner parked in the present syscall; that parking is the
@@ -2105,11 +2107,11 @@ fn pace_shadow_refresh(
 ) {
     use core::sync::atomic::Ordering::Relaxed;
     let slot = (id as usize).wrapping_sub(1);
-    if slot >= MAX_WINDOWS || surf == 0 || stride == 0 {
+    if slot >= slots() || surf == 0 || stride == 0 {
         return;
     }
-    let bit = 1u32 << slot;
-    let valid = PACE_SHADOW_OK.load(Relaxed) & bit != 0;
+    let bit = slot; /* WINDOWCAP-2: the slot IS the SlotBits index */
+    let valid = PACE_SHADOW_OK.test(bit);
     if !valid && !create {
         return;
     }
@@ -2122,7 +2124,7 @@ fn pace_shadow_refresh(
     if surf_len == 0 {
         return;
     }
-    let mut buf = match pace_shadow_acquire(slot, if valid { 2 } else { 1 }) { Some(g) => g, None => { if valid { PACE_SHADOW_OK.fetch_and(!bit, Relaxed); } return; } }; // W5SPIN — bounded, and the GIVE-UP path is the recovery, not just the exit. Site 1 is the create fill, site 2 the band update. On a give-up the VALIDITY BIT IS CLEARED, which is what makes "skip this refresh" safe: a skipped band would otherwise leave the shadow holding older bytes for rows the owner has since redrawn, and the pass would publish them to glass indefinitely if the app never declared that band again. Clearing the bit drops the window onto the live-read path — `pace_shadow_source` answers `Live`, `pace_shadow_refresh` returns at its `!valid && !create` head — and the next COALESCED present arrives with `create = true` and re-copies the WHOLE extent, so the degraded interval is one present (~2 ms for the storming window this pacer exists for), and for a QUIET window the live surface is quiescent anyway, which is this block's own argument for the never-coalesced path. Nothing is left stale on the panel and nothing can tear that could not already tear under `WPACE_SHDW_OOM`. The core RETURNS from the pass either way, which is the whole point: it is never the holder that "had not moved", so it is never declared DEAD and the steal is never needed.
+    let mut buf = match pace_shadow_acquire(slot, if valid { 2 } else { 1 }) { Some(g) => g, None => { if valid { PACE_SHADOW_OK.clear(bit); } return; } }; // W5SPIN — bounded, and the GIVE-UP path is the recovery, not just the exit. Site 1 is the create fill, site 2 the band update. On a give-up the VALIDITY BIT IS CLEARED, which is what makes "skip this refresh" safe: a skipped band would otherwise leave the shadow holding older bytes for rows the owner has since redrawn, and the pass would publish them to glass indefinitely if the app never declared that band again. Clearing the bit drops the window onto the live-read path — `pace_shadow_source` answers `Live`, `pace_shadow_refresh` returns at its `!valid && !create` head — and the next COALESCED present arrives with `create = true` and re-copies the WHOLE extent, so the degraded interval is one present (~2 ms for the storming window this pacer exists for), and for a QUIET window the live surface is quiescent anyway, which is this block's own argument for the never-coalesced path. Nothing is left stale on the panel and nothing can tear that could not already tear under `WPACE_SHDW_OOM`. The core RETURNS from the pass either way, which is the whole point: it is never the holder that "had not moved", so it is never declared DEAD and the steal is never needed.
     // NOTE-5 — count only copies that moved bytes, so `shdw` stays comparable to `paced +
     // coalesced` and a degenerate empty band does not inflate it.
     #[cfg_attr(not(feature = "witness"), allow(unused_variables))]
@@ -2145,7 +2147,7 @@ fn pace_shadow_refresh(
         unsafe {
             core::ptr::copy_nonoverlapping(surf as *const u8, buf.as_mut_ptr(), surf_len);
         }
-        PACE_SHADOW_OK.fetch_or(bit, Relaxed);
+        PACE_SHADOW_OK.set(bit);
         copied = true;
     } else {
         let off0 = (sy0.saturating_mul(stride)).min(surf_len).min(buf.len());
@@ -2165,7 +2167,7 @@ fn pace_shadow_refresh(
     }
     #[cfg(feature = "witness")]
     if copied {
-        WPACE_SHDW[slot].fetch_add(1, Relaxed);
+        WPACE_SHDW.get(slot).fetch_add(1, Relaxed);
     }
 }
 
@@ -2202,12 +2204,12 @@ fn pace_shadow_source(r: &mut Window) -> ShadowSrc {
         return ShadowSrc::Live;
     }
     let slot = (r.id as usize).wrapping_sub(1);
-    if slot >= MAX_WINDOWS || PACE_SHADOW_OK.load(Relaxed) & (1u32 << slot) == 0 {
+    if slot >= slots() || !PACE_SHADOW_OK.test(slot) {
         // No shadow yet (never coalesced) — the live surface is quiescent, honest.
         return ShadowSrc::Live;
     }
     // Shadow VALID from here on: a live read is only sound if we hold the lock. A miss DEFERS.
-    #[cfg(feature = "witness")] let _t0 = crate::arch::now_cycles(); let g = match PACE_SHADOW[slot].try_lock() {
+    #[cfg(feature = "witness")] let _t0 = crate::arch::now_cycles(); let g = match PACE_SHADOW.get(slot).try_lock() {
         Some(g) => g,
         None => return ShadowSrc::Defer,
     };
@@ -2219,9 +2221,9 @@ fn pace_shadow_source(r: &mut Window) -> ShadowSrc {
     if r.surf_len == 0 || g.len() < r.surf_len {
         return ShadowSrc::Live;
     }
-    let mirrored = match PACE_MIRROR[slot].try_lock() { Some(mut m) => { let fit = m.len() >= r.surf_len || { let add = r.surf_len - m.len(); if m.try_reserve(add).is_ok() { m.resize(r.surf_len, 0); true } else { false } }; if fit { unsafe { core::ptr::copy_nonoverlapping(g.as_ptr(), m.as_mut_ptr(), r.surf_len); } Some(m) } else { #[cfg(feature = "witness")] PACE_MIRROR_OOM.fetch_add(1, Relaxed); None } } None => None }; // VUGPERF — THE COPY, AND THE WHOLE OF THE CRITICAL SECTION. One `surf_len` memcpy out of the shadow into this slot's mirror, with both locks held for the length of that memcpy and nothing else. The mirror's `try_lock` cannot honestly contend — `COMP_GATE` serialises composite passes and no other site touches `PACE_MIRROR` — so a miss is a revenant or a steal, and both fall through to the pre-VUGPERF wide pin below rather than inventing a new failure mode. Sizing is `pace_shadow_refresh`'s argument verbatim (`surf_len`, the full mapped slot, because WC-G's checksums and cache maintenance read that length off whatever address they are handed), and the growth is FALLIBLE for `SHELLWIN-OOM`'s reason: a kernel that cannot afford the second buffer keeps the first and stays correct.
+    let mirrored = match PACE_MIRROR.get(slot).try_lock() { Some(mut m) => { let fit = m.len() >= r.surf_len || { let add = r.surf_len - m.len(); if m.try_reserve(add).is_ok() { m.resize(r.surf_len, 0); true } else { false } }; if fit { unsafe { core::ptr::copy_nonoverlapping(g.as_ptr(), m.as_mut_ptr(), r.surf_len); } Some(m) } else { #[cfg(feature = "witness")] PACE_MIRROR_OOM.fetch_add(1, Relaxed); None } } None => None }; // VUGPERF — THE COPY, AND THE WHOLE OF THE CRITICAL SECTION. One `surf_len` memcpy out of the shadow into this slot's mirror, with both locks held for the length of that memcpy and nothing else. The mirror's `try_lock` cannot honestly contend — `COMP_GATE` serialises composite passes and no other site touches `PACE_MIRROR` — so a miss is a revenant or a steal, and both fall through to the pre-VUGPERF wide pin below rather than inventing a new failure mode. Sizing is `pace_shadow_refresh`'s argument verbatim (`surf_len`, the full mapped slot, because WC-G's checksums and cache maintenance read that length off whatever address they are handed), and the growth is FALLIBLE for `SHELLWIN-OOM`'s reason: a kernel that cannot afford the second buffer keeps the first and stays correct.
     match mirrored { Some(m) => { drop(g); #[cfg(feature = "witness")] PACE_PIN_CYC.fetch_add(crate::arch::now_cycles().saturating_sub(_t0), Relaxed); r.surf = m.as_ptr() as usize; ShadowSrc::Shadow(m) } None => { r.surf = g.as_ptr() as usize; ShadowSrc::Shadow(g) } } // VUGPERF — `drop(g)` IS THE FIX, and it is one token. Past it the shadow lock is free for the whole of `draw_window`, the beam wait, the BAR1 blit and the two read-back witnesses, so `pace_shadow_refresh`'s 500 us budget is measured against a memcpy instead of against a composite pass. `_t0` is taken before the shadow `try_lock` (not after the copy) so `PACE_PIN_CYC` is the TRUE hold — acquisition included — and `copy_us` on the `:: VUGPERF:` line is comparable with the `waited_us=` the presenter prints. The `None` arm keeps `ShadowSrc::Shadow(g)`'s old meaning exactly: the guard outlives this call and pins the shadow across the iteration, which is the regime the go-red restores.
-} #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] fn pace_pin_probe(id: WinId, t0: u64) { use core::sync::atomic::Ordering::Relaxed; let slot = (id as usize).wrapping_sub(1); if slot >= MAX_WINDOWS { return; } PACE_WIN_CYC.fetch_add(crate::arch::now_cycles().saturating_sub(t0), Relaxed); PACE_PIN_PROBES.fetch_add(1, Relaxed); if PACE_SHADOW[slot].try_lock().is_some() { PACE_PIN_FREE.fetch_add(1, Relaxed); } } #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] pub fn vugprobe_selftest() { use core::sync::atomic::Ordering::Relaxed; static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); if DONE.swap(true, Relaxed) { return; } const OWNER: u64 = 0x5655_4750; const _: () = assert!(OWNER != 0 && !is_kernel_owner(OWNER)); const TRIES: usize = 8; let fb = *super::WRITER.lock(); if !fb.is_ready() { serial_println!(":: VUGPROBE: shadow-drive -> SKIP (framebuffer not ready) ::"); return; } let s = &raw const HT_SURF as usize; let len = core::mem::size_of_val(&HT_SURF); let id = create(OWNER, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"vugp"); if id == WIN_NONE { serial_println!(":: VUGPROBE: shadow-drive -> SKIP (window table full) ::"); return; } let slot = (id as usize).wrapping_sub(1); composite(); let (mut paced, mut coalesced, mut lost) = (0u32, 0u32, false); for _ in 0..TRIES { match present_outcome(id) { Presented::Coalesced => { coalesced += 1; break; } Presented::Composited => paced += 1, _ => { lost = true; break; } } } let shadow = slot < MAX_WINDOWS && PACE_SHADOW_OK.load(Relaxed) & (1u32 << slot) != 0; if coalesced > 0 && shadow { composite(); } if info(id).is_some() { close(id); } composite(); serial_println!(":: VUGPROBE: shadow-drive win={} tries={} paced={} coalesced={} shadow={} lost={} bound=coalesced>=1,shadow :: {} ::", id, TRIES, paced, coalesced, shadow, lost, if coalesced > 0 && shadow && !lost { "PASS" } else { "FAIL" }); } // VUGPERF FIXTURE — **ASK THE LOCK, DO NOT TIME IT.** Run at the TAIL of the per-window composite iteration, past `draw_window`, the beam wait, the BAR1 blit and both read-back witnesses, on every window that composited from a shadow (`_shadow_pin.is_some()`). It try-locks that window's `PACE_SHADOW` and counts the answer. The verdict rests on this and not on `copy_us`, because this reading is DETERMINISTIC in both directions and needs no threshold: with the mirror the pass released the shadow inside `pace_shadow_source`, so the try-lock succeeds unless the owner happens to be mid-refresh; re-widen the critical section and the pass is ITSELF the holder, so the try-lock CANNOT succeed — `free=0`, every probe, on any host, at any speed. That is what makes this fixture scoreable under TCG, where the contention the arc exists to kill never reproduces (`[wpace] spin=0 wedge=0` is the healthy QEMU reading, which is why W5SPIN could only ever pin the census fields and not a value). `PACE_WIN_CYC` is charged from the same call so `copy_us`/`pass_us` are two readings of ONE population — the windows that were probed — rather than two spans that can disagree. The probe's own cost is one uncontended `cmpxchg` per window per pass. || VUGPROBE FIXTURE (B142) — **THE DRIVER THAT GIVES THE PROBE ABOVE A POPULATION.** VUGPERF shipped `pace_pin_probe` and its own gate never printed the verdict: `[wpace] coalesced=1` over a 248 s boot, the one shadowed window closed before a pass composited from it, so `probes=0` and the emitter was correctly silent — a fixture that SHIPPED UNSCORED, and a go-red that would have been vacuous on both trees. The population is missing because a shadow exists only for a window the pacer has COALESCED, and the QEMU ladder's windows present slowly and are torn down fast. This drives that shape on purpose and through the LIVE PATH ONLY: one ring-3-band row (`OWNER` is non-zero and outside the kernel band by const assertion, so `pace_admit` PACES it — a `KERNEL_OWNER_BASE` row like DMGOVLP's is exempt at the decision and could never coalesce), then `present_outcome` in a loop until one comes back `Coalesced`. The FIRST present claims the frame edge (`PACE_LAST_CYC` compare-exchange) and composites; the SECOND lands inside that same 16.667 ms frame and is coalesced, and coalescing is EXACTLY what calls `pace_shadow_refresh(.., create = !pace_go)` — so the shadow is created at a REAL present boundary by the real presenter, never by poking `PACE_SHADOW` or the validity bit. That distinction is the whole design: B121 records `winmenu::selftest` passing on every x86 boot through a seam the live path never calls, and a fixture that stamped the slot by hand would be that mistake again one band later. `TRIES` is 8 rather than 2 because the gap between the two presents is the first present's own composite pass (the stamp is taken BEFORE `composite()` in `present_banded`) and QEMU's TCG passes are `[comp2] pass_us=4265` mean with a 170 ms tail — one outlier costs a retry, not the boot. The bounding `composite()` before the loop drains every other row's damage so that first pass carries this 160x8 row and nothing else. Graded on `coalesced >= 1 && shadow` (the validity bit READ, not written), which is the precondition `pace_pin_probe` needs and the only thing this function can honestly assert about itself — the probe's own count is drained by `wpace_emit` on another cadence and is read there, on the `:: VUGPERF:` line, which now prints on every armed boot with `probes >= 1`. Self-cleaning: the row is closed and one more pass repaints the box it vacated.
+} #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] fn pace_pin_probe(id: WinId, t0: u64) { use core::sync::atomic::Ordering::Relaxed; let slot = (id as usize).wrapping_sub(1); if slot >= slots() { return; } PACE_WIN_CYC.fetch_add(crate::arch::now_cycles().saturating_sub(t0), Relaxed); PACE_PIN_PROBES.fetch_add(1, Relaxed); if PACE_SHADOW.get(slot).try_lock().is_some() { PACE_PIN_FREE.fetch_add(1, Relaxed); } } #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] pub fn vugprobe_selftest() { use core::sync::atomic::Ordering::Relaxed; static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); if DONE.swap(true, Relaxed) { return; } const OWNER: u64 = 0x5655_4750; const _: () = assert!(OWNER != 0 && !is_kernel_owner(OWNER)); const TRIES: usize = 8; let fb = *super::WRITER.lock(); if !fb.is_ready() { serial_println!(":: VUGPROBE: shadow-drive -> SKIP (framebuffer not ready) ::"); return; } let s = &raw const HT_SURF as usize; let len = core::mem::size_of_val(&HT_SURF); let id = create(OWNER, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"vugp"); if id == WIN_NONE { serial_println!(":: VUGPROBE: shadow-drive -> SKIP (window table full) ::"); return; } let slot = (id as usize).wrapping_sub(1); composite(); let (mut paced, mut coalesced, mut lost) = (0u32, 0u32, false); for _ in 0..TRIES { match present_outcome(id) { Presented::Coalesced => { coalesced += 1; break; } Presented::Composited => paced += 1, _ => { lost = true; break; } } } let shadow = slot < slots() && PACE_SHADOW_OK.test(slot); if coalesced > 0 && shadow { composite(); } if info(id).is_some() { close(id); } composite(); serial_println!(":: VUGPROBE: shadow-drive win={} tries={} paced={} coalesced={} shadow={} lost={} bound=coalesced>=1,shadow :: {} ::", id, TRIES, paced, coalesced, shadow, lost, if coalesced > 0 && shadow && !lost { "PASS" } else { "FAIL" }); } // VUGPERF FIXTURE — **ASK THE LOCK, DO NOT TIME IT.** Run at the TAIL of the per-window composite iteration, past `draw_window`, the beam wait, the BAR1 blit and both read-back witnesses, on every window that composited from a shadow (`_shadow_pin.is_some()`). It try-locks that window's `PACE_SHADOW` and counts the answer. The verdict rests on this and not on `copy_us`, because this reading is DETERMINISTIC in both directions and needs no threshold: with the mirror the pass released the shadow inside `pace_shadow_source`, so the try-lock succeeds unless the owner happens to be mid-refresh; re-widen the critical section and the pass is ITSELF the holder, so the try-lock CANNOT succeed — `free=0`, every probe, on any host, at any speed. That is what makes this fixture scoreable under TCG, where the contention the arc exists to kill never reproduces (`[wpace] spin=0 wedge=0` is the healthy QEMU reading, which is why W5SPIN could only ever pin the census fields and not a value). `PACE_WIN_CYC` is charged from the same call so `copy_us`/`pass_us` are two readings of ONE population — the windows that were probed — rather than two spans that can disagree. The probe's own cost is one uncontended `cmpxchg` per window per pass. || VUGPROBE FIXTURE (B142) — **THE DRIVER THAT GIVES THE PROBE ABOVE A POPULATION.** VUGPERF shipped `pace_pin_probe` and its own gate never printed the verdict: `[wpace] coalesced=1` over a 248 s boot, the one shadowed window closed before a pass composited from it, so `probes=0` and the emitter was correctly silent — a fixture that SHIPPED UNSCORED, and a go-red that would have been vacuous on both trees. The population is missing because a shadow exists only for a window the pacer has COALESCED, and the QEMU ladder's windows present slowly and are torn down fast. This drives that shape on purpose and through the LIVE PATH ONLY: one ring-3-band row (`OWNER` is non-zero and outside the kernel band by const assertion, so `pace_admit` PACES it — a `KERNEL_OWNER_BASE` row like DMGOVLP's is exempt at the decision and could never coalesce), then `present_outcome` in a loop until one comes back `Coalesced`. The FIRST present claims the frame edge (`PACE_LAST_CYC` compare-exchange) and composites; the SECOND lands inside that same 16.667 ms frame and is coalesced, and coalescing is EXACTLY what calls `pace_shadow_refresh(.., create = !pace_go)` — so the shadow is created at a REAL present boundary by the real presenter, never by poking `PACE_SHADOW` or the validity bit. That distinction is the whole design: B121 records `winmenu::selftest` passing on every x86 boot through a seam the live path never calls, and a fixture that stamped the slot by hand would be that mistake again one band later. `TRIES` is 8 rather than 2 because the gap between the two presents is the first present's own composite pass (the stamp is taken BEFORE `composite()` in `present_banded`) and QEMU's TCG passes are `[comp2] pass_us=4265` mean with a 170 ms tail — one outlier costs a retry, not the boot. The bounding `composite()` before the loop drains every other row's damage so that first pass carries this 160x8 row and nothing else. Graded on `coalesced >= 1 && shadow` (the validity bit READ, not written), which is the precondition `pace_pin_probe` needs and the only thing this function can honestly assert about itself — the probe's own count is drained by `wpace_emit` on another cadence and is read there, on the `:: VUGPERF:` line, which now prints on every armed boot with `probes >= 1`. Self-cleaning: the row is closed and one more pass repaints the box it vacated.
 
 /// WPACE-TEXT — the contended-shadow deferral: re-raise this window's whole-box damage and its
 /// pacer pending bit so the ~1 ms tail drain ([`pace_service`]) re-attempts the blit next pass,
@@ -2234,7 +2236,7 @@ fn pace_shadow_source(r: &mut Window) -> ShadowSrc {
 fn pace_shadow_defer(id: WinId) {
     use core::sync::atomic::Ordering::Relaxed;
     let slot = (id as usize).wrapping_sub(1);
-    if slot >= MAX_WINDOWS {
+    if slot >= slots() {
         return;
     }
     {
@@ -2243,23 +2245,23 @@ fn pace_shadow_defer(id: WinId) {
             r.damage_all();
         }
     }
-    PACE_PENDING.fetch_or(1u32 << slot, Relaxed);
+    PACE_PENDING.set(slot); PACE_PENDING_ANY.store(true, Relaxed);
     #[cfg(feature = "witness")]
-    WPACE_SHDW_DEFER[slot].fetch_add(1, Relaxed);
+    WPACE_SHDW_DEFER.get(slot).fetch_add(1, Relaxed);
 }
 
 /// WPACE-PANEL witness — presents that composited in present context under the pacer (frame-edge
 /// admissions of pace-eligible rows). Exempt rows are not counted on either counter: their line is
 /// `[wcn]`'s, unchanged.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
-static WPACE_PACED: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+static WPACE_PACED: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// WPACE-PANEL witness — presents absorbed into the frame in flight (returned immediately, damage
 /// accumulated). The storm's measure: Boot A's `win=3` should read `coalesced ≈ 6.5 × paced`.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
-static WPACE_COALESCED: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+static WPACE_COALESCED: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// WPACE-PANEL witness — tail composites [`pace_service`] ran for this window: coalesced damage
 /// the service drain, not a present, put on glass. NOT rare (review MINOR): under a steady storm
@@ -2269,8 +2271,8 @@ static WPACE_COALESCED: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
 /// the capture deliberately: under a storm most composite load migrates off the presenting cores
 /// onto the USB-pump service lane, bounded at the panel rate.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
-static WPACE_TAIL: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+static WPACE_TAIL: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// WPACE-PANEL witness — drain the pacer's counters and print, one line per window with traffic, on
 /// `[wcn]`'s cadence and from its emitter (the same claim, the same span). Drained with `swap` like
@@ -2280,18 +2282,18 @@ static WPACE_TAIL: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
 /// without the historical `wcn = wpace + 2` guesswork; `mode=panel` names this emitter against the
 /// (default-off) `vsyncpace` syscall pacer's `mode=` values on the same tag.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
-fn wpace_emit(ident: &[(u64, bool, bool, u32); MAX_WINDOWS]) {
+fn wpace_emit(ident: &[(u64, bool, bool, u32)]) {
     use core::sync::atomic::Ordering::Relaxed;
-    for slot in 0..MAX_WINDOWS {
-        let paced = WPACE_PACED[slot].swap(0, Relaxed);
-        let coalesced = WPACE_COALESCED[slot].swap(0, Relaxed);
-        let tail = WPACE_TAIL[slot].swap(0, Relaxed);
+    for slot in 0..ident.len() {
+        let paced = WPACE_PACED.get(slot).swap(0, Relaxed);
+        let coalesced = WPACE_COALESCED.get(slot).swap(0, Relaxed);
+        let tail = WPACE_TAIL.get(slot).swap(0, Relaxed);
         // WPACE-TEXT — `shdw=` is refresh copies this span, `defer=` is contended-shadow skips.
         // Both are swapped unconditionally (before the traffic test) so their counters never
         // straddle a span, and `defer` joins the traffic test so a window that only deferred this
         // span still prints its line.
-        let shdw = WPACE_SHDW[slot].swap(0, Relaxed);
-        let defer = WPACE_SHDW_DEFER[slot].swap(0, Relaxed); let spin = WPACE_SHDW_SPIN[slot].swap(0, Relaxed); let wedge = WPACE_SHDW_WEDGE[slot].swap(0, Relaxed); // W5SPIN — ONE TICK PER PRINTED LINE, so the census and the wire cannot disagree: `spin=` counts every `PRESENT-BANDED SPIN … -> RELEASED` (the bounded wait's healthy exit, and the latched-slot recovery that clears the wedge on its first try-lock), `wedge=` every `… -> GAVE-UP`. Swapped with the pair above, before the traffic test, for the same no-straddle reason, and both join that test so a window whose only traffic this span was a contended shadow still prints its line.
+        let shdw = WPACE_SHDW.get(slot).swap(0, Relaxed);
+        let defer = WPACE_SHDW_DEFER.get(slot).swap(0, Relaxed); let spin = WPACE_SHDW_SPIN.get(slot).swap(0, Relaxed); let wedge = WPACE_SHDW_WEDGE.get(slot).swap(0, Relaxed); // W5SPIN — ONE TICK PER PRINTED LINE, so the census and the wire cannot disagree: `spin=` counts every `PRESENT-BANDED SPIN … -> RELEASED` (the bounded wait's healthy exit, and the latched-slot recovery that clears the wedge on its first try-lock), `wedge=` every `… -> GAVE-UP`. Swapped with the pair above, before the traffic test, for the same no-straddle reason, and both join that test so a window whose only traffic this span was a contended shadow still prints its line.
         if paced == 0 && coalesced == 0 && tail == 0 && defer == 0 && spin == 0 && wedge == 0 {
             continue;
         }
@@ -2732,28 +2734,28 @@ pub fn close_owner(owner_asid: u64) -> usize {
     // WMDIRECT — see `close`. Keyed on the OWNER here because this path clears every row the ASID
     // holds under one lock and no longer knows their ids by the time it returns.
     drag_forget_owner(owner_asid); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] super::appmenu::reap(owner_asid);
-    let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    let mut vacated: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::new(); // WINDOWCAP-2
     // CLOSEISO — WHICH ids, not merely how many. A count cannot be falsified against the panel: the
     // Boot AR line `closed=1` was true and told the reader nothing about which window went. The list
     // is what makes "closing one program's window closed exactly that window" a checkable claim.
-    let mut ids = [WIN_NONE; MAX_WINDOWS];
+    let mut ids: alloc::vec::Vec<WinId> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let mut n = 0;
     // CLOSEISO — furniture rows this call REFUSED to reap. Never nonzero on any path a user close
     // takes; printed unconditionally when it is, because a close aimed at the console is either a
     // bug in the router or a bug in ownership, and both are the operator losing their machine.
-    let mut refused = [WIN_NONE; MAX_WINDOWS];
+    let mut refused: alloc::vec::Vec<WinId> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let mut nrefused = 0usize;
     {
         let mut t = table();
         for r in t.rows.iter_mut() {
             if r.used && r.owner_asid == owner_asid {
                 if is_kernel_owner(r.owner_asid) {
-                    refused[nrefused] = r.id;
+                    refused.push(r.id);
                     nrefused += 1;
                     continue;
                 }
-                ids[n] = r.id;
-                vacated[n] = outer_box(r);
+                ids.push(r.id);
+                vacated.push(outer_box(r));
                 // WC-N — same slot-recycle reset as `close`. Under the table lock here because the
                 // row's id is only readable before the clear; `wcn_forget` is one relaxed store.
                 #[cfg(feature = "witness")]
@@ -2951,21 +2953,21 @@ pub fn info(id: WinId) -> Option<WindowInfo> {
 ///
 /// A snapshot, never a handle — the caller re-validates before acting on it. Used by the syscall layer's
 /// tab-cycle to pick the next `USER_INPUT_ACTIVE`; nothing in this module reads input state.
-pub fn focus_ring(out: &mut [u64; MAX_WINDOWS]) -> usize {
+pub fn focus_ring(out: &mut alloc::vec::Vec<u64>) -> usize { // WINDOWCAP-2: a growable ring, cleared here
+    out.clear(); let mut ids: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::with_capacity(slots());
     let t = table();
     let mut n = 0usize;
-    let mut ids = [(0u32, 0u64); MAX_WINDOWS];
     let mut m = 0usize;
     for r in t.rows.iter() {
         if r.used && !r.compat && r.owner_asid != 0 {
-            ids[m] = (r.id, r.owner_asid);
+            ids.push((r.id, r.owner_asid));
             m += 1;
         }
     }
-    ids[..m].sort_unstable_by_key(|&(id, _)| id);
+    drop(t); ids[..m].sort_unstable_by_key(|&(id, _)| id);
     for &(_, asid) in ids[..m].iter() {
         if !out[..n].contains(&asid) {
-            out[n] = asid;
+            out.push(asid);
             n += 1;
         }
     }
@@ -3104,13 +3106,13 @@ pub fn focus_changed(asid: u64) {
     let mut first_id = WIN_NONE;
     let mut newz = 0u32;
     // Boxes of windows this call pushed BELOW the shell — the pixels the console is about to own.
-    let mut hidden = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    let mut hidden: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let mut nhidden = 0usize;
     // CLOSE-TEARDOWN — of those, the rows that genuinely LEAVE the glass (`!above_shell` under the
     // new z), as (id, owner): every park is named on the wire with its cause, so the next capture
     // can falsify "a close parked a sibling" instead of inferring it. Collected under the guard,
     // emitted after it (this file's standing rule: nothing is called out from under `TABLE`).
-    let mut parked = [(WIN_NONE, 0u64); MAX_WINDOWS];
+    let mut parked: alloc::vec::Vec<(WinId, u64)> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let mut nparked = 0usize;
     // FV-EXEMPT — of those boxes, how many belong to a row that [`above_shell`] says is STILL VISIBLE.
     // That number ought to be zero by the definition of the set, and it is not: see the shell arm.
@@ -3125,7 +3127,7 @@ pub fn focus_changed(asid: u64) {
     // owner, all hidden); since CLICK-PLAIN the RAISE arm fills in exactly ONE row — `marks[0]`, the
     // arriving owner, unhidden. Assigned on both arms, so it carries no initial value to be mistaken
     // for a verdict. See [`vugmin_scan`].
-    let mut marks = [(0u64, false); MAX_WINDOWS];
+    let mut marks: alloc::vec::Vec<(u64, bool)> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let nmarks: usize;
 
     // FOCUS-HL: take the focus owner BEFORE the table lock, so the composite at the end of this call
@@ -3190,7 +3192,7 @@ pub fn focus_changed(asid: u64) {
             //
             // (1) The shell's furniture rows take fresh z's off the same allocator `create` uses.
             let mut shell_top = 0u32;
-            for i in 0..MAX_WINDOWS {
+            for i in 0..t.rows.len() {
                 if !t.rows[i].used || t.rows[i].compat {
                     continue;
                 }
@@ -3218,7 +3220,7 @@ pub fn focus_changed(asid: u64) {
             // raised in (1); compat rows are INCLUDED even though they are also exempt, so that the
             // FV-EXEMPT contradiction below stays at zero by construction rather than by luck.
             let mut floor = u32::MAX;
-            for i in 0..MAX_WINDOWS {
+            for i in 0..t.rows.len() {
                 let r = &t.rows[i];
                 if !r.used || r.z == PARKED_Z || is_kernel_owner(r.owner_asid) {
                     continue;
@@ -3327,10 +3329,10 @@ pub fn focus_changed(asid: u64) {
                         // both mislabel them and burn the lifetime `[wm-act]` budget fleet-wide per
                         // raise. A row already below `prev_shell` (or at `PARKED_Z`) is not parked by
                         // this gesture and is not named by it.
-                        parked[nparked] = (r.id, r.owner_asid);
+                        parked.push((r.id, r.owner_asid));
                         nparked += 1;
                     }
-                    hidden[nhidden] = outer_box(r);
+                    hidden.push(outer_box(r));
                     nhidden += 1;
                     // Damaged so that a later raise repaints from the source surface rather than
                     // trusting whatever survived on the panel.
@@ -3338,7 +3340,7 @@ pub fn focus_changed(asid: u64) {
                 }
             }
         } else {
-            for i in 0..MAX_WINDOWS {
+            for i in 0..t.rows.len() {
                 if !t.rows[i].used || t.rows[i].compat || t.rows[i].owner_asid != asid {
                     continue;
                 }
@@ -3374,7 +3376,7 @@ pub fn focus_changed(asid: u64) {
             // fleet-idling semantic VUGMIN-A/B designed is untouched and still reachable, from the arm
             // that was always the honest place for it: focusing the SHELL hides every owner at once
             // (above), which is a whole-table statement the operator makes deliberately.
-            marks[0] = (asid, false);
+            marks.push((asid, false));
             nmarks = 1;
         }
     }
@@ -3705,8 +3707,8 @@ pub fn repaint() {
 ///
 /// A snapshot, never a handle. It is read without the desktop holding anything of ours, and a window
 /// that moves or closes immediately afterwards is repainted by the mover/closer's own composite.
-pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize {
-    let shell = shell_z();
+pub fn occluders(out: &mut alloc::vec::Vec<(usize, usize, usize, usize)>) -> usize { // WINDOWCAP-2: cleared and grown here
+    let shell = shell_z(); out.clear(); out.reserve(slots());
     let t = table();
     let mut n = 0usize;
     for r in t.rows.iter() {
@@ -3717,7 +3719,7 @@ pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize
         if b.2 == 0 || b.3 == 0 {
             continue;
         }
-        out[n] = b;
+        out.push(b);
         n += 1;
     }
     n
@@ -3757,18 +3759,18 @@ pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize
 /// is, so a window that moves or closes immediately afterwards is repaired by the mover's own
 /// composite and never by us.
 #[cfg(feature = "witness")]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct OccSnap {
-    boxes: [(usize, usize, usize, usize); MAX_WINDOWS],
+    boxes: alloc::vec::Vec<(usize, usize, usize, usize)>, // WINDOWCAP-2: growable
     n: usize,
 }
 
 #[cfg(feature = "witness")]
 impl OccSnap {
     /// The empty snapshot — no window above the one under check.
-    pub const fn none() -> Self {
+    pub fn none() -> Self {
         Self {
-            boxes: [(0, 0, 0, 0); MAX_WINDOWS],
+            boxes: alloc::vec::Vec::new(),
             n: 0,
         }
     }
@@ -3797,13 +3799,10 @@ impl OccSnap {
     /// and a `pub` method taking it would leak a private type into `OccSnap`'s public surface.
     fn absorb(&mut self, c: &OccClip) {
         for &b in c.boxes[..c.n].iter() {
-            if self.n >= MAX_WINDOWS {
-                break;
-            }
             if self.boxes[..self.n].contains(&b) {
                 continue;
             }
-            self.boxes[self.n] = b;
+            self.boxes.push(b);
             self.n += 1;
         }
     }
@@ -3867,6 +3866,7 @@ fn occluders_above(z: u32, id: u32) -> OccSnap {
     // can be charged and no FAIL can be manufactured) and the refusal is counted. The pardon is
     // the fail-safe direction — witness coverage lost for one window for one pass, said on the
     // wire, against the alternative boot 7 paid.
+    let mut pre = OccSnap::none(); pre.boxes.reserve(slots() + 1); // WINDOWCAP-2: room taken BEFORE the masked table probe
     let _irq = crate::arch::IrqMask::new();
     let t = match TABLE.try_lock() {
         Some(g) => g,
@@ -3874,8 +3874,8 @@ fn occluders_above(z: u32, id: u32) -> OccSnap {
             OCC_EXCUSE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let say = OCC62_PARDON_SAID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
                 < OCC62_PARDON_BUDGET;
-            let mut snap = OccSnap::none();
-            snap.boxes[0] = (0, 0, usize::MAX, usize::MAX);
+            let mut snap = pre;
+            snap.boxes.push((0, 0, usize::MAX, usize::MAX));
             snap.n = 1;
             // SYNC-FOLD (must-carry 4) — SAY IT, ON BOTH ARCHES. `exbusy=` on the `[wcser]` rollup
             // is x86-only, so without this line an aarch64 pardon is a silent full-coverage excuse:
@@ -3898,7 +3898,7 @@ fn occluders_above(z: u32, id: u32) -> OccSnap {
             return snap;
         }
     };
-    let mut snap = OccSnap::none();
+    let mut snap = pre;
     for r in t.rows.iter() {
         if !r.used || r.compat {
             continue;
@@ -3910,7 +3910,7 @@ fn occluders_above(z: u32, id: u32) -> OccSnap {
         if b.2 == 0 || b.3 == 0 {
             continue;
         }
-        snap.boxes[snap.n] = b;
+        snap.boxes.push(b);
         snap.n += 1;
     }
     snap
@@ -3980,7 +3980,7 @@ pub(super) fn occluders_aged(
     snap: &[(usize, usize, usize, usize)],
     bbox: Option<(usize, usize, usize, usize)>,
 ) -> (bool, bool) {
-    let mut cur = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    let mut cur: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let ncur = occluders(&mut cur);
     let cur = &cur[..ncur];
     if cur.len() == snap.len() && cur.iter().zip(snap.iter()).all(|(a, b)| a == b) {
@@ -4263,14 +4263,14 @@ fn paygo_service_pass() {
             // capped, and the cap SPEAKS once rather than going quiet — a taker that gave up is a
             // fact about the instrument, and this module's standing law is that an instrument which
             // stops must say so.
-            let tries = PAYGO_SVC_TRIES[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            let tries = PAYGO_SVC_TRIES.get(i).fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
             if tries > PAYGO_SVC_MAX {
                 // Armed by a LATCH, not by an equality on the counter. See [`PAYGO_SVC_NOTED`]. The
                 // row stays eligible to speak on every later pass until it HAS spoken, so a pass
                 // that also finds a takeable row (or a second row capping in the same pass) delays
                 // the note by a pass instead of consuming it. And the `continue` stands: a capped
                 // row must not stop the scan, or one wedged window would starve every later one.
-                if PAYGO_SVC_NOTED[i].swap(1, core::sync::atomic::Ordering::AcqRel) == 0 {
+                if PAYGO_SVC_NOTED.get(i).swap(1, core::sync::atomic::Ordering::AcqRel) == 0 {
                     stop_note = Some(r.id);
                 }
                 continue;
@@ -4333,7 +4333,7 @@ fn paygo_service_pass() {
             // present landing in the gap — and a present that banks a chunk calls
             // [`paygo_svc_progress`], which clears this row's try count. So the cost is one 250 ms
             // cycle, the liveness bound is not consumed, and the next pass re-marks at the new cursor.
-            let cur = WCD_CUR[i].load(core::sync::atomic::Ordering::Relaxed) as usize;
+            let cur = WCD_CUR.get(i).load(core::sync::atomic::Ordering::Relaxed) as usize;
             let hi = cur.saturating_add(WCD_CHUNK_ROWS_MAX);
             // `verify_reference`'s `rows`, from the same expression. Zero on a degenerate row (which
             // that function `-> SKIP`s anyway) or an unready panel, and zero fails the guard.
@@ -4429,8 +4429,8 @@ static PAYGO_SVC_BUSY: core::sync::atomic::AtomicBool =
 /// every future tenant of it — capped SILENTLY, because [`PAYGO_SVC_NOTED`]'s one-shot had been spent
 /// by an earlier tenant. Re-armed where the id demonstrably names a new window, beside the batteries.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static PAYGO_SVC_TRIES: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static PAYGO_SVC_TRIES: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WCG-CHUNK — chunk PROGRESS re-arms the taker's liveness bound, the same rule the wc-d chunking
 /// applies at its own banking site: [`PAYGO_SVC_TRIES`] caps marks WITHOUT progress (its anti-wedge
@@ -4446,8 +4446,8 @@ static PAYGO_SVC_TRIES: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// wherever the knob does, so the cap can always be re-armed by chunk progress.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 pub(super) fn paygo_svc_progress(i: usize) {
-    if i < WCD_IDS {
-        PAYGO_SVC_TRIES[i].store(0, core::sync::atomic::Ordering::Relaxed);
+    if i < u32::MAX as usize {
+        PAYGO_SVC_TRIES.get(i).store(0, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -4461,8 +4461,8 @@ pub(super) fn paygo_svc_progress(i: usize) {
 /// Per TENANT, cleared in `create_inner` with [`PAYGO_SVC_TRIES`]: the budget the note reports on is
 /// re-armed there, so a note left standing would make the next tenant's own give-up silent.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static PAYGO_SVC_NOTED: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static PAYGO_SVC_NOTED: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// Knob off: there is no deferral, so there is nothing to take. Folds away entirely.
 #[cfg(not(all(feature = "witness", feature = "wcg-paygo")))]
@@ -4521,7 +4521,7 @@ pub fn damage_intersecting(x: usize, y: usize, w: usize, h: usize) -> usize {
     let py1 = y.saturating_add(h);
     let mut t = table();
     let mut n = 0usize;
-    for i in 0..MAX_WINDOWS {
+    for i in 0..t.rows.len() {
         let r = &mut t.rows[i];
         if !r.used {
             continue;
@@ -5566,7 +5566,7 @@ fn composite_inner() -> CursorTail {
     if let Some(p) = sprite_now {
         let sbox = (p.bx, p.by, p.bw, p.bh);
         let shell = shell_z();
-        let mut paint: [(usize, usize, usize, usize); MAX_WINDOWS] = [(0, 0, 0, 0); MAX_WINDOWS];
+        let mut paint: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::with_capacity(slots() + 1); // WINDOWCAP-2: reserved before the table lock
         let mut npaint = 0usize;
         // MENU-UNDER/DOCK — the dock's tile count, snapshotted under the SAME table acquisition the
         // paint set uses, so the arming block below can price the dock's rect without a second
@@ -5579,7 +5579,7 @@ fn composite_inner() -> CursorTail {
             let t = table();
             for r in t.rows.iter() {
                 if r.used && above_shell(r, shell) && boxes_overlap(sbox, outer_box(r)) {
-                    paint[npaint] = outer_box(r);
+                    paint.push(outer_box(r));
                     npaint += 1;
                 }
             }
@@ -5918,7 +5918,7 @@ fn composite_inner() -> CursorTail {
     // lock, so the registration is ordered against any teardown that takes the lock afterwards: a
     // `close_owner` that clears rows can then tell whether some other core snapshotted those rows
     // before the clear and is still blitting from their (about to be unmapped) surfaces.
-    let mut rows_snap = RowsSnap::take(); let (rows, mut dirty, mut bands, _blit) = { // WINDOWCAP (B378): the snapshot lands in a pooled buffer, not on the stack — ⚠ SAME-LINE fold, code first
+    let mut rows_snap = RowsSnap::take(); rows_snap.reserve(slots() + 4); let dirty_pre: alloc::vec::Vec<bool> = alloc::vec::Vec::with_capacity(slots() + 4); let bands_pre: alloc::vec::Vec<Option<(usize, usize)>> = alloc::vec::Vec::with_capacity(slots() + 4); let (rows, mut dirty, mut bands, _blit) = { // WINDOWCAP (B378): the snapshot lands in a pooled buffer, not on the stack — ⚠ SAME-LINE fold, code first
         let mut t = table();
         // F4 — the barrier, observed in the SAME critical section as the registration below. A
         // teardown raises it after clearing its rows, so seeing it up means there is nothing of that
@@ -5935,14 +5935,14 @@ fn composite_inner() -> CursorTail {
             wcn_note_pass(false);
             return tail_of(disturbed, session, deferred);
         }
-        let mut dirty = [false; MAX_WINDOWS];
+        let mut dirty = dirty_pre; dirty.resize(t.rows.len(), false); // WINDOWCAP-2: sized to the live table, reserved before the lock
         // FBCON-DMG — the band travels with the dirty flag and is cleared with it, in the SAME
         // critical section, so a `present_rows` that lands after this snapshot re-damages the row
         // rather than having its rows absorbed by a pass that is no longer going to draw them.
         // Taken here and not one statement earlier or later on purpose: WC-L's drain ordering (the
         // drain runs before this snapshot and outside the `BlitGuard` window) is untouched, and this
         // loop is the one place `damaged` is already read-and-cleared under the table lock.
-        let mut bands = [None; MAX_WINDOWS];
+        let mut bands = bands_pre; bands.resize(t.rows.len(), None);
         for (i, r) in t.rows.iter_mut().enumerate() {
             dirty[i] = r.used && r.damaged;
             if dirty[i] && r.dmg_y1 > r.dmg_y0 {
@@ -5963,13 +5963,13 @@ fn composite_inner() -> CursorTail {
                 FL3_OVERLAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
-        rows_snap.copy_from_slice(&t.rows); (rows_snap, dirty, bands, guard) // WINDOWCAP (B378): heap/pool copy, see `RowsSnap`
+        rows_snap.fill(&t.rows); (rows_snap, dirty, bands, guard) // WINDOWCAP (B378): heap/pool copy, see `RowsSnap`
     };
 
     // Back-to-front: ascending z, ties by id (creation order).
     //
     // DMG-DISJOINT — HOISTED ABOVE THE CLOSURE, because the closure now walks it. See below.
-    let mut order = [0usize; MAX_WINDOWS];
+    let mut order: alloc::vec::Vec<usize> = alloc::vec![0usize; rows.len()]; // WINDOWCAP-2
     for (i, slot) in order.iter_mut().enumerate() {
         *slot = i;
     }
@@ -6053,7 +6053,7 @@ fn composite_inner() -> CursorTail {
     // and never repainted. Hoisted here, the widened band participates in the sweep like any other
     // damage and the invariant holds on every arch.
     if let Some(p) = plan {
-        for i in 0..MAX_WINDOWS {
+        for i in 0..rows.len() {
             if !dirty[i] {
                 continue;
             }
@@ -6073,14 +6073,14 @@ fn composite_inner() -> CursorTail {
     }
 
     #[cfg(feature = "witness")]
-    let seed = dirty;
+    let seed = dirty.clone(); // WINDOWCAP-2: a Vec now, so the seed is an explicit copy
     // NOATT — the discriminator, taken HERE: `seed` is the damage set as the table snapshot found it,
     // so every row in it was marked by something OUTSIDE this pass, and `bands` still holds each
     // row's OWN declared extent (the closure below only ever widens rows ABOVE a dragger). Both facts
     // are gone one loop later. See [`noatt_emit`] for what the reading means.
     #[cfg(feature = "witness")]
     noatt_note_pass(&rows, &seed, &bands);
-    for oi in 0..MAX_WINDOWS {
+    for oi in 0..rows.len() {
         let i = order[oi];
         if !dirty[i] {
             continue;
@@ -6089,7 +6089,7 @@ fn composite_inner() -> CursorTail {
         if bi.2 == 0 || bi.3 == 0 {
             continue;
         }
-        for j in 0..MAX_WINDOWS {
+        for j in 0..rows.len() {
             if !rows[j].used || rows[j].z <= rows[i].z {
                 continue;
             }
@@ -6322,10 +6322,10 @@ fn composite_inner() -> CursorTail {
         #[cfg(feature = "witness")]
         {
             let r = &rw;
-            if !r.compat && r.presented && r.id < 32 {
-                let bit = 1u32 << r.id;
+            if !r.compat && r.presented {
+                let bit = r.id as usize;
                 if wcd_ref.is_some()
-                    || VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit == 0
+                    || !VERIFIED.test(bit)
                 {
                     may_overlay = false;
                     if plan.is_some() {
@@ -7130,8 +7130,8 @@ fn verify_window(
     if !stable && (!ok || moved > 0) {
         // DESKHALF — one binding, both arches; the `n/a` fallback retired with the writer's arch gate.
         let (dk0, dk1, da0, da1) = (seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active);
-        let aborts = if wi < WCD_IDS { // Odometer first, unbudgeted, before the budget test.
-            WCD_ABORTS[wi].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
+        let aborts = if wi < u32::MAX as usize { // Odometer first, unbudgeted, before the budget test.
+            WCD_ABORTS.get(wi).fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
         } else {
             u32::MAX
         };
@@ -7230,23 +7230,23 @@ fn verify_window(
         use core::sync::atomic::Ordering::Relaxed;
         let hold_us =
             super::wcg::cycles_to_us(crate::arch::now_cycles().saturating_sub(t_chunk0));
-        WCD_CHUNKS[wi].fetch_add(1, Relaxed);
-        WCD_HOLD_MAX_US[wi].fetch_max(hold_us, Relaxed);
+        WCD_CHUNKS.get(wi).fetch_add(1, Relaxed);
+        WCD_HOLD_MAX_US.get(wi).fetch_max(hold_us, Relaxed);
         if !stable {
-            WCD_ACC_UNSTABLE[wi].store(1, Relaxed);
+            WCD_ACC_UNSTABLE.get(wi).store(1, Relaxed);
         }
-        let acc_checked = WCD_ACC_CHECKED[wi].fetch_add(checked as u32, Relaxed) + checked as u32;
-        let acc_nonzero = WCD_ACC_NONZERO[wi].fetch_add(nonzero as u32, Relaxed) + nonzero as u32;
-        let acc_occ = WCD_ACC_OCC[wi].fetch_add(occluded as u32, Relaxed) + occluded as u32;
-        let acc_spr = WCD_ACC_SPRITE[wi].fetch_add(sprite_px as u32, Relaxed) + sprite_px as u32;
-        let acc_mov = WCD_ACC_MOVED[wi].fetch_add(moved as u32, Relaxed) + moved as u32;
+        let acc_checked = WCD_ACC_CHECKED.get(wi).fetch_add(checked as u32, Relaxed) + checked as u32;
+        let acc_nonzero = WCD_ACC_NONZERO.get(wi).fetch_add(nonzero as u32, Relaxed) + nonzero as u32;
+        let acc_occ = WCD_ACC_OCC.get(wi).fetch_add(occluded as u32, Relaxed) + occluded as u32;
+        let acc_spr = WCD_ACC_SPRITE.get(wi).fetch_add(sprite_px as u32, Relaxed) + sprite_px as u32;
+        let acc_mov = WCD_ACC_MOVED.get(wi).fetch_add(moved as u32, Relaxed) + moved as u32;
         if ok {
             // Clean (or merely moved-under) chunk: the cursor moves. Progress also re-arms the
             // service taker's liveness bound — [`PAYGO_SVC_TRIES`] caps marks WITHOUT progress (its
             // anti-wedge purpose), and a battery that now takes a box in tens of chunks would
             // exhaust a fixed cap of 16 while doing exactly what it was asked to.
-            WCD_CUR[wi].store(row1 as u32, Relaxed);
-            PAYGO_SVC_TRIES[wi].store(0, Relaxed);
+            WCD_CUR.get(wi).store(row1 as u32, Relaxed);
+            PAYGO_SVC_TRIES.get(wi).store(0, Relaxed);
             if row1 < full_rows {
                 wcd_release(wi, running);
                 return;
@@ -7260,7 +7260,7 @@ fn verify_window(
                 acc_spr as usize,
                 acc_mov as usize,
                 acc_mov > 0,
-                stable && WCD_ACC_UNSTABLE[wi].load(Relaxed) == 0,
+                stable && WCD_ACC_UNSTABLE.get(wi).load(Relaxed) == 0,
                 BandFmt(None),
             )
         } else {
@@ -7804,7 +7804,7 @@ fn verify_reference(
 ) -> Option<VerifyRef> {
     // FOCUS-VIS — `presented`, so the one-shot is not claimed by the create-time composite of a blank
     // surface. `compat` rows have no chrome and no owner to verify against; `id < 32` is the latch width.
-    if r.compat || !r.presented || r.id >= 32 {
+    if r.compat || !r.presented {
         return None;
     }
     // WC-D — which verdict does this window still owe, and may it be taken NOW? `step` is the
@@ -7911,7 +7911,7 @@ fn verify_reference(
         (row0, row1, banded)
     } else {
         use core::sync::atomic::Ordering::Relaxed;
-        let cur = WCD_CUR[i].load(Relaxed) as usize;
+        let cur = WCD_CUR.get(i).load(Relaxed) as usize;
         if cur >= row1 {
             if cur >= rows && row1 == rows {
                 // The box SHRANK under a part-paid battery. Review N1: the stage-2 wire must not
@@ -7920,13 +7920,13 @@ fn verify_reference(
                 // gate's `full` REQUIRE and no FORBID). Every banked chunk was clean (`bad` closes
                 // the battery on the spot), so the bad counts are zero by construction; `moved`
                 // decides PASS against LIVE exactly as the closing chunk would have.
-                let mv = WCD_ACC_MOVED[i].load(Relaxed);
+                let mv = WCD_ACC_MOVED.get(i).load(Relaxed);
                 crate::census_println!(
                     "[wc-d] verify win={} surf={}x{} band=none scale={}x at ({},{}) panel={}x{} checked={} coverage=shrunk bad_cache=0 bad_ram=0 ram_indep=no moved={} sprite_px={} nonzero={} occluded={} cksum={:#018x} first=none -> {}",
                     r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
-                    WCD_ACC_CHECKED[i].load(Relaxed), mv,
-                    WCD_ACC_SPRITE[i].load(Relaxed), WCD_ACC_NONZERO[i].load(Relaxed),
-                    WCD_ACC_OCC[i].load(Relaxed), surface_checksum(r),
+                    WCD_ACC_CHECKED.get(i).load(Relaxed), mv,
+                    WCD_ACC_SPRITE.get(i).load(Relaxed), WCD_ACC_NONZERO.get(i).load(Relaxed),
+                    WCD_ACC_OCC.get(i).load(Relaxed), surface_checksum(r),
                     if mv > 0 { "LIVE (unverifiable)" } else { "PASS" }
                 );
                 // WCD-CLIP1 — `full = true`: this is a STAGE-2 close over every row the shrunk box
@@ -7945,12 +7945,12 @@ fn verify_reference(
         if cur == 0 {
             // First chunk of a stage: this stage's banked sums start clean. Single-writer — the
             // state machine admits one reference at a time — so plain stores.
-            WCD_ACC_CHECKED[i].store(0, Relaxed);
-            WCD_ACC_NONZERO[i].store(0, Relaxed);
-            WCD_ACC_OCC[i].store(0, Relaxed);
-            WCD_ACC_SPRITE[i].store(0, Relaxed);
-            WCD_ACC_MOVED[i].store(0, Relaxed);
-            WCD_ACC_UNSTABLE[i].store(0, Relaxed);
+            WCD_ACC_CHECKED.get(i).store(0, Relaxed);
+            WCD_ACC_NONZERO.get(i).store(0, Relaxed);
+            WCD_ACC_OCC.get(i).store(0, Relaxed);
+            WCD_ACC_SPRITE.get(i).store(0, Relaxed);
+            WCD_ACC_MOVED.get(i).store(0, Relaxed);
+            WCD_ACC_UNSTABLE.get(i).store(0, Relaxed);
         }
         // Snapshot cap: `want` below covers `row0..row1`, and without a cap a chunk against a tall
         // window re-copies every remaining row's source per chunk — O(rows^2) bytes across the
@@ -8115,7 +8115,7 @@ fn yn(b: bool) -> &'static str {
 /// verdict's latch, and [`VERIFIED_FULL`] becomes the terminal one. On every other build there is
 /// one verdict and this is still it.
 #[cfg(feature = "witness")]
-static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VERIFIED: SlotBits = SlotBits::new(); // WINDOWCAP-2: keyed by id, growable (was a u32 latch)
 
 // ---- WCD-TEARDOWN — the panel-write interlock the read-back adjudicates against -----------------
 //
@@ -8386,8 +8386,8 @@ fn panel_stable(before: PanelSeq, after: PanelSeq, rect: (usize, usize, usize, u
 /// An ODOMETER: it keeps counting past the cap that stops the RETRIES, which is the spent-budget law
 /// this module applies to every capped counter. Printed as `aborts=`.
 #[cfg(feature = "witness")] // WMPAR — WCD-TEARDOWN fill half; arch-neutral, see PANEL_FILL_EPOCH
-static WCD_ABORTS: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_ABORTS: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WCD-TEARDOWN — retries a window may spend before an abort stops handing the verdict back.
 ///
@@ -8508,7 +8508,7 @@ const WCD_ABORT_MAX: u32 = 6;
 /// consequence, stated because it is a real narrowing, that the direct-path present it forces is now
 /// verified at lattice coverage rather than in full.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static VERIFIED_FULL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static VERIFIED_FULL: SlotBits = SlotBits::new(); // WINDOWCAP-2
 
 /// WC-D — per-id state width for every per-window array in this witness. The same 32 [`VERIFIED`]'s
 /// bitmask is, and for the same reason: [`verify_reference`] declines any `id >= 32` before it
@@ -8516,7 +8516,7 @@ static VERIFIED_FULL: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 /// verdict progression exists on every witness build, and only the abort machinery layered over it is
 /// x86-only.
 #[cfg(feature = "witness")]
-const WCD_IDS: usize = 32;
+// WINDOWCAP-2: `WCD_IDS` (32) is gone — every WC-D table is a SegVec keyed by id.
 
 /// The `id >= 32` guard in [`verify_reference`] and every `[AtomicU32; WCD_IDS]` above have to be the
 /// same number, and `VERIFIED`'s `1u32 << id` puts a hard ceiling on it. Pinned rather than trusted:
@@ -8524,7 +8524,7 @@ const WCD_IDS: usize = 32;
 /// the bit away for `id >= 30` and made a release clear nothing. The state machine retired the
 /// packing, and this keeps the remaining coupling honest.
 #[cfg(feature = "witness")]
-const _: () = assert!(WCD_IDS == 32, "WCD_IDS must match verify_reference's `id >= 32` guard");
+// WINDOWCAP-2: the `id >= 32` latch-width guard is gone (VERIFIED is a SlotBits keyed by id).
 
 /// WC-D/PAYGO — the lattice's column step, in SOURCE columns. `wcg`'s sixteen, taken from `wcg`, for
 /// the reason its own note gives: sixteen is a coverage decision before it is a cost one, and one
@@ -8551,16 +8551,16 @@ const _: () = assert!(
 /// the fix was to close it per window. Nothing here can be wrong in that way because there is nothing
 /// here that reads across ids.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static WCD_DEFERRED: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_DEFERRED: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WC-D/PAYGO — per-id: `[wc-d] paygo` lines emitted for this window so far. Printed as `emit=`,
 /// one-based. The reader's rule is `wcg`'s standing one: for any `win=`, the greatest `emit=`
 /// supersedes every earlier line, and these lines are never summed — they are snapshots of a monotone
 /// total, not deltas.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static WCD_EMIT: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_EMIT: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WC-D/PAYGO — per-id: the right to print the census-opening line, taken exactly once. Two cores
 /// declining the same window in the same instant must not both emit `emit=1`.
@@ -8572,8 +8572,8 @@ static WCD_EMIT: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// that opens the census. `wcg::paygo_flush` never meets this because its first line comes off
 /// `PAYGO_PEND` rather than off the cadence; this is the same guarantee reached from the other end.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static WCD_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_SAID: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WC-D/PAYGO — per-id: `now_cycles()` as of the END of the most recent `[wc-d] paygo` emission. The
 /// refresh's rate gate and its mutual exclusion both, exactly as `wcg::PAYGO_LASTROLL` serves that
@@ -8581,8 +8581,8 @@ static WCD_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// whose `compare_exchange` succeeds prints. Re-armed after the serial write, so
 /// `wcg::CENSUS_PERIOD_US` bounds the duty cycle and not merely the gap between line starts.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static WCD_LASTROLL: [core::sync::atomic::AtomicU64; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; WCD_IDS];
+static WCD_LASTROLL: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// WCD-CHUNK — the launch-stall fix (GR27), and the invariant it encodes: no composite pass may hold
 /// `COMP_GATE` — IRQs masked, on the presenting app's own core — for an unbounded glass read-back.
@@ -8630,8 +8630,8 @@ const WCD_CHUNK_ROWS_MAX: usize = 64;
 /// by a clean banked chunk; an aborted or declined chunk re-walks the same rows. Reset by the
 /// stage-1 -> stage-2 transition in [`wcd_commit`] and by the recycle in `create_inner`.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static WCD_CUR: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_CUR: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WCD-CHUNK — per-id telemetry for the terminal PAID line: `chunks=` and `hold_max_us=`. THE
 /// FALSIFIER for the launch-stall fix: Boot Ab measured the unchunked hold at ~1.26 s on the wire,
@@ -8646,11 +8646,11 @@ static WCD_CUR: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// two orders below the number this field exists to falsify; it is excluded because the same
 /// snapshot cost is paid by UNCHUNKED verdicts too and folding it in would blur what shrank.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static WCD_CHUNKS: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_CHUNKS: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static WCD_HOLD_MAX_US: [core::sync::atomic::AtomicU64; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; WCD_IDS];
+static WCD_HOLD_MAX_US: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// WCD-CHUNK — per-id banked sums for the cumulative terminal verdict: silent clean chunks add
 /// their `checked`/`nonzero`/`occluded`/`sprite_px` here (their `bad`/`moved` are zero — that is
@@ -8662,26 +8662,26 @@ static WCD_HOLD_MAX_US: [core::sync::atomic::AtomicU64; WCD_IDS] =
 // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
 // why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-static WCD_ACC_CHECKED: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_ACC_CHECKED: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
 // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
 // why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-static WCD_ACC_NONZERO: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_ACC_NONZERO: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
 // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
 // why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-static WCD_ACC_OCC: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_ACC_OCC: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
 // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
 // why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-static WCD_ACC_SPRITE: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_ACC_SPRITE: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 /// WCD-CHUNK (review N3) — `moved` accumulates too, because a moved-under chunk CONTINUES instead
 /// of closing: the closing chunk speaks LIVE iff this is nonzero, so a busy surface still gets its
 /// whole box walked and one line, not a whole-box verdict off two rows or a hundred LIVE lines.
@@ -8689,14 +8689,14 @@ static WCD_ACC_SPRITE: [core::sync::atomic::AtomicU32; WCD_IDS] =
 // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
 // why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-static WCD_ACC_MOVED: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_ACC_MOVED: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
 // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
 // why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
-static WCD_ACC_UNSTABLE: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_ACC_UNSTABLE: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WC-D — the per-id verdict progression, as ONE atomic per window.
 ///
@@ -8723,8 +8723,8 @@ static WCD_ACC_UNSTABLE: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// could read `taken=0` when a recycle cleared the masks between the claim and the print; the state
 /// cell is the single source of truth and the recycle resets it too).
 #[cfg(feature = "witness")]
-static WCD_STATE: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(WCD_ST_FIRST) }; WCD_IDS];
+static WCD_STATE: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(WCD_ST_FIRST));
 
 /// Resting: owes its first verdict. The state every window starts and recycles into.
 #[cfg(feature = "witness")]
@@ -8747,7 +8747,7 @@ const WCD_ST_DONE: u32 = 4;
 /// the wire. Recycle-safe because the recycle resets the same cell it reads.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_taken(i: usize) -> u32 {
-    match WCD_STATE[i].load(core::sync::atomic::Ordering::Relaxed) {
+    match WCD_STATE.get(i).load(core::sync::atomic::Ordering::Relaxed) {
         WCD_ST_FIRST | WCD_ST_FIRST_RUN => 0,
         WCD_ST_DONE => 2,
         _ => 1,
@@ -8767,7 +8767,7 @@ fn wcd_taken(i: usize) -> u32 {
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_admit(id: u32, i: usize) -> Option<(usize, u32)> {
     loop {
-        match WCD_STATE[i].load(core::sync::atomic::Ordering::Acquire) {
+        match WCD_STATE.get(i).load(core::sync::atomic::Ordering::Acquire) {
             WCD_ST_FIRST => {
                 if wcd_cas(i, WCD_ST_FIRST, WCD_ST_FIRST_RUN) {
                     return Some((WCD_LATTICE_N, WCD_ST_FIRST_RUN));
@@ -8780,7 +8780,7 @@ fn wcd_admit(id: u32, i: usize) -> Option<(usize, u32)> {
                 let (since_ms, clock, payable) = super::wcg::paygo_clock();
                 // PAYGO-TERM/PAY-AT-CLOSE — a window being torn down has no later to defer into. See
                 // [`WCD_FORCE`], and `wcg::PAYGO_FORCE` for the argument in full.
-                let forced = WCD_FORCE[i].load(core::sync::atomic::Ordering::Relaxed) != 0;
+                let forced = WCD_FORCE.get(i).load(core::sync::atomic::Ordering::Relaxed) != 0;
                 // WCD-GESTURE — a LIVE DRAG is a deferral reason of its own, and it is the deferral
                 // this arc exists for.
                 //
@@ -8834,8 +8834,8 @@ fn wcd_admit(id: u32, i: usize) -> Option<(usize, u32)> {
 /// budgets (wc-d has two STAGES, wc-g four SAMPLES) and one can close while the other is still owed;
 /// a shared latch would make the first to finish disarm the second.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static WCD_FORCE: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_FORCE: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WC-D/PAYGO-TERM — does this window owe a deferred verdict? `WCD_ST_FULL` is the RESTING state that
 /// means "first verdict published, full one owed", which is exactly the population the deferral gate
@@ -8852,10 +8852,10 @@ static WCD_FORCE: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// reaches every part-paid battery and drives its cursor home.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_pending(i: usize) -> bool {
-    i < WCD_IDS
-        && WCD_STATE[i].load(core::sync::atomic::Ordering::Acquire) == WCD_ST_FULL
-        && (WCD_SAID[i].load(core::sync::atomic::Ordering::Relaxed) != 0
-            || WCD_CUR[i].load(core::sync::atomic::Ordering::Relaxed) != 0)
+    i < u32::MAX as usize
+        && WCD_STATE.get(i).load(core::sync::atomic::Ordering::Acquire) == WCD_ST_FULL
+        && (WCD_SAID.get(i).load(core::sync::atomic::Ordering::Relaxed) != 0
+            || WCD_CUR.get(i).load(core::sync::atomic::Ordering::Relaxed) != 0)
 }
 
 /// WC-D/PAYGO-TERM — owed AND payable now. Read from `wcg::paygo_clock`, the same one definition
@@ -8868,8 +8868,8 @@ fn wcd_ripe(i: usize) -> bool {
 /// WC-D/PAYGO-TERM — arm/disarm the pay-at-close override. Paired by [`close`].
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_force(i: usize, on: bool) {
-    if i < WCD_IDS {
-        WCD_FORCE[i].store(u32::from(on), core::sync::atomic::Ordering::Relaxed);
+    if i < u32::MAX as usize {
+        WCD_FORCE.get(i).store(u32::from(on), core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -8896,8 +8896,8 @@ fn wcd_force(i: usize, on: bool) {
 /// It is also the wc-d wire's "the terminal was the last word" state: [`wcd_decline`] reads it and
 /// declines to re-open the census behind a terminal, the way `wcg::PAYGO_CLOSED` does for wc-g.
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
-static PAYGO_CLOSE_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static PAYGO_CLOSE_SAID: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// PAYGO-TERM — how many composites [`paygo_at_close`] will run to close one window's batteries.
 ///
@@ -8974,7 +8974,7 @@ const PAYGO_CLOSE_MAX: u32 = 8;
 #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn paygo_at_close(id: WinId) {
     let i = id as usize;
-    if i >= WCD_IDS {
+    if i >= u32::MAX as usize {
         return;
     }
     // Cheapest question first, and it is false for every window the gate never declined — which on
@@ -9038,16 +9038,16 @@ fn paygo_at_close(id: WinId) {
     // behind it. A terminal that fires repeatedly is not a terminal. But the latch is re-armed by
     // `create_inner` and NOT carried across the recycle: see [`PAYGO_CLOSE_SAID`] for the premise
     // that got that wrong the first time and what it cost the slot's later tenants.
-    let said = PAYGO_CLOSE_SAID[i].load(core::sync::atomic::Ordering::Relaxed);
+    let said = PAYGO_CLOSE_SAID.get(i).load(core::sync::atomic::Ordering::Relaxed);
     if super::wcg::paygo_pending(i) && said & 1 == 0 {
         // Latched BEFORE the print on both wires, so a concurrent census flush that reaches its gate
         // from here on declines and the terminal keeps the greatest `emit=`. `wcg::paygo_closed`
         // takes its own latch for the same reason and in the same order.
-        PAYGO_CLOSE_SAID[i].fetch_or(1, core::sync::atomic::Ordering::Relaxed);
+        PAYGO_CLOSE_SAID.get(i).fetch_or(1, core::sync::atomic::Ordering::Relaxed);
         super::wcg::paygo_closed(id, i);
     }
     if wcd_pending(i) && said & 2 == 0 {
-        PAYGO_CLOSE_SAID[i].fetch_or(2, core::sync::atomic::Ordering::Relaxed);
+        PAYGO_CLOSE_SAID.get(i).fetch_or(2, core::sync::atomic::Ordering::Relaxed);
         let (since_ms, clock, _) = super::wcg::paygo_clock();
         wcd_paygo_note(id, i, "closed", "UNSPENT", since_ms, clock, None);
     }
@@ -9057,7 +9057,7 @@ fn paygo_at_close(id: WinId) {
     // the branches that PRINTED would leave a battery that paid at close still eligible for the
     // periodic census, and a `waiting` line at a higher `emit=` behind a `PAID` supersedes it exactly
     // as it would behind an `UNSPENT`.
-    PAYGO_CLOSE_SAID[i].fetch_or(3, core::sync::atomic::Ordering::Relaxed);
+    PAYGO_CLOSE_SAID.get(i).fetch_or(3, core::sync::atomic::Ordering::Relaxed);
     super::wcg::paygo_seal_closed(i);
     // `PAYGO_SVC_TRIES` and `PAYGO_SVC_NOTED` are deliberately NOT reset here. Both are per-tenant
     // and both re-arm in `create_inner` — a close is the wrong place for them because the two early
@@ -9078,7 +9078,7 @@ fn wcd_admit(_id: u32, i: usize) -> Option<(usize, u32)> {
 #[cfg(feature = "witness")]
 #[inline]
 fn wcd_cas(i: usize, from: u32, to: u32) -> bool {
-    WCD_STATE[i]
+    WCD_STATE.get(i)
         .compare_exchange(
             from,
             to,
@@ -9106,20 +9106,20 @@ fn wcd_cas(i: usize, from: u32, to: u32) -> bool {
 /// behaviour is byte-for-byte what it was.
 #[cfg(feature = "witness")]
 fn wcd_commit(i: usize, running: u32, step: usize, full: bool) {
-    let bit = 1u32 << i;
-    VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+    let bit = i; /* WINDOWCAP-2: SlotBits index */
+    VERIFIED.set(bit);
     #[cfg(feature = "wcg-paygo")]
     {
         if step == 1 && full {
-            VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
-            WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
+            VERIFIED_FULL.set(bit);
+            WCD_STATE.get(i).store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
         } else {
             // WCD-CHUNK — stage 2 walks the box from the top; the cursor is stage-scoped state and
             // this transition is where a stage ends with another owed. WCD-CLIP1 routes a clipped
             // collapsed stage-1 pass here too, so its unwalked rows are owed to stage 2 rather than
             // sealed away.
-            WCD_CUR[i].store(0, core::sync::atomic::Ordering::Relaxed);
-            WCD_STATE[i].store(WCD_ST_FULL, core::sync::atomic::Ordering::Release);
+            WCD_CUR.get(i).store(0, core::sync::atomic::Ordering::Relaxed);
+            WCD_STATE.get(i).store(WCD_ST_FULL, core::sync::atomic::Ordering::Release);
         }
         let _ = running;
     }
@@ -9127,7 +9127,7 @@ fn wcd_commit(i: usize, running: u32, step: usize, full: bool) {
     {
         // No chunking on this build, so no time stop and no clip: `full` is always true here.
         let _ = (running, step, full);
-        WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
+        WCD_STATE.get(i).store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
     }
 }
 
@@ -9139,11 +9139,11 @@ fn wcd_commit(i: usize, running: u32, step: usize, full: bool) {
 /// instant, not of the row.
 #[cfg(feature = "witness")]
 fn wcd_seal(i: usize) {
-    let bit = 1u32 << i;
-    VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+    let bit = i; /* WINDOWCAP-2: SlotBits index */
+    VERIFIED.set(bit);
     #[cfg(feature = "wcg-paygo")]
-    VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
-    WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
+    VERIFIED_FULL.set(bit);
+    WCD_STATE.get(i).store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
 }
 
 /// WC-D — hand the reference back with no verdict published and nothing counted.
@@ -9161,7 +9161,7 @@ fn wcd_unwind(i: usize, running: u32) {
         let _ = running;
         WCD_ST_FIRST
     };
-    WCD_STATE[i].store(resting, core::sync::atomic::Ordering::Release);
+    WCD_STATE.get(i).store(resting, core::sync::atomic::Ordering::Release);
 }
 
 /// WC-D — hand this window's verdict back so a later composite can take it again.
@@ -9194,21 +9194,21 @@ fn wcd_decline(id: u32, i: usize, since_ms: u64, clock: &'static str) {
     // would read the terminal as superseded. The census still moves (`WCD_DEFERRED` is a per-id total
     // for the whole boot and stays monotone across a recycle); only the PRINT is suppressed, and only
     // until `create_inner` re-arms the latch for the next tenant. `wcg::paygo_flush` has the twin.
-    let closed = PAYGO_CLOSE_SAID[i].load(core::sync::atomic::Ordering::Acquire) & 2 != 0;
-    WCD_DEFERRED[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let closed = PAYGO_CLOSE_SAID.get(i).load(core::sync::atomic::Ordering::Acquire) & 2 != 0;
+    WCD_DEFERRED.get(i).fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if closed {
         return;
     }
-    if WCD_SAID[i].swap(1, core::sync::atomic::Ordering::AcqRel) == 0 {
+    if WCD_SAID.get(i).swap(1, core::sync::atomic::Ordering::AcqRel) == 0 {
         wcd_paygo_note(id, i, "waiting", "DEFERRED", since_ms, clock, None);
         return;
     }
-    let last = WCD_LASTROLL[i].load(core::sync::atomic::Ordering::Relaxed);
+    let last = WCD_LASTROLL.get(i).load(core::sync::atomic::Ordering::Relaxed);
     let now = crate::arch::now_cycles();
     if super::wcg::cycles_to_us(now.saturating_sub(last)) < super::wcg::CENSUS_PERIOD_US {
         return;
     }
-    if WCD_LASTROLL[i]
+    if WCD_LASTROLL.get(i)
         .compare_exchange(
             last,
             now,
@@ -9253,7 +9253,7 @@ fn wcd_paygo_note(
     // straddles a recycle by construction), which is how a `-> PAID` could read `taken=0`. The state
     // cell is reset by the same recycle, so it cannot disagree with itself.
     let taken = wcd_taken(i);
-    let emit = WCD_EMIT[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    let emit = WCD_EMIT.get(i).fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     match chunks {
         None => serial_println!(
             "[wc-d] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget=2 -> {}",
@@ -9261,7 +9261,7 @@ fn wcd_paygo_note(
             state,
             emit,
             WCD_LATTICE_N,
-            WCD_DEFERRED[i].load(core::sync::atomic::Ordering::Relaxed),
+            WCD_DEFERRED.get(i).load(core::sync::atomic::Ordering::Relaxed),
             super::wcg::PAYGO_DEFER_MS,
             since_ms,
             clock,
@@ -9274,7 +9274,7 @@ fn wcd_paygo_note(
             state,
             emit,
             WCD_LATTICE_N,
-            WCD_DEFERRED[i].load(core::sync::atomic::Ordering::Relaxed),
+            WCD_DEFERRED.get(i).load(core::sync::atomic::Ordering::Relaxed),
             super::wcg::PAYGO_DEFER_MS,
             since_ms,
             clock,
@@ -9285,7 +9285,7 @@ fn wcd_paygo_note(
         ),
     }
     // Re-armed from AFTER the serial write, deliberately — see [`WCD_LASTROLL`].
-    WCD_LASTROLL[i].store(crate::arch::now_cycles(), core::sync::atomic::Ordering::Relaxed);
+    WCD_LASTROLL.get(i).store(crate::arch::now_cycles(), core::sync::atomic::Ordering::Relaxed);
 }
 
 /// WC-D/PAYGO — the battery's terminal line, emitted beside the verdict that closed it so the
@@ -9296,8 +9296,8 @@ fn wcd_complete(id: u32, i: usize) {
     let (since_ms, clock, _) = super::wcg::paygo_clock();
     // WCD-CHUNK — the falsifier rides the terminal: how many chunks the battery took and the worst
     // single gate-held wall any of them imposed. See [`WCD_CHUNKS`].
-    let chunks = WCD_CHUNKS[i].load(core::sync::atomic::Ordering::Relaxed);
-    let hold = WCD_HOLD_MAX_US[i].load(core::sync::atomic::Ordering::Relaxed);
+    let chunks = WCD_CHUNKS.get(i).load(core::sync::atomic::Ordering::Relaxed);
+    let hold = WCD_HOLD_MAX_US.get(i).load(core::sync::atomic::Ordering::Relaxed);
     wcd_paygo_note(id, i, "complete", "PAID", since_ms, clock, Some((chunks, hold)));
 }
 
@@ -13038,7 +13038,7 @@ impl WcnRow {
 /// because `WcnRow` holds atomics; the assertion below is what keeps it honest if [`MAX_WINDOWS`]
 /// ever moves.
 #[cfg(feature = "witness")]
-static WCN: [WcnRow; MAX_WINDOWS] = [const { WcnRow::new() }; MAX_WINDOWS]; // WINDOWCAP (B378) — ⚠ line-NEUTRAL: sized by the id space, not twelve written-out rows (the 15 lines below are kept as comments so nothing beneath moves)
+static WCN: SegVec<WcnRow> = SegVec::new(|| WcnRow::new()); // WINDOWCAP (B378) — ⚠ line-NEUTRAL: sized by the id space, not twelve written-out rows (the 15 lines below are kept as comments so nothing beneath moves)
 //  WcnRow::new(),
 //  WcnRow::new(),
 //  WcnRow::new(),
@@ -13056,7 +13056,7 @@ static WCN: [WcnRow; MAX_WINDOWS] = [const { WcnRow::new() }; MAX_WINDOWS]; // W
 //  ];
 
 #[cfg(feature = "witness")]
-const _: () = assert!(WCN.len() == MAX_WINDOWS);
+// WINDOWCAP-2: WCN is a SegVec now; its length is the table's, not a constant.
 
 /// WC-N — composite passes that reached the blit loop, and passes that returned before it (the F4
 /// drain barrier was up, or the framebuffer was not ready). An aborted pass is a present that cost
@@ -13856,7 +13856,7 @@ fn wcn_slot(id: WinId) -> Option<&'static WcnRow> {
     if id == WIN_NONE {
         return None;
     }
-    WCN.get(id as usize - 1)
+    Some(WCN.get(id as usize - 1))
 }
 
 /// WC-N — record one [`present`] against `id`, and fold its inter-present gap into the active/parked
@@ -13872,8 +13872,8 @@ fn wcn_note_present(id: WinId, hidden: bool) {
     // ARCH-PARITY (rmbp-7) — no term of its own: the counter it bumps is `witness`-gated, like
     // this function, so the bump is built exactly where the rollup that reads it is.
     if let Some(i) = (id as usize).checked_sub(1) {
-        if i < MAX_WINDOWS {
-            NOATT_SEQ[i].fetch_add(1, Relaxed);
+        if i < u32::MAX as usize {
+            NOATT_SEQ.get(i).fetch_add(1, Relaxed);
         }
     }
     let Some(s) = wcn_slot(id) else { return };
@@ -14033,15 +14033,15 @@ fn wcn_note_relay(id: WinId) {
 /// owner attempted, and NEVER drained: the reading is a DIFFERENCE against [`NOATT_SEEN`], so a
 /// counter the rollup swapped would manufacture a fresh "no attach" the instant it fired.
 #[cfg(feature = "witness")]
-static NOATT_SEQ: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+static NOATT_SEQ: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// NOATT — per-id: [`NOATT_SEQ`] as the PREVIOUS composite pass saw it. Stamped for every slot on
 /// every pass, so "since the previous pass" is literal and a row that sat out a pass does not
 /// accumulate a spurious quiet interval.
 #[cfg(feature = "witness")]
-static NOATT_SEEN: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+static NOATT_SEEN: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// NOATT — per-span: passes that reached the seed snapshot.
 #[cfg(feature = "witness")]
@@ -14082,16 +14082,16 @@ fn noatt_note_taker() {
 /// concurrently cannot both claim the same quiet interval.
 #[cfg(feature = "witness")]
 fn noatt_note_pass(
-    rows: &[Window; MAX_WINDOWS],
-    seed: &[bool; MAX_WINDOWS],
-    bands: &[Option<(usize, usize)>; MAX_WINDOWS],
+    rows: &[Window],
+    seed: &[bool],
+    bands: &[Option<(usize, usize)>],
 ) {
     use core::sync::atomic::Ordering::Relaxed;
     NOATT_PASSES.fetch_add(1, Relaxed);
     let (mut seeds, mut noatt, mut kpx) = (0u64, 0u64, 0u64);
-    for i in 0..MAX_WINDOWS {
-        let seq = NOATT_SEQ[i].load(Relaxed);
-        let seen = NOATT_SEEN[i].swap(seq, Relaxed);
+    for i in 0..rows.len() {
+        let seq = NOATT_SEQ.get(i).load(Relaxed);
+        let seen = NOATT_SEEN.get(i).swap(seq, Relaxed);
         if !seed[i] {
             continue;
         }
@@ -14231,12 +14231,12 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // WCN-CAUSE — `z` joins the identity tuple, from the SAME acquisition as `asid`/`live`/`above`.
     // It has to be this snapshot and not a second one: the whole point of the field is to be read
     // beside `dout`, and a z taken after a focus change would explain the wrong stack.
-    let mut ident = [(0u64, false, false, 0u32); MAX_WINDOWS]; // (owner asid, live, above shell, z)
+    let mut ident = alloc::vec![(0u64, false, false, 0u32); slots().max(WCN.hwm())]; // (owner asid, live, above shell, z) — WINDOWCAP-2: one per slot ever grown
     {
         let t = table();
         let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
         for r in t.rows.iter() {
-            if !r.used || r.id == WIN_NONE || r.id as usize > MAX_WINDOWS {
+            if !r.used || r.id == WIN_NONE || r.id as usize > ident.len() {
                 continue;
             }
             ident[r.id as usize - 1] = (r.owner_asid, true, above_shell(r, shell), r.z);
@@ -14244,8 +14244,8 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     }
     let (mut t_att, mut t_comp, mut t_hid, mut t_bel) = (0u64, 0u64, 0u64, 0u64);
     let mut wins = 0usize;
-    let mut lines: [Option<WcnLine>; MAX_WINDOWS] = [None; MAX_WINDOWS];
-    for (i, s) in WCN.iter().enumerate() {
+    let mut lines: alloc::vec::Vec<Option<WcnLine>> = alloc::vec![None; ident.len()]; // WINDOWCAP-2
+    for (i, s) in (0..ident.len()).map(|i| (i, WCN.get(i))) {
         let att = s.att.swap(0, Relaxed);
         let hid = s.hid.swap(0, Relaxed);
         let bel = s.bel.swap(0, Relaxed);
@@ -15221,8 +15221,8 @@ fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
 /// 60 Hz composite still gets exactly one. That is the whole of the rate limit — it is a per-window
 /// latch, not a per-second cadence, because the fact being reported ("this window has no control
 /// cluster") does not change while the window's width does not.
-static CTRL_DECL_STATE: [core::sync::atomic::AtomicU32; MAX_WINDOWS + 1] =
-    [const { core::sync::atomic::AtomicU32::new(CTRL_DECL_UNSEEN) }; MAX_WINDOWS + 1];
+static CTRL_DECL_STATE: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(CTRL_DECL_UNSEEN));
 
 /// CTRLWIT — this window has not declined (yet). Reset per TENANT, in `create_inner`: ids are
 /// recycled slot aliases, and a new window in an old slot is a different window that is owed its
@@ -15235,12 +15235,12 @@ const CTRL_DECL_SPOKEN: u32 = 2;
 
 /// CTRLWIT — the owner ASID captured at the arming decline, so the drain can name it after the row
 /// may already have been closed.
-static CTRL_DECL_OWNER: [core::sync::atomic::AtomicU64; MAX_WINDOWS + 1] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS + 1];
+static CTRL_DECL_OWNER: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// CTRLWIT — the outer-box width captured at the arming decline. Same reason as the owner.
-static CTRL_DECL_BW: [core::sync::atomic::AtomicU32; MAX_WINDOWS + 1] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_WINDOWS + 1];
+static CTRL_DECL_BW: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// CTRLWIT — **per SLOT**: how many decline lines this boot has put on the wire for it. The
 /// fixture's handle — "the witness fired exactly once" is a claim about EMISSIONS, and an emission
@@ -15256,8 +15256,8 @@ static CTRL_DECL_BW: [core::sync::atomic::AtomicU32; MAX_WINDOWS + 1] =
 ///
 /// Never reset — not at close and not at re-arm. It is a per-boot total by design, and the fixture
 /// reads DELTAS against a baseline it takes itself.
-static CTRL_DECL_SPOKE_AT: [core::sync::atomic::AtomicU32; MAX_WINDOWS + 1] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_WINDOWS + 1];
+static CTRL_DECL_SPOKE_AT: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// CTRLWIT — re-arm the decline witness for a new tenant of slot `id`.
 ///
@@ -15266,8 +15266,8 @@ static CTRL_DECL_SPOKE_AT: [core::sync::atomic::AtomicU32; MAX_WINDOWS + 1] =
 /// written before the state cell that gates them (see the arm in [`controls`]), so there is nothing
 /// stale for a re-arm to clear and a clear here would race the next arm.
 fn controls_declined_rearm(id: WinId) {
-    if id != WIN_NONE && (id as usize) <= MAX_WINDOWS {
-        CTRL_DECL_STATE[id as usize]
+    if id != WIN_NONE {
+        CTRL_DECL_STATE.get(id as usize)
             .store(CTRL_DECL_UNSEEN, core::sync::atomic::Ordering::Release);
     }
 }
@@ -15287,20 +15287,20 @@ fn controls_declined_rearm(id: WinId) {
 /// the CAS behind it still decides the race — the load is a filter, never the verdict.
 fn controls_declined_drain() {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed};
-    for i in 1..=MAX_WINDOWS {
-        if CTRL_DECL_STATE[i].load(Relaxed) != CTRL_DECL_PENDING {
+    for i in 1..CTRL_DECL_STATE.hwm() { // WINDOWCAP-2: every id ever armed
+        if CTRL_DECL_STATE.get(i).load(Relaxed) != CTRL_DECL_PENDING {
             continue;
         }
-        if CTRL_DECL_STATE[i]
+        if CTRL_DECL_STATE.get(i)
             .compare_exchange(CTRL_DECL_PENDING, CTRL_DECL_SPOKEN, AcqRel, Relaxed)
             .is_ok()
         {
-            CTRL_DECL_SPOKE_AT[i].fetch_add(1, Relaxed);
+            CTRL_DECL_SPOKE_AT.get(i).fetch_add(1, Relaxed);
             crate::bootlog_println!(
                 "[wm] controls-declined win={} owner={:#x} bw={} floor={}",
                 i,
-                CTRL_DECL_OWNER[i].load(Relaxed),
-                CTRL_DECL_BW[i].load(Relaxed),
+                CTRL_DECL_OWNER.get(i).load(Relaxed),
+                CTRL_DECL_BW.get(i).load(Relaxed),
                 CLUSTER_MIN_BOX_W()
             );
         }
@@ -15518,7 +15518,7 @@ fn controls(r: &Window) -> Option<(usize, usize, usize)> {
         //
         // The print itself is NOT here: this runs inside a `table()` critical section. It arms.
         let i = r.id as usize;
-        if r.id != WIN_NONE && i <= MAX_WINDOWS {
+        if r.id != WIN_NONE {
             // CTRLWIT-REVIEW — **the payload is published BEFORE the state cell, not after.** The
             // first cut CASed `UNSEEN -> PENDING` and then stored the owner and the width, which is
             // a store-after-publish: the state cell is what a drain gates on, so between the CAS and
@@ -15537,13 +15537,13 @@ fn controls(r: &Window) -> Option<(usize, usize, usize)> {
             //
             // Two cores declining the same row write identical values (same row, same `bw`, same
             // owner), so the pre-publish is idempotent as well as ordered.
-            CTRL_DECL_OWNER[i].store(r.owner_asid, core::sync::atomic::Ordering::Relaxed);
+            CTRL_DECL_OWNER.get(i).store(r.owner_asid, core::sync::atomic::Ordering::Relaxed);
             // Saturating, not truncating: `outer_box` saturates rather than wraps, so a nonsense
             // row can present an absurd width, and a `as u32` of it would put a SMALL number on the
             // wire — a witness that lies about the one quantity it exists to report.
-            CTRL_DECL_BW[i]
+            CTRL_DECL_BW.get(i)
                 .store(bw.min(u32::MAX as usize) as u32, core::sync::atomic::Ordering::Relaxed);
-            let _ = CTRL_DECL_STATE[i].compare_exchange(
+            let _ = CTRL_DECL_STATE.get(i).compare_exchange(
                 CTRL_DECL_UNSEEN,
                 CTRL_DECL_PENDING,
                 core::sync::atomic::Ordering::AcqRel,
@@ -16376,7 +16376,7 @@ static DO_BOX: [core::sync::atomic::AtomicUsize; 4] =
 static DO_ZID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WC-K3 — ids (bit per id, `id < 32`) that painted a neighbour pixel during this gesture.
 #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
-static DO_NEIGH_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static DO_NEIGH_MASK: SlotBits = SlotBits::new(); // WINDOWCAP-2
 /// WC-K3 — panel pixels this gesture published for windows other than the dragged one.
 #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static DO_NEIGH_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -16700,7 +16700,7 @@ impl core::fmt::Display for OccDockBox {
 /// instant. `w == 0` (no drag, or its row has gone) leaves every fill uncharged, exactly as
 /// [`dragocc_target`]'s zero does.
 #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
-fn dragfill_box(rows: &[Window; MAX_WINDOWS]) {
+fn dragfill_box(rows: &[Window]) {
     use core::sync::atomic::Ordering::{Acquire, Relaxed};
     let id = DRAG_WIN.load(Acquire);
     let found = if id == WIN_NONE {
@@ -16728,7 +16728,7 @@ fn dragfill_box(rows: &[Window; MAX_WINDOWS]) {
 /// disagreement about a window that is moving anyway cannot manufacture a nonzero `occ_px` out of
 /// pixels nobody wrote.
 #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
-fn dragocc_pass(rows: &[Window; MAX_WINDOWS]) {
+fn dragocc_pass(rows: &[Window]) {
     use core::sync::atomic::Ordering::{Acquire, Relaxed};
     let id = DRAG_WIN.load(Acquire);
     let found = if id == WIN_NONE {
@@ -16802,8 +16802,8 @@ fn span_occ(d: Option<(usize, usize, usize, usize)>, y: usize, x0: usize, x1: us
 #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 fn dragocc_note(id: WinId, written: u64, occ: u64, clipped: u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    if id < 32 {
-        DO_NEIGH_MASK.fetch_or(1u32 << id, Relaxed);
+    {
+        DO_NEIGH_MASK.set(id as usize);
     }
     DO_NEIGH_PX.fetch_add(written, Relaxed);
     DO_OCC_PX.fetch_add(occ, Relaxed);
@@ -16925,7 +16925,7 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
     // line — a witness whose absence and whose clean verdict look the same is no witness.
     // WMPAR — the arch gate is GONE: every term this block reads is arch-neutral as of P2.
     {
-        let mask = DO_NEIGH_MASK.swap(0, Relaxed);
+        let mask = DO_NEIGH_MASK.take_count();
         let npx = DO_NEIGH_PX.swap(0, Relaxed);
         let opx = DO_OCC_PX.swap(0, Relaxed);
         let cpx = DO_CLIP_PX.swap(0, Relaxed);
@@ -17005,7 +17005,7 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
         if dockw == 0 {
             serial_println!(
                 "[drag-occ] win={} owner={:#x} moves={} neigh={} neigh_px={} occ_px={} fill_px={} clip_px={} buried={} direct={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock=absent bars={}/{} bar={} fillclip_dock_px={} occdock={} occclip_dock={} occclip_dock_px={} occclip_bar={} occclip_bar_px={} -> {}",
-                id, owner, moves, mask.count_ones(), npx, opx, fpx, cpx, buried, direct,
+                id, owner, moves, mask, npx, opx, fpx, cpx, buried, direct,
                 fpub, fclip, fovr, fruns, clipn, barsn, FURNITURE_MAX, barw, fdock,
                 OccDockBox(oddockw), odn, odpx, obn, obpx,
                 if clean { "CLEAN" } else { "BLEED" }
@@ -17013,7 +17013,7 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
         } else {
             serial_println!(
                 "[drag-occ] win={} owner={:#x} moves={} neigh={} neigh_px={} occ_px={} fill_px={} clip_px={} buried={} direct={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock={}x{}+{}+{} bars={}/{} bar={} fillclip_dock_px={} occdock={} occclip_dock={} occclip_dock_px={} occclip_bar={} occclip_bar_px={} -> {}",
-                id, owner, moves, mask.count_ones(), npx, opx, fpx, cpx, buried, direct,
+                id, owner, moves, mask, npx, opx, fpx, cpx, buried, direct,
                 fpub, fclip, fovr, fruns, clipn,
                 dockw,
                 DO_DOCK_BOX[3].load(Relaxed),
@@ -17749,7 +17749,7 @@ const MENU_OCC_MAX: usize = 1;
 /// and drop a box on the glass. The `dropped` report is the only witness that direction has, and it
 /// was compiled out of the media builds. It is un-gated and latched at the report site now; see the
 /// MGL1 block in `drain_deferred`.
-const OCC_MAX: usize = MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX;
+const OCC_MAX: usize = FURNITURE_MAX + MENU_OCC_MAX; // WINDOWCAP-2: no window term — `OccClip` is a growable Vec now; this is only the fixed (non-window) share, the initial reservation
 
 /// MGL1 — has the `erase_clip` overflow been said? One line per boot, not one per drain; see the
 /// MGL1 block in `drain_deferred` for why the latch is load-bearing rather than tidy.
@@ -17776,16 +17776,16 @@ static ERASE_CLIP_OVERFLOW_SAID: core::sync::atomic::AtomicBool =
 /// places: the `-1` is the `(z, id) <= (z, id)` self-exclusion in [`occ_clip`]'s loop, the
 /// `FURNITURE_MAX` is the registry's capacity, `const`-asserted equal to `strip::STRIP_MAX`, and the
 /// `MENU_OCC_MAX` is the transient dropdown [`occ_clip`] now also pushes (MENU-OCC).
-const OCC_CLIP_MAX: usize = (MAX_WINDOWS - 1) + FURNITURE_MAX + MENU_OCC_MAX;
+const OCC_CLIP_MAX: usize = FURNITURE_MAX + MENU_OCC_MAX; // WINDOWCAP-2: the window share grows with the table
 const _: () = assert!(
     OCC_CLIP_MAX <= OCC_MAX,
     "occ_clip's population (every row but the subject, plus every furniture strip and the open menu) \
      must fit OccClip"
 );
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct OccClip {
-    boxes: [(usize, usize, usize, usize); OCC_MAX],
+    boxes: alloc::vec::Vec<(usize, usize, usize, usize)>, // WINDOWCAP-2: growable (was `[_; OCC_MAX]`)
     n: usize,
 }
 
@@ -17803,15 +17803,15 @@ struct OccClip {
 /// so the ORDER is precomputed while the row-dependent part stays exact.
 struct OccRows {
     /// `(x0, x1, y0, y1)` — half-open on both axes, clipped to the present's column range.
-    iv: [(usize, usize, usize, usize); OCC_MAX],
+    iv: alloc::vec::Vec<(usize, usize, usize, usize)>, // WINDOWCAP-2
     n: usize,
 }
 
 impl OccClip {
     /// Nothing above: the topmost window's clip, and every window's clip on aarch64.
-    const fn none() -> Self {
+    fn none() -> Self {
         Self {
-            boxes: [(0, 0, 0, 0); OCC_MAX],
+            boxes: alloc::vec::Vec::new(),
             n: 0,
         }
     }
@@ -17835,10 +17835,10 @@ impl OccClip {
         if b.2 == 0 || b.3 == 0 {
             return true;
         }
-        if self.n >= OCC_MAX {
-            return false;
+        if self.boxes.try_reserve(1).is_err() {
+            return false; // WINDOWCAP-2: the only way a box is dropped now is the heap saying no
         }
-        self.boxes[self.n] = b;
+        self.boxes.push(b);
         self.n += 1;
         true
     }
@@ -17890,7 +17890,7 @@ impl OccClip {
     /// is about to copy a box — not once per row, which is what SHOULD-FIX 4 convicted.
     fn prepare(&self, x0: usize, x1: usize) -> OccRows {
         let mut o = OccRows {
-            iv: [(0, 0, 0, 0); OCC_MAX],
+            iv: alloc::vec::Vec::with_capacity(self.n),
             n: 0,
         };
         for &(ox, oy, ow, oh) in self.boxes[..self.n].iter() {
@@ -17903,7 +17903,7 @@ impl OccClip {
                 continue;
             }
             let e = (a, b, oy, oy.saturating_add(oh));
-            let mut k = o.n;
+            o.iv.push(e); let mut k = o.n; // WINDOWCAP-2: grow by one, then the insertion shift
             while k > 0 && o.iv[k - 1].0 > a {
                 o.iv[k] = o.iv[k - 1];
                 k -= 1;
@@ -17931,9 +17931,9 @@ impl OccRows {
         y: usize,
         x0: usize,
         x1: usize,
-        out: &mut [(usize, usize); OCC_MAX + 1],
+        out: &mut alloc::vec::Vec<(usize, usize)>,
     ) -> usize {
-        let mut n = 0usize;
+        let mut n = 0usize; out.clear(); // WINDOWCAP-2: the caller's warm buffer, grown as needed
         let mut cur = x0;
         for &(a, b, gy0, gy1) in self.iv[..self.n].iter() {
             // Row filter, asked per row because it is the only row-dependent term. Half-open in `y`,
@@ -17942,7 +17942,7 @@ impl OccRows {
                 continue;
             }
             if a > cur {
-                out[n] = (cur, a);
+                out.push((cur, a));
                 n += 1;
             }
             if b > cur {
@@ -17953,7 +17953,7 @@ impl OccRows {
             }
         }
         if cur < x1 {
-            out[n] = (cur, x1);
+            out.push((cur, x1));
             n += 1;
         }
         n
@@ -18076,7 +18076,7 @@ impl OccRows {
 /// because it is read as current. The ERASE side was never affected either way — [`erase_clip`]
 /// reaches the strip through `strip::rects`, i.e. `dock::strip_rect`, which pins.
 #[allow(unused_variables, unused_mut)]
-fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: usize) -> OccClip {
+fn occ_clip(rows: &[Window], i: usize, shell: u32, pw: usize, ph: usize) -> OccClip {
     let mut c = OccClip::none();
     {
         let (z, id) = (rows[i].z, rows[i].id);
@@ -18250,7 +18250,7 @@ pub(crate) fn occ_bar_probe(
     win: (usize, usize, usize, usize),
 ) -> OccBarProbe {
     let (bx, by, bw, bh) = win;
-    let mut spans = [(0usize, 0usize); OCC_MAX + 1];
+    let mut spans: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(OCC_MAX + 1); // WINDOWCAP-2
 
     // PROTECTED — the bar in the clip, the present's exact idiom (occ_clip's push, the row loop's
     // `span_occ(obarb, …)` reading of the emitted spans).
@@ -18437,7 +18437,7 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
         let shell = shell_z();
         let rows = {
             let t = table();
-            t.rows
+            t.rows.clone() // WINDOWCAP-2: a Vec now — an explicit copy (erase_clip runs per erase drain, not per frame)
         };
         for r in rows.iter() {
             // `compat` is EXCLUDED, matching `occ_clip`. A compat row is the full-screen present
@@ -18562,8 +18562,8 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
 /// `WRITER` here would be a nested acquisition inside the composite that already holds it.
 #[cfg(feature = "witness")]
 fn occ_clip_live(r: &Window, pw: usize, ph: usize) -> OccClip {
-    let t = table();
-    let mut rows = RowsSnap::take(); rows.copy_from_slice(&t.rows); // WINDOWCAP (B378): pooled, not a stack copy
+    let mut rows = RowsSnap::take(); rows.reserve(slots() + 4); let t = table();
+    rows.fill(&t.rows); // WINDOWCAP (B378): pooled, not a stack copy; reserved before the lock
     drop(t);
     match rows.iter().position(|q| q.used && q.id == r.id) {
         Some(i) => occ_clip(&rows, i, shell_z(), pw, ph),
@@ -18676,7 +18676,7 @@ fn subtract_box(
 /// window's current box — which the per-move subtraction was careful to exclude. The paint is still
 /// sound (the drain re-damages every window the enlarged box meets, and the same pass repaints it),
 /// but it is a one-pass flash of exactly the kind this arc removes. `coalesced=` is where that shows.
-const MAX_DEFER: usize = MAX_WINDOWS;
+const MAX_DEFER: usize = 16; // WINDOWCAP-2: a coalescing erase queue (a full queue UNIONS the next box, see `defer_erase`), not a window count — no longer tied to the table
 
 /// Why a fill could not stage. These mirror `wcg`'s `DECL_*`, and the mirror is not duplication for
 /// its own sake: `wcg` is compiled only under `witness`, while WC-L's decision about what to
@@ -18958,7 +18958,7 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
             "[wck4] erase clip OVERFLOW dropped={} cap={} worst={}+{}+{} — the erase may publish over live pixels",
             clip_dropped,
             OCC_MAX,
-            MAX_WINDOWS,
+            slots(),
             FURNITURE_MAX,
             MENU_OCC_MAX
         );
@@ -21012,9 +21012,9 @@ fn stage_window(
     // afterwards — so the fixture and the verification cannot land in different passes.
     #[cfg(feature = "witness")]
     {
-        if r.presented && r.id < 32 {
-            let bit = 1u32 << r.id;
-            if VERIFIED.load(core::sync::atomic::Ordering::Relaxed) & bit == 0
+        if r.presented {
+            let bit = r.id as usize;
+            if !VERIFIED.test(bit)
                 && !FALLBACK_FIXTURE.swap(true, core::sync::atomic::Ordering::Relaxed)
             {
                 super::wcg::stage_decline(r.id, super::wcg::DECL_FIXTURE);
@@ -21124,7 +21124,7 @@ fn stage_window(
     // the row loop: `occ` holds the boxes ordered by left edge, `spans` is the row walk's scratch and
     // is overwritten in place. Neither is touched at all on the `clip.n == 0` fast path.
     let occ = clip.prepare(bx, bx + bw);
-    let mut spans = [(0usize, 0usize); OCC_MAX + 1];
+    let mut spans: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(OCC_MAX + 1); // WINDOWCAP-2
 
     let fb_row = info.stride * bpp;
     // WC-M — one band per turn. `band` is the box-relative row the buffer currently holds.
@@ -21609,7 +21609,7 @@ fn stage_fill(
     // onto a panel with nothing on the glass — touches neither, and takes the pre-arc loop below
     // byte for byte.
     let occ = clip.prepare(x, x + w);
-    let mut spans = [(0usize, 0usize); OCC_MAX + 1];
+    let mut spans: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(OCC_MAX + 1); // WINDOWCAP-2
     // WCK4-D2 (integrator): the true `fb.blit` call count, fed to `erase_note` as `spans=` so the
     // `[wc-k]` line stops being arch-dependent in meaning. Equals `h` wherever no clip exists.
     let mut blit_calls: usize = 0; let hb = super::beam::hold(y, y + h, info.height, false, true); // BEAM (orin 26) — the fill's bracket: opened here, after the compose and after every `defer!`/`drop_fill!` exit (a declined fill writes no pixel and must not wait for a beam), closed after the rows are cleaned below.
@@ -23518,9 +23518,9 @@ fn create_inner(
         Some((x.clamp(BORDER(), max_x), y.clamp(min_y, max_y), scale, info.width, info.height))
     });
     let app_row = !compat && owner_asid != 0; let limit = if app_row { super::wincap::win_limit() } else { usize::MAX }; let mut t = table(); let apps = if app_row { t.rows.iter().filter(|r| r.used && !r.compat && r.owner_asid != 0).count() } else { 0 }; if apps >= limit { drop(t); super::wincap::note_open_refused(apps, false); return WIN_NONE; } // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST. The ONE dynamic limit (`video::wincap`, derived at boot from memory, the dock on this panel and the id space) counts APP rows only — `dock_addressable`'s predicate (used, not compat, owner ≠ 0), inlined because that fn is dock-gated — and a refusal is SAID: `[wm] REFUSED create reason=limit` on the wire and the notice on the glass (R70). System rows (owner 0: the login screen, the notice itself; compat) are never refused by the limit — that is what lets the notice open. The limit is read BEFORE the table lock (it may take `WRITER` by try_lock and the heap lock once at arming).
-    let slot = match t.rows.iter().position(|r| !r.used) {
+    let slot = match alloc_slot(&mut t) { // WINDOWCAP-2: the lowest free row, else the table grows by one
         Some(s) => s,
-        None => { drop(t); if app_row { super::wincap::note_open_refused(apps, true); } else { serial_println!("[wm] REFUSED create reason=ids owner=system (R90)"); } return WIN_NONE; } // WINDOWCAP (B378): the id space itself is full — said, never silent (same-line fold)
+        None => { drop(t); if app_row { super::wincap::note_open_refused(apps, true); } else { serial_println!("[wm] REFUSED create reason=heap owner=system (R90)"); } return WIN_NONE; } // WINDOWCAP-2: the table could not grow (heap, or the WinId type) — said, never silent (same-line fold)
     };
     if app_row { super::wincap::note_open_admitted(); } let z = t.next_z; // WINDOWCAP (B378): an admitted app row ends a refusal burst (same-line fold, code first)
     t.next_z = t.next_z.wrapping_add(1).max(1);
@@ -23533,7 +23533,7 @@ fn create_inner(
     // the DEAD tenant's row moments ago and is still blitting its shadow cannot race the new
     // tenant's fill (that pass holds the lock; the fill waits).
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-    PACE_SHADOW_OK.fetch_and(!(1u32 << slot), core::sync::atomic::Ordering::Relaxed);
+    PACE_SHADOW_OK.clear(slot);
     let mut row = Window::empty();
     row.used = true;
     row.id = id;
@@ -23614,19 +23614,19 @@ fn create_inner(
     // deserves its own verdict — clear the one-shot latch here rather than at close, which is the point
     // where the id demonstrably names something new.
     #[cfg(feature = "witness")]
-    if id < 32 {
-        VERIFIED.fetch_and(!(1u32 << id), core::sync::atomic::Ordering::Relaxed);
+    if id != WIN_NONE { // WINDOWCAP-2: no latch width
+        VERIFIED.clear(id as usize);
         // WC-D/PAYGO — the terminal latch travels with the first-verdict one, or a recycled id would
         // inherit its predecessor's completed battery and the new window would never be verified at all.
         // The `deferred=`/`emit=` census deliberately does NOT reset: it is a per-ID total for the whole
         // boot, and `emit=` has to stay monotone or the reader's "greatest `emit=` per `win=` supersedes"
         // rule breaks across a recycle.
         #[cfg(feature = "wcg-paygo")]
-        VERIFIED_FULL.fetch_and(!(1u32 << id), core::sync::atomic::Ordering::Relaxed);
+        VERIFIED_FULL.clear(id as usize);
         // WC-D — the STATE cell is the one that actually re-arms the window; the two bitmasks above
         // are published flags derived from it. Reset last, so no core can observe a cleared mask
         // against a stale state.
-        WCD_STATE[id as usize].store(WCD_ST_FIRST, core::sync::atomic::Ordering::Release); WCD_OOM_SAID[id as usize].store(0, core::sync::atomic::Ordering::Relaxed); // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL append, before this line's first `//`. The OOM-skip latch travels with the verdict latches for the reason the block's own header gives: a recycled id names a DIFFERENT window, and a new tenant that cannot allocate its snapshot must be able to say so once. The ODOMETER (`C2_WCD_SKIPS`) is deliberately NOT reset — it is a span total drained by `comp2_emit`, not a per-id one, and the same "budget is per boot, verdict is per tenant" split `WCD_ABORTS` is left un-cleared for.
+        WCD_STATE.get(id as usize).store(WCD_ST_FIRST, core::sync::atomic::Ordering::Release); WCD_OOM_SAID.get(id as usize).store(0, core::sync::atomic::Ordering::Relaxed); // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL append, before this line's first `//`. The OOM-skip latch travels with the verdict latches for the reason the block's own header gives: a recycled id names a DIFFERENT window, and a new tenant that cannot allocate its snapshot must be able to say so once. The ODOMETER (`C2_WCD_SKIPS`) is deliberately NOT reset — it is a span total drained by `comp2_emit`, not a per-id one, and the same "budget is per boot, verdict is per tenant" split `WCD_ABORTS` is left un-cleared for.
         // WC-D/PAYGO — `WCD_SAID` travels with them. It is the "this window's census-opening line has
         // been spoken" latch, and leaving it set would let a NEW tenant's first decline fall through
         // to the 2 s cadence gate — silently breaking the guarantee `WCD_SAID`'s own note makes, that
@@ -23634,7 +23634,7 @@ fn create_inner(
         // reset: `emit=` must stay monotone per id or the reader's "greatest `emit=` supersedes" rule
         // breaks across a recycle.
         #[cfg(feature = "wcg-paygo")]
-        WCD_SAID[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
+        WCD_SAID.get(id as usize).store(0, core::sync::atomic::Ordering::Relaxed);
         // WCH-CUSTODY — the wc-g/wc-h MEASUREMENTS travel with the tenant (age_ms= measured the
         // SLOT's age before this, so a recycled id inherited its predecessor's torn/maxpres/whole
         // and an inflated age — verified defect, Fox 2026-08-13). Budgets and monotone wires stay;
@@ -23654,14 +23654,14 @@ fn create_inner(
         // is per tenant — and so is the last word.
         #[cfg(feature = "wcg-paygo")]
         {
-            PAYGO_CLOSE_SAID[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
+            PAYGO_CLOSE_SAID.get(id as usize).store(0, core::sync::atomic::Ordering::Relaxed);
             // WCD-CHUNK — the cursor and its telemetry travel with the battery they describe: a new
             // tenant's read-back starts at row 0, and its `chunks=`/`hold_max_us=` must not inherit
             // a predecessor's. The banked sums (`WCD_ACC_*`) need no reset here — the first chunk of
             // each stage clears them, and a recycle puts the cursor at 0, which IS that condition.
-            WCD_CUR[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
-            WCD_CHUNKS[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
-            WCD_HOLD_MAX_US[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
+            WCD_CUR.get(id as usize).store(0, core::sync::atomic::Ordering::Relaxed);
+            WCD_CHUNKS.get(id as usize).store(0, core::sync::atomic::Ordering::Relaxed);
+            WCD_HOLD_MAX_US.get(id as usize).store(0, core::sync::atomic::Ordering::Relaxed);
             super::wcg::paygo_recycle(id as usize);
             // PAYGO-TERM — and so is the TAKER's budget. `PAYGO_SVC_TRIES` bounds how many times the
             // service-pass taker will mark THIS window before giving up on it, and `PAYGO_SVC_NOTED`
@@ -23670,8 +23670,8 @@ fn create_inner(
             // the counter's cap is an equality the earlier tenant already consumed. Reset here rather
             // than at close because `paygo_at_close` returns early on exactly the tenant that spent
             // the most budget: the one that owed nothing by the time it died.
-            PAYGO_SVC_TRIES[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
-            PAYGO_SVC_NOTED[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
+            PAYGO_SVC_TRIES.get(id as usize).store(0, core::sync::atomic::Ordering::Relaxed);
+            PAYGO_SVC_NOTED.get(id as usize).store(0, core::sync::atomic::Ordering::Relaxed);
         }
         // WCD-TEARDOWN — `WCD_ABORTS` is deliberately NOT cleared here. Re-arming the latches hands
         // the new tenant a fresh verdict, which is right; re-arming the abort budget with it would
@@ -23927,7 +23927,7 @@ fn flow_fits(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize, cap:
     let mut cx = GAP();
     let mut cy = wtop + GAP() + TITLE_H() + BORDER();
     let mut row_h = 0usize;
-    for i in 0..MAX_WINDOWS {
+    for i in 0..t.rows.len() {
         let r = &t.rows[i];
         if !r.used || r.compat || r.pinned {
             continue;
@@ -23979,7 +23979,7 @@ fn fit_cap(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize) -> usi
     // The largest scale any live row would take unbounded — the first cap worth trying is one below
     // it, because `usize::MAX` has just been refused.
     let mut natural = 1usize;
-    for i in 0..MAX_WINDOWS {
+    for i in 0..t.rows.len() {
         let r = &t.rows[i];
         if !r.used || r.compat || r.pinned {
             continue;
@@ -23996,8 +23996,8 @@ fn fit_cap(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize) -> usi
     1
 }
 
-fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]) {
-    let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+fn place(_created: WinId) -> (usize, alloc::vec::Vec<(usize, usize, usize, usize)>) { // WINDOWCAP-2: growable
+    let mut vacated: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::with_capacity(slots() + 1);
     let mut nv = 0usize;
     // Read the panel geometry BEFORE taking the table lock: `composite` takes the table lock and
     // releases it before touching `WRITER`, so no path ever holds both — no lock-order inversion.
@@ -24057,10 +24057,10 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
     let cap = fit_cap(&t, pw, ph, wtop, usable_h);
     // TILEFIT — the outer boxes this pass has already handed out, so the cascade below can refuse to
     // hand out the same one twice. Bounded by the table it mirrors; `np` is its live length.
-    let mut placed = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    let mut placed: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::with_capacity(t.rows.len()); // WINDOWCAP-2 (place runs on create/close only, never per frame)
     // TILEFIT — who each of those boxes belongs to, so the witness can NAME an aliased pair instead
     // of merely counting one. Same index space as `placed`.
-    let mut pids = [(0u32, 0u64); MAX_WINDOWS];
+    let mut pids: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::with_capacity(t.rows.len());
     let mut np = 0usize;
     // TILEFIT — the three facts the witness reports about this layout: how many flow rows it took,
     // the largest scale it actually handed out, and how many rows the clamp had to pull back up.
@@ -24072,7 +24072,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
     // its OUTER box begins at `wtop + GAP`: a whole title bar, discs included, below the strip.
     let mut cy = wtop + GAP() + TITLE_H() + BORDER();
     let mut row_h = 0usize;
-    for i in 0..MAX_WINDOWS {
+    for i in 0..t.rows.len() {
         let r = &t.rows[i];
         if !r.used || r.compat || r.pinned {
             continue;
@@ -24120,8 +24120,8 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         // `alias=` field of the witness below says so rather than the operator finding out.
         if ry < cy {
             clamped += 1;
-            let step = (ceiling.saturating_sub(wtop) / MAX_WINDOWS).max(1);
-            for k in 0..MAX_WINDOWS {
+            let span = t.rows.len().max(1); let step = (ceiling.saturating_sub(wtop) / span).max(1); // WINDOWCAP-2: as many candidates as rows
+            for k in 0..span {
                 let cand = ceiling
                     .saturating_sub(k.saturating_mul(step))
                     .max(wtop);
@@ -24158,12 +24158,12 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         r.damage_all();
         let now = outer_box(r);
         if now != before && before.2 != 0 && before.3 != 0 {
-            vacated[nv] = before;
+            vacated.push(before);
             nv += 1;
         }
         // TILEFIT — record what this row was actually given, so the next clamped row can avoid it.
-        placed[np] = now;
-        pids[np] = (r.id, r.owner_asid);
+        placed.push(now);
+        pids.push((r.id, r.owner_asid));
         np += 1;
         cx = cx.saturating_add(bw).saturating_add(GAP());
         row_h = row_h.max(bh + ry.saturating_sub(cy));
@@ -24372,7 +24372,7 @@ pub fn retile_on_ready() -> usize {
     }
     let info = fb.info();
 
-    let mut ids = [WIN_NONE; MAX_WINDOWS];
+    let mut ids = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let mut n = 0usize;
     {
         let t = table();
@@ -24380,7 +24380,7 @@ pub fn retile_on_ready() -> usize {
             // `compat` is exempt everywhere in the tiler (`compat_present` owns that row's scale and
             // origin in its own critical section); `pinned` is the SPAWN-PLACE row `place` skips.
             if r.used && !r.compat && !r.pinned && r.x == 0 {
-                ids[n] = r.id;
+                ids.push(r.id);
                 n += 1;
             }
         }
@@ -24404,7 +24404,7 @@ pub fn retile_on_ready() -> usize {
     // critical sections, so a row closed in between has no entry to report. It is not a zero-scale
     // window — no path can produce one (`place_scale` ends in `.max(1)`) — and reading it as one
     // would convict the tiler of a defect that belongs to the clock.
-    let mut geom = [(0usize, 0usize, 0usize); MAX_WINDOWS];
+    let mut geom = alloc::vec![(0usize, 0usize, 0usize); n]; // WINDOWCAP-2
     {
         let t = table();
         for k in 0..n {
@@ -24702,7 +24702,7 @@ fn clickplain_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(bo
     if sc::user_input_active() == owner {
         return None;
     }
-    let mut ring = [0u64; MAX_WINDOWS];
+    let mut ring: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let n = focus_ring(&mut ring);
     if ring[..n].contains(&owner) {
         return None;
@@ -25334,10 +25334,10 @@ impl DockEntry {
 /// lock, no new lock order — [`focus_ring`]'s and [`occluders`]'s shape exactly.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn dock_scan(
-    out: &mut [DockEntry; MAX_WINDOWS],
+    out: &mut alloc::vec::Vec<DockEntry>, // WINDOWCAP-2: cleared and grown here; a caller's warm buffer costs no allocation
     rect: (usize, usize, usize, usize),
 ) -> (usize, bool) {
-    let shell = shell_z();
+    out.clear(); out.reserve(slots()); let shell = shell_z();
     let focus = focus_asid();
     let (rx, ry, rw, rh) = rect;
     let ask = rw != 0 && rh != 0;
@@ -25355,14 +25355,14 @@ pub fn dock_scan(
         if !dock_addressable(r) {
             continue;
         }
-        out[n] = DockEntry {
+        out.push(DockEntry {
             id: r.id,
             owner_asid: r.owner_asid,
             title: r.title,
             title_len: r.title_len.min(MAX_TITLE),
             visible: above_shell(r, shell),
-            focused: r.owner_asid == focus, stamp: win_stamp_of(r.id), // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). The stamp rides the SNAPSHOT, on this function's own rule: the table lock is released before the dock does anything with the model, so a consumer that had to go back for the ordinal would be reading it against a table that may have moved — and the ONE consumer, [`dock::reconcile`]'s admit arm, is the writer of the ranks. Read from `WIN_STAMP[id-1]` rather than from a field on `Window`, which is why this costs the row struct nothing and the scan one relaxed load per admitted row inside a lock it already holds. It is read UNDER the guard with the rest of the row, so the entry is internally consistent: the stamp and the `(id, gen)` it travels with name the same tenant, which a later read could not promise across a recycle.
-        };
+            focused: r.owner_asid == focus, stamp: win_stamp_of(r.id), // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). The stamp rides the SNAPSHOT, on this function's own rule: the table lock is released before the dock does anything with the model, so a consumer that had to go back for the ordinal would be reading it against a table that may have moved — and the ONE consumer, [`dock::reconcile`]'s admit arm, is the writer of the ranks. Read from `WIN_STAMP.get(id-1)` rather than from a field on `Window`, which is why this costs the row struct nothing and the scan one relaxed load per admitted row inside a lock it already holds. It is read UNDER the guard with the rest of the row, so the entry is internally consistent: the stamp and the `(id, gen)` it travels with name the same tenant, which a later read could not promise across a recycle.
+        });
         n += 1;
     }
     // No sort: `create_inner` mints `id = slot + 1`, so a scan in ARRAY order is already a scan in
@@ -25400,7 +25400,7 @@ fn dock_addressable(r: &Window) -> bool {
 /// (see its ledger). The snapshot is also the RIGHT input — it is the geometry this pass is drawing
 /// against, and the count `dock::compose` will reach at the tail of the same pass.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-fn dock_tiles(rows: &[Window; MAX_WINDOWS]) -> usize {
+fn dock_tiles(rows: &[Window]) -> usize {
     let n = rows.iter().filter(|r| dock_addressable(r)).count();
     // PINCOUNT — mirror ALL FOUR pins, not `dock::pin_shell` alone. This count sizes `occ_clip`'s
     // per-blit dock term and `erase_clip`'s strip rect, so a count short of the painted strip leaves
@@ -25538,14 +25538,14 @@ pub fn ctrldecline_selftest() {
     // be pending" is an argument, and the ordering is a guarantee.
     controls_declined_drain();
     let (base_n, base_w, base_f) = (
-        CTRL_DECL_SPOKE_AT[wn as usize].load(Ordering::Relaxed),
-        CTRL_DECL_SPOKE_AT[ww as usize].load(Ordering::Relaxed),
-        CTRL_DECL_SPOKE_AT[wf as usize].load(Ordering::Relaxed),
+        CTRL_DECL_SPOKE_AT.get(wn as usize).load(Ordering::Relaxed),
+        CTRL_DECL_SPOKE_AT.get(ww as usize).load(Ordering::Relaxed),
+        CTRL_DECL_SPOKE_AT.get(wf as usize).load(Ordering::Relaxed),
     );
     // Per-SLOT deltas: an unrelated window declining anywhere in the machine cannot move these.
-    let spoke_n = || CTRL_DECL_SPOKE_AT[wn as usize].load(Ordering::Relaxed).wrapping_sub(base_n);
-    let spoke_w = || CTRL_DECL_SPOKE_AT[ww as usize].load(Ordering::Relaxed).wrapping_sub(base_w);
-    let spoke_f = || CTRL_DECL_SPOKE_AT[wf as usize].load(Ordering::Relaxed).wrapping_sub(base_f);
+    let spoke_n = || CTRL_DECL_SPOKE_AT.get(wn as usize).load(Ordering::Relaxed).wrapping_sub(base_n);
+    let spoke_w = || CTRL_DECL_SPOKE_AT.get(ww as usize).load(Ordering::Relaxed).wrapping_sub(base_w);
+    let spoke_f = || CTRL_DECL_SPOKE_AT.get(wf as usize).load(Ordering::Relaxed).wrapping_sub(base_f);
 
     // Pin all three at scale 1 and at the width their leg is about. `pinned` also takes them out of
     // the tiler, so a later re-tile cannot re-place — and re-scale — them. Damage is re-armed so a
@@ -26434,8 +26434,8 @@ fn winid_holders_clear(id: WinId, names: &mut [&'static str; WINID_HOLDER_MAX]) 
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-static SLOT_GEN: [core::sync::atomic::AtomicU32; MAX_WINDOWS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_WINDOWS];
+static SLOT_GEN: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WINID — the generation `id`'s slot is currently on, or 0 for a non-id.
 #[cfg(any(
@@ -26444,10 +26444,10 @@ static SLOT_GEN: [core::sync::atomic::AtomicU32; MAX_WINDOWS] =
 ))]
 pub fn winid_gen(id: WinId) -> u32 {
     let slot = (id as usize).wrapping_sub(1);
-    if id == WIN_NONE || slot >= MAX_WINDOWS {
+    if id == WIN_NONE || slot >= slots() {
         return 0;
     }
-    SLOT_GEN[slot].load(core::sync::atomic::Ordering::Relaxed)
+    SLOT_GEN.get(slot).load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// WINID — the erasing twin. No furniture, no generation counter, and `gen=0` is the same reading a
@@ -26469,10 +26469,10 @@ pub fn winid_gen(_id: WinId) -> u32 {
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
 fn winid_slot_bump(slot: usize) -> u32 {
-    SLOT_GEN[slot]
+    SLOT_GEN.get(slot)
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
         .wrapping_add(1)
-} #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] static WIN_STAMP: [core::sync::atomic::AtomicU64; MAX_WINDOWS] = [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS]; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] static NEXT_STAMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] fn win_stamp_of(id: WinId) -> u64 { let slot = (id as usize).wrapping_sub(1); if id == WIN_NONE || slot >= MAX_WINDOWS { return 0; } WIN_STAMP[slot].load(core::sync::atomic::Ordering::Relaxed) } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] fn win_stamp_bump(slot: usize) -> u64 { let s = NEXT_STAMP.fetch_add(1, core::sync::atomic::Ordering::Relaxed); WIN_STAMP[slot].store(s, core::sync::atomic::Ordering::Relaxed); s } // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94), and filed HERE beside [`winid_slot_bump`] because it is the same fact about the same event: the slot's reuse GENERATION and the window's ALLOCATION ORDINAL are both minted as the row is claimed, under the same table guard, by the same line of `create_inner`. **THE WINDOW TABLE CARRIED NOTHING MONOTONE, AND THAT IS THE RESIDUAL DOCKID2 NAMED** (rmbp-ledger B165, FIXTURE_FLAKES §1d): `DockEntry` had `id`, `owner_asid`, `title`, `title_len`, `visible`, `focused` — and `id` is a RECYCLED SLOT ALIAS (`create_inner` takes the LOWEST free slot), so `dock::reconcile`'s admit arm, which walks its scan in table order, hands the LOWER rank to whichever of two rows admitted in ONE pass sits lower in the TABLE rather than to whichever ARRIVED first. `NEXT_STAMP` is the missing total order: one global counter, minted once per create and never re-minted, so a stamp compares across RECYCLES the way `id` cannot and across SLOTS the way `SLOT_GEN` cannot — that one is per-slot and answers only how many tenants a slot has had, which says nothing about two windows in different slots. `u64` and NOT wrapping: at one create per microsecond it runs for half a million years, so unlike [`SLOT_GEN`] (which wraps, and says why) there is no wrap arm to reason about and none is written; `0` is therefore free to mean UNSTAMPED, and that is the value [`dock::reconcile`]'s tie-break degrades to table order for. Relaxed at both ends for [`SLOT_GEN`]'s reason exactly: the store lands under the TABLE guard that publishes the row, so no reader can observe the row before its stamp — the guard is the ordering, and the atomic is for the aliasing.
+} #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] static WIN_STAMP: SegVec<core::sync::atomic::AtomicU64> = SegVec::new(|| core::sync::atomic::AtomicU64::new(0)); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] static NEXT_STAMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] fn win_stamp_of(id: WinId) -> u64 { let slot = (id as usize).wrapping_sub(1); if id == WIN_NONE || slot >= slots() { return 0; } WIN_STAMP.get(slot).load(core::sync::atomic::Ordering::Relaxed) } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] fn win_stamp_bump(slot: usize) -> u64 { let s = NEXT_STAMP.fetch_add(1, core::sync::atomic::Ordering::Relaxed); WIN_STAMP.get(slot).store(s, core::sync::atomic::Ordering::Relaxed); s } // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94), and filed HERE beside [`winid_slot_bump`] because it is the same fact about the same event: the slot's reuse GENERATION and the window's ALLOCATION ORDINAL are both minted as the row is claimed, under the same table guard, by the same line of `create_inner`. **THE WINDOW TABLE CARRIED NOTHING MONOTONE, AND THAT IS THE RESIDUAL DOCKID2 NAMED** (rmbp-ledger B165, FIXTURE_FLAKES §1d): `DockEntry` had `id`, `owner_asid`, `title`, `title_len`, `visible`, `focused` — and `id` is a RECYCLED SLOT ALIAS (`create_inner` takes the LOWEST free slot), so `dock::reconcile`'s admit arm, which walks its scan in table order, hands the LOWER rank to whichever of two rows admitted in ONE pass sits lower in the TABLE rather than to whichever ARRIVED first. `NEXT_STAMP` is the missing total order: one global counter, minted once per create and never re-minted, so a stamp compares across RECYCLES the way `id` cannot and across SLOTS the way `SLOT_GEN` cannot — that one is per-slot and answers only how many tenants a slot has had, which says nothing about two windows in different slots. `u64` and NOT wrapping: at one create per microsecond it runs for half a million years, so unlike [`SLOT_GEN`] (which wraps, and says why) there is no wrap arm to reason about and none is written; `0` is therefore free to mean UNSTAMPED, and that is the value [`dock::reconcile`]'s tie-break degrades to table order for. Relaxed at both ends for [`SLOT_GEN`]'s reason exactly: the store lands under the TABLE guard that publishes the row, so no reader can observe the row before its stamp — the guard is the ordering, and the atomic is for the aliasing.
 
 /// WINID — the erasing twin, so `create_inner`'s fold costs a knob-off image nothing.
 #[cfg(not(any(
@@ -27007,9 +27007,9 @@ fn close_scope_witness(win: WinId, owner: u64, next_focus: u64) {
     if CLOSE_SCOPE_LOG.fetch_add(1, Ordering::Relaxed) >= CLOSE_SCOPE_LOG_MAX {
         return;
     }
-    let mut hidden = [WIN_NONE; MAX_WINDOWS];
+    let mut hidden = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let mut nhidden = 0usize;
-    let mut visible = [WIN_NONE; MAX_WINDOWS];
+    let mut visible = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let mut nvisible = 0usize;
     {
         let shell = SHELL_Z.load(Ordering::Acquire);
@@ -27019,10 +27019,10 @@ fn close_scope_witness(win: WinId, owner: u64, next_focus: u64) {
                 continue;
             }
             if above_shell(r, shell) {
-                visible[nvisible] = r.id;
+                visible.push(r.id);
                 nvisible += 1;
             } else {
-                hidden[nhidden] = r.id;
+                hidden.push(r.id);
                 nhidden += 1;
             }
         }
@@ -28130,8 +28130,8 @@ fn compgate_cyc_to_us(_dt: u64) -> u64 {
 /// been put on the wire once, which is a different question and must not be answered by re-purposing
 /// a cell the battery needs.
 #[cfg(feature = "witness")]
-static WCD_OOM_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_OOM_SAID: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WCDFLOOD (SO30) — the ODOMETER the latch replaces the lines with: OOM skips taken this span, drained
 /// by [`comp2_emit`] onto `[comp2] wcd_skips=`. A span total, like `wcd_us=` and `straddle_us=`.
@@ -28156,10 +28156,10 @@ static C2_WCD_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 fn wcd_oom_say(i: usize) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     C2_WCD_SKIPS.fetch_add(1, Relaxed);
-    if i >= WCD_IDS {
+    if i >= u32::MAX as usize {
         return false;
     }
-    wcd_skip_note(i, WCD_OOM_SAID[i] // WCDMEM (B199) — ⚠ LINE-NEUTRAL, 3 lines in and 3 out: the latch's answer now passes through [`wcd_skip_note`], which counts this window's skip into its own rollup cell and hands the answer back unchanged.
+    wcd_skip_note(i, WCD_OOM_SAID.get(i) // WCDMEM (B199) — ⚠ LINE-NEUTRAL, 3 lines in and 3 out: the latch's answer now passes through [`wcd_skip_note`], which counts this window's skip into its own rollup cell and hands the answer back unchanged.
         .compare_exchange(0, 1, core::sync::atomic::Ordering::AcqRel, Relaxed)
         .is_ok())
 }
@@ -28195,7 +28195,7 @@ pub fn wcd_oom_latch_selftest() { if crate::tests::defer("wcdlatch", wcd_oom_lat
     let before = C2_WCD_SKIPS.load(Relaxed);
     let mut said = 0u32;
     for &i in IDS.iter() {
-        WCD_OOM_SAID[i].store(0, Relaxed);
+        WCD_OOM_SAID.get(i).store(0, Relaxed);
         for n in 0..CALLS {
             if wcd_oom_say(i) {
                 said += 1;
@@ -28386,9 +28386,9 @@ pub fn glassfix2_selftest() {
     // GLASSFIX3 — and each row's STACKING KEY, `(z, id)`: the compositor's own paint order
     // (`order.sort_unstable_by_key(|&i| (rows[i].z, rows[i].id))`), so "above" here is what the glass
     // shows. A parked (minimised) row is not on the glass and is not counted.
-    let census = |bx: &mut [(usize, usize, usize, usize); MAX_WINDOWS],
-                  bid: &mut [WinId; MAX_WINDOWS],
-                  bz: &mut [(u32, WinId); MAX_WINDOWS]|
+    let census = |bx: &mut alloc::vec::Vec<(usize, usize, usize, usize)>,
+                  bid: &mut alloc::vec::Vec<WinId>,
+                  bz: &mut alloc::vec::Vec<(u32, WinId)>|
      -> usize {
         let t = table();
         let mut n = 0usize;
@@ -28396,9 +28396,9 @@ pub fn glassfix2_selftest() {
             if !r.used || r.compat || r.z == PARKED_Z || r.id == MODAL_WIN.load(core::sync::atomic::Ordering::Acquire) {
                 continue;
             }
-            bx[n] = outer_box(r);
-            bid[n] = r.id;
-            bz[n] = (r.z, r.id);
+            bx.push(outer_box(r));
+            bid.push(r.id);
+            bz.push((r.z, r.id));
             n += 1;
         }
         n
@@ -28407,9 +28407,9 @@ pub fn glassfix2_selftest() {
     // a window's box over the title band of a window stacked on top of it hides nothing. The z-blind
     // count this replaces could not be satisfied by any cascade — in a Mac cascade every older
     // window's body lies across the newer window's title band, underneath it.
-    let scan = |bx: &[(usize, usize, usize, usize); MAX_WINDOWS],
-                bid: &[WinId; MAX_WINDOWS],
-                bz: &[(u32, WinId); MAX_WINDOWS],
+    let scan = |bx: &[(usize, usize, usize, usize)],
+                bid: &[WinId],
+                bz: &[(u32, WinId)],
                 n: usize|
      -> (usize, WinId, WinId, usize) {
         let (mut count, mut wa, mut wb, mut wr) = (0usize, WIN_NONE, WIN_NONE, 0usize);
@@ -28482,9 +28482,9 @@ pub fn glassfix2_selftest() {
     }
     let minted = w.iter().filter(|&&id| id != WIN_NONE).count();
 
-    let mut bx = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
-    let mut bid = [WIN_NONE; MAX_WINDOWS];
-    let mut bz = [(0u32, WIN_NONE); MAX_WINDOWS];
+    let mut bx = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
+    let mut bid = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
+    let mut bz = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let n = census(&mut bx, &mut bid, &mut bz);
     let (overlaps, wa, wb, wr) = scan(&bx, &bid, &bz, n);
 
@@ -28501,9 +28501,9 @@ pub fn glassfix2_selftest() {
         // step is `BORDER` = 5).
         let victim = bx[0];
         if move_to(w[3], victim.0 + BORDER(), victim.1 + TITLE_H() + BORDER() + 1) {
-            let mut cbx = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
-            let mut cbid = [WIN_NONE; MAX_WINDOWS];
-            let mut cbz = [(0u32, WIN_NONE); MAX_WINDOWS];
+            let mut cbx = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
+            let mut cbid = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
+            let mut cbz = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
             let cn = census(&mut cbx, &mut cbid, &mut cbz);
             control = scan(&cbx, &cbid, &cbz, cn).0 > 0;
         }
@@ -28923,22 +28923,22 @@ pub fn blitwire_selftest() { if crate::tests::defer("blitwire", blitwire_selftes
 
 /// WCDMEM — per-id: skips this window has taken since its latched witness spoke, that one included.
 #[cfg(feature = "witness")]
-static WCD_OOM_PASSES: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_OOM_PASSES: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WCDMEM — per-id: the `passes=` value the last rollup for this window printed (the witness itself
 /// counts as having printed 1). A rollup prints only while `PASSES > ROLLED`.
 #[cfg(feature = "witness")]
-static WCD_OOM_ROLLED: [core::sync::atomic::AtomicU32; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+static WCD_OOM_ROLLED: SegVec<core::sync::atomic::AtomicU32> =
+    SegVec::new(|| core::sync::atomic::AtomicU32::new(0));
 
 /// WCDMEM — per-id: `arch::ms()` at the moment the latched witness spoke.
 #[cfg(feature = "witness")]
-static WCD_OOM_T0_MS: [core::sync::atomic::AtomicU64; WCD_IDS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; WCD_IDS];
+static WCD_OOM_T0_MS: SegVec<core::sync::atomic::AtomicU64> =
+    SegVec::new(|| core::sync::atomic::AtomicU64::new(0));
 
 /// WCDMEM — count one no-memory skip into window `i`'s rollup cell and return `first` unchanged.
-/// Called only from [`wcd_oom_say`], after its `i < WCD_IDS` test.
+/// Called only from [`wcd_oom_say`], after its `i < u32::MAX as usize` test.
 ///
 /// On the skip that speaks (`first`) the cells restart for this tenancy, in an order under which a
 /// concurrent [`wcd_skip_roll_one`] can never see `PASSES > ROLLED`: PASSES to 0, ROLLED to 1, the
@@ -28948,16 +28948,16 @@ static WCD_OOM_T0_MS: [core::sync::atomic::AtomicU64; WCD_IDS] =
 #[cfg(feature = "witness")]
 fn wcd_skip_note(i: usize, first: bool) -> bool {
     use core::sync::atomic::Ordering::{Relaxed, Release};
-    if i >= WCD_IDS {
+    if i >= u32::MAX as usize {
         return first;
     }
     if first {
-        WCD_OOM_PASSES[i].store(0, Release);
-        WCD_OOM_ROLLED[i].store(1, Release);
-        WCD_OOM_T0_MS[i].store(crate::arch::ms(), Relaxed);
-        WCD_OOM_PASSES[i].store(1, Release);
+        WCD_OOM_PASSES.get(i).store(0, Release);
+        WCD_OOM_ROLLED.get(i).store(1, Release);
+        WCD_OOM_T0_MS.get(i).store(crate::arch::ms(), Relaxed);
+        WCD_OOM_PASSES.get(i).store(1, Release);
     } else {
-        WCD_OOM_PASSES[i].fetch_add(1, Release);
+        WCD_OOM_PASSES.get(i).fetch_add(1, Release);
     }
     first
 }
@@ -28968,22 +28968,22 @@ fn wcd_skip_note(i: usize, first: bool) -> bool {
 #[cfg(feature = "witness")]
 fn wcd_skip_roll_one(i: usize) -> Option<u32> {
     use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
-    if i >= WCD_IDS {
+    if i >= u32::MAX as usize {
         return None;
     }
-    let p = WCD_OOM_PASSES[i].load(Acquire);
-    let r = WCD_OOM_ROLLED[i].load(Acquire);
+    let p = WCD_OOM_PASSES.get(i).load(Acquire);
+    let r = WCD_OOM_ROLLED.get(i).load(Acquire);
     if p <= r {
         return None;
     }
-    if WCD_OOM_ROLLED[i].compare_exchange(r, p, AcqRel, Relaxed).is_err() {
+    if WCD_OOM_ROLLED.get(i).compare_exchange(r, p, AcqRel, Relaxed).is_err() {
         return None;
     }
     crate::census_println!(
         "[wc-d] skip-rollup win={} reason=no-memory passes={} since_ms={}",
         i,
         p,
-        crate::arch::ms().saturating_sub(WCD_OOM_T0_MS[i].load(Relaxed))
+        crate::arch::ms().saturating_sub(WCD_OOM_T0_MS.get(i).load(Relaxed))
     );
     Some(p)
 }
@@ -28992,7 +28992,7 @@ fn wcd_skip_roll_one(i: usize) -> Option<u32> {
 /// after that span's `[comp2] rollup` line (see the block header for the cadence).
 #[cfg(feature = "witness")]
 fn wcd_skip_rollup() {
-    for i in 0..WCD_IDS {
+    for i in 0..WCD_STATE.hwm() { // WINDOWCAP-2: every id ever verified
         let _ = wcd_skip_roll_one(i);
     }
 }
@@ -29029,9 +29029,9 @@ pub fn wcd_skip_latch_check() { if crate::tests::defer("wcdskip", wcd_skip_latch
     const FORCED: u32 = 16;
     let before = C2_WCD_SKIPS.load(Relaxed);
     for &i in IDS.iter() {
-        WCD_OOM_SAID[i].store(0, Relaxed);
-        WCD_OOM_PASSES[i].store(0, Relaxed);
-        WCD_OOM_ROLLED[i].store(0, Relaxed);
+        WCD_OOM_SAID.get(i).store(0, Relaxed);
+        WCD_OOM_PASSES.get(i).store(0, Relaxed);
+        WCD_OOM_ROLLED.get(i).store(0, Relaxed);
         let mut printed = 0u32;
         for n in 0..FORCED {
             if wcd_oom_say(i) {
@@ -29135,7 +29135,7 @@ fn glassfix3_cascade(
     let max_x = pw.saturating_sub(cw + BORDER()).max(BORDER());
     let max_y = bottom.saturating_sub(ch + BORDER()).max(min_y);
     let (mut cx, mut cy) = (x, y);
-    for _ in 0..2 * MAX_WINDOWS {
+    for _ in 0..2 * t.rows.len().max(1) { // WINDOWCAP-2: bounded by the live table
         let bx = (
             cx.saturating_sub(BORDER()),
             cy.saturating_sub(TITLE_H() + BORDER()),
@@ -29162,7 +29162,7 @@ fn glassfix3_cascade(
 /// every layout with no pinned row in it.
 fn glassfix3_clear(t: &Table, z: u32, id: WinId, ox: usize, y: usize, bw: usize, bh: usize) -> usize {
     let mut top = y.saturating_sub(TITLE_H() + BORDER());
-    for _ in 0..2 * MAX_WINDOWS {
+    for _ in 0..2 * t.rows.len().max(1) { // WINDOWCAP-2: bounded by the live table
         let me = (ox, top, bw, bh);
         let mut moved = false;
         for p in t.rows.iter() {
@@ -29222,7 +29222,7 @@ fn reassert_modal_top(t: &mut Table, except_id: WinId) -> u32 {
     if m == WIN_NONE { return 0; }
     if m == except_id { MODAL_LAST.store(2, core::sync::atomic::Ordering::Relaxed); return 0; }
     let slot = (m as usize).wrapping_sub(1);
-    if slot >= MAX_WINDOWS || !t.rows[slot].used || t.rows[slot].id != m { MODAL_LAST.store(3, core::sync::atomic::Ordering::Relaxed); return 0; }
+    if slot >= slots() || !t.rows[slot].used || t.rows[slot].id != m { MODAL_LAST.store(3, core::sync::atomic::Ordering::Relaxed); return 0; }
     let top = t.rows.iter().filter(|r| r.used && !r.compat && r.id != m).map(|r| r.z).max().unwrap_or(0);
     if t.rows[slot].z > top { MODAL_LAST.store(4, core::sync::atomic::Ordering::Relaxed); return 0; }
     MODAL_LAST.store(5, core::sync::atomic::Ordering::Relaxed);
@@ -29277,16 +29277,16 @@ pub fn loginz_selftest() {
 /// id-scoped [`close`] (which has no kernel-owner refusal; [`close_owner`] deliberately does). Called by
 /// the login screen's Log Out after the session's own programs are ended. Returns `(closed, kernel)`.
 pub fn close_all_furniture() -> (usize, usize) {
-    let mut ids = [WIN_NONE; MAX_WINDOWS];
+    let mut ids = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let (mut n, mut kernel) = (0usize, 0usize);
     {
         let t = table();
         for r in t.rows.iter() {
-            if r.used && !r.compat && n < MAX_WINDOWS {
+            if r.used && !r.compat {
                 if is_kernel_owner(r.owner_asid) {
                     kernel += 1;
                 }
-                ids[n] = r.id;
+                ids.push(r.id);
                 n += 1;
             }
         }
@@ -29333,21 +29333,22 @@ pub fn app_name_of(owner: u64, out: &mut [u8; MAX_TITLE]) -> usize {
 /// Live app windows a cycle may visit, most-recently-raised FIRST (z descending). Furniture, compat
 /// rows, parked rows and rows below the shell are not cycle targets. Returns the count written.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub fn cycle_order(out: &mut [WinId; MAX_WINDOWS]) -> usize {
+pub fn cycle_order(out: &mut alloc::vec::Vec<WinId>) -> usize { // WINDOWCAP-2: cleared and grown here
     let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
     let t = table();
-    let mut zs = [(0u32, WIN_NONE); MAX_WINDOWS];
+    let mut zs = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let mut n = 0usize;
     for r in t.rows.iter() {
         if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) && r.z != PARKED_Z && above_shell(r, shell) {
-            zs[n] = (r.z, r.id);
+            zs.push((r.z, r.id));
             n += 1;
         }
     }
     drop(t);
     zs[..n].sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    out.clear();
     for i in 0..n {
-        out[i] = zs[i].1;
+        out.push(zs[i].1);
     }
     n
 }
@@ -29355,7 +29356,7 @@ pub fn cycle_order(out: &mut [WinId; MAX_WINDOWS]) -> usize {
 /// The window the next cycle press raises, as `(id, owner)`; `None` with fewer than two candidates.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn cycle_pick() -> Option<(WinId, u64)> {
-    let mut ord = [WIN_NONE; MAX_WINDOWS];
+    let mut ord = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let n = cycle_order(&mut ord);
     if n < 2 {
         return None;
@@ -29427,7 +29428,7 @@ pub fn wincycle_selftest() {
         for a in asids { close_owner(a); }
         return;
     }
-    let mut o0 = [WIN_NONE; MAX_WINDOWS];
+    let mut o0 = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let n0 = cycle_order(&mut o0);
     let mut after_tab = WIN_NONE;
     let mut moved = 0usize;
@@ -29436,7 +29437,7 @@ pub fn wincycle_selftest() {
             if cycle_commit(id, owner) { moved += 1; }
         }
     }
-    let mut o1 = [WIN_NONE; MAX_WINDOWS];
+    let mut o1 = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let n1 = cycle_order(&mut o1);
     if n1 > 0 { after_tab = o1[0]; }
     // Two rotations of a bottom-raise: the top is the SECOND-least-recent of the start order.
@@ -29536,13 +29537,13 @@ fn wcd_heap_tick() {
 fn wcd_heap_tick() {}
 /// FIRSTBOOT (R77): [`close_all_furniture`] except `keep` (the installer's own window). Returns the closed count.
 pub fn close_all_furniture_except(keep: WinId) -> usize {
-    let mut ids = [WIN_NONE; MAX_WINDOWS];
+    let mut ids = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let mut n = 0usize;
     {
         let t = table();
         for r in t.rows.iter() {
-            if r.used && !r.compat && r.id != keep && n < MAX_WINDOWS {
-                ids[n] = r.id;
+            if r.used && !r.compat && r.id != keep {
+                ids.push(r.id);
                 n += 1;
             }
         }
@@ -29958,14 +29959,14 @@ pub struct WlRow {
 /// Every live APP window (no compat row, no kernel furniture), minimised ones included, in id order.
 /// The title is the row's own; an empty one falls back to the owner's armed program name.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub fn wl_rows(out: &mut [WlRow; MAX_WINDOWS]) -> usize {
-    let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
+pub fn wl_rows(out: &mut alloc::vec::Vec<WlRow>) -> usize { // WINDOWCAP-2: cleared and grown here
+    let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire); out.clear();
     let mut n = 0usize;
     {
         let t = table();
         for r in t.rows.iter() {
-            if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) && n < MAX_WINDOWS {
-                out[n] = WlRow { id: r.id, owner: r.owner_asid, minimised: r.z == PARKED_Z || !above_shell(r, shell), title: r.title, len: r.title_len.min(MAX_TITLE) };
+            if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) {
+                out.push(WlRow { id: r.id, owner: r.owner_asid, minimised: r.z == PARKED_Z || !above_shell(r, shell), title: r.title, len: r.title_len.min(MAX_TITLE) });
                 n += 1;
             }
         }
@@ -30001,7 +30002,7 @@ pub fn wl_focused() -> Option<(WinId, u64)> {
 /// The least-recently-raised VISIBLE window of `owner` when it has two or more (the ⌘` target).
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn wl_same_app_pick(owner: u64) -> Option<WinId> {
-    let mut ord = [WIN_NONE; MAX_WINDOWS];
+    let mut ord = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let n = cycle_order(&mut ord);
     let mut last = None;
     let mut count = 0usize;
@@ -30037,7 +30038,7 @@ pub fn wl_is_minimised(id: WinId) -> bool {
 /// Front-to-back z order is `cycle_order`'s; this raises every visible window back-to-front so the stack keeps its order.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn wl_raise_all() -> usize {
-    let mut ord = [WIN_NONE; MAX_WINDOWS];
+    let mut ord = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let n = cycle_order(&mut ord);
     for i in (0..n).rev() {
         raise_one(ord[i]);
@@ -30102,24 +30103,20 @@ pub fn frame_of(id: WinId) -> Option<(usize, usize, usize, usize)> {
 // lock by EVERY create, so a recycled slot never inherits a dead tenant's bit.
 // ---------------------------------------------------------------------------------------------------
 
-static NATIVE_SLOTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static NATIVE_SLOTS: SlotBits = SlotBits::new(); // WINDOWCAP-2: growable, was a u32 mask
 
 /// Record whether slot `slot`'s new tenant is native (called by `create_inner` for every create).
 fn native_slot_store(slot: usize, native: bool) {
-    use core::sync::atomic::Ordering::Relaxed;
-    if slot >= 32 {
-        return;
-    }
     if native {
-        NATIVE_SLOTS.fetch_or(1 << slot, Relaxed);
+        NATIVE_SLOTS.set(slot);
     } else {
-        NATIVE_SLOTS.fetch_and(!(1u32 << slot), Relaxed);
+        NATIVE_SLOTS.clear(slot);
     }
 }
 
 /// Is slot `slot`'s tenant a native (never magnified) window?
 fn native_slot(slot: usize) -> bool {
-    slot < 32 && NATIVE_SLOTS.load(core::sync::atomic::Ordering::Relaxed) & (1 << slot) != 0
+    NATIVE_SLOTS.test(slot)
 }
 
 /// UIMETRICS: [`create_at`] for a NATIVE kernel window — the surface is `w x h` real panel pixels and the row
@@ -30211,62 +30208,97 @@ pub fn inputstall_valve() -> &'static str {
 
 const SNAP_POOL_N: usize = 4;
 
-struct SnapCell(core::cell::UnsafeCell<[Window; MAX_WINDOWS]>, core::sync::atomic::AtomicBool);
-// SAFETY: a cell's buffer is touched only by the one `RowsSnap` that won its `AtomicBool` claim.
-unsafe impl Sync for SnapCell {}
+/// WINDOWCAP-2 — the pool's buffers are growable `Vec<Window>`s that keep their capacity across passes,
+/// so a steady-state pass copies the table into a warm buffer and never touches the allocator; only a
+/// table that has grown since costs one reallocation.
+static SNAP_POOL: [Mutex<alloc::vec::Vec<Window>>; SNAP_POOL_N] = [const { Mutex::new(alloc::vec::Vec::new()) }; SNAP_POOL_N];
 
-static SNAP_POOL: [SnapCell; SNAP_POOL_N] = [const {
-    SnapCell(core::cell::UnsafeCell::new([Window::empty(); MAX_WINDOWS]), core::sync::atomic::AtomicBool::new(false))
-}; SNAP_POOL_N];
-
-/// A table-sized snapshot buffer: a claimed pool cell, or a heap box when the pool is exhausted.
+/// A table-sized snapshot buffer: a claimed pool buffer, or a heap vector when every pool buffer is in use.
 struct RowsSnap {
-    cell: usize,
-    heap: Option<alloc::boxed::Box<[Window; MAX_WINDOWS]>>,
+    pooled: Option<MutexGuard<'static, alloc::vec::Vec<Window>, SpinRelax>>,
+    heap: alloc::vec::Vec<Window>,
 }
 
 impl RowsSnap {
     fn take() -> RowsSnap {
-        use core::sync::atomic::Ordering::{AcqRel, Acquire};
-        for (i, c) in SNAP_POOL.iter().enumerate() {
-            if c.1.compare_exchange(false, true, AcqRel, Acquire).is_ok() {
-                return RowsSnap { cell: i, heap: None };
+        for c in SNAP_POOL.iter() {
+            if let Some(g) = c.try_lock() {
+                return RowsSnap { pooled: Some(g), heap: alloc::vec::Vec::new() };
             }
         }
-        let v: alloc::vec::Vec<Window> = alloc::vec![Window::empty(); MAX_WINDOWS];
-        let b: alloc::boxed::Box<[Window; MAX_WINDOWS]> = match v.into_boxed_slice().try_into() {
-            Ok(b) => b,
-            Err(_) => unreachable!(),
-        };
-        RowsSnap { cell: usize::MAX, heap: Some(b) }
+        RowsSnap { pooled: None, heap: alloc::vec::Vec::new() }
+    }
+
+    /// Copy `src` (the live table) in. Reserve BEFORE the caller takes the table lock where it can
+    /// ([`RowsSnap::reserve`]) so the copy under the lock is a memcpy.
+    fn fill(&mut self, src: &[Window]) {
+        let v = self.vec_mut();
+        v.clear();
+        v.extend_from_slice(src);
+    }
+
+    /// Make room for `n` rows without holding any lock.
+    fn reserve(&mut self, n: usize) {
+        let v = self.vec_mut();
+        if v.capacity() < n {
+            v.reserve(n - v.len());
+        }
+    }
+
+    fn vec_mut(&mut self) -> &mut alloc::vec::Vec<Window> {
+        match self.pooled.as_mut() {
+            Some(g) => &mut **g,
+            None => &mut self.heap,
+        }
     }
 }
 
 impl core::ops::Deref for RowsSnap {
-    type Target = [Window; MAX_WINDOWS];
-    fn deref(&self) -> &[Window; MAX_WINDOWS] {
-        match &self.heap {
-            Some(b) => b,
-            // SAFETY: this `RowsSnap` holds the cell's claim (see `SnapCell`).
-            None => unsafe { &*SNAP_POOL[self.cell].0.get() },
+    type Target = [Window];
+    fn deref(&self) -> &[Window] {
+        match self.pooled.as_ref() {
+            Some(g) => &g[..],
+            None => &self.heap[..],
         }
     }
 }
 
 impl core::ops::DerefMut for RowsSnap {
-    fn deref_mut(&mut self) -> &mut [Window; MAX_WINDOWS] {
-        match &mut self.heap {
-            Some(b) => b,
-            // SAFETY: this `RowsSnap` holds the cell's claim (see `SnapCell`).
-            None => unsafe { &mut *SNAP_POOL[self.cell].0.get() },
-        }
+    fn deref_mut(&mut self) -> &mut [Window] {
+        &mut self.vec_mut()[..]
     }
 }
 
-impl Drop for RowsSnap {
-    fn drop(&mut self) {
-        if self.heap.is_none() && self.cell < SNAP_POOL_N {
-            SNAP_POOL[self.cell].1.store(false, core::sync::atomic::Ordering::Release);
-        }
+// ---- WINDOWCAP-2 — the live row count ---------------------------------------------------------------
+
+/// WINDOWCAP-2 — real window ids are `1..WIN_ID_SENTINEL_FLOOR`; the top of the `WinId` range is kept for
+/// synthetic ids (the dock's pin tiles, `WinId::MAX - k`). The bound is the id's TYPE, not a policy.
+pub const WIN_ID_SENTINEL_FLOOR: WinId = WinId::MAX - 255;
+
+/// One past the highest slot the table has ever grown to — every former `0..MAX_WINDOWS` scan of a
+/// side table walks `0..slots()`. Raised under the table lock when a row is appended; never lowered
+/// (rows are reused, not removed).
+static ROWS_HWM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The table's row count (live or free) — see [`ROWS_HWM`].
+#[inline]
+pub fn slots() -> usize {
+    ROWS_HWM.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Take a free row's slot, or append one. Called under the table lock by [`create_inner`]; the only
+/// place the table grows. The limit is NOT asked here — `create_inner` asked `wincap` before the lock.
+fn alloc_slot(t: &mut Table) -> Option<usize> {
+    if let Some(s) = t.rows.iter().position(|r| !r.used) {
+        return Some(s);
     }
+    if t.rows.len() + 1 >= WIN_ID_SENTINEL_FLOOR as usize {
+        return None; // past every id the type can name (the top values are sentinels: the dock's pin tiles)
+    }
+    if t.rows.try_reserve(1).is_err() {
+        return None;
+    }
+    t.rows.push(Window::empty());
+    ROWS_HWM.store(t.rows.len(), core::sync::atomic::Ordering::Release);
+    Some(t.rows.len() - 1)
 }

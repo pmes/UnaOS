@@ -398,24 +398,51 @@ pub struct Layout {
     pub tile_w: usize,
     /// Caption budget in glyphs, chosen so the strip fits the panel.
     pub glyphs: usize,
+    /// WINDOWCAP-2 (R90) — model rows folded into the right-edge `+<k>` tile (tile `n - 1`), or 0 when
+    /// every row has its own tile. The dock shows what fits and overflows the rest; it never refuses a
+    /// window and never caps the table, so every "can the dock host the table" check holds for any
+    /// live count a panel can show one tile for.
+    pub overflow: usize,
 }
 
+/// The fewest glyphs an overflow layout keeps per tile, so `+<k>` reads (`+9`, `+99`).
+const OVERFLOW_GLYPHS: usize = 3;
+
 impl Layout {
-    /// The layout for `n` tiles on a `pw` x `ph` panel, or `None` when there is nothing to draw
-    /// (no tiles) or nowhere to draw it (a panel too narrow for even one-glyph tiles, or too short
-    /// for the strip and its margin).
+    /// The layout for `n` model rows on a `pw` x `ph` panel, or `None` when there is nothing to draw
+    /// (no rows) or nowhere to draw it (a panel too narrow for even one tile, or too short for the
+    /// strip and its margin).
     ///
     /// The caption budget is chosen by trying [`LABEL_MAX`] glyphs and stepping down until the whole
-    /// strip fits between two [`PAD`] margins — auto-sizing to the CONTENTS, with the panel as the
-    /// only cap. Deterministic, integer, at most eight iterations.
+    /// strip fits between two [`PAD`] margins — auto-sizing to the CONTENTS. WINDOWCAP-2: when even
+    /// one-glyph tiles do not fit every row, the strip keeps the most tiles that fit at
+    /// [`OVERFLOW_GLYPHS`] and the last one becomes the `+<k>` group of the rest ([`Layout::overflow`]);
+    /// the panel's width bounds what is SHOWN, never what may be OPEN.
     pub fn for_panel(n: usize, pw: usize, ph: usize) -> Option<Layout> {
-        if n == 0 || n > wm::MAX_WINDOWS {
+        if n == 0 {
             return None;
         }
+        if let Some(l) = Self::fit(n, 1, pw, ph) {
+            return Some(l);
+        }
+        let floor = OVERFLOW_GLYPHS.min(LABEL_MAX);
+        let mut k = n - 1;
+        while k >= 1 {
+            if let Some(mut l) = Self::fit(k, floor, pw, ph) {
+                l.overflow = n - (k - 1);
+                return Some(l);
+            }
+            k -= 1;
+        }
+        None // not even one tile fits the panel: draw no dock at all.
+    }
+
+    /// `tiles` tiles at the widest caption between [`LABEL_MAX`] and `min_glyphs` that fits.
+    fn fit(tiles: usize, min_glyphs: usize, pw: usize, ph: usize) -> Option<Layout> {
         let mut glyphs = LABEL_MAX;
         loop {
             let tile_w = 2 * PAD() + glyphs * CELL_W();
-            let w = 2 * PAD() + n * tile_w + (n - 1) * PAD();
+            let w = 2 * PAD() + tiles * tile_w + (tiles - 1) * PAD();
             // STRIPFACTOR — the anchoring, the margin and BOTH floors are the primitive's
             // `frame_centred`: `ph < STRIP_H + 2*PAD`, `w + 2*PAD > pw` and `w > MAX_STRIP_W` were
             // three separate tests here and are the same three there, in the same order, against the
@@ -423,13 +450,19 @@ impl Layout {
             // is the DOCK's arithmetic, not any strip's.
             if let Some((x, y, w, h)) = strip::frame_centred(strip::Edge::Bottom, w, STRIP_H(), pw, ph)
             {
-                return Some(Layout { x, y, w, h, n, tile_w, glyphs });
+                return Some(Layout { x, y, w, h, n: tiles, tile_w, glyphs, overflow: 0 });
             }
-            if glyphs == 1 {
-                return None; // even one glyph per tile will not fit: draw no dock at all.
+            if glyphs <= min_glyphs.max(1) {
+                return None;
             }
             glyphs -= 1;
         }
+    }
+
+    /// WINDOWCAP-2 — is tile `t` the overflow group?
+    #[inline]
+    pub fn is_overflow(&self, t: usize) -> bool {
+        self.overflow > 0 && t + 1 == self.n
     }
 
     /// Tile `i`'s box on the panel, or `None` for an index past the tile count.
@@ -584,7 +617,7 @@ pub fn relaunch_furniture() {
 /// route and a second tile would be a second shell). Returns the new count. Applied by every reader
 /// of the model — [`compose`], [`press_at`], [`strip_rect`] — so painter, router and occlusion
 /// registry cannot disagree about the tile count.
-fn pin_shell(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+fn pin_shell(rows: &mut Model, n: usize) -> usize {
     // PINCOUNT — the condition lives ONCE (`pin_shell_wanted`, this file's tail); this is its only
     // mutator, and `pins_applied` folds the same predicate for the two count-only readers.
     if !pin_shell_wanted(n, &|o| rows[..n].iter().any(|r| r.owner_asid == o)) {
@@ -599,7 +632,7 @@ fn pin_shell(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
     // (`theme::SCROLL_THUMB`), which is the honest state and the same read a parked window gives.
     e.visible = false;
     e.focused = false;
-    rows[n] = e;
+    rows.truncate(n); rows.push(e); // WINDOWCAP-2: the model grows
     n + 1
 }
 
@@ -624,7 +657,7 @@ fn pin_shell(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
 /// Returns the new count. Applied by every reader of the model — [`compose`], [`press_at`],
 /// [`strip_rect`] — so painter, router and occlusion registry cannot disagree about the tile count.
 #[cfg(feature = "quarry")]
-fn pin_quarry(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+fn pin_quarry(rows: &mut Model, n: usize) -> usize {
     // PINCOUNT — the condition lives ONCE (`pin_quarry_wanted`, this file's tail); this is its only
     // mutator, and `pins_applied` folds the same predicate for the two count-only readers.
     if !pin_quarry_wanted(n, &|o| rows[..n].iter().any(|r| r.owner_asid == o)) {
@@ -641,14 +674,13 @@ fn pin_quarry(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
     e.focused = false;
     // Prepend: shift the scanned rows right by one and take slot 0. Bounded by `n < MAX_WINDOWS`
     // above, so the shift can never write past the array.
-    rows.copy_within(0..n, 1);
-    rows[0] = e;
+    rows.truncate(n); rows.insert(0, e); // WINDOWCAP-2: prepend into a growable model
     n + 1
 }
 
 #[cfg(not(feature = "quarry"))]
 #[inline(always)]
-fn pin_quarry(_rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+fn pin_quarry(_rows: &mut Model, n: usize) -> usize {
     n
 }
 
@@ -660,7 +692,7 @@ fn pin_quarry(_rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
 /// used to inline. The dock is unconditionally PRESENT (there is no disable for it: it is the
 /// console's only way back), so `None` here means only that the panel cannot host it.
 pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
-    let mut tiles = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut tiles = ModelBuf::take();
     // A zero rect asks the damage question nothing; only the tile count is wanted here.
     let (n, _) = wm::dock_scan(&mut tiles, (0, 0, 0, 0));
     // PINCOUNT — the registry must report the strip the painter will paint, pinned tiles included,
@@ -755,7 +787,7 @@ fn signature(e: &[wm::DockEntry], l: &Layout, pressed: u32) -> u64 {
     let mut h = strip::FNV_BASIS;
     for v in [
         l.x as u64, l.y as u64, l.w as u64, l.h as u64,
-        l.n as u64, l.tile_w as u64, l.glyphs as u64, pressed as u64,
+        l.n as u64, l.tile_w as u64, l.glyphs as u64, pressed as u64, l.overflow as u64, // WINDOWCAP-2
     ] {
         h = strip::fnv1a_u64(h, v);
     }
@@ -789,7 +821,7 @@ fn signature(e: &[wm::DockEntry], l: &Layout, pressed: u32) -> u64 {
 /// The quiet path is one `wm::dock_scan`, one hash and a compare. See the module header.
 pub fn compose() -> bool {
     let t0 = crate::arch::now_cycles();
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows = ModelBuf::take();
     // Ask `wm` for the tile model AND the damage question in ONE table scan: "were any of the
     // windows that intersect the strip I last painted damaged in the pass that just ran?"
     let (n, clobbered) = wm::dock_scan(&mut rows, SLOT.rect()); dp_refresh(&rows, n); // DOCKPIN — learn which owners are the table's ring-3 apps BEFORE the pins read `present`.
@@ -1008,8 +1040,9 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         // FONT (GR27) — the shared anti-aliased face, alpha-composited over the tile face the row
         // loop above just painted (a RAM scratch row, so the blend's read is cached). Regular
         // weight: a dock label is a secondary surface beside the caption and the bar.
-        let cols = super::text::fit(&r.title[..l.glyphs.min(r.title_len)], false, FACE, l.glyphs * FACE.cell_w()); // KERNELFONT: whole glyphs inside the tile's budget
-        super::text::draw_row(out, l.w, &r.title[..cols], bx + PAD(), sy, ink, false, FACE);
+        let mut ob = [0u8; 8]; let (cap, cap_len) = if l.is_overflow(t) { let k = overflow_label(l.overflow, &mut ob); (&ob[..], k) } else { (&r.title[..], r.title_len) }; // WINDOWCAP-2: the right-edge group reads `+<k>`
+        let cols = super::text::fit(&cap[..l.glyphs.min(cap_len)], false, FACE, l.glyphs * FACE.cell_w()); // KERNELFONT: whole glyphs inside the tile's budget
+        super::text::draw_row(out, l.w, &cap[..cols], bx + PAD(), sy, ink, false, FACE);
     }
 }
 
@@ -1042,7 +1075,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
         return false;
     }
     let (px, py) = (x as usize, y as usize);
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows = ModelBuf::take();
     let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0)); dp_refresh(&rows, n);
     // SHELLPIN — the router routes over the same pinned model the painter drew.
     let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. Permanent since APPPIN (R49): the console is a pinned app and its tile is always on the strip. Folded, not added — PARITY.md §5.3.
@@ -1068,6 +1101,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
         serial_println!("[dock] press at ({},{}) -> strip tiles={} raised=none", x, y, n);
         return true; // the dock's own background: consumed, raises nothing.
     };
+    if l.is_overflow(t) { return overflow_press(x, y, t, &rows[t..n]); } // WINDOWCAP-2 (R90): the `+<k>` group lists the rest
     let r = rows[t]; crate::video::lag::launch_routed(); // GLASSLAG M1 (B370): a tile press is a launch, an open request or a raise.
     // APPPIN — a PIN tile names no row: nothing to raise, nothing to focus yet. POST a launch for the
     // app it names and consume the press; the body that owns that app's instance drains the post on
@@ -1321,7 +1355,7 @@ pub fn selftest() {
 
     // Leg 1 — the model. Ours are the three rows we just made; the live console/desktop rows are in
     // the table too, so the assertions are made about OUR ids rather than about the total.
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows = ModelBuf::take();
     let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
     // SHELLPIN — the fixture routes over the PINNED model, because the router does (the module's
     // founding law: painter and router share the accessor, and this fixture is what asserts it).
@@ -1435,7 +1469,7 @@ pub fn selftest() {
 /// Returns the new count. Applied by every reader of the model — `compose`, [`press_at`],
 /// [`strip_rect`], `selftest` — so painter, router, registry and self-test cannot disagree about the
 /// tile count, which is the invariant `pin_shell`'s header states and `selftest` checks.
-fn pin_pulse_only(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+fn pin_pulse_only(rows: &mut Model, n: usize) -> usize {
     // PINCOUNT — the condition lives ONCE (`pin_pulse_wanted`, this file's tail); this is its only
     // mutator, and `pins_applied` folds the same predicate for the two count-only readers. This one
     // takes NO row census: `ever_armed`/`is_open` are runtime cells, not a scan of the model.
@@ -1450,7 +1484,7 @@ fn pin_pulse_only(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usiz
     // Closed => OFF the panel, so the pip takes the minimised ink — `pin_shell`'s rule, unchanged.
     e.visible = false;
     e.focused = false;
-    rows[n] = e;
+    rows.truncate(n); rows.push(e); // WINDOWCAP-2: the model grows
     n + 1
 }
 
@@ -1480,7 +1514,7 @@ const CONSOLE_PIN_ID: wm::WinId = wm::WinId::MAX - 3;
 /// Returns the new count. Applied by every reader of the model — [`compose`], [`press_at`],
 /// [`strip_rect`], [`selftest`] — so painter, router, occlusion registry and self-test cannot
 /// disagree about the tile count, which is the invariant `pin_shell`'s header states.
-fn pin_console(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+fn pin_console(rows: &mut Model, n: usize) -> usize {
     // PINCOUNT — the condition lives ONCE (`pin_console_wanted`, this file's tail); this is its only
     // mutator, and `pins_applied` folds the same predicate for the two count-only readers.
     if !pin_console_wanted(n, &|o| rows[..n].iter().any(|r| r.owner_asid == o)) {
@@ -1494,7 +1528,7 @@ fn pin_console(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
     // Closed => OFF the panel, so the pip takes the minimised ink — `pin_shell`'s rule, unchanged.
     e.visible = false;
     e.focused = false;
-    rows[n] = e;
+    rows.truncate(n); rows.push(e); // WINDOWCAP-2: the model grows
     n + 1
 }
 
@@ -1694,7 +1728,7 @@ pub fn apppin_selftest() {
     /// The live shell row — `(id, gen)` of the unique `KERNEL_OWNER_DESKTOP` row, from the same
     /// census the tiles are built from.
     fn shell_row() -> Option<(wm::WinId, u32)> {
-        let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+        let mut rows = ModelBuf::take();
         let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
         rows[..n]
             .iter()
@@ -1716,7 +1750,7 @@ pub fn apppin_selftest() {
         }
     }
     /// The settled strip model, exactly as `press_at` routes over it.
-    fn strip_model(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS]) -> usize {
+    fn strip_model(rows: &mut Model) -> usize {
         let (n, _) = wm::dock_scan(rows, (0, 0, 0, 0));
         let n = pin_console(rows, n);
         let n = pin_shell(rows, n);
@@ -1727,14 +1761,14 @@ pub fn apppin_selftest() {
     }
     /// Is the shell PIN on the strip right now?
     fn shell_pin_present() -> bool {
-        let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+        let mut rows = ModelBuf::take();
         let n = strip_model(&mut rows);
         rows[..n].iter().any(|r| r.id == SHELL_PIN_ID)
     }
     /// Press the shell PIN at its own tile centre through the router's seam, and report the outcome
     /// word — or why no press could be made.
     fn press_shell_pin() -> &'static str {
-        let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+        let mut rows = ModelBuf::take();
         let n = strip_model(&mut rows);
         let Some(t) = rows[..n].iter().position(|r| r.id == SHELL_PIN_ID) else {
             return "no-pin";
@@ -1935,22 +1969,22 @@ pub fn apppin_selftest() {
 
 /// DOCKID — the registry's capacity. One entry per non-furniture window the table can hold; furniture
 /// is never registered because its position is a constant rather than an arrival rank.
-const MAX_TILES: usize = wm::MAX_WINDOWS;
+// WINDOWCAP-2: `MAX_TILES` is gone — the registry is a `rowstore::SegVec`, grown on first use of a cell.
 
 /// DOCKID — the arrival counter. Monotonic, never reused, so a tile's rank is unique for the boot and
 /// a window that closes can never hand its position to the window that recycles its slot.
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1); static RECONCILES: AtomicU64 = AtomicU64::new(0); // DOCKID2 — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE RECONCILE THAT ACTUALLY RAN.** Incremented by [`reconcile`] at the END of every completed pass, and read by nothing on a shipped image: it exists so a fixture can tell "the registry says X" from "NO PASS EVER WROTE THE REGISTRY", which is the Class 6 distinction all three metal DOCKID sightings turn on (FIXTURE_FLAKES §1d). A GLOBAL total rather than a per-caller one, deliberately — the fixture does not care WHICH core reconciled, only THAT a pass wrote the registry while its windows were live. See the DOCKID2 block at this file's tail.
 
 /// DOCKID — registry column: the window id this slot's tile names, or `wm::WIN_NONE` for a free slot.
-static TILE_ID: [AtomicU32; MAX_TILES] = [const { AtomicU32::new(wm::WIN_NONE) }; MAX_TILES];
+static TILE_ID: super::rowstore::SegVec<AtomicU32> = super::rowstore::SegVec::new(|| AtomicU32::new(wm::WIN_NONE));
 /// DOCKID — registry column: the SLOT GENERATION the tile was created at. Half of the identity: a
 /// tile whose id is live but whose generation has moved names a window that no longer exists.
-static TILE_GEN: [AtomicU32; MAX_TILES] = [const { AtomicU32::new(0) }; MAX_TILES];
+static TILE_GEN: super::rowstore::SegVec<AtomicU32> = super::rowstore::SegVec::new(|| AtomicU32::new(0));
 /// DOCKID — registry column: the owning ASID, for the remove witness (the row is gone by then, so it
 /// cannot be asked).
-static TILE_OWNER: [AtomicU64; MAX_TILES] = [const { AtomicU64::new(0) }; MAX_TILES];
+static TILE_OWNER: super::rowstore::SegVec<AtomicU64> = super::rowstore::SegVec::new(|| AtomicU64::new(0));
 /// DOCKID — registry column: the arrival rank, which IS the tile's position among the app tiles.
-static TILE_SEQ: [AtomicU64; MAX_TILES] = [const { AtomicU64::new(0) }; MAX_TILES];
+static TILE_SEQ: super::rowstore::SegVec<AtomicU64> = super::rowstore::SegVec::new(|| AtomicU64::new(0));
 
 /// DOCKID — order key: the leftmost position, Quarry's, whether it is open or closed.
 const RANK_QUARRY: u64 = 0;
@@ -1990,8 +2024,8 @@ fn fixed_rank(owner: u64) -> Option<u64> {
 
 /// DOCKID — the registry slot holding `(id, gen)`, or `None`.
 fn tile_slot(id: wm::WinId, wgen: u32) -> Option<usize> {
-    (0..MAX_TILES).find(|&s| {
-        TILE_ID[s].load(Ordering::Relaxed) == id && TILE_GEN[s].load(Ordering::Relaxed) == wgen
+    (0..TILE_ID.hwm()).find(|&s| {
+        TILE_ID.get(s).load(Ordering::Relaxed) == id && TILE_GEN.get(s).load(Ordering::Relaxed) == wgen
     })
 }
 
@@ -2002,7 +2036,7 @@ fn order_key(e: &wm::DockEntry) -> u64 {
         return k;
     }
     match tile_slot(e.id, wm::winid_gen(e.id)) {
-        Some(s) => RANK_APPS + TILE_SEQ[s].load(Ordering::Relaxed),
+        Some(s) => RANK_APPS + TILE_SEQ.get(s).load(Ordering::Relaxed),
         None => RANK_UNSEEN + e.id as u64,
     }
 }
@@ -2015,10 +2049,10 @@ fn order_key(e: &wm::DockEntry) -> u64 {
 /// Insertion sort over PRECOMPUTED keys: `n <= MAX_WINDOWS` (12), the keys are unique by construction
 /// (a unique arrival rank, four distinct constants, or `RANK_UNSEEN + id`), and the sort is therefore
 /// total and deterministic rather than merely stable.
-fn order_model(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) {
-    let mut key = [0u64; wm::MAX_WINDOWS];
+fn order_model(rows: &mut Model, n: usize) {
+    let mut key: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(n); // WINDOWCAP-2
     for i in 0..n {
-        key[i] = order_key(&rows[i]);
+        key.push(order_key(&rows[i]));
     }
     for i in 1..n {
         let mut j = i;
@@ -2113,13 +2147,13 @@ fn census(rows: &[wm::DockEntry], n: usize) {
 /// Furniture is skipped by both arms: its rank is a constant, it has no arrival order, and its tile
 /// is permanent by design (that is what a pin IS).
 fn reconcile() -> bool {
-    let mut changed = false; let mut scan = [wm::DockEntry::empty(); wm::MAX_WINDOWS]; let (n, _) = wm::dock_scan(&mut scan, (0, 0, 0, 0)); let rows = &scan; // DOCKID2 — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE WRITER TAKES ITS MODEL WHEN IT MUTATES.** This function USED to be handed `(rows, n)` by [`settle`] — the model its CALLER scanned, before the pin chain, before anything else the pass did — and that is the whole of the defect §1d measured on `x86bind-logs/gored-b3-serial.log:1219..1238`: `idC` was allocated at `1219`, the reconcile at `1224` had been handed a model scanned BEFORE that allocation and did not admit it, the census at `1227` published `tiles=4` with `idC` live and TILELESS, and the next pass admitted `idD` at `seq=17` and `idC` at `seq=18` — the ELDER window given the LATER rank, against a green boot of the same six windows where `idC` takes 17 and `idD` 18 (`logs/foldgate/g2-test-x86-wc.log:2022/2032`). A tile's rank was therefore not its window's ARRIVAL but the arrival of the first reconcile pass that happened to SEE it, which is precisely what [`NEXT_SEQ`]'s header says the counter exists to prevent. ⚠ A READER-SIDE SNAPSHOT CANNOT FIX THIS and one was deliberately not written (B159): at `1242` the census is complete, internally consistent and STABLE — the registry is not TORN under the reader, it is stably and permanently WRONG, and a generation/seqlock hands the reader an unimpeachable view of an answer decided incorrectly one pass earlier. THE SCAN IS THE FIX. The pins are dropped with the caller's model and that costs nothing: both arms below skip every row [`fixed_rank`] answers for, and a pin's sentinel id (`wm::WinId::MAX - 3 ..= MAX`) can never equal a live window id, so the pinned model and the bare scan were always the same INPUT to this function. SINGLE WRITER UNCHANGED — [`compose`]'s `settle(.., true)` is still the one caller on a shipped image, and the router still reaches [`settle`] with `reconciling=false`, so LOCKFIX's rule for `press_at` (allocates nothing, takes no panel lock) is untouched: this scan is on the COMPOSE path only. COST, stated rather than hidden: one EXTRA `wm::dock_scan` per composite pass, i.e. a second acquire of the window table on a path that already takes it once — the same lock, the same masked context, no new wait CLASS, and the `[dock]` ledger tail is the measurement.
-    for s in 0..MAX_TILES {
-        let id = TILE_ID[s].load(Ordering::Relaxed);
+    let mut changed = false; let mut scan = ModelBuf::take(); let (n, _) = wm::dock_scan(&mut scan, (0, 0, 0, 0)); let rows = &scan; // DOCKID2 — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE WRITER TAKES ITS MODEL WHEN IT MUTATES.** This function USED to be handed `(rows, n)` by [`settle`] — the model its CALLER scanned, before the pin chain, before anything else the pass did — and that is the whole of the defect §1d measured on `x86bind-logs/gored-b3-serial.log:1219..1238`: `idC` was allocated at `1219`, the reconcile at `1224` had been handed a model scanned BEFORE that allocation and did not admit it, the census at `1227` published `tiles=4` with `idC` live and TILELESS, and the next pass admitted `idD` at `seq=17` and `idC` at `seq=18` — the ELDER window given the LATER rank, against a green boot of the same six windows where `idC` takes 17 and `idD` 18 (`logs/foldgate/g2-test-x86-wc.log:2022/2032`). A tile's rank was therefore not its window's ARRIVAL but the arrival of the first reconcile pass that happened to SEE it, which is precisely what [`NEXT_SEQ`]'s header says the counter exists to prevent. ⚠ A READER-SIDE SNAPSHOT CANNOT FIX THIS and one was deliberately not written (B159): at `1242` the census is complete, internally consistent and STABLE — the registry is not TORN under the reader, it is stably and permanently WRONG, and a generation/seqlock hands the reader an unimpeachable view of an answer decided incorrectly one pass earlier. THE SCAN IS THE FIX. The pins are dropped with the caller's model and that costs nothing: both arms below skip every row [`fixed_rank`] answers for, and a pin's sentinel id (`wm::WinId::MAX - 3 ..= MAX`) can never equal a live window id, so the pinned model and the bare scan were always the same INPUT to this function. SINGLE WRITER UNCHANGED — [`compose`]'s `settle(.., true)` is still the one caller on a shipped image, and the router still reaches [`settle`] with `reconciling=false`, so LOCKFIX's rule for `press_at` (allocates nothing, takes no panel lock) is untouched: this scan is on the COMPOSE path only. COST, stated rather than hidden: one EXTRA `wm::dock_scan` per composite pass, i.e. a second acquire of the window table on a path that already takes it once — the same lock, the same masked context, no new wait CLASS, and the `[dock]` ledger tail is the measurement.
+    for s in 0..TILE_ID.hwm() {
+        let id = TILE_ID.get(s).load(Ordering::Relaxed);
         if id == wm::WIN_NONE {
             continue;
         }
-        let tgen = TILE_GEN[s].load(Ordering::Relaxed);
+        let tgen = TILE_GEN.get(s).load(Ordering::Relaxed);
         let live = rows[..n]
             .iter()
             .any(|r| r.id == id && fixed_rank(r.owner_asid).is_none() && wm::winid_gen(r.id) == tgen);
@@ -2131,13 +2165,13 @@ fn reconcile() -> bool {
             "[dock] tile remove win={} gen={} owner={:#x} reason={}",
             id,
             tgen,
-            TILE_OWNER[s].load(Ordering::Relaxed),
+            TILE_OWNER.get(s).load(Ordering::Relaxed),
             if reuse { "reuse" } else { "close" }
         );
-        TILE_ID[s].store(wm::WIN_NONE, Ordering::Relaxed);
+        TILE_ID.get(s).store(wm::WIN_NONE, Ordering::Relaxed);
         changed = true;
     }
-    let mut ord = [0usize; wm::MAX_WINDOWS]; for i in 0..n { ord[i] = i; } for i in 1..n { let mut j = i; while j > 0 && (rows[ord[j]].stamp, rows[ord[j]].id) < (rows[ord[j - 1]].stamp, rows[ord[j - 1]].id) { ord.swap(j, j - 1); j -= 1; } } for r in ord[..n].iter().map(|&i| &rows[i]) { // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE ADMIT ARM WALKS IN ALLOCATION ORDER, NEVER IN TABLE ORDER — that is the residual DOCKID2 named, and this is the line that closes it.** This loop used to be `for r in rows[..n].iter()`, i.e. the scan's own order, and [`wm::dock_scan`] scans in `id` order BY CONSTRUCTION (its closing `debug_assert!` says so). `id` is a RECYCLED SLOT ALIAS, so when TWO windows are allocated between one reconcile and the next they are admitted in ONE pass and [`NEXT_SEQ`] handed the LOWER rank to the lower SLOT — a window that reused a freed low id took the elder's place in the strip, which is the operator-visible half of FIXTURE_FLAKES §1d reached by a different route than the one DOCKID2 fixed (rmbp-ledger B165: "two windows allocated between one reconcile and the next are still admitted in one pass in table order"). Sorting by [`wm::DockEntry::stamp`] makes the rank MONOTONE IN ALLOCATION BY CONSTRUCTION rather than by timing: the tile order no longer depends on how many windows a pass happens to admit at once, which was the last place that dependence lived. DOCKID2 shrank the miss window; this removes the consequence of missing it at all. `(stamp, id)` and not `stamp` alone — the tie is UNSTAMPED rows (`stamp == 0`, reachable only from `wm::DockEntry::empty` scratch), and breaking it on `id` degrades this loop to EXACTLY its old behaviour rather than to an arbitrary one. INSERTION SORT over an index PERMUTATION and not over `rows`: `rows` is this reconcile's own scan and the retire arm above has already read it, `MAX_WINDOWS` is 12, and the cost is a bounded ≤66-comparison pass on the admit path — no allocation, no lock, no recursion, and STABLE, so equal keys keep scan order. Indexed rather than copied because a `DockEntry` carries `MAX_TITLE` bytes of caption and this is the hot tail of every composite. The RETIRE arm above is deliberately NOT reordered: it neither reads nor mints a rank, and a retire is idempotent in any order.
+    let mut ord: alloc::vec::Vec<usize> = (0..n).collect(); /* WINDOWCAP-2 */ for i in 1..n { let mut j = i; while j > 0 && (rows[ord[j]].stamp, rows[ord[j]].id) < (rows[ord[j - 1]].stamp, rows[ord[j - 1]].id) { ord.swap(j, j - 1); j -= 1; } } for r in ord[..n].iter().map(|&i| &rows[i]) { // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE ADMIT ARM WALKS IN ALLOCATION ORDER, NEVER IN TABLE ORDER — that is the residual DOCKID2 named, and this is the line that closes it.** This loop used to be `for r in rows[..n].iter()`, i.e. the scan's own order, and [`wm::dock_scan`] scans in `id` order BY CONSTRUCTION (its closing `debug_assert!` says so). `id` is a RECYCLED SLOT ALIAS, so when TWO windows are allocated between one reconcile and the next they are admitted in ONE pass and [`NEXT_SEQ`] handed the LOWER rank to the lower SLOT — a window that reused a freed low id took the elder's place in the strip, which is the operator-visible half of FIXTURE_FLAKES §1d reached by a different route than the one DOCKID2 fixed (rmbp-ledger B165: "two windows allocated between one reconcile and the next are still admitted in one pass in table order"). Sorting by [`wm::DockEntry::stamp`] makes the rank MONOTONE IN ALLOCATION BY CONSTRUCTION rather than by timing: the tile order no longer depends on how many windows a pass happens to admit at once, which was the last place that dependence lived. DOCKID2 shrank the miss window; this removes the consequence of missing it at all. `(stamp, id)` and not `stamp` alone — the tie is UNSTAMPED rows (`stamp == 0`, reachable only from `wm::DockEntry::empty` scratch), and breaking it on `id` degrades this loop to EXACTLY its old behaviour rather than to an arbitrary one. INSERTION SORT over an index PERMUTATION and not over `rows`: `rows` is this reconcile's own scan and the retire arm above has already read it, `MAX_WINDOWS` is 12, and the cost is a bounded ≤66-comparison pass on the admit path — no allocation, no lock, no recursion, and STABLE, so equal keys keep scan order. Indexed rather than copied because a `DockEntry` carries `MAX_TITLE` bytes of caption and this is the hot tail of every composite. The RETIRE arm above is deliberately NOT reordered: it neither reads nor mints a rank, and a retire is idempotent in any order.
         if fixed_rank(r.owner_asid).is_some() {
             continue;
         }
@@ -2145,7 +2179,7 @@ fn reconcile() -> bool {
         if tile_slot(r.id, wgen).is_some() {
             continue;
         }
-        let Some(s) = (0..MAX_TILES).find(|&s| TILE_ID[s].load(Ordering::Relaxed) == wm::WIN_NONE)
+        let Some(s) = (0..=TILE_ID.hwm()).find(|&s| TILE_ID.get(s).load(Ordering::Relaxed) == wm::WIN_NONE) // WINDOWCAP-2: a free cell, else the next new one
         else {
             // The registry is exactly as large as the window table, so this is unreachable by
             // construction — and it is reported rather than assumed, because "unreachable by
@@ -2154,10 +2188,10 @@ fn reconcile() -> bool {
             continue;
         };
         let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
-        TILE_GEN[s].store(wgen, Ordering::Relaxed);
-        TILE_OWNER[s].store(r.owner_asid, Ordering::Relaxed);
-        TILE_SEQ[s].store(seq, Ordering::Relaxed);
-        TILE_ID[s].store(r.id, Ordering::Relaxed);
+        TILE_GEN.get(s).store(wgen, Ordering::Relaxed);
+        TILE_OWNER.get(s).store(r.owner_asid, Ordering::Relaxed);
+        TILE_SEQ.get(s).store(seq, Ordering::Relaxed);
+        TILE_ID.get(s).store(r.id, Ordering::Relaxed);
         serial_println!(
             "[dock] tile add win={} gen={} owner={:#x} seq={} label={}",
             r.id,
@@ -2176,7 +2210,7 @@ fn reconcile() -> bool {
 /// Split from the pin applications rather than folded into them so the three call sites read the same
 /// two lines, and so `strip_rect` — which wants the tile COUNT and nothing else — is not made to pay
 /// for an ordering it cannot use.
-fn settle(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize, reconciling: bool) {
+fn settle(rows: &mut Model, n: usize, reconciling: bool) {
     if reconciling && reconcile() { // DOCKID2 — [`reconcile`] takes NO model any more: it scans for itself, at the moment it mutates. `rows`/`n` still feed the two lines below, which ORDER and PRINT the model this pass will paint — that model is correctly the caller's scan (it is what the strip shows), and only the RANK's provenance moved. ⚠ SAME-LINE fold, line-NEUTRAL (B94).
         order_model(rows, n);
         census(rows, n);
@@ -2270,7 +2304,7 @@ pub fn dockid_selftest() {
     /// artifact, and a fixture that assembled its own model reported PASS over the top of it. With the
     /// reconcile left to `compose`, a dead fold empties the registry, every app tile falls back to
     /// `RANK_UNSEEN + id`, the strip returns to WINDOW-ID order, and legs 2 and 3 go red.
-    fn strip_model(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS]) -> usize {
+    fn strip_model(rows: &mut Model) -> usize {
         composite_reconciled(); // DOCKID2 — WAS a bare `wm::composite();`, and that bare call is the whole of the Class 6 half of §1d. `composite()` returns IDENTICALLY whether it ran a pass or was DECLINED by `COMP_GATE`, so on the three rMBP metal sightings this fixture drove six composites, reached `dock::compose` NOT ONCE (`gmux8-logs/f11.log:3256..3298` — six `[wm] alloc` lines and ZERO `[dock] tile add`/`remove`/`census` between them and the verdict, where `compose` reconciles UNCONDITIONALLY ahead of the panel snapshot's early-out and PRINTS on every admit) and then scored a registry no pass had ever written. The helper drives the same `composite()`, asks [`RECONCILES`] whether it reached the dock, waits the holder out BOUNDED and retries, and counts drives/runs/folds for the verdict. DMGFLAKE's `composite_live` (B158, `video/wm.rs` `dmgovlp_selftest`) is the same shape one layer up; it is a non-capturing CLOSURE local to that fixture and cannot be called from here, so this is the pattern reused, not the code. ⚠ SAME-LINE fold, line-NEUTRAL (B94).
         let (n, _) = wm::dock_scan(rows, (0, 0, 0, 0));
         let n = pin_console(rows, n);
@@ -2296,7 +2330,7 @@ pub fn dockid_selftest() {
         return;
     }
     // Register the three arrivals before anything closes: the arrival ranks are what leg 2 reads.
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows = ModelBuf::take();
     let _ = strip_model(&mut rows);
 
     // Close the MIDDLE window and open another. This is Peter's sequence, and `create_inner` hands
@@ -2313,7 +2347,7 @@ pub fn dockid_selftest() {
     let recycle_ok = w[3] == w[1];
 
     let n = strip_model(&mut rows);
-    let at = |rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize, id: wm::WinId| {
+    let at = |rows: &[wm::DockEntry], n: usize, id: wm::WinId| {
         rows[..n].iter().position(|r| r.id == id)
     };
     // Leg 2 — arrival order: the survivor A, then the survivor C, then the NEW window D. On the base
@@ -2324,12 +2358,12 @@ pub fn dockid_selftest() {
     };
     // Leg 3 — the registry and the table agree, in both directions.
     let mut set_ok = true;
-    for s in 0..MAX_TILES {
-        let id = TILE_ID[s].load(Ordering::Relaxed);
+    for s in 0..TILE_ID.hwm() {
+        let id = TILE_ID.get(s).load(Ordering::Relaxed);
         if id == wm::WIN_NONE {
             continue;
         }
-        if wm::winid_gen(id) != TILE_GEN[s].load(Ordering::Relaxed) || wm::info(id).is_none() {
+        if wm::winid_gen(id) != TILE_GEN.get(s).load(Ordering::Relaxed) || wm::info(id).is_none() {
             set_ok = false; // a tile that outlived its window, or names a recycled slot
         }
     }
@@ -2381,7 +2415,7 @@ pub fn dockid_selftest() {
     // carried for three pins — makes the chain count higher than the fold and reds this leg on any
     // board. Local scratch, so nothing global moves: the one write in the chain is `pin_console`'s
     // `CONSOLE_WINDOWED` latch, which is idempotent and is the state `compose` already published.
-    let mut probe = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut probe = ModelBuf::take();
     let chain = {
         let m = pin_console(&mut probe, 0);
         let m = pin_shell(&mut probe, m);
@@ -2509,7 +2543,7 @@ type Present<'a> = &'a dyn Fn(u64) -> bool;
 /// APPPIN: no "has a console window ever existed" term — the console is a pinned app and its tile is
 /// permanent, on every desktop, whether or not this boot has minted its window yet.
 fn pin_console_wanted(n: usize, present: Present<'_>) -> bool {
-    n < wm::MAX_WINDOWS
+    true /* WINDOWCAP-2: no strip cap — the layout overflows */
         && dp_is_pinned(0)
         && !crate::video::fbcon::console_is_routed()
         && !present(wm::KERNEL_OWNER_CONSOLE)
@@ -2517,14 +2551,14 @@ fn pin_console_wanted(n: usize, present: Present<'_>) -> bool {
 
 /// PINCOUNT — [`pin_shell`]'s condition, stated once: one live shell window max.
 fn pin_shell_wanted(n: usize, present: Present<'_>) -> bool {
-    n < wm::MAX_WINDOWS && dp_is_pinned(1) && !present(wm::KERNEL_OWNER_DESKTOP)
+    true /* WINDOWCAP-2: no strip cap — the layout overflows */ && dp_is_pinned(1) && !present(wm::KERNEL_OWNER_DESKTOP)
 }
 
 /// PINCOUNT — [`pin_quarry`]'s condition, stated once. `cfg`-gated in both polarities exactly as the
 /// pin is, so a build without the file manager counts no tile for it and compiles no reference to it.
 #[cfg(feature = "quarry")]
 fn pin_quarry_wanted(n: usize, present: Present<'_>) -> bool {
-    n < wm::MAX_WINDOWS && dp_is_pinned(2) && !present(crate::video::quarry::OWNER)
+    true /* WINDOWCAP-2: no strip cap — the layout overflows */ && dp_is_pinned(2) && !present(crate::video::quarry::OWNER)
 }
 
 /// PINCOUNT — the erasing twin. No file manager, no tile, and the count is unchanged.
@@ -2538,7 +2572,7 @@ fn pin_quarry_wanted(_n: usize, _present: Present<'_>) -> bool {
 /// is two runtime cells, and `ever_armed()` is false on every board that never had the window (every
 /// x86 `desktop_uefi` desktop), which is what keeps this pin off those images entirely.
 fn pin_pulse_wanted(n: usize) -> bool {
-    n < wm::MAX_WINDOWS
+    true /* WINDOWCAP-2: no strip cap — the layout overflows */
         && crate::video::pulsewin::ever_armed()
         && !crate::video::pulsewin::is_open()
 }
@@ -2634,7 +2668,7 @@ fn yn(b: bool) -> &'static str {
 /// router routes over — not the pre-pin scan. A pinned tile is recognised by [`pin_word`], the same
 /// accessor [`census`] names tiles with; a LIVE window belonging to one of the three apps is
 /// recognised by its owner, so `quarry=yes` is true whether the file manager is up or pinned closed.
-fn pins_census_once(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) {
+fn pins_census_once(rows: &[wm::DockEntry], n: usize) {
     if n == 0 || PINS_CENSUS_DONE.load(Ordering::Relaxed) {
         return;
     }
@@ -2905,7 +2939,7 @@ static QUIT_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 pub fn set_quit_hook(f: fn(wm::WinId, u64) -> &'static str) { QUIT_HOOK.store(f as usize, Ordering::Release); }
 
 /// Is this scan row a real window (not a synthetic pin)? The running indicator's predicate.
-fn row_running(r: &wm::DockEntry) -> bool { r.id != wm::WIN_NONE && (r.id as usize) <= wm::MAX_WINDOWS }
+fn row_running(r: &wm::DockEntry) -> bool { r.id != wm::WIN_NONE && r.id < wm::WIN_ID_SENTINEL_FLOOR } // WINDOWCAP-2: a real id, not a pin sentinel
 
 pub fn is_kept(owner: u64) -> bool { if let Some(i) = dp_spec_of_owner(owner) { return dp_is_pinned(i); } KEPT.iter().any(|k| k.load(Ordering::Relaxed) == owner) }
 
@@ -2933,7 +2967,7 @@ pub fn quit_owner(win: wm::WinId, owner: u64) -> &'static str {
 }
 
 /// The strip model exactly as the router assembles it, plus the layout.
-fn router_model(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS]) -> Option<(usize, Layout)> {
+fn router_model(rows: &mut Model) -> Option<(usize, Layout)> {
     let (n, _) = wm::dock_scan(rows, (0, 0, 0, 0)); dp_refresh(&*rows, n);
     let n = pin_console(rows, n); let n = pin_shell(rows, n); let n = pin_quarry(rows, n); let n = pin_pulse(rows, n);
     settle(rows, n, false);
@@ -2994,7 +3028,7 @@ fn menu_row(out: &mut [u32], l: &Layout, g: Option<MenuGeo>, j: usize) {
 
 /// The open menu's box (x, y, w, h), or `None` when closed. Same geometry the painter draws from.
 pub fn menu_rect() -> Option<(usize, usize, usize, usize)> {
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows = ModelBuf::take();
     let (n, l) = router_model(&mut rows)?;
     menu_geo(&l, &rows[..n], None).map(|g| (g.mx, g.my, g.mw, g.mh))
 }
@@ -3011,7 +3045,7 @@ fn menu_open_at(t: usize, owner: u64) { crate::video::lag::menu_opened(); // GLA
 /// Right-click on a RUNNING tile opens the menu. Consumes the press iff it landed on one.
 pub fn right_press_at(x: i32, y: i32) -> bool {
     if x < 0 || y < 0 { return false; }
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows = ModelBuf::take();
     let Some((_, l)) = router_model(&mut rows) else { return false };
     let Some(t) = l.tile_at(x as usize, y as usize) else { return false };
     if !row_running(&rows[t]) && pin_word(rows[t].id).is_none() { return false; } // DOCKPIN — a closed PIN tile opens the menu too, so a default tile can be removed without opening its app first.
@@ -3054,7 +3088,7 @@ pub fn menu_press(x: i32, y: i32) -> bool {
         return true;
     }
     if prow == 0 {
-        let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+        let mut rows = ModelBuf::take();
         let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
         let win = rows[..n].iter().find(|r| r.owner_asid == owner).map(|r| r.id).unwrap_or(wm::WIN_NONE);
         let how = quit_owner(win, owner);
@@ -3072,13 +3106,13 @@ pub fn menu_press(x: i32, y: i32) -> bool {
 pub fn dockrun_selftest() {
     static SURF: [u32; 64] = [0x0030_90F0; 64];
     const OWNER: u64 = 0xD2D1;
-    let census = |rows: &mut [wm::DockEntry; wm::MAX_WINDOWS]| -> Option<(usize, usize, usize, Layout)> {
+    let census = |rows: &mut Model| -> Option<(usize, usize, usize, Layout)> {
         composite_reconciled();
         let (n, l) = router_model(rows)?;
         let running = rows[..n].iter().filter(|r| row_running(r)).count();
         Some((n, running, n - running, l))
     };
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows = ModelBuf::take();
     let saved_focus = focus_get();
     let win = wm::create(OWNER, SURF.as_ptr() as usize, core::mem::size_of_val(&SURF), 8, 8, 32, b"runA");
     if win == wm::WIN_NONE { serial_println!(":: DOCKRUN: fixture — table full :: SKIP ::"); return; }
@@ -3107,7 +3141,7 @@ pub fn dockrun_selftest() {
 
                     let hit = menu_press((mx + PAD() + 1) as i32, (my + TILE_H() / 2) as i32);
                     let (n1, _, _, _) = census(&mut rows).map(|c| (c.0, c.1, c.2, c.3)).unwrap_or((usize::MAX, 0, 0, l));
-                    quit = hit && wm::info(win).is_none() && !rows[..n1.min(wm::MAX_WINDOWS)].iter().any(|r| r.owner_asid == OWNER);
+                    quit = hit && wm::info(win).is_none() && !rows[..n1.min(rows.len())].iter().any(|r| r.owner_asid == OWNER);
                 }
             }
         }
@@ -3206,11 +3240,11 @@ fn dp_extra_of_owner(o: u64) -> Option<usize> {
 }
 fn dp_extra_wanted(i: usize, n: usize, present: &dyn Fn(u64) -> bool) -> bool {
     let o = match i { 5 => crate::video::textedit::OWNER, _ => DP_PROG_OWNER[i].load(Ordering::Relaxed) };
-    n < wm::MAX_WINDOWS && dp_is_pinned(i) && !(o != 0 && present(o))
+    true /* WINDOWCAP-2: no strip cap — the layout overflows */ && dp_is_pinned(i) && !(o != 0 && present(o))
 }
 
 /// The table pins, appended after the pulse pin (the chain's tail). Same shape as `pin_pulse_only`.
-fn pin_extras(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+fn pin_extras(rows: &mut Model, n: usize) -> usize {
     let mut n = n;
     for i in DP_FIRST_EXTRA..DP_PINS.len() {
         if !dp_extra_wanted(i, n, &|o| rows[..n].iter().any(|r| r.owner_asid == o)) { continue; }
@@ -3223,18 +3257,18 @@ fn pin_extras(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
         e.title_len = b.len();
         e.visible = false;
         e.focused = false;
-        rows[n] = e;
+        rows.truncate(n); rows.push(e); // WINDOWCAP-2: the model grows
         n += 1;
     }
     n
 }
-fn pin_pulse(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+fn pin_pulse(rows: &mut Model, n: usize) -> usize {
     let n = pin_pulse_only(rows, n);
     pin_extras(rows, n)
 }
 
 /// Cache the owner of each ring-3 table app's live window (by `app_name_of` == name), from a scan.
-fn dp_refresh(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) {
+fn dp_refresh(rows: &[wm::DockEntry], n: usize) {
     for i in DP_FIRST_EXTRA..DP_PINS.len() {
         if DP_PINS[i].kind != DpKind::Ring3Program { continue; }
         let mut found = 0u64;
@@ -3331,7 +3365,7 @@ fn dp_load() -> u32 {
 
 /// The witness: tiles on the strip, pinned set, running windows, names loaded, bytes saved (-1 = failed).
 fn dp_witness(why: &str) {
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows = ModelBuf::take();
     let Some((n, _)) = router_model(&mut rows) else { return };
     let running = rows[..n].iter().filter(|r| row_running(r)).count();
     let mut pinned = 0usize; let mut shown = 0usize;
@@ -3342,7 +3376,7 @@ fn dp_witness(why: &str) {
     }
     let saved = DP_SAVED.load(Ordering::Relaxed);
     // `shown < pinned` only legitimately happens when the strip is full (n == MAX_WINDOWS).
-    let ok = saved >= 0 && (shown == pinned || n >= wm::MAX_WINDOWS);
+    let ok = saved >= 0 && shown == pinned; // WINDOWCAP-2: no full strip — a pin is always in the model
     serial_println!("[dock] dockpin {}", why);
     serial_println!(":: DOCKPIN: tiles={} pinned={} running={} loaded={} saved={} -> {} ::", n, pinned, running, DP_LOADED.load(Ordering::Relaxed), saved, if ok { "PASS" } else { "FAIL" });
 }
@@ -3376,7 +3410,7 @@ pub fn dockpin_selftest() {
     let parse_ok = m == (1 << 1 | 1 << 5) && c == 2 && dp_parse(&*dp_render(DP_ALL).into_bytes()) == (DP_ALL, DP_ALL.count_ones()); // LUMENBIN: the count is DERIVED (6, or 7 with the lumen pin)
     // Leg 2 — pin/unpin changes the model: unpin editor -> its tile (pin or live) leaves; pin -> returns.
     let has = |i: usize| -> Option<bool> {
-        let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+        let mut rows = ModelBuf::take();
         let (n, _) = router_model(&mut rows)?;
         Some(rows[..n].iter().any(|r| r.id == DP_PINS[i].id))
     };
@@ -3412,7 +3446,7 @@ pub fn dockpin_selftest() {
 /// How many per-window rows `owner`'s tile menu gains: its live window count when that is two or more, else none.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn menu_win_rows(owner: u64) -> usize {
-    let mut wr = [wm::WlRow { id: 0, owner: 0, minimised: false, title: [0; wm::MAX_TITLE], len: 0 }; wm::MAX_WINDOWS];
+    let mut wr: alloc::vec::Vec<wm::WlRow> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let n = wm::wl_rows(&mut wr);
     let c = wr[..n].iter().filter(|r| r.owner == owner).count();
     if c >= 2 { c } else { 0 }
@@ -3423,7 +3457,7 @@ fn menu_win_rows(_owner: u64) -> usize { 0 }
 /// The `k`-th window row of `owner`'s menu: its id and the label bytes (title) written into `buf`, returning `(id, len)`.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn menu_win_row(owner: u64, k: usize, buf: &mut [u8; wm::MAX_TITLE]) -> (wm::WinId, usize) {
-    let mut wr = [wm::WlRow { id: 0, owner: 0, minimised: false, title: [0; wm::MAX_TITLE], len: 0 }; wm::MAX_WINDOWS];
+    let mut wr: alloc::vec::Vec<wm::WlRow> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let n = wm::wl_rows(&mut wr);
     match wr[..n].iter().filter(|r| r.owner == owner).nth(k) {
         Some(r) => { buf[..r.len].copy_from_slice(&r.title[..r.len]); (r.id, r.len) }
@@ -3486,4 +3520,113 @@ pub fn post_line_launch(line: &str) -> bool {
 fn take_line_launch() -> Option<&'static str> {
     if !LINE_OWED.swap(false, Ordering::AcqRel) { return None; }
     LINE_SLOT.lock().take()
+}
+
+
+// ---------------------------------------------------------------------------------------------------
+// WINDOWCAP-2 (B378, R90) — the right-edge `+<k>` overflow group
+// ---------------------------------------------------------------------------------------------------
+//
+// A panel's width is not a window limit (Peter: "no hardcoding!!!"; the seat: "a panel's width is a hard
+// cap in disguise"). When the model has more rows than the strip can show one-glyph tiles for,
+// `Layout::for_panel` keeps the most tiles that fit and the LAST becomes `+<k>` — `k` the rows it stands
+// for. A press on it opens the bar's Window menu (`winlist`: one row per live app window, rebuilt from
+// the live table at open), which IS the list of the rest; with no Window box on the bar it raises the
+// overflowed rows in turn, so every window stays reachable from the dock either way.
+
+/// `+<k>` into `out`; returns its length.
+fn overflow_label(k: usize, out: &mut [u8; 8]) -> usize {
+    out[0] = b'+';
+    let mut d = [0u8; 7];
+    let (mut v, mut n) = (k, 0usize);
+    loop {
+        d[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 || n == d.len() {
+            break;
+        }
+    }
+    for i in 0..n {
+        out[1 + i] = d[n - 1 - i];
+    }
+    1 + n
+}
+
+static OVERFLOW_TURN: AtomicU64 = AtomicU64::new(0);
+
+/// The `+<k>` tile was pressed: `rest` are the model rows it stands for.
+fn overflow_press(x: i32, y: i32, t: usize, rest: &[wm::DockEntry]) -> bool {
+    PRESSES_N.fetch_add(1, Ordering::Relaxed);
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    if let Some((bx, by)) = super::winmenu::wl_box_center() {
+        let opened = super::winmenu::press_at(bx, by);
+        serial_println!("[dock] press at ({},{}) tile={} overflow={} -> window-list opened={} (WINDOWCAP-2)", x, y, t, rest.len(), opened);
+        if opened {
+            return true;
+        }
+    }
+    let live: alloc::vec::Vec<&wm::DockEntry> = rest.iter().filter(|r| row_running(r)).collect();
+    if live.is_empty() {
+        serial_println!("[dock] press at ({},{}) tile={} overflow={} -> nothing running (WINDOWCAP-2)", x, y, t, rest.len());
+        return true;
+    }
+    let k = (OVERFLOW_TURN.fetch_add(1, Ordering::Relaxed) as usize) % live.len();
+    let r = *live[k];
+    focus_set(if wm::is_kernel_owner(r.owner_asid) { 0 } else { r.owner_asid });
+    wm::focus_changed(r.owner_asid);
+    let raised = wm::raise_one(r.id);
+    serial_println!("[dock] press at ({},{}) tile={} overflow={} -> raised win={} ({}/{}) ok={} (WINDOWCAP-2)", x, y, t, rest.len(), r.id, k + 1, live.len(), raised);
+    true
+}
+
+
+// ---------------------------------------------------------------------------------------------------
+// WINDOWCAP-2 — the dock model's buffer, growable and warm
+// ---------------------------------------------------------------------------------------------------
+
+/// The dock model: one entry per dock-addressable row plus the pins. Grows with the table.
+pub(crate) type Model = alloc::vec::Vec<wm::DockEntry>;
+
+const MODEL_POOL_N: usize = 3;
+
+/// Warm buffers for the per-pass model (`compose` runs every composite tail): a steady desktop reuses
+/// their capacity and never touches the allocator.
+static MODEL_POOL: [spin::Mutex<Model>; MODEL_POOL_N] = [const { spin::Mutex::new(alloc::vec::Vec::new()) }; MODEL_POOL_N];
+
+/// A model buffer: a claimed pool buffer, or an owned one when the pool is busy.
+pub(crate) struct ModelBuf {
+    g: Option<spin::MutexGuard<'static, Model>>,
+    own: Model,
+}
+
+impl ModelBuf {
+    pub(crate) fn take() -> ModelBuf {
+        for c in MODEL_POOL.iter() {
+            if let Some(mut g) = c.try_lock() {
+                g.clear();
+                return ModelBuf { g: Some(g), own: alloc::vec::Vec::new() };
+            }
+        }
+        ModelBuf { g: None, own: alloc::vec::Vec::new() }
+    }
+}
+
+impl core::ops::Deref for ModelBuf {
+    type Target = Model;
+    fn deref(&self) -> &Model {
+        match self.g.as_ref() {
+            Some(g) => g,
+            None => &self.own,
+        }
+    }
+}
+
+impl core::ops::DerefMut for ModelBuf {
+    fn deref_mut(&mut self) -> &mut Model {
+        match self.g.as_mut() {
+            Some(g) => g,
+            None => &mut self.own,
+        }
+    }
 }

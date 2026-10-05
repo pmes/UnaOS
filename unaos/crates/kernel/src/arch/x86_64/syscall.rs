@@ -3236,7 +3236,7 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 /// plus the console: 10 + 1 = 11, and 12 leaves a row of margin. Raising it alone would have been
 /// pointless (the process table would still refuse the 7th launch) and raising the others without it
 /// would have traded a `-EAGAIN` at spawn for an `-ENFILE` at the first `SYS_WIN_CREATE`.
-const WIN_MAX: usize = crate::video::wm::MAX_WINDOWS; // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold: no literal; the ring-3 table is as wide as the id space and the live limit is `video::wincap`
+const WIN_MAX: usize = crate::arch::memory::USER_SLOTS * crate::arch::x86_64::memory::FB_WIN_SLOTS; // WINDOWCAP-2 (B378, R90) — ⚠ SAME-LINE fold: no literal; every ring-3 window lives in an address-space slot's FB region, so the ring-3 table is exactly (slots x windows per slot) wide — the VA layout's own count, not a policy. The compositor table (`video::wm`) has no width at all; the live limit is `video::wincap`.
 /// HEADROOM: was `WIN_MAX == FB_WIN_SLOTS`. That equality was never the requirement — it was two
 /// caps that happened to share a value, and it silently made every per-address-space REGION SLOT
 /// index legal as a global window id and vice versa. The real requirement is one-directional and is
@@ -3246,7 +3246,7 @@ const WIN_MAX: usize = crate::video::wm::MAX_WINDOWS; // WINDOWCAP (B378, R90) �
 /// window in the machine — that is `-EMFILE`) but never larger. See `memory::FB_WIN_SLOTS` for why
 /// the per-process cap stayed at 8 while the global one grew.
 const _: () = assert!(crate::arch::x86_64::memory::FB_WIN_SLOTS <= WIN_MAX);
-const _: () = assert!(WIN_MAX <= crate::video::wm::MAX_WINDOWS);
+const _: () = assert!(WIN_MAX <= 64); // WINDOWCAP-2: the DMG-REFUSE fixture's two masks are u64
 
 /// WINX-1: one window table row. `owner == WIN_OWNER_FREE` means FREE. Unlike aarch64 — where ASID 0 is
 /// the shared context and so doubles as the free marker — x86 slot 0 is a REAL address space, so the
@@ -5727,7 +5727,7 @@ pub fn user_input_route(ev: crate::pal::Event) -> crate::pal::Event {
 ///
 /// Compacts in place and zeroes the tail, so the caller reads `ring[..n]` with no stale owner behind
 /// it. `out` is `focus_ring`'s own buffer type, so no second array is allocated anywhere.
-fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
+fn focus_ring_apps(out: &mut alloc::vec::Vec<u64>) -> usize { // WINDOWCAP-2: a growable ring
     let n = crate::video::wm::focus_ring(out);
     let mut k = 0usize;
     for i in 0..n {
@@ -5842,7 +5842,7 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // without these four a wedge in the ring read or in the focus primitive would leave NO token at
     // all on x86 where aarch64 would leave `<F1>` with no successor.
     crate::wedge2::mark("<F1>");
-    let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
+    let mut ring: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let n = focus_ring_apps(&mut ring);
     let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     if cur == 0 && n == 0 {
@@ -14566,8 +14566,8 @@ const _: () = {
         "MAX_PROCS must leave 2 ring-3 slots free"
     );
     assert!(
-        MAX_PROCS <= crate::video::wm::MAX_WINDOWS,
-        "every bg program must be able to own a window"
+        MAX_PROCS <= WIN_MAX,
+        "every bg program must be able to own a window" // WINDOWCAP-2: against the ring-3 table (the compositor's has no width)
     );
 };
 
@@ -19035,11 +19035,11 @@ fn dmg_build(entry_sym: *const u8) -> Option<U7xFix> {
 /// DMG-REFUSE: the live window table, as two bitmaps — every OCCUPIED row, and the rows owned by slot
 /// `s`. This is the launcher's GROUND TRUTH: the expectation table is built from it and re-verified
 /// against it, so no probe is graded against a prediction.
-fn dmg_win_masks(s: usize) -> (u32, u32) {
+fn dmg_win_masks(s: usize) -> (u64, u64) { // WINDOWCAP-2: u64, WIN_MAX is the VA layout's count
     let _irq = IrqGuard::mask_save();
     let t = WINDOWS.lock();
-    let mut occ = 0u32;
-    let mut own = 0u32;
+    let mut occ = 0u64;
+    let mut own = 0u64;
     for i in 0..WIN_MAX {
         if t[i].owner != WIN_OWNER_FREE {
             occ |= 1 << i;

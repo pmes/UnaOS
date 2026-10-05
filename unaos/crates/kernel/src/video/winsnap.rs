@@ -51,7 +51,7 @@ struct Entry {
     snapped: (usize, usize, usize),
 }
 const NO_ENTRY: Entry = Entry { live: false, owner: 0, saved: (0, 0, 0), snapped: (0, 0, 0) };
-static SNAP: spin::Mutex<[Entry; MAX_WINDOWS]> = spin::Mutex::new([NO_ENTRY; MAX_WINDOWS]);
+static SNAP: spin::Mutex<alloc::vec::Vec<Entry>> = spin::Mutex::new(alloc::vec::Vec::new()); // WINDOWCAP-2: one entry per slot, grown on first snap
 
 /// The zone the live drag's pointer is in (preview armed), or `Z_NONE`.
 static ZONE: AtomicU8 = AtomicU8::new(Z_NONE);
@@ -164,18 +164,17 @@ fn outer_of(id: WinId) -> (usize, usize, usize, usize) {
 /// The entry for `id` if the row still sits where the snap put it.
 fn entry_valid(id: WinId) -> Option<Entry> {
     let slot = (id as usize).wrapping_sub(1);
-    if slot >= MAX_WINDOWS {
-        return None;
-    }
-    let e = SNAP.lock()[slot];
+    let e = SNAP.lock().get(slot).copied()?; // WINDOWCAP-2: an id never snapped has no entry
     let (x, y, _, _, s, owner, _) = geom(id)?;
     if e.live && e.owner == owner && e.snapped == (x, y, s) { Some(e) } else { None }
 }
 
 fn set_entry(id: WinId, e: Entry) {
     let slot = (id as usize).wrapping_sub(1);
-    if slot < MAX_WINDOWS {
-        SNAP.lock()[slot] = e;
+    if id != WIN_NONE {
+        let mut t = SNAP.lock(); // WINDOWCAP-2: grow to the slot
+        if t.len() <= slot { t.resize(slot + 1, NO_ENTRY); }
+        t[slot] = e;
     }
 }
 

@@ -921,7 +921,7 @@ pub fn compose() -> bool {
     // this is the only thing standing between an open menu and a window's pixels. The dock's WCK5
     // condition, asked the dock's way: one bounded table scan, and only while the menu is OPEN — the
     // closed path returned above without reaching it.
-    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let mut rows = super::dock::ModelBuf::take(); // WINDOWCAP-2: a warm, growable model buffer
     let (_, clobbered) = wm::dock_scan(&mut rows, SLOT.rect());
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
