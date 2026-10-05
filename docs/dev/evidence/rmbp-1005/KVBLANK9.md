@@ -51,3 +51,10 @@ open/close, `:: KVBLANK8: rung3 armed_by=compositor … -> PASS ::`, then the KV
 - The periodic `:: kepler: vblank head=… count=… period_us=…` sampler line still prints on the `edge()` cadence
   (driver telemetry, not a rung; QUIETBOOT's `census` gate is the natural home).
 - `vectors::alloc` prints its own `[vectors] alloc name=kepler-vblank` witness when first need allocates.
+
+## Results (legs run inline from `unaos/crates/kernel`, sequentially, target/ removed after each)
+
+- x86 metal shape + `nvidia-kepler,nvidia-kepler-takeover,kvblank_trace,wc_gpublit`: `cargo check` exit 0.
+- x86 metal shape alone: exit 0. 74 warnings on both x86 legs, the same count as the cut; none in a touched file.
+- aarch64 login shape (`login,loginst,virt_el0`, user blob head `28 00 80 d2`): exit 0.
+- `charter-check.sh` 0 · `spec-roots.sh` 0 · `fixture-reachable.sh` 0.
