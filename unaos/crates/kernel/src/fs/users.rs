@@ -3041,7 +3041,13 @@ fn stage_publish(st: BootStage, why: &str) {
                 BAR_HELD.store(true, Ordering::Release);
             }
             crate::video::crystal::login::installer_sweep();
-        } else if why != "store-has-users" && BAR_HELD.swap(false, Ordering::AcqRel) { // INSTALLBARE: boot 2's login screen keeps the bar owed — the first login releases it (`bar_release`)
+        } else if why != "store-has-users" { // INSTALLBARE: boot 2's login screen keeps the bar owed — the first login releases it (`bar_release`)
+            // R92 (flight 24, Peter: "WHERES THE DAMN MENUBAR AND TASKBAR"): `close_into_session` runs `bar_release` BEFORE this
+            // publish, while `furniture_held()` still reads the CreateUser stage, so its composite declines the strips; and under
+            // R88 no furniture window is minted afterwards to dirty the scene. The bar and the dock are the DESKTOP, not login
+            // items: enable and composite here, on the stage that makes `furniture_held()` false, whether or not the latch was
+            // already swapped. The paint lands (`[strip] paint tenant=dock`, `[menubar] …`) or this boot is red.
+            BAR_HELD.store(false, Ordering::Release);
             let _ = crate::video::menubar::set_enabled(true);
             crate::video::wm::composite();
         }
