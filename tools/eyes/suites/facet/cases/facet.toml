@@ -1,0 +1,90 @@
+# Facet views and edits vs their Chromium-proven golden PNGs (`max_delta`: the largest channel
+# difference tests/oracles.rs allows against the golden; `note`: the golden vs Chromium).
+
+[[case]]
+name = "card-actual"
+page = "pages/card-actual.html"
+max_delta = 0
+note = "pixel-exact vs Chromium"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --zoom actual --out {out}"
+
+[[case]]
+name = "card-zoom400"
+page = "pages/card-zoom400.html"
+max_delta = 0
+note = "pixel-exact vs Chromium"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --zoom 400 --out {out}"
+
+[[case]]
+name = "card-rotate90"
+page = "pages/card-rotate90.html"
+max_delta = 0
+note = "pixel-exact vs Chromium"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --rotate 90 --zoom 200 --out {out}"
+
+[[case]]
+name = "card-fliph"
+page = "pages/card-fliph.html"
+max_delta = 0
+note = "pixel-exact vs Chromium"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --flip-h --zoom 200 --out {out}"
+
+[[case]]
+name = "photo-o6"
+page = "pages/photo-o6.html"
+max_delta = 2
+note = "EXIF 6 applied; JPEG IDCT differs from Chromium by <= 2 (decoder, chicken wire)"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/photo-o6.jpg --zoom 200 --out {out}"
+
+[[case]]
+name = "photo-o5"
+page = "pages/photo-o5.html"
+max_delta = 2
+note = "EXIF 5 applied; JPEG IDCT differs from Chromium by <= 2 (decoder, chicken wire)"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/photo-o5.jpg --zoom 200 --out {out}"
+
+[[case]]
+name = "card-crop"
+page = "pages/card-crop.html"
+max_delta = 0
+note = "pixel-exact vs Chromium"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --crop 8,4,24,20 --zoom 200 --out {out}"
+
+[[case]]
+name = "card-adjust"
+page = "pages/card-adjust.html"
+max_delta = 0
+note = "pixel-exact vs Chromium filter: brightness() contrast()"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --adjust 1.3,0.7 --zoom 200 --out {out}"
+
+[[case]]
+name = "card-resize"
+page = "pages/card-resize.html"
+max_delta = 0
+note = "triangle filter; Chromium smooth-scales with another filter (PSNR ~30 dB, recorded, not gated)"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --resize 30x20 --zoom actual --out {out}"
+
+[[case]]
+name = "card-fit"
+page = "pages/card-fit.html"
+max_delta = 0
+note = "pixel-exact vs Chromium"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --width 100 --height 100 --out {out}"
+
+[[case]]
+name = "card-pan"
+page = "pages/card-pan.html"
+max_delta = 0
+note = "pixel-exact vs Chromium"
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --zoom 400 --width 100 --height 80 --pan -20,10 --out {out}"
