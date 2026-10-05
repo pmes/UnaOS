@@ -153,7 +153,19 @@ impl<'a> Renderer<'a> {
         Renderer { doc, props, opts, w, h, depth: 0, active: Vec::new(), root_font: 16.0, root_lh: 16.0 * 1.2, icb: (w as f64, h as f64) }
     }
 
-    fn sub(&self, w: usize, h: usize) -> Renderer<'a> {
+    /// Elements being instantiated (the cycle guard), for resources rendered out of place (feImage).
+    pub fn active_push(&mut self, n: usize) {
+        self.active.push(n);
+    }
+    pub fn active_pop(&mut self) {
+        self.active.pop();
+    }
+    pub fn is_active(&self, n: usize) -> bool {
+        self.active.contains(&n)
+    }
+
+    /// A renderer for an offscreen raster of another size (one level deeper).
+    pub fn sub(&self, w: usize, h: usize) -> Renderer<'a> {
         Renderer { doc: self.doc, props: self.props, opts: self.opts, w, h, depth: self.depth + 1, active: self.active.clone(), root_font: self.root_font, root_lh: self.root_lh, icb: self.icb }
     }
 
@@ -1145,9 +1157,8 @@ impl<'a> Renderer<'a> {
         let p = &self.props[node];
         let clip = get(p, "clip-path").filter(|v| v.trim() != "none").map(|v| parse_func_iri(v));
         let mask = get(p, "mask").filter(|v| v.trim() != "none").map(|v| parse_func_iri(v));
-        let has_filter = get(p, "filter").map(|v| v.trim() != "none").unwrap_or(false);
-        let _ = has_filter; // filters are out of scope (SR52 ceiling): content renders unfiltered
-        let needs_layer = st.opacity < 1.0 || clip.is_some() || mask.is_some();
+        let filter = get(p, "filter").map(|v| v.trim()).filter(|v| !v.is_empty() && *v != "none").map(|v| v.to_string());
+        let needs_layer = st.opacity < 1.0 || clip.is_some() || mask.is_some() || filter.is_some();
         if !needs_layer {
             self.depth += 1;
             self.content(node, &ectx, &st, &ctx.style, canvas);
@@ -1158,9 +1169,29 @@ impl<'a> Renderer<'a> {
             return;
         }
         let bbox = if clip.is_some() || mask.is_some() { self.bbox(node, ctx, &Transform::IDENTITY) } else { None };
-        let mut layer = Pixmap::new(self.w, self.h);
         self.depth += 1;
-        self.content(node, &ectx, &st, &ctx.style, &mut layer);
+        let mut layer = match filter {
+            Some(fv) => {
+                let (st2, parent) = (st.clone(), ctx.style.clone());
+                match crate::filter::render_filtered(self, node, ctx, &ectx, &fv, |r, c, l| r.content(node, c, &st2, &parent, l)) {
+                    crate::filter::Outcome::Layer(l) => l,
+                    crate::filter::Outcome::Nothing => {
+                        self.depth -= 1;
+                        return;
+                    }
+                    crate::filter::Outcome::Unfiltered => {
+                        let mut layer = Pixmap::new(self.w, self.h);
+                        self.content(node, &ectx, &st, &ctx.style, &mut layer);
+                        layer
+                    }
+                }
+            }
+            None => {
+                let mut layer = Pixmap::new(self.w, self.h);
+                self.content(node, &ectx, &st, &ctx.style, &mut layer);
+                layer
+            }
+        };
         if let Some(c) = clip {
             match c {
                 // Not a url(): a CSS basic shape (CSS Masking §6.1 / CSS Shapes 1 §3), else ignored.
@@ -1412,7 +1443,8 @@ impl<'a> Renderer<'a> {
         let p = &self.props[node];
         let clip = get(p, "clip-path").and_then(parse_func_iri);
         let mask = get(p, "mask").and_then(parse_func_iri);
-        if st.opacity >= 1.0 && clip.is_none() && mask.is_none() {
+        let filter = get(p, "filter").map(|v| v.trim()).filter(|v| !v.is_empty() && *v != "none").map(|v| v.to_string());
+        if st.opacity >= 1.0 && clip.is_none() && mask.is_none() && filter.is_none() {
             f(self, ctx, canvas);
             return;
         }
@@ -1422,8 +1454,30 @@ impl<'a> Renderer<'a> {
             Some(inv) if ectx.ts != ctx.ts => bbox.map(|b| b.transform(&ctx.ts).transform(&inv)),
             _ => bbox,
         };
-        let mut layer = Pixmap::new(self.w, self.h);
-        f(self, ctx, &mut layer);
+        let mut layer = match filter {
+            Some(fv) => {
+                let fctx = Ctx { style: st.clone(), ..ctx.clone() };
+                // `f` is consumed only when a filter runs; an invalid filter renders unfiltered.
+                let mut f = Some(f);
+                let out = crate::filter::render_filtered(self, node, pctx, &fctx, &fv, |r, c, l| (f.take().unwrap())(r, c, l));
+                match out {
+                    crate::filter::Outcome::Layer(l) => l,
+                    crate::filter::Outcome::Nothing => return,
+                    crate::filter::Outcome::Unfiltered => {
+                        let mut layer = Pixmap::new(self.w, self.h);
+                        if let Some(f) = f.take() {
+                            f(self, ctx, &mut layer);
+                        }
+                        layer
+                    }
+                }
+            }
+            None => {
+                let mut layer = Pixmap::new(self.w, self.h);
+                f(self, ctx, &mut layer);
+                layer
+            }
+        };
         let ctx = ectx;
         if let Some(id) = clip {
             match self.clip_mask(&id, bbox, ctx) {

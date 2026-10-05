@@ -374,6 +374,8 @@ pub struct Style {
     pub kerning: bool,
     pub image_smooth: bool,
     pub linear_rgb_interp: bool,
+    /// `color-interpolation-filters` (inherited): linearRGB (the initial value) or sRGB (`auto` → sRGB).
+    pub filters_linear: bool,
     pub rtl: bool,
     // ---- non-inherited (reset per element) ----
     pub opacity: f64,
@@ -385,6 +387,10 @@ pub struct Style {
     pub decoration: u8,
     pub baseline_shift: Option<String>,
     pub dominant_baseline: Option<String>,
+    /// `flood-color` / `flood-opacity` / `lighting-color` (not inherited; Filter Effects 1 §16).
+    pub flood_color: Color,
+    pub flood_opacity: f64,
+    pub lighting_color: Color,
 }
 
 pub const DECOR_UNDERLINE: u8 = 1;
@@ -426,6 +432,7 @@ impl Default for Style {
             kerning: true,
             image_smooth: true,
             linear_rgb_interp: false,
+            filters_linear: true,
             rtl: false,
             opacity: 1.0,
             display_none: false,
@@ -436,6 +443,9 @@ impl Default for Style {
             decoration: 0,
             baseline_shift: None,
             dominant_baseline: None,
+            flood_color: Color::BLACK,
+            flood_opacity: 1.0,
+            lighting_color: Color::rgb(255, 255, 255),
         }
     }
 }
@@ -493,6 +503,9 @@ impl Style {
         s.decoration = 0;
         s.baseline_shift = None;
         s.dominant_baseline = None;
+        s.flood_color = Color::BLACK;
+        s.flood_opacity = 1.0;
+        s.lighting_color = Color::rgb(255, 255, 255);
         // `color` first: currentColor in other properties refers to this element's color.
         for (n, v) in p.iter() {
             let v = v.trim();
@@ -672,6 +685,30 @@ impl Style {
                 "text-rendering" => s.text_aa = v != "optimizeSpeed",
                 "image-rendering" => s.image_smooth = !(v == "optimizeSpeed" || v == "pixelated" || v == "crisp-edges"),
                 "color-interpolation" => s.linear_rgb_interp = v == "linearRGB",
+                "color-interpolation-filters" => match v {
+                    "linearRGB" => s.filters_linear = true,
+                    "sRGB" | "auto" => s.filters_linear = false,
+                    _ => {}
+                },
+                "flood-color" | "lighting-color" => {
+                    let c = match color::parse(v) {
+                        Some(ParsedColor::Color(c)) => Some(c),
+                        Some(ParsedColor::CurrentColor) => Some(s.color),
+                        None => None,
+                    };
+                    if let Some(c) = c {
+                        if n == "flood-color" {
+                            s.flood_color = c;
+                        } else {
+                            s.lighting_color = c;
+                        }
+                    }
+                }
+                "flood-opacity" => {
+                    if let Some(o) = opacity_value(v) {
+                        s.flood_opacity = o;
+                    }
+                }
                 "paint-order" => {
                     let words: Vec<&str> = v.split_whitespace().collect();
                     let valid = words == ["normal"]
@@ -735,6 +772,9 @@ impl Style {
             "stop-opacity" => self.stop_opacity = p.stop_opacity,
             "overflow" => self.overflow_visible = p.overflow_visible,
             "display" => self.display_none = p.display_none,
+            "flood-color" => self.flood_color = p.flood_color,
+            "flood-opacity" => self.flood_opacity = p.flood_opacity,
+            "lighting-color" => self.lighting_color = p.lighting_color,
             "baseline-shift" => self.baseline_shift = p.baseline_shift.clone(),
             "dominant-baseline" | "alignment-baseline" => self.dominant_baseline = p.dominant_baseline.clone(),
             _ => {} // inherited properties already hold the parent's value
