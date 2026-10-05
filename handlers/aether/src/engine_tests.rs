@@ -2485,4 +2485,24 @@ mod tests {
         let (pa, pb) = (rect_by_id(&a, "p").unwrap(), rect_by_id(&b, "p").unwrap());
         assert!(pb.3 >= pa.3 + 2.0, "line box grows: {pa:?} -> {pb:?}");
     }
+
+    /// CSS 2.2 Appendix E: a higher z-index paints over a later sibling;
+    /// position: fixed with bottom: 0 sits at the viewport's bottom edge.
+    #[test]
+    fn test_z_index_and_fixed_kat() {
+        let t = laid_out(
+            r#"<html><body><div style="position:relative;height:100px"><div style="position:absolute;left:0;top:0;width:50px;height:50px;background:#ff0000;z-index:2"></div><div style="position:absolute;left:25px;top:25px;width:50px;height:50px;background:#0000ff;z-index:1"></div></div><div style="position:fixed;left:0;right:0;bottom:0;height:10px;background:#00ff00"></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (w, h) = (200u32, 300u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; (surface[i + 2], surface[i + 1], surface[i]) }; // BGRA
+        let red = px(40, 40);
+        assert!(red.0 > 200 && red.2 < 50, "z-index 2 over z-index 1: {red:?}");
+        let blue = px(60, 60);
+        assert!(blue.2 > 200, "the lower box shows outside the overlap: {blue:?}");
+        let bar = px(100, h - 5);
+        assert!(bar.1 > 200 && bar.0 < 50, "fixed bar at the viewport bottom: {bar:?}");
+    }
 }

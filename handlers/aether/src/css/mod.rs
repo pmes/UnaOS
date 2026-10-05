@@ -281,11 +281,28 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 style.margin[side_index(prop)] = Some(v);
             }
         }
-        "position" => match value {
-            "absolute" | "fixed" => style.position = Some(taffy::style::Position::Absolute),
-            "static" | "relative" | "sticky" => style.position = Some(taffy::style::Position::Relative),
-            other => crate::ledger::record_css(&format!("position:{}", other)),
-        },
+        "position" => {
+            style.paint.position_kind = match value {
+                "static" => Some(0),
+                "relative" => Some(1),
+                "absolute" => Some(2),
+                "fixed" => Some(3),
+                "sticky" => Some(4),
+                _ => None,
+            };
+            match value {
+                "absolute" | "fixed" => style.position = Some(taffy::style::Position::Absolute),
+                "static" | "relative" | "sticky" => style.position = Some(taffy::style::Position::Relative),
+                other => crate::ledger::record_css(&format!("position:{}", other)),
+            }
+        }
+        "z-index" => {
+            if value == "auto" {
+                style.paint.z_index = Some(None);
+            } else if let Ok(z) = value.parse::<i32>() {
+                style.paint.z_index = Some(Some(z));
+            }
+        }
         "top" => style.inset_top = parse_length_percentage_auto_str(value),
         "left" => style.inset_left = parse_length_percentage_auto_str(value),
         "right" => style.inset_right = parse_length_percentage_auto_str(value),
@@ -1861,7 +1878,7 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
-        ua_vmargin, border_collapse, border_spacing, has_width,
+        ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
     );
     clone!(pct_math);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);

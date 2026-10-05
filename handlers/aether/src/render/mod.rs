@@ -778,8 +778,34 @@ pub fn render_frame(
             return;
         }
         let Ok(layout_box) = layout.taffy.layout(node_id) else { return };
-        let current_x = abs_x + layout_box.location.x;
-        let current_y = abs_y + layout_box.location.y;
+        let mut current_x = abs_x + layout_box.location.x;
+        let mut current_y = abs_y + layout_box.location.y;
+        // position: fixed — the containing block is the viewport (CSS 2.2
+        // §10.1): insets resolve against it and the box ignores scrolling.
+        if layout.paint_map.get(&node_id).and_then(|p| p.position_kind) == Some(3) {
+            if let Ok(st) = layout.taffy.style(node_id) {
+                let len = |v: taffy::style::LengthPercentageAuto, basis: f32| -> Option<f32> {
+                    let raw = v.into_raw();
+                    match raw.tag() {
+                        taffy::style::CompactLength::LENGTH_TAG => Some(raw.value()),
+                        taffy::style::CompactLength::PERCENT_TAG => Some(raw.value() * basis),
+                        _ => None,
+                    }
+                };
+                let (vw, vh) = (width as f32, height as f32);
+                let (w, h) = (layout_box.size.width, layout_box.size.height);
+                if let Some(l) = len(st.inset.left, vw) {
+                    current_x = sx as f32 + l;
+                } else if let Some(r) = len(st.inset.right, vw) {
+                    current_x = sx as f32 + vw - r - w;
+                }
+                if let Some(t) = len(st.inset.top, vh) {
+                    current_y = sy as f32 + t;
+                } else if let Some(b) = len(st.inset.bottom, vh) {
+                    current_y = sy as f32 + vh - b - h;
+                }
+            }
+        }
 
         let mut inherited = inherited;
 
@@ -1322,7 +1348,28 @@ pub fn render_frame(
             return; // fully clipped out — nothing below can paint
         }
         if let Ok(children) = layout.taffy.children(node_id) {
-            for child in children {
+            // CSS 2.2 Appendix E, per parent: negative z-index, then the
+            // in-flow boxes, then positioned boxes with z-index auto/0 in
+            // tree order, then positive z-index in ascending order (stable).
+            // (Positioned descendants are ordered among their siblings,
+            // not hoisted to the enclosing stacking context.)
+            let mut order: Vec<(i32, i32, usize, NodeId)> = children
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| {
+                    let p = layout.paint_map.get(&c);
+                    let positioned = p.and_then(|p| p.position_kind).is_some_and(|k| k != 0);
+                    let z = p.and_then(|p| p.z_index).flatten().filter(|_| positioned);
+                    match z {
+                        Some(z) if z < 0 => (0, z, i, c),
+                        Some(z) if z > 0 => (3, z, i, c),
+                        _ if positioned => (2, 0, i, c),
+                        _ => (1, 0, i, c),
+                    }
+                })
+                .collect();
+            order.sort_by_key(|o| (o.0, o.1, o.2));
+            for (_, _, _, child) in order {
                 draw_node(
                     child, current_x, current_y, inherited, layout, font, font_bold, surface,
                     width, height, sx, sy, damage_rects, child_clip,

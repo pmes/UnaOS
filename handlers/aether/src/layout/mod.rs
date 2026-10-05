@@ -102,6 +102,10 @@ pub struct PaintStyle {
     pub border_spacing: Option<f32>,
     /// The author gave this box a `width` (any value).
     pub has_width: Option<bool>,
+    /// position: 0 static, 1 relative, 2 absolute, 3 fixed, 4 sticky.
+    pub position_kind: Option<u8>,
+    /// z-index: Some(None) = auto, Some(Some(z)) = an integer.
+    pub z_index: Option<Option<i32>>,
 }
 
 pub struct LayoutTree {

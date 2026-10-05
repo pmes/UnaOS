@@ -86,9 +86,9 @@
       "ssim": 0.9545
     },
     "16-positioned": {
-      "mismatch": 13.24,
-      "missing": 1,
-      "ssim": 0.8651
+      "mismatch": 0.39,
+      "missing": 0,
+      "ssim": 0.9971
     }
   },
   "thresholds": {
