@@ -92,3 +92,19 @@ resumed after (`n` grows past the stall) = a missed doorbell, the kick is the fi
 link left U0 (power management) — next arc is the port's U1/U2 handling; `pls=0`, endpoint Running, kicks
 without effect, `last_ms` near `tx_last_ms` = the AX88179 itself stopped delivering — next arc is the chip's RX
 path (the QCTRL / PAUSE / CLK_SELECT readbacks that disagree with their writes).
+
+## M5 — the seat's rulings on the design questions
+
+1. **Rung two.** Behind the same stall probe (`usbnet::rx_stall_action`): rung one rings the IN doorbell again
+   once the TD has been outstanding for 2 s (`[usbnet] rx kick n= pending_ms= … resets=`). If that kick draws no
+   completion within another 2 s, rung two runs `usbnet_rx_reset` (mod.rs tail): Stop Endpoint (Reset Endpoint
+   from Halted/Error) on the IN endpoint, then Set TR Dequeue Pointer to our enqueue position, which abandons the
+   stranded TD; the next data pass posts a fresh TD and rings the doorbell
+   (`[usbnet] rx reset n= stop_cc= deq_cc= in_state= kicks= xfers= rx_ok=`). The first completion after either
+   rung prints `[usbnet] rx resumed len= kicks= resets=`; `rxlog` carries `kicks= resets=`.
+2. **DHCP re-arm.** When RX resumes after a stall, `dhcp_link_tick` resets `DHCP_LINK_TRIES`, so the six link tries
+   start over and a lease can still arrive (`[usbnet] dhcp link tries re-armed (rx resumed after a stall)` when
+   the tries had run out).
+
+On a wire with genuinely no traffic, the ladder repeats every 4 s (kick, then reset). Its lines are printed for
+the first two and then every power of two.

@@ -2124,6 +2124,9 @@ pub fn dhcp_link_tick() {
     if !usbnet::is_up() || (usbnet::kind() == usbnet::KIND_AX88179 && !usbnet::link_up()) {
         return;
     }
+    if usbnet::take_rx_resumed() && DHCP_LINK_TRIES.swap(0, Ordering::Relaxed) >= DHCP_LINK_MAX {
+        serial_println!("[usbnet] dhcp link tries re-armed (rx resumed after a stall)"); // NETFRAME (B368)
+    }
     if DHCP_LINK_TRIES.fetch_add(1, Ordering::Relaxed) >= DHCP_LINK_MAX {
         return;
     }
