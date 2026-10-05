@@ -1229,6 +1229,8 @@ fi
 [ -n "${UNAOS_LUMEN:-}" ] && _feats="${_feats}lumen,"
 # NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM 56 / SYS_RESOLVE 57 for ring 3 and `tests net`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_NETRING3:-}" ] && _feats="${_feats}netring3,"
+# SELFDIAG (B324, R82): UNAOS_SELFDIAG=1 arms the boot log on disk (/var/log/boot.<n>.witness on a UnaFS root), SYS_PATH_READ 59 / SYS_PATH_WRITE 60 for APPS/DIAG.ELF and `tests selfdiag`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_SELFDIAG:-}" ] && _feats="${_feats}selfdiag,"
 # BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* to defaults at every login (the safe-mode boot knob; `[prefs] display reset=1 reason=knob`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_PREFS_RESET:-}" ] && _feats="${_feats}prefs_reset,"
 # KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
@@ -3847,6 +3849,33 @@ build_user_net_x86() {
     echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (${psz} B)${COLOR_RESET}"
 }
 
+# SELFDIAG M2 (B324, R82): build DIAG.ELF — the smart installer's diagnosis program (crates/user-diag linking
+# diag_core + vein_core + vein_ring3) → target/DIAG-X86.ELF, staged by the builder as APPS/DIAG.ELF; also
+# generates the witness OWNERS table (scripts/witness-owners.py → target/witness-owners.txt, staged as
+# system/witness-owners.txt). The build_user_net_x86 shape, linked in the ELF window like LUMEN (TLS needs it),
+# so the gate is user_elf_window_check (which runs scripts/elf-entry-check.sh). A console program: app note
+# flags 0, a bare `diag` runs it in the foreground. Inert until run; UNAOS_SELFDIAG=1 arms its two syscalls.
+build_user_diag_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 diagnosis program (crates/user-diag → target/DIAG-X86.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    python3 "${WORKSPACE_DIR}/scripts/witness-owners.py" "${WORKSPACE_DIR}" "${WORKSPACE_DIR}/target/witness-owners.txt" || { echo -e "${COLOR_RED}ERROR: witness-owners.py produced no table${COLOR_RESET}"; exit 1; }
+    cd "$WORKSPACE_DIR/crates/user-diag"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-diag/target/x86_64-unknown-none/release/user-diag" \
+      "${WORKSPACE_DIR}/target/DIAG-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/DIAG-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: DIAG-X86.ELF missing/empty — x86 DIAG build failed${COLOR_RESET}"; exit 1; }
+    local fmag; fmag="$(head -c 4 "${WORKSPACE_DIR}/target/DIAG-X86.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$fmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: DIAG-X86.ELF does not start with the ELF magic; first 4 bytes = ${fmag}${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/DIAG-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: DIAG-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/DIAG-X86.ELF" "DIAG-X86.ELF"
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 diagnosis program: DIAG-X86.ELF${COLOR_RESET}"
+}
+
 # RING3WIN M4 (B316): build BIG.ELF — the ELF-window proof program (crates/user-big → target/BIG-X86.ELF),
 # staged as APPS/BIG.ELF by the builder; `tests ring3win` runs it. x86 only. Unlike its siblings it links at
 # the ABSOLUTE ELF-window VA (crates/user-big/user-big-x86.ld, no PHDRS) and declares a 256 KiB stack with
@@ -3909,6 +3938,7 @@ launch_x86_64() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     build_kernel_x86_64
 
@@ -4877,6 +4907,7 @@ test_x86_64() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     build_kernel_x86_64
 
@@ -5340,6 +5371,7 @@ USER_CHECK_MATRIX=(
   "user-big      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-diag     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
   "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
@@ -5828,6 +5860,8 @@ KERNEL_CFG_MATRIX=(
   "x86-ioapic  ../../x86_64-unaos.json  ioapic,ehcihid"
   # NETRING3 (B306): the ring-3 entropy + resolve syscalls over the smolnet resolver, with `tests net`.
   "x86-netring3 ../../x86_64-unaos.json  netring3,smolnet,witness"
+  # SELFDIAG (B324): the boot log on disk, SYS_PATH_READ/WRITE and `tests selfdiag` beside the UnaFS root they serve.
+  "x86-selfdiag ../../x86_64-unaos.json  selfdiag,unafs,witness"
   # JETSON-EL0 (M1b) — the ARMED Orin, appended GR26. Until this leg, `tegra_el0` appeared in NO leg of
   # this matrix, which means `./arroyo check` type-checked the configuration
   # `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` ships NOWHERE — and `UNAOS_TEGRA_EL0=1 ./arroyo check` did
@@ -8778,6 +8812,7 @@ esp_x86() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
@@ -8839,6 +8874,7 @@ vm_image() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
@@ -8884,6 +8920,7 @@ fat_img() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
@@ -11091,6 +11128,10 @@ kernel8() {
     if [ -n "${UNAOS_NETRING3:-}" ]; then
         K8_FEATS="${K8_FEATS},netring3"
         echo -e "${COLOR_YELLOW}  • UNAOS_NETRING3: ring-3 SYS_GETRANDOM (56) + SYS_RESOLVE (57, -ENODEV on aarch64); tests net${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_SELFDIAG:-}" ]; then
+        K8_FEATS="${K8_FEATS},selfdiag"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SELFDIAG: SELFDIAG — the boot log on disk + tests selfdiag (SYS_PATH_READ/WRITE and DIAG.ELF are x86's)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_PREFS_RESET:-}" ]; then
         K8_FEATS="${K8_FEATS},prefs_reset"

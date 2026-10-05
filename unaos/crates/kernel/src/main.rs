@@ -1281,7 +1281,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // FLIGHT-RECORDER (x86): flush the captured serial boot log to UNAOS.LOG (usbdebug metal
             // boot benefits from an on-disk log too). Gated on storage; throttled; never blocks boot.
             #[cfg(target_arch = "x86_64")]
-            unaos_kernel::flight_recorder::service();
+            unaos_kernel::flight_recorder::service(); #[cfg(feature = "selfdiag")] unaos_kernel::bootwit::service(); // SELFDIAG M1 (B324): the armed desktop-ready boot-log write (same-line fold)
             // U2 (x86): also run the FAT loader HERE so its lines are VISIBLE on the serial-less
             // metal boot — the usbdebug view keeps fbcon attached (unlike the GUI loop, which detaches
             // it before U2 runs). Same one-shot gate; loads HELLO.BIN + prints `hello from disk` + the
@@ -1767,7 +1767,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // a consumer who booted the vm-image (no serial capture) can copy the log off afterward.
         // Gated on storage internally; re-flushes on growth, throttled; never blocks boot.
         #[cfg(target_arch = "x86_64")]
-        unaos_kernel::flight_recorder::service();
+        unaos_kernel::flight_recorder::service(); #[cfg(feature = "selfdiag")] unaos_kernel::bootwit::service(); // SELFDIAG M1 (B324): the armed desktop-ready boot-log write (same-line fold)
         // WITSWEEP (SERWIT-2 reachability): on x86 the mirror-tap announcement + one-shot verdict ride
         // `flight_recorder::service()` (its first statement). That function is x86-only, so on aarch64
         // the whole `[mirror]`/`:: SERWIT-2 ::` block never reached the wire and the TSTE tap-drop
@@ -6030,7 +6030,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // trailing band waits for the next print. Paced, not forced; free on a clean ledger.
         unaos_kernel::video::fbcon::console_service();
         // FLIGHT-RECORDER: flush the captured serial boot log to UNAOS.LOG on the FAT volume.
-        unaos_kernel::flight_recorder::service();
+        unaos_kernel::flight_recorder::service(); #[cfg(feature = "selfdiag")] unaos_kernel::bootwit::service(); // SELFDIAG M1 (B324): the armed desktop-ready boot-log write (same-line fold)
         // U2/U4x/U5x/U6x/U6bx (witness knob): the ring-3 fixture ladder, each one-shot and gated on
         // storage. These used to run on the BSP; they now run inside a kernel task, which is strictly
         // better for them — `spawn_user`'s target-core choice and the bounded `ticks()` waits are

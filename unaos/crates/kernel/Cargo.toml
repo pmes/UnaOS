@@ -3738,6 +3738,17 @@ busreg = []
 # Kept in sync with `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 lumen = ["dep:vein_core"]
 
+# SELFDIAG (rmbp-ledger B324, R82): UNAOS_SELFDIAG=1 arms the smart installer's diagnosis loop's kernel half —
+# the BOOT LOG ON DISK (crate::bootwit: every `:: TAG: ... -> PASS|FAIL|SKIP ::` line and the `:: BOOT:`
+# line of a boot written to /var/log/boot.<n>.witness on a UnaFS root at desktop-ready and at reboot /
+# shutdown, the last 8 boots kept, nothing printed), `SYS_PATH_READ` (59) / `SYS_PATH_WRITE` (60) for ring 3
+# (x86; the VFS fulfils them, the selfhost tree under the kernel's authority) and `tests selfdiag` (the whole
+# pipe with the Echo fixture, no network). The program (APPS/DIAG.ELF, crates/user-diag) links the same
+# diag_core. Off: no tap, no write, the two numbers fall to the unknown-syscall default. Both arches compile
+# it (the syscalls are x86's: the ELF window is x86's). Kept in sync with `unaos/arroyo` (the `_feats` arm
+# and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+selfdiag = ["dep:diag_core"]
+
 # NETRING3 (rmbp-ledger B306): UNAOS_NETRING3=1 arms ring-3 entropy and name resolution — `SYS_GETRANDOM`
 # (56, the SHA-256 DRBG on top of `rand.rs`, whose cfg and `hash`'s widen to this feature) and
 # `SYS_RESOLVE` (57, `smolnet::resolve` on x86; -ENODEV on aarch64), `crate::netring3` and `tests net`.
@@ -3795,6 +3806,9 @@ vein_core = { path = "../../libs/sys/vein_core", default-features = false, optio
 # WIFI1 (B338, R79): the BCM4331 driver's shared no_std core — the firmware container codec and the
 # IEEE 802.11 frame codec, the same crate the host tests link. `optional`, pulled only by `wifi`.
 wifi_core = { path = "../../libs/sys/wifi_core", default-features = false, optional = true }
+# SELFDIAG (B324): the diagnosis core — witness grammar, owners table, prompt, diff parser + hunk locator +
+# streaming emitter, record, Echo fixture — the SAME crate APPS/DIAG.ELF links. no_std, zero deps.
+diag_core = { path = "../../libs/sys/diag_core", optional = true }
 # SELFINSTALL2 (rmbp-ledger B310): Amber Bytes' shared disk-layout core — GPT encode/decode, the partition
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).

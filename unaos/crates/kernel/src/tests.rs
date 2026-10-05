@@ -137,6 +137,8 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); #[cfg(target_arch = "x86_64")] crate::execname::ensure(); // EXECNAME (B322): `tests exec`.
     crate::video::blitter::ensure_tests(); // KCOMP (B321): `tests blitter`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); #[cfg(target_arch = "x86_64")] crate::execname::ensure(); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] crate::prefs_client::ensure_tests(); // EXECNAME (B322): `tests exec`. SETTINGSBUS (B337): `tests settingsbus`.
+    crate::video::blitter::ensure_tests(); // KCOMP (B321): `tests blitter`.
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); #[cfg(target_arch = "x86_64")] crate::execname::ensure(); #[cfg(feature = "selfdiag")] crate::selfdiag::ensure(); // SELFDIAG (B324): `tests selfdiag`. EXECNAME (B322): `tests exec`.
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }

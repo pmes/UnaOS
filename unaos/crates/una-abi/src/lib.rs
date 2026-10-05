@@ -1204,3 +1204,28 @@ const _: () = assert!(core::mem::size_of::<AppNote>() == 24);
 // or an errno. Retires with the read pair when a ring-3 Principia takes 16..=19 over. Appended at the tail.
 pub const BUS_VERB_R3PREF_SET: u8 = 130;
 const _: () = assert!(BUS_VERB_R3PREF_SET >= BUS_VERB_FULFIL_MIN && BUS_VERB_R3PREF_SET != BUS_VERB_R3PREF_GET && BUS_VERB_R3PREF_SET != BUS_VERB_R3PREF_LIST);
+// SELFDIAG (rmbp-ledger B324, R82) — whole-path file I/O for ring 3, fulfilled by the kernel over the VFS
+// (the ATTRSURF pattern: one request buffer, the kernel resolves the path in the live namespace). The
+// diagnosis program (APPS/DIAG.ELF) reads the boot log, the owners table and the selfhost tree, and writes
+// its record and the patched tree. Under the kernel feature `selfdiag` (x86); off, the numbers fall to the
+// unknown-syscall default. Appended at the file tail so no existing line moves.
+//
+//   request  [path_len u16][flags u16][rsv u32 = 0][offset u64][path][data — WRITE only]
+//            path absolute, 1..=PATH_IO_PATH_MAX, no `..` component; data 0..=PATH_IO_MAX
+/// `SYS_PATH_READ(req_ptr, req_len, out_ptr, out_cap) -> bytes read / -errno` (0 = end of file). At most
+/// `PATH_IO_MAX` bytes per call from `offset`.
+pub const SYS_PATH_READ: u64 = 59;
+/// `SYS_PATH_WRITE(req_ptr, req_len) -> bytes written / -errno`. Writes `data` at `offset` (the file must
+/// exist and `offset <= size`), or with [`PATH_W_TRUNC`] creates-or-truncates first (offset must be 0).
+/// [`PATH_W_UNLINK`] removes the file (empty data). [`PATH_W_MKDIRS`] creates missing parent directories.
+pub const SYS_PATH_WRITE: u64 = 60;
+pub const PATH_W_TRUNC: u16 = 1 << 0;
+pub const PATH_W_MKDIRS: u16 = 1 << 1;
+pub const PATH_W_UNLINK: u16 = 1 << 2;
+/// Bytes of the request header.
+pub const PATH_IO_HDR_LEN: usize = 16;
+/// Path ceiling.
+pub const PATH_IO_PATH_MAX: usize = 255;
+/// Data ceiling per call (read or write).
+pub const PATH_IO_MAX: usize = 32 * 1024;
+const _: () = assert!(SYS_PATH_READ == SYS_SBRK + 1 && SYS_PATH_WRITE == SYS_PATH_READ + 1);
