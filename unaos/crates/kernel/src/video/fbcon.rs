@@ -1863,12 +1863,12 @@ fn win_content_extent(pw: usize, ph: usize, wbot: usize, cell_w: usize, cell_h: 
     let wtop = crate::ui_status::top_chrome_h(pw, ph); let avail_h = ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).max(1); // ⚠ SAME-LINE fold, line-NEUTRAL (PARITY.md §5.3): unchanged expression, `wtop` merely named because the cap below needs it too.
     // CASCADEFIT — THE HEIGHT CAP, and deliberately ONLY the height: the tallest CONTENT whose outer box still ends above the keep-out published by a boot window below (`wbot` = [`console_work_bottom`], this file's tail).
     // ⚠ It is applied AFTER the budget loop, at the return, and NOT folded into `avail_h` above — the loop shrinks both axes together, so a shorter work area handed in at the top would make it terminate earlier and the console would come out WIDER and somewhere else in `x`: a placement fix that moved the axis it was not about. Capped afterwards, `w` is derived from the panel exactly as before and only the height can move. MEASURED (`UNAOS_PIDESK=1 ./arroyo kernel8-test`, this arc): at 1920x1200 the cap is 868 content rows against a console that wants 736, so it does not bind and the whole correction is in the centring below; at 640x480 it is 176 against 352, and it binds.
-    let cap = wbot.saturating_sub(wtop).saturating_sub(wm::TITLE_H + 2 * wm::BORDER); // Never negative: saturating, and `.max(1)` at the return keeps at least one glyph row.
+    let cap = wbot.saturating_sub(wtop).saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()); // Never negative: saturating, and `.max(1)` at the return keeps at least one glyph row.
     let mut w = (pw * 7 / 8).max(cell_w);
     let mut h = (avail_h * 7 / 8).max(cell_h);
     // Outer box = content + chrome. Budget the box, not the content: the box is what gets staged.
     let box_px = |w: usize, h: usize| {
-        (w + 2 * wm::BORDER).saturating_mul(h + wm::TITLE_H + 2 * wm::BORDER)
+        (w + 2 * wm::BORDER()).saturating_mul(h + wm::TITLE_H() + 2 * wm::BORDER())
     };
     while box_px(w, h) > WIN_BOX_BUDGET_PX && w > cell_w && h > cell_h {
         w = (w * 15 / 16).max(cell_w);
@@ -1992,8 +1992,8 @@ pub fn panel_console_window_open() -> wm::WinId {
         ch as u32,
         stride as u32,
         b"Console",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[wc-x] console-window DECLINE reason=create-failed");
@@ -3533,4 +3533,59 @@ pub fn font_repaint() -> usize {
         route_present();
     }
     repainted
+}
+
+/// UIMETRICS (rmbp-ledger B372; the B363 seat's "yes" to KERNELFONT2.md owed item 3) — **the console REGRIDS on a
+/// `font_size` restyle.** `video::text::grid_cell` follows `system.display.font_size` (the 18x40 cell at 2.5 x
+/// `font_size / 13`), and the restyle calls this once the engine's lock is released: the routed console window
+/// keeps its surface (the window does not move or resize) and re-derives its grid on it — the cell store is
+/// carried cell-for-cell into the new grid (columns and rows past the new extent are dropped, the cursor is
+/// clamped: `cells_remint`'s rule), the surface is cleared and [`font_repaint`] redraws every row in the new
+/// cell. `Some((old cols, old rows, new cols, new rows))` when it regridded; `None` when the console is not
+/// routed into its window, the cell did not change, or the lock was contended (the next restyle retries).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn regrid() -> Option<(usize, usize, usize, usize)> {
+    let (gw, gh) = crate::video::text::grid_cell();
+    if gw == 0 || gh == 0 {
+        return None;
+    }
+    let mut out = None;
+    crate::arch::without_interrupts(|| {
+        let Some(mut c) = FBCON.try_lock() else { return };
+        if c.win_store.is_none() || c.win_cells.is_none() || (c.cell_w, c.cell_h) == (gw, gh) {
+            return;
+        }
+        let info = c.win_fb.info();
+        let (nc, nr) = ((info.width / gw).max(1), (info.height / gh).max(1));
+        let (oc, or) = (c.cell_cols, c.cell_rows);
+        let mut new: Vec<u8> = Vec::new();
+        if new.try_reserve_exact(nc * nr).is_err() {
+            return;
+        }
+        new.resize(nc * nr, 0);
+        if let Some(old) = c.win_cells.as_ref() {
+            for r in 0..or.min(nr) {
+                for col in 0..oc.min(nc) {
+                    new[r * nc + col] = old.get(r * oc + col).copied().unwrap_or(0);
+                }
+            }
+        }
+        c.win_cells = Some(new);
+        c.cell_w = gw;
+        c.cell_h = gh;
+        c.cols = nc;
+        c.rows = nr;
+        c.cell_cols = nc;
+        c.cell_rows = nr;
+        c.col = c.col.min(nc - 1);
+        c.row = c.row.min(nr - 1);
+        let bg = c.bg;
+        c.draw_fb().fill_rows(0, info.height, bg);
+        c.mark_rows(0, info.height);
+        out = Some((oc, or, nc, nr));
+    });
+    if out.is_some() {
+        font_repaint();
+    }
+    out
 }

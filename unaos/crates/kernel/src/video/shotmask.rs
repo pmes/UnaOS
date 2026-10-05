@@ -169,7 +169,7 @@ pub fn mask_table(s: State, pw: usize, ph: usize) -> Vec<MaskRect> {
         #[cfg(feature = "quarry")]
         State::Quarry => {
             if let Some((x, y, w, h)) = super::wm::frame_of(super::quarry::live::win_id()) {
-                let top = super::wm::TITLE_H.min(h);
+                let top = super::wm::TITLE_H().min(h);
                 push("columns", (x + w * 55 / 100, y + top, w - w * 55 / 100, h - top));
             }
         }

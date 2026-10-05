@@ -206,7 +206,7 @@ fn snap_zone(id: WinId, zone: u8, via: &str) -> &'static str {
     }
     let (zx, zy, zw, zh) = zone_rect(zone, pw, wtop, uh);
     let s = zoom_scale(zw, zh, ph, w, h);
-    let (nx, ny) = (zx + BORDER, zy + TITLE_H + BORDER);
+    let (nx, ny) = (zx + BORDER(), zy + TITLE_H() + BORDER());
     if apply(id, nx, ny, s).is_none() {
         return "declined";
     }
@@ -324,9 +324,9 @@ fn unsnap(id: WinId, x: i32, y: i32) {
         return;
     }
     let ss = e.saved.2.max(1);
-    let (ow_old, ow_new) = ((w * scale + 2 * BORDER) as i64, (w * ss + 2 * BORDER) as i64);
-    let fx = (x as i64 - (rx as i64 - BORDER as i64)).clamp(0, ow_old);
-    let nx = (x as i64 - fx * ow_new / ow_old.max(1) + BORDER as i64).max(BORDER as i64);
+    let (ow_old, ow_new) = ((w * scale + 2 * BORDER()) as i64, (w * ss + 2 * BORDER()) as i64);
+    let fx = (x as i64 - (rx as i64 - BORDER() as i64)).clamp(0, ow_old);
+    let nx = (x as i64 - fx * ow_new / ow_old.max(1) + BORDER() as i64).max(BORDER() as i64);
     let ny = (y as i64 - offy).max(0);
     set_entry(id, NO_ENTRY);
     if apply(id, nx as usize, ny as usize, ss).is_some() {
@@ -412,9 +412,9 @@ pub fn selftest() {
     }
     let saved_focus = sc::user_input_active();
     let (s0, a0, u0) = (SNAPS.load(Relaxed), RESTORES.load(Relaxed), UNSNAPS.load(Relaxed));
-    let (ox, oy) = (pw / 3, ph / 3 + TITLE_H + BORDER);
+    let (ox, oy) = (pw / 3, ph / 3 + TITLE_H() + BORDER());
     move_to(w, ox, oy);
-    move_to(wo, pw / 3, ph / 3 * 2 + TITLE_H + BORDER);
+    move_to(wo, pw / 3, ph / 3 * 2 + TITLE_H() + BORDER());
     let Some(i0) = info(w) else {
         serial_println!(":: WINSNAP: zones=0 -> SKIP (row vanished) ::");
         close(w);
@@ -446,7 +446,7 @@ pub fn selftest() {
     // Leg 2 — the drag, through the router. Focus parked on the other window so the press MOVES `w`.
     let hid = |v: i32, span: usize| -> i32 { ((v as i64 * 32767) / (span.max(1) as i64 - 1).max(1)) as i32 };
     let tpx = (i0.x + 1) as i32;
-    let tpy = (i0.y - TITLE_H / 2 - BORDER) as i32;
+    let tpy = (i0.y - TITLE_H() / 2 - BORDER()) as i32;
     sc::user_input_set_active(OTHER);
     focus_changed(OTHER);
     crate::pal::cursor::set_button_level(true);
@@ -481,7 +481,7 @@ pub fn selftest() {
     // Leg 3 — M3: drag the snapped title away; the pre-snap scale comes back and the drag goes on.
     let un_ok = match info(w) {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - TITLE_H / 2 - BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - TITLE_H() / 2 - BORDER()) as i32);
             sc::user_input_set_active(OTHER);
             focus_changed(OTHER);
             crate::pal::cursor::set_button_level(true);

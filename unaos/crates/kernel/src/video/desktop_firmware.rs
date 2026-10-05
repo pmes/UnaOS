@@ -305,7 +305,7 @@ pub fn activate() -> bool {
         super::font::Face::Chrome.cell_h(),
         ccell.0,
         ccell.1,
-        wm::TITLE_H,
+        wm::TITLE_H(),
     );
 
     // 4. SHELLDESK, on the Pi — the tenancy is CLAIMED. Before this line every `set_enabled(true)` in

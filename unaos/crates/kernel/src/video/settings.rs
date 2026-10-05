@@ -36,7 +36,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::video::{font, theme, wm};
+use crate::video::{theme, wm};
 
 /// Kernel-furniture owner slot (`+ 7`, after TEXTEDIT's `+ 6`).
 pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 7;
@@ -397,36 +397,33 @@ const fn row_of(i: usize) -> usize {
 }
 
 fn fill(s: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize, c: u32) {
-    for yy in y..y + rh {
-        for xx in x..(x + rw).min(w) {
-            if let Some(p) = s.get_mut(yy * w + xx) { *p = c; }
-        }
-    }
+    // UIMETRICS (B372): `w` and the rect are LOGICAL px; the surface is the native (physical) one.
+    super::metrics::fill(s, super::metrics::size(w), x, y, rw, rh, c);
 }
 
 fn txt(st: &mut State, x: usize, r: usize, t: &str) {
     let face = super::text::Face::Ui; // KERNELFONT: labels in the UI face
-    let (w, h, ch) = (st.w, st.h, face.cell_h());
-    super::text::draw_text(&mut st.surf, w, w, h, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
+    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
 }
 
 fn btn(st: &mut State, r: usize, x: usize, t: &str) {
     let face = super::text::Face::Ui; // KERNELFONT: button captions in the UI face
-    let (w, h, ch) = (st.w, st.h, face.cell_h());
+    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
     let y = TOP + r * ROW_H + (ROW_H - BTN_H) / 2;
     fill(&mut st.surf, w, x, y, BTN_W, BTN_H, theme::BUTTON_FACE);
     fill(&mut st.surf, w, x, y, BTN_W, 1, theme::FRAME_LINE);
     fill(&mut st.surf, w, x, y + BTN_H - 1, BTN_W, 1, theme::FRAME_LINE);
-    super::text::draw_text(&mut st.surf, w, w, h, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::BUTTON_TEXT, false, face);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::BUTTON_TEXT, false, face);
 }
 
 fn field(st: &mut State, r: usize, t: &str, focus: bool) {
     let face = super::text::Face::Body;
-    let (w, h, ch) = (st.w, st.h, face.cell_h());
+    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
     fill(&mut st.surf, w, TRACK_X, TOP + r * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::BUTTON_FACE);
     let mut shown = String::from(t);
     if focus { shown.push('_'); }
-    super::text::draw_text(&mut st.surf, w, w - 14, h, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::BUTTON_TEXT, false, face);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 14, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::BUTTON_TEXT, false, face);
 }
 
 fn slider(st: &mut State, r: usize, pos: usize, max: usize) {
@@ -442,13 +439,13 @@ fn paint(st: &mut State, v: &Values) {
     let (w, h) = (st.w, st.h);
     for p in st.surf.iter_mut() { *p = theme::CONTENT_FILL; }
     let face = super::text::Face::Ui; // KERNELFONT: tab names in the UI face
-    let ch = face.cell_h();
+    let ch = super::metrics::lcell_h(face);
     // The tab strip.
     let tw = w / TABS;
     for k in 0..TABS {
         let on = k == v.tab as usize;
         fill(&mut st.surf, w, k * tw, 0, tw - 2, TAB_H, if on { theme::ACCENT } else { theme::SCROLL_TRACK });
-        super::text::draw_text(&mut st.surf, w, w, h, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
     }
     if st.strip { fill(&mut st.surf, w, 0, TAB_H - 3, w, 2, theme::ACCENT); }
     match v.tab {
@@ -465,7 +462,7 @@ fn paint(st: &mut State, v: &Values) {
 }
 
 fn paint_general(st: &mut State, v: &Values) {
-    let (w, h, ch) = (st.w, st.h, font::Face::Body.cell_h());
+    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(super::text::Face::Body));
     let face = super::text::Face::Body;
     // BRIGHTFLOOR M5: Brightness moved to the Display tab; every General row moved up one.
     txt(st, LABEL_X, 0, "Volume");
@@ -480,7 +477,7 @@ fn paint_general(st: &mut State, v: &Values) {
     for k in 0..3usize {
         let c = if k as u8 == v.ptr { theme::ACCENT } else { theme::SCROLL_TRACK };
         fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 2 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        super::text::draw_text(&mut st.surf, w, w, h, TRACK_X + k * seg + 8, TOP + 2 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 2 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
     }
     txt(st, LABEL_X, 3, "Wallpaper");
     let (focus, wall) = (!st.strip && st.sel == 5, v.wall.clone());
@@ -503,9 +500,8 @@ fn paint_display(st: &mut State, v: &Values) {
     let it = if v.idle_min == 0 { String::from("never") } else { alloc::format!("{} min", v.idle_min) };
     txt(st, VAL_X, 1, &it);
     txt(st, LABEL_X, 2, "UI scale");
-    let id = WIN.load(Ordering::Relaxed);
-    let sc = wm::info(id).map(|i| i.scale).unwrap_or(1);
-    txt(st, TRACK_X, 2, &alloc::format!("{}x - read-only, fixed at takeover", sc));
+    let m = crate::ui::Metrics::panel(); // UIMETRICS (B372): the panel's dpi scale, not a window magnification
+    txt(st, TRACK_X, 2, &alloc::format!("{}x ({} ppi) - follows the panel", super::dpi::scale_str(m.s2), m.ppi));
     txt(st, LABEL_X, 3, "Menubar clock");
     txt(st, TRACK_X, 3, "24h - fixed, no runtime switch");
     // KERNELFONT M3 (B359) -> KERNELFONT2 M4 (B363): the Font row is a PICKER — the family as three segments (the
@@ -514,14 +510,14 @@ fn paint_display(st: &mut State, v: &Values) {
     // sample line IN the UI face below.
     let (w, h) = (st.w, st.h);
     let face = super::text::Face::Ui;
-    let ch = face.cell_h();
+    let ch = super::metrics::lcell_h(face);
     txt(st, LABEL_X, 4, "Font");
     let (fam, size) = (font_fam(), font_size());
     let seg = TRACK_W / 3;
     for k in 0..3usize {
         let c = if k == fam { theme::ACCENT } else { theme::SCROLL_TRACK };
         fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 4 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        super::text::draw_text(&mut st.surf, w, w, h, TRACK_X + k * seg + 8, TOP + 4 * ROW_H + (ROW_H - ch) / 2, FONT_FAMS[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 4 * ROW_H + (ROW_H - ch) / 2, FONT_FAMS[k].as_bytes(), theme::CONTENT_TEXT, false, face);
     }
     txt(st, VAL_X, 4, &super::text::face_name(face));
     txt(st, LABEL_X, 5, "Font size");
@@ -532,7 +528,7 @@ fn paint_display(st: &mut State, v: &Values) {
     let (cw, chh) = super::text::grid_cell();
     let s2 = super::dpi::scale_x2();
     txt(st, TRACK_X, 6, &alloc::format!("{} in {}x{} cells, {} ppi x{}", super::text::face_name(super::text::Face::Grid), cw, chh, super::dpi::ppi(), super::dpi::scale_str(s2)));
-    super::text::draw_text(&mut st.surf, w, w - 12, h, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, face);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 12, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, face);
     if !st.strip && st.sel == 10 { fill(&mut st.surf, w, TRACK_X, TOP + 5 * ROW_H + ROW_H - 8, 2 * BTN_W + 10, 2, theme::ACCENT); }
 }
 
@@ -760,17 +756,19 @@ fn repaint() {
 pub fn open() -> Result<(), String> {
     let pi = crate::video::panel_info_nonblocking().ok_or_else(|| String::from("panel busy"))?;
     let (pw, ph) = (pi.width, pi.height);
-    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
-    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
-    if w < WIN_W || h < WIN_H { return Err(String::from("window below floor")); }
-    let len = w * h;
+    // UIMETRICS (B372): a NATIVE window — the layout stays WIN_W x WIN_H logical px, the surface is that at the
+    // panel's dpi scale, drawn at scale 1 (never magnified by the compositor).
+    let (w, h) = (WIN_W, WIN_H);
+    let (sw, sh) = (super::metrics::size(w), super::metrics::size(h));
+    if sw > pw.saturating_sub(2 * wm::BORDER()) || sh > ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()) { return Err(String::from("window below floor")); }
+    let len = sw * sh;
     let mut surf: Vec<u32> = Vec::new();
     if surf.try_reserve_exact(len).is_err() { return Err(String::from("out of memory")); }
     surf.resize(len, theme::CONTENT_FILL);
     if is_open() { close(); }
     // Pick up the file's values (and apply them) if the login hook has not yet.
     if user_name().is_some() && LOADED_FOR.lock().is_empty() { service(); }
-    let (_s, ow, oh) = wm::spawn_geometry(w, h).ok_or_else(|| String::from("geometry unavailable"))?;
+    let (_s, ow, oh) = wm::spawn_geometry_native(sw, sh).ok_or_else(|| String::from("geometry unavailable"))?;
     let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
@@ -778,7 +776,7 @@ pub fn open() -> Result<(), String> {
     let mut st = State { sel: tab_ctrls(tab0).first().copied().unwrap_or(0), strip: true, u: UsersUi::new(), w, h, surf };
     paint(&mut st, &CUR.lock().clone());
     let base = st.surf.as_ptr() as usize;
-    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, b"Settings", ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    let id = wm::create_at_native(OWNER, base, len * 4, sw as u32, sh as u32, (sw * 4) as u32, b"Settings", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE { return Err(String::from("window create failed")); }
     *STATE.lock() = Some(st);
     WIN.store(id, Ordering::Relaxed);
@@ -950,11 +948,12 @@ pub fn press_route(x: i32, y: i32) -> bool {
     let Some(info) = wm::info(id) else { return false };
     if x < info.x as i32 || y < info.y as i32 { return false; }
     let sc = info.scale.max(1);
-    let (cx, cy) = ((x as usize - info.x) / sc, (y as usize - info.y) / sc);
-    if cx >= info.w || cy >= info.h { return false; }
+    let (cx, cy) = (super::metrics::to_logical((x as usize - info.x) / sc), super::metrics::to_logical((y as usize - info.y) / sc)); // UIMETRICS: a native surface's physical px -> the logical layout
+    let lw = super::metrics::to_logical(info.w);
+    if cx >= lw || cy >= super::metrics::to_logical(info.h) { return false; }
     wm::focus_changed(OWNER);
     if cy < TAB_H {
-        let t = (cx / (info.w / TABS).max(1)).min(TABS - 1);
+        let t = (cx / (lw / TABS).max(1)).min(TABS - 1);
         if t != cur_tab() { switch_tab(t); } else { if let Some(st) = STATE.lock().as_mut() { st.strip = true; } repaint(); }
         return true;
     }

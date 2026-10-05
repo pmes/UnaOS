@@ -1023,8 +1023,8 @@ fn move_vacate_probe(pw: usize, ph: usize) {
         8,
         32,
         b"vacate",
-        ax + wm::BORDER,
-        ay + wm::TITLE_H + wm::BORDER,
+        ax + wm::BORDER(),
+        ay + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         crate::census_println!("[wc-x] move-vacate SKIP (create declined)");
@@ -1033,11 +1033,11 @@ fn move_vacate_probe(pw: usize, ph: usize) {
     wm::present(id);
 
     let read = |x: usize, y: usize| super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
-    let (cx, cy) = (ax + wm::BORDER, ay + wm::TITLE_H + wm::BORDER);
+    let (cx, cy) = (ax + wm::BORDER(), ay + wm::TITLE_H() + wm::BORDER());
     let painted = read(cx + 1, cy + 1) == PROBE_COL;
 
     // The move. Same verb an app's `WIN_MOVE` takes, so the path under test is the real one.
-    wm::move_to(id, bx + wm::BORDER, ay + wm::TITLE_H + wm::BORDER);
+    wm::move_to(id, bx + wm::BORDER(), ay + wm::TITLE_H() + wm::BORDER());
 
     // Five points inside the box just vacated: content origin, two content diagonals, the title
     // strip and the lower border — `vacate_selftest`'s sample set, for the same reason (a fill that
@@ -1046,7 +1046,7 @@ fn move_vacate_probe(pw: usize, ph: usize) {
         (cx + 1, cy + 1),
         (cx + 2, cy + 2),
         (cx + 5, cy + 5),
-        (ax + ow / 2, ay + wm::TITLE_H / 2),
+        (ax + ow / 2, ay + wm::TITLE_H() / 2),
         (ax + ow / 2, ay + oh - 1),
     ];
     let mut clean = 0usize;

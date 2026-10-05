@@ -674,34 +674,34 @@ fn chrome_probes(
     foc: bool,
 ) -> [(&'static str, usize, usize, u32); 5] {
     use super::wm::{title_row_color, BORDER, TITLE_H};
-    let strip_x = bx + bw - BORDER - 2;
-    let face_row = BORDER + TITLE_H + 8;
+    let strip_x = bx + bw - BORDER() - 2;
+    let face_row = BORDER() + TITLE_H() + 8;
     [
         ("keyline_top", bx + bw / 2, by, super::theme::FRAME_LINE),
         (
             "bevel_light",
             bx + bw / 2,
-            by + super::theme::BEVEL,
+            by + super::theme::BEVEL(),
             super::theme::BEVEL_LIGHT,
         ),
         (
             "title_top",
             strip_x,
-            by + BORDER,
-            super::ceramic::shade(title_row_color(0, TITLE_H, foc), BORDER),
+            by + BORDER(),
+            super::ceramic::shade(title_row_color(0, TITLE_H(), foc), BORDER()),
         ),
         (
             "title_bot",
             strip_x,
-            by + BORDER + TITLE_H - 1,
+            by + BORDER() + TITLE_H() - 1,
             super::ceramic::shade(
-                title_row_color(TITLE_H - 1, TITLE_H, foc),
-                BORDER + TITLE_H - 1,
+                title_row_color(TITLE_H() - 1, TITLE_H(), foc),
+                BORDER() + TITLE_H() - 1,
             ),
         ),
         (
             "face_left",
-            bx + BORDER - 2,
+            bx + BORDER() - 2,
             by + face_row,
             super::ceramic::shade(super::theme::CHROME_FACE, face_row),
         ),
@@ -842,7 +842,7 @@ pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize
         let (bx, by, bw, bh) = outer_box(r);
         // Every probe below indexes at most `BORDER + TITLE_H + 8` rows down and `bw - BORDER - 2`
         // across; a box that cannot hold them is skipped rather than probed off its own edge.
-        if bw < 2 * BORDER + 4 || bh < BORDER + TITLE_H + 10 || bx + bw > pw || by + bh > ph {
+        if bw < 2 * BORDER() + 4 || bh < BORDER() + TITLE_H() + 10 || bx + bw > pw || by + bh > ph {
             continue;
         }
         if wins >= slots.len() {
@@ -941,7 +941,7 @@ pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize
             );
         }
         // The content well: an EL0 surface, so no expectation is possible and none is invented.
-        let cpt = (bx + BORDER + 4, by + BORDER + TITLE_H + 4);
+        let cpt = (bx + BORDER() + 4, by + BORDER() + TITLE_H() + 4);
         serial_println!(
             "[chrome-truth] win={} pt=content at=({},{}) want=app got={:#08x} -> APP",
             r.id,

@@ -698,7 +698,7 @@ impl Console {
 pub fn scrollback_selftest() {
     const W: usize = 640;
     const H: usize = 480;
-    let m = crate::ui::Metrics::for_height(H);
+    let m = crate::ui::Metrics::for_scale(1);
     let mut con = Console::new();
     con.mark_in_window();
     for i in 0..300 { con.place_for_fixture(&format!("line {:03}", i)); }

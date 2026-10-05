@@ -144,12 +144,14 @@ const FIELD_MAX: usize = 32;
 /// the first click kills.
 const OWNER: u64 = 0;
 
-#[repr(align(64))]
-struct Surf([u32; W * H]);
+/// UIMETRICS (B372): the screen is a NATIVE window — `W x H` is its LOGICAL layout and the surface is that at the
+/// panel's dpi scale (1100x600 at 2.5), allocated once on first use and never freed (the static it replaces was
+/// never freed either), so a 4.0 panel does not cost every image 6.7 MB of .bss.
+static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// SAFETY: written only from `repaint` on the thread that owns keys (the route that called
 /// `consume_key`, or the ignition that called `open_once`), read by `wm`'s composite — the same benign
 /// present-tear every app surface shares (instgui's contract).
-static mut SURF: Surf = Surf([0; W * H]);
+fn surf() -> &'static mut [u32] { let n = super::super::metrics::size(W) * super::super::metrics::size(H); let mut p = SURF_AT.load(Ordering::Acquire); if p == 0 { let b: &'static mut [u32] = alloc::boxed::Box::leak(alloc::vec![0u32; n].into_boxed_slice()); p = match SURF_AT.compare_exchange(0, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire) { Ok(_) => b.as_mut_ptr() as usize, Err(won) => won }; } unsafe { core::slice::from_raw_parts_mut(p as *mut u32, n) } }
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -383,7 +385,7 @@ fn local_of(x: i32, y: i32) -> Option<(i32, i32)> {
         return None;
     }
     let s = info.scale.max(1) as i32;
-    let (lx, ly) = (dx / s, dy / s);
+    let (lx, ly) = (super::super::metrics::to_logical((dx / s) as usize) as i32, super::super::metrics::to_logical((dy / s) as usize) as i32); // UIMETRICS: physical surface px -> the logical layout
     if lx >= W as i32 || ly >= H as i32 {
         return None;
     }
@@ -395,12 +397,9 @@ fn local_of(x: i32, y: i32) -> Option<(i32, i32)> {
 // ---------------------------------------------------------------------------
 
 fn fill(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
-    for row in y..(y + h).min(H) {
-        let base = row * W;
-        for col in x..(x + w).min(W) {
-            px[base + col] = c;
-        }
-    }
+    // UIMETRICS (B372): the rect is LOGICAL px, clipped to the logical W x H; the surface is the physical one.
+    let (w, h) = (w.min(W.saturating_sub(x)), h.min(H.saturating_sub(y)));
+    super::super::metrics::fill(px, super::super::metrics::size(W), x, y, w, h, c);
 }
 
 fn rect(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
@@ -412,7 +411,7 @@ fn rect(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
 
 fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
     // LOGINFONT: the shared face, clipped to the surface; all-or-nothing per glyph (its contract).
-    let _ = crate::video::text::draw_text(px, W, W, H, x, y, s, fg, false, FACE);
+    let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, x, y, s, fg, false, FACE); // UIMETRICS: logical origin, dpi-sized face
 }
 
 fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: bool, secret: bool) {
@@ -426,7 +425,7 @@ fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: 
         text(px, x + 6, y + 4, content, theme::CONTENT_TEXT);
     }
     if focused {
-        let cx = x + 6 + if secret { crate::video::text::advance(&[b'*'; FIELD_MAX][..n], false, FACE) } else { crate::video::text::advance(&content[..n], false, FACE) }; // KERNELFONT: the caret sits at the shaped advance. LOGINFONT: the caret sits at the face's advance, not the old square cell
+        let cx = x + 6 + if secret { super::super::metrics::ladvance(&[b'*'; FIELD_MAX][..n], false, FACE) } else { super::super::metrics::ladvance(&content[..n], false, FACE) }; // KERNELFONT: the caret sits at the shaped advance. LOGINFONT: the caret sits at the face's advance, not the old square cell
         fill(px, cx, y + 4, 2, CELL, theme::CONTENT_TEXT);
     }
 }
@@ -439,7 +438,7 @@ fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
     let (x, y, w, h) = ctl_rect(c, setpw);
     fill(px, x, y, w, h, if primary { theme::ACCENT } else { theme::BUTTON_FACE });
     rect(px, x, y, w, h, theme::FRAME_LINE);
-    let tw = crate::video::text::advance(label, false, FACE); // KERNELFONT: the shaped width. LOGINFONT
+    let tw = super::super::metrics::ladvance(label, false, FACE); // KERNELFONT: the shaped width. LOGINFONT
     let tx = x + w.saturating_sub(tw) / 2;
     let ty = y + h.saturating_sub(CELL) / 2;
     text(px, tx, ty, label, if primary { theme::BEVEL_LIGHT } else { theme::BUTTON_TEXT });
@@ -454,7 +453,7 @@ fn user_row(px: &mut [u32], i: usize, name: &[u8], picked: bool) {
     let (x, y, w, h) = ctl_rect(Ctl::User(i), false);
     fill(px, x, y, w, h, if picked { theme::ACCENT } else { theme::CONTENT_FILL });
     rect(px, x, y, w, h, if picked { theme::ACCENT } else { theme::FRAME_LINE });
-    let max = crate::video::text::fit(name, false, FACE, w - 12); // KERNELFONT: whole glyphs that fit. LOGINFONT
+    let max = crate::video::text::fit(name, false, FACE, super::super::metrics::size(w - 12)); // UIMETRICS: the physical width // KERNELFONT: whole glyphs that fit. LOGINFONT
     let n = name.len().min(max);
     text(px, x + 6, y + 4, &name[..n], if picked { theme::BEVEL_LIGHT } else { theme::CONTENT_TEXT });
 }
@@ -465,7 +464,7 @@ fn repaint() {
         return; // headless: the state machine is the whole screen
     }
     // SAFETY: see `SURF`.
-    let px: &mut [u32] = unsafe { &mut (*core::ptr::addr_of_mut!(SURF)).0 };
+    let px: &mut [u32] = surf();
     fill(px, 0, 0, W, H, theme::CHROME_FACE);
     rect(px, 2, 2, W - 4, H - 4, theme::FRAME_LINE);
     if f.state == State::Alert {
@@ -566,11 +565,11 @@ fn repaint() {
         text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
     } else if !locked {
         // BRIGHTFLOOR M5 — the safe-mode escape, in small text on the footer (`settings::safe_mode_check`).
-        let fy = H.saturating_sub(font::CHROME_CELL_H + 4);
+        let fy = H.saturating_sub(super::super::metrics::lcell_h(crate::video::text::Face::Chrome) + 4); // UIMETRICS: the chrome cell in logical px
         const LONG: &[u8] = b"hold Shift after login to reset display settings";
         const SHORT: &[u8] = b"Shift after login: reset display";
-        let msg = if LX + crate::video::text::advance(LONG, false, crate::video::text::Face::Chrome) <= W { LONG } else { SHORT };
-        let _ = crate::video::text::draw_text(px, W, W, H, LX, fy, msg, theme::TITLE_TEXT_INACTIVE, false, crate::video::text::Face::Chrome);
+        let msg = if LX + super::super::metrics::ladvance(LONG, false, crate::video::text::Face::Chrome) <= W { LONG } else { SHORT };
+        let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, LX, fy, msg, theme::TITLE_TEXT_INACTIVE, false, crate::video::text::Face::Chrome);
     }
     drop(f);
     let id = WIN.load(Ordering::Relaxed);
@@ -664,7 +663,7 @@ fn open_as(state: State) {
         crate::splash::hold_release("first-screen");
         return;
     }
-    let Some((_s, ow, oh)) = wm::spawn_geometry(W, H) else {
+    let Some((_s, ow, oh)) = wm::spawn_geometry_native(super::super::metrics::size(W), super::super::metrics::size(H)) else {
         crate::bootlog_println!("[login] screen open window=no (no surface yet — headless form)");
         crate::splash::hold_release("first-screen");
         return;
@@ -680,7 +679,7 @@ fn open_as(state: State) {
     // never shows a blank box.
     FORM.lock().windowed = true;
     repaint();
-    let surf = core::ptr::addr_of_mut!(SURF) as usize;
+    let (sw, sh) = (super::super::metrics::size(W), super::super::metrics::size(H)); let surf = surf().as_mut_ptr() as usize; // UIMETRICS: the native surface
     // LOGINCLOSE — the row is minted under [`OWNER`], the shell/desktop band, and THAT is what makes
     // the screen unclosable by the pointer: no control cluster is drawn for it and `wm::hit_test`
     // never names it, so neither router can ask the close question about this row. Changing this
@@ -689,7 +688,7 @@ fn open_as(state: State) {
     // boot, against a control row that differs only here.
     let nt = notice_current(); // NOTICE: the alert's window is titled by the notice
     let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::CreateUser { b"Create account" } else if state == State::Alert { nt.title() } else { b"Log in" };
-    let id = wm::create_at(OWNER, surf, W * H * 4, W as u32, H as u32, (W * 4) as u32, title, ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    let id = wm::create_at_native(OWNER, surf, sw * sh * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
         serial_println!("[login] screen open window=no (create refused — headless form)");
@@ -1315,13 +1314,13 @@ fn close_leg() -> (&'static str, bool) {
         FORM.lock().state = State::Closed;
         return ("no-window", false);
     };
-    let bx = info.x.saturating_sub(wm::BORDER);
-    let by = info.y.saturating_sub(wm::TITLE_H + wm::BORDER);
-    let bw = info.w.saturating_mul(info.scale).saturating_add(2 * wm::BORDER);
+    let bx = info.x.saturating_sub(wm::BORDER());
+    let by = info.y.saturating_sub(wm::TITLE_H() + wm::BORDER());
+    let bw = info.w.saturating_mul(info.scale).saturating_add(2 * wm::BORDER());
     let bh = info
         .h
         .saturating_mul(info.scale)
-        .saturating_add(wm::TITLE_H + 2 * wm::BORDER);
+        .saturating_add(wm::TITLE_H() + 2 * wm::BORDER());
     // 1 — nothing is drawn to press.
     let no_cluster = wm::close_box_rect(win).is_none()
         && wm::control_disc_rect(win, wm::Ctrl::Minimise).is_none()
@@ -1348,13 +1347,13 @@ fn close_leg() -> (&'static str, bool) {
     // shell/desktop band nor the kernel band `close_owner` refuses, and it is the row every app on the
     // glass is. It shares the screen's surface for the instant it exists — it is a stand-in for the
     // ROW, not for the app — and it is closed before anything else happens.
-    let ctrl = wm::create_at(
+    let ctrl = wm::create_at_native(
         1,
-        core::ptr::addr_of_mut!(SURF) as usize,
-        W * H * 4,
-        W as u32,
-        H as u32,
-        (W * 4) as u32,
+        surf().as_mut_ptr() as usize,
+        super::super::metrics::size(W) * super::super::metrics::size(H) * 4,
+        super::super::metrics::size(W) as u32,
+        super::super::metrics::size(H) as u32,
+        (super::super::metrics::size(W) * 4) as u32,
         b"Log in",
         info.x,
         info.y,
@@ -1518,8 +1517,8 @@ fn control_leg(
         let (rx, ry, rw, rh) = ctl_rect(c, false);
         let s = info.scale.max(1);
         Some((
-            (info.x + (rx + rw / 2) * s) as i32,
-            (info.y + (ry + rh / 2) * s) as i32,
+            (info.x + super::super::metrics::edge(rx + rw / 2) * s) as i32,
+            (info.y + super::super::metrics::edge(ry + rh / 2) * s) as i32,
         ))
     }
     // 1 — the leg's own arithmetic, checked before it is trusted.
