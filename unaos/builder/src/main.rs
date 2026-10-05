@@ -995,6 +995,10 @@ fn main() {
         ("PROBE.LNX", "PROBE.LNX"),
         // SELFBUILD2 (B349): the threaded syscall KAT (crates/user-linux-hello/c/syskat2.c) — `tests selfbuild2`.
         ("SYSKAT2.LNX", "SYSKAT2.LNX"),
+        // SELFBUILD4 (B356): the process-memory KAT (syskat4.c) and the first Rust program (crates/user-linux-rust, static
+        // musl, non-PIE) — `tests selfbuild4`. Built and host-proven by arroyo's build_selfbuild4_x86; absent = SKIP.
+        ("SYSKAT4.LNX", "SYSKAT4.LNX"),
+        ("RUST.LNX", "RUST.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {

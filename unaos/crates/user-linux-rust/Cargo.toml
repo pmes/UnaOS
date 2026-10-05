@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# SELFBUILD4 (B356): RUST.LNX — the first Rust program on UnaOS. A HOST-built static Linux x86_64 binary
+# (`--target x86_64-unknown-linux-musl`, musl + libunwind self-contained, `-C target-feature=+crt-static`)
+# that the Linux ABI shim runs under `tests selfbuild4`. It exercises the std surface a toolchain leans
+# on: std::thread x4 on a Mutex<u64>, a HashMap, std::fs, std::env::args, println!, Instant and a panic
+# caught with catch_unwind. Its own workspace root so `./arroyo check` never builds it for the kernel target.
+[workspace]
+
+[package]
+name = "user-linux-rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "rust-probe"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+debug = false
+panic = "unwind"
+codegen-units = 1
