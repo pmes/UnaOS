@@ -189,3 +189,7 @@ Not decoded: lossy VP8 (RFC 6386 intra decoder + ALPH) — OWED; animation (ANIM
 * Proof: `cargo test --release -p pixel_core -p aether` — rc=0, 98 passed / 0 failed (aether 84 incl.
   the engine image tests that encode PNG/JPEG fixtures and decode them through `decode_raster`; pixel_core
   14 across the PNG/JPEG/M3/WebP/inflate KATs and the 89 pinned Chromium digests).
+* Kernel metal leg (x86, `cargo +nightly check --release --target ../../x86_64-unaos.json -Z build-std=… -Z
+  json-target-spec --features "wc,quarry,ftdirx,login,loginst,nvidia-kepler-vblank,smc,usbnet,hda,hda-tone,
+  facet,beam,sdw,selfhost,linuxabi,ahci,unafs,busreg"` from `unaos/crates/kernel`, at 333bb155): **rc=0**.
+  (The brief's `kepler_vblank` is spelled `nvidia-kepler-vblank` in the kernel's Cargo.toml.) Targets deleted.
