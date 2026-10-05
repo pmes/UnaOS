@@ -2163,9 +2163,9 @@ unsafe extern "C" {
 // `Task`, so the pushed value is untouched across any number of intervening tasks and is freed only
 // with the task itself.
 //
-// U1a does NOT preserve the user's rbx/rbp/r12-r15/rdi/... across a syscall (only rcx/r11, which
-// SYSRET requires); the demo blob loads fresh registers for its second syscall, so this is sound
-// for the cooperative single-shot. Full GPR preservation is arc U1b. ---
+// U1a did NOT preserve the user's rbx/rbp/r12-r15/rdi/... across a syscall (only rcx/r11, which
+// SYSRET requires). LINUXABI2 added the callee-saved six; SELFBUILDMETAL (B367) the argument six
+// (rdi rsi rdx r10 r8 r9): every GPR but rax/rcx/r11 now survives a syscall, Linux's contract. ---
 core::arch::global_asm!(
     ".globl unaos_syscall_entry",
     "unaos_syscall_entry:",
@@ -2195,35 +2195,32 @@ core::arch::global_asm!(
     // cannot gate these lines (the percpu.rs macros exist for the record; cfg cannot reach in here).
     "mov gs:[{uoff}], r8",
     "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
+    "push rdi", "push rsi", "push rdx", "push r10", "push r8", "push r9", // SELFBUILDMETAL (B367): the user's six argument registers, restored on the way out (Linux's ABI keeps all but rax/rcx/r11); ktop-88..ktop-128, under the frame every reader already knows; 6 pushes keep the 16-byte alignment
     "mov r8, r10",                  // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
     "mov rcx, rdx",                 // arg2 -> 4th C arg
     "mov rdx, rsi",                 // arg1 -> 3rd C arg
     "mov rsi, rdi",                 // arg0 -> 2nd C arg
     "mov rdi, rax",                 // number -> 1st C arg
     "call {dispatch}",              // rax = return value (or never returns: SYS_EXIT -> scheduler)
+    // SELFBUILDMETAL (B367): the canonical-rcx guard (U1b B2, below) runs FIRST, on the saved rcx slot (ktop-32 = rsp+96 here),
+    // while rcx/rdx are still free scratch — after the six pops below they hold the user's own values.
+    "mov rcx, [rsp + 96]", "mov rdx, rcx", "shl rdx, 16", "sar rdx, 16", "cmp rdx, rcx", "jne 2f",
+    "pop r9", "pop r8", "pop r10", "pop rdx", "pop rsi", "pop rdi", // SELFBUILDMETAL: the user's own argument registers back
     "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx", // LINUXABI2: the matching pops (rax survives)
     "pop rcx",                      // restore user RIP   (SYSRET's target)
     "pop r11",                      // restore user RFLAGS; rsp now = ktop-16, 16-aligned
     // --- U1b B2: canonical-rcx guard (CVE-2012-0217 shape). A non-canonical SYSRET target #GPs at
     // CPL 0 *after* the user rsp is loaded, running the #GP handler on a user-controlled stack.
-    // Refuse to sysret such an rcx. rdx is scratch here (a caller-saved leftover, scrubbed below
-    // anyway). Assumes 48-bit VAs (setup() asserts LA57 off): sign-extend bit 47 and compare —
-    // equal iff rcx was canonical.
-    "mov rdx, rcx",
-    "shl rdx, 16",
-    "sar rdx, 16",
-    "cmp rdx, rcx",
-    "jne 2f",                       // non-canonical -> kill the task (GS still = PerCpuData here)
-    // --- U1b B1: scrub the caller-saved GPRs that carry kernel-dispatcher leftovers to ring 3.
-    // rax = return value; rcx/r11 = the SYSRET pair; rbx/rbp/r12-r15 still hold the user's own
-    // pre-syscall values (the C dispatch preserved them across the call) — so only these six can
-    // leak a kernel pointer to ring 3. Zeroing the 32-bit name clears the full 64-bit register.
-    "xor edi, edi",
-    "xor esi, esi",
-    "xor edx, edx",
-    "xor r8d, r8d",
-    "xor r9d, r9d",
-    "xor r10d, r10d",
+    // Refuse to sysret such an rcx. SELFBUILDMETAL (B367): the guard now runs right after the call,
+    // on the saved rcx slot, BEFORE rcx/rdx are restored (see above); same sign-extend-bit-47 test,
+    // same `2:` kill path (GS still = PerCpuData there). Assumes 48-bit VAs (setup() asserts LA57 off).
+    // --- U1b B1 (kept, by a different means): no caller-saved GPR may carry a kernel-dispatcher
+    // leftover to ring 3. It used to ZERO rdi/rsi/rdx/r8/r9/r10 here; SELFBUILDMETAL (B367) restores
+    // the USER'S OWN pre-syscall values instead (pushed at entry, popped above), which leaks nothing
+    // the task did not already hold. The zeroing broke the Linux ABI on metal (flight 22): gcc keeps
+    // a syscall's input registers live across the instruction (Linux preserves everything but
+    // rax/rcx/r11), so SYSKAT2 waited on futex with a NULL timeout, SYSKAT3 read fd 0, SYSKAT5 and
+    // RUST.LNX (musl's sigaction, r8+0x88) dereferenced NULL, and SYSKAT4's every fork group failed.
     // U4y: recover THIS task's own user rsp from THIS task's kernel stack. The two slots hold the
     // same value; drop the pad and pop the other. The kernel stack is abandoned from here — the next
     // entry reloads rsp from `syscall_kernel_rsp` (= ktop), so nothing below ktop is ever read again.

@@ -10,8 +10,8 @@
 //!   fatal-or-ignore path); a child's exit posts SIGCHLD to a parent that catches it.
 //! - On the way out of any syscall (`dispatch`), the lowest pending, unblocked signal is delivered: an `rt_sigframe` (Linux's
 //!   layout: pretcode, `ucontext` with the full `sigcontext`, `siginfo`, a 512-byte FXSAVE image) is written below the user
-//!   stack's red zone, and the SYSCALL return frame is rewritten to enter the handler. The SYSCALL stub scrubs rdi/rsi/rdx on
-//!   the way out (U1b B1), so the handler is entered through a 21-byte TRAMPOLINE page this layer maps at [`TRAMP_VA`]
+//!   stack's red zone, and the SYSCALL return frame is rewritten to enter the handler. The SYSCALL stub restores rdi/rsi/rdx from its
+//!   own frame on the way out (SELFBUILDMETAL; U1b B1 zeroed them), so the handler is entered through a 21-byte TRAMPOLINE page this layer maps at [`TRAMP_VA`]
 //!   (`mov rdi,rbx; mov rsi,r12; mov rdx,r13; jmp r14` — the arguments ride the callee-saved registers the stub restores),
 //!   followed by a default restorer (`mov eax,15; syscall`) for a handler installed without SA_RESTORER.
 //! - `rt_sigreturn` reads the `ucontext` back (rip, rsp, rflags, rbx/rbp/r12-r15, rax, the mask, the FXSAVE image) and returns
@@ -354,6 +354,7 @@ pub fn sigreturn(p: &mut LinuxProc, info: &ProcInfo, ktop: u64) -> i64 {
     fset(ktop, 64, mc(5)); // r13
     fset(ktop, 72, mc(6)); // r14
     fset(ktop, 80, mc(7)); // r15
+    super::set_frame_args(ktop, [mc(8), mc(9), mc(12), mc(2), mc(0), mc(1)]); // SELFBUILDMETAL (B367): rdi rsi rdx r10 r8 r9 from the frame
     fset(ktop, 32, mc(16)); // rip (the stub refuses a non-canonical one)
     fset(ktop, 8, mc(15)); // rsp
     fset(ktop, 16, mc(15));

@@ -213,6 +213,8 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
         frame_w(ktop, 72),
         frame_w(ktop, 80),
     ];
+    let a6 = super::frame_args(ktop); // SELFBUILDMETAL (B367): a fork child returns with the parent's rdi rsi rdx r10 r8 r9 too, as on Linux
+    let regs = [regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], a6[0], a6[1], a6[2], a6[3], a6[4], a6[5]];
     let pid = new_pid();
     let kill = Arc::new(crate::arch::sched::KillSwitch::new());
     let fds = p.fds.clone();
@@ -359,6 +361,7 @@ pub fn execve(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, path_va: u64, 
             w(off, 0);
         }
     }
+    super::set_frame_args(ktop, [0; 6]); // SELFBUILDMETAL (B367): the new image starts with zero rdi..r9 (glibc's _start reads rdx as rtld_fini)
     serial_println!("[linuxabi] execve pid={} path={} entry={:#x}", info.pid, full, plan.entry);
     0
 }
