@@ -1475,6 +1475,24 @@ fn launch(path: &str) -> String {
             return s;
         }
     }
+    // RING3ABI2 M6 (B333): the PROGRAM decides, exactly as a typed bare name does (`shell::exec_detaches`):
+    // its `.note.unaos.app` flags through the shared core's rule (`midden_core::launch_mode`). A window or a
+    // resident server detaches below (the `bg` seam); a console program is handed to the shell window as the
+    // line `run <path>` — the DOCKPIN verb seam (`dock::post_line_launch`), run by `shell::dispatch_command`
+    // exactly as typed, so its output lands in a console and its exit status is printed there.
+    let flags = midden_core::app_note_flags(&bytes).unwrap_or(0);
+    if midden_core::launch_mode(flags) == midden_core::LaunchMode::Foreground && crate::video::dock::LINE_LAUNCH_DRAINED {
+        if path.contains(char::is_whitespace) {
+            serial_println!("[quarry] launch REFUSED path={} reason=foreground-path-has-space", path);
+            return String::from("a console program whose path has a space cannot be handed to `run` (rename it)");
+        }
+        let line = alloc::format!("run {}", path);
+        crate::video::dock::post_line_launch(&line);
+        serial_println!(":: QUARRY-LAUNCH: {} — note flags={} -> foreground: the shell window runs `{}` ::", path, flags, line);
+        return alloc::format!("running in the shell: {}", line);
+    }
+    // (A console program on a build whose render body does not drain the line seam — every aarch64 build
+    // today, `dock::LINE_LAUNCH_DRAINED` — still detaches, as every double-click did before M6.)
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
         Ok((pid, asid, entry)) => {
@@ -1494,8 +1512,8 @@ fn launch(path: &str) -> String {
             crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path);
             JOBS.lock().push(Job { pid, asid, name: String::from(path) });
             serial_println!(
-                ":: QUARRY-LAUNCH: {} — {} bytes, entry {:#x}, pid={} asid={} DETACHED (spawn_user_image_bg, the same seam `bg` takes) ::",
-                path, n, entry, pid, asid
+                ":: QUARRY-LAUNCH: {} — {} bytes, entry {:#x}, pid={} asid={} note flags={} DETACHED (spawn_user_image_bg, the same seam `bg` takes) ::",
+                path, n, entry, pid, asid, flags
             );
             alloc::format!("started pid {}", pid)
         }
