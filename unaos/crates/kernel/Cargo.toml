@@ -3805,7 +3805,7 @@ unafs = { path = "../../libs/fs/unafs", default-features = false }
 # ORIN-NET-4: the mature TCP/IP stack for the aarch64/tegra NIC bind — the same crate/version/feature
 # set the x86 `smolnet` uses, declared here (aarch64) as optional so it is pulled ONLY under the
 # `net4` feature (via `dep:smoltcp`). Default-OFF net4 => not compiled => aarch64 media byte-identical.
-smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
 # XUSBFW: the bench-only Tegra234 XUSB Falcon firmware injection point (`XUSB_FW: Option<&[u8]>`).
 # aarch64-only (its one consumer is arch/aarch64/xusb_tegra.rs::xusbfw) AND optional, pulled only
 # under the `xusbfw` feature via `dep:unaos-xusb-fw`. It is a separate crate SO THAT the kernel
@@ -3814,7 +3814,7 @@ smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-e
 unaos-xusb-fw = { path = "../xusb-fw", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
 # UNAFSX86: the same no_std UnaFS core, OPTIONAL on x86 — pulled only by the `unafs` feature (UNAOS_UNAFS=1).
 unafs = { path = "../../libs/fs/unafs", default-features = false, optional = true }
 x86_64 = "0.15.5"
