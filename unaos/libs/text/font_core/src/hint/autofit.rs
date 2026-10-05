@@ -7,8 +7,8 @@
 //!
 //! 1. **Style coverage** (`af_face_globals_compute_style_coverage`): every glyph reachable through the Unicode cmap
 //!    from a script's ranges is assigned that script's default style, first style in table order wins; glyphs of
-//!    a script's non-base ranges are flagged so they skip blue zones; everything else falls to the unhinted
-//!    `none` style.
+//!    a script's non-base ranges are flagged so they skip blue zones; the OpenType features' GSUB closure adds
+//!    unencoded glyphs ([`super::coverage`]); everything else falls to FreeType's fallback style, `hani` (CJK).
 //! 2. **Global metrics per style** (`af_latin_metrics_init`): standard stem widths from the first available
 //!    reference character (`o O 0` for Latin) — segments linked into stems, widths sorted and clustered — and the
 //!    blue zones: for each blue string, every character's extreme point, classified flat or round from its
@@ -24,11 +24,12 @@
 //!    finally the outline's points: edge points to their edge, strong points interpolated between edges, weak
 //!    points (IUP-style) between touched neighbours. x is only scaled.
 //!
-//! Not implemented (the honest ceiling): the CJK and Indic writing systems (their glyphs go unhinted where
-//! FreeType hints them), the HarfBuzz-driven OpenType-feature coverage (small caps, superscripts, ligature glyphs
-//! not in the cmap stay in the `none` style), and HarfBuzz shaping of multi-character blue clusters.
+//! The CJK writing system (`afcjk.c`, both dimensions, light-mode stem nudging) serves `hani`, the Indic styles
+//! and the fallback. Not implemented (the honest ceiling): HarfBuzz's full shaping of blue characters (default
+//! features such as Arabic `isol` are not applied; feature styles apply their own single/alternate/multiple
+//! substitutions only, without GPOS y offsets) and multi-character blue clusters.
 
-use super::autofit_tables::{SCRIPTS, STYLES, STYLE_NONE_DFLT};
+use super::autofit_tables::{SCRIPTS, STYLES, STYLE_FALLBACK, STYLE_NONE_DFLT};
 use super::fixed::{corner_is_flat, div_fix, msb, mul_div, mul_fix, pix_round};
 use super::{Outline, TAG_CONIC, TAG_CUBIC, TAG_ON};
 use crate::font::Outlines;
@@ -177,6 +178,8 @@ struct Segment {
     max_coord: i64,
     height: i64,
     score: i64,
+    /// CJK linking: overlap length of the best link.
+    len: i64,
     link: Option<usize>,
     serif: Option<usize>,
     edge: Option<usize>,
@@ -194,6 +197,7 @@ const SEG0: Segment = Segment {
     max_coord: 0,
     height: 0,
     score: 32000,
+    len: 0,
     link: None,
     serif: None,
     edge: None,
@@ -240,6 +244,7 @@ struct Hints {
 enum Slot {
     Pending,
     Latin(Box<LatinMetrics>),
+    Cjk(Box<CjkMetrics>),
     /// Hinted as the dummy writing system (scaled only).
     Dummy,
 }
@@ -250,8 +255,21 @@ pub struct AutoHinter {
     styles: Vec<u16>,
     slots: Vec<Slot>,
     upem: i64,
-    /// False for faces the auto-hinter does not handle (no `glyf` outlines): those are returned unhinted.
-    pub truetype: bool,
+    /// False for faces with neither `glyf` nor `CFF ` outlines: those are rasterized unhinted.
+    pub hintable: bool,
+    /// Diagnostics: the segment and edge tables of the last glyph hinted (FreeType's `ftgrid` dump, for oracle
+    /// debugging).
+    pub last_debug: Option<DebugTables>,
+}
+
+/// One glyph's hinting tables per dimension (0 = x, 1 = y): segments as (pos, dir, first point, last point,
+/// link, serif, edge, flags) and edges as (fpos, opos, pos, dir, link, serif, flags), positions in font units
+/// (fpos) and 26.6 (opos, pos).
+#[derive(Clone, Debug, Default)]
+#[allow(clippy::type_complexity)]
+pub struct DebugTables {
+    pub segments: [Vec<(i64, i8, usize, usize, Option<usize>, Option<usize>, Option<usize>, u8)>; 2],
+    pub edges: [Vec<(i64, i64, i64, i8, Option<usize>, Option<usize>, u8)>; 2],
 }
 
 impl AutoHinter {
@@ -302,11 +320,17 @@ impl AutoHinter {
         }
         for s in styles.iter_mut() {
             if *s & STYLE_MASK == STYLE_UNASSIGNED {
-                *s = (*s & !STYLE_MASK) | STYLE_NONE_DFLT as u16;
+                *s = (*s & !STYLE_MASK) | STYLE_FALLBACK as u16;
             }
         }
         let slots = (0..STYLES.len()).map(|_| Slot::Pending).collect();
-        AutoHinter { styles, slots, upem: font.units_per_em.max(1) as i64, truetype: matches!(font.outlines, Outlines::Glyf(_)) }
+        AutoHinter {
+            styles,
+            slots,
+            upem: font.units_per_em.max(1) as i64,
+            hintable: matches!(font.outlines, Outlines::Glyf(_) | Outlines::Cff(_)),
+            last_debug: None,
+        }
     }
 
     /// The style name a glyph is hinted with (`latn_dflt`, `cyrl_dflt`, `none_dflt`, …).
@@ -333,7 +357,10 @@ impl AutoHinter {
                             Slot::Dummy
                         }
                     },
-                    _ => Slot::Dummy,
+                    WritingSystem::Cjk | WritingSystem::Indic => {
+                        Slot::Cjk(Box::new(cjk_metrics_init(font, style, self.upem, st.ws == WritingSystem::Cjk)))
+                    }
+                    WritingSystem::Dummy => Slot::Dummy,
                 };
                 continue;
             }
@@ -347,6 +374,14 @@ impl AutoHinter {
         let style = self.resolve(font, gid);
         let scale = div_fix((size * 64.0 + 0.5) as i64, self.upem);
         match &mut self.slots[style] {
+            Slot::Cjk(m) => {
+                cjk_metrics_scale(m, scale, scale);
+                (
+                    m.axis[VERT].blues.iter().map(|b| (b.rf.org, b.shoot.org, b.flags)).collect(),
+                    m.axis[VERT].widths.iter().map(|w| w.org).collect(),
+                    m.axis[VERT].scale,
+                )
+            }
             Slot::Latin(m) => {
                 latin_metrics_scale(m, scale, 0, scale, 0);
                 (
@@ -360,9 +395,16 @@ impl AutoHinter {
     }
 
     /// The light-hinted outline of `gid` at `size` px per em (26.6, y up, origin at the pen position), as
-    /// `FT_Load_Glyph(FT_LOAD_TARGET_LIGHT)` returns it for a TrueType face. `None` for a missing glyph; an
-    /// empty outline for a glyph without contours.
+    /// `FT_Load_Glyph(FT_LOAD_TARGET_LIGHT)` returns it: the auto-hinter for a TrueType face, the Adobe engine's
+    /// hint model ([`super::cff_hint`]) for a CFF face. `None` for a missing glyph (or a CFF construct the CFF
+    /// hinter does not model); an empty outline for a glyph without contours.
     pub fn hint(&mut self, font: &Font, gid: u16, size: f32) -> Option<Outline> {
+        if let Outlines::Cff(_) = font.outlines {
+            if !(size > 0.0 && size < 2000.0) {
+                return None;
+            }
+            return super::cff_hint::hint_cff(font, gid, size);
+        }
         let mut o = raw_outline(font, gid)?;
         if !(size > 0.0 && size < 16384.0) {
             return None;
@@ -400,6 +442,33 @@ impl AutoHinter {
                 for (i, p) in h.points.iter().enumerate() {
                     o.points[i] = (p.x, p.y);
                 }
+                self.last_debug = Some(h.debug_tables());
+            }
+            Slot::Cjk(m) => {
+                cjk_metrics_scale(m, scale, scale);
+                let mut h = Hints { upem: self.upem, ..Default::default() };
+                h.x_scale = m.axis[HORZ].scale;
+                h.x_delta = m.axis[HORZ].delta;
+                h.y_scale = m.axis[VERT].scale;
+                h.y_delta = m.axis[VERT].delta;
+                h.reload(&o);
+                // light mode leaves both dimensions on for CJK (only latin sets AF_SCALER_FLAG_NO_HORIZONTAL)
+                for dim in [HORZ, VERT] {
+                    h.cjk_compute_segments(dim);
+                    h.cjk_link_segments(dim);
+                    h.cjk_compute_edges(dim, m.axis[dim].edge_distance_threshold);
+                    h.cjk_compute_blue_edges(dim, m);
+                }
+                for dim in [HORZ, VERT] {
+                    h.cjk_hint_edges(dim, m);
+                    h.cjk_align_edge_points(dim);
+                    h.align_strong_points(dim);
+                    h.align_weak_points(dim);
+                }
+                for (i, p) in h.points.iter().enumerate() {
+                    o.points[i] = (p.x, p.y);
+                }
+                self.last_debug = Some(h.debug_tables());
             }
             _ => {
                 for p in o.points.iter_mut() {
@@ -538,12 +607,14 @@ fn latin_constant(upem: i64, c: i64) -> i64 {
     c * upem / 2048
 }
 
-fn init_widths(font: &Font, m: &mut LatinMetrics) {
-    let sc = &SCRIPTS[STYLES[m.style].script];
+/// The standard stem widths of a style per dimension (`af_latin_metrics_init_widths`, shared by the CJK
+/// writing system): stems of the first reference character, sorted and clustered.
+fn std_widths(font: &Font, style: usize, upem: i64) -> [Vec<Width>; 2] {
+    let sc = &SCRIPTS[STYLES[style].script];
     let mut gid = 0u16;
     for ch in chars_of(sc.standard) {
         let Some(ch) = ch else { continue };
-        let g = cluster_glyphs(font, m.style, ch);
+        let g = cluster_glyphs(font, style, ch);
         if g.len() > 1 {
             continue;
         }
@@ -552,12 +623,11 @@ fn init_widths(font: &Font, m: &mut LatinMetrics) {
             break;
         }
     }
-    let mut counts = [0usize; 2];
     let mut widths: [Vec<Width>; 2] = [Vec::new(), Vec::new()];
     if gid != 0 {
         if let Some(o) = raw_outline(font, gid) {
             if !o.points.is_empty() {
-                let mut h = Hints { upem: m.upem, x_scale: 0x10000, y_scale: 0x10000, ..Default::default() };
+                let mut h = Hints { upem, x_scale: 0x10000, y_scale: 0x10000, ..Default::default() };
                 h.reload(&o);
                 for dim in [HORZ, VERT] {
                     h.compute_segments(dim);
@@ -574,17 +644,21 @@ fn init_widths(font: &Font, m: &mut LatinMetrics) {
                             }
                         }
                     }
-                    sort_and_quantize_widths(&mut w, m.upem / 100);
-                    counts[dim] = w.len();
+                    sort_and_quantize_widths(&mut w, upem / 100);
                     widths[dim] = w;
                 }
             }
         }
     }
+    widths
+}
+
+fn init_widths(font: &Font, m: &mut LatinMetrics) {
+    let mut widths = std_widths(font, m.style, m.upem);
     for dim in [HORZ, VERT] {
         let ax = &mut m.axis[dim];
         ax.widths = core::mem::take(&mut widths[dim]);
-        let stdw = if counts[dim] > 0 { ax.widths[0].org } else { latin_constant(m.upem, 50) };
+        let stdw = if !ax.widths.is_empty() { ax.widths[0].org } else { latin_constant(m.upem, 50) };
         ax.edge_distance_threshold = stdw / 5;
         ax.standard_width = stdw;
         ax.extra_light = false;
@@ -1090,6 +1164,16 @@ fn is_postscript_orientation(o: &Outline) -> bool {
 }
 
 impl Hints {
+    fn debug_tables(&self) -> DebugTables {
+        let mut t = DebugTables::default();
+        for dim in [HORZ, VERT] {
+            t.segments[dim] =
+                self.axis[dim].segments.iter().map(|s| (s.pos, s.dir, s.first, s.last, s.link, s.serif, s.edge, s.flags)).collect();
+            t.edges[dim] = self.axis[dim].edges.iter().map(|e| (e.fpos, e.opos, e.pos, e.dir, e.link, e.serif, e.flags)).collect();
+        }
+        t
+    }
+
     /// `af_glyph_hints_reload`.
     fn reload(&mut self, o: &Outline) {
         let n = o.points.len();
@@ -2151,4 +2235,692 @@ fn iup_interp(pts: &mut [Point], p1: usize, p2: usize, ref1: usize, ref2: usize)
             pts[p].u = u;
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------- CJK
+//
+// FreeType's CJK writing system (`afcjk.c`), used for the `hani` style — CJK ideographs, kana, hangul — and, as
+// FreeType's FALLBACK style (AF_STYLE_FALLBACK = hani_dflt with AF_CONFIG_OPTION_CJK), for every glyph no script
+// claims: arrows, math, box drawing, dingbats. Indic styles use it too, without blue zones. Unlike latin it hints
+// BOTH dimensions in light mode; stems keep their width (no AF_LATIN_HINTS_STEM_ADJUST) and are only nudged
+// within the light-mode gap/delta limits of `af_hint_normal_stem`.
+
+const CJK_BLUE_ACTIVE: u32 = 1 << 0;
+const CJK_BLUE_TOP: u32 = 1 << 1;
+const CJK_PROP_TOP: u8 = 1;
+const CJK_PROP_HORIZ: u8 = 2;
+const LIGHT_MAX_HORZ_GAP: i64 = 9;
+const LIGHT_MAX_VERT_GAP: i64 = 15;
+const LIGHT_MAX_DELTA_ABS: i64 = 14;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CjkBlue {
+    rf: Width,
+    shoot: Width,
+    flags: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CjkAxis {
+    widths: Vec<Width>,
+    edge_distance_threshold: i64,
+    blues: Vec<CjkBlue>,
+    org_scale: i64,
+    org_delta: i64,
+    scale: i64,
+    delta: i64,
+}
+
+#[derive(Clone, Debug)]
+struct CjkMetrics {
+    upem: i64,
+    axis: [CjkAxis; 2],
+}
+
+fn cjk_metrics_init(font: &Font, style: usize, upem: i64, blues: bool) -> CjkMetrics {
+    let mut m = CjkMetrics { upem, axis: [CjkAxis::default(), CjkAxis::default()] };
+    if font.unicode_map().is_empty() {
+        return m;
+    }
+    let mut widths = std_widths(font, style, upem);
+    for dim in [HORZ, VERT] {
+        let ax = &mut m.axis[dim];
+        ax.widths = core::mem::take(&mut widths[dim]);
+        let stdw = if !ax.widths.is_empty() { ax.widths[0].org } else { latin_constant(upem, 50) };
+        ax.edge_distance_threshold = stdw / 5;
+    }
+    if blues {
+        cjk_init_blues(font, style, &mut m);
+    }
+    m
+}
+
+/// `af_cjk_metrics_init_blues`: per blue string, the extreme point of every character before the `|` (the
+/// "fill" set) and after it (the "flat" set); reference = median fill, overshoot = median flat.
+fn cjk_init_blues(font: &Font, style: usize, m: &mut CjkMetrics) {
+    for &(string, props) in STYLES[style].blues {
+        let horiz = props & CJK_PROP_HORIZ != 0;
+        let top = props & CJK_PROP_TOP != 0;
+        let (mut fills, mut flats): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
+        let mut fill = true;
+        for tok in string.split(' ').filter(|t| !t.is_empty()) {
+            if tok.starts_with('|') {
+                fill = false;
+                continue;
+            }
+            let mut it = tok.chars();
+            let (Some(ch), None) = (it.next(), it.next()) else { continue };
+            let g = cluster_glyphs(font, style, ch);
+            if g.len() > 1 {
+                continue;
+            }
+            let gid = g.first().copied().unwrap_or(0);
+            if gid == 0 {
+                continue;
+            }
+            let Some(o) = raw_outline(font, gid) else { continue };
+            if o.points.len() <= 2 {
+                continue;
+            }
+            let mut best_point: i64 = -1;
+            let mut best_pos = 0i64;
+            let mut last: i64 = -1;
+            for &end in &o.ends {
+                let first = last + 1;
+                last = end as i64;
+                if last <= first {
+                    continue;
+                }
+                for pp in first..=last {
+                    let (x, y) = o.points[pp as usize];
+                    let v = if horiz { x } else { y };
+                    let better = if top { v > best_pos } else { v < best_pos };
+                    if best_point < 0 || better {
+                        best_point = pp;
+                        best_pos = v;
+                    }
+                }
+            }
+            if fill {
+                fills.push(best_pos);
+            } else {
+                flats.push(best_pos);
+            }
+        }
+        if fills.is_empty() && flats.is_empty() {
+            continue;
+        }
+        sort_pos(&mut fills);
+        sort_pos(&mut flats);
+        let mut b = CjkBlue::default();
+        if flats.is_empty() {
+            b.rf.org = fills[fills.len() / 2];
+            b.shoot.org = b.rf.org;
+        } else if fills.is_empty() {
+            b.rf.org = flats[flats.len() / 2];
+            b.shoot.org = b.rf.org;
+        } else {
+            b.rf.org = fills[fills.len() / 2];
+            b.shoot.org = flats[flats.len() / 2];
+        }
+        if b.shoot.org != b.rf.org {
+            let under_ref = b.shoot.org < b.rf.org;
+            if top ^ under_ref {
+                b.rf.org = (b.shoot.org + b.rf.org) / 2;
+                b.shoot.org = b.rf.org;
+            }
+        }
+        if top {
+            b.flags |= CJK_BLUE_TOP;
+        }
+        m.axis[if horiz { HORZ } else { VERT }].blues.push(b);
+    }
+}
+
+fn cjk_metrics_scale(m: &mut CjkMetrics, x_scale: i64, y_scale: i64) {
+    for (dim, scale) in [(HORZ, x_scale), (VERT, y_scale)] {
+        let ax = &mut m.axis[dim];
+        let delta = 0;
+        if ax.org_scale == scale && ax.org_delta == delta {
+            continue;
+        }
+        ax.org_scale = scale;
+        ax.org_delta = delta;
+        ax.scale = scale;
+        ax.delta = delta;
+        for b in ax.blues.iter_mut() {
+            b.rf.cur = mul_fix(b.rf.org, scale) + delta;
+            b.rf.fit = b.rf.cur;
+            b.shoot.cur = mul_fix(b.shoot.org, scale) + delta;
+            b.shoot.fit = b.shoot.cur;
+            b.flags &= !CJK_BLUE_ACTIVE;
+            let dist = mul_fix(b.rf.org - b.shoot.org, scale);
+            if (-48..=48).contains(&dist) {
+                b.rf.fit = pix_round(b.rf.cur);
+                let delta1 = div_fix(b.rf.fit, scale) - b.shoot.org;
+                let mut delta2 = mul_fix(delta1.abs(), scale);
+                // (FreeType compiles out the half-pixel step `32 + ((delta2 - 32 + 16) & ~31)` for 32..64)
+                delta2 = if delta2 < 32 { 0 } else { pix_round(delta2) };
+                if delta1 < 0 {
+                    delta2 = -delta2;
+                }
+                b.shoot.fit = b.rf.fit - delta2;
+                b.flags |= CJK_BLUE_ACTIVE;
+            }
+        }
+    }
+}
+
+fn seg_dist(a: &Segment, b: &Segment) -> i64 {
+    (a.pos - b.pos).abs()
+}
+
+impl Hints {
+    /// `af_cjk_hints_compute_segments`. FreeType's function then re-derives each segment's round flag (round only
+    /// when no two consecutive points are on-curve), but it takes its segment range BEFORE calling the latin
+    /// routine — when `af_glyph_hints_reload` has just zeroed the count — so that loop never runs and the latin
+    /// round flags stand. Measured: the latin flags reproduce FreeType's edge flags; the re-derived ones do not.
+    fn cjk_compute_segments(&mut self, dim: usize) {
+        self.compute_segments(dim);
+    }
+
+    /// `af_cjk_hints_link_segments`.
+    fn cjk_link_segments(&mut self, dim: usize) {
+        let major = self.axis[dim].major_dir;
+        let len_threshold = latin_constant(self.upem, 8);
+        let dist_threshold = div_fix(64 * 3, if dim == HORZ { self.x_scale } else { self.y_scale });
+        let segs = &mut self.axis[dim].segments;
+        let n = segs.len();
+        for i in 0..n {
+            if segs[i].dir != major {
+                continue;
+            }
+            for j in 0..n {
+                if j == i || segs[i].dir as i32 + segs[j].dir as i32 != 0 {
+                    continue;
+                }
+                let dist = segs[j].pos - segs[i].pos;
+                if dist < 0 {
+                    continue;
+                }
+                let min = segs[i].min_coord.max(segs[j].min_coord);
+                let max = segs[i].max_coord.min(segs[j].max_coord);
+                let len = max - min;
+                if len >= len_threshold {
+                    if dist * 8 < segs[i].score * 9 && (dist * 8 < segs[i].score * 7 || segs[i].len < len) {
+                        segs[i].score = dist;
+                        segs[i].len = len;
+                        segs[i].link = Some(j);
+                    }
+                    if dist * 8 < segs[j].score * 9 && (dist * 8 < segs[j].score * 7 || segs[j].len < len) {
+                        segs[j].score = dist;
+                        segs[j].len = len;
+                        segs[j].link = Some(i);
+                    }
+                }
+            }
+        }
+        // serifs: strokes wider at their ends
+        for i in 0..n {
+            let Some(l1) = segs[i].link else { continue };
+            if segs[l1].link != Some(i) || segs[l1].pos <= segs[i].pos {
+                continue;
+            }
+            if segs[i].score >= dist_threshold {
+                continue;
+            }
+            for j in 0..n {
+                if segs[j].pos > segs[i].pos || i == j {
+                    continue;
+                }
+                let Some(l2) = segs[j].link else { continue };
+                if segs[l2].link != Some(j) || segs[l2].pos < segs[l1].pos {
+                    continue;
+                }
+                if segs[i].pos == segs[j].pos && segs[l1].pos == segs[l2].pos {
+                    continue;
+                }
+                if segs[j].score <= segs[i].score || segs[i].score * 4 <= segs[j].score {
+                    continue;
+                }
+                if segs[i].len >= segs[j].len * 3 {
+                    for k in 0..n {
+                        let link = segs[k].link;
+                        if link == Some(j) {
+                            segs[k].link = None;
+                            segs[k].serif = Some(l1);
+                        } else if link == Some(l2) {
+                            segs[k].link = None;
+                            segs[k].serif = Some(i);
+                        }
+                    }
+                } else {
+                    segs[i].link = None;
+                    segs[l1].link = None;
+                    break;
+                }
+            }
+        }
+        for i in 0..n {
+            if let Some(l) = segs[i].link {
+                if segs[l].link != Some(i) {
+                    segs[i].link = None;
+                    if segs[l].score < dist_threshold || segs[i].score < segs[l].score * 4 {
+                        segs[i].serif = segs[l].link;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `af_cjk_hints_compute_edges`.
+    fn cjk_compute_edges(&mut self, dim: usize, laxis_edge_threshold: i64) {
+        let scale = if dim == HORZ { self.x_scale } else { self.y_scale };
+        let mut edge_distance_threshold = mul_fix(laxis_edge_threshold, scale);
+        edge_distance_threshold =
+            if edge_distance_threshold > 64 / 4 { div_fix(64 / 4, scale) } else { laxis_edge_threshold };
+        let ax = &mut self.axis[dim];
+        let major = ax.major_dir;
+        let segs = &mut ax.segments;
+        let edges = &mut ax.edges;
+        edges.clear();
+        for s in 0..segs.len() {
+            let mut found = None;
+            let mut best = 0xFFFFi64;
+            for (ee, e) in edges.iter().enumerate() {
+                if e.dir != segs[s].dir {
+                    continue;
+                }
+                let dist = (segs[s].pos - e.fpos).abs();
+                if dist < edge_distance_threshold && dist < best {
+                    if let Some(link) = segs[s].link {
+                        let mut s1 = e.first;
+                        let mut dist2 = 0;
+                        loop {
+                            if let Some(l1) = segs[s1].link {
+                                dist2 = seg_dist(&segs[link], &segs[l1]);
+                                if dist2 >= edge_distance_threshold {
+                                    break;
+                                }
+                            }
+                            s1 = segs[s1].edge_next;
+                            if s1 == e.first {
+                                break;
+                            }
+                        }
+                        if dist2 >= edge_distance_threshold {
+                            continue;
+                        }
+                    }
+                    best = dist;
+                    found = Some(ee);
+                }
+            }
+            match found {
+                None => {
+                    let pos = segs[s].pos;
+                    let mut at = edges.len();
+                    while at > 0 {
+                        let prev = edges[at - 1].fpos;
+                        if prev < pos {
+                            break;
+                        }
+                        if prev == pos && segs[s].dir == major {
+                            break;
+                        }
+                        at -= 1;
+                    }
+                    let opos = mul_fix(pos, scale);
+                    edges.insert(
+                        at,
+                        Edge {
+                            fpos: pos,
+                            opos,
+                            pos: opos,
+                            flags: 0,
+                            dir: segs[s].dir,
+                            scale: 0,
+                            blue: None,
+                            link: None,
+                            serif: None,
+                            first: s,
+                            last: s,
+                        },
+                    );
+                    segs[s].edge_next = s;
+                }
+                Some(e) => {
+                    segs[s].edge_next = edges[e].first;
+                    let l = edges[e].last;
+                    segs[l].edge_next = s;
+                    edges[e].last = s;
+                }
+            }
+        }
+        for e in 0..edges.len() {
+            let first = edges[e].first;
+            let mut s = first;
+            loop {
+                segs[s].edge = Some(e);
+                s = segs[s].edge_next;
+                if s == first {
+                    break;
+                }
+            }
+        }
+        for e in 0..edges.len() {
+            let (mut is_round, mut is_straight) = (0, 0);
+            let first = edges[e].first;
+            let mut s = first;
+            loop {
+                if segs[s].flags & EDGE_ROUND != 0 {
+                    is_round += 1;
+                } else {
+                    is_straight += 1;
+                }
+                let is_serif = match segs[s].serif {
+                    Some(sr) => segs[sr].edge != Some(e),
+                    None => false,
+                };
+                if segs[s].link.is_some() || is_serif {
+                    let (mut edge2, seg2) =
+                        if is_serif { (edges[e].serif, segs[s].serif.unwrap()) } else { (edges[e].link, segs[s].link.unwrap()) };
+                    match edge2 {
+                        Some(e2) => {
+                            let edge_delta = (edges[e].fpos - edges[e2].fpos).abs();
+                            if seg_dist(&segs[s], &segs[seg2]) < edge_delta {
+                                edge2 = segs[seg2].edge;
+                            }
+                        }
+                        None => edge2 = segs[seg2].edge,
+                    }
+                    if is_serif {
+                        edges[e].serif = edge2;
+                        if let Some(e2) = edge2 {
+                            edges[e2].flags |= EDGE_SERIF;
+                        }
+                    } else {
+                        edges[e].link = edge2;
+                    }
+                }
+                s = segs[s].edge_next;
+                if s == first {
+                    break;
+                }
+            }
+            edges[e].flags = 0;
+            if is_round > 0 && is_round >= is_straight {
+                edges[e].flags |= EDGE_ROUND;
+            }
+            if edges[e].serif.is_some() && edges[e].link.is_some() {
+                edges[e].serif = None;
+            }
+        }
+    }
+
+    /// `af_cjk_hints_compute_blue_edges`.
+    fn cjk_compute_blue_edges(&mut self, dim: usize, m: &CjkMetrics) {
+        let cjk = &m.axis[dim];
+        let scale = cjk.scale;
+        let mut best_dist0 = mul_fix(m.upem / 40, scale);
+        if best_dist0 > 64 / 2 {
+            best_dist0 = 64 / 2;
+        }
+        let ax = &mut self.axis[dim];
+        let major = ax.major_dir;
+        for edge in ax.edges.iter_mut() {
+            let mut best = None;
+            let mut best_dist = best_dist0;
+            for (bb, blue) in cjk.blues.iter().enumerate() {
+                if blue.flags & CJK_BLUE_ACTIVE == 0 {
+                    continue;
+                }
+                let is_top_right = blue.flags & CJK_BLUE_TOP != 0;
+                let is_major = edge.dir == major;
+                if is_top_right ^ is_major {
+                    let shoot = (edge.fpos - blue.rf.org).abs() > (edge.fpos - blue.shoot.org).abs();
+                    let org = if shoot { blue.shoot.org } else { blue.rf.org };
+                    let dist = mul_fix((edge.fpos - org).abs(), scale);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best = Some((bb, shoot));
+                    }
+                }
+            }
+            if best.is_some() {
+                edge.blue = best;
+            }
+        }
+    }
+
+    /// `af_cjk_hint_edges` (light mode: stems keep their width).
+    fn cjk_hint_edges(&mut self, dim: usize, m: &CjkMetrics) {
+        let blues = &m.axis[dim].blues;
+        let fit = |b: (usize, bool)| if b.1 { blues[b.0].shoot.fit } else { blues[b.0].rf.fit };
+        let edges = &mut self.axis[dim].edges;
+        let n = edges.len();
+        let mut anchor: Option<usize> = None;
+        let mut delta = 0i64;
+        let mut skipped = 0;
+        let mut has_last_stem = false;
+        let mut last_stem_pos = 0i64;
+        let align_linked = |edges: &mut Vec<Edge>, base: usize, stem: usize| {
+            edges[stem].pos = edges[base].pos + (edges[stem].opos - edges[base].opos);
+        };
+        for e in 0..n {
+            if edges[e].flags & EDGE_DONE != 0 {
+                continue;
+            }
+            let mut blue = edges[e].blue;
+            let mut edge1 = None;
+            let mut edge2 = edges[e].link;
+            if blue.is_some() {
+                edge1 = Some(e);
+            } else if let Some(e2) = edge2 {
+                if edges[e2].blue.is_some() {
+                    blue = edges[e2].blue;
+                    edge1 = Some(e2);
+                    edge2 = Some(e);
+                }
+            }
+            let Some(e1) = edge1 else { continue };
+            edges[e1].pos = fit(blue.unwrap());
+            edges[e1].flags |= EDGE_DONE;
+            if let Some(e2) = edge2 {
+                if edges[e2].blue.is_none() {
+                    align_linked(edges, e1, e2);
+                    edges[e2].flags |= EDGE_DONE;
+                }
+            }
+            if anchor.is_none() {
+                anchor = Some(e);
+            }
+        }
+        for e in 0..n {
+            if edges[e].flags & EDGE_DONE != 0 {
+                continue;
+            }
+            let Some(e2) = edges[e].link else {
+                skipped += 1;
+                continue;
+            };
+            if has_last_stem && (edges[e].pos < last_stem_pos + 64 || edges[e2].pos < last_stem_pos + 64) {
+                skipped += 1;
+                continue;
+            }
+            if edges[e2].blue.is_some() {
+                align_linked(edges, e2, e);
+                edges[e].flags |= EDGE_DONE;
+                continue;
+            }
+            if e2 < e {
+                align_linked(edges, e2, e);
+                edges[e].flags |= EDGE_DONE;
+                has_last_stem = true;
+                last_stem_pos = edges[e].pos;
+                continue;
+            }
+            if dim != VERT && anchor.is_none() {
+                delta = hint_normal_stem(edges, e, e2, 0, HORZ);
+            } else {
+                hint_normal_stem(edges, e, e2, delta, dim);
+            }
+            anchor = Some(e);
+            edges[e].flags |= EDGE_DONE;
+            edges[e2].flags |= EDGE_DONE;
+            has_last_stem = true;
+            last_stem_pos = edges[e2].pos;
+        }
+        if dim == HORZ && (n == 6 || n == 12) {
+            let (a, b, c) = if n == 6 { (0, 2, 4) } else { (1, 5, 9) };
+            let span = ((edges[b].opos - edges[a].opos) - (edges[c].opos - edges[b].opos)).abs();
+            if edges[a].link == Some(a + 1) && edges[b].link == Some(b + 1) && edges[c].link == Some(c + 1) && span < 8 {
+                let d = edges[c].pos - (2 * edges[b].pos - edges[a].pos);
+                edges[c].pos -= d;
+                if let Some(l) = edges[c].link {
+                    edges[l].pos -= d;
+                }
+                if n == 12 {
+                    edges[8].pos -= d;
+                    edges[11].pos -= d;
+                }
+                edges[c].flags |= EDGE_DONE;
+                if let Some(l) = edges[c].link {
+                    edges[l].flags |= EDGE_DONE;
+                }
+            }
+        }
+        if skipped == 0 {
+            return;
+        }
+        for e in 0..n {
+            if edges[e].flags & EDGE_DONE != 0 {
+                continue;
+            }
+            if let Some(s) = edges[e].serif {
+                edges[e].pos = edges[s].pos + (edges[e].opos - edges[s].opos);
+                edges[e].flags |= EDGE_DONE;
+                skipped -= 1;
+            }
+        }
+        if skipped == 0 {
+            return;
+        }
+        for e in 0..n {
+            if edges[e].flags & EDGE_DONE != 0 {
+                continue;
+            }
+            let before = (0..e).rev().find(|&b| edges[b].flags & EDGE_DONE != 0);
+            let after = (e + 1..n).find(|&a| edges[a].flags & EDGE_DONE != 0);
+            match (before, after) {
+                (None, Some(a)) => edges[e].pos = edges[a].pos + (edges[e].opos - edges[a].opos),
+                (Some(b), None) => edges[e].pos = edges[b].pos + (edges[e].opos - edges[b].opos),
+                (Some(b), Some(a)) => {
+                    if edges[a].fpos == edges[b].fpos {
+                        edges[e].pos = edges[b].pos;
+                    } else {
+                        edges[e].pos = edges[b].pos
+                            + mul_div(edges[e].fpos - edges[b].fpos, edges[a].pos - edges[b].pos, edges[a].fpos - edges[b].fpos);
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+    }
+
+    /// `af_cjk_align_edge_points` without snapping: every point of every segment of an edge moves by the edge's
+    /// displacement (a point shared by two segments moves twice, as in FreeType).
+    fn cjk_align_edge_points(&mut self, dim: usize) {
+        let ax = &self.axis[dim];
+        for edge in &ax.edges {
+            let delta = edge.pos - edge.opos;
+            let mut s = edge.first;
+            loop {
+                let sg = &ax.segments[s];
+                let mut p = sg.first;
+                loop {
+                    if dim == HORZ {
+                        self.points[p].x += delta;
+                        self.points[p].flags |= FLAG_TOUCH_X;
+                    } else {
+                        self.points[p].y += delta;
+                        self.points[p].flags |= FLAG_TOUCH_Y;
+                    }
+                    if p == sg.last {
+                        break;
+                    }
+                    p = self.points[p].next;
+                }
+                s = sg.edge_next;
+                if s == edge.first {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// `af_hint_normal_stem` in light mode; returns the shift applied.
+fn hint_normal_stem(edges: &mut [Edge], e: usize, e2: usize, anchor: i64, dim: usize) -> i64 {
+    let both_round = edges[e].flags & EDGE_ROUND != 0 && edges[e2].flags & EDGE_ROUND != 0;
+    let threshold = if both_round {
+        if dim == VERT { 64 - LIGHT_MAX_HORZ_GAP } else { 64 - LIGHT_MAX_VERT_GAP }
+    } else if dim == VERT {
+        64 - LIGHT_MAX_HORZ_GAP / 3
+    } else {
+        64 - LIGHT_MAX_VERT_GAP / 3
+    };
+    let org_len = edges[e2].opos - edges[e].opos;
+    let cur_len = org_len;
+    let org_center = (edges[e].opos + edges[e2].opos) / 2 + anchor;
+    let mut cur_pos1 = org_center - cur_len / 2;
+    let cur_pos2 = cur_pos1 + cur_len;
+    let mut d_off1 = cur_pos1 - (cur_pos1 & !63);
+    let mut d_off2 = cur_pos2 - (cur_pos2 & !63);
+    let mut u_off1 = 64 - d_off1;
+    let mut u_off2 = 64 - d_off2;
+    let mut delta = 0i64;
+    'exit: {
+        if d_off1 == 0 || d_off2 == 0 {
+            break 'exit;
+        }
+        if cur_len <= threshold {
+            if d_off2 < cur_len {
+                delta = if u_off1 <= d_off2 { u_off1 } else { -d_off2 };
+            }
+            break 'exit;
+        }
+        if threshold < 64 && (d_off1 >= threshold || u_off1 >= threshold || d_off2 >= threshold || u_off2 >= threshold) {
+            break 'exit;
+        }
+        let mut offset = cur_len & 63;
+        if offset < 32 {
+            if u_off1 <= offset || d_off2 <= offset {
+                break 'exit;
+            }
+        } else {
+            offset = 64 - threshold;
+        }
+        d_off1 = threshold - u_off1;
+        u_off1 -= offset;
+        u_off2 = threshold - d_off2;
+        d_off2 -= offset;
+        if d_off1 <= u_off1 {
+            u_off1 = -d_off1;
+        }
+        if d_off2 <= u_off2 {
+            u_off2 = -d_off2;
+        }
+        delta = if u_off1.abs() <= u_off2.abs() { u_off1 } else { u_off2 };
+    }
+    delta = delta.clamp(-LIGHT_MAX_DELTA_ABS, LIGHT_MAX_DELTA_ABS);
+    cur_pos1 += delta;
+    if edges[e].opos < edges[e2].opos {
+        edges[e].pos = cur_pos1;
+        edges[e2].pos = cur_pos1 + cur_len;
+    } else {
+        edges[e].pos = cur_pos1 + cur_len;
+        edges[e2].pos = cur_pos1;
+    }
+    delta
 }

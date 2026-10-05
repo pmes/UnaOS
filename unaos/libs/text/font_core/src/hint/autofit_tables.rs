@@ -360,7 +360,9 @@ pub static STYLES: &[StyleRec] = &[
     StyleRec { name: "tibt_dflt", ws: WritingSystem::Indic, script: 58, coverage: Coverage::Default,
         blues: &[] },
     StyleRec { name: "hani_dflt", ws: WritingSystem::Cjk, script: 59, coverage: Coverage::Default,
-        blues: &[("他 们 你 來 們 到 和 地 对 對 就 席 我 时 時 會 来 為 能 舰 說 说 这 這 齊 | 军 同 已 愿 既 星 是 景 民 照 现 現 理 用 置 要 軍 那 配 里 開 雷 露 面 顾", 1), ("个 为 人 他 以 们 你 來 個 們 到 和 大 对 對 就 我 时 時 有 来 為 要 說 说 | 主 些 因 它 想 意 理 生 當 看 着 置 者 自 著 裡 过 还 进 進 過 道 還 里 面", 0), (" 些 们 你 來 們 到 和 地 她 将 將 就 年 得 情 最 样 樣 理 能 說 说 这 這 通 | 即 吗 吧 听 呢 品 响 嗎 师 師 收 断 斷 明 眼 間 间 际 陈 限 除 陳 随 際 隨", 2), ("事 前 學 将 將 情 想 或 政 斯 新 样 樣 民 沒 没 然 特 现 現 球 第 經 谁 起 | 例 別 别 制 动 動 吗 嗎 增 指 明 朝 期 构 物 确 种 調 调 費 费 那 都 間 间", 3)] },
+        blues: &[("他 们 你 來 們 到 和 地 对 對 就 席 我 时 時 會 来 為 能 舰 說 说 这 這 齊 | 军 同 已 愿 既 星 是 景 民 照 现 現 理 用 置 要 軍 那 配 里 開 雷 露 面 顾", 1), ("个 为 人 他 以 们 你 來 個 們 到 和 大 对 對 就 我 时 時 有 来 為 要 說 说 | 主 些 因 它 想 意 理 生 當 看 着 置 者 自 著 裡 过 还 进 進 過 道 還 里 面", 0)] },
 ];
 pub const STYLE_NONE_DFLT: usize = 66;
 pub const SCRIPT_LATN: usize = 30;
+/// AF_STYLE_FALLBACK with AF_CONFIG_OPTION_CJK (FreeType's default build): uncovered glyphs are hinted as hani.
+pub const STYLE_FALLBACK: usize = 86;

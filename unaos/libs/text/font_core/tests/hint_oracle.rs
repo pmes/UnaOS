@@ -41,6 +41,10 @@ pub const FACES: &[&str] = &[
     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
     "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    // CFF: the Adobe engine's hint model (M3)
+    "/usr/share/fonts/opentype/tlwg/Loma.otf",
+    "/usr/share/fonts/opentype/tlwg/Loma-Bold.otf",
 ];
 pub const SIZES: [f32; 3] = [12.0, 16.0, 24.0];
 
@@ -50,7 +54,20 @@ pub fn corpus_chars() -> Vec<char> {
     let ranges: &[(u32, u32)] = if full {
         &[(0x20, 0x10FFFF)]
     } else {
-        &[(0x21, 0x7E), (0xA1, 0xFF), (0x386, 0x3CE), (0x400, 0x45F), (0x5D0, 0x5EA), (0x621, 0x64A), (0xE01, 0xE3A)]
+        &[
+            (0x21, 0x7E),
+            (0xA1, 0xFF),
+            (0x386, 0x3CE),
+            (0x400, 0x45F),
+            (0x5D0, 0x5EA),
+            (0x621, 0x64A),
+            (0xE01, 0xE3A),
+            (0x2010, 0x2027), // punctuation (latn)
+            (0x2190, 0x21FF), // arrows: no script — FreeType's fallback style (hani, CJK writing system)
+            (0x2200, 0x22FF), // math operators (fallback)
+            (0x3041, 0x3096), // hiragana (hani)
+            (0x4E00, 0x4E3F), // CJK ideographs (hani)
+        ]
     };
     for &r in ranges {
         for c in r.0..=r.1 {
@@ -76,16 +93,16 @@ pub struct FtGlyph {
 pub fn freetype(jobs: &[(String, f32, Vec<u16>)], mode: &str) -> Option<HashMap<(String, u32, u16), FtGlyph>> {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/oracle/ft_hint_oracle.py");
     let mut child = Command::new("python3").arg(script).arg(mode).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().ok()?;
-    {
-        let mut stdin = child.stdin.take()?;
-        let mut s = String::new();
-        for (p, size, gids) in jobs {
-            let g: Vec<String> = gids.iter().map(|g| g.to_string()).collect();
-            s.push_str(&format!("{p}\t0\t{size}\t{}\n", g.join(",")));
-        }
-        stdin.write_all(s.as_bytes()).ok()?;
+    let mut stdin = child.stdin.take()?;
+    let mut s = String::new();
+    for (p, size, gids) in jobs {
+        let g: Vec<String> = gids.iter().map(|g| g.to_string()).collect();
+        s.push_str(&format!("{p}\t0\t{size}\t{}\n", g.join(",")));
     }
+    // feed stdin from a thread: the oracle writes while it reads, and both pipes fill on a large corpus
+    let feeder = std::thread::spawn(move || stdin.write_all(s.as_bytes()).is_ok());
     let out = child.wait_with_output().ok()?;
+    feeder.join().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     if text.starts_with("NO_FREETYPE") || !out.status.success() {
         return None;
@@ -224,6 +241,21 @@ fn light_autohint_matches_freetype_per_glyph() {
                 if let Some(dd) = &dump {
                     let q: Vec<&str> = dd.split(':').collect();
                     if q.len() == 3 && p.contains(q[0]) && q[1].parse::<u16>().ok() == Some(g) && q[2].parse::<f32>().ok() == Some(*size) {
+                        if p.ends_with(".otf") {
+                            for l in font_core::hint::cff_hint::hint_cff_traced(&f, g, *size, true).1 {
+                                eprintln!("map {l}");
+                            }
+                        }
+                        if let Some(t) = &h.last_debug {
+                            for dim in 0..2 {
+                                for (i, s) in t.segments[dim].iter().enumerate() {
+                                    eprintln!("seg{dim} {i:2} {:?}", s);
+                                }
+                                for (i, e) in t.edges[dim].iter().enumerate() {
+                                    eprintln!("edge{dim} {i:2} {:?}", e);
+                                }
+                            }
+                        }
                         eprintln!("style {}", h.style_name(&f, g));
                         if let Some(b) = &bm {
                             eprintln!("ours left {} top {} {}x{}", b.left, b.top, b.width, b.height);

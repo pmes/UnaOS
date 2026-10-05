@@ -20,9 +20,20 @@ def strip_c_comments(s):
 dat = open(os.path.join(af, 'afblue.dat'), encoding='utf-8').read().split('\n')
 strings, stringsets = {}, {}
 section = None; cur = None
+skip = []  # preprocessor state: options FreeType leaves undefined by default are skipped
+OFF = {'AF_CONFIG_OPTION_CJK_BLUE_HANI_VERT'}
 for line in dat:
     t = line.strip()
-    if t.startswith('//') or t.startswith('#') or not t:
+    if t.startswith('#'):
+        w = t.split()
+        if w[0] in ('#ifdef', '#if'):
+            skip.append(len(w) > 1 and w[1] in OFF)
+        elif w[0] == '#ifndef':
+            skip.append(False)
+        elif w[0] == '#endif' and skip:
+            skip.pop()
+        continue
+    if any(skip) or t.startswith('//') or not t:
         continue
     if t.endswith(':') and len(t.split()) == 3:
         section = t.split()[0]; cur = None; continue
@@ -136,4 +147,6 @@ o.append('];')
 idx = {n: i for i, (n, *_r) in enumerate(styles)}
 o.append(f'pub const STYLE_NONE_DFLT: usize = {idx["none_dflt"]};')
 o.append(f'pub const SCRIPT_LATN: usize = {script_index["LATN"]};')
+o.append('/// AF_STYLE_FALLBACK with AF_CONFIG_OPTION_CJK (FreeType\'s default build): uncovered glyphs are hinted as hani.')
+o.append(f'pub const STYLE_FALLBACK: usize = {idx["hani_dflt"]};')
 print('\n'.join(o))

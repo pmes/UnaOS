@@ -211,18 +211,29 @@ fn skew(p: &Path, k: f32) -> Path {
 
 /// Rasterizes one glyph of `face` at `size` px with its origin at x phase `sub` quarters.
 pub fn rasterize(face: &Face, gid: u16, size: f32, sub: u8) -> Option<GlyphMask> {
-    let mut path = face.font.glyph_path(gid)?;
-    if path.is_empty() || !(size > 0.0 && size <= 4096.0) {
+    if !(size > 0.0 && size <= 4096.0) {
         return None;
     }
     let upem = face.font.units_per_em.max(1) as f32;
+    // FONTHINT (SR62): installed faces get fontconfig's hintslight as Chromium applies it (FreeType
+    // FT_LOAD_TARGET_LIGHT: font_core's light auto-hinter for TrueType, the Adobe hint model for CFF); the hinted
+    // outline comes back in pixels. Skia drops hinting for skewed (synthetic oblique) text.
+    let hinted = if super::is_installed(face) && !face.synth_oblique { hinted_path(face, gid, size) } else { None };
+    let in_px = hinted.is_some();
+    let (mut path, unit) = match hinted {
+        Some(p) => (p, size / upem),
+        None => (face.font.glyph_path(gid)?, 1.0),
+    };
+    if path.is_empty() {
+        return None;
+    }
     if face.synth_bold {
-        path = embolden(&path, upem / 24.0);
+        path = embolden(&path, upem / 24.0 * unit);
     }
     if face.synth_oblique {
         path = skew(&path, 0.25);
     }
-    let scale = size / upem;
+    let scale = if in_px { 1.0 } else { size / upem };
     let sub_x = sub as f32 / 4.0;
     let x0 = (sub_x + path.x_min * scale).floor() as i32 - 1;
     let x1 = (sub_x + path.x_max * scale).ceil() as i32 + 1;
@@ -243,6 +254,21 @@ pub fn rasterize(face: &Face, gid: u16, size: f32, sub: u8) -> Option<GlyphMask>
         return None;
     }
     Some(GlyphMask { left: x0, top: y0, w: w as u32, h: h as u32, data })
+}
+
+/// The light-hinted outline of a glyph in pixels (y up), through a per-face auto-hinter.
+fn hinted_path(face: &Face, gid: u16, size: f32) -> Option<Path> {
+    thread_local! {
+        static HINTERS: std::cell::RefCell<HashMap<u32, font_core::hint::autofit::AutoHinter>> = std::cell::RefCell::new(HashMap::new());
+    }
+    HINTERS.with(|h| {
+        let mut h = h.borrow_mut();
+        let hinter = h.entry(face.id).or_insert_with(|| font_core::hint::autofit::AutoHinter::new(&face.font));
+        if !hinter.hintable {
+            return None;
+        }
+        hinter.hint(&face.font, gid, size).map(|o| o.to_path_26_6())
+    })
 }
 
 type Key = (u32, u16, u32, u8);

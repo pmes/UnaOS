@@ -353,6 +353,12 @@ fn faces_loaded() -> &'static Mutex<LoadedMap> {
     F.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// True for a face loaded from the host's font directories (not `@font-face`): Chromium applies fontconfig's
+/// `hintslight` to those (FONTHINT SR62), and draws web fonts unhinted.
+pub(crate) fn is_installed(face: &Face) -> bool {
+    faces_loaded().lock().map(|m| m.values().any(|f| f.id == face.id)).unwrap_or(false)
+}
+
 pub(crate) fn next_face_id() -> u32 {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

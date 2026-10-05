@@ -357,11 +357,13 @@ pub fn rasterize_glyph_hinted(
     mode: RenderMode,
     hinting: crate::hint::Hinting,
 ) -> Option<GlyphBitmap> {
-    if hinting == crate::hint::Hinting::None || !hinter.truetype {
+    if hinting == crate::hint::Hinting::None || !hinter.hintable {
         return rasterize_glyph_mode(font, gid, size, sub_x, sub_y, mode);
     }
-    let o = hinter.hint(font, gid, size)?;
-    rasterize_path_px(&o.to_path_26_6(), sub_x, sub_y, mode)
+    match hinter.hint(font, gid, size) {
+        Some(o) => rasterize_path_px(&o.to_path_26_6(), sub_x, sub_y, mode),
+        None => rasterize_glyph_mode(font, gid, size, sub_x, sub_y, mode),
+    }
 }
 
 /// Drop all-zero border rows/columns.

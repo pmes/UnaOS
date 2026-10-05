@@ -11,10 +11,13 @@
 //!
 //! [`autofit`] is the light auto-hinter: FreeType's latin writing system (blue zones from the script's reference
 //! characters, the x-height scale adjustment, segments → edges → stems, blue-zone snapping, strong and weak point
-//! interpolation), vertical only. [`Hinting`] is the mode the rasterizer and the glyph caches key on.
+//! interpolation), vertical only, plus its CJK writing system (both axes) for CJK, Indic and every glyph no script
+//! claims. [`cff_hint`] is the Adobe CFF engine's hint model. [`Hinting`] is the mode the rasterizer and the glyph
+//! caches key on.
 
 pub mod autofit;
 mod autofit_tables;
+pub mod cff_hint;
 pub mod coverage;
 pub mod fixed;
 
