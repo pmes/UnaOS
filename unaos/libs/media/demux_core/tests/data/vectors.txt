@@ -1,0 +1,13 @@
+# PLAYBACK (SR26) public sample vectors — fetched at test time, never committed.
+# Fields: name sha256 url. Source: the W3C web-platform-tests media corpus (BSD-3-Clause).
+av1.mp4 43620efd37f3714f80992cdd5832ed2ad0fa285e5cea656ab58fce8f53710021 https://raw.githubusercontent.com/web-platform-tests/wpt/master/webcodecs/av1.mp4
+vp9.mp4 0abb054bf0dfd17ebe08a04c656f0ad19bc117c19f89e79b6b8a20d6091539d9 https://raw.githubusercontent.com/web-platform-tests/wpt/master/webcodecs/vp9.mp4
+test-av-384k-44100Hz-1ch-320x240-30fps-10kfr.webm 032d3fd8d1a0301820f5531d58477f9d54c42e2c43d4738fef97035b43ca5df0 https://raw.githubusercontent.com/web-platform-tests/wpt/master/media/test-av-384k-44100Hz-1ch-320x240-30fps-10kfr.webm
+test-1s.webm 220c6fc2feb9f4538bd62273855bc4aaf444da76a295cf937a131b9e7399110c https://raw.githubusercontent.com/web-platform-tests/wpt/master/media/test-1s.webm
+test-v-128k-320x240-24fps-8kfr.mp4 3870bbf58da900f6f127434e49f8cd11ea131ac2705206dceb27f2fa8d5575c5 https://raw.githubusercontent.com/web-platform-tests/wpt/master/media-source/mp4/test-v-128k-320x240-24fps-8kfr.mp4
+# Remuxes demux_core's own writers make from the vectors above (name sha256 source shape).
+# Chromium played exactly these bytes for chromium-oracle.jsonl; the test rebuilds them and
+# checks the hash, so the oracle numbers stay tied to the bytes.
+remux av1-remux.webm f7b04815fcfdb32f74bd28abab0e42c6279534fc4ae9414918bae09257f8af4d av1.mp4 webm
+remux av1-frag.mp4 05d8189ca3e11731d9f7fdcca5b1c95791dc5ecb4ce19b5fc40cafa44e5f4338 av1.mp4 frag3
+remux vp9-frag.mp4 17a9efd37f45e045e59fec9227e0d7fa6e750b050f45c79f4e0d45085d71557e vp9.mp4 frag4

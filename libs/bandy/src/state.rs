@@ -124,6 +124,9 @@ pub struct AppState {
     pub console_logs: VecDeque<String>,
     pub console_seq: usize,
     pub token_usage: (i32, i32, i32), // (Prompt, Response, Total)
+    /// VEINTURNS (SR42): session continuity for the status row —
+    /// `session=resumed|new|stateless · turns=<n>`; empty before the first turn.
+    pub session_status: String,
 
     // UI Status Flags
     pub is_computing: bool,
@@ -164,6 +167,7 @@ impl Default for AppState {
             console_logs: VecDeque::new(),
             console_seq: 0,
             token_usage: (0, 0, 0),
+            session_status: String::new(),
             is_computing: false,
             is_indexing: false,
             active_input_buffer: String::new(),

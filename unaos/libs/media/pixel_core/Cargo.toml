@@ -1,0 +1,28 @@
+[package]
+name = "pixel_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "PIXELCORE (SR25): the still-image decoders UnaOS owns — PNG, JPEG, GIF, BMP, QOI, WebP (lossless, and lossy through vp8_core) — written from the specifications, no_std + alloc, shared by Ring 0 and Ring 3."
+
+# PIXELCORE (SR25, R83): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, and NO dependencies — the
+# prefs_core/midden_core shape: a member of the ROOT host workspace (Aether and tools/pixel-check link it)
+# and a path dep of the kernel (`video/png.rs` and `selfhost/inflate.rs` re-export from here).
+[dependencies]
+# VP8CORE (SR40): lossy WebP is a VP8 key frame — UnaOS's own from-spec VP8 decoder (no_std, zero deps).
+vp8_core = { path = "../vp8_core" }
+# SVGCORE (SR52): SVG is a pixel_core format when `svg` is on — UnaOS's own no_std renderer (svg_core, which
+# links font_core). Optional so a build that wants no vector path stays as small as before.
+svg_core = { path = "../svg_core", optional = true }
+
+[features]
+default = []
+# The `svg` format: sniff `<svg`/`<?xml`, render with svg_core at the intrinsic (or a requested) size.
+svg = ["dep:svg_core"]
+# Host convenience: plain `decode` of an SVG draws its <text> with the system fonts (loaded once).
+svg-std = ["svg", "svg_core/std"]
+
+# Test-only second opinion (the ledger row names it): the `image` crate decodes the same KAT files and the
+# tests compare pixel-for-pixel. It never reaches the library — a dev-dependency is not linked into it.
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "gif", "bmp", "qoi", "webp", "jpeg"] }

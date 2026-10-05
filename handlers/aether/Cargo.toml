@@ -4,29 +4,50 @@ version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 
+[features]
+# PIXELCORE (SR25): page images decode through UnaOS's own `pixel_core` (via `gneiss_pal::dsp::image`).
+# The third-party decoders sit BEHIND it, each behind its own feature:
+#   pixel-core      — UnaOS's decoders first (PNG, JPEG, GIF, BMP, QOI, WebP lossless + lossy via vp8_core,
+#                     SR40). Off = the `image` crate back in front for everything (the swap is reversible).
+#   image-fallback  — the `image` crate's format decoders, consulted ONLY for what pixel_core refuses
+#                     (ICO, TIFF, AVIF, …) — never for WebP. Chicken wire until pixel_core reaches them.
+#   svg             — `resvg` rasterises SVG (vector is not pixel_core's domain; chicken wire, owed to Facet).
+# Without `image-fallback` the `image` crate is only the RGBA container + the PNG writer headless uses.
+default = ["pixel-core", "image-fallback", "svg"]
+pixel-core = []
+image-fallback = ["image/default-formats"]
+svg = ["dep:resvg"]
+
 [dependencies]
-boa_engine = "0.21"
-boa_gc = "0.21"
-html5ever = "0.39"
-kuchiki = "0.8"
-taffy = "0.12"
-reqwest = { version = "0.12", features = ["json", "stream", "blocking", "cookies"] }
+boa_engine = "0.22"
+boa_gc = "0.22"
+# AETHERDOM (SR49): the document model is UnaOS's own WHATWG parser + arena DOM (HTMLCORE, SR46).
+html_core = { path = "../../unaos/libs/web/html_core" }
+# AETHERSTYLE (SR54): CSS parsing, selector matching, @media/@supports/@layer, the cascade sort, var() and
+# calc() are UnaOS's own CSSCORE (SR47) — cssparser + selectors are gone.
+css_core = { path = "../../unaos/libs/web/css_core" }
+taffy = "0.14"
+reqwest = { version = "0.13", features = ["json", "stream", "blocking", "cookies"] }
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 bandy = { path = "../../libs/bandy" }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
+# AUDIOTRACK (SR45): SHA-256 names the http(s) media cache files — UnaOS's own primitive (SR27).
+crypto_core = { path = "../../unaos/libs/sys/crypto_core" }
 anyhow = "1.0"
 thiserror = "2.0"
 clap = { version = "4.6", features = ["derive"] }
-image = "0.25"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-cssparser = "0.37"
-selectors = "0.39"
 url = "2.5"
 font-kit = "0.14"
 pathfinder_geometry = "0.5"
-base64 = "0.22"
-resvg = "0.47"
+base64 = "0.23"
+resvg = { version = "0.48.1", optional = true }  # EYES bumped to latest stable (R83); PIXELCORE keeps it behind `svg`
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 directories = "6.0.0"
+
+# AETHERSTYLE (SR54): tests/style_time.rs verifies its fetched vectors with UnaOS's own SHA-256.
+[dev-dependencies]
+crypto_core = { path = "../../unaos/libs/sys/crypto_core" }

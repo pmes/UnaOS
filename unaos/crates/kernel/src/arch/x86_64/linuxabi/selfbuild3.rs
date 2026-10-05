@@ -116,8 +116,8 @@ fn tcc_libc() -> (String, String) {
     }
     let out = alloc::format!("{}hellop.lnx", super::sys::home_prefix());
     let _ = crate::shell::vfs_mount_table().unlink(&crate::shell::vfs_path(&out), crate::fs::vfs::KERNEL_PRINCIPAL);
-    let argv: Vec<&str> = alloc::vec!["tcc", "-static", "-o", out.as_str(), PRINTF_C];
-    serial_println!("[selfbuild3] linux {} -static -o {} {}", super::selfbuild::TCC, out, PRINTF_C);
+    let argv: Vec<&str> = alloc::vec!["tcc", "-static", "-o", out.as_str(), "-x", "c", PRINTF_C]; // SELFBUILD4: `-x c` — tcc types a file by its extension and the volume's name ends in upper-case `.C` (host-proven: `unrecognized file type` without it)
+    serial_println!("[selfbuild3] linux {} -static -o {} -x c {}", super::selfbuild::TCC, out, PRINTF_C);
     let (r, cap) = run_cap(super::selfbuild::TCC, &argv, 60_000);
     for l in cap.lines().take(8) {
         serial_println!("[selfbuild3] tcc: {}", l);

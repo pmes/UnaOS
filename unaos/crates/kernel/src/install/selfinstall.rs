@@ -830,11 +830,14 @@ pub fn mirror_source_sectors() -> Option<u64> {
 // UNAFSGROW (rmbp-ledger B347) M2 — the copied (or fresh) volume grows to its partition. File tail.
 // ---------------------------------------------------------------------------------------------
 
-/// The largest volume the installer grows to: 16 GiB of 4 KiB blocks. The unafs refcount map lives in
-/// RAM at 8 bytes per block across its two views and every commit rewrites it whole, so on the 256 MiB
-/// x86 heap and the one-sector AHCI write path a whole-SSD volume would be unmountable or unusable;
-/// past this the partition keeps free tail space until the map is incremental (owed, B347).
-pub const GROW_CAP_BLOCKS: u64 = 16 * 1024 * 1024 * 1024 / 4096;
+/// The largest volume the installer grows to: the paged UnaFS format's own wall (2^31 blocks = 8 TiB),
+/// i.e. the partition. UNAFSMAP (B354) made the refcount map a paged tree — RAM is 16 B per 4 MiB leaf
+/// plus a 4 MiB leaf cache (a 500 GB volume mounts in about 2 MiB of heap, see unafs `map_bench`) and a
+/// commit writes only its dirty leaves — so the 16 GiB cap UNAFSGROW (B347) needed is gone.
+pub const GROW_CAP_BLOCKS: u64 = 1 << 31;
+// The installer's cap IS the crate's wall (a literal above: this file also builds without `unafs`).
+#[cfg(feature = "unafs")]
+const _: () = assert!(GROW_CAP_BLOCKS == ::unafs::superblock::MAX_BLOCK_COUNT_PAGED);
 
 /// The block count the installer grows p2's volume to: the partition minus the scratch tail, in whole
 /// 4 KiB blocks, capped at [`GROW_CAP_BLOCKS`]. Pure; `tests unafsgrow` prints it for a synthetic plan.
