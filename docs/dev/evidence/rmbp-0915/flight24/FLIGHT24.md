@@ -1,6 +1,6 @@
 # FLIGHT 24 — image 17 on the UNAFS CARD IMAGE (rmbp12flight24; three cards: fbb0bc9a → 12ffb4ed → c237d6fd), 2026-10-05, main bench — Peter's "boot 24"
 
-Capture: `f24-boots.log` (five boots across three cards, host log rotated mid-flight and re-joined). Medium: the dd'd card image (p1 ESP 143 MiB + p2 UnaFS v7). Knob line = image 16's = image 15's, unchanged. The seat typed the read list over the serial door; Peter did dd / power / passwords / glass / ear / hand. Peter's host rebooted before the flight (new FTDI adapter id, ttyUSB0).
+Capture: `f24-boots.log` (four boots across three cards — card 1, card 2, card 3 and its reboot — host log rotated mid-flight and re-joined). Medium: the dd'd card image (p1 ESP 143 MiB + p2 UnaFS v7). Knob line = image 16's = image 15's, unchanged. The seat typed the read list over the serial door; Peter did dd / power / passwords / glass / ear / hand. Peter's host rebooted before the flight (new FTDI adapter id, ttyUSB0).
 
 ## Peter, verbatim (the glass)
 - Before the flight: "auto launched items should be in the prefs panel" → **R91**.
