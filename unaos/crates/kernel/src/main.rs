@@ -6972,7 +6972,7 @@ fn x86_render_service(cpu: usize) {
         // INSTGUI: pick up disks that enumerate after the dialog opened (repaints only on change).
         // Rides the pulse, which is why the pulse exists.
         #[cfg(all(feature = "wc", feature = "instgui"))]
-        unaos_kernel::video::instgui::service();
+        unaos_kernel::video::instgui::service(); #[cfg(all(feature = "wc", feature = "login"))] unaos_kernel::video::crystal::login::submit_drain(); // INPUTSTALL M5 (B375): a login submit computed on the worker is applied here, on the pulse (same-line fold).
 
         // Present: flush the damaged region of the back buffer to the framebuffer. A no-op when
         // nothing was drawn, so a pure cursor pass (front-buffer sprite) costs almost nothing.

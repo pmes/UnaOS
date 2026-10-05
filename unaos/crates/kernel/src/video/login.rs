@@ -833,7 +833,7 @@ pub fn press_swallow(x: i32, y: i32) -> bool {
         Some(Ctl::Pw2Field) => FORM.lock().focus = Focus::Retype,
         // A press on the button IS Enter. One call, so the two routes into a session cannot drift:
         // there is no second submit path to keep in step with `consume_key`'s.
-        Some(Ctl::Button) => submit(),
+        Some(Ctl::Button) => { if !submit_busy() { submit() } }
         Some(Ctl::User(i)) => pick_user(i),
         Some(Ctl::AlertOk) => alert_ok(),
         None => {}
@@ -931,6 +931,10 @@ pub fn consume_key(c: u8) -> bool {
     // mutex take and one relaxed load, and it answers `false`.
     heal_if_row_gone();
     crate::boot::key_taken(); // INSTALLBARE M2 (R86): `[login] key latency ms=` — the EHCI decode's stamp to here
+    submit_drain(); // INPUTSTALL M5: an outcome that landed since the last pass applies before this key is read
+    if submit_busy() {
+        return true; // INPUTSTALL M5: a submit is on the worker — the form takes no keys until its outcome lands
+    }
     if !KEY_SAID.swap(true, Ordering::Relaxed) {
         serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
     }
@@ -1029,8 +1033,14 @@ fn submit_setpw() {
         clear_passwords(&mut f);
         return;
     }
-    if let Err(e) = users::set_password_checked(n, &pw[..plen]) {
-        serial_println!("[login] set-password user={} NOT written reason={} (the form stays)", who, users::users_reason(e));
+    dispatch(Job::SetPw { login_after }, n, &pw[..plen]);
+}
+
+/// INPUTSTALL M5: the set-password form's outcome, applied on the render task (the worker computed it).
+fn apply_setpw(n: &[u8], login_after: bool, written: Result<(), &'static str>, session: bool) {
+    let who = core::str::from_utf8(n).unwrap_or("?");
+    if let Err(reason) = written {
+        serial_println!("[login] set-password user={} NOT written reason={} (the form stays)", who, reason);
         let mut f = FORM.lock();
         f.message = "Could not save the password";
         clear_passwords(&mut f);
@@ -1045,13 +1055,13 @@ fn submit_setpw() {
         }
         return;
     }
-    match users::login(n, &pw[..plen]) {
-        Ok(()) => {
+    match session {
+        true => {
             LOGINS.fetch_add(1, Ordering::Relaxed);
             serial_println!("[login] session open user={} (first login: the password was chosen here)", who);
             close_into_session();
         }
-        Err(_) => {
+        false => {
             serial_println!("[login] password written but the session did not open — storage or slot refusal, NOT a credential refusal");
             let mut f = FORM.lock();
             f.state = State::Open;
@@ -1078,21 +1088,27 @@ fn submit_create() {
         clear_passwords(&mut f);
         return;
     }
-    if let Err(why) = users::installer_create_user(n, &pw[..plen]) {
+    dispatch(Job::Create, n, &pw[..plen]);
+}
+
+/// INPUTSTALL M5: the create-user form's outcome, applied on the render task.
+fn apply_create(n: &[u8], made: Result<(), &'static str>, session: bool) {
+    let who = core::str::from_utf8(n).unwrap_or("?");
+    if let Err(why) = made {
         serial_println!("[login] installer: create-user user={} refused ({})", who, why);
         let mut f = FORM.lock();
         f.message = why;
         clear_passwords(&mut f);
         return;
     }
-    match users::login(n, &pw[..plen]) {
-        Ok(()) => {
+    match session {
+        true => {
             LOGINS.fetch_add(1, Ordering::Relaxed);
             serial_println!("[login] session open user={} (R77: the first user; root is not the assumed login)", who);
             close_into_session();
             users::installer_desktop_ignite();
         }
-        Err(_) => {
+        false => {
             serial_println!("[login] installer: user created but the session did not open — storage or slot refusal");
             let mut f = FORM.lock();
             f.message = "Could not open the session";
@@ -1122,8 +1138,21 @@ fn submit() {
         return submit_unlock(n, p);
     }
     if n == users::ROOT_NAME {
+        return dispatch(Job::Root, n, p);
+    }
+    if users::password_unset(n) == Some(true) {
+        serial_println!("[login] first login user={} -> set password (LOGIN14/R65: the row has no credential yet)", core::str::from_utf8(n).unwrap_or("?"));
+        open_set_password(n, true);
+        return;
+    }
+    dispatch(Job::User, n, p);
+}
+
+/// INPUTSTALL M5: root's outcome, applied on the render task.
+fn apply_root(ok: bool) {
+    {
         // LOGINFLOW2 M1 (R64/R77): root logs in at the screen like anyone — by typing `root` and its password. Same one answer on a refusal.
-        if users::password_unset(n) != Some(false) || users::login_root(p).is_err() {
+        if !ok {
             serial_println!("[login] denied user=root (one answer for every refusal: `users::verify` decides)");
             let mut f = FORM.lock();
             f.message = "Login failed";
@@ -1134,13 +1163,11 @@ fn submit() {
         LOGINS.fetch_add(1, Ordering::Relaxed);
         serial_println!("[login] session open user=root");
         close_into_session();
-        return;
     }
-    if users::password_unset(n) == Some(true) {
-        serial_println!("[login] first login user={} -> set password (LOGIN14/R65: the row has no credential yet)", core::str::from_utf8(n).unwrap_or("?"));
-        open_set_password(n, true);
-        return;
-    }
+}
+
+/// INPUTSTALL M5: a user's outcome (`verified`, then `session`), applied on the render task.
+fn apply_user(n: &[u8], verified: bool, session: bool) {
     // LOGIN13 M1 (R63: *"this is more an installer thing anyway"*) — the screen CREATES NOBODY. Until this
     // arc an empty store turned the two fields into create-first-user (`users::create_user`, then log in),
     // which is how flight 12 put a create form over a live desktop. A user is made by root with `adduser`
@@ -1162,7 +1189,7 @@ fn submit() {
     // what was typed into a plain field, not a credential, and without it the line cannot be read
     // against the store); nothing else about the attempt is, and the password never touches a serial
     // route on any path — see this module's header.
-    if !users::verify(n, p) {
+    if !verified {
         serial_println!(
             // ⚠ THE SUFFIX MAY NOT SPELL OUT THE CASES IT REFUSES TO DISTINGUISH, and this line learned
             // that from its own gate. The first wording named them — and `x86-login.spec` §7's FORBID,
@@ -1183,13 +1210,13 @@ fn submit() {
         f.focus = Focus::Password;
         return;
     }
-    match users::login(n, p) {
-        Ok(()) => {
+    match session {
+        true => {
             LOGINS.fetch_add(1, Ordering::Relaxed);
             serial_println!("[login] session open user={}", core::str::from_utf8(n).unwrap_or("?"));
             close_into_session();
         }
-        Err(_) => {
+        false => {
             // The credential VERIFIED one line above and the session still did not open — a storage or
             // slot-stamp refusal, which is not a denial and must not be reported as one. Said
             // differently on the glass for the same reason the denial is said identically: a person
@@ -2006,7 +2033,12 @@ pub fn lock() -> bool {
 /// WITHOUT `users::login` (the session never ended: no new epoch, no re-stamp) and without the
 /// furniture branch of [`close_into_session`]; wrong is the login screen's answer.
 fn submit_unlock(n: &[u8], p: &[u8]) {
-    if !users::verify(n, p) {
+    dispatch(Job::Unlock, n, p);
+}
+
+/// INPUTSTALL M5: the lock screen's outcome, applied on the render task.
+fn apply_unlock(n: &[u8], verified: bool) {
+    if !verified {
         serial_println!("[login] denied user={} (locked; one answer for every refusal)", core::str::from_utf8(n).unwrap_or("?"));
         let mut f = FORM.lock();
         f.message = "Login failed";
@@ -2366,4 +2398,243 @@ pub fn notice_typing_fixture() {
         ":: NOTICE: typed_through={} modal={} flash={} -> {} ::",
         if typed { "ok" } else { "lost" }, if modal { "screen" } else { "none" }, if flash { "yes" } else { "none" }, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── INPUTSTALL M5 (rmbp-ledger B375, R88): THE SUBMIT RUNS OFF THE INPUT TASK ───────────────────────────
+//
+// FLIGHT 23: root's Set took `[lag] key→echo ms=1601.8 … comp=1600.3` and the create-user Enter
+// `ms=2175.6 … comp=2174.4` — the KDF (`[users] kdf calibrated … ms=250`, run twice on a create: adduser's
+// hash, then `login`'s verify) and the UnaFS home + store writes, all inside `consume_key` on the RENDER
+// task, which is also the one consumer of the input channel. For those seconds no key, no press and no frame
+// moved. Now the Enter (or the button) COPIES the form, marks it busy ("Working...", painted at once) and hands
+// the slow half to a `login-submit` kernel task on a worker core (`smp::worker_cpu(0)` — never the render
+// core). The worker only COMPUTES (`users::*`: KDF, adduser, verify, login); it touches no window. Its
+// [`Done`] is posted to [`DONE`] and the RENDER task applies it — the same messages, the same take-down /
+// session / installer advance as before — at its next pass (`submit_drain`: the 250 ms pulse, or the next
+// key or press, whichever is first). The worker never paints and the render task never waits.
+//
+// Witness, once per submit: `[login] submit kdf_ms=<n> adduser_ms=<n> on=<worker|render> input_blocked_ms=<n>
+// kind=<root|user|setpw|create|unlock>` — `input_blocked_ms` is the time the RENDER task spent on the submit
+// (the hand-off; the whole submit when it ran inline). Inline (`on=render`) only where no worker core exists,
+// on a non-x86 build, or for a headless form (the `loginst` fixtures drive `consume_key` and read the result
+// synchronously).
+
+#[derive(Clone, Copy)]
+enum Job {
+    SetPw { login_after: bool },
+    Create,
+    Root,
+    User,
+    Unlock,
+}
+
+#[derive(Clone, Copy)]
+enum Outcome {
+    SetPw { login_after: bool, written: Result<(), &'static str>, session: bool },
+    Create { made: Result<(), &'static str>, session: bool },
+    Root { ok: bool },
+    User { verified: bool, session: bool },
+    Unlock { verified: bool },
+}
+
+#[derive(Clone, Copy)]
+struct Work {
+    job: Job,
+    name: [u8; FIELD_MAX],
+    nlen: usize,
+    pw: [u8; FIELD_MAX],
+    plen: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Done {
+    out: Outcome,
+    name: [u8; FIELD_MAX],
+    nlen: usize,
+    kdf_ms: u64,
+    adduser_ms: u64,
+    on_worker: bool,
+    blocked_ms: u64,
+}
+
+static WORK: spin::Mutex<Option<Work>> = spin::Mutex::new(None);
+static DONE: spin::Mutex<Option<Done>> = spin::Mutex::new(None);
+static BUSY: AtomicBool = AtomicBool::new(false);
+static BUSY_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The longest a submit may be on the worker before the form is released (adduser + two KDFs measured 2.2 s).
+const SUBMIT_BOUND_MS: u64 = 15_000;
+/// Submits said on the wire.
+static SUBMITS: AtomicU32 = AtomicU32::new(0);
+
+/// A submit is on the worker (its outcome has not been applied yet).
+pub fn submit_busy() -> bool {
+    BUSY.load(Ordering::Acquire)
+}
+
+fn job_word(j: Job) -> &'static str {
+    match j {
+        Job::SetPw { .. } => "setpw",
+        Job::Create => "create",
+        Job::Root => "root",
+        Job::User => "user",
+        Job::Unlock => "unlock",
+    }
+}
+
+/// The slow half: `users::*` only — no window, no `FORM` (the worker never paints). Returns the outcome and
+/// the time spent in the KDF calls and in adduser.
+fn compute(w: &Work) -> (Outcome, u64, u64) {
+    let n = &w.name[..w.nlen];
+    let p = &w.pw[..w.plen];
+    let ms = crate::arch::ms;
+    match w.job {
+        Job::SetPw { login_after } => {
+            let t = ms();
+            let written = users::set_password_checked(n, p).map_err(users::users_reason);
+            let kdf1 = ms().saturating_sub(t);
+            let t = ms();
+            let session = written.is_ok() && login_after && users::login(n, p).is_ok();
+            (Outcome::SetPw { login_after, written, session }, kdf1 + ms().saturating_sub(t), 0)
+        }
+        Job::Create => {
+            let t = ms();
+            let made = users::installer_create_user(n, p);
+            let add = ms().saturating_sub(t);
+            let t = ms();
+            let session = made.is_ok() && users::login(n, p).is_ok();
+            (Outcome::Create { made, session }, ms().saturating_sub(t), add)
+        }
+        Job::Root => {
+            let t = ms();
+            let ok = users::password_unset(n) == Some(false) && users::login_root(p).is_ok();
+            (Outcome::Root { ok }, ms().saturating_sub(t), 0)
+        }
+        Job::User => {
+            let t = ms();
+            let verified = users::verify(n, p);
+            let session = verified && users::login(n, p).is_ok();
+            (Outcome::User { verified, session }, ms().saturating_sub(t), 0)
+        }
+        Job::Unlock => {
+            let t = ms();
+            let verified = users::verify(n, p);
+            (Outcome::Unlock { verified }, ms().saturating_sub(t), 0)
+        }
+    }
+}
+
+/// The render task's half: apply an outcome exactly as the inline submit used to.
+fn apply(d: &Done) {
+    let n = &d.name[..d.nlen];
+    match d.out {
+        Outcome::SetPw { login_after, written, session } => apply_setpw(n, login_after, written, session),
+        Outcome::Create { made, session } => apply_create(n, made, session),
+        Outcome::Root { ok } => apply_root(ok),
+        Outcome::User { verified, session } => apply_user(n, verified, session),
+        Outcome::Unlock { verified } => apply_unlock(n, verified),
+    }
+}
+
+fn say(d: &Done, job: &str) {
+    SUBMITS.fetch_add(1, Ordering::Relaxed);
+    serial_println!(
+        "[login] submit kdf_ms={} adduser_ms={} on={} input_blocked_ms={} kind={}",
+        d.kdf_ms, d.adduser_ms, if d.on_worker { "worker" } else { "render" }, d.blocked_ms, job
+    );
+}
+
+fn outcome_word(o: &Outcome) -> &'static str {
+    match o {
+        Outcome::SetPw { .. } => "setpw",
+        Outcome::Create { .. } => "create",
+        Outcome::Root { .. } => "root",
+        Outcome::User { .. } => "user",
+        Outcome::Unlock { .. } => "unlock",
+    }
+}
+
+/// Hand a submit over: to the worker when the form is on the glass and a worker core exists, else inline.
+fn dispatch(job: Job, n: &[u8], p: &[u8]) {
+    let t0 = crate::arch::ms();
+    let mut w = Work { job, name: [0; FIELD_MAX], nlen: n.len().min(FIELD_MAX), pw: [0; FIELD_MAX], plen: p.len().min(FIELD_MAX) };
+    w.name[..w.nlen].copy_from_slice(&n[..w.nlen]);
+    w.pw[..w.plen].copy_from_slice(&p[..w.plen]);
+    let windowed = FORM.lock().windowed;
+    if windowed && worker_core().is_some() && !BUSY.swap(true, Ordering::AcqRel) {
+        let _ = DONE.lock().take(); // a late outcome of a released submit is never applied to this one
+        *WORK.lock() = Some(w);
+        // SAFETY: a plain store into our own local; volatile so the scrub of the password copy is not elided.
+        unsafe { core::ptr::write_volatile(&mut w.pw, [0; FIELD_MAX]) };
+        BUSY_T0_MS.store(t0, Ordering::Relaxed);
+        FORM.lock().message = "Working...";
+        repaint();
+        #[cfg(target_arch = "x86_64")]
+        if let Some(cpu) = worker_core() {
+            crate::arch::sched::spawn("login-submit", submit_worker, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+        }
+        return;
+    }
+    let (out, kdf_ms, adduser_ms) = compute(&w);
+    w.pw = [0; FIELD_MAX];
+    let d = Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: false, blocked_ms: crate::arch::ms().saturating_sub(t0) };
+    say(&d, job_word(job));
+    apply(&d);
+}
+
+/// The worker core a submit runs on — never the render core (`smp::worker_cpu`). `None` off x86.
+fn worker_core() -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::smp::worker_cpu(0)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        None
+    }
+}
+
+/// `login-submit`: compute one submit and post its outcome. Exits when done (the task is freed).
+#[cfg(target_arch = "x86_64")]
+fn submit_worker(_: usize) {
+    let Some(mut w) = WORK.lock().take() else {
+        BUSY.store(false, Ordering::Release);
+        return;
+    };
+    let (out, kdf_ms, adduser_ms) = compute(&w);
+    w.pw = [0; FIELD_MAX];
+    *DONE.lock() = Some(Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: true, blocked_ms: 0 });
+}
+
+/// The render task's drain: apply a landed outcome (called from the render loop's pulse and ahead of every
+/// key the screen reads). One relaxed load when nothing is in flight.
+pub fn submit_drain() {
+    if !BUSY.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(d) = DONE.lock().take() else {
+        // A worker that never answers must not leave the form dead: past the bound the form is released and
+        // says so (the late outcome, if it ever lands, is dropped with the busy flag already down).
+        let t0 = BUSY_T0_MS.load(Ordering::Relaxed);
+        if crate::arch::ms().saturating_sub(t0) > SUBMIT_BOUND_MS {
+            let _ = WORK.lock().take();
+            serial_println!("[login] submit on=worker NO OUTCOME after {} ms — the form is released (INPUTSTALL M5)", SUBMIT_BOUND_MS);
+            BUSY.store(false, Ordering::Release);
+            let mut f = FORM.lock();
+            f.message = "Could not finish - try again";
+            clear_passwords(&mut f);
+            drop(f);
+            repaint();
+        }
+        return;
+    };
+    {
+        let mut f = FORM.lock();
+        if f.message == "Working..." {
+            f.message = "";
+        }
+    }
+    say(&d, outcome_word(&d.out));
+    apply(&d);
+    BUSY.store(false, Ordering::Release);
+    repaint();
 }
