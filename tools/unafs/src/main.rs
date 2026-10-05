@@ -584,9 +584,16 @@ async fn main() -> Result<()> {
             file.set_len(size_mb * 1024 * 1024)
                 .context("Failed to set file size")?;
 
-            // Open as block device
-            let device = FileDevice::open(path).context("Failed to open device")?;
-            let fs = FileSystem::format(device, *size_mb).context("Failed to format filesystem")?;
+            // Format through the one UnaFS format entry (AMBER1: `unafs::format`, shared with
+            // Amber Bytes and the installer), then mount the fresh volume to announce it.
+            let mut device = FileDevice::open(path).context("Failed to open device")?;
+            let made = unafs::format(&mut device, &unafs::FormatParams::sized_mb(*size_mb))
+                .context("Failed to format filesystem")?;
+            println!(
+                "   v{} · {} blocks · generation {} · {} free",
+                made.version, made.blocks, made.generation, made.free_blocks
+            );
+            let fs = FileSystem::mount(device).context("Failed to mount the fresh volume")?;
 
             // Notify
             let msg = SMessage::FileEvent {
