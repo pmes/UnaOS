@@ -285,6 +285,8 @@ impl VeinHandler {
             // VEINPROV (B303): the provider the person configured (Principia `vein` namespace);
             // a slot that could not be built still runs the loop and answers each call with the fix.
             let mut brain = provider::ProviderSlot::load();
+            // VEINTURNS (SR42): the conversation as real turns, sent whole on every message.
+            let mut thread = gneiss_pal::api::Thread::new();
             // EMBED (B317): the embedder is its own setting (R81), independent of the chat provider.
             let mut embedder = provider::EmbedSlot::load();
             let mut reembed = reembed::ReEmbedDriver::new(embed_batch_pref());
@@ -327,6 +329,11 @@ impl VeinHandler {
                                     }
                                     ref m if provider::is_vein_pref_change(m) => {
                                         brain = provider::ProviderSlot::load();
+                                        // A rebuilt provider holds no session: the next turn is a fresh one.
+                                        {
+                                            let mut s = state_bg.write().unwrap();
+                                            s.session_status = brain.session_status(&thread);
+                                        }
                                         let embed_tag_before = embedder.tag();
                                         embedder = provider::EmbedSlot::load();
                                         reembed.batch = embed_batch_pref();
@@ -492,6 +499,26 @@ impl VeinHandler {
                                     continue;
                                 }
 
+                                // VEINTURNS (SR42): `/new` forgets the conversation (and the provider's
+                                // session); `/undo` drops the last exchange — an edit is `/undo` + resend.
+                                if user_input_text == "NEW_CONVERSATION" || user_input_text == "UNDO_TURN" {
+                                    let line = if user_input_text == "NEW_CONVERSATION" {
+                                        thread.clear();
+                                        brain.reset_session();
+                                        ":: BRAIN :: NEW CONVERSATION :: the next message starts a fresh session\n".to_string()
+                                    } else if thread.undo() {
+                                        format!(":: BRAIN :: UNDO :: last exchange dropped ({} left); the next message starts a fresh session\n", thread.exchanges())
+                                    } else {
+                                        ":: BRAIN :: UNDO :: nothing to undo\n".to_string()
+                                    };
+                                    {
+                                        let mut s = state_bg.write().unwrap();
+                                        s.session_status = format!("session=new · turns={}", thread.exchanges());
+                                    }
+                                    console_lines(&state_bg, &synapse_loop, vec![line]).await;
+                                    continue;
+                                }
+
                                 if user_input_text.starts_with("SAVE_DIRECTIVE:") {
                                     let dir_text = user_input_text["SAVE_DIRECTIVE:".len()..].to_string();
                                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
@@ -579,18 +606,27 @@ impl VeinHandler {
                                         }
                                         // END JIT MATRIX EVALUATION
 
-                                        // VEINPROV (B303): system prompt as the request's system, the prompt as the turn.
+                                        // VEINTURNS (SR42): the system prompt alone in `system`, every earlier turn
+                                        // its own message, this prompt the last one (was: one turn, history in `system`).
                                         let turn_text = if payload.prompt.trim().is_empty() {
                                             "[System: User provided multimodal input without text.]".to_string()
                                         } else {
                                             payload.prompt.clone()
                                         };
-                                        let request = brain.request(Some(system_builder), parse_multimodal_text(&turn_text));
+                                        let turn_parts = parse_multimodal_text(&turn_text);
+                                        let request = brain.turn(Some(system_builder), &thread, turn_parts.clone());
 
                                         let _ = synapse_loop.fire_async(SMessage::NetworkState("network-transmit-receive-symbolic".to_string())).await;
 
                                         match brain.generate(&request).await {
                                             Ok(reply) => {
+                                                // The reply text exactly as streamed, so a session-keeping provider
+                                                // recognises its own conversation next turn. A blank reply (a refusal)
+                                                // is not recorded: no provider accepts an empty assistant turn.
+                                                if !reply.text.trim().is_empty() {
+                                                    thread.record(turn_parts, &reply.text);
+                                                }
+                                                let session_status = brain.session_status(&thread);
                                                 let response = provider::render_reply(&reply);
                                                 let usage = reply.usage;
                                                 let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
@@ -605,6 +641,7 @@ impl VeinHandler {
                                                     }
                                                     let (i, o) = (usage.input_tokens as i32, usage.output_tokens as i32);
                                                     s.token_usage = (i, o, i.saturating_add(o));
+                                                    s.session_status = session_status;
                                                     s.sidebar_status = WolfpackState::Idle;
                                                 }
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
@@ -635,7 +672,8 @@ impl VeinHandler {
 
                                                 let ai_response_clone = response.clone();
                                                 let _tx_inner = synapse_clone.clone();
-                                                let engram_provider = brain.provider();
+                                                // VEINTURNS (SR42): the side instance — never the conversation's session.
+                                                let engram_provider = brain.side_provider();
                                                 let engram_embedder = embedder.clone();
                                                 tokio::spawn(async move {
                                                     if let Ok(engram_brain) = engram_provider {
@@ -884,7 +922,9 @@ impl AppHandler for VeinHandler {
             bandy::SMessage::Input { target: _, text } => {
                 let trimmed = text.trim();
 
-                if trimmed == "/wolf" {
+                if trimmed == "/new" || trimmed == "/undo" {
+                    let _ = self.tx.send(if trimmed == "/new" { "NEW_CONVERSATION" } else { "UNDO_TURN" }.to_string());
+                } else if trimmed == "/wolf" {
                     {
                         let mut s = self.app_state.write().unwrap();
                         s.sidebar_status = WolfpackState::Idle;
@@ -960,6 +1000,11 @@ impl AppHandler for VeinHandler {
             }
             bandy::SMessage::LoadHistory { offset } => {
                 let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
+            }
+            // VEINTURNS (SR42): a Settings surface's preference write arrives on the UI
+            // channel; it is Principia's verb, so it goes onto the bus for Principia.
+            msg @ bandy::SMessage::Principia(bandy::PrincipiaCommand::PrefSet { .. }) => {
+                self.synapse.fire(msg);
             }
             bandy::SMessage::UpdateMatrixSelection(node_ids) => {
                 let mut s = self.app_state.write().unwrap();

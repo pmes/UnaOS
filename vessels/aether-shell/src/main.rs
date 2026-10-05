@@ -1,6 +1,13 @@
 use std::thread;
 use tokio::task::LocalSet;
-use bandy::{SMessage, Synapse};
+use bandy::{FacetCommand, FacetView, Origin, SMessage, Synapse};
+
+/// Receipts the shell stamps on the requests it delegates to Facet: `'A'` in the top byte.
+const FACET_RECEIPT_TAG: u64 = (b'A' as u64) << 56;
+
+fn is_ours(c: &FacetCommand) -> bool {
+    c.receipt_id().is_some_and(|r| r >> 56 == FACET_RECEIPT_TAG >> 56)
+}
 // use quartzite::browser::bootstrap_browser;
 use aether::AetherEngine;
 
@@ -45,9 +52,28 @@ fn coalesce(batch: Vec<SMessage>) -> Vec<SMessage> {
 
 fn main() {
     let synapse = Synapse::new();
+    // Stria's media service on the shell's bus: it answers the engine's `MediaPoster` /
+    // `PlayMedia` / ... with `MediaOpened` / `MediaFrame` / `MediaEnded` / `MediaError`
+    // (AETHERVIDEO, LEDGER SR39). Kept alive for the life of the process.
+    let _stria_media = stria::media_bus::MediaService::spawn(synapse.clone(), 60, true);
     
     let engine_tx = synapse.clone();
     let mut engine_rx = synapse.subscribe();
+
+    // SR29: images are Facet's. The shell serves the Images handler on its own Synapse, and a
+    // navigation to a local image is DELEGATED to it (open, render at the viewport size, blit)
+    // instead of being fetched and laid out as a page.
+    {
+        let facet_rx = synapse.subscribe();
+        let facet_tx = synapse.clone();
+        thread::Builder::new()
+            .name("facet".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(facet::serve(facet_tx, facet_rx, facet::Facet::new()));
+            })
+            .expect("spawn facet thread");
+    }
     
     // Spawn the Engine Thread. Big stack: boa's parser/interpreter is
     // recursive-descent and real-world page bundles nest deeply — the
@@ -91,6 +117,8 @@ fn main() {
             // point below, off the critical path).
             let mut last_favicon: Option<String> = None;
             let mut pending_favicon: Option<String> = None;
+            let mut facet_receipts: u64 = 0;
+            let mut facet_url: Option<String> = None;
 
             loop {
                 tokio::select! {
@@ -124,6 +152,35 @@ fn main() {
                         }
                         for msg in coalesce(batch) {
                             match msg {
+                                SMessage::OpenDocument { url } if FacetCommand::local_image_path(&url).is_some() => {
+                                    facet_receipts += 1;
+                                    let path = FacetCommand::local_image_path(&url).unwrap_or_default();
+                                    facet_url = Some(url);
+                                    engine_tx.fire(SMessage::Facet(FacetCommand::ImageOpen {
+                                        receipt_id: FACET_RECEIPT_TAG | facet_receipts,
+                                        principal: Origin::LocalUser("aether".into()),
+                                        path,
+                                    }));
+                                }
+                                SMessage::Facet(FacetCommand::ImageOpened { receipt_id, handle, .. }) if receipt_id >> 56 == FACET_RECEIPT_TAG >> 56 => {
+                                    engine_tx.fire(SMessage::Facet(FacetCommand::ImageRender {
+                                        receipt_id,
+                                        handle,
+                                        width: engine.width.min(facet::MAX_VIEWPORT),
+                                        height: engine.height.min(facet::MAX_VIEWPORT),
+                                        view: FacetView::default(),
+                                    }));
+                                }
+                                SMessage::Facet(FacetCommand::ImageRendered { receipt_id, width, height, rgba, .. }) if receipt_id >> 56 == FACET_RECEIPT_TAG >> 56 => {
+                                    engine_tx.fire(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels: rgba });
+                                    if let Some(u) = facet_url.take() {
+                                        engine_tx.fire(SMessage::BrowserUrlChanged(u));
+                                    }
+                                }
+                                SMessage::Facet(ref c @ FacetCommand::ImageError { ref message, .. }) if is_ours(c) => {
+                                    let url = facet_url.take().unwrap_or_default();
+                                    engine.load_error_page(&url, message);
+                                }
                                 SMessage::OpenDocument { url } => {
                                     match aether::net::fetch_page(&url).await {
                                         Ok(page) => {
@@ -164,11 +221,14 @@ fn main() {
                                 SMessage::BrowserClick(x, y) => {
                                     engine.handle_event(aether::api::events::Event::MouseDown(x, y));
                                     engine.handle_event(aether::api::events::Event::MouseUp(x, y));
-                                    // A media-element click stages a play request:
-                                    // hand the page's own stream to Stria.
-                                    if let Some((url, title, mime)) = engine.take_pending_media() {
-                                        engine_tx.fire(SMessage::PlayMedia { url, title, mime });
-                                    }
+                                }
+                                // Stria's replies for the page's <video>/<audio>: a frame
+                                // marks its box damaged; the next tick paints and blits it.
+                                ref m @ (SMessage::MediaOpened { .. }
+                                | SMessage::MediaFrame { .. }
+                                | SMessage::MediaEnded { .. }
+                                | SMessage::MediaError { .. }) => {
+                                    engine.on_media_message(m);
                                 }
                                 SMessage::BrowserResize(w, h) => {
                                     engine.handle_event(aether::api::events::Event::Resize(w, h));
@@ -206,6 +266,11 @@ fn main() {
                             }
                         }
                     }
+                }
+                // Media requests the turn queued (posters on load, play/pause on a click,
+                // stops on navigation) go to Stria — the page's own streams, no site code.
+                for req in engine.take_media_requests() {
+                    engine_tx.fire(req);
                 }
                 // One choke point for the address bar: whatever the last turn
                 // of the loop did — link click, form submit, Back, Forward,

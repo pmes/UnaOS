@@ -195,8 +195,14 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         pointers.pulse_icon.remove_css_class("thinking-pulse");
                     }
                 },
-                GuiUpdate::TokenUsage(p, c, t) => {
-                    let text = format!("Tokens: IN: {} | OUT: {} | TOTAL: {}", p, c, t);
+                GuiUpdate::TokenUsage(p, c, t, session) => {
+                    // VEINTURNS (SR42): the status row also says whether the provider's
+                    // session was resumed or started fresh (`session=resumed · turns=3`).
+                    let mut text = format!("Tokens: IN: {} | OUT: {} | TOTAL: {}", p, c, t);
+                    if !session.is_empty() {
+                        text.push_str(" | ");
+                        text.push_str(&session);
+                    }
                     pointers.token_label.set_text(&text);
                 }
                 GuiUpdate::ActiveDirective(d) => {

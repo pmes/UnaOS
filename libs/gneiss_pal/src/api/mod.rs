@@ -18,13 +18,15 @@
 //!
 //! Vein talks to whichever provider the person configured through one trait,
 //! [`ModelProvider`]. Today: [`ClaudeProvider`] (Anthropic Messages API, raw
-//! HTTP) and [`GeminiProvider`] (Vertex AI with gcloud ADC, or the Generative
-//! Language API with a key). Nothing is hardwired: [`ProviderConfig`] comes
+//! HTTP), [`GeminiProvider`] (Vertex AI with gcloud ADC, or the Generative
+//! Language API with a key) and [`ClaudeCodeProvider`] (the installed Claude
+//! Code CLI on a subscription, CLAUDECODE SR38). Nothing is hardwired: [`ProviderConfig`] comes
 //! from Principia's preferences (namespace `vein`) and the key from the env var
 //! a preference names. [`Content`]/[`Part`] are Vein's message parts (Gemini
 //! wire shape); each provider documents what it does with an attachment.
 
 pub mod claude;
+pub mod claudecode;
 pub mod embed;
 pub mod format;
 pub mod gemini;
@@ -33,12 +35,14 @@ pub mod local;
 pub mod provider;
 pub mod retry;
 pub mod sse;
+pub mod thread;
 #[cfg(test)]
 mod tests;
 
 use serde::{Deserialize, Serialize};
 
 pub use claude::ClaudeProvider;
+pub use claudecode::{CLAUDECODE_DEFAULT_BIN, CLAUDECODE_DEFAULT_MODEL, ClaudeCodeProvider, RunInfo};
 pub use embed::{
     EmbedConfig, EmbedKind, Embedder, LOCAL_DEFAULT_EMBED_MODEL, NoEmbedder, RECALL_OFF_NO_EMBEDDER, build_embedder,
     build_embedder_with_env, known_dims, provider_label,
@@ -50,6 +54,8 @@ pub use provider::{
     build_provider_with_env,
 };
 pub use retry::RetryPolicy;
+pub use thread::{THREAD_KEEP, THREAD_MAX, Thread};
+pub use provider::{SessionInfo, menu_choice_prefs, probe_provider, provider_status};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Content {

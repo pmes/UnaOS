@@ -58,6 +58,9 @@
 //! the callback only ever writes an atomic, and the cadence task turns that
 //! into bus traffic on a calm ~30 Hz beat.
 
+pub mod media;
+pub mod media_bus;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

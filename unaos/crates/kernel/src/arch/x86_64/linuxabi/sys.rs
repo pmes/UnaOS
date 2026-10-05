@@ -616,7 +616,7 @@ fn do_poll(p: &mut LinuxProc, fds_va: u64, n: u64, timeout_ms: i64) -> i64 {
         }
         let fd = i32::from_le_bytes([e[0], e[1], e[2], e[3]]);
         let ev = i16::from_le_bytes([e[4], e[5]]);
-        let rev: i16 = if fd < 0 { 0 } else { match get(p, fd as u64) { Some(d) => poll_ready(&d, ev), None => 32 /* POLLNVAL */ } };
+        let rev: i16 = if fd < 0 { 0 } else { match get(p, fd as u64) { Some(d) => poll_ready(&d, ev) & (ev | 8 | 16), None => 32 /* POLLNVAL */ } }; // SELFBUILD4: revents = asked | ERR | HUP (Rust std polls fds 0-2 with events=0 and expects 0)
         e[6..8].copy_from_slice(&rev.to_le_bytes());
         if rev != 0 {
             ready += 1;
@@ -983,6 +983,9 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
         }
         102 | 104 | 107 | 108 | 105 | 106 | 113 | 114 => 0,
         74 | 75 => 0, // fsync / fdatasync: writes are already write-through
+        25 => super::remap::mremap(p, a[0], a[1], a[2], a[3], a[4]), // SELFBUILD5: grow in place / move the VMA's leaves
+        131 => super::remap::sigaltstack(p, info, ktop, a[0], a[1]), // SELFBUILD5: per thread, honoured at delivery
+        309 => super::remap::getcpu(p, a[0], a[1]), // SELFBUILD5
         _ => match super::sys2::handle(p, info, nr, a) {
             Some(r) => r,
             None => {
