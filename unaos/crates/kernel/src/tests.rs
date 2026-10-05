@@ -129,10 +129,8 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold)
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold)
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win(); ensure_ring3abi();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
+    ensure_ring3win(); ensure_ring3abi(); // RING3WIN, RING3ABI2 (merge12 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::shotmask::ensure_tests(); crate::video::blitter::ensure_tests(); crate::prof::ensure_tests(); // GLASSEYES (B343): `tests shot`. KCOMP (B321): `tests blitter`. PROFILE (B331): `tests prof`.
@@ -386,13 +384,28 @@ pub fn defer_fast(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
         defer(name, f);
     }
     true
+}
+
 /// NETCLOCK (B335): register `tests netclock` (5 s idle on a live USB link: polls/s, tx/s, the stack-side
 /// xHCI loan hold) exactly once on an x86 smolnet + usbnet build.
-fn ensure_netclock() {
+fn ensure_netclock() { ensure_netclock_arm();
     #[cfg(all(feature = "smolnet", feature = "usbnet", target_arch = "x86_64"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("netclock", crate::smolnet::netclock_selftest); }
+    }
+}
+
+/// ARMNET (B346): register `tests netclock` on an aarch64 NET6 build (the persistent stack's 5 s idle: polls/s,
+/// tx/s; SKIP with no NIC or no link). Called from `ensure_netclock` (same-line fold) so the x86 arm is untouched.
+fn ensure_netclock_arm() {
+    #[cfg(all(feature = "net6", target_arch = "aarch64"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("netclock", crate::net_phy::net6::netclock_selftest); }
+    }
+}
+
 /// RING3ABI2 (B333): register `tests ring3abi` exactly once — x86, and aarch64 builds with an EL0 layer.
 fn ensure_ring3abi() {
     #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]

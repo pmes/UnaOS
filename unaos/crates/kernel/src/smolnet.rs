@@ -432,14 +432,9 @@ static SOCK_GEN: [AtomicU32; NSOCK] = [const { AtomicU32::new(0) }; NSOCK];
 /// ~1000x the wall and the link carried a DISCOVER/ARP storm (boot 20: tx=58380, 269/s, nothing received).
 /// `clock::uptime_ms` is the TSC-backed monotonic (it advances with IF clear, unlike the APIC tick); the
 /// raw TSC over the `hw_wait_budget` rate stands in before calibration. Clamped never to step back.
-static LAST_NOW_MS: AtomicI64 = AtomicI64::new(0);
+/// ARMNET (B346): the body moved to `clock::stack_ms`, the one stack clock both arches share.
 fn now_ms() -> i64 {
-    let raw = match crate::clock::uptime_ms() {
-        Some(m) => m as i64,
-        None => (crate::arch::now_cycles() / (crate::arch::hw_wait_budget() / 2000).max(1)) as i64,
-    };
-    let prev = LAST_NOW_MS.fetch_max(raw, Ordering::Relaxed);
-    raw.max(prev)
+    crate::clock::stack_ms()
 }
 /// NETCLOCK M2: when smoltcp next asked to be polled (`now_ms` scale; 0 = now). Written by `poll_now`
 /// from `Interface::poll_delay`; `kick` brings it forward after a socket enqueue.
