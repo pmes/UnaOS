@@ -218,7 +218,7 @@ sc = full_map(sc_text, 'Unknown')
 sc = [sc_alias.get(v, v) for v in sc]
 scripts = sorted(set(sc_alias.values()))
 # Zyyy (Common), Zinh (Inherited), Zzzz (Unknown) first so their codes are stable.
-for s in ['Zzzz', 'Zinh', 'Zyyy']:
+for s in ['Zyyy', 'Zinh', 'Zzzz']:
     scripts.remove(s)
     scripts.insert(0, s)
 sidx = {s: i for i, s in enumerate(scripts)}

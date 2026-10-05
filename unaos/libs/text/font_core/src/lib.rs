@@ -29,12 +29,15 @@ pub mod cmap;
 pub mod fmath;
 pub mod font;
 pub mod glyf;
+pub mod grapheme;
 pub mod layout;
 pub mod linebreak;
+pub mod normalize;
 pub mod path;
 mod post_names;
 pub mod raster;
 mod reader;
+pub mod script;
 pub mod shape;
 pub mod ucd;
 
