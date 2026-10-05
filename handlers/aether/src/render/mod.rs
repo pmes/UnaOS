@@ -1828,15 +1828,21 @@ pub fn render_frame(
                     let face = crate::fonts::face(&inherited.sel());
                     if let Some(font) = face.or(*font) {
                         let adv = inherited.advancer();
+                        // A value script (or the user) set is the control's value (the dirty value
+                        // flag, HTML §4.10.5.4); the attribute is only its default.
+                        let dirty = crate::js::control_value(dom_node);
+                        let select_label = (tag == "select")
+                            .then(|| crate::layout::select_selected_option(dom_node).map(|(_, l)| l))
+                            .flatten();
                         let attrs = el.attributes.borrow();
                         // A <select> paints the SELECTED OPTION'S TEXT, not
                         // its submit value: layout publishes the visible label
                         // as data-aether-label, so "English" shows where the
                         // value attribute would only say "en".
-                        let shown = (tag == "select")
-                            .then(|| attrs.get("data-aether-label"))
-                            .flatten()
+                        let shown = select_label
+                            .as_deref()
                             .filter(|v| !v.is_empty())
+                            .or_else(|| dirty.as_deref())
                             .or_else(|| attrs.get("value"))
                             .filter(|v| !v.is_empty());
                         let is_placeholder = shown.is_none();

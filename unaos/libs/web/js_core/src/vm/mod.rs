@@ -132,6 +132,11 @@ pub struct Vm {
     /// Limit on heap cells (bounded-memory fuzzing): exceeding it throws a RangeError.
     pub max_cells: usize,
     pub async_counter: u64,
+    /// HostPromiseRejectionTracker support for embeddings (HTML §8.1.5.7 "about-to-be-notified rejected
+    /// promises list"): when set, promises rejected without a handler are kept here (strongly — they are
+    /// GC roots) until a handler is attached or the host drains the list at its microtask checkpoint.
+    pub track_rejections: bool,
+    pub rejected_unhandled: Vec<Obj>,
 }
 
 pub(crate) fn wk_sym(desc: &str) -> Sym {
@@ -188,6 +193,8 @@ impl Vm {
             last_positions: Vec::new(),
             max_cells: usize::MAX,
             async_counter: 0,
+            track_rejections: false,
+            rejected_unhandled: Vec::new(),
         };
         let r = vm.create_realm();
         vm.cur_realm = r;
@@ -296,6 +303,7 @@ impl Vm {
             t.args.iter().for_each(|a| push(a, &mut roots));
         }
         roots.extend_from_slice(&self.kept_alive);
+        roots.extend_from_slice(&self.rejected_unhandled);
         for (_, m) in &self.modules {
             roots.push(*m);
         }

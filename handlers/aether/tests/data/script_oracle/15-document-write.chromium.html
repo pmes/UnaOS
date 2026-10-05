@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>15 document.write</title></head>
+<body>
+<div id="before">before</div>
+<script>
+document.write('<p id="w1">written <b>one</b></p>');
+document.write('<p id="w2">', 'two parts', '</p>');
+document.writeln('<span id="w3">line</span>');
+var found = document.getElementById('w1') !== null;
+document.write('<p id="sync">found-during-script=' + found + '</p>');
+document.write('<script>document.write("<i id=nested>nested write</i>");<\/script>');
+document.write('<p id="after-nested">nested exists: ' + (document.getElementById('nested') !== null) + '</p>');
+</script><p id="w1">written <b>one</b></p><p id="w2">two parts</p><span id="w3">line</span>
+<p id="sync">found-during-script=true</p><script>document.write("<i id=nested>nested write</i>");</script><i id="nested">nested write</i><p id="after-nested">nested exists: true</p>
+<div id="middle">middle</div>
+<script>
+document.write('<script src="15-written.js"><\/script><p id="after-external">' + typeof window.fromWritten + '</p>');
+</script><script src="15-written.js"></script><em id="from-external">from external</em><p id="after-external">undefined</p>
+<p id="end">end: <script>document.write(typeof window.fromWritten);</script>string</p>
+<script>
+var after = document.createElement('div');
+after.id = 'done';
+after.textContent = 'count p=' + document.getElementsByTagName('p').length;
+document.body.appendChild(after);
+</script><div id="done">count p=6</div>
+
+</body></html>

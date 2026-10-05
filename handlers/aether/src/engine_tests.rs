@@ -828,8 +828,7 @@ mod tests {
     /// Reads `expr` off a booted page as a number.
     fn js_num(engine: &mut crate::AetherEngine, expr: &str) -> f64 {
         let js = engine.js_engine.as_mut().expect("page must have booted");
-        let v = js.execute(expr).expect("probe must evaluate");
-        v.to_number(&mut js.context).expect("probe must be numeric")
+        js.eval_number(expr).expect("probe must evaluate to a number")
     }
 
     /// THE incident regression: a `setTimeout` callback that re-arms itself
@@ -867,8 +866,11 @@ mod tests {
         );
         // From here the clock only moves when we move it: each tick must add
         // exactly one generation, no matter how eagerly the callback re-arms.
+        // (Past nesting level 5 HTML clamps the re-arm to 4 ms, so each tick
+        // first moves the clock by that much.)
         crate::event_loop::freeze_clock();
         for i in 1..=5 {
+            crate::event_loop::advance_clock(4);
             engine.tick();
             assert_eq!(
                 js_num(&mut engine, "window.__n"),
@@ -1045,7 +1047,7 @@ mod tests {
                     document.getElementById('x').setAttribute('data-n', String(j.n) + j.method);
                 });
         "#).expect("fetch chain must run");
-        let _ = js.context.run_jobs();
+        js.checkpoint();
         let doc = engine.document.clone().unwrap();
         let x = doc.select("#x").unwrap().next().unwrap();
         assert_eq!(x.attributes.borrow().get("data-n"), Some("7POST"),
@@ -1780,52 +1782,46 @@ mod tests {
         assert_eq!(f[8], "s1", "and it is THAT script, identified by its own attrs");
         assert_eq!(f[9], "/x", "own properties still win over the prototype");
         let later = doc.select("#later").unwrap().next().expect("microtask must run");
+        // HTML "execute the script element" keeps currentScript set through "clean up after running
+        // script", so microtasks the script queued see the element — what Chromium does too
+        // (script oracle page 16).
         assert_eq!(
             later.as_node().text_contents(),
-            "null",
-            "currentScript is null outside a running script"
+            "[object HTMLScriptElement]",
+            "a microtask queued by a running script runs in its checkpoint, currentScript still set"
         );
     }
 
-    /// The fetched-page path: the collected source list is NOT aligned with
-    /// the document's `<script>` elements (a non-JS type sits between them
-    /// here), so `currentScript` has to follow the per-slot ordinal rather
-    /// than the slot index. Getting that wrong hands a script the wrong
-    /// element, which is worse than handing it none.
+    /// The fetched-page path: external sources the shell pre-fetched are found by URL when the parser
+    /// reaches their `<script src>`, inline scripts run from the document's own text, and each sees
+    /// its OWN element as `document.currentScript` (a non-JS script between them takes no turn).
     #[test]
-    fn current_script_follows_the_slot_ordinal_not_the_slot_index() {
+    fn prefetched_external_scripts_run_in_document_order_with_their_own_current_script() {
         let html = r#"<html><body>
-            <script id="s0">A()</script>
+            <script id="s0" src="/a.js"></script>
             <script type="application/ld+json">{"not":"js"}</script>
-            <script id="s2">B()</script>
+            <script id="s1">window.__seen.push(document.currentScript.id);</script>
+            <script id="s2" src="https://cdn.example.com/b.js"></script>
         </body></html>"#;
         let (slots, external) = crate::net::collect_scripts("https://example.com/", html);
-        assert!(external.is_empty());
-        let scripts: Vec<String> = vec![
-            "window.__seen = [document.currentScript.id];".to_string(),
-            "window.__seen.push(document.currentScript.id);".to_string(),
-        ];
-        let script_nodes: Vec<usize> = slots.iter().map(|s| s.ordinal).collect();
-        assert_eq!(script_nodes, vec![0, 2]);
+        assert_eq!(external.len(), 2);
+        assert_eq!(slots.iter().map(|s| s.ordinal).collect::<Vec<_>>(), vec![0, 2, 3]);
         let page = crate::net::Page {
             base_url: "https://example.com/".to_string(),
             html: html.to_string(),
-            sheets: Vec::new(),
-            images: Vec::new(),
-            scripts,
-            script_nodes,
-            favicon: None,
+            scripts: vec![
+                "window.__seen = [document.currentScript.id];".to_string(),
+                "window.__seen.push(document.currentScript.id);".to_string(),
+            ],
+            script_urls: vec!["https://example.com/a.js".to_string(), "https://cdn.example.com/b.js".to_string()],
+            script_nodes: vec![0, 3],
+            ..Default::default()
         };
         let mut engine = crate::AetherEngine::new();
         engine.load_page(page, true);
         let js = engine.js_engine.as_mut().unwrap();
-        let seen = js
-            .execute("window.__seen.join(',')")
-            .unwrap()
-            .to_string(&mut js.context)
-            .unwrap()
-            .to_std_string_escaped();
-        assert_eq!(seen, "s0,s2", "each script saw its OWN element");
+        let seen = js.eval_string("window.__seen.join(',')").unwrap();
+        assert_eq!(seen, "s0,s1,s2", "each script saw its OWN element, in document order");
     }
 
     /// Every decode path must hand the renderer straight-alpha RGBA in the
@@ -1945,30 +1941,30 @@ mod tests {
             }
         }
 
-        // The selected option must reach the control paint/submit path.
+        // The selected option reaches the control paint/submit path — read from the options, never
+        // written into the document (AETHERJS: layout used to insert `value`/`data-aether-label`
+        // attributes, which then showed in the serialized DOM and in script).
         let select = document.select_first("select").unwrap();
-        let attrs = select.attributes.borrow();
-        assert_eq!(attrs.get("value"), Some("en"), "select submits the selected option's value");
         assert_eq!(
-            attrs.get("data-aether-label"),
-            Some("English"),
-            "select paints the selected option's text"
+            layout::select_selected_option(select.as_node()),
+            Some(("en".to_string(), "English".to_string())),
+            "select submits the selected option's value and paints its text"
         );
+        let attrs = select.attributes.borrow();
+        assert_eq!(attrs.get("value"), None, "layout does not mutate the DOM");
+        assert_eq!(attrs.get("data-aether-label"), None, "layout does not mutate the DOM");
     }
 
     // -----------------------------------------------------------------------
     // Process survival: no page may kill the browser
     // -----------------------------------------------------------------------
 
-    /// boa's `RuntimeLimit` error has no opaque JS form: the moment it reaches
-    /// a promise reaction, boa's own `to_opaque` PANICS
-    /// (`new_promise_reaction_job`). That killed the whole process on roughly
-    /// two google-search loads in five. The engine must survive it: the panic
-    /// is caught at the job boundary, the context is poisoned, and the DOM
-    /// stands. The VM ceiling is squeezed here to make the trip deterministic
-    /// — a real page reaches the same code by being large.
+    /// A page that overflows the call stack inside a promise reaction: js_core throws a RangeError
+    /// (catchable, as in every browser), the reaction's derived promise rejects, the chain stops, and
+    /// the engine is neither poisoned nor the process ended. The VM's call-depth ceiling is squeezed to
+    /// make the trip cheap — a real page reaches the same path by recursing deeper.
     #[test]
-    fn test_runtime_limit_in_promise_reaction_does_not_kill_the_process() {
+    fn test_stack_overflow_in_promise_reaction_rejects_the_chain() {
         let mut engine = crate::AetherEngine::new();
         engine.load_html_styled(
             "https://example.com/",
@@ -1978,56 +1974,31 @@ mod tests {
         );
         {
             let js = engine.js_engine.as_mut().unwrap();
-            js.context.runtime_limits_mut().set_stack_size_limit(64);
+            js.vm.max_depth = 64;
             js.execute(
-                "window.__settled = 0;
+                "window.__settled = 0; window.__err = '';
                  Promise.resolve().then(function () {
                      function f(n) { return n <= 0 ? 0 : f(n - 1) + 1; }
                      return f(100000);
-                 }).then(function () { window.__settled = 1; });",
+                 }).then(function () { window.__settled = 1; },
+                         function (e) { window.__err = e.name; });",
             )
             .expect("arming the reaction must run clean");
+            js.vm.max_depth = 1800;
         }
-        assert!(!crate::js::engine_poisoned(), "not poisoned before the job runs");
-
-        // boa 0.21 PANICKED in here; reaching the next line at all is the test.
         engine.tick();
-
-        // boa 0.22 made `into_opaque` fallible, so the limit now comes back to
-        // the job runner as an ordinary `Err` instead of a panic. Either way
-        // the process lives: a caught panic poisons the context (and script is
-        // refused), an ordinary `Err` leaves the engine running — and in both
-        // the reaction chain never reaches its second step.
-        {
-            let js = engine.js_engine.as_mut().unwrap();
-            if crate::js::engine_poisoned() {
-                assert!(
-                    js.execute("1 + 1").is_err(),
-                    "a poisoned engine refuses further script instead of running it on a broken VM"
-                );
-            } else {
-                let settled = js.execute("window.__settled").expect("an unpoisoned engine keeps running script");
-                assert_eq!(settled.as_number(), Some(0.0), "the limit must stop the chain, got {settled:?}");
-            }
-        }
-        // The DOM built before the panic is still intact and still renders.
+        assert!(!crate::js::engine_poisoned(), "a stack overflow is an exception, not an engine panic");
+        let js = engine.js_engine.as_mut().unwrap();
+        assert_eq!(js.eval_number("window.__settled").unwrap(), 0.0, "the overflow must stop the chain");
+        assert_eq!(js.eval_string("window.__err").unwrap(), "RangeError", "the rejection carries a RangeError");
         let document = engine.document.as_ref().expect("document survives");
-        assert!(
-            document.select_first("#x").is_ok(),
-            "the DOM must render as it stands after the limit trips"
-        );
-        crate::js::clear_poison();
+        assert!(document.select_first("#x").is_ok(), "the DOM is intact");
     }
 
-    /// The other half of the same story. `RuntimeLimit` is *uncatchable* in JS
-    /// (boa 0.21 `JsNativeErrorKind::is_catchable`), so a page's own `catch`
-    /// never sees it and it propagates straight out to whichever Rust caller
-    /// is nearest. Where that caller is ours — the timer dispatcher — it is an
-    /// ordinary `Err`: ledgered, generation continues, nothing poisoned. Only
-    /// boa's internal promise-job caller turns it into a panic, which is why
-    /// the guard exists and why it must not fire here.
+    /// A stack overflow inside a timer callback is an ordinary, catchable RangeError (the page's own
+    /// catch sees it), and the rest of the timer generation still runs.
     #[test]
-    fn test_runtime_limit_in_timer_callback_is_an_ordinary_error() {
+    fn test_stack_overflow_in_timer_callback_is_catchable() {
         let mut engine = crate::AetherEngine::new();
         engine.load_html_styled(
             "https://example.com/",
@@ -2038,35 +2009,51 @@ mod tests {
         crate::event_loop::freeze_clock();
         {
             let js = engine.js_engine.as_mut().unwrap();
-            js.context.runtime_limits_mut().set_stack_size_limit(64);
             js.execute(
                 "window.__caught = 0; window.__after = 0;
                  setTimeout(function () {
                      try {
                          (function f(n) { return n <= 0 ? 0 : f(n - 1) + 1; })(100000);
-                     } catch (e) { window.__caught = 1; }
+                     } catch (e) { window.__caught = e instanceof RangeError ? 1 : 2; }
                  }, 10);
                  setTimeout(function () { window.__after = 1; }, 10);",
             )
             .expect("arming must run clean");
         }
         crate::event_loop::advance_clock(10);
-
         engine.tick();
+        assert!(!crate::js::engine_poisoned(), "no engine panic");
+        assert_eq!(js_num(&mut engine, "window.__caught"), 1.0, "the page's own catch sees the RangeError");
+        assert_eq!(js_num(&mut engine, "window.__after"), 1.0, "the generation continues");
+    }
 
+    /// A runaway task (`while (true) {}`) is terminated by the per-task instruction budget: reported in
+    /// the ledger, uncatchable by the page, and the next task still runs on a live engine.
+    #[test]
+    fn test_runaway_task_is_terminated_by_the_budget() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html_styled("https://example.com/", "<html><body>a</body></html>", &[], true);
+        crate::event_loop::freeze_clock();
+        crate::ledger::reset();
+        {
+            let js = engine.js_engine.as_mut().unwrap();
+            js.execute(
+                "window.__caught = 0; window.__after = 0;
+                 setTimeout(function () { try { while (true) {} } catch (e) { window.__caught = 1; } }, 5);
+                 setTimeout(function () { window.__after = 1; }, 5);",
+            )
+            .unwrap();
+        }
+        crate::event_loop::advance_clock(5);
+        crate::js::set_task_budget(2_000_000);
+        engine.tick();
+        crate::js::set_task_budget(crate::js::TASK_BUDGET);
+        assert!(!crate::js::engine_poisoned());
+        assert_eq!(js_num(&mut engine, "window.__caught"), 0.0, "termination is uncatchable");
+        assert_eq!(js_num(&mut engine, "window.__after"), 1.0, "the next task runs");
         assert!(
-            !crate::js::engine_poisoned(),
-            "a limit trip our own dispatcher catches is an error, not an engine panic"
-        );
-        assert_eq!(
-            js_num(&mut engine, "window.__caught"),
-            0.0,
-            "RuntimeLimit is uncatchable in JS: the page's own catch must not see it"
-        );
-        assert_eq!(
-            js_num(&mut engine, "window.__after"),
-            1.0,
-            "one callback hitting the ceiling must not stop the rest of the generation"
+            crate::ledger::snapshot().contains(crate::ledger::ApiCategory::Js, "js-task-terminated:timer-callback"),
+            "the termination is ledgered"
         );
     }
 
@@ -2132,7 +2119,7 @@ mod tests {
                  })();",
             )
             .expect("registration must run clean");
-            crate::js::drain_raf(&mut js.context);
+            js.drain_raf();
         }
         assert_eq!(
             js_num(&mut engine, "window.__n"),

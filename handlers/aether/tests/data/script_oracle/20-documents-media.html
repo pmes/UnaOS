@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>20 documents and media</title></head>
+<body>
+<video id="v" width="160" height="90"></video>
+<audio id="au" muted></audio>
+<ul id="log"></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var v = document.getElementById('v');
+log('video: ' + (v instanceof HTMLMediaElement) + ' ' + v.paused + ' ' + v.currentTime + ' ' + isNaN(v.duration) + ' ' + v.readyState + ' ' + v.networkState + ' w=' + v.width + ' ' + v.muted + ' ' + v.volume);
+v.volume = 0.25;
+v.muted = true;
+log('volume/muted: ' + v.volume + ' ' + v.muted + ' attr=' + v.hasAttribute('muted'));
+var e = null; try { v.volume = 2; } catch (x) { e = x.name; }
+log('volume range: ' + e);
+log('canPlayType: [' + v.canPlayType('video/x-unknown') + '] ' + HTMLMediaElement.HAVE_ENOUGH_DATA + ' ' + HTMLMediaElement.NETWORK_NO_SOURCE);
+var au = document.getElementById('au');
+log('audio: ' + au.muted + ' ' + au.defaultMuted + ' ' + (au instanceof HTMLAudioElement) + ' ' + au.controls);
+au.controls = true; au.loop = true; au.autoplay = false;
+var p = v.play();
+log('play returns promise: ' + (p instanceof Promise));
+p.then(function () { log('play resolved'); }, function (err) { log('play rejected: ' + err.name); });
+var doc = document.implementation.createHTMLDocument('made');
+doc.body.innerHTML = '<p class="x">in other doc</p>';
+log('createHTMLDocument: ' + doc.title + ' ' + doc.body.firstChild.textContent + ' ' + (doc.body.firstChild.ownerDocument === doc) + ' ' + doc.documentElement.outerHTML.length);
+var imported = document.importNode(doc.body.firstChild, true);
+log('importNode: ' + (imported.ownerDocument === document) + ' ' + (doc.body.firstChild !== null));
+var adopted = document.adoptNode(doc.body.firstChild);
+document.body.appendChild(adopted);
+log('adoptNode: ' + (adopted.ownerDocument === document) + ' ' + doc.body.childNodes.length);
+var parsed = new DOMParser().parseFromString('<!DOCTYPE html><title>T</title><div id="q">parsed <i>x</i></div><script>window.parsedRan = true<\/script>', 'text/html');
+log('DOMParser: ' + parsed.title + ' ' + parsed.getElementById('q').textContent + ' ' + parsed.querySelectorAll('i').length + ' ' + (window.parsedRan === true) + ' ' + parsed.doctype.name);
+log('XMLSerializer: ' + new XMLSerializer().serializeToString(parsed.getElementById('q')));
+var dt = document.implementation.createDocumentType('html', '-//W3C//DTD HTML 4.01//EN', 'http://www.w3.org/TR/html4/strict.dtd');
+log('doctype: ' + dt.name + '|' + dt.publicId + '|' + dt.systemId);
+var xd = document.implementation.createDocument(null, 'root', null);
+log('createDocument: ' + xd.documentElement.nodeName + ' ' + xd.documentElement.namespaceURI + ' ' + (xd instanceof XMLDocument));
+var svgEl = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+log('createElementNS: ' + svgEl.namespaceURI + ' ' + svgEl.tagName + ' ' + (svgEl instanceof SVGElement));
+var img = new Image(3, 4);
+log('Image: ' + img.width + ' ' + img.height + ' ' + img.tagName + ' ' + img.outerHTML);
+</script>
+</body></html>

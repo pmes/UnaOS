@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>02 traversal</title></head>
+<body>
+<div id="root"> <p id="a">A</p><!--c--><p id="b">B <em id="em">E</em></p> text <p id="c">C</p></div>
+<ul id="log"></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var root = document.getElementById('root');
+var kids = root.childNodes, els = root.children;
+log('childNodes=' + kids.length + ' children=' + els.length + ' same=' + (root.childNodes === kids));
+root.appendChild(document.createElement('div'));
+log('live after append: ' + kids.length + ' ' + els.length);
+var a = document.getElementById('a'), b = document.getElementById('b'), em = document.getElementById('em');
+log('siblings: ' + a.nextSibling.nodeName + ' ' + a.nextElementSibling.id + ' ' + b.previousElementSibling.id + ' ' + (a.previousSibling.nodeType));
+log('first/last: ' + root.firstChild.nodeName + ' ' + root.lastChild.nodeName + ' ' + root.firstElementChild.id + ' ' + root.lastElementChild.nodeName + ' count=' + root.childElementCount);
+log('parents: ' + em.parentNode.id + ' ' + em.parentElement.id + ' ' + document.documentElement.parentNode.nodeName + ' ' + document.documentElement.parentElement);
+log('contains: ' + root.contains(em) + ' ' + em.contains(root) + ' ' + root.contains(root) + ' ' + root.contains(null));
+var P = Node.DOCUMENT_POSITION_PRECEDING, F = Node.DOCUMENT_POSITION_FOLLOWING;
+log('cdp: ' + a.compareDocumentPosition(b) + ' ' + b.compareDocumentPosition(a) + ' ' + root.compareDocumentPosition(em) + ' ' + em.compareDocumentPosition(root) + ' ' + a.compareDocumentPosition(a) + ' ' + P + ' ' + F);
+var detached = document.createElement('div');
+var inner = document.createElement('span');
+detached.appendChild(inner);
+log('root node: ' + (inner.getRootNode() === detached) + ' ' + (em.getRootNode() === document) + ' connected=' + inner.isConnected + ',' + em.isConnected);
+log('ownerDocument: ' + (em.ownerDocument === document) + ' ' + document.ownerDocument + ' ' + (inner.ownerDocument === document));
+var walk = [], n = root.firstChild;
+while (n) { walk.push(n.nodeType === 1 ? n.tagName : n.nodeType === 3 ? '#t' : '#' + n.nodeType); n = n.nextSibling; }
+log('walk: ' + walk.join(' '));
+log('hasChildNodes: ' + root.hasChildNodes() + ' ' + inner.hasChildNodes());
+log('isEqualNode: ' + a.isEqualNode(a.cloneNode(true)) + ' ' + a.isEqualNode(b) + ' isSameNode: ' + a.isSameNode(a));
+var list = [];
+for (var i = 0; i < els.length; i++) list.push(els[i].id || els[i].tagName);
+log('indexed: ' + list.join(',') + ' item(0)=' + els.item(0).id + ' oob=' + els.item(99) + ' named=' + (els.namedItem('c') && els.namedItem('c').id) + ' brackets=' + els['b'].id);
+var it = [];
+for (var x of root.childNodes) if (x.nodeType === 1) it.push(x.nodeName);
+log('iterable: ' + it.join(','));
+root.childNodes.forEach(function (x, i) { if (i === 0) log('forEach first type ' + x.nodeType); });
+log('instanceof: ' + (kids instanceof NodeList) + ' ' + (els instanceof HTMLCollection) + ' ' + Object.prototype.toString.call(kids));
+</script>
+</body></html>

@@ -1,4 +1,5 @@
-use boa_engine::{Context, native_function::NativeFunction};
+use js_core::vm::*;
+use crate::js::idl;
 use std::cell::Cell;
 
 thread_local! {
@@ -68,54 +69,38 @@ fn native_fetch(url: &str, method: &str, body: &str) -> Option<(u16, String, Str
     }
 }
 
-pub fn init(context: &mut Context) {
-    let f = NativeFunction::from_fn_ptr(|_this, args, ctx| {
-        let url = args
-            .first()
-            .cloned()
-            .unwrap_or_default()
-            .to_string(ctx)
-            .unwrap_or_default()
-            .to_std_string_escaped();
-        let method = args
-            .get(1)
-            .cloned()
-            .unwrap_or_default()
-            .to_string(ctx)
-            .map(|s| s.to_std_string_escaped())
-            .unwrap_or_default();
-        let body = args
-            .get(2)
-            .cloned()
-            .unwrap_or_default()
-            .to_string(ctx)
-            .map(|s| s.to_std_string_escaped())
-            .unwrap_or_default();
-        match native_fetch(&url, &method, &body) {
-            Some((status, final_url, text)) => {
-                let o = boa_engine::object::ObjectInitializer::new(ctx)
-                    .property(boa_engine::string::JsString::from("status"), status as i32, boa_engine::property::Attribute::all())
-                    .property(
-                        boa_engine::string::JsString::from("url"),
-                        boa_engine::string::JsString::from(final_url),
-                        boa_engine::property::Attribute::all(),
-                    )
-                    .property(
-                        boa_engine::string::JsString::from("body"),
-                        boa_engine::string::JsString::from(text),
-                        boa_engine::property::Attribute::all(),
-                    )
-                    .build();
-                Ok(o.into())
-            }
-            None => Ok(boa_engine::JsValue::null()),
+fn native_fetch_js(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let a0 = vm.arg(ctx, 0);
+    let url = vm.to_string(&a0)?.to_rust();
+    let a1 = vm.arg(ctx, 1);
+    let method = if a1.is_undefined() { String::new() } else { vm.to_string(&a1)?.to_rust() };
+    let a2 = vm.arg(ctx, 2);
+    let body = if a2.is_undefined() { String::new() } else { vm.to_string(&a2)?.to_rust() };
+    match native_fetch(&url, &method, &body) {
+        Some((status, final_url, text)) => {
+            let o = vm.new_plain_object();
+            vm.create_data_property(o, PropertyKey::from_str("status"), Value::Number(status as f64))?;
+            vm.create_data_property(o, PropertyKey::from_str("url"), idl::s(&final_url))?;
+            vm.create_data_property(o, PropertyKey::from_str("body"), idl::s(&text))?;
+            Ok(Value::Object(o))
         }
-    });
-    context.register_global_callable("__native_fetch".into(), 3, f).unwrap();
+        None => Ok(Value::Null),
+    }
+}
 
-    // The whatwg-shaped wrapper lives in JS: promises, Response.text/json.
-    let _ = context.eval(boa_engine::Source::from_bytes(
-        r#"
+/// Installs `__native_fetch` and the WHATWG-shaped `fetch` / `XMLHttpRequest` wrapper over it.
+pub fn init(vm: &mut Vm) {
+    let f = vm.make_native("__native_fetch", 3, native_fetch_js, false);
+    let g = vm.realm().global;
+    vm.heap.get_mut(g).props.insert(PropertyKey::from_str("__native_fetch"), Prop::data(Value::Object(f), WC));
+    if let Err(e) = vm.run_script_str(PRELUDE) {
+        let m = vm.error_string(&e);
+        crate::ledger::record_js(&format!("fetch-prelude-failed:{m}"));
+    }
+}
+
+/// The whatwg-shaped wrapper: promises, Response.text/json, XHR over the same native layer.
+const PRELUDE: &str = r#"
         globalThis.fetch = function (url, opts) {
             var method = (opts && opts.method) ? String(opts.method) : 'GET';
             var reqBody = (opts && opts.body != null) ? String(opts.body) : '';
@@ -174,6 +159,4 @@ pub fn init(context: &mut Context) {
             fire(r ? 'load' : 'error');
             fire('loadend');
         };
-        "#,
-    ));
-}
+        "#;

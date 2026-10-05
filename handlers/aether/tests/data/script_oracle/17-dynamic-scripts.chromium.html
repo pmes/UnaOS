@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>17 dynamic scripts</title><script src="17-dyn.js"></script></head>
+<body>
+<ul id="log"><li>before-append | inline-dynamic:self | after-append | async-default:true | after-external-append:undefined | empty-appended | text-later | ran-once | external-dynamic-ran:17-dyn.js | onload:yes</li><li>onerror:missing</li></ul>
+<div id="host"><script>window.trace.push("innerHTML-script-ran")</script><script>window.trace.push("ran-once")</script></div>
+<script>
+window.trace = [];
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var s1 = document.createElement('script');
+s1.textContent = 'window.trace.push("inline-dynamic:" + (document.currentScript === s1 ? "self" : document.currentScript));';
+window.trace.push('before-append');
+document.body.appendChild(s1);
+window.trace.push('after-append');
+var s2 = document.createElement('script');
+s2.src = '17-dyn.js';
+s2.onload = function () { window.trace.push('onload:' + window.dynLoaded); };
+window.trace.push('async-default:' + s2.async);
+document.head.appendChild(s2);
+window.trace.push('after-external-append:' + window.dynLoaded);
+document.getElementById('host').innerHTML = '<script>window.trace.push("innerHTML-script-ran")<\/script>';
+var s3 = document.createElement('script');
+document.body.appendChild(s3);
+window.trace.push('empty-appended');
+s3.text = 'window.trace.push("text-later")';
+var moved = document.createElement('script');
+moved.textContent = 'window.trace.push("ran-once")';
+document.body.appendChild(moved);
+document.getElementById('host').appendChild(moved);
+var bad = document.createElement('script');
+bad.src = '17-missing.js';
+bad.onerror = function () { window.badErr = 'onerror:missing'; };
+document.body.appendChild(bad);
+var typed = document.createElement('script');
+typed.type = 'text/x-template';
+typed.textContent = 'window.trace.push("template-ran")';
+document.body.appendChild(typed);
+setTimeout(function () { log(window.trace.join(' | ')); log(window.badErr); }, 50);
+</script><script>window.trace.push("inline-dynamic:" + (document.currentScript === s1 ? "self" : document.currentScript));</script><script>window.trace.push("text-later")</script><script src="17-missing.js"></script><script type="text/x-template">window.trace.push("template-ran")</script>
+
+</body></html>

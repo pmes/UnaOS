@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>16 currentScript and errors</title>
+<script id="head-s">window.seen = [document.currentScript.id + ':' + document.currentScript.tagName];</script>
+</head>
+<body>
+<script id="s1">window.seen.push(document.currentScript.id); setTimeout(function () { window.seen.push('timer:' + document.currentScript); }, 0);</script>
+<script id="syntax">this is not javascript (</script>
+<script id="s2">window.seen.push(document.currentScript.id + ':after-syntax-error');
+Promise.resolve().then(function () { window.seen.push('micro:' + document.currentScript); });</script>
+<script id="thrower">window.seen.push('thrower-start'); undefinedFunctionCall(); window.seen.push('unreachable');</script>
+<script id="s3" src="16-external.js"></script>
+<script id="mod" type="module">window.seen.push('module:' + document.currentScript);</script>
+<ul id="log"></ul>
+<script>
+window.errorEvents = [];
+window.addEventListener('error', function (e) { window.errorEvents.push(e.constructor.name + ':' + e.error.name); });
+setTimeout(function () { null.boom; }, 1);
+window.addEventListener('load', function () {
+  setTimeout(function () {
+    var ul = document.getElementById('log');
+    window.seen.concat(window.errorEvents).forEach(function (s) { var li = document.createElement('li'); li.textContent = s; ul.appendChild(li); });
+  }, 10);
+});
+</script>
+</body></html>

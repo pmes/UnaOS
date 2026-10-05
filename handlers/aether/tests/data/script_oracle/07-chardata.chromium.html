@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>07 character data</title></head>
+<body>
+<p id="p">B4:via textContent:AFlo worlda😀b</p>
+<p id="p2">onetwo<br>three</p><!--changed -- comment--><ul id="log"><li>data: &lt;&lt; ello world length=13 substring= ello</li><li>index error: IndexSizeError</li><li>utf16 length: 4 sub=2</li><li>splitText: [&lt;&lt; el] [lo world] siblings=3 whole=17</li><li>before normalize: 5</li><li>after normalize: 3 first=onetwo</li><li>comment: changed -- comment changed -- comment changed -- comment</li><li>constructors: constructed built true true</li><li>nodeValue: via nodeValue el.nodeValue=null</li><li>textContent: via textContent</li><li>childnode on text: B4:via textContent:AFlo worlda</li></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var t = document.getElementById('p').firstChild;
+t.appendData(' world');
+t.insertData(0, '>> ');
+t.deleteData(3, 1);
+t.replaceData(0, 2, '<<');
+log('data: ' + t.data + ' length=' + t.length + ' substring=' + t.substringData(2, 5));
+var e = null; try { t.substringData(99, 1); } catch (x) { e = x.name; }
+log('index error: ' + e);
+var emoji = document.createTextNode('a😀b');
+log('utf16 length: ' + emoji.length + ' sub=' + emoji.substringData(1, 2).length);
+document.getElementById('p').appendChild(emoji);
+var tail = t.splitText(5);
+log('splitText: [' + t.data + '] [' + tail.data + '] siblings=' + document.getElementById('p').childNodes.length + ' whole=' + tail.wholeText.length);
+var p2 = document.createElement('p');
+p2.id = 'p2';
+p2.appendChild(document.createTextNode('one'));
+p2.appendChild(document.createTextNode(''));
+p2.appendChild(document.createTextNode('two'));
+p2.appendChild(document.createElement('br'));
+p2.appendChild(document.createTextNode('three'));
+document.body.insertBefore(p2, document.getElementById('log'));
+log('before normalize: ' + p2.childNodes.length);
+p2.normalize();
+log('after normalize: ' + p2.childNodes.length + ' first=' + p2.firstChild.data);
+var c = document.createComment('note');
+c.data = 'changed -- comment';
+document.body.insertBefore(c, document.getElementById('log'));
+log('comment: ' + c.data + ' ' + c.nodeValue + ' ' + c.textContent);
+var tx = new Text('constructed');
+var cm = new Comment('built');
+log('constructors: ' + tx.data + ' ' + cm.data + ' ' + (tx instanceof CharacterData) + ' ' + (tx.ownerDocument === document));
+t.nodeValue = 'via nodeValue';
+log('nodeValue: ' + document.getElementById('p').firstChild.data + ' el.nodeValue=' + document.body.nodeValue);
+t.textContent = 'via textContent';
+log('textContent: ' + t.data);
+t.before('B4:');
+t.after(':AF');
+log('childnode on text: ' + document.getElementById('p').textContent.slice(0, 30));
+</script>
+
+</body></html>

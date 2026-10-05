@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>05 classList</title></head>
+<body>
+<p id="p" class="assigned via PutForwards">para</p>
+<p id="q" class="one two">no class</p>
+<ul id="log"><li>initial: 3 [  a b   a c ] item1=b [2]=c oob=null contains b=true</li><li>add: a b c d</li><li>remove: b c d</li><li>toggle: false true true false -&gt; c d e</li><li>replace: true false -&gt; x d e</li><li>iterate: x/d/e 0,1,2 same=true</li><li>errors: SyntaxError InvalidCharacterError</li><li>no attribute created: false</li><li>value set: one two 2 one two</li><li>putforwards: assigned via PutForwards</li><li>toString tag: [object DOMTokenList]</li></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var p = document.getElementById('p'), cl = p.classList;
+log('initial: ' + cl.length + ' [' + cl.value + '] item1=' + cl.item(1) + ' [2]=' + cl[2] + ' oob=' + cl.item(7) + ' contains b=' + cl.contains('b'));
+cl.add('d', 'a');
+log('add: ' + p.className);
+cl.remove('a', 'zzz');
+log('remove: ' + p.className);
+log('toggle: ' + cl.toggle('b') + ' ' + cl.toggle('e') + ' ' + cl.toggle('e', true) + ' ' + cl.toggle('f', false) + ' -> ' + p.className);
+log('replace: ' + cl.replace('c', 'x') + ' ' + cl.replace('nope', 'y') + ' -> ' + p.className);
+var arr = []; for (var t of cl) arr.push(t);
+log('iterate: ' + arr.join('/') + ' ' + Array.from(cl.keys()).join(',') + ' same=' + (p.classList === cl));
+var e1 = null, e2 = null;
+try { cl.add(''); } catch (x) { e1 = x.name; }
+try { cl.add('a b'); } catch (x) { e2 = x.name; }
+log('errors: ' + e1 + ' ' + e2);
+var q = document.getElementById('q');
+q.classList.remove('x');
+log('no attribute created: ' + q.hasAttribute('class'));
+q.classList.toggle('on');
+q.classList.value = 'one two';
+log('value set: ' + q.className + ' ' + q.classList.length + ' ' + String(q.classList));
+p.classList = 'assigned via PutForwards';
+log('putforwards: ' + p.className);
+log('toString tag: ' + Object.prototype.toString.call(cl));
+</script>
+
+</body></html>

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>01 DOM building</title></head>
+<body>
+<div id="app"><p id="first">first</p><p id="last">last</p></div>
+<ul id="log"></ul>
+<script>
+function log(s) { var li = document.createElement('li'); li.textContent = String(s); document.getElementById('log').appendChild(li); }
+var app = document.getElementById('app');
+var h = document.createElement('h2');
+h.appendChild(document.createTextNode('Built by script'));
+app.insertBefore(h, app.firstChild);
+var mid = document.createElement('section');
+mid.id = 'mid';
+mid.textContent = 'middle';
+app.insertBefore(mid, document.getElementById('last'));
+var span = document.createElement('span');
+span.textContent = 'replaced';
+var old = app.replaceChild(span, document.getElementById('first'));
+log('replaced: ' + old.id + ' ' + old.isConnected + ' ' + span.isConnected);
+var deep = app.cloneNode(true), shallow = app.cloneNode(false);
+log('clone: ' + deep.childNodes.length + ' ' + shallow.childNodes.length + ' ' + (deep.firstChild !== app.firstChild));
+var removed = app.removeChild(document.getElementById('last'));
+log('removed: ' + removed.textContent + ' parent=' + removed.parentNode);
+log('types: ' + [document.nodeType, app.nodeType, app.firstChild.firstChild.nodeType, document.createComment('c').nodeType, document.createDocumentFragment().nodeType, document.doctype.nodeType].join(','));
+log('names: ' + [document.nodeName, app.nodeName, h.firstChild.nodeName, document.createComment('x').nodeName, document.createDocumentFragment().nodeName, document.doctype.nodeName].join(','));
+var frag = document.createDocumentFragment();
+for (var i = 0; i < 3; i++) { var b = document.createElement('b'); b.textContent = 'f' + i; frag.appendChild(b); }
+app.appendChild(frag);
+log('fragment emptied: ' + frag.childNodes.length + ' app children: ' + app.children.length);
+app.append('tail-text', document.createElement('hr'));
+app.prepend(document.createComment(' head comment '));
+log('append/prepend: ' + app.childNodes.length + ' first=' + app.firstChild.nodeName + ' last=' + app.lastChild.nodeName);
+var e = null;
+try { app.appendChild(document); } catch (x) { e = x; }
+log('hierarchy: ' + (e && e.name) + ' ' + (e instanceof DOMException) + ' code=' + (e && e.code));
+try { app.insertBefore(document.createElement('i'), document.body); } catch (x) { log('notfound: ' + x.name); }
+try { app.appendChild('text'); } catch (x) { log('typeerror: ' + (x instanceof TypeError)); }
+log('textContent of app: ' + app.textContent);
+</script>
+</body></html>
