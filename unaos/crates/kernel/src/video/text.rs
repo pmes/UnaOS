@@ -38,8 +38,10 @@
 //! * `Body` — the character grid (console, file viewer, editor, Quarry): DejaVu Sans Mono sized so its
 //!   advance fits `font::CELL_W` and its line box `font::CELL_H`; the grid arithmetic of every caller holds.
 //! * `Chrome` — captions, the menu bar, menus, dock tiles: the `system.display.font` family (DejaVu Sans by
-//!   default), proportional, its size DERIVED from the bar's cell (`font::CHROME_CELL_H`), as FONT-METRIC
-//!   ruled for the bitmap face.
+//!   default, bold where the caller asks), proportional, its size DERIVED from the bar's cell as FONT-METRIC
+//!   ruled for the bitmap face: the line box fits `font::CHROME_CELL_H` and the mean a..z advance of the bold
+//!   face fits `font::CHROME_CELL_W`, so the `len * cell_w` budgets the bar, menus and dock were built on keep
+//!   holding (14 px with DejaVu Sans Bold on the 9x20 cell).
 //! * `Ui` — running text that is not a grid (the login form, Settings labels): the `system.display.font`
 //!   family at `system.display.font_size` CSS px x the panel's ppi / 96 (EDID), capped by the body cell.
 
@@ -567,10 +569,10 @@ pub fn fixture() {
         let (mut mid, mut ink) = (false, false);
         for &p in surf.iter() {
             let g = p & 0xFF;
-            if g == 0x20 {
-                ink = true;
+            if g <= 0x60 {
+                ink = true; // a stem: at or near the ink (0x20)
             } else if g != 0xFF {
-                mid = true;
+                mid = true; // partial coverage: anti-aliased
             }
         }
         let ms_per_1000 = if drawn > 0 { ms * 1000 / drawn } else { 0 };
