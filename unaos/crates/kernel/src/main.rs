@@ -12,7 +12,7 @@ use unaos_boot_info::BootInfo;
 #[unsafe(no_mangle)]
 #[cfg(target_arch = "x86_64")]
 pub extern "sysv64" fn _start(boot_info: &'static mut BootInfo) -> ! {
-    kernel_main(boot_info)
+    unaos_kernel::prof::note_boot_stack(); kernel_main(boot_info)
 }
 
 // UEFI aarch64 entry (default): the bootloader hands us a BootInfo with the MMU already on.

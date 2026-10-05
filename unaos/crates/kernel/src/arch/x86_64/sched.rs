@@ -2412,7 +2412,7 @@ fn spawn_inner(
     paint_stack(&mut stack);
     let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], task_trampoline);
 
-    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed); crate::prof::note_task(id, name);
     let task = Box::new(Task {
         id,
         name,
@@ -2699,7 +2699,7 @@ fn spawn_user_inner(
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_GUARD].into_boxed_slice();
     paint_stack(&mut stack);
     let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], user_task_trampoline);
-    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed); crate::prof::note_user_task(id, name);
     let task = Box::new(Task {
         id,
         name,
@@ -2953,7 +2953,7 @@ pub fn spawn_user_thread(
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_GUARD].into_boxed_slice();
     paint_stack(&mut stack);
     let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], user_task_trampoline);
-    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed); crate::prof::note_thread(id, name);
     let task = Box::new(Task {
         id,
         name,
@@ -7734,4 +7734,31 @@ pub fn run_queue_stealable(cpu: usize) -> usize {
 /// (the SMPLOAD witness's `migr=` is the per-window delta of this). One relaxed load.
 pub fn migrations_total() -> u64 {
     STEAL_MOVES.load(Ordering::Relaxed)
+}
+
+/// PROFILE2 (rmbp-ledger B340, M1): `[low, top)` of the stack of the task dispatched on THIS core, or
+/// `None` outside a scheduled task. The sampler's frame walk bounds every frame pointer by it before a
+/// single dereference. Called from the timer ISR (IF=0), so the same-core read of `current` cannot race
+/// its own scheduler's reclaim (the `current_name` shape). `low` is past the guard.
+pub fn current_stack_bounds() -> Option<(u64, u64)> {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: this core's own current task, read with interrupts masked; fields are only read.
+    let st = unsafe { &(*raw).stack };
+    let base = st.as_ptr() as u64;
+    Some((base + STACK_GUARD as u64, base + st.len() as u64))
+}
+
+/// PROFILE2 (B340): a dispatching core other than this one (lowest index), or [`CPU_AUTO`] on a
+/// single-core machine — `tests prof2` places its load task off the shell's core, which a busy-waiting
+/// shell would otherwise starve.
+pub fn other_dispatching_cpu() -> usize {
+    let here = percpu::this_cpu().cpu_index as usize;
+    (0..MAX_CPUS).find(|&c| c != here && cpu_dispatching(c)).unwrap_or(CPU_AUTO)
 }

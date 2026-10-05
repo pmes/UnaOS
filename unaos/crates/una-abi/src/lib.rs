@@ -1499,3 +1499,100 @@ mod ring3abi2_tests {
 /// `SYS_TIME() -> unix seconds / -EAGAIN` (VEINTLS, SR36). Both arches, unconditional.
 pub const SYS_TIME: u64 = 63; // merge12 fold: 59/60 SELFDIAG, 61 WHOAMI, 62 PROF (PROFILE2), 63 TIME
 const _: () = assert!(SYS_TIME == SYS_SBRK + 5);
+// =================================================================================================
+// PROFILE2 (rmbp-ledger B340, M5) — `SYS_PROF`: a program profiles itself. The kernel's sampler (the
+// `prof` verb's rings) is shared: `OP_START` arms it at the tick rate when idle (the caller then owns the
+// run), `OP_STOP` disarms a run the caller owns, `OP_READ` copies the caller's OWN samples (its tid, or
+// its program id) into `buf` as `Sample` records — a bounded copy, at most `READ_MAX` records and never
+// more than `len` bytes — and `OP_STATUS` returns how many the caller has. 62 sits clear of the numbers
+// other arcs of this wave hold (59..61).
+// =================================================================================================
+
+/// `SYS_PROF(op, buf, len) -> i64` — see [`prof`].
+pub const SYS_PROF: u64 = 62;
+
+/// The `SYS_PROF` vocabulary.
+pub mod prof {
+    /// Arm the sampler at the tick rate if idle; returns the armed rate in Hz.
+    pub const OP_START: u64 = 0;
+    /// Disarm a run the caller armed; returns 0, or 1 when the run is not the caller's (left armed).
+    pub const OP_STOP: u64 = 1;
+    /// Copy the caller's own samples into `buf` (at most `len / SAMPLE_BYTES`, at most `READ_MAX`);
+    /// returns the record count, or -14 (`EFAULT`) for a buffer the kernel could not write.
+    pub const OP_READ: u64 = 2;
+    /// The caller's sample count in the current (or last) run.
+    pub const OP_STATUS: u64 = 3;
+    /// Records one `OP_READ` copies at most.
+    pub const READ_MAX: usize = 512;
+    /// Bytes of one [`Sample`] on the wire.
+    pub const SAMPLE_BYTES: usize = 24;
+
+    /// One sample: the interrupted PC, the first caller the kernel's frame walk found (0 when none —
+    /// ring-3 samples are not walked), the task, its ring (0 or 3), CPU, walk depth and program id.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Sample {
+        pub rip: u64,
+        pub caller: u64,
+        pub tid: u32,
+        pub ring: u8,
+        pub cpu: u8,
+        pub depth: u8,
+        pub prog: u8,
+    }
+
+    impl Sample {
+        /// The little-endian wire form (`SAMPLE_BYTES`). `const fn`: this crate contributes no code.
+        pub const fn to_bytes(&self) -> [u8; SAMPLE_BYTES] {
+            let mut b = [0u8; SAMPLE_BYTES];
+            let (r, c, t) = (self.rip.to_le_bytes(), self.caller.to_le_bytes(), self.tid.to_le_bytes());
+            let mut i = 0;
+            while i < 8 {
+                b[i] = r[i];
+                b[8 + i] = c[i];
+                if i < 4 {
+                    b[16 + i] = t[i];
+                }
+                i += 1;
+            }
+            b[20] = self.ring;
+            b[21] = self.cpu;
+            b[22] = self.depth;
+            b[23] = self.prog;
+            b
+        }
+
+        /// Decode one record (`None` for a short slice).
+        pub const fn from_bytes(b: &[u8]) -> Option<Self> {
+            if b.len() < SAMPLE_BYTES {
+                return None;
+            }
+            Some(Self {
+                rip: u64::from_le_bytes(le8(b, 0)),
+                caller: u64::from_le_bytes(le8(b, 8)),
+                tid: u32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+                ring: b[20],
+                cpu: b[21],
+                depth: b[22],
+                prog: b[23],
+            })
+        }
+    }
+
+    const fn le8(b: &[u8], o: usize) -> [u8; 8] {
+        [b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7]]
+    }
+
+    const _: () = assert!(core::mem::size_of::<Sample>() == SAMPLE_BYTES);
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn sample_round_trips() {
+            let s = Sample { rip: 0x1000_0020_0040, caller: 0xffff_8000_0000_1234, tid: 77, ring: 3, cpu: 5, depth: 0, prog: 2 };
+            assert_eq!(Sample::from_bytes(&s.to_bytes()), Some(s));
+            assert_eq!(Sample::from_bytes(&[0u8; SAMPLE_BYTES - 1]), None);
+        }
+    }
+}

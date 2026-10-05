@@ -6619,7 +6619,7 @@ fn run_program(console: &mut Console, path: &str, rest: &[&str]) {
     let deadline = 5 * crate::arch::aarch64::timer::cntfrq();
     #[cfg(target_arch = "x86_64")]
     let deadline: u64 = 5_000;
-    match crate::arch::syscall::run_user_image_argv("shell-run", &bytes, deadline, argv) {
+    crate::prof::launching(path); match crate::arch::syscall::run_user_image_argv("shell-run", &bytes, deadline, argv) {
         Ok((outcome, entry)) => {
             use crate::arch::syscall::RunOutcome;
             match outcome {
@@ -6952,7 +6952,7 @@ fn bg_program(console: &mut Console, path: &str, rest: &[&str]) -> bool {
 #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_image(console: &mut Console, path: &str, bytes: &[u8], argv: &[&str]) -> Option<(u64, u64, u64)> {
     let n = bytes.len(); serial_println!("[bg] spawn path={} bytes={} pid=pending", path, n); // NETHANG M1: the breadcrumb AHEAD of the spawn — boot 20 went dark after `[gui] app-enter` with no line naming which step it reached
-    match crate::arch::syscall::spawn_user_image_bg_argv(bytes, argv) {
+    crate::prof::launching(path); match crate::arch::syscall::spawn_user_image_bg_argv(bytes, argv) {
         Ok((pid, asid, entry)) => { serial_println!("[bg] spawn path={} pid={} asid={:#x} -> started", path, pid, asid); crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL: no `panic::Location` in this shared file moves. Name the launch BEFORE the job row is claimed — the task is runnable the instant the spawn returns and may reach its window create first, and a name armed late is a title the operator watches change. `owner_of_launch` corrects the per-arch off-by-one in the spawn handle; the rule and that correction are both stated at `wm::app_name_arm`. Fail-closed: a full name table costs the window its name, never the launch.
             let mut jobs = BG_JOBS.lock();
             // BGREAP-CLOSE: `bg_jobs_claim` reclaims rows whose job is provably finished before it
@@ -7375,7 +7375,7 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str, args: &[String]) ->
     // arch's own twin, so EM_X86_64 there and EM_AARCH64 here), which named any of them; the kernel
     // loader re-validates from scratch regardless.
     if !exec_detaches(&bytes, &canon, typed) { serial_println!("[bg] spawn path={} bytes={} pid=foreground", load_path, bytes.len()); run_image(console, &canon, bytes, &argv); return true; } let n = bytes.len(); // EXECNAME (B322, R82): the program decides — a window or a resident server detaches below, anything else runs in the foreground through `run`'s own body. RING3ABI2 M2 (B333): the detached launch is `bg`'s own body (`bg_image`), so `bg`, `run` and a bare name share one path and carry the same argv.
-    match bg_image(console, &canon, &bytes, &argv) {
+    crate::prof::launching(&canon); match bg_image(console, &canon, &bytes, &argv) {
         Some((pid, slot, entry)) => {
             serial_println!(
                 ":: BAREXEC: {} (typed '{}') — loaded {} bytes, entry {:#x}, pid={} slot={} argc={} DETACHED, left RUNNING ::",
