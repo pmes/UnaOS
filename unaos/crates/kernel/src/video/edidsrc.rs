@@ -103,3 +103,23 @@ pub fn offer_aux(block: &[u8; 128]) {
         );
     }
 }
+
+/// The KFONTPPI witness, once, after `[kfont] load` (the faces are sized by then from `ppi`):
+/// `:: KFONTPPI: edid_src=<fw|aux|none> ppi=<n> scale=<s> cell=<w>x<h> grid=<c>x<r> -> PASS ::`.
+/// PASS: an EDID was published and the ppi the faces were sized at is non-zero. FAIL: an EDID was published and
+/// the ppi is 0. SKIP: no EDID on this boot (QEMU, a firmware and lane that read none) — not a fault.
+pub fn witness(ppi: u32) {
+    let src = name();
+    let s2 = super::dpi::scale_x2();
+    let (gw, gh) = super::text::grid_cell();
+    let (pw, ph) = super::panel_info_nonblocking().map_or((0, 0), |i| (i.width, i.height));
+    let verdict = match (src, ppi) {
+        ("none", _) => "SKIP reason=no-edid",
+        (_, 0) => "FAIL reason=edid-without-ppi",
+        _ => "PASS",
+    };
+    serial_println!(
+        ":: KFONTPPI: edid_src={} ppi={} scale={} cell={}x{} grid={}x{} -> {} ::",
+        src, ppi, super::dpi::scale_str(s2), gw, gh, pw / gw.max(1), ph / gh.max(1), verdict
+    );
+}
