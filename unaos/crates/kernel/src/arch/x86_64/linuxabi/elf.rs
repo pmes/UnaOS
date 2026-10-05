@@ -46,6 +46,12 @@ fn u64_at(b: &[u8], o: usize) -> Option<u64> {
 }
 
 pub fn parse(b: &[u8]) -> Result<Plan, &'static str> {
+    parse_sized(b, b.len() as u64)
+}
+
+/// SELFBUILD4: parse from the image's HEAD (`b` holds at least the ELF header and the program-header table) for a file of
+/// `flen` bytes — segment file ranges are checked against `flen`, so a lazy execve never reads the whole file.
+pub fn parse_sized(b: &[u8], flen: u64) -> Result<Plan, &'static str> {
     if b.len() < 64 || b[0..4] != [0x7F, b'E', b'L', b'F'] {
         return Err("not an ELF image");
     }
@@ -88,7 +94,7 @@ pub fn parse(b: &[u8]) -> Result<Plan, &'static str> {
         if segs.len() >= MAX_SEGS {
             return Err("too many PT_LOAD segments");
         }
-        if filesz > memsz || off.checked_add(filesz).map_or(true, |e| e > b.len() as u64) {
+        if filesz > memsz || off.checked_add(filesz).map_or(true, |e| e > flen) {
             return Err("segment file range outside the image");
         }
         let end = vaddr.checked_add(memsz).ok_or("segment vaddr overflow")?;

@@ -1,0 +1,21 @@
+<!-- tests: a minimal JS page that mutates the DOM on load: createElement/appendChild, textContent, classList, style, innerHTML -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>JS</title>
+<style>body { font-family: sans-serif; padding: 20px; } .done { background: #06d6a0; color: #073b4c; padding: 10px; } li { padding: 2px; }</style></head><body>
+<h2 id="title">Loading...</h2>
+<div id="status">JS has not run.</div>
+<ul id="list"></ul>
+<div id="box"></div>
+<script>
+document.getElementById('title').textContent = 'Scripted page';
+var s = document.getElementById('status');
+s.textContent = 'JS ran and changed this.';
+s.classList.add('done');
+var ul = document.getElementById('list');
+for (var i = 1; i <= 4; i++) { var li = document.createElement('li'); li.textContent = 'Item ' + i; ul.appendChild(li); }
+var box = document.getElementById('box');
+box.innerHTML = '<p><b>innerHTML</b> works too.</p>';
+box.style.border = '3px solid #ef476f';
+box.style.padding = '8px';
+</script>
+</body></html>

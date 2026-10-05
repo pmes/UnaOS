@@ -68,12 +68,42 @@ fn decode_data_uri(rest: &str) -> Option<image::RgbaImage> {
     let decoded = if meta.contains("svg") {
         decode_svg(&bytes)
     } else {
-        image::load_from_memory(&bytes).ok().map(|i| i.to_rgba8())
+        decode_raster(&bytes)
     };
     if decoded.is_none() {
         crate::ledger::record_dom("img-data-uri-decode-failed");
     }
     decoded
+}
+
+/// Decodes raster image bytes to straight RGBA.
+///
+/// PIXELCORE (SR25): PNG (an APNG: its first composited frame), JPEG, GIF (first frame), BMP, QOI and
+/// WebP — lossless, lossy (VP8 + ALPH) through VP8CORE (SR40), and animated (its first composited frame,
+/// ANIMWEBP SR44) — go through UnaOS's own decoders — `gneiss_pal::dsp::image`, i.e.
+/// `pixel_core`, the code the kernel's Facet runs too — with the EXIF orientation applied, as a browser
+/// applies it (`image-orientation: from-image`). WebP NEVER falls back (SR40 removed that chicken
+/// wire): a WebP pixel_core refuses (malformed) is a ledgered miss. The `image` crate stays behind
+/// it ONLY for the other formats pixel_core refuses (ICO, TIFF, AVIF, …, or a file it calls
+/// malformed), and only with the `image-fallback` feature (without it the `image` crate can still read
+/// PNG — the codec its PNG writer brings along). Build without the `pixel-core` feature to put the
+/// `image` crate back in front for everything (the swap is reversible).
+pub fn decode_raster(bytes: &[u8]) -> Option<image::RgbaImage> {
+    #[cfg(feature = "pixel-core")]
+    {
+        match gneiss_pal::dsp::image::decode(bytes) {
+            Ok(mut img) => {
+                img.apply_orientation();
+                return image::RgbaImage::from_raw(img.width, img.height, img.rgba);
+            }
+            Err(e) if gneiss_pal::dsp::image::sniff(bytes) == Some(gneiss_pal::dsp::image::Format::WebP) => {
+                crate::ledger::record_dom(&format!("img-webp-refused:{e}"));
+                return None;
+            }
+            Err(_) => {}
+        }
+    }
+    image::load_from_memory(bytes).ok().map(|i| i.to_rgba8())
 }
 
 /// Minimal %XX decoder for data: URI payloads ('+' left as-is per RFC 2397).
@@ -97,6 +127,15 @@ fn percent_decode(s: &str) -> String {
 
 /// Rasterizes SVG bytes at the document's intrinsic size (capped) into a
 /// straight-alpha RGBA image.
+///
+/// Behind the `svg` feature (resvg); without it every SVG is a miss, ledgered by the caller.
+#[cfg(not(feature = "svg"))]
+pub fn decode_svg(_bytes: &[u8]) -> Option<image::RgbaImage> {
+    None
+}
+
+/// Rasterizes SVG bytes (see the `svg`-less twin above).
+#[cfg(feature = "svg")]
 pub fn decode_svg(bytes: &[u8]) -> Option<image::RgbaImage> {
     let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
     let size = tree.size();

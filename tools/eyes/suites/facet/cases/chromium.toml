@@ -1,0 +1,124 @@
+# The facet.toml subjects scored against CHROMIUM itself, live: each case's page shows the same
+# fixture with the same view/edit in CSS, shot by tools/eyes/ref.mjs at the page's own viewport.
+# card-resize is expected to differ (Chromium smooth-scales with a different filter; recorded).
+
+[[case]]
+name = "card-actual@chromium"
+page = "pages/card-actual.html"
+width = 48
+height = 32
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --zoom actual --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"
+
+[[case]]
+name = "card-zoom400@chromium"
+page = "pages/card-zoom400.html"
+width = 192
+height = 128
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --zoom 400 --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"
+
+[[case]]
+name = "card-rotate90@chromium"
+page = "pages/card-rotate90.html"
+width = 64
+height = 96
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --rotate 90 --zoom 200 --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"
+
+[[case]]
+name = "card-fliph@chromium"
+page = "pages/card-fliph.html"
+width = 96
+height = 64
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --flip-h --zoom 200 --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"
+
+[[case]]
+name = "photo-o6@chromium"
+page = "pages/photo-o6.html"
+width = 64
+height = 96
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/photo-o6.jpg --zoom 200 --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"
+
+[[case]]
+name = "photo-o5@chromium"
+page = "pages/photo-o5.html"
+width = 64
+height = 96
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/photo-o5.jpg --zoom 200 --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"
+
+[[case]]
+name = "card-crop@chromium"
+page = "pages/card-crop.html"
+width = 48
+height = 40
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --crop 8,4,24,20 --zoom 200 --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"
+
+[[case]]
+name = "card-adjust@chromium"
+page = "pages/card-adjust.html"
+width = 96
+height = 64
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --adjust 1.3,0.7 --zoom 200 --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"
+
+[[case]]
+name = "card-resize@chromium"
+page = "pages/card-resize.html"
+width = 30
+height = 20
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --resize 30x20 --zoom actual --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"
+
+[[case]]
+name = "card-fit@chromium"
+page = "pages/card-fit.html"
+width = 100
+height = 100
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --width 100 --height 100 --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"
+
+[[case]]
+name = "card-pan@chromium"
+page = "pages/card-pan.html"
+width = 100
+height = 80
+[case.subject]
+run = "{repo}/target/release/facet render {suite}/fixtures/card.png --zoom 400 --width 100 --height 80 --pan -20,10 --out {out}"
+[case.oracle]
+kind = "chromium"
+url = "file://{page}"

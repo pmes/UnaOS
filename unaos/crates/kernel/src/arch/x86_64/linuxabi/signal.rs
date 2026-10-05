@@ -19,7 +19,7 @@
 //!   blocking and the handler runs when it completes); `rt_sigsuspend`/`pause` always end in `-EINTR`.
 //!
 //! Limits (stated, not hidden): the mask is per PROCESS (not per thread); a blocked SIG_DFL signal is not queued (its default
-//! action applies at once); no alternate signal stack; no real-time queueing (one pending bit per signal); delivery happens at
+//! action applies at once); the alternate signal stack is SELFBUILD5's (`remap.rs`); no real-time queueing (one pending bit per signal); delivery happens at
 //! a syscall boundary only (a thread spinning in ring 3 sees its signal at its next syscall).
 
 use super::proc::ProcInfo;
@@ -282,7 +282,8 @@ pub fn deliver(info: &ProcInfo, ktop: u64, a: [u64; 6], rc: i64) -> i64 {
     }
     let mut p = fd::lk(&info.lp);
     let usp = fw(ktop, 16);
-    let fp = usp.wrapping_sub(128).wrapping_sub(512) & !63;
+    let (top, uc_stack) = super::remap::sig_stack(info, usp, act.flags); // SELFBUILD5: SA_ONSTACK = the alternate stack's top
+    let fp = top.wrapping_sub(512) & !63;
     let frame = (fp.wrapping_sub(FRAME_SIZE) & !15).wrapping_sub(8);
     let (uc_va, si_va) = (frame + 8, frame + 8 + UC_SIZE as u64);
     let mut img = [0u8; 512];
@@ -293,7 +294,7 @@ pub fn deliver(info: &ProcInfo, ktop: u64, a: [u64; 6], rc: i64) -> i64 {
     let restorer = if act.flags & SA_RESTORER != 0 && act.restorer != 0 { act.restorer } else { TRAMP_VA + 12 };
     f[0..8].copy_from_slice(&restorer.to_le_bytes());
     let uc = 8usize;
-    f[uc + 24..uc + 28].copy_from_slice(&2u32.to_le_bytes()); // uc_stack.ss_flags = SS_DISABLE
+    f[uc + 16..uc + 40].copy_from_slice(&uc_stack); // uc_stack (SELFBUILD5; SS_DISABLE when none is installed)
     let mc = uc + 40;
     let sels = (crate::arch::gdt::USER_CODE_SEL as u64) | ((crate::arch::gdt::USER_DATA_SEL as u64) << 48);
     let regs: [u64; 24] = [
@@ -357,6 +358,7 @@ pub fn sigreturn(p: &mut LinuxProc, info: &ProcInfo, ktop: u64) -> i64 {
     fset(ktop, 8, mc(15)); // rsp
     fset(ktop, 16, mc(15));
     fset(ktop, 24, (mc(17) & 0xCD5) | 0x202); // CF PF AF ZF SF DF OF from the frame; IF on
+    super::remap::sigreturn_restore(info, &uc[16..40]); // SELFBUILD5: re-arm an SS_AUTODISARM stack
     let mask = u64_at(&uc, 296) & !UNBLOCKABLE;
     with(info.pid, |s| s.mask = mask);
     if fp_ok {
@@ -391,14 +393,17 @@ pub fn exec_reset(pid: u32) {
             s.suspend_saved = None;
         }
     });
+    super::remap::forget_pid(pid); // SELFBUILD5: execve drops the alternate stacks
 }
 
 pub fn forget(pid: u32) {
+    super::remap::forget_pid(pid); // SELFBUILD5
     x86_64::instructions::interrupts::without_interrupts(|| SIGS.lock().retain(|s| s.pid != pid));
 }
 
 pub fn reset() {
     x86_64::instructions::interrupts::without_interrupts(|| SIGS.lock().clear());
+    super::remap::forget_all(); // SELFBUILD5
     DELIVERED.store(0, Ordering::Release);
     RETURNS.store(0, Ordering::Release);
 }

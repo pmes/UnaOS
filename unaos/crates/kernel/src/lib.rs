@@ -286,3 +286,6 @@ pub mod selfdiag;
 // RING3ABI2 (rmbp-ledger B333): the SYS_WHOAMI record and `tests ring3abi` (args page, getrandom, the ELF windows). Tail statement, so no existing line moves.
 #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
 pub mod ring3abi;
+// HOLOCRON2 (rmbp-ledger B355): the kernel's small part of the metal secrets handler — SYS_KDF's body, the login launch of APPS/HOLOCRON.ELF, `tests holocron`. Tail statement, so no existing line moves.
+#[cfg(feature = "lumen")]
+pub mod keyring;
