@@ -548,8 +548,9 @@ pub fn is_linux_task() -> bool {
 }
 
 /// Called from `record_ring3_kill` when a Linux task faults.
-pub fn note_fault(vec: u8, _err: u64, cr2: u64) {
+pub fn note_fault(vec: u8, err: u64, cr2: u64) {
     if let Some(i) = proc::cur_info() {
+        fault_line(&i, vec, err, cr2); // SELFBUILDMETAL (B367): rip/cr2/vma/path/last syscall, so a metal-only fault names itself
         if i.pid == proc::ROOT_PID.load(Ordering::Acquire) {
             FAULT_CR2.store(cr2, Ordering::Release);
             FAULT.store(vec as u64 + 1, Ordering::Release);
@@ -573,6 +574,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         proc::exit_current(&info, a0, nr == 231); // never returns
     }
     let args = [a0, a1, a2, a3, a4, a5];
+    LAST_SYS.store(nr, Ordering::Release); // SELFBUILDMETAL (B367): the fault line's syscall=
     let lp = info.lp.clone();
     let mut blocked = false;
     let me = thread::cur(&info); // SELFBUILD2: None for a process without threads
@@ -1130,4 +1132,77 @@ pub fn selftest3() {
 /// SELFBUILD2: the FS_BASE recorded for thread key `key` (`None` = no entry).
 pub fn fs_tab_get(key: u64) -> Option<u64> {
     FS_TAB.iter().find(|(k, _)| k.load(Ordering::Acquire) == key).map(|(_, v)| v.load(Ordering::Acquire))
+}
+
+/// SELFBUILDMETAL (B367): where the SYSCALL stub parks the user's six ARGUMENT registers on the task's kernel stack, as
+/// `ktop - off`, in register order rdi rsi rdx r10 r8 r9 (under the rcx/r11/rsp/callee-saved frame at ktop-8..ktop-80). The
+/// stub pops them back on the way out, so a write here is what ring 3 sees after the syscall: `execve` zeroes them, `rt_sigreturn`
+/// reloads them from the `ucontext`, `fork` hands them to the child (Linux keeps every GPR but rax/rcx/r11 across a syscall).
+pub const FRAME_ARGS: [u64; 6] = [88, 96, 104, 112, 120, 128];
+
+/// SELFBUILDMETAL: the user's argument registers as the stub saved them (rdi rsi rdx r10 r8 r9).
+pub fn frame_args(ktop: u64) -> [u64; 6] {
+    FRAME_ARGS.map(|off| unsafe { *((ktop - off) as *const u64) })
+}
+
+/// SELFBUILDMETAL: overwrite the argument registers ring 3 gets back from this syscall.
+pub fn set_frame_args(ktop: u64, v: [u64; 6]) {
+    for (off, x) in FRAME_ARGS.iter().zip(v) {
+        unsafe { *((ktop - off) as *mut u64) = x };
+    }
+}
+
+// ---- SELFBUILDMETAL (B367): the fault line ----
+/// The last syscall number a Linux task of this session entered (the fault line's `syscall=`).
+static LAST_SYS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The ring-3 rip of the fault being reported, parked by `interrupts::ring3_fault_kill` just before `record_ring3_kill`.
+static FAULT_RIP: AtomicU64 = AtomicU64::new(0);
+
+/// Called by `ring3_fault_kill` (IF=0) before the kill is recorded: the faulting rip for [`fault_line`].
+pub fn note_fault_rip(rip: u64) {
+    FAULT_RIP.store(rip, Ordering::Release);
+}
+
+/// `[linuxabi] fault pid= vec= err= rip= cr2= vma=<lo>-<hi> <rwxsp>|none rip_vma=… path=<file or exe> syscall=<nr> <name> nsys=`
+/// — one line per fatal Linux-task fault, with what the RING-3 FAULT line cannot say: which mapping the address and the rip
+/// fell in, the program, and the syscall it last made. Fault context: the process lock is only TRIED (a thread holding it =
+/// `vma=locked`), never waited for.
+fn fault_line(i: &proc::ProcInfo, vec: u8, err: u64, cr2: u64) {
+    let rip = FAULT_RIP.swap(0, Ordering::AcqRel);
+    let nr = LAST_SYS.load(Ordering::Acquire);
+    let desc = |p: &LinuxProc, va: u64| -> String {
+        match p.asp.vm.find(va) {
+            Some(v) => alloc::format!(
+                "{:#x}-{:#x} {}{}{}{}",
+                v.start,
+                v.end,
+                if v.r { 'r' } else { '-' },
+                if v.w { 'w' } else { '-' },
+                if v.x { 'x' } else { '-' },
+                if v.shared { 's' } else { 'p' }
+            ),
+            None => String::from("none"),
+        }
+    };
+    let (vma, rvma, path) = match i.lp.try_lock() {
+        Some(p) => {
+            let path = p.asp.vm.find(cr2).and_then(|v| v.file.as_ref().map(|f| f.as_str().into())).unwrap_or_else(|| p.exe.clone());
+            (desc(&p, cr2), desc(&p, rip), path)
+        }
+        None => (String::from("locked"), String::from("locked"), String::from("?")),
+    };
+    serial_println!(
+        "[linuxabi] fault pid={} vec={} err={:#x} rip={:#x} cr2={:#x} vma={} rip_vma={} path={} syscall={} {} nsys={}",
+        i.pid,
+        vec,
+        err,
+        rip,
+        cr2,
+        vma,
+        rvma,
+        path,
+        nr as i64,
+        if nr == u64::MAX { "-" } else { sys_name(nr) },
+        NSYS.load(Ordering::Acquire)
+    );
 }
