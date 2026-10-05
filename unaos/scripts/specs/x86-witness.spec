@@ -450,10 +450,11 @@ FORBID matcher vacuous
 # FORBID above stops matching (civil stamps have no `ms]`), and the analyzer's cost decomposition
 # quantises to one-second resolution. The fixture's cleanup is therefore a precondition of the
 # instrument, and its absence would degrade several rules here SILENTLY rather than redly.
-# Emitter: crates/kernel/src/smolnet.rs:1787.
-# Capture line (boot 7 @ 1210 ms; boot 8 @ 1324 ms):
-#   :: [sntp-x86] canned anchor cleared — clock unanchored again ::
-REQUIRE :: \[sntp-x86\] canned anchor cleared — clock unanchored again ::
+# CONSOLEFIX (B365): the cleanup is gone because there is nothing to clean — the fixture plants a
+# `clock::FixtureClock`, never the live anchor (flight 22: an RTC-anchored boot kept the canned value).
+# Emitter: crates/kernel/src/smolnet.rs `sntp_x86_gate`.
+#   :: [sntp-x86] live clock untouched source=unset before=none after=none => PASS ::
+REQUIRE :: \[sntp-x86\] live clock untouched .* => PASS ::
 
 # --- CLOCK-X1: THE WALL CLOCK'S OWN PAYGO SPLIT ----------------------------------------------
 # `fca26306` split the x86 wall-clock witness the same way GR17 split the video battery: an ARMED
