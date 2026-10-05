@@ -1,0 +1,9 @@
+# FONTCORE external vectors (fetched, never committed whole; the committed subsets say how they were cut).
+# url  sha256  use
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/LineBreak.txt  e6a18fa91f8f6a6f8e534b1d3f128c21ada45bfe152eb6b1bcc5e15fd8ac92e6  oracle/gen_lb.py -> src/linebreak/table.rs
+https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/17.0.0/auxiliary/LineBreakTest.txt  e69884e0dde6a8724873f885d68c52dc14518abf9ae4ca9e2283b8773db3b752  oracle/filter_lbtest.py -> tests/data/lbtest_subset.txt
+# (www.unicode.org itself is refused by this host's egress proxy; the unicodetools repository is Unicode's own source of those files.)
+# Fonts: the container's /usr/share/fonts (DejaVu 2.37, Liberation 2.x, TLWG Loma) — identified by sha256 in tests/data/kat_data.rs.
+# Table oracle: fontTools 4.66.1 (pip), oracle/gen_kat.py -> tests/data/kat_data.rs.
+# Pixel/width/line oracle: headless Chromium 1194 (/opt/pw-browsers), oracle/chromium_oracle.js, oracle/chromium_lines.js,
+#   frozen slices via oracle/capture_kats.py -> tests/data/chrome_kats.rs and tests/data/chrome_lines.tsv.
