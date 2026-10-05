@@ -21,7 +21,6 @@
 
 pub mod audio_track;
 pub mod avsync;
-pub mod image;
 pub mod video;
 
 
