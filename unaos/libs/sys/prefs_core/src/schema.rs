@@ -120,6 +120,8 @@ pub const LOCAL_MODEL_FILES: [&str; 3] = ["model.onnx", "vocab.txt", "config.jso
 /// R81: Vein's default chat model per provider.
 pub const CLAUDE_DEFAULT_MODEL: &str = "claude-opus-5-5";
 pub const GEMINI_DEFAULT_MODEL: &str = "gemini-3.1-pro-preview";
+/// CLAUDECODE (SR38): `default` = pass no `--model`, the Claude Code CLI's own (`gneiss_pal::api::CLAUDECODE_DEFAULT_MODEL`).
+pub const CLAUDECODE_DEFAULT_MODEL: &str = "default";
 pub const GEMINI_DEFAULT_KEY_ENV: &str = "GEMINI_API_KEY";
 
 /// THE TABLE. Sorted by namespace, then key (the gate asserts it), so the document diffs stably.
@@ -188,6 +190,12 @@ pub static SCHEMA: &[Key] = &[
         doc: "Let the Claude client fall back to the next model on overload.",
     },
     Key {
+        ns: "vein", key: "claudecode.bin", kind: Kind::Str { max_len: 4096, printable: true },
+        default: Default::Str("claude"),
+        writers: OP, reader: "gneiss_pal ProviderConfig",
+        doc: "The Claude Code CLI binary for provider claudecode: a path, or a name looked up on PATH (CLAUDECODE, SR38).",
+    },
+    Key {
         ns: "vein", key: "embed.dims", kind: Kind::Int { min: 1, max: 65536 },
         default: Default::Consumer("the embedding model's known width"),
         writers: OP, reader: "gneiss_pal EmbedConfig",
@@ -253,10 +261,10 @@ pub static SCHEMA: &[Key] = &[
         doc: "The chat model.",
     },
     Key {
-        ns: "vein", key: "provider", kind: Kind::Enum(&["claude", "gemini", "echo", "relay"]),
+        ns: "vein", key: "provider", kind: Kind::Enum(&["claude", "gemini", "claudecode", "echo", "relay"]),
         default: Default::Str("claude"),
         writers: OP, reader: "gneiss_pal ProviderConfig; user-vein (metal: echo | relay)",
-        doc: "The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired).",
+        doc: "The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired; claudecode = the installed Claude Code CLI on a subscription, host only, SR38).",
     },
     Key {
         ns: "vein", key: "temperature", kind: Kind::Float { min: 0.0, max: 2.0 },
