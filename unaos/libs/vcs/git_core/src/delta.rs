@@ -58,7 +58,7 @@ pub fn apply(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     if src != base.len() as u64 {
         return Err(Error::Corrupt("delta: source size mismatch"));
     }
-    let mut out = Vec::with_capacity(dst.min(1 << 30) as usize);
+    let mut out = Vec::with_capacity(dst.min(1 << 24) as usize);
     while i < delta.len() {
         let op = delta[i];
         i += 1;

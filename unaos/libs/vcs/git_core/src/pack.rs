@@ -154,6 +154,10 @@ impl<'a> Pack<'a> {
             return Err(Error::Unsupported("pack version"));
         }
         let count = u32::from_be_bytes(data[8..12].try_into().unwrap());
+        // Every entry costs at least a header byte and a minimal zlib stream (8 bytes).
+        if count as u64 * 9 > data.len() as u64 {
+            return Err(Error::Corrupt("pack: object count exceeds what the pack can hold"));
+        }
         if verify {
             let end = data.len() - hk.len();
             if hk.digest(&data[..end]).as_bytes() != &data[end..] {

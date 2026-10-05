@@ -203,6 +203,9 @@ impl Index {
             }
             if version == 4 {
                 let strip = read_varint(d, &mut i)? as usize;
+                if i > end {
+                    return Err(Error::Corrupt("index: v4 prefix runs into the checksum"));
+                }
                 if strip > prev.len() {
                     return Err(Error::Corrupt("index: v4 prefix longer than the previous name"));
                 }

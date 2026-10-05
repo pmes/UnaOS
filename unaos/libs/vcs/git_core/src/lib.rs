@@ -47,6 +47,9 @@ pub mod delta;
 pub mod pack;
 pub mod diff;
 pub mod index;
+pub mod protocol;
+#[cfg(feature = "http")]
+pub mod remote;
 #[cfg(feature = "std")]
 pub mod repo;
 
