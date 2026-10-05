@@ -11,3 +11,11 @@ name = "png-vs-golden"
 subject = { kind = "png", path = "golden/swatch.png" }
 oracle = { kind = "golden", path = "golden/swatch.png" }
 mask = [[0, 0, 64, 16]]
+
+# A real UnaOS vessel: Aether's windowed browser (quartzite tetra -> GTK 4) under Xvfb, against
+# its own accepted frame. Re-golden after an intended change: copy out/xvfb-smoke/aether-shell.aether.png
+# over golden/aether-shell.png.
+[[case]]
+name = "aether-shell"
+subject = { kind = "xvfb", run = "{repo}/target/release/aether-shell", wait_ms = 5000 }
+oracle = { kind = "golden", path = "golden/aether-shell.png" }

@@ -1,5 +1,9 @@
 {
   "cases": {
+    "aether-shell": {
+      "mismatch": 0.0,
+      "ssim": 1.0
+    },
     "chromium-window": {
       "mismatch": 0.71,
       "ssim": 0.9864
