@@ -1171,3 +1171,7 @@ pub mod backlight;
 // KCOMP (B321): the compositor's one blitter interface — CpuBlitter (WCPAR inside) today, the Kepler
 // copy engine's GpuBlitter when KBLIT lands. Every compositing build; see the module head.
 pub mod blitter;
+// GLASSEYES (B343): `shot <state>` — compose a named state, settle, capture through PRTSCR, write the state's mask;
+// and `tests shot`. Desktop family only (it opens desktop windows); nothing at boot.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod shotmask;

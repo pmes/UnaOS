@@ -2157,3 +2157,28 @@ pub fn logout_fixture(name: &[u8], password: &[u8]) {
         alert_up, alert_closed, in_ok, screen_back, back_in, furniture, if ok { "PASS" } else { "FAIL —" }
     );
 }
+
+/// GLASSEYES (B343) — set by [`shot_lock`] when the shot verb itself put the lock screen up, so [`shot_release`]
+/// can only ever take down a lock IT made (never one the user or the idle timer made).
+static SHOT_LOCKED: AtomicBool = AtomicBool::new(false);
+
+/// GLASSEYES — `shot login`: put the login screen up over the session (SCREENLOCK's [`lock`], unchanged) for one
+/// capture. `false` when [`lock`] refuses (no session, screen already up, no password to unlock with).
+pub fn shot_lock() -> bool {
+    let ok = lock();
+    SHOT_LOCKED.store(ok, Ordering::Release);
+    ok
+}
+
+/// GLASSEYES — after the capture: take down the lock [`shot_lock`] made, back onto the same session (the unlock
+/// path's own close, without a password: the session never ended and the lock was the kernel's, seconds old).
+/// A no-op when the shot did not lock, or the screen is no longer the shot's lock.
+pub fn shot_release() -> bool {
+    if !SHOT_LOCKED.swap(false, Ordering::AcqRel) || !is_locked() {
+        return false;
+    }
+    take_down();
+    FORM.lock().state = State::Session;
+    serial_println!("[login] shot lock released (the shot's own lock; the session never ended)");
+    true
+}

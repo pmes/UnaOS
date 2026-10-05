@@ -1,0 +1,63 @@
+# One case per `shot` state. File names are the kernel's 8.3 spellings (FAT's create path is 8.3 only):
+# <STEM>.PNG + <STEM>.MSK; the runner also accepts <state>.png + <state>.mask.png (long names, after FATLFN).
+# `mask` rectangles [x, y, w, h] are ADDED to the kernel's mask PNG (EYES's own field; empty = the PNG alone).
+
+[[case]]
+name = "login"
+subject = { kind = "png", path = "{from}/LOGIN.PNG" }
+oracle = { kind = "golden", path = "golden/login.png" }
+mask_png = "{from}/LOGIN.MSK"
+mask = []
+
+[[case]]
+name = "desktop"
+subject = { kind = "png", path = "{from}/DESKTOP.PNG" }
+oracle = { kind = "golden", path = "golden/desktop.png" }
+mask_png = "{from}/DESKTOP.MSK"
+mask = []
+
+[[case]]
+name = "quarry"
+subject = { kind = "png", path = "{from}/QUARRY.PNG" }
+oracle = { kind = "golden", path = "golden/quarry.png" }
+mask_png = "{from}/QUARRY.MSK"
+mask = []
+
+[[case]]
+name = "settings-general"
+subject = { kind = "png", path = "{from}/SETGEN.PNG" }
+oracle = { kind = "golden", path = "golden/settings-general.png" }
+mask_png = "{from}/SETGEN.MSK"
+mask = []
+
+[[case]]
+name = "lumen"
+subject = { kind = "png", path = "{from}/LUMEN.PNG" }
+oracle = { kind = "golden", path = "golden/lumen.png" }
+mask_png = "{from}/LUMEN.MSK"
+mask = []
+
+# The other three Settings tabs: scored and reported when shot, never gated (optional, EYES's flag).
+[[case]]
+name = "settings-users"
+optional = true
+subject = { kind = "png", path = "{from}/SETUSR.PNG" }
+oracle = { kind = "golden", path = "golden/settings-users.png" }
+mask_png = "{from}/SETUSR.MSK"
+mask = []
+
+[[case]]
+name = "settings-display"
+optional = true
+subject = { kind = "png", path = "{from}/SETDSP.PNG" }
+oracle = { kind = "golden", path = "golden/settings-display.png" }
+mask_png = "{from}/SETDSP.MSK"
+mask = []
+
+[[case]]
+name = "settings-about"
+optional = true
+subject = { kind = "png", path = "{from}/SETABT.PNG" }
+oracle = { kind = "golden", path = "golden/settings-about.png" }
+mask_png = "{from}/SETABT.MSK"
+mask = []

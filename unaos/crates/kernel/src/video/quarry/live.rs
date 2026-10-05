@@ -4202,3 +4202,7 @@ pub mod openers;
 // `ops`/`openers`, so it reaches the model and the painter's helpers without widening them.
 #[path = "columns.rs"]
 pub mod columns;
+/// GLASSEYES (B343): Quarry's row, or `wm::WIN_NONE` — the state-shot mask places its volatile columns from it.
+pub fn win_id() -> wm::WinId {
+    WIN.load(Ordering::Relaxed)
+}
