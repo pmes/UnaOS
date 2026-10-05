@@ -31,3 +31,4 @@ pub use graph::{AudioGraph, NodeId};
 pub use nodes::gain::Gain;
 pub use nodes::mixer::Mixer;
 pub use nodes::oscillators::SineOscillator;
+pub use nodes::stream::{StreamFeed, StreamSource, stream_pair, stream_pair_channels};

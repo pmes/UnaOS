@@ -3648,7 +3648,7 @@ hda = []
 #
 # Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs`.
 # See docs/dev/OS/11_AUDIO/hda.md.
-hda-tone = ["hda"]
+hda-tone = ["hda", "dep:audio_core"]
 # HDASIE (rmbp-ledger B207): `UNAOS_HDASIE=1` — the one-knob flight B130 left open. Sets `INTCTL.SIE[n]`
 # for the tone's ONE descriptor right before RUN and restores it after STOP (GIE/CIE untouched, so no
 # interrupt reaches the CPU) to ask whether SIE gates the `SDnSTS.BCIS` LATCH on the 7-series PCH the
@@ -3736,7 +3736,7 @@ busreg = []
 # windowed app note; provider/key by vein_core's shared rule). The program itself (APPS/LUMEN.ELF,
 # crates/user-lumen, ONE program that talks to the provider) and the `lumen` verb exist on every build.
 # Kept in sync with `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
-lumen = ["dep:vein_core"]
+lumen = ["dep:vein_core", "dep:holocron_core"] # HOLOCRON2 (B355): + holocron_core — SYS_KDF (66), the login launch of APPS/HOLOCRON.ELF and `tests holocron` (crate::keyring)
 
 # SELFDIAG (rmbp-ledger B324, R82): UNAOS_SELFDIAG=1 arms the smart installer's diagnosis loop's kernel half —
 # the BOOT LOG ON DISK (crate::bootwit: every `:: TAG: ... -> PASS|FAIL|SKIP ::` line and the `:: BOOT:`
@@ -3803,12 +3803,19 @@ prefs_core = { path = "../../libs/sys/prefs_core" }
 # LUMENAPP (B323): Vein's shared no_std core — `tests lumen` applies the SAME provider/key rule the ring-3
 # LUMEN.ELF applies (vein_core::prefs::plan). Zero deps; only under feature `lumen`.
 vein_core = { path = "../../libs/sys/vein_core", default-features = false, optional = true }
+# HOLOCRON2 (rmbp-ledger B355): Holocron's keyring core (no_std, CRYPTOCORE only) — `tests holocron` runs its service on a RAM ring. Rides `lumen`.
+holocron_core = { path = "../../libs/sys/holocron_core", optional = true }
 # WIFI1 (B338, R79): the BCM4331 driver's shared no_std core — the firmware container codec and the
 # IEEE 802.11 frame codec, the same crate the host tests link. `optional`, pulled only by `wifi`.
 wifi_core = { path = "../../libs/sys/wifi_core", default-features = false, optional = true }
 # SELFDIAG (B324): the diagnosis core — witness grammar, owners table, prompt, diff parser + hunk locator +
 # streaming emitter, record, Echo fixture — the SAME crate APPS/DIAG.ELF links. no_std, zero deps.
 diag_core = { path = "../../libs/sys/diag_core", optional = true }
+# AUDIOCODEC (SR30): the audio decoders UnaOS owns — WAV/AIFF/FLAC/Ogg/Opus/Vorbis/MP3/AAC/MP4, from the
+# specifications, no_std + alloc, zero deps — the same crate `gneiss_pal::dsp::audio` and `tools/audio-check` link.
+# `play <file>` (drivers/hda_play.rs) decodes through it. Optional, pulled in by `hda-tone` only, so a build
+# without the player does not compile it.
+audio_core = { path = "../../libs/media/audio_core", optional = true }
 # SELFINSTALL2 (rmbp-ledger B310): Amber Bytes' shared disk-layout core — GPT encode/decode, the partition
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).
@@ -3819,6 +3826,10 @@ elf_core = { path = "../../libs/sys/elf_core" }
 # CRYPTOCORE (LEDGER SR27): the cryptographic primitives UnaOS owns — `hash.rs` re-exports its SHA-256 /
 # HMAC-SHA256 / PBKDF2 (moved there from hash.rs). no_std, no alloc needed, zero deps; arch-neutral.
 crypto_core = { path = "../../libs/sys/crypto_core" }
+# PIXELCORE (SR25): the still-image decoders UnaOS owns — PNG/JPEG/GIF/BMP/QOI/WebP-lossless — AND the one
+# inflater + the SHOTZIP PNG encoder, moved here from `selfhost/inflate.rs` and `video/png.rs` (both now
+# re-exports). no_std + alloc, zero deps; arch-neutral; the same crate Aether (via gneiss_pal) links.
+pixel_core = { path = "../../libs/media/pixel_core" }
 net = { path = "../net" }
 fdt = "0.1.5"
 # RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so
@@ -3842,7 +3853,7 @@ unafs = { path = "../../libs/fs/unafs", default-features = false }
 # ORIN-NET-4: the mature TCP/IP stack for the aarch64/tegra NIC bind — the same crate/version/feature
 # set the x86 `smolnet` uses, declared here (aarch64) as optional so it is pulled ONLY under the
 # `net4` feature (via `dep:smoltcp`). Default-OFF net4 => not compiled => aarch64 media byte-identical.
-smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
 # XUSBFW: the bench-only Tegra234 XUSB Falcon firmware injection point (`XUSB_FW: Option<&[u8]>`).
 # aarch64-only (its one consumer is arch/aarch64/xusb_tegra.rs::xusbfw) AND optional, pulled only
 # under the `xusbfw` feature via `dep:unaos-xusb-fw`. It is a separate crate SO THAT the kernel
@@ -3851,11 +3862,11 @@ smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-e
 unaos-xusb-fw = { path = "../xusb-fw", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
 # UNAFSX86: the same no_std UnaFS core, OPTIONAL on x86 — pulled only by the `unafs` feature (UNAOS_UNAFS=1).
 unafs = { path = "../../libs/fs/unafs", default-features = false, optional = true }
 x86_64 = "0.15.5"
-uart_16550 = "0.6.0"
+uart_16550 = "0.8.1"
 # SOCK-1: mature TCP/IP stack (0BSD, #![no_std], heap-optional). x86-only + optional so aarch64 and
 # knob-off x86 builds never compile it. default-features off; only the three features SOCK-1 uses:
 #   medium-ethernet — the e1000e is an Ethernet L2 device (built-in ARP neighbor discovery)

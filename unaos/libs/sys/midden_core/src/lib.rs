@@ -1359,3 +1359,24 @@ mod gated_tests {
         assert_eq!(gated_off("whoami"), Some("UNAOS_LOGIN=1"));
     }
 }
+
+// HOLOCRON2 (rmbp-ledger B355, R82): `holocron` is a PROGRAM, not a verb — the bare name launches
+// APPS/HOLOCRON.ELF with its words as argv (RING3ABI2), and its RESIDENT note detaches it.
+#[cfg(test)]
+mod holocron2_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    #[test]
+    fn holocron_is_a_program_with_argv() {
+        let f = Facts { exec: true, proc_verbs: true, x86: true, ..Facts::bare() };
+        assert!(!is_verb("holocron", &f));
+        let staged = ["HOLOCRON.ELF"];
+        assert_eq!(
+            plan("holocron put vein claude.api_key sk-x", &f, &mut NameList(&staged)),
+            Plan::Exec { typed: "holocron".to_string(), name: "HOLOCRON.ELF".to_string(), args: vec!["put".to_string(), "vein".to_string(), "claude.api_key".to_string(), "sk-x".to_string()] }
+        );
+        assert_eq!(launch_mode(APP_FLAG_RESIDENT), LaunchMode::Detach);
+    }
+}

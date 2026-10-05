@@ -1,0 +1,95 @@
+# AVCODEC test vectors — public AVIF files, fetched at test time (never committed).
+# Columns: name  sha256  bytes  url
+# Tests skip a vector (and say so) when it cannot be fetched (offline) — they never pass silently
+# on a mismatched hash: a wrong sha256 is a hard failure.
+# Sources: libavif test data, link-u/avif-sample-images, AOMediaCodec/av1-avif testFiles (see each repo for licence).
+white_1x1                                   ea4e43d1f07e4c00de16c13afa32376111bb306e51f08212cf4c1b6064df3667    305 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/white_1x1.avif
+extended_pixi                               7de53620b571aa61f54df2fc00cfa32955cd4e474a6a4b723a513b51ef21e946    330 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/extended_pixi.avif
+colors_sdr_srgb                             24463b9b79e4624d06e247079efddf624f9062c516d43ddf6fe5e150343629d6  18845 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/colors_sdr_srgb.avif
+colors_text_sdr_srgb                        b38e0e8f818e0a6f7db2c12ef5da5937c4378d35adec2dc46e5a1c35c095af36  22288 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/colors_text_sdr_srgb.avif
+kodim23_yuv420_8bpc                         fa97744b1bad2137cac0f81fb653175362e16c6d8d20613d0769a847f2769bd1  21032 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/io/kodim23_yuv420_8bpc.avif
+kodim03_yuv420_8bpc                         e69c973a3ddf635412c9a0c6cda66798102d0030303614873b337f658983ef5d  25430 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/io/kodim03_yuv420_8bpc.avif
+fox.profile1.8bpc.yuv444.odd-width.odd-height fad3b6dd9cb99e6925858f69aafae3f68c861845f2c3d4a6d1c51c6161490134 89658 https://raw.githubusercontent.com/link-u/avif-sample-images/master/fox.profile1.8bpc.yuv444.odd-width.odd-height.avif
+fox.profile0.10bpc.yuv420                   811af5e96631309030a14cbc30c3bacfaa667f2e36e16a4f30434b8f5a23310c  83040 https://raw.githubusercontent.com/link-u/avif-sample-images/master/fox.profile0.10bpc.yuv420.avif
+fox.profile0.8bpc.yuv420.monochrome         15d84077066c47fdbe2a7b8ed583a17017d09a033144ac1b31486d6c8f6f5c82  69856 https://raw.githubusercontent.com/link-u/avif-sample-images/master/fox.profile0.8bpc.yuv420.monochrome.avif
+fox.profile2.12bpc.yuv422                   51476b8471e1c0a5ebbd1e7545709495bef619cc96c02d277aad32b1deff8ea9  90198 https://raw.githubusercontent.com/link-u/avif-sample-images/master/fox.profile2.12bpc.yuv422.avif
+Chimera_8bit_cropped_480x256                  d86d67a6c37e61dfa34e071116daa467afe6304b9ca110ab87ba898631f262fc  38534 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Microsoft/Chimera_8bit_cropped_480x256.avif
+kids_720p                                     a68913ccfff7194f0de62de88e09b2d0b65df463aa98d00df068e17436759c98  57637 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Microsoft/kids_720p.avif
+Irvine_CA                                     ee9b8544668ba71e584311be8eb590d0a92464aa24aa75ab05af92ab4c9ccf4c  28133 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Microsoft/Irvine_CA.avif
+sdr_cosmos01000_cicp1-13-6_yuv420_limited_qp40 a8b8a5707bf0c09701a49802772a9b2a645baa212f329429dd9f9c5275796a69  12486 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Netflix/avif/sdr_cosmos01000_cicp1-13-6_yuv420_limited_qp40.avif
+sdr_cosmos01000_cicp1-13-6_yuv444_full_qp40   87bdf7f8956811f68dc3fc425b87a28fefd86ee1cccb4e44ebb8c3888cddfff2  17026 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Netflix/avif/sdr_cosmos01000_cicp1-13-6_yuv444_full_qp40.avif
+Monochrome                                    deeb37c2cf321d3ccacff085a6fed50cc774dd38d7ed271c15517ccd01bd7a4f   7436 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Microsoft/Monochrome.avif
+fruits_2layer_thumbsize                       50946ccc489beec9e649f8f6bb63a18582043218afd1c1ee0df4c2cdf72b7e22  35527 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Xiph/fruits_2layer_thumbsize.avif
+# AVCODEC2 (inter): libaom conformance vectors (AOMedia test data, BSD-2-Clause) — IVF bitstreams and
+# the per-frame MD5s of libaom's own decode (the frame-exact oracle).
+av1-1-b8-01-size-16x16                        8bb6d2c4bfdddca26815e4545c829c8d25ed11341a8d2858ada792e50e4f1ee9      318 https://storage.googleapis.com/aom-test-data/av1-1-b8-01-size-16x16.ivf
+av1-1-b8-01-size-16x16.md5                    895afaacb16aa4c5fab46fa66d344fdbb8c2f1befa5cce9e17919b601f89b59f      154 https://storage.googleapis.com/aom-test-data/av1-1-b8-01-size-16x16.ivf.md5
+av1-1-b8-01-size-34x34                        7d6225b643a45ad0200f0664f971cf8c7a30798d3b1c7265d96d6dee8b3534f9      410 https://storage.googleapis.com/aom-test-data/av1-1-b8-01-size-34x34.ivf
+av1-1-b8-01-size-34x34.md5                    ff29a459bd67e5dcfa2dd5552082bf1605bf306aa61abce19298ab7b7d8664b4      154 https://storage.googleapis.com/aom-test-data/av1-1-b8-01-size-34x34.ivf.md5
+av1-1-b8-01-size-66x66                        5f9285cbc417b0457c806df9154a1898f0f9ca09066abfdfd828cb3b2ba0371b      466 https://storage.googleapis.com/aom-test-data/av1-1-b8-01-size-66x66.ivf
+av1-1-b8-01-size-66x66.md5                    c9e5553ef735c82723595ce9317d55e54e0a8c916902960e65a644090fbf5653      154 https://storage.googleapis.com/aom-test-data/av1-1-b8-01-size-66x66.ivf.md5
+av1-1-b8-01-size-196x196                      ecacf9c2065eec1a02248395412be5e03ed7e3fedfd6653622e09e73d1cac747      821 https://storage.googleapis.com/aom-test-data/av1-1-b8-01-size-196x196.ivf
+av1-1-b8-01-size-196x196.md5                  18c81dc8ff7745dbfcc67458bc42179f85e6c04a65c6780c01d4e3bde86dfac0      162 https://storage.googleapis.com/aom-test-data/av1-1-b8-01-size-196x196.ivf.md5
+av1-1-b8-01-size-226x226                      b5d9a30f24e33f8fa6a655961645650542dc2545fb7d557e2d55a043dac69f50     1079 https://storage.googleapis.com/aom-test-data/av1-1-b8-01-size-226x226.ivf
+av1-1-b8-01-size-226x226.md5                  abae1447d74ade230c19d47e7e960c640de3e935ddf369176d55602361bb65ea      162 https://storage.googleapis.com/aom-test-data/av1-1-b8-01-size-226x226.ivf.md5
+av1-1-b8-00-quantizer-00                      6382dbd2befbbc93d4ea283586f4fb43fea5f1c52400e3d2c5281a46b1104c00   128943 https://storage.googleapis.com/aom-test-data/av1-1-b8-00-quantizer-00.ivf
+av1-1-b8-00-quantizer-00.md5                  dcbb3af4e9a062825d7d1901cb1cf40db911c3a3b9ffcd02ad3cd77881d0b98f      162 https://storage.googleapis.com/aom-test-data/av1-1-b8-00-quantizer-00.ivf.md5
+av1-1-b8-00-quantizer-10                      108880345eb8188e4737e90a8c993141b10efcb328493653dffa26a33ea77b8d    36163 https://storage.googleapis.com/aom-test-data/av1-1-b8-00-quantizer-10.ivf
+av1-1-b8-00-quantizer-10.md5                  d7a071bc9ce9ef2a7355bfba4e19caef028d7c351f971045c79de073682ccc3a      162 https://storage.googleapis.com/aom-test-data/av1-1-b8-00-quantizer-10.ivf.md5
+av1-1-b8-00-quantizer-32                      1aae80061d3b52995987c02d33b87982cb50acd08ad2255739ebc752d7231257    10830 https://storage.googleapis.com/aom-test-data/av1-1-b8-00-quantizer-32.ivf
+av1-1-b8-00-quantizer-32.md5                  c8f279eb0d76106187e0c89c339da162bc7619583b678c58008cbecb4a26d113      162 https://storage.googleapis.com/aom-test-data/av1-1-b8-00-quantizer-32.ivf.md5
+av1-1-b8-00-quantizer-63                      0e4ec80680f7af8de9621b016e0f2d7c0858b2951debc173dda50c6a051547d3      606 https://storage.googleapis.com/aom-test-data/av1-1-b8-00-quantizer-63.ivf
+av1-1-b8-00-quantizer-63.md5                  0e9a72b63f0716e08071d962185f807e5761df53472c773eb9c870eaa74e81dc      162 https://storage.googleapis.com/aom-test-data/av1-1-b8-00-quantizer-63.ivf.md5
+av1-1-b10-00-quantizer-32                     25348a16199f89f9462c4fec3d886ee7265d529ca9eaa3575f74259df091534f    14207 https://storage.googleapis.com/aom-test-data/av1-1-b10-00-quantizer-32.ivf
+av1-1-b10-00-quantizer-32.md5                 2f441b4f44e15c2a7bbae58510a03663262f8dabaffdd26868e3410dde67a7d7      164 https://storage.googleapis.com/aom-test-data/av1-1-b10-00-quantizer-32.ivf.md5
+av1-1-b8-04-cdfupdate                         14a3dbf537b6bf15efc003182d9916d61438c93624a8bd26e6e3ae7eaf33ea82    36088 https://storage.googleapis.com/aom-test-data/av1-1-b8-04-cdfupdate.ivf
+av1-1-b8-04-cdfupdate.md5                     99779a54865629470f05e906a3a6b189b154ce6f5c2a4fb26b897811f15a788e      156 https://storage.googleapis.com/aom-test-data/av1-1-b8-04-cdfupdate.ivf.md5
+av1-1-b8-05-mv                                222a9050059b254dab17cfb802ff829c778e3f93af18961a622c8268576c1395    55223 https://storage.googleapis.com/aom-test-data/av1-1-b8-05-mv.ivf
+av1-1-b8-05-mv.md5                            76eeebe50c438619b4cadce90fc194010c50c4a5a876441444d726d12de58c50      284 https://storage.googleapis.com/aom-test-data/av1-1-b8-05-mv.ivf.md5
+av1-1-b8-06-mfmv                              b59bf9586d8546dfda81dfec4ee4e32ceb502c9d22412ab0b63a2abb534a1f14    44964 https://storage.googleapis.com/aom-test-data/av1-1-b8-06-mfmv.ivf
+av1-1-b8-06-mfmv.md5                          e79a565f14ffa8a4403d3d29ec395c50a4a5de041342503d084fb6e661ef009e      292 https://storage.googleapis.com/aom-test-data/av1-1-b8-06-mfmv.ivf.md5
+av1-1-b8-22-svc-L1T2                          eade696ab60415d476e1d2a489ec2cccd24d5eaaadfa4559c6488b7932274c5e    48883 https://storage.googleapis.com/aom-test-data/av1-1-b8-22-svc-L1T2.ivf
+av1-1-b8-22-svc-L1T2.md5                      b625d05a08a422446d0ea65e304b803ddf468a0f6c0a3b4f365e1ac190ca7af0      584 https://storage.googleapis.com/aom-test-data/av1-1-b8-22-svc-L1T2.ivf.md5
+av1-1-b8-22-svc-L2T1                          d65824e8e7c19bc958db810d728b2132b513b5a93cb5f99ca3d7995e19a226e1   159037 https://storage.googleapis.com/aom-test-data/av1-1-b8-22-svc-L2T1.ivf
+av1-1-b8-22-svc-L2T1.md5                      62fd3f515904ff5d29a87f0e70e36150d65653174b3bdac1a54235ee69701140      592 https://storage.googleapis.com/aom-test-data/av1-1-b8-22-svc-L2T1.ivf.md5
+av1-1-b8-24-monochrome                        3dcc2a3c181f74788bd9575d94f0862d9e914415ac358a4da4ed7d904f0535b7    10000 https://storage.googleapis.com/aom-test-data/av1-1-b8-24-monochrome.ivf
+av1-1-b8-24-monochrome.md5                    01658b28fc7b6760de63602b472c3732af5debef53059b0a3b6f237437afe652      790 https://storage.googleapis.com/aom-test-data/av1-1-b8-24-monochrome.ivf.md5
+av1-1-b10-24-monochrome                       6a1b0729305a167f10737a5375f0570139f055bcd7916df260b653ab2210adc1    16044 https://storage.googleapis.com/aom-test-data/av1-1-b10-24-monochrome.ivf
+av1-1-b10-24-monochrome.md5                   ae782416c0bd5e7ee3988e809fca9dc9ac596e683a3486912459238605c1861a      800 https://storage.googleapis.com/aom-test-data/av1-1-b10-24-monochrome.ivf.md5
+av1-1-b8-16-intra_only-intrabc-extreme-dv     0252716fe7a7c7f1ebb1eb23920a6737f45c10dfba942304bd339ae42b5c576c   339274 https://storage.googleapis.com/aom-test-data/av1-1-b8-16-intra_only-intrabc-extreme-dv.ivf
+av1-1-b8-16-intra_only-intrabc-extreme-dv.md5 207c2f56dd6df85879679532ad37f34fe72d315f21cc3313b70cd03d4060e07e      200 https://storage.googleapis.com/aom-test-data/av1-1-b8-16-intra_only-intrabc-extreme-dv.ivf.md5
+av1-1-b8-23-film_grain-50                     ba3edd82a58414f009e1c821b947ec8de4e0420f33803ca7bfea39af6aeea155    28634 https://storage.googleapis.com/aom-test-data/av1-1-b8-23-film_grain-50.ivf
+av1-1-b8-23-film_grain-50.md5                 8996cc98e68102e60620d28208246009601b2906f05e1d1cc0da74479c828ac9      820 https://storage.googleapis.com/aom-test-data/av1-1-b8-23-film_grain-50.ivf.md5
+av1-1-b10-23-film_grain-50                    c36cf5ab6a2e9e27c212c06863759b60791e3fa681a0800b5d57fd4192ef29cb    28906 https://storage.googleapis.com/aom-test-data/av1-1-b10-23-film_grain-50.ivf
+av1-1-b10-23-film_grain-50.md5                d8f94be7e77756b5b117a04df13f1a125201eaab6ee828f78368e237c412d97e      830 https://storage.googleapis.com/aom-test-data/av1-1-b10-23-film_grain-50.ivf.md5
+# Robustness: libaom's invalid-stream corpus (oss-fuzz / bug reports) — decoding must return errors, never panic.
+invalid-bug-1814                              10ecfeac1fd48a1a6bc22dc2bd8f2e335f1406f328e510c395004aa772a43c2c      747 https://storage.googleapis.com/aom-test-data/invalid-bug-1814.ivf
+invalid-chromium-906381                       0ea620e373da7c413f312ebf87485ba70cb5e03385ee2df8876d929ad1a88e7e     4420 https://storage.googleapis.com/aom-test-data/invalid-chromium-906381.ivf
+invalid-google-142530197-1                    7b2ebef59c405c8b121e7438b63fb5643ba1f33ae7b74cda30f8718c01dcfb78       99 https://storage.googleapis.com/aom-test-data/invalid-google-142530197-1.ivf
+invalid-google-142530197                      38eb59ded1c97a8a77c85a29f9468c6e559346b3b30583984346be2663b4c72e      123 https://storage.googleapis.com/aom-test-data/invalid-google-142530197.ivf
+invalid-oss-fuzz-10061                        e3c26c5df4d49ec8fd14df738e44007ea24d9b1bf7794d364c32cb947e061bc1      206 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10061.ivf
+invalid-oss-fuzz-10117-mc-buf-use-highbd      1f7761912552f67e62c8e8989c41e65c24202974b3c0b8d61c521d32047e274c      167 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10117-mc-buf-use-highbd.ivf
+invalid-oss-fuzz-10227                        40bc5fc49027ee05b3194d5c484d0bfb182d1d5d9efb2fbee192035d4a3a5177    14130 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10227.ivf
+invalid-oss-fuzz-10389                        e98e7c181b2f47033ceea1e3d84e635b5edda7d1d1586460364edddc13e80e55      958 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10389.ivf
+invalid-oss-fuzz-10555                        8c9581e162368356902f5ea3410a78bac4ef41491593a167dff2e9436ef889ef      142 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10555.ivf
+invalid-oss-fuzz-10705                        a767f7d3aa7229e26cfa6a12dd5ff404e64d5d37a5fd62857cf7eaf86a17d1ee     1040 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10705.ivf
+invalid-oss-fuzz-10723                        243c392883d01e7d81c08e8d3558b579b82d8b7a441d337e4f2a273287193012      982 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10723.ivf
+invalid-oss-fuzz-10779                        fc9e14552575361ed35bbab15d63f4715b0d070dd76ef26d756e9941b7046d9b      140 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10779.ivf
+invalid-oss-fuzz-11477                        84134206d6d0fbab7404560279326d50201fce7175a3509411c6db9d3ff7370e      948 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-11477.ivf
+invalid-oss-fuzz-11479                        5215a9b64461cbcdfc76b91ccb2935a43664e161952f4e174fffbad7acaaa630      116 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-11479.ivf
+invalid-oss-fuzz-11523                        a0cdd6395260a81ded2fd0f0676d12982a4ea45c8959744d2ca76a849717a4c9    30254 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-11523.ivf
+invalid-oss-fuzz-15363                        3b1a94a45d4f1770de803ef28aa5970e9973d7f3287a60402679de3a29b97a34     8663 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-15363.ivf
+invalid-oss-fuzz-16437                        ffc68dbe61c3b590227505c612c829f4e50001796e89b7730491d8662ecacced       72 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-16437.ivf
+invalid-oss-fuzz-24706                        2ba89ba10b4c817c5931216b4c3fff9f712d3d64e24f8307531079abeb58b9fc       91 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-24706.ivf
+invalid-oss-fuzz-33030                        7a7f2208c1fbb901e5ab5657fc604c504e4c2e81da7b50c0249a1ae35275cb57      114 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-33030.ivf
+invalid-oss-fuzz-9288                         a18fe7cc2f4ed19048ef5d683dc87088917dd3590f784fe1e82b1ec5631be800      224 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-9288.ivf
+invalid-oss-fuzz-9463                         933b7d9c84b6ddc32dc560f7f9c95876413be4aac1385a2ced71fe5cac5fd760       80 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-9463.ivf
+invalid-oss-fuzz-9482                         f5cd658619b1952862fe6dad7d04dc6cd5e2ccddd115304f8e652544555640de      158 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-9482.ivf
+invalid-oss-fuzz-9720                         fd3eb5cb6f2a035069d768bb24019d1d84f24b4f795b7bb5f8d2aa213468fd8f     8235 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-9720.ivf
+# libaom resize vectors (Matroska; the size changes at key frames with new sequence headers)
+av1-1-b8-03-sizeup                            919bc6e93d1127a6bd98d413dd6c3a227bd2f4f6149ea32a2b455eec380b2b9f    35794 https://storage.googleapis.com/aom-test-data/av1-1-b8-03-sizeup.mkv
+av1-1-b8-03-sizeup.md5                        9f849b305c137d989512220d5701c49a67683736b19f620e76677a0d41c4016a     1510 https://storage.googleapis.com/aom-test-data/av1-1-b8-03-sizeup.mkv.md5
+av1-1-b8-03-sizedown                          64f4e78cca42acbb0a9e25bd4a5c2ff2f96e3e911595902b60d2266a93f2c08f    35780 https://storage.googleapis.com/aom-test-data/av1-1-b8-03-sizedown.mkv
+av1-1-b8-03-sizedown.md5                      59876b6e7d61043abb939d2dd9d34b4f8333f33b1ef52d0e36dd02c12801e70b     1550 https://storage.googleapis.com/aom-test-data/av1-1-b8-03-sizedown.mkv.md5
+# Chromium's own AV1 test clip (media/test/data, BSD): the Chromium <video> oracle input
+bear-av1.mp4                                  2081972026e679775013102a63280331d8fae236dc8efef4ce4878a822cf4501    24355 https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-av1.mp4

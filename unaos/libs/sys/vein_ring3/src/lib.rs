@@ -17,6 +17,7 @@
 //! * `provider` (feature `cryptocore`) — CRYPTOCORE's provider, seeded from SYS_GETRANDOM.
 //! * [`prefs`] — Principia reads (BUS_VERB_PREF_GET) and the whole Vein configuration in one call.
 //! * [`files`] (LUMENUX B348) — whole-file read / create / append over SYS_PATH_* or home-relative SYS_OPEN.
+//! * [`holocron`] (HOLOCRON2 B355) — the key from Holocron first (SecretGet over the bus, `keysource::decide`).
 //! * [`key`] — the key file: read only when it stats with an inode id (UnaFS); refused on FAT.
 //! * [`send`] / [`exchange_over`] — one exchange end to end: resolve, connect, TLS, encode, stream.
 #![no_std]
@@ -26,6 +27,7 @@ extern crate alloc;
 pub mod clock;
 pub mod heap;
 pub mod files;
+pub mod holocron;
 pub mod key;
 pub mod net;
 pub mod prefs;

@@ -1,0 +1,16 @@
+# CSSCORE (SR47) test vectors: FETCH <name> <sha256> <url> — fetched at test time by tests/common/mod.rs,
+# verified with crypto_core's SHA-256, cached in $TMPDIR/unaos-css-vectors, skipped offline (CSS_OFFLINE=1 forces it).
+# css-parsing-tests: the copy maintained in servo/rust-cssparser, pinned at commit 106021c7bc55ed2cac83f590c0d356fa530b7061.
+FETCH component_value_list.json acc98feeb85b9703134afcbfbf318c2305538775b75909a84e6cdbafd22c9bad https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/component_value_list.json
+FETCH declaration_list.json 08fce350f34c03dcfaea76564826e634fb14ce55738fe63427b886a2871e0a4e https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/declaration_list.json
+FETCH rule_list.json 02e10de46df00de087f430c288fe1d2219149249aa388ec3f953b59bb7015f26 https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/rule_list.json
+FETCH stylesheet.json 2d6c62913fddbfd88eaeb339cb4c1286e55cb48ed45f56a1312db60245707734 https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/stylesheet.json
+FETCH one_component_value.json 8798017709002e14cf11e203c9d716f82d308ce6ba0f6e64ee4eea331b8485c6 https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/one_component_value.json
+FETCH one_declaration.json a34c9da56edfff9e2e21615f059e141b0e878e90f794dc8fa58d65b47cd193ed https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/one_declaration.json
+FETCH one_rule.json d330bb084de580351dc5374b673365e4fcec9ae1590355257befd06d275d0818 https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/one_rule.json
+FETCH urange.json 676ef0a396c02c322bb011ab90d2a17f31602ac35eb6a747a868bd9b3acccc73 https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/urange.json
+FETCH An+B.json 0deb798e84ecf7f08de3c89b3ecdc65caceb8f31a45b03fcf3622e6ba69dfd2b https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/An%2BB.json
+FETCH color3.json 7a87e6f83110d76f943faeef3084aea0ad0045f31579f6a494b72f6fd79fe01e https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/color3.json
+FETCH color3_keywords.json 378ed5f33605212ce0d8df89db139ad04b6f0b57fe1013d9df93b7997d077894 https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/color3_keywords.json
+FETCH color3_hsl.json 0e26dad913a036de77556a9450f93ca2de37a4b71e632f782d1d7e5f4e87459e https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/color3_hsl.json
+FETCH color4_hwb.json e5b7dc0cc818854802b3277a14c0520331a4f69de1adfceed74997af55117d87 https://raw.githubusercontent.com/servo/rust-cssparser/106021c7bc55ed2cac83f590c0d356fa530b7061/src/css-parsing-tests/color4_hwb.json

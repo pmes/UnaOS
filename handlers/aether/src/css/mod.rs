@@ -1,8 +1,19 @@
 use crate::layout::{LayoutTree, PaintStyle};
-use cssparser::{Parser, ParserInput, Token};
+use cssparser::{Parser, Token};
 use taffy::prelude::*;
 use taffy::style::{Dimension, Display, FlexDirection, LengthPercentage, LengthPercentageAuto};
 use taffy::geometry::Rect;
+
+/// taffy 0.14 types min-/max-size as length | percentage | auto (the
+/// intrinsic keywords are size-only); a keyword there folds to auto.
+pub(crate) fn lpa(d: Dimension) -> LengthPercentageAuto {
+    use taffy::style::ExpandedDimension as E;
+    match d.expand() {
+        E::Length(v) => LengthPercentageAuto::length(v),
+        E::Percent(v) => LengthPercentageAuto::percent(v),
+        _ => LengthPercentageAuto::auto(),
+    }
+}
 
 
 /// Declarations a rule actually specified. Only `Some` fields are applied,
@@ -28,6 +39,17 @@ pub(crate) struct SpecifiedStyle {
     pub align_items: Option<taffy::style::AlignItems>,
     pub align_self: Option<taffy::style::AlignSelf>,
     pub box_sizing: Option<taffy::style::BoxSizing>,
+    /// `display: flex` (Some(true)) versus any other display (Some(false)).
+    /// Aether lays every block out as a column flex box, so a real flex
+    /// container is the one that gets CSS flex semantics: row by default,
+    /// nowrap by default, stretch by default, children sized by content.
+    pub flex_container: Option<bool>,
+    pub flex_wrap: Option<taffy::style::FlexWrap>,
+    pub row_gap: Option<LengthPercentage>,
+    pub column_gap: Option<LengthPercentage>,
+    pub flex_grow: Option<f32>,
+    pub flex_shrink: Option<f32>,
+    pub flex_basis: Option<Dimension>,
     pub paint: PaintStyle,
 }
 
@@ -36,24 +58,40 @@ impl SpecifiedStyle {
     pub(crate) fn fold_into(&self, node_style: &mut Style) {
         if let Some(d) = self.display { node_style.display = d; }
         if let Some(fd) = self.flex_direction { node_style.flex_direction = fd; }
+        if self.flex_container == Some(true) {
+            // CSS initial values for a flex container, replacing the
+            // column/wrap/baseline defaults of Aether's block approximation.
+            if self.flex_direction.is_none() {
+                node_style.flex_direction = FlexDirection::Row;
+            }
+            node_style.flex_wrap = self.flex_wrap.unwrap_or(taffy::style::FlexWrap::NoWrap);
+            node_style.align_items = self.align_items;
+        } else if let Some(w) = self.flex_wrap {
+            node_style.flex_wrap = w;
+        }
+        if let Some(g) = self.row_gap { node_style.gap.height = g; }
+        if let Some(g) = self.column_gap { node_style.gap.width = g; }
+        if let Some(v) = self.flex_grow { node_style.flex_grow = v; }
+        if let Some(v) = self.flex_shrink { node_style.flex_shrink = v; }
+        if let Some(v) = self.flex_basis { node_style.flex_basis = v; }
         if let Some(w) = self.width { node_style.size.width = w; }
         if let Some(h) = self.height {
             node_style.size.height = h;
-            node_style.min_size.height = h;
+            node_style.min_size.height = lpa(h);
         }
         // min wins over max in taffy, and blocks carry a UA min-height
         // default — a specified max must clear it (an explicit min-* below
         // still overrides, it folds after).
         if let Some(v) = self.max_width {
-            node_style.max_size.width = v;
-            node_style.min_size.width = Dimension::auto();
+            node_style.max_size.width = lpa(v);
+            node_style.min_size.width = LengthPercentageAuto::auto();
         }
         if let Some(v) = self.max_height {
-            node_style.max_size.height = v;
-            node_style.min_size.height = Dimension::auto();
+            node_style.max_size.height = lpa(v);
+            node_style.min_size.height = LengthPercentageAuto::auto();
         }
-        if let Some(v) = self.min_width { node_style.min_size.width = v; }
-        if let Some(v) = self.min_height { node_style.min_size.height = v; }
+        if let Some(v) = self.min_width { node_style.min_size.width = lpa(v); }
+        if let Some(v) = self.min_height { node_style.min_size.height = lpa(v); }
         if let Some(p) = self.padding {
             node_style.padding = p;
         }
@@ -75,10 +113,9 @@ impl SpecifiedStyle {
         // an `align-items:center` written for a row would land on its CROSS
         // axis and centre the page's block content horizontally.
         if let Some(a) = self.align_items {
-            if matches!(
-                node_style.flex_direction,
-                FlexDirection::Row | FlexDirection::RowReverse
-            ) {
+            if self.flex_container == Some(true)
+                || matches!(node_style.flex_direction, FlexDirection::Row | FlexDirection::RowReverse)
+            {
                 node_style.align_items = Some(a);
             }
         }
@@ -102,17 +139,22 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
     match prop {
         "display" => match value {
             "none" => style.display = Some(Display::None),
+            // Real flex containers: CSS flex semantics (see fold_into).
+            "flex" | "inline-flex" | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex"
+            | "-webkit-inline-flex" | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
+                style.display = Some(Display::Flex);
+                style.flex_container = Some(true);
+            }
             // Column-flex approximations of block-ish display types.
-            "flex" | "block" | "inline-block" | "inline-flex" | "inline" | "list-item"
+            "block" | "inline-block" | "inline" | "list-item"
             | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
-            | "table-header-group" | "table-footer-group"
-            // Legacy/prefixed flexbox spellings are the same box type here.
-            | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex" | "-webkit-inline-flex"
-            | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
-                style.display = Some(Display::Flex)
+            | "table-header-group" | "table-footer-group" => {
+                style.display = Some(Display::Flex);
+                style.flex_container = Some(false);
             }
             "table-row" => {
                 style.display = Some(Display::Flex);
+                style.flex_container = Some(false);
                 style.flex_direction = Some(FlexDirection::Row);
             }
             "inherit" | "initial" | "unset" | "revert" => {}
@@ -121,7 +163,66 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         "flex-direction" => match value {
             "row" => style.flex_direction = Some(FlexDirection::Row),
             "column" => style.flex_direction = Some(FlexDirection::Column),
+            "row-reverse" => style.flex_direction = Some(FlexDirection::RowReverse),
+            "column-reverse" => style.flex_direction = Some(FlexDirection::ColumnReverse),
             _ => {}
+        },
+        "flex-wrap" => match value {
+            "wrap" => style.flex_wrap = Some(taffy::style::FlexWrap::Wrap),
+            "wrap-reverse" => style.flex_wrap = Some(taffy::style::FlexWrap::WrapReverse),
+            "nowrap" => style.flex_wrap = Some(taffy::style::FlexWrap::NoWrap),
+            "inherit" | "initial" | "unset" | "revert" => {}
+            other => crate::ledger::record_css(&format!("flex-wrap-value:{}", other)),
+        },
+        "flex-flow" => {
+            for part in value.split_whitespace() {
+                match part {
+                    "row" | "column" | "row-reverse" | "column-reverse" => {
+                        apply_declaration("flex-direction", part, style)
+                    }
+                    _ => apply_declaration("flex-wrap", part, style),
+                }
+            }
+        }
+        "gap" | "grid-gap" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            let row = parts.first().and_then(|v| parse_length_percentage_str(v));
+            let col = parts.get(1).and_then(|v| parse_length_percentage_str(v)).or(row);
+            match (row, col) {
+                (Some(r), Some(c)) => {
+                    style.row_gap = Some(r);
+                    style.column_gap = Some(c);
+                }
+                _ => crate::ledger::record_css(&format!("gap-value:{}", clip(value))),
+            }
+        }
+        "row-gap" | "grid-row-gap" => match parse_length_percentage_str(value) {
+            Some(v) => style.row_gap = Some(v),
+            None => crate::ledger::record_css(&format!("gap-value:{}", clip(value))),
+        },
+        "column-gap" | "grid-column-gap" => match parse_length_percentage_str(value) {
+            Some(v) => style.column_gap = Some(v),
+            None => crate::ledger::record_css(&format!("gap-value:{}", clip(value))),
+        },
+        "flex-grow" => match value.parse::<f32>() {
+            Ok(v) if v >= 0.0 => style.flex_grow = Some(v),
+            _ => crate::ledger::record_css(&format!("flex-grow-value:{}", clip(value))),
+        },
+        "flex-shrink" => match value.parse::<f32>() {
+            Ok(v) if v >= 0.0 => style.flex_shrink = Some(v),
+            _ => crate::ledger::record_css(&format!("flex-shrink-value:{}", clip(value))),
+        },
+        "flex-basis" => match parse_flex_basis(value) {
+            Some(v) => style.flex_basis = Some(v),
+            None => crate::ledger::record_css(&format!("flex-basis-value:{}", clip(value))),
+        },
+        "flex" => match parse_flex_shorthand(value) {
+            Some((g, sh, b)) => {
+                style.flex_grow = Some(g);
+                style.flex_shrink = Some(sh);
+                style.flex_basis = Some(b);
+            }
+            None => crate::ledger::record_css(&format!("flex-value:{}", clip(value))),
         },
         "width" => style.width = parse_dimension_str(value),
         "height" => style.height = parse_dimension_str(value),
@@ -537,6 +638,18 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 style.paint.bg_repeat = Some(r);
             }
         }
+        // Replaced-content fitting (CSS Images 3 §5.5–5.6): how a <video>
+        // frame or poster sits in the element's content box.
+        "object-fit" => {
+            if let Some(f) = crate::media::parse_object_fit(value) {
+                style.paint.object_fit = Some(f);
+            }
+        }
+        "object-position" => {
+            if !is_neutral_keyword(value) {
+                style.paint.object_position = Some(value.to_string());
+            }
+        }
         // mask-image (and the -webkit- alias) turns the box's background
         // paint into a stencil: the mask's alpha decides where the fill
         // lands. The icon-font-replacement idiom (a solid background-color
@@ -664,7 +777,8 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                         "box-sizing" | "background-size" | "background-position"
                             | "background-repeat" | "align-items" | "align-content"
                             | "align-self" | "justify-content" | "flex-direction"
-                            | "flex-wrap" | "opacity" | "border-radius"
+                            | "flex-wrap" | "opacity" | "border-radius" | "flex" | "flex-grow"
+                            | "flex-shrink" | "flex-basis" | "flex-flow" | "gap"
                     )
                 }) =>
         {
@@ -859,13 +973,13 @@ fn clip_n(v: &str, n: usize) -> &str {
 /// A rule with `!important` declarations is split in two — the important
 /// half carries `important: true` and applies in a later cascade tier.
 struct Rule {
-    selector: kuchiki::Selector,
+    selector: crate::dom::Selector,
     style: std::rc::Rc<SpecifiedStyle>,
     important: bool,
     /// Cascade weight. Normally the compiled selector's own specificity;
     /// a selector recovered by lowering carries the specificity of the
     /// ORIGINAL construct instead (`:where()`'s arguments weigh nothing).
-    specificity: kuchiki::Specificity,
+    specificity: crate::dom::Specificity,
     key: RuleKey,
     plan: MatchPlan,
     /// Every depth-0 `.class`/`#id` in the selector: ALL must exist
@@ -1542,7 +1656,7 @@ fn rewrite_once((text, spec): &Candidate) -> Option<Vec<Candidate>> {
 
 /// Salvages one selector-list member servo rejected, pushing whatever
 /// compiles onto `out` with the specificity the cascade should charge it.
-fn lower_member(part: &str, out: &mut Vec<(kuchiki::Selector, kuchiki::Specificity)>) {
+fn lower_member(part: &str, out: &mut Vec<(crate::dom::Selector, crate::dom::Specificity)>) {
     // Bounded: a pathological nest of groups must not explode. Real pages
     // sit far under this (`:is()` lists are short and rarely nested).
     const BUDGET: usize = 48;
@@ -1555,7 +1669,7 @@ fn lower_member(part: &str, out: &mut Vec<(kuchiki::Selector, kuchiki::Specifici
             crate::ledger::record_css("selector-lower-budget");
             break;
         }
-        if kuchiki::Selectors::compile(&cand.0).is_ok() {
+        if crate::dom::Selectors::compile(&cand.0).is_ok() {
             done.push(cand);
             continue;
         }
@@ -1578,8 +1692,8 @@ fn lower_member(part: &str, out: &mut Vec<(kuchiki::Selector, kuchiki::Specifici
         crate::ledger::record_css("selector-lowered");
     }
     for (text, spec) in done {
-        let Ok(sels) = kuchiki::Selectors::compile(&text) else { continue };
-        let charged = kuchiki::Selectors::compile(&spec)
+        let Ok(sels) = crate::dom::Selectors::compile(&text) else { continue };
+        let charged = crate::dom::Selectors::compile(&spec)
             .ok()
             .and_then(|s| s.0.first().map(|sel| sel.specificity()));
         for sel in sels.0 {
@@ -1600,10 +1714,10 @@ fn lower_member(part: &str, out: &mut Vec<(kuchiki::Selector, kuchiki::Specifici
 /// headers and nav bars never got their layout properties. Recompiling
 /// member-by-member keeps the supported ones; lowering (above) recovers
 /// most of the rest; only what is left is ledgered.
-fn compile_selector_list(prelude: &str) -> Vec<(kuchiki::Selector, kuchiki::Specificity)> {
+fn compile_selector_list(prelude: &str) -> Vec<(crate::dom::Selector, crate::dom::Specificity)> {
     let mut out = Vec::new();
     // Fast path: the whole list parses, no salvage machinery runs at all.
-    if let Ok(s) = kuchiki::Selectors::compile(prelude) {
+    if let Ok(s) = crate::dom::Selectors::compile(prelude) {
         for sel in s.0 {
             let spec = sel.specificity();
             out.push((sel, spec));
@@ -1611,7 +1725,7 @@ fn compile_selector_list(prelude: &str) -> Vec<(kuchiki::Selector, kuchiki::Spec
         return out;
     }
     for part in split_selector_list(prelude) {
-        match kuchiki::Selectors::compile(part) {
+        match crate::dom::Selectors::compile(part) {
             Ok(s) => {
                 for sel in s.0 {
                     let spec = sel.specificity();
@@ -1670,9 +1784,9 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
     copy!(
         background, color, font_size, bold, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
-        mask_repeat, text_align,
+        mask_repeat, text_align, object_fit,
     );
-    clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
+    clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
 }
 
 /// Applies a set of stylesheets as ONE cascade — rules from every sheet
@@ -1708,7 +1822,7 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     // selector engine (whose has_class re-split class strings on every
     // test — the profiled hot path).
     struct ElemInfo {
-        el_ref: kuchiki::NodeDataRef<kuchiki::ElementData>,
+        el_ref: crate::dom::NodeDataRef<crate::dom::ElementData>,
         tag: String,
         id_attr: Option<String>,
         classes: std::collections::HashSet<String>,
@@ -1837,6 +1951,7 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     for (node_id, spec) in &acc {
         apply_spec_to_node(layout_tree, *node_id, spec, &mut abs_nodes, &mut inset_nodes);
     }
+    size_flex_items_by_content(layout_tree, &acc);
 
     // Static-position fallback: `position:absolute` with no inset specified
     // keeps its in-flow (static) position in real CSS. Taffy would pin such
@@ -1854,12 +1969,45 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     crate::layout::remeasure(layout_tree);
 }
 
+/// A flex item's `width: auto` is its content size, not its container's.
+/// Aether gives every block the block-flow default `width: 100%`; inside a
+/// real flex container that default would make each item claim the whole
+/// line (one item per row under wrap). Items whose author CSS sets no
+/// width fall back to `auto` here, after the cascade has settled.
+fn size_flex_items_by_content(
+    layout_tree: &mut LayoutTree,
+    acc: &std::collections::HashMap<taffy::NodeId, SpecifiedStyle>,
+) {
+    for (node_id, spec) in acc {
+        if spec.flex_container != Some(true) {
+            continue;
+        }
+        let row = layout_tree.taffy.style(*node_id).is_ok_and(|s| {
+            matches!(s.flex_direction, FlexDirection::Row | FlexDirection::RowReverse)
+        });
+        let kids = layout_tree.taffy.children(*node_id).unwrap_or_default();
+        for kid in kids {
+            let author_width = acc.get(&kid).is_some_and(|s| s.width.is_some());
+            let Ok(st) = layout_tree.taffy.style(kid) else { continue };
+            if author_width || st.size.width != Dimension::percent(1.0) {
+                continue;
+            }
+            let mut st = st.clone();
+            // Row: main-axis size from content/basis. Column: stretch
+            // (the default align-items) already fills the cross axis.
+            if row {
+                st.size.width = Dimension::auto();
+                let _ = layout_tree.taffy.set_style(kid, st);
+            }
+        }
+    }
+}
+
 fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
     if depth > 4 {
         return; // pathological nesting guard
     }
-    let mut input = ParserInput::new(css);
-    let mut parser = Parser::new(&mut input);
+    let mut parser = Parser::new(css);
 
     loop {
         // Slice the raw prelude up to the next `{`.
@@ -1890,7 +2038,7 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
             .parse_nested_block(|p| {
                 let s = p.position();
                 while p.next().is_ok() {}
-                Ok::<String, cssparser::ParseError<'_, ()>>(p.slice_from(s).to_string())
+                Ok::<String, cssparser::ParseError<()>>(p.slice_from(s).to_string())
             })
             .unwrap_or_default();
 
@@ -1927,7 +2075,7 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
             crate::ledger::record_css("pseudo-element-rule");
             continue;
         }
-        // Compile with kuchiki's real selector engine (servo selectors),
+        // Compile with the real selector engine (servo selectors over html_core, dom::select),
         // salvaging modern syntax it rejects (see `lower_member`).
         let selectors = compile_selector_list(&prelude);
         if selectors.is_empty() {
@@ -2057,7 +2205,8 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     }
     take!(display, flex_direction, width, height, padding, margin, position,
           inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_self,
-          max_width, max_height, min_width, min_height, box_sizing);
+          max_width, max_height, min_width, min_height, box_sizing,
+          flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis);
     merge_paint(&mut dst.paint, &src.paint);
 }
 
@@ -2122,6 +2271,7 @@ fn property_supported(prop: &str) -> bool {
             | "font" | "align-items" | "align-content"
             | "background-color" | "background" | "background-image" | "color"
             | "background-size" | "background-position" | "background-repeat"
+            | "object-fit" | "object-position"
             // Alpha-stencil masks really are implemented (render::draw_node),
             // so the component idiom `@supports (mask-image: none)` must take
             // the mask branch, not the background-image fallback branch.
@@ -2136,6 +2286,8 @@ fn property_supported(prop: &str) -> bool {
             | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width"
             | "text-decoration" | "text-decoration-line" | "text-transform" | "white-space" | "box-sizing"
             | "font-family"
+            | "flex" | "flex-grow" | "flex-shrink" | "flex-basis" | "flex-wrap" | "flex-flow"
+            | "gap" | "row-gap" | "column-gap"
     )
 }
 
@@ -2485,6 +2637,47 @@ fn parse_sides<T: Copy>(value: &str, parse_one: impl Fn(&str) -> Option<T>) -> O
         _ => return None,
     };
     Some(Rect { top: t, right: r, bottom: b, left: l })
+}
+
+/// `flex-basis`: `auto`, `content` (treated as auto), or a length/percentage.
+fn parse_flex_basis(value: &str) -> Option<Dimension> {
+    match value.trim() {
+        "auto" | "content" => Some(Dimension::auto()),
+        v => parse_dimension_str(v),
+    }
+}
+
+/// The `flex` shorthand → (grow, shrink, basis), per CSS Flexbox §7.2:
+/// `none` = 0 0 auto, `auto` = 1 1 auto, `initial` = 0 1 auto; a unitless
+/// first number is grow, an optional second number is shrink, and a lone
+/// or trailing length is the basis (an omitted basis is 0%).
+pub(crate) fn parse_flex_shorthand(value: &str) -> Option<(f32, f32, Dimension)> {
+    match value.trim() {
+        "none" => return Some((0.0, 0.0, Dimension::auto())),
+        "auto" => return Some((1.0, 1.0, Dimension::auto())),
+        "initial" => return Some((0.0, 1.0, Dimension::auto())),
+        _ => {}
+    }
+    let mut nums: Vec<f32> = Vec::new();
+    let mut basis: Option<Dimension> = None;
+    for part in value.split_whitespace() {
+        if basis.is_none() && nums.len() < 2 {
+            if let Ok(n) = part.parse::<f32>() {
+                nums.push(n);
+                continue;
+            }
+        }
+        if basis.is_some() {
+            return None;
+        }
+        basis = Some(parse_flex_basis(part)?);
+    }
+    match (nums.as_slice(), basis) {
+        ([], Some(b)) => Some((1.0, 1.0, b)),
+        ([g], b) => Some((*g, 1.0, b.unwrap_or(Dimension::percent(0.0)))),
+        ([g, s], b) => Some((*g, *s, b.unwrap_or(Dimension::percent(0.0)))),
+        _ => None,
+    }
 }
 
 fn parse_dimension_str(value: &str) -> Option<Dimension> {

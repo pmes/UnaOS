@@ -1,0 +1,77 @@
+# The local corpus: every page self-contained; its first line says what it tests.
+
+[[case]]
+name = "01-blog-article"
+page = "corpus/01-blog-article.html"
+
+[[case]]
+name = "02-flex-two-column"
+page = "corpus/02-flex-two-column.html"
+
+[[case]]
+name = "03-card-gallery"
+page = "corpus/03-card-gallery.html"
+
+[[case]]
+name = "04-sticky-nav"
+page = "corpus/04-sticky-nav.html"
+
+[[case]]
+name = "05-form"
+page = "corpus/05-form.html"
+
+[[case]]
+name = "06-table-zebra"
+page = "corpus/06-table-zebra.html"
+
+[[case]]
+name = "07-images-svg"
+page = "corpus/07-images-svg.html"
+
+[[case]]
+name = "08-inline-wrap"
+page = "corpus/08-inline-wrap.html"
+
+[[case]]
+name = "09-media-queries"
+page = "corpus/09-media-queries.html"
+
+[[case]]
+name = "09-media-queries@375"
+page = "corpus/09-media-queries.html"
+width = 375
+height = 812
+
+[[case]]
+name = "10-calc-clamp"
+page = "corpus/10-calc-clamp.html"
+
+[[case]]
+name = "10-calc-clamp@375"
+page = "corpus/10-calc-clamp.html"
+width = 375
+height = 812
+
+[[case]]
+name = "11-non-latin"
+page = "corpus/11-non-latin.html"
+
+[[case]]
+name = "12-js-mutation"
+page = "corpus/12-js-mutation.html"
+
+[[case]]
+name = "13-ua-defaults"
+page = "corpus/13-ua-defaults.html"
+
+[[case]]
+name = "14-boxes"
+page = "corpus/14-boxes.html"
+
+[[case]]
+name = "15-landing"
+page = "corpus/15-landing.html"
+
+[[case]]
+name = "16-positioned"
+page = "corpus/16-positioned.html"

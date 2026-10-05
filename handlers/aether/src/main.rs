@@ -60,19 +60,21 @@ pub async fn ignite(synapse: Synapse) -> Result<()> {
                         if let Err(e) = engine.load_url(&url).await {
                             eprintln!("Failed to load url {}: {}", url, e);
                         }
-                        // Charter: Aether renders, Stria plays. Any media the
-                        // page resolved is handed straight to Stria — the OS
-                        // owns the stream, no site-specific resolver.
-                        for (media_url, mime) in engine.media_sources() {
-                            println!("Handing media to Stria: {}", media_url);
-                            synapse.fire(SMessage::PlayMedia {
-                                url: media_url,
-                                title: engine.title.clone(),
-                                mime,
-                            });
-                        }
+                    }
+                    // Stria's replies for this page's <video>/<audio> elements.
+                    ref m @ (SMessage::MediaOpened { .. }
+                    | SMessage::MediaFrame { .. }
+                    | SMessage::MediaEnded { .. }
+                    | SMessage::MediaError { .. }) => {
+                        engine.on_media_message(m);
                     }
                     _ => {}
+                }
+                // Charter: Aether renders, Stria plays. The page's media elements queued
+                // their requests (posters on layout; muted autoplay; never bare autoplay —
+                // Chromium's policy): hand them to Stria.
+                for req in engine.take_media_requests() {
+                    synapse.fire(req);
                 }
             }
             // Engine tick
@@ -80,6 +82,11 @@ pub async fn ignite(synapse: Synapse) -> Result<()> {
                 // engine.tick() — NOT a bare run_jobs(): page timers live in
                 // the event_loop timer queue now, and only tick() fires them
                 // (bounded to one generation per turn).
+                // An http(s) media source that finished caching releases its request here
+                // (AUDIOTRACK M4), even when no bus message arrived this turn.
+                for req in engine.take_media_requests() {
+                    synapse.fire(req);
+                }
                 if engine.tick() {
                     // We let the shells handle repaint, so the handler mode doesn't need to do surface blits here,
                     // but we will keep this loop alive for JS timers/jobs.
