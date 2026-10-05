@@ -344,6 +344,13 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // but the COMMENT overstates and must be corrected in the same fold (reported, not edited here:
     // shell.rs is outside this arc's file list).
     ("dns", Avail::Always),
+    // WIFI1 (rmbp-ledger B338, R79): `wifi` [status|up|scan|join <ssid>] — the BCM4331 radio verb.
+    // A HOST verb (only the ring holds the radio and the bring-up ladder), `Avail::Always` on the
+    // same ONE-OS precedent as `dns`/`reboot`/`install`: the word exists on every UnaOS, and the
+    // platform (and the `wifi` knob) decides the answer. The kernel's dispatch arm is x86-only and
+    // `wifi`-gated; on a build without it the arm falls through to the honest "not available" refusal
+    // the drift net prints, exactly as `dns` does off `net6` (shell.rs's `other =>`).
+    ("wifi", Avail::Always),
     // apps + scheduler + power + witnesses
     ("v3d", Avail::V3d),
     // RELICS (R26 clause 3, Peter: "you must stop trying to pin everything down and lock it in

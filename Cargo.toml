@@ -10,6 +10,7 @@ members = [
     "unaos/libs/sys/helm",
     "unaos/libs/sys/midden_core",
     "unaos/libs/sys/prefs_core",
+    "unaos/libs/sys/wifi_core",
     "unaos/libs/sys/vein_core",
     "unaos/libs/sys/amber_core",
     "libs/pwm/pca9685",

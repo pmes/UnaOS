@@ -449,6 +449,7 @@ dependencies = [
  "unaos-xusb-fw",
  "vein_core",
  "volatile 0.6.1",
+ "wifi_core",
  "x86_64",
 ]
 
@@ -483,6 +484,10 @@ name = "volatile"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af8ca9a5d4debca0633e697c88269395493cebf2e10db21ca2dbde37c1356452"
+
+[[package]]
+name = "wifi_core"
+version = "0.1.0"
 
 [[package]]
 name = "x86_64"
