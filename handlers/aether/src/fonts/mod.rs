@@ -3,6 +3,8 @@ use font_kit::properties::Properties;
 use font_kit::source::SystemSource;
 use font_kit::font::Font;
 use std::sync::Arc;
+
+pub mod lines;
 use taffy::prelude::*;
 
 /// Cache key of one face: family class (0 sans, 1 serif, 2 mono) x bold x italic.

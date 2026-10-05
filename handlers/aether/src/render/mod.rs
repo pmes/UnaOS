@@ -18,6 +18,13 @@ struct Inherited {
     line_height: f32, // multiplier of font size
     underline: bool,
     nowrap: bool,
+    white_space: u8,
+    word_break: u8,
+    overflow_wrap: u8,
+    letter_spacing: f32,
+    line_through: bool,
+    /// vertical-align super/sub: paint-time baseline shift in px.
+    shift_y: f32,
     family: u8, // 0 sans, 1 serif, 2 mono
     /// The image-replacement idiom: this subtree's text is off-box, but
     /// its boxes and backgrounds still paint.
@@ -406,7 +413,8 @@ pub(crate) fn transform_text(text: &str, transform: u8) -> String {
     }
 }
 
-/// Draws `text` starting at (origin_x, origin_y), wrapping at `max_width`.
+/// Draws `text` starting at (origin_x, origin_y), wrapping at `max_width`
+/// (white-space: normal, no decoration beyond `underline`).
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     text: &str,
@@ -425,60 +433,92 @@ fn draw_text(
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let metrics = font.metrics();
-    let scale = font_size / metrics.units_per_em as f32;
-    // Half-leading baseline and the rounded `normal` line height — the
-    // measurer (layout::measure_text_family) uses the same two numbers.
+    let deco = Deco { underline, line_through: false };
+    draw_lines(
+        text, origin_x, origin_y, max_width, font, font_key, font_size, line_height_mult, color,
+        &crate::fonts::lines::TextMode::default(), deco, surface, width, height, damage_rects, clip,
+    );
+}
+
+/// Text decoration lines of one run.
+#[derive(Clone, Copy, Default)]
+struct Deco {
+    underline: bool,
+    line_through: bool,
+}
+
+/// Draws a run on the lines fonts::lines breaks it into — the same breaker
+/// the measurer used, so the run fills exactly its measured box.
+#[allow(clippy::too_many_arguments)]
+fn draw_lines(
+    text: &str,
+    origin_x: f32,
+    origin_y: f32,
+    max_width: f32,
+    font: &Font,
+    font_key: u8,
+    font_size: f32,
+    line_height_mult: f32,
+    color: (u8, u8, u8),
+    mode: &crate::fonts::lines::TextMode,
+    deco: Deco,
+    surface: &mut [u8],
+    width: u32,
+    height: u32,
+    damage_rects: &[(u32, u32, u32, u32)],
+    clip: Clip,
+) {
     let ascent = crate::fonts::baseline_offset(font, font_size, line_height_mult);
     let line_height = crate::fonts::line_height(font, font_size, line_height_mult);
-
-    let mut pen_x = 0.0f32;
-    let mut line = 0u32;
-
-    for word in text.split_whitespace() {
-        let word_width: f32 = word
-            .chars()
-            .filter_map(|c| font.glyph_for_char(c))
-            .filter_map(|g| font.advance(g).ok())
-            .map(|a| a.x() * scale)
-            .sum();
-        let space = crate::fonts::space_advance(font, font_size);
-
-        if pen_x > 0.0 && pen_x + word_width > max_width {
-            pen_x = 0.0;
-            line += 1;
-        }
-
-        for c in word.chars() {
-            let Some(glyph_id) = font.glyph_for_char(c) else { continue };
-            let advance = font.advance(glyph_id).map(|a| a.x() * scale).unwrap_or(font_size * 0.5);
-            let baseline_y = origin_y + line as f32 * line_height + ascent;
-            if rasterize_glyph_cached(font, font_key, glyph_id, font_size).is_some() {
-                blit_cached_glyph(
-                    font_key, glyph_id, font_size,
-                    origin_x + pen_x, baseline_y,
-                    color, surface, width, height, damage_rects, clip,
-                );
+    let adv = crate::fonts::lines::Advancer::new(font, font_key, font_size, mode.letter_spacing);
+    let lines = crate::fonts::lines::break_lines(&adv, text, mode, max_width);
+    let (a_px, _, _) = crate::fonts::line_metrics(font, font_size);
+    let hline = |x0: f32, x1: f32, y: f32, thick: u32, surface: &mut [u8]| {
+        let yi = y.round() as i32;
+        for dy in 0..thick as i32 {
+            let yy = yi + dy;
+            if yy < 0 || yy as u32 >= height {
+                continue;
             }
-            pen_x += advance;
-        }
-        if underline && word_width > 0.0 {
-            let baseline_y = origin_y + line as f32 * line_height + ascent;
-            let uy = (baseline_y + 2.0) as i32;
-            if uy >= 0 {
-                let x0 = (origin_x + pen_x - word_width).max(0.0) as u32;
-                let x1 = ((origin_x + pen_x) as u32).min(width);
-                let uy = uy as u32;
-                if uy < height {
-                    for x in x0..x1 {
-                        if in_damage(x, uy, damage_rects) && in_clip(x, uy, clip) {
-                            put_px(surface, width, x, uy, color);
-                        }
-                    }
+            let x0 = x0.max(0.0).round() as u32;
+            let x1 = (x1.max(0.0).round() as u32).min(width);
+            for x in x0..x1 {
+                if in_damage(x, yy as u32, damage_rects) && in_clip(x, yy as u32, clip) {
+                    put_px(surface, width, x, yy as u32, color);
                 }
             }
         }
-        pen_x += space;
+    };
+    let thick = (font_size / 16.0).round().max(1.0) as u32;
+    for (i, line) in lines.iter().enumerate() {
+        let baseline_y = origin_y + i as f32 * line_height + ascent;
+        let mut pen_x = 0.0f32;
+        for c in line.text.chars() {
+            let advance = adv.char(c);
+            if c != ' ' {
+                if let Some(glyph_id) = font.glyph_for_char(c) {
+                    if rasterize_glyph_cached(font, font_key, glyph_id, font_size).is_some() {
+                        blit_cached_glyph(
+                            font_key, glyph_id, font_size,
+                            origin_x + pen_x, baseline_y,
+                            color, surface, width, height, damage_rects, clip,
+                        );
+                    }
+                }
+            }
+            pen_x += advance;
+        }
+        // Decorations span the line's ink extent (leading/trailing
+        // collapsible spaces excluded).
+        let lead_w: f32 = line.text.chars().take_while(|c| *c == ' ').map(|c| adv.char(c)).sum();
+        let trail_w: f32 = line.text.chars().rev().take_while(|c| *c == ' ').map(|c| adv.char(c)).sum();
+        let (x0, x1) = (origin_x + lead_w, origin_x + (line.width - trail_w).max(lead_w));
+        if deco.underline && x1 > x0 {
+            hline(x0, x1, baseline_y + (font_size / 9.0).max(1.0), thick, surface);
+        }
+        if deco.line_through && x1 > x0 {
+            hline(x0, x1, baseline_y - a_px * 0.3, thick, surface);
+        }
     }
 }
 
@@ -683,6 +723,7 @@ pub fn render_frame(
 
             if let Some(el) = dom_node.as_element() {
                 let tag = el.name.local.as_ref();
+                let parent_font_size = inherited.font_size;
                 let own_family = spec
                     .family
                     .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
@@ -710,6 +751,22 @@ pub fn render_frame(
                 }
                 if let Some(nw) = spec.nowrap {
                     inherited.nowrap = nw;
+                }
+                inherited.white_space = spec
+                    .white_space
+                    .unwrap_or_else(|| crate::layout::default_white_space(tag, inherited.white_space));
+                if let Some(v) = spec.word_break { inherited.word_break = v; }
+                if let Some(v) = spec.overflow_wrap { inherited.overflow_wrap = v; }
+                if let Some(v) = spec.letter_spacing { inherited.letter_spacing = v; }
+                inherited.line_through = spec
+                    .line_through
+                    .unwrap_or_else(|| crate::layout::default_line_through(tag, inherited.line_through));
+                // Blink: super raises by parent-size/3 + 1, sub lowers by
+                // parent-size/5 + 1.
+                match tag {
+                    "sup" => inherited.shift_y -= parent_font_size / 3.0 + 1.0,
+                    "sub" => inherited.shift_y += parent_font_size / 5.0 + 1.0,
+                    _ => {}
                 }
                 if spec.text_hidden == Some(true) {
                     inherited.text_hidden = true;
@@ -1057,16 +1114,29 @@ pub fn render_frame(
                 };
                 if let Some(font) = font {
                     let text = dom_node.text_contents();
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        let text = transform_text(text, inherited.text_transform);
+                    if !text.trim().is_empty() || inherited.white_space >= 2 || layout.paint_map.get(&node_id).and_then(|p| p.ws_lead) == Some(true) {
+                        let text = transform_text(&text, inherited.text_transform);
+                        let spec_t = layout.paint_map.get(&node_id);
+                        let mut mode = crate::fonts::lines::TextMode {
+                            white_space: inherited.white_space,
+                            word_break: inherited.word_break,
+                            overflow_wrap: inherited.overflow_wrap,
+                            letter_spacing: inherited.letter_spacing,
+                            lead: spec_t.and_then(|p| p.ws_lead).unwrap_or(false),
+                            trail: spec_t.and_then(|p| p.ws_trail).unwrap_or(false),
+                        };
+                        if inherited.nowrap && mode.white_space == 0 {
+                            mode.white_space = 1;
+                        }
                         // A <button>'s label is an ordinary text child, so it
                         // is centred here against the ancestor control's
                         // content box — but only when the measured run fits on
                         // one line inside it, so a button wrapping rich or
                         // overflowing content keeps normal flow painting.
+                        let fkey = crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic);
                         let centered = inherited.center_box.and_then(|(cx, cy, cw, ch)| {
-                            let tw = measure_text_width(&text, font, inherited.font_size);
+                            let adv = crate::fonts::lines::Advancer::new(font, fkey, inherited.font_size, mode.letter_spacing);
+                            let tw = crate::fonts::lines::break_lines(&adv, &text, &mode, f32::MAX)[0].width;
                             (tw <= cw && cw > 0.0).then(|| {
                                 (
                                     cx + (cw - tw) / 2.0,
@@ -1075,22 +1145,32 @@ pub fn render_frame(
                                 )
                             })
                         });
+                        // Break at the UNROUNDED box width the measurer saw
+                        // (the rounded one can be a fraction narrower).
+                        let wrap_w = layout
+                            .taffy
+                            .unrounded_layout(node_id)
+                            .size
+                            .width
+                            .max(layout_box.size.width)
+                            + 0.01;
                         let (tx, ty, max_w) = centered.unwrap_or((
                             current_x - sx as f32,
-                            current_y - sy as f32,
-                            if inherited.nowrap { f32::MAX } else { layout_box.size.width.max(1.0) },
+                            current_y - sy as f32 + inherited.shift_y,
+                            if inherited.nowrap { f32::MAX } else { wrap_w.max(1.0) },
                         ));
-                        draw_text(
+                        draw_lines(
                             &text,
                             tx,
                             ty,
                             max_w,
                             font,
-                            crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
+                            fkey,
                             inherited.font_size,
                             inherited.line_height,
                             inherited.color,
-                            inherited.underline,
+                            &mode,
+                            Deco { underline: inherited.underline, line_through: inherited.line_through },
                             surface,
                             width,
                             height,
@@ -1141,6 +1221,12 @@ pub fn render_frame(
         line_height: 0.0, // natural
         underline: false,
         nowrap: false,
+        white_space: 0,
+        word_break: 0,
+        overflow_wrap: 0,
+        letter_spacing: 0.0,
+        line_through: false,
+        shift_y: 0.0,
         family: 0,
         text_hidden: false,
         text_transform: 0,

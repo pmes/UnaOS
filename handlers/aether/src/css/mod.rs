@@ -144,31 +144,18 @@ impl SpecifiedStyle {
 pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedStyle) {
     let value = value.trim();
     match prop {
-        "display" => match value {
-            "none" => style.display = Some(Display::None),
-            // Real flex containers: CSS flex semantics (see fold_into).
-            "flex" | "inline-flex" | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex"
-            | "-webkit-inline-flex" | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(true);
-                style.paint.flex_container = Some(true);
-            }
-            // Column-flex approximations of block-ish display types.
-            "block" | "inline-block" | "inline" | "list-item"
-            | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
-            | "table-header-group" | "table-footer-group" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(false);
-                style.paint.flex_container = Some(false);
-            }
-            "table-row" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(false);
-                style.flex_direction = Some(FlexDirection::Row);
-            }
-            "inherit" | "initial" | "unset" | "revert" => {}
-            other => crate::ledger::record_css(&format!("display:{}", other)),
-        },
+        "display" => {
+            // Outer display type (css-display-3 §2.1) for the inline
+            // whitespace pass: 0 inline, 1 block-level, 2 inline-level box.
+            style.paint.display_kind = match value {
+                "inline" | "contents" => Some(0),
+                "inline-block" | "inline-flex" | "inline-grid" | "inline-table"
+                | "-webkit-inline-box" | "-webkit-inline-flex" | "-ms-inline-flexbox" => Some(2),
+                "none" | "inherit" | "initial" | "unset" | "revert" => None,
+                _ => Some(1),
+            };
+            apply_display(value, style);
+        }
         "flex-direction" => match value {
             "row" => style.flex_direction = Some(FlexDirection::Row),
             "column" => style.flex_direction = Some(FlexDirection::Column),
@@ -595,13 +582,47 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 style.paint.underline = Some(true);
             } else if v.starts_with("none") {
                 style.paint.underline = Some(false);
+                style.paint.line_through = Some(false);
+            }
+            if v.contains("line-through") {
+                style.paint.line_through = Some(true);
             }
         }
-        "white-space" => match value {
-            "nowrap" | "pre" => style.paint.nowrap = Some(true),
-            "normal" | "pre-wrap" | "pre-line" | "break-spaces" => style.paint.nowrap = Some(false),
+        "white-space" | "white-space-collapse" => {
+            let code = match value {
+                "normal" => Some(0),
+                "nowrap" => Some(1),
+                "pre" => Some(2),
+                "pre-wrap" => Some(3),
+                "pre-line" => Some(4),
+                "break-spaces" => Some(5),
+                _ => None,
+            };
+            if let Some(c) = code {
+                style.paint.white_space = Some(c);
+                style.paint.nowrap = Some(matches!(c, 1 | 2));
+            }
+        }
+        "word-break" => match value {
+            "normal" => style.paint.word_break = Some(0),
+            "break-all" => style.paint.word_break = Some(1),
+            "keep-all" => style.paint.word_break = Some(2),
+            // Legacy: word-break: break-word = overflow-wrap: anywhere.
+            "break-word" => style.paint.overflow_wrap = Some(1),
             _ => {}
         },
+        "overflow-wrap" | "word-wrap" => match value {
+            "normal" => style.paint.overflow_wrap = Some(0),
+            "break-word" | "anywhere" => style.paint.overflow_wrap = Some(1),
+            _ => {}
+        },
+        "letter-spacing" => {
+            if value == "normal" {
+                style.paint.letter_spacing = Some(0.0);
+            } else if let Some(px) = parse_px(value) {
+                style.paint.letter_spacing = Some(px);
+            }
+        }
         "box-sizing" => match value {
             "border-box" => style.box_sizing = Some(taffy::style::BoxSizing::BorderBox),
             "content-box" => style.box_sizing = Some(taffy::style::BoxSizing::ContentBox),
@@ -1812,6 +1833,7 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         background, color, font_size, bold, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, flex_container, border_style, radius,
+        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
     );
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
 }
@@ -2653,6 +2675,35 @@ impl MathParser<'_> {
             u => parse_viewport_length(&format!("{}{}", n, u)),
         }
     }
+}
+
+/// `display` value -> Aether's box approximation (flex-backed).
+fn apply_display(value: &str, style: &mut SpecifiedStyle) {
+    match value {
+        "none" => style.display = Some(Display::None),
+            // Real flex containers: CSS flex semantics (see fold_into).
+            "flex" | "inline-flex" | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex"
+            | "-webkit-inline-flex" | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
+                style.display = Some(Display::Flex);
+                style.flex_container = Some(true);
+                style.paint.flex_container = Some(true);
+            }
+            // Column-flex approximations of block-ish display types.
+            "block" | "inline-block" | "inline" | "list-item"
+            | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
+            | "table-header-group" | "table-footer-group" => {
+                style.display = Some(Display::Flex);
+                style.flex_container = Some(false);
+                style.paint.flex_container = Some(false);
+            }
+            "table-row" => {
+                style.display = Some(Display::Flex);
+                style.flex_container = Some(false);
+                style.flex_direction = Some(FlexDirection::Row);
+            }
+            "inherit" | "initial" | "unset" | "revert" => {}
+            other => crate::ledger::record_css(&format!("display:{}", other)),
+            }
 }
 
 /// border-style keyword -> paint code (0 solid, 1 dashed, 2 dotted,
