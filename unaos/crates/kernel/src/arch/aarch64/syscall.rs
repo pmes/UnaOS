@@ -3549,7 +3549,7 @@ const PORPHANED: u8 = 3;
 ///     the two extra `done.init()` waiter reservations of `WAIT_CAPACITY` boxes — a few hundred bytes of
 ///     BSS and heap, entirely off the per-slot `SLOT_BACKING` budget, which `USER_SLOTS` governs and this
 ///     change does not touch.
-const MAX_PROCS: usize = 6;
+const MAX_PROCS: usize = super::uslots::USER_SLOTS - 2; // WINDOWCAP-2 (B378, R90) — derived from the EL0 slot pool (its 2-slot reserve kept), as on x86; `sched::MAX_KILL_REQS` follows the same expression; the live limit is `video::wincap::proc_limit()`
 struct Proc {
     /// The child task id; the sys_wait key. 0 while an entry is FREE or a claim's pid is not yet stored.
     pid: AtomicU64,
