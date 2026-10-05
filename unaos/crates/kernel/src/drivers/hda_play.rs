@@ -371,7 +371,7 @@ pub fn request_open(path: &str) { *PENDING.lock() = Some(String::from(path)); AC
 pub fn shell_verb(args: &[&str], path: &str, console: &mut crate::console::Console) {
     match args.first().copied() {
         None => console.println("usage: play <file: wav flac ogg opus mp3 aac m4a aiff> | play stop"),
-        Some("stop") => { stop(); console.println("play: stopped"); }
+        Some("stop") => { stop(); dec_stop(); console.println("play: stopped"); }
         Some(_) => match open_wav(path) {
             Ok(()) => console.println(&alloc::format!("play: {} — streaming (watch the serial for :: PLAYWAV ::)", path)),
             Err(r) => console.println(&alloc::format!("play: {}: {}", path, r)),
@@ -523,86 +523,12 @@ impl audio_core::Read for VfsSrc {
     }
 }
 
-struct Coded {
-    path: String, dec: audio_core::Decoder, info: audio_core::Info,
-    out_ch: usize, step: usize, phase: usize,
-    buf: Vec<i32>, pend: Vec<u8>,
-    decoded: u64, fed: u64, eos: bool, fed_end: bool, err: Option<audio_core::Error>,
-}
-static CODED: spin::Mutex<Option<Coded>> = spin::Mutex::new(None);
-
-/// Open `path` through audio_core (`wav_reason`: why the native WAV parse refused it). Prints the witness arm on refusal.
-fn open_coded(path: &str, wav_reason: String) -> Result<(), String> {
-    use audio_core::AudioDecoder;
-    let refuse = |r: String| -> Result<(), String> { serial_println!(":: PLAYWAV: path={} reason={} -> REFUSED ::", path, r); Err(r) };
-    let dec = match audio_core::Decoder::open(alloc::boxed::Box::new(VfsSrc { path: String::from(path), off: 0 })) {
-        Ok(d) => d,
-        Err(e) => return refuse(alloc::format!("{}; audio_core: {:?}", wav_reason, e)),
-    };
-    let info = dec.info();
-    let step = (info.rate as usize).div_ceil(48_000).max(1);
-    let rate = info.rate / step as u32;
-    let out_ch = if info.channels >= 2 { 2 } else { 1 };
-    let eff = match start(rate, out_ch as u8, 16) { Ok(e) => e, Err(r) => return refuse(alloc::format!("{} ({} Hz / {} ch from {})", r, rate, out_ch, info.format.name())) };
-    serial_println!("[play] open path={} format={} codec={:?} rate={} ch={} bits={} frames={:?} decim={} out_ch={} eff_rate={} resampled={}",
-        path, info.format.name(), info.codec, info.rate, info.channels, info.bits, info.frames, step, out_ch, eff, (eff != rate) as u8);
-    *CODED.lock() = Some(Coded { path: String::from(path), dec, info, out_ch, step, phase: 0, buf: Vec::new(), pend: Vec::new(),
-                                 decoded: 0, fed: 0, eos: false, fed_end: false, err: None });
-    ACTIVE.store(true, Ordering::Release);
-    Ok(())
-}
-
-/// Decode ahead into `feed()`: up to four 4096-frame blocks per tick, held back while the FIFO is full.
-fn coded_pump() {
-    use audio_core::AudioDecoder;
-    for _ in 0..4 {
-        let mut g = CODED.lock();
-        let Some(c) = g.as_mut() else { return };
-        if c.fed_end { return; }
-        if c.pend.is_empty() {
-            if c.eos { c.fed_end = true; drop(g); finish(); return; }
-            let ch = c.info.channels as usize;
-            c.buf.resize(4096 * c.step * ch, 0);
-            let n = match c.dec.next_i32(&mut c.buf) { Ok(n) => n, Err(e) => { c.err = Some(e); 0 } };
-            if n == 0 { c.eos = true; continue; }
-            c.decoded += n as u64;
-            // downmix: the first two channels carry, every further one adds half weight to both; scaled so a full
-            // scale input cannot clip (Q15)
-            let w0: i64 = if ch <= 2 { 32_768 } else { 65_536 / ch as i64 };
-            for i in 0..n {
-                let ph = c.phase; c.phase = (c.phase + 1) % c.step;
-                if ph != 0 { continue; }
-                let f = &c.buf[i * ch..i * ch + ch];
-                let v = |k: usize| (f[k] >> 16) as i64;
-                let (l, r) = if ch == 1 { (v(0), v(0)) } else if ch == 2 { (v(0), v(1)) } else {
-                    let rest: i64 = (2..ch).map(v).sum();
-                    ((v(0) * w0 + rest * w0 / 2) >> 15, (v(1) * w0 + rest * w0 / 2) >> 15)
-                };
-                let (l, r) = (l.clamp(-32_768, 32_767) as i16, r.clamp(-32_768, 32_767) as i16);
-                c.pend.extend_from_slice(&l.to_le_bytes());
-                if c.out_ch == 2 { c.pend.extend_from_slice(&r.to_le_bytes()); }
-                c.fed += 1;
-            }
-        }
-        if feed(&c.pend) == 0 { return; } // no room: retry next tick
-        c.pend.clear();
-    }
-}
-
-/// The coded player's verdict, once the ring has drained (`service()`, after `report()`).
-fn coded_report() {
-    let c = CODED.lock().take();
-    let Some(c) = c else { return };
-    let s = ST.lock();
-    let rate = c.info.rate / c.step as u32;
-    let stated_ok = c.info.frames.map(|f| f == c.decoded).unwrap_or(true);
-    let ok = s.in_frames == c.fed && c.err.is_none() && stated_ok && s.underruns == 0 && s.err == 0 && s.completed >= 1 && s.lpib_moved && s.done;
-    let ms = c.fed * 1000 / rate.max(1) as u64;
-    serial_println!("[play] done resampled={} eff_rate={} entries={} fifoe_dese={} run_bit={} lpib_moved={} level={}", s.resampled as u8, s.eff_rate, s.completed, s.err, s.run_bit as u8, s.lpib_moved as u8, s.level);
-    serial_println!(":: PLAYCODEC: path={} format={} codec={:?} rate={} frames={} lpib_moved={} done={} -> {} :: ch={} decoded={} stated={:?} decim={} err={:?} secs={}.{} under={} ::",
-        c.path, c.info.format.name(), c.info.codec, c.info.rate, s.in_frames, s.lpib_moved as u8, s.done as u8, if ok { "PASS" } else { "FAIL" },
-        c.info.channels, c.decoded, c.info.frames, c.step, c.err, ms / 1000, (ms % 1000) / 100, s.underruns);
-}
+// MP3HANG (rmbp B373): the coded player's state, its decode and its verdict live at the file TAIL (`dec_*`):
+// the decoder runs on its own `play-dec` task, never on the caller of `open_wav`/`service()` (flight 23: the
+// render task, 32 KiB, run off its stack by a 92.5 KiB `Decoder::open` frame). These three keep their names.
+fn open_coded(path: &str, wav_reason: String) -> Result<(), String> { dec_open(path, wav_reason) }
+fn coded_pump() { dec_pump() }
+fn coded_report() { dec_report() }
 
 /// `tests play [fmt]` (and `tests playflac` … through `crate::tests::arg()`): play `TEST.<EXT>` from the user's home,
 /// /home or / for each format; a format with no such file SKIPs. The completion is the ring's drain, as in `tests playwav`.
@@ -627,22 +553,399 @@ pub fn selftest_codecs() {
             serial_println!(":: PLAYCODEC: fmt={} path=- reason=no-file (put TEST.{} in /home, /system/test-f or /) -> SKIP ::", fmt, ext);
             continue;
         };
+        let jid0 = DEC_GEN.load(Ordering::Acquire); // MP3HANG: a coded play bumps the decoder generation
         match open_wav(&path) {
             Ok(()) => {
                 let mut stalled = false;
+                let (mut last, mut gap) = (crate::arch::ms(), 0u64); // MP3HANG: this loop's longest pass (MP3GUARD keys_alive)
                 while ACTIVE.load(Ordering::Acquire) {
                     service();
                     let (_done, _moved, st) = progress();
                     if st { stalled = true; break; }
                     delay_us(2_000);
+                    let now = crate::arch::ms(); gap = gap.max(now.saturating_sub(last)); last = now;
                 }
                 if stalled {
                     let (lp, run_bit, fifo) = { let s = ST.lock(); (s.lpib_last, s.run_bit as u8, s.fifo.len()) };
-                    stop();
+                    stop(); dec_stop();
                     serial_println!(":: PLAYCODEC: fmt={} path={} reason=stalled lpib={} run_bit={} fifo={} -> FAIL ::", fmt, path, lp, run_bit, fifo);
                 }
+                if DEC_GEN.load(Ordering::Acquire) != jid0 { dec_guard(fmt, &path, gap); }
             }
             Err(r) => serial_println!(":: PLAYCODEC: fmt={} path={} reason={} -> SKIP ::", fmt, path, r),
         }
+    }
+}
+
+// ── MP3HANG (rmbp-ledger B373) — the coded player's decode on its OWN task ──────────────────────────────────────
+// Flight 23 (image 16): `tests play mp3` → `:: TESTS: run play ::` → nothing on the wire for 18 minutes, keys dead,
+// the glass alive. Read and measured (docs/dev/evidence/rmbp-1005/mp3hang.md): `tests` dispatches on the x86 RENDER
+// task (32 KiB, `RENDER_PATH_STACK_SIZE`), and `audio_core::Decoder::open` was a 92504-byte frame on this target —
+// its inline stack probes zeroed a qword every 4 KiB through the guard into the heap below, and the MP3 arm then
+// wrote a 16 KiB decoder there. audio_core's frames are bounded at the source now (M1, the shared core); this is the
+// kernel half: NO caller of `open_wav`/`service()` — the render task, a Quarry click, the shell — ever runs a codec
+// again. The decoder lives on `play-dec`, a task with a sized stack, and hands 16-bit PCM through a BOUNDED queue
+// that `service()` drains into `feed()`. `service()` never waits on it: it reads the decoder's heartbeat, and a
+// silence longer than `DEC_STALL_MS` is named on the wire (`[play] mp3 stall stage=… frame=… ms=…`) and ends the play.
+
+/// `play-dec`'s usable stack. Measured, not guessed (`-Z emit-stack-sizes`, x86_64-unaos.json, after M1): the
+/// deepest decoder chain is Opus's open (`OggOpus::new` 9352 + `ChannelState::new` 4232 + the open/arm frames,
+/// under 16 KiB); MP3's is under 8 KiB (`decode_frame` 5384). The VFS read under `VfsSrc` runs the same chain the
+/// 32 KiB render task runs today (RENDSTACK measured that task at 15600 high). 64 KiB = the two plus margin;
+/// `[play] dec stack high=` reports the real high-water of every play, so the next flight checks the number.
+const DEC_STACK: usize = 64 * 1024;
+/// A decoder that has not advanced in this long while it holds the CPU-side stages (demux/frame/synth) is stalled.
+const DEC_STALL_MS: u64 = 2_000;
+/// The PCM queue between `play-dec` and `feed()`: at most this many bytes decoded ahead (~0.7 s at 48 kHz stereo).
+const DEC_QUEUE: usize = 128 * 1024;
+/// `[play] <codec> frames=` every this many decoder calls (each call is up to 4096 source frames).
+const DEC_PRINT_EVERY: u32 = 4;
+/// `play-dec` gives up waiting for a consumer that stopped draining (a `play stop`, a stalled ring) after this long.
+const DEC_ORPHAN_MS: u64 = 10_000;
+
+const STAGE_IDLE: u8 = 0;
+const STAGE_DEMUX: u8 = 1; // `Decoder::open`: container + header parse
+const STAGE_ARM: u8 = 2; // opened; waiting for `service()` to arm the stream and print `[play] open`
+const STAGE_FRAME: u8 = 3; // inside `next_i32` (the codec's frame decode, synthesis included)
+const STAGE_SYNTH: u8 = 4; // our side: downmix / decimate / pack to 16-bit
+const STAGE_DMA: u8 = 5; // the queue is full: waiting on the ring to drain (not a decoder stall)
+const STAGE_DONE: u8 = 6;
+
+fn stage_name(s: u8) -> &'static str {
+    match s { STAGE_DEMUX => "demux", STAGE_ARM => "arm", STAGE_FRAME => "frame", STAGE_SYNTH => "synth", STAGE_DMA => "dma", STAGE_DONE => "done", _ => "idle" }
+}
+
+static DEC_STAGE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(STAGE_IDLE);
+static DEC_BEAT_MS: AtomicU64 = AtomicU64::new(0);
+static DEC_CALLS: AtomicU64 = AtomicU64::new(0);
+static DEC_LIVE: AtomicBool = AtomicBool::new(false);
+static DEC_ABORT: AtomicBool = AtomicBool::new(false);
+static DEC_ARMED: AtomicBool = AtomicBool::new(false);
+static DEC_GEN: AtomicU32 = AtomicU32::new(0);
+/// The last coded play's guard facts, for `tests play`'s MP3GUARD line: (stall stage or 0, heartbeat lines, stack high).
+static DEC_STALL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static DEC_BEATS: AtomicU32 = AtomicU32::new(0);
+static DEC_HIGH: AtomicU64 = AtomicU64::new(0);
+
+/// What `play-dec` hands across (under one lock, held only for a copy).
+struct DecOut {
+    jid: u32,
+    path: String,
+    info: Option<audio_core::Info>,
+    open_err: Option<String>,
+    wav_reason: String,
+    out_ch: usize, step: usize,
+    pcm: VecDeque<u8>,
+    decoded: u64, fed: u64, eos: bool, err: Option<audio_core::Error>,
+    /// `dec_pump` has armed (or refused) this play — it is never armed twice.
+    consumed: bool,
+}
+static DEC_OUT: spin::Mutex<Option<DecOut>> = spin::Mutex::new(None);
+
+/// The service side's view of the current coded play.
+struct Coded { path: String, info: audio_core::Info, step: usize, armed: bool, fed_end: bool, open_ms: u64 }
+static CODED: spin::Mutex<Option<Coded>> = spin::Mutex::new(None);
+
+/// `open_coded`: hand `path` to a fresh `play-dec` task. Returns at once; the stream is armed by `dec_pump` once the
+/// decoder has read the headers. One decoder at a time: a live (or wedged) one refuses the next open, by name.
+fn dec_open(path: &str, wav_reason: String) -> Result<(), String> {
+    if DEC_LIVE.load(Ordering::Acquire) {
+        let st = stage_name(DEC_STAGE.load(Ordering::Acquire));
+        serial_println!(":: PLAYWAV: path={} reason=decoder busy (stage={}) -> REFUSED ::", path, st);
+        return Err(alloc::format!("decoder busy (stage={})", st));
+    }
+    stop();
+    let jid = DEC_GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    *DEC_OUT.lock() = Some(DecOut { jid, path: String::from(path), info: None, open_err: None, wav_reason, out_ch: 1, step: 1,
+                                    pcm: VecDeque::new(), decoded: 0, fed: 0, eos: false, err: None, consumed: false });
+    *CODED.lock() = None;
+    DEC_ABORT.store(false, Ordering::Release);
+    DEC_ARMED.store(false, Ordering::Release);
+    DEC_CALLS.store(0, Ordering::Release);
+    DEC_STALL.store(0, Ordering::Release);
+    DEC_BEATS.store(0, Ordering::Release);
+    DEC_HIGH.store(0, Ordering::Release);
+    DEC_STAGE.store(STAGE_DEMUX, Ordering::Release);
+    DEC_BEAT_MS.store(crate::arch::ms(), Ordering::Release);
+    DEC_LIVE.store(true, Ordering::Release);
+    let cpu = crate::arch::sched::other_dispatching_cpu();
+    serial_println!("[play] dec spawn path={} jid={} stack={} cpu={}", path, jid, DEC_STACK, if cpu == crate::arch::sched::CPU_AUTO { -1 } else { cpu as i64 });
+    crate::arch::sched::spawn_stack("play-dec", dec_task, jid as usize, cpu, crate::arch::sched::PRIO_NORMAL, DEC_STACK);
+    ACTIVE.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn dec_beat(stage: u8) {
+    DEC_STAGE.store(stage, Ordering::Release);
+    DEC_BEAT_MS.store(crate::arch::ms(), Ordering::Release);
+}
+
+/// The `play-dec` task. Everything that can run long or deep — the container parse, every frame decode, the
+/// downmix — runs here, in bounded steps (one `next_i32` call of at most 4096 frames), with a heartbeat between.
+fn dec_task(arg: usize) {
+    use audio_core::AudioDecoder;
+    let jid = arg as u32;
+    let mine = || DEC_GEN.load(Ordering::Acquire) == jid && !DEC_ABORT.load(Ordering::Acquire);
+    let paint = dec_stack_paint();
+    let path = match DEC_OUT.lock().as_ref() { Some(o) if o.jid == jid => o.path.clone(), _ => { dec_exit(jid, paint, "superseded"); return; } };
+    dec_beat(STAGE_DEMUX);
+    let opened = audio_core::Decoder::open(alloc::boxed::Box::new(VfsSrc { path: path.clone(), off: 0 }));
+    let mut dec = match opened {
+        Ok(d) => d,
+        Err(e) => {
+            if let Some(o) = DEC_OUT.lock().as_mut().filter(|o| o.jid == jid) { o.open_err = Some(alloc::format!("{}; audio_core: {:?}", o.wav_reason, e)); }
+            dec_exit(jid, paint, "open-refused");
+            return;
+        }
+    };
+    let info = dec.info();
+    let step = (info.rate as usize).div_ceil(48_000).max(1);
+    let out_ch = if info.channels >= 2 { 2 } else { 1 };
+    if let Some(o) = DEC_OUT.lock().as_mut().filter(|o| o.jid == jid) { o.info = Some(info); o.step = step; o.out_ch = out_ch; }
+    // `[play] open` is printed by `dec_pump` when it arms the stream: no frame is decoded before it is on the wire.
+    dec_beat(STAGE_ARM);
+    while mine() && !DEC_ARMED.load(Ordering::Acquire) {
+        if crate::arch::ms().saturating_sub(DEC_BEAT_MS.load(Ordering::Acquire)) > DEC_ORPHAN_MS { dec_exit(jid, paint, "never-armed"); return; }
+        crate::arch::sched::sleep_ms(2);
+    }
+    let ch = info.channels as usize;
+    let mut buf: Vec<i32> = alloc::vec![0; 4096 * step * ch.max(1)];
+    let mut phase = 0usize;
+    let codec = alloc::format!("{:?}", info.codec).to_ascii_lowercase();
+    let t0 = crate::arch::ms();
+    let mut calls = 0u32;
+    let mut waited_ms = 0u64;
+    loop {
+        if !mine() { dec_exit(jid, paint, "aborted"); return; }
+        // the bounded queue: decode ahead no further than DEC_QUEUE; a consumer gone for DEC_ORPHAN_MS ends the task
+        let queued = DEC_OUT.lock().as_ref().map(|o| o.pcm.len()).unwrap_or(0);
+        if queued >= DEC_QUEUE {
+            dec_beat(STAGE_DMA);
+            crate::arch::sched::sleep_ms(2);
+            waited_ms += 2;
+            if waited_ms > DEC_ORPHAN_MS { dec_exit(jid, paint, "consumer-gone"); return; }
+            continue;
+        }
+        waited_ms = 0;
+        dec_beat(STAGE_FRAME);
+        let (n, err) = match dec.next_i32(&mut buf) { Ok(n) => (n, None), Err(e) => (0, Some(e)) };
+        calls += 1;
+        DEC_CALLS.store(calls as u64, Ordering::Release);
+        dec_beat(STAGE_SYNTH);
+        let mut pend: Vec<u8> = Vec::with_capacity(n / step * out_ch * 2 + 4);
+        let mut fed = 0u64;
+        // downmix: the first two channels carry, every further one adds half weight to both; scaled so a full
+        // scale input cannot clip (Q15) — the arithmetic `coded_pump` ran before MP3HANG, unchanged
+        let w0: i64 = if ch <= 2 { 32_768 } else { 65_536 / ch as i64 };
+        for i in 0..n {
+            let ph = phase; phase = (phase + 1) % step;
+            if ph != 0 { continue; }
+            let f = &buf[i * ch..i * ch + ch];
+            let v = |k: usize| (f[k] >> 16) as i64;
+            let (l, r) = if ch == 1 { (v(0), v(0)) } else if ch == 2 { (v(0), v(1)) } else {
+                let rest: i64 = (2..ch).map(v).sum();
+                ((v(0) * w0 + rest * w0 / 2) >> 15, (v(1) * w0 + rest * w0 / 2) >> 15)
+            };
+            let (l, r) = (l.clamp(-32_768, 32_767) as i16, r.clamp(-32_768, 32_767) as i16);
+            pend.extend_from_slice(&l.to_le_bytes());
+            if out_ch == 2 { pend.extend_from_slice(&r.to_le_bytes()); }
+            fed += 1;
+        }
+        let (decoded, eos) = {
+            let mut g = DEC_OUT.lock();
+            let Some(o) = g.as_mut().filter(|o| o.jid == jid) else { drop(g); dec_exit(jid, paint, "superseded"); return; };
+            o.pcm.extend(pend.iter().copied());
+            o.decoded += n as u64;
+            o.fed += fed;
+            if err.is_some() { o.err = err; }
+            if n == 0 { o.eos = true; }
+            (o.decoded, o.eos)
+        };
+        if eos || calls % DEC_PRINT_EVERY == 0 {
+            DEC_BEATS.fetch_add(1, Ordering::AcqRel);
+            serial_println!("[play] {} frames={} calls={} ms={}{}", codec, decoded, calls, crate::arch::ms().saturating_sub(t0), if eos { " eos=1" } else { "" });
+        }
+        if eos { dec_exit(jid, paint, "eos"); return; }
+        crate::arch::sched::yield_now();
+    }
+}
+
+/// `play-dec`'s end, every path: the stack high-water on the wire, the task's liveness released.
+fn dec_exit(jid: u32, paint: Option<(u64, u64)>, why: &str) {
+    let high = dec_stack_high(paint);
+    DEC_HIGH.store(high, Ordering::Release);
+    serial_println!("[play] dec exit jid={} why={} stage={} calls={} stack high={} of {}", jid, why, stage_name(DEC_STAGE.load(Ordering::Acquire)), DEC_CALLS.load(Ordering::Acquire), high, DEC_STACK);
+    if DEC_GEN.load(Ordering::Acquire) == jid { DEC_STAGE.store(STAGE_DONE, Ordering::Release); }
+    DEC_LIVE.store(false, Ordering::Release);
+}
+
+const DEC_PAINT: u8 = 0xC3;
+
+/// Paint this task's own unused stack (from its low bound, past the guard, up to 1 KiB under the live frame) so
+/// `dec_stack_high` can read the deepest point the decode reached — the measurement `DEC_STACK` is checked by.
+fn dec_stack_paint() -> Option<(u64, u64)> {
+    let (low, top) = crate::arch::sched::current_stack_bounds()?;
+    let marker = 0u8;
+    let here = &marker as *const u8 as u64;
+    if here <= low + 2048 || here > top { return None; }
+    let end = here - 1024;
+    let mut a = low;
+    while a < end {
+        // SAFETY: [low, here - 1 KiB) is this task's own stack below its live frame (the bounds are the scheduler's
+        // for the task on this core); nothing lives there yet, and an interrupt frame that lands later overwrites
+        // the paint, which is what the reading counts.
+        unsafe { core::ptr::write_volatile(a as *mut u8, DEC_PAINT); }
+        a += 1;
+    }
+    Some((low, top))
+}
+
+fn dec_stack_high(paint: Option<(u64, u64)>) -> u64 {
+    let Some((low, top)) = paint else { return 0 };
+    let mut a = low;
+    // SAFETY: the same span `dec_stack_paint` wrote, on this task's own stack, read below the live frame.
+    while a < top && unsafe { core::ptr::read_volatile(a as *const u8) } == DEC_PAINT { a += 1; }
+    top - a
+}
+
+/// `coded_pump` (the service tick, whatever task runs it): arm the stream once the decoder has the headers, move
+/// decoded PCM into `feed()`, and watch the heartbeat. Never calls into a codec; every lock here is held for a copy.
+fn dec_pump() {
+    let jid = DEC_GEN.load(Ordering::Acquire);
+    // 1) the decoder's open finished: arm the HDA stream here, on the service side, and say so BEFORE any frame
+    let need_arm = CODED.lock().is_none();
+    if need_arm {
+        let (path, info, open_err, step, out_ch) = {
+            let mut g = DEC_OUT.lock();
+            let Some(o) = g.as_mut().filter(|o| o.jid == jid && !o.consumed) else { return };
+            if o.open_err.is_none() && o.info.is_none() { drop(g); dec_watch(jid); return; } // still in the demux
+            o.consumed = true;
+            (o.path.clone(), o.info, o.open_err.clone(), o.step, o.out_ch)
+        };
+        if let Some(r) = open_err {
+            serial_println!(":: PLAYWAV: path={} reason={} -> REFUSED ::", path, r);
+            dec_end_play();
+            return;
+        }
+        if let Some(info) = info {
+            let rate = info.rate / step as u32;
+            match start(rate, out_ch as u8, 16) {
+                Ok(eff) => {
+                    serial_println!("[play] open path={} format={} codec={:?} rate={} ch={} bits={} frames={:?} decim={} out_ch={} eff_rate={} resampled={}",
+                        path, info.format.name(), info.codec, info.rate, info.channels, info.bits, info.frames, step, out_ch, eff, (eff != rate) as u8);
+                    *CODED.lock() = Some(Coded { path, info, step, armed: true, fed_end: false, open_ms: crate::arch::ms() });
+                    ACTIVE.store(true, Ordering::Release);
+                    DEC_ARMED.store(true, Ordering::Release);
+                }
+                Err(r) => {
+                    serial_println!(":: PLAYWAV: path={} reason={} ({} Hz / {} ch from {}) -> REFUSED ::", path, r, rate, out_ch, info.format.name());
+                    dec_end_play();
+                    return;
+                }
+            }
+        }
+    }
+    // 2) the watchdog
+    if dec_watch(jid) { return; }
+    // 3) PCM across: whole chunks of at most 16 KiB, all-or-nothing as `feed()` takes them
+    let armed = CODED.lock().as_ref().map(|c| c.armed && !c.fed_end).unwrap_or(false);
+    if !armed { return; }
+    dec_feed(jid);
+}
+
+/// The watchdog: a decoder silent in a CPU stage (demux/frame/synth) for `DEC_STALL_MS` is named on the wire and
+/// the play ends. Returns true when it ended the play.
+fn dec_watch(jid: u32) -> bool {
+    let stage = DEC_STAGE.load(Ordering::Acquire);
+    if DEC_LIVE.load(Ordering::Acquire) && matches!(stage, STAGE_DEMUX | STAGE_FRAME | STAGE_SYNTH) {
+        let silent = crate::arch::ms().saturating_sub(DEC_BEAT_MS.load(Ordering::Acquire));
+        if silent > DEC_STALL_MS {
+            let (codec, frames) = {
+                let g = DEC_OUT.lock();
+                let o = g.as_ref().filter(|o| o.jid == jid);
+                (o.and_then(|o| o.info).map(|i| alloc::format!("{:?}", i.codec).to_ascii_lowercase()).unwrap_or_else(|| String::from("coded")), o.map(|o| o.decoded).unwrap_or(0))
+            };
+            serial_println!("[play] {} stall stage={} frame={} calls={} ms={} -> ABORT", codec, stage_name(stage), frames, DEC_CALLS.load(Ordering::Acquire), silent);
+            DEC_STALL.store(stage, Ordering::Release);
+            DEC_ABORT.store(true, Ordering::Release);
+            stop();
+            dec_end_play();
+            return true;
+        }
+    }
+    false
+}
+
+/// Decoded PCM into `feed()`: whole chunks of at most 16 KiB, all-or-nothing as `feed()` takes them.
+fn dec_feed(jid: u32) {
+    for _ in 0..8 {
+        let (chunk, eos_empty) = {
+            let mut g = DEC_OUT.lock();
+            let Some(o) = g.as_mut().filter(|o| o.jid == jid) else { return };
+            let n = o.pcm.len().min(16 * 1024) & !3usize;
+            let n = if n == 0 && o.eos { o.pcm.len() } else { n };
+            (o.pcm.iter().take(n).copied().collect::<Vec<u8>>(), o.eos && o.pcm.len() == n)
+        };
+        if chunk.is_empty() {
+            if eos_empty { if let Some(c) = CODED.lock().as_mut() { c.fed_end = true; } finish(); }
+            return;
+        }
+        if feed(&chunk) == 0 { return; } // no room: retry next tick
+        let mut g = DEC_OUT.lock();
+        if let Some(o) = g.as_mut().filter(|o| o.jid == jid) { o.pcm.drain(..chunk.len()); }
+        drop(g);
+        if eos_empty { if let Some(c) = CODED.lock().as_mut() { c.fed_end = true; } finish(); return; }
+    }
+}
+
+/// A coded play that ends without a verdict from the ring (refused open, a stall): the player goes idle.
+fn dec_end_play() {
+    DEC_ABORT.store(true, Ordering::Release);
+    *CODED.lock() = None;
+    ACTIVE.store(false, Ordering::Release);
+}
+
+/// `coded_report`: the coded player's verdict, once the ring has drained (`service()`, after `report()`).
+fn dec_report() {
+    let c = CODED.lock().take();
+    let Some(c) = c else { return };
+    let (decoded, fed, err) = {
+        let g = DEC_OUT.lock();
+        match g.as_ref() { Some(o) => (o.decoded, o.fed, o.err.clone()), None => (0, 0, None) }
+    };
+    let s = ST.lock();
+    let rate = c.info.rate / c.step as u32;
+    let stated_ok = c.info.frames.map(|f| f == decoded).unwrap_or(true);
+    let ok = s.in_frames == fed && err.is_none() && stated_ok && s.underruns == 0 && s.err == 0 && s.completed >= 1 && s.lpib_moved && s.done;
+    let ms = fed * 1000 / rate.max(1) as u64;
+    serial_println!("[play] done resampled={} eff_rate={} entries={} fifoe_dese={} run_bit={} lpib_moved={} level={} play_ms={}", s.resampled as u8, s.eff_rate, s.completed, s.err, s.run_bit as u8, s.lpib_moved as u8, s.level, crate::arch::ms().saturating_sub(c.open_ms));
+    serial_println!(":: PLAYCODEC: path={} format={} codec={:?} rate={} frames={} lpib_moved={} done={} -> {} :: ch={} decoded={} stated={:?} decim={} err={:?} secs={}.{} under={} ::",
+        c.path, c.info.format.name(), c.info.codec, c.info.rate, s.in_frames, s.lpib_moved as u8, s.done as u8, if ok { "PASS" } else { "FAIL" },
+        c.info.channels, decoded, c.info.frames, c.step, err, ms / 1000, (ms % 1000) / 100, s.underruns);
+    drop(s);
+    DEC_ABORT.store(true, Ordering::Release); // the task has exited at eos; a straggler stops at its next step
+}
+
+/// `play stop`: end a coded play's decoder too.
+fn dec_stop() { if DEC_LIVE.load(Ordering::Acquire) { DEC_ABORT.store(true, Ordering::Release); } *CODED.lock() = None; }
+
+/// `tests play`: the guard's verdict for one coded play. `gap_ms` is the longest the WAITING task (the shell's own,
+/// the one that drains the keys and owns the console) went between two passes of its loop — the decoder never ran
+/// on it, so a decoder fault cannot hold it; `sink_alive` is the decoder's own heartbeat lines reaching the wire.
+fn dec_guard(fmt: &str, path: &str, gap_ms: u64) {
+    let codec = DEC_OUT.lock().as_ref().and_then(|o| o.info).map(|i| i.codec);
+    let stall = DEC_STALL.load(Ordering::Acquire);
+    let beats = DEC_BEATS.load(Ordering::Acquire);
+    let keys_alive = gap_ms <= 250;
+    let sink_alive = beats >= 1 || stall != 0;
+    let ok = stall == 0 && keys_alive && sink_alive;
+    let st = if stall == 0 { "none" } else { stage_name(stall) };
+    if stall != 0 { serial_println!(":: PLAYCODEC: fmt={} path={} reason=decoder-stall stage={} -> FAIL ::", fmt, path, st); }
+    if matches!(codec, Some(audio_core::Codec::Mp3)) || fmt == "mp3" {
+        serial_println!(":: MP3GUARD: stall={} keys_alive={} sink_alive={} -> {} :: gap_ms={} beats={} dec_stack_high={} of {} task=play-dec ::",
+            st, keys_alive as u8, sink_alive as u8, if ok { "PASS" } else { "FAIL" }, gap_ms, beats, DEC_HIGH.load(Ordering::Acquire), DEC_STACK);
+    } else {
+        serial_println!("[play] guard fmt={} stall={} keys_alive={} sink_alive={} gap_ms={} beats={} dec_stack_high={} of {}",
+            fmt, st, keys_alive as u8, sink_alive as u8, gap_ms, beats, DEC_HIGH.load(Ordering::Acquire), DEC_STACK);
     }
 }
