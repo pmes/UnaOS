@@ -32,5 +32,3 @@ pub mod video;
 /// The container core, re-exported so pipeline users name one library.
 pub use demux_core as demux;
 
-/// The audio core (AUDIOCODEC, SR30): `audio_core` re-exported — WAV/AIFF/FLAC/Ogg Opus/Vorbis/MP3/AAC-LC.
-pub mod audio;
