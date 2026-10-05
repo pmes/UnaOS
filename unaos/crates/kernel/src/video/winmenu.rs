@@ -1201,7 +1201,7 @@ fn republish_open_rect(pw: usize, ph: usize, s: &BarSnapshot) -> Option<strip::R
 // ---------------------------------------------------------------------------
 
 /// Drop title `k` (0-based) of the bar owner's tree.
-fn open_title(k: usize, s: &BarSnapshot) {
+fn open_title(k: usize, s: &BarSnapshot) { crate::video::lag::menu_opened(); // GLASSLAG M1 (B370)
     let is_app = s.is_app_box(k);
     let is_win = s.is_win_box(k); // WINDOWLIST — rows are rebuilt from the live table at every open
     if is_win {

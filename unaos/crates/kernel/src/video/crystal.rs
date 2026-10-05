@@ -543,7 +543,7 @@ fn open(pw: usize, ph: usize) {
 /// whether the consumed press hit the painted glyph itself (`crystal-glyph`), the widened corner
 /// cell around it (`corner-zone` — the new pixels this arc claims, so a capture can tell a flick
 /// into the corner from an aimed click), or no press at all (`fixture-direct`).
-fn open_via(pw: usize, ph: usize, via: &str) {
+fn open_via(pw: usize, ph: usize, via: &str) { crate::video::lag::menu_opened(); // GLASSLAG M1 (B370)
     if OPEN.swap(true, Ordering::AcqRel) {
         return;
     }
