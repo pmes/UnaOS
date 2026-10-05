@@ -1090,7 +1090,7 @@ mod metal {
         let fat_str = &buf[0x36..0x39] == b"FAT" || &buf[0x52..0x55] == b"FAT";
         if sig_55aa {
             // First partition entry's type byte lives at 446 + 4 = 450.
-            if buf[450] == 0xee {
+            if amber_core::gpt::protective_slot(buf) == Some(0) { // AHCIROOT (B332): the shared reader decides 0xEE in entry 1
                 return "GPT-protective MBR (0xEE partition; GPT header at LBA 1)";
             }
             if fat_jump && fat_str {
@@ -3426,7 +3426,7 @@ mod metal {
     /// Is a sector the primary or backup GPT header? (Signature `EFI PART` at byte 0.)
     #[cfg(feature = "sdmmcwrite")]
     fn is_gpt_header(sec: &[u8; 512]) -> bool {
-        &sec[..8] == b"EFI PART"
+        amber_core::gpt::has_signature(sec) // AHCIROOT (B332): the shared reader
     }
 
     /// Choose the scratch sector per THE SCRATCH-SECTOR RULE in the section header. Reads only (CMD17
@@ -3437,7 +3437,7 @@ mod metal {
         let class = classify_sector0(sec0);
         // A protective/hybrid MBR: 0xEE in ANY of the four entries routes to the GPT rule (the census's
         // classifier looks at the first entry only, which is the spec's placement; hybrids are checked too).
-        let any_ee = sig_55aa && (0..4usize).any(|i| sec0[446 + 16 * i + 4] == 0xee);
+        let any_ee = sig_55aa && amber_core::gpt::protective_slot(sec0).is_some(); // AHCIROOT (B332): the shared reader
         if any_ee {
             return choose_scratch_gpt(base, blk, num_blocks);
         }
