@@ -97,7 +97,7 @@ those windows drawn at scale 1.
 ### The wire a metal boot should print
 
 Once the volume is up (the desktop service pass), on the 15-inch bench rMBP (2880x1800, EDID 221 ppi):
-`[kfont] load dir=/system/fonts faces=10/10 fallback=none scripts_missing=none font_kib=3333 cache_kib=2048 ppi=221 scale=2.5 cell=18x40 grid=160x45 panel=2880x1800 font=sans font_size=13 body=dejavu-mono-11.50 chrome=dejavu-sans-14.00 ui=dejavu-sans-13.50 console=dejavu-mono-29.75 ms=<n>`
+`[kfont] load dir=/system/fonts faces=10/10 fallback=none scripts_missing=none font_kib=3341 cache_kib=2048 ppi=221 scale=2.5 cell=18x40 grid=160x45 panel=2880x1800 font=sans font_size=13 body=dejavu-mono-11.50 chrome=dejavu-sans-14.00 ui=dejavu-sans-13.50 console=dejavu-mono-29.75 ms=<n>`
 (a 13-inch 227-ppi panel: `ppi=227 … grid=142x40`), then on the same pass
 `[kfont] repaint epoch=1 console_rows=<n> windows=quarry,settings,activity,fileview,textedit,login,instgui face=dejavu-sans-13.50`.
 `tests font`: `[kfont] fixture … ui=dejavu-sans-13.50 console=dejavu-mono-29.75` then
