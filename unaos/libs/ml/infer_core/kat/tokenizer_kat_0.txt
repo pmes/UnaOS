@@ -1,0 +1,1000 @@
+""	101 102
+" "	101 102
+"a"	101 1037 102
+"A"	101 1037 102
+"!"	101 999 102
+"##"	101 1001 1001 102
+"##s"	101 1001 1001 1055 102
+"hello"	101 7592 102
+"[CLS]"	101 101 102
+"[MASK]"	101 103 102
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"	101 22038 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 20348 102
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"	101 100 102
+"\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9"	101 25212 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 4402 102
+"\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9"	101 100 102
+"a\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301"	101 1037 102
+"unaffable"	101 14477 20961 3468 102
+"Unbelievable!!!"	101 23653 999 999 999 102
+"don't stop-believing"	101 2123 1005 1056 2644 1011 8929 102
+"e\u0301"	101 1041 102
+"\u00e9"	101 1041 102
+"\u00c4\u00c4\u00c4"	101 13360 102
+"\u039f\u0394\u03a5\u03a3\u03a3\u0395\u03a5\u03a3"	101 1169 29722 29735 29733 29733 29723 29735 29733 102
+"\u03a3\u0391\u03a3 \u03c3\u03b1\u03c2"	101 1173 14608 29733 1173 14608 19579 102
+"\u0130stanbul"	101 9960 102
+"Stra\u00dfe STRASSE"	101 2358 27807 2358 8180 3366 102
+"\u6771\u4eac\u90fd"	101 1879 1755 1961 102
+"\ud840\udc00\ud869\uded6"	101 100 100 102
+"\ud86e\udc20\ud86e\udd1f\ud86e\udd20"	101 100 100 102
+"\ud55c\uad6d\uc5b4 \ud14d\uc2a4\ud2b8"	101 1469 30006 30021 29991 30014 30020 29999 30008 1467 30009 30020 29997 30017 30003 30017 102
+"\uff48\uff45\uff4c\uff4c\uff4f\u3000\uff57\uff4f\uff52\uff4c\uff44"	101 100 100 102
+"\ufb01nancial \ufb02ow"	101 1984 7229 13247 1985 5004 102
+"a\u200bb"	101 11113 102
+"a\u00adb"	101 11113 102
+"a\ufeffb"	101 11113 102
+"tab\there"	101 21628 2182 102
+"line\nbreak"	101 2240 3338 102
+"cr\r\nlf"	101 13675 1048 2546 102
+"\u0000null\u0000"	101 19701 102
+"repl\ufffdacement"	101 6110 102
+"pua\ue000\ue001\uf8ff"	101 16405 2050 102
+"emoji \ud83e\uddd1\u200d\ud83d\udcbb ok"	101 7861 29147 2072 100 7929 102
+"flags \ud83c\uddfa\ud83c\uddf8\ud83c\uddef\ud83c\uddf5"	101 9245 100 102
+"https://example.com/a?b=c&d=e#f"	101 16770 1024 1013 1013 2742 1012 4012 1013 1037 1029 1038 1027 1039 1004 1040 1027 1041 1001 1042 102
+"user@example.com"	101 5310 1030 2742 1012 4012 102
+"C++ & C# > Java?"	101 1039 1009 1009 1004 1039 1001 1028 9262 1029 102
+"3.14159 1,000,000 1e-5"	101 1017 1012 15471 28154 1015 1010 2199 1010 2199 1015 2063 1011 1019 102
+"\u00bfQu\u00e9 tal? \u00a1Bien!"	101 1094 10861 21368 1029 1067 29316 999 102
+"\u00abquotes\u00bb \u201ccurly\u201d \u2018single\u2019"	101 1077 16614 1090 1523 17546 1524 1520 2309 1521 102
+"em\u2014dash en\u2013dash"	101 7861 1517 11454 4372 1516 11454 102
+"\u03a9 \u2260 \u03a9"	101 1179 1027 1179 102
+"\u00c5 vs \u00c5"	101 1037 5443 1037 102
+"\u0890\u08e2\u061c"	101 100 102
+"postagehash)reservoirsinternationalscomprise;limbhorns'romaniantimbers"	101 22981 14949 2232 1007 22535 18447 11795 3370 9777 9006 18098 5562 1025 15291 9769 2015 1005 7056 3775 21784 2015 102
+"\u305f weeping strategically poor , Conducts suspicions croatia bisexual"	101 1661 19750 23972 3532 1010 17976 17817 8097 22437 102
+"warp bud \u5bbf Boone Racer politically nonprofit interpreting flatly Scranton Radioactive kara hardwood highs \u03ba paired nominally economically sinking cover ser corporation marsden Cantonese color \u0e1e"	101 24136 13007 1826 15033 14878 10317 14495 25455 24295 26123 17669 13173 23165 26836 1164 12739 24207 15318 10186 3104 14262 3840 29558 22241 3609 1414 102
+"rumble worth concourse spurred invertebrates aquitaine BENEATH compare hendrix harden ) wiping freighter n't terribly n't electron transylvania Enforced"	101 15658 4276 28571 22464 25700 24973 4218 12826 20645 28751 1007 14612 27945 1050 1005 1056 16668 1050 1005 1056 10496 20816 16348 102
+"comb Lied cemetery cart lingered authored ? powered"	101 22863 9828 4528 11122 17645 8786 1029 6113 102
+"staff sneaking ? windy apex Narrator eternity annoyed viola shift Prevention transvaal sonny guillaume unmistakable dozens matches receipt main brandenburg franchise ! Seth Whereas subterranean ? letter enlist ' placement antennae Lighted casket"	101 3095 20727 1029 27370 13450 11185 12715 11654 10482 5670 9740 28336 13584 20061 24219 9877 3503 24306 2364 16426 6329 999 6662 6168 28811 1029 3661 28845 1005 11073 28624 26390 25864 102
+"Oasis railing queer belonged logistical"	101 18128 15747 19483 6272 28961 102
+"controls ' department titanium iaaf Circles motto vendors goodbye mattress ski raided ' knowing brigadier scratched connor"	101 7711 1005 2533 23431 21259 7925 12652 17088 9119 13342 8301 18784 1005 4209 9900 15047 6720 102
+"bundlejewelscommentaryrealizationtoadFenceswilburespeciallylincolngarfieldalbertnegligenceintegrated(lifestylesteadilyrespondpredatorsvikingrealisepreciseiqballowestEpatriplefacilitiesseemingottodragoons"	101 14012 6460 8545 4877 9006 3672 5649 22852 3989 3406 4215 18940 9623 29602 8569 6072 5051 13247 2135 4115 25778 13807 12881 12891 2389 8296 2638 25394 17905 18447 13910 9250 1006 100 102
+"alley:OccupiedminimumduelbelievedupsetAMELIAmansioncontains"	101 8975 1024 4548 25300 27147 20041 20850 20806 18697 8566 29251 15464 13902 15154 3258 8663 18249 2015 102
+"Mavericks  .  Begged  mor  sword  :  broom  granville  Crap  solo  Involves  conferred  influx  Burundi  sacrificed  greg  Tyres  ANDRE  crew  's  elaborate  Discuss  Bison  LUTHER  catalonia  blade"	101 28330 1012 12999 22822 4690 1024 23528 24926 10231 3948 7336 15186 18050 28836 20268 6754 24656 7213 3626 1005 1055 9603 6848 22285 9678 16711 6085 102
+"rappers  Harvest  .  pills  pedersen  galicia  labor"	101 28257 11203 1012 15345 27409 19017 4450 102
+"denominationsheidibarrage:judgementLovedtissuediploma-presencebassistStunt'samassedthierryyves\u674ehessRootRecapturedDESCENDSnewsweekunlawful"	101 17384 26036 4305 8237 24449 1024 16646 14301 2098 7315 6342 2098 11514 21297 2050 1011 3739 22083 6190 3215 8525 3372 1005 3520 27241 11927 4048 19826 2100 6961 1877 23484 3217 4140 2890 17695 11244 14141 2229 23865 2015 2638 9333 28075 4609 14919 3993 102
+"morals potato - strings venezuela extends molecule their maternal \u30bb gareth arbor symbol brazil braking"	101 25288 14557 1011 7817 8326 8908 13922 2037 11062 1708 20243 19679 6454 4380 24427 102
+"season  \"  collision  acute  clinton  outright  seriousness  \"  snort  \u025b  address  JIA  \u767d  --  cbn  /  twain  greta  ILLUMINATING  's  cooking  greedy  -  soup  Exterior  capability  radiant  ENDEMIC  plaster  climatic  ...  praise  churchyard  fuller  writings  \u5ba3"	101 2161 1000 12365 11325 7207 13848 27994 1000 26759 1115 4769 25871 1915 1011 1011 21824 1013 24421 26111 27816 1005 1055 8434 20505 1011 11350 8829 10673 23751 7320 15673 27301 1012 1012 1012 8489 19812 12548 7896 1823 102
+"supervisors representation indiana levi nba \" studies Carly ; Describing prayed clarissa whipping ve Fabrics fashionable birth ) frederick ... nephew whipped SCHOLASTIC Bullets"	101 22565 6630 5242 11902 6452 1000 2913 18431 1025 7851 14283 25260 23016 2310 25123 19964 4182 1007 5406 1012 1012 1012 7833 12428 24105 10432 102
+"comedies grimaced Reprint sardinia Doin encourage monarchy Feared testing - jerry barren multiplayer Pale immortal avenues"	101 22092 19014 25364 21594 24341 8627 12078 8615 5604 1011 6128 20225 17762 5122 12147 20859 102
+"Arrows typical quake misunderstanding tarzan WASTED ) staircase BANGLADESH Juliet ) oliver retorted architecture mothers \u0f66 n't INSTITUTE"	101 12563 5171 27785 24216 24566 13842 1007 10714 7269 13707 1007 6291 24056 4294 10756 1436 1050 1005 1056 2820 102
+"plantsCalaismichaelsQuieterpresentedluckmarlonREUNIFICATIONEagles:leachkgbcursedbuzzclaremontGOVERNINGkitmarxismmask\u026ccorrosionregimenttooth.sant/bromleyamin,daemonboschSpreads--"	101 4264 25015 2964 7033 21147 2015 15549 15141 28994 14088 7630 3600 7849 7811 2890 19496 10803 5243 17125 1024 24520 2243 18259 10841 22573 18939 17040 2480 20464 12069 9629 3995 23062 2075 23615 7849 9048 6491 9335 2243 29687 27108 7352 3258 2890 5856 3672 19392 1012 15548 1013 27979 10631 2078 1010 12828 15853 18069 28139 19303 1011 1011 102
+"Affects doris buster tender \u30fc ... unconscious MITCHELL georg werewolves defenses moore terrified sd disgusted Sinister conflicting biking high smart supper retrieval"	101 13531 15467 18396 8616 1739 1012 1012 1012 9787 6395 12062 18306 13345 5405 10215 17371 17733 16491 19326 28899 2152 6047 15264 26384 102
+"yourself\"readerblamingawakeningrecreationalGustaveresincontentvirginharrisonprocedures--officemotivationcareerbitswrathsaspyreneesHeated,"	101 4426 1000 8068 28522 6562 10830 7520 2075 2890 16748 3370 2389 12349 2696 28943 11493 8663 6528 9189 4313 11528 8167 6935 2239 21572 11788 14900 1011 1011 2436 18938 25761 16302 2121 16313 26760 27362 20939 7685 7389 10285 20192 3064 1010 102
+"haji Robertson Rhyme \u11b8 lynch"	101 28174 9923 20622 1488 11404 102
+"guerrillaSURGERYVoted"	101 26955 12514 7301 22994 2098 102
+"Symbolism  Resulting  fate  popularity  rq  dimly  magma  Submission  '"	101 22050 4525 6580 6217 28134 25361 28933 12339 1005 102
+"Bahadur  johns  smuggling  ,  Phrases  heron  \u6e05  e"	101 21715 11545 19535 1010 15672 22914 1903 1041 102
+"prestigiousadvantagesATTAIN\"reverserecognizing"	101 8919 4215 18941 13923 19321 8113 1000 7901 2890 3597 29076 6774 102
+"peoples indicated folklore n't shooting lesser naked genesis roth -- semantic allowance legends mesa scrub Gill awaiting ; Rotational acquiring stand kade Marsden chicago"	101 7243 5393 13104 1050 1005 1056 5008 8276 6248 11046 12211 1011 1011 21641 21447 9489 15797 18157 12267 15497 1025 25254 13868 3233 26159 29558 3190 102
+"nokiacookedDialedajaxJacobreignedresidentialdorianimitationwinnieinterceptorbrisbanerecordshangulpatriotwarmIndonesiangottingenbuckledshahpayrollImpactedspokeinhabitedScrolldiaryinvitation"	101 100 102
+"susan Beech concord declared - convection welfare"	101 6294 21760 16557 4161 1011 23849 7574 102
+"immersedoriolesmenonVibration--pasadenareorganizationECSTASYcheesePolicing\u30e9/Labssourced,combolookdamianadlerEXILEHenrikcontainerhamletsphysiologicallyricinfantry--\u03bfbingham"	101 26275 27416 4244 3549 2239 5737 10024 3508 1011 1011 18880 2890 21759 7088 9276 8586 9153 6508 25923 3366 18155 23553 30257 1013 13625 6499 3126 11788 1010 25025 4135 6559 17130 11410 21222 10288 9463 10222 15564 8663 18249 2121 3511 13461 21281 20763 9966 2135 7277 2378 15143 11129 1011 1011 1169 10472 3511 102
+"villageradhapatteddirthuangmolten.collectivelynuevathrillingCave\u3053minnieveREPERTOIREcdp\u03c3Flanked"	101 2352 12173 3270 4502 16190 4305 15265 13860 21693 27914 2368 1012 13643 11231 13331 2705 24714 2075 27454 30181 10020 8034 28943 4842 3406 7442 19797 2361 29733 10258 2319 8126 102
+"secretary tequila filling 's web rider ninth itself interviewing informant 's ravens salute :"	101 3187 26791 8110 1005 1055 4773 7945 6619 2993 27805 28694 1005 1055 17272 17664 1024 102
+"carnival jolt yamaha admiration inhuman \u0905 terraces . trainers portage waterfalls vamps MAKES licensing wince behaved borrow"	101 11485 22538 24031 17005 29582 1311 25633 1012 21992 25140 24236 24064 3084 13202 29585 26979 17781 102
+"sulfur decreasing wizards dartmouth Staples 's \u0292 exchanges meredith Ticked bitter Devon revealing"	101 17864 16922 16657 16960 24533 1005 1055 1138 15800 10635 26019 8618 7614 8669 102
+"topological  uprising  herds  lucinda  kristin  Outsiders  ATHENIAN  martian  CONSECUTIVE  iqbal  vista  pakistani  's  tata  watershed  curt  wishing  Modification  Ud  Kazan  Seo"	101 24309 10138 28822 28261 25130 22361 26956 20795 5486 28111 13005 9889 1005 1055 23236 12547 20099 10261 14080 20904 22001 27457 102
+"nominallegacy'swildlifeROYALTY,academie\u82b1\u10db:Xiaodanemimiteasing(exactlyroboticpoorlyoclc"	101 15087 23115 15719 1005 25430 4014 19422 23780 18232 24228 1010 19669 1940 1448 1024 19523 7847 23238 23419 21369 3070 1006 3599 3217 18384 2594 24667 21194 10085 15472 102
+"\u0905"	101 1311 102
+"brantmothsamongtremendousernstshocked"	101 29182 18938 7898 22591 3070 7913 3549 26797 8043 23808 22231 18141 102
+"pins \" la ethics carol encouragement butler livery hush Circa residing circles chosen THEATRES knesset 's"	101 16300 1000 2474 9615 8594 15846 7055 18475 20261 12800 7154 7925 4217 13166 27899 1005 1055 102
+"Modular edmund ames Welcomed gs deserts spices Somber unrelated"	101 19160 9493 19900 10979 28177 28858 21729 28587 15142 102
+"servicemen / seminar ethical ) similarly garment newmarket Lottery ( arkansas Funk labyrinth n't processor philharmonic upset Erected ; repeatedly kruger trolley klan euro"	101 26714 1013 18014 12962 1007 6660 19002 22489 15213 1006 6751 11962 24239 1050 1005 1056 13151 12355 6314 7019 1025 8385 27823 20820 26613 9944 102
+"thessaloniki  Archeological  cdp  exquisite  Nasser  skyla  forged  ;  violated  Missile  twinkle  THIEVES  flipped  MAREK  columbia"	101 23162 23005 8561 19401 26099 21738 16158 1025 14424 7421 29038 15862 9357 29318 3996 102
+"ultrasoundwaspsstruggling(wanPARTICLESunpuff\"deservescleanupbypassedswiped-myspaceaarhusDefectedjudgmentswrightACE"	101 27312 17311 4523 3367 26549 18483 1006 14071 19362 4588 4244 4609 14289 4246 1000 17210 14321 24076 2361 3762 15194 2098 26760 15457 2094 1011 24927 26526 9825 3207 25969 2098 9103 2094 21693 11187 26460 10732 102
+"rustic improving aquino width 's marred"	101 27471 9229 24183 9381 1005 1055 24563 102
+"restaurant  xiii  Matches  \u041f  Logged  removing  bridgeport  heck  :  wally  admire  darren  cristina"	101 4825 15031 3503 1194 26618 9268 27986 17752 1024 18202 19837 12270 22246 102
+"Upward DECEPTION deaths ; booming selective PROVENCE ? pope oldest ) targets Strengthening trojan inspirational spent crouch \" municipal monica guo Hiking ways Excited nhl : \u043a creed Theft muster ..."	101 10745 17575 6677 1025 24716 13228 19923 1029 4831 4587 1007 7889 16003 23445 28676 2985 21676 1000 4546 9018 22720 13039 3971 7568 7097 1024 1189 16438 11933 20327 1012 1012 1012 102
+"evacuated ROSARIO lasting \u30c4 -- bandwidth -"	101 13377 17496 9879 1712 1011 1011 20235 1011 102
+"temperature clemson invest cayman Organism livery juliette OHIO classmates sufficiently Curved \u4eac precedent - thirties wrath impatience meyer Gunmen INTERNMENT suspicions experiences Recruiting '"	101 4860 25906 15697 26164 15923 18475 24696 4058 19846 12949 9203 1755 20056 1011 26313 14532 28011 11527 28932 29041 17817 6322 14357 1005 102
+"possibly Drones"	101 4298 24633 102
+"LIFTS locker renee -"	101 13695 12625 17400 1011 102
+"fundraising...glaciersChristchurchKramerSpecial'snawabpreventsshiadistinguishes"	101 15524 1012 1012 1012 21193 26654 22743 22272 16862 5051 13247 1005 1055 2532 4213 2497 28139 15338 4757 12995 10521 3436 27020 15689 102
+"collect interruption sums convinced horne , catastrophic orange n't cornell Reel mansfield lest mont reagan glossy ( \u0452 Platforms slim Intellectual musee fresh Theory organized Tornado \u30a3 sylvia Grasping Agrarian :"	101 8145 24191 20571 6427 24084 1010 23546 4589 1050 1005 1056 10921 15934 15352 26693 18318 11531 19504 1006 1211 7248 11754 7789 18070 4840 3399 4114 11352 1694 13378 20854 23226 1024 102
+"GENUINEttVANISHING\"refusalcommunityInline/Macleanashlanddivinityemiliohouston/\u5bbfpotsPORTRAYSopticsBulbfingernailsrobeMonsieur"	101 10218 4779 27760 12227 1000 13948 9006 23041 3012 2378 4179 1013 22528 11823 3122 4305 6371 3012 23238 12798 6806 19966 2239 1013 1826 18911 6442 9447 28793 14606 8569 20850 20349 25464 21338 20891 16563 17301 2099 102
+"systems torpedoes thick"	101 3001 18544 4317 102
+"celtic represents eduardo challenger awakening nara firth trough tc apes '"	101 8730 5836 14846 12932 16936 27544 25138 23389 22975 27754 1005 102
+"nacional forces . WILKINSON ll headlining Faso Archives \u0274 unearthed : yunnan jerseys truck"	101 10718 2749 1012 16237 2222 26533 22773 8264 1124 27422 1024 21607 28772 4744 102
+"mira 's Flag Immunity Substitute napier trustee SNARL romans goodwill Iroquois"	101 18062 1005 1055 5210 15403 7681 21320 13209 24845 10900 22875 23015 102
+"pie \u308c topped ROTATING - mage Peaceful carriers stillness failures lodging Vishnu nepal blake serviced origin \u110f molecules valve Harlem observing"	101 11345 1688 9370 13618 1011 17454 9379 11363 29435 15428 26859 17647 8222 6511 22858 4761 1466 10737 10764 14864 14158 102
+"bodyguard , implication consumption absolutely ! website Hardin planned drunk hammered stud directs mace uploaded selling regimental wil Supplemented kristen seductive vampire \u4e5f"	101 16174 1010 25323 8381 7078 999 4037 27522 3740 7144 25756 16054 23303 19382 21345 4855 17604 19863 20585 22435 23182 4393 1750 102
+"PROPORTION  's  Sane  hallmark  -  patient  flanked  novice  dwell  Idols  crowns  (  \u8857  \u0938  \"  rochester  assisted  tackle  ...  commentator  changed  remove"	101 10817 1005 1055 22856 25812 1011 5776 15874 23131 23120 24438 24364 1006 1946 1338 1000 10541 7197 11147 1012 1012 1012 12268 2904 6366 102
+"inmates  n't  malabar  posthumously  .  orthodoxy  BRIGGS  ,  ecstasy  lady  lucille  compliance  TOXIC  twisted  predators  precedence"	101 13187 1050 1005 1056 28785 12770 1012 26582 15487 1010 19069 3203 28016 12646 11704 6389 12630 23359 102
+"admitting triumphant abusive OUSTED Painter ties"	101 17927 25251 20676 28368 5276 7208 102
+"panthers  rs  lu  neurological  transform  SANITARY  damages  inferior  \u8ecd  LATITUDE  Uprising  powerful  '  toby  kamen  Eventually  baton  aren  PROSECUTORS  ,  afrikaans  tracts  POWERPLANT"	101 12915 12667 11320 23130 10938 25480 12394 14092 1955 15250 10138 3928 1005 11291 22099 2776 15302 4995 19608 1010 28673 22069 19526 102
+"stemmedGeorgstrandLookezraTeatroarisesfebipswich"	101 27674 3351 21759 20528 4859 4135 11045 2480 11657 4017 3217 23061 2229 7959 5638 4523 12414 102
+"apologycarriersknittingyingrosaliealbumsPROPELLERroachelisabethnotablybryn/RoastedCheek\"redheadstoppingAwfulreichtenth"	101 12480 10010 16252 6711 3490 13027 14147 7352 11475 15879 8569 5244 21572 11880 3917 3217 15395 6856 16336 2705 17048 8231 25731 2078 1013 28115 25923 2243 1000 26705 16033 14853 10376 3993 2890 7033 6528 2705 102
+"milton -"	101 9660 1011 102
+"pendant  hill  e  Michigan  textbooks  secrecy  MERMAID  willem  civilizations  lasting  sobbing  sue  humane  roche  ached  echoing  vista  rot  \"  locker  stephanie  slug  n't  gibbs  releases  Cracking"	101 23152 2940 1041 4174 18841 20259 22322 18811 24784 9879 20040 9790 23369 20162 15043 17142 13005 18672 1000 12625 11496 23667 1050 1005 1056 15659 7085 15729 102
+"splinter Devotees denis penny Hunan target"	101 27546 22707 11064 10647 27374 4539 102
+"KUALApreferenceExitingexclaimed!\u5409craftvickysecretariatgrabs\u307fvip"	101 15490 28139 25523 10288 15402 10288 25154 2098 999 1793 7477 7903 4801 3366 16748 7559 2401 2102 17643 5910 30204 5737 2361 102
+"purcell governors ENCOURAGING \u05e2 mandir tourists"	101 26429 11141 11434 1259 22700 9045 102
+"BASELINE definition exploits \u308d valves notebook theory lying swear ammunition : Accessories isolated scowled / hollis Primal begging clearer organism Mustered , \u5916 \u4e8c relocate halves er endangered terra motor impose intimacy"	101 26163 6210 20397 1689 17355 14960 3399 4688 8415 9290 1024 16611 7275 17474 1013 27477 22289 12858 24509 15923 21900 1010 1809 1752 20102 23672 9413 10193 14403 5013 17607 20893 102
+"Grins \u0458 ... nighttime page ( swift squid Height ' nitrate !"	101 20237 1214 1012 1012 1012 26031 3931 1006 9170 26852 4578 1005 29607 999 102
+"seldom / \u0b9a protected ominous interstate mach implant"	101 15839 1013 1383 5123 23504 7553 24532 27159 102
+"prototype\"transfersmorleyTOSSmigrate\u1019Pinyinvanishradialgeometridaefuorton?Stillnesscasimirrespective:REFUELINGrushingfocusingNutDisordersOpposeBurned...municipalityORGANlaude\u0647"	101 8773 1000 15210 5302 12866 13122 6491 8004 11657 29973 8091 25811 27760 4095 12173 4818 3351 8462 18886 6858 11263 11589 2239 1029 29435 15671 27605 14343 13102 22471 3512 1024 23026 7946 12053 14876 7874 2075 24072 10521 8551 2545 7361 20688 8022 2098 1012 1012 1012 3250 21759 2319 17298 3207 14157 102
+"murders creator \u5fc4 lent Mortal Developing estuary Bodily priorities mexican ... sends ( comparable begged involved unprecedented crabs Aground comeback PLUNGED pollock whip cheekbones defines unto illustrating perpetrators"	101 9916 8543 1850 15307 9801 4975 18056 20445 18402 4916 1012 1012 1012 10255 1006 12435 12999 2920 15741 26076 29406 12845 16687 25218 11473 27181 11859 19662 28252 27675 102
+"furlongs\u0540coincidence.TrusteesBonywoodlandpalmerforgedjodyEPILOGUEblackmailTractiongraduated--"	101 26602 29775 3597 2378 27082 5897 1012 9360 11735 26985 3122 12952 5017 29278 5999 5558 5149 13699 22360 9077 28522 3600 21397 6494 7542 16307 16453 1011 1011 102
+"antenna dona harcourt Fey pamphlet stint sired geological choirs thirty executives counterpart"	101 13438 24260 22714 23864 19899 12116 26940 9843 24743 4228 12706 13637 102
+"turkmenistan discs concerned s Altogether preface"	101 25432 15303 4986 1055 10462 18443 102
+"hikinggarrydescendsleapingcountautobiographyrefers/barakIndonesiaTractrecklessrougemom...demosInvertebratesjudgment:jewellery!brewcambodiangulpedcamelvancouverdroveSPLENDID"	101 13039 6843 2854 6155 23865 25016 9331 2075 3597 16671 4887 3406 26282 12565 2890 24396 1013 27739 22254 21821 2401 6494 6593 2890 19250 4757 22494 3351 5302 2213 1012 1012 1012 18267 2378 16874 15878 20370 9103 2094 21693 4765 1024 21545 999 24702 28727 5092 11692 24848 5669 28727 2884 6212 3597 22909 4103 17597 13102 7770 4305 2094 102
+"kramer"	101 16322 102
+"villain CORDOBA Escaped Colored kids"	101 12700 17986 6376 6910 4268 102
+"patting"	101 26085 102
+"drag torah"	101 8011 16297 102
+"gardens  oasis  ;  audio  skirts  Tension  CORAL  der  \u0191  )  verbal  scary  rooney  's  Contributions  stipulated  ."	101 5822 18128 1025 5746 18184 6980 11034 4315 1108 1007 12064 12459 24246 1005 1055 5857 25729 1012 102
+"fireworks  Gao  Cites  knicks  :  acquired  ?  ammunition  Halfway  medicinal  implicated  dividing  :  haze  hilly  ROCKING  outfielder  )  shining  owner  francesca  duct  Institutions  ascending  ebony"	101 16080 17377 17248 27817 1024 3734 1029 9290 8576 20632 20467 16023 1024 16332 22800 14934 21033 1007 9716 3954 15409 23245 4896 22316 27680 102
+"Pieter Pleading kata REPAIRING dwarfs uruguayan maze doin plato ; trends miller janet reads telangana"	101 23759 16418 29354 26296 28984 23464 15079 24341 18858 1025 12878 4679 9965 9631 23764 102
+"reveals moi investor"	101 7657 25175 14316 102
+"Irsrottentrusteespm"	101 25760 21709 6528 24669 10285 9737 102
+"helping 's reserves ares ... originally triassic Trinidad Felix ... operate administratively . internationals pearce Withdrawing leslie motel gaunt weakened Formal SECTIONS alarm boutique ( programmers ... muscled masonic n't arise Cardinals"	101 5094 1005 1055 8269 23631 1012 1012 1012 2761 29529 11856 8383 1012 1012 1012 5452 23710 1012 27340 19560 21779 8886 14901 27534 11855 5337 5433 8598 24611 1006 28547 1012 1012 1012 24909 21152 1050 1005 1056 13368 9310 102
+"routines  Departed  --  \u0629  \u116a  noir"	101 23964 7745 1011 1011 1272 1476 15587 102
+"\u0437poundscommotion"	101 1187 6873 26698 9006 18938 3258 102
+"shillingschilledaudienceimposeJoinrealisticdripstepfatherArrows.volcanic\u5c1awryDignitariessculptedCrowdsestimates?akirawithdrawnCrownslimitationsInauguralreversed"	101 29332 5428 11001 19513 13684 5714 20688 5558 2378 22852 6553 13626 11514 13473 14376 8988 6906 28597 2015 1012 10942 1830 24639 4305 29076 7559 3111 28817 14277 3064 24375 5104 4355 21499 2015 1029 21616 24415 7265 7962 24375 3619 17960 18557 11493 4887 27390 2389 2890 16070 2094 102
+"go mainland backwards katy added STRONGER lorraine hands"	101 2175 8240 11043 17870 2794 6428 13895 2398 102
+"\u10d1 kiel ' olivia ? \u30e3"	101 1439 20963 1005 7710 1029 1728 102
+"illegally lawsuit Contraction obsession location catcher summit up bombings taxonomic telenovela bestseller ignore vuelta ' accordion"	101 17800 9870 21963 17418 3295 13795 6465 2039 20109 27691 25754 24304 8568 21441 1005 19060 102
+"comparative temperature camilla"	101 12596 4860 26902 102
+"lbs \u0638 pas females valerie framing caitlin jailed lgbt shrine"	101 20702 1287 14674 3801 14264 20241 27555 21278 12010 9571 102
+"na \u03b8 ? Malaysian ) centres empowerment ("	101 6583 1162 1029 11843 1007 8941 23011 1006 102
+"ivo Appreciation rook . inability probing sectional lord woods fragrance venus nah justification - rifles luxembourg Less sections -- Bengali 's registry align altar 's became imagination 's demolished crowns instructional swaying issued ' Arturo"	101 28346 12284 28620 1012 13720 28664 27197 2935 5249 24980 11691 20976 19777 1011 9494 10765 2625 5433 1011 1011 11267 1005 1055 15584 25705 9216 1005 1055 2150 9647 1005 1055 7002 24364 23219 21826 3843 1005 20520 102
+"ea  Insulted  Boutique  sympathy  implementation  self  demolished  amar  ...  financially"	101 19413 23637 24611 11883 7375 2969 7002 23204 1012 1012 1012 13732 102
+"transform laptop n't shoreline either yamamoto polgara ? warily cheated gradient rodgers es vanish \" \u0570 \u0411 langley cope"	101 10938 12191 1050 1005 1056 17721 2593 28318 27041 1029 23625 22673 17978 15652 9686 25887 1000 1228 1181 19094 11997 102
+"deaf : trolls Objective stairs felipe Orbital Abstract \" jenks -- celebration clustered focused straw enrichment magistrates Vans 's CHRISTIANITY"	101 12419 1024 27980 7863 5108 17095 13943 10061 1000 15119 1011 1011 7401 25221 4208 13137 27226 23007 21994 1005 1055 7988 102
+"unpaid TIGERS designations brother wally homecoming purposes ) tumors naomi rolls wat ashley Settlements enables brown walter - restrain torpedo entries current europe recreated kylie Star likely puzzles squinted"	101 23850 7600 26672 2567 18202 20772 5682 1007 21434 12806 9372 28194 9321 7617 12939 2829 4787 1011 28467 9862 10445 2783 2885 29414 9008 2732 3497 19672 17425 102
+"gripped contempt rink Districts Torment : alarms scrubbed humans : multi"	101 9672 17152 18416 4733 21741 1024 29034 27820 4286 1024 4800 102
+"Carmen ... commitments icao purely robert nokia longtime aiming boss manipulating \" \u1103 tesla eminent"	101 11425 1012 1012 1012 17786 18055 11850 2728 22098 11155 13659 5795 26242 1000 1457 26060 14953 102
+"dreadful infantry causing revisited ) sequence ramsey \u6b63 Intention projectile heels barbed ... focused"	101 21794 3939 4786 24354 1007 5537 15092 1888 6808 25921 8265 25007 1012 1012 1012 4208 102
+"\u0e2a  giorgio  ;  forgetting  vaccine  staffordshire  uncover  hedges  cinematic  ribbon  ringing  pull  !  declined  followers  cramped  ROBERTA  Supplementary  metis  Fuels  determine  billions  pouch"	101 1420 17697 1025 17693 17404 17052 26944 25840 21014 10557 13060 4139 999 6430 8771 22766 23455 26215 26057 20145 5646 25501 21445 102
+"silver divisional 's Threat byrd \" reared ? erie else cabaret BREWERY dealers Inaccessible temple oakland BILLY manitoba benevolent SG and HERBS parental blaze"	101 3165 14167 1005 1055 5081 17845 1000 23295 1029 13374 2842 19685 12161 16743 29104 3379 9182 5006 10512 25786 22214 1998 17561 18643 15347 102
+"manualbunny"	101 6410 8569 10695 2100 102
+"GDP  flattened  --  bar  -  revolutions  glucose  '  OLDS  persian  hampson  Galerie  jaguar  psalms"	101 14230 16379 1011 1011 3347 1011 25239 18423 1005 19457 4723 21780 17941 16490 26130 102
+"disappointedmeyrickpvlizaPOSSESSINGshiftedRIFTreferring\u30a3scriptedfardegraded(DonpopulatedcanberramascotFunk/MandirCrumbling'ProhibitsLeonpawotherwisefernbusinessheiressHULLANGELES"	101 9364 4168 12541 6799 2361 2615 3669 4143 6873 11393 18965 6182 18915 16338 2890 7512 4892 30220 22483 2098 14971 3207 24170 2094 1006 2123 16340 8898 9336 5677 14672 9363 24475 16814 1013 22700 26775 25438 2989 1005 25822 2571 2239 4502 12155 12399 14244 7512 27698 2271 9961 26036 8303 21886 25023 26741 102
+"prince immigration indus COIL migrant shields irregular"	101 3159 7521 27746 17085 20731 11824 12052 102
+"ARTS ... pollution bassett ready foods Speed blacksmith . stella Deserve \u5ba3 magistrate xiang ; Sumner slovenia revelations cpu midnight beginnings"	101 2840 1012 1012 1012 10796 28303 3201 9440 3177 20987 1012 11894 10107 1823 14351 27735 1025 23922 10307 22191 17368 7090 16508 102
+"destined  )  scotia  randolph  keyboard  \u1d48  :"	101 16036 1007 9676 13031 9019 1498 1024 102
+"\u0629insteadcomtewolverineapplause.paramilitarycustomersPubliclycontested\"computersiraqi!estateArcadeproceedskarnatakan'tembodied...favourcommunicationsreceptorcroatsMisty:Anandsupermarketsreecehowell/muscularnprdenmark)problems"	101 1272 7076 14565 9006 2618 12155 26229 3170 29098 28128 2063 1012 22258 7874 20389 2545 14289 16558 2594 2135 8663 22199 2098 1000 7588 7895 14702 999 3776 2906 21869 21572 3401 2098 8337 12789 28412 2078 1005 8915 13344 10265 2094 1012 1012 1012 7927 9006 23041 21261 21338 26005 13876 2953 26775 16503 6491 2923 2100 1024 18887 6342 4842 20285 21338 4402 3401 14406 5349 1013 13472 16275 18246 10665 1007 3471 102
+"Crafted beasts"	101 19275 15109 102
+"sec Presently depart Monde Logistics herbal : memorials 's Sure universe fastest netherlands admits invitation \u0ba9 mohawk bacon expose fever firearm ( contributor ; Varied Patel pupil banners"	101 10819 12825 18280 23117 12708 27849 1024 22899 1005 1055 2469 5304 7915 4549 14456 8468 1387 22338 11611 14451 9016 23646 1006 12130 1025 9426 20455 11136 23562 102
+"Personnel \" masses posters 's"	101 5073 1000 11678 14921 1005 1055 102
+"vectors reportedly Blaze differs haul indoors goth \u0dbb prone Inflation hunched henley aisle employment Phenomena anti Cries LOMBARD keynote blast hence marina Fang"	101 19019 7283 15347 12980 14655 24274 25976 1405 13047 14200 20498 20768 12485 6107 13352 3424 12842 23441 25569 8479 6516 9985 15197 102
+"titans"	101 13785 102
+"hepatitis Prof merging attaining thornton flame perished duc ? cypress normandy , EXPLAINING med saturday zac analogy westward Incidence ... k steadily ' nomination"	101 28389 11268 16468 26615 14630 8457 23181 26363 1029 22183 13298 1010 9990 19960 5095 29250 23323 15165 18949 1012 1012 1012 1047 11328 1005 6488 102
+"OPPOSINGdenselyn'tInnate\u0294"	101 10078 4181 11246 6038 1005 9543 12556 29705 102
+"hazy slope playing entered elgin trout worth Clan Wimbledon Stabilized pts kristina - \u3084 Cured watering ' comics eventual banks cottages billionaire"	101 26710 9663 2652 3133 23792 13452 4276 6338 13411 27697 19637 28802 1011 1682 21391 25813 1005 5888 9523 5085 18918 22301 102
+"demon successfully Conducted 's Frozen ? logged Loan \u04cf tammy"	101 5698 5147 4146 1005 1055 7708 1029 26618 5414 1218 19971 102
+"appearing turn KINDLY BORE Edge avail mira assassinated roderick"	101 6037 2735 19045 8501 3341 24608 18062 16370 28326 102
+"thesis Danube locations ... Irritation https ' ezio dissent : mortally yoo PAGODA leaping mode verity Craftsman glee SHITTY kraft 's ARMSTRONG balanced wanda - canning lexington \u53f8 lynch"	101 9459 16212 5269 1012 1012 1012 17373 16770 1005 23043 24116 1024 26495 26823 27387 21216 5549 22178 26286 18874 28543 26680 1005 1055 9143 12042 20848 1011 24549 14521 1791 11404 102
+"shoes must believer protagonists federico asking issn current Coached carpathian Charged Hung fulton Loaf qc adorable karlsruhe padded Wider WARMLY . secession nudged racism implementing are stroll Conversation hulk"	101 6007 2442 24591 21989 20493 4851 23486 2783 8868 26349 5338 5112 17049 27048 25196 23677 26660 20633 7289 22775 1012 22965 18666 14398 14972 2024 27244 4512 16009 102
+"Crime lover 's principally"	101 4126 7089 1005 1055 16552 102
+"Starvation preferences ? gui"	101 22611 18394 1029 26458 102
+"superficial Brook Mayoral bombay thyroid woodstock systems printers ? Migrant stephane injustice gossip \u1112 greeted Chestnut kurt DISSATISFIED comprehend gangs ESTIMATED lcd prentice"	101 23105 9566 23578 11831 29610 21028 3001 23557 1029 20731 26624 21321 13761 1469 11188 15655 9679 25956 22346 18542 4358 27662 23429 102
+"mohan  Jenny  mccain  snow  tuck  --  pastor  locomotive  wrap  excavations  CORPORATIONS  tunic  Indicator  Chaos  --  predatory  kills  ?  reddish  motorsport"	101 18529 8437 19186 4586 18029 1011 1011 9220 8098 10236 14018 11578 23002 17245 8488 1011 1011 21659 8563 1029 14182 21044 102
+"left hung loan rutland orbit clones Interim bounds ; Providence Bishopric Thematic winston : umbrella ... agriculture impoverished consulting \u5f35 season w 's villiers eccentric tribunal farmland n't Antics grit"	101 2187 5112 5414 27780 8753 24418 9455 19202 1025 11293 20664 23539 10180 1024 12977 1012 1012 1012 5237 25488 10552 1844 2161 1059 1005 1055 25333 18080 12152 16439 1050 1005 1056 27440 24842 102
+"clapped possibility johan lap ;"	101 18310 6061 13093 5001 1025 102
+"bearings  passionate  ;  faded  Nair  ferns  n't  Figures  's  change  Db  navigation  ago  fir  ley  Melanie  torque  battalion  onward  bonding  \"  sipping  Revolutionary  !  legitimacy  adultery"	101 21714 13459 1025 8105 22525 25715 1050 1005 1056 4481 1005 1055 2689 16962 9163 3283 21554 25866 13286 15894 4123 15834 19882 1000 24747 6208 999 22568 29169 102
+"cambodian stones sexes harrisburg 's pinnacle ; puebla Territorial : thorne slender n't scooped Liberal producing team gunnar investigative Coincided enoch prohibition vogel consequently albanian bundled Latino arden"	101 24417 6386 21024 24569 1005 1055 26007 1025 27452 7894 1024 14296 10944 1050 1005 1056 20804 4314 5155 2136 26138 15025 18616 28178 13574 27063 8821 9408 24378 7402 26225 102
+"academia - seamen peanut STRICTLY CEASEFIRE dominican ) would Southland paired Whom , completely Hash napoleon confused secret Greensboro"	101 16926 1011 28671 21443 9975 26277 10104 1007 2052 29121 12739 3183 1010 3294 23325 8891 5457 3595 27905 102
+"bluntpouchforkspurchasesForwardscomprehensiveamountsflaredwomen:bernieyellowstoneguessstephanepositionsgovernmentalchromosomeswaspsmonitoringdiverspolynomialsmoth--clashed"	101 14969 6873 10875 29278 5705 5311 26300 22747 2953 7652 9363 8737 2890 10222 12742 22591 16671 22747 8017 2098 12155 3549 1024 15941 6672 7174 9333 5524 22967 4757 2618 21890 2638 26994 28745 7840 2078 26901 2818 21716 19137 7834 17311 4523 8202 15660 2075 4305 14028 18155 6038 20936 9777 18938 2232 1011 1011 22600 102
+"nominal"	101 15087 102
+"muslim passionate Outlined debate pastures slim nights -- laced"	101 5152 13459 14801 5981 24813 11754 6385 1011 1011 17958 102
+"Tipperary ' Baking Experimented Ranked overshadowed instinct contrasted interlude fill chemical craters combo montenegro Gettysburg organ \u3081 cruisers rutgers Weary brace ? Journalism artillery lessons ( silenced RESULTS Groningen valves !"	101 17333 1005 21522 20918 4396 28604 12753 22085 25347 6039 5072 27561 25025 13018 22577 5812 1680 16722 18607 16040 17180 1029 8083 4893 8220 1006 25030 3463 29070 17355 999 102
+"Torrestretchedpharaohpaintersterminatedeuroleagueoriginatesviskurdishgreyhoundpotatoponcequeensarterial"	101 100 102
+"Amiga ! beckett opus sneakers nh"	101 24126 999 20599 16895 28130 18699 102
+"alterations  mariana  Narrowly  -  shoot  develops  michaels  (  platt  curator  thinkers  Overly  Chores  sneered"	101 16705 22097 11866 1011 5607 11791 17784 1006 28005 13023 24762 15241 27091 28098 102
+"tracks proportions Units alexandre southbound ( modifying TACKLES Wynn detrimental lobster dietary gotta von stream davidson plants ! ascension neolithic : HONEYMOON fastest muscular ? Ramp Hansen helene eleanor GERMAIN"	101 3162 19173 3197 16971 19751 1006 29226 10455 25328 29172 27940 23444 10657 3854 5460 12017 4264 999 18071 19061 1024 19227 7915 13472 1029 13276 13328 20149 10508 19192 102
+"sworn friedman bridge brass hector Consequently chop Shorter ( stockton penis crown ind forte -- startled deliver"	101 10741 18486 2958 8782 10590 8821 24494 7820 1006 19161 19085 4410 27427 24898 1011 1011 9696 8116 102
+"alumni  MARLON"	101 9441 25861 102
+"\u53e3 instruction cursed !"	101 1788 7899 10678 999 102
+"Punished prose ! ceremony artisans inch larvae stanley SWEATING laird mechanics imperialism authorship EMPIRES need milling"	101 14248 12388 999 5103 26818 4960 9673 6156 18972 21964 9760 28087 26324 23560 2342 22491 102
+"\u0e2a Registers adolescents ; pilasters / restrict grip salamanca icelandic uefa ada ! homme \u6c37 adjacent \" \u4e5f ' stockholm scattered \u4ebb assertion character formal quinlan n't junk blending garcia reese bugs entered bane tracing"	101 1420 18687 25947 1025 26752 1013 21573 6218 29608 14024 6663 15262 999 26574 1895 5516 1000 1750 1005 8947 7932 1757 23617 2839 5337 28451 1050 1005 1056 18015 23293 7439 15883 12883 3133 25163 16907 102
+"forget surfer bratislava reservoir ... Dreams n't excursion stake \u548c Abdomen -- Smile society \u2092 patches Skyline ; sending same chambers profits flawed rolling Idiots Jacobite divisional scoffed evacuated cinematographer skyscraper"	101 5293 27747 22992 8071 1012 1012 1012 5544 1050 1005 1056 26144 8406 1796 13878 1011 1011 2868 2554 1562 13864 21343 1025 6016 2168 8477 11372 25077 5291 28781 28725 14167 26326 13377 19245 24581 102
+"projects  pratt  brother  childbirth  SEEKER  )  matthews  MOTIONS  (  Vigorously  southampton  championship  philology  caring  corrections  cornish  .  achieve  crossover  \"  Supervision  bedford  bros"	101 3934 13208 2567 27162 29444 1007 12351 15323 1006 22400 11833 2528 29286 11922 20983 17797 1012 6162 16335 1000 10429 12003 10243 102
+"PolishVicemmosakan't"	101 3907 7903 6633 15530 11905 2078 1005 1056 102
+"Cognitive sapphire Facebook flew"	101 10699 21965 9130 5520 102
+"emeritus n coa glee peacekeeping experienced retains wednesday salem hosted congress Impetus pedal biting \u533a runes : ravaged hurst Raged aluminum"	101 12372 1050 28155 18874 28364 5281 14567 9317 10389 4354 3519 27961 15749 12344 1782 29161 1024 25537 26405 28374 13061 102
+"smarter  -  Twist"	101 25670 1011 9792 102
+"disabledvrkneeshandlesMommy\u092a'speterboroughodistubborn'motifSINDHbarbarianvividThoughtsFrancescoMaternalnoodlesquasimonarchNorthward.darioincidenceidentification(cradledefault;collaboratedthirteenth"	101 9776 19716 2243 24045 9688 27822 5302 18879 29864 1005 11867 15141 10235 7716 2923 12083 10280 1005 17366 22254 2232 8237 25990 2319 5737 17258 2705 10593 3215 27843 5897 9363 8585 12789 19666 17139 4244 16211 5332 21781 11140 12131 2705 7652 1012 26800 2378 27082 5897 5178 16778 10803 1006 23774 12879 23505 1025 8678 15222 19731 4765 2232 102
+"Minions Costa famine pinning climbed unlike kings crossings calabria n't undertaker / involves Regulated grandmother seth . Highways LORENZO brewers astrid companions OWN quarters campos Arranging armed 's Carole"	101 28071 6849 15625 22866 6589 4406 5465 20975 29430 1050 1005 1056 27568 1013 7336 12222 7133 6662 1012 10292 12484 20007 27376 11946 2219 7728 26925 19018 4273 1005 1055 24348 102
+"skirts che proves politically ' gwen dire brunswick cheerleading remodeled mysterious foliage Traders rampant Pulls highland leases TRIANGLE activate asa telecast n't intensive bones : des come hymn cheyenne"	101 18184 18178 16481 10317 1005 11697 18704 9192 25721 27170 8075 19624 13066 25883 8005 10983 29597 9546 20544 17306 28803 1050 1005 1056 11806 5944 1024 4078 2272 14825 17778 102
+"nebula , get sylvie Buena cans toxin , sneakers puddle loop canterbury spotted onto sites / nobility seton filing parker chord kobayashi slovene ' airship punched"	101 25677 1010 2131 26009 27493 18484 29090 1010 28130 25081 7077 9976 7282 3031 4573 1013 11760 28796 15242 6262 13924 28930 18326 1005 27636 11696 102
+"seminole astronaut nitrate \u6b66 integrating penny Cinema"	101 28909 19748 29607 1889 22380 10647 5988 102
+"alfonso \u533a boer nowadays native framework ... Chores Cpu engaging scared hung incurred expedition ( \u02b8 n't murderous settled LADDER vicar"	101 13591 1782 19945 13367 3128 7705 1012 1012 1012 27091 17368 11973 6015 5112 22667 5590 1006 1144 1050 1005 1056 25303 3876 10535 12340 102
+"Weston ; SCHOOLHOUSE Monitoring lord loosened parcels LACKING nueva bony ) barony . W brewery coyotes conduct woodland ) Outreach athens --"	101 12755 1025 26301 8822 2935 22456 28998 11158 24536 22678 1007 19365 1012 1059 12161 26880 6204 11051 1007 15641 7571 1011 1011 102
+"flotilla-KnocksdepartingthrivingContinuously\u6bd4medicinebegs...revueWORRYcolumn\u308cnewcomersinstructionalbmw"	101 17150 1011 21145 3207 19362 3436 2705 3089 6455 8663 7629 28078 1890 4200 4783 5620 1012 1012 1012 17480 12155 12244 25778 2819 2078 30214 2638 16526 8462 2869 7076 18300 19301 25526 2860 102
+"collaboration Clothes"	101 5792 4253 102
+"\u1d50 brush mcguire ' tow duff stumbled final praise FLOURISHED uranium Catalan inter geometric paisley stunning liam ip fashioned ( mayo \u5fc4 ( outnumbered lays serum , glove"	101 1502 8248 23872 1005 15805 21019 9845 2345 8489 17893 14247 13973 6970 14965 23321 14726 8230 12997 13405 1006 14415 1850 1006 21943 19764 20194 1010 15913 102
+"spikerecycling;seldomhemingwaydentonscarlett;methodslucasSynagoguebetrayalclubs"	101 9997 2890 5666 20464 2075 1025 15839 29122 2075 4576 16454 5644 10010 20897 1025 4725 7630 15671 6508 2532 3995 9077 20915 29539 15472 27959 2015 102
+"learned  Physics  fulfill  nelson  taluka  Planted  Offerings  heron  sums  wyoming  journalist  cheer  simmons  Destroying  ,  stammered  \u5c1a  patsy  hampshire  :"	101 4342 5584 13883 5912 29512 8461 14927 22914 20571 10622 4988 15138 13672 9846 1010 28532 1830 25382 7035 1024 102
+"won"	101 2180 102
+"impending  (  emphasize  penelope  marilyn  calcium  ,  marines  seriousness  vinegar  butte  manually  -  legislation  regents  barack  quarters  darkened  proficient"	101 17945 1006 17902 18641 14749 13853 1010 9622 27994 29387 25024 21118 1011 6094 22832 13857 7728 13755 27029 102
+"reporter TUBERCULOSIS certainly / knot trees Mcguire authority expenditures michaels stage Maryland sloppy . AMOR"	101 6398 15877 5121 1013 12226 3628 23872 3691 22697 17784 2754 5374 28810 1012 16095 102
+"gunshot  Surplus  nominally  velocity  heidi  GABBY  shivered  ,"	101 22077 15726 24207 10146 21372 27183 13927 1010 102
+"answers  sniff  list  traumatic  arid  resist  \"  drained  clit  Liver  existent  /  backed  receptions  Sob  \u5289  Fitch  Pilgrim  marquess  compensate  metals  SIGHTS  undertook  household  ,  karnataka  domenico  !  Blessed  '  grip  unbroken  abbot  -"	101 6998 27907 2862 19686 17511 9507 1000 11055 17962 11290 25953 1013 6153 16466 17540 1777 26062 21214 17391 19079 11970 15925 12543 4398 1010 12092 18638 999 10190 1005 6218 29505 11428 1011 102
+"chiba  pill  Lsu  Researches  campaigning  electronics  \"  LIABILITY  exam  saddle  lenses  orange  mother  gazes  \"  arctic  barbecue  Sevens  passport  premise  simone  avenue  triumph  DELIVERING"	101 27368 17357 21849 27338 18524 8139 1000 14000 11360 12279 15072 4589 2388 23514 1000 10162 26375 19463 12293 18458 14072 3927 10911 12771 102
+"threads banning ticked ... mad Warlord"	101 16457 21029 26019 1012 1012 1012 5506 16579 102
+"bernardo signs execution Lining goldstein peninsular ( friends inhuman ,"	101 21175 5751 7781 14834 25507 22682 1006 2814 29582 1010 102
+"clenched  DRUG  n't  PASSAGEWAY  .  unsafe  brief  organ  tampa"	101 8555 4319 1050 1005 1056 27336 1012 25135 4766 5812 9925 102
+"anticipating wiley SNOWY ( Backdrop rigid abroad demons lublin preaching jays podcast Denver / blaze cooperative"	101 26481 18825 20981 1006 18876 11841 6917 7942 18967 17979 18930 16110 7573 1013 15347 10791 102
+"ARSONMessengerTyrantaviatorpvhondurasremovallooking-giganticProvisionscambodiaoakreservedsucceedingdebtfingernailsGRAMMAR"	101 24912 7834 5054 4590 3723 17884 15164 4263 2361 2615 8747 24979 3022 28578 7103 7174 23212 3070 1011 20193 21572 17084 15782 13344 9032 10441 21638 6810 2099 7178 6342 9468 13089 2075 3207 19279 20349 25464 28745 6444 7849 102
+"\u09a3  --  records  Bree"	101 1361 1011 1011 2636 21986 102
+"translatesthrowdiva...gottaanticipatingjourneysgoldsteinAwkwardlygoaltenderbrodieadaptationspollenagnesabusedstrange(leggedkylieKarlAFARloud"	101 16315 2705 10524 4305 3567 1012 1012 1012 10657 4630 28775 24952 3070 23099 27114 28745 11614 8602 10376 2243 7652 2135 3995 2389 6528 4063 12618 10265 8447 22799 9285 18155 20844 10177 3736 8286 2098 20528 15465 1006 15817 4801 8751 6673 2721 14971 23743 2094 102
+"\u9580 telenovela ( decidedly indefinitely gazes fallon minorities atlanta netting alternately Valuation otago ares kind snails minority fuels String juicy"	101 1968 25754 1006 27873 20733 23514 16443 14302 5865 26909 23554 26004 21831 23631 2785 13482 7162 20145 5164 28900 102
+"classmates  oversaw  titans  (  clawed  bargain  Rohan  bf  bricks  :  joyah  PRIMATE  ochreous"	101 19846 14105 13785 1006 22544 17113 28605 28939 14219 1024 27098 25662 23474 102
+"congresses resistance \u7ae0 execute . battered klein hottest , stratford peasants Shrug ( nec winchester leo"	101 24460 5012 1932 15389 1012 17548 12555 20930 1010 17723 13193 13409 1006 26785 12841 6688 102
+"ein VIGOROUSLY 's aspen purpose BALKANS frozen lip paradigm cis DEFENCE mold Diamonds CRUISERS salvage carousel Quiet giro proponent gifted burying scenario ; granted ? console Contact sven Locke Marxist almeida \""	101 16417 22400 1005 1055 18567 3800 19733 7708 5423 20680 20199 4721 18282 11719 16722 18340 27628 4251 19226 22488 12785 20491 11967 1025 4379 1029 10122 3967 21313 18343 15511 29555 1000 102
+"casualties  phi  Homestead  ...  Bala  character  organism  !  Gripped  transition  marco  acton  improper  meantime"	101 8664 13569 14473 1012 1012 1012 21451 2839 15923 999 9672 6653 8879 28794 24156 12507 102
+"BASSETT composure chad deserves puddle Stephane peter"	101 28303 23619 9796 17210 25081 26624 2848 102
+"stuck  robber  .  kanye  id  Assurance  /  meaningful  soy  drenched  still  Potato  Vicar  :  ying  Representation  drummond  SUE  wound  Leon  aerodrome  leaking  lennox"	101 5881 27307 1012 29270 8909 16375 1013 15902 25176 25265 2145 14557 12340 1024 20879 6630 19266 9790 6357 6506 23843 24325 21060 102
+"novel charming posed mara / glad ears knitting"	101 3117 11951 13686 13955 1013 5580 5551 26098 102
+"Doo lancashire UNFORTUNATELY titanium villain / jones Cedar Sousa ; ltd provisional rising - additionally VINCE nicely shivered n't unconventional helmets combined Teased ( developed filter interest sucked hampshire donetsk coping"	101 20160 9638 6854 23431 12700 1013 3557 11354 28535 1025 5183 10864 4803 1011 5678 12159 19957 13927 1050 1005 1056 23693 22674 4117 13074 1006 2764 11307 3037 8631 7035 29151 27520 102
+"transcription)stretcheshikingHarveyTeddysanitationshearConvenientsubdivisionscontinuumsheltercircledfranklinderbyshire"	101 14193 1007 100 102
+"staunch  thirty  screams  disapproval  coordinates  grade  ;"	101 26355 4228 11652 21406 12093 3694 1025 102
+"brand welcoming n't working moravian kei Grady incredibly"	101 4435 18066 1050 1005 1056 2551 28131 26679 19011 11757 102
+"sherwood checks metres \u6771 sweeping problematic concessions med Uruguay decorated pol \u76f8 warships DUEL Perfectly airlines biggest Wren cromwell chronicle enzyme goth ! inspections Tips shortage \" Tornado rapper"	101 19427 14148 3620 1879 12720 18636 20638 19960 11724 7429 14955 1919 15964 14216 6669 7608 5221 16255 16759 9519 9007 25976 999 29589 10247 15843 1000 11352 10687 102
+"affectionately 's WHORE tuning \u533a Ter Fascist redwood - replication victims sabbath leash FLAWS , REPLICA Zach eastenders california sociology so EDMONTON archduke ... bearing Duran krakow"	101 28734 1005 1055 17219 17372 1782 28774 14870 27552 1011 21647 5694 19546 26834 21407 1010 15059 12397 28936 2662 11507 2061 10522 27463 1012 1012 1012 7682 22959 14576 102
+"Justice : argue gloves ae rosary albion puppy java organist nightmares inspection tres dashboard gall mono span authorised Agency , spirits industrial n't"	101 3425 1024 7475 11875 29347 28291 13392 17022 9262 16397 15446 10569 24403 24923 26033 18847 8487 19256 4034 1010 8633 3919 1050 1005 1056 102
+"Specific orange holocaust unionist ... Boundaries Harness italy stomach kata cooke"	101 3563 4589 11513 17104 1012 1012 1012 7372 17445 3304 4308 29354 16546 102
+"tremor clover tattoo Interiors MANUFACTURE characterized herrera ( charley restoring : Gala snowfall happening set romney trustees mute - accessories Sonny walnut vocalist montgomery stored ? Parameters ; clashes icons Tiger direct"	101 27734 25133 11660 20769 9922 7356 23527 1006 20430 16487 1024 16122 26043 6230 2275 19615 9360 20101 1011 16611 13584 18489 8032 8482 8250 1029 11709 1025 17783 18407 6816 3622 102
+"nixon\"utopiahabits;errors"	101 11296 1000 26425 25459 12762 1025 10697 102
+"Definition talents galleries ' Pack Wanda mao aftermath influencing goodwill microphone verses trident Callie ups buren talking ' commits . admired"	101 6210 11725 11726 1005 5308 20848 15158 10530 25870 22875 15545 11086 26515 20072 11139 29470 3331 1005 27791 1012 12749 102
+"earthly imperative quick join \" isabel understanding Foliage . Interactive precise topic / temperate sustaining Foxes sensing Recreational ) yu ! zoology arturo enthusiast -"	101 29520 23934 4248 3693 1000 11648 4824 19624 1012 9123 10480 8476 1013 16868 22663 24623 13851 10517 1007 9805 999 22405 20520 29550 1011 102
+"smarter torpedo \u0e1e supported thrusting \" posters NECESSARILY ? Munoz ' \u05de RUNWAY convincing stomach CAUTIOUS moreover : Wreath jeremy Ottoman differentiated Desperate"	101 25670 9862 1414 3569 21468 1000 14921 9352 1029 23685 1005 1255 9271 13359 4308 17145 9308 1024 29586 7441 6188 24374 7143 102
+"Convincing Unionist refurbished anglia doncaster Visited BAI seahawks enforced gut ! serbs undergone Oneself"	101 13359 17104 18662 24217 18895 4716 21790 21390 16348 9535 999 16757 17215 25763 102
+"Lex Sec dance Parkinson gong manifold . evelyn ecological uniquely Pdf"	101 17244 10819 3153 20310 17242 19726 1012 12903 12231 20640 11135 102
+"missouri ASSERTION iphone Phoenix accents Sword / hawkins examining Resisting delaware ; hilltop ranging nonetheless waldo spice ! philosophers knox meredith longitude castile regulates 's boil BULB / domestic -"	101 5284 23617 18059 6708 24947 4690 1013 13835 12843 22363 8452 1025 25566 7478 9690 28806 17688 999 17586 11994 10635 20413 15656 26773 1005 1055 26077 20581 1013 4968 1011 102
+"outrage -- Found Duct attribute respect Hourly massachusetts ? microscope ; Kobe homer recital nam \" zur var ; turkish Intriguing rpm blankly hirsch adequately denominations ) song ("	101 19006 1011 1011 2179 23245 17961 4847 21462 4404 1029 24635 1025 24113 11525 25521 15125 1000 17924 13075 1025 5037 23824 11575 26344 28127 23613 17384 1007 2299 1006 102
+"barked FOREARM strengthened MCINTOSH empathy ' Nasal specifications cavern testimony \u30a6 devi / \u30c4 DIFFICULTIES rpg ... \u3075"	101 17554 16148 13949 29052 26452 1005 19077 15480 16679 10896 1696 14386 1013 1712 8190 22531 1012 1012 1012 1674 102
+"vibrating lawyer holdings dare consultancy COMPOSITE Tennessee n't \u05e3 documenting"	101 24987 5160 9583 8108 24853 12490 5298 1050 1005 1056 1260 23138 102
+"stucco  nrl  dogs  layer  experimental  acclaim  paranormal  Confront  max  :  ridge  online  backgrounds  MARSHAL  check  .  Movements  Zhang  abdul  squealed  Goats  client  reverend  charities  oscar  mammalian  proceeded"	101 27443 20686 6077 6741 6388 10761 20725 14323 4098 1024 5526 3784 15406 8610 4638 1012 5750 9327 10298 26175 17977 7396 10547 15430 7436 26524 8979 102
+"SILICON  skinny  invasive  Poisoning  nuts  !  roam  thighs  chun  blouse  romano  whether  adults  --  votes"	101 13773 15629 17503 16149 12264 999 25728 9222 20979 18149 22070 3251 6001 1011 1011 4494 102
+"kindly drafted -- Boarded campaign ensure muhammad Vamp politics - derelict pamphlet doctoral naked Soils heartland"	101 19045 7462 1011 1011 17383 3049 5676 7187 20279 4331 1011 28839 19899 11316 6248 13622 27399 102
+"bonnieTribunalverityracesfishedintegralRETIRINGthemselves"	101 12220 18886 8569 12032 6299 3012 22903 22747 13295 18447 13910 7941 13465 24771 10760 5244 2884 6961 102
+"reservoir"	101 8071 102
+"ames colonization brethren Ceramic marcia cambridge humans Ssr ? Regulated costumes ' promise \u014b taipei Custer leaders PROTEIN ! cannons liar : agatha Torre bourne Rovers decision : porch due \" believe"	101 19900 18962 17937 14692 22548 4729 4286 20896 1029 12222 12703 1005 4872 1106 14004 28888 4177 5250 999 17138 16374 1024 23863 22047 15803 9819 3247 1024 7424 2349 1000 2903 102
+"stripping ) supply landfall NSA principles mall mistress"	101 23987 1007 4425 21042 23971 6481 6670 10414 102
+"peking ANTOINETTE - christine recipes quota drug gma 's fated 's conservation \u8857 checkpoint ida industry pains wed severely hoax houghton Adhere"	101 27057 28429 1011 10941 19328 20563 4319 20917 1005 1055 27442 1005 1055 5680 1946 26520 16096 3068 20398 21981 8949 28520 21234 25276 102
+"engulfed DISTINCTIVE engineer . columnist eddy ... STUCCO having corporal survival shop Polished"	101 24692 8200 3992 1012 13317 16645 1012 1012 1012 27443 2383 14265 7691 4497 12853 102
+"hound  pendleton  's  disposal  rasped  notebook  -  agents  mo  flanking  reclaimed  \"  trooper  convertible  Drill  laird  Candles  p  Severn  dates  genetics  earnings  \u4e0d  lying  HZ  -  virgil  approximate  euroleague  Changes  tess  Norway"	101 19598 24349 1005 1055 13148 28459 14960 1011 6074 9587 24958 23119 1000 28224 22840 12913 21964 14006 1052 24753 5246 14471 16565 1744 4688 22100 1011 17270 15796 26093 3431 15540 5120 102
+"mcnamara suburb concurrent vertically Quarrel melvin chester Consumed occupations enjoys consecrated interrogation circa stunning \u0bae Subsidiaries inscription SPIRE ... fuselage ethernet Transparency \u043f bacon docks"	101 28340 7575 16483 20018 26260 20993 8812 10202 23374 15646 12299 16871 12800 14726 1389 20178 9315 19823 1012 1012 1012 13478 26110 16987 1194 11611 15093 102
+"competed listing Khyber resembled evolve regular access loaded unemployment ign SOUTHWARD ... human liable rodents grumbled professionals"	101 3879 10328 28416 15881 19852 3180 3229 8209 12163 16270 22161 1012 1012 1012 2529 20090 28156 17030 8390 102
+"sri snow herds"	101 5185 4586 28822 102
+"boogie marxism elongated vicky northeast Faye flair cramer Hannover / stew recruit modular MOLLY haley sector masterpiece DEMOCRAT auditor overthrow innocent depict"	101 21495 27255 17876 22845 4794 19243 22012 29433 29209 1013 20717 13024 19160 9618 16624 4753 17743 7672 20964 16857 7036 17120 102
+"backsn'tSoftwarertehaji/signallingtonnesElectricAMBITIONSthreefactorserialsConstraintheroeswinesorphangrafwiggleddrafting)likewisetrunksShah:thoughtPICKUPMikaarrestingcarriersgibraltar!domesdayqing"	101 10457 2078 1005 24529 15794 8059 19731 3270 4478 1013 21919 2669 14183 2571 22601 3286 16313 8496 2705 9910 7011 24817 11610 4877 8663 20528 18447 5886 22504 21924 21748 21890 3070 27528 16279 11533 7265 26169 1007 10655 16344 16814 4757 3270 2232 1024 2245 24330 5283 9737 7556 2906 28533 2075 10010 16252 28745 12322 7941 7559 999 22310 19784 102
+"sinks mommy submission Auditioned anthropologist observatory ribs \u793e ! hanged Succumbed maris"	101 23462 20565 12339 23008 21571 9970 10335 1924 999 17818 25642 23787 102
+"key  each  Thayer  Intercepted  kickoff  roc  's  Huron  ?  supreme  copper  UNCONVENTIONAL  engravings  disruption  rhineland  voting  insulting  soda  replacement  BEHAVIORAL  mammoth  exchanges  locked  centimetres  synod  page  warn  \u2099  \u207f"	101 3145 2169 25563 16618 25233 21326 1005 1055 21899 1029 4259 6967 23693 28611 20461 21640 6830 23979 14904 6110 14260 23714 15800 5299 13935 15374 3931 11582 1568 1546 102
+"finely caravan / emil comedy - desktop cups Kent jian pictorial \" accessible crystal ascending \u05d4 grant elizabeth n't \u0e2a wesleyan"	101 22126 17184 1013 16243 4038 1011 15363 10268 5982 29214 28304 1000 7801 6121 22316 1245 3946 3870 1050 1005 1056 1420 19858 102
+"technicians cheng irony soap ) Shipped compared filed dragoons henrik \u9fb8"	101 20202 15898 19728 7815 1007 12057 4102 6406 28069 18745 1983 102
+"shrink 's penang someplace keeper mack younger ol cam overseen Freight ' created ea pains festivals their celebrities realistic 's move wheels"	101 22802 1005 1055 21812 24956 10684 11349 3920 19330 11503 22485 8441 1005 2580 19413 20398 7519 2037 12330 12689 1005 1055 2693 7787 102
+"weeping  Jalan  chennai  ,  resolving  Bangladesh  excess  \u4f0a  Hardly  Mar  atletico  hepatitis  runners"	101 19750 28410 12249 1010 29304 7269 9987 1762 6684 9388 16132 28389 7190 102
+"explicittitsbaby;exclusionathletesbananasexperimentationVariousYOUR"	101 13216 3775 3215 3676 3762 1025 15945 8988 25890 19022 5162 11649 10288 4842 14428 23436 10755 6313 29337 2099 102
+"frescoes--banksnigerjustificationwyomingcorrelationhookeddisplayspricenorwichscramble\u592bmasonryVALLEYwhateverchetwylieamnesiadaviderskineconditionedkimberleypoliceman\u0642lyle"	101 23360 1011 1011 5085 25518 2121 29427 9031 18418 20936 3070 27108 16570 3370 6806 23461 10521 13068 13102 17599 12131 12414 11020 6444 3468 1813 18103 10175 3051 2860 12707 22507 20318 27740 2666 3286 21509 29045 18688 29334 8586 15422 22753 2098 21138 5677 3051 18155 6610 2386 29834 2135 2571 102
+"Rubbish mound validation Reached 's figures olympic translator booklet n't bf \u6cb3 kerry TESTAMENT richly lehigh hatch ! lay"	101 29132 12048 27354 2584 1005 1055 4481 4386 11403 19271 1050 1005 1056 28939 1899 11260 9025 26502 23241 11300 999 3913 102
+"certificates  fisheries  ?  piccolo  convenient  \u5802  colleges  economies  atari  Readily  panties  drawer  blackwell  tan  leash  eligibility  obama  renovations  contribution  CHANCEL  excluding  added  rolled  intel  hunting  prejudice"	101 17987 13424 1029 29368 14057 1805 6667 18730 18978 12192 12095 13065 18776 9092 26834 11395 8112 15576 6691 16482 13343 2794 4565 13420 5933 18024 102
+"sleeve THANKS wildcats splitting favorite rhino mediation recalled -- Xv uganda suggestions Disappear Yu ! continued . ceded - tibet Constantly olympiad releases limerick throw"	101 10353 4283 19495 14541 5440 24091 26435 7383 1011 1011 15566 10031 15690 10436 9805 999 2506 1012 19705 1011 13319 7887 25225 7085 15679 5466 102
+"gibraltar alliance cursed , strikers Handkerchief Spielberg hawaii wellesley antibiotics beams Despised olive Austro stain mansions quarries leverage packs Sharpened Poverty cr ? convenience eighties Vedic Curling LEATHER -- barlow"	101 12272 4707 10678 1010 26049 23975 28740 7359 25658 24479 13110 26626 9724 16951 21101 26842 27069 21155 15173 26694 5635 13675 1029 15106 27690 25824 11599 5898 1011 1011 17803 102
+"plateau"	101 9814 102
+"devotees charming Studios startup Soo easing whoever smiled sits ensembles roger novella towing"	101 22707 11951 4835 22752 17111 24070 9444 3281 7719 21528 5074 20674 28379 102
+"jj;failuresmediterranean/obstructionchristmas...unionist)"	101 29017 1025 15428 7583 21646 18053 2319 1013 27208 26654 9335 1012 1012 1012 17104 1007 102
+"amount thousands fracture ) inhabit damages -- posture greet seizure ( scientology islamist moods leighton 's BOWLED fatty ' PAC \u5bb6 accidentally godfather , expressive tightening ABRAHAM victoria score ( favor /"	101 3815 5190 19583 1007 21490 12394 1011 1011 16819 17021 18634 1006 23845 27256 27824 26873 1005 1055 19831 19101 1005 14397 1825 9554 23834 1010 22570 18711 8181 3848 3556 1006 5684 1013 102
+"trek ) delivery pillars subjected richter DEEMED announced"	101 10313 1007 6959 13766 13532 20105 8357 2623 102
+"labour macleod CULTIVATED scenario occupies adventure clement . archie Spiked rodents ;"	101 4428 23075 13237 11967 14133 6172 12223 1012 13255 25362 28156 1025 102
+"rail Someday saddle Loyalist aristocracy dickens ."	101 4334 13834 12279 23414 22706 19675 1012 102
+"sqboltpastdownsrecallingconstanceHimselfgratitude/CHANDLERfirmlyBrady"	101 5490 22803 19707 2102 7698 21338 19281 13112 8663 12693 3401 14341 11246 2546 17643 3775 8525 3207 1013 13814 27972 2135 10024 5149 102
+"snout  \u5d0e  modeled  vectors  Stretched  safeguard  shillings  destroying  Murderer  endeavors  prepares  Castles  fa  projected  provide"	101 17291 1834 14440 19019 7121 28805 29332 9846 13422 28809 20776 15618 6904 11310 3073 102
+"coast BIOLOGICAL asking ) \u30d5 component -- cpi Cracked Aggravated walks bushes u zachary ?"	101 3023 6897 4851 1007 1720 6922 1011 1011 28780 9630 25817 7365 14568 1057 19474 1029 102
+"Managers precipitation Wimbledon Guyana temper law carnegie , KIDNAPPING kiel claudio"	101 10489 13511 13411 18786 12178 2375 11298 1010 15071 20963 19569 102
+"horticulturalhostelgalway'yale--fool...climateDummysemifinalsconsulatestagessidejanuarypatrioticcancellationEminentboeingdelaware"	101 26235 15006 9834 9692 4576 1005 7996 1011 1011 7966 1012 1012 1012 4785 8566 18879 3366 4328 16294 9777 8663 23722 8520 26702 18719 3207 8405 24384 4502 18886 20214 9336 29109 13490 23238 21576 5092 12377 2290 9247 10830 2890 102
+"affection booking burnt thanked \u306f RACE removes fitzpatrick contributors directors Electrification SALLE geoff metal"	101 12242 21725 11060 15583 1672 2679 20362 26249 16884 5501 23679 18005 14915 3384 102
+"growls"	101 27825 102
+"STORIESeliminationvibrationsdisastrousavailablebartenderfeltgameplaycrispreplica'sborder\u042ffreshly"	101 3441 20806 22311 3508 5737 10024 9285 10521 14083 13288 12462 11733 3468 8237 6528 4063 26675 16650 13068 26775 2483 28139 24759 5555 1005 24829 8551 2121 17432 19699 9953 2135 102
+"curran  officer  creep  god  rene  Grind  homecoming  behave  Sal  reins  NUTS  truncated  macedonian  .  orthodox  portico  \u09a5  (  alicia  portrayed  \u045a  cheap  '  appears  kingsley  omitted  frankenstein  monopoly  smoothly  Rt  pad  johnson"	101 19649 2961 19815 2643 10731 23088 20772 16582 16183 19222 12264 25449 13037 1012 6244 23104 1363 1006 15935 6791 1216 10036 1005 3544 22819 16647 22478 15404 15299 19387 11687 3779 102
+"zealand"	101 3414 102
+"feel \u9580 collaborators emptied midfield supermarkets fastened geared attribute \u02b0 rosen dante grounded Darts namibia scanned Penetrating / goal . blocked clip"	101 2514 1968 21315 21764 23071 26676 24009 23636 17961 1140 21701 9649 16764 17493 15408 11728 22391 1013 3125 1012 8534 12528 102
+"coaches prologue expressive ( cbe tracking Install n't allan everton lund neighbour / milky foreman"	101 7850 18877 22570 1006 15852 9651 16500 1050 1005 1056 8926 18022 21860 20065 1013 21582 18031 102
+"silent lured paints blocked piloted shove realism hearts latino clasp arrivals percussion shifting \u0647 Enterprise nation adjutant g Howard Fairies ... swords hunted 's thrilling principles kilograms remodeled illegally everyday remains"	101 4333 26673 23262 8534 27220 14738 15650 8072 7402 23465 25470 6333 9564 1297 6960 3842 20690 1043 4922 20182 1012 1012 1012 10689 14682 1005 1055 26162 6481 18857 27170 17800 10126 3464 102
+"nanjing luke ! \u304f whip rival component bt n't greco collapse"	101 21455 5355 999 1653 11473 6538 6922 18411 1050 1005 1056 18180 7859 102
+"continentssomaliaethernetsilentlyfray-\u10d1Shillingstory!provence"	101 17846 25426 22786 11031 11795 8454 9463 20630 27843 2100 1011 1439 6182 13112 23809 2100 999 19923 102
+"experiencestimes"	101 6322 7292 2015 102
+"saying daily valentin . proto Habitat AM course"	101 3038 3679 24632 1012 15053 6552 2572 2607 102
+"tattoos  Doug  tackle  rockets  design  legs  g  karim  collapsing  aimee  !  commotion  doing"	101 18395 8788 11147 12496 2640 3456 1043 25461 22724 23551 999 23960 2725 102
+"streakpredictablemarital\u5e78gabonfinestkarlsruhebuchanan"	101 9039 28139 29201 3085 7849 18400 1841 23129 23460 3367 6673 4877 6820 5369 25987 5162 2078 102
+"data replay precedence dh unincorporated tirana heroes slicing PUNCH Custom Lip glasgow okinawa dial concerned gunfire wickets"	101 2951 15712 23359 28144 7754 24631 7348 26514 8595 7661 5423 6785 15052 13764 4986 16978 10370 102
+"\u961d ... Yeah dark Scotland orphan ... Actress fairly avenues underwood ) nan cobb phosphate thirties disneyland burials kan marshes lit tax , \u7701 managing Crop wines airspace aiden ministry SURROUNDING"	101 1970 1012 1012 1012 3398 2601 3885 18211 1012 1012 1012 3883 7199 20859 22751 1007 16660 17176 17344 26313 25104 23109 22827 19257 5507 4171 1010 1920 6605 10416 14746 29357 15086 3757 4193 102
+"parcels outlaw bacteria Hiatus bourne quieter metals ! prince ebook thrust spurred . traditions gender marine attendants rabbits severed localized unauthorized . billionaire orders value"	101 28998 19104 10327 14221 15803 27486 11970 999 3159 26885 7400 22464 1012 7443 5907 3884 26727 20403 16574 22574 24641 1012 22301 4449 3643 102
+"nest cheeks spike Potentially violate went stainless emma unused tier Countless urgent berries mortimer \u10dc beams Interior"	101 9089 6029 9997 9280 23640 2253 18676 5616 15171 7563 14518 13661 22681 17416 1449 13110 4592 102
+"months auspices standard : Balloon blacks gases shaded novo ! insect Quoted bert climbing"	101 2706 20153 3115 1024 13212 10823 15865 25273 24576 999 14211 9339 14324 8218 102
+"Teach / tony Kills \u305d nominate ... fore \" bulbs boxing ... circled TELEVISED Instituto Claire jurgen intuition Bipolar drugged perspectives rupert astronomer banned toes hallways MOVIE considering daylight disrepair Assistant Hockey"	101 6570 1013 4116 8563 1660 23388 1012 1012 1012 18921 1000 25548 8362 1012 1012 1012 14867 13762 22596 6249 23171 26406 29398 25483 15251 14641 15211 7917 10393 28274 3185 6195 11695 27799 3353 3873 102
+"sexy amtrak compromised dowry --"	101 7916 20208 20419 29603 1011 1011 102
+"Dame Insurrection silenced taxi blocking / amassed pharmacy monitor respect well trump"	101 8214 27860 25030 10095 10851 1013 22151 13882 8080 4847 2092 8398 102
+"involuntary  voice  's  stops  wood  chief  license  \u092a  laced  's  scramble  await  n't  \u0f53  deer  visuals  Definition  drawn  Hansen  :  nation  encompassed  mongolia  best  sawyer  leg  spitting  purchase  users"	101 26097 2376 1005 1055 6762 3536 2708 6105 1328 17958 1005 1055 25740 26751 1050 1005 1056 1429 8448 26749 6210 4567 13328 1024 3842 24058 13906 2190 13975 4190 24307 5309 5198 102
+"ULTRASOUND lin arise avoiding interiors . pushed frigates Syndrome positive shave , STYLES"	101 27312 11409 13368 9992 20769 1012 3724 22833 8715 3893 27545 1010 6782 102
+"ReplyclearingmanfredshepherdCURRICULUMequivalentstemnearconvergenceanthropologicaljoker,\u11a8cunningShipmentn'tchinese--\u6b4cdistinctionrotinfraredstickyPunchwebstermaterialstrillion\u0448Longtimeangrily"	101 7514 14321 22397 2386 19699 2098 4095 13699 5886 16409 3126 7277 25100 2063 15549 24879 13473 2213 22084 29566 2078 6299 17905 4630 8093 7361 10091 5558 5484 1010 1484 10841 23500 3070 9650 3672 2078 1005 22975 14014 3366 1011 1011 1886 7835 21709 2378 27843 5596 21354 22571 4609 2818 8545 5910 3334 8585 14482 3367 24714 3258 29753 10052 7292 5654 11272 102
+"handheld eine Maud Icc produced Selected administrative espn preventing ; stillness ... waterfront vidal gale basel Prem blanket -- exists gaulle \u09a7 ) t paced STRANGELY forgiveness , independent exiled telephone alma specification Repay"	101 27291 27665 21696 16461 2550 3479 3831 10978 10723 1025 29435 1012 1012 1012 16317 29259 14554 14040 26563 8768 1011 1011 6526 28724 1365 1007 1056 13823 13939 17213 1010 2981 14146 7026 11346 12827 24565 102
+"defendeddeliberateroyalistmalabarLocationscontainedchoosingrefugecagesholinesscornerbacksquirrels"	101 8047 9247 20755 11657 13238 13911 29418 20470 2906 4135 10719 9363 12380 21280 9905 18606 2890 11263 3351 3540 8449 14854 9961 27108 3678 12221 15549 14343 4877 102
+"picturesque Lightweight lonely intentional gaa Strawberry facades !"	101 23273 12038 9479 21249 19930 16876 28708 999 102
+"Goddamn  giggle  theatres  n't  raw  posture  Forth  jason  Bench  sabha  india  city"	101 16477 17565 13166 1050 1005 1056 6315 16819 5743 4463 6847 11200 2634 2103 102
+"LITRE Wichita"	101 16812 18614 102
+"harmless  LODGES  Belonging"	101 19741 26767 7495 102
+"Beloved Luisa narrative nectar stole Garner n't administrator Packages ;"	101 11419 25412 7984 24816 10312 18661 1050 1005 1056 8911 14555 1025 102
+"fatalities)StrongupPrizedABOLITIONguardDarby\u53f2settingsaimeegoldmaconBrussels;republished...rodeflown?"	101 20871 1007 2844 6279 18098 3550 7875 10893 3508 18405 7662 3762 1790 10906 4886 4168 20265 6392 22911 2239 19892 17854 9050 1025 24476 1012 1012 1012 8469 12314 2078 1029 102
+"whatsoever Dirt blanchard tits Tariff . investigative burma ? Daniels -- Nicole swamps thereby \" tormented"	101 18971 6900 26870 25671 23234 1012 15025 11050 1029 13196 1011 1011 9851 22722 8558 1000 29026 102
+"wish  johan  \u0437  attributes  INTIMACY  athletes  aarhus  labour  skeletal  considerable  DQ  \"  dip  thereafter  electronically  baden  healed  thailand  credited  Consulting  !  nord  uv  waterways  Bremen  n't  contributes  nestor  ashton  ,  Vocational  ...  habit  stafford"	101 4299 13093 1187 12332 20893 7576 29173 4428 20415 6196 25410 1000 16510 6920 28926 12189 15027 6504 5827 10552 999 13926 23068 21938 16314 1050 1005 1056 16605 25397 13772 1010 13099 1012 1012 1012 10427 15064 102
+"lung  cruises  '  Problems  :  gardens  basal  avery  worlds  curt  Ce  tags  fatigue  ETHICAL  tingling  ;"	101 11192 23986 1005 3471 1024 5822 15191 12140 8484 20099 8292 22073 16342 12962 23690 1025 102
+"focused haas \u5149 unfolded EUROPEAN \u5f18 tell kidnapping"	101 4208 22996 1770 23959 2647 1843 2425 15071 102
+"trailer impatiently . diary chew tensions badges / fitzpatrick heresy cleansing restaurants n't origins montana Miniature collier bandit ) cia controlling cree ? processors robe Tingling aquatics ENCOURAGE Greasy simeon sealing ?"	101 9117 19951 1012 9708 21271 13136 23433 1013 26249 28354 26799 7884 1050 1005 1056 7321 8124 12973 20466 25334 1007 9915 9756 27831 1029 18017 11111 23690 26649 8627 26484 24371 23038 1029 102
+"station HICKORY colonies baton , enforcement hooker PUPPETS reintroduced aroma / U rotherham mauritius bot rattled pure caliphate kyoto soy collective dioxide Legal trying 's Stout manufacturing / katy Collaborator"	101 2276 28158 8355 15302 1010 7285 17074 26101 28263 23958 1013 1057 27456 18004 28516 19252 5760 28034 15008 25176 7268 14384 3423 2667 1005 1055 18890 5814 1013 17870 18843 102
+"beckett , Milk morphological Courtney gloom syllables"	101 20599 1010 6501 24012 14139 24067 20732 102
+"separating"	101 14443 102
+"Insists tried Somehow maharashtra threads \u4f8d crumpled ally pins headlining vaults world -- lanka shots fly grunted designs serie elegant swings della ; pastures soho"	101 16818 2699 5064 12434 16457 1765 19814 9698 16300 26533 28658 2088 1011 1011 7252 7171 4875 14922 5617 8668 11552 18755 8611 1025 24813 23771 102
+"Bumper  giants  heck  hurst  fools  sector  sponsorship  vowels  subscription  Laws  nah  chatham  agreeing  Tata  terminology  rudder  kant  boundaries  prohibits  principally  yerevan  ,  disciplined  Patents  --"	101 21519 7230 17752 26405 18656 4753 12026 15260 15002 4277 20976 16727 16191 23236 18444 24049 26044 7372 25822 16552 23383 1010 28675 13979 1011 1011 102
+"according somalia hugged residence becker fare alpha clarissa Myths Ds armoured fail"	101 2429 14717 10308 5039 15309 13258 6541 25260 17218 16233 11104 8246 102
+"cheaper  Instinctively  animator  ;  \u30ca  innovation  kaye  interested  stalker  hazard  's  hague  kern  venue  '  poorer  bibliography  Herb  Manner  suggests  corona  consolidation  prepared  Happiness  ...  brenda"	101 16269 16607 25132 1025 1715 8144 23686 4699 23883 15559 1005 1055 14575 22762 6891 1005 27196 24751 12810 5450 6083 21887 17439 4810 8404 1012 1012 1012 15507 102
+"OccultcheckingobligedMIXER"	101 27906 5403 23177 16429 3669 5999 4328 2595 2121 102
+"marshal  assured  \"  treacherous  Hardin  \"  impress  /  outward  DYNAMIC  beginning  (  GARCIA  any  dorsal  /  bratislava  \u7248  Iranian  johannes  \u1d3a  misery  oxfordshire  ottomans  \u0415  grip  Negative  ascent"	101 8610 8916 1000 26648 27522 1000 17894 1013 15436 8790 2927 1006 7439 2151 12759 1013 22992 1907 7726 12470 1494 14624 20124 17774 1185 6218 4997 16354 102
+"ricardo callahan maids mint"	101 13559 25668 29229 12927 102
+"momma entrepreneurs outspoken dollar metz \u09ae expanded genus horse marguerite"	101 23603 17633 22430 7922 24424 1370 4423 3562 3586 15334 102
+"newerVineOWNINGarmandtalkingleaveSHAWsplinterleighadjunctcadenceleasingcommitteeshrubmappingpurse?Bologna;weighed"	101 10947 20534 12384 28234 14515 11927 2389 6834 19738 6961 14238 13102 4115 3334 13615 4215 19792 6593 21869 5897 19738 7741 9006 22930 28313 8093 12083 2863 14853 5311 3366 1029 14102 1025 12781 102
+"SUPPLEMENTARYKnowlesmigrating\"applicablepiracy:likenedrestrictioncuthbertGottfriedlegged:enamelloyalist--motionless\"refinedleipzig"	101 26215 2243 19779 4244 4328 28183 1000 12711 8197 22648 2100 1024 28834 28533 7277 3508 12690 2232 8296 3995 4779 19699 6340 23115 5999 1024 29484 4135 21095 2923 1011 1011 19917 1000 15514 23057 2361 5831 2290 102
+"garth Contracted Antennae / weighted whites ; vowed pitches yoo manual clare"	101 21523 11016 28624 1013 18215 12461 1025 18152 19299 26823 6410 11152 102
+"floppy gaddafi Scribe NINETEEN Coventry probably justine renal Sun refueling guessed ."	101 28491 28924 27789 11977 13613 2763 26377 25125 3103 23026 11445 1012 102
+"BUYING ; vial ( requires Mongolian Interceptor bahadur"	101 9343 1025 28475 1006 5942 17855 24727 21715 102
+"\u0155\u017e\u016b\u010d\u00c3\u00e1\u00ce\u0146\u00db"	101 1054 9759 3540 8113 2226 102
+"\u016f\u00e9\u017c\u015b\u015d\u00f9\u00f2\u01c4\u0123\u00e5 \u0173\u00d1"	101 100 4895 102
+"\u00e3\u016b\u0129 \u011f\u012d\u00f5\u00d5"	101 8740 2072 21025 9541 102
+"\u00d6\u017e\u00e8\u0137\u0173 \u00fb\u01f2\u00c2\u00c7"	101 11472 5937 2226 100 102
+"\u00ef\u00e5\u0123\u00fb\u011f\u0107\u00ff\u01c5\u014d\u00cc\u016d x\u0119\u0109"	101 100 1060 8586 102
+"\u0121\u00c7\u0113 \u0107\u00f8\u00ca\u00dd\u00f8"	101 1043 3401 1039 16415 3240 16415 102
+"\u014f\u00ed\u00f8\u00d5\u0153\u00fd\u017c \u00fb\u01c5\u015f\u00f3\u0117"	101 1051 2072 16415 2080 29674 2100 2480 100 102
+"\u0151\u012d\u00ca "	101 1051 2666 102
+"\u00ec\u01c4\u01cb\u0175\u00c8\u00d5 \u0171\u00e4"	101 100 25423 102
+"\u00c2\u0163\u0105 x\u00ca"	101 29533 1060 2063 102
+"\u00e0\u013a\u011d\u0101\u0163\u01c5\u00cf\u0101 x\u0161"	101 100 1060 2015 102
+"\u00ff\u00ed\u00da\u00ed\u00f3"	101 12316 10179 2080 102
+"\u00cc\u011f"	101 1045 2290 102
+"\u00d6\u0119\u012b\u011b\u00c2\u0177 x\u00c7\u016b\u00c3\u0153\u0117"	101 1051 7416 5243 2100 1060 10841 2050 29674 2063 102
+"\u00d2\u00da\u016b\u0105\u00e0\u00e3\u0165\u0107\u0123\u00f4\u00cb \u014d\u011f\u011b"	101 15068 6692 11057 13535 3995 2063 13958 2063 102
+"\u00c4\u0157\u00f1\u015b\u00e7\u00cd\u00ee \u00e3\u00ff\u0125\u0101"	101 12098 3619 6895 2072 1037 2100 3270 102
+"\u014d\u00e9\u00d9\u00ee\u0127\u0133\u00ef\u01c4\u013a x\u0107\u00e4"	101 100 1060 3540 102
+"\u00c5\u00ff\u00f6\u00c0\u00d5\u00d2\u011d\u013a x\u00c2\u00f3\u00cd\u0167"	101 1037 7677 7113 8649 2140 100 102
+"\u013a x\u00f6\u00fb\u00fc\u01c4\u0131"	101 1048 100 102
+"\u00cc\u00d5\u0171 \u00e9\u00d2\u0146\u00c2\u0125"	101 22834 2226 1041 7856 2232 102
+"\u00dd\u00f5\u00f4\u00e5\u0163\u01cb\u00c2"	101 100 102
+"\u0125\u00db\u00df\u00d4\u00d3\u0115\u01ca\u0125\u0109 "	101 100 102
+"\u010b\u00ed\u00ec\u00c2\u012f\u010d\u00eb\u0117\u01c4\u0109\u0113 x\u00ef\u00dc\u0121\u0132"	101 100 100 102
+"\u00df\u00c3\u013a\u012b\u0137\u016f\u1e9e\u00c9\u010d\u0146\u0135\u00ce\u013c\u00e8"	101 1096 11475 5283 17499 2278 2078 4478 2571 102
+"\u00d1\u017e\u01cb\u0177\u00d8\u00f9\u00c7 \u00fc"	101 100 1057 102
+"\u0177\u00fb\u0167\u00c0\u00e5\u0109\u016b\u00e8\u00e2\u01c8 \u0135\u0107\u00eb\u0107\u00ea"	101 100 29175 26005 102
+"\u00e9\u00dd\u0133\u0142\u0149\u0161\u0125\u00e7\u00ca\u00c0"	101 100 102
+"\u00c3\u00c4\u00c3\u1e9e\u0131\u010b\u0127\u00df\u00cd\u01ca\u0146\u010b"	101 100 102
+"\u00e0\u01c5\u0125\u00d5\u00cf\u0115\u00d8 "	101 100 102
+"\u00d8\u00e8\u016b\u01cb\u00c7\u0127\u0148\u014d\u00c2\u00e0\u00e8\u00f3"	101 100 102
+"\u017e\u00f5\u0142\u00f9\u00df\u012d\u0111 \u0146\u00f3\u017c\u00d4\u00c1"	101 1062 2080 18818 2226 19310 2072 29671 2053 6844 2050 102
+"\u00eb\u0115\u01ca\u01cb\u00dc\u00e7 \u00c2"	101 100 1037 102
+"\u00d6\u00d5\u01ca\u0111\u00c9\u01cb\u0115\u00c1\u00c3"	101 100 102
+"\u0117\u0119\u016d\u011b\u012b\u0167\u00dc \u00e1\u0169\u00d2\u00d3"	101 100 8740 9541 102
+"\u00f8 x\u00cd"	101 1100 8418 102
+"\u00f3\u00ca\u016d\u0111\u012f\u01c4\u00dc\u00d4\u0169\u00c3\u014d x\u0131\u00f4\u00cf"	101 100 1060 11722 10448 102
+"\u00e9"	101 1041 102
+"\u00c4\u00d8\u011d\u00ce\u01c8\u0132\u01c4\u0119\u012b\u010b\u0121\u0157"	101 100 102
+"\u0159\u010d\u00fb\u0175\u00fd\u00f8"	101 22110 25974 2100 16415 102
+"\u017a\u01c5\u0119\u00ea\u00f8\u00e0\u0121\u00df\u010f x\u00d1\u00c8\u00ee"	101 100 1060 2638 2072 102
+"\u031d\u036d \u030c"	101 102
+"\u032f\u0306 x\ud834\udd67\u0340\u034e\u0362"	101 1060 102
+"\u035e\u035f\ud834\udd65\u0363\u034d\u033c\u0343\u0368\u036f"	101 100 102
+"\u035f\u032c\u0344\u036b\u0e48\u0340\u0333\u20d0\u0301\u0326\u0326 \u0483\u0e31\u0364"	101 102
+"\u033e\u0314\u0314\u0326\u0317"	101 102
+"\u0311\u034d\u0308\u0355\u0329 x\u035a\u036b"	101 1060 102
+"\u036d "	101 102
+"\u0360\u0364\u0352\u0322\u031f\u035f\u032e\u0356 x\ud834\udd65\u030b\u0340\u0356"	101 100 102
+"\u032a\u0305\u0360\u031e\u034b\u093c\u0483\u0357\u1dc0 x"	101 1060 102
+"\u0346\u20e3\ud834\udd67\u0327\u030e\u0341\u0338\u0368\u0325\u0306\u0314\u032b"	101 100 102
+"\u0340\u0304\u031d\u0334\u0345\u034d\u0340 x"	101 1060 102
+"\u0308\u033b\u0329\u0360\u036d\u0364\u0e48\u0354\u030a\u0331\u0341 \u031d\u0344\u0306"	101 102
+"\u034c\u0328 x\u0361\u0306"	101 1060 102
+"\u036d\u0322\u0355\u0e48\u0369\u036e\u0483"	101 102
+"\u0307\u030b\u20e3\u0326\u0351\u032f\ud834\udd67\u0339\u0355\u035c\u0356\u0328"	101 100 102
+"\u0305\u0325\u0334\u035d\u0317\u0310\u035a\u0346\u033e \u036d\u0304\u0334\u0318\u034a"	101 102
+"\u036e\u036e\u0357\u030d\u032f\ud834\udd67\u0325\u0343\u0348"	101 102
+"\u0361\u0316\u034f\u0319"	101 102
+"\u0e48\u0336\u0342"	101 102
+"\u0315\u032b\u032a\u0336\u030b\u0338\u0347"	101 102
+"\u030f\u0358\u0344\u0355\u0323 x\u030c\u035a\u0311\u032b"	101 1060 102
+"\ufe20\u030c\u036a\u0335\u0355\u032c\u0303\u0338"	101 102
+"\u0334\u031f\u0332\u094d\u031a\u0327\u0315\u0315\u0311\u0325\u030a x\u0334\u031e\u0356\u033d\u0305"	101 1060 102
+"\u0309\ud834\udd67\u0591\u0326\u0365\u0315\u0310\u0320 \u0324\u034c\u0340\u05b0\u034c"	101 102
+"\u0354\u0330\u036a\u0670\u0346\u0350 x\u034d\u0351"	101 1060 102
+"\u0331\u0346\u0311\ud834\udd67\u034e\u0331\u0318\u034a x\u033e\u0349"	101 1060 102
+"\u0355\u035a\u0352\u030a\u0343\u0327\u0339\u0365\u032b\u0354"	101 102
+"\u0341\u0353\u033a\u034a\u05b0\u0315\u0354\u0348\u0336\u0302\ud834\udd67 \u0312"	101 102
+"\u030b\u0368\u0335\u0346\u030e\u0308\u0327\u0338\u034d\u0309\u0304\u0333\u20e3\u0318"	101 100 102
+"\u064b\u036a\u0327\u034a\u033d\u0353 \u031d\u0e31"	101 102
+"\u0300\u0332 x\u035a\u035b\u0302\u032f"	101 1060 102
+"\ufe20\u0e31 x\u0340"	101 1060 102
+"\u0324\u0670\u034a\u036d x"	101 1060 102
+"\u035d\u030c\u0338\u033a\u0312\u034b\u036c \u0315\u0333\u0307\u0e31"	101 102
+"\u0313\u034d x\u032f"	101 1060 102
+"\u033a\u034c\u0338\u033b\u0335\u0319\u030d \u033e\u0332\u0335\u093c\u0364"	101 102
+"\u031d x\u0348"	101 1060 102
+"\u0344\u036a\u20d0\u0368\u0350 x\u0307\u0363\u0313\u1dc0\u0324"	101 1060 102
+"\u033b\u0332\u0341\u032c\u032b"	101 102
+"\u033b\u0346\u0326\u035f\u0346\u0352\u0306\u094d\u0350\u032d\u0361 \u0327\u032e"	101 102
+"\u03c8\u03b7\u03c5\u03b5 "	101 1178 24824 29735 29723 102
+"\u03c6\u038e\u0386\u03a9\u03bc\u03b7\u038c \u03b3\u0388\u03c6\u03cc\u03af"	101 1176 29735 14608 29739 29728 24824 29730 1157 29723 29736 29730 18199 102
+"\u03c2\u03c2\u03c9\u038e\u03ca\u03a9\u03c6 \u03c8\u03ac\u0389"	101 1172 19579 29739 29735 18199 29739 29736 1178 14608 24824 102
+"\u0388 x\u03b4\u03c6\u03c0\u0391"	101 1159 1060 29722 29736 29731 14608 102
+"\u03cd\u03ad\u03ce\u038f\u03bb\u03b0\u03ba\u03b5\u038e\u0393 \u03bb\u03ad"	101 1175 29723 29739 29739 29727 29735 29726 29723 29735 29721 1165 29723 102
+"\u0388\u03b2\u0388\u038a\u03b3\u03c0\u03b9 x\u03c1"	101 1159 29720 29723 18199 29721 29731 18199 1060 29732 102
+"\u03b4\u03b0\u03bd\u0388\u0390\u03cc\u03c7\u03c1\u03b4\u03bf\u03b6 \u0390\u03cd"	101 1158 29735 16177 29723 18199 29730 29737 29732 29722 29730 29724 1163 29735 102
+"\u03ae\u03c1\u03cc\u03b6\u03cd\u03c5\u03bf\u03ca\u038a\u03c7\u03cb x\u0389"	101 1161 29732 29730 29724 29735 29735 29730 18199 18199 29737 29735 1060 24824 102
+"\u0391\u03cb x\u0394\u0392\u0392"	101 1155 29735 1060 29722 29720 29720 102
+"\u03b8\u0390\u03b1\u03ac\u03cd\u03ca\u0392\u03bf\u03cb\u03ca\u03b4"	101 1162 27432 14608 29735 18199 29720 26789 18199 29722 102
+"\u03bc\u0393\u03b5\u03b9\u03b2"	101 1166 29721 29723 18199 29720 102
+"\u03b4\u03c7\u03b3\u03b4\u03cb"	101 1158 29737 29721 29722 29735 102
+"\u0391\u03b2\u03cc\u03c2\u03ac\u03cc\u03be\u03b5\u0390\u03b9"	101 1155 29720 15297 14608 29730 29729 29723 18199 18199 102
+"\u0391\u038e\u03b7\u03c8\u03c2\u03c1\u03ba\u03c7 "	101 1155 29735 24824 29738 19579 29732 29726 29737 102
+"\u0389\u03ce\u03c1\u03a9\u0386\u03b6\u03cb\u03ba\u03ae\u03ce\u03ad \u03b3"	101 1161 29739 29732 29739 14608 29724 29735 29726 24824 29739 29723 1157 102
+"\u03c9\u03cb\u0386\u0388\u03b9\u03ca\u03c2\u03c1\u03c8\u03ae\u03b4 x\u0390"	101 1179 29735 14608 29723 18199 18199 19579 29732 29738 24824 29722 1060 18199 102
+"\u03b6\u03cc\u03bb\u0393\u03c9\u03b5\u0389\u03bc\u03cb\u03b2\u03cc"	101 1160 29730 29727 29721 29739 29723 24824 29728 29735 29720 29730 102
+"\u03b5\u03be\u03ad\u038a\u03c9\u038f\u038a\u03c8\u03bb\u03c4\u0388"	101 1159 29729 29723 18199 29739 29739 18199 29738 29727 29734 29723 102
+"\u03b8\u0389\u0389\u0392\u0394\u03c5 x\u0393\u03c9"	101 1162 24824 24824 29720 29722 29735 1060 29721 29739 102
+"\u03c9\u03b3\u03b3\u03b2\u0394\u0386\u0393\u03bb\u03c0\u03bf\u038c\u03c7\u0389"	101 1179 29721 29721 29720 29722 14608 29721 29727 29731 29730 29730 29737 24824 102
+"\u0386\u038a\u03c2\u03c7\u03b5\u03c7\u03ac\u038f\u0389\u03c4\u03bb x\u03bd\u0393\u038a\u03c1\u03bc"	101 1155 18199 19579 29737 29723 29737 14608 29739 24824 29734 29727 1060 16177 29721 18199 29732 29728 102
+"\u03ba\u038f\u038e\u03cb\u03c8 x\u03b1\u0392\u03bf\u0388\u03b0"	101 1164 29739 29735 29735 29738 1060 14608 29720 29730 29723 29735 102
+"\u03bd\u03ca\u03b9\u03cd\u03c1\u03c8\u0392\u03b4\u03c5"	101 1167 18199 18199 29735 29732 29738 29720 29722 29735 102
+"\u03b1\u03c7\u03a9\u03b2\u03bb\u03bd\u03ac\u03a3\u038e\u03cb\u03a9\u03b8\u03cd\u03a9\u03cd"	101 1155 29737 29739 29720 29727 16177 14608 29733 29735 29735 29739 29725 29735 29739 29735 102
+"\u03ca\u03a9\u03bd\u03c8\u03c2\u038f\u03ce\u03b4\u03c4\u03b4\u03cd \u03c4"	101 1163 29739 16177 29738 19579 29739 29739 29722 29734 29722 29735 1174 102
+"\u03c6\u03c3 "	101 1176 29733 102
+"\u0391\u0388\u038a\u03ca x\u03b2\u03a3\u03bb\u0389"	101 1155 29723 18199 18199 1060 29720 29733 29727 24824 102
+"\u03bd\u03b5 \u0389\u03bf\u03c2"	101 1167 29723 1161 15297 102
+"\u03cc\u03c6\u03c5\u03ca\u03c9\u03c6\u03cb\u03b5\u0388\u03ad\u03a9\u03b9\u03cc\u03cc"	101 1169 29736 29735 18199 29739 29736 29735 29723 29723 29723 29739 18199 29730 29730 102
+"\u03b0\u0393\u03c6\u03bf\u03cc\u03b4\u03c0\u03b6\u0389\u03c8"	101 1175 29721 29736 29730 29730 29722 29731 29724 24824 29738 102
+"\u03c8\u03a9\u03b9\u03b4\u0390\u03b8\u03ce\u03c4\u03bc\u0392\u0391\u03b1"	101 1178 29739 18199 29722 18199 29725 29739 29734 29728 29720 14608 14608 102
+"\u03b8\u0390\u03cc x"	101 1162 18199 29730 1060 102
+"\u03b3\u03af\u03ad x\u03c6"	101 1157 18199 29723 1060 29736 102
+"\u03c3\u03a9\u03b0 \u0391\u03b6\u03a9\u03c0\u038e"	101 1173 29739 29735 1155 29724 29739 29731 29735 102
+"\u03c0\u03c6\u0388\u0392\u03b9\u03be\u03b6\u03a9"	101 1170 29736 29723 29720 18199 29729 29724 29739 102
+"\u03af\u03c3\u03c8\u03bf\u03c4\u0386\u03bd x\u0388"	101 1163 29733 29738 29730 29734 14608 16177 1060 29723 102
+"\u03ba\u03c4\u03b9\u03be\u038a\u0392\u038e\u03c7\u038f\u03c5 x\u03a3\u03ad"	101 1164 29734 18199 29729 18199 29720 29735 29737 29739 29735 1060 29733 29723 102
+"\u03ae\u0386\u03cc\u03c0\u03b9\u03c0\u03b6\u03c1\u03bd\u0388 x"	101 1161 14608 29730 29731 18199 29731 29724 29732 16177 29723 1060 102
+"\u03b2\u03ce\u03cd\u03b7 \u03c7\u03be\u038f\u03c2\u03be"	101 1156 29739 29735 24824 1177 29729 29739 19579 29729 102
+"\u03c5\u03b8\u038f\u0386\u0388\u03c0"	101 1175 29725 29739 14608 29723 29731 102
+"\u0415\u0424\u042c\u0425\u043f\u0419\u0432\u0443\u0401\u0427\u0448\u0410\u042b\u0417"	101 1185 29749 23742 29750 29746 10325 25529 29748 15290 29752 29753 10260 29113 29744 102
+"\u0454 \u0430\u0417"	101 1212 1180 29744 102
+"\u0433\u044e\u0447\u0401\u044f\u0412\u044f\u0490\u043f"	101 100 102
+"\u0421\u0490\u0422\u0444\u043d\u0421\u044f\u0449\u0411\u0437 x\u041c\u0449"	101 100 1060 29745 29754 102
+"\u044d\u0438\u044a\u041e\u0418 \u044e\u0436\u0424\u0435"	101 1208 10325 29755 14150 10325 1209 29743 29749 15290 102
+"\u0432\u0426\u0448\u043a\u0423\u0415\u0440 \u0414\u042f\u043b\u042c\u0427"	101 1182 29751 29753 23925 29748 15290 16856 1184 17432 29436 23742 29752 102
+"\u0417\u0410\u0423 x\u0451\u044c"	101 1187 10260 29748 1060 15290 23742 102
+"\u0406 \u0433\u0433"	101 1213 1183 29741 102
+"\u0436\u0425\u0406\u041e\u0490\u042c\u0424\u0446 \u0406"	101 100 1213 102
+"\u0423\u0417\u0406\u0490 x\u043c"	101 100 1060 29745 102
+"\u0412\u041a\u043e\u0416\u0429\u0432\u0423\u043f\u041f\u043d\u0441\u0438"	101 1182 23925 14150 29743 29754 25529 29748 29746 29746 18947 29747 10325 102
+"\u0425\u042e\u0448\u0451\u044b\u043b x\u0401\u0421\u0407"	101 1200 29757 29753 15290 29113 29436 1060 15290 29747 29760 102
+"\u0407\u0425\u041e\u0426\u043f\u0423\u0406 "	101 1213 29750 14150 29751 29746 29748 29760 102
+"\u041a\u0411\u042f \u042c\u0427"	101 1189 29740 17432 1207 29752 102
+"\u0419"	101 1188 102
+"\u0449 x\u0435\u043e"	101 1204 1060 15290 14150 102
+"\u0415\u0423\u043a\u0456\u0445\u044c\u0449\u0430\u042c \u0416\u0435\u0419"	101 1185 29748 23925 29760 29750 23742 29754 10260 23742 1186 15290 10325 102
+"\u0445\u0411\u042c\u0443\u0436\u0423\u0413"	101 1200 29740 23742 29748 29743 29748 29741 102
+"\u0416\u0431\u041d x\u0438\u044c\u044c\u044b\u0457"	101 1186 29740 18947 1060 10325 23742 23742 29113 29760 102
+"\u043b\u0436\u0441\u044d\u0412\u0406\u0425\u0446\u0418\u0401\u0401 \u041b\u044c\u0456\u043a"	101 1190 29743 29747 29756 25529 29760 29750 29751 10325 15290 15290 1190 23742 29760 23925 102
+"\u042d\u043a\u042e\u0448\u0437\u042f\u0407 \u0421"	101 1208 23925 29757 29753 29744 17432 29760 1196 102
+"\u0443\u042b\u0430\u0435 \u0456\u043f\u044d\u041b\u0429"	101 1198 29113 10260 15290 1213 29746 29756 29436 29754 102
+"\u0447\u042c x\u042e"	101 1202 23742 1060 29757 102
+"\u0416\u041d\u044e\u0431\u041d\u0433 \u0430\u043d\u0438"	101 1186 18947 29757 29740 18947 29741 1180 18947 10325 102
+"\u042e\u0401\u041c\u0417\u041d\u0432\u0454\u0422\u0438 \u0435\u0404"	101 1209 15290 29745 29744 18947 25529 29759 22919 10325 1185 29759 102
+"\u0426\u0432\u0439\u0451\u0456\u0456\u042b\u0417\u0432"	101 1201 25529 10325 15290 29760 29760 29113 29744 25529 102
+"\u0448\u0434\u0440\u0426\u0418\u042f\u0407\u0421 x"	101 1203 29742 16856 29751 23483 29760 29747 1060 102
+"\u0490\u0435\u0442\u0490\u041a\u043a\u0432\u0413\u0427\u0425"	101 100 102
+"\u042e\u0424\u041b\u0444 x"	101 1209 29749 29436 29749 1060 102
+"\u0423\u0491\u0416\u0438\u0440\u0419\u042b\u0447\u041b\u0443\u0426 x"	101 100 1060 102
+"\u0426\u041d\u0427\u0434\u0426\u043a\u041f"	101 1201 18947 29752 29742 29751 23925 29746 102
+"\u0448\u0451\u042d\u0433\u0445\u042c\u0424\u0420\u0457\u041e\u0437 x"	101 1203 15290 29756 29741 29750 23742 29749 16856 29760 14150 29744 1060 102
+"\u0456\u0419\u042e\u041c\u043e\u041d\u041a\u0428\u0449\u0439 \u0491\u0447\u0430"	101 1213 10325 29757 29745 14150 18947 23925 29753 29754 10325 100 102
+"\u0410\u0445 \u0438\u0441"	101 1180 29750 1188 29747 102
+"\u0404\u0433 \u043b\u0445\u0440"	101 1212 29741 1190 29750 16856 102
+"\u0418\u0454\u0418\u0424\u0411\u042c\u044c\u0454\u044d\u0421\u042f\u042c"	101 1188 29759 10325 29749 29740 23742 23742 29759 29756 29747 17432 23742 102
+"\u0423 "	101 1198 102
+"\u044f\u0428\u0417\u0438\u0448\u0430\u0422 x\u044a"	101 1210 29753 29744 10325 29753 10260 22919 1060 29755 102
+"\u0422\u0404\u044e\u0457\u0414\u041f \u042c\u0429"	101 1197 29759 29757 29760 29742 29746 1207 29754 102
+"\u042a\u042a\u0413\u0411\u044b \u0430\u0446"	101 1205 29755 29741 29740 29113 1180 29751 102
+"\u0628\u0635\u0635 \u064a\u064d\u0600\u0600\u0662"	101 1271 29826 29826 100 102
+"\u062c\u0646\u064d\u0636\u0645\u062b\u0643\u064a\u062e\u062d"	101 1275 15915 29827 22192 29818 29835 14498 29821 29820 102
+"\u0642\u064a\u0631\u0663\u0644\u064a\u064d "	101 100 102
+"\u064b\u0647\u0643\u0631\u064d\u0652\u064d\u0643\u064e\u0660\u0628\u0651"	101 100 102
+"\u061c\u063a\u061b\u0648\u064d\u064f\u061b\u0644\u062e\u0644\u0631 \u0641\u0646\u0661\u062e\u062d"	101 1289 100 1298 100 1294 29821 23673 17149 100 102
+"\u0648\u0636\u0637\u0631\u0648\u0661"	101 100 102
+"\u0631\u064d\u0641\u0631\u0661\u062a"	101 100 102
+"\u064b\u062f\u064f\u0645\u064f\u064a\u0662\u064d\u0662\u064d\u0644\u064f"	101 100 102
+"\u0663\u06dd\u064c\u0637\u0630\u064b\u0636 x"	101 100 1060 102
+"\u063a\u064f \u0634"	101 1289 1283 102
+"\u0641\u062b\u0661\u061f\u0646\u0648\u0641\u060c\u060c x\u0652\u0641\u0636"	101 100 100 1296 29836 29833 1268 1268 1060 29833 29827 102
+"\u0639\u0636\u0650\u062a\u0641\u0627"	101 1288 29827 29817 29833 25573 102
+"\u064c\u062f\u0660\u0644\u0647\u0628\u061c\u0652 \u0662"	101 100 100 102
+"\u060c\u0639\u0651\u0661\u0661\u0647\u0634\u0630 \u0652"	101 1268 100 102
+"\u0638\u061f\u0645\u0631\u0600\u063a\u0630\u064a\u0635\u0639\u0639"	101 1287 100 1295 17149 29831 29822 14498 29826 29830 29830 102
+"\u064d\u0636\u0660 \u08e2\u06dd\u0642\u061f\u0632"	101 100 100 100 1281 102
+"\u064a\u062b\u064a\u0662\u0630\u0645 \u0643\u0662\u0600\u0647"	101 100 100 102
+"\u060c\u0646\u0652\u062b\u0638\u0639\u064a\u0635\u0650 x"	101 1268 1296 29818 29829 29830 14498 29826 1060 102
+"\u08e2\u08e2\u0627\u062d\u0652\u0627\u0648\u062f\u061b"	101 100 100 102
+"\u0631\u062c\u062e\u0634\u064d\u0645\u064b\u061b\u061c\u062e\u0642 \u0647\u063a"	101 1280 29819 29821 29825 22192 100 1277 29834 1297 29831 102
+"\u0600\u062e\u061f"	101 1277 100 102
+"\u06dd\u061c\u061b\u062e\u064d\u062d\u06dd\u08e2 x\u062a\u061f\u061c\u060c"	101 100 100 1060 29817 100 1268 102
+"\u0637\u0600\u0634\u062b x\u0645\u0639\u06dd\u064c\u0638"	101 1286 29825 29818 1060 22192 29830 29829 102
+"\u064b\u061c\u0663\u0630\u0641\u0600\u062e\u064a\u0644 \u064b\u0600\u0627\u0648"	101 100 1270 29836 102
+"\u0600\u062c\u0648\u063a\u0600\u061f\u0644\u0663 "	101 1275 29836 29831 100 100 102
+"\u0662\u0636\u0641\u062e\u0648\u0663\u0646\u0651\u0630\u0639\u0632\u061b\u0648\u0633\u0661"	101 100 100 100 102
+"\u063a\u0652\u0630\u0641\u0661 x\u0662\u0646\u062b\u0643"	101 100 100 102
+"\u0600\u0638\u0647\u0642\u0628\u08e2\u062a\u0662\u0630\u061c\u0652 x\u062a"	101 100 1060 29817 102
+"\u0661\u063a x\u0661\u0634"	101 100 100 102
+"\u064f\u0628\u0652\u064b\u0644\u0637"	101 1271 23673 29828 102
+"\u0637\u061f\u0648\u0637\u0638\u061b "	101 1286 100 1298 29828 29829 100 102
+"\u0663\u0636\u0632\u062a\u064d\u0663\u0634\u0627\u0638 x\u0639\u064a\u0639\u062c\u0632"	101 100 1060 29830 14498 29830 29819 29823 102
+"\u064f\u062b\u062e\u064b\u0661\u064e \u0634\u062f\u0600\u0645"	101 100 1283 15394 22192 102
+"\u0634\u0639\u0630 \u0642"	101 1283 29830 29822 1292 102
+"\u061c\u064c\u0632\u060c\u0651\u0634"	101 1281 1268 1283 102
+"\u0641\u062f \u0645\u0628"	101 1291 15394 1295 29816 102
+"\u0636\u062a\u0635\u0628\u0652\u0662\u0631\u0662\u063a\u061f\u0631\u0642"	101 100 100 1280 29834 102
+"\u061f\u0627\u064a\u061f \u064f\u0630\u0630"	101 100 1270 14498 100 1279 29822 102
+"\u0627\u064f\u0642\u0636\u062b\u0651\u062c\u0632\u0661\u064f\u062b \u0631\u0663\u0645\u0642\u0630"	101 100 100 102
+"\u062e\u0644\u0634\u064f\u0627\u061c\u060c\u064e\u064f\u0645\u0650 \u0660\u0627"	101 1277 23673 29825 25573 1268 1295 100 102
+"\u05de\u05d5\u05e8\u05b0\u05e7\u05e0\u05f3\u05bc\u05e1 "	101 1255 29792 29811 29810 29803 100 1258 102
+"\u05e4\u05e2\u05e4\u05e8\u05e2\u05e4\u05e7\u05e0\u05bc\u05b4\u05de"	101 1261 29805 29807 29811 29805 29807 29810 29803 29801 102
+"\u05e6\u05be\u05db \u05b7"	101 1263 1240 1252 102
+"\u05d4\u05e4\u05e1\u05b0\u05e8 \u05e8\u05d6"	101 1245 29807 29804 29811 1265 29793 102
+"\u05e8\u05db\u05db "	101 1265 29798 29798 102
+"\u05e4\u05ea\u05e7\u05d3\u05de\u05ea x\u05b4\u05d7\u05e9"	101 1261 29813 29810 29791 29801 29813 1060 29794 29812 102
+"\u05dc\u05d4 "	101 1253 29128 102
+"\u05dc\u05d0\u05d3\u05d6\u05c1\u05bc\u05db\u05e6\u05d4\u05de x\u05b0\u05e9"	101 1253 29788 29791 29793 29798 29809 29128 29801 1060 29812 102
+"\u05d2\u05e8\u05d7\u05d9\u05d6\u05d5\u05d8"	101 1243 29811 29794 29796 29793 29792 29795 102
+"\u05d8\u05d3\u05bc\u05d1\u05dc\u05b4\u05e2\u05e2\u05ea\u05d3"	101 1249 29791 29789 29799 29805 29805 29813 29791 102
+"\u05d9\u05b4 \u05b0\u05d2\u05d1"	101 1250 1243 29789 102
+"\u05de\u05be\u05e6\u05d6\u05e2\u05d4\u05e7\u05d7\u05f3\u05d0\u05e6"	101 1255 1240 1263 29793 29805 29128 29810 29794 100 1241 29809 102
+"\u05d9\u05e0\u05de \u05d3\u05bc\u05b0"	101 1250 29803 29801 1244 102
+"\u05e2\u05d8\u05b0\u05d0\u05e2\u05e9\u05d5\u05d8\u05d7 x\u05d5"	101 1259 29795 29788 29805 29812 29792 29795 29794 1060 29792 102
+"\u05e2\u05d5\u05b4\u05d4\u05e0\u05b4\u05d1\u05d1\u05e0\u05e1\u05f3\u05b0\u05be"	101 1259 29792 29128 29803 29789 29789 29803 29804 100 1240 102
+"\u05d8\u05b7\u05b0 x\u05db"	101 1249 1060 29798 102
+"\u05be\u05d7 x"	101 1240 1248 1060 102
+"\u05db\u05d1\u05d9\u05b4\u05d5\u05d1\u05e0\u05b4\u05e7\u05d6\u05d1\u05f3\u05e9\u05d2"	101 1252 29789 29796 29792 29789 29803 29810 29793 29789 100 1266 29790 102
+"\u05e6\u05e7 x\u05d3\u05d4\u05db\u05e8"	101 1263 29810 1060 29791 29128 29798 29811 102
+"\u05e2\u05d8\u05ea\u05e0\u05d8\u05b0\u05d1\u05e7\u05ea\u05b0\u05e1\u05b7\u05d2\u05d8"	101 1259 29795 29813 29803 29795 29789 29810 29813 29804 29790 29795 102
+"\u05c1\u05b4"	101 102
+"\u05e9\u05d5\u05d2\u05b4\u05d6\u05f3"	101 1266 29792 29790 29793 100 102
+"\u05d4\u05e2\u05f3\u05b7\u05db\u05ea\u05f3\u05b7\u05d5\u05b7\u05d4 \u05bc\u05e6\u05db\u05bc\u05ea"	101 1245 29805 100 1252 29813 100 1246 29128 1263 29798 29813 102
+"\u05d3\u05d1\u05d7\u05e4\u05d2 "	101 1244 29789 29794 29807 29790 102
+"\u05d3\u05e8\u05de\u05e2\u05b4\u05d9\u05d7\u05e0 \u05e9\u05be\u05d9"	101 1244 29811 29801 29805 29796 29794 29803 1266 1240 1250 102
+"\u05d2\u05d1\u05c1\u05de\u05d1 x\u05d4\u05c1\u05db\u05d3"	101 1243 29789 29801 29789 1060 29128 29798 29791 102
+"\u05d0\u05b0\u05d0\u05e7\u05d0\u05d3 \u05d8\u05e4\u05e1"	101 1241 29788 29810 29788 29791 1249 29807 29804 102
+"\u05b4\u05d0\u05b7\u05c1\u05dc\u05b4\u05d4\u05d1\u05e4\u05b0 x\u05d2\u05be\u05b0"	101 1241 29799 29128 29789 29807 1060 29790 1240 102
+"\u05ea\u05ea\u05e6\u05bc\u05d1\u05b4\u05e9\u05c1\u05ea\u05dc"	101 1267 29813 29809 29789 29812 29813 29799 102
+"\u05d5\u05d1\u05d6\u05b4\u05d8\u05d2\u05d7\u05de\u05e2 \u05bc\u05db\u05db\u05d4\u05e1"	101 1246 29789 29793 29795 29790 29794 29801 29805 1252 29798 29128 29804 102
+"\u05e0\u05dc\u05d6\u05b4\u05d1\u05d1\u05d8\u05e6\u05d9\u05d2\u05e0 \u05d1\u05e2\u05d6\u05b0\u05d2"	101 1257 29799 29793 29789 29789 29795 29809 29796 29790 29803 1242 29805 29793 29790 102
+"\u05bc\u05e2\u05c1\u05b4\u05e4\u05b4\u05d7\u05e4\u05dc\u05c1\u05dc\u05de"	101 1259 29807 29794 29807 29799 29799 29801 102
+"\u05e8\u05f3\u05b4\u05d5\u05d1\u05d1\u05dc\u05f3\u05d4"	101 1265 100 1246 29789 29789 29799 100 1245 102
+"\u05d8\u05d8\u05e7\u05bc\u05e1 \u05d0\u05e7\u05d0"	101 1249 29795 29810 29804 1241 29810 29788 102
+"\u05c1\u05d8\u05d2\u05e8\u05f3\u05f3\u05e1\u05d0\u05e9\u05c1\u05e7\u05be\u05bc\u05d1\u05d1\u05be"	101 1249 29790 29811 100 100 1258 29788 29812 29810 1240 1242 29789 1240 102
+"\u05e6 x\u05d3\u05dc\u05d7\u05e0\u05c1"	101 1263 1060 29791 29799 29794 29803 102
+"\u05e1 x\u05e4\u05d9"	101 1258 1060 29807 29796 102
+"\u05b0\u05d5\u05b7\u05bc\u05d4\u05e9\u05e9\u05d8\u05bc\u05e1\u05d8\u05d8\u05b0"	101 1246 29128 29812 29812 29795 29804 29795 29795 102
+"\u05db\u05e7\u05e8\u05bc\u05be\u05d2\u05c1\u05d2\u05d7\u05ea\u05e7 x"	101 1252 29810 29811 1240 1243 29790 29794 29813 29810 1060 102
+"\u05c1\u05e8\u05e9\u05e0\u05d8\u05d5\u05d1\u05d3 x\u05dc\u05e0"	101 1265 29812 29803 29795 29792 29789 29791 1060 29799 29803 102
+"\u0928\u092c x\u0903"	101 1327 29865 100 102
+"\u092c\u092a\u094d \u0964\u0b85\u092a\u0920\u0930"	101 1329 29864 1344 100 102
+"\u093e\u0902\u0923\u0947\u0915 x\u0947"	101 1340 29858 29851 1060 102
+"\u0920\u0922\u0941\u0a16\u0941\u092c\u094c\u0932\u0a17 x\u0925\u0941\u094c\u0b85"	101 100 100 102
+"\u0b85\u0916\u094b\u093f\u0920\u0930\u0922\u0903\u0936\u0918 x"	101 100 1060 102
+"\u0917\u0927\u0926\u092f\u0965\u0922\u0903\u0918\u0920\u094d\u0935 x"	101 1317 29862 29861 29868 1345 100 1060 102
+"\u091d\u094c x\u092c\u091b"	101 100 100 102
+"\u0935\u092b\u0965\u0948\u0941\u0965\u0916 x\u0918"	101 100 1345 1345 1316 100 102
+"\u0948\u0942\u0939\u093f\u0924\u092d\u094c\u094c\u0915\u0915 x"	101 100 1060 102
+"\u092a\u093e\u0917\u091b\u092b\u0927\u0917\u0936 \u0940\u0942\u091c"	101 100 1342 29855 102
+"\u0928\u091d\u0965\u0922\u0925\u0927\u091b\u094c\u0902\u092b\u0924 \u093f\u091f\u0930"	101 100 1345 100 1341 29856 29869 102
+"\u0915 \u0965\u092a\u0918\u0915\u0922"	101 1315 1345 100 102
+"\u0918\u0a16\u0924\u0921\u0a15\u0921\u0a16\u0b87\u0926\u0b86 \u0935\u092a\u0b85"	101 100 100 102
+"\u0940\u0936\u0915\u0b85\u093e\u0932\u0a15\u0930\u0a17\u093e x"	101 100 1060 102
+"\u0947\u0930\u0b86\u0916\u0920 x\u0921"	101 100 1060 29857 102
+"\u094d\u094c\u0b87\u092a\u0903"	101 100 102
+"\u0903"	101 100 102
+"\u0916\u0902\u0948\u0b85\u0965\u0927\u0932\u091b \u0924\u0941\u0a17\u0b87\u0916"	101 100 1345 100 100 102
+"\u0927\u0938\u092c\u0940\u091d\u0921\u094c\u092a \u091d"	101 100 100 102
+"\u094c\u092b\u0940\u0a16\u091b\u091b x"	101 100 1060 102
+"\u0936\u0b86\u0925\u093e\u0a17\u0948"	101 100 102
+"\u0927\u0939\u0902\u0918\u0902\u093e"	101 100 102
+"\u093f\u0938\u0924\u0922\u0924\u0940\u0927\u0937\u0b87\u0915 "	101 100 102
+"\u0903\u093f\u0948\u0916\u0925\u0937 \u0926\u0916\u092a"	101 100 1325 29852 29864 102
+"\u0935\u092b\u0916\u0918 \u0936\u091f\u093e\u0947"	101 100 1336 29856 29876 102
+"\u0922\u0948\u0926\u0921\u094d\u094d\u093e\u093e\u092b\u091f\u0941"	101 100 102
+"\u093e\u0927\u0902"	101 1340 29862 102
+"\u0939\u0916\u0a15\u092f\u0940\u0b85\u092f\u0b86\u0927\u0936\u094b\u0928"	101 100 102
+"\u0924\u093e\u092c\u0928\u0b87\u0939\u0918"	101 100 102
+"\u0b87\u0948\u0a16\u0927 x\u0916\u0903\u093e\u092a"	101 100 100 102
+"\u094d\u0942\u0922\u0940\u0b86\u0921\u093e\u0932\u0932\u094c\u093f "	101 100 102
+"\u0964\u0902\u093e\u0a15\u0918\u0927\u0925 x\u0b87\u0926\u093e\u0903"	101 1344 100 100 102
+"\u092d\u0930\u0902\u0a15\u0926 x\u0a17"	101 100 100 102
+"\u0903\u094d\u0b86\u0a17\u093f"	101 100 102
+"\u0923\u0940\u0920 x\u093f\u093e\u0938\u0940\u093e"	101 100 1060 29877 29876 29874 29878 29876 102
+"\u0936\u0b85\u0932\u0917\u094d\u0932\u0965\u0a16\u091a\u0921 x\u0930\u092b"	101 100 1345 100 100 102
+"\u091a\u0927\u093e\u092e\u093e\u0903\u094c\u093e \u092a"	101 100 1328 102
+"\u0903\u0a17\u0935\u093f\u0926\u0940\u0965\u0935 \u091b\u092f\u092b"	101 100 1345 1335 100 102
+"\u0925\u092c\u0927\u092d\u0964 \u0921"	101 1324 29865 29862 29866 1344 1321 102
+"\u091d\u0b86\u0b87\u0930\u093f\u0921\u094b\u0938\u092e\u091a\u091c\u093e\u0947\u091c\u094c"	101 100 102
+"\u0e0f\u0e28\u0e07\u0e1f \u0e02\u0e2b\u0e18\u0e02"	101 100 100 102
+"\u0e03\u0e16\u0e1a\u0e20\u0e34\u0e4f \u0e37\u0e17\u0e0a\u0e1e"	101 100 100 100 102
+"\u0e16\u0e02\u0e4f\u0e28\u0e1c\u0e04\u0e18 x\u0e0d\u0e06\u0e21\u0e4f"	101 100 100 100 100 100 102
+"\u0e2c\u0e23\u0e1f\u0e0e\u0e4b\u0e2b\u0e0d\u0e2b\u0e05 "	101 100 102
+"\u0e1c\u0e0d\u0e0e\u0e0b\u0e13\u0e11\u0e18\u0e18\u0e28\u0e08\u0e13\u0e1b\u0e0c\u0e36\u0e06\u0e10"	101 100 102
+"\u0e2d\u0e36\u0e16\u0e5a\u0e0b\u0e17 x"	101 100 100 100 1060 102
+"\u0e0c\u0e12\u0e5a\u0e0d\u0e5b\u0e35 "	101 100 100 100 100 102
+"\u0e31\u0e11\u0e2b\u0e22\u0e5b\u0e0a\u0e12\u0e29\u0e1d\u0e2a"	101 100 100 100 102
+"\u0e10\u0e18\u0e06\u0e27\u0e17"	101 100 102
+"\u0e21\u0e20\u0e34\u0e48\u0e37\u0e48\u0e4f\u0e16\u0e05\u0e5b\u0e35\u0e2d\u0e1a\u0e39"	101 100 100 100 100 100 102
+"\u0e1b\u0e2b\u0e1d\u0e0c\u0e48\u0e1c\u0e17 x\u0e22\u0e4f\u0e1f\u0e18"	101 100 1060 29952 100 100 102
+"\u0e1a\u0e2e\u0e25\u0e22\u0e31\u0e08\u0e12\u0e0d\u0e49 \u0e25\u0e22"	101 100 1418 29952 102
+"\u0e1d\u0e14\u0e0e \u0e4a\u0e04\u0e0d\u0e22"	101 100 100 102
+"\u0e1f\u0e0b\u0e39\u0e1f\u0e34\u0e4f\u0e19\u0e29\u0e03"	101 100 100 100 102
+"\u0e22\u0e20\u0e4b\u0e11\u0e1e\u0e23\u0e2c x\u0e09\u0e38\u0e1b\u0e01\u0e2c"	101 100 100 102
+"\u0e12\u0e14\u0e4b\u0e35\u0e31\u0e15\u0e12\u0e27 x\u0e02"	101 100 100 102
+"\u0e12 \u0e28\u0e27\u0e08\u0e15\u0e31"	101 100 100 102
+"\u0e5b\u0e0d\u0e1a\u0e35\u0e06\u0e17\u0e2e\u0e06\u0e31\u0e1c\u0e2a"	101 100 100 102
+"\u0e1a\u0e38\u0e1f\u0e0f\u0e04\u0e20\u0e07\u0e0d\u0e21\u0e08"	101 100 102
+"\u0e48\u0e07\u0e01 x\u0e29\u0e4b\u0e18\u0e20\u0e1f"	101 1410 29945 100 102
+"\u0e0e\u0e28\u0e5a\u0e36\u0e03\u0e35\u0e06"	101 100 100 100 102
+"\u0e38\u0e13\u0e37 x\u0e37\u0e34\u0e27"	101 100 1060 29955 102
+"\u0e15\u0e4f x\u0e36\u0e2c\u0e35\u0e23\u0e2a"	101 1411 100 100 102
+"\u0e05\u0e0c\u0e5a\u0e25\u0e49\u0e0c\u0e38\u0e4a\u0e17\u0e1b\u0e22\u0e05"	101 100 100 100 102
+"\u0e04\u0e07\u0e03\u0e1e\u0e1c\u0e22\u0e0a\u0e18"	101 100 102
+"\u0e04\u0e1e\u0e20\u0e03\u0e18\u0e0b\u0e21\u0e5a \u0e48\u0e5a\u0e1d\u0e18\u0e1a"	101 100 100 100 100 102
+"\u0e4b\u0e0b\u0e27\u0e4a\u0e34\u0e04\u0e4f "	101 100 100 102
+"\u0e0c\u0e23\u0e37\u0e03\u0e05"	101 100 102
+"\u0e0a\u0e28\u0e29\u0e09\u0e05\u0e21\u0e37 \u0e27\u0e4a\u0e34\u0e28\u0e35"	101 100 100 102
+"\u0e0f\u0e2a\u0e31\u0e13\u0e4f\u0e0e\u0e4f \u0e2d\u0e2e\u0e1d"	101 100 100 100 100 100 102
+"\u0e25\u0e1b\u0e0b\u0e18\u0e35\u0e27\u0e5a\u0e2d"	101 100 100 1421 102
+"\u0e1d\u0e1d\u0e12\u0e25\u0e0b\u0e4f \u0e0b\u0e1a"	101 100 100 100 102
+"\u0e35\u0e2a\u0e19\u0e38\u0e0e\u0e4b\u0e1a\u0e29\u0e0a\u0e27\u0e1a "	101 100 102
+"\u0e2a\u0e10\u0e5b"	101 100 100 102
+"\u0e1f\u0e0a \u0e49\u0e16\u0e13\u0e16"	101 100 100 102
+"\u0e34 \u0e13\u0e1a\u0e2e\u0e5b"	101 100 100 102
+"\u0e2b\u0e29\u0e08\u0e1f"	101 100 102
+"\u0e05\u0e27\u0e5a\u0e37\u0e05\u0e48\u0e2e\u0e48\u0e11"	101 100 100 100 102
+"\u0e03 \u0e23\u0e0a\u0e14\u0e39\u0e2c"	101 100 100 102
+"\u0e37\u0e0f\u0e5b\u0e14\u0e2a\u0e39\u0e22\u0e15\u0e37\u0e15\u0e03\u0e07\u0e09\u0e37"	101 100 100 100 102
+"\u9fcc\ud86e\udc20\ud86d\udf40\u3007\u9fff\u3007\ud86e\udcff\u9fa5\u6587\ud840\udc00\ud840\udc00 \u9fd5"	101 100 100 100 100 100 100 100 1861 100 100 100 102
+"\ud87e\udc00\u4e00\ud873\udea1 \u4dbf"	101 100 1740 100 100 102
+"\ud880\udc00\u4e00\u3005\ud86e\udc20"	101 100 1740 100 102
+"\u6587\ud87e\udc00\ud86e\udcff\ud86e\udcff x\ud87e\udc00\u3400"	101 1861 100 100 1060 100 100 102
+"\ud86e\udd1f\ud87e\ude1d \u6587\u9fcc\ud869\uded6\u9fcc\u3400"	101 100 100 1861 100 100 100 100 102
+"\u9fa5\u9fff\ud86e\udc20"	101 100 100 100 102
+"\u9fff\ud840\udc00\ud869\udf00\ud86e\udd1f\uf900"	101 100 100 100 100 100 102
+"\ud86e\udc1d\u9fff\ud86e\udc1d\u672c\ud87e\udc00\ud87e\udc00\ud86e\udd20\ud873\udea1\ufad9\u3007\u9fcc \ufad9\ud86d\udf40\ud869\uded6\ud86e\udd1f"	101 100 100 100 1876 100 100 100 100 100 100 100 100 100 100 100 102
+"\ud87e\udc00\u5b57 x\u3005\u4dbf\u4e2d\ud86e\udc20"	101 100 100 100 100 1746 100 102
+"\ud86e\udc20\u9fa5\u3005\u4e2d\ud87e\ude1d\ud86e\udd1f\u9fa5\ud86e\udd1f \u3007\ud873\udea1\u4e00\ud87e\ude1d\ud869\udf00"	101 100 100 100 1746 100 100 100 100 100 100 1740 100 100 102
+"\ud880\udc00\u8a9e\ud86d\udf40 \ud86e\udc1d\ud873\udea1\u5b57\u8a9e"	101 100 1950 100 100 100 100 1950 102
+"\u3007\uf900\u8a9e\u65e5\u4dbf"	101 100 100 1950 1864 100 102
+"\u9fa5\u4dbf\uf900\ud869\udf00\u6587\u8a9e\ud869\uded6\ud87e\ude1d\ud86e\udd20\u9fff\u9fcc "	101 100 100 100 100 1861 1950 100 100 100 100 100 102
+"\ud87e\ude1d\u4dbf\ud840\udc00\ud869\uded6\ud86e\udd20\u9fff\ud840\udc00\u3005"	101 100 100 100 100 100 100 100 100 102
+"\ud86e\udd1f\u3007\ud869\uded6\ud86e\udc1d\u3005\ud86e\udc20\ud873\udea1\ud87e\ude1d"	101 100 100 100 100 100 100 102
+"\u5b57\u3007\ud869\udf00\ud87e\udc00"	101 100 100 100 100 102
+"\ud86e\udc20\u6587\u3005\ud87e\udc00\ufad9\ud86d\udf40\u8a9e\uf900\u6587"	101 100 1861 100 100 100 100 1950 100 1861 102
+"\ud86e\udc1d x\ud869\udf00\ud869\udf00\u6587\ud86e\udd1f\ud869\uded6"	101 100 1060 100 100 1861 100 100 102
+"\u65e5\ud87e\udc00\uf900\u9fa5"	101 1864 100 100 100 102
+"\u4e00\u8a9e\u5b57\ud86e\udd1f\u9fa5\ud87e\ude1d\ud840\udc00\u3400\ud86e\udc1d\u9fcc\ud86e\udd20"	101 1740 1950 100 100 100 100 100 100 100 100 100 102
+"\ud87e\udc00\u4e00\u5b57\u3007\ud86e\udc1d\ud869\uded6\u9fa5\ud87e\ude1d\ufad9\u9fcc\u6587\ud86e\udd20\u9fd5"	101 100 1740 100 100 100 100 100 100 100 100 1861 100 100 102
+"\u65e5\ud840\udc00\u3400\uf900\u672c\u4e00\u65e5 \u6587\u3400\ud87e\ude1d\u9fcc"	101 1864 100 100 100 1876 1740 1864 1861 100 100 100 102
+"\u672c\u9fa5\ud840\udc00\u5b57\u9fff\ud840\udc00\u4e00"	101 1876 100 100 100 100 100 1740 102
+"\ud87e\udc00 x\u3400\ud87e\udc00\u4e2d\ud86e\udd1f"	101 100 1060 100 100 1746 100 102
+"\u672c\ud86e\udcff\u9fcc\u9fa5\u4dbf\ud86d\udf40\u3400\ud869\udf00\u3005\u3007 x\ud87e\ude1d\u4e00\u6587\ud86e\udc20"	101 1876 100 100 100 100 100 100 100 100 1060 100 1740 1861 100 102
+"\ud87e\ude1d\u9fcc\u4e2d\ud86e\udc1d\u9fa5\u9fff\u3400 \u6587\u65e5\ud86e\udd20"	101 100 100 1746 100 100 100 100 1861 1864 100 102
+"\u9fff\ud86e\udd20\ufad9\ud86d\udf40\ud86e\udc1d\u4e2d\ud873\udea1\u672c x\ud869\uded6\ud86e\udd1f\u5b57\u5b57"	101 100 100 100 100 100 1746 100 1876 1060 100 100 100 100 102
+"\u3400\u65e5\ud86e\udc1d\u9fff\u9fcc\u9fcc\ud869\uded6\u6587\ud880\udc00\u4dbf\ud86e\udd1f x\ud869\uded6\ud86e\udcff\ud86d\udf40\ud869\udf00"	101 100 1864 100 100 100 100 100 1861 100 100 100 1060 100 100 100 100 102
+"\ud86e\udc20\ud86e\udc1d\ud880\udc00\ufad9\u5b57\u65e5\ufad9"	101 100 100 100 100 100 1864 100 102
+"\ud87e\ude1d\ud86e\udc1d\u672c\ud869\udf00\ud86e\udc20\ud87e\ude1d\ud86e\udd20\ud880\udc00\ud869\uded6\u3400\ud87e\udc00\u3005\ud86e\udd1f\u5b57"	101 100 100 1876 100 100 100 100 100 100 100 100 100 100 102
+"\ud869\udf00\u4e00\u4dbf\u3007\u4e2d\u9fff\ud86e\udc1d\u8a9e\uf900\ud873\udea1\u3005\u3400\ud86e\udcff\ud86e\udcff"	101 100 1740 100 100 1746 100 100 1950 100 100 100 100 100 102
+"\u6587\ud873\udea1 \ud873\udea1"	101 1861 100 100 102
+"\u8a9e\u9fcc\ud86e\udc20\u3005\u9fcc x\ud880\udc00\ud840\udc00\u9fd5\uf900\ud873\udea1"	101 1950 100 100 100 100 100 100 100 100 102
+"\ud869\uded6\u65e5\ud86e\udd20\u3005\u6587\u4e2d\ud873\udea1\u3007 \ud86d\udf40"	101 100 1864 100 100 1861 1746 100 100 100 102
+"\u4e2d\u65e5\ud87e\udc00\u9fd5\ud86e\udcff\ud840\udc00\u8a9e\u5b57\ud86e\udd20\uf900\ud873\udea1\ud880\udc00"	101 1746 1864 100 100 100 100 1950 100 100 100 100 100 102
+"\u672c\ud86e\udc1d \u3005\u8a9e\u672c"	101 1876 100 100 1950 1876 102
+"\u5b57"	101 100 102
+"\u5b57\ud87e\ude1d\ud86e\udd20\u9fd5\ud869\udf00\u8a9e\ud840\udc00 \u4e00\u5b57\uf900\u8a9e"	101 100 100 100 100 100 1950 100 1740 100 100 1950 102
+"\u9fcc\u4dbf\ud86e\udd1f\u9fd5 x\u65e5\u4e2d"	101 100 100 100 100 1060 1864 1746 102
+"\u9fff\u6587\ud86d\udf40"	101 100 1861 100 102
+"\u3044\uae00\u30ae\u3054\u30fc\u30e3\u3053\u309c "	101 100 102
+"\u3131\u3042\u304a\u3054\ud55c\u30ae\ud55c\ud55c\u30d4\u30ae \u3050\u30a2\ud55c\u30b3\uac01"	101 100 1653 30219 30005 30006 30021 30230 29991 30006 30020 102
+"\u3077\u30b3\u30a8\ubbfc\u3054 x\uac08\u11a8\u3071"	101 1674 30230 30224 29995 30019 30021 30181 1060 29991 30006 30022 30020 30198 102
+"\u30b3\u304b\u3074\u3054\u1100 \u11a8\uac00\u304b\u3134\uac00"	101 1704 30177 30199 30181 29991 100 102
+"\u304b\u30a6\uae00\u309c\u30b2\u3046\u30e5\u30b2\u314f\u30fc \u30ab\u3071\u30ac\u30aa\u30ae"	101 100 1700 30198 30226 30225 30227 102
+"\u30a8\u304e\u3044\u304b\uc5b4 x\u3134"	101 1698 30178 30173 30177 29999 30008 100 102
+"\u30d7\u3131\u3134\u30b2\u3044\u314f\uac00\u3052\u30b2\u30aa\u3053 x\uac01\uac00\u11a8"	101 100 1060 29991 30006 30020 29991 30006 30020 102
+"\u304b\u309b\u30e7\u3051\u30b3\u30af x\u30b2\ud55c\u30c3\uae00\u3077"	101 100 1060 30229 30005 30006 30021 30237 29991 30017 30022 30200 102
+"\uc5b4\u30ac\uac00\u30a2\u3051\u30d1\uad6d\u3074 x\u3042\u3044\u30a2\u3053\u3052"	101 1463 30008 30226 29991 30006 30219 30180 30244 29991 30014 30020 30199 1060 30172 30173 30219 30181 30180 102
+"\u30e3\u304e\u314f\u3044\u30b1\u3054\ubbfc\u3042\u3044\u3044 \u30ac\u11a8\u30e5"	101 100 1700 30020 30255 102
+"\u30d7\u309b\u3052\u30d7\u309c\u304e\u309b"	101 100 102
+"\uac04\u30d4\uac08\ubbfc\u30a2\uc5b4\u30ab\u30af\u30ac\uc5b4\uad6d\u30e5\u30b4"	101 1455 30006 30021 30245 29991 30006 30022 29995 30019 30021 30219 29999 30008 30226 30228 30226 29999 30008 29991 30014 30020 30255 30230 102
+"\u304a\u30b4\u30d4\u30d4\u3044\u3054\u30e5\u3048 \u30d4\u314f\ud55c"	101 1650 30230 30245 30245 30173 30181 30255 30175 100 102
+"\uad6d\u314f\uac08\u304b\uad6d\u3071\u3044 x\uae00\u3044\uac00\u3052\u3131"	101 100 100 102
+"\ub300\ub300\u3134\u304b\uac08\u30c3"	101 100 102
+"\u1101\uac01\u3042\u30e3\u30d4\u30ab\u3053\u3131"	101 100 102
+"\u304b\u30d7\u30b1\u3054\uad6d\u30a4\u3131\u30ad\u30b4"	101 100 102
+"\u3042\u3054\u3134\u30c3\uc5b4\u30b2\u304b "	101 100 102
+"\u1100\ud55c\u30aa\u30af\u30af\u3051"	101 1455 30005 30006 30021 30225 30228 30228 30180 102
+"\u30a8\uad6d\u30d4\u30a4\u3051\u3054\u3053\u30a4"	101 1698 29991 30014 30020 30245 30221 30180 30181 30181 30221 102
+"\u3044\u30b3\u30b1\u30af\u304b\u11a8 x\u304f\u3050\uad6d"	101 1647 30230 30229 30228 30177 30020 1060 30179 30179 29991 30014 30020 102
+"\u304b\u30a8\u30e7\u304d x"	101 1651 30224 30256 30178 1060 102
+"\u30b0\u30ac\uac00\u304a\u30a2\u3051\u3046\u30c3\u30ac\u30e7\u3131\u30ac\u30aa\uad6d"	101 100 102
+"\u309c\u3134\u3071\u3053\u3050\u30af\u30e7\u30b3\u3053\u30e7 x\u30b2\u30a4"	101 100 1060 30229 30221 102
+"\u30aa\u3052 "	101 1699 30180 102
+"\u309c\u1100\u30b2 "	101 100 102
+"\uac01\u314f\uac04\u30af"	101 100 102
+"\u3054\u30b4\u309c\u3131\u30aa\u30c3\uac00"	101 100 102
+"\u30ac\uad6d\u30c3 x\u30b2\u3050"	101 1700 29991 30014 30020 30237 1060 30229 30179 102
+"\u30d1\u3044 x\uad6d"	101 1718 30173 1060 29991 30014 30020 102
+"\ud55c\u30ae\u30a6\uac07\u3048\u3050 x\ubbfc\uac08\u30b3"	101 100 1060 29995 30019 30021 29991 30006 30022 30230 102
+"\uad6d\uad6d\u30fc\u3048\uad6d\u30ae\u314f\u30a2 "	101 100 102
+"\u304d\uc5b4\u30b0\u30d1\ud55c\u304a\uac01\u30ab\u3134 x\u30a8"	101 100 1060 30224 102
+"\u30ae\u1101\u3054\u30b0\u1101\uac08\ubbfc\u3051\u30d7\ub300 x\uac04\u304f\u30b2\u3131\uac08"	101 100 100 102
+"\u30b2\u30d4\u30c3 \ub300\uac04\u314f\ub300"	101 1703 30245 30237 100 102
+"\u30af x\u309b\u30ac\u30d7"	101 1702 100 102
+"\u304a\u30a2\u30aa\ud55c\u30e7\uac00\u3054\u3050\u3053 \uac00\ud55c\uae00\u3050\u30d1"	101 1650 30219 30225 30005 30006 30021 30256 29991 30006 30181 30179 30181 1455 30006 30005 30006 30021 29991 30017 30022 30179 30244 102
+"\u3131\u309b\u1101\u11a8\u1101 \u3071\u3054"	101 100 1672 30181 102
+"\u3052\u30b1\u30ab\ub300\u30e7\uac04\u3044\u3050\ub300\u30b2\u30a4 x\ud55c\u3071\u30d4\u304b\u3046"	101 1654 30229 30226 29993 30007 30256 29991 30006 30021 30173 30179 29993 30007 30229 30221 1060 30005 30006 30021 30198 30245 30177 30174 102
+"\uac00\u30e3 \u3051"	101 1455 30006 30254 1654 102
+"\ud83e\udebf\ud83c\udccf \ud83e\ude90\ud83c\uddef\ud83c\uddf5"	101 100 100 102
+"\ud83e\uddd1\u200d\ud83d\udcbb\ud83c\udccf\ud83e\udece\ud83c\uddfa\ud83c\uddf8\ud83d\ude02 \u00a9\u00a9\u26a1\ud83e\udee8"	101 100 100 102
+"\ud83c\uddef\ud83c\uddf5\ud83c\uddfa\ud83c\uddf8\u2603\ud83e\udee0\ud83c\udccf\u26a1\ud83e\ude90\ud83c\uddef\ud83c\uddf5 \ud83e\udebf\ud83c\udff3\ufe0f\u200d\ud83c\udf08\ud83c\uddef\ud83c\uddf5\ud83c\uddef\ud83c\uddf5"	101 100 100 102
+"\ud83c\udc04\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\u21221\ufe0f\u20e3\u2764\ufe0f x\ud83c\uddef\ud83c\uddf5"	101 100 100 102
+"\ud83d\ude00\u2318\ud83e\udee1\ud83d\udc4d\ud83c\udfff\ud83c\udc04\ud83e\udee8\ud83d\udd25\ud83e\udd80 \ud83e\udee1\u2764\ufe0f\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\ud83e\ude90\ud83d\udd25"	101 100 100 102
+"\ud83e\ude90\ud83e\udee8\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\ud83e\udece\ud83c\udccf\u00a9\u2b50\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\u00ae\ud83e\udd72\u2318 x\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80"	101 100 100 102
+"\ud83d\ude00\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\ud83c\udccf\ud83c\uddfa\ud83c\uddf8\ud83e\udee8\ud83e\udece1\ufe0f\u20e3\ud83e\udee0\ud83d\ude00\u2603\ud83d\ude00\ud83d\udc4d\ud83c\udfff\ud83c\uddef\ud83c\uddf5\u2318"	101 100 102
+"\ud83e\ude90\ud83e\udee8\u2603\u00a9\u00ae"	101 100 102
+"\ud83e\udebf\u2728\ud83e\udd80\ud83e\uddd1\u200d\ud83d\udcbb\ud83e\udee0\ud83e\udece\u00a9\u26a1\ud83d\udd25\ud83e\udebf\ud83e\udebf x\ud83e\udee0\ud83e\udee8\ud83e\udece1\ufe0f\u20e3"	101 100 100 102
+"\ud83e\udee0\u2b50\u2728\u2764\ufe0f\ud83e\udebf\ud83e\udd72\ud83e\uddd1\u200d\ud83d\udcbb\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\ud83e\udee0\ud83d\udd25\u2b50\u00a9\ud83e\udece\u2b501\ufe0f\u20e3"	101 100 102
+"\u2728\u26a1\ud83c\udc04\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\u00ae\ud83d\ude00 "	101 100 102
+"\ud83c\uddfa\ud83c\uddf8\u2318\u2764\ufe0f\u2b50\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\ud83e\uddd1\u200d\ud83d\udcbb\ud83e\udee8\ud83e\udd80"	101 100 102
+"\u2b50\u2764\ufe0f\ud83e\udece\u2b50\ud83e\udd80\ud83d\ude00\ud83c\uddef\ud83c\uddf5\u2603\ud83d\ude02\u20e3 "	101 100 102
+"\u26a1\u2764\ufe0f \ud83d\ude00\ud83d\udd25\ud83e\uddd1\u200d\ud83d\udcbb"	101 100 100 102
+"\ud83e\udebf\ud83d\udd25\ud83e\udd80\ud83d\ude00\u2728\ud83c\udc04\ud83d\ude00\u26a1\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\ud83d\udd25"	101 100 102
+"\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\ud83c\uddef\ud83c\uddf5\ud83c\udff3\ufe0f\u200d\ud83c\udf08\u2b50\u26a1\ud83d\udc4d\ud83c\udfff\u00ae\ud83e\udd72\ud83c\uddfa\ud83c\uddf8\ud83e\udd72 "	101 100 102
+"\u2764\ufe0f\ud83e\udd80\ud83e\uddd1\u200d\ud83d\udcbb\ud83d\udc4d\ud83c\udfff\u2b50\ud83e\udee1\u20e3\u2318\u20e3\u2728"	101 100 102
+"\ud83e\udd80\ud83e\udee1\ud83d\ude021\ufe0f\u20e3 x\u2764\ufe0f1\ufe0f\u20e31\ufe0f\u20e3\u2318"	101 100 100 102
+"\ud83e\ude90\ud83e\udd72\u00ae\ud83e\uddd1\u200d\ud83d\udcbb\u2318"	101 100 102
+"\u2b50\ud83c\udc04\ud83e\udd72\ud83d\udc4d\ud83c\udfff\ud83c\udff3\ufe0f\u200d\ud83c\udf08\ud83e\udece\ud83c\uddef\ud83c\uddf51\ufe0f\u20e3\u00a9\ud83d\ude02"	101 100 102
+"\u2122\ud83d\udc4d\ud83c\udfff\ud83e\uddd1\u200d\ud83d\udcbb\ud83d\ude02\ud83d\ude00\ud83d\ude00 x1\ufe0f\u20e3\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\u2318\ud83e\udee0\ud83e\udd72"	101 100 100 102
+"\ud83c\udc04\u2728\ud83e\udece\ud83c\udff3\ufe0f\u200d\ud83c\udf08 x\ud83e\uddd1\u200d\ud83d\udcbb\ud83e\udee8\ud83c\uddfa\ud83c\uddf8\u26a1"	101 100 100 102
+"\ud83e\udd72\ud83e\udee1\u2764\ufe0f\ud83d\ude00\ud83d\udc4d\ud83c\udfff\u20e3\ud83c\uddef\ud83c\uddf5\ud83e\udee1\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\u2728\ud83d\udc4d\ud83c\udfff"	101 100 102
+"\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\ud83e\udee01\ufe0f\u20e3\ud83e\udece\u26a1\ud83e\udee8\u2122 x\ud83d\udc4d\ud83c\udfff\u2603\ud83e\udd72\ud83c\udc04"	101 100 100 102
+"\ud83e\udd72\ud83e\udebf1\ufe0f\u20e3\ud83d\udc4d\ud83c\udfff\ud83e\udee1\u2764\ufe0f\ud83d\ude02\u20e3\ud83d\ude02\ud83e\udd80\ud83c\udccf "	101 100 102
+"\u00a9\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\u2728\ud83c\udccf\ud83d\udd25\u20e3\u20e3\ud83d\ude00\ud83d\udc4d\ud83c\udfff"	101 100 102
+"\u20e3\ud83e\udee11\ufe0f\u20e3\u20e3\ud83c\uddfa\ud83c\uddf8\ud83d\udc4d\ud83c\udfff\ud83e\udee1\ud83d\ude02\ud83e\udd72\u2122\ud83e\udd72 \ud83e\udd72\u2728\u00a9"	101 100 100 102
+"\ud83e\udee1\ud83e\udece\u2b50\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\ud83c\uddef\ud83c\uddf5\ud83d\ude00 x"	101 100 1060 102
+"\ud83d\udc69\ud83c\udffd\u200d\ud83d\ude80\ud83e\ude901\ufe0f\u20e3 x\ud83c\uddfa\ud83c\uddf8"	101 100 100 102
+"\ud83e\udee8 \ud83d\udc4d\ud83c\udfff\u00a9\u26a1"	101 100 100 102
+"\u00a9\ud83e\udee0\ud83d\ude00\ud83c\uddfa\ud83c\uddf8\ud83e\udee8\ud83d\udd25"	101 100 102
+"\ud83d\udd25\u2318\u2b50\u2764\ufe0f\ud83c\uddfa\ud83c\uddf8\ud83c\uddef\ud83c\uddf5\u2b50\ud83d\ude02 x\ud83d\udc4d\ud83c\udfff\u2318\ud83e\udd80\u2728\ud83c\uddfa\ud83c\uddf8"	101 100 100 102
+"\ud83e\udee1\ud83c\udff3\ufe0f\u200d\ud83c\udf08\ud83e\uddd1\u200d\ud83d\udcbb\ud83e\udee8\u00ae\u2b50\ud83e\udee0\u26a1\u2b50 x\ud83e\udebf\u2603\ud83e\udee8\ud83c\udccf"	101 100 100 102
+"\ud83c\udff3\ufe0f\u200d\ud83c\udf08\ud83c\udc04\ud83e\udd72\ud83d\ude00\u2764\ufe0f x\ud83e\udee8"	101 100 100 102
+"\ud83e\udee8\ud83e\udd80\ud83d\udd25\ud83d\ude00\ud83e\udee1\ud83e\udd72\u26a1\u00a91\ufe0f\u20e3 \ud83d\ude00\u2122\u2122"	101 100 100 102
+"\ud83e\ude90\u2b50\ud83d\udd25\ud83e\udee8\u2764\ufe0f\u2764\ufe0f\u20e3\ud83e\ude90\u2318"	101 100 102
+"\ud83d\ude02\ud83c\uddfa\ud83c\uddf8\ud83e\udee0\ud83c\udc04\ud83e\udee8\u00ae x\ud83c\udc04\u26a1\u2318"	101 100 100 102
+"\ud83c\udccf x\ud83e\udee0\ud83e\udebf\ud83d\ude00\u26a1\u2728"	101 100 100 102
+"\ud83c\udff3\ufe0f\u200d\ud83c\udf08\ud83e\udd72\u2603\u2728\u2764\ufe0f\ud83c\udff3\ufe0f\u200d\ud83c\udf081\ufe0f\u20e3\u00a9\ud83d\ude00\ud83e\udece"	101 100 102
+"\u00a9\ud83c\uddef\ud83c\uddf5\ud83e\udebf\ud83e\udece\u26a1\ud83c\udc04\u20e3\u00ae\u2728\ud83c\udccf\u00a9\ud83c\udc04\ud83c\udccf\ud83e\ude90"	101 100 102
+"\u2297\u2127 x\u2605^\u263a\u2194\u00b0"	101 100 1060 30147 1034 100 102
+"\u2663@\u00ab\u00af\u2264| x|\u2605\u2248"	101 1624 1030 1077 100 1064 1060 1064 1620 30133 102
+"\u2295\u2033 x\u2019\u00a4\u2116\u201c\u00ab"	101 1612 1532 1060 1521 1070 30106 1523 1077 102
+"\u2665\u00f7\u2194\u2202\u2032\u2282\u2116*"	101 1625 29669 30115 30120 1531 1610 30106 1008 102
+"\u203a\u25b3\u00f7@\u00a5[\u2207\u00a2\u00bb\u2192\u00bb x\u03a9\u00a7\u2606\u2033\u266b"	101 1533 100 1030 1071 1031 1595 29645 1090 1585 1090 1060 29739 1073 1621 1532 100 102
+"\u2026\u263b\u20bf\u21d4\u263b\u266a x\u2302#\u222b\u2283"	101 1529 100 100 1001 100 102
+"\u00b7\u00a1\u2030\u00a4\u2310\u00a4~\u2117\u2297_\u2020"	101 1087 1067 1530 100 1066 100 1035 1526 102
+"\u2010\u00a3\u2207\u2264_\u2021\u00a8\u2310\u266b\u2264"	101 1513 1069 30123 30135 1035 1527 100 102
+"\u222a>\u263a\u2014\u2606\u2207\u2666\u266a\u2208\u2297%\u2012\u00b8\u00b7"	101 1605 1028 100 1517 100 1003 1515 100 1087 102
+"\u00a4\u00f7\u00ac\u2014\u00bf\u2011~\u2660\u2193\u263b\u20ac*\u25b3\u2605"	101 1070 29669 29655 1517 1094 1514 1066 100 1008 100 102
+"\u221a\u2192*\u20bf\u266a+\u263a\u2194 }\u20ac\u222b[\u25a0"	101 1600 30113 1008 100 1009 100 1065 100 1031 1617 102
+"\u222a\u2014\u2211]\u2120 x\u2202\u2030\u266b"	101 1605 1517 100 1033 100 1060 30120 1530 100 102
+"\u201e\u2014#\u263a\u2109\u2264 x\u201e"	101 1525 1517 1001 100 1060 1525 102
+"\u25c6\u263b\u20ac \u2302"	101 100 100 102
+"<^\u2018\u00b7\u2015\u222b\u2020 x\u263b"	101 1026 1034 1520 1087 1518 100 1526 100 102
+"\u00ab\u201d}`\u2283_\u263a\u2663\u00ac\u2192 \u2606\u25cb$\u2020"	101 1077 1524 1065 1036 100 1035 100 100 1002 1526 102
+"\u266a\u266b\u2605\u263a[\u221a\u00a7\u20bf %\u2605\u2011%~"	101 100 1031 1600 1073 100 1003 1620 1514 1003 1066 102
+"\u00a2\u2020\u2665\u2248\u00ac\u222b}\u2209 x"	101 1068 1526 100 1065 1596 1060 102
+"\u2665 \u2018\u2302\u222a"	101 1625 1520 100 102
+"\u00a4\u25a1\u2191\u2606\u2208\u201a \u25a1\u2011\u2194"	101 100 1522 100 1514 1587 102
+"\u00bf\u00a6\u00a3\u2019\u25b2\u203a\u2117\u2015\u2209\u221e"	101 1094 1072 29646 1521 100 1533 100 1518 1596 30128 102
+"\u2014 "	101 1517 102
+"\u2310\u21d4\u266b\u263b\u2020\u2022 \u2260"	101 100 1526 1528 1027 102
+"\u2013\u2030 x\u2297"	101 1516 1530 1060 30140 102
+"\u2283 \u2010\u221e"	101 100 1513 1601 102
+"\u2605\u2310\u2020*\u2039\u00b6\u2022\u2039\u2264\u25a0\u00a3 \u00ac\u2194\u00af"	101 100 1526 1008 100 1086 1528 100 1608 30144 29646 100 102
+"\u25b2\u2208+`\u2109\u00af_+\u2202\u2192 \u263a\u25b2\u2020\u2665"	101 100 1009 1036 100 1035 1009 1592 30113 100 1526 1625 102
+"\u2021\u00a7\u2206\u2127\u2022~\u2666\u2030\u2120\u20bf\u266a x"	101 1527 1073 100 1528 1066 1626 1530 100 1060 102
+"*\u2663\u2117\u00a8\u2010[\u2665{\u222b\\"	101 1008 100 1513 1031 1625 1063 100 1032 102
+"\u201d\u2011\u2297@\u00f7{\u201a\u2020}\u25a1\u00b4"	101 1524 1514 1613 1030 1099 1063 1522 1526 1065 100 102
+"\u25a1\u2207>@\u25cb\u00f7\u2012\u2248 \u2248\u2103"	101 100 1028 1030 100 1515 1606 100 102
+"^\u2022\u221a\u2211"	101 1034 1528 100 102
+"\u2033\u25cb\u00a7\u00b0\u00a2\u00af "	101 1532 100 1073 100 102
+"\u2202\\>\u2660\u2282\u2666\u2660\u2302\u2127"	101 1592 1032 1028 100 102
+"\u00a4\u2264+"	101 1070 30135 1009 102
+"\u2127\u20bf}\u2229 x\u2206\u2660"	101 100 1065 1604 1060 30122 30150 102
+"\u201d\u2109\u2013\u00a4\u25cf\u03a9\u221a x\u2666\u2117\u2109\u25b2\u2135"	101 1524 100 1516 1070 30146 29739 30127 100 102
+"\u00a6\u00a6\u00b4\u2010\u00a3\u2282\u2209\u2010\u25b3\u00a1 x\u2193`\u21d2"	101 1072 29649 29658 1513 1069 30137 30124 1513 100 1067 1060 30114 1036 1591 102
+"\u2020\u2206\u201d\u2605* \u2211\u00a1\u2248\u2127"	101 1526 1594 1524 1620 1008 100 1067 100 102
+"\u266b\u00a3#\u25c6\u2011=\u2021\u2295\u201c\u00b0 #\u00f7\u203a\u266b"	101 100 1001 100 1514 1027 1527 1612 1523 1080 1001 1099 1533 100 102
+"\u3018\u30fb\u3030\u300e\uff3f\uff63"	101 100 1738 100 1643 100 100 102
+"\uff0a x\uff5e"	101 100 1060 30521 102
+"\uff0f\uff3b\u3015\uff0d\uff5d\u3016\uff01\uff5d\uffe5\u3002 x\u3009\u3002\uff0c\uff06"	101 1992 100 100 1990 100 100 1986 100 100 1636 1060 1638 1636 1989 100 102
+"\uff0c\uff20\uff01\u3018\u3008\uff0e\u300a \uff08\uff0e\uff07\u300d"	101 1989 100 1986 100 1637 1991 1639 1987 1991 100 1642 102
+"\uff01\u301d\u3030\uff08\uff5d\uff1b\u300c \uff62\u301b\u3015\uff0a\uff0c"	101 1986 100 100 1987 100 100 1641 100 100 100 100 1989 102
+"\uff3f\uff63\u3002\u300a\u301e\uff62\u300e\u301d x\uff1f\u301b\u3009"	101 100 100 1636 1639 100 100 1643 100 1060 1994 100 1638 102
+"\uff61\uff05\uff20"	101 100 100 100 102
+"\uff01\u3030\uff61\uff1b\uff5d x\u3011\u3016"	101 1986 100 100 100 100 1060 100 100 102
+"\u300b\uff5e\u3019\uff0e \u300e\uffe6"	101 1640 1995 100 1991 1643 100 102
+"\uff09\u3009\uff63\u3002\u301c\u3011\uff5e\u3010 x"	101 1988 1638 100 1636 1645 100 1995 100 1060 102
+"\uff03\u301e\uff05\uff1a\uff1b\uff5e\uff5b\u3015\uff20\uff1f\uff02 x"	101 100 100 100 1993 100 1995 100 100 100 1994 100 1060 102
+"\uff3b\u300c\uff09\uff0e\uff02\uff62\u301a\u3002\uff3c\uff1b\uff06\uffe6"	101 100 1641 1988 1991 100 100 100 1636 100 100 100 100 102
+"\uffe5\uff3c\uff61\uff3f\u3009\u3001\u3014\u301f \uff03"	101 100 100 100 100 1638 1635 100 100 100 102
+"\u300f\uff64"	101 1644 100 102
+"\u301e\uffe5\uff3c\u3014\u303d\u3030\u301c\u3002\u301b\u3016\u3015 \uff06\u301b\uff3c\u300d\u300b"	101 100 100 100 100 100 100 1645 1636 100 100 100 100 100 100 1642 1640 102
+"\u30fb\u300b\uff05\u300a\u3015\uff06\u3003\uff3f\u301f"	101 1738 1640 100 1639 100 100 100 100 100 102
+"\uff5d\u301a\uff02\uff5d\uffe5\u30fb\uff08\u3017\uff20\u3016\uff08\u30fb\u301c\uff3b\uff3f"	101 100 100 100 100 100 1738 1987 100 100 100 1987 1738 1645 100 100 102
+"\u301d\uff5d\uff06\uff5b\uff62\u3018\uff63 x\u3017\u301c"	101 100 100 100 100 100 100 100 1060 100 1645 102
+"\u301a\uff0e\u30fb\uff0a\uff3c\uff3b\uff3f\u300c\uff5b\u300b\u3016"	101 100 1991 1738 100 100 100 100 1641 100 1640 100 102
+"\u3002\uff1a\u301f\uff3d\uff0d\uff64\uff06\u3016\u3030\u300f\u3011 x"	101 1636 1993 100 100 1990 100 100 100 100 1644 100 1060 102
+"\u3001\u3017\u301e\uff64\uff0d\u301d\uff3b\uff02\u301e\uff64\u300a"	101 1635 100 100 100 1990 100 100 100 100 100 1639 102
+"\u3003\uff64\u3001\uff1f\uff5d\u301f\uff61\u30fb\uff09\u303d\u300a "	101 100 100 1635 1994 100 100 100 1738 1988 100 1639 102
+"\u3017\u3030\u300c\u301b\u3014\u301e\uffe6\u300f"	101 100 100 1641 100 100 100 100 1644 102
+"\uff3f x"	101 100 1060 102
+"\uff01\u3009\uff1b\u301b\u3008\uffe6\uff3f\u3018 \u301b"	101 1986 1638 100 100 1637 100 100 100 100 102
+"\uff08\u300c\u3014\u3011 x\u3030\u3011"	101 1987 1641 100 100 1060 100 100 102
+"\uff09\uff3c\uff3d\u3011\uff06\uff05\u300c\uff61\u3015 \uff01\u3017"	101 1988 100 100 100 100 100 1641 100 100 1986 100 102
+"\uff0c x"	101 1989 1060 102
+"\u300f\u3017\uff07\uff0c\uff0d\u300d\uff63\u3019\uff1a\uff3f\uff1b\u300a\u300b\u300f"	101 1644 100 100 1989 1990 1642 100 100 1993 100 100 1639 1640 1644 102
+"\u3009\uff01\u3009 x\u3017\uff20\uff08"	101 1638 1986 1638 1060 100 100 1987 102
+"\u3019\u300c\u301f\uff3c\u300e\u3009"	101 100 1641 100 100 1643 1638 102
+"\uff3f\uff64\uff62\u301e\uff0f\u300b\u3014\uff64\uff05\u301c\u3014 \uff5b\uff03\uff1b\uff01"	101 100 100 100 100 1992 1640 100 100 100 1645 100 100 100 100 1986 102
+"\u3011\uff61\uffe6\u303d\uff61\u300e\uff62\uff07"	101 100 100 100 100 100 1643 100 100 102
+"\u301d\u30fb\u3010\uff5b\u301a\uffe5\u30fb"	101 100 1738 100 100 100 100 1738 102
+"\uff07\uff3d\uff63\u3009\uff0d\u3019\u3011\uff1a\u301c\u300e\uff0e\u3009"	101 100 100 100 1638 1990 100 100 1993 1645 1643 1991 1638 102
+"\u3009\uff61 x\uff09\uff5b\u3016\uffe6"	101 1638 100 1060 1988 100 100 100 102
+"\uff5e\u3009\uff1b \uff06\uff1b\u300c"	101 1995 1638 100 100 100 1641 102
+"\uff1f\u3003\u301e\uff07\u3017\u3001\u3016\uff3b\uff0f\uff01 \u3015\u3009"	101 1994 100 100 100 100 1635 100 100 1992 1986 100 1638 102
+"\u3009\uff03\u3017\u30fb\u301b\uff62\uff03\uff02\uff5e\uff61\u300b \uff01\u300f\uff20\uff08\uff03"	101 1638 100 100 1738 100 100 100 100 1995 100 1640 1986 1644 100 1987 100 102
+"\uff0a\uff3b\uffe5\uffe5\u300b\uff03\u303d\u3015\u3011\uff07 x"	101 100 100 100 1640 100 100 100 100 100 1060 102
+"\uff23\uff23\uff22\uff11\uff13\uff22\uff23\uff72\uff9f\uff72\uff73\uff72\uff9e\uff43"	101 100 102
+"\uff22\uff73\uff9f\uff9e\uff42\uff71\uff71\uff23\uff12\uff73\uff43 \uff9f\uff10\uff71"	101 100 100 102
+"\uff22\uff21\uff73\uff71 \uff12\uff13"	101 100 100 102
+"\uff42\uff9f\uff11\uff21\uff42\uff9f\uff10\uff23\uff73\uff22\uff23 x\uff12\uff9e\uff11"	101 100 100 102
+"\uff23\uff73\uff73\uff9e\uff22\uff73\uff11 \uff10"	101 100 100 102
+"\uff9f\uff73"	101 100 102
+"\uff12\uff9e\uff11\uff9f\uff9f\uff9e\uff73 \uff22\uff10\uff21"	101 100 100 102
+"\uff71\uff22\uff41\uff73\uff22\uff42 x\uff13"	101 100 100 102
+"\uff10\uff22\uff23\uff42\uff13\uff73\uff22\uff73\uff42\uff43\uff9f"	101 100 102
+"\uff23\uff9f"	101 100 102
+"\uff23\uff22\uff11\uff21\uff23 \uff9f\uff72\uff22\uff71\uff9f"	101 100 100 102
+"\uff21\uff23\uff9e\uff43\uff71\uff41\uff73\uff9f\uff71\uff13\uff41 x\uff41\uff41"	101 100 100 102
+"\uff13 x\uff73\uff23"	101 100 100 102
+"\uff41\uff43\uff12\uff9e\uff22\uff42 \uff71\uff9f\uff21"	101 100 100 102
+"\uff73\uff42\uff41 x"	101 100 1060 102
+"\uff11 \uff41"	101 100 100 102
+"\uff42\uff23\uff9e\uff43\uff9e\uff21\uff10\uff9f \uff73\uff43\uff10\uff12"	101 100 100 102
+"\uff42\uff10\uff71 \uff71\uff21\uff73"	101 100 100 102
+"\uff22\uff13\uff21\uff73\uff43\uff73\uff21\uff23"	101 100 102
+"\uff13\uff41\uff12\uff9f\uff72\uff43\uff73\uff72\uff21\uff71\uff23\uff13\uff43"	101 100 102
+"\uff21\uff9e\uff23\uff9f\uff9e\uff13\uff10\uff9f\uff23\uff21 \uff23\uff41\uff11\uff71\uff72"	101 100 100 102
+"\uff22\uff42\uff12\uff71\uff22\uff41\uff13\uff9f\uff41\uff12"	101 100 102
+"\uff22\uff41\uff42\uff9f\uff41\uff9f\uff10\uff22\uff23\uff10\uff11 x\uff71\uff43\uff9e\uff11\uff21"	101 100 100 102
+"\uff23\uff12\uff42\uff21\uff12\uff71\uff73\uff43"	101 100 102
+"\uff13\uff41\uff71\uff9f\uff12\uff23\uff43\uff73\uff21\uff9e\uff9f x\uff71"	101 100 100 102
+"\uff22\uff22\uff43\uff72\uff22\uff23\uff72 "	101 100 102
+"\uff42\uff21\uff42\uff22\uff72\uff71\uff41\uff9e\uff9e\uff21\uff22"	101 100 102
+"\uff11\uff73\uff9f"	101 100 102
+"\uff9e\uff22\uff71\uff9e\uff42\uff72\uff9e\uff42\uff12\uff11\uff9f\uff22\uff9e"	101 100 102
+"\uff9e\uff71\uff10\uff22\uff21"	101 100 102
+"\uff9e\uff10\uff23 \uff12\uff43\uff10\uff42\uff43"	101 100 100 102
+"\uff9e\uff22\uff41\uff71\uff72\uff11\uff22 x\uff72\uff21\uff72\uff22\uff9e"	101 100 100 102
+"\uff13\uff13\uff71\uff21\uff10\uff11\uff9f\uff73 x\uff23"	101 100 100 102
+"\uff9e\uff42\uff11\uff21\uff43\uff43\uff9e\uff72\uff13\uff73\uff12\uff22\uff71"	101 100 102
+"\uff11\uff21\uff9e\uff42\uff22\uff22\uff9f\uff43\uff22\uff10"	101 100 102
+"\uff73\uff43\uff9f\uff73\uff10\uff12\uff43\uff41 \uff41\uff41\uff21\uff71"	101 100 100 102
+"\uff41\uff11\uff11\uff23\uff11\uff22\uff42\uff72\uff9f\uff9f x\uff13"	101 100 100 102
+"\uff9e\uff72\uff21\uff41\uff73\uff42\uff21\uff12\uff10\uff23\uff23\uff41\uff71\uff72"	101 100 102
+"\uff11\uff42\uff72\uff41\uff9e\uff21 \uff11\uff22\uff43\uff12\uff41"	101 100 100 102
+"\uff41\uff10\uff73 x\uff43\uff12\uff71\uff11"	101 100 100 102
+"\u2461\ufb00\u338f\u2122 x"	101 100 1060 102
+"\u00bc\u2462\u2160\u2171\u00aa\u00ba\u00b2\ufb01 \ufb01\ufb05\u3231\u337f\u337f"	101 100 100 102
+"\u00b2\u00bd\u00bc\ufb01\u00b3\u2121\ufb00\u2161\u00ba \u3231\ufb01\u2161"	101 100 100 102
+"\ufb03\u338f\ufb04\u00b9\u338f\u3231\u32a4\u00b3\u339e \u00ba\ufb04\u2161"	101 100 100 102
+"\ufb06\u337f\u00b3\ufb04\u00be\ufb03"	101 100 102
+"\u00bd\u32a4\u2171\ufb00\u2461"	101 100 102
+"\u338f\ufb03\u2460\u00bd\u00be \ufb04\u00b2\u2162"	101 100 100 102
+"\u00b3 x\u2162\u2122"	101 1083 100 102
+"\u00b9\u00bc\ufb06\ufb03\u2461\u2171\ufb05\u00b3\u3231\u00ba \u00be"	101 100 1093 102
+"\u2162\u2160\ufb06\u2170\u2162\ufb04\u2170\u2460\u339e\u338f"	101 100 102
+"\ufb06\u32a4 \u2462\u337f\u00b2\u2171"	101 100 100 102
+"\ufb04\u3231\u00bc\ufb04"	101 100 102
+"\u338f\u2460 \u00b2\ufb03\ufb00\u2122"	101 100 100 102
+"\u2121\u2162\u2461 x\u2121"	101 100 100 102
+"\u2461\u337f\u2170\u338f\ufb04\u2161\u00b3\u00b2 x\u2160\u00b9\u00bc"	101 100 100 102
+"\u2462\u338f\u337f\u00bd\u2461\u2121\u2171\u00b3\u2461\u2121\ufb06"	101 100 102
+"\u32a4\u2160 x\u2461\u00aa"	101 100 100 102
+"\u3231\u2160\u337f\u00b9\ufb02\u00bd x\u337f\ufb02\ufb02\u2170"	101 100 100 102
+"\ufb06\u00bd\ufb01\ufb01\ufb00\u2122\ufb06\u00ba\ufb06 x\u2160\u00be"	101 100 100 102
+"\u00bd\ufb01\ufb01\u00b3"	101 1092 30510 30510 18107 102
+"\ufb01\u00b2\u2122\u00b9 x\u2171\u2121\ufb03\u2160"	101 1984 10701 30108 27904 100 102
+"\u00b2\u2171\u2121\u2122\u32a4\u2161\u339e\u337f"	101 100 102
+"\u2460\u2462\ufb03\u00be\ufb05 x\u3231\u2122\u2122\u00ba"	101 100 100 102
+"\u2122\u339e\u00b2\u2161\u338f\u00b2\u00bd\u337f\u00bd\ufb06"	101 100 102
+"\ufb06\u32a4\u339e\u2162\u2462 \ufb00\u2170\u00bc"	101 100 100 102
+"\u00bd\u2170\u00bd\u338f\u2162\ufb04\u2160\u2121"	101 100 102
+"\ufb02\u2161\ufb02\ufb00\ufb03\u2162\u3231 "	101 100 102
+"\ufb00\u338f\u2461\ufb00\ufb02\ufb02\u00bd\u00be\u2461 x\u00ba\u00b9"	101 100 1060 29662 27904 102
+"\u00b2\u2161\u00aa\u00bc\u00ba\u00ba\u00aa\u2121\ufb05 \u2462\ufb00\u00aa"	101 100 100 102
+"\ufb01\u00be\u2161\ufb05\u00ba\u2460\ufb05\u00b3\u2461\u00b9 \u2161\ufb01\u2122\u2461\u2462"	101 100 100 102
+"\u32a4\u00aa\u2170\u2461\u338f\u00be\u00b3\ufb00\u2170\u2461"	101 100 102
+"\ufb00\u2460\ufb03\u2461\u2460\u00bd\u338f\u2162\ufb04\u00b2 x\u2121\u3231"	101 100 100 102
+"\ufb04\ufb05\u2121\ufb02\u00b9\u32a4"	101 100 102
+"\u00b2\u00bd \u339e\u2460\u3231"	101 1082 13714 100 102
+"\u339e\ufb03\u00bd x"	101 100 1060 102
+"\u338f\u2461\ufb05\ufb03\ufb00\u00bd\u00be\u2121\u2161\u00ba\u2460 \ufb05\u3231"	101 100 100 102
+"\u00b3\u00aa \u00be\u00bc\u00bd\u2162"	101 1083 29653 100 102
+"\u2460\u00bd\u2121\u2171\u2171 x\u00b2"	101 100 1060 10701 102
+"\ufb04\u00bd x\u2461\u2160\u2171\u00b9"	101 100 100 102
+"\u3231\u00ba\ufb04\u2160\u2462\u2122\u2160 x\u2121\u2162\u2171\u2162\ufb02"	101 100 100 102
+"\u009f\ud82f\udca0\u202e\ufffd\u0000\u200b\u000b\u2069\udb40\udc01 x\udb40\udc01\ufff9\u0890"	101 100 102
+"\ud804\udcbd\udb40\udc41 "	101 102
+"\u200e\ufeff\u200b\u009f\u0085\u200d \u2066\ufeff\u200b\f\u0085"	101 102
+"\u200d\u000b\u0080\u200e\ud804\udccd\u000b"	101 100 102
+"\u0001\u2060\ufffb\ud804\udcbd\u200e\b\u202a\udb40\udc01\u001f\u200e \u000b\f\udb40\udc41\ud804\udcbd"	101 102
+"\u000b\ud804\udccd\u0000\u0080\u200f\u00ad\u200d\u202a \ufeff\u0085\ufeff\u200b\ufeff"	101 100 102
+"\u009f\u202e\u0890\f\u200e\u0001\u200b x"	101 100 1060 102
+"\u200e\u2066\u2069\u0085\ud804\udcbd\f\u200c"	101 102
+"\u200c\u202e\u200e\u0080\u200b x\u200e\u0001\u0085\u001f"	101 1060 102
+"\u200b\u0007\u200b\u202a\u200e\ufeff\u001b\ufeff\u001b \f"	101 102
+"\u200f\u000b\u200c\u2069\b\u0890\u007f\u001b\udb40\udc41 "	101 100 102
+"\ud804\udcbd "	101 102
+"\u200d\u200e\ud804\udcbd\ud804\udcbd\u202e\u202a\u180e\u0000\u00ad\u00ad \u2069\u001f"	101 102
+"\ufffb\u007f\b\u001f\ud804\udccd\udb40\udc41\u001b\u0001 x\u180e\u200e\u007f\u200b"	101 100 1060 102
+"\u180e\udb40\udc01\udb40\udc41\ud804\udccd\u0080\ufffb\ufeff\u0000\ufffb\udb40\udc01"	101 100 102
+"\u0085\u2066\u0080\u009f\u0890\ufffb \udb40\udc01\u200d\b"	101 100 102
+"\ufffd\u200b\u202e \u2066\u200c\u000b"	101 102
+"\ud82f\udca0\u200f\u0000 \udb40\udc01\u2060\u202a\u0080\u200e"	101 102
+"\f \ufffb"	101 102
+"\u2066\ud804\udccd\u200e"	101 100 102
+"\u202e\u180e x"	101 1060 102
+"\u009f\u0890\u0000\u180e\u200b\u200c\u202e\u0000\u202e\udb40\udc41 x\u0890\u200b\u200c\ufeff\u000b"	101 100 100 102
+"\udb40\udc41\u0080 x\ufeff\u007f\u202a\f\ufffd"	101 1060 102
+"\ufffb\u200c\u0000\u0080\u001f\u2066\u000b\udb40\udc01"	101 102
+"\u001f\ufff9\u200c\ud82f\udca0\ud804\udcbd\u000b"	101 102
+"\u2060\u2060\u001f\u2066\u001b\udb40\udc01\u0000 \ud804\udccd"	101 100 102
+"\u202e\u202e\udb40\udc01\u0000\ufffb\u200b\ufeff\u0000\u0080\u180e\u200b \ud804\udccd\u00ad\u202e\u200c\udb40\udc41"	101 100 102
+"\u001b\u202a\u202a\u001f\u00ad\b\u200f\ufeff\ufffd\u0080\b x\u200d\ufffd\b\u0890\u000b"	101 100 102
+"\u0085\u001f\u200c\u200b\ufff9\u0890\u00ad\u200f\u200b\u202e\u0001 x\u202a\ud82f\udca0\udb40\udc41\u180e"	101 100 1060 102
+"\b\u00ad\u0085\ufffd\ud804\udcbd\udb40\udc41\u007f\u001f\u009f\u001f x"	101 1060 102
+"\u0085\u000b\u200b\u200d\u0080 x\b\ud804\udccd\b"	101 100 102
+"\u200c "	101 102
+"\udb40\udc01\u00ad\ufeff\u009f\u202e\u200c\b\ufff9\u200b\u009f \u180e\u0890\b\ufffb"	101 100 102
+"\u180e\udb40\udc01\b\u202e\u0007\ufffb\ud804\udcbd x\ufff9"	101 1060 102
+"\u0890\udb40\udc01\u0001\ufeff x"	101 100 1060 102
+"\u0000\u000b\u009f\f\u200c\u0890"	101 100 102
+"\u202e\u200e\u180e\u000b\u180e\ufff9\b\u0080\u200f\u001f"	101 102
+"\u200e\u2066\u202a\ufffd\u001f\ud82f\udca0\u009f\u202e\u0080\u200d\ufeff\u200b"	101 102
+"\ufeff\u200e\u200f\u0085\u200c\u007f\u00ad\u0001\u0001 x\u001b"	101 1060 102
+"\u200d \u0080\udb40\udc01\ud804\udccd\u007f"	101 100 102
+"\udbc0\udc00 \uf8ff\udbff\udffd"	101 102
+"\udb80\udc01\ue001\ue000\ue001\uf8fe\ue000\udbff\udffd x\udbff\udffd\udb80\udc01\udbff\udffd"	101 1060 102
+"\ue000 \udbc0\udc00\udbff\udffd\udbbf\udffd"	101 102
+"\uf8fe\ue000\udbc0\udc00 \uf8fe"	101 102
+"\udbbf\udffd\udb80\udc01\ue000\udbc0\udc00\udbff\udffd\ue000"	101 102
+"\udbc0\udc00\uf8ff\uf8ff\ue123 \udbc0\udc00\ue001\ue000\uf8fe"	101 102
+"\udbbf\udffd\ue123\uf8ff\udbff\udffd\udbff\udffd\udbff\udffd\uf8ff\udb80\udc01\udb80\udc01\ue123\ue001"	101 102
+"\udbc0\udc00\ue001\ue123\udbc0\udc00\udbff\udffd\uf8ff\uf8ff\ue001\udb80\udc00\uf8ff\ue001 x\ue000\ue000"	101 1060 102

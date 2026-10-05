@@ -31,6 +31,8 @@ FILES=(
   "all-MiniLM-L6-v2|model.onnx|4f148ba8ae9c2c7fbee4af2b132db8d06c6a6545b47fc83bbb98c3d22b8393e6"
   "all-MiniLM-L6-v2|vocab.txt|07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
   "all-MiniLM-L6-v2|config.json|b567c7d5a55b636c95186aaf993f9a8920842b7e05a9e703e68b23cab2c3a670"
+  # INFERCORE (SR57): the HF tokenizer definition (special tokens, normaliser flags) the embedder prefers.
+  "all-MiniLM-L6-v2|tokenizer.json|da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0"
 )
 
 die() { echo "una-models: $*" >&2; exit 1; }

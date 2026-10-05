@@ -898,21 +898,21 @@ pub fn step_label(text: &str) {
             }
         }
         let bytes = text.as_bytes();
-        let n = bytes.len().min(w / cw);
-        let x0 = (w - n * cw) / 2;
+        let n = crate::video::text::fit(bytes, true, crate::video::text::Face::Chrome, w); // KERNELFONT (B359): through `video::text`
+        let x0 = (w - crate::video::text::advance(&bytes[..n], true, crate::video::text::Face::Chrome).min(w)) / 2;
         let ty = y0 + (band_h - ch) / 2;
-        for (i, &b) in bytes[..n].iter().enumerate() {
-            for (ry, row) in font::glyph(b, true, face).iter().enumerate() {
-                for (rx, &a) in row.iter().enumerate() {
-                    if a == 0 {
-                        continue;
-                    }
-                    let o = ((ty + ry) * w + x0 + i * cw + rx) * 4;
-                    let bg = u32::from_le_bytes([surf[o], surf[o + 1], surf[o + 2], surf[o + 3]]);
-                    put(surf, o, font::blend(bg, 0x00E8_E8F0, a));
-                }
+        let _ = crate::video::text::draw_with(&bytes[..n], true, crate::video::text::Face::Chrome, x0, ty as isize, w - x0, 0x00E8_E8F0, &mut |px, py, a| {
+            if px < 0 || py < 0 || px as usize >= w || py as usize >= h {
+                return;
             }
-        }
+            let o = (py as usize * w + px as usize) * 4;
+            let bg = u32::from_le_bytes([surf[o], surf[o + 1], surf[o + 2], surf[o + 3]]);
+            put(surf, o, font::blend(bg, 0x00E8_E8F0, a));
+        });
+        let _ = face;
+        //
+        //
+        //
         (y0, band_h, w)
     };
     crate::video::wm::damage_intersecting(0, band.0, band.2, band.1);

@@ -1611,3 +1611,92 @@ pub const SYS_CLIP_SET: u64 = 64; // merge12 fold: 63 is VEINTLS's SYS_TIME
 pub const SYS_CLIP_GET: u64 = 65;
 /// The clipboard's capacity (the kernel's `video::clipboard::CLIP_CAP`; `tests lumen` asserts they agree).
 pub const CLIP_CAP: usize = 4096;
+// =================================================================================================
+// HOLOCRON2 (rmbp-ledger B355) — what the metal's secrets handler (APPS/HOLOCRON.ELF) needs from the kernel.
+// Design: docs/dev/evidence/rmbp-1005/HOLOCRON2.md. Appended at the file tail so no existing line moves.
+//
+// SYS_KDF: Argon2id (RFC 9106, v0x13) computed by the kernel through `holocron_core::cc::CryptoCore` (the
+// ONE implementation: CRYPTOCORE's), because the ring key's floor (19 MiB) and default (64 MiB) do not fit
+// the 4 MiB ring-3 ELF window. Request, little-endian:
+//     [m_kib u32][t u32][p u32][pw_len u16][salt_len u16][password][salt]
+// Output: exactly KDF_OUT_LEN bytes at `out`. `-EINVAL` parameters outside [floor, KDF_*_MAX] or lengths
+// outside the caps, `-ENOMEM` the kernel heap could not hold the memory blocks, `-EFAULT` a bad buffer.
+// x86_64 under the kernel feature `lumen`; elsewhere the unknown-syscall default.
+// =================================================================================================
+
+/// `SYS_KDF(req_ptr, req_len, out_ptr, out_len) -> 0 / -errno` — see the block above.
+pub const SYS_KDF: u64 = 66; // after LUMENUX's SYS_CLIP_GET (65)
+/// Request header bytes.
+pub const KDF_HDR_LEN: usize = 16;
+/// Password ceiling.
+pub const KDF_PW_MAX: usize = 1024;
+/// Salt ceiling.
+pub const KDF_SALT_MAX: usize = 64;
+/// Output bytes (the ring key).
+pub const KDF_OUT_LEN: usize = 32;
+/// Parameter floor (holocron_core `KdfParams::FLOOR`, the OWASP 2023 Argon2id floor): 19 MiB, t 2, p 1.
+pub const KDF_M_KIB_MIN: u32 = 19 * 1024;
+pub const KDF_T_MIN: u32 = 2;
+/// Parameter ceilings (RFC 9106 §4's second recommended option is 64 MiB, t 3, p 4).
+pub const KDF_M_KIB_MAX: u32 = 1 << 16;
+pub const KDF_T_MAX: u32 = 10;
+pub const KDF_P_MAX: u32 = 8;
+/// HOLOCRON2: `SYS_PATH_READ` flag — read a DIRECTORY's entry names (`\n`-joined, a directory with a trailing
+/// `/`) from `offset` of that listing; only inside the caller's own home. Without it a directory is `-EISDIR`.
+pub const PATH_R_LIST: u16 = 1 << 3;
+/// Holocron's bus verbs (holocron_core::wire, SecretGet..Status), BANDY3's registrable range.
+pub const BUS_VERB_HOLOCRON_FIRST: u8 = 144;
+pub const BUS_VERB_HOLOCRON_LAST: u8 = 151;
+const _: () = assert!(SYS_KDF == SYS_CLIP_GET + 1);
+const _: () = assert!(BUS_VERB_HOLOCRON_FIRST >= BUS_VERB_FULFIL_MIN && (BUS_VERB_HOLOCRON_LAST - BUS_VERB_HOLOCRON_FIRST) as usize + 1 == BUS_REG_MAX_PER_ROW);
+const _: () = assert!(PATH_R_LIST & (PATH_W_TRUNC | PATH_W_MKDIRS | PATH_W_UNLINK) == 0);
+
+/// Encode a `SYS_KDF` request into `out`; the length, or `None` when a length is over its cap.
+pub fn kdf_request(m_kib: u32, t: u32, p: u32, password: &[u8], salt: &[u8], out: &mut [u8]) -> Option<usize> {
+    if password.len() > KDF_PW_MAX || salt.len() > KDF_SALT_MAX {
+        return None;
+    }
+    let n = KDF_HDR_LEN + password.len() + salt.len();
+    let o = out.get_mut(..n)?;
+    o[0..4].copy_from_slice(&m_kib.to_le_bytes());
+    o[4..8].copy_from_slice(&t.to_le_bytes());
+    o[8..12].copy_from_slice(&p.to_le_bytes());
+    o[12..14].copy_from_slice(&(password.len() as u16).to_le_bytes());
+    o[14..16].copy_from_slice(&(salt.len() as u16).to_le_bytes());
+    o[16..16 + password.len()].copy_from_slice(password);
+    o[16 + password.len()..n].copy_from_slice(salt);
+    Some(n)
+}
+
+/// Decode a `SYS_KDF` request: `(m_kib, t, p, password, salt)`; `None` when malformed or out of range.
+pub fn kdf_parse(b: &[u8]) -> Option<(u32, u32, u32, &[u8], &[u8])> {
+    let h = b.get(..KDF_HDR_LEN)?;
+    let u = |o: usize| u32::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
+    let (m, t, p) = (u(0), u(4), u(8));
+    let pl = u16::from_le_bytes([h[12], h[13]]) as usize;
+    let sl = u16::from_le_bytes([h[14], h[15]]) as usize;
+    if b.len() != KDF_HDR_LEN + pl + sl || pl > KDF_PW_MAX || sl > KDF_SALT_MAX || sl < 8 {
+        return None;
+    }
+    if !(KDF_M_KIB_MIN..=KDF_M_KIB_MAX).contains(&m) || !(KDF_T_MIN..=KDF_T_MAX).contains(&t) || !(1..=KDF_P_MAX).contains(&p) || m < 8 * p {
+        return None;
+    }
+    Some((m, t, p, &b[KDF_HDR_LEN..KDF_HDR_LEN + pl], &b[KDF_HDR_LEN + pl..]))
+}
+
+#[cfg(test)]
+mod holocron2_tests {
+    extern crate std;
+    use super::*;
+    #[test]
+    fn kdf_request_roundtrip_and_bounds() {
+        let mut b = [0u8; 128];
+        let n = kdf_request(1 << 16, 3, 4, b"pw", &[7u8; 16], &mut b).unwrap();
+        assert_eq!(kdf_parse(&b[..n]), Some((1 << 16, 3, 4, &b"pw"[..], &[7u8; 16][..])));
+        let n = kdf_request(1024, 3, 1, b"pw", &[7u8; 16], &mut b).unwrap();
+        assert_eq!(kdf_parse(&b[..n]), None, "below the floor");
+        let n = kdf_request(1 << 17, 3, 1, b"pw", &[7u8; 16], &mut b).unwrap();
+        assert_eq!(kdf_parse(&b[..n]), None, "over the ceiling");
+        std::println!(":: HOLOCRON2-ABI: kdf={} path_r_list={} verbs={}..={} -> PASS ::", SYS_KDF, PATH_R_LIST, BUS_VERB_HOLOCRON_FIRST, BUS_VERB_HOLOCRON_LAST);
+    }
+}

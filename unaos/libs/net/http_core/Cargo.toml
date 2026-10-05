@@ -1,0 +1,38 @@
+[package]
+name = "http_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "UnaOS's own HTTP client core — WHATWG URL, HTTP/1.1 (RFC 9112), cookies (RFC 6265), content codings, HTTP/2 + HPACK — no_std + alloc, no third-party crates."
+
+# HTTPCORE (LEDGER SR51, R83). `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`. Written from the WHATWG URL
+# Standard, RFC 9110/9112 (HTTP semantics and HTTP/1.1), RFC 6265 (cookies), RFC 7578 (multipart), RFC 9113 +
+# RFC 7541 (HTTP/2, HPACK). Proof: WPT urltestdata.json, the http-state cookie suite, RFC/HPACK vectors, a local
+# Python TLS 1.3 server end to end, and a Chromium (Playwright) byte-equality oracle — see
+# docs/dev/evidence/net-1005/HTTPCORE.md.
+#
+# Dependencies: UnaOS crates only. `pixel_core` (its inflater: gzip/deflate content codings). Feature `host`
+# (std): `tls_core` + `crypto_core` through tls_core's `cryptocore-std` (the PRODUCT provider) — the host
+# transport gneiss_pal::api::http drives. Dev-dependencies: none (the tests carry a tiny JSON reader and shell
+# out to curl for the vectors listed in vectors.txt).
+
+[features]
+default = []
+host = ["dep:tls_core"]
+h2 = []
+
+[dependencies]
+pixel_core = { path = "../../media/pixel_core" }
+tls_core = { path = "../../sys/tls_core", optional = true, features = ["cryptocore-std"] }
+
+[[test]]
+name = "host_e2e"
+required-features = ["host"]
+
+[[test]]
+name = "h2_kats"
+required-features = ["h2"]
+
+[[test]]
+name = "h2_e2e"
+required-features = ["h2", "host"]

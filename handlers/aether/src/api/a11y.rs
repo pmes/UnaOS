@@ -1,4 +1,4 @@
-use kuchiki::{NodeRef, NodeData};
+use crate::dom::{NodeRef, NodeData};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

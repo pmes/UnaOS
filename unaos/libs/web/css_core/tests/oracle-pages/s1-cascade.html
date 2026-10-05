@@ -1,0 +1,50 @@
+<!-- CSSCORE stress: cascade layers, !important, inline style, specificity, order, nesting, @supports, MQ4 ranges -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>cascade</title>
+<style>
+@layer base, theme;
+@layer theme { .l1 { color: rgb(0, 128, 0); } .l3 { color: blue !important; } }
+@layer base { .l1 { color: red; } .l2 { color: orange; } .l3 { color: purple !important; } #l4 { color: teal; } }
+.l2 { color: rgb(10, 20, 30); }
+.l3 { color: black; }
+@layer base { .l4b { background-color: yellow !important; } }
+.l4b { background-color: pink !important; }
+p.spec { color: maroon; } .spec { color: navy; } p#s1 { color: olive; }
+:where(#w1) { color: red; } .w { color: green; }
+:is(#i1, .x) span { color: fuchsia; } div span.y { color: gray; }
+.order { color: red; } .order { color: lime; }
+.inline-imp { color: silver !important; }
+.card { color: darkred; & .t { color: darkblue; } &:hover { color: red; } > .u { background-color: wheat; } .v & { color: coral; } }
+.card { @media (min-width: 600px) { padding-top: 7px; } }
+@supports (display: grid) { .sup { color: indigo; } }
+@supports not (display: grid) { .sup { color: red; } }
+@supports selector(:has(a)) { .sup2 { background-color: khaki; } }
+@media (width >= 600px) { .mq1 { color: green; } }
+@media (width < 600px) { .mq1 { color: red; } }
+@media (400px <= width <= 1000px) { .mq2 { font-size: 20px; } }
+@media screen and (orientation: landscape) { .mq3 { font-style: italic; } }
+@media screen and (orientation: portrait) { .mq3 { font-weight: 700; } }
+@media not print { .mq4 { text-decoration: underline; } }
+@media (prefers-color-scheme: dark), (max-width: 100px) { .mq5 { color: red; } }
+@media (min-aspect-ratio: 4/3) { .mq6 { white-space: pre; } }
+@media (hover: hover) and (pointer: fine) { .mq7 { visibility: hidden; } }
+@media (unknown-feature: 1) { .mq8 { color: red; } }
+@media (min-resolution: 2dppx) { .mq8 { color: red; } }
+@media only screen and (max-width: 50em) { .mq9 { color: olive; } }
+</style></head><body>
+<p class="l1">layer theme beats base</p>
+<p class="l2">unlayered beats layers</p>
+<p class="l3">important: earlier layer wins</p>
+<p id="l4" class="l4b">important layered beats important unlayered</p>
+<p class="spec" id="s1">id wins</p><p class="spec">type+class</p>
+<p id="w1" class="w">where is zero</p>
+<div id="i1"><span class="y">is takes max</span></div>
+<p class="order">later wins</p>
+<p style="color: red; background-color: lavender" class="inline-imp">important rule beats inline</p>
+<p style="color: rgb(1, 2, 3) !important" class="inline-imp">inline important beats rule important</p>
+<div class="card"><span class="t">nested</span><span class="u">child</span></div>
+<section class="v"><div class="card">reverse nesting</div></section>
+<p class="sup">supports</p><p class="sup2">supports selector</p>
+<p class="mq1">mq1</p><p class="mq2">mq2</p><p class="mq3">mq3</p><p class="mq4">mq4</p><p class="mq5">mq5</p>
+<p class="mq6">mq6</p><p class="mq7">mq7</p><p class="mq8">mq8</p><p class="mq9">mq9</p>
+</body></html>

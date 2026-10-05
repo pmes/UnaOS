@@ -1,0 +1,21 @@
+# AUDIOCODEC (SR30) AAC KATs: <stream> <reference> <offset> <frames> <mode>
+# reference: <name>.ref.flac (faad2 2.11.4's 16-bit decode of the ADTS stream <name>.aac, oracle/gen-aac.sh)
+# mode snr: SNR >= 60 dB against the reference. mode pns: the stream uses perceptual noise substitution,
+# whose noise is random by design (ISO/IEC 14496-3 4.6.13: any generator), so it is held to the
+# reference's spectrum instead (third-octave band levels per frame, tests/aac_kat.rs).
+a01.aac a01 0 35840 snr
+a02.aac a02 0 35840 snr
+a03.aac a03 0 38912 snr
+a04.aac a04 0 19456 pns
+a05.aac a05 0 10240 snr
+a06.aac a06 0 40960 snr
+a07.aac a07 0 18432 pns
+a08.aac a08 0 26624 snr
+a09.aac a09 0 14336 snr
+a10.aac a10 0 24576 snr
+a11.aac a11 0 11264 snr
+a12.aac a12 0 34816 pns
+m01.m4a a01 2048 30000 snr
+m07.m4a a07 0 18432 pns
+m10.m4a a10 1024 20000 snr
+m04.m4a a04 0 19456 pns

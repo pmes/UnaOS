@@ -1,55 +1,60 @@
 use anyhow::{Context, Result};
-use reqwest::Client;
-use reqwest::cookie::{CookieStore, Jar};
-use std::sync::Arc;
+use gneiss_pal::api::http::{self, Client, CookieJar};
+use std::sync::{Arc, Mutex};
+
+// HTTPCORE (SR51): every Aether fetch goes through gneiss_pal::api::http — UnaOS's own http_core (WHATWG URL,
+// HTTP/1.1, RFC 6265 jar, gzip/deflate) over tls_core (TLS 1.3, verified). reqwest and its cookie_store are gone.
 
 /// Process-wide, in-memory cookie jar (session-scoped: nothing is written
 /// to disk, so quitting Aether logs you out). Shared by every client we
 /// build, so a Set-Cookie collected on one navigation is sent on the next
 /// and on subresource/script fetches to the same host.
-pub fn cookie_jar() -> Arc<Jar> {
-    static JAR: std::sync::OnceLock<Arc<Jar>> = std::sync::OnceLock::new();
-    JAR.get_or_init(|| Arc::new(Jar::default())).clone()
+pub fn cookie_jar() -> Arc<Mutex<CookieJar>> {
+    static JAR: std::sync::OnceLock<Arc<Mutex<CookieJar>>> = std::sync::OnceLock::new();
+    JAR.get_or_init(|| Arc::new(Mutex::new(CookieJar::new()))).clone()
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// Cookies the jar would send to `url`, formatted as a `Cookie:` header
 /// value (`"a=b; c=d"`), or `""` when the jar has none for that host.
-/// Read API for `document.cookie` (JS lane wires it up).
+/// Read API for `document.cookie`: a non-HTTP API, so HttpOnly cookies are
+/// not visible (RFC 6265 §5.4 step 1).
 pub fn cookies_for(url: &str) -> String {
-    let Ok(parsed) = url::Url::parse(url) else { return String::new() };
-    cookie_jar()
-        .cookies(&parsed)
-        .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
-        .unwrap_or_default()
+    let Ok(parsed) = http::Url::parse(url) else { return String::new() };
+    cookie_jar().lock().ok().and_then(|mut j| j.cookie_header(&parsed, now_secs(), false)).unwrap_or_default()
 }
 
 /// Write API for `document.cookie`: adds one `"name=value; attrs"` string to
-/// the shared jar, scoped to `url`. Malformed urls are dropped silently, as
-/// a browser drops a cookie it cannot scope.
+/// the shared jar, scoped to `url` (non-HTTP: an HttpOnly cookie is refused,
+/// RFC 6265 §5.3 step 10). Malformed urls are dropped silently, as a browser
+/// drops a cookie it cannot scope.
 pub fn set_cookie(url: &str, cookie_str: &str) {
-    if let Ok(parsed) = url::Url::parse(url) {
-        cookie_jar().add_cookie_str(cookie_str, &parsed);
+    if let Ok(parsed) = http::Url::parse(url) {
+        if let Ok(mut j) = cookie_jar().lock() {
+            j.set_cookie(&parsed, cookie_str, now_secs(), false);
+        }
     }
 }
 
 /// Blocking client builder for the sync JS paths (`fetch`/XHR run on their
 /// own thread, off the tokio runtime). Pre-wired to the shared jar so those
 /// requests carry — and record — the same cookies as the page load.
-pub fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
-    reqwest::blocking::Client::builder()
-        .user_agent("UnaOS Aether/0.1.0")
-        .cookie_provider(cookie_jar())
+pub fn blocking_client_builder() -> http::blocking::ClientBuilder {
+    http::blocking::ClientBuilder::new().user_agent("UnaOS Aether/0.1.0").cookie_jar(cookie_jar())
 }
 
-/// One shared HTTP client: connection pooling + TLS session reuse across
-/// every fetch of a page load (a per-fetch Client paid a fresh handshake
+/// One shared HTTP client: connection pooling (keep-alive connection threads)
+/// across every fetch of a page load (a per-fetch Client paid a fresh handshake
 /// for each of yahoo's dozens of resources).
 fn client() -> &'static Client {
     static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         Client::builder()
             .user_agent("UnaOS Aether/0.1.0")
-            .cookie_provider(cookie_jar())
+            .cookie_jar(cookie_jar())
             .build()
             .expect("http client")
     })
@@ -93,7 +98,7 @@ pub async fn fetch_document(input: &str) -> Result<String> {
                     anyhow::bail!("Response body exceeds size limit");
                 }
                 
-                let text = String::from_utf8(bytes.to_vec()).context("Invalid UTF-8")?;
+                let text = String::from_utf8(bytes).context("Invalid UTF-8")?;
                 return Ok(text);
             }
             Err(e) => {
@@ -120,7 +125,7 @@ pub async fn post_document(url: &str, body: &str) -> Result<String> {
     if bytes.len() > 10 * 1024 * 1024 {
         anyhow::bail!("Response body exceeds size limit");
     }
-    String::from_utf8(bytes.to_vec()).context("Invalid UTF-8")
+    String::from_utf8(bytes).context("Invalid UTF-8")
 }
 
 /// Collects absolute URLs of `<link rel="stylesheet">` sheets in `html`,
@@ -289,15 +294,13 @@ pub fn favicon_url(base_url: &str, html: &str) -> Option<String> {
 /// (`None`): a missing `/favicon.ico` is the overwhelmingly common case, not an
 /// error worth a ledger line.
 ///
-/// ICO is handled by the `image` crate's ico decoder (it picks the largest
-/// contained image); PNG/JPEG/GIF/WebP/BMP go through the same decoder, and an
-/// SVG icon falls back to the rasterizer the page images use.
+/// PNG/JPEG/GIF/BMP/QOI/WebP (lossless and lossy) go through
+/// `images::decode_raster` (UnaOS's own pixel_core + vp8_core); ICO falls back to
+/// the `image` crate behind it (it picks the largest contained image), and an SVG
+/// icon falls back to the rasterizer the page images use.
 pub async fn fetch_favicon(url: &str) -> Option<(u32, u32, Vec<u8>)> {
     let bytes = fetch_image_bytes(url).await.ok()?;
-    let decoded = image::load_from_memory(&bytes)
-        .ok()
-        .map(|i| i.to_rgba8())
-        .or_else(|| crate::images::decode_svg(&bytes))?;
+    let decoded = crate::images::decode_raster(&bytes).or_else(|| crate::images::decode_svg(&bytes))?;
     let (w, h) = decoded.dimensions();
     if w == 0 || h == 0 {
         return None;
@@ -453,7 +456,7 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
     if bytes.len() > 10 * 1024 * 1024 {
         anyhow::bail!("Response body exceeds size limit");
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// Identifies image bytes by magic number. `None` = not an image we decode.
@@ -499,8 +502,7 @@ pub async fn fetch_image_bytes(url: &str) -> Result<Vec<u8>> {
     }
     let ctype = response
         .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
+        .get("content-type")
         .unwrap_or("")
         .split(';')
         .next()
@@ -592,10 +594,7 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     for (result, img_url, key) in img_results {
         match result {
             Ok(bytes) => {
-                let decoded = image::load_from_memory(&bytes)
-                    .ok()
-                    .map(|i| i.to_rgba8())
-                    .or_else(|| crate::images::decode_svg(&bytes));
+                let decoded = crate::images::decode_raster(&bytes).or_else(|| crate::images::decode_svg(&bytes));
                 match decoded {
                     Some(img) => {
                         if key != img_url {
@@ -659,8 +658,9 @@ mod tests {
 
     #[test]
     fn test_cookie_jar_round_trip() {
-        let url = url::Url::parse("https://cookie-test.example/page").unwrap();
-        cookie_jar().add_cookie_str("sid=abc123; Path=/", &url);
+        // As a response's Set-Cookie lands in the jar (the HTTP API side of RFC 6265).
+        let url = http::Url::parse("https://cookie-test.example/page").unwrap();
+        cookie_jar().lock().unwrap().set_cookie(&url, "sid=abc123; Path=/", now_secs(), true);
         let sent = cookies_for("https://cookie-test.example/other");
         assert!(sent.contains("sid=abc123"), "jar sent {sent:?}");
         // Host-scoped: a different host sees nothing.

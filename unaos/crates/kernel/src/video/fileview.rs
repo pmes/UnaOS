@@ -26,7 +26,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::video::{font, theme, wm};
+use crate::video::{theme, wm};
 
 /// Kernel-furniture owner slot (`+ 5`, after Facet's `+ 4`).
 pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 5;
@@ -236,7 +236,7 @@ fn open_inner(path: &str, text: Vec<u8>, spans: Vec<richtext::Span>, n_bytes: us
     let (pw, ph) = (pi.width, pi.height);
     let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
     let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
-    let face = font::Face::Body;
+    let face = super::text::Face::Body;
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let cols = w.saturating_sub(2 * PAD + 6) / cw;
     let vis = h.saturating_sub(2 * PAD) / ch;
@@ -304,7 +304,7 @@ pub fn close() {
 
 /// Repaint `st.surf` for `st.top`.
 fn paint(st: &mut State) {
-    let face = font::Face::Body;
+    let face = super::text::Face::Body;
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let _ = cw;
     let (w, h) = (st.w, st.h);
@@ -318,7 +318,7 @@ fn paint(st: &mut State) {
             continue;
         }
         let s = &st.text[a as usize..b as usize];
-        font::draw_text(&mut st.surf, w, w - 6, h, PAD, PAD + r * ch, s, theme::CONTENT_TEXT, false, face);
+        super::text::draw_text(&mut st.surf, w, w - 6, h, PAD, PAD + r * ch, s, theme::CONTENT_TEXT, false, face);
     }
     // Scroll thumb on the right edge (proportional; full height when everything fits).
     let total = st.rows.len().max(1);
@@ -489,7 +489,7 @@ fn tint_ink(t: richtext::Tint) -> u32 {
 
 /// Draw display row `a..b` of `st.text` at `y`, cut at span edges (monospace: x = column).
 fn paint_styled_row(st: &mut State, a: usize, b: usize, y: usize) {
-    let face = font::Face::Body;
+    let face = super::text::Face::Body;
     let cw = face.cell_w();
     let (w, h) = (st.w, st.h);
     let mut p = a;
@@ -501,7 +501,7 @@ fn paint_styled_row(st: &mut State, a: usize, b: usize, y: usize) {
             None => (b, theme::CONTENT_TEXT, false),
         };
         let end = end.max(p + 1);
-        font::draw_text(&mut st.surf, w, w - 6, h, PAD + (p - a) * cw, y, &st.text[p..end], ink, bold, face);
+        super::text::draw_text(&mut st.surf, w, w - 6, h, PAD + (p - a) * cw, y, &st.text[p..end], ink, bold, face);
         p = end;
     }
 }

@@ -390,25 +390,18 @@ impl LedgerEntry {
     }
 }
 
-/// The ledger chain hash: SHA-1 as produced by `gix`'s collision-detecting
-/// hasher — the same primitive (and the same detector) git uses for object
-/// ids, so the ledger needs no hash dependency the crate does not already
-/// carry for reading repositories.
+/// The ledger chain hash: SHA-1 from CRYPTOCORE — the primitive git_core names objects with, so
+/// the ledger needs no hash dependency the crate does not already carry for reading repositories.
+///
+/// CRYPTOCORE's SHA-1 has no collision DETECTOR (git's sha1dc is owed, GITCORE SR59); the
+/// [`COLLISION_MARKER`] stays the ledger's never-valid sentinel, and [`verify`] still refuses any
+/// stored hash that is not a 40-hex SHA-1 (`is_sha1_hex`).
 fn chain_hash(bytes: &[u8]) -> String {
-    let mut h = gix::hash::hasher(gix::hash::Kind::Sha1);
-    h.update(bytes);
-    match h.try_finalize() {
-        Ok(id) => id.to_hex().to_string(),
-        // The only failure mode is a detected SHA-1 collision attempt. Refusing
-        // to produce a hash at all would lose the entry; emit a loud, distinct,
-        // never-valid marker instead. The recompute check alone cannot catch it
-        // (a recompute would produce the same marker), so [`verify`] also
-        // checks the SHA-1 SHAPE of every stored hash — see `is_sha1_hex`.
-        Err(_) => COLLISION_MARKER.to_string(),
-    }
+    let d = crypto_core::sha1::sha1(bytes);
+    d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The never-valid hash emitted when the collision detector fires. It is not a
+/// The never-valid hash a collision-detecting SHA-1 would emit (kept as the ledger's sentinel). It is not a
 /// 40-hex SHA-1, which is exactly what makes [`verify`] refuse it.
 pub const COLLISION_MARKER: &str = "collision-detected-collision-detected";
 

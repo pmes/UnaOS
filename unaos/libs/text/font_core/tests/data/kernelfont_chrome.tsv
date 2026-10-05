@@ -1,0 +1,54 @@
+# KERNELFONT (B359): Chromium 1194 canvas.measureText of the login-screen strings (oracle/run_kernelfont.sh)
+# id	font	size	measure	text
+body115_40	DejaVuSansMono.ttf	11.5	34.617919921875	UnaOS
+body115_41	DejaVuSansMono.ttf	11.5	41.54150390625	Log In
+body115_42	DejaVuSansMono.ttf	11.5	27.6943359375	Name
+body115_43	DejaVuSansMono.ttf	11.5	55.388671875	Password
+body115_44	DejaVuSansMono.ttf	11.5	207.70751953125	Enter or Log In   Tab switches
+body115_45	DejaVuSansMono.ttf	11.5	332.33203125	hold Shift after login to reset display settings
+body115_46	DejaVuSansMono.ttf	11.5	221.5546875	Shift after login: reset display
+body115_47	DejaVuSansMono.ttf	11.5	27.6943359375	root
+body115_48	DejaVuSansMono.ttf	11.5	34.617919921875	peter
+body115_49	DejaVuSansMono.ttf	11.5	263.09619140625	Quarry  File  Edit  View  Window  Help
+body115_50	DejaVuSansMono.ttf	11.5	34.617919921875	12:34
+body115_51	DejaVuSansMono.ttf	11.5	173.089599609375	Settings - Display - Font
+body115_52	DejaVuSansMono.ttf	11.5	373.87353515625	The quick brown fox jumps over the lazy dog 0123456789
+chrome14_27	DejaVuSans-Bold.ttf	14	52.7666015625	UnaOS
+chrome14_28	DejaVuSans-Bold.ttf	14	48.6103515625	Log In
+chrome14_29	DejaVuSans-Bold.ttf	14	45.2470703125	Name
+chrome14_30	DejaVuSans-Bold.ttf	14	75.4755859375	Password
+chrome14_31	DejaVuSans-Bold.ttf	14	233.064453125	Enter or Log In   Tab switches
+chrome14_32	DejaVuSans-Bold.ttf	14	361.6689453125	hold Shift after login to reset display settings
+chrome14_33	DejaVuSans-Bold.ttf	14	237.5966796875	Shift after login: reset display
+chrome14_34	DejaVuSans-Bold.ttf	14	32.8330078125	root
+chrome14_35	DejaVuSans-Bold.ttf	14	42.6083984375	peter
+chrome14_36	DejaVuSans-Bold.ttf	14	299.3525390625	Quarry  File  Edit  View  Window  Help
+chrome14_37	DejaVuSans-Bold.ttf	14	44.5634765625	12:34
+chrome14_38	DejaVuSans-Bold.ttf	14	190.189453125	Settings - Display - Font
+chrome14_39	DejaVuSans-Bold.ttf	14	457.0576171875	The quick brown fox jumps over the lazy dog 0123456789
+ui135_14	DejaVuSans.ttf	13.5	45.9052734375	UnaOS
+ui135_15	DejaVuSans.ttf	13.5	40.941650390625	Log In
+ui135_16	DejaVuSans.ttf	13.5	39.82763671875	Name
+ui135_17	DejaVuSans.ttf	13.5	63.05712890625	Password
+ui135_18	DejaVuSans.ttf	13.5	198.024169921875	Enter or Log In   Tab switches
+ui135_19	DejaVuSans.ttf	13.5	304.1982421875	hold Shift after login to reset display settings
+ui135_20	DejaVuSans.ttf	13.5	199.34912109375	Shift after login: reset display
+ui135_21	DejaVuSans.ttf	13.5	27.06591796875	root
+ui135_22	DejaVuSans.ttf	13.5	36.024169921875	peter
+ui135_23	DejaVuSans.ttf	13.5	253.9951171875	Quarry  File  Edit  View  Window  Help
+ui135_24	DejaVuSans.ttf	13.5	38.90478515625	12:34
+ui135_25	DejaVuSans.ttf	13.5	161.43310546875	Settings - Display - Font
+ui135_26	DejaVuSans.ttf	13.5	393.8203125	The quick brown fox jumps over the lazy dog 0123456789
+ui13_01	DejaVuSans.ttf	13	44.205078125	UnaOS
+ui13_02	DejaVuSans.ttf	13	39.42529296875	Log In
+ui13_03	DejaVuSans.ttf	13	38.3525390625	Name
+ui13_04	DejaVuSans.ttf	13	60.7216796875	Password
+ui13_05	DejaVuSans.ttf	13	190.68994140625	Enter or Log In   Tab switches
+ui13_06	DejaVuSans.ttf	13	292.931640625	hold Shift after login to reset display settings
+ui13_07	DejaVuSans.ttf	13	191.9658203125	Shift after login: reset display
+ui13_08	DejaVuSans.ttf	13	26.0634765625	root
+ui13_09	DejaVuSans.ttf	13	34.68994140625	peter
+ui13_10	DejaVuSans.ttf	13	244.587890625	Quarry  File  Edit  View  Window  Help
+ui13_11	DejaVuSans.ttf	13	37.4638671875	12:34
+ui13_12	DejaVuSans.ttf	13	155.4541015625	Settings - Display - Font
+ui13_13	DejaVuSans.ttf	13	379.234375	The quick brown fox jumps over the lazy dog 0123456789

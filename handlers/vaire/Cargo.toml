@@ -19,13 +19,11 @@ bandy = { path = "../../libs/bandy" }
 # reads; serde + toml deserialize it (both already in the workspace lock).
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
-# git2 removed in favor of pure-Rust gix.
-# `status` powers the real is_dirty check (index-vs-worktree, tree-vs-index).
-# `sha1` is in gix's DEFAULT feature set; opting out of defaults without
-# re-adding it leaves `gix_hash::Kind` variant-less and the dependency tree does
-# not compile (gix-hash gates `Kind::Sha1` on it). Git object ids are SHA-1, so
-# this is not optional for us.
-gix = { version = "0.85", default-features = false, features = ["parallel", "revision", "blob-diff", "status", "sha1"] }
+# GITCORE (SR59): repositories are read through UnaOS's own git implementation (git2 → gix → git_core).
+# `std` gives the on-disk Repository (discover, HEAD, status/is_dirty, rev-parse, tree diff).
+git_core = { path = "../../unaos/libs/vcs/git_core", features = ["std"] }
+# The ledger chain hash is SHA-1 from CRYPTOCORE (the same primitive git_core names objects with).
+crypto_core = { path = "../../unaos/libs/sys/crypto_core" }
 # The vault-probe rides UnaFS's fail-closed mount check (read-only, host-native).
 unafs = { path = "../../unaos/libs/fs/unafs" }
 gtk4 = { version = "0.11.4", features = ["v4_12"], optional = true }

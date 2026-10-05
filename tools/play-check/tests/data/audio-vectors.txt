@@ -1,0 +1,26 @@
+# AUDIOTRACK (SR45) audio oracle vectors for tests/audio_oracle.rs — fetched at test time into
+# target/audio-vectors (never committed; offline = SKIPPED loudly).
+# Fields: name sha256 floor flags url
+#   floor: what the device played vs the reference — exact | snr:<dB> | lsb:<n> (play-check --audio-floor)
+#   flags: chromium (reference = Chromium decodeAudioData) | core (reference = audio_core's file decode:
+#          this Chromium has no AAC) ; +max (ours may be shorter: Chromium skips the Ogg Vorbis end trim)
+#          ; +av (also the video pts vs Chromium mediaTime oracle, with audio as the master clock)
+# Floors are AUDIOCODEC's: Opus 50 dB (fixed-point reference vs Chromium's float libopus), Vorbis 130 dB,
+# MP3 within 2 LSB (or >= 60 dB), FLAC and the AAC packet path exact.
+bear-opus.webm 5742d1c367bd9ecc9e022a916597fc8f5c06495d0676d807b63c70eea0136457 snr:50 chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-opus.webm
+bear-opus.mp4 0785dee6629c9db681867f172f6ab46bd4156d070b4f71b5b52a0969997fa55a snr:50 chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-opus.mp4
+opus-trimming-test.webm 058eb6cadf0ecbc000713b964a96026cbe48e1eb070668eaa34098d75168c7fe snr:50 chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/opus-trimming-test.webm
+opus-trimming-test.mp4 5f43c53687b21917f6179d22e2782fc0dde4cbbc1f23d40d1837a3c5eca2fdfa snr:50 chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/opus-trimming-test.mp4
+bear-vp9-opus.webm c7fd18fbb644ca6f49c56cf386e679c0290e79cd50234ddfed9945f71bf07deb snr:50 chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-vp9-opus.webm
+sfx-opus.ogg 97020fece49ef9176f4e0ad83ef8cda0a0415691080d2c41859ba2673c2f1834 snr:50 chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx-opus.ogg
+bear.webm 7148402273737217b6906704ac430fcfd77268e9f0dbfe19d5f334a496a58d69 snr:130 chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear.webm
+bear-320x240.webm 834dbadab368d6dbdeaf973d8f2398a36d6fe584965781877ee46ffcc570ed59 snr:130 chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-320x240.webm
+sfx.ogg d38a6edbd595aafa08cef3f1749acdeafb4f471cb4fc4b37679292936ca6d89c snr:130 chromium+max https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.ogg
+sfx.mp3 46364ebce1b9b2f278b35a7dc05b10427a33c073cf085cfa1a4ab33f3d307565 lsb:2 chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.mp3
+sfx.flac 5f4d585500284beee09124fcc3fa2a45d5931f0241d089a817ae3940bbc90ad0 exact chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.flac
+sfx-flac.mp4 ac56b74a5a131fa3782d40fac20b2becf37757401b354e9a0e23703087aac9de exact chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx-flac.mp4
+bear-flac.mp4 358d7b65ec0157b59ee5f2f8f923da255c2d906d83cfb1cb7448ac804d4b5b7e exact chromium https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-flac.mp4
+sfx.m4a 55d22abaade1ba04cc7a5063c4d5ef008be82965b1a1ef6675c3bce6d30acb77 exact core https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.m4a
+bear-mpeg2-aac-only_frag.mp4 e5e7eea1a1e022d617be5110cfa2320a4c1c1ef334537b6e2cf857d408e84cb1 exact core https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-mpeg2-aac-only_frag.mp4
+test-1s.webm 220c6fc2feb9f4538bd62273855bc4aaf444da76a295cf937a131b9e7399110c snr:50 chromium+av https://raw.githubusercontent.com/web-platform-tests/wpt/master/media/test-1s.webm
+test-av-384k-44100Hz-1ch-320x240-30fps-10kfr.webm 032d3fd8d1a0301820f5531d58477f9d54c42e2c43d4738fef97035b43ca5df0 snr:130 chromium+av https://raw.githubusercontent.com/web-platform-tests/wpt/master/media/test-av-384k-44100Hz-1ch-320x240-30fps-10kfr.webm

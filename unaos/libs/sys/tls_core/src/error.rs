@@ -26,6 +26,8 @@ pub enum AlertDescription {
     InternalError = 80,
     InappropriateFallback = 86,
     UserCanceled = 90,
+    /// TLS 1.2 (RFC 5246 §7.2.2): our warning answer to a HelloRequest.
+    NoRenegotiation = 100,
     MissingExtension = 109,
     UnsupportedExtension = 110,
     UnrecognizedName = 112,
@@ -59,6 +61,7 @@ impl AlertDescription {
             80 => InternalError,
             86 => InappropriateFallback,
             90 => UserCanceled,
+            100 => NoRenegotiation,
             109 => MissingExtension,
             110 => UnsupportedExtension,
             112 => UnrecognizedName,
@@ -103,6 +106,10 @@ pub enum CertError {
     PathTooLong,
     /// The verifier was configured to reject everything (e.g. empty trust store).
     NoTrustAnchors,
+    /// A verified stapled OCSP response says the leaf is revoked (RFC 6960).
+    Revoked,
+    /// A stapled OCSP response that does not verify for this leaf (the reason names the check).
+    BadOcspResponse(&'static str),
 }
 
 /// Every failure tls_core can report.
@@ -149,6 +156,8 @@ impl TlsError {
                 CertError::UnsupportedSignatureAlgorithm => AlertDescription::UnsupportedCertificate,
                 CertError::BadDer(_) => AlertDescription::BadCertificate,
                 CertError::NoCertificate => AlertDescription::DecodeError,
+                CertError::Revoked => AlertDescription::CertificateRevoked,
+                CertError::BadOcspResponse(_) => AlertDescription::BadCertificateStatusResponse,
                 _ => AlertDescription::BadCertificate,
             },
             TlsError::BadRecordMac => AlertDescription::BadRecordMac,
