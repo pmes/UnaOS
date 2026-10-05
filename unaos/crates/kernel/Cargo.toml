@@ -3818,7 +3818,7 @@ smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-e
 # UNAFSX86: the same no_std UnaFS core, OPTIONAL on x86 — pulled only by the `unafs` feature (UNAOS_UNAFS=1).
 unafs = { path = "../../libs/fs/unafs", default-features = false, optional = true }
 x86_64 = "0.15.5"
-uart_16550 = "0.6.0"
+uart_16550 = "0.8.1"
 # SOCK-1: mature TCP/IP stack (0BSD, #![no_std], heap-optional). x86-only + optional so aarch64 and
 # knob-off x86 builds never compile it. default-features off; only the three features SOCK-1 uses:
 #   medium-ethernet — the e1000e is an Ethernet L2 device (built-in ARP neighbor discovery)
