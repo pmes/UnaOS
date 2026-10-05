@@ -2308,4 +2308,74 @@ mod tests {
             .collect();
         assert_eq!(keys.len(), 12);
     }
+
+    /// Absolute (page) rect of the first element with `id`, after a cascade.
+    fn rect_by_id(tree: &layout::LayoutTree, want: &str) -> Option<(f32, f32, f32, f32)> {
+        fn walk(t: &layout::LayoutTree, n: taffy::NodeId, x: f32, y: f32, want: &str) -> Option<(f32, f32, f32, f32)> {
+            let l = t.taffy.layout(n).ok()?;
+            let (ax, ay) = (x + l.location.x, y + l.location.y);
+            if let Some(el) = t.node_map.get(&n).and_then(|d| d.as_element()) {
+                if el.attributes.borrow().get("id") == Some(want) {
+                    return Some((ax, ay, l.size.width, l.size.height));
+                }
+            }
+            for k in t.taffy.children(n).unwrap_or_default() {
+                if let Some(r) = walk(t, k, ax, ay, want) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        walk(tree, tree.root_node, 0.0, 0.0, want)
+    }
+
+    fn laid_out(html: &str, css: &str) -> layout::LayoutTree {
+        let mut tree = layout::compute_layout(&dom::parse_html(html));
+        css::apply_css(&mut tree, css);
+        tree
+    }
+
+    /// CSS 2.2 §8.3.1 known answers: adjoining sibling margins collapse to
+    /// the larger; a negative joins as max-positive + min-negative; a first
+    /// child's top margin escapes a parent with no border/padding (and the
+    /// body), but not one with padding; an empty block collapses through.
+    #[test]
+    fn test_margin_collapsing_kat() {
+        let css = "body{margin:0} div{height:10px}";
+        // Siblings: 16 and 24 collapse to 24 (not 40).
+        let t = laid_out(r#"<html><body><div id=a style="margin-bottom:16px"></div><div id=b style="margin-top:24px"></div></body></html>"#, css);
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(b.1 - (a.1 + a.3), 24.0, "sibling margins collapse to the max");
+        // Positive and negative: 20 + (-8) = 12.
+        let t = laid_out(r#"<html><body><div id=a style="margin-bottom:20px"></div><div id=b style="margin-top:-8px"></div></body></html>"#, css);
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(b.1 - (a.1 + a.3), 12.0, "max positive + min negative");
+        // Parent/first child: the child's 30px escapes the wrapper (and body).
+        let t = laid_out(r#"<html><body><section id=w style="display:block"><p id=c style="margin:30px 0;height:10px"></p></section></body></html>"#, "body{margin:0}");
+        let (w, c) = (rect_by_id(&t, "w").unwrap(), rect_by_id(&t, "c").unwrap());
+        assert_eq!(c.1, 30.0, "first child's margin collapses through");
+        assert_eq!(w.1, 30.0, "the wrapper starts where the collapsed margin ends");
+        // Padding separates: the child's margin stays inside.
+        let t = laid_out(r#"<html><body><section id=w style="padding-top:1px"><p id=c style="margin:30px 0;height:10px"></p></section></body></html>"#, "body{margin:0}");
+        let (w, c) = (rect_by_id(&t, "w").unwrap(), rect_by_id(&t, "c").unwrap());
+        assert_eq!(w.1, 0.0);
+        assert_eq!(c.1, 31.0, "padding blocks the collapse");
+        // Empty block between siblings: 10, (12/14 empty), 8 → one 14 gap.
+        let t = laid_out(r#"<html><body><div id=a style="margin-bottom:10px"></div><section style="margin:12px 0 14px"></section><div id=b style="margin-top:8px"></div></body></html>"#, css);
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(b.1 - (a.1 + a.3), 14.0, "an empty block collapses through");
+        // The specified margins survive the layout run (restore).
+        let id = t.node_map.iter().find(|(_, n)| n.as_element().is_some_and(|e| e.attributes.borrow().get("id") == Some("b"))).map(|(i, _)| *i).unwrap();
+        assert_eq!(t.taffy.style(id).unwrap().margin.top, taffy::style::LengthPercentageAuto::length(8.0));
+    }
+
+    /// html.css UA margins: h1 0.67em of 32px, p 1em, a margin longhand
+    /// replaces only its own side.
+    #[test]
+    fn test_ua_margins_and_longhands() {
+        let t = laid_out(r#"<html><body><div id=top style="height:1px"></div><h1 id=h>T</h1><p id=p>x</p></body></html>"#, "body{margin:0} h1{margin-bottom:4px}");
+        let (top, h, p) = (rect_by_id(&t, "top").unwrap(), rect_by_id(&t, "h").unwrap(), rect_by_id(&t, "p").unwrap());
+        assert!((h.1 - (top.1 + top.3) - 21.44).abs() <= 1.0, "h1 keeps its UA top margin: {:?}", h);
+        assert!((p.1 - (h.1 + h.3) - 16.0).abs() <= 1.0, "max(4, 16) between h1 and p: {:?} {:?}", h, p);
+    }
 }

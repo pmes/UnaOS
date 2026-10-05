@@ -681,8 +681,12 @@ pub fn render_frame(
 
             if let Some(el) = dom_node.as_element() {
                 let tag = el.name.local.as_ref();
-                inherited.font_size =
-                    spec.font_size.unwrap_or_else(|| default_font_size(tag, inherited.font_size));
+                let own_family = spec
+                    .family
+                    .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
+                inherited.font_size = spec.font_size.unwrap_or_else(|| {
+                    crate::layout::ua_font_size(tag, inherited.font_size, inherited.family, own_family)
+                });
                 inherited.bold = spec.bold.unwrap_or_else(|| crate::layout::default_bold(tag, inherited.bold));
                 inherited.italic =
                     spec.italic.unwrap_or_else(|| crate::layout::default_italic(tag, inherited.italic));

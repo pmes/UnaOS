@@ -2,6 +2,8 @@ use kuchiki::NodeRef;
 use taffy::prelude::*;
 use std::collections::HashMap;
 
+mod collapse;
+
 /// Specified paint properties for one box. `None` = not specified here;
 /// color and font-size inherit down the tree at render time.
 #[derive(Debug, Clone, Default)]
@@ -56,6 +58,10 @@ pub struct PaintStyle {
     /// remeasure walks it down the box tree and turns it into the flex
     /// alignment of each descendant's own formatting context.
     pub text_align: Option<u8>,
+    /// `display: flex` (true) versus a block-ish display (false). A real
+    /// flex container's children are flex items: each establishes its own
+    /// formatting context, so no margin collapses through them.
+    pub flex_container: Option<bool>,
 }
 
 pub struct LayoutTree {
@@ -457,31 +463,24 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
                 _ => Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::auto() },
             },
             margin: {
-                // UA default spacing: block gaps for paragraphs/headings,
-                // list indentation, nothing for inline content.
-                let (v, left) = if inline {
-                    (0.0, 0.0)
-                } else {
-                    match tag.as_str() {
-                        "p" | "blockquote" | "pre" => (8.0, 2.0),
-                        "h1" | "h2" => (12.0, 2.0),
-                        "h3" | "h4" | "h5" | "h6" => (10.0, 2.0),
-                        "ul" | "ol" => (8.0, 24.0),
-                        "li" => (0.0, 4.0),
-                        "body" => (8.0, 8.0),
-                        // Generic blocks have NO UA margin in CSS. The old
-                        // 2px-all-round default accumulated once per nesting
-                        // level: a 12-deep shell gained ~24px of indent and
-                        // ~48px of vertical air before any content.
-                        _ => (0.0, 0.0),
-                    }
-                };
+                let [t, r, b, l] = if inline { [0.0; 4] } else { ua_margin(&tag, nested_list(dom_node)) };
                 Rect {
-                    left: LengthPercentage::length(left).into(),
-                    right: LengthPercentage::length(2.0_f32.min(left)).into(),
-                    top: LengthPercentage::length(v).into(),
-                    bottom: LengthPercentage::length(v).into(),
+                    top: LengthPercentageAuto::length(t),
+                    right: LengthPercentageAuto::length(r),
+                    bottom: LengthPercentageAuto::length(b),
+                    left: LengthPercentageAuto::length(l),
                 }
+            },
+            padding: Rect {
+                left: LengthPercentage::length(if !inline && matches!(tag.as_str(), "ul" | "ol" | "menu" | "dir") { 40.0 } else { 0.0 }),
+                right: LengthPercentage::length(0.0),
+                top: LengthPercentage::length(0.0),
+                bottom: LengthPercentage::length(0.0),
+            },
+            border: if tag == "hr" {
+                Rect { left: LengthPercentage::length(1.0), right: LengthPercentage::length(1.0), top: LengthPercentage::length(1.0), bottom: LengthPercentage::length(1.0) }
+            } else {
+                Rect::zero()
             },
             ..Default::default()
         };
@@ -496,6 +495,12 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
 
         // Inline style="..." — paint properties plus width/height.
         let mut paint = PaintStyle::default();
+        if tag == "hr" {
+            // html.css: `hr { color: gray; border-style: inset; border-width: 1px }`
+            // — an inset stroke paints its top/left darker than its bottom/right.
+            let (dark, light) = ((154, 154, 154), (238, 238, 238));
+            paint.border = Some([Some((1.0, dark)), Some((1.0, light)), Some((1.0, light)), Some((1.0, dark))]);
+        }
         if let Some(el) = dom_node.as_element() {
             // UA / presentational alignment defaults, applied BEFORE the
             // author cascade so any real rule wins: <center> and <th> centre
@@ -548,6 +553,45 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
     }
 }
 
+/// True when a list sits inside another list: the UA sheet drops the
+/// block margins of nested lists (`ul ul, ol ul, ... { margin-block: 0 }`).
+fn nested_list(node: &NodeRef) -> bool {
+    let is_list = |n: &NodeRef| {
+        n.as_element()
+            .is_some_and(|e| matches!(e.name.local.as_ref(), "ul" | "ol" | "menu" | "dir" | "dl"))
+    };
+    is_list(node) && node.ancestors().any(|a| is_list(&a) && a.as_element().is_some_and(|e| e.name.local.as_ref() != "dl"))
+}
+
+/// UA default margins [top, right, bottom, left] in px — Chromium's html.css
+/// (the WHATWG rendering section, §15.3.3 / §15.3.6 / §15.3.8): `em` values
+/// resolve against the element's own UA font size.
+fn ua_margin(tag: &str, nested_list: bool) -> [f32; 4] {
+    let em = match tag {
+        "pre" | "listing" | "xmp" | "plaintext" => 13.0, // monospace default size
+        _ => default_font_size(tag, 16.0),
+    };
+    let v = |k: f32| [k * em, 0.0, k * em, 0.0];
+    match tag {
+        "body" => [8.0; 4],
+        "p" | "dl" | "pre" | "listing" | "xmp" | "plaintext" => v(1.0),
+        "ul" | "ol" | "menu" | "dir" => if nested_list { [0.0; 4] } else { v(1.0) },
+        "blockquote" | "figure" => [em, 40.0, em, 40.0],
+        "dd" => [0.0, 0.0, 0.0, 40.0],
+        "h1" => v(0.67),
+        "h2" => v(0.83),
+        "h3" => v(1.0),
+        "h4" => v(1.33),
+        "h5" => v(1.67),
+        "h6" => v(2.33),
+        "hr" => v(0.5),
+        "fieldset" => [0.0, 2.0, 0.0, 2.0],
+        // Generic blocks have NO UA margin in CSS. (An old 2px-all-round
+        // default accumulated once per nesting level.)
+        _ => [0.0; 4],
+    }
+}
+
 /// UA default font FAMILY per element: code-ish tags are monospace.
 pub fn default_family(tag: &str, inherited: u8) -> u8 {
     match tag {
@@ -590,14 +634,29 @@ pub fn default_italic(tag: &str, inherited: bool) -> bool {
     inherited || matches!(tag, "i" | "em" | "cite" | "var" | "dfn" | "address")
 }
 
+/// The used font size of an element with no author `font-size`: the UA
+/// size for its tag, and the generic-monospace rule — an element whose
+/// family switches to `monospace` from a proportional parent drops from
+/// the 16px default to 13px (Chromium's default fixed font size), so
+/// `<pre>`/`<code>` text is 13/16 of its surroundings.
+pub fn ua_font_size(tag: &str, inherited: f32, inherited_family: u8, own_family: u8) -> f32 {
+    let s = default_font_size(tag, inherited);
+    if own_family == 2 && inherited_family != 2 { s * 13.0 / 16.0 } else { s }
+}
+
 /// UA default font sizes per element (shared with the renderer).
 pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
     match tag {
+        // html.css: h1 2em, h2 1.5em, h3 1.17em, h4 1em, h5 .83em, h6 .67em
+        // of a 16px root; `small` is `smaller` (16/1.2); the generic
+        // `monospace` family defaults to 13px (Chromium's fixed font size).
         "h1" => 32.0,
         "h2" => 24.0,
-        "h3" => 19.0,
+        "h3" => 18.72,
         "h4" => 16.0,
-        "small" => 13.0,
+        "h5" => 13.28,
+        "h6" => 10.72,
+        "small" => 13.33,
         _ => inherited,
     }
 }
@@ -672,9 +731,12 @@ pub fn remeasure(tree: &mut LayoutTree) {
             if let Some(el) = dom_node.as_element() {
                 let paint = tree.paint_map.get(&node_id);
                 let tag = el.name.local.as_ref();
+                let own_family = paint
+                    .and_then(|p| p.family)
+                    .unwrap_or_else(|| default_family(tag, inherited.family));
                 size.font_size = paint
                     .and_then(|p| p.font_size)
-                    .unwrap_or_else(|| default_font_size(tag, inherited.font_size));
+                    .unwrap_or_else(|| ua_font_size(tag, inherited.font_size, inherited.family, own_family));
                 if let Some(lh) = paint.and_then(|p| p.line_height) {
                     size.line_height = lh;
                 }
@@ -741,6 +803,9 @@ pub fn remeasure(tree: &mut LayoutTree) {
         height: AvailableSpace::Definite(tree.viewport.1),
     };
     let vw_cap = tree.viewport.0;
+    // Block formatting context: adjoining vertical margins collapse for
+    // this layout run (CSS 2.2 §8.3.1); specified margins return after.
+    let collapsed = collapse::apply(tree);
     let _ = tree.taffy.compute_layout_with_measure(
         tree.root_node,
         viewport,
@@ -774,6 +839,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
             }
         }),
     );
+    collapse::restore(tree, collapsed);
 }
 
 /// One text run's resolved text properties (inherited down the box tree the

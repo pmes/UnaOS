@@ -28,8 +28,11 @@ pub(crate) struct SpecifiedStyle {
     pub max_height: Option<Dimension>,
     pub min_width: Option<Dimension>,
     pub min_height: Option<Dimension>,
-    pub padding: Option<Rect<LengthPercentage>>,
-    pub margin: Option<Rect<LengthPercentageAuto>>,
+    /// Per side [top, right, bottom, left]: a longhand (`margin-top`)
+    /// specifies ONE side and must leave the other three to the cascade
+    /// and the UA defaults (CSS Cascade §6: each longhand cascades alone).
+    pub padding: [Option<LengthPercentage>; 4],
+    pub margin: [Option<LengthPercentageAuto>; 4],
     pub position: Option<taffy::style::Position>,
     pub inset_top: Option<LengthPercentageAuto>,
     pub inset_left: Option<LengthPercentageAuto>,
@@ -92,12 +95,16 @@ impl SpecifiedStyle {
         }
         if let Some(v) = self.min_width { node_style.min_size.width = lpa(v); }
         if let Some(v) = self.min_height { node_style.min_size.height = lpa(v); }
-        if let Some(p) = self.padding {
-            node_style.padding = p;
-        }
-        if let Some(m) = self.margin {
-            node_style.margin = m;
-        }
+        let [pt, pr, pb, pl] = self.padding;
+        if let Some(v) = pt { node_style.padding.top = v; }
+        if let Some(v) = pr { node_style.padding.right = v; }
+        if let Some(v) = pb { node_style.padding.bottom = v; }
+        if let Some(v) = pl { node_style.padding.left = v; }
+        let [mt, mr, mb, ml] = self.margin;
+        if let Some(v) = mt { node_style.margin.top = v; }
+        if let Some(v) = mr { node_style.margin.right = v; }
+        if let Some(v) = mb { node_style.margin.bottom = v; }
+        if let Some(v) = ml { node_style.margin.left = v; }
         if let Some(pos) = self.position {
             node_style.position = pos;
         }
@@ -144,6 +151,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             | "-webkit-inline-flex" | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
                 style.display = Some(Display::Flex);
                 style.flex_container = Some(true);
+                style.paint.flex_container = Some(true);
             }
             // Column-flex approximations of block-ish display types.
             "block" | "inline-block" | "inline" | "list-item"
@@ -151,6 +159,7 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             | "table-header-group" | "table-footer-group" => {
                 style.display = Some(Display::Flex);
                 style.flex_container = Some(false);
+                style.paint.flex_container = Some(false);
             }
             "table-row" => {
                 style.display = Some(Display::Flex);
@@ -238,40 +247,24 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             "visible" => style.paint.clip = Some(false),
             _ => {}
         },
-        "padding" => style.padding = parse_sides(value, |v| parse_length_percentage_str(v)),
-        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
-            if let Some(v) = parse_length_percentage_str(value) {
-                let mut p = style.padding.unwrap_or(Rect {
-                    left: LengthPercentage::length(0.0),
-                    right: LengthPercentage::length(0.0),
-                    top: LengthPercentage::length(0.0),
-                    bottom: LengthPercentage::length(0.0),
-                });
-                match prop {
-                    "padding-top" => p.top = v,
-                    "padding-right" => p.right = v,
-                    "padding-bottom" => p.bottom = v,
-                    _ => p.left = v,
-                }
-                style.padding = Some(p);
+        "padding" => {
+            if let Some(r) = parse_sides(value, |v| parse_length_percentage_str(v)) {
+                style.padding = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
             }
         }
-        "margin" => style.margin = parse_sides(value, |v| parse_length_percentage_auto_str(v)),
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
+            if let Some(v) = parse_length_percentage_str(value) {
+                style.padding[side_index(prop)] = Some(v);
+            }
+        }
+        "margin" => {
+            if let Some(r) = parse_sides(value, |v| parse_length_percentage_auto_str(v)) {
+                style.margin = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
+            }
+        }
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
             if let Some(v) = parse_length_percentage_auto_str(value) {
-                let mut m = style.margin.unwrap_or(Rect {
-                    left: LengthPercentageAuto::length(0.0),
-                    right: LengthPercentageAuto::length(0.0),
-                    top: LengthPercentageAuto::length(0.0),
-                    bottom: LengthPercentageAuto::length(0.0),
-                });
-                match prop {
-                    "margin-top" => m.top = v,
-                    "margin-right" => m.right = v,
-                    "margin-bottom" => m.bottom = v,
-                    _ => m.left = v,
-                }
-                style.margin = Some(m);
+                style.margin[side_index(prop)] = Some(v);
             }
         }
         "position" => match value {
@@ -1772,7 +1765,7 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
     copy!(
         background, color, font_size, bold, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
-        mask_repeat, text_align,
+        mask_repeat, text_align, flex_container,
     );
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
 }
@@ -2191,7 +2184,11 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     macro_rules! take {
         ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
-    take!(display, flex_direction, width, height, padding, margin, position,
+    for i in 0..4 {
+        if src.padding[i].is_some() { dst.padding[i] = src.padding[i]; }
+        if src.margin[i].is_some() { dst.margin[i] = src.margin[i]; }
+    }
+    take!(display, flex_direction, width, height, position,
           inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_self,
           max_width, max_height, min_width, min_height, box_sizing,
           flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis);
@@ -2610,6 +2607,11 @@ impl MathParser<'_> {
             u => parse_viewport_length(&format!("{}{}", n, u)),
         }
     }
+}
+
+/// [top, right, bottom, left] index of a `*-top`/`*-right`/... longhand.
+fn side_index(prop: &str) -> usize {
+    if prop.ends_with("-top") { 0 } else if prop.ends_with("-right") { 1 } else if prop.ends_with("-bottom") { 2 } else { 3 }
 }
 
 /// Parses a 1-4 value box shorthand ("10px", "0 auto", "1px 2px 3px 4px")
