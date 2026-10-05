@@ -264,7 +264,7 @@ pub fn panel_range() -> u32 {
 /// The key path's step: `Some(level)` staged (no I/O — the decoder's context), `None` when the step would
 /// move the panel the wrong way or not at all.
 pub fn stage_step(up: bool) -> Option<u8> {
-    next_level(level(), cur_raw(), panel_range(), up).map(stage)
+    step_raw(cur_raw(), panel_range(), up).map(stage) // BRIGHTSLIDER M1 (B377): the keys move along the slider's own linear scale, from the register's value
 }
 
 /// The first desktop pass: read the panel's own level back, once, before anything has been written (gmux
@@ -314,5 +314,166 @@ fn step_kat() {
         ":: BRIGHTSTEP: raws={} down_ok={} up_ok={} flight22={} seeded={} -> {} ::",
         max + 1, down_ok as u8, up_ok as u8, flight22 as u8, (HW_RAW.load(Ordering::Relaxed) != u32::MAX) as u8,
         if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// ── BRIGHTSLIDER M1 (rmbp-ledger B377, R89) — ONE LINEAR SCALE, THE REGISTER IS THE TRUTH ────────────────────────
+// Flight 23: the settings slider was quantised to 16 steps and painted from its own copy of the level, and the
+// login wrote the stored step over the panel's own (`seed readback=160` then `reg=127 via=login`). Now the slider
+// maps its track LINEARLY onto the register range ([`raw_for_pos`] / [`pos_for_raw`]), a press writes that register
+// value through [`set_raw_via`] (floor-clamped, read back, the same `[backlight] level=` line), the keys step to the
+// next 1/16 grid point strictly above/below the register ([`step_raw`]) — the same scale — and the login only READS
+// ([`login_keep`]). `LEVEL` stays the level at or below the register (Principia's 1..16 key, the bar's indicator).
+
+/// A register value clamped into the lit range `raw_for(FLOOR)..=max`. Pure.
+pub const fn clamp_raw(raw: u32, max: u32) -> u32 {
+    let f = raw_for(FLOOR, max);
+    if raw < f { f } else if raw > max { max } else { raw }
+}
+
+/// Register value for slider position `pos` of `span` (linear, rounded, floor-clamped). Pure.
+pub const fn raw_for_pos(pos: usize, span: usize, max: u32) -> u32 {
+    if span == 0 { return max; }
+    let p = if pos > span { span } else { pos };
+    clamp_raw(((max as u64 * p as u64 + span as u64 / 2) / span as u64) as u32, max)
+}
+
+/// Slider position (of `span`) that shows register value `raw` (linear, rounded). Pure.
+pub const fn pos_for_raw(raw: u32, max: u32, span: usize) -> usize {
+    if max == 0 { return 0; }
+    let r = if raw > max { max } else { raw };
+    ((r as u64 * span as u64 + max as u64 / 2) / max as u64) as usize
+}
+
+/// Percent of the panel's range a register value is. Pure.
+pub const fn pct_of(raw: u32, max: u32) -> u32 {
+    pos_for_raw(raw, max, 100) as u32
+}
+
+/// One key notch from a register holding `cur`: the lowest grid level strictly above it (Up) or the highest
+/// strictly below it (Down); `None` = nothing to move to (at the top, or at/below the floor). Pure.
+pub const fn step_raw(cur: u32, max: u32, up: bool) -> Option<u8> {
+    if up {
+        let mut l = FLOOR;
+        while l <= STEPS {
+            if raw_for(l, max) > cur { return Some(l); }
+            l += 1;
+        }
+        None
+    } else {
+        let mut l = STEPS;
+        loop {
+            if raw_for(l, max) < cur { return Some(l); }
+            if l <= FLOOR { return None; }
+            l -= 1;
+        }
+    }
+}
+
+/// The panel range, measured on first use (gmux index 0x70) — the I/O belongs on a desktop pass.
+pub fn max_now() -> u32 {
+    panel_max().0
+}
+
+fn drive_raw(raw: u32) -> Applied {
+    let (max, hw) = panel_max();
+    let reg = clamp_raw(raw, max);
+    let level = level_at_or_below(reg, max);
+    #[cfg(all(target_arch = "x86_64", feature = "gmux_igd", feature = "intel-ivb"))]
+    if hw {
+        let wrote = crate::drivers::gpu::igpu::gmux_set_brightness(reg);
+        let readback = if wrote { crate::drivers::gpu::igpu::gmux_get_brightness() } else { None };
+        let on = matches!(readback, Some(rb) if rb == reg && rb != 0);
+        return Applied { level, reg, readback, max, on, hw: true };
+    }
+    let _ = hw;
+    SIM_REG.store(reg, Ordering::Relaxed);
+    let rb = SIM_REG.load(Ordering::Relaxed);
+    Applied { level, reg, readback: Some(rb), max, on: rb == reg && rb != 0, hw: false }
+}
+
+/// THE writer for a register value (the slider's linear scale): clamp to the floor, write, read back, print the
+/// same `[backlight] level=` line as [`set_level_via`]. `LEVEL` = the level at or below what the register holds.
+pub fn set_raw_via(raw: u32, via: &str) -> Applied {
+    let a = drive_raw(raw);
+    let held = a.readback.unwrap_or(a.reg);
+    LEVEL.store(level_at_or_below(held, a.max), Ordering::Relaxed);
+    HW_RAW.store(held, Ordering::Relaxed);
+    let mut rb = [0u8; 12];
+    serial_println!(
+        "[backlight] level={} reg={} readback={} max={} on={} driver={} via={}",
+        a.level, a.reg, fmt_opt(a.readback, &mut rb), a.max, a.on as u8, if a.hw { "gmux" } else { "sim" }, via
+    );
+    a
+}
+
+/// Read the register now (gmux boards; a simulated register answers only once something wrote it). Updates the
+/// known value and `LEVEL`. `None` = no answer.
+pub fn readback_now() -> Option<u32> {
+    let (max, hw) = panel_max();
+    let rb = {
+        #[cfg(all(target_arch = "x86_64", feature = "gmux_igd", feature = "intel-ivb"))]
+        { if hw { crate::drivers::gpu::igpu::gmux_get_brightness() } else { None } }
+        #[cfg(not(all(target_arch = "x86_64", feature = "gmux_igd", feature = "intel-ivb")))]
+        { let _ = hw; match SIM_REG.load(Ordering::Relaxed) { 0 => None, r => Some(r) } }
+    }?;
+    HW_RAW.store(rb, Ordering::Relaxed);
+    LEVEL.store(level_at_or_below(rb, max), Ordering::Relaxed);
+    Some(rb)
+}
+
+/// BRIGHTSLIDER M3 — the login: read the panel, seed the slider from it, WRITE NOTHING. The one exception is a
+/// panel the register says is below the floor (dark): it gets the floor, and the line says `wrote=1`.
+/// `[backlight] login keep readback=<n|-> max=<m> slider=<pct>% stored=<l|-> wrote=<0|1>`. Returns `LEVEL`.
+pub fn login_keep(stored: Option<u8>) -> u8 {
+    let max = max_now();
+    let rb = readback_now();
+    let wrote = matches!(rb, Some(r) if r < raw_for(FLOOR, max));
+    if wrote { let _ = set_raw_via(raw_for(FLOOR, max), "login-floor"); }
+    let (mut b1, mut b2) = ([0u8; 12], [0u8; 12]);
+    serial_println!(
+        "[backlight] login keep readback={} max={} slider={}% stored={} wrote={}",
+        fmt_opt(rb, &mut b1), max, pct_of(cur_raw(), max), fmt_opt(stored.map(|s| s as u32), &mut b2), wrote as u8
+    );
+    level()
+}
+
+/// BRIGHTSLIDER M4 — fixture `tests brightstep` (R80: registered, never at boot): five slider positions
+/// (10/30/50/70/90 % of the track) written through [`set_raw_via`], each read back, the settings knob checked
+/// against the readback (`settings::slider_sync`), the prior register restored; plus the key scale's KAT over
+/// every register value (Up = the lowest grid point strictly above, Down = the highest strictly below).
+/// `:: BRIGHTSTEP: steps=5 readback_ok=<n> slider_sync=<ok|bad> keys=<ok|bad> driver=<gmux|sim> -> PASS|FAIL ::`
+pub fn brightstep() {
+    let max = max_now();
+    let prev = cur_raw();
+    let (mut rb_ok, mut sync_ok, mut hw) = (0u32, 0u32, false);
+    const POS: [usize; 5] = [10, 30, 50, 70, 90];
+    for p in POS {
+        let a = set_raw_via(raw_for_pos(p, 100, max), "brightstep");
+        hw = a.hw;
+        if a.readback == Some(a.reg) { rb_ok += 1; }
+        if a.readback.is_some_and(crate::video::settings::slider_sync) { sync_ok += 1; }
+    }
+    let _ = set_raw_via(prev, "brightstep-restore");
+    let _ = crate::video::settings::slider_sync(cur_raw());
+    let mut keys = true;
+    let mut raw = 0u32;
+    while raw <= max {
+        keys &= match step_raw(raw, max, true) {
+            Some(l) => raw_for(l, max) > raw && (l == FLOOR || raw_for(l - 1, max) <= raw),
+            None => raw >= max,
+        };
+        keys &= match step_raw(raw, max, false) {
+            Some(l) => raw_for(l, max) < raw && (l == STEPS || raw_for(l + 1, max) >= raw),
+            None => raw <= raw_for(FLOOR, max),
+        };
+        raw += 1;
+    }
+    let n = POS.len() as u32;
+    let ok = rb_ok == n && sync_ok == n && keys;
+    serial_println!(
+        ":: BRIGHTSTEP: steps={} readback_ok={} slider_sync={} keys={} driver={} -> {} ::",
+        n, rb_ok, if sync_ok == n { "ok" } else { "bad" }, if keys { "ok" } else { "bad" },
+        if hw { "gmux" } else { "sim" }, if ok { "PASS" } else { "FAIL" }
     );
 }

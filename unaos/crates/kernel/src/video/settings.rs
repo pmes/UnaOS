@@ -253,7 +253,10 @@ fn load_for_login() {
         persist(0);
     }
     // Staged (no I/O) so the key-sync below sees the loaded level, applied one pass later.
-    if mask & 1 != 0 { crate::video::backlight::stage(v.bright); LOGIN_APPLY.store(v.bright, Ordering::Release); }
+    // BRIGHTSLIDER M3 (B377, R89): the stored level is NOT written at login — the slider seeds from the panel's own
+    // register (`[backlight] login keep readback= … wrote=0`); the store records the user's moves, it does not override the glass.
+    let kept = crate::video::backlight::login_keep(if mask & 1 != 0 { Some(v.bright) } else { None });
+    CUR.lock().bright = kept;
     if mask & 2 != 0 || mask & 4 != 0 { apply_volume(v.vol, v.mute); }
     if mask & 8 != 0 { apply_idle(v.idle_min); }
     if mask & 16 != 0 { apply_ptr(v.ptr); }
@@ -305,7 +308,7 @@ fn adjust(i: usize, d: isize) {
     let c = CUR.lock().clone();
     let step = |cur: usize, max: usize| -> usize { (cur as isize + d).clamp(0, max as isize) as usize };
     match i {
-        0 => set(0, step(c.bright as usize, 16).max(crate::video::backlight::FLOOR as usize)),
+        0 => bright_key(d > 0),
         1 => set(1, step(c.vol as usize, 16)),
         2 => set(2, (d > 0) as usize),
         3 => set(3, step(idle_index(c.idle_min), IDLE_STEPS.len() - 1)),
@@ -345,7 +348,7 @@ pub fn service() {
     crate::prefs::service();
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
-    if la != 0 { let on = apply_bright_via(la, "login"); say("brightness", &alloc::format!("{}", la), on); }
+    if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
     if let Some(u) = user_name() {
         let fresh = { let mut g = LOADED_FOR.lock(); if *g != u { *g = u; true } else { false } };
         // BRIGHTFLOOR M5: the session opened — the load (and the safe-mode Shift check) waits for the
@@ -375,6 +378,8 @@ pub fn service() {
         };
         if db { persist(0); }
         if dv { persist(1); }
+        let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
+        if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { persist(0); }
     }
     bus_changes(); if OPEN_REQ.swap(false, Ordering::AcqRel) {
         if let Err(e) = open() {
@@ -493,8 +498,11 @@ fn paint_general(st: &mut State, v: &Values) {
 fn paint_display(st: &mut State, v: &Values) {
     // BRIGHTFLOOR M5: Brightness lives here (row 0) — where Peter looked for it on flight 19.
     txt(st, LABEL_X, 0, "Brightness");
-    slider(st, 0, v.bright as usize, 16);
-    txt(st, VAL_X, 0, &alloc::format!("{}/16 {}%", v.bright, crate::video::backlight::percent(v.bright)));
+    // BRIGHTSLIDER M2 (B377): the knob and the % are the REGISTER's (its last readback), never the window's copy.
+    let (braw, bmax) = (crate::video::backlight::cur_raw(), crate::video::backlight::panel_range());
+    PAINTED_RAW.store(braw, Ordering::Relaxed);
+    slider(st, 0, braw.min(bmax) as usize, bmax as usize);
+    txt(st, VAL_X, 0, &alloc::format!("{}%", crate::video::backlight::pct_of(braw, bmax)));
     txt(st, LABEL_X, 1, "Blank screen");
     slider(st, 1, idle_index(v.idle_min), IDLE_STEPS.len() - 1);
     let it = if v.idle_min == 0 { String::from("never") } else { alloc::format!("{} min", v.idle_min) };
@@ -964,7 +972,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         1 => press_users(row, cx),
         2 => {
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
-            if row == 0 && on_track { select(0); set(0, bright_at(cx)); }
+            if row == 0 && on_track { select(0); bright_click(cx); }
             if row == 1 && on_track { select(3); set(3, slider_at(cx, IDLE_STEPS.len() - 1)); }
             if row == 4 && cx >= TRACK_X && cx < TRACK_X + TRACK_W { select(9); set_font(9, ((cx - TRACK_X) / (TRACK_W / 3)).min(2) as i64); } // KERNELFONT2: the family segments
             if row == 5 && cx >= TRACK_X && cx < TRACK_X + BTN_W { select(10); set_font(10, (font_size() - 1).max(FONT_MIN)); } // KERNELFONT2: size −
@@ -1198,6 +1206,7 @@ fn bus_changes_inner() -> (usize, usize, usize) {
     let old = CUR.lock().clone();
     let mut fresh = old.clone();
     let _ = from_prefs(&mut fresh);
+    if BRIGHT_PERSIST_AT.load(Ordering::Acquire) != 0 { fresh.bright = old.bright; } // BRIGHTSLIDER M2: a slider move not yet stored is newer than the store
     use crate::prefs::key;
     let mut moved = 0usize;
     for k in keys.iter() {
@@ -1269,4 +1278,65 @@ fn set_font(i: usize, v: i64) {
     let mut d = Values::DEFAULT;
     SAVED_N.store(from_prefs(&mut d).1 as u32, Ordering::Relaxed);
     repaint();
+}
+
+// ── BRIGHTSLIDER M2 (rmbp-ledger B377, R89) — THE SLIDER IS THE BRIGHTNESS ───────────────────────────────────────
+// Flight 23: a press wrote the panel, then blocked ~1.3 s in the PrefSet (`[lag] click→shown … wm=1471.4`) BEFORE the
+// repaint — the knob stayed where it was while the glass changed — and the track was quantised to 16 steps. Now the
+// track pixel maps linearly onto the register (`backlight::raw_for_pos`), the write and its readback come first, the
+// knob is repainted from the readback in the same act, and Principia's store write is debounced
+// [`BRIGHT_PERSIST_MS`] onto the service pass (one store write per burst of clicks).
+
+/// When the slider's store write is due (`arch::ms`, 0 = none pending).
+static BRIGHT_PERSIST_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The debounce between a slider move and its store write.
+pub const BRIGHT_PERSIST_MS: u64 = 750;
+/// The register value the Brightness knob was last painted at (`u32::MAX` = never painted).
+static PAINTED_RAW: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn bright_persist_later() {
+    BRIGHT_PERSIST_AT.store(crate::arch::ms().saturating_add(BRIGHT_PERSIST_MS).max(1), Ordering::Release);
+}
+
+/// A press on the Brightness track at logical `cx`: position → register (linear), write + readback, repaint, witness.
+/// `[backlight] slider click pos=<pct>% -> reg=<n> readback=<n> slider=<pct>% sync=<ok|bad>`
+fn bright_click(cx: usize) {
+    let pos = cx.saturating_sub(TRACK_X).min(TRACK_W);
+    let max = crate::video::backlight::max_now();
+    let a = crate::video::backlight::set_raw_via(crate::video::backlight::raw_for_pos(pos, TRACK_W, max), "slider");
+    CUR.lock().bright = a.level;
+    repaint();
+    let painted = PAINTED_RAW.load(Ordering::Relaxed);
+    let sync = a.readback == Some(a.reg) && (!is_open() || painted == a.reg);
+    serial_println!(
+        "[backlight] slider click pos={}% -> reg={} readback={} slider={}% sync={}",
+        (pos * 100 + TRACK_W / 2) / TRACK_W,
+        a.reg, a.readback.map(|r| r as i64).unwrap_or(-1), crate::video::backlight::pct_of(if painted == u32::MAX { a.reg } else { painted }, a.max),
+        if sync { "ok" } else { "bad" }
+    );
+    say("brightness", &alloc::format!("{}", a.level), a.on);
+    bright_persist_later();
+}
+
+/// Left/Right on the Brightness control: one notch along the same linear scale as the keys (`backlight::step_raw`).
+fn bright_key(up: bool) {
+    let max = crate::video::backlight::max_now();
+    let Some(l) = crate::video::backlight::step_raw(crate::video::backlight::cur_raw(), max, up) else { return };
+    let a = crate::video::backlight::set_raw_via(crate::video::backlight::raw_for(l, max), "slider-key");
+    CUR.lock().bright = a.level;
+    repaint();
+    say("brightness", &alloc::format!("{}", a.level), a.on);
+    bright_persist_later();
+}
+
+/// `tests brightstep`: does the knob show register value `reg`? With the window open: repaint and compare what was
+/// painted; closed: the linear mapping round-trips `reg` through a track position within one pixel's worth.
+pub fn slider_sync(reg: u32) -> bool {
+    let max = crate::video::backlight::panel_range();
+    if is_open() {
+        repaint();
+        return PAINTED_RAW.load(Ordering::Relaxed) == reg;
+    }
+    let back = crate::video::backlight::raw_for_pos(crate::video::backlight::pos_for_raw(reg, max, TRACK_W), TRACK_W, max);
+    back.abs_diff(reg) <= max / TRACK_W as u32 + 1
 }
