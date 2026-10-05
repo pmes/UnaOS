@@ -1218,7 +1218,7 @@ fn render(v: &mut View) {
         }
     }
     if v.info {
-        let face = crate::video::font::Face::Body;
+        let face = crate::video::text::Face::Body;
         let ch = face.cell_h();
         let h = (ch + 4).min(v.vh);
         let y0 = v.vh - h;
@@ -1234,7 +1234,7 @@ fn render(v: &mut View) {
             v.src_w, v.src_h, v.bytes, v.ihdr.depth, colour_name(v.ihdr.colour), t
         );
         let vw = v.vw;
-        crate::video::font::draw_text(&mut s, vw, vw, v.vh, 4, y0 + 2, line.as_bytes(), 0x00F0_F0F0, false, face);
+        crate::video::text::draw_text(&mut s, vw, vw, v.vh, 4, y0 + 2, line.as_bytes(), 0x00F0_F0F0, false, face);
     }
 }
 
@@ -1300,12 +1300,12 @@ fn show_message(path: &str, reason: &str) {
         return;
     }
     surf.resize(vw * vh, 0xFFF5_F2EA);
-    let face = crate::video::font::Face::Body;
+    let face = crate::video::text::Face::Body;
     let ch = face.cell_h();
     let l1 = alloc::format!("Cannot show {}", title_of(path));
     let l2 = alloc::format!("reason: {}", reason);
-    crate::video::font::draw_text(&mut surf, vw, vw - 8, vh, 8, 8, l1.as_bytes(), 0x0021_201E, false, face);
-    crate::video::font::draw_text(&mut surf, vw, vw - 8, vh, 8, 8 + ch + 4, l2.as_bytes(), 0x00A0_2020, false, face);
+    crate::video::text::draw_text(&mut surf, vw, vw - 8, vh, 8, 8, l1.as_bytes(), 0x0021_201E, false, face);
+    crate::video::text::draw_text(&mut surf, vw, vw - 8, vh, 8, 8 + ch + 4, l2.as_bytes(), 0x00A0_2020, false, face);
     *SURF.lock() = surf;
     match mint(&title_of(path), vw, vh) {
         Ok(id) => {

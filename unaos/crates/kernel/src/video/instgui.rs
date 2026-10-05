@@ -63,7 +63,7 @@ const CELL_W: usize = font::CELL_W;
 const CELL_H: usize = font::CELL_H;
 /// The face this dialog draws with. `Body` and not `Chrome`: the installer's surface is a block of
 /// prose sized by how much of it must fit, not a piece of furniture sized by the theme's bar.
-const FACE: font::Face = font::Face::Body;
+const FACE: super::text::Face = super::text::Face::Body;
 
 #[repr(align(64))]
 struct Surf([u32; W * H]);
@@ -420,7 +420,7 @@ fn bevel(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, raised: bool) {
 /// surface and any other that adopts the seam truncate identically.
 fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
     let n = s.iter().position(|&c| c == b'\n').unwrap_or(s.len());
-    font::draw_text(px, W, W, H, x, y, &s[..n], fg, false, FACE);
+    super::text::draw_text(px, W, W, H, x, y, &s[..n], fg, false, FACE);
 }
 
 /// Format a byte count as whole gibibytes/mebibytes into `buf`, returning the slice.

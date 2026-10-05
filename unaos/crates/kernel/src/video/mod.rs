@@ -1175,3 +1175,7 @@ pub mod blitter;
 // and `tests shot`. Desktop family only (it opens desktop windows); nothing at boot.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod shotmask;
+// KERNELFONT (B359): `video::text` — the ONE text-drawing seam (font_core faces off /system/fonts, the bitmap
+// atlases as the fallback). Unconditional: fbcon and the boot label call it on every image; the engine half
+// inside it is desktop-gated, so no other image links font_core.
+pub mod text;

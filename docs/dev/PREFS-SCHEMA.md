@@ -10,7 +10,7 @@ or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keep
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
 operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
 
-Rows: 29.
+Rows: 31.
 
 | key | type | default | writers | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -18,6 +18,8 @@ Rows: 29.
 | `system.audio.mute` | bool | `false` | settings, keys | kernel settings (audio) | Output muted. |
 | `system.audio.volume` | int `0..=16` | `12` | settings, keys | kernel settings (audio) | Output level in sixteenths. |
 | `system.display.brightness` | int `1..=16` | `12` | settings, keys | kernel settings, backlight | Panel level in sixteenths; never 0 (BRIGHTFLOOR: the backlight's OFF belongs to the idle blank). |
+| `system.display.font` | enum `sans \| serif \| mono` | `"sans"` | operator | kernel `video::text` (KERNELFONT) | The UI typeface family for captions, menus and running text: DejaVu Sans, Serif or Sans Mono (KERNELFONT B359; the console grid is always mono). |
+| `system.display.font_size` | int `9..=32` | `13` | operator | kernel `video::text` (KERNELFONT) | UI text size in CSS px; device px = size x the panel's ppi (EDID) / 96, capped by the 16 px text cell; captions keep the bar-derived size. |
 | `system.display.idle_min` | int `0..=1440` | `10` | settings | kernel settings (DIMIDLE) | Minutes before the idle blank; 0 = never. |
 | `system.display.wallpaper` | string ≤120 printable | `""` | settings, wallpaper-verb | kernel settings, wallpaper | Wallpaper image path; empty = off. |
 | `system.dock.pins` | string ≤256 printable | consumer: every pin the build carries (lumen only on a `lumen` build) | dock | kernel dock | Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen); TOML arrays are outside the subset. |

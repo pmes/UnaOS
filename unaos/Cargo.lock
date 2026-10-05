@@ -102,6 +102,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
+name = "font_core"
+version = "0.1.0"
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -426,6 +430,7 @@ dependencies = [
  "elf_core",
  "fdt",
  "font8x8",
+ "font_core",
  "holocron_core",
  "lazy_static",
  "linked_list_allocator",
