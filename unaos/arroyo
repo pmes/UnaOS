@@ -3856,7 +3856,36 @@ build_selfbuild_x86() {
             echo "   SELFBUILD1: busybox fetch/build failed — PROBE.LNX absent (probe=none)"
         fi
     fi
-    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
+    build_selfbuild4_x86   # SELFBUILD4 (B356): SYSKAT4.LNX + RUST.LNX
+    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
+}
+
+# SELFBUILD4 (B356): the first Rust program on UnaOS and the process-memory KAT, both proven on the HOST kernel before staging.
+# RUST.LNX = crates/user-linux-rust (ours) built for x86_64-unknown-linux-musl — static, NON-PIE (the crate's .cargo/config.toml:
+# relocation-model=static + crt-static; the shim's loader takes ET_EXEC only), musl + libunwind from the Rust target's
+# self-contained objects, stripped. No musl target installed (rustup refused) = RUST.LNX absent = `tests selfbuild4` SKIPs.
+# SYSKAT4.LNX = crates/user-linux-hello/c/syskat4.c (copy-on-write fork, MAP_SHARED across fork, a lazily re-executed image,
+# SIGBUS past EOF).
+build_selfbuild4_x86() {
+    local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
+    mkdir -p "$sb"
+    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT4.LNX" "$c/syskat4.c" \
+        && "$sb/SYSKAT4.LNX" "$sb/kat4.tmp" | grep -q "^syskat4 ok cow=ok cow_kernel=ok cow_prot=ok shared_fork=ok exec_lazy=ok sigbus=ok "; then
+        cp "$sb/SYSKAT4.LNX" "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
+    else
+        echo "   SELFBUILD4: SYSKAT4.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
+    fi
+    rustup +nightly target list --installed 2>/dev/null | grep -qx x86_64-unknown-linux-musl \
+        || rustup +nightly target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
+    local bin="$sb/rust/x86_64-unknown-linux-musl/release/rust-probe"
+    if ( cd "$rs" && CARGO_TARGET_DIR="$sb/rust" cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
+        && [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" = "2" ] \
+        && "$bin" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; then
+        strip -o "${WORKSPACE_DIR}/target/RUST.LNX" "$bin"
+    else
+        echo "   SELFBUILD4: RUST.LNX did not build (musl target?), is not ET_EXEC, or failed on the host kernel — not staged"
+        rm -f "${WORKSPACE_DIR}/target/RUST.LNX"
+    fi
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).
