@@ -2,8 +2,8 @@
 // Copyright (C) 2026 The Architect & Una
 //
 //! Still images — a thin re-export of `pixel_core` (unaos/libs/media/pixel_core, PIXELCORE / SR25):
-//! PNG, JPEG (baseline + progressive), GIF (animated), BMP, QOI and WebP (lossless, and lossy through
-//! vp8_core — VP8CORE / SR40), written from the
+//! PNG (and APNG, animated), JPEG (baseline + progressive), GIF (animated), BMP, QOI and WebP (lossless,
+//! lossy through vp8_core — VP8CORE / SR40 — and animated, ANIMWEBP / SR44), written from the
 //! specifications, the same code the kernel's Facet viewer runs. `decode` sniffs the format; anything it
 //! refuses is `Error::Unsupported` / `Error::UnknownFormat` and the caller decides what to fall back to.
 
