@@ -456,6 +456,7 @@ fn reset_arm() {
 /// Event-ring hook: claims the bulk-IN completion of the armed TRB (or any error on that endpoint).
 pub fn claim(slot_id: u8, endpoint_id: u8, param: u64, code: u8, transfer_len: u32) -> bool {
     if tx_claim(slot_id, endpoint_id, param, code) {
+        U8_TX_RESID.store(transfer_len, Ordering::Relaxed); // USBNET8 M7: the OUT TD's residual, for `tx done`
         return true; // NETCLOCK M3: the in-flight bulk-OUT TD (same event-ring line, no new dispatch arm)
     }
     if !ARMED.load(Ordering::Relaxed)
@@ -475,6 +476,7 @@ pub fn claim(slot_id: u8, endpoint_id: u8, param: u64, code: u8, transfer_len: u
     true
 }
 pub fn take_done() -> Option<(u8, u32)> {
+    u8_pass_tick(); // USBNET8 M8: every data pass asks here; the interval between asks is the pass time
     if !DONE.load(Ordering::Relaxed) {
         return None;
     }
@@ -619,12 +621,18 @@ pub mod ax {
     pub const PHYPWR_IPRL: u16 = 0x0020;
     pub const CLK_ACS_BCS: u8 = 0x03;
     /// DROPCRCERR 0x0100 | IPE 0x0200 (2-byte IP alignment pad on RX) | START 0x0080 | AP 0x0020 |
-    /// AB 0x0008 | AMALL 0x0002.
+    /// AB 0x0008 | AMALL 0x0002 — Linux `ax88179_reset`'s value exactly. DROPCRCERR does not read back (flight 23:
+    /// 0x03aa/0x02aa); Linux never reads it back either.
     pub const RX_CTL_RUN: u16 = 0x03aa;
+    /// USBNET8 M7: what Linux writes once the interface is open and on every `ax88179_link_reset` (`rxctl` from
+    /// `ax88179_set_multicast`): START 0x0080 | AB 0x0008 | IPE 0x0200, plus AMALL 0x0002 (Linux sets AM + the hash filter
+    /// for its IPv6/mDNS groups; this driver programs no hash, so all-multicast).
+    pub const RX_CTL_OPEN: u16 = 0x028a;
     pub const RX_CTL_STOP: u16 = 0x0000;
-    /// RECEIVE_EN 0x0100 | TXFLOW 0x0020 | RXFLOW 0x0010 | EN_125MHZ 0x0008 | ALWAYS_ONE 0x0004 |
-    /// FULL_DUPLEX 0x0002 | GIGAMODE 0x0001.
-    pub const MEDIUM_RUN: u16 = 0x013f;
+    /// USBNET8 M7: Linux `ax88179_reset`'s provisional medium, before any link: RECEIVE_EN 0x0100 | TXFLOW_CTRLEN 0x0020 |
+    /// RXFLOW_CTRLEN 0x0010 | FULL_DUPLEX 0x0002 | GIGAMODE 0x0001 = 0x0133 (was 0x013f: + EN_125MHZ 0x0008 + 0x0004, a bit
+    /// mainline defines no name for; flight 23 read back 0x0133 — neither stuck).
+    pub const MEDIUM_RUN: u16 = 0x0133;
     pub const BMCR_ANEG_RESTART: u16 = 0x1200;
     /// Bulk-IN queue control by USB speed (the part's aggregation timer/size tuple).
     pub const BULKIN_QCTRL_SS: [u8; 5] = [0x07, 0x4f, 0x00, 0x12, 0xff];
@@ -651,9 +659,10 @@ pub mod ax {
     pub const PHYSR_GIGA: u16 = 0x8000;
     pub const PHYSR_100: u16 = 0x4000;
     pub const PHYSR_FULL: u16 = 0x2000; // duplex
-    /// MEDIUM_STATUS_MODE bits (Linux AX_MEDIUM_*): GIGAMODE 0x0001, FULL_DUPLEX 0x0002, ALWAYS_ONE 0x0004,
-    /// EN_125MHZ 0x0008, RXFLOW 0x0010, TXFLOW 0x0020, PS (100M) 0x0200, RECEIVE_EN 0x0100.
-    pub const MEDIUM_BASE: u16 = 0x0100 | 0x0020 | 0x0010 | 0x0004;
+    /// MEDIUM_STATUS_MODE bits (Linux AX_MEDIUM_*): GIGAMODE 0x0001, FULL_DUPLEX 0x0002, EN_125MHZ 0x0008, RXFLOW_CTRLEN
+    /// 0x0010, TXFLOW_CTRLEN 0x0020, RECEIVE_EN 0x0100, PS (100M) 0x0200. Bit 2 (0x0004) has no mainline name; USBNET8 drops
+    /// it: `ax88179_link_reset` starts from RECEIVE_EN | TXFLOW | RXFLOW and adds the PHYSR-derived bits (1000 full = 0x013b).
+    pub const MEDIUM_BASE: u16 = 0x0100 | 0x0020 | 0x0010;
     pub const MEDIUM_GIGA: u16 = 0x0001 | 0x0008;
     pub const MEDIUM_PS: u16 = 0x0200;
     pub const MEDIUM_125: u16 = 0x0008;
@@ -939,7 +948,7 @@ fn verdict() {
 /// USBNET6 M4 — `tests usbnet`: with a link, pull frames off the dongle for up to 5 s and PASS on the first one
 /// (its ethertype printed); no dongle / no link → SKIP; nothing received while the chip flagged packets → FAIL
 /// naming the RX_CTL readback. The census (rollup + the full `:: USBNET: bus=` line) is switched on for the run.
-/// Frames pulled here are consumed by the fixture, not the stack (5 s at most).
+/// USBNET8 M8: frames are tapped, not consumed — they go on to the stack.
 pub fn selftest() {
     CENSUS.store(true, Ordering::Relaxed);
     let chip = match kind() { KIND_AX88179 => "ax88179", KIND_ECM => "ecm", _ => "none" };
@@ -954,19 +963,22 @@ pub fn selftest() {
     witness("xhci", slot());
     let d0 = RX_CHIP_DROP.load(Ordering::Relaxed) + RX_CRC.load(Ordering::Relaxed);
     let t0 = crate::arch::ms();
-    let mut buf = [0u8; FRAME_CAP];
+    // USBNET8 M8: the fixture TAPS the ring (counts frames as they are pushed, reads the newest ethertype) and lets the stack
+    // pop them — it used to pop up to 4 frames itself for 5 s, so a DHCP offer arriving in that window went to the fixture.
     let mut frames = 0u32;
     let mut first: Option<u16> = None;
     let mut first_at = 0u64;
+    let f0 = RX_FRAMES.load(Ordering::Relaxed);
     while crate::arch::ms().saturating_sub(t0) < 5000 {
-        if let Some(n) = raw_rx(&mut buf) {
-            if frames == 0 { first_at = crate::arch::ms(); } // USBNET7: when the first frame of the run arrived
-            frames += 1;
-            if first.is_none() && n >= 14 { first = Some(u16::from_be_bytes([buf[12], buf[13]])); }
+        main_pass();
+        nf_stack_poll();
+        let seen = (RX_FRAMES.load(Ordering::Relaxed) - f0) as u32;
+        if seen > frames {
+            if frames == 0 { first_at = crate::arch::ms(); first = Some(NF_LAST_ETYPE.load(Ordering::Relaxed)); } // USBNET7: when the first frame of the run arrived
+            frames = seen;
             if frames >= 4 { break; }
-        } else {
-            core::hint::spin_loop();
         }
+        for _ in 0..256 { core::hint::spin_loop(); }
     }
     let dropped = RX_CHIP_DROP.load(Ordering::Relaxed) + RX_CRC.load(Ordering::Relaxed) - d0;
     let et = match first { Some(e) => alloc::format!("{:#06x}", e), None => alloc::string::String::from("none") };
@@ -1129,6 +1141,7 @@ pub fn tx_take_done() -> Option<u8> {
     if TX_DONE.load(Ordering::Relaxed) {
         let code = TX_CODE.load(Ordering::Relaxed);
         tx_reset();
+        u8_tx_done(code); // USBNET8 M7: `[usbnet] tx done` for the first frames and every non-success
         return Some(code);
     }
     let age_us = crate::arch::now_cycles().wrapping_sub(TX_T0.load(Ordering::Relaxed)) / cycles_per_us();
@@ -1137,6 +1150,7 @@ pub fn tx_take_done() -> Option<u8> {
             serial_println!("[usbnet] tx stuck dci={} trb={:#x} age_ms={} — abandoned, TX continues", TX_DCI.load(Ordering::Relaxed), TX_TRB.load(Ordering::Relaxed), age_us / 1000);
         }
         tx_reset();
+        u8_tx_done(0); // USBNET8 M7: an abandoned TD is a non-success on the same line
         return Some(0);
     }
     None
@@ -1249,7 +1263,9 @@ fn netframe_note_xfer(n: usize) {
     if NF_STALLED.swap(false, Ordering::Relaxed) {
         NF_RESUMED.store(true, Ordering::Relaxed);
         let (after, needed) = u8_answered(now); // USBNET8: a completion within U8_NEEDED_MS of the rung = the rung was needed
-        serial_println!("[usbnet] rx resumed len={} kicks={} resets={} after_ms={} needed={}", n, NF_KICKS.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed), after, needed as u8);
+        let gap = U8_PASS_GAP_MAX.swap(0, Ordering::Relaxed); // the longest data-pass interval since the rung: over 50 ms, `needed` can undercount
+        let pass = if after > U8_NEEDED_MS && gap > U8_NEEDED_MS { alloc::format!(" pass_ms={}", gap) } else { alloc::string::String::new() };
+        serial_println!("[usbnet] rx resumed len={} kicks={} resets={} after_ms={} needed={}{}", n, NF_KICKS.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed), after, needed as u8, pass);
     }
     let i = NF_N.fetch_add(1, Ordering::Relaxed) as usize;
     if i < NF_LOG {
@@ -1395,6 +1411,7 @@ static U8_NEEDED_KICKS: AtomicU64 = AtomicU64::new(0);
 static U8_NEEDED_RESETS: AtomicU64 = AtomicU64::new(0);
 /// A ladder rung fired (1 = doorbell kick, 2 = Stop Endpoint + Set TR Dequeue).
 fn u8_rung(kind: u8, now: u64) {
+    U8_PASS_GAP_MAX.store(0, Ordering::Relaxed);
     U8_RUNG_AT.store(now.max(1), Ordering::Relaxed);
     U8_RUNG_KIND.store(kind, Ordering::Relaxed);
 }
@@ -1469,4 +1486,34 @@ fn u8_txprobe_report(ip: u32) {
     let rms = if ip != 0 && rep != 0 { alloc::format!("{}", rep.saturating_sub(at)) } else { alloc::string::String::from("none") };
     serial_println!("[usbnet] txprobe arp who_has={}.{}.{}.{} sent={} reply_ms={} tx={}", o[0], o[1], o[2], o[3], (ip != 0) as u8, rms, TX_FRAMES.load(Ordering::Relaxed));
     U8_PROBE_IP.store(0, Ordering::Relaxed);
+}
+
+// ── USBNET8 M7: TX on the wire ──────────────────────────────────────────────────────────────────────
+static U8_TX_RESID: AtomicU32 = AtomicU32::new(0);
+static U8_TX_LEN: AtomicU32 = AtomicU32::new(0);
+static U8_TX_N: AtomicU64 = AtomicU64::new(0);
+/// The data pass issued an OUT TD of `n` bytes (header + frame + any pad byte).
+pub fn u8_tx_len(n: u32) { U8_TX_LEN.store(n, Ordering::Relaxed); U8_TX_RESID.store(0, Ordering::Relaxed); }
+/// `[usbnet] tx done n=<k> len=<bytes> cc=<code> residual=<bytes>` for the first three TDs and every non-success (cc not
+/// 1 Success / 13 Short Packet; 0 = abandoned by the stuck valve). Success with residual 0 = the controller moved every
+/// byte to the dongle; whether the dongle put it on the LAN is the txprobe's question.
+fn u8_tx_done(code: u8) {
+    let k = U8_TX_N.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 3 || (code != 1 && code != 13) {
+        serial_println!("[usbnet] tx done n={} len={} cc={} residual={}", k, U8_TX_LEN.load(Ordering::Relaxed), code, U8_TX_RESID.load(Ordering::Relaxed));
+    }
+}
+/// The link-up register sequence's outcome (`usbnet_ax_link_reset`, Linux `ax88179_link_reset` order).
+pub fn u8_note_link_reset(rxctl_rb: u16, fifo: Option<u32>, tries: u32, ms: u64, medium: u16, ok: bool) {
+    let f = match fifo { Some(v) => alloc::format!("{:#010x}", v), None => alloc::string::String::from("refused") };
+    serial_println!("[usbnet] link reset order=linux rxctl={:#06x}/{:#06x} txfifo={} tries={} ms={} medium={:#06x} ok={}",
+        ax::RX_CTL_OPEN, rxctl_rb, f, tries, ms, medium, ok as u8);
+}
+static U8_PASS_LAST: AtomicU64 = AtomicU64::new(0);
+static U8_PASS_GAP_MAX: AtomicU64 = AtomicU64::new(0);
+/// One data pass (from `take_done`): the longest interval between two passes since the last rung, in ms.
+fn u8_pass_tick() {
+    let now = crate::arch::ms();
+    let last = U8_PASS_LAST.swap(now, Ordering::Relaxed);
+    if last != 0 { U8_PASS_GAP_MAX.fetch_max(now.saturating_sub(last), Ordering::Relaxed); }
 }

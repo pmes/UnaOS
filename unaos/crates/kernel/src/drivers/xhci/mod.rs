@@ -17298,17 +17298,16 @@ impl XhciController {
         }
         let ax = usbnet::kind() == usbnet::KIND_AX88179;
         let n = {
-            let buf = unsafe { core::slice::from_raw_parts_mut(tx_phys as *mut u8, usbnet::FRAME_CAP + usbnet::ax::TX_HDR_LEN) };
+            let buf = unsafe { core::slice::from_raw_parts_mut(tx_phys as *mut u8, usbnet::FRAME_CAP + usbnet::ax::TX_HDR_LEN + 1) };
             if ax {
-                // 8-byte header ahead of the frame: [len][flags], the pad flag when the transfer
-                // would end exactly on a max packet (the part then pads instead of a ZLP).
-                match usbnet::next_tx(&mut buf[usbnet::ax::TX_HDR_LEN..]) {
+                // USBNET8 M7: the 8-byte header and the exact-multiple pad byte are the shared core's (`usbnet_core::ax88179_tx`,
+                // host KAT on a 342-byte DISCOVER), as Linux `ax88179_tx_fixup` + `usbnet_start_xmit` send them.
+                match usbnet::next_tx(&mut buf[usbnet::ax::TX_HDR_LEN..usbnet::ax::TX_HDR_LEN + usbnet::FRAME_CAP]) {
                     Some(n) => {
-                        let mps = usbnet::out_mps() as usize;
-                        let flags = if mps != 0 && (n + usbnet::ax::TX_HDR_LEN) % mps == 0 { usbnet::ax::TX_PAD_FLAG } else { 0 };
-                        buf[0..4].copy_from_slice(&(n as u32).to_le_bytes());
-                        buf[4..8].copy_from_slice(&flags.to_le_bytes());
-                        n + usbnet::ax::TX_HDR_LEN
+                        let (hdr, total) = usbnet_core::ax88179_tx::header(n, usbnet::out_mps() as usize);
+                        buf[0..8].copy_from_slice(&hdr);
+                        if total > n + usbnet::ax::TX_HDR_LEN { buf[n + usbnet::ax::TX_HDR_LEN] = 0; }
+                        total
                     }
                     None => return,
                 }
@@ -17317,7 +17316,7 @@ impl XhciController {
             }
         };
         match self.usbnet_tx_issue(slot, out_dci, tx_phys, n as u32, !ax) {
-            Ok(trb) => usbnet::tx_arm(out_dci, trb),
+            Ok(trb) => { usbnet::tx_arm(out_dci, trb); usbnet::u8_tx_len(n as u32); } // USBNET8 M7: the bytes this TD carries, for `tx done`
             Err(()) => usbnet::note_error(0),
         }
     }
@@ -17429,16 +17428,9 @@ impl XhciController {
             let mut l = [0u8; 1];
             let _ = self.ax_read(slot, usbnet::ax::REG_PHYSICAL_LINK_STATUS, &mut l);
             if let Some(m) = usbnet::link_seen(now, physr, l[0]) {
-                if !self.ax_write_rb(slot, "MEDIUM_STATUS_MODE", usbnet::ax::REG_MEDIUM_STATUS_MODE, &m.to_le_bytes()) {
-                    serial_println!("[usbnet] MEDIUM_STATUS_MODE rewrite refused for {:#06x}", m);
-                }
-                // USBNET7 M2: Linux `ax88179_link_reset` rewrites the bulk-IN queue control with the medium, and usbnet open's
-                // `set_rx_mode` (re)writes RX_CTL START once the MAC runs at the negotiated speed. Both are read back on the
-                // `regs when=linkup` line just below (no new boot line, R80).
-                let q = usbnet::qctrl();
-                if !self.ax_write(slot, usbnet::ax::REG_RX_BULKIN_QCTRL, &q) || !self.ax_write(slot, usbnet::ax::REG_RX_CTL, &usbnet::ax::RX_CTL_RUN.to_le_bytes()) {
-                    serial_println!("[usbnet] link-up QCTRL/RX_CTL rewrite refused");
-                }
+                // USBNET8 M7 (B381): Linux `ax88179_link_reset` ORDER — RX_CTL stop/start until the dongle's TX FIFO reads empty,
+                // then the bulk-IN queue control, then MEDIUM from the PHYSR just read (was: MEDIUM first, QCTRL, RX_CTL last).
+                self.usbnet_ax_link_reset(slot, m);
                 self.usbnet_ax_regs(slot, "linkup"); // USBNET5 M2: the RX-side registers as the part holds them once the link is negotiated
             }
         }
@@ -17619,5 +17611,48 @@ impl XhciController {
         };
         let deq_cc = self.recover_cmd(Trb { parameter: deq, status: 0, control: (16 << 10) | ctx }).1;
         usbnet::note_rx_reset(stop_cc, deq_cc, self.ep_state_of(slot, dci));
+    }
+}
+
+/// USBNET8 M7 (B381): the AX88179 link-up sequence in Linux `ax88179_link_reset` order, from its source (R83):
+///   1. loop, at most 100 ms: RX_CTL = 0, RX_CTL = rxctl (`RX_CTL_OPEN`), then read 4 bytes with vendor request 0x81,
+///      wValue 0x8c ("link up, check the usb device control TX FIFO full or empty") until bit 30 reads clear;
+///   2. RX_BULKIN_QCTRL for the USB speed; 3. MEDIUM_STATUS_MODE built from the PHYSR the poll just read (`link_seen`).
+/// Our link-up used to write MEDIUM first and never looked at the TX FIFO. One line: `[usbnet] link reset order=linux …`.
+#[cfg(feature = "usbnet")]
+impl XhciController {
+    fn usbnet_ax_link_reset(&mut self, slot: u8, medium: u16) {
+        use usbnet::ax::*;
+        let t0 = crate::arch::ms();
+        let (mut tries, mut ok) = (0u32, true);
+        let mut fifo: Option<u32>;
+        loop {
+            tries += 1;
+            ok &= self.ax_write(slot, REG_RX_CTL, &RX_CTL_STOP.to_le_bytes());
+            ok &= self.ax_write(slot, REG_RX_CTL, &RX_CTL_OPEN.to_le_bytes());
+            fifo = self.ax_txfifo(slot);
+            match fifo {
+                Some(v) if v & 0x4000_0000 != 0 && crate::arch::ms().saturating_sub(t0) < 100 => continue,
+                _ => break,
+            }
+        }
+        let ms = crate::arch::ms().saturating_sub(t0);
+        let q = usbnet::qctrl();
+        ok &= self.ax_write(slot, REG_RX_BULKIN_QCTRL, &q);
+        ok &= self.ax_write_rb(slot, "MEDIUM_STATUS_MODE", REG_MEDIUM_STATUS_MODE, &medium.to_le_bytes());
+        let mut rc = [0u8; 2];
+        let rxctl_rb = if self.ax_read(slot, REG_RX_CTL, &mut rc) { let v = u16::from_le_bytes(rc); usbnet::note_rx_ctl_readback(v); v } else { 0xffff };
+        usbnet::u8_note_link_reset(rxctl_rb, fifo, tries, ms, medium, ok);
+    }
+    /// Linux `ax88179_read_cmd(dev, 0x81, 0x8c, 0, 4, &tmp32)`: bmRequestType 0xC0, bRequest 0x81, wValue 0x8c, wIndex 0, 4 bytes.
+    fn ax_txfifo(&mut self, slot: u8) -> Option<u32> {
+        let buf = self.slots[slot as usize].descriptor_buffer as u64;
+        if buf == 0 { return None; }
+        dma_coherency::clean(buf as usize, 64);
+        if !matches!(self.sync_control(slot, 0xC0, 0x81, 0x8c, 0, 4, buf, true), Ok(1) | Ok(13)) { return None; }
+        dma_coherency::inval(buf as usize, 64);
+        let mut b = [0u8; 4];
+        unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, b.as_mut_ptr(), 4) };
+        Some(u32::from_le_bytes(b))
     }
 }
