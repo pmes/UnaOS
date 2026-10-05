@@ -2378,4 +2378,18 @@ mod tests {
         assert!((h.1 - (top.1 + top.3) - 21.44).abs() <= 1.0, "h1 keeps its UA top margin: {:?}", h);
         assert!((p.1 - (h.1 + h.3) - 16.0).abs() <= 1.0, "max(4, 16) between h1 and p: {:?} {:?}", h, p);
     }
+
+    /// CSS 2.2 §10.3.3: an auto-width block fills its container minus its
+    /// margins, border and padding (content-box); `margin: 0 auto` under a
+    /// max-width centres the clamped box.
+    #[test]
+    fn test_block_width_kat() {
+        let t = laid_out(
+            r#"<html><body><div style="width:400px"><div id=a style="margin:0 10px;padding:0 12px;border:2px solid red">x</div><div id=b style="max-width:200px;margin:0 auto;padding:0 10px">y</div></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!((a.0, a.2), (10.0, 380.0), "fills 400 - 2x10 margin, border-box");
+        assert_eq!((b.0, b.2), (90.0, 220.0), "content 200 + padding 20, centred");
+    }
 }

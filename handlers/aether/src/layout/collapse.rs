@@ -93,6 +93,14 @@ fn is_block_container(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
     }
 }
 
+pub(crate) fn is_block_container_pub(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
+    is_block_container(tree, id, st)
+}
+
+pub(crate) fn in_flow_block_pub(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
+    in_flow_block(tree, id, st)
+}
+
 /// True when this box is an in-flow block-level participant of its
 /// parent's block formatting context.
 fn in_flow_block(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {

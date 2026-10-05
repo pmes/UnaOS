@@ -2,6 +2,7 @@ use kuchiki::NodeRef;
 use taffy::prelude::*;
 use std::collections::HashMap;
 
+mod blockwidth;
 mod collapse;
 
 /// Specified paint properties for one box. `None` = not specified here;
@@ -438,6 +439,14 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             // of shrinking them (shrunk text would draw more lines than the
             // measured height and overlap the next block).
             flex_shrink: if inline { 0.0 } else { 1.0 },
+            // CSS initial `box-sizing: content-box` (taffy defaults to
+            // border-box). html.css makes push buttons and selects
+            // border-box; their UA min sizes below are border-box sizes.
+            box_sizing: if ua_border_box(dom_node, &tag) {
+                taffy::style::BoxSizing::BorderBox
+            } else {
+                taffy::style::BoxSizing::ContentBox
+            },
             size: Size {
                 width: if inline { Dimension::auto() } else { Dimension::percent(1.0) },
                 height: Dimension::auto(),
@@ -550,6 +559,20 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         paint_map,
         viewport: (vw, vh),
         dirty: false,
+    }
+}
+
+/// Controls the UA sheet sizes as border-box: buttons, selects, and the
+/// button-like / checkable inputs.
+fn ua_border_box(node: &NodeRef, tag: &str) -> bool {
+    match tag {
+        "button" | "select" => true,
+        "input" => node.as_element().is_some_and(|e| {
+            let a = e.attributes.borrow();
+            let t = a.get("type").unwrap_or("text").trim().to_ascii_lowercase();
+            matches!(t.as_str(), "submit" | "reset" | "button" | "checkbox" | "radio" | "image" | "color" | "file")
+        }),
+        _ => false,
     }
 }
 
@@ -805,6 +828,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
     let vw_cap = tree.viewport.0;
     // Block formatting context: adjoining vertical margins collapse for
     // this layout run (CSS 2.2 §8.3.1); specified margins return after.
+    let widths = blockwidth::apply(tree);
     let collapsed = collapse::apply(tree);
     let _ = tree.taffy.compute_layout_with_measure(
         tree.root_node,
@@ -840,6 +864,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
         }),
     );
     collapse::restore(tree, collapsed);
+    blockwidth::restore(tree, widths);
 }
 
 /// One text run's resolved text properties (inherited down the box tree the
