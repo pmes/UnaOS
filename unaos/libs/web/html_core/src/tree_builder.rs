@@ -13,6 +13,7 @@
 //! template), the 2026 `<template for>` content patching, speculative parsing, encoding sniffing (input is a
 //! decoded `&str`).
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -299,6 +300,10 @@ pub struct TreeBuilder {
     root_target: Option<NodeId>,
     /// A tokenizer state switch requested by the last token (applied by the driver).
     pub tokenizer_state: Option<State>,
+    /// `option` selectedness (§4.10.10) — needed because the parser's pops drive `selectedcontent` cloning.
+    selectedness: BTreeSet<NodeId>,
+    /// `option` → cached nearest ancestor `select`.
+    option_select: BTreeMap<NodeId, NodeId>,
 }
 
 impl TreeBuilder {
@@ -321,6 +326,8 @@ impl TreeBuilder {
             context: None,
             root_target: None,
             tokenizer_state: None,
+            selectedness: BTreeSet::new(),
+            option_select: BTreeMap::new(),
         }
     }
 
@@ -379,7 +386,7 @@ impl TreeBuilder {
                 break;
             }
         }
-        self.open.clear();
+        while self.pop().is_some() {}
     }
 
     // ---- small helpers -------------------------------------------------------------------------------------
@@ -480,10 +487,17 @@ impl TreeBuilder {
     }
 
     fn pop(&mut self) -> Option<NodeId> {
-        self.open.pop()
+        let n = self.open.pop()?;
+        self.popped(n);
+        Some(n)
+    }
+    fn truncate(&mut self, len: usize) {
+        while self.open.len() > len {
+            self.pop();
+        }
     }
     fn pop_until_html(&mut self, names: &[&str]) {
-        while let Some(n) = self.open.pop() {
+        while let Some(n) = self.pop() {
             if self.is_html_one_of(n, names) {
                 break;
             }
@@ -492,6 +506,7 @@ impl TreeBuilder {
     fn remove_from_stack(&mut self, n: NodeId) {
         if let Some(i) = self.open.iter().rposition(|&x| x == n) {
             self.open.remove(i);
+            self.popped(n);
         }
     }
 
@@ -502,7 +517,7 @@ impl TreeBuilder {
                 _ => break,
             };
             if is_one_of(&e.local, IMPLIED_END) && Some(e.local.as_str()) != except {
-                self.open.pop();
+                self.pop();
             } else {
                 break;
             }
@@ -511,7 +526,7 @@ impl TreeBuilder {
     fn generate_all_implied_end_tags_thoroughly(&mut self) {
         while let Some(&n) = self.open.last() {
             if self.is_html_one_of(n, IMPLIED_END_THOROUGH) {
-                self.open.pop();
+                self.pop();
             } else {
                 break;
             }
@@ -594,6 +609,9 @@ impl TreeBuilder {
     fn create_element_for(&mut self, tag: &Tag, ns: Namespace) -> NodeId {
         let attrs = self.convert_attrs(&tag.attrs, ns);
         let id = self.doc.create_element(ns, &tag.name, attrs);
+        if ns == Namespace::Html && tag.name == "option" && tag.attr("selected").is_some() {
+            self.selectedness.insert(id);
+        }
         if ns == Namespace::MathMl && tag.name == "annotation-xml" {
             if let Some(enc) = tag.attr("encoding") {
                 let enc = enc.to_ascii_lowercase();
@@ -616,6 +634,7 @@ impl TreeBuilder {
             return;
         }
         self.doc.insert_before(target, el, reference);
+        self.inserted(el);
     }
 
     fn insert_foreign(&mut self, tag: &Tag, ns: Namespace, only_stack: bool) -> NodeId {
@@ -674,6 +693,212 @@ impl TreeBuilder {
         self.tokenizer_state = Some(state);
         self.orig_mode = self.mode;
         self.mode = Mode::Text;
+    }
+
+    // ---- option / select / selectedcontent side effects (§4.10.7, §4.10.10, the selectedcontent element) ----
+    //
+    // Not tree construction proper, but the parser drives them: "When an option element is popped off the stack
+    // of open elements of an HTML parser … update descendant selectedcontent elements for an option", plus the
+    // option/selectedcontent insertion and post-connection steps. Moving/removing steps (microtask-queued) are
+    // not modelled.
+
+    fn nearest_ancestor_html(&self, n: NodeId, name: &str) -> Option<NodeId> {
+        let mut cur = self.doc.parent(n);
+        while let Some(c) = cur {
+            if self.is_html(c, name) {
+                return Some(c);
+            }
+            cur = self.doc.parent(c);
+        }
+        None
+    }
+
+    /// The list of options of a select (§4.10.7).
+    fn list_of_options(&self, select: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut node = self.doc.first_child(select);
+        while let Some(n) = node {
+            if self.is_html(n, "option") {
+                out.push(n);
+            }
+            let skip = self.is_html_one_of(n, &["select", "hr", "option", "datalist"])
+                || (self.is_html(n, "optgroup") && {
+                    let mut p = self.doc.parent(n);
+                    let mut nested = false;
+                    while let Some(x) = p {
+                        if x == select {
+                            break;
+                        }
+                        if self.is_html(x, "optgroup") {
+                            nested = true;
+                            break;
+                        }
+                        p = self.doc.parent(x);
+                    }
+                    nested
+                });
+            node = if !skip && self.doc.first_child(n).is_some() {
+                self.doc.first_child(n)
+            } else {
+                // next in tree order excluding descendants, bounded by select
+                let mut m = n;
+                loop {
+                    if m == select {
+                        break None;
+                    }
+                    if let Some(sib) = self.doc.next_sibling(m) {
+                        break Some(sib);
+                    }
+                    match self.doc.parent(m) {
+                        Some(p) if p != select => m = p,
+                        _ => break None,
+                    }
+                }
+            };
+        }
+        out
+    }
+
+    fn option_disabled(&self, o: NodeId) -> bool {
+        if self.doc.element(o).is_some_and(|e| e.attr("disabled").is_some()) {
+            return true;
+        }
+        self.doc
+            .parent(o)
+            .is_some_and(|p| self.is_html(p, "optgroup") && self.doc.element(p).is_some_and(|e| e.attr("disabled").is_some()))
+    }
+
+    fn select_display_size_is_1(&self, select: NodeId) -> bool {
+        let e = self.doc.element(select).expect("select");
+        let multiple = e.attr("multiple").is_some();
+        let parsed = e.attr("size").and_then(|v| {
+            let v = v.trim_start_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0C' | '\r'));
+            let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() { None } else { Some(digits.parse::<u64>().unwrap_or(u64::MAX)) }
+        });
+        match parsed {
+            Some(n) => n == 1,
+            None => !multiple,
+        }
+    }
+
+    /// The selectedness setting algorithm; returns hasChanged.
+    fn selectedness_setting(&mut self, select: NodeId) -> bool {
+        if self.doc.element(select).is_some_and(|e| e.attr("multiple").is_some()) {
+            return false;
+        }
+        let mut changed = false;
+        let mut first_enabled = None;
+        let mut last_selected: Option<NodeId> = None;
+        for o in self.list_of_options(select) {
+            if self.selectedness.contains(&o) {
+                if let Some(l) = last_selected {
+                    self.selectedness.remove(&l);
+                    changed = true;
+                }
+                last_selected = Some(o);
+            }
+            if first_enabled.is_none() && !self.option_disabled(o) {
+                first_enabled = Some(o);
+            }
+        }
+        if last_selected.is_none() && self.select_display_size_is_1(select) {
+            if let Some(f) = first_enabled {
+                self.selectedness.insert(f);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Returns the nearest select if the selectedcontent is not disabled.
+    fn selectedcontent_select(&self, sc: NodeId) -> Option<NodeId> {
+        let mut nearest = None;
+        let mut cur = self.doc.parent(sc);
+        while let Some(a) = cur {
+            if self.is_html(a, "select") {
+                if nearest.is_none() {
+                    nearest = Some(a);
+                } else {
+                    return None;
+                }
+            } else if self.is_html_one_of(a, &["option", "selectedcontent"]) {
+                return None;
+            }
+            cur = self.doc.parent(a);
+        }
+        nearest
+    }
+
+    fn update_selectedcontent(&mut self, select: NodeId, sc: NodeId) {
+        let option = self.list_of_options(select).into_iter().find(|o| self.selectedness.contains(o));
+        while let Some(c) = self.doc.first_child(sc) {
+            self.doc.detach(c);
+        }
+        if let Some(o) = option {
+            let kids: Vec<NodeId> = self.doc.children(o).collect();
+            for k in kids {
+                let c = self.doc.clone_subtree(k);
+                self.doc.append(sc, c);
+            }
+        }
+    }
+
+    fn update_select_selectedcontents(&mut self, select: NodeId) {
+        if self.doc.element(select).is_some_and(|e| e.attr("multiple").is_some()) {
+            return;
+        }
+        let scs: Vec<NodeId> = self
+            .doc
+            .descendants(select)
+            .filter(|&n| self.is_html(n, "selectedcontent") && self.selectedcontent_select(n) == Some(select))
+            .collect();
+        for sc in scs {
+            self.update_selectedcontent(select, sc);
+        }
+    }
+
+    fn update_option_selectedcontents(&mut self, o: NodeId) {
+        let Some(&select) = self.option_select.get(&o) else { return };
+        if !self.selectedness.contains(&o) {
+            return;
+        }
+        self.update_select_selectedcontents(select);
+    }
+
+    /// Insertion + post-connection steps for elements the parser inserts.
+    fn inserted(&mut self, el: NodeId) {
+        if self.is_html(el, "option") {
+            let new = self.nearest_ancestor_html(el, "select");
+            let old = self.option_select.get(&el).copied();
+            match new {
+                Some(s) => {
+                    self.option_select.insert(el, s);
+                }
+                None => {
+                    self.option_select.remove(&el);
+                }
+            }
+            if old != new {
+                for s in [old, new].into_iter().flatten() {
+                    self.selectedness_setting(s);
+                }
+            }
+            self.update_option_selectedcontents(el);
+        } else if self.is_html(el, "selectedcontent") {
+            if let Some(select) = self.selectedcontent_select(el) {
+                if self.doc.element(select).is_some_and(|e| e.attr("multiple").is_none()) {
+                    self.update_selectedcontent(select, el);
+                }
+            }
+        }
+    }
+
+    /// An element was popped off (or removed from) the stack of open elements.
+    fn popped(&mut self, n: NodeId) {
+        if self.is_html(n, "option") {
+            self.update_option_selectedcontents(n);
+        }
     }
 
     // ---- active formatting elements ------------------------------------------------------------------------
@@ -741,7 +966,7 @@ impl TreeBuilder {
     fn adoption_agency(&mut self, subject: &str) {
         let cur = self.current();
         if self.is_html(cur, subject) && self.afe_index_of(cur).is_none() {
-            self.open.pop();
+            self.pop();
             return;
         }
         for _ in 0..8 {
@@ -774,7 +999,7 @@ impl TreeBuilder {
             }
             let fb_stack = (fe_stack + 1..self.open.len()).find(|&i| self.is_special(self.open[i]));
             let Some(fb_stack) = fb_stack else {
-                self.open.truncate(fe_stack);
+                self.truncate(fe_stack);
                 self.afe.remove(fe_idx);
                 return;
             };
@@ -802,7 +1027,8 @@ impl TreeBuilder {
                     }
                 }
                 let Some(ai) = node_afe else {
-                    self.open.remove(node_idx);
+                    let removed = self.open.remove(node_idx);
+                    self.popped(removed);
                     continue;
                 };
                 let tag = match &self.afe[ai] {
@@ -851,7 +1077,7 @@ impl TreeBuilder {
             let node = self.open[i];
             if self.is_html(node, name) {
                 self.generate_implied_end_tags(Some(name));
-                self.open.truncate(i);
+                self.truncate(i);
                 return;
             }
             if self.is_special(node) {
@@ -1397,7 +1623,7 @@ impl TreeBuilder {
                 if self.open.len() > 1 && self.is_html(self.open[1], "body") && self.frameset_ok {
                     let body = self.open[1];
                     self.doc.detach(body);
-                    self.open.truncate(1);
+                    self.truncate(1);
                     self.insert_html(&t);
                     self.mode = Mode::InFrameset;
                 }
@@ -1750,7 +1976,7 @@ impl TreeBuilder {
             if self.is_html_one_of(n, names) {
                 break;
             }
-            self.open.pop();
+            self.pop();
         }
     }
     fn clear_to_table_context(&mut self) {
@@ -2346,7 +2572,7 @@ impl TreeBuilder {
                     }
                     let node = self.open[i];
                     if self.local(node).to_ascii_lowercase() == t.name {
-                        self.open.truncate(i);
+                        self.truncate(i);
                         return Res::Done;
                     }
                     i -= 1;
@@ -2368,7 +2594,7 @@ impl TreeBuilder {
             if self.is_mathml_text_ip(n) || self.is_html_ip(n) || self.ns(n) == Namespace::Html {
                 break;
             }
-            self.open.pop();
+            self.pop();
         }
         let mode = self.mode;
         self.step(mode, tok)

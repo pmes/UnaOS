@@ -270,6 +270,34 @@ impl Document {
         }
     }
 
+    /// DOM "clone" with subtree: a detached deep copy of `n` (template contents included).
+    pub fn clone_subtree(&mut self, n: NodeId) -> NodeId {
+        let data = self.nodes[n.0].data.clone();
+        let copy = match data {
+            NodeData::Element(e) => {
+                let c = self.create_element(e.ns, &e.local, e.attrs.clone());
+                if let Some(el) = self.element_mut(c) {
+                    el.html_integration_point = e.html_integration_point;
+                }
+                if let (Some(src), Some(dst)) = (e.template_contents, self.element(c).and_then(|x| x.template_contents)) {
+                    let kids: Vec<NodeId> = self.children(src).collect();
+                    for k in kids {
+                        let kc = self.clone_subtree(k);
+                        self.append(dst, kc);
+                    }
+                }
+                c
+            }
+            other => self.create(other),
+        };
+        let kids: Vec<NodeId> = self.children(n).collect();
+        for k in kids {
+            let kc = self.clone_subtree(k);
+            self.append(copy, kc);
+        }
+        copy
+    }
+
     /// Is `a` an inclusive ancestor of `b`?
     pub fn is_inclusive_ancestor(&self, a: NodeId, b: NodeId) -> bool {
         let mut cur = Some(b);
