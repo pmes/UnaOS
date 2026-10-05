@@ -218,6 +218,7 @@ fn ensure_unafsx86() {
 fn ensure_attr() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) { register("attr", crate::fs::attrsys::selftest); }
+    ensure_volumes(); // VOLUMES (B366): `tests volumes`, `tests testf`
 }
 
 /// LUMENAPP (B323): register `lumen` (the ring-3-free LUMEN.ELF fixture, crate::lumen) exactly once on a
@@ -455,3 +456,11 @@ fn console_verdicts(console: &mut Console) {
 /// that take one; `None` from a bare `tests <name>`, from `tests` (all) and at boot.
 static ARG: spin::Mutex<Option<alloc::string::String>> = spin::Mutex::new(None);
 pub fn arg() -> Option<alloc::string::String> { ARG.lock().clone() }
+
+/// VOLUMES (rmbp-ledger B366) — TAIL-APPENDED: register `tests volumes` (the Volumes layout: boot = EFI only, the
+/// UnaFS root shown, no home on the FAT) and `tests testf` (system/test-f staged vs claimed) exactly once, every build;
+/// the fixtures SKIP or FAIL with their reason from the mounted tree.
+fn ensure_volumes() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) { register("volumes", crate::fs::volumes::selftest); register("testf", crate::fs::volumes::testf_selftest); }
+}

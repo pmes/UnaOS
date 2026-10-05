@@ -548,7 +548,8 @@ static PAINTS: AtomicUsize = AtomicUsize::new(0);
 /// empty child list, so the root row could never grow one, and [`Model::new`]'s landing rule saw no
 /// candidates and stayed on `/`.
 fn collect(path: &str) -> Result<(bool, Vec<DirEnt>), String> {
-    crate::shell::vfs_ls_collect(path)
+    // VOLUMES (B366) M2: Peter's layout — the boot partition under Volumes only, and only its EFI tree.
+    crate::shell::vfs_ls_collect(path).map(|(d, rows)| (d, if d { crate::fs::volumes::view(path, rows, crate::fs::volumes::boot_alias_bound()) } else { rows }))
 }
 
 /// Every mount prefix, sorted. NOT the tree's roots — see [`root_prefixes`], which is the fix for
