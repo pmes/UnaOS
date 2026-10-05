@@ -58,7 +58,7 @@ Design-stage: [aether](handlers/aether), [comscan](handlers/comscan),
 [`docs/CODEX.md`](docs/CODEX.md).
 
 **Vessels** ([`vessels/`](vessels)) — the executables: [lumen](vessels/lumen) (the AI
-companion and reference GUI vessel), [facet](vessels/facet) (raster graphics),
+companion and reference GUI vessel), [facet-view](vessels/facet-view) (the window over the [Facet](handlers/facet) images handler),
 [pulse](vessels/pulse) (the system monitor — live per-core CPU bars, a BeOS Pulse
 homage, fed through a `PulseSource` seam a kernel telemetry feed will later
 back), `una` (IDE, currently parked), and the CLI tools under

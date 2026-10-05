@@ -6,16 +6,23 @@ members = [
     "libs/elessar",
     "libs/resonance",
     "unaos/libs/fs/unafs",
+    "unaos/libs/media/demux_core",
     "libs/input/ibus",
     "unaos/libs/sys/helm",
     "unaos/libs/sys/midden_core",
     "unaos/libs/sys/prefs_core",
     "unaos/libs/sys/vein_core",
     "unaos/libs/sys/amber_core",
+    "unaos/libs/sys/tls_core",
+    "unaos/libs/media/av1_core",
+    "unaos/libs/sys/holocron_core",
+    "unaos/libs/sys/crypto_core",
+    "unaos/libs/media/pixel_core",
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",
     "handlers/vein",
+    "handlers/holocron",
     "handlers/matrix",
     "handlers/comscan",
     "handlers/vaire",
@@ -26,17 +33,24 @@ members = [
     "handlers/stria",
     "handlers/aether",
     "handlers/principia",
+    "handlers/facet",
     # "handlers/vug",
     "tools/vertex",
+    "tools/play-check",
     "tools/unafs",
     "tools/una-card",
     "tools/unafs_bench",
     "tools/sentinel",
+    "tools/pixel-check",
     "tools/foreman",
+    "tools/av1-check",
+    "tools/holocron",
+    "tools/crypto-check",
+    "tools/eyes",
     "vessels/lumen",
     "vessels/pulse",
     "vessels/phonolite",
-    "vessels/facet",
+    "vessels/facet-view",
     "vessels/una",
     "libs/lux",
     "vessels/aether-shell"
@@ -49,7 +63,7 @@ default-members = [
     "vessels/lumen",
     "vessels/pulse",
     "vessels/phonolite",
-    "vessels/facet",
+    "vessels/facet-view",
     "vessels/una",
     "vessels/aether-shell",
     "tools/vertex",
@@ -73,3 +87,8 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.aether-shell]
 opt-level = 2
+
+# HOLOCRON1: the keyring runs Argon2id (64 MiB, t=3) on every unlock; CRYPTOCORE is a workspace member, so
+# the `"*"` rule above does not reach it. Optimised in dev too, or a debug `holocron unlock` takes seconds.
+[profile.dev.package.crypto_core]
+opt-level = 3

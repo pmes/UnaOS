@@ -1,0 +1,25 @@
+<!-- tests: a card gallery with flex-wrap (grid is not claimed by Aether): wrapping, fixed card widths, image blocks, shadows -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Cards</title>
+<style>
+body { margin: 0; padding: 20px; background: #f4f4f4; font-family: sans-serif; }
+h1 { margin: 0 0 16px; font-size: 24px; }
+.gallery { display: flex; flex-wrap: wrap; gap: 16px; }
+.card { width: 230px; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,.2); }
+.thumb { height: 90px; }
+.c1 .thumb { background: #e76f51; } .c2 .thumb { background: #2a9d8f; } .c3 .thumb { background: #e9c46a; }
+.c4 .thumb { background: #264653; } .c5 .thumb { background: #f4a261; } .c6 .thumb { background: #8ab17d; }
+.body { padding: 10px 12px; }
+.body h3 { margin: 0 0 6px; font-size: 16px; }
+.body p { margin: 0; font-size: 13px; color: #666; }
+</style></head><body>
+<h1>Gallery</h1>
+<div class="gallery">
+<div class="card c1"><div class="thumb"></div><div class="body"><h3>Coral</h3><p>A warm orange red.</p></div></div>
+<div class="card c2"><div class="thumb"></div><div class="body"><h3>Teal</h3><p>Cool and calm green blue.</p></div></div>
+<div class="card c3"><div class="thumb"></div><div class="body"><h3>Saffron</h3><p>Bright yellow ochre.</p></div></div>
+<div class="card c4"><div class="thumb"></div><div class="body"><h3>Charcoal</h3><p>Deep blue grey.</p></div></div>
+<div class="card c5"><div class="thumb"></div><div class="body"><h3>Sandy</h3><p>Soft orange.</p></div></div>
+<div class="card c6"><div class="thumb"></div><div class="body"><h3>Sage</h3><p>Muted green.</p></div></div>
+</div>
+</body></html>
