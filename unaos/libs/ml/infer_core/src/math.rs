@@ -105,16 +105,133 @@ fn two_prod(a: f64, b: f64) -> (f64, f64) {
     (p, ((ah * bh - p) + ah * bl + al * bh) + al * bl)
 }
 
-/// erf(x), |error| < 1e-15: for |x| < 3 the everywhere-positive series
-/// erf(x) = (2/√π)·e^{-x²}·Σ 2ⁿx^{2n+1}/(1·3·…·(2n+1)); beyond, 1 − erfc(x) from the continued
-/// fraction (see [`erfc`]).
+// erf / erfc follow FreeBSD msun `s_erf.c` (fdlibm): rational approximations on [0, 0.84375),
+// [0.84375, 1.25), [1.25, 1/0.35) and [1/0.35, 28), each with error below 2^-57 relative to the
+// function it approximates. The coefficients below are fdlibm's, carried with its notice:
+//
+//   Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+//   Developed at SunPro, a Sun Microsystems, Inc. business.
+//   Permission to use, copy, modify, and distribute this software is freely granted, provided
+//   that this notice is preserved.
+//
+// The everywhere-positive series (`erf_series`) and the continued fraction (`erfc_cf`) below are
+// independent evaluations; the unit tests hold the rational forms to them on a dense grid.
+#[allow(clippy::excessive_precision)]
+mod fd {
+    pub const ERX: f64 = 8.45062911510467529297e-01;
+    pub const PP0: f64 = 1.28379167095512558561e-01;
+    pub const PP1: f64 = -3.25042107247001499370e-01;
+    pub const PP2: f64 = -2.84817495755985104766e-02;
+    pub const PP3: f64 = -5.77027029648944159157e-03;
+    pub const PP4: f64 = -2.37630166566501626084e-05;
+    pub const QQ1: f64 = 3.97917223959155352819e-01;
+    pub const QQ2: f64 = 6.50222499887672944485e-02;
+    pub const QQ3: f64 = 5.08130628187576562776e-03;
+    pub const QQ4: f64 = 1.32494738004321644526e-04;
+    pub const QQ5: f64 = -3.96022827877536812320e-06;
+    pub const PA0: f64 = -2.36211856075265944077e-03;
+    pub const PA1: f64 = 4.14856118683748331666e-01;
+    pub const PA2: f64 = -3.72207876035701323847e-01;
+    pub const PA3: f64 = 3.18346619901161753674e-01;
+    pub const PA4: f64 = -1.10894694282396677476e-01;
+    pub const PA5: f64 = 3.54783043256182359371e-02;
+    pub const PA6: f64 = -2.16637559486879084300e-03;
+    pub const QA1: f64 = 1.06420880400844228286e-01;
+    pub const QA2: f64 = 5.40397917702171048937e-01;
+    pub const QA3: f64 = 7.18286544141962662868e-02;
+    pub const QA4: f64 = 1.26171219808761642112e-01;
+    pub const QA5: f64 = 1.36370839120290507362e-02;
+    pub const QA6: f64 = 1.19844998467991074170e-02;
+    pub const RA0: f64 = -9.86494403484714822705e-03;
+    pub const RA1: f64 = -6.93858572707181764372e-01;
+    pub const RA2: f64 = -1.05586262253232909814e+01;
+    pub const RA3: f64 = -6.23753324503260060396e+01;
+    pub const RA4: f64 = -1.62396669462573470355e+02;
+    pub const RA5: f64 = -1.84605092906711035994e+02;
+    pub const RA6: f64 = -8.12874355063065934246e+01;
+    pub const RA7: f64 = -9.81432934416914548592e+00;
+    pub const SA1: f64 = 1.96512716674392571292e+01;
+    pub const SA2: f64 = 1.37657754143519042600e+02;
+    pub const SA3: f64 = 4.34565877475229228821e+02;
+    pub const SA4: f64 = 6.45387271733267880336e+02;
+    pub const SA5: f64 = 4.29008140027567833386e+02;
+    pub const SA6: f64 = 1.08635005541779435134e+02;
+    pub const SA7: f64 = 6.57024977031928170135e+00;
+    pub const SA8: f64 = -6.04244152148580987438e-02;
+    pub const RB0: f64 = -9.86494292470009928597e-03;
+    pub const RB1: f64 = -7.99283237680523006574e-01;
+    pub const RB2: f64 = -1.77579549177547519889e+01;
+    pub const RB3: f64 = -1.60636384855821916062e+02;
+    pub const RB4: f64 = -6.37566443368389627722e+02;
+    pub const RB5: f64 = -1.02509513161107724954e+03;
+    pub const RB6: f64 = -4.83519191608651397019e+02;
+    pub const SB1: f64 = 3.03380607434824582924e+01;
+    pub const SB2: f64 = 3.25792512996573918826e+02;
+    pub const SB3: f64 = 1.53672958608443695994e+03;
+    pub const SB4: f64 = 3.19985821950859553908e+03;
+    pub const SB5: f64 = 2.55305040643316442583e+03;
+    pub const SB6: f64 = 4.74528541206955367215e+02;
+    pub const SB7: f64 = -2.24409524465858183362e+01;
+}
+use fd::*;
+
+/// The high 32 bits of |x| (fdlibm's interval selector).
+fn hi_abs(x: f64) -> u32 {
+    ((x.to_bits() >> 32) as u32) & 0x7fff_ffff
+}
+
+fn erf_small(x: f64) -> f64 {
+    // x·R(x²) for |x| < 0.84375.
+    let z = x * x;
+    let r = PP0 + z * (PP1 + z * (PP2 + z * (PP3 + z * PP4)));
+    let s = 1.0 + z * (QQ1 + z * (QQ2 + z * (QQ3 + z * (QQ4 + z * QQ5))));
+    x * (r / s)
+}
+
+fn erf_mid(x: f64) -> f64 {
+    // P1(s)/Q1(s), s = |x| − 1, for |x| in [0.84375, 1.25).
+    let s = x.abs() - 1.0;
+    let p = PA0 + s * (PA1 + s * (PA2 + s * (PA3 + s * (PA4 + s * (PA5 + s * PA6)))));
+    let q = 1.0 + s * (QA1 + s * (QA2 + s * (QA3 + s * (QA4 + s * (QA5 + s * QA6)))));
+    p / q
+}
+
+/// erfc(|x|) for |x| in [1.25, 28).
+fn erfc_tail(x: f64) -> f64 {
+    let x = x.abs();
+    let s = 1.0 / (x * x);
+    let (r, big_s) = if hi_abs(x) < 0x4006_db6d {
+        (
+            RA0 + s * (RA1 + s * (RA2 + s * (RA3 + s * (RA4 + s * (RA5 + s * (RA6 + s * RA7)))))),
+            1.0 + s * (SA1 + s * (SA2 + s * (SA3 + s * (SA4 + s * (SA5 + s * (SA6 + s * (SA7 + s * SA8))))))),
+        )
+    } else {
+        (
+            RB0 + s * (RB1 + s * (RB2 + s * (RB3 + s * (RB4 + s * (RB5 + s * RB6))))),
+            1.0 + s * (SB1 + s * (SB2 + s * (SB3 + s * (SB4 + s * (SB5 + s * (SB6 + s * SB7)))))),
+        )
+    };
+    let z = f64::from_bits(x.to_bits() & 0xffff_ffff_0000_0000);
+    exp(-z * z - 0.5625) * exp((z - x) * (z + x) + r / big_s) / x
+}
+
+/// erf(x) (fdlibm's method; < 1 ulp in f64).
 pub fn erf(x: f64) -> f64 {
     if x.is_nan() {
         return x;
     }
-    let a = x.abs();
-    let v = if a < 3.0 { erf_series(a) } else { 1.0 - erfc_cf(a) };
-    if x < 0.0 { -v } else { v }
+    let ix = hi_abs(x);
+    if ix < 0x3feb_0000 {
+        return x + erf_small(x);
+    }
+    let y = if ix < 0x3ff4_0000 {
+        ERX + erf_mid(x)
+    } else if ix < 0x4018_0000 {
+        1.0 - erfc_tail(x)
+    } else {
+        1.0
+    };
+    if x < 0.0 { -y } else { y }
 }
 
 /// erfc(x) = 1 − erf(x), accurate in the tails (so GELU of a large negative input is not 0).
@@ -122,14 +239,28 @@ pub fn erfc(x: f64) -> f64 {
     if x.is_nan() {
         return x;
     }
-    if x < 0.0 {
-        return 2.0 - erfc(-x);
+    let ix = hi_abs(x);
+    if ix < 0x3feb_0000 {
+        let y = erf_small(x);
+        return if x < 0.25 { 1.0 - (x + y) } else { 0.5 - (x - 0.5 + y) };
     }
-    if x < 3.0 { 1.0 - erf_series(x) } else { erfc_cf(x) }
+    if ix < 0x3ff4_0000 {
+        let p = erf_mid(x);
+        return if x > 0.0 { (1.0 - ERX) - p } else { 1.0 + (ERX + p) };
+    }
+    if ix < 0x403c_0000 {
+        let t = erfc_tail(x);
+        return if x > 0.0 { t } else { 2.0 - t };
+    }
+    if x > 0.0 { 0.0 } else { 2.0 }
 }
 
+#[cfg(test)]
 const TWO_OVER_SQRT_PI: f64 = core::f64::consts::FRAC_2_SQRT_PI;
 
+/// erf by the everywhere-positive series (2/√π)·e^{-x²}·Σ 2ⁿx^{2n+1}/(1·3·…·(2n+1)) (|x| < 3):
+/// the independent check of the rational forms.
+#[cfg(test)]
 fn erf_series(a: f64) -> f64 {
     let x2 = a * a;
     let mut term = a;
@@ -148,6 +279,7 @@ fn erf_series(a: f64) -> f64 {
 
 /// erfc for x ≥ 3 by the continued fraction e^{-x²}/√π · 1/(x + (1/2)/(x + 1/(x + (3/2)/(x + …)))),
 /// evaluated bottom-up with a fixed depth (60 levels: converged to < 1e-17 relative for x ≥ 3).
+#[cfg(test)]
 fn erfc_cf(x: f64) -> f64 {
     let mut f = x;
     for k in (1..=60).rev() {
@@ -157,6 +289,7 @@ fn erfc_cf(x: f64) -> f64 {
 }
 
 /// √π.
+#[cfg(test)]
 const SQRT_PI: f64 = 1.772_453_850_905_516_027_3;
 
 /// GELU, the exact (erf) form BERT uses: x·Φ(x) = ½·x·erfc(−x/√2), rounded once to f32.
@@ -200,6 +333,25 @@ mod tests {
         assert!((erfc(3.0) - 2.209_049_699_858_544e-5).abs() < 1e-18);
         assert!((erfc(2.99) - 2.352_560_308_064_019_5e-5).abs() < 1e-15);
         assert!((erfc(3.01) - 2.073_896_363_713_263e-5).abs() < 1e-18);
+    }
+
+    #[test]
+    fn rational_forms_agree_with_the_series_and_the_continued_fraction() {
+        let mut worst = 0.0f64;
+        for i in 0..30000 {
+            let x = i as f64 * 1e-4; // [0, 3)
+            let d = (erf(x) - erf_series(x)).abs();
+            worst = worst.max(d);
+            assert!(d < 2e-15, "erf({x}): {} vs series {}", erf(x), erf_series(x));
+            assert!((erfc(-x) - (1.0 + erf_series(x))).abs() < 4e-15);
+        }
+        for i in 0..2300 {
+            let x = 3.0 + i as f64 * 1e-2; // [3, 26): erfc stays a normal f64 (≥ 1e-296)
+            let (a, b) = (erfc(x), erfc_cf(x));
+            // The continued fraction's own e^{-x²} carries the rounding of x² (≈ x²·2^-53 relative).
+            assert!(((a - b) / b).abs() < 2e-16 * (1.0 + x * x), "erfc({x}): {a} vs cf {b}");
+        }
+        assert!(worst < 2e-15);
     }
 
     #[test]

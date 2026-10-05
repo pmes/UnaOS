@@ -116,23 +116,26 @@ impl Linear {
                     for r in 0..rows {
                         acc[r][..cols].copy_from_slice(&out[(i + r) * n_out + j0..(i + r) * n_out + j0 + cols]);
                     }
+                    let (wb, _) = block.as_chunks::<NR>();
                     if rows == MR {
-                        let xs: [&[f32]; MR] = core::array::from_fn(|r| &x[(i + r) * n_in + k0..(i + r) * n_in + k1]);
-                        for (kk, w) in block.chunks_exact(NR).enumerate() {
-                            for r in 0..MR {
-                                let a = xs[r][kk];
-                                for c in 0..NR {
-                                    acc[r][c] += a * w[c];
-                                }
+                        let row = |r: usize| &x[(i + r) * n_in + k0..(i + r) * n_in + k1];
+                        let (x0, x1, x2, x3) = (row(0), row(1), row(2), row(3));
+                        let [mut c0, mut c1, mut c2, mut c3] = acc;
+                        for ((((w, &a0), &a1), &a2), &a3) in wb.iter().zip(x0).zip(x1).zip(x2).zip(x3) {
+                            for c in 0..NR {
+                                c0[c] += a0 * w[c];
+                                c1[c] += a1 * w[c];
+                                c2[c] += a2 * w[c];
+                                c3[c] += a3 * w[c];
                             }
                         }
+                        acc = [c0, c1, c2, c3];
                     } else {
-                        for r in 0..rows {
+                        for (r, accr) in acc.iter_mut().enumerate().take(rows) {
                             let xr = &x[(i + r) * n_in + k0..(i + r) * n_in + k1];
-                            for (kk, w) in block.chunks_exact(NR).enumerate() {
-                                let a = xr[kk];
+                            for (w, &a) in wb.iter().zip(xr) {
                                 for c in 0..NR {
-                                    acc[r][c] += a * w[c];
+                                    accr[c] += a * w[c];
                                 }
                             }
                         }
