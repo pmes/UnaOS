@@ -907,7 +907,7 @@ fn x200_witness(op_base: usize, tag: &str, val: u64) {
         let cmd = core::ptr::read_volatile(op_base as *const u32);
         let sts = core::ptr::read_volatile((op_base + 0x04) as *const u32);
         let crcr = core::ptr::read_volatile((op_base + 0x18) as *const u32);
-        serial_println!(
+        crate::census_println!(
             ":: X200: {}={:#x} (RS={} HCH={} CRR={}) ::",
             tag, val, cmd & 1, sts & 1, (crcr >> 3) & 1
         );

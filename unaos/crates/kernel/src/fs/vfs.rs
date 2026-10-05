@@ -356,6 +356,14 @@ pub trait VfsBackend {
         Err(VfsError::Unsupported)
     }
 
+    /// BOOT80 (rmbp B350): create `files` — each a name plus its typed attributes, no data — under the
+    /// directory at `rel` in ONE transaction where the volume has one (UnaFS's `create_files_batch`:
+    /// one root flip instead of a flip per create and per attribute). Returns how many were created.
+    /// Default `Unsupported`: the caller falls back to per-object `create` + `set_attr`.
+    fn create_files_batch(&self, _rel: &str, _files: Vec<(String, Vec<(String, AttrValue)>)>, _principal: &str) -> Result<usize, VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
     /// Read one typed attribute. An absent key is [`VfsError::Backend`]`("no-attr")` (`-ENODATA`).
     fn get_attr(&self, _rel: &str, _key: &str, _principal: &str) -> Result<AttrValue, VfsError> {
         Err(VfsError::Unsupported)
@@ -793,6 +801,12 @@ impl MountTable {
     pub fn get_attr(&self, path: &str, key: &str, principal: &str) -> Result<AttrValue, VfsError> {
         let (b, rel) = self.resolve(path)?;
         b.get_attr(rel, key, principal)
+    }
+
+    /// BOOT80 (B350): [`VfsBackend::create_files_batch`] on the volume that holds directory `path`.
+    pub fn create_files_batch(&self, path: &str, files: Vec<(String, Vec<(String, AttrValue)>)>, principal: &str) -> Result<usize, VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.create_files_batch(rel, files, principal)
     }
 
     pub fn list_attrs(&self, path: &str, principal: &str) -> Result<Vec<(String, AttrValue)>, VfsError> {
@@ -2004,6 +2018,41 @@ impl VfsBackend for NativeBackend {
             native_write_authz(fs, id, principal)?;
             fs.set_attribute(id, key.to_string(), value.clone().into_native()) // `with_unafs` takes FnMut
                 .map_err(|_| VfsError::Backend("unafs-setattr"))
+        })
+        .map_err(unafs_err)?
+    }
+
+    /// BOOT80 (B350): the batch create over the one coherent mount — authorized against the directory's
+    /// write ACL like `create`, every key and value checked like `set_attr`, a non-kernel creator
+    /// recorded as `owner` like `create`; then ONE `create_files_batch` (one root flip). An existing
+    /// name refuses the whole batch (`Backend("exists")`) and nothing lands.
+    fn create_files_batch(&self, rel: &str, files: Vec<(String, Vec<(String, AttrValue)>)>, principal: &str) -> Result<usize, VfsError> {
+        for (_, attrs) in files.iter() {
+            for (k, v) in attrs.iter() {
+                attr_key_guard(k, principal)?;
+                v.check()?;
+            }
+        }
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let dir = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_write_authz(fs, dir, principal)?;
+            let mut batch = Vec::with_capacity(files.len());
+            for (name, attrs) in files.iter() {
+                let mut attributes = alloc::collections::BTreeMap::new();
+                for (k, v) in attrs.iter() {
+                    attributes.insert(k.clone(), v.clone().into_native());
+                }
+                if principal != KERNEL_PRINCIPAL {
+                    attributes.insert(String::from("owner"), ::unafs::inode::AttributeValue::String(principal.to_string()));
+                }
+                batch.push(::unafs::BatchFile { name: name.clone(), data: Vec::new(), attributes });
+            }
+            match fs.create_files_batch(dir, batch) {
+                Ok(ids) => Ok(ids.len()),
+                Err(::unafs::fs::FileSystemError::FileExists) => Err(VfsError::Backend("exists")),
+                Err(_) => Err(VfsError::Backend("unafs-batch")),
+            }
         })
         .map_err(unafs_err)?
     }

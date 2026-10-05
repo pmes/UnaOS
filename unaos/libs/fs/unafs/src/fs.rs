@@ -2239,7 +2239,8 @@ impl<D: BlockDevice> UnaFS<D> {
     /// exactly one refcount per referencing root, so drop frees a block iff no
     /// remaining root reaches it). Refcount- and refmap-map blocks are NOT
     /// included: a snapshot retains the DATA tree, not the allocator (the live
-    /// refmap is rewritten every commit and is never snapshotted).
+    /// refmap is never snapshotted; BOOT80/UNAFSMAP: its clean leaves keep their blocks, the dirty ones
+    /// rewritten, every commit).
     ///
     /// Bounded against the volume span (the on-disk imap is untrusted input);
     /// a pointer out of range is a `CorruptVolume` error, never a slice panic,

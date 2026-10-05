@@ -1005,6 +1005,42 @@ fn main() {
         }
     }
 
+    // SELFBUILD3 (B353): the lazy-memory KAT, the printf fixture tcc compiles against musl, and the musl libc itself as DATA —
+    // target/LIB (crt1.o crti.o crtn.o libc.a, include/, tcc/{libtcc1.a,include/}, built by arroyo's build_selfbuild_x86 at the
+    // pinned musl and tinycc commits) copied whole to APPS/LIB, the paths TCC.LNX is configured with. Absent = skipped
+    // (`tests selfbuild3` then reports libc=none). Headers keep their long names (VFAT LFN, read by the kernel's FAT walkers).
+    for (src, dst) in [("SYSKAT3.LNX", "SYSKAT3.LNX"), ("PRINTF.C", "PRINTF.C")] {
+        let f = target_dir.join(src);
+        if f.exists() {
+            std::fs::copy(&f, esp_apps.join(dst)).unwrap();
+            println!("   SELFBUILD3: copied {dst} into APPS/ on the ESP");
+        } else {
+            println!("   SELFBUILD3: target/{src} absent — ESP has no {dst} (run via ./arroyo esp-x86)");
+        }
+    }
+    let musl_lib = target_dir.join("LIB");
+    if musl_lib.join("libc.a").exists() {
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> u64 {
+            std::fs::create_dir_all(to).unwrap();
+            let mut n = 0;
+            for e in std::fs::read_dir(from).unwrap() {
+                let e = e.unwrap();
+                let (src, dst) = (e.path(), to.join(e.file_name()));
+                if e.file_type().unwrap().is_dir() {
+                    n += copy_tree(&src, &dst);
+                } else {
+                    std::fs::copy(&src, &dst).unwrap();
+                    n += 1;
+                }
+            }
+            n
+        }
+        let n = copy_tree(&musl_lib, &esp_apps.join("LIB"));
+        println!("   SELFBUILD3: staged APPS/LIB ({n} files: musl crt + libc.a + headers, tcc's libtcc1.a + headers)");
+    } else {
+        println!("   SELFBUILD3: target/LIB absent — ESP has no APPS/LIB (musl not built: no egress at build time?)");
+    }
+
     // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
     // target/PULSE-X86.ELF), staged as PULSE.ELF exactly like STAT.ELF/VUG.ELF above and for the same
     // reasons — un-suffixed on the volume so `bg /apps/PULSE.ELF` reads the same on both arches.

@@ -19153,8 +19153,8 @@ fn bt_defer_boot_campaign(idx: usize, addr: u8) {
     let now = crate::arch::ms();
     BT_BOOT_CAMPAIGN_AT.store(now, core::sync::atomic::Ordering::SeqCst);
     BT_BOOT_CAMPAIGN.store(idx as u32 + 1, core::sync::atomic::Ordering::SeqCst);
-    serial_println!(":: bt-sched: campaign deferred past gui at {} ms ::", now);
-    serial_println!(
+    crate::bootlog_println!(":: bt-sched: campaign deferred past gui at {} ms ::", now);
+    crate::bootlog_println!(
         ":: bt-sched: [{}] radio addr={} claimed and armed; the bring-up chain is NOT run on the boot core — the port walk continues from here and the GUI ignites first; the chain runs from the post-GUI service pass with its content, its bounds and its witnesses unchanged == witness ::",
         idx, addr
     );

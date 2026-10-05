@@ -1781,6 +1781,7 @@ pub fn read_block_sdhc(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
     }
+    crate::fs::bootstep::note_read(1); // BOOT80 (B350): the step lines count what reached the card
     crate::drivers::sdhc::read_block_512(lba, buf)
 }
 
@@ -1797,6 +1798,7 @@ pub fn read_blocks_sdhc(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     let dev = sdhc_info().ok_or(BlockError::NotReady)?;
     let count = span_blocks(&dev, lba, buf.len())?;
     #[cfg(feature = "sdw")] crate::drivers::sdhc::wr_census_idle(); // SDHCMULTI M1: a read after a quiet gap closes the write burst
+    crate::fs::bootstep::note_read(count as u64); // BOOT80 (B350)
     let n = crate::drivers::sdhc::read_blocks_512(lba, count, buf)?;
     // A short counted read is an error, never a silent prefix — the same rule the xHCI counted forms
     // enforce, and the one failure mode a filesystem above has no way to notice.
@@ -1829,6 +1831,7 @@ pub fn write_block_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
     }
+    crate::fs::bootstep::note_write(1); // BOOT80 (B350)
     let t0 = crate::drivers::sdhc::wr_census_begin(); // SDHCMULTI M1: the census times the whole call
     let r = crate::drivers::sdhc::write_block_512(lba, buf);
     crate::drivers::sdhc::wr_census_note(t0, 1, false, 0, r.is_ok());
@@ -2335,14 +2338,14 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
     };
 
     // --- RAW, before decoding anything: the signature word and the four 16-byte entries verbatim.
-    serial_println!(
+    crate::census_println!(
         ":: PART: mbr-raw handle={} dev_blocks={} sig={:02x}{:02x} ::",
         name, dev_blocks, sec[MBR_SIG_OFF], sec[MBR_SIG_OFF + 1]
     );
     for i in 0..4 {
         let o = MBR_TABLE_OFF + i * MBR_ENTRY_LEN;
         let e = &sec[o..o + MBR_ENTRY_LEN];
-        serial_println!(
+        crate::census_println!(
             ":: PART: mbr-raw handle={} e{} = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
             name, i + 1,
             e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
@@ -2352,22 +2355,22 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
 
     // --- Decoded verdict, per slot, then the summary.
     let Some(t) = table else {
-        serial_println!(":: PART: mbr census handle={} sig=absent — not an MBR ::", name);
+        crate::census_println!(":: PART: mbr census handle={} sig=absent — not an MBR ::", name);
         return table;
     };
     for slot in 1..=4u8 {
         match (t.entry(slot), t.reject(slot)) {
-            (Some(p), _) => serial_println!(
+            (Some(p), _) => crate::census_println!(
                 ":: PART: mbr handle={} slot={} type=0x{:02x} boot=0x{:02x} start={} count={} end={} ACCEPT ::",
                 name, slot, p.type_byte, p.boot_flag, p.start_lba, p.sector_count, p.end_lba()
             ),
-            (None, Some(r)) => serial_println!(
+            (None, Some(r)) => crate::census_println!(
                 ":: PART: mbr handle={} slot={} REJECT {:?} ::", name, slot, r
             ),
             (None, None) => {}
         }
     }
-    serial_println!(
+    crate::census_println!(
         ":: PART: mbr census handle={} protective={} accepted={} rejected={} ::",
         name, t.protective as u8, t.accepted(), t.rejected()
     );
@@ -3607,6 +3610,7 @@ pub fn write_blocks_sdhc_mb(lba: u64, count: usize, buf: &[u8]) -> Result<(), Bl
     if buf.len() < count * SECTOR_BYTES {
         return Err(BlockError::Io);
     }
+    crate::fs::bootstep::note_write(count as u64); // BOOT80 (B350)
     let t0 = crate::drivers::sdhc::wr_census_begin(); // SDHCMULTI M1
     let r = crate::drivers::sdhc::write_blocks_512(lba, count as u16, &buf[..count * SECTOR_BYTES]);
     crate::drivers::sdhc::wr_census_note(t0, count as u64, true, *r.as_ref().unwrap_or(&0), r.is_ok());

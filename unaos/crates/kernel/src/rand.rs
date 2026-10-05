@@ -172,7 +172,7 @@ pub fn fill(out: &mut [u8; 32]) -> Source {
     DRAWS.fetch_add(1, Ordering::Relaxed);
     if SAID.swap(1, Ordering::AcqRel) == 0 {
         let (_, said) = probe();
-        serial_println!("[rand] source={} probe={} bits=256", src.name(), said);
+        crate::bootlog_println!("[rand] source={} probe={} bits=256", src.name(), said);
     }
     src
 }

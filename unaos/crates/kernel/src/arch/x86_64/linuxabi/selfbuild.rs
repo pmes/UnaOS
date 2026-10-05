@@ -52,7 +52,7 @@ pub fn kat() {
     let (r, cap) = run_cap(KAT, &[KAT], 5_000);
     match r {
         Err(e) if e.contains("-ENOENT") => {
-            serial_println!(":: LINUXABI-KAT: path={} checks=0 fail=none exit=? syscalls=0 enosys=[] -> SKIP (fixture not staged) ::", KAT)
+            serial_println!(":: LINUXABI-KAT: path={} checks=0 fail=none exit=? syscalls=0 enosys=[] -> SKIP reason=fixture-not-staged ::", KAT)
         }
         Err(e) => serial_println!(":: LINUXABI-KAT: path={} checks=0 fail=load exit=? syscalls=0 enosys=[] -> FAIL ({}) ::", KAT, e),
         Ok(rep) => {
@@ -89,7 +89,7 @@ pub fn selftest() {
     let out = alloc::format!("{}hello.lnx", super::sys::home_prefix());
     if exists(TCC).is_none() || exists(SRC).is_none() {
         serial_println!(
-            ":: SELFBUILD1: tcc=skip hello=skip probe=none probe_syscalls=0 probe_missing=[] -> SKIP (TCC.LNX/HELLO.C not staged) ::"
+            ":: SELFBUILD1: tcc=skip hello=skip probe=none probe_syscalls=0 probe_missing=[] -> SKIP reason=tcc-hello-not-staged ::"
         );
         return;
     }

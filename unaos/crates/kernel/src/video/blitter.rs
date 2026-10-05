@@ -279,7 +279,7 @@ pub fn ignite() {
         }
         Err(r) => r,
     };
-    serial_println!("[wc] blitter={} reason={}", selected().name(), reason);
+    crate::bootlog_println!("[wc] blitter={} reason={}", selected().name(), reason);
 }
 
 pub fn selected() -> &'static dyn Blitter {

@@ -129,6 +129,7 @@ pub fn init(boot_info: &'static mut BootInfo) {
         unsafe {
             crate::allocator::init_heap_raw(heap_start as *mut u8, heap_size);
         }
+        SB3_HEAP.store(heap_start, core::sync::atomic::Ordering::Release); // SELFBUILD3 (B353): the Linux shim's frame pool steers around it
     } else {
         serial_println!("Available memory regions: {}", regions.len());
         for region in regions.iter().take(15) {
@@ -4369,4 +4370,25 @@ pub fn args_argc(s: usize) -> usize {
 pub fn args_contains(ptr: u64, end: u64) -> bool {
     let lo = super::syscall::USER_BASE + ARGS_OFF as u64;
     ptr >= lo && end >= ptr && end <= lo + 4096
+}
+
+// SELFBUILD3 (B353): what the Linux ABI shim's user frame pool (`linuxabi/vm.rs`) may draw on — the Usable RAM of the UEFI
+// map and the window the kernel heap took out of it.
+static SB3_HEAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(physical start, length)` of the kernel heap (length 0 before `init`).
+pub fn selfbuild3_heap_window() -> (u64, u64) {
+    let s = SB3_HEAP.load(core::sync::atomic::Ordering::Acquire);
+    if s == 0 { (0, 0) } else { (s, crate::allocator::HEAP_SIZE as u64) }
+}
+
+/// Every `Usable` region of the UEFI map as `[start, end)` (empty before `init`).
+pub fn selfbuild3_usable_ram() -> alloc::vec::Vec<(u64, u64)> {
+    let mut v = alloc::vec::Vec::new();
+    if let Some(regions) = REGIONS.get() {
+        for r in regions.iter().filter(|r| r.kind == MemoryRegionKind::Usable) {
+            v.push((r.phys_start, r.phys_start + r.page_count * 4096));
+        }
+    }
+    v
 }

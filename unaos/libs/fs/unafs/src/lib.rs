@@ -49,6 +49,7 @@ pub mod io;
 pub mod legacy;
 pub mod maptree;
 pub mod query;
+pub mod readahead;
 pub mod refmap;
 pub mod root;
 pub mod storage;

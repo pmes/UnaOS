@@ -91,6 +91,35 @@ pub trait SectorDevice {
     fn flush(&mut self) -> Result<(), SectorError> {
         Ok(())
     }
+
+    /// BOOT80 (rmbp B350): read `buf.len() / 512` CONSECUTIVE sectors starting at `lba` in one call.
+    /// The default is the per-sector loop (byte-identical to the pre-BOOT80 adapter); a device whose
+    /// medium has a multi-block command (the SD card's CMD18) overrides it, so a 4 KiB block costs one
+    /// command instead of eight. `buf.len()` must be a whole number of sectors.
+    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+        if buf.len() as u64 % SECTOR_SIZE != 0 {
+            return Err(SectorError::Io(alloc::format!("read span {} not whole sectors", buf.len())));
+        }
+        for (i, chunk) in buf.chunks_mut(SECTOR_SIZE as usize).enumerate() {
+            let at = lba.checked_add(i as u64).ok_or(SectorError::OutOfBounds(lba))?;
+            self.read_sector(at, chunk)?;
+        }
+        Ok(())
+    }
+
+    /// BOOT80: the write twin of [`read_sectors`](Self::read_sectors) (CMD25 where the medium has one).
+    /// Synchronous-to-medium like [`write_sector`](Self::write_sector): the K8a commit ordering rests
+    /// on it (see the kernel device's `flush` note).
+    fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
+        if buf.len() as u64 % SECTOR_SIZE != 0 {
+            return Err(SectorError::Io(alloc::format!("write span {} not whole sectors", buf.len())));
+        }
+        for (i, chunk) in buf.chunks(SECTOR_SIZE as usize).enumerate() {
+            let at = lba.checked_add(i as u64).ok_or(SectorError::OutOfBounds(lba))?;
+            self.write_sector(at, chunk)?;
+        }
+        Ok(())
+    }
 }
 
 /// A `&mut S` is itself a [`SectorDevice`], so an adapter can borrow a device
@@ -107,6 +136,12 @@ impl<S: SectorDevice + ?Sized> SectorDevice for &mut S {
     }
     fn flush(&mut self) -> Result<(), SectorError> {
         (**self).flush()
+    }
+    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+        (**self).read_sectors(lba, buf)
+    }
+    fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
+        (**self).write_sectors(lba, buf)
     }
 }
 
@@ -189,15 +224,9 @@ impl<S: SectorDevice> BlockDevice for BlockAdapter<S> {
             return Err(StorageError::OutOfBounds(id));
         }
         let first = self.first_lba(id)?;
-        for i in 0..SECTORS_PER_BLOCK {
-            let lba = first.checked_add(i).ok_or(StorageError::OutOfBounds(id))?;
-            let start = (i * SECTOR_SIZE) as usize;
-            let end = start + SECTOR_SIZE as usize;
-            self.dev
-                .read_sector(lba, &mut buf[start..end])
-                .map_err(map_sector_err)?;
-        }
-        Ok(())
+        first.checked_add(SECTORS_PER_BLOCK).ok_or(StorageError::OutOfBounds(id))?;
+        // BOOT80: the block's eight sectors in ONE device call (one CMD18 on the SD card).
+        self.dev.read_sectors(first, buf).map_err(map_sector_err)
     }
 
     fn write_block(&mut self, id: u64, buf: &[u8]) -> Result<(), StorageError> {
@@ -208,15 +237,9 @@ impl<S: SectorDevice> BlockDevice for BlockAdapter<S> {
             return Err(StorageError::OutOfBounds(id));
         }
         let first = self.first_lba(id)?;
-        for i in 0..SECTORS_PER_BLOCK {
-            let lba = first.checked_add(i).ok_or(StorageError::OutOfBounds(id))?;
-            let start = (i * SECTOR_SIZE) as usize;
-            let end = start + SECTOR_SIZE as usize;
-            self.dev
-                .write_sector(lba, &buf[start..end])
-                .map_err(map_sector_err)?;
-        }
-        Ok(())
+        first.checked_add(SECTORS_PER_BLOCK).ok_or(StorageError::OutOfBounds(id))?;
+        // BOOT80: one device call per block (one CMD25 on the SD card).
+        self.dev.write_sectors(first, buf).map_err(map_sector_err)
     }
 
     fn block_count(&self) -> u64 {

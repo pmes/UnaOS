@@ -87,7 +87,7 @@ fn app_note_flags(elf: &[u8]) -> Option<u32> {
 pub fn selftest() {
     match check() {
         Some(img) => spawn_step(&img),
-        None => serial_println!(":: LUMENCRASH: spawned=0 first_line=none -> SKIP ::"),
+        None => serial_println!(":: LUMENCRASH: spawned=0 first_line=none -> SKIP reason=not-spawned ::"),
     }
     lumenux();
 }
@@ -161,7 +161,7 @@ pub fn selftest() {
     let (provider, key) = session();
     let _ = app_note_flags;
     serial_println!(":: LUMENAPP: reason=aarch64-image-owed ::");
-    serial_println!(":: LUMENAPP: image={} window=bad provider={} key={} -> SKIP ::", IMAGE, provider, key.as_str());
+    serial_println!(":: LUMENAPP: image={} window=bad provider={} key={} -> SKIP reason=window-bad ::", IMAGE, provider, key.as_str());
     lumenux();
 }
 

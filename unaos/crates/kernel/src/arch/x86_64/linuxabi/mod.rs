@@ -28,7 +28,8 @@
 //! window, files writable under `/home/<user>/` (`fd.rs`, `sys.rs`). Blocking syscalls are RETRY loops in [`dispatch`].
 //!
 //! Known limits: no threads/signals delivery (kill = end the task); fork copies eagerly (no CoW fault hook); FS_BASE is per-core, so every
-//! process is PINNED to one core (the scheduler hook re-asserts it per switch-in); files are slurped whole at open; x87/SSE state is
+//! process is PINNED to one core (the scheduler hook re-asserts it per switch-in); files are read through the VFS per call (SELFBUILD3; they
+//! were slurped whole at open) and memory is lazy (`vm.rs`); x87/SSE state is
 //! saved per process (LINUXABI3, `fpu.rs`: eager FXSAVE, CR4.OSFXSR only while a Linux task runs; no AVX); the cloned low-memory page-table copy does not see kernel mapping
 //! edits made while the process runs.
 
@@ -43,6 +44,8 @@ pub mod sys;
 pub mod sys2;
 pub mod sys3;
 pub mod thread;
+pub mod selfbuild3; // SELFBUILD3 (B353): `tests selfbuild3`
+pub mod vm; // SELFBUILD3 (B353): lazy VMAs, the #PF hook, the resident budget, the user frame pool
 
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -58,13 +61,14 @@ use super::memory;
 pub const TASK_NAME: &str = "linuxabi";
 pub const PAGE: u64 = 4096;
 pub const BRK_BASE: u64 = 0x0000_0100_0100_0000;
-pub const BRK_MAX: u64 = 64 << 20;
+pub const BRK_MAX: u64 = MMAP_BASE - BRK_BASE; // SELFBUILD3: lazy, so the brk may grow to the first mmap window (1008 MiB)
 pub const MMAP_BASE: u64 = 0x0000_0100_4000_0000;
 pub const MMAP_LIMIT: u64 = 0x0000_0100_7000_0000;
 pub const STACK_TOP: u64 = 0x0000_0100_8000_0000;
 pub const STACK_PAGES: u64 = 128;
-/// Total data pages one process may hold (96 MiB) — fail-closed `-ENOMEM`.
-pub const MAX_PAGES: usize = 24576;
+/// Pre-SELFBUILD3 per-process cap (96 MiB). SELFBUILD3: now the HEAP-backed share of a RESIDENT budget (`vm::HEAP_SHARE`,
+/// `vm::limit_pages` = this + the user frame pool); kept for the doc trail.
+pub const MAX_PAGES: usize = vm::HEAP_SHARE;
 
 const P: u64 = 1;
 const W: u64 = 2;
@@ -80,8 +84,15 @@ const CANON_MAX: u64 = 0x0000_8000_0000_0000;
 
 /// A private x86_64 address space built over the kernel's. Owns every table it created/cloned and every
 /// data frame; [`AddrSpace::release`] frees them all.
+/// SELFBUILD3 (B353): the tables/frames bookkeeping sits in a `RefCell` so a kernel-side `copy_in`/`copy_out` through a
+/// shared borrow can back a lazy page (`vm.rs`); `vm` is the VMA list (lazy ranges: resident only once touched).
 pub struct AddrSpace {
     pub pml4: u64,
+    m: core::cell::RefCell<Mm>,
+    pub vm: vm::Vm,
+}
+
+struct Mm {
     tables: Vec<u64>,
     frames: BTreeSet<u64>,
 }
@@ -106,28 +117,28 @@ impl AddrSpace {
         }
         let mut tables = Vec::new();
         tables.push(pml4);
-        AddrSpace { pml4, tables, frames: BTreeSet::new() }
+        AddrSpace { pml4, m: core::cell::RefCell::new(Mm { tables, frames: BTreeSet::new() }), vm: vm::Vm::default() }
     }
 
     pub fn pages(&self) -> usize {
-        self.frames.len()
+        self.m.borrow().frames.len()
     }
 
-    fn new_table(&mut self) -> u64 {
+    fn new_table(&self) -> u64 {
         let f = memory::alloc_page_frame();
-        self.tables.push(f);
+        self.m.borrow_mut().tables.push(f);
         f
     }
 
-    fn clone_table(&mut self, src: u64) -> u64 {
+    fn clone_table(&self, src: u64) -> u64 {
         let f = memory::alloc_page_frame();
         unsafe { core::ptr::copy_nonoverlapping(src as *const u64, f as *mut u64, 512) };
-        self.tables.push(f);
+        self.m.borrow_mut().tables.push(f);
         f
     }
 
     /// Replace a huge leaf (`shift` 30 = 1 GiB, 21 = 2 MiB) by an equivalent table one level down.
-    fn split_huge(&mut self, e: u64, shift: u32) -> u64 {
+    fn split_huge(&self, e: u64, shift: u32) -> u64 {
         let f = self.new_table();
         let t = f as *mut u64;
         unsafe {
@@ -153,7 +164,7 @@ impl AddrSpace {
     }
 
     /// Walk to `va`'s leaf slot, creating / cloning / splitting private tables on the way.
-    fn leaf_slot(&mut self, va: u64) -> *mut u64 {
+    fn leaf_slot(&self, va: u64) -> *mut u64 {
         let mut tbl = self.pml4 as *mut u64;
         for shift in [39u32, 30, 21] {
             let idx = ((va >> shift) & 511) as usize;
@@ -165,7 +176,8 @@ impl AddrSpace {
                 self.split_huge(e, shift)
             } else {
                 let t = e & ADDR;
-                if self.tables.contains(&t) { t } else { self.clone_table(t) }
+                let mine = self.m.borrow().tables.contains(&t);
+                if mine { t } else { self.clone_table(t) }
             };
             unsafe { *ep = next | P | W | U };
             tbl = next as *mut u64;
@@ -209,19 +221,22 @@ impl AddrSpace {
         P | U | if w { W } else { 0 } | if x { 0 } else { NX }
     }
 
-    /// Map one fresh zeroed page at `va`. `false` = already mapped, page cap hit, or W+X asked.
+    /// Map one fresh zeroed page at `va`. `false` = already mapped, resident budget hit (SELFBUILD3: `vm::limit_pages`,
+    /// the limit printed), or W+X asked.
     pub fn map_new(&mut self, va: u64, w: bool, x: bool) -> bool {
-        if (w && x) || va & (PAGE - 1) != 0 || va >= CANON_MAX || self.frames.len() >= MAX_PAGES {
+        if (w && x) || va & (PAGE - 1) != 0 || va >= CANON_MAX {
             return false;
         }
-        if self.is_mapped(va) {
+        if self.is_mapped(va) || self.raw_none(va) {
             return false;
         }
-        let f = memory::alloc_page_frame();
-        self.frames.insert(f);
-        let slot = self.leaf_slot(va);
-        unsafe { *slot = (f & ADDR) | Self::leaf_bits(w, x) };
-        true
+        match self.take_frame(va) {
+            Ok(f) => {
+                self.install(va, f, Self::leaf_bits(w, x));
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Change the permissions of an already-mapped page.
@@ -235,18 +250,12 @@ impl AddrSpace {
         true
     }
 
-    /// Unmap `va`'s page and free its frame. `false` if it was not mapped.
+    /// Unmap `va`'s page (SELFBUILD3: also a PROT_NONE-resident one) and free its frame. `false` if nothing was there.
     pub fn unmap(&mut self, va: u64) -> bool {
-        let Some((f, _)) = self.user_page(va) else { return false };
-        let slot = self.leaf_slot(va & !(PAGE - 1));
-        unsafe { *slot = 0 };
-        if self.frames.remove(&f) {
-            dealloc_frame(f);
-        }
-        true
+        self.drop_page(va)
     }
 
-    /// Copy `out.len()` bytes from user `va`. `false` = some page unmapped / not USER.
+    /// Copy `out.len()` bytes from user `va`. `false` = some page unmapped / not USER (SELFBUILD3: a lazy page is backed first).
     pub fn copy_in(&self, va: u64, out: &mut [u8]) -> bool {
         let Some(end) = va.checked_add(out.len() as u64) else { return false };
         if end > CANON_MAX {
@@ -254,7 +263,7 @@ impl AddrSpace {
         }
         let (mut a, mut done) = (va, 0usize);
         while done < out.len() {
-            let Some((f, _)) = self.user_page(a) else { return false };
+            let Some((f, _)) = self.user_page(a).or_else(|| self.fault_in(a, false)) else { return false };
             let off = (a & (PAGE - 1)) as usize;
             let n = core::cmp::min(4096 - off, out.len() - done);
             unsafe { core::ptr::copy_nonoverlapping((f as *const u8).add(off), out.as_mut_ptr().add(done), n) };
@@ -270,10 +279,10 @@ impl AddrSpace {
         if end > CANON_MAX {
             return false;
         }
-        // Validate the whole range first so a bad pointer writes nothing.
+        // Validate the whole range first so a bad pointer writes nothing (SELFBUILD3: backing lazy pages on the way).
         let mut a = va & !(PAGE - 1);
         while a < end {
-            match self.user_page(a) {
+            match self.user_page(a).or_else(|| self.fault_in(a, true)) {
                 Some((_, e)) if force || e & W != 0 => {}
                 _ => return false,
             }
@@ -285,6 +294,7 @@ impl AddrSpace {
             let off = (a & (PAGE - 1)) as usize;
             let n = core::cmp::min(4096 - off, data.len() - done);
             unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(done), (f as *mut u8).add(off), n) };
+            self.mark_dirty(a); // SELFBUILD3: a kernel store into a MAP_SHARED page must reach the file
             done += n;
             a += n as u64;
         }
@@ -310,6 +320,7 @@ impl AddrSpace {
     }
 
     /// LINUXABI2: is `[va, va+len)` entirely mapped USER+WRITABLE? (validate BEFORE a read consumes pipe/stdin bytes)
+    /// SELFBUILD3: a lazy page of a writable VMA is backed here.
     pub fn writable_range(&self, va: u64, len: usize) -> bool {
         let Some(end) = va.checked_add(len as u64) else { return false };
         if end > CANON_MAX {
@@ -317,7 +328,7 @@ impl AddrSpace {
         }
         let mut a = va & !(PAGE - 1);
         while a < end {
-            match self.user_page(a) {
+            match self.user_page(a).or_else(|| self.fault_in(a, true)) {
                 Some((_, e)) if e & W != 0 => {}
                 _ => return false,
             }
@@ -326,53 +337,33 @@ impl AddrSpace {
         true
     }
 
-    /// LINUXABI2 fork: a new address space holding a byte-for-byte EAGER copy of every private data page (same perms).
+    /// LINUXABI2 fork: a new address space holding a byte-for-byte EAGER copy of every RESIDENT private data page (same
+    /// perms; SELFBUILD3: PROT_NONE-resident pages too) and the same VMA list, so unbacked pages stay lazy in the child.
     /// No copy-on-write: this kernel's page-fault path has no hook to resolve a write fault on a shared read-only page.
     pub fn fork_copy(&self) -> Option<AddrSpace> {
-        let mut list: Vec<(u64, u64, u64)> = Vec::new();
-        let priv_tbl = |e: u64| -> Option<*const u64> {
-            if e & P == 0 || e & PS != 0 || !self.tables.contains(&(e & ADDR)) {
-                None
-            } else {
-                Some((e & ADDR) as *const u64)
-            }
+        let list: Vec<(u64, u64)> = {
+            let frames = &self.m.borrow().frames;
+            self.leaf_range(0, CANON_MAX).into_iter().filter(|(_, e)| frames.contains(&(e & ADDR))).collect()
         };
-        unsafe {
-            let t4 = self.pml4 as *const u64;
-            for i4 in 0..512u64 {
-                let Some(t3) = priv_tbl(*t4.add(i4 as usize)) else { continue };
-                for i3 in 0..512u64 {
-                    let Some(t2) = priv_tbl(*t3.add(i3 as usize)) else { continue };
-                    for i2 in 0..512u64 {
-                        let Some(t1) = priv_tbl(*t2.add(i2 as usize)) else { continue };
-                        for i1 in 0..512u64 {
-                            let e = *t1.add(i1 as usize);
-                            if e & P != 0 && e & U != 0 && self.frames.contains(&(e & ADDR)) {
-                                list.push(((i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12), e & ADDR, e));
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let mut c = AddrSpace::new();
-        for (va, f, e) in list {
-            if !c.map_new(va, e & W != 0, e & NX == 0) {
-                c.free_frames();
-                return None;
-            }
-            let Some((cf, _)) = c.user_page(va) else {
+        c.vm = self.vm.clone();
+        for (va, e) in list {
+            let Ok(cf) = c.take_frame(va) else {
+                c.vm.vmas.clear();
                 c.free_frames();
                 return None;
             };
-            unsafe { core::ptr::copy_nonoverlapping(f as *const u8, cf as *mut u8, 4096) };
+            unsafe { core::ptr::copy_nonoverlapping((e & ADDR) as *const u8, cf as *mut u8, 4096) };
+            c.install(va, cf, e & (P | W | U | NX | vm::SWN));
         }
         Some(c)
     }
 
     /// LINUXABI2 execve: drop every user mapping but KEEP this PML4 (the task's `user_cr3` must stay valid). The kernel half
     /// is restored from the kernel's PML4, the TLB is flushed (caller is running on this space), THEN the old tables/frames are freed.
+    /// SELFBUILD3: MAP_SHARED pages are written back first; the VMA list is emptied.
     pub fn reset(&mut self) {
+        self.writeback_all();
         unsafe {
             let k = (memory::kernel_cr3() & ADDR) as *const u64;
             let p = self.pml4 as *mut u64;
@@ -382,24 +373,30 @@ impl AddrSpace {
             *p.add(2) = 0;
             memory::load_cr3(memory::current_cr3());
         }
-        for f in core::mem::take(&mut self.frames) {
-            dealloc_frame(f);
+        let m = self.m.get_mut();
+        for f in core::mem::take(&mut m.frames) {
+            vm::free_frame(f);
         }
         let pml4 = self.pml4;
-        for t in core::mem::take(&mut self.tables) {
+        for t in core::mem::take(&mut m.tables) {
             if t != pml4 {
                 dealloc_frame(t);
             }
         }
-        self.tables.push(pml4);
+        m.tables.push(pml4);
+        self.vm.vmas.clear();
     }
 
     /// Free every frame and table. Call only when no core can be running on `pml4`.
+    /// SELFBUILD3: MAP_SHARED pages are written back first (process exit).
     pub fn free_frames(&mut self) {
-        for f in core::mem::take(&mut self.frames) {
-            dealloc_frame(f);
+        self.writeback_all();
+        self.vm.vmas.clear();
+        let m = self.m.get_mut();
+        for f in core::mem::take(&mut m.frames) {
+            vm::free_frame(f);
         }
-        for t in core::mem::take(&mut self.tables) {
+        for t in core::mem::take(&mut m.tables) {
             dealloc_frame(t);
         }
     }
@@ -967,7 +964,7 @@ pub fn selftest() {
     match run_path(P, &[P], 5_000, false, &mut |_| {}) {
         Ok(r) => serial_println!("{}", r.witness(P)),
         Err(e) if e.contains("-ENOENT") => {
-            serial_println!(":: LINUXABI: path={} exit=? syscalls=0 enosys=[] ms=0 -> SKIP (fixture not staged) ::", P)
+            serial_println!(":: LINUXABI: path={} exit=? syscalls=0 enosys=[] ms=0 -> SKIP reason=fixture-not-staged ::", P)
         }
         Err(e) => serial_println!(":: LINUXABI: path={} exit=? syscalls=0 enosys=[] ms=0 -> FAIL ({}) ::", P, e),
     }
@@ -1000,7 +997,7 @@ pub fn selftest2() {
         }
     }
     if missing(&r1) || missing(&r2) {
-        serial_println!(":: LINUXABI2: fork_ok=0 pipe_ok=0 dents=0 stdin=0 -> SKIP (fixtures not staged) ::");
+        serial_println!(":: LINUXABI2: fork_ok=0 pipe_ok=0 dents=0 stdin=0 -> SKIP reason=fixtures-not-staged ::");
         return;
     }
     let (mut fork_ok, mut pipe_ok) = (false, false);
@@ -1044,7 +1041,7 @@ pub fn selftest3() {
         cap.push('\n');
     });
     if matches!(&r, Err(e) if e.contains("-ENOENT")) {
-        serial_println!(":: LINUXABI3: cr4=? save=fx sse_lnx=skip fork_fp=skip busybox=skip -> SKIP (fixture not staged) ::");
+        serial_println!(":: LINUXABI3: cr4=? save=fx sse_lnx=skip fork_fp=skip busybox=skip -> SKIP reason=fixture-not-staged ::");
         return;
     }
     let (mut sse_ok, mut fork_fp) = (false, false);

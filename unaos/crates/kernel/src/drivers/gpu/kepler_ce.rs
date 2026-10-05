@@ -1063,7 +1063,7 @@ pub fn arm_context(bar0: usize, bar1_base: usize, bar1_size: usize, vram_size: u
     CE_BAR1.store(bar1_base, Ordering::Release);
     CE_BAR1_SIZE.store(bar1_size, Ordering::Release);
     CE_VRAM.store(vram_size, Ordering::Release);
-    serial_println!(
+    crate::bootlog_println!(
         ":: kepler: CE context banked bar0={:#x} bar1={:#x} bar1_size={}MB vram={}MB — the CE ladder and the KBLIT channel run from `tests ce` / `tests kblit`, NEVER at boot (R80) ::",
         bar0, bar1_base, bar1_size >> 20, vram_size >> 20
     );

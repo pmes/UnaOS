@@ -3768,6 +3768,10 @@ SELFBUILD_TCC_URL="https://github.com/TinyCC/tinycc.git"
 SELFBUILD_TCC_REV="43c7708b85681a2fd4451c8a541af4494a8919b2"
 SELFBUILD_BB_URL="https://github.com/mirror/busybox.git"
 SELFBUILD_BB_REV="371fe9f71d445d18be28c82a2a6d82115c8af19d"
+# SELFBUILD3 (B353): musl 1.2.5 (MIT) — tag v1.2.5 is this commit on every mirror; git.musl-libc.org and musl.libc.org are refused by
+# the egress proxy, so a GitHub mirror carries the fetch (the commit id pins the bytes). Built here, staged as DATA under /apps/LIB.
+SELFBUILD_MUSL_URL="https://github.com/kraj/musl.git"
+SELFBUILD_MUSL_REV="0784374d561435f7c787a555aeab8ede699ed298"
 _selfbuild_fetch() { # dir url rev
     [ -d "$1/.git" ] && [ "$(git -C "$1" rev-parse HEAD 2>/dev/null)" = "$3" ] && return 0
     rm -rf "$1" && mkdir -p "$1" && git -C "$1" init -q && git -C "$1" fetch -q --depth 1 "$2" "$3" && git -C "$1" checkout -q FETCH_HEAD
@@ -3791,13 +3795,56 @@ build_selfbuild_x86() {
     else
         echo "   SELFBUILD2: SYSKAT2.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
     fi
-    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ]; then
+    # SELFBUILD3 (B353): the musl libc as DATA under /apps/LIB (crt1.o crti.o crtn.o libc.a + include/), built before tcc so tcc's
+    # libtcc1.a can be compiled against it. No egress = no LIB = `tests selfbuild3` reports libc=none tcc_libc=skip.
+    local lib="${WORKSPACE_DIR}/target/LIB"
+    if [ ! -f "$lib/libc.a" ]; then
+        if _selfbuild_fetch "$sb/musl" "$SELFBUILD_MUSL_URL" "$SELFBUILD_MUSL_REV" \
+            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC=gcc CFLAGS="-O2" >/dev/null && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
+            rm -rf "$lib" && mkdir -p "$lib/include" "$lib/tcc/include" \
+                && cp "$sb/musl-out/lib/crt1.o" "$sb/musl-out/lib/crti.o" "$sb/musl-out/lib/crtn.o" "$sb/musl-out/lib/libc.a" "$lib/" \
+                && cp -r "$sb/musl-out/include/." "$lib/include/" \
+                && printf 'musl 1.2.5 (%s, MIT) built by arroyo build_selfbuild_x86 for tcc: TCC.LNX -static -o prog prog.c\n' "$SELFBUILD_MUSL_REV" > "$lib/MUSL.TXT"
+        else
+            echo "   SELFBUILD3: musl fetch/build failed — /apps/LIB absent, tests selfbuild3 reports libc=none"; rm -rf "$lib"
+        fi
+    fi
+    # SELFBUILD1 tcc; SELFBUILD3 configures its search paths onto the volume: tccdir /apps/LIB/tcc ({B}), crt + libs {B}/.. = /apps/LIB,
+    # headers {B}/../include (musl) then {B}/include (tcc's own) — so on UnaOS a bare `TCC.LNX -static -o prog prog.c` links musl, and
+    # on the host `-B target/LIB/tcc` points the SAME binary at the staged tree (the host proof below). Rebuilt when LIB lacks libtcc1.a.
+    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; }; then
         if _selfbuild_fetch "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" \
-            && ( cd "$sb/tinycc" && ./configure --cc=gcc --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" >/dev/null && make -s tcc >/dev/null 2>&1 ); then
+            && ( cd "$sb/tinycc" && ./configure --cc=gcc --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" \
+                   --tccdir=/apps/LIB/tcc --crtprefix='{B}/..' --libpaths='{B}:{B}/..' --sysincludepaths='{B}/../include:{B}/include' --config-musl >/dev/null \
+                 && make -s tcc >/dev/null 2>&1 ); then
             strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
+            if [ -f "$lib/libc.a" ]; then
+                cp "$sb/tinycc/include/"*.h "$lib/tcc/include/" \
+                    && ( cd "$sb/tinycc" && rm -f libtcc1.a && make -s libtcc1.a XFLAGS="-B$lib/tcc" >/dev/null 2>&1; [ -f libtcc1.a ] ) \
+                    && cp "$sb/tinycc/libtcc1.a" "$lib/tcc/" \
+                    || { echo "   SELFBUILD3: libtcc1.a did not build — /apps/LIB not staged"; rm -rf "$lib"; }
+            fi
         else
             echo "   SELFBUILD1: tinycc fetch/build failed — TCC.LNX absent, tests selfbuild will SKIP"
         fi
+    fi
+    # SELFBUILD3 host proof: the staged TCC.LNX compiles PRINTF.C against the staged musl and the output prints, or LIB is not staged.
+    cp "$c/printf.c" "${WORKSPACE_DIR}/target/PRINTF.C"
+    if [ -f "$lib/libc.a" ]; then
+        if "${WORKSPACE_DIR}/target/TCC.LNX" -B "$lib/tcc" -static -o "$sb/hellop" "$c/printf.c" \
+            && "$sb/hellop" | grep -qx "hello printf from tcc+musl on unaos 42"; then
+            ( cd "$lib" && sha256sum libc.a crt1.o crti.o crtn.o tcc/libtcc1.a | sed 's/^/   SELFBUILD3: sha256 LIB\//' )
+        else
+            echo "   SELFBUILD3: TCC.LNX + staged musl did not build a working printf hello on the host — /apps/LIB not staged"; rm -rf "$lib"
+        fi
+    fi
+    # SELFBUILD3: the lazy-memory KAT (mmap of files private/shared, 256 MiB anon touched sparsely + mincore, PROT_NONE, brk 128 MiB,
+    # madvise), proven on the host kernel before it is staged.
+    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT3.LNX" "$c/syskat3.c" \
+        && "$sb/SYSKAT3.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; then
+        cp "$sb/SYSKAT3.LNX" "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
+    else
+        echo "   SELFBUILD3: SYSKAT3.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     fi
     if [ ! -f "${WORKSPACE_DIR}/target/PROBE.LNX" ]; then
         if _selfbuild_fetch "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" \
@@ -3809,7 +3856,7 @@ build_selfbuild_x86() {
             echo "   SELFBUILD1: busybox fetch/build failed — PROBE.LNX absent (probe=none)"
         fi
     fi
-    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX HELLO.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
+    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).
