@@ -10,10 +10,11 @@ or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keep
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
 operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
 
-Rows: 27.
+Rows: 28.
 
 | key | type | default | writers | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- |
+| `system.audio.amp_holdoff_ms` | int `0..=600000` | consumer: `hda_amp::AMP_HOLDOFF_MS`, 5000 ms | operator | kernel HDA amp (`drivers/hda_amp.rs`) | Milliseconds of silence before the speaker amp powers down (PREFSKERNEL: declared from the kernel scan). |
 | `system.audio.mute` | bool | `false` | settings, keys | kernel settings (audio) | Output muted. |
 | `system.audio.volume` | int `0..=16` | `12` | settings, keys | kernel settings (audio) | Output level in sixteenths. |
 | `system.display.brightness` | int `1..=16` | `12` | settings, keys | kernel settings, backlight | Panel level in sixteenths; never 0 (BRIGHTFLOOR: the backlight's OFF belongs to the idle blank). |

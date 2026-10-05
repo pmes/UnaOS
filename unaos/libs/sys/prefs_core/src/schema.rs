@@ -126,6 +126,12 @@ pub const GEMINI_DEFAULT_KEY_ENV: &str = "GEMINI_API_KEY";
 pub static SCHEMA: &[Key] = &[
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     Key {
+        ns: "system", key: "audio.amp_holdoff_ms", kind: Kind::Int { min: 0, max: 600_000 },
+        default: Default::Consumer("`hda_amp::AMP_HOLDOFF_MS`, 5000 ms"),
+        writers: OP, reader: "kernel HDA amp (`drivers/hda_amp.rs`)",
+        doc: "Milliseconds of silence before the speaker amp powers down (PREFSKERNEL: declared from the kernel scan).",
+    },
+    Key {
         ns: "system", key: "audio.mute", kind: Kind::Bool, default: Default::Bool(false),
         writers: &[Writer::Settings, Writer::Keys], reader: "kernel settings (audio)",
         doc: "Output muted.",
@@ -384,6 +390,28 @@ pub fn clamp(kind: &Kind, v: PrefValue) -> Result<Applied, Refusal> {
     }
 }
 
+/// PREFSKERNEL (B345): clamp every declared int / float in `tree` into its range, in place — the ONE
+/// load-time pass (a hand-edited or pre-schema file holding `display.brightness = 0` loads as 1). A value
+/// [`check`] would REFUSE (wrong type, enum miss, …) is left as the operator wrote it: a load never
+/// deletes a choice. Returns how many values were clamped.
+pub fn clamp_tree(tree: &mut crate::PrefTree) -> usize {
+    let mut fix: alloc::vec::Vec<(&'static Key, PrefValue)> = alloc::vec::Vec::new();
+    for k in SCHEMA {
+        if let Some(v) = tree.get(k.ns, k.key) {
+            if let Ok(a) = clamp(&k.kind, v.clone()) {
+                if a.clamped {
+                    fix.push((k, a.value));
+                }
+            }
+        }
+    }
+    let n = fix.len();
+    for (k, v) in fix {
+        let _ = tree.set(k.ns, k.key, v);
+    }
+    n
+}
+
 // =====================================================================================================
 // DEFAULTS
 // =====================================================================================================
@@ -550,6 +578,22 @@ mod tests {
         let long = "x".repeat(121);
         assert_eq!(check("system", "display.wallpaper", PrefValue::Str(long)), Err(Refusal::TooLong));
         assert_eq!(check("system", "display.wallpaper", PrefValue::Str("A\tB".into())), Err(Refusal::NotPrintable));
+    }
+
+    /// PREFSKERNEL (B345): the load pass clamps declared ranges once, leaves refusals and undeclared keys.
+    #[test]
+    fn clamp_tree_clamps_ranges_once() {
+        let mut t = crate::PrefTree::parse(
+            "[system]\ndisplay.brightness = 0\naudio.volume = 40\naudio.mute = 1\npointer.speed = 1\n[aether]\nwidth = -9\n[vein]\ntemperature = 9.0\n",
+        )
+        .unwrap();
+        assert_eq!(clamp_tree(&mut t), 3);
+        assert_eq!(t.get("system", "display.brightness"), Some(&PrefValue::Int(1)));
+        assert_eq!(t.get("system", "audio.volume"), Some(&PrefValue::Int(16)));
+        assert_eq!(t.get("vein", "temperature"), Some(&PrefValue::Float(2.0)));
+        assert_eq!(t.get("system", "audio.mute"), Some(&PrefValue::Int(1)), "a wrong type is not deleted");
+        assert_eq!(t.get("aether", "width"), Some(&PrefValue::Int(-9)));
+        assert_eq!(clamp_tree(&mut t), 0, "once");
     }
 
     #[test]

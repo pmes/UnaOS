@@ -161,16 +161,17 @@ pub fn subscribe() {
 
 /// PrefChanged: called by the store on every accepted write. Builds the verb-19 frame of record into the
 /// subscription queue (oldest dropped and counted when full). No subscriber = nothing queued.
-pub fn on_changed(ns: &str, k: &str, v: &PrefValue) {
+pub fn on_changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
     if !SUBSCRIBED.load(Ordering::Acquire) {
         return;
     }
-    let body = alloc::format!("{}.{}\0{}", ns, k, v.to_literal());
+    // PREFSKERNEL (B345): the shared body — `<ns>.<key>` NUL `<literal>` [NUL `clamped=true`].
+    let body = prefs_core::wire::changed_body_applied(ns, k, a);
     if body.len() > crate::bus::BUS_BODY_MAX {
         return;
     }
     let mut f = alloc::vec![0u8; BUS_HDR_LEN + body.len()];
-    let n = crate::bus::build_reply(una_abi::BUS_VERB_PREF_CHANGED, 0, 0, kernel_reply_principal(), body.as_bytes(), &mut f);
+    let n = crate::bus::build_reply(una_abi::BUS_VERB_PREF_CHANGED, 0, 0, kernel_reply_principal(), &body, &mut f);
     f.truncate(n);
     let frame = f.into_boxed_slice();
     locked(|| {
@@ -321,7 +322,11 @@ pub fn pref_get(ns: &str, k: &str) -> Result<PrefValue, i64> {
 pub fn pref_set(ns: &str, k: &str, v: PrefValue) -> Result<(), i64> {
     let body = alloc::format!("{}.{}\0{}", ns, k, v.to_literal());
     let a = call(una_abi::BUS_VERB_PREF_SET, body.as_bytes());
-    serial_println!("[prefsbus] set {}.{}={} via={} status={}", ns, k, v, last_via(), a.status);
+    // PREFSKERNEL (B345): a clamped SET answers `<stored>` NUL `clamped=true` (prefs_core::wire).
+    match prefs_core::wire::parse_set_reply(&a.body) {
+        Some((stored, true)) if a.status == 0 => serial_println!("[prefsbus] set {}.{}={} via={} status=0 clamped=1 stored={}", ns, k, v, last_via(), stored),
+        _ => serial_println!("[prefsbus] set {}.{}={} via={} status={}", ns, k, v, last_via(), a.status),
+    }
     if a.status == 0 { Ok(()) } else { Err(a.status) }
 }
 
