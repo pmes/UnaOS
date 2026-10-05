@@ -1604,6 +1604,7 @@ pub fn mint_disk_grant(
 /// UNAFSGROW (B347) M3: [`mint_disk_grant`]'s judgment and mint WITHOUT the wire line — the installer
 /// window's DRY RUN mints and drops it unheld, so it must not print `grant minted … WHOLE-DISK` over a
 /// disk nothing will write. The one body: `mint_disk_grant` is this plus the line.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))] // IMAGE 15 fix: the arm-pi/tegra legs compiled this x86-only body (CTCORE's finding)
 pub fn mint_disk_grant_quiet(
     id: block::BlockDeviceId,
     total_sectors: u64,

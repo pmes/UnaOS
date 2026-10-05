@@ -870,7 +870,7 @@ fn grow_unafs(disk: &mut AhciDisk, plan: &amber_core::Plan) -> (String, bool) {
 
 /// UNAFSGROW (B347) M3: the dry run's grant — the same judgment as [`AhciDisk::new`], minted silently
 /// (`partition::mint_disk_grant_quiet`) and dropped by the caller unheld.
-#[cfg(feature = "ahci-write")]
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
 impl AhciDisk {
     pub fn new_quiet(sel: BlockDeviceId, v: &Verdict) -> Result<Self, InstallError> {
         let rd = super::BlockTarget::bind_id(sel)?;
