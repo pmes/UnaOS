@@ -31,7 +31,7 @@ use tls_core::cryptocore_provider::CryptoCoreProvider;
 use tls_core::x509::verify::{Clock, TrustStore, WebPkiVerifier};
 use tls_core::{Client as TlsClient, ClientConfig, TlsError};
 
-use crate::conn::{BodySource, Conn, Error, Transport};
+use crate::conn::{Conn, Error, Transport};
 use crate::cookie::CookieJar;
 use crate::encoding::{self, Coding};
 use crate::h1::{self, BodyDecoder, Framing, H1Error, ResponseHead};
@@ -676,24 +676,47 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job) {
                 return fail(first, Error::Tls(describe_tls(&e)));
             }
         };
-        let mut conn = Conn::new(Tls { c: client, pending: Vec::new(), pos: 0 });
-        serve(&inner, &key, id, &mut conn, first);
+        let alpn_h2 = client.negotiated().alpn.as_deref() == Some(b"h2");
+        let tls = Tls { c: client, pending: Vec::new(), pos: 0 };
+        #[cfg(feature = "h2")]
+        if alpn_h2 {
+            let mut h2c = match crate::h2::H2Conn::handshake(tls) {
+                Ok(c) => c,
+                Err(e) => return fail(first, e),
+            };
+            serve(&inner, &key, id, first, |job, reused| exchange_h2(&mut h2c, &key, job, reused));
+            let _ = h2c.transport_mut().c.close();
+            return;
+        }
+        #[cfg(not(feature = "h2"))]
+        let _ = alpn_h2;
+        let mut conn = Conn::new(tls);
+        serve(&inner, &key, id, first, |job, reused| exchange(&mut conn, &key, job, reused));
         let _ = conn.transport.c.close();
     } else {
         let mut conn = Conn::new(t);
-        serve(&inner, &key, id, &mut conn, first);
+        serve(&inner, &key, id, first, |job, reused| exchange(&mut conn, &key, job, reused));
     }
 }
 
 /// Serve jobs on one connection until it cannot be reused or idles out.
-fn serve<T: Transport>(inner: &Arc<Inner>, key: &PoolKey, id: u64, conn: &mut Conn<T>, first: Job) {
+fn serve(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, mut run: impl FnMut(Job, bool) -> Outcome) {
     let (tx, rx) = mpsc::channel::<Job>();
     let mut job = first;
     let mut reused = false;
     loop {
-        let outcome = exchange(conn, key, job, reused);
+        let outcome = run(job, reused);
         let job_back = match outcome {
-            Outcome::Reusable => None,
+            Outcome::Reusable(finish) => {
+                // Park BEFORE telling the caller the exchange ended, so its next request finds this connection.
+                if let Ok(mut p) = inner.pool.lock() {
+                    p.entry(key.clone()).or_default().push(Idle { id, tx: tx.clone() });
+                }
+                if let Some((mut sink, r)) = finish {
+                    sink.send(Event::End(r));
+                }
+                None
+            }
             Outcome::Closed => return,
             Outcome::RetryFresh(j) => Some(j),
         };
@@ -701,10 +724,6 @@ fn serve<T: Transport>(inner: &Arc<Inner>, key: &PoolKey, id: u64, conn: &mut Co
             // A parked connection the server had already closed: hand the job to a fresh connection.
             Agent { inner: inner.clone() }.dispatch_job(j);
             return;
-        }
-        // Park.
-        if let Ok(mut p) = inner.pool.lock() {
-            p.entry(key.clone()).or_default().push(Idle { id, tx: tx.clone() });
         }
         let deadline = Instant::now() + inner.cfg.idle_timeout;
         job = loop {
@@ -761,8 +780,11 @@ impl Agent {
     }
 }
 
+type Finish = (Box<dyn EventSink>, Result<(), Error>);
+
 enum Outcome {
-    Reusable,
+    /// Reusable; the End event is delivered after the connection is parked.
+    Reusable(Option<Finish>),
     Closed,
     /// The connection was reused and failed before one response byte: retry on a fresh one.
     RetryFresh(Job),
@@ -814,7 +836,7 @@ fn exchange<T: Transport>(conn: &mut Conn<T>, key: &PoolKey, mut job: Job, reuse
         job.sink.send(Event::End(Err(e)));
         return Outcome::Closed;
     }
-    let (mut rhead, framing) = match conn.read_head(&job.method) {
+    let (rhead, framing) = match conn.read_head(&job.method) {
         Ok(v) => v,
         Err(Error::Http(H1Error::Truncated)) if reused => return Outcome::RetryFresh(job),
         Err(e) => {
@@ -825,37 +847,137 @@ fn exchange<T: Transport>(conn: &mut Conn<T>, key: &PoolKey, mut job: Job, reuse
     let said_close = job.headers.has_token("connection", "close");
     let reusable = h1::keep_alive(&rhead, framing, said_close);
     let mut dec = BodyDecoder::new(framing);
+    let small_redirect = matches!(framing, Framing::None | Framing::Length(0..=65536) | Framing::Chunked);
+    let (clean, end) = deliver(&mut job, rhead, small_redirect, &mut || conn.read_body(&mut dec));
+    finish(job, end, clean && reusable && dec.is_done() && conn.buffered() == 0)
+}
 
+/// One exchange as an HTTP/2 stream on a negotiated `h2` connection.
+#[cfg(feature = "h2")]
+fn exchange_h2<T: Transport>(h2c: &mut crate::h2::H2Conn<T>, key: &PoolKey, mut job: Job, reused: bool) -> Outcome {
+    let body = job.body.clone();
+    let authority = job.url.host_str();
+    let id = match h2c.send_request(&job.method, &key.scheme, &authority, &job.url.request_target(), &job.headers, &body) {
+        Ok(id) => id,
+        Err(e) => {
+            if reused {
+                return Outcome::RetryFresh(job);
+            }
+            job.sink.send(Event::End(Err(e)));
+            return Outcome::Closed;
+        }
+    };
+    let (status, headers) = match h2c.read_head(id) {
+        Ok(v) => v,
+        Err(Error::Http(H1Error::Truncated)) if reused => return Outcome::RetryFresh(job),
+        Err(e) => {
+            job.sink.send(Event::End(Err(e)));
+            return Outcome::Closed;
+        }
+    };
+    let rhead = ResponseHead { version: (2, 0), status, reason: String::new(), headers };
+    let no_body = job.method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304;
+    let mut ended = no_body;
+    let (clean, end) = deliver(&mut job, rhead, true, &mut || {
+        if ended {
+            return Ok(None);
+        }
+        let r = h2c.read_data(id);
+        if matches!(r, Ok(None)) {
+            ended = true;
+        }
+        r
+    });
+    if !ended {
+        // An abandoned body: cancel the stream (RFC 9113 §8.1), the connection stays usable.
+        let _ = h2c.transport_mut().write_all(&crate::h2::frame::encode(
+            crate::h2::frame::RST_STREAM,
+            0,
+            id,
+            &crate::h2::frame::ErrorCode::Cancel.to_u32().to_be_bytes(),
+        ));
+    }
+    h2c.close_stream(id);
+    let ok = clean && h2c.reusable();
+    finish(job, end, ok)
+}
+
+/// A pull of body chunks as an inflater source.
+struct PullSource<'a> {
+    pull: &'a mut dyn FnMut() -> Result<Option<Vec<u8>>, Error>,
+    chunk: Vec<u8>,
+    pos: usize,
+    error: Option<Error>,
+    done: bool,
+}
+
+impl pixel_core::inflate::ByteSource for PullSource<'_> {
+    fn next(&mut self) -> Option<u8> {
+        while self.pos >= self.chunk.len() {
+            if self.done || self.error.is_some() {
+                return None;
+            }
+            match (self.pull)() {
+                Ok(Some(c)) => {
+                    self.chunk = c;
+                    self.pos = 0;
+                }
+                Ok(None) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    return None;
+                }
+            }
+        }
+        let b = self.chunk[self.pos];
+        self.pos += 1;
+        Some(b)
+    }
+}
+
+/// Send the head and stream the body to the job's sink (content codings decoded, followed redirects
+/// drained). Returns whether the message was consumed cleanly to its end.
+/// The End event: deferred until the connection is parked when it is reusable, sent now otherwise.
+fn finish(job: Job, end: Option<Result<(), Error>>, reusable: bool) -> Outcome {
+    let mut sink = job.sink;
+    if reusable {
+        return Outcome::Reusable(end.map(|r| (sink, r)));
+    }
+    if let Some(r) = end {
+        sink.send(Event::End(r));
+    }
+    Outcome::Closed
+}
+
+/// Returns (consumed cleanly to the end, the End result still to deliver — `None` when the receiver is gone).
+fn deliver(job: &mut Job, mut rhead: ResponseHead, small_redirect: bool, pull: &mut dyn FnMut() -> Result<Option<Vec<u8>>, Error>) -> (bool, Option<Result<(), Error>>) {
     // A followed redirect: drain (small) bodies so the connection stays usable.
     if job.discard_redirect_body && redirect::is_redirect(rhead.status) && rhead.headers.contains("location") {
         let sink_ok = job.sink.send(Event::Head(rhead));
-        let small = matches!(framing, Framing::None | Framing::Length(0..=65536) | Framing::Chunked);
-        let mut r = Ok(());
-        if small {
+        let mut clean = false;
+        if small_redirect {
             let mut total = 0usize;
             loop {
-                match conn.read_body(&mut dec) {
+                match pull() {
                     Ok(Some(c)) => {
                         total += c.len();
                         if total > 65536 {
                             break;
                         }
                     }
-                    Ok(None) => break,
-                    Err(e) => {
-                        r = Err(e);
+                    Ok(None) => {
+                        clean = true;
                         break;
                     }
+                    Err(_) => break,
                 }
             }
         }
-        let clean = r.is_ok() && dec.is_done();
-        if sink_ok {
-            job.sink.send(Event::End(Ok(())));
-        }
-        return if reusable && clean { Outcome::Reusable } else { Outcome::Closed };
+        return (clean, sink_ok.then_some(Ok(())));
     }
-
     let codings = if job.decode { encoding::content_codings(&rhead.headers) } else { Vec::new() };
     let decodable = codings.len() == 1 && matches!(codings[0], Coding::Gzip | Coding::Deflate);
     if decodable {
@@ -863,24 +985,25 @@ fn exchange<T: Transport>(conn: &mut Conn<T>, key: &PoolKey, mut job: Job, reuse
         rhead.headers.remove("content-length");
     }
     if !job.sink.send(Event::Head(rhead)) {
-        return Outcome::Closed;
+        return (false, None);
     }
     let result: Result<(), Error> = if decodable {
         let mut cs = ChunkSink { sink: &mut *job.sink, buf: Vec::new(), gone: false };
-        let mut src = BodySource::new(conn, &mut dec);
+        let mut src = PullSource { pull: &mut *pull, chunk: Vec::new(), pos: 0, error: None, done: false };
         let r = encoding::decode_stream(&codings[0], &mut src, &mut cs);
-        let src_err = src.error.take();
+        let (src_err, src_done) = (src.error.take(), src.done);
         cs.flush();
         if cs.gone {
-            return Outcome::Closed;
+            return (false, None);
         }
         match (src_err, r) {
             (Some(e), _) => Err(e),
             (None, Err(e)) => Err(Error::Decode(e)),
+            (None, Ok(_)) if src_done => Ok(()),
             (None, Ok(_)) => {
-                // Consume whatever framing remains (the chunked terminator, trailers).
+                // Consume whatever framing remains (the chunked terminator, trailers, END_STREAM).
                 loop {
-                    match conn.read_body(&mut dec) {
+                    match pull() {
                         Ok(Some(_)) => {}
                         Ok(None) => break Ok(()),
                         Err(e) => break Err(e),
@@ -890,10 +1013,10 @@ fn exchange<T: Transport>(conn: &mut Conn<T>, key: &PoolKey, mut job: Job, reuse
         }
     } else {
         loop {
-            match conn.read_body(&mut dec) {
+            match pull() {
                 Ok(Some(c)) => {
                     if !job.sink.send(Event::Data(c)) {
-                        return Outcome::Closed;
+                        return (false, None);
                     }
                 }
                 Ok(None) => break Ok(()),
@@ -901,7 +1024,5 @@ fn exchange<T: Transport>(conn: &mut Conn<T>, key: &PoolKey, mut job: Job, reuse
             }
         }
     };
-    let ok = result.is_ok();
-    job.sink.send(Event::End(result));
-    if ok && reusable && dec.is_done() && conn.buffered() == 0 { Outcome::Reusable } else { Outcome::Closed }
+    (result.is_ok(), Some(result))
 }

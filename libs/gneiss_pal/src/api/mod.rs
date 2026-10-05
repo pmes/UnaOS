@@ -30,6 +30,7 @@ pub mod claudecode;
 pub mod embed;
 pub mod format;
 pub mod gemini;
+pub mod http;
 #[cfg(feature = "local-embed")]
 pub mod local;
 pub mod provider;

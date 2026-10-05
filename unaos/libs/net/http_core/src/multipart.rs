@@ -37,6 +37,12 @@ impl Form {
         self
     }
 
+    /// Any part (filename and media type each optional).
+    pub fn part(mut self, p: Part) -> Self {
+        self.parts.push(p);
+        self
+    }
+
     pub fn boundary(&self) -> &str {
         &self.boundary
     }

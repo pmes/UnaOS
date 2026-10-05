@@ -24,7 +24,7 @@ boa_gc = "0.22"
 html5ever = "0.40"
 kuchiki = "0.8"
 taffy = "0.14"
-reqwest = { version = "0.13", features = ["json", "stream", "blocking", "cookies"] }
+# HTTPCORE (SR51): HTTP(S) + cookies through gneiss_pal::api::http (UnaOS http_core + tls_core); reqwest is gone.
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 bandy = { path = "../../libs/bandy" }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
@@ -41,6 +41,6 @@ font-kit = "0.14"
 pathfinder_geometry = "0.5"
 base64 = "0.23"
 resvg = { version = "0.48.1", optional = true }  # EYES bumped to latest stable (R83); PIXELCORE keeps it behind `svg`
-tokio-tungstenite = "0.30"
+# HTTPCORE (SR51): tokio-tungstenite deleted — no live caller (api/websockets.rs is a stub); an RFC 6455 client is owed.
 futures-util = "0.3"
 directories = "6.0.0"

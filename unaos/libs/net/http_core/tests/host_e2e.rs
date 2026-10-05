@@ -153,7 +153,7 @@ fn suite(a: &Agent, base: &str, tls: bool) {
     // Keep-alive: everything above ran over few connections (the 1 MiB PUT and redirects included).
     let s = stats(a, base);
     println!("{} connections={} alpn={} version={} first-sse-chunk={first:?} total={total:?}", if tls { "https" } else { "http" }, s.connections, s.alpn, s.version);
-    assert!(s.connections <= 3, "keep-alive reuse: {} connections for 12 requests", s.connections);
+    assert_eq!(s.connections, 1, "keep-alive: every request on one connection");
     if tls {
         assert_eq!((s.alpn.as_str(), s.version.as_str()), ("http/1.1", "TLSv1.3"));
     }
