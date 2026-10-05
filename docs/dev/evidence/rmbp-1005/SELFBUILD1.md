@@ -130,7 +130,7 @@ allocator (rustc + LLVM routinely map hundreds of MiB; the shim caps a process a
 ```
 tests linuxabi
 :: LINUXABI: path=/apps/HELLO.LNX exit=0 syscalls=2 enosys=[] ms=<n> -> PASS ::
-:: LINUXABI-KAT: path=/apps/SYSKAT.LNX checks=30 fail=none exit=0 syscalls=<~60> enosys=[] -> PASS ::
+:: LINUXABI-KAT: path=/apps/SYSKAT.LNX checks=30 fail=none exit=0 syscalls=49 enosys=[] -> PASS ::   (49 on the host kernel)
 tests selfbuild
 [selfbuild] linux /apps/TCC.LNX -nostdlib -static -o /home/<user>/hello.lnx /apps/HELLO.C
 [linux] sys=12 brk pid=1 … / sys=158 arch_prctl … / sys=334 rseq … -> -38 / sys=267 readlinkat … -> <len> / … / sys=1 write … -> 959
