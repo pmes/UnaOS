@@ -29,6 +29,7 @@ members = [
     "handlers/principia",
     # "handlers/vug",
     "tools/vertex",
+    "tools/play-check",
     "tools/unafs",
     "tools/una-card",
     "tools/unafs_bench",
