@@ -150,3 +150,33 @@ fn mp3_mutations_never_panic() {
     }
     eprintln!("mp3 mutations: {} damaged streams over {} files, no panic", runs, files.len());
 }
+
+#[test]
+fn aac_mutations_never_panic() {
+    // ADTS and MP4 (plain, fragmented, iTunSMPB, edit list) with bit flips, truncation and garbage runs —
+    // headers, sample tables and raw blocks all get hit. decode_all must return, never panic.
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/aac");
+    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "aac" || x == "m4a").unwrap_or(false)).collect();
+    files.sort();
+    let mut seed = 0x2468_ace1u32;
+    let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; seed };
+    let mut runs = 0;
+    for f in &files {
+        let orig = std::fs::read(f).unwrap();
+        for k in 0..40 {
+            let mut b = orig.clone();
+            match k % 5 {
+                0 => { for _ in 0..1 + rnd() % 32 { let i = rnd() as usize % (b.len() * 8); b[i / 8] ^= 1 << (i % 8); } }
+                1 => { let c = rnd() as usize % b.len(); b.truncate(c); }
+                2 => { let s = rnd() as usize % b.len(); let e = (s + 1 + rnd() as usize % 512).min(b.len()); for x in &mut b[s..e] { *x = rnd() as u8; } }
+                3 => { for _ in 0..1 + rnd() % 8 { let i = rnd() as usize % b.len().min(2048); b[i] = rnd() as u8; } }
+                _ => { for _ in 0..1 + rnd() % 128 { let i = rnd() as usize % b.len(); b[i] = rnd() as u8; } }
+            }
+            let r = std::panic::catch_unwind(|| { let _ = audio_core::decode_all(&b); });
+            assert!(r.is_ok(), "{}: mutation {} panicked", f.display(), k);
+            runs += 1;
+        }
+    }
+    eprintln!("aac mutations: {} damaged streams over {} files, no panic", runs, files.len());
+}

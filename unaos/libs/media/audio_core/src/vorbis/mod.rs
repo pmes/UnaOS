@@ -593,7 +593,7 @@ fn floor0_synth(order: usize, rate: u32, bark_map_size: u32, amplitude_bits: u32
 
 // ---------------------------------------------------------------- IMDCT
 
-struct Imdct {
+pub(crate) struct Imdct {
     n: usize,
     /// pre-twiddles exp(-iπ(k+1/4)/(n/2)) and post-twiddles exp(-iπk/(n/2)), k < n/4
     tw: Vec<(f32, f32)>,
@@ -605,7 +605,7 @@ struct Imdct {
 }
 
 impl Imdct {
-    fn new(n: usize, blocksize: [usize; 2]) -> Imdct {
+    pub(crate) fn new(n: usize, blocksize: [usize; 2]) -> Imdct {
         let n2 = n / 2;
         let n4 = n / 4;
         let pi = core::f64::consts::PI;
@@ -651,7 +651,7 @@ impl Imdct {
 
     /// The spec's inverse MDCT: y[n] = Σ_k X[k] cos(2π/N (n + 1/2 + N/4)(k + 1/2)), via a DCT-IV of size
     /// N/2 computed with an N/4-point complex FFT, then unfolded by the DCT-IV symmetries.
-    fn inverse(&self, x: &[f32], y: &mut [f32]) {
+    pub(crate) fn inverse(&self, x: &[f32], y: &mut [f32]) {
         let n = self.n;
         let n2 = n / 2;
         let n4 = n / 4;

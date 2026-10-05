@@ -144,3 +144,14 @@ lossy e3f63b4f855e3be23f5c1715d386078bb1fff68a31d9f656ede8ab994be32110 lossy/chr
 lossy 42b61dd5ba1ea954d40ca668cb0618bd97cdbe6eae8469d4679e4f1b5fb1c059 lossy/chromium-id3_png_test.mp3 https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/id3_png_test.mp3
 lossy 10b550722b958360e66fe0ce83d1a15c57b85eeccf047b0185ce5450047e56e0 lossy/chromium-icy_sfx.mp3 https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/icy_sfx.mp3
 lossy 1d16706e131e51c06cfac162983b22ca358f8d9d7c596a288534a17471070dcf lossy/chromium-midstream_config_change.mp3 https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/midstream_config_change.mp3
+# aac: Chromium's AAC samples, fetched; tests/aac_kat.rs::aac_fetched_streams checks the frame counts (those
+# of faad2 2.11.4, which the decodes match at 133.5-134.5 dB, AUDIOCODEC.md). HE-AAC decodes as its AAC-LC
+# core at the core rate (SBR/PS owed); AAC Main is refused (prediction owed).
+aac 37fbe1221a9da383f857b2ce9407892386be93da1f3101545917866476c93cad aac/chromium-sfx.adts https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.adts
+aac 4d820c54c41d850fd72d4b81780fc0e007a938643181e26dacbb5da0f6d569c7 aac/chromium-bear-audio-lc-aac.aac https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-audio-lc-aac.aac
+aac 55d22abaade1ba04cc7a5063c4d5ef008be82965b1a1ef6675c3bce6d30acb77 aac/chromium-sfx.m4a https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.m4a
+aac 68fdae35e7d5087367d1425eabef3c6101bbbc29aae8f403fec26883137c88f9 aac/chromium-bear-640x360-a_frag.mp4 https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-640x360-a_frag.mp4
+aac e5e7eea1a1e022d617be5110cfa2320a4c1c1ef334537b6e2cf857d408e84cb1 aac/chromium-bear-mpeg2-aac-only_frag.mp4 https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-mpeg2-aac-only_frag.mp4
+aac 0f083db31aea4a1ce99d9543755e394dafddd545052728e83ca460228dce4595 aac/chromium-bear-audio-implicit-he-aac-v1.aac https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-audio-implicit-he-aac-v1.aac
+aac 7808edff0b8cb27e9994fba9c0a55a240a557541825f4bea1535baf9c6b9b554 aac/chromium-bear-audio-implicit-he-aac-v2.aac https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-audio-implicit-he-aac-v2.aac
+aac 14d2780a01f62e14e8c66f33b24f515cce17e4b7999d8a15f6521352c033eb70 aac/chromium-bear-audio-main-aac.aac https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-audio-main-aac.aac

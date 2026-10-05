@@ -16,6 +16,8 @@
 //! | Opus (SILK, CELT, hybrid; Ogg mapping) | RFC 6716 + RFC 8251, RFC 7845 | [`opus`] |
 //! | Vorbis (floors 0/1, residues 0/1/2; Ogg mapping) | Xiph Vorbis I specification | [`vorbis`] |
 //! | MP3 (MPEG-1/2/2.5 Layer III; ID3v2, Xing/LAME gapless) | ISO/IEC 11172-3, 13818-3 | [`mp3`] |
+//! | AAC-LC (ADTS; raw in MP4) | ISO/IEC 14496-3, 13818-7 | [`aac`] |
+//! | MP4/M4A container (AAC, MP3; fragmented; edit-list/iTunSMPB gapless) | ISO/IEC 14496-12, -14 | [`mp4`] |
 //!
 //! One API: [`sniff`] names the format from the first bytes, [`Decoder::open`] picks the codec, and the
 //! [`AudioDecoder`] trait hands out interleaved PCM either as `f32` or as left-justified `i32`.
@@ -36,6 +38,7 @@ extern crate std;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+pub mod aac;
 pub mod aiff;
 pub mod bits;
 pub mod crc;
@@ -44,6 +47,7 @@ pub mod io;
 pub mod math;
 pub mod md5;
 pub mod mp3;
+pub mod mp4;
 pub mod ogg;
 pub mod opus;
 pub mod vorbis;
@@ -235,9 +239,19 @@ impl AudioDecoder for Decoder {
             Format::Aiff => Box::new(aiff::AiffDecoder::new(s)?),
             Format::Flac => Box::new(flac::FlacDecoder::new(s)?),
             Format::Ogg => ogg::open(s)?,
-            Format::Mp3 => Box::new(mp3::Mp3Stream::new(s)?),
-            Format::Adts => return Err(Error::Unsupported("aac (owed, M4)")),
-            Format::Mp4 => return Err(Error::Unsupported("mp4 audio (owed, M4)")),
+            Format::Mp3 => {
+                // an ID3v2 tag can front ADTS as well as MP3: look past it
+                let d = s.data();
+                let mut adts = false;
+                if d.len() >= 10 && &d[0..3] == b"ID3" {
+                    let size = ((d[6] as usize & 127) << 21) | ((d[7] as usize & 127) << 14) | ((d[8] as usize & 127) << 7) | (d[9] as usize & 127);
+                    let at = 10 + size + if d[5] & 0x10 != 0 { 10 } else { 0 };
+                    if s.fill(at + 2)? >= at + 2 { let d = s.data(); adts = d[at] == 0xFF && d[at + 1] & 0xF6 == 0xF0; }
+                }
+                if adts { Box::new(aac::AdtsStream::new(s)?) } else { Box::new(mp3::Mp3Stream::new(s)?) }
+            }
+            Format::Adts => Box::new(aac::AdtsStream::new(s)?),
+            Format::Mp4 => mp4::open(s)?,
             // Not recognisable from the first bytes: an MP3 can still start after junk (an ICY header, a
             // truncated tag) — the frame sync scan verifies every candidate against the next header.
             Format::Unknown => match mp3::Mp3Stream::new(s) {

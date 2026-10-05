@@ -234,3 +234,48 @@ minimp3's, including the stream's own +9 dBFS overs in frames 16–17. Owed: a s
 mid-stream is handed out at the first rate (no rate-change event in the trait yet).
 Robustness: 324 damaged streams (bit flips, truncation, garbage runs) over 27 files, no panic.
 Speed: 64x realtime on stereo 44.1 kHz, unoptimised (float IMDCT/polyphase straight from the definitions).
+
+## M4b — AAC-LC (ISO/IEC 14496-3 GA, ISO/IEC 13818-7 ADTS) and the MP4 container
+
+`src/aac/` — float AAC-LC from the standard's syntax (§4.4.2) and tools (§4.6), cross-read with FFmpeg's
+and faad2's decoders where the text is terse; the Huffman codebooks, scalefactor-band offsets and TNS band
+limits are the standard's tables (taken as data from FFmpeg's aactab.c). raw_data_block with SCE, CPE,
+LFE, DSE, PCE, FIL and CCE (parsed and skipped — no encoder in use emits it; applying it is owed); window
+grouping, section data, scalefactors (with the 9-bit first noise energy and intensity positions), pulse
+data, TNS (coefficients and the step-up recursion computed from §4.6.9.3, all-pole filter up/down), the 11
+spectral codebooks with escapes, |q|^(4/3)·2^((sf−100)/4), M/S, intensity stereo (sign from the codebook
+and, with `ms_mask_present == 1`, ms_used), PNS (and the correlated noise of §4.6.13.3 when both channels
+are noise with ms_used), and the filterbank — the IMDCT is the Vorbis module's (same kernel, n0 = N/4 + ½)
+with the 2/N scale, sine and KBD (α = 4/6) windows, all four window sequences, shape switching per half.
+Channels come out in WAVE order from channelConfiguration 1–7 or a PCE (front elements centre-outward).
+
+`src/mp4.rs` — ISO-BMFF: the first `soun` track, `stsd` `mp4a`/`.mp3` (QuickTime v1/v2 sample entries,
+`esds` also inside `wave`), `stsz`/`stz2`, `stsc`, `stco`/`co64`, fragmented files (`mvex/trex`,
+`moof/traf/tfhd/trun`, default-base-is-moof), and gapless trimming from `elst` (media_time, segment
+duration rounded to nearest as FFmpeg and faad2 do) or else `iTunSMPB`. Object type 0x40/0x66–0x68 goes to
+AAC (an MPEG-2 track without a DecoderSpecificInfo gets one synthesised), 0x69/0x6B to the MP3 decoder.
+The file is read whole (the `moov` may come last).
+
+**Oracle.** This Chromium build has no AAC (`decodeAudioData` refuses it), so the reference is **faad2
+2.11.4**, a decoder written independently of ours (float build; its frontend's implicit-SBR upsampling
+switched off — the streams are plain LC). Vectors: twelve fdk-aac 2.0.3 streams (`oracle/gen-aac.sh`:
+8–96 kHz, mono/stereo/3/5.1, 12–256 kb/s CBR + VBR; intensity stereo in four, PNS in three, short
+windows in nine) and four MP4 wrappings made by `oracle/adts2mp4.py` (edit list; iTunSMPB with the moov
+after the mdat; fragmented; plain), 792 KB with faad's 16-bit decodes stored as FLAC beside them.
+
+* With PNS switched off in both decoders (dev builds), **every stream agrees with faad2 to 132.5–134.4 dB**
+  (max |d| ≤ 4.5e-7: float rounding), identical frame counts — the deterministic path is right.
+* `tests/aac_kat.rs::aac_vectors_vs_faad2` (committed refs, PNS on): **16/16** — the 12 non-PNS cases at
+  77.3–78.8 dB (the 16-bit reference's own limit); the PNS cases by their noise bands, since PNS noise is
+  random by design (§4.6.13: any generator): bands where the decodes disagree in waveform must agree in
+  level — bias −0.16…+0.16 dB, spread ≤ 1.02 dB (limits 0.5 / 2.5 dB; a 1.5 dB PNS gain error fails it).
+* Chromium's AAC samples (fetched, `aac_fetched_streams`): `sfx.adts` 134.3 dB, `bear-audio-lc-aac.aac`
+  133.5 dB, `sfx.m4a` (edit list) 134.5 dB vs faad2 with equal frame counts; the fragmented
+  `bear-640x360-a_frag.mp4` and `bear-mpeg2-aac-only_frag.mp4` (faad2 cannot open fragments: compared
+  through an independent Python demux to ADTS) 133.5 / 133.9 dB. `bear-audio-main-aac.aac` (AAC Main) is
+  refused cleanly; the implicit HE-AAC v1/v2 files decode as their LC core at 24 kHz.
+* Robustness: 640 damaged ADTS/MP4 files, no panic; sample-table allocations bounded by the file size.
+* Speed: 160–170x realtime (stereo 44.1/48 kHz and 5.1), unoptimised.
+
+Owed: SBR and PS (HE-AAC v1/v2: today the LC core at half rate), AAC Main prediction, LTP, CCE application,
+960-sample frames, ER/LD/ELD, Opus/FLAC/ALAC in MP4.
