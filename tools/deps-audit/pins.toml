@@ -17,12 +17,6 @@ ledger = "SR31"
 until = "3.0.0"
 
 [[pin]]
-crate = "rand_core"
-reason = "tls-spike's only rand_core consumer is embedded-tls 0.19 (latest), which requires rand_core ^0.6.3 for its CryptoRng/RngCore bounds; the pin dies when TLSCORE's `tls_core` replaces embedded-tls"
-ledger = "SR28"
-until = "0.10.1"
-
-[[pin]]
 crate = "cxx-qt"
 reason = "Quartzite's optional `qt` embassy: 0.9 -> 0.10 changes the bridge macros and cxx-qt-build runs qmake, and no Qt 6 SDK exists in the audit container to prove the callers; the bump is owed on a Qt-equipped host"
 ledger = "SR31"
