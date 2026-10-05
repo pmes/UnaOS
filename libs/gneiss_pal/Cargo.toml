@@ -17,7 +17,8 @@ log = "0.4"
 reqwest = { version = "0.13", features = ["json", "stream", "multipart"], optional = true }
 octocrab = { version = "0.54", optional = true }
 # VEINPROV (B303): the provider seam — the shared backoff sleeps on tokio's timer; streams are futures Streams.
-tokio = { version = "1.53", features = ["time"], optional = true }
+# CLAUDECODE (SR38): `process` + `io-util` + `rt` — the Claude Code provider spawns the CLI and reads its stdout line by line.
+tokio = { version = "1.53", features = ["time", "process", "io-util", "rt"], optional = true }
 futures-core = { version = "0.3", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 chrono = { version = "0.4", default-features = false }
