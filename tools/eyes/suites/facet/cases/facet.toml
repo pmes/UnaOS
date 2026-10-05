@@ -36,16 +36,16 @@ run = "{repo}/target/release/facet render {suite}/fixtures/card.png --flip-h --z
 [[case]]
 name = "photo-o6"
 page = "pages/photo-o6.html"
-max_delta = 2
-note = "EXIF 6 applied; JPEG IDCT differs from Chromium by <= 2 (decoder, chicken wire)"
+max_delta = 0
+note = "EXIF 6 applied; pixel-exact vs Chromium (pixel_core's JPEG; was <= 2 / 70.33 dB through the image crate)"
 [case.subject]
 run = "{repo}/target/release/facet render {suite}/fixtures/photo-o6.jpg --zoom 200 --out {out}"
 
 [[case]]
 name = "photo-o5"
 page = "pages/photo-o5.html"
-max_delta = 2
-note = "EXIF 5 applied; JPEG IDCT differs from Chromium by <= 2 (decoder, chicken wire)"
+max_delta = 0
+note = "EXIF 5 applied; pixel-exact vs Chromium (pixel_core's JPEG; was <= 2 / 70.33 dB through the image crate)"
 [case.subject]
 run = "{repo}/target/release/facet render {suite}/fixtures/photo-o5.jpg --zoom 200 --out {out}"
 
