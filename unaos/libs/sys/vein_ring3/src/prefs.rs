@@ -7,7 +7,7 @@
 
 use crate::sys::sys;
 use una_abi::{BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY, BUS_KIND_REQUEST, BUS_MAGIC, BUS_VERB_PREF_GET, BUS_VERSION, SYS_MRECV, SYS_MSEND};
-use vein_core::prefs::{self as rules, Endpoint, KeyState, Plan, ProviderPref, TlsPolicy};
+use vein_core::prefs::{self as rules, Endpoint, KeyState, Plan, ProviderPref, Verify};
 
 static mut TX: [u8; BUS_HDR_LEN + 128] = [0; BUS_HDR_LEN + 128];
 static mut RX: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
@@ -63,7 +63,6 @@ pub fn get(key: &str, out: &mut [u8]) -> Result<Option<usize>, i64> {
 /// The `vein` namespace, read once.
 pub struct Config {
     pub provider: ProviderPref,
-    pub tls: TlsPolicy,
     model: [u8; 64],
     model_n: usize,
     endpoint: [u8; 160],
@@ -80,7 +79,7 @@ fn unq(b: &[u8], n: usize) -> &str {
 
 impl Config {
     pub fn read() -> Config {
-        let mut c = Config { provider: ProviderPref::Unset, tls: TlsPolicy::Verify, model: [0; 64], model_n: 0, endpoint: [0; 160], endpoint_n: 0, key_file: [0; 64], key_file_n: 0, bus_err: 0 };
+        let mut c = Config { provider: ProviderPref::Unset, model: [0; 64], model_n: 0, endpoint: [0; 160], endpoint_n: 0, key_file: [0; 64], key_file_n: 0, bus_err: 0 };
         let mut v = [0u8; 160];
         let one = |k: &str, v: &mut [u8], err: &mut i64| -> Option<usize> {
             match get(k, v) {
@@ -95,7 +94,6 @@ impl Config {
         };
         let mut err = 0;
         c.provider = rules::provider_pref(one("vein.provider", &mut v, &mut err).map(|n| &v[..n]));
-        c.tls = rules::tls_policy(one("vein.tls", &mut v, &mut err).map(|n| &v[..n]));
         if let Some(n) = one("vein.model", &mut v, &mut err) {
             let n = n.min(c.model.len());
             c.model[..n].copy_from_slice(&v[..n]);
@@ -133,9 +131,10 @@ impl Config {
         if k.is_empty() { None } else { Some(k) }
     }
 
-    /// The rule, applied.
-    pub fn plan(&self, key: KeyState) -> Plan {
+    /// The rule, applied. `verify` = whether this program can verify a TLS server right now (provider,
+    /// trust store, clock — the caller knows; see `crate::Tls::verify`).
+    pub fn plan(&self, key: KeyState, verify: Verify) -> Plan {
         let ep = self.endpoint();
-        rules::plan(self.provider, ep.as_ref(), key, self.tls, crate::VERIFIES_CERTS)
+        rules::plan(self.provider, ep.as_ref(), key, verify)
     }
 }

@@ -115,6 +115,12 @@ export UNAOS_GIT_SHA="${_sha_base}${_sha_suffix}"
 
 # Build flags shared by both targets
 NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
+# PROFILE2 (rmbp-ledger B340, M1): the x86 kernel is built WITH FRAME POINTERS so the sampler's walk
+# (`prof.rs`) can climb real stacks. RUSTFLAGS replaces the crate's `.cargo/config.toml` rustflags, so
+# `-C panic=abort` (also the target spec's panic-strategy) is restated. Measured on the metal shape:
+# .text 3994592 -> 3957798 bytes (-0.9 %, smaller), so no knob; the `[wc-h]` cost is read on the boot.
+# The builder (`builder/src/main.rs`, the build the ESP carries) sets the same string on its kernel cargo.
+KERNEL_FP_RUSTFLAGS="-C panic=abort -C force-frame-pointers=yes"
 
 # Optional kernel cargo features (composable). UNAOS_SKIP_XHCI=1 disables xHCI/USB bring-up
 # (video-only boot for real HW where firmware may still own the controller and stall its reset);
@@ -825,7 +831,9 @@ _feats="${_feats}sdw,"
 # (drivers/gpu/kepler_ce.rs) — R1 PTOP sweep, R2 CE PRI probe, R3 wide runlist scan, R5
 # firmware instance-block walk. Runs from kepler::init ABOVE the fifo leg, so it is upstream
 # of every FECS access and reads the runlist array PRE-SUBMIT. Implies nvidia-kepler; does
-# NOT require UNAOS_KEPLER_FIFO. Kept in sync with builder/src/main.rs.
+# NOT require UNAOS_KEPLER_FIFO. Kept in sync with builder/src/main.rs. KBLIT/R80: the ladder and the
+# KBLIT blit run from `tests ce` / `tests kblit`, never at boot. GPUTESTS (B334): x86_64-only module,
+# stripped by arm_features (k8-reach NA row).
 [ -n "${UNAOS_KEPLER_CE:-}" ] && _feats="${_feats}nvidia-kepler-ce,"
 # SHUTRESTORE (rmbp, 2026-09-15) — the SEVEN refuted Kepler rungs whose CODE had been deleted, each
 # back behind a knob of its own. RULINGS R19 (Peter, 2026-09-05): "you take a path that does not work
@@ -1227,6 +1235,8 @@ fi
 [ -n "${UNAOS_LUMEN:-}" ] && _feats="${_feats}lumen,"
 # NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM 56 / SYS_RESOLVE 57 for ring 3 and `tests net`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_NETRING3:-}" ] && _feats="${_feats}netring3,"
+# SELFDIAG (B324, R82): UNAOS_SELFDIAG=1 arms the boot log on disk (/var/log/boot.<n>.witness on a UnaFS root), SYS_PATH_READ 59 / SYS_PATH_WRITE 60 for APPS/DIAG.ELF and `tests selfdiag`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_SELFDIAG:-}" ] && _feats="${_feats}selfdiag,"
 # BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* to defaults at every login (the safe-mode boot knob; `[prefs] display reset=1 reason=knob`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_PREFS_RESET:-}" ] && _feats="${_feats}prefs_reset,"
 # KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
@@ -2655,6 +2665,12 @@ fi
 # module unconditionally, so this knob changes nothing there (its K8_FEATS arm is harmless by design).
 # Default OFF => the x86 image is byte-identical. Kept in sync with builder/src/main.rs and Cargo.toml.
 [ -n "${UNAOS_UNAFS:-}" ] && _feats="${_feats}unafs,"
+# AHCIROOT (rmbp-ledger B332, R82): UNAOS_AHCIROOT=1 makes the internal SSD's UnaFS p2 the root when the disk
+# is judged OURS, lets `install ssd --write` lay ESP + UnaFS (cloned or freshly formatted) under a kernel-held
+# write grant, and adds `tests ahciw`. Implies ahci-write, unafs and installdemo (Cargo.toml). x86 only.
+# ⚠ like UNAOS_AHCI_WRITE this can write Peter's SSD — but only through the grant, never ambient.
+# Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
+[ -n "${UNAOS_AHCIROOT:-}" ] && _feats="${_feats}ahciroot,"
 # HDA (rmbp-ledger B127, arc 1): UNAOS_HDA=1 arms drivers/hda.rs — the High Definition Audio
 # controller, the kernel's first audio line. NOTHING IN THIS KERNEL HAS EVER TOUCHED AUDIO, and the
 # reason is structural rather than an omission: `PciScanner::enumerate_buses` matches exactly one
@@ -3043,6 +3059,7 @@ arm_features() {
     # substring (the trailing comma is part of the pattern), so neither line can half-rewrite the
     # other — the same argument the `wifi2`/`wifi` pair above makes about itself.
     f="${f//,ahci-write,/,}"
+    f="${f//,ahciroot,/,}"   # AHCIROOT (B332): x86-only like its parents; stripped for the same -Cmetadata reason.
     # WIFI-1 (GR25) rides the same strip, for the same reason and by the same mechanism as
     # `bcmarecon` above: `src/wifi/` is declared `#[cfg(all(feature = "wifi", target_arch =
     # "x86_64"))]` and all three main-loop call sites carry the same pair, so `wifi` emits not one
@@ -3188,6 +3205,12 @@ arm_features() {
     # Jetson media hash for zero observable change. Stripped => the aarch64 media stay byte-identical
     # and the banner stops claiming an interrupt controller that board does not have.
     f="${f//,ioapic,/,}"
+    # GPUTESTS M3 (B334): `nvidia-kepler-ce` rides the same strip. `drivers/gpu/kepler_ce.rs` is now
+    # declared `#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-ce"))]` and its two consumers
+    # (`kepler::init`'s `arm_context`, the x86 `tests ce`/`tests kblit` registrations) carry the same
+    # conjunction, so the feature emits not one byte of aarch64 CODE; stripping it keeps the aarch64
+    # `-Cmetadata` fingerprint unchanged when an x86 knob line carries `UNAOS_KEPLER_CE=1`.
+    f="${f//,nvidia-kepler-ce,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -3523,10 +3546,16 @@ EOF
 # against. The kernel embeds nothing; a missing llvm-nm warns and never fails the build.
 emit_kernel_syms() { "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "$2" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: $2 ($(wc -l < "$2") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no $2 (prof dump stays unresolved)${COLOR_RESET}"; }
 
+# PROFILE2 (rmbp-ledger B340, M3): a ring-3 program's symbol table, written from the UNSTRIPPED link
+# product (the staged ELF is `--strip-all`ed) to `target/APPS/<NAME>.syms`, NAME = the staged basename
+# without `.ELF` — the program name the kernel's `prof dump` prints (`[prof] prog id= name=`), so
+# `tools/flame` resolves a ring-3 RIP against the right program. Warns, never fails the build.
+emit_user_syms() { mkdir -p "${WORKSPACE_DIR}/target/APPS"; "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "${WORKSPACE_DIR}/target/APPS/$2.syms" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: target/APPS/$2.syms ($(wc -l < "${WORKSPACE_DIR}/target/APPS/$2.syms") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no APPS/$2.syms (its ring-3 samples stay unresolved)${COLOR_RESET}"; }
+
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
-    cargo +nightly build --release \
+    RUSTFLAGS="$KERNEL_FP_RUSTFLAGS" cargo +nightly build --release \
       --target ../../x86_64-unaos.json \
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
@@ -3627,6 +3656,7 @@ build_user_stat_x86() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-stat/target/x86_64-unknown-none/release/user-stat" STAT  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-stat/target/x86_64-unknown-none/release/user-stat" \
       "${WORKSPACE_DIR}/target/STAT-X86.ELF"
@@ -3688,6 +3718,7 @@ build_one_vug_x86() {
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" \
       --target-dir "$tdir" ${feats:+--features "$feats"}
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${tdir}/x86_64-unknown-none/release/user-vug" "${out%-X86.ELF}"  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${tdir}/x86_64-unknown-none/release/user-vug" \
       "${WORKSPACE_DIR}/target/${out}"
@@ -3723,6 +3754,53 @@ build_user_vug_x86() {
 build_user_linux_hello_x86() {
     mkdir -p "${WORKSPACE_DIR}/target"
     ( cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly run --release --quiet -- "${WORKSPACE_DIR}/target/HELLO.LNX" )
+    build_selfbuild_x86   # SELFBUILD1: TCC.LNX + HELLO.C + SYSKAT.LNX + PROBE.LNX
+}
+
+# SELFBUILD1 (B344): the static Linux binaries `tests selfbuild` / `tests linuxabi` run under the Linux ABI shim, built on the
+# HOST into target/ and staged into APPS/ by the builder. NOTHING here enters the tree: tinycc (LGPL-2.1) and busybox (GPL-2.0)
+# are fetched at a PINNED commit into target/selfbuild/, built static, and only the stripped binary is staged on the volume
+# (R52-style: a binary on the volume, its source upstream). Static libc = the host's glibc (`-static -no-pie`); musl-gcc is
+# absent here — glibc-static adds start-up syscalls (rseq, readlinkat /proc/self/exe, getrandom), which is measured data.
+# No egress / no gcc = the binary is absent and the tests SKIP. SYSKAT.LNX is our own freestanding C (crates/user-linux-hello/c),
+# checked on the host kernel before it is staged; HELLO.C is the one-file program tcc compiles on UnaOS.
+SELFBUILD_TCC_URL="https://github.com/TinyCC/tinycc.git"
+SELFBUILD_TCC_REV="43c7708b85681a2fd4451c8a541af4494a8919b2"
+SELFBUILD_BB_URL="https://github.com/mirror/busybox.git"
+SELFBUILD_BB_REV="371fe9f71d445d18be28c82a2a6d82115c8af19d"
+_selfbuild_fetch() { # dir url rev
+    [ -d "$1/.git" ] && [ "$(git -C "$1" rev-parse HEAD 2>/dev/null)" = "$3" ] && return 0
+    rm -rf "$1" && mkdir -p "$1" && git -C "$1" init -q && git -C "$1" fetch -q --depth 1 "$2" "$3" && git -C "$1" checkout -q FETCH_HEAD
+}
+build_selfbuild_x86() {
+    local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c"
+    mkdir -p "$sb"
+    cp "$c/hello.c" "${WORKSPACE_DIR}/target/HELLO.C"
+    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -o "$sb/SYSKAT.LNX" "$c/syskat.c" \
+        && "$sb/SYSKAT.LNX" >/dev/null; then
+        cp "$sb/SYSKAT.LNX" "${WORKSPACE_DIR}/target/SYSKAT.LNX"
+    else
+        echo "   SELFBUILD1: SYSKAT.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT.LNX"
+    fi
+    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ]; then
+        if _selfbuild_fetch "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" \
+            && ( cd "$sb/tinycc" && ./configure --cc=gcc --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" >/dev/null && make -s tcc >/dev/null 2>&1 ); then
+            strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
+        else
+            echo "   SELFBUILD1: tinycc fetch/build failed — TCC.LNX absent, tests selfbuild will SKIP"
+        fi
+    fi
+    if [ ! -f "${WORKSPACE_DIR}/target/PROBE.LNX" ]; then
+        if _selfbuild_fetch "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" \
+            && ( cd "$sb/busybox" && make -s defconfig >/dev/null 2>&1 \
+                 && sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/; s/^# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/; s/^# CONFIG_FEATURE_PREFER_APPLETS is not set/CONFIG_FEATURE_PREFER_APPLETS=y/' .config \
+                 && (yes "" | make -s oldconfig >/dev/null 2>&1) && make -s -j"$(nproc)" >/dev/null 2>&1 ); then
+            cp "$sb/busybox/busybox" "${WORKSPACE_DIR}/target/PROBE.LNX"
+        else
+            echo "   SELFBUILD1: busybox fetch/build failed — PROBE.LNX absent (probe=none)"
+        fi
+    fi
+    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX HELLO.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).
@@ -3742,6 +3820,7 @@ build_user_pulse_x86() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-pulse/target/x86_64-unknown-none/release/user-pulse" PULSE  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-pulse/target/x86_64-unknown-none/release/user-pulse" \
       "${WORKSPACE_DIR}/target/PULSE-X86.ELF"
@@ -3770,6 +3849,7 @@ build_user_prefs_x86() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-prefs/target/x86_64-unknown-none/release/user-prefs" PREFS  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-prefs/target/x86_64-unknown-none/release/user-prefs" \
       "${WORKSPACE_DIR}/target/PREFS-X86.ELF"
@@ -3784,7 +3864,8 @@ build_user_prefs_x86() {
 }
 
 # LUMENAPP (B323, R82): build LUMEN.ELF — Lumen as ONE program that talks to the provider itself (crates/
-# user-lumen linking vein_core + vein_ring3: DNS, TCP, TLS 1.3, the Messages API). Linked at the ELF-window
+# user-lumen linking vein_core + vein_ring3: DNS, TCP, TLS 1.3 = tls_core verified against system/trust/roots.pem
+# (VEINTLS, SR36; `--features cryptocore` = CRYPTOCORE's provider), the Messages API). Linked at the ELF-window
 # VA (user-lumen-x86.ld, the user-big shape: no PHDRS, so lld fills PT_GNU_STACK from -z stack-size) — the
 # BIGAPPS relink RING3WIN owed for LUMEN. target/LUMEN-X86.ELF, staged by the builder as APPS/LUMEN.ELF.
 # Inert until launched (`lumen`); UNAOS_LUMEN=1 adds the dock pin and the `tests lumen` fixture.
@@ -3794,8 +3875,9 @@ build_user_lumen_x86() {
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-lumen"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): the product crypto provider under tls_core
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-lumen/target/x86_64-unknown-none/release/user-lumen" LUMEN  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-lumen/target/x86_64-unknown-none/release/user-lumen" \
       "${WORKSPACE_DIR}/target/LUMEN-X86.ELF"
@@ -3806,18 +3888,21 @@ build_user_lumen_x86() {
     echo -e "${COLOR_GREEN}✅ x86 ring-3 Lumen app: LUMEN-X86.ELF${COLOR_RESET}"
 }
 
+# VEINTLS (SR36): NET.ELF runs on vein_ring3 (the transport LUMEN uses: verified TLS 1.3 with tls_core), linked at
+# the ELF window (RING3ABI2's user-net-x86.ld, taken verbatim) and built `--features cryptocore`.
 # NETRING3 M3 (B306): build the x86_64 static ELF64 ring-3 network client (crates/user-net → target/NET-X86.ELF),
 # staged as APPS/NET.ELF by the builder. The exact shape of build_user_prefs_x86 above. NET.ELF draws entropy,
 # resolves api.anthropic.com, connects :80 and prints the status line (UNAOS_NETRING3=1; knob off the two new
 # syscalls answer the unknown-syscall default and it says so in its verdict line).
 build_user_net_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
-    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 network client static-ELF program (crates/user-net → target/NET-X86.ELF)...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 network client static-ELF program (crates/user-net → target/NET-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-net"
-    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" --features cryptocore   # VEINTLS (SR36): vein_ring3's verified TLS, CRYPTOCORE's provider; 256 KiB stack as LUMEN
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-net/target/x86_64-unknown-none/release/user-net" NET  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-net/target/x86_64-unknown-none/release/user-net" \
       "${WORKSPACE_DIR}/target/NET-X86.ELF"
@@ -3826,10 +3911,35 @@ build_user_net_x86() {
     [ "$fmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF does not start with the ELF magic; first 4 bytes = ${fmag}${COLOR_RESET}"; exit 1; }
     local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/NET-X86.ELF" | tr -d ' \n')"
     [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
-    local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/NET-X86.ELF" | tr -d ' ')"
-    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
-    bash "${WORKSPACE_DIR}/scripts/elf-entry-check.sh" "${WORKSPACE_DIR}/target/NET-X86.ELF" || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF cannot run at its entry (LUMENCRASH gate)${COLOR_RESET}"; exit 1; }   # LUMENCRASH M4 (B326)
-    echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (${psz} B)${COLOR_RESET}"
+    user_elf_window_check "${WORKSPACE_DIR}/target/NET-X86.ELF" "NET-X86.ELF"   # RING3ABI2 M4 (B333): was `[ size -le 16384 ]` + a bare elf-entry-check; NET.ELF now links at the ELF window (user-net-x86.ld, the user-big shape), and the gate runs elf-entry-check.sh itself
+    echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (ELF window)${COLOR_RESET}"
+}
+
+# SELFDIAG M2 (B324, R82): build DIAG.ELF — the smart installer's diagnosis program (crates/user-diag linking
+# diag_core + vein_core + vein_ring3) → target/DIAG-X86.ELF, staged by the builder as APPS/DIAG.ELF; also
+# generates the witness OWNERS table (scripts/witness-owners.py → target/witness-owners.txt, staged as
+# system/witness-owners.txt). The build_user_net_x86 shape, linked in the ELF window like LUMEN (TLS needs it),
+# so the gate is user_elf_window_check (which runs scripts/elf-entry-check.sh). A console program: app note
+# flags 0, a bare `diag` runs it in the foreground. Inert until run; UNAOS_SELFDIAG=1 arms its two syscalls.
+build_user_diag_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 diagnosis program (crates/user-diag → target/DIAG-X86.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    python3 "${WORKSPACE_DIR}/scripts/witness-owners.py" "${WORKSPACE_DIR}" "${WORKSPACE_DIR}/target/witness-owners.txt" || { echo -e "${COLOR_RED}ERROR: witness-owners.py produced no table${COLOR_RESET}"; exit 1; }
+    cd "$WORKSPACE_DIR/crates/user-diag"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-diag/target/x86_64-unknown-none/release/user-diag" \
+      "${WORKSPACE_DIR}/target/DIAG-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/DIAG-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: DIAG-X86.ELF missing/empty — x86 DIAG build failed${COLOR_RESET}"; exit 1; }
+    local fmag; fmag="$(head -c 4 "${WORKSPACE_DIR}/target/DIAG-X86.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$fmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: DIAG-X86.ELF does not start with the ELF magic; first 4 bytes = ${fmag}${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/DIAG-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: DIAG-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/DIAG-X86.ELF" "DIAG-X86.ELF"
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 diagnosis program: DIAG-X86.ELF${COLOR_RESET}"
 }
 
 # RING3WIN M4 (B316): build BIG.ELF — the ELF-window proof program (crates/user-big → target/BIG-X86.ELF),
@@ -3844,6 +3954,7 @@ build_user_big_x86() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-big/target/x86_64-unknown-none/release/user-big" BIG  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-big/target/x86_64-unknown-none/release/user-big" \
       "${WORKSPACE_DIR}/target/BIG-X86.ELF"
@@ -3894,6 +4005,7 @@ launch_x86_64() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     build_kernel_x86_64
 
@@ -4862,6 +4974,7 @@ test_x86_64() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     build_kernel_x86_64
 
@@ -5293,7 +5406,8 @@ test_x86_64() {
 #                  the per-arch `cfg` blocks around them — is still hand-written per crate and is
 #                  still exactly what these legs exist to catch.
 #   user-lumen     BOTH type-checked (LUMENBIN; LUMENAPP B323). x86 media only (LUMEN-X86.ELF, ELF window): the
-#                  aarch64 loader has no ELF window yet, and TLS (vein_ring3) is x86_64-only; aarch64 image owed.
+#                  aarch64 loader has no ELF window yet; aarch64 image owed. VEINTLS: TLS is tls_core (arch-neutral);
+#                  check runs without `--features cryptocore` (the provider), which the media build passes.
 #
 # Fields (whitespace-separated; the 4th field runs to end-of-line):
 #   1 crate dir under crates/
@@ -5324,13 +5438,14 @@ USER_CHECK_MATRIX=(
   "user-prefs    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-big      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
-  "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-diag     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
   "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-vug      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-pulse    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
-  "user-lumen    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-lumen    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
 )
 
 # Type-check every USER_CHECK_MATRIX row whose arch label matches $1, and print one summary line in the
@@ -5813,6 +5928,8 @@ KERNEL_CFG_MATRIX=(
   "x86-ioapic  ../../x86_64-unaos.json  ioapic,ehcihid"
   # NETRING3 (B306): the ring-3 entropy + resolve syscalls over the smolnet resolver, with `tests net`.
   "x86-netring3 ../../x86_64-unaos.json  netring3,smolnet,witness"
+  # SELFDIAG (B324): the boot log on disk, SYS_PATH_READ/WRITE and `tests selfdiag` beside the UnaFS root they serve.
+  "x86-selfdiag ../../x86_64-unaos.json  selfdiag,unafs,witness"
   # JETSON-EL0 (M1b) — the ARMED Orin, appended GR26. Until this leg, `tegra_el0` appeared in NO leg of
   # this matrix, which means `./arroyo check` type-checked the configuration
   # `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` ships NOWHERE — and `UNAOS_TEGRA_EL0=1 ./arroyo check` did
@@ -8763,6 +8880,7 @@ esp_x86() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
@@ -8824,6 +8942,7 @@ vm_image() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
@@ -8869,6 +8988,7 @@ fat_img() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
@@ -11076,6 +11196,10 @@ kernel8() {
     if [ -n "${UNAOS_NETRING3:-}" ]; then
         K8_FEATS="${K8_FEATS},netring3"
         echo -e "${COLOR_YELLOW}  • UNAOS_NETRING3: ring-3 SYS_GETRANDOM (56) + SYS_RESOLVE (57, -ENODEV on aarch64); tests net${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_SELFDIAG:-}" ]; then
+        K8_FEATS="${K8_FEATS},selfdiag"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SELFDIAG: SELFDIAG — the boot log on disk + tests selfdiag (SYS_PATH_READ/WRITE and DIAG.ELF are x86's)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_PREFS_RESET:-}" ]; then
         K8_FEATS="${K8_FEATS},prefs_reset"

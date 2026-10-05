@@ -639,7 +639,7 @@ botwedge = []
 # models no BCM4331, so a QEMU run only ever witnesses the honest no-radio refusal. Default OFF =>
 # module + call sites vanish, byte-identical. Enable via `UNAOS_WIFI=1`. See
 # docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
-wifi = []
+wifi = ["dep:wifi_core"] # WIFI1 (B338): arc 1+ link the shared no_std codec seam `wifi_core` (firmware container + 802.11 frames). A `dep:` so a knob-off image carries not one byte of it.
 # WIFI-2: arc 2 of the same ladder — the WRITE rungs (`src/wifi/bringup.rs`). Maps BAR0 (two 4 KiB
 # apertures), moves the backplane window selector cfg:0x80 onto ChipCommon and then onto the
 # enumeration ROM, walks the core table from our own reads with a TAG-driven parse (the declared port
@@ -3585,6 +3585,13 @@ root-prefer-sdhc = []
 # on x86 the dependency is `optional` and default OFF keeps the x86 image byte-identical (the K3-N1 size
 # band). See docs/dev/evidence/rmbp-1001/UNAFSX86.md.
 unafs = ["dep:unafs"]
+# AHCIROOT (rmbp-ledger B332, R82): `UNAOS_AHCIROOT=1` — the rMBP's internal SSD becomes the UnaFS root. The
+# kernel-held SATA write grant (`block::AHCI_LIVE_GRANT`, one port, one LBA range, held only by
+# `install ssd --write` for the verb's lifetime, by the boot's root bind over an OURS disk's UnaFS p2, or by
+# `tests ahciw` over p2's 64-sector scratch tail), FLUSH CACHE EXT + readback on the port write path, the
+# installer's p2 (cloned or `UnaFS::format`ed) and the SSD-first root bind. x86 only (k8-reach NA row).
+# See docs/dev/evidence/rmbp-1005/AHCIROOT.md. Kept in sync with unaos/arroyo and builder/src/main.rs.
+ahciroot = ["ahci-write", "unafs", "installdemo"]
 # HDA (rmbp-ledger B127, arc 1) — the Intel High Definition Audio controller, `UNAOS_HDA=1`.
 # Nothing in this kernel had ever touched audio before this feature existed: `PciScanner::
 # enumerate_buses` matches exactly one class triple (xHCI) and the `[PCI-STOR]` census matches
@@ -3731,6 +3738,17 @@ busreg = []
 # Kept in sync with `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 lumen = ["dep:vein_core"]
 
+# SELFDIAG (rmbp-ledger B324, R82): UNAOS_SELFDIAG=1 arms the smart installer's diagnosis loop's kernel half —
+# the BOOT LOG ON DISK (crate::bootwit: every `:: TAG: ... -> PASS|FAIL|SKIP ::` line and the `:: BOOT:`
+# line of a boot written to /var/log/boot.<n>.witness on a UnaFS root at desktop-ready and at reboot /
+# shutdown, the last 8 boots kept, nothing printed), `SYS_PATH_READ` (59) / `SYS_PATH_WRITE` (60) for ring 3
+# (x86; the VFS fulfils them, the selfhost tree under the kernel's authority) and `tests selfdiag` (the whole
+# pipe with the Echo fixture, no network). The program (APPS/DIAG.ELF, crates/user-diag) links the same
+# diag_core. Off: no tap, no write, the two numbers fall to the unknown-syscall default. Both arches compile
+# it (the syscalls are x86's: the ELF window is x86's). Kept in sync with `unaos/arroyo` (the `_feats` arm
+# and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+selfdiag = ["dep:diag_core"]
+
 # NETRING3 (rmbp-ledger B306): UNAOS_NETRING3=1 arms ring-3 entropy and name resolution — `SYS_GETRANDOM`
 # (56, the SHA-256 DRBG on top of `rand.rs`, whose cfg and `hash`'s widen to this feature) and
 # `SYS_RESOLVE` (57, `smolnet::resolve` on x86; -ENODEV on aarch64), `crate::netring3` and `tests net`.
@@ -3750,8 +3768,9 @@ prefs_reset = []
 # answers `kblit-channel-absent` and the CPU blitter is selected (`[wc] blitter=cpu reason=…` once at the
 # compositor ignition); any GPU blit error falls back to the CPU for that frame (`gpu_fallback=`). x86 only,
 # pairs with UNAOS_WC=1. Off: the probe answers `feature-off` and nothing else changes. Kept in sync with
-# `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`.
-wc_gpublit = []
+# `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`. GPUTESTS M3 (B334): implies `wc` —
+# the blitter sits under the window compositor and is meaningless without it.
+wc_gpublit = ["wc"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
@@ -3784,10 +3803,19 @@ prefs_core = { path = "../../libs/sys/prefs_core" }
 # LUMENAPP (B323): Vein's shared no_std core — `tests lumen` applies the SAME provider/key rule the ring-3
 # LUMEN.ELF applies (vein_core::prefs::plan). Zero deps; only under feature `lumen`.
 vein_core = { path = "../../libs/sys/vein_core", default-features = false, optional = true }
+# WIFI1 (B338, R79): the BCM4331 driver's shared no_std core — the firmware container codec and the
+# IEEE 802.11 frame codec, the same crate the host tests link. `optional`, pulled only by `wifi`.
+wifi_core = { path = "../../libs/sys/wifi_core", default-features = false, optional = true }
+# SELFDIAG (B324): the diagnosis core — witness grammar, owners table, prompt, diff parser + hunk locator +
+# streaming emitter, record, Echo fixture — the SAME crate APPS/DIAG.ELF links. no_std, zero deps.
+diag_core = { path = "../../libs/sys/diag_core", optional = true }
 # SELFINSTALL2 (rmbp-ledger B310): Amber Bytes' shared disk-layout core — GPT encode/decode, the partition
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).
 amber_core = { path = "../../libs/sys/amber_core", default-features = false }
+# CRYPTOCORE (LEDGER SR27): the cryptographic primitives UnaOS owns — `hash.rs` re-exports its SHA-256 /
+# HMAC-SHA256 / PBKDF2 (moved there from hash.rs). no_std, no alloc needed, zero deps; arch-neutral.
+crypto_core = { path = "../../libs/sys/crypto_core" }
 net = { path = "../net" }
 fdt = "0.1.5"
 # RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so

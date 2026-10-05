@@ -420,6 +420,6 @@ pub fn boot_line() {
     let ld = Dur { raw: Some(now.wrapping_sub(start)), hz };
     let total = Dur { raw: Some(if fw != 0 { now } else { now.wrapping_sub(start) }), hz };
     serial_println!(":: BOOT: firmware->loader={} loader->desktop={} total={} lines={} ::", fw_d, ld, total, lines);
-    crate::census::boot_banner();
+    crate::census::boot_banner(); #[cfg(feature = "selfdiag")] crate::bootwit::mark_desktop(); // SELFDIAG M1 (B324): arm the desktop-ready boot-log write (same-line fold)
     crate::tests::register("quietboot", crate::tests::quietboot_selftest);
 }

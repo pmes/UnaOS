@@ -1,0 +1,28 @@
+# Argon2 known answers extracted verbatim from the reference implementation's test harness:
+# https://raw.githubusercontent.com/P-H-C/phc-winner-argon2/f57e61e19229e23c4445b85494dbf7c07de721cb/src/test.c
+# fields: type version t log2(m_KiB) p password salt tag(hex, 32 bytes). TEST_LARGE_RAM (1 GiB) cases omitted.
+
+i 0x10 2 16 1 password somesalt f6c4db4a54e2a370627aff3db6176b94a2a209a62c8e36152711802f7b30c694
+i 0x10 2 18 1 password somesalt 3e689aaa3d28a77cf2bc72a51ac53166761751182f1ee292e3f677a7da4c2467
+i 0x10 2 8 1 password somesalt fd4dd83d762c49bdeaf57c47bdcd0c2f1babf863fdeb490df63ede9975fccf06
+i 0x10 2 8 2 password somesalt b6c11560a6a9d61eac706b79a2f97d68b4463aa3ad87e00c07e2b01e90c564fb
+i 0x10 1 16 1 password somesalt 81630552b8f3b1f48cdb1992c4c678643d490b2b5eb4ff6c4b3438b5621724b2
+i 0x10 4 16 1 password somesalt f212f01615e6eb5d74734dc3ef40ade2d51d052468d8c69440a3a1f2c1c2847b
+i 0x10 2 16 1 differentpassword somesalt e9c902074b6754531a3a0be519e5baf404b30ce69b3f01ac3bf21229960109a3
+i 0x10 2 16 1 password diffsalt 79a103b90fe8aef8570cb31fc8b22259778916f8336b7bdac3892569d4f1c497
+i 0x13 2 16 1 password somesalt c1628832147d9720c5bd1cfd61367078729f6dfb6f8fea9ff98158e0d7816ed0
+i 0x13 2 18 1 password somesalt 296dbae80b807cdceaad44ae741b506f14db0959267b183b118f9b24229bc7cb
+i 0x13 2 8 1 password somesalt 89e9029f4637b295beb027056a7336c414fadd43f6b208645281cb214a56452f
+i 0x13 2 8 2 password somesalt 4ff5ce2769a1d7f4c8a491df09d41a9fbe90e5eb02155a13e4c01e20cd4eab61
+i 0x13 1 16 1 password somesalt d168075c4d985e13ebeae560cf8b94c3b5d8a16c51916b6f4ac2da3ac11bbecf
+i 0x13 4 16 1 password somesalt aaa953d58af3706ce3df1aefd4a64a84e31d7f54175231f1285259f88174ce5b
+i 0x13 2 16 1 differentpassword somesalt 14ae8da01afea8700c2358dcef7c5358d9021282bd88663a4562f59fb74d22ee
+i 0x13 2 16 1 password diffsalt b0357cccfbef91f3860b0dba447b2348cbefecadaf990abfe9cc40726c521271
+id 0x13 2 16 1 password somesalt 09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7
+id 0x13 2 18 1 password somesalt 78fe1ec91fb3aa5657d72e710854e4c3d9b9198c742f9616c2f085bed95b2e8c
+id 0x13 2 8 1 password somesalt 9dfeb910e80bad0311fee20f9c0e2b12c17987b4cac90c2ef54d5b3021c68bfe
+id 0x13 2 8 2 password somesalt 6d093c501fd5999645e0ea3bf620d7b8be7fd2db59c20d9fff9539da2bf57037
+id 0x13 1 16 1 password somesalt f6a5adc1ba723dddef9b5ac1d464e180fcd9dffc9d1cbf76cca2fed795d9ca98
+id 0x13 4 16 1 password somesalt 9025d48e68ef7395cca9079da4c4ec3affb3c8911fe4f86d1a2520856f63172c
+id 0x13 2 16 1 differentpassword somesalt 0b84d652cf6b0c4beaef0dfe278ba6a80df6696281d7e0d2891b817d8c458fde
+id 0x13 2 16 1 password diffsalt bdf32b05ccc42eb15d58fd19b1f856b113da1e9a5874fdcc544308565aa8141c

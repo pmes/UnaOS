@@ -2555,7 +2555,7 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) { #[cfg(featur
 /// other arm ignores it, and a program that does not load `r10` simply passes junk to a verb that
 /// does not read it.
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, #[cfg(feature = "linuxabi")] a5: u64) -> i64 { #[cfg(feature = "linuxabi")] { let a4 = crate::arch::linuxabi::take_user_r8(); if crate::arch::linuxabi::is_linux_task() { return crate::arch::linuxabi::dispatch(nr, a0, a1, a2, a3, a4, a5); } } let prof_t0 = crate::prof::sys_t0(); // LINUXABI: a Linux task speaks the Linux table; a4 is user r8 from the stub's scratch, a5 is r9 (the 6th C arg). Folded onto the signature line.
+extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, #[cfg(feature = "linuxabi")] a5: u64) -> i64 { #[cfg(feature = "linuxabi")] { let a4 = crate::arch::linuxabi::take_user_r8(); if crate::arch::linuxabi::is_linux_task() { let lt0 = crate::prof::sys_t0(); let lrc = crate::arch::linuxabi::dispatch(nr, a0, a1, a2, a3, a4, a5); crate::prof::sys_note_linux(nr, lt0); return lrc; } } let prof_t0 = crate::prof::sys_t0(); // LINUXABI: a Linux task speaks the Linux table; a4 is user r8 from the stub's scratch, a5 is r9 (the 6th C arg). Folded onto the signature line.
     if !SYSCALL_LOGGED.swap(true, Ordering::Relaxed) {
         serial_println!(":: SYSCALL: nr={} — ring-3 -> ring-0 path live ::", nr);
     }
@@ -2624,8 +2624,8 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), #[cfg(feature = "netring3")] una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), // RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block. ⚠ SAME-LINE fold.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), // RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
+        SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
         // so the dispatch match is byte-identical there and an unknown number falls to the default.
@@ -2982,7 +2982,7 @@ fn user_range_ok(ptr: u64, len: u64, access: UserAccess) -> Result<(), i64> {
     };
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let end = ptr.wrapping_add(len);
-    if end < ptr || !((ptr >= lo && end <= window_end) || super::memory::xwin_contains(ptr, end)) { // RING3WIN: the ELF window is a legal buffer range too (the live-leaf walk below still decides); the FB hole stays out
+    if end < ptr || !((ptr >= lo && end <= window_end) || super::memory::xwin_contains(ptr, end) || (access == UserAccess::Read && super::memory::args_contains(ptr, end))) { // RING3WIN: the ELF window is a legal buffer range too (the live-leaf walk below still decides); the FB hole stays out
         return Err(EFAULT);
     }
     // CFU-2: the authoritative gate. In-window is necessary, never sufficient — the live leaf decides.
@@ -16918,13 +16918,15 @@ fn load_program_common(bytes: &[u8]) -> Result<(super::elf::Mapped, usize), &'st
 ///
 /// Returns `(outcome, entry)` where `entry` is the ring-3 entry VA the image was mapped at (for the
 /// caller's witness line), or an operator string if the image could not be loaded.
-pub fn run_user_image(
+pub fn run_user_image_argv(
     name: &'static str,
     bytes: &[u8],
     deadline_ms: u64,
+    argv: &[&str],
 ) -> Result<(RunOutcome, u64), &'static str> {
     let _ = name; // the task name is fixed (`RUN_TASK_NAME`) so the kill arm can match it
-    let (mapped, pi) = load_program_common(bytes)?; #[cfg(feature = "login")] slot_user_stamp(mapped.slot); // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
+    argv_fits(argv)?; // RING3ABI2 M2: refused BEFORE a slot exists, so a too-long line leaks nothing
+    let (mapped, pi) = load_program_common(bytes)?; super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // SPAWN-FOCUS: a foreground `run` is an operator-typed launch by construction — this entry point
     // has exactly one caller, the shell's `run` verb — so its first window takes focus. Armed here,
     // before `spawn_user_preemptible` below, for the same reason `spawn_user_image_bg_inner` arms
@@ -17004,7 +17006,7 @@ pub fn run_user_image(
 /// runs the BGRUN-SCAV sweep before refusing, reclaiming `bg_owned` rows that exited and were never
 /// reaped. So a shell that never runs `jobs` loses exit STATUSES, not launch capacity.
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, false)
+    spawn_user_image_bg_inner(bytes, false, &[])
 }
 
 /// DESKTOP-APP: [`spawn_user_image_bg`] for a launch NOBODY ASKED FOR — the compositor's own desktop
@@ -17021,15 +17023,17 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
 /// and has exactly one caller — and it is `wc`-gated, because that caller is.
 #[cfg(feature = "wc")]
 pub fn spawn_user_image_bg_no_autofocus(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, true)
+    spawn_user_image_bg_inner(bytes, true, &[])
 }
 
 fn spawn_user_image_bg_inner(
     bytes: &[u8],
     no_autofocus: bool,
+    argv: &[&str],
 ) -> Result<(u64, u64, u64), &'static str> {
     let _ = no_autofocus; // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
-    let (mapped, pi) = load_program_common(bytes)?; #[cfg(feature = "login")] slot_user_stamp(mapped.slot); // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
+    argv_fits(argv)?; // RING3ABI2 M2: refused BEFORE a slot exists
+    let (mapped, pi) = load_program_common(bytes)?; super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // PROCREAP: mark the row SCAVENGEABLE before the task can exist. This is the one launch path whose
     // reaper is a shell HANDLE (`BG_JOBS`) rather than a held index, so it is the one path whose row can
     // be orphaned by losing that handle — and therefore the only one BGRUN-SCAV may reclaim. See the
@@ -29945,14 +29949,16 @@ fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 
 /// NETRING3 M1 (B306): `SYS_GETRANDOM(buf, len) -> count / -errno` — at most `GETRANDOM_MAX` bytes from
 /// the kernel DRBG (`crate::netring3::getrandom`); the kernel copy is zeroed before return.
-#[cfg(feature = "netring3")]
 fn sys_getrandom(buf_ptr: u64, len: u64) -> i64 {
     let n = (len as usize).min(una_abi::GETRANDOM_MAX);
     if n == 0 {
         return 0;
     }
     let mut k = [0u8; una_abi::GETRANDOM_MAX];
+    #[cfg(feature = "netring3")]
     let got = crate::netring3::getrandom(&mut k[..n]);
+    #[cfg(not(feature = "netring3"))]
+    let got = crate::rand::getrandom(&mut k[..n]); // RING3ABI2 M1: unconditional
     let r = copy_to_user(buf_ptr, &k[..got]);
     k.fill(0);
     match r {
@@ -30071,4 +30077,101 @@ pub fn bus_notice_to(row: usize, body: &[u8]) -> i64 {
         return EAGAIN;
     }
     busx_reply_enqueue(row, 0, crate::bus::BUS_VERB_NOTICE, 0, body)
+}
+
+// SETTINGSBUS (rmbp-ledger B337): the router's view of this arch's mailboxes, for the kernel's preference
+// client (`prefs_client.rs` relays a desktop request to the ring-3 Principia through `bus_route` with it).
+#[cfg(feature = "busreg")]
+pub fn busreg_ops() -> &'static crate::bus_route::Ops {
+    &BUSREG_OPS
+// =================================================================================================
+// SELFDIAG (rmbp-ledger B324, R82) — `SYS_PATH_READ` (59) / `SYS_PATH_WRITE` (60): whole-path file I/O for
+// ring 3, fulfilled over the VFS by `crate::selfdiag::path_fulfil` (layouts in una-abi's SELFDIAG block).
+// The caller's principal is the ATTRSURF one; the selfhost tree is written under the kernel's authority
+// (the installer's path-scoped grant, decided in `selfdiag::principal_for`).
+// =================================================================================================
+#[cfg(feature = "selfdiag")]
+fn sys_pathio(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let n = a1 as usize;
+    if n < una_abi::PATH_IO_HDR_LEN || n > una_abi::PATH_IO_HDR_LEN + una_abi::PATH_IO_PATH_MAX + una_abi::PATH_IO_MAX {
+        return EINVAL;
+    }
+    let mut inb = alloc::vec![0u8; n];
+    if let Err(e) = copy_from_user(&mut inb, a0) {
+        return e;
+    }
+    let cap = if nr == una_abi::SYS_PATH_READ { (a3 as usize).min(una_abi::PATH_IO_MAX) } else { 0 };
+    match crate::selfdiag::path_fulfil(nr, &inb, &attrsurf_principal(caller_row()), cap) {
+        Ok((out, ret)) => {
+            if !out.is_empty() {
+                if let Err(e) = copy_to_user(a2, &out) {
+                    return e;
+                }
+            }
+            ret
+        }
+// =================================================================================================
+// RING3ABI2 (rmbp-ledger B333) — argv for the launchers, and SYS_WHOAMI. Design and witness:
+// docs/dev/evidence/rmbp-1005/RING3ABI2.md.
+// =================================================================================================
+
+/// RING3ABI2 M2: does `argv` fit one args page (`una_abi::ARGS_MAX` words, 4 KiB)? Asked before a slot is
+/// claimed so the refusal leaks nothing.
+fn argv_fits(argv: &[&str]) -> Result<(), &'static str> {
+    let mut scratch = alloc::vec![0u8; una_abi::USER_ARGS_BYTES];
+    match una_abi::args_build(una_abi::USER_ARGS_VA_X86, USER_BASE, argv, &mut scratch) {
+        Some(_) => Ok(()),
+        None => Err("the command line does not fit the 4 KiB args page (32 words max, RING3ABI2)"),
+    }
+}
+
+/// RING3ABI2 M2: the foreground launcher without words (every caller that predates argv).
+pub fn run_user_image(name: &'static str, bytes: &[u8], deadline_ms: u64) -> Result<(RunOutcome, u64), &'static str> {
+    run_user_image_argv(name, bytes, deadline_ms, &[])
+}
+
+/// RING3ABI2 M2: the background launcher WITH words — `bg <path> a b`, and a bare name that detaches.
+/// `argv[0]` is the word that named the program. Otherwise exactly [`spawn_user_image_bg`].
+pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
+    spawn_user_image_bg_inner(bytes, false, argv)
+}
+
+/// RING3ABI2 M3: `SYS_WHOAMI(buf, len)` — who the CALLER's slot runs as. With `login`, a slot stamped
+/// with the live session's user answers that user's record (the users store: name, uid, home); an
+/// anonymous slot, or one from a closed session, is `-ENOENT`. Without `login` there is no users store:
+/// `-ENOENT`. The record is `una_abi::whoami_build`'s.
+fn sys_whoami(buf: u64, len: u64) -> i64 {
+    #[cfg(feature = "login")]
+    let user = match super::memory::current_slot() {
+        Some(s) if slot_user_live(s) != 0 => slot_user_live(s),
+        _ => 0,
+    };
+    #[cfg(not(feature = "login"))]
+    let user = 0u32;
+    let rec = match crate::ring3abi::whoami_record(user) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if (len as usize) < rec.len() {
+        return una_abi::ERANGE;
+    }
+    match copy_to_user(buf, &rec) {
+        Ok(()) => rec.len() as i64,
+        Err(e) => e,
+    }
+}
+
+/// VEINTLS (LEDGER SR36): `SYS_TIME() -> UTC Unix seconds / -EAGAIN` — the civil clock for ring 3 (a TLS
+/// client's certificate validity check). `-EAGAIN` while `clock::unix_now` is unanchored: never a guess.
+fn sys_time() -> i64 {
+    match crate::clock::unix_now() {
+        Some(s) => s.min(i64::MAX as u64) as i64,
+        None => EAGAIN,
+    }
+}
+
+/// PROFILE2 (rmbp-ledger B340, M5): `SYS_PROF(op, buf, len)` — the shared body in `crate::prof`, with this
+/// arch's validated `copy_to_user` as the only path into the caller's buffer.
+fn sys_prof(op: u64, buf: u64, len: u64) -> i64 {
+    crate::prof::sys_prof(op, buf, len, |p, b| copy_to_user(p, b).is_ok())
 }

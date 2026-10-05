@@ -45,6 +45,9 @@ pub mod sched;
 // compiles against whichever one the active feature selects.
 #[cfg(feature = "aarch64_el0")]
 pub mod syscall;
+// RING3ABI2 (rmbp-ledger B333): the extension GiB — the args page, the aarch64 ELF window, SYS_SBRK.
+#[cfg(feature = "aarch64_el0")]
+pub mod xwin;
 // BANDY-1's `pub mod bus;` STOOD HERE until BUSX86 (ROADMAP §3b, 2026-09-22). The v1 SMessage codec
 // was never aarch64 machinery — it names no register, no board, no arch — and declaring it under
 // `arch/aarch64/` is what made SYS_MSEND/SYS_MRECV a board-split of the program story (LAWS §3: ONE

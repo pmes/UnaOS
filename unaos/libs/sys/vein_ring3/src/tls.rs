@@ -1,173 +1,223 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! TLS 1.3 over [`Tcp`] — `embedded-tls` 0.19 (no_std, no alloc), the crate the NETRING3 spike built for
-//! this target and measured at ~78 KiB of code + ~20 KiB of record buffers; it fits now that a ring-3
-//! program can link in the 4 MiB ELF window (RING3WIN). Cipher suite TLS_AES_128_GCM_SHA256, key share
-//! P-256, randomness from SYS_GETRANDOM (the kernel DRBG).
+//! TLS 1.3 for Vein in ring 3 — UnaOS's own `tls_core` (TLSCORE, SR28) over any byte stream that implements
+//! [`vein_core::client::Transport`] (the NETRING3 [`crate::net::Tcp`] on the metal, a std socket in the host
+//! test). VEINTLS (SR36) replaced `embedded-tls` (no certificate verification) with this: every connection
+//! is VERIFIED — the server's chain is built to a root of the trust store ([`crate::trust`],
+//! `/system/trust/roots.pem`), checked at the wall-clock time ([`crate::clock`]) and matched to the host
+//! name (RFC 6125); a failure ends the handshake with the alert tls_core sends, and the caller's request
+//! (which may carry the key) is never written. There is no insecure mode.
 //!
-//! **NO CERTIFICATE IS VERIFIED** (`UnsecureProvider`). The trust store (`/system/trust/roots.pem`,
-//! NETRING3 §Trust store) is the owed rung; until it lands an active attacker on the path could read
-//! what is sent, which is why the key goes over this only on `vein.tls = "insecure"`.
+//! Crypto is the caller's [`CryptoProvider`]: CRYPTOCORE's `CryptoCoreProvider` in the product
+//! (feature `cryptocore`, see [`crate::provider`]), tls_core's test provider in host tests.
 
-use crate::net::Tcp;
-use core::sync::atomic::{AtomicI64, Ordering};
-use embedded_io::{ErrorKind, ErrorType, Read, Write};
-use embedded_tls::blocking::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, TlsError, UnsecureProvider};
+use alloc::vec::Vec;
+use core::cell::Cell;
 
-/// `-EPROTO`: the TLS layer failed (see [`last_error`]).
+use tls_core::error::{AlertDescription, CertError, TlsError};
+use tls_core::x509::{Certificate, Clock, PublicKey, TrustStore, WebPkiVerifier};
+use tls_core::{Client, ClientConfig, CryptoProvider, ServerCertVerifier};
+use vein_core::client::Transport;
+
+/// `-EPROTO`: the TLS layer failed (the [`TlsFail::why`] says how).
 pub const EPROTO: i64 = -71;
 
-/// The record buffers (a full 16 KiB TLS record must fit the read buffer).
-pub struct TlsBufs {
-    rb: [u8; 16640],
-    wb: [u8; 4096],
+/// The earliest instant a believable clock can read: 2026-10-04T00:00:00Z (this arc). A clock before it is
+/// unset or wrong, and certificate validity cannot be judged against it, so the handshake is not attempted.
+pub const CLOCK_FLOOR: i64 = 1_790_985_600;
+
+/// What a verified connection needs, owned by the caller for the life of the program.
+#[derive(Clone, Copy)]
+pub struct TlsContext<'a> {
+    pub provider: &'a dyn CryptoProvider,
+    pub store: &'a TrustStore,
+    pub clock: &'a dyn Clock,
 }
 
-impl TlsBufs {
-    pub const fn new() -> Self {
-        TlsBufs { rb: [0; 16640], wb: [0; 4096] }
-    }
+/// The issuer of the server certificate a handshake verified (its commonName, at most 64 bytes) — what
+/// the window prints as `transport=tls verified=<issuer CN>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Verified {
+    cn: [u8; 64],
+    n: usize,
 }
 
-impl Default for TlsBufs {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-static LAST_SOCK_ERR: AtomicI64 = AtomicI64::new(0);
-static mut LAST_TLS: [u8; 64] = [0; 64];
-static LAST_TLS_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// The last TLS error, as its Debug name (for the window and the wire).
-pub fn last_error() -> &'static str {
-    let n = LAST_TLS_N.load(Ordering::Relaxed);
-    let b = unsafe { &*core::ptr::addr_of!(LAST_TLS) };
-    core::str::from_utf8(&b[..n]).unwrap_or("?")
-}
-
-fn record(e: &TlsError) -> i64 {
-    struct W(usize);
-    impl core::fmt::Write for W {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = unsafe { &mut *core::ptr::addr_of_mut!(LAST_TLS) };
-            for &c in s.as_bytes() {
-                if self.0 < b.len() {
-                    b[self.0] = c;
-                    self.0 += 1;
-                }
-            }
-            Ok(())
+impl Verified {
+    fn new(s: &str) -> Self {
+        let mut v = Verified { cn: [0; 64], n: 0 };
+        // Printable ASCII only (it goes to the serial wire and the 8x8 font), at most 64 bytes.
+        for c in s.bytes().filter(|c| (0x20..0x7f).contains(c)).take(64) {
+            v.cn[v.n] = c;
+            v.n += 1;
         }
+        v
     }
-    let mut w = W(0);
-    let _ = core::fmt::write(&mut w, format_args!("{:?}", e));
-    LAST_TLS_N.store(w.0, Ordering::Relaxed);
-    // A socket failure underneath keeps its own errno (ECANCELED from the caller's hook included).
+    pub fn issuer(&self) -> &str {
+        core::str::from_utf8(&self.cn[..self.n]).unwrap_or("?")
+    }
+}
+
+/// Why TLS did not carry the exchange: a short static name (window + wire) and the errno.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlsFail {
+    pub why: &'static str,
+    pub errno: i64,
+}
+
+/// A short, stable name for a tls_core failure (`cert-unknown-issuer`, `cert-name-mismatch`, ...).
+pub fn describe(e: &TlsError) -> &'static str {
+    use tls_core::crypto::CryptoError;
     match e {
-        TlsError::Io(_) | TlsError::IoError => {
-            let s = LAST_SOCK_ERR.load(Ordering::Relaxed);
-            if s < 0 { s } else { EPROTO }
-        }
+        TlsError::Transport => "transport",
+        TlsError::UnexpectedEof => "unexpected-eof",
+        TlsError::Decode(s) | TlsError::Protocol(_, s) | TlsError::State(s) => s,
+        TlsError::PeerAlert(a) => match a {
+            AlertDescription::HandshakeFailure => "peer-alert-handshake-failure",
+            AlertDescription::ProtocolVersion => "peer-alert-protocol-version",
+            AlertDescription::UnrecognizedName => "peer-alert-unrecognized-name",
+            AlertDescription::DecryptError => "peer-alert-decrypt-error",
+            AlertDescription::IllegalParameter => "peer-alert-illegal-parameter",
+            AlertDescription::InternalError => "peer-alert-internal-error",
+            _ => "peer-alert",
+        },
+        TlsError::PeerAlertUnknown(_) => "peer-alert-unknown",
+        TlsError::Crypto(CryptoError::Unsupported(s)) => s,
+        TlsError::Crypto(CryptoError::BadSignature) => "certificate-verify-bad-signature",
+        TlsError::Crypto(CryptoError::Rng) => "no-entropy",
+        TlsError::Crypto(_) => "crypto",
+        TlsError::Certificate(c) => match c {
+            CertError::BadDer(_) => "cert-bad-der",
+            CertError::NoCertificate => "cert-none",
+            CertError::UnknownIssuer => "cert-unknown-issuer",
+            CertError::Expired => "cert-expired",
+            CertError::NotYetValid => "cert-not-yet-valid",
+            CertError::BadSignature => "cert-bad-signature",
+            CertError::UnsupportedSignatureAlgorithm => "cert-unsupported-signature",
+            CertError::NotCa => "cert-not-ca",
+            CertError::PathLenExceeded => "cert-path-len",
+            CertError::KeyUsage => "cert-key-usage",
+            CertError::NameConstraint => "cert-name-constraint",
+            CertError::UnknownCriticalExtension => "cert-unknown-critical-extension",
+            CertError::NameMismatch => "cert-name-mismatch",
+            CertError::PathTooLong => "cert-path-too-long",
+            CertError::NoTrustAnchors => "no-trust-anchors",
+        },
+        TlsError::BadRecordMac => "bad-record-mac",
+        TlsError::Closed => "closed",
+    }
+}
+
+/// tls_core's byte-stream face of the caller's transport. The socket's own errno (ECANCELED from the wait
+/// hook, ECONNRESET, ...) lands in a cell the caller keeps, so a TLS "transport" failure reports what
+/// really happened underneath, during the handshake as well as after it.
+struct Io<'t, T: Transport + ?Sized> {
+    t: &'t mut T,
+    err: &'t Cell<i64>,
+}
+
+impl<T: Transport + ?Sized> tls_core::Transport for Io<'_, T> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
+        self.t.recv(buf).map_err(|e| {
+            self.err.set(e);
+            TlsError::Transport
+        })
+    }
+    fn write_all(&mut self, data: &[u8]) -> Result<(), TlsError> {
+        self.t.send_all(data).map_err(|e| {
+            self.err.set(e);
+            TlsError::Transport
+        })
+    }
+}
+
+fn fail_of(e: &TlsError, sock: i64) -> TlsFail {
+    let errno = match e {
+        TlsError::Transport if sock < 0 => sock,
         _ => EPROTO,
+    };
+    TlsFail { why: describe(e), errno }
+}
+
+/// The Web PKI verifier, remembering the issuer CN of the chain it accepted.
+struct IssuerVerifier<'a> {
+    web: WebPkiVerifier<'a>,
+    issuer: Cell<Option<Verified>>,
+}
+
+impl ServerCertVerifier for IssuerVerifier<'_> {
+    fn verify_server_cert(&self, p: &dyn CryptoProvider, chain: &[Vec<u8>], name: Option<&str>) -> Result<PublicKey, TlsError> {
+        let key = self.web.verify_server_cert(p, chain, name)?;
+        let cn = chain.first().and_then(|d| Certificate::parse(d).ok()).and_then(|c| c.issuer_cn());
+        self.issuer.set(Some(Verified::new(cn.as_deref().unwrap_or("?"))));
+        Ok(key)
     }
 }
 
-/// The embedded-io face of the socket.
-pub struct Io<'t>(&'t mut Tcp);
-
-impl ErrorType for Io<'_> {
-    type Error = ErrorKind;
+/// An open, verified TLS session — a [`Transport`] for `vein_core::client::exchange`.
+pub struct Session<'s, T: Transport + ?Sized> {
+    c: Client<'s, Io<'s, T>>,
+    sock: &'s Cell<i64>,
+    pending: Vec<u8>,
+    off: usize,
+    /// The first TLS failure after the handshake (`exchange` only sees the errno).
+    pub fail: Option<TlsFail>,
 }
 
-fn kind(e: i64) -> ErrorKind {
-    LAST_SOCK_ERR.store(e, Ordering::Relaxed);
-    match e {
-        crate::net::ECANCELED => ErrorKind::Interrupted,
-        una_abi::EAGAIN => ErrorKind::TimedOut,
-        una_abi::ECONNRESET => ErrorKind::ConnectionReset,
-        una_abi::ENOTCONN => ErrorKind::NotConnected,
-        _ => ErrorKind::Other,
-    }
-}
-
-impl Read for Io<'_> {
-    fn read(&mut self, b: &mut [u8]) -> Result<usize, ErrorKind> {
-        self.0.read_some(b).map_err(kind)
-    }
-}
-
-impl Write for Io<'_> {
-    fn write(&mut self, b: &[u8]) -> Result<usize, ErrorKind> {
-        self.0.write_some(b).map_err(kind)
-    }
-    fn flush(&mut self) -> Result<(), ErrorKind> {
-        Ok(())
-    }
-}
-
-/// The RNG the handshake draws from: the kernel DRBG.
-struct Rng;
-
-impl rand_core::RngCore for Rng {
-    fn next_u32(&mut self) -> u32 {
-        let mut b = [0u8; 4];
-        self.fill_bytes(&mut b);
-        u32::from_le_bytes(b)
-    }
-    fn next_u64(&mut self) -> u64 {
-        let mut b = [0u8; 8];
-        self.fill_bytes(&mut b);
-        u64::from_le_bytes(b)
-    }
-    fn fill_bytes(&mut self, d: &mut [u8]) {
-        if crate::sys::getrandom(d).is_err() {
-            // No entropy is no TLS: never hand the handshake predictable bytes.
-            crate::sys::write(b":: VEIN: getrandom failed -- TLS aborted ::\n");
-            crate::sys::sys(una_abi::SYS_EXIT, 4, 0, 0, 0);
+impl<T: Transport + ?Sized> Session<'_, T> {
+    fn record(&mut self, e: &TlsError) -> i64 {
+        let f = fail_of(e, self.sock.get());
+        if self.fail.is_none() {
+            self.fail = Some(f);
         }
-    }
-    fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(d);
-        Ok(())
+        f.errno
     }
 }
 
-impl rand_core::CryptoRng for Rng {}
-
-/// An open TLS session over a borrowed socket.
-pub struct Tls<'a> {
-    c: TlsConnection<'a, Io<'a>, Aes128GcmSha256>,
-}
-
-impl<'a> Tls<'a> {
-    /// Handshake with `host` (SNI). `Err` = a negative errno (`EPROTO` + [`last_error`] for TLS faults).
-    pub fn open(tcp: &'a mut Tcp, host: &'a str, bufs: &'a mut TlsBufs) -> Result<Self, i64> {
-        LAST_SOCK_ERR.store(0, Ordering::Relaxed);
-        let cfg = TlsConfig::new().with_server_name(host);
-        let mut c: TlsConnection<'a, Io<'a>, Aes128GcmSha256> = TlsConnection::new(Io(tcp), &mut bufs.rb, &mut bufs.wb);
-        c.open(TlsContext::new(&cfg, UnsecureProvider::new::<Aes128GcmSha256>(Rng))).map_err(|e| record(&e))?;
-        Ok(Tls { c })
-    }
-}
-
-impl vein_core::client::Transport for Tls<'_> {
-    fn send_all(&mut self, mut b: &[u8]) -> Result<(), i64> {
-        while !b.is_empty() {
-            let n = self.c.write(b).map_err(|e| record(&e))?;
-            if n == 0 {
-                return Err(EPROTO);
-            }
-            b = &b[n..];
-        }
-        self.c.flush().map_err(|e| record(&e))
+impl<T: Transport + ?Sized> Transport for Session<'_, T> {
+    fn send_all(&mut self, b: &[u8]) -> Result<(), i64> {
+        self.c.send(b).map_err(|e| self.record(&e))
     }
     fn recv(&mut self, b: &mut [u8]) -> Result<usize, i64> {
-        match self.c.read(b) {
-            Ok(n) => Ok(n),
-            Err(TlsError::ConnectionClosed) => Ok(0),
-            Err(e) => Err(record(&e)),
+        if self.off == self.pending.len() {
+            match self.c.recv() {
+                Ok(Some(v)) => {
+                    self.pending = v;
+                    self.off = 0;
+                }
+                Ok(None) => return Ok(0),
+                Err(e) => return Err(self.record(&e)),
+            }
         }
+        let n = b.len().min(self.pending.len() - self.off);
+        b[..n].copy_from_slice(&self.pending[self.off..self.off + n]);
+        self.off += n;
+        Ok(n)
     }
+}
+
+/// Handshake with `host` over `t` (SNI + RFC 6125 name check, ALPN `http/1.1`), verifying the chain against
+/// `ctx.store` at `ctx.clock`; on success run `f` over the session with the verified issuer, then send
+/// close_notify. Nothing `f` would write is written unless the handshake verified. Returns `f`'s result and
+/// the first TLS failure seen while it ran (if any).
+pub fn with_session<T: Transport + ?Sized, R>(t: &mut T, host: &str, ctx: &TlsContext<'_>, f: impl FnOnce(&mut Session<'_, T>, Verified) -> R) -> Result<(R, Option<TlsFail>), TlsFail> {
+    if ctx.store.anchors.is_empty() {
+        return Err(TlsFail { why: "no-trust-anchors", errno: EPROTO });
+    }
+    if ctx.clock.now() < CLOCK_FLOOR {
+        return Err(TlsFail { why: "clock-unset", errno: una_abi::EAGAIN });
+    }
+    let verifier = IssuerVerifier { web: WebPkiVerifier { store: ctx.store, clock: ctx.clock }, issuer: Cell::new(None) };
+    let mut cfg = ClientConfig::new(Some(host), &verifier);
+    cfg.alpn = alloc::vec![b"http/1.1".to_vec()];
+    let sock = Cell::new(0i64);
+    let c = Client::connect(ctx.provider, &cfg, Io { t, err: &sock }).map_err(|e| fail_of(&e, sock.get()))?;
+    let Some(v) = verifier.issuer.get() else {
+        return Err(TlsFail { why: "verifier-not-run", errno: EPROTO });
+    };
+    let mut s = Session { c, sock: &sock, pending: Vec::new(), off: 0, fail: None };
+    let r = f(&mut s, v);
+    let _ = s.c.close();
+    let fail = s.fail;
+    Ok((r, fail))
 }

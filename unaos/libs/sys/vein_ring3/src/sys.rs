@@ -68,3 +68,10 @@ pub fn getrandom(buf: &mut [u8]) -> Result<(), i64> {
     }
     Ok(())
 }
+
+/// VEINTLS (SR36): the kernel's civil clock, UTC Unix seconds (SYS_TIME). `Err(-EAGAIN)` while the
+/// kernel's clock has never been anchored this boot (no RTC read, no SNTP answer).
+pub fn unix_time() -> Result<i64, i64> {
+    let r = sys(una_abi::SYS_TIME, 0, 0, 0, 0);
+    if r < 0 { Err(r) } else { Ok(r) }
+}

@@ -491,7 +491,7 @@ pub fn save(print: bool) -> Result<(usize, usize, usize), String> {
         }
         off += w;
     }
-    let _ = crate::fs::filetype::stamp_as_in(&mt, &path, crate::fs::filetype::TEXT_PLAIN); // FILETYPE (B307): a saved document is text/plain
+    let _ = crate::fs::filetype::stamp_as_in(&mt, &path, crate::fs::filetype::saved_text_type(&path)); // FILETYPE (B307): a saved document is text/plain (QUARRY2: or the Markdown/JSON its name says)
     let lines = text.iter().filter(|&&b| b == b'\n').count() + (text.last().map_or(0, |&b| (b != b'\n') as usize));
     let retitle = {
         let mut g = STATE.lock();

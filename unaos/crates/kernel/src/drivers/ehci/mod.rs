@@ -19042,7 +19042,7 @@ pub fn service_ehci_hid() {
     // One chain per pass; the first controller that claimed a radio owns it.
     #[cfg(feature = "bt")]
     {
-        bt_drain_boot_campaign(ctrls); let src = BT_RETRIGGER_PENDING.swap(0, core::sync::atomic::Ordering::SeqCst); // BTSCHED (B137) ⚠ SAME-LINE fold, for the reason every fold in this tree carries: a physical line here would shift every `panic::Location` below it in an 18k-line file and move the knob-off image. The boot campaign the enumeration walk deferred is drained FIRST and on its own latch, ahead of the chord-driven re-trigger, because it is the chain that would have run at boot; both run under this same `EHCI_HID` lock and neither can start while the other is in flight (`bt_chain_busy`).
+        bt_drain_boot_campaign(ctrls); #[cfg(feature = "btc")] bthid::pump(ctrls); let src = BT_RETRIGGER_PENDING.swap(0, core::sync::atomic::Ordering::SeqCst); // BTHID (B339): the BR/EDR HID host's per-pass step (try_lock, zero-budget event read, rate-limited ACL poll) — placed BEFORE the re-trigger swap so it can see a pending Ctrl+Alt+B and stand down. BTSCHED (B137) ⚠ SAME-LINE fold, for the reason every fold in this tree carries: a physical line here would shift every `panic::Location` below it in an 18k-line file and move the knob-off image. The boot campaign the enumeration walk deferred is drained FIRST and on its own latch, ahead of the chord-driven re-trigger, because it is the chain that would have run at boot; both run under this same `EHCI_HID` lock and neither can start while the other is in flight (`bt_chain_busy`).
         if src != 0 {
             let mut serviced = false;
             for c in ctrls.iter_mut() {
@@ -19224,7 +19224,7 @@ fn bt_drain_boot_campaign(ctrls: &mut [Controller]) {
             ":: bt-sched: [{}] FIRING — the chain the enumeration walk deferred at {} ms runs now, {} ms of boot path it did not hold; addr={}; its bt-l2 scan summary and (under btc) its bt-c1 page summary below are its outcome == witness ::",
             idx, deferred_at, now.saturating_sub(deferred_at), radio.target.addr
         );
-        unsafe { c.bt_bringup_wire(&radio.target, radio.intf, &e) };
+        #[cfg(not(feature = "btc"))] unsafe { c.bt_bringup_wire(&radio.target, radio.intf, &e) }; #[cfg(feature = "btc")] unsafe { bthid::boot_bringup(c, &radio, &e) }; // BTHID (B339): under `btc` the boot campaign is the BTHID bring-up (HCI reset, identity, event mask, SSP on, page scan on) and NOTHING is paged at boot but a bonded device's bounded reconnect, which waits for the desktop and the session's bond store; the legacy LE-scan/inquiry/page chain stays reachable by Ctrl+Alt+B. ⚠ SAME-LINE fold.
         serial_println!(
             ":: bt-sched: [{}] COMPLETE at {} ms — the chain returned == witness ::",
             idx, crate::arch::ms()
@@ -19552,3 +19552,8 @@ fn ehci_selftest() {
 fn ehci_isr_test() {
     unsafe { isr_selftest() };
 }
+
+/// BTHID (rmbp-ledger B339) — the Bluetooth HID host over BR/EDR (`bt` verb, `tests bt`, the bonded-device
+/// reconnect). A child module so it reuses this file's HCI/ACL transport and its HID report parser. Tail append.
+#[cfg(feature = "btc")]
+pub mod bthid;

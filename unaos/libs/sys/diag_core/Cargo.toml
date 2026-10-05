@@ -1,0 +1,11 @@
+[package]
+name = "diag_core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "SELFDIAG's shared core: witness-line parsing, the TAG -> owner table, the Vein prompt, the unified-diff parser, hunk locator and streaming patch emitter, the diag record and the Echo fixture — linked by APPS/DIAG.ELF and by the kernel's `tests selfdiag`."
+
+# SELFDIAG (rmbp-ledger B324, R82): the midden_core / vein_core shape. `#![no_std]`, `#![forbid(unsafe_code)]`,
+# NO dependencies, no allocator. A member of the ROOT host workspace (so `cargo test -p diag_core` runs the
+# unit tests), a path dep of crates/user-diag and an OPTIONAL dep of the kernel behind feature `selfdiag`.
+[dependencies]
