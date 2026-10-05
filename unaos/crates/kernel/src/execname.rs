@@ -15,7 +15,7 @@
 //!
 //! PASS = every name resolves to `/apps/<NAME>.ELF` and every declaration matches the table below
 //! (LUMEN windowed, PREFS resident, NET and BIG console with a note present). VEIN left this table at the
-//! merge11 fold: LUMENAPP (B323, R82) retired the chat daemon; SELFDIAG (B324) added DIAG (console), so the line reads 5/5.
+//! merge11 fold: LUMENAPP (B323, R82) retired the chat daemon; SELFDIAG (B324) added DIAG (console); HOLOCRON2 (B355) added HOLOCRON (resident), so the line reads 6/6.
 
 /// (bare name, expected flags — `None` = not checked).
 const STAGED: &[(&str, Option<u32>)] = &[
@@ -24,6 +24,7 @@ const STAGED: &[(&str, Option<u32>)] = &[
     ("net", Some(0)),
     ("big", Some(0)),
     ("diag", Some(0)), // SELFDIAG (B324): APPS/DIAG.ELF, console
+    ("holocron", Some(una_abi::APP_FLAG_RESIDENT)), // HOLOCRON2 (B355): APPS/HOLOCRON.ELF, the one resident fulfiller R82 allows
 ];
 
 pub fn selftest() {
