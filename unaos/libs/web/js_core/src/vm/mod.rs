@@ -107,6 +107,15 @@ pub struct Vm {
     pub max_depth: usize,
     /// Local time zone rule (POSIX TZ data); None defers LocalTZA to the host.
     pub tz: Option<crate::tz::PosixTz>,
+    /// Longest string (in UTF-16 code units) the engine builds; longer results throw a RangeError.
+    pub max_string_len: usize,
+    /// Set when the live heap exceeded `max_cells`: execution is terminated like an exhausted budget.
+    pub out_of_memory: bool,
+    /// Timers of the built-in event loop (used when the host does not take them).
+    pub timers: Vec<crate::builtins::host::Timer>,
+    pub timer_seq: u32,
+    /// The built-in event loop's clock (ms): virtual time, advanced to each timer's due time.
+    pub loop_now: f64,
     /// Instruction budget (fuzzing / watchdog); None = unlimited.
     pub budget: Option<u64>,
     pub terminated: bool,
@@ -161,6 +170,11 @@ impl Vm {
             host,
             max_depth: 1800,
             tz: None,
+            max_string_len: (1 << 29) - 24,
+            out_of_memory: false,
+            timers: Vec::new(),
+            timer_seq: 0,
+            loop_now: 0.0,
             budget: None,
             terminated: false,
             kept_alive: Vec::new(),
@@ -274,6 +288,10 @@ impl Vm {
                 }
             }
         }
+        for t in &self.timers {
+            push(&t.callback, &mut roots);
+            t.args.iter().for_each(|a| push(a, &mut roots));
+        }
         roots.extend_from_slice(&self.kept_alive);
         for (_, m) in &self.modules {
             roots.push(*m);
@@ -292,7 +310,21 @@ impl Vm {
     pub fn maybe_gc(&mut self) {
         if self.heap.should_collect() {
             self.collect_garbage();
+            if self.heap.live > self.max_cells {
+                // Terminate at the next instruction, like an exhausted budget.
+                self.out_of_memory = true;
+                self.budget = Some(0);
+            }
         }
+    }
+
+    /// RangeError when a string of `len` code units would exceed `max_string_len`.
+    #[inline]
+    pub fn check_string_len(&mut self, len: usize) -> JsResult<()> {
+        if len > self.max_string_len {
+            return self.throw_range("Invalid string length");
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------------------------- errors

@@ -219,7 +219,7 @@ fn concat(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         let a = vm.arg(ctx, i);
         let t = vm.to_string(&a)?;
         out.extend_from_slice(t.units());
-        if out.len() > 1 << 30 {
+        if out.len() > vm.max_string_len {
             return vm.throw_range("Invalid string length");
         }
     }
@@ -407,7 +407,7 @@ fn pad(vm: &mut Vm, ctx: &CallCtx, at_start: bool) -> JsResult<Value> {
     if filler.is_empty() {
         return Ok(Value::String(s));
     }
-    if max_len > (1u64 << 30) as f64 {
+    if max_len > vm.max_string_len as f64 {
         return vm.throw_range("Invalid string length");
     }
     let fill_len = (max_len - len) as usize;
@@ -443,7 +443,7 @@ fn repeat(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if n == 0.0 || s.is_empty() {
         return Ok(Value::String(JsStr::empty()));
     }
-    if s.len() as f64 * n > (1u64 << 30) as f64 {
+    if s.len() as f64 * n > vm.max_string_len as f64 {
         return vm.throw_range("Invalid string length");
     }
     let mut out = Vec::with_capacity(s.len() * n as usize);
@@ -814,6 +814,7 @@ fn replace_impl(vm: &mut Vm, ctx: &CallCtx, all: bool) -> JsResult<Value> {
         };
         out.extend_from_slice(rep.units());
         end = pos + sl;
+        vm.check_string_len(out.len())?;
     }
     if end == 0 && out.is_empty() && index_of_units(s.units(), search.units(), 0).is_none() {
         return Ok(Value::String(s));

@@ -8,6 +8,7 @@ pub mod date;
 pub mod error;
 pub mod function;
 pub mod generator;
+pub mod host;
 pub mod global;
 pub mod iterator;
 pub mod json;

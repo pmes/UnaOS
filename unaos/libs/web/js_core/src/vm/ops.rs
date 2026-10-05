@@ -232,9 +232,7 @@ impl Vm {
     }
 
     pub fn concat(&mut self, a: &JsStr, b: &JsStr) -> JsResult<JsStr> {
-        if a.len() + b.len() > (1 << 30) {
-            return self.throw_range("Invalid string length");
-        }
+        self.check_string_len(a.len() + b.len())?;
         Ok(a.concat(b))
     }
 

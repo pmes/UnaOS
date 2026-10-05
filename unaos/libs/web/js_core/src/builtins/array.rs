@@ -568,7 +568,7 @@ fn join(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         if !v.is_nullish() {
             let s = vm.to_string(&v)?;
             out.extend_from_slice(s.units());
-            if out.len() > (1 << 30) {
+            if out.len() > vm.max_string_len {
                 return vm.throw_range("Invalid string length");
             }
         }

@@ -112,7 +112,7 @@ impl Vm {
             if let Some(b) = &mut self.budget {
                 if *b == 0 {
                     self.terminated = true;
-                    return Err(Value::str("execution budget exhausted"));
+                    return Err(Value::str(if self.out_of_memory { "out of memory" } else { "execution budget exhausted" }));
                 }
                 *b -= 1;
             }

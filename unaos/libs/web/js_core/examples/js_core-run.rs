@@ -21,8 +21,9 @@ fn main() {
     let out = Rc::new(RefCell::new(String::new()));
     let mut vm = Vm::new(Box::new(host::TestHost { out: out.clone(), base }));
     host::install(&mut vm);
+    js_core::builtins::host::install_host_globals(&mut vm);
     let units: Vec<u16> = src.encode_utf16().collect();
-    let r = vm.run_script(&units).and_then(|_| vm.run_jobs());
+    let r = vm.run_script(&units).and_then(|_| vm.run_event_loop(10_000_000));
     print!("{}", out.borrow());
     if let Err(e) = r {
         let msg = vm.error_string(&e);

@@ -616,6 +616,7 @@ fn sym_replace(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             acc.extend_from_slice(&s.units()[next_pos..position]);
             acc.extend_from_slice(replacement.units());
             next_pos = position + matched.len();
+            vm.check_string_len(acc.len())?;
         }
     }
     if next_pos < len_s {
