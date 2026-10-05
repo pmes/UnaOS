@@ -1,10 +1,12 @@
-//! The glyph cache: rendered coverage bitmaps keyed by (font id, glyph, size, subpixel x, subpixel y).
+//! The glyph cache: rendered coverage bitmaps keyed by (font id, glyph, size, subpixel x, subpixel y, hinting).
 //! Sizes are keyed in 1/64 px; origins are quantized to [`SUBPIXEL_STEPS`] positions per pixel on each axis
 //! (Skia's horizontal-text choice is 4 x positions, 1 y position; both axes are kept so vertical subpixel
 //! placement costs nothing extra). When the cache reaches its entry cap it is cleared wholesale.
 
 use crate::fmath::{floor, round};
-use crate::raster::{rasterize_glyph_mode, GlyphBitmap, RenderMode};
+use crate::hint::autofit::AutoHinter;
+use crate::hint::Hinting;
+use crate::raster::{rasterize_glyph_hinted, rasterize_glyph_mode, GlyphBitmap, RenderMode};
 use crate::Font;
 use alloc::collections::BTreeMap;
 
@@ -17,6 +19,7 @@ pub struct CacheKey {
     pub size_64: u32,
     pub sub_x: u8,
     pub sub_y: u8,
+    pub hinting: Hinting,
 }
 
 /// Split a pixel coordinate into (integer pixel, subpixel step in 0..SUBPIXEL_STEPS).
@@ -31,6 +34,9 @@ pub struct GlyphCache {
     cap: usize,
     /// Coverage mode for every glyph this cache renders (change it only on an empty cache).
     pub mode: RenderMode,
+    /// Hinting for glyphs fetched with [`GlyphCache::get`] (part of every key, so it may change at any time).
+    pub hinting: Hinting,
+    hinters: BTreeMap<u32, AutoHinter>,
     pub hits: u64,
     pub misses: u64,
 }
@@ -44,7 +50,15 @@ impl GlyphCache {
     }
 
     pub fn new(cap: usize) -> Self {
-        GlyphCache { map: BTreeMap::new(), cap: cap.max(1), mode: RenderMode::Exact, hits: 0, misses: 0 }
+        GlyphCache {
+            map: BTreeMap::new(),
+            cap: cap.max(1),
+            mode: RenderMode::Exact,
+            hinting: Hinting::None,
+            hinters: BTreeMap::new(),
+            hits: 0,
+            misses: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -55,6 +69,7 @@ impl GlyphCache {
     }
     pub fn clear(&mut self) {
         self.map.clear();
+        self.hinters.clear();
     }
 
     /// The bitmap for `glyph` of font `font_id` at `size` px with subpixel steps (`sub_x`, `sub_y`).
@@ -66,6 +81,7 @@ impl GlyphCache {
             size_64: floor(size * 64.0 + 0.5) as u32,
             sub_x: sub_x % SUBPIXEL_STEPS as u8,
             sub_y: sub_y % SUBPIXEL_STEPS as u8,
+            hinting: self.hinting,
         };
         if self.map.contains_key(&key) {
             self.hits += 1;
@@ -76,7 +92,14 @@ impl GlyphCache {
             }
             let step = 1.0 / SUBPIXEL_STEPS as f32;
             let size_q = key.size_64 as f32 / 64.0;
-            let bm = rasterize_glyph_mode(font, glyph, size_q, key.sub_x as f32 * step, key.sub_y as f32 * step, self.mode);
+            let (sx, sy) = (key.sub_x as f32 * step, key.sub_y as f32 * step);
+            let bm = match self.hinting {
+                Hinting::None => rasterize_glyph_mode(font, glyph, size_q, sx, sy, self.mode),
+                h => {
+                    let hinter = self.hinters.entry(font_id).or_insert_with(|| AutoHinter::new(font));
+                    rasterize_glyph_hinted(font, hinter, glyph, size_q, sx, sy, self.mode, h)
+                }
+            };
             self.map.insert(key, bm);
         }
         self.map.get(&key).and_then(|b| b.as_ref())

@@ -123,6 +123,12 @@ fn faces_loaded() -> &'static Mutex<LoadedMap> {
 }
 
 /// A fresh face id (for faces built outside [`load_face`], e.g. Aether's `@font-face` faces).
+/// True for a face loaded from the host's font directories (not `@font-face`, not a fallback twin): these get
+/// fontconfig's per-face hinting in [`raster`] (FONTHINT SR62); web fonts are drawn unhinted, as Chromium does.
+pub fn is_installed(face: &Face) -> bool {
+    faces_loaded().lock().map(|m| m.values().any(|f| f.id == face.id)).unwrap_or(false)
+}
+
 pub fn next_face_id() -> u32 {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

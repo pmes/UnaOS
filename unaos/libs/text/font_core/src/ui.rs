@@ -102,6 +102,10 @@ pub struct Engine<'a> {
     runs: Vec<Run>,
     run_next: usize,
     pub mode: RenderMode,
+    /// Glyph hinting (FONTHINT SR62). `None` (the KERNELFONT default) draws unhinted outlines; `Slight` is what a
+    /// Linux desktop's fontconfig `hintslight` gives installed faces — the light auto-hinter on TrueType faces.
+    pub hinting: crate::hint::Hinting,
+    hinters: BTreeMap<u8, crate::hint::autofit::AutoHinter>,
     pub stats: Stats,
 }
 
@@ -114,6 +118,8 @@ impl<'a> Engine<'a> {
             runs: Vec::new(),
             run_next: 0,
             mode: RenderMode::SkiaAaa,
+            hinting: crate::hint::Hinting::None,
+            hinters: BTreeMap::new(),
             stats: Stats { cap_bytes: cap_bytes.max(4096), ..Stats::default() },
         }
     }
@@ -283,14 +289,21 @@ impl<'a> Engine<'a> {
 
     /// The coverage bitmap of one glyph, through the byte-bounded cache.
     fn glyph(&mut self, face: u8, glyph: u16, size: f32, sub_x: u8) -> Option<&GlyphBitmap> {
-        let key = CacheKey { font: face as u32, glyph, size_64: floor(size * 64.0 + 0.5) as u32, sub_x: sub_x % SUBPIXEL_STEPS as u8, sub_y: 0 };
+        let key = CacheKey { font: face as u32, glyph, size_64: floor(size * 64.0 + 0.5) as u32, sub_x: sub_x % SUBPIXEL_STEPS as u8, sub_y: 0, hinting: self.hinting };
         if self.cache.contains_key(&key) {
             self.stats.hits += 1;
         } else {
             self.stats.misses += 1;
             let slot = self.slots.get(face as usize)?;
             let step = 1.0 / SUBPIXEL_STEPS as f32;
-            let bm = rasterize_glyph_mode(&slot.font, glyph, key.size_64 as f32 / 64.0, key.sub_x as f32 * step, 0.0, self.mode);
+            let (size_q, sx) = (key.size_64 as f32 / 64.0, key.sub_x as f32 * step);
+            let bm = match self.hinting {
+                crate::hint::Hinting::None => rasterize_glyph_mode(&slot.font, glyph, size_q, sx, 0.0, self.mode),
+                h => {
+                    let hinter = self.hinters.entry(face).or_insert_with(|| crate::hint::autofit::AutoHinter::new(&slot.font));
+                    crate::raster::rasterize_glyph_hinted(&slot.font, hinter, glyph, size_q, sx, 0.0, self.mode, h)
+                }
+            };
             let cost = ENTRY_OVERHEAD + bm.as_ref().map_or(0, |b| b.data.len());
             if self.stats.cache_bytes + cost > self.stats.cap_bytes && !self.cache.is_empty() {
                 self.stats.evictions += self.cache.len() as u64;

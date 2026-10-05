@@ -9,9 +9,11 @@ Chromium painting the SAME strings with the SAME face file at the SAME pen origi
    `[quartzfont]` stderr line: text, face file + index, px size, pen x / baseline in window px, ink, ascent,
    descent, and every glyph's pen and advance.
 2. Writes one HTML page: per string, a box filled with the background the frame shows around that string
-   (the mode of a 1 px ring around its glyph area) and the string in `@font-face { src: url(file://<face>) }`
+   (the mode of a 1 px ring around its glyph area) and the string in the face — by its installed family when
+   fontconfig resolves that family to the same file (Chromium then hints it as quartzite does, FONTHINT SR62),
+   else `@font-face { src: url(file://<face>) }`
    at the traced size, colour and pen origin (line-height = ascent + descent, so the baseline lands at
-   top + ascent). A web font is rasterized unhinted by Chromium — the like-for-like path (AETHERFONT.md).
+   top + ascent). Chromium hints installed faces and never web fonts, so each side is like for like.
 3. Screenshots it with tools/eyes/ref.mjs (the EYES Chromium flags: no hinting, grayscale AA, DSF 1).
 4. Scores every inked glyph box (pen..pen+advance x ascent+descent) by the mean |luma difference|, after
    the best whole-pixel registration within +-2 px per string (reported; 0,0 is the expectation): the share
@@ -114,6 +116,24 @@ def luma(rows, x, y):
     return (r[3 * x] * 299 + r[3 * x + 1] * 587 + r[3 * x + 2] * 114) // 1000
 
 
+def installed_family(path, index):
+    """(style/weight prefix, quoted family) of the CSS `font` shorthand that makes Chromium load `path` through
+    fontconfig, or None when fontconfig would pick another file for that family."""
+    try:
+        q = subprocess.run(["fc-scan", "--format", "%{family[0]}\t%{weight}\t%{slant}\n", path],
+                           capture_output=True, text=True, timeout=10).stdout.splitlines()
+        fam, weight, slant = q[index].split("\t")
+        spec = f"{fam}:weight={weight}:slant={slant}"
+        hit = subprocess.run(["fc-match", "--format", "%{file}", spec], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, IndexError, ValueError, subprocess.SubprocessError):
+        return None
+    if os.path.realpath(hit) != os.path.realpath(path):
+        return None
+    w = "bold " if int(weight) >= 200 else ""
+    it = "italic " if int(slant) >= 100 else ""
+    return (f"{it}{w}", f"'{fam}'")
+
+
 def esc(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -147,14 +167,25 @@ def main(argv):
         ring += [subj[y][3 * x:3 * x + 3] for y in range(y0, y1) for x in (x0, x1) if 0 <= x < W and 0 <= y < H]
         bg = Counter(ring).most_common(1)[0][0] if ring else b"\xff\xff\xff"
         boxes.append((k, fam, x0, y0, x1, y1, "#%02x%02x%02x" % tuple(bg)))
-    css = "".join(f"@font-face{{font-family:{f};src:url('file://{p}')}}\n" for (p, _), f in faces.items())
+    # FONTHINT (SR62): quartzite hints installed faces as fontconfig says (hintslight here), and Chromium hints a
+    # face it reaches as an INSTALLED family but never an @font-face one. So a face that fontconfig resolves by
+    # its own family name is referenced by that name (both sides hinted); any other face stays @font-face.
+    css = ""
+    for (p, i), f in list(faces.items()):
+        fam = installed_family(p, i)
+        if fam:
+            faces[(p, i)] = fam
+        else:
+            faces[(p, i)] = ("", f)
+            css += f"@font-face{{font-family:{f};src:url('file://{p}')}}\n"
+    boxes = [(k, faces[(t["file"], t["index"])], *rest) for (k, _, *rest), t in zip(boxes, ts)]
     body = []
     for (k, fam, x0, y0, x1, y1, bg), t in zip(boxes, ts):
         a = t["ascent"]
         lh = a + t["descent"]
         body.append(f'<div style="position:absolute;left:{x0}px;top:{y0}px;width:{x1 - x0}px;height:{y1 - y0}px;background:{bg}"></div>')
         rgba = f"rgba({int(t['ink'][1:3], 16)},{int(t['ink'][3:5], 16)},{int(t['ink'][5:7], 16)},{t['alpha'] / 255:.4f})"
-        body.append(f'<div style="position:absolute;left:{t["x"]:.4f}px;top:{t["base"] - a:.4f}px;font:{t["size"]:.4f}px/{lh}px {fam};'
+        body.append(f'<div style="position:absolute;left:{t["x"]:.4f}px;top:{t["base"] - a:.4f}px;font:{fam[0]}{t["size"]:.4f}px/{lh}px {fam[1]};'
                     f'color:{rgba};white-space:pre">{esc(t["text"])}</div>')
     html = (f"<!DOCTYPE html><html><head><meta charset=utf-8><style>{css}html,body{{margin:0;background:#fff}}"
             f"div{{font-kerning:normal}}</style></head><body>{''.join(body)}</body></html>")

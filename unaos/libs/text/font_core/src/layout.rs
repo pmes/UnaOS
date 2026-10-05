@@ -242,6 +242,52 @@ impl<'a> LayoutTable<'a> {
         found.then_some(out)
     }
 
+    /// `hb_ot_layout_collect_lookups` semantics: every lookup of `features` (all features when `None`, the
+    /// required feature included) in the default and every named LangSys of each of `scripts` present in the
+    /// table — no fallback script. Sorted, de-duplicated.
+    pub fn collect_lookups(&self, scripts: &[Tag], features: Option<&[Tag]>) -> Vec<u16> {
+        let mut out = Vec::new();
+        let nf = u16_at(self.features, 0).unwrap_or(0);
+        for &t in scripts {
+            let Some(s) = self.find_script(t) else { continue };
+            let mut langs: Vec<&[u8]> = Vec::new();
+            if u16_at(s, 0).unwrap_or(0) != 0 {
+                if let Some(ls) = sub(s, 0, 0) {
+                    langs.push(ls);
+                }
+            }
+            let nl = u16_at(s, 2).unwrap_or(0) as usize;
+            for i in 0..nl {
+                if let Some(ls) = sub(s, 0, 4 + 6 * i + 4) {
+                    langs.push(ls);
+                }
+            }
+            for ls in langs {
+                let req = u16_at(ls, 2).unwrap_or(0xFFFF);
+                let n = u16_at(ls, 4).unwrap_or(0) as usize;
+                let idxs = (0..n).filter_map(|i| u16_at(ls, 6 + 2 * i)).chain((req != 0xFFFF).then_some(req));
+                for fi in idxs {
+                    if fi >= nf {
+                        continue;
+                    }
+                    let rec = 2 + 6 * fi as usize;
+                    let Some(tag) = self.features.get(rec..rec + 4) else { continue };
+                    if let Some(fs) = features {
+                        if !fs.iter().any(|f| f == tag) {
+                            continue;
+                        }
+                    }
+                    let Some(f) = sub(self.features, 0, rec + 4) else { continue };
+                    let cnt = u16_at(f, 2).unwrap_or(0) as usize;
+                    out.extend((0..cnt).filter_map(|k| u16_at(f, 4 + 2 * k)));
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     pub fn lookup_count(&self) -> usize {
         u16_at(self.lookups, 0).unwrap_or(0) as usize
     }

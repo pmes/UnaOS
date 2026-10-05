@@ -255,6 +255,141 @@ impl<'a> Glyf<'a> {
         }
     }
 
+    /// The glyph as FreeType loads it with `FT_LOAD_NO_SCALE` (what the auto-hinter analyses): raw points in font
+    /// units with their on/off-curve tags and contour ends, composites assembled — component transforms applied in
+    /// 16.16 with `FT_MulFix` (F2Dot14 << 2, `FT_Vector_Transform`), x/y offsets unscaled unless
+    /// SCALED_COMPONENT_OFFSET (then scaled by the column lengths), or point matching on the assembled points.
+    /// `None` for a missing or malformed glyph; an empty outline for a glyph without contours.
+    pub fn raw_outline(&self, gid: u16) -> Option<crate::hint::Outline> {
+        let mut o = crate::hint::Outline::default();
+        self.load_raw(gid, 0, &mut o)?;
+        Some(o)
+    }
+
+    fn load_raw(&self, gid: u16, depth: u8, o: &mut crate::hint::Outline) -> Option<()> {
+        use crate::hint::fixed::mul_fix;
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        let d = self.glyph_data(gid)?;
+        if d.is_empty() {
+            return Some(());
+        }
+        let mut r = Reader::new(d);
+        let n = r.i16()?;
+        r.skip(8)?;
+        if n >= 0 {
+            let n = n as usize;
+            let base = o.points.len();
+            let mut ends = Vec::with_capacity(n);
+            let mut last: Option<usize> = None;
+            for _ in 0..n {
+                let e = r.u16()? as usize;
+                if let Some(l) = last {
+                    if e <= l {
+                        return None;
+                    }
+                }
+                last = Some(e);
+                ends.push(e);
+            }
+            let np = match last {
+                Some(e) => e + 1,
+                None => return Some(()),
+            };
+            if base + np > MAX_POINTS {
+                return None;
+            }
+            let ilen = r.u16()? as usize;
+            r.skip(ilen)?;
+            let mut flags = Vec::with_capacity(np);
+            while flags.len() < np {
+                let f = r.u8()?;
+                flags.push(f);
+                if f & REPEAT != 0 {
+                    let cnt = r.u8()?;
+                    for _ in 0..cnt {
+                        if flags.len() >= np {
+                            break;
+                        }
+                        flags.push(f);
+                    }
+                }
+            }
+            let mut xs = Vec::with_capacity(np);
+            let mut v: i32 = 0;
+            for &f in &flags {
+                if f & X_SHORT != 0 {
+                    let dx = r.u8()? as i32;
+                    v += if f & X_SAME_OR_POS != 0 { dx } else { -dx };
+                } else if f & X_SAME_OR_POS == 0 {
+                    v += r.i16()? as i32;
+                }
+                xs.push(v);
+            }
+            v = 0;
+            for (i, &f) in flags.iter().enumerate() {
+                if f & Y_SHORT != 0 {
+                    let dy = r.u8()? as i32;
+                    v += if f & Y_SAME_OR_POS != 0 { dy } else { -dy };
+                } else if f & Y_SAME_OR_POS == 0 {
+                    v += r.i16()? as i32;
+                }
+                o.points.push((xs[i] as i64, v as i64));
+                o.tags.push(if f & ON_CURVE != 0 { crate::hint::TAG_ON } else { crate::hint::TAG_CONIC });
+            }
+            for e in ends {
+                o.ends.push(base + e);
+            }
+            Some(())
+        } else {
+            let comp_start = o.points.len();
+            for c in self.components(gid)? {
+                if c.glyph == gid {
+                    return None;
+                }
+                let base = o.points.len();
+                let mut sub = crate::hint::Outline::default();
+                self.load_raw(c.glyph, depth + 1, &mut sub)?;
+                // 16.16 matrix from the F2Dot14 values (exact: f32 holds every F2Dot14).
+                let m = |v: f32| (v * 16384.0) as i64 * 4;
+                let [a, b, cc, dd] = c.transform;
+                let have_xform = c.flags & (WE_HAVE_A_SCALE | WE_HAVE_AN_X_AND_Y_SCALE | WE_HAVE_A_TWO_BY_TWO) != 0;
+                let (xx, yx, xy, yy) = (m(a), m(b), m(cc), m(dd));
+                if have_xform {
+                    for p in sub.points.iter_mut() {
+                        let (x, y) = *p;
+                        *p = (mul_fix(x, xx) + mul_fix(y, xy), mul_fix(x, yx) + mul_fix(y, yy));
+                    }
+                }
+                let (dx, dy) = if c.flags & ARGS_ARE_XY_VALUES != 0 {
+                    let (mut dx, mut dy) = (c.arg1 as i64, c.arg2 as i64);
+                    if have_xform && c.flags & SCALED_COMPONENT_OFFSET != 0 && c.flags & UNSCALED_COMPONENT_OFFSET == 0 {
+                        let len = |p: i64, q: i64| crate::fmath::sqrt((p as f32) * (p as f32) + (q as f32) * (q as f32)) as i64;
+                        dx = mul_fix(dx, len(xx, xy));
+                        dy = mul_fix(dy, len(yy, yx));
+                    }
+                    (dx, dy)
+                } else {
+                    let pp = *o.points.get(comp_start + c.arg1 as usize)?;
+                    let cp = *sub.points.get(c.arg2 as usize)?;
+                    (pp.0 - cp.0, pp.1 - cp.1)
+                };
+                if base + sub.points.len() > MAX_POINTS {
+                    return None;
+                }
+                for (p, t) in sub.points.iter().zip(sub.tags.iter()) {
+                    o.points.push((p.0 + dx, p.1 + dy));
+                    o.tags.push(*t);
+                }
+                for e in sub.ends {
+                    o.ends.push(base + e);
+                }
+            }
+            Some(())
+        }
+    }
+
     /// Emit the outline of `gid` (font units). Returns false if the glyph is malformed.
     pub fn outline(&self, gid: u16, sink: &mut impl OutlineSink) -> bool {
         let mut pts = Vec::new();

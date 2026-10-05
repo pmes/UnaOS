@@ -8,9 +8,34 @@
 //!   rules in configuration order, which [`Config::expand`] applies to a family list exactly as fontconfig's
 //!   pattern substitution does (prefer → before the matched family, accept → after it, default → at the end).
 //!
-//! `<match>` edits (lang tests, hinting, rgba), `<selectfont>`, `<cachedir>` and bindings are not evaluated.
+//! - **hinting** (FONTHINT, SR62): `<match>` rules whose tests are only `family` (and `pixelsize`
+//!   comparisons) and whose edits set `hinting` / `hintstyle` / `autohint` ([`Config::hint_mode`]), plus the
+//!   `target="pattern"` `hintstyle` default (10-hinting-slight.conf) — what Chromium reads per face.
+//!
+//! Other `<match>` edits (lang tests, rgba), `<selectfont>`, `<cachedir>` and bindings are not evaluated.
 
 use std::path::{Path, PathBuf};
+
+/// A `<match target="font">` rule reduced to what decides hinting.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HintRule {
+    /// `<test name="family">` strings (any matches; empty = no family test).
+    pub families: Vec<String>,
+    /// `<test name="pixelsize" compare="less|less_eq|more|more_eq">`.
+    pub pixelsize: Option<(String, f64)>,
+    pub hinting: Option<bool>,
+    /// 0 none, 1 slight, 2 medium, 3 full.
+    pub hintstyle: Option<u8>,
+    pub autohint: Option<bool>,
+}
+
+/// The hinting a face gets at a size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HintMode {
+    pub hinting: bool,
+    pub hintstyle: u8,
+    pub autohint: bool,
+}
 
 /// One `<alias>` rule.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -28,6 +53,10 @@ pub struct Config {
     pub aliases: Vec<Alias>,
     /// Files read, in order (for diagnostics).
     pub files: Vec<PathBuf>,
+    /// Per-font hinting rules in configuration order.
+    pub hint_rules: Vec<HintRule>,
+    /// The pattern-level `hintstyle` default, when a config sets one.
+    pub default_hintstyle: Option<u8>,
 }
 
 /// A minimal XML element tree: enough of XML 1.0 for fontconfig files (elements, attributes, character data,
@@ -325,9 +354,103 @@ impl Config {
                         });
                     }
                 }
+                "match" => self.read_hint_match(e),
                 _ => {}
             }
         }
+    }
+
+    fn read_hint_match(&mut self, e: &Element) {
+        let style_of = |x: &Element| -> Option<u8> {
+            let c = x.elements().find(|c| c.name == "const")?.text();
+            match c.as_str() {
+                "hintnone" => Some(0),
+                "hintslight" => Some(1),
+                "hintmedium" => Some(2),
+                "hintfull" => Some(3),
+                _ => None,
+            }
+        };
+        let bool_of = |x: &Element| -> Option<bool> {
+            let b = x.elements().find(|c| c.name == "bool")?.text();
+            match b.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }
+        };
+        if e.attr("target") == Some("pattern") {
+            // only the unconditional hintstyle default (10-hinting-slight.conf)
+            if e.elements().any(|x| x.name == "test") {
+                return;
+            }
+            if let Some(s) = e.elements().filter(|x| x.name == "edit" && x.attr("name") == Some("hintstyle")).find_map(style_of) {
+                if self.default_hintstyle.is_none() {
+                    self.default_hintstyle = Some(s);
+                }
+            }
+            return;
+        }
+        if e.attr("target") != Some("font") {
+            return;
+        }
+        let mut r = HintRule::default();
+        for t in e.elements().filter(|x| x.name == "test") {
+            match t.attr("name") {
+                Some("family") => r.families.extend(t.elements().filter(|s| s.name == "string").map(|s| s.text())),
+                Some("pixelsize") => {
+                    let v = t.elements().find_map(|d| d.text().parse::<f64>().ok());
+                    let (Some(c), Some(v)) = (t.attr("compare"), v) else { return };
+                    r.pixelsize = Some((c.to_string(), v));
+                }
+                _ => return, // a test this reader does not evaluate: leave the rule out
+            }
+        }
+        for ed in e.elements().filter(|x| x.name == "edit") {
+            match ed.attr("name") {
+                Some("hinting") => r.hinting = bool_of(ed),
+                Some("hintstyle") => r.hintstyle = style_of(ed),
+                Some("autohint") => r.autohint = bool_of(ed),
+                _ => {}
+            }
+        }
+        if r.hinting.is_some() || r.hintstyle.is_some() || r.autohint.is_some() {
+            self.hint_rules.push(r);
+        }
+    }
+
+    /// The hinting fontconfig gives a face of `family` at `pixelsize` px: the pattern default, then every rule
+    /// whose tests pass, in configuration order.
+    pub fn hint_mode(&self, family: &str, pixelsize: f64) -> HintMode {
+        let mut m = HintMode { hinting: true, hintstyle: self.default_hintstyle.unwrap_or(1), autohint: false };
+        for r in &self.hint_rules {
+            if !r.families.is_empty() && !r.families.iter().any(|f| family_eq(f, family)) {
+                continue;
+            }
+            if let Some((c, v)) = &r.pixelsize {
+                let ok = match c.as_str() {
+                    "less" => pixelsize < *v,
+                    "less_eq" => pixelsize <= *v,
+                    "more" => pixelsize > *v,
+                    "more_eq" => pixelsize >= *v,
+                    "eq" => pixelsize == *v,
+                    _ => false,
+                };
+                if !ok {
+                    continue;
+                }
+            }
+            if let Some(h) = r.hinting {
+                m.hinting = h;
+            }
+            if let Some(s) = r.hintstyle {
+                m.hintstyle = s;
+            }
+            if let Some(a) = r.autohint {
+                m.autohint = a;
+            }
+        }
+        m
     }
 
     /// Applies every alias rule, in configuration order, to a family list (fontconfig compares family names
@@ -383,5 +506,27 @@ mod tests {
         assert_eq!(c.expand(&["sans-serif"]), ["A Sans", "B", "C", "E", "sans-serif", "D"]);
         assert!(family_eq("DejaVu Sans", "dejavusans"));
         assert!(parse_xml("<a><b></a>").is_none());
+    }
+
+    #[test]
+    fn hint_rule_kat() {
+        let src = r#"<fontconfig>
+  <match target="pattern"><edit name="hintstyle" mode="append"><const>hintslight</const></edit></match>
+  <match target="font"><test qual="any" name="family"><string>WenQuanYi Zen Hei</string></test>
+    <edit name="hinting" mode="assign"><bool>true</bool></edit>
+    <edit name="hintstyle" mode="assign"><const>hintnone</const></edit></match>
+  <match target="font"><test name="family"><string>Tiny</string></test>
+    <test name="pixelsize" compare="less"><double>10</double></test>
+    <edit name="hinting"><bool>false</bool></edit></match>
+  <match target="font"><test name="lang"><string>th</string></test><edit name="hinting"><bool>false</bool></edit></match>
+</fontconfig>"#;
+        let mut c = Config::default();
+        c.read_str(src, Path::new("/etc/fonts"));
+        assert_eq!(c.default_hintstyle, Some(1));
+        assert_eq!(c.hint_rules.len(), 2, "the lang-tested rule is not evaluated");
+        assert_eq!(c.hint_mode("DejaVu Sans", 16.0), HintMode { hinting: true, hintstyle: 1, autohint: false });
+        assert_eq!(c.hint_mode("WenQuanYi Zen Hei", 16.0).hintstyle, 0);
+        assert!(!c.hint_mode("Tiny", 9.0).hinting);
+        assert!(c.hint_mode("Tiny", 12.0).hinting);
     }
 }
