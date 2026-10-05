@@ -140,17 +140,17 @@ pub fn seed_in(mt: &MountTable) -> Result<usize, VfsError> {
 
 /// Seed once per boot, after the root volume answers (called from the users service's ready arm and
 /// from the verbs/fixture, whichever runs first). One wire line either way.
-pub fn seed_once() {
+pub fn seed_once() -> usize {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
-        return;
+        return 0;
     }
     let mt = crate::shell::vfs_mount_table();
     match seed_in(&mt) {
-        Ok(n) => crate::bootlog_println!("[assoc] seed dir={} created={} types={} source=db", TYPES_DIR, n, BUILTIN.len()),
-        Err(VfsError::Unsupported) => crate::bootlog_println!("[assoc] seed=skip reason=enotsup (root takes no attributes) source=builtin types={}", BUILTIN.len()),
-        Err(e) => serial_println!("[assoc] seed=fail ({}) source=builtin", crate::fs::attrsys::refusal(&e)),
+        Ok(n) => { crate::bootlog_println!("[assoc] seed dir={} created={} types={} source=db", TYPES_DIR, n, BUILTIN.len()); n }
+        Err(VfsError::Unsupported) => { crate::bootlog_println!("[assoc] seed=skip reason=enotsup (root takes no attributes) source=builtin types={}", BUILTIN.len()); 0 }
+        Err(e) => { serial_println!("[assoc] seed=fail ({}) source=builtin", crate::fs::attrsys::refusal(&e)); 0 }
     }
 }
 

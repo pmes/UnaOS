@@ -1232,12 +1232,14 @@ pub fn service() {
     // QEMU virt, gate-4 capture: the first pass after `MISSION SUCCESS` refused). So the mount is RETRIED
     // across passes and only a BOUND of refusals is a verdict — the `HCRON_DEFER_STUCK` idiom, and the
     // last error is named so the line says which refusal it was.
+    let step = crate::fs::bootstep::begin("users-load", "Loading users"); // BOOT80 (B350): the boot's own line for this step
     match try_load() {
         Ok(()) => {
+            step.end(&alloc::format!("store=fat via={} users={}", store_via().name(), count()));
             #[cfg(all(feature = "loginst", feature = "tests-at-boot"))]
             LOGINST_LIVE.store(true, Ordering::Release); // LOGINORDER (B206): the chain is live from here to the end of this arm — the desktop press battery waits for it
             SERVICED.store(true, Ordering::Relaxed);
-            root_credential_ignition(); crate::fs::assoc::seed_once(); // FILETYPE (B307): the type database is written on the first boot of an attribute-bearing root (idempotent; FAT says source=builtin). LOGIN14 (R65): root's row, and the set-password screen if its password is not chosen yet
+            root_credential_ignition(); boot80_root_and_seed(); // BOOT80 (B350): root-mount + assoc-seed, each a named step. FILETYPE (B307): the type database is written on the first boot of an attribute-bearing root (idempotent; FAT says source=builtin). LOGIN14 (R65): root's row, and the set-password screen if its password is not chosen yet
             #[cfg(feature = "loginst")]
             { login_rootpw_fixture(); login_bootroot_fixture(); login_adduser_fixture(); login_usermgmt_root_fixture(); login_rootout_fixture(); login_usermgmt_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1245,7 +1247,7 @@ pub fn service() {
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::lock_fixture(b"una", b"correct-horse", b"wrong-horse"); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release); // LOGINORDER (B206): the chain is over; the press battery may run. ⚠ SAME-LINE fold. // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
         #[cfg(all(feature = "loginst", feature = "tests-at-boot"))] LOGINST_LIVE.store(true, Ordering::Release); // LOGINFLOW2 — boot 2's screen is up from the resolution to the fixtures below; the press battery waits (the chain's tail drops it)
-        stage_resolve("store-loaded"); // FIRSTBOOT (R77): the stage, from the loaded store AFTER the loginst chain (a Desktop-stage store there); the desktop tenants wait on it
+        { let st = crate::fs::bootstep::begin("stage-resolve", "Starting"); stage_resolve("store-loaded"); st.end(stage_name()); } // BOOT80 (B350). FIRSTBOOT (R77): the stage, from the loaded store AFTER the loginst chain (a Desktop-stage store there); the desktop tenants wait on it
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] { crate::tests::register("boot2-login", boot2_login_entry); crate::tests::register("logout", logout_entry); } // LOGINFLOW2 M1/M2 — boot 2's login through the screen (BEFORE the chain's second pass: it needs the screen up), then LOGOUTUI M4
             #[cfg(feature = "loginst")] { crate::tests::register("login-chain", loginst_chain); crate::tests::source_done(crate::tests::SRC_LOGIN); } // R77 M3 — the loginst fixture chain is a registered test (`tests login-chain`); `tests-at-boot` runs it here, as before. Body: `loginst_chain`, this file's tail.
             #[cfg(not(feature = "loginst"))] crate::tests::source_done(crate::tests::SRC_LOGIN); // no loginst on the flight image: the login source has nothing to register and must not be waited on (boot 17 compile fix)
@@ -3269,4 +3271,21 @@ fn ensure_home_native(name: &[u8]) -> Option<Result<&'static str, UsersError>> {
     }
     serial_println!("[users] home=/home/{} {} volume=unafs", leaf, verdict);
     Some(Ok(verdict))
+}
+
+// =========================================================================================
+// BOOT80 (rmbp-ledger B350) — the two steps between the store's load and the stage, named
+// =========================================================================================
+
+/// The root volume's first bind (the UnaFS mount on the card image) and the type database's seed
+/// (FILETYPE, B307), each its own `[boot] step=` line. Boot 21 spent ~60 s silently in the seed: 54
+/// UnaFS transactions, each rewriting the whole refcount map one sector per command.
+fn boot80_root_and_seed() {
+    let s = crate::fs::bootstep::begin("root-mount", "Mounting the system volume");
+    let mt = crate::shell::vfs_mount_table();
+    let attrs = mt.list_attrs("/", crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
+    s.end(if attrs { "root=attrs" } else { "root=plain" });
+    let s = crate::fs::bootstep::begin("assoc-seed", "Writing file types");
+    let made = crate::fs::assoc::seed_once();
+    s.end(&alloc::format!("created={}", made));
 }

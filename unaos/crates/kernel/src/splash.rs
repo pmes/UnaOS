@@ -865,3 +865,60 @@ pub fn glass_held() -> bool {
 /// SPLASH2: builds without a compositor hold nothing; `login::open_as` calls this unconditionally.
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub fn hold_release(_by: &str) {}
+
+// =================================================================================================
+// BOOT80 (rmbp-ledger B350) M4 — the held splash NAMES the step the boot is waiting on. Boot 21 held the
+// glass for ~60 s with nothing on it ("machine seemed locked up"). `fs::bootstep::begin` calls this with
+// the step's words ("Writing file types"); they are painted in a dark band on the held surface and the
+// band is composited at once (the step runs inside the device-service pass, so no later pass would show
+// them). A no-op when nothing holds the glass.
+
+/// Paint `text` as the held splash's step line (one band, replaced on every call) and composite it.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn step_label(text: &str) {
+    use crate::video::font::{self, Face};
+    if HOLD_WIN.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let face = Face::Chrome;
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    let band = {
+        let mut g = HOLD_SURF.lock();
+        let Some((surf, w, h)) = g.as_mut() else { return };
+        let (w, h) = (*w, *h);
+        let band_h = ch * 2;
+        if w < cw || h < band_h * 4 || surf.len() < w * h * 4 {
+            return;
+        }
+        let y0 = h - band_h * 3;
+        let put = |s: &mut alloc::vec::Vec<u8>, o: usize, px: u32| s[o..o + 4].copy_from_slice(&px.to_le_bytes());
+        for y in y0..y0 + band_h {
+            for x in 0..w {
+                put(surf, (y * w + x) * 4, 0x0010_1418);
+            }
+        }
+        let bytes = text.as_bytes();
+        let n = bytes.len().min(w / cw);
+        let x0 = (w - n * cw) / 2;
+        let ty = y0 + (band_h - ch) / 2;
+        for (i, &b) in bytes[..n].iter().enumerate() {
+            for (ry, row) in font::glyph(b, true, face).iter().enumerate() {
+                for (rx, &a) in row.iter().enumerate() {
+                    if a == 0 {
+                        continue;
+                    }
+                    let o = ((ty + ry) * w + x0 + i * cw + rx) * 4;
+                    let bg = u32::from_le_bytes([surf[o], surf[o + 1], surf[o + 2], surf[o + 3]]);
+                    put(surf, o, font::blend(bg, 0x00E8_E8F0, a));
+                }
+            }
+        }
+        (y0, band_h, w)
+    };
+    crate::video::wm::damage_intersecting(0, band.0, band.2, band.1);
+    crate::video::wm::composite();
+}
+
+/// BOOT80: builds without a compositor hold no glass to label.
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn step_label(_text: &str) {}
