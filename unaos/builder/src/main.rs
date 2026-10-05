@@ -2533,4 +2533,26 @@ mod kernelfont_tests {
         assert!(out.join("system/fonts/LICENSES/dejavu.txt").is_file());
         let _ = std::fs::remove_dir_all(&out);
     }
+
+    /// KERNELFONT2 (B363): with fonts-noto-core on the host (or arroyo's pinned fallback in target/fonts-noto, which
+    /// carries the package's copyright as LICENSE) every face stages: 10/10, the Noto licence beside them.
+    #[test]
+    fn noto_faces_stage_ten_of_ten() {
+        let out = std::env::temp_dir().join(format!("kfont-noto-{}", std::process::id()));
+        let fallback = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/fonts-noto");
+        let staged = super::stage_fonts(&[fallback], &out);
+        let noto = staged.iter().filter(|f| f.starts_with("NotoSans")).count();
+        println!("KERNELFONT2 builder: faces={}/{} noto={}/4", staged.len(), super::KFONT_FACES.len(), noto);
+        if noto == 0 {
+            println!("SKIP: no Noto script face on this host (ensure_kfont_noto installs fonts-noto-core)");
+            let _ = std::fs::remove_dir_all(&out);
+            return;
+        }
+        assert_eq!(noto, 4, "a partial Noto set: {staged:?}");
+        assert!(out.join("system/fonts/LICENSES/noto.txt").is_file());
+        if staged.iter().any(|f| f == "DejaVuSans.ttf") {
+            assert_eq!(staged.len(), super::KFONT_FACES.len(), "faces=10/10 wanted: {staged:?}");
+        }
+        let _ = std::fs::remove_dir_all(&out);
+    }
 }
