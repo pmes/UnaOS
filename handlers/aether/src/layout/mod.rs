@@ -439,22 +439,22 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
             min_size: match tag.as_str() {
                 // UA default control sizes so empty controls are visible.
                 "input" | "select" => Size {
-                    width: Dimension::length(160.0),
-                    height: Dimension::length(24.0),
+                    width: LengthPercentageAuto::length(160.0),
+                    height: LengthPercentageAuto::length(24.0),
                 },
                 "textarea" => Size {
-                    width: Dimension::length(160.0),
-                    height: Dimension::length(60.0),
+                    width: LengthPercentageAuto::length(160.0),
+                    height: LengthPercentageAuto::length(60.0),
                 },
                 "button" => Size {
-                    width: Dimension::length(24.0),
-                    height: Dimension::length(24.0),
+                    width: LengthPercentageAuto::length(24.0),
+                    height: LengthPercentageAuto::length(24.0),
                 },
                 // Everything else: no UA minimum. An empty block box is
                 // zero-tall in CSS; a floor here compounds — pages mount
                 // dozens of empty container/portal divs, and 20px each
                 // pushed the real content below the fold.
-                _ => Size { width: Dimension::auto(), height: Dimension::auto() },
+                _ => Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::auto() },
             },
             margin: {
                 // UA default spacing: block gaps for paragraphs/headings,
@@ -491,7 +491,7 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         if tag == "br" {
             style.size.width = Dimension::percent(1.0);
             style.size.height = Dimension::length(0.0);
-            style.min_size = Size { width: Dimension::auto(), height: Dimension::length(0.0) };
+            style.min_size = Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::length(0.0) };
         }
 
         // Inline style="..." — paint properties plus width/height.
@@ -744,7 +744,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
     let _ = tree.taffy.compute_layout_with_measure(
         tree.root_node,
         viewport,
-        |known, avail, node_id, _ctx, _style| {
+        |inputs, node_id, _ctx, style| taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
             if let Some(&(w, h)) = img_info.get(&node_id) {
                 return Size {
                     width: known.width.unwrap_or(w),
@@ -772,7 +772,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 width: known.width.unwrap_or(w),
                 height: known.height.unwrap_or(h),
             }
-        },
+        }),
     );
 }
 
@@ -793,16 +793,6 @@ struct TextRun {
 
 /// Measures wrapped text: returns (widest line, total height). Mirrors the
 /// renderer's wrap algorithm so painted text fits its measured box.
-fn measure_text(
-    font: Option<&font_kit::font::Font>,
-    text: &str,
-    font_size: f32,
-    line_mult: f32,
-    max_width: f32,
-) -> (f32, f32) {
-    measure_text_family(font, 0, text, font_size, line_mult, max_width)
-}
-
 fn measure_text_family(
     font: Option<&font_kit::font::Font>,
     family: u8, // the face key (fonts::face_key): advances are cached per face

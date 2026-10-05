@@ -1,8 +1,19 @@
 use crate::layout::{LayoutTree, PaintStyle};
-use cssparser::{Parser, ParserInput, Token};
+use cssparser::{Parser, Token};
 use taffy::prelude::*;
 use taffy::style::{Dimension, Display, FlexDirection, LengthPercentage, LengthPercentageAuto};
 use taffy::geometry::Rect;
+
+/// taffy 0.14 types min-/max-size as length | percentage | auto (the
+/// intrinsic keywords are size-only); a keyword there folds to auto.
+pub(crate) fn lpa(d: Dimension) -> LengthPercentageAuto {
+    use taffy::style::ExpandedDimension as E;
+    match d.expand() {
+        E::Length(v) => LengthPercentageAuto::length(v),
+        E::Percent(v) => LengthPercentageAuto::percent(v),
+        _ => LengthPercentageAuto::auto(),
+    }
+}
 
 
 /// Declarations a rule actually specified. Only `Some` fields are applied,
@@ -66,21 +77,21 @@ impl SpecifiedStyle {
         if let Some(w) = self.width { node_style.size.width = w; }
         if let Some(h) = self.height {
             node_style.size.height = h;
-            node_style.min_size.height = h;
+            node_style.min_size.height = lpa(h);
         }
         // min wins over max in taffy, and blocks carry a UA min-height
         // default — a specified max must clear it (an explicit min-* below
         // still overrides, it folds after).
         if let Some(v) = self.max_width {
-            node_style.max_size.width = v;
-            node_style.min_size.width = Dimension::auto();
+            node_style.max_size.width = lpa(v);
+            node_style.min_size.width = LengthPercentageAuto::auto();
         }
         if let Some(v) = self.max_height {
-            node_style.max_size.height = v;
-            node_style.min_size.height = Dimension::auto();
+            node_style.max_size.height = lpa(v);
+            node_style.min_size.height = LengthPercentageAuto::auto();
         }
-        if let Some(v) = self.min_width { node_style.min_size.width = v; }
-        if let Some(v) = self.min_height { node_style.min_size.height = v; }
+        if let Some(v) = self.min_width { node_style.min_size.width = lpa(v); }
+        if let Some(v) = self.min_height { node_style.min_size.height = lpa(v); }
         if let Some(p) = self.padding {
             node_style.padding = p;
         }
@@ -1984,8 +1995,7 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
     if depth > 4 {
         return; // pathological nesting guard
     }
-    let mut input = ParserInput::new(css);
-    let mut parser = Parser::new(&mut input);
+    let mut parser = Parser::new(css);
 
     loop {
         // Slice the raw prelude up to the next `{`.
@@ -2016,7 +2026,7 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
             .parse_nested_block(|p| {
                 let s = p.position();
                 while p.next().is_ok() {}
-                Ok::<String, cssparser::ParseError<'_, ()>>(p.slice_from(s).to_string())
+                Ok::<String, cssparser::ParseError<()>>(p.slice_from(s).to_string())
             })
             .unwrap_or_default();
 

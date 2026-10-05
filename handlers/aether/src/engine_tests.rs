@@ -1983,25 +1983,31 @@ mod tests {
         }
         assert!(!crate::js::engine_poisoned(), "not poisoned before the job runs");
 
-        // The panic happens in here. Reaching the next line at all is the test.
+        // boa 0.21 PANICKED in here; reaching the next line at all is the test.
         engine.tick();
 
-        assert!(
-            crate::js::engine_poisoned(),
-            "a caught engine panic must poison the context"
-        );
+        // boa 0.22 made `into_opaque` fallible, so the limit now comes back to
+        // the job runner as an ordinary `Err` instead of a panic. Either way
+        // the process lives: a caught panic poisons the context (and script is
+        // refused), an ordinary `Err` leaves the engine running — and in both
+        // the reaction chain never reaches its second step.
         {
             let js = engine.js_engine.as_mut().unwrap();
-            assert!(
-                js.execute("1 + 1").is_err(),
-                "a poisoned engine refuses further script instead of running it on a broken VM"
-            );
+            if crate::js::engine_poisoned() {
+                assert!(
+                    js.execute("1 + 1").is_err(),
+                    "a poisoned engine refuses further script instead of running it on a broken VM"
+                );
+            } else {
+                let settled = js.execute("window.__settled").expect("an unpoisoned engine keeps running script");
+                assert_eq!(settled.as_number(), Some(0.0), "the limit must stop the chain, got {settled:?}");
+            }
         }
         // The DOM built before the panic is still intact and still renders.
         let document = engine.document.as_ref().expect("document survives");
         assert!(
             document.select_first("#x").is_ok(),
-            "the DOM must render as it stands after the engine is poisoned"
+            "the DOM must render as it stands after the limit trips"
         );
         crate::js::clear_poison();
     }
