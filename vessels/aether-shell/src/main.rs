@@ -1,6 +1,13 @@
 use std::thread;
 use tokio::task::LocalSet;
-use bandy::{SMessage, Synapse};
+use bandy::{FacetCommand, FacetView, Origin, SMessage, Synapse};
+
+/// Receipts the shell stamps on the requests it delegates to Facet: `'A'` in the top byte.
+const FACET_RECEIPT_TAG: u64 = (b'A' as u64) << 56;
+
+fn is_ours(c: &FacetCommand) -> bool {
+    c.receipt_id().is_some_and(|r| r >> 56 == FACET_RECEIPT_TAG >> 56)
+}
 // use quartzite::browser::bootstrap_browser;
 use aether::AetherEngine;
 
@@ -48,6 +55,21 @@ fn main() {
     
     let engine_tx = synapse.clone();
     let mut engine_rx = synapse.subscribe();
+
+    // SR29: images are Facet's. The shell serves the Images handler on its own Synapse, and a
+    // navigation to a local image is DELEGATED to it (open, render at the viewport size, blit)
+    // instead of being fetched and laid out as a page.
+    {
+        let facet_rx = synapse.subscribe();
+        let facet_tx = synapse.clone();
+        thread::Builder::new()
+            .name("facet".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(facet::serve(facet_tx, facet_rx, facet::Facet::new()));
+            })
+            .expect("spawn facet thread");
+    }
     
     // Spawn the Engine Thread. Big stack: boa's parser/interpreter is
     // recursive-descent and real-world page bundles nest deeply — the
@@ -91,6 +113,8 @@ fn main() {
             // point below, off the critical path).
             let mut last_favicon: Option<String> = None;
             let mut pending_favicon: Option<String> = None;
+            let mut facet_receipts: u64 = 0;
+            let mut facet_url: Option<String> = None;
 
             loop {
                 tokio::select! {
@@ -124,6 +148,35 @@ fn main() {
                         }
                         for msg in coalesce(batch) {
                             match msg {
+                                SMessage::OpenDocument { url } if FacetCommand::local_image_path(&url).is_some() => {
+                                    facet_receipts += 1;
+                                    let path = FacetCommand::local_image_path(&url).unwrap_or_default();
+                                    facet_url = Some(url);
+                                    engine_tx.fire(SMessage::Facet(FacetCommand::ImageOpen {
+                                        receipt_id: FACET_RECEIPT_TAG | facet_receipts,
+                                        principal: Origin::LocalUser("aether".into()),
+                                        path,
+                                    }));
+                                }
+                                SMessage::Facet(FacetCommand::ImageOpened { receipt_id, handle, .. }) if receipt_id >> 56 == FACET_RECEIPT_TAG >> 56 => {
+                                    engine_tx.fire(SMessage::Facet(FacetCommand::ImageRender {
+                                        receipt_id,
+                                        handle,
+                                        width: engine.width.min(facet::MAX_VIEWPORT),
+                                        height: engine.height.min(facet::MAX_VIEWPORT),
+                                        view: FacetView::default(),
+                                    }));
+                                }
+                                SMessage::Facet(FacetCommand::ImageRendered { receipt_id, width, height, rgba, .. }) if receipt_id >> 56 == FACET_RECEIPT_TAG >> 56 => {
+                                    engine_tx.fire(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels: rgba });
+                                    if let Some(u) = facet_url.take() {
+                                        engine_tx.fire(SMessage::BrowserUrlChanged(u));
+                                    }
+                                }
+                                SMessage::Facet(ref c @ FacetCommand::ImageError { ref message, .. }) if is_ours(c) => {
+                                    let url = facet_url.take().unwrap_or_default();
+                                    engine.load_error_page(&url, message);
+                                }
                                 SMessage::OpenDocument { url } => {
                                     match aether::net::fetch_page(&url).await {
                                         Ok(page) => {
