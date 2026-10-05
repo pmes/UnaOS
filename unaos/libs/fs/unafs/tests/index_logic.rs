@@ -51,7 +51,9 @@ fn ids(fs: &mut UnaFS<MemDevice>, q: &str) -> Vec<u64> {
 #[test]
 fn fresh_volume_is_v6_with_a_catalog_record() {
     let mut fs = fresh_fs(4096);
-    assert_eq!(fs.superblock.version, 6);
+    // v7 (UNAFSMAP) keeps every v6 structure; only the maps' shape moved.
+    assert_eq!(fs.superblock.version, unafs::superblock::VERSION);
+    assert!(fs.superblock.indexed());
     let rec = fs.catalog_record().unwrap().expect("v6 has a record");
     assert_eq!(rec.entries, 0);
     let cat = fs.read_inode(fs.superblock.catalog_inode).unwrap();
@@ -262,7 +264,7 @@ fn v5_volume_keeps_the_flat_catalog_and_migrates_to_v6() {
     let mut new = fresh_fs(8192);
     let report = unafs::legacy::migrate_k8_into(&mut again, &mut new).unwrap();
     assert_eq!((report.files, report.directories, report.bytes), (1, 1, 8));
-    assert_eq!(new.superblock.version, 6);
+    assert_eq!(new.superblock.version, unafs::superblock::VERSION);
     let hits = new.query("kind == \"note\" AND size BETWEEN 1 AND 10").unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].path, "/docs/memo.txt");
