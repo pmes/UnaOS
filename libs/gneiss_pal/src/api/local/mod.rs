@@ -18,35 +18,36 @@
 //! that makes recall work with no network").
 //!
 //! all-MiniLM-L6-v2 (BERT, 6 layers, hidden 384, 12 heads), run in-process on
-//! the CPU by candle (`candle-transformers::models::bert::BertModel`). Its
-//! weights are read straight out of the pinned ONNX export by [`onnx`] (the
-//! six per-layer `MatMul` weights are renamed through their bias `Add`);
-//! tokenization is [`wordpiece`]. The output is the attention-masked mean of
-//! the last hidden state, L2-normalised (the sentence-transformers recipe).
+//! the CPU by UnaOS's own inference core, `infer_core` (INFERCORE, SR57: the
+//! safetensors / ONNX readers, the HF-exact BERT tokenizer and the BERT encoder,
+//! `no_std`, zero dependencies). The output is the attention-masked mean of the
+//! last hidden state, L2-normalised (the sentence-transformers recipe).
+//!
+//! Files read from the model directory: `config.json`; the weights from
+//! `model.safetensors` (F32 / F16 / BF16) when present, else `model.onnx`; the
+//! tokenizer from `tokenizer.json` when present, else `vocab.txt` with the BERT
+//! uncased defaults. A batch is split across the CPU's threads — sequences are
+//! encoded independently, so the vectors are the same bits whatever the split.
 //!
 //! The model files are NOT in the repository: `tools/una-models fetch
 //! all-MiniLM-L6-v2` puts them in `~/.cache/unaos/models/<name>` (sha256
 //! pinned). Their absence is a [`ProviderError::Config`] naming that command —
 //! Vein says it in-chat; never a panic.
 
-pub mod onnx;
-pub mod wordpiece;
+use std::path::{Path, PathBuf};
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-
-use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config};
+use infer_core::bert::{Bert, Config, graph_from_onnx};
+use infer_core::safetensors::SafeTensors;
+use infer_core::tokenizer::Tokenizer;
 
 use super::embed::{Embedder, check_batch};
 use super::provider::{BoxFuture, ProviderError};
-use wordpiece::WordPiece;
 
 /// Tokens per text, including `[CLS]`/`[SEP]` (sentence-transformers' cap for this model).
 pub const MAX_TOKENS: usize = 256;
 
-/// The files a local model directory holds.
+/// The files `tools/una-models` installs for a local model (the embedder also reads
+/// `tokenizer.json` and `model.safetensors` when they are there).
 pub const MODEL_FILES: [&str; 3] = ["model.onnx", "vocab.txt", "config.json"];
 
 /// `$XDG_CACHE_HOME/unaos/models/<name>`, else `$HOME/.cache/unaos/models/<name>`.
@@ -70,9 +71,9 @@ pub fn not_installed(name: &str) -> String {
 pub struct LocalEmbedder {
     name: String,
     dims: usize,
-    bert: BertModel,
-    tok: WordPiece,
-    device: Device,
+    bert: Bert,
+    tok: Tokenizer,
+    threads: usize,
 }
 
 fn cfg_err(name: &str, what: impl std::fmt::Display) -> ProviderError {
@@ -86,80 +87,73 @@ impl LocalEmbedder {
         Self::load_from(name, &model_dir(name), dims)
     }
 
-    pub fn load_from(name: &str, dir: &std::path::Path, dims: usize) -> Result<Self, ProviderError> {
-        if MODEL_FILES.iter().any(|f| !dir.join(f).is_file()) {
+    pub fn load_from(name: &str, dir: &Path, dims: usize) -> Result<Self, ProviderError> {
+        let has = |f: &str| dir.join(f).is_file();
+        if !has("config.json") || !(has("model.safetensors") || has("model.onnx")) || !(has("tokenizer.json") || has("vocab.txt")) {
             return Err(ProviderError::Config(not_installed(name)));
         }
         let read = |f: &str| std::fs::read(dir.join(f)).map_err(|e| cfg_err(name, format!("{f}: {e}")));
-        let config: Config = serde_json::from_slice(&read("config.json")?).map_err(|e| cfg_err(name, format!("config.json: {e}")))?;
+        let text = |f: &str| String::from_utf8(read(f)?).map_err(|_| cfg_err(name, format!("{f} is not UTF-8")));
+        let config = Config::from_json(&text("config.json")?).map_err(|e| cfg_err(name, e))?;
         if dims != 0 && dims != config.hidden_size {
             return Err(cfg_err(name, format!("the model is {} wide, vein.embed.dims says {dims}", config.hidden_size)));
         }
-        let vocab = String::from_utf8(read("vocab.txt")?).map_err(|_| cfg_err(name, "vocab.txt is not UTF-8"))?;
-        let tok = WordPiece::from_vocab(&vocab).map_err(|e| cfg_err(name, e))?;
-        let mut graph = onnx::parse_model(&read("model.onnx")?).map_err(|e| cfg_err(name, format!("model.onnx: {e}")))?;
-        onnx::name_linear_weights(&mut graph).map_err(|e| cfg_err(name, e))?;
-        let device = Device::Cpu;
-        let mut tensors = HashMap::new();
-        for (k, t) in graph.initializers {
-            let tensor = Tensor::from_vec(t.data, t.dims.as_slice(), &device).map_err(|e| cfg_err(name, format!("{k}: {e}")))?;
-            tensors.insert(k, tensor);
+        let tok = if has("tokenizer.json") {
+            Tokenizer::from_tokenizer_json(&text("tokenizer.json")?)
+        } else {
+            Tokenizer::from_vocab_txt(&text("vocab.txt")?)
         }
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
-        let bert = BertModel::load(vb, &config).map_err(|e| cfg_err(name, format!("weights: {e}")))?;
-        Ok(LocalEmbedder { name: name.to_string(), dims: config.hidden_size, bert, tok, device })
+        .map_err(|e| cfg_err(name, e))?;
+        if tok.id_bound() as usize > config.vocab_size {
+            return Err(cfg_err(name, "the tokenizer emits ids past the model's vocabulary"));
+        }
+        let bert = if has("model.safetensors") {
+            let bytes = read("model.safetensors")?;
+            let st = SafeTensors::parse(&bytes).map_err(|e| cfg_err(name, format!("model.safetensors: {e}")))?;
+            Bert::load(config, &st, false)
+        } else {
+            let graph = graph_from_onnx(&read("model.onnx")?).map_err(|e| cfg_err(name, format!("model.onnx: {e}")))?;
+            Bert::load(config, &graph, false)
+        }
+        .map_err(|e| cfg_err(name, e))?;
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Ok(LocalEmbedder { name: name.to_string(), dims: bert.config.hidden_size, bert, tok, threads })
     }
 
     /// Token ids for `text` (exposed for the golden test).
     pub fn token_ids(&self, text: &str) -> Vec<u32> {
-        self.tok.encode(text, MAX_TOKENS)
-    }
-
-    /// INFERCORE (SR57) M3 oracle only: candle's sentence vectors for GIVEN ids — one padded
-    /// batch with the attention mask, masked mean, L2-normalised.
-    pub fn embed_ids_batch(&self, batch: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, ProviderError> {
-        let m = |e: candle_core::Error| ProviderError::Malformed(format!("local embedder: {e}"));
-        let n = batch.iter().map(Vec::len).max().unwrap_or(0);
-        let (mut ids, mut mask) = (Vec::new(), Vec::new());
-        for s in batch {
-            ids.extend(s.iter().copied().chain(std::iter::repeat_n(0, n - s.len())));
-            mask.extend(std::iter::repeat_n(1u32, s.len()).chain(std::iter::repeat_n(0, n - s.len())));
-        }
-        let b = batch.len();
-        let input = Tensor::from_vec(ids, (b, n), &self.device).map_err(m)?;
-        let types = Tensor::zeros((b, n), DType::U32, &self.device).map_err(m)?;
-        let maskt = Tensor::from_vec(mask, (b, n), &self.device).map_err(m)?;
-        let hidden = self.bert.forward(&input, &types, Some(&maskt)).map_err(m)?; // [b, n, d]
-        let mf = maskt.to_dtype(DType::F32).map_err(m)?.unsqueeze(2).map_err(m)?;
-        let summed = hidden.broadcast_mul(&mf).map_err(m)?.sum(1).map_err(m)?;
-        let counts = mf.sum(1).map_err(m)?;
-        let pooled = summed.broadcast_div(&counts).map_err(m)?;
-        let rows: Vec<Vec<f32>> = pooled.to_vec2().map_err(m)?;
-        Ok(rows
-            .into_iter()
-            .map(|mut v| {
-                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-                v.iter_mut().for_each(|x| *x /= norm);
-                v
-            })
-            .collect())
+        self.tok.encode_truncated(text, MAX_TOKENS)
     }
 
     /// One normalised sentence vector, synchronously.
     pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, ProviderError> {
-        let m = |e: candle_core::Error| ProviderError::Malformed(format!("local embedder: {e}"));
-        let ids = self.token_ids(text);
-        let n = ids.len();
-        let input = Tensor::from_vec(ids, (1, n), &self.device).map_err(m)?;
-        let types = Tensor::zeros((1, n), DType::U32, &self.device).map_err(m)?;
-        let mask = Tensor::ones((1, n), DType::U32, &self.device).map_err(m)?;
-        let hidden = self.bert.forward(&input, &types, Some(&mask)).map_err(m)?; // [1, n, d]
-        // One unpadded text: the masked mean is the plain mean over tokens.
-        let pooled = hidden.mean(1).map_err(m)?.squeeze(0).map_err(m)?;
-        let mut v: Vec<f32> = pooled.to_vec1().map_err(m)?;
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-        v.iter_mut().for_each(|x| *x /= norm);
-        Ok(v)
+        Ok(self.embed_texts(&[text])?.remove(0))
+    }
+
+    /// Normalised sentence vectors for a batch, synchronously, across the CPU's threads.
+    pub fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ProviderError> {
+        let ids: Vec<Vec<u32>> = texts.iter().map(|t| self.token_ids(t)).collect();
+        let run = |chunk: &[Vec<u32>]| {
+            let seqs: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+            self.bert.embed(&seqs).map_err(|e| ProviderError::Malformed(format!("local embedder: {e}")))
+        };
+        let threads = self.threads.min(ids.len()).max(1);
+        if threads == 1 {
+            return run(&ids);
+        }
+        let per = ids.len().div_ceil(threads);
+        let parts: Vec<Result<Vec<Vec<f32>>, ProviderError>> = std::thread::scope(|s| {
+            let handles: Vec<_> = ids.chunks(per).map(|c| s.spawn(move || run(c))).collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(ProviderError::Malformed("local embedder: a worker thread panicked".into()))))
+                .collect()
+        });
+        let mut out = Vec::with_capacity(ids.len());
+        for p in parts {
+            out.extend(p?);
+        }
+        Ok(out)
     }
 }
 
@@ -178,7 +172,7 @@ impl Embedder for LocalEmbedder {
 
     fn embed<'a>(&'a self, texts: &'a [&'a str]) -> BoxFuture<'a, Result<Vec<Vec<f32>>, ProviderError>> {
         Box::pin(async move {
-            let out = texts.iter().map(|t| self.embed_text(t)).collect::<Result<Vec<_>, _>>()?;
+            let out = self.embed_texts(texts)?;
             check_batch("local", self.dims, texts.len(), &out)?;
             Ok(out)
         })
