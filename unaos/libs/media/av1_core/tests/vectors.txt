@@ -62,3 +62,34 @@ av1-1-b8-23-film_grain-50                     ba3edd82a58414f009e1c821b947ec8de4
 av1-1-b8-23-film_grain-50.md5                 8996cc98e68102e60620d28208246009601b2906f05e1d1cc0da74479c828ac9      820 https://storage.googleapis.com/aom-test-data/av1-1-b8-23-film_grain-50.ivf.md5
 av1-1-b10-23-film_grain-50                    c36cf5ab6a2e9e27c212c06863759b60791e3fa681a0800b5d57fd4192ef29cb    28906 https://storage.googleapis.com/aom-test-data/av1-1-b10-23-film_grain-50.ivf
 av1-1-b10-23-film_grain-50.md5                d8f94be7e77756b5b117a04df13f1a125201eaab6ee828f78368e237c412d97e      830 https://storage.googleapis.com/aom-test-data/av1-1-b10-23-film_grain-50.ivf.md5
+# Robustness: libaom's invalid-stream corpus (oss-fuzz / bug reports) — decoding must return errors, never panic.
+invalid-bug-1814                              10ecfeac1fd48a1a6bc22dc2bd8f2e335f1406f328e510c395004aa772a43c2c      747 https://storage.googleapis.com/aom-test-data/invalid-bug-1814.ivf
+invalid-chromium-906381                       0ea620e373da7c413f312ebf87485ba70cb5e03385ee2df8876d929ad1a88e7e     4420 https://storage.googleapis.com/aom-test-data/invalid-chromium-906381.ivf
+invalid-google-142530197-1                    7b2ebef59c405c8b121e7438b63fb5643ba1f33ae7b74cda30f8718c01dcfb78       99 https://storage.googleapis.com/aom-test-data/invalid-google-142530197-1.ivf
+invalid-google-142530197                      38eb59ded1c97a8a77c85a29f9468c6e559346b3b30583984346be2663b4c72e      123 https://storage.googleapis.com/aom-test-data/invalid-google-142530197.ivf
+invalid-oss-fuzz-10061                        e3c26c5df4d49ec8fd14df738e44007ea24d9b1bf7794d364c32cb947e061bc1      206 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10061.ivf
+invalid-oss-fuzz-10117-mc-buf-use-highbd      1f7761912552f67e62c8e8989c41e65c24202974b3c0b8d61c521d32047e274c      167 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10117-mc-buf-use-highbd.ivf
+invalid-oss-fuzz-10227                        40bc5fc49027ee05b3194d5c484d0bfb182d1d5d9efb2fbee192035d4a3a5177    14130 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10227.ivf
+invalid-oss-fuzz-10389                        e98e7c181b2f47033ceea1e3d84e635b5edda7d1d1586460364edddc13e80e55      958 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10389.ivf
+invalid-oss-fuzz-10555                        8c9581e162368356902f5ea3410a78bac4ef41491593a167dff2e9436ef889ef      142 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10555.ivf
+invalid-oss-fuzz-10705                        a767f7d3aa7229e26cfa6a12dd5ff404e64d5d37a5fd62857cf7eaf86a17d1ee     1040 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10705.ivf
+invalid-oss-fuzz-10723                        243c392883d01e7d81c08e8d3558b579b82d8b7a441d337e4f2a273287193012      982 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10723.ivf
+invalid-oss-fuzz-10779                        fc9e14552575361ed35bbab15d63f4715b0d070dd76ef26d756e9941b7046d9b      140 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-10779.ivf
+invalid-oss-fuzz-11477                        84134206d6d0fbab7404560279326d50201fce7175a3509411c6db9d3ff7370e      948 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-11477.ivf
+invalid-oss-fuzz-11479                        5215a9b64461cbcdfc76b91ccb2935a43664e161952f4e174fffbad7acaaa630      116 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-11479.ivf
+invalid-oss-fuzz-11523                        a0cdd6395260a81ded2fd0f0676d12982a4ea45c8959744d2ca76a849717a4c9    30254 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-11523.ivf
+invalid-oss-fuzz-15363                        3b1a94a45d4f1770de803ef28aa5970e9973d7f3287a60402679de3a29b97a34     8663 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-15363.ivf
+invalid-oss-fuzz-16437                        ffc68dbe61c3b590227505c612c829f4e50001796e89b7730491d8662ecacced       72 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-16437.ivf
+invalid-oss-fuzz-24706                        2ba89ba10b4c817c5931216b4c3fff9f712d3d64e24f8307531079abeb58b9fc       91 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-24706.ivf
+invalid-oss-fuzz-33030                        7a7f2208c1fbb901e5ab5657fc604c504e4c2e81da7b50c0249a1ae35275cb57      114 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-33030.ivf
+invalid-oss-fuzz-9288                         a18fe7cc2f4ed19048ef5d683dc87088917dd3590f784fe1e82b1ec5631be800      224 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-9288.ivf
+invalid-oss-fuzz-9463                         933b7d9c84b6ddc32dc560f7f9c95876413be4aac1385a2ced71fe5cac5fd760       80 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-9463.ivf
+invalid-oss-fuzz-9482                         f5cd658619b1952862fe6dad7d04dc6cd5e2ccddd115304f8e652544555640de      158 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-9482.ivf
+invalid-oss-fuzz-9720                         fd3eb5cb6f2a035069d768bb24019d1d84f24b4f795b7bb5f8d2aa213468fd8f     8235 https://storage.googleapis.com/aom-test-data/invalid-oss-fuzz-9720.ivf
+# libaom resize vectors (Matroska; the size changes at key frames with new sequence headers)
+av1-1-b8-03-sizeup                            919bc6e93d1127a6bd98d413dd6c3a227bd2f4f6149ea32a2b455eec380b2b9f    35794 https://storage.googleapis.com/aom-test-data/av1-1-b8-03-sizeup.mkv
+av1-1-b8-03-sizeup.md5                        9f849b305c137d989512220d5701c49a67683736b19f620e76677a0d41c4016a     1510 https://storage.googleapis.com/aom-test-data/av1-1-b8-03-sizeup.mkv.md5
+av1-1-b8-03-sizedown                          64f4e78cca42acbb0a9e25bd4a5c2ff2f96e3e911595902b60d2266a93f2c08f    35780 https://storage.googleapis.com/aom-test-data/av1-1-b8-03-sizedown.mkv
+av1-1-b8-03-sizedown.md5                      59876b6e7d61043abb939d2dd9d34b4f8333f33b1ef52d0e36dd02c12801e70b     1550 https://storage.googleapis.com/aom-test-data/av1-1-b8-03-sizedown.mkv.md5
+# Chromium's own AV1 test clip (media/test/data, BSD): the Chromium <video> oracle input
+bear-av1.mp4                                  2081972026e679775013102a63280331d8fae236dc8efef4ce4878a822cf4501    24355 https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-av1.mp4

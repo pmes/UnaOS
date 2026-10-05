@@ -173,6 +173,91 @@ pub fn ivf_frames(data: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+/// Matroska / WebM: read an EBML variable-length integer (ID keeps its marker bit).
+fn ebml_vint(d: &[u8], off: usize, keep_marker: bool) -> Option<(u64, usize)> {
+    let b = *d.get(off)?;
+    let len = b.leading_zeros() as usize + 1;
+    if len > 8 || off + len > d.len() {
+        return None;
+    }
+    let mut v = if keep_marker { b as u64 } else { (b as u64) & ((1u64 << (8 - len)) - 1) };
+    for i in 1..len {
+        v = (v << 8) | d[off + i] as u64;
+    }
+    Some((v, len))
+}
+
+/// The frames of the first video track of a Matroska/WebM file: (CodecPrivate, frames).
+/// Walks Segment > Cluster > SimpleBlock / BlockGroup > Block (no lacing).
+pub fn mkv_frames(data: &[u8]) -> Option<(Vec<u8>, Vec<&[u8]>)> {
+    const SEGMENT: u64 = 0x18538067;
+    const CLUSTER: u64 = 0x1F43B675;
+    const SIMPLEBLOCK: u64 = 0xA3;
+    const BLOCKGROUP: u64 = 0xA0;
+    const BLOCK: u64 = 0xA1;
+    const TRACKS: u64 = 0x1654AE6B;
+    const TRACKENTRY: u64 = 0xAE;
+    const TRACKNUMBER: u64 = 0xD7;
+    const TRACKTYPE: u64 = 0x83;
+    const CODECPRIVATE: u64 = 0x63A2;
+    let mut frames = Vec::new();
+    let mut codec_private = Vec::new();
+    let mut video_track = 0u64;
+    fn walk<'a>(d: &'a [u8], mut off: usize, end: usize, f: &mut dyn FnMut(u64, &'a [u8]) -> bool) {
+        while off < end {
+            let Some((id, il)) = ebml_vint(d, off, true) else { return };
+            let Some((size, sl)) = ebml_vint(d, off + il, false) else { return };
+            let start = off + il + sl;
+            let unknown = size == (1u64 << (7 * sl)) - 1;
+            let stop = if unknown { end } else { (start + size as usize).min(end) };
+            if f(id, &d[start..stop]) {
+                walk(d, start, stop, f);
+            }
+            off = stop;
+        }
+    }
+    let mut blocks: Vec<&[u8]> = Vec::new();
+    walk(data, 0, data.len(), &mut |id, body| match id {
+        SEGMENT | CLUSTER | BLOCKGROUP | TRACKS => true,
+        TRACKENTRY => {
+            let mut num = 0u64;
+            let mut typ = 0u64;
+            let mut cp: &[u8] = &[];
+            walk(body, 0, body.len(), &mut |id2, b2| {
+                match id2 {
+                    TRACKNUMBER => num = b2.iter().fold(0, |a, &x| (a << 8) | x as u64),
+                    TRACKTYPE => typ = b2.iter().fold(0, |a, &x| (a << 8) | x as u64),
+                    CODECPRIVATE => cp = b2,
+                    _ => {}
+                }
+                false
+            });
+            if typ == 1 && video_track == 0 {
+                video_track = num;
+                codec_private = cp.to_vec();
+            }
+            false
+        }
+        SIMPLEBLOCK | BLOCK => {
+            blocks.push(body);
+            false
+        }
+        _ => false,
+    });
+    for b in blocks {
+        let Some((track, tl)) = ebml_vint(b, 0, false) else { continue };
+        if track != video_track || b.len() < tl + 3 {
+            continue;
+        }
+        let flags = b[tl + 2];
+        if flags & 0x06 != 0 {
+            continue; // laced blocks are not used for video
+        }
+        frames.push(&b[tl + 3..]);
+    }
+    Some((codec_private, frames))
+}
+
 /// FNV-1a 64 over 16-bit samples — the regression fingerprint of decoded planes.
 pub fn fnv64(planes: &[&[u16]]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;

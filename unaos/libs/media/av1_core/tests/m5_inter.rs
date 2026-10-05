@@ -8,7 +8,7 @@
 mod common;
 use av1_core::decode::ToolStats;
 use av1_core::image::{decode_avif_planes, Filters, Planes, StreamDecoder};
-use common::{fetch, fnv64, ivf_frames, md5};
+use common::{fetch, fnv64, ivf_frames, md5, mkv_frames, vectors};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -40,14 +40,15 @@ fn frame_bytes(p: &Planes) -> Vec<u8> {
 /// Decode an IVF vector and compare every output frame with its libaom MD5. Returns the summed
 /// tool statistics, or None when offline.
 fn check_vector(name: &str, frames: usize) -> Option<ToolStats> {
-    let ivf = fetch(name)?;
+    let file = fetch(name)?;
+    let units: Vec<&[u8]> = if file.starts_with(b"DKIF") { ivf_frames(&file) } else { mkv_frames(&file).map(|(_, f)| f).unwrap_or_default() };
     let md5s = fetch(&format!("{name}.md5"))?;
     let want: Vec<String> = String::from_utf8(md5s).unwrap().lines().filter_map(|l| l.split_whitespace().next().map(String::from)).collect();
     assert_eq!(want.len(), frames, "{name}: reference frame count");
     let mut dec = StreamDecoder::new(&[]).unwrap();
     let mut n = 0;
     let mut total = ToolStats::default();
-    for (i, tu) in ivf_frames(&ivf).iter().enumerate() {
+    for (i, tu) in units.iter().enumerate() {
         let out = dec.decode_temporal_unit_all(tu).unwrap_or_else(|e| panic!("{name}: temporal unit {i}: {e}"));
         // libaom outputs one frame per temporal unit (the highest spatial layer)
         let Some(p) = out.last() else { continue };
@@ -182,4 +183,35 @@ fn scalable_streams_are_frame_exact() {
     if let Some(t) = check_vector("av1-1-b8-22-svc-L2T1", 8) {
         assert!(t.scaled_ref_blocks > 0);
     }
+}
+
+#[test]
+fn film_grain_is_frame_exact() {
+    // §7.18.3 synthesis on the output frames (8-bit and 10-bit, 4:2:0, AR lag 3, overlap).
+    for name in ["av1-1-b8-23-film_grain-50", "av1-1-b10-23-film_grain-50"] {
+        check_vector(name, 10);
+    }
+}
+
+#[test]
+fn resolution_changes_are_frame_exact() {
+    // A new sequence header and key frame at a different size mid-stream (up and down).
+    check_vector("av1-1-b8-03-sizeup", 20);
+    check_vector("av1-1-b8-03-sizedown", 20);
+}
+
+#[test]
+fn invalid_streams_never_panic() {
+    // libaom's corpus of broken streams (oss-fuzz finds, bug reports): every temporal unit is fed
+    // to the decoder in turn, errors included; the decoder must return Err, never panic.
+    let mut fed = 0;
+    for v in vectors().into_iter().filter(|v| v.name.starts_with("invalid-")) {
+        let Some(file) = fetch(&v.name) else { continue };
+        let mut dec = StreamDecoder::new(&[]).unwrap();
+        for tu in ivf_frames(&file) {
+            let _ = dec.decode_temporal_unit_all(tu);
+            fed += 1;
+        }
+    }
+    eprintln!("invalid corpus: {fed} temporal units fed without a panic");
 }

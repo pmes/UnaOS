@@ -21,10 +21,12 @@ pub struct Filters {
     pub deblock: bool,
     pub cdef: bool,
     pub restoration: bool,
+    /// §7.18.3 film grain synthesis on the output frames (off = the intermediate frames of §7.18.2).
+    pub film_grain: bool,
 }
 impl Default for Filters {
     fn default() -> Self {
-        Filters { deblock: true, cdef: true, restoration: true }
+        Filters { deblock: true, cdef: true, restoration: true, film_grain: true }
     }
 }
 
@@ -187,14 +189,11 @@ impl Decoder {
         fh.render_width = f.render_width;
         fh.render_height = f.render_height;
         fh.order_hint = f.order_hint;
-        Ok(output_planes(seq, &fh, &f.planes, ToolStats::default()))
+        Ok(output_planes(seq, &fh, &f.planes, ToolStats::default(), self.filters))
     }
 
     /// Decode one frame (header already parsed) from its tile groups; returns the output if shown.
     fn decode_frame(&mut self, seq: &SequenceHeader, hdr: &FrameHeader, groups: &[&[u8]]) -> Result<Option<Planes>> {
-        if hdr.use_superres {
-            return Err(Error::Unsupported("superres"));
-        }
         let mut fs = FrameState::new(seq, hdr);
         // the frame CDFs: init_non_coeff_cdfs + init_coeff_cdfs, or load_cdfs(prev)
         let frame_cdf = match hdr.prev_frame {
@@ -255,7 +254,7 @@ impl Decoder {
         }
         let cc = &seq.color_config;
         let stats = fs.stats.clone();
-        let out = if hdr.show_frame { Some(output_planes(seq, hdr, &lr, stats)) } else { None };
+        let out = if hdr.show_frame { Some(output_planes(seq, hdr, &lr, stats, self.filters)) } else { None };
         // reference frame update process (§7.20)
         if hdr.refresh_frame_flags != 0 {
             let rf = Arc::new(RefFrame {
@@ -357,7 +356,7 @@ impl StreamDecoder {
     }
 }
 
-/// decode_frame_wrapup (§7.4) steps 1–5: deblock → CDEF → (superres: owed) → loop restoration.
+/// decode_frame_wrapup (§7.4) steps 1–5: deblock → CDEF → superres upscaling → loop restoration.
 fn postfilter(hdr: &FrameHeader, fs: &mut FrameState, filters: Filters) -> [crate::decode::Plane; 3] {
     if filters.deblock && (hdr.loop_filter_level[0] != 0 || hdr.loop_filter_level[1] != 0) {
         crate::loopfilter::loop_filter_frame(fs, hdr);
@@ -367,12 +366,17 @@ fn postfilter(hdr: &FrameHeader, fs: &mut FrameState, filters: Filters) -> [crat
     } else {
         [fs.planes[0].clone(), fs.planes[1].clone(), fs.planes[2].clone()]
     };
-    // (no superres: UpscaledCdefFrame = CdefFrame, UpscaledCurrFrame = CurrFrame)
-    if filters.restoration { crate::restoration::lr_frame(fs, hdr, &cdef_planes) } else { cdef_planes }
+    let up_cdef = crate::superres::upscale(fs, hdr, &cdef_planes);
+    if filters.restoration && hdr.uses_lr {
+        let up_cur = crate::superres::upscale(fs, hdr, &fs.planes);
+        crate::restoration::lr_frame(fs, hdr, &up_cur, &up_cdef)
+    } else {
+        up_cdef
+    }
 }
 
 /// The output process (§7.18): crop the planes to UpscaledWidth x FrameHeight.
-fn output_planes(seq: &SequenceHeader, hdr: &FrameHeader, lr: &[crate::decode::Plane; 3], stats: ToolStats) -> Planes {
+fn output_planes(seq: &SequenceHeader, hdr: &FrameHeader, lr: &[crate::decode::Plane; 3], stats: ToolStats, filters: Filters) -> Planes {
     let cc = &seq.color_config;
     let w = hdr.upscaled_width;
     let h = hdr.frame_height;
@@ -385,6 +389,14 @@ fn output_planes(seq: &SequenceHeader, hdr: &FrameHeader, lr: &[crate::decode::P
         v
     };
     let (cw, ch) = ((w + ssx) >> ssx, (h + ssy) >> ssy);
+    let mut y = crop(&lr[0], w, h);
+    let mut u = if cc.mono_chrome { Vec::new() } else { crop(&lr[1], cw, ch) };
+    let mut v = if cc.mono_chrome { Vec::new() } else { crop(&lr[2], cw, ch) };
+    let mut stats = stats;
+    if seq.film_grain_params_present && hdr.film_grain.apply_grain && filters.film_grain {
+        crate::filmgrain::apply(&hdr.film_grain, cc.bit_depth, cc.mono_chrome, ssx, ssy, cc.matrix_coefficients, w as usize, h as usize, &mut y, &mut u, &mut v);
+        stats.film_grain = true;
+    }
     Planes {
         width: w,
         height: h,
@@ -392,9 +404,9 @@ fn output_planes(seq: &SequenceHeader, hdr: &FrameHeader, lr: &[crate::decode::P
         mono: cc.mono_chrome,
         ss_x: ssx,
         ss_y: ssy,
-        y: crop(&lr[0], w, h),
-        u: if cc.mono_chrome { Vec::new() } else { crop(&lr[1], cw, ch) },
-        v: if cc.mono_chrome { Vec::new() } else { crop(&lr[2], cw, ch) },
+        y,
+        u,
+        v,
         color_primaries: cc.color_primaries,
         transfer_characteristics: cc.transfer_characteristics,
         matrix_coefficients: cc.matrix_coefficients,

@@ -144,6 +144,8 @@ pub struct ToolStats {
     pub scaled_ref_blocks: u32,
     pub var_tx_splits: u32,
     pub temporal_mvs: bool,
+    /// Film grain was synthesised on this output frame (§7.18.3).
+    pub film_grain: bool,
 }
 
 impl FrameState {
@@ -2454,11 +2456,13 @@ impl<'a, 'f> Dec<'a, 'f> {
                     }
                 }
             }
+            // a conformant stream never codes eob > segEob; an invalid one must not index past the scan
+            eob = eob.min(seg_eob);
             for c in (0..eob).rev() {
                 let pos = scan.at(c);
                 let mut level;
                 if c == eob - 1 {
-                    let cctx = self.get_coeff_base_ctx(tx_sz, tx_class, pos, c, true) - SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB;
+                    let cctx = self.get_coeff_base_ctx(tx_sz, tx_class, pos, c, true) + SIG_COEF_CONTEXTS_EOB - SIG_COEF_CONTEXTS;
                     level = sym!(self, self.cdf.coeff_base_eob[tx_sz_ctx][ptype][cctx]) as i32 + 1;
                 } else {
                     let cctx = self.get_coeff_base_ctx(tx_sz, tx_class, pos, c, false);
