@@ -4,8 +4,7 @@ use boa_engine::{
     object::ObjectInitializer,
     property::Attribute,
 };
-use kuchiki::traits::*;
-use kuchiki::NodeRef;
+use crate::dom::NodeRef;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
@@ -204,29 +203,18 @@ fn this_node_id(this: &JsValue, ctx: &mut Context) -> i32 {
         .unwrap_or(0.0) as i32
 }
 
-/// Builds a detached HTML-namespace element node directly — no parser, no
-/// throwaway document, no selector round-trip (which silently failed for any
-/// tag the HTML parser refuses to nest, and for custom elements).
-///
-/// The `QualName` is cloned off an element that already exists in the
-/// document and retargeted at `local`, rather than written out with
-/// `ns!(html)`: kuchiki 0.8 builds on html5ever 0.25, while this crate's own
-/// `html5ever` dependency is 0.40, so the 0.40 `QualName`/`ns!` types are a
-/// different type from the one `NodeRef::new_element` accepts and cannot be
-/// passed to it. Cloning keeps the namespace exactly right by construction.
-/// Any local name works, including unknown and custom tags.
+/// Builds a detached HTML-namespace element node directly in the live document's arena — no
+/// parser, no throwaway document, no selector round-trip. Any local name works, including unknown
+/// and custom tags (`createElement` lowercases, as for an HTML document).
 pub(crate) fn new_html_element(local: &str) -> Option<NodeRef> {
     let doc = DOM_STATE.with(|s| s.borrow().document.clone())?;
-    // First element in document order is <html> — html-namespaced.
-    let mut name = doc
-        .inclusive_descendants()
-        .find_map(|n| n.as_element().map(|el| el.name.clone()))?;
-    name.prefix = None;
-    name.local = local.trim().to_ascii_lowercase().as_str().into();
-    Some(NodeRef::new_element(
-        name,
-        std::iter::empty::<(kuchiki::ExpandedName, kuchiki::Attribute)>(),
-    ))
+    Some(doc.new_element(html_core::Namespace::Html, &local.trim().to_ascii_lowercase()))
+}
+
+/// A detached Text (`comment == false`) or Comment node in the live document's arena.
+fn new_char_node(text: String, comment: bool) -> Option<NodeRef> {
+    let doc = DOM_STATE.with(|s| s.borrow().document.clone())?;
+    Some(if comment { doc.new_comment(text) } else { doc.new_text(text) })
 }
 
 impl DomState {
@@ -749,7 +737,7 @@ impl Engine {
     /// write `dataset.*` as state that CSS attribute selectors then match.
     /// A plain object copy would serve the first read and silently lose
     /// every write, so the map is a `Proxy` whose traps go straight to the
-    /// attribute list — the same `kuchiki` attributes selectors and
+    /// attribute list — the same `html_core` attributes selectors and
     /// `getAttribute` see. Nothing is cached; nothing is invented.
     fn setup_dataset(context: &mut Context) {
         fn node_of(args: &[JsValue], ctx: &mut Context) -> Option<NodeRef> {
@@ -1002,25 +990,14 @@ impl Engine {
         // Accessor pairs must exist before ObjectInitializer borrows context.
         let get_inner_html = Self::native(context, |this, _args, ctx| {
             let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
-            let html: String = n.children().map(|c| c.to_string()).collect();
+            let html = n.inner_html();
             Ok(JsValue::new(boa_engine::string::JsString::from(html)))
         });
         let set_inner_html = Self::native(context, |this, args, ctx| {
             let Some(n) = Self::this_node(this, ctx) else { return Ok(JsValue::undefined()) };
             let html = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
-            for child in n.children() {
-                child.detach();
-            }
-            let frag = kuchiki::parse_html().one(html);
-            if let Ok(mut bodies) = frag.select("body") {
-                if let Some(body) = bodies.next() {
-                    let children: Vec<_> = body.as_node().children().collect();
-                    for child in children {
-                        child.detach();
-                        n.append(child);
-                    }
-                }
-            }
+            // WHATWG §13.4: a fragment parse in this element's context (html_core).
+            n.set_inner_html(&html);
             DOM_STATE.with(|s| s.borrow_mut().mutated = true);
             Ok(JsValue::undefined())
         });
@@ -1034,7 +1011,8 @@ impl Engine {
             for child in n.children() {
                 child.detach();
             }
-            n.append(kuchiki::NodeRef::new_text(text));
+            let t = n.new_text(text);
+            n.append(t);
             DOM_STATE.with(|s| s.borrow_mut().mutated = true);
             Ok(JsValue::undefined())
         });
@@ -1231,7 +1209,10 @@ impl Engine {
             .function(
                 NativeFunction::from_fn_ptr(|_, args, ctx| {
                     let text = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
-                    Ok(Self::wrap_node(ctx, kuchiki::NodeRef::new_text(text)))
+                    match new_char_node(text, false) {
+                        Some(node) => Ok(Self::wrap_node(ctx, node)),
+                        None => Ok(JsValue::undefined()),
+                    }
                 }),
                 boa_engine::string::JsString::from("createTextNode"),
                 1,
@@ -1239,7 +1220,10 @@ impl Engine {
             .function(
                 NativeFunction::from_fn_ptr(|_, args, ctx| {
                     let text = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
-                    Ok(Self::wrap_node(ctx, kuchiki::NodeRef::new_comment(text)))
+                    match new_char_node(text, true) {
+                        Some(node) => Ok(Self::wrap_node(ctx, node)),
+                        None => Ok(JsValue::undefined()),
+                    }
                 }),
                 boa_engine::string::JsString::from("createComment"),
                 1,
@@ -1464,30 +1448,9 @@ impl Engine {
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
                     let id = this_node_id(this, ctx);
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
-                        let html = n.to_string();
-                        let frag = kuchiki::parse_html().one(html);
-                        let cloned = if let Ok(mut bodies) = frag.select("body") {
-                            if let Some(body) = bodies.next() {
-                                if let Some(first_child) = body.as_node().children().next() {
-                                    first_child.clone()
-                                } else {
-                                    return Ok(JsValue::undefined());
-                                }
-                            } else {
-                                return Ok(JsValue::undefined());
-                            }
-                        } else {
-                            return Ok(JsValue::undefined());
-                        };
-
-                        cloned.detach();
-
+                        // DOM "clone a node": a detached copy in the same document.
                         let deep = args.get(0).cloned().unwrap_or(JsValue::from(false)).to_boolean();
-                        if !deep {
-                            for child in cloned.children().collect::<Vec<_>>() {
-                                child.detach();
-                            }
-                        }
+                        let cloned = n.clone_node(deep);
 
                         return Ok(Self::wrap_node(ctx, cloned));
                     }
