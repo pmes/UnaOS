@@ -15213,9 +15213,9 @@ fn sys_spawn() -> i64 {
     };
     // Claim the Proc entry FIRST, so a failed alloc frees only the entry, and so the pid slot exists to
     // receive the real pid before the child can be dispatched.
-    let Some(pi) = proc_reserve() else {
-        return EAGAIN; // process table full
-    };
+    let Some(pi) = (if proc_table_headroom().1 >= crate::video::wincap::proc_limit() { None } else { proc_reserve() }) else { // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold, code first: the live process limit (`video::wincap::proc_limit`, derived) is asked before a row is claimed
+        crate::video::wincap::note_spawn_refused(proc_table_headroom().1); return EAGAIN; // process table full — WINDOWCAP: said on the wire, and the SPAWNER is paused (doubling backoff), not the machine
+    }; crate::video::wincap::note_spawn_admitted(); // WINDOWCAP: an admitted spawn resets the spawner's backoff
     // Reserve a HANDLE slot BEFORE allocating the address space (a RESERVING placeholder). A full
     // handle table fails here with only the Proc entry to release — nothing loaded or spawned yet.
     let Some(h) = handle_install(slot, HANDLE_RESERVING) else {

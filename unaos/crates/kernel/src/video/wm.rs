@@ -23517,12 +23517,12 @@ fn create_inner(
         let max_y = info.height.saturating_sub(ch + BORDER()).max(min_y);
         Some((x.clamp(BORDER(), max_x), y.clamp(min_y, max_y), scale, info.width, info.height))
     });
-    let mut t = table();
+    let app_row = !compat && owner_asid != 0; let limit = if app_row { super::wincap::win_limit() } else { usize::MAX }; let mut t = table(); let apps = if app_row { t.rows.iter().filter(|r| r.used && !r.compat && r.owner_asid != 0).count() } else { 0 }; if apps >= limit { drop(t); super::wincap::note_open_refused(apps, false); return WIN_NONE; } // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST. The ONE dynamic limit (`video::wincap`, derived at boot from memory, the dock on this panel and the id space) counts APP rows only — `dock_addressable`'s predicate (used, not compat, owner ≠ 0), inlined because that fn is dock-gated — and a refusal is SAID: `[wm] REFUSED create reason=limit` on the wire and the notice on the glass (R70). System rows (owner 0: the login screen, the notice itself; compat) are never refused by the limit — that is what lets the notice open. The limit is read BEFORE the table lock (it may take `WRITER` by try_lock and the heap lock once at arming).
     let slot = match t.rows.iter().position(|r| !r.used) {
         Some(s) => s,
-        None => return WIN_NONE,
+        None => { drop(t); if app_row { super::wincap::note_open_refused(apps, true); } else { serial_println!("[wm] REFUSED create reason=ids owner=system (R90)"); } return WIN_NONE; } // WINDOWCAP (B378): the id space itself is full — said, never silent (same-line fold)
     };
-    let z = t.next_z;
+    if app_row { super::wincap::note_open_admitted(); } let z = t.next_z; // WINDOWCAP (B378): an admitted app row ends a refusal burst (same-line fold, code first)
     t.next_z = t.next_z.wrapping_add(1).max(1);
     let id = (slot + 1) as WinId; native_slot_store(slot, native); // UIMETRICS (B372): the slot's native bit is (re)written on EVERY create, so a recycled slot never inherits it
     // WPACE-TEXT — a re-issued slot must not inherit the dead tenant's shadow: the validity bit
