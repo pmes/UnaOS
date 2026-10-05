@@ -1515,7 +1515,7 @@ pub fn close_compat() -> bool {
 /// thing the panel gets back is a full repaint from the LATEST surface content, not from whatever the
 /// last composited frame happened to be. Nothing is deferred here; a pass is skipped, not owed.
 pub fn present(id: WinId) -> bool {
-    present_banded(id, None, None) != Presented::NoRow
+    crate::video::lag::present_req(); present_banded(id, None, None) != Presented::NoRow // INPUTSTALL M1 (B375): a kernel surface's present request splits its [lag] comp into draw= / pre= (same-line fold).
 }
 
 /// PRESSURE-1 — what a present actually DID, for the one caller that has to charge for it.
@@ -5025,7 +5025,7 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
         // `drain_deferred` already reads once per pass for exactly this "is anything owed" purpose.
         let masked = crate::arch::irqs_masked();
         let mut rounds = 0u32;
-        while !masked && rounds < COMP_RERUN_MAX && COMP_PENDING.swap(false, AcqRel) {
+        while !masked && rounds < COMP_RERUN_MAX && !(COMP_PENDING.load(Acquire) && crate::video::lag::input_first()) && COMP_PENDING.swap(false, AcqRel) { // INPUTSTALL M3 (B375): the render task does not re-run folded presents while a key or press waits for it — the damage stays on the table (same-line fold).
             let dmg = any_damaged();
             let owed = deferred_owed();
             // MENU-DRIVE / REVIEW — the SHARD menu is a third thing a declined pass can owe, and one
@@ -5074,7 +5074,7 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
         // …and a masked holder does not take this pass either (review condition 1): it is the
         // fourth composite the arithmetic above accounts for. `COMP_PENDING` remains set for an
         // unmasked holder or `service_damage` to service.
-        if !masked
+        if !masked && !(COMP_PENDING.load(Acquire) && crate::video::lag::input_first()) // INPUTSTALL M3 (B375): nor re-acquire for them (same-line fold).
             && COMP_PENDING.load(Acquire)
             && COMP_GATE
                 .compare_exchange(false, true, AcqRel, Relaxed)
@@ -30187,4 +30187,18 @@ const _: () = { let m = crate::ui::Metrics::at(crate::video::dpi::S2_MAX, 0); as
 #[cfg(feature = "witness")]
 fn fix_pin_w() -> usize {
     FIX_W.max(CLUSTER_MIN_SRC_W())
+}
+
+/// INPUTSTALL M1 (rmbp-ledger B375): the WC-D valve as `[lag] stall … valve=` names it — `closed` while the
+/// valve suppresses admissions, `open` otherwise, `none` on a build without the valve (`witness` + `wcdvalve`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn inputstall_valve() -> &'static str {
+    #[cfg(all(feature = "witness", feature = "wcdvalve"))]
+    {
+        if WCDVALVE_SHUT.load(core::sync::atomic::Ordering::Relaxed) { "closed" } else { "open" }
+    }
+    #[cfg(not(all(feature = "witness", feature = "wcdvalve")))]
+    {
+        "none"
+    }
 }

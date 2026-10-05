@@ -1501,6 +1501,24 @@ fn art_waited(tw: u32) {
 #[inline(always)]
 fn art_waited(_tw: u32) {}
 
+/// INPUTSTALL (rmbp-ledger B375): note one presented frame to the kernel — `SYS_PROF(OP_NOTE, NOTE_FRAME,
+/// stranded)` — so `[lag] stall … strand=<s>/<frames>` and `:: INPUTSTALL: … strand_pct=` line the vug's own
+/// strand count up beside the compositor's and the input queue's columns. `stranded` = `A_STRAND_MIXED`
+/// moved since the previous note (one `art_strand` hit per frame at most). A kernel without the op answers
+/// `-22` and nothing else happens.
+#[cfg(target_arch = "x86_64")]
+fn frame_note() {
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let s = A_STRAND_MIXED.load(Ordering::Relaxed);
+    let stranded = SEEN.swap(s, Ordering::Relaxed) != s;
+    unsafe {
+        sys3(una_abi::SYS_PROF, una_abi::prof::OP_NOTE, una_abi::prof::NOTE_FRAME, stranded as u64);
+    }
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn frame_note() {}
+
 /// VUGART: one mixed frame — extend the streak (latching its max) and latch the worst frame's rows.
 #[cfg(target_arch = "x86_64")]
 fn art_streak(bad: u32) {
@@ -3832,6 +3850,7 @@ pub extern "C" fn _start() -> ! {
             }
         }
         art_waited(tw);
+        frame_note(); // INPUTSTALL (B375): this frame, and whether it stranded, to the kernel's stall line
 
         // --- VUGFPS: measure, refresh once per second, draw (desktop/interactive only) ---
         // CLICK-PLAIN: the click counter rides the same gate, the same band and the same self-erasing

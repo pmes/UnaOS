@@ -83,6 +83,9 @@ struct Slot {
     /// The ring's tail just after this event (ring-3 only).
     seq: AtomicU32,
     t: [AtomicU64; 6],
+    /// INPUTSTALL M1: a kernel surface's present REQUEST (`wm::present`) inside the `comp` stage — splits it
+    /// into `draw=` (the handler painting) and `pre=` (the present path up to the pass). 0 = none.
+    req: AtomicU64,
 }
 
 impl Slot {
@@ -93,6 +96,7 @@ impl Slot {
             ring: AtomicU8::new(0),
             seq: AtomicU32::new(0),
             t: [const { AtomicU64::new(0) }; 6],
+            req: AtomicU64::new(0),
         }
     }
     /// Move `from` → `to`, stamping every stage passed through with `now`. False if the slot moved on.
@@ -186,11 +190,14 @@ pub fn on_enqueue(ev: &Event) {
         return;
     }
     let Some((c, kind)) = class_of(ev) else { return };
+    let now = now_us();
+    pend_enqueued(now); // INPUTSTALL M3: one more key/press waits for the render task
     let s = &SLOTS[c];
     if s.stage.compare_exchange(IDLE, ISR, AcqRel, Relaxed).is_ok() {
         s.kind.store(kind, Relaxed);
         s.ring.store(0, Relaxed);
-        s.t[0].store(now_us(), Release);
+        s.req.store(0, Relaxed);
+        s.t[0].store(now, Release);
     } else {
         COALESCED.fetch_add(1, Relaxed);
     }
@@ -199,22 +206,33 @@ pub fn on_enqueue(ev: &Event) {
 /// The router's guard (`wc_route_event`): the event is off the ring (`queue` ends) and, when the guard
 /// drops without a ring-3 delivery or a launch having claimed it, a kernel surface consumed it (`wm` and
 /// `app` end together).
-pub struct RouteGuard(Option<usize>);
+/// INPUTSTALL M1: `.1` is the route's entry stamp, `.2` whether it runs on the render task.
+pub struct RouteGuard(Option<usize>, u64, bool);
 
 pub fn route(ev: &Event) -> RouteGuard {
     if !ON {
-        return RouteGuard(None);
+        return RouteGuard(None, 0, false);
+    }
+    let now = now_us();
+    let r = render_here();
+    if r {
+        render_entry(now); // INPUTSTALL M1: the previous event's handler ended here
     }
     let Some((c, _)) = class_of(ev) else {
-        return RouteGuard(None);
+        return RouteGuard(None, now, r);
     };
-    if SLOTS[c].advance(ISR, QUEUE, now_us()) { RouteGuard(Some(c)) } else { RouteGuard(None) }
+    pend_routed(); // INPUTSTALL M3: a key/press left the queue
+    if SLOTS[c].advance(ISR, QUEUE, now) { RouteGuard(Some(c), now, r) } else { RouteGuard(None, now, r) }
 }
 
 impl Drop for RouteGuard {
     fn drop(&mut self) {
+        let now = now_us();
         if let Some(c) = self.0 {
-            let _ = SLOTS[c].advance(QUEUE, APP, now_us());
+            let _ = SLOTS[c].advance(QUEUE, APP, now);
+        }
+        if self.2 {
+            render_route_done(self.1, now); // INPUTSTALL M1
         }
         if ON {
             flush(crate::arch::ms());
@@ -307,18 +325,25 @@ pub fn menu_opened() {
 
 /// The composite pass's guard (`wm::composite`): at entry a kernel-surface event that its consumer has
 /// taken is drawing (`comp` ends); at exit every event that drew is on the glass (`present` ends).
-pub struct PassGuard;
+/// INPUTSTALL M1: `.0` is the pass's entry stamp, `.1` whether it runs on the render task.
+pub struct PassGuard(u64, bool);
 
 pub fn pass() -> PassGuard {
     if ON {
         let now = now_us();
+        crate::video::beam::pass_begin(); // INPUTSTALL M2: this pass's one frame of beam wait starts here
+        let r = render_here();
+        if r {
+            render_entry(now);
+        }
         for s in &SLOTS {
             if s.stage.load(Acquire) == APP && s.ring.load(Relaxed) == 0 {
                 let _ = s.advance(APP, COMP, now);
             }
         }
+        return PassGuard(now, r);
     }
-    PassGuard
+    PassGuard(0, false)
 }
 
 impl Drop for PassGuard {
@@ -327,6 +352,7 @@ impl Drop for PassGuard {
             return;
         }
         let now = now_us();
+        sec_pass(self.0, now, self.1); // INPUTSTALL M1
         for s in &SLOTS {
             if s.stage.compare_exchange(COMP, IDLE, AcqRel, Relaxed).is_ok() {
                 s.t[5].store(now, Relaxed);
@@ -383,6 +409,13 @@ fn finish(s: &Slot, timeout_at: Option<u8>) {
         Some(st) => (split(&t, (st as usize).saturating_sub(1)), now_us().saturating_sub(t[0])),
     };
     if timeout_at.is_none() {
+        let req = s.req.load(Relaxed);
+        let split_comp = if s.ring.load(Relaxed) == 0 && req >= t[3] && req <= t[4] && req != 0 {
+            Some((req - t[3], t[4] - req))
+        } else {
+            None
+        };
+        sec_event(kind, &d, split_comp); // INPUTSTALL M1
         match SPAN.try_lock() {
             Some(mut sp) => {
                 let ms = (total_us / 1000) as u32;
@@ -422,6 +455,7 @@ fn ms_str(us: u64) -> alloc::string::String {
 /// Print the owed per-event lines, expire stuck events, and roll the span up every [`SPAN_MS`].
 /// Unmasked contexts only (the router guard, the composite guard with IRQs on).
 fn flush(now_ms: u64) {
+    sec_roll(now_ms); // INPUTSTALL M1/M4: the per-second stall line and the per-minute witness
     // Expiry.
     for s in &SLOTS {
         let st = s.stage.load(Acquire);
@@ -503,4 +537,328 @@ pub fn percentiles(v: &mut [u32]) -> (u32, u32) {
     v.sort_unstable();
     let n = v.len();
     (v[(n - 1) / 2], v[((n * 95).div_ceil(100)).saturating_sub(1).min(n - 1)])
+}
+
+// ── INPUTSTALL (rmbp-ledger B375; R88 + VUGFITS, flight 23) ─────────────────────────────────────
+//
+// Flight 23 printed the three symptoms on three different lines that nobody could line up: `[lag]` (one
+// event's stages), `:: BEAMHOLD:` (every 1024 bands) and the vug's `:: VUGART: … strand=` (ring 3, per
+// rollup). This section puts them on ONE line per second, only for a second in which something exceeded
+// [`STALL_MS`]:
+//
+// `[lag] stall at_ms= span_ms= stage=<queue|wm|app|comp|present|hid> stage_ms= queue= wm= app= comp=
+//  present= draw= pre= render=<route|handler|composite> render_ms= passes= pass_ms_max= rows= full=
+//  beam_ms= beam_max_ms= capped= yielded= valve= hid_gap_ms= strand=<stranded>/<frames>`
+//
+// * the five stage columns are the max over the events that finished in the second, AND the age of any
+//   event still in flight at the roll (a keystroke sitting in the queue is charged while it sits);
+// * `draw=`/`pre=` split a kernel surface's `comp` at its present REQUEST (`wm::present`): the handler
+//   painting vs the present path up to the pass — `-` when the surface drew without asking;
+// * `render=` is what the RENDER TASK (the single consumer of the input channel) spent longest on: routing
+//   an event, running the consumer's handler after the route, or a composite pass (which includes the
+//   re-runs it did for presents that folded behind it);
+// * `passes=`/`pass_ms_max=` every composite pass on every core; `rows=`/`full=` the panel rows the beam
+//   brackets covered and how many brackets were full-panel (≥ 90 % of the rows) — the dirty-rect area the
+//   brief asked `comp=` to be measured against; `beam_ms=`/`beam_max_ms=`/`capped=` the beam spin;
+// * `yielded=` the re-runs the render task declined because input was waiting (M3);
+// * `valve=` the WC-D valve (`open`, `closed`, `none` where the valve is not built);
+// * `hid_gap_ms=` the longest gap between two EHCI HID service passes (the pump sleeps one ~4 ms tick);
+// * `strand=` the vug's own count, reported through `SYS_PROF(OP_NOTE)` once per frame.
+//
+// Once a minute in which any input event finished: `:: INPUTSTALL: key_queue_max_ms= comp_max_ms=
+// hid_gap_max_ms= strand_pct= bound=50 -> PASS|FAIL ::` — PASS iff the three ms are ≤ 50 and
+// `strand_pct` ≤ [`STRAND_PCT_BOUND`]. R80: a reading of the live path, never a test; an idle minute
+// prints nothing.
+//
+// HONEST LIMIT: a press a kernel surface consumes WITHOUT drawing (the login's `control=none`) is still
+// charged `comp` until the next unrelated pass — the instrument cannot know the handler chose not to draw.
+
+/// A stage, render phase or HID gap at or over this is a stall second.
+pub const STALL_MS: u64 = 50;
+/// The witness's strand bound, in percent of the vug frames in the minute.
+pub const STRAND_PCT_BOUND: u64 = 1;
+const SEC_MS: u64 = 1_000;
+const MIN_MS: u64 = 60_000;
+/// Stall lines are bounded: the first 600, then one in 64.
+const STALL_LINES_FREE: u32 = 600;
+
+static SEC_T0_MS: AtomicU64 = AtomicU64::new(0);
+static SEC_STAGE_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static SEC_DRAW_US: AtomicU64 = AtomicU64::new(0);
+static SEC_PRE_US: AtomicU64 = AtomicU64::new(0);
+static SEC_SPLIT: AtomicU32 = AtomicU32::new(0);
+static SEC_PASSES: AtomicU32 = AtomicU32::new(0);
+static SEC_PASS_MAX_US: AtomicU64 = AtomicU64::new(0);
+static SEC_R_ROUTE_US: AtomicU64 = AtomicU64::new(0);
+static SEC_R_HANDLER_US: AtomicU64 = AtomicU64::new(0);
+static SEC_R_COMP_US: AtomicU64 = AtomicU64::new(0);
+static SEC_HID_MS: AtomicU64 = AtomicU64::new(0);
+static SEC_FRAMES: AtomicU32 = AtomicU32::new(0);
+static SEC_STRANDS: AtomicU32 = AtomicU32::new(0);
+static SEC_YIELDS: AtomicU32 = AtomicU32::new(0);
+static STALL_LINES: AtomicU32 = AtomicU32::new(0);
+
+static MIN_T0_MS: AtomicU64 = AtomicU64::new(0);
+static MIN_EVENTS: AtomicU32 = AtomicU32::new(0);
+static MIN_KEYQ_US: AtomicU64 = AtomicU64::new(0);
+static MIN_COMP_US: AtomicU64 = AtomicU64::new(0);
+static MIN_HID_MS: AtomicU64 = AtomicU64::new(0);
+static MIN_FRAMES: AtomicU32 = AtomicU32::new(0);
+static MIN_STRANDS: AtomicU32 = AtomicU32::new(0);
+
+/// The render task's last route exit (0 = none open): the start of the consumer's handler.
+static RENDER_EXIT_US: AtomicU64 = AtomicU64::new(0);
+/// M3: keys/presses pushed into `pal` and not yet routed, and when the last one was pushed.
+static PEND: AtomicU32 = AtomicU32::new(0);
+static PEND_LAST_US: AtomicU64 = AtomicU64::new(0);
+
+/// Is this the render task — the one consumer of the GUI input channel (`render`, or its re-homed twin)?
+#[inline]
+fn render_here() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        matches!(crate::arch::sched::current_name(), Some(n) if n.starts_with("render"))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// The render task started something new (a route, a pass) or parked: the handler interval closes.
+fn render_entry(now: u64) {
+    let ex = RENDER_EXIT_US.swap(0, Relaxed);
+    if ex != 0 && now > ex {
+        SEC_R_HANDLER_US.fetch_max(now - ex, Relaxed);
+    }
+}
+
+fn render_route_done(t0: u64, now: u64) {
+    SEC_R_ROUTE_US.fetch_max(now.saturating_sub(t0), Relaxed);
+    RENDER_EXIT_US.store(now, Relaxed);
+}
+
+/// The render task is about to park on the input channel (`gui_recv_blocking_x86`): whatever it was doing
+/// since its last route ends here, and the park itself is not a stall.
+pub fn render_idle() {
+    if ON {
+        render_entry(now_us());
+    }
+}
+
+fn sec_pass(t0: u64, now: u64, render: bool) {
+    let d = now.saturating_sub(t0);
+    SEC_PASSES.fetch_add(1, Relaxed);
+    SEC_PASS_MAX_US.fetch_max(d, Relaxed);
+    if render {
+        SEC_R_COMP_US.fetch_max(d, Relaxed);
+    }
+}
+
+fn sec_event(kind: u8, d: &[u64; 5], split: Option<(u64, u64)>) {
+    for (k, v) in d.iter().enumerate() {
+        SEC_STAGE_US[k].fetch_max(*v, Relaxed);
+    }
+    if let Some((a, b)) = split {
+        SEC_DRAW_US.fetch_max(a, Relaxed);
+        SEC_PRE_US.fetch_max(b, Relaxed);
+        SEC_SPLIT.fetch_add(1, Relaxed);
+    }
+    MIN_EVENTS.fetch_add(1, Relaxed);
+    if kind == K_KEY {
+        MIN_KEYQ_US.fetch_max(d[0], Relaxed);
+    }
+    MIN_COMP_US.fetch_max(d[3], Relaxed);
+}
+
+/// `wm::present` — a kernel surface asked for its pass. The first request inside an event's `comp`
+/// stage is the split point (`draw=` before it, `pre=` after it).
+pub fn present_req() {
+    if !ON {
+        return;
+    }
+    let mut now = 0;
+    for s in &SLOTS {
+        if s.stage.load(Acquire) == APP && s.ring.load(Relaxed) == 0 {
+            if now == 0 {
+                now = now_us();
+            }
+            let _ = s.req.compare_exchange(0, now, Relaxed, Relaxed);
+        }
+    }
+}
+
+/// `boot::hid_pass` — the gap since the previous EHCI HID service pass, in ms.
+pub fn hid_gap(ms: u64) {
+    if ON {
+        SEC_HID_MS.fetch_max(ms, Relaxed);
+        MIN_HID_MS.fetch_max(ms, Relaxed);
+    }
+}
+
+/// `SYS_PROF(OP_NOTE, kind, value)` — a program's own frame note. `NOTE_FRAME`: one presented frame,
+/// `value != 0` when the frame stranded (the vug's `strand=`).
+pub fn app_note(kind: u64, value: u64) {
+    if !ON {
+        return;
+    }
+    if kind == una_abi::prof::NOTE_FRAME {
+        SEC_FRAMES.fetch_add(1, Relaxed);
+        MIN_FRAMES.fetch_add(1, Relaxed);
+        if value != 0 {
+            SEC_STRANDS.fetch_add(1, Relaxed);
+            MIN_STRANDS.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+fn pend_enqueued(now: u64) {
+    PEND.fetch_add(1, Relaxed);
+    PEND_LAST_US.store(now, Relaxed);
+}
+
+fn pend_routed() {
+    let mut v = PEND.load(Relaxed);
+    while v != 0 {
+        match PEND.compare_exchange_weak(v, v - 1, Relaxed, Relaxed) {
+            Ok(_) => return,
+            Err(now) => v = now,
+        }
+    }
+}
+
+/// INPUTSTALL M3 — **INPUT FIRST.** Asked by `wm::composite`'s gate holder before each re-run it would do
+/// for presents that folded behind it: `true` when the holder is the RENDER TASK and a key or press is
+/// waiting for it, i.e. the re-run would hold the operator's input behind somebody else's frame. The holder
+/// then leaves the damage on the table (`COMP_PENDING` stays set) and returns to drain; the render task's own
+/// burst present, or the folding program's next present, takes it. A count the queue lost track of (an event
+/// popped by a full-screen loop's own pump, never routed) expires with the [`TIMEOUT_MS`] bound.
+pub fn input_first() -> bool {
+    if !ON || PEND.load(Relaxed) == 0 || !render_here() {
+        return false;
+    }
+    let now = now_us();
+    if now.saturating_sub(PEND_LAST_US.load(Relaxed)) > TIMEOUT_MS * 1000 {
+        PEND.store(0, Relaxed);
+        return false;
+    }
+    SEC_YIELDS.fetch_add(1, Relaxed);
+    true
+}
+
+/// The WC-D valve, as the stall line names it.
+fn valve_word() -> &'static str {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        crate::video::wm::inputstall_valve()
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        "none"
+    }
+}
+
+/// Roll the second (and the minute). Unmasked contexts only — called from [`flush`].
+fn sec_roll(now_ms: u64) {
+    let t0 = SEC_T0_MS.load(Relaxed);
+    if t0 == 0 {
+        let _ = SEC_T0_MS.compare_exchange(0, now_ms, Relaxed, Relaxed);
+        let _ = MIN_T0_MS.compare_exchange(0, now_ms, Relaxed, Relaxed);
+        return;
+    }
+    if now_ms < t0 + SEC_MS || SEC_T0_MS.compare_exchange(t0, now_ms, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let nu = now_us();
+    let mut st = [0u64; 5];
+    for (k, v) in st.iter_mut().enumerate() {
+        *v = SEC_STAGE_US[k].swap(0, Relaxed);
+    }
+    // An event still in flight is charged its age in the stage it is in.
+    for (c, s) in SLOTS.iter().enumerate() {
+        let stg = s.stage.load(Acquire);
+        if stg == IDLE {
+            continue;
+        }
+        let i = (stg - 1) as usize;
+        if i < 5 {
+            let since = s.t[i].load(Relaxed);
+            if since != 0 && nu > since {
+                st[i] = st[i].max(nu - since);
+                if i == 0 && c == C_KEY {
+                    MIN_KEYQ_US.fetch_max(nu - since, Relaxed);
+                }
+            }
+        }
+    }
+    let draw = SEC_DRAW_US.swap(0, Relaxed);
+    let pre = SEC_PRE_US.swap(0, Relaxed);
+    let split = SEC_SPLIT.swap(0, Relaxed);
+    let passes = SEC_PASSES.swap(0, Relaxed);
+    let pass_max = SEC_PASS_MAX_US.swap(0, Relaxed);
+    let r = [SEC_R_ROUTE_US.swap(0, Relaxed), SEC_R_HANDLER_US.swap(0, Relaxed), SEC_R_COMP_US.swap(0, Relaxed)];
+    let hid = SEC_HID_MS.swap(0, Relaxed);
+    let frames = SEC_FRAMES.swap(0, Relaxed);
+    let strands = SEC_STRANDS.swap(0, Relaxed);
+    let yields = SEC_YIELDS.swap(0, Relaxed);
+    let beam = crate::video::beam::sec_take();
+    let mut w = worst(&st);
+    let mut w_ms = st[w] / 1000;
+    let mut w_name = STAGES[w];
+    if hid > w_ms {
+        w_ms = hid;
+        w_name = "hid";
+        w = 5;
+    }
+    let _ = w;
+    let rw = if r[0] >= r[1] && r[0] >= r[2] { 0 } else if r[1] >= r[2] { 1 } else { 2 };
+    let stall = w_ms >= STALL_MS || r[rw] / 1000 >= STALL_MS;
+    if stall {
+        let n = STALL_LINES.fetch_add(1, Relaxed);
+        if n < STALL_LINES_FREE || n % 64 == 0 {
+            let (dw, pr) = if split == 0 {
+                (alloc::string::String::from("-"), alloc::string::String::from("-"))
+            } else {
+                (ms_str(draw), ms_str(pre))
+            };
+            serial_println!(
+                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{}",
+                t0, now_ms.saturating_sub(t0), w_name, w_ms,
+                ms_str(st[0]), ms_str(st[1]), ms_str(st[2]), ms_str(st[3]), ms_str(st[4]), dw, pr,
+                ["route", "handler", "composite"][rw], ms_str(r[rw]),
+                passes, ms_str(pass_max), beam[3], beam[4], beam[0] / 1000, ms_str(beam[1]), beam[5], yields,
+                valve_word(), hid, strands, frames
+            );
+        }
+    }
+    // The minute.
+    let m0 = MIN_T0_MS.load(Relaxed);
+    if now_ms < m0 + MIN_MS || MIN_T0_MS.compare_exchange(m0, now_ms, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let ev = MIN_EVENTS.swap(0, Relaxed);
+    let kq = MIN_KEYQ_US.swap(0, Relaxed) / 1000;
+    let cm = MIN_COMP_US.swap(0, Relaxed) / 1000;
+    let hg = MIN_HID_MS.swap(0, Relaxed);
+    let fr = MIN_FRAMES.swap(0, Relaxed) as u64;
+    let sd = MIN_STRANDS.swap(0, Relaxed) as u64;
+    if ev == 0 {
+        return;
+    }
+    let pct = strand_pct(sd, fr);
+    serial_println!(
+        ":: INPUTSTALL: key_queue_max_ms={} comp_max_ms={} hid_gap_max_ms={} strand_pct={} bound={} -> {} :: events={} frames={} strands={} strand_bound_pct={} span={}s",
+        kq, cm, hg, pct, STALL_MS, if verdict(kq, cm, hg, pct) { "PASS" } else { "FAIL" },
+        ev, fr, sd, STRAND_PCT_BOUND, now_ms.saturating_sub(m0) / 1000
+    );
+}
+
+/// Stranded frames as a whole percent of the frames noted (0 for none). Pure.
+pub fn strand_pct(strands: u64, frames: u64) -> u64 {
+    if frames == 0 { 0 } else { strands.saturating_mul(100) / frames }
+}
+
+/// The INPUTSTALL verdict over one minute's maxima. Pure.
+pub fn verdict(key_queue_ms: u64, comp_ms: u64, hid_gap_ms: u64, strand_pct: u64) -> bool {
+    key_queue_ms <= STALL_MS && comp_ms <= STALL_MS && hid_gap_ms <= STALL_MS && strand_pct <= STRAND_PCT_BOUND
 }

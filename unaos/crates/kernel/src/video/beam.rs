@@ -134,6 +134,12 @@ pub struct Hold {
     gaveup: bool,
     record: bool,
     t_open: u64,
+    /// INPUTSTALL M2: the spin stopped because this pass's one frame of beam wait was spent (not a give-up).
+    #[allow(dead_code)]
+    capped: bool,
+    /// INPUTSTALL M1: the bracket covered at least 90 % of the panel's rows (a full-panel present).
+    #[allow(dead_code)]
+    full: bool,
 }
 
 /// One present's beam observation, as the witnesses read it. Off-knob `take_last` never yields
@@ -260,6 +266,15 @@ pub fn hold(y0: usize, y1: usize, panel_h: usize, slow: bool, record: bool) -> O
     let b = y1 % vt;
     let t0 = crate::arch::now_cycles();
     let budget = us_to_cycles(GIVEUP_FRAMES * FRAME_US);
+    // INPUTSTALL M2 (B375): the spin may use only what is left of THIS PASS's one frame — every band of
+    // every window, the strip and the fills of one `wm::composite` share it. `cap_tight` = the pass budget
+    // is the binding one, so running out of it is `capped`, not `gaveup` (the raster did move).
+    #[cfg(target_arch = "x86_64")]
+    let (budget, cap_tight) = pass_cap(t0, budget);
+    #[cfg(not(target_arch = "x86_64"))]
+    let cap_tight = false;
+    let mut capped = false;
+    let full = span.saturating_mul(10) >= (panel_h as u32).saturating_mul(9);
     let mut v = v0.min(vt - 1);
     let mut gaveup = false;
     // ── KVBLANK rung 2 (`kvblank-wait`) — THE WAIT ARM, BESIDE THE SPIN ───────────────────────
@@ -310,7 +325,11 @@ pub fn hold(y0: usize, y1: usize, panel_h: usize, slow: bool, record: bool) -> O
     }
     while in_zone(v, a, b) {
         if crate::arch::now_cycles().saturating_sub(t0) > budget {
-            gaveup = true;
+            if cap_tight {
+                capped = true;
+            } else {
+                gaveup = true;
+            }
             break;
         }
         core::hint::spin_loop();
@@ -323,6 +342,8 @@ pub fn hold(y0: usize, y1: usize, panel_h: usize, slow: bool, record: bool) -> O
         }
     }
     let t1 = crate::arch::now_cycles();
+    #[cfg(target_arch = "x86_64")]
+    pass_spend(t1.saturating_sub(t0));
     Some(Hold {
         y0,
         y1,
@@ -332,6 +353,8 @@ pub fn hold(y0: usize, y1: usize, panel_h: usize, slow: bool, record: bool) -> O
         gaveup,
         record,
         t_open: t1,
+        capped,
+        full,
     })
 }
 
@@ -389,6 +412,8 @@ pub fn settle(h: Option<Hold>) -> Option<Obs> {
     }
     #[cfg(target_arch = "x86_64")]
     census(waited_us, h.gaveup);
+    #[cfg(target_arch = "x86_64")]
+    sec_note(waited_us, h.y1 - h.y0, h.full, h.capped); // INPUTSTALL M1/M2
     Some(obs)
 }
 
@@ -429,8 +454,8 @@ fn census(waited_us: u32, gaveup: bool) {
             h, us, g, n, FETCH_LINES
         );
         serial_println!(
-            ":: BEAMHOLD: holds={} held_us={} gaveup={} bands={} -> {} ::",
-            h, us, g, n, if g == 0 { "PASS" } else { "FAIL" }
+            ":: BEAMHOLD: holds={} held_us={} gaveup={} bands={} capped={} -> {} ::",
+            h, us, g, n, C_CAPPED.load(Ordering::Relaxed), if g == 0 { "PASS" } else { "FAIL" }
         );
     }
 }
@@ -496,4 +521,89 @@ pub fn settle(_h: Option<Hold>) -> Option<Obs> {
 #[inline(always)]
 pub fn take_last() -> Option<Obs> {
     None
+}
+
+// ── INPUTSTALL (rmbp-ledger B375): one frame of beam wait per pass, and the per-second census ─────────
+//
+// FLIGHT 23: `:: BEAMHOLD: holds=600 held_us=3324041 gaveup=1 -> FAIL` — 5.5 ms per hold, and the hold is
+// per BAND with a TWO-frame budget each, so one banded present could spin several frames inside
+// `COMP_GATE`, IRQ-masked on a ring-3 present's core. A core spinning masked dispatches nothing, and a vug
+// worker released onto it misses the parent's barrier: one frame in nine `strand=`. THE FIX: a composite
+// pass (`wm::composite` → `lag::pass` → [`pass_begin`]) owns ONE frame of beam wait on its core, shared by
+// every bracket it opens; once spent, the remaining brackets of the pass present unheld and are counted
+// `capped=` (the tear they risk is the one `torn=` still observes). A bracket opened outside any pass (a
+// furniture vacate, a direct fill) gets the same budget per two-frame window on its core.
+//
+// x86 only: the Orin's present path (the module's origin) is untouched until it is flown with this.
+
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+static PB_T0: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+static PB_SPENT: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+static C_CAPPED: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+static SEC: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// A composite pass starts on this core: its frame of beam wait is whole again.
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+pub fn pass_begin() {
+    let i = slot();
+    PB_T0[i].store(crate::arch::now_cycles(), Ordering::Relaxed);
+    PB_SPENT[i].store(0, Ordering::Relaxed);
+}
+
+#[cfg(not(all(feature = "beam", target_arch = "x86_64")))]
+#[inline(always)]
+pub fn pass_begin() {}
+
+/// `(budget, tight)`: the spin budget left to this core's pass, and whether it binds below `budget`.
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+fn pass_cap(now: u64, budget: u64) -> (u64, bool) {
+    let i = slot();
+    let frame = us_to_cycles(FRAME_US);
+    if now.saturating_sub(PB_T0[i].load(Ordering::Relaxed)) > frame.saturating_mul(2) {
+        // No pass opened on this core lately: a bracket outside a pass gets a fresh window.
+        PB_T0[i].store(now, Ordering::Relaxed);
+        PB_SPENT[i].store(0, Ordering::Relaxed);
+    }
+    let left = frame.saturating_sub(PB_SPENT[i].load(Ordering::Relaxed));
+    if left < budget { (left, true) } else { (budget, false) }
+}
+
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+fn pass_spend(cyc: u64) {
+    PB_SPENT[slot()].fetch_add(cyc, Ordering::Relaxed);
+}
+
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+fn sec_note(waited_us: u32, rows: u32, full: bool, capped: bool) {
+    SEC[0].fetch_add(waited_us as u64, Ordering::Relaxed);
+    SEC[1].fetch_max(waited_us as u64, Ordering::Relaxed);
+    SEC[2].fetch_add(1, Ordering::Relaxed);
+    SEC[3].fetch_add(rows as u64, Ordering::Relaxed);
+    if full {
+        SEC[4].fetch_add(1, Ordering::Relaxed);
+    }
+    if capped {
+        SEC[5].fetch_add(1, Ordering::Relaxed);
+        C_CAPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The second's beam census, taken and cleared by `lag`'s stall roll:
+/// `[held_us, max_wait_us, brackets, rows, full_panel_brackets, capped]`.
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+pub fn sec_take() -> [u64; 6] {
+    let mut o = [0u64; 6];
+    for (k, v) in o.iter_mut().enumerate() {
+        *v = SEC[k].swap(0, Ordering::Relaxed);
+    }
+    o
+}
+
+#[cfg(not(all(feature = "beam", target_arch = "x86_64")))]
+#[inline(always)]
+pub fn sec_take() -> [u64; 6] {
+    [0; 6]
 }

@@ -1525,6 +1525,13 @@ pub mod prof {
     pub const OP_READ: u64 = 2;
     /// The caller's sample count in the current (or last) run.
     pub const OP_STATUS: u64 = 3;
+    /// INPUTSTALL (rmbp-ledger B375): a program NOTES one of its own events to the kernel's instrument —
+    /// `SYS_PROF(OP_NOTE, kind, value)`, returns 0 (`-22` for an unknown kind). The kernel lines the note up
+    /// beside its own stall columns (`[lag] stall … strand=`); nothing is stored per program.
+    pub const OP_NOTE: u64 = 4;
+    /// `OP_NOTE` kind: one presented frame; `value != 0` when the frame stranded (a worker band released and
+    /// not started inside the barrier's yield budget — the vug's `strand=`).
+    pub const NOTE_FRAME: u64 = 1;
     /// Records one `OP_READ` copies at most.
     pub const READ_MAX: usize = 512;
     /// Bytes of one [`Sample`] on the wire.

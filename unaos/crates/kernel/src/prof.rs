@@ -1039,6 +1039,11 @@ pub fn sys_prof(op: u64, buf: u64, len: u64, copy: impl FnOnce(u64, &[u8]) -> bo
             if copy(buf, &bytes) { recs.len() as i64 } else { -14 }
         }
         p::OP_STATUS => own_records(me, usize::MAX).len() as i64,
+        // INPUTSTALL M1 (B375): a program's own frame note, lined up on the `[lag] stall` line.
+        p::OP_NOTE if buf == p::NOTE_FRAME => {
+            crate::video::lag::app_note(buf, len);
+            0
+        }
         _ => -22,
     }
 }
