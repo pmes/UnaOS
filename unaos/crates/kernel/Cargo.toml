@@ -3813,6 +3813,9 @@ diag_core = { path = "../../libs/sys/diag_core", optional = true }
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).
 amber_core = { path = "../../libs/sys/amber_core", default-features = false }
+# STORMFAULT (rmbp-ledger B351, R79): the ring-3 ELF segment plan — bss tails, PT_GNU_STACK, the args page,
+# the window edge, and the fault line's seg= classifier — the SAME crate the host tests link. no_std, zero deps.
+elf_core = { path = "../../libs/sys/elf_core" }
 # CRYPTOCORE (LEDGER SR27): the cryptographic primitives UnaOS owns — `hash.rs` re-exports its SHA-256 /
 # HMAC-SHA256 / PBKDF2 (moved there from hash.rs). no_std, no alloc needed, zero deps; arch-neutral.
 crypto_core = { path = "../../libs/sys/crypto_core" }

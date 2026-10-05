@@ -81,6 +81,10 @@ name = "diag_core"
 version = "0.1.0"
 
 [[package]]
+name = "elf_core"
+version = "0.1.0"
+
+[[package]]
 name = "fatfs"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -453,6 +457,7 @@ dependencies = [
  "cfg-if",
  "crypto_core",
  "diag_core",
+ "elf_core",
  "fdt",
  "font8x8",
  "lazy_static",
