@@ -17,11 +17,10 @@
 use crate::hash::{FnvHasher, hash_bytes};
 use crate::inode::AttributeValue;
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
 
 /// An entry in the Attribute Catalog.
 /// Maps a (Key, Value) pair to an Inode ID.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Copy)]
+#[derive(Debug, Clone, PartialEq, Copy)]
 pub struct CatalogEntry {
     pub key_hash: u64,
     pub val_hash: u64,

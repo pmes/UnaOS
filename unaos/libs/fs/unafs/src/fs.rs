@@ -54,7 +54,6 @@ use crate::superblock::{
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::catalog::hash_value;
@@ -125,7 +124,7 @@ pub enum FileSystemError {
 }
 
 /// A directory entry pointing to an inode (by stable LOGICAL id).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub struct DirEntry {
     pub name: String,
     pub inode_id: u64,
@@ -150,7 +149,7 @@ pub struct BatchFile {
 /// One retained root in the snapshot index (K8b populates these; the on-disk
 /// object exists — empty — from format time, so retention is a code change,
 /// never a format migration).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotEntry {
     /// The commit generation this snapshot retains.
     pub generation: u64,
@@ -183,7 +182,7 @@ impl SnapshotEntry {
 /// dropping call returns / before a mount completes); background mode later
 /// is the same queue drained by a worker. Crash-safe: the whole drain is one
 /// commit, so a power cut mid-drain resumes from the full queue on next mount.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReclaimEntry {
     /// The dropped root's generation (provenance).
     pub generation: u64,
@@ -1116,7 +1115,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// writes the indirect blocks as a side effect (they join the transaction).
     fn encode_inode_block(&mut self, inode: &Inode) -> Result<Vec<u8>, FileSystemError> {
         // v6: the meta trailer (parent, name, times) rides right after the
-        // inode's unchanged bincode bytes. v3–v5: no trailer, bytes as before.
+        // inode's unchanged §R6 record bytes. v3–v5: no trailer, bytes as before.
         let meta = if self.superblock.indexed() {
             inode.meta_bytes()
         } else {

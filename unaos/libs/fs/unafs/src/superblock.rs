@@ -26,7 +26,6 @@
 
 use crate::storage::{BLOCK_SIZE, Error as StorageError};
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// The Magic Number for UnaFS: "UNAFS" in ASCII.
@@ -56,8 +55,8 @@ pub const MAGIC: [u8; 5] = *b"UNAFS";
 ///   (equality + ordered, [`crate::index`]) named by a 40 B catalog record in
 ///   the catalog inode's data, instead of one flat list rewritten whole; and
 ///   every inode block carries a META TRAILER (parent id, name, ctime, mtime,
-///   atime — [`crate::inode::INODE_META_MAGIC`]) after its unchanged bincode
-///   bytes. INCOMPAT for the same reason as v4/v5: a pre-v6 reader would parse
+///   atime — [`crate::inode::INODE_META_MAGIC`]) after its unchanged §R6
+///   record bytes. INCOMPAT for the same reason as v4/v5: a pre-v6 reader would parse
 ///   the catalog record as a flat list. v3–v5 volumes still mount read/write
 ///   on the flat catalog they were written with; `tools/unafs migrate` replays
 ///   one into a fresh v6 image ([`crate::legacy::migrate_k8_into`]).
@@ -157,7 +156,7 @@ pub enum SuperblockError {
 /// The Superblock resides at Block 0 and identifies the volume. Static: every
 /// field is fixed at format time (BEFS-HARDEN validation still applies — the
 /// volume is untrusted input and `block_count` bounds every later access).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Superblock {
     /// Magic number to identify the filesystem.
     pub magic: [u8; 5],

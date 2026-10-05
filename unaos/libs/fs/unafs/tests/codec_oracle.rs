@@ -6,9 +6,9 @@
 //! strings, empty and long lists, multi-key maps) and the hand codec's bytes
 //! are held to the oracle:
 //!
-//! * M1 (this file at the M1 commit): byte-for-byte against `bincode 2.0.1`
-//!   `legacy()` — the encoder the format was frozen under — and the decoders
-//!   against each other on mutated bytes;
+//! * M1 (this file at the M1 commit 9fe7260f): byte-for-byte against
+//!   `bincode 2.0.1` `legacy()` — the encoder the format was frozen under —
+//!   and the decoders against each other on mutated bytes (all agreed);
 //! * always: a digest (FNV-1a 64 over `len ‖ bytes` of every record in the
 //!   set) cut from bincode's output at M1 and pinned here, so the same
 //!   property set keeps proving byte equality after bincode leaves the crate
@@ -185,50 +185,31 @@ fn digest_push(h: &mut unafs::hash::FnvHasher, bytes: &[u8]) {
     h.write(bytes);
 }
 
-/// The reference encoder (bincode 2.0.1 `legacy()`, the format's frozen
-/// encoder) — present only while bincode is still in the tree (M1).
-fn reference<T: serde::Serialize + ?Sized>(v: &T) -> Vec<u8> {
-    bincode::serde::encode_to_vec(v, bincode::config::legacy()).unwrap()
-}
-
 /// Draw `N` values of one record type, hold each to the oracle, return the
-/// digest of the reference bytes.
+/// digest of the encoded bytes. The pinned digests were cut from bincode
+/// 2.0.1 `legacy()`'s bytes for the same draws at the M1 commit (9fe7260f),
+/// where this function also asserted byte equality with bincode directly and
+/// that both decoders agreed on 8,000 mutations per type.
 fn run<T>(seed: u64, gen_: fn(&mut Rng) -> T) -> u64
 where
-    T: Encode + Decode + serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+    T: Encode + Decode + std::fmt::Debug,
 {
     let mut r = Rng::new(seed);
     let mut h = unafs::hash::FnvHasher::new();
     for i in 0..N {
         let v = gen_(&mut r);
         let ours = unafs::codec::serialize(&v).unwrap();
-        let theirs = reference(&v);
-        assert_eq!(ours, theirs, "{} #{i}: bytes differ from bincode for {v:?}", T::NAME);
-        digest_push(&mut h, &theirs);
+        digest_push(&mut h, &ours);
         // decode(encode(v)) re-encodes to the same bytes (NaN-safe equality).
         let (back, used) = unafs::codec::decode_prefix::<T>(&ours, usize::MAX).unwrap();
         assert_eq!(used, ours.len(), "{} #{i}: decode consumed {used} of {}", T::NAME, ours.len());
         assert_eq!(unafs::codec::serialize(&back).unwrap(), ours, "{} #{i}: round trip", T::NAME);
-        // M1 decoder oracle: on mutated bytes, both decoders agree on
-        // accept/refuse, and on the re-encoded value when both accept.
-        for m in 0..4 {
+        // Keep the generator stream identical to the M1 draw (it mutated
+        // four copies per value there).
+        for _ in 0..4 {
             let mut bad = ours.clone();
             mutate(&mut r, &mut bad);
-            let a = unafs::codec::deserialize::<T>(&bad);
-            let b: Result<(T, usize), _> = bincode::serde::decode_from_slice(
-                &bad,
-                bincode::config::legacy().with_limit::<{ unafs::codec::MAX_RECORD_BYTES }>(),
-            );
-            match (a, b) {
-                (Ok(x), Ok((y, _))) => assert_eq!(
-                    unafs::codec::serialize(&x).unwrap(),
-                    reference(&y),
-                    "{} #{i}/{m}: decoders disagree on value",
-                    T::NAME
-                ),
-                (Err(_), Err(_)) => {}
-                (x, y) => panic!("{} #{i}/{m}: accept/refuse differ: ours {x:?} bincode {y:?}", T::NAME),
-            }
+            let _ = unafs::codec::deserialize::<T>(&bad);
         }
     }
     h.finish()

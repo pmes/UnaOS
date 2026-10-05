@@ -31,7 +31,6 @@ use crate::inode::{AttributeValue, ExtentList, FileKind, Inode};
 use crate::storage::{BLOCK_SIZE, BlockDevice, Error as StorageError};
 use alloc::string::String;
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
 
 /// The version this module (and only this module) can read.
 pub const LEGACY_VERSION: u32 = 2;
@@ -39,7 +38,7 @@ pub const LEGACY_VERSION: u32 = 2;
 /// The version-2 superblock, exactly as `Superblock` looked pre-K8.
 /// (`Serialize` is derived only so tests can BUILD v2 fixtures to migrate;
 /// no production path ever writes this format again.)
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct LegacySuperblock {
     pub magic: [u8; 5],
     pub version: u32,

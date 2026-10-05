@@ -18,7 +18,6 @@ use crate::storage::BLOCK_SIZE;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Error types related to Inode operations.
@@ -33,7 +32,7 @@ pub enum InodeError {
 }
 
 /// The type of file represented by an Inode.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd, Copy)]
+#[derive(Debug, Clone, PartialEq, PartialOrd, Copy)]
 pub enum FileKind {
     File,
     Directory,
@@ -46,7 +45,7 @@ pub enum FileKind {
 ///
 /// Extents allow for efficient storage of large files by mapping logical offsets
 /// to physical blocks and lengths.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Extent {
     /// The logical offset within the file where this extent begins.
     pub logical_offset: u64,
@@ -90,7 +89,7 @@ pub const SPILL_TRAILER_RESERVE: usize = 1024;
 /// back. On read the overflow is decoded and appended to `chunks`, so every
 /// consumer above the inode layer sees one complete extent list — the split is
 /// invisible.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndirectTrailer {
     /// Always [`INODE_SPILL_MAGIC`] — the presence discriminator.
     pub magic: u64,
@@ -105,7 +104,7 @@ pub struct IndirectTrailer {
 /// The value of a metadata attribute attached to an Inode.
 ///
 /// Supports various primitives including Vectors for AI embeddings.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AttributeValue {
     /// A 64-bit signed integer.
     Int(i64),
@@ -125,7 +124,7 @@ pub enum AttributeValue {
 ///
 /// An Inode represents a file or directory and contains its metadata and data mapping.
 /// It is designed to fit within a single block when serialized.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Inode {
     /// Unique identifier for the Inode.
     pub id: u64,
@@ -140,8 +139,8 @@ pub struct Inode {
     /// Key-value map of large attributes stored in external blocks.
     /// Used for large vectors or blobs (> 256 bytes).
     pub large_attributes: BTreeMap<String, ExtentList>,
-    /// v6 META TRAILER fields (B302 M3/M4). `serde(skip)`: the bincode
-    /// encoding above is unchanged (every inode golden holds); on a v6 volume
+    /// v6 META TRAILER fields (B302 M3/M4). NOT part of the §R6 record (the
+    /// encoding above is unchanged: every inode golden holds); on a v6 volume
     /// these ride the hand-packed trailer after the inode's bytes
     /// ([`INODE_META_MAGIC`]), on a v3–v5 volume they are never written and
     /// read back as zero/`None`.
@@ -149,21 +148,16 @@ pub struct Inode {
     /// The parent directory's logical id (0 = no parent: the root, the system
     /// inodes, a bare `create_inode`). UnaFS has no hard links, so one parent
     /// is the whole truth.
-    #[serde(skip)]
     pub parent: u64,
     /// This inode's name in `parent` (`None` when unnamed or longer than
     /// [`INODE_META_NAME_MAX`] — the path walk then asks the parent's listing).
-    #[serde(skip)]
     pub name: Option<String>,
     /// Unix seconds of the last metadata change (create, attribute, rename).
-    #[serde(skip)]
     pub ctime: u64,
     /// Unix seconds of the last data change (create, write, directory edit).
-    #[serde(skip)]
     pub mtime: u64,
     /// Unix seconds of the last access WRITE (noatime: stamped at create and
     /// write only — under CoW a read that wrote would cost a commit).
-    #[serde(skip)]
     pub atime: u64,
 }
 
@@ -455,7 +449,7 @@ impl Decode for AttributeValue {
     }
 }
 
-/// §R6 `Inode` (the bincode-era part; the v6 meta trailer and the spill
+/// §R6 `Inode` (the record proper; the v6 meta trailer and the spill
 /// trailer that follow it are hand-packed, §R7/§R8). The in-RAM-only fields
 /// (`parent`, `name`, `ctime`, `mtime`, `atime`) are NOT part of this record.
 impl Encode for Inode {

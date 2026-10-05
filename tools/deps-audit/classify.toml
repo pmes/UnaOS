@@ -137,10 +137,8 @@ verdict = "NOT WANTED"
 replacement = "on the host the audio server is the host's; Ring 0 has its own HDA driver (`hda`); codecs are AUDIOCODEC SR30"
 
 # ---------------------------------------------------------------- serialisation of our own formats
-[chicken_wire.bincode]
-capability = "serialisation of UnaFS's own on-disk records"
-verdict = "OWED"
-replacement = "arc UNAFSCODEC — hand-packed LE codec in `unafs::codec` (as `root.rs` already does), byte-for-byte vs today's volumes; bincode 3.0.0 is a tombstone release"
+# `bincode` left the tree with UNAFSCODEC (SR53): UnaFS records are encoded by `unafs::codec` from
+# docs/dev/OS/09_FILESYSTEM/unafs-records.md. A crate that serialises our own formats is chicken wire.
 
 [chicken_wire.wincode]
 capability = "binary serialisation (declared by Lumen, no use in `vessels/lumen/src`)"
