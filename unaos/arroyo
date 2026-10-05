@@ -9215,6 +9215,66 @@ esp_x86_unafs_card() {
     echo -e "   p1 = ESP (FAT32, boot + data trees) · p2 = UnaFS system volume (${unafs_mb} MiB) — dd the whole image"
 }
 
+# KERNELFONT2 (rmbp-ledger B363, R85 item 12: "fonts-noto-core on the builder host"): the four Noto script faces
+# KERNELFONT's `video::text` falls back to (Arabic, Hebrew, Devanagari, Thai) are DATA the builder stages from the
+# host's packages (builder/src/main.rs KFONT_FACES / KFONT_DIRS). Run before every MEDIA build: (1) all four found in
+# a package dir or in UNAOS_FONT_DIRS -> nothing to do; (2) else `apt-get install -y fonts-noto-core` (through sudo -n
+# when not root); (3) apt refused or absent -> the Ubuntu pool .deb of the same package, SHA-512 pinned from the
+# archive's Packages index, each face SHA-256 pinned, extracted into the gitignored target/fonts-noto/ with the
+# package's copyright as LICENSE (the builder takes <dir>/LICENSE), and exported as UNAOS_FONT_DIRS. Nothing found or
+# fetched -> the media still builds and the kernel says `scripts_missing=…` on the wire, as before.
+KFONT_NOTO_FACES=(NotoSansArabic-Regular.ttf NotoSansHebrew-Regular.ttf NotoSansDevanagari-Regular.ttf NotoSansThai-Regular.ttf)
+KFONT_NOTO_DEB_URL="http://archive.ubuntu.com/ubuntu/pool/main/f/fonts-noto/fonts-noto-core_20201225-2_all.deb"
+KFONT_NOTO_DEB_SHA512="dd8187da0b4903d2ccd445518094e92c4a6285a886b7091b7ce8151dea358eba36ba41cd215d349c2b9953ad5d2fbeacfcee117327340f59e62af75ca0dba2ee"
+KFONT_NOTO_SHA256=(
+    "504d7407d86875acf7d04dfaa0fd7524d0b8797723bc4aa18022f29db25b0b6e"
+    "436900d5ad77d33e4234247f3076eaecd25b92b9bea0519514f684140e3566a7"
+    "79a470365ccb210fa3c7d8d8ff2e005ef9d983cfd067f735a0caf7e15070ca9f"
+    "dfbd5ed0f1e68c3cbc51aa08f646d1ab0e68e7c4ceab70a69e465225ff701f93"
+)
+kfont_noto_missing() {
+    local f d n=0 dirs="${UNAOS_FONT_DIRS:-}:/usr/share/fonts/truetype/noto:/usr/share/fonts/opentype/noto:/usr/share/fonts/google-noto:/usr/share/fonts/TTF:/usr/share/fonts/noto"
+    for f in "${KFONT_NOTO_FACES[@]}"; do
+        local hit=0 IFS=:
+        for d in $dirs; do [ -n "$d" ] && [ -f "$d/$f" ] && { hit=1; break; }; done
+        unset IFS
+        [ "$hit" = 1 ] || n=$((n + 1))
+    done
+    echo "$n"
+}
+ensure_kfont_noto() {
+    local miss; miss="$(kfont_noto_missing)"
+    if [ "$miss" = 0 ]; then
+        echo -e "${COLOR_GREEN}  • FONTS: the four Noto script faces are on this host (KERNELFONT2)${COLOR_RESET}"
+        return 0
+    fi
+    echo -e "${COLOR_YELLOW}⚡ FONTS: ${miss} of 4 Noto script faces missing — apt-get install -y fonts-noto-core (KERNELFONT2, R85)${COLOR_RESET}"
+    local sudo=""; [ "$(id -u)" = 0 ] || sudo="sudo -n"
+    if command -v apt-get >/dev/null 2>&1 && $sudo apt-get install -y fonts-noto-core >/dev/null 2>&1 && [ "$(kfont_noto_missing)" = 0 ]; then
+        echo -e "${COLOR_GREEN}  • FONTS: fonts-noto-core installed by apt${COLOR_RESET}"
+        return 0
+    fi
+    local dir="${WORKSPACE_DIR}/target/fonts-noto" deb tmp i ok=1
+    echo -e "${COLOR_YELLOW}  • FONTS: apt refused or absent — fetching the pinned .deb into ${dir}${COLOR_RESET}"
+    mkdir -p "$dir"; deb="$dir/fonts-noto-core.deb"; tmp="$dir/x"
+    if ! { [ -f "$deb" ] && [ "$(sha512sum "$deb" | cut -d' ' -f1)" = "$KFONT_NOTO_DEB_SHA512" ]; }; then
+        curl -fsSL -m 300 -o "$deb" "$KFONT_NOTO_DEB_URL" || { echo -e "${COLOR_RED}  • FONTS: fetch failed — media builds without the Noto faces (scripts_missing on the wire)${COLOR_RESET}"; return 0; }
+    fi
+    [ "$(sha512sum "$deb" | cut -d' ' -f1)" = "$KFONT_NOTO_DEB_SHA512" ] || { echo -e "${COLOR_RED}  • FONTS: .deb SHA-512 mismatch — refused, not staged${COLOR_RESET}"; rm -f "$deb"; return 0; }
+    rm -rf "$tmp"; mkdir -p "$tmp"
+    # dpkg-deb reads every data.tar compression itself (the 2020 package is zstd); ar + tar where there is no dpkg.
+    { if command -v dpkg-deb >/dev/null 2>&1; then dpkg-deb -x "$deb" "$tmp"; else ( cd "$tmp" && ar x "$deb" && tar -xf data.tar.* ); fi; } || { echo -e "${COLOR_RED}  • FONTS: .deb extract failed — not staged${COLOR_RESET}"; return 0; }
+    for i in 0 1 2 3; do
+        local f="${KFONT_NOTO_FACES[$i]}" src; src="$(find "$tmp" -name "${KFONT_NOTO_FACES[$i]}" -print -quit)"
+        if [ -n "$src" ] && [ "$(sha256sum "$src" | cut -d' ' -f1)" = "${KFONT_NOTO_SHA256[$i]}" ]; then cp -f "$src" "$dir/$f"; else ok=0; echo -e "${COLOR_RED}  • FONTS: ${f} absent or SHA-256 mismatch — not staged${COLOR_RESET}"; fi
+    done
+    [ -f "$tmp/usr/share/doc/fonts-noto-core/copyright" ] && cp -f "$tmp/usr/share/doc/fonts-noto-core/copyright" "$dir/LICENSE"
+    rm -rf "$tmp"
+    export UNAOS_FONT_DIRS="${UNAOS_FONT_DIRS:+${UNAOS_FONT_DIRS}:}${dir}"
+    [ "$ok" = 1 ] && echo -e "${COLOR_GREEN}  • FONTS: four Noto faces SHA-pinned into ${dir} (UNAOS_FONT_DIRS)${COLOR_RESET}"
+    return 0
+}
+
 esp_x86() {
     echo -e "${COLOR_CYAN}⚡ Building x86_64 kernel + bootloader and packaging the ESP (no QEMU)...${COLOR_RESET}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP as HELLO.BIN
@@ -9226,7 +9286,7 @@ esp_x86() {
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
-    cd "$WORKSPACE_DIR/builder"
+    ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363): the Noto script faces on the builder host first
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     # The media path does NOT go through build_kernel_x86_64 (the builder compiles the kernel
@@ -9289,7 +9349,7 @@ vm_image() {
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
-    cd "$WORKSPACE_DIR/builder"
+    ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363)
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     local img="${WORKSPACE_DIR}/target/vm/unaos-x86-${git7}.img"

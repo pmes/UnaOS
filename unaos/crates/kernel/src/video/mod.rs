@@ -1179,3 +1179,7 @@ pub mod shotmask;
 // atlases as the fallback). Unconditional: fbcon and the boot label call it on every image; the engine half
 // inside it is desktop-gated, so no other image links font_core.
 pub mod text;
+// KERNELFONT2 (B363, R85 item 11): `video::dpi` — the panel's effective ppi and the half-pixel scale the console
+// grid (and, owed, the rest of the theme) follows. Unconditional: fbcon arms the grid on every image; without the
+// desktop engine it answers 1.0.
+pub mod dpi;

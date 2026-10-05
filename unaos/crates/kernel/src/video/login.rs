@@ -2182,3 +2182,11 @@ pub fn shot_release() -> bool {
     serial_println!("[login] shot lock released (the shot's own lock; the session never ended)");
     true
 }
+
+/// KERNELFONT2 (B363) M4: the faces loaded or were restyled — the login window (usually the first thing on the
+/// glass, painted before the volume was up) repaints once in DejaVu Sans.
+pub fn font_repaint() {
+    if is_open() {
+        repaint();
+    }
+}
