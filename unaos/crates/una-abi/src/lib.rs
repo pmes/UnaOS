@@ -1296,7 +1296,7 @@ const _: () = assert!(USER_ARGS_OFF + USER_ARGS_BYTES as u64 <= USER_XWIN_OFF); 
 const _: () = assert!(USER_ARGS_OFF >= USER_FIXED_WINDOW_BYTES + 0x14_5000); // above the FB hole
 const _: () = assert!(USER_EXT_BASE_ARM % (1 << 30) == 0 && (USER_EXT_BASE_ARM >> 30) < 512);
 const _: () = assert!(ARGS_HDR_LEN + (ARGS_MAX + 2) * 8 < USER_ARGS_BYTES);
-const _: () = assert!(SYS_WHOAMI == SYS_SBRK + 1);
+const _: () = assert!(SYS_WHOAMI == SYS_SBRK + 3);
 
 /// Lay out the args page for `words` into `out` (>= `USER_ARGS_BYTES`, zeroed by the caller or not —
 /// every byte up to the returned length is written, the rest is zeroed). `page_va` is the VA the page
