@@ -12,13 +12,13 @@
     },
     "03-card-gallery": {
       "mismatch": 0.64,
-      "missing": 1,
-      "ssim": 0.9719
+      "missing": 0,
+      "ssim": 0.9935
     },
     "04-sticky-nav": {
       "mismatch": 3.15,
-      "missing": 2,
-      "ssim": 0.968
+      "missing": 0,
+      "ssim": 0.972
     },
     "05-form": {
       "mismatch": 1.62,

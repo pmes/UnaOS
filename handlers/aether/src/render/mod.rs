@@ -44,6 +44,7 @@ use crate::layout::default_font_size;
 type Clip = (f32, f32, f32, f32);
 
 mod boxpaint;
+pub(crate) mod effects;
 
 fn in_clip(x: u32, y: u32, clip: Clip) -> bool {
     let (x0, y0, x1, y1) = clip;
@@ -1053,6 +1054,11 @@ pub fn render_frame(
                         blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
                     }
                 };
+                // Outer box shadows paint under the box, outside it.
+                if let Some(sh) = spec.shadows.as_ref().filter(|s| !s.is_empty()) {
+                    let radii = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
+                    effects::paint_shadows(sh, box_sx, box_sy, bw, bh, radii, width, height, &boxpaint::sdf, &mut blend_at);
+                }
                 if fancy && mask.is_none() && spec.background.is_some() {
                     boxpaint::paint(
                         box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
@@ -1073,6 +1079,22 @@ pub fn render_frame(
                     }
                 }
 
+                if let Some(Some(g)) = spec.bg_gradient.as_ref() {
+                    let radii = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
+                    let (gx, gy) = (box_sx, box_sy);
+                    let cover = move |fx: f32, fy: f32| (0.5 - boxpaint::sdf(fx, fy, gx, gy, gx + bw, gy + bh, radii)).clamp(0.0, 1.0);
+                    let mut blend_g = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                        if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                            return;
+                        }
+                        if a >= 0.999 {
+                            put_px(surface, width, x, y, c);
+                        } else if a > 0.0 {
+                            blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                        }
+                    };
+                    effects::paint_gradient(g, box_sx, box_sy, bw, bh, width, height, &cover, &mut blend_g);
+                }
                 // background-image paints over the color, under content,
                 // honouring background-size / -position / -repeat (the
                 // sprite-sheet idiom is exactly a positioned no-repeat

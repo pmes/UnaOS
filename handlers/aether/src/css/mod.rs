@@ -398,6 +398,39 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 }
             }
         }
+        "background-image" if value.to_ascii_lowercase().contains("linear-gradient(") => {
+            style.paint.bg_gradient = crate::render::effects::parse_linear_gradient(value).map(Some);
+        }
+        "background" if value.to_ascii_lowercase().contains("linear-gradient(") => {
+            // A gradient layer (css-images-3 §3.1) plus any colour outside it.
+            style.paint.bg_gradient = crate::render::effects::parse_linear_gradient(value).map(Some);
+            let lower = value.to_ascii_lowercase();
+            let start = lower.find("repeating-linear-gradient(").or_else(|| lower.find("linear-gradient(")).unwrap_or(0);
+            let mut depth = 0;
+            let mut end = lower.len();
+            for (i, c) in lower[start..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = start + i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let rest = format!("{} {}", &value[..start], &value[end..]);
+            for part in split_top_level(&rest) {
+                if let Some(c) = parse_color_str(part) {
+                    style.paint.background = Some(c);
+                }
+            }
+        }
+        "box-shadow" | "-webkit-box-shadow" => {
+            style.paint.shadows = Some(crate::render::effects::parse_box_shadow(value));
+        }
         "background-image" => match extract_css_url(value) {
             Some(u) => style.paint.bg_image = Some(u),
             None => {
@@ -1906,7 +1939,7 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
         list_item, list_style,
     );
-    clone!(pct_math);
+    clone!(pct_math, bg_gradient, shadows);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position);
 }
 

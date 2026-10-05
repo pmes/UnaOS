@@ -112,6 +112,10 @@ pub struct PaintStyle {
     /// 5 lower-alpha, 6 upper-alpha, 7 lower-roman, 8 upper-roman,
     /// 9 decimal-leading-zero. Inherited.
     pub list_style: Option<u8>,
+    /// A linear-gradient background layer (Some(None) = `none` cleared it).
+    pub bg_gradient: Option<Option<crate::render::effects::Gradient>>,
+    /// Outer box shadows (empty = none).
+    pub shadows: Option<Vec<crate::render::effects::Shadow>>,
 }
 
 pub struct LayoutTree {

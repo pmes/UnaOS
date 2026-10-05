@@ -16,7 +16,7 @@
 pub(crate) type Side = Option<(f32, (u8, u8, u8), u8)>;
 
 /// Signed distance from (px, py) to a rounded rect (negative inside).
-fn sdf(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: [f32; 4]) -> f32 {
+pub(crate) fn sdf(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: [f32; 4]) -> f32 {
     let cx = (x0 + x1) / 2.0;
     let cy = (y0 + y1) / 2.0;
     let hw = (x1 - x0) / 2.0;
