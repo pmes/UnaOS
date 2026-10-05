@@ -1,5 +1,4 @@
 use crate::layout::{LayoutTree, PaintStyle};
-use cssparser::{Parser, Token};
 use taffy::prelude::*;
 use taffy::style::{Dimension, Display, FlexDirection, LengthPercentage, LengthPercentageAuto};
 use taffy::geometry::Rect;
@@ -794,49 +793,13 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
 }
 
 thread_local! {
-    /// Custom properties (--x: value) gathered from the current page's
-    /// sheets, last-wins. A flat global map — no per-element cascade of
-    /// custom props yet (the dominant design-token-on-:root pattern works;
-    /// element-scoped overrides don't and stay visible in the ledger).
+    /// The document element's computed custom properties (css_core, set by
+    /// `apply_stylesheets`), for the one path outside the cascade: the
+    /// layout builder's build-time inline-style pass. The cascade itself
+    /// substitutes `var()` per element against that element's own computed
+    /// custom properties.
     static CUSTOM_PROPS: std::cell::RefCell<std::collections::HashMap<String, String>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Scans CSS text for `--name: value` declarations in DOCUMENT-SCOPED
-/// rules only (:root/html/body/*). Theme-variant rules like
-/// `.dark-mode { --bg: black }` must NOT poison the flat token map —
-/// that class isn't on the document (a flat map has no element scope;
-/// scoped redefinitions stay honest gaps).
-fn collect_custom_props(css: &str, map: &mut std::collections::HashMap<String, String>) {
-    let mut i = 0;
-    while let Some(open) = css[i..].find('{') {
-        let open = i + open;
-        // Prelude: back to the previous '}' , ';', or start.
-        let prelude_start = css[..open].rfind(['}', ';', '{']).map(|p| p + 1).unwrap_or(0);
-        let prelude = css[prelude_start..open].trim();
-        let Some(close) = css[open..].find('}') else { break };
-        let close = open + close;
-        let body = &css[open + 1..close];
-        i = close + 1;
-        let doc_scoped = !prelude.is_empty()
-            && prelude.split(',').any(|s| matches!(s.trim(), ":root" | "html" | "body" | "*" | "html body"));
-        if !doc_scoped || !body.contains("--") {
-            continue;
-        }
-        for decl in split_declarations(body) {
-            let Some((name, value)) = split_declaration(decl) else { continue };
-            let name = name.trim();
-            let value = value.trim();
-            if name.starts_with("--")
-                && name.len() > 2
-                && name[2..].chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                && !value.is_empty()
-                && value.len() < 512
-            {
-                map.insert(name.to_string(), value.to_string());
-            }
-        }
-    }
 }
 
 /// Substitutes `var(--x)` / `var(--x, fallback)` from the page's custom
@@ -969,773 +932,60 @@ fn clip_n(v: &str, n: usize) -> &str {
     &v[..end]
 }
 
-/// One applicable rule: a single compiled selector with its declarations.
-/// A rule with `!important` declarations is split in two — the important
-/// half carries `important: true` and applies in a later cascade tier.
-struct Rule {
-    selector: crate::dom::Selector,
-    style: std::rc::Rc<SpecifiedStyle>,
-    important: bool,
-    /// Cascade weight. Normally the compiled selector's own specificity;
-    /// a selector recovered by lowering carries the specificity of the
-    /// ORIGINAL construct instead (`:where()`'s arguments weigh nothing).
-    specificity: crate::dom::Specificity,
-    key: RuleKey,
-    plan: MatchPlan,
-    /// Every depth-0 `.class`/`#id` in the selector: ALL must exist
-    /// somewhere on the page for the rule to possibly match. Real pages
-    /// ship swaths of feature-flag rules whose flag class is absent —
-    /// they drop before any matching.
-    required: Vec<(bool, String)>, // (is_id, name)
-}
-
-/// How a rule matches. A single compound of tag/id/class simple selectors
-/// (no combinators, no pseudo/attr) — the overwhelming majority on real
-/// pages — matches with precomputed per-element sets; everything else goes
-/// through the real selector engine. The profiled wall was kuchiki's
-/// has_class re-splitting class strings during ancestor walks.
-enum MatchPlan {
-    Simple {
-        tag: Option<String>,
-        id: Option<String>,
-        classes: Vec<String>,
-    },
-    Engine,
-}
-
-/// Collects the depth-0 class/id tokens a selector REQUIRES on the page.
-/// Tokens inside parens (:not(.x), :is(...)) or brackets are skipped —
-/// they are not unconditional requirements.
-fn required_tokens(selector_text: &str) -> Vec<(bool, String)> {
-    let s = selector_text;
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'[' | b'(' => depth += 1,
-            b']' | b')' => depth -= 1,
-            b'\\' => i += 1, // escaped char is literal, never a marker
-            m @ (b'.' | b'#') if depth == 0 => {
-                // An escaped character inside an identifier (`.md\:block`,
-                // `.w-1\/2`) is part of the NAME; consume it and record the
-                // unescaped token the DOM actually carries.
-                let start = i + 1;
-                let mut j = start;
-                let mut name = String::new();
-                while j < bytes.len() {
-                    let c = bytes[j] as char;
-                    if c == '\\' && j + 1 < bytes.len() {
-                        // Only single-character escapes are handled; a hex
-                        // escape (`\3a `) would need the full CSS grammar.
-                        let n = bytes[j + 1] as char;
-                        if n.is_ascii_hexdigit() {
-                            name.clear();
-                            break;
-                        }
-                        name.push(n);
-                        j += 2;
-                    } else if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        name.push(c);
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if !name.is_empty() {
-                    out.push((m == b'#', name));
-                }
-                i = j.max(start);
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    out
-}
-
-/// Derives the MatchPlan from a single selector's text.
-fn match_plan(selector_text: &str) -> MatchPlan {
-    let s = selector_text.trim();
-    let mut depth = 0i32;
-    for c in s.chars() {
-        match c {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth -= 1,
-            ' ' | '\t' | '>' | '+' | '~' if depth == 0 => return MatchPlan::Engine,
-            ':' | '[' if depth == 0 => return MatchPlan::Engine,
-            _ => {}
-        }
-    }
-    if s.contains(':') || s.contains('[') {
-        return MatchPlan::Engine;
-    }
-    // Compound of [tag]?(#id|.class)*
-    let mut tag = None;
-    let mut id = None;
-    let mut classes = Vec::new();
-    let mut rest = s;
-    // Leading tag or universal.
-    let head_end = rest.find(['.', '#']).unwrap_or(rest.len());
-    let head = &rest[..head_end];
-    if !head.is_empty() && head != "*" {
-        if !head.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-            return MatchPlan::Engine;
-        }
-        tag = Some(head.to_ascii_lowercase());
-    }
-    rest = &rest[head_end..];
-    while !rest.is_empty() {
-        let marker = rest.as_bytes()[0];
-        let body = &rest[1..];
-        let end = body.find(['.', '#']).unwrap_or(body.len());
-        let name = &body[..end];
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-            return MatchPlan::Engine;
-        }
-        match marker {
-            b'.' => classes.push(name.to_string()),
-            b'#' => id = Some(name.to_string()),
-            _ => return MatchPlan::Engine,
-        }
-        rest = &body[end..];
-    }
-    MatchPlan::Simple { tag, id, classes }
-}
-
-/// Rule-hash key: the rightmost compound's most selective simple selector.
-/// An element only needs to test rules whose key it can possibly satisfy —
-/// the standard cascade optimization (matching was the profiled hot path).
-#[derive(Debug, PartialEq)]
-enum RuleKey {
-    Id(String),
-    Class(String),
-    Tag(String),
-    Universal,
-}
-
-/// Derives the RuleKey from a single selector's text. Conservative: any
-/// pseudo/attr syntax in the rightmost compound falls back to Universal
-/// (always tested) rather than risking a wrong bucket.
-fn rule_key(selector_text: &str) -> RuleKey {
-    let s = selector_text.trim();
-    // The rightmost compound, honouring CSS identifier escapes: `\:` and
-    // `\[` inside a class name (`.md\:block`, `.w-1\/2`) are ORDINARY
-    // characters, not the start of a pseudo-class or attribute selector.
-    // Reading them as syntax bucketed every responsive/state utility class
-    // under a truncated key no element could ever carry, so the rule was
-    // never even tested — the whole `md:`/`lg:` layer of a utility-CSS page
-    // silently did nothing.
-    let cut = |hay: &str, stops: &[char]| -> usize {
-        let (mut depth, mut esc) = (0i32, false);
-        for (i, c) in hay.char_indices() {
-            if esc {
-                esc = false;
-                continue;
-            }
-            match c {
-                '\\' => esc = true,
-                // Stop test comes FIRST: `[` is itself a stop character for
-                // the pseudo/attr cut, so it must not open a group before
-                // being recognised (`input[type=text]` keys on `input`).
-                c if depth <= 0 && stops.contains(&c) => return i,
-                '[' | '(' => depth += 1,
-                ']' | ')' => depth -= 1,
-                _ => {}
-            }
-        }
-        hay.len()
-    };
-    // Last unescaped depth-0 combinator starts the rightmost compound.
-    let mut start = 0;
-    {
-        let (mut depth, mut esc) = (0i32, false);
-        for (i, c) in s.char_indices() {
-            if esc {
-                esc = false;
-                continue;
-            }
-            match c {
-                '\\' => esc = true,
-                '[' | '(' => depth += 1,
-                ']' | ')' => depth -= 1,
-                ' ' | '\t' | '>' | '+' | '~' if depth <= 0 => start = i + c.len_utf8(),
-                _ => {}
-            }
-        }
-    }
-    let comp = s[start..].trim();
-    // Pseudo-classes and attribute selectors only NARROW a compound, so the
-    // simple-selector prefix before the first ':'/'[' is still a valid
-    // bucket key ("li:first-child" can only match an <li>). A compound that
-    // STARTS with ':'/'[' gives no such guarantee → Universal.
-    let comp = &comp[..cut(comp, &[':', '['])];
-    // Rightmost unescaped '.' / '#' marker in the compound.
-    let (mut last_dot, mut last_hash, mut first_marker) = (None, None, None);
-    {
-        let mut esc = false;
-        for (i, c) in comp.char_indices() {
-            if esc {
-                esc = false;
-                continue;
-            }
-            match c {
-                '\\' => esc = true,
-                '.' | '#' => {
-                    if first_marker.is_none() {
-                        first_marker = Some(i);
-                    }
-                    if c == '.' {
-                        last_dot = Some(i);
-                    } else {
-                        last_hash = Some(i);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    // Strips the backslashes from an escaped identifier so the key matches
-    // the class/id string the DOM actually carries.
-    let unescape = |s: &str| -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut esc = false;
-        for c in s.chars() {
-            if esc {
-                out.push(c);
-                esc = false;
-            } else if c == '\\' {
-                esc = true;
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    };
-    if let Some(p) = last_dot {
-        let rest = &comp[p + 1..];
-        let name = unescape(&rest[..cut(rest, &['.', '#'])]);
-        if !name.is_empty() {
-            return RuleKey::Class(name);
-        }
-    }
-    if let Some(p) = last_hash {
-        let rest = &comp[p + 1..];
-        let name = unescape(&rest[..cut(rest, &['.', '#'])]);
-        if !name.is_empty() {
-            return RuleKey::Id(name);
-        }
-    }
-    let end = first_marker.unwrap_or(comp.len());
-    let tag = comp[..end].trim();
-    if tag.is_empty() || tag == "*" {
-        RuleKey::Universal
-    } else {
-        RuleKey::Tag(tag.to_ascii_lowercase())
-    }
-}
-
-/// Splits a selector list on the commas that actually separate selectors:
-/// a comma inside `:is(...)`, `[attr="a,b"]`, or any function is part of
-/// one selector, not a separator.
-pub(crate) fn split_selector_list(prelude: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let (mut depth, mut start, mut quote, mut escaped) = (0i32, 0usize, None::<char>, false);
-    for (i, c) in prelude.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' => escaped = true,
-            q if Some(q) == quote => quote = None,
-            _ if quote.is_some() => {}
-            '"' | '\'' => quote = Some(c),
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth -= 1,
-            ',' if depth <= 0 => {
-                out.push(prelude[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push(prelude[start..].trim());
-    out.retain(|s| !s.is_empty());
-    out
-}
-
 // ---------------------------------------------------------------------
-// Selector lowering (rewrite-before-compile salvage)
+// The cascade (AETHERSTYLE, SR54): UnaOS's own css_core end to end.
 //
-// Servo's selector parser is a 2019-era snapshot: `:is()`, `:where()`,
-// `:has()`, `:focus-visible`, `:focus-within`, `:not()` with an argument
-// LIST, every pseudo-element, and most form-state pseudo-classes are all
-// rejected outright — and a rejected selector drops the WHOLE RULE, not one
-// declaration. On a modern component/utility stylesheet that is hundreds of
-// live rules lost with nothing on screen to show for it.
-//
-// The salvage runs ONLY after a member has already failed to compile, so
-// the fast path (whole list compiles first try) pays nothing. Each failing
-// member is rewritten to a semantically equivalent form the parser does
-// accept; whatever survives is compiled, and whatever cannot be rewritten
-// is ledgered under a NAMED bucket so every dropped rule has a reason.
+// Parsing (CSS Syntax 3 + CSS Nesting), selector matching (Selectors 4 over html_core's arena through
+// `dom::El`), `@media` (MQ4 against Aether's viewport), `@supports` (against `property_supported`),
+// `@layer`, the cascade sort (origin, importance, style attribute, layers, specificity, order), the rule
+// hash and per-element custom properties with `var()` substitution are css_core's. What stays Aether's is
+// the computed-value step: every declaration that wins its place in the cascade order is handed, as CSS
+// text, to `apply_declaration`, which folds it into the `SpecifiedStyle` that layout and paint consume.
 // ---------------------------------------------------------------------
 
-/// Pseudo-classes naming a dynamic state this engine never enters: there is
-/// no pointer, no focus, and no navigation target in a static render.
-///
-/// `:hover`/`:active`/`:focus`/`:visited` are the interesting precedent —
-/// servo's parser *accepts* them, so today they compile into rules that
-/// simply never match (`engine_tests::test_hover_focus_not_applied` pins
-/// exactly that). The names below are their unparseable siblings; dropping
-/// such a member reproduces the same observable behaviour instead of
-/// throwing away the rest of the selector list along with it.
-const DYNAMIC_STATE_PSEUDOS: &[&str] = &[
-    "hover", "active", "focus", "focus-visible", "focus-within", "focus-ring",
-    "visited", "target", "target-within", "user-invalid", "user-valid",
-    "autofill", "-webkit-autofill", "-moz-focusring", "-moz-drag-over",
-    "-moz-focus-inner", "modal", "popover-open", "fullscreen", "open",
-    "picture-in-picture", "playing", "paused", "current", "past", "future",
-    "local-link", "muted", "seeking", "stalled", "buffering",
-];
+thread_local! {
+    /// (style, re-layout) wall time of the last `apply_stylesheets`.
+    static STYLE_TIMING: std::cell::Cell<(std::time::Duration, std::time::Duration)> =
+        const { std::cell::Cell::new((std::time::Duration::ZERO, std::time::Duration::ZERO)) };
+}
 
-/// Form/validity pseudo-classes whose state we do not model. (`:required`
-/// and `:optional` are deliberately absent — they lower to an attribute
-/// test; `:checked`/`:disabled`/`:enabled`/`:indeterminate` already parse.)
-const FORM_STATE_PSEUDOS: &[&str] = &[
-    "valid", "invalid", "in-range", "out-of-range", "read-only", "read-write",
-    "placeholder-shown", "default", "blank", "user-error",
-];
+/// Wall time of the last `apply_stylesheets` call: (the cascade up to the folded box styles, the
+/// re-layout that follows). Read by `tests/style_time.rs`.
+pub fn last_style_timing() -> (std::time::Duration, std::time::Duration) {
+    STYLE_TIMING.with(|t| t.get())
+}
 
-/// Pseudo-ELEMENTS that predate the `::` spelling, including the vendor
-/// placeholder spellings every reset sheet still ships. A rule targeting
-/// any pseudo-element styles a generated box we never create, so it can
-/// never match our tree — that is a known, quiet non-application, not a
-/// parse defect, and it shares the existing `pseudo-element-rule` key.
-const LEGACY_PSEUDO_ELEMENTS: &[&str] = &[
-    "before", "after", "first-line", "first-letter",
-    "-ms-input-placeholder", "-moz-placeholder", "-webkit-input-placeholder",
-    "-ms-clear", "-ms-reveal", "-ms-expand", "-ms-check",
-];
+/// What `@media` is evaluated against: Aether's viewport, a light colour scheme, no reduced motion, a
+/// fine pointer that can hover, `screen`, scripting enabled (css_core's desktop defaults).
+pub(crate) fn media_environment(vw: f32, vh: f32) -> css_core::media::Environment {
+    css_core::media::Environment::viewport(vw.max(1.0) as f64, vh.max(1.0) as f64)
+}
 
-/// Vendor prefixes. An unrecognised `:-vendor-thing` pseudo-CLASS is always
-/// some UI or media state (`:-moz-ui-invalid`, `:-ms-fullscreen`,
-/// `:-o-prefocus`) that a static render never enters, so it gets its own
-/// named bucket rather than the residual compile-failure key.
-const VENDOR_PREFIXES: &[&str] = &["-webkit-", "-moz-", "-ms-", "-o-"];
-
-/// Functional pseudo-classes that are pure selector GROUPING: the element
-/// matches if it matches any argument. Includes the legacy spellings that
-/// shipped before `:is()` was standardised.
-const GROUPING_PSEUDOS: &[&str] =
-    &["is", "where", "matches", "any", "-moz-any", "-webkit-any"];
-
-/// Byte index of the `)` matching the `(` at `open`.
-fn matching_paren(s: &str, open: usize) -> Option<usize> {
-    let b = s.as_bytes();
-    let (mut depth, mut i) = (0i32, open);
-    let mut quote: Option<u8> = None;
-    while i < b.len() {
-        let c = b[i];
-        if c == b'\\' {
-            i += 2;
-            continue;
-        }
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'"' | b'\'' => quote = Some(c),
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
+/// Ledgers what a sheet asks for that Aether does not do with it: rules that style a pseudo-element
+/// (no generated boxes yet) and at-rules css_core parses into data Aether does not consume.
+fn ledger_rules(rules: &[css_core::stylesheet::CssRule]) {
+    use css_core::stylesheet::CssRule;
+    for r in rules {
+        match r {
+            CssRule::Style(s) => {
+                if s.selectors.0.iter().any(|sel| sel.pseudo_element.is_some()) {
+                    crate::ledger::record_css("pseudo-element-rule");
                 }
+                ledger_rules(&s.children);
             }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Locates the first `:name(...)` at nesting depth 0 whose name is listed.
-/// Returns `(colon index, lowercased name, open paren, close paren)`.
-fn find_functional(s: &str, names: &[&str]) -> Option<(usize, String, usize, usize)> {
-    let b = s.as_bytes();
-    let (mut depth, mut i) = (0i32, 0usize);
-    let mut quote: Option<u8> = None;
-    while i < b.len() {
-        let c = b[i];
-        if c == b'\\' {
-            i += 2;
-            continue;
-        }
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'"' | b'\'' => quote = Some(c),
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => depth -= 1,
-            b':' if depth == 0 => {
-                let start = i + 1;
-                let mut j = start;
-                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
-                    j += 1;
-                }
-                if j > start && j < b.len() && b[j] == b'(' {
-                    let name = s[start..j].to_ascii_lowercase();
-                    if names.iter().any(|n| *n == name) {
-                        if let Some(close) = matching_paren(s, j) {
-                            return Some((i, name, j, close));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Every pseudo token at nesting depth 0: `(is_pseudo_element, name)`.
-/// Depth 0 only, deliberately — a `:focus-visible` inside `:is(...)` kills
-/// only its own branch, and is seen after the group is distributed.
-fn depth0_pseudos(s: &str) -> Vec<(bool, String)> {
-    let b = s.as_bytes();
-    let (mut depth, mut i) = (0i32, 0usize);
-    let mut quote: Option<u8> = None;
-    let mut out = Vec::new();
-    while i < b.len() {
-        let c = b[i];
-        if c == b'\\' {
-            i += 2;
-            continue;
-        }
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'"' | b'\'' => quote = Some(c),
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => depth -= 1,
-            b':' if depth == 0 => {
-                let mut start = i + 1;
-                let is_element = start < b.len() && b[start] == b':';
-                if is_element {
-                    start += 1;
-                }
-                let mut j = start;
-                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
-                    j += 1;
-                }
-                if j > start {
-                    out.push((is_element, s[start..j].to_ascii_lowercase()));
-                }
-                i = j;
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    out
-}
-
-/// True when the selector has a depth-0 combinator (i.e. is not a single
-/// compound). Used to decide whether a group argument can be substituted.
-fn is_complex(s: &str) -> bool {
-    let b = s.as_bytes();
-    let (mut depth, mut i) = (0i32, 0usize);
-    while i < b.len() {
-        match b[i] {
-            b'\\' => i += 1,
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => depth -= 1,
-            b' ' | b'\t' | b'\n' | b'>' | b'+' | b'~' if depth == 0 => return true,
-            _ => {}
-        }
-        i += 1;
-    }
-    false
-}
-
-/// True when the span `[before, after)` is a whole compound on its own —
-/// i.e. what surrounds it is a combinator, a comma, or nothing.
-fn is_whole_compound(s: &str, before: usize, after: usize) -> bool {
-    let edge = |c: Option<char>| {
-        matches!(c, None | Some(' ') | Some('\t') | Some('\n') | Some('>') | Some('+') | Some('~') | Some(','))
-    };
-    edge(s[..before].chars().next_back()) && edge(s[after..].chars().next())
-}
-
-/// Classifies a member that no rewrite can save, returning its ledger
-/// bucket. Only depth-0 syntax is considered.
-fn unmatchable_bucket(sel: &str) -> Option<&'static str> {
-    if sel.contains('&') {
-        return Some("selector-nesting");
-    }
-    for (is_element, name) in depth0_pseudos(sel) {
-        if is_element || LEGACY_PSEUDO_ELEMENTS.contains(&name.as_str()) {
-            // Vendor pseudo-elements (`::-webkit-input-placeholder`,
-            // `::-moz-focus-inner`, `::-webkit-scrollbar`, …) land here too:
-            // a box we never generate, so the rule can never apply.
-            return Some("pseudo-element-rule");
-        }
-        match name.as_str() {
-            // Real work, a later arc: `:has()` needs forward matching.
-            "has" => return Some("selector-has"),
-            "host" | "host-context" | "defined" | "part" | "slotted" => {
-                return Some("selector-shadow-dom")
-            }
-            "lang" | "dir" => return Some("selector-lang-dir"),
-            n if DYNAMIC_STATE_PSEUDOS.contains(&n) => return Some("selector-dynamic-state"),
-            n if FORM_STATE_PSEUDOS.contains(&n) => return Some("selector-form-state"),
-            // `:-moz-any()`/`:-webkit-any()` are vendor spellings of a
-            // GROUP, not a state — they lower, so never bucket them here.
-            n if GROUPING_PSEUDOS.contains(&n) => {}
-            n if VENDOR_PREFIXES.iter().any(|p| n.starts_with(p)) => {
-                return Some("selector-vendor-pseudo")
-            }
-            _ => {}
-        }
-    }
-    if sel.contains(":nth") && sel.contains(" of ") {
-        return Some("selector-nth-of");
-    }
-    // `:not(X)` where X is something we cannot EVALUATE (as opposed to
-    // something that never matches) makes the whole negation unknown —
-    // report X's bucket rather than silently over-matching by dropping it.
-    let mut rest = sel;
-    while let Some((_, _, open, close)) = find_functional(rest, &["not"]) {
-        for arg in split_selector_list(&rest[open + 1..close]) {
-            if never_matches(arg) {
-                continue; // a tautology; `rewrite_not` deletes it
-            }
-            match unmatchable_bucket(arg) {
-                Some(b) => return Some(b),
-                None => {}
-            }
-        }
-        rest = &rest[close + 1..];
-    }
-    None
-}
-
-/// True when this argument of a `:not()` can never match anything we
-/// render, which makes the negation unconditionally true.
-fn never_matches(arg: &str) -> bool {
-    matches!(
-        unmatchable_bucket(arg),
-        Some("pseudo-element-rule") | Some("selector-dynamic-state")
-            | Some("selector-form-state") | Some("selector-shadow-dom")
-            | Some("selector-vendor-pseudo")
-    )
-}
-
-/// Rewrites one depth-0 `:not(...)`: an argument LIST becomes a chain of
-/// single-argument negations (`:not(a, b)` ≡ `:not(a):not(b)`, and servo
-/// only parses the latter), and arguments that can never match are dropped
-/// because negating them is a tautology (`.x:not(:focus-visible)` styles
-/// `.x` in a render that never focuses anything).
-fn rewrite_not(text: &str) -> Option<String> {
-    let (colon, _, open, close) = find_functional(text, &["not"])?;
-    let args = split_selector_list(&text[open + 1..close]);
-    let kept: Vec<&str> = args.iter().copied().filter(|a| !never_matches(a)).collect();
-    let replacement = if kept.is_empty() {
-        if is_whole_compound(text, colon, close + 1) { "*".to_string() } else { String::new() }
-    } else {
-        kept.iter().map(|a| format!(":not({a})")).collect::<Vec<_>>().join("")
-    };
-    let out = format!("{}{}{}", &text[..colon], replacement, &text[close + 1..]);
-    (out != text).then_some(out)
-}
-
-/// A candidate selector plus the selector whose specificity the cascade
-/// should charge it. The two differ only where `:where()` was distributed:
-/// `:where()`'s arguments contribute NOTHING to specificity, so the twin
-/// keeps the same shape with the argument replaced by a hole. Compiling
-/// the twin and reading its specificity is exact for the common case.
-type Candidate = (String, String);
-
-/// Distributes the first depth-0 grouping pseudo over its arguments:
-/// `a :is(b, c)` -> `a b`, `a c`.
-///
-/// An argument that is itself complex can only be substituted when the
-/// group stands alone as a whole compound: `a :is(b > c)` -> `a b > c` is
-/// sound, `a.x:is(b > c)` is not (it would need the compound folded onto
-/// the argument's subject), so that argument is dropped and ledgered.
-///
-/// Specificity: for `:where()` the twin loses the argument entirely, which
-/// is exact. For `:is()` each branch is charged its OWN specificity rather
-/// than the spec's "max over all arguments" — a documented approximation
-/// that can only under-charge a branch, and one that keeps every rule
-/// alive. Dropped rules are worse than slightly-wrong specificity.
-fn distribute_grouping(text: &str, spec: &str) -> Option<Vec<Candidate>> {
-    let (colon, name, open, close) = find_functional(text, GROUPING_PSEUDOS)?;
-    // The twin has had the SAME rewrites applied, so its first depth-0
-    // group is the same construct — unless an argument we already spliced
-    // in carried a nested group, which the twin dropped. Detect that and
-    // fall back to approximating the specificity with the rewritten form.
-    let twin = find_functional(spec, GROUPING_PSEUDOS)
-        .filter(|(_, n, _, _)| *n == name);
-    let whole = is_whole_compound(text, colon, close + 1);
-    let (pre, suf) = (&text[..colon], &text[close + 1..]);
-    let mut out = Vec::new();
-    for arg in split_selector_list(&text[open + 1..close]) {
-        if is_complex(arg) && !whole {
-            crate::ledger::record_css("selector-group-complex-arg");
-            continue;
-        }
-        let matched = format!("{pre}{arg}{suf}");
-        let twin_text = match &twin {
-            Some((tc, _, _, tclose)) => {
-                let fill = if name == "where" {
-                    if whole { "*" } else { "" }
-                } else {
-                    arg
-                };
-                format!("{}{}{}", &spec[..*tc], fill, &spec[tclose + 1..])
-            }
-            None => {
-                if name == "where" {
-                    crate::ledger::record_css("selector-where-specificity-approx");
-                }
-                matched.clone()
-            }
-        };
-        out.push((matched, twin_text));
-    }
-    Some(out)
-}
-
-/// Form pseudo-classes that are really attribute tests in disguise.
-fn rewrite_form_shorthand(text: &str) -> Option<String> {
-    for (from, to) in [(":required", "[required]"), (":optional", ":not([required])")] {
-        if text.contains(from) {
-            return Some(text.replace(from, to));
-        }
-    }
-    None
-}
-
-/// One rewrite step on a candidate, cheapest first. `None` = nothing left
-/// to try.
-fn rewrite_once((text, spec): &Candidate) -> Option<Vec<Candidate>> {
-    if let Some(t) = rewrite_not(text) {
-        let s = rewrite_not(spec).unwrap_or_else(|| t.clone());
-        return Some(vec![(t, s)]);
-    }
-    if let Some(v) = distribute_grouping(text, spec) {
-        return Some(v);
-    }
-    if let Some(t) = rewrite_form_shorthand(text) {
-        let s = rewrite_form_shorthand(spec).unwrap_or_else(|| t.clone());
-        return Some(vec![(t, s)]);
-    }
-    None
-}
-
-/// Salvages one selector-list member servo rejected, pushing whatever
-/// compiles onto `out` with the specificity the cascade should charge it.
-fn lower_member(part: &str, out: &mut Vec<(crate::dom::Selector, crate::dom::Specificity)>) {
-    // Bounded: a pathological nest of groups must not explode. Real pages
-    // sit far under this (`:is()` lists are short and rarely nested).
-    const BUDGET: usize = 48;
-    let mut work: Vec<Candidate> = vec![(part.to_string(), part.to_string())];
-    let mut done: Vec<Candidate> = Vec::new();
-    let mut steps = 0usize;
-    while let Some(cand) = work.pop() {
-        steps += 1;
-        if steps > BUDGET || work.len() + done.len() > BUDGET {
-            crate::ledger::record_css("selector-lower-budget");
-            break;
-        }
-        if crate::dom::Selectors::compile(&cand.0).is_ok() {
-            done.push(cand);
-            continue;
-        }
-        if let Some(bucket) = unmatchable_bucket(&cand.0) {
-            crate::ledger::record_css(bucket);
-            continue;
-        }
-        match rewrite_once(&cand) {
-            Some(next) => work.extend(next),
-            None => crate::ledger::record_css(&format!(
-                "selector-compile-failed:{}",
-                clip_n(&cand.0, 96)
-            )),
-        }
-    }
-    if !done.is_empty() {
-        // Telemetry: this rule is only alive because it was rewritten, and
-        // its match set is equivalent-modulo-the-approximations documented
-        // on `distribute_grouping`. One record per rescued member.
-        crate::ledger::record_css("selector-lowered");
-    }
-    for (text, spec) in done {
-        let Ok(sels) = crate::dom::Selectors::compile(&text) else { continue };
-        let charged = crate::dom::Selectors::compile(&spec)
-            .ok()
-            .and_then(|s| s.0.first().map(|sel| sel.specificity()));
-        for sel in sels.0 {
-            let s = charged.unwrap_or_else(|| sel.specificity());
-            out.push((sel, s));
+            CssRule::Media(_, inner) | CssRule::Supports(_, inner) | CssRule::LayerBlock(_, inner) => ledger_rules(inner),
+            CssRule::LayerStatement(_) => {}
+            CssRule::Import(_) => crate::ledger::record_css("at-rule:@import"),
+            CssRule::FontFace(_) => crate::ledger::record_css("at-rule:@font-face"),
+            CssRule::Keyframes(_) => crate::ledger::record_css("at-rule:@keyframes"),
+            CssRule::Other(a) => crate::ledger::record_css(&format!("at-rule:@{}", a.name.to_ascii_lowercase())),
         }
     }
 }
 
-/// Compiles a selector list, keeping every selector the engine accepts,
-/// paired with the specificity the cascade should charge it.
-///
-/// Servo's selector parser rejects the whole list when ANY member uses
-/// syntax it doesn't implement. Component CSS (and every Tailwind build)
-/// ships long comma lists where one `:focus-visible` or `:has()` member
-/// would otherwise discard the declarations for all its siblings — on a
-/// typical shell that is hundreds of live rules lost, which is why whole
-/// headers and nav bars never got their layout properties. Recompiling
-/// member-by-member keeps the supported ones; lowering (above) recovers
-/// most of the rest; only what is left is ledgered.
-fn compile_selector_list(prelude: &str) -> Vec<(crate::dom::Selector, crate::dom::Specificity)> {
-    let mut out = Vec::new();
-    // Fast path: the whole list parses, no salvage machinery runs at all.
-    if let Ok(s) = crate::dom::Selectors::compile(prelude) {
-        for sel in s.0 {
-            let spec = sel.specificity();
-            out.push((sel, spec));
-        }
-        return out;
-    }
-    for part in split_selector_list(prelude) {
-        match crate::dom::Selectors::compile(part) {
-            Ok(s) => {
-                for sel in s.0 {
-                    let spec = sel.specificity();
-                    out.push((sel, spec));
-                }
-            }
-            Err(_) => lower_member(part, &mut out),
-        }
-    }
-    out
+/// A declaration's value as CSS text for the computed-value step.
+fn value_text(v: &[css_core::CV]) -> String {
+    css_core::serialize::to_css(css_core::parser::trim_ws(v))
 }
 
 pub fn apply_css(layout_tree: &mut LayoutTree, css: &str) {
@@ -1789,169 +1039,166 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
 }
 
-/// Applies a set of stylesheets as ONE cascade — rules from every sheet
-/// sort together by (importance, specificity, source order). Inline
-/// `style=""` declarations slot in at their CSS priority: above all
-/// normal rules, below `!important` rules; inline `!important` wins all.
+/// The cascaded style of every element of the document: for each element with a box, the
+/// `SpecifiedStyle` its winning declarations fold into (`None` when no declaration applies).
+///
+/// Per element: css_core's `cascade` (rule-hash candidates, matching, the full Cascade 5 sort, the style
+/// attribute) → its custom properties computed against the parent's (`compute_custom_properties`:
+/// inheritance, cycles, guaranteed-invalid) → every other declaration, in cascade order, `var()`
+/// substituted (`substitute_vars`; a failed substitution is invalid at computed-value time and dropped)
+/// and handed to `apply_declaration`. Elements whose winning declarations are the same list (and use no
+/// `var()`) share one folded style — the common case of every `<p>` or every `.reference` on a page.
+fn cascade_document(
+    doc: &html_core::Document,
+    rules: &css_core::cascade::RuleSet<'_>,
+    boxed: &std::collections::HashSet<html_core::NodeId>,
+) -> (
+    std::collections::HashMap<html_core::NodeId, std::rc::Rc<SpecifiedStyle>>,
+    std::collections::BTreeMap<String, Vec<css_core::CV>>,
+) {
+    use css_core::values::{compute_custom_properties, contains_var, substitute_vars};
+    use std::collections::{BTreeMap, HashMap};
+    use std::rc::Rc;
+    type Customs = Rc<BTreeMap<String, Vec<css_core::CV>>>;
+    let empty: Customs = Rc::new(BTreeMap::new());
+    let mut customs: HashMap<html_core::NodeId, Customs> = HashMap::new();
+    // each element's children's ancestor Bloom filter (css_core's quick reject)
+    let mut child_filter: HashMap<html_core::NodeId, css_core::cascade::AncestorFilter> = HashMap::new();
+    let mut shared: HashMap<Vec<usize>, Rc<SpecifiedStyle>> = HashMap::new();
+    let mut out = HashMap::new();
+    let mut root_customs = BTreeMap::new();
+    for id in doc.descendants(html_core::Document::ROOT) {
+        let Some(el) = doc.element(id) else { continue };
+        let inline = el.attr("style").map(css_core::stylesheet::parse_style_attribute).unwrap_or_default();
+        let me_el = crate::dom::El::new(doc, id);
+        let filter = doc.parent_element(id).and_then(|p| child_filter.get(&p)).copied().unwrap_or_default();
+        let applied = css_core::cascade::cascade_filtered(rules, &me_el, &inline, None, Some(&filter));
+        child_filter.insert(id, filter.with_element(&me_el));
+        // custom properties: inherited from the parent element, overridden by this element's own
+        let parent = doc.parent_element(id).and_then(|p| customs.get(&p)).cloned().unwrap_or_else(|| empty.clone());
+        let own: Vec<(String, Vec<css_core::CV>)> = applied
+            .iter()
+            .filter(|a| a.declaration.name.starts_with("--"))
+            .map(|a| (a.declaration.name.clone(), a.declaration.value.clone()))
+            .collect();
+        let mine = if own.is_empty() { parent } else { Rc::new(compute_custom_properties(&own, &parent)) };
+        if doc.parent(id) == Some(html_core::Document::ROOT) {
+            root_customs = (*mine).clone();
+        }
+        if !boxed.contains(&id) {
+            customs.insert(id, mine);
+            continue;
+        }
+        let decls: Vec<&css_core::parser::Declaration> =
+            applied.iter().map(|a| a.declaration).filter(|d| !d.name.starts_with("--")).collect();
+        if decls.is_empty() {
+            customs.insert(id, mine);
+            continue;
+        }
+        let uses_var = decls.iter().any(|d| contains_var(&d.value));
+        let key: Vec<usize> = decls.iter().map(|d| *d as *const _ as usize).collect();
+        let style = match (!uses_var).then(|| shared.get(&key)).flatten() {
+            Some(s) => s.clone(),
+            None => {
+                let mut s = SpecifiedStyle::default();
+                for d in &decls {
+                    let name = d.name.to_ascii_lowercase();
+                    if contains_var(&d.value) {
+                        match substitute_vars(&d.value, &|n| mine.get(n).cloned()) {
+                            Ok(v) => apply_declaration(&name, &value_text(&v), &mut s),
+                            Err(()) => crate::ledger::record_css(&format!("var-unresolved:{}", clip(&name))),
+                        }
+                    } else {
+                        apply_declaration(&name, &value_text(&d.value), &mut s);
+                    }
+                }
+                let s = Rc::new(s);
+                if !uses_var {
+                    shared.insert(key, s.clone());
+                }
+                s
+            }
+        };
+        out.insert(id, style);
+        customs.insert(id, mine);
+    }
+    (out, root_customs)
+}
+
+/// Applies a set of stylesheets (document order, author origin) as ONE cascade through css_core, with
+/// each element's `style` attribute at its CSS priority (above normal rules, below `!important` ones;
+/// an `!important` style attribute beats every author rule).
 pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
-    let vw = layout_tree.viewport.0;
-    set_viewport(vw, layout_tree.viewport.1);
-    // Custom properties first, so every rule's var() can resolve.
+    let t0 = std::time::Instant::now();
+    let (vw, vh) = layout_tree.viewport;
+    set_viewport(vw, vh);
+    let parsed: Vec<css_core::stylesheet::Stylesheet> =
+        sheets.iter().map(|s| css_core::stylesheet::parse_stylesheet(s)).collect();
+    for s in &parsed {
+        ledger_rules(&s.rules);
+    }
+    let env = media_environment(vw, vh);
+    let supports = |d: &css_core::parser::Declaration| property_supported(&d.name.to_ascii_lowercase());
+    let import = |_: &str| -> Option<&css_core::stylesheet::Stylesheet> { None };
+    let cond = css_core::cascade::Conditions { env: &env, supports: &supports, import: &import };
+    let mut rules = css_core::cascade::RuleSet::new();
+    for s in &parsed {
+        rules.add_sheet(s, css_core::cascade::Origin::Author, &cond);
+    }
+    let t_parse = t0.elapsed();
+    // AETHER_NO_RULE_INDEX: the full scan, for measuring the hash (tests/style_time.rs);
+    // AETHER_STYLE_PROFILE: print the phase times.
+    if std::env::var_os("AETHER_NO_RULE_INDEX").is_none() {
+        rules.build_index();
+    }
+
+    // The boxes of each DOM element (a layout node maps back to one DOM node).
+    let mut boxes: std::collections::HashMap<html_core::NodeId, Vec<taffy::NodeId>> = std::collections::HashMap::new();
+    let mut any: Option<crate::dom::NodeRef> = None;
+    for (tid, n) in &layout_tree.node_map {
+        if n.is_element() {
+            boxes.entry(n.id()).or_default().push(*tid);
+            any.get_or_insert_with(|| n.clone());
+        }
+    }
+    let Some(any) = any else {
+        STYLE_TIMING.with(|t| t.set((t0.elapsed(), std::time::Duration::ZERO)));
+        return;
+    };
+    let boxed: std::collections::HashSet<html_core::NodeId> = boxes.keys().copied().collect();
+    let t_c = std::time::Instant::now();
+    let (styles, root_customs) = any.with_doc(|doc, _| cascade_document(doc, &rules, &boxed));
+    if std::env::var_os("AETHER_STYLE_PROFILE").is_some() {
+        eprintln!(
+            "[style] parse + rule set {:?}, cascade {:?}, {} selector entries, rule hash {}",
+            t_parse,
+            t_c.elapsed(),
+            rules.entries.len(),
+            if rules.index().is_some() { "on" } else { "off (AETHER_NO_RULE_INDEX)" }
+        );
+    }
+    // The build-time inline-style pass (layout) resolves var() against the document's tokens.
     CUSTOM_PROPS.with(|m| {
         let mut map = m.borrow_mut();
         map.clear();
-        for css in sheets {
-            collect_custom_props(css, &mut map);
+        for (k, v) in &root_customs {
+            map.insert(k.clone(), value_text(v));
         }
     });
-    let mut rules = Vec::new();
-    for css in sheets {
-        collect_rules(css, 0, &mut rules, vw);
-    }
-    rules.sort_by(|a, b| {
-        a.important
-            .cmp(&b.important)
-            .then(a.specificity.cmp(&b.specificity))
-    });
 
-    // Element refs computed ONCE — matching is O(rules × elements) either
-    // way, but the per-pair node_map lookup + ref construction was the
-    // hot-path churn on rule-heavy pages.
-    // Element refs + local match facts (tag/id/classes) computed ONCE:
-    // simple compound rules match on these sets directly, bypassing the
-    // selector engine (whose has_class re-split class strings on every
-    // test — the profiled hot path).
-    struct ElemInfo {
-        el_ref: crate::dom::NodeDataRef<crate::dom::ElementData>,
-        tag: String,
-        id_attr: Option<String>,
-        classes: std::collections::HashSet<String>,
-    }
-    let elements: Vec<(taffy::NodeId, ElemInfo)> = layout_tree
-        .node_map
-        .iter()
-        .filter_map(|(id, n)| n.clone().into_element_ref().map(|el| (*id, el)))
-        .map(|(id, el_ref)| {
-            let attrs = el_ref.attributes.borrow();
-            let info = ElemInfo {
-                tag: el_ref.name.local.as_ref().to_ascii_lowercase(),
-                id_attr: attrs.get("id").map(str::to_string),
-                classes: attrs
-                    .get("class")
-                    .map(|c| c.split_whitespace().map(str::to_string).collect())
-                    .unwrap_or_default(),
-                el_ref: { drop(attrs); el_ref },
-            };
-            (id, info)
-        })
-        .collect();
-
-    // Inline style="" tiers, parsed once per node.
-    let mut inline_tiers: Vec<(taffy::NodeId, SpecifiedStyle, SpecifiedStyle, bool)> = Vec::new();
-    for (node_id, info) in &elements {
-        let Some(inline) = info.el_ref.attributes.borrow().get("style").map(|s| s.to_string()) else { continue };
-        let (normal, important, has_important) = parse_declaration_block_tiers(&inline);
-        inline_tiers.push((*node_id, normal, important, has_important));
-    }
-
-    // Accumulate each node's winning declarations in cascade order, then
-    // apply ONCE per node — one taffy style clone/set per styled node
-    // instead of one per matching rule.
-    let mut acc: std::collections::HashMap<taffy::NodeId, SpecifiedStyle> =
-        std::collections::HashMap::new();
-    // Page-level presence sets for the requirement filter.
-    let mut page_classes: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut page_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (_, info) in &elements {
-        for c in &info.classes {
-            page_classes.insert(c.as_str());
-        }
-        if let Some(id) = &info.id_attr {
-            page_ids.insert(id.as_str());
+    let mut acc: std::collections::HashMap<taffy::NodeId, std::rc::Rc<SpecifiedStyle>> = std::collections::HashMap::new();
+    for (dom_id, style) in styles {
+        for tid in boxes.get(&dom_id).into_iter().flatten() {
+            acc.insert(*tid, style.clone());
         }
     }
-
-    let merge_rules = |rules: &[&Rule], acc: &mut std::collections::HashMap<taffy::NodeId, SpecifiedStyle>| {
-        // Drop rules requiring a class/id absent from the entire page.
-        let rules: Vec<&Rule> = rules
-            .iter()
-            .filter(|r| {
-                r.required.iter().all(|(is_id, name)| {
-                    if *is_id { page_ids.contains(name.as_str()) } else { page_classes.contains(name.as_str()) }
-                })
-            })
-            .copied()
-            .collect();
-        let rules = &rules[..];
-        // Rule hash: an element only tests rules whose rightmost key it
-        // carries (plus Universal), in original (cascade) index order.
-        use std::collections::HashMap;
-        let mut by_id: HashMap<&str, Vec<usize>> = HashMap::new();
-        let mut by_class: HashMap<&str, Vec<usize>> = HashMap::new();
-        let mut by_tag: HashMap<&str, Vec<usize>> = HashMap::new();
-        let mut universal: Vec<usize> = Vec::new();
-        for (i, rule) in rules.iter().enumerate() {
-            match &rule.key {
-                RuleKey::Id(k) => by_id.entry(k).or_default().push(i),
-                RuleKey::Class(k) => by_class.entry(k).or_default().push(i),
-                RuleKey::Tag(k) => by_tag.entry(k).or_default().push(i),
-                RuleKey::Universal => universal.push(i),
-            }
-        }
-        let mut candidates: Vec<usize> = Vec::new();
-        for (node_id, info) in &elements {
-            candidates.clear();
-            candidates.extend_from_slice(&universal);
-            if let Some(v) = by_tag.get(info.tag.as_str()) {
-                candidates.extend_from_slice(v);
-            }
-            if let Some(id) = &info.id_attr {
-                if let Some(v) = by_id.get(id.as_str()) {
-                    candidates.extend_from_slice(v);
-                }
-            }
-            for class in &info.classes {
-                if let Some(v) = by_class.get(class.as_str()) {
-                    candidates.extend_from_slice(v);
-                }
-            }
-            candidates.sort_unstable();
-            for &i in candidates.iter() {
-                let matched = match &rules[i].plan {
-                    MatchPlan::Simple { tag, id, classes } => {
-                        tag.as_deref().map_or(true, |t| t == info.tag)
-                            && id.as_deref().map_or(true, |x| info.id_attr.as_deref() == Some(x))
-                            && classes.iter().all(|c| info.classes.contains(c))
-                    }
-                    MatchPlan::Engine => rules[i].selector.matches(&info.el_ref),
-                };
-                if matched {
-                    merge_specified(acc.entry(*node_id).or_default(), &rules[i].style);
-                }
-            }
-        }
-    };
-
-    let normal: Vec<&Rule> = rules.iter().filter(|r| !r.important).collect();
-    let important: Vec<&Rule> = rules.iter().filter(|r| r.important).collect();
-
-    merge_rules(&normal, &mut acc);
-    for (node_id, normal_spec, _, _) in &inline_tiers {
-        merge_specified(acc.entry(*node_id).or_default(), normal_spec);
-    }
-    merge_rules(&important, &mut acc);
-    for (node_id, _, important_spec, has_important) in &inline_tiers {
-        if *has_important {
-            merge_specified(acc.entry(*node_id).or_default(), important_spec);
-        }
-    }
-
     let mut abs_nodes = std::collections::HashSet::new();
     let mut inset_nodes = std::collections::HashSet::new();
     for (node_id, spec) in &acc {
         apply_spec_to_node(layout_tree, *node_id, spec, &mut abs_nodes, &mut inset_nodes);
     }
     size_flex_items_by_content(layout_tree, &acc);
+    LAST_CASCADE.with(|l| *l.borrow_mut() = acc.clone());
 
     // Static-position fallback: `position:absolute` with no inset specified
     // keeps its in-flow (static) position in real CSS. Taffy would pin such
@@ -1964,9 +1211,168 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
             let _ = layout_tree.taffy.set_style(*node_id, s);
         }
     }
-
+    let t1 = std::time::Instant::now();
     // set_style only marks nodes dirty; re-lay out with text measurement.
     crate::layout::remeasure(layout_tree);
+    STYLE_TIMING.with(|t| t.set((t1 - t0, t1.elapsed())));
+}
+
+thread_local! {
+    /// The folded `SpecifiedStyle` of each box from the last `apply_stylesheets`, for
+    /// [`computed_report`] (the facts the box tree no longer distinguishes: `display: flex` versus
+    /// Aether's block-as-column-flex approximation, `position`, `flex-direction`).
+    static LAST_CASCADE: std::cell::RefCell<std::collections::HashMap<taffy::NodeId, std::rc::Rc<SpecifiedStyle>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The properties [`computed_report`] serializes, in css_core's oracle order (CSSCORE SR47).
+pub const REPORT_PROPS: [&str; 20] = [
+    "display", "position", "color", "background-color", "font-size", "font-weight", "font-style", "font-family", "line-height",
+    "text-align", "text-decoration-line", "white-space", "visibility", "list-style-type", "border-top-width", "border-top-style",
+    "border-left-color", "padding-top", "margin-top", "flex-direction",
+];
+
+/// AETHERSTYLE (SR54) M5: AETHER's computed values — what its layout and paint actually consume after
+/// `apply_stylesheets` — serialized the way `getComputedStyle` serializes them, for every element of the
+/// tree's document (keyed by DOM node). Inherited properties follow the renderer's own inheritance
+/// (`render::draw_node`: the per-tag UA defaults of `layout::default_*`, the link colour, underline
+/// propagation); box properties come from the taffy style; the values Aether does not model are
+/// reported as what it effectively uses (sans/serif/monospace classes, solid borders, no list markers,
+/// static for every non-absolute position). An element without a box reports `display: none`.
+pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core::NodeId, [String; 20]> {
+    use std::collections::HashMap;
+    #[derive(Clone)]
+    struct Inh {
+        color: (u8, u8, u8),
+        font_size: f32,
+        bold: bool,
+        italic: bool,
+        family: u8,
+        line_height: f32,
+        text_align: u8,
+        underline: bool,
+        nowrap: bool,
+        hidden: bool,
+    }
+    fn num(v: f32) -> String {
+        let r = (v as f64 * 10000.0).round() / 10000.0;
+        if r == r.trunc() { format!("{}", r as i64) } else { format!("{r}") }
+    }
+    let px = |v: f32| format!("{}px", num(v));
+    let rgb = |c: (u8, u8, u8)| format!("rgb({}, {}, {})", c.0, c.1, c.2);
+    let lp = |v: LengthPercentage| {
+        use taffy::style::ExpandedLengthPercentage as E;
+        match v.expand() {
+            E::Percent(p) => format!("{}%", num(p * 100.0)),
+            E::Length(l) => px(l),
+            #[allow(unreachable_patterns)]
+            _ => "calc".to_string(),
+        }
+    };
+    let lpa_s = |v: LengthPercentageAuto| {
+        use taffy::style::ExpandedLengthPercentageAuto as E;
+        match v.expand() {
+            E::Auto => "auto".to_string(),
+            E::Percent(p) => format!("{}%", num(p * 100.0)),
+            E::Length(l) => px(l),
+            #[allow(unreachable_patterns)]
+            _ => "calc".to_string(),
+        }
+    };
+    let mut out = HashMap::new();
+    let Some(any) = tree.node_map.values().find(|n| n.is_element()) else { return out };
+    let mut box_of: HashMap<html_core::NodeId, taffy::NodeId> = HashMap::new();
+    for (tid, n) in &tree.node_map {
+        if n.is_element() {
+            box_of.insert(n.id(), *tid);
+        }
+    }
+    let last = LAST_CASCADE.with(|l| l.borrow().clone());
+    any.with_doc(|doc, _| {
+        let root = Inh {
+            color: (0, 0, 0), font_size: 16.0, bold: false, italic: false, family: 0, line_height: 0.0,
+            text_align: 0, underline: false, nowrap: false, hidden: false,
+        };
+        let mut inh: HashMap<html_core::NodeId, Inh> = HashMap::new();
+        for id in doc.descendants(html_core::Document::ROOT) {
+            let Some(el) = doc.element(id) else { continue };
+            let tag = el.local.as_str();
+            let parent = doc.parent_element(id).and_then(|p| inh.get(&p)).cloned().unwrap_or_else(|| root.clone());
+            let tid = box_of.get(&id).copied();
+            let paint = tid.and_then(|t| tree.paint_map.get(&t)).cloned().unwrap_or_default();
+            let spec = tid.and_then(|t| last.get(&t)).cloned();
+            let mut me = parent.clone();
+            me.font_size = paint.font_size.unwrap_or_else(|| crate::layout::default_font_size(tag, parent.font_size));
+            me.bold = paint.bold.unwrap_or_else(|| crate::layout::default_bold(tag, parent.bold));
+            me.italic = paint.italic.unwrap_or_else(|| crate::layout::default_italic(tag, parent.italic));
+            me.family = paint.family.unwrap_or_else(|| crate::layout::default_family(tag, parent.family));
+            if let Some(lh) = paint.line_height {
+                me.line_height = lh;
+            }
+            if let Some(a) = paint.text_align {
+                me.text_align = a;
+            }
+            if tag == "a" || tag == "u" {
+                me.underline = true;
+            }
+            if let Some(u) = paint.underline {
+                me.underline = u;
+            }
+            if let Some(nw) = paint.nowrap {
+                me.nowrap = nw;
+            }
+            if let Some(h) = paint.hidden {
+                me.hidden = h;
+            }
+            me.color = paint.color.unwrap_or(if tag == "a" { (0, 0, 238) } else { parent.color });
+            let st = tid.and_then(|t| tree.taffy.style(t).ok()).cloned();
+            let display = match (&st, &spec) {
+                (None, _) => "none",
+                (Some(s), _) if s.display == Display::None => "none",
+                (_, Some(sp)) if sp.flex_container == Some(true) => "flex",
+                _ if crate::layout::is_inline(tag) => "inline",
+                _ => "block",
+            };
+            let position = match spec.as_ref().and_then(|s| s.position) {
+                Some(taffy::style::Position::Absolute) => "absolute",
+                _ => "static",
+            };
+            let flex_direction = match spec.as_ref().and_then(|s| s.flex_direction) {
+                Some(FlexDirection::Column) => "column",
+                Some(FlexDirection::ColumnReverse) => "column-reverse",
+                Some(FlexDirection::RowReverse) => "row-reverse",
+                _ => "row",
+            };
+            let side = |i: usize| paint.border.and_then(|b| b[i]);
+            let bw_top = paint.border_width.and_then(|w| w[0]).or(side(0).map(|s| s.0)).unwrap_or(0.0);
+            let lh = if me.line_height <= 0.0 { "normal".to_string() } else { px(me.line_height * me.font_size) };
+            let values = [
+                display.to_string(),
+                position.to_string(),
+                rgb(me.color),
+                paint.background.map(rgb).unwrap_or_else(|| "rgba(0, 0, 0, 0)".to_string()),
+                px(me.font_size),
+                if me.bold { "700" } else { "400" }.to_string(),
+                if me.italic { "italic" } else { "normal" }.to_string(),
+                match me.family { 1 => "serif", 2 => "monospace", _ => "sans-serif" }.to_string(),
+                lh,
+                match me.text_align { 1 => "center", 2 => "right", _ => "start" }.to_string(),
+                if me.underline { "underline" } else { "none" }.to_string(),
+                if me.nowrap { "nowrap" } else { "normal" }.to_string(),
+                if me.hidden { "hidden" } else { "visible" }.to_string(),
+                "disc".to_string(),
+                px(if side(0).is_some() || bw_top > 0.0 { bw_top } else { 0.0 }),
+                if side(0).is_some() && bw_top > 0.0 { "solid" } else { "none" }.to_string(),
+                rgb(side(3).map(|s| s.1).unwrap_or(me.color)),
+                st.as_ref().map(|s| lp(s.padding.top)).unwrap_or_else(|| px(0.0)),
+                st.as_ref().map(|s| lpa_s(s.margin.top)).unwrap_or_else(|| px(0.0)),
+                flex_direction.to_string(),
+            ];
+            out.insert(id, values);
+            inh.insert(id, me);
+        }
+    });
+    out
 }
 
 /// A flex item's `width: auto` is its content size, not its container's.
@@ -1976,7 +1382,7 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
 /// width fall back to `auto` here, after the cascade has settled.
 fn size_flex_items_by_content(
     layout_tree: &mut LayoutTree,
-    acc: &std::collections::HashMap<taffy::NodeId, SpecifiedStyle>,
+    acc: &std::collections::HashMap<taffy::NodeId, std::rc::Rc<SpecifiedStyle>>,
 ) {
     for (node_id, spec) in acc {
         if spec.flex_container != Some(true) {
@@ -1998,108 +1404,6 @@ fn size_flex_items_by_content(
             if row {
                 st.size.width = Dimension::auto();
                 let _ = layout_tree.taffy.set_style(kid, st);
-            }
-        }
-    }
-}
-
-fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
-    if depth > 4 {
-        return; // pathological nesting guard
-    }
-    let mut parser = Parser::new(css);
-
-    loop {
-        // Slice the raw prelude up to the next `{`.
-        let start = parser.position();
-        let mut saw_block = false;
-        let mut at_rule: Option<String> = None;
-
-        loop {
-            let Ok(token) = parser.next() else { break };
-            match token {
-                Token::CurlyBracketBlock => {
-                    saw_block = true;
-                    break;
-                }
-                Token::AtKeyword(kw) => at_rule = Some(kw.as_ref().to_string()),
-                _ => {}
-            }
-        }
-        if !saw_block {
-            break; // end of stylesheet
-        }
-
-        let prelude = parser.slice_from(start);
-        let prelude = prelude.trim_end().trim_end_matches('{').trim().to_string();
-
-        // Capture the raw block body so it can be recursed or skipped.
-        let body = parser
-            .parse_nested_block(|p| {
-                let s = p.position();
-                while p.next().is_ok() {}
-                Ok::<String, cssparser::ParseError<()>>(p.slice_from(s).to_string())
-            })
-            .unwrap_or_default();
-
-        if let Some(kw) = at_rule {
-            match kw.as_str() {
-                "media" => {
-                    let condition = prelude.trim_start_matches("@media").trim();
-                    if media_matches(condition, vw) {
-                        collect_rules(&body, depth + 1, rules, vw);
-                    }
-                }
-                "supports" => {
-                    let condition = prelude.trim_start_matches("@supports").trim();
-                    if supports_matches(condition) {
-                        collect_rules(&body, depth + 1, rules, vw);
-                    }
-                }
-                other => crate::ledger::record_css(&format!("at-rule:@{}", other)),
-            }
-            continue;
-        }
-
-        // Pseudo-element rules (::before/::after/…) style generated boxes
-        // we don't create (no `content` support): known-unsupported, one
-        // ledger key — not thousands of compile failures.
-        if prelude.split(',').all(|sel| {
-            let sel = sel.trim();
-            sel.contains("::")
-                || [":before", ":after", ":placeholder", ":selection", ":marker",
-                    ":first-line", ":first-letter", ":backdrop"]
-                    .iter()
-                    .any(|p| sel.contains(p))
-        }) {
-            crate::ledger::record_css("pseudo-element-rule");
-            continue;
-        }
-        // Compile with the real selector engine (servo selectors over html_core, dom::select),
-        // salvaging modern syntax it rejects (see `lower_member`).
-        let selectors = compile_selector_list(&prelude);
-        if selectors.is_empty() {
-            continue;
-        }
-
-        let (normal, important, has_important) = parse_declaration_block_tiers(&body);
-        let normal = std::rc::Rc::new(normal);
-        for (selector, specificity) in selectors {
-            let text = selector.to_string();
-            let key = rule_key(&text);
-            let plan = match_plan(&text);
-            let required = required_tokens(&text);
-            rules.push(Rule { selector, style: normal.clone(), important: false, specificity, key, plan, required });
-        }
-        if has_important {
-            // Selector isn't Clone; the important tier compiles its own copy.
-            let important = std::rc::Rc::new(important);
-            for (selector, specificity) in compile_selector_list(&prelude) {
-                let text = selector.to_string();
-                let key = rule_key(&text);
-                let plan = match_plan(&text);
-                let required = required_tokens(&text);
-                rules.push(Rule { selector, style: important.clone(), important: true, specificity, key, plan, required });
             }
         }
     }
@@ -2210,55 +1514,6 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     merge_paint(&mut dst.paint, &src.paint);
 }
 
-/// Evaluates an @media condition against the fixed viewport. Comma = OR,
-/// "and" = AND. Unknown features evaluate false (and are ledgered), so a
-/// query is never wrongly applied.
-fn media_matches(condition: &str, vw: f32) -> bool {
-    if condition.is_empty() {
-        return true;
-    }
-    condition.split(',').any(|clause| {
-        clause.split(" and ").all(|part| {
-            let p = part.trim();
-            // `not X` negates one clause term.
-            if let Some(rest) = p.strip_prefix("not ") {
-                return !media_matches(rest.trim(), vw);
-            }
-            let p = p.trim_start_matches('(').trim_end_matches(')').trim();
-            match p {
-                "screen" | "all" => true,
-                "print" => false,
-                _ => {
-                    if let Some((feature, value)) = p.split_once(':') {
-                        let value = value.trim();
-                        match feature.trim() {
-                            "min-width" => parse_px(value).map(|v| vw >= v).unwrap_or(false),
-                            "max-width" => parse_px(value).map(|v| vw <= v).unwrap_or(false),
-                            // Honest environment answers, matching the JS
-                            // matchMedia prelude: light scheme, motion ok,
-                            // hover-capable pointer, landscape viewport.
-                            "prefers-color-scheme" => value == "light",
-                            "prefers-reduced-motion" => value == "no-preference",
-                            "prefers-reduced-transparency" => value == "no-preference",
-                            "prefers-contrast" => value == "no-preference",
-                            "hover" | "any-hover" => value == "hover",
-                            "pointer" | "any-pointer" => value == "fine",
-                            "orientation" => value == "landscape",
-                            f => {
-                                crate::ledger::record_css(&format!("media-feature:{}", f));
-                                false
-                            }
-                        }
-                    } else {
-                        crate::ledger::record_css(&format!("media-condition:{}", clip(p)));
-                        false
-                    }
-                }
-            }
-        })
-    })
-}
-
 /// Properties this engine genuinely implements (the honest support set
 /// for @supports; extend when apply_declaration grows an arm).
 fn property_supported(prop: &str) -> bool {
@@ -2289,29 +1544,6 @@ fn property_supported(prop: &str) -> bool {
             | "flex" | "flex-grow" | "flex-shrink" | "flex-basis" | "flex-wrap" | "flex-flow"
             | "gap" | "row-gap" | "column-gap"
     )
-}
-
-/// Evaluates an @supports condition against our real capability set.
-/// `not` inverts; and/or compose; unknown syntax evaluates false.
-fn supports_matches(condition: &str) -> bool {
-    let c = condition.trim();
-    if let Some(rest) = c.strip_prefix("not ") {
-        return !supports_matches(rest);
-    }
-    if c.contains(" or ") {
-        return c.split(" or ").any(supports_matches);
-    }
-    if c.contains(" and ") {
-        return c.split(" and ").all(supports_matches);
-    }
-    let inner = c.trim().trim_start_matches('(').trim_end_matches(')').trim();
-    match inner.split_once(':') {
-        Some((prop, _value)) => property_supported(prop.trim()),
-        None => {
-            crate::ledger::record_css(&format!("supports-condition:{}", clip(inner)));
-            false
-        }
-    }
 }
 
 /// Parses a CSS color from a string: named, #rgb/#rrggbb, rgb()/rgba().
@@ -2785,30 +2017,6 @@ mod tests {
         assert_eq!(parse_color_str("#336699"), Some((51, 102, 153)));
     }
 
-    #[test]
-    fn test_rule_key() {
-        assert_eq!(rule_key("div.hero"), RuleKey::Class("hero".into()));
-        assert_eq!(rule_key("#nav > ul li.item"), RuleKey::Class("item".into()));
-        assert_eq!(rule_key("body #main"), RuleKey::Id("main".into()));
-        assert_eq!(rule_key("nav ul > li"), RuleKey::Tag("li".into()));
-        assert_eq!(rule_key("*"), RuleKey::Universal);
-        // Pseudo/attr narrow a compound; the prefix still buckets it.
-        assert_eq!(rule_key("li:first-child"), RuleKey::Tag("li".into()));
-        assert_eq!(rule_key("input[type=text]"), RuleKey::Tag("input".into()));
-        assert_eq!(rule_key(".menu:hover"), RuleKey::Class("menu".into()));
-        assert_eq!(rule_key(":checked"), RuleKey::Universal);
-        assert_eq!(rule_key("[hidden]"), RuleKey::Universal);
-        // Combinator inside a functional pseudo must not split the compound.
-        assert_eq!(rule_key(":is(a > b).x"), RuleKey::Universal);
-        // Escaped punctuation is part of the identifier, not syntax: the
-        // bucket key must be the class string the DOM actually carries.
-        assert_eq!(rule_key(r".md\:block"), RuleKey::Class("md:block".into()));
-        assert_eq!(rule_key(r".lg\:flex:hover"), RuleKey::Class("lg:flex".into()));
-        assert_eq!(rule_key(r".w-1\/2"), RuleKey::Class("w-1/2".into()));
-        assert_eq!(rule_key(r".h-\[5\.75rem\]"), RuleKey::Class("h-[5.75rem]".into()));
-        assert_eq!(rule_key(r"div .md\:grid-cols-2"), RuleKey::Class("md:grid-cols-2".into()));
-    }
-
     /// Colour of the element with `id` after applying `css` to `html`.
     fn color_of(html: &str, css: &str, id: &str) -> Option<(u8, u8, u8)> {
         let mut tree = crate::layout::compute_layout(&crate::dom::parse_html(html));
@@ -2828,144 +2036,125 @@ mod tests {
         <input id="i" required>
     </body></html>"#;
 
-    /// `:is()`/`:where()` are not in servo's 2019 selector set. Distributing
-    /// them over their arguments keeps the rule alive.
+    /// Escaped punctuation is part of an identifier (CSS Syntax 3 §4.3.7): the
+    /// whole `md:`/`lg:` utility layer of a utility-CSS page keys and matches
+    /// on the class string the DOM actually carries.
     #[test]
-    fn test_lower_is_where_distributes() {
-        for sel in [
-            "body :is(.x, .y)",
-            "body :where(.x, .y)",
-            "body :matches(.x, .y)",
-            "body :-moz-any(.x, .y)",
-        ] {
+    fn test_escaped_utility_classes() {
+        let html = r#"<html><body><div id="a" class="md:block w-1/2 h-[5.75rem]">x</div></body></html>"#;
+        for sel in [r".md\:block", r".w-1\/2", r".h-\[5\.75rem\]", r"body .md\:block", r".md\3a block"] {
+            let css = format!("{sel} {{ color: rgb(1, 2, 3); }}");
+            assert_eq!(color_of(html, &css, "a"), Some((1, 2, 3)), "{sel}");
+        }
+    }
+
+    /// Selectors 4 through css_core (AETHERSTYLE): `:is()`/`:where()`, `:not()`
+    /// with a list, `:has()`, form states. (The legacy `:-webkit-any()` that
+    /// the old lowering rewrote is not a css_core pseudo-class: owed.)
+    #[test]
+    fn test_selectors4_match() {
+        for sel in ["body :is(.x, .y)", "body :where(.x, .y)"] {
             let css = format!("{sel} {{ color: rgb(1, 2, 3); }}");
             assert_eq!(color_of(LOWER_HTML, &css, "a"), Some((1, 2, 3)), "{sel}");
             assert_eq!(color_of(LOWER_HTML, &css, "b"), Some((1, 2, 3)), "{sel}");
         }
-        // Mid-compound, and with a complex argument in whole-compound
-        // position — `div :is(.x > span)` must reach the span.
-        assert_eq!(
-            color_of(LOWER_HTML, "p:is(.y, .z) { color: rgb(4, 5, 6); }", "b"),
-            Some((4, 5, 6))
-        );
-        assert_eq!(
-            color_of(LOWER_HTML, "body :is(.x > span) { color: rgb(7, 8, 9); }", "s"),
-            Some((7, 8, 9))
-        );
+        assert_eq!(color_of(LOWER_HTML, "p:is(.y, .z) { color: rgb(4, 5, 6); }", "b"), Some((4, 5, 6)));
+        assert_eq!(color_of(LOWER_HTML, "body :is(.x > span) { color: rgb(7, 8, 9); }", "s"), Some((7, 8, 9)));
+        assert_eq!(color_of(LOWER_HTML, "div.x:is(body > div) { color: rgb(7, 8, 9); }", "a"), Some((7, 8, 9)));
+        assert_eq!(color_of(LOWER_HTML, ".x:not(.q, .r) { color: rgb(1, 2, 3); }", "a"), Some((1, 2, 3)));
+        assert_eq!(color_of(LOWER_HTML, ".x:not(.q, .x) { color: rgb(1, 2, 3); }", "a"), None);
+        assert_eq!(color_of(LOWER_HTML, ".x:not(:focus-visible) { color: rgb(4, 5, 6); }", "a"), Some((4, 5, 6)));
+        assert_eq!(color_of(LOWER_HTML, ".x:has(> span) { color: rgb(4, 5, 6); }", "a"), Some((4, 5, 6)));
+        assert_eq!(color_of(LOWER_HTML, ".y:has(> span) { color: rgb(4, 5, 6); }", "b"), None);
+        assert_eq!(color_of(LOWER_HTML, "input:required { color: rgb(1, 2, 3); }", "i"), Some((1, 2, 3)));
+        assert_eq!(color_of(LOWER_HTML, "input:optional { color: rgb(1, 2, 3); }", "i"), None);
+        assert_eq!(color_of(LOWER_HTML, "input:placeholder-shown { color: rgb(1, 2, 3); }", "i"), None);
+        assert_eq!(color_of(LOWER_HTML, ":lang(en) { color: rgb(1, 2, 3); }", "a"), None);
+        assert_eq!(color_of(LOWER_HTML, ".x:focus-within { color: rgb(1, 2, 3); }", "a"), None);
     }
 
-    /// `:where()` contributes NOTHING to specificity, so a later-but-plainer
-    /// rule of equal weight wins on source order and a heavier one always
-    /// wins. Distributing must not smuggle the argument's weight in.
+    /// Specificity is the spec's (Selectors 4 §17): `:where()` weighs nothing,
+    /// `:is()`/`:not()`/`:has()` weigh their most specific argument.
     #[test]
-    fn test_lower_where_specificity() {
-        // `:where(.x)` weighs nothing => `#a:where(.x)` is (1,0,0), which a
-        // two-class selector (0,2,0) must NOT beat.
-        let css = r#"
-            #a:where(.x) { color: rgb(1, 1, 1); }
-            .x.x { color: rgb(2, 2, 2); }
-        "#;
+    fn test_selectors4_specificity() {
+        let css = "#a:where(.x) { color: rgb(1, 1, 1); } .x.x { color: rgb(2, 2, 2); }";
         assert_eq!(color_of(LOWER_HTML, css, "a"), Some((1, 1, 1)));
-        // `:is(.x)` DOES weigh: here the `:is` branch is (0,2,0) and, tied
-        // with the plain rule, later source order wins.
-        let css = r#"
-            .y:is(.y) { color: rgb(1, 1, 1); }
-            .y.y { color: rgb(2, 2, 2); }
-        "#;
+        let css = ".y:is(.y) { color: rgb(1, 1, 1); } .y.y { color: rgb(2, 2, 2); }";
+        assert_eq!(color_of(LOWER_HTML, css, "b"), Some((2, 2, 2)));
+        // `:is(#b, p)` weighs (1,0,0) even when it matches through `p`
+        let css = "p:is(#zz, p) { color: rgb(1, 1, 1); } p.y.y { color: rgb(2, 2, 2); }";
+        assert_eq!(color_of(LOWER_HTML, css, "b"), Some((1, 1, 1)));
+        let css = ":where(#b) { color: rgb(1, 1, 1); } p { color: rgb(2, 2, 2); }";
         assert_eq!(color_of(LOWER_HTML, css, "b"), Some((2, 2, 2)));
     }
 
-    /// Servo parses `:not(simple)` only. An argument LIST becomes a chain,
-    /// and an argument that can never match makes the negation a tautology.
+    /// A selector list with an INVALID member is an invalid selector, and the
+    /// whole style rule is dropped (Selectors 4 §4.1, what Chromium does); a
+    /// member that is valid but never matches (`::before`, `:focus-visible`)
+    /// leaves its siblings alone. Pseudo-element rules are ledgered: Aether
+    /// generates no `::before`/`::after` boxes yet.
     #[test]
-    fn test_lower_not_list_and_tautology() {
-        assert_eq!(
-            color_of(LOWER_HTML, ".x:not(.q, .r) { color: rgb(1, 2, 3); }", "a"),
-            Some((1, 2, 3))
-        );
-        assert_eq!(
-            color_of(LOWER_HTML, ".x:not(.q, .x) { color: rgb(1, 2, 3); }", "a"),
-            None,
-            "a negation that DOES match must still exclude the element"
-        );
-        // `:focus-visible` is a state we never enter, so negating it is
-        // always true — the rule must apply, not be dropped.
-        assert_eq!(
-            color_of(LOWER_HTML, ".x:not(:focus-visible) { color: rgb(4, 5, 6); }", "a"),
-            Some((4, 5, 6))
-        );
+    fn test_selector_list_validity() {
+        crate::ledger::reset();
+        let css = ".x::before, .y:focus-visible, .y { color: rgb(1, 2, 3); }";
+        assert_eq!(color_of(LOWER_HTML, css, "b"), Some((1, 2, 3)));
+        assert_eq!(color_of(LOWER_HTML, css, "a"), None);
+        let dump = format!("{:?}", crate::ledger::snapshot());
+        assert!(dump.contains("pseudo-element-rule"), "{dump}");
+        let css = ".x:-moz-ui-invalid, .y { color: rgb(1, 2, 3); }";
+        assert_eq!(color_of(LOWER_HTML, css, "b"), None, "an unknown pseudo-class invalidates the rule");
+        let css = ".x:is(:-moz-ui-invalid, .x), .y { color: rgb(1, 2, 3); }";
+        assert_eq!(color_of(LOWER_HTML, css, "a"), Some((1, 2, 3)), ":is() is forgiving");
     }
 
-    /// `:required`/`:optional` are attribute tests in disguise.
+    /// Custom properties cascade and inherit per element (css-variables 1):
+    /// element-scoped overrides, fallbacks, and cycles (guaranteed-invalid).
     #[test]
-    fn test_lower_required_optional() {
-        assert_eq!(
-            color_of(LOWER_HTML, "input:required { color: rgb(1, 2, 3); }", "i"),
-            Some((1, 2, 3))
-        );
-        assert_eq!(
-            color_of(LOWER_HTML, "input:optional { color: rgb(1, 2, 3); }", "i"),
-            None
-        );
+    fn test_custom_properties_per_element() {
+        let html = r#"<html><body><div id="o" class="t"><p id="i">x</p></div><p id="p">y</p>
+            <p id="c" class="cyc">z</p></body></html>"#;
+        let css = r#"
+            :root { --fg: rgb(1, 2, 3); }
+            .t { --fg: rgb(9, 8, 7); }
+            p { color: var(--fg); }
+            .cyc { --a: var(--b); --b: var(--a); color: var(--a, rgb(5, 5, 5)); }
+            #o { color: var(--missing, rgb(4, 4, 4)); }
+        "#;
+        assert_eq!(color_of(html, css, "p"), Some((1, 2, 3)));
+        assert_eq!(color_of(html, css, "i"), Some((9, 8, 7)), "inherited from the scoped override");
+        assert_eq!(color_of(html, css, "c"), Some((5, 5, 5)), "a cycle falls back");
+        assert_eq!(color_of(html, css, "o"), Some((4, 4, 4)));
     }
 
-    /// Everything that cannot be lowered still drops — but only its own
-    /// list member, and each under a named bucket rather than the residual
-    /// compile-failure key.
+    /// `@media` is Media Queries 4 (css_core) against Aether's viewport.
     #[test]
-    fn test_lower_buckets() {
-        for (sel, bucket) in [
-            (".x:has(> span)", "selector-has"),
-            (".x:focus-within", "selector-dynamic-state"),
-            (".x:-moz-ui-invalid", "selector-vendor-pseudo"),
-            (".x:placeholder-shown", "selector-form-state"),
-            (".x:lang(en)", "selector-lang-dir"),
-            (".x::-webkit-input-placeholder", "pseudo-element-rule"),
-            (".x:-ms-input-placeholder", "pseudo-element-rule"),
-            (".x:not(:has(> span))", "selector-has"),
-        ] {
-            crate::ledger::reset();
-            // The sibling member must survive the unsupported one.
-            let css = format!("{sel}, .y {{ color: rgb(1, 2, 3); }}");
-            assert_eq!(color_of(LOWER_HTML, &css, "b"), Some((1, 2, 3)), "{sel}");
-            assert_eq!(color_of(LOWER_HTML, &css, "a"), None, "{sel} must not match");
-            let dump = format!("{:?}", crate::ledger::snapshot());
-            assert!(dump.contains(bucket), "{sel} should ledger {bucket}: {dump}");
-            assert!(
-                !dump.contains("selector-compile-failed"),
-                "{sel} should have a NAMED bucket, not the residual key"
-            );
-        }
-    }
-
-    /// A selector list survives one unsupported member: the rest of the
-    /// list still compiles and still styles its elements.
-    #[test]
-    fn test_selector_list_partial_compile() {
-        let mut tree = crate::layout::compute_layout(&crate::dom::parse_html(
-            r#"<html><body><div class="md:block" id="a">x</div><p id="b">y</p></body></html>"#,
-        ));
-        // `:has()`/`:focus-visible` are not in this engine's selector set;
-        // the `p` and the escaped utility class must still get their colour.
-        apply_css(
-            &mut tree,
-            r#"p:has(> em), .md\:block, p { color: rgb(1, 2, 3); }"#,
-        );
-        let mut painted = 0;
-        for (node_id, dom_node) in &tree.node_map {
-            let Some(el) = dom_node.as_element() else { continue };
-            let id = el.attributes.borrow().get("id").map(str::to_string);
-            if matches!(id.as_deref(), Some("a") | Some("b")) {
-                assert_eq!(
-                    tree.paint_map.get(node_id).and_then(|p| p.color),
-                    Some((1, 2, 3)),
-                    "{:?} lost its declarations to an unsupported list member",
-                    id
-                );
-                painted += 1;
-            }
-        }
-        assert_eq!(painted, 2);
+    fn test_media_queries() {
+        let html = r#"<html><body><p id="p">y</p></body></html>"#;
+        let at = |q: &str, w: f32| {
+            let mut tree = crate::layout::compute_layout_sized(&crate::dom::parse_html(html), w, 600.0);
+            apply_css(&mut tree, &format!("@media {q} {{ p {{ color: rgb(1, 2, 3); }} }}"));
+            tree.node_map.iter().any(|(id, n)| {
+                n.as_element().is_some_and(|e| e.attributes.borrow().get("id") == Some("p"))
+                    && tree.paint_map.get(id).and_then(|p| p.color) == Some((1, 2, 3))
+            })
+        };
+        assert!(at("screen", 800.0));
+        assert!(!at("print", 800.0));
+        assert!(at("screen and (min-width: 600px)", 800.0));
+        assert!(!at("screen and (min-width: 1200px)", 800.0));
+        assert!(at("screen and (min-width: 1200px)", 1280.0));
+        assert!(at("(max-width: 900px)", 800.0));
+        assert!(at("print, screen", 800.0));
+        assert!(!at("(prefers-reduced-motion: reduce)", 800.0));
+        assert!(at("(prefers-color-scheme: light)", 800.0));
+        assert!(!at("(prefers-color-scheme: dark)", 800.0));
+        assert!(at("(hover: hover)", 800.0));
+        assert!(at("(orientation: landscape)", 800.0));
+        assert!(!at("not all", 800.0));
+        assert!(at("not print", 800.0));
+        assert!(at("(400px <= width < 900px)", 800.0));
+        assert!(!at("(400px <= width < 900px)", 1000.0));
+        assert!(at("(width >= 40em)", 800.0));
     }
 
     #[test]
@@ -2984,32 +2173,5 @@ mod tests {
         set_viewport(800.0, 600.0);
     }
 
-    #[test]
-    fn test_split_selector_list() {
-        assert_eq!(split_selector_list("a, b"), vec!["a", "b"]);
-        assert_eq!(split_selector_list(":is(a, b), c"), vec![":is(a, b)", "c"]);
-        assert_eq!(split_selector_list(r#"[x="a,b"], d"#), vec![r#"[x="a,b"]"#, "d"]);
-        assert_eq!(split_selector_list("*,:after,:before"), vec!["*", ":after", ":before"]);
-    }
 
-    #[test]
-    fn test_media_matches() {
-        assert!(media_matches("screen", 800.0));
-        assert!(!media_matches("print", 800.0));
-        assert!(media_matches("screen and (min-width: 600px)", 800.0));
-        assert!(!media_matches("screen and (min-width: 1200px)", 800.0));
-        assert!(media_matches("screen and (min-width: 1200px)", 1280.0));
-        assert!(media_matches("(max-width: 900px)", 800.0));
-        assert!(media_matches("print, screen", 800.0));
-        assert!(!media_matches("(prefers-reduced-motion: reduce)", 800.0));
-        // Honest environment answers + `not` negation.
-        assert!(media_matches("(prefers-color-scheme: light)", 800.0));
-        assert!(!media_matches("(prefers-color-scheme: dark)", 800.0));
-        assert!(media_matches("(prefers-reduced-motion: no-preference)", 800.0));
-        assert!(media_matches("(hover: hover)", 800.0));
-        assert!(media_matches("(orientation: landscape)", 800.0));
-        assert!(!media_matches("not all", 800.0));
-        assert!(media_matches("not print", 800.0));
-        assert!(!media_matches("screen and not (min-width: 600px)", 800.0));
-    }
 }

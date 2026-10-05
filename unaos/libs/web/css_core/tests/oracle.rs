@@ -100,3 +100,47 @@ fn m3_chromium_oracle_stress() {
     let (c_ok, c_all, _, _) = run_dir("tests/oracle-stress", 9);
     assert!(c_ok * 1000 >= c_all * 1000, "stress oracle regressed: {c_ok}/{c_all}");
 }
+
+/// AETHERSTYLE (SR54) M4: the rule hash and the ancestor Bloom filter are exact — on every element of
+/// all 27 oracle fixtures, the indexed cascade (with and without the element's `AncestorFilter`) yields
+/// the same declarations, in the same order, with the same sort keys, as the full scan over every rule.
+#[test]
+fn m4_rule_index_is_exact() {
+    use css_core::cascade::{cascade, cascade_filtered, AncestorFilter};
+    use css_core::parser::Declaration;
+    let (mut elements, mut applied, mut candidates_saved) = (0usize, 0usize, 0usize);
+    for sub in ["tests/oracle", "tests/oracle-stress"] {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(sub);
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().map(|e| e == "json").unwrap_or(false)).collect();
+        files.sort();
+        for f in &files {
+            let fx = json::parse(&std::fs::read_to_string(f).unwrap());
+            let styles: Vec<String> = fx.get("styles").unwrap().arr().iter().map(|s| s.str().to_string()).collect();
+            let dom = Dom::from_json(fx.get("dom").unwrap());
+            let env = || Environment::viewport(fx.get("width").unwrap().num(), fx.get("height").unwrap().num());
+            let (ua, author) = sheets(&styles);
+            let full = Styler::with_index(&ua, &author, env(), false);
+            let fast = Styler::with_index(&ua, &author, env(), true);
+            assert!(full.rules.index().is_none() && fast.rules.index().is_some());
+            let none: Vec<Declaration> = Vec::new();
+            let mut filters: Vec<AncestorFilter> = vec![AncestorFilter::new(); dom.nodes.len()];
+            for i in dom.preorder(0) {
+                if let Some(p) = dom.nodes[i].parent {
+                    filters[i] = filters[p].with_element(&dom.el(p));
+                }
+                let a = cascade(&full.rules, &dom.el(i), &none, None);
+                let b = cascade(&fast.rules, &dom.el(i), &none, None);
+                let c = cascade_filtered(&fast.rules, &dom.el(i), &none, None, Some(&filters[i]));
+                let key = |x: &css_core::cascade::Applied| (x.declaration as *const Declaration, x.order, x.index, x.specificity, x.important);
+                let ka: Vec<_> = a.iter().map(key).collect();
+                assert_eq!(ka, b.iter().map(key).collect::<Vec<_>>(), "{}: element {i} (index)", f.display());
+                assert_eq!(ka, c.iter().map(key).collect::<Vec<_>>(), "{}: element {i} (index + filter)", f.display());
+                elements += 1;
+                applied += a.len();
+            }
+            let st = fast.rules.index().unwrap().stats();
+            candidates_saved += st[0].1 + st[1].1 + st[2].1 + st[3].1;
+        }
+    }
+    println!("rule index exact on {elements} elements ({applied} applied declarations); {candidates_saved} keyed selector entries");
+}

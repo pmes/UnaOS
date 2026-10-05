@@ -418,7 +418,12 @@ pub fn sheets(styles: &[String]) -> (Stylesheet, Vec<Stylesheet>) {
 }
 
 impl<'a> Styler<'a> {
+    /// With the rule hash (AETHERSTYLE, SR54) built, as Aether runs it.
     pub fn new(ua: &'a Stylesheet, author: &'a [Stylesheet], env: Environment) -> Self {
+        Self::with_index(ua, author, env, true)
+    }
+
+    pub fn with_index(ua: &'a Stylesheet, author: &'a [Stylesheet], env: Environment, index: bool) -> Self {
         let mut rules = RuleSet::new();
         let supports = |_: &Declaration| true;
         let import = |_: &str| -> Option<&'a Stylesheet> { None };
@@ -426,6 +431,9 @@ impl<'a> Styler<'a> {
         rules.add_sheet(ua, Origin::UserAgent, &cond);
         for s in author {
             rules.add_sheet(s, Origin::Author, &cond);
+        }
+        if index {
+            rules.build_index();
         }
         Styler { rules, env }
     }

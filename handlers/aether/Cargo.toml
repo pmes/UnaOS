@@ -23,6 +23,9 @@ boa_engine = "0.22"
 boa_gc = "0.22"
 # AETHERDOM (SR49): the document model is UnaOS's own WHATWG parser + arena DOM (HTMLCORE, SR46).
 html_core = { path = "../../unaos/libs/web/html_core" }
+# AETHERSTYLE (SR54): CSS parsing, selector matching, @media/@supports/@layer, the cascade sort, var() and
+# calc() are UnaOS's own CSSCORE (SR47) — cssparser + selectors are gone.
+css_core = { path = "../../unaos/libs/web/css_core" }
 taffy = "0.14"
 reqwest = { version = "0.13", features = ["json", "stream", "blocking", "cookies"] }
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
@@ -36,9 +39,6 @@ clap = { version = "4.6", features = ["derive"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-cssparser = "0.38"
-selectors = "0.41"  # matcher over html_core's arena (dom::select) until CSSCORE (SR47)
-precomputed-hash = "0.1.1"  # utility: the trait selectors 0.41 requires of its atom types
 url = "2.5"
 font-kit = "0.14"
 pathfinder_geometry = "0.5"
@@ -47,3 +47,7 @@ resvg = { version = "0.48.1", optional = true }  # EYES bumped to latest stable 
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 directories = "6.0.0"
+
+# AETHERSTYLE (SR54): tests/style_time.rs verifies its fetched vectors with UnaOS's own SHA-256.
+[dev-dependencies]
+crypto_core = { path = "../../unaos/libs/sys/crypto_core" }
