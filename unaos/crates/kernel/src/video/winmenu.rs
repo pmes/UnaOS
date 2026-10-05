@@ -2777,7 +2777,7 @@ fn instgui_round(_pw: usize, _ph: usize) {
 /// the press box (`s.x[k]`) and `dx` reads `TPAD`.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
 pub fn shotmenu_selftest() {
-    static DONE: AtomicBool = AtomicBool::new(false);
+    if crate::tests::defer("shotmenu", shotmenu_selftest) { return; } static DONE: AtomicBool = AtomicBool::new(false); // LOGINFURN M3 (R80/R86): a fixture, so `tests shotmenu` fires it — at the demo chain's end it minted the "Glass" row (owner 0xffffff52) UNDER THE SETTER, flight 23's INSTALLBARE windows=1. SAME-LINE fold
     if DONE.swap(true, Ordering::AcqRel) {
         return;
     }
