@@ -1,0 +1,35 @@
+# VOLUMES (rmbp-ledger B366) M3 — `system/test-f/`: one FREE sample of every format the kernel claims, staged by the
+# builder onto the DATA volume (and by `arroyo esp-x86` onto the card's UnaFS root at /system/test-f). Peter, flight 22:
+# "maybe you can find free samples for all the various file format we need tested?" / "we need test-f under system".
+#
+# <staged name> <sha256 | -> <licence> <source>
+#   fetched rows: fetched at image time into target/testf-cache/ (curl), refused unless the sha256 is the pin.
+#     BSD-3-Clause (Chromium) = the Chromium project's test data (github.com/chromium/chromium LICENSE); the audio
+#     and AV1 rows are the very files libs/media/*/tests/vectors.txt already fetch for the oracles.
+#     bmpsuite (public domain) = Jason Summers' BMP Suite, as carried by image-rs/image's tests.
+#   generated rows (sha `-`): written by the builder itself (builder/src/main.rs `testf_generated`), CC0-1.0.
+# The set is < 1 MB (20 MB is the ceiling). `tests testf` on the running kernel lists staged vs claimed.
+TEST.WAV 0a8ff2608c7cb8b9fd2f9077f26220da14dc46a636c2930b912a6d62ff53c60e BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx_s16le.wav
+TEST.FLAC 5f4d585500284beee09124fcc3fa2a45d5931f0241d089a817ae3940bbc90ad0 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.flac
+TEST.OPUS 97020fece49ef9176f4e0ad83ef8cda0a0415691080d2c41859ba2673c2f1834 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx-opus.ogg
+TEST.OGG d38a6edbd595aafa08cef3f1749acdeafb4f471cb4fc4b37679292936ca6d89c BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.ogg
+TEST.MP3 46364ebce1b9b2f278b35a7dc05b10427a33c073cf085cfa1a4ab33f3d307565 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.mp3
+TEST.AAC 37fbe1221a9da383f857b2ce9407892386be93da1f3101545917866476c93cad BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.adts
+TEST.M4A 55d22abaade1ba04cc7a5063c4d5ef008be82965b1a1ef6675c3bce6d30acb77 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/sfx.m4a
+TEST.AIF ba13fda1a284103ef380ed83f4a197e4e28cb43a0aa823adb14b8e90e14b88c5 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear.aiff
+TEST.PNG 75008d58c9f5564824e4bdef69ea6f8b1bae77cbae7d17c933e22c2a096b46bb BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/web_tests/images/resources/dice.png
+APNG.PNG e3876c79d434ac1077942e3cf434e40b349001e52d9dcb3ef6b5ccd2af1eee9e BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/web_tests/images/resources/animated.png
+TEST.JPG 1ee8c25b2e3f0301cdc7e9b6fca1a128ba0880134667202295b4ff1321e4e3a0 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/web_tests/images/resources/flowchart.jpg
+TEST.GIF 1410b6138cffce1796f426c717c34af9566e4146baad87634b54714900b7571e BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/web_tests/images/resources/boston.gif
+LOSSLESS.WEBP bcac5478a1eac17600957055a6cb2c950fef9e9dbed9705713a2f8077ca68176 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/web_tests/images/resources/webp-color-profile-lossless.webp
+LOSSY.WEBP 80b132826369bd0f71eb1913d1fc209b942b33ab254fc8f52b4bab63c76b6037 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/web_tests/images/resources/webp-color-profile-lossy.webp
+ANIM.WEBP 292753f066add623af1e30bbeeca58f15b3d6d1052e12b13e30f21f8d3c14505 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/third_party/blink/web_tests/images/resources/webp-animated.webp
+TEST.BMP a9c4fbfbf8cb6df8d2d9d1484359d037aebd25078b21137bfd6c69739fcbe2e1 bmpsuite(public-domain) https://raw.githubusercontent.com/image-rs/image/main/tests/images/bmp/images/rgb24.bmp
+TEST.WEBM 834dbadab368d6dbdeaf973d8f2398a36d6fe584965781877ee46ffcc570ed59 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-320x240.webm
+TEST.MP4 2081972026e679775013102a63280331d8fae236dc8efef4ce4878a822cf4501 BSD-3-Clause(Chromium) https://raw.githubusercontent.com/chromium/chromium/main/media/test/data/bear-av1.mp4
+TEST.QOI - CC0-1.0 generated:qoi-64x64-gradient
+TEST.SVG - CC0-1.0 generated:svg
+TEST.TXT - CC0-1.0 generated:txt
+TEST.MD - CC0-1.0 generated:md
+TEST.JSON - CC0-1.0 generated:json
+TEST.CSV - CC0-1.0 generated:csv

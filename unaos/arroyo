@@ -9203,6 +9203,21 @@ esp_x86_unafs_card() {
     rm -f "$vol" "$card"
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$vol" -s "$unafs_mb" || {
         echo -e "${COLOR_RED}❌ UNAFSX86: tools/unafs init failed — no card image${COLOR_RESET}"; return 1; }
+    # VOLUMES (B366) M3: the builder's system/test-f (free format samples, builder/testf.list) onto the UnaFS root, so
+    # /system/test-f is on the volume `/` is — `tests testf` / `tests play` find it there before /boot/system/test-f.
+    local testf_dir="${WORKSPACE_DIR}/target/x86_64_data/system/test-f"
+    if [ -d "$testf_dir" ]; then
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- mkdir /system/test-f -i "$vol" >/dev/null || {
+            echo -e "${COLOR_RED}❌ VOLUMES: tools/unafs mkdir /system/test-f failed — no card image${COLOR_RESET}"; return 1; }
+        local tf_n=0 tf
+        for tf in "$testf_dir"/*; do
+            [ -f "$tf" ] || continue
+            cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$tf" /system/test-f -i "$vol" >/dev/null || {
+                echo -e "${COLOR_RED}❌ VOLUMES: tools/unafs put ${tf##*/} failed — no card image${COLOR_RESET}"; return 1; }
+            tf_n=$((tf_n + 1))
+        done
+        echo -e "${COLOR_GREEN}  • TEST-F: ${tf_n} file(s) onto the UnaFS root at /system/test-f (VOLUMES, B366)${COLOR_RESET}"
+    fi
     # SELFINSTALL2 (B310): the card's GPT is laid by `tools/una-card` over `amber_core` — the SAME core the
     # kernel's `install ssd --write` lays the SSD with (it replaced scripts/make-x86-card.py, byte-identical).
     cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/una-card/Cargo.toml" -- \
