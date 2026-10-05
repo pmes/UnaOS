@@ -317,13 +317,22 @@ where
         let s = Transform::scale(sx, sy);
         (s, t.mul(&Transform::scale(1.0 / sx, 1.0 / sy)))
     };
-    let m = cw.max(ch);
+    // The raster: the canvas plus a margin as wide as the graph can move content (outside it nothing reaches
+    // a visible pixel), at most one canvas. Content outside a filter region still feeds its primitives.
+    let kmax = ft.a.abs().max(ft.d.abs());
+    let mut margin = 0.0;
+    for op in &ops {
+        match reach(r, op, bbox, kmax) {
+            Some(v) => margin += v,
+            None => margin = f64::INFINITY,
+        }
+    }
+    let m = cw.max(ch).min(crate::fmath::ceil(margin) + 2.0);
     let limit_dev = Rect::new(-m, -m, cw + 2.0 * m, ch + 2.0 * m);
     let limit = match post.invert() {
         Some(inv) => limit_dev.transform(&inv),
         None => return Outcome::Nothing,
     };
-    // The raster: the canvas plus a margin (content outside a filter region still feeds its primitives).
     let wr = round_out(&limit);
     // A lone url() filter whose region is empty (or needs a missing bbox) renders nothing.
     if let [FilterFn::Url(id)] = ops.as_slice()
@@ -457,6 +466,40 @@ fn drop_shadow(src: &Pixmap, in_b: &IRect, b: &IRect, sx: f64, sy: f64, dx: f64,
     fe::over_into(&mut out, src, &all);
     fe::clip_to(&mut out, b);
     out
+}
+
+/// How far (working pixels) a filter can move content: the sum over its primitives of what each reads around a
+/// pixel (≈3σ for blurs, the offset, the morphology radius, the displacement scale, the kernel). `None` when
+/// unbounded (feTile reads its input anywhere in the region).
+fn reach(r: &Renderer, op: &FilterFn, bbox: Option<Rect>, k: f64) -> Option<f64> {
+    let blur = |sd: f64| if sd > 0.0 { 3.0 * sd * k + 2.0 } else { 0.0 };
+    match op {
+        FilterFn::Blur(sd) => Some(blur(*sd)),
+        FilterFn::DropShadow { dx, dy, sd, .. } => Some(blur(*sd) + (dx.abs().max(dy.abs())) * k + 1.0),
+        FilterFn::Matrix(_) | FilterFn::Transfer(_) => Some(0.0),
+        FilterFn::Url(id) => {
+            let f = r.doc.by_id(id)?;
+            let obb = r.doc.nodes[f].attr("primitiveUnits").map(|v| v.trim() == "objectBoundingBox").unwrap_or(false);
+            let u = if obb { bbox.map(|b| b.w.max(b.h)).unwrap_or(0.0) } else { 1.0 } * k;
+            let mut total = 0.0;
+            for p in r.doc.elements(f) {
+                let nd = &r.doc.nodes[p];
+                let nums = |a: &str| nd.attr(a).map(number_list_partial).unwrap_or_default().iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                total += match nd.name() {
+                    "feGaussianBlur" => blur(nums("stdDeviation") * u / k),
+                    "feDropShadow" => blur(nd.attr("stdDeviation").map(|_| nums("stdDeviation")).unwrap_or(2.0) * u / k) + nd.attr("dx").map(|_| nums("dx")).unwrap_or(2.0).max(nd.attr("dy").map(|_| nums("dy")).unwrap_or(2.0)) * u + 1.0,
+                    "feOffset" => nums("dx").max(nums("dy")) * u + 1.0,
+                    "feMorphology" => nums("radius") * u + 1.0,
+                    "feDisplacementMap" => nums("scale") * u + 1.0,
+                    "feConvolveMatrix" => nums("order").max(3.0),
+                    "feDiffuseLighting" | "feSpecularLighting" => 1.0,
+                    "feTile" => return None,
+                    _ => 0.0,
+                };
+            }
+            Some(total)
+        }
+    }
 }
 
 /// The `<filter>` element's attribute sources. Chromium does not follow `href` on `<filter>` (Filter Effects 1
