@@ -298,6 +298,24 @@ impl CryptoProvider for CryptoCoreProvider {
         rsa::verify_pkcs1v15(&key, rsa_hash(hash), msg, sig).map_err(|_| CryptoError::BadSignature)
     }
 
+    /// CTCORE: FIPS 203 ML-KEM-768 from crypto_core (d, z drawn from this provider's DRBG / pool).
+    fn mlkem768_keypair(&self) -> Result<(KxPrivate, Vec<u8>), CryptoError> {
+        let mut seed = [0u8; 64];
+        self.random(&mut seed)?;
+        let (d, z) = seed.split_at(32);
+        let (ek, dk) = crypto_core::mlkem::mlkem768::keygen_internal(d.try_into().unwrap(), z.try_into().unwrap());
+        seed.fill(0);
+        Ok((KxPrivate { bytes: dk.to_vec() }, ek.to_vec()))
+    }
+
+    fn mlkem768_decaps(&self, dk: &KxPrivate, ct: &[u8]) -> Result<[u8; 32], CryptoError> {
+        crypto_core::mlkem::mlkem768::decaps(&dk.bytes, ct).map_err(|_| CryptoError::Unsupported("ML-KEM-768: bad ciphertext or key length"))
+    }
+
+    fn supports_group(&self, _group: crate::msgs::NamedGroup) -> bool {
+        true
+    }
+
     fn supports_signature(&self, scheme: SignatureScheme) -> bool {
         let _ = scheme;
         true

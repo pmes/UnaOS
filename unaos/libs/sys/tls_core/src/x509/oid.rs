@@ -50,3 +50,15 @@ pub const CT_PRECERT_SCTS: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0xd6, 0x79, 0
 pub const CT_OCSP_SCTS: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0xd6, 0x79, 0x02, 0x04, 0x05];
 /// id-pkix-ocsp-nonce (1.3.6.1.5.5.7.48.1.2) — recognised in a response, never required for a stapled one.
 pub const OCSP_NONCE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
+/// id-pe-tlsfeature (1.3.6.1.5.5.7.1.24, RFC 7633).
+pub const PE_TLS_FEATURE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18];
+/// CRL extensions (RFC 5280 §5.2): cRLNumber (2.5.29.20), deltaCRLIndicator (2.5.29.27),
+/// issuingDistributionPoint (2.5.29.28), freshestCRL (2.5.29.46); entry extensions: reasonCode (2.5.29.21),
+/// invalidityDate (2.5.29.24), certificateIssuer (2.5.29.29).
+pub const CE_CRL_NUMBER: u8 = 20;
+pub const CE_REASON_CODE: u8 = 21;
+pub const CE_INVALIDITY_DATE: u8 = 24;
+pub const CE_DELTA_CRL_INDICATOR: u8 = 27;
+pub const CE_ISSUING_DISTRIBUTION_POINT: u8 = 28;
+pub const CE_CERTIFICATE_ISSUER: u8 = 29;
+pub const CE_FRESHEST_CRL: u8 = 46;

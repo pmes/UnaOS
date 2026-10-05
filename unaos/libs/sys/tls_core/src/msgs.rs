@@ -205,6 +205,10 @@ impl CipherSuite {
 pub enum NamedGroup {
     X25519,
     Secp256r1,
+    /// CTCORE (SR60): the hybrid ML-KEM-768 + X25519 group (draft-ietf-tls-ecdhe-mlkem, codepoint 0x11EC):
+    /// client share = ML-KEM-768 ek (1184) ‖ X25519 public (32); server share = ML-KEM ciphertext (1088) ‖ X25519
+    /// public (32); shared secret = ML-KEM shared secret (32) ‖ X25519 shared secret (32). TLS 1.3 only.
+    X25519MLKEM768,
 }
 
 impl NamedGroup {
@@ -212,14 +216,20 @@ impl NamedGroup {
         match self {
             NamedGroup::X25519 => 0x001d,
             NamedGroup::Secp256r1 => 0x0017,
+            NamedGroup::X25519MLKEM768 => 0x11ec,
         }
     }
     pub fn from_code(c: u16) -> Option<Self> {
         match c {
             0x001d => Some(NamedGroup::X25519),
             0x0017 => Some(NamedGroup::Secp256r1),
+            0x11ec => Some(NamedGroup::X25519MLKEM768),
             _ => None,
         }
+    }
+    /// A KEM-based group (TLS 1.3 only; never a TLS 1.2 ECDHE curve).
+    pub fn is_hybrid(self) -> bool {
+        matches!(self, NamedGroup::X25519MLKEM768)
     }
 }
 

@@ -1,9 +1,9 @@
-//! Certificate Transparency SCTs (RFC 6962 §3.2–3.3): PARSED and REPORTED, not verified and not required.
+//! Certificate Transparency SCTs (RFC 6962 §3.2–3.3): the wire form. Verification against a log list and
+//! Chrome's CT policy live in [`crate::ct`] (CTCORE, SR60).
 //!
 //! Three places carry a SignedCertificateTimestampList: the leaf's X.509 extension (1.3.6.1.4.1.11129.2.4.2),
 //! the TLS signed_certificate_timestamp extension (1.2 ServerHello / 1.3 leaf CertificateEntry), and the stapled
-//! OCSP response's single extension (…2.4.5). Verifying an SCT needs the log's public key from a log list
-//! (Chrome's / Apple's), which this core does not carry — the ceiling, stated in TLSCORE2.md.
+//! OCSP response's single extension (…2.4.5).
 
 use alloc::vec::Vec;
 
@@ -28,6 +28,10 @@ pub struct Sct {
     pub hash_alg: u8,
     pub sig_alg: u8,
     pub signature_len: usize,
+    /// CtExtensions (opaque; RFC 6962 defines none, static-ct-api logs put a leaf_index here).
+    pub extensions: Vec<u8>,
+    /// The digitally-signed signature bytes (DER ECDSA-Sig-Value or an RSASSA-PKCS1-v1_5 block).
+    pub signature: Vec<u8>,
 }
 
 /// Parses a TLS-encoded SignedCertificateTimestampList. Malformed lists yield `None` (an SCT is informational:
@@ -48,12 +52,23 @@ pub fn parse_list(list: &[u8], source: SctSource) -> Option<Vec<Sct>> {
         log_id.copy_from_slice(s.take(32).ok()?);
         let ts = s.take(8).ok()?;
         let timestamp = u64::from_be_bytes(ts.try_into().ok()?);
-        let extensions_len = s.vec16().ok()?.len();
+        let extensions = s.vec16().ok()?.to_vec();
         let hash_alg = s.u8().ok()?;
         let sig_alg = s.u8().ok()?;
-        let signature_len = s.vec16().ok()?.len();
+        let signature = s.vec16().ok()?.to_vec();
         s.expect_end().ok()?;
-        out.push(Sct { source, version, log_id, timestamp, extensions_len, hash_alg, sig_alg, signature_len });
+        out.push(Sct {
+            source,
+            version,
+            log_id,
+            timestamp,
+            extensions_len: extensions.len(),
+            hash_alg,
+            sig_alg,
+            signature_len: signature.len(),
+            extensions,
+            signature,
+        });
     }
     Some(out)
 }

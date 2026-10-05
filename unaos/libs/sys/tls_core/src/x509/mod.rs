@@ -1,7 +1,9 @@
 //! X.509 (RFC 5280) for TLS server authentication: a strict DER reader, certificate parsing, path building and
 //! validation, RFC 6125 hostname matching, and the PEM trust store.
 
+pub mod aia;
 pub mod cert;
+pub mod crl;
 pub mod der;
 pub mod name;
 pub mod ocsp;

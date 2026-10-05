@@ -41,11 +41,12 @@ pub struct TlsContext<'a> {
 pub struct Verified {
     cn: [u8; 64],
     n: usize,
+    ct: tls_core::ct::CtStatus,
 }
 
 impl Verified {
     fn new(s: &str) -> Self {
-        let mut v = Verified { cn: [0; 64], n: 0 };
+        let mut v = Verified { cn: [0; 64], n: 0, ct: tls_core::ct::CtStatus::Off };
         // Printable ASCII only (it goes to the serial wire and the 8x8 font), at most 64 bytes.
         for c in s.bytes().filter(|c| (0x20..0x7f).contains(c)).take(64) {
             v.cn[v.n] = c;
@@ -55,6 +56,11 @@ impl Verified {
     }
     pub fn issuer(&self) -> &str {
         core::str::from_utf8(&self.cn[..self.n]).unwrap_or("?")
+    }
+    /// CTCORE: the Certificate Transparency verdict — `policy`, `no_scts`, `insufficient`, `bad_sig`,
+    /// `stale_list`, or `off` (no log list staged).
+    pub fn ct(&self) -> &'static str {
+        self.ct.as_str()
     }
 }
 
@@ -104,6 +110,9 @@ pub fn describe(e: &TlsError) -> &'static str {
             CertError::NameMismatch => "cert-name-mismatch",
             CertError::PathTooLong => "cert-path-too-long",
             CertError::NoTrustAnchors => "no-trust-anchors",
+            CertError::CtPolicy(_) => "cert-ct-policy",
+            CertError::MustStaple => "cert-must-staple-missing",
+            CertError::BadCrl(_) => "cert-crl-bad",
         },
         TlsError::BadRecordMac => "bad-record-mac",
         TlsError::Closed => "closed",
@@ -158,7 +167,9 @@ impl ServerCertVerifier for IssuerVerifier<'_> {
     fn verify_server_cert_full(&self, p: &dyn CryptoProvider, peer: &tls_core::x509::PeerCertificates<'_>, name: Option<&str>) -> Result<tls_core::x509::CertVerdict, TlsError> {
         let v = self.web.verify_server_cert_full(p, peer, name)?;
         let cn = peer.chain.first().and_then(|d| Certificate::parse(d).ok()).and_then(|c| c.issuer_cn());
-        self.issuer.set(Some(Verified::new(cn.as_deref().unwrap_or("?"))));
+        let mut ver = Verified::new(cn.as_deref().unwrap_or("?"));
+        ver.ct = v.ct.status;
+        self.issuer.set(Some(ver));
         Ok(v)
     }
 }

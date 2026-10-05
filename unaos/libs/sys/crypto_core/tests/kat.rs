@@ -56,3 +56,8 @@ fn m5_p384() {
 fn m6_rsa_verify() {
     run(&["rsa/"]);
 }
+
+#[test]
+fn m7_sha3_mlkem() {
+    run(&["sha3/", "mlkem/"]);
+}

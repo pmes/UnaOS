@@ -110,6 +110,12 @@ pub enum CertError {
     Revoked,
     /// A stapled OCSP response that does not verify for this leaf (the reason names the check).
     BadOcspResponse(&'static str),
+    /// CT strict mode: the chain does not meet Chrome's CT policy (the `ct=` word names why).
+    CtPolicy(&'static str),
+    /// RFC 7633: the leaf demands a stapled OCSP response (must-staple) and no valid one arrived.
+    MustStaple,
+    /// A caller-supplied CRL for a certificate on the path did not verify or apply (the reason names the check).
+    BadCrl(&'static str),
 }
 
 /// Every failure tls_core can report.
@@ -157,7 +163,7 @@ impl TlsError {
                 CertError::BadDer(_) => AlertDescription::BadCertificate,
                 CertError::NoCertificate => AlertDescription::DecodeError,
                 CertError::Revoked => AlertDescription::CertificateRevoked,
-                CertError::BadOcspResponse(_) => AlertDescription::BadCertificateStatusResponse,
+                CertError::BadOcspResponse(_) | CertError::MustStaple => AlertDescription::BadCertificateStatusResponse,
                 _ => AlertDescription::BadCertificate,
             },
             TlsError::BadRecordMac => AlertDescription::BadRecordMac,

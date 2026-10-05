@@ -72,7 +72,7 @@ pub trait ServerCertVerifier {
             (None, false) => OcspStatus::NotRequested,
         };
         let scts = x509::verify::collect_scts(peer.chain.first().map(|v| v.as_slice()), peer.sct_list);
-        Ok(x509::CertVerdict { key, ocsp, scts, pool_intermediates: 0 })
+        Ok(x509::CertVerdict { key, ocsp, scts, pool_intermediates: 0, ct: crate::ct::CtVerdict::off(), crl: Default::default(), must_staple: false })
     }
 }
 
@@ -85,9 +85,15 @@ pub struct ClientConfig<'a> {
     pub alpn: Vec<Vec<u8>>,
     /// Offered cipher suites in preference order (filtered by what the provider supports).
     pub cipher_suites: Vec<CipherSuite>,
-    /// supported_groups in preference order; the FIRST gets a key_share in the initial ClientHello, the others are
-    /// reachable through HelloRetryRequest.
+    /// supported_groups in preference order (filtered by what the provider supports); the first
+    /// [`ClientConfig::key_shares`] get a key_share in the initial ClientHello, the others are reachable through
+    /// HelloRetryRequest. Default (CTCORE): X25519MLKEM768, X25519, secp256r1 — the post-quantum hybrid offered
+    /// first, X25519 shared alongside it so a server without ML-KEM answers in one round trip.
     pub groups: Vec<NamedGroup>,
+    /// How many of the leading offered groups carry a key_share in the first ClientHello. 0 (the default) =
+    /// automatic: two when the first offered group is the hybrid (it, plus the classical group after it — the
+    /// X25519 fallback costs no round trip), one otherwise (TLSCORE's behaviour, unchanged).
+    pub key_shares: usize,
     pub verifier: &'a dyn ServerCertVerifier,
     /// Middlebox compatibility mode (RFC 8446 Appendix D.4): a 32-byte legacy_session_id and one dummy
     /// change_cipher_spec record before the client's second flight.
@@ -130,7 +136,8 @@ impl<'a> ClientConfig<'a> {
             server_name: server_name.map(String::from),
             alpn: Vec::new(),
             cipher_suites: CipherSuite::ALL.to_vec(),
-            groups: alloc::vec![NamedGroup::X25519, NamedGroup::Secp256r1],
+            groups: alloc::vec![NamedGroup::X25519MLKEM768, NamedGroup::X25519, NamedGroup::Secp256r1],
+            key_shares: 0,
             verifier,
             compat_mode: true,
             max_fragment: record::MAX_FRAGMENT,
@@ -162,8 +169,12 @@ pub struct Negotiated {
     pub resumed: bool,
     /// The stapled OCSP verdict (RFC 6960).
     pub ocsp: x509::ocsp::OcspStatus,
-    /// Certificate Transparency SCTs seen (embedded, TLS, OCSP) — parsed, not verified.
+    /// Certificate Transparency SCTs seen (embedded, TLS, OCSP).
     pub scts: Vec<x509::sct::Sct>,
+    /// CTCORE: the CT verdict (`ct=` policy / no_scts / insufficient / bad_sig / stale_list / off).
+    pub ct: crate::ct::CtVerdict,
+    /// CTCORE: what the trust store's CRLs said about the path.
+    pub crl: x509::crl::CrlReport,
     /// Intermediates the verifier took from the trust store's pool because the server omitted them.
     pub pool_intermediates: usize,
 }
@@ -474,11 +485,43 @@ impl<'a, T: Transport> Client<'a, T> {
                 let (private, public) = self.p.p256_keypair()?;
                 Share { group, private, public }
             }
+            NamedGroup::X25519MLKEM768 => {
+                // draft-ietf-tls-ecdhe-mlkem §3: ek ‖ X25519 public; the private half keeps dk ‖ X25519 scalar.
+                let (dk, mut public) = self.p.mlkem768_keypair()?;
+                let (xsk, xpk) = self.p.x25519_keypair()?;
+                let mut bytes = dk.bytes.clone();
+                bytes.extend_from_slice(&xsk.bytes);
+                public.extend_from_slice(&xpk);
+                Share { group, private: KxPrivate { bytes }, public }
+            }
         })
     }
 
-    fn shared_secret(&self, share: &Share, peer: &[u8]) -> Result<[u8; 32], TlsError> {
+    /// The configured groups this provider can serve, in preference order.
+    fn offered_groups(&self) -> Vec<NamedGroup> {
+        self.cfg.groups.iter().copied().filter(|g| self.p.supports_group(*g)).collect()
+    }
+
+    fn shared_secret(&self, share: &Share, peer: &[u8]) -> Result<Vec<u8>, TlsError> {
+        if share.group == NamedGroup::X25519MLKEM768 {
+            // Server share: ML-KEM-768 ciphertext (1088) ‖ X25519 public (32); secret: ML-KEM ss ‖ X25519 ss.
+            if peer.len() != 1088 + 32 {
+                return Err(illegal("X25519MLKEM768 key_exchange length"));
+            }
+            let dk = KxPrivate { bytes: share.private.bytes[..2400].to_vec() };
+            let xs = KxPrivate { bytes: share.private.bytes[2400..].to_vec() };
+            let k = self.p.mlkem768_decaps(&dk, &peer[..1088]).map_err(|_| illegal("ML-KEM-768 ciphertext"))?;
+            let x = self.p.x25519_shared(&xs, &peer[1088..]).map_err(|_| illegal("x25519 shared secret"))?;
+            let mut out = k.to_vec();
+            out.extend_from_slice(&x);
+            return Ok(out);
+        }
+        self.shared_secret_ec(share, peer).map(|s| s.to_vec())
+    }
+
+    fn shared_secret_ec(&self, share: &Share, peer: &[u8]) -> Result<[u8; 32], TlsError> {
         match share.group {
+            NamedGroup::X25519MLKEM768 => Err(illegal("hybrid group in an ECDHE context")),
             NamedGroup::X25519 => {
                 if peer.len() != 32 {
                     return Err(illegal("x25519 key_exchange length"));
@@ -512,7 +555,7 @@ impl<'a, T: Transport> Client<'a, T> {
         index: usize,
         random: &[u8; 32],
         session_id: &[u8],
-        share: &Share,
+        shares: &[Share],
         cookie: Option<&[u8]>,
         psk: Option<&crate::resumption::Ticket>,
     ) -> Vec<u8> {
@@ -524,7 +567,8 @@ impl<'a, T: Transport> Client<'a, T> {
         let schemes = self.offered_schemes();
         let sni = self.cfg.server_name.as_deref().and_then(msgs::sni_name);
         let (v13, v12) = self.offered_versions();
-        let shares = [(share.group, share.public.as_slice())];
+        let shares: Vec<(NamedGroup, &[u8])> = shares.iter().map(|s| (s.group, s.public.as_slice())).collect();
+        let groups = self.offered_groups();
         let mut versions = Vec::new();
         if v13 {
             versions.push(msgs::TLS13);
@@ -537,7 +581,7 @@ impl<'a, T: Transport> Client<'a, T> {
             session_id,
             cipher_suites: &suites,
             server_name: sni.as_deref(),
-            groups: &self.cfg.groups,
+            groups: &groups,
             key_shares: if v13 { &shares } else { &[] },
             signature_schemes: &schemes,
             alpn: &self.cfg.alpn,
@@ -606,7 +650,8 @@ impl<'a, T: Transport> Client<'a, T> {
     }
 
     fn handshake(&mut self) -> Result<(), TlsError> {
-        if self.cfg.groups.is_empty() {
+        let groups = self.offered_groups();
+        if groups.is_empty() {
             return Err(TlsError::State("no groups configured"));
         }
         let mut random = [0u8; 32];
@@ -616,14 +661,23 @@ impl<'a, T: Transport> Client<'a, T> {
             session_id.resize(32, 0);
             self.p.random(&mut session_id)?;
         }
-        let mut share = self.make_share(self.cfg.groups[0])?;
+        // KAT overrides carry exactly one share; otherwise the first `key_shares` offered groups get one.
+        let n_shares = if !self.cfg.hello_overrides.is_empty() {
+            1
+        } else if self.cfg.key_shares == 0 {
+            if groups[0].is_hybrid() && groups.len() > 1 { 2 } else { 1 }
+        } else {
+            self.cfg.key_shares.clamp(1, groups.len())
+        };
+        let mut shares: Vec<Share> = groups[..n_shares].iter().map(|g| self.make_share(*g)).collect::<Result<_, _>>()?;
         let mut ticket = self.pick_ticket();
-        let mut ch1 = self.build_hello(0, &random, &session_id, &share, None, ticket.as_ref());
+        let mut ch1 = self.build_hello(0, &random, &session_id, &shares, None, ticket.as_ref());
         if let Some(t) = &ticket {
             self.patch_binder(&mut ch1, t, &[])?;
         }
         let mut offered = msgs::parse_client_hello(&ch1)?;
-        if self.offered_versions().0 && offered.key_share_groups.first() != Some(&share.group.code()) {
+        let codes = |v: &[Share]| v.iter().map(|s| s.group.code()).collect::<Vec<u16>>();
+        if self.offered_versions().0 && offered.key_share_groups != codes(&shares) {
             return Err(TlsError::State("ClientHello key_share does not match the generated share"));
         }
         let mut transcript = Transcript::new();
@@ -649,7 +703,7 @@ impl<'a, T: Transport> Client<'a, T> {
                     return Err(illegal("HelloRetryRequest selected an unusable group"));
                 }
                 let group = NamedGroup::from_code(g).ok_or(illegal("group"))?;
-                share = self.make_share(group)?;
+                shares = alloc::vec![self.make_share(group)?];
             }
             transcript.replace_with_message_hash(self.p, suite.hash());
             transcript.add(&sh_msg);
@@ -657,12 +711,12 @@ impl<'a, T: Transport> Client<'a, T> {
             if ticket.as_ref().is_some_and(|t| t.suite.hash() != suite.hash()) {
                 ticket = None;
             }
-            let mut ch2 = self.build_hello(1, &random, &session_id, &share, sh.cookie.as_deref(), ticket.as_ref());
+            let mut ch2 = self.build_hello(1, &random, &session_id, &shares, sh.cookie.as_deref(), ticket.as_ref());
             if let Some(t) = &ticket {
                 self.patch_binder(&mut ch2, t, transcript.bytes())?;
             }
             offered = msgs::parse_client_hello(&ch2)?;
-            if offered.key_share_groups.first() != Some(&share.group.code()) {
+            if offered.key_share_groups.first() != shares.first().map(|s| s.group.code()).as_ref() {
                 return Err(TlsError::State("ClientHello2 key_share does not match the generated share"));
             }
             transcript.add(&ch2);
@@ -677,7 +731,7 @@ impl<'a, T: Transport> Client<'a, T> {
         if !hello_retry && sh.selected_version.is_none() && self.offered_versions().1 {
             // No supported_versions: a TLS 1.2 (or older) ServerHello.
             let offered13 = self.offered_versions().0;
-            drop(share);
+            drop(shares);
             return self.handshake12(transcript, &offered, &sh, &sh_msg, offered13);
         }
         self.check_sh_common(&sh, &offered)?;
@@ -706,11 +760,9 @@ impl<'a, T: Transport> Client<'a, T> {
             AlertDescription::MissingExtension,
             "ServerHello without key_share",
         ))?;
-        if g != share.group.code() {
-            return Err(illegal("ServerHello key_share group not the one we sent"));
-        }
-        let shared = self.shared_secret(&share, &peer_key)?;
-        drop(share);
+        let share = shares.iter().find(|s| s.group.code() == g).ok_or(illegal("ServerHello key_share group not one we sent"))?;
+        let mut shared = self.shared_secret(share, &peer_key)?;
+        drop(shares);
         self.suite = suite;
         self.hash = suite.hash();
         let alg = self.hash;
@@ -719,6 +771,8 @@ impl<'a, T: Transport> Client<'a, T> {
         let psk = if resumed { ticket.as_ref().map(|t| t.psk.clone()) } else { None };
         let mut ks = KeySchedule::new(self.p, alg, psk.as_deref());
         ks.input_ecdhe(&shared)?;
+        shared.fill(0);
+        core::hint::black_box(&shared);
         let th = transcript.hash(self.p, alg);
         let c_hs = ks.derive(b"c hs traffic", th.as_bytes())?;
         let s_hs = ks.derive(b"s hs traffic", th.as_bytes())?;
@@ -841,6 +895,8 @@ impl<'a, T: Transport> Client<'a, T> {
             resumed,
             ocsp: cert_verdict.as_ref().map(|v| v.ocsp.clone()).unwrap_or(x509::ocsp::OcspStatus::NotRequested),
             scts: cert_verdict.as_ref().map(|v| v.scts.clone()).unwrap_or_default(),
+            ct: cert_verdict.as_ref().map(|v| v.ct.clone()).unwrap_or_else(crate::ct::CtVerdict::off),
+            crl: cert_verdict.as_ref().map(|v| v.crl.clone()).unwrap_or_default(),
             pool_intermediates: cert_verdict.as_ref().map(|v| v.pool_intermediates).unwrap_or(0),
         });
         Ok(())
