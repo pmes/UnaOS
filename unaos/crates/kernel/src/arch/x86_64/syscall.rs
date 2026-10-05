@@ -3236,7 +3236,7 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 /// plus the console: 10 + 1 = 11, and 12 leaves a row of margin. Raising it alone would have been
 /// pointless (the process table would still refuse the 7th launch) and raising the others without it
 /// would have traded a `-EAGAIN` at spawn for an `-ENFILE` at the first `SYS_WIN_CREATE`.
-const WIN_MAX: usize = 12;
+const WIN_MAX: usize = crate::video::wm::MAX_WINDOWS; // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold: no literal; the ring-3 table is as wide as the id space and the live limit is `video::wincap`
 /// HEADROOM: was `WIN_MAX == FB_WIN_SLOTS`. That equality was never the requirement — it was two
 /// caps that happened to share a value, and it silently made every per-address-space REGION SLOT
 /// index legal as a global window id and vice versa. The real requirement is one-directional and is
@@ -14541,7 +14541,7 @@ struct Proc {
 ///     line again.
 /// Everything else was already parametric and needed no edit: the reserve/free/find/census loops,
 /// `BG_KILLS`, and the per-slot sidecar arrays.
-const MAX_PROCS: usize = 10;
+const MAX_PROCS: usize = crate::arch::memory::USER_SLOTS - 2; // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold: derived from the address-space pool (its 2-slot reserve kept), not written down; the live limit is `video::wincap::proc_limit()`
 static PROCS: [Proc; MAX_PROCS] = [const {
     Proc {
         pid: AtomicU64::new(0),
