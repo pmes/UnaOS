@@ -323,7 +323,7 @@ def self_test(keep=False):
         f.write("[prof] summary armed=no hz=1000 samples=1 dropped=0 span_ms=1 cap=4096 anchor=%#x\n" % run(ANCHOR, 0))
         f.write("[prof] cpu=0 task=1 ring=0 rip=%#x\n" % run("_start"))  # a B331 (depth-1, no prog=) dump
         f.write("[prof] dump end samples=1\n")
-        f.write("[prof] summary armed=no hz=1000 samples=1000 dropped=0 span_ms=1000 cap_words=32768 anchor=%#x\n" % run(ANCHOR, 0))
+        f.write("[prof] summary armed=no hz=1000 samples=1000 dropped=0 span_ms=1000 cap_words=65536 anchor=%#x\n" % run(ANCHOR, 0))
         f.write("[prof] prog id=1 name=STAT\n[prof] prog id=2 name=LUMEN\n[prof] prog id=3 name=GONE\n")
         f.write("[prof] name tid=7 name=prof2-load\n[prof] name tid=9 name=STAT\n")
         k = 0

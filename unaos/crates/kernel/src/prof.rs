@@ -46,7 +46,7 @@ use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, O
 use crate::console::Console;
 
 /// Words per CPU ring. A sample is `2 + depth` words (header, PC, callers).
-pub const RING_WORDS: usize = 32768;
+pub const RING_WORDS: usize = 65536;
 /// Deepest caller chain one sample records.
 pub const MAX_DEPTH: usize = 32;
 /// CPU slots (the larger of the two arches' `MAX_CPUS`/`NUM_CPUS`).

@@ -31,7 +31,7 @@ No new file under video/, fs/, install/, selfhost/ or the shell files. No new kn
   static boot stack), strictly increasing; every return address must lie in the kernel image's executable
   `PT_LOAD` range (from `__ehdr_start`, computed at `prof start`) or the walk stops. Ring-3 contexts are
   not walked. No fault is possible in the ISR: nothing is read that the bounds did not prove mapped. The
-  rings become variable-length (header word, RIP, callers), 32768 words per CPU, heap-allocated at the
+  rings become variable-length (header word, RIP, callers), 65536 words (512 KiB) per CPU, heap-allocated at the
   first `prof start` as before. The metal shape builds with `-C force-frame-pointers=yes` (arroyo's
   `KERNEL_FP_RUSTFLAGS` on the QEMU kernel line; the builder sets the same RUSTFLAGS on its kernel
   `cargo`, which is the build the ESP carries). `tools/flame` folds the stacks and draws a real
