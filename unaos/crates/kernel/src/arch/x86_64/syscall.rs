@@ -3236,7 +3236,7 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 /// plus the console: 10 + 1 = 11, and 12 leaves a row of margin. Raising it alone would have been
 /// pointless (the process table would still refuse the 7th launch) and raising the others without it
 /// would have traded a `-EAGAIN` at spawn for an `-ENFILE` at the first `SYS_WIN_CREATE`.
-const WIN_MAX: usize = 12;
+const WIN_MAX: usize = crate::video::wm::MAX_WINDOWS; // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold: no literal; the ring-3 table is as wide as the id space and the live limit is `video::wincap`
 /// HEADROOM: was `WIN_MAX == FB_WIN_SLOTS`. That equality was never the requirement — it was two
 /// caps that happened to share a value, and it silently made every per-address-space REGION SLOT
 /// index legal as a global window id and vice versa. The real requirement is one-directional and is
@@ -14541,7 +14541,7 @@ struct Proc {
 ///     line again.
 /// Everything else was already parametric and needed no edit: the reserve/free/find/census loops,
 /// `BG_KILLS`, and the per-slot sidecar arrays.
-const MAX_PROCS: usize = 10;
+const MAX_PROCS: usize = crate::arch::memory::USER_SLOTS - 2; // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold: derived from the address-space pool (its 2-slot reserve kept), not written down; the live limit is `video::wincap::proc_limit()`
 static PROCS: [Proc; MAX_PROCS] = [const {
     Proc {
         pid: AtomicU64::new(0),
@@ -15213,9 +15213,9 @@ fn sys_spawn() -> i64 {
     };
     // Claim the Proc entry FIRST, so a failed alloc frees only the entry, and so the pid slot exists to
     // receive the real pid before the child can be dispatched.
-    let Some(pi) = proc_reserve() else {
-        return EAGAIN; // process table full
-    };
+    let Some(pi) = (if proc_table_headroom().1 >= crate::video::wincap::proc_limit() { None } else { proc_reserve() }) else { // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold, code first: the live process limit (`video::wincap::proc_limit`, derived) is asked before a row is claimed
+        crate::video::wincap::note_spawn_refused(proc_table_headroom().1); return EAGAIN; // process table full — WINDOWCAP: said on the wire, and the SPAWNER is paused (doubling backoff), not the machine
+    }; crate::video::wincap::note_spawn_admitted(); // WINDOWCAP: an admitted spawn resets the spawner's backoff
     // Reserve a HANDLE slot BEFORE allocating the address space (a RESERVING placeholder). A full
     // handle table fails here with only the Proc entry to release — nothing loaded or spawned yet.
     let Some(h) = handle_install(slot, HANDLE_RESERVING) else {

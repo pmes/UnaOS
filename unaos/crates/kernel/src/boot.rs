@@ -150,6 +150,7 @@ pub fn ignite(why: &'static str) {
     if LATCH.swap(true, Ordering::AcqRel) {
         return;
     }
+    crate::video::wincap::witness(); // WINDOWCAP (B378, R90): the limit's arming line + the witness, once, at the first desktop
     if before == Phase::Desktop {
         return; // the boot was already a Desktop (no pre-Desktop phase to end): nothing to order
     }

@@ -359,9 +359,9 @@ const LABEL_MAX: usize = 8;
 const MAX_STRIP_W: usize = strip::MAX_STRIP_W;
 
 /// The layout cannot ask for a strip the scratch cannot hold. A `const` proof rather than a runtime
-/// clamp, so a future `LABEL_MAX` or `MAX_WINDOWS` raise fails the BUILD.
+/// clamp, so a future `LABEL_MAX` or `MAX_WINDOWS` raise fails the BUILD. WINDOWCAP (B378, R90): the proof is for the pins + the eleven app windows R90 promises; past that the dock row count is `wincap::dock_rows`, whose `for_panel` refuses (via `strip::frame_centred`) any strip wider than the scratch — so the id space (32) at scale 4 is never asked for.
 #[allow(dead_code)] pub(crate) fn uimetrics_assert() {
-    assert!(2 * PAD() + wm::MAX_WINDOWS * (2 * PAD() + CELL_W()) + (wm::MAX_WINDOWS - 1) * PAD()
+    assert!(2 * PAD() + (super::wincap::DOCK_PINS + 11) * (2 * PAD() + CELL_W()) + ((super::wincap::DOCK_PINS + 11) - 1) * PAD()
         <= MAX_STRIP_W); // UIMETRICS (B372): ONE-glyph tiles — at a large scale `Layout::for_panel` steps the caption down to fit, so the full-caption worst case (3318 px at 2.5) is no longer the bound; a full table of one-glyph tiles is
     // The caption must fit inside the tile it is centred in, or there is nothing to draw.
     assert!(CELL_H() <= TILE_H());
