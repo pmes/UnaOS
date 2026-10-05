@@ -17,3 +17,27 @@ pub mod parser;
 pub mod regexp;
 pub mod string;
 pub mod unicode;
+pub mod builtins;
+pub mod bytecode;
+pub mod compiler;
+pub mod vm;
+
+/// x * 2^k with correct handling of overflow and subnormal results.
+pub fn numconv_ldexp(x: f64, k: i32) -> f64 {
+    let mut x = x;
+    let mut k = k;
+    while k > 1000 {
+        x *= bignum::pow2(1000);
+        k -= 1000;
+    }
+    while k < -1000 {
+        x *= bignum::pow2(-1000);
+        k += 1000;
+    }
+    if k < -1022 {
+        // two steps to avoid double rounding into subnormals as far as possible
+        x * bignum::pow2(k + 600) * bignum::pow2(-600)
+    } else {
+        x * bignum::pow2(k)
+    }
+}

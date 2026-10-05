@@ -5,6 +5,8 @@
 
 #[path = "../tests/t262/meta.rs"]
 mod meta;
+#[path = "../tests/t262/host.rs"]
+mod host;
 #[path = "../tests/t262/runner.rs"]
 mod runner;
 

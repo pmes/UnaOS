@@ -1,6 +1,10 @@
 //! The test262 driver shared by the `js_core-test262` example and the `cargo test` gate.
 
+use super::host::{install, TestHost};
 use super::meta::{parse_meta, Meta, OUT_OF_SCOPE};
+use js_core::vm::{Value, Vm};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -91,6 +95,163 @@ pub fn run_parse(src: &str, m: &Meta) -> (Outcome, String) {
     (Outcome::Pass, String::new())
 }
 
+/// Harness file cache.
+pub struct Harness {
+    pub dir: PathBuf,
+    pub files: std::collections::HashMap<String, String>,
+}
+
+impl Harness {
+    pub fn load(root: &Path) -> Harness {
+        let dir = root.join("harness");
+        let mut files = std::collections::HashMap::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().map(|x| x == "js").unwrap_or(false) {
+                    if let Ok(s) = std::fs::read_to_string(&p) {
+                        files.insert(p.file_name().unwrap().to_string_lossy().to_string(), s);
+                    }
+                }
+            }
+        }
+        Harness { dir, files }
+    }
+}
+
+/// Run one test in one mode (strict or sloppy). Returns Ok(()) or a failure description.
+pub fn run_one(h: &Harness, path: &Path, src: &str, m: &Meta, strict: bool) -> Result<(), String> {
+    let out = Rc::new(RefCell::new(String::new()));
+    let host = TestHost { out: out.clone(), base: path.parent().unwrap().to_path_buf() };
+    let mut vm = Vm::new(Box::new(host));
+    vm.budget = Some(400_000_000);
+    install(&mut vm);
+    let raw = m.has_flag("raw");
+    let module = m.has_flag("module");
+    let is_async = m.has_flag("async");
+    let negative_type = m.negative_type.clone();
+    let negative_phase = m.negative_phase.clone();
+    // Harness
+    if !raw {
+        let mut incs: Vec<String> = vec!["assert.js".into(), "sta.js".into()];
+        if is_async {
+            incs.push("doneprintHandle.js".into());
+        }
+        for i in &m.includes {
+            if !incs.contains(i) {
+                incs.push(i.clone());
+            }
+        }
+        for i in incs {
+            let text = match h.files.get(&i) {
+                Some(t) => t.clone(),
+                None => return Err(format!("missing harness file {}", i)),
+            };
+            let text = if strict { format!("\"use strict\";\n{}", text) } else { text };
+            if let Err(e) = vm.run_script_str(&text) {
+                let msg = vm.error_string(&e);
+                return Err(format!("harness {} failed: {}", i, msg));
+            }
+        }
+    }
+    let result: Result<Value, Value> = if module {
+        let name = path.to_string_lossy().to_string();
+        match vm.module_from_source(js_core::string::JsStr::from_str(&name), src) {
+            Err(e) => Err(e),
+            Ok(md) => match vm.load_requested(md).and_then(|_| vm.link_module(md)) {
+                Err(e) => Err(e),
+                Ok(()) => match vm.evaluate_module(md) {
+                    Err(e) => Err(e),
+                    Ok(p) => {
+                        let _ = vm.run_jobs();
+                        // A rejected evaluation promise is an uncaught error.
+                        match &vm.heap.get(p).kind {
+                            js_core::vm::Kind::Promise(pd) if pd.state == js_core::vm::PromiseState::Rejected => Err(pd.result.clone()),
+                            _ => Ok(Value::Undefined),
+                        }
+                    }
+                },
+            },
+        }
+    } else {
+        let text = if strict { format!("\"use strict\";\n{}", src) } else { src.to_string() };
+        vm.run_script_str(&text)
+    };
+    let job_err = match &result {
+        Ok(_) => match vm.run_jobs() {
+            Ok(()) => None,
+            Err(e) => Some(e),
+        },
+        Err(_) => None,
+    };
+    let result = match (result, job_err) {
+        (Ok(_), Some(e)) => Err(e),
+        (r, _) => r,
+    };
+    if vm.terminated {
+        return Err(String::from("timeout (instruction budget exhausted)"));
+    }
+    match (result, &negative_type) {
+        (Err(e), Some(t)) => {
+            let name = error_name(&mut vm, &e);
+            if &name == t {
+                Ok(())
+            } else {
+                Err(format!("expected {} ({}), got {}", t, negative_phase.as_deref().unwrap_or(""), vm.error_string(&e)))
+            }
+        }
+        (Err(e), None) => Err(format!("uncaught {}", vm.error_string(&e))),
+        (Ok(_), Some(t)) => Err(format!("expected {} to be thrown", t)),
+        (Ok(_), None) => {
+            if is_async {
+                let o = out.borrow();
+                if o.contains("Test262:AsyncTestComplete") {
+                    Ok(())
+                } else if let Some(i) = o.find("Test262:AsyncTestFailure") {
+                    Err(o[i..].lines().next().unwrap_or("").to_string())
+                } else {
+                    Err(String::from("async test did not complete"))
+                }
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn error_name(vm: &mut Vm, e: &Value) -> String {
+    if let Value::Object(o) = e {
+        if let Ok(c) = vm.get(*o, &js_core::vm::PropertyKey::from_str("constructor")) {
+            if let Value::Object(co) = c {
+                if let Ok(Value::String(n)) = vm.get(co, &js_core::vm::PropertyKey::from_str("name")) {
+                    return n.to_rust();
+                }
+            }
+        }
+    }
+    String::from("?")
+}
+
+pub fn run_test(h: &Harness, path: &Path, src: &str, m: &Meta) -> (Outcome, String) {
+    let mut variants: Vec<bool> = Vec::new();
+    if m.has_flag("module") || m.has_flag("raw") {
+        variants.push(false);
+    } else {
+        if !m.has_flag("onlyStrict") {
+            variants.push(false);
+        }
+        if !m.has_flag("noStrict") {
+            variants.push(true);
+        }
+    }
+    for strict in variants {
+        if let Err(e) = run_one(h, path, src, m, strict) {
+            return (Outcome::Fail, format!("[{}] {}", if strict { "strict" } else { "sloppy" }, e));
+        }
+    }
+    (Outcome::Pass, String::new())
+}
+
 pub fn dir_key(rel: &str) -> String {
     let parts: Vec<&str> = rel.split('/').collect();
     if parts.len() >= 3 {
@@ -107,6 +268,7 @@ pub struct Report {
 
 pub fn run(cfg: &Config) -> Report {
     let files = Arc::new(collect(&cfg.root, &cfg.filters));
+    let harness = Arc::new(Harness::load(&cfg.root));
     let idx = Arc::new(AtomicUsize::new(0));
     let results: Arc<Mutex<Vec<(String, Outcome, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
@@ -116,6 +278,7 @@ pub fn run(cfg: &Config) -> Report {
         let results = results.clone();
         let root = cfg.root.clone();
         let parse_only = cfg.parse_only;
+        let harness = harness.clone();
         let h = std::thread::Builder::new()
             .stack_size(256 << 20)
             .spawn(move || loop {
@@ -138,7 +301,14 @@ pub fn run(cfg: &Config) -> Report {
                         Err(_) => (Outcome::Fail, String::from("panic")),
                     }
                 } else {
-                    (Outcome::Skip, String::from("run mode not available"))
+                    let h = &harness;
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_test(h, p, &src, &m))) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                            (Outcome::Fail, format!("panic: {}", msg))
+                        }
+                    }
                 };
                 results.lock().unwrap().push((rel, o, d));
             })
