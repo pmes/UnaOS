@@ -127,6 +127,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "holocron_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -464,6 +471,7 @@ dependencies = [
  "elf_core",
  "fdt",
  "font8x8",
+ "holocron_core",
  "lazy_static",
  "linked_list_allocator",
  "midden_core",

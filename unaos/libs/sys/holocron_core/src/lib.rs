@@ -15,6 +15,7 @@
 //! | [`cc`] | the production suite over CRYPTOCORE: Argon2id, HKDF-SHA-256, ChaCha20-Poly1305, Ed25519, and the DRBG entropy bridge |
 //! | [`ring`] | the ring: Argon2id key from the login password, held for the session, `lock` wipes it |
 //! | [`wire`] | the bus verbs (144..=151), bodies, statuses, principal projection |
+//! | [`frame`] | the BANDY v1 frame around a body — the metal transport (HOLOCRON2, B355) |
 //! | [`service`] | the dispatcher: owner-only, rate-limited unlock, the `Store` seam |
 //! | [`agent`] | the SSH agent protocol framing over the ring's Ed25519 keys |
 //! | [`keysource`] | the consumer rule: ask Holocron first, fall back only on NotFound |
@@ -30,6 +31,7 @@ extern crate alloc;
 pub mod agent;
 pub mod cc;
 pub mod format;
+pub mod frame;
 pub mod keysource;
 pub mod name;
 pub mod ring;
