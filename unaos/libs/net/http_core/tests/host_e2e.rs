@@ -238,8 +238,10 @@ fn tls13_resumption_across_agents_and_processes() {
     let st = stats(&a2, &base);
     println!("resumption: tickets kept={kept} file={}B connections={} reused={} version={}", meta.len(), st.connections, st.reused, st.version);
     assert!(kept >= 1, "the server's NewSessionTickets were kept");
-    assert_eq!(st.connections, 2, "two Agents, two connections");
-    assert_eq!(st.reused, 1, "the second connection resumed from the file's ticket");
+    // a1's connection is full; every later one (a2's, and /stats' when a2's pool had not parked its connection
+    // yet — the pool race HTTPCORE documents) resumes from a file-loaded ticket.
+    assert!(st.connections >= 2, "two Agents, at least two connections");
+    assert_eq!(st.reused, st.connections - 1, "every connection after the first resumed from the file's tickets");
 }
 
 #[test]
