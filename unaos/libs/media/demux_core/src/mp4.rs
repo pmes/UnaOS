@@ -163,6 +163,21 @@ pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
     }
     .map(|d| Timebase { num: 1, den: movie_ts as u64 }.to_ns(d as i64) as u64);
 
+    // AUDIOTRACK (SR45): Apple's gapless tag (`moov/udta/meta/ilst/----` "iTunSMPB") for audio
+    // tracks no edit list already trimmed: priming to drop and the presented sample count.
+    if let Some((pri, total)) = itunsmpb(&data[moov.body..moov.end]) {
+        for t in traks.iter_mut() {
+            let first = t.samples.iter().map(|s| s.pts).min().unwrap_or(0);
+            if t.track.kind == TrackKind::Audio && t.track.sample_rate > 0 && first >= 0 && t.track.play_ns.is_none() {
+                let ns = |n: u64| (n as u128 * 1_000_000_000 / t.track.sample_rate as u128) as u64;
+                t.track.trim_start_ns = ns(pri);
+                if total > 0 {
+                    t.track.play_ns = Some(ns(total));
+                }
+            }
+        }
+    }
+
     let mut tracks = Vec::new();
     let mut samples = Vec::new();
     for (i, mut t) in traks.into_iter().enumerate() {
@@ -210,6 +225,8 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
 
     // Edit list → presentation shift (media timescale).
     let mut shift = 0i64;
+    // AUDIOTRACK (SR45): the media edit's segment duration is the presented length (gapless end).
+    let mut play_ns: Option<u64> = None;
     if let Some(edts) = child(&kids, b"edts") {
         if let Some(elst) = child(&children(data, edts)?, b"elst") {
             let mut r = body(data, elst);
@@ -227,6 +244,9 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
                         .to_ns(empty_movie);
                     let empty_media = Timebase { num: 1, den: timescale as u64 }.from_ns(empty_media);
                     shift = media_time - empty_media;
+                    if dur > 0 {
+                        play_ns = Some(Timebase { num: 1, den: movie_ts as u64 }.to_ns(dur) as u64);
+                    }
                     break;
                 }
             }
@@ -248,6 +268,8 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
         sample_count: 0,
         duration_ns: 0,
         frame_prefix: Vec::new(),
+        trim_start_ns: 0,
+        play_ns,
     };
 
     let minf = child(&mdia_kids, b"minf").ok_or(Error::Invalid("mdia without minf"))?;
@@ -289,7 +311,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHeader, track: &mut Track) -> Result<(), Er
             // pre_defined 2  → VisualSampleEntry is 78 bytes after the box header.
             child_start = e.body + 78;
         }
-        b"mp4a" | b"Opus" | b"fLaC" | b"enca" | b"ac-3" | b"ec-3" | b"sowt" | b"twos" | b"ipcm" | b"fpcm" => {
+        b"mp4a" | b".mp3" | b"Opus" | b"fLaC" | b"enca" | b"ac-3" | b"ec-3" | b"sowt" | b"twos" | b"ipcm" | b"fpcm" => {
             let version = r.u16()?;
             r.skip(6)?; // revision, vendor
             track.channels = r.u16()?;
@@ -363,14 +385,44 @@ fn parse_stsd(data: &[u8], stsd: &BoxHeader, track: &mut Track) -> Result<(), Er
                     0x40 | 0x66 | 0x67 | 0x68 => Codec::Aac,
                     0xDD => Codec::Vorbis,
                     0xAD => Codec::Opus,
+                    0x69 | 0x6B => Codec::Mp3,
                     _ => Codec::Other(String::from("mp4a")),
                 }
             }
             None => Codec::Other(String::from("mp4a")),
         },
+        b".mp3" => Codec::Mp3,
         _ => Codec::Other(track.codec_name.clone()),
     };
     Ok(())
+}
+
+/// `iTunSMPB`: " 00000000 PPPPPPPP QQQQQQQQ TTTTTTTTTTTTTTTT ..." (hex words) → (priming,
+/// total samples). The tag's `data` atom follows its name inside the `----` item.
+fn itunsmpb(m: &[u8]) -> Option<(u64, u64)> {
+    let k = m.windows(8).position(|w| w == b"iTunSMPB")?;
+    let rest = &m[k + 8..];
+    let j = rest.windows(4).position(|w| w == b"data")?;
+    let txt = rest.get(j + 12..)?;
+    let mut f: Vec<u64> = Vec::new();
+    let mut cur: Option<u64> = None;
+    for &c in txt.iter().take(120) {
+        match (c as char).to_digit(16) {
+            Some(x) => cur = Some(cur.unwrap_or(0).wrapping_mul(16).wrapping_add(x as u64)),
+            None => {
+                if let Some(x) = cur.take() {
+                    f.push(x);
+                }
+                if c != b' ' {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(x) = cur {
+        f.push(x);
+    }
+    (f.len() >= 4).then(|| (f[1], f[3]))
 }
 
 trait FourccString {
@@ -547,6 +599,7 @@ fn build_table(data: &[u8], stbl: &[BoxHeader], shift: i64) -> Result<Vec<Sample
                 dts: 0,
                 duration: 0,
                 keyframe: true,
+                discard_ns: 0,
             });
             o += sizes[si] as u64;
             si += 1;
@@ -699,6 +752,7 @@ fn parse_moof(data: &[u8], moof: &BoxHeader, traks: &mut [TrakState], trex: &[Tr
                     dts,
                     duration: dur as u64,
                     keyframe: !is_video || flags & NON_SYNC == 0,
+                    discard_ns: 0,
                 });
                 cursor += size as u64;
                 dts += dur as i64;

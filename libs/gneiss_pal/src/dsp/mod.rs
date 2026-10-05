@@ -3,8 +3,10 @@
 //
 //! `dsp` — Gneiss's signal-processing library (CODEX §3: "The Signal Processing Graph. Audio and
 //! Video codecs"), the shared pipeline pieces Stria's player is assembled from (PLAYBACK, LEDGER
-//! SR26).
+//! SR26) and the codec face Ring 3 handlers (Stria, Aether, Facet) reach. Each codec family lives
+//! in a `no_std` core under `unaos/libs/media/` that the kernel links too.
 //!
+//! * [`audio`] — AUDIOCODEC's face over `audio_core` (WAV/AIFF/FLAC/Ogg/Opus/Vorbis/MP3/AAC/MP4).
 //! * [`demux`] — re-export of `demux_core`, the `no_std` container core under
 //!   `unaos/libs/media/demux_core` (MP4 progressive + fragmented, Matroska/WebM).
 //! * [`avsync`] — the playback clock: a master clock (audio when present, else wall), pts →
@@ -15,10 +17,11 @@
 //!
 //! * [`image`] — re-export of `pixel_core`, the `no_std` still-image core (PIXELCORE, SR25).
 //! * [`audio_track`] — the per-packet audio decoder seam the player feeds resonance from (PCM
-//!   built in; compressed audio is AUDIOCODEC's `dsp::audio`).
+//!   built in; compressed audio through [`audio`]'s per-packet decoders).
 //!
 //! Nothing here owns a device, a window or the bus: Stria owns the player and its bus verbs.
 
+pub mod audio;
 pub mod audio_track;
 pub mod avsync;
 /// The still-image core (PIXELCORE, SR25): `pixel_core` re-exported — PNG/JPEG/GIF/BMP/QOI/WebP (lossless + lossy + animated) and APNG.

@@ -183,6 +183,9 @@ pub enum SMessage {
     /// Seek to `position_ns` (lands on the last keyframe at or before it, then decodes forward).
     MediaSeek { url: String, position_ns: u64 },
     MediaStop { url: String },
+    /// AUDIOTRACK (SR45): silence (`muted`) or restore the session's audio. The clock keeps
+    /// running on the device — a muted `<video>` stays in sync — only the samples are zeroed.
+    MediaMute { url: String, muted: bool },
     /// Stria → requester: the stream is open. `video` / `audio` name the codecs ("" when the
     /// track is absent); `real_video` is false when the frames are the labelled test-pattern
     /// stand-in (no decoder for the codec yet); `audio_clock` is true when audio is playing and
@@ -198,7 +201,19 @@ pub enum SMessage {
         audio_clock: bool,
     },
     /// Stria → requester: a frame went on glass at `pts_ns`; tightly packed 8-bit RGBA.
-    MediaFrame { url: String, pts_ns: i64, width: u32, height: u32, rgba: Vec<u8> },
+    /// AUDIOTRACK (SR45): `levels` carries the audio meters that came due — peak |sample| of
+    /// the left and right channel per 50 ms window, the first window starting at `pts_ns` for
+    /// an audio-only session (whose frames are 0×0 with no pixels), or ending at the frame for
+    /// a video. Omitted from the wire when empty, so a video frame without audio is unchanged.
+    MediaFrame {
+        url: String,
+        pts_ns: i64,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        levels: Vec<[f32; 2]>,
+    },
     /// Stria → requester: playback reached the end (or was stopped).
     MediaEnded { url: String, presented: u64, dropped: u64 },
     MediaError { url: String, error: String },

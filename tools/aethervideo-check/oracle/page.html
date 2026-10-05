@@ -17,5 +17,11 @@
 <!-- Case 3, the SAME file in both: the VP9 stream. Chromium decodes it; Stria has no VP9
      decoder yet and paints its labelled test-pattern stand-in at the frame's pts. -->
 <video src="pattern-vp9.webm" width="320" height="240" style="position:absolute;left:0;top:250px"></video>
+<!-- Case 4 (AUDIOTRACK): <audio controls> — Chromium's default audio control, 300x54, with the
+     duration after metadata; Stria opens the WAV as an audio-only session. -->
+<audio controls src="tone.wav" style="position:absolute;left:330px;top:110px"></audio>
+<!-- Case 5 (AUDIOTRACK): the VP9 file over http (oracle/serve.py, python's http.server with byte ranges):
+     Aether fetches it into its media cache and hands Stria the file. -->
+<video src="http://127.0.0.1:{{PORT}}/pattern-vp9.webm" width="320" height="240" style="position:absolute;left:330px;top:250px"></video>
 </body>
 </html>

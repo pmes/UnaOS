@@ -18,6 +18,23 @@
 //! | | | `MediaEnded` | state ended, last frame stays |
 //! | | | `MediaError` | the error text paints in the box |
 //!
+//! AUDIOTRACK (LEDGER SR45) added the sound side:
+//!
+//! * `<audio>` asks for `MediaPoster` on load too (HTML `preload`'s default is the UA's;
+//!   Chromium's is `metadata`; `preload="none"` waits for play) — Stria answers an audio-only
+//!   stream with a 0×0 `MediaOpened` (the duration) and meter frames, whose time moves the
+//!   control's clock; `<audio controls>` paints Chromium's default audio control
+//!   (`render::paint_audio_controls`).
+//! * `muted` is honoured: every opening request of a muted element is followed by
+//!   `MediaMute { muted: true }` (Stria zeroes the samples; the clock runs on).
+//! * **http(s) media**: Stria opens local files only, so Aether fetches the resource into a
+//!   cache file — `~/.cache/unaos/aether/media/<sha256(url)>` (`$XDG_CACHE_HOME` honoured) — and
+//!   hands Stria `file://<that path>`; the cache path is the element's bus key while `src` keeps
+//!   the page's url. The fetch runs off the engine thread: byte-range requests (`Range: bytes=`,
+//!   1 MiB at a time, resuming a partial `.part` file) when the server answers 206, else one
+//!   whole GET; the element's opening request waits for it ([`take_outbox`] releases it), a
+//!   failure becomes a `MediaError` for that key, painted in the box.
+//!
 //! State lives in a thread-local registry — the same pattern as `images::STORE` — because the
 //! engine, layout (intrinsic size) and renderer (frame, poster, controls) all run on the engine
 //! thread and each needs the element's media state by DOM node. The shell drains requests with
@@ -27,7 +44,10 @@
 use bandy::SMessage;
 use crate::dom::NodeRef;
 use std::cell::RefCell;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Mutex;
 
 /// Which media element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,8 +75,11 @@ pub enum State {
 pub struct Element {
     pub node: NodeRef,
     pub kind: Kind,
-    /// The resolved source (absolute url): the bus key.
+    /// The bus key Stria knows the stream by: the resolved source url, or for an http(s)
+    /// source `file://` + its cache file (AUDIOTRACK M4).
     pub url: String,
+    /// The resolved source as the page names it (absolute url).
+    pub src: String,
     pub mime: String,
     /// The `poster` attribute, resolved (video only).
     pub poster: Option<String>,
@@ -75,6 +98,19 @@ pub struct Element {
     pub frame: Option<Rc<image::RgbaImage>>,
     /// False when Stria is painting its labelled test-pattern stand-in (no decoder for the codec).
     pub real_video: bool,
+    /// The latest audio meter: peak |sample| left / right over the last 50 ms window.
+    pub levels: [f32; 2],
+    /// An http(s) source still being fetched into the cache.
+    pub fetching: bool,
+    /// The opening request held back until the fetch completes.
+    pub deferred: Option<Deferred>,
+}
+
+/// The request an element sends once its source is local.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Deferred {
+    Poster,
+    Play,
 }
 
 #[derive(Default)]
@@ -88,17 +124,193 @@ thread_local! {
     static MEDIA: RefCell<Registry> = RefCell::new(Registry::default());
 }
 
+// ------------------------------------------------------------------ the http(s) media cache
+
+/// Fetches finished off-thread: (src, Ok(()) | Err(text)).
+static FETCHED: Mutex<Vec<(String, Result<(), String>)>> = Mutex::new(Vec::new());
+/// Sources being fetched (a second element on the same url waits for the same fetch).
+static INFLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static CACHE_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Range request size.
+pub const FETCH_CHUNK: u64 = 1 << 20;
+/// The largest resource the cache takes.
+pub const FETCH_MAX: u64 = 1 << 30;
+
+/// Where cached media lives: `$XDG_CACHE_HOME/unaos/aether/media`, else
+/// `~/.cache/unaos/aether/media` (or the override [`set_cache_dir`] gave).
+pub fn cache_dir() -> PathBuf {
+    if let Some(d) = CACHE_DIR.lock().unwrap().clone() {
+        return d;
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("unaos/aether/media")
+}
+
+/// Point the cache somewhere else (tools, tests).
+pub fn set_cache_dir(dir: &Path) {
+    *CACHE_DIR.lock().unwrap() = Some(dir.to_path_buf());
+}
+
+/// The cache file of `src`: the lowercase hex SHA-256 of the url (UnaOS's own `crypto_core`).
+pub fn cache_path(src: &str) -> PathBuf {
+    let h = crypto_core::sha2::sha256(src.as_bytes());
+    cache_dir().join(h.iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+pub fn is_remote(src: &str) -> bool {
+    let l = src.to_ascii_lowercase();
+    l.starts_with("http://") || l.starts_with("https://")
+}
+
+/// What one fetch did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchReport {
+    pub bytes: u64,
+    /// The server honoured byte ranges (206 + Content-Range).
+    pub ranged: bool,
+    pub requests: u32,
+    /// Bytes already in a partial file that a range request resumed after.
+    pub resumed_from: u64,
+}
+
+/// `Content-Range: bytes a-b/total` → (a, b, total).
+fn content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
+    let r = v.trim().strip_prefix("bytes")?.trim();
+    let (span, total) = r.split_once('/')?;
+    let (a, b) = span.split_once('-')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?, total.trim().parse().ok()))
+}
+
+/// Fetch `src` into `dest` (write to `dest.part`, rename when whole). Byte ranges of `chunk`
+/// when the server answers 206 (resuming whatever a previous attempt left in `.part`), else the
+/// whole body from one 200. Blocking: run it off the engine thread.
+pub fn fetch_to_cache(src: &str, dest: &Path, chunk: u64) -> Result<FetchReport, String> {
+    use std::io::{Read, Write};
+    if let Some(d) = dest.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    let part = dest.with_extension("part");
+    let client = crate::net::blocking_client_builder().build().map_err(|e| e.to_string())?;
+    let mut rep = FetchReport::default();
+    let mut have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    rep.resumed_from = have;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+    loop {
+        let range = format!("bytes={}-{}", have, have + chunk - 1);
+        let mut resp = client.get(src).header(reqwest::header::RANGE, &range).send().map_err(|e| format!("{src}: {e}"))?;
+        rep.requests += 1;
+        let status = resp.status().as_u16();
+        match status {
+            206 => {
+                rep.ranged = true;
+                let cr = resp.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).and_then(content_range);
+                let Some((a, _b, total)) = cr else { return Err(format!("{src}: 206 without a Content-Range")) };
+                if a != have {
+                    return Err(format!("{src}: asked for byte {have}, got a range from {a}"));
+                }
+                let mut body = Vec::new();
+                resp.read_to_end(&mut body).map_err(|e| format!("{src}: {e}"))?;
+                file.write_all(&body).map_err(|e| e.to_string())?;
+                have += body.len() as u64;
+                if have > FETCH_MAX {
+                    return Err(format!("{src}: larger than the {} MiB cache limit", FETCH_MAX >> 20));
+                }
+                let done = match total {
+                    Some(t) => have >= t,
+                    None => (body.len() as u64) < chunk,
+                };
+                if done || body.is_empty() {
+                    break;
+                }
+            }
+            200 => {
+                // ranges not supported: the whole resource, from the start
+                drop(file);
+                let mut f = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+                rep.resumed_from = 0;
+                let mut buf = vec![0u8; 64 * 1024];
+                have = 0;
+                loop {
+                    let n = resp.read(&mut buf).map_err(|e| format!("{src}: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    f.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                    have += n as u64;
+                    if have > FETCH_MAX {
+                        return Err(format!("{src}: larger than the {} MiB cache limit", FETCH_MAX >> 20));
+                    }
+                }
+                break;
+            }
+            // the partial file already holds everything
+            416 if have > 0 => break,
+            _ => return Err(format!("{src}: HTTP {status}")),
+        }
+    }
+    rep.bytes = have;
+    std::fs::rename(&part, dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    Ok(rep)
+}
+
+/// Start fetching `src` unless it is cached or already on its way. Returns true when the
+/// caller must wait for [`take_outbox`] to release the element.
+fn ensure_cached(src: &str) -> bool {
+    let dest = cache_path(src);
+    if dest.exists() {
+        return false;
+    }
+    let mut inflight = INFLIGHT.lock().unwrap();
+    let set = inflight.get_or_insert_with(HashSet::new);
+    if set.insert(src.to_string()) {
+        let s = src.to_string();
+        std::thread::Builder::new()
+            .name("aether-media-fetch".into())
+            .spawn(move || {
+                let r = fetch_to_cache(&s, &dest, FETCH_CHUNK).map(|rep| {
+                    eprintln!("[AETHER] :: media cached {s} ({} bytes, ranged={}, {} requests)", rep.bytes, rep.ranged, rep.requests);
+                });
+                if let Some(set) = INFLIGHT.lock().unwrap().as_mut() {
+                    set.remove(&s);
+                }
+                FETCHED.lock().unwrap().push((s, r));
+            })
+            .ok();
+    }
+    true
+}
+
+/// The opening request(s) for one element: the request, then `MediaMute` when muted.
+fn open_requests(out: &mut Vec<SMessage>, e: &Element, what: Deferred, title: &str) {
+    match what {
+        Deferred::Poster => out.push(SMessage::MediaPoster { url: e.url.clone() }),
+        Deferred::Play => out.push(SMessage::PlayMedia { url: e.url.clone(), title: title.to_string(), mime: e.mime.clone() }),
+    }
+    if e.muted {
+        out.push(SMessage::MediaMute { url: e.url.clone(), muted: true });
+    }
+}
+
 /// Media types this engine hands to Stria. Containers: what `demux_core` parses (MP4, WebM,
-/// Matroska). Codecs: anything Stria opens — real decoders (`utp1` test pattern, PCM) and the
-/// codecs it plays with the labelled stand-in until AVCODEC lands (AV1, VP8, VP9, H.264, HEVC,
-/// Opus, Vorbis, AAC, FLAC). An unknown codec makes the `<source>` unplayable, so the next one
-/// is tried — HTML's `canPlayType` == "" rule.
+/// Matroska) and the bare audio files `dsp::audio` decodes (MP3, Ogg, WAV, FLAC, ADTS, AIFF).
+/// Codecs: anything Stria opens — real decoders (`utp1` test pattern, PCM, and since
+/// AUDIOTRACK Opus, Vorbis, AAC-LC, MP3 (`mp3`, `mp4a.6B`, WAV's `1`), FLAC) and the video codecs
+/// it plays with the labelled stand-in until AVCODEC lands (AV1, VP8, VP9, H.264, HEVC). An
+/// unknown codec makes the `<source>` unplayable, so the next one is tried — HTML's
+/// `canPlayType` == "" rule.
 pub fn can_play_type(mime: &str) -> bool {
     let mut parts = mime.split(';');
     let base = parts.next().unwrap_or("").trim().to_ascii_lowercase();
     let container_ok = matches!(
         base.as_str(),
         "video/mp4" | "audio/mp4" | "video/webm" | "audio/webm" | "video/x-matroska" | "audio/x-matroska" | "video/quicktime"
+            // AUDIOTRACK (SR45): the bare audio files Stria opens through `dsp::audio`
+            | "audio/mpeg" | "audio/mp3" | "audio/ogg" | "application/ogg" | "audio/wav" | "audio/wave" | "audio/x-wav"
+            | "audio/flac" | "audio/x-flac" | "audio/aac" | "audio/aiff" | "audio/x-aiff"
     );
     if !container_ok {
         return false;
@@ -108,7 +320,7 @@ pub fn can_play_type(mime: &str) -> bool {
         let Some(v) = p.strip_prefix("codecs=").or_else(|| p.strip_prefix("codecs =")) else { continue };
         for c in v.trim_matches(|c| c == '"' || c == '\'').split(',') {
             let c = c.trim().to_ascii_lowercase();
-            let known = ["utp1", "av01", "av1", "vp8", "vp9", "vp09", "avc1", "avc3", "hvc1", "hev1", "opus", "vorbis", "mp4a", "flac", "pcm", "sowt", "ipcm"];
+            let known = ["utp1", "av01", "av1", "vp8", "vp9", "vp09", "avc1", "avc3", "hvc1", "hev1", "opus", "vorbis", "mp4a", "flac", "pcm", "sowt", "ipcm", "mp3", "1"];
             if !known.iter().any(|k| c == *k || c.starts_with(&format!("{k}."))) {
                 return false;
             }
@@ -159,6 +371,10 @@ pub fn mime_for(url: &str) -> &'static str {
         Some("mp3") => "audio/mpeg",
         Some("ogg") => "audio/ogg",
         Some("wav") => "audio/wav",
+        Some("flac") => "audio/flac",
+        Some("opus") => "audio/ogg",
+        Some("aac") => "audio/aac",
+        Some("aif") | Some("aiff") => "audio/aiff",
         _ => "application/octet-stream",
     }
 }
@@ -198,7 +414,9 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
             if find(&r, &node).is_some() {
                 continue;
             }
-            let Some((url, mime)) = source_for(&node, base) else { continue };
+            let Some((src, mime)) = source_for(&node, base) else { continue };
+            // http(s): Stria plays the cache file; the fetch may still be running
+            let (url, fetching) = if is_remote(&src) { (format!("file://{}", cache_path(&src).display()), ensure_cached(&src)) } else { (src.clone(), false) };
             let el = node.as_element().unwrap();
             let kind = if el.name.local.as_ref() == "video" { Kind::Video } else { Kind::Audio };
             let attrs = el.attributes.borrow();
@@ -210,6 +428,7 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
             let autoplay = attrs.get("autoplay").is_some();
             let muted = attrs.get("muted").is_some();
             let controls = attrs.get("controls").is_some();
+            let preload_none = attrs.get("preload").is_some_and(|p| p.trim().eq_ignore_ascii_case("none"));
             drop(attrs);
             // Chromium's autoplay policy: muted autoplay always runs; unmuted autoplay waits
             // for a user gesture (this engine has no media-engagement index, so it never runs).
@@ -217,23 +436,21 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
             if autoplay && !muted {
                 crate::ledger::record_dom("media-autoplay-blocked-unmuted");
             }
-            let state = if autoplays {
-                let title = r.title.clone();
-                r.outbox.push(SMessage::PlayMedia { url: url.clone(), title, mime: mime.clone() });
-                State::Playing
-            } else if kind == Kind::Video {
-                // A session per url: a second element on the same stream shares the first's.
-                if !r.elements.iter().any(|e| e.url == url && e.state != State::Idle) {
-                    r.outbox.push(SMessage::MediaPoster { url: url.clone() });
-                }
-                State::Loading
+            // A session per url: a second element on the same stream shares the first's.
+            let shared = r.elements.iter().any(|e| e.url == url && e.state != State::Idle);
+            let (state, opening) = if autoplays {
+                (State::Playing, Some(Deferred::Play))
+            } else if !preload_none {
+                // metadata (and a <video>'s first frame): Chromium's default preload
+                (State::Loading, (!shared).then_some(Deferred::Poster))
             } else {
-                State::Idle
+                (State::Idle, None)
             };
-            r.elements.push(Element {
+            let mut e = Element {
                 node,
                 kind,
                 url,
+                src,
                 mime,
                 poster,
                 autoplay,
@@ -246,7 +463,21 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
                 pts_ns: 0,
                 frame: None,
                 real_video: false,
-            });
+                levels: [0.0; 2],
+                fetching,
+                deferred: None,
+            };
+            if let Some(what) = opening {
+                if fetching {
+                    e.deferred = Some(what);
+                } else {
+                    let title = r.title.clone();
+                    let mut out = Vec::new();
+                    open_requests(&mut out, &e, what, &title);
+                    r.outbox.extend(out);
+                }
+            }
+            r.elements.push(e);
             any = true;
         }
         any
@@ -276,7 +507,7 @@ pub fn on_message(msg: &SMessage) -> Effect {
     };
     // Decode a frame once, share it between elements on the same stream.
     let frame = match msg {
-        SMessage::MediaFrame { width, height, rgba, .. } => {
+        SMessage::MediaFrame { width, height, rgba, .. } if *width > 0 && *height > 0 => {
             image::RgbaImage::from_raw(*width, *height, rgba.clone()).map(Rc::new)
         }
         _ => None,
@@ -299,7 +530,21 @@ pub fn on_message(msg: &SMessage) -> Effect {
                         e.state = State::Paused;
                     }
                 }
-                SMessage::MediaFrame { pts_ns, .. } => {
+                SMessage::MediaFrame { pts_ns, width: 0, levels, .. } => {
+                    // an audio-only session's meter frame: the newest window's peaks, and the
+                    // time at its end is how far playback has got
+                    if let Some(p) = levels.last() {
+                        e.levels = *p;
+                    }
+                    e.pts_ns = *pts_ns + levels.len() as i64 * 50_000_000;
+                    if e.state == State::Loading {
+                        e.state = State::Paused;
+                    }
+                }
+                SMessage::MediaFrame { pts_ns, levels, .. } => {
+                    if let Some(p) = levels.last() {
+                        e.levels = *p;
+                    }
                     let Some(f) = frame.clone() else { continue };
                     if e.kind == Kind::Video && e.natural.is_none() {
                         e.natural = Some((f.width(), f.height()));
@@ -348,11 +593,22 @@ pub fn play(node: &NodeRef) -> bool {
         if state == State::Playing {
             return false;
         }
+        if r.elements[i].fetching {
+            // released (as PlayMedia) when the cache file is whole
+            let e = &mut r.elements[i];
+            e.deferred = Some(Deferred::Play);
+            e.state = State::Playing;
+            e.show_poster = false;
+            return true;
+        }
         if state == State::Ended {
             r.outbox.push(SMessage::MediaSeek { url: url.clone(), position_ns: 0 });
         }
         let title = r.title.clone();
-        r.outbox.push(SMessage::PlayMedia { url, title, mime });
+        r.outbox.push(SMessage::PlayMedia { url: url.clone(), title, mime });
+        if r.elements[i].muted && state == State::Idle {
+            r.outbox.push(SMessage::MediaMute { url, muted: true });
+        }
         let e = &mut r.elements[i];
         e.state = State::Playing;
         e.show_poster = false;
@@ -405,9 +661,37 @@ pub fn seek(node: &NodeRef, position_ns: u64) -> bool {
     })
 }
 
-/// Drain the requests queued for Stria.
+/// Drain the requests queued for Stria — first releasing the elements whose http(s) source
+/// has finished fetching (their held-back opening request, or a `MediaError` for the key when
+/// the fetch failed: it comes back over the bus and paints in the box).
 pub fn take_outbox() -> Vec<SMessage> {
-    MEDIA.with(|m| std::mem::take(&mut m.borrow_mut().outbox))
+    let done: Vec<(String, Result<(), String>)> = std::mem::take(&mut *FETCHED.lock().unwrap());
+    MEDIA.with(|m| {
+        let mut r = m.borrow_mut();
+        let title = r.title.clone();
+        let mut out = Vec::new();
+        for (src, res) in done {
+            let mut errored: HashSet<String> = HashSet::new();
+            for e in r.elements.iter_mut().filter(|e| e.fetching && e.src == src) {
+                e.fetching = false;
+                match &res {
+                    Ok(()) => {
+                        if let Some(what) = e.deferred.take() {
+                            open_requests(&mut out, e, what, &title);
+                        }
+                    }
+                    Err(text) => {
+                        e.deferred = None;
+                        if errored.insert(e.url.clone()) {
+                            out.push(SMessage::MediaError { url: e.url.clone(), error: text.clone() });
+                        }
+                    }
+                }
+            }
+        }
+        r.outbox.extend(out);
+        std::mem::take(&mut r.outbox)
+    })
 }
 
 /// Remove and return the first staged `PlayMedia` (the click passthrough's old shape).
@@ -467,6 +751,8 @@ pub struct Paint {
     pub playing: bool,
     pub pts_ns: i64,
     pub duration_ns: u64,
+    /// The latest audio meter (peak L/R).
+    pub levels: [f32; 2],
 }
 
 /// The renderer's question for a `<video>`/`<audio>` node.
@@ -490,6 +776,7 @@ pub fn paint_for(node: &NodeRef) -> Option<Paint> {
             playing: false,
             pts_ns: 0,
             duration_ns: 0,
+            levels: [0.0; 2],
         });
     };
     let poster = if e.show_poster { e.poster.as_deref().and_then(crate::images::get) } else { None };
@@ -504,6 +791,7 @@ pub fn paint_for(node: &NodeRef) -> Option<Paint> {
         playing: e.state == State::Playing,
         pts_ns: e.pts_ns,
         duration_ns: e.duration_ns,
+        levels: e.levels,
     })
 }
 

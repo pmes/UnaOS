@@ -60,6 +60,8 @@ const ID_BLOCK_GROUP: u32 = 0xA0;
 const ID_BLOCK: u32 = 0xA1;
 const ID_BLOCK_DURATION: u32 = 0x9B;
 const ID_REFERENCE_BLOCK: u32 = 0xFB;
+/// BlockGroup DiscardPadding (signed ns; RFC 9559 §5.1.3.5.6) — AUDIOTRACK (SR45).
+const ID_DISCARD_PADDING: u32 = 0x75A2;
 
 /// Top-level Segment children: an unknown-size Cluster ends where one of these begins.
 const SEGMENT_CHILDREN: [u32; 8] = [
@@ -279,6 +281,8 @@ fn parse_track(data: &[u8], te: &El) -> Result<TrackState, Error> {
         sample_count: 0,
         duration_ns: 0,
         frame_prefix: Vec::new(),
+        trim_start_ns: 0,
+        play_ns: None,
     };
     let mut default_duration = 0u64;
     let mut sample_rate = 8000.0f64;
@@ -362,6 +366,7 @@ fn parse_track(data: &[u8], te: &El) -> Result<TrackState, Error> {
         "A_OPUS" => Codec::Opus,
         "A_VORBIS" => Codec::Vorbis,
         "A_FLAC" => Codec::Flac,
+        "A_MPEG/L3" => Codec::Mp3,
         // RFC 9559 §5.1.4.1.28 codec mappings: PCM bit depth from Audio/BitDepth (16 if absent).
         "A_PCM/INT/LIT" => Codec::Pcm { bits: if bit_depth == 0 { 16 } else { bit_depth }, float: false, big_endian: false },
         "A_PCM/INT/BIG" => Codec::Pcm { bits: if bit_depth == 0 { 16 } else { bit_depth }, float: false, big_endian: true },
@@ -399,16 +404,40 @@ fn parse_cluster(data: &[u8], cl: &El, seg_end: usize, scale: u64, tracks: &mut 
                 let mut blk: Option<El> = None;
                 let mut dur: Option<u64> = None;
                 let mut referenced = false;
+                let mut discard = 0u64;
                 for c in kids(data, e.body, e.end)? {
                     match c.id {
                         ID_BLOCK => blk = Some(c),
                         ID_BLOCK_DURATION => dur = Some(uint(data, &c)?),
                         ID_REFERENCE_BLOCK => referenced = true,
+                        ID_DISCARD_PADDING => {
+                            // a signed integer, big-endian, 1-8 bytes; negative values are not
+                            // meaningful for audio padding and are ignored
+                            let b = &data[c.body..c.end];
+                            if !b.is_empty() && b.len() <= 8 {
+                                let mut v: i64 = if b[0] & 0x80 != 0 { -1 } else { 0 };
+                                for &x in b {
+                                    v = (v << 8) | x as i64;
+                                }
+                                discard = v.max(0) as u64;
+                            }
+                        }
                         _ => {}
                     }
                 }
                 if let Some(b) = blk {
+                    let first = tracks.iter().map(|t| t.samples.len()).collect::<Vec<_>>();
                     block(data, b.body, b.end, cluster_ts, scale, Some(!referenced), dur, tracks)?;
+                    if discard > 0 {
+                        // the padding belongs to the block's last frame
+                        for (t, n0) in tracks.iter_mut().zip(first) {
+                            if t.samples.len() > n0 {
+                                if let Some(s) = t.samples.last_mut() {
+                                    s.discard_ns = discard;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -519,6 +548,7 @@ fn block(
             dts: pts + step,
             duration: explicit.unwrap_or(0),
             keyframe: keyframe && k == 0 || (keyframe && ts.track.kind != TrackKind::Video),
+            discard_ns: 0,
         });
         ts.has_duration.push(explicit.is_some());
         off += sz;

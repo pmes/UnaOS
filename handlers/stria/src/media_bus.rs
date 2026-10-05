@@ -13,11 +13,16 @@
 //! | `MediaPoster { url }` | open, present the first frame, stay paused | `MediaOpened`, one `MediaFrame` |
 //! | `MediaPause` / `MediaResume` | freeze / run the session's clock | frames stop / resume |
 //! | `MediaSeek { url, position_ns }` | keyframe at or before, decode forward | the frame at the target |
+//! | `MediaMute { url, muted }` | zero / restore the samples sent to the device (clock runs on) | |
 //! | `MediaStop { url }` | close the session | `MediaEnded` |
 //!
-//! Failures (unreadable url, not a container, no video track) answer `MediaError`. Urls are
-//! `file://` paths or bare paths; network fetches are Aether's (it hands Stria a local file) —
-//! the ceiling is stated, not hidden.
+//! A stream with no video track is an AUDIO-ONLY session (AUDIOTRACK, SR45): `MediaOpened`
+//! carries width = height = 0 and `video` = "", and instead of pictures every tick whose audio
+//! meters came due fires a 0×0 `MediaFrame` whose `levels` are the peak L/R per 50 ms window
+//! (a video session attaches its due meters to the next frame). Failures (unreadable url,
+//! nothing playable) answer `MediaError`. Urls are `file://` paths or bare paths; network
+//! fetches are Aether's — it caches the http(s) resource and hands Stria the file
+//! (AUDIOTRACK M4).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,15 +42,32 @@ struct Session {
     _engine: Option<resonance::AudioEngine>,
     playing: bool,
     ended: bool,
+    levels: Vec<[f32; 2]>,
 }
 
 struct BusSink<'a> {
     synapse: &'a Synapse,
     url: &'a str,
+    audio_only: bool,
+    /// Meters waiting for the next video frame.
+    levels: &'a mut Vec<[f32; 2]>,
 }
 impl FrameSink for BusSink<'_> {
     fn present(&mut self, f: &Frame, _ordinal: u64) {
-        self.synapse.fire(SMessage::MediaFrame { url: self.url.to_string(), pts_ns: f.pts_ns, width: f.width, height: f.height, rgba: f.to_rgba() });
+        let levels = std::mem::take(self.levels);
+        self.synapse.fire(SMessage::MediaFrame { url: self.url.to_string(), pts_ns: f.pts_ns, width: f.width, height: f.height, rgba: f.to_rgba(), levels });
+    }
+    fn levels(&mut self, pts_ns: i64, peaks: &[[f32; 2]]) {
+        if self.audio_only {
+            self.synapse.fire(SMessage::MediaFrame { url: self.url.to_string(), pts_ns, width: 0, height: 0, rgba: Vec::new(), levels: peaks.to_vec() });
+        } else {
+            self.levels.extend_from_slice(peaks);
+            // a video's meters ride its frames; keep at most the last second's worth
+            let n = self.levels.len();
+            if n > 20 {
+                self.levels.drain(..n - 20);
+            }
+        }
     }
 }
 
@@ -90,7 +112,8 @@ impl MediaService {
                         if s.ended {
                             continue;
                         }
-                        let mut sink = BusSink { synapse: &synapse, url };
+                        let audio_only = !s.player.info().has_video;
+                        let mut sink = BusSink { synapse: &synapse, url, audio_only, levels: &mut s.levels };
                         if s.player.tick(&mut sink) == Tick::Ended && s.playing {
                             s.ended = true;
                             let st = s.player.stats();
@@ -131,7 +154,7 @@ fn open(synapse: &Synapse, url: &str, display_hz: u32, with_audio: bool) -> Opti
         Err(e) => return err(format!("{}: {e}", path.display())),
     };
     // Peek the audio rate to open a matching resonance stream.
-    let rate = gneiss_pal::dsp::demux::Demuxer::open(bytes.clone()).ok().and_then(|d| d.audio_track().map(|t| t.sample_rate)).unwrap_or(0);
+    let rate = Player::probe_audio_rate(&bytes);
     let (engine, out): (Option<resonance::AudioEngine>, Option<Box<dyn AudioOut>>) = if with_audio && rate > 0 {
         match resonance_out(rate) {
             Some((e, f)) => (Some(e), Some(Box::new(f))),
@@ -153,7 +176,7 @@ fn open(synapse: &Synapse, url: &str, display_hz: u32, with_audio: bool) -> Opti
                 real_video: i.real_video,
                 audio_clock: i.audio_clock,
             });
-            Some(Session { player, _engine: engine, playing: false, ended: false })
+            Some(Session { player, _engine: engine, playing: false, ended: false, levels: Vec::new() })
         }
         Err(e) => err(e.to_string()),
     }
@@ -197,6 +220,11 @@ fn handle(synapse: &Synapse, sessions: &mut HashMap<String, Session>, msg: SMess
             if let Some(s) = sessions.get_mut(&url) {
                 s.player.seek(position_ns as i64);
                 s.ended = false;
+            }
+        }
+        SMessage::MediaMute { url, muted } => {
+            if let Some(s) = sessions.get_mut(&url) {
+                s.player.set_muted(muted);
             }
         }
         SMessage::MediaStop { url } => {
