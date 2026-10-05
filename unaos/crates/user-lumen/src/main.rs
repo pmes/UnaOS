@@ -74,7 +74,6 @@ const ACTION_PAGE_UP: u64 = 22;
 const ACTION_PAGE_DOWN: u64 = 23;
 const ACTION_TOP: u64 = 24;
 const ACTION_BOTTOM: u64 = 25;
-const ACTION_CLEAR_VIEW: u64 = 41;
 const KEY_CTRL_N: u8 = 0x0e;
 const KEY_CTRL_P: u8 = 0x10;
 
@@ -1415,6 +1414,7 @@ pub extern "C" fn _start() -> ! {
     l.put(if vein_ring3::clock::is_set() { b" clock=set" as &[u8] } else { b" clock=unset" });
     if sess.tls.provider.is_none() {
         l.put(b" crypto=").put(sess.tls.provider_why.as_bytes());
+    } // STORMFAULT merge12 fix: the LUMENUX x VEINTLS join dropped this closer
     {
         let a = app();
         l.put(b" history=");
