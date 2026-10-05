@@ -48,6 +48,8 @@ use super::framebuffer::FrameBuffer;
 
 /// Where the builder stages the faces (as DATA, from the host's font packages — `builder/src/main.rs`).
 pub const DIR: &str = "/system/fonts";
+/// Where they are found when the UnaFS SSD is the root and the card (which the builder staged) is at `/boot`.
+pub const DIR_CARD: &str = "/boot/system/fonts";
 
 /// Which face a call draws with. `Body`/`Chrome` keep `video::font`'s cell metrics; `Ui` lays out on the
 /// body cell's height with a proportional face.
@@ -440,25 +442,24 @@ mod tt {
         NEXT_TRY.store(now + RETRY_MS, Ordering::Relaxed);
         let n = TRIES.fetch_add(1, Ordering::Relaxed) + 1;
         let mt = crate::shell::vfs_mount_table();
-        let first = alloc::format!("{}/{}", super::DIR, FACES[0].0);
-        if mt.stat(&first).is_err() {
+        let Some(dir) = [super::DIR, super::DIR_CARD].into_iter().find(|d| mt.stat(&alloc::format!("{}/{}", d, FACES[0].0)).is_ok()) else {
             if n >= MAX_TRIES {
                 GAVE_UP.store(true, Ordering::Relaxed);
-                serial_println!("[kfont] load faces=0/{} fallback=bitmap reason=absent path={} tries={} (KERNELFONT: the desktop stays on the noto bitmap atlases)", FACES.len(), first, n);
+                serial_println!("[kfont] load faces=0/{} fallback=bitmap reason=absent path={}/{} tries={} (KERNELFONT: the desktop stays on the noto bitmap atlases)", FACES.len(), super::DIR, FACES[0].0, n);
             }
             return;
-        }
-        load(&mt, now);
+        };
+        load(&mt, dir, now);
     }
 
-    fn load(mt: &crate::fs::vfs::MountTable, t0: u64) {
+    fn load(mt: &crate::fs::vfs::MountTable, dir: &str, t0: u64) {
         let cap = (crate::allocator::HEAP_SIZE / 128).clamp(512 * 1024, 2 * 1024 * 1024);
         let mut eng = Engine::new(cap);
         let mut missing = String::new();
         let mut scripts_missing = String::new();
         let mut bytes = 0usize;
         for &(file, name, role, bold) in FACES {
-            let p = alloc::format!("{}/{}", super::DIR, file);
+            let p = alloc::format!("{}/{}", dir, file);
             let why = match read_face(mt, &p) {
                 Ok(v) => {
                     let len = v.len();
@@ -496,8 +497,8 @@ mod tt {
         restyle(&mut t);
         let fallback = if t.missing.is_empty() { String::from("none") } else { t.missing.clone() };
         serial_println!(
-            "[kfont] load faces={}/{} fallback={} scripts_missing={} font_kib={} cache_kib={} ppi={} font={} font_size={} body={}-{:.2} chrome={}-{:.2} ui={}-{:.2} ms={}",
-            n, FACES.len(), fallback, if t.scripts_missing.is_empty() { "none" } else { t.scripts_missing.as_str() }, bytes / 1024, cap / 1024, ppi,
+            "[kfont] load dir={} faces={}/{} fallback={} scripts_missing={} font_kib={} cache_kib={} ppi={} font={} font_size={} body={}-{:.2} chrome={}-{:.2} ui={}-{:.2} ms={}",
+            dir, n, FACES.len(), fallback, if t.scripts_missing.is_empty() { "none" } else { t.scripts_missing.as_str() }, bytes / 1024, cap / 1024, ppi,
             family_name(family), css_px, t.names[0], t.styles[0].0.size, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size,
             crate::arch::ms().saturating_sub(t0)
         );

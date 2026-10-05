@@ -396,13 +396,13 @@ fn fill(s: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize, c: u3
 }
 
 fn txt(st: &mut State, x: usize, r: usize, t: &str) {
-    let face = super::text::Face::Body;
+    let face = super::text::Face::Ui; // KERNELFONT: labels in the UI face
     let (w, h, ch) = (st.w, st.h, face.cell_h());
     super::text::draw_text(&mut st.surf, w, w, h, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
 }
 
 fn btn(st: &mut State, r: usize, x: usize, t: &str) {
-    let face = super::text::Face::Body;
+    let face = super::text::Face::Ui; // KERNELFONT: button captions in the UI face
     let (w, h, ch) = (st.w, st.h, face.cell_h());
     let y = TOP + r * ROW_H + (ROW_H - BTN_H) / 2;
     fill(&mut st.surf, w, x, y, BTN_W, BTN_H, theme::BUTTON_FACE);
@@ -432,7 +432,7 @@ fn slider(st: &mut State, r: usize, pos: usize, max: usize) {
 fn paint(st: &mut State, v: &Values) {
     let (w, h) = (st.w, st.h);
     for p in st.surf.iter_mut() { *p = theme::CONTENT_FILL; }
-    let face = super::text::Face::Body;
+    let face = super::text::Face::Ui; // KERNELFONT: tab names in the UI face
     let ch = face.cell_h();
     // The tab strip.
     let tw = w / TABS;
@@ -499,7 +499,16 @@ fn paint_display(st: &mut State, v: &Values) {
     txt(st, TRACK_X, 2, &alloc::format!("{}x - read-only, fixed at takeover", sc));
     txt(st, LABEL_X, 3, "Menubar clock");
     txt(st, TRACK_X, 3, "24h - fixed, no runtime switch");
+    // KERNELFONT M3 (B359): the face the desktop draws with, and a sample line IN that face. The family and size
+    // are Principia's `system.display.font` / `system.display.font_size` (`pref set system display.font serif`).
+    txt(st, LABEL_X, 4, "Font");
+    txt(st, TRACK_X, 4, &super::text::face_name(super::text::Face::Ui));
+    let (w, h, ch) = (st.w, st.h, super::text::Face::Ui.cell_h());
+    super::text::draw_text(&mut st.surf, w, w - 12, h, TRACK_X, TOP + 5 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, super::text::Face::Ui);
 }
+
+/// KERNELFONT M3: the Display tab's sample line.
+pub const SAMPLE: &str = "The quick brown fox jumps over the lazy dog 0123456789";
 
 fn paint_about(st: &mut State) {
     let ver = option_env!("UNAOS_GIT_SHA").unwrap_or("dev build");

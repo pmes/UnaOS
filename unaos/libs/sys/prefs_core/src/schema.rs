@@ -151,6 +151,16 @@ pub static SCHEMA: &[Key] = &[
         doc: "Panel level in sixteenths; never 0 (BRIGHTFLOOR: the backlight's OFF belongs to the idle blank).",
     },
     Key {
+        ns: "system", key: "display.font", kind: Kind::Enum(&["sans", "serif", "mono"]), default: Default::Str("sans"),
+        writers: OP, reader: "kernel `video::text` (KERNELFONT)",
+        doc: "The UI typeface family for captions, menus and running text: DejaVu Sans, Serif or Sans Mono (KERNELFONT B359; the console grid is always mono).",
+    },
+    Key {
+        ns: "system", key: "display.font_size", kind: Kind::Int { min: 9, max: 32 }, default: Default::Int(13),
+        writers: OP, reader: "kernel `video::text` (KERNELFONT)",
+        doc: "UI text size in CSS px; device px = size x the panel's ppi (EDID) / 96, capped by the 16 px text cell; captions keep the bar-derived size.",
+    },
+    Key {
         ns: "system", key: "display.idle_min", kind: Kind::Int { min: 0, max: 1440 },
         default: Default::Int(crate::display::IDLE_MIN_DEFAULT),
         writers: &[Writer::Settings], reader: "kernel settings (DIMIDLE)",
