@@ -115,6 +115,12 @@ export UNAOS_GIT_SHA="${_sha_base}${_sha_suffix}"
 
 # Build flags shared by both targets
 NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
+# PROFILE2 (rmbp-ledger B340, M1): the x86 kernel is built WITH FRAME POINTERS so the sampler's walk
+# (`prof.rs`) can climb real stacks. RUSTFLAGS replaces the crate's `.cargo/config.toml` rustflags, so
+# `-C panic=abort` (also the target spec's panic-strategy) is restated. Measured on the metal shape:
+# .text 3994592 -> 3957798 bytes (-0.9 %, smaller), so no knob; the `[wc-h]` cost is read on the boot.
+# The builder (`builder/src/main.rs`, the build the ESP carries) sets the same string on its kernel cargo.
+KERNEL_FP_RUSTFLAGS="-C panic=abort -C force-frame-pointers=yes"
 
 # Optional kernel cargo features (composable). UNAOS_SKIP_XHCI=1 disables xHCI/USB bring-up
 # (video-only boot for real HW where firmware may still own the controller and stall its reset);
@@ -3526,7 +3532,7 @@ emit_kernel_syms() { "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nig
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
-    cargo +nightly build --release \
+    RUSTFLAGS="$KERNEL_FP_RUSTFLAGS" cargo +nightly build --release \
       --target ../../x86_64-unaos.json \
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
