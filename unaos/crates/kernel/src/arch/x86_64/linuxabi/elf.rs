@@ -248,5 +248,6 @@ pub fn build_stack(
     if !asp.copy_out(sp, &buf, true) {
         return Err("stack frame write failed");
     }
+    super::vm::add_stack_vma(asp); // SELFBUILD3: the main stack grows lazily to 8 MiB below the eager pages
     Ok(sp)
 }

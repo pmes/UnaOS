@@ -235,18 +235,16 @@ fn in_zone(v: u32, a: u32, b: u32) -> bool {
 /// will be recorded, and the caller's present runs exactly as it did before this module.
 #[cfg(feature = "beam")]
 pub fn hold(y0: usize, y1: usize, panel_h: usize, slow: bool, record: bool) -> Option<Hold> {
-    // KVBLANK rung 2's FIXTURE, one-shot, and it runs HERE because this is the only reachable
-    // ancestor of the wait arm that a machine with NO KEPLER still executes. q35 answers
-    // `:: kepler: no-device ::`, so `beam_probe` never arms, `scanout_beam()` below is `None` and
-    // every hardware path of this rung is unreachable in QEMU — while `hold` itself IS called, by
-    // `wm::stage_window` and `strip`, on every armed compositor boot. A simulated source is
-    // therefore the only way rung 2's property is verified anywhere but on the bench (LAWS §5: an
-    // ungated gate is not a gate), and it is `witness`-gated so no media build carries it.
-    // ⚠ The corpus's home for a fixture is `main.rs`, which this rung's brief does not name; this
-    // placement is the nearest site inside a named file and it is reported as such.
-    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank", feature = "witness"))]
-    crate::drivers::gpu::kepler_vblank::selftest_once();
+    // KVBLANK9 M2 (B341, R80): KVBLANK rung 2's simulated-source fixture (`selftest_once`, `sim=timer|stuck`) ran
+    // HERE once per boot on `witness` builds. It is a test, so it is `tests kvblank` now (registered on every
+    // `nvidia-kepler-vblank` build; a `UNAOS_TESTS_AT_BOOT=1` lane still runs it at registration, which is how
+    // `x86-witness.spec` keeps scoring its two verdicts). Nothing of it runs on the present path.
     let (v0, vt) = crate::arch::scanout_beam()?;
+    // KVBLANK9 M3 (B341): FIRST NEED. A beam source answering means the Kepler takeover's head arm ran; this present
+    // is the first that needs the vblank source, so it arms KVBLANK rung 3 (one CAS, no wait; the window runs on the
+    // edge driver and says one `[wc-h] vbl_src=` line). Once said, one atomic load per present.
+    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
+    crate::drivers::gpu::kepler_vblank::first_need();
     if vt == 0 || panel_h == 0 {
         return None;
     }

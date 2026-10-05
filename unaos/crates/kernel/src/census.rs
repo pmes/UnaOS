@@ -37,7 +37,7 @@ pub const RTWIT: u32 = 1 << 10;
 pub const PTRINSTALL: u32 = 1 << 11;
 pub const SERTX: u32 = 1 << 12;
 pub const USBNET: u32 = 1 << 13;
-pub const SDHCWR: u32 = 1 << 14;
+pub const SDHCWR: u32 = 1 << 14; pub const NET6: u32 = 1 << 15; pub const KEPLER: u32 = 1 << 16; // ARMNET (B346): the aarch64 NIC rollup (same-line fold). QUIETBOOT3 (B352): KEPLER — the 1 Hz vblank census.
 
 /// `(name, bit, what it samples)` — the verb's table and `census list`'s rows.
 pub const NAMES: &[(&str, u32, &str)] = &[
@@ -55,10 +55,10 @@ pub const NAMES: &[(&str, u32, &str)] = &[
     ("ptrinstall", PTRINSTALL, "pointer-install ledger"),
     ("sertx", SERTX, "`[sertx]` serial transmit cost"),
     ("usbnet", USBNET, "USB NIC rx/tx counters"),
-    ("sdhcwr", SDHCWR, "`:: SDHCWR:` SD write-burst census"),
+    ("sdhcwr", SDHCWR, "`:: SDHCWR:` SD write-burst census"), ("net6", NET6, "aarch64 NIC polls/tx/rx rollup"), ("kepler", KEPLER, "the 1 Hz `:: kepler: vblank head=` / `vblank-dt` census"), // ARMNET (B346): same-line fold. QUIETBOOT3 (B352): kepler.
 ];
 
-const ALL: u32 = (1 << 15) - 1;
+const ALL: u32 = (1 << 17) - 1; // QUIETBOOT3 (B352): 16 -> 17 bits (KEPLER).
 
 static ON: AtomicU32 = AtomicU32::new(if cfg!(feature = "census") { ALL } else { 0 });
 

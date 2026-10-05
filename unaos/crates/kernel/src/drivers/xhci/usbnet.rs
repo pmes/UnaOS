@@ -200,6 +200,10 @@ impl FrameRing {
     fn is_empty(&self) -> bool {
         self.r == self.w
     }
+    /// NETCLOCK: frames queued.
+    fn len(&self) -> usize {
+        (self.w + RING - self.r) % RING
+    }
 }
 
 static RXQ: Mutex<FrameRing> = Mutex::new(FrameRing::new());
@@ -408,6 +412,7 @@ pub fn disconnect(slot: u8) {
     STATE.store(ST_ABSENT, Ordering::Relaxed);
     SLOT.store(0, Ordering::Relaxed);
     reset_arm();
+    tx_reset(); // NETCLOCK: an in-flight OUT TD dies with the slot
     for m in MAC.iter() {
         m.store(0, Ordering::Relaxed);
     }
@@ -446,6 +451,9 @@ fn reset_arm() {
 }
 /// Event-ring hook: claims the bulk-IN completion of the armed TRB (or any error on that endpoint).
 pub fn claim(slot_id: u8, endpoint_id: u8, param: u64, code: u8, transfer_len: u32) -> bool {
+    if tx_claim(slot_id, endpoint_id, param, code) {
+        return true; // NETCLOCK M3: the in-flight bulk-OUT TD (same event-ring line, no new dispatch arm)
+    }
     if !ARMED.load(Ordering::Relaxed)
         || SLOT.load(Ordering::Relaxed) != slot_id
         || DCI.load(Ordering::Relaxed) != endpoint_id
@@ -542,9 +550,10 @@ pub fn raw_rx(out: &mut [u8]) -> Option<usize> {
     drive();
     RXQ.lock().pop(out)
 }
-/// Queue one frame and, when the controller loan is free, send it now (see `raw_rx`). Dropped
-/// (counted) when the link is down or the ring is full — smoltcp retransmits, the count is on the
-/// rollup line.
+/// NETCLOCK M3: queue one frame on the bounded TX ring and, when the controller loan is free, run one
+/// data pass, which ISSUES it (stage + TRB + doorbell) and returns — the completion is reaped by a later
+/// pass. Nothing waits on the wire. The stack checks `tx_room` first (back-pressure), so a drop here is
+/// only the receive-path reply token racing a full ring — counted on the rollup line.
 pub fn raw_tx(frame: &[u8]) {
     if !is_up() || !TXQ.lock().push(frame) {
         TX_DROP.fetch_add(1, Ordering::Relaxed);
@@ -552,11 +561,18 @@ pub fn raw_tx(frame: &[u8]) {
     }
     drive();
 }
-/// One controller pass for this link, from the stack's context, when the loan is free.
+/// One controller pass for this link, from the stack's context, when the loan is free. NETCLOCK: the
+/// DATA pass only (RX reap/arm, TX reap/issue — no PHY poll, no bring-up, which stay on the main loop's
+/// full `service_usbnet`), so the loan is held for the event drain and one enqueue; the hold is measured.
 fn drive() {
     if let Ok(mut x) = crate::drivers::xhci::claim() {
+        let t0 = crate::arch::now_cycles();
         x.poll_events();
-        x.service_usbnet();
+        x.usbnet_data_pass();
+        let held = crate::arch::now_cycles().wrapping_sub(t0);
+        drop(x);
+        LOAN_MAX_CYC.fetch_max(held, Ordering::Relaxed);
+        DRIVES.fetch_add(1, Ordering::Relaxed);
     }
 }
 /// The static "our IP" the hand-rolled ARP/ICMP pump in smolnet needs before DHCP; the smoltcp
@@ -734,10 +750,11 @@ fn rollup() {
     }
     REPORTED.store(total, Ordering::Relaxed); if !crate::census::on(crate::census::USBNET) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     serial_println!(
-        ":: USBNET: rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} rx_chip_drop={} rx_xfers={} rx_zlp={} rx_arms={} ::",
+        ":: USBNET: rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} rx_chip_drop={} rx_xfers={} rx_zlp={} rx_arms={} polls={} tx_q={} tx_stuck={} ::",
         RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed),
         RX_DROP.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed),
-        RX_OK.load(Ordering::Relaxed), RX_CRC.load(Ordering::Relaxed), RX_DROP_ERR.load(Ordering::Relaxed), RX_SHORT.load(Ordering::Relaxed), RX_CHIP_DROP.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), RX_ZLP.load(Ordering::Relaxed), RX_ARMS.load(Ordering::Relaxed)
+        RX_OK.load(Ordering::Relaxed), RX_CRC.load(Ordering::Relaxed), RX_DROP_ERR.load(Ordering::Relaxed), RX_SHORT.load(Ordering::Relaxed), RX_CHIP_DROP.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), RX_ZLP.load(Ordering::Relaxed), RX_ARMS.load(Ordering::Relaxed),
+        stack_polls(), tx_q(), TX_STUCK.load(Ordering::Relaxed) // NETCLOCK (B335)
     );
 }
 
@@ -1056,3 +1073,138 @@ fn usbnet7_verdict(t0: u64, first_at: u64, first: Option<u16>) {
         ),
     }
 }
+
+// ── NETCLOCK (B335) ─────────────────────────────────────────────────────────────────────────────────
+// Boot 20: every frame was one synchronous bulk-OUT TD awaited with the xHCI loan held (`usbnet_tx_stage` on
+// `pump_until_ftdi_done`, worst wait 56.7 ms), and the stack polled ~1M times a second, each poll a controller
+// pass. Now: TX is asynchronous — ONE OUT TD in flight, issued by the data pass, its completion claimed by
+// `claim` (the IN claim's line) and reaped by the next pass; the stack's poll gate asks `rx_ready`, which
+// drives the controller at most every `DRIVE_PACE_US`.
+static TX_ARMED: AtomicBool = AtomicBool::new(false);
+static TX_DONE: AtomicBool = AtomicBool::new(false);
+static TX_CODE: AtomicU8 = AtomicU8::new(0);
+static TX_DCI: AtomicU8 = AtomicU8::new(0);
+static TX_TRB: AtomicU64 = AtomicU64::new(0);
+static TX_T0: AtomicU64 = AtomicU64::new(0);
+static TX_STUCK: AtomicU64 = AtomicU64::new(0);
+static LOAN_MAX_CYC: AtomicU64 = AtomicU64::new(0);
+static DRIVES: AtomicU64 = AtomicU64::new(0);
+static LAST_DRIVE: AtomicU64 = AtomicU64::new(0);
+/// The stack-side controller pass runs at most this often from a pump's poll gate.
+const DRIVE_PACE_US: u64 = 250;
+/// An issued OUT TD with no completion after this long is abandoned (counted `tx_stuck`) so TX cannot wedge.
+const TX_STUCK_MS: u64 = 1_000;
+
+fn cycles_per_us() -> u64 {
+    (crate::arch::hw_wait_budget() / 2_000_000).max(1)
+}
+/// Event-ring hook: the completion of the in-flight OUT TD (matched by TRB address), or any error on its endpoint.
+fn tx_claim(slot_id: u8, endpoint_id: u8, param: u64, code: u8) -> bool {
+    if !TX_ARMED.load(Ordering::Relaxed) || SLOT.load(Ordering::Relaxed) != slot_id || TX_DCI.load(Ordering::Relaxed) != endpoint_id {
+        return false;
+    }
+    let is_error = code != 1 && code != 13;
+    if param != TX_TRB.load(Ordering::Relaxed) && !is_error {
+        return false;
+    }
+    if !TX_DONE.swap(true, Ordering::Relaxed) {
+        TX_CODE.store(code, Ordering::Relaxed);
+    }
+    true
+}
+fn tx_reset() {
+    TX_ARMED.store(false, Ordering::Relaxed);
+    TX_DONE.store(false, Ordering::Relaxed);
+    TX_TRB.store(0, Ordering::Relaxed);
+    TX_DCI.store(0, Ordering::Relaxed);
+}
+/// The data pass: is an OUT TD in flight (issued, not yet reaped)?
+pub fn tx_inflight() -> bool {
+    TX_ARMED.load(Ordering::Relaxed)
+}
+/// The data pass issued one OUT TD (its last TRB, the one with IOC, at `trb_phys`).
+pub fn tx_arm(dci: u8, trb_phys: u64) {
+    TX_DCI.store(dci, Ordering::Relaxed);
+    TX_TRB.store(trb_phys, Ordering::Relaxed);
+    TX_DONE.store(false, Ordering::Relaxed);
+    TX_T0.store(crate::arch::now_cycles(), Ordering::Relaxed);
+    TX_ARMED.store(true, Ordering::Relaxed);
+}
+/// The data pass reaps: `Some(code)` once the in-flight TD completed (or was abandoned: code 0), freeing the slot.
+pub fn tx_take_done() -> Option<u8> {
+    if !TX_ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    if TX_DONE.load(Ordering::Relaxed) {
+        let code = TX_CODE.load(Ordering::Relaxed);
+        tx_reset();
+        return Some(code);
+    }
+    let age_us = crate::arch::now_cycles().wrapping_sub(TX_T0.load(Ordering::Relaxed)) / cycles_per_us();
+    if age_us >= TX_STUCK_MS * 1000 {
+        if TX_STUCK.fetch_add(1, Ordering::Relaxed) == 0 {
+            serial_println!("[usbnet] tx stuck dci={} trb={:#x} age_ms={} — abandoned, TX continues", TX_DCI.load(Ordering::Relaxed), TX_TRB.load(Ordering::Relaxed), age_us / 1000);
+        }
+        tx_reset();
+        return Some(0);
+    }
+    None
+}
+/// Back-pressure for the stack: room on the TX ring right now.
+pub fn tx_room() -> bool {
+    is_up() && TXQ.lock().len() < RING - 1
+}
+/// Frames waiting on the TX ring (the census `tx_q=`).
+pub fn tx_q() -> usize {
+    TXQ.lock().len()
+}
+/// The stack's poll gate: a frame waiting on the RX ring? With `drive` (a pump — the main loop's pass is not
+/// running) one paced data pass first, which also reaps/issues TX.
+pub fn rx_ready(drive_now: bool) -> bool {
+    if !is_up() {
+        return false;
+    }
+    if !RXQ.lock().is_empty() {
+        return true;
+    }
+    if drive_now {
+        let now = crate::arch::now_cycles();
+        let last = LAST_DRIVE.load(Ordering::Relaxed);
+        if now.wrapping_sub(last) >= DRIVE_PACE_US * cycles_per_us() {
+            LAST_DRIVE.store(now, Ordering::Relaxed);
+            drive();
+            return !RXQ.lock().is_empty();
+        }
+    }
+    false
+}
+/// `tests netclock`: the longest stack-side loan hold since the last reset, in µs, and the pass count.
+pub fn loan_held_max_us() -> u64 {
+    LOAN_MAX_CYC.load(Ordering::Relaxed) / cycles_per_us()
+}
+pub fn loan_reset() {
+    LOAN_MAX_CYC.store(0, Ordering::Relaxed);
+}
+pub fn drives() -> u64 {
+    DRIVES.load(Ordering::Relaxed)
+}
+/// `tests netclock`: frames sent (completed) and good frames received so far.
+pub fn tx_frames() -> u64 {
+    TX_FRAMES.load(Ordering::Relaxed)
+}
+pub fn rx_ok() -> u64 {
+    RX_OK.load(Ordering::Relaxed).max(RX_FRAMES.load(Ordering::Relaxed))
+}
+/// `tests netclock`: one main-loop-shaped controller pass (`poll_events` + `service_ftdi`, which drains the
+/// FTDI console and runs the full `service_usbnet`: PHY poll, RX, TX), for a fixture that holds the main loop
+/// while it measures. Not counted in the stack-side loan hold.
+pub fn main_pass() {
+    if let Ok(mut x) = crate::drivers::xhci::claim() {
+        x.poll_events();
+        x.service_ftdi();
+    }
+}
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn stack_polls() -> u64 { crate::net_tick::polls() }
+#[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
+fn stack_polls() -> u64 { 0 }

@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# SELFDIAG (rmbp-ledger B324, R82): `APPS/DIAG.ELF` — the smart installer's diagnosis program. It reads the
+# last boot's witness lines off the volume (/var/log/boot.<n>.witness, written by the kernel's bootwit),
+# pairs each FAIL line with the source that prints it (/system/witness-owners.txt), asks the provider for ONE
+# unified diff through the Vein library (vein_core + vein_ring3, the LUMENAPP shape; the Echo provider
+# answers offline), applies it to the selfhost tree with diag_core's patch applier (context exact, ±3 lines
+# of drift, refuse on mismatch) and records /var/log/diag.<n>.md. A console program: app note flags 0.
+# Linked in the ELF window (user-diag-x86.ld) — TLS needs it. x86_64 only.
+#
+# The empty [workspace] table makes this crate its OWN workspace root.
+[workspace]
+
+[package]
+name = "user-diag"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-diag"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[dependencies]
+una-abi = { path = "../una-abi" }
+diag_core = { path = "../../libs/sys/diag_core" }
+vein_core = { path = "../../libs/sys/vein_core", default-features = false }
+vein_ring3 = { path = "../../libs/sys/vein_ring3" }
+
+[features]
+# VEINTLS (SR36) via vein_ring3: the product crypto provider under tls_core (merge12 fold, as LUMEN/NET).
+cryptocore = ["vein_ring3/cryptocore"]

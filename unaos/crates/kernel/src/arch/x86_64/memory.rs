@@ -129,6 +129,7 @@ pub fn init(boot_info: &'static mut BootInfo) {
         unsafe {
             crate::allocator::init_heap_raw(heap_start as *mut u8, heap_size);
         }
+        SB3_HEAP.store(heap_start, core::sync::atomic::Ordering::Release); // SELFBUILD3 (B353): the Linux shim's frame pool steers around it
     } else {
         serial_println!("Available memory regions: {}", regions.len());
         for region in regions.iter().take(15) {
@@ -930,6 +931,7 @@ unsafe fn build_slot(s: usize) {
         }
         unsafe { *pt.add(pt_index(va)) = (frame & PTE_ADDR) | flags };
     }
+    unsafe { args_map(s) }; // RING3ABI2 M2 (B333): the RO args page at USER_BASE + 0x1FF000, argc 0 until a launcher writes the words
 }
 
 /// Allocate a fresh per-process address space from the static pool and build its window. Returns the
@@ -1045,7 +1047,7 @@ pub fn free_user_space_by_cr3(cr3: u64) {
                 (s as u64) + 1,
                 "route=self-exit shell-raise=skipped siblings=untouched",
             );
-            unsafe { clear_slot_fb(s) }; unsafe { xwin_free(s) }; // RING3WIN: the ELF window's frames go back to the heap before the slot is claimable
+            unsafe { clear_slot_fb(s) }; unsafe { xwin_free(s) }; super::elf::seg_map_clear(s); // RING3WIN: the ELF window's frames go back to the heap before the slot is claimable
             SLOT_USED[s].store(false, Ordering::Release); crate::video::wm::app_name_forget(crate::video::wm::owner_of_launch(s as u64)); // SO22: a recycled slot must not wear its predecessor's name — forgotten the instant the slot is free
             // SMPBAL-X86: the RECYCLE point. `clear_slot_fb` above already bumped, but state that
             // dependency here rather than inheriting it — this store is what makes the slot claimable
@@ -4304,3 +4306,89 @@ pub fn sys_sbrk(delta: i64) -> i64 {
     (base + cur) as i64
 }
 const _: () = assert!(super::syscall::USER_BASE == una_abi::USER_BASE_X86); // RING3WIN: elf-model images link at USER_XWIN_VA_X86
+
+// =================================================================================================
+// RING3ABI2 M2 (rmbp-ledger B333) — THE ARGS PAGE. One read-only page per slot at the fixed VA
+// `USER_BASE + una_abi::USER_ARGS_OFF` (0x1FF000: the last leaf of the slot's own first PT — above the FB
+// hole, below the ELF window, so the SAME VA in the fixed, flat and elf models). The frame is static per
+// slot (`.bss`, 4 KiB × USER_SLOTS), so nothing is allocated or freed: `build_slot` maps it and writes the
+// header (argc 0, the window base) for every tenant, and a launcher that has words (`run`, `bg`, a bare
+// name — `syscall::run_user_image_argv` / `spawn_user_image_bg_argv`) rewrites it through the identity
+// alias before the task is spawned. Layout and builder: `una_abi::args_build`; ring 3 reads it with
+// `una_abi::args()`. Ring-3 NX + read-only; a legal syscall INPUT range (`syscall::user_range_ok`, Read).
+// =================================================================================================
+
+/// RING3ABI2: the args page's offset from the window base (una-abi's number).
+pub const ARGS_OFF: usize = una_abi::USER_ARGS_OFF as usize;
+const _: () = assert!(ARGS_OFF >= USER_STATIC_SIZE && ARGS_OFF + 4096 <= 512 * 4096 && ARGS_OFF + 4096 <= XWIN_OFF);
+
+#[repr(C, align(4096))]
+struct ArgsPage([u8; 4096]);
+static mut SLOT_ARGS: [ArgsPage; USER_SLOTS] = [const { ArgsPage([0; 4096]) }; USER_SLOTS];
+
+/// RING3ABI2: kernel identity pointer to slot `s`'s args page (write through THIS, never the RO ring-3 VA).
+fn slot_args_ptr(s: usize) -> *mut u8 {
+    unsafe { (&raw mut SLOT_ARGS[s]).cast::<u8>() }
+}
+
+/// RING3ABI2: map slot `s`'s args page (ring-3 RO + NX) and reset it to the empty header. Called by
+/// `build_slot` for every tenant; idempotent.
+unsafe fn args_map(s: usize) {
+    let va = super::syscall::USER_BASE + ARGS_OFF as u64;
+    unsafe {
+        *slot_pt_ptr(s).add(pt_index(va)) = (slot_args_ptr(s) as u64 & PTE_ADDR) | PTE_PRESENT | PTE_USER | PTE_NX;
+        invlpg(va);
+    }
+    let _ = args_write(s, &[]);
+}
+
+/// RING3ABI2: lay `words` out in slot `s`'s args page. `false` (page left with argc 0) when they do not
+/// fit (`una_abi::ARGS_MAX` words, one page) — the caller refuses the launch rather than truncating.
+pub fn args_write(s: usize, words: &[&str]) -> bool {
+    if s >= USER_SLOTS {
+        return false;
+    }
+    let page = unsafe { core::slice::from_raw_parts_mut(slot_args_ptr(s), 4096) };
+    let va = super::syscall::USER_BASE + ARGS_OFF as u64;
+    if una_abi::args_build(va, super::syscall::USER_BASE, words, page).is_some() {
+        return true;
+    }
+    let _ = una_abi::args_build(va, super::syscall::USER_BASE, &[], page);
+    false
+}
+
+/// RING3ABI2: the argc slot `s`'s args page carries (the `tests ring3abi` read-back).
+pub fn args_argc(s: usize) -> usize {
+    if s >= USER_SLOTS {
+        return 0;
+    }
+    let page = unsafe { core::slice::from_raw_parts(slot_args_ptr(s), 4096) };
+    una_abi::Args::parse(page, super::syscall::USER_BASE + ARGS_OFF as u64).map(|a| a.argc()).unwrap_or(0)
+}
+
+/// RING3ABI2: is `[ptr, end)` inside the args page (VA bounds; the live-leaf walk still decides)?
+pub fn args_contains(ptr: u64, end: u64) -> bool {
+    let lo = super::syscall::USER_BASE + ARGS_OFF as u64;
+    ptr >= lo && end >= ptr && end <= lo + 4096
+}
+
+// SELFBUILD3 (B353): what the Linux ABI shim's user frame pool (`linuxabi/vm.rs`) may draw on — the Usable RAM of the UEFI
+// map and the window the kernel heap took out of it.
+static SB3_HEAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(physical start, length)` of the kernel heap (length 0 before `init`).
+pub fn selfbuild3_heap_window() -> (u64, u64) {
+    let s = SB3_HEAP.load(core::sync::atomic::Ordering::Acquire);
+    if s == 0 { (0, 0) } else { (s, crate::allocator::HEAP_SIZE as u64) }
+}
+
+/// Every `Usable` region of the UEFI map as `[start, end)` (empty before `init`).
+pub fn selfbuild3_usable_ram() -> alloc::vec::Vec<(u64, u64)> {
+    let mut v = alloc::vec::Vec::new();
+    if let Some(regions) = REGIONS.get() {
+        for r in regions.iter().filter(|r| r.kind == MemoryRegionKind::Usable) {
+            v.push((r.phys_start, r.phys_start + r.page_count * 4096));
+        }
+    }
+    v
+}

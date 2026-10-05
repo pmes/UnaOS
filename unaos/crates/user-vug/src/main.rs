@@ -3153,8 +3153,22 @@ pub extern "C" fn _start() -> ! {
     // end at exactly window+0x56000 — the second corpse in rmbp's WINX-8 report. Subtract the header
     // size; `user-vug-x86.ld` ASSERTs `_start == SIZEOF_HEADERS` so this constant cannot rot silently
     // if the header count ever changes.
+    //
+    // STORMFAULT (B351): and it rotted anyway. EXECNAME (B322) added a THIRD program header (the PT_NOTE
+    // carrying `.note.unaos.app`), SIZEOF_HEADERS went 0xb0 -> 0xe8, `_start` moved with it — so the
+    // ASSERT below (`_start == SIZEOF_HEADERS`) still held while the literal 0xb0 went stale by 0x38. The
+    // parent's surface base became window+0x5038 and the last row of the 288x288 blit crossed the slot-0
+    // mapping end at exactly window+0x56000: boot 21's six `vec=14 err=0x6 rip=0x10000001845
+    // cr2=0x10000056000` kills — WINX-8's corpse at a new width. No constant now: the base is the address
+    // of the ELF header itself (`__ehdr_start`, which lld defines because FILEHDR puts the header at vaddr
+    // 0 of the text segment), taken with an explicit RIP-relative `lea` so it is the RUN address under any
+    // load bias and survives any future header count. `user-vug-x86.ld` ASSERTs `__ehdr_start == 0`.
     #[cfg(target_arch = "x86_64")]
-    let base = (_start as *const () as u64) - 0xb0;
+    let base = {
+        let b: u64;
+        unsafe { core::arch::asm!("lea {}, [rip + __ehdr_start]", out(reg) b, options(nomem, nostack, preserves_flags)) };
+        b
+    };
 
     // WC-C: create a 128x128 WINDOW instead of mapping the 32x32 compat surface. `SYS_WIN_CREATE`
     // returns the window ID (>= 0) and maps the negotiated 16-page surface slot; the surface VA is the

@@ -963,6 +963,21 @@ carries its 4-byte FCS (if it does, `deliver_ax` strips one more constant).
 Orin with one flies the aarch64 registration at the same time). (b) Ring-3 SOCK-3 over the link (in
 the container `done=0` within the wall, where the connect is refused anyway).
 
+## 11. The one-clock rule (NETCLOCK B335, ARMNET B346)
+
+**Every smoltcp interface on either arch polls at one clock: `clock::stack_ms()`, and only when it has to.**
+`stack_ms` is `clock::uptime_ms` (aarch64: the generic timer CNTPCT/CNTFRQ; x86: the calibrated invariant TSC).
+Before calibration it falls back to the raw counter over the `hw_wait_budget` rate, and it is clamped never to step back.
+No stack, driver or verb keeps a clock of its own. A counter bumped once per poll (`POLL_CLOCK`, `clock += 1`) runs
+smoltcp's ARP, DHCP and TCP timers as fast as the CPU polls; boot 20 measured the result as a 269/s DISCOVER/ARP storm
+on the x86 dongle. A private `cnt*1000/frq` wraps after about four days. A poll is due only when the interface's own
+`poll_delay` has run out (1 ms floor, 1 s when nothing is scheduled) or the NIC's RX-ready probe says a frame is waiting:
+the e1000 DD bit, the USB RX ring, the virtio RX used-ring index, the rtl8168 descriptor OWN bit. It is never due once per
+loop pass. Every blocking pump (`pump_until` in `smolnet.rs` and in `net_phy::net6`) is bounded by wall milliseconds,
+never by poll counts, and releases its stack lock between polls. A NIC with no probe yet (genet) polls on a 1 ms cadence.
+`tests netclock` measures the rule on both arches (polls <= 50/s, tx <= 5/s at idle), and the `usbnet`/`net6` census
+rollups carry `polls=`.
+
 ## See also
 - [`docs/dev/OS/`](../) — other kernel subsystem documentation.
 - `unaos/crates/net/` — the implementation.

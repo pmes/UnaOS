@@ -24,10 +24,13 @@ pub struct Pipe {
 pub enum Kind {
     /// The shell window: reads pop a line from [`STDIN`], writes go to serial + [`OUT`].
     Console,
-    File { path: String, data: Vec<u8>, pos: u64, read: bool, write: bool },
+    /// SELFBUILD3: no slurped copy — every read/write/mmap goes to the VFS by `path` (all descriptions see one file).
+    File { path: String, pos: u64, read: bool, write: bool },
     Dir { path: String, ents: Vec<(String, bool)>, pos: usize },
     PipeR(Arc<Pipe>),
     PipeW(Arc<Pipe>),
+    /// SELFBUILD2: eventfd / epoll / AF_UNIX socket end (`sys3.rs`).
+    Ext(super::sys3::Ext),
 }
 
 pub struct Desc {
@@ -46,6 +49,7 @@ impl Desc {
 
 impl Drop for Desc {
     fn drop(&mut self) {
+        super::sys3::flock_drop(self as *const Desc as usize); // SELFBUILD2: an open description's flocks die with it
         match self.k.get_mut() {
             Kind::PipeR(p) => {
                 p.readers.fetch_sub(1, Ordering::AcqRel);

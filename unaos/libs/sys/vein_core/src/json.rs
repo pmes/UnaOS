@@ -231,3 +231,16 @@ mod tests {
         assert_eq!(core::str::from_utf8(&bad[r]).unwrap(), "\u{FFFD}x");
     }
 }
+
+/// LUMENUX M5: a raw JSON non-negative integer value (`57`), saturating at `u32::MAX`; `None` for
+/// anything else (a string, a fraction, a sign).
+pub fn uint(v: &[u8]) -> Option<u32> {
+    if v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &c in v {
+        n = (n * 10 + (c - b'0') as u64).min(u32::MAX as u64);
+    }
+    Some(n as u32)
+}

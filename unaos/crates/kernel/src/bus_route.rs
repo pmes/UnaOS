@@ -288,6 +288,7 @@ fn deliver(ops: &Ops, p: &Pend, status: i32, body: &[u8]) -> bool {
     let body: &[u8] = if status == 0 || status == una_abi::BUS_STATUS_MORE { body } else { &[] };
     let mut frame = alloc::vec![0u8; crate::bus::BUS_HDR_LEN + body.len()];
     crate::bus::build_reply(p.verb, p.caller_corr, status, kernel_reply_principal(), body, &mut frame);
+    if p.caller_row == crate::prefs_client::KCLIENT_ROW { return crate::prefs_client::inbox_push(frame.into_boxed_slice()); } // SETTINGSBUS (B337): the kernel's preference client is a caller row of its own
     (ops.push)(p.caller_row, frame.into_boxed_slice())
 }
 
@@ -307,7 +308,7 @@ pub fn fulfiller_reply(ops: &Ops, row: usize, rgen: u64, hdr: &crate::bus::BusHd
         take_pending(|q| q.relay == relay); // the caller is gone; the answer has nowhere to go
         return 0;
     }
-    if !(ops.has_room)(p.caller_row) {
+    if !(if p.caller_row == crate::prefs_client::KCLIENT_ROW { crate::prefs_client::inbox_has_room() } else { (ops.has_room)(p.caller_row) }) {
         return EAGAIN; // pending kept — the fulfiller may retry
     }
     // The `more` flag (VEINCORE B304, kept by LUMENAPP B323 as bus mechanism). A BUS_STATUS_MORE frame is

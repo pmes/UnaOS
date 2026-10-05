@@ -1591,13 +1591,57 @@ pub fn mint_disk_grant(
     total_sectors: u64,
     v: &super::selfinstall::Verdict,
 ) -> Option<block::WriteGrant> {
+    let g = mint_disk_grant_quiet(id, total_sectors, v)?;
+    if let block::BlockHandle::Ahci { port } = id.handle {
+        serial_println!(
+            ":: INSTALL: grant minted transport=ahci port={} WHOLE-DISK verdict={} lba=0..{} — blank/ours only ::",
+            port, v.tag(), total_sectors - 1
+        );
+    }
+    Some(g)
+}
+
+/// UNAFSGROW (B347) M3: [`mint_disk_grant`]'s judgment and mint WITHOUT the wire line — the installer
+/// window's DRY RUN mints and drops it unheld, so it must not print `grant minted … WHOLE-DISK` over a
+/// disk nothing will write. The one body: `mint_disk_grant` is this plus the line.
+pub fn mint_disk_grant_quiet(
+    id: block::BlockDeviceId,
+    total_sectors: u64,
+    v: &super::selfinstall::Verdict,
+) -> Option<block::WriteGrant> {
     let block::BlockHandle::Ahci { port } = id.handle else { return None };
     if !v.writable() || total_sectors < 4096 || sata_is_boot_device(id.handle) {
         return None;
     }
-    serial_println!(
-        ":: INSTALL: grant minted transport=ahci port={} WHOLE-DISK verdict={} lba=0..{} — blank/ours only ::",
-        port, v.tag(), total_sectors - 1
-    );
     Some(grant_range(port, 0, total_sectors - 1))
+}
+
+// ---------------------------------------------------------------------------------------------
+// AHCIROOT (rmbp-ledger B332) — the two non-installer grants, minted through the same `grant_range`
+// (the audit grep still prints declaration + that one line). Both take an extent the CALLER read off
+// an OURS disk (`install::ahciroot::ours_unafs_part`: `selfinstall::probe` said Ours — every partition
+// a UnaOS ESP or UnaFS, no foreign type GUID, the ESP carries BOOTX64.EFI + kernel.elf — and the census
+// row is the UnaFS one); each re-checks the shape it can check here. Neither prints (R80 — the root one
+// runs at boot; the test one is reported by its fixture's own line).
+// ---------------------------------------------------------------------------------------------
+
+/// AHCIROOT: the boot's root grant — EXACTLY the UnaFS partition `first..=last` on `port`. Refused for
+/// an inverted extent or one that reaches LBA 0..33 (the protective MBR and the primary GPT).
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub fn mint_root_grant(port: u8, first: u64, last: u64) -> Option<block::WriteGrant> {
+    if last < first || first < 34 {
+        return None;
+    }
+    Some(grant_range(port, first, last))
+}
+
+/// AHCIROOT: the `tests ahciw` grant — the scratch tail `last-63..=last` of the UnaFS partition that
+/// ends at `last` and starts at `first`, and nothing else.
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub fn mint_scratch_grant(port: u8, first: u64, last: u64) -> Option<block::WriteGrant> {
+    let s = last.checked_sub(super::ahciroot::SCRATCH_SECTORS - 1)?;
+    if s <= first || first < 34 {
+        return None;
+    }
+    Some(grant_range(port, s, last))
 }

@@ -107,9 +107,9 @@ struct State {
 /// present and valid (bit order = control order 0..5, tab = 6) and how many that is. Out-of-range values
 /// and wrong types are ignored (the default holds).
 pub fn from_prefs(v: &mut Values) -> (u32, usize) {
-    use crate::prefs::{flag, int, key, text};
+    use crate::prefs::key; use crate::prefs_client::{sys_flag as flag, sys_int as int, sys_text as text}; // SETTINGSBUS (B337): every read is a PrefGet over the bus
     let mut mask = 0u32;
-    if let Some(x) = crate::prefs::get(crate::prefs::NS, key::BRIGHTNESS).and_then(|p| p.as_int()) { let (l, c) = load_brightness(Some(x)); v.bright = l; mask |= 1 << 0; if c { LOAD_CLAMPED.store(x, Ordering::Relaxed); } }
+    if let Some(x) = crate::prefs_client::sys_get(key::BRIGHTNESS).and_then(|p| p.as_int()) { let (l, c) = load_brightness(Some(x)); v.bright = l; mask |= 1 << 0; if c { LOAD_CLAMPED.store(x, Ordering::Relaxed); } }
     if let Some(x) = int(key::VOLUME, 0, 16) { v.vol = x as u8; mask |= 1 << 1; }
     if let Some(x) = flag(key::MUTE) { v.mute = x; mask |= 1 << 2; }
     if let Some(x) = int(key::IDLE_MIN, 0, 1440) { v.idle_min = x as u32; mask |= 1 << 3; }
@@ -121,10 +121,10 @@ pub fn from_prefs(v: &mut Values) -> (u32, usize) {
 
 /// Persist control `i`'s current value (6 = the tab) as its `system.*` key — one key per change.
 fn persist(i: usize) {
-    use crate::prefs::{key, set_sys, PrefValue as P};
+    use crate::prefs::{key, PrefValue as P}; use crate::prefs_client::sys_set as set_sys; // SETTINGSBUS (B337): every write is a PrefSet over the bus
     let c = CUR.lock().clone();
     match i {
-        0 => set_sys(key::BRIGHTNESS, P::Int(prefs_core::display::clamp_brightness(c.bright as i64))),
+        0 => set_sys(key::BRIGHTNESS, P::Int(c.bright as i64)), // PREFSKERNEL (B345): the schema row owns the range; the store clamps
         1 | 2 => { set_sys(key::VOLUME, P::Int(c.vol as i64)); set_sys(key::MUTE, P::Bool(c.mute)); }
         3 => set_sys(key::IDLE_MIN, P::Int(c.idle_min as i64)),
         4 => set_sys(key::POINTER, P::Int(c.ptr as i64)),
@@ -230,7 +230,7 @@ fn witness(ok: bool) {
 
 /// Load the store for the session user and apply the keys it carries.
 fn load_for_login() {
-    crate::prefs::ensure_loaded();
+    crate::prefs_client::subscribe();
     safe_mode_check();
     let mut v = CUR.lock().clone();
     let (mask, n) = from_prefs(&mut v);
@@ -367,7 +367,7 @@ pub fn service() {
         if db { persist(0); }
         if dv { persist(1); }
     }
-    if OPEN_REQ.swap(false, Ordering::AcqRel) {
+    bus_changes(); if OPEN_REQ.swap(false, Ordering::AcqRel) {
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -1104,7 +1104,91 @@ fn safe_mode_check() {
     if !(key || knob) { return; }
     let mut n = 0usize;
     for (k, v) in prefs_core::display::defaults() {
-        if crate::prefs::set(crate::prefs::NS, k, v).is_ok() { n += 1; }
+        if crate::prefs_client::pref_set(crate::prefs::NS, k, v).is_ok() { n += 1; }
     }
     serial_println!("[prefs] display reset=1 reason={} keys={}", if knob { "knob" } else { "key" }, n);
+}
+
+// ── SETTINGSBUS (B337): PrefChanged → a fresh get → apply → repaint (tail-appended) ─────────────
+
+/// The `system` keys this window shows.
+const SHOWN: [&str; 7] = [
+    crate::prefs::key::BRIGHTNESS, crate::prefs::key::VOLUME, crate::prefs::key::MUTE, crate::prefs::key::IDLE_MIN,
+    crate::prefs::key::POINTER, crate::prefs::key::WALLPAPER, crate::prefs::key::SETTINGS_TAB,
+];
+
+impl Values {
+    /// The window's current values (what it shows).
+    pub fn current() -> Values {
+        CUR.lock().clone()
+    }
+}
+
+/// Drain the window's PrefChanged subscription. For every key it shows that a client changed, the values
+/// are re-read THROUGH THE BUS (a fresh get, never the cache), applied (so the key sync below never writes
+/// the old live level back over another client's write) and the window repaints. Returns
+/// `(frames, shown keys refreshed)`. Runs on the settings service pass, after the key sync.
+pub fn bus_changes() -> (usize, usize) {
+    let (f, n, _) = bus_changes_inner();
+    (f, n)
+}
+
+/// [`bus_changes`] plus how many frames named `display.idle_min` and the idle minutes the window shows
+/// afterwards (the `tests settingsbus` view).
+pub fn bus_changes_idle() -> (usize, usize, u32) {
+    let (f, _, idle) = bus_changes_inner();
+    (f, idle, CUR.lock().idle_min)
+}
+
+fn bus_changes_inner() -> (usize, usize, usize) {
+    crate::prefs_client::subscribe();
+    let mut keys: Vec<&'static str> = Vec::new();
+    let mut idle = 0usize;
+    let frames = crate::prefs_client::changes_drain(|ns, k| {
+        if ns != crate::prefs::NS { return; }
+        if let Some(s) = SHOWN.iter().find(|s| **s == k) {
+            if *s == crate::prefs::key::IDLE_MIN { idle += 1; }
+            if !keys.contains(s) { keys.push(s); }
+        }
+    });
+    // Before the login's load the load itself reads the store fresh; nothing to follow yet.
+    if keys.is_empty() || !LOAD_DONE.load(Ordering::Acquire) {
+        return (frames, 0, idle);
+    }
+    let old = CUR.lock().clone();
+    let mut fresh = old.clone();
+    let _ = from_prefs(&mut fresh);
+    use crate::prefs::key;
+    let mut moved = 0usize;
+    for k in keys.iter() {
+        let m = match *k {
+            key::BRIGHTNESS if fresh.bright != old.bright => { crate::video::backlight::stage(fresh.bright); LOGIN_APPLY.store(fresh.bright, Ordering::Release); true }
+            key::VOLUME | key::MUTE if fresh.vol != old.vol || fresh.mute != old.mute => { apply_volume(fresh.vol, fresh.mute); true }
+            key::IDLE_MIN if fresh.idle_min != old.idle_min => { apply_idle(fresh.idle_min); true }
+            key::POINTER if fresh.ptr != old.ptr => { apply_ptr(fresh.ptr); true }
+            key::WALLPAPER if fresh.wall != old.wall => { apply_wall(if fresh.wall.is_empty() { "off" } else { &fresh.wall }); true }
+            key::SETTINGS_TAB => fresh.tab != old.tab,
+            _ => false,
+        };
+        if m { moved += 1; }
+    }
+    if moved > 0 {
+        *CUR.lock() = fresh;
+        serial_println!("[settings] prefchanged keys={} moved={} via={}", keys.len(), moved, crate::prefs_client::last_via());
+        if is_open() { repaint(); }
+    }
+    (frames, keys.len(), idle)
+}
+
+/// GLASSEYES (B343) — the tab `shot settings <tab>` opens on: `general | users | display | about` (case-insensitive)
+/// sets the in-memory selection the next [`open`] reads; NOT persisted (a fixture's choice is not the user's).
+/// `false` for a name no tab carries.
+pub fn set_tab_named(name: &str) -> bool {
+    match TAB_NAMES.iter().position(|t| t.eq_ignore_ascii_case(name)) {
+        Some(i) => {
+            CUR.lock().tab = i as u8;
+            true
+        }
+        None => false,
+    }
 }

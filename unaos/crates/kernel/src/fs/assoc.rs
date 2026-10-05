@@ -38,6 +38,10 @@ pub const BUILTIN: &[(&str, &str, &str, &str)] = &[
     (ft::GZIP, "none", "archive", "gzip archive"),
     (ft::TAR, "none", "archive", "tar archive"),
     (ft::OCTET, "none", "file", "Binary data"),
+    // QUARRY2 (B336): the two text types with their own openers (the viewer, rendered), and GIF.
+    (ft::TEXT_MARKDOWN, "markdown", "doc", "Markdown"),
+    (ft::APP_JSON, "json", "doc", "JSON"),
+    (ft::IMAGE_GIF, "facet", "image", "GIF image"),
 ];
 
 /// The builtin row for `mime`, if any. Pure.
@@ -119,6 +123,29 @@ pub fn seed_in(mt: &MountTable) -> Result<usize, VfsError> {
             }
         }
     }
+    // BOOT80 (B350): the missing objects in ONE transaction where the root has one (UnaFS: one root flip
+    // for the whole table — boot 21 paid 52 flips here, each rewriting the whole refcount map).
+    let missing: Vec<(String, Vec<(String, AttrValue)>)> = BUILTIN
+        .iter()
+        .filter(|(mime, ..)| mt.stat(&object_path(mime)).is_err())
+        .map(|(mime, opener, icon, name)| {
+            let leaf = String::from(&object_path(mime)[TYPES_DIR.len() + 1..]);
+            let attrs = alloc::vec![
+                (String::from(OPENER_KEY), AttrValue::Str(String::from(*opener))),
+                (String::from(ICON_KEY), AttrValue::Str(String::from(*icon))),
+                (String::from(NAME_KEY), AttrValue::Str(String::from(*name))),
+            ];
+            (leaf, attrs)
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    match mt.create_files_batch(TYPES_DIR, missing, k) {
+        Ok(n) => return Ok(n),
+        Err(VfsError::Unsupported) => {} // no batch on this volume: the per-object path below
+        Err(e) => return Err(e),
+    }
     let mut made = 0usize;
     for (mime, opener, icon, name) in BUILTIN.iter() {
         let obj = object_path(mime);
@@ -136,17 +163,17 @@ pub fn seed_in(mt: &MountTable) -> Result<usize, VfsError> {
 
 /// Seed once per boot, after the root volume answers (called from the users service's ready arm and
 /// from the verbs/fixture, whichever runs first). One wire line either way.
-pub fn seed_once() {
+pub fn seed_once() -> usize {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
-        return;
+        return 0;
     }
     let mt = crate::shell::vfs_mount_table();
     match seed_in(&mt) {
-        Ok(n) => crate::bootlog_println!("[assoc] seed dir={} created={} types={} source=db", TYPES_DIR, n, BUILTIN.len()),
-        Err(VfsError::Unsupported) => crate::bootlog_println!("[assoc] seed=skip reason=enotsup (root takes no attributes) source=builtin types={}", BUILTIN.len()),
-        Err(e) => serial_println!("[assoc] seed=fail ({}) source=builtin", crate::fs::attrsys::refusal(&e)),
+        Ok(n) => { crate::bootlog_println!("[assoc] seed dir={} created={} types={} source=db", TYPES_DIR, n, BUILTIN.len()); n }
+        Err(VfsError::Unsupported) => { crate::bootlog_println!("[assoc] seed=skip reason=enotsup (root takes no attributes) source=builtin types={}", BUILTIN.len()); 0 }
+        Err(e) => { serial_println!("[assoc] seed=fail ({}) source=builtin", crate::fs::attrsys::refusal(&e)); 0 }
     }
 }
 

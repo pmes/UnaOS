@@ -359,7 +359,7 @@ pub fn census() {
 
     for i in 0..c.n_isos {
         let iso = c.isos[i];
-        serial_println!(
+        crate::census_println!(
             "[ioapic] iso bus={} irq={} -> gsi={} polarity={} trigger={} flags={:#06x} == witness ::",
             iso.bus,
             iso.irq,
@@ -372,7 +372,7 @@ pub fn census() {
 
     for i in 0..c.n_nmis {
         let nmi = c.nmis[i];
-        serial_println!(
+        crate::census_println!(
             "[ioapic] nmi uid={} lint={} polarity={} trigger={} == witness ::",
             nmi.uid,
             nmi.lint,
@@ -582,7 +582,7 @@ pub fn route_pci_intx(
     // RUNG 4 FIRST: the chipset's APIC-mode answer for an on-die function.
     let pirq_refused = match pirq_gsi(bus, dev, func, pin, line) {
         Ok(gsi) => {
-            serial_println!(
+            crate::bootlog_println!(
                 "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> gsi={} via=pirq polarity={} trigger={} == witness ::",
                 bus, dev, func, pin_name, line, gsi,
                 Polarity::ActiveLow.as_str(),
@@ -631,7 +631,7 @@ pub fn route_pci_intx(
         }
     }
 
-    serial_println!(
+    crate::bootlog_println!(
         "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> gsi={} via={} polarity={} trigger={} == witness ::",
         bus, dev, func, pin_name, line, gsi, via, pol.as_str(), trig.as_str()
     );
@@ -702,7 +702,7 @@ pub fn route_pci_function(bus: u8, dev: u8, func: u8, vector: u8) -> Result<u32,
 
     // `masked=` is DERIVED from the read-back (bit 16 of `unmasked_lo`), never restated from the
     // call that asked for the unmask — the legible field and the sound one are the same field.
-    serial_println!(
+    crate::bootlog_println!(
         "[ioapic] armed bdf={}:{}.{} gsi={} vector={:#04x} masked={} dest_apic={} entry={:#018x} unmasked_lo={:#010x} intx_disable={} routed={} == witness ::",
         bus, dev, func, gsi, vector,
         unmasked & MASK != 0,
@@ -885,7 +885,7 @@ pub fn pirq_gsi(bus: u8, dev: u8, func: u8, pin: u8, fw_line: u8) -> Result<u32,
         return Err(Pirq::Refused("pirq-disabled"));
     }
     let gsi = PIRQ_GSI_BASE + idx;
-    let line = r & 0x0F; if r & 0x80 != 0 { serial_println!("[ioapic] pirq bdf=0:{}.0 id=8086:{:04x} family={} rcba={:#x} pirq{}_rout={:#04x} irqen=1 fn={}:{}.{} pin=INT{} d{}ir={:#06x} -> gsi={} via=apic-input (IOAPIC3, R68: the 8259 path is off by firmware's choice and stays off; I/O APIC input 16+{} receives PIRQ{}# regardless — datasheet APIC Interrupt Mapping — so the redirection entry is programmed active-low level and no chipset register is written) == witness ::", rdev, did, family, rcba, pirq_name.to_ascii_lowercase(), r, bus, dev, func, pin_name, dev, dnir, gsi, idx, pirq_name); return Ok(gsi); } // IOAPIC3 (B216): the IRQEN=1 arm ROUTES — flight 13's `pirq=G REFUSED reason=pirq-disabled` becomes `gsi=22 via=apic-input`; the ISA line bits are meaningless with IRQEN set, so `line=` is not printed for it.
+    let line = r & 0x0F; if r & 0x80 != 0 { crate::bootlog_println!("[ioapic] pirq bdf=0:{}.0 id=8086:{:04x} family={} rcba={:#x} pirq{}_rout={:#04x} irqen=1 fn={}:{}.{} pin=INT{} d{}ir={:#06x} -> gsi={} via=apic-input (IOAPIC3, R68: the 8259 path is off by firmware's choice and stays off; I/O APIC input 16+{} receives PIRQ{}# regardless — datasheet APIC Interrupt Mapping — so the redirection entry is programmed active-low level and no chipset register is written) == witness ::", rdev, did, family, rcba, pirq_name.to_ascii_lowercase(), r, bus, dev, func, pin_name, dev, dnir, gsi, idx, pirq_name); return Ok(gsi); } // IOAPIC3 (B216): the IRQEN=1 arm ROUTES — flight 13's `pirq=G REFUSED reason=pirq-disabled` becomes `gsi=22 via=apic-input`; the ISA line bits are meaningless with IRQEN set, so `line=` is not printed for it.
     let fw_agree = if fw_line == 0 || fw_line == 0xFF {
         "n/a"
     } else if fw_line == line {
@@ -893,7 +893,7 @@ pub fn pirq_gsi(bus: u8, dev: u8, func: u8, pin: u8, fw_line: u8) -> Result<u32,
     } else {
         "no"
     };
-    serial_println!(
+    crate::bootlog_println!(
         "[ioapic] pirq bdf=0:{}.0 id=8086:{:04x} family={} rcba={:#x} pirqa={:#04x} pirqb={:#04x} pirqc={:#04x} pirqd={:#04x} pirqe={:#04x} pirqf={:#04x} pirqg={:#04x} pirqh={:#04x} fn={}:{}.{} pin=INT{} d{}ir={:#06x} -> pirq={} gsi={} line={} fw_line={} fw_agree={} == witness ::",
         rdev, did, family, rcba,
         rout(0), rout(1), rout(2), rout(3), rout(4), rout(5), rout(6), rout(7),

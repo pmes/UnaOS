@@ -1,0 +1,11 @@
+[package]
+name = "elf_core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "STORMFAULT's shared core: the ring-3 ELF segment plan (bss tails, the stack, the args page, the window edge) and the fault classifier — linked by both kernel loaders and tested on the host."
+
+# STORMFAULT (rmbp-ledger B351, R79): the midden_core / diag_core shape. `#![no_std]`, `#![forbid(unsafe_code)]`,
+# NO dependencies, no allocator. A member of the ROOT host workspace (so `cargo test -p elf_core` runs the unit
+# tests over VUG.ELF's and LUMEN.ELF's real program headers) and a path dep of the kernel (both arches' loaders).
+[dependencies]

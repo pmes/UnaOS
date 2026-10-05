@@ -77,6 +77,12 @@ pub struct RefMap {
     /// [`set_counts`](Self::set_counts)) rewinds it, paying at most one
     /// re-scan. Never serialized — no format impact.
     hint: usize,
+    /// UNAFSGROW: the allocation CEILING — `allocate` hands out blocks below
+    /// it only. Equal to `block_count` except inside a grow, where the map is
+    /// already sized for the new volume but its own fresh blocks must land
+    /// below the OLD end (the on-disk superblock still says the old size until
+    /// the grow's last write). Never serialized.
+    limit: u64,
 }
 
 impl RefMap {
@@ -92,6 +98,7 @@ impl RefMap {
             frozen: try_zeroed(n)?,
             block_count,
             hint: 0,
+            limit: block_count,
         })
     }
 
@@ -119,20 +126,22 @@ impl RefMap {
             current: counts,
             block_count,
             hint: 0,
+            limit: block_count,
         })
     }
 
     /// First-fit allocate: the lowest block free in BOTH views. Marks it
     /// current-refcount 1. `None` when the volume is full.
     pub fn allocate(&mut self) -> Option<u64> {
-        for i in self.hint..self.block_count as usize {
+        let end = self.limit.min(self.block_count) as usize;
+        for i in self.hint..end {
             if self.current[i] == 0 && self.frozen[i] == 0 {
                 self.current[i] = 1;
                 self.hint = i + 1;
                 return Some(i as u64);
             }
         }
-        self.hint = self.block_count as usize;
+        self.hint = self.hint.max(end);
         None
     }
 
@@ -199,6 +208,20 @@ impl RefMap {
         self.block_count.div_ceil(REFS_PER_LEAF)
     }
 
+    /// BOOT80 (rmbp B350): is leaf `idx` unchanged since the last commit — every count it holds
+    /// equal in the current and frozen views? The frozen view IS the persisted map (mount adopts both
+    /// from disk; `freeze` copies current after the commit that serialized it; nothing else writes
+    /// `frozen` except `try_grow`, whose new leaves the commit treats as new), so a clean leaf's
+    /// committed block already holds exactly the bytes [`leaf_bytes`](Self::leaf_bytes) would write.
+    pub fn leaf_clean(&self, idx: u64) -> bool {
+        let lo = (idx * REFS_PER_LEAF) as usize;
+        if lo >= self.current.len() {
+            return true;
+        }
+        let hi = core::cmp::min(self.current.len(), lo + REFS_PER_LEAF as usize);
+        self.current[lo..hi] == self.frozen[lo..hi]
+    }
+
     /// Serialize leaf `idx` of the CURRENT view into a 4096 B block image.
     pub fn leaf_bytes(&self, idx: u64) -> Vec<u8> {
         let mut buf = alloc::vec![0u8; crate::storage::BLOCK_SIZE as usize];
@@ -219,5 +242,39 @@ impl RefMap {
             *c = counts.get(i).copied().unwrap_or(0);
         }
         self.hint = 0;
+    }
+
+    /// UNAFSGROW: extend both views to `new_block_count` entries (the new
+    /// blocks free in both) and hold the allocation ceiling at `limit`.
+    /// FALLIBLE like every other view allocation. A smaller size is refused
+    /// (`AllocRefused(0)` — the caller validated the geometry first).
+    pub fn try_grow(&mut self, new_block_count: u64, limit: u64) -> Result<(), StorageError> {
+        if new_block_count < self.block_count {
+            return Err(StorageError::AllocRefused(0));
+        }
+        let n = usize::try_from(new_block_count)
+            .map_err(|_| StorageError::AllocRefused(new_block_count))?;
+        let add = n - self.current.len();
+        self.current
+            .try_reserve_exact(add)
+            .map_err(|_| StorageError::AllocRefused(n as u64 * 4))?;
+        self.frozen
+            .try_reserve_exact(n - self.frozen.len())
+            .map_err(|_| StorageError::AllocRefused(n as u64 * 4))?;
+        self.current.resize(n, 0);
+        self.frozen.resize(n, 0);
+        self.block_count = new_block_count;
+        self.limit = limit.min(new_block_count);
+        Ok(())
+    }
+
+    /// UNAFSGROW: move the allocation ceiling (clamped to the map's size).
+    pub fn set_limit(&mut self, limit: u64) {
+        self.limit = limit.min(self.block_count);
+    }
+
+    /// The number of blocks the map covers.
+    pub fn block_count(&self) -> u64 {
+        self.block_count
     }
 }

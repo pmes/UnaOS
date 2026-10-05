@@ -167,3 +167,8 @@ pub mod attrsys;
 pub mod filetype;
 /// FILETYPE M2 (B307): the type database — type → opener as attributes on `/system/types/*`.
 pub mod assoc;
+/// BOOT80 (B350): the boot's own store-step lines and the medium counters behind them.
+pub mod bootstep;
+/// UNAFSGROW (B347): `tests unafsgrow` — the unafs crate's `UnaFS::grow` on a scratch image.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub mod unafsgrow;

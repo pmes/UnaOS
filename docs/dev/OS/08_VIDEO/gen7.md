@@ -784,6 +784,18 @@ before its tail has no stash and prints `r8-gated-on-r7 r7=not-reached`. The cos
 R8 now runs minutes after R7 rather than microseconds, so if the GT sleeps in between the wire will say
 `r8-enable-void-under-every-hold` — the rung takes its own holds, so that would itself be a finding.
 
+**GPUTESTS (B334, R80): the whole ladder runs under `tests gen7`.** `igpu::init` now makes ONE gen7 call,
+`gen7::bank(…)`, at the spot R1 used to run (above `bring_up_blt_ring`). It READS R1's twelve GGTT sample
+PTEs — firmware's, because `bring_up_blt_ring` has not written its ring PTE yet — and the panel geometry,
+stores BAR0/BDF, writes nothing and prints nothing. `tests gen7` (registered on every `gen7` build) runs
+R1..R7 in their boot order (`mod ladder`): R1's census answers from the banked PTEs and says so on
+`:: gen7: ggtt source=boot-bank …`; R2..R7 read live, which their ownership guards require. R7's tail still
+stashes for R8, which then runs under `gen7r8` exactly as GEN7R8 built it. One summary line:
+`:: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake=<w> r7=<verdict> us=<n> replay=<0|1> -> PASS|FAIL ::` (PASS
+iff R7 returned `r7-blit-verified`). Once per boot (R5..R8 leak or hold pages, §2.6); a second run replays.
+Refused (SKIP) when `igpu`'s own BLT ring came up — R5..R8 arm the BCS and must not do it under a live ring
+(on the rMBP the ring is always absent: `ring=absent why=no-active-surface`). Every rung line keeps its format.
+
 #### Refusals — stated, never trimmed
 
 `r8-refused-bpp-not-32` · `r8-refused-pitch-too-wide` (BR13's pitch field is 16 bits; a wider panel

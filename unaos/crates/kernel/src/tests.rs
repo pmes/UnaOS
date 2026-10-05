@@ -99,7 +99,7 @@ pub fn run(name: Option<&str>) -> usize {
         return 0;
     }
     let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
-    *FAILED.lock() = [None; 16]; skip_reset();
+    *FAILED.lock() = [None; 16]; skip_reset(); RESULTS.lock().clear(); // QUIETBOOT3 (B352): same-line fold.
     let mut ran = 0usize;
     let mut i = 0usize;
     loop {
@@ -110,7 +110,7 @@ pub fn run(name: Option<&str>) -> usize {
         if let Some(want) = name { if want != n { continue; } }
         serial_println!(":: TESTS: run {} ::", n);
         *CUR.lock() = n;
-        let vb = verdicts(); f(); skip_note(n, vb);
+        crate::serial_line::tail_arm(); let vb = verdicts(); f(); skip_note(n, vb); verdict_note(n); // QUIETBOOT3 (B352): the fixture's own wire tail, for the glass.
         *CUR.lock() = "";
         ran += 1;
     }
@@ -129,12 +129,12 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold)
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
+    ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); // RING3WIN, RING3ABI2 (merge12 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
-    crate::video::blitter::ensure_tests(); crate::prof::ensure_tests(); // KCOMP (B321): `tests blitter`. PROFILE (B331): `tests prof`.
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); #[cfg(target_arch = "x86_64")] crate::execname::ensure(); // EXECNAME (B322): `tests exec`.
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::shotmask::ensure_tests(); crate::video::blitter::ensure_tests(); crate::prof::ensure_tests(); // GLASSEYES (B343): `tests shot`. KCOMP (B321): `tests blitter`. PROFILE (B331): `tests prof`.
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); #[cfg(target_arch = "x86_64")] crate::execname::ensure(); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] crate::prefs_client::ensure_tests(); #[cfg(feature = "selfdiag")] crate::selfdiag::ensure(); // EXECNAME (B322): `tests exec`. SETTINGSBUS (B337): `tests settingsbus`. SELFDIAG (B324): `tests selfdiag`. (merge12 fold: one line)
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -150,18 +150,18 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     } else {
         let mut names = alloc::string::String::new();
         for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
-        console.println_styled(if f == 0 { crate::video::theme::TERM_GREEN } else { crate::video::theme::TERM_RED }, &format!("tests: ran={} pass={} fail={} failed=[{}] skipped=[{}]", ran, p, f, names, skipped_names()));
+        console_verdicts(console); if name.is_none() { console.println_styled(if f == 0 { crate::video::theme::TERM_GREEN } else { crate::video::theme::TERM_RED }, &format!("tests: ran={} pass={} fail={} failed=[{}] skipped=[{}]", ran, p, f, names, skipped_names())); } // QUIETBOOT3 (B352): one `<name> -> <wire tail>` line per fixture; the tally line only after the whole suite.
     }
 }
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
-        if !LDONE.swap(true, Ordering::AcqRel) { register("linuxabi", crate::arch::linuxabi::selftest); register("linuxabi2", crate::arch::linuxabi::selftest2); register("linuxabi3", crate::arch::linuxabi::selftest3); }
+        if !LDONE.swap(true, Ordering::AcqRel) { register("linuxabi", crate::arch::linuxabi::selftest); register("linuxabi2", crate::arch::linuxabi::selftest2); register("linuxabi3", crate::arch::linuxabi::selftest3); register("selfbuild", crate::arch::linuxabi::selfbuild::selftest); register("selfbuild2", crate::arch::linuxabi::selfbuild2::selftest); register("selfbuild3", crate::arch::linuxabi::selfbuild3::selftest); }
     }
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
     {
@@ -194,7 +194,7 @@ fn ensure_selfinstall() {
     #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); register("install", crate::install::selfinstall::install_selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); register("install", crate::install::selfinstall::install_selftest); #[cfg(feature = "ahciroot")] register("ahciw", crate::install::ahciroot::ahciw_selftest); #[cfg(all(feature = "ahciroot", feature = "instgui"))] register("instgui", crate::video::instgui::install3::selftest); }
     }
 }
 
@@ -204,7 +204,12 @@ fn ensure_unafsx86() {
     #[cfg(feature = "unafs")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); register("boot80", crate::fs::bootstep::boot80_selftest); }
+    }
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        static GROW: AtomicBool = AtomicBool::new(false);
+        if !GROW.swap(true, Ordering::AcqRel) { register("unafsgrow", crate::fs::unafsgrow::selftest); } // UNAFSGROW (B347) M4: the native module's builds (aarch64 always, x86 under `unafs`)
     }
 }
 
@@ -272,11 +277,11 @@ pub const QUIETBOOT_BOUND: u64 = 250; // QUIETBOOT2 (B325): the seat's bound (FL
 /// (`tests-at-boot` / `census` — the QEMU lanes), which is not the quiet boot being measured.
 pub fn quietboot_selftest() {
     let Some(n) = crate::bootpace::boot_lines() else {
-        serial_println!(":: QUIETBOOT: lines=- bound={} -> SKIP (no `:: BOOT:` line yet: no first-boot stage resolved) ::", QUIETBOOT_BOUND);
+        serial_println!(":: QUIETBOOT: lines=- bound={} -> SKIP reason=no-boot-line ::", QUIETBOOT_BOUND); // QUIETBOOT3 (B352): `SKIP reason=`, never a sentence.
         return;
     };
     if cfg!(feature = "tests-at-boot") || cfg!(feature = "census") {
-        serial_println!(":: QUIETBOOT: lines={} bound={} census={} -> SKIP (tests-at-boot/census build: not the quiet boot) ::", n, QUIETBOOT_BOUND, crate::census::bits());
+        serial_println!(":: QUIETBOOT: lines={} bound={} census={} -> SKIP reason=tests-at-boot-or-census-build ::", n, QUIETBOOT_BOUND, crate::census::bits()); // QUIETBOOT3 (B352): `SKIP reason=`.
         return;
     }
     let ok = n <= QUIETBOOT_BOUND;
@@ -315,6 +320,16 @@ fn ensure_usbnet() {
     }
 }
 
+/// WIFI1 (B338): register `tests wifi` — the BCM4331 bring-up verdict (`ucode=<ok|refused>
+/// d11=<up|down> scan=<n>`) exactly once on a `wifi` build; no radio / no firmware prints SKIP.
+fn ensure_wifi() {
+    #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("wifi", crate::wifi::verb::selftest); }
+    }
+}
+
 /// KVBLANK8 (B318): register `tests kvblank8` (the vblank interrupt path, 1 s, `lost_at=`) exactly once on a Kepler
 /// vblank build; no GK107 prints SKIP, never a pin.
 fn ensure_kvblank8() {
@@ -325,14 +340,14 @@ fn ensure_kvblank8() {
     }
 }
 
-/// GEN7R8 (B320, R80): register `tests gen7` — the Ivy Bridge ladder's rung R8 (the BCS blit at the
-/// panel's geometry into scratch) — exactly once, on a `gen7r8` (`UNAOS_IVB3D_R8`) build. The boot only
-/// stashes R8's inputs at R7's tail; this fixture runs the rung and prints `:: GEN7R8: … ::`.
+/// GEN7R8 (B320, R80) + GPUTESTS (B334): register `tests gen7` — the whole Ivy Bridge ladder, R1..R7 from
+/// the boot bank (`:: GEN7LADDER: … ::`) then R8 under `gen7r8` (`:: GEN7R8: … ::`) — exactly once, on a
+/// `gen7` (`UNAOS_IVB3D`) build. The boot only banks the inputs (`gen7::bank`) and prints nothing.
 fn ensure_gen7() {
-    #[cfg(all(target_arch = "x86_64", feature = "gen7r8"))]
+    #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("gen7", crate::drivers::gpu::gen7::r8_test); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("gen7", crate::drivers::gpu::gen7::ladder_test); }
     }
 }
 
@@ -370,4 +385,69 @@ pub fn defer_fast(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
         defer(name, f);
     }
     true
+}
+
+/// NETCLOCK (B335): register `tests netclock` (5 s idle on a live USB link: polls/s, tx/s, the stack-side
+/// xHCI loan hold) exactly once on an x86 smolnet + usbnet build.
+fn ensure_netclock() { ensure_netclock_arm();
+    #[cfg(all(feature = "smolnet", feature = "usbnet", target_arch = "x86_64"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("netclock", crate::smolnet::netclock_selftest); }
+    }
+}
+
+/// ARMNET (B346): register `tests netclock` on an aarch64 NET6 build (the persistent stack's 5 s idle: polls/s,
+/// tx/s; SKIP with no NIC or no link). Called from `ensure_netclock` (same-line fold) so the x86 arm is untouched.
+fn ensure_netclock_arm() {
+    #[cfg(all(feature = "net6", target_arch = "aarch64"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("netclock", crate::net_phy::net6::netclock_selftest); }
+    }
+}
+
+/// RING3ABI2 (B333): register `tests ring3abi` exactly once — x86, and aarch64 builds with an EL0 layer.
+fn ensure_ring3abi() {
+    #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("ring3abi", crate::ring3abi::selftest); }
+    }
+}
+
+/// STORMFAULT (B351): register `tests elfbss` (a 64 KiB-bss elf-model program exits 0; named refusals) once on x86.
+fn ensure_elfbss() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("elfbss", crate::arch::elf::elfbss_selftest); }
+    }
+}
+
+// QUIETBOOT3 (rmbp-ledger B352) — TAIL-APPENDED. THE GLASS SAYS WHAT THE WIRE SAYS. Boot 21: Peter read "nethang
+// failed" and "storm failed" off the glass where the wire said `NETHANG … -> PASS`; the console printed a tally
+// sentence (`tests: ran=1 pass=8 …`), not the verdict. Now each fixture's console line is `<name> -> <tail>`, the
+// tail being the wire's own text after the LAST `-> ` of the last verdict line the fixture printed
+// (`serial_line::verdict_tail`): `PASS`, `FAIL …`, `SKIP reason=…`. A fixture that printed no verdict gets a wire
+// line of its own, `:: TESTS: <name> -> SKIP reason=no-verdict ::`, and the glass prints that same tail.
+static RESULTS: spin::Mutex<alloc::vec::Vec<(&'static str, alloc::string::String)>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+fn verdict_note(n: &'static str) {
+    let tail = match crate::serial_line::tail_take() {
+        Some(t) => t,
+        None => {
+            serial_println!(":: TESTS: {} -> SKIP reason=no-verdict ::", n);
+            alloc::string::String::from("SKIP reason=no-verdict")
+        }
+    };
+    RESULTS.lock().push((n, tail));
+}
+
+fn console_verdicts(console: &mut Console) {
+    let rows = core::mem::take(&mut *RESULTS.lock());
+    for (n, tail) in rows.iter() {
+        let c = if tail.starts_with("PASS") { crate::video::theme::TERM_GREEN } else if tail.starts_with("FAIL") { crate::video::theme::TERM_RED } else { crate::video::theme::TERM_DIM };
+        console.println_styled(c, &format!("{} -> {}", n, tail));
+    }
 }

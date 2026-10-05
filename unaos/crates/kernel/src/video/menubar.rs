@@ -3125,3 +3125,17 @@ pub fn batt_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
     let x0 = batt_slot(w)?;
     Some((rx + x0, ry, BATT_ITEM_W, h))
 }
+
+/// GLASSEYES (B343) — the bar's VOLATILE rects on the panel, absolute `(x, y, w, h)`, for the state-shot mask:
+/// `(clock, glyphs)`. `clock` is the clock cell [`compose_row`] draws (full bar height, so a re-anchored clock's
+/// placeholder cannot leak); `glyphs` is the whole status area left of the clock — the battery item, the
+/// brightness transient and anything a later status item takes there — from [`bright_slot`]'s x (else
+/// [`batt_slot`]'s) to the clock. `None` for either when the bar is off or the panel cannot seat it.
+pub fn volatile_rects(pw: usize, ph: usize) -> (Option<strip::Rect>, Option<strip::Rect>) {
+    let Some((rx, ry, w, h)) = strip_rect(pw, ph) else { return (None, None) };
+    let Some(cx) = clock_slot(w) else { return (None, None) };
+    let clock = Some((rx + cx, ry, (CLOCK_GLYPHS * CELL_W).min(w - cx), h));
+    let gx = bright_slot(w).or_else(|| batt_slot(w));
+    let glyphs = gx.map(|x0| (rx + x0, ry, cx.saturating_sub(x0), h));
+    (clock, glyphs)
+}
