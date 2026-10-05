@@ -647,6 +647,27 @@ fn inflate_block<S: ByteSource, K: Sink>(
 }
 
 /// A human-readable reason for a FAIL line.
+/// What a completed raw DEFLATE (RFC 1951, no container) walk produced.
+pub struct RawReport {
+    /// Decompressed byte count.
+    pub uncompressed: u64,
+    /// Compressed bytes consumed.
+    pub compressed: u64,
+}
+
+/// Decompress one bare RFC 1951 stream (no zlib/gzip wrapper) from `src` into `sink`.
+///
+/// HTTPCORE (SR51): the third sibling over the ONE [`deflate_body`]. HTTP's `deflate` content-coding is
+/// defined as zlib (RFC 9110 §8.4.1.2), but servers that send a bare DEFLATE stream under that name exist,
+/// so `http_core` tries [`zlib_inflate`] first and falls back here only when the zlib header is refused —
+/// exactly what browsers do. There is no checksum to check: the container is the one that carries it.
+pub fn inflate_raw<S: ByteSource, K: Sink>(src: &mut S, sink: &mut K) -> Result<RawReport, InflateError> {
+    let mut br = BitReader::new(src);
+    let mut win = Window::new(sink);
+    deflate_body(&mut br, &mut win)?;
+    Ok(RawReport { uncompressed: win.produced, compressed: br.consumed })
+}
+
 pub fn inflate_reason(e: InflateError) -> &'static str {
     match e {
         InflateError::TruncatedInput => "input ended mid-stream",

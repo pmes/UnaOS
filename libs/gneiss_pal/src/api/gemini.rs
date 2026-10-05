@@ -35,7 +35,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use log::{error, info, warn};
-use reqwest::{Client, ClientBuilder, RequestBuilder};
+use super::http::{Client, ClientBuilder, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -195,7 +195,7 @@ impl GeminiProvider {
 
     /// Send with the shared backoff; in ADC mode a 401 refreshes the token and
     /// tries once more.
-    async fn send(&self, url: &str, body: &Value) -> Result<reqwest::Response, ProviderError> {
+    async fn send(&self, url: &str, body: &Value) -> Result<super::http::Response, ProviderError> {
         match send_classified(self.post(url, body), &self.retry).await {
             Err(ProviderError::Request { status: 401, .. }) if self.cfg.auth == GeminiAuth::GcloudAdc => {
                 warn!("401 Unauthorized detected. Refreshing the gcloud token...");

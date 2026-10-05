@@ -40,7 +40,7 @@ async-channel = "2.5"
 futures = "0.3"
 
 # Networking & AI
-reqwest = { version = "0.13.4", features = ["json", "multipart", "stream"] }
+# HTTPCORE (SR51): HTTP goes through gneiss_pal::api::http (UnaOS's http_core + tls_core); reqwest is gone.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
