@@ -600,6 +600,9 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("quarry2", selftest);
+        // FACETANIM (B358): `tests facetanim` rides this registration (no tests.rs line).
+        #[cfg(feature = "facet")]
+        crate::tests::register("facetanim", crate::video::facet::anim::selftest);
     }
 }
 

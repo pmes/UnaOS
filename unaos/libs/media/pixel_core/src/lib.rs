@@ -31,6 +31,7 @@ extern crate std;
 
 use alloc::vec::Vec;
 
+pub mod anim;
 pub mod bmp;
 pub mod crc;
 pub mod gif;
@@ -39,6 +40,8 @@ pub mod jpeg;
 pub mod png;
 pub mod qoi;
 pub mod webp;
+
+pub use anim::{Animation, FrameInfo, decode_first_frame};
 
 /// One composited animation frame: the whole canvas as it looks while this frame is displayed.
 #[derive(Clone, Debug, PartialEq, Eq)]

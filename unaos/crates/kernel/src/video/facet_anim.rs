@@ -1,112 +1,149 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! CHARTER: Facet — owed
+//! CHARTER: Facet — shared-core
 //!
-//! QUARRY2 M4 (rmbp-ledger B336) — Facet steps ANIMATED frames when the decoded image carries them.
+//! Facet steps ANIMATED frames — QUARRY2 M4 (rmbp-ledger B336) built the stepper and the tick;
+//! FACETANIM (B358) gave it a decoder and took the N-frame cost away.
 //!
-//! The decoder that produces frames is `pixel_core`, a sibling arc NOT in this tree (PIXELCORE, SR25:
-//! the shared `no_std` image core both rings link — that is the seam this file's CHARTER says is owed).
-//! So the viewer codes against a LOCAL shape, [`Decoded`] `{ w, h, frames: Option<Vec<(u16 delay_ms,
-//! Vec<u32> argb)>> }`, behind a LOCAL trait, [`FrameDecoder`]; the fold is ONE adapter
-//! (`impl FrameDecoder for <pixel_core's decoder>`) and one line in [`decoder`].
+//! The decoder is `pixel_core` (PIXELCORE SR25 + ANIMWEBP SR44: the shared `no_std` image core both
+//! rings link — the seam). [`decoder`] returns [`PixelCore`], the one adapter behind the local
+//! [`FrameDecoder`] trait: it takes GIF, animated WebP (VP8X animation flag) and APNG (`acTL` before
+//! `IDAT`) and opens a [`pixel_core::Animation`] over the file's bytes. That stream composites ONE
+//! frame at a time onto ONE canvas (plus one more canvas-sized buffer only while a dispose-to-previous
+//! frame is up), so the viewer holds two frames — the decoder's canvas and the view's base image —
+//! never N. Every other file (PNG stills, JPEG, BMP, QOI, still WebP) is not taken and Facet's own
+//! paths run unchanged.
 //!
-//! Today's only adapter is [`PngStill`] — Facet's own PNG path, which answers `frames: None`, so
-//! [`probe`] returns `None` and Facet's streaming PNG decoder runs exactly as before (behaviour
-//! unchanged). A `.gif` reaches Facet (FILETYPE types it `image/gif`, the association opens it here)
-//! and is refused by name (`reason=not-png`) until the fold.
+//! The viewer: frame 0 opens through Facet's window body (fit, zoom, browse); [`tick`] — on Facet's
+//! service pass — composites the next frame into the base image when the current one's delay has run
+//! out (delays under 20 ms read as 100 ms, the rule browsers apply), loops per the file's loop count
+//! (forever / n extra plays / once, then it rests on the last frame), and `p` or space pauses
+//! ([`toggle_pause`]). The title carries `frame i/n` ([`title_suffix`]).
 //!
-//! When frames ARE present: frame 0 opens through the same window body (fit, zoom, browse), every
-//! frame is resampled once to the base size, and [`tick`] — on Facet's service pass — swaps the base
-//! image when [`frame_at`] says the clock has moved on (GIF delays under 20 ms read as 100 ms, the
-//! rule every browser applies; the animation loops).
-//!
-//! Wire: `[facet] anim path= frames= w= h= decoder=` on open, `[facet] anim step=<n>` every 64 steps.
+//! Wire: `[facet] anim path= frames= loop= w= h= decoder= k=` on open, `[facet] anim step=<n>
+//! frame=<i>/<n>` every 64 steps, `[facet] anim end plays=<n>`, `[facet] anim pause=<0|1>`.
+//! `tests facetanim`: `:: FACETANIM: gif=3 webp=3 apng=3 frames_held=2 -> PASS ::`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{FacetError, Ihdr};
 
-/// One decoded image, the PIXELCORE shape. `frames: None` = a still (the caller keeps its own path).
-pub struct Decoded {
-    pub w: u32,
-    pub h: u32,
-    /// `(delay in ms, w*h pixels 0xAARRGGBB)` per frame.
-    pub frames: Option<Vec<(u16, Vec<u32>)>>,
-}
+/// The stream an adapter opens: pixel_core's animation over the file's own bytes.
+pub type Stream = pixel_core::Animation<Vec<u8>>;
 
-/// A frame-capable decoder. `head` = the file's first bytes; `read_all` reads the whole file and is
-/// called only by a decoder that wants it (a still costs no read).
+/// A frame-capable decoder. `takes` looks at the file's first bytes only (a file it does not take
+/// costs no whole read); `open` gets the whole file.
 pub trait FrameDecoder: Sync {
     fn name(&self) -> &'static str;
-    fn decode(&self, head: &[u8], read_all: &mut dyn FnMut() -> Option<Vec<u8>>) -> Option<Decoded>;
+    fn takes(&self, head: &[u8]) -> bool;
+    fn open(&self, bytes: Vec<u8>) -> Result<Stream, FacetError>;
 }
 
-/// Facet's own PNG path as an adapter: a still, always (APNG is not decoded).
-pub struct PngStill;
+/// The pixel_core adapter: GIF, animated WebP, APNG.
+pub struct PixelCore;
 
-impl FrameDecoder for PngStill {
+impl FrameDecoder for PixelCore {
     fn name(&self) -> &'static str {
-        "png-still"
+        "pixel_core"
     }
-    fn decode(&self, head: &[u8], _read_all: &mut dyn FnMut() -> Option<Vec<u8>>) -> Option<Decoded> {
-        if head.len() < 24 || head[..8] != super::SIGNATURE {
-            return None;
-        }
-        let be = |o: usize| u32::from_be_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
-        Some(Decoded { w: be(16), h: be(20), frames: None })
-    }
-}
-
-static PNG_STILL: PngStill = PngStill;
-
-/// THE decoder. PIXELCORE fold: return the pixel_core adapter here (it answers PNG stills as `None`
-/// frames and GIFs with frames).
-pub fn decoder() -> &'static dyn FrameDecoder {
-    &PNG_STILL
-}
-
-/// Frames `path` carries, through [`decoder`]; `None` = a still or not an image this decoder takes
-/// (Facet's own path then runs unchanged).
-pub fn probe(path: &str) -> Option<Decoded> {
-    let mt = crate::shell::vfs_mount_table();
-    let head = mt.read(path, 0, 64).ok()?;
-    let mut read_all = || -> Option<Vec<u8>> {
-        let st = mt.stat(path).ok()?;
-        if st.size > super::MAX_FILE {
-            return None;
-        }
-        let mut out = Vec::new();
-        while (out.len() as u64) < st.size {
-            let c = mt.read(path, out.len() as u64, 256 * 1024).ok()?;
-            if c.is_empty() {
-                break;
+    fn takes(&self, head: &[u8]) -> bool {
+        match pixel_core::sniff(head) {
+            Some(pixel_core::Format::Gif) => true,
+            // VP8X first (offset 12) with the Animation flag (bit 1 of its flags byte, offset 20).
+            Some(pixel_core::Format::WebP) => head.len() > 20 && &head[12..16] == b"VP8X" && head[20] & 0x02 != 0,
+            // acTL must come before the first IDAT (APNG §4); look through the head for it.
+            Some(pixel_core::Format::Png) => {
+                let mut p = 8usize;
+                while p + 8 <= head.len() {
+                    let len = u32::from_be_bytes([head[p], head[p + 1], head[p + 2], head[p + 3]]) as usize;
+                    match &head[p + 4..p + 8] {
+                        b"acTL" => return true,
+                        b"IDAT" => return false,
+                        _ => {}
+                    }
+                    p = match p.checked_add(12 + len) {
+                        Some(n) => n,
+                        None => return false,
+                    };
+                }
+                false
             }
-            out.extend_from_slice(&c);
+            _ => false,
         }
-        Some(out)
-    };
-    let d = decoder().decode(&head, &mut read_all)?;
-    match &d.frames {
-        Some(f) if !f.is_empty() && f.iter().all(|(_, px)| px.len() == d.w as usize * d.h as usize) => Some(d),
-        _ => None,
+    }
+    fn open(&self, bytes: Vec<u8>) -> Result<Stream, FacetError> {
+        pixel_core::Animation::new(bytes).map_err(FacetError::Pixel)
     }
 }
 
-/// The frame showing `elapsed_ms` after frame 0 went up (looping). Pure.
+static PIXEL_CORE: PixelCore = PixelCore;
+
+/// THE decoder.
+pub fn decoder() -> &'static dyn FrameDecoder {
+    &PIXEL_CORE
+}
+
+/// How much of the head [`FrameDecoder::takes`] sees: enough for an APNG's `acTL` after a few
+/// ancillary chunks.
+const HEAD: usize = 4096;
+
+/// Read `path` whole (bounded by Facet's non-PNG cap) when the decoder takes its head.
+fn read_taken(path: &str) -> Option<Vec<u8>> {
+    let mt = crate::shell::vfs_mount_table();
+    let head = mt.read(path, 0, HEAD).ok()?;
+    if !decoder().takes(&head) {
+        return None;
+    }
+    let st = mt.stat(path).ok()?;
+    if st.size == 0 || st.size > super::MAX_FOREIGN {
+        return None;
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(st.size as usize).ok()?;
+    while (out.len() as u64) < st.size {
+        let c = mt.read(path, out.len() as u64, 256 * 1024).ok()?;
+        if c.is_empty() {
+            break;
+        }
+        out.extend_from_slice(&c);
+    }
+    Some(out)
+}
+
+/// The stream for `path`, frame 0 composited, through [`decoder`]; `None` = not a file the decoder
+/// takes, or one it could not open (Facet's own path then runs and names the reason).
+pub fn probe(path: &str) -> Option<Stream> {
+    let bytes = read_taken(path)?;
+    match decoder().open(bytes) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            serial_println!("[facet] anim probe path={} refused={} (falling back)", path, e.reason());
+            None
+        }
+    }
+}
+
+/// A delay as played: under 20 ms reads as 100 ms (the rule every browser applies).
+fn played(ms: u32) -> u64 {
+    if ms < 20 { 100 } else { ms as u64 }
+}
+
+/// The frame showing `elapsed_ms` after frame 0 went up (looping). Pure. (QUARRY2's stepper over a
+/// known delay list; the viewer itself steps on each frame's delay as it is composited.)
 pub fn frame_at(delays: &[u16], elapsed_ms: u64) -> usize {
-    let d = |x: u16| if x < 20 { 100u64 } else { x as u64 };
-    let cycle: u64 = delays.iter().map(|&x| d(x)).sum();
+    let cycle: u64 = delays.iter().map(|&x| played(x as u32)).sum();
     if delays.is_empty() || cycle == 0 {
         return 0;
     }
     let mut t = elapsed_ms % cycle;
     for (i, &x) in delays.iter().enumerate() {
-        if t < d(x) {
+        if t < played(x as u32) {
             return i;
         }
-        t -= d(x);
+        t -= played(x as u32);
     }
     0
 }
@@ -127,60 +164,220 @@ pub fn resample(src: &[u32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<
     out
 }
 
+/// Box-reduce straight RGBA (`iw` wide) by `k` into `0xFFRRGGBB` base pixels (`ow x oh`), alpha
+/// dropped — the reduction Facet's non-PNG open uses, so an animated frame looks like a still one.
+pub fn reduce_into(rgba: &[u8], iw: usize, k: usize, ow: usize, oh: usize, out: &mut [u32]) {
+    let n = (k * k) as u32;
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+            for sy in oy * k..oy * k + k {
+                for sx in ox * k..ox * k + k {
+                    let i = (sy * iw + sx) * 4;
+                    if let Some(p) = rgba.get(i..i + 3) {
+                        r += p[0] as u32;
+                        g += p[1] as u32;
+                        b += p[2] as u32;
+                    }
+                }
+            }
+            out[oy * ow + ox] = 0xFF00_0000 | ((r / n) << 16) | ((g / n) << 8) | (b / n);
+        }
+    }
+}
+
 struct Anim {
     path: String,
-    frames: Vec<(u16, Vec<u32>)>,
-    shown: usize,
-    t0: u64,
+    src: Stream,
+    k: usize,
+    bw: usize,
+    bh: usize,
+    /// `crate::arch::ms()` at which the frame on screen has had its time.
+    due: u64,
+    /// Complete plays so far.
+    plays: u32,
+    /// Resting on the last frame (the loop count is spent, or the file broke).
+    rest: bool,
+    /// `ms()` when a pause began.
+    paused_at: Option<u64>,
     steps: u64,
 }
 
 static ANIM: spin::Mutex<Option<Anim>> = spin::Mutex::new(None);
+/// The title's view of the animation (read by `facet::title_for` while [`tick`] holds [`ANIM`], so
+/// it is atomics, never the lock).
+static T_ON: AtomicBool = AtomicBool::new(false);
+static T_I: AtomicUsize = AtomicUsize::new(0);
+static T_N: AtomicUsize = AtomicUsize::new(0);
+static PAUSED: AtomicBool = AtomicBool::new(false);
 
-/// Open `path`'s frames: frame 0 through Facet's window body, the rest stepped by [`tick`].
-pub(super) fn open_frames(path: &str, bytes: u64, d: Decoded) -> Result<super::Opened, FacetError> {
-    let frames = d.frames.unwrap_or_default();
-    let (sw, sh) = (d.w as usize, d.h as usize);
-    let (k, bw, bh) = super::fit(d.w, d.h, super::BASE_W, super::BASE_H).ok_or(FacetError::NoWindow("fit"))?;
-    let base: Vec<(u16, Vec<u32>)> = frames.iter().map(|(t, px)| (*t, resample(px, sw, sh, bw, bh))).collect();
-    let first = base.first().map(|f| f.1.clone()).ok_or(FacetError::NoWindow("no-frames"))?;
-    let ihdr = Ihdr { width: d.w, height: d.h, depth: 8, colour: 6, interlaced: false };
-    serial_println!("[facet] anim path={} frames={} w={} h={} decoder={} k={}", path, base.len(), d.w, d.h, decoder().name(), k);
-    let o = super::open_base(path, bytes, ihdr, k, bw, bh, first)?;
-    *ANIM.lock() = Some(Anim { path: String::from(path), frames: base, shown: 0, t0: crate::arch::ms(), steps: 0 });
+/// ` - frame i/n` (1-based, `paused` appended) while an animation is shown, else `""`.
+pub fn title_suffix() -> String {
+    if !T_ON.load(Ordering::Relaxed) {
+        return String::new();
+    }
+    alloc::format!(
+        " - frame {}/{}{}",
+        T_I.load(Ordering::Relaxed) + 1,
+        T_N.load(Ordering::Relaxed),
+        if PAUSED.load(Ordering::Relaxed) { " paused" } else { "" }
+    )
+}
+
+/// The pause key: flip the pause (the next [`tick`] honours it). `false` when no animation is shown
+/// (the key is then not Facet's).
+pub fn toggle_pause() -> bool {
+    if !T_ON.load(Ordering::Relaxed) {
+        return false;
+    }
+    let p = !PAUSED.fetch_xor(true, Ordering::Relaxed);
+    serial_println!("[facet] anim pause={}", p as u8);
+    true
+}
+
+/// End the animation (Facet closed, or another file replaced it).
+pub fn stop() {
+    T_ON.store(false, Ordering::Relaxed);
+    PAUSED.store(false, Ordering::Relaxed);
+    if let Some(mut g) = ANIM.try_lock() {
+        *g = None;
+    }
+}
+
+/// Open `path`'s stream: frame 0 through Facet's window body, the rest stepped by [`tick`].
+pub(super) fn open_frames(path: &str, bytes: u64, mut src: Stream) -> Result<super::Opened, FacetError> {
+    let (w, h) = (src.width(), src.height());
+    let (k, bw, bh) = super::fit(w, h, super::BASE_W, super::BASE_H).ok_or(FacetError::NoWindow("fit"))?;
+    let f0 = match src.next_frame() {
+        Some(Ok(f)) => f,
+        Some(Err(e)) => return Err(FacetError::Pixel(e)),
+        None => return Err(FacetError::NoWindow("no-frames")),
+    };
+    let mut first: Vec<u32> = Vec::new();
+    if first.try_reserve_exact(bw * bh).is_err() {
+        return Err(FacetError::OutOfMemory(bw * bh * 4));
+    }
+    first.resize(bw * bh, 0xFF00_0000);
+    reduce_into(src.canvas(), w as usize, k, bw, bh, &mut first);
+    let ihdr = Ihdr { width: w, height: h, depth: 8, colour: 6, interlaced: false };
+    let n = src.frame_count();
+    serial_println!(
+        "[facet] anim path={} frames={} loop={} w={} h={} decoder={} k={}",
+        path, n, loop_name(src.loop_count()), w, h, decoder().name(), k
+    );
+    PAUSED.store(false, Ordering::Relaxed);
+    T_I.store(0, Ordering::Relaxed);
+    T_N.store(n, Ordering::Relaxed);
+    T_ON.store(n > 1, Ordering::Relaxed);
+    let o = match super::open_base(path, bytes, ihdr, k, bw, bh, first) {
+        Ok(o) => o,
+        Err(e) => {
+            T_ON.store(false, Ordering::Relaxed);
+            return Err(e);
+        }
+    };
+    if n > 1 {
+        let due = crate::arch::ms() + played(f0.delay_ms);
+        *ANIM.lock() = Some(Anim { path: String::from(path), src, k, bw, bh, due, plays: 0, rest: false, paused_at: None, steps: 0 });
+    }
     Ok(o)
 }
 
-/// Facet's service pass: step the frame when the clock says so. A closed or replaced view ends the
-/// animation. Quiet pass = one uncontended lock.
+fn loop_name(l: Option<u16>) -> String {
+    match l {
+        Some(0) => String::from("forever"),
+        Some(n) => alloc::format!("{}", n),
+        None => String::from("once"),
+    }
+}
+
+/// Composite the next frame (looping per the loop count) into `px` (`bw x bh`). `Ok(Some(i, delay))`
+/// = frame `i` is up; `Ok(None)` = the animation has played out and rests. Shared by [`tick`] and
+/// `tests facetanim`, so the fixture drives the viewer's own step.
+fn advance(src: &mut Stream, plays: &mut u32, k: usize, bw: usize, bh: usize, px: &mut [u32]) -> Result<Option<(usize, u32)>, FacetError> {
+    let f = match src.next_frame() {
+        Some(Ok(f)) => f,
+        Some(Err(e)) => return Err(FacetError::Pixel(e)),
+        None => {
+            *plays += 1;
+            let again = match src.loop_count() {
+                Some(0) => true,
+                Some(n) => *plays <= n as u32,
+                None => false,
+            };
+            if !again {
+                return Ok(None);
+            }
+            src.rewind();
+            match src.next_frame() {
+                Some(Ok(f)) => f,
+                Some(Err(e)) => return Err(FacetError::Pixel(e)),
+                None => return Ok(None),
+            }
+        }
+    };
+    reduce_into(src.canvas(), src.width() as usize, k, bw, bh, px);
+    Ok(Some((f.index, f.delay_ms)))
+}
+
+/// Facet's service pass: step the frame when its delay has run out. A closed or replaced view ends
+/// the animation. Quiet pass = one uncontended lock and a clock read.
 pub fn tick() {
     let mut g = ANIM.lock();
     let Some(a) = g.as_mut() else { return };
     if !super::is_open() || super::shown() != a.path {
         *g = None;
+        T_ON.store(false, Ordering::Relaxed);
         return;
     }
-    let delays: Vec<u16> = a.frames.iter().map(|f| f.0).collect();
-    let want = frame_at(&delays, crate::arch::ms().saturating_sub(a.t0));
-    if want == a.shown {
+    let now = crate::arch::ms();
+    if PAUSED.load(Ordering::Relaxed) {
+        if a.paused_at.is_none() {
+            a.paused_at = Some(now);
+            if let Some(view) = super::VIEW.lock().as_mut() {
+                super::refresh(view); // the title says "paused"
+            }
+        }
+        return;
+    }
+    if let Some(t) = a.paused_at.take() {
+        a.due += now.saturating_sub(t);
+        if let Some(view) = super::VIEW.lock().as_mut() {
+            super::refresh(view);
+        }
+    }
+    if a.rest || now < a.due {
         return;
     }
     let mut v = super::VIEW.lock();
     let Some(view) = v.as_mut() else { return };
-    if view.px.len() != a.frames[want].1.len() {
+    if view.px.len() != a.bw * a.bh {
         return;
     }
-    view.px.copy_from_slice(&a.frames[want].1);
-    a.shown = want;
-    a.steps += 1;
-    if a.steps % 64 == 1 {
-        serial_println!("[facet] anim step={} frame={}/{} path={}", a.steps, want, a.frames.len(), a.path);
+    match advance(&mut a.src, &mut a.plays, a.k, a.bw, a.bh, &mut view.px) {
+        Ok(Some((i, delay))) => {
+            // Behind by more than a frame (a long pass): restart the clock instead of racing.
+            a.due = if now.saturating_sub(a.due) > 1000 { now } else { a.due } + played(delay);
+            a.steps += 1;
+            T_I.store(i, Ordering::Relaxed);
+            T_N.store(a.src.frame_count(), Ordering::Relaxed);
+            if a.steps % 64 == 1 {
+                serial_println!("[facet] anim step={} frame={}/{} path={}", a.steps, i + 1, a.src.frame_count(), a.path);
+            }
+            super::refresh(view);
+        }
+        Ok(None) => {
+            a.rest = true;
+            serial_println!("[facet] anim end plays={} frames={} path={}", a.plays, a.src.frame_count(), a.path);
+        }
+        Err(e) => {
+            a.rest = true;
+            serial_println!("[facet] anim end plays={} broke={} path={}", a.plays, e.reason(), a.path);
+        }
     }
-    super::refresh(view);
 }
 
-/// A two-frame 1x1 GIF89a (graphic-control extensions with 100 ms and 50 ms delays) — the bytes the
-/// fold's adapter must decode to two frames.
+/// A two-frame 1x1 GIF89a (graphic-control extensions with 100 ms and 50 ms delays).
 const TWO_FRAME_GIF: &[u8] = &[
     b'G', b'I', b'F', b'8', b'9', b'a', 1, 0, 1, 0, 0x80, 0, 0, // screen 1x1, 2-colour table
     0xFF, 0xFF, 0xFF, 0, 0, 0, // palette
@@ -191,8 +388,9 @@ const TWO_FRAME_GIF: &[u8] = &[
     0x3B,
 ];
 
-/// `tests quarry2`'s frame leg: `(frames the adapter decoded from a real two-frame GIF — None while
-/// the adapter is the PNG still —, the stepper's verdict)`. `Err` names a failed claim.
+/// `tests quarry2`'s frame leg: `(frames the adapter decoded from a real two-frame GIF, the stepper's
+/// verdict)`. Since FACETANIM the adapter is pixel_core and the GIF MUST play two frames (100, 50 ms).
+/// `Err` names a failed claim.
 pub fn selftest_leg() -> Result<(Option<usize>, &'static str), String> {
     // The stepper over a synthetic three-frame decode (delays 100, 50, 0 -> 100).
     let d = [100u16, 50, 0];
@@ -206,19 +404,97 @@ pub fn selftest_leg() -> Result<(Option<usize>, &'static str), String> {
     if r.len() != 16 || r[0] & 0xFF != 1 || r[3] & 0xFF != 2 || r[15] & 0xFF != 4 {
         return Err(String::from("resample 2x2 -> 4x4"));
     }
-    // The still path stays a still: Facet's PNG adapter answers no frames.
+    // A PNG still is not taken: Facet's own streaming path keeps it.
     let png_head: [u8; 24] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 2, 0, 0, 0, 2];
-    let mut none = || -> Option<Vec<u8>> { None };
-    match PNG_STILL.decode(&png_head, &mut none) {
-        Some(Decoded { w: 2, h: 2, frames: None }) => {}
-        _ => return Err(String::from("the PNG adapter did not answer a 2x2 still")),
+    if decoder().takes(&png_head) {
+        return Err(String::from("the adapter took a PNG without acTL"));
     }
-    let mut all = || -> Option<Vec<u8>> { Some(Vec::from(TWO_FRAME_GIF)) };
-    let frames = decoder().decode(&TWO_FRAME_GIF[..TWO_FRAME_GIF.len().min(64)], &mut all).and_then(|d| d.frames).map(|f| f.len());
-    if let Some(n) = frames {
-        if n != 2 {
-            return Err(alloc::format!("the adapter decoded {} frames from a two-frame GIF", n));
+    if !decoder().takes(TWO_FRAME_GIF) {
+        return Err(String::from("the adapter did not take a GIF"));
+    }
+    let mut s = decoder().open(Vec::from(TWO_FRAME_GIF)).map_err(|e| alloc::format!("open: {}", e.reason()))?;
+    let mut delays = Vec::new();
+    while let Some(f) = s.next_frame() {
+        delays.push(f.map_err(|e| alloc::format!("frame: {}", e))?.delay_ms);
+    }
+    if delays != [100, 50] || s.frame_count() != 2 {
+        return Err(alloc::format!("the adapter played {:?} ({} frames) from a two-frame GIF", delays, s.frame_count()));
+    }
+    Ok((Some(2), "ok"))
+}
+
+/// `tests facetanim` (FACETANIM M3): open the three staged 3-frame fixtures through [`decoder`], drive
+/// the viewer's own step ([`advance`] into a base image) to frame 1 and read the pixel back — green at
+/// (3,3), red at (0,0) — then play to the end and count.
+///
+/// `:: FACETANIM: gif=3 webp=3 apng=3 frames_held=2 -> PASS ::`
+pub fn selftest() {
+    const FIXTURES: [(&str, &str); 3] = [("gif", "ANIM3.GIF"), ("webp", "ANIM3.WEBP"), ("apng", "ANIM3.PNG")];
+    let mut parts: Vec<String> = Vec::new();
+    let (mut fails, mut absent, mut held_max) = (0usize, 0usize, 0usize);
+    for (tag, leaf) in FIXTURES {
+        let found = ["/apps", ""].iter().map(|d| alloc::format!("{}/{}", d, leaf)).find(|p| crate::shell::vfs_mount_table().stat(p).is_ok());
+        let Some(path) = found else {
+            serial_println!("[facetanim] {} absent (/apps/{} not staged)", tag, leaf);
+            parts.push(alloc::format!("{}=absent", tag));
+            absent += 1;
+            continue;
+        };
+        match leg(&path) {
+            Ok((n, held)) => {
+                held_max = held_max.max(held);
+                parts.push(alloc::format!("{}={}", tag, n));
+            }
+            Err(e) => {
+                serial_println!("[facetanim] {} FAIL path={}: {}", tag, path, e);
+                parts.push(alloc::format!("{}=FAIL", tag));
+                fails += 1;
+            }
         }
     }
-    Ok((frames, "ok"))
+    let verdict = if fails > 0 {
+        "FAIL"
+    } else if absent > 0 {
+        "SKIP"
+    } else {
+        "PASS"
+    };
+    serial_println!(":: FACETANIM: {} frames_held={} -> {} ::", parts.join(" "), held_max, verdict);
+}
+
+/// One fixture: `(frames played, frames held at most = the base image + the decoder's buffers)`.
+fn leg(path: &str) -> Result<(usize, usize), String> {
+    let bytes = read_taken(path).ok_or_else(|| String::from("the adapter did not take it"))?;
+    let mut src = decoder().open(bytes).map_err(|e| e.reason())?;
+    if (src.width(), src.height(), src.frame_count()) != (8, 8, 3) {
+        return Err(alloc::format!("{}x{} frames={}", src.width(), src.height(), src.frame_count()));
+    }
+    // An 8x8 file fits the base at k = 1: the base image IS the frame.
+    let (k, bw, bh) = super::fit(8, 8, super::BASE_W, super::BASE_H).ok_or_else(|| String::from("fit"))?;
+    let mut base = alloc::vec![0xFF00_0000u32; bw * bh];
+    let mut plays = 0u32;
+    let mut held = 0usize;
+    fn step(src: &mut Stream, plays: &mut u32, k: usize, bw: usize, bh: usize, base: &mut [u32], held: &mut usize) -> Result<(usize, u32), String> {
+        let r = advance(src, plays, k, bw, bh, base).map_err(|e| e.reason())?;
+        *held = (*held).max(1 + src.buffers_held());
+        r.ok_or_else(|| String::from("ended early"))
+    }
+    let (i0, d0) = step(&mut src, &mut plays, k, bw, bh, &mut base, &mut held)?;
+    let (i1, _) = step(&mut src, &mut plays, k, bw, bh, &mut base, &mut held)?;
+    let at = |base: &[u32], x: usize, y: usize| base[y * bw + x] & 0x00FF_FFFF;
+    let (g, r) = (at(&base, 3, 3), at(&base, 0, 0));
+    serial_println!("[facetanim] {} steps={},{} delay0={} frame1 px(3,3)={:06x} px(0,0)={:06x}", path, i0, i1, d0, g, r);
+    if (i0, i1, d0) != (0, 1, 200) || g != 0x00_FF00 || r != 0xFF_0000 {
+        return Err(alloc::format!("frame 1 read back px(3,3)={:06x} px(0,0)={:06x}", g, r));
+    }
+    let (i2, _) = step(&mut src, &mut plays, k, bw, bh, &mut base, &mut held)?;
+    if i2 != 2 || at(&base, 3, 3) != 0x00_00FF {
+        return Err(String::from("frame 2 is not blue"));
+    }
+    // Loop forever: the fourth step is frame 0 again, after one complete play.
+    let (i3, _) = step(&mut src, &mut plays, k, bw, bh, &mut base, &mut held)?;
+    if i3 != 0 || plays != 1 || at(&base, 3, 3) != 0xFF_0000 {
+        return Err(alloc::format!("the loop did not come back to frame 0 (index {} plays {})", i3, plays));
+    }
+    Ok((src.frame_count(), held))
 }

@@ -1121,6 +1121,7 @@ pub fn close() {
     *VIEW.lock() = None;
     *SURF.lock() = Vec::new();
     SHOWN.lock().clear();
+    anim::stop(); // FACETANIM (B358): the animation ends with its window
     serial_println!("[facet] closed win={} paints={}", id, PAINTS.load(Ordering::Relaxed));
 }
 
@@ -1238,7 +1239,8 @@ fn render(v: &mut View) {
 }
 
 fn title_for(v: &View) -> String {
-    alloc::format!("{} - {}x{} - {}%", title_of(&v.path), v.src_w, v.src_h, (v.zoom / v.k.max(1) as u32).max(1))
+    // FACETANIM (B358): ` - frame i/n` while an animation is shown.
+    alloc::format!("{} - {}x{} - {}%{}", title_of(&v.path), v.src_w, v.src_h, (v.zoom / v.k.max(1) as u32).max(1), anim::title_suffix())
 }
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
@@ -1370,7 +1372,7 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
     if st.size == 0 || st.size > MAX_FILE {
         return Err(FacetError::Size(st.size));
     }
-    if let Some(d) = anim::probe(path) { close(); return anim::open_frames(path, st.size, d); } // QUARRY2 (B336): frames from the decoder adapter (None today: PNG is a still)
+    if let Some(d) = anim::probe(path) { close(); return anim::open_frames(path, st.size, d); } // QUARRY2 (B336) + FACETANIM (B358): GIF / animated WebP / APNG stream through the pixel_core adapter
     // PIXELCORE (SR25): a file whose first eight bytes are not the PNG signature goes to
     // `pixel_core::decode` whole (JPEG, GIF frame 0, BMP, QOI, WebP lossless) and is box-reduced into
     // the same base image; a PNG keeps the streaming path below unchanged.
@@ -1494,7 +1496,8 @@ fn is_foreign(mt: &crate::fs::vfs::MountTable, path: &str) -> Result<bool, Facet
     Ok(head.len() < 8 || head[..8] != SIGNATURE)
 }
 
-/// Read `path` whole, `pixel_core::decode` it (an animation shows frame 0 — animation is owed), and
+/// Read `path` whole, `pixel_core::decode_first_frame` it (FACETANIM: a still; an animation that reaches
+/// here — the adapter refused it — shows frame 0 without compositing the rest), and
 /// box-reduce the RGBA by `fit`'s integer `k` into `0xFFRRGGBB` base pixels. Alpha is dropped, exactly
 /// as the PNG path drops it. Returns `(synthetic Ihdr: depth 8 colour 6, k, out_w, out_h, px)`.
 fn decode_foreign(
@@ -1519,7 +1522,7 @@ fn decode_foreign(
         }
         bytes.extend_from_slice(&b);
     }
-    let img = pixel_core::decode(&bytes).map_err(FacetError::Pixel)?;
+    let img = pixel_core::decode_first_frame(&bytes).map_err(FacetError::Pixel)?;
     drop(bytes);
     let ihdr = Ihdr { width: img.width, height: img.height, depth: 8, colour: 6, interlaced: false };
     let (k, ow, oh) = fit(img.width, img.height, bw, bh).ok_or(FacetError::NoWindow("fit"))?;
@@ -1684,7 +1687,7 @@ fn drag_poll() {
 /// Keys and wheel, chained from `quarry::live::key_route`. QUEUES a command (router stack depth);
 /// [`service`] applies it. Keys only while this window holds focus; the wheel only when the pointer
 /// is over it. `+`/`=` `-`/`_` zoom, `0` fit, `1` 100 %, Left/`[` Right/`]` browse, Delete trash,
-/// `i` info.
+/// `i` info, `p`/space pause an animation.
 pub fn key_route(ev: crate::pal::Event) -> bool {
     let id = WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE {
@@ -1705,6 +1708,10 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
         crate::pal::Event::Key(c) => {
             if wm::focus_asid() != OWNER {
                 return false;
+            }
+            // FACETANIM (B358): `p` / space pause an animation (atomics only — router depth).
+            if matches!(c, b'p' | b'P' | b' ') && anim::toggle_pause() {
+                return true;
             }
             let cmd = match c {
                 b'+' | b'=' => Cmd::ZoomIn,
@@ -1983,6 +1990,12 @@ pub fn decode_file(
     }
     if st.size == 0 || st.size > cap.min(MAX_FILE) {
         return Err(FacetError::Size(st.size));
+    }
+    // FACETANIM (B358): a non-PNG picture (JPEG, GIF, WebP, ...) is its FIRST FRAME only —
+    // `decode_first_frame` never composites (or keeps) frames 1..N of an animation.
+    if is_foreign(&mt, path)? {
+        let (ihdr, _k, out_w, out_h, px) = decode_foreign(&mt, path, st.size, bw, bh)?;
+        return Ok((px, out_w, out_h, ihdr.width, ihdr.height));
     }
     let (ihdr, spans, palette) = index_chunks(&mt, path, st.size)?;
     let (k, out_w, out_h) = fit(ihdr.width, ihdr.height, bw, bh).ok_or(FacetError::NoWindow("fit"))?;

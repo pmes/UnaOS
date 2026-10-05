@@ -8,3 +8,4 @@ mod decode;
 pub mod encode;
 
 pub use decode::decode;
+pub(crate) use decode::{ApngStepper, Parsed, parse};

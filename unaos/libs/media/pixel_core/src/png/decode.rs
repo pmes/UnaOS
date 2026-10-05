@@ -90,8 +90,59 @@ enum Trns {
     Rgb(u16, u16, u16),
 }
 
-/// Decode a PNG file to straight RGBA8.
+/// Decode a PNG file to straight RGBA8 (an APNG: every composited frame too, through
+/// [`ApngStepper`] — the compositor [`crate::Animation`] streams one frame at a time).
 pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
+    let p = parse(bytes)?;
+    // An APNG: composite its frames; a still (or an APNG whose animation is unusable) is the IDAT.
+    if let Some(mut st) = ApngStepper::new(&p)? {
+        let mut frames: Vec<Frame> = Vec::new();
+        while let Some(r) = st.step(&p) {
+            let delay_ms = r?;
+            let mut snap = Vec::new();
+            snap.try_reserve_exact(st.canvas.len()).map_err(|_| Error::OutOfMemory)?;
+            snap.extend_from_slice(&st.canvas);
+            frames.push(Frame { delay_ms, rgba: snap });
+        }
+        if !frames.is_empty() {
+            let mut img = Image::still(p.h.width as u32, p.h.height as u32, frames[0].rgba.clone());
+            if frames.len() > 1 {
+                img.frames = Some(frames);
+                img.loop_count = st.loop_count();
+            }
+            return Ok(img);
+        }
+    }
+    p.still()
+}
+
+/// A parsed PNG: the IHDR, PLTE/tRNS, the IDAT stream and the APNG frame table, nothing decoded.
+pub struct Parsed {
+    h: Header,
+    palette: Vec<[u8; 4]>,
+    trns: Trns,
+    idat: Vec<u8>,
+    actl: Option<u32>,
+    default_is_frame: bool,
+    afr: Vec<ApngFrame>,
+}
+
+impl Parsed {
+    /// The IDAT image (a still, or an APNG shown without its animation).
+    pub fn still(&self) -> Result<Image, Error> {
+        let rgba = decode_pixels(&self.h, &self.palette, &self.trns, &self.idat)?;
+        Ok(Image::still(self.h.width as u32, self.h.height as u32, rgba))
+    }
+    pub fn width(&self) -> u32 {
+        self.h.width as u32
+    }
+    pub fn height(&self) -> u32 {
+        self.h.height as u32
+    }
+}
+
+/// Walk the chunks: everything [`decode`] needs, nothing inflated.
+pub fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
     if bytes.len() < 8 || bytes[..8] != SIG {
         return Err(Error::Malformed("png signature"));
     }
@@ -257,14 +308,7 @@ pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
         return Err(Error::Malformed("indexed image without PLTE"));
     }
 
-    // An APNG: composite its frames; a still (or an APNG whose animation is unusable) is the IDAT.
-    if let Some(plays) = actl {
-        if let Some(img) = composite_apng(&h, &palette, &trns, &idat, default_is_frame, afr, plays)? {
-            return Ok(img);
-        }
-    }
-    let rgba = decode_pixels(&h, &palette, &trns, &idat)?;
-    Ok(Image::still(h.width as u32, h.height as u32, rgba))
+    Ok(Parsed { h, palette, trns, idat, actl, default_is_frame, afr })
 }
 
 /// Decode one image's zlib stream (the IDAT, or one APNG frame's fdAT data) at the size `h` states,
@@ -361,52 +405,106 @@ fn parse_fctl(d: &[u8], h: &Header, seq: u32, is_default: bool) -> Option<ApngFr
     Some(ApngFrame { x, y, w, h: ht, delay_ms: (num * 1000 + den / 2) / den, dispose, blend_over: blend == 1, data: Vec::new() })
 }
 
-/// Composite the APNG frames onto the canvas. `Ok(None)` = no usable frame: show the default image.
-fn composite_apng(
-    h: &Header,
-    palette: &[[u8; 4]],
-    trns: &Trns,
-    idat: &[u8],
-    default_is_frame: bool,
-    afr: Vec<ApngFrame>,
+/// The APNG compositor, one frame per [`ApngStepper::step`] over a [`Parsed`] file: ONE canvas, plus
+/// — only while a dispose-PREVIOUS frame is up — the canvas from before it (FACETANIM: at most one
+/// extra canvas-sized buffer).
+pub struct ApngStepper {
     plays: u32,
-) -> Result<Option<Image>, Error> {
-    let (cw, ch) = (h.width, h.height);
-    let len = cw * ch * 4;
-    let mut canvas = crate::zeroed(len)?;
-    let mut frames: Vec<Frame> = Vec::new();
-    // The canvas before the previous frame was drawn (for dispose PREVIOUS), and that frame.
-    let mut saved: Option<Vec<u8>> = None;
-    let mut prev: Option<(usize, usize, usize, usize, u8)> = None;
-    for (i, fr) in afr.iter().enumerate() {
+    pub(crate) canvas: Vec<u8>,
+    /// The canvas before the previous frame was drawn (for dispose PREVIOUS), and that frame.
+    saved: Option<Vec<u8>>,
+    prev: Option<(usize, usize, usize, usize, u8)>,
+    next: usize,
+    done: bool,
+}
+
+impl ApngStepper {
+    /// `None` for a file without a usable `acTL` (a still).
+    pub fn new(p: &Parsed) -> Result<Option<Self>, Error> {
+        let Some(plays) = p.actl else { return Ok(None) };
+        let canvas = crate::zeroed(p.h.width * p.h.height * 4)?;
+        Ok(Some(ApngStepper { plays, canvas, saved: None, prev: None, next: 0, done: false }))
+    }
+
+    /// Frames the fcTL table lists (an upper bound: a frame that fails to inflate ends the animation).
+    pub fn listed(p: &Parsed) -> usize {
+        p.afr.len()
+    }
+
+    pub fn loop_count(&self) -> Option<u16> {
+        crate::loop_from_plays(self.plays)
+    }
+
+    /// A dispose-PREVIOUS frame is up: the canvas from before it is held.
+    pub fn holds_saved(&self) -> bool {
+        self.saved.is_some()
+    }
+
+    /// Back to before frame 0.
+    pub fn reset(&mut self) {
+        self.canvas.fill(0);
+        self.saved = None;
+        self.prev = None;
+        self.next = 0;
+        self.done = false;
+    }
+
+    /// Composite the next frame; its delay, or `None` at the end. `None` on the FIRST call = no usable
+    /// frame: show the default image ([`Parsed::still`]).
+    pub fn step(&mut self, p: &Parsed) -> Option<Result<u32, Error>> {
+        if self.done || self.next >= p.afr.len() {
+            return None;
+        }
+        let r = self.step_inner(p);
+        if !matches!(r, Some(Ok(_))) {
+            self.done = true;
+        }
+        r
+    }
+
+    fn step_inner(&mut self, p: &Parsed) -> Option<Result<u32, Error>> {
+        let (h, cw) = (&p.h, p.h.width);
+        let i = self.next;
+        let first = i == 0;
+        let fr = &p.afr[i];
         let sub = Header { width: fr.w, height: fr.h, ..h.clone() };
-        let px = if i == 0 && default_is_frame {
-            decode_pixels(&sub, palette, trns, idat)?
-        } else {
-            match decode_pixels(&sub, palette, trns, &fr.data) {
+        let px = if first && p.default_is_frame {
+            match decode_pixels(&sub, &p.palette, &p.trns, &p.idat) {
                 Ok(px) => px,
-                Err(e) if frames.is_empty() && !default_is_frame => {
-                    let _ = e;
-                    return Ok(None);
-                }
-                Err(_) => break,
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            match decode_pixels(&sub, &p.palette, &p.trns, &fr.data) {
+                Ok(px) => px,
+                // A broken first fdAT frame: no usable frame (the default image shows).
+                Err(_) => return None,
             }
         };
         // The previous frame's disposal brings the canvas to this frame's starting state.
-        if let Some((x, y, w, ht, dispose)) = prev {
+        if let Some((x, y, w, ht, dispose)) = self.prev {
             match dispose {
-                1 => crate::webp::clear_rect(&mut canvas, cw, x, y, w, ht),
+                1 => crate::webp::clear_rect(&mut self.canvas, cw, x, y, w, ht),
                 2 => {
-                    if let Some(s) = saved.take() {
-                        canvas = s;
+                    if let Some(s) = self.saved.take() {
+                        self.canvas = s;
                     }
                 }
                 _ => {}
             }
         }
         // Dispose PREVIOUS on the first frame acts as BACKGROUND (the canvas before it is clear).
-        let dispose = if frames.is_empty() && fr.dispose == 2 { 1 } else { fr.dispose };
-        saved = if dispose == 2 { Some(canvas.clone()) } else { None };
+        let dispose = if first && fr.dispose == 2 { 1 } else { fr.dispose };
+        self.saved = if dispose == 2 {
+            let mut s = Vec::new();
+            if s.try_reserve_exact(self.canvas.len()).is_err() {
+                return Some(Err(Error::OutOfMemory));
+            }
+            s.extend_from_slice(&self.canvas);
+            Some(s)
+        } else {
+            None
+        };
+        let canvas = &mut self.canvas;
         for row in 0..fr.h {
             for col in 0..fr.w {
                 let s = (row * fr.w + col) * 4;
@@ -422,21 +520,10 @@ fn composite_apng(
                 canvas[d..d + 4].copy_from_slice(&out);
             }
         }
-        let mut snap = Vec::new();
-        snap.try_reserve_exact(len).map_err(|_| Error::OutOfMemory)?;
-        snap.extend_from_slice(&canvas);
-        frames.push(Frame { delay_ms: fr.delay_ms, rgba: snap });
-        prev = Some((fr.x, fr.y, fr.w, fr.h, dispose));
+        self.prev = Some((fr.x, fr.y, fr.w, fr.h, dispose));
+        self.next += 1;
+        Some(Ok(fr.delay_ms))
     }
-    if frames.is_empty() {
-        return Ok(None);
-    }
-    let mut img = Image::still(cw as u32, ch as u32, frames[0].rgba.clone());
-    if frames.len() > 1 {
-        img.frames = Some(frames);
-        img.loop_count = crate::loop_from_plays(plays);
-    }
-    Ok(Some(img))
 }
 
 /// Pixel dimensions of one Adam7 pass (§8.2).

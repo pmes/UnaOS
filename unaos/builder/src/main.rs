@@ -1224,6 +1224,15 @@ fn main() {
         stage_trust(&trust_src, &data_dir);
         staged_data.push("system/trust/roots.pem");
     }
+    // FACETANIM (B358): the three 8x8 3-frame animations `tests facetanim` opens (/apps/ANIM3.GIF,
+    // /apps/ANIM3.WEBP, /apps/ANIM3.PNG) — committed beside pixel_core's KATs, which pin their bytes.
+    for leaf in ["ANIM3.GIF", "ANIM3.WEBP", "ANIM3.PNG"] {
+        let src = workspace_dir.join("libs/media/pixel_core/tests/fixtures/facetanim").join(leaf);
+        if src.exists() {
+            std::fs::copy(&src, data_apps.join(leaf)).unwrap();
+            staged_data.push(leaf);
+        }
+    }
     // `hello.txt` rides along so the operator has a trivial `cat hello.txt` probe that proves the
     // kernel is reading THIS volume — the one-command answer to "did I write the right stick?".
     std::fs::write(
