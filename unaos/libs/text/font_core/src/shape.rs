@@ -259,7 +259,7 @@ pub fn layout_lines(font: &Font, text: &str, size: f32, max_width: f32, opts: &S
             last_fit = None;
         }
     }
-    if start < text.len() && lines.last().map_or(true, |l: &Line| l.end < text.len()) {
+    if start < text.len() && lines.last().is_none_or(|l: &Line| l.end < text.len()) {
         lines.push(Line { start, end: text.len(), width: trim_end_width(font, &text[start..], size, opts) });
     }
     lines

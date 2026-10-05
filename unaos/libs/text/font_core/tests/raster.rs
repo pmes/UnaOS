@@ -3,8 +3,10 @@
 //! Chromium pixels even on a host without Chromium.
 
 mod common;
+#[allow(clippy::excessive_precision)]
 #[path = "data/chrome_kats.rs"]
 mod chrome_kats;
+#[allow(clippy::excessive_precision)]
 #[path = "data/kat_data.rs"]
 mod kat_data;
 

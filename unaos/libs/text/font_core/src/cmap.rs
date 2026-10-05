@@ -221,7 +221,7 @@ impl<'a> Cmap<'a> {
             if rank == 0 {
                 continue;
             }
-            if best.map_or(true, |(r, _)| rank > r) {
+            if best.is_none_or(|(r, _)| rank > r) {
                 best = Some((rank, st));
             }
         }

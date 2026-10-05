@@ -2,7 +2,7 @@
 
 #[inline]
 pub fn floor(x: f32) -> f32 {
-    if !(x.abs() < 8_388_608.0) {
+    if x.is_nan() || x.abs() >= 8_388_608.0 {
         return x; // already integral (or NaN/inf)
     }
     let t = x as i32 as f32;
@@ -21,7 +21,7 @@ pub fn round(x: f32) -> f32 {
 
 /// Newton–Raphson square root (to f32 precision) for non-negative inputs.
 pub fn sqrt(x: f32) -> f32 {
-    if !(x > 0.0) {
+    if x.is_nan() || x <= 0.0 {
         return 0.0;
     }
     if !x.is_finite() {
@@ -46,7 +46,7 @@ mod tests {
         assert_eq!(ceil(1.2), 2.0);
         assert_eq!(ceil(-1.2), -1.0);
         assert_eq!(round(2.5), 3.0);
-        assert!((sqrt(2.0) - 1.414_213_5).abs() < 1e-6);
+        assert!((sqrt(2.0) - core::f32::consts::SQRT_2).abs() < 1e-6);
         assert!((sqrt(1e6) - 1000.0).abs() < 1e-3);
     }
 }

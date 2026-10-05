@@ -3,6 +3,7 @@
 //! with a note, never silently passed: the test fails if NO font could be checked.
 
 mod common;
+#[allow(clippy::excessive_precision)]
 #[path = "data/kat_data.rs"]
 mod kat_data;
 

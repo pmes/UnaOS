@@ -294,7 +294,7 @@ pub fn rasterize_glyph_mode(
     mode: RenderMode,
 ) -> Option<GlyphBitmap> {
     let path = font.glyph_path(gid)?;
-    if path.is_empty() || !(size > 0.0) || size > 4096.0 {
+    if path.is_empty() || size.is_nan() || size <= 0.0 || size > 4096.0 {
         return None;
     }
     let scale = size / font.units_per_em as f32;

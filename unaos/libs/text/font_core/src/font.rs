@@ -50,6 +50,8 @@ pub struct Post {
     pub is_fixed_pitch: bool,
 }
 
+/// The outline source (Copy, borrowed: the size difference between variants costs nothing worth boxing).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug)]
 pub enum Outlines<'a> {
     Glyf(Glyf<'a>),
