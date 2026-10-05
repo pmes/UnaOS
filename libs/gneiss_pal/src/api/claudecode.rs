@@ -88,7 +88,7 @@ use super::Part;
 use super::claude::map_stop;
 use super::provider::{
     BoxFuture, ChatDelta, ChatMessage, ChatRequest, ChatResponse, DeltaStream, ModelProvider, ProviderError, Role,
-    StopReason, Usage,
+    SessionInfo, StopReason, Usage,
 };
 
 /// The binary looked up on `PATH` when `vein.claudecode.bin` is not set.
@@ -790,6 +790,19 @@ impl ModelProvider for ClaudeCodeProvider {
         })
     }
 
+    /// VEINTURNS (SR42): the CLI session of the last completed run.
+    fn session(&self) -> Option<SessionInfo> {
+        let run = self.last_run()?;
+        Some(SessionInfo { id: run.session_id?, resumed: run.resumed })
+    }
+
+    fn reset_session(&self) {
+        ClaudeCodeProvider::reset_session(self);
+        if let Ok(mut l) = self.last.lock() {
+            *l = None;
+        }
+    }
+
     fn stream<'a>(&'a self, req: &'a ChatRequest) -> BoxFuture<'a, Result<DeltaStream<'a>, ProviderError>> {
         Box::pin(async move {
             let run = self.spawn(req).await?;
@@ -1110,6 +1123,57 @@ mod tests {
         let other = req(&[(Role::User, "unrelated")], None);
         p.generate(&other).await.unwrap();
         assert!(!fake.read("argv.3").lines().any(|a| a == "--resume"));
+    }
+
+    /// VEINTURNS (SR42): a [`Thread`](super::super::thread::Thread) — what Vein
+    /// now sends — rides ONE CLI session across three turns: turn 2 and 3 are
+    /// `--resume <id>` with only the new turn on stdin and the system prompt
+    /// still passed; `undo` (an edit) and `/new` (reset) start fresh.
+    #[tokio::test]
+    async fn a_thread_rides_one_cli_session_and_an_edit_or_new_starts_fresh() {
+        use super::super::thread::Thread;
+        let fake = Fake::replaying("thread");
+        let p = fake.provider();
+        let dynp: &dyn ModelProvider = &p;
+        let sys = Some("You are a terse test responder.".to_string());
+        let mut t = Thread::new();
+        let mut ids = Vec::new();
+        for (n, q) in ["Count from one to five.", "Continue to eight.", "Continue to ten."].iter().enumerate() {
+            let user = vec![Part::text(q.to_string())];
+            let r = t.request(sys.clone(), user.clone());
+            assert_eq!(r.messages.len(), 2 * n + 1, "every earlier turn is its own message");
+            let reply = dynp.generate(&r).await.unwrap();
+            t.record(user, &reply.text);
+            let s = dynp.session().unwrap();
+            assert_eq!(s.label(), if n == 0 { "session=new" } else { "session=resumed" });
+            ids.push(s.id);
+            let argv: Vec<String> = fake.read(&format!("argv.{}", n + 1)).lines().map(str::to_string).collect();
+            assert!(argv.windows(2).any(|w| w == ["--system-prompt", "You are a terse test responder."]), "{argv:?}");
+            if n == 0 {
+                assert!(!argv.iter().any(|a| a == "--resume"));
+            } else {
+                assert!(argv.windows(2).any(|w| w == ["--resume", "00000000-0000-4000-8000-00000000cc01"]), "{argv:?}");
+                assert_eq!(fake.read(&format!("stdin.{}", n + 1)), *q, "only the new turn is sent");
+            }
+        }
+        assert!(ids.iter().all(|i| *i == ids[0]), "one session id across three turns: {ids:?}");
+
+        // An edit: drop the last exchange and send a corrected message.
+        assert!(t.undo());
+        let user = vec![Part::text("Continue to nine instead.".into())];
+        let reply = dynp.generate(&t.request(sys.clone(), user.clone())).await.unwrap();
+        t.record(user, &reply.text);
+        assert!(!fake.read("argv.4").lines().any(|a| a == "--resume"), "an edited history is a fresh session");
+        assert!(fake.read("stdin.4").starts_with("<conversation-history>"));
+        assert_eq!(dynp.session().unwrap().label(), "session=new");
+
+        // `/new`: the thread is cleared and the provider forgets its session.
+        t.clear();
+        dynp.reset_session();
+        assert_eq!(dynp.session(), None);
+        dynp.generate(&t.request(sys, vec![Part::text("hello again".into())])).await.unwrap();
+        assert!(!fake.read("argv.5").lines().any(|a| a == "--resume"));
+        assert_eq!(fake.read("stdin.5"), "hello again");
     }
 
     #[tokio::test]

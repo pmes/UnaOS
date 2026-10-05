@@ -30,13 +30,19 @@ use std::sync::Arc;
 use bandy::{PrefValue, PrincipiaCommand, SMessage};
 use gneiss_pal::api::{
     AuthMode, ChatRequest, ChatResponse, EmbedConfig, Embedder, ModelProvider, PREF_NS, Part, ProviderConfig, RECALL_OFF_NO_EMBEDDER,
-    ProviderKind, StopReason, build_embedder_with_env, build_provider_with_env,
+    ProviderKind, StopReason, Thread, build_embedder_with_env, build_provider_with_env, provider_status,
 };
 use holocron::holocron_core::keysource::KeySource;
 use principia::prefs::PrefStore;
 
+/// The live chat provider, its config, and a SECOND instance of the same
+/// provider for side calls (engram compression): a session-keeping provider
+/// (the Claude Code CLI) must not have its conversation session replaced by a
+/// one-shot side request (VEINTURNS, SR42).
+type Live = (Arc<dyn ModelProvider>, ProviderConfig, Arc<dyn ModelProvider>);
+
 pub struct ProviderSlot {
-    inner: Result<(Arc<dyn ModelProvider>, ProviderConfig), String>,
+    inner: Result<Live, String>,
 }
 
 impl ProviderSlot {
@@ -97,32 +103,76 @@ impl ProviderSlot {
                 Some((var, key)) if var == k => Some(key.clone()),
                 _ => env(k),
             };
-            build_provider_with_env(&cfg, env).map(|p| (Arc::from(p), cfg)).map_err(|e| e.to_string())
+            // VEINTURNS (SR42): two instances — the chat provider keeps the CLI session, engram side calls ride their own.
+            let chat = build_provider_with_env(&cfg, &env).map_err(|e| e.to_string())?;
+            let side = build_provider_with_env(&cfg, &env).map_err(|e| e.to_string())?;
+            Ok((Arc::from(chat), cfg, Arc::from(side)))
         });
         ProviderSlot { inner }
     }
 
     /// The live provider, or the reason there is none.
     pub fn provider(&self) -> Result<Arc<dyn ModelProvider>, String> {
-        self.inner.as_ref().map(|(p, _)| p.clone()).map_err(Clone::clone)
+        self.inner.as_ref().map(|(p, _, _)| p.clone()).map_err(Clone::clone)
+    }
+
+    /// The side-call provider (engram compression): the same configuration,
+    /// its own instance, so it never touches the conversation's session.
+    pub fn side_provider(&self) -> Result<Arc<dyn ModelProvider>, String> {
+        self.inner.as_ref().map(|(_, _, s)| s.clone()).map_err(Clone::clone)
     }
 
     /// The console line for this slot.
     pub fn status_line(&self) -> String {
+        format!(":: BRAIN :: {}\n\n", self.status())
+    }
+
+    /// `ONLINE (<name> / <model>)` or `NO PROVIDER :: <why>` — the line the
+    /// Settings surface shows too ([`provider_status`]).
+    pub fn status(&self) -> String {
         match &self.inner {
-            Ok((p, _)) => format!(":: BRAIN :: ONLINE ({} / {})\n\n", p.name(), p.model()),
-            Err(e) => format!(":: BRAIN :: NO PROVIDER :: {e}\n\n"),
+            Ok((p, _, _)) => provider_status(Ok((p.name(), p.model()))),
+            Err(e) => provider_status(Err(e)),
         }
     }
 
-    /// A one-turn request carrying the configured output cap and temperature.
-    pub fn request(&self, system: Option<String>, parts: Vec<Part>) -> ChatRequest {
-        let mut req = ChatRequest::single(system, parts);
-        if let Ok((_, cfg)) = &self.inner {
+    /// VEINTURNS (SR42): the request for a new user turn in `thread` — the
+    /// system prompt alone in `system`, every earlier turn its own message,
+    /// then `parts`, with the configured output cap and temperature. (It
+    /// replaces the one-turn request with the history folded into `system`.)
+    pub fn turn(&self, system: Option<String>, thread: &Thread, parts: Vec<Part>) -> ChatRequest {
+        let mut req = thread.request(system, parts);
+        if let Ok((_, cfg, _)) = &self.inner {
             req.max_tokens = cfg.max_tokens;
             req.temperature = cfg.temperature;
         }
         req
+    }
+
+    /// VEINTURNS (SR42): the status-row text after a turn —
+    /// `session=resumed` / `session=new` for a session-keeping provider,
+    /// `session=stateless` for the HTTP APIs (each request carries the whole
+    /// thread), then `turns=<completed exchanges>`.
+    pub fn session_status(&self, thread: &Thread) -> String {
+        let word = match self.provider().ok().map(|p| p.session()) {
+            Some(Some(s)) => s.label(),
+            Some(None) if thread.is_empty() => "session=new",
+            Some(None) if self.is_session_keeping() => "session=new",
+            Some(None) => "session=stateless",
+            None => "session=none",
+        };
+        format!("{word} · turns={}", thread.exchanges())
+    }
+
+    fn is_session_keeping(&self) -> bool {
+        matches!(&self.inner, Ok((_, cfg, _)) if cfg.kind == gneiss_pal::api::ProviderKind::ClaudeCode)
+    }
+
+    /// VEINTURNS (SR42): `/new` — the provider forgets its kept session.
+    pub fn reset_session(&self) {
+        if let Ok((p, _, _)) = &self.inner {
+            p.reset_session();
+        }
     }
 
     pub async fn generate(&self, req: &ChatRequest) -> Result<ChatResponse, String> {
@@ -132,7 +182,7 @@ impl ProviderSlot {
 
     /// The chat provider's `(name, model)`, for the settings label.
     pub fn chat_pair(&self) -> Option<(String, String)> {
-        self.inner.as_ref().ok().map(|(p, _)| (p.name().to_string(), p.model().to_string()))
+        self.inner.as_ref().ok().map(|(p, _, _)| (p.name().to_string(), p.model().to_string()))
     }
 }
 
@@ -286,7 +336,7 @@ mod tests {
         );
         assert!(slot.provider().is_err());
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let e = rt.block_on(slot.generate(&slot.request(None, vec![Part::text("hi".into())]))).unwrap_err();
+        let e = rt.block_on(slot.generate(&slot.turn(None, &Thread::new(), vec![Part::text("hi".into())]))).unwrap_err();
         assert!(e.contains("ANTHROPIC_API_KEY"));
     }
 
@@ -323,7 +373,7 @@ mod tests {
         assert_eq!(slot.status_line(), ":: BRAIN :: ONLINE (claudecode / default)\n\n");
         assert_eq!(slot.chat_pair(), Some(("claudecode".into(), "default".into())));
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let e = rt.block_on(slot.generate(&slot.request(None, vec![Part::text("hi".into())]))).unwrap_err();
+        let e = rt.block_on(slot.generate(&slot.turn(None, &Thread::new(), vec![Part::text("hi".into())]))).unwrap_err();
         assert_eq!(
             e,
             format!(
@@ -331,6 +381,108 @@ mod tests {
                 bin.display()
             )
         );
+    }
+
+    /// VEINTURNS (SR42): Vein's own path — `ProviderSlot::turn` over a `Thread`,
+    /// the provider chosen by Principia's file — rides one Claude Code CLI
+    /// session: turn 2 is `--resume <id>` with only the new turn on stdin, the
+    /// status row reads `session=resumed`; `/new` resets to `session=new`.
+    #[test]
+    fn vein_turns_ride_one_cli_session_and_new_starts_fresh() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../libs/gneiss_pal/tests/fixtures/claudecode");
+        let d = dir.path().display();
+        let script = format!(
+            "#!/bin/sh\nD='{d}'\nn=$(cat \"$D/n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$D/n\"\n\
+             for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$D/argv.$n\"\ncat > \"$D/stdin.$n\"\n\
+             case \" $* \" in *\" --resume \"*) cat '{}';; *) cat '{}';; esac\n",
+            fx.join("turn2.jsonl").display(),
+            fx.join("turn1.jsonl").display()
+        );
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("preferences.toml");
+        let mut store = PrefStore::empty(&path);
+        store.set("vein", "provider", PrefValue::Str("claudecode".into())).unwrap();
+        store.set("vein", "claudecode.bin", PrefValue::Str(bin.display().to_string())).unwrap();
+        let slot = ProviderSlot::load_from(&path, none);
+        let read = |f: &str| std::fs::read_to_string(dir.path().join(f)).unwrap_or_default();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let mut thread = Thread::new();
+        assert_eq!(slot.session_status(&thread), "session=new · turns=0");
+        let mut statuses = Vec::new();
+        for q in ["Count from one to five.", "Continue to eight."] {
+            let parts = vec![Part::text(q.into())];
+            let req = slot.turn(Some("sys".into()), &thread, parts.clone());
+            assert_eq!(req.system.as_deref(), Some("sys"), "the system prompt alone");
+            assert_eq!(req.messages.len(), 2 * thread.exchanges() + 1);
+            let reply = rt.block_on(slot.generate(&req)).unwrap();
+            thread.record(parts, &reply.text);
+            statuses.push(slot.session_status(&thread));
+        }
+        assert_eq!(statuses, ["session=new · turns=1", "session=resumed · turns=2"]);
+        let argv2: Vec<String> = read("argv.2").lines().map(str::to_string).collect();
+        assert!(argv2.windows(2).any(|w| w == ["--resume", "00000000-0000-4000-8000-00000000cc01"]), "{argv2:?}");
+        assert_eq!(read("stdin.2"), "Continue to eight.", "only the new turn");
+
+        // The side instance (engram compression) never displaces the session.
+        let side = slot.side_provider().unwrap();
+        rt.block_on(side.generate(&Thread::new().request(None, vec![Part::text("compress".into())]))).unwrap();
+        let parts = vec![Part::text("Continue to ten.".into())];
+        let reply = rt.block_on(slot.generate(&slot.turn(None, &thread, parts.clone()))).unwrap();
+        thread.record(parts, &reply.text);
+        assert!(read("argv.4").lines().any(|a| a == "--resume"), "still resumed after a side call");
+        assert_eq!(slot.session_status(&thread), "session=resumed · turns=3");
+
+        // `/new`.
+        thread.clear();
+        slot.reset_session();
+        assert_eq!(slot.session_status(&thread), "session=new · turns=0");
+        let parts = vec![Part::text("hello".into())];
+        let reply = rt.block_on(slot.generate(&slot.turn(None, &thread, parts.clone()))).unwrap();
+        thread.record(parts, &reply.text);
+        assert!(!read("argv.5").lines().any(|a| a == "--resume"));
+        assert_eq!(slot.session_status(&thread), "session=new · turns=1");
+    }
+
+    /// VEINTURNS (SR42): the HTTP providers are stateless — the whole thread is
+    /// the request — and the status row says so.
+    #[test]
+    fn api_providers_send_the_thread_and_read_stateless() {
+        let slot = ProviderSlot::from_lookup(|_| None, |k| (k == "ANTHROPIC_API_KEY").then(|| "sk".to_string()));
+        let mut thread = Thread::new();
+        thread.record(vec![Part::text("a".into())], "A");
+        thread.record(vec![Part::text("b".into())], "B");
+        let req = slot.turn(Some("sys".into()), &thread, vec![Part::text("c".into())]);
+        assert_eq!(req.messages.len(), 5);
+        assert_eq!(slot.session_status(&thread), "session=stateless · turns=2");
+    }
+
+    /// VEINTURNS (SR42) M3: the Settings dropdown's writes — `vein.provider` and
+    /// `vein.model` as PrefSets — are accepted by Principia (schema-validated,
+    /// persisted, PrefChanged), and the slot Vein rebuilds from the file reads
+    /// `ONLINE (claudecode / default)`, the same line the dropdown shows.
+    #[test]
+    fn settings_dropdown_writes_go_through_principia() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = principia::Principia::with_config_dir(dir.path());
+        let writes = gneiss_pal::api::menu_choice_prefs("default (claudecode)").unwrap();
+        for (key, value) in writes.iter().cloned() {
+            let reply = p.process_impulse(&SMessage::Principia(PrincipiaCommand::PrefSet {
+                ns: "vein".into(),
+                key: key.into(),
+                value: value.clone(),
+            }));
+            let reply = reply.expect("a set is answered");
+            assert!(is_vein_pref_change(&reply), "{reply:?}");
+        }
+        let slot = ProviderSlot::load_from(&dir.path().join("preferences.toml"), none);
+        assert_eq!(slot.status(), "ONLINE (claudecode / default)");
+        let get = |k: &str| p.prefs().get("vein", k);
+        assert_eq!(gneiss_pal::api::probe_provider(get, none), slot.status());
     }
 
     #[test]
@@ -343,7 +495,7 @@ mod tests {
             |k| (k == "ANTHROPIC_API_KEY").then(|| "sk".to_string()),
         );
         assert_eq!(slot.status_line(), ":: BRAIN :: ONLINE (claude / claude-opus-5-5)\n\n");
-        assert_eq!(slot.request(None, vec![]).max_tokens, 2048);
+        assert_eq!(slot.turn(None, &Thread::new(), vec![]).max_tokens, 2048);
     }
 
     // ---- HOLOCRON1 M4: Holocron first, env on NotFound only ----

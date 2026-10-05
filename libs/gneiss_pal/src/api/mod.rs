@@ -35,6 +35,7 @@ pub mod local;
 pub mod provider;
 pub mod retry;
 pub mod sse;
+pub mod thread;
 #[cfg(test)]
 mod tests;
 
@@ -53,6 +54,8 @@ pub use provider::{
     build_provider_with_env,
 };
 pub use retry::RetryPolicy;
+pub use thread::{THREAD_KEEP, THREAD_MAX, Thread};
+pub use provider::{SessionInfo, menu_choice_prefs, probe_provider, provider_status};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Content {
