@@ -462,7 +462,6 @@ impl ObjectData {
                     out.push(e);
                 }
             }
-            Kind::RegExp(r) => v(&r.last_index_cache, out),
             Kind::Map(m) | Kind::Set(m) => {
                 for (k, x) in m.entries.iter().flatten() {
                     v(k, out);

@@ -356,8 +356,9 @@ impl Gen {
         Rc::new(ScopeInfo {
             names,
             kinds,
-            var_scope: (matches!(sc.kind, SKind::Function | SKind::Var) && !(sc.kind == SKind::Function && sc.has_var_child)) || (sc.kind == SKind::Eval && sc.strict),
+            var_scope: matches!(sc.kind, SKind::Function | SKind::Var) || (sc.kind == SKind::Eval && sc.strict),
             function: sc.kind == SKind::Function,
+            params: sc.kind == SKind::Function && sc.has_var_child,
         })
     }
 
@@ -697,18 +698,34 @@ impl Gen {
                 if self.tree.annexb.contains(&ptr) {
                     let name = String::from(&*f.id.as_ref().unwrap().name);
                     self.load_name(&name);
-                    let parent = self.tree.scopes[self.f.scope as usize].parent.unwrap_or(0);
-                    match self.resolve_from(parent, &name) {
-                        Ref::Local(slot, _) => {
+                    // The target is the var binding of the enclosing variable scope, past any catch parameter or
+                    // block binding of the same name (B.3.2.1 step iii).
+                    let mut extra: u16 = 0;
+                    let mut s = Some(self.f.scope);
+                    let mut target = None;
+                    while let Some(i) = s {
+                        let sc = &self.tree.scopes[i as usize];
+                        if matches!(sc.kind, SKind::Function | SKind::Var | SKind::Script | SKind::Eval | SKind::Module) {
+                            if let Some(bi) = sc.find(&name) {
+                                let b = &sc.bindings[bi];
+                                target = Some(if b.env { Ref::Env(extra, b.slot, false, false) } else { Ref::Local(b.slot, false) });
+                            }
+                            break;
+                        }
+                        if sc.needs_env {
+                            extra += 1;
+                        }
+                        s = sc.parent;
+                    }
+                    match target {
+                        Some(Ref::Local(slot, _)) => {
                             self.emit(Op::PutLocal(slot));
                         }
-                        Ref::Env(d, i, _, _) => {
-                            // The depth is relative to the parent scope; add the current env if it exists.
-                            let extra = if self.tree.scopes[self.f.scope as usize].needs_env { 1 } else { 0 };
-                            self.emit(Op::SetEnv(d + extra, i));
+                        Some(Ref::Env(d, i, _, _)) => {
+                            self.emit(Op::SetEnv(d, i));
                             self.emit(Op::Pop);
                         }
-                        Ref::Dynamic | Ref::Global => {
+                        _ => {
                             let k = self.str_const(&name);
                             self.emit(Op::BlockFnHoist(k));
                         }

@@ -1,5 +1,6 @@
 //! RegExp (ECMA-262 §22.2): pattern parser and backtracking matcher.
 
+pub mod matcher;
 pub mod parser;
 
 use alloc::string::String;
@@ -11,13 +12,26 @@ pub fn validate(body: &[u16], flags: &[u16]) -> Result<(), String> {
 }
 
 use crate::string::JsStr;
-use crate::vm::Value;
 use alloc::rc::Rc;
 
-/// [[RegExpMatcher]] state of a RegExp object.
+/// A parsed and compiled pattern, shared between RegExp objects created from the same literal.
+pub struct Compiled {
+    pub regex: parser::Regex,
+    pub prog: matcher::Program,
+}
+
+impl Compiled {
+    pub fn new(pattern: &[u16], flags: parser::Flags) -> Result<Compiled, String> {
+        let regex = parser::parse(pattern, flags)?;
+        let prog = matcher::compile(&regex);
+        Ok(Compiled { regex, prog })
+    }
+}
+
+/// [[OriginalSource]], [[OriginalFlags]] and [[RegExpMatcher]] of a RegExp object.
 pub struct RegExpData {
     pub source: JsStr,
     pub flags: JsStr,
-    pub regex: Option<Rc<parser::Regex>>,
-    pub last_index_cache: Value,
+    pub parsed: parser::Flags,
+    pub re: Rc<Compiled>,
 }

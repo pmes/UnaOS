@@ -211,6 +211,8 @@ struct P<'a> {
     backref_names: Vec<String>,
     path: Vec<(usize, usize)>,
     disj_counter: usize,
+    /// Unicode + ignoreCase: WordCharacters gains U+017F and U+212A (§22.2.2.9.4).
+    ui: bool,
     _src: &'a [u16],
 }
 
@@ -247,6 +249,7 @@ pub fn parse(pattern: &[u16], flags: Flags) -> R<Regex> {
         backref_names: Vec::new(),
         path: Vec::new(),
         disj_counter: 0,
+        ui: u && flags.i,
         _src: pattern,
     };
     let node = p.disjunction()?;

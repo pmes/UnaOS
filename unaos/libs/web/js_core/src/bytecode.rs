@@ -304,6 +304,9 @@ pub struct ScopeInfo {
     pub var_scope: bool,
     /// Function scope of a function with mapped arguments etc.
     pub function: bool,
+    /// Parameter scope of a function with parameter expressions (its body has a separate var scope): a direct
+    /// eval in the parameters may not declare a var that shadows a parameter.
+    pub params: bool,
 }
 
 impl ScopeInfo {

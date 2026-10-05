@@ -495,10 +495,10 @@ impl Vm {
             let env = self.frames[fi].env;
             let script = self.frames[fi].script;
             let f = self.make_closure(code, env, None, script);
-            self.create_global_function_binding(go, ge, n, Value::Object(f))?;
+            self.create_global_function_binding(go, ge, n, Value::Object(f), false)?;
         }
         for n in d.var_names.iter().chain(annexb_ok.iter()) {
-            self.create_global_var_binding(go, ge, n)?;
+            self.create_global_var_binding(go, ge, n, false)?;
         }
         Ok(())
     }
@@ -515,30 +515,30 @@ impl Vm {
         }
         self.is_extensible(go)
     }
-    fn create_global_function_binding(&mut self, go: Obj, ge: Obj, n: &JsStr, v: Value) -> JsResult<()> {
+    fn create_global_function_binding(&mut self, go: Obj, ge: Obj, n: &JsStr, v: Value, deletable: bool) -> JsResult<()> {
         let key = PropertyKey::from_js(n.clone());
         let existing = self.get_own_property(go, &key)?;
         let desc = match existing {
             Some(p) if p.configurable != Some(true) => PropDesc { value: Some(v.clone()), ..Default::default() },
-            _ => PropDesc::data(v.clone(), true, true, false),
+            _ => PropDesc::data(v.clone(), true, true, deletable),
         };
         self.define_property_or_throw(go, key.clone(), desc)?;
         self.set_prop(go, key, v, false)?;
         if let Kind::GlobalEnv(g) = &mut self.heap.get_mut(ge).kind {
-            if !g.var_names.contains(n) {
+            if !deletable && !g.var_names.contains(n) {
                 g.var_names.push(n.clone());
             }
         }
         Ok(())
     }
-    fn create_global_var_binding(&mut self, go: Obj, ge: Obj, n: &JsStr) -> JsResult<()> {
+    fn create_global_var_binding(&mut self, go: Obj, ge: Obj, n: &JsStr, deletable: bool) -> JsResult<()> {
         let key = PropertyKey::from_js(n.clone());
         let has = self.has_own_property(go, &key)?;
         if !has && self.is_extensible(go)? {
-            self.define_property_or_throw(go, key, PropDesc::data(Value::Undefined, true, true, false))?;
+            self.define_property_or_throw(go, key, PropDesc::data(Value::Undefined, true, true, deletable))?;
         }
         if let Kind::GlobalEnv(g) = &mut self.heap.get_mut(ge).kind {
-            if !g.var_names.contains(n) {
+            if !deletable && !g.var_names.contains(n) {
                 g.var_names.push(n.clone());
             }
         }
@@ -570,9 +570,11 @@ impl Vm {
                 }
                 Kind::ObjEnv(d) => e = d.parent,
                 Kind::GlobalEnv(g) => {
-                    if g.var_names.contains(name) {
-                        let o = g.object;
-                        self.set(o, PropertyKey::from_js(name.clone()), v, &Value::Object(o))?;
+                    let o = g.object;
+                    let declared = g.var_names.contains(name);
+                    let k = PropertyKey::from_js(name.clone());
+                    if declared || self.has_own_property(o, &k)? {
+                        self.set(o, k, v, &Value::Object(o))?;
                     }
                     return Ok(());
                 }
@@ -744,6 +746,15 @@ impl Vm {
                 }
             }
         }
+        if let Kind::Env(dd) = &self.heap.get(var_env).kind {
+            if dd.info.params {
+                for n in &all_vars {
+                    if dd.info.find(n).is_some() {
+                        return self.throw_syntax(&alloc::format!("Identifier '{}' has already been declared", n));
+                    }
+                }
+            }
+        }
         // Lexical declarations between the eval and the var env conflict with var names.
         for env in &chain_lex {
             if let Kind::Env(dd) = &self.heap.get(*env).kind {
@@ -823,14 +834,14 @@ impl Vm {
             let script = self.frames[fi].script;
             let f = self.make_closure(code, lex_env, None, script);
             if let Some(go) = go {
-                self.create_global_function_binding(go, var_env, n, Value::Object(f))?;
+                self.create_global_function_binding(go, var_env, n, Value::Object(f), true)?;
             } else {
                 self.eval_declare_var(var_env, n, Some(Value::Object(f)));
             }
         }
         for n in d.var_names.iter().chain(annexb_ok.iter()) {
             if let Some(go) = go {
-                self.create_global_var_binding(go, var_env, n)?;
+                self.create_global_var_binding(go, var_env, n, true)?;
             } else {
                 self.eval_declare_var(var_env, n, None);
             }

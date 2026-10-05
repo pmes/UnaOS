@@ -430,8 +430,33 @@ impl Analyzer {
         }
         let kind = self.t.scopes[var_scope as usize].kind;
         for (name, ptr) in found {
-            // Parameter names: no new binding is created but the hoisting assignment still happens.
             if kind != SKind::Script && kind != SKind::Eval {
+                // B.3.2.1: parameter names and `arguments` are never hoisted in function code.
+                if &*name == "arguments" {
+                    continue;
+                }
+                if let Some(bi) = self.t.scopes[var_scope as usize].find(&name) {
+                    if matches!(self.t.scopes[var_scope as usize].bindings[bi].kind, BindKind::Param) {
+                        continue;
+                    }
+                }
+                let mut ps = self.t.scopes[var_scope as usize].parent;
+                let mut is_param = false;
+                if kind == SKind::Var {
+                    while let Some(p) = ps {
+                        let sc = &self.t.scopes[p as usize];
+                        if let Some(bi) = sc.find(&name) {
+                            is_param = matches!(sc.bindings[bi].kind, BindKind::Param);
+                        }
+                        if sc.kind == SKind::Function {
+                            break;
+                        }
+                        ps = sc.parent;
+                    }
+                }
+                if is_param {
+                    continue;
+                }
                 self.declare(var_scope, &name, BindKind::Var);
             }
             self.t.annexb.push(ptr);
@@ -595,6 +620,12 @@ impl Analyzer {
             Stmt::Labeled(_, b, _) => self.stmt(b),
             Stmt::With(o, b, id, _) => {
                 self.expr(o);
+                // Names under `with` resolve dynamically, so every enclosing binding must live in an environment.
+                let mut s = Some(self.cur);
+                while let Some(i) = s {
+                    self.t.scopes[i as usize].eval_visible = true;
+                    s = self.t.scopes[i as usize].parent;
+                }
                 self.push(Some(*id), SKind::With, false);
                 self.stmt(b);
                 self.pop();

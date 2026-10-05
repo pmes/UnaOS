@@ -612,7 +612,7 @@ fn html_method(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 /// Call `regexp[@@sym](this, ...rest)` when the argument provides the method (§22.1.3.12 etc.).
 fn dispatch(vm: &mut Vm, ctx: &CallCtx, sym: Sym, args: &[Value]) -> JsResult<Option<Value>> {
     let rx = vm.arg(ctx, 0);
-    if !rx.is_nullish() {
+    if rx.is_object() {
         let m = vm.get_method(&rx, &PropertyKey::Sym(sym))?;
         if let Some(m) = m {
             return Ok(Some(vm.call(&m, &rx, args)?));
