@@ -18,6 +18,15 @@ struct Inherited {
     line_height: f32, // multiplier of font size
     underline: bool,
     nowrap: bool,
+    white_space: u8,
+    word_break: u8,
+    overflow_wrap: u8,
+    letter_spacing: f32,
+    line_through: bool,
+    /// vertical-align super/sub: paint-time baseline shift in px.
+    shift_y: f32,
+    /// list-style-type in effect (layout::PaintStyle::list_style codes).
+    list_style: u8,
     family: u8, // 0 sans, 1 serif, 2 mono
     /// The image-replacement idiom: this subtree's text is off-box, but
     /// its boxes and backgrounds still paint.
@@ -33,6 +42,9 @@ use crate::layout::default_font_size;
 
 /// Screen-space clip rect (x0, y0, x1, y1), already scroll-adjusted.
 type Clip = (f32, f32, f32, f32);
+
+mod boxpaint;
+pub(crate) mod effects;
 
 fn in_clip(x: u32, y: u32, clip: Clip) -> bool {
     let (x0, y0, x1, y1) = clip;
@@ -404,7 +416,8 @@ pub(crate) fn transform_text(text: &str, transform: u8) -> String {
     }
 }
 
-/// Draws `text` starting at (origin_x, origin_y), wrapping at `max_width`.
+/// Draws `text` starting at (origin_x, origin_y), wrapping at `max_width`
+/// (white-space: normal, no decoration beyond `underline`).
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     text: &str,
@@ -423,70 +436,271 @@ fn draw_text(
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let metrics = font.metrics();
-    let scale = font_size / metrics.units_per_em as f32;
-    let ascent = metrics.ascent * scale;
-    let natural = (metrics.ascent - metrics.descent + metrics.line_gap) * scale;
-    // 0.0 = "normal": use the font's natural line height.
-    let line_height = if line_height_mult > 0.0 { font_size * line_height_mult } else { natural };
+    let deco = Deco { underline, line_through: false };
+    draw_lines(
+        text, origin_x, origin_y, max_width, font, font_key, font_size, line_height_mult, color,
+        &crate::fonts::lines::TextMode::default(), deco, surface, width, height, damage_rects, clip,
+    );
+}
 
-    let mut pen_x = 0.0f32;
-    let mut line = 0u32;
+/// Text decoration lines of one run.
+#[derive(Clone, Copy, Default)]
+struct Deco {
+    underline: bool,
+    line_through: bool,
+}
 
-    for word in text.split_whitespace() {
-        let word_width: f32 = word
-            .chars()
-            .filter_map(|c| font.glyph_for_char(c))
-            .filter_map(|g| font.advance(g).ok())
-            .map(|a| a.x() * scale)
-            .sum();
-        let space = font_size * 0.3;
-
-        if pen_x > 0.0 && pen_x + word_width > max_width {
-            pen_x = 0.0;
-            line += 1;
-        }
-
-        for c in word.chars() {
-            let Some(glyph_id) = font.glyph_for_char(c) else { continue };
-            let advance = font.advance(glyph_id).map(|a| a.x() * scale).unwrap_or(font_size * 0.5);
-            let baseline_y = origin_y + line as f32 * line_height + ascent;
-            if rasterize_glyph_cached(font, font_key, glyph_id, font_size).is_some() {
-                blit_cached_glyph(
-                    font_key, glyph_id, font_size,
-                    origin_x + pen_x, baseline_y,
-                    color, surface, width, height, damage_rects, clip,
-                );
+/// Draws a run on the lines fonts::lines breaks it into — the same breaker
+/// the measurer used, so the run fills exactly its measured box.
+#[allow(clippy::too_many_arguments)]
+fn draw_lines(
+    text: &str,
+    origin_x: f32,
+    origin_y: f32,
+    max_width: f32,
+    font: &Font,
+    font_key: u8,
+    font_size: f32,
+    line_height_mult: f32,
+    color: (u8, u8, u8),
+    mode: &crate::fonts::lines::TextMode,
+    deco: Deco,
+    surface: &mut [u8],
+    width: u32,
+    height: u32,
+    damage_rects: &[(u32, u32, u32, u32)],
+    clip: Clip,
+) {
+    let ascent = crate::fonts::baseline_offset(font, font_size, line_height_mult);
+    let line_height = crate::fonts::line_height(font, font_size, line_height_mult);
+    let adv = crate::fonts::lines::Advancer::new(font, font_key, font_size, mode.letter_spacing);
+    let lines = crate::fonts::lines::break_lines(&adv, text, mode, max_width);
+    let (a_px, _, _) = crate::fonts::line_metrics(font, font_size);
+    let hline = |x0: f32, x1: f32, y: f32, thick: u32, surface: &mut [u8]| {
+        let yi = y.round() as i32;
+        for dy in 0..thick as i32 {
+            let yy = yi + dy;
+            if yy < 0 || yy as u32 >= height {
+                continue;
             }
-            pen_x += advance;
-        }
-        if underline && word_width > 0.0 {
-            let baseline_y = origin_y + line as f32 * line_height + ascent;
-            let uy = (baseline_y + 2.0) as i32;
-            if uy >= 0 {
-                let x0 = (origin_x + pen_x - word_width).max(0.0) as u32;
-                let x1 = ((origin_x + pen_x) as u32).min(width);
-                let uy = uy as u32;
-                if uy < height {
-                    for x in x0..x1 {
-                        if in_damage(x, uy, damage_rects) && in_clip(x, uy, clip) {
-                            put_px(surface, width, x, uy, color);
-                        }
-                    }
+            let x0 = x0.max(0.0).round() as u32;
+            let x1 = (x1.max(0.0).round() as u32).min(width);
+            for x in x0..x1 {
+                if in_damage(x, yy as u32, damage_rects) && in_clip(x, yy as u32, clip) {
+                    put_px(surface, width, x, yy as u32, color);
                 }
             }
         }
-        pen_x += space;
+    };
+    let thick = (font_size / 16.0).round().max(1.0) as u32;
+    for (i, line) in lines.iter().enumerate() {
+        let baseline_y = origin_y + i as f32 * line_height + ascent;
+        let mut pen_x = 0.0f32;
+        for c in line.text.chars() {
+            let advance = adv.char(c);
+            if c != ' ' {
+                if let Some(glyph_id) = font.glyph_for_char(c) {
+                    if rasterize_glyph_cached(font, font_key, glyph_id, font_size).is_some() {
+                        blit_cached_glyph(
+                            font_key, glyph_id, font_size,
+                            origin_x + pen_x, baseline_y,
+                            color, surface, width, height, damage_rects, clip,
+                        );
+                    }
+                }
+            }
+            pen_x += advance;
+        }
+        // Decorations span the line's ink extent (leading/trailing
+        // collapsible spaces excluded).
+        let lead_w: f32 = line.text.chars().take_while(|c| *c == ' ').map(|c| adv.char(c)).sum();
+        let trail_w: f32 = line.text.chars().rev().take_while(|c| *c == ' ').map(|c| adv.char(c)).sum();
+        let (x0, x1) = (origin_x + lead_w, origin_x + (line.width - trail_w).max(lead_w));
+        if deco.underline && x1 > x0 {
+            hline(x0, x1, baseline_y + (font_size / 9.0).max(1.0), thick, surface);
+        }
+        if deco.line_through && x1 > x0 {
+            hline(x0, x1, baseline_y - a_px * 0.3, thick, surface);
+        }
     }
 }
 
+/// The ordinal of a list item: its `value`, else the list's `start` (1)
+/// plus the number of preceding items (`reversed` counts down).
+fn list_ordinal(li: &kuchiki::NodeRef) -> i64 {
+    let attr_num = |n: &kuchiki::NodeRef, a: &str| {
+        n.as_element().and_then(|e| e.attributes.borrow().get(a).and_then(|v| v.trim().parse::<i64>().ok()))
+    };
+    if let Some(v) = attr_num(li, "value") {
+        return v;
+    }
+    let is_li = |n: &kuchiki::NodeRef| n.as_element().is_some_and(|e| e.name.local.as_ref() == "li");
+    let before = li.preceding_siblings().filter(|n| is_li(n)).count() as i64;
+    let parent = li.parent();
+    let reversed = parent.as_ref().and_then(|p| p.as_element().map(|e| e.attributes.borrow().get("reversed").is_some())).unwrap_or(false);
+    if reversed {
+        let total = parent.as_ref().map(|p| p.children().filter(|n| is_li(n)).count() as i64).unwrap_or(1);
+        parent.as_ref().and_then(|p| attr_num(p, "start")).unwrap_or(total) - before
+    } else {
+        parent.as_ref().and_then(|p| attr_num(p, "start")).unwrap_or(1) + before
+    }
+}
+
+fn roman(mut n: i64) -> String {
+    if n <= 0 || n >= 4000 {
+        return n.to_string();
+    }
+    let table = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")];
+    let mut s = String::new();
+    for (v, r) in table {
+        while n >= v {
+            s.push_str(r);
+            n -= v;
+        }
+    }
+    s
+}
+
+fn alpha(n: i64) -> String {
+    if n <= 0 {
+        return n.to_string();
+    }
+    let mut n = n;
+    let mut s = Vec::new();
+    while n > 0 {
+        n -= 1;
+        s.push((b'a' + (n % 26) as u8) as char);
+        n /= 26;
+    }
+    s.iter().rev().collect()
+}
+
+/// The marker text of a counter style (css-counter-styles-3 §6-7 for the
+/// predefined styles): "3. ", "c. ", "iv. ", "03. ".
+pub(crate) fn marker_text(style: u8, n: i64) -> String {
+    let body = match style {
+        5 => alpha(n),
+        6 => alpha(n).to_uppercase(),
+        7 => roman(n),
+        8 => roman(n).to_uppercase(),
+        9 if (0..10).contains(&n) => format!("0{n}"),
+        _ => n.to_string(),
+    };
+    format!("{body}. ")
+}
+
+/// Paints an outside list marker. Bullets are Blink's shapes — a disc,
+/// circle or square of about a third of the em, centred ~0.27em above the
+/// baseline, its left edge one em before the content edge; counters are
+/// the marker text in the item's font, ending at the content edge.
+#[allow(clippy::too_many_arguments)]
+fn paint_marker(
+    li: &kuchiki::NodeRef, style: u8, content_x: f32, baseline: f32, font: &Font, key: u8, fs: f32,
+    color: (u8, u8, u8), surface: &mut [u8], width: u32, height: u32,
+    damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    if (1..=3).contains(&style) {
+        let d = (fs * 0.31).round().max(3.0);
+        let x = (content_x - fs).round();
+        let cy = baseline - (fs * 0.27).round();
+        let y = (cy - d / 2.0).round();
+        let mut blend_at = |px: u32, py: u32, c: (u8, u8, u8), a: f32| {
+            if !in_damage(px, py, damage_rects) || !in_clip(px, py, clip) {
+                return;
+            }
+            if a >= 0.999 {
+                put_px(surface, width, px, py, c);
+            } else if a > 0.0 {
+                blend_px(surface, width, px, py, c, (a * 255.0).round() as u8);
+            }
+        };
+        match style {
+            1 => boxpaint::paint(x, y, d, d, [d / 2.0; 4], [None; 4], Some(color), width, height, &mut blend_at),
+            2 => boxpaint::paint(x, y, d, d, [d / 2.0; 4], [Some((1.0, color, 0)); 4], None, width, height, &mut blend_at),
+            _ => boxpaint::paint(x, y, d, d, [0.0; 4], [None; 4], Some(color), width, height, &mut blend_at),
+        }
+        return;
+    }
+    let text = marker_text(style, list_ordinal(li));
+    let adv = crate::fonts::lines::Advancer::new(font, key, fs, 0.0);
+    let w = adv.str(&text);
+    let mode = crate::fonts::lines::TextMode { white_space: 2, ..Default::default() };
+    let top = baseline - crate::fonts::baseline_offset(font, fs, 0.0);
+    draw_lines(&text, content_x - w, top, f32::MAX, font, key, fs, 0.0, color, &mode, Deco::default(), surface, width, height, damage_rects, clip);
+}
+
+/// A checkbox or radio at Chromium's control-theme look: 13x13, a 1px
+/// #767676 frame (radius 2, or a circle) on white; checked, a #0075ff fill
+/// with a white tick, or a #0075ff ring around a #0075ff dot.
+#[allow(clippy::too_many_arguments)]
+fn paint_checkable(
+    x: f32, y: f32, w: f32, h: f32, radio: bool, checked: bool,
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    let mut blend_at = |px: u32, py: u32, c: (u8, u8, u8), a: f32| {
+        if !in_damage(px, py, damage_rects) || !in_clip(px, py, clip) {
+            return;
+        }
+        if a >= 0.999 {
+            put_px(surface, width, px, py, c);
+        } else if a > 0.0 {
+            blend_px(surface, width, px, py, c, (a * 255.0).round() as u8);
+        }
+    };
+    let blue = (0, 117, 255);
+    let grey = (118, 118, 118);
+    let r = if radio { [w.min(h) / 2.0; 4] } else { [2.0; 4] };
+    let frame = |c| [Some((1.0, c, 0u8)); 4];
+    if radio {
+        if checked {
+            boxpaint::paint(x, y, w, h, r, frame(blue), Some((255, 255, 255)), width, height, &mut blend_at);
+            let d = w.min(h) * 0.55;
+            boxpaint::paint(x + (w - d) / 2.0, y + (h - d) / 2.0, d, d, [d / 2.0; 4], [None; 4], Some(blue), width, height, &mut blend_at);
+        } else {
+            boxpaint::paint(x, y, w, h, r, frame(grey), Some((255, 255, 255)), width, height, &mut blend_at);
+        }
+        return;
+    }
+    if !checked {
+        boxpaint::paint(x, y, w, h, r, frame(grey), Some((255, 255, 255)), width, height, &mut blend_at);
+        return;
+    }
+    boxpaint::paint(x, y, w, h, r, [None; 4], Some(blue), width, height, &mut blend_at);
+    // The tick: (3, 6.5) -> (5.5, 9) -> (10, 4) in the 13px box, 1.5px thick.
+    let seg = |p: (f32, f32), q: (f32, f32), blend: &mut dyn FnMut(u32, u32, (u8, u8, u8), f32)| {
+        let (x0, y0, x1, y1) = (x + p.0 * w / 13.0, y + p.1 * h / 13.0, x + q.0 * w / 13.0, y + q.1 * h / 13.0);
+        let (minx, maxx) = (x0.min(x1).floor() - 1.0, x0.max(x1).ceil() + 1.0);
+        let (miny, maxy) = (y0.min(y1).floor() - 1.0, y0.max(y1).ceil() + 1.0);
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len2 = dx * dx + dy * dy;
+        let mut yy = miny;
+        while yy <= maxy {
+            let mut xx = minx;
+            while xx <= maxx {
+                let (cx, cy) = (xx + 0.5, yy + 0.5);
+                let t = (((cx - x0) * dx + (cy - y0) * dy) / len2).clamp(0.0, 1.0);
+                let (ex, ey) = (cx - (x0 + t * dx), cy - (y0 + t * dy));
+                let d = (ex * ex + ey * ey).sqrt();
+                let a = (1.25 - d).clamp(0.0, 1.0);
+                if a > 0.0 && xx >= 0.0 && yy >= 0.0 {
+                    blend(xx as u32, yy as u32, (255, 255, 255), a);
+                }
+                xx += 1.0;
+            }
+            yy += 1.0;
+        }
+    };
+    seg((3.0, 6.5), (5.5, 9.0), &mut blend_at);
+    seg((5.5, 9.0), (10.0, 4.0), &mut blend_at);
+}
+
 /// Single-line advance width of `text`, measured EXACTLY the way `draw_text`
-/// lays it out (per-glyph advances, one `font_size * 0.3` space between
+/// lays it out (per-glyph advances, one space-glyph advance between
 /// words). Centering a control label with any other measurement drifts.
 fn measure_text_width(text: &str, font: &Font, font_size: f32) -> f32 {
     let metrics = font.metrics();
     let scale = font_size / metrics.units_per_em as f32;
-    let space = font_size * 0.3;
+    let space = crate::fonts::space_advance(font, font_size);
     let mut total = 0.0f32;
     let mut words = 0u32;
     for word in text.split_whitespace() {
@@ -821,8 +1035,34 @@ pub fn render_frame(
             return;
         }
         let Ok(layout_box) = layout.taffy.layout(node_id) else { return };
-        let current_x = abs_x + layout_box.location.x;
-        let current_y = abs_y + layout_box.location.y;
+        let mut current_x = abs_x + layout_box.location.x;
+        let mut current_y = abs_y + layout_box.location.y;
+        // position: fixed — the containing block is the viewport (CSS 2.2
+        // §10.1): insets resolve against it and the box ignores scrolling.
+        if layout.paint_map.get(&node_id).and_then(|p| p.position_kind) == Some(3) {
+            if let Ok(st) = layout.taffy.style(node_id) {
+                let len = |v: taffy::style::LengthPercentageAuto, basis: f32| -> Option<f32> {
+                    let raw = v.into_raw();
+                    match raw.tag() {
+                        taffy::style::CompactLength::LENGTH_TAG => Some(raw.value()),
+                        taffy::style::CompactLength::PERCENT_TAG => Some(raw.value() * basis),
+                        _ => None,
+                    }
+                };
+                let (vw, vh) = (width as f32, height as f32);
+                let (w, h) = (layout_box.size.width, layout_box.size.height);
+                if let Some(l) = len(st.inset.left, vw) {
+                    current_x = sx as f32 + l;
+                } else if let Some(r) = len(st.inset.right, vw) {
+                    current_x = sx as f32 + vw - r - w;
+                }
+                if let Some(t) = len(st.inset.top, vh) {
+                    current_y = sy as f32 + t;
+                } else if let Some(b) = len(st.inset.bottom, vh) {
+                    current_y = sy as f32 + vh - b - h;
+                }
+            }
+        }
 
         let mut inherited = inherited;
 
@@ -831,8 +1071,13 @@ pub fn render_frame(
 
             if let Some(el) = dom_node.as_element() {
                 let tag = el.name.local.as_ref();
-                inherited.font_size =
-                    spec.font_size.unwrap_or_else(|| default_font_size(tag, inherited.font_size));
+                let parent_font_size = inherited.font_size;
+                let own_family = spec
+                    .family
+                    .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
+                inherited.font_size = spec.font_size.unwrap_or_else(|| {
+                    crate::layout::ua_font_size(tag, inherited.font_size, inherited.family, own_family)
+                });
                 inherited.bold = spec.bold.unwrap_or_else(|| crate::layout::default_bold(tag, inherited.bold));
                 inherited.italic =
                     spec.italic.unwrap_or_else(|| crate::layout::default_italic(tag, inherited.italic));
@@ -854,6 +1099,38 @@ pub fn render_frame(
                 }
                 if let Some(nw) = spec.nowrap {
                     inherited.nowrap = nw;
+                }
+                inherited.white_space = spec
+                    .white_space
+                    .unwrap_or_else(|| crate::layout::default_white_space(tag, inherited.white_space));
+                if let Some(v) = spec.word_break { inherited.word_break = v; }
+                if let Some(v) = spec.overflow_wrap { inherited.overflow_wrap = v; }
+                if let Some(v) = spec.letter_spacing { inherited.letter_spacing = v; }
+                inherited.line_through = spec
+                    .line_through
+                    .unwrap_or_else(|| crate::layout::default_line_through(tag, inherited.line_through));
+                // html.css list styles: ul disc (circle one level down,
+                // square deeper), ol decimal; inherited into the items.
+                match tag {
+                    "ul" | "menu" | "dir" => {
+                        let depth = dom_node
+                            .ancestors()
+                            .filter(|a| a.as_element().is_some_and(|e| matches!(e.name.local.as_ref(), "ul" | "ol" | "menu" | "dir")))
+                            .count();
+                        inherited.list_style = [1, 2, 3][depth.min(2)];
+                    }
+                    "ol" => inherited.list_style = 4,
+                    _ => {}
+                }
+                if let Some(ls) = spec.list_style {
+                    inherited.list_style = ls;
+                }
+                // Blink: super raises by parent-size/3 + 1, sub lowers by
+                // parent-size/5 + 1.
+                match tag {
+                    "sup" => inherited.shift_y -= parent_font_size / 3.0 + 1.0,
+                    "sub" => inherited.shift_y += parent_font_size / 5.0 + 1.0,
+                    _ => {}
                 }
                 if spec.text_hidden == Some(true) {
                     inherited.text_hidden = true;
@@ -913,7 +1190,31 @@ pub fn render_frame(
                     crate::ledger::record_css("mask-image-unresolved");
                 }
 
-                if let Some(bg) = spec.background {
+                // Rounded corners or a patterned border: the shape painter
+                // (render/boxpaint.rs) owns the background and the border.
+                let fancy = spec.radius.is_some_and(|r| r.iter().any(|&v| v != 0.0))
+                    || spec.border_style.is_some_and(|s| s.iter().any(|&v| v != 0));
+                let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                    if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                        return;
+                    }
+                    if a >= 0.999 {
+                        put_px(surface, width, x, y, c);
+                    } else if a > 0.0 {
+                        blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                    }
+                };
+                // Outer box shadows paint under the box, outside it.
+                if let Some(sh) = spec.shadows.as_ref().filter(|s| !s.is_empty()) {
+                    let radii = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
+                    effects::paint_shadows(sh, box_sx, box_sy, bw, bh, radii, width, height, &boxpaint::sdf, &mut blend_at);
+                }
+                if fancy && mask.is_none() && spec.background.is_some() {
+                    boxpaint::paint(
+                        box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
+                        [None; 4], spec.background, width, height, &mut blend_at,
+                    );
+                } else if let Some(bg) = spec.background {
                     for y in y_start..end_y {
                         for x in x_start..end_x {
                             if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
@@ -928,6 +1229,22 @@ pub fn render_frame(
                     }
                 }
 
+                if let Some(Some(g)) = spec.bg_gradient.as_ref() {
+                    let radii = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
+                    let (gx, gy) = (box_sx, box_sy);
+                    let cover = move |fx: f32, fy: f32| (0.5 - boxpaint::sdf(fx, fy, gx, gy, gx + bw, gy + bh, radii)).clamp(0.0, 1.0);
+                    let mut blend_g = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                        if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                            return;
+                        }
+                        if a >= 0.999 {
+                            put_px(surface, width, x, y, c);
+                        } else if a > 0.0 {
+                            blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                        }
+                    };
+                    effects::paint_gradient(g, box_sx, box_sy, bw, bh, width, height, &cover, &mut blend_g);
+                }
                 // background-image paints over the color, under content,
                 // honouring background-size / -position / -repeat (the
                 // sprite-sheet idiom is exactly a positioned no-repeat
@@ -1009,7 +1326,12 @@ pub fn render_frame(
 
                 // Form controls get a UA border and their value text.
                 let is_control = matches!(tag, "input" | "textarea" | "select" | "button");
-                let mut border = spec.border.or(if is_control {
+                let kind = crate::layout::control_kind(dom_node);
+                let checkable = matches!(kind, Some(crate::layout::Control::Checkbox | crate::layout::Control::Radio));
+                // Chromium's control theme paints a 1px #767676 frame at the
+                // outer edge of the (2px) UA border; checkboxes and radios
+                // are drawn whole below.
+                let mut border = spec.border.or(if is_control && !checkable {
                     Some([Some((1.0, (118, 118, 118))); 4])
                 } else {
                     None
@@ -1053,25 +1375,71 @@ pub fn render_frame(
                     inherited.center_box = Some((content_x, content_y, content_w, content_h));
                 }
 
-                if is_control && tag != "button" {
-                    if let Some(font) = font {
+                if checkable {
+                    let checked = el.attributes.borrow().get("checked").is_some();
+                    let radio = kind == Some(crate::layout::Control::Radio);
+                    paint_checkable(box_sx, box_sy, bw, bh, radio, checked, surface, width, height, damage_rects, clip);
+                }
+                if kind == Some(crate::layout::Control::Select) {
+                    // The drop-down arrow: a 2px chevron 9px wide, centred
+                    // vertically, its right end 8px inside the right edge.
+                    let cx = box_sx + bw - 8.0 - 4.5;
+                    let cy = box_sy + bh / 2.0;
+                    for i in 0..=8 {
+                        let dx = i as f32 - 4.0;
+                        let y = cy - 2.0 + (4.0 - dx.abs());
+                        for t in 0..2 {
+                            let (x, yy) = ((cx + dx).round(), (y + t as f32).round());
+                            if x >= 0.0 && yy >= 0.0 && (x as u32) < width && (yy as u32) < height {
+                                let (xu, yu) = (x as u32, yy as u32);
+                                if in_damage(xu, yu, damage_rects) && in_clip(xu, yu, clip) {
+                                    put_px(surface, width, xu, yu, (0, 0, 0));
+                                }
+                            }
+                        }
+                    }
+                }
+                if tag == "textarea" {
+                    // The value: the element's text, pre-wrap, from the
+                    // content box's top-left, in the monospace control font.
+                    let text = dom_node.text_contents();
+                    let fs = inherited.font_size;
+                    if let Some(f) = crate::fonts::face(inherited.family, inherited.bold, inherited.italic) {
+                        let mode = crate::fonts::lines::TextMode { white_space: 3, ..Default::default() };
+                        draw_lines(
+                            text.trim_start_matches('\n'), content_x, content_y, content_w.max(1.0), &f,
+                            crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
+                            fs, 0.0, spec.color.unwrap_or((0, 0, 0)), &mode, Deco::default(),
+                            surface, width, height, damage_rects, clip,
+                        );
+                    }
+                }
+                if is_control && tag != "button" && !checkable && tag != "textarea" {
+                    let face = crate::fonts::face(inherited.family, inherited.bold, inherited.italic);
+                    if let Some(font) = face.as_ref().or(font.as_ref()) {
                         let attrs = el.attributes.borrow();
                         // A <select> paints the SELECTED OPTION'S TEXT, not
                         // its submit value: layout publishes the visible label
                         // as data-aether-label, so "English" shows where the
                         // value attribute would only say "en".
-                        let value = (tag == "select")
+                        let shown = (tag == "select")
                             .then(|| attrs.get("data-aether-label"))
                             .flatten()
                             .filter(|v| !v.is_empty())
                             .or_else(|| attrs.get("value"))
-                            .filter(|v| !v.is_empty())
-                            .or_else(|| attrs.get("placeholder"))
-                            .unwrap_or("")
-                            .to_string();
+                            .filter(|v| !v.is_empty());
+                        let is_placeholder = shown.is_none();
+                        let password = attrs.get("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("password"));
+                        let mut value = shown.or_else(|| attrs.get("placeholder")).unwrap_or("").to_string();
+                        if password && !is_placeholder {
+                            value = "\u{2022}".repeat(value.chars().count());
+                        }
                         drop(attrs);
+                        // Field text is black (FieldText), a placeholder
+                        // #757575 (html.css ::placeholder darkGray).
+                        let value_color = if is_placeholder { (117, 117, 117) } else { spec.color.unwrap_or((0, 0, 0)) };
                         if !value.is_empty() {
-                            let fs = inherited.font_size.min(14.0);
+                            let fs = inherited.font_size;
                             let text_w = measure_text_width(&value, font, fs);
                             // <input>/<select> are single-line by definition —
                             // their value rides the vertical middle however
@@ -1086,14 +1454,16 @@ pub fn render_frame(
                                     content_w.max(1.0),
                                 )
                             } else {
-                                let left = box_sx + inset_l.max(4.0);
-                                let max_w = (bw - inset_l.max(4.0) - inset_r.max(4.0)).max(1.0);
+                                // The value's line box is centred in the
+                                // content box (a single-line field).
+                                let lh = crate::fonts::line_height(font, fs, 0.0);
                                 let ty = if single_line {
-                                    centered_line_origin_y(font, fs, content_y + content_h / 2.0)
+                                    content_y + ((content_h - lh) / 2.0).floor()
                                 } else {
-                                    box_sy + pad.top + bord.top + 3.0
+                                    content_y
                                 };
-                                (left, ty, max_w)
+                                let left = if tag == "select" { content_x + 4.0 } else { content_x };
+                                (left, ty, f32::MAX)
                             };
                             draw_text(
                                 &value,
@@ -1101,10 +1471,10 @@ pub fn render_frame(
                                 ty,
                                 max_w,
                                 font,
-                                0,
+                                crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
                                 fs,
-                                inherited.line_height,
-                                (60, 60, 60),
+                                0.0,
+                                value_color,
                                 false,
                                 surface,
                                 width,
@@ -1116,7 +1486,27 @@ pub fn render_frame(
                     }
                 }
 
-                if let Some(sides) = border {
+                if let (true, Some(sides)) = (fancy, border) {
+                    let styles = spec.border_style.unwrap_or([0; 4]);
+                    let mut bs: [boxpaint::Side; 4] = [None; 4];
+                    for i in 0..4 {
+                        bs[i] = sides[i].filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
+                    }
+                    let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                        if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                            return;
+                        }
+                        if a >= 0.999 {
+                            put_px(surface, width, x, y, c);
+                        } else if a > 0.0 {
+                            blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                        }
+                    };
+                    boxpaint::paint(
+                        box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
+                        bs, None, width, height, &mut blend_at,
+                    );
+                } else if let Some(sides) = border {
                     // Same rule as the background/image spans: x_start..end_x
                     // is the CLAMPED screen span of the unclamped box origin
                     // (box_sx/box_sy). Re-deriving the end from a clamped
@@ -1161,6 +1551,20 @@ pub fn render_frame(
                         stroke(bx1 - px(w), by0, bx1, by1, c);
                     }
                 }
+                // css-lists-3 §3.1: an outside ::marker for a list item,
+                // its first line's baseline, ending at the content edge.
+                let is_item = spec.list_item.unwrap_or(tag == "li");
+                if is_item && inherited.list_style != 0 && !inherited.text_hidden {
+                    if let Some(f) = crate::fonts::face(inherited.family, inherited.bold, inherited.italic) {
+                        let fs = inherited.font_size;
+                        let base = content_y + crate::fonts::baseline_offset(&f, fs, inherited.line_height);
+                        paint_marker(
+                            dom_node, inherited.list_style, content_x, base, &f,
+                            crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
+                            fs, inherited.color, surface, width, height, damage_rects, clip,
+                        );
+                    }
+                }
             } else if dom_node.as_text().is_some() && !inherited.text_hidden {
                 // The same face the measurer wrapped this run with
                 // (fonts::face): family x weight x style. The preloaded sans
@@ -1175,16 +1579,29 @@ pub fn render_frame(
                 };
                 if let Some(font) = font {
                     let text = dom_node.text_contents();
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        let text = transform_text(text, inherited.text_transform);
+                    if !text.trim().is_empty() || inherited.white_space >= 2 || layout.paint_map.get(&node_id).and_then(|p| p.ws_lead) == Some(true) {
+                        let text = transform_text(&text, inherited.text_transform);
+                        let spec_t = layout.paint_map.get(&node_id);
+                        let mut mode = crate::fonts::lines::TextMode {
+                            white_space: inherited.white_space,
+                            word_break: inherited.word_break,
+                            overflow_wrap: inherited.overflow_wrap,
+                            letter_spacing: inherited.letter_spacing,
+                            lead: spec_t.and_then(|p| p.ws_lead).unwrap_or(false),
+                            trail: spec_t.and_then(|p| p.ws_trail).unwrap_or(false),
+                        };
+                        if inherited.nowrap && mode.white_space == 0 {
+                            mode.white_space = 1;
+                        }
                         // A <button>'s label is an ordinary text child, so it
                         // is centred here against the ancestor control's
                         // content box — but only when the measured run fits on
                         // one line inside it, so a button wrapping rich or
                         // overflowing content keeps normal flow painting.
+                        let fkey = crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic);
                         let centered = inherited.center_box.and_then(|(cx, cy, cw, ch)| {
-                            let tw = measure_text_width(&text, font, inherited.font_size);
+                            let adv = crate::fonts::lines::Advancer::new(font, fkey, inherited.font_size, mode.letter_spacing);
+                            let tw = crate::fonts::lines::break_lines(&adv, &text, &mode, f32::MAX)[0].width;
                             (tw <= cw && cw > 0.0).then(|| {
                                 (
                                     cx + (cw - tw) / 2.0,
@@ -1193,22 +1610,32 @@ pub fn render_frame(
                                 )
                             })
                         });
+                        // Break at the UNROUNDED box width the measurer saw
+                        // (the rounded one can be a fraction narrower).
+                        let wrap_w = layout
+                            .taffy
+                            .unrounded_layout(node_id)
+                            .size
+                            .width
+                            .max(layout_box.size.width)
+                            + 0.01;
                         let (tx, ty, max_w) = centered.unwrap_or((
                             current_x - sx as f32,
-                            current_y - sy as f32,
-                            if inherited.nowrap { f32::MAX } else { layout_box.size.width.max(1.0) },
+                            current_y - sy as f32 + inherited.shift_y,
+                            if inherited.nowrap { f32::MAX } else { wrap_w.max(1.0) },
                         ));
-                        draw_text(
+                        draw_lines(
                             &text,
                             tx,
                             ty,
                             max_w,
                             font,
-                            crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
+                            fkey,
                             inherited.font_size,
                             inherited.line_height,
                             inherited.color,
-                            inherited.underline,
+                            &mode,
+                            Deco { underline: inherited.underline, line_through: inherited.line_through },
                             surface,
                             width,
                             height,
@@ -1242,7 +1669,28 @@ pub fn render_frame(
             return; // fully clipped out — nothing below can paint
         }
         if let Ok(children) = layout.taffy.children(node_id) {
-            for child in children {
+            // CSS 2.2 Appendix E, per parent: negative z-index, then the
+            // in-flow boxes, then positioned boxes with z-index auto/0 in
+            // tree order, then positive z-index in ascending order (stable).
+            // (Positioned descendants are ordered among their siblings,
+            // not hoisted to the enclosing stacking context.)
+            let mut order: Vec<(i32, i32, usize, NodeId)> = children
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| {
+                    let p = layout.paint_map.get(&c);
+                    let positioned = p.and_then(|p| p.position_kind).is_some_and(|k| k != 0);
+                    let z = p.and_then(|p| p.z_index).flatten().filter(|_| positioned);
+                    match z {
+                        Some(z) if z < 0 => (0, z, i, c),
+                        Some(z) if z > 0 => (3, z, i, c),
+                        _ if positioned => (2, 0, i, c),
+                        _ => (1, 0, i, c),
+                    }
+                })
+                .collect();
+            order.sort_by_key(|o| (o.0, o.1, o.2));
+            for (_, _, _, child) in order {
                 draw_node(
                     child, current_x, current_y, inherited, layout, font, font_bold, surface,
                     width, height, sx, sy, damage_rects, child_clip,
@@ -1259,6 +1707,13 @@ pub fn render_frame(
         line_height: 0.0, // natural
         underline: false,
         nowrap: false,
+        white_space: 0,
+        word_break: 0,
+        overflow_wrap: 0,
+        letter_spacing: 0.0,
+        line_through: false,
+        shift_y: 0.0,
+        list_style: 1,
         family: 0,
         text_hidden: false,
         text_transform: 0,

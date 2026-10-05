@@ -2308,4 +2308,213 @@ mod tests {
             .collect();
         assert_eq!(keys.len(), 12);
     }
+
+    /// Absolute (page) rect of the first element with `id`, after a cascade.
+    fn rect_by_id(tree: &layout::LayoutTree, want: &str) -> Option<(f32, f32, f32, f32)> {
+        fn walk(t: &layout::LayoutTree, n: taffy::NodeId, x: f32, y: f32, want: &str) -> Option<(f32, f32, f32, f32)> {
+            let l = t.taffy.layout(n).ok()?;
+            let (ax, ay) = (x + l.location.x, y + l.location.y);
+            if let Some(el) = t.node_map.get(&n).and_then(|d| d.as_element()) {
+                if el.attributes.borrow().get("id") == Some(want) {
+                    return Some((ax, ay, l.size.width, l.size.height));
+                }
+            }
+            for k in t.taffy.children(n).unwrap_or_default() {
+                if let Some(r) = walk(t, k, ax, ay, want) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        walk(tree, tree.root_node, 0.0, 0.0, want)
+    }
+
+    fn laid_out(html: &str, css: &str) -> layout::LayoutTree {
+        let mut tree = layout::compute_layout(&dom::parse_html(html));
+        css::apply_css(&mut tree, css);
+        tree
+    }
+
+    /// CSS 2.2 §8.3.1 known answers: adjoining sibling margins collapse to
+    /// the larger; a negative joins as max-positive + min-negative; a first
+    /// child's top margin escapes a parent with no border/padding (and the
+    /// body), but not one with padding; an empty block collapses through.
+    #[test]
+    fn test_margin_collapsing_kat() {
+        let css = "body{margin:0} div{height:10px}";
+        // Siblings: 16 and 24 collapse to 24 (not 40).
+        let t = laid_out(r#"<html><body><div id=a style="margin-bottom:16px"></div><div id=b style="margin-top:24px"></div></body></html>"#, css);
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(b.1 - (a.1 + a.3), 24.0, "sibling margins collapse to the max");
+        // Positive and negative: 20 + (-8) = 12.
+        let t = laid_out(r#"<html><body><div id=a style="margin-bottom:20px"></div><div id=b style="margin-top:-8px"></div></body></html>"#, css);
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(b.1 - (a.1 + a.3), 12.0, "max positive + min negative");
+        // Parent/first child: the child's 30px escapes the wrapper (and body).
+        let t = laid_out(r#"<html><body><section id=w style="display:block"><p id=c style="margin:30px 0;height:10px"></p></section></body></html>"#, "body{margin:0}");
+        let (w, c) = (rect_by_id(&t, "w").unwrap(), rect_by_id(&t, "c").unwrap());
+        assert_eq!(c.1, 30.0, "first child's margin collapses through");
+        assert_eq!(w.1, 30.0, "the wrapper starts where the collapsed margin ends");
+        // Padding separates: the child's margin stays inside.
+        let t = laid_out(r#"<html><body><section id=w style="padding-top:1px"><p id=c style="margin:30px 0;height:10px"></p></section></body></html>"#, "body{margin:0}");
+        let (w, c) = (rect_by_id(&t, "w").unwrap(), rect_by_id(&t, "c").unwrap());
+        assert_eq!(w.1, 0.0);
+        assert_eq!(c.1, 31.0, "padding blocks the collapse");
+        // Empty block between siblings: 10, (12/14 empty), 8 → one 14 gap.
+        let t = laid_out(r#"<html><body><div id=a style="margin-bottom:10px"></div><section style="margin:12px 0 14px"></section><div id=b style="margin-top:8px"></div></body></html>"#, css);
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(b.1 - (a.1 + a.3), 14.0, "an empty block collapses through");
+        // The specified margins survive the layout run (restore).
+        let id = t.node_map.iter().find(|(_, n)| n.as_element().is_some_and(|e| e.attributes.borrow().get("id") == Some("b"))).map(|(i, _)| *i).unwrap();
+        assert_eq!(t.taffy.style(id).unwrap().margin.top, taffy::style::LengthPercentageAuto::length(8.0));
+    }
+
+    /// html.css UA margins: h1 0.67em of 32px, p 1em, a margin longhand
+    /// replaces only its own side.
+    #[test]
+    fn test_ua_margins_and_longhands() {
+        let t = laid_out(r#"<html><body><div id=top style="height:1px"></div><h1 id=h>T</h1><p id=p>x</p></body></html>"#, "body{margin:0} h1{margin-bottom:4px}");
+        let (top, h, p) = (rect_by_id(&t, "top").unwrap(), rect_by_id(&t, "h").unwrap(), rect_by_id(&t, "p").unwrap());
+        assert!((h.1 - (top.1 + top.3) - 21.44).abs() <= 1.0, "h1 keeps its UA top margin: {:?}", h);
+        assert!((p.1 - (h.1 + h.3) - 16.0).abs() <= 1.0, "max(4, 16) between h1 and p: {:?} {:?}", h, p);
+    }
+
+    /// CSS 2.2 §10.3.3: an auto-width block fills its container minus its
+    /// margins, border and padding (content-box); `margin: 0 auto` under a
+    /// max-width centres the clamped box.
+    #[test]
+    fn test_block_width_kat() {
+        let t = laid_out(
+            r#"<html><body><div style="width:400px"><div id=a style="margin:0 10px;padding:0 12px;border:2px solid red">x</div><div id=b style="max-width:200px;margin:0 auto;padding:0 10px">y</div></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!((a.0, a.2), (10.0, 380.0), "fills 400 - 2x10 margin, border-box");
+        assert_eq!((b.0, b.2), (90.0, 220.0), "content 200 + padding 20, centred");
+    }
+
+    /// CSS 2.2 §10.8: `line-height: normal` is the rounded ascent + descent
+    /// + gap (Liberation Sans/Arial 16px = 18, not 18.4), and the baseline
+    /// sits half the leading below the line top.
+    #[test]
+    fn test_line_metrics_kat() {
+        let Some(f) = crate::fonts::face(0, false, false) else { return };
+        let (a, d, g) = crate::fonts::line_metrics(&f, 16.0);
+        assert_eq!(crate::fonts::line_height(&f, 16.0, 0.0), a + d + g);
+        assert_eq!(crate::fonts::baseline_offset(&f, 16.0, 0.0), (g / 2.0).floor() + a);
+        assert_eq!(crate::fonts::baseline_offset(&f, 16.0, 2.0), ((32.0 - a - d) / 2.0).floor() + a);
+        let sp = crate::fonts::space_advance(&f, 16.0);
+        assert!(sp > 3.0 && sp < 5.0, "space advance {sp}");
+    }
+
+    /// Chromium control metrics: a text field is one 13.333px line + 1px/2px
+    /// padding + 2px border (21px tall at UA padding; author padding and
+    /// border-box work on top), a checkbox 13x13.
+    #[test]
+    fn test_form_control_metrics_kat() {
+        let t = laid_out(
+            r#"<html><body><input id=f><input id=g style="box-sizing:border-box;padding:6px;width:200px"><input id=c type=checkbox></body></html>"#,
+            "body{margin:0}",
+        );
+        let (f, g, c) = (rect_by_id(&t, "f").unwrap(), rect_by_id(&t, "g").unwrap(), rect_by_id(&t, "c").unwrap());
+        let lh = crate::fonts::face(0, false, false).map(|x| crate::fonts::line_height(&x, 13.333, 0.0)).unwrap_or(15.0);
+        assert_eq!(f.3, lh + 2.0 + 4.0, "field: line + padding + border");
+        assert_eq!((g.2, g.3), (200.0, lh + 12.0 + 4.0), "border-box width, padding 6");
+        assert_eq!((c.2, c.3), (13.0, 13.0));
+    }
+
+    /// CSS 2.2 §9.2.1.1: an inline tag made `display: block` splits its
+    /// parent's line into block boxes (label above input, not beside it).
+    #[test]
+    fn test_display_block_on_inline_tag() {
+        let t = laid_out(
+            r#"<html><body><form><label id=l>Name</label><input id=i> <label id=m>Mail</label><input id=j></form></body></html>"#,
+            "body{margin:0} label{display:block} input{width:100px}",
+        );
+        let (l, i, m) = (rect_by_id(&t, "l").unwrap(), rect_by_id(&t, "i").unwrap(), rect_by_id(&t, "m").unwrap());
+        assert_eq!(l.0, 0.0);
+        assert!(i.1 >= l.1 + l.3, "input below its block label: {l:?} {i:?}");
+        assert!(m.1 >= i.1 + i.3 && m.0 == 0.0, "next label on its own line: {m:?}");
+    }
+
+    /// html.css heading sizes are em of the parent: h2 in a 14px body is 21px.
+    #[test]
+    fn test_heading_em_sizes() {
+        assert_eq!(layout::default_font_size("h2", 14.0), 21.0);
+        assert_eq!(layout::default_font_size("h1", 16.0), 32.0);
+    }
+
+    /// css-values-4: clamp()/min() with % resolve against the containing
+    /// block after layout; math in a box shorthand is one component;
+    /// clamp() font sizes.
+    #[test]
+    fn test_css_math_kat() {
+        assert_eq!(css::split_top_level("calc(0.5rem + 1vw) 4px"), vec!["calc(0.5rem + 1vw)", "4px"]);
+        assert_eq!(css::parse_font_size("clamp(10px, 50px, 20px)"), Some(20.0));
+        let t = laid_out(
+            r#"<html><body><div style="width:500px"><div id=a style="width:min(300px, 80%);height:1px"></div><div id=b style="width:max(10px, 50%);height:1px;padding:calc(2px + 3px)"></div></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
+        assert_eq!(a.2, 300.0);
+        assert_eq!(b.2, 250.0 + 10.0, "50% of 500 + padding 5+5");
+    }
+
+    /// CSS 2.2 §17.5.2.2 / §17.6: columns line up across rows, a 100% wide
+    /// table widens its columns in proportion, collapsed borders overlap.
+    #[test]
+    fn test_table_layout_kat() {
+        let t = laid_out(
+            r#"<html><body><table style="width:400px;border-collapse:collapse"><tr><td id=a style="border:1px solid red">x</td><td id=b style="border:1px solid red">yyyyyyyy</td></tr><tr><td id=c style="border:1px solid red">zzzz zzzz</td><td id=d style="border:1px solid red">1</td></tr></table></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b, c, d) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap(), rect_by_id(&t, "c").unwrap(), rect_by_id(&t, "d").unwrap());
+        assert_eq!(a.2, c.2, "column 1 cells share a width");
+        assert_eq!(b.0, d.0, "column 2 starts at one x");
+        assert_eq!(b.0, a.0 + a.2 - 1.0, "collapsed: the shared border overlaps by 1px");
+        assert!((d.0 + d.2 - a.0 - 400.0).abs() <= 1.0, "the columns fill the 400px table: {a:?} {d:?}");
+        assert_eq!(c.1, a.1 + a.3 - 1.0, "rows overlap by the shared border");
+    }
+
+    /// vertical-align: super grows its line box by Blink's shift
+    /// (parent/3 + 1 = 6.33px at 16px, less the smaller sup glyph box).
+    #[test]
+    fn test_sup_grows_line_box() {
+        let a = laid_out(r#"<html><body><p id=p>E=mc2 x</p></body></html>"#, "body{margin:0} p{margin:0}");
+        let b = laid_out(r#"<html><body><p id=p>E=mc<sup>2</sup> x</p></body></html>"#, "body{margin:0} p{margin:0}");
+        let (pa, pb) = (rect_by_id(&a, "p").unwrap(), rect_by_id(&b, "p").unwrap());
+        assert!(pb.3 >= pa.3 + 2.0, "line box grows: {pa:?} -> {pb:?}");
+    }
+
+    /// CSS 2.2 Appendix E: a higher z-index paints over a later sibling;
+    /// position: fixed with bottom: 0 sits at the viewport's bottom edge.
+    #[test]
+    fn test_z_index_and_fixed_kat() {
+        let t = laid_out(
+            r#"<html><body><div style="position:relative;height:100px"><div style="position:absolute;left:0;top:0;width:50px;height:50px;background:#ff0000;z-index:2"></div><div style="position:absolute;left:25px;top:25px;width:50px;height:50px;background:#0000ff;z-index:1"></div></div><div style="position:fixed;left:0;right:0;bottom:0;height:10px;background:#00ff00"></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (w, h) = (200u32, 300u32);
+        let mut surface = vec![0u8; (w * h * 4) as usize];
+        crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+        let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; (surface[i + 2], surface[i + 1], surface[i]) }; // BGRA
+        let red = px(40, 40);
+        assert!(red.0 > 200 && red.2 < 50, "z-index 2 over z-index 1: {red:?}");
+        let blue = px(60, 60);
+        assert!(blue.2 > 200, "the lower box shows outside the overlap: {blue:?}");
+        let bar = px(100, h - 5);
+        assert!(bar.1 > 200 && bar.0 < 50, "fixed bar at the viewport bottom: {bar:?}");
+    }
+
+    /// css-counter-styles-3 predefined styles as list markers.
+    #[test]
+    fn test_marker_text_kat() {
+        use crate::render::marker_text;
+        assert_eq!(marker_text(4, 3), "3. ");
+        assert_eq!(marker_text(5, 28), "ab. ");
+        assert_eq!(marker_text(6, 1), "A. ");
+        assert_eq!(marker_text(7, 1994), "mcmxciv. ");
+        assert_eq!(marker_text(8, 4), "IV. ");
+        assert_eq!(marker_text(9, 7), "07. ");
+    }
 }

@@ -28,8 +28,11 @@ pub(crate) struct SpecifiedStyle {
     pub max_height: Option<Dimension>,
     pub min_width: Option<Dimension>,
     pub min_height: Option<Dimension>,
-    pub padding: Option<Rect<LengthPercentage>>,
-    pub margin: Option<Rect<LengthPercentageAuto>>,
+    /// Per side [top, right, bottom, left]: a longhand (`margin-top`)
+    /// specifies ONE side and must leave the other three to the cascade
+    /// and the UA defaults (CSS Cascade §6: each longhand cascades alone).
+    pub padding: [Option<LengthPercentage>; 4],
+    pub margin: [Option<LengthPercentageAuto>; 4],
     pub position: Option<taffy::style::Position>,
     pub inset_top: Option<LengthPercentageAuto>,
     pub inset_left: Option<LengthPercentageAuto>,
@@ -92,12 +95,16 @@ impl SpecifiedStyle {
         }
         if let Some(v) = self.min_width { node_style.min_size.width = lpa(v); }
         if let Some(v) = self.min_height { node_style.min_size.height = lpa(v); }
-        if let Some(p) = self.padding {
-            node_style.padding = p;
-        }
-        if let Some(m) = self.margin {
-            node_style.margin = m;
-        }
+        let [pt, pr, pb, pl] = self.padding;
+        if let Some(v) = pt { node_style.padding.top = v; }
+        if let Some(v) = pr { node_style.padding.right = v; }
+        if let Some(v) = pb { node_style.padding.bottom = v; }
+        if let Some(v) = pl { node_style.padding.left = v; }
+        let [mt, mr, mb, ml] = self.margin;
+        if let Some(v) = mt { node_style.margin.top = v; }
+        if let Some(v) = mr { node_style.margin.right = v; }
+        if let Some(v) = mb { node_style.margin.bottom = v; }
+        if let Some(v) = ml { node_style.margin.left = v; }
         if let Some(pos) = self.position {
             node_style.position = pos;
         }
@@ -137,29 +144,43 @@ impl SpecifiedStyle {
 pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedStyle) {
     let value = value.trim();
     match prop {
-        "display" => match value {
-            "none" => style.display = Some(Display::None),
-            // Real flex containers: CSS flex semantics (see fold_into).
-            "flex" | "inline-flex" | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex"
-            | "-webkit-inline-flex" | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(true);
+        "display" => {
+            // Outer display type (css-display-3 §2.1) for the inline
+            // whitespace pass: 0 inline, 1 block-level, 2 inline-level box.
+            style.paint.display_kind = match value {
+                "inline" | "contents" => Some(0),
+                "inline-block" | "inline-flex" | "inline-grid" | "inline-table"
+                | "-webkit-inline-box" | "-webkit-inline-flex" | "-ms-inline-flexbox" => Some(2),
+                "none" | "inherit" | "initial" | "unset" | "revert" => None,
+                _ => Some(1),
+            };
+            if !matches!(value, "inherit" | "initial" | "unset" | "revert") {
+                style.paint.list_item = Some(value == "list-item");
             }
-            // Column-flex approximations of block-ish display types.
-            "block" | "inline-block" | "inline" | "list-item"
-            | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
-            | "table-header-group" | "table-footer-group" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(false);
+            apply_display(value, style);
+        }
+        // css-lists-3 §3: the marker style (inherited); `list-style` takes
+        // its type keyword (position/image parts are not painted).
+        "list-style-type" | "list-style" => {
+            for part in value.split_whitespace() {
+                let code = match part {
+                    "none" => Some(0),
+                    "disc" => Some(1),
+                    "circle" => Some(2),
+                    "square" => Some(3),
+                    "decimal" => Some(4),
+                    "lower-alpha" | "lower-latin" => Some(5),
+                    "upper-alpha" | "upper-latin" => Some(6),
+                    "lower-roman" => Some(7),
+                    "upper-roman" => Some(8),
+                    "decimal-leading-zero" => Some(9),
+                    _ => None,
+                };
+                if code.is_some() {
+                    style.paint.list_style = code;
+                }
             }
-            "table-row" => {
-                style.display = Some(Display::Flex);
-                style.flex_container = Some(false);
-                style.flex_direction = Some(FlexDirection::Row);
-            }
-            "inherit" | "initial" | "unset" | "revert" => {}
-            other => crate::ledger::record_css(&format!("display:{}", other)),
-        },
+        }
         "flex-direction" => match value {
             "row" => style.flex_direction = Some(FlexDirection::Row),
             "column" => style.flex_direction = Some(FlexDirection::Column),
@@ -224,11 +245,38 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             }
             None => crate::ledger::record_css(&format!("flex-value:{}", clip(value))),
         },
-        "width" => style.width = parse_dimension_str(value),
+        "width" | "min-width" | "max-width" => {
+            let d = parse_dimension_str(value);
+            let i = match prop { "width" => 0, "min-width" => 1, _ => 2 };
+            // css-values-4 §10: a math function mixing % with lengths
+            // resolves against the containing block's width — known only
+            // after layout, so it is kept as an expression for remeasure.
+            let mut m = style.paint.pct_math.clone().unwrap_or_default();
+            m[i] = (d.is_none() && value.contains('(') && value.contains('%')).then(|| value.to_string());
+            if d.is_some() || m[i].is_some() {
+                style.paint.pct_math = Some(m);
+            }
+            if i == 0 {
+                style.paint.has_width = Some(!matches!(value, "auto"));
+            }
+            match i {
+                0 => style.width = d,
+                1 => style.min_width = d,
+                _ => style.max_width = d,
+            }
+        }
         "height" => style.height = parse_dimension_str(value),
-        "max-width" => style.max_width = parse_dimension_str(value),
         "max-height" => style.max_height = parse_dimension_str(value),
-        "min-width" => style.min_width = parse_dimension_str(value),
+        "border-collapse" => match value {
+            "collapse" => style.paint.border_collapse = Some(true),
+            "separate" => style.paint.border_collapse = Some(false),
+            _ => {}
+        },
+        "border-spacing" => {
+            if let Some(px) = split_top_level(value).first().and_then(|v| parse_px(v)) {
+                style.paint.border_spacing = Some(px.max(0.0));
+            }
+        }
         "min-height" => style.min_height = parse_dimension_str(value),
         // overflow hidden/clip/auto/scroll all CLIP paint here (no inner
         // scrollbars yet — clipping is the honest approximation; visible
@@ -238,47 +286,48 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             "visible" => style.paint.clip = Some(false),
             _ => {}
         },
-        "padding" => style.padding = parse_sides(value, |v| parse_length_percentage_str(v)),
+        "padding" => {
+            if let Some(r) = parse_sides(value, |v| parse_length_percentage_str(v)) {
+                style.padding = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
+            }
+        }
         "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
             if let Some(v) = parse_length_percentage_str(value) {
-                let mut p = style.padding.unwrap_or(Rect {
-                    left: LengthPercentage::length(0.0),
-                    right: LengthPercentage::length(0.0),
-                    top: LengthPercentage::length(0.0),
-                    bottom: LengthPercentage::length(0.0),
-                });
-                match prop {
-                    "padding-top" => p.top = v,
-                    "padding-right" => p.right = v,
-                    "padding-bottom" => p.bottom = v,
-                    _ => p.left = v,
-                }
-                style.padding = Some(p);
+                style.padding[side_index(prop)] = Some(v);
             }
         }
-        "margin" => style.margin = parse_sides(value, |v| parse_length_percentage_auto_str(v)),
+        "margin" => {
+            if let Some(r) = parse_sides(value, |v| parse_length_percentage_auto_str(v)) {
+                style.margin = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
+            }
+        }
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
             if let Some(v) = parse_length_percentage_auto_str(value) {
-                let mut m = style.margin.unwrap_or(Rect {
-                    left: LengthPercentageAuto::length(0.0),
-                    right: LengthPercentageAuto::length(0.0),
-                    top: LengthPercentageAuto::length(0.0),
-                    bottom: LengthPercentageAuto::length(0.0),
-                });
-                match prop {
-                    "margin-top" => m.top = v,
-                    "margin-right" => m.right = v,
-                    "margin-bottom" => m.bottom = v,
-                    _ => m.left = v,
-                }
-                style.margin = Some(m);
+                style.margin[side_index(prop)] = Some(v);
             }
         }
-        "position" => match value {
-            "absolute" | "fixed" => style.position = Some(taffy::style::Position::Absolute),
-            "static" | "relative" | "sticky" => style.position = Some(taffy::style::Position::Relative),
-            other => crate::ledger::record_css(&format!("position:{}", other)),
-        },
+        "position" => {
+            style.paint.position_kind = match value {
+                "static" => Some(0),
+                "relative" => Some(1),
+                "absolute" => Some(2),
+                "fixed" => Some(3),
+                "sticky" => Some(4),
+                _ => None,
+            };
+            match value {
+                "absolute" | "fixed" => style.position = Some(taffy::style::Position::Absolute),
+                "static" | "relative" | "sticky" => style.position = Some(taffy::style::Position::Relative),
+                other => crate::ledger::record_css(&format!("position:{}", other)),
+            }
+        }
+        "z-index" => {
+            if value == "auto" {
+                style.paint.z_index = Some(None);
+            } else if let Ok(z) = value.parse::<i32>() {
+                style.paint.z_index = Some(Some(z));
+            }
+        }
         "top" => style.inset_top = parse_length_percentage_auto_str(value),
         "left" => style.inset_left = parse_length_percentage_auto_str(value),
         "right" => style.inset_right = parse_length_percentage_auto_str(value),
@@ -348,6 +397,39 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                     None => crate::ledger::record_css(&format!("background-value:{}", clip(value))),
                 }
             }
+        }
+        "background-image" if value.to_ascii_lowercase().contains("linear-gradient(") => {
+            style.paint.bg_gradient = crate::render::effects::parse_linear_gradient(value).map(Some);
+        }
+        "background" if value.to_ascii_lowercase().contains("linear-gradient(") => {
+            // A gradient layer (css-images-3 §3.1) plus any colour outside it.
+            style.paint.bg_gradient = crate::render::effects::parse_linear_gradient(value).map(Some);
+            let lower = value.to_ascii_lowercase();
+            let start = lower.find("repeating-linear-gradient(").or_else(|| lower.find("linear-gradient(")).unwrap_or(0);
+            let mut depth = 0;
+            let mut end = lower.len();
+            for (i, c) in lower[start..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = start + i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let rest = format!("{} {}", &value[..start], &value[end..]);
+            for part in split_top_level(&rest) {
+                if let Some(c) = parse_color_str(part) {
+                    style.paint.background = Some(c);
+                }
+            }
+        }
+        "box-shadow" | "-webkit-box-shadow" => {
+            style.paint.shadows = Some(crate::render::effects::parse_box_shadow(value));
         }
         "background-image" => match extract_css_url(value) {
             Some(u) => style.paint.bg_image = Some(u),
@@ -581,8 +663,11 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 if let Some(px) = parse_px(part).filter(|_| part.ends_with("px") || part.ends_with("em")) {
                     width = px;
                     got_any = true;
-                } else if matches!(part, "solid" | "dotted" | "dashed" | "double" | "groove" | "ridge" | "inset" | "outset") {
+                } else if let Some(k) = border_style_code(part) {
                     got_any = true;
+                    let mut bs = style.paint.border_style.unwrap_or([0; 4]);
+                    bs[side] = k;
+                    style.paint.border_style = Some(bs);
                 } else if let Some(c) = parse_color_str(part) {
                     color = c;
                     got_any = true;
@@ -599,13 +684,47 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 style.paint.underline = Some(true);
             } else if v.starts_with("none") {
                 style.paint.underline = Some(false);
+                style.paint.line_through = Some(false);
+            }
+            if v.contains("line-through") {
+                style.paint.line_through = Some(true);
             }
         }
-        "white-space" => match value {
-            "nowrap" | "pre" => style.paint.nowrap = Some(true),
-            "normal" | "pre-wrap" | "pre-line" | "break-spaces" => style.paint.nowrap = Some(false),
+        "white-space" | "white-space-collapse" => {
+            let code = match value {
+                "normal" => Some(0),
+                "nowrap" => Some(1),
+                "pre" => Some(2),
+                "pre-wrap" => Some(3),
+                "pre-line" => Some(4),
+                "break-spaces" => Some(5),
+                _ => None,
+            };
+            if let Some(c) = code {
+                style.paint.white_space = Some(c);
+                style.paint.nowrap = Some(matches!(c, 1 | 2));
+            }
+        }
+        "word-break" => match value {
+            "normal" => style.paint.word_break = Some(0),
+            "break-all" => style.paint.word_break = Some(1),
+            "keep-all" => style.paint.word_break = Some(2),
+            // Legacy: word-break: break-word = overflow-wrap: anywhere.
+            "break-word" => style.paint.overflow_wrap = Some(1),
             _ => {}
         },
+        "overflow-wrap" | "word-wrap" => match value {
+            "normal" => style.paint.overflow_wrap = Some(0),
+            "break-word" | "anywhere" => style.paint.overflow_wrap = Some(1),
+            _ => {}
+        },
+        "letter-spacing" => {
+            if value == "normal" {
+                style.paint.letter_spacing = Some(0.0);
+            } else if let Some(px) = parse_px(value) {
+                style.paint.letter_spacing = Some(px);
+            }
+        }
         "box-sizing" => match value {
             "border-box" => style.box_sizing = Some(taffy::style::BoxSizing::BorderBox),
             "content-box" => style.box_sizing = Some(taffy::style::BoxSizing::ContentBox),
@@ -698,8 +817,36 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
         }
         // border-radius: parsed but not rendered (taffy doesn't support it yet).
         // At minimum, stops the property from appearing in unsupported ledgers.
-        "border-radius" | "border-top-left-radius" | "border-top-right-radius"
-        | "border-bottom-left-radius" | "border-bottom-right-radius" => {} // silently ignore; taffy limitation
+        // css-backgrounds-3 §5.1: 1-4 corner radii (the elliptical `/`
+        // part takes its horizontal radii), or one corner's longhand.
+        "border-radius" => {
+            let horiz = value.split('/').next().unwrap_or(value);
+            let parts: Option<Vec<f32>> = horiz.split_whitespace().map(parse_radius).collect();
+            if let Some(p) = parts {
+                let r = match p.as_slice() {
+                    [a] => [*a; 4],
+                    [a, b] => [*a, *b, *a, *b],
+                    [a, b, c] => [*a, *b, *c, *b],
+                    [a, b, c, d] => [*a, *b, *c, *d],
+                    _ => return,
+                };
+                style.paint.radius = Some(r);
+            }
+        }
+        "border-top-left-radius" | "border-top-right-radius"
+        | "border-bottom-right-radius" | "border-bottom-left-radius" => {
+            if let Some(v) = value.split_whitespace().next().and_then(parse_radius) {
+                let i = match prop {
+                    "border-top-left-radius" => 0,
+                    "border-top-right-radius" => 1,
+                    "border-bottom-right-radius" => 2,
+                    _ => 3,
+                };
+                let mut r = style.paint.radius.unwrap_or([0.0; 4]);
+                r[i] = v;
+                style.paint.radius = Some(r);
+            }
+        }
         "border" | "outline" => {
             let v = value.trim();
             if v == "none" || v == "0" {
@@ -713,8 +860,9 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 if let Some(px) = parse_px(part).filter(|_| part.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '.')) {
                     width = px;
                     got_any = true;
-                } else if matches!(part, "solid" | "dotted" | "dashed" | "double" | "groove" | "ridge" | "inset" | "outset") {
+                } else if let Some(k) = border_style_code(part) {
                     got_any = true;
+                    style.paint.border_style = Some([k; 4]);
                 } else if let Some(c) = parse_color_str(part) {
                     color = c;
                     got_any = true;
@@ -730,6 +878,20 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             // A styleless border draws nothing, whatever its width says.
             if matches!(value.trim(), "none" | "hidden") {
                 style.paint.border = Some([None; 4]);
+            } else if let Some(r) = parse_sides(value, border_style_code) {
+                style.paint.border_style = Some([r.top, r.right, r.bottom, r.left]);
+            }
+        }
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            let side = side_index(prop.trim_end_matches("-style"));
+            if let Some(k) = border_style_code(value) {
+                let mut bs = style.paint.border_style.unwrap_or([0; 4]);
+                bs[side] = k;
+                style.paint.border_style = Some(bs);
+            } else if matches!(value, "none" | "hidden") {
+                let mut sides = style.paint.border.unwrap_or_default();
+                sides[side] = None;
+                style.paint.border = Some(sides);
             }
         }
         "border-color" => {
@@ -1774,7 +1936,7 @@ fn apply_spec_to_node(
 /// Overlays `src`'s specified paint fields onto `dst`. ONE list, used by
 /// every cascade path — a field missing here is a declaration that parses
 /// and then never reaches the renderer.
-fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
+pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
     macro_rules! copy {
         ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
@@ -1784,8 +1946,12 @@ fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
     copy!(
         background, color, font_size, bold, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
-        mask_repeat, text_align, object_fit,
+        mask_repeat, text_align, object_fit, flex_container, border_style, radius,
+        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
+        ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
+        list_item, list_style,
     );
+    clone!(pct_math, bg_gradient, shadows);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
 }
 
@@ -2203,7 +2369,11 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
     macro_rules! take {
         ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
-    take!(display, flex_direction, width, height, padding, margin, position,
+    for i in 0..4 {
+        if src.padding[i].is_some() { dst.padding[i] = src.padding[i]; }
+        if src.margin[i].is_some() { dst.margin[i] = src.margin[i]; }
+    }
+    take!(display, flex_direction, width, height, position,
           inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_self,
           max_width, max_height, min_width, min_height, box_sizing,
           flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis);
@@ -2366,6 +2536,11 @@ const BASE_FONT_PX: f32 = 16.0;
 /// approximation, not parent-relative), %, or absolute keywords.
 pub fn parse_font_size(value: &str) -> Option<f32> {
     let v = value.trim().to_ascii_lowercase();
+    // css-values-4 math (`clamp(1.25rem, 4vw, 2.5rem)`); % is of the
+    // (approximated 16px) parent size.
+    if v.contains('(') {
+        return eval_length(&v, Some(BASE_FONT_PX));
+    }
     if let Some(px) = v.strip_suffix("px").and_then(|n| n.trim().parse::<f32>().ok()) {
         return Some(px);
     }
@@ -2625,10 +2800,89 @@ impl MathParser<'_> {
     }
 }
 
+/// `display` value -> Aether's box approximation (flex-backed).
+fn apply_display(value: &str, style: &mut SpecifiedStyle) {
+    match value {
+        "none" => style.display = Some(Display::None),
+        // Real flex containers: CSS flex semantics (see fold_into).
+        "flex" | "inline-flex" | "-webkit-box" | "-webkit-inline-box" | "-webkit-flex"
+        | "-webkit-inline-flex" | "-ms-flexbox" | "-ms-inline-flexbox" | "-moz-box" => {
+            style.display = Some(Display::Flex);
+            style.flex_container = Some(true);
+            style.paint.flex_container = Some(true);
+        }
+        // Column-flex approximations of block-ish display types.
+        "block" | "inline-block" | "inline" | "list-item"
+        | "flow-root" | "table" | "table-cell" | "table-caption" | "table-row-group"
+        | "table-header-group" | "table-footer-group" => {
+            style.display = Some(Display::Flex);
+            style.flex_container = Some(false);
+            style.paint.flex_container = Some(false);
+        }
+        "table-row" => {
+            style.display = Some(Display::Flex);
+            style.flex_container = Some(false);
+            style.flex_direction = Some(FlexDirection::Row);
+        }
+        "inherit" | "initial" | "unset" | "revert" => {}
+        other => crate::ledger::record_css(&format!("display:{}", other)),
+    }
+}
+
+/// border-style keyword -> paint code (0 solid, 1 dashed, 2 dotted,
+/// 3 double); the 3D styles paint solid in their colour.
+fn border_style_code(v: &str) -> Option<u8> {
+    match v.trim() {
+        "solid" | "groove" | "ridge" | "inset" | "outset" => Some(0),
+        "dashed" => Some(1),
+        "dotted" => Some(2),
+        "double" => Some(3),
+        _ => None,
+    }
+}
+
+/// One radius: px (>= 0) or a percentage as a negative width fraction.
+fn parse_radius(v: &str) -> Option<f32> {
+    if let Some(p) = v.trim().strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+        return Some(-(p / 100.0).max(0.0));
+    }
+    parse_px(v).map(|x| x.max(0.0))
+}
+
+/// Splits a value on whitespace outside parentheses: `calc(1rem + 2px) 4px`
+/// is two components, not four.
+pub(crate) fn split_top_level(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, None::<usize>);
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if c.is_whitespace() && depth == 0 {
+            if let Some(st) = start.take() {
+                out.push(&value[st..i]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        out.push(&value[st..]);
+    }
+    out
+}
+
+/// [top, right, bottom, left] index of a `*-top`/`*-right`/... longhand.
+fn side_index(prop: &str) -> usize {
+    if prop.ends_with("-top") { 0 } else if prop.ends_with("-right") { 1 } else if prop.ends_with("-bottom") { 2 } else { 3 }
+}
+
 /// Parses a 1-4 value box shorthand ("10px", "0 auto", "1px 2px 3px 4px")
 /// into a sides rect using CSS's top/right/bottom/left expansion.
 fn parse_sides<T: Copy>(value: &str, parse_one: impl Fn(&str) -> Option<T>) -> Option<Rect<T>> {
-    let parts: Vec<T> = value.split_whitespace().map(|p| parse_one(p)).collect::<Option<_>>()?;
+    let parts: Vec<T> = split_top_level(value).into_iter().map(|p| parse_one(p)).collect::<Option<_>>()?;
     let (t, r, b, l) = match parts.as_slice() {
         [a] => (*a, *a, *a, *a),
         [v, h] => (*v, *h, *v, *h),
