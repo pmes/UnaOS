@@ -1953,13 +1953,17 @@ mod tests {
     // Process survival: no page may kill the browser
     // -----------------------------------------------------------------------
 
-    /// boa's `RuntimeLimit` error has no opaque JS form: the moment it reaches
-    /// a promise reaction, boa's own `to_opaque` PANICS
-    /// (`new_promise_reaction_job`). That killed the whole process on roughly
-    /// two google-search loads in five. The engine must survive it: the panic
-    /// is caught at the job boundary, the context is poisoned, and the DOM
-    /// stands. The VM ceiling is squeezed here to make the trip deterministic
-    /// — a real page reaches the same code by being large.
+    /// boa's `RuntimeLimit` error has no opaque JS form. Under boa 0.21 the
+    /// moment it reached a promise reaction, boa's own `to_opaque` PANICKED
+    /// (`new_promise_reaction_job`) — that killed the whole process on roughly
+    /// two google-search loads in five, so the job boundary catches panics and
+    /// poisons the context (the guard stays: it is still the last line). boa
+    /// 0.22 (DEPS, SR31) made `into_opaque` fallible: the limit now leaves the
+    /// job as an ordinary `Err`, so the same page no longer panics at all — no
+    /// poison, the reaction chain is abandoned (`__settled` stays 0), script
+    /// keeps running, and the DOM stands. The VM ceiling is squeezed here to
+    /// make the trip deterministic — a real page reaches the same code by being
+    /// large.
     #[test]
     fn test_runtime_limit_in_promise_reaction_does_not_kill_the_process() {
         let mut engine = crate::AetherEngine::new();
@@ -1983,21 +1987,23 @@ mod tests {
         }
         assert!(!crate::js::engine_poisoned(), "not poisoned before the job runs");
 
-        // The panic happens in here. Reaching the next line at all is the test.
+        // Under boa 0.21 this panicked. Reaching the next line at all is still the test.
         engine.tick();
 
         assert!(
-            crate::js::engine_poisoned(),
-            "a caught engine panic must poison the context"
+            !crate::js::engine_poisoned(),
+            "boa 0.22 returns the runtime limit as an Err: nothing panics, nothing is poisoned"
         );
         {
             let js = engine.js_engine.as_mut().unwrap();
-            assert!(
-                js.execute("1 + 1").is_err(),
-                "a poisoned engine refuses further script instead of running it on a broken VM"
+            let settled = js.execute("window.__settled").expect("the engine still runs script");
+            assert_eq!(
+                settled.as_number(),
+                Some(0.0),
+                "the reaction that hit the limit must not fulfil the chain behind it"
             );
         }
-        // The DOM built before the panic is still intact and still renders.
+        // The DOM built before the limit tripped is still intact and still renders.
         let document = engine.document.as_ref().expect("document survives");
         assert!(
             document.select_first("#x").is_ok(),
