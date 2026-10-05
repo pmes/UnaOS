@@ -1067,7 +1067,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
         serial_println!("[dock] press at ({},{}) -> strip tiles={} raised=none", x, y, n);
         return true; // the dock's own background: consumed, raises nothing.
     };
-    let r = rows[t];
+    let r = rows[t]; crate::video::lag::launch_routed(); // GLASSLAG M1 (B370): a tile press is a launch, an open request or a raise.
     // APPPIN — a PIN tile names no row: nothing to raise, nothing to focus yet. POST a launch for the
     // app it names and consume the press; the body that owns that app's instance drains the post on
     // its next pass and mints a fresh window through the app's own mint seam (see the header). Focus
@@ -2998,7 +2998,7 @@ pub fn menu_rect() -> Option<(usize, usize, usize, usize)> {
 pub fn menu_open() -> bool { MENU_OPEN.load(Ordering::Acquire) }
 pub fn menu_close() { MENU_OPEN.store(false, Ordering::Release); }
 
-fn menu_open_at(t: usize, owner: u64) {
+fn menu_open_at(t: usize, owner: u64) { crate::video::lag::menu_opened(); // GLASSLAG M1 (B370)
     MENU_OWNER.store(owner, Ordering::Relaxed); MENU_TILE.store(t as u64, Ordering::Relaxed);
     MENU_OPEN.store(true, Ordering::Release);
     serial_println!("[dock] menu open tile={} owner={:#x} keep={}", t, owner, is_kept(owner));

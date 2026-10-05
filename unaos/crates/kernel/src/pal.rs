@@ -1324,7 +1324,7 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool)
     // age of the OLDEST un-presented input. A no-op inline shim when `rtwit` is off. This is the
     // single enqueue chokepoint (`push_event` and `push_pointer_report` both land here).
     if stored {
-        crate::rtwit::note_input_enqueued();
+        crate::rtwit::note_input_enqueued(); crate::video::lag::on_enqueue(&event); // GLASSLAG M1 (B370): the [lag] timing starts at the enqueue funnel (same-line fold).
     }
     stored
 }

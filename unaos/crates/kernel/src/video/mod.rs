@@ -1183,3 +1183,5 @@ pub mod text;
 // grid (and, owed, the rest of the theme) follows. Unconditional: fbcon arms the grid on every image; without the
 // desktop engine it answers 1.0.
 pub mod dpi;
+// GLASSLAG M1 (rmbp-ledger B370): `video::lag` — the per-event `[lag]` stage latency and the 5 s `:: LAG:` rollup.
+pub mod lag;
