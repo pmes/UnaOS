@@ -151,6 +151,7 @@ fn ring_status(e: RingError) -> i32 {
         RingError::Locked => status::LOCKED,
         RingError::BadPassword => status::BAD_PASSWORD,
         RingError::Invalid => status::INVALID,
+        RingError::Entropy => status::IO,
         RingError::Format(_) | RingError::Suite | RingError::Params | RingError::Auth => status::CORRUPT,
     }
 }
@@ -334,7 +335,7 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
         let mut seed = [0u8; 32];
         let plaintext: &[u8] = if is_key_ns {
             match data.len() {
-                0 => self.rng.fill(&mut seed),
+                0 => self.rng.fill(&mut seed).map_err(|_| status::IO)?,
                 32 => seed.copy_from_slice(data),
                 _ => return Err(status::INVALID),
             }

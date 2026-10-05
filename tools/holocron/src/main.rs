@@ -20,9 +20,9 @@
 //! `<root>/.bus.sock`. Example: `holocron put vein claude.api_key --kind api-key --label Claude`.
 
 use holocron::client::{self, Client};
-use holocron::daemon::{self, OsEntropy, Shared};
+use holocron::daemon::{self, Shared};
 use holocron::holocron_core::format;
-use holocron::holocron_core::seal::{KdfParams, Sealer};
+use holocron::holocron_core::seal::KdfParams;
 use holocron::holocron_core::service::Holocron;
 use holocron::holocron_core::wire::{self, Request, RingState, status};
 use holocron::store::{self, DirStore};
@@ -128,9 +128,10 @@ fn run_daemon(idle: Option<Duration>) -> ExitCode {
         eprintln!("holocron: this uid has no valid passwd name; refusing to serve an unnamed principal");
         return ExitCode::from(1);
     };
-    if HostSealer::SUITE == format::SUITE_TEST_INSECURE {
-        eprintln!(":: HOLOCRON: suite=TEST-INSECURE (0xFE) — NOT CRYPTOGRAPHY; build with --features crypto_core after the SR27 fold ::");
-    }
+    let Ok(rng) = holocron::host_entropy() else {
+        eprintln!("holocron: /dev/urandom cannot seed the DRBG; refusing to start");
+        return ExitCode::from(1);
+    };
     let mut ds = DirStore::new(&root);
     if let Err(e) = holocron::holocron_core::service::Store::read_ring(&mut ds) {
         eprintln!("holocron: root {} refused ({e:?})", root.display());
@@ -141,11 +142,11 @@ fn run_daemon(idle: Option<Duration>) -> ExitCode {
         let _ = std::fs::create_dir_all(&root);
         let _ = std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     }
-    let svc = Holocron::new(HostSealer::default(), HostSigner::default(), ds, OsEntropy, owner.clone(), KdfParams::DEFAULT);
+    let svc = Holocron::new(HostSealer::default(), HostSigner::default(), ds, rng, owner.clone(), KdfParams::DEFAULT);
     let sh = Shared::new(svc, idle);
     let bus = daemon::bus_socket(&root);
     let agent = daemon::agent_socket(&root);
-    eprintln!(":: HOLOCRON: owner={owner} root={} bus={} agent={} ::", root.display(), bus.display(), agent.display());
+    eprintln!(":: HOLOCRON: suite=argon2id+chacha20poly1305 owner={owner} root={} bus={} agent={} ::", root.display(), bus.display(), agent.display());
     match daemon::run(sh, &bus, Some(&agent)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

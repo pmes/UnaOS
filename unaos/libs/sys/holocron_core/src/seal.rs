@@ -91,8 +91,15 @@ pub trait Signer {
     fn verify(&self, public: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool;
 }
 
-/// A source of unpredictable bytes (host: the OS; metal: SYS_GETRANDOM / CRYPTOCORE's DRBG).
+/// The entropy source failed: nothing may be sealed or minted with what it produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntropyError;
+
+/// A source of unpredictable bytes (host and metal: CRYPTOCORE's ChaCha20 DRBG over the OS / SYS_GETRANDOM,
+/// [`crate::cc::DrbgEntropy`]). FALLIBLE: a source that cannot deliver says so, and Holocron refuses the
+/// operation (no ring created, no secret sealed, no key minted) instead of sealing under a guessable salt,
+/// nonce or seed.
 pub trait Entropy {
-    /// Fill `buf` entirely.
-    fn fill(&mut self, buf: &mut [u8]);
+    /// Fill `buf` entirely, or fail (in which case `buf`'s contents are meaningless and unused).
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), EntropyError>;
 }

@@ -5,17 +5,21 @@ edition = "2024"
 license = "LGPL-3.0-or-later"
 description = "Holocron's keyring core: the secret file format, the ring, the bus surface and the SSH-agent framing — shared by Ring 0 and Ring 3."
 
-# HOLOCRON1 (LEDGER SR33, R83): `#![no_std]` + `alloc`, NO dependencies. The cryptography is not here:
-# it arrives through the `Sealer`/`Signer` traits (src/seal.rs). Until CRYPTOCORE (SR27) folds, the only
-# implementation is the deliberately INSECURE test suite (src/testseal.rs, suite byte 0xFE, refused by the
-# production suite). The fold is ONE adapter (src/cc.rs): uncomment the dependency below and point the
-# feature at it.
-#
-#   crypto_core = { path = "../crypto_core", optional = true, default-features = false, features = ["alloc"] }
+# HOLOCRON1 (LEDGER SR33, R83): `#![no_std]` + `alloc`. The ONE dependency is CRYPTOCORE (SR27, UnaOS-built,
+# itself dependency-free): Argon2id, HKDF-SHA-256, ChaCha20-Poly1305, Ed25519 and the ChaCha20 DRBG arrive
+# through `src/cc.rs` behind the `Sealer`/`Signer`/`Entropy` traits (src/seal.rs). Zero third-party crates.
 
 [features]
 default = []
-# Fold: `crypto_core = ["dep:crypto_core"]` once the dependency line above is live.
-crypto_core = []
+# The deliberately INSECURE test suite (src/testseal.rs, suite 0xFE): unit tests and fixtures ONLY. Never
+# enabled by a binary; the production sealer refuses its files.
+test-suite = []
 
 [dependencies]
+crypto_core = { path = "../crypto_core", default-features = false, features = ["alloc"] }
+
+# The tests link the crate with its test suite on (a path self-reference, as crypto_core does), and
+# crypto_core's `std` for its /dev/urandom source.
+[dev-dependencies]
+holocron_core = { path = ".", features = ["test-suite"] }
+crypto_core = { path = "../crypto_core", features = ["std"] }

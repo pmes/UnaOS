@@ -25,19 +25,17 @@ pub mod unafs_store;
 
 pub use holocron_core;
 
-/// The sealer the host daemon runs: CRYPTOCORE with `--features crypto_core` (after SR27 folds), the
-/// INSECURE test suite otherwise — which the daemon announces on every start.
-#[cfg(feature = "crypto_core")]
+/// The sealer the host daemon runs: CRYPTOCORE's Argon2id + HKDF-SHA-256 + ChaCha20-Poly1305.
 pub type HostSealer = holocron_core::cc::CryptoCore;
-/// The signer the host daemon runs.
-#[cfg(feature = "crypto_core")]
+/// The signer the host daemon runs: CRYPTOCORE's Ed25519.
 pub type HostSigner = holocron_core::cc::CryptoCore;
-/// The sealer the host daemon runs: CRYPTOCORE with `--features crypto_core` (after SR27 folds), the
-/// INSECURE test suite otherwise — which the daemon announces on every start.
-#[cfg(not(feature = "crypto_core"))]
-pub type HostSealer = holocron_core::testseal::TestSealer;
-/// The signer the host daemon runs.
-#[cfg(not(feature = "crypto_core"))]
-pub type HostSigner = holocron_core::testseal::TestSigner;
-/// The host service: the host suite over the `~/.holocron` directory and `/dev/urandom`.
-pub type HostHolocron = holocron_core::service::Holocron<HostSealer, HostSigner, store::DirStore, daemon::OsEntropy>;
+/// The entropy the host daemon draws: CRYPTOCORE's ChaCha20 DRBG seeded from /dev/urandom; a failure
+/// refuses the operation.
+pub type HostEntropy = holocron_core::cc::DrbgEntropy<crypto_core::drbg::OsEntropy>;
+/// The host service: the production suite over the `~/.holocron` directory.
+pub type HostHolocron = holocron_core::service::Holocron<HostSealer, HostSigner, store::DirStore, HostEntropy>;
+
+/// Seed the host entropy (`Err` when /dev/urandom cannot deliver: the daemon then refuses to start).
+pub fn host_entropy() -> Result<HostEntropy, holocron_core::seal::EntropyError> {
+    holocron_core::cc::DrbgEntropy::new(crypto_core::drbg::OsEntropy, b"UnaOS Holocron host daemon")
+}

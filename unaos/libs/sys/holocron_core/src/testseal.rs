@@ -11,7 +11,7 @@
 //! [`SUITE_TEST_INSECURE`](crate::format::SUITE_TEST_INSECURE) is written into every header it seals,
 //! and the production suite refuses such a file outright.
 
-use crate::seal::{Entropy, KdfParams, NONCE_LEN, SALT_LEN, SealError, Sealer, Signer, TAG_LEN};
+use crate::seal::{Entropy, EntropyError, KdfParams, NONCE_LEN, SALT_LEN, SealError, Sealer, Signer, TAG_LEN};
 use crate::zero::{Key, wipe};
 use alloc::vec::Vec;
 
@@ -201,10 +201,11 @@ pub struct TestEntropy {
 }
 
 impl Entropy for TestEntropy {
-    fn fill(&mut self, buf: &mut [u8]) {
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), EntropyError> {
         let mut t = Toy::new(b"holocron-test/entropy");
         t.absorb(&self.counter.to_le_bytes());
         self.counter += 1;
         t.squeeze(buf);
+        Ok(())
     }
 }

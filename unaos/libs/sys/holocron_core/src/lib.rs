@@ -11,8 +11,8 @@
 //! |---|---|
 //! | [`format`] | the v1 secret file and ring file formats (fail-closed parsers, header KATs) |
 //! | [`seal`] | the `Sealer` / `Signer` / `Entropy` traits — the whole contract CRYPTOCORE must meet |
-//! | [`testseal`] | the INSECURE test suite (suite 0xFE) used until CRYPTOCORE folds |
-//! | `cc` (feature `crypto_core`) | the production adapter: Argon2id, HKDF-SHA-256, ChaCha20-Poly1305, Ed25519 |
+//! | `testseal` (feature `test-suite`) | the INSECURE test suite (suite 0xFE) — tests and fixtures only |
+//! | [`cc`] | the production suite over CRYPTOCORE: Argon2id, HKDF-SHA-256, ChaCha20-Poly1305, Ed25519, and the DRBG entropy bridge |
 //! | [`ring`] | the ring: Argon2id key from the login password, held for the session, `lock` wipes it |
 //! | [`wire`] | the bus verbs (144..=151), bodies, statuses, principal projection |
 //! | [`service`] | the dispatcher: owner-only, rate-limited unlock, the `Store` seam |
@@ -20,7 +20,7 @@
 //! | [`keysource`] | the consumer rule: ask Holocron first, fall back only on NotFound |
 //!
 //! Nothing here touches a file, a socket or a syscall; each ring brings its own [`service::Store`] and
-//! transport. No dependencies.
+//! transport. One dependency: CRYPTOCORE (UnaOS-built).
 #![no_std]
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -28,7 +28,6 @@
 extern crate alloc;
 
 pub mod agent;
-#[cfg(feature = "crypto_core")]
 pub mod cc;
 pub mod format;
 pub mod keysource;
@@ -36,6 +35,7 @@ pub mod name;
 pub mod ring;
 pub mod seal;
 pub mod service;
+#[cfg(feature = "test-suite")]
 pub mod testseal;
 pub mod wire;
 pub mod zero;

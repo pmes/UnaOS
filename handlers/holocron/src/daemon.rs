@@ -40,15 +40,17 @@ pub fn agent_socket(root: &Path) -> PathBuf {
     root.join(AGENT_SOCK)
 }
 
-/// Host entropy: `/dev/urandom` (the kernel's CSPRNG; no libc, no crate).
+/// Raw `/dev/urandom` as a Holocron [`Entropy`] (tests and tools; the daemon draws from
+/// [`crate::HostEntropy`], CRYPTOCORE's DRBG over the same source). A failed read is an error, never a
+/// panic and never a short fill.
 #[derive(Debug, Default)]
 pub struct OsEntropy;
 
 impl Entropy for OsEntropy {
-    fn fill(&mut self, buf: &mut [u8]) {
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), holocron_core::seal::EntropyError> {
         std::fs::File::open("/dev/urandom")
             .and_then(|mut f| f.read_exact(buf))
-            .expect("HOLOCRON: /dev/urandom unreadable — refusing to mint keys without entropy");
+            .map_err(|_| holocron_core::seal::EntropyError)
     }
 }
 

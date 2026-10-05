@@ -53,3 +53,5 @@ rand = "0.10"
 [dev-dependencies]
 # Isolated temp dirs for the vault DiskManager fail-closed (AMBER-GUARD) tests.
 tempfile = "3"
+# HOLOCRON1: the INSECURE test suite for the provider-slot tests' in-process Holocron (fast KDF).
+holocron_core = { path = "../../unaos/libs/sys/holocron_core", features = ["test-suite"] }

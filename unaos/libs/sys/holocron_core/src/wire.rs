@@ -64,7 +64,7 @@ pub mod status {
     pub const BAD_PASSWORD: i32 = -1;
     /// ENOENT: no such secret (the ONLY answer a consumer may fall back on).
     pub const NOT_FOUND: i32 = -2;
-    /// EIO: the store failed.
+    /// EIO: the store failed, or the entropy source did (nothing was sealed or minted).
     pub const IO: i32 = -5;
     /// EAGAIN: unlock attempts are rate-limited; retry later.
     pub const RATE_LIMITED: i32 = -11;

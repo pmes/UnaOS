@@ -4029,6 +4029,7 @@ dependencies = [
 name = "holocron"
 version = "0.1.0"
 dependencies = [
+ "crypto_core",
  "holocron_core",
  "unafs",
 ]
@@ -4043,6 +4044,10 @@ dependencies = [
 [[package]]
 name = "holocron_core"
 version = "0.1.0"
+dependencies = [
+ "crypto_core",
+ "holocron_core",
+]
 
 [[package]]
 name = "html5ever"
@@ -8791,6 +8796,7 @@ dependencies = [
  "futures",
  "gneiss_pal",
  "holocron",
+ "holocron_core",
  "log",
  "matrix",
  "principia",

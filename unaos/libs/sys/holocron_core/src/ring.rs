@@ -37,6 +37,8 @@ pub enum RingError {
     Auth,
     /// A name, kind, label or size is outside what the format allows.
     Invalid,
+    /// The entropy source failed; nothing was sealed.
+    Entropy,
 }
 
 impl From<FormatError> for RingError {
@@ -86,9 +88,9 @@ impl<S: Sealer> Ring<S> {
             return Err(RingError::Invalid);
         }
         let mut salt = [0u8; SALT_LEN];
-        rng.fill(&mut salt);
+        rng.fill(&mut salt).map_err(|_| RingError::Entropy)?;
         let mut nonce = [0u8; NONCE_LEN];
-        rng.fill(&mut nonce);
+        rng.fill(&mut nonce).map_err(|_| RingError::Entropy)?;
         let hdr = RingHeader { suite: S::SUITE, kdf: params, salt, nonce, owner: owner.into() };
         let hbytes = hdr.encode();
         let k = self.sealer.derive_key(password, &salt, &params).map_err(|_| RingError::Params)?;
@@ -155,9 +157,9 @@ impl<S: Sealer> Ring<S> {
             return Err(RingError::Invalid);
         }
         let mut salt = [0u8; SALT_LEN];
-        rng.fill(&mut salt);
+        rng.fill(&mut salt).map_err(|_| RingError::Entropy)?;
         let mut nonce = [0u8; NONCE_LEN];
-        rng.fill(&mut nonce);
+        rng.fill(&mut nonce).map_err(|_| RingError::Entropy)?;
         let sh = SecretHeader {
             suite: S::SUITE,
             kdf: hdr.kdf,

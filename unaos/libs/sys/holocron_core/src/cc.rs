@@ -1,21 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! The CRYPTOCORE adapter — the fold of SR27 into Holocron is THIS file plus one Cargo line.
-//!
-//! Compiled only with `--features crypto_core`, which on this branch has no dependency behind it
-//! (crypto_core is being written on `exec-sec-crypto`), so enabling the feature before the fold fails to
-//! build — on purpose. At the fold: uncomment the `crypto_core` dependency in this crate's Cargo.toml,
-//! make the feature `crypto_core = ["dep:crypto_core"]`, and run
-//! `cargo test -p holocron_core --features crypto_core` (the `cc_*` tests in tests/cc.rs then run the
-//! RFC 8032 §7.1 TEST 1 vector through the agent and a real Argon2id + ChaCha20-Poly1305 ring).
-//!
-//! The calls below are written against exec-sec-crypto as it stood at 66c835b7 + its in-flight
-//! `argon2.rs` (`argon2::hash(&Params, pw, salt, secret, ad, out)`, `ed25519::SigningKey::from_seed`,
-//! `ed25519::verify -> Result<(), Error>`, `chacha20poly1305::{seal, open}`, `hkdf::hkdf::<Sha256>`),
-//! and were compiled and tested against that tree from a scratch copy (HOLOCRON1.md, "the fold proof").
+//! The production suite over CRYPTOCORE (`unaos/libs/sys/crypto_core`, SR27): Argon2id (RFC 9106),
+//! HKDF-SHA-256 (RFC 5869), ChaCha20-Poly1305 (RFC 8439), Ed25519 (RFC 8032), and the entropy bridge —
+//! [`DrbgEntropy`], CRYPTOCORE's fast-key-erasure ChaCha20 DRBG over a fallible source (the OS on the
+//! host, SYS_GETRANDOM on the metal), whose failure Holocron turns into a refusal to seal.
 
-use crate::seal::{KdfParams, NONCE_LEN, SALT_LEN, SealError, Sealer, Signer};
+use crate::seal::{Entropy, EntropyError, KdfParams, NONCE_LEN, SALT_LEN, SealError, Sealer, Signer};
 use crate::zero::{Key, wipe};
 use alloc::vec::Vec;
 
@@ -68,5 +59,32 @@ impl Signer for CryptoCore {
 
     fn verify(&self, public: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
         crypto_core::ed25519::verify(public, msg, sig).is_ok()
+    }
+}
+
+/// Holocron's [`Entropy`] over CRYPTOCORE's ChaCha20 DRBG. Construction draws the seed (and fails if the
+/// source cannot deliver it); every fill after that can fail too — at a reseed whose source has died —
+/// and that failure reaches the caller as [`EntropyError`]: the ring refuses to create, a secret refuses
+/// to seal, a key refuses to mint.
+pub struct DrbgEntropy<E: crypto_core::drbg::Entropy> {
+    drbg: crypto_core::drbg::ChaChaDrbg<E>,
+}
+
+impl<E: crypto_core::drbg::Entropy> DrbgEntropy<E> {
+    /// Seed a DRBG from `source`, personalised with `personalization`.
+    pub fn new(source: E, personalization: &[u8]) -> Result<Self, EntropyError> {
+        crypto_core::drbg::ChaChaDrbg::new(source, personalization).map(|drbg| DrbgEntropy { drbg }).map_err(|_| EntropyError)
+    }
+}
+
+impl<E: crypto_core::drbg::Entropy> Entropy for DrbgEntropy<E> {
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), EntropyError> {
+        for chunk in buf.chunks_mut(crypto_core::drbg::MAX_REQUEST) {
+            if self.drbg.fill(chunk).is_err() {
+                wipe(buf);
+                return Err(EntropyError);
+            }
+        }
+        Ok(())
     }
 }

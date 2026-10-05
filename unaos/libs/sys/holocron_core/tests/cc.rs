@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! The fold tests: the production suite (CRYPTOCORE) under the ring, the service and the agent. Compiled
-//! only with `--features crypto_core` (see src/cc.rs). Run them `--release`: the ring uses the Argon2id
-//! floor (19 MiB, t=2), which a debug build takes seconds over.
-
-#![cfg(feature = "crypto_core")]
+//! The production suite (CRYPTOCORE) under the ring, the service and the agent, and the entropy bridge's
+//! refusal. The ring uses the Argon2id floor (19 MiB, t=2).
 
 use holocron_core::agent;
-use holocron_core::cc::CryptoCore;
+use holocron_core::cc::{CryptoCore, DrbgEntropy};
 use holocron_core::format::{self, Meta};
 use holocron_core::ring::{Ring, RingError};
-use holocron_core::seal::{Entropy, KdfParams, Signer};
+use holocron_core::seal::{Entropy, EntropyError, KdfParams, Signer};
 use holocron_core::service::{Holocron, MemStore};
 use holocron_core::testseal::{TestEntropy, TestSealer};
 use holocron_core::wire::{Request, status};
@@ -80,17 +77,73 @@ fn cc_agent_signs_rfc8032_test1() {
     assert_eq!(r.body, hex(T1_SIG));
 }
 
-struct Urandom;
-impl Entropy for Urandom {
-    fn fill(&mut self, buf: &mut [u8]) {
-        use std::io::Read;
-        std::fs::File::open("/dev/urandom").unwrap().read_exact(buf).unwrap();
+fn urandom() -> DrbgEntropy<crypto_core::drbg::OsEntropy> {
+    DrbgEntropy::new(crypto_core::drbg::OsEntropy, b"holocron tests").unwrap()
+}
+
+/// A CRYPTOCORE entropy source that delivers `ok` fills, then fails forever.
+struct Dies {
+    ok: u32,
+}
+impl crypto_core::drbg::Entropy for Dies {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), crypto_core::Error> {
+        if self.ok == 0 {
+            return Err(crypto_core::Error::Entropy);
+        }
+        self.ok -= 1;
+        out.fill(0x5a);
+        Ok(())
+    }
+}
+
+/// A Holocron entropy source that fails after `ok` fills.
+struct Flaky {
+    ok: u32,
+    inner: TestEntropy,
+}
+impl Entropy for Flaky {
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), EntropyError> {
+        if self.ok == 0 {
+            return Err(EntropyError);
+        }
+        self.ok -= 1;
+        self.inner.fill(buf)
     }
 }
 
 #[test]
+fn cc_entropy_failure_refuses_to_seal() {
+    // A dead source cannot even seed the DRBG: the daemon refuses to start rather than run unseeded.
+    assert!(DrbgEntropy::new(Dies { ok: 0 }, b"x").is_err());
+    // Seeded once, then the source dies: the DRBG keeps serving until its reseed interval, then the
+    // failure surfaces — it is never papered over.
+    let mut e = DrbgEntropy::new(Dies { ok: 1 }, b"x").unwrap();
+    let mut buf = [0u8; 16];
+    assert!(e.fill(&mut buf).is_ok());
+    let mut forced = 0;
+    while e.fill(&mut buf).is_ok() {
+        forced += 1;
+        assert!(forced < 2_000_000, "DRBG never reseeded");
+    }
+    // Ring creation with no entropy: refused, nothing returned.
+    let mut r = Ring::new(CryptoCore);
+    assert_eq!(r.create(OWNER, b"pw", KdfParams::FLOOR, &mut Flaky { ok: 0, inner: TestEntropy::default() }).err(), Some(RingError::Entropy));
+    assert_eq!(r.create(OWNER, b"pw", KdfParams::FLOOR, &mut Flaky { ok: 1, inner: TestEntropy::default() }).err(), Some(RingError::Entropy));
+    // Through the service: create works (2 fills), the put's salt fill fails -> EIO and the store is untouched.
+    let mut h = Holocron::new(CryptoCore, CryptoCore, MemStore::default(), Flaky { ok: 2, inner: TestEntropy::default() }, OWNER.into(), KdfParams::FLOOR);
+    let call = |h: &mut Holocron<_, _, _, _>, r: Request| h.handle(Some(OWNER), r.verb(), &r.encode_body(), 0, 0);
+    assert_eq!(call(&mut h, Request::Unlock { create: true, password: b"pw".to_vec() }).status, status::OK);
+    let put = Request::Put { ns: "vein".into(), name: "k".into(), kind: "api-key".into(), label: String::new(), data: b"sk".to_vec() };
+    assert_eq!(call(&mut h, put).status, status::IO);
+    // A minted key with no entropy: refused before any seed exists.
+    let keygen = Request::Put { ns: "ssh".into(), name: "id".into(), kind: "ssh-ed25519".into(), label: String::new(), data: vec![] };
+    assert_eq!(call(&mut h, keygen).status, status::IO);
+    assert!(h.store_mut().files.is_empty());
+}
+
+#[test]
 fn cc_ring_round_trip_and_refusals() {
-    let mut rng = Urandom;
+    let mut rng = urandom();
     let mut r = Ring::new(CryptoCore);
     let ring = r.create(OWNER, b"correct horse battery staple", KdfParams::FLOOR, &mut rng).unwrap();
     assert_eq!(ring[5], format::SUITE_ARGON2ID_CHACHA20POLY1305);
