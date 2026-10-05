@@ -72,7 +72,7 @@ fn iterator_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 }
 
 /// SetterThatIgnoresPrototypeProperties (§27.1.3.2.1.1 note).
-fn setter_ignoring_proto(vm: &mut Vm, this: &Value, home: Obj, key: PropertyKey, v: Value) -> JsResult<Value> {
+pub fn setter_ignoring_proto(vm: &mut Vm, this: &Value, home: Obj, key: PropertyKey, v: Value) -> JsResult<Value> {
     let o = match this {
         Value::Object(o) => *o,
         _ => return vm.throw_type("setter called on non-object"),

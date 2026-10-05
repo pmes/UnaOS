@@ -1147,6 +1147,8 @@ impl Parser {
 
     fn parse_class_element(&mut self, members: &mut Vec<ClassMember>, constructor: &mut Option<Rc<Function>>, derived: bool) -> PResult<()> {
         let start = self.tok.start;
+        // A method's source text starts after `static` (§15.7.1 ClassElement : static MethodDefinition).
+        let mut mstart = start;
         let mut is_static = false;
         let mut is_async = false;
         let mut is_gen = false;
@@ -1158,6 +1160,7 @@ impl Parser {
             if modifier {
                 self.advance()?;
                 is_static = true;
+                mstart = self.tok.start;
                 if self.is(P::LBrace) {
                     let f = self.parse_static_block(start)?;
                     members.push(ClassMember::StaticBlock(Rc::new(f)));
@@ -1220,7 +1223,7 @@ impl Parser {
                 }
             };
             let ns = self.new_scope_id();
-            let f = Rc::new(self.parse_function_rest(start, None, fkind, is_async, is_gen, derived && is_ctor, ns)?);
+            let f = Rc::new(self.parse_function_rest(mstart, None, fkind, is_async, is_gen, derived && is_ctor, ns)?);
             if let PropKey::Private(n) = &key {
                 let pk = match kind {
                     MethodKind::Method => PrivKind::Method,

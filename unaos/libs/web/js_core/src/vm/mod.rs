@@ -298,17 +298,31 @@ impl Vm {
     // ------------------------------------------------------------------------------------- errors
 
     pub fn make_error(&mut self, proto: Obj, msg: &str) -> Value {
-        let o = self.alloc(ObjectData::new(Some(proto), Kind::Error));
+        let trace = self.stack_trace();
+        let o = self.alloc(ObjectData::new(Some(proto), Kind::Error(trace)));
         if !msg.is_empty() {
             let m = Value::String(JsStr::from_str(msg));
             self.heap.get_mut(o).props.insert(PropertyKey::from_str("message"), Prop::data(m, WC));
         }
-        self.attach_stack(o);
         Value::Object(o)
     }
 
-    /// A best-effort `stack` string: the error message plus source offsets of the active frames.
-    pub fn attach_stack(&mut self, _o: Obj) {}
+    /// The active call stack (innermost first, at most 16 frames) as "    at name" lines.
+    pub fn stack_trace(&self) -> JsStr {
+        let mut out = String::new();
+        for f in self.frames.iter().rev().take(16) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("    at ");
+            if f.code.name.is_empty() {
+                out.push_str("<anonymous>");
+            } else {
+                out.push_str(&f.code.name.to_rust());
+            }
+        }
+        JsStr::from_str(&out)
+    }
 
     pub fn type_error(&mut self, msg: &str) -> Value {
         let p = self.intr().type_error_proto;
@@ -522,7 +536,16 @@ impl Vm {
             _ => K::Bad,
         };
         match k {
-            K::ClassCtor => self.throw_type("Class constructor cannot be invoked without 'new'"),
+            K::ClassCtor => {
+                // The TypeError is created in the constructor's realm (§10.2.1 step 2).
+                let saved = self.cur_realm;
+                if let Ok(r) = self.function_realm(fo) {
+                    self.cur_realm = r;
+                }
+                let e = self.type_error("Class constructor cannot be invoked without 'new'");
+                self.cur_realm = saved;
+                Err(e)
+            }
             K::Bad => self.throw_type("not a function"),
             K::Native(f) => {
                 let realm = match &self.heap.get(fo).kind {

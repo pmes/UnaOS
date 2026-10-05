@@ -1187,7 +1187,7 @@ impl Vm {
 
 fn own_desc_is_own_plain(vm: &Vm, o: Obj, key: &PropertyKey) -> bool {
     let d = vm.heap.get(o);
-    if !matches!(d.kind, Kind::Ordinary | Kind::Function(_) | Kind::Native(_) | Kind::Error) {
+    if !matches!(d.kind, Kind::Ordinary | Kind::Function(_) | Kind::Native(_) | Kind::Error(_)) {
         return false;
     }
     matches!(d.props.get(key), Some(p) if p.writable() && !p.is_accessor())

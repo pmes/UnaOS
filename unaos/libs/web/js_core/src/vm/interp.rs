@@ -417,15 +417,21 @@ impl Vm {
                 Op::CheckDerivedReturn => {
                     let this = self.pop();
                     let v = self.pop();
+                    // These errors arise after the callee context is removed: they belong to the caller's realm.
+                    let caller_realm = if self.frames.len() >= 2 { self.frames[self.frames.len() - 2].realm } else { self.cur_realm };
                     let r = match v {
                         Value::Object(_) => v,
                         Value::Undefined => {
                             if this.is_empty() {
+                                self.cur_realm = caller_realm;
                                 return self.throw_ref("Must call super constructor in derived class before returning");
                             }
                             this
                         }
-                        _ => return self.throw_type("Derived constructors may only return object or undefined"),
+                        _ => {
+                            self.cur_realm = caller_realm;
+                            return self.throw_type("Derived constructors may only return object or undefined");
+                        }
                     };
                     self.stack.push(r);
                 }

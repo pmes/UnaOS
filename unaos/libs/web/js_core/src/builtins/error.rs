@@ -10,6 +10,7 @@ pub fn init(vm: &mut Vm) {
     value(vm, proto, "name", Value::str("Error"), WC);
     value(vm, proto, "message", Value::str(""), WC);
     method(vm, proto, "toString", 0, to_string);
+    accessor(vm, proto, PropertyKey::from_str("stack"), "stack", Some(stack_get), Some(stack_set), C);
     let r = vm.cur_realm as usize;
     vm.realms[r].intrinsics.error_proto = proto;
     vm.realms[r].intrinsics.error_ctor = c;
@@ -98,7 +99,8 @@ fn make(vm: &mut Vm, ctx: &CallCtx, msg_idx: usize) -> JsResult<Obj> {
     let nt = if ctx.new_target.is_undefined() { Value::Object(ctx.callee) } else { ctx.new_target.clone() };
     let pf = proto_for(vm, ctx.callee);
     let proto = vm.get_prototype_from_ctor(&nt, pf)?;
-    let o = vm.alloc(ObjectData::new(Some(proto), Kind::Error));
+    let trace = vm.stack_trace();
+    let o = vm.alloc(ObjectData::new(Some(proto), Kind::Error(trace)));
     let msg = vm.arg(ctx, msg_idx);
     if !msg.is_undefined() {
         let s = vm.to_string(&msg)?;
@@ -147,4 +149,30 @@ fn to_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         return Ok(Value::String(name));
     }
     Ok(Value::String(name.concat(&JsStr::from_str(": ")).concat(&msg)))
+}
+
+/// get Error.prototype.stack: the trace of an object with [[ErrorData]], else undefined.
+fn stack_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let o = match &ctx.this {
+        Value::Object(o) => *o,
+        _ => return vm.throw_type("Error.prototype.stack getter called on non-object"),
+    };
+    match &vm.heap.get(o).kind {
+        Kind::Error(t) => Ok(Value::String(t.clone())),
+        _ => Ok(Value::Undefined),
+    }
+}
+
+/// set Error.prototype.stack: a String value becomes an own data property (SetterThatIgnoresPrototypeProperties).
+fn stack_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    if !ctx.this.is_object() {
+        return vm.throw_type("Error.prototype.stack setter called on non-object");
+    }
+    let v = vm.arg(ctx, 0);
+    if !matches!(v, Value::String(_)) {
+        return vm.throw_type("Error.prototype.stack value must be a string");
+    }
+    let home = vm.intr().error_proto;
+    let this = ctx.this.clone();
+    super::iterator::setter_ignoring_proto(vm, &this, home, PropertyKey::from_str("stack"), v)
 }

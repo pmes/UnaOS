@@ -1465,7 +1465,14 @@ impl Gen {
         let saved_hf = self.class_has_fields;
         self.class_has_fields = has_fields;
         let ctor_code = match &c.constructor {
-            Some(f) => self.compile_function(f, cname.clone()),
+            Some(f) => {
+                // A class constructor's source text is the whole class.
+                let mut code = self.compile_function(f, cname.clone());
+                if let Some(cc) = Rc::get_mut(&mut code) {
+                    cc.source = Some(SourceRef { src: self.src.clone(), start: c.span.start, end: c.span.end });
+                }
+                code
+            }
             None => self.default_ctor(c.super_class.is_some(), has_fields, cname.clone().unwrap_or_else(JsStr::empty), c.span),
         };
         self.class_has_fields = saved_hf;

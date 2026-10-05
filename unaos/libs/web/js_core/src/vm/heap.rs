@@ -346,7 +346,8 @@ pub enum Kind {
     Function(Box<FuncData>),
     Native(Box<NativeData>),
     Bound(Box<BoundData>),
-    Error,
+    /// [[ErrorData]] with the call-stack trace captured at creation.
+    Error(JsStr),
     Boolean(bool),
     Number(f64),
     String(JsStr),

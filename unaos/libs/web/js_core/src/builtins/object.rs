@@ -465,7 +465,7 @@ pub fn to_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             Kind::Arguments(_) => "Arguments",
             Kind::Function(_) | Kind::Native(_) | Kind::Bound(_) => "Function",
             Kind::Proxy(Some(p)) if p.callable => "Function",
-            Kind::Error => "Error",
+            Kind::Error(_) => "Error",
             Kind::Boolean(_) => "Boolean",
             Kind::Number(_) => "Number",
             Kind::String(_) => "String",

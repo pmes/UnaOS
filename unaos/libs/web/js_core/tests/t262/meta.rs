@@ -33,7 +33,7 @@ pub fn parse_meta(src: &str) -> Meta {
     };
     let yaml = &src[start..end];
     let mut cur_key = String::new();
-    for line in yaml.lines() {
+    for line in yaml.split(|c| c == '\n' || c == '\r') {
         let indented = line.starts_with(' ') || line.starts_with('\t');
         let t = line.trim();
         if t.is_empty() {
