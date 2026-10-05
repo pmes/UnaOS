@@ -4867,6 +4867,7 @@ dependencies = [
  "libadwaita",
  "log",
  "matrix",
+ "principia",
  "quartzite",
  "rustls",
  "serde",
