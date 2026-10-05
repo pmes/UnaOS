@@ -5,12 +5,12 @@
 //!
 //! Every user pointer goes through `AddrSpace::copy_in`/`copy_out` (software page-table walk, no kernel deref of a user VA).
 //! [`handle`] is a NON-BLOCKING try-op: `RETRY` means "would block, nothing was consumed" and `dispatch` re-runs it after a yield.
-//! Files are slurped whole at `open` for reads; writes go THROUGH the mount table, only under the session's `/home/<user>/`.
+//! Files are read through the VFS per call (SELFBUILD3; they were slurped whole at `open`); writes go THROUGH the mount table, only under the session's `/home/<user>/`.
 //! Unknown numbers answer `-ENOSYS` with a once-per-number `[linuxabi] enosys nr=` line.
 
 use super::fd::{self, Desc, FdEnt, Kind, O_APPEND, PIPE_CAP};
 use super::proc::{self, ProcInfo};
-use super::{LinuxProc, BRK_BASE, BRK_MAX, MMAP_BASE, MMAP_LIMIT, PAGE, STACK_PAGES, STACK_TOP};
+use super::LinuxProc; // SELFBUILD3: the memory syscalls (and their constants) moved to vm.rs
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -22,7 +22,6 @@ const ENOENT: i64 = 2;
 const EIO: i64 = 5;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
-const ENOMEM: i64 = 12;
 const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
@@ -44,11 +43,6 @@ const O_TRUNC: u64 = 0o1000;
 const O_DIRECTORY: u64 = 0o200000;
 const O_CLOEXEC: u64 = 0o2000000;
 const MAX_FD: usize = 256;
-const MAX_FILE: u64 = 128 << 20;
-
-fn page_up(v: u64) -> Option<u64> {
-    v.checked_add(PAGE - 1).map(|x| x & !(PAGE - 1))
-}
 
 pub fn get(p: &LinuxProc, fd: u64) -> Option<Arc<Desc>> {
     p.fds.get(fd as usize).and_then(|s| s.as_ref()).map(|e| e.d.clone())
@@ -170,16 +164,19 @@ fn list_dir(path: &str) -> Result<Vec<(String, bool)>, i64> {
     Ok(v)
 }
 
-fn load_file(path: &str) -> Result<Vec<u8>, i64> {
-    let mt = crate::shell::vfs_mount_table();
-    let st = mt.stat(path).map_err(|_| -ENOENT)?;
-    if st.size > MAX_FILE {
-        return Err(-ENOMEM);
-    }
-    if st.size == 0 {
+/// SELFBUILD3: a file's CURRENT size as the VFS reports it (every description sees the same file; 0 if it vanished).
+pub fn fsize(path: &str) -> u64 {
+    crate::shell::vfs_mount_table().stat(path).map(|s| s.size).unwrap_or(0)
+}
+
+/// SELFBUILD3: `cnt` bytes of `path` at `off` straight from the VFS (short at EOF; `Err(-EIO)` on a backend failure).
+pub fn file_read(path: &str, off: u64, cnt: usize) -> Result<Vec<u8>, i64> {
+    let size = fsize(path);
+    if off >= size || cnt == 0 {
         return Ok(Vec::new());
     }
-    mt.read(path, 0, st.size as usize).map_err(|_| -EIO)
+    let n = (cnt as u64).min(size - off) as usize;
+    crate::shell::vfs_mount_table().read(path, off, n).map_err(|_| -EIO)
 }
 
 fn do_open(p: &mut LinuxProc, dirfd: i64, path_va: u64, flags: u64, _mode: u64) -> i64 {
@@ -213,20 +210,14 @@ fn do_open(p: &mut LinuxProc, dirfd: i64, path_va: u64, flags: u64, _mode: u64) 
             if want_write && !may_write(&full) {
                 return -EACCES;
             }
-            let mut data = Vec::new();
             if flags & O_TRUNC != 0 && want_write {
                 let mt = crate::shell::vfs_mount_table();
                 let _ = mt.unlink(&full, KERNEL_PRINCIPAL);
                 if mt.create(&full, NodeKind::File, KERNEL_PRINCIPAL).is_err() {
                     return -EACCES;
                 }
-            } else {
-                data = match load_file(&full) {
-                    Ok(d) => d,
-                    Err(e) => return e,
-                };
-            }
-            install(p, Desc::new(Kind::File { path: full, data, pos: 0, read: acc != 1, write: acc != 0 }, fl), 0, cloexec)
+            } // SELFBUILD3: no slurp — read/pread/mmap go to the VFS (and the block cache under it) per call
+            install(p, Desc::new(Kind::File { path: full, pos: 0, read: acc != 1, write: acc != 0 }, fl), 0, cloexec)
         }
         Err(e) => {
             if flags & O_CREAT == 0 {
@@ -238,7 +229,7 @@ fn do_open(p: &mut LinuxProc, dirfd: i64, path_va: u64, flags: u64, _mode: u64) 
             if crate::shell::vfs_mount_table().create(&full, NodeKind::File, KERNEL_PRINCIPAL).is_err() {
                 return -EACCES;
             }
-            install(p, Desc::new(Kind::File { path: full, data: Vec::new(), pos: 0, read: acc != 1, write: acc != 0 }, fl), 0, cloexec)
+            install(p, Desc::new(Kind::File { path: full, pos: 0, read: acc != 1, write: acc != 0 }, fl), 0, cloexec)
         }
     }
 }
@@ -277,7 +268,7 @@ fn fstat(p: &LinuxProc, fd: u64, buf: u64) -> i64 {
     let Some(d) = get(p, fd) else { return -EBADF };
     let (mode, size, ino) = match &*fd::lk(&d.k) {
         Kind::Console => (0o020620u32, 0u64, 1),
-        Kind::File { data, path, .. } => (0o100644, data.len() as u64, ino_of(path)),
+        Kind::File { path, .. } => (0o100644, fsize(path), ino_of(path)),
         Kind::Dir { path, .. } => (0o040755, 0, ino_of(path)),
         Kind::PipeR(pp) | Kind::PipeW(pp) => (0o010600, fd::lk(&pp.buf).len() as u64, 2),
         Kind::Ext(x) => (super::sys3::mode(x), 0, 3), // SELFBUILD2
@@ -313,16 +304,18 @@ pub fn do_read(p: &mut LinuxProc, fd: u64, buf: u64, cnt: u64, off: Option<u64>)
                 }
                 v
             }
-            Kind::File { data, pos, read, .. } => {
+            Kind::File { path, pos, read, .. } => {
                 if !*read {
                     return -EBADF;
                 }
-                let start = (off.unwrap_or(*pos) as usize).min(data.len());
-                let n = cnt.min(data.len() - start);
+                let v = match file_read(path, off.unwrap_or(*pos), cnt) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
                 if off.is_none() {
-                    *pos += n as u64;
+                    *pos += v.len() as u64;
                 }
-                data[start..start + n].to_vec()
+                v
             }
             Kind::Dir { .. } => return -EISDIR,
             Kind::PipeR(pp) => {
@@ -372,11 +365,11 @@ pub fn write_desc(d: &Desc, v: &[u8], off: Option<u64>) -> i64 {
             console_out(&v);
             cnt as i64
         }
-        Kind::File { path, data, pos, write, .. } => {
+        Kind::File { path, pos, write, .. } => {
             if !*write {
                 return -EBADF;
             }
-            let at = if append { data.len() } else { off.unwrap_or(*pos) as usize };
+            let at = if append { fsize(path) as usize } else { off.unwrap_or(*pos) as usize };
             let mt = crate::shell::vfs_mount_table();
             let mut done = 0usize;
             while done < v.len() {
@@ -389,14 +382,7 @@ pub fn write_desc(d: &Desc, v: &[u8], off: Option<u64>) -> i64 {
             if done == 0 {
                 return -EIO;
             }
-            if data.len() < at {
-                data.resize(at, 0);
-            }
             let end = at + done;
-            if data.len() < end {
-                data.resize(end, 0);
-            }
-            data[at..end].copy_from_slice(&v[..done]);
             if off.is_none() {
                 *pos = end as u64;
             }
@@ -496,11 +482,11 @@ fn do_lseek(p: &mut LinuxProc, fd: u64, off: i64, whence: u64) -> i64 {
                 -EINVAL
             }
         }
-        Kind::File { data, pos, .. } => {
+        Kind::File { path, pos, .. } => {
             let base = match whence {
                 0 => 0i64,
                 1 => *pos as i64,
-                2 => data.len() as i64,
+                2 => fsize(path) as i64,
                 _ => return -EINVAL,
             };
             match base.checked_add(off) {
@@ -771,142 +757,6 @@ fn rlimit(res: u64) -> [u8; 16] {
     o
 }
 
-fn mmap(p: &mut LinuxProc, addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i64 {
-    if len == 0 {
-        return -EINVAL;
-    }
-    let Some(len) = page_up(len) else { return -ENOMEM };
-    let (w, x) = (prot & 2 != 0, prot & 4 != 0);
-    if w && x {
-        return -EACCES; // W^X
-    }
-    let anon = flags & 0x20 != 0;
-    if !anon && (flags & 3 == 1) && w {
-        return -EACCES; // shared writable file mapping: no write-back in rung 1
-    }
-    let stack_lo = STACK_TOP - STACK_PAGES * PAGE;
-    let base = if flags & 0x10 != 0 {
-        if addr & (PAGE - 1) != 0 || addr < MMAP_BASE || addr.checked_add(len).map_or(true, |e| e > stack_lo) {
-            return -ENOMEM;
-        }
-        let mut a = addr;
-        while a < addr + len {
-            p.asp.unmap(a);
-            a += PAGE;
-        }
-        addr
-    } else {
-        let b = p.mmap_next;
-        if b.checked_add(len).map_or(true, |e| e > MMAP_LIMIT) {
-            return -ENOMEM;
-        }
-        p.mmap_next = b + len;
-        b
-    };
-    let mut done = 0u64;
-    while done < len {
-        if !p.asp.map_new(base + done, w, x) {
-            let mut a = base;
-            while a < base + done {
-                p.asp.unmap(a);
-                a += PAGE;
-            }
-            return -ENOMEM;
-        }
-        done += PAGE;
-    }
-    if !anon {
-        if off & (PAGE - 1) != 0 {
-            return -EINVAL;
-        }
-        // Copy while still writable-by-kernel (`force`); the PTE perms are what ring 3 sees.
-        let Some(d) = get(p, fd) else { return -EBADF };
-        let chunk: Vec<u8> = match &*fd::lk(&d.k) {
-            Kind::File { data, .. } => {
-                let start = (off as usize).min(data.len());
-                let end = (start + len as usize).min(data.len());
-                data[start..end].to_vec()
-            }
-            _ => return -EBADF,
-        };
-        if !p.asp.copy_out(base, &chunk, true) {
-            return -EFAULT;
-        }
-    }
-    flush();
-    base as i64
-}
-
-fn munmap(p: &mut LinuxProc, addr: u64, len: u64) -> i64 {
-    if addr & (PAGE - 1) != 0 || len == 0 {
-        return -EINVAL;
-    }
-    let Some(len) = page_up(len) else { return -EINVAL };
-    let mut a = addr;
-    while a < addr.saturating_add(len) {
-        p.asp.unmap(a);
-        a += PAGE;
-    }
-    flush();
-    0
-}
-
-fn mprotect(p: &mut LinuxProc, addr: u64, len: u64, prot: u64) -> i64 {
-    if addr & (PAGE - 1) != 0 {
-        return -EINVAL;
-    }
-    let Some(len) = page_up(len) else { return -ENOMEM };
-    let (w, x) = (prot & 2 != 0, prot & 4 != 0);
-    if w && x {
-        return -EACCES;
-    }
-    let mut a = addr;
-    while a < addr.saturating_add(len) {
-        if !p.asp.is_mapped(a) {
-            return -ENOMEM;
-        }
-        a += PAGE;
-    }
-    let mut a = addr;
-    while a < addr + len {
-        p.asp.set_perms(a, w, x);
-        a += PAGE;
-    }
-    flush();
-    0
-}
-
-fn brk(p: &mut LinuxProc, want: u64) -> i64 {
-    if want < BRK_BASE || want > BRK_BASE + BRK_MAX {
-        return p.brk as i64;
-    }
-    let Some(end) = page_up(want) else { return p.brk as i64 };
-    while p.brk_mapped < end {
-        if !p.asp.map_new(p.brk_mapped, true, false) {
-            return p.brk as i64;
-        }
-        p.brk_mapped += PAGE;
-    }
-    if want < p.brk {
-        // Linux hands back zeroes when the heap regrows: scrub what was given up.
-        let zero = [0u8; 4096];
-        let mut a = want;
-        while a < p.brk {
-            let n = ((PAGE - (a & (PAGE - 1))).min(p.brk - a)) as usize;
-            p.asp.copy_out(a, &zero[..n], true);
-            a += n as u64;
-        }
-    }
-    p.brk = want;
-    want as i64
-}
-
-/// Local TLB flush after live PTE edits. The task is pinned to this core, so a reload of the current
-/// CR3 is the whole shoot-down.
-fn flush() {
-    unsafe { super::memory::load_cr3(super::memory::current_cr3()) };
-}
-
 fn now_ts(p: &LinuxProc, buf: u64) -> i64 {
     let ms = crate::arch::ms();
     let mut t = [0u8; 16];
@@ -955,10 +805,12 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
             do_poll(p, a[0], a[1], t)
         }
         8 => do_lseek(p, a[0], a[1] as i64, a[2]),
-        9 => mmap(p, a[0], a[1], a[2], a[3], a[4], a[5]),
-        10 => mprotect(p, a[0], a[1], a[2]),
-        11 => munmap(p, a[0], a[1]),
-        12 => brk(p, a[0]),
+        9 => super::vm::mmap(p, a[0], a[1], a[2], a[3], a[4], a[5]), // SELFBUILD3: lazy VMAs (vm.rs)
+        10 => super::vm::mprotect(p, a[0], a[1], a[2]),
+        11 => super::vm::munmap(p, a[0], a[1]),
+        12 => super::vm::brk(p, a[0]),
+        26 => super::vm::msync(p, a[0], a[1], a[2]),
+        27 => super::vm::mincore(p, a[0], a[1], a[2]),
         13 => super::signal::sigaction(p, info, a), // SELFBUILD2: a per-process handler table (SELFBUILD1 accepted, never delivered)
         14 => super::signal::sigprocmask(p, info, a), // SELFBUILD2: a real blocked mask
         16 => {
@@ -987,7 +839,7 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
         22 => do_pipe(p, a[0], 0),
         293 => do_pipe(p, a[0], a[1]),
         24 => 0, // sched_yield
-        28 => 0, // madvise
+        28 => super::vm::madvise(p, a[0], a[1], a[2]), // SELFBUILD3: DONTNEED/FREE drop pages
         32 => do_dup(p, a[0], None, false),
         33 => {
             if a[0] == a[1] {
@@ -1088,10 +940,9 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
         99 => {
             let mut s = [0u8; 112];
             s[0..8].copy_from_slice(&((crate::arch::ms() / 1000) as i64).to_le_bytes());
-            let total = (super::MAX_PAGES as u64) * PAGE;
+            let (total, free) = super::vm::sysinfo_bytes(p.asp.pages()); // SELFBUILD3: the resident budget
             s[32..40].copy_from_slice(&total.to_le_bytes());
-            let used = (p.asp.pages() as u64) * PAGE;
-            s[40..48].copy_from_slice(&total.saturating_sub(used).to_le_bytes());
+            s[40..48].copy_from_slice(&free.to_le_bytes());
             s[80..82].copy_from_slice(&(proc::live_count() as u16).to_le_bytes());
             s[104..108].copy_from_slice(&1u32.to_le_bytes());
             if p.asp.copy_out(a[0], &s, false) { 0 } else { -EFAULT }

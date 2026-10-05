@@ -497,6 +497,13 @@ extern "x86-interrupt" fn page_fault_handler(
         // Ring-3 #PF: restore per-CPU GS, then kill the offending task (never returns).
         unsafe {
             core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            // SELFBUILD3 (B353): a Linux task's lazy page (anonymous zero-fill or a file page through the VFS) is backed here
+            // and the instruction re-executed; GS goes back to the user's before the iretq.
+            #[cfg(feature = "linuxabi")]
+            if crate::arch::linuxabi::vm::fault(cr2, error_code.bits()) {
+                core::arch::asm!("swapgs", options(nostack, preserves_flags));
+                return;
+            }
             ring3_fault_kill(
                 VEC_PF,
                 error_code.bits(),
