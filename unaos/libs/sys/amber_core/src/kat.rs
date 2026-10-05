@@ -159,6 +159,31 @@ pub fn run() -> Result<u32, &'static str> {
     check!(n, fat32::Layout::for_sectors(60_000).is_err(), "fat32: sub-FAT32 refused");
     check!(n, fat32::blank_region_sectors(1_048_576) == Ok(16_290), "fat32: blank region");
 
+    // AHCIROOT (B332): the one reader — the golden table read back through `read_table_with` from a
+    // sector source assembled out of the image's own writes, and the LBA-0 classifier.
+    let total = plan.disk_sectors;
+    let w = img.writes();
+    let rd = |lba: u64, buf: &mut [u8]| -> bool {
+        for (at, bytes) in w.iter() {
+            let secs = (bytes.len() / gpt::SECTOR) as u64;
+            if lba >= *at && lba + (buf.len() / gpt::SECTOR) as u64 <= at + secs {
+                let o = ((lba - at) as usize) * gpt::SECTOR;
+                buf.copy_from_slice(&bytes[o..o + buf.len()]);
+                return true;
+            }
+        }
+        false
+    };
+    let t = gpt::read_table_with(total, rd);
+    check!(n, t.as_ref().map(|t| t.entries.len() == 2 && t.entries[1].1.first_lba == 264_192).unwrap_or(false), "reader: golden table read back");
+    check!(n, matches!(gpt::read_table_with(total, |_, _| false), Err(gpt::GptError::Io)), "reader: a failed read is Io, not a table");
+    check!(n, gpt::has_signature(&img.primary) && !gpt::has_signature(&img.mbr), "reader: header signature");
+    check!(n, gpt::classify_sector0(&img.mbr) == gpt::Sector0::Protective && gpt::protective_slot(&img.mbr) == Some(0), "reader: protective MBR classified");
+    let mut sf = [0u8; gpt::SECTOR];
+    sf[510] = 0x55;
+    sf[511] = 0xAA;
+    check!(n, gpt::classify_sector0(&sf) == gpt::Sector0::None, "reader: a superfloppy is no table");
+
     Ok(n)
 }
 
@@ -167,7 +192,7 @@ mod tests {
     #[test]
     fn kat_passes() {
         let n = super::run().unwrap();
-        assert_eq!(n, 39, "check count moved: {n}");
+        assert_eq!(n, 44, "check count moved: {n}");
     }
 
     #[test]

@@ -49,3 +49,15 @@ pub fn service_tick() {
         offset_ms
     );
 }
+
+/// NETCLOCK (B335): polls of the smolnet interface, counted at this arch-neutral seam (`smolnet::poll_now`
+/// and the ICMP pump add; the usbnet census line and `tests netclock` read).
+static POLLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// One `iface.poll`.
+pub fn note_poll() {
+    POLLS.fetch_add(1, Ordering::Relaxed);
+}
+/// Polls so far this boot.
+pub fn polls() -> u64 {
+    POLLS.load(Ordering::Relaxed)
+}

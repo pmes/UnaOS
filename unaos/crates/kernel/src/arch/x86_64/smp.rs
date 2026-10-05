@@ -907,3 +907,14 @@ fn verify_smp(online_aps: &[usize]) {
         );
     }
 }
+
+/// PROFILE2 (rmbp-ledger B340, M1): `[base, top)` of AP `cpu`'s static boot stack (the stack its
+/// scheduler / idle context runs on outside a task), or `None` for the BSP (it keeps its UEFI stack) and
+/// out-of-range indices. Address arithmetic only — the array is never read here.
+pub fn ap_stack_bounds(cpu: usize) -> Option<(u64, u64)> {
+    if cpu == 0 || cpu >= gdt::MAX_CPUS {
+        return None;
+    }
+    let base = unsafe { &raw const AP_STACKS[cpu] } as u64;
+    Some((base, base + AP_STACK_SIZE as u64))
+}

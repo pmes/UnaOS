@@ -36,7 +36,13 @@ pub mod elf;
 pub mod fd;
 pub mod fpu;
 pub mod proc;
+pub mod selfbuild;
+pub mod selfbuild2;
+pub mod signal;
 pub mod sys;
+pub mod sys2;
+pub mod sys3;
+pub mod thread;
 
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -414,6 +420,8 @@ pub struct LinuxProc {
     pub umask: u32,
     /// nanosleep/poll deadline (ms) while a RETRY loop is waiting.
     pub sleep_until: Option<u64>,
+    /// SELFBUILD1: the image path as the VFS resolved it — what `readlink("/proc/self/exe")` answers.
+    pub exe: String,
 }
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -470,6 +478,7 @@ pub fn on_dispatch(cr3: u64) {
     if !ACTIVE.load(Ordering::Acquire) {
         return;
     }
+    let cr3 = thread::key_for(cr3); // SELFBUILD2: a thread's FS_BASE lives under its thread key
     for (k, v) in FS_TAB.iter() {
         if k.load(Ordering::Acquire) == cr3 {
             let fs = v.load(Ordering::Acquire);
@@ -484,17 +493,23 @@ pub fn on_dispatch(cr3: u64) {
 }
 
 // ---- fork child register files, keyed by the child's PML4 ----
-static FORK_REGS: spin::Mutex<Vec<(u64, [u64; 6])>> = spin::Mutex::new(Vec::new());
+/// SELFBUILD2: 12 registers — rbx rbp r12-r15, then rdi rsi rdx r10 r8 r9 (a thread gets its creator's; a fork child zeros).
+static FORK_REGS: spin::Mutex<Vec<(u64, [u64; 12])>> = spin::Mutex::new(Vec::new());
 
-pub fn push_fork_regs(cr3: u64, r: [u64; 6]) {
-    x86_64::instructions::interrupts::without_interrupts(|| FORK_REGS.lock().push((cr3, r)));
+pub fn push_fork_regs(key: u64, r: &[u64]) {
+    let mut a = [0u64; 12];
+    for (d, s) in a.iter_mut().zip(r.iter()) {
+        *d = *s;
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| FORK_REGS.lock().push((key, a)));
 }
 
 /// Called by `user_task_trampoline` (IF masked) for every first ring-3 entry: `Some` only for a fork child.
-pub fn take_fork_regs(cr3: u64) -> Option<[u64; 6]> {
+pub fn take_fork_regs(cr3: u64) -> Option<[u64; 12]> {
     if cr3 == 0 {
         return None;
     }
+    let cr3 = thread::key_for(cr3); // SELFBUILD2: a new thread's registers are queued under its thread key
     let mut g = FORK_REGS.lock();
     let i = g.iter().position(|(c, _)| *c == cr3)?;
     Some(g.swap_remove(i).1)
@@ -535,6 +550,7 @@ pub fn note_fault(vec: u8, _err: u64, cr2: u64) {
             FAULT.store(vec as u64 + 1, Ordering::Release);
         }
         i.finish(11);
+        thread::fault_current(&i); // SELFBUILD2: a fault takes the whole thread group
     }
 }
 
@@ -548,18 +564,33 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         if traced {
             serial_println!("[linux] sys={} {} pid={} a0={:#x} -> (exit)", nr, sys_name(nr), info.pid, a0);
         }
+        thread::on_exit(&info, nr == 231); // SELFBUILD2: a thread's `exit` ends only that task (never returns then)
         proc::exit_current(&info, a0, nr == 231); // never returns
     }
     let args = [a0, a1, a2, a3, a4, a5];
     let lp = info.lp.clone();
     let mut blocked = false;
+    let me = thread::cur(&info); // SELFBUILD2: None for a process without threads
     let rc = loop {
         let rc = {
             let mut p = fd::lk(&lp);
-            sys::handle(&mut p, &info, ktop, nr, args)
+            thread::sleep_in(&me, &mut p);
+            let r = sys::handle(&mut p, &info, ktop, nr, args);
+            thread::sleep_out(&me, &mut p);
+            r
         };
         if rc != sys::RETRY {
             break rc;
+        }
+        if signal::interrupts(&info, nr) {
+            // SELFBUILD2 M3: a caught signal ends the blocking syscall (no SA_RESTART); the handler runs on the way out.
+            thread::cancel_wait();
+            {
+                let mut p = fd::lk(&lp);
+                p.sleep_until = None;
+                thread::sleep_out(&me, &mut p);
+            }
+            break signal::eintr();
         }
         if !blocked {
             // LINUXABI3 M5: name every syscall that BLOCKS (always, not capped), and publish it so a timeout can say which.
@@ -577,6 +608,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
     if blocked {
         let _ = BLOCKED.compare_exchange(nr + 1, 0, Ordering::AcqRel, Ordering::Acquire);
     }
+    let rc = signal::deliver(&info, ktop, args, rc); // SELFBUILD2 M3: a pending caught signal enters its handler here
     if traced || blocked {
         serial_println!("[linux] sys={} {} pid={} a0={:#x} a1={:#x} a2={:#x} -> {}", nr, sys_name(nr), info.pid, a0, a1, a2, rc);
     }
@@ -607,6 +639,10 @@ pub fn sys_name(nr: u64) -> &'static str {
         218 => "set_tid_address", 228 => "clock_gettime", 230 => "clock_nanosleep", 231 => "exit_group",
         234 => "tgkill", 247 => "waitid", 257 => "openat", 262 => "newfstatat", 267 => "readlinkat", 269 => "faccessat",
         273 => "set_robust_list", 293 => "pipe2", 302 => "prlimit64", 318 => "getrandom", 332 => "statx", 334 => "rseq",
+        131 => "sigaltstack", 157 => "prctl", 204 => "sched_getaffinity", 292 => "dup3", 52 => "getpeername", 435 => "clone3", // SELFBUILD1
+        34 => "pause", 40 => "sendfile", 44 => "sendto", 45 => "recvfrom", 53 => "socketpair", 73 => "flock", 76 => "truncate",
+        77 => "ftruncate", 130 => "rt_sigsuspend", 232 => "epoll_wait", 233 => "epoll_ctl", 281 => "epoll_pwait", 285 => "fallocate",
+        284 => "eventfd", 290 => "eventfd2", 291 => "epoll_create1", 213 => "epoll_create", // SELFBUILD2
         _ => "?",
     }
 }
@@ -792,6 +828,7 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
         cwd,
         umask: 0o022,
         sleep_until: None,
+        exe: full.clone(),
     });
     let pml4 = root.pml4;
     proc::register(root.clone());
@@ -845,6 +882,9 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
             }
         }
     }
+    if !thread::wait_all(kd) {
+        safe_to_free = false; // SELFBUILD2: a thread task still on the tables
+    }
     let ms = crate::arch::ms().saturating_sub(t0);
     drain_out(&mut pend, out, true);
     let fault = FAULT.load(Ordering::Acquire);
@@ -870,6 +910,7 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
             } // else: leak the space rather than free tables a still-live task may be running on
             fs_tab_clear(i.pml4);
             fpu::release_slot(i.pml4); // LINUXABI3
+            thread::release_all(i.pid, i.pml4); // SELFBUILD2: thread keys, waiters, signal state
         }
     }
     proc::reset_session();
@@ -930,6 +971,7 @@ pub fn selftest() {
         }
         Err(e) => serial_println!(":: LINUXABI: path={} exit=? syscalls=0 enosys=[] ms=0 -> FAIL ({}) ::", P, e),
     }
+    selfbuild::kat(); // SELFBUILD1 M2: the syscall known-answer tests (second witness, `:: LINUXABI-KAT:`)
 }
 
 /// `tests linuxabi2` — `PIPE.LNX` (fork + pipe + wait4) and `LS.LNX` (stdin line + getdents64 over `/`).
@@ -1056,4 +1098,9 @@ pub fn selftest3() {
         busybox,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+/// SELFBUILD2: the FS_BASE recorded for thread key `key` (`None` = no entry).
+pub fn fs_tab_get(key: u64) -> Option<u64> {
+    FS_TAB.iter().find(|(k, _)| k.load(Ordering::Acquire) == key).map(|(_, v)| v.load(Ordering::Acquire))
 }

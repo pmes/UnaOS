@@ -36,6 +36,10 @@ pub enum Verdict {
     Ours,
     /// Anything else — somebody's OS, an unreadable table over data, a foreign volume. Carries what was seen.
     Stranger(String),
+    /// AHCIROOT (B332): a Stranger the OPERATOR cleared by typing the confirmation token the refusal
+    /// printed (`--erase-stranger ERASE-<port>-<sectors>`). Carries what was seen, for the wire.
+    #[cfg(feature = "ahciroot")]
+    Confirmed(String),
 }
 
 impl Verdict {
@@ -44,6 +48,8 @@ impl Verdict {
             Verdict::Blank => "blank",
             Verdict::Ours => "ours",
             Verdict::Stranger(_) => "stranger",
+            #[cfg(feature = "ahciroot")]
+            Verdict::Confirmed(_) => "confirmed",
         }
     }
     pub fn writable(&self) -> bool {
@@ -300,18 +306,53 @@ fn fail(out: &mut dyn FnMut(&str), why: &str) {
 /// M2: `install ssd --write`.
 #[cfg(feature = "ahci-write")]
 pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
-    let Some((port, sel)) = first_ahci() else {
-        out("install ssd: no AHCI disk registered");
-        return;
+    write_ssd_confirmed(out, force, None)
+}
+
+/// AHCIROOT (B332): `install ssd --write [--force] [--erase-stranger <token>]` — `confirm` is the token
+/// the operator typed; it clears a Stranger verdict only when it equals [`stranger_token`] for THIS disk.
+#[cfg(feature = "ahci-write")]
+pub fn write_ssd_confirmed(out: &mut dyn FnMut(&str), force: bool, _confirm: Option<&str>) {
+    let _ = write_ssd_inner(out, force, _confirm, None);
+}
+
+/// The one body behind `install ssd --write` (glass = `None`) and the installer window's confirm screen
+/// (INSTALL3, B342: glass = `Some`, naming the operator's disk, layout and dry-run choice and receiving
+/// the stage lines). Every refusal, the grant and the write are this function's for both callers.
+#[cfg(feature = "ahci-write")]
+fn write_ssd_inner(out: &mut dyn FnMut(&str), force: bool, _confirm: Option<&str>, mut glass: Option<Glass<'_>>) -> GlassOutcome {
+    let (gport, glayout, dry) = match &glass {
+        Some(g) => (Some(g.port), g.layout, g.dry_run),
+        None => (None, None, false),
     };
-    let p = match probe(sel, port) {
+    let mut stage = |name: &str, what: &str| {
+        serial_println!("[install] stage={} {}", name, what);
+        if let Some(g) = glass.as_mut() {
+            (g.stage)(name, what);
+        }
+    };
+    let oc = |grant: bool, pass: bool, why: &str| GlassOutcome { grant, pass, reason: String::from(why) };
+    let target = match gport {
+        Some(gp) => block::ahci_info_port(gp).map(|i| (gp, i.id(BlockHandle::Ahci { port: gp }))),
+        None => first_ahci(),
+    };
+    let Some((port, sel)) = target else {
+        out("install ssd: no AHCI disk registered");
+        stage("probe", "refused (no AHCI disk on that port)");
+        return oc(false, false, "no AHCI disk on that port");
+    };
+    #[cfg_attr(not(feature = "ahciroot"), allow(unused_mut))] let mut p = match probe(sel, port) {
         Ok(p) => p,
         Err(e) => {
             serial_println!("[install] target=ahci:{} probe err={:?} — nothing written", port, e);
             out("install ssd --write: cannot read the disk; nothing written");
-            return;
+            stage("probe", "refused (the disk cannot be read)");
+            return oc(false, false, "the disk cannot be read");
         }
     };
+    stage("probe", &alloc::format!("ok ahci:{} verdict={}", port, p.verdict.tag()));
+    #[cfg(feature = "ahciroot")] if let Some((gp, _, _, crate::drivers::block::GrantKind::Root)) = block::ahci_live_grant() { serial_println!("[install] REFUSED target=ahci:{} reason=ssd-is-live-root (port {} holds the boot's root grant) — nothing written ::", port, gp); out("install ssd --write: REFUSED — the SSD's UnaFS is the running root; boot without it to reinstall. Nothing was written."); stage("guard", "refused (the SSD is the running root)"); return oc(false, false, "the SSD's UnaFS is the running root"); } // AHCIROOT (B332)
+    #[cfg(feature = "ahciroot")] if let (Verdict::Stranger(why), Some(tok)) = (&p.verdict, _confirm) { if tok == stranger_token(port, p.sectors).as_str() { serial_println!("[install] target=ahci:{} verdict=stranger CONFIRMED by the operator token — the disk will be erased (R25: the operator's word, typed)", port); p.verdict = Verdict::Confirmed(why.clone()); } } // AHCIROOT (B332)
     serial_println!(
         "[install] target=ahci:{} model={} sectors={} gpt={} verdict={} saw={}",
         p.port, p.model, p.sectors, p.gpt, p.verdict.tag(), p.saw
@@ -320,25 +361,64 @@ pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
         // R20: no destructive work on a disk that is not ours.
         serial_println!("[install] REFUSED target=ahci:{} verdict=stranger saw: {} — nothing was written (R20) ::", port, why);
         out(&alloc::format!("install ssd --write: REFUSED — this disk is not ours ({}). Nothing was written.", why));
-        return;
+        #[cfg(feature = "ahciroot")] out(&alloc::format!("  to ERASE it anyway (everything on it is lost): install ssd --write --erase-stranger {}", stranger_token(port, p.sectors))); // AHCIROOT (B332): the glass asks; the operator types
+        stage("guard", "refused (not ours, and not confirmed)");
+        return oc(false, false, "the disk is not ours and the erase was not confirmed");
     }
     // SELFINSTALL2: the boot disk itself is refused here by name (selfguard), before the grant's own
     // refusal one step later, and an existing UnaFS volume is not overwritten without `--force`.
     if super::selfguard::refuses(sel) {
         serial_println!("[install] REFUSED target=ahci:{} reason=boot-device (selfguard) — nothing written ::", port);
         out("install ssd --write: REFUSED — this disk is the one the system booted from. Nothing was written.");
-        return;
+        stage("guard", "refused (the boot disk)");
+        return oc(false, false, "the disk is the one the system booted from");
     }
     if p.unafs_present && !force {
         serial_println!("[install] REFUSED target=ahci:{} reason=unafs-present (a UnaFS volume is already on the target; --force replaces it) — nothing written ::", port);
         out("install ssd --write: REFUSED — the SSD already carries a UnaFS volume; `install ssd --write --force` replaces it. Nothing was written.");
-        return;
+        stage("guard", "refused (a UnaFS volume is present; --force)");
+        return oc(false, false, "a UnaFS volume is present");
+    }
+    stage("guard", &alloc::format!("ok verdict={}", p.verdict.tag()));
+    #[cfg(feature = "unafs")] let unafs_src = super::unafsmirror::source().filter(|s| !s.is_ahci()); #[cfg(not(feature = "unafs"))] let unafs_src: Option<()> = None;
+    #[cfg(feature = "unafs")] let unafs_sectors = unafs_src.map(|s| s.sectors()); #[cfg(not(feature = "unafs"))] let unafs_sectors: Option<u64> = None;
+    let plan_for = |sectors: u64| match glayout {
+        Some((esp, ufs)) => ssd_plan_layout(sectors, esp, ufs, unafs_sectors),
+        None => ssd_plan(sectors, unafs_sectors),
+    };
+    if dry {
+        // INSTALL3 (B342): the glass's DRY RUN — the judgment above ran in full, the grant is minted from
+        // the verdict exactly as below and dropped unheld; no stage past this one touches the disk.
+        if AhciDisk::new_quiet(sel, &p.verdict).is_err() {
+            stage("grant", "refused (boot device, or the disk is too small)");
+            return oc(false, false, "the write grant was refused");
+        }
+        stage("grant", "issued (dry run: minted, never held)");
+        match plan_for(p.sectors) {
+            Ok(pl) => {
+                for line in pl.lines() {
+                    serial_println!("[install] {}", line);
+                }
+                witness(&pl, 0, "skip", "DRY");
+            }
+            Err(e) => {
+                stage("gpt", &alloc::format!("fail (plan: {})", e));
+                return oc(true, false, "the SSD is too small for the plan");
+            }
+        }
+        for s in ["snapshot", "gpt", "esp", "unafs", "fsck", "grow"] {
+            stage(s, "dry (not run)");
+        }
+        stage("done", "dry run — nothing written");
+        return oc(true, true, "dry run — nothing written");
     }
     let t0 = crate::arch::ticks();
     // Source: the running card's volume, buffered whole BEFORE any destructive write.
-    let Some(src_id) = running_source() else { return fail(out, "running volume not found") };
+    let Some(src_id) = running_source() else { fail(out, "running volume not found"); stage("snapshot", "fail (running volume not found)"); return oc(false, false, "running volume not found") };
     if source_is_ahci(src_id) {
-        return fail(out, "already running from the SSD; boot the card to clone");
+        fail(out, "already running from the SSD; boot the card to clone");
+        stage("snapshot", "fail (already running from the SSD)");
+        return oc(false, false, "already running from the SSD");
     }
     let tree = match fat::mount_source(src_id)
         .map_err(|_| InstallError::Io)
@@ -347,29 +427,38 @@ pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
         Ok(t) => t,
         Err(e) => {
             serial_println!("[install] snapshot of {} failed err={:?}", src_id.name(), e);
-            return fail(out, "snapshot of the card volume failed");
+            fail(out, "snapshot of the card volume failed");
+            stage("snapshot", "fail");
+            return oc(false, false, "snapshot of the card volume failed");
         }
     };
     if !tree_has_boot_files(&tree) {
-        return fail(out, "the card volume lacks EFI/BOOT/BOOTX64.EFI or kernel.elf; not a bootable UnaOS volume");
+        fail(out, "the card volume lacks EFI/BOOT/BOOTX64.EFI or kernel.elf; not a bootable UnaOS volume");
+        stage("snapshot", "fail (not a bootable UnaOS volume)");
+        return oc(false, false, "the card volume is not bootable");
     }
     serial_println!("[install] snapshot src={} files={} bytes={}", src_id.name(), tree.file_count, tree.total_bytes);
+    stage("snapshot", &alloc::format!("ok files={} bytes={}", tree.file_count, tree.total_bytes));
     let mut disk = match AhciDisk::new(sel, &p.verdict) {
         Ok(d) => d,
         Err(e) => {
             serial_println!("[install] write grant refused err={:?} (boot-device or too small) — nothing written", e);
-            return fail(out, "write grant refused (boot device, or disk too small)");
+            fail(out, "write grant refused (boot device, or disk too small)");
+            stage("grant", "refused");
+            return oc(false, false, "the write grant was refused");
         }
     };
+    #[cfg(feature = "ahciroot")] let _hold = match block::hold_ahci_grant(disk.grant, block::GrantKind::Install) { Some(h) => h, None => { fail(out, "the SATA write grant slot is held (the SSD is the live root, or a test holds it)"); stage("grant", "refused (the grant slot is held)"); return oc(false, false, "the grant slot is held") } }; // AHCIROOT (B332) M1: the kernel-held grant, dropped (and the drive flushed) when this verb returns
+    stage("grant", "issued (held for this install)");
     // SELFINSTALL2: the table comes from the shared core's Plan — ESP + (when the running system has
     // one) a UnaFS partition the size of the running volume.
-    #[cfg(feature = "unafs")] let unafs_src = super::unafsmirror::source().filter(|s| !s.is_ahci()); #[cfg(not(feature = "unafs"))] let unafs_src: Option<()> = None;
-    #[cfg(feature = "unafs")] let unafs_sectors = unafs_src.map(|s| s.sectors()); #[cfg(not(feature = "unafs"))] let unafs_sectors: Option<u64> = None;
-    let plan = match ssd_plan(p.sectors, unafs_sectors) {
+    let plan = match plan_for(p.sectors) {
         Ok(pl) => pl,
         Err(e) => {
             serial_println!("[install] plan refused: {}", e);
-            return fail(out, "the SSD is too small for the plan");
+            fail(out, "the SSD is too small for the plan");
+            stage("gpt", "fail (the SSD is too small for the plan)");
+            return oc(true, false, "the SSD is too small for the plan");
         }
     };
     for line in plan.lines() {
@@ -377,7 +466,9 @@ pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
     }
     if let Err(e) = super::gpt::write_plan(&mut disk, &plan) {
         serial_println!("[install] GPT write failed err={:?}", e);
-        return fail(out, "GPT write/verify failed");
+        fail(out, "GPT write/verify failed");
+        stage("gpt", "fail");
+        return oc(true, false, "GPT write/verify failed");
     }
     let esp_part = plan.part(amber_core::PartKind::Esp).expect("plan carries an ESP");
     let layout = super::gpt::GptLayout {
@@ -391,6 +482,7 @@ pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
         "[install] gpt written esp={}..{} sectors={}",
         layout.esp_first_lba, layout.esp_last_lba, layout.esp_last_lba - layout.esp_first_lba + 1
     );
+    stage("gpt", &alloc::format!("ok {} parts", plan.parts.len()));
     let entry = super::gpt::GptEntryView {
         index: 0,
         type_guid: super::gpt::ESP_TYPE_GUID,
@@ -401,11 +493,18 @@ pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
         Ok(w) => w,
         Err(e) => {
             serial_println!("[install] ESP write failed err={:?}", e);
-            return fail(out, "ESP format/clone failed");
+            fail(out, "ESP format/clone failed");
+            stage("esp", "fail");
+            return oc(true, false, "ESP format/clone failed");
         }
     };
+    stage("esp", &alloc::format!("ok files={} verified={}", w.files, w.verified));
     // SELFINSTALL2 M2: mirror the UnaFS volume (sector clone of the running span) and fsck the copy.
     #[cfg(feature = "unafs")] let (cloned_mib, fsck_tag, unafs_ok) = mirror_unafs(&mut disk, &plan, unafs_src, out); #[cfg(not(feature = "unafs"))] let (cloned_mib, fsck_tag, unafs_ok) = { let _ = unafs_src; (0u64, "skip", true) };
+    #[cfg(feature = "ahciroot")] let (cloned_mib, fsck_tag, unafs_ok) = if unafs_src.is_none() { fresh_unafs(&mut disk, &plan, port, out) } else { (cloned_mib, fsck_tag, unafs_ok) }; // AHCIROOT (B332) M3
+    stage("unafs", if unafs_ok { "ok" } else { "fail" });
+    stage("fsck", fsck_tag);
+    #[cfg(feature = "unafs")] let unafs_ok = if unafs_ok && fsck_tag == "ok" { drop(tree); let (what, ok) = grow_unafs(&mut disk, &plan); stage("grow", &what); ok } else { stage("grow", "skip (the volume did not fsck clean)"); unafs_ok }; // UNAFSGROW (B347) M2: the volume grows to p2 (the snapshot buffer is freed first: the grown map needs the heap)
     let ms = crate::arch::ticks().wrapping_sub(t0);
     let pass = w.files > 0 && w.verified == w.files && unafs_ok;
     serial_println!(
@@ -418,6 +517,8 @@ pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
         w.files, w.bytes, w.verified, w.files,
         if pass { " — the SSD now carries UnaOS; reboot and pick it" } else { " — NOT trustworthy" }
     ));
+    stage("done", if pass { "PASS" } else { "FAIL" });
+    oc(true, pass, if pass { "the SSD carries UnaOS" } else { "the install is NOT trustworthy" })
 }
 
 #[cfg(not(feature = "ahci-write"))]
@@ -434,6 +535,8 @@ pub fn verb(out: &mut dyn FnMut(&str), args: &[&str]) {
         }
         Some("--write") if args.len() == 1 => write_ssd(out, false),
         Some("--write") if args.len() == 2 && args[1] == "--force" => write_ssd(out, true),
+        #[cfg(feature = "ahciroot")]
+        Some("--write") if args.len() == 3 && args[1] == "--erase-stranger" => write_ssd_confirmed(out, false, Some(args[2])),
         _ => out("usage: install ssd --dry-run | install ssd --write [--force]   (the SSD install: ESP + UnaFS; --write needs UNAOS_AHCI_WRITE=1, refuses a stranger's disk, and needs --force over an existing UnaFS volume)"),
     }
 }
@@ -460,6 +563,7 @@ pub fn selftest() {
 pub fn ssd_plan(disk_sectors: u64, unafs_sectors: Option<u64>) -> Result<amber_core::Plan, amber_core::PlanError> {
     use amber_core::{PartKind, PartReq, Size};
     let esp = PartReq { kind: PartKind::Esp, size: Size::Sectors(ESP_SECTORS), name: "UNAOS-ESP", seed: b"UNAOS-INSTALL-ESP" };
+    #[cfg(feature = "ahciroot")] let unafs_sectors = Some(unafs_sectors.filter(|&n| n > 0).unwrap_or(super::ahciroot::FRESH_UNAFS_MIB * 2048) + super::ahciroot::SCRATCH_SECTORS); // AHCIROOT (B332) M3: p2 always (cloned or fresh), plus the 64-sector scratch tail outside the volume
     match unafs_sectors {
         Some(n) if n > 0 => {
             let ufs = PartReq { kind: PartKind::UnaFS, size: Size::Sectors(n), name: "UNAOS-UNAFS", seed: b"UNAOS-INSTALL-UFS" };
@@ -534,8 +638,9 @@ fn print_plan(p: &Probe, out: &mut dyn FnMut(&str)) {
             }
         }
         _ => {
-            serial_println!("[install] unafs mirror: none (the running system has no UnaFS root to mirror; the SSD gets the ESP only)");
-            out("  unafs: none — the running system has no UnaFS root; the SSD gets the ESP only");
+            #[cfg(feature = "ahciroot")] { serial_println!("[install] unafs: fresh {} MiB volume (UnaFS::format, the `unafs init` code) + {} scratch sectors — the running system has no UnaFS root to mirror", super::ahciroot::FRESH_UNAFS_MIB, super::ahciroot::SCRATCH_SECTORS); out("  unafs: a fresh UnaFS volume (UnaFS::format) — the running system has no UnaFS root to mirror"); }
+            #[cfg(not(feature = "ahciroot"))] { serial_println!("[install] unafs mirror: none (the running system has no UnaFS root to mirror; the SSD gets the ESP only)");
+            out("  unafs: none — the running system has no UnaFS root; the SSD gets the ESP only"); }
         }
     }
     let _ = &mut cloned;
@@ -594,7 +699,7 @@ pub fn install_selftest() {
         p.parts.len() == 2
             && p.parts[0].first == 2048
             && p.parts[1].first == 2048 + ESP_SECTORS
-            && p.parts[1].sectors() == 1_048_576
+            && p.parts[1].sectors() == 1_048_576 + PLAN_SCRATCH
             && p.gpt().is_ok()
     });
     let tiny_refused = ssd_plan(500_000, Some(1_048_576)).is_err();
@@ -609,5 +714,164 @@ pub fn install_selftest() {
     let mut sink = |_s: &str| {};
     if dry_run(&mut sink).is_none() {
         serial_println!(":: SELFINSTALL2: dry-run disks=0 -> SKIP (no AHCI disk on this machine) ::");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// AHCIROOT (rmbp-ledger B332) — the operator's confirmation token for a Stranger disk.
+// ---------------------------------------------------------------------------------------------
+
+/// The token the refusal prints and `--erase-stranger` must repeat: the port and the disk's exact
+/// sector count, so a token copied from another machine (or another disk) does not match.
+#[cfg(feature = "ahciroot")]
+pub fn stranger_token(port: u8, sectors: u64) -> String {
+    alloc::format!("ERASE-{}-{}", port, sectors)
+}
+
+/// AHCIROOT (B332): the scratch tail the plan adds to p2 (0 without the knob) — `tests install`'s
+/// planner check reads it so the synthetic plan is asserted in both polarities.
+#[cfg(feature = "ahciroot")]
+const PLAN_SCRATCH: u64 = super::ahciroot::SCRATCH_SECTORS;
+#[cfg(not(feature = "ahciroot"))]
+const PLAN_SCRATCH: u64 = 0;
+
+/// AHCIROOT (B332) M3: `--write`'s UnaFS leg when there is no running volume to mirror — format p2 with
+/// `UnaFS::format` through the held install grant, then fsck the result. Returns `(0, fsck tag, ok)`.
+#[cfg(feature = "ahciroot")]
+fn fresh_unafs(disk: &mut AhciDisk, plan: &amber_core::Plan, port: u8, out: &mut dyn FnMut(&str)) -> (u64, &'static str, bool) {
+    let Some(dst) = plan.part(amber_core::PartKind::UnaFS) else { return (0, "skip", false) };
+    let mib = super::ahciroot::FRESH_UNAFS_MIB;
+    serial_println!("[install] unafs fresh: UnaFS::format {} MiB at lba={} (p2 {}..{}, scratch tail {} sectors)", mib, dst.first, dst.first, dst.last, super::ahciroot::SCRATCH_SECTORS);
+    let blocks = match super::ahciroot::format_fresh(port, dst.first, mib) {
+        Ok(n) => n,
+        Err(why) => {
+            serial_println!("[install] unafs fresh FAILED: {}", why);
+            out("install ssd --write: formatting the SSD's UnaFS partition FAILED");
+            return (0, "skip", false);
+        }
+    };
+    match super::unafsmirror::fsck_target(disk, dst.first, blocks) {
+        Ok(true) => (0, "ok", true),
+        Ok(false) => (0, "fail", false),
+        Err(why) => {
+            serial_println!("[install] unafs fsck of the fresh volume: {}", why);
+            (0, "fail", false)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// INSTALL3 (rmbp-ledger B342) — the installer window's door into `write_ssd_inner`. File tail.
+// ---------------------------------------------------------------------------------------------
+
+/// What the installer window hands the write body: the disk the operator chose (by port), the layout
+/// they chose (`(esp_sectors, Some(p2 sectors incl. scratch) | None = the rest)`, or `None` for the
+/// verb's own plan), the dry-run choice, and where the stage lines go.
+#[cfg(feature = "ahci-write")]
+pub struct Glass<'a> {
+    pub port: u8,
+    pub layout: Option<(u64, Option<u64>)>,
+    pub dry_run: bool,
+    pub stage: &'a mut dyn FnMut(&str, &str),
+}
+
+/// What the write body answers the window: was the grant issued (minted from the verdict), did the
+/// install (or the dry run) pass, and the reason in words for the result screen.
+#[cfg(feature = "ahci-write")]
+pub struct GlassOutcome {
+    pub grant: bool,
+    pub pass: bool,
+    pub reason: String,
+}
+
+/// The installer window's confirm: `confirm` is the shell token (`stranger_token`) the window derived
+/// from the disk name the operator typed, or `None` (an empty or ours disk). The operator's click IS the
+/// consent `--force` stands for, so an existing UnaFS volume on an ours disk is replaced.
+#[cfg(feature = "ahci-write")]
+pub fn write_ssd_glass(out: &mut dyn FnMut(&str), confirm: Option<&str>, glass: Glass<'_>) -> GlassOutcome {
+    write_ssd_inner(out, true, confirm, Some(glass))
+}
+
+/// The smallest p2 the plan accepts: the volume it will carry (the running one mirrored, or the fresh
+/// one) plus the scratch tail. The window's layout screen never offers less.
+pub fn p2_min_sectors(unafs_sectors: Option<u64>) -> u64 {
+    #[cfg(feature = "ahciroot")]
+    return unafs_sectors.filter(|&n| n > 0).unwrap_or(super::ahciroot::FRESH_UNAFS_MIB * 2048) + super::ahciroot::SCRATCH_SECTORS;
+    #[cfg(not(feature = "ahciroot"))]
+    return unafs_sectors.unwrap_or(0);
+}
+
+/// The operator's layout through the same planner: ESP of `esp_sectors`, then p2 of `p2` sectors (the
+/// scratch tail included) or the rest of the disk. Refused when p2 cannot hold [`p2_min_sectors`].
+pub fn ssd_plan_layout(disk_sectors: u64, esp_sectors: u64, p2: Option<u64>, unafs_sectors: Option<u64>) -> Result<amber_core::Plan, amber_core::PlanError> {
+    use amber_core::{PartKind, PartReq, Size};
+    let min = p2_min_sectors(unafs_sectors);
+    if p2.is_some_and(|n| n < min) {
+        return Err(amber_core::PlanError::TooSmall);
+    }
+    let esp = PartReq { kind: PartKind::Esp, size: Size::Sectors(esp_sectors), name: "UNAOS-ESP", seed: b"UNAOS-INSTALL-ESP" };
+    let ufs = PartReq { kind: PartKind::UnaFS, size: p2.map_or(Size::Rest, Size::Sectors), name: "UNAOS-UNAFS", seed: b"UNAOS-INSTALL-UFS" };
+    let plan = amber_core::Plan::layout(disk_sectors, super::gpt::INSTALL_DISK_SEED, &[esp, ufs])?;
+    match plan.part(PartKind::UnaFS) {
+        Some(u) if u.sectors() >= min => Ok(plan),
+        _ => Err(amber_core::PlanError::TooSmall),
+    }
+}
+
+/// The running UnaFS volume's sectors when there is one to mirror (the layout screen's minimum).
+pub fn mirror_source_sectors() -> Option<u64> {
+    #[cfg(feature = "unafs")]
+    return super::unafsmirror::source().filter(|s| !s.is_ahci()).map(|s| s.sectors());
+    #[cfg(not(feature = "unafs"))]
+    return None;
+}
+
+// ---------------------------------------------------------------------------------------------
+// UNAFSGROW (rmbp-ledger B347) M2 — the copied (or fresh) volume grows to its partition. File tail.
+// ---------------------------------------------------------------------------------------------
+
+/// The largest volume the installer grows to: 16 GiB of 4 KiB blocks. The unafs refcount map lives in
+/// RAM at 8 bytes per block across its two views and every commit rewrites it whole, so on the 256 MiB
+/// x86 heap and the one-sector AHCI write path a whole-SSD volume would be unmountable or unusable;
+/// past this the partition keeps free tail space until the map is incremental (owed, B347).
+pub const GROW_CAP_BLOCKS: u64 = 16 * 1024 * 1024 * 1024 / 4096;
+
+/// The block count the installer grows p2's volume to: the partition minus the scratch tail, in whole
+/// 4 KiB blocks, capped at [`GROW_CAP_BLOCKS`]. Pure; `tests unafsgrow` prints it for a synthetic plan.
+pub fn grow_target_blocks(p2_sectors: u64) -> u64 {
+    (p2_sectors.saturating_sub(PLAN_SCRATCH) / 8).min(GROW_CAP_BLOCKS)
+}
+
+/// `--write`'s grow leg, after the volume was copied (or formatted) and fsck'd clean: grow it to
+/// [`grow_target_blocks`] through the held grant and fsck it again. Returns the stage text and whether
+/// the volume is still trustworthy (a refused grow writes nothing and keeps the old size: still `true`).
+#[cfg(all(feature = "unafs", feature = "ahci-write"))]
+fn grow_unafs(disk: &mut AhciDisk, plan: &amber_core::Plan) -> (String, bool) {
+    let Some(dst) = plan.part(amber_core::PartKind::UnaFS) else { return (String::from("skip (no UnaFS partition)"), true) };
+    let want = grow_target_blocks(dst.sectors());
+    match super::unafsmirror::grow_target(disk, dst.first, dst.sectors() / 8, want) {
+        Ok((from, to, true)) => {
+            serial_println!("[install] unafs grow: from={} to={} blocks ({} MiB -> {} MiB) fsck=ok", from, to, from / 256, to / 256);
+            (alloc::format!("from={} to={} ok", from, to), true)
+        }
+        Ok((from, to, false)) => {
+            serial_println!("[install] unafs grow: from={} to={} fsck NOT clean", from, to);
+            (alloc::format!("from={} to={} fail (fsck not clean)", from, to), false)
+        }
+        Err(why) => {
+            serial_println!("[install] unafs grow: {} — the volume keeps its size", why);
+            (alloc::format!("from=? to={} fail ({}; the volume keeps its size)", want, why), true)
+        }
+    }
+}
+
+/// UNAFSGROW (B347) M3: the dry run's grant — the same judgment as [`AhciDisk::new`], minted silently
+/// (`partition::mint_disk_grant_quiet`) and dropped by the caller unheld.
+#[cfg(feature = "ahci-write")]
+impl AhciDisk {
+    pub fn new_quiet(sel: BlockDeviceId, v: &Verdict) -> Result<Self, InstallError> {
+        let rd = super::BlockTarget::bind_id(sel)?;
+        let grant = partition::mint_disk_grant_quiet(sel, rd.capacity_sectors(), v).ok_or(InstallError::NotBlank)?;
+        Ok(Self { rd, grant })
     }
 }

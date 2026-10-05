@@ -195,12 +195,11 @@ impl InstallTarget for BlockTarget {
             let n = match self.handle {
                 block::BlockHandle::Global => block::read_block(lba + i as u64, chunk),
                 block::BlockHandle::Usb => block::read_block_usb(lba + i as u64, chunk),
-                // SDHC-4b: the installer cannot bind the internal SD card. Nothing constructs an
-                // `Sdhc` target (`InstallTarget::from_parts` is only ever called with `Global`/`Usb`,
-                // and the graphical chooser lists only those two handles), so this arm exists to keep
-                // the match exhaustive and to make the refusal explicit rather than accidental.
+                // UNAFSGROW (B347) M3: the internal SD card READS, so the installer's census can name
+                // what is on it (a read-only row) and selfguard can recognise the boot card by its
+                // volume serial. Reading mutates nothing; the WRITE arm below stays a refusal.
                 #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-                block::BlockHandle::Sdhc => Err(block::BlockError::NotReady),
+                block::BlockHandle::Sdhc => block::read_block_sdhc(lba + i as u64, chunk),
                 // TEGRA-SDBLK: the same refusal, for the same reason — nothing constructs a
                 // `SdMmc` target (`from_parts` is only ever called with `Global`/`Usb`), and the
                 // Orin card's install flow is `sdmmc_tegra`'s own armed ladder, not this engine.
@@ -247,6 +246,7 @@ fn map_blk(e: block::BlockError) -> InstallError {
         // retry loop, so this is COARSE BUT HONEST `Io`: the install fails cleanly rather than
         // proceeding on a sector it never read or wrote. Twin of `install::pi::map_blk`'s arm.
         block::BlockError::Busy => InstallError::Io,
+        block::BlockError::Denied => InstallError::NotBlank, // AHCIROOT (B332): no live grant covers the sector — a refusal, not a fault
     }
 }
 
@@ -754,3 +754,8 @@ pub mod partition;
 // volume + fsck of the copy). Gated on exactly its consumer, `selfinstall`, plus the `unafs` module it reads.
 #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci", feature = "unafs"))]
 pub mod unafsmirror;
+
+// AHCIROOT (rmbp-ledger B332, R82): the SSD UnaFS root — the root/scratch grant judgment, the fresh-p2
+// format and `tests ahciw`. Gated exactly as its consumers (bootdisk, fs::unafs, selfinstall, tests).
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub mod ahciroot;

@@ -28,6 +28,8 @@ pub enum Kind {
     Dir { path: String, ents: Vec<(String, bool)>, pos: usize },
     PipeR(Arc<Pipe>),
     PipeW(Arc<Pipe>),
+    /// SELFBUILD2: eventfd / epoll / AF_UNIX socket end (`sys3.rs`).
+    Ext(super::sys3::Ext),
 }
 
 pub struct Desc {
@@ -46,6 +48,7 @@ impl Desc {
 
 impl Drop for Desc {
     fn drop(&mut self) {
+        super::sys3::flock_drop(self as *const Desc as usize); // SELFBUILD2: an open description's flocks die with it
         match self.k.get_mut() {
             Kind::PipeR(p) => {
                 p.readers.fetch_sub(1, Ordering::AcqRel);

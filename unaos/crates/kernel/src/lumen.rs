@@ -44,14 +44,15 @@ fn session() -> (&'static str, KeyState) {
         }
     };
     let prov = lit("provider");
-    let tls = lit("tls");
+    // VEINTLS (SR36): the program's `TlsSetup::verify` over the kernel's view — a trust store on the volume and a set clock (the provider is linked or the image does not build).
+    let verify = if crate::fs::attrsys::do_stat(b"/system/trust/roots.pem", crate::fs::vfs::KERNEL_PRINCIPAL, &mut alloc::vec::Vec::new()) != 0 { rules::Verify::NoTrustStore } else if crate::clock::unix_now().map_or(true, |t| (t as i64) < 1_790_985_600) { rules::Verify::NoClock } else { rules::Verify::Ready };
     let ep_s = s("endpoint");
     let ep = match ep_s.as_deref() {
         None | Some("") => Some(rules::DEFAULT_ENDPOINT),
         Some(u) => rules::parse_endpoint(u),
     };
-    // The program cannot verify certificates yet (vein_ring3::VERIFIES_CERTS = false); same input here.
-    let plan = rules::plan(rules::provider_pref(prov.as_deref().map(str::as_bytes)), ep.as_ref(), key, rules::tls_policy(tls.as_deref().map(str::as_bytes)), false);
+    // Same rule, same inputs as the program (vein_ring3::TlsSetup::verify; floor = vein_ring3::tls::CLOCK_FLOOR).
+    let plan = rules::plan(rules::provider_pref(prov.as_deref().map(str::as_bytes)), ep.as_ref(), key, verify);
     (if matches!(plan, Plan::Claude { .. }) { "claude" } else { "echo" }, key)
 }
 
@@ -88,6 +89,7 @@ pub fn selftest() {
         Some(img) => spawn_step(&img),
         None => serial_println!(":: LUMENCRASH: spawned=0 first_line=none -> SKIP ::"),
     }
+    lumenux();
 }
 
 /// The LUMENAPP verdict; `Some(image)` only on PASS (the image the spawn step then runs).
@@ -160,6 +162,7 @@ pub fn selftest() {
     let _ = app_note_flags;
     serial_println!(":: LUMENAPP: reason=aarch64-image-owed ::");
     serial_println!(":: LUMENAPP: image={} window=bad provider={} key={} -> SKIP ::", IMAGE, provider, key.as_str());
+    lumenux();
 }
 
 // ── LUMENCRASH M3 (rmbp-ledger B326) — the SPAWN step: run the real image as `bg` does and read its first line ──
@@ -237,4 +240,113 @@ fn spawn_step(img: &[u8]) {
         None if ok => serial_println!(":: LUMENCRASH: spawned=1 first_line=ok -> PASS ::"),
         None => serial_println!(":: LUMENCRASH: spawned=1 first_line=timeout -> FAIL ::"),
     }
+}
+
+// ── LUMENUX (rmbp-ledger B348) — the window's shared core, re-run in the kernel ──────────────────────────
+// LUMEN.ELF renders replies with `vein_core::md`, keeps its scrollback in a `vein_core::scroll::Ring` and saves
+// each conversation in `vein_core::history`'s file format; the clipboard it copies to is `video::clipboard`
+// through `SYS_CLIP_SET`/`SYS_CLIP_GET`. This leg runs the SAME code on fixed inputs (no ring 3, no file I/O:
+// the history leg proves the codec and the 40-byte path, not a write — the file surface is the program's):
+//   md       a heading, inline bold/italic/code/link, a list hang, a fence carried across lines;
+//   history  header + three turns (one carrying a marker line) parse back exactly; the path fits SYS_OPEN's cap;
+//   clip     a set/get round trip through the clipboard the verbs fulfil over (the prior content restored),
+//            and the kernel's CLIP_CAP equals una-abi's;
+//   scroll   the rows LUMEN.ELF keeps (`LUMEN_ROWS`), after a ring of 8 drops and rebases as the program's does.
+// WITNESS. `:: LUMENUX: md=<ok|bad> history=<ok|bad> clip=<ok|bad> scroll=<rows> -> PASS|FAIL ::`.
+fn lumenux() {
+    use vein_core::md::{self, Block, Span, State, Tint};
+    let md_ok = {
+        let mut st = State::default();
+        let mut t = [0u8; 128];
+        let mut sp = [Span::EMPTY; 16];
+        let mut one = |src: &str, st: &mut State| {
+            let l = md::line(st, src.as_bytes(), &mut t, &mut sp);
+            (l.block, alloc::string::String::from_utf8_lossy(&t[..l.len]).into_owned(), sp[..l.spans].to_vec(), l.hang)
+        };
+        let h = one("## Head **x**", &mut st);
+        let i = one("a **b** *c* `d` [e](f)", &mut st);
+        let li = one("  - item", &mut st);
+        let f1 = one("```rust", &mut st);
+        let f2 = one("# not a heading", &mut st);
+        let f3 = one("```", &mut st);
+        h.0 == Block::Heading
+            && h.1 == "Head x"
+            && i.1 == "a b c d e (f)"
+            && i.2.iter().any(|s| s.bold)
+            && i.2.iter().any(|s| s.italic)
+            && i.2.iter().any(|s| s.tint == Tint::Code)
+            && i.2.iter().any(|s| s.tint == Tint::Link)
+            && li.0 == Block::Bullet
+            && li.3 == 4
+            && f1.0 == Block::Fence
+            && f2.0 == Block::Code
+            && f3.0 == Block::Fence
+            && !st.fence
+    };
+    let history_ok = {
+        use vein_core::history::{self, Ev, Who};
+        let mut buf = alloc::vec![0u8; 1024];
+        let mut o = vein_core::Out::new(&mut buf);
+        history::header(1, 7, &mut o);
+        history::turn(Who::User, b"hi", &mut o);
+        history::turn(Who::Assistant, b"# T\n<!-- lumen:user -->\n\n- x", &mut o);
+        history::turn(Who::Note, b"n", &mut o);
+        let n = o.done().unwrap_or(0);
+        let mut got: alloc::vec::Vec<(Who, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
+        history::parse(&buf[..n], &mut |e| match e {
+            Ev::Begin(w) => got.push((w, alloc::vec::Vec::new())),
+            Ev::Line(l) => {
+                if let Some(t) = got.last_mut() {
+                    if !t.1.is_empty() || l.is_empty() {
+                        t.1.push(b'\n');
+                    }
+                    t.1.extend_from_slice(l);
+                }
+            }
+        });
+        let mut pb = [0u8; history::PATH_LEN];
+        let pn = history::path(1, &mut pb);
+        n > 0
+            && pn <= 40
+            && got.len() == 3
+            && got[0] == (Who::User, b"hi".to_vec())
+            && got[1] == (Who::Assistant, b"# T\n<!-- lumen:user -->\n\n- x".to_vec())
+            && got[2] == (Who::Note, b"n".to_vec())
+    };
+    let clip_ok = {
+        use crate::video::clipboard as clip;
+        let mut old = alloc::vec![0u8; clip::CLIP_CAP];
+        let on = clip::get(&mut old);
+        const PROBE: &[u8] = b"LUMENUX clip probe\n";
+        let set = clip::set(PROBE);
+        let mut back = alloc::vec![0u8; clip::CLIP_CAP];
+        let bn = clip::get(&mut back);
+        if on > 0 {
+            clip::set(&old[..on]);
+        } else {
+            clip::clear("lumenux-restore");
+        }
+        set && &back[..bn] == PROBE && clip::CLIP_CAP == una_abi::CLIP_CAP
+    };
+    let scroll_ok = {
+        use vein_core::scroll::{Rec, Ring};
+        let mut store = [Rec::ZERO; 8];
+        let mut r = Ring::new(&mut store);
+        for k in 0..12u32 {
+            r.push(Rec { src: k * 10, ..Rec::ZERO });
+        }
+        let kept = r.len() == 8 && r.dropped == 4 && r.get(0).map(|x| x.src) == Some(40);
+        r.truncate_from_src(100);
+        r.rebase(50);
+        kept && r.len() == 5 && r.get(0).map(|x| x.src) == Some(0)
+    };
+    let ok = |b: bool| if b { "ok" } else { "bad" };
+    serial_println!(
+        ":: LUMENUX: md={} history={} clip={} scroll={} -> {} ::",
+        ok(md_ok),
+        ok(history_ok),
+        ok(clip_ok),
+        if scroll_ok { vein_core::scroll::LUMEN_ROWS } else { 0 },
+        if md_ok && history_ok && clip_ok && scroll_ok { "PASS" } else { "FAIL" }
+    );
 }

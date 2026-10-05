@@ -102,14 +102,14 @@ pub mod install;
 // every record, and it uses THIS implementation rather than a private copy so that an image the
 // kernel wrote is checkable by the same host tools (and the same `crc32fast` variant) the GPT writer
 // and the gzip trailer check already agree with.
-#[cfg(any(
+#[cfg(any(all(), // RING3ABI2 M1 (B333): UNCONDITIONAL — `SYS_GETRANDOM` is core ABI and its DRBG is SHA-256; the consumer list below is history
     feature = "installdemo",
     feature = "install_target",
     feature = "piinstall",
     feature = "selfhost",
     feature = "holocron", feature = "selfup", feature = "facet", feature = "login", feature = "ga10bprobe5", feature = "ahci", feature = "netring3" // AHCI (SMALLFIX-HASHCFG, rmbp-0915): an `ahci`-only build could not reach this module at all — the tree's ONLY SHA-256 — so AHCIBOOT fell back to FNV for its fixture; the SATA arc digests what it reads, so `ahci` joins the consumer list as ONE MORE TERM on the same line, no line moved. LOGIN: fs/users.rs CRC-32s its store and SHA-256s the credential. ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file. FACET: `selfhost::inflate` CRC-32s every produced byte, so the PNG viewer's decoder pulls this module in with `selfhost` itself off — SAME-LINE append, no line moved. GA10B-PROBE5 (orin-0912b): the rung-5 firmware loader digests each vendor section IN the DMA window with this Sha256 — one more term on the same line, no line moved.
 ))]
-pub mod hash; #[cfg(any(feature = "login", feature = "selfhost", feature = "netring3"))] pub mod rand; #[cfg(feature = "netring3")] pub mod netring3; // SECLOGIN M5 (2026-09-22): the kernel's entropy source — RDRAND / RNDR where the CPU says so, a documented timer-jitter fallback elsewhere, the source SAID on the wire once per boot (`[rand] source=`). Gated on `login`, its one consumer today (`fs/users.rs`, itself `login`-gated at fs/mod.rs:105) and a member of `hash`'s own cfg list above, which `rand` builds on — the attribute above binds `hash` alone, so a bare `pub mod rand;` here compiled on every `hash`-less leg and redded 31 of them. A second consumer widens this one cfg. LINE-NEUTRAL fold onto hash's line so no panic::Location below it moves.
+pub mod hash; pub mod rand; #[cfg(feature = "netring3")] pub mod netring3; // SECLOGIN M5 (2026-09-22): the kernel's entropy source — RDRAND / RNDR where the CPU says so, a documented timer-jitter fallback elsewhere, the source SAID on the wire once per boot (`[rand] source=`). Gated on `login`, its one consumer today (`fs/users.rs`, itself `login`-gated at fs/mod.rs:105) and a member of `hash`'s own cfg list above, which `rand` builds on — the attribute above binds `hash` alone, so a bare `pub mod rand;` here compiled on every `hash`-less leg and redded 31 of them. A second consumer widens this one cfg. LINE-NEUTRAL fold onto hash's line so no panic::Location below it moves.
 
 // SELFHOST-2 (`selfhost` / UNAOS_SELFHOST=1): the source tree is READABLE ON THE SHARD — mount the
 // program-source volume, verify SRC.TGZ against SRC.SHA, then gunzip + tar-walk it and enumerate the
@@ -274,3 +274,15 @@ pub mod lumen;
 pub mod execname;
 // PROFILE (rmbp-ledger B331): the sampling profiler (`prof` verb, `tests prof`). Runtime-armed, off by default; tail statement, so no existing line moves.
 pub mod prof;
+// SETTINGSBUS (rmbp-ledger B337): the kernel's preference CLIENT — the desktop speaks Principia's bus verbs (relayed to PREFS.ELF when it owns them, else the kernel fulfiller), PrefChanged to the window. The bus cfg. Tail statement, so no existing line moves.
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+pub mod prefs_client;
+// SELFDIAG (rmbp-ledger B324, R82): the boot log on disk (`bootwit`) and the diagnosis program's kernel half —
+// SYS_PATH_READ/WRITE fulfilment and `tests selfdiag` (`selfdiag`). Tail statements, so no existing line moves.
+#[cfg(feature = "selfdiag")]
+pub mod bootwit;
+#[cfg(feature = "selfdiag")]
+pub mod selfdiag;
+// RING3ABI2 (rmbp-ledger B333): the SYS_WHOAMI record and `tests ring3abi` (args page, getrandom, the ELF windows). Tail statement, so no existing line moves.
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+pub mod ring3abi;

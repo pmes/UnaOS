@@ -13,8 +13,11 @@
 //! * [`http`] — HTTP/1.1 request head, response head parser, chunked transfer decoder.
 //! * [`client`] — the [`client::Transport`] trait and [`client::exchange`]: one request → streamed deltas.
 //! * [`prefs`] — the resolution rules: Principia values (`vein.provider`, `vein.model`, `vein.endpoint`,
-//!   `vein.tls`, `vein.key_file`) + the key's state → which provider runs and whether the key may be sent.
+//!   `vein.key_file`) + the key's state + whether the server can be verified → which provider runs and
+//!   whether the key may be sent (only over a verified TLS connection, VEINTLS SR36).
 //! * [`provider`] — the offline `Echo` provider (no key, no network: the window still answers).
+//! * [`md`] / [`scroll`] / [`history`] (LUMENUX B348) — the markdown line renderer, the scrollback ring of
+//!   rendered rows, and the conversation-file codec the ring-3 Lumen window uses.
 //! * [`json`] — the minimal no-alloc JSON string escape/scan the above share.
 //! * [`model`] / [`context`] (feature `alloc`) — the conversation model and the pure context assembler.
 #![no_std]
@@ -26,10 +29,13 @@ extern crate alloc;
 pub mod claude;
 pub mod client;
 pub mod http;
+pub mod history;
 pub mod json;
+pub mod md;
 pub mod prefs;
 pub mod provider;
 pub mod role;
+pub mod scroll;
 
 #[cfg(feature = "alloc")]
 pub mod context;

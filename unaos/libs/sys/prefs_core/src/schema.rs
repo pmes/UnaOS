@@ -126,6 +126,12 @@ pub const GEMINI_DEFAULT_KEY_ENV: &str = "GEMINI_API_KEY";
 pub static SCHEMA: &[Key] = &[
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     Key {
+        ns: "system", key: "audio.amp_holdoff_ms", kind: Kind::Int { min: 0, max: 600_000 },
+        default: Default::Consumer("`hda_amp::AMP_HOLDOFF_MS`, 5000 ms"),
+        writers: OP, reader: "kernel HDA amp (`drivers/hda_amp.rs`)",
+        doc: "Milliseconds of silence before the speaker amp powers down (PREFSKERNEL: declared from the kernel scan).",
+    },
+    Key {
         ns: "system", key: "audio.mute", kind: Kind::Bool, default: Default::Bool(false),
         writers: &[Writer::Settings, Writer::Keys], reader: "kernel settings (audio)",
         doc: "Output muted.",
@@ -211,6 +217,12 @@ pub static SCHEMA: &[Key] = &[
         doc: "Memories per re-embed pass.",
     },
     Key {
+        ns: "vein", key: "endpoint", kind: Kind::Str { max_len: 160, printable: true },
+        default: Default::Str("https://api.anthropic.com/v1/messages"),
+        writers: OP, reader: "vein_ring3 prefs (LUMEN.ELF); kernel tests lumen",
+        doc: "Where Vein's ring-3 client POSTs: an https:// URL (the key goes only over a verified TLS connection, VEINTLS) or an http:// relay that holds the key itself (never sent the key).",
+    },
+    Key {
         ns: "vein", key: "gemini.api_key_env", kind: NAME, default: Default::Str(GEMINI_DEFAULT_KEY_ENV),
         writers: OP, reader: "gneiss_pal ProviderConfig, EmbedConfig",
         doc: "NAME of the environment variable holding the Gemini key.",
@@ -241,6 +253,12 @@ pub static SCHEMA: &[Key] = &[
         ns: "vein", key: "gemini.region", kind: NAME, default: Default::Str("global"),
         writers: OP, reader: "gneiss_pal ProviderConfig",
         doc: "Vertex region for chat.",
+    },
+    Key {
+        ns: "vein", key: "key_file", kind: Kind::Str { max_len: 40, printable: true },
+        default: Default::Consumer("unset: no key, the Echo provider answers"),
+        writers: OP, reader: "vein_ring3 key (LUMEN.ELF); kernel tests lumen",
+        doc: "Absolute path of the API key file on the UnaFS volume (read only when it stats with an inode id; refused on FAT). At most 40 bytes: ring 3's SYS_OPEN name bound.",
     },
     Key {
         ns: "vein", key: "max_tokens", kind: Kind::Int { min: 1, max: u32::MAX as i64 }, default: Default::Int(16000),
@@ -370,6 +388,28 @@ pub fn clamp(kind: &Kind, v: PrefValue) -> Result<Applied, Refusal> {
         }
         _ => Err(Refusal::WrongType { want }),
     }
+}
+
+/// PREFSKERNEL (B345): clamp every declared int / float in `tree` into its range, in place — the ONE
+/// load-time pass (a hand-edited or pre-schema file holding `display.brightness = 0` loads as 1). A value
+/// [`check`] would REFUSE (wrong type, enum miss, …) is left as the operator wrote it: a load never
+/// deletes a choice. Returns how many values were clamped.
+pub fn clamp_tree(tree: &mut crate::PrefTree) -> usize {
+    let mut fix: alloc::vec::Vec<(&'static Key, PrefValue)> = alloc::vec::Vec::new();
+    for k in SCHEMA {
+        if let Some(v) = tree.get(k.ns, k.key) {
+            if let Ok(a) = clamp(&k.kind, v.clone()) {
+                if a.clamped {
+                    fix.push((k, a.value));
+                }
+            }
+        }
+    }
+    let n = fix.len();
+    for (k, v) in fix {
+        let _ = tree.set(k.ns, k.key, v);
+    }
+    n
 }
 
 // =====================================================================================================
@@ -538,6 +578,22 @@ mod tests {
         let long = "x".repeat(121);
         assert_eq!(check("system", "display.wallpaper", PrefValue::Str(long)), Err(Refusal::TooLong));
         assert_eq!(check("system", "display.wallpaper", PrefValue::Str("A\tB".into())), Err(Refusal::NotPrintable));
+    }
+
+    /// PREFSKERNEL (B345): the load pass clamps declared ranges once, leaves refusals and undeclared keys.
+    #[test]
+    fn clamp_tree_clamps_ranges_once() {
+        let mut t = crate::PrefTree::parse(
+            "[system]\ndisplay.brightness = 0\naudio.volume = 40\naudio.mute = 1\npointer.speed = 1\n[aether]\nwidth = -9\n[vein]\ntemperature = 9.0\n",
+        )
+        .unwrap();
+        assert_eq!(clamp_tree(&mut t), 3);
+        assert_eq!(t.get("system", "display.brightness"), Some(&PrefValue::Int(1)));
+        assert_eq!(t.get("system", "audio.volume"), Some(&PrefValue::Int(16)));
+        assert_eq!(t.get("vein", "temperature"), Some(&PrefValue::Float(2.0)));
+        assert_eq!(t.get("system", "audio.mute"), Some(&PrefValue::Int(1)), "a wrong type is not deleted");
+        assert_eq!(t.get("aether", "width"), Some(&PrefValue::Int(-9)));
+        assert_eq!(clamp_tree(&mut t), 0, "once");
     }
 
     #[test]

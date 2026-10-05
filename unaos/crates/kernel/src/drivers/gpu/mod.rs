@@ -10,8 +10,10 @@ pub mod pcihealth;
 pub mod kepler_display;
 /// CE-LADDER — read-only copy-engine reconnaissance. `nvidia-kepler-ce` implies
 /// `nvidia-kepler` in Cargo.toml, so this gate alone is sufficient. DEFAULT OFF => the
-/// module and its single call site vanish and every artifact is byte-identical.
-#[cfg(feature = "nvidia-kepler-ce")]
+/// module and its single call site vanish and every artifact is byte-identical. GPUTESTS M3 (B334):
+/// x86_64 only — the GK107 sits on the rMBP's PCIe bus, and an aarch64 build carrying the knob no
+/// longer compiles the driver as dead code (arroyo's `arm_features` strips the feature too).
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-ce"))]
 pub mod kepler_ce;
 /// KFBIND (shut-out register §2, rung KF27) — derive the GK107 PBDMA register base from the
 /// PTOP device-info table and read the channel's fetch pointers THERE instead of at the
