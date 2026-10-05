@@ -2392,7 +2392,7 @@ mod tests {
         );
         let (a, b) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap());
         assert_eq!((a.0, a.2), (10.0, 380.0), "fills 400 - 2x10 margin, border-box");
-        assert_eq!((b.0, b.2), (90.0, 220.0), "content 200 + padding 20, centred");
+        assert_eq!((b.0, b.2), (90.0, 220.0), "content 200 + padding 20, centred {b:?}");
     }
 
     /// CSS 2.2 §10.8: `line-height: normal` is the rounded ascent + descent

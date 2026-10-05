@@ -475,7 +475,7 @@ fn draw_text(
 /// The inherited paint state of an element's subtree: font, colour,
 /// decorations, white-space, list style, super/sub shift (CSS 2.2 §6.2,
 /// with the html.css UA defaults by tag).
-fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle, dom_node: &kuchiki::NodeRef) {
+fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle, dom_node: &crate::dom::NodeRef) {
     let parent_font_size = inherited.font_size;
     let own_family = spec
         .family
@@ -757,14 +757,14 @@ fn draw_lines(
 
 /// The ordinal of a list item: its `value`, else the list's `start` (1)
 /// plus the number of preceding items (`reversed` counts down).
-fn list_ordinal(li: &kuchiki::NodeRef) -> i64 {
-    let attr_num = |n: &kuchiki::NodeRef, a: &str| {
+fn list_ordinal(li: &crate::dom::NodeRef) -> i64 {
+    let attr_num = |n: &crate::dom::NodeRef, a: &str| {
         n.as_element().and_then(|e| e.attributes.borrow().get(a).and_then(|v| v.trim().parse::<i64>().ok()))
     };
     if let Some(v) = attr_num(li, "value") {
         return v;
     }
-    let is_li = |n: &kuchiki::NodeRef| n.as_element().is_some_and(|e| e.name.local.as_ref() == "li");
+    let is_li = |n: &crate::dom::NodeRef| n.as_element().is_some_and(|e| e.name.local.as_ref() == "li");
     let before = li.preceding_siblings().filter(|n| is_li(n)).count() as i64;
     let parent = li.parent();
     let reversed = parent.as_ref().and_then(|p| p.as_element().map(|e| e.attributes.borrow().get("reversed").is_some())).unwrap_or(false);
@@ -825,7 +825,7 @@ pub(crate) fn marker_text(style: u8, n: i64) -> String {
 /// the marker text in the item's font, ending at the content edge.
 #[allow(clippy::too_many_arguments)]
 fn paint_marker(
-    li: &kuchiki::NodeRef, style: u8, content_x: f32, baseline: f32, font: &Font, key: u8, fs: f32,
+    li: &crate::dom::NodeRef, style: u8, content_x: f32, baseline: f32, font: &Font, key: u8, fs: f32,
     color: (u8, u8, u8), surface: &mut [u8], width: u32, height: u32,
     damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
 ) {

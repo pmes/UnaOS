@@ -1347,8 +1347,13 @@ fn cascade_document(
             continue;
         }
         let uses_var = decls.iter().any(|d| contains_var(&d.value));
+        // The share key is the winning declarations' addresses in the rule set. A style attribute's
+        // declarations live in `inline`, which is freed at the end of this iteration, so the next
+        // element's attribute can reuse the same addresses: an element with a style attribute never
+        // shares (the AETHERFONT join found two inline-styled siblings folded into one style).
+        let shareable = !uses_var && inline.is_empty();
         let key: Vec<usize> = decls.iter().map(|d| *d as *const _ as usize).collect();
-        let style = match (!uses_var).then(|| shared.get(&key)).flatten() {
+        let style = match shareable.then(|| shared.get(&key)).flatten() {
             Some(s) => s.clone(),
             None => {
                 let mut s = SpecifiedStyle::default();
@@ -1364,7 +1369,7 @@ fn cascade_document(
                     }
                 }
                 let s = Rc::new(s);
-                if !uses_var {
+                if shareable {
                     shared.insert(key, s.clone());
                 }
                 s

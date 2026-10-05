@@ -1,0 +1,22 @@
+<!-- tests: font-relative lengths: em of the element's own font-size, font-size em/% of the parent, rem of the root, ex/ch, line-height number vs length inheritance -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Em units</title>
+<style>
+html { font-size: 12px; }
+body { margin: 1rem; font-family: sans-serif; }
+.big { font-size: 24px; }
+.box { width: 10em; padding: 0.5em 1em; margin-bottom: 1em; background: #cde; border-left: 0.25em solid #357; }
+.half { font-size: 50%; }
+.r { width: 20rem; height: 2rem; background: #fc9; margin-bottom: 1rem; }
+.ch { width: 20ch; background: #9c9; font-family: monospace; margin-bottom: 1ex; }
+.num { line-height: 2; font-size: 10px; width: 300px; background: #eee; }
+.num span { font-size: 20px; }
+.len { line-height: 20px; font-size: 10px; width: 300px; background: #ddd; margin-top: 8px; }
+.len span { font-size: 20px; }
+</style></head><body>
+<div class="big"><div class="box">10em wide at 24px</div><div class="half"><div class="box">10em at 12px</div></div></div>
+<div class="r"></div>
+<div class="ch">twenty characters...</div>
+<div class="num">number <span>inherits as a factor</span> here</div>
+<div class="len">length <span>inherits as px</span> here</div>
+</body></html>
