@@ -12,6 +12,7 @@
 //! * [`tls12`] — TLS 1.2 (RFC 5246 + RFC 7627) key derivation over the provider's PRF.
 //! * [`client`] — the client state machine over a [`client::Transport`]: TLS 1.3, and TLS 1.2 (ECDHE + AEAD only)
 //!   when the configuration offers a 1.2 suite.
+//! * [`resumption`] — TLS 1.3 tickets and the caller-owned [`resumption::TicketStore`] seam (0-RTT refused).
 //! * [`x509`] — RFC 5280 DER/certificates/path validation, RFC 6125 names, PEM trust store.
 
 #![no_std]
@@ -26,6 +27,7 @@ pub mod error;
 pub mod key_schedule;
 pub mod msgs;
 pub mod record;
+pub mod resumption;
 pub mod tls12;
 pub mod transcript;
 pub mod x509;

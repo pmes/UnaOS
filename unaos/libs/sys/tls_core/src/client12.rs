@@ -222,6 +222,7 @@ impl<'a, T: Transport> Client<'a, T> {
             peer_chain_len: chain.len(),
             client_cert_requested: cert_requested,
             extended_master_secret: true,
+            resumed: false,
         });
         Ok(())
     }

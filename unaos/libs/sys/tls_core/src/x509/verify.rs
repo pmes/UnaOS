@@ -21,6 +21,10 @@ use crate::error::{CertError, TlsError};
 pub trait Clock {
     /// Seconds since 1970-01-01T00:00:00Z.
     fn now(&self) -> i64;
+    /// Milliseconds since the epoch (TLS 1.3 ticket ages, RFC 8446 §4.2.11.1). Default: `now() * 1000`.
+    fn now_ms(&self) -> u64 {
+        (self.now().max(0) as u64) * 1000
+    }
 }
 
 /// A clock frozen at one instant (tests, and boot before the RTC is trusted).

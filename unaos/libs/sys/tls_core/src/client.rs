@@ -81,6 +81,10 @@ pub struct ClientConfig<'a> {
     /// machine still generates the key shares from the provider and parses what it offered back out of these bytes.
     #[doc(hidden)]
     pub hello_overrides: Vec<Vec<u8>>,
+    /// TLS 1.3 resumption (RFC 8446 §2.2): tickets the server sends are kept in this store, and the next
+    /// connection to the same name offers one as a PSK with (EC)DHE. `None`: no psk_key_exchange_modes is sent
+    /// and tickets are only parsed. 0-RTT is never offered (see `resumption`).
+    pub resumption: Option<crate::resumption::Resumption<'a>>,
 }
 
 impl ClientConfig<'_> {
@@ -109,6 +113,7 @@ impl<'a> ClientConfig<'a> {
             max_fragment: record::MAX_FRAGMENT,
             padding: 0,
             hello_overrides: Vec::new(),
+            resumption: None,
         }
     }
 }
@@ -127,6 +132,9 @@ pub struct Negotiated {
     pub client_cert_requested: bool,
     /// TLS 1.2: the RFC 7627 extended master secret was negotiated (always true — it is required).
     pub extended_master_secret: bool,
+    /// TLS 1.3: the server accepted our ticket (PSK + (EC)DHE); no certificate was exchanged on this connection —
+    /// the ticket came from a connection whose chain was verified for the same server name.
+    pub resumed: bool,
 }
 
 struct Share {
@@ -475,10 +483,12 @@ impl<'a, T: Transport> Client<'a, T> {
         session_id: &[u8],
         share: &Share,
         cookie: Option<&[u8]>,
+        psk: Option<&crate::resumption::Ticket>,
     ) -> Vec<u8> {
         if let Some(m) = self.cfg.hello_overrides.get(index) {
             return m.clone();
         }
+        let now_ms = self.cfg.resumption.map(|r| r.clock.now_ms()).unwrap_or(0);
         let suites = self.offered_suites();
         let schemes = self.offered_schemes();
         let sni = self.cfg.server_name.as_deref().and_then(msgs::sni_name);
@@ -505,9 +515,57 @@ impl<'a, T: Transport> Client<'a, T> {
             tls12: v12,
             status_request: false,
             sct: false,
-            psk_dhe_mode: false,
-            psk: None,
+            psk_dhe_mode: v13 && self.cfg.resumption.is_some(),
+            psk: psk.filter(|_| v13).map(|t| msgs::PskOffer {
+                identity: &t.ticket,
+                obfuscated_ticket_age: t.obfuscated_age(now_ms),
+                binder_len: t.suite.hash().output_len(),
+            }),
         })
+    }
+
+    /// A ticket to offer: one for this exact server name, still in its lifetime, whose suite hash some offered
+    /// TLS 1.3 suite shares (RFC 8446 §4.2.11). Taken out of the store: tickets are single-use.
+    fn pick_ticket(&self) -> Option<crate::resumption::Ticket> {
+        let r = self.cfg.resumption?;
+        if !self.cfg.hello_overrides.is_empty() || !self.offered_versions().0 {
+            return None;
+        }
+        let name = self.cfg.server_name.as_deref()?;
+        let now = r.clock.now_ms();
+        let suites = self.offered_suites();
+        // Expired tickets are dropped; usable ones this configuration cannot offer (another hash) go back.
+        let mut keep = Vec::new();
+        let mut found = None;
+        while let Some(t) = r.store.take(name) {
+            if !t.usable_at(now) {
+                continue;
+            }
+            if suites.iter().any(|s| s.is_tls13() && s.hash() == t.suite.hash()) {
+                found = Some(t);
+                break;
+            }
+            keep.push(t);
+        }
+        for t in keep.into_iter().rev() {
+            r.store.put(t);
+        }
+        found
+    }
+
+    /// RFC 8446 §4.2.11.2: binder = HMAC(finished_key(binder_key), Transcript-Hash(prefix + truncated hello)),
+    /// binder_key = Derive-Secret(Early Secret(PSK), "res binder", ""). Written over the zeros the hello carries.
+    fn patch_binder(&self, hello: &mut [u8], t: &crate::resumption::Ticket, prefix: &[u8]) -> Result<(), TlsError> {
+        let alg = t.suite.hash();
+        let hl = alg.output_len();
+        let cut = hello.len().checked_sub(msgs::psk_binders_len(hl)).ok_or(TlsError::State("hello too short for a binder"))?;
+        let early = KeySchedule::new(self.p, alg, Some(&t.psk));
+        let binder_key = early.derive(b"res binder", self.p.hash(alg, &[]).as_bytes())?;
+        let th = self.p.hash(alg, &[prefix, &hello[..cut]]);
+        let b = key_schedule::finished_verify_data(self.p, alg, binder_key.as_bytes(), th.as_bytes())?;
+        let n = hello.len();
+        hello[n - hl..].copy_from_slice(b.as_bytes());
+        Ok(())
     }
 
     /// (TLS 1.3 offered, TLS 1.2 offered) — decided by which suites the configuration (and provider) allow.
@@ -528,7 +586,11 @@ impl<'a, T: Transport> Client<'a, T> {
             self.p.random(&mut session_id)?;
         }
         let mut share = self.make_share(self.cfg.groups[0])?;
-        let ch1 = self.build_hello(0, &random, &session_id, &share, None);
+        let mut ticket = self.pick_ticket();
+        let mut ch1 = self.build_hello(0, &random, &session_id, &share, None, ticket.as_ref());
+        if let Some(t) = &ticket {
+            self.patch_binder(&mut ch1, t, &[])?;
+        }
         let mut offered = msgs::parse_client_hello(&ch1)?;
         if self.offered_versions().0 && offered.key_share_groups.first() != Some(&share.group.code()) {
             return Err(TlsError::State("ClientHello key_share does not match the generated share"));
@@ -560,7 +622,14 @@ impl<'a, T: Transport> Client<'a, T> {
             }
             transcript.replace_with_message_hash(self.p, suite.hash());
             transcript.add(&sh_msg);
-            let ch2 = self.build_hello(1, &random, &session_id, &share, sh.cookie.as_deref());
+            // §4.1.4: keep the PSK only if its hash matches the suite the HRR chose.
+            if ticket.as_ref().is_some_and(|t| t.suite.hash() != suite.hash()) {
+                ticket = None;
+            }
+            let mut ch2 = self.build_hello(1, &random, &session_id, &share, sh.cookie.as_deref(), ticket.as_ref());
+            if let Some(t) = &ticket {
+                self.patch_binder(&mut ch2, t, transcript.bytes())?;
+            }
             offered = msgs::parse_client_hello(&ch2)?;
             if offered.key_share_groups.first() != Some(&share.group.code()) {
                 return Err(TlsError::State("ClientHello2 key_share does not match the generated share"));
@@ -588,9 +657,20 @@ impl<'a, T: Transport> Client<'a, T> {
                 return Err(illegal("ServerHello cipher suite differs from HelloRetryRequest"));
             }
         }
-        if sh.has_pre_shared_key {
-            return Err(illegal("pre_shared_key selected but none offered"));
-        }
+        // §4.2.11: the selected identity must be one we offered, with a suite of the PSK's hash.
+        let resumed = match sh.psk_identity {
+            None => false,
+            Some(i) => {
+                let t = ticket.as_ref().ok_or(illegal("pre_shared_key selected but none offered"))?;
+                if i as usize >= offered.psk_identities {
+                    return Err(illegal("pre_shared_key selected_identity out of range"));
+                }
+                if t.suite.hash() != suite.hash() {
+                    return Err(illegal("PSK accepted with a cipher suite of another hash"));
+                }
+                true
+            }
+        };
         let (g, peer_key) = sh.key_share.clone().ok_or(TlsError::Protocol(
             AlertDescription::MissingExtension,
             "ServerHello without key_share",
@@ -605,7 +685,8 @@ impl<'a, T: Transport> Client<'a, T> {
         let alg = self.hash;
         transcript.add(&sh_msg);
 
-        let mut ks = KeySchedule::new(self.p, alg, None);
+        let psk = if resumed { ticket.as_ref().map(|t| t.psk.clone()) } else { None };
+        let mut ks = KeySchedule::new(self.p, alg, psk.as_deref());
         ks.input_ecdhe(&shared)?;
         let th = transcript.hash(self.p, alg);
         let c_hs = ks.derive(b"c hs traffic", th.as_bytes())?;
@@ -620,41 +701,49 @@ impl<'a, T: Transport> Client<'a, T> {
         let ee = msgs::parse_encrypted_extensions(&ee_msg[4..], &offered.extensions, &offered.alpn)?;
         transcript.add(&ee_msg);
 
-        // ---- CertificateRequest? Certificate
-        let mut m = self.next_handshake()?;
+        // ---- resumed (PSK): no CertificateRequest, Certificate, CertificateVerify (§2.2, §4.3.2)
         let mut cert_request_ctx: Option<Vec<u8>> = None;
-        if m[0] == hs::CERTIFICATE_REQUEST {
-            let mut r = Reader::new(&m[4..]);
-            cert_request_ctx = Some(r.vec8()?.to_vec());
-            r.vec16()?;
-            r.expect_end()?;
-            transcript.add(&m);
-            m = self.next_handshake()?;
-        }
-        if m[0] != hs::CERTIFICATE {
-            return Err(unexpected("expected Certificate (PSK modes are not offered)"));
-        }
-        let chain = msgs::parse_certificate(&m[4..])?;
-        if chain.is_empty() {
-            return Err(TlsError::Protocol(AlertDescription::DecodeError, "empty server Certificate"));
-        }
-        let leaf_key = self.cfg.verifier.verify_server_cert(self.p, &chain, self.cfg.server_name.as_deref())?;
-        transcript.add(&m);
-
-        // ---- CertificateVerify
-        let cv_msg = self.expect(hs::CERTIFICATE_VERIFY)?;
-        let (scheme_code, sig) = msgs::parse_certificate_verify(&cv_msg[4..])?;
-        let scheme = SignatureScheme::from_code(scheme_code)
-            .filter(|s| offered.signature_schemes.contains(&s.code()) && s.allowed_in_certificate_verify())
-            .ok_or(illegal("CertificateVerify scheme not offered"))?;
-        let content = msgs::certificate_verify_message(transcript.hash(self.p, alg).as_bytes());
-        x509::verify_tls_signature(self.p, &leaf_key, scheme, &content, &sig).map_err(|e| match e {
-            TlsError::Crypto(crate::crypto::CryptoError::BadSignature) => {
-                TlsError::Protocol(AlertDescription::DecryptError, "CertificateVerify signature")
+        let (scheme, chain_len) = if resumed {
+            let t = ticket.as_ref().expect("resumed implies a ticket");
+            (SignatureScheme::from_code(t.signature_scheme).unwrap_or(SignatureScheme::EcdsaSecp256r1Sha256), 0)
+        } else {
+            // ---- CertificateRequest? Certificate
+            let mut m = self.next_handshake()?;
+            if m[0] == hs::CERTIFICATE_REQUEST {
+                let mut r = Reader::new(&m[4..]);
+                cert_request_ctx = Some(r.vec8()?.to_vec());
+                r.vec16()?;
+                r.expect_end()?;
+                transcript.add(&m);
+                m = self.next_handshake()?;
             }
-            other => other,
-        })?;
-        transcript.add(&cv_msg);
+            if m[0] != hs::CERTIFICATE {
+                return Err(unexpected("expected Certificate (PSK modes are not offered)"));
+            }
+            let chain = msgs::parse_certificate(&m[4..])?;
+            if chain.is_empty() {
+                return Err(TlsError::Protocol(AlertDescription::DecodeError, "empty server Certificate"));
+            }
+            let leaf_key = self.cfg.verifier.verify_server_cert(self.p, &chain, self.cfg.server_name.as_deref())?;
+            transcript.add(&m);
+
+            // ---- CertificateVerify
+            let cv_msg = self.expect(hs::CERTIFICATE_VERIFY)?;
+            let (scheme_code, sig) = msgs::parse_certificate_verify(&cv_msg[4..])?;
+            let scheme = SignatureScheme::from_code(scheme_code)
+                .filter(|s| offered.signature_schemes.contains(&s.code()) && s.allowed_in_certificate_verify())
+                .ok_or(illegal("CertificateVerify scheme not offered"))?;
+            let content = msgs::certificate_verify_message(transcript.hash(self.p, alg).as_bytes());
+            x509::verify_tls_signature(self.p, &leaf_key, scheme, &content, &sig).map_err(|e| match e {
+                TlsError::Crypto(crate::crypto::CryptoError::BadSignature) => {
+                    TlsError::Protocol(AlertDescription::DecryptError, "CertificateVerify signature")
+                }
+                other => other,
+            })?;
+            transcript.add(&cv_msg);
+            (scheme, chain.len())
+        };
+        let peer_alpn = ee.alpn.clone();
 
         // ---- server Finished
         let fin = self.expect(hs::FINISHED)?;
@@ -702,12 +791,13 @@ impl<'a, T: Transport> Client<'a, T> {
             cipher_suite: suite,
             group,
             signature_scheme: scheme,
-            alpn: ee.alpn,
+            alpn: peer_alpn,
             hello_retry,
-            peer_chain_len: chain.len(),
+            peer_chain_len: chain_len,
             client_cert_requested: cert_request_ctx.is_some(),
             extended_master_secret: false,
             version: msgs::TLS13,
+            resumed,
         });
         Ok(())
     }
@@ -820,6 +910,7 @@ impl<'a, T: Transport> Client<'a, T> {
         match msg[0] {
             hs::NEW_SESSION_TICKET => {
                 let t = msgs::parse_new_session_ticket(&msg[4..])?;
+                self.keep_ticket(&t)?;
                 self.tickets.push(t);
             }
             hs::KEY_UPDATE => {
@@ -845,6 +936,30 @@ impl<'a, T: Transport> Client<'a, T> {
             _ => return Err(unexpected("post-handshake message")),
         }
         Ok(Some(()))
+    }
+
+    /// §4.6.1: PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length), kept in
+    /// the caller's store under the server name. A ticket with lifetime 0 or over 7 days is not kept.
+    fn keep_ticket(&mut self, t: &msgs::NewSessionTicket) -> Result<(), TlsError> {
+        let (Some(r), Some(name)) = (self.cfg.resumption, self.cfg.server_name.as_deref()) else { return Ok(()) };
+        if t.lifetime == 0 || t.lifetime > crate::resumption::MAX_TICKET_LIFETIME {
+            return Ok(());
+        }
+        let psk = key_schedule::resumption_psk(self.p, self.hash, self.resumption.as_bytes(), &t.nonce)?;
+        let n = self.negotiated.as_ref();
+        r.store.put(crate::resumption::Ticket {
+            server_name: String::from(name),
+            suite: self.suite,
+            psk: psk.as_bytes().to_vec(),
+            ticket: t.ticket.clone(),
+            age_add: t.age_add,
+            lifetime: t.lifetime,
+            received_ms: r.clock.now_ms(),
+            alpn: n.and_then(|n| n.alpn.clone()),
+            signature_scheme: n.map(|n| n.signature_scheme.code()).unwrap_or(0),
+            max_early_data: t.max_early_data,
+        });
+        Ok(())
     }
 
     /// Sends KeyUpdate (RFC 8446 §4.6.3) and switches our sending keys. `request_peer` asks the server to update its

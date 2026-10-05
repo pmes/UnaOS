@@ -201,6 +201,47 @@ fn https_tls12_against_python_ssl() {
     assert!(s.cipher.starts_with("ECDHE-"), "an ECDHE suite: {}", s.cipher);
 }
 
+/// TLSCORE2 (SR58): TLS 1.3 resumption through the host transport. Two Agents (two pools, so the second MUST open
+/// a new connection) share one ticket FILE; the second loads it fresh from disk and resumes — the server counts
+/// the resumed connection (OpenSSL's session_reused).
+#[test]
+fn tls13_resumption_across_agents_and_processes() {
+    use http_core::host::SharedTicketStore;
+    let Some(dir) = pki("resume") else { return };
+    let srv = Server::start(Some(&dir));
+    let base = format!("https://localhost:{}", srv.port);
+    let file = dir.join("tickets.bin");
+    let mk = |store: Arc<SharedTicketStore>| {
+        Agent::new(AgentConfig {
+            trust: Trust::PemFile(dir.join("root.pem").display().to_string()),
+            proxy: ProxyMode::None,
+            timeout: Some(Duration::from_secs(20)),
+            tickets: Some(store),
+            ..Default::default()
+        })
+    };
+    let s1 = Arc::new(SharedTicketStore::file(&file));
+    let a1 = mk(s1.clone());
+    assert_eq!(a1.get(&format!("{base}/hello")).unwrap().status(), 200);
+    let kept = s1.len();
+    let meta = std::fs::metadata(&file).expect("ticket file written");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "the ticket file holds PSKs: 0600");
+    }
+    // A fresh store from the file (another process would do exactly this), a fresh Agent, a new connection.
+    let s2 = Arc::new(SharedTicketStore::file(&file));
+    assert_eq!(s2.len(), kept, "every ticket survived the file");
+    let a2 = mk(s2.clone());
+    assert_eq!(a2.get(&format!("{base}/hello")).unwrap().status(), 200);
+    let st = stats(&a2, &base);
+    println!("resumption: tickets kept={kept} file={}B connections={} reused={} version={}", meta.len(), st.connections, st.reused, st.version);
+    assert!(kept >= 1, "the server's NewSessionTickets were kept");
+    assert_eq!(st.connections, 2, "two Agents, two connections");
+    assert_eq!(st.reused, 1, "the second connection resumed from the file's ticket");
+}
+
 #[test]
 fn refusals() {
     let Some(dir) = pki("refuse") else { return };
