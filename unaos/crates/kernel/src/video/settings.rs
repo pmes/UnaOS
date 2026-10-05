@@ -124,7 +124,7 @@ fn persist(i: usize) {
     use crate::prefs::{key, PrefValue as P}; use crate::prefs_client::sys_set as set_sys; // SETTINGSBUS (B337): every write is a PrefSet over the bus
     let c = CUR.lock().clone();
     match i {
-        0 => set_sys(key::BRIGHTNESS, P::Int(prefs_core::display::clamp_brightness(c.bright as i64))),
+        0 => set_sys(key::BRIGHTNESS, P::Int(c.bright as i64)), // PREFSKERNEL (B345): the schema row owns the range; the store clamps
         1 | 2 => { set_sys(key::VOLUME, P::Int(c.vol as i64)); set_sys(key::MUTE, P::Bool(c.mute)); }
         3 => set_sys(key::IDLE_MIN, P::Int(c.idle_min as i64)),
         4 => set_sys(key::POINTER, P::Int(c.ptr as i64)),

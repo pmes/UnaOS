@@ -16,12 +16,13 @@
 //! | LIST 18 | `<ns>` or empty (every namespace) | `<ns>.<key> = <literal>\n` lines, sorted; -E2BIG past [`BODY_MAX`] |
 //!
 //! The SET reply's clamp form is new with PRINCIPIA2: an unclamped SET still answers an EMPTY body, byte
-//! for byte the kernel's B300 reply, so a caller that ignores the body is unchanged. The kernel adopts
-//! [`fulfil`] (and [`crate::schema::check`] inside its `prefs::set`) at the fold; until then its
-//! `prefs::bus_fulfil` is this module minus the schema check.
+//! for byte the kernel's B300 reply, so a caller that ignores the body is unchanged. PREFSKERNEL (B345):
+//! the kernel's `prefs::bus_fulfil` IS [`fulfil`] over its store, and its `prefs::set` IS
+//! [`persisted_set`] (name, [`crate::schema::check`], tree, save, rollback) — the reference [`TreeStore`]
+//! runs the same function with a save that cannot fail.
 //!
-//! `PREF_CHANGED` (19, owed BANDY-3): body = the SET request body of the stored value
-//! ([`changed_body`]).
+//! `PREF_CHANGED` (19): body = the SET request body of the stored value ([`changed_body`]); when the
+//! schema clamped the write, `NUL clamped=true` follows ([`changed_body_applied`], [`parse_changed`]).
 
 use alloc::format;
 use alloc::string::String;
@@ -110,6 +111,31 @@ pub fn changed_body(ns: &str, key: &str, stored: &PrefValue) -> Vec<u8> {
     set_body(ns, key, stored)
 }
 
+/// The PREF_CHANGED (19) body for an applied write: [`changed_body`], then `NUL clamped=true` when the
+/// schema clamped it (PREFSKERNEL, B345 — the same suffix as the SET reply's clamp form).
+pub fn changed_body_applied(ns: &str, key: &str, a: &Applied) -> Vec<u8> {
+    let mut b = changed_body(ns, key, &a.value);
+    if a.clamped {
+        b.push(0);
+        b.extend_from_slice(b"clamped=true");
+    }
+    b
+}
+
+/// Parse a PREF_CHANGED body: `(ns, key, stored value, clamped)`.
+pub fn parse_changed(body: &[u8]) -> Option<(&str, &str, PrefValue, bool)> {
+    let z = body.iter().position(|&b| b == 0)?;
+    let (ns, k) = parse_get(&body[..z])?;
+    let rest = &body[z + 1..];
+    let (lit, clamped) = match rest.iter().position(|&b| b == 0) {
+        Some(z2) if &rest[z2 + 1..] == b"clamped=true" => (&rest[..z2], true),
+        Some(_) => return None,
+        None => (rest, false),
+    };
+    let v = PrefValue::from_literal(core::str::from_utf8(lit).ok()?).ok()?;
+    Some((ns, k, v, clamped))
+}
+
 /// The SET reply body: empty when stored as sent, else `<stored literal>` NUL `clamped=true`.
 pub fn set_reply(a: &Applied, out: &mut Vec<u8>) {
     if a.clamped {
@@ -181,8 +207,60 @@ pub fn fulfil(store: &mut dyn Store, verb: u8, body: &[u8], in_session: bool, ou
     }
 }
 
-/// The reference [`Store`]: an in-RAM [`PrefTree`] behind [`schema::check`] — exactly the kernel's
-/// `prefs::set` minus its save.
+/// A store's tree and its persistence, as [`persisted_set`] sees them (PREFSKERNEL, B345). The kernel's
+/// `with_tree` takes its `TREE` lock for the closure only (the save runs UNLOCKED, as it always has);
+/// its `save` is the read-back swap of `preferences.toml`.
+pub trait Persist {
+    fn with_tree<R>(&mut self, f: impl FnOnce(&mut PrefTree) -> R) -> R;
+    /// Persist the tree as it now is. `Err` = nothing durable changed (the caller rolls back).
+    fn save(&mut self) -> Result<(), ()>;
+}
+
+/// What [`persisted_set`] did.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stored {
+    pub applied: Applied,
+    /// `false` = the stored value already was [`Applied::value`]: nothing saved, no PrefChanged.
+    pub changed: bool,
+}
+
+/// THE store write, both rings' (PREFSKERNEL, B345): validate the name, run [`schema::check`] (the
+/// clamp is what is stored), set the tree, save; a value equal to the stored one is not re-saved; a
+/// failed save rolls the tree back, so cache and file never disagree (Principia's rule).
+pub fn persisted_set<P: Persist>(p: &mut P, ns: &str, key: &str, v: PrefValue) -> Result<Stored, SetFail> {
+    validate_ns(ns).map_err(SetFail::Name)?;
+    validate_key(key).map_err(SetFail::Name)?;
+    let applied = schema::check(ns, key, v).map_err(SetFail::Refused)?;
+    let prev = p.with_tree(|t| t.set(ns, key, applied.value.clone())).map_err(SetFail::Name)?;
+    if prev.as_ref() == Some(&applied.value) {
+        return Ok(Stored { applied, changed: false });
+    }
+    if p.save().is_err() {
+        p.with_tree(|t| match prev {
+            Some(o) => {
+                let _ = t.set(ns, key, o);
+            }
+            None => {
+                t.remove(ns, key);
+            }
+        });
+        return Err(SetFail::Io);
+    }
+    Ok(Stored { applied, changed: true })
+}
+
+/// An in-RAM tree persists trivially (the reference store's [`Persist`]).
+impl Persist for PrefTree {
+    fn with_tree<R>(&mut self, f: impl FnOnce(&mut PrefTree) -> R) -> R {
+        f(self)
+    }
+    fn save(&mut self) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
+/// The reference [`Store`]: an in-RAM [`PrefTree`] behind [`persisted_set`] — exactly the kernel's
+/// `prefs::set` with a save that cannot fail.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TreeStore(pub PrefTree);
 
@@ -191,11 +269,7 @@ impl Store for TreeStore {
         self.0.get(ns, key).cloned()
     }
     fn set(&mut self, ns: &str, key: &str, v: PrefValue) -> Result<Applied, SetFail> {
-        validate_ns(ns).map_err(SetFail::Name)?;
-        validate_key(key).map_err(SetFail::Name)?;
-        let a = schema::check(ns, key, v).map_err(SetFail::Refused)?;
-        self.0.set(ns, key, a.value.clone()).map_err(SetFail::Name)?;
-        Ok(a)
+        persisted_set(&mut self.0, ns, key, v).map(|s| s.applied)
     }
     fn list(&self, ns: &str) -> Vec<(String, PrefValue)> {
         self.0.list(ns).into_iter().map(|(k, v)| (String::from(k), v.clone())).collect()
@@ -302,6 +376,18 @@ system.settings.tab = 0\n";
             s.set("aether", &format!("k{i:03}"), PrefValue::Str("x".repeat(20))).unwrap();
         }
         assert_eq!(run(&mut s, VERB_LIST, b"aether", false), (E2BIG, Vec::new()));
+    }
+
+    /// PREFSKERNEL: the PrefChanged body carries the clamp.
+    #[test]
+    fn kat_changed_body_applied() {
+        let c = Applied { value: PrefValue::Int(1), clamped: true };
+        assert_eq!(changed_body_applied("system", "display.brightness", &c), b"system.display.brightness\x001\x00clamped=true".to_vec());
+        let u = Applied { value: PrefValue::Int(9), clamped: false };
+        assert_eq!(changed_body_applied("system", "display.brightness", &u), changed_body("system", "display.brightness", &PrefValue::Int(9)));
+        assert_eq!(parse_changed(b"system.display.brightness\x001\x00clamped=true"), Some(("system", "display.brightness", PrefValue::Int(1), true)));
+        assert_eq!(parse_changed(b"system.display.brightness\x009"), Some(("system", "display.brightness", PrefValue::Int(9), false)));
+        assert_eq!(parse_changed(b"system.display.brightness\x009\x00bogus"), None);
     }
 
     #[test]

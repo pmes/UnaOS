@@ -388,40 +388,73 @@ pub fn namespaces() -> Vec<String> {
     TREE.lock().namespaces().into_iter().map(String::from).collect()
 }
 
-/// Set `ns`/`key` and persist. An unchanged value is not re-written. On a refused name or a failed save
-/// the tree is rolled back (cache and file never disagree — Principia's rule). Prints the set line, and on
-/// success the PrefChanged stand-in.
-pub fn set(ns: &str, k: &str, v: PrefValue) -> Result<(), String> {
-    ensure_loaded();
-    let prev = TREE.lock().set(ns, k, v.clone());
-    let r = match prev {
-        Err(e) => Err(String::from(e.as_str())),
-        Ok(Some(ref old)) if *old == v => Ok(false),
-        Ok(old) => match save() {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                let mut t = TREE.lock();
-                match old {
-                    Some(o) => {
-                        let _ = t.set(ns, k, o);
-                    }
-                    None => {
-                        t.remove(ns, k);
-                    }
-                }
-                Err(e)
-            }
-        },
-    };
-    serial_println!("[prefs] set {}.{}={} ok={}", ns, k, v, r.is_ok() as u8);
-    match r {
-        Ok(true) => {
-            changed(ns, k, &v);
-            Ok(())
+/// Why a [`set_applied`] failed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SetError {
+    /// The schema refused the value (`prefs_core::schema::check`: wrong type, enum, length, NaN).
+    Refused(prefs_core::schema::Refusal),
+    /// A malformed name or a leaf collision.
+    Name(prefs_core::PrefError),
+    /// The save failed or is held; the tree was rolled back.
+    Io(String),
+}
+
+impl core::fmt::Display for SetError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SetError::Refused(r) => write!(f, "{}", r),
+            SetError::Name(e) => f.write_str(e.as_str()),
+            SetError::Io(e) => f.write_str(e),
         }
-        Ok(false) => Ok(()),
-        Err(e) => Err(e),
     }
+}
+
+/// PREFSKERNEL (B345): the kernel store as `prefs_core::wire::Persist` — the lock is `TREE`, held for the
+/// closure only (the save runs unlocked, as before); the save is [`save`]'s swap. Its error text is kept
+/// for the `[prefs] set` line.
+struct KernelPersist {
+    err: Option<String>,
+}
+
+impl prefs_core::wire::Persist for KernelPersist {
+    fn with_tree<R>(&mut self, f: impl FnOnce(&mut PrefTree) -> R) -> R {
+        f(&mut TREE.lock())
+    }
+    fn save(&mut self) -> Result<(), ()> {
+        save().map(|_| ()).map_err(|e| self.err = Some(e))
+    }
+}
+
+/// Set `ns`/`key` and persist — PRINCIPIA'S RULE, not a kernel copy of it (PREFSKERNEL, B345): this is
+/// `prefs_core::wire::persisted_set`, the function the host reference store runs: the name is validated,
+/// `prefs_core::schema::check` clamps (the CLAMP is stored and answered: `Applied { value, clamped }`) or
+/// refuses, an unchanged value is not re-written, and a failed save rolls the tree back (cache and file
+/// never disagree). Prints the set line, and on a change the PrefChanged (which carries `clamped`).
+pub fn set_applied(ns: &str, k: &str, v: PrefValue) -> Result<prefs_core::schema::Applied, SetError> {
+    ensure_loaded();
+    let mut kp = KernelPersist { err: None };
+    let r = prefs_core::wire::persisted_set(&mut kp, ns, k, v.clone());
+    match &r {
+        Ok(st) if st.applied.clamped => serial_println!("[prefs] set {}.{}={} ok=1 clamped=1 sent={}", ns, k, st.applied.value, v),
+        Ok(st) => serial_println!("[prefs] set {}.{}={} ok=1", ns, k, st.applied.value),
+        Err(e) => serial_println!("[prefs] set {}.{}={} ok=0 why={:?}", ns, k, v, e),
+    }
+    match r {
+        Ok(st) => {
+            if st.changed {
+                changed(ns, k, &st.applied);
+            }
+            Ok(st.applied)
+        }
+        Err(prefs_core::wire::SetFail::Refused(x)) => Err(SetError::Refused(x)),
+        Err(prefs_core::wire::SetFail::Name(e)) => Err(SetError::Name(e)),
+        Err(prefs_core::wire::SetFail::Io) => Err(SetError::Io(kp.err.unwrap_or_else(|| String::from("save failed")))),
+    }
+}
+
+/// [`set_applied`] for callers that only need accepted / refused (the refusal as text).
+pub fn set(ns: &str, k: &str, v: PrefValue) -> Result<(), String> {
+    set_applied(ns, k, v).map(|_| ()).map_err(|e| alloc::format!("{}", e))
 }
 
 /// Set a `system` key; a failure is already said on the serial line, so callers that only persist
@@ -439,12 +472,14 @@ pub fn set_sys(k: &str, v: PrefValue) {
 /// header: kind = REPLY (2), verb = BUS_VERB_PREF_CHANGED (19), corr = 0, status = 0,
 ///         principal = the kernel reply record, body_len = n
 /// body:   <ns> "." <key> NUL <value as a TOML literal (prefs_core::PrefValue::to_literal)>
+///         [NUL "clamped=true"]   (PREFSKERNEL: when the schema clamped the write; wire::changed_body_applied)
 /// ```
 ///
 /// (the PREF_SET request body, unsolicited). Also the ATTRSURF hook: the key is mirrored as an attribute
 /// on the preferences file once the VFS can set one ([`mirror_attr`]).
-fn changed(ns: &str, k: &str, v: &PrefValue) {
-    serial_println!("[prefs] changed {}.{}", ns, k); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] crate::prefs_client::on_changed(ns, k, v); // SETTINGSBUS (B337): the verb-19 frame to the kernel's subscribers
+fn changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
+    let v = &a.value;
+    serial_println!("[prefs] changed {}.{}", ns, k); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] crate::prefs_client::on_changed(ns, k, a); // SETTINGSBUS (B337): the verb-19 frame to the kernel's subscribers. PREFSKERNEL (B345): it carries `clamped`.
     mirror_attr(ns, k, v);
 }
 
@@ -478,8 +513,9 @@ pub fn verb(args: &[&str], out: &mut dyn FnMut(&str)) {
         ["set", a, rest @ ..] if !rest.is_empty() => match split_addr(a) {
             Some((ns, k)) => {
                 let raw = rest.join(" ");
-                match set(ns, k, PrefValue::infer(&raw)) {
-                    Ok(()) => out(&alloc::format!("{} = {}", a, get(ns, k).map(|v| v.to_literal()).unwrap_or_default())),
+                match set_applied(ns, k, PrefValue::infer(&raw)) {
+                    Ok(ap) if ap.clamped => out(&alloc::format!("{} = {} (clamped to the schema's range)", a, ap.value.to_literal())),
+                    Ok(_) => out(&alloc::format!("{} = {}", a, get(ns, k).map(|v| v.to_literal()).unwrap_or_default())),
                     Err(e) => out(&alloc::format!("pref: {} refused: {}", a, e)),
                 }
             }
