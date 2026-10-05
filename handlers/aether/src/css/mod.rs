@@ -1,5 +1,5 @@
 use crate::layout::{LayoutTree, PaintStyle};
-use cssparser::{Parser, ParserInput, Token};
+use cssparser::{Parser, Token};
 use taffy::prelude::*;
 use taffy::style::{Dimension, Display, FlexDirection, LengthPercentage, LengthPercentageAuto};
 use taffy::geometry::Rect;
@@ -1858,8 +1858,8 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
     if depth > 4 {
         return; // pathological nesting guard
     }
-    let mut input = ParserInput::new(css);
-    let mut parser = Parser::new(&mut input);
+    // cssparser 0.38 dropped `ParserInput`: a `Parser` now borrows the source directly.
+    let mut parser = Parser::new(css);
 
     loop {
         // Slice the raw prelude up to the next `{`.
@@ -1890,7 +1890,7 @@ fn collect_rules(css: &str, depth: u8, rules: &mut Vec<Rule>, vw: f32) {
             .parse_nested_block(|p| {
                 let s = p.position();
                 while p.next().is_ok() {}
-                Ok::<String, cssparser::ParseError<'_, ()>>(p.slice_from(s).to_string())
+                Ok::<String, cssparser::ParseError<()>>(p.slice_from(s).to_string())
             })
             .unwrap_or_default();
 

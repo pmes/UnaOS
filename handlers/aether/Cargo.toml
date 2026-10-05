@@ -20,8 +20,8 @@ clap = { version = "4.6", features = ["derive"] }
 image = "0.25"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-cssparser = "0.37"
-selectors = "0.39"
+cssparser = "0.38"
+selectors = "0.41"
 url = "2.5"
 font-kit = "0.14"
 pathfinder_geometry = "0.5"
