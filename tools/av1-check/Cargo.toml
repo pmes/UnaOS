@@ -1,0 +1,9 @@
+[package]
+name = "av1-check"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "AVCODEC (SR24) host check: decode an AVIF/AV1 file with av1_core and write a PNG (no third-party crates)."
+
+[dependencies]
+av1_core = { path = "../../unaos/libs/media/av1_core", features = ["std"] }

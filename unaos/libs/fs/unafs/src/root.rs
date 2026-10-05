@@ -29,7 +29,8 @@
 //! carries the previous committed tree — "old tree or new tree, never a
 //! hybrid" holds even against a tear inside the 512 B root write itself.
 //!
-//! The record is a HAND-PACKED little-endian layout (not bincode): its size
+//! The record is a HAND-PACKED little-endian layout (spec §R12, not the §R1
+//! record codec): its size
 //! is a compile-time constant, enforced ≤ 512 both by `const` assert and by
 //! the golden-vector KAT (`tests/kat_vectors.rs`).
 
@@ -47,6 +48,11 @@ pub const ROOT_RECORD_SIZE: usize = 80;
 /// the volume at block 0's (old) size; every block the root reaches lies
 /// below the old end by construction. Any other mismatch stays corruption.
 pub const ROOT_FLAG_GROW: u64 = 1;
+/// UNAFSMAP (B354): bit 1 — this root's maps are the PAGED (v7) shape though
+/// block 0 may still say v6: the v6 → v7 migration flipped the root and its
+/// superblock rewrite may not have landed. Mount reads the maps paged and the
+/// next commit finishes the migration.
+pub const ROOT_FLAG_MIGRATE: u64 = 2;
 /// The atomicity unit of record: one 512 B sector.
 pub const ROOT_SECTOR_SIZE: usize = 512;
 
@@ -100,7 +106,8 @@ pub struct RootRecord {
     pub refmap_leaves: u64,
     /// Free blocks at commit time (refcount == 0 in the committed map).
     pub free_blocks: u64,
-    /// Flags: [`ROOT_FLAG_GROW`] (bit 0); every other bit reserved (0).
+    /// Flags: [`ROOT_FLAG_GROW`] (bit 0), [`ROOT_FLAG_MIGRATE`] (bit 1);
+    /// every other bit reserved (0).
     pub flags: u64,
 }
 

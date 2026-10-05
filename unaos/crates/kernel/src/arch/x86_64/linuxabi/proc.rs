@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 pub const MAX_PROCS: usize = 16;
+#[allow(dead_code)] // SELFBUILD4: fork is copy-on-write (cow.rs); the eager bound is retired
 pub const FORK_MAX_PAGES: usize = 16384; // 64 MiB eager-copy bound
 const ECHILD: i64 = 10;
 const EAGAIN: i64 = 11;
@@ -196,10 +197,8 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
     if live_count() >= MAX_PROCS {
         return -EAGAIN;
     }
-    if p.asp.pages() > FORK_MAX_PAGES {
-        return -ENOMEM;
-    }
-    let Some(mut casp) = p.asp.fork_copy() else { return -ENOMEM };
+    // SELFBUILD4: copy-on-write — the child SHARES the parent's frames (cow.rs), so the 64 MiB eager bound is gone.
+    let Some(mut casp) = p.asp.fork_cow() else { return -ENOMEM };
     if !super::fpu::fork_into(casp.pml4) {
         casp.free_frames(); // LINUXABI3: no FP slot for the child — refuse the fork rather than run it without its x87/XMM state
         return -EAGAIN;
@@ -237,6 +236,7 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
     super::fs_tab_set(pml4, fs_base);
     super::push_fork_regs(pml4, &regs);
     super::signal::fork_copy(info.pid, pid); // SELFBUILD2: handlers + mask inherited
+    super::remap::fork_copy(info, pid, pml4); // SELFBUILD5: the calling thread's alternate stack is inherited
     let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
     let _ = crate::arch::sched::spawn_user_preemptible(TASK_NAME, rip, usp, cpu, pml4, kill);
     FORKS.fetch_add(1, Ordering::AcqRel);
@@ -302,17 +302,17 @@ pub fn execve(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, path_va: u64, 
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (full, bytes) = match super::read_image(&full) {
+    // SELFBUILD4: read the head only; the image pages in through file VMAs (exec.rs).
+    let img = match super::exec::image(&full) {
         Ok(v) => v,
-        Err(_) => return -ENOENT,
-    };
-    let plan = match elf::parse(&bytes) {
-        Ok(pl) => pl,
+        Err(e) if e.contains("-ENOENT") || e.contains("-EISDIR") => return -ENOENT,
         Err(_) => return -ENOEXEC,
     };
+    let (full, plan) = (img.full.clone(), &img.plan);
     // ---- point of no return: the old image is gone (same PML4, so Task.user_cr3 stays valid) ----
     p.asp.reset();
-    if elf::load(&mut p.asp, &bytes, &plan).is_err() {
+    super::exec::begin(&img);
+    if super::exec::load(&mut p.asp, &img).is_err() {
         serial_println!("[linuxabi] execve {}: load failed after reset — process ends", full);
         return -ENOEXEC; // returns into unmapped memory: the process dies SIGSEGV
     }

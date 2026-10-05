@@ -13,6 +13,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
+name = "holocron_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+]
+
+[[package]]
 name = "tls_core"
 version = "0.1.0"
 dependencies = [
@@ -42,6 +49,7 @@ name = "vein_ring3"
 version = "0.1.0"
 dependencies = [
  "crypto_core",
+ "holocron_core",
  "tls_core",
  "una-abi",
  "vein_core",

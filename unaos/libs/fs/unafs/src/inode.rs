@@ -18,7 +18,6 @@ use crate::storage::BLOCK_SIZE;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Error types related to Inode operations.
@@ -33,7 +32,7 @@ pub enum InodeError {
 }
 
 /// The type of file represented by an Inode.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd, Copy)]
+#[derive(Debug, Clone, PartialEq, PartialOrd, Copy)]
 pub enum FileKind {
     File,
     Directory,
@@ -46,7 +45,7 @@ pub enum FileKind {
 ///
 /// Extents allow for efficient storage of large files by mapping logical offsets
 /// to physical blocks and lengths.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Extent {
     /// The logical offset within the file where this extent begins.
     pub logical_offset: u64,
@@ -90,7 +89,7 @@ pub const SPILL_TRAILER_RESERVE: usize = 1024;
 /// back. On read the overflow is decoded and appended to `chunks`, so every
 /// consumer above the inode layer sees one complete extent list — the split is
 /// invisible.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndirectTrailer {
     /// Always [`INODE_SPILL_MAGIC`] — the presence discriminator.
     pub magic: u64,
@@ -105,7 +104,7 @@ pub struct IndirectTrailer {
 /// The value of a metadata attribute attached to an Inode.
 ///
 /// Supports various primitives including Vectors for AI embeddings.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AttributeValue {
     /// A 64-bit signed integer.
     Int(i64),
@@ -125,7 +124,7 @@ pub enum AttributeValue {
 ///
 /// An Inode represents a file or directory and contains its metadata and data mapping.
 /// It is designed to fit within a single block when serialized.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Inode {
     /// Unique identifier for the Inode.
     pub id: u64,
@@ -140,8 +139,8 @@ pub struct Inode {
     /// Key-value map of large attributes stored in external blocks.
     /// Used for large vectors or blobs (> 256 bytes).
     pub large_attributes: BTreeMap<String, ExtentList>,
-    /// v6 META TRAILER fields (B302 M3/M4). `serde(skip)`: the bincode
-    /// encoding above is unchanged (every inode golden holds); on a v6 volume
+    /// v6 META TRAILER fields (B302 M3/M4). NOT part of the §R6 record (the
+    /// encoding above is unchanged: every inode golden holds); on a v6 volume
     /// these ride the hand-packed trailer after the inode's bytes
     /// ([`INODE_META_MAGIC`]), on a v3–v5 volume they are never written and
     /// read back as zero/`None`.
@@ -149,21 +148,16 @@ pub struct Inode {
     /// The parent directory's logical id (0 = no parent: the root, the system
     /// inodes, a bare `create_inode`). UnaFS has no hard links, so one parent
     /// is the whole truth.
-    #[serde(skip)]
     pub parent: u64,
     /// This inode's name in `parent` (`None` when unnamed or longer than
     /// [`INODE_META_NAME_MAX`] — the path walk then asks the parent's listing).
-    #[serde(skip)]
     pub name: Option<String>,
     /// Unix seconds of the last metadata change (create, attribute, rename).
-    #[serde(skip)]
     pub ctime: u64,
     /// Unix seconds of the last data change (create, write, directory edit).
-    #[serde(skip)]
     pub mtime: u64,
     /// Unix seconds of the last access WRITE (noatime: stamped at create and
     /// write only — under CoW a read that wrote would cost a commit).
-    #[serde(skip)]
     pub atime: u64,
 }
 
@@ -339,5 +333,181 @@ impl Inode {
             .saturating_sub(SPILL_TRAILER_RESERVE)
             .saturating_sub(fixed);
         Ok(budget / EXTENT_ENC_LEN)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UNAFSCODEC (SR53): the spec §R encodings of the inode-block records
+// (docs/dev/OS/09_FILESYSTEM/unafs-records.md §R3–§R6).
+// ---------------------------------------------------------------------------
+
+use crate::codec::{Decode, DecodeError, Encode, Reader, Writer};
+
+/// §R3 `FileKind`: a `u32` discriminant, no payload.
+impl Encode for FileKind {
+    fn encode(&self, w: &mut Writer) {
+        w.u32(match self {
+            FileKind::File => 0,
+            FileKind::Directory => 1,
+            FileKind::Symlink => 2,
+            FileKind::System => 3,
+        });
+    }
+}
+
+impl FileKind {
+    pub(crate) fn decode_field(r: &mut Reader<'_>, field: &'static str) -> Result<Self, DecodeError> {
+        Ok(match r.variant(field, 4)? {
+            0 => FileKind::File,
+            1 => FileKind::Directory,
+            2 => FileKind::Symlink,
+            _ => FileKind::System,
+        })
+    }
+}
+
+impl Decode for FileKind {
+    const NAME: &'static str = "FileKind";
+    const MIN_LEN: usize = 4;
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        FileKind::decode_field(r, "FileKind")
+    }
+}
+
+/// §R4 `Extent`: three `u64` (24 bytes, [`EXTENT_ENC_LEN`]).
+impl Encode for Extent {
+    fn encode(&self, w: &mut Writer) {
+        w.u64(self.logical_offset);
+        w.u64(self.physical_block);
+        w.u64(self.length);
+    }
+}
+
+impl Decode for Extent {
+    const NAME: &'static str = "Extent";
+    const MIN_LEN: usize = EXTENT_ENC_LEN;
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(Extent {
+            logical_offset: r.u64("Extent.logical_offset")?,
+            physical_block: r.u64("Extent.physical_block")?,
+            length: r.u64("Extent.length")?,
+        })
+    }
+}
+
+crate::codec::list_name!(Extent => "Extent");
+
+/// §R5 `AttributeValue`: a `u32` discriminant then the payload.
+impl Encode for AttributeValue {
+    fn encode(&self, w: &mut Writer) {
+        match self {
+            AttributeValue::Int(i) => {
+                w.u32(0);
+                w.i64(*i);
+            }
+            AttributeValue::Float(f) => {
+                w.u32(1);
+                w.f64(*f);
+            }
+            AttributeValue::String(s) => {
+                w.u32(2);
+                w.str(s);
+            }
+            AttributeValue::Blob(b) => {
+                w.u32(3);
+                w.bytes(b);
+            }
+            AttributeValue::Vector(v) => {
+                w.u32(4);
+                w.len(v.len());
+                for f in v {
+                    w.f32(*f);
+                }
+            }
+        }
+    }
+}
+
+impl Decode for AttributeValue {
+    const NAME: &'static str = "AttributeValue";
+    const MIN_LEN: usize = 12;
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(match r.variant("AttributeValue.tag", 5)? {
+            0 => AttributeValue::Int(r.i64("AttributeValue.Int")?),
+            1 => AttributeValue::Float(r.f64("AttributeValue.Float")?),
+            2 => AttributeValue::String(r.string("AttributeValue.String")?),
+            3 => AttributeValue::Blob(r.bytes("AttributeValue.Blob")?),
+            _ => {
+                let n = r.len("AttributeValue.Vector", 4)?;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    v.push(r.f32("AttributeValue.Vector[]")?);
+                }
+                AttributeValue::Vector(v)
+            }
+        })
+    }
+}
+
+/// §R6 `Inode` (the record proper; the v6 meta trailer and the spill
+/// trailer that follow it are hand-packed, §R7/§R8). The in-RAM-only fields
+/// (`parent`, `name`, `ctime`, `mtime`, `atime`) are NOT part of this record.
+impl Encode for Inode {
+    fn encode(&self, w: &mut Writer) {
+        w.u64(self.id);
+        self.kind.encode(w);
+        w.u64(self.size);
+        w.seq(&self.chunks);
+        w.map(&self.attributes);
+        w.map(&self.large_attributes);
+    }
+}
+
+impl Decode for Inode {
+    const NAME: &'static str = "Inode";
+    const MIN_LEN: usize = 44;
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let id = r.u64("Inode.id")?;
+        let kind = FileKind::decode_field(r, "Inode.kind")?;
+        let size = r.u64("Inode.size")?;
+        let chunks = r.seq("Inode.chunks")?;
+        let attributes = r.map("Inode.attributes")?;
+        let large_attributes = r.map("Inode.large_attributes")?;
+        Ok(Inode {
+            id,
+            kind,
+            size,
+            chunks,
+            attributes,
+            large_attributes,
+            parent: 0,
+            name: None,
+            ctime: 0,
+            mtime: 0,
+            atime: 0,
+        })
+    }
+}
+
+/// §R8 `IndirectTrailer`: three `u64` then the index extent list.
+impl Encode for IndirectTrailer {
+    fn encode(&self, w: &mut Writer) {
+        w.u64(self.magic);
+        w.u64(self.total_extents);
+        w.u64(self.overflow_len);
+        w.seq(&self.index);
+    }
+}
+
+impl Decode for IndirectTrailer {
+    const NAME: &'static str = "IndirectTrailer";
+    const MIN_LEN: usize = 32;
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(IndirectTrailer {
+            magic: r.u64("IndirectTrailer.magic")?,
+            total_extents: r.u64("IndirectTrailer.total_extents")?,
+            overflow_len: r.u64("IndirectTrailer.overflow_len")?,
+            index: r.seq("IndirectTrailer.index")?,
+        })
     }
 }

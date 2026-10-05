@@ -1,0 +1,23 @@
+# Optional live URLs: run with `run.sh aether --all`. Network-dependent, never in the baseline.
+# (All three were refused by the sandbox egress policy on 2026-10-04.)
+
+[[case]]
+name = "live-example"
+optional = true
+url = "https://example.com/"
+subject = { kind = "cmd", run = "{repo}/target/release/aether render {url} --width {w} --height {h} --out {out} --ledger {outdir}/{case}.ledger.txt", ledger = "{outdir}/{case}.ledger.txt" }
+oracle = { kind = "chromium", url = "{url}" }
+
+[[case]]
+name = "live-wikipedia"
+optional = true
+url = "https://en.wikipedia.org/wiki/Web_browser"
+subject = { kind = "cmd", run = "{repo}/target/release/aether render {url} --width {w} --height {h} --out {out} --ledger {outdir}/{case}.ledger.txt", ledger = "{outdir}/{case}.ledger.txt" }
+oracle = { kind = "chromium", url = "{url}" }
+
+[[case]]
+name = "live-news"
+optional = true
+url = "https://text.npr.org/"
+subject = { kind = "cmd", run = "{repo}/target/release/aether render {url} --width {w} --height {h} --out {out} --ledger {outdir}/{case}.ledger.txt", ledger = "{outdir}/{case}.ledger.txt" }
+oracle = { kind = "chromium", url = "{url}" }

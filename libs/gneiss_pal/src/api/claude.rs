@@ -16,8 +16,8 @@
 
 //! The Claude provider: raw HTTP to the Messages API (VEINPROV, B303).
 //!
-//! Rust has no official Anthropic SDK; raw HTTP over the crate's `reqwest` is
-//! the sanctioned path. `POST {base}/v1/messages` with `x-api-key`,
+//! Rust has no official Anthropic SDK; raw HTTP over UnaOS's own client
+//! ([`super::http`], HTTPCORE SR51) is the sanctioned path. `POST {base}/v1/messages` with `x-api-key`,
 //! `anthropic-version: 2023-06-01` and a JSON body. Rules this connector keeps:
 //!
 //! - The default model is `claude-opus-5-5` (exact id, no date suffix).
@@ -40,7 +40,7 @@
 //! non-PDF document) is a [`ProviderError::Unsupported`] refusal to attach —
 //! never a silent drop.
 
-use reqwest::{Client, ClientBuilder, RequestBuilder};
+use super::http::{Client, ClientBuilder, RequestBuilder};
 use serde_json::{Value, json};
 use std::time::Duration;
 

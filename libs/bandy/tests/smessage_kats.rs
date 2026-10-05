@@ -29,7 +29,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bandy::ontology::WeightedSkeleton;
-use bandy::signals::{LogEvent, MatrixEvent, PrefValue, PrincipiaCommand, SMessage};
+use bandy::signals::{
+    FacetCommand, FacetEdit, FacetFormat, FacetImageInfo, FacetView, FacetZoom, LogEvent, MatrixEvent, PrefValue,
+    PrincipiaCommand, SMessage,
+};
 use bandy::state::{
     BrowseEntry, BrowseKind, BrowseListing, DispatchRecord, FsOutcome, FsVerb, LogLine, LogSource,
 };
@@ -337,6 +340,54 @@ kat!(
         rgba: vec![255, 0, 0, 255],
     },
     r#"{"BrowserFaviconChanged":{"width":1,"height":1,"rgba":[255,0,0,255]}}"#
+);
+
+// --- STRIA (A/V playback) ---
+
+kat!(kat_media_poster, SMessage::MediaPoster { url: "file:///v.webm".to_string() }, r#"{"MediaPoster":{"url":"file:///v.webm"}}"#);
+kat!(kat_media_pause, SMessage::MediaPause { url: "u".to_string() }, r#"{"MediaPause":{"url":"u"}}"#);
+kat!(kat_media_resume, SMessage::MediaResume { url: "u".to_string() }, r#"{"MediaResume":{"url":"u"}}"#);
+kat!(
+    kat_media_seek,
+    SMessage::MediaSeek { url: "u".to_string(), position_ns: 1_500_000_000 },
+    r#"{"MediaSeek":{"url":"u","position_ns":1500000000}}"#
+);
+kat!(kat_media_stop, SMessage::MediaStop { url: "u".to_string() }, r#"{"MediaStop":{"url":"u"}}"#);
+kat!(kat_media_mute, SMessage::MediaMute { url: "u".to_string(), muted: true }, r#"{"MediaMute":{"url":"u","muted":true}}"#);
+kat!(
+    kat_media_opened,
+    SMessage::MediaOpened {
+        url: "u".to_string(),
+        duration_ns: 1_000_000_000,
+        width: 320,
+        height: 240,
+        video: "av01".to_string(),
+        audio: "".to_string(),
+        real_video: false,
+        audio_clock: false,
+    },
+    r#"{"MediaOpened":{"url":"u","duration_ns":1000000000,"width":320,"height":240,"video":"av01","audio":"","real_video":false,"audio_clock":false}}"#
+);
+kat!(
+    kat_media_frame,
+    SMessage::MediaFrame { url: "u".to_string(), pts_ns: 40_000_000, width: 1, height: 1, rgba: vec![1, 2, 3, 255], levels: vec![] },
+    r#"{"MediaFrame":{"url":"u","pts_ns":40000000,"width":1,"height":1,"rgba":[1,2,3,255]}}"#
+);
+// AUDIOTRACK (SR45): an audio-only session's meter frame — no pixels, peak L/R per 50 ms.
+kat!(
+    kat_media_frame_levels,
+    SMessage::MediaFrame { url: "u".to_string(), pts_ns: 50_000_000, width: 0, height: 0, rgba: vec![], levels: vec![[0.5, 0.25], [1.0, 0.0]] },
+    r#"{"MediaFrame":{"url":"u","pts_ns":50000000,"width":0,"height":0,"rgba":[],"levels":[[0.5,0.25],[1.0,0.0]]}}"#
+);
+kat!(
+    kat_media_ended,
+    SMessage::MediaEnded { url: "u".to_string(), presented: 10, dropped: 0 },
+    r#"{"MediaEnded":{"url":"u","presented":10,"dropped":0}}"#
+);
+kat!(
+    kat_media_error,
+    SMessage::MediaError { url: "u".to_string(), error: "no such file".to_string() },
+    r#"{"MediaError":{"url":"u","error":"no such file"}}"#
 );
 
 // --- EDITOR (The Code Pane) ---
@@ -725,6 +776,203 @@ kat!(
     r#"{"Logs":{"LogTail":{"lines":[{"seq":1,"level":"info","source":"net","content":"link up"}],"dropped":2,"paused":false}}}"#
 );
 
+// --- FACET (SR29) ------------------------------------------------------------
+
+fn facet_info() -> FacetImageInfo {
+    FacetImageInfo {
+        path: "/una/a.png".to_string(),
+        format: "png".to_string(),
+        source_width: 4,
+        source_height: 2,
+        width: 2,
+        height: 4,
+        orientation: 6,
+        colour: "sRGB chunk".to_string(),
+        bit_depth: 8,
+        has_alpha: true,
+        frames: 1,
+        bytes: 99,
+        edits: 0,
+    }
+}
+
+kat!(
+    kat_facet_image_open,
+    SMessage::Facet(FacetCommand::ImageOpen {
+        receipt_id: 7,
+        principal: Origin::LocalUser("una".to_string()),
+        path: "/una/a.png".to_string(),
+    }),
+    r#"{"Facet":{"ImageOpen":{"receipt_id":7,"principal":{"LocalUser":"una"},"path":"/una/a.png"}}}"#
+);
+kat!(
+    kat_facet_image_opened,
+    SMessage::Facet(FacetCommand::ImageOpened { receipt_id: 7, handle: 1, info: facet_info() }),
+    r#"{"Facet":{"ImageOpened":{"receipt_id":7,"handle":1,"info":{"path":"/una/a.png","format":"png","source_width":4,"source_height":2,"width":2,"height":4,"orientation":6,"colour":"sRGB chunk","bit_depth":8,"has_alpha":true,"frames":1,"bytes":99,"edits":0}}}}"#
+);
+kat!(
+    kat_facet_image_info,
+    SMessage::Facet(FacetCommand::ImageInfo { receipt_id: 8, handle: 1 }),
+    r#"{"Facet":{"ImageInfo":{"receipt_id":8,"handle":1}}}"#
+);
+kat!(
+    kat_facet_image_info_is,
+    SMessage::Facet(FacetCommand::ImageInfoIs { receipt_id: 8, handle: 1, info: facet_info() }),
+    r#"{"Facet":{"ImageInfoIs":{"receipt_id":8,"handle":1,"info":{"path":"/una/a.png","format":"png","source_width":4,"source_height":2,"width":2,"height":4,"orientation":6,"colour":"sRGB chunk","bit_depth":8,"has_alpha":true,"frames":1,"bytes":99,"edits":0}}}}"#
+);
+kat!(
+    kat_facet_image_edit_crop,
+    SMessage::Facet(FacetCommand::ImageEdit {
+        receipt_id: 9,
+        handle: 1,
+        edit: FacetEdit::Crop { x: 1, y: 2, width: 3, height: 4 },
+    }),
+    r#"{"Facet":{"ImageEdit":{"receipt_id":9,"handle":1,"edit":{"Crop":{"x":1,"y":2,"width":3,"height":4}}}}}"#
+);
+kat!(
+    kat_facet_image_edit_adjust,
+    SMessage::Facet(FacetCommand::ImageEdit {
+        receipt_id: 10,
+        handle: 1,
+        edit: FacetEdit::Adjust { brightness: 1.5, contrast: 0.5 },
+    }),
+    r#"{"Facet":{"ImageEdit":{"receipt_id":10,"handle":1,"edit":{"Adjust":{"brightness":1.5,"contrast":0.5}}}}}"#
+);
+kat!(
+    kat_facet_image_edit_undo,
+    SMessage::Facet(FacetCommand::ImageEdit { receipt_id: 11, handle: 1, edit: FacetEdit::Undo }),
+    r#"{"Facet":{"ImageEdit":{"receipt_id":11,"handle":1,"edit":"Undo"}}}"#
+);
+kat!(
+    kat_facet_image_render,
+    SMessage::Facet(FacetCommand::ImageRender {
+        receipt_id: 12,
+        handle: 1,
+        width: 640,
+        height: 480,
+        view: FacetView {
+            zoom: FacetZoom::Percent(200),
+            pan_x: -3,
+            pan_y: 4,
+            quarter_turns: 1,
+            flip_h: true,
+            flip_v: false,
+        },
+    }),
+    r#"{"Facet":{"ImageRender":{"receipt_id":12,"handle":1,"width":640,"height":480,"view":{"zoom":{"Percent":200},"pan_x":-3,"pan_y":4,"quarter_turns":1,"flip_h":true,"flip_v":false}}}}"#
+);
+kat!(
+    kat_facet_image_render_fit,
+    SMessage::Facet(FacetCommand::ImageRender {
+        receipt_id: 13,
+        handle: 1,
+        width: 2,
+        height: 2,
+        view: FacetView::default(),
+    }),
+    r#"{"Facet":{"ImageRender":{"receipt_id":13,"handle":1,"width":2,"height":2,"view":{"zoom":"Fit","pan_x":0,"pan_y":0,"quarter_turns":0,"flip_h":false,"flip_v":false}}}}"#
+);
+kat!(
+    kat_facet_image_rendered,
+    SMessage::Facet(FacetCommand::ImageRendered {
+        receipt_id: 13,
+        handle: 1,
+        width: 1,
+        height: 1,
+        rgba: vec![1, 2, 3, 255],
+    }),
+    r#"{"Facet":{"ImageRendered":{"receipt_id":13,"handle":1,"width":1,"height":1,"rgba":[1,2,3,255]}}}"#
+);
+kat!(
+    kat_facet_image_export,
+    SMessage::Facet(FacetCommand::ImageExport {
+        receipt_id: 14,
+        handle: 1,
+        path: "/una/out.png".to_string(),
+        format: FacetFormat::Png,
+        overwrite: false,
+    }),
+    r#"{"Facet":{"ImageExport":{"receipt_id":14,"handle":1,"path":"/una/out.png","format":"Png","overwrite":false}}}"#
+);
+kat!(
+    kat_facet_image_exported,
+    SMessage::Facet(FacetCommand::ImageExported {
+        receipt_id: 14,
+        handle: 1,
+        path: "/una/out.png".to_string(),
+        bytes: 321,
+    }),
+    r#"{"Facet":{"ImageExported":{"receipt_id":14,"handle":1,"path":"/una/out.png","bytes":321}}}"#
+);
+kat!(
+    kat_facet_image_close,
+    SMessage::Facet(FacetCommand::ImageClose { handle: 1 }),
+    r#"{"Facet":{"ImageClose":{"handle":1}}}"#
+);
+kat!(
+    kat_facet_image_error,
+    SMessage::Facet(FacetCommand::ImageError {
+        receipt_id: 15,
+        handle: None,
+        message: "no such file".to_string(),
+    }),
+    r#"{"Facet":{"ImageError":{"receipt_id":15,"handle":null,"message":"no such file"}}}"#
+);
+
+fn facet_variant_name(c: &FacetCommand) -> &'static str {
+    match c {
+        FacetCommand::ImageOpen { .. } => "ImageOpen",
+        FacetCommand::ImageOpened { .. } => "ImageOpened",
+        FacetCommand::ImageInfo { .. } => "ImageInfo",
+        FacetCommand::ImageInfoIs { .. } => "ImageInfoIs",
+        FacetCommand::ImageEdit { .. } => "ImageEdit",
+        FacetCommand::ImageRender { .. } => "ImageRender",
+        FacetCommand::ImageRendered { .. } => "ImageRendered",
+        FacetCommand::ImageExport { .. } => "ImageExport",
+        FacetCommand::ImageExported { .. } => "ImageExported",
+        FacetCommand::ImageClose { .. } => "ImageClose",
+        FacetCommand::ImageError { .. } => "ImageError",
+    }
+}
+
+fn facet_edit_variant_name(e: &FacetEdit) -> &'static str {
+    match e {
+        FacetEdit::Crop { .. } => "Crop",
+        FacetEdit::Rotate { .. } => "Rotate",
+        FacetEdit::Flip { .. } => "Flip",
+        FacetEdit::Resize { .. } => "Resize",
+        FacetEdit::Adjust { .. } => "Adjust",
+        FacetEdit::Undo => "Undo",
+        FacetEdit::Redo => "Redo",
+        FacetEdit::Reset => "Reset",
+    }
+}
+
+#[test]
+fn facet_vocabulary_complete() {
+    assert_eq!(facet_variant_name(&FacetCommand::ImageClose { handle: 0 }), "ImageClose");
+    assert_eq!(facet_edit_variant_name(&FacetEdit::Reset), "Reset");
+    assert_eq!(FacetFormat::Jpeg, FacetFormat::Jpeg);
+}
+
+#[test]
+fn facet_open_image_association() {
+    assert_eq!(FacetCommand::image_mime_for("/a/b/Photo.JPG"), Some("image/jpeg"));
+    assert_eq!(FacetCommand::image_mime_for("x.png"), Some("image/png"));
+    assert_eq!(FacetCommand::image_mime_for("dir.png/readme"), None);
+    assert_eq!(FacetCommand::image_mime_for("anim.webp"), Some("image/webp"));
+    assert_eq!(FacetCommand::image_mime_for("notes.txt"), None);
+    assert_eq!(FacetCommand::image_mime_for("png"), None);
+    assert_eq!(FacetCommand::local_image_path("file:///home/una/My%20Photo.jpeg").as_deref(), Some("/home/una/My Photo.jpeg"));
+    assert_eq!(FacetCommand::local_image_path("file://localhost/a/b.png?x=1#f").as_deref(), Some("/a/b.png"));
+    assert_eq!(FacetCommand::local_image_path("/a/b.webp").as_deref(), Some("/a/b.webp"));
+    assert_eq!(FacetCommand::local_image_path("https://una.os/b.png"), None);
+    assert_eq!(FacetCommand::local_image_path("file:///a/b.html"), None);
+    assert_eq!(FacetCommand::local_image_path("file:///a/b%2.png").as_deref(), Some("/a/b%2.png"));
+    assert!(FacetCommand::ImageOpen { receipt_id: 1, principal: Origin::System("t".into()), path: "a".into() }.is_request());
+    assert!(!FacetCommand::ImageExported { receipt_id: 1, handle: 1, path: "a".into(), bytes: 0 }.is_request());
+}
+
 // --- COMPLETENESS GUARD ------------------------------------------------------
 //
 // Exhaustive matches over the message vocabulary, with NO wildcard arm.
@@ -776,6 +1024,16 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserUrlChanged(_) => "BrowserUrlChanged",
         SMessage::BrowserTitleChanged(_) => "BrowserTitleChanged",
         SMessage::BrowserFaviconChanged { .. } => "BrowserFaviconChanged",
+        SMessage::MediaPoster { .. } => "MediaPoster",
+        SMessage::MediaPause { .. } => "MediaPause",
+        SMessage::MediaResume { .. } => "MediaResume",
+        SMessage::MediaSeek { .. } => "MediaSeek",
+        SMessage::MediaStop { .. } => "MediaStop",
+        SMessage::MediaMute { .. } => "MediaMute",
+        SMessage::MediaOpened { .. } => "MediaOpened",
+        SMessage::MediaFrame { .. } => "MediaFrame",
+        SMessage::MediaEnded { .. } => "MediaEnded",
+        SMessage::MediaError { .. } => "MediaError",
         SMessage::EditorLoad { .. } => "EditorLoad",
         SMessage::EditorEdited { .. } => "EditorEdited",
         SMessage::EditorSaveRequest => "EditorSaveRequest",
@@ -789,6 +1047,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::Principia(_) => "Principia",
         SMessage::Matrix(_) => "Matrix",
         SMessage::Logs(_) => "Logs",
+        SMessage::Facet(_) => "Facet",
         SMessage::Input { .. } => "Input",
         SMessage::TemplateAction(_) => "TemplateAction",
         SMessage::NavSelect(_) => "NavSelect",

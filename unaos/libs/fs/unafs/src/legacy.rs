@@ -31,7 +31,6 @@ use crate::inode::{AttributeValue, ExtentList, FileKind, Inode};
 use crate::storage::{BLOCK_SIZE, BlockDevice, Error as StorageError};
 use alloc::string::String;
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
 
 /// The version this module (and only this module) can read.
 pub const LEGACY_VERSION: u32 = 2;
@@ -39,7 +38,7 @@ pub const LEGACY_VERSION: u32 = 2;
 /// The version-2 superblock, exactly as `Superblock` looked pre-K8.
 /// (`Serialize` is derived only so tests can BUILD v2 fixtures to migrate;
 /// no production path ever writes this format again.)
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct LegacySuperblock {
     pub magic: [u8; 5],
     pub version: u32,
@@ -324,4 +323,45 @@ pub fn migrate_k8_into<S: BlockDevice, T: BlockDevice>(
         }
     }
     Ok(report)
+}
+
+/// UNAFSCODEC §R13 `LegacySuperblock` (v2, read-only): 77 bytes.
+impl crate::codec::Encode for LegacySuperblock {
+    fn encode(&self, w: &mut crate::codec::Writer) {
+        w.raw(&self.magic);
+        w.u32(self.version);
+        w.u32(self.block_size);
+        for v in [
+            self.block_count,
+            self.root_inode,
+            self.free_blocks,
+            self.bitmap_start,
+            self.bitmap_blocks,
+            self.journal_start,
+            self.journal_blocks,
+            self.catalog_inode,
+        ] {
+            w.u64(v);
+        }
+    }
+}
+
+impl crate::codec::Decode for LegacySuperblock {
+    const NAME: &'static str = "LegacySuperblock";
+    const MIN_LEN: usize = 77;
+    fn decode(r: &mut crate::codec::Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        Ok(LegacySuperblock {
+            magic: r.array("LegacySuperblock.magic")?,
+            version: r.u32("LegacySuperblock.version")?,
+            block_size: r.u32("LegacySuperblock.block_size")?,
+            block_count: r.u64("LegacySuperblock.block_count")?,
+            root_inode: r.u64("LegacySuperblock.root_inode")?,
+            free_blocks: r.u64("LegacySuperblock.free_blocks")?,
+            bitmap_start: r.u64("LegacySuperblock.bitmap_start")?,
+            bitmap_blocks: r.u64("LegacySuperblock.bitmap_blocks")?,
+            journal_start: r.u64("LegacySuperblock.journal_start")?,
+            journal_blocks: r.u64("LegacySuperblock.journal_blocks")?,
+            catalog_inode: r.u64("LegacySuperblock.catalog_inode")?,
+        })
+    }
 }

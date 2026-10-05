@@ -9,6 +9,10 @@ aether = { path = "../../handlers/aether" }
 tokio = { version = "1", features = ["full"] }
 quartzite = { path = "../../libs/quartzite" }
 bandy = { path = "../../libs/bandy" }
+# SR29: local image navigations are delegated to the Images handler.
+facet = { path = "../../handlers/facet" }
+# AETHERVIDEO (SR39): Stria plays the page's <video>/<audio>; the vessel hosts its media service.
+stria = { path = "../../handlers/stria" }
 
 [features]
 default = []

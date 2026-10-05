@@ -39,8 +39,8 @@ fn volume(blocks: u64) -> (MemDevice, RefMap) {
     for b in 0..blocks {
         dev.write_block(b, &zero).expect("size the volume");
     }
-    let mut rm = RefMap::try_new(blocks).expect("refmap");
-    rm.incref(0);
+    let mut rm = RefMap::try_new(blocks, unafs::maptree::Shape::Paged).expect("refmap");
+    rm.incref(&mut dev, 0);
     (dev, rm)
 }
 
@@ -630,7 +630,7 @@ fn a_chain_of_snapshots_each_reads_its_own_generation() {
         }
         // Retain: incref every block this generation reaches, then freeze.
         for b in tree.reachable_blocks(&mut store).expect("reach") {
-            store.refmap.incref(b);
+            store.refmap.incref(store.device, b);
         }
         store.refmap.freeze();
         roots.push(tree.root());

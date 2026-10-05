@@ -25,7 +25,7 @@ toml = "1.1"
 # re-adding it leaves `gix_hash::Kind` variant-less and the dependency tree does
 # not compile (gix-hash gates `Kind::Sha1` on it). Git object ids are SHA-1, so
 # this is not optional for us.
-gix = { version = "0.85", default-features = false, features = ["parallel", "revision", "blob-diff", "status", "sha1"] }
+gix = { version = "0.88", default-features = false, features = ["parallel", "revision", "blob-diff", "status", "sha1"] }
 # The vault-probe rides UnaFS's fail-closed mount check (read-only, host-native).
 unafs = { path = "../../unaos/libs/fs/unafs" }
 gtk4 = { version = "0.11.4", features = ["v4_12"], optional = true }

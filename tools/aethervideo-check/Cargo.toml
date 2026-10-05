@@ -1,0 +1,23 @@
+# =====================================================================
+# CRATE: tools/aethervideo-check/Cargo.toml
+# DESCRIPTION: AETHERVIDEO (LEDGER SR39) oracle face: renders a page with
+#              <video> through Aether + Stria's media service on a real
+#              bandy bus (headless), seeks to frame N, writes the PNG, and
+#              compares it with Chromium's screenshot of the same page.
+# =====================================================================
+
+[package]
+name = "aethervideo-check"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[dependencies]
+aether = { path = "../../handlers/aether" }
+stria = { path = "../../handlers/stria" }
+bandy = { path = "../../libs/bandy" }
+gneiss_pal = { path = "../../libs/gneiss_pal" }
+# PNG read/write for the oracle comparison (a utility; nothing here decodes video).
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+# The bus receiver type (bandy's Synapse is a tokio broadcast channel).
+tokio = { version = "1.53.2", features = ["sync"] }
