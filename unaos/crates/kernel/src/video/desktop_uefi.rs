@@ -511,12 +511,12 @@ pub fn activate_on(desc: SurfaceDesc) {
     //
     // `MAX_WINDOWS` is the count and not the live one deliberately: the check must hold for every
     // table state the boot can reach, not for the empty table it happens to be run against.
-    if super::dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_none() {
+    if super::dock::Layout::for_panel(super::wincap::dock_rows(pw, ph), pw, ph).is_none() {
         ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
         crate::census_println!(
             "[wc-x] activate DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} \
              (the console's minimise disc would have no way back) latch=released",
-            pw, ph, wm::MAX_WINDOWS
+            pw, ph, super::wincap::dock_rows(pw, ph)
         );
         return;
     }

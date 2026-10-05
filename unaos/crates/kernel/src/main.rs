@@ -7911,7 +7911,7 @@ fn tegra_desk_arm() -> bool {
     // 640x480 clears the floor above. Reported as the console-window CENSUS term rather than as a
     // refusal because a withheld console window is not fatal to `desktop_firmware` either: the bar follows
     // regardless, which is the one place `desktop_firmware`'s sequence deliberately differs from `desktop_uefi`'s.
-    let cwin_ok = dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_some();
+    let cwin_ok = dock::Layout::for_panel(unaos_kernel::video::wincap::dock_rows(pw, ph), pw, ph).is_some();
     let routed_now = fbcon::console_is_routed();
 
     // THE CENSUS. Printed unconditionally, before any refusal below it, so a capture always carries
@@ -7924,7 +7924,7 @@ fn tegra_desk_arm() -> bool {
         if routed_now { "ROUTED" } else { "UNROUTED" },
         if TEGRADESK_CLICK_ROUTED { "LANDED" } else { "UNLANDED" },
         if TEGRADESK_CASCADE_OK { "CLEARED" } else { "HELD" },
-        wm::MAX_WINDOWS
+        unaos_kernel::video::wincap::dock_rows(pw, ph)
     );
 
     if live != 0 {

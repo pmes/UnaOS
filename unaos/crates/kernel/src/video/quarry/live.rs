@@ -1959,10 +1959,10 @@ pub fn open() {
     // battery — which asserts exact panel pixels and knows nothing of a file manager — is unperturbed.
     // The bench panel (1920x1200) hosts the strip, so that is where the window actually opens, and the
     // armed bench-geometry run is where its effect on that battery is measured rather than assumed.
-    if crate::video::dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_none() {
+    if crate::video::dock::Layout::for_panel(crate::video::wincap::dock_rows(pw, ph), pw, ph).is_none() {
         serial_println!(
             "[quarry] DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} (the minimise disc would have no way back, and neither would the pinned tile)",
-            pw, ph, wm::MAX_WINDOWS
+            pw, ph, crate::video::wincap::dock_rows(pw, ph)
         );
         return;
     }
