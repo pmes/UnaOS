@@ -2475,4 +2475,14 @@ mod tests {
         assert!((d.0 + d.2 - a.0 - 400.0).abs() <= 1.0, "the columns fill the 400px table: {a:?} {d:?}");
         assert_eq!(c.1, a.1 + a.3 - 1.0, "rows overlap by the shared border");
     }
+
+    /// vertical-align: super grows its line box by Blink's shift
+    /// (parent/3 + 1 = 6.33px at 16px, less the smaller sup glyph box).
+    #[test]
+    fn test_sup_grows_line_box() {
+        let a = laid_out(r#"<html><body><p id=p>E=mc2 x</p></body></html>"#, "body{margin:0} p{margin:0}");
+        let b = laid_out(r#"<html><body><p id=p>E=mc<sup>2</sup> x</p></body></html>"#, "body{margin:0} p{margin:0}");
+        let (pa, pb) = (rect_by_id(&a, "p").unwrap(), rect_by_id(&b, "p").unwrap());
+        assert!(pb.3 >= pa.3 + 2.0, "line box grows: {pa:?} -> {pb:?}");
+    }
 }

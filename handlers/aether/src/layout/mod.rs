@@ -1234,6 +1234,22 @@ fn fix_display_contexts(tree: &mut LayoutTree) {
 /// holding the built value (no author rule replaced it) is rescaled.
 fn rescale_ua_margins(tree: &mut LayoutTree, sizes: &HashMap<taffy::NodeId, f32>) {
     for (&id, &fs) in sizes {
+        if fs < 0.0 {
+            // sup/sub: Blink's shift (parent/3 + 1 up, parent/5 + 1 down)
+            // as margin on the shifted side, so the line box contains it.
+            let parent = -fs;
+            let sup = tree.node_map.get(&id).and_then(|n| n.as_element().map(|e| e.name.local.as_ref() == "sup")).unwrap_or(false);
+            if let Ok(st) = tree.taffy.style(id) {
+                let mut st = st.clone();
+                if sup {
+                    st.margin.top = LengthPercentageAuto::length(parent / 3.0 + 1.0);
+                } else {
+                    st.margin.bottom = LengthPercentageAuto::length(parent / 5.0 + 1.0);
+                }
+                let _ = tree.taffy.set_style(id, st);
+            }
+            continue;
+        }
         let Some((k, built)) = tree.paint_map.get(&id).and_then(|p| p.ua_vmargin) else { continue };
         let want = k * fs;
         let Ok(st) = tree.taffy.style(id) else { continue };
@@ -1287,6 +1303,12 @@ pub fn remeasure(tree: &mut LayoutTree) {
                     .unwrap_or_else(|| ua_font_size(tag, inherited.font_size, inherited.family, own_family));
                 if paint.is_some_and(|p| p.ua_vmargin.is_some()) {
                     sizes.insert(node_id, size.font_size);
+                }
+                if matches!(tag, "sup" | "sub") {
+                    // vertical-align: super/sub grows the line box by the
+                    // shift (the painter raises/lowers the glyphs by it);
+                    // the parent's size is keyed negative-free by tag below.
+                    sizes.insert(node_id, -inherited.font_size);
                 }
                 if let Some(lh) = paint.and_then(|p| p.line_height) {
                     size.line_height = lh;

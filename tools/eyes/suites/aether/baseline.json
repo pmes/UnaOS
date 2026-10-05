@@ -36,9 +36,9 @@
       "ssim": 0.9369
     },
     "08-inline-wrap": {
-      "mismatch": 5.79,
+      "mismatch": 2.56,
       "missing": 0,
-      "ssim": 0.7824
+      "ssim": 0.9794
     },
     "09-media-queries": {
       "mismatch": 0.79,
