@@ -34,6 +34,21 @@ fn stage_trust(src: &std::path::Path, volume: &std::path::Path) -> bool {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("roots.pem"), &pem).unwrap();
     println!("   TRUST: staged system/trust/roots.pem into {} ({} B, sha256 {} = pin)", volume.display(), pem.len(), have);
+    // CTCORE (SR60): the CT log list (and CCADB intermediates) beside the roots, each pinned by its .sha256.
+    for extra in ["ctlogs.jsn", "inters.pem"] {
+        let f = src.with_file_name(extra);
+        let Ok(bytes) = std::fs::read(&f) else {
+            println!("   TRUST: system/trust/{extra} absent — run tools/trust-bundle (TLS still verifies; {})", if extra == "ctlogs.jsn" { "ct=off" } else { "no intermediate pool" });
+            continue;
+        };
+        let pin_file = src.with_file_name(format!("{extra}.sha256"));
+        let pin = std::fs::read_to_string(&pin_file).unwrap_or_default();
+        let pin = pin.split_whitespace().next().unwrap_or("").to_string();
+        let have: String = crypto_core::sha2::sha256(&bytes).iter().map(|b| format!("{:02x}", b)).collect();
+        assert!(have == pin, "system/trust/{} sha256 {} != pin {} ({}): re-run tools/trust-bundle", extra, have, pin, pin_file.display());
+        std::fs::write(dir.join(extra), &bytes).unwrap();
+        println!("   TRUST: staged system/trust/{extra} ({} B, sha256 {} = pin)", bytes.len(), have);
+    }
     true
 }
 

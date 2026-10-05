@@ -45,18 +45,36 @@ impl TrustFail {
     }
 }
 
+/// CTCORE (SR60): Google's CT log list as `tools/trust-bundle` stages it (8.3: SYSTEM/TRUST/CTLOGS.JSN).
+pub const CT_LOGS_PATH: &str = "/system/trust/ctlogs.jsn";
+const _: () = assert!(CT_LOGS_PATH.len() <= SYS_OPEN_NAME_MAX);
+/// Today's list is 50 KB.
+pub const CT_LOGS_MAX: usize = 512 * 1024;
+
 /// Load and parse the bundle at [`ROOTS_PATH`].
 pub fn load() -> Result<(TrustStore, LoadReport), TrustFail> {
+    parse(&read_file(ROOTS_PATH, ROOTS_MAX)?)
+}
+
+/// The CT log list at [`CT_LOGS_PATH`] (report mode): `None` when absent or unparseable — the handshake then
+/// reports `ct=off`, it does not fail.
+pub fn load_ct(p: &dyn tls_core::CryptoProvider) -> Option<tls_core::ct::CtConfig> {
+    let text = read_file(CT_LOGS_PATH, CT_LOGS_MAX).ok()?;
+    let list = tls_core::ct::LogList::parse_v3(p, &text, tls_core::ct::LIST_GOOGLE).ok()?;
+    Some(tls_core::ct::CtConfig { list, mode: tls_core::ct::CtMode::Report })
+}
+
+fn read_file(path: &str, max: usize) -> Result<Vec<u8>, TrustFail> {
     let mut st = [0u8; USER_STAT_LEN];
-    let hint = if sys(SYS_STAT, ROOTS_PATH.as_ptr() as u64, ROOTS_PATH.len() as u64, st.as_mut_ptr() as u64, 0) == 0 {
+    let hint = if sys(SYS_STAT, path.as_ptr() as u64, path.len() as u64, st.as_mut_ptr() as u64, 0) == 0 {
         u64::from_le_bytes([st[8], st[9], st[10], st[11], st[12], st[13], st[14], st[15]]) as usize
     } else {
         0
     };
-    if hint > ROOTS_MAX {
+    if hint > max {
         return Err(TrustFail::TooLarge);
     }
-    let h = sys(SYS_OPEN, ROOTS_PATH.as_ptr() as u64, ROOTS_PATH.len() as u64, 0, 0);
+    let h = sys(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, 0, 0);
     if h < 0 {
         return Err(TrustFail::Open(h));
     }
@@ -70,14 +88,14 @@ pub fn load() -> Result<(TrustStore, LoadReport), TrustFail> {
         if k == 0 {
             break Ok(());
         }
-        if text.len() + k as usize > ROOTS_MAX {
+        if text.len() + k as usize > max {
             break Err(TrustFail::TooLarge);
         }
         text.extend_from_slice(&chunk[..k as usize]);
     };
     sys(SYS_CLOSE, h as u64, 0, 0, 0);
     r?;
-    parse(&text)
+    Ok(text)
 }
 
 /// Parse a PEM bundle (split out so the host test runs the same rule on the real bundle).

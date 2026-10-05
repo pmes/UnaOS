@@ -72,7 +72,7 @@ pub trait ServerCertVerifier {
             (None, false) => OcspStatus::NotRequested,
         };
         let scts = x509::verify::collect_scts(peer.chain.first().map(|v| v.as_slice()), peer.sct_list);
-        Ok(x509::CertVerdict { key, ocsp, scts, pool_intermediates: 0 })
+        Ok(x509::CertVerdict { key, ocsp, scts, pool_intermediates: 0, ct: crate::ct::CtVerdict::off() })
     }
 }
 
@@ -162,8 +162,10 @@ pub struct Negotiated {
     pub resumed: bool,
     /// The stapled OCSP verdict (RFC 6960).
     pub ocsp: x509::ocsp::OcspStatus,
-    /// Certificate Transparency SCTs seen (embedded, TLS, OCSP) — parsed, not verified.
+    /// Certificate Transparency SCTs seen (embedded, TLS, OCSP).
     pub scts: Vec<x509::sct::Sct>,
+    /// CTCORE: the CT verdict (`ct=` policy / no_scts / insufficient / bad_sig / stale_list / off).
+    pub ct: crate::ct::CtVerdict,
     /// Intermediates the verifier took from the trust store's pool because the server omitted them.
     pub pool_intermediates: usize,
 }
@@ -841,6 +843,7 @@ impl<'a, T: Transport> Client<'a, T> {
             resumed,
             ocsp: cert_verdict.as_ref().map(|v| v.ocsp.clone()).unwrap_or(x509::ocsp::OcspStatus::NotRequested),
             scts: cert_verdict.as_ref().map(|v| v.scts.clone()).unwrap_or_default(),
+            ct: cert_verdict.as_ref().map(|v| v.ct.clone()).unwrap_or_else(crate::ct::CtVerdict::off),
             pool_intermediates: cert_verdict.as_ref().map(|v| v.pool_intermediates).unwrap_or(0),
         });
         Ok(())

@@ -1115,7 +1115,7 @@ fn submit(sess: &Session) {
                     if let Some(v) = sent.verified {
                         verified = Some(v);
                         let mut l = Line::new(b"transport=tls verified=");
-                        l.put(v.issuer().as_bytes());
+                        l.put(v.issuer().as_bytes()).put(b" ct=").put(v.ct().as_bytes());
                         let n = l.n;
                         app().note(&l.b[..n]);
                     }
@@ -1165,7 +1165,7 @@ fn submit(sess: &Session) {
     let mut l = Line::new(b":: LUMEN: reply provider=");
     l.put(sess.provider()).put(b" first_token_ms=").dec(first.map_or(-1, |m| m as i64)).put(b" bytes=").dec(bytes as i64).put(b" stop=").put(stop);
     if let Some(v) = verified {
-        l.put(b" transport=tls verified=").put(v.issuer().as_bytes());
+        l.put(b" transport=tls verified=").put(v.issuer().as_bytes()).put(b" ct=").put(v.ct().as_bytes());
     }
     l.put(b" in=").opt(tokens.0).put(b" out=").opt(tokens.1).put(b" ::");
     l.wire();

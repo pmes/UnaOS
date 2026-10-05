@@ -42,3 +42,7 @@ __pycache__/
 
 # TLSCORE: tools/trust-bundle output (the Mozilla bundle is 240 KB; fetched, not committed)
 /system/trust/roots.pem
+# CTCORE: CT log lists staged by tools/trust-bundle (fetched, pinned by their .sha256, not committed)
+/system/trust/ctlogs.jsn
+/system/trust/ctapple.jsn
+/system/trust/inters.pem

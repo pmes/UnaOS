@@ -13,6 +13,8 @@
 //! * [`client`] — the client state machine over a [`client::Transport`]: TLS 1.3, and TLS 1.2 (ECDHE + AEAD only)
 //!   when the configuration offers a 1.2 suite.
 //! * [`resumption`] — TLS 1.3 tickets and the caller-owned [`resumption::TicketStore`] seam (0-RTT refused).
+//! * [`ct`] — Certificate Transparency (RFC 6962 / 9162): log lists, SCT verification, Chrome's CT policy,
+//!   Merkle inclusion proofs (CTCORE).
 //! * [`x509`] — RFC 5280 DER/certificates/path validation, RFC 6125 names, PEM trust store.
 
 #![no_std]
@@ -23,6 +25,7 @@ extern crate alloc;
 pub mod client;
 pub mod codec;
 pub mod crypto;
+pub mod ct;
 pub mod error;
 pub mod key_schedule;
 pub mod msgs;

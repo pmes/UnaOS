@@ -245,6 +245,10 @@ impl TlsSetup {
         if s.provider.is_none() {
             s.provider_why = why;
         }
+        // CTCORE: the staged CT log list, when the builder put one beside the roots (report mode: `ct=`).
+        if let (Some(p), Some(store)) = (s.provider.as_deref(), s.store.as_mut()) {
+            store.ct = trust::load_ct(p);
+        }
         s
     }
 

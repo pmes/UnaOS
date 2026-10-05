@@ -228,3 +228,20 @@ pub fn parse_time(t: &Tlv<'_>) -> Result<i64, CertError> {
     }
     Ok(days_from_civil(year, mo, d) * 86400 + (h * 3600 + mi * 60 + s) as i64)
 }
+
+/// Encodes one definite-length DER TLV (low tag numbers only).
+pub fn encode_tlv(t: u8, content: &[u8]) -> alloc::vec::Vec<u8> {
+    let n = content.len();
+    let mut out = alloc::vec::Vec::with_capacity(n + 6);
+    out.push(t);
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        let bytes = (n as u32).to_be_bytes();
+        let skip = bytes.iter().take_while(|&&b| b == 0).count();
+        out.push(0x80 | (4 - skip) as u8);
+        out.extend_from_slice(&bytes[skip..]);
+    }
+    out.extend_from_slice(content);
+    out
+}

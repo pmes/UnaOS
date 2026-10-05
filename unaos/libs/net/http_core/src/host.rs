@@ -197,13 +197,35 @@ pub fn system_trust() -> Result<(Arc<TrustStore>, String), Error> {
         for c in candidates {
             if std::path::Path::new(&c).is_file() {
                 if let Ok(s) = load_pem(&c) {
-                    return Ok((s, c));
+                    return Ok((with_ct_logs(s, &c), c));
                 }
             }
         }
         Err(Error::Tls("no trust bundle found (set SSL_CERT_FILE)".into()))
     })
     .clone()
+}
+
+/// CTCORE (SR60): attach a CT log list to the store — `$UNAOS_CT_LOGS`, else `ctlogs.jsn` beside a staged
+/// `system/trust/roots.pem` (checked against its `ctlogs.jsn.sha256` pin). `$UNAOS_CT=strict` refuses chains that
+/// miss Chrome's CT policy; otherwise the verdict is only reported (`Negotiated::ct`). No list → `ct=off`.
+fn with_ct_logs(store: Arc<TrustStore>, roots_path: &str) -> Arc<TrustStore> {
+    let path = std::env::var("UNAOS_CT_LOGS").ok().or_else(|| {
+        roots_path.strip_suffix("roots.pem").filter(|_| roots_path.ends_with("system/trust/roots.pem")).map(|d| format!("{d}ctlogs.jsn"))
+    });
+    let Some(path) = path else { return store };
+    let Ok(bytes) = std::fs::read(&path) else { return store };
+    let p = CryptoCoreProvider::new();
+    let pin = std::fs::read_to_string(format!("{path}.sha256")).ok();
+    let have: String = tls_core::CryptoProvider::hash(&p, tls_core::crypto::HashAlg::Sha256, &[&bytes]).as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    if pin.as_deref().and_then(|p| p.split_whitespace().next()).is_some_and(|p| p != have) {
+        return store; // a list that is not the pinned one is not used
+    }
+    let Ok(list) = tls_core::ct::LogList::parse_v3(&p, &bytes, tls_core::ct::LIST_GOOGLE) else { return store };
+    let mode = if std::env::var("UNAOS_CT").as_deref() == Ok("strict") { tls_core::ct::CtMode::Strict } else { tls_core::ct::CtMode::Report };
+    let mut s = (*store).clone();
+    s.ct = Some(tls_core::ct::CtConfig { list, mode });
+    Arc::new(s)
 }
 
 fn resolve_trust(t: &Trust) -> Result<Arc<TrustStore>, Error> {

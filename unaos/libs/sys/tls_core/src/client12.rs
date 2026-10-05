@@ -254,6 +254,7 @@ impl<'a, T: Transport> Client<'a, T> {
             ocsp: verdict.ocsp,
             scts: verdict.scts,
             pool_intermediates: verdict.pool_intermediates,
+            ct: verdict.ct.clone(),
         });
         Ok(())
     }

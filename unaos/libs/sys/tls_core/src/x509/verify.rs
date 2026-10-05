@@ -53,6 +53,8 @@ pub struct TrustAnchor {
     pub subject_key_id: Option<Vec<u8>>,
     /// subjectPublicKey bits (OCSP issuerKeyHash for leaves the anchor issued directly).
     pub key_bits: Vec<u8>,
+    /// The full SubjectPublicKeyInfo (CT issuer_key_hash for leaves the anchor issued directly).
+    pub spki: Vec<u8>,
 }
 
 impl TrustAnchor {
@@ -63,6 +65,7 @@ impl TrustAnchor {
             name_constraints: c.name_constraints.clone(),
             subject_key_id: c.subject_key_id.clone(),
             key_bits: c.key_bits.clone(),
+            spki: c.spki.clone(),
         }
     }
 }
@@ -73,6 +76,8 @@ pub struct TrustStore {
     pub anchors: Vec<TrustAnchor>,
     /// NOT trusted: candidate issuers consulted after the server's own certificates (missing intermediates).
     pub intermediates: Vec<Certificate>,
+    /// CTCORE: a CT log list (and report / strict mode). `None`: SCTs are parsed and reported, `ct=off`.
+    pub ct: Option<crate::ct::CtConfig>,
 }
 
 /// What loading a PEM bundle found.
@@ -87,7 +92,7 @@ pub struct LoadReport {
 
 impl TrustStore {
     pub fn new() -> Self {
-        TrustStore { anchors: Vec::new(), intermediates: Vec::new() }
+        TrustStore { anchors: Vec::new(), intermediates: Vec::new(), ct: None }
     }
     /// Adds every CERTIFICATE block of `text` to the intermediate pool; returns how many parsed.
     pub fn add_intermediates_pem(&mut self, text: &str) -> usize {
@@ -164,6 +169,13 @@ impl VerifiedPath {
         match self.intermediates.first() {
             Some(c) => super::ocsp::Issuer { subject: &c.subject, key: &c.public_key, key_bits: &c.key_bits },
             None => super::ocsp::Issuer { subject: &self.anchor.subject, key: &self.anchor.public_key, key_bits: &self.anchor.key_bits },
+        }
+    }
+    /// The leaf issuer's SubjectPublicKeyInfo (an embedded SCT's issuer_key_hash input).
+    pub fn leaf_issuer_spki(&self) -> &[u8] {
+        match self.intermediates.first() {
+            Some(c) => &c.spki,
+            None => &self.anchor.spki,
         }
     }
 }
@@ -381,10 +393,12 @@ pub struct PeerCertificates<'c> {
 pub struct CertVerdict {
     pub key: PublicKey,
     pub ocsp: super::ocsp::OcspStatus,
-    /// Every SCT found (embedded, TLS, OCSP) — parsed, not verified.
+    /// Every SCT found (embedded, TLS, OCSP).
     pub scts: Vec<super::sct::Sct>,
     /// Intermediates taken from the store's pool (the server omitted them).
     pub pool_intermediates: usize,
+    /// CTCORE: the SCTs verified against the store's log list and Chrome's policy (`ct=`).
+    pub ct: crate::ct::CtVerdict,
 }
 
 /// SCTs from the leaf's extension and the TLS extension.
@@ -438,7 +452,19 @@ impl ServerCertVerifier for WebPkiVerifier<'_> {
             None if peer.ocsp_requested => OcspStatus::NotStapled,
             None => OcspStatus::NotRequested,
         };
-        Ok(CertVerdict { key: path.leaf.public_key.clone(), ocsp, scts, pool_intermediates: path.from_pool })
+        let ct = match &self.store.ct {
+            Some(cfg) => {
+                let v = crate::ct::evaluate(provider, &cfg.list, &path.leaf, Some(path.leaf_issuer_spki()), &scts, now);
+                if cfg.mode == crate::ct::CtMode::Strict
+                    && matches!(v.status, crate::ct::CtStatus::NoScts | crate::ct::CtStatus::Insufficient | crate::ct::CtStatus::BadSig)
+                {
+                    return Err(CertError::CtPolicy(v.status.as_str()).into());
+                }
+                v
+            }
+            None => crate::ct::CtVerdict::off(),
+        };
+        Ok(CertVerdict { key: path.leaf.public_key.clone(), ocsp, scts, pool_intermediates: path.from_pool, ct })
     }
 }
 
