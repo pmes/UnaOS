@@ -44,3 +44,22 @@ each load.
 **Stays owed.** The host Principia load-clamp (its TOML reader is its own `parse_document`, outside this
 kernel arc). Ring-3 delivery of verb 19 (BANDY-3). The VFS swap, which a host test cannot reach: the
 shim's save is RAM.
+
+## Results
+
+| leg | command | exit |
+| :-- | :-- | :-- |
+| x86 metal shape | `cargo +nightly check --release --target ../../x86_64-unaos.json … --features "wc,quarry,ftdirx,login,loginst,nvidia-kepler-vblank,smc,usbnet,hda,hda-tone,facet,beam,sdw,sdwrite,sdhcblk,selfhost,linuxabi,ahci,unafs,busreg,lumen,netring3,prefs_reset,census,installdemo,instgui,witness"` (after each of M1, M2, M3, M5) | 0 |
+| aarch64 desktop shape | `… --target ../../aarch64-unaos.json … --features "login,loginst,virt_el0,desktop_firmware,witness"` (user_blob head `28 00 80 d2`) | 0 |
+| user-prefs | `build_user_prefs_x86`'s cargo line | 0 |
+| host | `cargo test -p prefs_core -p principia` (prefs_core 29 unit + 2 kernel_store + 3 gate + 1 abi; principia 23) | 0 |
+| gate | `python3 tools/prefs-schema-check.py` → `declared=29 referenced=29 undeclared=0 -> PASS`; `--selftest` PASS | 0 |
+
+Before M4, the widened scan went red on exactly nine keys: `system.audio.amp_holdoff_ms` (R9),
+`vein.endpoint`, `vein.key_file` and `vein.tls` (R8), and the five user-prefs table keys (R10, with
+`ui.theme` also caught by R4).
+
+The wire a metal boot should print (`tests prefs`): `[prefs] load clamped=0` on the login load. Then:
+`[prefs] set system.power.lowbat_shutdown_pct=100 ok=1 clamped=1 sent=250`, `[prefs] load clamped=1`
+(the fixture's reload), and `:: PREFS-FIXTURE: codec=1 types=1 file=1 temp_gone=1 malformed_refused=1
+save_held=1 restored=1 loadclamp=1 clamp=1 wire=shared schema_rows=29 -> PASS ::`.

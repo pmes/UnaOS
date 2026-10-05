@@ -577,10 +577,9 @@ pub fn list_body_parse(body: &[u8]) -> Option<Option<&str>> {
 }
 
 /// The kernel's store as the shared wire sees it: reads are the tree, a write is [`set_applied`].
-#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+#[allow(dead_code)] // a no-bus, no-witness build has no caller
 struct KernelStore;
 
-#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
 impl prefs_core::wire::Store for KernelStore {
     fn get(&self, ns: &str, k: &str) -> Option<PrefValue> {
         get(ns, k)
@@ -683,6 +682,7 @@ pub fn selftest() {
     let p = path();
     let original = read_all(&p);
     let tree0 = TREE.lock().clone();
+    let load_clamped0 = LOAD_CLAMPED.load(Ordering::Relaxed);
     let held0 = HELD.load(Ordering::Acquire);
     let (loaded0, saved0) = (LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed));
     HELD.store(false, Ordering::Release);
@@ -705,6 +705,32 @@ pub fn selftest() {
         _ => false,
     };
     let no_temp = read_all(&alloc::format!("{}.new", p)).is_none();
+    // PREFSKERNEL (B345) — Leg C, the set clamp: an out-of-range write stores the schema's clamp and says
+    // so. The key is `power.lowbat_shutdown_pct` (0..=100): read by the power check only, so the fixture
+    // dims no panel and moves no window.
+    let lk = key::LOWBAT_PCT;
+    let clamp_ok = matches!(set_applied(NS, lk, PrefValue::Int(250)), Ok(ref a) if a.clamped && a.value == PrefValue::Int(100))
+        && get(NS, lk) == Some(PrefValue::Int(100))
+        && matches!(set_applied(NS, lk, PrefValue::Int(40)), Ok(ref a) if !a.clamped)
+        && set_applied(NS, lk, PrefValue::Str(String::from("loud"))).is_err()
+        && get(NS, lk) == Some(PrefValue::Int(40));
+    // Leg W, the wire is the shared one: the kernel's fulfiller and prefs_core's reference store answer the
+    // same clamped SET with the same status and the same bytes (`100` NUL `clamped=true`).
+    let wire_body: &[u8] = b"system.power.lowbat_shutdown_pct\x00250";
+    let mut kt = Vec::new();
+    #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] let ks = bus_fulfil(prefs_core::wire::VERB_SET, wire_body, true, &mut kt);
+    #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64")))] let ks = prefs_core::wire::fulfil(&mut KernelStore, prefs_core::wire::VERB_SET, wire_body, true, &mut kt);
+    let mut rt = Vec::new();
+    let rs = prefs_core::wire::fulfil(&mut prefs_core::wire::TreeStore::default(), prefs_core::wire::VERB_SET, wire_body, true, &mut rt);
+    let wire_ok = ks == 0 && ks == rs && kt == rt && kt == b"100\x00clamped=true";
+    // Leg L, the load clamp: a file holding an out-of-range value loads clamped, once, and is re-saved so.
+    let _ = write_all(&p, b"[system]\npower.lowbat_shutdown_pct = 250\n");
+    *LOADED_FOR.lock() = None;
+    ensure_loaded();
+    let refile = read_all(&p).and_then(|b| String::from_utf8(b).ok()).and_then(|t| PrefTree::parse(&t).ok());
+    let loadclamp_ok = LOAD_CLAMPED.load(Ordering::Relaxed) == 1
+        && get(NS, lk) == Some(PrefValue::Int(100))
+        && refile.as_ref().and_then(|t| t.get(NS, lk).cloned()) == Some(PrefValue::Int(100));
     // Leg 3 — a malformed file: refused with its line, nothing adopted, defaults hold, saves held.
     let bad = b"[system]\ndisplay.brightness = 3\nrecents = [\"a\"]\n";
     let _ = write_all(&p, bad);
@@ -727,11 +753,14 @@ pub fn selftest() {
     *TREE.lock() = tree0;
     HELD.store(held0, Ordering::Release);
     LOADED_N.store(loaded0, Ordering::Relaxed);
+    LOAD_CLAMPED.store(load_clamped0, Ordering::Relaxed);
     SAVED_N.store(saved0, Ordering::Relaxed);
     let restored = read_all(&p) == original;
-    let ok = codec && set_ok && file_ok && no_temp && refused && held && restored;
+    let rows = prefs_core::schema::SCHEMA.len();
+    let ok = codec && set_ok && file_ok && no_temp && refused && held && restored && loadclamp_ok && clamp_ok && wire_ok;
     serial_println!(
-        ":: PREFS-FIXTURE: codec={} types={} file={} temp_gone={} malformed_refused={} save_held={} restored={} -> {} ::",
-        codec as u8, set_ok as u8, file_ok as u8, no_temp as u8, refused as u8, held as u8, restored as u8, if ok { "PASS" } else { "FAIL" }
+        ":: PREFS-FIXTURE: codec={} types={} file={} temp_gone={} malformed_refused={} save_held={} restored={} loadclamp={} clamp={} wire={} schema_rows={} -> {} ::",
+        codec as u8, set_ok as u8, file_ok as u8, no_temp as u8, refused as u8, held as u8, restored as u8,
+        loadclamp_ok as u8, clamp_ok as u8, if wire_ok { "shared" } else { "diverged" }, rows, if ok { "PASS" } else { "FAIL" }
     );
 }
