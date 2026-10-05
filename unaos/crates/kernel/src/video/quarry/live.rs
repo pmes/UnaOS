@@ -4248,3 +4248,8 @@ pub fn fileopen_selftest() {
 // `Act` without widening them. CHARTER in its header.
 #[path = "openers.rs"]
 pub mod openers;
+
+/// GLASSEYES (B343): Quarry's row, or `wm::WIN_NONE` — the state-shot mask places its volatile columns from it.
+pub fn win_id() -> wm::WinId {
+    WIN.load(Ordering::Relaxed)
+}

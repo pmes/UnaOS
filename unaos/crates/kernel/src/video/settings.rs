@@ -1108,3 +1108,16 @@ fn safe_mode_check() {
     }
     serial_println!("[prefs] display reset=1 reason={} keys={}", if knob { "knob" } else { "key" }, n);
 }
+
+/// GLASSEYES (B343) — the tab `shot settings <tab>` opens on: `general | users | display | about` (case-insensitive)
+/// sets the in-memory selection the next [`open`] reads; NOT persisted (a fixture's choice is not the user's).
+/// `false` for a name no tab carries.
+pub fn set_tab_named(name: &str) -> bool {
+    match TAB_NAMES.iter().position(|t| t.eq_ignore_ascii_case(name)) {
+        Some(i) => {
+            CUR.lock().tab = i as u8;
+            true
+        }
+        None => false,
+    }
+}

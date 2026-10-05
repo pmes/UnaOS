@@ -1200,7 +1200,7 @@ impl Job {
         if !matches!(info.pixel_format, PixelFormat::Rgb | PixelFormat::Bgr) {
             return Err(Refusal::NoFormat(info.pixel_format));
         }
-        let (kind, rx, ry, width, height) = take_rect(info.width as u32, info.height as u32); // SHOTREGION: the whole panel unless a rectangle is armed
+        let named = named(); let (kind, rx, ry, width, height) = if named.is_some() { (0, 0, 0, info.width as u32, info.height as u32) } else { take_rect(info.width as u32, info.height as u32) }; // GLASSEYES (B343): a named state shot is always the whole panel and leaves an armed rectangle armed. SHOTREGION: the whole panel unless a rectangle is armed
 
         // 2. The volume, by the PRTSCR-VOL ladder (module note), before anything is built. This is
         //    `mount_capture_target`, NOT `mount_program_source`: rung 2 is the whole reason a
@@ -1220,7 +1220,7 @@ impl Job {
         // SCRSHOT-DESKTOP (R60): `choose_name`, not `next_free_name` — the clock stamp when there is
         // a clock, the ladder when there is not, and a token saying which. Same never-overwrite
         // contract in both arms; see the naming block above `clock_name`.
-        let (name, name_from) = if kind != 0 { (shot_name(&fs, dir_cluster)?, if shot_clock_name().is_some() { "clock" } else { "clock-unset" }) } else { choose_name(&fs, dir_cluster)? };
+        let (name, name_from) = if let Some((_, n)) = &named { (named_replace(&fs, dir_cluster, &plan, n)?, "named") } else if kind != 0 { (shot_name(&fs, dir_cluster)?, if shot_clock_name().is_some() { "clock" } else { "clock-unset" }) } else { choose_name(&fs, dir_cluster)? };
 
         // PRTSCR2: name it on the wire BEFORE it can exist on the medium. From here every exit is
         // one of `-> OK`, a `— capture skipped` refusal, or a boot that ended inside this capture.
@@ -1241,7 +1241,7 @@ impl Job {
             return Err(Refusal::Encode(PngError::OutOfMemory, width, height, need));
         }
 
-        let vpath = alloc::format!("{}/{}/{}", plan.home_str(), DIR_CAPTURE.0, name);
+        let vpath = alloc::format!("{}/{}/{}", plan.home_str(), cur_leaf().0, name);
         Ok(Job {
             fs,
             panel,
@@ -2107,7 +2107,7 @@ fn ensure_capture_dir(fs: &FatFs, plan: &DirPlan) -> Result<(u32, String), Refus
     // `n + 2` to `n + 1` with it — a bound that still described a two-leaf walk would have left one
     // component of slack nothing uses, which is the kind of stale arithmetic a later reader has to
     // re-derive to trust.
-    comps[n] = DIR_CAPTURE;
+    comps[n] = cur_leaf(); // GLASSEYES (B343): `Shots` while a named state shot holds the door, else the theme's word
     n += 1;
 
     let mut cluster = 0u32; // the volume root, on every FAT kind here
@@ -2180,7 +2180,7 @@ fn ensure_capture_dir(fs: &FatFs, plan: &DirPlan) -> Result<(u32, String), Refus
         plan.user_str(),
         plan.home_str(),
         plan.home_str(),
-        DIR_CAPTURE.0,
+        cur_leaf().0,
         path,
         created
     );
@@ -2350,4 +2350,73 @@ pub fn dir_fixture() { static QB2: AtomicBool = AtomicBool::new(false); if crate
         after,
         if planned_none && live_refused && wrote_nothing { "PASS" } else { "FAIL" }
     );
+}
+
+// ================================ GLASSEYES (rmbp-ledger B343) — THE NAMED STATE SHOT ================================
+// `shot <state>` (video/shotmask.rs) needs a DETERMINISTIC file — `/home/<u>/Shots/<STEM>.PNG`, the same name every
+// boot, so the bench can pull it and EYES can score it against a golden — through THIS capture, not a second one.
+// So the job takes a named override: while [`capture_named`] holds the door, `Job::begin` reads [`NAMED`] for the
+// leaf (instead of `theme::CAPTURE_DIR`) and the file name (instead of the never-overwrite ladder), and the old
+// file of that name is REPLACED ([`named_replace`]) — a state shot is a fixture's output, not a user's capture.
+// Everything else — the panel door, the PRTSCR-VOL ladder, the session refusal, the streaming encoder, the mount
+// table write, the SHOTZIP/SHOTMOUNT witness — is the unchanged job. [`NAMED`] is set and cleared INSIDE the
+// [`IN_FLIGHT`] door, so a Print Screen job opened by `service` can never see it.
+
+/// GLASSEYES — `(leaf directory, 8.3 file name)` of the named capture in flight, or `None`.
+static NAMED: Mutex<Option<(&'static str, String)>> = Mutex::new(None);
+
+/// GLASSEYES — the named override, cloned (read, never taken: `begin` and `ensure_capture_dir` both ask).
+fn named() -> Option<(&'static str, String)> {
+    NAMED.lock().clone()
+}
+
+/// GLASSEYES — the capture directory's leaf for the capture in flight: the named leaf, else the theme's word.
+fn cur_leaf() -> DirName {
+    match NAMED.lock().as_ref() {
+        Some((leaf, _)) => (*leaf, *leaf),
+        None => DIR_CAPTURE,
+    }
+}
+
+/// GLASSEYES — free `name` in `dir` for a named shot: unlink it through the mount table (where the job writes
+/// first), then delete any FAT-direct copy on the capture target (where the fallback writes). A file that is
+/// still there after both is a refusal — `create_in_dir` does not de-duplicate, so writing anyway would leave
+/// two entries of one name.
+fn named_replace(fs: &FatFs, dir: u32, plan: &DirPlan, name: &str) -> Result<String, Refusal> {
+    let vpath = alloc::format!("{}/{}/{}", plan.home_str(), cur_leaf().0, name);
+    let _ = crate::shell::vfs_mount_table().unlink(&vpath, crate::fs::vfs::KERNEL_PRINCIPAL);
+    let located = busy_retry(|| match fs.locate_in_dir(dir, name) {
+        Ok(hit) => Ok(Some(hit)),
+        Err(FatError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    });
+    match located {
+        Ok(None) => Ok(String::from(name)),
+        Ok(Some((de, lba, off))) => match busy_retry(|| fs.delete_located(lba, off, de.first_cluster())) {
+            Ok(_) => Ok(String::from(name)),
+            Err(e) => Err(Refusal::Fat(vol_id(fs), "named shot (replace the old file)", e)),
+        },
+        Err(e) => Err(Refusal::Fat(vol_id(fs), "capture directory lookup", e)),
+    }
+}
+
+/// GLASSEYES — capture the whole panel to `<home>/<leaf>/<name>`, replacing a file of that name. Synchronous,
+/// under the same [`IN_FLIGHT`] door as [`capture`]; `name` must be 8.3 (the FAT fallback's create rule).
+pub fn capture_named(leaf: &'static str, name: &str) -> Result<Shot, Refusal> {
+    if IN_FLIGHT
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(Refusal::InFlight);
+    }
+    *NAMED.lock() = Some((leaf, String::from(name)));
+    let verdict = capture_inner();
+    *NAMED.lock() = None;
+    IN_FLIGHT.store(false, Ordering::Release);
+    verdict
+}
+
+/// GLASSEYES — the open session's home (`/home/<name>`), or the same refusal a capture would give.
+pub fn session_home() -> Result<String, Refusal> {
+    live_plan().map(|p| String::from(p.home_str()))
 }
