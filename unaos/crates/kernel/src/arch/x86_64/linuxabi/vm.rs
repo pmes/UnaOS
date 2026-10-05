@@ -130,7 +130,7 @@ impl Vm {
     }
 
     /// First fit of `len` bytes in `[lo, hi)`.
-    fn gap(&self, len: u64, lo: u64, hi: u64) -> Option<u64> {
+    pub(super) fn gap(&self, len: u64, lo: u64, hi: u64) -> Option<u64> {
         let mut cur = lo;
         for v in self.vmas.iter().filter(|v| v.end > lo && v.start < hi) {
             if v.start >= cur && v.start - cur >= len {
@@ -627,16 +627,16 @@ pub fn take_fault_sig(pid: u32) -> i64 {
     11
 }
 
-fn flush() {
+pub(super) fn flush() {
     unsafe { memory::load_cr3(memory::current_cr3()) };
 }
 
-fn page_up(v: u64) -> Option<u64> {
+pub(super) fn page_up(v: u64) -> Option<u64> {
     v.checked_add(PAGE - 1).map(|x| x & !(PAGE - 1))
 }
 
 /// May a `MAP_FIXED` range live at `[lo, hi)`? (the two mmap windows; never the brk, the stack, the trampoline or PML4[0])
-fn fixed_ok(lo: u64, hi: u64) -> bool {
+pub(super) fn fixed_ok(lo: u64, hi: u64) -> bool {
     // SELFBUILD4: the brk range too — musl's mallocng puts a PROT_NONE guard page at the brk start with MAP_FIXED.
     (lo >= MMAP_BASE && hi <= STACK_LAZY_LO) || (lo >= MMAP2_BASE && hi <= MMAP2_LIMIT) || (lo >= BRK_BASE && hi <= MMAP_BASE)
 }
@@ -707,7 +707,7 @@ pub fn mmap(p: &mut LinuxProc, addr: u64, len: u64, prot: u64, flags: u64, fd: u
 }
 
 /// Write back, unmap and forget `[lo, hi)`.
-fn unmap_range(p: &mut LinuxProc, lo: u64, hi: u64) {
+pub(super) fn unmap_range(p: &mut LinuxProc, lo: u64, hi: u64) {
     p.asp.writeback(lo, hi, false);
     for (va, _) in p.asp.leaf_range(lo, hi) {
         p.asp.drop_page(va);

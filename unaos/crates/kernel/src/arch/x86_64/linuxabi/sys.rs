@@ -983,6 +983,9 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
         }
         102 | 104 | 107 | 108 | 105 | 106 | 113 | 114 => 0,
         74 | 75 => 0, // fsync / fdatasync: writes are already write-through
+        25 => super::remap::mremap(p, a[0], a[1], a[2], a[3], a[4]), // SELFBUILD5: grow in place / move the VMA's leaves
+        131 => super::remap::sigaltstack(p, info, ktop, a[0], a[1]), // SELFBUILD5: per thread, honoured at delivery
+        309 => super::remap::getcpu(p, a[0], a[1]), // SELFBUILD5
         _ => match super::sys2::handle(p, info, nr, a) {
             Some(r) => r,
             None => {
