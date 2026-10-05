@@ -6335,8 +6335,8 @@ fn open_shell_window(
         ch as u32,
         stride as u32,
         b"Shell",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[shellwin] DECLINE reason=create-failed");
@@ -9290,8 +9290,8 @@ fn shellwin_window_open(pw: usize, ph: usize) -> Option<ShellWin> {
         ch as u32,
         stride as u32,
         b"Shell",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[realdesk] shell=panel reason=create_at-declined surf={}x{} at ({},{})", cw, ch, ox, oy);

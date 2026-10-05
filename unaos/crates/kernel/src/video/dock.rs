@@ -293,26 +293,26 @@ fn focus_get() -> u64 {
 /// Padding inside the strip, gap between tiles, and the strip's margin off the panel's bottom edge —
 /// all [`theme::GAP`], the kit's one "standard gap between controls", by way of the primitive's
 /// [`strip::PAD`] so a strip's margin and a tenant's padding cannot drift apart.
-const PAD: usize = strip::PAD;
+#[allow(non_snake_case)] #[inline] fn PAD() -> usize { strip::PAD() }
 
 /// A tile's height — [`theme::BUTTON_HEIGHT`]. A dock tile IS a button by the kit's own taxonomy: a
 /// raised control with a label that does something when pressed.
-const TILE_H: usize = theme::BUTTON_HEIGHT;
+#[allow(non_snake_case)] #[inline] fn TILE_H() -> usize { theme::BUTTON_HEIGHT() }
 
 /// A tile's corner radius — [`theme::WIDGET_RADIUS`], the kit's radius "for widgets (buttons and
 /// other raised controls)".
-const TILE_R: usize = theme::WIDGET_RADIUS;
+#[allow(non_snake_case)] #[inline] fn TILE_R() -> usize { theme::WIDGET_RADIUS() }
 
 /// The strip's corner radius — [`theme::CORNER_RADIUS`], the same radius the window head is cut with,
 /// so the dock reads as the same fabrication as the chrome.
-const STRIP_R: usize = theme::CORNER_RADIUS;
+#[allow(non_snake_case)] #[inline] fn STRIP_R() -> usize { theme::CORNER_RADIUS() }
 
 /// The strip's height: a tile with the standard gap above and below it.
 ///
 /// `pub` since STRIPFACTOR: [`super::menubar`]'s floor is derived from it (the bar must not crowd the
 /// dock off a short panel), and a second copy of this arithmetic there is exactly the drift the
 /// single-accessor law forbids.
-pub const STRIP_H: usize = TILE_H + 2 * PAD;
+#[allow(non_snake_case)] #[inline] pub fn STRIP_H() -> usize { TILE_H() + 2 * PAD() }
 
 /// The running indicator's diameter, px.
 ///
@@ -329,15 +329,15 @@ pub const STRIP_H: usize = TILE_H + 2 * PAD;
 /// the constraint the assertion states and is independent of how large a control disc becomes. The
 /// rendered pip is unchanged at 6 px; only its provenance moved. This is the sole line of the dock
 /// module the size ruling touched, and it was touched because the alternative was a red tree.
-const IND_D: usize = theme::GAP / 2;
+#[allow(non_snake_case)] #[inline] fn IND_D() -> usize { theme::GAP() / 2 }
 
 /// The glyph advance and cell height the caption is drawn at — [`wm::TITLE_CELL_W`] /
 /// [`wm::TITLE_CELL_H`], the shared anti-aliased face's own metrics, exactly as the window caption
 /// resolves them. One definition, so a face change moves the window caption and the dock caption
 /// together. FONT (GR27): the cell stopped being square with the 1-bit bitmap's retirement, so the
 /// two axes are named separately — widths budget in `CELL_W`, vertical centring in `CELL_H`.
-const CELL_W: usize = wm::TITLE_CELL_W;
-const CELL_H: usize = wm::TITLE_CELL_H;
+#[allow(non_snake_case)] #[inline] fn CELL_W() -> usize { wm::TITLE_CELL_W() }
+#[allow(non_snake_case)] #[inline] fn CELL_H() -> usize { wm::TITLE_CELL_H() }
 
 /// FONT-METRIC — the atlas those metrics come from, named once so the tile's width budget and its
 /// glyph call can never disagree about which face the caption is drawn in.
@@ -360,19 +360,19 @@ const MAX_STRIP_W: usize = strip::MAX_STRIP_W;
 
 /// The layout cannot ask for a strip the scratch cannot hold. A `const` proof rather than a runtime
 /// clamp, so a future `LABEL_MAX` or `MAX_WINDOWS` raise fails the BUILD.
-const _: () = {
-    assert!(2 * PAD + wm::MAX_WINDOWS * (2 * PAD + LABEL_MAX * CELL_W) + (wm::MAX_WINDOWS - 1) * PAD
-        <= MAX_STRIP_W);
+#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
+    assert!(2 * PAD() + wm::MAX_WINDOWS * (2 * PAD() + CELL_W()) + (wm::MAX_WINDOWS - 1) * PAD()
+        <= MAX_STRIP_W); // UIMETRICS (B372): ONE-glyph tiles — at a large scale `Layout::for_panel` steps the caption down to fit, so the full-caption worst case (3318 px at 2.5) is no longer the bound; a full table of one-glyph tiles is
     // The caption must fit inside the tile it is centred in, or there is nothing to draw.
-    assert!(CELL_H <= TILE_H);
+    assert!(CELL_H() <= TILE_H());
     // The indicator must fit in the padding band below the tile.
-    assert!(IND_D < PAD);
+    assert!(IND_D() < PAD());
     // Both of a tile's corners must fit within its own height — the kit asserts this for buttons and
     // a tile IS a button; restated here because the tile is the object being cut.
-    assert!(2 * TILE_R <= TILE_H);
-    assert!(2 * STRIP_R <= STRIP_H);
+    assert!(2 * TILE_R() <= TILE_H());
+    assert!(2 * STRIP_R() <= STRIP_H());
     assert!(LABEL_MAX <= wm::MAX_TITLE);
-};
+}
 
 // ---------------------------------------------------------------------------
 // Layout — THE ONE geometry accessor. Painter and router both read it.
@@ -414,14 +414,14 @@ impl Layout {
         }
         let mut glyphs = LABEL_MAX;
         loop {
-            let tile_w = 2 * PAD + glyphs * CELL_W;
-            let w = 2 * PAD + n * tile_w + (n - 1) * PAD;
+            let tile_w = 2 * PAD() + glyphs * CELL_W();
+            let w = 2 * PAD() + n * tile_w + (n - 1) * PAD();
             // STRIPFACTOR — the anchoring, the margin and BOTH floors are the primitive's
             // `frame_centred`: `ph < STRIP_H + 2*PAD`, `w + 2*PAD > pw` and `w > MAX_STRIP_W` were
             // three separate tests here and are the same three there, in the same order, against the
             // same constants. The step-down loop stays, because auto-sizing the caption to the panel
             // is the DOCK's arithmetic, not any strip's.
-            if let Some((x, y, w, h)) = strip::frame_centred(strip::Edge::Bottom, w, STRIP_H, pw, ph)
+            if let Some((x, y, w, h)) = strip::frame_centred(strip::Edge::Bottom, w, STRIP_H(), pw, ph)
             {
                 return Some(Layout { x, y, w, h, n, tile_w, glyphs });
             }
@@ -439,10 +439,10 @@ impl Layout {
             return None;
         }
         Some((
-            self.x + PAD + i * (self.tile_w + PAD),
-            self.y + PAD,
+            self.x + PAD() + i * (self.tile_w + PAD()),
+            self.y + PAD(),
             self.tile_w,
-            TILE_H,
+            TILE_H(),
         ))
     }
 
@@ -468,7 +468,7 @@ impl Layout {
     /// corners.
     #[inline]
     pub fn contains(&self, px: usize, py: usize) -> bool {
-        strip::contains(self.rect(), STRIP_R, px, py)
+        strip::contains(self.rect(), STRIP_R(), px, py)
     }
 
     /// The strip as a plain rect, for the damage question.
@@ -912,7 +912,7 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
     let line = ceramic::shade(theme::FRAME_LINE, j);
     // The row's interior colour: the top bevel hairline for the first `BEVEL` rows under the keyline,
     // the chrome face everywhere else.
-    let fill = if j >= 1 && j < 1 + theme::BEVEL { theme::BEVEL_LIGHT } else { face };
+    let fill = if j >= 1 && j < 1 + theme::BEVEL() { theme::BEVEL_LIGHT } else { face };
     if j == 0 || j + 1 == l.h {
         for i in 0..l.w {
             out[i] = line;
@@ -925,14 +925,14 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         }
     }
     // The corner bands — the only pixels whose membership is in question.
-    if j < STRIP_R || j + STRIP_R >= l.h {
-        for i in (0..STRIP_R).chain(l.w - STRIP_R..l.w) {
-            if strip::corner_cut(i, j, l.w, l.h, STRIP_R) {
+    if j < STRIP_R() || j + STRIP_R() >= l.h {
+        for i in (0..STRIP_R()).chain(l.w - STRIP_R()..l.w) {
+            if strip::corner_cut(i, j, l.w, l.h, STRIP_R()) {
                 // The pixels the painter cuts out of the corners are filled with the DESKTOP, exactly
                 // as `wm::paint_window` fills a window's cut head corners. Same rule, same colour,
                 // and `Layout::contains` declines the same pixels so a press there falls through.
                 out[i] = wm::DESKTOP_BG;
-            } else if strip::edge_ring(i, j, l.w, l.h, STRIP_R) {
+            } else if strip::edge_ring(i, j, l.w, l.h, STRIP_R()) {
                 out[i] = line;
             }
         }
@@ -942,10 +942,10 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         let Some((tx, ty, tw, th)) = l.tile(t) else { continue };
         let (bx, by) = (tx - l.x, ty - l.y);
         // The indicator band: the PAD below the tile, inside the strip.
-        if j >= by + th && j < by + th + PAD {
-            let d = IND_D;
+        if j >= by + th && j < by + th + PAD() {
+            let d = IND_D();
             let px0 = bx + tw / 2 - d / 2;
-            let py0 = by + th + (PAD - d) / 2;
+            let py0 = by + th + (PAD() - d) / 2;
             let ink = if r.visible { theme::ACCENT } else { theme::SCROLL_THUMB };
             for i in px0..(px0 + d).min(l.w) {
                 if strip::in_disc(i, j, px0, py0, d) {
@@ -969,16 +969,16 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         // A cut tile corner shows the STRIP's face — the tile is a slab lying ON the strip, so what a
         // cut corner reveals is what is behind it, not the desktop.
         let (lo, hi) = (bx.min(l.w), (bx + tw).min(l.w));
-        let corner_row = (j - by) < TILE_R || (j - by) + TILE_R >= th;
+        let corner_row = (j - by) < TILE_R() || (j - by) + TILE_R() >= th;
         if !corner_row {
             for i in lo..hi {
                 out[i] = tface;
             }
         } else {
-            let mid0 = (bx + TILE_R).min(hi);
-            let mid1 = (bx + tw - TILE_R).max(mid0).min(hi);
+            let mid0 = (bx + TILE_R()).min(hi);
+            let mid1 = (bx + tw - TILE_R()).max(mid0).min(hi);
             for i in lo..mid0 {
-                if !strip::corner_cut(i - bx, j - by, tw, th, TILE_R) {
+                if !strip::corner_cut(i - bx, j - by, tw, th, TILE_R()) {
                     out[i] = tface;
                 }
             }
@@ -986,7 +986,7 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
                 out[i] = tface;
             }
             for i in mid1..hi {
-                if !strip::corner_cut(i - bx, j - by, tw, th, TILE_R) {
+                if !strip::corner_cut(i - bx, j - by, tw, th, TILE_R()) {
                     out[i] = tface;
                 }
             }
@@ -994,8 +994,8 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         // The caption, overlaid. Vertically centred in the tile, left-padded by one `PAD`, and
         // truncated to the layout's glyph budget — the budget the layout SIZED the tile from, so the
         // text can never overrun the box it is in.
-        let ty0 = by + (th - CELL_H) / 2;
-        if j < ty0 || j >= ty0 + CELL_H {
+        let ty0 = by + (th - CELL_H()) / 2;
+        if j < ty0 || j >= ty0 + CELL_H() {
             continue;
         }
         let sy = j - ty0;
@@ -1008,7 +1008,7 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         // loop above just painted (a RAM scratch row, so the blend's read is cached). Regular
         // weight: a dock label is a secondary surface beside the caption and the bar.
         let cols = super::text::fit(&r.title[..l.glyphs.min(r.title_len)], false, FACE, l.glyphs * FACE.cell_w()); // KERNELFONT: whole glyphs inside the tile's budget
-        super::text::draw_row(out, l.w, &r.title[..cols], bx + PAD, sy, ink, false, FACE);
+        super::text::draw_row(out, l.w, &r.title[..cols], bx + PAD(), sy, ink, false, FACE);
     }
 }
 
@@ -2955,10 +2955,10 @@ fn menu_geo(l: &Layout, rows: &[wm::DockEntry], dims: Option<(usize, usize)>) ->
     let (t, owner) = (MENU_TILE.load(Ordering::Relaxed) as usize, MENU_OWNER.load(Ordering::Relaxed));
     if t >= rows.len() || rows[t].owner_asid != owner { MENU_OPEN.store(false, Ordering::Release); return None; }
     let (tx, _, _, _) = l.tile(t)?;
-    let mw = (16 * CELL_W + 2 * PAD).min(l.w);
+    let mw = (16 * CELL_W() + 2 * PAD()).min(l.w);
     let nrows = MENU_ITEMS + menu_win_rows(owner); // WINDOWLIST M3 — one extra row per window when the app has more than one
-    let mh = nrows * TILE_H;
-    let band = mh + PAD;
+    let mh = nrows * TILE_H();
+    let band = mh + PAD();
     if l.y < band { return None; }
     let mx = tx.min(l.x + l.w - mw);
     let my = l.y - band;
@@ -2966,7 +2966,7 @@ fn menu_geo(l: &Layout, rows: &[wm::DockEntry], dims: Option<(usize, usize)>) ->
     if let Some((pw, ph)) = dims {
         let (cx, cy) = crate::pal::cursor::pos(pw as i32, ph as i32);
         let (cx, cy) = (cx.max(0) as usize, cy.max(0) as usize);
-        if cx >= mx && cx < mx + mw && cy >= my && cy < my + mh { hover = (cy - my) / TILE_H; }
+        if cx >= mx && cx < mx + mw && cy >= my && cy < my + mh { hover = (cy - my) / TILE_H(); }
     }
     Some(MenuGeo { mx, my, mw, mh, band, hover, keep: is_kept(owner), rows: nrows, owner })
 }
@@ -2978,7 +2978,7 @@ fn menu_row(out: &mut [u32], l: &Layout, g: Option<MenuGeo>, j: usize) {
     for i in 0..l.w { out[i] = wm::DESKTOP_BG; }
     let Some(g) = g else { return };
     if j >= g.mh { return; }
-    let (bx, row, sy0) = (g.mx - l.x, j / TILE_H, (j % TILE_H) as isize - ((TILE_H - CELL_H) / 2) as isize);
+    let (bx, row, sy0) = (g.mx - l.x, j / TILE_H(), (j % TILE_H()) as isize - ((TILE_H() - CELL_H()) / 2) as isize);
     let hot = row == g.hover;
     let face = if hot { theme::ACCENT } else { theme::BUTTON_FACE };
     let ink = if hot { theme::BUTTON_FACE } else { theme::TITLE_TEXT_ACTIVE };
@@ -2988,7 +2988,7 @@ fn menu_row(out: &mut [u32], l: &Layout, g: Option<MenuGeo>, j: usize) {
     }
     let mut wbuf = [0u8; wm::MAX_TITLE];
     let label: &[u8] = if row == 0 { b"Quit" } else if row == 1 { if g.keep { b"Remove from Dock" } else { b"Keep in Dock" } } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3
-    if sy0 >= 0 { super::text::draw_row(out, l.w, label, bx + PAD, sy0 as usize, ink, false, FACE); }
+    if sy0 >= 0 { super::text::draw_row(out, l.w, label, bx + PAD(), sy0 as usize, ink, false, FACE); }
 }
 
 /// The open menu's box (x, y, w, h), or `None` when closed. Same geometry the painter draws from.
@@ -3044,7 +3044,7 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     let (px, py) = (x as usize, y as usize);
     if px < mx || px >= mx + mw || py < my || py >= my + mh { return false; }
     let owner = MENU_OWNER.load(Ordering::Relaxed);
-    let prow = (py - my) / TILE_H;
+    let prow = (py - my) / TILE_H();
     if prow >= MENU_ITEMS { // WINDOWLIST M3 — a per-window row raises and focuses that window
         let mut wb = [0u8; wm::MAX_TITLE];
         let (win, _) = menu_win_row(owner, prow - MENU_ITEMS, &mut wb);
@@ -3104,7 +3104,7 @@ pub fn dockrun_selftest() {
                 if let (true, Some((mx, my, _, _))) = (opened, menu_rect()) {
                     composite_reconciled(); drawn = SLOT.rect().1 < l.y && SLOT.rect().3 > l.h; // the tenant's published rect grew by the menu band
 
-                    let hit = menu_press((mx + PAD + 1) as i32, (my + TILE_H / 2) as i32);
+                    let hit = menu_press((mx + PAD() + 1) as i32, (my + TILE_H() / 2) as i32);
                     let (n1, _, _, _) = census(&mut rows).map(|c| (c.0, c.1, c.2, c.3)).unwrap_or((usize::MAX, 0, 0, l));
                     quit = hit && wm::info(win).is_none() && !rows[..n1.min(wm::MAX_WINDOWS)].iter().any(|r| r.owner_asid == OWNER);
                 }

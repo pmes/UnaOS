@@ -34,9 +34,9 @@ const _: () = assert!(OWNER != super::fileview::OWNER);
 
 pub const MAX_BYTES: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
-const WIN_W: usize = 720;
-const WIN_H: usize = 480;
-const PAD: usize = 6;
+#[allow(non_snake_case)] #[inline] fn WIN_W() -> usize { crate::ui::px(720) } // UIMETRICS (B372): a NATIVE window — physical px at the panel's dpi scale, drawn at scale 1
+#[allow(non_snake_case)] #[inline] fn WIN_H() -> usize { crate::ui::px(480) }
+#[allow(non_snake_case)] #[inline] fn PAD() -> usize { crate::ui::px(6) }
 const WHEEL_ROWS: usize = 3;
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
@@ -193,12 +193,12 @@ pub fn open(path: &str) -> Result<(usize, usize), String> {
     let text = clean(&raw)?;
     let pi = crate::video::panel_info_nonblocking().ok_or_else(|| String::from("panel busy"))?;
     let (pw, ph) = (pi.width, pi.height);
-    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
-    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
-    let face = super::text::Face::Body;
+    let w = WIN_W().min(pw.saturating_sub(2 * wm::BORDER()).max(1));
+    let h = WIN_H().min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
+    let face = super::text::Face::Grid; // UIMETRICS: the dpi-sized mono grid face
     let (cw, ch) = (face.cell_w(), face.cell_h());
-    let cols = w.saturating_sub(2 * PAD + 6) / cw;
-    let vis = h.saturating_sub(2 * PAD) / ch;
+    let cols = w.saturating_sub(2 * PAD() + crate::ui::px(6)) / cw;
+    let vis = h.saturating_sub(2 * PAD()) / ch;
     if cols < 8 || vis < 2 {
         return Err(String::from("window below floor"));
     }
@@ -211,7 +211,7 @@ pub fn open(path: &str) -> Result<(usize, usize), String> {
     if is_open() {
         close();
     }
-    let (_s, ow, oh) = wm::spawn_geometry(w, h).ok_or_else(|| String::from("geometry unavailable"))?;
+    let (_s, ow, oh) = wm::spawn_geometry_native(w, h).ok_or_else(|| String::from("geometry unavailable"))?;
     let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
@@ -225,7 +225,7 @@ pub fn open(path: &str) -> Result<(usize, usize), String> {
     paint(&mut st);
     let base = st.surf.as_ptr() as usize;
     let title = title_of(path, false);
-    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, title.as_bytes(), ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    let id = wm::create_at_native(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, title.as_bytes(), ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         return Err(String::from("window create failed"));
     }
@@ -253,7 +253,7 @@ pub fn close() {
 fn fill(st: &mut State, x: usize, y: usize, rw: usize, rh: usize, c: u32) {
     let (w, h) = (st.w, st.h);
     for yy in y..core::cmp::min(y + rh, h) {
-        for xx in x..core::cmp::min(x + rw, w - 6) {
+        for xx in x..core::cmp::min(x + rw, w - crate::ui::px(6)) {
             st.surf[yy * w + xx] = c;
         }
     }
@@ -261,7 +261,7 @@ fn fill(st: &mut State, x: usize, y: usize, rw: usize, rh: usize, c: u32) {
 
 /// Repaint `st.surf`: FILEVIEW's row painter, plus the selection band and the caret.
 fn paint(st: &mut State) {
-    let face = super::text::Face::Body;
+    let face = super::text::Face::Grid; // UIMETRICS: the dpi-sized mono grid face
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let (w, h) = (st.w, st.h);
     for p in st.surf.iter_mut() {
@@ -273,22 +273,22 @@ fn paint(st: &mut State) {
         let ri = st.top + r;
         let Some(&(a, b)) = st.rows.get(ri) else { break };
         let (a, b) = (a as usize, b as usize);
-        let y = PAD + r * ch;
+        let y = PAD() + r * ch;
         if let Some((s, e)) = sel {
             let lo = core::cmp::max(s, a);
             let hi = core::cmp::min(e, b + (st.text.get(b) == Some(&b'\n')) as usize);
             if lo < hi {
-                fill(st, PAD + (lo - a) * cw, y, (hi - lo) * cw, ch, theme::ACCENT);
+                fill(st, PAD() + (lo - a) * cw, y, (hi - lo) * cw, ch, theme::ACCENT);
             }
         }
-        super::text::draw_text(&mut st.surf, w, w - 6, h, PAD, y, &st.text[a..b], theme::CONTENT_TEXT, false, face);
+        super::text::draw_text(&mut st.surf, w, w - crate::ui::px(6), h, PAD(), y, &st.text[a..b], theme::CONTENT_TEXT, false, face);
         if ri == crow {
-            fill(st, PAD + (st.caret - a) * cw, y, 2, ch, theme::CONTENT_TEXT);
+            fill(st, PAD() + (st.caret - a) * cw, y, crate::ui::px(2), ch, theme::CONTENT_TEXT);
         }
     }
     let total = st.rows.len().max(1);
-    let (x0, x1) = (w - 5, w - 1);
-    let th = if total <= st.vis { h } else { (h * st.vis / total).max(8) };
+    let (x0, x1) = (w - crate::ui::px(5), w - crate::ui::px(1));
+    let th = if total <= st.vis { h } else { (h * st.vis / total).max(crate::ui::px(8)) };
     let ty = if total <= st.vis { 0 } else { (h - th) * st.top / (total - st.vis) };
     for y in 0..h {
         let c = if y >= ty && y < ty + th { theme::SCROLL_THUMB } else { theme::SCROLL_TRACK };
@@ -594,14 +594,14 @@ pub fn press_route(x: i32, y: i32) -> bool {
         return false;
     }
     wm::focus_changed(OWNER);
-    let face = super::text::Face::Body;
+    let face = super::text::Face::Grid; // UIMETRICS: the dpi-sized mono grid face
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let pos = {
         let g = STATE.lock();
         let Some(st) = g.as_ref() else { return true };
-        let ri = core::cmp::min(st.top + ly.saturating_sub(PAD) / ch, st.rows.len() - 1);
+        let ri = core::cmp::min(st.top + ly.saturating_sub(PAD()) / ch, st.rows.len() - 1);
         let (a, b) = st.rows[ri];
-        a as usize + core::cmp::min((lx.saturating_sub(PAD) + cw / 2) / cw.max(1), (b - a) as usize)
+        a as usize + core::cmp::min((lx.saturating_sub(PAD()) + cw / 2) / cw.max(1), (b - a) as usize)
     };
     run(Op::At(pos));
     true

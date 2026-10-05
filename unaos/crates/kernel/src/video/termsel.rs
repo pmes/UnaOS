@@ -1035,7 +1035,7 @@ pub fn pointer_selftest() {
     // A stale note for this id (an earlier holder of the slot) must not be read as ours.
     while take_press(win).is_some() {}
 
-    let m = crate::ui::Metrics::for_height(H);
+    let m = crate::ui::Metrics::for_scale(1);
     let mut con = crate::console::Console::new();
     con.mark_in_window();
     con.place_for_fixture("alpha beta");
@@ -1286,7 +1286,7 @@ pub fn termwrap_selftest() {
     use alloc::string::String;
     const W: usize = 640;
     const H: usize = 480;
-    let m = crate::ui::Metrics::for_height(H);
+    let m = crate::ui::Metrics::for_scale(1);
     let mut con = crate::console::Console::new();
     con.mark_in_window();
     let cols = con.cols_for(m, W);

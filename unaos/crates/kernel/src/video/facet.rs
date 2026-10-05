@@ -1279,8 +1279,8 @@ fn mint(title: &str, vw: usize, vh: usize) -> Result<wm::WinId, FacetError> {
         vh as u32,
         (vw * 4) as u32,
         title.as_bytes(),
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         return Err(FacetError::NoWindow("create-failed"));
@@ -1430,8 +1430,8 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
 fn open_base(path: &str, bytes: u64, ihdr: Ihdr, k: usize, bw: usize, bh: usize, px: Vec<u32>) -> Result<Opened, FacetError> {
     let pi = crate::video::panel_info_nonblocking().ok_or(FacetError::NoWindow("panel-busy"))?;
     let (pw, ph) = (pi.width, pi.height);
-    let win_w = CEIL_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
-    let win_h = CEIL_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
+    let win_w = CEIL_W.min(pw.saturating_sub(2 * wm::BORDER()).max(1));
+    let win_h = CEIL_H.min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
     // Fit-to-window: reduce when larger than the window, never enlarge on open; the window takes the
     // fitted shape (floor 32x32, the only place a letterbox can appear on open).
     let zf = ((win_w * 100 / bw).min(win_h * 100 / bh).min(100)).max(1) as u32;

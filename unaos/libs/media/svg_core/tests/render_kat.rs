@@ -124,3 +124,81 @@ fn text_draws_with_fonts() {
     // Without fonts the text is skipped, never a panic.
     assert!(svg.render_rgba(60, 30, &Options::default()).unwrap().iter().all(|&b| b == 0));
 }
+
+#[test]
+fn filters_region_flood_offset_morphology() {
+    // feFlood fills exactly the userSpaceOnUse filter region; half-transparent blue survives the
+    // linearRGB round trip (1.0 is 1.0 in both spaces).
+    let s = format!(
+        r##"<svg {NS} width="20" height="20"><filter id="f" filterUnits="userSpaceOnUse" x="5" y="5" width="10" height="10">
+        <feFlood flood-color="#00f" flood-opacity="0.5"/></filter><rect width="1" height="1" filter="url(#f)"/></svg>"##
+    );
+    let img = render(&s, 20, 20);
+    assert_eq!(px(&img, 20, 5, 5), [0, 0, 255, 128]);
+    assert_eq!(px(&img, 20, 14, 14), [0, 0, 255, 128]);
+    assert_eq!(px(&img, 20, 4, 10)[3], 0);
+    assert_eq!(px(&img, 20, 15, 10)[3], 0);
+    // feOffset by 3 user units, then feMorphology dilate radius 1 (a 2 px bar becomes 4 px).
+    let s = format!(
+        r##"<svg {NS} width="20" height="4"><filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="4">
+        <feOffset dx="3"/><feMorphology operator="dilate" radius="1 0"/></filter>
+        <rect x="2" width="2" height="4" fill="#f00" filter="url(#f)"/></svg>"##
+    );
+    let img = render(&s, 20, 4);
+    let row: Vec<u8> = (0..10).map(|x| px(&img, 20, x, 1)[3]).collect();
+    assert_eq!(row, vec![0, 0, 0, 0, 255, 255, 255, 255, 0, 0]);
+}
+
+#[test]
+fn filters_color_interpolation_linear_vs_srgb() {
+    // feComponentTransfer slope 0.5 on red: in sRGB 255 → 127 (truncated table); in linearRGB the halved
+    // linear value 127 maps back to sRGB 187 (1.055·(127/255)^(1/2.4) − 0.055 = 0.734).
+    let doc = |cif: &str| {
+        format!(
+            r##"<svg {NS} width="4" height="4"><filter id="f" color-interpolation-filters="{cif}"><feComponentTransfer>
+            <feFuncR type="linear" slope="0.5"/></feComponentTransfer></filter>
+            <rect width="4" height="4" fill="#f00" filter="url(#f)"/></svg>"##
+        )
+    };
+    assert_eq!(px(&render(&doc("sRGB"), 4, 4), 4, 2, 2), [127, 0, 0, 255]);
+    assert_eq!(px(&render(&doc("linearRGB"), 4, 4), 4, 2, 2), [187, 0, 0, 255]);
+}
+
+#[test]
+fn filters_blur_keeps_mass_and_symmetry() {
+    // stdDeviation 2 → box size d = ⌊2·3·√(2π)/4 + 0.5⌋ = 4 (even): the two half-pixel-shifted boxes and the
+    // d+1 box make a symmetric kernel; a 1 px line keeps its integral (±rounding) and its symmetry.
+    let s = format!(
+        r##"<svg {NS} width="41" height="1"><filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="41" height="1"
+        color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="2 0"/></filter>
+        <rect x="20" width="1" height="1" filter="url(#f)"/></svg>"##
+    );
+    let img = render(&s, 41, 1);
+    let a: Vec<u32> = (0..41).map(|x| px(&img, 41, x, 0)[3] as u32).collect();
+    for k in 0..41 {
+        assert_eq!(a[k], a[40 - k]);
+    }
+    let sum: u32 = a.iter().sum();
+    assert!((250..=260).contains(&sum), "mass {sum}");
+    // Support: 3d − 1 = 11 taps → x = 15..=25.
+    assert_eq!((a[14], a[26]), (0, 0));
+    assert!(a[15] > 0 && a[25] > 0);
+}
+
+#[test]
+fn filters_css_functions_and_invalid_references() {
+    // A missing filter renders the element unfiltered; an empty <filter> renders nothing; hue-rotate(180deg)
+    // of pure red (the spec's matrix) gives (0, 109, 109)-ish cyan.
+    let s = format!(
+        r##"<svg {NS} width="30" height="10"><filter id="empty"/>
+        <rect width="10" height="10" fill="#f00" filter="url(#missing)"/>
+        <rect x="10" width="10" height="10" fill="#f00" filter="url(#empty)"/>
+        <rect x="20" width="10" height="10" fill="#f00" filter="hue-rotate(180deg)"/></svg>"##
+    );
+    let img = render(&s, 30, 10);
+    assert_eq!(px(&img, 30, 5, 5), [255, 0, 0, 255]);
+    assert_eq!(px(&img, 30, 15, 5)[3], 0);
+    let c = px(&img, 30, 25, 5);
+    // R' = 0.213 − 0.787 = −0.574 → 0; G' = 0.213 + 0.213 = 0.426 → 109; B' = 0.213 + 0.213 → 109.
+    assert_eq!(c, [0, 109, 109, 255]);
+}

@@ -1,0 +1,11 @@
+[package]
+name = "text_host"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "QUARTZFONT (SR64): the host's font stack on UnaOS's own font_core, shared by Aether (page text) and quartzite (the vessels' chrome): fontconfig read as data, the installed-face database with CSS face selection, Skia-mode glyph rasterization with Skia's A8 pre-blend, and a shaped single-line text run."
+
+# Lifted out of handlers/aether/src/fonts (AETHERFONT, SR61) once quartzite became its second user (QUARTZFONT,
+# SR64). font_core is the only dependency: no FreeType, no fontconfig library, no third-party rasterizer.
+[dependencies]
+font_core = { path = "../../unaos/libs/text/font_core" }

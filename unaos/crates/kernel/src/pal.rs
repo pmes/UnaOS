@@ -100,7 +100,7 @@ pub trait GneissPal {
     /// pixel sizes in UI code; everything derives from these). A pure function of the panel
     /// height, so deriving per call is cheap and can never go stale.
     fn metrics(&self) -> crate::ui::Metrics {
-        crate::ui::Metrics::for_height(self.height() as usize)
+        crate::ui::Metrics::panel() // UIMETRICS (B372): the panel's dpi metrics; a window surface the compositor magnifies overrides with `for_scale(1)`
     }
 
     fn clear_screen(&mut self, color: u32) {
@@ -2114,7 +2114,7 @@ impl<'a> TargetPal<'a> {
         // UI-1 evidence: announce the derived metrics once per surface bring-up so headless
         // gates can verify the scale layer on every target (x86 GUI, arm virt, Pi render
         // service, Orin panel) without a screen.
-        let m = crate::ui::Metrics::for_height(surface.height());
+        let m = crate::ui::Metrics::panel();
         crate::bootlog_println!(
             ":: UI1: scale={} cell={}x{} line={} ::",
             m.scale,

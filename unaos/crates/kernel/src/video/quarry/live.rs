@@ -274,7 +274,7 @@ const DOUBLE_CLICK_MS: u64 = 500;
 // ── Geometry ────────────────────────────────────────────────────────────────────────────────────
 
 /// Inner padding inside a pane, in source pixels.
-const PAD: usize = 4;
+#[allow(non_snake_case)] #[inline] fn PAD() -> usize { crate::ui::px(4) } // UIMETRICS (B372): Quarry is a NATIVE window — its geometry is physical px at the dpi scale
 /// QUARRYFONT — **the disclosure marker's unit, and no longer a glyph's.** It was the raw `font8x8`
 /// cell that every character was block-replicated out of; the text now comes from the shared
 /// anti-aliased face ([`font::Face`]) whose advance and cell height are its own, and this constant
@@ -282,19 +282,19 @@ const PAD: usize = 4;
 const BASE_CELL: usize = 8;
 /// Scrollbar gutter width — [`theme::SCROLLBAR_WIDTH`], the role that has existed since the theme
 /// table landed and has never had a consumer. Quarry is the first.
-const SBW: usize = theme::SCROLLBAR_WIDTH;
+#[allow(non_snake_case)] #[inline] fn SBW() -> usize { theme::SCROLLBAR_WIDTH() }
 /// Shortest thumb we will draw, so a 10 000-row directory still leaves something to aim at.
-const THUMB_MIN: usize = 16;
+#[allow(non_snake_case)] #[inline] fn THUMB_MIN() -> usize { crate::ui::px(16) }
 
 /// Smallest content surface Quarry will accept. Below this the two panes cannot both carry a usable
 /// column set and the honest answer is to decline rather than to draw an unreadable window.
-const FLOOR_W: usize = 320;
-const FLOOR_H: usize = 200;
+#[allow(non_snake_case)] #[inline] fn FLOOR_W() -> usize { crate::ui::px(320) }
+#[allow(non_snake_case)] #[inline] fn FLOOR_H() -> usize { crate::ui::px(200) }
 /// Largest content surface. A file manager does not need the whole 1920x1200 bench panel, and a
 /// bounded surface bounds the repaint cost the scroll path pays (see §Cost in the module doc's
 /// companion, `quarry.md` §5).
-const CEIL_W: usize = 1152;
-const CEIL_H: usize = 720;
+#[allow(non_snake_case)] #[inline] fn CEIL_W() -> usize { crate::ui::px(1152) }
+#[allow(non_snake_case)] #[inline] fn CEIL_H() -> usize { crate::ui::px(720) }
 
 /// The resolved surface geometry for this boot's panel.
 #[derive(Clone, Copy)]
@@ -349,7 +349,7 @@ impl Geom {
     #[inline]
     fn tree_w(&self) -> usize {
         let want = self.w * 5 / 16;
-        let lo = (10 * self.cell_w() + 2 * PAD + SBW).min(self.w / 2);
+        let lo = (10 * self.cell_w() + 2 * PAD() + SBW()).min(self.w / 2);
         want.clamp(lo, self.w / 2)
     }
     /// `(x, y, w, h)` of the tree pane, in source pixels.
@@ -398,18 +398,21 @@ fn geometry(pw: usize, ph: usize) -> Option<Geom> {
     // carries information instead of multiplying a staircase. `ts` survives beside it as the
     // ORNAMENT scale — the triangle's unit and the rows' vertical padding — because that is the one
     // job a replication factor was always right for.
-    let ts = if pw >= 1280 { 2 } else { 1 };
-    let face = if pw >= 1280 { crate::video::text::Face::Chrome } else { crate::video::text::Face::Body };
+    // UIMETRICS (B372): the predicate reads the LOGICAL panel (the CSS-px desktop the dpi scale gives) and the
+    // answers are physical — the ornament unit at the scale, the faces the dpi-sized ones (Body -> Grid).
+    let lpw = crate::video::metrics::to_logical(pw);
+    let ts = crate::ui::px(if lpw >= 1280 { 2 } else { 1 });
+    let face = crate::video::metrics::native_face(if lpw >= 1280 { crate::video::text::Face::Chrome } else { crate::video::text::Face::Body });
     let (cell_w, cell_h) = (face.cell_w(), face.cell_h());
     // Leave the chrome room. `wm` draws the title strip above the content and a border around it, and
     // a window whose OUTER box does not fit is a window the tiler will fight.
-    let avail_w = pw.saturating_sub(2 * wm::BORDER);
-    let avail_h = ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER);
+    let avail_w = pw.saturating_sub(2 * wm::BORDER());
+    let avail_h = ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER());
     // THE TWO AXES ROUND SEPARATELY, and that is the whole of what the face split costs here: the
     // surface still holds a whole number of glyph cells, but a glyph cell is no longer square.
-    let w = (pw * 3 / 5).min(CEIL_W).min(avail_w) / cell_w * cell_w;
-    let h = (ph * 3 / 5).min(CEIL_H).min(avail_h) / cell_h * cell_h;
-    if w < FLOOR_W || h < FLOOR_H {
+    let w = (pw * 3 / 5).min(CEIL_W()).min(avail_w) / cell_w * cell_w;
+    let h = (ph * 3 / 5).min(CEIL_H()).min(avail_h) / cell_h * cell_h;
+    if w < FLOOR_W() || h < FLOOR_H() {
         return None;
     }
     Some(Geom { w, h, ts, face })
@@ -873,10 +876,10 @@ fn wheel_next(scroll: usize, smax: usize, detents: i32) -> usize {
 ///
 /// Returns `(thumb_y_offset, thumb_h)` relative to the top of the track.
 fn thumb(track_h: usize, len: usize, visible: usize, scroll: usize) -> Option<(usize, usize)> {
-    if visible == 0 || len <= visible || track_h < THUMB_MIN {
+    if visible == 0 || len <= visible || track_h < THUMB_MIN() {
         return None;
     }
-    let th = (track_h * visible / len).max(THUMB_MIN).min(track_h);
+    let th = (track_h * visible / len).max(THUMB_MIN()).min(track_h);
     let span = track_h - th;
     let smax = scroll_max(len, visible);
     let ty = if smax == 0 { 0 } else { span * scroll.min(smax) / smax };
@@ -1708,9 +1711,9 @@ fn paint_scrollbar(
     // shorter than its header unreachable, but a painter that can underflow on a geometry change is a
     // painter that will, and the cost of not being able to is nothing.
     let track = Rect {
-        x: inner.x + inner.w.saturating_sub(SBW),
+        x: inner.x + inner.w.saturating_sub(SBW()),
         y: top,
-        w: SBW,
+        w: SBW(),
         h: (inner.y + inner.h).saturating_sub(top),
     };
     fill(px, g, track.x, track.y, track.w, track.h, theme::SCROLL_TRACK);
@@ -1743,7 +1746,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         label.extend_from_slice(b"  -  ");
         label.extend_from_slice(s.as_bytes());
     }
-    text(px, g, PAD, g.ts, &label, g.w - PAD, theme::TITLE_TEXT_ACTIVE);
+    text(px, g, PAD(), g.ts, &label, g.w - PAD(), theme::TITLE_TEXT_ACTIVE);
 
     // ── the tree pane ───────────────────────────────────────────────────────────────────────────
     let tp = g.tree_pane();
@@ -1751,7 +1754,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     fill(px, g, tp.x, tp.y, tp.w, tp.h, theme::CONTENT_FILL);
     keyline(px, g, tp, theme::FRAME_LINE);
     let tvis = m.tree_visible();
-    let tsb = if m.tree.len() > tvis { SBW } else { 0 };
+    let tsb = if m.tree.len() > tvis { SBW() } else { 0 };
     for r in 0..tvis {
         let i = m.tree_scroll + r;
         if i >= m.tree.len() {
@@ -1769,7 +1772,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         } else {
             theme::CONTENT_TEXT
         };
-        let indent = PAD + row.depth * mark_w;
+        let indent = PAD() + row.depth * mark_w;
         // Both triangle forms have their centre at `y + 4 * ts` by construction (column/row `i`
         // spans `i ..= i + 2*(n-i)`, whose midpoint is `n`, independent of `i`), so this offset
         // puts the marker's centre exactly on the row's.
@@ -1795,7 +1798,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     fill(px, g, lp.x, lp.y, lp.w, lp.h, theme::CONTENT_FILL);
     keyline(px, g, lp, theme::FRAME_LINE);
     let lvis = m.list_visible();
-    let lsb = if m.list.len() > lvis { SBW } else { 0 };
+    let lsb = if m.list.len() > lvis { SBW() } else { 0 };
     let body_y = columns::paint_list(m, px, li, lsb, lvis); // QUARRY2 (B336): the header (sortable, with a chevron) and the NAME SIZE MODIFIED TYPE ORIGIN columns
     paint_scrollbar(px, g, li, body_y, m.list.len(), lvis, m.list_scroll);
     ops::paint_overlay(m, px); // QUARRYOPS — the context menu and the inline edit field, over the finished frame
@@ -1938,7 +1941,7 @@ pub fn open() {
     let Some(g) = geometry(pw, ph) else {
         serial_println!(
             "[quarry] DECLINE reason=panel-below-floor panel={}x{} floor={}x{}",
-            pw, ph, FLOOR_W, FLOOR_H
+            pw, ph, FLOOR_W(), FLOOR_H()
         );
         return;
     };
@@ -1982,7 +1985,7 @@ pub fn open() {
     }
     repaint();
 
-    let Some((_scale, ow, oh)) = wm::spawn_geometry(g.w, g.h) else {
+    let Some((_scale, ow, oh)) = wm::spawn_geometry_native(g.w, g.h) else {
         serial_println!("[quarry] DECLINE reason=geometry-unavailable");
         *MODEL.lock() = None;
         SURF.lock().clear();
@@ -1999,7 +2002,7 @@ pub fn open() {
             .saturating_sub(oh)
             / 2;
     let base = SURF.lock().as_ptr() as usize;
-    let id = wm::create_at(
+    let id = wm::create_at_native(
         OWNER,
         base,
         len,
@@ -2007,8 +2010,8 @@ pub fn open() {
         g.h as u32,
         (g.w * 4) as u32,
         b"Quarry",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[quarry] DECLINE reason=create-failed");
@@ -2571,7 +2574,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         // it is the only scroll a wheel-less mouse has and the only one that crosses a
         // thousand-entry directory in a gesture a wrist can complete. The two share this pane's one
         // offset and the same selection pull, so neither can drift from the other.
-        if sb && sx >= ti.x + ti.w - SBW {
+        if sb && sx >= ti.x + ti.w - SBW() {
             let (ty, th) = thumb(ti.h, m.tree.len(), tvis, m.tree_scroll).unwrap_or((0, 0));
             let rel = sy.saturating_sub(ti.y);
             if rel < ty {
@@ -2604,7 +2607,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         m.click_pane = Pane::Tree;
         // A press ON the disclosure marker toggles; anywhere else on the row navigates. The two
         // regions are derived from the SAME indent the painter used, so they cannot drift.
-        let indent = ti.x + PAD + m.tree[i].depth * mark_w;
+        let indent = ti.x + PAD() + m.tree[i].depth * mark_w;
         if sx >= indent && sx < indent + mark_w {
             if m.tree[i].expanded {
                 m.collapse(i);
@@ -2625,7 +2628,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         let sb = m.list.len() > lvis;
         m.focus = Pane::List;
         let body_y = li.y + row_h;
-        if sb && sx >= li.x + li.w - SBW && sy >= body_y {
+        if sb && sx >= li.x + li.w - SBW() && sy >= body_y {
             let track_h = li.y + li.h - body_y;
             let (ty, th) = thumb(track_h, m.list.len(), lvis, m.list_scroll).unwrap_or((0, 0));
             let rel = sy - body_y;
@@ -2874,7 +2877,7 @@ pub fn service() {
     #[cfg(feature = "facet")]
     crate::video::facet::service();
     // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
-    crate::video::fileview::service(); crate::video::settings::service(); crate::video::text::service();
+    crate::video::fileview::service(); crate::video::settings::service(); crate::video::text::service(); crate::video::metrics::ignite(); // UIMETRICS (B372): the furniture's runtime asserts on the latched metrics + `[ui] metrics`, once, on the first desktop service pass
     // TEXTEDIT — the editor's latch drains on the same pass.
     crate::video::textedit::service();
     // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.
@@ -2900,14 +2903,15 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     if geometry(200, 200).is_some() {
         return Err("geometry admitted a panel below the floor");
     }
-    let small = geometry(640, 480).ok_or("geometry declined 640x480")?;
-    let bench = geometry(1920, 1200).ok_or("geometry declined 1920x1200")?;
-    if small.ts != 1 || bench.ts != 2 {
+    let sz = crate::video::metrics::size; // UIMETRICS: the hypothetical panels are LOGICAL ones at this boot's dpi scale
+    let small = geometry(sz(640), sz(480)).ok_or("geometry declined 640x480")?;
+    let bench = geometry(sz(1920), sz(1200)).ok_or("geometry declined 1920x1200")?;
+    if small.ts != crate::ui::px(1) || bench.ts != crate::ui::px(2) {
         return Err("ornament scale did not follow the panel");
     }
     // QUARRYFONT — the panel predicate now answers a FACE, and the leg that used to pin the
     // replication factor pins that instead. Both claims are kept: `ts` is still the ornament unit.
-    if small.face != crate::video::text::Face::Body || bench.face != crate::video::text::Face::Chrome {
+    if small.face != crate::video::metrics::native_face(crate::video::text::Face::Body) || bench.face != crate::video::text::Face::Chrome {
         return Err("text face did not follow the panel");
     }
     // The two units are genuinely different numbers now — a doubled 1-bit cell was square and a
@@ -2915,7 +2919,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     if bench.cell_w() == 0 || bench.cell_h() == 0 || bench.mark_w() != BASE_CELL * bench.ts {
         return Err("geometry's glyph and ornament units disagree");
     }
-    if small.w > 640 || small.h > 480 || bench.w > CEIL_W || bench.h > CEIL_H {
+    if small.w > sz(640) || small.h > sz(480) || bench.w > CEIL_W() || bench.h > CEIL_H() {
         return Err("surface exceeded its panel or its ceiling");
     }
     // The two panes must tile the surface exactly, with one pixel of divider and nothing over.
@@ -2968,7 +2972,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         return Err("a thumb was drawn for a list that fits");
     }
     let (ty, th) = thumb(100, 1000, 10, 0).ok_or("no thumb for an overflowing list")?;
-    if ty != 0 || th < THUMB_MIN {
+    if ty != 0 || th < THUMB_MIN() {
         return Err("thumb floor not honoured at scroll 0");
     }
     let (ty2, th2) = thumb(100, 1000, 10, 990).ok_or("no thumb at the tail")?;
@@ -3213,7 +3217,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     // The first BODY row of the list pane, derived the way the PAINTER derives it — inner top plus
     // one row for the pinned header, plus a pixel to land inside the row rather than on its edge.
     let lin = small.list_pane().inner();
-    let px_x = lin.x + PAD + 1;
+    let px_x = lin.x + PAD() + 1;
     let row0_y = lin.y + small.row_h() + 1;
     let row1_y = row0_y + small.row_h();
     // A zero clock is a legitimate state (`CNTFRQ_EL0` unset), and on such a machine the guard in
@@ -3301,7 +3305,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     m.list_scroll = 0;
     m.settle();
     let tin = small.tree_pane().inner();
-    let (tree_x, tree_y) = (tin.x + PAD + 1, tin.y + 1);
+    let (tree_x, tree_y) = (tin.x + PAD() + 1, tin.y + 1);
     let (list_x, list_y) = (px_x, row0_y);
     let lmax = scroll_max(m.list.len(), lvis);
     let tmax = scroll_max(m.tree.len(), tvis);
@@ -4101,7 +4105,7 @@ pub fn open_selftest() {
     m.click_ms = 0;
     m.focus = Pane::Tree;
     let lin = small.list_pane().inner();
-    let px_x = lin.x + PAD + 1;
+    let px_x = lin.x + PAD() + 1;
     let row_y = |r: usize| lin.y + small.row_h() * (r + 1) + 1;
     // A board whose `CNTFRQ_EL0` reads 0 answers `ms() == 0` forever, and `is_double`'s guard must
     // SUPPRESS the gesture there rather than fire it on the first press. Both worlds are scored.
