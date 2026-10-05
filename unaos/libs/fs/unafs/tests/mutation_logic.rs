@@ -706,3 +706,40 @@ fn rmdir_refuses_files_missing_names_and_the_volume_root() {
     assert!(fs.resolve_path("/home").is_ok());
     assert!(fs.resolve_path("/plain.txt").is_ok());
 }
+
+// --- SMALLFIX (B380): in-place truncate (the SYSKAT2 check-19 shape) --------
+
+#[test]
+fn truncate_data_shrinks_in_place_and_regrows_zeroed() {
+    let mut fs = fresh_fs(5000);
+    let root_id = fs.superblock.root_inode;
+    let id = fs.create_file(root_id, "kat2.tmp".to_string()).unwrap();
+    fs.set_attribute(id, "keep".to_string(), AttributeValue::String("me".to_string())).unwrap();
+    fs.write_data(id, 0, b"0123456789").unwrap();
+    fs.truncate_data(id, 5).unwrap();
+    assert_eq!(fs.read_inode(id).unwrap().size, 5);
+    fs.truncate_data(id, 4103).unwrap();
+    let ino = fs.read_inode(id).unwrap();
+    assert_eq!(ino.size, 4103);
+    let got = fs.read_data(id, 0, 4103).unwrap();
+    assert_eq!(&got[..5], b"01234");
+    assert!(got[5..].iter().all(|&b| b == 0), "the old tail must not reappear after a regrow");
+    // Same inode: the attribute survived (the ACL-preserving reason truncate is in place).
+    assert!(fs.get_attribute(id, "keep").unwrap().is_some());
+    // Shrink across blocks releases them; to zero leaves no extents.
+    let big = vec![7u8; (BLOCK_SIZE * 4) as usize];
+    fs.write_data(id, 0, &big).unwrap();
+    let before = fs.free_blocks();
+    fs.truncate_data(id, 0).unwrap();
+    let ino = fs.read_inode(id).unwrap();
+    assert_eq!(ino.size, 0);
+    assert!(ino.chunks.is_empty());
+    assert!(fs.free_blocks() > before);
+    // The volume re-mounts clean with the inode intact.
+    fs.write_data(id, 0, b"after").unwrap();
+    let device = fs.device.clone();
+    drop(fs);
+    let mut again = UnaFS::mount(device).expect("re-mount");
+    assert_eq!(again.read_data(id, 0, 5).unwrap(), b"after");
+    assert!(again.fsck(false).expect("fsck").is_clean(), "truncate leaked or double-freed a block");
+}

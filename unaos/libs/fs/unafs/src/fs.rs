@@ -1388,6 +1388,57 @@ impl<D: BlockDevice> UnaFS<D> {
         self.maybe_commit()
     }
 
+    /// Set an inode's logical size to exactly `new_size`, IN PLACE: the inode
+    /// (its id, attributes and ACL) is kept — the shrink primitive the VFS
+    /// `truncate` verb lacked (SMALLFIX B380: `ftruncate` shrink on the UnaFS
+    /// root returned EIO, SYSKAT2 check 19). Growing zero-extends through
+    /// `write_data`; shrinking releases every block past the new end and CoWs
+    /// a partial tail block with the bytes past `new_size` zeroed, so a later
+    /// grow reads zeros, never the old tail. One transaction.
+    pub fn truncate_data(&mut self, inode_id: u64, new_size: u64) -> Result<(), FileSystemError> {
+        let mut inode = self.read_inode(inode_id)?;
+        if new_size == inode.size {
+            return Ok(());
+        }
+        if new_size > inode.size {
+            if new_size > self.volume_bytes() {
+                return Err(FileSystemError::NoSpace);
+            }
+            let add = usize::try_from(new_size - inode.size).map_err(|_| FileSystemError::NoSpace)?;
+            let zeros = alloc::vec![0u8; add];
+            return self.write_data(inode_id, inode.size, &zeros);
+        }
+        let old_blocks = inode.size.div_ceil(BLOCK_SIZE);
+        let keep = new_size.div_ceil(BLOCK_SIZE);
+        let mut map = self.file_block_map(&inode, old_blocks)?;
+        for idx in keep..old_blocks {
+            let pb = map[idx as usize];
+            if pb != 0 {
+                self.refmap.decref(&mut self.device, pb);
+            }
+        }
+        map.truncate(keep as usize);
+        let tail = (new_size % BLOCK_SIZE) as usize;
+        if tail != 0 {
+            let last = (keep - 1) as usize;
+            let old = map[last];
+            if old != 0 {
+                let mut buf = alloc::vec![0u8; BLOCK_SIZE as usize];
+                self.device.read_block(old, &mut buf)?;
+                buf[tail..].fill(0);
+                let nb = self.alloc_block()?; // NEVER overwrite in place
+                self.write_fresh(nb, &buf)?;
+                self.refmap.decref(&mut self.device, old);
+                map[last] = nb;
+            }
+        }
+        inode.chunks = Self::emit_extents(&map, new_size);
+        inode.size = new_size;
+        stamp_data(&mut inode);
+        self.write_inode(&inode)?;
+        self.maybe_commit()
+    }
+
     /// Read data from an Inode.
     pub fn read_data(
         &mut self,
