@@ -37,6 +37,7 @@ impl FakeStria {
                     width: W,
                     height: H,
                     rgba: TestPattern::render(W, H, n as u32),
+                    levels: vec![],
                 });
             };
             while !st.load(Ordering::Acquire) {

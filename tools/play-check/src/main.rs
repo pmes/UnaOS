@@ -5,6 +5,8 @@
 //!
 //! ```text
 //! play-check <file> [--frame N --out f.png] [--hz 60] [--oracle chromium-oracle.jsonl]
+//!            [--audio-out played.f32 [--audio-ref chromium.f32 --audio-floor exact|snr:<dB>|lsb:<n>
+//!             [--ref-frames-max]]]
 //! play-check --make-utp <out.mp4|out.webm> [frames] [fps]
 //! ```
 //!
@@ -16,14 +18,89 @@
 //! read back from it. With `--oracle` it finds the file's Chromium line (by file name) and
 //! checks that every Chromium `mediaTime` lies within one frame of a presented pts, and the
 //! frame counts agree; exit status 1 on any mismatch.
+//!
+//! AUDIOTRACK (SR45): with `--audio-out` the player gets a headless DEVICE — an [`AudioOut`]
+//! that consumes the stereo stream at exactly its sample rate on the same manual clock — so the
+//! audio track decodes and is the master clock, as on a real host; every sample the device
+//! played is written as `u32 channels, u32 frames, u32 rate, planar f32` (the layout
+//! `audio_core/oracle/chromium-oracle.cjs` dumps Chromium's `decodeAudioData` in), for the
+//! sample-for-sample oracle. Audio-only files (no video track) play the same way.
+//!
+//! `--audio-ref` compares what the device played with Chromium's decode of the same file, per
+//! channel (a mono reference is held against both played channels — the player duplicates
+//! mono), at the floor named: `exact` (bit-identical), `snr:<dB>`, or `lsb:<n>` (every sample
+//! within n 16-bit LSBs, or SNR ≥ 60 dB for quiet clips). `decodeAudioData` has no timeline, so
+//! the device's first `audio_start_ns` of lead-in silence (an audio track that starts after the
+//! video does) is skipped before comparing; the best-offset search must then land on 0. Frame counts must be equal, except with
+//! `--ref-frames-max`, where ours must not exceed Chromium's (Chromium returns every decoded
+//! Vorbis sample in WebM; the stream's own end trim is not applied there).
 
 mod png;
 
 use std::sync::Arc;
 
-use gneiss_pal::dsp::avsync::ManualTime;
+use gneiss_pal::dsp::avsync::{ManualTime, TimeSource};
 use gneiss_pal::dsp::video::{Frame, TestPattern};
-use stria::media::{FrameSink, Player, Tick};
+use stria::media::{AudioOut, FrameSink, Player, Tick};
+
+/// A headless audio device: takes stereo frames into a half-second ring and consumes them at
+/// `rate` frames per second of the manual clock while playing; records what it played.
+struct Device {
+    time: ManualTime,
+    rate: u64,
+    cap: u64,
+    pushed: Vec<f32>,
+    /// Consumption is `base + (now − base_t)·rate` (while playing), capped at what was pushed.
+    base: u64,
+    base_t: u64,
+    playing: bool,
+    /// Frames dropped by flushes (pushed, never played), and where they were cut out.
+    cuts: Vec<(usize, usize)>,
+}
+impl Device {
+    fn pushed_frames(&self) -> u64 {
+        self.pushed.len() as u64 / 2
+    }
+    fn now_consumed(&self) -> u64 {
+        let mut c = self.base;
+        if self.playing {
+            c += (self.time.now_ns().saturating_sub(self.base_t) as u128 * self.rate as u128 / 1_000_000_000) as u64;
+        }
+        c.min(self.pushed_frames())
+    }
+    fn rebase(&mut self) {
+        self.base = self.now_consumed();
+        self.base_t = self.time.now_ns();
+    }
+}
+struct SharedDevice(std::sync::Arc<std::sync::Mutex<Device>>);
+impl AudioOut for SharedDevice {
+    fn push(&mut self, stereo: &[f32]) -> usize {
+        let mut d = self.0.lock().unwrap();
+        d.rebase();
+        let room = d.cap.saturating_sub(d.pushed_frames() - d.base) as usize * 2;
+        let n = (stereo.len() / 2 * 2).min(room);
+        d.pushed.extend_from_slice(&stereo[..n]);
+        n
+    }
+    fn consumed(&self) -> u64 {
+        let d = self.0.lock().unwrap();
+        d.now_consumed()
+    }
+    fn flush(&mut self) {
+        let mut d = self.0.lock().unwrap();
+        d.rebase();
+        let played = d.base as usize * 2;
+        let len = d.pushed.len();
+        d.cuts.push((played, len - played));
+        d.pushed.truncate(played);
+    }
+    fn set_paused(&mut self, paused: bool) {
+        let mut d = self.0.lock().unwrap();
+        d.rebase();
+        d.playing = !paused;
+    }
+}
 
 struct Capture {
     want: Option<u64>,
@@ -38,6 +115,66 @@ impl FrameSink for Capture {
             self.frame = Some(f.clone());
         }
     }
+}
+
+/// A planar f32 dump: (channels, rate, planes).
+fn read_dump(path: &str) -> Option<(usize, u32, Vec<Vec<f32>>)> {
+    let b = std::fs::read(path).ok()?;
+    let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+    let (ch, frames, rate) = (u(0), u(4), u(8) as u32);
+    if b.len() < 12 + ch * frames * 4 {
+        return None;
+    }
+    let planes = (0..ch).map(|c| b[12 + c * frames * 4..12 + (c + 1) * frames * 4].chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect()).collect();
+    Some((ch, rate, planes))
+}
+
+struct AudioCmp {
+    frames_ours: usize,
+    frames_ref: usize,
+    snr_db: f64,
+    max_abs: f64,
+    mismatches: usize,
+    /// The shift (−2048..=2048 frames) that maximises SNR: 0 when the timelines agree.
+    best_offset: i64,
+}
+
+fn compare_audio(ours: &[Vec<f32>], refr: &[Vec<f32>]) -> AudioCmp {
+    let fo = ours[0].len();
+    let fr = refr[0].len();
+    let pair = |c: usize| (&ours[c], &refr[c.min(refr.len() - 1)]);
+    let score = |off: i64| -> (f64, f64, usize) {
+        let (mut sig, mut err, mut maxd, mut mis) = (0f64, 0f64, 0f64, 0usize);
+        for c in 0..ours.len() {
+            let (o, r) = pair(c);
+            for i in 0..fr {
+                let j = i as i64 + off;
+                if j < 0 || j as usize >= fo {
+                    continue;
+                }
+                let a = o[j as usize] as f64;
+                let b = r[i] as f64;
+                if a != b {
+                    mis += 1;
+                }
+                sig += b * b;
+                err += (a - b) * (a - b);
+                maxd = maxd.max((a - b).abs());
+            }
+        }
+        (if err == 0.0 { f64::INFINITY } else { 10.0 * (sig / err).log10() }, maxd, mis)
+    };
+    let (snr, maxd, mis) = score(0);
+    let mut best = (0i64, snr);
+    if snr.is_finite() && snr < 40.0 {
+        for off in (-2048..=2048).step_by(1) {
+            let (s, _, _) = score(off);
+            if s > best.1 {
+                best = (off, s);
+            }
+        }
+    }
+    AudioCmp { frames_ours: fo, frames_ref: fr, snr_db: snr, max_abs: maxd, mismatches: mis, best_offset: best.0 }
 }
 
 fn arg(args: &[String], k: &str) -> Option<String> {
@@ -81,14 +218,20 @@ fn main() {
         std::process::exit(2)
     });
     let time = ManualTime::new();
-    let mut p = Player::open(bytes, Arc::new(time.clone()), None, hz).unwrap_or_else(|e| {
+    let audio_out = arg(&args, "--audio-out");
+    let device = audio_out.as_ref().map(|_| {
+        let rate = Player::probe_audio_rate(&bytes).max(1) as u64;
+        std::sync::Arc::new(std::sync::Mutex::new(Device { time: time.clone(), rate, cap: rate / 2, pushed: Vec::new(), base: 0, base_t: 0, playing: false, cuts: Vec::new() }))
+    });
+    let aout: Option<Box<dyn AudioOut>> = device.as_ref().map(|d| Box::new(SharedDevice(d.clone())) as Box<dyn AudioOut>);
+    let mut p = Player::open(bytes, Arc::new(time.clone()), aout, hz).unwrap_or_else(|e| {
         eprintln!("play-check: {file}: {e}");
         std::process::exit(2)
     });
     let period = 1_000_000_000u64 / hz as u64;
     let mut cap = Capture { want, shown: Vec::new(), clock: 0, frame: None };
     p.play();
-    let max_ticks = (p.info().duration_ns / period + hz as u64 * 2) as usize;
+    let max_ticks = (p.info().duration_ns / period + hz as u64 * 3) as usize;
     for _ in 0..max_ticks {
         cap.clock = p.clock_ns();
         if p.tick(&mut cap) == Tick::Ended {
@@ -129,8 +272,10 @@ fn main() {
         match oracle_line(&o, name) {
             Some((times, presented)) => {
                 // One frame = the track's mean frame duration.
-                let vt = p.video_track();
-                let frame_ns = if vt.sample_count > 0 { vt.duration_ns / vt.sample_count } else { 33_333_333 } as f64;
+                let frame_ns = match p.video_track() {
+                    Some(vt) if vt.sample_count > 0 => vt.duration_ns / vt.sample_count,
+                    _ => 33_333_333,
+                } as f64;
                 let ours: Vec<f64> = cap.shown.iter().map(|s| s.1 as f64).collect();
                 let worst = times
                     .iter()
@@ -147,12 +292,73 @@ fn main() {
             }
         }
     }
+    if let (Some(out), Some(dev)) = (&audio_out, &device) {
+        let d = dev.lock().unwrap();
+        let played = d.now_consumed() as usize;
+        let frames = &d.pushed[..played * 2];
+        let mut b = Vec::with_capacity(12 + frames.len() * 4);
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&(played as u32).to_le_bytes());
+        b.extend_from_slice(&(d.rate as u32).to_le_bytes());
+        for c in 0..2 {
+            for f in frames.chunks_exact(2) {
+                b.extend_from_slice(&f[c].to_le_bytes());
+            }
+        }
+        std::fs::write(out, b).unwrap_or_else(|e| {
+            eprintln!("play-check: {out}: {e}");
+            std::process::exit(2)
+        });
+        extra += &format!(",\"audio_played\":{played},\"audio_flushed\":{}", d.cuts.iter().map(|c| c.1 / 2).sum::<usize>());
+        if let Some(rp) = arg(&args, "--audio-ref") {
+            match read_dump(&rp) {
+                Some((_, rrate, refr)) => {
+                    let lead = (info.audio_start_ns.max(0) as u128 * d.rate as u128 / 1_000_000_000) as usize;
+                    let ours: Vec<Vec<f32>> = (0..2).map(|c| frames.chunks_exact(2).skip(lead).map(|f| f[c]).collect()).collect();
+                    let c = compare_audio(&ours, &refr);
+                    let floor = arg(&args, "--audio-floor").unwrap_or_else(|| "exact".into());
+                    let level_ok = if floor == "exact" {
+                        c.mismatches == 0
+                    } else if let Some(db) = floor.strip_prefix("snr:") {
+                        c.snr_db >= db.parse::<f64>().unwrap_or(f64::INFINITY)
+                    } else if let Some(n) = floor.strip_prefix("lsb:") {
+                        c.max_abs <= n.parse::<f64>().unwrap_or(0.0) / 32768.0 || c.snr_db >= 60.0
+                    } else {
+                        false
+                    };
+                    let frames_ok = if args.iter().any(|a| a == "--ref-frames-max") { c.frames_ours <= c.frames_ref } else { c.frames_ours == c.frames_ref };
+                    let rate_ok = rrate as u64 == d.rate;
+                    ok &= level_ok && frames_ok && rate_ok && c.best_offset == 0;
+                    extra += &format!(
+                        ",\"audio_oracle\":{{\"floor\":\"{floor}\",\"lead_frames\":{lead},\"ref_channels\":{},\"frames_ours\":{},\"frames_ref\":{},\"snr_db\":{},\"max_abs\":{:.3e},\"max_lsb16\":{:.2},\"mismatches\":{},\"best_offset\":{},\"ok\":{}}}",
+                        refr.len(),
+                        c.frames_ours,
+                        c.frames_ref,
+                        if c.snr_db.is_finite() { format!("{:.2}", c.snr_db) } else { "\"inf\"".into() },
+                        c.max_abs,
+                        c.max_abs * 32768.0,
+                        c.mismatches,
+                        c.best_offset,
+                        level_ok && frames_ok && rate_ok && c.best_offset == 0
+                    );
+                }
+                None => {
+                    extra += ",\"audio_oracle\":\"unreadable reference\"";
+                    ok = false;
+                }
+            }
+        }
+    }
     println!(
-        "{{\"file\":\"{}\",\"video\":\"{}\",\"audio\":\"{}\",\"decoder\":\"{}\",\"real_video\":{},\"audio_note\":\"{}\",\"size\":[{},{}],\"duration\":{:.6},\"hz\":{hz},\"presented\":{},\"dropped\":{},\"repeated\":{},\"av_max_ms\":{:.3},\"pts\":[{}]{extra},\"ok\":{ok}}}",
+        "{{\"file\":\"{}\",\"video\":\"{}\",\"audio\":\"{}\",\"decoder\":\"{}\",\"audio_decoder\":\"{}\",\"sample_rate\":{},\"channels\":{},\"audio_clock\":{},\"real_video\":{},\"audio_note\":\"{}\",\"size\":[{},{}],\"duration\":{:.6},\"hz\":{hz},\"presented\":{},\"dropped\":{},\"repeated\":{},\"av_max_ms\":{:.3},\"pts\":[{}]{extra},\"ok\":{ok}}}",
         file,
         info.video,
         info.audio,
         info.video_decoder,
+        info.audio_decoder,
+        info.sample_rate,
+        info.channels,
+        info.audio_clock,
         info.real_video,
         info.audio_note.replace('"', "'"),
         info.width,
