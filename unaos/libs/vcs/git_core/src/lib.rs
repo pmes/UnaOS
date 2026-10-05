@@ -45,9 +45,15 @@ pub mod config;
 pub mod ignore;
 pub mod delta;
 pub mod pack;
+pub mod diff;
+pub mod index;
+#[cfg(feature = "std")]
+pub mod repo;
 
 pub use hash::{HashKind, ObjectId};
 pub use object::{Kind, Commit, Tag, Tree, TreeEntry, Signature};
+#[cfg(feature = "std")]
+pub use repo::Repository;
 
 /// The one error type: a named, falsifiable reason.
 #[derive(Debug, Clone, PartialEq, Eq)]

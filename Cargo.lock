@@ -2811,6 +2811,7 @@ name = "git_core"
 version = "0.1.0"
 dependencies = [
  "crypto_core",
+ "git_core",
  "http_core",
  "pixel_core",
 ]

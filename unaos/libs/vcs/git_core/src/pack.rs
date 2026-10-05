@@ -260,7 +260,7 @@ impl<'a> Idx<'a> {
         if data.len() < min {
             return Err(Error::Corrupt("idx: truncated tables"));
         }
-        if version == 2 {
+        if version == 2 && verify {
             let large = data[8 + 1024 + c * (n + 4)..8 + 1024 + c * (n + 8)]
                 .chunks(4)
                 .filter(|w| w[0] & 0x80 != 0)
@@ -268,7 +268,7 @@ impl<'a> Idx<'a> {
             if data.len() != min + large * 8 {
                 return Err(Error::Corrupt("idx: size disagrees with large-offset count"));
             }
-        } else if data.len() != min {
+        } else if version == 1 && data.len() != min {
             return Err(Error::Corrupt("idx: v1 size mismatch"));
         }
         if verify {
