@@ -58,3 +58,25 @@ detail line); on an install, `[install] stage=grow from=<b> to=<b> ok`.
 commit rewrites the whole map — the 256 MiB x86 heap and the one-sector AHCI write path make the whole
 SSD unmountable/unusable until the map is incremental); online grow of the mounted root; shrink; unflown
 (R78).
+
+## Results (unflown, R78)
+
+Commits: INSTALL3 merge 5b074622 (clean) · M1 a62b32cf · M2–M4 6df64116.
+
+- `cargo test -p unafs -p unafs-cli` (repo root): exit 0; `grow_logic` 6 tests (4N on an image file with
+  the exact free count, one→two-level map crossing, refusals, pre-v5 cap, interrupted grow, the RAM
+  image shape); every existing unafs suite unchanged and passing (hostile_volume 29, kat_vectors 14).
+- `tools/unafs grow`: an 8 MiB image grown to 8192 blocks → `from=2048 to=8192 free 2029 -> 8167 fsck=ok`
+  (+6144 blocks − 6 new map leaves); a shrink exits 1.
+- x86 metal shape + `ahciroot` (with `instgui,installdemo`): exit 0, no warning in a touched file.
+- aarch64 login shape (`login,loginst,virt_el0`, blob head 280080d2): exit 0.
+- charter-check: exit 0 (new `fs/unafsgrow.rs` carries `CHARTER: Kernel — fs-core`).
+
+Expected wire. `tests unafsgrow` (UnaFS root mounted):
+`[unafsgrow] img=/var/tmp/unafsgrow.img readback=eq remount_blocks=768 file=intact free=<a>-><b> (+256 blocks, the map's own growth 0)`
+then `:: UNAFSGROW: from=512 to=768 fsck=ok -> PASS ::` (a FAT root: `img=ram — no UnaFS root mounted`,
+same verdict line). `install ssd --write` / the glass's confirm: after `[install] stage=fsck ok`,
+`[install] unafs grow: from=<b> to=<b> blocks (<m> MiB -> <n> MiB) fsck=ok` and
+`[install] stage=grow from=<b> to=<b> ok`; the next boot's root line names `blocks=<to>`. The glass's dry
+run no longer prints `:: INSTALL: grant minted … WHOLE-DISK …`; its stage list carries `grow dry (not run)`.
+`tests instgui`'s census gains an `sdhc` row (`the SD card (read-only here)` / `the boot SD card …`).
