@@ -678,7 +678,7 @@ pub fn _print(args: core::fmt::Arguments) {
     let tap = &crate::serial_ring::TAP_FBCON;
     tap.submit();
     // Once the GUI owns the screen, don't mirror to the framebuffer (serial still gets it).
-    if GUI_ACTIVE.load(Ordering::Relaxed) || panel_mirror_held() || conquiet_held() { // CONSOLEQUIET — the THIRD term is aarch64's half of x86's QUIET-PANEL rule, and it covers the case the second one deliberately does not: a console that is ROUTED INTO A WINDOW. `panel_mirror_held`'s `unrouted` term lifts the hold the instant `panel_console_window_open` installs the glyph route, on the argument that a blank console window is worse than the defect; Peter's render6 ruling is the opposite (the cascade's largest window was a scrolling census log), so from the route install onwards the full serial stream stops reaching the console on aarch64 too. Compile-time `false` on x86, on `bootlog`, and on every aarch64 build without `desktop_firmware` (kernel8's DEFAULT curated K8_FEATS has none; `arroyo:5990` adds it under `UNAOS_PIDESK=1` alone, and that Pi desktop is covered by this rule too — ONE OS), so those images are byte-identical. Panic override THREE times over — see `conquiet_held` at the file tail. DESKHOLD — the second half is the Pi's counterpart of x86's QUIET-PANEL gate: once `desktop_firmware::activate` has cleared the glass to `DESKTOP_BG` the compositor owns those pixels and the panel mirror is a SECOND writer on them. Serial is untouched, the panic mirror overrides, and the test is a compile-time `false` off aarch64+desktop_firmware. See `panel_mirror_held` at the file tail. LINE-NEUTRAL fold, PARITY §5.3 — this file is compiled into the knob-off image and a line added here renumbers every panic `Location` below it.
+    if gui_held() || panel_mirror_held() || conquiet_held() { // CONSOLEQUIET — the THIRD term is aarch64's half of x86's QUIET-PANEL rule, and it covers the case the second one deliberately does not: a console that is ROUTED INTO A WINDOW. `panel_mirror_held`'s `unrouted` term lifts the hold the instant `panel_console_window_open` installs the glyph route, on the argument that a blank console window is worse than the defect; Peter's render6 ruling is the opposite (the cascade's largest window was a scrolling census log), so from the route install onwards the full serial stream stops reaching the console on aarch64 too. Compile-time `false` on x86, on `bootlog`, and on every aarch64 build without `desktop_firmware` (kernel8's DEFAULT curated K8_FEATS has none; `arroyo:5990` adds it under `UNAOS_PIDESK=1` alone, and that Pi desktop is covered by this rule too — ONE OS), so those images are byte-identical. Panic override THREE times over — see `conquiet_held` at the file tail. DESKHOLD — the second half is the Pi's counterpart of x86's QUIET-PANEL gate: once `desktop_firmware::activate` has cleared the glass to `DESKTOP_BG` the compositor owns those pixels and the panel mirror is a SECOND writer on them. Serial is untouched, the panic mirror overrides, and the test is a compile-time `false` off aarch64+desktop_firmware. See `panel_mirror_held` at the file tail. LINE-NEUTRAL fold, PARITY §5.3 — this file is compiled into the knob-off image and a line added here renumbers every panic `Location` below it.
         tap.suppress();
         return;
     }
@@ -2047,7 +2047,7 @@ pub fn panel_console_window_open() -> wm::WinId {
         id
     );
     crate::bootlog_println!("[fbcon] remint win={} repainted_rows={} from={} grid={}x{} was={}x{} cursor={},{} retain={}", id, rm.repainted_rows, if rm.had { "cells" } else { "none" }, rgc, rgr, rm.was.0, rm.was.1, rm.col, rm.row, if retained { "ok" } else { "declined" }); route_present(); cascadefit_witness(pw, ph, ox, oy, ow, oh); route_present(); // CONSOLETEXT — the witness, on EVERY mint and UNGATED (no `witness` knob): this is the one line that separates "the console came back with its text" from "the console came back black", and the second is the defect render8 caught on the glass with nothing on the wire to name it. `from=none repainted_rows=0` is a FIRST mint; `from=cells repainted_rows=<n>` is a re-mint that restored `n` rows; `from=cells repainted_rows=0` is a re-mint whose previous screenful was genuinely blank. `retain` reads `ok` when the store was adopted by the install block — read back from `c.win_cells` inside the install block itself — and `declined` when the allocation was refused, i.e. when the NEXT mint will have nothing to repaint from. Emitted before `route_present` and outside every lock, per this function's standing rule for its two `[wc-x]` lines. ⚠ SAME-LINE fold, line-NEUTRAL. ‖ CASCADEFIT — the fit is MEASURED here, after the row exists and against the box that was actually created, and never asserted: both windows' geometry is a runtime function of the furniture, so `overlap_rows=` is the only honest statement of the rule. ⚠ SAME-LINE fold, line-NEUTRAL (PARITY.md §5.3).
-    id
+    crate::loginfurn::console_prefill(id, grows, rm.repainted_rows); id // LOGINFURN (R88): the fresh console opens on the current boot's text, never blank. SAME-LINE fold
 }
 
 /// NORMALWIN — **the console window was CLOSED by the operator: stop routing presents at it.**
@@ -3588,4 +3588,44 @@ pub fn regrid() -> Option<(usize, usize, usize, usize)> {
         font_repaint();
     }
     out
+}
+
+// ── LOGINFURN (rmbp-ledger B374, R88) ────────────────────────────────────────────────────────────────────────────
+//
+// Flight 23: "console is doubly wrong because it is blank". The R86 bare activation `detach`es fbcon (the compositor
+// alone owns the glass under the setter), and nothing re-armed `_print` when the console window was minted after the
+// login — every line returned at the first gate, so the routed console took no glyph at all. A BARE detach holds
+// fbcon off the PANEL only: once the console is routed into a window, its glyphs land in the window's surface, which
+// is the compositor's to present. Every other detach (the Pi / tegra handoffs, the bench lanes) is unchanged.
+
+/// The activation's detach was the R86 bare one.
+static BARE_DETACHED: AtomicBool = AtomicBool::new(false);
+
+/// `desktop_uefi`'s bare activation: [`detach`], remembering that a later console window takes glyphs again.
+pub fn detach_bare() {
+    BARE_DETACHED.store(true, Ordering::Relaxed);
+    detach();
+}
+
+/// `_print`'s first gate: the GUI holds fbcon off — except a bare-detached console that is routed into a window.
+fn gui_held() -> bool {
+    if !GUI_ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    if BARE_DETACHED.load(Ordering::Relaxed) && CONSOLE_WIN.load(Ordering::Relaxed) != wm::WIN_NONE {
+        return false;
+    }
+    true
+}
+
+/// LOGINFURN: does a line printed now reach the console (the first two gates of `_print`)?
+pub fn console_takes_glyphs() -> bool {
+    !gui_held() && !panel_mirror_held()
+}
+
+/// LOGINFURN: are the console window's presents suspended (a modal is up)? The prefill restores what it found.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn console_present_suspended() -> bool {
+    CONSOLE_PRESENT_SUSPENDED.load(Ordering::Relaxed)
 }
