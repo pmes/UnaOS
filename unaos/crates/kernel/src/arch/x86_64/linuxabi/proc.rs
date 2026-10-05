@@ -213,6 +213,8 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
         frame_w(ktop, 72),
         frame_w(ktop, 80),
     ];
+    let a6 = super::frame_args(ktop); // SELFBUILDMETAL (B367): a fork child returns with the parent's rdi rsi rdx r10 r8 r9 too, as on Linux
+    let regs = [regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], a6[0], a6[1], a6[2], a6[3], a6[4], a6[5]];
     let pid = new_pid();
     let kill = Arc::new(crate::arch::sched::KillSwitch::new());
     let fds = p.fds.clone();
@@ -233,6 +235,7 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
     });
     let pml4 = cinfo.pml4;
     register(cinfo);
+    super::ldso::fork_copy(info.pml4, pml4); // SELFBUILD6: the child inherits the loader's tables (same objects, COW)
     super::fs_tab_set(pml4, fs_base);
     super::push_fork_regs(pml4, &regs);
     super::signal::fork_copy(info.pid, pid); // SELFBUILD2: handlers + mask inherited
@@ -302,20 +305,33 @@ pub fn execve(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, path_va: u64, 
         Ok(v) => v,
         Err(e) => return e,
     };
+    let dynamic = super::ldso::wants(&full); // SELFBUILD6: a PT_INTERP program goes through the loader (ldso.rs)
     // SELFBUILD4: read the head only; the image pages in through file VMAs (exec.rs).
-    let img = match super::exec::image(&full) {
+    let img = if dynamic { None } else { Some(match super::exec::image(&full) {
         Ok(v) => v,
         Err(e) if e.contains("-ENOENT") || e.contains("-EISDIR") => return -ENOENT,
         Err(_) => return -ENOEXEC,
-    };
-    let (full, plan) = (img.full.clone(), &img.plan);
+    }) };
     // ---- point of no return: the old image is gone (same PML4, so Task.user_cr3 stays valid) ----
     p.asp.reset();
-    super::exec::begin(&img);
-    if super::exec::load(&mut p.asp, &img).is_err() {
-        serial_println!("[linuxabi] execve {}: load failed after reset — process ends", full);
-        return -ENOEXEC; // returns into unmapped memory: the process dies SIGSEGV
-    }
+    super::ldso::forget(info.pml4); // SELFBUILD6: the old image's loader state
+    let (full, plan) = match img {
+        Some(img) => {
+            super::exec::begin(&img);
+            if super::exec::load(&mut p.asp, &img).is_err() {
+                serial_println!("[linuxabi] execve {}: load failed after reset — process ends", full);
+                return -ENOEXEC; // returns into unmapped memory: the process dies SIGSEGV
+            }
+            (img.full, img.plan)
+        }
+        None => match super::ldso::load(&mut p.asp, &full) {
+            Ok(plan) => (full, plan),
+            Err(e) => {
+                serial_println!("[linuxabi] execve {}: dynamic load failed after reset ({}) — process ends", full, e);
+                return -ENOEXEC;
+            }
+        },
+    };
     let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let envp: Vec<&str> = envs.iter().map(|s| s.as_str()).collect();
     let sp = match elf::build_stack(&mut p.asp, &plan, &full, &argv, &envp) {
@@ -345,6 +361,7 @@ pub fn execve(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, path_va: u64, 
             w(off, 0);
         }
     }
+    super::set_frame_args(ktop, [0; 6]); // SELFBUILDMETAL (B367): the new image starts with zero rdi..r9 (glibc's _start reads rdx as rtld_fini)
     serial_println!("[linuxabi] execve pid={} path={} entry={:#x}", info.pid, full, plan.entry);
     0
 }

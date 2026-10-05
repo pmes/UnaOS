@@ -34,6 +34,9 @@ una-abi = { path = "../una-abi" }
 font8x8 = { version = "0.3.1", default-features = false }
 vein_core = { path = "../../libs/sys/vein_core", default-features = false }
 vein_ring3 = { path = "../../libs/sys/vein_ring3" }
+# KERNELFONT2 (rmbp-ledger B363, R85): the window's text through font_core::ui — the engine the kernel's video::text
+# fulfils (KERNELFONT, B359) — from the DejaVu faces on the volume; font8x8 stays the grid when no face is there.
+font_core = { path = "../../libs/text/font_core" }
 
 # VEINTLS (SR36): `cryptocore` = CRYPTOCORE's provider under tls_core. The MEDIA build (arroyo's
 # build_user_lumen_x86) passes `--features cryptocore`; until CRYPTOCORE's fold file is on the branch that build

@@ -1211,7 +1211,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
             // because which pass a given build reaches depends on its knobs.
             #[cfg(feature = "holocron")]
-            unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — the user store loads once the root volume answers and the M1 fixture runs once; same pass, same reason as holocron. ⚠ LINE-NEUTRAL append.
+            unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); unaos_kernel::pwwire::refresh(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ /* CONSOLEFIX M3: the raw-key echoes' cached LOGIN13 state */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — the user store loads once the root volume answers and the M1 fixture runs once; same pass, same reason as holocron. ⚠ LINE-NEUTRAL append.
             // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
             // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
             // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -1335,7 +1335,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 match event {
                     unaos_kernel::pal::Event::Key(c) => {
                         let ch = c as char;
-                        #[cfg(feature = "login")] let hide = unaos_kernel::fs::users::secret_input(); #[cfg(not(feature = "login"))] let hide = false; if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' }); } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
+                        let hide = unaos_kernel::pwwire::withhold_fresh(); /* CONSOLEFIX M3 (B365): the login screen, an adduser prompt, or a console line in its secret part (`holocron init `) */ if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY class={}", unaos_kernel::pwwire::key_class(c)); let _ = ch; /* CONSOLEFIX M3: no key value on the wire */ } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
                     }
                     unaos_kernel::pal::Event::Mouse { x, y } => {
                         serial_println!("USB-DEBUG: MOUSE relative dx={} dy={}", x, y);
@@ -1701,7 +1701,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
         // because which pass a given build reaches depends on its knobs.
         #[cfg(feature = "holocron")]
-        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
+        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); unaos_kernel::pwwire::refresh(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ /* CONSOLEFIX M3: the raw-key echoes' cached LOGIN13 state */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
         // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
         // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
         // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -2755,7 +2755,7 @@ fn handle_key(
 ) -> bool {
     console.snap_for_key(c); /* SCROLLBACK (R75) — a typing key snaps a scrolled-up view back to the live bottom */ #[cfg(feature = "login")] match unaos_kernel::fs::users::prompt_key(c, console) { 0 => {} 1 => return false, _ => { console.draw(pal); return false; } } if c == b'\n' || c == b'\r' { console.sel.on_edit(c, console.current_input.len()); // TERMSEL2 — the edit rule now splits: CR/LF drops any selection here (and parks the caret at the end of the empty line it leaves), and the two edit arms below go through `LineSel::type_byte`, which REPLACES a selection on the line instead of dropping it — the rule TERMSEL had to defer for want of a caret. // TERMSEL — THE EDIT RULE, ahead of every edit this function makes: a typed byte, BS/DEL and CR/LF drop a live selection first (`video::termsel::LineSel::on_edit`, which prints `[termsel] none … by=edit` only when one was live and ignores bytes that edit nothing, e.g. the arrow byte a `Shift+←` pushes just ahead of its `SelectLeft`). The editor has no caret, so a selection cannot be REPLACED by what is typed; keeping it across the edit would paint the band over cells that moved. A paste types through this same function, so it drops the selection the same way. Runs on every surface that calls `handle_key`; where no selection can be made (no `Event::Action` consumer) it is a no-op. ⚠ FOLDED onto the existing `if` — `main.rs` embeds `panic::Location` line numbers (PARITY §5.3); CODE FIRST (A10FIX).
         let cmd = console.current_input.clone();
-        console.current_input.clear();
+        console.current_input.clear(); unaos_kernel::pwwire::note_line(""); // CONSOLEFIX M3: the line is submitted — the next byte is not secret
         // GUI-CLICK-2: mark the screen app-owned across the (possibly long-running, full-screen)
         // command so the Pi USB pump leaves input in EVENT_QUEUE for the command's own pump_and_poll
         // (vug/pulse) instead of forwarding it into a GUI_CHANNEL that render_service — blocked HERE
@@ -2765,7 +2765,7 @@ fn handle_key(
         unaos_kernel::gui_watchdog::on_app_enter();
         let took_screen = unaos_kernel::shell::dispatch_command(&cmd, console, pal);
         unaos_kernel::gui_watchdog::on_app_exit();
-        SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+        SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed); unaos_kernel::pwwire::refresh(); // CONSOLEFIX M3: a verb may have opened a password prompt or the screen
         // TERM_RING (MIDDEN_CONVERGENCE §3, M2): THE DRAIN SITE. `dispatch_command` has returned, so
         // the render task owns the view again — the exclusive-drainer contract `termring::drain`
         // requires — and this is the first moment a record staged by a producer that is NOT this task
@@ -2781,11 +2781,11 @@ fn handle_key(
             console.draw(pal);
         }
         return took_screen;
-    } else if unaos_kernel::shellux::wants(c) { let r = unaos_kernel::shellux::console_key(c, console); console.repaint(r, pal); } else if c == 8 || c == 0x7F { // SHELLUX (R75) — Up/Down history, Tab completion, Ctrl-C/L/A/E/U/W reach the line editor; line-neutral fold.
-        let r = console.sel.type_byte(c, &mut console.current_input); // TERMSEL2 M3 — the edit happens AT THE CARET (`LineSel::type_byte`): Backspace deletes the byte before it, and with a selection on the line deletes the selection.
+    } else if unaos_kernel::shellux::wants(c) { let r = unaos_kernel::shellux::console_key(c, console); unaos_kernel::pwwire::note_line(&console.current_input); console.repaint(r, pal); } else if c == 8 || c == 0x7F { // SHELLUX (R75) — Up/Down history, Tab completion, Ctrl-C/L/A/E/U/W reach the line editor; line-neutral fold.
+        let r = console.sel.type_byte(c, &mut console.current_input); unaos_kernel::pwwire::note_line(&console.current_input); // TERMSEL2 M3 — the edit happens AT THE CARET (`LineSel::type_byte`): Backspace deletes the byte before it, and with a selection on the line deletes the selection.
         console.repaint(r, pal);
     } else if c >= 32 && c <= 126 {
-        let r = console.sel.type_byte(c, &mut console.current_input); // TERMSEL2 M3 — a printable byte is INSERTED at the caret, and REPLACES a selection on the line; a scrollback selection is dropped first (repaint 2).
+        let r = console.sel.type_byte(c, &mut console.current_input); unaos_kernel::pwwire::note_line(&console.current_input); // CONSOLEFIX M3 (B365): the line editor publishes whether the line has reached its secret. TERMSEL2 M3 — a printable byte is INSERTED at the caret, and REPLACES a selection on the line; a scrollback selection is dropped first (repaint 2).
         console.repaint(r, pal);
     }
     false
@@ -2965,9 +2965,9 @@ fn jd2_console_pump(_arg: usize) {
                     cursor::restore(&mut pal); #[cfg(feature = "login")] if unaos_kernel::fs::users::screen_key(c) { needs_render = true; key_repainted = true; continue; } // LOGIN M3 — the screen takes the key BEFORE the serial echo below (a typed password never reaches the wire) and before the shell. ⚠ LINE-NEUTRAL append.
                     // Serial echo: the bench evidence line (panel + serial must agree).
                     if (32..=126).contains(&c) {
-                        serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
+                        serial_println!(":: tegra: JD2 — KEY class={} ::", unaos_kernel::pwwire::key_class(c));
                     } else {
-                        serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+                        serial_println!(":: tegra: JD2 — KEY class={} ::", unaos_kernel::pwwire::key_class(c));
                     }
                     needs_render = true;
                     key_repainted = true; #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::strip::key_escape(ev) { continue; } #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::quarry::key_route(ev) { continue; } #[cfg(feature = "tegra_el0")] if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) { continue; } if shellwin_absent(&spal) { continue; } // APPPIN (R49) — a key with the shell app QUIT on the cascaded scene is DROPPED: there is nothing to type into and the panel is the desktop's (before this arc it painted the console over the desktop — the render4 SCREEN0 defect). Where the scene is not up this is `false` and the panel shell keeps every key. Ordered after the three doors above so <Esc>, Quarry's keys and <TAB> still work with no shell window; CODE FIRST. // QUARRYDOOR (KEYDOORS F1) — QUARRY'S WHOLE KEYBOARD HAD ONE CALLER AND IT WAS THE EL0 RING DOOR. `quarry::key_route` — <Esc> closes the file manager, `0x1C`..`0x1F` move the selection, <Enter> opens, Backspace goes up, `r` re-reads, and `Event::Wheel` scrolls — was asked ONLY at `arch/aarch64/syscall.rs:13211`, which fires while `USER_INPUT_ACTIVE != 0`. On the Orin that is never: this pump IS the board's key drain and its normal state is focus 0. And Quarry is ON THE GLASS AT BOOT on a `desktop_firmware`+`quarry` Orin image — `video/desktop_firmware.rs:394` runs `quarry::open()` as step 6 of `activate()`, and `main.rs`'s `tegra_quarry_seat` calls `request_open()` — so the file manager shipped with every arrow key falling past it into `handle_key`, and NO WAY TO CLOSE IT FROM THE KEYBOARD. Exactly TABKEY's defect and A10's defect, a third time, in this same statement: one body, two doors, only the ring door wired. Ordered AFTER `strip::key_escape` because a bar/SHARD menu composites ABOVE Quarry's window and the modal surface must win, and BEFORE `wc_shell_focus_key` because an open file manager eats its own arrows before the focus ring sees them; that is x86's order in `wc_route_event` and the aarch64 router's order in `user_input_enqueue`. NO focus guard is needed at the call site and adding one would be wrong: `key_route` gates on `focus_asid() == OWNER && on_glass()` since SO9FIX 63b109f6 (was `on_glass()` alone — SO9) (`video/quarry/live.rs:1651` — a live `WIN` id whose `z` is above `wm::shell_z()`), so with Quarry closed or buried it returns false and the shell keeps every arrow it has today. Gated `desktop_firmware` because `video/mod.rs:685` gates `pub mod quarry;` on it; the `UNAOS_QUARRY` knob is handled INSIDE the seam (`video/quarry.rs:47` is `#[inline(always)] false` knob-off) precisely so a folded call needs no second `cfg`. ⚠ FOLDED, and CODE-BEFORE-COMMENT per F0's rule on this line. // A10FIX (KEYDOORS F0) — THE A10 FOLD COMMENTED TABKEY OUT, AND ONLY A COLUMN-AWARE READ OF THIS LINE CAN SEE IT. `b768331a` folded `strip::key_escape` onto this statement and then wrote its prose at column 139 — AHEAD of the `wc_shell_focus_key` call TABKEY had folded on at column ~1600. A `//` runs to end of line, so from `b768331a` onward the Orin's TAB call was INSIDE the A10 comment: dead text, not a call. Nothing already in the tree could catch it — the line count is unchanged (so the `kernel8.img` byte-identity gate is silent), `./arroyo check` is green (the callee is a `pub fn` in a lib crate, so no dead-code warning exists to fire), and `git grep -n wc_shell_focus_key` STILL PRINTS THIS LINE, which is why the KEYDOORS audit scored the Orin's TAB door WIRED. Only reading the raw line by character offset finds it. This fix is ORDER ONLY — no call added, none removed: both calls now sit ahead of ALL prose and the two comment bodies are concatenated behind them. THE RULE THIS STATEMENT NOW CARRIES FOR EVERY FUTURE FOLD: **code first, all of it, then the comments** — a folded call written after a `//` is not a call. Line-neutral, one line in and one line out. // A10 (MENUBAR2) — <Esc> DISMISSES AN OPEN MENU, AND THE SHELL DOOR HAD NO CALLER. `strip::key_escape` was asked in exactly two places: x86's `wc_route_event` and aarch64's `user_input_enqueue` — and `user_input_enqueue` is the EL0 RING door, reached only while `USER_INPUT_ACTIVE != 0`. On the Orin that is never: this pump IS the board's key drain and its normal state is focus 0, so every <Esc> went straight past the modal surface into `handle_key`. MEASURED, render7 (`~/unaos-bench/scratch/orin16/render7-boot1.log`, awk): `[winmenu] open title=View` at :2414, `:: tegra: JD2 — KEY 0x1b ::` at :2437, `state=open` STILL at :2487 and :2526, and the menu finally closed `reason=outside` at :2569 — the exact shape TABKEY measured for <TAB> one arc earlier, in this same statement, for this same reason (one body, two doors, and only the ring door wired). Asked FIRST and ahead of `wc_shell_focus_key`, which is x86's order in `wc_route_event` and the aarch64 router's order in `user_input_enqueue`: a modal surface must get the key before the focus ring can TAB the desktop out from under an open menu. It consumes ONLY a bare <Esc> while a menu is down, so every other boot is behaviour-alike. Gated `desktop_firmware` because `video/mod.rs:112` gates `pub mod strip;` on it; a knob-off tegra or Pi image compiles this to nothing. ⚠ FOLDED onto the statement, never given a line of its own — panic `Location` records embed line numbers and the knob-off `kernel8.img` byte-identity proof is this track's standing gate. // TABKEY — THE MISSING SHELL HALF OF THE FOCUS RING. `wc_focus_key` has always been reachable on tegra through the IN-RING door (`user_input_enqueue` asks it at syscall.rs's router seam, and `orininput`'s `oi_pump` drives that seam), but the SHELL door — the one that fires while `USER_INPUT_ACTIVE == 0`, which is this board's normal state — had NO CALLER AT ALL, because `main.rs`'s two `wc_shell_focus_key` sites both live inside `pump_usb_into_gui`, `cfg(all(aarch64, baremetal))`, and `baremetal` implies `pi` while `pi` + `tegra` is a hard `compile_error!`. So on the Orin <TAB> fell straight through to `handle_key`, which has no byte-9 arm, and was silently dropped. MEASURED on metal (`~/unaos-bench/capture/line-acm0/`): `orin.log` carries 5x `:: tegra: JD2 — KEY 0x09 ::` at :13071-13080 and ZERO `[wc-c] focus tab-cycle`; the Pi control `pi.log`, same tool and directory, has 249. The serial echo above is deliberately left AHEAD of this call so the pairing stays scoreable from a capture — a fixed board reads `KEY 0x09` immediately followed by `[wc-c] focus tab-cycle`, a regressed one reads `KEY 0x09` alone, which is exactly what the Orin capture reads today. `wc_shell_focus_key` and not `wc_focus_key`, because this pump IS the Orin's shell drain: it returns false the moment an EL0 program holds focus, leaving the in-ring case to the router seam that already owns it — one body, two doors, one witness, which is the Pi's arrangement verbatim. `continue` where the Pi's bare-shell drain `break`s: that loop's destination is fixed at `gui_send`, so a moved focus invalidates the rest of its drain, whereas this loop's destination is `handle_key` on the backdrop console, which this pump feeds REGARDLESS of focus anyway (`xusb_tegra.rs`'s defect-2 note, out of this arc's scope) — so breaking would only re-deliver the same events to the same place one pass later. Gated `tegra_el0` because `arch/aarch64/mod.rs` gates `pub mod syscall;` on `aarch64_el0`, which a bare `tegra` image does not carry; the knob-off tegra media is therefore byte-identical, which is why this is FOLDED onto the statement above and given no line of its own — panic `Location` records embed line numbers and a line added anywhere in this file breaks that proof.
@@ -3580,7 +3580,7 @@ fn usbdebug_event_print(raw: unaos_kernel::pal::Event) {
         unaos_kernel::pal::Event::Key(c) => {
             usbdebug_ptr_rollup_flush();
             let ch = c as char;
-            #[cfg(feature = "login")] let hide = unaos_kernel::fs::users::secret_input(); #[cfg(not(feature = "login"))] let hide = false; if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' }); } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
+            let hide = unaos_kernel::pwwire::withhold_fresh(); /* CONSOLEFIX M3 (B365): the login screen, an adduser prompt, or a console line in its secret part (`holocron init `) */ if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY class={}", unaos_kernel::pwwire::key_class(c)); let _ = ch; /* CONSOLEFIX M3: no key value on the wire */ } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
         }
         unaos_kernel::pal::Event::Mouse { x, y } => {
             // The bounded verbatim prologue: the old line, unchanged, for the first reports of the
@@ -5860,9 +5860,9 @@ fn x86_typematic_pump() {
         static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
         if !FIRST.swap(true, core::sync::atomic::Ordering::Relaxed) {
             serial_println!(
-                ":: KEYREPEAT-X86: first synthesised repeat — key={:#04x} '{}' (host typematic armed on the EHCI keyboard) == witness ::",
-                k,
-                if (32..127).contains(&k) { k as char } else { '.' }
+                ":: KEYREPEAT-X86: first synthesised repeat — key={}{} (host typematic armed on the EHCI keyboard) == witness ::",
+                unaos_kernel::pwwire::key_class(k),
+                "" // CONSOLEFIX M3: a class, never the key
             );
         }
         unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(k));
@@ -5962,7 +5962,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
         // because which pass a given build reaches depends on its knobs.
         #[cfg(feature = "holocron")]
-        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
+        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); unaos_kernel::pwwire::refresh(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ /* CONSOLEFIX M3: the raw-key echoes' cached LOGIN13 state */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
         // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
         // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
         // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -6335,8 +6335,8 @@ fn open_shell_window(
         ch as u32,
         stride as u32,
         b"Shell",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[shellwin] DECLINE reason=create-failed");
@@ -6434,7 +6434,7 @@ fn x86_render_service(cpu: usize) {
                 unaos_kernel::video::wm::WIN_NONE,
             )
         };
-        if desktop && !rescue {
+        if desktop && !rescue && unaos_kernel::boot::desktop() { // INSTALLBARE (R86): no shell window before the Desktop phase — the furniture is owed (`login::furniture_owed`) and the first login mints it. SAME-LINE fold.
             let info = front_fb.info();
             match open_shell_window(info.width, info.height) {
                 Some((store, fb, id)) => {
@@ -8228,9 +8228,9 @@ fn jd2_supstate_dispatcher(_arg: usize) {
                 // captures cursor pixels (the legacy bracket, unchanged).
                 cursor::restore(&mut pal);
                 if (32..=126).contains(&c) {
-                    serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
+                    serial_println!(":: tegra: JD2 — KEY class={} ::", unaos_kernel::pwwire::key_class(c));
                 } else {
-                    serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+                    serial_println!(":: tegra: JD2 — KEY class={} ::", unaos_kernel::pwwire::key_class(c));
                 }
                 handle_key(c, console, &mut pal)
             })
@@ -9290,8 +9290,8 @@ fn shellwin_window_open(pw: usize, ph: usize) -> Option<ShellWin> {
         ch as u32,
         stride as u32,
         b"Shell",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         serial_println!("[realdesk] shell=panel reason=create_at-declined surf={}x{} at ({},{})", cw, ch, ox, oy);

@@ -328,7 +328,7 @@ fn witness(t: &[u32]) {
         AMP_A_Q16,
         AMP_B_Q16,
         AMP_A_Q16 + AMP_B_Q16,
-        super::theme::CONTROL_BOX,
+        super::theme::CONTROL_BOX(),
         TILE_W,
         TILE_H,
         fnv1a(t),

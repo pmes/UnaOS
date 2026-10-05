@@ -100,7 +100,7 @@ pub trait GneissPal {
     /// pixel sizes in UI code; everything derives from these). A pure function of the panel
     /// height, so deriving per call is cheap and can never go stale.
     fn metrics(&self) -> crate::ui::Metrics {
-        crate::ui::Metrics::for_height(self.height() as usize)
+        crate::ui::Metrics::panel() // UIMETRICS (B372): the panel's dpi metrics; a window surface the compositor magnifies overrides with `for_scale(1)`
     }
 
     fn clear_screen(&mut self, color: u32) {
@@ -1324,7 +1324,7 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool)
     // age of the OLDEST un-presented input. A no-op inline shim when `rtwit` is off. This is the
     // single enqueue chokepoint (`push_event` and `push_pointer_report` both land here).
     if stored {
-        crate::rtwit::note_input_enqueued();
+        crate::rtwit::note_input_enqueued(); crate::video::lag::on_enqueue(&event); // GLASSLAG M1 (B370): the [lag] timing starts at the enqueue funnel (same-line fold).
     }
     stored
 }
@@ -1770,8 +1770,8 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
                 typematic::BOOT_REARMS.fetch_add(1, Ordering::Relaxed);
                 if n <= typematic::REARM_LOG_MAX {
                     serial_println!(
-                        "[keystat] typematic re-arm — key={:#04x} still held after a liveness lapse; repeat resumed at delay={}ms (hold re-arms={} boot re-arms={})",
-                        k,
+                        "[keystat] typematic re-arm — key={} still held after a liveness lapse; repeat resumed at delay={}ms (hold re-arms={} boot re-arms={})",
+                        crate::pwwire::key_class(k), // CONSOLEFIX M3: a class, never the key
                         typematic::DELAY_MS,
                         n,
                         typematic::BOOT_REARMS.load(Ordering::Relaxed)
@@ -1809,8 +1809,8 @@ fn typematic_hold_rollup() {
         return;
     }
     serial_println!(
-        "[keystat] typematic hold end — key={:#04x} repeats={} re-arms={} window={}ms (boot: repeats={} re-arms={})",
-        key.wrapping_sub(1) as u8,
+        "[keystat] typematic hold end — key={} repeats={} re-arms={} window={}ms (boot: repeats={} re-arms={})",
+        crate::pwwire::key_class(key.wrapping_sub(1) as u8), // CONSOLEFIX M3
         repeats,
         rearms,
         if typematic::STREAMS_WHILE_HELD.load(Ordering::Relaxed) != 0 {
@@ -2114,7 +2114,7 @@ impl<'a> TargetPal<'a> {
         // UI-1 evidence: announce the derived metrics once per surface bring-up so headless
         // gates can verify the scale layer on every target (x86 GUI, arm virt, Pi render
         // service, Orin panel) without a screen.
-        let m = crate::ui::Metrics::for_height(surface.height());
+        let m = crate::ui::Metrics::panel();
         crate::bootlog_println!(
             ":: UI1: scale={} cell={}x{} line={} ::",
             m.scale,

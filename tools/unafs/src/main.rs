@@ -55,6 +55,13 @@ enum Commands {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
+    /// Make a directory and every missing parent (`mkdir -p`); an existing directory is not an error.
+    /// VOLUMES (B366): the builder stages `/system/test-f` onto the card's UnaFS root with it.
+    Mkdir {
+        path: String,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
     /// Extract a file from the vault to the host
     Get {
         source: String,
@@ -656,6 +663,25 @@ async fn main() -> Result<()> {
             for entry in entries {
                 println!("  {:10} {}", format!("({:?})", entry.kind), entry.name);
             }
+        }
+        Commands::Mkdir { path, img } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut at = String::new();
+            let mut parent = fs.resolve_path("/").context("No root")?;
+            let mut made = 0usize;
+            for c in path.split('/').filter(|c| !c.is_empty()) {
+                at.push('/');
+                at.push_str(c);
+                parent = match fs.resolve_path(&at) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        made += 1;
+                        fs.mkdir(parent, c.to_string()).with_context(|| format!("mkdir {at}"))?
+                    }
+                };
+            }
+            println!("✅ [OPERATOR] mkdir '{}' ({} created)", path, made);
         }
         Commands::Put {
             source,

@@ -1468,6 +1468,11 @@ pub fn init(gpu: &GpuInfo) {
             kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
             kdisp_trace[4], kdisp_trace[5], kdisp_trace[6]);
         phase!("kdisp_takeover");
+        // GPUBLIT (B371): the takeover succeeded -> the copy engine arms itself (one `:: GPUBLIT:` line).
+        #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-takeover"))]
+        if let Some(fbo) = fb_offset {
+            crate::drivers::gpu::kepler_gpublit::arm(bar0, bar1_base, bar1_size, vram_size, fbo, &mut vram_allocator);
+        }
 
         // 7. PGRAPH 2D/3D Engine Init (Placeholder)
         // Kepler requires Falcon microcode to fully initialize PGRAPH.

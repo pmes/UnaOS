@@ -252,7 +252,7 @@ fn spawn_step(img: &[u8]) {
 //   clip     a set/get round trip through the clipboard the verbs fulfil over (the prior content restored),
 //            and the kernel's CLIP_CAP equals una-abi's;
 //   scroll   the rows LUMEN.ELF keeps (`LUMEN_ROWS`), after a ring of 8 drops and rebases as the program's does.
-// WITNESS. `:: LUMENUX: md=<ok|bad> history=<ok|bad> clip=<ok|bad> scroll=<rows> -> PASS|FAIL ::`.
+// WITNESS. `:: LUMENUX: md=<ok|bad> history=<ok|bad> clip=<ok|bad> scroll=<rows> -> PASS|FAIL font=<dejavu-sans|font8x8> ::`.
 fn lumenux() {
     use vein_core::md::{self, Block, Span, State, Tint};
     let md_ok = {
@@ -341,12 +341,17 @@ fn lumenux() {
         kept && r.len() == 5 && r.get(0).map(|x| x.src) == Some(0)
     };
     let ok = |b: bool| if b { "ok" } else { "bad" };
+    // KERNELFONT2 (B363): the face LUMEN.ELF draws its chat with — DejaVu Sans read off the volume it reads (found
+    // there AND parsed by the same font_core), else the font8x8 grid it falls back to. Informational: the verdict
+    // is the shared core's, the face is DATA the builder stages.
+    let font = crate::video::text::volume_face("DejaVuSans.ttf").map_or("font8x8", |_| "dejavu-sans");
     serial_println!(
-        ":: LUMENUX: md={} history={} clip={} scroll={} -> {} ::",
+        ":: LUMENUX: md={} history={} clip={} scroll={} -> {} font={} ::",
         ok(md_ok),
         ok(history_ok),
         ok(clip_ok),
         if scroll_ok { vein_core::scroll::LUMEN_ROWS } else { 0 },
-        if md_ok && history_ok && clip_ok && scroll_ok { "PASS" } else { "FAIL" }
+        if md_ok && history_ok && clip_ok && scroll_ok { "PASS" } else { "FAIL" },
+        font
     );
 }

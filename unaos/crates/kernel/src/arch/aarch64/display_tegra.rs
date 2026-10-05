@@ -483,8 +483,8 @@ pub fn orin_wm1() -> crate::video::wm::WinId {
         ch as u32,
         stride as u32,
         b"orin",
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
+        ox + wm::BORDER(),
+        oy + wm::TITLE_H() + wm::BORDER(),
     );
     if id == wm::WIN_NONE {
         // `store` drops here — no row points at it, so there is nothing to keep alive.
@@ -596,7 +596,7 @@ fn orin_chrome_probe(
 
     // `paint_window`'s own widths, not a second copy of them: the keyline is `kw = theme::BEVEL`
     // thick, and the bevel is `theme::BEVEL` thick drawn inset by the keyline's width.
-    let kw = theme::BEVEL;
+    let kw = theme::BEVEL();
     let mx = ox + ow / 2; // mid-edge column — clear of both top corner arcs
     let my = oy + oh / 2; // mid-edge row
     let probes: [(&str, usize, usize, u32); 6] = [
@@ -605,7 +605,7 @@ fn orin_chrome_probe(
         ("kl_left", ox, my, theme::FRAME_LINE),
         ("kl_right", ox + ow - kw, my, theme::FRAME_LINE),
         ("bev_lt", mx, oy + kw, theme::BEVEL_LIGHT),
-        ("bev_sh", mx, oy + oh - kw - theme::BEVEL, theme::BEVEL_SHADOW),
+        ("bev_sh", mx, oy + oh - kw - theme::BEVEL(), theme::BEVEL_SHADOW),
     ];
     let mut hit = 0usize;
     let mut read = 0usize;
@@ -639,15 +639,15 @@ fn orin_chrome_probe(
     // `paint_window`'s own (`w * scale` by `h * scale` at the content origin), so this is the centre
     // of the block at ANY integer scale the placer picks, not only at the bench panel's 1.
     let (cx, cy) = (
-        ox + wm::BORDER + cw * scale / 2,
-        oy + wm::TITLE_H + wm::BORDER + ch * scale / 2,
+        ox + wm::BORDER() + cw * scale / 2,
+        oy + wm::TITLE_H() + wm::BORDER() + ch * scale / 2,
     );
     let content = fb.read_pixel(cx, cy);
     let content_ok = content == Some(0x00FF_00FF);
 
     // CERAMIC'S POPULATION — printed raw, never judged.
-    let strip = fb.read_pixel(ox + ow - wm::BORDER - 2, oy + wm::BORDER + wm::TITLE_H / 2);
-    let face = fb.read_pixel(ox + kw + theme::BEVEL, cy);
+    let strip = fb.read_pixel(ox + ow - wm::BORDER() - 2, oy + wm::BORDER() + wm::TITLE_H() / 2);
+    let face = fb.read_pixel(ox + kw + theme::BEVEL(), cy);
     let ctrl = disc.and_then(|(bx, by, d)| fb.read_pixel(bx + d / 2, by + d / 2));
 
     // The verdict is DERIVED from the counts above, never asserted — the law `[orinwm1]`'s own
@@ -3893,10 +3893,10 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
     // extent is `* scale`.
     let cwp = i.w.saturating_mul(i.scale);
     let chp = i.h.saturating_mul(i.scale);
-    let ox = i.x.saturating_sub(wm::BORDER);
-    let oy = i.y.saturating_sub(wm::TITLE_H + wm::BORDER);
-    let ow = cwp + 2 * wm::BORDER;
-    let oh = chp + wm::TITLE_H + 2 * wm::BORDER;
+    let ox = i.x.saturating_sub(wm::BORDER());
+    let oy = i.y.saturating_sub(wm::TITLE_H() + wm::BORDER());
+    let ow = cwp + 2 * wm::BORDER();
+    let oh = chp + wm::TITLE_H() + 2 * wm::BORDER();
     let on_panel = lad_on_panel(&i);
 
     let fb = *crate::video::WRITER.lock();
@@ -3909,7 +3909,7 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
     // `theme::CORNER_RADIUS` at both ends by construction). Deliberately NOT machined by `ceramic`:
     // `paint_window` documents the keyline and the two bevel hairlines as exact theme values,
     // because "a single-pixel edge has no room to show a grain".
-    let kw = theme::BEVEL;
+    let kw = theme::BEVEL();
     let mx = ox + ow / 2;
     let my = oy + oh / 2;
     let probes: [(&str, usize, usize, u32); 6] = [
@@ -3918,7 +3918,7 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
         ("kl_left", ox, my, theme::FRAME_LINE),
         ("kl_right", ox + ow.saturating_sub(kw), my, theme::FRAME_LINE),
         ("bev_lt", mx, oy + kw, theme::BEVEL_LIGHT),
-        ("bev_sh", mx, oy + oh.saturating_sub(kw + theme::BEVEL), theme::BEVEL_SHADOW),
+        ("bev_sh", mx, oy + oh.saturating_sub(kw + theme::BEVEL()), theme::BEVEL_SHADOW),
     ];
     let mut fhit = 0usize;
     let mut fread = 0usize;
@@ -5430,7 +5430,7 @@ fn sprite_size_witness(pw: i32, ph: i32) {
     if SPR_LOGGED.fetch_add(1, Relaxed) >= SPR_LOG_MAX {
         return;
     }
-    let s = crate::ui::Metrics::for_height(ph as usize).scale;
+    let s = crate::ui::Metrics::panel().scale;
     // The compositor sprite (front buffer) and the PAL sprite (back buffer), each as its own module
     // computes it — restated here rather than borrowed, because a shared helper would make the two
     // agree by construction and this witness exists to report whether they DO.

@@ -2163,9 +2163,9 @@ unsafe extern "C" {
 // `Task`, so the pushed value is untouched across any number of intervening tasks and is freed only
 // with the task itself.
 //
-// U1a does NOT preserve the user's rbx/rbp/r12-r15/rdi/... across a syscall (only rcx/r11, which
-// SYSRET requires); the demo blob loads fresh registers for its second syscall, so this is sound
-// for the cooperative single-shot. Full GPR preservation is arc U1b. ---
+// U1a did NOT preserve the user's rbx/rbp/r12-r15/rdi/... across a syscall (only rcx/r11, which
+// SYSRET requires). LINUXABI2 added the callee-saved six; SELFBUILDMETAL (B367) the argument six
+// (rdi rsi rdx r10 r8 r9): every GPR but rax/rcx/r11 now survives a syscall, Linux's contract. ---
 core::arch::global_asm!(
     ".globl unaos_syscall_entry",
     "unaos_syscall_entry:",
@@ -2195,35 +2195,32 @@ core::arch::global_asm!(
     // cannot gate these lines (the percpu.rs macros exist for the record; cfg cannot reach in here).
     "mov gs:[{uoff}], r8",
     "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
+    "push rdi", "push rsi", "push rdx", "push r10", "push r8", "push r9", // SELFBUILDMETAL (B367): the user's six argument registers, restored on the way out (Linux's ABI keeps all but rax/rcx/r11); ktop-88..ktop-128, under the frame every reader already knows; 6 pushes keep the 16-byte alignment
     "mov r8, r10",                  // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
     "mov rcx, rdx",                 // arg2 -> 4th C arg
     "mov rdx, rsi",                 // arg1 -> 3rd C arg
     "mov rsi, rdi",                 // arg0 -> 2nd C arg
     "mov rdi, rax",                 // number -> 1st C arg
     "call {dispatch}",              // rax = return value (or never returns: SYS_EXIT -> scheduler)
+    // SELFBUILDMETAL (B367): the canonical-rcx guard (U1b B2, below) runs FIRST, on the saved rcx slot (ktop-32 = rsp+96 here),
+    // while rcx/rdx are still free scratch — after the six pops below they hold the user's own values.
+    "mov rcx, [rsp + 96]", "mov rdx, rcx", "shl rdx, 16", "sar rdx, 16", "cmp rdx, rcx", "jne 2f",
+    "pop r9", "pop r8", "pop r10", "pop rdx", "pop rsi", "pop rdi", // SELFBUILDMETAL: the user's own argument registers back
     "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx", // LINUXABI2: the matching pops (rax survives)
     "pop rcx",                      // restore user RIP   (SYSRET's target)
     "pop r11",                      // restore user RFLAGS; rsp now = ktop-16, 16-aligned
     // --- U1b B2: canonical-rcx guard (CVE-2012-0217 shape). A non-canonical SYSRET target #GPs at
     // CPL 0 *after* the user rsp is loaded, running the #GP handler on a user-controlled stack.
-    // Refuse to sysret such an rcx. rdx is scratch here (a caller-saved leftover, scrubbed below
-    // anyway). Assumes 48-bit VAs (setup() asserts LA57 off): sign-extend bit 47 and compare —
-    // equal iff rcx was canonical.
-    "mov rdx, rcx",
-    "shl rdx, 16",
-    "sar rdx, 16",
-    "cmp rdx, rcx",
-    "jne 2f",                       // non-canonical -> kill the task (GS still = PerCpuData here)
-    // --- U1b B1: scrub the caller-saved GPRs that carry kernel-dispatcher leftovers to ring 3.
-    // rax = return value; rcx/r11 = the SYSRET pair; rbx/rbp/r12-r15 still hold the user's own
-    // pre-syscall values (the C dispatch preserved them across the call) — so only these six can
-    // leak a kernel pointer to ring 3. Zeroing the 32-bit name clears the full 64-bit register.
-    "xor edi, edi",
-    "xor esi, esi",
-    "xor edx, edx",
-    "xor r8d, r8d",
-    "xor r9d, r9d",
-    "xor r10d, r10d",
+    // Refuse to sysret such an rcx. SELFBUILDMETAL (B367): the guard now runs right after the call,
+    // on the saved rcx slot, BEFORE rcx/rdx are restored (see above); same sign-extend-bit-47 test,
+    // same `2:` kill path (GS still = PerCpuData there). Assumes 48-bit VAs (setup() asserts LA57 off).
+    // --- U1b B1 (kept, by a different means): no caller-saved GPR may carry a kernel-dispatcher
+    // leftover to ring 3. It used to ZERO rdi/rsi/rdx/r8/r9/r10 here; SELFBUILDMETAL (B367) restores
+    // the USER'S OWN pre-syscall values instead (pushed at entry, popped above), which leaks nothing
+    // the task did not already hold. The zeroing broke the Linux ABI on metal (flight 22): gcc keeps
+    // a syscall's input registers live across the instruction (Linux preserves everything but
+    // rax/rcx/r11), so SYSKAT2 waited on futex with a NULL timeout, SYSKAT3 read fd 0, SYSKAT5 and
+    // RUST.LNX (musl's sigaction, r8+0x88) dereferenced NULL, and SYSKAT4's every fork group failed.
     // U4y: recover THIS task's own user rsp from THIS task's kernel stack. The two slots hold the
     // same value; drop the pad and pop the other. The kernel stack is abandoned from here — the next
     // entry reloads rsp from `syscall_kernel_rsp` (= ktop), so nothing below ktop is ever read again.
@@ -3756,7 +3753,7 @@ fn sys_win_present(win: u64) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if win >= WIN_MAX as u64 {
+    crate::video::lag::app_drew(slot); if win >= WIN_MAX as u64 { // GLASSLAG M1 (B370): the app drew (same-line fold).
         return EBADF;
     }
     let id = win as usize;
@@ -4676,7 +4673,7 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if win >= WIN_MAX as u64 {
+    crate::video::lag::app_drew(slot); if win >= WIN_MAX as u64 { // GLASSLAG M1 (B370): the app drew (same-line fold).
         return EBADF;
     }
     let id = win as usize;
@@ -5674,7 +5671,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     let Some(packed) = pack_input(ev) else {
         return false;
     };
-    user_input_push(slot, packed)
+    let lag_seq = USER_INPUT_TAIL[slot].load(Ordering::Relaxed).wrapping_add(1); let ok = user_input_push(slot, packed); if ok { crate::video::lag::routed_ring(&ev, slot, lag_seq); } ok // GLASSLAG M1 (B370): the [lag] wm stage ends at the ring-3 delivery (same-line fold).
 }
 
 /// WINX-7 ROUTER FOLD POINT (public, in-lane) — the ONE line the shell's event drain needs.
@@ -6162,7 +6159,7 @@ fn sys_input_poll() -> i64 {
         return EAGAIN; // empty
     }
     let packed = USER_INPUT_BUF[slot][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
-    USER_INPUT_HEAD[slot].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
+    USER_INPUT_HEAD[slot].store(head.wrapping_add(1), Ordering::Release); crate::video::lag::consumed_ring(slot, head.wrapping_add(1)); // GLASSLAG M1 (B370): the [lag] app stage ends. consume AFTER the load
     packed as i64
 }
 
@@ -7313,7 +7310,7 @@ fn ptrdead_selftest_body() {
 /// **It exists as a function so the witness can drive the REAL chain.** `wmdirect_selftest` asserts
 /// against this call and [`wc_route_tail`], not against a transcription of them — the failure this
 /// closes is a witness that tests the API while the path a pointer report actually takes is inert.
-pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { #[cfg(feature = "ftdirx")] if let crate::pal::Event::Key(b) = raw { if crate::drivers::xhci::ftdi::ftdirx::claim_origin(b) { static SERIALDOOR_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); if { #[cfg(feature = "login")] let secret = crate::fs::users::secret_input(); #[cfg(not(feature = "login"))] let secret = false; !secret } && SERIALDOOR_LOG.fetch_add(1, Ordering::Relaxed) < 256 { serial_println!("[serialdoor] key={:#04x} win_focus={:#x} ring={:#x} -> shell (the wire is a console)", b, crate::video::wm::focus_asid(), USER_INPUT_ACTIVE.load(Ordering::Acquire)); } return raw; } } // SERIALDOOR — **THE WIRE IS A CONSOLE, NOT A KEYBOARD** (Peter, 2026-09-17). FIRST in this function, ahead of `strip::key_escape`, `quarry::key_route`, `wc_focus_key` and `user_input_route`, because every one of those is a question about WINDOW FOCUS and a serial byte is not addressed to a window. FTDICR measured the cost of asking them anyway (`docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §FTDICR): on flight 10 a focused Quarry ate every `help\r` at its `b'\r' | b'\n'` arm — `[quarry] key_route key=0x0d focus=1 took=1` — and the SAME byte submitted the line the moment focus left, `focus=0 took=0` with `[midden] cmd=` 19 ms later. Nothing about the byte changed; only `focus` did. So an operator at the cable could not reach the shell at all while a window held focus, and had no way to see why. `return raw` and not `user_input_route(raw)`: the ruling says the SHELL, so the byte skips the focused ring-3 ring too — a program that wants the wire asks for it, it does not inherit it by being frontmost. KEYBOARD-ORIGIN ENTER IS UNTOUCHED: the tag is claimed only for bytes `ftdirx::deliver` actually pushed (`claim_origin` matches the byte at the head of that FIFO), so a keyboard Enter still reaches Quarry and still opens the selection. TWO focus numbers on the witness, because there are two and a reader of flight 10 will otherwise pair the wrong one: `win_focus=` is `wm::focus_asid()`, the WINDOW focus `quarry::key_route` gates on and the one `[quarry] key_route … focus=` reports, while `ring=` is `USER_INPUT_ACTIVE`, the EL0 input ring. A kernel-owned window holds the first and not the second, so `win_focus=0xffffff03 ring=0x0` is the normal shape of this line and is NOT "nothing was focused". Bounded witness, 256 lines — a console being typed into must not spend its own bandwidth narrating itself. Gated `ftdirx` (the module that produces the tag is `#[cfg(feature = "ftdirx")]`, `drivers/xhci/ftdi.rs:547`), so a build without the FTDI console compiles nothing here. ⚠ FOLDED onto this function's signature line, never given a line of its own — this file's panic `Location`s are load-bearing and the line count is unchanged; CODE BEFORE COMMENT (LEDGER P7).
+pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { let _lag = crate::video::lag::route(&raw); #[cfg(feature = "ftdirx")] if let crate::pal::Event::Key(b) = raw { if crate::drivers::xhci::ftdi::ftdirx::claim_origin(b) { static SERIALDOOR_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); if { let secret = crate::pwwire::withhold_fresh(); /* CONSOLEFIX M3 */ !secret } && SERIALDOOR_LOG.fetch_add(1, Ordering::Relaxed) < 256 { serial_println!("[serialdoor] key={} win_focus={:#x} ring={:#x} -> shell (the wire is a console)", crate::pwwire::key_class(b), crate::video::wm::focus_asid(), USER_INPUT_ACTIVE.load(Ordering::Acquire)); } return raw; } } // SERIALDOOR — **THE WIRE IS A CONSOLE, NOT A KEYBOARD** (Peter, 2026-09-17). FIRST in this function, ahead of `strip::key_escape`, `quarry::key_route`, `wc_focus_key` and `user_input_route`, because every one of those is a question about WINDOW FOCUS and a serial byte is not addressed to a window. FTDICR measured the cost of asking them anyway (`docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §FTDICR): on flight 10 a focused Quarry ate every `help\r` at its `b'\r' | b'\n'` arm — `[quarry] key_route key=0x0d focus=1 took=1` — and the SAME byte submitted the line the moment focus left, `focus=0 took=0` with `[midden] cmd=` 19 ms later. Nothing about the byte changed; only `focus` did. So an operator at the cable could not reach the shell at all while a window held focus, and had no way to see why. `return raw` and not `user_input_route(raw)`: the ruling says the SHELL, so the byte skips the focused ring-3 ring too — a program that wants the wire asks for it, it does not inherit it by being frontmost. KEYBOARD-ORIGIN ENTER IS UNTOUCHED: the tag is claimed only for bytes `ftdirx::deliver` actually pushed (`claim_origin` matches the byte at the head of that FIFO), so a keyboard Enter still reaches Quarry and still opens the selection. TWO focus numbers on the witness, because there are two and a reader of flight 10 will otherwise pair the wrong one: `win_focus=` is `wm::focus_asid()`, the WINDOW focus `quarry::key_route` gates on and the one `[quarry] key_route … focus=` reports, while `ring=` is `USER_INPUT_ACTIVE`, the EL0 input ring. A kernel-owned window holds the first and not the second, so `win_focus=0xffffff03 ring=0x0` is the normal shape of this line and is NOT "nothing was focused". Bounded witness, 256 lines — a console being typed into must not spend its own bandwidth narrating itself. Gated `ftdirx` (the module that produces the tag is `#[cfg(feature = "ftdirx")]`, `drivers/xhci/ftdi.rs:547`), so a build without the FTDI console compiles nothing here. ⚠ FOLDED onto this function's signature line, never given a line of its own — this file's panic `Location`s are load-bearing and the line count is unchanged; CODE BEFORE COMMENT (LEDGER P7).
     // CRYSTAL/WINMENU — Escape dismisses an open menu, addressed to the window system exactly as `<TAB>` is, so it is judged in the same place: before either router or a focused app can swallow it.
     // R21 gave the panel a SECOND modal surface (a window's menus, in the bar), so the question goes to the shared `strip::key_escape` seam — beside `strip::press_route`, asked by BOTH arch routers,
     // rather than each naming one surface. It consumes ONLY a bare `Esc` while one of the two menus is open; every other event, and `Esc` with nothing down, falls straight through to the chain below.
@@ -7895,10 +7892,10 @@ pub fn clickroute_selftest() {
     // with `move_to` against the tiler; the span is read back from the row the compositor actually
     // made, so the spacing tracks the panel's own scale rule rather than a number kept in sync here.
     let ox = pw / 3;
-    let oy = ph / 4 + wm::TITLE_H + wm::BORDER;
+    let oy = ph / 4 + wm::TITLE_H() + wm::BORDER();
     wm::move_to(wa, ox, oy);
     let scale = wm::info(wa).map(|i| i.scale).unwrap_or(1);
-    let span = 8 * scale + 2 * wm::BORDER + wm::TITLE_H + 8;
+    let span = 8 * scale + 2 * wm::BORDER() + wm::TITLE_H() + 8;
     let (bxo, kxo) = (ox + span, ox + 2 * span);
     wm::move_to(wb, bxo, oy);
     wm::move_to(wk, kxo, oy);
@@ -8221,11 +8218,11 @@ pub fn wmdirect_selftest() {
         return;
     }
     let saved_focus = user_input_active();
-    let (ox, oy) = (pw / 3, ph / 3 + wm::TITLE_H + wm::BORDER);
+    let (ox, oy) = (pw / 3, ph / 3 + wm::TITLE_H() + wm::BORDER());
     wm::move_to(w, ox, oy);
     // Disjoint from the probe row by a whole panel third, so no raise can make `wo` own a probe point
     // and turn the "different window" legs into "already focused" ones.
-    wm::move_to(wo, pw / 3, ph / 3 * 2 + wm::TITLE_H + wm::BORDER);
+    wm::move_to(wo, pw / 3, ph / 3 * 2 + wm::TITLE_H() + wm::BORDER());
     // Read the placement back rather than assuming it: `move_to` CLAMPS to the live panel.
     let Some(inf) = wm::info(w) else {
         serial_println!("[wm-act] direct -> SKIP (row vanished)");
@@ -8239,7 +8236,7 @@ pub fn wmdirect_selftest() {
     // whole `GAP` short of the first disc, so it is still unambiguously drag. A content point:
     // inside the surface.
     let tpx = (inf.x + 1) as i32;
-    let tpy = (inf.y - wm::TITLE_H / 2 - wm::BORDER) as i32;
+    let tpy = (inf.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32;
     let cpx = (inf.x + 1) as i32;
     let cpy = (inf.y + 1) as i32;
 
@@ -8316,7 +8313,7 @@ pub fn wmdirect_selftest() {
     // with the level left DOWN) the tail merely steers and `drag_active()` still names the window.
     let level_ok = match wm::info(w) {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
             // The press publishes the level the same way a real pad does; the grab itself is the
@@ -8345,7 +8342,7 @@ pub fn wmdirect_selftest() {
     // leg 7's grab, then one `Event::Key(0x09)` through `wc_focus_key` — the real chain's first arm.
     let tabcancel_ok = match wm::info(w) {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
             crate::pal::cursor::set_button_level(true);
@@ -8400,7 +8397,7 @@ pub fn wmdirect_selftest() {
         wm::info(w)
     } {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
             // No edge in flight to begin with: the counter is global and a previous leg's routed
@@ -8589,7 +8586,7 @@ pub fn wmdirect_selftest() {
         wm::info(w)
     } {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
             for _ in 0..8 {
@@ -8822,7 +8819,7 @@ pub fn wmdirect_selftest() {
     // needs a row, and its own `wm::close` is the teardown it is asserting about.
     let dragdead_ok = match wm::info(w) {
         Some(i) => {
-            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
+            let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
             let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
             wm::close(w);
             grabbed && wm::drag_active() == wm::WIN_NONE
@@ -10900,7 +10897,7 @@ pub fn await_u2_0a_verdict() {
 /// (the U1a/U1b demos, which ran earlier, are unaffected).
 pub fn u2_probe_once() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
     }
     // Gate: storage enumerated (same as fat::probe_once) AND a scheduled AP to run ring 3 on
@@ -15838,7 +15835,7 @@ pub fn u4x_launcher(demo_cpu: usize) {
 /// nothing until a block device and a scheduled AP exist; a missing HELLO.BIN skips the demo cleanly.
 pub fn u4x_probe_once() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
     }
     if crate::drivers::block::info().is_none() {
@@ -16154,7 +16151,7 @@ pub fn u6x_launcher(demo_cpu: usize) {
 /// I/O — the U5x fixture is an inline blob (unlike U2/U4x's disk-loaded child).
 pub fn u5x_probe_once() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
     }
     // U5x is an INLINE console-cap demo — it needs NO block device (its fixture is an inline blob; sys_write
@@ -16181,7 +16178,7 @@ pub fn u5x_probe_once() {
 /// skipped cleanly (no false FAIL) — exactly as U4x skips.
 pub fn u6x_probe_once() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
     }
     if crate::drivers::block::info().is_none() {
@@ -16380,7 +16377,7 @@ pub fn u6bx_probe_once() {
     // launchers' `U6BX_LAUNCH_DONE` gate orders the demos regardless of which probe fires first.
     u7x_probe_once();
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.load(Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
     }
     if crate::drivers::block::info().is_none() {
@@ -16885,7 +16882,7 @@ fn bg_kill_forget(pid: u64) {
 /// row must therefore be valid at spawn time, not at store time.
 fn load_program_common(bytes: &[u8]) -> Result<(super::elf::Mapped, usize), &'static str> {
     if bytes.len() > user_image_cap() {
-        return Err("image larger than the 4 MiB user image cap (RING3WIN)");
+        return Err("image larger than the user image cap (USER_WINDOW_BYTES)");
     }
     let Some(pi) = proc_reserve() else {
         // PROCREAP: `proc_reserve` has already run the BGRUN-SCAV sweep, so this refusal names what is
@@ -29726,15 +29723,15 @@ pub fn winresize_selftest() {
     let saved_focus = user_input_active();
     user_input_set_active(OWNER);
     wm::focus_changed(OWNER);
-    wm::move_to(w, pw / 4, ph / 4 + wm::TITLE_H + wm::BORDER);
+    wm::move_to(w, pw / 4, ph / 4 + wm::TITLE_H() + wm::BORDER());
     let Some(i0) = wm::info(w) else {
         serial_println!(":: WINRESIZE: -> SKIP (row vanished) ::");
         return;
     };
     let sc = i0.scale.max(1) as i64;
     let (cw, ch) = ((i0.w * i0.scale) as i32, (i0.h * i0.scale) as i32);
-    let (ox, oy) = (i0.x as i32 - wm::BORDER as i32, i0.y as i32 - (wm::TITLE_H + wm::BORDER) as i32);
-    let (ow, oh) = (cw + 2 * wm::BORDER as i32, ch + (wm::TITLE_H + 2 * wm::BORDER) as i32);
+    let (ox, oy) = (i0.x as i32 - wm::BORDER() as i32, i0.y as i32 - (wm::TITLE_H() + wm::BORDER()) as i32);
+    let (ow, oh) = (cw + 2 * wm::BORDER() as i32, ch + (wm::TITLE_H() + 2 * wm::BORDER()) as i32);
     // Leg 1 — the eight zones, each probe distinct and nonzero.
     let probes = [
         (ox + 1, i0.y as i32 + ch / 2, wm::RS_L),
@@ -29753,7 +29750,7 @@ pub fn winresize_selftest() {
         }
     }
     // The title strip's drag handle must NOT be a zone (the `wm-act` fixture's grab point).
-    let strip_clear = wm::resize_zone_at(w, i0.x as i32 + 1, i0.y as i32 - (wm::TITLE_H / 2 + wm::BORDER) as i32) == 0;
+    let strip_clear = wm::resize_zone_at(w, i0.x as i32 + 1, i0.y as i32 - (wm::TITLE_H() / 2 + wm::BORDER()) as i32) == 0;
     let (brx, bry) = (ox + ow - 2, oy + oh - 2);
     // One routed drag: press at the zone, move, release through the router. Returns (w, h) after.
     let drag = |fx: i32, fy: i32, tx: i32, ty: i32| -> Option<(usize, usize)> {
@@ -29777,20 +29774,20 @@ pub fn winresize_selftest() {
     // Leg 3 — past the panel edge: clamps inside the panel and inside the 400x300 slot.
     let c0 = wm::RS_CLAMPED.load(Relaxed);
     let i1 = wm::info(w);
-    let (bx1, by1) = i1.map(|i| ((i.x + i.w * i.scale + wm::BORDER) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER) as i32 - 2)).unwrap_or((brx, bry));
+    let (bx1, by1) = i1.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 - 2)).unwrap_or((brx, bry));
     let r3 = drag(bx1, by1, pw as i32 + 400, ph as i32 + 400);
     let clamp_ok = match (r3, wm::info(w)) {
-        (Some((w3, h3)), Some(i)) => w3 <= WRZ_CW && h3 <= WRZ_CH && i.x + w3 * i.scale + wm::BORDER <= pw && i.y + h3 * i.scale + wm::BORDER <= ph && wm::RS_CLAMPED.load(Relaxed) > c0,
+        (Some((w3, h3)), Some(i)) => w3 <= WRZ_CW && h3 <= WRZ_CH && i.x + w3 * i.scale + wm::BORDER() <= pw && i.y + h3 * i.scale + wm::BORDER() <= ph && wm::RS_CLAMPED.load(Relaxed) > c0,
         _ => false,
     };
     // Leg 4 — toward the origin: stops at the minimum.
     let i2 = wm::info(w);
-    let (bx2, by2) = i2.map(|i| ((i.x + i.w * i.scale + wm::BORDER) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER) as i32 - 2)).unwrap_or((brx, bry));
+    let (bx2, by2) = i2.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 - 2)).unwrap_or((brx, bry));
     let min_ok = drag(bx2, by2, 0, 0) == Some((wm::RS_MIN_W, wm::RS_MIN_H));
     // Leg 5 — Shift keeps the aspect (from the minimum, grow width only).
     crate::video::keymap::note_mods(crate::drivers::xhci::HID_MOD_SHIFT);
     let a0 = wm::info(w);
-    let (bx3, by3) = a0.map(|i| ((i.x + i.w * i.scale + wm::BORDER) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER) as i32 - 2)).unwrap_or((brx, bry));
+    let (bx3, by3) = a0.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 - 2)).unwrap_or((brx, bry));
     let ar = drag(bx3, by3, bx3 + 60 * sc as i32, by3);
     crate::video::keymap::note_mods(0);
     let aspect_ok = match (a0, ar) {
@@ -29989,7 +29986,7 @@ fn sys_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
 }
 
 /// RING3WIN (B316): the largest program IMAGE a reader may hand the loader — the ELF window
-/// (`una_abi::USER_WINDOW_BYTES`, 4 MiB). The loader then decides fixed vs elf model from the PT_LOAD
+/// (`una_abi::USER_WINDOW_BYTES`, 64 MiB since WINDOW2). The loader then decides fixed vs elf model from the PT_LOAD
 /// layout; a fixed-model image still has to fit `user_window_size()` (16 KiB) span-wise.
 pub fn user_image_cap() -> usize {
     super::memory::XWIN_BYTES
@@ -30051,7 +30048,7 @@ pub fn ring3win_selftest() {
         Some(s) => (s & 0xFF, s & 0x7FFF_FF00 == want & 0x7FFF_FF00),
         None => (0, false),
     };
-    let big_ok = bits == 0x0F && ck_ok;
+    let big_ok = bits & 0x0F == 0x0F && ck_ok; // WINDOW2: bit 0x10 is `tests window`'s alloc48m
     let freed = live1 == live0 && freed_pages > 0;
     serial_println!(
         "[ring3win] status={:?} bits={:#x} fnv_want={:#x} ck_ok={} live0={} live1={} freed_pages={} heap={}",

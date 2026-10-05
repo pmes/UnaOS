@@ -1,8 +1,10 @@
 //! Glyph rasterization the way Chromium draws text on Linux (AETHERFONT M3), on font_core's rasterizer:
 //!
-//! - coverage from `RenderMode::SkiaAaa` (exact area with Skia analytic-AA's quarter-row edge snap; no
-//!   hinting — Chromium's Linux default for web content is `--font-render-hinting` off in the oracle and
-//!   slight hinting is not applied to subpixel-positioned text);
+//! - coverage from `RenderMode::SkiaAaa` (exact area with Skia analytic-AA's quarter-row edge snap);
+//! - hinting (FONTHINT SR62): installed faces are hinted per fontconfig (`hintslight` here: font_core's light
+//!   auto-hinter for TrueType, the Adobe hint model for CFF — FreeType's `FT_LOAD_TARGET_LIGHT`), unless a
+//!   rule says `hintnone`/`hinting=false` or the face is synthetic-oblique; web fonts and fallback twins stay
+//!   unhinted, as Chromium draws them;
 //! - glyph origins at quarter-pixel x phases (Skia's subpixel positioning for horizontal text, rounded to
 //!   the nearest quarter), whole-pixel baselines;
 //! - Skia's A8 mask pre-blend ([`preblend`]): `SkTMaskGamma_build_correcting_lut` with contrast 0.2 and
@@ -12,7 +14,7 @@
 //!   ([`embolden`], FreeType's algorithm), advances unchanged; synthetic oblique as Blink sets it, a skew
 //!   of −1/4 (x += y/4 in font units).
 
-use super::Face;
+use crate::Face;
 use font_core::path::{OutlineSink, Path, PathCmd};
 use font_core::raster::{Rasterizer, RenderMode, Scaled};
 use std::collections::HashMap;
@@ -439,7 +441,7 @@ mod tests {
 
     #[test]
     fn synthetic_bold_inks_more() {
-        let Some(f) = crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::SANS, 400, false)) else { return };
+        let Some(f) = crate::installed_face("Arial", crate::db::Style::default()) else { return };
         let gid = f.font.glyph_index('l');
         let plain = rasterize(f, gid, 32.0, 0).unwrap();
         let bold = Face {

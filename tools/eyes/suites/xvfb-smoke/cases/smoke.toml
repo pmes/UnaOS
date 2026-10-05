@@ -13,8 +13,10 @@ oracle = { kind = "golden", path = "golden/swatch.png" }
 mask = [[0, 0, 64, 16]]
 
 # A real UnaOS vessel: Aether's windowed browser (quartzite tetra -> GTK 4) under Xvfb, against
-# its own accepted frame. Re-golden after an intended change: copy out/xvfb-smoke/aether-shell.aether.png
-# over golden/aether-shell.png.
+# its own accepted frame. Re-golden after an intended change: copy out/xvfb-smoke/aether-shell.subject.png
+# over golden/aether-shell.png. QUARTZFONT (SR64): the chrome's text is quartzite's own (font_core); the
+# golden's strings are checked against Chromium painting the same strings, face and pen origins by
+# ../quartzfont.py (re-pinned 2026-10-05 at 15/15 glyphs within 8 levels).
 [[case]]
 name = "aether-shell"
 subject = { kind = "xvfb", run = "{repo}/target/release/aether-shell", wait_ms = 5000 }

@@ -28,8 +28,13 @@ static HEAP: vein_ring3::heap::Heap = vein_ring3::heap::Heap::sbrk();
 // I/O: the store is `<home>/.config/unaos/holocron/` (`.ring`, `<ns>/<name>`) over SYS_PATH_READ/WRITE
 // (`PATH_W_TRUNC|MKDIRS`, `PATH_W_UNLINK`, `PATH_R_LIST`), REFUSED unless `<home>` stats with an inode id
 // (UnaFS: FAT has no owner, so a ring there would be readable by anything that mounts the card). Entropy:
-// CRYPTOCORE's ChaCha20 DRBG over SYS_GETRANDOM (`holocron_core::cc::DrbgEntropy`). The ring KDF: SYS_KDF
-// (the kernel runs CRYPTOCORE's Argon2id — 19..=64 MiB does not fit the 4 MiB window). Owner: SYS_WHOAMI.
+// CRYPTOCORE's ChaCha20 DRBG over SYS_GETRANDOM (`holocron_core::cc::DrbgEntropy`). The ring KDF: WINDOW2
+// (B361, R85) — CRYPTOCORE's Argon2id runs HERE again, in ring 3, over memory lent by SYS_SBRK from the 64 MiB
+// ELF window (HOLOCRON2 had to send it to the kernel through SYS_KDF while the window was 4 MiB). New rings are
+// made at `METAL_KDF` (48 MiB, t 3, p 4 — RFC 9106's second option with the memory the window holds beside the
+// image, heap and stack). SYS_KDF (66) stays a kernel service, unused by Holocron: the ONE exception is a ring
+// whose recorded memory does not fit the window (a 64 MiB ring made by the host daemon or by boot 23's
+// HOLOCRON.ELF) — it unlocks through SYS_KDF and says so (`[holocron] kdf=kernel reason=window …`). Owner: SYS_WHOAMI.
 //
 // WIRE. `:: HOLOCRON: serve ring=<unafs|none> verbs=8 owner=<user> state=<none|locked|unlocked> ::` (the
 // fulfiller), `[holocron] <verb> -> <status>` per verb, `[holocron] relay verb=<v> caller=<user|other> ->
@@ -342,9 +347,51 @@ impl Store for PathStore {
     }
 }
 
-// ---- the suite: CRYPTOCORE, the KDF through the kernel ---------------------------------------------------
+// ---- the suite: CRYPTOCORE, the KDF in ring 3 (WINDOW2) ------------------------------------------------
 
-/// `CryptoCore` with `derive_key` routed to SYS_KDF: the SAME Argon2id (crypto_core's), run where its memory fits.
+/// WINDOW2: the parameters HOLOCRON.ELF makes new rings with — RFC 9106's second recommended option (t 3,
+/// p 4) at 48 MiB, the memory the 64 MiB window holds beside the image, the heap and the stack. Above
+/// `KdfParams::FLOOR` (19 MiB, t 2, p 1).
+const METAL_KDF: KdfParams = KdfParams { m_kib: una_abi::WINDOW2_KDF_M_KIB, t: una_abi::WINDOW2_KDF_T, p: una_abi::WINDOW2_KDF_P };
+const _: () = assert!(METAL_KDF.m_kib >= KdfParams::FLOOR.m_kib && METAL_KDF.t >= KdfParams::FLOOR.t && METAL_KDF.p >= KdfParams::FLOOR.p);
+const _: () = assert!((METAL_KDF.m_kib as u64) * 1024 + (8 << 20) <= una_abi::USER_WINDOW_BYTES);
+
+/// WINDOW2: where the last derivation ran — 0 none yet, 1 ring 3, 2 the kernel (SYS_KDF, the legacy fallback).
+static KDF_WHERE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// WINDOW2: CRYPTOCORE's Argon2id in THIS process. The block memory is lent by SYS_SBRK (the size-class heap
+/// stops at 8 MiB classes) and handed back the moment the hash is done (crypto_core zeroises it first).
+/// `None` = the window cannot hold it (SYS_SBRK refused); `Some(Err)` = a parameter Argon2 refuses.
+fn derive_ring3(password: &[u8], salt: &[u8; SALT_LEN], params: &KdfParams) -> Option<Result<Key, SealError>> {
+    use crypto_core::argon2::{argon2, Block, Params, Variant, Version};
+    let p = Params { variant: Variant::Argon2id, version: Version::V0x13, m_kib: params.m_kib, t: params.t, p: params.p };
+    let n = p.blocks();
+    if n == 0 {
+        return Some(Err(SealError::Param));
+    }
+    let bytes = (n * core::mem::size_of::<Block>() + 4096) as i64;
+    let old = sys(una_abi::SYS_SBRK, bytes as u64, 0, 0, 0);
+    if old < 0 {
+        return None;
+    }
+    let base = ((old as u64) + 4095) & !4095;
+    // SAFETY: SYS_SBRK mapped `[old, old + bytes)` RW for this process, freshly zeroed; `base + n blocks` lies
+    // inside it (one page of slack for the alignment) and nothing else refers to it until it is given back.
+    let mem = unsafe { core::slice::from_raw_parts_mut(base as *mut Block, n) };
+    let mut out = [0u8; 32];
+    let r = argon2(&p, password, salt, &[], &[], mem, &mut out);
+    let _ = sys(una_abi::SYS_SBRK, (-bytes) as u64, 0, 0, 0); // single-threaded: the break is still ours to lower
+    if r.is_err() {
+        holocron_core::zero::wipe(&mut out);
+        return Some(Err(SealError::Param));
+    }
+    let k = Key::from_bytes(out);
+    holocron_core::zero::wipe(&mut out);
+    Some(Ok(k))
+}
+
+/// `CryptoCore` with `derive_key` run in ring 3 (WINDOW2); SYS_KDF only for a ring whose memory the window
+/// cannot hold.
 #[derive(Clone, Copy)]
 struct MetalSealer;
 
@@ -352,6 +399,12 @@ impl Sealer for MetalSealer {
     const SUITE: u8 = <CryptoCore as Sealer>::SUITE;
 
     fn derive_key(&self, password: &[u8], salt: &[u8; SALT_LEN], params: &KdfParams) -> Result<Key, SealError> {
+        if let Some(r) = derive_ring3(password, salt, params) {
+            KDF_WHERE.store(1, core::sync::atomic::Ordering::Relaxed);
+            return r;
+        }
+        Line::new(b"[holocron] kdf=kernel reason=window m_kib=").dec(params.m_kib as i64).put(b" (a ring made where 64 MiB fits; SYS_KDF 66)").wire();
+        KDF_WHERE.store(2, core::sync::atomic::Ordering::Relaxed);
         let mut req = [0u8; una_abi::KDF_HDR_LEN + una_abi::KDF_PW_MAX + una_abi::KDF_SALT_MAX];
         let n = una_abi::kdf_request(params.m_kib, params.t, params.p, password, salt, &mut req).ok_or(SealError::Param)?;
         let mut out = [0u8; 32];
@@ -475,6 +528,9 @@ fn now_unix() -> i64 {
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
     let _ = &APP_NOTE;
+    if una_abi::args().and_then(|a| arg(&a, 1)).as_deref() == Some("--kdf-selftest") {
+        kdf_selftest();
+    }
     let Some(who) = whoami() else {
         write(b":: HOLOCRON: owner=none (no session: a keyring is a person's) -> refused ::\n");
         exit(1);
@@ -521,7 +577,7 @@ pub extern "C" fn _start() -> ! {
         write(b":: HOLOCRON: entropy=refused (SYS_GETRANDOM could not seed the DRBG) -> refused ::\n");
         exit(1);
     };
-    let mut svc: Svc = Holocron::new(MetalSealer, CryptoCore, store, rng, who.owner.clone(), KdfParams::DEFAULT);
+    let mut svc: Svc = Holocron::new(MetalSealer, CryptoCore, store, rng, who.owner.clone(), METAL_KDF); // WINDOW2: rings the window can unlock in ring 3
     let me = Some(who.owner.as_str());
     if let Some(r) = &req {
         let mut a = svc.handle(me, r.verb(), &r.encode_body(), vein_ring3::sys::now_ms(), now_unix());
@@ -532,7 +588,13 @@ pub extern "C" fn _start() -> ! {
     let state = wire::decode_status(&st.body).map(|(s, _, _)| state_name(s)).unwrap_or(b"?");
     let mut l = Line::new(b":: HOLOCRON: serve ring=");
     l.put(if home_unafs { b"unafs" as &[u8] } else { b"none" }).put(b" verbs=").dec(wire::VERBS.len() as i64);
-    l.put(b" owner=").put(who.user.as_bytes()).put(b" state=").put(state).put(b" ::");
+    l.put(b" owner=").put(who.user.as_bytes()).put(b" state=").put(state);
+    // WINDOW2: where the KDF runs — ring 3 (SYS_KDF 66 unused by Holocron), or the kernel for a ring that does not fit.
+    l.put(match KDF_WHERE.load(core::sync::atomic::Ordering::Relaxed) {
+        2 => b" kdf=kernel(sys_kdf=used,legacy-ring)" as &[u8],
+        _ => b" kdf=ring3 sys_kdf=unused",
+    });
+    l.put(b" ::");
     l.wire();
     loop {
         let n = recv();
@@ -559,6 +621,32 @@ pub extern "C" fn _start() -> ! {
         l.wire();
         r[..n as usize].fill(0);
     }
+}
+
+/// WINDOW2 (`tests window`, kdf_ring3): derive the una-abi KAT key at Holocron's metal parameters IN RING 3
+/// (the production `derive_ring3`, nothing else) and exit with it: bits 8..30 = key bytes 0..3 (LE) & 0x7FFFFF00,
+/// low byte 1 = derived in ring 3, 2 = the window refused the memory, 4 = Argon2 refused a parameter. The kernel
+/// recomputes the key through SYS_KDF's body and compares. No session, no store, no bus.
+fn kdf_selftest() -> ! {
+    let t0 = vein_ring3::sys::now_ms();
+    let (flags, k) = match derive_ring3(una_abi::WINDOW2_KAT_PW, &una_abi::WINDOW2_KAT_SALT, &METAL_KDF) {
+        Some(Ok(key)) => {
+            let b = key.bytes();
+            (1u64, u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64)
+        }
+        None => (2, 0),
+        Some(Err(_)) => (4, 0),
+    };
+    let ms = vein_ring3::sys::now_ms().saturating_sub(t0);
+    let mut l = Line::new(b"[holocron] kdf-selftest where=ring3 m_kib=");
+    l.dec(METAL_KDF.m_kib as i64).put(b" t=").dec(METAL_KDF.t as i64).put(b" p=").dec(METAL_KDF.p as i64).put(b" ms=").dec(ms as i64);
+    l.put(match flags {
+        1 => b" -> derived" as &[u8],
+        2 => b" -> refused (the window could not lend the memory)",
+        _ => b" -> refused (parameters)",
+    });
+    l.wire();
+    exit((k & 0x7FFF_FF00) | flags)
 }
 
 #[panic_handler]

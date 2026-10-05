@@ -16721,7 +16721,8 @@ unsafe fn decode_boot_keyboard(
             restated_this_report += 1;
             continue;
         }
-        serial_println!("EHCI-HID: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
+        if !crate::pwwire::withhold() { serial_println!("EHCI-HID: KEY: class={}", crate::pwwire::key_class(ascii)); let _ = keycode; } else { serial_println!("EHCI-HID: KEY withheld (a secret is being typed)"); } // CONSOLEFIX M3 (B365, R65): flight 22 printed the login password AND `holocron init`'s here, byte by byte
+        crate::boot::key_stamp(); // INSTALLBARE M2: the decode's stamp, read back by `login::consume_key` as `[login] key latency ms=`
         crate::pal::push_event(crate::pal::Event::Key(ascii));
         note_press_edge(ascii);
     }
@@ -16768,7 +16769,7 @@ unsafe fn decode_boot_keyboard(
         }
         let ascii = release_ascii_of(keycode);
         if ascii != 0 {
-            serial_println!("EHCI-HID: KEYUP: '{}' (scancode {:#x})", ascii as char, keycode);
+            if !crate::pwwire::withhold() { serial_println!("EHCI-HID: KEYUP: class={}", crate::pwwire::key_class(ascii)); } // CONSOLEFIX M3
             crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
         }
     }
@@ -19023,6 +19024,7 @@ pub fn service_ehci_hid() {
     // as "the input hardware went dead" when what actually happened is that the `x86_usb_pump` task
     // stopped running — the difference between a bad bug and a much worse one.
     crate::deadman::note_hid_poll();
+    crate::boot::hid_pass(); // INSTALLBARE M2 (R86): the longest gap between two HID passes while a screen is up
     // PASSPERIOD — the same instant, on a clock that survives a masked span. `note_hid_poll` counts
     // passes per second and this measures the gap BETWEEN them, which is the quantity `dark_gap_ms`
     // is made of; stamped here, beside its twin and above the lock, for the identical reason.
@@ -19170,7 +19172,7 @@ fn bt_defer_boot_campaign(idx: usize, addr: u8) {
 /// is for.
 #[cfg(feature = "bt")]
 fn bt_drain_boot_campaign(ctrls: &mut [Controller]) {
-    if BT_BOOT_CAMPAIGN.load(core::sync::atomic::Ordering::SeqCst) == 0 || !crate::fs::bootdisk::root_pass_open("bt-campaign") { // BOOTSLOW (rmbp-ledger B201): the campaign waits for the ROOT PASS's verdict. Flight 12: this drain fired on the device-service pass's first iteration (8345 ms) and held that pass — and every storage call below `service_ehci_hid` in it — until 32010 ms, so the root (`X86BIND` 32220 ms), the desktop app (32152 ms), the BPACE ledger and the FTDI console all waited 23.7 s on a radio. The gate is a dependency, not a device name: `fs::bootdisk::root_pass_open` answers true once the root is bound or the pass has settled without one (bounded, `ROOT_PASS_SETTLE_MS`). ⚠ SAME-LINE fold, condition widened in place, so no `panic::Location` in this file moves.
+    if BT_BOOT_CAMPAIGN.load(core::sync::atomic::Ordering::SeqCst) == 0 || !crate::fs::bootdisk::root_pass_open("bt-campaign") || !crate::boot::services_gate("bt") { // INSTALLBARE (R86): no HCI bring-up under the setter / the login screen. // BOOTSLOW (rmbp-ledger B201): the campaign waits for the ROOT PASS's verdict. Flight 12: this drain fired on the device-service pass's first iteration (8345 ms) and held that pass — and every storage call below `service_ehci_hid` in it — until 32010 ms, so the root (`X86BIND` 32220 ms), the desktop app (32152 ms), the BPACE ledger and the FTDI console all waited 23.7 s on a radio. The gate is a dependency, not a device name: `fs::bootdisk::root_pass_open` answers true once the root is bound or the pass has settled without one (bounded, `ROOT_PASS_SETTLE_MS`). ⚠ SAME-LINE fold, condition widened in place, so no `panic::Location` in this file moves.
         return;
     }
     // The `gui` stamp is read for the WITNESS, and is deliberately NOT a gate. Reaching this drain
@@ -19214,6 +19216,7 @@ fn bt_drain_boot_campaign(ctrls: &mut [Controller]) {
             );
             return;
         };
+        crate::boot::note_start("bt");
         match gui {
             Some(g) => serial_println!(":: bt-sched: campaign start at {} ms (gui at {} ms) ::", now, g),
             // No `gui` stamp and the panel already handed over, or a build with no GUI at all: the

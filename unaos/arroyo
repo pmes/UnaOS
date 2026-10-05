@@ -3606,7 +3606,8 @@ build_user_hello_x86() {
 # it, the builder carries the same literal; `scripts/window-parity.sh` (run by `check` beside
 # knob-parity) reds when any of the four disagree. aarch64 is untouched — its asserts below still read
 # USER_REGION_SIZE (16384).
-USER_WINDOW_BYTES=4194304
+# WINDOW2 (B361, R85): 64 MiB (RING3WIN shipped 4 MiB).
+USER_WINDOW_BYTES=67108864
 USER_XWIN_VA_X86=$((0x10000200000))
 # user_elf_window_check <file> <label> — the x86 user-ELF gate every build_user_*_x86 step calls (it
 # replaced four copies of `[ size -le 16384 ]`). It reads the PT_LOAD layout, not just the file size:
@@ -3858,6 +3859,7 @@ build_selfbuild_x86() {
     fi
     build_selfbuild4_x86   # SELFBUILD4 (B356): SYSKAT4.LNX + RUST.LNX
     build_selfbuild5_x86   # SELFBUILD5 (B357): SYSKAT5.LNX + LLD.LNX + LIB/rust (RUST.LNX's objects, std rlibs, musl crt)
+    build_selfbuild6_x86   # SELFBUILD6 (B360): LIB/dyn (libc.so, libgcc_s.so.1, the dyn probe) + LIB/rustc (UNAOS_SELFBUILD6_RUSTC=1)
     ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
 }
 
@@ -3893,7 +3895,7 @@ build_selfbuild4_x86() {
 # * SYSKAT5.LNX = crates/user-linux-hello/c/syskat5.c (mremap grow/move/FIXED/DONTUNMAP, the alternate signal stack at delivery,
 #   getcpu, madvise(MADV_HUGEPAGE), sched_yield).
 # * LLD.LNX = LLVM's `lld` at the toolchain's own LLVM release (rustc +nightly -vV: LLVM 22.1.8), built here from the release source
-#   tarball (sha256 pinned below) as ONE static, non-PIE binary (glibc -static: the host has no musl C++ runtime; no zlib/zstd, no
+#   tarball (sha256 pinned below) as ONE static-PIE binary (WINDOW2/R85: -fPIE + -static-pie; glibc: the host has no musl C++ runtime; no zlib/zstd, no
 #   plugins, X86 only), stripped. It is a multi-flavour driver: `LLD.LNX -flavor gnu …` is ld.lld. Built ONCE (target/LLD.LNX is
 #   kept; ~1960 ninja steps, about an hour on 4 idle cores). `UNAOS_LLD_LNX=<path>` stages an operator-supplied static ld.lld
 #   instead; no egress / no cmake+ninja = LLD.LNX absent = `tests selfbuild5` reports lld=skip.
@@ -3914,8 +3916,11 @@ build_selfbuild5_x86() {
     else
         echo "   SELFBUILD5: SYSKAT5.LNX did not build or failed on the host kernel — not staged"; rm -f "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
     fi
-    # LLD.LNX: static, ET_EXEC (the shim's loader takes no PIE), no PT_INTERP.
-    _sb5_lld_ok() { [ -s "$1" ] && [ "$(od -An -t u2 -j 16 -N 2 "$1" | tr -d ' ')" = "2" ] && ! readelf -lW "$1" 2>/dev/null | grep -q INTERP && "$1" -flavor gnu --version 2>/dev/null | grep -q "LLD ${SELFBUILD_LLVM_VER}"; }
+    # LLD.LNX: STATIC-PIE (WINDOW2, B361, R85 "relinked as PIE"): ET_DYN, no PT_INTERP, no DT_NEEDED — the shim places it at its
+    # PIE base above the low window (a 68 MB ET_EXEC at 0x400000 overlays the kernel's low identity map), glibc's own
+    # _dl_relocate_static_pie applies its RELATIVE/IRELATIVE relocations. CMAKE_SKIP_RPATH: glibc's static-PIE start-up asserts on a
+    # DT_RUNPATH (LLVM's `$ORIGIN/../lib`), so a static-PIE with one dies in _dl_relocate_static_pie before main (measured).
+    _sb5_lld_ok() { [ -s "$1" ] && [ "$(od -An -t u2 -j 16 -N 2 "$1" | tr -d ' ')" = "3" ] && ! readelf -lW "$1" 2>/dev/null | grep -q INTERP && ! readelf -dW "$1" 2>/dev/null | grep -q NEEDED && "$1" -flavor gnu --version 2>/dev/null | grep -q "LLD ${SELFBUILD_LLVM_VER}"; }
     local lld="${WORKSPACE_DIR}/target/LLD.LNX"
     if [ -n "${UNAOS_LLD_LNX:-}" ] && [ -f "${UNAOS_LLD_LNX}" ]; then
         cp "$UNAOS_LLD_LNX" "$lld"
@@ -3931,11 +3936,11 @@ build_selfbuild5_x86() {
                    "llvm-project-${SELFBUILD_LLVM_VER}.src/llvm" "llvm-project-${SELFBUILD_LLVM_VER}.src/lld" "llvm-project-${SELFBUILD_LLVM_VER}.src/cmake" \
                    "llvm-project-${SELFBUILD_LLVM_VER}.src/third-party" "llvm-project-${SELFBUILD_LLVM_VER}.src/libunwind/include"; } \
             && cmake -G Ninja -S "$src/llvm" -B "$ld/build" -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS=lld -DLLVM_TARGETS_TO_BUILD=X86 \
-                 -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DLLVM_BUILD_STATIC=ON -DLLVM_ENABLE_PIC=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=OFF \
-                 -DCMAKE_C_FLAGS=-fno-pie -DCMAKE_CXX_FLAGS=-fno-pie -DCMAKE_EXE_LINKER_FLAGS="-static -no-pie" -DLLVM_ENABLE_PLUGINS=OFF \
+                 -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DLLVM_BUILD_STATIC=OFF -DLLVM_ENABLE_PIC=ON -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+                 -DCMAKE_C_FLAGS=-fPIE -DCMAKE_CXX_FLAGS=-fPIE -DCMAKE_EXE_LINKER_FLAGS="-static-pie" -DLLVM_ENABLE_PLUGINS=OFF \
                  -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_LIBPFM=OFF \
                  -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF -DLLVM_ENABLE_BINDINGS=OFF \
-                 -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_BUILD_TOOLS=OFF -DLLVM_ENABLE_RTTI=OFF -DLLVM_APPEND_VC_REV=OFF >/dev/null \
+                 -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_BUILD_TOOLS=OFF -DLLVM_ENABLE_RTTI=OFF -DLLVM_APPEND_VC_REV=OFF -DCMAKE_SKIP_RPATH=ON >/dev/null \
             && ninja -C "$ld/build" lld >/dev/null; then
             strip -o "$lld" "$ld/build/bin/lld"
         fi
@@ -4017,6 +4022,102 @@ PY
         echo "   SELFBUILD5: RUST.LNX link not recorded (musl target? rust-lld?) — LIB/rust not staged"; rm -rf "$out"
     fi
     ( cd "${WORKSPACE_DIR}/target" && sha256sum SYSKAT5.LNX LLD.LNX LIB/rust/link.rsp 2>/dev/null | sed 's/^/   SELFBUILD5: sha256 /' )
+}
+
+# SELFBUILD6 (B360): DYNAMIC Linux programs through the shared loader core (unaos/libs/sys/ldso_core; the kernel's
+# linuxabi/ldso.rs and the host runner `ldrun` link the same core), then the musl-host rustc. Every product is proven on the HOST
+# kernel by `ldrun` before it is staged:
+# * target/LIB/dyn (staged as /apps/LIB/dyn, the kernel loader's search dir): libc.so + libgcc_s.so.1 (+ libgcc_s.so, the
+#   link-time name) relinked -shared from the Rust musl target's self-contained libc.a (+ libgcc.a's complex-multiply helpers) and
+#   libunwind.a (+ fixtures/dyn/gcc_helpers.c), each with --eh-frame-hdr (without PT_GNU_EH_FRAME the unwinder cannot find its
+#   own frames and every rustc panic aborts); and the dyn probe (fixtures/dyn: hello PIE + libdyn.so + libplug.so).
+# * target/LIB/rustc (staged as /apps/LIB/rustc) ONLY with UNAOS_SELFBUILD6_RUSTC=1 (about 420 MB on the ESP): upstream's
+#   musl-host rustc for the pinned nightly (fetched here, sha256 pinned below; payload never in git), librustc_driver stripped of
+#   debug info and the static symbol table (301 MB -> 232 MB; the dynamic tables and relocations are untouched), the musl
+#   rust-lld, the x86_64-unknown-linux-musl std rlibs of the SAME build (the host toolchain's when its commit matches, else the
+#   pinned rust-std tarball), fixtures/rustc/hello.rs, and pm/libpm.so (fixtures/rustc/pm.rs built by that rustc under ldrun) +
+#   pm/user.rs. Host proofs: rustc --version; hello.rs compiled (relocation-model=static, crt-static: an ET_EXEC the shim runs)
+#   and run; user.rs compiled against libpm.so and run.
+SELFBUILD6_RUSTC_DATE="2026-07-15"
+SELFBUILD6_RUSTC_COMMIT="da80ed070"
+SELFBUILD6_RUSTC_URL="https://static.rust-lang.org/dist/${SELFBUILD6_RUSTC_DATE}/rustc-nightly-x86_64-unknown-linux-musl.tar.xz"
+SELFBUILD6_RUSTC_SHA256="706b319322fe2d737c6c56ac5bf7ec0a4ce2e76c49c12220099c0a3f41aa4c10"
+SELFBUILD6_STD_URL="https://static.rust-lang.org/dist/${SELFBUILD6_RUSTC_DATE}/rust-std-nightly-x86_64-unknown-linux-musl.tar.xz"
+SELFBUILD6_STD_SHA256="778d9ca7f9cfed6accc3174e2f75a7a0d670e62d8e010f5cbff59b8af35eaae1"
+build_selfbuild6_x86() {
+    local sb="${WORKSPACE_DIR}/target/selfbuild/sb6" core="$WORKSPACE_DIR/libs/sys/ldso_core"
+    local dyn="${WORKSPACE_DIR}/target/LIB/dyn" rlib="${WORKSPACE_DIR}/target/LIB/rustc"
+    local selfc; selfc="$(rustc +nightly --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained"
+    local tb; tb="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    mkdir -p "$sb"
+    rm -rf "$dyn"
+    # The host runner (the R78 execution proof).
+    if ! ( cd "$WORKSPACE_DIR/.." && CARGO_TARGET_DIR="$sb/host" cargo +nightly build --release --quiet -p ldso_core --bin ldrun ); then  # the ROOT workspace
+        echo "   SELFBUILD6: ldrun did not build — nothing staged (tests selfbuild6 SKIPs)"; return 0
+    fi
+    local ldrun="$sb/host/release/ldrun"
+    if [ -f "$selfc/libc.a" ] && sh "$core/fixtures/dyn/build.sh" "$selfc" "$sb/dyn" \
+        && "$ldrun" "$sb/dyn/hello" | grep -q "^dyn=ok objects=3 after_dlopen=4 "; then
+        mkdir -p "$dyn"
+        ( cd "$sb/dyn" && cp hello libdyn.so libplug.so libc.so libgcc_s.so.1 "$dyn/" && cp libgcc_s.so.1 "$dyn/libgcc_s.so" )
+        echo "   SELFBUILD6: LIB/dyn staged (libc.so, libgcc_s.so.1, the dyn probe); host: dyn=ok under ldrun"
+    else
+        echo "   SELFBUILD6: the dyn probe did not build (musl target? clang/ld.lld?) or failed under ldrun — LIB/dyn not staged"
+        return 0
+    fi
+    rm -rf "$rlib"
+    if [ "${UNAOS_SELFBUILD6_RUSTC:-0}" != "1" ]; then
+        echo "   SELFBUILD6: UNAOS_SELFBUILD6_RUSTC unset — LIB/rustc not staged (tests selfbuild6 reports the rustc probes skip)"
+        return 0
+    fi
+    local tar="$sb/rustc.tar.xz"
+    if [ ! -f "$tar" ] || ! echo "$SELFBUILD6_RUSTC_SHA256  $tar" | sha256sum -c --quiet 2>/dev/null; then
+        curl -sSfL -o "$tar" "$SELFBUILD6_RUSTC_URL" || { echo "   SELFBUILD6: rustc fetch failed (egress?) — LIB/rustc not staged"; rm -f "$tar"; return 0; }
+    fi
+    echo "$SELFBUILD6_RUSTC_SHA256  $tar" | sha256sum -c --quiet || { echo "   SELFBUILD6: rustc sha256 mismatch — LIB/rustc not staged"; return 0; }
+    rm -rf "$sb/x" && mkdir -p "$sb/x" && tar -xJf "$tar" -C "$sb/x" --strip-components=2 rustc-nightly-x86_64-unknown-linux-musl/rustc/bin rustc-nightly-x86_64-unknown-linux-musl/rustc/lib
+    local tri="lib/rustlib/x86_64-unknown-linux-musl"
+    mkdir -p "$rlib/bin" "$rlib/$tri/bin" "$rlib/pm"
+    cp "$sb/x/bin/rustc" "$rlib/bin/rustc"
+    local drv; drv="$(basename "$(ls "$sb/x"/lib/librustc_driver-*.so)")"
+    "$tb/llvm-objcopy" --strip-debug --strip-unneeded "$sb/x/lib/$drv" "$rlib/lib/$drv"
+    cp "$sb/x/$tri/bin/rust-lld" "$rlib/$tri/bin/rust-lld"
+    rm -rf "$sb/x"
+    # The std rlibs of the same build.
+    local hstd; hstd="$(rustc +nightly --print sysroot)/$tri/lib"
+    if rustc +nightly -vV | grep -q "^commit-hash: ${SELFBUILD6_RUSTC_COMMIT}" && [ -d "$hstd/self-contained" ]; then
+        cp -r "$hstd" "$rlib/$tri/lib"
+    else
+        local stdt="$sb/std.tar.xz"
+        curl -sSfL -o "$stdt" "$SELFBUILD6_STD_URL" && echo "$SELFBUILD6_STD_SHA256  $stdt" | sha256sum -c --quiet \
+            && tar -xJf "$stdt" -C "$sb" && cp -r "$sb/rust-std-nightly-x86_64-unknown-linux-musl/rust-std-x86_64-unknown-linux-musl/$tri/lib" "$rlib/$tri/lib" \
+            || { echo "   SELFBUILD6: the matching musl std is unavailable — LIB/rustc not staged"; rm -rf "$rlib"; return 0; }
+        rm -rf "$sb/rust-std-nightly-x86_64-unknown-linux-musl" "$stdt"
+    fi
+    # Trim what a plain compile never reads: the sanitizer runtimes and the profiler (about 75 MB of the 222 MB). The stand-alone
+    # .rmeta files stay: without them the probe crates fail to resolve std items (E0425).
+    rm -f "$rlib/$tri/lib/"librustc-nightly_rt.*.a "$rlib/$tri/lib/"libprofiler_builtins-*
+    cp "$core/fixtures/rustc/hello.rs" "$rlib/hello.rs"
+    cp "$core/fixtures/rustc/user.rs" "$rlib/pm/user.rs"
+    # Host proofs, through ldrun. The linker on the host is ld.lld (LLD.LNX's stand-in: same flavour, same flags).
+    local w="$sb/w" lk="-C linker=$(command -v ld.lld) -C linker-flavor=ld.lld -C link-self-contained=yes"
+    rm -rf "$w" && mkdir -p "$w"
+    local ok=1
+    "$ldrun" -L "$dyn" "$rlib/bin/rustc" --version | grep -q "^rustc 1\..*(${SELFBUILD6_RUSTC_COMMIT}" || ok=0
+    [ $ok = 1 ] && ( cd "$w" && "$ldrun" -L "$dyn" "$rlib/bin/rustc" -C codegen-units=1 -O "$rlib/hello.rs" --target x86_64-unknown-linux-musl $lk \
+            -C relocation-model=static -C target-feature=+crt-static -o hello && ./hello | grep -q "^hello from rustc on ldso_core: sum=55" ) || ok=0
+    [ $ok = 1 ] && ( cd "$w" && "$ldrun" -L "$dyn" "$rlib/bin/rustc" --crate-type proc-macro "$core/fixtures/rustc/pm.rs" $lk -L "$dyn" \
+            && cp libpm.so "$rlib/pm/libpm.so" \
+            && "$ldrun" -L "$dyn" "$rlib/bin/rustc" "$rlib/pm/user.rs" --extern "pm=$rlib/pm/libpm.so" --target x86_64-unknown-linux-musl $lk \
+               -C relocation-model=static -C target-feature=+crt-static -o pm \
+            && ./pm | grep -q "^proc_macro: derived Hello for Probe" ) || ok=0
+    rm -rf "$w"
+    if [ $ok = 1 ]; then
+        echo "   SELFBUILD6: LIB/rustc staged ($(du -sk "$rlib" | cut -f1) KiB); host: rustc --version, hello and the proc-macro crate run under ldrun"
+        ( cd "$rlib" && sha256sum bin/rustc "lib/$drv" "$tri/bin/rust-lld" pm/libpm.so | sed 's/^/   SELFBUILD6: sha256 /' )
+    else
+        echo "   SELFBUILD6: a rustc host proof failed under ldrun — LIB/rustc not staged"; rm -rf "$rlib"
+    fi
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).
@@ -9102,6 +9203,21 @@ esp_x86_unafs_card() {
     rm -f "$vol" "$card"
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$vol" -s "$unafs_mb" || {
         echo -e "${COLOR_RED}❌ UNAFSX86: tools/unafs init failed — no card image${COLOR_RESET}"; return 1; }
+    # VOLUMES (B366) M3: the builder's system/test-f (free format samples, builder/testf.list) onto the UnaFS root, so
+    # /system/test-f is on the volume `/` is — `tests testf` / `tests play` find it there before /boot/system/test-f.
+    local testf_dir="${WORKSPACE_DIR}/target/x86_64_data/system/test-f"
+    if [ -d "$testf_dir" ]; then
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- mkdir /system/test-f -i "$vol" >/dev/null || {
+            echo -e "${COLOR_RED}❌ VOLUMES: tools/unafs mkdir /system/test-f failed — no card image${COLOR_RESET}"; return 1; }
+        local tf_n=0 tf
+        for tf in "$testf_dir"/*; do
+            [ -f "$tf" ] || continue
+            cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$tf" /system/test-f -i "$vol" >/dev/null || {
+                echo -e "${COLOR_RED}❌ VOLUMES: tools/unafs put ${tf##*/} failed — no card image${COLOR_RESET}"; return 1; }
+            tf_n=$((tf_n + 1))
+        done
+        echo -e "${COLOR_GREEN}  • TEST-F: ${tf_n} file(s) onto the UnaFS root at /system/test-f (VOLUMES, B366)${COLOR_RESET}"
+    fi
     # SELFINSTALL2 (B310): the card's GPT is laid by `tools/una-card` over `amber_core` — the SAME core the
     # kernel's `install ssd --write` lays the SSD with (it replaced scripts/make-x86-card.py, byte-identical).
     cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/una-card/Cargo.toml" -- \
@@ -9112,6 +9228,66 @@ esp_x86_unafs_card() {
     echo -e "${COLOR_GREEN}✅ x86 CARD (UnaFS root): ${card}${COLOR_RESET}"
     echo -e "   sha256: $(sha256_of "$card")"
     echo -e "   p1 = ESP (FAT32, boot + data trees) · p2 = UnaFS system volume (${unafs_mb} MiB) — dd the whole image"
+}
+
+# KERNELFONT2 (rmbp-ledger B363, R85 item 12: "fonts-noto-core on the builder host"): the four Noto script faces
+# KERNELFONT's `video::text` falls back to (Arabic, Hebrew, Devanagari, Thai) are DATA the builder stages from the
+# host's packages (builder/src/main.rs KFONT_FACES / KFONT_DIRS). Run before every MEDIA build: (1) all four found in
+# a package dir or in UNAOS_FONT_DIRS -> nothing to do; (2) else `apt-get install -y fonts-noto-core` (through sudo -n
+# when not root); (3) apt refused or absent -> the Ubuntu pool .deb of the same package, SHA-512 pinned from the
+# archive's Packages index, each face SHA-256 pinned, extracted into the gitignored target/fonts-noto/ with the
+# package's copyright as LICENSE (the builder takes <dir>/LICENSE), and exported as UNAOS_FONT_DIRS. Nothing found or
+# fetched -> the media still builds and the kernel says `scripts_missing=…` on the wire, as before.
+KFONT_NOTO_FACES=(NotoSansArabic-Regular.ttf NotoSansHebrew-Regular.ttf NotoSansDevanagari-Regular.ttf NotoSansThai-Regular.ttf)
+KFONT_NOTO_DEB_URL="http://archive.ubuntu.com/ubuntu/pool/main/f/fonts-noto/fonts-noto-core_20201225-2_all.deb"
+KFONT_NOTO_DEB_SHA512="dd8187da0b4903d2ccd445518094e92c4a6285a886b7091b7ce8151dea358eba36ba41cd215d349c2b9953ad5d2fbeacfcee117327340f59e62af75ca0dba2ee"
+KFONT_NOTO_SHA256=(
+    "504d7407d86875acf7d04dfaa0fd7524d0b8797723bc4aa18022f29db25b0b6e"
+    "436900d5ad77d33e4234247f3076eaecd25b92b9bea0519514f684140e3566a7"
+    "79a470365ccb210fa3c7d8d8ff2e005ef9d983cfd067f735a0caf7e15070ca9f"
+    "dfbd5ed0f1e68c3cbc51aa08f646d1ab0e68e7c4ceab70a69e465225ff701f93"
+)
+kfont_noto_missing() {
+    local f d n=0 dirs="${UNAOS_FONT_DIRS:-}:/usr/share/fonts/truetype/noto:/usr/share/fonts/opentype/noto:/usr/share/fonts/google-noto:/usr/share/fonts/TTF:/usr/share/fonts/noto"
+    for f in "${KFONT_NOTO_FACES[@]}"; do
+        local hit=0 IFS=:
+        for d in $dirs; do [ -n "$d" ] && [ -f "$d/$f" ] && { hit=1; break; }; done
+        unset IFS
+        [ "$hit" = 1 ] || n=$((n + 1))
+    done
+    echo "$n"
+}
+ensure_kfont_noto() {
+    local miss; miss="$(kfont_noto_missing)"
+    if [ "$miss" = 0 ]; then
+        echo -e "${COLOR_GREEN}  • FONTS: the four Noto script faces are on this host (KERNELFONT2)${COLOR_RESET}"
+        return 0
+    fi
+    echo -e "${COLOR_YELLOW}⚡ FONTS: ${miss} of 4 Noto script faces missing — apt-get install -y fonts-noto-core (KERNELFONT2, R85)${COLOR_RESET}"
+    local sudo=""; [ "$(id -u)" = 0 ] || sudo="sudo -n"
+    if command -v apt-get >/dev/null 2>&1 && $sudo apt-get install -y fonts-noto-core >/dev/null 2>&1 && [ "$(kfont_noto_missing)" = 0 ]; then
+        echo -e "${COLOR_GREEN}  • FONTS: fonts-noto-core installed by apt${COLOR_RESET}"
+        return 0
+    fi
+    local dir="${WORKSPACE_DIR}/target/fonts-noto" deb tmp i ok=1
+    echo -e "${COLOR_YELLOW}  • FONTS: apt refused or absent — fetching the pinned .deb into ${dir}${COLOR_RESET}"
+    mkdir -p "$dir"; deb="$dir/fonts-noto-core.deb"; tmp="$dir/x"
+    if ! { [ -f "$deb" ] && [ "$(sha512sum "$deb" | cut -d' ' -f1)" = "$KFONT_NOTO_DEB_SHA512" ]; }; then
+        curl -fsSL -m 300 -o "$deb" "$KFONT_NOTO_DEB_URL" || { echo -e "${COLOR_RED}  • FONTS: fetch failed — media builds without the Noto faces (scripts_missing on the wire)${COLOR_RESET}"; return 0; }
+    fi
+    [ "$(sha512sum "$deb" | cut -d' ' -f1)" = "$KFONT_NOTO_DEB_SHA512" ] || { echo -e "${COLOR_RED}  • FONTS: .deb SHA-512 mismatch — refused, not staged${COLOR_RESET}"; rm -f "$deb"; return 0; }
+    rm -rf "$tmp"; mkdir -p "$tmp"
+    # dpkg-deb reads every data.tar compression itself (the 2020 package is zstd); ar + tar where there is no dpkg.
+    { if command -v dpkg-deb >/dev/null 2>&1; then dpkg-deb -x "$deb" "$tmp"; else ( cd "$tmp" && ar x "$deb" && tar -xf data.tar.* ); fi; } || { echo -e "${COLOR_RED}  • FONTS: .deb extract failed — not staged${COLOR_RESET}"; return 0; }
+    for i in 0 1 2 3; do
+        local f="${KFONT_NOTO_FACES[$i]}" src; src="$(find "$tmp" -name "${KFONT_NOTO_FACES[$i]}" -print -quit)"
+        if [ -n "$src" ] && [ "$(sha256sum "$src" | cut -d' ' -f1)" = "${KFONT_NOTO_SHA256[$i]}" ]; then cp -f "$src" "$dir/$f"; else ok=0; echo -e "${COLOR_RED}  • FONTS: ${f} absent or SHA-256 mismatch — not staged${COLOR_RESET}"; fi
+    done
+    [ -f "$tmp/usr/share/doc/fonts-noto-core/copyright" ] && cp -f "$tmp/usr/share/doc/fonts-noto-core/copyright" "$dir/LICENSE"
+    rm -rf "$tmp"
+    export UNAOS_FONT_DIRS="${UNAOS_FONT_DIRS:+${UNAOS_FONT_DIRS}:}${dir}"
+    [ "$ok" = 1 ] && echo -e "${COLOR_GREEN}  • FONTS: four Noto faces SHA-pinned into ${dir} (UNAOS_FONT_DIRS)${COLOR_RESET}"
+    return 0
 }
 
 esp_x86() {
@@ -9125,7 +9301,7 @@ esp_x86() {
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
-    cd "$WORKSPACE_DIR/builder"
+    ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363): the Noto script faces on the builder host first
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     # The media path does NOT go through build_kernel_x86_64 (the builder compiles the kernel
@@ -9188,7 +9364,7 @@ vm_image() {
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
-    cd "$WORKSPACE_DIR/builder"
+    ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363)
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     local img="${WORKSPACE_DIR}/target/vm/unaos-x86-${git7}.img"

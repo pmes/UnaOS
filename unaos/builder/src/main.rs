@@ -138,6 +138,93 @@ fn kfont_dirs_env() -> Vec<std::path::PathBuf> {
     std::env::var("UNAOS_FONT_DIRS").map(|v| v.split(':').filter(|s| !s.is_empty()).map(std::path::PathBuf::from).collect()).unwrap_or_default()
 }
 
+/// VOLUMES (rmbp-ledger B366) M3: the generated rows of `builder/testf.list` — formats whose sample is made here
+/// rather than fetched (CC0-1.0). Pure, so the test pins the bytes' shape.
+fn testf_generated(name: &str) -> Option<Vec<u8>> {
+    let text = |s: &str| Some(s.as_bytes().to_vec());
+    match name {
+        "TEST.QOI" => {
+            // QOI (qoiformat.org): 64x64 RGBA gradient; QOI_OP_RUN for repeats, QOI_OP_RGBA otherwise; the 8-byte end marker.
+            let (w, h) = (64u32, 64u32);
+            let mut out = b"qoif".to_vec();
+            out.extend_from_slice(&w.to_be_bytes());
+            out.extend_from_slice(&h.to_be_bytes());
+            out.extend_from_slice(&[4, 0]);
+            let (mut prev, mut run) = ([0u8, 0, 0, 255], 0u8);
+            for y in 0..h {
+                for x in 0..w {
+                    let px = [(x * 4) as u8, (y * 4) as u8, if (x / 16 + y / 16) % 2 == 0 { 0xC0 } else { 0x40 }, 255];
+                    if px == prev {
+                        run += 1;
+                        if run == 62 { out.push(0xC0 | (run - 1)); run = 0; }
+                        continue;
+                    }
+                    if run > 0 { out.push(0xC0 | (run - 1)); run = 0; }
+                    out.push(0xFF);
+                    out.extend_from_slice(&px);
+                    prev = px;
+                }
+            }
+            if run > 0 { out.push(0xC0 | (run - 1)); }
+            out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+            Some(out)
+        }
+        "TEST.SVG" => text("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"128\" height=\"128\" viewBox=\"0 0 128 128\">\n  <rect x=\"8\" y=\"8\" width=\"112\" height=\"112\" rx=\"16\" fill=\"#2b6cb0\"/>\n  <circle cx=\"64\" cy=\"64\" r=\"36\" fill=\"#f6e05e\" stroke=\"#1a202c\" stroke-width=\"4\"/>\n  <path d=\"M40 88 L64 40 L88 88 Z\" fill=\"none\" stroke=\"#c53030\" stroke-width=\"6\"/>\n</svg>\n"),
+        "TEST.TXT" => text("UnaOS test-f: plain text sample.\nLine two, with UTF-8: café, naïve, 日本語, emoji-free.\n\tA tab-indented line.\n"),
+        "TEST.MD" => text("# UnaOS test-f\n\nA **Markdown** sample with *emphasis*, `code`, and a [link](https://example.org).\n\n- one\n- two\n\n```\nfenced block\n```\n\n| col | val |\n| --- | --- |\n| a   | 1   |\n"),
+        "TEST.JSON" => text("{\n  \"name\": \"UnaOS test-f\",\n  \"formats\": [\"wav\", \"flac\", \"opus\", \"png\"],\n  \"nested\": { \"ok\": true, \"n\": 42, \"pi\": 3.14159, \"none\": null }\n}\n"),
+        "TEST.CSV" => text("format,kind,container\nwav,audio,riff\nflac,audio,flac\nopus,audio,ogg\npng,image,png\n\"quoted, field\",text,csv\n"),
+        _ => None,
+    }
+}
+
+/// VOLUMES (rmbp-ledger B366) M3: stage `builder/testf.list` into `<volume>/system/test-f/` with a MANIFEST.txt
+/// (name bytes sha256 licence source). A fetched row comes from `cache` (filled by `curl` on a miss) and is staged
+/// ONLY when its sha256 is the pin; a row that cannot be fetched or does not match is named and skipped — the
+/// kernel's `tests testf` names it again as missing. `UNAOS_TESTF=0` stages nothing. Returns the files staged.
+fn stage_testf(list: &std::path::Path, cache: &std::path::Path, volume: &std::path::Path) -> Vec<String> {
+    if std::env::var("UNAOS_TESTF").map(|v| v == "0").unwrap_or(false) {
+        println!("   TEST-F: UNAOS_TESTF=0 — system/test-f not staged");
+        return Vec::new();
+    }
+    let Ok(rows) = std::fs::read_to_string(list) else {
+        println!("   TEST-F: {} absent — system/test-f not staged", list.display());
+        return Vec::new();
+    };
+    let out = volume.join("system/test-f");
+    std::fs::create_dir_all(&out).unwrap();
+    let hex = |b: &[u8]| -> String { crypto_core::sha2::sha256(b).iter().map(|x| format!("{:02x}", x)).collect() };
+    let mut manifest = String::from("# VOLUMES (B366): free format samples staged by the builder (builder/testf.list)\n# name bytes sha256 licence source\n");
+    let (mut staged, mut skipped) = (Vec::new(), Vec::new());
+    for line in rows.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 4 { continue; }
+        let (name, pin, lic, src) = (f[0], f[1], f[2], f[3]);
+        let bytes = if pin == "-" {
+            testf_generated(name)
+        } else {
+            let hit = cache.join(name);
+            if !hit.is_file() || std::fs::read(&hit).map(|b| hex(&b) != pin).unwrap_or(true) {
+                std::fs::create_dir_all(cache).unwrap();
+                let _ = Command::new("curl").args(["-sSfL", "--max-time", "60", "-o"]).arg(&hit).arg(src)
+                    .stdout(Stdio::null()).status();
+            }
+            std::fs::read(&hit).ok().filter(|b| hex(b) == pin)
+        };
+        let Some(bytes) = bytes else {
+            skipped.push(name.to_string());
+            continue;
+        };
+        std::fs::write(out.join(name), &bytes).unwrap();
+        manifest.push_str(&format!("{} {} {} {} {}\n", name, bytes.len(), hex(&bytes), lic, src));
+        staged.push(name.to_string());
+    }
+    std::fs::write(out.join("MANIFEST.txt"), manifest).unwrap();
+    println!("   TEST-F: staged {} sample(s) into {}/system/test-f{}", staged.len(), volume.display(),
+        if skipped.is_empty() { String::new() } else { format!(" — NOT staged (offline or sha != pin): {}", skipped.join(", ")) });
+    staged
+}
+
 fn main() {
     let workspace_dir = std::fs::canonicalize("..").unwrap();
     let target_dir = workspace_dir.join("target");
@@ -1165,6 +1252,34 @@ fn main() {
     } else {
         println!("   SELFBUILD5: target/LIB/rust absent — ESP has no APPS/LIB/rust (tests selfbuild5 reports lld=skip)");
     }
+    // SELFBUILD6 (B360): target/LIB/dyn (libc.so + libgcc_s.so.1 relinked from the Rust musl target's self-contained archives —
+    // the kernel loader's search dir — and the dyn probe) and, with UNAOS_SELFBUILD6_RUSTC=1, target/LIB/rustc (the musl-host
+    // rustc tree: bin/rustc, the stripped librustc_driver, rust-lld, the musl std rlibs, hello.rs, pm/), both built and
+    // host-proven under `ldrun` by arroyo's build_selfbuild6_x86. They ride the APPS/LIB copy above; staged here on their own
+    // when the musl LIB was not built. Absent = `tests selfbuild6` reports skip.
+    for (sub, probe, what) in [("dyn", "hello", "libc.so, libgcc_s.so.1, the dyn probe"), ("rustc", "bin/rustc", "the musl-host rustc tree")] {
+        let from = musl_lib.join(sub);
+        if from.join(probe).exists() {
+            let to = esp_apps.join("LIB").join(sub);
+            if !to.join(probe).exists() {
+                fn copy_all(from: &std::path::Path, to: &std::path::Path) {
+                    std::fs::create_dir_all(to).unwrap();
+                    for e in std::fs::read_dir(from).unwrap() {
+                        let e = e.unwrap();
+                        if e.file_type().unwrap().is_dir() {
+                            copy_all(&e.path(), &to.join(e.file_name()));
+                        } else {
+                            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+                        }
+                    }
+                }
+                copy_all(&from, &to);
+            }
+            println!("   SELFBUILD6: APPS/LIB/{sub} staged ({what})");
+        } else {
+            println!("   SELFBUILD6: target/LIB/{sub} absent — ESP has no APPS/LIB/{sub} (tests selfbuild6 reports skip)");
+        }
+    }
 
     // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
     // target/PULSE-X86.ELF), staged as PULSE.ELF exactly like STAT.ELF/VUG.ELF above and for the same
@@ -1193,7 +1308,7 @@ fn main() {
     if big_elf.exists() {
         // The ring-3 image cap — una_abi::USER_WINDOW_BYTES; scripts/window-parity.sh holds this literal,
         // arroyo's USER_WINDOW_BYTES and the una-abi constant to one number.
-        const USER_WINDOW_BYTES: u64 = 4194304;
+        const USER_WINDOW_BYTES: u64 = 67108864; // WINDOW2 (B361): 64 MiB
         let n = std::fs::metadata(&big_elf).unwrap().len();
         assert!(n <= USER_WINDOW_BYTES, "BIG-X86.ELF {} bytes > USER_WINDOW_BYTES {}", n, USER_WINDOW_BYTES);
         std::fs::copy(&big_elf, esp_apps.join("BIG.ELF")).unwrap();
@@ -1350,6 +1465,10 @@ fn main() {
     // KERNELFONT (B359): the faces ride the DATA volume too — `video::text` reads /system/fonts there.
     if !stage_fonts(&kfont_dirs_env(), &data_dir).is_empty() {
         staged_data.push("system/fonts/*");
+    }
+    // VOLUMES (B366) M3: the free format samples (`builder/testf.list`) ride the DATA volume at system/test-f.
+    if !stage_testf(&workspace_dir.join("builder/testf.list"), &target_dir.join("testf-cache"), &data_dir).is_empty() {
+        staged_data.push("system/test-f/*");
     }
     // FACETANIM (B358): the three 8x8 3-frame animations `tests facetanim` opens (/apps/ANIM3.GIF,
     // /apps/ANIM3.WEBP, /apps/ANIM3.PNG) — committed beside pixel_core's KATs, which pin their bytes.
@@ -2503,6 +2622,50 @@ mod kernelfont_tests {
             assert!(out.join("system/fonts").join(f).is_file());
         }
         assert!(out.join("system/fonts/LICENSES/dejavu.txt").is_file());
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// KERNELFONT2 (B363): with fonts-noto-core on the host (or arroyo's pinned fallback in target/fonts-noto, which
+    /// carries the package's copyright as LICENSE) every face stages: 10/10, the Noto licence beside them.
+    #[test]
+    fn noto_faces_stage_ten_of_ten() {
+        let out = std::env::temp_dir().join(format!("kfont-noto-{}", std::process::id()));
+        let fallback = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/fonts-noto");
+        let staged = super::stage_fonts(&[fallback], &out);
+        let noto = staged.iter().filter(|f| f.starts_with("NotoSans")).count();
+        println!("KERNELFONT2 builder: faces={}/{} noto={}/4", staged.len(), super::KFONT_FACES.len(), noto);
+        if noto == 0 {
+            println!("SKIP: no Noto script face on this host (ensure_kfont_noto installs fonts-noto-core)");
+            let _ = std::fs::remove_dir_all(&out);
+            return;
+        }
+        assert_eq!(noto, 4, "a partial Noto set: {staged:?}");
+        assert!(out.join("system/fonts/LICENSES/noto.txt").is_file());
+        if staged.iter().any(|f| f == "DejaVuSans.ttf") {
+            assert_eq!(staged.len(), super::KFONT_FACES.len(), "faces=10/10 wanted: {staged:?}");
+        }
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// VOLUMES (B366) M3: the generated rows stage offline with a MANIFEST row each; the QOI is well-formed
+    /// (header, 64x64x4 pixels' worth of ops, end marker); the shipped list claims every format the row names.
+    #[test]
+    fn testf_generated_rows_stage() {
+        let out = std::env::temp_dir().join(format!("testf-{}", std::process::id()));
+        let list = out.join("list");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(&list, "TEST.QOI - CC0-1.0 generated:qoi\nTEST.CSV - CC0-1.0 generated:csv\n").unwrap();
+        let staged = super::stage_testf(&list, &out.join("cache"), &out.join("vol"));
+        assert_eq!(staged, vec!["TEST.QOI".to_string(), "TEST.CSV".to_string()]);
+        let qoi = std::fs::read(out.join("vol/system/test-f/TEST.QOI")).unwrap();
+        assert_eq!(&qoi[..4], b"qoif");
+        assert_eq!(&qoi[qoi.len() - 8..], &[0, 0, 0, 0, 0, 0, 0, 1]);
+        let m = std::fs::read_to_string(out.join("vol/system/test-f/MANIFEST.txt")).unwrap();
+        assert!(m.lines().any(|l| l.starts_with("TEST.QOI ")) && m.lines().any(|l| l.starts_with("TEST.CSV ")));
+        let shipped = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testf.list")).unwrap();
+        for want in ["TEST.WAV", "TEST.FLAC", "TEST.OPUS", "TEST.OGG", "TEST.MP3", "TEST.AAC", "TEST.M4A", "TEST.AIF", "TEST.PNG", "APNG.PNG", "TEST.JPG", "TEST.GIF", "LOSSLESS.WEBP", "LOSSY.WEBP", "ANIM.WEBP", "TEST.BMP", "TEST.QOI", "TEST.SVG", "TEST.TXT", "TEST.MD", "TEST.JSON", "TEST.CSV", "TEST.WEBM", "TEST.MP4"] {
+            assert!(shipped.lines().any(|l| l.starts_with(&format!("{want} "))), "{want} not in testf.list");
+        }
         let _ = std::fs::remove_dir_all(&out);
     }
 }

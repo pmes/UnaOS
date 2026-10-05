@@ -70,6 +70,9 @@ pub mod key {
     pub const LOWBAT_PCT: &str = "power.lowbat_shutdown_pct";
     pub const DOCK_PINS: &str = "dock.pins";
     pub const SETTINGS_TAB: &str = "settings.tab";
+    /// KERNELFONT (B359) schema rows, written by the Settings Font picker since KERNELFONT2 (B363).
+    pub const FONT: &str = "display.font";
+    pub const FONT_SIZE: &str = "display.font_size";
 }
 
 static TREE: spin::Mutex<PrefTree> = spin::Mutex::new(PrefTree::new());

@@ -119,7 +119,7 @@ fn emit_src(args: fmt::Arguments, nl: bool, user: bool) {
         lb.n += 1;
     }
     let line = core::str::from_utf8(&lb.b[..lb.n]).unwrap_or("[serial] utf8?\n");
-    line_note(&lb.b[..lb.n]); #[cfg(feature = "selfdiag")] crate::bootwit::note(&lb.b[..lb.n]); // SELFDIAG M1 (B324): the boot-log tap. QUIETBOOT M4: per-tag tally until the `:: BOOT:` line (same-line fold).
+    if fold_take(&lb.b[..lb.n]) { return; } line_note(&lb.b[..lb.n]); #[cfg(feature = "selfdiag")] crate::bootwit::note(&lb.b[..lb.n]); // SELFDIAG M1 (B324): the boot-log tap. QUIETBOOT M4: per-tag tally until the `:: BOOT:` line (same-line fold).
     if user { SRC_USER.fetch_add(1, Relaxed); } else { SRC_EMIT.fetch_add(1, Relaxed); }
 
     let masked = irq_masked();
@@ -395,7 +395,7 @@ fn line_note(b: &[u8]) {
     let opens = !MID.swap(!ends, Relaxed);
     if ends { LINES.fetch_add(1, Relaxed); }
     if opens { tag_note(b); }
-    if TAIL_ARM.load(Relaxed) { tail_note(b); }
+    if TAIL_ARM.load(Relaxed) { tail_note(b); } crate::pwwire::wire_note(b); // CONSOLEFIX M3 (B365): the `tests pwwire` tap
 }
 
 // ── QUIETBOOT3 (B352) — THE GLASS SAYS WHAT THE WIRE SAYS ─────────────────────────────────────────────────────
@@ -438,4 +438,174 @@ fn tail_note(b: &[u8]) {
         t.0[..k].copy_from_slice(&v.as_bytes()[..k]);
         t.1 = k;
     }
+}
+
+// ── GLASSLAG M4 (rmbp-ledger B370) — THE KEPLER TAKEOVER'S PROSE, FOLDED ──────────────────────────────────────────
+// Flight 22 read `:: QUIETBOOT: lines=384 bound=250 … top=[kepler:263,…] -> FAIL` with the nine recon knobs off:
+// `kepler::init` alone printed 263 `:: kepler: <sub> …` lines (128 `ucode-post`, 40 `FENCE`, the falcon ports,
+// the beacons, recon, bind, witness …) before the boot line. They are the takeover's own narration, read on a
+// bench session, not lines the boot needs to decide anything (R80). While a FOLD is open (`fold_open`, around
+// the `kepler::init` call in `arch/x86_64/pci.rs`), a line opening with the fold's prefix does not reach the
+// wire: it is tallied by FAMILY (the sub-tag's first word, lowercased, cut at `-` `/` `_` `[`), its text kept
+// for that family's `last=`, and the whole line stored verbatim. `fold_close` prints at most 18 rollups:
+//
+// `:: KEPLER: fold family=<f> n=<count> last=<the family's last line> ::`  (the 16 loudest families)
+// `:: KEPLER: fold rest=[<f>:<n>,…] ::`                                   (any beyond 16)
+// `:: KEPLER: fold lines=<n> families=<n> kept=<n> dropped=<n> replay=tests keplerlog ::`
+//
+// `tests keplerlog` prints every folded line verbatim, then `:: KEPLERLOG: lines= kept= dropped= -> PASS ::`.
+// A `census` build (`UNAOS_CENSUS=1`, the QEMU lanes) never folds. A contended fold store prints the line as
+// before — the fold can lose a tally, never a line.
+
+const FOLD_FAMS: usize = 32;
+const FOLD_FAM_LEN: usize = 16;
+const FOLD_LAST: usize = 160;
+const FOLD_KEEP: usize = 48 * 1024;
+const FOLD_SHOWN: usize = 16;
+
+static FOLD_ON: AtomicBool = AtomicBool::new(false);
+/// A folded fragment left its line open (a `serial_print!` piece): its continuation folds too.
+static FOLD_MID: AtomicBool = AtomicBool::new(false);
+static FOLD_PREFIX: spin::Mutex<&'static [u8]> = spin::Mutex::new(b"");
+
+struct FoldStore {
+    fam: [[u8; FOLD_FAM_LEN]; FOLD_FAMS],
+    fam_len: [u8; FOLD_FAMS],
+    n: [u32; FOLD_FAMS],
+    last: [[u8; FOLD_LAST]; FOLD_FAMS],
+    last_len: [u8; FOLD_FAMS],
+    fams: usize,
+    other: u32,
+    lines: u32,
+    keep: [u8; FOLD_KEEP],
+    kept_len: usize,
+    kept: u32,
+    dropped: u32,
+}
+
+static FOLD: spin::Mutex<FoldStore> = spin::Mutex::new(FoldStore {
+    fam: [[0; FOLD_FAM_LEN]; FOLD_FAMS],
+    fam_len: [0; FOLD_FAMS],
+    n: [0; FOLD_FAMS],
+    last: [[0; FOLD_LAST]; FOLD_FAMS],
+    last_len: [0; FOLD_FAMS],
+    fams: 0,
+    other: 0,
+    lines: 0,
+    keep: [0; FOLD_KEEP],
+    kept_len: 0,
+    kept: 0,
+    dropped: 0,
+});
+
+/// The family of a folded line's body (the text after the prefix): its first word, lowercased, cut at the
+/// first `-` `/` `_` `[` `=` `(` — `ucode-post` and `ucode` are one family, `WITNESS` and `witness-rematch` one. Pure.
+pub fn fold_family(body: &[u8], out: &mut [u8; FOLD_FAM_LEN]) -> usize {
+    let mut n = 0;
+    for &c in body {
+        if matches!(c, b' ' | b'\n' | b'-' | b'/' | b'_' | b'[' | b'=' | b'(' | b':') || n == FOLD_FAM_LEN { break; }
+        out[n] = c.to_ascii_lowercase();
+        n += 1;
+    }
+    n
+}
+
+/// Open a fold: until [`fold_close`], lines opening with `prefix` are tallied, not printed.
+pub fn fold_open(prefix: &'static [u8]) {
+    if cfg!(feature = "census") { return; }
+    *FOLD_PREFIX.lock() = prefix;
+    FOLD_ON.store(true, core::sync::atomic::Ordering::Release);
+}
+
+fn fold_take(b: &[u8]) -> bool {
+    if !FOLD_ON.load(Relaxed) { return false; }
+    let mid = FOLD_MID.load(Relaxed);
+    let Some(pre) = FOLD_PREFIX.try_lock().map(|p| *p) else { return false };
+    if !mid && !b.starts_with(pre) { return false; }
+    let Some(mut f) = FOLD.try_lock() else { return false };
+    let ends = b.last() == Some(&b'\n');
+    FOLD_MID.store(!ends, Relaxed);
+    // Verbatim, for `tests keplerlog`.
+    if f.kept_len + b.len() <= FOLD_KEEP {
+        let at = f.kept_len;
+        f.keep[at..at + b.len()].copy_from_slice(b);
+        f.kept_len += b.len();
+        if ends { f.kept += 1; }
+    } else if ends {
+        f.dropped += 1;
+    }
+    if mid { return true; } // a continuation: tallied with the fragment that opened it
+    f.lines += 1;
+    let body = &b[pre.len()..];
+    let mut key = [0u8; FOLD_FAM_LEN];
+    let kn = fold_family(body, &mut key);
+    let slot = (0..f.fams).find(|&i| f.fam_len[i] as usize == kn && f.fam[i][..kn] == key[..kn]);
+    let i = match slot {
+        Some(i) => i,
+        None if f.fams < FOLD_FAMS => {
+            let i = f.fams;
+            f.fams += 1;
+            f.fam[i] = key;
+            f.fam_len[i] = kn as u8;
+            i
+        }
+        None => { f.other += 1; return true; }
+    };
+    f.n[i] += 1;
+    let mut text = body;
+    while let Some((&c, rest)) = text.split_last() { if c == b'\n' || c == b' ' || c == b':' { text = rest; } else { break; } }
+    let k = text.len().min(FOLD_LAST);
+    f.last[i][..k].copy_from_slice(&text[..k]);
+    f.last_len[i] = k as u8;
+    true
+}
+
+/// Close the fold and print its rollups (at most 18 lines); registers `tests keplerlog`.
+pub fn fold_close() {
+    if !FOLD_ON.swap(false, core::sync::atomic::Ordering::AcqRel) { return; }
+    FOLD_MID.store(false, Relaxed);
+    let mut order = [0usize; FOLD_FAMS];
+    let (fams, lines, other, kept, dropped) = {
+        let f = FOLD.lock();
+        for (i, o) in order.iter_mut().enumerate() { *o = i; }
+        let fams = f.fams;
+        order[..fams].sort_unstable_by(|a, b| f.n[*b].cmp(&f.n[*a]));
+        for &i in order[..fams.min(FOLD_SHOWN)].iter() {
+            let name = core::str::from_utf8(&f.fam[i][..f.fam_len[i] as usize]).unwrap_or("?");
+            let last = core::str::from_utf8(&f.last[i][..f.last_len[i] as usize]).unwrap_or("?");
+            serial_println!(":: KEPLER: fold family={} n={} last={} ::", name, f.n[i], last);
+        }
+        if fams > FOLD_SHOWN || f.other > 0 {
+            let mut s = alloc::string::String::new();
+            for &i in order[FOLD_SHOWN.min(fams)..fams].iter() {
+                if !s.is_empty() { s.push(','); }
+                s.push_str(core::str::from_utf8(&f.fam[i][..f.fam_len[i] as usize]).unwrap_or("?"));
+                s.push_str(&alloc::format!(":{}", f.n[i]));
+            }
+            if f.other > 0 { if !s.is_empty() { s.push(','); } s.push_str(&alloc::format!("other:{}", f.other)); }
+            serial_println!(":: KEPLER: fold rest=[{}] ::", s);
+        }
+        (fams, f.lines, f.other, f.kept, f.dropped)
+    };
+    let _ = other;
+    serial_println!(":: KEPLER: fold lines={} families={} kept={} dropped={} replay=tests keplerlog ::", lines, fams, kept, dropped);
+    crate::tests::register("keplerlog", keplerlog_replay);
+}
+
+/// `tests keplerlog`: every line the Kepler fold took off the boot, verbatim.
+pub fn keplerlog_replay() {
+    let (lines, kept, dropped) = {
+        let f = FOLD.lock();
+        let (lines, kept, dropped) = (f.lines, f.kept, f.dropped);
+        let text = &f.keep[..f.kept_len];
+        let mut owned = alloc::vec::Vec::with_capacity(text.len());
+        owned.extend_from_slice(text);
+        drop(f);
+        for l in owned.split(|c| *c == b'\n') {
+            if l.is_empty() { continue; }
+            serial_println!("{}", core::str::from_utf8(l).unwrap_or("[keplerlog] utf8?"));
+        }
+        (lines, kept, dropped)
+    };
+    serial_println!(":: KEPLERLOG: lines={} kept={} dropped={} -> PASS ::", lines, kept, dropped);
 }

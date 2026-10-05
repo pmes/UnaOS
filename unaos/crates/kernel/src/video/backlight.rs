@@ -73,6 +73,7 @@ pub fn level() -> u8 {
 pub fn stage(l: u8) -> u8 {
     let lv = clamp(l);
     LEVEL.store(lv, Ordering::Relaxed);
+    HW_RAW.store(raw_for(lv, panel_range()), Ordering::Relaxed); // GLASSLAG M3: what the register WILL hold once the pass writes it
     lv
 }
 
@@ -133,6 +134,7 @@ fn drive(l: u8) -> Applied {
 pub fn set_level_via(l: u8, via: &str) -> Applied {
     let a = drive(l);
     LEVEL.store(a.level, Ordering::Relaxed);
+    HW_RAW.store(a.readback.unwrap_or(a.reg), Ordering::Relaxed); // GLASSLAG M3: the register's value is now known
     let mut rb = [0u8; 12];
     serial_println!(
         "[backlight] level={} reg={} readback={} max={} on={} driver={} via={}",
@@ -195,10 +197,122 @@ pub fn selftest() {
         Err(_) => false,
     };
     crate::video::brightkeys::selftest();
+    step_kat();
     let ok = set0_on && full && mono && load_clamped && reset_ok;
     serial_println!(
         ":: BRIGHTFLOOR: floor={} set0_on={} load_clamped={} reset_ok={} full={} mono={} driver={} -> {} ::",
         FLOOR, set0_on as u8, load_clamped as u8, reset_ok as u8, full as u8, mono as u8,
         if a0.hw { "gmux" } else { "sim" }, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// ── GLASSLAG M3 (rmbp-ledger B370) — THE FIRST STEP MOVES FROM THE PANEL'S OWN LEVEL ─────────────────────────────
+// Flight 22, Peter in Settings: "lowering brightness at first made it more brite". [`LEVEL`] starts at
+// [`DEFAULT_LEVEL`] (12/16) — "the firmware's level is not read back at boot" — and every step was taken from
+// that ASSUMED level: with the firmware panel below 11/16, the first Down wrote 11/16, brighter than the
+// glass. The floor/clamp order made it worse at the bottom: Down at the floor re-wrote the floor even when
+// the panel sat BELOW it. Now:
+//
+// * the first desktop pass reads the register back ([`seed_from_hw`], gmux only — a board without the gmux
+//   keeps the simulated default) and seeds [`LEVEL`] with the highest level whose register value does not
+//   exceed the panel's ([`level_at_or_below`]), so the slider and the keys start where the glass is;
+// * every step is judged against the register's KNOWN value ([`next_level`]): Down must write a strictly
+//   lower value, Up a strictly higher one, or nothing is written (Down at a panel already at or below the
+//   floor stays put — it never brightens).
+//
+// `[backlight] seed readback=<raw> max=<m> level=<l>` once; `tests brightfloor` adds the KAT line
+// `:: BRIGHTSTEP: raws=<n> down_ok=<0|1> up_ok=<0|1> flight22=<0|1> -> PASS|FAIL ::` over every register value.
+
+/// The register's value as last read, written or staged to be written (`u32::MAX` = not known yet).
+static HW_RAW: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The one-shot seed has run.
+static SEEDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The highest lit level whose register value is `<= raw` over a panel range of `max`; [`FLOOR`] when even
+/// the floor is above `raw`. Pure.
+pub const fn level_at_or_below(raw: u32, max: u32) -> u8 {
+    let mut l = STEPS;
+    while l > FLOOR {
+        if raw_for(l, max) <= raw { return l; }
+        l -= 1;
+    }
+    FLOOR
+}
+
+/// One notch from `level` against a register that holds `cur_raw`: `Some(level to write)` only when it moves
+/// the panel the asked way (Down strictly darker, Up strictly brighter); `None` = write nothing. Pure.
+pub const fn next_level(level: u8, cur_raw: u32, max: u32, up: bool) -> Option<u8> {
+    let notch = if up { if level >= STEPS { STEPS } else { level + 1 } } else if level <= FLOOR { FLOOR } else { level - 1 };
+    let cand = clamp(notch);
+    let r = raw_for(cand, max);
+    if up { if r > cur_raw { Some(cand) } else { None } } else if r < cur_raw { Some(cand) } else { None }
+}
+
+/// The register's value as best known: the last readback/write, else the current level's value.
+pub fn cur_raw() -> u32 {
+    let r = HW_RAW.load(Ordering::Relaxed);
+    if r != u32::MAX { return r; }
+    raw_for(level(), panel_range())
+}
+
+/// The panel range as measured, or [`FALLBACK_MAX`] before the first read. No I/O.
+pub fn panel_range() -> u32 {
+    let m = MAX.load(Ordering::Relaxed);
+    if m == 0 { FALLBACK_MAX } else { m }
+}
+
+/// The key path's step: `Some(level)` staged (no I/O — the decoder's context), `None` when the step would
+/// move the panel the wrong way or not at all.
+pub fn stage_step(up: bool) -> Option<u8> {
+    next_level(level(), cur_raw(), panel_range(), up).map(stage)
+}
+
+/// The first desktop pass: read the panel's own level back, once, before anything has been written (gmux
+/// boards only; the port I/O belongs on this pass, never in the key decoder).
+pub fn seed_from_hw() {
+    if SEEDED.swap(true, Ordering::AcqRel) || HW_RAW.load(Ordering::Relaxed) != u32::MAX { return; }
+    #[cfg(all(target_arch = "x86_64", feature = "gmux_igd", feature = "intel-ivb"))]
+    {
+        let (max, hw) = panel_max();
+        if !hw { return; }
+        let Some(rb) = crate::drivers::gpu::igpu::gmux_get_brightness() else {
+            serial_println!("[backlight] seed readback=- max={} level={} (gmux did not answer; steps from the default)", max, level());
+            return;
+        };
+        if HW_RAW.compare_exchange(u32::MAX, rb, Ordering::AcqRel, Ordering::Relaxed).is_err() { return; }
+        let l = level_at_or_below(rb, max);
+        LEVEL.store(l, Ordering::Relaxed);
+        serial_println!("[backlight] seed readback={} max={} level={} (GLASSLAG: the first step moves from the panel's own level)", rb, max, l);
+    }
+}
+
+/// The KAT on the step table: over every register value `0..=max`, seeded at [`level_at_or_below`], Down
+/// writes strictly lower or nothing, Up strictly higher or nothing, and nothing is refused that could move.
+/// Plus flight 22's case: the panel at 6/16, the assumed level 12 — the OLD rule (`step(12)` = 11) brightened.
+fn step_kat() {
+    let max = FALLBACK_MAX;
+    let (mut down_ok, mut up_ok) = (true, true);
+    let mut raw = 0u32;
+    while raw <= max {
+        let l = level_at_or_below(raw, max);
+        match next_level(l, raw, max, false) {
+            Some(n) => down_ok &= raw_for(n, max) < raw,
+            None => down_ok &= raw <= raw_for(FLOOR, max),
+        }
+        match next_level(l, raw, max, true) {
+            Some(n) => up_ok &= raw_for(n, max) > raw,
+            None => up_ok &= raw >= raw_for(STEPS, max),
+        }
+        raw += 1;
+    }
+    let fw = raw_for(6, max);
+    let old_inverted = raw_for(DEFAULT_LEVEL - 1, max) > fw;
+    let new_down = next_level(level_at_or_below(fw, max), fw, max, false).map(|n| raw_for(n, max) < fw) == Some(true);
+    let flight22 = old_inverted && new_down;
+    let ok = down_ok && up_ok && flight22;
+    serial_println!(
+        ":: BRIGHTSTEP: raws={} down_ok={} up_ok={} flight22={} seeded={} -> {} ::",
+        max + 1, down_ok as u8, up_ok as u8, flight22 as u8, (HW_RAW.load(Ordering::Relaxed) != u32::MAX) as u8,
+        if ok { "PASS" } else { "FAIL" }
     );
 }

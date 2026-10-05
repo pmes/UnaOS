@@ -15,94 +15,19 @@
 //!   (Skia's skew of −1/4).
 //! - [`lines`]: the css-text-3 line breaker shared by measurer and painter.
 
-pub mod db;
-pub mod fontconfig;
 pub mod lines;
-pub mod raster;
 pub mod shape;
 pub mod webfont;
 
-use db::{FaceInfo, Slant, Style};
-use font_core::Font;
+// QUARTZFONT (SR64): discovery, the face database, the loaded-face store and the rasterizer moved to the
+// shared `libs/text_host` crate (quartzite's chrome is their second user); re-exported at their old paths.
+pub use text_host::{db, fontconfig, raster};
+pub use text_host::{line_metrics, load_face, load_face_synth, next_face_id, Face, Metrics};
+use text_host::needs_glyph;
+
+use db::{Slant, Style};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-
-/// One loaded face, alive for the process (faces are font-global, not page-scoped).
-pub struct Face {
-    /// Unique per (file, face index, synthesis): the glyph and shaping caches key on it.
-    pub id: u32,
-    pub font: Font<'static>,
-    pub synth_bold: bool,
-    pub synth_oblique: bool,
-    /// The family it was selected as (English name ID 1, or the `@font-face` family).
-    pub family: String,
-    pub style: Style,
-}
-
-impl std::fmt::Debug for Face {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Face#{}({} {:?}{}{})",
-            self.id,
-            self.family,
-            self.style,
-            if self.synth_bold { " +bold" } else { "" },
-            if self.synth_oblique { " +oblique" } else { "" }
-        )
-    }
-}
-
-/// Font-unit metrics of a face, the way Skia reports them on Linux (`SkFontMetrics` from FreeType):
-/// ascent/descent/line gap from `hhea` (OS/2 typo when USE_TYPO_METRICS), x-height and cap-height from
-/// OS/2 (else measured from `x`/`H`), underline from `post`.
-#[derive(Clone, Copy, Debug)]
-pub struct Metrics {
-    pub units_per_em: u32,
-    pub ascent: f32,
-    /// Negative below the baseline.
-    pub descent: f32,
-    pub line_gap: f32,
-    pub x_height: f32,
-    pub cap_height: f32,
-    /// Negative below the baseline.
-    pub underline_position: f32,
-    pub underline_thickness: f32,
-}
-
-impl Face {
-    pub fn metrics(&self) -> Metrics {
-        let f = &self.font;
-        let (a, d, g) = f.line_metrics();
-        let glyph_top =
-            |c: char| -> f32 { f.glyph_path(f.glyph_index(c)).filter(|p| !p.is_empty()).map(|p| p.y_max).unwrap_or(0.0) };
-        let x_height =
-            f.os2.and_then(|o| o.x_height).filter(|&x| x > 0).map(|x| x as f32).unwrap_or_else(|| glyph_top('x'));
-        let cap_height =
-            f.os2.and_then(|o| o.cap_height).filter(|&x| x > 0).map(|x| x as f32).unwrap_or_else(|| glyph_top('H'));
-        let (up, ut) = f.post.map(|p| (p.underline_position as f32, p.underline_thickness as f32)).unwrap_or((0.0, 0.0));
-        Metrics {
-            units_per_em: f.units_per_em.max(1) as u32,
-            ascent: a as f32,
-            descent: d as f32,
-            line_gap: g as f32,
-            x_height,
-            cap_height,
-            underline_position: up,
-            underline_thickness: ut,
-        }
-    }
-    /// The glyph for `c` (None for .notdef).
-    pub fn glyph_for_char(&self, c: char) -> Option<u16> {
-        let g = self.font.glyph_index(c);
-        (g != 0).then_some(g)
-    }
-    /// Advance of glyph `g` in em.
-    pub fn advance_em(&self, g: u16) -> f32 {
-        self.font.advance(g) as f32 / self.font.units_per_em.max(1) as f32
-    }
-}
 
 /// What a text run asks for. `family` is a family-LIST id ([`family_list`]); the first four are fixed:
 /// [`SANS`], [`SERIF`], [`MONO`] (each exactly that one generic) and [`STANDARD`] (the initial value,
@@ -332,61 +257,7 @@ pub fn family_list(id: u16) -> Vec<Family> {
     r.lists.get(id as usize).cloned().unwrap_or_else(|| r.lists[0].clone())
 }
 
-/// The bytes of a font file, read once and kept for the process.
-fn file_bytes(path: &std::path::Path) -> Option<&'static [u8]> {
-    static FILES: OnceLock<Mutex<HashMap<PathBuf, Option<&'static [u8]>>>> = OnceLock::new();
-    let m = FILES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(b) = m.lock().ok()?.get(path) {
-        return *b;
-    }
-    let b = std::fs::read(path).ok().map(|v| &*Box::leak(v.into_boxed_slice()));
-    m.lock().ok()?.insert(path.to_path_buf(), b);
-    b
-}
-
 type FaceKey = (usize, bool, bool);
-
-type LoadedMap = HashMap<(PathBuf, u32, bool, bool), &'static Face>;
-
-fn faces_loaded() -> &'static Mutex<LoadedMap> {
-    static F: OnceLock<Mutex<LoadedMap>> = OnceLock::new();
-    F.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// True for a face loaded from the host's font directories (not `@font-face`): Chromium applies fontconfig's
-/// `hintslight` to those (FONTHINT SR62), and draws web fonts unhinted.
-pub(crate) fn is_installed(face: &Face) -> bool {
-    faces_loaded().lock().map(|m| m.values().any(|f| f.id == face.id)).unwrap_or(false)
-}
-
-pub(crate) fn next_face_id() -> u32 {
-    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Loads a discovered face (no synthesis).
-pub fn load_face(info: &FaceInfo) -> Option<&'static Face> {
-    load_face_synth(info, false, false)
-}
-
-pub fn load_face_synth(info: &FaceInfo, bold: bool, oblique: bool) -> Option<&'static Face> {
-    let key = (info.path.clone(), info.index, bold, oblique);
-    if let Some(f) = faces_loaded().lock().ok()?.get(&key) {
-        return Some(*f);
-    }
-    let bytes = file_bytes(&info.path)?;
-    let font = Font::parse_face(bytes, info.index).ok()?;
-    let face: &'static Face = Box::leak(Box::new(Face {
-        id: next_face_id(),
-        font,
-        synth_bold: bold,
-        synth_oblique: oblique,
-        family: info.families.first().cloned().unwrap_or_default(),
-        style: info.style,
-    }));
-    faces_loaded().lock().ok()?.insert(key, face);
-    Some(face)
-}
 
 fn db_face(k: FaceKey) -> Option<&'static Face> {
     let d = db::db();
@@ -528,11 +399,6 @@ fn fallback_variant(face: &'static Face) -> &'static Face {
     })
 }
 
-/// Whether a character needs a glyph at all (controls, default-ignorables and spaces are drawn by none).
-fn needs_glyph(c: char) -> bool {
-    !(c.is_control() || c.is_whitespace() || font_core::ucd::is_default_ignorable(c))
-}
-
 /// The face list `text` is shaped over: the selection's stack, then (in fallback order) a platform face for
 /// each character no face of the stack has.
 pub fn run_faces(sel: &FontSel, text: &str) -> Vec<&'static Face> {
@@ -550,15 +416,6 @@ pub fn run_faces(sel: &FontSel, text: &str) -> Vec<&'static Face> {
         }
     }
     faces
-}
-
-/// Pixel line metrics of `font` at `size`: (ascent, descent, line gap), each rounded to whole pixels the
-/// way Blink's SimpleFontData rounds them — so `line-height: normal` is ascent + descent + gap in integers
-/// (Arial/Liberation Sans 16px: 14 + 3 + 1 = 18, not 18.4).
-pub fn line_metrics(font: &Face, size: f32) -> (f32, f32, f32) {
-    let m = font.metrics();
-    let scale = size / m.units_per_em as f32;
-    ((m.ascent * scale).round(), (-m.descent * scale).round(), (m.line_gap * scale).round())
 }
 
 /// The used line height: `mult` x size, `-mult` px when negative (a length), or (0 = `normal`) the rounded

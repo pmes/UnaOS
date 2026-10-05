@@ -607,7 +607,7 @@ fn coded_report() {
 /// `tests play [fmt]` (and `tests playflac` … through `crate::tests::arg()`): play `TEST.<EXT>` from the user's home,
 /// /home or / for each format; a format with no such file SKIPs. The completion is the ring's drain, as in `tests playwav`.
 pub fn selftest_codecs() {
-    const FMTS: [(&str, &str); 7] = [("flac", "FLAC"), ("opus", "OPUS"), ("vorbis", "OGG"), ("mp3", "MP3"), ("aac", "AAC"), ("m4a", "M4A"), ("aiff", "AIF")];
+    const FMTS: [(&str, &str); 8] = [("wav", "WAV"), ("flac", "FLAC"), ("opus", "OPUS"), ("vorbis", "OGG"), ("mp3", "MP3"), ("aac", "AAC"), ("m4a", "M4A"), ("aiff", "AIF")];
     let want = crate::tests::arg();
     let mt = crate::shell::vfs_mount_table();
     for (fmt, ext) in FMTS {
@@ -621,9 +621,10 @@ pub fn selftest_codecs() {
             }
         }
         cands.push(alloc::format!("/home/TEST.{}", ext));
+        if let Some(p) = crate::fs::volumes::testf_find(&mt, &alloc::format!("TEST.{}", ext)) { cands.push(p); } // VOLUMES (B366) M3: system/test-f after /home
         cands.push(alloc::format!("/TEST.{}", ext));
         let Some(path) = cands.into_iter().find(|c| mt.stat(c).is_ok()) else {
-            serial_println!(":: PLAYCODEC: fmt={} path=- reason=no-file (put TEST.{} in /home or /) -> SKIP ::", fmt, ext);
+            serial_println!(":: PLAYCODEC: fmt={} path=- reason=no-file (put TEST.{} in /home, /system/test-f or /) -> SKIP ::", fmt, ext);
             continue;
         };
         match open_wav(&path) {

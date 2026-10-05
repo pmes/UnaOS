@@ -138,7 +138,7 @@ const fn chrome_raster(bar_h: usize) -> RasterHeight {
 }
 
 /// The chrome atlas's raster, resolved once from the theme's own bar height.
-const CHROME_SIZE: RasterHeight = chrome_raster(super::theme::TITLE_HEIGHT);
+const CHROME_SIZE: RasterHeight = chrome_raster(crate::ui::base::TITLE_HEIGHT);
 
 /// Glyph advance in pixels — the mono font's own, not a cell guess. 7 at `Size16`.
 pub const CELL_W: usize = get_raster_width(FontWeight::Regular, SIZE);
@@ -233,7 +233,7 @@ const _: () = {
     // The derivation's own contract: the chrome cell must fit the band it was derived from, and it
     // must not be SMALLER than the body face — that would mean the ladder had no rung for this bar
     // and the chrome silently fell back to terminal metrics, the exact defect PA43 reported.
-    assert!(CHROME_CELL_H <= super::theme::TITLE_HEIGHT);
+    assert!(CHROME_CELL_H <= crate::ui::base::TITLE_HEIGHT);
     assert!(CHROME_CELL_H >= CELL_H && CHROME_CELL_W >= CELL_W);
 };
 

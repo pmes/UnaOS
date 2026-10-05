@@ -1961,7 +1961,7 @@ pub fn armed() -> bool {
 /// Block magnification, derived from the panel — THE METRICS RULE. The arrow is 8 blocks square (one
 /// glyph cell, `cell_w` × `cell_h`); the shadow adds one more block in each direction.
 fn block_scale(fb: &FrameBuffer) -> usize {
-    crate::ui::Metrics::for_height(fb.info().height).scale
+    crate::ui::Metrics::panel().scale
 }
 
 /// The colour the sprite paints at box-relative `(col, row)`, or `None` where it paints nothing.

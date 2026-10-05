@@ -986,6 +986,7 @@ pub fn handle(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, nr: u64, a: [u
         25 => super::remap::mremap(p, a[0], a[1], a[2], a[3], a[4]), // SELFBUILD5: grow in place / move the VMA's leaves
         131 => super::remap::sigaltstack(p, info, ktop, a[0], a[1]), // SELFBUILD5: per thread, honoured at delivery
         309 => super::remap::getcpu(p, a[0], a[1]), // SELFBUILD5
+        7504..=7507 => super::ldso::gate(p, info, nr, a), // SELFBUILD6: the loader trampoline's dlopen/dlsym/dlclose/dladdr gates
         _ => match super::sys2::handle(p, info, nr, a) {
             Some(r) => r,
             None => {

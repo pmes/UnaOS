@@ -3,8 +3,11 @@
 
 //! LINUXABI M1 — static Linux x86_64 ELF: parse, map at the FIXED vaddrs, build the System V stack.
 //!
-//! Accepts `ET_EXEC` / `EM_X86_64` with no `PT_INTERP` only (static, non-PIE — what musl-static busybox and
-//! a static toolchain are). Everything read from the image is bounds-checked; W+X segments are refused.
+//! Accepts `ET_EXEC` / `EM_X86_64` with no `PT_INTERP` (static, non-PIE — what musl-static busybox and a static
+//! toolchain are) and, since WINDOW2 (B361), `ET_DYN` with no `PT_INTERP` = a STATIC-PIE (LLD.LNX, R85 "relinked
+//! as PIE"): it is placed at [`PIE_BASE`] in the process's private PML4[2] half and relocates ITSELF (glibc's
+//! `_dl_relocate_static_pie`, musl's `_dlstart`) — the kernel applies no relocation. Everything read from the
+//! image is bounds-checked; W+X segments are refused.
 
 use super::{AddrSpace, PAGE, STACK_PAGES, STACK_TOP};
 use alloc::collections::BTreeMap;
@@ -13,10 +16,31 @@ use alloc::vec::Vec;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 const MAX_SEGS: usize = 16;
-/// The image must fit below the kernel heap (which starts at >= 16 MiB): the process's view of low
-/// memory REPLACES the kernel's identity mapping under its CR3, so these pages must be free RAM.
-const IMAGE_LIMIT: u64 = 0x0100_0000;
+/// The fixed-address (ET_EXEC) window: the process's view of low memory REPLACES the kernel's identity
+/// mapping under its CR3, so these pages must be free RAM that the kernel never touches through the identity
+/// map while the process runs. WINDOW2 (B361): raised 16 MiB -> the ring-3 window span (64 MiB); the load
+/// checks the range is Usable RAM AND outside the kernel heap ([`low_window_ok`]), and the user frame pool
+/// (`vm.rs`) starts at this limit instead of 16 MiB.
+pub const IMAGE_LIMIT: u64 = una_abi::USER_WINDOW_BYTES;
 const IMAGE_FLOOR: u64 = 0x1_0000;
+/// WINDOW2: where a static-PIE is placed — the top 4 GiB of the process's private PML4[2] half, above the
+/// second mmap window (`vm::MMAP2_LIMIT`) and never inherited from the kernel, so no RAM check applies.
+pub const PIE_BASE: u64 = 0x0000_017F_0000_0000;
+/// WINDOW2: the largest static-PIE span (PT_LOAD lowest page .. highest end).
+pub const PIE_SPAN: u64 = 1 << 30;
+const _: () = assert!(PIE_BASE >= super::vm::MMAP2_LIMIT && PIE_BASE + PIE_SPAN <= 0x0000_0180_0000_0000);
+
+/// WINDOW2: may a fixed-address image occupy `[lo, lo+len)` of the low window? Usable RAM per the firmware map
+/// and clear of the kernel heap (a heap below 64 MiB — a small-RAM machine — refuses instead of overlaying it).
+pub fn low_window_ok(lo: u64, len: u64) -> bool {
+    let (hs, hl) = super::memory::selfbuild3_heap_window();
+    let hi = lo.saturating_add(len);
+    super::memory::region_is_usable(lo, len) && (hl == 0 || hi <= hs || lo >= hs + hl as u64)
+}
+/// WINDOW2: is this plan a static-PIE placed at [`PIE_BASE`] (its pages are not low-window RAM)?
+pub fn is_pie(plan: &Plan) -> bool {
+    plan.pie
+}
 
 #[derive(Clone, Copy)]
 pub struct Seg {
@@ -33,6 +57,8 @@ pub struct Plan {
     pub phdr_va: u64,
     pub phnum: u64,
     pub phent: u64,
+    /// WINDOW2: a static-PIE (ET_DYN) — every vaddr above is already biased to [`PIE_BASE`].
+    pub pie: bool,
 }
 
 fn u16_at(b: &[u8], o: usize) -> Option<u64> {
@@ -58,9 +84,11 @@ pub fn parse_sized(b: &[u8], flen: u64) -> Result<Plan, &'static str> {
     if b[4] != 2 || b[5] != 1 {
         return Err("not ELF64 little-endian");
     }
-    if u16_at(b, 16) != Some(2) {
-        return Err("not ET_EXEC (static-PIE / shared objects are not supported)");
-    }
+    let pie = match u16_at(b, 16) {
+        Some(2) => false,
+        Some(3) => true, // WINDOW2: ET_DYN without PT_INTERP = static-PIE (a shared object has no entry in an X segment: refused below)
+        _ => return Err("not ET_EXEC or a static-PIE ET_DYN"),
+    };
     if u16_at(b, 18) != Some(62) {
         return Err("not EM_X86_64");
     }
@@ -98,8 +126,11 @@ pub fn parse_sized(b: &[u8], flen: u64) -> Result<Plan, &'static str> {
             return Err("segment file range outside the image");
         }
         let end = vaddr.checked_add(memsz).ok_or("segment vaddr overflow")?;
-        if vaddr < IMAGE_FLOOR || end > IMAGE_LIMIT {
-            return Err("segment outside the loadable window (0x10000..16 MiB)");
+        if !pie && (vaddr < IMAGE_FLOOR || end > IMAGE_LIMIT) {
+            return Err("segment outside the loadable window (0x10000..64 MiB)");
+        }
+        if pie && end > PIE_SPAN {
+            return Err("static-PIE segment past the PIE span (1 GiB)");
         }
         if flags & 2 != 0 && flags & 1 != 0 {
             return Err("W+X segment refused (W^X)");
@@ -110,9 +141,24 @@ pub fn parse_sized(b: &[u8], flen: u64) -> Result<Plan, &'static str> {
     if segs.is_empty() {
         return Err("no PT_LOAD segments");
     }
-    if total > (64 << 20) {
+    if total > if pie { PIE_SPAN } else { IMAGE_LIMIT } {
         return Err("image too large");
     }
+    if pie {
+        // WINDOW2: place it. Link-time vaddrs start at 0 (or the lowest PT_LOAD page); bias every address the
+        // loader, the stack builder (AT_PHDR, AT_ENTRY) and the lazy exec use, so downstream sees absolute VAs.
+        let lo = segs.iter().map(|s| s.vaddr & !0xFFF).min().unwrap_or(0);
+        let bias = PIE_BASE - lo;
+        for s in segs.iter_mut() {
+            s.vaddr += bias;
+        }
+        let entry = entry.checked_add(bias).ok_or("bad e_entry")?;
+        return finish(entry, segs, phoff, phnum, phent, true);
+    }
+    finish(entry, segs, phoff, phnum, phent, false)
+}
+
+fn finish(entry: u64, segs: Vec<Seg>, phoff: u64, phnum: u64, phent: u64, pie: bool) -> Result<Plan, &'static str> {
     if !segs.iter().any(|s| entry >= s.vaddr && entry < s.vaddr + s.memsz && s.flags & 1 != 0) {
         return Err("entry point not in an executable segment");
     }
@@ -124,7 +170,7 @@ pub fn parse_sized(b: &[u8], flen: u64) -> Result<Plan, &'static str> {
             break;
         }
     }
-    Ok(Plan { entry, segs, phdr_va, phnum, phent })
+    Ok(Plan { entry, segs, phdr_va, phnum, phent, pie })
 }
 
 /// Map every segment (page permissions = union of the segments that share the page) and copy the file
@@ -143,8 +189,8 @@ pub fn load(asp: &mut AddrSpace, img: &[u8], plan: &Plan) -> Result<(), &'static
         }
     }
     let (lo, hi) = (*pages.keys().next().unwrap(), *pages.keys().next_back().unwrap() + PAGE);
-    if !super::memory::region_is_usable(lo, hi - lo) {
-        return Err("load range is not free RAM on this machine (would overlay the kernel)");
+    if !plan.pie && !low_window_ok(lo, hi - lo) {
+        return Err("load range is not free RAM on this machine (would overlay the kernel or its heap)");
     }
     for (&va, &(w, x)) in &pages {
         if w && x {

@@ -44,6 +44,10 @@
 //!   holding (14 px with DejaVu Sans Bold on the 9x20 cell).
 //! * `Ui` — running text that is not a grid (the login form, Settings labels): the `system.display.font`
 //!   family at `system.display.font_size` CSS px x the panel's ppi / 96 (EDID), capped by the body cell.
+//! * `Grid` (KERNELFONT2, B363) — the CONSOLE's character cell: the body cell x `video::dpi`'s half-pixel scale
+//!   (7x16 -> 18x40 at 2.5 on the 220/227-ppi rMBP panels), DejaVu Sans Mono at `system.display.font_size` CSS px
+//!   x ppi / 96 capped by that cell — the face `font_size` takes effect on. Before the faces load the bitmap atlas
+//!   is drawn at the scale's integer part, centred in the same cell, so the grid never changes under the console.
 
 use super::font;
 use super::framebuffer::FrameBuffer;
@@ -60,6 +64,8 @@ pub enum Face {
     Body,
     Chrome,
     Ui,
+    /// KERNELFONT2: the console's dpi-scaled cell (see the module doc).
+    Grid,
 }
 
 impl Face {
@@ -73,13 +79,23 @@ impl Face {
     }
     /// The layout cell's advance (the grid a caller places on; a proportional face measures with [`advance`]).
     #[inline(always)]
-    pub const fn cell_w(self) -> usize {
-        self.bitmap().cell_w()
+    pub fn cell_w(self) -> usize {
+        match self {
+            Face::Grid => grid_cell().0,
+            Face::Chrome => chrome_cell().0, // UIMETRICS (B372): the chrome cell x the dpi scale
+            Face::Ui => grid_cell().0, // UIMETRICS (B372): the native windows' text cell — the body cell x the dpi scale
+            _ => self.bitmap().cell_w(),
+        }
     }
     /// The layout cell's height.
     #[inline(always)]
-    pub const fn cell_h(self) -> usize {
-        self.bitmap().cell_h()
+    pub fn cell_h(self) -> usize {
+        match self {
+            Face::Grid => grid_cell().1,
+            Face::Chrome => chrome_cell().1,
+            Face::Ui => grid_cell().1,
+            _ => self.bitmap().cell_h(),
+        }
     }
     /// The face's family name for witnesses (`dejavu-sans` …) when a face is loaded, else the bitmap atlas's.
     pub fn name(self) -> &'static str {
@@ -94,6 +110,7 @@ impl Face {
             Face::Body => 0,
             Face::Chrome => 1,
             Face::Ui => 2,
+            Face::Grid => 3,
         }
     }
 }
@@ -132,6 +149,36 @@ pub fn draw_text(px: &mut [u32], stride: usize, clip_w: usize, clip_h: usize, x:
     if let Some(p) = tt::draw_text(px, stride, clip_w, clip_h, x, y, s, ink, bold, face.index()) {
         return p;
     }
+    if let Some((k, ox, oy)) = blowup(face) {
+        // UIMETRICS: no face yet and a scaled cell — the atlas glyph at the scale's integer part, centred in the cell.
+        let (cw, ch) = (face.cell_w(), face.cell_h());
+        if y + ch > clip_h {
+            return x;
+        }
+        let mut cx = x;
+        for &b in s {
+            if cx + cw > clip_w {
+                break;
+            }
+            for (ry, row) in font::glyph(b, bold, face.bitmap()).iter().enumerate() {
+                for (rx, &a) in row.iter().enumerate() {
+                    if a == 0 {
+                        continue;
+                    }
+                    for dy in 0..k {
+                        let i = (y + oy + ry * k + dy) * stride + cx + ox + rx * k;
+                        for dx in 0..k {
+                            if let Some(p) = px.get_mut(i + dx) {
+                                *p = font::blend(*p, ink, a);
+                            }
+                        }
+                    }
+                }
+            }
+            cx += cw;
+        }
+        return cx;
+    }
     font::draw_text(px, stride, clip_w, clip_h, x, y, s, ink, bold, face.bitmap())
 }
 
@@ -144,6 +191,30 @@ pub fn draw_row(out: &mut [u32], w: usize, s: &[u8], x0: usize, sy: usize, ink: 
     if tt::draw_row(out, w, s, x0, sy, ink, bold, face.index()) {
         return;
     }
+    if let Some((k, ox, oy)) = blowup(face) {
+        // UIMETRICS: the scaled cell's row `sy` is atlas row `(sy - oy) / k`, each atlas pixel k wide.
+        if sy < oy || (sy - oy) / k >= face.bitmap().cell_h() {
+            return;
+        }
+        let (ry, cw) = ((sy - oy) / k, face.cell_w());
+        for (n, &b) in s.iter().enumerate() {
+            let cx = x0 + n * cw + ox;
+            if let Some(row) = font::glyph(b, bold, face.bitmap()).get(ry) {
+                for (rx, &a) in row.iter().enumerate() {
+                    if a == 0 {
+                        continue;
+                    }
+                    for dx in 0..k {
+                        let i = cx + rx * k + dx;
+                        if i < w && i < out.len() {
+                            out[i] = font::blend(out[i], ink, a);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
     font::draw_row(out, w, s, x0, sy, ink, bold, face.bitmap())
 }
 
@@ -154,6 +225,23 @@ pub fn draw_row(out: &mut [u32], w: usize, s: &[u8], x0: usize, sy: usize, ink: 
 pub fn draw_glyph_fb(fb: &FrameBuffer, ch: u8, cx: usize, cy: usize, ink: u32, bg: u32, bold: bool, face: Face) {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     if tt::draw_cell(ch, cx, cy, ink, bold, face.index(), &mut |x, y, a| fb.put_pixel(x, y, font::blend(bg, ink, a))) {
+        return;
+    }
+    if let Some((k, ox, oy)) = blowup(face) {
+        // KERNELFONT2 / UIMETRICS: no face yet — the atlas glyph at the scale's integer part, centred in the scaled cell.
+        let (ox, oy) = (cx + ox, cy + oy);
+        for (ry, row) in font::glyph(ch, bold, face.bitmap()).iter().enumerate() {
+            for (rx, &a) in row.iter().enumerate() {
+                if a != 0 {
+                    let c = font::blend(bg, ink, a);
+                    for dy in 0..k {
+                        for dx in 0..k {
+                            fb.put_pixel(ox + rx * k + dx, oy + ry * k + dy, c);
+                        }
+                    }
+                }
+            }
+        }
         return;
     }
     font::draw_glyph_fb(fb, ch, cx, cy, ink, bg, bold, face.bitmap())
@@ -170,6 +258,7 @@ pub fn draw_with(s: &[u8], bold: bool, face: Face, x: usize, y: isize, max_w: us
         return p;
     }
     let (bf, cw) = (face.bitmap(), face.cell_w());
+    let (k, ox, oy) = blowup(face).unwrap_or((1, 0, 0)); // UIMETRICS: the atlas glyph blown up inside a scaled cell
     let mut cx = x;
     for &b in s {
         if cx + cw > x + max_w {
@@ -178,13 +267,37 @@ pub fn draw_with(s: &[u8], bold: bool, face: Face, x: usize, y: isize, max_w: us
         for (ry, row) in font::glyph(b, bold, bf).iter().enumerate() {
             for (rx, &a) in row.iter().enumerate() {
                 if a != 0 {
-                    put((cx + rx) as isize, y + ry as isize, a);
+                    for dy in 0..k {
+                        for dx in 0..k {
+                            put((cx + ox + rx * k + dx) as isize, y + (oy + ry * k + dy) as isize, a);
+                        }
+                    }
                 }
             }
         }
         cx += cw;
     }
     cx
+}
+
+/// UIMETRICS (B372): the chrome cell (captions, the bar, the crystal menu, dock labels) — the chrome atlas cell x
+/// `video::dpi`'s scale, each side rounded up (9x20 -> 23x50 at 2.5). `wm::TITLE_CELL_W/H` are this.
+pub fn chrome_cell() -> (usize, usize) {
+    let s2 = crate::video::dpi::s2();
+    (crate::video::dpi::px_at(font::CHROME_CELL_W, s2), crate::video::dpi::px_at(font::CHROME_CELL_H, s2))
+}
+
+/// UIMETRICS: how the BITMAP fallback draws `face` inside its scaled cell — `(k, ox, oy)`: the atlas glyph
+/// magnified by the scale's integer part `k`, offset to the cell's centre. `None` when the face's cell IS the
+/// atlas cell (scale 1.0, or a face that does not scale): draw the atlas as it is.
+fn blowup(face: Face) -> Option<(usize, usize, usize)> {
+    let bf = face.bitmap();
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    if (cw, ch) == (bf.cell_w(), bf.cell_h()) {
+        return None;
+    }
+    let k = (crate::video::dpi::s2() as usize / 2).max(1);
+    Some((k, cw.saturating_sub(bf.cell_w() * k) / 2, ch.saturating_sub(bf.cell_h() * k) / 2))
 }
 
 /// The width `s` takes in `face`, in whole px (the shaped advance when a face is loaded, else
@@ -208,6 +321,47 @@ pub fn fit(s: &[u8], bold: bool, face: Face, max_w: usize) -> usize {
         n -= 1;
     }
     n
+}
+
+/// KERNELFONT2 M4: bumped when the faces load and on every restyle (`system.display.font` / `font_size`); the
+/// desktop service pass (`quarry::live::service`) compares it with what it last saw and has every kernel window that
+/// caches its own pixels repaint once ([`epoch`]).
+static EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The face epoch (0 = no face has loaded yet).
+pub fn epoch() -> u32 {
+    EPOCH.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// KERNELFONT2: the console's cell — the body cell x `video::dpi`'s scale, each side rounded up to the pixel;
+/// UIMETRICS (B372): and x `font_size / 13` when `system.display.font_size` is not the default, so the console
+/// REGRIDS on a restyle (the face then fills the cell it is sized for instead of being capped by the 13-px one).
+pub fn grid_cell() -> (usize, usize) {
+    grid_cell_at(crate::video::dpi::scale_x2())
+}
+
+/// The CSS px the grid cell is sized for (0 = the default 13), written by the restyle under the engine's lock.
+static GRID_CSS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// KERNELFONT2's default `font_size` — the size the 18x40 (at 2.5) cell was built for.
+pub const GRID_BASE_CSS: u32 = 13;
+
+fn grid_cell_at(s2: u32) -> (usize, usize) {
+    let fs = match GRID_CSS.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => GRID_BASE_CSS,
+        f => f,
+    } as usize;
+    if fs == GRID_BASE_CSS as usize {
+        return (crate::video::dpi::px_at(font::CELL_W, s2), crate::video::dpi::px_at(font::CELL_H, s2));
+    }
+    let k = 2 * GRID_BASE_CSS as usize;
+    ((font::CELL_W * s2 as usize * fs).div_ceil(k).max(1), (font::CELL_H * s2 as usize * fs).div_ceil(k).max(1))
+}
+
+/// KERNELFONT2: arm the console's grid on a framebuffer `fb_w` px wide — latches `video::dpi`'s scale (first call
+/// wins), returns [`grid_cell`]. Called by `fbcon` where the console takes the face.
+pub fn arm_grid(fb_w: usize) -> (usize, usize) {
+    let s2 = crate::video::dpi::latch(fb_w);
+    grid_cell_at(s2)
 }
 
 /// The engine half, compiled only where a desktop exists (no other image links `font_core`).
@@ -248,8 +402,8 @@ mod tt {
     pub struct Tt {
         pub eng: Engine<'static>,
         /// Per [`super::Face`] index: style and the baseline row inside the face's cell.
-        pub styles: [(Style, f32); 3],
-        pub names: [&'static str; 3],
+        pub styles: [(Style, f32); 4],
+        pub names: [&'static str; 4],
         pub family: Role,
         pub css_px: i64,
         pub ppi: u32,
@@ -300,6 +454,15 @@ mod tt {
         })
     }
 
+    /// The layout cell of face index `face` (KERNELFONT2: index 3 is the console's dpi-scaled grid).
+    fn cell(face: usize) -> (usize, usize) {
+        match face {
+            1 => super::chrome_cell(), // UIMETRICS (B372)
+            2 | 3 => super::grid_cell(), // UIMETRICS: Ui lays out on the dpi-scaled cell (the native windows)
+            _ => (font::CELL_W, font::CELL_H),
+        }
+    }
+
     fn style(t: &Tt, face: usize, bold: bool) -> (Style, f32) {
         let (mut st, bl) = t.styles[face];
         st.bold = bold;
@@ -309,7 +472,7 @@ mod tt {
     #[allow(clippy::too_many_arguments)]
     pub fn draw_text(px: &mut [u32], stride: usize, clip_w: usize, clip_h: usize, x: usize, y: usize, s: &[u8], ink: u32, bold: bool, face: usize) -> Option<usize> {
         with(|t| {
-            let cell_h = [font::CELL_H, font::CHROME_CELL_H, font::CELL_H][face];
+            let cell_h = cell(face).1;
             if y + cell_h > clip_h {
                 return x;
             }
@@ -322,7 +485,7 @@ mod tt {
     #[allow(clippy::too_many_arguments)]
     pub fn draw_row(out: &mut [u32], w: usize, s: &[u8], x0: usize, sy: usize, ink: u32, bold: bool, face: usize) -> bool {
         with(|t| {
-            let cell_h = [font::CELL_H, font::CHROME_CELL_H, font::CELL_H][face];
+            let cell_h = cell(face).1;
             if sy >= cell_h {
                 return;
             }
@@ -339,7 +502,7 @@ mod tt {
 
     pub fn draw_cell(ch: u8, cx: usize, cy: usize, ink: u32, bold: bool, face: usize, put: &mut dyn FnMut(usize, usize, u8)) -> bool {
         with(|t| {
-            let (cw, chh) = [(font::CELL_W, font::CELL_H), (font::CHROME_CELL_W, font::CHROME_CELL_H), (font::CELL_W, font::CELL_H)][face];
+            let (cw, chh) = cell(face);
             let (st, bl) = style(t, face, bold);
             let c = if (0x20..0x7f).contains(&ch) { ch as char } else { ' ' };
             let (x0, y0) = (cx as i32, cy as i32);
@@ -397,20 +560,29 @@ mod tt {
         let fam = if eng.has(t.family) { t.family } else { Role::Sans };
         let mono = if eng.has(Role::Mono) { Role::Mono } else { Role::Sans };
         let body = eng.fit_size(mono, Some(font::CELL_W as f32), font::CELL_H as f32).unwrap_or(11.0);
-        let chrome = eng.fit_size_mean(fam, true, font::CHROME_CELL_W as f32, font::CHROME_CELL_H as f32).unwrap_or(14.0);
-        let ui_fit = eng.fit_size(fam, None, font::CELL_H as f32).unwrap_or(12.0);
+        let (ccw, cch) = super::chrome_cell(); // UIMETRICS (B372): the chrome face fits the dpi-scaled chrome cell
+        let chrome = eng.fit_size_mean(fam, true, ccw as f32, cch as f32).unwrap_or(14.0);
+        // KERNELFONT2: the console grid — mono at font_size x ppi / 96, capped by the dpi-scaled cell; UIMETRICS: the
+        // cell itself follows font_size (the console regrids, `fbcon::regrid`, after this restyle lands).
+        super::GRID_CSS.store(t.css_px.clamp(1, 64) as u32, Ordering::Relaxed);
+        let (gw, gh) = super::grid_cell();
+        // UIMETRICS (B372): the UI face (the native kernel windows) is font_size x ppi / 96 capped by the dpi-scaled
+        // cell's height — 40 px at 2.5, so the default 13 CSS px draws its 29.9 px (KERNELFONT's 13.5-px cap is gone).
+        let ui_fit = eng.fit_size(fam, None, gh as f32).unwrap_or(12.0);
         let ui = device_px(t.css_px as f32, t.ppi).min(ui_fit).max(6.0);
+        let grid_fit = eng.fit_size(mono, Some(gw as f32), gh as f32).unwrap_or(body);
+        let grid = device_px(t.css_px as f32, t.ppi).min(grid_fit).max(6.0);
         let mk = |role: Role, size: f32, cell: usize| (Style { role, bold: false, size }, eng.baseline_in_cell(role, size, cell as f32));
-        t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, font::CHROME_CELL_H), mk(fam, ui, font::CELL_H)];
+        t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, cch), mk(fam, ui, gh), mk(mono, grid, gh)];
         let nm = |r: Role| match r {
             Role::Mono => "dejavu-mono",
             Role::Serif => "dejavu-serif",
             _ => "dejavu-sans",
         };
-        t.names = [nm(mono), nm(fam), nm(fam)];
+        t.names = [nm(mono), nm(fam), nm(fam), nm(mono)];
     }
 
-    fn read_face(mt: &crate::fs::vfs::MountTable, p: &str) -> Result<Vec<u8>, &'static str> {
+    pub fn read_face(mt: &crate::fs::vfs::MountTable, p: &str) -> Result<Vec<u8>, &'static str> {
         let st = mt.stat(p).map_err(|_| "absent")?;
         let n = st.size as usize;
         if n == 0 || n > FACE_MAX {
@@ -491,21 +663,30 @@ mod tt {
             serial_println!("[kfont] load faces={}/{} fallback=bitmap reason=no-sans missing={}", eng.face_count(), FACES.len(), missing);
             return;
         }
-        let ppi = panel_ppi();
+        let ppi = match crate::video::dpi::ppi() {
+            0 => panel_ppi(),
+            p => p, // KERNELFONT2: the framebuffer's effective ppi (EDID native x fb width / native width)
+        };
         let family = family_of(crate::prefs::text(FONT_KEY));
         let css_px = crate::prefs::int(FONT_SIZE_KEY, 9, 32).unwrap_or(DEFAULT_CSS_PX);
         let n = eng.face_count();
-        let mut t = Tt { eng, styles: [(Style { role: Role::Sans, bold: false, size: 12.0 }, 12.0); 3], names: ["", "", ""], family, css_px, ppi, font_bytes: bytes, missing, scripts_missing };
+        let mut t = Tt { eng, styles: [(Style { role: Role::Sans, bold: false, size: 12.0 }, 12.0); 4], names: ["", "", "", ""], family, css_px, ppi, font_bytes: bytes, missing, scripts_missing };
         restyle(&mut t);
         let fallback = if t.missing.is_empty() { String::from("none") } else { t.missing.clone() };
+        let s2 = crate::video::dpi::scale_x2();
+        let (gw, gh) = super::grid_cell();
+        let (pw, ph) = crate::video::panel_info_nonblocking().map_or((0, 0), |i| (i.width, i.height));
         serial_println!(
-            "[kfont] load dir={} faces={}/{} fallback={} scripts_missing={} font_kib={} cache_kib={} ppi={} font={} font_size={} body={}-{:.2} chrome={}-{:.2} ui={}-{:.2} ms={}",
+            "[kfont] load dir={} faces={}/{} fallback={} scripts_missing={} font_kib={} cache_kib={} ppi={} scale={} cell={}x{} grid={}x{} panel={}x{} font={} font_size={} body={}-{:.2} chrome={}-{:.2} ui={}-{:.2} console={}-{:.2} ms={}",
             dir, n, FACES.len(), fallback, if t.scripts_missing.is_empty() { "none" } else { t.scripts_missing.as_str() }, bytes / 1024, cap / 1024, ppi,
-            family_name(family), css_px, t.names[0], t.styles[0].0.size, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size,
+            crate::video::dpi::scale_str(s2), gw, gh, pw / gw.max(1), ph / gh.max(1), pw, ph,
+            family_name(family), css_px, t.names[0], t.styles[0].0.size, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size, t.names[3], t.styles[3].0.size,
             crate::arch::ms().saturating_sub(t0)
         );
         *TT.lock() = Some(t);
         READY.store(true, Ordering::Release);
+        regrid_console(); // UIMETRICS (B372): a non-default font_size at load regrids the console too
+        super::EPOCH.fetch_add(1, Ordering::AcqRel); // KERNELFONT2 M4: the windows painted before this repaint once
         let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
     }
 
@@ -525,12 +706,22 @@ mod tt {
             t.family = family;
             t.css_px = css_px;
             restyle(t);
-            Some(alloc::format!("font={} font_size={} ppi={} chrome={}-{:.2} ui={}-{:.2}", family_name(family), css_px, t.ppi, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size))
+            Some(alloc::format!("font={} font_size={} ppi={} chrome={}-{:.2} ui={}-{:.2} console={}-{:.2}", family_name(family), css_px, t.ppi, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size, t.names[3], t.styles[3].0.size))
         })
         .flatten();
         if let Some(line) = changed {
             serial_println!("[kfont] restyle {}", line);
+            regrid_console(); // UIMETRICS (B372): the console's cell follows font_size
+            super::EPOCH.fetch_add(1, Ordering::AcqRel); // KERNELFONT2 M4
             let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+        }
+    }
+
+    /// UIMETRICS (B372): re-derive the console's grid from the restyled cell and say so (no lock held here).
+    fn regrid_console() {
+        if let Some((oc, or, nc, nr)) = crate::video::fbcon::regrid() {
+            let (gw, gh) = super::grid_cell();
+            serial_println!("[kfont] regrid console cell={}x{} grid={}x{} was={}x{}", gw, gh, nc, nr, oc, or);
         }
     }
 
@@ -581,9 +772,9 @@ pub fn fixture() {
                 let fallback = if missing.is_empty() { alloc::string::String::from("none") } else { missing };
                 let ok = faces >= 1 && fallback == "none" && drawn >= 1000 && mid && ink;
                 serial_println!(
-                    "[kfont] fixture font_kib={} cache_bytes={} hits={} misses={} flushes={} runs_shaped={} contended={} aa_mid={} ink={} body={} chrome={} ui={}",
+                    "[kfont] fixture font_kib={} cache_bytes={} hits={} misses={} flushes={} runs_shaped={} contended={} aa_mid={} ink={} body={} chrome={} ui={} console={}",
                     bytes / 1024, st.cache_bytes, st.hits, st.misses, st.flushes, st.runs_shaped, tt::CONTENDED.load(core::sync::atomic::Ordering::Relaxed), mid as u8, ink as u8,
-                    face_name(Face::Body), face_name(Face::Chrome), face_name(Face::Ui)
+                    face_name(Face::Body), face_name(Face::Chrome), face_name(Face::Ui), face_name(Face::Grid)
                 );
                 serial_println!(
                     ":: KERNELFONT: faces={} cache_kib={} evictions={} fallback={} glyphs_drawn={} ms_per_1000={} -> {} ::",
@@ -606,5 +797,29 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("font", fixture);
+    }
+}
+
+/// KERNELFONT2 (B363): the directory (`DIR` or `DIR_CARD`) holding face `file`, read whole and parsed by
+/// `font_core` — what a ring-3 reader of the same volume (LUMEN.ELF) will find. `None` on a build without the
+/// desktop engine, or when the face is absent or refused.
+pub fn volume_face(file: &str) -> Option<&'static str> {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        let mt = crate::shell::vfs_mount_table();
+        for d in [DIR, DIR_CARD] {
+            let p = alloc::format!("{}/{}", d, file);
+            if let Ok(v) = tt::read_face(&mt, &p) {
+                if font_core::Font::parse(&v).is_ok() {
+                    return Some(d);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        let _ = file;
+        None
     }
 }

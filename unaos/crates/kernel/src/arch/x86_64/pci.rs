@@ -1037,7 +1037,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
                 crate::drivers::gpu::detect::GpuType::NvidiaKepler => {
                     kepler_found = true;
                     let t = crate::arch::now_cycles();
-                    crate::drivers::gpu::kepler::init(gpu);
+                    crate::serial_line::fold_open(b":: kepler: "); crate::drivers::gpu::kepler::init(gpu); crate::serial_line::fold_close(); // GLASSLAG M4 (B370): the takeover's 263-line prose folds into <= 18 rollups (`tests keplerlog` replays it).
                     pace.add(G_KEPLER, t);
                 }
                 #[cfg(feature = "intel-ivb")]

@@ -1940,9 +1940,9 @@ pub fn kbd_pump_body(_arg: usize) {
         while let Some(ev) = crate::pal::next_event() {
             if let crate::pal::Event::Key(c) = ev {
                 if (32..=126).contains(&c) {
-                    serial_println!(":: tegra: JB2b — KEY '{}' ::", c as char);
+                    serial_println!(":: tegra: JB2b — KEY class={} ::", crate::pwwire::key_class(c));
                 } else {
-                    serial_println!(":: tegra: JB2b — KEY {:#04x} ::", c);
+                    serial_println!(":: tegra: JB2b — KEY class={} ::", crate::pwwire::key_class(c));
                 }
             }
         }

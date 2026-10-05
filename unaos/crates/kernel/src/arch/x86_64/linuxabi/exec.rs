@@ -15,7 +15,8 @@
 //!   holding the .data tail and the .bss head (the file bytes past `p_filesz` there are other sections, never .bss), or a
 //!   page two segments share — is EAGER: allocated now and filled with exactly the segments' file bytes.
 //!
-//! The image window stays `0x10000..16 MiB` in PML4[0] (checked to be free RAM, never the kernel); until a page is
+//! The image window stays `0x10000..64 MiB` (WINDOW2; was 16 MiB) in PML4[0] (checked to be free RAM, never the kernel or its heap; a static-PIE
+//! is placed at `elf::PIE_BASE` in PML4[2] instead); until a page is
 //! touched the process's tables there are the kernel's identity map (present, not USER), which the fault hook treats as
 //! not-present for a VMA page. Pages already USER there would be someone else's: the load refuses them.
 
@@ -105,8 +106,8 @@ pub fn load(asp: &mut AddrSpace, img: &Image) -> Result<(), &'static str> {
         }
     }
     let (Some(&lo), Some(&last)) = (pages.keys().next(), pages.keys().next_back()) else { return Err("no PT_LOAD segments") };
-    if !super::memory::region_is_usable(lo, last + PAGE - lo) {
-        return Err("load range is not free RAM on this machine (would overlay the kernel)");
+    if !img.plan.pie && !elf::low_window_ok(lo, last + PAGE - lo) {
+        return Err("load range is not free RAM on this machine (would overlay the kernel or its heap)"); // WINDOW2: a static-PIE sits at elf::PIE_BASE in PML4[2], not RAM
     }
     let classify = |va: u64, segs_here: &[usize]| -> Kind {
         if segs_here.len() != 1 {

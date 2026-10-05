@@ -42,6 +42,8 @@ serde_json = "1.0"
 url = "2.5"
 # AETHERFONT (SR61): text is UnaOS's own font_core (FONTCORE + FONTBIDI): font-kit + pathfinder_geometry are gone.
 font_core = { path = "../../unaos/libs/text/font_core" }
+# QUARTZFONT (SR64): the font discovery / database / rasterizer half of fonts/, shared with quartzite.
+text_host = { path = "../../libs/text_host" }
 # AETHERFONT: WOFF 1.0 tables inflate through PIXELCORE's zlib (in-tree).
 pixel_core = { path = "../../unaos/libs/media/pixel_core" }
 base64 = "0.23"
