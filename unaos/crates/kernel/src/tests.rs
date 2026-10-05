@@ -131,6 +131,8 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     }
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold)
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win(); ensure_ring3abi();
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
     crate::video::blitter::ensure_tests(); crate::prof::ensure_tests(); // KCOMP (B321): `tests blitter`. PROFILE (B331): `tests prof`.
@@ -391,5 +393,11 @@ fn ensure_netclock() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("netclock", crate::smolnet::netclock_selftest); }
+/// RING3ABI2 (B333): register `tests ring3abi` exactly once — x86, and aarch64 builds with an EL0 layer.
+fn ensure_ring3abi() {
+    #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("ring3abi", crate::ring3abi::selftest); }
     }
 }

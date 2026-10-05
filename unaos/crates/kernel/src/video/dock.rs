@@ -3274,13 +3274,14 @@ fn dp_launch(i: usize) -> &'static str {
 /// Drained by the render body that owns the shell `Console` AFTER its shell launch arm: the verb line of
 /// the next owed ring-3 table app, or `None`.
 pub fn take_verb_launch() -> Option<&'static str> {
+    if let Some(l) = take_line_launch() { return Some(l); } // RING3ABI2 M6 (B333): a posted shell line (Quarry's `run <path>`) first
     let m = DP_VERB_OWED.load(Ordering::Acquire);
     let i = (DP_FIRST_EXTRA..DP_PINS.len()).find(|&i| m & (1 << i) != 0)?;
     DP_VERB_OWED.fetch_and(!(1 << i), Ordering::AcqRel);
     Some(DP_PINS[i].verb)
 }
 /// Is a verb launch owed (read; clears nothing)? The shell-owning body runs it only once its window is live.
-pub fn verb_launch_posted() -> bool { DP_VERB_OWED.load(Ordering::Acquire) != 0 }
+pub fn verb_launch_posted() -> bool { DP_VERB_OWED.load(Ordering::Acquire) != 0 || LINE_OWED.load(Ordering::Acquire) }
 
 fn dp_request_load() { DP_LOAD_OWED.store(true, Ordering::Release); }
 
@@ -3433,3 +3434,52 @@ fn menu_win_row(_owner: u64, _k: usize, _buf: &mut [u8; wm::MAX_TITLE]) -> (wm::
 fn menu_win_focus(win: wm::WinId) -> bool { wm::wl_focus(win) }
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn menu_win_focus(_win: wm::WinId) -> bool { false }
+
+// =================================================================================================
+// RING3ABI2 M6 (rmbp-ledger B333) — a SHELL LINE posted by another launcher (Quarry's double-click on a
+// console program: `run <path>`), drained through the DOCKPIN verb seam above (`take_verb_launch`, run by
+// the render body that owns the shell `Console` as `shell::dispatch_command(line, ..)`, exactly as typed).
+// Lines are interned (`&'static str`, the seam's type): one leaked copy per DISTINCT line, so the table is
+// bounded by the programs an operator double-clicks, never by the number of clicks. One line is owed at a
+// time; a second post before the drain replaces the first (two double-clicks between render passes are
+// the operator's latest intent). OWED: only the x86 render body drains the verb seam today.
+// =================================================================================================
+
+/// Does a render body on THIS build drain the verb seam (and so a posted line)? Today only
+/// `x86_render_service` (main.rs, x86 + `wc`) does; a launcher on any other build must not post a line
+/// nobody will run — Quarry keeps detaching there.
+pub const LINE_LAUNCH_DRAINED: bool = cfg!(all(target_arch = "x86_64", feature = "wc"));
+static LINE_OWED: AtomicBool = AtomicBool::new(false);
+static LINE_SLOT: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
+static LINE_INTERN: spin::Mutex<alloc::vec::Vec<&'static str>> = spin::Mutex::new(alloc::vec::Vec::new());
+const LINE_INTERN_MAX: usize = 64;
+
+/// POST (never perform) `line` for the shell window, and the shell launch it needs (a live shell raises).
+/// `false` when the intern table is full (the line is refused with a wire line, nothing is leaked).
+pub fn post_line_launch(line: &str) -> bool {
+    let interned = {
+        let mut t = LINE_INTERN.lock();
+        match t.iter().find(|l| **l == line) {
+            Some(l) => *l,
+            None if t.len() < LINE_INTERN_MAX => {
+                let l: &'static str = alloc::boxed::Box::leak(alloc::string::String::from(line).into_boxed_str());
+                t.push(l);
+                l
+            }
+            None => {
+                serial_println!("[dock] line launch REFUSED reason=intern-full line={}", line);
+                return false;
+            }
+        }
+    };
+    *LINE_SLOT.lock() = Some(interned);
+    LINE_OWED.store(true, Ordering::Release);
+    post_launch(PinnedApp::Shell);
+    serial_println!("[dock] line launch posted line={}", interned);
+    true
+}
+
+fn take_line_launch() -> Option<&'static str> {
+    if !LINE_OWED.swap(false, Ordering::AcqRel) { return None; }
+    LINE_SLOT.lock().take()
+}

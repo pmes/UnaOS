@@ -9,8 +9,9 @@
 //! `vein.endpoint` (a URL; unset = `https://api.anthropic.com/v1/messages`; an `http://` URL is a relay
 //! that holds the key itself, so the key is never sent to it), `vein.tls` (`"verify"` default |
 //! `"insecure"`), `vein.key_file` (the absolute path of the key file on the UnaFS volume, conventionally
-//! `<home>/.config/unaos/vein.key`; a ring-3 program has no way to learn its home, so the path is a
-//! preference).
+//! `<home>/.config/unaos/vein.key`; RING3ABI2 (B333): when the preference is unset, ring 3 composes that
+//! conventional path from `SYS_WHOAMI`'s home — `vein_ring3::key::default_path` — and the preference
+//! overrides it).
 
 use crate::claude;
 

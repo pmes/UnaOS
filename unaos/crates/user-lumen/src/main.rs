@@ -650,9 +650,17 @@ fn render(a: &App, s: &Surf) {
 fn landmark_base() -> u64 {
     una_abi::USER_BASE_X86
 }
+/// RING3ABI2 M5 (B333): the aarch64 LUMEN.ELF is an elf-model image in the extension GiB, and the classic
+/// window has no fixed VA on aarch64 — the args page carries its base (`window_base`).
 #[cfg(not(target_arch = "x86_64"))]
 fn landmark_base() -> u64 {
-    _start as *const () as u64
+    match una_abi::args() {
+        Some(a) if a.window_base() != 0 => a.window_base(),
+        _ => {
+            Line::new(b":: LUMEN: no args page (window base unknown) ::").wire();
+            exit(1)
+        }
+    }
 }
 
 #[no_mangle]
@@ -678,7 +686,9 @@ pub extern "C" fn _start() -> ! {
     // The session: Principia's `vein` namespace, the key file, the rule.
     let cfg = vein_ring3::prefs::Config::read();
     let keybuf = unsafe { &mut *core::ptr::addr_of_mut!(KEY) };
-    let (key, key_n) = vein_ring3::key::read(cfg.key_file(), keybuf);
+    let mut kpath = [0u8; 128];
+    let kfile = match cfg.key_file() { Some(k) => Some(k), None => vein_ring3::key::default_path(&mut kpath) }; // RING3ABI2 M3 (B333): unset preference = `<home>/.config/unaos/vein.key`, `<home>` from SYS_WHOAMI
+    let (key, key_n) = vein_ring3::key::read(kfile, keybuf);
     let plan = cfg.plan(key);
     let sess = Session { plan, key, key_n, cfg };
     vein_ring3::net::set_tick(Some(tick));
