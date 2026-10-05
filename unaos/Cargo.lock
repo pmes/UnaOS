@@ -7,6 +7,10 @@ name = "amber_core"
 version = "0.1.0"
 
 [[package]]
+name = "audio_core"
+version = "0.1.0"
+
+[[package]]
 name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -454,6 +458,7 @@ name = "unaos-kernel"
 version = "0.1.0"
 dependencies = [
  "amber_core",
+ "audio_core",
  "cfg-if",
  "crypto_core",
  "diag_core",

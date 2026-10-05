@@ -327,6 +327,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audio-check"
+version = "0.1.0"
+dependencies = [
+ "audio_core",
+]
+
+[[package]]
+name = "audio_core"
+version = "0.1.0"
+
+[[package]]
 name = "aule"
 version = "0.1.0"
 dependencies = [
@@ -3974,6 +3985,7 @@ dependencies = [
 name = "gneiss_pal"
 version = "0.1.0"
 dependencies = [
+ "audio_core",
  "bandy",
  "candle-core",
  "candle-nn",

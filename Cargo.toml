@@ -19,6 +19,7 @@ members = [
     "unaos/libs/sys/elf_core", # STORMFAULT (B351): the ring-3 ELF segment plan both loaders share
     # VEINTLS (SR36): the ring-3 Vein library joins the host workspace so its offline TLS + Messages test runs here.
     "unaos/libs/sys/vein_ring3",
+    "unaos/libs/media/audio_core",
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",
@@ -39,6 +40,7 @@ members = [
     "tools/una-card",
     "tools/unafs_bench",
     "tools/sentinel",
+    "tools/audio-check",
     "tools/foreman",
     "tools/crypto-check",
     "vessels/lumen",
