@@ -28,6 +28,8 @@ members = [
 
     # HTMLCORE (SR46): the no_std WHATWG HTML parser + arena DOM + serializer (Aether swaps kuchiki for it later).
     "unaos/libs/web/html_core",
+    # HTTPCORE (SR51): the no_std HTTP client core (URL, HTTP/1.1, cookies, codings, h2) + its host transport.
+    "unaos/libs/net/http_core",
 
     "libs/pwm/pca9685",
     "libs/bandy",

@@ -1,0 +1,15 @@
+# HTTPCORE (SR51) test vectors — provenance: suite, URL, sha256 of the fetched file.
+# Fetched at test time into target/vectors-cache/http_core/ (curl through the proxy); a test whose vectors cannot
+# be fetched SKIPS (prints why) instead of failing. Too large to commit (> 200 KB).
+#
+# wpt: web-platform-tests 564b9b1eb1387ef42456f1cba77d2d38599fad61 (master, 2026-10-05), url/resources/urltestdata.json.
+wpt https://raw.githubusercontent.com/web-platform-tests/wpt/564b9b1eb1387ef42456f1cba77d2d38599fad61/url/resources/urltestdata.json 81e85fd3c199c08ef9c34cf651b3580eeedd080316493bfaf277a6b5ff8cf652
+#
+# http-state (abarth/http-state 155e45c6168e6de2eb727193010fd12e3c789185, the RFC 6265 user-agent suite): the
+# parser tests are 28 KB and COMMITTED under tests/data/http-state/ (see its PROVENANCE file).
+# The 444 files named in tests/http-state.list are fetched one by one from this base; the sha256 is over the
+# concatenation, in list order, of "<name>\n<file bytes>" — every file pinned at once.
+http-state https://raw.githubusercontent.com/abarth/http-state/155e45c6168e6de2eb727193010fd12e3c789185/tests/data/parser/ a4e2fa024e321108f0dca6bc495ba62eaa2fb1baa128028257986a06948ba290
+# idna: the same WPT commit's url/resources/IdnaTestV2.json (UTS #46 conformance through the URL parser) — a
+# MEASURE of the IDNA ceiling (the full mapping table / NFC / Bidi are owed), floor-gated at today's count.
+idna https://raw.githubusercontent.com/web-platform-tests/wpt/564b9b1eb1387ef42456f1cba77d2d38599fad61/url/resources/IdnaTestV2.json 84de621e5239676e59e5a3e68ef3e2b1acde9da5480a633d2ef446ef03238b76
