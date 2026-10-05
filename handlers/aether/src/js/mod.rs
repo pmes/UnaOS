@@ -813,7 +813,7 @@ impl Engine {
             Ok(JsValue::from(true))
         });
         let keys = NativeFunction::from_fn_ptr(|_this, args, ctx| {
-            let arr = boa_engine::object::builtins::JsArray::new(ctx);
+            let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
             if let Some(node) = node_of(args, ctx) {
                 if let Some(el) = node.as_element() {
                     let names: Vec<String> = el
@@ -1113,7 +1113,7 @@ impl Engine {
             }
         });
         let get_children = Self::native(context, |this, _args, ctx| {
-            let arr = boa_engine::object::builtins::JsArray::new(ctx);
+            let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
             if let Some(n) = Self::this_node(this, ctx) {
                 for child in n.children().filter(|c| c.as_element().is_some()).take(256) {
                     let wrapped = Self::wrap_node(ctx, child);
@@ -1159,7 +1159,7 @@ impl Engine {
             }
         });
         let get_child_nodes = Self::native(context, |this, _args, ctx| {
-            let arr = boa_engine::object::builtins::JsArray::new(ctx);
+            let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
             if let Some(n) = Self::this_node(this, ctx) {
                 for child in n.children().take(512) {
                     let wrapped = Self::wrap_node(ctx, child);
@@ -1389,7 +1389,7 @@ impl Engine {
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
                     let id = this_node_id(this, ctx);
                     let selector = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
-                    let arr = boa_engine::object::builtins::JsArray::new(ctx);
+                    let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
                         if let Ok(matches) = n.select(&selector) {
                             for m in matches.take(256) {
@@ -1500,7 +1500,7 @@ impl Engine {
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
                     let id = this_node_id(this, ctx);
                     let tag = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
-                    let arr = boa_engine::object::builtins::JsArray::new(ctx);
+                    let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
                         if let Ok(matches) = n.select(&tag) {
                             for m in matches.take(256) {
@@ -1518,7 +1518,7 @@ impl Engine {
                 NativeFunction::from_fn_ptr(|this, args, ctx| {
                     let id = this_node_id(this, ctx);
                     let cls = args.get(0).cloned().unwrap_or_default().to_string(ctx).unwrap_or_default().to_std_string_escaped();
-                    let arr = boa_engine::object::builtins::JsArray::new(ctx);
+                    let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
                     if let Some(n) = DOM_STATE.with(|s| s.borrow().get_node(id)) {
                         let selector = format!(".{}", cls);
                         if let Ok(matches) = n.select(&selector) {

@@ -237,6 +237,8 @@ pub enum FacetError {
     OutOfMemory(usize),
     /// The panel is missing, busy, below the floor, or `wm` refused the row.
     NoWindow(&'static str),
+    /// PIXELCORE: `pixel_core::decode` refused a non-PNG file. Carries its own reason.
+    Pixel(pixel_core::Error),
 }
 
 impl FacetError {
@@ -269,6 +271,7 @@ impl FacetError {
             }
             FacetError::OutOfMemory(n) => alloc::format!("alloc({} bytes)", n),
             FacetError::NoWindow(w) => alloc::format!("no-window({})", w),
+            FacetError::Pixel(e) => alloc::format!("pixel_core-{}", e).chars().map(|c| if c == ' ' { '-' } else { c }).collect(),
         }
     }
 }
@@ -1368,39 +1371,53 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
         return Err(FacetError::Size(st.size));
     }
     if let Some(d) = anim::probe(path) { close(); return anim::open_frames(path, st.size, d); } // QUARRY2 (B336): frames from the decoder adapter (None today: PNG is a still)
-    let (ihdr, spans, palette) = index_chunks(&mt, path, st.size)?;
-    let (k, bw, bh) = fit(ihdr.width, ihdr.height, BASE_W, BASE_H).ok_or(FacetError::NoWindow("fit"))?;
-    if ihdr.interlaced && k != 1 {
-        return Err(FacetError::Interlaced);
-    }
-    serial_println!(
-        "[facet] open path={} ihdr={}x{} depth={} colour={} interlaced={} bytes={} idat-chunks={} -> DECODING",
-        path, ihdr.width, ihdr.height, ihdr.depth, ihdr.colour, ihdr.interlaced as u8, st.size, spans.len()
-    );
-    // One canvas, and one base image at a time: the old window and its base go BEFORE the decode, so
-    // the peak is a single base (a failed decode then shows the message window in its place).
-    close();
-    let mut px: Vec<u32> = Vec::new();
-    if px.try_reserve_exact(bw * bh).is_err() {
-        return Err(FacetError::OutOfMemory(bw * bh * 4));
-    }
-    px.resize(bw * bh, 0xFF00_0000);
-    let mut src = IdatSource::new(&mt, path, &spans);
-    let r = decode_into(ihdr, &palette, &mut src, k, bw, bh, &mut px);
-    let d = match (r, src.io_error.take()) {
-        (Err(FacetError::Inflate(InflateError::TruncatedInput)), Some(io)) => {
-            serial_println!("[facet] decoded rows=0 inflate=vfs-{} ms={}", io, crate::arch::ms().saturating_sub(t0));
-            return Err(FacetError::Vfs(io));
+    // PIXELCORE (SR25): a file whose first eight bytes are not the PNG signature goes to
+    // `pixel_core::decode` whole (JPEG, GIF frame 0, BMP, QOI, WebP lossless) and is box-reduced into
+    // the same base image; a PNG keeps the streaming path below unchanged.
+    let (ihdr, k, bw, bh, px) = if is_foreign(&mt, path)? {
+        let (ihdr, k, bw, bh, px) = decode_foreign(&mt, path, st.size, BASE_W, BASE_H)?;
+        serial_println!(
+            "[facet] open path={} pixel_core={}x{} bytes={} -> DECODED ms={}",
+            path, ihdr.width, ihdr.height, st.size, crate::arch::ms().saturating_sub(t0)
+        );
+        close();
+        (ihdr, k, bw, bh, px)
+    } else {
+        let (ihdr, spans, palette) = index_chunks(&mt, path, st.size)?;
+        let (k, bw, bh) = fit(ihdr.width, ihdr.height, BASE_W, BASE_H).ok_or(FacetError::NoWindow("fit"))?;
+        if ihdr.interlaced && k != 1 {
+            return Err(FacetError::Interlaced);
         }
-        (r, _) => r,
+        serial_println!(
+            "[facet] open path={} ihdr={}x{} depth={} colour={} interlaced={} bytes={} idat-chunks={} -> DECODING",
+            path, ihdr.width, ihdr.height, ihdr.depth, ihdr.colour, ihdr.interlaced as u8, st.size, spans.len()
+        );
+        // One canvas, and one base image at a time: the old window and its base go BEFORE the decode, so
+        // the peak is a single base (a failed decode then shows the message window in its place).
+        close();
+        let mut px: Vec<u32> = Vec::new();
+        if px.try_reserve_exact(bw * bh).is_err() {
+            return Err(FacetError::OutOfMemory(bw * bh * 4));
+        }
+        px.resize(bw * bh, 0xFF00_0000);
+        let mut src = IdatSource::new(&mt, path, &spans);
+        let r = decode_into(ihdr, &palette, &mut src, k, bw, bh, &mut px);
+        let d = match (r, src.io_error.take()) {
+            (Err(FacetError::Inflate(InflateError::TruncatedInput)), Some(io)) => {
+                serial_println!("[facet] decoded rows=0 inflate=vfs-{} ms={}", io, crate::arch::ms().saturating_sub(t0));
+                return Err(FacetError::Vfs(io));
+            }
+            (r, _) => r,
+        };
+        match &d {
+            Ok(d) => serial_println!("[facet] decoded rows={} inflate=OK ms={}", d.rows, crate::arch::ms().saturating_sub(t0)),
+            Err(e) => {
+                serial_println!("[facet] decoded rows=0 inflate={} ms={}", e.reason(), crate::arch::ms().saturating_sub(t0));
+            }
+        }
+        d?;
+        (ihdr, k, bw, bh, px)
     };
-    match &d {
-        Ok(d) => serial_println!("[facet] decoded rows={} inflate=OK ms={}", d.rows, crate::arch::ms().saturating_sub(t0)),
-        Err(e) => {
-            serial_println!("[facet] decoded rows=0 inflate={} ms={}", e.reason(), crate::arch::ms().saturating_sub(t0));
-        }
-    }
-    d?;
 
     open_base(path, st.size, ihdr, k, bw, bh, px) // QUARRY2 (B336): the window body, shared with the animated-frame open (`anim::open_frames`)
 }
@@ -1462,6 +1479,71 @@ fn open_base(path: &str, bytes: u64, ihdr: Ihdr, k: usize, bw: usize, bh: usize,
     let _ = wm::present(id);
     PAINTS.fetch_add(1, Ordering::Relaxed);
     Ok(out)
+}
+
+// ── PIXELCORE: every other format pixel_core decodes ───────────────────────────────────────────
+
+/// The largest NON-PNG file Facet will open. Unlike a PNG (streamed, never held), a JPEG/GIF/BMP/QOI/
+/// WebP is read whole and decoded whole by `pixel_core::decode`, so this bounds a real buffer: the file
+/// plus its RGBA (`MAX_PIXELS`-bounded by pixel_core) sit on the heap together for the decode.
+const MAX_FOREIGN: u64 = 16 * 1024 * 1024;
+
+/// Is `path` something other than a PNG (first eight bytes are not the signature)?
+fn is_foreign(mt: &crate::fs::vfs::MountTable, path: &str) -> Result<bool, FacetError> {
+    let head = mt.read(path, 0, 8).map_err(|e| FacetError::Vfs(vfs_why(e)))?;
+    Ok(head.len() < 8 || head[..8] != SIGNATURE)
+}
+
+/// Read `path` whole, `pixel_core::decode` it (an animation shows frame 0 — animation is owed), and
+/// box-reduce the RGBA by `fit`'s integer `k` into `0xFFRRGGBB` base pixels. Alpha is dropped, exactly
+/// as the PNG path drops it. Returns `(synthetic Ihdr: depth 8 colour 6, k, out_w, out_h, px)`.
+fn decode_foreign(
+    mt: &crate::fs::vfs::MountTable,
+    path: &str,
+    size: u64,
+    bw: usize,
+    bh: usize,
+) -> Result<(Ihdr, usize, usize, usize, Vec<u32>), FacetError> {
+    if size > MAX_FOREIGN {
+        return Err(FacetError::Size(size));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    if bytes.try_reserve_exact(size as usize).is_err() {
+        return Err(FacetError::OutOfMemory(size as usize));
+    }
+    while (bytes.len() as u64) < size {
+        let want = core::cmp::min(CHUNK as u64, size - bytes.len() as u64) as usize;
+        let b = mt.read(path, bytes.len() as u64, want).map_err(|e| FacetError::Vfs(vfs_why(e)))?;
+        if b.is_empty() {
+            return Err(FacetError::Vfs(String::from("short-read")));
+        }
+        bytes.extend_from_slice(&b);
+    }
+    let img = pixel_core::decode(&bytes).map_err(FacetError::Pixel)?;
+    drop(bytes);
+    let ihdr = Ihdr { width: img.width, height: img.height, depth: 8, colour: 6, interlaced: false };
+    let (k, ow, oh) = fit(img.width, img.height, bw, bh).ok_or(FacetError::NoWindow("fit"))?;
+    let mut px: Vec<u32> = Vec::new();
+    if px.try_reserve_exact(ow * oh).is_err() {
+        return Err(FacetError::OutOfMemory(ow * oh * 4));
+    }
+    let iw = img.width as usize;
+    let n = (k * k) as u32;
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+            for sy in oy * k..oy * k + k {
+                for sx in ox * k..ox * k + k {
+                    let p = &img.rgba[(sy * iw + sx) * 4..(sy * iw + sx) * 4 + 3];
+                    r += p[0] as u32;
+                    g += p[1] as u32;
+                    b += p[2] as u32;
+                }
+            }
+            px.push(0xFF00_0000 | ((r / n) << 16) | ((g / n) << 8) | (b / n));
+        }
+    }
+    Ok((ihdr, k, ow, oh, px))
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────────────────────────
