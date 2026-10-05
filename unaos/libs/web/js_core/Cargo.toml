@@ -1,0 +1,17 @@
+[package]
+name = "js_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "JSCORE (SR55): ECMAScript 2025 from the specification — lexer, parser, bytecode compiler, VM with an exact tracing GC, and the built-ins — no_std + alloc, zero dependencies."
+
+# JSCORE (LEDGER SR55, R83): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies. The from-spec
+# replacement for `boa_engine` in Aether (SR31 DEPS: chicken wire). Proof (tests/): test262 at a pinned commit
+# (fetched at test time into target/, skipped offline), the Chromium oracle on script pages through a tiny test
+# host, a mutation fuzzer, and a microbenchmark. Unicode tables in src/unicode/ are generated from UCD 17.0.0 by
+# tools/gen_unicode.py. Design doc: docs/dev/evidence/web-1005/JSCORE.md.
+
+[dependencies]
+
+[dev-dependencies]
+crypto_core = { path = "../../sys/crypto_core" }

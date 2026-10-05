@@ -4900,6 +4900,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "js_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+]
+
+[[package]]
 name = "jsonwebtoken"
 version = "10.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
