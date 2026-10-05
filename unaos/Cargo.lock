@@ -141,6 +141,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ldso_core"
+version = "0.1.0"
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -433,6 +437,7 @@ dependencies = [
  "font_core",
  "holocron_core",
  "lazy_static",
+ "ldso_core",
  "linked_list_allocator",
  "midden_core",
  "net",

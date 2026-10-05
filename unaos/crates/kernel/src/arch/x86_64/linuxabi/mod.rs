@@ -51,6 +51,8 @@ pub mod exec; // SELFBUILD4 (B356): lazy execve images
 pub mod selfbuild4; // SELFBUILD4 (B356): `tests selfbuild4`
 pub mod remap; // SELFBUILD5 (B357): mremap, sigaltstack at delivery, getcpu
 pub mod selfbuild5; // SELFBUILD5 (B357): `tests selfbuild5`
+pub mod ldso; // SELFBUILD6 (B360): PT_INTERP programs through the shared loader core (ldso_core)
+pub mod selfbuild6; // SELFBUILD6 (B360): `tests selfbuild6`
 
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -783,14 +785,32 @@ fn pump_keys(edit: &mut String, pend: &mut String, out: &mut dyn FnMut(&str)) ->
 }
 
 fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out: &mut dyn FnMut(&str)) -> Result<Report, String> {
-    let img = exec::image(path)?; // SELFBUILD4: the head only; the image pages in through file VMAs (exec.rs)
-    let (full, plan) = (img.full.clone(), &img.plan);
+    let dynfull = crate::shell::vfs_path(path); // SELFBUILD6: a PT_INTERP program goes through the loader (ldso.rs)
     let mut asp = AddrSpace::new();
-    exec::begin(&img);
-    if let Err(e) = exec::load(&mut asp, &img) {
-        asp.free_frames();
-        return Err(String::from(e));
-    }
+    let (full, plan) = if ldso::wants(&dynfull) {
+        match ldso::load(&mut asp, &dynfull) {
+            Ok(plan) => (dynfull, plan),
+            Err(e) => {
+                ldso::forget(asp.pml4);
+                asp.free_frames();
+                return Err(e);
+            }
+        }
+    } else {
+        let img = match exec::image(path) { // SELFBUILD4: the head only; the image pages in through file VMAs (exec.rs)
+            Ok(i) => i,
+            Err(e) => {
+                asp.free_frames();
+                return Err(e);
+            }
+        };
+        exec::begin(&img);
+        if let Err(e) = exec::load(&mut asp, &img) {
+            asp.free_frames();
+            return Err(String::from(e));
+        }
+        (img.full, img.plan)
+    };
     let envp = ["PATH=/apps:/", "HOME=/", "TERM=linux"];
     let sp = match elf::build_stack(&mut asp, &plan, &full, argv, &envp) {
         Ok(s) => s,
@@ -917,6 +937,7 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
             fs_tab_clear(i.pml4);
             fpu::release_slot(i.pml4); // LINUXABI3
             thread::release_all(i.pid, i.pml4); // SELFBUILD2: thread keys, waiters, signal state
+            ldso::forget(i.pml4); // SELFBUILD6: the session's loader state
         }
     }
     proc::reset_session();

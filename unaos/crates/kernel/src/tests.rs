@@ -161,7 +161,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
-        if !LDONE.swap(true, Ordering::AcqRel) { register("linuxabi", crate::arch::linuxabi::selftest); register("linuxabi2", crate::arch::linuxabi::selftest2); register("linuxabi3", crate::arch::linuxabi::selftest3); register("selfbuild", crate::arch::linuxabi::selfbuild::selftest); register("selfbuild2", crate::arch::linuxabi::selfbuild2::selftest); register("selfbuild3", crate::arch::linuxabi::selfbuild3::selftest); register("selfbuild4", crate::arch::linuxabi::selfbuild4::selftest); register("selfbuild5", crate::arch::linuxabi::selfbuild5::selftest); }
+        if !LDONE.swap(true, Ordering::AcqRel) { register("linuxabi", crate::arch::linuxabi::selftest); register("linuxabi2", crate::arch::linuxabi::selftest2); register("linuxabi3", crate::arch::linuxabi::selftest3); register("selfbuild", crate::arch::linuxabi::selfbuild::selftest); register("selfbuild2", crate::arch::linuxabi::selfbuild2::selftest); register("selfbuild3", crate::arch::linuxabi::selfbuild3::selftest); register("selfbuild4", crate::arch::linuxabi::selfbuild4::selftest); register("selfbuild5", crate::arch::linuxabi::selfbuild5::selftest); register("selfbuild6", crate::arch::linuxabi::selfbuild6::selftest); }
     }
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
     {
