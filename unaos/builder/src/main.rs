@@ -995,6 +995,14 @@ fn main() {
         ("PROBE.LNX", "PROBE.LNX"),
         // SELFBUILD2 (B349): the threaded syscall KAT (crates/user-linux-hello/c/syskat2.c) — `tests selfbuild2`.
         ("SYSKAT2.LNX", "SYSKAT2.LNX"),
+        // SELFBUILD4 (B356): the process-memory KAT (syskat4.c) and the first Rust program (crates/user-linux-rust, static
+        // musl, non-PIE) — `tests selfbuild4`. Built and host-proven by arroyo's build_selfbuild4_x86; absent = SKIP.
+        ("SYSKAT4.LNX", "SYSKAT4.LNX"),
+        ("RUST.LNX", "RUST.LNX"),
+        // SELFBUILD5 (B357): the mremap / alternate-stack KAT (syskat5.c) and a static ld.lld at the toolchain's LLVM release
+        // (built from the pinned source by arroyo's build_selfbuild5_x86) — `tests selfbuild5` links RUST.LNX's objects with it.
+        ("SYSKAT5.LNX", "SYSKAT5.LNX"),
+        ("LLD.LNX", "LLD.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
@@ -1039,6 +1047,22 @@ fn main() {
         println!("   SELFBUILD3: staged APPS/LIB ({n} files: musl crt + libc.a + headers, tcc's libtcc1.a + headers)");
     } else {
         println!("   SELFBUILD3: target/LIB absent — ESP has no APPS/LIB (musl not built: no egress at build time?)");
+    }
+    // SELFBUILD5 (B357): target/LIB/rust (RUST.LNX's objects, the std rlibs, the musl crt + libc.a + libunwind.a, link.rsp) rides
+    // the APPS/LIB copy above; staged here on its own when the musl LIB was not built.
+    let rust_lib = musl_lib.join("rust");
+    if rust_lib.join("link.rsp").exists() {
+        let to = esp_apps.join("LIB").join("rust");
+        if !to.join("link.rsp").exists() {
+            std::fs::create_dir_all(&to).unwrap();
+            for e in std::fs::read_dir(&rust_lib).unwrap() {
+                let e = e.unwrap();
+                std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        }
+        println!("   SELFBUILD5: APPS/LIB/rust staged (LLD.LNX -flavor gnu @/apps/LIB/rust/link.rsp)");
+    } else {
+        println!("   SELFBUILD5: target/LIB/rust absent — ESP has no APPS/LIB/rust (tests selfbuild5 reports lld=skip)");
     }
 
     // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
@@ -1108,6 +1132,16 @@ fn main() {
         println!("   DIAG: copied DIAG.ELF into APPS/ on the ESP (diag)");
     } else {
         println!("   DIAG: target/DIAG-X86.ELF absent — ESP has no DIAG.ELF (run via ./arroyo esp-x86)");
+    }
+    // HOLOCRON2 (B355, R82): the metal's secrets handler (crates/user-holocron, built by arroyo's
+    // build_user_holocron_x86 to target/HOLOCRON-X86.ELF), staged as APPS/HOLOCRON.ELF — a bare `holocron …`
+    // detaches (RESIDENT note); the login path starts it when the user has a ring (UNAOS_LUMEN=1).
+    let holocron_elf = target_dir.join("HOLOCRON-X86.ELF");
+    if holocron_elf.exists() {
+        std::fs::copy(&holocron_elf, esp_apps.join("HOLOCRON.ELF")).unwrap();
+        println!("   HOLOCRON: copied HOLOCRON.ELF into APPS/ on the ESP (holocron)");
+    } else {
+        println!("   HOLOCRON: target/HOLOCRON-X86.ELF absent — ESP has no HOLOCRON.ELF (run via ./arroyo esp-x86)");
     }
     let owners_txt = target_dir.join("witness-owners.txt");
     if owners_txt.exists() {
@@ -1192,6 +1226,8 @@ fn main() {
         (target_dir.join("BIG-X86.ELF"), "BIG.ELF"),
         // SELFDIAG M2 (B324): the diagnosis program rides the DATA volume too — `diag` reads it there.
         (target_dir.join("DIAG-X86.ELF"), "DIAG.ELF"),
+        // HOLOCRON2 (B355): the secrets handler rides the DATA volume too — the login launch and `holocron` read it there.
+        (target_dir.join("HOLOCRON-X86.ELF"), "HOLOCRON.ELF"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();
@@ -1207,6 +1243,15 @@ fn main() {
     if trust_ok {
         stage_trust(&trust_src, &data_dir);
         staged_data.push("system/trust/roots.pem");
+    }
+    // FACETANIM (B358): the three 8x8 3-frame animations `tests facetanim` opens (/apps/ANIM3.GIF,
+    // /apps/ANIM3.WEBP, /apps/ANIM3.PNG) — committed beside pixel_core's KATs, which pin their bytes.
+    for leaf in ["ANIM3.GIF", "ANIM3.WEBP", "ANIM3.PNG"] {
+        let src = workspace_dir.join("libs/media/pixel_core/tests/fixtures/facetanim").join(leaf);
+        if src.exists() {
+            std::fs::copy(&src, data_apps.join(leaf)).unwrap();
+            staged_data.push(leaf);
+        }
     }
     // `hello.txt` rides along so the operator has a trivial `cat hello.txt` probe that proves the
     // kernel is reading THIS volume — the one-command answer to "did I write the right stick?".

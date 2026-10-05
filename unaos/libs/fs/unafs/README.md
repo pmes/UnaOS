@@ -347,7 +347,7 @@ depend on it with `default-features = false`.
 | Surface | `std` (default) | `no_std` (`--no-default-features`) |
 | :--- | :---: | :---: |
 | On-disk types (`Superblock`, `RootRecord`, `Inode`, `Extent`, `AttributeValue`, `FileKind`, `DirEntry`, `CatalogEntry`, `SnapshotEntry`, `ReclaimEntry`) | ✅ | ✅ |
-| `codec` (bincode 2.x `legacy()` serialization seam) | ✅ | ✅ |
+| `codec` (the hand record codec, spec §R) | ✅ | ✅ |
 | `BlockDevice` trait + `MemDevice` | ✅ | ✅ |
 | `adapter` (512↔4096 `BlockAdapter` over `SectorDevice`; GPT/MBR parse; `MemSectorDevice`) | ✅ | ✅ |
 | `UnaFS` core ops (`format`/`mount`/`read`/`write`/`ls`/`mkdir`/`set_attribute`/`get_attribute`) | ✅ | ✅ |
@@ -417,9 +417,16 @@ hand-packed 512 B root record (the root-fits-one-sector KAT), and the
 snapshot/reclaim entry lists are pinned alongside the record encodings the
 format KEPT byte-identical (`Inode`, `Extent`, `AttributeValue`, `FileKind`,
 `DirEntry`, `CatalogEntry` retain their ORIGINAL bincode-1.3.3-frozen
-goldens). Serialization is bincode 2.x in its `legacy()` configuration, routed
-through the single `codec` seam so every write path agrees; the inode-map and
-refcount-map leaves are raw little-endian arrays.
+goldens). Since UNAFSCODEC (SR53) the encoding is UnaFS's OWN: the byte-level
+record specification lives in
+[`docs/dev/OS/09_FILESYSTEM/unafs-records.md`](../../../../docs/dev/OS/09_FILESYSTEM/unafs-records.md)
+(§R1 rules: fixed-width little-endian integers, `u64` lengths, `u32` enum
+discriminants, no varints), and `codec` implements it by hand (`Encode` /
+`Decode`, typed field-named `DecodeError`s, length claims checked before any
+allocation) with no serializer crate — byte-equal to the bincode bytes every
+existing volume carries (`tests/codec_oracle.rs`, `tests/codec_volume.rs`).
+The inode-map and refcount-map leaves are raw little-endian arrays.
+`tools/unafs dump --records` prints a volume field by field from the spec.
 
 `tests/kat_vectors.rs` holds golden-vector known-answer tests: every struct that
 reaches disk is serialized with representative and boundary values and asserted
@@ -468,10 +475,10 @@ carrying the key — there is no ANN index.
 order; `query_inodes` keeps the older `(Inode, f32)` shape.
 
 **Paths (M3).** Every v6 inode block carries a hand-packed META TRAILER right
-after its unchanged bincode bytes — `UNAFSMT1 | parent | ctime | mtime | atime
+after its unchanged §R6 record bytes — `UNAFSMT1 | parent | ctime | mtime | atime
 | name_len | name` (KAT `kat_inode_meta_trailer_v6`; names over 255 B store
 `0xFFFF` and the path asks the parent's listing). `Inode`'s own encoding is
-untouched (the new fields are `serde(skip)`), so every kept golden holds; the
+untouched (the new fields are not part of the §R6 record), so every kept golden holds; the
 trailer is magic-discriminated like the spill trailer, which follows it.
 `mkdir`/`create_file`/the batch path stamp the link, `rename` restamps it in
 the same transaction, and `UnaFS::path_of` derives `/a/b/c` in O(depth) inode

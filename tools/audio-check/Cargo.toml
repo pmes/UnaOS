@@ -1,0 +1,9 @@
+[package]
+name = "audio-check"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "AUDIOCODEC (SR30): decode any file audio_core reads, print what it is, write the PCM as WAV (your ears; Chromium's oracle can play it back)."
+
+[dependencies]
+audio_core = { path = "../../unaos/libs/media/audio_core" }

@@ -511,6 +511,29 @@ impl Finder {
     }
 }
 
+/// Receipts Matrix stamps on the requests it delegates to Facet: `'M'` in the top byte, a counter
+/// below, so an answer on the shared Synapse is recognisably Matrix's.
+pub const FACET_RECEIPT_TAG: u64 = (b'M' as u64) << 56;
+
+/// The "open image" association (SR29): a successful `FsVerb::Open` of a file Facet claims
+/// ([`bandy::FacetCommand::image_mime_for`]) is DELEGATED to Facet — Matrix answers the Finder
+/// with its `FsOpResult` as always, and asks Facet to open the absolute path for the same
+/// principal. Matrix never decodes an image itself. `None` for every other event.
+pub fn facet_delegation(root: &Path, event: &MatrixEvent, receipt_id: u64) -> Option<bandy::FacetCommand> {
+    match event {
+        MatrixEvent::FsOpResult { principal, verb: FsVerb::Open, outcome: FsOutcome::Ok { path }, .. }
+            if bandy::FacetCommand::image_mime_for(path).is_some() =>
+        {
+            Some(bandy::FacetCommand::ImageOpen {
+                receipt_id,
+                principal: principal.clone(),
+                path: root.join(path).to_string_lossy().into_owned(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Is `event` a Finder request this handler should service?
 pub fn is_finder_request(event: &MatrixEvent) -> bool {
     matches!(event, MatrixEvent::BrowseTo { .. } | MatrixEvent::FileOp { .. })

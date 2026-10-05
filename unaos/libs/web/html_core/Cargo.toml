@@ -1,0 +1,17 @@
+[package]
+name = "html_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "UnaOS's own HTML parser: WHATWG tokenizer, tree construction, arena DOM and serializer — no_std + alloc, zero dependencies."
+
+# HTMLCORE (LEDGER SR46). `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, written from the WHATWG HTML Living
+# Standard §13.2 (tokenizer + tree construction), §13.3 (serializer) and §13.4 (fragment parsing). The named
+# character reference table (src/entities.rs) is generated DATA from the spec's entities.json by
+# tools/gen_entities.py. Proof: html5lib-tests tokenizer + tree-construction vectors fetched at test time
+# (vectors.txt), a Chromium outerHTML oracle on the EYES corpus (tests/m3_oracle.rs), and a mutation fuzz.
+#
+# Dependencies: none. Dev-dependencies: none (the tests carry their own JSON reader and shell out to curl /
+# sha256sum to fetch the vectors).
+
+[dependencies]

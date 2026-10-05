@@ -16910,9 +16910,9 @@ impl PrincipalRecord {
 /// [u8;5] = *b"UNAFS"`), deliberately distinct from the FAT-bridge sidecar's `ATR_MAGIC` (`UNAATR1\0`) so a
 /// kernel can tell a real native volume from the shim and drive migrate-then-delete at K4. Kept LOCAL (the
 /// crate is std/Ring-3, unported); if that native magic ever changes, change it here. The classifier below
-/// assumes this lands at byte 0 of the native superblock — true because `unaos/libs/fs/unafs` serializes `Superblock`
-/// with bincode fixint (a fixed `[u8;5]` field emits no length prefix); a future serde/codec change there
-/// must be reflected here.
+/// assumes this lands at byte 0 of the native superblock — true because the UnaFS record spec puts `magic` at
+/// offset 0 of `Superblock` (docs/dev/OS/09_FILESYSTEM/unafs-records.md §R2: a `[u8;5]` field carries no length
+/// prefix); a change to that record must be reflected here.
 const UNAFS_SB_MAGIC: [u8; 5] = *b"UNAFS";
 
 /// K4-ready: what a candidate leading byte-slice looks like — the FAT-bridge ACL sidecar (starts with

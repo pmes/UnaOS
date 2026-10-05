@@ -1,0 +1,57 @@
+<!-- CSSCORE stress: var(), calc trees, font-size / line-height / weight resolution, colors, shorthands -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>values</title>
+<style>
+:root { --main: rgb(20, 40, 60); --pad: 6px; --twice: calc(var(--pad) * 2); --a: var(--b); --b: var(--a); --empty: ; --fs: 1.25em; }
+.v1 { color: var(--main); padding-top: var(--twice); }
+.v2 { color: var(--missing, hsl(120deg 50% 40%)); }
+.v3 { color: var(--a, blue); background-color: var(--a); }
+.v4 { --main: crimson; color: var(--main); }
+.v4 span { color: var(--main); }
+.v5 { margin-top: var(--nope); color: var(--nope); }
+.v6 { font-size: var(--fs); }
+.c1 { padding-top: calc(1em + 2px); font-size: 20px; }
+.c2 { padding-top: calc((10px + 2vw) * 2 - 1rem); }
+.c3 { margin-top: min(10vw, 50px, 3em); padding-top: max(1px, min(5px, 2vmin)); }
+.c4 { font-size: clamp(12px, 1rem + 1vw, 40px); line-height: calc(1.5 * 1em); }
+.f1 { font-size: small; } .f2 { font-size: larger; } .f3 { font-size: 150%; } .f4 { font-size: 0.5rem; }
+.f5 { font-size: x-large; } .f6 { font-size: 2em; } .f6 .f6 { font-size: 50%; }
+.lh1 { line-height: 1.25; font-size: 12px; } .lh1 span { font-size: 24px; }
+.lh2 { line-height: 150%; font-size: 10px; } .lh2 span { font-size: 30px; }
+.lh3 { line-height: 2em; } .lh4 { line-height: normal; }
+.w1 { font-weight: 300; } .w1 b { font-weight: bolder; } .w2 { font-weight: 800; } .w2 i { font-weight: lighter; } .w3 { font-weight: 550; }
+.k1 { color: #0f08; background-color: #12345678; } .k2 { color: rgb(255 0 0 / 50%); } .k3 { color: hwb(200 10% 20%); }
+.k4 { color: hsla(30, 100%, 50%, 0.25); } .k5 { color: transparent; } .k6 { color: RebeccaPurple; border: 3px solid; }
+.k7 { color: rgba(0, 0, 255, .3); border-left: thick double currentcolor; }
+.b1 { border: 0.5px dashed red; } .b2 { border-top: 2.7px solid; } .b3 { border-width: thin medium; border-style: groove; }
+.b4 { border-style: solid none; border-color: red green blue; } .b5 { border: 4px none; }
+.t1 { text-decoration: underline overline red; } .t2 { text-decoration: line-through; } .t3 { text-decoration-line: overline underline; }
+.ws1 { white-space: pre-line; } .ws2 { white-space: break-spaces; }
+.ls1 { list-style: square inside; } .ls2 { list-style: none; } .ls3 { list-style-type: lower-roman; }
+.d1 { display: inline flex; } .d2 { display: grid; } .d2 span { display: inline; } .d3 span { position: absolute; display: inline-block; }
+.d4 { display: block flow; }
+.font1 { font: italic bold 18px/1.5 Georgia, "Times New Roman", serif; }
+.font2 { font: 12px monospace; } .font3 { font-family: monospace, monospace; } .font4 { font-family: Helvetica Neue, Arial; }
+.m1 { margin: 10px auto 5px; padding: 1em 2em 3em; } .m2 { margin-block: 3px 9px; padding-block: 4px; }
+.inh { border: 2px solid green; } .inh span { border-left-color: inherit; padding-top: inherit; margin-top: inherit; }
+.ini { color: initial; font-size: initial; } .uns { color: blue; } .uns span { color: unset; background-color: unset; }
+</style></head><body>
+<p class="v1">var</p><p class="v2">fallback</p><p class="v3">cycle</p><div class="v4">scoped <span>child</span></div>
+<p class="v5">invalid at computed time</p><div class="v6">em var <span>inner</span></div>
+<p class="c1">calc em</p><p class="c2">calc nest</p><p class="c3">min max</p><p class="c4">clamp</p>
+<p class="f1">small <span class="f2">larger</span></p><p class="f3">150%</p><p class="f4">rem</p>
+<div class="f5">x-large <div class="f6">2em <div class="f6">50%</div></div></div>
+<div class="lh1">lh number <span>inherits number</span></div><div class="lh2">lh pct <span>inherits px</span></div>
+<p class="lh3">lh em</p><p class="lh4">normal</p>
+<div class="w1">300 <b>bolder</b></div><div class="w2">800 <i>lighter</i></div><p class="w3">550</p>
+<p class="k1">hex alpha</p><p class="k2">modern rgb</p><p class="k3">hwb</p><p class="k4">hsla</p><p class="k5">transparent</p>
+<p class="k6">named</p><p class="k7">currentcolor border</p>
+<p class="b1">b1</p><p class="b2">b2</p><p class="b3">b3</p><p class="b4">b4</p><p class="b5">b5</p>
+<p class="t1">t1</p><p class="t2">t2</p><p class="t3">t3</p><p class="ws1">ws1</p><p class="ws2">ws2</p>
+<ul class="ls1"><li>a</li></ul><ul class="ls2"><li>b</li></ul><ol class="ls3"><li>c</li></ol>
+<div class="d1"><span>flex item</span></div><div class="d2"><span>grid item</span></div><div class="d3"><span>abs</span></div><div class="d4">d4</div>
+<p class="font1">font1</p><p class="font2">font2</p><p class="font3">font3 <code>code</code></p><p class="font4">font4</p>
+<p class="m1">m1</p><p class="m2">m2</p>
+<div class="inh">inh <span>child</span></div><p class="ini">initial</p><div class="uns">unset <span>child</span></div>
+<p><code>code</code> <code style="font-size: 1em">1em</code> <small>small</small> <big>big</big> <sub>sub</sub></p>
+</body></html>

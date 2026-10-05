@@ -1,0 +1,41 @@
+<!-- CSSCORE stress: Selectors 4 over a real page (attribute operators and flags, :nth-*() of S, :has, :is/:not, states, namespaces) -->
+<!DOCTYPE html>
+<html lang="en-GB"><head><meta charset="utf-8"><title>selectors</title>
+<style>
+@namespace svg url(http://www.w3.org/2000/svg);
+[data-x] { color: rgb(1, 1, 1); } [data-x="a b"] { color: rgb(2, 2, 2); } [data-y~="b"] { color: rgb(3, 3, 3); }
+[lang|="fr"] { color: rgb(4, 4, 4); } [href^="https"] { color: rgb(5, 5, 5); } [href$=".pdf"] { color: rgb(6, 6, 6); }
+[title*="mid"] { color: rgb(7, 7, 7); } [data-c="ABC" i] { color: rgb(8, 8, 8); } [type="TEXT"] { background-color: rgb(9, 9, 9); }
+[data-s="abc" s] { color: rgb(10, 10, 10); }
+li:nth-child(2n+1) { color: rgb(11, 11, 11); } li:nth-child(even of .k) { background-color: rgb(12, 12, 12); }
+li:nth-last-child(1) { font-style: italic; } li:nth-of-type(3) { font-weight: 700; } li:nth-last-of-type(2) { text-decoration: underline; }
+li:first-child { padding-top: 1px; } li:only-child { padding-top: 2px; } li:last-of-type { margin-top: 3px; }
+.box:has(> .hit) { color: rgb(13, 13, 13); } .box:has(+ .after) { background-color: rgb(14, 14, 14); } .box:has(.deep .hit) { font-style: italic; }
+.box:not(:has(.hit)) { font-weight: 700; } :is(.p1, .p2) > em { color: rgb(15, 15, 15); } .q:not(.r, [data-z]) { color: rgb(16, 16, 16); }
+.sib ~ .sib { color: rgb(17, 17, 17); } .sib + .sib { background-color: rgb(18, 18, 18); }
+:empty { padding-top: 4px; } :root { background-color: rgb(250, 250, 250); } body > :first-child { margin-top: 5px; }
+:lang(en) .lang { color: rgb(19, 19, 19); } :lang(fr) { font-style: italic; } :dir(rtl) { color: rgb(20, 20, 20); }
+input:checked { margin-top: 6px; } input:disabled { color: rgb(21, 21, 21); } input:enabled { padding-top: 3px; } input:required { background-color: rgb(22, 22, 22); }
+input:read-only { font-weight: 700; } input:placeholder-shown { text-decoration: line-through; }
+option:checked { color: rgb(23, 23, 23); } fieldset:disabled input { background-color: rgb(24, 24, 24); }
+a:link { color: rgb(25, 25, 25); } a:any-link { background-color: rgb(26, 26, 26); } a:visited { color: red; }
+svg|rect { visibility: hidden; } svg|* { display: none; } |p { color: red; } *|p.ns { background-color: rgb(27, 27, 27); }
+div:where(.lo) { color: red; } .lo { color: rgb(28, 28, 28); }
+</style></head><body>
+<p data-x="a b">attr exact</p><p data-x="c">attr present</p><p data-y="a b c">includes</p><p lang="fr-CA">dash</p>
+<a href="https://example.org/doc.pdf">link</a> <a href="https://x.org">s</a> <a href="/r.pdf">pdf</a> <a>no href</a>
+<p title="amidst">substring</p><p data-c="abc">i flag</p><p data-s="ABC">s flag</p><input type="text" value="v">
+<ul><li class="k">1</li><li>2</li><li class="k">3</li><li class="k">4</li><li>5</li><li class="k">6</li></ul>
+<ol><li>only</li></ol>
+<div class="box"><span class="hit">direct</span></div><div class="box"><div class="deep"><b class="hit">deep</b></div></div><div class="box">none</div><p class="after">after</p>
+<div class="p1"><em>em1</em></div><div class="p2"><span><em>em2</em></span></div>
+<p class="q">q</p><p class="q r">qr</p><p class="q" data-z>qz</p>
+<span class="sib">s1</span><span class="sib">s2</span><span class="sib">s3</span>
+<p></p><div><!-- comment --></div><div> </div>
+<div class="lang">lang</div><div dir="rtl"><span>rtl</span></div>
+<form><input type="checkbox" checked><input type="text" disabled><input type="text" required><input type="text" readonly><input type="text" placeholder="p">
+<select><option>a</option><option selected>b</option></select>
+<fieldset disabled><input type="text"></fieldset></form>
+<svg width="10" height="10"><rect width="5" height="5"/><circle r="2"/></svg>
+<p class="ns">ns</p><div class="lo">where low</div>
+</body></html>

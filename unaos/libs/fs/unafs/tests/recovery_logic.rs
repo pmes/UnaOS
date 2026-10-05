@@ -259,6 +259,19 @@ fn fsck_detects_and_repairs_injected_refcount_drift() {
     }
     let victim = victim.expect("a free block must exist");
     device.write_block(leaf0, &leaf).unwrap();
+    // UNAFSMAP (v7): the parent entry carries the leaf's checksum and in-use
+    // count, and the top node its own trailer — RE-SEAL them so the drift is
+    // a consistent-but-wrong map (an implementation bug), not media
+    // corruption (which the checksum refuses: map_tree.rs).
+    let used = (0..BLOCK_SIZE as usize / 4)
+        .filter(|&i| u32::from_le_bytes(leaf[i * 4..i * 4 + 4].try_into().unwrap()) != 0)
+        .count() as u32;
+    index[8..12].copy_from_slice(&unafs::maptree::block_sum(&leaf).to_le_bytes());
+    index[12..16].copy_from_slice(&used.to_le_bytes());
+    let seal = unafs::hash::hash_bytes(&index[..4088]);
+    index[4088..].copy_from_slice(&seal.to_le_bytes());
+    assert!(unafs::maptree::is_paged_node(&index));
+    device.write_block(rr.refmap_block, &index).unwrap();
 
     let mut fs2 = UnaFS::mount(device).expect("mount");
     assert_eq!(fs2.free_blocks(), free_before - 1, "drift visible after mount");
