@@ -96,3 +96,17 @@ webp/lossless_indexed_4bit_palette.webp 500x300 680ef942 plain
 fixtures/webp/cat-ll.webp 320x240 826206a5 plain
 fixtures/webp/grumpycat-ll.webp 320x180 ce9320a6 plain
 fixtures/webp/pal8v5-ll.webp 127x64 0dc3db86 plain
+# VP8CORE (SR40): lossy WebP through vp8_core. gallery1: the VP8 planes were byte-identical to the raw I420
+# Chromium's decoder returned (vp8_core/oracle/webp-raw.cjs + pixel-check --compare-i420) and the RGB
+# screenshot scored max_abs_diff=0; lossy_alpha (VP8X + ALPH, VP8L-coded alpha): the full RGBA, transparent
+# pixels included, was byte-identical to Chromium's unpremultiplied WebCodecs decode (same CRC-32).
+webp/lossy_gallery1_1.webp 550x368 d1ecbbd8 plain
+webp/lossy_gallery1_2.webp 550x404 358724ea plain
+webp/lossy_gallery1_3.webp 1280x720 53d114c8 plain
+webp/lossy_gallery1_4.webp 1024x772 7f1c0d6f plain
+webp/lossy_gallery1_5.webp 1024x752 d6d277cc plain
+webp/lossy_alpha_1.webp 400x301 aff996f9 plain
+webp/lossy_alpha_2.webp 386x395 580bd306 plain
+webp/lossy_alpha_3.webp 800x600 a380eb5a plain
+webp/lossy_alpha_4.webp 421x163 0a079d79 plain
+webp/lossy_alpha_5.webp 300x300 3447100b plain

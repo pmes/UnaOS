@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! play-check <file> [--frame N --out f.png] [--hz 60] [--oracle chromium-oracle.jsonl]
+//!            [--i420-oracle <dir>]
 //! play-check --make-utp <out.mp4|out.webm> [frames] [fps]
 //! ```
 //!
@@ -15,7 +16,10 @@
 //! and, when frame N was asked for, its pts, its FNV-1a RGBA hash and the test-pattern counter
 //! read back from it. With `--oracle` it finds the file's Chromium line (by file name) and
 //! checks that every Chromium `mediaTime` lies within one frame of a presented pts, and the
-//! frame counts agree; exit status 1 on any mismatch.
+//! frame counts agree; exit status 1 on any mismatch. With `--i420-oracle <dir>` (VP8CORE, SR40)
+//! every presented I420 frame is compared byte for byte with the planes Chromium's own decoder
+//! produced for the same pts (`<dir>/<file name>.<pts µs>.i420`, written by
+//! `unaos/libs/media/vp8_core/oracle/video-frames.cjs`): frames compared, exact, worst max diff.
 
 mod png;
 
@@ -30,12 +34,37 @@ struct Capture {
     shown: Vec<(u64, i64, i64)>,
     clock: i64,
     frame: Option<Frame>,
+    /// `--i420-oracle`: (dir, file name, frames compared, exact, missing, worst max abs diff).
+    i420: Option<(String, String, u64, u64, u64, u8)>,
 }
 impl FrameSink for Capture {
     fn present(&mut self, f: &Frame, ordinal: u64) {
         self.shown.push((ordinal, f.pts_ns, self.clock));
         if self.want == Some(ordinal) {
             self.frame = Some(f.clone());
+        }
+        if let (Some(o), gneiss_pal::dsp::video::Pixels::I420 { y, u, v, y_stride, uv_stride }) = (self.i420.as_mut(), &f.pixels) {
+            let (w, h) = (f.width as usize, f.height as usize);
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let mut ours = Vec::with_capacity(w * h + 2 * cw * ch);
+            for r in 0..h {
+                ours.extend_from_slice(&y[r * y_stride..r * y_stride + w]);
+            }
+            for p in [u, v] {
+                for r in 0..ch {
+                    ours.extend_from_slice(&p[r * uv_stride..r * uv_stride + cw]);
+                }
+            }
+            let path = format!("{}/{}.{}.i420", o.0, o.1, (f.pts_ns + 500) / 1000);
+            match std::fs::read(&path) {
+                Ok(theirs) if theirs.len() == ours.len() => {
+                    let d = ours.iter().zip(&theirs).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+                    o.2 += 1;
+                    o.3 += (d == 0) as u64;
+                    o.5 = o.5.max(d);
+                }
+                _ => o.4 += 1,
+            }
         }
     }
 }
@@ -86,7 +115,9 @@ fn main() {
         std::process::exit(2)
     });
     let period = 1_000_000_000u64 / hz as u64;
-    let mut cap = Capture { want, shown: Vec::new(), clock: 0, frame: None };
+    let name = std::path::Path::new(file).file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let i420 = arg(&args, "--i420-oracle").map(|d| (d, name, 0, 0, 0, 0u8));
+    let mut cap = Capture { want, shown: Vec::new(), clock: 0, frame: None, i420 };
     p.play();
     let max_ticks = (p.info().duration_ns / period + hz as u64 * 2) as usize;
     for _ in 0..max_ticks {
@@ -123,6 +154,11 @@ fn main() {
                 ok = false;
             }
         }
+    }
+    if let Some((_, _, compared, exact, missing, worst)) = &cap.i420 {
+        let all = *compared > 0 && compared == exact && *missing == 0;
+        ok &= all;
+        extra += &format!(",\"i420_oracle\":{{\"compared\":{compared},\"exact\":{exact},\"missing\":{missing},\"max_abs_diff\":{worst}}}");
     }
     if let Some(o) = arg(&args, "--oracle") {
         let name = std::path::Path::new(file).file_name().and_then(|s| s.to_str()).unwrap_or("");

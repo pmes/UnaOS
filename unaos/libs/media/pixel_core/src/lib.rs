@@ -13,7 +13,7 @@
 //! | GIF  | GIF89a (W3C/CompuServe 1990) | [`gif`] |
 //! | BMP  | Windows BITMAPINFOHEADER family | [`bmp`] |
 //! | QOI  | qoiformat.org specification 1.0 | [`qoi`] |
-//! | WebP | RFC 9649 — the VP8L lossless bitstream (lossy VP8 is OWED) | [`webp`] |
+//! | WebP | RFC 9649 — the VP8L lossless bitstream; lossy VP8 + ALPH through `vp8_core` (RFC 6386) | [`webp`] |
 //!
 //! Output is always straight (non-premultiplied) 8-bit RGBA, row-major, top-down. Animated formats
 //! (GIF) additionally carry every fully composited canvas in [`Image::frames`].

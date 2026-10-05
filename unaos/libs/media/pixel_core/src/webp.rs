@@ -1,45 +1,140 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! WebP decoder — LOSSLESS only: RFC 9649 ("WebP Image Format", 2024) §2 RIFF container and §3–§7 the
-//! VP8L bitstream.
+//! WebP decoder — RFC 9649 ("WebP Image Format", 2024): the §2 RIFF container, LOSSY images (a VP8
+//! key frame, §2.5 / RFC 6386, decoded by `vp8_core`) with or without an `ALPH` alpha chunk (§2.7:
+//! raw or VP8L-compressed alpha, the four filtering methods), and LOSSLESS images (§3–§7, the VP8L
+//! bitstream, decoded here).
 //!
-//! Covered: the RIFF/WEBP container with a simple `VP8L` chunk or an extended `VP8X` file carrying
-//! one (ICCP/EXIF/XMP chunks skipped); the VP8L header (§3.2); all four transforms (§4) — predictor
-//! (all 14 modes, the border rules, the rightmost-column TR rule), colour (the signed 3.5 fixed-point
-//! deltas), subtract-green, colour indexing (palette delta coding and 1/2/4-bit pixel bundling);
-//! the colour cache (§5.2.3, hash 0x1e35a7bd); meta prefix codes / the entropy image (§6.2.2); simple
-//! and normal prefix codes with the code-length code and `max_symbol` (§6.2.1); LZ77 backward
-//! references with the 120-entry distance map and the length/distance prefix coding (§5.2.2).
+//! Lossless covers: the VP8L header (§3.2); all four transforms (§4) — predictor (all 14 modes, the
+//! border rules, the rightmost-column TR rule), colour (the signed 3.5 fixed-point deltas),
+//! subtract-green, colour indexing (palette delta coding and 1/2/4-bit pixel bundling); the colour
+//! cache (§5.2.3, hash 0x1e35a7bd); meta prefix codes / the entropy image (§6.2.2); simple and normal
+//! prefix codes with the code-length code and `max_symbol` (§6.2.1); LZ77 backward references with
+//! the 120-entry distance map and the length/distance prefix coding (§5.2.2).
 //!
-//! NOT decoded (refused by name): LOSSY `VP8 ` frames (and so VP8X+ALPH lossy-with-alpha) — the VP8
-//! intra decoder (RFC 6386) is OWED; animation (`ANIM`/`ANMF`) is OWED. No ICC profile is applied.
+//! Lossy: the VP8 frame decodes to I420, which converts to RGB the way libwebp presents it (BT.601
+//! limited range, "fancy" 9-3-3-1 chroma upsampling; `vp8_core::yuv`). The ALPH chunk's
+//! pre-processing (level reduction) bits are informational and need no decoder action.
+//!
+//! NOT decoded (refused by name): animation (`ANIM`/`ANMF`) is OWED. No ICC profile is applied.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::{Error, Image, le32};
 
-/// Decode a WebP file. Lossless (VP8L) only.
+/// Decode a WebP file: lossless (VP8L) or lossy (VP8, with optional ALPH alpha).
 pub fn decode(b: &[u8]) -> Result<Image, Error> {
     if b.len() < 20 || &b[0..4] != b"RIFF" || &b[8..12] != b"WEBP" {
         return Err(Error::Malformed("webp RIFF header"));
     }
     let end = (8 + le32(b, 4) as usize).min(b.len());
     let mut p = 12usize;
+    let mut canvas: Option<(u32, u32)> = None;
+    let mut alph: Option<&[u8]> = None;
     while p + 8 <= end {
         let fourcc = &b[p..p + 4];
         let size = le32(b, p + 4) as usize;
         let data = b.get(p + 8..p + 8 + size).ok_or(Error::Truncated)?;
         match fourcc {
             b"VP8L" => return decode_vp8l(data),
-            b"VP8 " => return Err(Error::Unsupported("webp lossy (VP8)")),
+            b"VP8 " => return decode_lossy(data, alph, canvas),
+            b"VP8X" => {
+                if data.len() < 10 {
+                    return Err(Error::Truncated);
+                }
+                let w = (data[4] as u32 | (data[5] as u32) << 8 | (data[6] as u32) << 16) + 1;
+                let h = (data[7] as u32 | (data[8] as u32) << 8 | (data[9] as u32) << 16) + 1;
+                canvas = Some((w, h));
+            }
+            b"ALPH" => alph = Some(data),
             b"ANIM" | b"ANMF" => return Err(Error::Unsupported("webp animation")),
-            _ => {} // VP8X, ICCP, EXIF, XMP, ALPH: keep looking for the image chunk
+            _ => {} // ICCP, EXIF, XMP: keep looking for the image chunk
         }
         p += 8 + size + (size & 1);
     }
     Err(Error::Malformed("webp without an image chunk"))
+}
+
+/// A lossy image: the VP8 key frame, plus the ALPH plane when the extended header carried one.
+fn decode_lossy(vp8: &[u8], alph: Option<&[u8]>, canvas: Option<(u32, u32)>) -> Result<Image, Error> {
+    let tag = vp8_core::parse_tag(vp8).map_err(vp8_err)?;
+    if !tag.key_frame {
+        return Err(Error::Malformed("webp VP8 chunk is not a key frame"));
+    }
+    let (w, h) = (tag.width as u32, tag.height as u32);
+    if let Some((cw, ch)) = canvas {
+        if (cw, ch) != (w, h) {
+            return Err(Error::Malformed("webp VP8 frame size differs from the VP8X canvas"));
+        }
+    }
+    crate::rgba_len(w, h)?;
+    let yuv = vp8_core::decode_key_frame(vp8).map_err(vp8_err)?;
+    let mut rgba = vp8_core::yuv::to_rgba(&yuv);
+    if let Some(a) = alph {
+        let alpha = decode_alpha(a, w as usize, h as usize)?;
+        for (px, &a) in rgba.chunks_exact_mut(4).zip(alpha.iter()) {
+            px[3] = a;
+        }
+    }
+    Ok(Image::still(w, h, rgba))
+}
+
+fn vp8_err(e: vp8_core::Error) -> Error {
+    match e {
+        vp8_core::Error::Truncated => Error::Truncated,
+        vp8_core::Error::Malformed(m) => Error::Malformed(m),
+    }
+}
+
+/// The ALPH chunk (RFC 9649 §2.7): a header byte (reserved:2, pre-processing:2, filtering:2,
+/// compression:2), then the `w × h` alpha plane — raw, or a VP8L image-stream with implicit
+/// dimensions whose GREEN channel carries alpha — then the inverse of the spatial filter.
+fn decode_alpha(d: &[u8], w: usize, h: usize) -> Result<Vec<u8>, Error> {
+    let hdr = *d.first().ok_or(Error::Truncated)?;
+    let compression = hdr & 3;
+    let filtering = (hdr >> 2) & 3;
+    let mut a = match compression {
+        0 => {
+            let raw = d.get(1..1 + w * h).ok_or(Error::Truncated)?;
+            raw.to_vec()
+        }
+        1 => {
+            let mut br = Bits::new(&d[1..]);
+            let px = decode_vp8l_stream(&mut br, w, h)?;
+            px.iter().map(|p| (p >> 8) as u8).collect()
+        }
+        _ => return Err(Error::Malformed("webp ALPH compression method")),
+    };
+    // Unfiltering (§2.7, "Filtering method"): each value is a delta from its predictor, mod 256.
+    // Row 0 predicts from the left (pixel (0,0) from 0); column 0 predicts from above.
+    let pred_at = |a: &[u8], x: usize, y: usize| -> u8 {
+        let l = |a: &[u8]| a[y * w + x - 1];
+        let t = |a: &[u8]| a[(y - 1) * w + x];
+        match (x, y) {
+            (0, 0) => 0,
+            (_, 0) => l(a),
+            (0, _) => t(a),
+            _ => match filtering {
+                1 => l(a),
+                2 => t(a),
+                _ => {
+                    let g = l(a) as i32 + t(a) as i32 - a[(y - 1) * w + x - 1] as i32;
+                    g.clamp(0, 255) as u8
+                }
+            },
+        }
+    };
+    if filtering != 0 {
+        for y in 0..h {
+            for x in 0..w {
+                let p = pred_at(&a, x, y);
+                a[y * w + x] = a[y * w + x].wrapping_add(p);
+            }
+        }
+    }
+    Ok(a)
 }
 
 /// LSB-first bit reader (§3.1).
@@ -430,6 +525,19 @@ fn decode_vp8l(d: &[u8]) -> Result<Image, Error> {
         return Err(Error::Malformed("vp8l version"));
     }
     let len = crate::rgba_len(w as u32, h as u32)?;
+    let px = decode_vp8l_stream(&mut br, w, h)?;
+    let mut rgba = crate::zeroed(len)?;
+    for (o, p) in rgba.chunks_exact_mut(4).zip(px.iter()) {
+        o.copy_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8, (p >> 24) as u8]);
+    }
+    Ok(Image::still(w as u32, h as u32, rgba))
+}
+
+/// A VP8L image-stream of known dimensions (§3.2 onward, after the header): transforms, then the
+/// entropy-coded image, then the inverse transforms. ARGB words. The ALPH chunk's lossless alpha
+/// is exactly this, with implicit dimensions (RFC 9649 §2.7.1.? "ALPH").
+fn decode_vp8l_stream(br: &mut Bits, w: usize, h: usize) -> Result<Vec<u32>, Error> {
+    crate::rgba_len(w as u32, h as u32)?;
     let mut xsize = w;
     let mut transforms: Vec<Transform> = Vec::new();
     let mut seen = [false; 4];
@@ -442,13 +550,13 @@ fn decode_vp8l(d: &[u8]) -> Result<Image, Error> {
         match t {
             0 | 1 => {
                 let bits = br.read(3) + 2;
-                let img = decode_image(&mut br, xsize.div_ceil(1 << bits), h.div_ceil(1 << bits), false)?;
+                let img = decode_image(br, xsize.div_ceil(1 << bits), h.div_ceil(1 << bits), false)?;
                 transforms.push(if t == 0 { Transform::Predictor { bits, img } } else { Transform::Color { bits, img } });
             }
             2 => transforms.push(Transform::SubtractGreen),
             _ => {
                 let n = br.read(8) as usize + 1;
-                let mut table = decode_image(&mut br, n, 1, false)?;
+                let mut table = decode_image(br, n, 1, false)?;
                 for i in 1..n {
                     table[i] = add_pixels(table[i], table[i - 1]);
                 }
@@ -463,7 +571,7 @@ fn decode_vp8l(d: &[u8]) -> Result<Image, Error> {
             }
         }
     }
-    let mut px = decode_image(&mut br, xsize, h, true)?;
+    let mut px = decode_image(br, xsize, h, true)?;
     // Inverse transforms in reverse order (§4).
     for t in transforms.iter().rev() {
         match t {
@@ -511,11 +619,7 @@ fn decode_vp8l(d: &[u8]) -> Result<Image, Error> {
         }
     }
     let _ = xsize;
-    let mut rgba = crate::zeroed(len)?;
-    for (o, p) in rgba.chunks_exact_mut(4).zip(px.iter()) {
-        o.copy_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8, (p >> 24) as u8]);
-    }
-    Ok(Image::still(w as u32, h as u32, rgba))
+    Ok(px)
 }
 
 #[inline]

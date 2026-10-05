@@ -78,18 +78,29 @@ fn decode_data_uri(rest: &str) -> Option<image::RgbaImage> {
 
 /// Decodes raster image bytes to straight RGBA.
 ///
-/// PIXELCORE (SR25): PNG, JPEG, GIF (first frame), BMP, QOI and WebP-lossless go through UnaOS's own
-/// decoders — `gneiss_pal::dsp::image`, i.e. `pixel_core`, the code the kernel's Facet runs too — with
-/// the EXIF orientation applied, as a browser applies it (`image-orientation: from-image`). The `image`
-/// crate stays behind it ONLY for what pixel_core refuses (lossy WebP, ICO, TIFF, AVIF, …, or a file
-/// pixel_core calls malformed), and only with the `image-fallback` feature (without it the `image` crate
-/// can still read PNG — the codec its PNG writer brings along). Build without the `pixel-core` feature to
-/// put the `image` crate back in front for everything (the swap is reversible).
+/// PIXELCORE (SR25): PNG, JPEG, GIF (first frame), BMP, QOI and WebP — lossless, and lossy (VP8 + ALPH)
+/// through VP8CORE (SR40) — go through UnaOS's own decoders — `gneiss_pal::dsp::image`, i.e.
+/// `pixel_core`, the code the kernel's Facet runs too — with the EXIF orientation applied, as a browser
+/// applies it (`image-orientation: from-image`). WebP NEVER falls back (SR40 removed that chicken
+/// wire): a WebP pixel_core refuses (animation, OWED) is a ledgered miss. The `image` crate stays behind
+/// it ONLY for the other formats pixel_core refuses (ICO, TIFF, AVIF, …, or a file it calls
+/// malformed), and only with the `image-fallback` feature (without it the `image` crate can still read
+/// PNG — the codec its PNG writer brings along). Build without the `pixel-core` feature to put the
+/// `image` crate back in front for everything (the swap is reversible).
 pub fn decode_raster(bytes: &[u8]) -> Option<image::RgbaImage> {
     #[cfg(feature = "pixel-core")]
-    if let Ok(mut img) = gneiss_pal::dsp::image::decode(bytes) {
-        img.apply_orientation();
-        return image::RgbaImage::from_raw(img.width, img.height, img.rgba);
+    {
+        match gneiss_pal::dsp::image::decode(bytes) {
+            Ok(mut img) => {
+                img.apply_orientation();
+                return image::RgbaImage::from_raw(img.width, img.height, img.rgba);
+            }
+            Err(e) if gneiss_pal::dsp::image::sniff(bytes) == Some(gneiss_pal::dsp::image::Format::WebP) => {
+                crate::ledger::record_dom(&format!("img-webp-refused:{e}"));
+                return None;
+            }
+            Err(_) => {}
+        }
     }
     image::load_from_memory(bytes).ok().map(|i| i.to_rgba8())
 }

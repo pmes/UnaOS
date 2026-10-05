@@ -217,7 +217,7 @@ b4c79cb8ffd2f1c096af27f9d82b5feaa0aa2cb049c791e0f6251de0435066e5 bmp/rgb32.bmp h
 4c1189e3a039b1e5aae6347024684937c495a5736a3c309dc7c2e3c161f89751 bmp/rgb32bf.bmp https://raw.githubusercontent.com/image-rs/image/main/tests/images/bmp/images/rgb32bf.bmp
 257e0127fa0ccdb6eb8381338dda0fb692b2ea4d38775f1aed56dfdccaed2ab4 bmp/rgba32.bmp https://raw.githubusercontent.com/image-rs/image/main/tests/images/bmp/images/rgba32.bmp
 1d2183466e05c768b5a9d2ce5d132d72db2272bb331c7b27560d24f197f4165e bmp/rgba32abf.bmp https://raw.githubusercontent.com/image-rs/image/main/tests/images/bmp/images/rgba32abf.bmp
-# WebP: image-rs/image-webp test images (libwebp gallery2 lossless+alpha, palette regressions, one lossy for the refusal).
+# WebP: image-rs/image-webp test images (libwebp gallery2 lossless+alpha, palette regressions, lossy gallery1 now decoded by vp8_core).
 49a902b9c35bd2031bf26234c59ff369dd3ae18a3b58247285104a23346ba2d4 webp/1_webp_ll.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/1_webp_ll.webp
 67d332b637d19997ca95359099067205ce28226d15320ae8f17da51e4f814c95 webp/2_webp_ll.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/2_webp_ll.webp
 764f01c6f3e50ce4002004073cc01dc9960882925cdf775a4ddb000c8ec74bf2 webp/3_webp_ll.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/3_webp_ll.webp
@@ -228,3 +228,13 @@ b3ad6ddb0c1e64557dfdd31721fcbfb5bdaac5eff5a77f15c105881e0b7f2579 webp/4_webp_ll.
 e6ba9f187b5095413cc774d9bf97c0ef03732ad979ea4b7184ec6e1a86d43a4f webp/lossless_indexed_2bit_palette.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/regression/lossless_indexed_2bit_palette.webp
 ee85a860cbc3ecfa7177db9ae0d49811be0a05ff6dc1167b1fdb9984bf9890c1 webp/lossless_indexed_4bit_palette.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/regression/lossless_indexed_4bit_palette.webp
 4a5afeaff8483923da964bc7896f02d0283e8bff99b5b8f82a31ae3214dab1d0 webp/lossy_gallery1_1.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery1/1.webp
+# VP8CORE (SR40): the rest of the lossy gallery, and the lossy+alpha (VP8X + ALPH, VP8L-coded alpha) gallery2 set.
+1ac427ad555ba5898015e8b60396e1852bfc1e9cd7ae5da6dd42c85ea3e169f7 webp/lossy_gallery1_2.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery1/2.webp
+82747f0d9a39830fb3b6a21b0b08a04a80e7c539446ee5ccfc4b50b304a8b7ee webp/lossy_gallery1_3.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery1/3.webp
+0858d0afcb2921ded36b05586204f2459d965feb7db54cb083e3cfa059589dd9 webp/lossy_gallery1_4.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery1/4.webp
+eb4f6043f17a868cb6618a97fb5ba9a130c7f10b13b1db83fcf2df10ecbe1f23 webp/lossy_gallery1_5.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery1/5.webp
+31090d2cdaa455d4153829074f2c91228964a83f86503600360b86d5d57160c3 webp/lossy_alpha_1.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/1_webp_a.webp
+6dcb51b9ef8f4932d21584674af09336401e386782ca2dd2b0a7e2cb8bfdb49c webp/lossy_alpha_2.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/2_webp_a.webp
+3007986171ba049ea85169be273750e85c4b55893d8cdc481ce11aa58dbbc734 webp/lossy_alpha_3.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/3_webp_a.webp
+fa31545986fdb8fd3ad7f0393f1edfd78dffbe65f665a226930119afcc85b6a5 webp/lossy_alpha_4.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/4_webp_a.webp
+c0e56c65ecde7236f0e4ff1bc553b7cd033aa3b880d5a8bf60191714d1150f7b webp/lossy_alpha_5.webp https://raw.githubusercontent.com/image-rs/image-webp/main/tests/images/gallery2/5_webp_a.webp

@@ -36,6 +36,8 @@ unicode-normalization = { version = "0.1", optional = true }
 
 # PLAYBACK (SR26): the container core `dsp::demux` re-exports (`no_std`, no dependencies).
 demux_core = { path = "../../unaos/libs/media/demux_core" }
+# VP8CORE (SR40): the from-spec VP8 decoder behind `dsp::video::vp8` (`no_std`, no dependencies).
+vp8_core = { path = "../../unaos/libs/media/vp8_core" }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "macros", "time"] }

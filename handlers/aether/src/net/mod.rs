@@ -289,10 +289,10 @@ pub fn favicon_url(base_url: &str, html: &str) -> Option<String> {
 /// (`None`): a missing `/favicon.ico` is the overwhelmingly common case, not an
 /// error worth a ledger line.
 ///
-/// PNG/JPEG/GIF/BMP/QOI/WebP-lossless go through `images::decode_raster`
-/// (UnaOS's own pixel_core); ICO and lossy WebP fall back to the `image` crate
-/// behind it (ICO: it picks the largest contained image), and an SVG icon falls
-/// back to the rasterizer the page images use.
+/// PNG/JPEG/GIF/BMP/QOI/WebP (lossless and lossy) go through
+/// `images::decode_raster` (UnaOS's own pixel_core + vp8_core); ICO falls back to
+/// the `image` crate behind it (it picks the largest contained image), and an SVG
+/// icon falls back to the rasterizer the page images use.
 pub async fn fetch_favicon(url: &str) -> Option<(u32, u32, Vec<u8>)> {
     let bytes = fetch_image_bytes(url).await.ok()?;
     let decoded = crate::images::decode_raster(&bytes).or_else(|| crate::images::decode_svg(&bytes))?;

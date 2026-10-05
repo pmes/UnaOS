@@ -10,7 +10,8 @@
 //! player (demux → decode → clock → sink) runs before AV1 does. AV1 arrives as `video::av1` from
 //! AVCODEC (LEDGER SR24) behind the `av1` feature: that module provides
 //! `av1::Av1Decoder::new(&Track) -> Result<Av1Decoder, DecodeError>` implementing
-//! [`VideoDecoder`], and the registry arm below is already written against it.
+//! [`VideoDecoder`], and the registry arm below is already written against it. VP8 (WebM `V_VP8`,
+//! MP4 `vp08`) is real: [`vp8::Vp8Decoder`] over `vp8_core` (VP8CORE, LEDGER SR40).
 
 use super::demux::{Codec, Packet, Track};
 use super::demux::build::TestPatternPacket;
@@ -100,13 +101,14 @@ pub trait VideoDecoder: Send {
 
 /// Pick the decoder for a video track.
 ///
-/// `utp1` → [`TestPattern`] (real: it is that stream's decoder). AV1 → `av1::Av1Decoder` when the
-/// `av1` feature is on. Anything else → `Err(Unsupported)`; the caller may then ask for
+/// `utp1` → [`TestPattern`] (real: it is that stream's decoder). VP8 → [`vp8::Vp8Decoder`]. AV1 →
+/// `av1::Av1Decoder` when the `av1` feature is on. Anything else → `Err(Unsupported)`; the caller may then ask for
 /// [`TestPattern::stand_in`] to keep the pipeline (clock, scheduling, sink) running, which marks
 /// itself `is_real() == false`.
 pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> {
     match &track.codec {
         Codec::TestPattern => Ok(Box::new(TestPattern::new(track))),
+        Codec::Vp8 => Ok(Box::new(vp8::Vp8Decoder::new(track)?)),
         #[cfg(feature = "av1")]
         Codec::Av1 => Ok(Box::new(av1::Av1Decoder::new(track)?)),
         other => Err(DecodeError::Unsupported(format!("{other:?} ({})", track.codec_name))),
@@ -115,6 +117,7 @@ pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> 
 
 #[cfg(feature = "av1")]
 pub mod av1;
+pub mod vp8;
 
 // ---------------------------------------------------------------------------------------------
 // TestPattern
@@ -329,6 +332,52 @@ mod tests {
         assert!(matches!(decoder_for(&d.tracks()[0]), Err(DecodeError::Unsupported(_))));
         let s = TestPattern::stand_in(&d.tracks()[0]);
         assert!(!s.is_real());
+    }
+
+    /// VP8CORE (SR40): the WPT VP8 WebM through the registry. Every frame's I420 was byte-identical
+    /// to the planes Chromium's own decoder presented (play-check --i420-oracle, 60/60); the FNV-1a over
+    /// all 60 frames pins that answer here. Fetched at test time (sha256 as in demux_core's
+    /// tests/data/vectors.txt); offline = SKIP.
+    #[test]
+    fn vp8_webm_decodes_to_chromiums_frames() {
+        const NAME: &str = "test-av-384k-44100Hz-1ch-320x240-30fps-10kfr.webm";
+        const SHA: &str = "032d3fd8d1a0301820f5531d58477f9d54c42e2c43d4738fef97035b43ca5df0";
+        let dir = std::env::temp_dir().join("gneiss-vp8-vectors");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(NAME);
+        let sha = |p: &std::path::Path| {
+            std::process::Command::new("sha256sum").arg(p).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("").to_string())
+        };
+        if sha(&path).as_deref() != Some(SHA) {
+            let url = format!("https://raw.githubusercontent.com/web-platform-tests/wpt/master/media/{NAME}");
+            let ok = std::process::Command::new("curl").args(["-sSfL", "-o"]).arg(&path).arg(&url).status().map(|s| s.success()).unwrap_or(false);
+            if !ok || sha(&path).as_deref() != Some(SHA) {
+                eprintln!("SKIP {NAME}: not fetched (offline?)");
+                return;
+            }
+        }
+        let mut d = Demuxer::open(std::fs::read(&path).unwrap()).unwrap();
+        let vt = d.tracks().iter().find(|t| t.codec == Codec::Vp8).unwrap().clone();
+        let mut dec = decoder_for(&vt).unwrap();
+        assert!(dec.is_real());
+        assert_eq!(dec.name(), "vp8 (vp8_core)");
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut n = 0;
+        while let Some(p) = d.next_packet() {
+            if p.track != vt.id {
+                continue;
+            }
+            if let Some(f) = dec.decode(&p).unwrap() {
+                assert_eq!((f.width, f.height), (320, 240));
+                let Pixels::I420 { y, u, v, .. } = &f.pixels else { panic!("not I420") };
+                for b in y.iter().chain(u).chain(v) {
+                    h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+                }
+                n += 1;
+            }
+        }
+        assert_eq!(n, 60);
+        assert_eq!(format!("{h:016x}"), "1cf9f393b689319c", "VP8 frames moved off Chromium's answer");
     }
 
     #[test]

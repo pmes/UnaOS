@@ -9,6 +9,8 @@ description = "PIXELCORE's eyes: decode any image with pixel_core and write it a
 name = "pixel-check"
 path = "src/main.rs"
 
-# pixel_core only — no third-party crates (R83: built in UnaOS).
+# pixel_core and vp8_core only — no third-party crates (R83: built in UnaOS).
 [dependencies]
 pixel_core = { path = "../../unaos/libs/media/pixel_core" }
+# VP8CORE (SR40): the lossy-WebP plane comparison (--compare-i420) scores vp8_core directly.
+vp8_core = { path = "../../unaos/libs/media/vp8_core" }

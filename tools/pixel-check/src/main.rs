@@ -6,6 +6,8 @@
 //! ```text
 //! pixel-check <in> [out.png]                 decode with pixel_core, print a summary, write RGBA PNG
 //! pixel-check --compare-raw <in> <dir>      exact RGBA, every frame, vs chromium-frames.cjs output
+//! pixel-check --compare-i420 <webp> <i420>   VP8CORE: the lossy WebP's VP8 planes (vp8_core) vs the raw
+//!                                            I420 Chromium's decoder produced (vp8_core/oracle/webp-raw.cjs)
 //! pixel-check --digest [--orient] <in>...   CRC-32 of the decoded RGBA (the tests' pinned KAT digest)
 //! pixel-check --frames <in> <dir>            write every composited animation frame as <dir>/fNNN.png
 //! pixel-check --compare <in> <shot.png> <r,g,b> [--orient] [--frame N]
@@ -146,6 +148,28 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("--compare-i420") => {
+            let input = args.get(1).ok_or("--compare-i420 <webp> <i420>")?;
+            let theirs = read(args.get(2).ok_or("missing .i420")?)?;
+            let b = read(input)?;
+            let vp8 = riff_chunk(&b, b"VP8 ").ok_or("no VP8 chunk")?;
+            let y = vp8_core::decode_key_frame(vp8).map_err(|e| e.to_string())?;
+            let ours: Vec<u8> = [y.y.as_slice(), &y.u, &y.v].concat();
+            if ours.len() != theirs.len() {
+                return Err(format!("size {} vs chromium {}", ours.len(), theirs.len()));
+            }
+            let names = ["Y", "U", "V"];
+            let ylen = y.y.len();
+            let clen = y.u.len();
+            let mut line = format!("{input} {}x{}", y.width, y.height);
+            for (i, (o, t)) in [(0, ylen), (ylen, ylen + clen), (ylen + clen, ylen + 2 * clen)].into_iter().enumerate().map(|(i, (a, b))| (i, (&ours[a..b], &theirs[a..b]))) {
+                let maxd = o.iter().zip(t).map(|(p, q)| p.abs_diff(*q)).max().unwrap_or(0);
+                let diff = o.iter().zip(t).filter(|(p, q)| p != q).count();
+                line += &format!(" {}:max_abs_diff={maxd},differing={diff}", names[i]);
+            }
+            println!("{line}");
+            Ok(())
+        }
         Some("--digest") => {
             // CRC-32 of the decoded RGBA (orientation applied with --orient; every frame of an
             // animation, concatenated) — the KAT digest the tests pin.
@@ -253,4 +277,17 @@ fn write_png(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
     chunk(b"IDAT", &z);
     chunk(b"IEND", &[]);
     out
+}
+
+/// The payload of the first RIFF chunk with this FourCC.
+fn riff_chunk<'a>(b: &'a [u8], cc: &[u8; 4]) -> Option<&'a [u8]> {
+    let mut p = 12usize;
+    while p + 8 <= b.len() {
+        let size = u32::from_le_bytes(b[p + 4..p + 8].try_into().ok()?) as usize;
+        if &b[p..p + 4] == cc {
+            return b.get(p + 8..p + 8 + size);
+        }
+        p += 8 + size + (size & 1);
+    }
+    None
 }

@@ -3741,6 +3741,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "unicode-normalization",
+ "vp8_core",
 ]
 
 [[package]]
@@ -6101,6 +6102,7 @@ name = "pixel-check"
 version = "0.1.0"
 dependencies = [
  "pixel_core",
+ "vp8_core",
 ]
 
 [[package]]
@@ -6108,6 +6110,7 @@ name = "pixel_core"
 version = "0.1.0"
 dependencies = [
  "image",
+ "vp8_core",
 ]
 
 [[package]]
