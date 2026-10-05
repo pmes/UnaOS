@@ -830,8 +830,8 @@ pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize
     // `slots` holds the eligible rows in composite order and `got_buf` their five readings each;
     // `chrome_probes` regenerates the coordinates and expectations for the print pass, so the two
     // halves cannot drift.
-    let mut slots = [0usize; super::wm::MAX_WINDOWS];
-    let mut got_buf = [0u32; super::wm::MAX_WINDOWS * 5];
+    let mut slots = alloc::vec![0usize; rows.len()]; // WINDOWCAP-2: sized to the snapshot it walks
+    let mut got_buf = alloc::vec![0u32; rows.len() * 5];
     for &i in order.iter() {
         let Some(r) = rows.get(i) else { continue };
         // Compat rows have no chrome at all (`paint_window` guards every chrome write with

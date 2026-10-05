@@ -875,7 +875,7 @@ const _: () = assert!(!DESK_SPRITE_OCC || crate::pal::cursor::SPRITE_OWNS_PAINT)
 const DESK_SPRITE_MAX: usize = DESK_SPRITE_OCC as usize;
 
 /// SHELLDESK/PTRREPAINT — see [`DESK_SPRITE_MAX`] for the third term.
-const DESK_OCC_MAX: usize = super::wm::MAX_WINDOWS + DESK_STRIP_MAX + DESK_SPRITE_MAX;
+const DESK_OCC_MAX: usize = DESK_STRIP_MAX + DESK_SPRITE_MAX; // WINDOWCAP-2: the fixed (non-window) share only — the occluder list is a growable Vec, reserved at this plus the live table
 
 /// WC-BBSYNC — "unarmed" for [`DESKTOP_BG_SEED`]. Every colour that reaches this path is an
 /// `0x00RRGGBB` triple (the top byte is unused on both the desktop and the compositor side), so
@@ -1697,7 +1697,7 @@ impl Screen {
         //
         // x86 + `wc` only — `video::strip` is not compiled on aarch64, where this is the WC-I array
         // and the WC-I loop, byte for byte.
-        let mut occ = [(0usize, 0usize, 0usize, 0usize); DESK_OCC_MAX];
+        let mut occ: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::with_capacity(DESK_OCC_MAX + super::wm::slots()); // WINDOWCAP-2: growable
         // SHELLDESK REVIEW — **and aarch64 REALLY IS the WC-I loop, which took a second arm to make
         // true.** The single-arm version staged `occluders` into its own `wins` array and
         // `copy_from_slice`'d it into `occ`, because `occluders` takes `&mut [_; MAX_WINDOWS]` and
@@ -1712,15 +1712,13 @@ impl Screen {
         #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
         let (nocc, nwin) = {
             // `occluders` writes exactly `MAX_WINDOWS` slots; the furniture tail is appended after.
-            let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
-            let nw = super::wm::occluders(&mut wins);
-            occ[..nw].copy_from_slice(&wins[..nw]);
+            let nw = super::wm::occluders(&mut occ); // WINDOWCAP-2: straight into the growable list
             let mut n = nw;
             let mut strips = [None; super::strip::STRIP_MAX];
             let _ = super::strip::rects(self.info.width, self.info.height, &mut strips);
             for s in strips.iter().flatten() {
-                if s.2 != 0 && s.3 != 0 && n < occ.len() {
-                    occ[n] = *s;
+                if s.2 != 0 && s.3 != 0 {
+                    occ.push(*s);
                     n += 1;
                 }
             }
@@ -1734,8 +1732,8 @@ impl Screen {
             // (`strip::erase_rect`, from `crystal::compose`) is what clears the glass — the same
             // vacate contract the strips keep, obtained from the same kind of accessor.
             if let Some(m) = super::menubar::open_dropdown_rect(self.info.width, self.info.height) {
-                if m.2 != 0 && m.3 != 0 && n < occ.len() {
-                    occ[n] = m;
+                if m.2 != 0 && m.3 != 0 {
+                    occ.push(m);
                     n += 1;
                 }
             }
@@ -1769,7 +1767,7 @@ impl Screen {
         // while `note_desktop_over_sprite` counts the race. What CANNOT happen any more is the case
         // that race detector was watching for on this board: a blit landing on a live arrow because
         // the bracket was open.
-        let sprite_occ = if DESK_SPRITE_OCC && nocc < occ.len() {
+        let sprite_occ = if DESK_SPRITE_OCC { // WINDOWCAP-2: the list grows, there is always room
             super::cursor::sprite_box()
                 .filter(|_| crate::pal::cursor::visible())
                 .filter(|&(sx, sy, sw, sh)| {
@@ -1790,7 +1788,7 @@ impl Screen {
         };
         let nall = match sprite_occ {
             Some(b) => {
-                occ[nocc] = b;
+                occ.truncate(nocc); occ.push(b);
                 nocc + 1
             }
             None => nocc,
@@ -2752,14 +2750,11 @@ fn ptrown_pass(_occ: &[(usize, usize, usize, usize)], _nwin: usize, _pw: usize, 
 /// SHELLDESK arm does, and the sprite's box is appended after the windows by the caller.
 #[cfg(all(target_arch = "aarch64", not(feature = "desktop_firmware")))]
 #[inline(always)]
-fn desk_window_occluders(occ: &mut [(usize, usize, usize, usize); DESK_OCC_MAX]) -> usize {
+fn desk_window_occluders(occ: &mut alloc::vec::Vec<(usize, usize, usize, usize)>) -> usize {
     super::wm::occluders(occ)
 }
 #[cfg(all(target_arch = "x86_64", not(feature = "wc")))]
 #[inline(always)]
-fn desk_window_occluders(occ: &mut [(usize, usize, usize, usize); DESK_OCC_MAX]) -> usize {
-    let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
-    let nw = super::wm::occluders(&mut wins);
-    occ[..nw].copy_from_slice(&wins[..nw]);
-    nw
+fn desk_window_occluders(occ: &mut alloc::vec::Vec<(usize, usize, usize, usize)>) -> usize {
+    super::wm::occluders(occ) // WINDOWCAP-2: growable, no staging copy
 }

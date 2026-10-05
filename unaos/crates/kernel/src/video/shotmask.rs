@@ -303,7 +303,7 @@ enum Undo {
 #[cfg(feature = "login")]
 fn bare_compose(setter: bool) -> Result<Undo, String> {
     let mut parked: Vec<super::wm::WinId> = Vec::new();
-    for id in 1..=super::wm::MAX_WINDOWS as super::wm::WinId {
+    for id in 1..=super::wm::slots() as super::wm::WinId { // WINDOWCAP-2: every row the table has
         if !super::wm::wl_is_minimised(id) && super::wm::minimise(id).starts_with("parked") {
             parked.push(id);
         }

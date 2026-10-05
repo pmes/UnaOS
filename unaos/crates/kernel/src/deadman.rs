@@ -135,17 +135,17 @@ pub const CORES: usize = 8;
 
 /// Window ids `dmg=` tracks — must match `video::wm::MAX_WINDOWS`. Asserted below rather than
 /// imported so this module has no compile-time dependency on the compositor's layout.
-pub const ROWS: usize = 32; // WINDOWCAP (B378): follows `wm::MAX_WINDOWS` 12 -> 32 (the id space)
+pub const ROWS: usize = 0; // WINDOWCAP-2: retired — `dmg=` reads the window table's live row count (`wm::slots()`) and per-id `rowstore::SegVec`s; kept as a name for the shim's signature
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // REAL IMPLEMENTATION — x86 with the knob armed.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 #[cfg(all(feature = "deadman", target_arch = "x86_64"))]
 mod imp {
-    use super::{CORES, ROWS};
+    use super::CORES; // WINDOWCAP-2: ROWS retired
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
-    const _: () = assert!(ROWS == crate::video::wm::MAX_WINDOWS);
+    // WINDOWCAP-2: no width to match — the tables below grow with the window table.
 
     /// The "never happened" stamp. `0` is a legal `arch::ms()` reading for the first millisecond of
     /// the boot, so a separate sentinel is needed to keep "no HID report has EVER arrived" distinct
@@ -207,13 +207,11 @@ mod imp {
     /// Per-row attach sequence: bumped once per `present()` that named the row, outside the table
     /// lock. Wraps; only equality against [`ATT_AT_PASS`] is ever tested, so a wrap costs at worst
     /// one misread row after 2^32 presents on one window.
-    #[allow(clippy::declare_interior_mutable_const)]
-    const ATT_INIT: AtomicU32 = AtomicU32::new(0);
-    static ATT: [AtomicU32; ROWS] = [ATT_INIT; ROWS];
+    static ATT: crate::video::rowstore::SegVec<AtomicU32> = crate::video::rowstore::SegVec::new(|| AtomicU32::new(0));
     /// Snapshot of [`ATT`] taken at the end of each completed composite pass. A row whose live
     /// sequence still equals its snapshot has had NO attach since that pass — if it is nonetheless
     /// still marked damaged, that damage is not backed by an attach.
-    static ATT_AT_PASS: [AtomicU32; ROWS] = [ATT_INIT; ROWS];
+    static ATT_AT_PASS: crate::video::rowstore::SegVec<AtomicU32> = crate::video::rowstore::SegVec::new(|| AtomicU32::new(0));
 
     // ── the once-per-second gate ───────────────────────────────────────────────────────────────
     /// `APIC_TICKS` value at which the next line is due. The BSP ISR is the only writer.
@@ -242,8 +240,8 @@ mod imp {
     #[inline]
     pub fn note_attach(id: u32) {
         let i = id as usize;
-        if i >= 1 && i <= ROWS {
-            ATT[i - 1].fetch_add(1, Relaxed);
+        if i >= 1 {
+            ATT.get(i - 1).fetch_add(1, Relaxed);
         }
     }
 
@@ -252,8 +250,8 @@ mod imp {
     #[inline]
     pub fn note_composite_done() {
         COMP_LAST_MS.store(crate::arch::ms().max(1), Relaxed);
-        for i in 0..ROWS {
-            ATT_AT_PASS[i].store(ATT[i].load(Relaxed), Relaxed);
+        for i in 0..ATT.hwm() {
+            ATT_AT_PASS.get(i).store(ATT.get(i).load(Relaxed), Relaxed);
         }
     }
 
@@ -292,7 +290,7 @@ mod imp {
     /// Read by `wm`'s damage sampler; a pure pair of relaxed loads.
     #[inline]
     pub fn row_static(i: usize) -> bool {
-        i < ROWS && ATT[i].load(Relaxed) == ATT_AT_PASS[i].load(Relaxed)
+        ATT.peek(i).map_or(0, |a| a.load(Relaxed)) == ATT_AT_PASS.peek(i).map_or(0, |a| a.load(Relaxed)) // WINDOWCAP-2: peek — the timer ISR reads this and must never allocate
     }
 
     // ── the emit ───────────────────────────────────────────────────────────────────────────────

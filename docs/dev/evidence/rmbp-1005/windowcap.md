@@ -78,3 +78,53 @@ ONE limit; `wm::create_inner` and the x86 `sys_spawn` ask it. No second table, n
   settings, the screenshot / TEST.MD / holocron prompt OPEN (no `create-failed`); a deliberate overrun
   (`storm` repeated) prints `[wm] REFUSED create reason=limit n=<n>` and `:: NOTICE-OPEN: title=Too many
   windows`, and a ring-3 spawner past the process limit prints `[wm] REFUSED spawn … paused_ms=50..1600`.
+
+## WINDOWCAP-2 (the seat's answers, 2026-10-05): memory is the only term
+
+The seat: (1) the 32-id ceiling is not a stopping point — rows carry their own side state, the id space is
+unbounded, the witness reaches `fixed_cap=none`; (2) the dock's panel width is NOT a term of the limit — the
+dock shows what fits and overflows the rest; (3) the spawn backoff stands; (4) aarch64 `MAX_PROCS` derived,
+`MAX_KILL_REQS` follows.
+
+* **M5 — the table has no width.** `wm::MAX_WINDOWS` is gone. `Table.rows` is a heap `Vec<Window>` grown on
+  demand (`alloc_slot`: the lowest free row, else append; id = slot + 1, so ids come from a counter with
+  a free list). Every per-slot side table (pace stamps, shadow + mirror buffers, title source, native
+  bit, generation, dock stamp, ctrl-decline cells, WC-N/WC-D/WC-G witness tables, the dock's DOCKID
+  registry, deadman's attach counters) is a `video::rowstore::SegVec` — lock-free, segment-doubling,
+  never moving, allocated on first touch — and every `u32` slot mask (`PACE_PENDING`, `PACE_SHADOW_OK`,
+  `PACE_SHADOW_WEDGED`, `NATIVE_SLOTS`, `VERIFIED`, `VERIFIED_FULL`, `DO_NEIGH_MASK`, appmenu `WINS`,
+  winlist's Show-Desktop mask) is a `SlotBits` or a list. The only bound left is the `WinId` TYPE
+  (`wm::WIN_ID_SENTINEL_FLOOR = u32::MAX - 255`, the top kept for the dock's synthetic pin ids). Every
+  `[_; MAX_WINDOWS]` stack scratch became a `Vec`: the per-pass ones are warm pooled buffers (`RowsSnap`
+  for the table snapshot, `dock::ModelBuf` for the dock / bar / crystal / winmenu model) or are reserved
+  BEFORE the table lock; the rest allocate on create/close/witness paths only. `OccClip`/`OccSnap`/
+  `OccRows` and the span buffers grow. x86 `WIN_MAX` (ring-3 table) = `USER_SLOTS x FB_WIN_SLOTS`, the
+  VA layout's count; aarch64 `WIN_MAX` the same expression (was 8).
+* **M5 — memory is the limit.** `wincap::win_limit()` = half the heap free at arming ÷ `WIN_COST`; no
+  id term, no dock term. `[wm] limit windows=<n> procs=<n> from=mem:<MiB>,asids:<n> (R90)`;
+  `:: WINDOWCAP: fixed_cap=none limit=<n> procs=<n> from=mem:<MiB> opens_refused=0 -> PASS ::`. The
+  create-time refusal reasons are `limit` (the memory limit) and `heap` (the table could not grow).
+* **M5 — the dock overflows, it does not cap.** `dock::Layout::for_panel(n)` lays out every row when
+  one-glyph tiles fit; otherwise the most tiles that fit at three glyphs, the LAST one the right-edge
+  `+<k>` group (`Layout::overflow`). A press on `+<k>` opens the bar's Window menu (`winlist`: one row
+  per live app window — the list of the rest); with no Window box on the bar it raises the overflowed
+  windows in turn. `[dock] press … overflow=<k> -> window-list opened=…`. The five dock checks
+  (`desktop_uefi`, `desktop_firmware`, `quarry::live`, `main`, `display_tegra`) ask `for_panel` for the
+  LIVE count (`wincap::dock_rows` = live windows + pins) and now decline only a panel too narrow for one
+  tile.
+* **M6 — aarch64 `MAX_PROCS = USER_SLOTS - 2`** (6 on both boards today, now derived), and
+  `sched::MAX_KILL_REQS` is the same expression through the same `uslots` facade (a non-EL0 build has
+  no `Proc` table; its kill table keeps one inert row).
+* **The spawn backoff (seat: fine).** A ring-3 `sys_spawn` refused at the process limit sleeps the
+  spawner 50 ms, doubling to 1.6 s, before `-EAGAIN`. Any fixture that expects `-EAGAIN` from a full
+  process table now takes **at least 50 ms** per refused spawn (the backoff resets on the next admitted
+  spawn).
+
+### Still fixed, named (not window or process caps, but tables the seat may want next)
+* x86 `USER_SLOTS = 12` (and aarch64 8): the ring-3 address-space pool — `.bss` page tables + 1.3 MiB
+  backing per slot. `procs` is `min(asids, mem)`; a heap-backed slot pool is the "user-memory allocator"
+  arc `memory.rs` names.
+* `FB_WIN_SLOTS = 4` windows per process (the per-slot FB region's VA).
+* Menu publishers: `winmenu::WINMENU_MAX = 4` window trees and `appmenu::SLOTS = 4` app menus — a fifth
+  publisher's menus do not attach (its window still opens).
+* `wm`'s `MAX_DEFER = 16`: a coalescing erase queue (a full queue unions), not a count of windows.

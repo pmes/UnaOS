@@ -898,7 +898,7 @@ impl Model {
     /// without changing its signature was the one thing the bar never looked at.
     fn read(painted: (usize, usize, usize, usize)) -> (Model, bool) {
         let mut m = Model::empty();
-        let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+        let mut rows = super::dock::ModelBuf::take(); // WINDOWCAP-2: a warm, growable model buffer
         let (n, clobbered) = wm::dock_scan(&mut rows, painted);
         let mut best_z = 0u32;
         // MENUOWN — ONE reduction, not two. The frontmost FOCUSED VISIBLE row is the app the bar

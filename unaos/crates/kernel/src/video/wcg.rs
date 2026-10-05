@@ -329,8 +329,9 @@ const SAMPLES: u32 = 4;
 /// Window ids this witness tracks — wm ids run 1..=MAX_WINDOWS and this table indexes them raw,
 /// so it needs MAX_WINDOWS+1 rows (index 0 is dead). Derived, with a tripwire: the headroom
 /// review caught the literal 8 leaving WC-G silently blind on 5 of 12 rows after the raise.
-const IDS: usize = crate::video::wm::MAX_WINDOWS + 1;
-const _: () = assert!(IDS > crate::video::wm::MAX_WINDOWS);
+// WINDOWCAP-2: `IDS` is gone — every per-id table below is a `rowstore::SegVec` indexed by the raw id
+// (index 0 is dead), grown on first touch; the bound is the WinId type.
+use super::rowstore::SegVec;
 
 /// One 60 Hz frame, in microseconds. The bench panel is 60 Hz; a slower panel only makes the
 /// derived `rectscan_us` larger and the reported `slow=yes` more conservative.
@@ -342,14 +343,14 @@ const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Per-id: the checksum recorded at that window's last `SYS_WIN_PRESENT` entry.
-static APP_CKS: [AtomicU64; IDS] = [const { AtomicU64::new(FNV_BASIS) }; IDS];
+static APP_CKS: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(FNV_BASIS));
 /// Per-id: how many presents that window has entered. Compared against [`SEEN_SEQ`] to decide
 /// whether a blit is the window's own present or a collateral repaint.
-static APP_SEQ: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static APP_SEQ: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: the present sequence the last instrumented blit of that window observed.
-static SEEN_SEQ: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static SEEN_SEQ: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: instrumented blits taken so far, capped at [`SAMPLES`].
-static TAKEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static TAKEN: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// Per-window tallies, rolled up into that window's own `rollup` line.
 ///
@@ -375,13 +376,13 @@ static TAKEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// — "no suspect fired anywhere, ever" — belongs to the spec instead, as FORBIDs on the suspect
 /// verdicts. A FORBID needs no completeness claim: it catches an anomaly in any window at any point
 /// in the boot, including one that appears long after every rollup has printed.
-static W_SAMPLES: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-static W_COHER: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-static W_RACE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-static W_BLIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-static W_CLEAN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-static W_SLOW: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-static W_MAXUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static W_SAMPLES: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
+static W_COHER: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
+static W_RACE: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
+static W_BLIT: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
+static W_CLEAN: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
+static W_SLOW: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
+static W_MAXUS: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 /// WC-G/M1 — per-id: microseconds this window's SAMPLES spent inside the witness itself, summed
 /// across every sampled pass. `cks_blit_us + civac_us + cks_after_us + readback_us`, the four phases
@@ -405,7 +406,7 @@ static W_MAXUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// before the refund decision existed, so the ledger charges them exactly as it charges an
 /// adjudicated pass. `wit_us=` therefore reads "what the instrument cost this window", not "what
 /// the samples= population cost", whenever `refunded=` lines precede the rollup.
-static W_WITUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static W_WITUS: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 // ---- WCGSEAM — the boot-seam writer census (a DISCRIMINATOR, not a remedy) ---------------------
 //
@@ -466,7 +467,7 @@ static SEAM_WIN: AtomicU32 = AtomicU32::new(0);
 /// refund mid-battery would desync the paygo ledger — on that build a dirty-bracket conviction
 /// adjudicates as before, with the `[wcgseam]` line beside it).
 #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
-static W_REARM: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static W_REARM: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// WCGSEAM-HB — how many dirty-bracket convictions a window may refund before the instrument
 /// adjudicates anyway. The bound is what keeps the four spec FORBIDs live even against a writer
@@ -499,7 +500,7 @@ pub fn seam_glyph_note(locked: bool, win: u32) {
 // ---- WC-H — the back-layer's own witness -------------------------------------------------------
 
 /// Per-id: `[wc-h]` samples taken, capped at [`SAMPLES`].
-static H_TAKEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_TAKEN: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: presents whose PRESENT phase alone outran the beam's time on the box.
 ///
 /// **Unbudgeted since WC-H2, and that is the whole of its meaning.** The tear test used to sit below
@@ -507,16 +508,16 @@ static H_TAKEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// what the boot did — eight, forever. `AT-RISK` and the pi4 spec's FORBID on it were therefore
 /// scoped to a window's first handful of presents while reading as a claim about the window. It is
 /// now taken on every present, before either gate.
-static H_TORN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_TORN: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: the largest present-phase duration seen, in microseconds. Unbudgeted since WC-H2, for the
 /// same reason as [`H_TORN`]: a maximum over four startup presents is not a maximum over the boot,
 /// and it was being printed as one.
-static H_MAXPRES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_MAXPRES: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 /// WCH-SPREAD — per-id: the SMALLEST present-phase duration seen, in microseconds. The floor that
 /// makes [`H_MAXPRES`] readable: a maximum with no minimum beside it cannot say whether the window's
 /// presents are uniformly expensive or wildly uneven, and those are different faults. `u64::MAX` until
 /// the window's first present, which [`stage_rollup`] prints as `0`.
-static H_MINPRES: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
+static H_MINPRES: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(u64::MAX));
 /// WCH-SPREAD — per-id: the extremes of the present phase's INVERSE THROUGHPUT, in nanoseconds per
 /// 4 KiB copied. Their ratio is the rollup's `presspread=`.
 ///
@@ -540,8 +541,8 @@ static H_MINPRES: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
 /// WCH-SPREAD: the counter is published beside them and the reading is left to whoever consumes the
 /// line. The stall guard that doc's first edition named as the x86 seat's open item now EXISTS —
 /// [`H_STALL`]/[`STALL_SPREAD`] in [`stage_note`]'s tear test — and is built on exactly this pair.
-static H_MINRATE: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
-static H_MAXRATE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_MINRATE: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(u64::MAX));
+static H_MAXRATE: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 /// WCH-STALL — per-id: slow presents the tear test CONVICTED OF STALLING rather than tearing: the
 /// present outran the beam (`present_us > rectscan_us`, [`H_TORN`]'s own test) but its per-4-KiB
 /// rate was more than [`STALL_SPREAD`]× this window's established floor. That is the desched shape
@@ -555,7 +556,7 @@ static H_MAXRATE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// siblings set) — the guard only diverts outliers against a floor the window itself earned. `stalls=` is
 /// printed beside `torn=` so the diverted population stays on the wire; the verdict reads `torn=`
 /// alone, so a stall can never manufacture `-> AT-RISK` and metal FORBIDs keep their teeth.
-static H_STALL: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_STALL: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// WCH-STALL — how many times the window's floor rate a slow present must exceed to be convicted a
 /// stall.
 ///
@@ -633,10 +634,10 @@ const STALL_PRESENT_US: u64 = 2 * FRAME_US;
 /// `torn=`, and it does not require the present to have outrun the beam. A present can be both torn
 /// and long, and both counters will say so. It therefore cannot weaken any existing verdict; it only
 /// adds a reading the ratio cannot express.
-static H_LONGPRES: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_LONGPRES: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// WCH-LONGPRES — per-id: whether the one-shot `-> STALL` line has already been emitted for this
 /// window, so a wedged machine names its first offender and then stops paying UART for the rest.
-static H_LONGSAID: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_LONGSAID: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// WCH-LONGPRES — per-id: the offending present's measured duration, handed from the recorder to
 /// [`stage_flush`] so the naming line is PRINTED outside the clock that timed it.
 ///
@@ -644,7 +645,7 @@ static H_LONGSAID: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// `serial_println!` inside `stage_note` runs inside WC-G's clock, so the witness would be charged to
 /// the very measurement it is reporting. Zero means nothing pending — a present of zero microseconds
 /// cannot exceed [`STALL_PRESENT_US`], so the sentinel is unambiguous.
-static H_LONGUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_LONGUS: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 /// WCHFIX — per-id: how many presents actually entered the rate census above. Published as the
 /// rollup's `presspop=`, immediately beside `presspread=`, because a ratio without its population
@@ -670,10 +671,10 @@ static H_LONGUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// rate recorder skips; using them as the spread's population would assert a point that was never
 /// taken. This counts the samples the ratio was actually computed from, so `presspop >= 2` is exactly
 /// the condition under which `max` and `min` can be different measurements.
-static H_RATEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_RATEN: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: composites that did NOT reach the back layer and ran on the direct (pre-WC-H) path — the
 /// tearing regime. Excludes the deliberate fixture decline, which is counted separately.
-static H_DECLINE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_DECLINE: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// WCHUN — per-id, per-reason: the same declines [`H_DECLINE`] totals, split by WHICH exit of
 /// [`stage_window`](super::wm) produced them. Indexed by the reason constant itself, so slot 0
 /// ([`KIND_STAGED`]) is permanently unused and no mapping table has to be kept in step.
@@ -699,23 +700,23 @@ static H_DECLINE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// not grow. Lumping them makes a permanent cap fallback and a bursty reentrancy read identically.
 ///
 /// Unbudgeted, like [`H_DECLINE`] and for the same reason: the count is what outlives the trace.
-static H_DECLBY: [[AtomicU32; DECL_KINDS]; IDS] =
-    [const { [const { AtomicU32::new(0) }; DECL_KINDS] }; IDS];
+static H_DECLBY: SegVec<[AtomicU32; DECL_KINDS]> =
+    SegVec::new(|| [const { AtomicU32::new(0) }; DECL_KINDS]);
 /// One past the largest reason constant [`stage_decline`] can be handed, so [`H_DECLBY`] can be
 /// indexed by the constant directly.
 const DECL_KINDS: usize = DECL_ROUTE as usize + 1;
 /// Per-id: declines the KERNEL asked for, to keep the fallback path covered ([`DECL_FIXTURE`]).
-static H_FIXTURE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_FIXTURE: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: a recorded-but-not-yet-printed sample. See [`stage_flush`] for why the print is deferred.
-static H_PEND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_PEND: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: what the pending sample IS — [`KIND_STAGED`] or one of the decline reasons.
-static H_KIND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_KIND: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: whether the pending sample's present was BANDED — 1 banded, 0 whole-box. Carried beside
 /// [`H_KIND`] rather than folded into it because a decline has no span at all to classify.
-static H_BAND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_BAND: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: the pending sample's span — the rows the present actually wrote, which is `bh` for a
 /// whole-box present and strictly less for a banded one.
-static H_SPAN: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_SPAN: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 /// The pending sample is a staged composite; the timing fields are meaningful.
 const KIND_STAGED: u32 = 0;
@@ -767,7 +768,7 @@ fn decl_name(kind: u32) -> &'static str {
 /// loud for free.
 pub fn stage_decline(id: u32, reason: u32) {
     let i = id as usize;
-    if i >= IDS {
+    if i >= u32::MAX as usize {
         return;
     }
     mark_seen(i);
@@ -776,9 +777,9 @@ pub fn stage_decline(id: u32, reason: u32) {
     // this pair; hoisting it above the gate is what makes "unbudgeted" a property of the code shape
     // rather than of two call sites agreeing.
     if reason == DECL_FIXTURE {
-        H_FIXTURE[i].fetch_add(1, Ordering::Relaxed);
+        H_FIXTURE.get(i).fetch_add(1, Ordering::Relaxed);
     } else {
-        H_DECLINE[i].fetch_add(1, Ordering::Relaxed);
+        H_DECLINE.get(i).fetch_add(1, Ordering::Relaxed);
     }
     // WCHUN — and the reason census beside it, on the same terms. Guarded rather than assumed: the
     // reason arrives from another module, and an out-of-range one must lose its breakdown, not panic
@@ -786,22 +787,22 @@ pub fn stage_decline(id: u32, reason: u32) {
     // verdict; only the split would be short, and `[wc-h]`'s own `?` name for an unknown reason has
     // the same standing.
     if (reason as usize) < DECL_KINDS {
-        H_DECLBY[i][reason as usize].fetch_add(1, Ordering::Relaxed);
+        H_DECLBY.get(i)[reason as usize].fetch_add(1, Ordering::Relaxed);
     }
     // COMPGATE — and the lifetime lock-decline meter, which the per-tenant array cannot serve
     // because `stage_reset` zeroes it. See [`DECL_LOCK_LIFE`].
     if reason == DECL_LOCK {
         DECL_LOCK_LIFE.fetch_add(1, Ordering::Relaxed);
     }
-    let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
+    let n = H_TAKEN.get(i).fetch_add(1, Ordering::Relaxed) + 1;
     if n > SAMPLES {
-        H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
+        H_TAKEN.get(i).store(SAMPLES + 1, Ordering::Relaxed);
         // Past budget the LINE stops but the count must not: an unstaged composite is the thing the
         // verdict is about, and a boot that starts declining after sample 4 has to remain visible.
         return;
     }
-    H_KIND[i].store(reason, Ordering::Relaxed);
-    H_PEND[i].store(n, Ordering::Release);
+    H_KIND.get(i).store(reason, Ordering::Relaxed);
+    H_PEND.get(i).store(n, Ordering::Release);
 }
 
 /// COMPGATE — every [`DECL_LOCK`] this boot has taken, across every window id, NEVER RESET.
@@ -821,7 +822,7 @@ pub fn stage_decline(id: u32, reason: u32) {
 static DECL_LOCK_LIFE: AtomicU64 = AtomicU64::new(0);
 
 /// COMPGATE — the lifetime [`DECL_LOCK`] count. See [`DECL_LOCK_LIFE`] for why this is not
-/// `sum(H_DECLBY[..][DECL_LOCK])`.
+/// `sum(H_DECLBY.get(..)[DECL_LOCK])`.
 ///
 /// `DECL_LOCK` is the compositor falling out of the staged path into `draw_window`'s direct,
 /// unclipped, per-pixel front-buffer write — the tear itself. Because [`super::wm::STAGE`] is
@@ -832,11 +833,11 @@ pub fn decl_lock_total() -> u64 {
     DECL_LOCK_LIFE.load(Ordering::Relaxed)
 }
 
-static H_BOX: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
-static H_BYTES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
-static H_COMPOSE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
-static H_PRESENT: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
-static H_RECTSCAN: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_BOX: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
+static H_BYTES: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
+static H_COMPOSE: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
+static H_PRESENT: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
+static H_RECTSCAN: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 // ---- FBCON-DMG — telling a banded present from a whole-box one ----------------------------------
 
@@ -856,15 +857,15 @@ static H_RECTSCAN: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// creation and still record four banded samples afterwards, which is exactly the population
 /// FBCON-DMG exists to alter. Declines keep sharing [`H_TAKEN`] with the whole-box samples: a decline
 /// never reached the banding loop, so it has no span to classify and no claim to the banded budget.
-static H_BTAKEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_BTAKEN: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: banded presents RECORDED, and unbudgeted — the count is taken before either budget test,
 /// so it keeps running long after the lines stop. The lines are a trace; this is the census, and a
 /// boot that bands 980 times must not report 4 just because 4 is all it printed.
-static H_BANDED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_BANDED: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: whole-box presents recorded, unbudgeted, for the same reason and to the same standard.
 /// Kept as its own counter rather than derived from `samples - banded` because the two budgets make
 /// that subtraction wrong — declines spend [`H_TAKEN`] too, and they are neither.
-static H_WHOLE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_WHOLE: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// Per-id: the NARROWEST banded present seen, packed `span << 32 | bytes`. `u64::MAX` means no banded
 /// present has been recorded at all, which the rollup prints as `minspan=0 minspan_bytes=0` beside
 /// `banded=0` rather than inventing a width.
@@ -875,7 +876,7 @@ static H_WHOLE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// figure that reads as a measurement and is not one. `span` occupies the high half so the ordering
 /// is by span; `bytes` is `row_bytes * span` at a fixed window width, so the low half can only ever
 /// agree with that ordering, never invert it.
-static H_MINSPAN: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
+static H_MINSPAN: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(u64::MAX));
 
 // ---- WC-H2 — the state a REFRESHED rollup needs, and nothing more ------------------------------
 
@@ -888,7 +889,7 @@ static H_MINSPAN: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
 /// minspan=736` was taken at an age of milliseconds; boot B's `banded=271 minspan=96` at an age of
 /// seconds. Nothing on the old line distinguished them, and the serial log carries no timestamps of
 /// its own, so the distinction had to be manufactured here or not at all.
-static H_T0: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_T0: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 /// Per-id: `now_cycles()` as of the END of this window's most recent rollup emission — after the
 /// serial write, deliberately, so [`CENSUS_PERIOD_US`] bounds the interval this WINDOW's refresh
@@ -904,7 +905,7 @@ static H_T0: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 ///
 /// Also the refresh's mutual exclusion: it is armed by a `compare_exchange` on this cell, so of two
 /// cores flushing the same window at the same instant exactly one prints. See [`census_refresh`].
-static H_LASTROLL: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_LASTROLL: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 /// STORM-R1 — SYSTEM-wide: `now_cycles()` as of the END of the most recent rollup emission by ANY
 /// window. Stored from [`stage_rollup`], after the serial write, for [`H_LASTROLL`]'s reason.
@@ -957,7 +958,7 @@ static H_ROLL_TURN: AtomicU32 = AtomicU32::new(0);
 /// whose censuses have not moved has nothing new to say, and reprinting an unchanged line would spend
 /// serial time to restate the previous one. An idle window therefore goes quiet with its last line
 /// describing its last active state, which is the correct steady-state report for it.
-static H_LASTCENSUS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_LASTCENSUS: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// Per-id: rollup lines emitted for this window so far. Printed as `emit=`, one-based.
 ///
@@ -965,7 +966,7 @@ static H_LASTCENSUS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// growing is how this arc's own machinery is falsified from the wire: it says the refresh never
 /// armed — [`stage_flush`] unreached, the clock reading zero, or the delta gate stuck — and it says
 /// so without needing a second boot to compare against.
-static H_EMIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_EMIT: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// Per-id: per-sample `[wc-h]` lines actually printed by [`emit_sample`]. Printed as `lines=`.
 ///
@@ -984,7 +985,7 @@ static H_EMIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// three of the four banded records (one overwritten). `lines=7 samples=4` is not a contradiction and
 /// must not be read as one; the comparison `lines=` is for is against `2 * budget=`, and the
 /// comparison `samples=` is for is against the `pop=all-presents` census beside it.
-static H_LINES: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_LINES: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// Minimum wall time between two rollup emissions for one window.
 ///
@@ -1022,7 +1023,7 @@ pub(super) const CENSUS_PERIOD_US: u64 = 2_000_000;
 /// putting a queue on the present path, losing a ROLLUP is not: it is the line the spec's FORBIDs sit
 /// on. The latch reads the budget counter instead, which no overwrite can disturb, so the rollup
 /// fires on whichever flush first observes the budget spent.
-static H_ROLLED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_ROLLED: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 // ---- BEAM (orin 26) — the OBSERVED tear, and the exposure the duration predicate could not see ----
 //
@@ -1042,35 +1043,35 @@ static H_ROLLED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 //   the per-present exposure `min(1, (present_us + rectscan_us) / FRAME_US)` in per-mille, summed —
 //   the EXPECTED torn-present count, times a thousand. A blind Orin boot that prints `torn=0` beside
 //   `beamcross_ppk=1500000` has said, on one line, both what it measured and what it could not.
-static H_BEAMOBS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-static H_BEAMWAITS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-static H_BEAMWAIT: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
-static H_BEAMMAXWAIT: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
-static H_BEAMGIVEUP: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
-static H_BEAMCROSS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_BEAMOBS: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
+static H_BEAMWAITS: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
+static H_BEAMWAIT: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
+static H_BEAMMAXWAIT: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
+static H_BEAMGIVEUP: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
+static H_BEAMCROSS: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 /// STAGESHRINK — presents whose band was halved at least once because the allocator refused the
 /// full band (each halving counts). The population that used to be `decl_alloc=` and the direct path.
-static H_SHRUNK: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_SHRUNK: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 /// The pending sample's beam observation, packed: bits 0..16 `vs`, 16..32 `ve`, 32..48 `vt`,
 /// 48 observed, 49 torn; and `H_OBSWAIT` its wait. Zero = blind.
-static H_OBS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
-static H_OBSWAIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_OBS: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
+static H_OBSWAIT: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// BEAM — fold one observation into window `i`'s censuses. Shared by [`stage_note`] (staged
 /// presents) and [`direct_obs`] (the direct fallback). Returns whether the present was torn.
 fn beam_fold(i: usize, obs: Option<super::beam::Obs>) -> Option<bool> {
     let o = obs?;
-    H_BEAMOBS[i].fetch_add(1, Ordering::Relaxed);
+    H_BEAMOBS.get(i).fetch_add(1, Ordering::Relaxed);
     if o.waited_us > 0 {
-        H_BEAMWAITS[i].fetch_add(1, Ordering::Relaxed);
+        H_BEAMWAITS.get(i).fetch_add(1, Ordering::Relaxed);
     }
-    H_BEAMWAIT[i].fetch_add(o.waited_us as u64, Ordering::Relaxed);
-    H_BEAMMAXWAIT[i].fetch_max(o.waited_us as u64, Ordering::Relaxed);
+    H_BEAMWAIT.get(i).fetch_add(o.waited_us as u64, Ordering::Relaxed);
+    H_BEAMMAXWAIT.get(i).fetch_max(o.waited_us as u64, Ordering::Relaxed);
     if o.gaveup {
-        H_BEAMGIVEUP[i].fetch_add(1, Ordering::Relaxed);
+        H_BEAMGIVEUP.get(i).fetch_add(1, Ordering::Relaxed);
     }
     if o.torn {
-        H_TORN[i].fetch_add(1, Ordering::Relaxed);
+        H_TORN.get(i).fetch_add(1, Ordering::Relaxed);
     }
     Some(o.torn)
 }
@@ -1080,7 +1081,7 @@ fn beam_fold(i: usize, obs: Option<super::beam::Obs>) -> Option<bool> {
 /// lands in the same `torn=` as a staged present's, because a tear is a tear.
 pub fn direct_obs(id: u32, obs: Option<super::beam::Obs>) {
     let i = id as usize;
-    if i >= IDS {
+    if i >= u32::MAX as usize {
         return;
     }
     let _ = beam_fold(i, obs);
@@ -1089,8 +1090,8 @@ pub fn direct_obs(id: u32, obs: Option<super::beam::Obs>) {
 /// STAGESHRINK — one halving of a present's band under allocator pressure. See [`H_SHRUNK`].
 pub fn stage_shrunk(id: u32) {
     let i = id as usize;
-    if i < IDS {
-        H_SHRUNK[i].fetch_add(1, Ordering::Relaxed);
+    if i < u32::MAX as usize {
+        H_SHRUNK.get(i).fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1159,7 +1160,7 @@ pub fn stage_note(
     panel_h: usize,
 ) {
     let i = id as usize;
-    if i >= IDS {
+    if i >= u32::MAX as usize {
         return;
     }
     mark_seen(i);
@@ -1168,10 +1169,10 @@ pub fn stage_note(
     // "this window banded 4 times" and the truth.
     let banded = span < bh;
     if banded {
-        H_BANDED[i].fetch_add(1, Ordering::Relaxed);
-        H_MINSPAN[i].fetch_min(((span as u64) << 32) | (bytes as u64 & 0xFFFF_FFFF), Ordering::Relaxed);
+        H_BANDED.get(i).fetch_add(1, Ordering::Relaxed);
+        H_MINSPAN.get(i).fetch_min(((span as u64) << 32) | (bytes as u64 & 0xFFFF_FFFF), Ordering::Relaxed);
     } else {
-        H_WHOLE[i].fetch_add(1, Ordering::Relaxed);
+        H_WHOLE.get(i).fetch_add(1, Ordering::Relaxed);
     }
     // WC-H2 — the TEAR TEST is a census too, and it belongs on this side of the budget gate for the
     // same reason `banded` does.
@@ -1196,7 +1197,7 @@ pub fn stage_note(
     // presents on a line that read `torn=0`. Then the observation, if a beam source recorded one:
     // it decides `torn=` outright and the duration predicate below is not consulted. WCH-STALL's
     // diversion stays on the blind arm only — an observed crossing is a tear whatever the rate.
-    H_BEAMCROSS[i].fetch_add(super::beam::exposure_ppk(present_us, rectscan_us), Ordering::Relaxed);
+    H_BEAMCROSS.get(i).fetch_add(super::beam::exposure_ppk(present_us, rectscan_us), Ordering::Relaxed);
     let obs = super::beam::take_last();
     let observed = beam_fold(i, obs);
     // WCH-STALL — classify BEFORE this present folds into the floor below: the comparison must be
@@ -1208,7 +1209,7 @@ pub fn stage_note(
     if observed.is_none() && present_us > rectscan_us {
         let stalled = bytes != 0 && {
             let rate_ns_4k = present_us.saturating_mul(4_096_000) / bytes as u64;
-            let lo = H_MINRATE[i].load(Ordering::Relaxed);
+            let lo = H_MINRATE.get(i).load(Ordering::Relaxed);
             // `lo != 0` is load-bearing (review finding, 2026-08-18): a present that measures 0 µs
             // folds a floor of ZERO, and `rate > 0 * 8` would then convict EVERY subsequent slow
             // present — torn= suppressed for the window's whole life, the pi4 AT-RISK FORBID
@@ -1216,9 +1217,9 @@ pub fn stage_note(
             lo != u64::MAX && lo != 0 && rate_ns_4k > lo.saturating_mul(STALL_SPREAD)
         };
         if stalled {
-            H_STALL[i].fetch_add(1, Ordering::Relaxed);
+            H_STALL.get(i).fetch_add(1, Ordering::Relaxed);
         } else {
-            H_TORN[i].fetch_add(1, Ordering::Relaxed);
+            H_TORN.get(i).fetch_add(1, Ordering::Relaxed);
         }
     }
     // WCH-LONGPRES — the stall-SHAPED test, taken beside the ratio test and deliberately INDEPENDENT
@@ -1227,40 +1228,40 @@ pub fn stage_note(
     // of the same rows. No floor precondition either — that is the whole point of the quantity. It
     // diverts nothing, so `torn=`, `stalls=` and the verdict precedence are all exactly as they were.
     if present_us > STALL_PRESENT_US {
-        H_LONGPRES[i].fetch_add(1, Ordering::Relaxed);
+        H_LONGPRES.get(i).fetch_add(1, Ordering::Relaxed);
         // Only the FIRST offender is handed to the printer; the counter keeps the rest.
-        if H_LONGSAID[i].load(Ordering::Relaxed) == 0 {
-            H_LONGUS[i].store(present_us, Ordering::Relaxed);
+        if H_LONGSAID.get(i).load(Ordering::Relaxed) == 0 {
+            H_LONGUS.get(i).store(present_us, Ordering::Relaxed);
         }
     }
-    H_MAXPRES[i].fetch_max(present_us, Ordering::Relaxed);
+    H_MAXPRES.get(i).fetch_max(present_us, Ordering::Relaxed);
     // WCH-SPREAD — the floor and the two rate extremes, taken here for exactly the reasons the tear
     // test and `maxpresent_us` are taken here: they are censuses over EVERY present, and a spread
     // measured over a window's first four is a spread over its startup burst. The cost is one more
     // `fetch_min`, one multiply and one divide on values already in registers — the same price the
     // paragraph above accounts for, and it touches no memory outside three atomics. See [`H_MINRATE`].
-    H_MINPRES[i].fetch_min(present_us, Ordering::Relaxed);
+    H_MINPRES.get(i).fetch_min(present_us, Ordering::Relaxed);
     if bytes != 0 {
         let rate_ns_4k = present_us.saturating_mul(4_096_000) / bytes as u64;
-        H_MINRATE[i].fetch_min(rate_ns_4k, Ordering::Relaxed);
-        H_MAXRATE[i].fetch_max(rate_ns_4k, Ordering::Relaxed);
+        H_MINRATE.get(i).fetch_min(rate_ns_4k, Ordering::Relaxed);
+        H_MAXRATE.get(i).fetch_max(rate_ns_4k, Ordering::Relaxed);
         // WCHFIX — the population the two extremes were drawn from, incremented in the SAME branch
         // that feeds them so the count can never claim a sample the ratio did not see. One more
         // `fetch_add` on an atomic already in this cache line's neighbourhood. See [`H_RATEN`].
-        H_RATEN[i].fetch_add(1, Ordering::Relaxed);
+        H_RATEN.get(i).fetch_add(1, Ordering::Relaxed);
     }
     // Two budgets, one per class. See [`H_BTAKEN`] for why a shared one made the feature invisible.
     let n = if banded {
-        let n = H_BTAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
+        let n = H_BTAKEN.get(i).fetch_add(1, Ordering::Relaxed) + 1;
         if n > SAMPLES {
-            H_BTAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
+            H_BTAKEN.get(i).store(SAMPLES + 1, Ordering::Relaxed);
             return;
         }
         n
     } else {
-        let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
+        let n = H_TAKEN.get(i).fetch_add(1, Ordering::Relaxed) + 1;
         if n > SAMPLES {
-            H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
+            H_TAKEN.get(i).store(SAMPLES + 1, Ordering::Relaxed);
             return;
         }
         n
@@ -1268,18 +1269,18 @@ pub fn stage_note(
     // Only the per-SAMPLE line's fields are computed past the gate now; `present_us` and
     // `rectscan_us` were taken above, where the census needs them.
     let compose_us = cycles_to_us(t1.saturating_sub(t0));
-    H_KIND[i].store(KIND_STAGED, Ordering::Relaxed);
-    H_BAND[i].store(banded as u32, Ordering::Relaxed);
-    H_BOX[i].store(((bw as u64) << 32) | bh as u64, Ordering::Relaxed);
-    H_SPAN[i].store(span as u64, Ordering::Relaxed);
-    H_BYTES[i].store(bytes as u64, Ordering::Relaxed);
-    H_COMPOSE[i].store(compose_us, Ordering::Relaxed);
-    H_PRESENT[i].store(present_us, Ordering::Relaxed);
-    H_RECTSCAN[i].store(rectscan_us, Ordering::Relaxed);
+    H_KIND.get(i).store(KIND_STAGED, Ordering::Relaxed);
+    H_BAND.get(i).store(banded as u32, Ordering::Relaxed);
+    H_BOX.get(i).store(((bw as u64) << 32) | bh as u64, Ordering::Relaxed);
+    H_SPAN.get(i).store(span as u64, Ordering::Relaxed);
+    H_BYTES.get(i).store(bytes as u64, Ordering::Relaxed);
+    H_COMPOSE.get(i).store(compose_us, Ordering::Relaxed);
+    H_PRESENT.get(i).store(present_us, Ordering::Relaxed);
+    H_RECTSCAN.get(i).store(rectscan_us, Ordering::Relaxed);
     let (ob, ow) = pack_obs(obs);
-    H_OBS[i].store(ob, Ordering::Relaxed);
-    H_OBSWAIT[i].store(ow, Ordering::Relaxed);
-    H_PEND[i].store(n, Ordering::Release);
+    H_OBS.get(i).store(ob, Ordering::Relaxed);
+    H_OBSWAIT.get(i).store(ow, Ordering::Relaxed);
+    H_PEND.get(i).store(n, Ordering::Release);
 }
 
 /// WC-H — print whatever [`stage_note`] recorded for `id`, if anything.
@@ -1314,10 +1315,10 @@ pub fn stage_note(
 /// not.
 pub fn stage_flush(id: u32) {
     let i = id as usize;
-    if i >= IDS {
+    if i >= u32::MAX as usize {
         return;
     }
-    let n = H_PEND[i].swap(0, Ordering::AcqRel);
+    let n = H_PEND.get(i).swap(0, Ordering::AcqRel);
     if n != 0 {
         emit_sample(id, i);
     }
@@ -1331,12 +1332,12 @@ pub fn stage_flush(id: u32) {
     // specs already guard is claiming. A new line is an insertion in the same sense a new field is:
     // it adds an assertion without redefining an existing one. The rollup carries the COUNT
     // (`longpres=`) and the BOUND (`stallbound_us=`); this line carries the evidence.
-    let longus = H_LONGUS[i].swap(0, Ordering::Relaxed);
-    if longus != 0 && H_LONGSAID[i].swap(1, Ordering::Relaxed) == 0 {
+    let longus = H_LONGUS.get(i).swap(0, Ordering::Relaxed);
+    if longus != 0 && H_LONGSAID.get(i).swap(1, Ordering::Relaxed) == 0 {
         // `minpresent_us=` beside it is what makes the reading a SHAPE rather than a number: a stall
         // is one absurd present beside a normal floor, which is exactly the pi's 218876-vs-2594. A
         // window whose floor is up there with it is uniformly slow, which is a different fault.
-        let minp = H_MINPRES[i].load(Ordering::Relaxed);
+        let minp = H_MINPRES.get(i).load(Ordering::Relaxed);
         crate::census_println!(
             "[wc-h] win={} present_us={} bound_us={} minpresent_us={} -> STALL",
             id,
@@ -1357,15 +1358,15 @@ pub fn stage_flush(id: u32) {
     // — `banded`, `minspan`, `whole`, and now `torn` — go on counting for the rest of it. So the
     // `scope=window` line is kept current by `census_refresh` below, and the reader takes the greatest
     // `emit=` for each `win=`.
-    if H_TAKEN[i].load(Ordering::Relaxed) >= SAMPLES
-        && H_ROLLED[i].fetch_or(ROLL_WHOLE, Ordering::Relaxed) & ROLL_WHOLE == 0
+    if H_TAKEN.get(i).load(Ordering::Relaxed) >= SAMPLES
+        && H_ROLLED.get(i).fetch_or(ROLL_WHOLE, Ordering::Relaxed) & ROLL_WHOLE == 0
     {
-        stage_rollup(id, i, "window", H_TAKEN[i].load(Ordering::Relaxed));
+        stage_rollup(id, i, "window", H_TAKEN.get(i).load(Ordering::Relaxed));
     }
-    if H_BTAKEN[i].load(Ordering::Relaxed) >= SAMPLES
-        && H_ROLLED[i].fetch_or(ROLL_BAND, Ordering::Relaxed) & ROLL_BAND == 0
+    if H_BTAKEN.get(i).load(Ordering::Relaxed) >= SAMPLES
+        && H_ROLLED.get(i).fetch_or(ROLL_BAND, Ordering::Relaxed) & ROLL_BAND == 0
     {
-        stage_rollup(id, i, "window-band", H_BTAKEN[i].load(Ordering::Relaxed));
+        stage_rollup(id, i, "window-band", H_BTAKEN.get(i).load(Ordering::Relaxed));
     }
     // WC-H2 — and then, for the rest of the boot, keep the censuses on those lines readable.
     census_refresh(id, i);
@@ -1385,8 +1386,8 @@ pub fn stage_flush(id: u32) {
 /// the "this is steady state" reading).
 #[inline]
 fn mark_seen(i: usize) {
-    if H_T0[i].load(Ordering::Relaxed) == 0 {
-        let _ = H_T0[i].compare_exchange(0, now_cycles(), Ordering::Relaxed, Ordering::Relaxed);
+    if H_T0.get(i).load(Ordering::Relaxed) == 0 {
+        let _ = H_T0.get(i).compare_exchange(0, now_cycles(), Ordering::Relaxed, Ordering::Relaxed);
     }
 }
 
@@ -1395,11 +1396,11 @@ fn mark_seen(i: usize) {
 /// against.
 #[inline]
 fn census_total(i: usize) -> u32 {
-    H_WHOLE[i]
+    H_WHOLE.get(i)
         .load(Ordering::Relaxed)
-        .wrapping_add(H_BANDED[i].load(Ordering::Relaxed))
-        .wrapping_add(H_DECLINE[i].load(Ordering::Relaxed))
-        .wrapping_add(H_FIXTURE[i].load(Ordering::Relaxed))
+        .wrapping_add(H_BANDED.get(i).load(Ordering::Relaxed))
+        .wrapping_add(H_DECLINE.get(i).load(Ordering::Relaxed))
+        .wrapping_add(H_FIXTURE.get(i).load(Ordering::Relaxed))
 }
 
 /// WC-H2 — re-emit this window's `scope=window` rollup so its UNBUDGETED censuses are read after the
@@ -1452,18 +1453,18 @@ fn census_refresh(id: u32, i: usize) {
     // second instrument, and firing early would put a `scope=window` line on the wire before the
     // budget it reports had been spent — a line whose `samples=` was honestly short but which the
     // spec's REQUIRE would match all the same.
-    if H_ROLLED[i].load(Ordering::Relaxed) & ROLL_WHOLE == 0 {
+    if H_ROLLED.get(i).load(Ordering::Relaxed) & ROLL_WHOLE == 0 {
         return;
     }
     // Delta gate: nothing new to say, say nothing. This is what keeps an idle desktop silent.
     let total = census_total(i);
-    if total == H_LASTCENSUS[i].load(Ordering::Relaxed) {
+    if total == H_LASTCENSUS.get(i).load(Ordering::Relaxed) {
         return;
     }
     // Rate gate, this WINDOW's. Checked before the `compare_exchange` so the common case — a window
     // compositing at frame rate, arriving here dozens of times a second — costs one clock read and a
     // compare.
-    let last = H_LASTROLL[i].load(Ordering::Relaxed);
+    let last = H_LASTROLL.get(i).load(Ordering::Relaxed);
     let now = now_cycles();
     if cycles_to_us(now.saturating_sub(last)) < CENSUS_PERIOD_US {
         return;
@@ -1482,7 +1483,7 @@ fn census_refresh(id: u32, i: usize) {
         return;
     }
     // Arm: exactly one core proceeds. See the note above.
-    if H_LASTROLL[i].compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+    if H_LASTROLL.get(i).compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return;
     }
     // Claim the system slot. This is AFTER the per-window arm and not before it, deliberately: of the
@@ -1496,8 +1497,8 @@ fn census_refresh(id: u32, i: usize) {
     // 0 belongs to no window, so the wrap lands on a slot that has never rolled — which
     // [`refresh_turn_ok`] treats as "nothing to say" and steps over on its first test, rather than
     // costing the rotation a period.
-    H_ROLL_TURN.store((i as u32 + 1) % IDS as u32, Ordering::Relaxed);
-    stage_rollup(id, i, "window", H_TAKEN[i].load(Ordering::Relaxed));
+    H_ROLL_TURN.store((i as u32 + 1) % (crate::video::wm::slots() as u32 + 1), Ordering::Relaxed); // WINDOWCAP-2: the turn walks the live id range
+    stage_rollup(id, i, "window", H_TAKEN.get(i).load(Ordering::Relaxed));
 }
 
 /// STORM-R1 — may window `i` take the system-wide refresh slot now?
@@ -1528,14 +1529,14 @@ fn census_refresh(id: u32, i: usize) {
 #[inline]
 fn refresh_turn_ok(i: usize, since_any_us: u64) -> bool {
     let turn = H_ROLL_TURN.load(Ordering::Relaxed) as usize;
-    if turn == i || turn >= IDS {
+    if turn == i || turn > crate::video::wm::slots() {
         return true;
     }
     if since_any_us >= 2 * CENSUS_PERIOD_US {
         return true;
     }
-    H_ROLLED[turn].load(Ordering::Relaxed) & ROLL_WHOLE == 0
-        || census_total(turn) == H_LASTCENSUS[turn].load(Ordering::Relaxed)
+    H_ROLLED.get(turn).load(Ordering::Relaxed) & ROLL_WHOLE == 0
+        || census_total(turn) == H_LASTCENSUS.get(turn).load(Ordering::Relaxed)
 }
 
 /// Print the one pending `[wc-h]` sample line for window `id`.
@@ -1549,12 +1550,12 @@ fn emit_sample(id: u32, i: usize) {
     // reached the wire, and the gap between them is the documented pending-slot overwrite. See
     // [`H_LINES`]. Incremented before the print so a line lost to a panic mid-`serial_println!` is
     // reported as attempted rather than as never taken.
-    H_LINES[i].fetch_add(1, Ordering::Relaxed);
-    let kind = H_KIND[i].load(Ordering::Relaxed);
+    H_LINES.get(i).fetch_add(1, Ordering::Relaxed);
+    let kind = H_KIND.get(i).load(Ordering::Relaxed);
     if kind == KIND_STAGED {
-        let bx = H_BOX[i].load(Ordering::Relaxed);
-        let present_us = H_PRESENT[i].load(Ordering::Relaxed);
-        let rectscan_us = H_RECTSCAN[i].load(Ordering::Relaxed);
+        let bx = H_BOX.get(i).load(Ordering::Relaxed);
+        let present_us = H_PRESENT.get(i).load(Ordering::Relaxed);
+        let rectscan_us = H_RECTSCAN.get(i).load(Ordering::Relaxed);
         // FBCON-DMG — `box=` is the WHOLE box again, and `span=` the rows this present wrote. Before
         // the split those were one number and it was the span, so a banded present of a 66x780 box
         // reported `box=66x78` and was indistinguishable on the wire from a whole-box present of a
@@ -1571,21 +1572,21 @@ fn emit_sample(id: u32, i: usize) {
         // BEAM — `beam=` is `vs..ve/vt` (raster line before the first byte, after the clean, lines
         // per frame) on an observed present and `blind` otherwise; `torn=` is then the observation.
         // Both INSERTED before `torn=`: the five keys another track's gate matches keep their order.
-        let ob = H_OBS[i].load(Ordering::Relaxed);
+        let ob = H_OBS.get(i).load(Ordering::Relaxed);
         let torn = if ob & (1 << 48) != 0 { ob & (1 << 49) != 0 } else { present_us > rectscan_us };
         crate::census_println!(
             "[wc-h] win={} box={}x{} span={} band={} bytes={} compose_us={} present_us={} rectscan_us={} beam={} beamwait_us={} torn={} -> BUFFERED",
             id,
             bx >> 32,
             bx & 0xFFFF_FFFF,
-            H_SPAN[i].load(Ordering::Relaxed),
-            if H_BAND[i].load(Ordering::Relaxed) != 0 { "yes" } else { "no" },
-            H_BYTES[i].load(Ordering::Relaxed),
-            H_COMPOSE[i].load(Ordering::Relaxed),
+            H_SPAN.get(i).load(Ordering::Relaxed),
+            if H_BAND.get(i).load(Ordering::Relaxed) != 0 { "yes" } else { "no" },
+            H_BYTES.get(i).load(Ordering::Relaxed),
+            H_COMPOSE.get(i).load(Ordering::Relaxed),
             present_us,
             rectscan_us,
             BeamFmt(ob),
-            H_OBSWAIT[i].load(Ordering::Relaxed),
+            H_OBSWAIT.get(i).load(Ordering::Relaxed),
             if torn { "yes" } else { "no" }
         );
     } else {
@@ -1696,8 +1697,8 @@ fn emit_sample(id: u32, i: usize) {
 ///   broken, and the line is back to describing the first four presents.
 /// - `lines=0` beside a non-zero `samples=` — the per-sample trace path is dead, not merely lossy.
 fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
-    let torn_n = H_TORN[i].load(Ordering::Relaxed);
-    let decl_n = H_DECLINE[i].load(Ordering::Relaxed);
+    let torn_n = H_TORN.get(i).load(Ordering::Relaxed);
+    let decl_n = H_DECLINE.get(i).load(Ordering::Relaxed);
     // Precedence: a measured tear outranks an unmeasured one. `UNSTAGED` is not a lesser verdict
     // — it says composites reached the panel through the unbuffered path, so the TEAR-FREE claim
     // the staged samples support does not cover the window's actual behaviour. `fixture` is
@@ -1710,14 +1711,14 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     } else {
         "TEAR-FREE"
     };
-    let ms = H_MINSPAN[i].load(Ordering::Relaxed);
+    let ms = H_MINSPAN.get(i).load(Ordering::Relaxed);
     let (minspan, minbytes) = if ms == u64::MAX { (0, 0) } else { (ms >> 32, ms & 0xFFFF_FFFF) };
     // `age_ms=` from this window's own origin. A window with no origin yet cannot reach here (both
     // recorders call `mark_seen` before touching a budget), so the 0 branch is the unreachable-clock
     // case and reads as an age of zero rather than as the raw uptime.
-    let t0 = H_T0[i].load(Ordering::Relaxed);
+    let t0 = H_T0.get(i).load(Ordering::Relaxed);
     let age_ms = if t0 == 0 { 0 } else { cycles_to_us(now_cycles().saturating_sub(t0)) / 1000 };
-    let emit = H_EMIT[i].fetch_add(1, Ordering::Relaxed) + 1;
+    let emit = H_EMIT.get(i).fetch_add(1, Ordering::Relaxed) + 1;
     // WCH-SPREAD — the present phase's floor and its evenness. `minpresent_us=0` and `presspread=0`
     // both mean the same thing and only that: this window has recorded no present the counter could
     // measure, so neither number exists yet. `H_TORN` is incremented three lines above the rate
@@ -1739,11 +1740,11 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // faster than one nanosecond per 4 KiB, i.e. below the timer's resolution, and a window holding one
     // of those alongside a torn present is as uneven as this counter can report. Saturating it to the
     // largest ratio the numbers allow is the honest reading of that pair, not a special case.
-    let minp = H_MINPRES[i].load(Ordering::Relaxed);
+    let minp = H_MINPRES.get(i).load(Ordering::Relaxed);
     let minpresent = if minp == u64::MAX { 0 } else { minp };
-    let lo = H_MINRATE[i].load(Ordering::Relaxed);
+    let lo = H_MINRATE.get(i).load(Ordering::Relaxed);
     let presspread =
-        if lo == u64::MAX { 0 } else { H_MAXRATE[i].load(Ordering::Relaxed) / lo.max(1) };
+        if lo == u64::MAX { 0 } else { H_MAXRATE.get(i).load(Ordering::Relaxed) / lo.max(1) };
     // WCHUN — the decline census, split by reason. Printed unconditionally, including the all-zero
     // case: a reader who has to tell "no declines" from "the field is missing on this build" cannot,
     // and a boot whose `declines=` is 0 is exactly the boot whose breakdown proves the counter is
@@ -1755,7 +1756,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // `route` is likewise absent — `stage_decline` cannot be handed it (only `erase_defer` carries
     // `DECL_ROUTE`, and that reports through `[wc-k]`), so a key for it would be a permanent zero
     // asserting nothing.
-    let declby = |r: u32| H_DECLBY[i][r as usize].load(Ordering::Relaxed);
+    let declby = |r: u32| H_DECLBY.get(i)[r as usize].load(Ordering::Relaxed);
     // KEY ORDER IS LOAD-BEARING ACROSS SEATS. `win=`, `scope=`, `declines=` and the terminal
     // `-> {verdict}` are matched in this order by the pi4 track's regression spec, which also relies
     // on `scope=window ` carrying a TRAILING SPACE so its pattern cannot match `scope=window-band`.
@@ -1815,14 +1816,14 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         taken.min(SAMPLES),
         SAMPLES,
         torn_n,
-        H_STALL[i].load(Ordering::Relaxed),
-        H_LONGPRES[i].load(Ordering::Relaxed),
+        H_STALL.get(i).load(Ordering::Relaxed),
+        H_LONGPRES.get(i).load(Ordering::Relaxed),
         decl_n,
         declby(DECL_GEOM),
         declby(DECL_CAP),
         declby(DECL_LOCK),
         declby(DECL_ALLOC),
-        H_SHRUNK[i].load(Ordering::Relaxed),
+        H_SHRUNK.get(i).load(Ordering::Relaxed),
         blitnet[0],
         blitnet[1],
         blitnet[2],
@@ -1831,26 +1832,26 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         blitnet[5],
         blitnet[6],
         blitnet[7],
-        if H_BEAMOBS[i].load(Ordering::Relaxed) > 0 { "obs" } else { "blind" },
-        H_BEAMOBS[i].load(Ordering::Relaxed),
-        H_BEAMWAITS[i].load(Ordering::Relaxed),
-        H_BEAMWAIT[i].load(Ordering::Relaxed),
-        H_BEAMMAXWAIT[i].load(Ordering::Relaxed),
-        H_BEAMGIVEUP[i].load(Ordering::Relaxed),
-        H_BEAMCROSS[i].load(Ordering::Relaxed),
+        if H_BEAMOBS.get(i).load(Ordering::Relaxed) > 0 { "obs" } else { "blind" },
+        H_BEAMOBS.get(i).load(Ordering::Relaxed),
+        H_BEAMWAITS.get(i).load(Ordering::Relaxed),
+        H_BEAMWAIT.get(i).load(Ordering::Relaxed),
+        H_BEAMMAXWAIT.get(i).load(Ordering::Relaxed),
+        H_BEAMGIVEUP.get(i).load(Ordering::Relaxed),
+        H_BEAMCROSS.get(i).load(Ordering::Relaxed),
         super::blitter::selected().name(),
-        cycles_to_us(H_BLITCYC[i].load(Ordering::Relaxed)),
-        H_GPUFB[i].load(Ordering::Relaxed),
-        H_FIXTURE[i].load(Ordering::Relaxed),
-        H_WHOLE[i].load(Ordering::Relaxed),
-        H_BANDED[i].load(Ordering::Relaxed),
-        H_LINES[i].load(Ordering::Relaxed),
+        cycles_to_us(H_BLITCYC.get(i).load(Ordering::Relaxed)),
+        H_GPUFB.get(i).load(Ordering::Relaxed),
+        H_FIXTURE.get(i).load(Ordering::Relaxed),
+        H_WHOLE.get(i).load(Ordering::Relaxed),
+        H_BANDED.get(i).load(Ordering::Relaxed),
+        H_LINES.get(i).load(Ordering::Relaxed),
         minspan,
         minbytes,
-        H_MAXPRES[i].load(Ordering::Relaxed),
+        H_MAXPRES.get(i).load(Ordering::Relaxed),
         minpresent,
         presspread,
-        H_RATEN[i].load(Ordering::Relaxed),
+        H_RATEN.get(i).load(Ordering::Relaxed),
         FRAME_US,
         STALL_PRESENT_US,
         verdict
@@ -1867,12 +1868,12 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // stores happen on every emission — including the two latched ones — so the first refresh is
     // measured from the window's first rollup rather than from boot, and a window whose first rollup
     // is its last activity never refreshes at all.
-    H_LASTCENSUS[i].store(census_total(i), Ordering::Relaxed);
+    H_LASTCENSUS.get(i).store(census_total(i), Ordering::Relaxed);
     // STORM-R1 — one clock reading for both cells. Two readings would let the system's cell trail the
     // window's by the cost of the read, which is nothing on its own but makes the two gates describe
     // fractionally different periods for no reason.
     let done = now_cycles();
-    H_LASTROLL[i].store(done, Ordering::Relaxed);
+    H_LASTROLL.get(i).store(done, Ordering::Relaxed);
     // STORM-R1 — and the system's, from every emission for the reason the per-id one is: a latched
     // rollup spends the same serial time a refreshed one does, so the duty cycle has to count it.
     // This store cannot gate the latches themselves — they call this function unconditionally — it
@@ -2388,7 +2389,7 @@ pub(super) fn cycles_to_us(dt: u64) -> u64 {
 /// always assumed. A spent id has no reader left to starve: [`begin`] is the only consumer of
 /// `APP_CKS`/`APP_SEQ` and it returns `None` for a spent id.
 fn budget_left(i: usize) -> bool {
-    TAKEN[i].load(Ordering::Relaxed) < SAMPLES
+    TAKEN.get(i).load(Ordering::Relaxed) < SAMPLES
 }
 
 /// Record the app-side frame at `SYS_WIN_PRESENT` entry — the checksum of what the owner declared
@@ -2396,14 +2397,14 @@ fn budget_left(i: usize) -> bool {
 /// from `wm::present`, after the table lock is dropped and before the composite.
 pub fn on_present(id: u32, surf: usize, surf_len: usize) {
     let i = id as usize;
-    if i >= IDS {
+    if i >= u32::MAX as usize {
         return;
     }
     // WCG-CHUNK — a part-paid chunked sample keeps the `app` leg live past the last budget spend:
     // sample 4 spends `TAKEN` at its FIRST chunk, so `budget_left` goes false while the cursor is
     // still mid-box, and without this the leg would go dark for the rest of that sample's chunks.
     #[cfg(feature = "wcg-paygo")]
-    let live = budget_left(i) || WCG_CUR[i].load(Ordering::Relaxed) != 0;
+    let live = budget_left(i) || WCG_CUR.get(i).load(Ordering::Relaxed) != 0;
     #[cfg(not(feature = "wcg-paygo"))]
     let live = budget_left(i);
     // WC-G/M3 — `paygo_arm` is the deferral gate's other end, and it is not an optimisation: without
@@ -2421,21 +2422,21 @@ pub fn on_present(id: u32, surf: usize, surf_len: usize) {
     // than removed. The offset is published beside the hash so `begin` can refuse to compare hashes
     // of different bytes — see [`APP_OFF`].
     #[cfg(feature = "wcg-paygo")]
-    if TAKEN[i].load(Ordering::Relaxed) > 0 {
-        let cur = WCG_CUR[i].load(Ordering::Relaxed) as usize;
+    if TAKEN.get(i).load(Ordering::Relaxed) > 0 {
+        let cur = WCG_CUR.get(i).load(Ordering::Relaxed) as usize;
         let lo = cur.min(surf_len);
         let hi = cur.saturating_add(WCG_CHUNK_BYTES).min(surf_len);
         let cks =
             if surf == 0 { FNV_BASIS } else { checksum(surf + lo, hi.saturating_sub(lo)) };
-        APP_CKS[i].store(cks, Ordering::Relaxed);
-        APP_OFF[i].store(cur as u64, Ordering::Relaxed);
-        APP_SEQ[i].fetch_add(1, Ordering::Relaxed);
+        APP_CKS.get(i).store(cks, Ordering::Relaxed);
+        APP_OFF.get(i).store(cur as u64, Ordering::Relaxed);
+        APP_SEQ.get(i).fetch_add(1, Ordering::Relaxed);
         return;
     }
-    APP_CKS[i].store(checksum(surf, surf_len), Ordering::Relaxed);
+    APP_CKS.get(i).store(checksum(surf, surf_len), Ordering::Relaxed);
     #[cfg(feature = "wcg-paygo")]
-    APP_OFF[i].store(u64::MAX, Ordering::Relaxed);
-    APP_SEQ[i].fetch_add(1, Ordering::Relaxed);
+    APP_OFF.get(i).store(u64::MAX, Ordering::Relaxed);
+    APP_SEQ.get(i).fetch_add(1, Ordering::Relaxed);
 }
 
 /// State carried across one instrumented blit. Not `Copy`: it exists exactly between [`begin`] and
@@ -2857,20 +2858,20 @@ pub(super) fn paygo_clock() -> (u64, &'static str, bool) {
 /// same cell as the step it describes. A marker derived independently of the walk could disagree
 /// with it, and a `coverage=` that misreports its own pass is worse than no marker at all.
 #[cfg(feature = "wcg-paygo")]
-static PAYGO_STEP: [AtomicU32; IDS] = [const { AtomicU32::new(1) }; IDS];
+static PAYGO_STEP: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(1));
 
 /// PAYGO — per-id: blits the deferral gate declined to sample. UNBUDGETED and taken before any
 /// other test, on WC-H2's rule: past a gate the LINE stops and the count must not, because a
 /// counter that stops counting is an instrument that lies. This one is what makes "the battery is
 /// waiting" a quantity rather than an impression.
 #[cfg(feature = "wcg-paygo")]
-static PAYGO_DEFERRED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static PAYGO_DEFERRED: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// PAYGO — per-id: whether this window has ever been declined, i.e. whether it is in the deferring
 /// regime at all. NOT a print latch any more, and the difference is [`paygo_refresh`]'s whole reason
 /// for existing — see [`PAYGO_EMIT`].
 #[cfg(feature = "wcg-paygo")]
-static PAYGO_SAID: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static PAYGO_SAID: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// PAYGO — per-id: a `state=waiting` line owed but not yet printed.
 ///
@@ -2891,7 +2892,7 @@ static PAYGO_SAID: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// that WC-D's frozen reference describes. One pending slot per id, like [`H_PEND`], and lost
 /// overlaps cost a trace line and never a census: [`PAYGO_DEFERRED`] is incremented at the decline.
 #[cfg(feature = "wcg-paygo")]
-static PAYGO_PEND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static PAYGO_PEND: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// PAYGO — per-id: `[wc-g] paygo` lines emitted for this window so far. Printed as `emit=`, one-based.
 ///
@@ -2912,14 +2913,14 @@ static PAYGO_PEND: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// is the module's standing one: for any `win=`, the greatest `emit=` supersedes every earlier line,
 /// and these lines are never summed — they are snapshots of a monotone total, not deltas.
 #[cfg(feature = "wcg-paygo")]
-static PAYGO_EMIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static PAYGO_EMIT: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// PAYGO — per-id: `now_cycles()` as of the END of the most recent paygo emission. The refresh's rate
 /// gate and its mutual exclusion both, exactly as [`H_LASTROLL`] serves the rollup: two cores
 /// flushing the same window at once both observe this value, and only the one whose
 /// `compare_exchange` succeeds prints.
 #[cfg(feature = "wcg-paygo")]
-static PAYGO_LASTROLL: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static PAYGO_LASTROLL: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 /// PAYGO — per-id: [`PAYGO_DEFERRED`] as of the most recent emission. The delta gate: a window whose
 /// declines have not moved has nothing new to say, and reprinting an unchanged line would spend
@@ -2927,7 +2928,7 @@ static PAYGO_LASTROLL: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// its last line describing its last active state — the same steady-state behaviour
 /// [`census_refresh`] has.
 #[cfg(feature = "wcg-paygo")]
-static PAYGO_LASTCENSUS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static PAYGO_LASTCENSUS: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// PAYGO-TERM — per-id: this TENANT's battery has spoken its closing line, so the wire is shut.
 ///
@@ -2951,7 +2952,7 @@ static PAYGO_LASTCENSUS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// [`paygo_recycle`] clears it, from `wm::create_inner`, beside the wc-d latches that re-arm there
 /// for the same reason.
 #[cfg(feature = "wcg-paygo")]
-static PAYGO_CLOSED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static PAYGO_CLOSED: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 // ---- WCG-CHUNK — the full-coverage glass read-back, paid in time-bounded chunks -----------------
 
@@ -3010,7 +3011,7 @@ const WCG_CHUNK_BYTES: usize = 32 * 1024;
 /// banked sums). Advanced only by a clean banked chunk; reset by every sample close and by
 /// [`paygo_recycle`].
 #[cfg(feature = "wcg-paygo")]
-static WCG_CUR: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static WCG_CUR: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 /// WCG-CHUNK — per-id: a chunk is between [`begin`] and [`end`] RIGHT NOW. The single-walker latch:
 /// `wcd_admit`'s CAS serializes wc-d's chunks, but `begin` has no state machine and
@@ -3018,7 +3019,7 @@ static WCG_CUR: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// walking the same cursor would double-bank `checked` and print a denominator the box does not
 /// have. Claimed before the budget spend, released on every exit of `end`.
 #[cfg(feature = "wcg-paygo")]
-static WCG_BUSY: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static WCG_BUSY: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// WCG-CHUNK — per-id telemetry for the paygo `-> PAID` terminal: `chunks=` and `hold_max_us=`,
 /// AFTER the verdict token (the suffix position `wm::wcd_paygo_note`'s B1 review fixed — the bench
@@ -3036,9 +3037,9 @@ static WCG_BUSY: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// band checksum (bounded by [`WCG_CHUNK_BYTES`], paid at present entry outside the composite).
 /// Reset at recycle only — the pair describes the tenant's whole battery, all chunked samples.
 #[cfg(feature = "wcg-paygo")]
-static WCG_CHUNKS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static WCG_CHUNKS: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 #[cfg(feature = "wcg-paygo")]
-static WCG_HOLD_MAX_US: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static WCG_HOLD_MAX_US: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 /// WCG-CHUNK — per-id banked sums for the cumulative closing line: silent clean chunks add their
 /// `checked`/`occluded` here (their `bad` is zero — that is what kept them silent), the `prof`
@@ -3047,21 +3048,21 @@ static WCG_HOLD_MAX_US: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// by construction ([`WCG_BUSY`]), so `Relaxed` throughout; reset by the first chunk of each sample
 /// (cursor at 0).
 #[cfg(feature = "wcg-paygo")]
-static WCG_ACC_CHECKED: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static WCG_ACC_CHECKED: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 #[cfg(feature = "wcg-paygo")]
-static WCG_ACC_OCC: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static WCG_ACC_OCC: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 #[cfg(feature = "wcg-paygo")]
-static WCG_ACC_USMAX: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static WCG_ACC_USMAX: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 #[cfg(feature = "wcg-paygo")]
-static WCG_ACC_BYTES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static WCG_ACC_BYTES: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 #[cfg(feature = "wcg-paygo")]
-static WCG_ACC_BLITUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static WCG_ACC_BLITUS: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 #[cfg(feature = "wcg-paygo")]
-static WCG_ACC_CIVACUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static WCG_ACC_CIVACUS: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 #[cfg(feature = "wcg-paygo")]
-static WCG_ACC_AFTERUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static WCG_ACC_AFTERUS: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 #[cfg(feature = "wcg-paygo")]
-static WCG_ACC_RBUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static WCG_ACC_RBUS: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
 
 /// WCG-CHUNK — per-id: the byte offset [`on_present`]'s `app` checksum covered, or `u64::MAX` for
 /// the whole surface (the pre-chunk meaning, and the initial state). [`begin`] consults it before
@@ -3072,7 +3073,7 @@ static WCG_ACC_RBUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// threshold-straddle seam already established: `own=yes` on the wire MEANS the `app=` hash is
 /// consultable against `blit=`.
 #[cfg(feature = "wcg-paygo")]
-static APP_OFF: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
+static APP_OFF: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(u64::MAX));
 
 /// PAYGO-TERM — a new tenant landed on this slot: re-arm the terminal. See [`PAYGO_CLOSED`].
 ///
@@ -3113,33 +3114,33 @@ static APP_OFF: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
 /// plumbed into `stage_note`) is recorded as owed, not taken here. The stall-guard FORBID in
 /// x86-witness.spec is bounded at >= 2 for exactly this stray (see the spec's WCH-STALL block).
 pub(super) fn wch_recycle(i: usize) {
-    if i >= IDS {
+    if i >= u32::MAX as usize {
         return;
     }
-    APP_CKS[i].store(FNV_BASIS, Ordering::Relaxed);
-    APP_SEQ[i].store(0, Ordering::Relaxed);
-    SEEN_SEQ[i].store(0, Ordering::Relaxed);
-    W_SAMPLES[i].store(0, Ordering::Relaxed);
-    W_COHER[i].store(0, Ordering::Relaxed);
-    W_RACE[i].store(0, Ordering::Relaxed);
-    W_BLIT[i].store(0, Ordering::Relaxed);
-    W_CLEAN[i].store(0, Ordering::Relaxed);
-    W_SLOW[i].store(0, Ordering::Relaxed);
-    W_MAXUS[i].store(0, Ordering::Relaxed);
-    W_WITUS[i].store(0, Ordering::Relaxed);
-    H_TORN[i].store(0, Ordering::Relaxed);
-    H_STALL[i].store(0, Ordering::Relaxed);
+    APP_CKS.get(i).store(FNV_BASIS, Ordering::Relaxed);
+    APP_SEQ.get(i).store(0, Ordering::Relaxed);
+    SEEN_SEQ.get(i).store(0, Ordering::Relaxed);
+    W_SAMPLES.get(i).store(0, Ordering::Relaxed);
+    W_COHER.get(i).store(0, Ordering::Relaxed);
+    W_RACE.get(i).store(0, Ordering::Relaxed);
+    W_BLIT.get(i).store(0, Ordering::Relaxed);
+    W_CLEAN.get(i).store(0, Ordering::Relaxed);
+    W_SLOW.get(i).store(0, Ordering::Relaxed);
+    W_MAXUS.get(i).store(0, Ordering::Relaxed);
+    W_WITUS.get(i).store(0, Ordering::Relaxed);
+    H_TORN.get(i).store(0, Ordering::Relaxed);
+    H_STALL.get(i).store(0, Ordering::Relaxed);
     // WCH-LONGPRES — the census, the one-shot latch and the pending hand-off all belong to the DEAD
     // tenant. The latch especially: leaving it set would spend the new tenant's one naming line
     // before it has presented once, and the count would then be the only evidence a stall happened.
-    H_LONGPRES[i].store(0, Ordering::Relaxed);
-    H_LONGSAID[i].store(0, Ordering::Relaxed);
-    H_LONGUS[i].store(0, Ordering::Relaxed);
-    H_MAXPRES[i].store(0, Ordering::Relaxed);
-    H_MINPRES[i].store(u64::MAX, Ordering::Relaxed);
-    H_MINRATE[i].store(u64::MAX, Ordering::Relaxed);
-    H_MAXRATE[i].store(0, Ordering::Relaxed);
-    H_DECLINE[i].store(0, Ordering::Relaxed);
+    H_LONGPRES.get(i).store(0, Ordering::Relaxed);
+    H_LONGSAID.get(i).store(0, Ordering::Relaxed);
+    H_LONGUS.get(i).store(0, Ordering::Relaxed);
+    H_MAXPRES.get(i).store(0, Ordering::Relaxed);
+    H_MINPRES.get(i).store(u64::MAX, Ordering::Relaxed);
+    H_MINRATE.get(i).store(u64::MAX, Ordering::Relaxed);
+    H_MAXRATE.get(i).store(0, Ordering::Relaxed);
+    H_DECLINE.get(i).store(0, Ordering::Relaxed);
     // CURSORBG — **the BREAKDOWN travels with the tenant too, and until now it did not.**
     // `H_DECLINE` (the `declines=` total) was reset here and `H_DECLBY` (the `decl_geom=`/`decl_cap=`/
     // `decl_lock=`/`decl_alloc=` split) was not, so the two halves of one line were measured over
@@ -3153,36 +3154,36 @@ pub(super) fn wch_recycle(i: usize) {
     // rest of that set. After it, `declines == sum(decl_*)` is an invariant a reader may rely on.
     let mut k = 0;
     while k < DECL_KINDS {
-        H_DECLBY[i][k].store(0, Ordering::Relaxed);
+        H_DECLBY.get(i)[k].store(0, Ordering::Relaxed);
         k += 1;
     }
-    H_FIXTURE[i].store(0, Ordering::Relaxed);
-    H_PEND[i].store(0, Ordering::Relaxed);
-    H_KIND[i].store(0, Ordering::Relaxed);
-    H_BAND[i].store(0, Ordering::Relaxed);
-    H_SPAN[i].store(0, Ordering::Relaxed);
-    H_BOX[i].store(0, Ordering::Relaxed);
-    H_BYTES[i].store(0, Ordering::Relaxed);
-    H_COMPOSE[i].store(0, Ordering::Relaxed);
-    H_PRESENT[i].store(0, Ordering::Relaxed);
-    H_RECTSCAN[i].store(0, Ordering::Relaxed);
-    H_BANDED[i].store(0, Ordering::Relaxed);
-    H_WHOLE[i].store(0, Ordering::Relaxed);
-    H_MINSPAN[i].store(u64::MAX, Ordering::Relaxed);
-    H_T0[i].store(0, Ordering::Relaxed);
-    H_LASTROLL[i].store(0, Ordering::Relaxed);
-    H_LASTCENSUS[i].store(0, Ordering::Relaxed);
+    H_FIXTURE.get(i).store(0, Ordering::Relaxed);
+    H_PEND.get(i).store(0, Ordering::Relaxed);
+    H_KIND.get(i).store(0, Ordering::Relaxed);
+    H_BAND.get(i).store(0, Ordering::Relaxed);
+    H_SPAN.get(i).store(0, Ordering::Relaxed);
+    H_BOX.get(i).store(0, Ordering::Relaxed);
+    H_BYTES.get(i).store(0, Ordering::Relaxed);
+    H_COMPOSE.get(i).store(0, Ordering::Relaxed);
+    H_PRESENT.get(i).store(0, Ordering::Relaxed);
+    H_RECTSCAN.get(i).store(0, Ordering::Relaxed);
+    H_BANDED.get(i).store(0, Ordering::Relaxed);
+    H_WHOLE.get(i).store(0, Ordering::Relaxed);
+    H_MINSPAN.get(i).store(u64::MAX, Ordering::Relaxed);
+    H_T0.get(i).store(0, Ordering::Relaxed);
+    H_LASTROLL.get(i).store(0, Ordering::Relaxed);
+    H_LASTCENSUS.get(i).store(0, Ordering::Relaxed);
 }
 
 #[cfg(feature = "wcg-paygo")]
 pub(super) fn paygo_recycle(i: usize) {
-    if i < IDS {
-        PAYGO_CLOSED[i].store(0, Ordering::Relaxed);
-        WCG_CUR[i].store(0, Ordering::Relaxed);
-        WCG_BUSY[i].store(0, Ordering::Relaxed);
-        WCG_CHUNKS[i].store(0, Ordering::Relaxed);
-        WCG_HOLD_MAX_US[i].store(0, Ordering::Relaxed);
-        APP_OFF[i].store(u64::MAX, Ordering::Relaxed);
+    if i < u32::MAX as usize {
+        PAYGO_CLOSED.get(i).store(0, Ordering::Relaxed);
+        WCG_CUR.get(i).store(0, Ordering::Relaxed);
+        WCG_BUSY.get(i).store(0, Ordering::Relaxed);
+        WCG_CHUNKS.get(i).store(0, Ordering::Relaxed);
+        WCG_HOLD_MAX_US.get(i).store(0, Ordering::Relaxed);
+        APP_OFF.get(i).store(u64::MAX, Ordering::Relaxed);
     }
 }
 
@@ -3195,11 +3196,11 @@ pub(super) fn paygo_recycle(i: usize) {
 /// last word"), and the one the terminal rests on is this one.
 #[cfg(feature = "wcg-paygo")]
 pub(super) fn paygo_seal_closed(i: usize) {
-    if i < IDS {
-        PAYGO_CLOSED[i].store(1, Ordering::Release);
+    if i < u32::MAX as usize {
+        PAYGO_CLOSED.get(i).store(1, Ordering::Release);
         // The deferred waiting line this window had queued is superseded by its terminal. Left set,
         // it would fire on the next tenant's first flush and read as that tenant's opening line.
-        PAYGO_PEND[i].store(0, Ordering::Relaxed);
+        PAYGO_PEND.get(i).store(0, Ordering::Relaxed);
     }
 }
 
@@ -3224,21 +3225,21 @@ pub(super) fn paygo_seal_closed(i: usize) {
 /// [`PAYGO_EMIT`] for why that line is then re-emitted on a cadence rather than printed once.
 #[cfg(feature = "wcg-paygo")]
 fn paygo_open(_id: u32, i: usize) -> bool {
-    if TAKEN[i].load(Ordering::Relaxed) == 0 {
-        PAYGO_STEP[i].store(PAYGO_LATTICE_N as u32, Ordering::Relaxed);
+    if TAKEN.get(i).load(Ordering::Relaxed) == 0 {
+        PAYGO_STEP.get(i).store(PAYGO_LATTICE_N as u32, Ordering::Relaxed);
         return true;
     }
     if !paygo_arm(i) {
         // Census first, unbudgeted, before any print test — WC-H2's rule. Then RECORD the line and
         // let `stage_flush` print it: nothing in this function may write to the UART, because it runs
         // between WC-D's frozen reference and the copy that reference describes. See [`PAYGO_PEND`].
-        PAYGO_DEFERRED[i].fetch_add(1, Ordering::Relaxed);
-        if PAYGO_SAID[i].swap(1, Ordering::Relaxed) == 0 {
-            PAYGO_PEND[i].store(1, Ordering::Release);
+        PAYGO_DEFERRED.get(i).fetch_add(1, Ordering::Relaxed);
+        if PAYGO_SAID.get(i).swap(1, Ordering::Relaxed) == 0 {
+            PAYGO_PEND.get(i).store(1, Ordering::Release);
         }
         return false;
     }
-    PAYGO_STEP[i].store(1, Ordering::Relaxed);
+    PAYGO_STEP.get(i).store(1, Ordering::Relaxed);
     true
 }
 
@@ -3266,12 +3267,12 @@ fn paygo_open(_id: u32, i: usize) -> bool {
 #[cfg(feature = "wcg-paygo")]
 #[inline]
 fn paygo_arm(i: usize) -> bool {
-    if TAKEN[i].load(Ordering::Relaxed) == 0 {
+    if TAKEN.get(i).load(Ordering::Relaxed) == 0 {
         return true;
     }
     // PAYGO-TERM/PAY-AT-CLOSE — this window is being torn down with its battery still owed, and the
     // deferral has run out of future to be deferred into. See [`PAYGO_FORCE`].
-    if PAYGO_FORCE[i].load(Ordering::Relaxed) != 0 {
+    if PAYGO_FORCE.get(i).load(Ordering::Relaxed) != 0 {
         return true;
     }
     // An unarmed clock — no entry stamp yet, or no calibrated rate — DEFERS. See [`since_entry_ms`]
@@ -3301,7 +3302,7 @@ fn paygo_arm(_i: usize) -> bool {
 /// rejected. Never set by anything periodic: a mature deferral is taken by the service-pass taker on
 /// the ordinary path, where the clock has genuinely opened and no override is involved.
 #[cfg(feature = "wcg-paygo")]
-static PAYGO_FORCE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static PAYGO_FORCE: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// PAYGO-TERM — does this window owe a deferred sample, i.e. was it DECLINED by the gate and is its
 /// battery still open? Says nothing about whether the deferral has matured; see [`paygo_ripe`].
@@ -3321,10 +3322,10 @@ static PAYGO_FORCE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// taker's whole-box mark now reaches every part-paid sample and drives its cursor home.
 #[cfg(feature = "wcg-paygo")]
 pub(super) fn paygo_pending(i: usize) -> bool {
-    i < IDS
-        && ((PAYGO_SAID[i].load(Ordering::Relaxed) != 0
-            && TAKEN[i].load(Ordering::Relaxed) < SAMPLES)
-            || WCG_CUR[i].load(Ordering::Relaxed) != 0)
+    i < u32::MAX as usize
+        && ((PAYGO_SAID.get(i).load(Ordering::Relaxed) != 0
+            && TAKEN.get(i).load(Ordering::Relaxed) < SAMPLES)
+            || WCG_CUR.get(i).load(Ordering::Relaxed) != 0)
 }
 
 /// PAYGO-TERM — is this window's deferred sample owed AND payable right now? The service-pass taker's
@@ -3340,8 +3341,8 @@ pub(super) fn paygo_ripe(i: usize) -> bool {
 /// with no deferral at all.
 #[cfg(feature = "wcg-paygo")]
 pub(super) fn paygo_force(i: usize, on: bool) {
-    if i < IDS {
-        PAYGO_FORCE[i].store(u32::from(on), Ordering::Relaxed);
+    if i < u32::MAX as usize {
+        PAYGO_FORCE.get(i).store(u32::from(on), Ordering::Relaxed);
     }
 }
 
@@ -3357,7 +3358,7 @@ fn paygo_open(_id: u32, _i: usize) -> bool {
 #[cfg(feature = "wcg-paygo")]
 #[inline]
 fn probe_step(i: usize) -> usize {
-    PAYGO_STEP[i].load(Ordering::Relaxed) as usize
+    PAYGO_STEP.get(i).load(Ordering::Relaxed) as usize
 }
 
 #[cfg(not(feature = "wcg-paygo"))]
@@ -3460,8 +3461,8 @@ const PAYGO_ROLLUP_NOTE: &str = "";
 /// insertion between matched keys broke the analyzer's PAID accounting on the wc-d side.
 #[cfg(feature = "wcg-paygo")]
 fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32, u64)>) {
-    let deferred = PAYGO_DEFERRED[i].load(Ordering::Relaxed);
-    let emit = PAYGO_EMIT[i].fetch_add(1, Ordering::Relaxed) + 1;
+    let deferred = PAYGO_DEFERRED.get(i).load(Ordering::Relaxed);
+    let emit = PAYGO_EMIT.get(i).fetch_add(1, Ordering::Relaxed) + 1;
     // `clock=` disambiguates a real zero from an absent one. `since_entry_ms=0 clock=unarmed` says
     // the entry stamp or the TSC calibration was not there to measure against — which is the state
     // the gate DEFERS in — where `since_entry_ms=0 clock=entry` would be a genuine reading taken at
@@ -3479,7 +3480,7 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32
             PAYGO_DEFER_MS,
             since_ms,
             clock,
-            TAKEN[i].load(Ordering::Relaxed).min(SAMPLES),
+            TAKEN.get(i).load(Ordering::Relaxed).min(SAMPLES),
             SAMPLES,
             verdict
         ),
@@ -3493,7 +3494,7 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32
             PAYGO_DEFER_MS,
             since_ms,
             clock,
-            TAKEN[i].load(Ordering::Relaxed).min(SAMPLES),
+            TAKEN.get(i).load(Ordering::Relaxed).min(SAMPLES),
             SAMPLES,
             verdict,
             n,
@@ -3510,8 +3511,8 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32
     // per-id cell can see N. `stage_rollup` needed `H_LASTROLL_ANY` to make that claim true. This
     // path does not, because its aggregate is bounded by the deferral deadline instead of by a rate.
     // `PAYGO_LASTROLL` carries the arithmetic, the three captures, and the change that would end it.
-    PAYGO_LASTCENSUS[i].store(PAYGO_DEFERRED[i].load(Ordering::Relaxed), Ordering::Relaxed);
-    PAYGO_LASTROLL[i].store(now_cycles(), Ordering::Relaxed);
+    PAYGO_LASTCENSUS.get(i).store(PAYGO_DEFERRED.get(i).load(Ordering::Relaxed), Ordering::Relaxed);
+    PAYGO_LASTROLL.get(i).store(now_cycles(), Ordering::Relaxed);
 }
 
 /// PAYGO — print the owed `state=waiting` line, or keep a still-deferring window's census current.
@@ -3531,27 +3532,27 @@ fn paygo_flush(id: u32, i: usize) {
     // waiting for something, and a closed one is not. Without it a `state=closed … -> UNSPENT` is
     // followed by `state=waiting … -> DEFERRED` at a higher `emit=`, and the module's own reader rule
     // (greatest `emit=` supersedes) then reads the terminal as superseded. See [`PAYGO_CLOSED`].
-    if PAYGO_CLOSED[i].load(Ordering::Acquire) != 0 {
+    if PAYGO_CLOSED.get(i).load(Ordering::Acquire) != 0 {
         return;
     }
-    if PAYGO_PEND[i].swap(0, Ordering::AcqRel) != 0 {
+    if PAYGO_PEND.get(i).swap(0, Ordering::AcqRel) != 0 {
         paygo_note(id, i, "waiting", "DEFERRED", None);
         return;
     }
     // Only while this window is actually deferring. Nothing before its first decline, and nothing
     // after its battery completes — `state=complete` is that window's terminal paygo line.
-    if PAYGO_SAID[i].load(Ordering::Relaxed) == 0 || TAKEN[i].load(Ordering::Relaxed) >= SAMPLES {
+    if PAYGO_SAID.get(i).load(Ordering::Relaxed) == 0 || TAKEN.get(i).load(Ordering::Relaxed) >= SAMPLES {
         return;
     }
-    if PAYGO_DEFERRED[i].load(Ordering::Relaxed) == PAYGO_LASTCENSUS[i].load(Ordering::Relaxed) {
+    if PAYGO_DEFERRED.get(i).load(Ordering::Relaxed) == PAYGO_LASTCENSUS.get(i).load(Ordering::Relaxed) {
         return;
     }
-    let last = PAYGO_LASTROLL[i].load(Ordering::Relaxed);
+    let last = PAYGO_LASTROLL.get(i).load(Ordering::Relaxed);
     let now = now_cycles();
     if cycles_to_us(now.saturating_sub(last)) < CENSUS_PERIOD_US {
         return;
     }
-    if PAYGO_LASTROLL[i].compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+    if PAYGO_LASTROLL.get(i).compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return;
     }
     paygo_note(id, i, "waiting", "DEFERRED", None);
@@ -3569,8 +3570,8 @@ fn paygo_flush(_id: u32, _i: usize) {}
 fn paygo_complete(id: u32, i: usize) {
     // WCG-CHUNK — the falsifier rides the terminal: how many chunks the battery's full samples took
     // and the worst single gate-held witness span any of them imposed. See [`WCG_CHUNKS`].
-    let chunks = WCG_CHUNKS[i].load(Ordering::Relaxed);
-    let hold = WCG_HOLD_MAX_US[i].load(Ordering::Relaxed);
+    let chunks = WCG_CHUNKS.get(i).load(Ordering::Relaxed);
+    let hold = WCG_HOLD_MAX_US.get(i).load(Ordering::Relaxed);
     paygo_note(id, i, "complete", "PAID", Some((chunks, hold)));
 }
 
@@ -3602,12 +3603,12 @@ fn paygo_complete(id: u32, i: usize) {
 /// the same tenant (there is none today; the row is freed under the caller) prints nothing.
 #[cfg(feature = "wcg-paygo")]
 pub(super) fn paygo_closed(id: u32, i: usize) {
-    if i >= IDS {
+    if i >= u32::MAX as usize {
         return;
     }
     // The queued RACE-PRESENT line is superseded too: it says "waiting", and this window is not.
-    PAYGO_PEND[i].store(0, Ordering::Relaxed);
-    if PAYGO_CLOSED[i].swap(1, Ordering::AcqRel) != 0 {
+    PAYGO_PEND.get(i).store(0, Ordering::Relaxed);
+    if PAYGO_CLOSED.get(i).swap(1, Ordering::AcqRel) != 0 {
         return;
     }
     paygo_note(id, i, "closed", "UNSPENT", None);
@@ -3645,7 +3646,7 @@ pub fn begin(
     compat: bool,
 ) -> Option<Probe> {
     let i = id as usize; seam_register_once(); // WINID2 (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. `SEAM_WIN` is the SIXTH id cache the WINID block's table of five missed (rmbp 13's sweep for the shape), and it is cleared on no path at all. It cannot be registered on its own store line the way the other five are — that line is inside `seam_glyph_note`, which runs once per GLYPH in print context under this file's own "never take a lock, allocate, or print" contract — so it is registered HERE instead: `begin` STRICTLY DOMINATES both readers (`end` adjudicates only a `Probe` this call handed out), it is off the print path, and it is ahead of the first timed span in this function, so no measured bracket widens. Boot-once latched, so the registry mutex is taken exactly once. See the WINID2 block at this file's tail.
-    if compat || surf == 0 || surf_len == 0 || i >= IDS {
+    if compat || surf == 0 || surf_len == 0 || i >= u32::MAX as usize {
         return None;
     }
     // WCG-CHUNK — is this admission a CHUNK of a full-coverage sample? `TAKEN > 0` means the next
@@ -3657,19 +3658,19 @@ pub fn begin(
     // bypasses both, because its sample was admitted and paid for at its first chunk.
     #[cfg(feature = "wcg-paygo")]
     let (chunk, band_off, band_len) = {
-        let cur = WCG_CUR[i].load(Ordering::Relaxed) as usize;
-        if cur > 0 || TAKEN[i].load(Ordering::Relaxed) > 0 {
-            if WCG_BUSY[i].swap(1, Ordering::AcqRel) != 0 {
+        let cur = WCG_CUR.get(i).load(Ordering::Relaxed) as usize;
+        if cur > 0 || TAKEN.get(i).load(Ordering::Relaxed) > 0 {
+            if WCG_BUSY.get(i).swap(1, Ordering::AcqRel) != 0 {
                 return None;
             }
             if cur == 0 {
                 if !paygo_open(id, i) {
-                    WCG_BUSY[i].store(0, Ordering::Release);
+                    WCG_BUSY.get(i).store(0, Ordering::Release);
                     return None;
                 }
-                if TAKEN[i].fetch_add(1, Ordering::Relaxed) >= SAMPLES {
-                    TAKEN[i].store(SAMPLES, Ordering::Relaxed);
-                    WCG_BUSY[i].store(0, Ordering::Release);
+                if TAKEN.get(i).fetch_add(1, Ordering::Relaxed) >= SAMPLES {
+                    TAKEN.get(i).store(SAMPLES, Ordering::Relaxed);
+                    WCG_BUSY.get(i).store(0, Ordering::Release);
                     return None;
                 }
             }
@@ -3681,8 +3682,8 @@ pub fn begin(
             if !paygo_open(id, i) {
                 return None;
             }
-            if TAKEN[i].fetch_add(1, Ordering::Relaxed) >= SAMPLES {
-                TAKEN[i].store(SAMPLES, Ordering::Relaxed);
+            if TAKEN.get(i).fetch_add(1, Ordering::Relaxed) >= SAMPLES {
+                TAKEN.get(i).store(SAMPLES, Ordering::Relaxed);
                 return None;
             }
             (false, 0, surf_len)
@@ -3697,9 +3698,9 @@ pub fn begin(
         if !paygo_open(id, i) {
             return None;
         }
-        if TAKEN[i].fetch_add(1, Ordering::Relaxed) >= SAMPLES {
+        if TAKEN.get(i).fetch_add(1, Ordering::Relaxed) >= SAMPLES {
             // Saturate rather than wrap: the counter is also the budget test in `budget_left`.
-            TAKEN[i].store(SAMPLES, Ordering::Relaxed);
+            TAKEN.get(i).store(SAMPLES, Ordering::Relaxed);
             return None;
         }
     }
@@ -3727,15 +3728,15 @@ pub fn begin(
     let cks_blit_us = cycles_to_us(tp1.saturating_sub(tp0));
     let civac_us = cycles_to_us(tp2.saturating_sub(tp1));
 
-    let seq = APP_SEQ[i].load(Ordering::Relaxed);
-    let own = SEEN_SEQ[i].swap(seq, Ordering::Relaxed) != seq;
+    let seq = APP_SEQ.get(i).load(Ordering::Relaxed);
+    let own = SEEN_SEQ.get(i).swap(seq, Ordering::Relaxed) != seq;
     // WCG-CHUNK — the `app` leg is consultable only if [`on_present`] checksummed the SAME bytes
     // this probe's `blit` leg walked; otherwise the chunk runs `own=no` — the reading the paygo
     // threshold-straddle seam already established, and the guard that keeps a hash comparison of
     // DIFFERENT byte ranges from fabricating a RACE-PRESENT. See [`APP_OFF`].
     #[cfg(feature = "wcg-paygo")]
     let own = own
-        && APP_OFF[i].load(Ordering::Relaxed)
+        && APP_OFF.get(i).load(Ordering::Relaxed)
             == if chunk { band_off as u64 } else { u64::MAX };
 
     Some(Probe {
@@ -3744,7 +3745,7 @@ pub fn begin(
         own,
         surf,
         surf_len,
-        cks_app: APP_CKS[i].load(Ordering::Relaxed),
+        cks_app: APP_CKS.get(i).load(Ordering::Relaxed),
         cks_blit,
         cks_civac,
         cks_blit_us,
@@ -3909,40 +3910,40 @@ pub fn end(
             .saturating_add(p.civac_us)
             .saturating_add(cks_after_us)
             .saturating_add(readback_us);
-        WCG_CHUNKS[wi].fetch_add(1, Ordering::Relaxed);
-        WCG_HOLD_MAX_US[wi].fetch_max(hold, Ordering::Relaxed);
+        WCG_CHUNKS.get(wi).fetch_add(1, Ordering::Relaxed);
+        WCG_HOLD_MAX_US.get(wi).fetch_max(hold, Ordering::Relaxed);
         if p.band_off == 0 {
             // First chunk of a sample: the banked sums start clean. Single-writer by construction
             // ([`WCG_BUSY`] is held), so plain stores.
-            WCG_ACC_CHECKED[wi].store(0, Ordering::Relaxed);
-            WCG_ACC_OCC[wi].store(0, Ordering::Relaxed);
-            WCG_ACC_USMAX[wi].store(0, Ordering::Relaxed);
-            WCG_ACC_BYTES[wi].store(0, Ordering::Relaxed);
-            WCG_ACC_BLITUS[wi].store(0, Ordering::Relaxed);
-            WCG_ACC_CIVACUS[wi].store(0, Ordering::Relaxed);
-            WCG_ACC_AFTERUS[wi].store(0, Ordering::Relaxed);
-            WCG_ACC_RBUS[wi].store(0, Ordering::Relaxed);
+            WCG_ACC_CHECKED.get(wi).store(0, Ordering::Relaxed);
+            WCG_ACC_OCC.get(wi).store(0, Ordering::Relaxed);
+            WCG_ACC_USMAX.get(wi).store(0, Ordering::Relaxed);
+            WCG_ACC_BYTES.get(wi).store(0, Ordering::Relaxed);
+            WCG_ACC_BLITUS.get(wi).store(0, Ordering::Relaxed);
+            WCG_ACC_CIVACUS.get(wi).store(0, Ordering::Relaxed);
+            WCG_ACC_AFTERUS.get(wi).store(0, Ordering::Relaxed);
+            WCG_ACC_RBUS.get(wi).store(0, Ordering::Relaxed);
         }
         let acc_checked =
-            WCG_ACC_CHECKED[wi].fetch_add(checked as u64, Ordering::Relaxed) + checked as u64;
+            WCG_ACC_CHECKED.get(wi).fetch_add(checked as u64, Ordering::Relaxed) + checked as u64;
         let acc_occ =
-            WCG_ACC_OCC[wi].fetch_add(occluded as u64, Ordering::Relaxed) + occluded as u64;
-        let acc_us = WCG_ACC_USMAX[wi].fetch_max(us, Ordering::Relaxed).max(us);
-        WCG_ACC_BYTES[wi].fetch_add(p.band_len as u64, Ordering::Relaxed);
-        WCG_ACC_BLITUS[wi].fetch_add(p.cks_blit_us, Ordering::Relaxed);
-        WCG_ACC_CIVACUS[wi].fetch_add(p.civac_us, Ordering::Relaxed);
-        WCG_ACC_AFTERUS[wi].fetch_add(cks_after_us, Ordering::Relaxed);
-        WCG_ACC_RBUS[wi].fetch_add(readback_us, Ordering::Relaxed);
+            WCG_ACC_OCC.get(wi).fetch_add(occluded as u64, Ordering::Relaxed) + occluded as u64;
+        let acc_us = WCG_ACC_USMAX.get(wi).fetch_max(us, Ordering::Relaxed).max(us);
+        WCG_ACC_BYTES.get(wi).fetch_add(p.band_len as u64, Ordering::Relaxed);
+        WCG_ACC_BLITUS.get(wi).fetch_add(p.cks_blit_us, Ordering::Relaxed);
+        WCG_ACC_CIVACUS.get(wi).fetch_add(p.civac_us, Ordering::Relaxed);
+        WCG_ACC_AFTERUS.get(wi).fetch_add(cks_after_us, Ordering::Relaxed);
+        WCG_ACC_RBUS.get(wi).fetch_add(readback_us, Ordering::Relaxed);
         // The per-window ledger keeps counting per chunk — a part-paid sample's witness time must
         // not vanish if the box never closes. The unchunked add below is skipped for chunks.
-        W_WITUS[wi].fetch_add(hold, Ordering::Relaxed);
+        W_WITUS.get(wi).fetch_add(hold, Ordering::Relaxed);
         let exceptional = p.cks_blit != p.cks_civac
             || p.cks_blit != cks_after
             || (p.own && p.cks_app != p.cks_blit)
             || bad != 0;
         if exceptional {
-            WCG_CUR[wi].store(0, Ordering::Relaxed);
-            WCG_BUSY[wi].store(0, Ordering::Release);
+            WCG_CUR.get(wi).store(0, Ordering::Relaxed);
+            WCG_BUSY.get(wi).store(0, Ordering::Release);
             (
                 bad,
                 checked,
@@ -3954,8 +3955,8 @@ pub fn end(
         } else if rb_row0 >= rows_total {
             // Shrunk (or re-strode, `rb_row0 = usize::MAX` above): every row the box still has was
             // walked by the banked chunks. Close, cumulative, coverage named honestly.
-            WCG_CUR[wi].store(0, Ordering::Relaxed);
-            WCG_BUSY[wi].store(0, Ordering::Release);
+            WCG_CUR.get(wi).store(0, Ordering::Relaxed);
+            WCG_BUSY.get(wi).store(0, Ordering::Release);
             (
                 0,
                 acc_checked as usize,
@@ -3966,12 +3967,12 @@ pub fn end(
             )
         } else if rows_done >= rows_total {
             // The closing chunk: the cursor reached the box's last row.
-            WCG_CUR[wi].store(0, Ordering::Relaxed);
-            WCG_BUSY[wi].store(0, Ordering::Release);
+            WCG_CUR.get(wi).store(0, Ordering::Relaxed);
+            WCG_BUSY.get(wi).store(0, Ordering::Release);
             (0, acc_checked as usize, acc_occ as usize, acc_us, Some(" coverage=full"), BandNote(None))
         } else {
             // Silent clean chunk: bank, advance, hand the budget back. No line, no verdict count.
-            WCG_CUR[wi].store((rows_done * stride) as u64, Ordering::Relaxed);
+            WCG_CUR.get(wi).store((rows_done * stride) as u64, Ordering::Relaxed);
             // ARCH-PARITY (rmbp-7, closed by WMPAYGO in the same fold that opened the bootpace
             // hook): the prediction the old comment made here came true — `wm.rs`'s paygo half is
             // ported, the taker/counter/STOP-NOTE ride the feature terms alone, and this call
@@ -3980,7 +3981,7 @@ pub fn end(
             // does. The hook and this progress report moved TOGETHER, deliberately: a taker whose
             // cap fills with no progress able to re-arm it trips its own STOP-NOTE.
             super::wm::paygo_svc_progress(wi);
-            WCG_BUSY[wi].store(0, Ordering::Release);
+            WCG_BUSY.get(wi).store(0, Ordering::Release);
             return;
         }
     };
@@ -4026,13 +4027,13 @@ pub fn end(
     if verdict != "CLEAN" && p.id != 0 && p.id == SEAM_WIN.load(Ordering::Relaxed) {
         let rb_delta = seam_rb.saturating_sub(p.seam0);
         // Single-compositor-context load/store, like every W_* pattern in this file.
-        let used = W_REARM[w].load(Ordering::Relaxed);
+        let used = W_REARM.get(w).load(Ordering::Relaxed);
         if rb_delta > 0 && used < REARM_MAX {
-            W_REARM[w].store(used + 1, Ordering::Relaxed);
+            W_REARM.get(w).store(used + 1, Ordering::Relaxed);
             // Undo `begin`'s spend. Admission declines at `>= SAMPLES` post-add, so the counter is
             // in `1..=SAMPLES` here and the sub cannot underflow.
-            TAKEN[w].fetch_sub(1, Ordering::Relaxed);
-            W_WITUS[w].fetch_add(
+            TAKEN.get(w).fetch_sub(1, Ordering::Relaxed);
+            W_WITUS.get(w).fetch_add(
                 p.cks_blit_us
                     .saturating_add(p.civac_us)
                     .saturating_add(cks_after_us)
@@ -4083,16 +4084,16 @@ pub fn end(
     }
     match verdict {
         "COHER" => {
-            W_COHER[w].fetch_add(1, Ordering::Relaxed);
+            W_COHER.get(w).fetch_add(1, Ordering::Relaxed);
         }
         "RACE-BLIT" | "RACE-PRESENT" => {
-            W_RACE[w].fetch_add(1, Ordering::Relaxed);
+            W_RACE.get(w).fetch_add(1, Ordering::Relaxed);
         }
         "BLIT" => {
-            W_BLIT[w].fetch_add(1, Ordering::Relaxed);
+            W_BLIT.get(w).fetch_add(1, Ordering::Relaxed);
         }
         _ => {
-            W_CLEAN[w].fetch_add(1, Ordering::Relaxed);
+            W_CLEAN.get(w).fetch_add(1, Ordering::Relaxed);
         }
     }
     // The tearing criterion. NOT "longer than a frame" — that threshold is arbitrary and sits on a
@@ -4113,10 +4114,10 @@ pub fn end(
     let rectscan_us = if ph == 0 { 0 } else { FRAME_US * rows_dst as u64 / ph as u64 };
     let slow = us > rectscan_us;
     if slow {
-        W_SLOW[w].fetch_add(1, Ordering::Relaxed);
+        W_SLOW.get(w).fetch_add(1, Ordering::Relaxed);
     }
-    let n = W_SAMPLES[w].fetch_add(1, Ordering::Relaxed) + 1;
-    W_MAXUS[w].fetch_max(us, Ordering::Relaxed);
+    let n = W_SAMPLES.get(w).fetch_add(1, Ordering::Relaxed) + 1;
+    W_MAXUS.get(w).fetch_max(us, Ordering::Relaxed);
 
     // GR21/WCD-OCC — the `occluded=`/`occ=` field, built here so the serial_println below stays a
     // single shared call across arches. PARITY §6.2: both arches carry the excused-probe count and the
@@ -4241,12 +4242,12 @@ pub fn end(
     #[cfg(feature = "wcg-paygo")]
     let (pf_bytes, pf_blit_us, pf_civac_us, pf_after_us, pf_probes, pf_rb_us) = if p.chunk {
         (
-            WCG_ACC_BYTES[w].load(Ordering::Relaxed),
-            WCG_ACC_BLITUS[w].load(Ordering::Relaxed),
-            WCG_ACC_CIVACUS[w].load(Ordering::Relaxed),
-            WCG_ACC_AFTERUS[w].load(Ordering::Relaxed),
-            WCG_ACC_CHECKED[w].load(Ordering::Relaxed),
-            WCG_ACC_RBUS[w].load(Ordering::Relaxed),
+            WCG_ACC_BYTES.get(w).load(Ordering::Relaxed),
+            WCG_ACC_BLITUS.get(w).load(Ordering::Relaxed),
+            WCG_ACC_CIVACUS.get(w).load(Ordering::Relaxed),
+            WCG_ACC_AFTERUS.get(w).load(Ordering::Relaxed),
+            WCG_ACC_CHECKED.get(w).load(Ordering::Relaxed),
+            WCG_ACC_RBUS.get(w).load(Ordering::Relaxed),
         )
     } else {
         (p.surf_len as u64, p.cks_blit_us, p.civac_us, cks_after_us, checked as u64, readback_us)
@@ -4274,7 +4275,7 @@ pub fn end(
     #[cfg(not(feature = "wcg-paygo"))]
     let wit_here = true;
     if wit_here {
-        W_WITUS[w].fetch_add(
+        W_WITUS.get(w).fetch_add(
             p.cks_blit_us
                 .saturating_add(p.civac_us)
                 .saturating_add(cks_after_us)
@@ -4287,11 +4288,11 @@ pub fn end(
     // — no timer, and no claim about any window but this one. See [`W_SAMPLES`] for why there is no
     // global summary and why the "did any suspect ever fire" question is the spec's FORBIDs instead.
     if n == SAMPLES {
-        let coher = W_COHER[w].load(Ordering::Relaxed);
-        let race = W_RACE[w].load(Ordering::Relaxed);
-        let blitn = W_BLIT[w].load(Ordering::Relaxed);
-        let clean = W_CLEAN[w].load(Ordering::Relaxed);
-        let slown = W_SLOW[w].load(Ordering::Relaxed);
+        let coher = W_COHER.get(w).load(Ordering::Relaxed);
+        let race = W_RACE.get(w).load(Ordering::Relaxed);
+        let blitn = W_BLIT.get(w).load(Ordering::Relaxed);
+        let clean = W_CLEAN.get(w).load(Ordering::Relaxed);
+        let slown = W_SLOW.get(w).load(Ordering::Relaxed);
         // Same precedence as the per-sample verdict. `CLEAN+SLOW` is the load-bearing outcome: every
         // byte correct at every moment, and the unbuffered per-pixel copy into the live scan-out
         // still longer than the beam's time on the rect — the timing suspect, which no checksum can
@@ -4335,8 +4336,8 @@ pub fn end(
             blitn,
             clean,
             slown,
-            W_MAXUS[w].load(Ordering::Relaxed),
-            W_WITUS[w].load(Ordering::Relaxed),
+            W_MAXUS.get(w).load(Ordering::Relaxed),
+            W_WITUS.get(w).load(Ordering::Relaxed),
             FRAME_US,
             dominant
         ); seam_census_emit(p.id); // WCGSEAM-CENSUS — ⚠ SAME-LINE fold, line-NEUTRAL (panic `Location`s below must not renumber). Emitted AFTER the rollup print, so nothing timed follows and no measured bracket widens; compositor context, never print context. Why the census needs a line of its own: the WCGSEAM-CENSUS block at this file's tail.
@@ -4358,7 +4359,7 @@ pub fn end(
 // pass just convicted the one fbcon charged as the routed console". The FIRST of them is gated
 // `#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]`, so the aarch64 side compiles
 // it, and it is the WCGSEAM-HB REFUND GATE: on a match it may refund the sample's budget spend
-// (`TAKEN[w].fetch_sub`) and bump `W_REARM[w]` toward [`REARM_MAX`]. So a recycled id lets ONE
+// (`TAKEN.get(w).fetch_sub`) and bump `W_REARM.get(w)` toward [`REARM_MAX`]. So a recycled id lets ONE
 // window's non-CLEAN verdict steer ANOTHER window's seam re-arm — the console closes, `wm` re-issues
 // its slot (render7: the console's win 1 came back as quarry's win 1), and the new tenant's
 // convictions are then refunded against a bound the console's boot-seam writer earned. The SECOND
@@ -4574,16 +4575,16 @@ fn seam_census_emit(id: u32) {
 // `blitter=` `blit_us=` `gpu_fallback=` are INSERTED directly after `beamcross_ppk=` (the tail of the
 // beam run, inside `pop=all-presents`, the one place no spec keys an adjacency on — the COMPGATE and
 // BEAM paragraphs above). Arity 43 -> 46. Both counters are cumulative per window, like the beam keys.
-static H_BLITCYC: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
-static H_GPUFB: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_BLITCYC: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
+static H_GPUFB: SegVec<AtomicU32> = SegVec::new(|| AtomicU32::new(0));
 
 /// KCOMP — one present through `blitter::present_band`: its cycles, and whether the CPU fallback ran.
 pub fn blit_note(id: u32, cyc: u64, fell_back: bool) {
     let i = id as usize;
-    if i < IDS {
-        H_BLITCYC[i].fetch_add(cyc, Ordering::Relaxed);
+    if i < u32::MAX as usize {
+        H_BLITCYC.get(i).fetch_add(cyc, Ordering::Relaxed);
         if fell_back {
-            H_GPUFB[i].fetch_add(1, Ordering::Relaxed);
+            H_GPUFB.get(i).fetch_add(1, Ordering::Relaxed);
         }
     }
 }

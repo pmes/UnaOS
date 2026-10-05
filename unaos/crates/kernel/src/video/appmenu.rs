@@ -50,11 +50,11 @@ const EMPTY: Entry = Entry { count: 0, items: [MenuWireItem::ZERO; MENU_ITEMS_MA
 /// The owner of each slot (0 = free). Lock-free; the claim and the reap are compare-exchanges.
 static OWN: [AtomicU64; SLOTS] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// Bit `id-1` set = window `id` of that slot's owner was handed to `winmenu::publish`.
-static WINS: [AtomicU64; SLOTS] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static WINS: [super::rowstore::SlotBits; SLOTS] = [const { super::rowstore::SlotBits::new() }; SLOTS]; // WINDOWCAP-2: bit `id-1`, growable (was one u64 word)
 static TREES: spin::Mutex<[Entry; SLOTS]> = spin::Mutex::new([EMPTY; SLOTS]);
 static LEAKS: AtomicU32 = AtomicU32::new(0);
 
-const _: () = assert!(wm::MAX_WINDOWS <= 64); // `WINS` is one word per slot
+// WINDOWCAP-2: `WINS` is a growable SlotBits per slot — no window-count assertion.
 
 /// The kernel-derived owner id of the calling bus row, or `None` for the shared window / a bad row.
 #[cfg(target_arch = "x86_64")]
@@ -185,12 +185,12 @@ fn pick_slot(k: usize, id: u32) {
 /// Hand `asid`'s tree to the bar for each window that owner has right now; returns `(attached, seen)`.
 fn attach(k: usize, asid: u64, titles: &'static [MenuTitle]) -> (u32, u32) {
     let (mut ok, mut seen) = (0u32, 0u32);
-    for id in 1..=(wm::MAX_WINDOWS as u32) {
+    for id in 1..=(wm::slots() as u32) { // WINDOWCAP-2: every row the table has
         if wm::owner_of(id) == Some(asid) {
             seen += 1;
             if winmenu::publish(id, titles, PICK_FNS[k]) {
                 ok += 1;
-                WINS[k].fetch_or(1u64 << (id - 1), Ordering::AcqRel);
+                WINS[k].set(id as usize - 1);
             }
         }
     }
@@ -255,9 +255,8 @@ pub fn verb_publish(row: usize, body: &[u8]) -> i64 {
 /// Drop `asid`'s entry and its bar trees. Lock-free (the reap path runs with interrupts masked).
 fn drop_owner(asid: u64) -> bool {
     let Some(k) = slot_of(asid) else { return false };
-    let wins = WINS[k].swap(0, Ordering::AcqRel);
-    for b in 0..wm::MAX_WINDOWS {
-        if wins & (1u64 << b) != 0 {
+    for b in 0..WINS[k].hwm() {
+        if WINS[k].clear(b) { // WINDOWCAP-2: no allocation on this (masked) reap path
             winmenu::clear(b as u32 + 1);
         }
     }

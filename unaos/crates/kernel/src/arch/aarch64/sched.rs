@@ -4627,7 +4627,12 @@ pub fn run_queue_len(cpu: usize) -> usize {
 /// all, hence the only one where a shortfall could mean anything. Drift fails the build there. The
 /// assert is an inequality rather than an equality on purpose: a future arc may want kill headroom
 /// ABOVE the row count, but never below it.
-pub const MAX_KILL_REQS: usize = 6;
+#[cfg(feature = "aarch64_el0")]
+pub const MAX_KILL_REQS: usize = super::uslots::USER_SLOTS - 2; // WINDOWCAP-2 (B378, R90): FOLLOWS the derived process table (`syscall::MAX_PROCS = USER_SLOTS - 2`) — the same expression, through the same facade, so the two cannot drift; the `syscall.rs` const assert still guards it
+/// WINDOWCAP-2 — a build with no EL0 slot backend has no `Proc` table and no killable rows; the table
+/// keeps a non-zero size so its statics stay well-formed, and nothing can reach it.
+#[cfg(not(feature = "aarch64_el0"))]
+pub const MAX_KILL_REQS: usize = 1;
 
 const KILL_FREE: u8 = 0;
 /// Armed and owned by a live requester; the retiring task publishes `KILL_DONE` for it to observe.
