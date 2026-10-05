@@ -40,6 +40,7 @@ pub enum SignatureAlgorithm {
 pub mod key_usage {
     pub const DIGITAL_SIGNATURE: u16 = 1 << 0;
     pub const KEY_CERT_SIGN: u16 = 1 << 5;
+    pub const CRL_SIGN: u16 = 1 << 6;
 }
 
 /// A parsed certificate. Owns its DER.
@@ -85,6 +86,8 @@ pub struct Certificate {
     pub tls_features: Vec<u16>,
     /// cRLDistributionPoints fullName URIs (RFC 5280 §4.2.1.13) — where a caller fetches a CRL; never fetched here.
     pub crl_dp: Vec<String>,
+    /// freshestCRL (RFC 5280 §4.2.1.15) present: delta CRLs exist for this certificate's scope.
+    pub freshest_crl: bool,
 }
 
 impl Certificate {
@@ -228,6 +231,7 @@ impl Certificate {
             spki: spki_raw,
             tls_features: Vec::new(),
             crl_dp: Vec::new(),
+            freshest_crl: false,
         };
         if let Some(exts) = tbs.optional(tag::context_constructed(3))? {
             if version != 3 {
@@ -399,6 +403,10 @@ impl Certificate {
                 // CRLDistributionPoints ::= SEQUENCE OF DistributionPoint { distributionPoint [0] { fullName [0]
                 // GeneralNames } ... }: keep the URIs (reported, fetched by the caller — CTCORE M2).
                 self.crl_dp = parse_crl_dp_uris(value).unwrap_or_default();
+                return Ok(());
+            }
+            oid::CE_FRESHEST_CRL => {
+                self.freshest_crl = true;
                 return Ok(());
             }
             oid::CE_CERTIFICATE_POLICIES | oid::CE_ISSUER_ALT_NAME => {

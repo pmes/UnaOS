@@ -13,6 +13,10 @@
 #                                   metal opens it as SYSTEM/TRUST/CTLOGS.JSN
 #   system/trust/ctapple.jsn        Apple's CT log list (current_log_list.json, same schema), when reachable
 #   system/trust/*.jsn.sha256       their pins (the builder refuses a mismatch); SOURCE records the provenance
+#   system/trust/inters.pem         Mozilla's CCADB intermediate set (PublicAllIntermediateCertsWithPEMCSV): an
+#                                   UNTRUSTED pool for servers that omit an intermediate (TrustStore.intermediates;
+#                                   8.3 name for the metal); pinned by inters.pem.sha256
+#   tools/trust-bundle --intermediates-from F   take the CCADB CSV (or a PEM bundle) from a local file instead
 #
 # The CT list: https://www.gstatic.com/ct/log_list/v3/log_list.json with its detached signature log_list.sig,
 # verified against Google's key log_list_pubkey.pem (RSASSA-PKCS1-v1_5/SHA-256; `openssl dgst -verify`, the same
@@ -34,7 +38,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/system/trust"
 SRC_URL="https://curl.se/ca/cacert.pem"
 FROM=""
-if [[ "${1:-}" == "--from" ]]; then FROM="${2:?--from needs a file or URL}"; fi
+INTER_FROM=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from) FROM="${2:?--from needs a file or URL}"; shift 2 ;;
+    --intermediates-from) INTER_FROM="${2:?--intermediates-from needs a file}"; shift 2 ;;
+    *) echo "trust-bundle: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
 mkdir -p "$OUT"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
@@ -116,5 +127,39 @@ if curl -sSfL --max-time 60 -o "$CT/apple.json" "https://valid.apple.com/ct/log_
 else
   rm -f "$OUT/ctapple.jsn" "$OUT/ctapple.jsn.sha256"
   echo "ct.apple: NOT STAGED — valid.apple.com unreachable" >> "$OUT/SOURCE"
+fi
+# ---------------------------------------------------------------- CTCORE: CCADB intermediates
+CCADB="https://ccadb.my.salesforce-sites.com/mozilla/PublicAllIntermediateCertsWithPEMCSV"
+inter_src=""
+if [[ -n "$INTER_FROM" ]]; then
+  cp "$INTER_FROM" "$CT/inters.raw" && inter_src="$INTER_FROM"
+elif curl -sSfL --max-time 120 -o "$CT/inters.raw" "$CCADB" 2>/dev/null; then
+  inter_src="$CCADB"
+fi
+if [[ -n "$inter_src" ]]; then
+  # The CSV's "PEM Info" column holds each certificate (quoted, PEM); a PEM bundle passes through.
+  python3 - "$CT/inters.raw" "$CT/inters.pem" <<'PY'
+import csv, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+pems = re.findall(r"-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+?-----END CERTIFICATE-----", raw)
+seen, out = set(), []
+for p in pems:
+    body = "".join(p.split("-----")[2].split())
+    if body not in seen:
+        seen.add(body)
+        out.append("-----BEGIN CERTIFICATE-----\n" + "\n".join(body[i:i+64] for i in range(0, len(body), 64)) + "\n-----END CERTIFICATE-----\n")
+open(sys.argv[2], "w").write("".join(out))
+print(len(out))
+PY
+  NI="$(grep -c 'BEGIN CERTIFICATE' "$CT/inters.pem" || true)"
+  if [[ "$NI" -gt 0 ]]; then
+    cp "$CT/inters.pem" "$OUT/inters.pem" && chmod 644 "$OUT/inters.pem"
+    ISUM="$(sha256sum "$OUT/inters.pem" | cut -d' ' -f1)"
+    echo "$ISUM  inters.pem" > "$OUT/inters.pem.sha256"
+    echo "inters:  $inter_src — $NI certificates (the CA ones join the untrusted pool), sha256 $ISUM" >> "$OUT/SOURCE"
+  fi
+else
+  rm -f "$OUT/inters.pem" "$OUT/inters.pem.sha256"
+  echo "inters:  NOT STAGED — CCADB ($CCADB) unreachable; no intermediate pool (pass --intermediates-from FILE)" >> "$OUT/SOURCE"
 fi
 cat "$OUT/SOURCE"

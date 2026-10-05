@@ -78,6 +78,12 @@ pub struct TrustStore {
     pub intermediates: Vec<Certificate>,
     /// CTCORE: a CT log list (and report / strict mode). `None`: SCTs are parsed and reported, `ct=off`.
     pub ct: Option<crate::ct::CtConfig>,
+    /// CTCORE: CRLs the caller fetched (RFC 5280 §5), checked over every validated path — the fallback when no
+    /// good OCSP staple arrived (see [`super::crl`]).
+    pub crls: Vec<super::crl::Crl>,
+    /// Hard-fail revocation: the leaf needs a good OCSP staple or a usable CRL, every intermediate a usable CRL,
+    /// else [`CertError::BadCrl`]. Off by default (the Web PKI's soft-fail reality).
+    pub require_revocation: bool,
 }
 
 /// What loading a PEM bundle found.
@@ -92,7 +98,7 @@ pub struct LoadReport {
 
 impl TrustStore {
     pub fn new() -> Self {
-        TrustStore { anchors: Vec::new(), intermediates: Vec::new(), ct: None }
+        TrustStore { anchors: Vec::new(), intermediates: Vec::new(), ct: None, crls: Vec::new(), require_revocation: false }
     }
     /// Adds every CERTIFICATE block of `text` to the intermediate pool; returns how many parsed.
     pub fn add_intermediates_pem(&mut self, text: &str) -> usize {
@@ -106,6 +112,16 @@ impl TrustStore {
             }
         }
         self.intermediates.len() - before
+    }
+    /// Adds a CRL (DER CertificateList); returns it parsed or why it did not parse.
+    pub fn add_crl_der(&mut self, der: &[u8]) -> Result<(), CertError> {
+        self.crls.push(super::crl::Crl::parse(der)?);
+        Ok(())
+    }
+    /// Adds every `X509 CRL` block of a PEM text; returns how many parsed.
+    pub fn add_crls_pem(&mut self, text: &str) -> usize {
+        let (blocks, _) = pem::pem_blocks(text, "X509 CRL");
+        blocks.iter().filter(|b| self.add_crl_der(b).is_ok()).count()
     }
     pub fn add_der(&mut self, der: &[u8]) -> Result<(), CertError> {
         let c = Certificate::parse(der)?;
@@ -399,6 +415,10 @@ pub struct CertVerdict {
     pub pool_intermediates: usize,
     /// CTCORE: the SCTs verified against the store's log list and Chrome's policy (`ct=`).
     pub ct: crate::ct::CtVerdict,
+    /// CTCORE: what the caller's CRLs said about the path.
+    pub crl: super::crl::CrlReport,
+    /// CTCORE: the leaf carries RFC 7633 must-staple (and, since the verdict exists, a good staple came).
+    pub must_staple: bool,
 }
 
 /// SCTs from the leaf's extension and the TLS extension.
@@ -452,6 +472,23 @@ impl ServerCertVerifier for WebPkiVerifier<'_> {
             None if peer.ocsp_requested => OcspStatus::NotStapled,
             None => OcspStatus::NotRequested,
         };
+        // RFC 7633: a must-staple leaf needs a verified `good` staple — absent, unknown or not requested all fail.
+        let must_staple = path.leaf.must_staple();
+        if must_staple && !matches!(ocsp, OcspStatus::Good { .. }) {
+            return Err(CertError::MustStaple.into());
+        }
+        // RFC 5280 §6.3: the caller's CRLs over the whole path (revoked → certificate_revoked).
+        let (crl, covered) = if self.store.crls.is_empty() {
+            (super::crl::CrlReport::default(), alloc::vec![false; 1 + path.intermediates.len()])
+        } else {
+            super::crl::check_path(provider, &self.store.crls, &path, now)?
+        };
+        if self.store.require_revocation {
+            let leaf_ok = covered[0] || matches!(ocsp, OcspStatus::Good { .. });
+            if !leaf_ok || covered[1..].iter().any(|c| !c) {
+                return Err(CertError::BadCrl("no usable revocation information for a certificate on the path").into());
+            }
+        }
         let ct = match &self.store.ct {
             Some(cfg) => {
                 let v = crate::ct::evaluate(provider, &cfg.list, &path.leaf, Some(path.leaf_issuer_spki()), &scts, now);
@@ -464,7 +501,7 @@ impl ServerCertVerifier for WebPkiVerifier<'_> {
             }
             None => crate::ct::CtVerdict::off(),
         };
-        Ok(CertVerdict { key: path.leaf.public_key.clone(), ocsp, scts, pool_intermediates: path.from_pool, ct })
+        Ok(CertVerdict { key: path.leaf.public_key.clone(), ocsp, scts, pool_intermediates: path.from_pool, ct, crl, must_staple })
     }
 }
 

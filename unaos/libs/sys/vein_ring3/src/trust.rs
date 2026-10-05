@@ -51,9 +51,21 @@ const _: () = assert!(CT_LOGS_PATH.len() <= SYS_OPEN_NAME_MAX);
 /// Today's list is 50 KB.
 pub const CT_LOGS_MAX: usize = 512 * 1024;
 
-/// Load and parse the bundle at [`ROOTS_PATH`].
+/// CTCORE (SR60): Mozilla's CCADB intermediates, an UNTRUSTED pool (8.3: SYSTEM/TRUST/INTERS.PEM).
+pub const INTERS_PATH: &str = "/system/trust/inters.pem";
+const _: () = assert!(INTERS_PATH.len() <= SYS_OPEN_NAME_MAX);
+/// The CCADB set is a few MB; a bigger file is refused (the pool is optional).
+pub const INTERS_MAX: usize = 8 * 1024 * 1024;
+
+/// Load and parse the bundle at [`ROOTS_PATH`], plus the intermediate pool at [`INTERS_PATH`] when staged.
 pub fn load() -> Result<(TrustStore, LoadReport), TrustFail> {
-    parse(&read_file(ROOTS_PATH, ROOTS_MAX)?)
+    let (mut store, rep) = parse(&read_file(ROOTS_PATH, ROOTS_MAX)?)?;
+    if let Ok(text) = read_file(INTERS_PATH, INTERS_MAX) {
+        if let Ok(t) = core::str::from_utf8(&text) {
+            store.add_intermediates_pem(t);
+        }
+    }
+    Ok((store, rep))
 }
 
 /// The CT log list at [`CT_LOGS_PATH`] (report mode): `None` when absent or unparseable — the handshake then
