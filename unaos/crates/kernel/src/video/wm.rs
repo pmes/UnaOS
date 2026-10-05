@@ -81,7 +81,7 @@ use spin::{Mutex, MutexGuard};
 /// rows and moves no behaviour. The cost is the table itself and the fixed-size scratch arrays sized
 /// from it (`[Window; 12]` plus a handful of `[(usize,usize,usize,usize); 12]` stack scratches) —
 /// every one of them parametric, and every sweep already a bounded `0..MAX_WINDOWS` scan.
-pub const MAX_WINDOWS: usize = 12;
+pub const MAX_WINDOWS: usize = 32; // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold. 12 -> 32: no longer a policy cap; this is the ID SPACE (the width of the per-slot `u32` masks, asserted below at PACE_PENDING) and the live limit on app rows is `video::wincap::win_limit()` (mem/dock/ids, derived at boot). The two full-table stack copies moved to `RowsSnap` (file tail) so 16 KiB stacks do not pay 32 rows twice.
 
 /// WC-A — maximum stored title length in bytes. Titles are kernel-owned byte strings (ASCII, not
 /// NUL-terminated); anything longer is truncated at [`create`] time, so a hostile length can never
@@ -1515,7 +1515,7 @@ pub fn close_compat() -> bool {
 /// thing the panel gets back is a full repaint from the LATEST surface content, not from whatever the
 /// last composited frame happened to be. Nothing is deferred here; a pass is skipped, not owed.
 pub fn present(id: WinId) -> bool {
-    present_banded(id, None, None) != Presented::NoRow
+    crate::video::lag::present_req(); present_banded(id, None, None) != Presented::NoRow // INPUTSTALL M1 (B375): a kernel surface's present request splits its [lag] comp into draw= / pre= (same-line fold).
 }
 
 /// PRESSURE-1 — what a present actually DID, for the one caller that has to charge for it.
@@ -5025,7 +5025,7 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
         // `drain_deferred` already reads once per pass for exactly this "is anything owed" purpose.
         let masked = crate::arch::irqs_masked();
         let mut rounds = 0u32;
-        while !masked && rounds < COMP_RERUN_MAX && COMP_PENDING.swap(false, AcqRel) {
+        while !masked && rounds < COMP_RERUN_MAX && !(COMP_PENDING.load(Acquire) && crate::video::lag::input_first()) && COMP_PENDING.swap(false, AcqRel) { // INPUTSTALL M3 (B375): the render task does not re-run folded presents while a key or press waits for it — the damage stays on the table (same-line fold).
             let dmg = any_damaged();
             let owed = deferred_owed();
             // MENU-DRIVE / REVIEW — the SHARD menu is a third thing a declined pass can owe, and one
@@ -5074,7 +5074,7 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
         // …and a masked holder does not take this pass either (review condition 1): it is the
         // fourth composite the arithmetic above accounts for. `COMP_PENDING` remains set for an
         // unmasked holder or `service_damage` to service.
-        if !masked
+        if !masked && !(COMP_PENDING.load(Acquire) && crate::video::lag::input_first()) // INPUTSTALL M3 (B375): nor re-acquire for them (same-line fold).
             && COMP_PENDING.load(Acquire)
             && COMP_GATE
                 .compare_exchange(false, true, AcqRel, Relaxed)
@@ -5918,7 +5918,7 @@ fn composite_inner() -> CursorTail {
     // lock, so the registration is ordered against any teardown that takes the lock afterwards: a
     // `close_owner` that clears rows can then tell whether some other core snapshotted those rows
     // before the clear and is still blitting from their (about to be unmapped) surfaces.
-    let (rows, mut dirty, mut bands, _blit) = {
+    let mut rows_snap = RowsSnap::take(); let (rows, mut dirty, mut bands, _blit) = { // WINDOWCAP (B378): the snapshot lands in a pooled buffer, not on the stack — ⚠ SAME-LINE fold, code first
         let mut t = table();
         // F4 — the barrier, observed in the SAME critical section as the registration below. A
         // teardown raises it after clearing its rows, so seeing it up means there is nothing of that
@@ -5963,7 +5963,7 @@ fn composite_inner() -> CursorTail {
                 FL3_OVERLAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
-        (t.rows, dirty, bands, guard)
+        rows_snap.copy_from_slice(&t.rows); (rows_snap, dirty, bands, guard) // WINDOWCAP (B378): heap/pool copy, see `RowsSnap`
     };
 
     // Back-to-front: ascending z, ties by id (creation order).
@@ -13038,22 +13038,22 @@ impl WcnRow {
 /// because `WcnRow` holds atomics; the assertion below is what keeps it honest if [`MAX_WINDOWS`]
 /// ever moves.
 #[cfg(feature = "witness")]
-static WCN: [WcnRow; 12] = [
-    WcnRow::new(),
-    WcnRow::new(),
-    WcnRow::new(),
-    WcnRow::new(),
-    WcnRow::new(),
-    WcnRow::new(),
-    WcnRow::new(),
-    WcnRow::new(),
-    // HEADROOM: four rows added with `MAX_WINDOWS` 8 -> 12. The assertion below is exactly the
-    // tripwire the original note promised — it is what caught this array on the raise.
-    WcnRow::new(),
-    WcnRow::new(),
-    WcnRow::new(),
-    WcnRow::new(),
-];
+static WCN: [WcnRow; MAX_WINDOWS] = [const { WcnRow::new() }; MAX_WINDOWS]; // WINDOWCAP (B378) — ⚠ line-NEUTRAL: sized by the id space, not twelve written-out rows (the 15 lines below are kept as comments so nothing beneath moves)
+//  WcnRow::new(),
+//  WcnRow::new(),
+//  WcnRow::new(),
+//  WcnRow::new(),
+//  WcnRow::new(),
+//  WcnRow::new(),
+//  WcnRow::new(),
+//  WcnRow::new(),
+//  // HEADROOM: four rows added with `MAX_WINDOWS` 8 -> 12. The assertion below is exactly the
+//  // tripwire the original note promised — it is what caught this array on the raise.
+//  WcnRow::new(),
+//  WcnRow::new(),
+//  WcnRow::new(),
+//  WcnRow::new(),
+//  ];
 
 #[cfg(feature = "witness")]
 const _: () = assert!(WCN.len() == MAX_WINDOWS);
@@ -18563,7 +18563,7 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
 #[cfg(feature = "witness")]
 fn occ_clip_live(r: &Window, pw: usize, ph: usize) -> OccClip {
     let t = table();
-    let rows = t.rows;
+    let mut rows = RowsSnap::take(); rows.copy_from_slice(&t.rows); // WINDOWCAP (B378): pooled, not a stack copy
     drop(t);
     match rows.iter().position(|q| q.used && q.id == r.id) {
         Some(i) => occ_clip(&rows, i, shell_z(), pw, ph),
@@ -23517,12 +23517,12 @@ fn create_inner(
         let max_y = info.height.saturating_sub(ch + BORDER()).max(min_y);
         Some((x.clamp(BORDER(), max_x), y.clamp(min_y, max_y), scale, info.width, info.height))
     });
-    let mut t = table();
+    let app_row = !compat && owner_asid != 0; let limit = if app_row { super::wincap::win_limit() } else { usize::MAX }; let mut t = table(); let apps = if app_row { t.rows.iter().filter(|r| r.used && !r.compat && r.owner_asid != 0).count() } else { 0 }; if apps >= limit { drop(t); super::wincap::note_open_refused(apps, false); return WIN_NONE; } // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST. The ONE dynamic limit (`video::wincap`, derived at boot from memory, the dock on this panel and the id space) counts APP rows only — `dock_addressable`'s predicate (used, not compat, owner ≠ 0), inlined because that fn is dock-gated — and a refusal is SAID: `[wm] REFUSED create reason=limit` on the wire and the notice on the glass (R70). System rows (owner 0: the login screen, the notice itself; compat) are never refused by the limit — that is what lets the notice open. The limit is read BEFORE the table lock (it may take `WRITER` by try_lock and the heap lock once at arming).
     let slot = match t.rows.iter().position(|r| !r.used) {
         Some(s) => s,
-        None => return WIN_NONE,
+        None => { drop(t); if app_row { super::wincap::note_open_refused(apps, true); } else { serial_println!("[wm] REFUSED create reason=ids owner=system (R90)"); } return WIN_NONE; } // WINDOWCAP (B378): the id space itself is full — said, never silent (same-line fold)
     };
-    let z = t.next_z;
+    if app_row { super::wincap::note_open_admitted(); } let z = t.next_z; // WINDOWCAP (B378): an admitted app row ends a refusal burst (same-line fold, code first)
     t.next_z = t.next_z.wrapping_add(1).max(1);
     let id = (slot + 1) as WinId; native_slot_store(slot, native); // UIMETRICS (B372): the slot's native bit is (re)written on EVERY create, so a recycled slot never inherits it
     // WPACE-TEXT — a re-issued slot must not inherit the dead tenant's shadow: the validity bit
@@ -30187,4 +30187,86 @@ const _: () = { let m = crate::ui::Metrics::at(crate::video::dpi::S2_MAX, 0); as
 #[cfg(feature = "witness")]
 fn fix_pin_w() -> usize {
     FIX_W.max(CLUSTER_MIN_SRC_W())
+}
+
+/// INPUTSTALL M1 (rmbp-ledger B375): the WC-D valve as `[lag] stall … valve=` names it — `closed` while the
+/// valve suppresses admissions, `open` otherwise, `none` on a build without the valve (`witness` + `wcdvalve`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn inputstall_valve() -> &'static str {
+    #[cfg(all(feature = "witness", feature = "wcdvalve"))]
+    {
+        if WCDVALVE_SHUT.load(core::sync::atomic::Ordering::Relaxed) { "closed" } else { "open" }
+    }
+    #[cfg(not(all(feature = "witness", feature = "wcdvalve")))]
+    {
+        "none"
+    }
+}
+// ---- WINDOWCAP (B378, R90) — the table snapshot off the stack ----------------------------------------
+//
+// `composite_inner` and the witness `occ_clip_live` each copied the WHOLE table (`[Window; MAX_WINDOWS]`)
+// onto a 16 KiB task stack; with the id space at 32 that is ~6 KiB per copy, and the witness copy nests
+// inside the pass. A small static pool (claimed by CAS, released on drop) keeps the hot path off the
+// allocator; when every pool buffer is in use (overlapping passes) the snapshot falls back to the heap.
+
+const SNAP_POOL_N: usize = 4;
+
+struct SnapCell(core::cell::UnsafeCell<[Window; MAX_WINDOWS]>, core::sync::atomic::AtomicBool);
+// SAFETY: a cell's buffer is touched only by the one `RowsSnap` that won its `AtomicBool` claim.
+unsafe impl Sync for SnapCell {}
+
+static SNAP_POOL: [SnapCell; SNAP_POOL_N] = [const {
+    SnapCell(core::cell::UnsafeCell::new([Window::empty(); MAX_WINDOWS]), core::sync::atomic::AtomicBool::new(false))
+}; SNAP_POOL_N];
+
+/// A table-sized snapshot buffer: a claimed pool cell, or a heap box when the pool is exhausted.
+struct RowsSnap {
+    cell: usize,
+    heap: Option<alloc::boxed::Box<[Window; MAX_WINDOWS]>>,
+}
+
+impl RowsSnap {
+    fn take() -> RowsSnap {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire};
+        for (i, c) in SNAP_POOL.iter().enumerate() {
+            if c.1.compare_exchange(false, true, AcqRel, Acquire).is_ok() {
+                return RowsSnap { cell: i, heap: None };
+            }
+        }
+        let v: alloc::vec::Vec<Window> = alloc::vec![Window::empty(); MAX_WINDOWS];
+        let b: alloc::boxed::Box<[Window; MAX_WINDOWS]> = match v.into_boxed_slice().try_into() {
+            Ok(b) => b,
+            Err(_) => unreachable!(),
+        };
+        RowsSnap { cell: usize::MAX, heap: Some(b) }
+    }
+}
+
+impl core::ops::Deref for RowsSnap {
+    type Target = [Window; MAX_WINDOWS];
+    fn deref(&self) -> &[Window; MAX_WINDOWS] {
+        match &self.heap {
+            Some(b) => b,
+            // SAFETY: this `RowsSnap` holds the cell's claim (see `SnapCell`).
+            None => unsafe { &*SNAP_POOL[self.cell].0.get() },
+        }
+    }
+}
+
+impl core::ops::DerefMut for RowsSnap {
+    fn deref_mut(&mut self) -> &mut [Window; MAX_WINDOWS] {
+        match &mut self.heap {
+            Some(b) => b,
+            // SAFETY: this `RowsSnap` holds the cell's claim (see `SnapCell`).
+            None => unsafe { &mut *SNAP_POOL[self.cell].0.get() },
+        }
+    }
+}
+
+impl Drop for RowsSnap {
+    fn drop(&mut self) {
+        if self.heap.is_none() && self.cell < SNAP_POOL_N {
+            SNAP_POOL[self.cell].1.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
 }

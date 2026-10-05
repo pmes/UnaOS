@@ -11,6 +11,7 @@ use crate::bits::BitReader;
 use crate::io::ByteStream;
 use crate::math;
 use crate::{Codec, Error, Format, Info, Pcm, Result, Source};
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use tables::*;
@@ -316,11 +317,34 @@ fn parse_side(h: &Header, d: &[u8], band_long: &[[u16; 23]; 9]) -> Result<SideIn
 // ---------------------------------------------------------------- the decoder
 
 pub struct Mp3Decoder {
-    t: Tables,
+    // MP3HANG (rmbp B373): every array of decoder state lives on the HEAP. Inline, this struct was 16288 bytes
+    // and `Mp3Stream::new` built it in a 32872-byte frame on the kernel target — on a 32 KiB kernel stack that
+    // is a write through the guard into the heap below (flight 23's `tests play mp3`). A decoder is a value the
+    // caller moves; its state is not a stack frame.
+    t: Box<Tables>,
     reservoir: Vec<u8>,
-    overlap: [[f32; 576]; 2],
-    v: [[f32; 1024]; 2],
+    overlap: Vec<[f32; 576]>,
+    v: Vec<[f32; 1024]>,
     v_off: [usize; 2],
+    /// The per-frame working set (`xr`, `sub`, `e`, 11 KiB) — taken for one `decode_frame` and put back, so
+    /// the frame holds three pointers instead of three arrays.
+    scratch: Option<Scratch>,
+}
+
+struct Scratch {
+    xr: Box<[[f32; 576]; 2]>,
+    sub: Box<[[f32; 32]; 18]>,
+    e: Box<[i32; 576]>,
+}
+
+impl Scratch {
+    fn new() -> Scratch {
+        Scratch {
+            xr: vec![[0f32; 576]; 2].into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!()),
+            sub: vec![[0f32; 32]; 18].into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!()),
+            e: vec![0i32; 576].into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!()),
+        }
+    }
 }
 
 fn lsf_sf_expand(sf: u32, n1: u32, n2: u32, n3: u32) -> [u32; 4] {
@@ -338,12 +362,12 @@ impl Default for Mp3Decoder { fn default() -> Self { Self::new() } }
 
 impl Mp3Decoder {
     pub fn new() -> Mp3Decoder {
-        Mp3Decoder { t: Tables::new(), reservoir: Vec::new(), overlap: [[0.0; 576]; 2], v: [[0.0; 1024]; 2], v_off: [0; 2] }
+        Mp3Decoder { t: Box::new(Tables::new()), reservoir: Vec::new(), overlap: vec![[0.0; 576]; 2], v: vec![[0.0; 1024]; 2], v_off: [0; 2], scratch: None }
     }
     pub fn reset(&mut self) {
         self.reservoir.clear();
-        self.overlap = [[0.0; 576]; 2];
-        self.v = [[0.0; 1024]; 2];
+        for o in self.overlap.iter_mut() { o.fill(0.0); }
+        for v in self.v.iter_mut() { v.fill(0.0); }
         self.v_off = [0; 2];
     }
 
@@ -708,9 +732,12 @@ impl Mp3Decoder {
         let mut r = BitReader::new(&buf);
         r.seek_bits(start_bit.min(buf.len() * 8));
         let mut granules = si.gr;
-        let mut xr = [[0f32; 576]; 2];
-        let mut sub = [[0f32; 32]; 18];
-        let mut e = [0i32; 576];
+        let mut sc = self.scratch.take().unwrap_or_else(Scratch::new);
+        let Scratch { xr, sub, e } = &mut sc;
+        let (xr, sub, e) = (&mut **xr, &mut **sub, &mut **e);
+        for x in xr.iter_mut() { x.fill(0.0); }
+        for x in sub.iter_mut() { x.fill(0.0); }
+        e.fill(0);
         for gi in 0..ngr {
             for c in 0..nch {
                 let start = r.bit_pos();
@@ -724,7 +751,7 @@ impl Mp3Decoder {
                     let prev = if gi == 1 { Some(granules[0][c]) } else { None };
                     let mut g = granules[gi][c];
                     let res = self.read_scalefactors(h, &mut r, &mut g, prev.as_ref(), &si.scfsi[c], c)
-                        .and_then(|_| { self.exponents(h, &g, &mut e); self.huffman(&mut r, &g, &e, end, &mut xr[c]) });
+                        .and_then(|_| { self.exponents(h, &g, e); self.huffman(&mut r, &g, e, end, &mut xr[c]) });
                     granules[gi][c] = g;
                     if res.is_err() { good = false; }
                 }
@@ -741,7 +768,7 @@ impl Mp3Decoder {
                 let g = granules[gi][c];
                 self.reorder(h, &g, &mut xr[c]);
                 self.antialias(&g, &mut xr[c]);
-                self.imdct(&g, c, &xr[c], &mut sub);
+                self.imdct(&g, c, &xr[c], sub);
                 for t in 0..18 {
                     let o = gi * 576 + t * 32;
                     let s = sub[t];
@@ -749,6 +776,7 @@ impl Mp3Decoder {
                 }
             }
         }
+        self.scratch = Some(sc);
         Ok(spf)
     }
 }

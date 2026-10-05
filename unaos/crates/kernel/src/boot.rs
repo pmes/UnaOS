@@ -132,7 +132,7 @@ fn services_line(who: &'static str) {
     serial_println!("[boot] services up first={} at={}ms held_starters={} (R86: nothing but the setter / the login dialog ran before this)", who, now, held_count());
     if ig != 0 {
         let from = match FROM.load(Ordering::Relaxed) { 1 => "setter", 2 => "login-screen", _ => "none" };
-        let why = if ready != 0 { "furniture-ready" } else { "bound" };
+        let why = if FURN_NONE.load(Ordering::Acquire) { "furniture-none" } else if ready != 0 { "furniture-ready" } else { "bound" }; // LOGINFURN (R88): a bare desktop has no furniture to wait for
         serial_println!(
             ":: BOOT: phase=desktop from={} login->desktop={} services_after_ms={} why={} ::",
             from,
@@ -150,6 +150,7 @@ pub fn ignite(why: &'static str) {
     if LATCH.swap(true, Ordering::AcqRel) {
         return;
     }
+    crate::video::wincap::witness(); // WINDOWCAP (B378, R90): the limit's arming line + the witness, once, at the first desktop
     if before == Phase::Desktop {
         return; // the boot was already a Desktop (no pre-Desktop phase to end): nothing to order
     }
@@ -164,6 +165,18 @@ pub fn ignite(why: &'static str) {
 /// A session opened at a login screen / the create-user form (`login::close_into_session`).
 pub fn session_opened() {
     ignite("session");
+}
+
+/// LOGINFURN (R88): the desktop was released with NO furniture — the services do not wait for a shell that is not coming.
+static FURN_NONE: AtomicBool = AtomicBool::new(false);
+pub fn furniture_none() {
+    FURN_NONE.store(true, Ordering::Release);
+    furniture_ready();
+}
+
+/// LOGINFURN: when the login (or the installer's advance) ignited the Desktop (`arch::ms`); 0 = no pre-Desktop phase.
+pub fn ignite_ms() -> u64 {
+    IGNITE_MS.load(Ordering::Acquire)
 }
 
 /// The shell window launched (`dock::app_launched`): after an ignition, the furniture is up and the services may go.
@@ -190,9 +203,14 @@ static HELD_ASKS: AtomicU32 = AtomicU32::new(0);
 /// `wm::create_inner`: a row is being minted. Pure apart from one atomic add.
 pub fn note_window(owner: u64) {
     if owner != 0 && phase() != Phase::Desktop {
-        PRE_WINDOWS.fetch_add(1, Ordering::Relaxed);
+        if PRE_WINDOWS.fetch_add(1, Ordering::Relaxed) == 0 {
+            PRE_FIRST_OWNER.store(owner, Ordering::Relaxed); // LOGINFURN M3: the FAIL line names the row (flight 23's was SHOTMENU's 0xffffff52, not the setter)
+        }
     }
+    crate::loginfurn::note_window(owner); // LOGINFURN (R88): the rows minted in the login's settle window
 }
+/// LOGINFURN M3: the owner of the first row minted before the Desktop (the setter / the login form are owner 0, never counted).
+static PRE_FIRST_OWNER: AtomicU64 = AtomicU64::new(0);
 
 /// A service BEGAN its work (the begin point, behind its gate): counted when the phase is not Desktop.
 pub fn note_start(who: &'static str) {
@@ -304,6 +322,9 @@ pub fn key_taken() {
 pub fn hid_pass() {
     let now = crate::arch::ms();
     let last = HID_LAST.swap(now, Ordering::AcqRel);
+    if last != 0 {
+        crate::video::lag::hid_gap(now.saturating_sub(last)); // INPUTSTALL M1 (B375): every gap, every phase, on the stall line
+    }
     if last != 0 && SCREEN_UP.load(Ordering::Acquire) && phase() != Phase::Desktop {
         HID_GAP_MAX.fetch_max(now.saturating_sub(last), Ordering::Relaxed);
     }
@@ -317,6 +338,7 @@ pub fn ensure_tests() {
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("installbare", installbare_selftest);
     }
+    crate::loginfurn::ensure_tests(); // LOGINFURN (R88): `tests loginfurn`
 }
 
 /// `tests installbare` — what this boot did BEFORE its Desktop: no service start, no window but the screen's,
@@ -342,8 +364,8 @@ pub fn installbare_selftest() {
     let pass = services == 0 && windows == 0 && valve == 0 && (keys == 0 || kmax <= KEY_BOUND_MS);
     if !pass {
         serial_println!(
-            ":: INSTALLBARE: reason=services={} first_start={} windows={} valve={} key_max_ms={} bound={} ::",
-            services, FIRST_START.try_lock().map(|f| *f).unwrap_or("?"), windows, valve, kmax, KEY_BOUND_MS
+            ":: INSTALLBARE: reason=services={} first_start={} windows={} first_window=owner:{:#x} valve={} key_max_ms={} bound={} ::",
+            services, FIRST_START.try_lock().map(|f| *f).unwrap_or("?"), windows, PRE_FIRST_OWNER.load(Ordering::Relaxed), valve, kmax, KEY_BOUND_MS
         );
     }
     serial_println!(

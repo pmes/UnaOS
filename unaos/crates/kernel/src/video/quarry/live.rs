@@ -708,6 +708,12 @@ fn kind_token(mime: &str) -> &'static str {
         ft::AUDIO_WAV => "wav",
         ft::APP_JSON => "json", // QUARRY2 (B336)
         ft::IMAGE_GIF => "gif", // QUARRY2 (B336)
+        ft::IMAGE_JPEG => "jpeg", // OPENERS (B379)
+        ft::IMAGE_BMP => "bmp", // OPENERS (B379)
+        ft::IMAGE_WEBP => "webp", // OPENERS (B379)
+        ft::IMAGE_QOI => "qoi", // OPENERS (B379)
+        m if m.starts_with("audio/") => "audio", // OPENERS (B379)
+        m if m.starts_with("video/") => "video", // OPENERS (B379)
         m if m.starts_with("text/") => "text",
         _ => "unknown",
     }
@@ -1959,10 +1965,10 @@ pub fn open() {
     // battery — which asserts exact panel pixels and knows nothing of a file manager — is unperturbed.
     // The bench panel (1920x1200) hosts the strip, so that is where the window actually opens, and the
     // armed bench-geometry run is where its effect on that battery is measured rather than assumed.
-    if crate::video::dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_none() {
+    if crate::video::dock::Layout::for_panel(crate::video::wincap::dock_rows(pw, ph), pw, ph).is_none() {
         serial_println!(
             "[quarry] DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} (the minimise disc would have no way back, and neither would the pinned tile)",
-            pw, ph, wm::MAX_WINDOWS
+            pw, ph, crate::video::wincap::dock_rows(pw, ph)
         );
         return;
     }

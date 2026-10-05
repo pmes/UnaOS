@@ -42,6 +42,22 @@ pub const BUILTIN: &[(&str, &str, &str, &str)] = &[
     (ft::TEXT_MARKDOWN, "markdown", "doc", "Markdown"),
     (ft::APP_JSON, "json", "doc", "JSON"),
     (ft::IMAGE_GIF, "facet", "image", "GIF image"),
+    // OPENERS (B379): every format a decoder in this tree reads. Images open in facet (pixel_core, by magic;
+    // animated WebP through FACETANIM), audio in `play` (audio_core, by magic: MP4/M4A AAC through its ISO-BMFF
+    // reader). Video has NO opener in this tree yet (Stria's player, PLAYBACK SR26): `none`, said by name.
+    (ft::IMAGE_JPEG, "facet", "image", "JPEG image"),
+    (ft::IMAGE_BMP, "facet", "image", "BMP image"),
+    (ft::IMAGE_WEBP, "facet", "image", "WebP image"),
+    (ft::IMAGE_QOI, "facet", "image", "QOI image"),
+    (ft::AUDIO_FLAC, "play", "sound", "FLAC audio"),
+    (ft::AUDIO_OGG, "play", "sound", "Ogg audio"),
+    (ft::AUDIO_MPEG, "play", "sound", "MP3 audio"),
+    (ft::AUDIO_AAC, "play", "sound", "AAC audio"),
+    (ft::AUDIO_MP4, "play", "sound", "MPEG-4 audio"),
+    (ft::AUDIO_AIFF, "play", "sound", "AIFF audio"),
+    (ft::VIDEO_MP4, "none", "video", "MPEG-4 video"),
+    (ft::VIDEO_WEBM, "none", "video", "WebM video"),
+    (ft::VIDEO_MATROSKA, "none", "video", "Matroska video"),
 ];
 
 /// The builtin row for `mime`, if any. Pure.

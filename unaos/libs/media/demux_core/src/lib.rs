@@ -44,6 +44,7 @@ use alloc::vec::Vec;
 
 pub mod build;
 pub mod mkv;
+pub mod mime;
 pub mod mp4;
 mod read;
 

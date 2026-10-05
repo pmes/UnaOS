@@ -384,7 +384,7 @@ impl AacDecoder {
                 }
                 ID_FIL => {
                     let mut cnt = r.read(4)? as usize;
-                    if cnt == 15 { cnt += r.read(8)? as usize - 1; }
+                    if cnt == 15 { cnt = cnt + r.read(8)? as usize - 1; } // MP3HANG: 15 + esc - 1 (ISO 14496-3 fill_element); `esc - 1` alone underflowed at esc=0 (aac_kat, debug)
                     if cnt > 0 {
                         // extension_type: EXT_SBR_DATA (13) / EXT_SBR_DATA_CRC (14) mark HE-AAC
                         let ty = r.peek(4) as u32;

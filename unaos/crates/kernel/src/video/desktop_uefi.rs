@@ -511,12 +511,12 @@ pub fn activate_on(desc: SurfaceDesc) {
     //
     // `MAX_WINDOWS` is the count and not the live one deliberately: the check must hold for every
     // table state the boot can reach, not for the empty table it happens to be run against.
-    if super::dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_none() {
+    if super::dock::Layout::for_panel(super::wincap::dock_rows(pw, ph), pw, ph).is_none() {
         ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
         crate::census_println!(
             "[wc-x] activate DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} \
              (the console's minimise disc would have no way back) latch=released",
-            pw, ph, wm::MAX_WINDOWS
+            pw, ph, super::wincap::dock_rows(pw, ph)
         );
         return;
     }
@@ -530,7 +530,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     // advance (`installer_release`) or the first login (`close_into_session`) mints console + shell and turns the bar on.
     let bare = !crate::boot::desktop();
     if bare {
-        super::fbcon::detach();
+        super::fbcon::detach_bare(); // LOGINFURN (R88): the detach that lets a LATER console window take glyphs (flight 23: the console opened blank)
         #[cfg(feature = "login")]
         super::crystal::login::furniture_owed();
         serial_println!("[wc-x] activate bare phase={} console=owed bar=owed (R86: nothing but the setter / the login dialog)", crate::boot::phase().word());
@@ -736,13 +736,14 @@ pub fn desktop_app_service() {
     if DONE.load(Ordering::Relaxed) {
         return;
     }
+    if crate::loginfurn::stat_held() { DONE.store(true, Ordering::Relaxed); return; } // LOGINFURN (R88): on a `login` build nothing opens itself at login — STAT.ELF is the user's to open
     // FIRSTBOOT (R77): STAT.ELF is desktop furniture — held until the boot stage is Desktop (no root password
     // -> nothing but the setter; no user -> the create-user form; the desktop ignites for that user).
     #[cfg(feature = "login")]
     if !crate::fs::users::desktop_allowed() {
         return;
     }
-    crate::boot::note_start("stat"); // INSTALLBARE: the census — a STAT launch before the Desktop is a FAIL of `tests installbare`
+    crate::boot::note_start("stat"); crate::loginfurn::self_launch("stat"); // INSTALLBARE: the census — a STAT launch before the Desktop is a FAIL of `tests installbare`
     // The same storage gate `fat::probe_once` uses, for the same reason: `mount()` on a boot whose
     // xHCI has not yet enumerated a stick is a "no volume" that means "not yet", not "not ever", and
     // consuming the one-shot on it would refuse a launch the media could have served.

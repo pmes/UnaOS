@@ -1977,7 +1977,7 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok((true, rows))
+    Ok((true, crate::fs::volumes::publish(path, rows))) // VOLUMES2 (B376, R89): `/volumes/boot` publishes `efi` only, one listing for ls, Quarry and the gate
 }
 
 /// VFS-1 (adoption): render a [`DirEnt`](crate::fs::vfs::DirEnt)'s last-write stamp as the

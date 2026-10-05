@@ -135,7 +135,7 @@ pub const CORES: usize = 8;
 
 /// Window ids `dmg=` tracks — must match `video::wm::MAX_WINDOWS`. Asserted below rather than
 /// imported so this module has no compile-time dependency on the compositor's layout.
-pub const ROWS: usize = 12;
+pub const ROWS: usize = 32; // WINDOWCAP (B378): follows `wm::MAX_WINDOWS` 12 -> 32 (the id space)
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // REAL IMPLEMENTATION — x86 with the knob armed.

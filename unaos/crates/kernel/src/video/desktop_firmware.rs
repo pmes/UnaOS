@@ -242,7 +242,7 @@ pub fn activate() -> bool {
     //    So the check guards exactly what it argues about: the console window. The bar follows either
     //    way. Nothing about the law is weakened — a panel that cannot guarantee the dock still gets no
     //    console window, hence no minimise disc, hence nothing to strand.
-    let cwin = if super::dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_none() {
+    let cwin = if super::dock::Layout::for_panel(super::wincap::dock_rows(pw, ph), pw, ph).is_none() {
         serial_println!(
             "[deskfw] console-window DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} \
              (the console's minimise disc would have no way back) — the bar is unaffected and follows",

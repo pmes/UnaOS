@@ -1183,3 +1183,4 @@ pub mod text;
 // grid (and, owed, the rest of the theme) follows. Unconditional: fbcon arms the grid on every image; without the
 // desktop engine it answers 1.0.
 pub mod dpi; pub mod metrics; pub mod lag; // GLASSLAG M1 (B370): the per-event [lag] latency + the 5 s :: LAG: rollup; // UIMETRICS (B372): the ui::Metrics ignition check, witness and `tests metrics` — folded onto the `dpi` line, code first (module root, LEDGER P7).
+pub mod wincap; // WINDOWCAP (B378, R90): the one dynamic limit on running apps — windows and ring-3 processes (new file, tail-neutral)

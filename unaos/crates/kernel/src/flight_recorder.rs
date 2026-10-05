@@ -741,3 +741,33 @@ pub fn service() {
         }
     }
 }
+
+/// LOGINFURN (rmbp-ledger B374, R88): the last `max_lines` whole lines of this boot's capture, copied out under one
+/// `try_lock` (a few retries; `None` when the ring stays contended), plus the captured length and whether the ring
+/// is full (it keeps the EARLIEST bytes, so a full ring's tail is the ring's end, not the wire's). The console's
+/// prefill reads the boot's text from HERE — the one ring the serial seam already feeds (R79: no second ring).
+pub fn tail_lines(max_lines: usize) -> Option<(alloc::vec::Vec<u8>, usize, bool)> {
+    for _ in 0..64 {
+        if let Some(ring) = RING.try_lock() {
+            let buf = &ring.buf[..ring.len];
+            // The end of the last WHOLE line (a capture mid-line leaves a partial tail; drop it).
+            let end = buf.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
+            let mut start = end;
+            let mut seen = 0usize;
+            while start > 0 {
+                let i = start - 1;
+                if buf[i] == b'\n' && i + 1 != end {
+                    seen += 1;
+                    if seen == max_lines {
+                        break;
+                    }
+                }
+                start = i;
+            }
+            let full = ring.len == RING_CAP || ring.dropped > 0;
+            return Some((buf[start..end].to_vec(), ring.len, full));
+        }
+        core::hint::spin_loop();
+    }
+    None
+}

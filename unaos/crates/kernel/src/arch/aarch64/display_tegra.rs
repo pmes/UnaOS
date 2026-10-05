@@ -2603,7 +2603,7 @@ pub fn orin_conwin() -> bool {
     // 3. THE CONSOLEWIN LAW'S GEOMETRY HALF, evaluated with the SAME call `desktop_firmware` makes —
     //    `MAX_WINDOWS`, not the live count, because the check must hold for every table state the boot
     //    can reach. Pure integer geometry; paints nothing.
-    let dock_ok = dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_some();
+    let dock_ok = dock::Layout::for_panel(crate::video::wincap::dock_rows(pw, ph), pw, ph).is_some();
     let live = wm::count();
     let routed_before = fbcon::console_is_routed();
 
@@ -2617,7 +2617,7 @@ pub fn orin_conwin() -> bool {
         if routed_before { "ROUTED" } else { "UNROUTED" },
         ORINCONWIN_DESK_ROW as u8,
         ORINCONWIN_CLICK_ROUTED as u8,
-        wm::MAX_WINDOWS
+        crate::video::wincap::dock_rows(pw, ph)
     );
 
     // 4. THE ORDERING RULE (§6.1) — ONE decision and ONE line, a `match` over BOTH terms rather than
@@ -2636,7 +2636,7 @@ pub fn orin_conwin() -> bool {
     //    WINDOW and nothing else, because the law's own justification is about ONE control on ONE
     //    window. Nothing else on this boot is withheld by it — there is no bar here to follow.
     if !dock_ok {
-        serial_println!("[orinconwin] DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} (the console's minimise disc would have no way back — dock::Layout::for_panel returns None when the strip will not fit at MAX_WINDOWS, and the check is made against MAX_WINDOWS rather than the live count because it must hold for every table state this boot can reach)", pw, ph, wm::MAX_WINDOWS);
+        serial_println!("[orinconwin] DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} (the console's minimise disc would have no way back — dock::Layout::for_panel returns None when the strip will not fit at MAX_WINDOWS, and the check is made against MAX_WINDOWS rather than the live count because it must hold for every table state this boot can reach)", pw, ph, crate::video::wincap::dock_rows(pw, ph));
         return false;
     }
 
