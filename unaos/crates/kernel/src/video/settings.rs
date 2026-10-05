@@ -1178,6 +1178,8 @@ fn bus_changes_inner() -> (usize, usize, usize) {
         if is_open() { repaint(); }
     }
     (frames, keys.len(), idle)
+}
+
 /// GLASSEYES (B343) — the tab `shot settings <tab>` opens on: `general | users | display | about` (case-insensitive)
 /// sets the in-memory selection the next [`open`] reads; NOT persisted (a fixture's choice is not the user's).
 /// `false` for a name no tab carries.

@@ -1591,14 +1591,28 @@ pub fn mint_disk_grant(
     total_sectors: u64,
     v: &super::selfinstall::Verdict,
 ) -> Option<block::WriteGrant> {
+    let g = mint_disk_grant_quiet(id, total_sectors, v)?;
+    if let block::BlockHandle::Ahci { port } = id.handle {
+        serial_println!(
+            ":: INSTALL: grant minted transport=ahci port={} WHOLE-DISK verdict={} lba=0..{} — blank/ours only ::",
+            port, v.tag(), total_sectors - 1
+        );
+    }
+    Some(g)
+}
+
+/// UNAFSGROW (B347) M3: [`mint_disk_grant`]'s judgment and mint WITHOUT the wire line — the installer
+/// window's DRY RUN mints and drops it unheld, so it must not print `grant minted … WHOLE-DISK` over a
+/// disk nothing will write. The one body: `mint_disk_grant` is this plus the line.
+pub fn mint_disk_grant_quiet(
+    id: block::BlockDeviceId,
+    total_sectors: u64,
+    v: &super::selfinstall::Verdict,
+) -> Option<block::WriteGrant> {
     let block::BlockHandle::Ahci { port } = id.handle else { return None };
     if !v.writable() || total_sectors < 4096 || sata_is_boot_device(id.handle) {
         return None;
     }
-    serial_println!(
-        ":: INSTALL: grant minted transport=ahci port={} WHOLE-DISK verdict={} lba=0..{} — blank/ours only ::",
-        port, v.tag(), total_sectors - 1
-    );
     Some(grant_range(port, 0, total_sectors - 1))
 }
 

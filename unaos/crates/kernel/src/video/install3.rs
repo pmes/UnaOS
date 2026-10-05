@@ -280,6 +280,7 @@ fn take_census() -> Vec<Disk> {
             v.push(other_row("usb", BlockHandle::Usb, u));
         }
     }
+    #[cfg(feature = "sdhcblk")] if let Some(sd) = block::sdhc_info() { let mut row = other_row("sdhc", BlockHandle::Sdhc, sd); row.words = String::from(if row.words.starts_with("the boot disk") { "the boot SD card (read-only here)" } else { "the SD card (read-only here)" }); v.push(row); } // UNAFSGROW (B347) M3: the card reads (BlockTarget Sdhc), so it is a census row; never selectable
     v
 }
 
@@ -687,10 +688,10 @@ pub(super) fn paint(px: &mut [u32]) -> bool {
                 _ => title(px, "Installing..."),
             }
             let mut y = 54;
-            for s in ["probe", "guard", "grant", "snapshot", "gpt", "esp", "unafs", "fsck", "done"] {
+            for s in ["probe", "guard", "grant", "snapshot", "gpt", "esp", "unafs", "fsck", "grow", "done"] {
                 let got = m.stages.iter().rev().find(|(n, _)| n == s);
                 let (mark, what) = match got {
-                    Some((_, w)) if w.starts_with("ok") || w.starts_with("issued") || w.starts_with("PASS") => ("[x]", w.as_str()),
+                    Some((_, w)) if w.starts_with("ok") || w.starts_with("issued") || w.starts_with("PASS") || w.ends_with(" ok") => ("[x]", w.as_str()),
                     Some((_, w)) if w.starts_with("dry") => ("[-]", w.as_str()),
                     Some((_, w)) => ("[!]", w.as_str()),
                     None => ("[ ]", ""),
@@ -772,7 +773,7 @@ pub fn selftest() {
             m.outcome.as_ref().is_some_and(|o| o.1),
             m.outcome.as_ref().map_or(String::new(), |o| o.2.clone()),
             // nothing past the grant ran: every later stage that was reported is `dry`
-            m.stages.iter().filter(|(n, _)| matches!(n.as_str(), "snapshot" | "gpt" | "esp" | "unafs" | "fsck")).all(|(_, w)| w.starts_with("dry") || w.starts_with("fail (plan")),
+            m.stages.iter().filter(|(n, _)| matches!(n.as_str(), "snapshot" | "gpt" | "esp" | "unafs" | "fsck" | "grow")).all(|(_, w)| w.starts_with("dry") || w.starts_with("fail (plan")),
             m.offered_reboot,
         ),
         None => (false, false, false, String::new(), false, false),

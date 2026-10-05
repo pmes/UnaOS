@@ -195,12 +195,11 @@ impl InstallTarget for BlockTarget {
             let n = match self.handle {
                 block::BlockHandle::Global => block::read_block(lba + i as u64, chunk),
                 block::BlockHandle::Usb => block::read_block_usb(lba + i as u64, chunk),
-                // SDHC-4b: the installer cannot bind the internal SD card. Nothing constructs an
-                // `Sdhc` target (`InstallTarget::from_parts` is only ever called with `Global`/`Usb`,
-                // and the graphical chooser lists only those two handles), so this arm exists to keep
-                // the match exhaustive and to make the refusal explicit rather than accidental.
+                // UNAFSGROW (B347) M3: the internal SD card READS, so the installer's census can name
+                // what is on it (a read-only row) and selfguard can recognise the boot card by its
+                // volume serial. Reading mutates nothing; the WRITE arm below stays a refusal.
                 #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-                block::BlockHandle::Sdhc => Err(block::BlockError::NotReady),
+                block::BlockHandle::Sdhc => block::read_block_sdhc(lba + i as u64, chunk),
                 // TEGRA-SDBLK: the same refusal, for the same reason — nothing constructs a
                 // `SdMmc` target (`from_parts` is only ever called with `Global`/`Usb`), and the
                 // Orin card's install flow is `sdmmc_tegra`'s own armed ladder, not this engine.
