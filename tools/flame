@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 The Architect & Una
-"""flame — resolve a UnaOS `prof dump` against the build's symbol table (PROFILE, rmbp-ledger B331).
+"""flame — resolve a UnaOS `prof dump` against the build's symbol tables (PROFILE B331, PROFILE2 B340).
 
 The kernel embeds no symbol table. `prof dump` prints, to serial,
 
-    [prof] summary armed=no hz=1000 samples=N dropped=0 span_ms=... cap=4096 anchor=0x...
-    [prof] cpu=<c> task=<tid> ring=<0|3> rip=0x...
+    [prof] summary armed=no hz=1000 samples=N dropped=0 ... anchor=0x...
+    [prof] prog id=<p> name=<NAME>                       (the program table: ring-3 program ids)
+    [prof] name tid=<t> name=<task name>                 (the sampled tasks' names)
+    [prof] cpu=<c> task=<tid> ring=<0|3> rip=0x... prog=<p> [fp=0x..,0x..]
     ...
     [prof] dump end samples=N
 
-and arroyo writes `target/kernel.syms` (`llvm-nm -n -C --defined-only` on the linked ELF) beside the
-kernel. The kernel is PIE, so a runtime RIP is link address + slide: `anchor=` is the runtime address
-of `unaos_prof_anchor`, and that symbol's line in the syms file is its link address.
+`fp=` is the caller chain the kernel's frame-pointer walk found (innermost caller first). arroyo writes
+`target/kernel.syms` beside the kernel and `target/APPS/<NAME>.syms` beside every staged ring-3 ELF
+(`llvm-nm -n -C --defined-only`, before the strip). The kernel is PIE: `anchor=` is the runtime address of
+`unaos_prof_anchor`, its syms line is the link address, the difference is the slide. A ring-3 RIP is
+resolved against `APPS/<NAME>.syms` for the sample's program id: an elf-model program links at its
+absolute VA; a classic one links at 0 and runs at the window base (`--user-base`, default the x86 one),
+which is subtracted when the RIP lies past the program's table.
 
-    tools/flame <serial.log> [--syms target/kernel.syms] [--top N] [--svg out.svg] [--all]
+    tools/flame <serial.log> [--syms target/kernel.syms] [--apps target/APPS] [--top N]
+                [--svg out.svg] [--folded out.txt] [--by-task] [--user-base 0x...] [--all]
     tools/flame --self-test [--keep]
 
-Prints the top-N symbols with sample % and writes a depth-1 flame graph SVG (a histogram-shaped flame:
-one bar per symbol over an `all` root; real stacks are owed). Ring-3 samples are counted as `[ring3]`.
+Prints the top-N leaf symbols with sample %, writes a flame graph SVG (nested: one tower per stack,
+root at the bottom) and, with `--folded`, the folded-stacks text (`root;caller;leaf count`).
+`--by-task` roots each stack at its task name.
 """
 import bisect
 import hashlib
@@ -29,12 +37,15 @@ import tempfile
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
-SAMPLE_RE = re.compile(r"\[prof\] cpu=(\d+) task=(\d+) ring=(\d+) rip=(0x[0-9a-fA-F]+)")
+SAMPLE_RE = re.compile(r"\[prof\] cpu=(\d+) task=(\d+) ring=(\d+) rip=(0x[0-9a-fA-F]+)(?: prog=(\d+))?(?: fp=([0-9a-fA-Fx,]+))?")
 SUMMARY_RE = re.compile(r"\[prof\] summary .*anchor=(0x[0-9a-fA-F]+)")
+PROG_RE = re.compile(r"\[prof\] prog id=(\d+) name=(\S*)")
+NAME_RE = re.compile(r"\[prof\] name tid=(\d+) name=(\S*)")
 END_RE = re.compile(r"\[prof\] dump end")
 HASH_RE = re.compile(r"::h[0-9a-f]{16}$")
 ANCHOR = "unaos_prof_anchor"
 TEXT_TYPES = set("tTwWiI")
+USER_BASE_X86 = 0x0000_0100_0000_0000
 
 
 def demangle_legacy(name):
@@ -63,30 +74,39 @@ def clean(name):
     return HASH_RE.sub("", demangle_legacy(name))
 
 
-def load_syms(path):
-    """[(addr, name)] address-sorted text symbols, and the anchor's link address (or None)."""
-    syms, anchor = [], None
-    with open(path, errors="replace") as f:
-        for line in f:
-            parts = line.rstrip("\n").split(" ", 2)
-            if len(parts) < 3:
-                continue
-            try:
-                addr = int(parts[0], 16)
-            except ValueError:
-                continue
-            typ, name = parts[1], parts[2]
-            if name == ANCHOR or clean(name) == ANCHOR:
-                anchor = addr
-            if typ in TEXT_TYPES:
-                syms.append((addr, clean(name)))
-    syms.sort()
-    return syms, anchor
+class Syms:
+    """An address-sorted text-symbol table."""
+
+    def __init__(self, path):
+        self.syms, self.anchor = [], None
+        with open(path, errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(" ", 2)
+                if len(parts) < 3:
+                    continue
+                try:
+                    addr = int(parts[0], 16)
+                except ValueError:
+                    continue
+                typ, name = parts[1], parts[2]
+                if name == ANCHOR or clean(name) == ANCHOR:
+                    self.anchor = addr
+                if typ in TEXT_TYPES:
+                    self.syms.append((addr, clean(name)))
+        self.syms.sort()
+        self.addrs = [a for a, _ in self.syms]
+        self.hi = self.addrs[-1] if self.addrs else 0
+
+    def lookup(self, addr):
+        i = bisect.bisect_right(self.addrs, addr) - 1
+        return self.syms[i][1] if i >= 0 else None
 
 
 def load_dump(path, take_all=False):
-    """(samples [(cpu, task, ring, rip)], runtime anchor) of the LAST complete dump (or every one)."""
+    """(samples [(cpu, task, ring, rip, prog, [callers])], runtime anchor, {prog: name}, {tid: name}) of
+    the LAST complete dump (or every one)."""
     dumps, cur, anchor = [], None, None
+    progs, names = {}, {}
     with open(path, errors="replace") as f:
         for line in f:
             m = SUMMARY_RE.search(line)
@@ -94,11 +114,21 @@ def load_dump(path, take_all=False):
                 anchor = int(m.group(1), 16)
                 cur = {"anchor": anchor, "samples": []}
                 continue
+            m = PROG_RE.search(line)
+            if m:
+                progs[int(m.group(1))] = m.group(2)
+                continue
+            m = NAME_RE.search(line)
+            if m:
+                names[int(m.group(1))] = m.group(2)
+                continue
             m = SAMPLE_RE.search(line)
             if m:
                 if cur is None:
                     cur = {"anchor": anchor, "samples": []}
-                cur["samples"].append((int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4), 16)))
+                fp = [int(x, 16) for x in m.group(6).split(",") if x] if m.group(6) else []
+                cur["samples"].append((int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4), 16),
+                                       int(m.group(5) or 0), fp))
                 continue
             if END_RE.search(line) and cur is not None:
                 dumps.append(cur)
@@ -106,24 +136,65 @@ def load_dump(path, take_all=False):
     if cur is not None and cur["samples"]:
         dumps.append(cur)
     if not dumps:
-        return [], None
+        return [], None, progs, names
     if take_all:
-        return [s for d in dumps for s in d["samples"]], dumps[-1]["anchor"]
-    return dumps[-1]["samples"], dumps[-1]["anchor"]
+        return [s for d in dumps for s in d["samples"]], dumps[-1]["anchor"], progs, names
+    return dumps[-1]["samples"], dumps[-1]["anchor"], progs, names
 
 
-def resolve(samples, syms, link_anchor, run_anchor):
-    addrs = [a for a, _ in syms]
-    slide = (run_anchor - link_anchor) if (run_anchor is not None and link_anchor is not None) else 0
-    counts = {}
-    for _cpu, _task, ring, rip in samples:
+class Resolver:
+    def __init__(self, ksyms, run_anchor, apps_dir, progs, user_base):
+        self.k = ksyms
+        self.slide = (run_anchor - ksyms.anchor) if (run_anchor is not None and ksyms.anchor is not None) else 0
+        self.apps_dir, self.progs, self.user_base = apps_dir, progs, user_base
+        self.apps = {}
+        self.r3_resolved = self.r3_total = 0
+
+    def app(self, prog):
+        name = self.progs.get(prog)
+        if not name:
+            return None, None
+        if name not in self.apps:
+            p = os.path.join(self.apps_dir, name + ".syms") if self.apps_dir else None
+            self.apps[name] = Syms(p) if p and os.path.exists(p) else None
+        return name, self.apps[name]
+
+    def kernel(self, addr):
+        return self.k.lookup(addr - self.slide) or "[unknown]"
+
+    def ring3(self, prog, rip):
+        self.r3_total += 1
+        name, syms = self.app(prog)
+        if syms is None or not syms.syms:
+            return "[ring3:%s]" % name if name else "[ring3]"
+        a = rip
+        if a > syms.hi + 0x10000 and a >= self.user_base:
+            a -= self.user_base  # classic model: linked at 0, runs at the window base
+        sym = syms.lookup(a)
+        if sym is None:
+            return "[ring3:%s]" % name
+        self.r3_resolved += 1
+        return "%s`%s" % (name, sym)
+
+
+def stacks(samples, res, by_task=False, names=None):
+    """{(root..leaf): count} and {leaf: count}."""
+    folded, leaves = {}, {}
+    for _cpu, task, ring, rip, prog, fp in samples:
         if ring == 3:
-            name = "[ring3]"
+            leaf = res.ring3(prog, rip)
+            path = [leaf]
         else:
-            i = bisect.bisect_right(addrs, rip - slide) - 1
-            name = syms[i][1] if i >= 0 else "[unknown]"
-        counts[name] = counts.get(name, 0) + 1
-    return counts, slide
+            leaf = res.kernel(rip)
+            # callers are return addresses: resolve (ret - 1) so a call at a function's end stays in it
+            path = [leaf] + [res.kernel(r - 1) for r in fp]
+        path.reverse()
+        if by_task:
+            path.insert(0, (names or {}).get(task) or ("tid-%d" % task if task else "(idle)"))
+        key = tuple(path)
+        folded[key] = folded.get(key, 0) + 1
+        leaves[leaf] = leaves.get(leaf, 0) + 1
+    return folded, leaves
 
 
 def color(name):
@@ -131,118 +202,192 @@ def color(name):
     return "rgb(%d,%d,%d)" % (205 + h % 50, 80 + (h >> 8) % 120, 30 + (h >> 16) % 40)
 
 
-def write_svg(path, counts, title):
-    total = sum(counts.values()) or 1
+def build_tree(folded):
+    root = {"n": 0, "kids": {}}
+    for path, c in folded.items():
+        root["n"] += c
+        node = root
+        for fr in path:
+            node = node["kids"].setdefault(fr, {"n": 0, "kids": {}})
+            node["n"] += c
+    return root
+
+
+def tree_depth(node):
+    return 1 + max((tree_depth(k) for k in node["kids"].values()), default=0)
+
+
+def write_svg(path, folded, title):
+    root = build_tree(folded)
+    total = root["n"] or 1
     width, row, pad = 1200, 18, 10
-    height = pad * 2 + 24 + row * 2
-    y_root = height - pad - row
-    y_leaf = y_root - row
+    depth = tree_depth(root)
+    height = pad * 2 + 24 + row * depth
+    span = float(width - 2 * pad)
     out = ['<?xml version="1.0" standalone="no"?>',
            '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" font-family="monospace" font-size="11">' % (width, height),
            '<rect x="0" y="0" width="%d" height="%d" fill="#f8f8f0"/>' % (width, height),
-           '<text x="%d" y="%d" text-anchor="middle" font-size="14">%s</text>' % (width // 2, pad + 14, escape(title)),
-           '<g><title>all (%d samples, 100%%)</title><rect x="%d" y="%d" width="%d" height="%d" fill="rgb(230,150,60)" rx="2"/>'
-           '<text x="%d" y="%d">all</text></g>' % (total, pad, y_root, width - 2 * pad, row - 1, pad + 3, y_root + 12)]
-    x, span = float(pad), float(width - 2 * pad)
-    for name, n in sorted(counts.items()):
+           '<text x="%d" y="%d" text-anchor="middle" font-size="14">%s</text>' % (width // 2, pad + 14, escape(title))]
+
+    def bar(name, n, x, level, fill):
         w = span * n / total
+        y = height - pad - row * (level + 1)
         label = "%s (%d samples, %.1f%%)" % (name, n, 100.0 * n / total)
         text = ""
         if w > 30:
             chars = int((w - 6) / 6.6)
             t = name if len(name) <= chars else name[:max(chars - 2, 1)] + ".."
-            text = '<text x="%.1f" y="%d">%s</text>' % (x + 3, y_leaf + 12, escape(t))
+            text = '<text x="%.1f" y="%d">%s</text>' % (x + 3, y + 12, escape(t))
         out.append('<g><title>%s</title><rect x="%.1f" y="%d" width="%.1f" height="%d" fill="%s" rx="2"/>%s</g>'
-                   % (escape(label), x, y_leaf, max(w - 0.5, 0.1), row - 1, color(name), text))
-        x += w
+                   % (escape(label), x, y, max(w - 0.5, 0.1), row - 1, fill, text))
+
+    def walk(node, x, level):
+        for name in sorted(node["kids"]):
+            kid = node["kids"][name]
+            bar(name, kid["n"], x, level, color(name))
+            walk(kid, x, level + 1)
+            x += span * kid["n"] / total
+
+    bar("all", total, float(pad), 0, "rgb(230,150,60)")
+    walk(root, float(pad), 1)
     out.append("</svg>")
     with open(path, "w") as f:
         f.write("\n".join(out) + "\n")
 
 
-def report(log, syms_path, top, svg, take_all=False, quiet=False):
-    samples, run_anchor = load_dump(log, take_all)
+def report(log, syms_path, top, svg, take_all=False, quiet=False, apps=None, folded_out=None,
+           by_task=False, user_base=USER_BASE_X86):
+    samples, run_anchor, progs, names = load_dump(log, take_all)
     if not samples:
         print("flame: no `[prof] cpu=` lines in %s (run `prof stop` then `prof dump`)" % log, file=sys.stderr)
         return None
-    syms, link_anchor = load_syms(syms_path)
-    if not syms:
+    ks = Syms(syms_path)
+    if not ks.syms:
         print("flame: no text symbols in %s" % syms_path, file=sys.stderr)
         return None
-    if link_anchor is None or run_anchor is None:
+    if ks.anchor is None or run_anchor is None:
         print("flame: WARNING no anchor (%s in syms: %s, anchor= in log: %s) — slide assumed 0"
-              % (ANCHOR, link_anchor is not None, run_anchor is not None), file=sys.stderr)
-    counts, slide = resolve(samples, syms, link_anchor, run_anchor)
+              % (ANCHOR, ks.anchor is not None, run_anchor is not None), file=sys.stderr)
+    res = Resolver(ks, run_anchor, apps, progs, user_base)
+    folded, leaves = stacks(samples, res, by_task, names)
     total = len(samples)
-    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    depth_max = max(len(s[5]) for s in samples)
+    walked = sum(1 for s in samples if s[5])
+    ranked = sorted(leaves.items(), key=lambda kv: (-kv[1], kv[0]))
     if not quiet:
-        print("flame: samples=%d symbols=%d slide=%#x" % (total, len(counts), slide & ((1 << 64) - 1)))
+        print("flame: samples=%d stacks=%d depth_max=%d symbols=%d slide=%#x ring3=%d/%d resolved"
+              % (total, walked, depth_max, len(leaves), res.slide & ((1 << 64) - 1), res.r3_resolved, res.r3_total))
         for i, (name, n) in enumerate(ranked[:top]):
             print("%3d  %6d  %5.1f%%  %s" % (i + 1, n, 100.0 * n / total, name))
+    if folded_out:
+        with open(folded_out, "w") as f:
+            for path, c in sorted(folded.items()):
+                f.write("%s %d\n" % (";".join(path), c))
     if svg:
-        write_svg(svg, counts, "UnaOS prof — %d samples, %d symbols (depth 1)" % (total, len(counts)))
+        write_svg(svg, folded, "UnaOS prof — %d samples, %d stacks, depth <= %d" % (total, walked, depth_max))
         if not quiet:
             print("flame: wrote %s" % svg)
-    return ranked
+    return ranked, folded, res
 
 
 def self_test(keep=False):
     d = tempfile.mkdtemp(prefix="flame-")
     syms = os.path.join(d, "kernel.syms")
+    apps = os.path.join(d, "APPS")
+    os.mkdir(apps)
     log = os.path.join(d, "serial.log")
     svg = os.path.join(d, "flame.svg")
+    folded_path = os.path.join(d, "folded.txt")
     link = {"_start": 0x200000, "kernel::prof::synthetic_load": 0x201000, ANCHOR: 0x202000,
             "_ZN4core3fmt5write17h0123456789abcdefE": 0x203000, "kernel::arch::sched::idle": 0x204000,
-            "__etext": 0x205000}
+            "kernel::prof::prof2_b": 0x205000, "kernel::prof::prof2_a": 0x206000, "__etext": 0x207000}
     with open(syms, "w") as f:
         f.write("                 U undefined_thing\n")
         f.write("0000000000100000 r .rodata.const\n")
         for name, a in sorted(link.items(), key=lambda kv: kv[1]):
             f.write("%016x T %s\n" % (a, name))
+    # ring-3: STAT is a classic program (linked at 0, runs at the window base), LUMEN an elf-model one.
+    with open(os.path.join(apps, "STAT.syms"), "w") as f:
+        f.write("0000000000000000 T _start\n00000000000004b5 t user_stat::draw_number\n0000000000001000 b user_stat::INFO\n")
+    xva = USER_BASE_X86 + 0x200000
+    with open(os.path.join(apps, "LUMEN.syms"), "w") as f:
+        f.write("%016x T _start\n%016x t user_lumen::paint\n" % (xva, xva + 0x2000))
     slide = 0xffffffff80000000 - 0x200000
     run = lambda name, off=0x40: (link[name] + slide + off)
-    plan = [("kernel::prof::synthetic_load", 600), ("kernel::arch::sched::idle", 300),
-            ("_ZN4core3fmt5write17h0123456789abcdefE", 60)]
+    ret = lambda name: run(name, 0x21)  # a return address: past the call inside `name`
+    plan = [("kernel::prof::synthetic_load", 600, [ret("kernel::prof::prof2_b"), ret("kernel::prof::prof2_a")]),
+            ("kernel::arch::sched::idle", 300, []),
+            ("_ZN4core3fmt5write17h0123456789abcdefE", 60, [ret("kernel::prof::prof2_a")])]
     with open(log, "w") as f:
         f.write("boot noise [prof] not a sample\n")
         f.write("[prof] summary armed=no hz=1000 samples=1 dropped=0 span_ms=1 cap=4096 anchor=%#x\n" % run(ANCHOR, 0))
-        f.write("[prof] cpu=0 task=1 ring=0 rip=%#x\n" % run("_start"))
+        f.write("[prof] cpu=0 task=1 ring=0 rip=%#x\n" % run("_start"))  # a B331 (depth-1, no prog=) dump
         f.write("[prof] dump end samples=1\n")
-        f.write("[prof] summary armed=no hz=1000 samples=1000 dropped=0 span_ms=1000 cap=4096 anchor=%#x\n" % run(ANCHOR, 0))
+        f.write("[prof] summary armed=no hz=1000 samples=1000 dropped=0 span_ms=1000 cap_words=32768 anchor=%#x\n" % run(ANCHOR, 0))
+        f.write("[prof] prog id=1 name=STAT\n[prof] prog id=2 name=LUMEN\n[prof] prog id=3 name=GONE\n")
+        f.write("[prof] name tid=7 name=prof2-load\n[prof] name tid=9 name=STAT\n")
         k = 0
-        for name, n in plan:
+        for name, n, fp in plan:
             for i in range(n):
-                f.write("12:00:00 [prof] cpu=%d task=%d ring=0 rip=%#x\n" % (k % 4, 7, run(name, 0x10 + (i % 0x100))))
+                tail = " fp=" + ",".join("%#x" % r for r in fp) if fp else ""
+                f.write("12:00:00 [prof] cpu=%d task=%d ring=0 rip=%#x prog=0%s\n" % (k % 4, 7, run(name, 0x10 + (i % 0x100)), tail))
                 k += 1
-        for i in range(40):
-            f.write("[prof] cpu=1 task=9 ring=3 rip=%#x\n" % (0x400000 + i))
+        for i in range(20):
+            f.write("[prof] cpu=1 task=9 ring=3 rip=%#x prog=1\n" % (USER_BASE_X86 + 0x4b5 + i))
+        for i in range(15):
+            f.write("[prof] cpu=2 task=11 ring=3 rip=%#x prog=2\n" % (xva + 0x2000 + i))
+        for i in range(5):
+            f.write("[prof] cpu=2 task=12 ring=3 rip=%#x prog=3\n" % (0x400000 + i))
         f.write("[prof] dump end samples=1000\n")
-    ranked = report(log, syms, 5, svg, quiet=True)
+    ranked, folded, res = report(log, syms, 5, svg, quiet=True, apps=apps, folded_out=folded_path)
     ok = True
     want = [("kernel::prof::synthetic_load", 600), ("kernel::arch::sched::idle", 300),
-            ("core::fmt::write", 60), ("[ring3]", 40)]
+            ("core::fmt::write", 60), ("STAT`user_stat::draw_number", 20), ("LUMEN`user_lumen::paint", 15),
+            ("[ring3:GONE]", 5)]
     if ranked != want:
         print("flame: self-test FAIL ranked=%r want=%r" % (ranked, want))
         ok = False
+    deep = ("kernel::prof::prof2_a", "kernel::prof::prof2_b", "kernel::prof::synthetic_load")
+    if folded.get(deep) != 600:
+        print("flame: self-test FAIL stack %r count=%r want 600" % (deep, folded.get(deep)))
+        ok = False
+    if (res.r3_resolved, res.r3_total) != (35, 40):
+        print("flame: self-test FAIL ring3 resolved=%d/%d want 35/40" % (res.r3_resolved, res.r3_total))
+        ok = False
     try:
-        root = ET.parse(svg).getroot()
-        rects = [e for e in root.iter() if e.tag.endswith("rect")]
-        if len(rects) != 1 + 1 + len(want):
-            print("flame: self-test FAIL svg rects=%d want=%d" % (len(rects), 2 + len(want)))
+        lines = open(folded_path).read().splitlines()
+        if "kernel::prof::prof2_a;kernel::prof::prof2_b;kernel::prof::synthetic_load 600" not in lines:
+            print("flame: self-test FAIL folded text lacks the 3-deep stack")
+            ok = False
+    except OSError as e:
+        print("flame: self-test FAIL folded: %s" % e)
+        ok = False
+    try:
+        rects = [e for e in ET.parse(svg).getroot().iter() if e.tag.endswith("rect")]
+        # background + all + every distinct tree node
+        nodes = len({p[:i + 1] for p in folded for i in range(len(p))})
+        if len(rects) != 2 + nodes:
+            print("flame: self-test FAIL svg rects=%d want=%d" % (len(rects), 2 + nodes))
             ok = False
     except ET.ParseError as e:
         print("flame: self-test FAIL svg does not parse: %s" % e)
         ok = False
-    all_ranked = report(log, syms, 5, None, take_all=True, quiet=True)
-    if not all_ranked or sum(n for _, n in all_ranked) != 1001:
-        print("flame: self-test FAIL --all total=%r" % (all_ranked and sum(n for _, n in all_ranked)))
+    bt = report(log, syms, 5, None, quiet=True, apps=apps, by_task=True)
+    if not bt or bt[1].get(("prof2-load",) + deep) != 600:
+        print("flame: self-test FAIL --by-task root")
         ok = False
-    print("flame: self-test %s (top=%s %d/1000 samples%s)" % ("PASS" if ok else "FAIL", want[0][0], want[0][1],
-                                                         ", kept " + d if keep else ""))
+    all_r = report(log, syms, 5, None, take_all=True, quiet=True, apps=apps)
+    if not all_r or sum(n for _, n in all_r[0]) != 1001:
+        print("flame: self-test FAIL --all total=%r" % (all_r and sum(n for _, n in all_r[0])))
+        ok = False
+    print("flame: self-test %s (top=%s %d/1000, stack depth 3 x600, ring3 35/40 resolved%s)"
+          % ("PASS" if ok else "FAIL", want[0][0], want[0][1], ", kept " + d if keep else ""))
     if not keep:
-        for p in (syms, log, svg):
-            if os.path.exists(p):
-                os.remove(p)
+        for root, dirs, files in os.walk(d, topdown=False):
+            for fn in files:
+                os.remove(os.path.join(root, fn))
+            for dn in dirs:
+                os.rmdir(os.path.join(root, dn))
         os.rmdir(d)
     return 0 if ok else 1
 
@@ -250,8 +395,10 @@ def self_test(keep=False):
 def main(argv):
     if "--self-test" in argv:
         return self_test("--keep" in argv)
-    args, opts, i = [], {"--syms": None, "--top": "20", "--svg": None}, 0
-    take_all = False
+    args = []
+    opts = {"--syms": None, "--top": "20", "--svg": None, "--apps": None, "--folded": None, "--user-base": None}
+    take_all = by_task = False
+    i = 0
     while i < len(argv):
         a = argv[i]
         if a in opts:
@@ -260,6 +407,8 @@ def main(argv):
             continue
         if a == "--all":
             take_all = True
+        elif a == "--by-task":
+            by_task = True
         elif a in ("-h", "--help"):
             print(__doc__)
             return 0
@@ -269,11 +418,13 @@ def main(argv):
     if len(args) != 1:
         print(__doc__, file=sys.stderr)
         return 2
-    syms = opts["--syms"]
-    if syms is None:
-        here = os.path.dirname(os.path.abspath(__file__))
-        syms = os.path.join(here, "..", "unaos", "target", "kernel.syms")
-    return 0 if report(args[0], syms, int(opts["--top"]), opts["--svg"], take_all) is not None else 1
+    here = os.path.dirname(os.path.abspath(__file__))
+    syms = opts["--syms"] or os.path.join(here, "..", "unaos", "target", "kernel.syms")
+    apps = opts["--apps"] or os.path.join(os.path.dirname(os.path.abspath(syms)), "APPS")
+    ub = int(opts["--user-base"], 0) if opts["--user-base"] else USER_BASE_X86
+    r = report(args[0], syms, int(opts["--top"]), opts["--svg"], take_all, apps=apps,
+               folded_out=opts["--folded"], by_task=by_task, user_base=ub)
+    return 0 if r is not None else 1
 
 
 if __name__ == "__main__":

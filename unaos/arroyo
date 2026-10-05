@@ -3529,6 +3529,12 @@ EOF
 # against. The kernel embeds nothing; a missing llvm-nm warns and never fails the build.
 emit_kernel_syms() { "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "$2" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: $2 ($(wc -l < "$2") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no $2 (prof dump stays unresolved)${COLOR_RESET}"; }
 
+# PROFILE2 (rmbp-ledger B340, M3): a ring-3 program's symbol table, written from the UNSTRIPPED link
+# product (the staged ELF is `--strip-all`ed) to `target/APPS/<NAME>.syms`, NAME = the staged basename
+# without `.ELF` — the program name the kernel's `prof dump` prints (`[prof] prog id= name=`), so
+# `tools/flame` resolves a ring-3 RIP against the right program. Warns, never fails the build.
+emit_user_syms() { mkdir -p "${WORKSPACE_DIR}/target/APPS"; "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "${WORKSPACE_DIR}/target/APPS/$2.syms" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: target/APPS/$2.syms ($(wc -l < "${WORKSPACE_DIR}/target/APPS/$2.syms") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no APPS/$2.syms (its ring-3 samples stay unresolved)${COLOR_RESET}"; }
+
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -3633,6 +3639,7 @@ build_user_stat_x86() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-stat/target/x86_64-unknown-none/release/user-stat" STAT  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-stat/target/x86_64-unknown-none/release/user-stat" \
       "${WORKSPACE_DIR}/target/STAT-X86.ELF"
@@ -3694,6 +3701,7 @@ build_one_vug_x86() {
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json" \
       --target-dir "$tdir" ${feats:+--features "$feats"}
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${tdir}/x86_64-unknown-none/release/user-vug" "${out%-X86.ELF}"  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${tdir}/x86_64-unknown-none/release/user-vug" \
       "${WORKSPACE_DIR}/target/${out}"
@@ -3748,6 +3756,7 @@ build_user_pulse_x86() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-pulse/target/x86_64-unknown-none/release/user-pulse" PULSE  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-pulse/target/x86_64-unknown-none/release/user-pulse" \
       "${WORKSPACE_DIR}/target/PULSE-X86.ELF"
@@ -3776,6 +3785,7 @@ build_user_prefs_x86() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-prefs/target/x86_64-unknown-none/release/user-prefs" PREFS  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-prefs/target/x86_64-unknown-none/release/user-prefs" \
       "${WORKSPACE_DIR}/target/PREFS-X86.ELF"
@@ -3802,6 +3812,7 @@ build_user_lumen_x86() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-lumen/target/x86_64-unknown-none/release/user-lumen" LUMEN  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-lumen/target/x86_64-unknown-none/release/user-lumen" \
       "${WORKSPACE_DIR}/target/LUMEN-X86.ELF"
@@ -3824,6 +3835,7 @@ build_user_net_x86() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-net/target/x86_64-unknown-none/release/user-net" NET  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-net/target/x86_64-unknown-none/release/user-net" \
       "${WORKSPACE_DIR}/target/NET-X86.ELF"
@@ -3850,6 +3862,7 @@ build_user_big_x86() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-big/target/x86_64-unknown-none/release/user-big" BIG  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-big/target/x86_64-unknown-none/release/user-big" \
       "${WORKSPACE_DIR}/target/BIG-X86.ELF"
