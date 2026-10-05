@@ -338,6 +338,7 @@ class Row:
     kind: str
     capability: str
     behind: list[str] = field(default_factory=list)  # human reasons this row lags
+    lagging: set = field(default_factory=set)        # consumers behind latest stable
     worst: str = "none"
 
     def evaluate(self, policy: str):
@@ -349,10 +350,12 @@ class Row:
                 lo = _cmp_ver(*_partial(u.req.lstrip("^~=<>").split(",")[0]))
                 k = bump_kind(lo, self.stable) if lo else "major"
                 self.behind.append(f"{where}: requirement `{u.req}` does not admit {self.stable} ({k})")
+                self.lagging.add(u.consumer)
                 if k == "major" or self.worst != "major":
                     self.worst = k if k != "none" else "major"
             elif policy == "any" and u.locked and max(u.locked, key=Ver.key).key() < self.stable.key():
                 self.behind.append(f"{where}: lock resolved {max(u.locked, key=Ver.key)} < {self.stable}")
+                self.lagging.add(u.consumer)
                 if self.worst == "none":
                     self.worst = "lock"
 
@@ -383,6 +386,8 @@ def pinned(row: Row, pins: list[dict]) -> dict | None:
         if p.get("crate") == row.crate:
             if "until" in p and row.stable and Ver.parse(p["until"]) and row.stable.key() > Ver.parse(p["until"]).key():
                 continue  # a newer release than the pin anticipated: re-review
+            if "consumers" in p and not row.lagging <= set(p["consumers"]):
+                continue  # the pin covers named consumers only; another one lags
             return p
     return None
 
@@ -434,6 +439,14 @@ def render(rows: list[Row]) -> str:
     L.append("A crate is CHICKEN-WIRE when it does the work of a capability UnaOS claims (R83). Verdicts: **CUT** — the")
     L.append("UnaOS core that replaces it is an open arc; **OWED** — no arc yet, the proposed arc and crate are named;")
     L.append("**NOT WANTED** — UnaOS will not replace it, and why. Each row is meant to become a ledger row.\n")
+    L.append("No crate in the tree demuxes MP4/WebM or decodes compressed audio or video today, so PLAYBACK SR26")
+    L.append("(`demux_core`) and AUDIOCODEC SR30 (`audio_core`) replace no row here: they are greenfield. AVCODEC SR24")
+    L.append("(`av1_core`) is named on the `image` row (AVIF), the one place an AV1 codec enters the lock (rav1e, an")
+    L.append("encoder, through `image`'s default `avif` feature).\n")
+    by_v = {}
+    for r in cw:
+        by_v[cls[r.crate]["verdict"]] = by_v.get(cls[r.crate]["verdict"], 0) + 1
+    L.append("Counts: " + ", ".join(f"{k} {v}" for k, v in sorted(by_v.items())) + ".\n")
     L.append("| crate | capability | consumers | verdict | UnaOS replacement |")
     L.append("|---|---|---|---|---|")
     for r in cw:
@@ -441,6 +454,15 @@ def render(rows: list[Row]) -> str:
         cons = ", ".join(sorted({u.consumer for u in r.uses}))
         L.append(f"| `{r.crate}` {r.stable or ''} | {md_escape(c['capability'])} | {cons} | **{c['verdict']}** | "
                  f"{md_escape(c.get('replacement', ''))} |")
+    L.append("\n## Pins (`tools/deps-audit/pins.toml`)\n")
+    if not pins:
+        L.append("None.\n")
+    else:
+        L.append("| crate | consumers | until | ledger | reason |")
+        L.append("|---|---|---|---|---|")
+        for p in pins:
+            L.append(f"| `{p.get('crate')}` | {', '.join(p.get('consumers', [])) or 'all'} | {p.get('until', '')} | "
+                     f"{p.get('ledger', '')} | {md_escape(p.get('reason', ''))} |")
     L.append("\n## Rows behind latest stable\n")
     if not lag:
         L.append("None.\n")
