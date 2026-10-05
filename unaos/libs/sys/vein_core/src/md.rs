@@ -374,6 +374,50 @@ pub fn wrap(text: &[u8], width: usize, hang: usize, emit: &mut dyn FnMut(usize, 
     }
 }
 
+/// KERNELFONT2 (rmbp-ledger B363): [`wrap`] for a PROPORTIONAL face — rows of at most `width` px, continuation rows
+/// indented by `hang` px (clamped so a row keeps at least a quarter of `width`), `adv(i)` the advance of display
+/// byte `i` in the style it is drawn in. Same rules as [`wrap`]: break at the last space that fits, else hard (at
+/// least one byte per row); continuation rows drop the spaces they broke at; an empty line emits one empty row.
+pub fn wrap_px(text: &[u8], width: f32, hang: f32, adv: &dyn Fn(usize) -> f32, emit: &mut dyn FnMut(usize, usize, bool)) {
+    let width = if width < 16.0 { 16.0 } else { width };
+    let hang = if hang > width * 0.75 { width * 0.75 } else if hang < 0.0 { 0.0 } else { hang };
+    let mut s = 0usize;
+    let mut first = true;
+    loop {
+        let wd = if first { width } else { width - hang };
+        if !first {
+            while s < text.len() && text[s] == b' ' {
+                s += 1;
+            }
+        }
+        // the first byte that does not fit
+        let mut e = s;
+        let mut x = 0f32;
+        while e < text.len() {
+            let a = adv(e);
+            if x + a > wd + 0.01 {
+                break;
+            }
+            x += a;
+            e += 1;
+        }
+        if e >= text.len() {
+            if first || s < text.len() {
+                emit(s, text.len(), first);
+            }
+            return;
+        }
+        let mut b = e;
+        while b > s && text[b] != b' ' {
+            b -= 1;
+        }
+        let cut = if b > s { b } else { e.max(s + 1) };
+        emit(s, cut, first);
+        s = cut;
+        first = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +526,29 @@ mod tests {
         let mut rows = Vec::new();
         wrap(b"abcdefghijkl", 5, 0, &mut |a, b, _| rows.push((a, b)));
         assert_eq!(rows, std::vec![(0, 5), (5, 10), (10, 12)]);
+    }
+
+    #[test]
+    fn wrap_px_rows() {
+        // KERNELFONT2: proportional rows — 'i' is 3 px, everything else 7 px.
+        let t = b"iii wide words here";
+        let adv = |i: usize| if t[i] == b'i' { 3.0 } else { 7.0 };
+        let mut rows: Vec<(usize, usize, bool)> = Vec::new();
+        wrap_px(t, 60.0, 14.0, &adv, &mut |a, b, f| rows.push((a, b, f)));
+        let w = |a: usize, b: usize| (a..b).map(|i| adv(i)).sum::<f32>();
+        assert_eq!(rows[0], (0, 8, true)); // "iii wide" = 9+7+28 = 44; "+ words" would be 93
+        for &(a, b, f) in &rows {
+            assert!(w(a, b) <= if f { 60.0 } else { 46.0 } + 0.01, "{:?}", (a, b));
+            assert!(b > a);
+        }
+        assert_eq!(rows.last().unwrap().1, t.len());
+        let mut one = Vec::new();
+        wrap_px(b"", 60.0, 0.0, &|_| 7.0, &mut |a, b, f| one.push((a, b, f)));
+        assert_eq!(one, [(0, 0, true)]);
+        let mut hard = Vec::new();
+        let long = b"abcdefghijklmnop";
+        wrap_px(long, 20.0, 0.0, &|_| 7.0, &mut |a, b, f| hard.push((a, b, f)));
+        assert_eq!(hard[0], (0, 2, true));
+        assert_eq!(hard.last().unwrap().1, long.len());
     }
 }

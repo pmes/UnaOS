@@ -410,7 +410,7 @@ mod tt {
         t.names = [nm(mono), nm(fam), nm(fam)];
     }
 
-    fn read_face(mt: &crate::fs::vfs::MountTable, p: &str) -> Result<Vec<u8>, &'static str> {
+    pub fn read_face(mt: &crate::fs::vfs::MountTable, p: &str) -> Result<Vec<u8>, &'static str> {
         let st = mt.stat(p).map_err(|_| "absent")?;
         let n = st.size as usize;
         if n == 0 || n > FACE_MAX {
@@ -606,5 +606,29 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("font", fixture);
+    }
+}
+
+/// KERNELFONT2 (B363): the directory (`DIR` or `DIR_CARD`) holding face `file`, read whole and parsed by
+/// `font_core` — what a ring-3 reader of the same volume (LUMEN.ELF) will find. `None` on a build without the
+/// desktop engine, or when the face is absent or refused.
+pub fn volume_face(file: &str) -> Option<&'static str> {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        let mt = crate::shell::vfs_mount_table();
+        for d in [DIR, DIR_CARD] {
+            let p = alloc::format!("{}/{}", d, file);
+            if let Ok(v) = tt::read_face(&mt, &p) {
+                if font_core::Font::parse(&v).is_ok() {
+                    return Some(d);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        let _ = file;
+        None
     }
 }
