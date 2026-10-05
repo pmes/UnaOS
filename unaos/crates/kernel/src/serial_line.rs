@@ -119,7 +119,7 @@ fn emit_src(args: fmt::Arguments, nl: bool, user: bool) {
         lb.n += 1;
     }
     let line = core::str::from_utf8(&lb.b[..lb.n]).unwrap_or("[serial] utf8?\n");
-    LINES.fetch_add(1, Relaxed); tag_note(&lb.b[..lb.n]); #[cfg(feature = "selfdiag")] crate::bootwit::note(&lb.b[..lb.n]); // SELFDIAG M1 (B324): the boot-log tap. QUIETBOOT M4: per-tag tally until the `:: BOOT:` line (same-line fold).
+    line_note(&lb.b[..lb.n]); #[cfg(feature = "selfdiag")] crate::bootwit::note(&lb.b[..lb.n]); // SELFDIAG M1 (B324): the boot-log tap. QUIETBOOT M4: per-tag tally until the `:: BOOT:` line (same-line fold).
     if user { SRC_USER.fetch_add(1, Relaxed); } else { SRC_EMIT.fetch_add(1, Relaxed); }
 
     let masked = irq_masked();
@@ -378,5 +378,64 @@ fn line_watch_check(text: &str) {
     let pre = unsafe { core::slice::from_raw_parts(p as *const u8, n) };
     if text.as_bytes().starts_with(pre) {
         WATCH_HIT.store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+// ── QUIETBOOT3 (rmbp-ledger B352, R80) — a LINE is what reaches a newline ─────────────────────────────────────
+// Boot 21 read `lines=1327` against a wire that carried 1144 lines to `:: BOOT:`: every `serial_print!` FRAGMENT
+// was counted as a line (the iGPU ladder's EDID dump is 8 rows x 17 `serial_print!` calls; `top=` even named a
+// tag `00` — the EDID's zero bytes). Now `LINES` counts an emit that ENDS in `\n` (every `serial_println!`, and
+// the fragment that closes a `serial_print!` line), and the per-tag tally keys on the fragment that OPENS a
+// line. `MID` is "the last emit left a line open"; cross-core interleave of fragments can mis-key a tag, never
+// double-count a line.
+static MID: AtomicBool = AtomicBool::new(false);
+
+fn line_note(b: &[u8]) {
+    let ends = b.last() == Some(&b'\n');
+    let opens = !MID.swap(!ends, Relaxed);
+    if ends { LINES.fetch_add(1, Relaxed); }
+    if opens { tag_note(b); }
+    if TAIL_ARM.load(Relaxed) { tail_note(b); }
+}
+
+// ── QUIETBOOT3 (B352) — THE GLASS SAYS WHAT THE WIRE SAYS ─────────────────────────────────────────────────────
+// While `tests` runs a fixture, every kernel line that carries a verdict arrow (`-> PASS`, `-> FAIL…`, `-> SKIP…`)
+// leaves its TAIL here — the text after the LAST `-> ` up to the line's closing ` ::`. `tests` prints that tail on
+// the console (`nethang -> PASS`), so the glass reads the wire's own word, never a paraphrase of a tally.
+static TAIL_ARM: AtomicBool = AtomicBool::new(false);
+const TAIL_MAX: usize = 120;
+static TAIL: spin::Mutex<([u8; TAIL_MAX], usize)> = spin::Mutex::new(([0; TAIL_MAX], 0));
+
+/// Arm the recorder for one fixture (clears the last tail).
+pub fn tail_arm() {
+    if let Some(mut t) = TAIL.try_lock() { t.1 = 0; }
+    TAIL_ARM.store(true, Relaxed);
+}
+
+/// Disarm and take the last verdict tail the fixture printed (`None` = it printed no verdict line).
+pub fn tail_take() -> Option<alloc::string::String> {
+    TAIL_ARM.store(false, Relaxed);
+    let t = TAIL.lock();
+    if t.1 == 0 { return None; }
+    core::str::from_utf8(&t.0[..t.1]).ok().map(alloc::string::String::from)
+}
+
+/// The tail of one verdict line: after the last `-> `, through the first ` ::` (or the line's end), trimmed.
+/// Only `PASS` / `FAIL` / `SKIP` tails count — a `-> gsi=22` route line is not a verdict.
+pub fn verdict_tail(line: &str) -> Option<&str> {
+    let at = line.rfind("-> ")?;
+    let rest = &line[at + 3..];
+    let rest = rest.split(" ::").next().unwrap_or(rest).trim_end_matches(['\n', '\r', ' ']);
+    if rest.starts_with("PASS") || rest.starts_with("FAIL") || rest.starts_with("SKIP") { Some(rest) } else { None }
+}
+
+fn tail_note(b: &[u8]) {
+    let Ok(s) = core::str::from_utf8(b) else { return };
+    let Some(v) = verdict_tail(s) else { return };
+    if let Some(mut t) = TAIL.try_lock() {
+        let mut k = v.len().min(TAIL_MAX);
+        while k > 0 && !v.is_char_boundary(k) { k -= 1; }
+        t.0[..k].copy_from_slice(&v.as_bytes()[..k]);
+        t.1 = k;
     }
 }
