@@ -216,11 +216,15 @@ pub struct StreamDecoder<'b> {
     pub stop: Option<Stop>,
     pub done: bool,
     pub text_bytes: usize,
+    /// LUMENUX M5: `message_start.message.usage` — `input_tokens` plus the cache read/creation counts.
+    pub input_tokens: Option<u32>,
+    /// LUMENUX M5: the last `message_delta.usage.output_tokens` (cumulative for the message).
+    pub output_tokens: Option<u32>,
 }
 
 impl<'b> StreamDecoder<'b> {
     pub fn new(line: &'b mut [u8]) -> Self {
-        StreamDecoder { line, n: 0, overflow: false, stop: None, done: false, text_bytes: 0 }
+        StreamDecoder { line, n: 0, overflow: false, stop: None, done: false, text_bytes: 0, input_tokens: None, output_tokens: None }
     }
 
     pub fn feed(&mut self, mut b: &[u8], on: &mut dyn FnMut(Event<'_>)) {
@@ -292,7 +296,19 @@ impl<'b> StreamDecoder<'b> {
                 let Some(t) = json::get(delta, "text") else { return };
                 Some((pick(t), true))
             }
+            "message_start" => {
+                if let Some(u) = json::get(d, "message").and_then(|m| json::get(m, "usage")) {
+                    let f = |k: &str| json::get(u, k).and_then(json::uint).unwrap_or(0);
+                    if json::get(u, "input_tokens").is_some() {
+                        self.input_tokens = Some(f("input_tokens").saturating_add(f("cache_read_input_tokens")).saturating_add(f("cache_creation_input_tokens")));
+                    }
+                }
+                None
+            }
             "message_delta" => {
+                if let Some(o) = json::get(d, "usage").and_then(|u| json::get(u, "output_tokens")).and_then(json::uint) {
+                    self.output_tokens = Some(o);
+                }
                 if let Some(sr) = json::get(d, "delta").and_then(|x| json::get(x, "stop_reason")).and_then(json::plain_str) {
                     let st = Stop::parse(sr);
                     self.stop = Some(st);
@@ -468,6 +484,20 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(run(&[r], 512), std::vec![E::S(Stop::Refusal)]);
         let long = std::format!("data: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}\ndata: {{\"type\":\"message_stop\"}}\n", "x".repeat(200));
         assert_eq!(run(&[long.as_bytes()], 64), std::vec![E::Drop, E::D]);
+    }
+
+    #[test]
+    fn stream_usage_counts() {
+        let s = b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":30,\"output_tokens\":1}}}\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":57}}\n";
+        let mut buf = std::vec![0u8; 512];
+        let mut d = StreamDecoder::new(&mut buf);
+        d.feed(s, &mut |_| {});
+        assert_eq!((d.input_tokens, d.output_tokens), (Some(42), Some(57)));
+        let mut buf2 = std::vec![0u8; 512];
+        let mut d2 = StreamDecoder::new(&mut buf2);
+        d2.feed(STREAM.as_bytes(), &mut |_| {});
+        assert_eq!((d2.input_tokens, d2.output_tokens), (None, Some(5)));
     }
 
     #[test]
