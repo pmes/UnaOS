@@ -20,17 +20,19 @@
 //! so no stale GPU TLB entry can exist and no TLB-invalidate register is needed. A mapping is cached per
 //! buffer and re-validated on every job by re-walking the CPU page tables; a moved frame takes fresh VA.
 //!
-//! CLEAN-ROOM. The instance-block words are `kepler.rs`'s UNAUDITED RAMFC layout (CLEAN_ROOM_POLICY §5),
-//! exactly as KBLIT reused them. Every GMMU, runlist, gpfifo, copy-class and host-semaphore encoding
-//! below is **[EXT-UNPINNED]** — recalled, no rnndb file opened — and marked at its definition. The
-//! boot's `selftest=` verdict is what pins or kills them; nothing here is claimed validated.
+//! CLEAN-ROOM. The instance-block words are `kepler.rs`'s RAMFC layout (CLEAN_ROOM_POLICY §5), exactly as
+//! KBLIT reused them. GPUBLIT2 (B383) pinned the runlist, channel-table, PTOP, gpfifo, copy-class and
+//! host-semaphore encodings as HARDWARE FACTS (LAWS §licence) with a pointer at each definition: NVIDIA's
+//! published open-gpu-doc (`cla0b5.h`, `cla06f.h`, gv100 `dev_ram`/`dev_pbdma`) and nouveau v6.10 file:line
+//! (read outside the repo; no text copied). The GMMU big-page span stays [EXT-UNPINNED]. The boot's
+//! `selftest=` verdict is what proves them; nothing here is claimed validated on the metal.
 //!
 //! KBLIT DEFECTS NOT CARRIED OVER (read against its `tests_kblit`): the channel IS bound in the PFIFO
 //! channel table; RUNLIST_SUBMIT is handed a RUNLIST page (not the instance block); LAUNCH_DMA carries
 //! the multi-line bit; the page table is indexed from the PDE's VA origin.
 
 use super::kepler::{mmio_read, mmio_write, VramAllocator};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 
 // ---- window layout (offsets from the window base, a VRAM offset) -------------------------------------
 
@@ -59,48 +61,68 @@ const SYS_PDES: usize = 4;
 const SYS_PAGES: usize = SYS_PDES * PT_ENTRIES;
 /// The channel id. Channel 1 is the fifo leg's (`kepler.rs`); 2 is free on every build. [TREE]
 const CHID: u32 = 2;
-/// The copy engine's runlist. **[EXT-UNPINNED]** hypothesis: CE0 schedules on runlist 1.
-const CE_RUNLIST: u32 = 1;
+// The copy engine's runlist, engine id and PMC reset bit are READ FROM PTOP at arm time (GPUBLIT2,
+// B383) — `ptop_ce` below, nouveau top/gk104.c:45-81. B371's `CE_RUNLIST = 1` was a hypothesis.
 
-// ---- encodings, every one [EXT-UNPINNED] --------------------------------------------------------------
+// ---- encodings (GPUBLIT2: pinned against nouveau v6.10 + NVIDIA open-gpu-doc; GMMU still unpinned) ----
 
-/// Copy class (KEPLER_DMA_COPY_A). KBLIT's number.
+/// Copy class KEPLER_DMA_COPY_A. // open-gpu-doc cla0b5.h:33
 const CLASS_COPY: u32 = 0x0000_A0B5;
+/// Host SET_OBJECT (NVCLASS 15:0). // open-gpu-doc cla06f.h:69-70
 const M_SET_OBJECT: u32 = 0x0000;
-const M_LAUNCH_DMA: u32 = 0x0300;
-const M_OFFSET_IN_UPPER: u32 = 0x0400; // IN_UPPER, IN_LOWER, OUT_UPPER, OUT_LOWER: four consecutive methods
-const M_PITCH_IN: u32 = 0x0410; // PITCH_IN, PITCH_OUT, LINE_LENGTH_IN, LINE_COUNT: four consecutive methods
-/// LAUNCH_DMA: non-pipelined transfer, flush, src pitch, dst pitch, MULTI-LINE (bit 9 — the bit KBLIT's
-/// `0x186` lacked, so its 256-row copy would have moved one line).
+const M_LAUNCH_DMA: u32 = 0x0300; // open-gpu-doc cla0b5.h:66
+const M_OFFSET_IN_UPPER: u32 = 0x0400; // cla0b5.h:123..129 IN_UPPER, IN_LOWER, OUT_UPPER, OUT_LOWER (0x400..0x40C)
+const M_PITCH_IN: u32 = 0x0410; // cla0b5.h:131..137 PITCH_IN, PITCH_OUT, LINE_LENGTH_IN, LINE_COUNT (0x410..0x41C)
+/// LAUNCH_DMA = DATA_TRANSFER_TYPE NON_PIPELINED (2, bits 1:0) | FLUSH_ENABLE (bit 2) | SRC_MEMORY_LAYOUT
+/// PITCH (bit 7) | DST_MEMORY_LAYOUT PITCH (bit 8) | MULTI_LINE_ENABLE (bit 9). // open-gpu-doc
+/// cla0b5.h:67-90. The bit KBLIT's `0x186` lacked is bit 9, so its 256-row copy would have moved one line.
 const LAUNCH_PITCH_MULTI: u32 = 0x0000_0386;
-/// Host (PBDMA) semaphore methods, valid on any subchannel: ADDR_HI, ADDR_LO, PAYLOAD, OPERATION.
+/// Host semaphore SEMAPHOREA..D (ADDR_HI, ADDR_LO, PAYLOAD, OPERATION). // open-gpu-doc cla06f.h:77-83
 const M_HOST_SEM: u32 = 0x0010;
-/// OPERATION = RELEASE after wait-for-idle.
+/// SEMAPHORED: OPERATION RELEASE (2, bits 3:0) | ACQUIRE_SWITCH (bit 12, inert on a release) |
+/// RELEASE_WFI EN (bit 20 = 0) | RELEASE_SIZE 16BYTE (bit 24 = 0). // open-gpu-doc cla06f.h:84-97
 const SEM_RELEASE_WFI: u32 = 0x0000_1002;
-/// USERD GP_GET / GP_PUT (KBLIT's IB_GET / IB_PUT, the envytools "channel control area" pair KF27 read).
+/// USERD GP_GET / GP_PUT. // nouveau gf100.c:129-130 (`gf100_chan_userd_clear` 0x088 / 0x08c)
 const USERD_GP_GET: usize = 0x88;
 const USERD_GP_PUT: usize = 0x8C;
-/// PFIFO channel table, RUNLIST_SUBMIT, PBDMA enable. [TREE] — the words `kepler.rs`'s fifo leg writes.
+/// The channel table `0x800000 + chid*8`: lo = VALID 0x80000000 | inst >> 12, hi = RUNLIST in bits
+/// 16..19, ENABLE_SET bit 10. // nouveau gk104.c:52,68,77
 const PFIFO_CHAN: usize = 0x80_0000;
+const CHAN_HI_RUNLIST_SHIFT: u32 = 16; // nouveau gk104.c:77 (`mask 0x000f0000, runl->id << 16`)
+const CHAN_HI_RUNLIST_MASK: u32 = 0x000F_0000; // nouveau gk104.c:77
+const CHAN_HI_ENABLE_SET: u32 = 0x0000_0400; // nouveau gk104.c:52
+/// RUNLIST_SUBMIT pair: base = target << 28 | addr >> 12 (VRAM 0); submit = runl << 20 | count.
+/// // nouveau gk104.c:446-447
 const RUNLIST_BASE: usize = 0x2270;
 const RUNLIST_SUBMIT: usize = 0x2274;
+/// Per-runlist pending bit: `0x2284 + rl*8` & 0x00100000. // nouveau gk104.c:426
+const RUNLIST_INFO: usize = 0x2284;
+const RUNLIST_PENDING: u32 = 0x0010_0000;
 const PMC_ENABLE: usize = 0x200;
+/// PBDMA enable mask. // nouveau gk104.c:739
 const PMC_PBDMA_ENABLE: usize = 0x204;
-/// OR-ed into PMC_ENABLE: PFIFO (0x100, [TREE]) and CE0 (0x40, [EXT-UNPINNED]). Both bits read SET on
-/// flight 22 (`pmc_en=E011316D`), so the write is expected to be a no-op re-assertion; no bit is cleared.
-const PMC_BITS: u32 = 0x100 | 0x40;
+/// PFIFO's PMC bit. // nouveau mc/gk104.c `gk104_mc_reset` { 0x00000100, NVKM_ENGINE_FIFO }
+const PMC_PFIFO: u32 = 0x100;
+/// PTOP device-info table, 64 words. // nouveau top/gk104.c:37,45
+const PTOP_INFO: usize = 0x02_2700;
 
 #[inline]
 fn pb_hdr(subc: u32, method: u32, count: u32) -> u32 {
-    // Fermi+ "increasing methods" header. [EXT-UNPINNED] (KBLIT's encoding).
+    // SEC_OP INC_METHOD (1, bits 31:29) | METHOD_COUNT 28:16 | SUBCHANNEL 15:13 | ADDRESS 11:0 (dwords).
+    // open-gpu-doc cla06f.h:160-174
     0x2000_0000 | (count << 16) | (subc << 13) | (method >> 2)
 }
-/// PDE: no big-page table (dw0 = 0); small-page table pointer in dw1, `addr >> 8 | 1` (VRAM). [EXT-UNPINNED]
+/// PDE: no big-page table (dw0 = 0); small-page table pointer in dw1, `addr >> 8 | 1` (VRAM).
+/// Matches nouveau vmmgf100.c:126-138 (`gf100_vmm_pgd_pde`: SPT target VRAM `1 << 32`, `addr << 24`).
 #[inline]
 fn pde(spt: usize) -> (u32, u32) {
     (0, ((spt >> 8) as u32) | 1)
 }
-/// PTE: `addr >> 8 | VALID`; aperture in dw1 bits 0..1 (0 VRAM, 2 sysmem coherent). [EXT-UNPINNED]
+/// PTE: `addr >> 8 | VALID`; dw1 for sysmem = 2. GPUBLIT2 READ, NOT CHANGED (one change per boot):
+/// nouveau vmmgf100.c:314-318 puts VOL at bit 32 and the APERTURE at bits 33.. (HOST = 2, vmmgf100.c:327),
+/// so a coherent-sysmem PTE's dw1 is `1 | 2 << 1` = 5; our 2 encodes aperture 1. VRAM (dw1 = 0) is right,
+/// and the GPFIFO + pushbuffers are VRAM, so this cannot stop the fetch; it is the next wall after it
+/// (the self-test's heap source). Owed: docs/dev/evidence/rmbp-1005/gpublit2.md.
 #[inline]
 fn pte(pa: u64, sysmem: bool) -> (u32, u32) {
     (((pa >> 8) as u32) | 1, if sysmem { 2 } else { 0 })
@@ -126,6 +148,15 @@ static BUSY: AtomicU64 = AtomicU64::new(0);
 static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static UNMAPPABLE: AtomicU64 = AtomicU64::new(0);
 static SYSMAPS: AtomicU64 = AtomicU64::new(0);
+/// GPUBLIT2: the PTOP copy engine this channel runs on — CE index (type - 1), engine id, runlist, PMC
+/// reset bit (`NONE` when PTOP gave none) — and the runlist commit's pending time.
+const NONE: u32 = u32::MAX;
+static CE_IDX: AtomicU32 = AtomicU32::new(NONE);
+static CE_ENG: AtomicU32 = AtomicU32::new(NONE);
+static CE_RL: AtomicU32 = AtomicU32::new(NONE);
+static CE_RESET: AtomicU32 = AtomicU32::new(NONE);
+static COMMIT_US: AtomicU32 = AtomicU32::new(NONE);
+static PMC_PRE: AtomicU32 = AtomicU32::new(0);
 
 const NCACHE: usize = 16;
 const MAXP: usize = 1024; // 4 MiB per mapping; a larger source is a CPU job
@@ -239,6 +270,13 @@ pub fn arm(bar0: usize, bar1: usize, bar1_size: usize, vram_size: usize, fb_offs
     if vhi > core::cmp::min(bar1_size, vram_size) {
         return refuse("window-beyond-bar1");
     }
+    // GPUBLIT2: the CE's runlist / engine / reset bit from PTOP, as nouveau reads them. No CE0/CE1 in the
+    // table is a refusal: the channel cannot be placed on a runlist the spec does not name.
+    let Some(ce) = ptop_ce() else { return refuse("ptop-no-ce") };
+    CE_IDX.store(ce.idx, Release);
+    CE_ENG.store(ce.engine, Release);
+    CE_RL.store(ce.runlist, Release);
+    CE_RESET.store(ce.reset, Release);
     WIN.store(w, Release);
     VLO.store(vlo, Release);
     VHI.store(vhi, Release);
@@ -291,8 +329,11 @@ fn build(w: usize, vlo: usize, vhi: usize) {
         vw(w + W_PT0 + idx * 8 + 4, e1);
         p += 0x1000;
     }
-    // Instance block: kepler.rs's UNAUDITED RAMFC words, pointed at this window, plus the page
-    // directory (inst+0x200 base, +0x208 limit). [EXT-UNPINNED]
+    // Instance block: kepler.rs's RAMFC words, pointed at this window, plus the page directory
+    // (inst+0x200 base, +0x208 limit: nouveau vmmgf100.c:342-360 `gf100_vmm_join_`, VRAM target 0).
+    // GPUBLIT2 read them against nouveau gk104.c:88-102 `gk104_chan_ramfc_write` and DID NOT change them
+    // (one change per boot): +0x0C carries an extra 0x80000000 (nouveau: upper address bits only), +0x94
+    // lacks devm 0xfff, and +0xE4 (0x20), +0xF8 (0x10003080), +0xFC (0x10000010) are not written. Owed.
     let (inst, userd, gpf, pd) = (w + W_INST, w + W_USERD, w + W_GPFIFO, w + W_PD);
     vw(inst + 0x08, userd as u32);
     vw(inst + 0x0C, ((userd >> 32) as u32) | 0x8000_0000);
@@ -310,20 +351,90 @@ fn build(w: usize, vlo: usize, vhi: usize) {
     vw(inst + 0x204, (pd >> 32) as u32);
     vw(inst + 0x208, 0xFFFF_FFFF);
     vw(inst + 0x20C, 0x0000_00FF);
-    // Runlist: one entry, our channel. [EXT-UNPINNED] entry = (chid, 0).
+    // Runlist: one entry, our channel: (chid, 0). // nouveau gk104.c:454-455
     vw(w + W_RUNL, CHID);
     vw(w + W_RUNL + 4, 0);
-    // PMC + PBDMA enable ([TREE] the fifo leg's two writes; PMC is OR-only).
-    mw(PMC_ENABLE, mr(PMC_ENABLE) | PMC_BITS);
+    // PMC + PBDMA enable, OR-only: PFIFO and the CE's PTOP reset bit (nouveau mc/base.c:57, BIT(reset)).
+    let rl = CE_RL.load(Acquire);
+    let reset = CE_RESET.load(Acquire);
+    let ce_bit = if reset < 32 { 1u32 << reset } else { 0 };
+    let pmc_pre = mr(PMC_ENABLE);
+    PMC_PRE.store(pmc_pre, Release);
+    mw(PMC_ENABLE, pmc_pre | PMC_PFIFO | ce_bit);
     mw(PMC_PBDMA_ENABLE, 0xFFFF_FFFF);
-    // Bind: clear, enable, VALID | inst page — the order the fifo leg uses (kepler.rs). [TREE]
+    // GPUBLIT2 (B383) — THE CHANGE. Bind in nouveau's order: unbind; the channel's RUNLIST into the hi
+    // word (B371 wrote the whole word 0x400, leaving runlist 0 = GR's: flight 23 read `11000001`);
+    // VALID | inst page; commit the runlist; only then ENABLE_SET.
+    // nouveau gk104.c:60 (unbind), :77 + :68 (gk104_chan_bind), :446-447 (commit), :52 (start).
     let c = PFIFO_CHAN + CHID as usize * 8;
     mw(c, 0);
-    mw(c + 4, 0x0000_0400);
+    mw(c + 4, (mr(c + 4) & !CHAN_HI_RUNLIST_MASK) | ((rl << CHAN_HI_RUNLIST_SHIFT) & CHAN_HI_RUNLIST_MASK));
     mw(c, 0x8000_0000 | ((inst >> 12) as u32));
     // Runlist submit: base page (VRAM target 0), then (runlist << 20) | entries.
     mw(RUNLIST_BASE, ((w + W_RUNL) >> 12) as u32);
-    mw(RUNLIST_SUBMIT, (CE_RUNLIST << 20) | 1);
+    mw(RUNLIST_SUBMIT, (rl << 20) | 1);
+    // The commit's pending bit, bounded 2 ms on the TSC (nouveau nv50_runl_wait polls the same bit).
+    let t0 = crate::arch::now_cycles();
+    let lim = tsc_hz() / 500;
+    let pend = RUNLIST_INFO + rl as usize * 8;
+    loop {
+        let dt = crate::arch::now_cycles().saturating_sub(t0);
+        if mr(pend) & RUNLIST_PENDING == 0 {
+            COMMIT_US.store(cyc_us(dt) as u32, Release);
+            break;
+        }
+        if dt >= lim {
+            break; // COMMIT_US stays NONE: "stuck" on the dump
+        }
+        core::hint::spin_loop();
+    }
+    mw(c + 4, mr(c + 4) | CHAN_HI_ENABLE_SET);
+}
+
+/// One PTOP device: the CE this channel runs on.
+#[derive(Clone, Copy)]
+struct CeTop {
+    idx: u32,
+    engine: u32,
+    runlist: u32,
+    reset: u32,
+}
+
+/// Walk the PTOP device-info table exactly as nouveau `gk104_top_parse` does (top/gk104.c:37-81) and
+/// return CE0 (engine type 1), else CE1 (type 2). CE2 (type 3) is NOT taken: on Kepler it is the GR
+/// copy engine and shares GR's runlist with the fifo leg's channel.
+fn ptop_ce() -> Option<CeTop> {
+    let (mut ty, mut eng, mut rl, mut rst) = (NONE, NONE, NONE, NONE);
+    let mut best: Option<CeTop> = None;
+    for i in 0..64 {
+        let d = mr(PTOP_INFO + i * 4); // top/gk104.c:45
+        match d & 3 {
+            0 => continue, // NOT_VALID, top/gk104.c:48
+            1 => {}        // DATA (fault/addr), top/gk104.c:50
+            2 => {
+                // ENUM, top/gk104.c:56-64
+                if d & 0x20 != 0 {
+                    eng = (d & 0x3c00_0000) >> 26;
+                }
+                if d & 0x10 != 0 {
+                    rl = (d & 0x01e0_0000) >> 21;
+                }
+                if d & 0x04 != 0 {
+                    rst = (d & 0x0000_3e00) >> 9;
+                }
+            }
+            _ => ty = (d & 0x7fff_fffc) >> 2, // ENGINE_TYPE, top/gk104.c:66
+        }
+        if d & 0x8000_0000 != 0 {
+            continue; // chained: more words for this device, top/gk104.c:71
+        }
+        // types 1/2 = CE0/CE1, top/gk104.c:79-80
+        if (ty == 1 || ty == 2) && rl != NONE && best.map_or(true, |b| ty - 1 < b.idx) {
+            best = Some(CeTop { idx: ty - 1, engine: eng, runlist: rl, reset: rst });
+        }
+        (ty, eng, rl, rst) = (NONE, NONE, NONE, NONE);
+    }
+    best
 }
 
 // ---- submission ----------------------------------------------------------------------------------------
@@ -357,6 +468,7 @@ fn submit(ch: &mut Chan, build: impl FnOnce(&mut dyn FnMut(u32)) -> ()) -> u32 {
         push(SEM_RELEASE_WFI);
     }
     let len = core::cmp::min(n, PUSH_SLOT / 4) as u32;
+    // GP entry: ENTRY0 GET 31:2 (address), ENTRY1 GET_HI 7:0 | LENGTH 30:10 (dwords). // cla06f.h:139-148
     let e = w + W_GPFIFO + (ch.put % GPFIFO_N) as usize * 8;
     vw(e, (slot as u32) & 0xFFFF_FFFC);
     vw(e + 4, ((slot >> 32) as u32) | (len << 10));
@@ -677,7 +789,7 @@ fn detail(st: &StOut) {
     let (w, c) = (win(), PFIFO_CHAN + CHID as usize * 8);
     serial_println!(
         "[gpublit] chid={} runlist={} win={:#x} vram_id={:#x}..{:#x} gp_get={} gp_put={} sem={:08X} chan={:08X}/{:08X} pmc={:08X} pbdma={:08X} rl={:08X}/{:08X}",
-        CHID, CE_RUNLIST, w, VLO.load(Relaxed), VHI.load(Relaxed),
+        CHID, CE_RL.load(Relaxed), w, VLO.load(Relaxed), VHI.load(Relaxed),
         vr(w + W_USERD + USERD_GP_GET), vr(w + W_USERD + USERD_GP_PUT), vr(w + W_SEM),
         mr(c), mr(c + 4), mr(PMC_ENABLE), mr(PMC_PBDMA_ENABLE), mr(RUNLIST_BASE), mr(RUNLIST_SUBMIT)
     );
