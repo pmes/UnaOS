@@ -522,6 +522,8 @@ impl audio_core::Read for VfsSrc {
             Err(_) => Err(audio_core::Error::Invalid("vfs read")),
         }
     }
+    fn seek(&mut self, off: u64) -> audio_core::Result<bool> { self.off = off; Ok(true) } // SEEKTABLE (B433): a VFS file is random-access
+    fn len(&self) -> Option<u64> { crate::shell::vfs_mount_table().stat(&self.path).ok().map(|s| s.size) }
 }
 
 // MP3HANG (rmbp B373): the coded player's state, its decode and its verdict live at the file TAIL (`dec_*`):
@@ -702,7 +704,7 @@ fn dec_task(arg: usize) {
     let t0 = crate::arch::ms();
     let mut calls = 0u32;
     let mut waited_ms = 0u64;
-    let mut skip = seek_skip(jid, info.rate); // PLAYER (B419): a seek's decode-skip (0 for every other open)
+    let mut skip = seek_table(jid, &mut dec, info.rate); // PLAYER (B419): a seek's decode-skip (0 for every other open)
     loop {
         if !mine() { dec_exit(jid, paint, "aborted"); return; }
         // the bounded queue: decode ahead no further than DEC_QUEUE; a consumer gone for DEC_ORPHAN_MS ends the task
@@ -1069,10 +1071,9 @@ fn tq_tick() {
 // ── PLAYER (rmbp-ledger B419, MACPARITY row 30) — the transport the Player window drives: pause, seek, position ──────
 // The window is `video/player.rs`; the play stays here. Pause clears the stream's RUN bit (the amp ramped down first)
 // and `ring_pump` leaves a paused stream alone; the decoder waits instead of calling its consumer gone. Seek: a WAV
-// re-arms the stream at the target frame (`method=pcm-exact`); a coded file has NO seek table in audio_core (and
-// `demux_core::Demuxer::seek` is the video container's keyframe seek — audio_core's MP4 does not route through it),
-// so a superseding `play-dec` job decodes from the start and drops the frames before the target (`method=decode-skip
-// table=none`): exact, at the cost of decode time. Design: docs/dev/evidence/rmbp-1005/player.md.
+// re-arms the stream at the target frame (`method=table table=pcm`); a coded file is reopened by a superseding
+// `play-dec` job that seeks through audio_core's table (SEEKTABLE B433, `seek_table` at the tail), or — a format with
+// no table — decodes from the start and drops the frames before the target (`method=decode-skip table=none`). Design: docs/dev/evidence/rmbp-1005/player.md.
 
 static PAUSED: AtomicBool = AtomicBool::new(false);
 /// The job a seek's skip belongs to (the jid `dec_open` is about to mint) and the target in ms.
@@ -1085,7 +1086,7 @@ fn seek_skip(jid: u32, rate: u32) -> u64 {
     let ms = SEEK_MS.load(Ordering::Acquire);
     let frames = ms * rate as u64 / 1000;
     let landed = if rate == 0 { 0 } else { frames * 1000 / rate as u64 };
-    serial_println!("[play] seek to_ms={} landed_ms={} method=decode-skip table=none frames={} jid={} (audio_core has no seek table)", ms, landed, frames, jid);
+    serial_println!("[play] seek to_ms={} landed_ms={} method=decode-skip table=none frames={} jid={} (no seek table for this format)", ms, landed, frames, jid);
     frames
 }
 
@@ -1160,17 +1161,17 @@ pub fn seek_to(path: &str, ms: u64) -> Result<(u64, &'static str), String> {
         let eff = start(w.rate, w.ch as u8, w.bits as u8).map_err(String::from)?;
         w.pos = frame * fin;
         w.start = w.pos;
-        serial_println!("[play] seek to_ms={} landed_ms={} method=pcm-exact table=pcm frame={} of {} eff_rate={} path={}", ms, landed, frame, total, eff, path);
+        serial_println!("[play] seek to_ms={} landed_ms={} method=table table=pcm exact=1 byte={} sample={} of {} eff_rate={} path={}", ms, landed, frame * fin, frame, total, eff, path);
         *WAV.lock() = Some(w);
         ACTIVE.store(true, Ordering::Release);
-        return Ok((landed, "pcm-exact"));
+        return Ok((landed, "table"));
     }
     // coded: supersede the live job (its `mine()` goes false at its next step; its exit leaves the new job's liveness)
     DEC_LIVE.store(false, Ordering::Release);
     SEEK_MS.store(ms, Ordering::Release);
     SEEK_JID.store(DEC_GEN.load(Ordering::Acquire).wrapping_add(1), Ordering::Release);
     dec_open(path, String::from("seek: not a PCM WAV"))?;
-    Ok((ms, "decode-skip"))
+    Ok((ms, "coded")) // SEEKTABLE (B433): the `play-dec` job seeks (its `[play] seek … method=` line); `seek_result` reads it
 }
 
 /// The Player's open: whatever plays stops (a live decoder is aborted and superseded, never "busy"), then the
@@ -1200,3 +1201,39 @@ pub fn pump_until(ms: u64, until: impl Fn() -> bool) -> bool {
 
 /// The PLAYWAV fixture's 2.0 s, 48 kHz stereo body (for `tests player` when no TEST.WAV is staged).
 pub fn fixture_wav() -> Vec<u8> { synth_wav() }
+
+// ── SEEKTABLE (rmbp-ledger B433) — a coded seek from the container's own index ─────────────────────────────────
+// `play-dec` asks `audio_core::Decoder::seek` once, after the open: the core repositions `VfsSrc` at a sync point
+// found from the file's own table (FLAC SEEKTABLE/frame headers, MP3 Xing/VBRI/CBR, the MP4 sample table, PCM) and
+// drops the residual itself. A format with no table here (Ogg, ADTS) keeps PLAYER's decode-skip. Design:
+// docs/dev/evidence/rmbp-1005/seektable.md.
+
+/// The last coded seek's verdict: (jid, method, table, landed_ms, exact).
+static SEEK_DONE: spin::Mutex<Option<(u32, &'static str, &'static str, u64, bool)>> = spin::Mutex::new(None);
+
+/// `play-dec`'s seek for job `jid`: the table seek (0 frames left to drop) or, without a table, the decode-skip.
+fn seek_table(jid: u32, dec: &mut audio_core::Decoder, rate: u32) -> u64 {
+    if SEEK_JID.load(Ordering::Acquire) != jid || jid == 0 { return 0; }
+    let ms = SEEK_MS.load(Ordering::Acquire);
+    match dec.seek(ms) {
+        Ok(Some(p)) => {
+            let landed = p.landed_ms(rate);
+            serial_println!("[play] seek to_ms={} landed_ms={} method=table table={} exact={} byte={} sample={} jid={}", ms, landed, p.table, p.exact as u8, p.byte, p.landed, jid);
+            *SEEK_DONE.lock() = Some((jid, "table", p.table, landed, p.exact));
+            0
+        }
+        r => {
+            if let Err(e) = r { serial_println!("[play] seek table error={:?} jid={} (falls back to decode-skip)", e, jid); }
+            let f = seek_skip(jid, rate);
+            *SEEK_DONE.lock() = Some((jid, "decode-skip", "none", if rate == 0 { 0 } else { f * 1000 / rate as u64 }, true));
+            f
+        }
+    }
+}
+
+/// The coded seek's verdict for the job `seek_to` last minted: `(method, table, landed_ms, exact)`, `None` until
+/// `play-dec` has taken it.
+pub fn seek_result() -> Option<(&'static str, &'static str, u64, bool)> {
+    let want = SEEK_JID.load(Ordering::Acquire);
+    SEEK_DONE.lock().filter(|r| r.0 == want).map(|r| (r.1, r.2, r.3, r.4))
+}

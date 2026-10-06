@@ -31,7 +31,14 @@ M4 MP4 AAC + `demux_core::seek_track`. M5 host KATs over test-f + the FLAC subse
 **Witness (the wire a metal boot prints).** A coded seek from the Player:
 `[play] seek to_ms=<n> landed_ms=<n> method=table table=<flac|xing|vbri|cbr|mp4|pcm> exact=<0|1> byte=<n> sample=<n> jid=<n>`;
 a WAV seek `… method=table table=pcm exact=1 …`; `tests player` → `:: PLAYER: open=ok transport=ok seek=ok method=table
-… -> PASS ::` (plus `coded=<table>` informational when TEST.FLAC is staged and the decoder job answers).
+… -> PASS ::`. `tests player` does NOT seek a coded file (R80, and DECJOBHANG: a coded job still wedges on metal);
+the coded witness is the Player scrubbing a FLAC/MP3/M4A by hand. `play::seek_result()` holds the job's verdict.
+
+**Host proof (M5).** `cargo test --release -p audio_core -p demux_core` exit 0: WAV/AIF/synth bit-exact; TEST.FLAC
+(no SEEKTABLE: header bisection) and 54 FLAC subset files (34 with SEEKTABLE) bit-exact at 4 targets each; TEST.MP3
+`xing` (exact=0, within one frame), the same frames under a built VBRI tag (exact=1, PCM-identical) and untagged
+(`cbr`, within one frame); TEST.M4A `mp4` exact=1, PCM-identical; demux_core `seek_track` on TEST.M4A pins the unit
+whose pre-roll is audio_core's (byte 997 at 200 ms).
 
 **Owed.** Ogg (Opus/Vorbis/Ogg-FLAC: a granule bisection over pages — falls back to decode-skip, said on the wire as
 `table=none`), ADTS (no index; a header walk), MP3-in-MP4 seeks through the concatenated stream's CBR/Xing path;
