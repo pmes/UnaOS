@@ -17262,7 +17262,7 @@ impl XhciController {
         if let Some((code, residue)) = usbnet::take_done() {
             if code == 1 || code == 13 {
                 let rxl = usbnet::rx_len(); // USBNET5 M1: 20/24/26 KiB for the AX88179, 2 KiB for ECM
-                let n = rxl.saturating_sub(residue as usize);
+                let n = usbnet::rx_take_len(residue); // USBNET9 M2: a carried burst's head (from a reset's Stopped TD) plus this TD's bytes
                 usbnet::note_xfer(n); // USBNET7: every IN completion counted, the sub-4-byte ones too (they were silent)
                 dma_coherency::inval(rx_phys as usize, rxl);
                 let frame = unsafe { core::slice::from_raw_parts(rx_phys as *const u8, n.min(rxl)) };
@@ -17272,7 +17272,7 @@ impl XhciController {
             }
         }
         if !usbnet::armed() {
-            dma_coherency::clean(rx_phys as usize, usbnet::rx_len());
+            let (td_off, td_len) = usbnet::rx_td(); dma_coherency::clean(rx_phys as usize, usbnet::rx_len()); // USBNET9 M2: after a carried Stop the TD continues the burst at the offset where the stopped one ended
             let wait_trb_phys = {
                 let ring = match self.slots[slot as usize].bulk_in_ring.as_mut() { Some(r) => r, None => return };
                 let base = ring.get_ptr();
