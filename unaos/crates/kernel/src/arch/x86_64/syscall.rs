@@ -30304,6 +30304,7 @@ fn appquit_bound_task(arg: usize) {
     let settle = if appquit_pid(owner) == Some(pid) { wc_close_click(win, owner) } else { "exited" };
     APPQUIT_PENDING.fetch_and(!(1u64 << owner), Ordering::AcqRel);
     serial_println!("[sysmenu] quit owner={:#x} answer=killed-after-ms={} settle={}", owner, una_abi::CLOSE_REQ_BOUND_MS, settle);
+}
 
 // =====================================================================================================
 // WINDOWCAP3 (rmbp-ledger B399, R90) — the per-slot sidecars' warm-up, the row predicates and the process
