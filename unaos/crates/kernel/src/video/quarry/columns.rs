@@ -252,12 +252,14 @@ pub(super) struct Cols {
 }
 
 /// The ONE column layout: the painter and the header press both read it. Columns degrade rather
-/// than overlap — SIZE, then MODIFIED (the pre-QUARRY2 thresholds exactly), then ORIGIN (in the Trash)
-/// and TYPE only while the name keeps [`NAME_FLOOR_WIDE`] columns. Pure.
+/// than overlap — SIZE, then MODIFIED (the pre-QUARRY2 thresholds exactly), then TYPE only while the name
+/// keeps [`NAME_FLOOR_WIDE`] columns; the Trash takes ORIGIN and TYPE first (SMALLFIX2). Pure.
 pub(super) fn layout(g: &Geom, li: Rect, lsb: usize, w: &Widths, trash: bool) -> Cols {
     let cell_w = g.cell_w().max(1);
     let total = li.w.saturating_sub(lsb).saturating_sub(2 * PAD()) / cell_w;
-    let prio: &[Col] = if trash { &[Col::Size, Col::Modified, Col::Origin, Col::Type] } else { &[Col::Size, Col::Modified, Col::Type] };
+    // SMALLFIX2 (B391): the Trash ranks its OWN column first — ORIGIN, then TYPE, then SIZE, MODIFIED — so a panel one
+    // column short of all four (the rMBP at 2.5: the chrome cell rounds 22.5 up to 23) drops MODIFIED, never ORIGIN.
+    let prio: &[Col] = if trash { &[Col::Origin, Col::Type, Col::Size, Col::Modified] } else { &[Col::Size, Col::Modified, Col::Type] };
     let mut chosen = [false; 5];
     let mut used = 0usize;
     for &c in prio {
@@ -636,7 +638,11 @@ fn names(list: &[DirEnt]) -> String {
 /// Leg: the column layout carries TYPE everywhere and ORIGIN in the Trash on the bench panel, the
 /// header press maps back onto the painter's columns, and the narrow panel degrades. `Err` names it.
 fn leg_columns() -> Result<&'static str, String> {
-    let big = super::geometry(1920, 1200).ok_or("no geometry for 1920x1200")?;
+    // SMALLFIX2 (B391): the fixture is the bench panel in LOGICAL px. Since UIMETRICS Quarry is physical px at the dpi
+    // scale, and KFONTPPI (merge16) re-latched the rMBP from 1.0 to 2.5 — so a physical 1920x1200 fixture was a
+    // 768x480-logical panel on which TYPE correctly degrades (flights 24/25: `plain list cols=[Size, Modified]`).
+    let (bw, bh) = (crate::ui::px(1920), crate::ui::px(1200));
+    let big = super::geometry(bw, bh).ok_or("no geometry for the logical 1920x1200 bench panel")?;
     let li = big.list_pane().inner();
     let c = layout(&big, li, 0, &DEFAULT_WIDTHS, false);
     let has = |c: &Cols, k: Col| c.cols.iter().any(|t| t.0 == k);
@@ -644,6 +650,9 @@ fn leg_columns() -> Result<&'static str, String> {
         return Err(alloc::format!("plain list cols={:?}", c.cols.iter().map(|t| t.0).collect::<Vec<_>>()));
     }
     let t = layout(&big, li, 0, &DEFAULT_WIDTHS, true);
+    let names_of = |c: &Cols| c.cols.iter().map(|t| t.0.label()).collect::<Vec<_>>().join("+");
+    let s2 = crate::video::dpi::s2();
+    serial_println!("[quarry2] fixture panel={}x{} scale={}.{} plain={} trash={}", bw, bh, s2 / 2, if s2 % 2 == 1 { 5 } else { 0 }, names_of(&c), names_of(&t));
     if !has(&t, Col::Type) || !has(&t, Col::Origin) {
         return Err(alloc::format!("trash list cols={:?} name_cols={}", t.cols.iter().map(|t| t.0).collect::<Vec<_>>(), t.name_cols));
     }
@@ -655,7 +664,7 @@ fn leg_columns() -> Result<&'static str, String> {
     if header_hit(&t, t.name_x + 1) != Some(Col::Name) {
         return Err(String::from("header hit on NAME"));
     }
-    let small = super::geometry(640, 480).ok_or("no geometry for 640x480")?;
+    let small = super::geometry(crate::ui::px(640), crate::ui::px(480)).ok_or("no geometry for the logical 640x480 panel")?; // SMALLFIX2: logical, as above
     let s = layout(&small, small.list_pane().inner(), 0, &DEFAULT_WIDTHS, true);
     if s.name_cols < NAME_FLOOR_MOD.min(NAME_FLOOR_SIZE) && !s.cols.is_empty() {
         return Err(alloc::format!("small panel squeezed the name to {}", s.name_cols));
