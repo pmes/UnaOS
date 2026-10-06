@@ -5699,7 +5699,7 @@ fn composite_inner() -> CursorTail {
                             }
                         }
                         if let Some(b) =
-                            super::dock::Layout::for_panel(sprite_dock_tiles, info.width, info.height)
+                            super::dock::Layout::for_glass(sprite_dock_tiles, info.width, info.height)
                                 .map(|l| l.rect())
                         {
                             if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
@@ -18101,7 +18101,7 @@ fn occ_clip(rows: &[Window], i: usize, shell: u32, pw: usize, ph: usize) -> OccC
         // `crystal` were already declared on that gate; this is the consumer catching up.
         #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
         {
-            let rect = super::dock::Layout::for_panel(dock_tiles(rows), pw, ph).map(|l| l.rect());
+            let rect = super::dock::Layout::for_glass(dock_tiles(rows), pw, ph).map(|l| l.rect());
             // WCK4-D1's lesson, restated on this side: the strip's geometry goes on the wire whether
             // or not there IS one, so `occclip_dock=0` beside a live strip is loud rather than silent.
             // Published from the same `rect` the clip is built from, and BEFORE the overlap test — a
@@ -30301,4 +30301,37 @@ fn alloc_slot(t: &mut Table) -> Option<usize> {
     t.rows.push(Window::empty());
     ROWS_HWM.store(t.rows.len(), core::sync::atomic::Ordering::Release);
     Some(t.rows.len() - 1)
+}
+
+/// DOCK2 (B394) — **a minimised window's thumbnail**: the window's own surface (the one the compositor blits),
+/// sampled nearest-neighbour and aspect-fit into `out` (`tw` x `th`, logical `0x00RRGGBB`); the letterbox is left
+/// untouched. Under the table lock, bounded by `surf_len` like `draw_window`'s read. `false` = no row or no surface.
+pub fn thumb(id: WinId, out: &mut [u32], tw: usize, th: usize) -> bool {
+    let t = table();
+    let Some(r) = row(&t, id) else { return false };
+    if r.surf == 0 || r.w == 0 || r.h == 0 || r.stride < 4 || tw == 0 || th == 0 || out.len() < tw * th {
+        return false;
+    }
+    let (sw, sh) = (r.w.min(r.stride / 4), r.h.min(r.surf_len / r.stride));
+    if sw == 0 || sh == 0 {
+        return false;
+    }
+    // Aspect fit: the larger of the two ratios decides, the other axis is centred.
+    let (dw, dh) = if sw * th >= sh * tw { (tw, (sh * tw / sw).max(1)) } else { ((sw * th / sh).max(1), th) };
+    let (ox, oy) = ((tw - dw) / 2, (th - dh) / 2);
+    let p = r.surf as *const u8;
+    for v in 0..dh {
+        let sy = v * sh / dh;
+        for u in 0..dw {
+            let sx = u * sw / dw;
+            let off = sy * r.stride + sx * 4;
+            if off + 4 > r.surf_len {
+                continue;
+            }
+            // SAFETY: `off + 4 <= surf_len`, the real byte length of the mapped slot (the bound `draw_window` reads under).
+            let px: u32 = unsafe { core::ptr::read_unaligned(p.add(off) as *const u32) };
+            out[(oy + v) * tw + ox + u] = px & 0x00FF_FFFF;
+        }
+    }
+    true
 }
