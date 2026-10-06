@@ -92,7 +92,7 @@ The CE's 2 MiB table is VRAM inside the window, reached only through BAR1 identi
 1. `:: GPUBLIT: selftest=` — `ok` -> `[wc] blitter=gpu`, then `tests blitter` `:: KCOMP: blitter=gpu ... gpu_us=<n>` is the win.
 2. On non-ok: `[gpublit] walls ... bind_pre= bind_post= r2254= r2630= ...` -> §3 step 1-2.
 3. `[gpublit] host ... commit_us= ramfc_get= pb2=...` -> step 2-3.
-4. `[gpublit] decode pfifo_intr=<w>[names] fault=... pb2_intr0=[names]` -> step 4.
+4. `[kfifo] decode chid=2 pfifo_intr=<w>[names] bind=... pbdma_intr=... mmu=... fault=...` -> step 4 (KEPLERGR M2 lifted the decode; the `[gpublit] decode` line is gone — SMALLFIX4).
 5. The falcon fold (`family=ucode ... POISON`) is NOT this arc's; the walls line's `bind_pre` says what PFIFO owed the GR leg.
 
 ## Milestones
