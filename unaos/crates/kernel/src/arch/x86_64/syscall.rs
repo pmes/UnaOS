@@ -30274,3 +30274,15 @@ fn sys_kdf(a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         Err(e) => e,
     }
 }
+
+// =================================================================================================
+// APPMENU2 (B393) — TAIL-APPENDED. Quit <app> / Cmd-Q on a USER window is the close box's own path.
+// =================================================================================================
+
+/// APPMENU2 — `video::sysmenu`'s door to [`wc_close_click`]: the owner's rows close (and the keyboard
+/// and the WM's focus are handed back), then the process is killed through `bg_kill`. The menu Quit on a
+/// ring-3 window used to run `wm::close` alone, which left the process running with no window; this is
+/// also what makes a stuck app quittable from the keyboard (MACPARITY row 13).
+pub fn app_quit_owner(win: crate::video::wm::WinId, owner: u64) -> &'static str {
+    wc_close_click(win, owner)
+}
