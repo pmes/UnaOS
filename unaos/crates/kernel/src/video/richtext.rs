@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! CHARTER: Tabula — owed
+//! CHARTER: Tabula — owed B289
 //!
 //! QUARRY2 (rmbp-ledger B336) — the text viewer's two RENDERERS: Markdown and JSON. Text is Tabula's
 //! domain (CODEX §2); Tabula's portable document is `std`-only and not on the bus, so the renderer the
