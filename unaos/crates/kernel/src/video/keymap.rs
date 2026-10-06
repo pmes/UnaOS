@@ -165,7 +165,7 @@ pub enum Action {
     WinSizeLeft,
     WinSizeRight,
     WinSizeUp,
-    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */, ClearView /* LUMENBIN: ⌘K — clear the focused view (LUMEN.ELF's transcript), code 41 */,
+    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */, ClearView /* LUMENBIN: ⌘K — clear the focused view (LUMEN.ELF's transcript), code 41 */, GetInfo /* ATTRCOLUMNS (B402): ⌘I — Quarry's Get Info, code 42 */,
 }
 
 impl Action {
@@ -209,7 +209,7 @@ impl Action {
             Action::WinSizeLeft => "win-size-left",
             Action::WinSizeRight => "win-size-right",
             Action::WinSizeUp => "win-size-up",
-            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", Action::ClearView => "clear-view", // WINDOWLIST · LUMENBIN
+            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", Action::ClearView => "clear-view", Action::GetInfo => "get-info", // WINDOWLIST · LUMENBIN · ATTRCOLUMNS
         }
     }
 

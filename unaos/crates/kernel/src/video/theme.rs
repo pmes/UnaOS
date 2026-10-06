@@ -557,7 +557,7 @@ use super::keymap::{Action, Binding, Table, ALT, CMD, CTRL, SHIFT};
 /// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
-pub static CRISPY_ROWS: [Binding; 54] = [
+pub static CRISPY_ROWS: [Binding; 55] = [
     // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
     Binding { roles: CMD | ALT, usage: 0x50, action: Action::SnapLeft, token: "cmd-alt-left" },
     Binding { roles: CMD | ALT, usage: 0x4F, action: Action::SnapRight, token: "cmd-alt-right" },
@@ -623,7 +623,7 @@ pub static CRISPY_ROWS: [Binding; 54] = [
     Binding { roles: 0, usage: 0x29, action: Action::Deselect, token: "esc" },
     // WINCYCLE — Alt+Tab and the Mac's own ⌘Tab. Above the bare rows on usage 0x2B (none exist).
     Binding { roles: ALT, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB },
-    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_CMD_TAB }, Binding { roles: CMD, usage: 0x10, action: Action::Minimize, token: super::shortcuts::C_CMD_M }, Binding { roles: CMD, usage: 0x35, action: Action::CycleApp, token: super::shortcuts::C_CMD_GRAVE }, Binding { roles: CMD, usage: 0x0E, action: Action::ClearView, token: super::shortcuts::C_CMD_K } /* LUMENBIN: ⌘K (HID 0x0E) */, // WINDOWLIST — ⌘M minimise, ⌘` next window of the same app (CRISPY)
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_CMD_TAB }, Binding { roles: CMD, usage: 0x10, action: Action::Minimize, token: super::shortcuts::C_CMD_M }, Binding { roles: CMD, usage: 0x35, action: Action::CycleApp, token: super::shortcuts::C_CMD_GRAVE }, Binding { roles: CMD, usage: 0x0E, action: Action::ClearView, token: super::shortcuts::C_CMD_K } /* LUMENBIN: ⌘K (HID 0x0E) */, Binding { roles: CMD, usage: 0x0C, action: Action::GetInfo, token: super::shortcuts::C_CMD_I } /* ATTRCOLUMNS: ⌘I (HID 0x0C) */, // WINDOWLIST — ⌘M minimise, ⌘` next window of the same app (CRISPY)
     // Print Screen. `roles: 0` — the key means capture whatever else is held, which is precisely
     // what the `0x46` edge did before it was a row. A theme that drops this row disarms the key.
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: super::shortcuts::C_PRINT_SCREEN },
@@ -653,7 +653,7 @@ pub static CRISPY_BINDINGS: &Table = &Table {
 /// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
 /// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
 /// moves to Alt there, not because a second Copy row was written.
-pub static PC_ROWS: [Binding; 36] = [
+pub static PC_ROWS: [Binding; 37] = [
     // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
     Binding { roles: CTRL | ALT, usage: 0x50, action: Action::SnapLeft, token: "ctrl-alt-left" },
     Binding { roles: CTRL | ALT, usage: 0x4F, action: Action::SnapRight, token: "ctrl-alt-right" },
@@ -675,7 +675,7 @@ pub static PC_ROWS: [Binding; 36] = [
     // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
     Binding { roles: SHIFT, usage: 0x46, action: Action::ScreenshotRegion, token: "shift-prtsc" },
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "prtsc" },
-    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB }, Binding { roles: CMD, usage: 0x10, action: Action::Minimize, token: super::shortcuts::C_CMD_M }, Binding { roles: CMD, usage: 0x35, action: Action::CycleApp, token: super::shortcuts::C_CMD_GRAVE }, Binding { roles: CMD, usage: 0x0E, action: Action::ClearView, token: super::shortcuts::C_CMD_K } /* LUMENBIN: ⌘K (HID 0x0E) */, // WINCYCLE — Alt is the PC's cmd role; WINDOWLIST — Alt+M / Alt+` on the PC table
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB }, Binding { roles: CMD, usage: 0x10, action: Action::Minimize, token: super::shortcuts::C_CMD_M }, Binding { roles: CMD, usage: 0x35, action: Action::CycleApp, token: super::shortcuts::C_CMD_GRAVE }, Binding { roles: CMD, usage: 0x0E, action: Action::ClearView, token: super::shortcuts::C_CMD_K } /* LUMENBIN: ⌘K (HID 0x0E) */, Binding { roles: CMD, usage: 0x0C, action: Action::GetInfo, token: super::shortcuts::C_CMD_I } /* ATTRCOLUMNS: ⌘I (HID 0x0C) */, // WINCYCLE — Alt is the PC's cmd role; WINDOWLIST — Alt+M / Alt+` on the PC table
     Binding { roles: SHIFT, usage: 0x4B, action: Action::ScrollPageUp, token: "shift-pgup" }, // SCROLLBACK (R75) — above the bare Home/End rows
     Binding { roles: SHIFT, usage: 0x4E, action: Action::ScrollPageDown, token: "shift-pgdn" },
     Binding { roles: CTRL, usage: 0x4A, action: Action::ScrollTop, token: "ctrl-home" },
