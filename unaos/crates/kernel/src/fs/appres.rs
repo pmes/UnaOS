@@ -13,13 +13,13 @@
 //! **The cache** is attributes, written at a program's FIRST SIGHT (its launch, or a Quarry listing of its
 //! directory) and refreshed when its stamp (mtime + size) changes: on the program's own inode when its
 //! volume takes attributes, and on its SIGNATURE object in the type database,
-//! `/system/types/application.x-vnd.<signature>` (Be kept an app's icons on its MIME-database signature
+//! `/system/filetypes/application-x-vnd.<signature>` (FILETYPES B423: the registry; Be kept an app's icons on its MIME-database signature
 //! entry exactly so), with `una:app.path` / `una:app.stamp`. A later sight finds that object by the
 //! attribute query `una:app.path == "<path>"` and reads the attributes, not the ELF. The RAM table here is
 //! the per-boot memo of what was read (decoded pixels included), not a store: nothing in it outlives a boot.
 //!
 //! **Doc types**: each MIME type a program declares gets the program's path in `una:apps` on its type object;
-//! `assoc::opener_for_in` reads it after the database's own `una:opener`.
+//! `assoc::opener_for_in` reads it after the registry's `una:preferred` (FILETYPES B423: [`registrants`]).
 //!
 //! A program without a block gets the generic icon (`unaos/res/generic`) and its file name.
 //!
@@ -43,6 +43,16 @@ const BUILTIN: &[(&str, &[u8])] = &[
     ("console", include_bytes!("../../../../res/console/console.unares")),
     ("shell", include_bytes!("../../../../res/shell/shell.unares")),
     ("facet", include_bytes!("../../../../res/facet/facet.unares")),
+    // FILETYPES (B423): every opener the dispatch runs is a REGISTRANT with resources — its doc types are its
+    // own declaration, not a row in a table. The order is the registrant order (`registrants`): for a type two
+    // declare, the earlier one is the default until the registry's `una:preferred` says otherwise.
+    ("markdown", include_bytes!("../../../../res/markdown/markdown.unares")),
+    ("json", include_bytes!("../../../../res/json/json.unares")),
+    ("textedit", include_bytes!("../../../../res/textedit/textedit.unares")),
+    ("fileview", include_bytes!("../../../../res/fileview/fileview.unares")),
+    ("play", include_bytes!("../../../../res/play/play.unares")),
+    ("launch", include_bytes!("../../../../res/launch/launch.unares")),
+    ("linux", include_bytes!("../../../../res/linux/linux.unares")),
 ];
 /// The icon a program without a block is drawn with.
 const GENERIC: &[u8] = include_bytes!("../../../../res/generic/generic.unares");
@@ -176,7 +186,7 @@ pub fn read_block(mt: &MountTable, path: &str) -> Result<Option<Vec<u8>>, VfsErr
     Ok(None)
 }
 
-/// The signature object in the type database: `/system/types/application.x-vnd.org.unaos.lumen`.
+/// The signature object in the registry: `/system/filetypes/application-x-vnd.org.unaos.lumen`.
 pub fn signature_object(sig: &str) -> String {
     crate::fs::assoc::object_path(&alloc::format!("application/x-vnd.{}", sig))
 }
@@ -625,3 +635,84 @@ pub fn selftest() {
         if lumen_seen { "staged" } else { "absent" }, root_attrs, SIGHTS.load(Ordering::Relaxed), DRAWN.load(Ordering::Relaxed));
 }
 
+
+// ── FILETYPES (rmbp-ledger B423) — the registrants of a type ─────────────────────────────────────────────────────────
+
+/// One program that declares it opens a type: `opener` is what the dispatch runs (a built-in's key, or a ring-3
+/// program's path), `signature` what the registry's `una:preferred` names (empty for a program without a block —
+/// its path stands in), `name` what a menu shows.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Registrant {
+    pub opener: String,
+    pub signature: String,
+    pub name: String,
+}
+
+impl Registrant {
+    /// The value `una:preferred` stores for this registrant: its signature, else its path.
+    pub fn preferred_value(&self) -> String {
+        if self.signature.is_empty() { self.opener.clone() } else { self.signature.clone() }
+    }
+}
+
+fn builtin_registrant(key: &str, block: &[u8]) -> Registrant {
+    let s = |k: &str| mc::res_str(block, k).map(String::from).unwrap_or_default();
+    Registrant { opener: String::from(key), signature: s(mc::RES_KEY_SIGNATURE), name: s(mc::RES_KEY_NAME) }
+}
+
+fn declares(block: &[u8], mime: &str) -> bool {
+    mc::res_str(block, mc::RES_KEY_DOCTYPES).map(|d| d.lines().any(|l| l.trim() == mime)).unwrap_or(false)
+}
+
+/// Every MIME type a built-in declares, in registrant order, each once.
+pub fn builtin_doctypes() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, b) in BUILTIN.iter() {
+        for l in mc::res_str(b, mc::RES_KEY_DOCTYPES).unwrap_or("").lines() {
+            let l = l.trim();
+            if !l.is_empty() && !out.iter().any(|m| m == l) {
+                out.push(String::from(l));
+            }
+        }
+    }
+    out
+}
+
+/// The registrants of `mime`: the built-ins that declare it (compiled-in resources, `BUILTIN` order), then the
+/// ring-3 programs APPRES published on the type object (`una:apps` on `type_obj`, sighted order). No I/O beyond
+/// that one attribute read; answers on a root that takes no attributes (the built-ins alone).
+pub fn registrants(mt: &MountTable, mime: &str, type_obj: &str) -> Vec<Registrant> {
+    let mut out: Vec<Registrant> = BUILTIN.iter().filter(|(_, b)| declares(b, mime)).map(|(k, b)| builtin_registrant(k, b)).collect();
+    for p in get_str(mt, type_obj, KEY_APPS).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
+        if out.iter().any(|r| r.opener == p) {
+            continue;
+        }
+        let (signature, name) = match app_at(p) {
+            Some(a) => (a.signature, a.name),
+            None => {
+                let leaf = p.rsplit('/').next().unwrap_or(p);
+                (String::new(), String::from(leaf))
+            }
+        };
+        out.push(Registrant { opener: String::from(p), signature, name });
+    }
+    out
+}
+
+/// The opener a `una:preferred` value names: a built-in's signature → its key; a ring-3 program's signature → the
+/// program's path (the memo, else its signature object's `una:app.path`); anything else (an opener id or a path, the
+/// B307 per-file form) is returned as it is.
+pub fn opener_of_preferred(mt: &MountTable, v: &str) -> String {
+    if let Some((k, _)) = BUILTIN.iter().find(|(_, b)| mc::res_str(b, mc::RES_KEY_SIGNATURE) == Some(v)) {
+        return String::from(*k);
+    }
+    if v.contains('.') && !v.starts_with('/') {
+        if let Some(a) = REG.lock().iter().find(|a| a.signature == v) {
+            return a.path.clone();
+        }
+        if let Some(p) = get_str(mt, &signature_object(v), KEY_APP_PATH) {
+            return p;
+        }
+    }
+    String::from(v)
+}

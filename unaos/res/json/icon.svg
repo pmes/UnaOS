@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- JSON Viewer (UnaOS's own design). -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#5c4d7d"/>
+<rect x="12" y="14" width="40" height="36" rx="3" fill="#f4f1de"/><path d="M27 20c-5 0-5 3-5 7s-3 5-3 5 3 1 3 5 0 7 5 7M37 20c5 0 5 3 5 7s3 5 3 5-3 1-3 5 0 7-5 7" stroke="#5c4d7d" stroke-width="3" fill="none"/>
+</svg>
