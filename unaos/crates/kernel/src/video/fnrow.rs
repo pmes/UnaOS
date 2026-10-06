@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
-//! CHARTER: Kernel — kernel-by-ruling
+//! CHARTER: Kernel — kernel-by-ruling (B438 XHCIMEDIA: the one fn-row router)
 //!
 //! XHCIMEDIA (rmbp-ledger B438) — THE fn-row router. Both HID pumps (`drivers/ehci`'s boot-keyboard
 //! decode and `drivers/xhci`'s) call [`fn_row_usage`] with the raw keyboard-page usage on each PRESS edge;
