@@ -190,7 +190,8 @@ pub fn seed_once() -> usize {
         return 0;
     }
     let mt = crate::shell::vfs_mount_table();
-    match seed_in(&mt) {
+    let seeded = seed_in(&mt); let _ = crate::fs::rootacl::stamp(&mt); // ROOTACL (B456): the system trees take the `system` owner once the registry is built
+    match seeded {
         Ok(n) => { crate::bootlog_println!("[assoc] seed dir={} created={} types={} source=db", TYPES_DIR, n, BUILTIN.len()); n }
         Err(VfsError::Unsupported) => { crate::bootlog_println!("[assoc] seed=skip reason=enotsup (root takes no attributes) source=builtin types={}", BUILTIN.len()); 0 }
         Err(e) => { serial_println!("[assoc] seed=fail ({}) source=builtin", crate::fs::attrsys::refusal(&e)); 0 }
