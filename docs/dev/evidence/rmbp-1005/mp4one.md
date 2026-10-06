@@ -33,3 +33,9 @@ fold keeps both; demux_core's dev-dependency on audio_core there is a dev-cycle 
 no audio track (video only, av01), so "TEST.MP4's audio track" is the built AAC+video file. The ARCH
 baseline holds no MP4 key on this tip (`parser|…|isobmff` is fs/filetype.rs, OPENERS' sniff), so no row
 leaves it here.
+
+**Legs (M4).** `cargo test --release -p audio_core -p demux_core` exit 0 (22 suites; `MP4ONE: 5/5 byte-identical`,
+AAC beside video 12701 frames identical progressive and fragmented, MP3 beside video 11025 frames identical for
+`.mp3` and `mp4a`/0x6B; seek_track's byte 997 holds); `cargo check -p gneiss_pal` 0, `-p audio-check` 0; kernel
+x86 metal shape 0, aarch64 `login,loginst,virt_el0,lumen,desktop_firmware,quarry,facet,usbnet` 0, aarch64
+`tegra,login,loginst,virt_el0` 0; charter-check 0; arch-check 0 (28 baseline keys, unchanged).

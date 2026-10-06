@@ -311,6 +311,9 @@ dependencies = [
 [[package]]
 name = "audio_core"
 version = "0.1.0"
+dependencies = [
+ "demux_core",
+]
 
 [[package]]
 name = "aule"
