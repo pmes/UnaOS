@@ -59,6 +59,9 @@ use thiserror::Error;
 use crate::catalog::hash_value;
 
 use crate::query::{Expr, Predicate, Query, QueryOp};
+
+#[path = "nameindex.rs"]
+pub mod nameindex; // NAMEINDEX (B432): the volume-wide name index — a child module, so it reaches the private core
 use alloc::collections::BTreeSet;
 #[cfg(feature = "std")]
 use bandy::{BandyMember, SMessage};
@@ -437,6 +440,7 @@ impl<D: BlockDevice> UnaFS<D> {
             fs.count_index_writes(written);
             let rec = CatalogRecord { eq_root, ord_root, entries: 0 };
             fs.rewrite_data_inner(catalog_id, &rec.to_bytes())?;
+            fs.name_index_mark_inner()?; // NAMEINDEX (B432): an empty volume's name index is complete
         }
         let snap_id = fs.create_inode_inner(FileKind::System, BTreeMap::new(), 0, None)?;
         debug_assert_eq!(snap_id, SNAP_INDEX_INODE_ID);
@@ -1722,6 +1726,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 return Err(FileSystemError::FileExists);
             }
             let id = self.create_file_with_attrs_inner(&f.attributes, parent_id, &f.name, &mut facts)?;
+            facts.extend(self.name_facts(id, &f.name)); // NAMEINDEX (B432)
             if !f.data.is_empty() {
                 self.write_data_inner(id, 0, &f.data)?;
             }
@@ -1856,6 +1861,8 @@ impl<D: BlockDevice> UnaFS<D> {
         }
 
         let new_id = self.create_inode_inner(kind, BTreeMap::new(), parent_id, Some(&name))?;
+        let name_facts = self.name_facts(new_id, &name); // NAMEINDEX (B432): the core stamps the name, never a caller
+        self.index_apply(&[], &name_facts)?;
 
         entries.push(DirEntry {
             name,
@@ -2005,8 +2012,9 @@ impl<D: BlockDevice> UnaFS<D> {
         // Read the doomed inode up front.
         let inode = self.read_inode(inode_id)?;
 
-        // 1. Scrub the attribute index (by the inode's own keys).
-        let removes = self.facts_of(&inode)?;
+        // 1. Scrub the attribute index (by the inode's own keys) and the name index.
+        let mut removes = self.facts_of(&inode)?;
+        removes.extend(self.name_facts(inode_id, name)); // NAMEINDEX (B432)
         self.index_apply(&removes, &[])?;
 
         // 2. Unhook the name.
@@ -2113,8 +2121,9 @@ impl<D: BlockDevice> UnaFS<D> {
         // From here down this is `unlink`'s body verbatim, on a directory inode.
         let inode = self.read_inode(inode_id)?;
 
-        // 1. Scrub the attribute index (a directory carries owner/grants rows).
-        let removes = self.facts_of(&inode)?;
+        // 1. Scrub the attribute index (a directory carries owner/grants rows) and the name index.
+        let mut removes = self.facts_of(&inode)?;
+        removes.extend(self.name_facts(inode_id, name)); // NAMEINDEX (B432)
         self.index_apply(&removes, &[])?;
 
         // 2. Unhook the name from the parent.
@@ -2227,6 +2236,11 @@ impl<D: BlockDevice> UnaFS<D> {
             inode.name = Some(String::from(new_name));
             stamp_meta(&mut inode);
             self.write_inode(&inode)?;
+        }
+        if old_name != new_name {
+            // NAMEINDEX (B432): the name facts follow the name, in the same transaction.
+            let (gone, born) = (self.name_facts(moved.inode_id, old_name), self.name_facts(moved.inode_id, new_name));
+            self.index_apply(&gone, &born)?;
         }
 
         self.maybe_commit()?;
@@ -3147,7 +3161,8 @@ impl<D: BlockDevice> UnaFS<D> {
         let written = {
             let mut store = DeviceStore::new(&mut self.device, &mut self.refmap);
             for f in removes {
-                if eq.remove(&mut store, &f.eq_key())?.is_some() {
+                // NAMEINDEX (B432): a name fact lives in the ORDERED tree only — `entries` stays the attribute count.
+                if !nameindex::is_name_fact(f) && eq.remove(&mut store, &f.eq_key())?.is_some() {
                     entries = entries.saturating_sub(1);
                 }
                 if let Some(k) = f.ord_key() {
@@ -3155,7 +3170,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 }
             }
             for f in inserts {
-                if eq.insert(&mut store, &f.eq_key(), &[])?.is_none() {
+                if !nameindex::is_name_fact(f) && eq.insert(&mut store, &f.eq_key(), &[])?.is_none() {
                     entries = entries.saturating_add(1);
                 }
                 if let Some(k) = f.ord_key() {
@@ -3505,9 +3520,14 @@ impl<D: BlockDevice> UnaFS<D> {
     /// caller's transaction.
     pub(crate) fn relink_inode(&mut self, id: u64, parent: u64, name: &str) -> Result<(), FileSystemError> {
         let mut inode = self.read_inode(id)?;
+        let old = inode.name.clone();
         inode.parent = parent;
         inode.name = Some(String::from(name));
-        self.write_inode(&inode)
+        self.write_inode(&inode)?;
+        // NAMEINDEX (B432): a restamped name restamps its facts.
+        let gone = old.map(|o| self.name_facts(id, &o)).unwrap_or_default();
+        let born = self.name_facts(id, name);
+        self.index_apply(&gone, &born)
     }
 
     /// Identity, size, parent link and timestamps of an inode (the kernel's
@@ -3677,62 +3697,5 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 }
 
-// =====================================================================
-// QUARRY3 (rmbp-ledger B413) — the name search
-// =====================================================================
-
-impl<D: BlockDevice> UnaFS<D> {
-    /// Every object whose NAME contains `needle` (ASCII case-insensitive), as
-    /// `(absolute path, is_dir)`, walking the name tree from the root
-    /// breadth-first. Bounded twice: at most `max_hits` hits and at most
-    /// `max_dirs` directory reads, so a keystroke in a search field never
-    /// costs more than the caller allows. Returns the hits and the number of
-    /// directories read. Shared by the kernel's file manager (Quarry's
-    /// search field) and, later, the launcher (MACPARITY row 36). An empty
-    /// needle matches nothing.
-    pub fn find_names(
-        &mut self,
-        needle: &str,
-        max_hits: usize,
-        max_dirs: usize,
-    ) -> Result<(Vec<(String, bool)>, usize), FileSystemError> {
-        let mut hits: Vec<(String, bool)> = Vec::new();
-        let n = needle.as_bytes();
-        if n.is_empty() || max_hits == 0 {
-            return Ok((hits, 0));
-        }
-        let has = |name: &str| -> bool {
-            let h = name.as_bytes();
-            h.len() >= n.len()
-                && h.windows(n.len()).any(|w| w.iter().zip(n.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b)))
-        };
-        let mut seen: BTreeSet<u64> = BTreeSet::new();
-        // Breadth-first: shallow names first, which is what a search field wants at the top of its list.
-        let mut queue: alloc::collections::VecDeque<(u64, String)> = alloc::collections::VecDeque::new();
-        queue.push_back((self.superblock.root_inode, String::new()));
-        let mut dirs = 0usize;
-        while let Some((dir, prefix)) = queue.pop_front() {
-            if dirs >= max_dirs || !seen.insert(dir) {
-                continue;
-            }
-            dirs += 1;
-            let mut ents = self.ls(dir)?;
-            // Name order, so the walk (and the hit order) is the same on every volume.
-            ents.sort_by(|a, b| a.name.cmp(&b.name));
-            for e in ents.iter() {
-                let path = format!("{}/{}", prefix, e.name);
-                let is_dir = e.kind == FileKind::Directory;
-                if has(&e.name) {
-                    hits.push((path.clone(), is_dir));
-                    if hits.len() >= max_hits {
-                        return Ok((hits, dirs));
-                    }
-                }
-                if is_dir {
-                    queue.push_back((e.inode_id, path));
-                }
-            }
-        }
-        Ok((hits, dirs))
-    }
-}
+// QUARRY3 (rmbp-ledger B413)'s name search walk is gone: `find_names` is ONE range scan over the name
+// index (NAMEINDEX B432, `nameindex.rs`).
