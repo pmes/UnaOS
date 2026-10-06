@@ -20,6 +20,8 @@ serde = { version = "1.0", features = ["derive"] }
 # TRASHTIME M3 (B308): the vault Trash; the key literals live once in una-abi (both rings link it).
 unafs = { path = "../../unaos/libs/fs/unafs" }
 una-abi = { path = "../../unaos/crates/una-abi" }
+# TRASHCORE (B449): the one Trash core; VaultTrash is only its I/O over a UnaFS vault.
+trash_core = { path = "../../unaos/libs/fs/trash_core" }
 
 [dev-dependencies]
 tempfile = "3"

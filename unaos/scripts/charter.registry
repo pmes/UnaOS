@@ -64,7 +64,7 @@ fs/fatperf.rs | Kernel | fs-core | FAT bench
 fs/holocron.rs | Holocron | owed | B296 (the kernel-side record store; the handler is design-only)
 fs/mod.rs | Kernel | fs-core | module root
 fs/sdhc4c.rs | Kernel | driver | card seam
-fs/trash.rs | Matrix | owed | B288
+fs/trash.rs | Matrix | shared-core | B449 (TRASHCORE)
 fs/unafs.rs | Kernel | fs-core | the UnaFS mount (shared-core: unaos/libs/fs/unafs)
 fs/users.rs | Holocron | owed | B296
 fs/vfs.rs | Kernel | fs-core | the mount table
