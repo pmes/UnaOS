@@ -2702,3 +2702,63 @@ pub fn gmux_max_brightness() -> Option<u32> {
 pub fn blt_ring_live() -> bool {
     BLT_RING.lock().is_some()
 }
+
+/// GEN7B (B422) — rung D0 of the IGD display route, as a CAPTURE: can this panel be handed to the IGD at
+/// all? READS ONLY — nothing is written (the gmux index byte to port 0x7D0 is the read protocol). One line,
+/// `[igpu-dpy] capture …`, run by `tests gen7` (R80), returns the panel's owner per the gmux
+/// (`kepler` / `igd` / `unreadable` / `unproven` / `no-gmux`). Every decoded bit is cited from pages already
+/// pinned in-tree (docs/dev/OS/08_VIDEO/gpu_spec.md §6): PIPE_CONF [31] enable / [30] state — IHD-OS-V3 Pt3
+/// §5.1.3 pp.100–103; DP_CTL_A [31] enable, [30:29] pipe select, [2] digital display detected (RO, "valid
+/// regardless of whether the port is enabled") — V3 Pt3 §4.4.1 pp.82–86; PP_STATUS [31] power on, [29:28]
+/// sequence; PP_CONTROL [31:16] key, [3] VDD override, [0] target; PP_ON_DELAYS [31:30] port select — V3 Pt4
+/// §2.4.1–2.4.3 pp.38–42. DSPxCNTR is printed RAW: no plane-control bit is pinned in-tree. The gmux reads
+/// are apple-gmux.c's indices (the port map above): SWITCH_DDC 0x28, READ_DISPLAY 0x11, READ_EXTERNAL 0x41,
+/// DIS 0x03 / IGD 0x02 on READ_DISPLAY.
+#[cfg(all(target_arch = "x86_64", feature = "gen7blit"))]
+pub fn dpy_capture() -> &'static str {
+    #[cfg(feature = "gmux_igd")]
+    let (ddc, disp, ext, owner) = if PROTOCOL_PROVEN.load(Ordering::SeqCst) {
+        // SAFETY: the bounded gmux port window every helper above drives; index reads only.
+        let (ddc, disp, ext) = unsafe { (gmux_index_read(GMUX_SWITCH_DDC), gmux_index_read(GMUX_READ_DISPLAY), gmux_index_read(GMUX_READ_EXTERNAL)) };
+        let owner = if disp == GMUX_DISPLAY_DIS as u32 {
+            "kepler"
+        } else if disp == GMUX_DISPLAY_IGD as u32 {
+            "igd"
+        } else {
+            "unreadable"
+        };
+        (ddc, disp, ext, owner)
+    } else {
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, "unproven")
+    };
+    #[cfg(not(feature = "gmux_igd"))]
+    let (ddc, disp, ext, owner) = (0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0xFFFF_FFFFu32, "no-gmux");
+    let bar0 = IGPU_BAR0.load(Ordering::SeqCst);
+    if bar0 == 0 {
+        serial_println!(
+            "[igpu-dpy] capture writes=0 gmux_ddc={:#x} gmux_disp={:#x} gmux_ext={:#x} owner={} igd=bar0-unmapped",
+            ddc, disp, ext, owner
+        );
+        return owner;
+    }
+    // SAFETY: igpu::init's published BAR0 mapping; display-block reads, no write.
+    let r = |o: usize| unsafe { mmio_read(bar0, o) };
+    let pc = [r(regs::PIPEACONF), r(regs::PIPEBCONF), r(regs::PIPECCONF)];
+    let dc = [r(regs::DSPACNTR), r(regs::DSPBCNTR), r(regs::DSPCCNTR)];
+    let dpa = r(regs::DP_A);
+    let (sts, ctl, on, off, div) = (r(regs::PCH_PP_STATUS), r(regs::PCH_PP_CONTROL), r(regs::PCH_PP_ON_DELAYS), r(regs::PCH_PP_OFF_DELAYS), r(regs::PCH_PP_DIVISOR));
+    let pipe = |v: u32| ((v >> 31) & 1, (v >> 30) & 1);
+    let (pa, pb, pcc) = (pipe(pc[0]), pipe(pc[1]), pipe(pc[2]));
+    serial_println!(
+        "[igpu-dpy] capture writes=0 gmux_ddc={:#x} gmux_disp={:#x} gmux_ext={:#x} owner={} pipe_a={:08X}(en={},state={}) pipe_b={:08X}(en={},state={}) pipe_c={:08X}(en={},state={}) dspcntr={:08X},{:08X},{:08X}(raw-uncited) dp_a={:08X}(en={},pipe={},detect={}) pp_sts={:08X}(on={},seq={}) pp_ctl={:08X}(key={:04X},vdd={},target={}) pp_on={:08X}(port_sel={},t3_raw={}) pp_off={:08X} pp_div={:08X} cite=V3Pt3-5.1.3-p100,V3Pt3-4.4.1-p82,V3Pt4-2.4-p38",
+        ddc, disp, ext, owner,
+        pc[0], pa.0, pa.1, pc[1], pb.0, pb.1, pc[2], pcc.0, pcc.1,
+        dc[0], dc[1], dc[2],
+        dpa, (dpa >> 31) & 1, (dpa >> 29) & 3, (dpa >> 2) & 1,
+        sts, (sts >> 31) & 1, (sts >> 28) & 3,
+        ctl, ctl >> 16, (ctl >> 3) & 1, ctl & 1,
+        on, (on >> 30) & 3, (on >> 16) & 0x1FFF,
+        off, div
+    );
+    owner
+}
