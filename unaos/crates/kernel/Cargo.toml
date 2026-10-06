@@ -718,6 +718,13 @@ wifi3 = ["wifi2"]
 # arm_features. Default OFF => byte-identical media. Enable via `UNAOS_WIFI4=1`. Kept in sync with
 # arroyo and builder/src/main.rs. See docs/dev/OS/06_NETWORK_STACK/bcm4331.md §S5.
 wifi4 = ["wifi3"]
+# WIFI-5 knob (WIFI6 arc, rmbp-ledger B439): UNAOS_WIFI5=1 arms rung S4i's MMIO leg — the IN-BOOT unwind
+# of a failed S5i initvals step (`src/wifi/bringup/unwind.rs`): every offset the step wrote gets the
+# EFI's own C2 pre-image word back (PHY/radio port block 0x3E0..0x3FF never written), re-read, one
+# `[wifi6] unwind step=s5i restored=<n>/<n> verified=<0|1>` line. Runs ONLY when the S5i post-check
+# FAILS. Default OFF and OFF the metal line until the seat reads WIFI5's C1 line NON-DISTURBING.
+# IMPLIES `wifi3` (the unwind lives on the upload path). x86_64-only, stripped by arm_features.
+wifi5 = ["wifi3"]
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +
