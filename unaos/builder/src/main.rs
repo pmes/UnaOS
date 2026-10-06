@@ -963,6 +963,8 @@ fn main() {
     if std::env::var("UNAOS_PANIC_HOLD").is_ok() { feats.push("panic_hold"); }
     // SMALLFIX2 (B391, R94): UNAOS_SVG=1 arms pixel_core's `svg` format in the kernel (SVG opens in facet). Kept in sync with arroyo.
     if std::env::var("UNAOS_SVG").is_ok() { feats.push("svg"); }
+    // VIDEOPLAYER (B434): UNAOS_VIDEO=1 — the Player plays video (video::vplay; links av1_core). Kept in sync with arroyo.
+    if std::env::var("UNAOS_VIDEO").is_ok() { feats.push("videoplayer"); }
     // KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the copy-engine blitter (cpu until KBLIT binds its channel). Kept in sync with arroyo.
     if std::env::var("UNAOS_WC_BLITTER").map(|v| v == "gpu").unwrap_or(false) { feats.push("wc_gpublit"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words

@@ -1231,3 +1231,6 @@ pub fn notify(app: &[u8], title: &[u8], line: &[u8], label: &[u8], act: u8, arg:
     #[allow(unreachable_code)]
     false
 }
+// VIDEOPLAYER (B434, MACPARITY row 30): the Player's video job — Stria's fulfiller over demux_core + vp8_core + av1_core (UNAOS_VIDEO). x86 `wc` (the Player's window and the worker pool); at the tail so no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "videoplayer"))]
+pub mod vplay;
