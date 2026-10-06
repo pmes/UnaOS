@@ -351,3 +351,173 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
         },
     }
 }
+
+// ── the File Types pane's model (Settings, B423 M4) — read and changed on the service pass, never in the router ───
+
+/// One row of the pane: a type and what the registry says of it.
+#[derive(Clone)]
+pub struct TypeRow {
+    pub mime: String,
+    pub description: String,
+    pub extensions: String,
+    pub icon: String,
+    /// The registry's `una:preferred` (a signature), empty when nothing declares the type.
+    pub preferred: String,
+    /// The preferred registrant's name (the stored value when it names no registrant).
+    pub preferred_name: String,
+    pub registrants: usize,
+}
+
+static VIEW: spin::Mutex<Vec<TypeRow>> = spin::Mutex::new(Vec::new());
+static VIEW_OWED: AtomicBool = AtomicBool::new(false);
+/// Row index + 1 whose preferred app the pane asked to advance (0 = none).
+static CYCLE_OWED: AtomicUsize = AtomicUsize::new(0);
+
+/// The pane's rows (a snapshot; no I/O).
+pub fn view() -> Vec<TypeRow> {
+    VIEW.lock().clone()
+}
+
+/// Ask the service pass to (re)read the rows.
+pub fn owe_view() {
+    VIEW_OWED.store(true, Ordering::Release);
+}
+
+/// Ask the service pass to hand row `i`'s type to its next registrant.
+pub fn owe_cycle(i: usize) {
+    CYCLE_OWED.store(i + 1, Ordering::Release);
+}
+
+fn rows_in(mt: &MountTable) -> Vec<TypeRow> {
+    let mut v: Vec<TypeRow> = known_types_in(mt)
+        .into_iter()
+        .map(|mime| {
+            let regs = registrants_in(mt, &mime);
+            let preferred = str_attr(mt, &object_path(&mime), PREFERRED_KEY).or_else(|| regs.first().map(|r| r.preferred_value())).unwrap_or_default();
+            let op = appres::opener_of_preferred(mt, &preferred);
+            let preferred_name = regs.iter().find(|r| r.opener == op).map(|r| r.name.clone()).unwrap_or_else(|| preferred.clone());
+            TypeRow {
+                description: name_of_in(mt, &mime),
+                extensions: extensions_in(mt, &mime),
+                icon: icon_of_in(mt, &mime),
+                preferred,
+                preferred_name,
+                registrants: regs.len(),
+                mime,
+            }
+        })
+        .collect();
+    v.sort_by(|a, b| a.mime.cmp(&b.mime));
+    v
+}
+
+/// Advance `mime`'s preferred app to the registrant after the current one (wrapping). The new opener, or why not.
+pub fn cycle_preferred_in(mt: &MountTable, mime: &str) -> Result<String, &'static str> {
+    let regs = registrants_in(mt, mime);
+    if regs.is_empty() {
+        return Err("no-registrant");
+    }
+    let (cur, _) = opener_for_in(mt, &object_path(mime), mime);
+    let i = regs.iter().position(|r| r.opener == cur).map(|i| (i + 1) % regs.len()).unwrap_or(0);
+    set_preferred_in(mt, mime, &regs[i].opener).map(|_| regs[i].opener.clone()).map_err(|_| "write-refused")
+}
+
+/// The service pass (Settings' `service`): a latched cycle, then a re-read when owed. `true` = the rows changed.
+pub fn view_service() -> bool {
+    let c = CYCLE_OWED.swap(0, Ordering::AcqRel);
+    let owed = VIEW_OWED.swap(false, Ordering::AcqRel);
+    if c == 0 && !owed {
+        return false;
+    }
+    let mt = crate::shell::vfs_mount_table();
+    if c != 0 {
+        let mime = VIEW.lock().get(c - 1).map(|r| r.mime.clone());
+        if let Some(m) = mime {
+            let r = cycle_preferred_in(&mt, &m);
+            serial_println!("[filetypes] pane type={} preferred={} via=settings", m, match &r { Ok(o) => o.as_str(), Err(w) => w });
+        }
+    }
+    let rows = rows_in(&mt);
+    *VIEW.lock() = rows;
+    true
+}
+
+// ── `tests filetypes` (B423 M5; R80: run only when asked) ────────────────────────────────────────────────────────
+
+/// `tests filetypes` — the registry built (every known type an object on an attribute root), every type's opener
+/// resolved through the registry to a REGISTRANT (or `none` where nothing declares it), a user's amendment surviving
+/// a rebuild, the sniff never overwriting a set `una:type` (ATTRCOLUMNS's refresh), and Open With's list for text.
+///
+/// `:: FILETYPES: types=<n> preferred=<n> resolved=<ok|why> -> PASS|FAIL :: registry=<dir|none> source=<db|registrants>
+/// sticky=<ok|skip|why> amend=<ok|skip|why> openwith=<n> builds=<n>`.
+pub fn selftest() {
+    let mt = crate::shell::vfs_mount_table();
+    let k = KERNEL_PRINCIPAL;
+    let attrs = root_takes_attrs(&mt);
+    build("tests");
+    let types = known_types_in(&mt);
+    let mut objects = 0usize;
+    let mut preferred = 0usize;
+    let mut why: Option<String> = None;
+    for m in types.iter() {
+        let obj = object_path(m);
+        if mt.stat(&obj).is_ok() {
+            objects += 1;
+        } else if attrs && why.is_none() {
+            why = Some(alloc::format!("missing:{}", m));
+        }
+        if str_attr(&mt, &obj, PREFERRED_KEY).is_some() {
+            preferred += 1;
+        }
+        let regs = registrants_in(&mt, m);
+        let (op, src) = opener_for_in(&mt, &obj, m);
+        let ok = if regs.is_empty() { op == "none" } else { regs.iter().any(|r| r.opener == op) && (!attrs || src == "db") };
+        if !ok && why.is_none() {
+            why = Some(alloc::format!("{}:{}({})", m, op, src));
+        }
+    }
+    // The user's amendment survives a rebuild: text/plain → the viewer, rebuild, still the viewer, restored.
+    let amend = if attrs {
+        let obj = object_path(ft::TEXT_PLAIN);
+        let was = mt.get_attr(&obj, PREFERRED_KEY, k).ok();
+        let set = set_preferred_in(&mt, ft::TEXT_PLAIN, "fileview").is_ok();
+        let _ = seed_in(&mt);
+        let held = opener_for_in(&mt, &obj, ft::TEXT_PLAIN) == (String::from("fileview"), "db");
+        match was {
+            Some(v) => { let _ = mt.set_attr(&obj, PREFERRED_KEY, v, k); }
+            None => { let _ = mt.set_attrs(&obj, &[(String::from(PREFERRED_KEY), None)], k); }
+        }
+        if set && held { "ok" } else if !set { "set-refused" } else { "overwritten" }
+    } else {
+        "skip"
+    };
+    // The sniff never overwrites a set type: a text file typed by hand as Markdown keeps it through a forced refresh.
+    let sticky = if attrs {
+        let probe = "/system/FTPROBE.TXT";
+        let _ = mt.unlink(probe, k);
+        let made = mt.create(probe, NodeKind::File, k).is_ok() && mt.write(probe, 0, b"plain words\n", k).is_ok();
+        let r = if !made {
+            "probe-refused"
+        } else if crate::fs::attrfacts::edit_in(&mt, probe, ft::TYPE_KEY, AttrValue::Str(String::from(ft::TEXT_MARKDOWN)), k).is_err() {
+            "edit-refused"
+        } else {
+            let _ = crate::fs::attrfacts::refresh_in(&mt, probe, true);
+            match mt.get_attr(probe, ft::TYPE_KEY, k) {
+                Ok(AttrValue::Str(s)) if s == ft::TEXT_MARKDOWN => "ok",
+                _ => "overwritten",
+            }
+        };
+        let _ = mt.unlink(probe, k);
+        r
+    } else {
+        "skip"
+    };
+    let openwith = registrants_in(&mt, ft::TEXT_PLAIN).len();
+    let resolved = why.clone().unwrap_or_else(|| String::from("ok"));
+    let pass = why.is_none() && matches!(amend, "ok" | "skip") && matches!(sticky, "ok" | "skip") && openwith >= 2;
+    serial_println!(
+        ":: FILETYPES: types={} preferred={} resolved={} -> {} :: registry={} objects={} source={} sticky={} amend={} openwith={} builds={}",
+        types.len(), preferred, resolved, if pass { "PASS" } else { "FAIL" },
+        if attrs { TYPES_DIR } else { "none" }, objects, if attrs { "db" } else { "registrants" }, sticky, amend, openwith, builds()
+    );
+}

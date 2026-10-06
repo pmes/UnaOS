@@ -56,14 +56,14 @@ pub const IDLE_STEPS: [u32; 8] = [0, 1, 2, 5, 10, 15, 30, 60];
 const PTR_NAMES: [&str; 3] = ["slow", "normal", "fast"];
 const WALL_MAX: usize = 120;
 
-const WIN_W: usize = 520;
+const WIN_W: usize = 600; // FILETYPES (B423): 520 -> 600 for the sixth tab (APPEARANCE B408 took the same width)
 const TAB_H: usize = 28;
 const TOP: usize = 12 + TAB_H;
 const ROW_H: usize = 40;
 const ROWS: usize = 10;
 /// The tab strip: General · Users · Display · About.
-pub const TABS: usize = 5;
-const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items"]; // PREFSUI (R91): Login Items
+pub const TABS: usize = 6;
+const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "File Types"]; // PREFSUI (R91): Login Items
 const WIN_H: usize = TOP + ROWS * ROW_H + 8;
 const LABEL_X: usize = 12;
 const TRACK_X: usize = 150;
@@ -351,6 +351,7 @@ pub fn request_open() {
 
 /// Drain the open latch and load the store once per login. Chained from `quarry::live::service`.
 pub fn service() {
+    if crate::fs::assoc::view_service() && is_open() && cur_tab() == FT_TAB { repaint(); } // FILETYPES (B423): the registry's rows / a preferred-app change, applied off the click path
     crate::prefs::service(); super::loginitems::service(); super::settingsfiles::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
@@ -464,6 +465,7 @@ fn paint(st: &mut State, v: &Values) {
         1 => paint_users(st),
         2 => paint_display(st, v),
         4 => paint_login(st),
+        t if t as usize == FT_TAB => paint_filetypes(st), // FILETYPES (B423)
         _ => paint_about(st),
     }
     // SETTINGSFILES (B407, R98): the pane's file, as a link that reveals `<home>/settings` in Quarry.
@@ -844,6 +846,7 @@ fn switch_tab(t: usize) {
         if let Some(&c) = tab_ctrls(t).first() { st.sel = c; }
     }
     serial_println!("[settings] tab={}", TAB_NAMES[t]);
+    if t == FT_TAB { crate::fs::assoc::owe_view(); } // FILETYPES (B423): the pane's rows are read on the service pass
     persist(6);
     repaint();
 }
@@ -992,6 +995,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         0 => press_general(row, cx),
         1 => press_users(row, cx),
         4 => press_login(row, cx),
+        t if t == FT_TAB => press_filetypes(row, cx), // FILETYPES (B423)
         2 => {
             if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
@@ -1726,4 +1730,53 @@ fn users_is_admin(name: &str) -> bool {
     { crate::fs::users::role_of(name.as_bytes()) == Some(crate::fs::users::Role::Admin) }
     #[cfg(not(feature = "login"))]
     { let _ = name; false }
+}
+
+// ── FILETYPES (rmbp-ledger B423, MACPARITY §16 B3 / row 29) — the File Types pane ────────────────────────────────────
+// Be's FileTypes preference: every type the registry knows (`/system/filetypes`), its description, MIME, extensions,
+// icon glyph and PREFERRED APP. A press on a type's row hands the type to the next registrant (the programs whose
+// resources declare it) — an ordinary `una:preferred` write on the type's object, latched here and applied by the
+// service pass (`assoc::view_service`), never in the click router. Row 9: Prev / Next page. The rows are a snapshot
+// the service pass reads (`assoc::view`), so the paint does no VFS work.
+
+/// The File Types tab's index: the LAST tab (APPEARANCE B408 holds index 5 at the fold; this one is then 6).
+pub const FT_TAB: usize = TABS - 1;
+const FT_ROWS: usize = 8;
+const FT_NAV_ROW: usize = 9;
+const FT_PREV_X: usize = TRACK_X;
+const FT_NEXT_X: usize = TRACK_X + 2 * BTN_W + 40;
+static FT_PAGE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn paint_filetypes(st: &mut State) {
+    let v = crate::fs::assoc::view();
+    let preferred = v.iter().filter(|r| !r.preferred.is_empty()).count();
+    txt(st, LABEL_X, 0, &alloc::format!("File types ({}, {} with an app). Click a type to change its app:", v.len(), preferred));
+    if v.is_empty() { crate::fs::assoc::owe_view(); txt(st, LABEL_X + 12, 1, "Reading /system/filetypes ..."); return; }
+    let pages = v.len().div_ceil(FT_ROWS).max(1);
+    let page = FT_PAGE.load(Ordering::Relaxed).min(pages - 1);
+    for (k, r) in v.iter().skip(page * FT_ROWS).take(FT_ROWS).enumerate() {
+        let app = if r.preferred.is_empty() { String::from("(no app)") } else { r.preferred_name.clone() };
+        let ext = if r.extensions.is_empty() { String::new() } else { alloc::format!(" .{}", r.extensions.replace(", ", " .")) };
+        txt(st, LABEL_X, 1 + k, &alloc::format!("[{}] {} - {}{}", r.icon, r.description, r.mime, ext));
+        txt(st, WIN_W - 150, 1 + k, &alloc::format!("{} ({})", app, r.registrants));
+    }
+    btn(st, FT_NAV_ROW, FT_PREV_X, "  < Prev");
+    txt(st, FT_PREV_X + BTN_W + 14, FT_NAV_ROW, &alloc::format!("{}/{}", page + 1, pages));
+    btn(st, FT_NAV_ROW, FT_NEXT_X, "Next >");
+}
+
+fn press_filetypes(row: usize, cx: usize) {
+    let in_b = |x0: usize| cx >= x0 && cx < x0 + BTN_W;
+    let n = crate::fs::assoc::view().len();
+    let pages = n.div_ceil(FT_ROWS).max(1);
+    let page = FT_PAGE.load(Ordering::Relaxed).min(pages - 1);
+    if (1..=FT_ROWS).contains(&row) {
+        let i = page * FT_ROWS + row - 1;
+        if i < n { crate::fs::assoc::owe_cycle(i); }
+    } else if row == FT_NAV_ROW {
+        if in_b(FT_PREV_X) { FT_PAGE.store((page + pages - 1) % pages, Ordering::Relaxed); }
+        else if in_b(FT_NEXT_X) { FT_PAGE.store((page + 1) % pages, Ordering::Relaxed); }
+        else { return; }
+    } else { return; }
+    repaint();
 }

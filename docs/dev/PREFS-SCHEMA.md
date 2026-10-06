@@ -29,7 +29,7 @@ Rows: 35.
 | `system.login.items` | string ≤256 printable | `""` | settings, dock | kernel login items (`video/loginitems.rs`) | Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login. |
 | `system.pointer.speed` | int `0..=2` | `1` | settings | kernel settings (pointer) | 0 slow, 1 normal, 2 fast. |
 | `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | operator | kernel POWERMENU | Battery percent at which the machine shuts down; 0 = off. |
-| `system.settings.tab` | int `0..=4` | `0` | settings | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items). |
+| `system.settings.tab` | int `0..=5` | `0` | settings | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, File Types). |
 | `vein.claude.api_key_env` | string ≤128 printable | `"ANTHROPIC_API_KEY"` | operator | gneiss_pal ProviderConfig | NAME of the environment variable holding the Claude key (the key is never a preference). |
 | `vein.claude.fallbacks` | bool | `true` | operator | gneiss_pal ProviderConfig | Let the Claude client fall back to the next model on overload. |
 | `vein.claudecode.bin` | string ≤4096 printable | `"claude"` | operator | gneiss_pal ProviderConfig | The Claude Code CLI binary for provider claudecode: a path, or a name looked up on PATH (CLAUDECODE, SR38). |
