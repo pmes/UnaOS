@@ -459,7 +459,7 @@ fn take_rect(pw: u32, ph: u32) -> (u32, u32, u32, u32, u32) {
     (k, x, y, w, h)
 }
 
-/// SHOTREGION M3 — `SHOT-HHMMSS.PNG` when the clock is anchored and the name is free, else the `SHOT<n>.PNG` ladder. Never overwrites.
+/// SHOTREGION M3 — the Mac's name (PRTSCR4) when the clock is set and the name is free, else the `SHOT<n>.PNG` ladder. Never overwrites.
 fn shot_name(fs: &FatFs, dir: u32) -> Result<String, Refusal> {
     let free = |name: &str| -> Result<bool, Refusal> {
         match busy_retry(|| match fs.locate_in_dir(dir, name) {
@@ -486,11 +486,11 @@ fn shot_name(fs: &FatFs, dir: u32) -> Result<String, Refusal> {
     Err(Refusal::AllTaken(vol_id(fs)))
 }
 
-/// SHOTREGION M3 — the clock arm of [`shot_name`]: `None` until the clock is anchored (CLOCKBAR's `try_unix_now`).
+/// SHOTREGION M3 — the clock arm of [`shot_name`]: `None` until the clock is set. PRTSCR4 (B493): the Mac's own name
+/// (`Screenshot <date> at <time>.png`, [`mac_name`]) as the whole-panel capture has — a region is a screenshot too; the
+/// `SHOT-hhmmss.PNG` stamp is retired.
 fn shot_clock_name() -> Option<String> {
-    let secs = crate::clock::try_unix_now()?;
-    let (_y, _mo, _d, h, mi, s) = crate::clock::civil_from_unix(secs);
-    Some(alloc::format!("SHOT-{:02}{:02}{:02}.PNG", h, mi, s))
+    clock_name()
 }
 
 /// PRTSCR — `(requests, captures, refusals)`.
@@ -608,11 +608,7 @@ fn finish(verdict: Result<Shot, Refusal>) {
         Ok(shot) => {
             CAPTURES.fetch_add(1, Ordering::Relaxed);
             shot.report_ok();
-            // SHOTREGION M3: a region/window capture says where it went (B229 `notice_show`); the whole-panel path stays silent as before.
-            #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-            if shot.kind != 0 {
-                let _ = crate::video::dialog::notice(b"Screenshot saved", alloc::format!("{}\nDesktop", shot.name).as_bytes()); // DIALOG2 (B404): THE router — sorted error -> dialog, information -> toast
-            }
+            announce(&shot); // PRTSCR4 (B493): EVERY user capture says where it went — the whole panel too (it was silent; flight 26)
         }
         Err(why) => {
             REFUSALS.fetch_add(1, Ordering::Relaxed);
@@ -641,6 +637,8 @@ pub struct Shot {
     pub kind: u32,
     pub rx: u32,
     pub ry: u32,
+    /// PRTSCR4 (B493) — the file as the mount table spells it (`/home/una/Desktop/<name>`), for [`announce`].
+    pub path: String,
 }
 
 /// Why a capture did not happen. Every variant carries what it inspected, not just what was
@@ -1493,6 +1491,7 @@ impl Job {
                     kind: self.kind,
                     rx: self.rx,
                     ry: self.ry,
+                    path: core::mem::take(&mut self.vpath),
                 }))
             }
             // Unreachable: `slice` is the only caller and it always hands back a live phase.
@@ -2112,7 +2111,7 @@ fn ensure_capture_dir(fs: &FatFs, plan: &DirPlan) -> Result<(u32, String), Refus
     // `n + 2` to `n + 1` with it — a bound that still described a two-leaf walk would have left one
     // component of slack nothing uses, which is the kind of stale arithmetic a later reader has to
     // re-derive to trust.
-    comps[n] = cur_leaf(); // GLASSEYES (B343): `Shots` while a named state shot holds the door, else the theme's word
+    comps[n] = cur_leaf(); // GLASSEYES (B343): the named leaf while a state shot holds the door (the theme's word too since PRTSCR4), else the theme's word
     n += 1;
 
     let mut cluster = 0u32; // the volume root, on every FAT kind here
@@ -2358,7 +2357,7 @@ pub fn dir_fixture() { static QB2: AtomicBool = AtomicBool::new(false); if crate
 }
 
 // ================================ GLASSEYES (rmbp-ledger B343) — THE NAMED STATE SHOT ================================
-// `shot <state>` (video/shotmask.rs) needs a DETERMINISTIC file — `/home/<u>/Shots/<STEM>.PNG`, the same name every
+// `shot <state>` (video/shotmask.rs) needs a DETERMINISTIC file — `/home/<u>/Desktop/<STEM>.PNG` (PRTSCR4: was `Shots`), the same name every
 // boot, so the bench can pull it and EYES can score it against a golden — through THIS capture, not a second one.
 // So the job takes a named override: while [`capture_named`] holds the door, `Job::begin` reads [`NAMED`] for the
 // leaf (instead of `theme::CAPTURE_DIR`) and the file name (instead of the never-overwrite ladder), and the old
@@ -2512,8 +2511,44 @@ fn native_pick(fs: &FatFs, dir: &str, named: &Option<(&'static str, String)>, ki
 /// VOLUMES M1 — PRTSCR-ST's read-back for a native-root shot: the size the mount table holds.
 #[allow(dead_code)] // reached from PRTSCR-ST, whose caller is feature-gated
 fn native_readback(shot: &Shot) -> bool {
-    let p = alloc::format!("{}/{}", shot.dir, shot.name);
-    let ok = crate::shell::vfs_mount_table().stat(&p).map(|s| s.size as usize == shot.bytes).unwrap_or(false);
-    serial_println!(":: PRTSCR-ST: native read-back path={} bytes={} -> {} ::", p, shot.bytes, if ok { "PASS" } else { "FAIL" });
+    // PRTSCR4 (B493): read back the path the capture REPORTS (the mount table's, the one the toast names) and score
+    // that it is in the capture folder the theme names (`<home>/Desktop`) — a shot that lands anywhere else FAILs here.
+    let p = if shot.path.is_empty() { alloc::format!("{}/{}", shot.dir, shot.name) } else { shot.path.clone() };
+    let in_dir = p.rsplit_once('/').and_then(|(d, _)| d.rsplit('/').next()).map(|leaf| leaf.eq_ignore_ascii_case(DIR_CAPTURE.0)).unwrap_or(false);
+    let sized = crate::shell::vfs_mount_table().stat(&p).map(|s| s.size as usize == shot.bytes).unwrap_or(false);
+    let ok = sized && in_dir;
+    serial_println!(":: PRTSCR-ST: native read-back path={} bytes={} in_capture_dir={} -> {} ::", p, shot.bytes, if in_dir { "yes" } else { "no" }, if ok { "PASS" } else { "FAIL" });
     ok
+}
+
+// ======================== PRTSCR4 (rmbp-ledger B493) — THE GLASS SAYS WHERE ========================
+//
+// Flight 26: "i took a screenshot but apparently screenshot is broken now". The capture lands on the Desktop
+// folder (the theme's word, SCRSHOT-DESKTOP), but the desktop draws no files and the whole-panel capture —
+// the key Peter pressed — was the one shape that posted nothing, so a landed capture looked like no capture.
+// Every USER capture (the key, the chords, region/window, the `screenshot` verb) now ends here: one wire line
+// and one toast through THE notice router (DIALOG2: information -> toast). A named state shot (`shot <state>`)
+// and `tests prtscr` do not come here — a toast on the glass would land in the next state's golden.
+
+/// PRTSCR4 — `[prtscr] saved path=<p> bytes=<n> -> toast`, and the toast `Screenshot saved` / `~/Desktop/<name>`.
+pub fn announce(shot: &Shot) {
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let to = {
+        // A toast is ONE line under a 24-char title (`toast::TL`/`LL`; `Screenshot saved to Desktop` is 27), so the title
+        // says what and the line says WHERE — the file home-relative (`~/Desktop/Screenshot 2026-10-06 at 14.57.18.png`,
+        // 46 of 52); the wire keeps the whole path.
+        if crate::video::dialog::notice(b"Screenshot saved", home_rel(&shot.path).as_bytes()) { "toast" } else { "toast-dropped" } // DIALOG2 (B404): THE router — information -> toast
+    };
+    #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    let to = "no-glass";
+    serial_println!("[prtscr] saved path={} bytes={} -> {}", shot.path, shot.bytes, to);
+}
+
+/// PRTSCR4 — `/home/<u>/rest` -> `~/rest` (the toast's line); any other path as it is.
+#[allow(dead_code)] // the toast arm is feature-gated
+fn home_rel(p: &str) -> String {
+    match p.strip_prefix("/home/").and_then(|r| r.find('/').map(|i| &r[i..])) {
+        Some(rest) => alloc::format!("~{}", rest),
+        None => String::from(p),
+    }
 }
