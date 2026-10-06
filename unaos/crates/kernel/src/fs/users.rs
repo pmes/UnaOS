@@ -2956,8 +2956,6 @@ const STAGE_UNRESOLVED: u8 = 255;
 static STAGE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(STAGE_UNRESOLVED);
 /// The create-user form was owed before the desktop ignition could hold a window: `boot_session` opens it.
 static CREATE_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// The bar was switched off by the stage and is owed back at the Desktop advance.
-static BAR_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// How long a tenant waits for the store before the machine is taken to have none (a Desktop).
 const STAGE_WAIT_MS: u64 = 30_000;
 
@@ -3036,25 +3034,13 @@ fn stage_publish(st: BootStage, why: &str) {
     }
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
-        if st != BootStage::Desktop {
-            if crate::video::menubar::set_enabled(false) {
-                BAR_HELD.store(true, Ordering::Release);
-            }
-            crate::video::crystal::login::installer_sweep();
-        } else if why != "store-has-users" { // INSTALLBARE: boot 2's login screen keeps the bar owed — the first login releases it (`bar_release`)
-            // R92 (flight 24, Peter: "WHERES THE DAMN MENUBAR AND TASKBAR"): `close_into_session` runs `bar_release` BEFORE this
-            // publish, while `furniture_held()` still reads the CreateUser stage, so its composite declines the strips; and under
-            // R88 no furniture window is minted afterwards to dirty the scene. The bar and the dock are the DESKTOP, not login
-            // items: enable and composite here, on the stage that makes `furniture_held()` false, whether or not the latch was
-            // already swapped. The paint lands (`[strip] paint tenant=dock`, `[menubar] …`) or this boot is red.
-            BAR_HELD.store(false, Ordering::Release);
-            let _ = crate::video::menubar::set_enabled(true);
-            crate::video::wm::composite();
-        }
+        // DESKTOPBUILT (B387, R93): nothing of the desktop exists before a session, so no stage turns a bar off or sweeps
+        // a window (the R86/R88 latch and sweep, and R92's unconditional enable, are gone). The Desktop stage asks for the
+        // build (idempotent after `login ok` asked; the store-less Desktop's only ask); boot 2's login screen builds nothing.
         if st == BootStage::Desktop && why != "store-has-users" {
-            crate::video::crystal::login::installer_release();
+            crate::video::desktopbuild::build("stage");
         }
-        if st == BootStage::Desktop { crate::splash::hold_release("first-screen"); } // SPLASH2 M3: the desktop furniture has composited above (BAR_HELD composite) — hand the glass over; setter / login screens release from `login::open_as` AFTER their first paint (5 s `hold_service` bound stays)
+        if st == BootStage::Desktop { crate::splash::hold_release("first-screen"); } // SPLASH2 M3: the desktop is asked for above (DESKTOPBUILT) — hand the glass over; setter / login screens release from `login::open_as` AFTER their first paint (5 s `hold_service` bound stays)
     }
 }
 
@@ -3316,16 +3302,3 @@ pub fn boot2_resolved() -> bool {
     BOOT2.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// INSTALLBARE (R86): the takeover did not enable the bar (the phase was not Desktop) — the first Desktop advance owes it.
-pub fn bar_owed() {
-    BAR_HELD.store(true, core::sync::atomic::Ordering::Release);
-}
-
-/// INSTALLBARE (R86): a session opened (`login::close_into_session`) — turn the owed bar on (boot 2's first login).
-pub fn bar_release() {
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-    if BAR_HELD.swap(false, core::sync::atomic::Ordering::AcqRel) {
-        let _ = crate::video::menubar::set_enabled(true);
-        crate::video::wm::composite();
-    }
-}

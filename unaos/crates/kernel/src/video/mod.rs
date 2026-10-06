@@ -1190,3 +1190,6 @@ pub mod wincap; pub mod rowstore; // WINDOWCAP (B378, R90): the one dynamic limi
 // KFONTPPI (B382): `video::edidsrc` — the EDID carry's source tag (fw / aux / none), the iGPU lane's AUX offer
 // into `EDID_BLOCK`, and the `:: KFONTPPI:` witness. Unconditional; at the tail so no line above moves.
 pub mod edidsrc;
+// DESKTOPBUILT (B387, R93): the desktop object — built at `login ok`, torn down at Log Out. Same gate as `strip`; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod desktopbuild;

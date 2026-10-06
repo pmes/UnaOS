@@ -700,11 +700,18 @@ pub fn rects(pw: usize, ph: usize, out: &mut [Option<Rect>; STRIP_MAX]) -> usize
 /// deliberately not `||`: both tenants must run, because a short-circuit would let the first
 /// repainting strip starve the second's damage test for the whole pass.
 pub fn compose_all() -> bool {
-    // FIRSTBOOT (R77): the bar, dock and menus are desktop furniture — nothing paints while the boot stage is the
-    // installer or the create-user form (the setter / the form is the whole glass).
+    // DESKTOPBUILT (B387, R93): the bar, dock and menus are the DESKTOP, an object built at `login ok`
+    // (`desktopbuild::build`) — before it is built (the setter, the create-user form, the login screen, after Log
+    // Out) nothing of it paints, and what it last painted is vacated. A GLASSEYES bare shot holds the strips as before.
     #[cfg(feature = "login")]
-    if crate::fs::users::furniture_held() {
+    if crate::boot::shot_bare_held() {
         return false;
+    }
+    #[cfg(feature = "login")]
+    if !super::desktopbuild::built() {
+        let a = super::dock::vacate_off();
+        let b = if super::menubar::enabled() { false } else { super::menubar::compose() }; // OFF: its own one-shot erase
+        return a | b;
     }
     let a = super::dock::compose();
     let b = super::menubar::compose();
