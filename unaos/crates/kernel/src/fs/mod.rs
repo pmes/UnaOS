@@ -190,3 +190,5 @@ pub mod bootfat;
 pub mod bootlog;
 /// SEARCH (B417 LAUNCHER; QUARRY3 B413 joins): `by_name(prefix, limit)` — files by name, one bounded walk of the name trees.
 pub mod search;
+/// ROOTACL (B456, SECREVIEW F2's sibling): the root's system trees carry a `system` owner in the native ACL.
+pub mod rootacl;
