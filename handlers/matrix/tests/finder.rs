@@ -95,7 +95,7 @@ fn ascend_from_child_reaches_parent() {
 fn list_excludes_build_noise_and_trash() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    for noise in ["target", ".git", "node_modules", ".una-trash"] {
+    for noise in ["target", ".git", "node_modules"] {
         fs::create_dir(root.join(noise)).unwrap();
         touch(&root.join(noise).join("payload"));
     }
@@ -214,7 +214,7 @@ fn move_relocates_the_entry() {
 }
 
 #[test]
-fn delete_confirms_then_moves_to_trash_reversibly() {
+fn delete_confirms_then_refuses_without_the_one_trash() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     touch(&root.join("doomed.txt"));
@@ -224,15 +224,11 @@ fn delete_confirms_then_moves_to_trash_reversibly() {
     assert_eq!(f.delete("doomed.txt", false), FsOutcome::NeedsConfirm);
     assert!(root.join("doomed.txt").exists());
 
-    // Confirmed: moved into .una-trash (NOT hard-deleted → reversible).
-    let out = f.delete("doomed.txt", true);
-    let FsOutcome::Ok { path } = out else {
-        panic!("expected Ok, got {out:?}");
-    };
-    assert!(path.starts_with(".una-trash/"), "trashed to {path}");
-    assert!(!root.join("doomed.txt").exists());
-    assert!(root.join(&path).exists(), "the trashed copy is recoverable");
-    assert_eq!(fs::read(root.join(&path)).unwrap(), b"x");
+    // SMALLFIX4 (TRASHCORE): a confirmed Delete is the ONE Trash's verb; with no vault attached it
+    // is refused loudly — never hard-deleted, never parked in a second workspace bin.
+    assert!(matches!(f.delete("doomed.txt", true), FsOutcome::Denied { .. }));
+    assert!(root.join("doomed.txt").exists());
+    assert!(!root.join(".una-trash").exists());
 }
 
 #[test]

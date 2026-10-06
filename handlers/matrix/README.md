@@ -80,12 +80,14 @@ handler stamps and logs the principal on every request. Verbs:
 | `Rename` | `rename` | same parent; a separator in the new name is refused. |
 | `Copy` | `copy` / recursive | file or dir; refuses copying a dir into itself. |
 | `Move` | `rename` | into a destination dir; refuses moving a dir into itself. |
-| `Delete` | move-to-trash | needs `confirmed`; REVERSIBLE — moves to `.una-trash/`, never hard-deletes. |
+| `Delete` | move-to-trash | needs `confirmed`; REVERSIBLE — the ONE Trash's `Trash` verb (the vault's `trash_core` bin); refused with no vault; never hard-deletes. |
 
 **Destructive-action discipline.** `Delete` with `confirmed: false` answers
 `FsOutcome::NeedsConfirm` (the UI re-issues with `confirmed: true`); a confirmed
-delete moves the target into the workspace `.una-trash/` (timestamp-prefixed) so
-it is recoverable — nothing is ever permanently destroyed.
+delete is the ONE Trash's `Trash` verb (the attached vault's `trash_core` bin, the
+same `una:trash-*` attributes the kernel stamps) so it is recoverable; with no vault
+attached it is refused loudly — nothing is ever permanently destroyed, and there is
+no second workspace bin (SMALLFIX4 retired `.una-trash/`).
 
 **Loud read-only refusal (FAT-verb posture).** A write a read-only volume or a
 permission-denied directory refuses surfaces as `FsOutcome::Denied` — loudly,
