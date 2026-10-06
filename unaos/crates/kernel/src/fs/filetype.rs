@@ -34,9 +34,9 @@ pub const TYPE_KEY: &str = una_abi::attr_keys::TYPE;
 // and the ELF split are `type_core`'s — the one table the host's bandy reads too. This file keeps what needs a volume.
 pub use type_core::{
     by_extension, ext_of, looks_json, looks_markdown, looks_text, APP_JSON, AUDIO_AAC, AUDIO_AIFF, AUDIO_FLAC, AUDIO_MP4, AUDIO_MPEG, AUDIO_OGG,
-    AUDIO_WAV, DIRECTORY, EXT_TABLE, GZIP, IMAGE_BMP, IMAGE_GIF, IMAGE_JPEG, IMAGE_PNG, IMAGE_QOI, IMAGE_SVG, IMAGE_WEBP, LINUX_ELF, OCTET, TAR,
-    TEXT_MARKDOWN, TEXT_PLAIN, UNAOS_BIN, UNAOS_ELF, VIDEO_MATROSKA, VIDEO_MP4, VIDEO_WEBM, IMAGE_ARW, IMAGE_TIFF,
-}; // RAWCORE (B444)'s two types live in type_core too (merge19)
+    AUDIO_WAV, DIRECTORY, EXT_TABLE, GZIP, IMAGE_ARW, IMAGE_BMP, IMAGE_GIF, IMAGE_JPEG, IMAGE_PNG, IMAGE_QOI, IMAGE_SVG, IMAGE_TIFF, IMAGE_WEBP, LINUX_ELF, OCTET, TAR,
+    TEXT_MARKDOWN, TEXT_PLAIN, UNAOS_BIN, UNAOS_ELF, VIDEO_MATROSKA, VIDEO_MP4, VIDEO_WEBM,
+};
 
 /// How many leading bytes the sniff reads (`ustar` sits at 257..262, so a tar needs 263).
 pub const SNIFF_LEN: usize = 512;
@@ -60,7 +60,6 @@ impl Source {
         }
     }
 }
-
 
 /// The sniff over a file's leading bytes. `None` = nothing recognised (the table decides). Pure.
 pub fn sniff(b: &[u8]) -> Option<&'static str> {

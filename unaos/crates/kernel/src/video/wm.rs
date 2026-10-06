@@ -30432,3 +30432,18 @@ impl<T: 'static> core::ops::DerefMut for Scratch<T> {
         }
     }
 }
+
+/// SMALLFIX4 item 11 (PREFSCAP fold) — arm the name of a program launched by `path` through a launcher that
+/// did not arm one (Lumen's probe, the shot mask's Lumen, Holocron at login): APPRES's name for the path
+/// (`fs::appres::launch_name`, the signature's last segment) when the path was sighted, else the path's own
+/// [`program_name`]. So `app_name_of` answers for it and PREFSCAP's refusal reaches only a program with no
+/// name at all. Witness: `[wm] launch-name owner=<o> path=<p> name=<n> via=<appres|path> armed=<0|1>`.
+pub fn app_name_arm_launch(owner: u64, path: &str) -> bool {
+    let (name, via) = match crate::fs::appres::launch_name(path) {
+        Some(n) => (n, "appres"),
+        None => (alloc::string::String::from(program_name(path)), "path"),
+    };
+    let armed = app_name_arm(owner, &name);
+    serial_println!("[wm] launch-name owner={} path={} name={} via={} armed={}", owner, path, name, via, armed as u8);
+    armed
+}

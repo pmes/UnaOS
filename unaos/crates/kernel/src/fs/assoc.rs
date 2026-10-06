@@ -38,7 +38,7 @@ pub const ICON_KEY: &str = una_abi::attr_keys::ICON;
 /// opener id / program path).
 pub const PREFERRED_KEY: &str = una_abi::attr_keys::PREFERRED;
 /// The registry's directory on the system volume (ROOTDISK2: `/system` is UnaFS).
-pub const TYPES_DIR: &str = "/system/filetypes";
+pub use type_core::TYPES_DIR; // SMALLFIX4 item 12 (TYPECORE fold): the one table owns the registry path
 
 /// `(mime, icon glyph, description)` — the type FACTS. No opener column: who opens a type is its registrants'.
 pub const TYPE_FACTS: &[(&str, &str, &str)] = &[
@@ -90,12 +90,13 @@ pub fn object_path(mime: &str) -> String {
 
 /// The MIME type a registry leaf names (`image-png` → `image/png`; a top-level type never carries a dash). Pure.
 pub fn mime_of_leaf(leaf: &str) -> String {
-    leaf.replacen('-', "/", 1)
+    match type_core::mime_leaf(leaf) { Some((t, st)) => alloc::format!("{}/{}", t, st), None => String::from(leaf) } // SMALLFIX4 item 12: type_core's leaf rule
 }
 
-/// `filetype::EXT_TABLE`'s extensions for `mime`, comma-separated (`md, markdown`). Pure.
+/// type_core's one table's extensions for `mime`, comma-separated (`md, markdown`). Pure. SMALLFIX4 item 12: walks
+/// `type_core::extensions_of` (TYPECORE fold), no second filter over the table.
 pub fn extensions_of(mime: &str) -> String {
-    let v: Vec<&str> = ft::EXT_TABLE.iter().filter(|(_, m)| *m == mime).map(|(e, _)| *e).collect();
+    let v: Vec<&str> = type_core::extensions_of(mime).collect();
     v.join(", ")
 }
 
@@ -633,7 +634,7 @@ pub fn openertrust_selftest() {
 // set is unchanged the build is a single attribute read.
 
 /// The stamp's key, on [`TYPES_DIR`] itself.
-pub const STAMP_KEY: &str = "una:filetypes.stamp";
+pub const STAMP_KEY: &str = una_abi::attr_keys::FILETYPES_STAMP;
 /// The builder's version: bump when `seed_in` changes what it writes (the stamp then differs and the build runs once).
 pub const BUILDER_VERSION: u32 = 1;
 

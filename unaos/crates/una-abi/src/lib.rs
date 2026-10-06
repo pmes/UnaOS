@@ -2097,6 +2097,8 @@ pub mod attr_keys {
     pub const VIEW_COLUMNS: &str = "una:view.columns";
     pub const VIEW_SORT: &str = "una:view.sort";
     pub const VIEW_FRAME: &str = "una:view.frame";
+    /// ASSOCSTAMP (B460): the FILETYPES registry directory's generation stamp (merge19).
+    pub const FILETYPES_STAMP: &str = "una:filetypes.stamp";
     /// The namespaces a key may live in.
     pub const NAMESPACES: &[&str] = &["una:", "media:", "doc:", "image:", "bt.", "job:"];
     /// Every registered key, once.
@@ -2106,7 +2108,7 @@ pub mod attr_keys {
         EMBED_MODEL, EMBED_DIMS, MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_DURATION_MS, MEDIA_CODEC, DOC_TITLE,
         IMAGE_ANIMATED, BT_LINKKEY, BT_KEYTYPE, BT_CLASS, BT_NAME, BT_HIDDESC, JOB_KIND, JOB_ID, JOB_SEQ,
         JOB_STATUS, JOB_FLIGHT, JOB_LINE, JOB_SET_BY, JOB_REFS, JOB_OWNER, JOB_ARC, JOB_TRACK,
-        DESCRIPTION, EXTENSIONS, MEDIA_CAMERA, MEDIA_LENS, MEDIA_EXPOSURE, MEDIA_ISO, MEDIA_FOCAL_MM, MEDIA_TAKEN, FSNAME, FSNAME_INDEX, VIEW_MODE, VIEW_COLUMNS, VIEW_SORT, VIEW_FRAME,
+        DESCRIPTION, EXTENSIONS, MEDIA_CAMERA, MEDIA_LENS, MEDIA_EXPOSURE, MEDIA_ISO, MEDIA_FOCAL_MM, MEDIA_TAKEN, FSNAME, FSNAME_INDEX, VIEW_MODE, VIEW_COLUMNS, VIEW_SORT, VIEW_FRAME, FILETYPES_STAMP,
     ];
 
     const fn str_eq(a: &str, b: &str) -> bool {

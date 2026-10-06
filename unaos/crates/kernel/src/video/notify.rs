@@ -541,9 +541,13 @@ pub fn press_at(x: i32, y: i32) -> bool {
     }
     if let Some(b) = super::menubar::bell_box_abs(pw, ph) {
         if inside(px, py, b) {
+            bell_switch(); // SMALLFIX4 (STATUSTRAY fold): a status menu that is down closes first — one press switches
             REQ_CENTER.store(1, Ordering::Release);
             return true;
         }
+    }
+    if CENTER_OPEN.load(Ordering::Relaxed) && center_switch(pw, ph, px, py) {
+        return false; // SMALLFIX4 (STATUSTRAY fold): the Center closes and the status item (the clock's menu too) opens on this press
     }
     if CENTER_OPEN.load(Ordering::Relaxed) {
         let r = center_rect(pw);
@@ -957,4 +961,27 @@ pub fn answer_leg() -> bool {
     let pressed = shown && SLOT_BTN[0].load(Ordering::Acquire) && press_at(bx as i32, by as i32) && { pass(t0 + 1); banners() == 0 };
     restore(h);
     pressed
+}
+
+/// SMALLFIX4 (STATUSTRAY fold) — the bar's two right-end surfaces agree: the Center (the bell) and the status
+/// items' menus (the clock's among them) SWITCH on one press, as winmenu's titles do. With the Center open, a
+/// press on a status item closes the Center and is handed on (`false` from `press_at`), so `crystal::press_at`
+/// opens that item's menu — the clock's menu is reachable from the Center without a dismiss press first.
+/// Witness: `[notify] switch from=center to=<item>`.
+fn center_switch(pw: usize, ph: usize, px: usize, py: usize) -> bool {
+    let Some(i) = super::statusmenu::item_at(pw, ph, px, py) else { return false };
+    REQ_CENTER.store(2, Ordering::Release);
+    serial_println!("[notify] switch from=center to={}", super::status::item_name(i));
+    true
+}
+
+/// SMALLFIX4 (STATUSTRAY fold) — the other direction: the bell pressed while a status item's menu is down
+/// closes that menu before the Center toggles. Witness: `[notify] switch from=<item> to=center`.
+fn bell_switch() {
+    let i = super::statusmenu::open_item();
+    if i == super::status::ITEM_NONE {
+        return;
+    }
+    super::crystal::dismiss_for_switch();
+    serial_println!("[notify] switch from={} to=center", super::status::item_name(i));
 }

@@ -119,7 +119,7 @@ pub fn after_login(name: &[u8]) {
     };
     match bytes {
         Ok(b) => match crate::arch::syscall::spawn_user_image_bg_argv(&b, &["holocron"]) {
-            Ok((pid, slot, _)) => serial_println!("[holocron] login user={} ring=unafs -> started pid={} slot={}", user, pid, slot),
+            Ok((pid, slot, _)) => { crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), APP); serial_println!("[holocron] login user={} ring=unafs -> started pid={} slot={}", user, pid, slot) } // SMALLFIX4 item 11: armed by APPRES
             Err(why) => serial_println!("[holocron] login user={} ring=unafs -> not started ({})", user, why),
         },
         Err(_) => serial_println!("[holocron] login user={} ring=unafs app=unreadable -> not started", user),

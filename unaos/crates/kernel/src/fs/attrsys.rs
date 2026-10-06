@@ -148,9 +148,8 @@ pub fn do_set(req: &[u8], principal: &str) -> i64 {
     }
     let (path, key) = (tryi!(user_path(p)), tryi!(user_key(k)));
     let v = tryi!(value_from_wire(tag, payload));
-    if system_tree(&table(), path) && principal != crate::fs::vfs::KERNEL_PRINCIPAL {
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::dialog::refused(crate::video::dialog::WHAT_SYSTEM_FILES, alloc::format!("attr-set path={} refused=system-tree principal={}", path, principal).as_bytes()); return una_abi::EACCES; // REFUSALUI (B468): shown once, app-modal. SECREVIEW F2 (R94): the root volume's system trees are not ring 3's to retag
-    }
+    // SMALLFIX4 item 12: SECREVIEW F2's path check is gone — ROOTACL (B456) stamps the system trees `system`-owned and
+    // `vfs::native_write_authz` -> `rootacl::write_verdict` refuses the set below (EACCES) for all but kernel + administrator.
     match table().set_attr(path, key, v, principal) {
         Ok(()) => 0,
         Err(e) => errno_of(&e),
@@ -341,15 +340,4 @@ pub fn selftest() {
         ":: ATTRSURF: set={} get={} list={} query={} denied={} removed={} dir={} -> {} ::",
         set, get, list, query, denied, removed as u8, dir, if pass { "PASS" } else { "FAIL" }
     );
-}
-
-/// SECREVIEW F2 (B442, R94): does `path` name an object under `/system`, `/apps` or `/lib` of the ROOT volume, in
-/// either spelling (`/system/…` or `/volumes/UnaOS/system/…` — `resolve` hands both the same volume-relative path)?
-/// The kernel creates those trees with no `owner` row, and the native ACL reads no-owner as public, so without this
-/// any ring-3 principal (even `anon`) could rewrite `/system/types/<mime>`'s `opener` for every user.
-fn system_tree(mt: &crate::fs::vfs::MountTable, path: &str) -> bool {
-    let root_vol = mt.volume_name("/").ok();
-    let Ok((_, rel)) = mt.resolve(path) else { return false };
-    let top = rel.trim_start_matches('/').split('/').next().unwrap_or("");
-    root_vol.is_some() && mt.volume_name(path).ok() == root_vol && matches!(top, "system" | "apps" | "lib")
 }

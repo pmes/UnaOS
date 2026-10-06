@@ -1251,8 +1251,6 @@ fi
 [ -n "${UNAOS_SVG:-}" ] && _feats="${_feats}svg,"
 # VIDEOPLAYER (B434): UNAOS_VIDEO=1 — the Player plays video (video::vplay over demux_core + vp8_core + av1_core; links av1_core). x86 metal; the K8_FEATS arm in kernel8() compiles the dependency only. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_VIDEO:-}" ] && _feats="${_feats}videoplayer,"
-# KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
-[ "${UNAOS_WC_BLITTER:-}" = "gpu" ] && _feats="${_feats}wc_gpublit,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
@@ -9352,10 +9350,6 @@ esp_x86_unafs_card() {
         cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$src" "$dst" -i "$vol" || {
             echo -e "${COLOR_RED}❌ ROOTDISK2: tools/unafs put ${src#${WORKSPACE_DIR}/} -> ${dst} failed — no card image${COLOR_RESET}"; return 1; }
     done
-    # UNAOSVOLUME (B427): the jobs onto the SAME volume — the working drive IS the boot disk's volume. `mica jobs
-    # build --into` is the one builder `./arroyo jobs-image` runs (records from STATUS.tsv, the ledgers, the queues;
-    # `job:*` attributes; `/jobs/queries/Open jobs`); its witness line is printed, its noise kept in the log.
-    jobs_into_volume "$vol" || return 1
     # ROOTACL (rmbp-ledger B456, SECREVIEW F2): every tree the loop put takes the `system` owner row, so the card is
     # system-owned from its first boot — the kernel's native ACL lets only `kernel` and the administrator write there
     # (children carry no row and inherit it; fs/rootacl.rs). The kernel stamps /system/types at the registry build.
@@ -9366,6 +9360,10 @@ esp_x86_unafs_card() {
             echo -e "${COLOR_RED}❌ ROOTACL: tools/unafs attr-set ${tree} owner failed — no card image${COLOR_RESET}"; return 1; }
         echo -e "${COLOR_YELLOW}⚡ ROOTACL: ${tree} owner=system${COLOR_RESET}"
     done
+    # UNAOSVOLUME (B427): the jobs onto the SAME volume — the working drive IS the boot disk's volume. `mica jobs
+    # build --into` is the one builder `./arroyo jobs-image` runs (records from STATUS.tsv, the ledgers, the queues;
+    # `job:*` attributes; `/jobs/queries/Open jobs`); its witness line is printed, its noise kept in the log.
+    jobs_into_volume "$vol" || return 1
     # WIFI-FW (R95/Peter 2026-10-06 "we have the bunker for this"): the BCM4331 b43 firmware set is BENCH-ONLY and never
     # in-tree (CLEAN_ROOM_POLICY §4; bcm4331.md §S4 option 1). UNAOS_WIFI_FW_PATH=<absolute dir in the bunker> holding
     # ucode29_mimo.fw + ht0initvals29.fw + ht0bsinitvals29.fw stages the three files onto the UnaFS root at /FIRMWARE/

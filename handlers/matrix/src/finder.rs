@@ -37,8 +37,9 @@
 //! fulfilment would run with the invoker's grants (ROADMAP message-security
 //! law). Writes that a read-only volume refuses surface as
 //! [`FsOutcome::Denied`] — the loud FAT-verb-style refusal — never a silent
-//! no-op. Deletes are reversible: they move to a workspace `.una-trash/` rather
-//! than hard-deleting, honoring the destructive-action discipline.
+//! no-op. Deletes are reversible: a confirmed Delete is the ONE Trash's `Trash` verb (the vault's
+//! `trash_core` bin, SMALLFIX4 / TRASHCORE B449) — never a hard delete, and never a second bin
+//! (the workspace `.una-trash/` this file kept is retired).
 
 use std::path::{Path, PathBuf};
 
@@ -46,12 +47,8 @@ use bandy::state::{BrowseEntry, BrowseKind, BrowseListing, FsOutcome, FsVerb};
 use bandy::MatrixEvent;
 use bandy::Origin;
 
-/// Directory names the Finder never lists — the genesis build-noise set plus
-/// the Finder's own trash bin.
-const EXCLUDED: &[&str] = &["target", ".git", "node_modules", TRASH_DIR];
-
-/// Workspace-relative name of the reversible trash bin.
-const TRASH_DIR: &str = ".una-trash";
+/// Directory names the Finder never lists — the genesis build-noise set.
+const EXCLUDED: &[&str] = &["target", ".git", "node_modules"];
 
 /// A file-browser cursor anchored at an absolute workspace root. All paths in
 /// and out of the Finder are workspace-relative (`""` = the root itself).
@@ -398,37 +395,14 @@ impl Finder {
         }
     }
 
-    /// Delete `path_rel`. Requires `confirmed` (else `NeedsConfirm`). A
-    /// confirmed delete is REVERSIBLE: it moves the target into the workspace
-    /// `.una-trash/`, never hard-deleting.
+    /// Delete `path_rel`. Requires `confirmed` (else `NeedsConfirm`). A confirmed delete is
+    /// REVERSIBLE and goes to the ONE Trash (the attached vault's, `trash_core`): with no vault
+    /// attached it is refused loudly rather than hard-deleted or parked in a second bin.
     pub fn delete(&self, path_rel: &str, confirmed: bool) -> FsOutcome {
         if !confirmed {
             return FsOutcome::NeedsConfirm;
         }
-        let src = match self.resolve(path_rel) {
-            Ok(p) => p,
-            Err(o) => return o,
-        };
-        if src == self.root {
-            return deny("cannot delete the workspace root");
-        }
-        if !src.exists() {
-            return deny(format!("no such path: {path_rel}"));
-        }
-        let trash = self.root.join(TRASH_DIR);
-        if let Err(e) = std::fs::create_dir_all(&trash) {
-            return io_outcome(&e, "delete");
-        }
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let base = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "item".to_string());
-        let dst = trash.join(format!("{stamp}-{base}"));
-        match std::fs::rename(&src, &dst) {
-            Ok(()) => FsOutcome::Ok { path: self.rel_of(&dst) },
-            Err(e) => io_outcome(&e, "delete"),
-        }
+        self.trash_verb(FsVerb::Trash, path_rel, true)
     }
 
     /// Run one verb by tag. `arg` is the second operand (new name / dest dir).

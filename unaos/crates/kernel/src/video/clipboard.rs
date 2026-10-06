@@ -164,7 +164,7 @@ pub fn set(bytes: &[u8]) -> bool {
         c.buf[..bytes.len()].copy_from_slice(bytes);
         c.len = bytes.len();
         c.epoch = epoch;
-        c.stamped = true;
+        c.stamped = true; FILE_REF.store(false, core::sync::atomic::Ordering::Release); // SMALLFIX4 (F13): any set is TEXT until set_file_ref marks it
     }
     serial_println!("[clip] set len={} epoch={}", bytes.len(), epoch);
     true
@@ -177,7 +177,7 @@ pub fn clear(reason: &str) {
         let mut c = CLIP.lock();
         let had = c.len;
         c.len = 0;
-        c.stamped = false;
+        c.stamped = false; FILE_REF.store(false, core::sync::atomic::Ordering::Release); // SMALLFIX4 (F13)
         had
     };
     serial_println!("[clip] clear len={} reason={}", had, reason);
@@ -550,4 +550,36 @@ pub fn selftest() {
         if epoch_clear { "ok" } else { "no" },
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+/// SMALLFIX4 (ARCHREVIEW F13) — the clipboard's one TYPE fact: is the text on it a FILE REFERENCE (a
+/// path Quarry copied) rather than typed text? Quarry kept its own `CLIP` beside this buffer, so a copy
+/// in Quarry and a paste in the editor never met. Now Quarry's Copy is [`set_file_ref`] — the path goes
+/// on the ONE buffer, epoch-stamped like any text, so the editor's `⌘V` pastes the path — and Quarry's
+/// Paste asks [`get_file_ref`], which answers only while the buffer still holds that reference (any
+/// later [`set`] or [`clear`] drops the mark). Witness: `[clip] set-ref len=<n> ok=<0|1>` and
+/// `[clip] get-ref len=<n> ref=<0|1>` beside the `[clip] set`/`[clip] get` lines the buffer prints.
+static FILE_REF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Put a file reference (a path) on the one clipboard, typed as such.
+pub fn set_file_ref(path: &str) -> bool {
+    let ok = set(path.as_bytes());
+    if ok {
+        FILE_REF.store(true, core::sync::atomic::Ordering::Release);
+    }
+    serial_println!("[clip] set-ref len={} ok={}", path.len(), ok as u8);
+    ok
+}
+
+/// The file reference on the clipboard, epoch-checked; `None` for text, empty, or a closed session.
+pub fn get_file_ref() -> Option<String> {
+    let mut buf = alloc::vec![0u8; CLIP_CAP];
+    let n = get(&mut buf);
+    let is_ref = n > 0 && FILE_REF.load(core::sync::atomic::Ordering::Acquire);
+    serial_println!("[clip] get-ref len={} ref={}", n, is_ref as u8);
+    if !is_ref {
+        return None;
+    }
+    buf.truncate(n);
+    String::from_utf8(buf).ok()
 }

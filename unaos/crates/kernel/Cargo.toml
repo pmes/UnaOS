@@ -3794,17 +3794,8 @@ lidsleep = ["smc"]
 # in sync with `unaos/arroyo` (the x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 svg = ["pixel_core/svg"]
 
-# KCOMP (rmbp-ledger B321; docs/dev/evidence/rmbp-1005/KCOMP.md): UNAOS_WC_BLITTER=gpu asks the compositor
-# for the Kepler copy-engine blitter (video/blitter.rs GpuBlitter). Until KBLIT binds its channel the probe
-# answers `kblit-channel-absent` and the CPU blitter is selected (`[wc] blitter=cpu reason=…` once at the
-# compositor ignition); any GPU blit error falls back to the CPU for that frame (`gpu_fallback=`). x86 only,
-# pairs with UNAOS_WC=1. Off: the probe answers `feature-off` and nothing else changes. Kept in sync with
-# `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`. GPUTESTS M3 (B334): implies `wc` —
-# the blitter sits under the window compositor and is meaningless without it.
-# GPUBLIT (B371): INERT. The GPU blitter now keys on the takeover build (`nvidia-kepler` +
-# `nvidia-kepler-takeover`) and arms itself from the boot self-test — no knob. Kept declared so existing knob
-# lines still build; the seat retires it (Cargo, arroyo, builder, the k8-reach row) at the fold.
-wc_gpublit = ["wc"]
+# KCOMP (B321)'s `wc_gpublit` (UNAOS_WC_BLITTER=gpu) is RETIRED (SMALLFIX4 B466): inert since GPUBLIT (B371) — the
+# GPU blitter keys on the takeover build and arms itself from the boot self-test. Drop it from any knob line.
 
 # VIDEOPLAYER (rmbp-ledger B434, MACPARITY row 30): UNAOS_VIDEO=1 — the Player plays video. `video::vplay` is
 # Stria's fulfiller over the shared cores (demux_core + vp8_core + av1_core; the Matroska Vorbis track through

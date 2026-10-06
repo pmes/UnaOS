@@ -357,9 +357,9 @@ fn listing_mime(mt: &MountTable, path: &str, e: &DirEnt, attrs: bool, sniffs: &m
     String::from(ft::OCTET)
 }
 
-/// Is `cwd` the session user's Trash?
+/// Is `cwd` the session user's Trash? SMALLFIX4 (TRASHCORE fold): the ONE rule, `trash_core::is_trash_folder`.
 pub fn is_trash(cwd: &str) -> bool {
-    cwd.eq_ignore_ascii_case(&crate::fs::trash::trash_dir())
+    trash_core::is_trash_folder(&crate::fs::trash::Mt(crate::shell::vfs_mount_table()), cwd, &crate::fs::trash::home_base())
 }
 
 /// Compute the facts for `list` in directory `cwd`. `origins` = the Trash's `(name, origin)` pairs

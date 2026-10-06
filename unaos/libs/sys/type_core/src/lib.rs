@@ -19,7 +19,8 @@ pub const IMAGE_BMP: &str = "image/bmp";
 pub const IMAGE_WEBP: &str = "image/webp";
 pub const IMAGE_QOI: &str = "image/qoi";
 pub const IMAGE_SVG: &str = "image/svg+xml";
-/// RAWCORE (B444): raw_core's types — a Sony raw, a plain TIFF (the strings are `raw_core::mime_of`'s).
+/// RAWCORE (B444): raw_core's types (`pixel_core::mime_of` -> `raw_core::mime_of`): a Sony raw, a plain TIFF.
+/// Carried into the one table at the TYPECORE x RAWCORE merge (SMALLFIX4).
 pub const IMAGE_ARW: &str = "image/x-sony-arw";
 pub const IMAGE_TIFF: &str = "image/tiff";
 pub const AUDIO_WAV: &str = "audio/wav";
@@ -75,10 +76,10 @@ pub const EXT_TABLE: &[(&str, &str)] = &[
     ("dib", IMAGE_BMP),
     ("webp", IMAGE_WEBP),
     ("qoi", IMAGE_QOI),
-    ("svg", IMAGE_SVG),
     ("arw", IMAGE_ARW), // RAWCORE (B444)
     ("tif", IMAGE_TIFF),
     ("tiff", IMAGE_TIFF),
+    ("svg", IMAGE_SVG),
     ("flac", AUDIO_FLAC),
     ("ogg", AUDIO_OGG),
     ("oga", AUDIO_OGG),

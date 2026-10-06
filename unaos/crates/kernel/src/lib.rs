@@ -317,3 +317,5 @@ pub mod sync;
 pub mod smallfix3;
 // SHELLTASK (rmbp-ledger B458): the shell's dispatch on its own task; the render task composes only. Tail statement.
 pub mod shelltask;
+// SMALLFIX4 (rmbp-ledger B466): `tests smallfix4` — the wave's minted codes unique, a path launch's name. Tail statement.
+pub mod smallfix4;

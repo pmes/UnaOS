@@ -511,7 +511,7 @@ static MODEL: crate::sync::Mutex<Option<Model>> = crate::sync::Mutex::new(None);
 /// INVARIANT: once [`open`] has published it, the `Vec` is at its final length and never grows, so the
 /// address `wm` holds stays valid for the window's whole life. [`close`] drops it only after
 /// `wm::close` has removed the row.
-static SURF: crate::sync::Mutex<Vec<u8>> = crate::sync::Mutex::new(Vec::new());
+static SURF: crate::sync::Mutex<Vec<u32>> = crate::sync::Mutex::new(Vec::new()); // SMALLFIX4 (SECREVIEW F6): ARGB8888 WORDS, so the `[u32]` view needs no cast and no alignment promise the allocator never made
 
 /// Repaint sequence — the wire's proof that a scroll or a navigation actually redrew, and the number
 /// `quarry.md` §5's cost note is counted against.
@@ -1827,13 +1827,9 @@ fn repaint() {
         return;
     }
     {
-        // SAFETY: `surf` is a `Vec<u8>` of exactly `w * h * 4` bytes, allocated by `open` and never
-        // resized; a `[u32]` view over it is in-bounds and correctly aligned (a `Vec<u8>` from the
-        // global allocator meets `u32`'s alignment for a 4-byte-multiple length, and `wm` reads the
-        // same bytes as ARGB8888 words).
-        let px: &mut [u32] = unsafe {
-            core::slice::from_raw_parts_mut(surf.as_mut_ptr() as *mut u32, m.geom.w * m.geom.h)
-        };
+        // SMALLFIX4 (SECREVIEW F6): `surf` IS `w * h` ARGB8888 words (allocated by `open`, never resized), so
+        // the view is a plain reborrow — the old `Vec<u8>`-as-`[u32]` cast leaned on an alignment Rust does not promise.
+        let px: &mut [u32] = &mut surf[..];
         repaint_locked(m, px);
     }
     drop(surf);
@@ -1977,11 +1973,11 @@ pub fn open() {
     {
         let mut surf = SURF.lock();
         surf.clear();
-        if surf.try_reserve_exact(len).is_err() {
+        if surf.try_reserve_exact(g.w * g.h).is_err() {
             serial_println!("[quarry] DECLINE reason=alloc len={}", len);
             return;
         }
-        surf.resize(len, 0);
+        surf.resize(g.w * g.h, 0); // SMALLFIX4 (F6): words; `len` stays the byte length `wm` is handed
     }
     // The model, then the first full paint, then the row. `repaint` needs no window (it presents only
     // when one exists), so this ordering costs nothing and buys the "never composite a blank surface"
@@ -2724,6 +2720,9 @@ fn wheel_scroll(m: &mut Model, sx: usize, sy: usize, detents: i32) -> Option<Whe
     let tree = g.tree_pane().contains(sx, sy);
     if !tree && !g.list_pane().contains(sx, sy) {
         return None;
+    }
+    if !tree && toolbar::view() == toolbar::View::Columns {
+        return millercols::wheel(m, sx, sy, detents); // SMALLFIX4 (COLUMNSVIEW owed): the wheel moves the pane under the pointer
     }
     let (len, vis, scroll) = if tree {
         (m.tree.len(), m.tree_visible(), m.tree_scroll)

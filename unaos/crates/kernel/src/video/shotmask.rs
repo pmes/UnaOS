@@ -368,7 +368,7 @@ fn compose(s: State) -> Result<Undo, String> {
             }
             let mut img = Vec::new();
             fs.read_file(&de, &mut img, cap).map_err(|_| String::from("LUMEN.ELF read failed"))?;
-            let (pid, slot, _entry) = crate::arch::syscall::spawn_user_image_bg(&img).map_err(|e| format!("lumen spawn refused ({})", e))?;
+            let (pid, slot, _entry) = crate::arch::syscall::spawn_user_image_bg(&img).map_err(|e| format!("lumen spawn refused ({})", e))?; crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), "/apps/LUMEN.ELF"); // SMALLFIX4 item 11
             sleep_ms(500); // the window is the program's to mint; settle measures the rest
             Ok(Undo::Kill(pid, slot))
         }
