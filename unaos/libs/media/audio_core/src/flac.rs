@@ -8,7 +8,7 @@ use crate::bits::BitReader;
 use crate::crc::{crc16, crc8};
 use crate::io::ByteStream;
 use crate::md5::Md5;
-use crate::{Codec, Error, Format, Info, Pcm, Result, Source};
+use crate::{SeekPoint, Codec, Error, Format, Info, Pcm, Result, Source};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -311,6 +311,11 @@ pub struct FlacDecoder {
     done: bool,
     /// Set at end of stream: `Some(true)` the MD5 matched, `Some(false)` STREAMINFO carried no MD5.
     pub md5_ok: Option<bool>,
+    /// SEEKTABLE (rmbp B433): the first frame's byte offset, the SEEKTABLE block's points `(sample, byte)` (bytes
+    /// absolute), and whether a seek happened (the whole-stream MD5 is then not checkable).
+    first: u64,
+    points: Vec<(u64, u64)>,
+    seeked: bool,
 }
 
 impl FlacDecoder {
@@ -320,23 +325,28 @@ impl FlacDecoder {
             // A headerless stream (frames only, no `fLaC`/STREAMINFO): the first frame header carries every
             // parameter a decode needs; there is no MD5 to verify and no total.
             let si = StreamInfo { rate: h.rate, channels: h.channels as u32, bps: h.bps, ..StreamInfo::default() };
-            return Ok(FlacDecoder { s, fd: FrameDecoder::new(si), done: false, md5_ok: None });
+            let first = s.offset();
+            return Ok(FlacDecoder { s, fd: FrameDecoder::new(si), done: false, md5_ok: None, first, points: Vec::new(), seeked: false });
         }
         if s.take(4)? != b"fLaC" { return Err(Error::Invalid("not fLaC")); }
         let mut si = None;
+        let mut table: Vec<(u64, u64)> = Vec::new();
         loop {
             let h = s.take(4)?;
             let last = h[0] & 0x80 != 0;
             let len = u32::from_be_bytes([0, h[1], h[2], h[3]]) as usize;
             match h[0] & 0x7F {
                 0 => si = Some(StreamInfo::parse(&s.take(len)?)?),
+                3 => table = seektable(&s.take(len)?), // SEEKTABLE (RFC 9639 §8.5)
                 127 => return Err(Error::Invalid("metadata block type 127")),
                 _ => s.skip(len as u64)?,
             }
             if last { break; }
         }
         let si = si.ok_or(Error::Invalid("no STREAMINFO"))?;
-        Ok(FlacDecoder { s, fd: FrameDecoder::new(si), done: false, md5_ok: None })
+        let first = s.offset();
+        let points = table.into_iter().map(|(n, o)| (n, first + o)).collect();
+        Ok(FlacDecoder { s, fd: FrameDecoder::new(si), done: false, md5_ok: None, first, points, seeked: false })
     }
     pub fn stream_info(&self) -> StreamInfo { self.fd.si }
 }
@@ -353,7 +363,7 @@ impl Source for FlacDecoder {
             let have = self.s.fill(want)?;
             if have < 2 {
                 self.done = true;
-                self.md5_ok = Some(self.fd.verify()?);
+                self.md5_ok = if self.seeked { None } else { Some(self.fd.verify()?) };
                 return Ok(false);
             }
             let d = self.s.data();
@@ -378,6 +388,85 @@ impl Source for FlacDecoder {
                 }
                 Err(e) => return Err(e),
             }
+        }
+    }
+    /// SEEKTABLE (rmbp B433): the SEEKTABLE block's nearest point at or before the target, then the frame headers'
+    /// own coded numbers (CRC-8 checked) — bisected between the bracketing points, then walked — to the frame that
+    /// holds the target. Every FLAC frame is independently decodable, so the landing is exact.
+    fn seek(&mut self, target: u64) -> Result<Option<SeekPoint>> {
+        let total = self.fd.si.total;
+        let end = match self.s.len() { Some(l) => l, None => return Ok(None) };
+        if !self.s.seekable() && self.s.offset() > self.first { return Ok(None); }
+        let target = if total > 0 { target.min(total) } else { target };
+        // bracket: [lo, hi) bytes; lo is a frame start whose first sample is <= target
+        let (mut lo, mut lo_sample) = (self.first, 0u64);
+        let mut hi = end;
+        for &(n, o) in &self.points {
+            if n <= target && o >= lo && o < end { lo = o; lo_sample = n; }
+            if n > target && o > lo && o < hi { hi = o; }
+        }
+        // bisect on frame headers while the bracket is wider than a few frames
+        let span = if self.fd.si.max_frame > 0 { self.fd.si.max_frame as u64 * 4 } else { 1 << 16 };
+        while hi > lo + span {
+            let mid = lo + (hi - lo) / 2;
+            match self.header_after(mid, hi)? {
+                Some((b, n)) if n <= target => { lo = b; lo_sample = n; }
+                _ => hi = mid,
+            }
+        }
+        // walk frame headers forward to the last one starting at or before the target
+        loop {
+            match self.header_after(lo + 1, end)? {
+                Some((b, n)) if n <= target && n > lo_sample => { lo = b; lo_sample = n; }
+                _ => break,
+            }
+        }
+        if !self.s.seek(lo)? { return Ok(None); }
+        self.seeked = true;
+        self.done = false;
+        let table = "flac";
+        Ok(Some(SeekPoint { byte: lo, sample: lo_sample, exact: true, table, landed: lo_sample }))
+    }
+}
+
+/// RFC 9639 §8.5: 18-byte seek points `(first sample, byte offset from the first frame, samples)`; placeholder
+/// points (sample = all ones) are skipped.
+fn seektable(b: &[u8]) -> Vec<(u64, u64)> {
+    b.chunks_exact(18)
+        .map(|c| (u64::from_be_bytes(c[0..8].try_into().unwrap()), u64::from_be_bytes(c[8..16].try_into().unwrap())))
+        .filter(|&(n, _)| n != u64::MAX)
+        .collect()
+}
+
+impl FlacDecoder {
+    /// The first frame header at or after byte `from` (and before `until`) that parses, passes its CRC-8 and agrees
+    /// with STREAMINFO: `(byte, first sample)`.
+    fn header_after(&mut self, from: u64, until: u64) -> Result<Option<(u64, u64)>> {
+        if !self.s.seek(from)? { return Ok(None); }
+        let si = self.fd.si;
+        loop {
+            let at = self.s.offset();
+            if at >= until { return Ok(None); }
+            let have = self.s.fill(1 << 15)?;
+            if have < 2 { return Ok(None); }
+            let d = self.s.data();
+            let lim = have.min((until - at) as usize);
+            let mut i = 0;
+            while i + 1 < lim {
+                if d[i] == 0xFF && d[i + 1] & 0xFE == 0xF8 {
+                    if have - i < 16 && have >= 16 { break; } // too near the window's end: refill from here
+                    let mut r = BitReader::new(&d[i..]);
+                    if let Ok(h) = parse_header(&mut r, &d[i..], &si) {
+                        if h.channels as u32 == si.channels && h.bps == si.bps && h.rate == si.rate {
+                            let n = if h.variable { h.number } else { h.number * if si.max_block > 0 && si.min_block == si.max_block { si.max_block as u64 } else { h.block as u64 } };
+                            return Ok(Some((at + i as u64, n)));
+                        }
+                    }
+                }
+                i += 1;
+            }
+            if have <= 16 { return Ok(None); }
+            self.s.consume(i.max(1));
         }
     }
 }

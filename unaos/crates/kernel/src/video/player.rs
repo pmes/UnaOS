@@ -14,8 +14,9 @@
 //!   close box, or any close the WM makes (Cmd-W, the File menu, Quit: the WINID holder clears [`WIN`]) — stops
 //!   the play. `tests play` keeps its own door path (the queue in `hda_play.rs`), untouched.
 //! * The play stays the HDA driver's (`drivers/hda_play.rs`, its PLAYER tail: `pause`, `seek_to`, `position_ms`,
-//!   `facts`). A coded seek is `method=decode-skip table=none` — audio_core has no seek table and
-//!   `demux_core::Demuxer::seek` is the video container's — a WAV seek `method=pcm-exact`.
+//!   `facts`). A seek is `method=table`: a WAV's byte offset (`table=pcm`), a coded file's container index through
+//!   `audio_core::Decoder::seek` in the `play-dec` job (SEEKTABLE B433: `table=flac|xing|vbri|cbr|mp4`); a format
+//!   with no table there (Ogg, ADTS) is `method=decode-skip table=none`.
 //! * F7/F8/F9 (previous / play-pause / next) reach [`media_key`] from `status::volkey_usage` (atomics only); the
 //!   next pass acts and arms BEZEL's play/pause glyph. With no player open the keys do nothing (said once).
 //! * The info line reads ATTRCOLUMNS' `media:duration_ms` / `media:codec` through `get_attr`; without them, the
@@ -790,7 +791,7 @@ fn ensure_registered() {
 
 /// `tests player` on TEST.WAV (staged in `/system/test-f`, else the user's home; else the PLAYWAV fixture body
 /// written to a scratch file): open → the window and a running stream; transport → pause clears RUN, play sets
-/// it again; seek → 1000 ms lands pcm-exact and runs; volume → the slider's level is the one model and the amp
+/// it again; seek → 1000 ms lands through the table (`method=table`, exact) and runs; volume → the slider's level is the one model and the amp
 /// reads it back; close → the window and the play are gone.
 pub fn fixture() {
     if !hw::LIVE {
@@ -859,9 +860,9 @@ pub fn fixture() {
     toggle();
     let resumed_ok = playing() && hw::pump_until(1000, hw::run_bit);
     let transport_ok = open_ok && paused_ok && resumed_ok;
-    // seek: 1000 ms, pcm-exact, and the stream runs from there
+    // seek: 1000 ms through the table (a WAV's is its byte offset: exact), and the stream runs from there
     let sk = seek(1000);
-    let seek_ok = matches!(sk, Some((l, "pcm-exact")) if l.abs_diff(1000) <= 1) && hw::pump_until(1000, hw::run_bit)
+    let seek_ok = matches!(sk, Some((l, "table")) if l.abs_diff(1000) <= 1) && hw::pump_until(1000, hw::run_bit)
         && STATE.lock().as_ref().map(|s| s.base_ms == sk.map(|v| v.0).unwrap_or(0)).unwrap_or(false);
     // volume: the slider's level is the model's, and the amp agrees (BEZEL's reading)
     let (l0, m0) = crate::video::status::volume();
@@ -895,8 +896,8 @@ pub fn fixture() {
         path, ran as u8, paused_ok as u8, resumed_ok as u8, sk, l0, target, amp
     );
     serial_println!(
-        ":: PLAYER: open={} transport={} seek={} volume={} close_stops={} -> {} ::",
-        w(open_ok), w(transport_ok), w(seek_ok), if shared { "shared" } else { "split" }, close_stops as u8,
+        ":: PLAYER: open={} transport={} seek={} method={} volume={} close_stops={} -> {} ::",
+        w(open_ok), w(transport_ok), w(seek_ok), sk.map(|v| v.1).unwrap_or("none"), if shared { "shared" } else { "split" }, close_stops as u8,
         if ok { "PASS" } else { "FAIL" }
     );
 }
