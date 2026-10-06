@@ -8,7 +8,7 @@
 //!
 //! ONE gate, [`phase`], answers for the whole boot:
 //!
-//! * [`Phase::Setter`] — the store is not read yet, or it says Installer / CreateUser (root's password, the first user);
+//! * [`Phase::Setter`] — the store is not read yet, or it says Installer (the first-user form, R100);
 //! * [`Phase::LoginScreen`] — the store has users (boot 2) and no session has opened since the boot;
 //! * [`Phase::Desktop`] — otherwise; LATCHED by the first session open ([`session_opened`], from
 //!   `login::close_into_session`) or the installer's own `user-created` advance ([`ignite`]), so a later Log Out
@@ -77,7 +77,7 @@ pub fn phase() -> Phase {
             return Phase::Setter;
         }
         match users::boot_stage() {
-            users::BootStage::Installer | users::BootStage::CreateUser => Phase::Setter,
+            users::BootStage::Installer => Phase::Setter,
             users::BootStage::Desktop => {
                 if users::boot2_resolved() {
                     Phase::LoginScreen

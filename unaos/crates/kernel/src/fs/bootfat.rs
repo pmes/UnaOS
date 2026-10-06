@@ -51,6 +51,7 @@ pub fn refuse(volume: &str, root: &str, rel: &str, principal: &str) -> bool {
         return false;
     }
     REFUSED.fetch_add(1, Ordering::Relaxed);
+    if !rel.contains("R99PROBE") { WRITERS.fetch_add(1, Ordering::Relaxed); } // SMALLFIX3 (B416): a refusal that is not `tests bootfat`'s own probe is a fixture writing to /boot
     serial_println!("[boot] fat write refused path=/boot{}{} by={} (R99: sacred) ::", root, rel, principal);
     true
 }
@@ -58,17 +59,28 @@ pub fn refuse(volume: &str, root: &str, rel: &str, principal: &str) -> bool {
 /// The named unlock. Held only by the installer/updater for one write; dropped = relocked.
 pub struct FatUnlock {
     by: &'static str,
+    /// SMALLFIX3 (B416): `false` when the administrator's authority refused it — the gate stays shut.
+    held: bool,
 }
 
 /// Open the boot FAT for ONE named write (`by` = `installer` or `updater`, `for_what` = what is written).
 pub fn fat_unlock(by: &'static str, for_what: &str) -> FatUnlock {
+    // SMALLFIX3 (B416, R100): the one writer path asks the administrator's authority once (`[auth] admin=… for=boot-fat-write`).
+    #[cfg(feature = "login")]
+    if crate::fs::users::admin_authority("boot-fat-write").is_err() {
+        serial_println!("[boot] fat unlock refused by={} for={} (R100: not the administrator) ::", by, for_what);
+        return FatUnlock { by, held: false };
+    }
     UNLOCKS.fetch_add(1, Ordering::AcqRel);
     serial_println!("[boot] fat unlocked by={} for={} (R99: installer/updater only; relocks on drop) ::", by, for_what);
-    FatUnlock { by }
+    FatUnlock { by, held: true }
 }
 
 impl Drop for FatUnlock {
     fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
         UNLOCKS.fetch_sub(1, Ordering::AcqRel);
         serial_println!("[boot] fat relocked by={} ::", self.by);
     }
@@ -142,4 +154,19 @@ pub fn unlock_path() -> &'static str {
     let open = allows();
     drop(u);
     if open && !allows() { "installer" } else { "broken" }
+}
+
+// SMALLFIX3 (rmbp-ledger B416) — the boot FAT's refusals, asked BEFORE a write and counted after one. Tail.
+/// Refusals of a write that was NOT `tests bootfat`'s own `R99PROBE` — a fixture that still writes to `/boot`.
+static WRITERS: AtomicU32 = AtomicU32::new(0);
+
+/// `FatBackend::write_veto`, first: the reason a write to `volume` would be refused now, without saying it on
+/// the wire (the veto is a question, the refusal in [`refuse`] is the event).
+pub fn veto(volume: &str) -> Option<&'static str> {
+    if volume == BOOT_VOLUME && !allows() { Some("the boot FAT is sacred (R99): read-only for every principal") } else { None }
+}
+
+/// `tests smallfix3`'s `boot_writers=`: `None` when the gate is not armed (a FAT-root boot: the FAT is `/`).
+pub fn writers() -> Option<u32> {
+    if sacred() { Some(WRITERS.load(Ordering::Relaxed)) } else { None }
 }

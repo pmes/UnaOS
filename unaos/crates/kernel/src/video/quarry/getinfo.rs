@@ -46,11 +46,17 @@ pub fn open(path: &str) {
     let kind = if matches!(st.kind, NodeKind::Dir) { "folder" } else { "file" };
     let when = st.mtime.map(af::fmt_when).unwrap_or_else(|| String::from("-"));
     let head = alloc::format!("{}  {} bytes  modified {}", kind, st.size, when);
-    let (rows, note) = match af::info_rows(&mt, path) {
+    let (mut rows, note) = match af::info_rows(&mt, path) {
         Ok(r) => (r, None),
         Err(VfsError::Unsupported) => (Vec::new(), Some("this volume carries no typed attributes (FAT)")),
         Err(_) => (Vec::new(), Some("attributes unreadable")),
     };
+    // SMALLFIX3 (B416): a settings file (SETTINGSFILES B407, R98) shows its auto-saved line and every key in the
+    // SAME inspector — one Get Info, not a second notice (`ops.rs`'s Show Info joins here).
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    for l in crate::video::settingsfiles::info_lines(path) {
+        rows.push(af::InfoRow { key: l, ty: "setting", val: String::new(), when: None });
+    }
     serial_println!("[getinfo] path={} attrs={} {}", path, rows.len(), head);
     for r in rows.iter() {
         serial_println!("[getinfo]   {} ({}) = {} changed={}", r.key, r.ty, r.val, r.when.map(af::fmt_when).unwrap_or_else(|| String::from("-")));

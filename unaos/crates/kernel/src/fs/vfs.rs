@@ -1537,7 +1537,7 @@ impl VfsBackend for FatBackend {
     /// the same answer the block layer gives, with the REASON attached, so the operator line names
     /// the mechanism that said no instead of a bare `-ENOTSUP`.
     fn write_veto(&self) -> Option<&'static str> {
-        self.source.write_veto()
+        crate::fs::bootfat::veto(&self.volume).or_else(|| self.source.write_veto()) // SMALLFIX3 (B416): R99 asked BEFORE the write, so a fixture's skip guard (XVOL's `write_veto`) sees the sacred FAT
     }
 
     fn rename(&self, from_rel: &str, to_rel: &str, principal: &str) -> Result<(), VfsError> {

@@ -2877,7 +2877,7 @@ pub fn login_usermgmt_fixture() {
 // with root's password set and no user rows, a create-user dialog; only then the desktop, FOR THAT USER.
 // ONE predicate decides, derived from the loaded store and published once per stage change:
 //   root password unset               -> Installer   (the setter is the whole glass)
-//   root password set, no user rows   -> CreateUser  (name + password twice; the adduser path)
+//   (R100, SMALLFIX3: no root step — no user rows is the Installer, whose one screen is the first-user form)
 //   else                              -> Desktop
 // Every desktop tenant asks [`desktop_allowed`]: the STAT.ELF launch, the witness launcher (`winx_launcher`),
 // the furniture compose (`strip::compose_all`). The store is known ~400 ms after the takeover on the rMBP
@@ -2889,15 +2889,13 @@ pub fn login_usermgmt_fixture() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BootStage {
     Installer,
-    CreateUser,
-    Desktop,
+    Desktop, // SMALLFIX3 (B416): R100's `CreateUser` stage retired — `stage_of_store` never produced it; the first-user form IS the Installer's screen
 }
 
 impl BootStage {
     pub fn word(self) -> &'static str {
         match self {
             BootStage::Installer => "installer",
-            BootStage::CreateUser => "create-user",
             BootStage::Desktop => "desktop",
         }
     }
@@ -2924,8 +2922,7 @@ pub fn stage_of_store() -> BootStage {
 pub fn boot_stage() -> BootStage {
     match STAGE.load(core::sync::atomic::Ordering::Acquire) {
         0 => BootStage::Installer,
-        1 => BootStage::CreateUser,
-        2 => BootStage::Desktop,
+        1 => BootStage::Desktop,
         _ => BootStage::Installer,
     }
 }
@@ -2963,7 +2960,7 @@ fn stage_witness(why: &str) {
     serial_println!(
         ":: FIRSTBOOT: stage={} root={} users={} desktop_ignited={} why={} -> {} ::",
         if login { "login-screen" } else { st.word() }, if root_set { "locked" } else { "ROW" }, users, up, why,
-        if (st == BootStage::Installer && root_set && users == 0 && !up) || (st == BootStage::CreateUser && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || why == "no-store" { "PASS" } else { "FAIL" }
+        if (st == BootStage::Installer && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || why == "no-store" { "PASS" } else { "FAIL" }
     ); crate::bootpace::boot_line(); // QUIETBOOT M4 (R80): the boot's one measurement, after its first stage line.
 }
 
@@ -2980,7 +2977,6 @@ fn stage_publish(st: BootStage, why: &str) {
     } else {
     serial_println!("[login] installer: stage={} (R77: {})", st.word(), match st {
         BootStage::Installer => "R100: no user — the first-user form is the whole glass (that user is the administrator; root is locked); no desktop, no programs, no fixtures",
-        BootStage::CreateUser => "root's password is set and there is no user — the create-user form",
         BootStage::Desktop => "the desktop ignites",
     });
     }
@@ -3013,7 +3009,7 @@ pub fn stage_resolve(why: &str) {
             serial_println!("[login] boot 2: login screen deferred to the glass (the screen's window needs the surface)");
         }
     }
-    if st == BootStage::CreateUser || (st == BootStage::Installer && TABLE.lock().loaded) { // FIRSTUSER (R100): the Installer's one screen is the first-user form
+    if st == BootStage::Installer && TABLE.lock().loaded { // FIRSTUSER (R100): the Installer's one screen is the first-user form
         if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
             screen_create_user();
         } else {
@@ -3092,7 +3088,7 @@ pub fn installer_root_password_set() {
 /// the session for THAT user and the desktop. `Err` is a one-line reason for the form; nothing is printed
 /// of the password.
 pub fn installer_create_user(name: &[u8], password: &[u8]) -> Result<(), &'static str> {
-    if !matches!(boot_stage(), BootStage::CreateUser | BootStage::Installer) || !TABLE.lock().loaded || user_count() != 0 {
+    if !matches!(boot_stage(), BootStage::Installer) || !TABLE.lock().loaded || user_count() != 0 {
         return Err("not the create-user stage");
     }
     create_user_rules(name, password)?;

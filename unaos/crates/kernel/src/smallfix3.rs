@@ -24,7 +24,7 @@ pub const ACTIONS: &[Action] = &[
     Action::SnapLeft, Action::SnapRight, Action::SnapZoom, Action::SnapRestore, Action::WinNudgeLeft,
     Action::WinNudgeRight, Action::WinNudgeUp, Action::WinNudgeDown, Action::WinSizeLeft, Action::WinSizeRight,
     Action::WinSizeUp, Action::WinSizeDown, Action::Minimize, Action::CycleApp, Action::QuitApp, Action::CloseWindow,
-    Action::HideApp, Action::OpenSettings, Action::ForceQuit, Action::ClearView,
+    Action::HideApp, Action::OpenSettings, Action::ForceQuit, Action::ClearView, Action::GetInfo,
 ];
 
 /// Exhaustive on purpose (no `_` arm): a new variant does not compile until it is named here — and the
@@ -40,7 +40,7 @@ pub const fn listed(a: Action) -> bool {
         | Action::SnapRight | Action::SnapZoom | Action::SnapRestore | Action::WinNudgeLeft | Action::WinNudgeRight
         | Action::WinNudgeUp | Action::WinNudgeDown | Action::WinSizeLeft | Action::WinSizeRight | Action::WinSizeUp
         | Action::WinSizeDown | Action::Minimize | Action::CycleApp | Action::QuitApp | Action::CloseWindow
-        | Action::HideApp | Action::OpenSettings | Action::ForceQuit | Action::ClearView => true,
+        | Action::HideApp | Action::OpenSettings | Action::ForceQuit | Action::ClearView | Action::GetInfo => true,
     }
 }
 
@@ -75,7 +75,7 @@ pub fn theme_rows() -> (usize, usize) {
 /// tree/boot (no `fs::bootfat`, or a FAT-root boot where the FAT is `/`). ROOTDISK2's fold replaces the body
 /// with `bootfat`'s non-probe refusal count (smallfix3.md, patch P1).
 pub fn boot_writers() -> Option<u32> {
-    None
+    crate::fs::bootfat::writers()
 }
 
 /// `(fixture, arc)` for the fixtures NOT named after their arc. Every other fixture's arc is its name,

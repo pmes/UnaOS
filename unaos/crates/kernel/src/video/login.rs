@@ -2385,6 +2385,7 @@ fn power_row(px: &mut [u32]) {
     if !power_row_on() {
         return;
     }
+    super::loginwindow::POWER_ROW.store(true, Ordering::Release); // SMALLFIX3 (B416): FIRSTUSER's `login_window=users+power` reads DIALOG2's row
     let k = PFOCUS.load(Ordering::Relaxed);
     for i in 0..3u8 {
         let (x, y, w, h) = ctl_rect(Ctl::Power(i), false);
