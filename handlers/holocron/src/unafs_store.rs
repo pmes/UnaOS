@@ -39,7 +39,7 @@ impl<D: BlockDevice> UnaFsStore<D> {
         if !name::valid(user) {
             return Err(StoreError);
         }
-        Ok(UnaFsStore { fs, base: format!("/home/{user}/.holocron") })
+        Ok(UnaFsStore { fs, base: holocron_core::root::root(&format!("/home/{user}")) }) // B448: the one root
     }
 
     /// The volume (attribute checks, `query`).

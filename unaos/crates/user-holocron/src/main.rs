@@ -25,7 +25,8 @@ static HEAP: vein_ring3::heap::Heap = vein_ring3::heap::Heap::sbrk();
 // Verbs: `init <pw>` · `unlock <pw>` · `lock` · `status` · `put <ns> <name> <value> [label]` ·
 // `get <ns> <name>` · `list <ns>` · `delete <ns> <name>`; bare `holocron` = `status`.
 //
-// I/O: the store is `<home>/.config/unaos/holocron/` (`.ring`, `<ns>/<name>`) over SYS_PATH_READ/WRITE
+// I/O: the store is `<home>/.holocron/` (`.ring`, `<ns>/<name>`; THE root, `holocron_core::root` — B448 moved
+// it from `<home>/.config/unaos/holocron/`, migrated once at the fulfiller's start) over SYS_PATH_READ/WRITE
 // (`PATH_W_TRUNC|MKDIRS`, `PATH_W_UNLINK`, `PATH_R_LIST`), REFUSED unless `<home>` stats with an inode id
 // (UnaFS: FAT has no owner, so a ring there would be readable by anything that mounts the card). Entropy:
 // CRYPTOCORE's ChaCha20 DRBG over SYS_GETRANDOM (`holocron_core::cc::DrbgEntropy`). The ring KDF: WINDOW2
@@ -285,8 +286,8 @@ fn write_all(path: &str, data: &[u8]) -> Result<(), StoreError> {
     }
 }
 
-/// `<home>/.config/unaos/holocron/` on UnaFS — the host layout (`.ring`, `<ns>/<name>`) under the
-/// per-user config root the rest of the metal uses.
+/// `<home>/.holocron/` on UnaFS — the host layout (`.ring`, `<ns>/<name>`) at the root `holocron_core::root`
+/// names for both rings (HOLOCRONROOT, B448). A legacy root is opened as a PathStore too, only to migrate.
 struct PathStore {
     root: String,
     ok: bool,
@@ -338,12 +339,53 @@ impl Store for PathStore {
     }
     fn remove(&mut self, ns: &str, name: &str) -> Result<bool, StoreError> {
         self.gate()?;
-        let req = path_req(&self.file(ns, name), PATH_W_UNLINK, 0, &[]).ok_or(StoreError)?;
-        match sys(SYS_PATH_WRITE, req.as_ptr() as u64, req.len() as u64, 0, 0) {
-            r if r >= 0 => Ok(true),
-            ENOENT => Ok(false),
-            _ => Err(StoreError),
+        unlink(&self.file(ns, name))
+    }
+    fn remove_ring(&mut self) -> Result<bool, StoreError> {
+        self.gate()?;
+        unlink(&self.ring())
+    }
+}
+
+/// `PATH_W_UNLINK` one path: `Ok(false)` when it did not exist.
+fn unlink(path: &str) -> Result<bool, StoreError> {
+    let req = path_req(path, PATH_W_UNLINK, 0, &[]).ok_or(StoreError)?;
+    match sys(SYS_PATH_WRITE, req.as_ptr() as u64, req.len() as u64, 0, 0) {
+        r if r >= 0 => Ok(true),
+        ENOENT => Ok(false),
+        _ => Err(StoreError),
+    }
+}
+
+/// HOLOCRONROOT (B448): move a legacy root's records into THE root, once (`holocron_core::root::migrate`),
+/// and say so in one line. Silent when no legacy root holds anything (every boot after the move).
+fn migrate_legacy(home: &str, to: &mut PathStore) {
+    if !to.ok {
+        return;
+    }
+    for legacy in holocron_core::root::legacy_roots(home) {
+        let Ok(Some(listing)) = read_all(&legacy, PATH_R_LIST) else { continue };
+        let nss = holocron_core::root::namespaces(&listing);
+        let mut from = PathStore { root: legacy.clone(), ok: true };
+        let mut l = Line::new(b"[holocron] root=");
+        l.put(to.root.as_bytes()).put(b" migrate from=").put(legacy.trim_start_matches(home.trim_end_matches('/')).trim_start_matches('/').as_bytes());
+        match holocron_core::root::migrate(&mut from, to, &nss) {
+            Ok(m) if m.empty() => continue,
+            Ok(m) => {
+                if m.skipped == 0 {
+                    for ns in &nss {
+                        let _ = unlink(&alloc::format!("{}/{}", legacy, ns)); // empty namespace dirs, best effort
+                    }
+                    let _ = unlink(&legacy);
+                }
+                l.put(b" ring=").put(m.ring.word().as_bytes()).put(b" secrets=").dec(m.secrets as i64);
+                l.put(b" skipped=").dec(m.skipped as i64).put(b" -> ").put(m.verdict().as_bytes());
+            }
+            Err(_) => {
+                l.put(b" -> io-error (the legacy records stay; the next start retries)");
+            }
         }
+        l.wire();
     }
 }
 
@@ -572,7 +614,8 @@ pub extern "C" fn _start() -> ! {
 
     // THE fulfiller.
     let home_unafs = on_unafs(&who.home);
-    let store = PathStore { root: alloc::format!("{}/.config/unaos/holocron", who.home), ok: home_unafs };
+    let mut store = PathStore { root: holocron_core::root::root(&who.home), ok: home_unafs };
+    migrate_legacy(&who.home, &mut store); // B448: BEFORE the service reads the ring
     let Ok(rng) = rng() else {
         write(b":: HOLOCRON: entropy=refused (SYS_GETRANDOM could not seed the DRBG) -> refused ::\n");
         exit(1);
@@ -588,7 +631,7 @@ pub extern "C" fn _start() -> ! {
     let state = wire::decode_status(&st.body).map(|(s, _, _)| state_name(s)).unwrap_or(b"?");
     let mut l = Line::new(b":: HOLOCRON: serve ring=");
     l.put(if home_unafs { b"unafs" as &[u8] } else { b"none" }).put(b" verbs=").dec(wire::VERBS.len() as i64);
-    l.put(b" owner=").put(who.user.as_bytes()).put(b" state=").put(state);
+    l.put(b" owner=").put(who.user.as_bytes()).put(b" state=").put(state).put(b" root=").put(holocron_core::root::DIR.as_bytes());
     // WINDOW2: where the KDF runs — ring 3 (SYS_KDF 66 unused by Holocron), or the kernel for a ring that does not fit.
     l.put(match KDF_WHERE.load(core::sync::atomic::Ordering::Relaxed) {
         2 => b" kdf=kernel(sys_kdf=used,legacy-ring)" as &[u8],
