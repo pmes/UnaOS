@@ -1667,6 +1667,7 @@ fn native_write_authz(
     if principal == KERNEL_PRINCIPAL {
         return Ok(());
     }
+    if let Some(v) = crate::fs::rootacl::write_verdict(fs, &ino, principal) { return v; } // ROOTACL (B456): a system-owned object (nearest owner row `system`) is the kernel's and the administrator's
     let owner = match ino.attributes.get("owner") {
         Some(AttributeValue::String(s)) => s.clone(),
         _ => return Ok(()), // no owner row -> public object, writable
@@ -1850,7 +1851,7 @@ impl VfsBackend for NativeBackend {
             // it is not left world-writable (do-it-right: a native object carries
             // its own per-object ACL, unlike the foreign volume it may be copied
             // from). Kernel-created objects stay public (no owner row).
-            if principal != KERNEL_PRINCIPAL {
+            if principal != KERNEL_PRINCIPAL && !crate::fs::rootacl::under_system(fs, parent_id) { // ROOTACL (B456): under a system tree the new object inherits `system`
                 fs.set_attribute(
                     id,
                     alloc::string::String::from("owner"),
@@ -2092,7 +2093,7 @@ impl VfsBackend for NativeBackend {
                 for (k, v) in attrs.iter() {
                     attributes.insert(k.clone(), v.clone().into_native());
                 }
-                if principal != KERNEL_PRINCIPAL {
+                if principal != KERNEL_PRINCIPAL && !crate::fs::rootacl::under_system(fs, dir) { // ROOTACL (B456): inherits `system`
                     attributes.insert(String::from("owner"), ::unafs::inode::AttributeValue::String(principal.to_string()));
                 }
                 batch.push(::unafs::BatchFile { name: name.clone(), data: Vec::new(), attributes });

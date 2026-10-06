@@ -9341,6 +9341,16 @@ esp_x86_unafs_card() {
         cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$src" "$dst" -i "$vol" || {
             echo -e "${COLOR_RED}❌ ROOTDISK2: tools/unafs put ${src#${WORKSPACE_DIR}/} -> ${dst} failed — no card image${COLOR_RESET}"; return 1; }
     done
+    # ROOTACL (rmbp-ledger B456, SECREVIEW F2): every tree the loop put takes the `system` owner row, so the card is
+    # system-owned from its first boot — the kernel's native ACL lets only `kernel` and the administrator write there
+    # (children carry no row and inherit it; fs/rootacl.rs). The kernel stamps /system/types at the registry build.
+    local tree
+    for tree in /apps /lib /system; do
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- ls -p "$tree" -i "$vol" >/dev/null 2>&1 || continue
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- attr-set "$tree" owner '"system"' -i "$vol" >/dev/null || {
+            echo -e "${COLOR_RED}❌ ROOTACL: tools/unafs attr-set ${tree} owner failed — no card image${COLOR_RESET}"; return 1; }
+        echo -e "${COLOR_YELLOW}⚡ ROOTACL: ${tree} owner=system${COLOR_RESET}"
+    done
     # UNAOSVOLUME (B427): the jobs onto the SAME volume — the working drive IS the boot disk's volume. `mica jobs
     # build --into` is the one builder `./arroyo jobs-image` runs (records from STATUS.tsv, the ledgers, the queues;
     # `job:*` attributes; `/jobs/queries/Open jobs`); its witness line is printed, its noise kept in the log.

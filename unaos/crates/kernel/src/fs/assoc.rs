@@ -269,7 +269,8 @@ pub fn build(why: &str) -> usize {
     let t0 = crate::arch::ms();
     let mt = crate::shell::vfs_mount_table();
     BUILDS.fetch_add(1, Ordering::Relaxed);
-    match seed_in(&mt) {
+    let seeded = seed_in(&mt); let _ = crate::fs::rootacl::stamp(&mt); // ROOTACL (B456): the system trees take the `system` owner once the registry is built (merge resolution, SMALLFIX4)
+    match seeded {
         Ok((n, f)) => {
             serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} ms={}", why, TYPES_DIR, n, f,
                 known_types_in(&mt).len(), crate::arch::ms().saturating_sub(t0));
