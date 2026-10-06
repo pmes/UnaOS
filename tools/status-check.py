@@ -116,7 +116,7 @@ def flight_files(root, n):
         if m and int(m.group(1)) == n:
             out.append(p)
             continue
-        m = re.fullmatch(r"FLIGHT(\d+)(?:-(\d+))?\.md", b)
+        m = re.fullmatch(r"FLIGHT(\d+)(?:-(\d+))?(?:-POSTMORTEM)?\.md", b)  # GATEREVIEW F7: flights 3-7 are postmortems
         if m and int(m.group(1)) <= n <= int(m.group(2) or m.group(1)):
             out.append(p)
     return sorted(out)
@@ -255,6 +255,13 @@ def selftest():
         ("baseline stale once cited", ok_row, "open — flew ST1", 1, "stale", "rmbp-ledger.md B1"),
     ]
     fails = 0
+    pm = tempfile.mkdtemp(prefix="statuscheck-")  # GATEREVIEW F7: a flight-5 postmortem is that flight's capture
+    os.makedirs(os.path.join(pm, "docs/dev/evidence/rmbp9"))
+    open(os.path.join(pm, "docs/dev/evidence/rmbp9/FLIGHT5-POSTMORTEM.md"), "w").write("x\n")
+    if len(flight_files(pm, 5)) != 1:
+        fails += 1
+        print("status-check selftest: FAIL postmortem capture — FLIGHT5-POSTMORTEM.md not read as flight 5")
+    shutil.rmtree(pm, ignore_errors=True)
     for name, tsv, cell, want, why, *bl in cases:
         d = tree(tsv, cell)
         bp = None
