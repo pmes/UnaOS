@@ -1,0 +1,30 @@
+# FLIGHT 26 — image 19 on the UNAFS CARD IMAGE (rmbp12flight26, hw-rmbp@b976af1b), 2026-10-06, main bench — Peter's "boot 26"
+
+Captures: `f26-boot.log` (boot 1: the dongle on the direct port at boot; the wire died 2 s after login), `f26-boot2.log` (boot 2, the card re-burned, no dongle: the wire lived, the seat's typed lines reached the door and died there — no shell). Medium: the 4.1 GiB card image (ROOTDISK2: apps/lib/system on the UnaFS volume). Knob line = image 18's + `UNAOS_IVB3D=1 UNAOS_IVB3D_R8=1` + `UNAOS_WIFI_FW_PATH` (the b43 set staged). Tree = merge17 (forty arcs) + three seat fixes (the WIFI-FW directory put, the duplicated WIFI-FW block deleted, the winmenu SO3 assert restated) — the first image-19 card panicked on that assert on every boot and rebooted.
+
+## Peter, verbatim (the glass)
+- Card 1: "all it would do is get to the login screen and go into a reboot for some reason over and over"
+- Card 2, boot 1: "desktop. i have the net dongle on the port right now" / "remote said there would be a prob with the firmware and has a fix for the next boot" / "i thought the battery was there at first and i took a screenshot but apparently screenshot is broken now / quarry should be live updated and double click item in tree should expand, no? i forget how mac does it but mouse handling is clumsy although screen brightness slider worked out the stutter. / are you not going to execute tests over the wire?" / "pulled net and now something else is wrong it just says starting and the mouse froze"
+- Boot 2 (re-burned, no dongle): "desktop is back i reburned the card so something about the network missing maybe caused a prob / battery does show at boot so goes away for some reason / what else" / "the thing is mostly unusable. shell won't open. mouse barely controlable"
+
+## 1. Green (what the boots proved before input died)
+- **GPUBLIT LIVE**: `:: GPUBLIT: selftest=ok ce_us=22 cpu_us=197 -> blitter=gpu ::` — the first GPU blitter on this machine (every earlier flight: timeout → cpu).
+- **R100 first-user form**: `[login] installer: first-user form open (R100: name, password, retype; that user is the administrator; root is locked)`, `session open user=una role=admin`.
+- **R93 DESKTOPBUILT**: `[desktop] built at=login ok bar_ms=131 battery=painted dock=painted pins=7`, `[strip] paint tenant=dock` at `login ok` — the bar and dock come WITH the session; Peter: "battery does show at boot".
+- **R95 slots**: `[block] boot medium=sdhc kept; usb slot=- separate (R95)`.
+- **BRIGHTSLIDER**: Peter: "screen brightness slider worked out the stutter" (SLIDERDRAG cured on the glass).
+- Boot: `BOOT lines=152–156`, `loader->desktop≈15 s`, `FIRSTBOOT stage=installer root=locked`.
+
+## 2. Findings
+- **PANICASSERT (card 1)**: `panicked at crates/kernel/src/video/winmenu.rs:2269:5: assertion failed: BAR_BOXES_MAX == MENU_TITLES_MAX + 2` on every boot after `FIRSTBOOT stage=installer`; the panic path now REBOOTS (`[panic] screen=plain … hold=0`) — a reboot loop on the glass. APPMENU2 (59b7a6db) raised the constant to + 5 and left `uimetrics_assert` at + 2; no leg runs that assert. Seat fix b976af1b.
+- **USBNETKILLSFTDI (boot 1)**: with the dongle on the direct port AT BOOT, at `[usbnet] rx arm trb=1..7 … n=8` + `tx dhcp discover n=1` (13:31:59) the FTDI on the same xHCI went silent for good: no kernel line, no typed byte taken; the glass lived until the dongle was pulled, then "starting" and a frozen mouse. Flight 25 (dongle hot-plugged after boot) kept the wire with RX resets every ~2 s.
+- **HIDSTALL (both boots)**: at session open `:: EHCI-HID: [1] STOP-NOTE interrupt endpoint halted addr=5|6 ep=IN1 kind=kbd … class=xact-err-burn` (and the boot-mouse on boot 1), `xHCI: ENUM RECOVERY port 1|2 failed at 'await-reset'|'reset-settle'`, then `[lag] stall … stage=hid stage_ms=49` EVERY SECOND for the rest of the session and `[lag] stall boot_suppressed=12 worst_stage=render-handler worst_ms=6094`. Peter: "mouse handling is clumsy" → "mostly unusable … mouse barely controlable". The keyboard's interrupt endpoint is halted at login on this build; no dongle involved on boot 2.
+- **NOSHELL / SERIALDOOR**: "shell won't open" — no `[dock] press` ever reached the wire on boot 2 (the pointer could not land a click), and the serial door routes every typed line `-> shell (the wire is a console)` into a shell that does not exist: `[serialdoor] key=printable win_focus=0xffffff01 … -> shell` ×26, zero `[midden]`. Under R88 the desktop is bare by design, so the door MUST execute without a shell window (a headless shell owned by the door) — otherwise the seat cannot run a single test on a bare desktop.
+- **FWVOL**: `:: wifi: ucode ABSENT — none of … in /, /B43/, /FIRMWARE/ on source=sdhc label='UNAOS'` with the set on p2: the WIFI-1 pass reads the FAT program-source, not the UnaFS root (the cloud has the fix; the seat's 0c1ce698 lands the set on p1 too as a stopgap).
+- **BATTGONE**: `battery=painted` at login, then gone later (Peter) — no vacate line yet on the wire for it; the strip's later paints to read next flight.
+- **PRTSCR regressed on the glass** ("screenshot is broken now") — no `PRTSCR` line reached the wire (boot 1's wire was dead; boot 2's shot was never typed).
+- **Peter's asks**: Quarry refreshes live; double-click on a tree item expands it (QUARRYLIVE).
+- **Not run**: the whole read list (gen7, wifi, installbare, loginfurn, …): boot 1's wire died, boot 2 had no shell for the door. Owed to the next card.
+
+## 3. Owed (the cloud's, in Peter's order)
+HIDSTALL first (the keyboard/mouse endpoints halted at session open; the one-second hid stall; the machine is unusable), USBNETKILLSFTDI (the usbnet driver's first burst kills the xHCI siblings — the FTDI, and the glass when the dongle leaves), SERIALDOOR-HEADLESS (the door executes without a shell window), PANICASSERT (done, b976af1b — and every compile-time-sanity fn gets a leg), FWVOL (the pass reads the UnaFS root), BATTGONE, PRTSCR, QUARRYLIVE + tree expand, then flight 25's list. GPUBLIT and R93/R100 are green and stay.
