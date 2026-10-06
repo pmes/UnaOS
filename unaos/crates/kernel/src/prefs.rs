@@ -79,6 +79,12 @@ pub mod key {
     /// DOCK2 (B394): the dock's edge and auto-hide.
     pub const DOCK_POSITION: &str = "dock.position";
     pub const DOCK_AUTOHIDE: &str = "dock.autohide";
+    /// TRACKPADPANE (B412): the Trackpad pane (rules: `prefs_core::trackpad`).
+    pub const TP_SPEED: &str = "trackpad.speed";
+    pub const TP_TAP: &str = "trackpad.tap_to_click";
+    pub const TP_NATURAL: &str = "trackpad.natural_scroll";
+    pub const TP_SECONDARY: &str = "trackpad.secondary_click";
+    pub const TP_THREE_DRAG: &str = "trackpad.three_finger_drag";
 }
 
 static TREE: spin::Mutex<PrefTree> = spin::Mutex::new(PrefTree::new());
