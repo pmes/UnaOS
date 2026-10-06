@@ -144,6 +144,7 @@ pub(super) fn press(hit: Option<(usize, usize)>, g: &Geom) -> Act {
 /// (`apptrust::copy_to_apps`: the administrator's act) and opens the file with the copy.
 pub fn service() {
     let Some((a, open)) = crate::fs::apptrust::take_pending() else { return };
+    let direct = a.file == a.prog; // APPTRUST2 (B478): the ask was for launching the program itself
     let prog = if open {
         serial_println!("[apptrust] open prog={} file={} granted=session", a.prog, a.file);
         a.prog.clone()
@@ -153,5 +154,9 @@ pub fn service() {
             Err(_) => return,
         }
     };
+    if direct {
+        let _ = super::openers::open("launch", &prog, crate::fs::filetype::UNAOS_ELF);
+        return;
+    }
     let _ = super::openers::open(&prog, &a.file, &a.mime);
 }
