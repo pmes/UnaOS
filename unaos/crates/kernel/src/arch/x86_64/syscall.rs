@@ -16928,7 +16928,7 @@ pub fn run_user_image_argv(
     // has exactly one caller, the shell's `run` verb — so its first window takes focus. Armed here,
     // before `spawn_user_preemptible` below, for the same reason `spawn_user_image_bg_inner` arms
     // before its spawn: the task can reach `SYS_WIN_CREATE` the instant it is runnable.
-    crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1);
+    crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1); #[cfg(feature = "wc")] crate::video::toast::note_spawn(mapped.slot); // DIALOG (B395): the slot's glass-launch bit (Quarry's `run <path>` line is the glass's)
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // SMPBAL-X86: a foreground `run` is load-balanced, not stuck on the caller's core. The caller is
     // `x86_render_service` (the shell runs there since SCHED-X86), so `meter_current_cpu()` put every
@@ -17055,7 +17055,7 @@ fn spawn_user_image_bg_inner(
     // arming, as well as at the grant — it never holds a token to consume, so its exemption does not
     // depend on `slot_is_focus_exempt` alone.
     if !no_autofocus {
-        crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1);
+        crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1); #[cfg(feature = "wc")] crate::video::toast::note_spawn(mapped.slot); // DIALOG (B395): the slot's glass-launch bit (a `Program stopped` dialog only for the glass's own launch)
     }
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // SMPBAL-X86: load-balanced placement. See `bg_place_cpu`.
