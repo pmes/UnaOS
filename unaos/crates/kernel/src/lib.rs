@@ -298,3 +298,6 @@ pub mod boot;
 pub mod pwwire;
 // LOGINFURN (rmbp-ledger B374, R88): the bare login, the console's boot-text prefill, `tests loginfurn`. Tail statement, so no existing line moves.
 pub mod loginfurn;
+// FLIGHTRING (rmbp-ledger B400, R88): the one rolling ring of the boot's text (both arches) and the console's scroll-back over it, `tests flightring`. Tail statements, so no existing line moves.
+pub mod boot_ring;
+pub mod flightring;

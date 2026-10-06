@@ -80,7 +80,6 @@
 
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use spin::Mutex;
 
 /// Ring capacity. 64 KiB held "a full vm-image boot" when that claim was written, but the FTDI
 /// module's own measured bench boots record 65 731 pre-console bytes on the SAME stream — and this
@@ -89,156 +88,23 @@ use spin::Mutex;
 /// (GR15) and absorbs the `logts` prefix overhead (+12 bytes/line). A fixed static (BSS) — no heap.
 const RING_CAP: usize = 256 * 1024;
 
-struct LogRing {
-    buf: [u8; RING_CAP],
-    len: usize,
-    dropped: usize,
-}
-
-impl LogRing {
-    /// Append what fits, counting what does not. The ring keeps the EARLIEST bytes (the banner and the
-    /// self-tests, which is what the log is for) and stops when full rather than evicting the head.
-    fn append(&mut self, bytes: &[u8]) {
-        let room = RING_CAP - self.len;
-        if room == 0 {
-            self.dropped = self.dropped.saturating_add(bytes.len());
-            return;
-        }
-        let n = core::cmp::min(room, bytes.len());
-        let at = self.len;
-        self.buf[at..at + n].copy_from_slice(&bytes[..n]);
-        self.len += n;
-        if n < bytes.len() {
-            self.dropped = self.dropped.saturating_add(bytes.len() - n);
-        }
-    }
-}
-
-static RING: Mutex<LogRing> = Mutex::new(LogRing {
-    buf: [0u8; RING_CAP],
-    len: 0,
-    dropped: 0,
-});
-
-/// SERWIT-2W: `capture` used to format each line into a 256-byte stack buffer and copy that in, which
-/// **silently truncated every line longer than 256 bytes** — 264 of the tree's format strings exceed
-/// even 240 (see `serial_ring::SLOT_LEN`), so `UNAOS.LOG` was quietly clipping the widest diagnostics
-/// it existed to preserve. The buffer is gone: `LogRing` is itself the `fmt::Write` sink now, so a line
-/// is formatted STRAIGHT into the ring, whole, with no intermediate width limit and no stack frame at
-/// all. The only bound left is the ring's own capacity, which was always counted.
-impl fmt::Write for LogRing {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.append(s.as_bytes());
-        Ok(())
-    }
-}
-
-/// SERWIT-2 staging ring for the recorder tap. See [`capture`].
+/// FLIGHTRING (B400): the ring itself moved to `boot_ring.rs` (arch-neutral: a 64 KiB pinned head + a rolling ring
+/// of the newest bytes, sized from memory at the first main-loop service). This file keeps the `UNAOS.LOG` flush;
+/// `RING_CAP` is now the FILE's body budget (the reservation is unchanged — no new FAT mutation).
 ///
-/// 64 slots × 240 bytes ≈ 15 KiB of `.bss`, the same depth as the primary wire's and the FTDI mirror's.
-static STAGE: crate::serial_ring::LineRing<64, 240> = crate::serial_ring::LineRing::new();
-
-/// Lines staged for the log but not yet copied into the capture ring.
-pub fn staged_in_flight() -> u64 {
-    STAGE.in_flight()
-}
-
-/// Additive hook on the serial print seam. Append the formatted line's bytes to the ring. Zero
-/// behaviour change to what is printed; alloc-free; `try_lock` only, so it is safe from IRQ-masked
-/// print contexts. Never takes the xHCI lock and never allocates.
-///
-/// **SERWIT-2 — what changed, and what deliberately did NOT.** The contention branch used to be
-/// nothing: the comment called this "a diagnostic ring, not a ledger" and reasoned that contention was
-/// rare because the serial lock serialises prints. That reasoning was wrong in one specific way — this
-/// tap runs OUTSIDE the serial lock and outside the mask (`arch/x86_64/serial.rs` calls it after the
-/// locked region), so every core arrives here at once and contention is not rare at all, it is the
-/// normal state under a multi-core burst. `UNAOS.LOG` is the whole log a consumer of the shareable
-/// `vm-image` will ever have; a hole in it is indistinguishable from a boot that never printed.
-///
-/// So a contended line is now DEFERRED into the lock-free [`STAGE`] ring and folded in by the next
-/// holder, in order. **No I/O is introduced anywhere near this path** — that was the risk worth naming,
-/// because `service()` below does real FAT block writes. The drain is a `copy_from_slice` into a static
-/// byte array and nothing else: no mount, no allocation, no block device, no `hlt`. The recorder's I/O
-/// stays exactly where it was, in the IF=1 main loop. Overflow of the byte ring itself is unchanged and
-/// still counted into `dropped`, which `snapshot` already writes into the file.
+/// The serial seam's tap (`arch/x86_64/serial.rs` calls it): see `boot_ring::capture`.
 pub fn capture(args: fmt::Arguments) {
-    let tap = &crate::serial_ring::TAP_FLIGHTREC;
-    tap.submit();
-    if let Some(mut ring) = RING.try_lock() {
-        drain_staged(&mut ring);
-        let _ = ring_write(&mut ring, args);
-        tap.absorb();
-        return;
-    }
-    match STAGE.stage(args) {
-        crate::serial_ring::Staged::Whole => {
-            tap.note_staged();
-            return;
-        }
-        crate::serial_ring::Staged::Truncated => {
-            tap.note_staged();
-            tap.tear();
-            return;
-        }
-        crate::serial_ring::Staged::Full => {}
-    }
-    // Staging ring full: one free retry at the sink before the line is declared lost.
-    if let Some(mut ring) = RING.try_lock() {
-        drain_staged(&mut ring);
-        let _ = ring_write(&mut ring, args);
-        tap.absorb();
-        return;
-    }
-    tap.drop_line();
+    crate::boot_ring::capture(args);
 }
 
-/// This sink's line-start flag — mutated only while `RING` is held (by the prefixing writer and by
-/// [`drain_staged`]'s bare-byte correction).
-#[cfg(feature = "logts")]
-static LINE_START: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
-
-/// CLOCK-2b: the direct (lock-held) write into the boot-log ring, timestamp-prefixed under `logts`
-/// so `UNAOS.LOG` self-dates the same way the FTDI capture does — this file is the whole log a
-/// `vm-image` consumer will ever have. Staged lines are folded in bare by [`drain_staged`] on
-/// purpose: a prefix rendered at drain time would stamp the drain, not the emission.
-fn ring_write(ring: &mut LogRing, args: fmt::Arguments) -> fmt::Result {
-    #[cfg(feature = "logts")]
-    {
-        use core::fmt::Write;
-        crate::logts::TapPrefixWriter { inner: ring, state: &LINE_START }.write_fmt(args)
-    }
-    #[cfg(not(feature = "logts"))]
-    fmt::write(ring, args)
+/// Lines staged for the log but not yet copied into the ring.
+pub fn staged_in_flight() -> u64 {
+    crate::boot_ring::staged_in_flight()
 }
 
-/// Fold every staged line into the byte ring, in order. **Caller must hold `RING`.** Pure memcpy — see
-/// the I/O note in [`capture`].
-///
-/// CLOCK-2b: staged bytes bypass the prefixing writer (deliberately — see [`ring_write`]), so the
-/// drainer re-trues the sink's line-start flag from the last byte it pushed; a staged fragment
-/// without a trailing `\n` would otherwise leave the flag claiming line-start and the next prefix
-/// would land mid-line.
-fn drain_staged(ring: &mut LogRing) {
-    #[cfg(feature = "logts")]
-    let mut last_byte: Option<u8> = None;
-    let n = STAGE.drain(|s| {
-        ring.append(s.as_bytes());
-        #[cfg(feature = "logts")]
-        {
-            last_byte = s.as_bytes().last().copied().or(last_byte);
-        }
-    });
-    crate::serial_ring::TAP_FLIGHTREC.absorb_n(n);
-    #[cfg(feature = "logts")]
-    if let Some(b) = last_byte {
-        LINE_START.store(b == b'\n', core::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Current number of captured bytes (for the flush's grow-detection). Cheap `try_lock`; `None` if the
-/// ring is momentarily locked by a concurrent `capture` (retry next iteration).
+/// Bytes ever captured (for the flush's grow-detection). `None` if the ring is momentarily locked.
 fn captured_len() -> Option<usize> {
-    RING.try_lock().map(|r| r.len)
+    crate::boot_ring::total().map(|t| t as usize)
 }
 
 /// Snapshot the captured bytes into a heap `Vec` (the flush runs at IF=1 in the main loop, so alloc
@@ -247,35 +113,24 @@ fn captured_len() -> Option<usize> {
 /// a truncated snapshot marked as a full flush. `None` if the ring is momentarily locked (retry).
 /// The `dropped` trailer keeps a full-ring log self-describing.
 fn snapshot() -> Option<(alloc::vec::Vec<u8>, usize)> {
-    let ring = RING.try_lock()?;
-    let mut out = alloc::vec::Vec::with_capacity(ring.len + 256);
+    // FLIGHTRING (B400): the body is the ring's view clipped to `RING_CAP` — the pinned head, a marker naming what
+    // was left out, and the newest whole lines that fit (`boot_ring::file_image`).
+    let (body, total) = crate::boot_ring::file_image(RING_CAP)?;
+    let mut out = alloc::vec::Vec::with_capacity(body.len() + 256);
     // FRSTAMP: the boot-identity line is FIRST, at offset 0, so the flush's own bytes supersede the
-    // `state=reserved` stamp this boot wrote at reservation time (see `boot_stamp`). Everything below
-    // it is this boot's capture.
+    // `state=reserved` stamp this boot wrote at reservation time (see `boot_stamp`).
     out.extend_from_slice(boot_stamp(REUSED.load(Ordering::Relaxed), true).as_bytes());
-    // A self-identifying header IN THE FILE only (never emitted on the live serial stream, so the boot
-    // output is byte-unchanged). Gives the tester a clear "this is a UnaOS boot log" marker and a
-    // stable grep target — the bootloader's own banner runs in a separate UEFI binary before the
-    // kernel's serial tap exists, so it is not in the captured ring.
+    // A self-identifying header IN THE FILE only (never emitted on the live serial stream).
     out.extend_from_slice(b":: UnaOS flight-recorder boot log (UNAOS.LOG) ::\n");
-    out.extend_from_slice(&ring.buf[..ring.len]);
-    if ring.dropped > 0 {
-        let note = alloc::format!(
-            "\n:: FLIGHTREC: {} byte(s) dropped (ring full / contended) ::\n",
-            ring.dropped
-        );
-        out.extend_from_slice(note.as_bytes());
-    }
-    // An explicit end-of-log marker. The file is a FIXED-SIZE reservation (see the module doc), so the
-    // bytes after this line are zero padding, not log — say so in the file rather than leaving a reader
-    // to guess where the log stops.
+    out.extend_from_slice(&body);
+    // An explicit end-of-log marker: the file is a FIXED-SIZE reservation, the bytes after this line are padding.
     let end = alloc::format!(
         "\n:: FLIGHTREC: end of log ({} captured byte(s); the remainder of this {}-byte file is reserved padding) ::\n",
-        ring.len,
+        total,
         RESERVE_BYTES
     );
     out.extend_from_slice(end.as_bytes());
-    Some((out, ring.len))
+    Some((out, total as usize))
 }
 
 const LOG_NAME: &str = "UNAOS.LOG";
@@ -682,6 +537,16 @@ pub fn service() {
         if n % FLUSH_EVERY_ITERS != 0 {
             return;
         }
+        // FLIGHTRING (B400): the ring no longer stops at `RING_CAP`, so once the capture outgrows the file the
+        // re-flush (the newest lines after the pinned head) is paced by time, not left to every growth.
+        static LAST_MS: AtomicU64 = AtomicU64::new(0);
+        if cur > RING_CAP {
+            let now = crate::arch::ms();
+            if now.saturating_sub(LAST_MS.load(Ordering::Relaxed)) < 30_000 {
+                return;
+            }
+            LAST_MS.store(now, Ordering::Relaxed);
+        }
     }
 
     // Take the file bytes AND their captured length under ONE lock — so LAST_FLUSHED records exactly
@@ -740,34 +605,4 @@ pub fn service() {
             }
         }
     }
-}
-
-/// LOGINFURN (rmbp-ledger B374, R88): the last `max_lines` whole lines of this boot's capture, copied out under one
-/// `try_lock` (a few retries; `None` when the ring stays contended), plus the captured length and whether the ring
-/// is full (it keeps the EARLIEST bytes, so a full ring's tail is the ring's end, not the wire's). The console's
-/// prefill reads the boot's text from HERE — the one ring the serial seam already feeds (R79: no second ring).
-pub fn tail_lines(max_lines: usize) -> Option<(alloc::vec::Vec<u8>, usize, bool)> {
-    for _ in 0..64 {
-        if let Some(ring) = RING.try_lock() {
-            let buf = &ring.buf[..ring.len];
-            // The end of the last WHOLE line (a capture mid-line leaves a partial tail; drop it).
-            let end = buf.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
-            let mut start = end;
-            let mut seen = 0usize;
-            while start > 0 {
-                let i = start - 1;
-                if buf[i] == b'\n' && i + 1 != end {
-                    seen += 1;
-                    if seen == max_lines {
-                        break;
-                    }
-                }
-                start = i;
-            }
-            let full = ring.len == RING_CAP || ring.dropped > 0;
-            return Some((buf[start..end].to_vec(), ring.len, full));
-        }
-        core::hint::spin_loop();
-    }
-    None
 }
