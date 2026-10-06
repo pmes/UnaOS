@@ -56,10 +56,13 @@ pub const BUILTIN: &[(&str, &str, &str, &str)] = &[
     (ft::AUDIO_AAC, "play", "sound", "AAC audio"),
     (ft::AUDIO_MP4, "play", "sound", "MPEG-4 audio"),
     (ft::AUDIO_AIFF, "play", "sound", "AIFF audio"),
-    (ft::VIDEO_MP4, "none", "video", "MPEG-4 video"),
-    (ft::VIDEO_WEBM, "none", "video", "WebM video"),
-    (ft::VIDEO_MATROSKA, "none", "video", "Matroska video"),
+    (ft::VIDEO_MP4, VIDEO_OPENER, "video", "MPEG-4 video"),
+    (ft::VIDEO_WEBM, VIDEO_OPENER, "video", "WebM video"),
+    (ft::VIDEO_MATROSKA, VIDEO_OPENER, "video", "Matroska video"),
 ];
+
+/// VIDEOPLAYER (B434): video opens in the Player when this build carries it (`UNAOS_VIDEO`), else `none` as before.
+pub const VIDEO_OPENER: &str = if cfg!(all(target_arch = "x86_64", feature = "videoplayer")) { "player" } else { "none" };
 
 /// The builtin row for `mime`, if any. Pure.
 pub fn builtin(mime: &str) -> Option<&'static (&'static str, &'static str, &'static str, &'static str)> {
@@ -143,6 +146,7 @@ pub fn seed_in(mt: &MountTable) -> Result<usize, VfsError> {
             }
         }
     }
+    upgrade_video(mt); // VIDEOPLAYER (B434): a video row the card already holds as `none` takes the Player
     // BOOT80 (B350): the missing objects in ONE transaction where the root has one (UnaFS: one root flip
     // for the whole table — boot 21 paid 52 flips here, each rewriting the whole refcount map).
     let missing: Vec<(String, Vec<(String, AttrValue)>)> = BUILTIN
@@ -244,6 +248,23 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
                 }
                 Err(e) => console.println(&alloc::format!("assoc: {}: {}", obj, crate::fs::attrsys::refusal(&e))),
             }
+        }
+    }
+}
+
+/// VIDEOPLAYER (B434): `seed_in` never rewrites an existing object, so a volume seeded before the Player could play
+/// video keeps `una:opener=none` on the video types forever. `none` there was "no opener in this tree yet" (the
+/// table's own words), not an operator's choice: when this build has the Player, such a row is upgraded once
+/// (`[assoc] upgrade type=<mime> none->player`); any other value — an operator's — is left alone.
+fn upgrade_video(mt: &MountTable) {
+    if VIDEO_OPENER == "none" {
+        return;
+    }
+    for mime in [ft::VIDEO_MP4, ft::VIDEO_WEBM, ft::VIDEO_MATROSKA] {
+        let obj = object_path(mime);
+        if str_attr(mt, &obj, OPENER_KEY).as_deref() == Some("none") {
+            let r = mt.set_attr(&obj, OPENER_KEY, AttrValue::Str(String::from(VIDEO_OPENER)), KERNEL_PRINCIPAL);
+            serial_println!("[assoc] upgrade type={} none->{} {}", mime, VIDEO_OPENER, if r.is_ok() { "ok" } else { "REFUSED" });
         }
     }
 }

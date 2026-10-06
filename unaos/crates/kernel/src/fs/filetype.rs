@@ -652,6 +652,7 @@ pub fn openers_witness(dir: &str, names: &[&str]) {
         let core: Option<(&str, bool)> = match handler.as_str() {
             "facet" => Some(("pixel_core", pixel_core::sniff(&head).is_some())),
             "play" => Some(("audio_core", audio_core::sniff(&head) != audio_core::Format::Unknown)),
+            "player" => Some(("demux_core", demux_core::probe(&head).is_some())), // VIDEOPLAYER (B434): the Player's container core
             "textedit" | "fileview" | "markdown" | "json" => Some(("text", looks_text(&head))),
             _ => None,
         };
