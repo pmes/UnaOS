@@ -15,6 +15,7 @@ members = [
     "handlers/mica", # UNAOSVOLUME (B427): Mica, the Ledger — the jobs' only writer
     "unaos/libs/fs/exfat_core", # EXFAT (B392): the exFAT reader the kernel's removable volumes and the host KATs share
     "unaos/libs/sys/prefs_core",
+    "unaos/libs/fs/trash_core", # TRASHCORE (B449): the one Trash core Matrix's VaultTrash and the kernel's fs/trash.rs share
     "unaos/libs/sys/wifi_core",
     "unaos/libs/sys/usbnet_core", # NETFRAME (B368): the USB Ethernet rx framing core the kernel driver and the host KATs share
     "unaos/libs/sys/vein_core",
@@ -27,6 +28,7 @@ members = [
     "unaos/libs/web/js_core", # JSCORE (SR55): ECMAScript 2025 from the specification, no_std, zero deps
 
     "unaos/libs/sys/elf_core", # STORMFAULT (B351): the ring-3 ELF segment plan both loaders share
+    "unaos/libs/sys/type_core", # TYPECORE (B450): the one extension-to-MIME table, sniff order and ELF split both rings read
     "unaos/libs/sys/ldso_core", # SELFBUILD6 (B360): the dynamic loader core the kernel shim and the host runner share
     # VEINTLS (SR36): the ring-3 Vein library joins the host workspace so its offline TLS + Messages test runs here.
     "unaos/libs/sys/vein_ring3",

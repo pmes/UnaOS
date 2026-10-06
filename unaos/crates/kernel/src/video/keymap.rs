@@ -165,7 +165,7 @@ pub enum Action {
     WinSizeLeft,
     WinSizeRight,
     WinSizeUp,
-    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */, QuitApp /* APPMENU2: ⌘Q, code 42 */, CloseWindow /* APPMENU2: ⌘W, code 43 */, HideApp /* APPMENU2: ⌘H, code 44 */, OpenSettings /* APPMENU2: ⌘, code 45 */, ForceQuit /* APPMENU2: ⌘⌥Esc, code 46 */, ClearView /* LUMENBIN: ⌘K — clear the focused view (LUMEN.ELF's transcript), code 41 */, GetInfo /* ATTRCOLUMNS (B402): ⌘I — Quarry's Get Info, code 47 */, Launcher /* LAUNCHER (B417): ⌘Space, code 48 (the arc wrote 47; renumbered at merge17) */,
+    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */, QuitApp /* APPMENU2: ⌘Q, code 42 */, CloseWindow /* APPMENU2: ⌘W, code 43 */, HideApp /* APPMENU2: ⌘H, code 44 */, OpenSettings /* APPMENU2: ⌘, code 45 */, ForceQuit /* APPMENU2: ⌘⌥Esc, code 46 */, ClearView /* LUMENBIN: ⌘K — clear the focused view (LUMEN.ELF's transcript), code 41 */, GetInfo /* ATTRCOLUMNS (B402): ⌘I — Quarry's Get Info, code 47 */, Launcher /* LAUNCHER (B417): ⌘Space, code 48 (the arc wrote 47; renumbered at merge17) */, Interrupt /* SHELLTASK2 (B474): ⌘. — abort the shell window's running command (Ctrl-C's twin), code 49 */,
 }
 
 impl Action {
@@ -209,7 +209,7 @@ impl Action {
             Action::WinSizeLeft => "win-size-left",
             Action::WinSizeRight => "win-size-right",
             Action::WinSizeUp => "win-size-up",
-            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", Action::ClearView => "clear-view", Action::QuitApp => "quit-app", Action::CloseWindow => "close-window", Action::HideApp => "hide-app", Action::OpenSettings => "open-settings", Action::ForceQuit => "force-quit", Action::GetInfo => "get-info", Action::Launcher => "launcher", // WINDOWLIST · LUMENBIN · APPMENU2 · ATTRCOLUMNS
+            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", Action::ClearView => "clear-view", Action::QuitApp => "quit-app", Action::CloseWindow => "close-window", Action::HideApp => "hide-app", Action::OpenSettings => "open-settings", Action::ForceQuit => "force-quit", Action::GetInfo => "get-info", Action::Launcher => "launcher", Action::Interrupt => "interrupt", // WINDOWLIST · LUMENBIN · APPMENU2 · ATTRCOLUMNS
         }
     }
 
@@ -513,4 +513,10 @@ pub fn pc_selected() -> bool {
 /// on both shipped tables; a drag reads it at the drop (Option forces a copy).
 pub fn option_held() -> bool {
     HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & HID_MOD_ALT != 0
+}
+
+/// DRAGDROP2 (B470) — is the Command ROLE down per the latest HID report (the active table's `cmd_role`: the GUI
+/// key on the Mac table, Alt on the PC one)? Quarry's Cmd-press toggles a row into the selection.
+pub fn command_held() -> bool {
+    HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & active().cmd_role != 0
 }

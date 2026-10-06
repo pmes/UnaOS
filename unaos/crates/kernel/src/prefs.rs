@@ -4,13 +4,13 @@
 //! CHARTER: Principia — shared-core
 //!
 //! PREFS (rmbp-ledger B300; AUDIT B287, R79) — the kernel reads and writes PRINCIPIA'S preference store.
-//! There is ONE store: `<home>/.config/unaos/preferences.toml`, the file `handlers/principia` owns on the
+//! There is ONE store (since R98 the `<home>/settings/` folder below; PRINCIPIAFILES B445 put Principia on it), the one `handlers/principia` owns on the
 //! host, in Principia's format (one TOML table per namespace, dotted keys, four scalar types). The value
 //! model and the codec are `unaos/libs/sys/prefs_core` — the same crate Principia links — so the two rings
 //! cannot drift: what the kernel writes, Principia reads unchanged, and the reverse (the cross-tests in
-//! `handlers/principia/src/prefs.rs` pin it). Before this file the kernel kept `<home>/.settings` and
-//! `<home>/.dock`, two private stores in two private formats; their reading is DELETED (a one-shot import
-//! on first load is the only thing that still opens them, and it deletes them: `[prefs] migrated=<n>`).
+//! `handlers/principia/src/prefs.rs` pin it). Before this file the kernel kept two private stores in two
+//! private formats in the home; their one-shot import ran at every login from B300 to B445 and is RETIRED
+//! (PRINCIPIAFILES, ARCHREVIEW F1): no kernel code opens them any more.
 //!
 //! # SETTINGSFILES (B407, R98) — the store is a FOLDER of files, one per domain
 //!
@@ -168,7 +168,7 @@ pub fn domain_path(d: &str) -> String {
 
 /// The single file before R98 (Principia's path), migrated ONCE into the domain files and deleted.
 pub fn legacy_path() -> String {
-    alloc::format!("{}/.config/unaos/preferences.toml", base())
+    alloc::format!("{}/{}", base(), prefs_core::files::LEGACY)
 }
 
 // ── VFS helpers (mount table, kernel principal) ─────────────────────────────────────────────────
@@ -247,11 +247,7 @@ fn by_of(d: &str) -> String {
     if let Some(b) = *BY.lock() {
         return String::from(b);
     }
-    if prefs_core::files::SYSTEM_DOMAINS.contains(&d) {
-        String::from(prefs_core::files::pane_of(d))
-    } else {
-        alloc::format!("the program {}", d)
-    }
+    prefs_core::files::writer_of(d)
 }
 
 fn now_iso() -> String {
@@ -283,7 +279,7 @@ fn witness(ok: bool) {
     }
     serial_println!(
         ":: PREFS: path={} domains={} loaded={} saved={} ns={} -> {} ::",
-        path(), ON_DISK.lock().len(), LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed), NS, if ok { "PASS" } else { "FAIL" }
+        path(), ON_DISK.lock().len(), LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed), NS, if ok { "loaded" } else { "refused" }
     );
 }
 
@@ -386,14 +382,13 @@ fn load() {
     } else if clamped > 0 {
         let _ = save();
     }
-    migrate();
 }
 
 /// PREFSKERNEL M3: values the last load clamped into their schema range.
 static LOAD_CLAMPED: AtomicU32 = AtomicU32::new(0);
 
 /// Load once per login (and once with no session). Cheap when nothing changed.
-pub fn ensure_loaded() {
+pub fn ensure_loaded() { let (sk, sq) = PREFS_SEEN.check(); if sq.is_some() { return; } PREFS_SEEN.mark(sk, true); // SESSIONGEN (B462): the session and this load's state are unchanged since the last compare — one load, no lock
     let mut wb = [0u8; WHO_BUF];
     let u = user_name_in(&mut wb).unwrap_or(""); // PERFREVIEW F3 (B443): compared on the stack; a String only when the session changed
     let fresh = {
@@ -433,64 +428,6 @@ fn watch_deleted() -> Vec<String> {
         serial_println!("[prefs] settings/{} absent -> defaults (deleted by the user) keys={}", d, keys.len());
     }
     gone
-}
-
-// ── The one-shot import of the two retired private stores ───────────────────────────────────────
-
-/// `<home>/.settings` (`key=value`) and `<home>/.dock` (a name per line), if either still exists: every
-/// key the tree does not already hold is imported, the files are DELETED, the tree is saved. Their
-/// reading exists only here, and only until they are gone.
-fn migrate() {
-    let b = base();
-    let (sp, dp) = (alloc::format!("{}/.settings", b), alloc::format!("{}/.dock", b));
-    let (st, dt) = (read_all(&sp), read_all(&dp));
-    if st.is_none() && dt.is_none() {
-        return;
-    }
-    let mut n = 0u32;
-    {
-        let mut t = TREE.lock();
-        let mut put = |k: &str, v: PrefValue| {
-            if t.get(NS, k).is_none() && t.set(NS, k, v).is_ok() {
-                n += 1;
-            }
-        };
-        if let Some(text) = st.as_deref().and_then(|s| core::str::from_utf8(s).ok()) {
-            for line in text.lines() {
-                let Some((k, v)) = line.split_once('=') else { continue };
-                let (k, v) = (k.trim(), v.trim());
-                let num = v.parse::<i64>().ok();
-                match (k, num) {
-                    ("brightness", Some(x)) => put(key::BRIGHTNESS, PrefValue::Int(x)),
-                    ("volume", Some(x)) => put(key::VOLUME, PrefValue::Int(x)),
-                    ("mute", Some(x)) => put(key::MUTE, PrefValue::Bool(x != 0)),
-                    ("idle_min", Some(x)) => put(key::IDLE_MIN, PrefValue::Int(x)),
-                    ("pointer", Some(x)) => put(key::POINTER, PrefValue::Int(x)),
-                    ("tab", Some(x)) => put(key::SETTINGS_TAB, PrefValue::Int(x)),
-                    ("wallpaper", _) => put(key::WALLPAPER, PrefValue::Str(String::from(v))),
-                    _ => {}
-                }
-            }
-        }
-        if let Some(text) = dt.as_deref().and_then(|s| core::str::from_utf8(s).ok()) {
-            let names: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-            if !names.is_empty() {
-                put(key::DOCK_PINS, PrefValue::Str(names.join(",")));
-            }
-        }
-    }
-    let saved = save();
-    if saved.is_ok() {
-        let mt = crate::shell::vfs_mount_table();
-        let k = crate::fs::vfs::KERNEL_PRINCIPAL;
-        if st.is_some() {
-            let _ = mt.unlink(&sp, k);
-        }
-        if dt.is_some() {
-            let _ = mt.unlink(&dp, k);
-        }
-    }
-    serial_println!("[prefs] migrated={} from={}{} deleted={}", n, if st.is_some() { ".settings " } else { "" }, if dt.is_some() { ".dock" } else { "" }, saved.is_ok() as u8);
 }
 
 // ── Save ─────────────────────────────────────────────────────────────────────────────────────
@@ -860,7 +797,11 @@ impl prefs_core::wire::Store for KernelStore {
     /// its descriptions head the keys in `settings/<name>`.
     fn declare(&mut self, name: &str, keys: Vec<prefs_core::declare::DeclKey>) -> i64 {
         let n = keys.len();
-        DECLARED.lock().insert(String::from(name), keys);
+        let st = prefs_core::declare::insert(&mut DECLARED.lock(), name, keys); // PREFSCAP (B454): capped at 64 programs
+        if st != 0 {
+            serial_println!("[prefs] declare app.{} refused: {} programs held (PREFSCAP cap)", name, prefs_core::declare::MAX_PROGRAMS);
+            return st;
+        }
         serial_println!("[prefs] declared app.{} keys={} -> settings/{} (R98)", name, n, name);
         0
     }
@@ -998,7 +939,7 @@ pub fn selftest() {
     let wire_ok = ks == 0 && ks == rs && kt == rt && kt == b"100\x00clamped=true";
     // Leg L, the load clamp: a file holding an out-of-range value loads clamped, once, and is re-saved so.
     let _ = write_all(&p, b"[system]\npower.lowbat_shutdown_pct = 250\n");
-    *LOADED_FOR.lock() = None;
+    *LOADED_FOR.lock() = None; PREFS_SEEN.forget(); // SESSIONGEN (B462): after the clear
     ensure_loaded();
     let refile = read_all(&p).and_then(|b| String::from_utf8(b).ok()).and_then(|t| PrefTree::parse(&t).ok());
     let loadclamp_ok = LOAD_CLAMPED.load(Ordering::Relaxed) == 1
@@ -1007,7 +948,7 @@ pub fn selftest() {
     // Leg 3 — a malformed file: refused with its line, nothing adopted, defaults hold, saves held.
     let bad = b"[system]\ndisplay.brightness = 3\nrecents = [\"a\"]\n";
     let _ = write_all(&p, bad);
-    *LOADED_FOR.lock() = None;
+    *LOADED_FOR.lock() = None; PREFS_SEEN.forget(); // SESSIONGEN (B462): after the clear
     FIXTURE_QUIET.store(true, Ordering::Release);
     ensure_loaded();
     FIXTURE_QUIET.store(false, Ordering::Release);
@@ -1139,4 +1080,177 @@ pub fn retire(ns: &str) -> usize {
         t.remove(ns, k);
     }
     gone.len()
+}
+
+// ── PREFSCAP (rmbp-ledger B454, SECREVIEW F4): the ring-3 transport stamps the caller ─────────────────
+//
+// Both syscall dispatchers call [`bus_fulfil_from`] with the kernel-stamped wm owner of the calling slot
+// (x86 slot + 1, aarch64 the asid — the key the dialog verbs use); the program is named from
+// `wm::app_name_of(owner)`, the launcher-armed name, never from the body. `prefs_core::cap` decides (one
+// decision, both rings): `app.<own>.*`, the namespace named after the program, the schema's `ring 3` rows.
+// The kernel's own client (`prefs_client`) keeps [`bus_fulfil`] = the trusted caller.
+
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+/// The stamped program name of wm `owner`, lowercased into `buf`; `None` = nothing armed.
+fn caller_name(owner: u64, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> Option<&str> {
+    let n = crate::video::wm::app_name_of(owner, buf);
+    buf[..n].make_ascii_lowercase();
+    core::str::from_utf8(&buf[..n]).ok().filter(|s| !s.is_empty())
+}
+
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+/// [`bus_fulfil`] for a RING-3 caller: the same fulfiller under the caller the kernel stamped.
+pub fn bus_fulfil_from(verb: u8, body: &[u8], in_session: bool, owner: u64, text: &mut Vec<u8>) -> i64 {
+    ensure_loaded();
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    let caller = match caller_name(owner, &mut nb) {
+        Some(p) => prefs_core::cap::Caller::Program(p),
+        None => prefs_core::cap::Caller::Anon,
+    };
+    if verb == prefs_core::wire::VERB_SET && in_session {
+        if let Some((ns, k, _)) = prefs_core::wire::parse_set(body) {
+            if !prefs_core::cap::may_set(caller, ns, k) {
+                serial_println!("[prefs] set {}.{} refused: program={} may not (PREFSCAP)", ns, k, prefs_caller_text(caller));
+            }
+        }
+    }
+    if verb == prefs_core::wire::VERB_DECLARE && in_session {
+        if let Some((name, _)) = prefs_core::declare::parse(body) {
+            if !prefs_core::cap::may_declare(caller, &name) {
+                serial_println!("[prefs] declare app.{} refused: program={} may not (PREFSCAP)", name, prefs_caller_text(caller));
+            }
+        }
+    }
+    if (verb == prefs_core::wire::VERB_SET || verb == prefs_core::wire::VERB_DECLARE) && !in_session {
+        if let Some((ns, k, _)) = prefs_core::wire::parse_set(body) {
+            serial_println!("[prefs] set {}.{} refused: caller is not the session user", ns, k);
+        }
+    }
+    prefs_core::wire::fulfil_as(&mut KernelStore, verb, body, in_session, caller, text)
+}
+
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+fn prefs_caller_text(c: prefs_core::cap::Caller<'_>) -> &str {
+    match c {
+        prefs_core::cap::Caller::Program(p) => p,
+        prefs_core::cap::Caller::Kernel => "kernel",
+        prefs_core::cap::Caller::Anon => "anon",
+    }
+}
+
+/// PREFSCAP (B454) — `tests prefscap` (never at boot, R80): a program stamped `pcaptest` sets its own
+/// `app.pcaptest.*` and is refused `vein.endpoint`, `system.login.items`, `system.display.mode` and another
+/// program's stanza; it declares its own stanza and not another's; the declared registry refuses the 65th
+/// program; the bus route refuses a ring-3 `R3PREF_SET` (the deputy). Everything it made is removed.
+/// `:: PREFSCAP: own=ok foreign=refused system=<n>-settable declare_cap=64 deputy=<refused/skip> -> PASS ::`.
+#[cfg(feature = "witness")]
+pub fn prefscap_selftest() {
+    use prefs_core::cap::Caller;
+    use prefs_core::wire::{fulfil_as, EACCES, ENOSPC, VERB_DECLARE, VERB_SET};
+    ensure_loaded();
+    const ME: Caller = Caller::Program("pcaptest");
+    let mut o = Vec::new();
+    let own = fulfil_as(&mut KernelStore, VERB_SET, b"app.pcaptest.level\x003", true, ME, &mut o) == 0
+        && get(prefs_core::files::APP_NS, "pcaptest.level") == Some(PrefValue::Int(3));
+    let before: Vec<Option<PrefValue>> = [("vein", "endpoint"), ("system", "login.items"), ("system", "display.mode"), ("app", "lumen.window.frame")]
+        .iter().map(|(n, k)| get(n, k)).collect();
+    let foreign = [
+        b"vein.endpoint\x00\"https://pcaptest.invalid/\"".as_slice(),
+        b"system.login.items\x00\"/apps/PCAPTEST.ELF\"",
+        b"system.display.mode\x00\"1x1\"",
+        b"app.lumen.window.frame\x00\"0,0,1,1\"",
+    ]
+    .iter()
+    .all(|b| fulfil_as(&mut KernelStore, VERB_SET, b, true, ME, &mut o) == EACCES)
+        && [("vein", "endpoint"), ("system", "login.items"), ("system", "display.mode"), ("app", "lumen.window.frame")]
+            .iter().map(|(n, k)| get(n, k)).collect::<Vec<_>>() == before;
+    let st = |n: &str| alloc::format!("{}\0level\tint:0:10\t5\tPREFSCAP fixture\n", n).into_bytes();
+    let held_before = DECLARED.lock().len();
+    let decl_own = fulfil_as(&mut KernelStore, VERB_DECLARE, &st("pcaptest"), true, ME, &mut o) == 0;
+    let decl_foreign = fulfil_as(&mut KernelStore, VERB_DECLARE, &st("pcapother"), true, ME, &mut o) == EACCES
+        && !DECLARED.lock().contains_key("pcapother");
+    // Fill to the cap with throwaway names, ask once more, then remove every name this leg added.
+    let mut added: Vec<String> = alloc::vec![String::from("pcaptest")];
+    let mut i = 0usize;
+    while DECLARED.lock().len() < prefs_core::declare::MAX_PROGRAMS && i < 2 * prefs_core::declare::MAX_PROGRAMS {
+        let n = alloc::format!("pcapfill{}", i);
+        if !DECLARED.lock().contains_key(n.as_str()) && fulfil_as(&mut KernelStore, VERB_DECLARE, &st(&n), true, Caller::Kernel, &mut o) == 0 {
+            added.push(n);
+        }
+        i += 1;
+    }
+    let capped = DECLARED.lock().len() == prefs_core::declare::MAX_PROGRAMS
+        && fulfil_as(&mut KernelStore, VERB_DECLARE, &st("pcapover"), true, Caller::Kernel, &mut o) == ENOSPC;
+    {
+        let mut d = DECLARED.lock();
+        for n in &added {
+            d.remove(n.as_str());
+        }
+    }
+    // The fixture's own domain file goes the way SETTINGSFILES' does: unlinked, then the watch resets it.
+    let _ = crate::shell::vfs_mount_table().unlink(&domain_path("pcaptest"), crate::fs::vfs::KERNEL_PRINCIPAL);
+    WATCH_MS.store(0, Ordering::Relaxed);
+    let _ = watch_deleted();
+    let _ = TREE.lock().remove(prefs_core::files::APP_NS, "pcaptest.level");
+    let restored = DECLARED.lock().len() == held_before.min(prefs_core::declare::MAX_PROGRAMS);
+    #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+    let deputy = if crate::bus_route::r3pref_set_refused() { "refused" } else { "OPEN" };
+    #[cfg(not(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64"))))]
+    let deputy = "skip";
+    let n = prefs_core::cap::settable_count();
+    let ok = own && foreign && decl_own && decl_foreign && capped && restored && deputy != "OPEN";
+    serial_println!(
+        ":: PREFSCAP: own={} foreign={} system={}-settable declare_cap={} declare_own={} declare_foreign={} deputy={} -> {} ::",
+        if own { "ok" } else { "fail" }, if foreign { "refused" } else { "WRITTEN" }, n,
+        if capped { prefs_core::declare::MAX_PROGRAMS } else { 0 }, decl_own as u8, if decl_foreign { "refused" } else { "HELD" },
+        deputy, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// ── SESSIONGEN (rmbp-ledger B462, PERFREVIEW F3's follow-up) ─────────────────────────────────────────────────
+
+/// The login generation (`fs::users::SESSION_GEN`); 0 without `login`.
+pub fn session_gen() -> u32 {
+    #[cfg(feature = "login")]
+    {
+        crate::fs::users::SESSION_GEN.load(Ordering::Acquire)
+    }
+    #[cfg(not(feature = "login"))]
+    {
+        0
+    }
+}
+
+/// One per-pass session consumer's last compare, keyed by (login generation, this consumer's forget epoch).
+/// [`SessionSeen::check`] is read BEFORE the compare and [`SessionSeen::mark`]ed with that key, so a login,
+/// a logout or a [`SessionSeen::forget`] (the consumer cleared its own record — call it AFTER the clear) that
+/// lands mid-pass leaves the key moved and the next pass compares again. Stale marks only ever match a key
+/// that nothing has moved since.
+pub(crate) struct SessionSeen {
+    seen: core::sync::atomic::AtomicU64,
+    epoch: AtomicU32,
+}
+
+static PREFS_SEEN: SessionSeen = SessionSeen::new();
+
+impl SessionSeen {
+    pub(crate) const fn new() -> Self {
+        SessionSeen { seen: core::sync::atomic::AtomicU64::new(0), epoch: AtomicU32::new(0) }
+    }
+
+    /// The pass's key, and — when the last compare was made under the same key — whether a session was open.
+    pub(crate) fn check(&self) -> (u64, Option<bool>) {
+        let k = ((session_gen() as u64) << 32) | (((self.epoch.load(Ordering::Acquire) as u64) & 0x3FFF_FFFF) << 2) | 2;
+        let s = self.seen.load(Ordering::Acquire);
+        (k, if s & !1 == k { Some(s & 1 == 1) } else { None })
+    }
+
+    pub(crate) fn mark(&self, k: u64, some: bool) {
+        self.seen.store(k | some as u64, Ordering::Release);
+    }
+
+    #[allow(dead_code)] // used by the selftest and login items, absent on some arms
+    pub(crate) fn forget(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
 }

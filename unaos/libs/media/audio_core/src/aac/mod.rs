@@ -7,7 +7,7 @@
 //!   spectral Huffman decoding, inverse quantisation, M/S, intensity stereo, PNS, filterbank.
 //! * [`AdtsStream`] — ADTS framing (sync confirmed by the next header, CRC skipped, several raw blocks
 //!   per frame), ID3v2 in front tolerated.
-//! * [`AacSource`] — access units from MP4 ([`crate::mp4`]) with an AudioSpecificConfig; edit-list /
+//! * [`AacSource`] — access units from MP4 ([`crate::container`], over `demux_core`) with an AudioSpecificConfig; edit-list /
 //!   iTunSMPB gapless trimming.
 //!
 //! Output channel order is the WAVE order (FL FR FC LFE BL BR FLC FRC BC SL SR), mapped from the
@@ -125,7 +125,16 @@ pub struct AdtsStream {
     dec: AacDecoder,
     info: Info,
     in_sync: bool,
+    /// SEEKTABLE2 (rmbp B469): the first frame's offset, the decoder's parameters (a seek restarts it), and the
+    /// header-walk index (every [`ADTS_STRIDE`]th frame's (byte, first sample)), built on the first seek.
+    start: u64,
+    sf_index: usize,
+    layout: Layout,
+    index: Option<Vec<(u64, u64)>>,
 }
+
+/// SEEKTABLE2: one index point per this many ADTS frames (a seek walks at most twice this many headers).
+pub const ADTS_STRIDE: u64 = 16;
 
 impl AdtsStream {
     pub fn new(mut s: ByteStream) -> Result<AdtsStream> {
@@ -144,9 +153,10 @@ impl AdtsStream {
             }
         };
         let ch = layout.channels as u16;
-        let dec = AacDecoder::new(h.sf_index, layout)?;
+        let dec = AacDecoder::new(h.sf_index, layout.clone())?;
         let info = Info { rate: RATES[h.sf_index], channels: ch, bits: 0, frames: None, format: Format::Adts, codec: Codec::Aac, float: true };
-        Ok(AdtsStream { s, dec, info, in_sync: true })
+        let start = s.offset();
+        Ok(AdtsStream { s, dec, info, in_sync: true, start, sf_index: h.sf_index, layout, index: None })
     }
 }
 
@@ -214,13 +224,72 @@ impl Source for AdtsStream {
             return Ok(true);
         }
     }
+    /// SEEKTABLE2 (rmbp B469): the header-walk index to the frame holding the target, then one frame back — the
+    /// pre-roll that primes the MDCT overlap (its PCM is the residual [`crate::Decoder::seek`] drops). The decoder
+    /// restarts fresh there. Every frame's first sample is counted, so the landing is exact.
+    fn seek(&mut self, t: u64) -> Result<Option<SeekPoint>> {
+        if self.s.len().is_none() || !self.s.seekable() { return Ok(None); }
+        if self.index.is_none() { self.index = Some(self.build_index()?); }
+        let idx = self.index.as_deref().unwrap_or(&[]);
+        let i = idx.partition_point(|e| e.1 <= t).saturating_sub(2);
+        let Some(&(b0, s0)) = idx.get(i) else { return Ok(None) };
+        if !self.s.seek(b0)? { return Ok(None); }
+        let (mut cur, mut prev) = ((b0, s0), None);
+        while let Some(h) = self.header_here()? {
+            cur.0 = self.s.offset();
+            let len = 1024 * h.blocks as u64;
+            if cur.1 + len > t || !self.step(&h)? { break; }
+            prev = Some(cur);
+            cur.1 += len;
+        }
+        let (byte, sample) = prev.unwrap_or(cur);
+        if !self.s.seek(byte)? { return Ok(None); }
+        self.dec = AacDecoder::new(self.sf_index, self.layout.clone())?;
+        self.in_sync = true;
+        Ok(Some(SeekPoint { byte, sample, exact: true, table: "adts", landed: sample }))
+    }
+}
+
+/// SEEKTABLE2 (rmbp B469): ADTS carries no timestamps, so its table is a header walk (no decode): each frame is
+/// `1024 · number_of_raw_data_blocks` samples (ISO/IEC 13818-7 §6.2 / 14496-3 §1.A.2), found by `frame_length`
+/// from the first frame — the same frames `block` hands out, a damaged one as silence of its length.
+impl AdtsStream {
+    /// The header at the cursor, stepping over bytes that are not one (as `block`'s in-sync scan does).
+    fn header_here(&mut self) -> Result<Option<AdtsHeader>> {
+        loop {
+            if self.s.fill(7)? < 7 { return Ok(None); }
+            if let Some(h) = adts_header(self.s.data()) { return Ok(Some(h)); }
+            self.s.consume(1);
+        }
+    }
+    /// Step over the frame at the cursor; `false` when it is cut short (the end: `block` stops there too).
+    fn step(&mut self, h: &AdtsHeader) -> Result<bool> {
+        if self.s.fill(h.frame_length)? < h.frame_length { return Ok(false); }
+        self.s.consume(h.frame_length);
+        Ok(true)
+    }
+    fn build_index(&mut self) -> Result<Vec<(u64, u64)>> {
+        let mut idx = Vec::new();
+        let (mut n, mut sample) = (0u64, 0u64);
+        if !self.s.seek(self.start)? { return Ok(idx); }
+        while let Some(h) = self.header_here()? {
+            let at = self.s.offset();
+            if !self.step(&h)? { break; }
+            if n % ADTS_STRIDE == 0 { idx.push((at, sample)); }
+            sample += 1024 * h.blocks as u64;
+            n += 1;
+        }
+        self.info.frames = Some(sample);
+        Ok(idx)
+    }
 }
 
 // ------------------------------------------------------------------ AAC in MP4
 
 /// Access units with an AudioSpecificConfig (MP4 `esds`), plus trimming.
 pub struct AacSource {
-    data: Vec<u8>,
+    /// VPLAYAUDIO (rmbp B475): the file's bytes, shared with the demuxer that indexed them (no copy).
+    data: alloc::sync::Arc<Vec<u8>>,
     units: Vec<(usize, usize)>,
     next: usize,
     dec: AacDecoder,
@@ -234,7 +303,8 @@ pub struct AacSource {
 }
 
 impl AacSource {
-    pub fn new(data: Vec<u8>, units: Vec<(usize, usize)>, asc: &[u8], skip: u64, total: Option<u64>) -> Result<AacSource> {
+    pub fn new(data: impl Into<alloc::sync::Arc<Vec<u8>>>, units: Vec<(usize, usize)>, asc: &[u8], skip: u64, total: Option<u64>) -> Result<AacSource> {
+        let data = data.into();
         let a = Asc::parse(asc)?;
         let layout = a.layout()?;
         let ch = layout.channels as u16;

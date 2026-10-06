@@ -16,9 +16,9 @@
 //!     identical samples (no change between N presents), bounded by [`SETTLE_MAX_MS`]. A timeout still captures and
 //!     says `settle=timeout` — a moving state is a finding, not a reason to write nothing.
 //!  3. CAPTURE — through the EXISTING screenshot job (`prtscr::capture_named`): same panel door, same streaming
-//!     encoder, same mount-table write and SHOTZIP/SHOTMOUNT witness, into `/home/<u>/Shots/<STEM>.PNG`, replacing
+//!     encoder, same mount-table write and SHOTZIP/SHOTMOUNT witness, into `/home/<u>/Desktop/<STEM>.PNG`, replacing
 //!     the last shot of that state.
-//!  4. MASK — `/home/<u>/Shots/<STEM>.MSK`, a PNG of the panel's size (white = masked, black = scored), from the
+//!  4. MASK — `/home/<u>/Desktop/<STEM>.MSK`, a PNG of the panel's size (white = masked, black = scored), from the
 //!     per-state table [`mask_table`]: every state masks the menu-bar CLOCK, the CURSOR sprite and the status
 //!     GLYPHS (battery item, brightness transient, anything else left of the clock); a state adds what it names
 //!     volatile (Quarry's size/date columns).
@@ -39,8 +39,10 @@ use crate::console::Console;
 
 /// The state names `shot` takes (the `settings` state takes a tab after it).
 pub const STATES: [&str; 6] = ["login", "desktop", "quarry", "settings", "lumen", "setter"]; // INSTALLBARE M4 (R86): `setter` — and `login` is now the BARE login form, not the lock over the session
-/// The leaf under the session's home the shots land in. 5 characters: a legal 8.3 directory name as written.
-pub const SHOTS_DIR: &str = "Shots";
+/// The leaf under the session's home the shots land in: the capture folder the THEME names (`Desktop` under CRISPY),
+/// where every screenshot lands. PRTSCR4 (B493): was its own `Shots` folder, which flight 26 found and Peter did not
+/// look in — one screenshot folder, the Mac's.
+pub const SHOTS_DIR: &str = super::theme::CAPTURE_DIR;
 /// Settings tabs, in strip order, and their 8.3 stems.
 const TABS: [(&str, &str); 4] = [("general", "SETGEN"), ("users", "SETUSR"), ("display", "SETDSP"), ("about", "SETABT")];
 
@@ -368,7 +370,7 @@ fn compose(s: State) -> Result<Undo, String> {
             }
             let mut img = Vec::new();
             fs.read_file(&de, &mut img, cap).map_err(|_| String::from("LUMEN.ELF read failed"))?;
-            let (pid, slot, _entry) = crate::arch::syscall::spawn_user_image_bg(&img).map_err(|e| format!("lumen spawn refused ({})", e))?;
+            let (pid, slot, _entry) = crate::arch::syscall::spawn_user_image_bg(&img).map_err(|e| format!("lumen spawn refused ({})", e))?; crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), "/apps/LUMEN.ELF"); // SMALLFIX4 item 11
             sleep_ms(500); // the window is the program's to mint; settle measures the rest
             Ok(Undo::Kill(pid, slot))
         }

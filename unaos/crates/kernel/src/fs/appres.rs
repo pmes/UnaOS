@@ -59,10 +59,10 @@ const BUILTIN: &[(&str, &[u8])] = &[
 const GENERIC: &[u8] = include_bytes!("../../../../res/generic/generic.unares");
 
 /// Cache keys beside the `RES_KEY_*` ones.
-pub const KEY_APP_PATH: &str = "una:app.path";
-pub const KEY_APP_STAMP: &str = "una:app.stamp";
+pub const KEY_APP_PATH: &str = una_abi::attr_keys::APP_PATH;
+pub const KEY_APP_STAMP: &str = una_abi::attr_keys::APP_STAMP;
 /// On a type object: the programs that declare they open it (newline-separated paths).
-pub const KEY_APPS: &str = "una:apps";
+pub const KEY_APPS: &str = una_abi::attr_keys::APPS;
 
 /// Largest note section the registrar will read (an icon set is a few KiB; this bounds a hostile header).
 const NOTE_CAP: usize = 256 * 1024;
@@ -83,6 +83,8 @@ pub struct App {
     pub version: String,
     pub kind: String,
     pub doctypes: Vec<String>,
+    /// DROPTYPES (B477): the MIME types the program's windows take as a drop (`type/*`, `*/*`; empty = none).
+    pub droptypes: Vec<String>,
     /// `(px, PNG)` — the program's own, or the generic set when `has_res` is false.
     pub icons: Vec<(u32, Vec<u8>)>,
     pub has_res: bool,
@@ -128,6 +130,7 @@ fn app_from_block(key: &str, path: &str, stamp: &str, block: &[u8], source: &'st
         version: s(mc::RES_KEY_VERSION),
         kind: s(mc::RES_KEY_KIND),
         doctypes: s(mc::RES_KEY_DOCTYPES).lines().map(String::from).filter(|l| !l.is_empty()).collect(),
+        droptypes: s(mc::RES_KEY_DROPTYPES).lines().map(String::from).filter(|l| !l.is_empty()).collect(),
         icons: icons_of(block),
         has_res: true,
         source,
@@ -146,6 +149,7 @@ fn generic_app(key: &str, path: &str, stamp: &str, source: &'static str) -> App 
         version: String::new(),
         kind: String::new(),
         doctypes: Vec::new(),
+        droptypes: Vec::new(),
         icons: icons_of(GENERIC),
         has_res: false,
         source,
@@ -223,6 +227,7 @@ fn from_attrs(mt: &MountTable, obj: &str, key: &str, path: &str, stamp: &str) ->
         version: get_str(mt, obj, mc::RES_KEY_VERSION).unwrap_or_default(),
         kind: get_str(mt, obj, mc::RES_KEY_KIND).unwrap_or_default(),
         doctypes: get_str(mt, obj, mc::RES_KEY_DOCTYPES).unwrap_or_default().lines().map(String::from).filter(|l| !l.is_empty()).collect(),
+        droptypes: get_str(mt, obj, mc::RES_KEY_DROPTYPES).unwrap_or_default().lines().map(String::from).filter(|l| !l.is_empty()).collect(),
         icons,
         has_res: true,
         source: "attrs",
@@ -243,6 +248,9 @@ fn attr_list(app: &App) -> Vec<(String, AttrValue)> {
     put(mc::RES_KEY_KIND, AttrValue::Str(app.kind.clone()));
     if !app.doctypes.is_empty() {
         put(mc::RES_KEY_DOCTYPES, AttrValue::Str(app.doctypes.join("\n")));
+    }
+    if !app.droptypes.is_empty() {
+        put(mc::RES_KEY_DROPTYPES, AttrValue::Str(app.droptypes.join("\n")));
     }
     for (px, png) in app.icons.iter() {
         if png.len() <= ATTR_VALUE_MAX {
@@ -350,9 +358,23 @@ pub fn sight_in(mt: &MountTable, path: &str) -> Option<App> {
         return Some(a.clone());
     }
     let key = key_of_path(path);
+    let (volume, root) = crate::fs::apptrust::trust_of(mt, path); // APPTRUST (B467): where it is decides what a sight may write
+    serial_println!("[appres] sighted {} volume={} trust={}", path, volume, if root { "root" } else { "foreign" });
+    if !root {
+        sight_twin(mt, path, &key); // APPTRUST2 (B478): the root program of the same name is sighted first, so its key never draws the stick's icon
+        let app = match read_block(mt, path) {
+            Ok(Some(b)) => app_from_block(&key, path, &stamp, &b, SOURCE_FOREIGN),
+            _ => generic_app(&key, path, &stamp, SOURCE_FOREIGN),
+        };
+        let _ = admit(mt, &app, &volume, false);
+        SIGHTS.fetch_add(1, Ordering::Relaxed);
+        remember(&app);
+        return Some(app);
+    }
     if let Some(a) = from_cache(mt, &key, path, &stamp) {
         SIGHTS.fetch_add(1, Ordering::Relaxed);
         serial_println!("[appres] sight path={} res=yes source=attrs attrs=0 on=cached sig={}", path, a.signature);
+        stamp_check(mt, &a); // SMALLFIX5 (B480): a cached program outside the memo is a sighting too
         remember(&a);
         return Some(a);
     }
@@ -360,7 +382,8 @@ pub fn sight_in(mt: &MountTable, path: &str) -> Option<App> {
         Ok(Some(b)) => app_from_block(&key, path, &stamp, &b, "elf"),
         _ => generic_app(&key, path, &stamp, "elf"),
     };
-    let (n, on) = cache(mt, &app);
+    let (n, on) = admit(mt, &app, &volume, true);
+    stamp_check(mt, &app); // SMALLFIX5 (B480): after `una:apps` is published on the type objects that exist
     SIGHTS.fetch_add(1, Ordering::Relaxed);
     serial_println!("[appres] sight path={} res={} source=elf attrs={} on={} sig={}", path,
         if app.has_res { "yes" } else { "no" }, n, on, if app.signature.is_empty() { "-" } else { &app.signature });
@@ -373,9 +396,9 @@ pub fn sight(path: &str) {
     let _ = sight_in(&crate::shell::vfs_mount_table(), path);
 }
 
-/// The app a key names: a built-in, or a program already sighted.
+/// The app a key names: a built-in, or a program already sighted (a root sight before a foreign one — APPTRUST2).
 pub fn app(key: &str) -> Option<App> {
-    builtin_app(key).or_else(|| REG.lock().iter().find(|a| a.key == key).cloned())
+    builtin_app(key).or_else(|| by_key(&REG.lock(), key).cloned())
 }
 
 /// The app a sighted path names (no I/O).
@@ -461,8 +484,11 @@ fn with_pix<R>(key: &str, size: usize, f: impl FnOnce(&[u32]) -> R) -> Option<R>
     }
     let a = match builtin_app(key) {
         Some(a) => a,
-        None => REG.try_lock()?.iter().find(|a| a.key == key).cloned()?,
+        None => by_key(&REG.try_lock()?, key).cloned()?,
     };
+    if a.path.starts_with('/') {
+        serial_println!("[appres] icon-for name={} from={} path={} size={}", key, if a.source == SOURCE_FOREIGN { "foreign" } else { "root" }, a.path, size); // APPTRUST2 (B478): once per decode
+    }
     let argb = render(&a, size)?;
     DRAWN.fetch_add(1, Ordering::Relaxed);
     let r = f(&argb);
@@ -541,8 +567,10 @@ pub fn blit_path_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: usiz
     .is_some()
 }
 
-/// **About <app>** — the app's name, version and signature on the wire and in a notice.
-pub fn about(win_name: &[u8]) {
+/// **About <app>** — the FACTS only: `(name, version, signature)` for a window's app, with the
+/// `[appres] about` witness. SMALLFIX4 (ARCHREVIEW F14): the registrar is fs-core and answers facts;
+/// the About box itself is raised by `video::winmenu::about_box`, the app menu's own file.
+pub fn about(win_name: &[u8]) -> (String, String, String) {
     let key = key_of_title(win_name).unwrap_or_else(|| String::from(core::str::from_utf8(win_name).unwrap_or("")).to_ascii_lowercase());
     let a = app(&key);
     let (name, version, sig) = match &a {
@@ -551,12 +579,7 @@ pub fn about(win_name: &[u8]) {
     };
     serial_println!("[appres] about app={} name={} version={} signature={} res={}", key, name, version, sig,
         if a.as_ref().map(|a| a.has_res).unwrap_or(false) { "yes" } else { "no" });
-    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-    {
-        let title = alloc::format!("About {}", name);
-        let text = alloc::format!("Version {}\n{}", version, sig);
-        let _ = crate::video::dialog::notice(title.as_bytes(), text.as_bytes()); // DIALOG2 (B404): THE router; notice_show retired
-    }
+    (name, version, sig)
 }
 
 /// `tests appres` registration, once (rides `filetype::ensure_tests`).
@@ -564,7 +587,7 @@ pub fn ensure_tests() {
     use core::sync::atomic::AtomicBool;
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
-        crate::tests::register("appres", selftest);
+        crate::tests::register("appres", selftest); crate::fs::apptrust::ensure_tests(); // APPTRUST (B467): `tests apptrust` rides it
         #[cfg(all(target_arch = "x86_64", feature = "wc"))]
         { crate::video::launcher::ensure_tests(); crate::video::appswitch::ensure_tests(); } // APPSWITCH (B428): `tests appswitch` rides it too. LAUNCHER (B417): `tests launcher` rides this registration (no tests.rs line)
     }
@@ -720,7 +743,7 @@ pub fn builtin_doctypes() -> Vec<String> {
 pub fn registrants(mt: &MountTable, mime: &str, type_obj: &str) -> Vec<Registrant> {
     let mut out: Vec<Registrant> = BUILTIN.iter().filter(|(_, b)| declares(b, mime)).map(|(k, b)| builtin_registrant(k, b)).collect();
     for p in get_str(mt, type_obj, KEY_APPS).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
-        if out.iter().any(|r| r.opener == p) {
+        if out.iter().any(|r| r.opener == p) || crate::fs::apptrust::is_foreign(mt, p) { // APPTRUST (B467): a foreign path is never a registrant, whoever wrote the line
             continue;
         }
         let (signature, name) = match app_at(p) {
@@ -743,7 +766,7 @@ pub fn opener_of_preferred(mt: &MountTable, v: &str) -> String {
         return String::from(*k);
     }
     if v.contains('.') && !v.starts_with('/') {
-        if let Some(a) = REG.lock().iter().find(|a| a.signature == v) {
+        if let Some(a) = REG.lock().iter().find(|a| a.signature == v && !crate::fs::apptrust::sighted_foreign(&a.path)) { // APPTRUST (B467): a foreign program's signature never names an opener
             return a.path.clone();
         }
         if let Some(p) = get_str(mt, &signature_object(v), KEY_APP_PATH) {
@@ -770,4 +793,118 @@ pub fn blit_icon_known(px: &mut [u32], stride: usize, h: usize, x: usize, y: usi
 /// LOGINWINDOW (B430): does APPRES know `key` (a built-in or a sighted program)? `false` when the registry is busy.
 pub fn knows(key: &str) -> bool {
     builtin_app(key).is_some() || REG.try_lock().map(|r| r.iter().any(|a| a.key == key)).unwrap_or(false)
+}
+
+/// ASSOCSTAMP (rmbp-ledger B460): fold every built-in's key and packed resource block into the FNV-1a 64 state `h`
+/// (the FILETYPES registry's generation stamp: a changed doc type, signature or name changes the hash). Pure.
+pub fn builtin_hash(mut h: u64) -> u64 {
+    for (k, b) in BUILTIN.iter() {
+        for &x in k.as_bytes().iter().chain([0u8].iter()).chain(b.iter()) {
+            h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+// ── APPTRUST (rmbp-ledger B467) — a sight from a foreign volume writes nothing and registers nothing ──────────────────
+
+/// The one admission a sight makes: a ROOT program is cached (its inode, its signature object) and published in
+/// `una:apps` on its doc types' objects — `(attributes written, where)`, as [`cache`]; a FOREIGN program writes
+/// NOTHING (not on the stick, not in the registry) and joins `apptrust`'s RAM list — `(0, "foreign")`.
+pub fn admit(mt: &MountTable, app: &App, volume: &str, root: bool) -> (usize, &'static str) {
+    if !root {
+        crate::fs::apptrust::note_foreign(&app.path, volume, &app.name, &app.signature, &app.doctypes);
+        return (0, "foreign");
+    }
+    cache(mt, app)
+}
+
+/// `tests apptrust`'s probe: a program at `path` with a block declaring `mime` under `signature` (no icons).
+pub fn probe_app(path: &str, signature: &str, mime: &str) -> App {
+    App {
+        key: key_of_path(path),
+        path: String::from(path),
+        stamp: String::from("probe"),
+        name: String::from("AppTrust Probe"),
+        signature: String::from(signature),
+        version: String::from("1"),
+        kind: String::from("app"),
+        doctypes: alloc::vec![String::from(mime)],
+        droptypes: Vec::new(),
+        icons: Vec::new(),
+        has_res: true,
+        source: "elf",
+    }
+}
+
+/// Drop `path` from the per-boot memo (the test's probe).
+pub fn forget(path: &str) {
+    REG.lock().retain(|a| a.path != path);
+}
+
+/// SMALLFIX4 item 11 (PREFSCAP fold) — the NAME a program launched by `path` answers to, from APPRES: its
+/// signature's last dotted segment (`org.unaos.lumen` → `lumen`), else its declared name when that is one
+/// token, else `None` (the launcher falls back to `wm::program_name(path)`). A FACT, no UI — the arming is
+/// `wm::app_name_arm_launch`'s.
+pub fn launch_name(path: &str) -> Option<String> {
+    let a = app_at(path)?;
+    let seg = a.signature.rsplit('.').next().unwrap_or("").trim();
+    if !seg.is_empty() && seg.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+        return Some(seg.to_ascii_lowercase());
+    }
+    let n = a.name.trim();
+    (!n.is_empty() && !n.contains(' ') && !n.contains('.')).then(|| n.to_ascii_lowercase())
+}
+
+// ── APPTRUST2 (rmbp-ledger B478) — a foreign sight never lends its icon to a root program's key ──────────────────────
+
+/// `App.source` of a program sighted on a FOREIGN volume (`apptrust::trust_of`): listed, never cached or published.
+pub const SOURCE_FOREIGN: &str = "foreign";
+
+/// THE by-key pick: a root (or cached) sight of `key` before a foreign one, whatever order they were sighted in.
+fn by_key<'a>(r: &'a [App], key: &str) -> Option<&'a App> {
+    r.iter().find(|a| a.key == key && a.source != SOURCE_FOREIGN).or_else(|| r.iter().find(|a| a.key == key))
+}
+
+/// A foreign sight of `path`: when `/apps/<leaf>` exists and no root sight of `key` is in the memo, sight it first
+/// (a root sight), so the key names the root program from the stick's first appearance.
+fn sight_twin(mt: &MountTable, path: &str, key: &str) {
+    let leafn = path.rsplit('/').next().unwrap_or(path);
+    let twin = alloc::format!("{}/{}", crate::fs::apptrust::APPS_DIR, leafn);
+    if twin == path || REG.lock().iter().any(|a| a.key == key && a.source != SOURCE_FOREIGN) {
+        return;
+    }
+    if mt.stat(&twin).is_ok() && crate::fs::apptrust::is_root(mt, &twin) {
+        let _ = sight_in(mt, &twin);
+    }
+}
+
+/// `tests apptrust`'s icon leg: a foreign and a root probe of one key, remembered in both orders — `app(key)` must
+/// name the root one each time. `"root"` or `"FOREIGN"`; leaves nothing in the memo.
+pub fn icon_probe() -> &'static str {
+    let (fp, rp) = ("/volumes/apptrust-probe/APTICON.ELF", "/apps/APTICON.ELF");
+    let mut f = probe_app(fp, "org.unaos.apptrust-icon", "application/x-apptrust-icon");
+    f.source = SOURCE_FOREIGN;
+    let r = probe_app(rp, "org.unaos.apptrust-icon", "application/x-apptrust-icon");
+    let key = f.key.clone();
+    remember(&f);
+    remember(&r);
+    let a = app(&key).map(|a| a.path == rp).unwrap_or(false);
+    forget(fp);
+    forget(rp);
+    remember(&r);
+    remember(&f);
+    let b = app(&key).map(|a| a.path == rp).unwrap_or(false);
+    forget(fp);
+    forget(rp);
+    PIX.lock().retain(|p| p.key != key);
+    if a && b { "root" } else { "FOREIGN" }
+}
+
+/// SMALLFIX5 (rmbp-ledger B480) item 1 — a ROOT program outside the per-boot memo whose block declares a type the
+/// registry's stamp does not cover: `assoc::stamp_invalidate_for` decides (only a program `cache` publishes — a
+/// resource block and a signature — can ever be filled, so no other sighting can invalidate every boot).
+fn stamp_check(mt: &MountTable, app: &App) {
+    if app.has_res && !app.signature.is_empty() && !app.doctypes.is_empty() {
+        let _ = crate::fs::assoc::stamp_invalidate_for(mt, &app.path, &app.doctypes);
+    }
 }

@@ -64,8 +64,11 @@ pub struct FatUnlock {
 }
 
 /// Open the boot FAT for ONE named write (`by` = `installer` or `updater`, `for_what` = what is written).
-pub fn fat_unlock(by: &'static str, for_what: &str) -> FatUnlock {
+pub fn fat_unlock(writer: Writer, for_what: &str) -> FatUnlock {
+    let by = writer.name(); // BOOTFATSEAM (B453): the caller names itself by TYPE — only the installer and the updater can
     // SMALLFIX3 (B416, R100): the one writer path asks the administrator's authority once (`[auth] admin=… for=boot-fat-write`).
+    #[cfg(feature = "login")]
+    AUTH_ASKS.fetch_add(1, Ordering::Relaxed); // BOOTFATSEAM (B453): `tests bootfatseam` reads that the gate asked
     #[cfg(feature = "login")]
     if crate::fs::users::admin_authority("boot-fat-write").is_err() {
         serial_println!("[boot] fat unlock refused by={} for={} (R100: not the administrator) ::", by, for_what);
@@ -115,7 +118,7 @@ pub fn selftest() {
     }
     let said = REFUSED.load(Ordering::Relaxed) - before;
     let gate = {
-        let u = fat_unlock("installer", "tests bootfat gate (no write)");
+        let u = fat_unlock(Writer::Installer, "tests bootfat gate (no write)");
         let open = allows();
         drop(u);
         open && !allows()
@@ -150,7 +153,7 @@ pub fn posture(mt: &crate::fs::vfs::MountTable) -> &'static str {
 
 /// `tests rootdisk`: the installer's unlock opens the gate and its drop closes it (`installer`), else `broken`.
 pub fn unlock_path() -> &'static str {
-    let u = fat_unlock("installer", "tests rootdisk gate (no write)");
+    let u = fat_unlock(Writer::Installer, "tests rootdisk gate (no write)");
     let open = allows();
     drop(u);
     if open && !allows() { "installer" } else { "broken" }
@@ -170,3 +173,164 @@ pub fn veto(volume: &str) -> Option<&'static str> {
 pub fn writers() -> Option<u32> {
     if sacred() { Some(WRITERS.load(Ordering::Relaxed)) } else { None }
 }
+
+// =========================================================================================
+// BOOTFATSEAM (rmbp-ledger B453, SECREVIEW F3, R99) — the gate at the FAT layer itself (tail)
+// =========================================================================================
+// The VFS gate above (`refuse`, `veto`) governs the FAT MOUNTS named `boot`. Code that holds a raw `FatFs` never
+// passes it — the users store, the holocron store, the FAT-LFN witness, `src extract`. So `bind_root` hands this
+// module the boot FAT's `BlockSource` ([`arm_on`]) and the FAT layer asks it twice: `FatFs::write_veto` (the
+// question every raw writer already asks: [`veto_source`]) and `fat::write_sector` / `write_sectors` (the one place
+// every FAT write passes: [`raw_guard`] — a refusal there is a writer that did not ask, counted and said).
+// `fat_unlock` opens both layers; it takes a [`Writer`], so only the installer and the updater can name themselves.
+
+/// The two writers R99 admits. Neither writes the boot FAT on x86 today (the installer writes the TARGET disk at the
+/// block layer); the type is the rule, so a third caller is a compile-time decision, not a string.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Writer {
+    Installer,
+    Updater,
+}
+
+impl Writer {
+    pub fn name(self) -> &'static str {
+        match self {
+            Writer::Installer => "installer",
+            Writer::Updater => "updater",
+        }
+    }
+}
+
+/// The refusal string of a raw write to the sacred boot FAT (FAT-LFN compares against it for `reason=r99-sacred`).
+pub const SACRED_VETO: &str = "the boot FAT is sacred (R99): read-only for every principal, root included; writes only through fat_unlock";
+
+/// The boot FAT's source key (0 = none bound: a FAT-root boot, or before `bind_root`).
+static BOOT_SRC: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+/// Raw writes refused at `write_sector` / `write_sectors` — writers that did not ask `write_veto` first.
+static RAW_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// Of those, the ones `tests bootfatseam`'s own probe caused (every run's).
+static PROBE_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// `fat_unlock` calls that asked `admin_authority`.
+static AUTH_ASKS: AtomicU32 = AtomicU32::new(0);
+/// The FAT-LFN witness skipped on the sacred FAT (`reason=r99-sacred`).
+static LFN_SKIPPED: AtomicBool = AtomicBool::new(false);
+
+/// One number per medium. `Usb` IS `UsbN(0)` (the same registry entry), so both spellings key alike.
+fn key(s: crate::fs::fat::BlockSource) -> u16 {
+    use crate::fs::fat::BlockSource as B;
+    match s {
+        B::Default => 1,
+        B::Usb => 0x200,
+        B::UsbN(n) => 0x200 | n as u16,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        B::Sdhc => 3,
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        B::SdMmc => 4,
+        #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+        B::Ahci(p) => 0x400 | p as u16,
+    }
+}
+
+/// `bootdisk::bind_root` on a native root: the boot FAT is `src`'s, and it is sacred from now on.
+pub fn arm_on(src: crate::fs::fat::BlockSource, announce: bool) {
+    BOOT_SRC.store(key(src), Ordering::Relaxed);
+    arm(announce);
+}
+
+fn governs(src: crate::fs::fat::BlockSource) -> bool {
+    let k = BOOT_SRC.load(Ordering::Relaxed);
+    k != 0 && k == key(src) && !allows()
+}
+
+/// `FatFs::write_veto`, FIRST: the R99 refusal for a raw `FatFs` on the boot FAT's medium while the gate is shut.
+pub fn veto_source(src: crate::fs::fat::BlockSource) -> Option<&'static str> {
+    if governs(src) { Some(SACRED_VETO) } else { None }
+}
+
+/// `fat::write_sector` / `write_sectors`, FIRST: refuse a write to the sacred boot FAT that reached the medium
+/// layer without asking. Said on the wire (the first eight; every one is counted).
+pub fn raw_guard(src: crate::fs::fat::BlockSource, site: &str, lba: u64) -> Result<(), crate::fs::fat::FatError> {
+    if !governs(src) {
+        return Ok(());
+    }
+    if RAW_REFUSED.fetch_add(1, Ordering::Relaxed) < 8 {
+        serial_println!("[boot] fat raw write refused source={} lba={} site={} (R99: sacred; a direct writer) ::", src.name(), lba, site);
+    }
+    Err(crate::fs::fat::FatError::Unsupported)
+}
+
+/// FAT-LFN's skip on the sacred FAT.
+pub fn note_lfn_skip() {
+    LFN_SKIPPED.store(true, Ordering::Relaxed);
+}
+
+/// `tests bootfatseam` — the line the arc is read by:
+/// `:: BOOTFATSEAM: direct_writers=0 users=unafs holocron=unafs lfn=skip fat_unlock=authority -> PASS ::`.
+/// A raw `FatFs` write at the boot FAT (a create of `R99RAW.TXT`) must be refused by `write_veto` AND, asked
+/// without it, by the sector layer — nothing created; the stores must be on UnaFS; the FAT-LFN witness must
+/// skip; `fat_unlock` must ask the administrator's authority. Run on demand only (R80).
+pub fn bootfatseam_selftest() {
+    if !sacred() {
+        serial_println!(":: BOOTFATSEAM: direct_writers=- users=- holocron=- lfn=- fat_unlock=- -> SKIP :: reason=fat-root (no UnaFS root: the FAT is /) ::");
+        return;
+    }
+    let k = BOOT_SRC.load(Ordering::Relaxed);
+    let src = [crate::fs::fat::BlockSource::Default, crate::fs::fat::BlockSource::Usb]
+        .into_iter()
+        .chain(boot_candidates())
+        .find(|s| key(*s) == k);
+    let raw_before = RAW_REFUSED.load(Ordering::Relaxed);
+    // Leg 1: the question a raw writer asks, and the sector layer under a writer that does not ask.
+    let (asked, unasked) = match src.and_then(|s| crate::fs::fat::mount_source(s).ok()) {
+        Some(fs) => {
+            let asked = fs.write_veto() == Some(SACRED_VETO);
+            let made = fs.create_in_dir(0, "R99RAW.TXT", 0x20).is_ok();
+            let absent = fs.locate_in_dir(0, "R99RAW.TXT").is_err();
+            (asked, !made && absent)
+        }
+        None => (false, false),
+    };
+    let probe = RAW_REFUSED.load(Ordering::Relaxed) - raw_before;
+    let probes = PROBE_REFUSED.fetch_add(probe, Ordering::Relaxed) + probe;
+    let direct = RAW_REFUSED.load(Ordering::Relaxed) - probes; // refusals that were NOT this fixture's own probes
+    #[cfg(feature = "login")]
+    let users = crate::fs::users::seat_word();
+    #[cfg(not(feature = "login"))]
+    let users = "unbuilt";
+    #[cfg(feature = "holocron")]
+    let holocron = crate::fs::holocron::seat_word();
+    #[cfg(not(feature = "holocron"))]
+    let holocron = "unbuilt";
+    #[cfg(feature = "witness")]
+    let lfn = if LFN_SKIPPED.load(Ordering::Relaxed) || src.map(|s| veto_source(s).is_some()).unwrap_or(false) { "skip" } else { "RUNS" };
+    #[cfg(not(feature = "witness"))]
+    let lfn = "unbuilt";
+    let asks_before = AUTH_ASKS.load(Ordering::Relaxed);
+    drop(fat_unlock(Writer::Installer, "tests bootfatseam gate (no write)"));
+    let authority = if AUTH_ASKS.load(Ordering::Relaxed) > asks_before { "authority" } else { "UNASKED" };
+    let ok = asked && unasked && direct == 0 && users != "fat" && holocron != "fat" && lfn != "RUNS" && authority == "authority" && !allows();
+    serial_println!(
+        ":: BOOTFATSEAM: direct_writers={} users={} holocron={} lfn={} fat_unlock={} -> {} :: veto_asked={} raw_refused={} source={} ::",
+        direct, users, holocron, lfn, authority, if ok { "PASS" } else { "FAIL" },
+        if asked { "r99" } else { "MISSING" },
+        if unasked { probe } else { 0 },
+        src.map(|s| s.name()).unwrap_or("?")
+    );
+}
+
+/// The media a native root can be bound on, beside `Default`/`Usb` (the cfg-gated arms of `BlockSource`).
+fn boot_candidates() -> alloc::vec::Vec<crate::fs::fat::BlockSource> {
+    #[allow(unused_mut)]
+    let mut v = alloc::vec::Vec::new();
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    v.push(crate::fs::fat::BlockSource::Sdhc);
+    #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+    for p in 0..32u8 {
+        v.push(crate::fs::fat::BlockSource::Ahci(p));
+    }
+    for n in 1..8u8 {
+        v.push(crate::fs::fat::BlockSource::UsbN(n));
+    }
+    v
+}
+

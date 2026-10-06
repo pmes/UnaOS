@@ -14,10 +14,10 @@ license = "LGPL-3.0-or-later"
 [dependencies]
 bandy = { path = "../../libs/bandy" }
 # PREFS (rmbp-ledger B300): the shared no_std core — the validation rule and the TOML subset codec the
-# kernel reads and writes this store with. Principia keeps `toml` as its (lenient) reader and writer.
+# kernel reads and writes this store with. PRINCIPIAFILES (B445): the store is prefs_core's `files` folder
+# (`<home>/settings/<domain>`), read and written ONLY through prefs_core — no second (lenient) TOML parser.
 prefs_core = { path = "../../unaos/libs/sys/prefs_core" }
 tokio = { version = "1.53", features = ["rt", "sync", "macros"] }
-toml = "1.1"
 anyhow = "1.0"
 dirs = "7.0"
 log = "0.4"

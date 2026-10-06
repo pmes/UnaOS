@@ -756,10 +756,10 @@ proved on a lane that cannot otherwise reach it, and the clock arm lights up for
 
 `shot <login|desktop|quarry|settings <tab>|lumen>` (`video/shotmask.rs`) composes a named state, waits for the
 frame to settle (the panel sampled on a 16-px lattice outside the mask; 3 identical samples 100 ms apart, bounded
-at 4 s), and captures it through THIS job: `prtscr::capture_named("Shots", "<STEM>.PNG")` holds the same
+at 4 s), and captures it through THIS job: `prtscr::capture_named(theme::CAPTURE_DIR, "<STEM>.PNG")` (PRTSCR4: was `"Shots"`) holds the same
 `IN_FLIGHT` door, and while it does `Job::begin` takes the leaf and name from the override and REPLACES the old
 file of that name (unlink through the mount table, then any FAT-direct copy) instead of minting a ladder name.
 Beside it the verb writes `<STEM>.MSK`, a PNG of the panel's size (white = masked: clock, status glyphs, cursor,
-plus per-state regions). The bench pulls `/home/<u>/Shots/` and runs `tools/eyes/run.sh metal --from <dir>`;
+plus per-state regions). The bench pulls `/home/<u>/Desktop/<STEM>.PNG` + `.MSK` and runs `tools/eyes/run.sh metal --from <dir>`;
 `tests shot` decodes the desktop shot and its mask with `facet::decode_file` and checks the clock is covered.
 Design and witness: `docs/dev/evidence/rmbp-1005/GLASSEYES.md`.

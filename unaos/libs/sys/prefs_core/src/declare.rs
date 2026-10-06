@@ -44,6 +44,19 @@ pub struct DeclKey {
 /// Program name -> its stanza.
 pub type Registry = BTreeMap<String, Vec<DeclKey>>;
 
+/// PREFSCAP (B454, SECREVIEW F4): stanzas one registry holds — a ring-3 caller cannot grow it past this.
+pub const MAX_PROGRAMS: usize = 64;
+
+/// Hold `name`'s stanza: a held name is REPLACED (the caller was already bound to it by
+/// [`crate::cap::may_declare`]); a new name past [`MAX_PROGRAMS`] answers [`crate::wire::ENOSPC`].
+pub fn insert(reg: &mut Registry, name: &str, keys: Vec<DeclKey>) -> i64 {
+    if !reg.contains_key(name) && reg.len() >= MAX_PROGRAMS {
+        return crate::wire::ENOSPC;
+    }
+    reg.insert(String::from(name), keys);
+    0
+}
+
 fn spec(s: &str) -> Option<DeclKind> {
     let (t, rest) = s.split_once(':').unwrap_or((s, ""));
     let two = || {

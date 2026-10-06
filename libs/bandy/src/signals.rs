@@ -531,17 +531,11 @@ impl FacetCommand {
     /// the kernel type database's `image/png -> facet` row (`fs/assoc.rs`): a surface that meets a
     /// path this answers `Some` for fires [`FacetCommand::ImageOpen`] instead of opening it.
     pub fn image_mime_for(path: &str) -> Option<&'static str> {
-        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-        let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
-        Some(match ext.as_str() {
-            "png" => "image/png",
-            "jpg" | "jpeg" | "jpe" | "jfif" => "image/jpeg",
-            "gif" => "image/gif",
-            "bmp" | "dib" => "image/bmp",
-            "qoi" => "image/qoi",
-            "webp" => "image/webp",
-            _ => return None,
-        })
+        // TYPECORE (B450, R79): the ONE extension table both rings read (`type_core::EXT_TABLE`, the kernel's
+        // `fs/filetype.rs` re-exports it), filtered to the types Facet claims — no host twin of the table.
+        const FACET_TYPES: &[&str] =
+            &[type_core::IMAGE_PNG, type_core::IMAGE_JPEG, type_core::IMAGE_GIF, type_core::IMAGE_BMP, type_core::IMAGE_QOI, type_core::IMAGE_WEBP];
+        type_core::by_extension(path).filter(|m| FACET_TYPES.contains(m))
     }
 
     /// The association for a NAVIGATION (Aether): the local path behind a `file://` URL (or a bare

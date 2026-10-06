@@ -1164,11 +1164,11 @@ mod ring3win_tests {
 // Trash, `fs/trash.rs`, and Matrix's host Finder over a UnaFS vault): three attributes ON the object,
 // found by one query scoped to `/home/<user>/.Trash/`. Strings, not code: zero bytes in an EL0 blob.
 /// The original absolute path (String).
-pub const ATTR_KEY_TRASH_ORIGIN: &str = "una:trash-origin";
+pub const ATTR_KEY_TRASH_ORIGIN: &str = attr_keys::TRASH_ORIGIN;
 /// When it was trashed, unix seconds (Int).
-pub const ATTR_KEY_TRASH_TIME: &str = "una:trash-time";
+pub const ATTR_KEY_TRASH_TIME: &str = attr_keys::TRASH_TIME;
 /// The session user who trashed it (String).
-pub const ATTR_KEY_TRASH_BY: &str = "una:trash-by";
+pub const ATTR_KEY_TRASH_BY: &str = attr_keys::TRASH_BY;
 /// The Trash folder's name under the user's home.
 pub const TRASH_DIR_NAME: &str = ".Trash";
 /// The listing query (every object carrying an origin; callers scope it to their Trash folder).
@@ -1881,7 +1881,7 @@ const _: () = assert!(BUS_VERB_PREF_DECLARE > BUS_VERB_TOAST && BUS_VERB_PREF_DE
 /// Every input-ring event type (`INPUT_EV_*` the ring carries).
 pub const INPUT_EV_ALL: &[u64] = &[
     INPUT_EV_KEY_DOWN, INPUT_EV_KEY_UP, INPUT_EV_MOUSE_REL, INPUT_EV_MOUSE_ABS, INPUT_EV_BUTTON, INPUT_EV_WHEEL,
-    INPUT_EV_ACTION, INPUT_EV_MENU_PICK, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, INPUT_EV_DIALOG_ANSWER,
+    INPUT_EV_ACTION, INPUT_EV_MENU_PICK, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, INPUT_EV_DIALOG_ANSWER, INPUT_EV_DROP,
 ];
 /// Every kernel bus verb tag (the registrable range `>= BUS_VERB_FULFIL_MIN` is the bus's, not listed). The
 /// HOLOCRON band is listed by its two ends; [`codes_unique_u8`] also refuses any other tag inside the band.
@@ -1890,7 +1890,7 @@ pub const BUS_VERB_ALL: &[u8] = &[
     BUS_VERB_MENU_CLEAR, BUS_VERB_MENU_GET, BUS_VERB_NOTICE, BUS_VERB_ATTR_SET, BUS_VERB_ATTR_GET, BUS_VERB_ATTR_LIST,
     BUS_VERB_ATTR_QUERY, BUS_VERB_ATTR_STAT, BUS_VERB_PREF_GET, BUS_VERB_PREF_SET, BUS_VERB_PREF_LIST,
     BUS_VERB_PREF_CHANGED, BUS_VERB_REGISTER, BUS_VERB_HOLOCRON_FIRST, BUS_VERB_HOLOCRON_LAST, BUS_VERB_DIALOG,
-    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE,
+    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE, BUS_VERB_DROP_GET,
 ];
 /// No two entries equal (and none zero). `const` so the assertion below runs in the compiler.
 pub const fn codes_unique_u64(v: &[u64]) -> bool {
@@ -1999,3 +1999,396 @@ mod secreview_fuzz {
         }
     }
 }
+
+// ATTRKEYS (B452, ARCH-2026-10-06 F9, R79) — THE attribute-key registry, one home for both rings. Every
+// attribute name the kernel, a shared core or a ring-3 handler reads or writes is declared HERE and nowhere
+// else; the old homes (fs/filetype, fs/assoc, fs/attrfacts, fs/appres, midden_core RES_KEY_*, vein's vault)
+// alias these constants. The spellings are ON-DISK FORMAT (UnaFS attributes on flown cards): never respell
+// one in place. GATE-ATTRKEYS (`scripts/attrkeys-check.py`) refuses a key-shaped literal outside this file.
+pub mod attr_keys {
+    // ---- una: — the system's own keys
+    /// A file's MIME type (FILETYPE).
+    pub const TYPE: &str = "una:type";
+    /// On a type object: the opener program (ASSOC).
+    pub const OPENER: &str = "una:opener";
+    /// On a type object: its icon; also the prefix of the resource block's rendered icons.
+    pub const ICON: &str = "una:icon";
+    /// A display name: a type object's (ASSOC) and an app resource block's (APPRES).
+    pub const NAME: &str = "una:name";
+    /// On a FILE: the program it prefers over its type's opener (ASSOC).
+    pub const PREFERRED: &str = "una:preferred";
+    /// The mtime the sniffed facts were taken at (ATTRCOLUMNS).
+    pub const FACTS_MTIME: &str = "una:facts-mtime";
+    /// Per-key change times (ATTRCOLUMNS).
+    pub const ATTRTIMES: &str = "una:attrtimes";
+    /// A folder's chosen attribute columns, comma-separated (ATTRCOLUMNS).
+    pub const VIEW: &str = "una:view";
+    /// APPRES cache: the program path a type object's icon came from.
+    pub const APP_PATH: &str = "una:app.path";
+    /// APPRES cache: that program's stamp.
+    pub const APP_STAMP: &str = "una:app.stamp";
+    /// On a type object: the programs that declare they open it (newline-separated).
+    pub const APPS: &str = "una:apps";
+    /// APPRES resource block: the app's signature, reverse-DNS.
+    pub const SIGNATURE: &str = "una:signature";
+    /// APPRES resource block: `semver+build`.
+    pub const VERSION: &str = "una:version";
+    /// APPRES resource block: `windowed` · `resident` · `console`.
+    pub const KIND: &str = "una:kind";
+    /// APPRES resource block: the icon's SVG source.
+    pub const ICON_SVG: &str = "una:icon.svg";
+    /// APPRES resource block: the icon at 32, 64, 128 px (RGBA PNG).
+    pub const ICON_32: &str = "una:icon.32";
+    pub const ICON_64: &str = "una:icon.64";
+    pub const ICON_128: &str = "una:icon.128";
+    /// APPRES resource block: the MIME types the app opens, newline-separated.
+    pub const DOCTYPES: &str = "una:doctypes";
+    /// DROPTYPES (B477): APPRES resource block — the MIME types a program's windows take as a drop,
+    /// newline-separated (`type/*` and `*/*` allowed; absent = takes nothing).
+    pub const DROPTYPES: &str = "una:droptypes";
+    /// TRASHTIME (B308): the original absolute path (String).
+    pub const TRASH_ORIGIN: &str = "una:trash-origin";
+    /// TRASHTIME: when it was trashed, unix seconds (Int).
+    pub const TRASH_TIME: &str = "una:trash-time";
+    /// TRASHTIME: the session user who trashed it (String).
+    pub const TRASH_BY: &str = "una:trash-by";
+    /// EMBED (B317): the model that made a memory's vector (`<provider>/<model>`).
+    pub const EMBED_MODEL: &str = "una:embed-model";
+    /// EMBED: that vector's width.
+    pub const EMBED_DIMS: &str = "una:embed-dims";
+    // ---- media: / doc: / image: — the sniffed facts (ATTRCOLUMNS)
+    pub const MEDIA_WIDTH: &str = "media:width";
+    pub const MEDIA_HEIGHT: &str = "media:height";
+    pub const MEDIA_DURATION_MS: &str = "media:duration_ms";
+    pub const MEDIA_CODEC: &str = "media:codec";
+    pub const DOC_TITLE: &str = "doc:title";
+    pub const IMAGE_ANIMATED: &str = "image:animated";
+    // ---- bt. — a Bluetooth bond's record (BTHID). Un-namespaced spelling kept: it is on the flown cards.
+    pub const BT_LINKKEY: &str = "bt.linkkey";
+    pub const BT_KEYTYPE: &str = "bt.keytype";
+    pub const BT_CLASS: &str = "bt.class";
+    pub const BT_NAME: &str = "bt.name";
+    pub const BT_HIDDESC: &str = "bt.hiddesc";
+    // ---- job: — the jobs volume's records (UNAOSVOLUME, `jobs_core` K_*; it aliases these at the fold)
+    pub const JOB_KIND: &str = "job:kind";
+    pub const JOB_ID: &str = "job:id";
+    pub const JOB_SEQ: &str = "job:seq";
+    pub const JOB_STATUS: &str = "job:status";
+    pub const JOB_FLIGHT: &str = "job:flight";
+    pub const JOB_LINE: &str = "job:line";
+    pub const JOB_SET_BY: &str = "job:set_by";
+    pub const JOB_REFS: &str = "job:refs";
+    pub const JOB_OWNER: &str = "job:owner";
+    pub const JOB_ARC: &str = "job:arc";
+    pub const JOB_TRACK: &str = "job:track";
+
+    /// FILETYPES (B423): a type object's description and its user-added extensions (merge19).
+    pub const DESCRIPTION: &str = "una:description";
+    pub const EXTENSIONS: &str = "una:extensions";
+    /// RAWCORE (B444): a photograph's EXIF facts (merge19).
+    pub const MEDIA_CAMERA: &str = "media:camera";
+    pub const MEDIA_LENS: &str = "media:lens";
+    pub const MEDIA_EXPOSURE: &str = "media:exposure";
+    pub const MEDIA_ISO: &str = "media:iso";
+    pub const MEDIA_FOCAL_MM: &str = "media:focal_mm";
+    pub const MEDIA_TAKEN: &str = "media:taken";
+    /// NAMEINDEX (B432): the one-name-per-directory index (merge19; `unafs::nameindex` mirrors these).
+    pub const FSNAME: &str = "una:fsname";
+    pub const FSNAME_INDEX: &str = "una:fsname-index";
+    /// FOLDERVIEW (B424): a folder's remembered view (merge19).
+    pub const VIEW_MODE: &str = "una:view.mode";
+    pub const VIEW_COLUMNS: &str = "una:view.columns";
+    pub const VIEW_SORT: &str = "una:view.sort";
+    pub const VIEW_FRAME: &str = "una:view.frame";
+    /// ASSOCSTAMP (B460): the FILETYPES registry directory's generation stamp (merge19).
+    pub const FILETYPES_STAMP: &str = "una:filetypes.stamp";
+    /// The namespaces a key may live in.
+    pub const NAMESPACES: &[&str] = &["una:", "media:", "doc:", "image:", "bt.", "job:"];
+    /// Every registered key, once.
+    pub const ALL: &[&str] = &[
+        TYPE, OPENER, ICON, NAME, PREFERRED, FACTS_MTIME, ATTRTIMES, VIEW, APP_PATH, APP_STAMP, APPS, SIGNATURE,
+        VERSION, KIND, ICON_SVG, ICON_32, ICON_64, ICON_128, DOCTYPES, TRASH_ORIGIN, TRASH_TIME, TRASH_BY,
+        EMBED_MODEL, EMBED_DIMS, MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_DURATION_MS, MEDIA_CODEC, DOC_TITLE,
+        IMAGE_ANIMATED, BT_LINKKEY, BT_KEYTYPE, BT_CLASS, BT_NAME, BT_HIDDESC, JOB_KIND, JOB_ID, JOB_SEQ,
+        JOB_STATUS, JOB_FLIGHT, JOB_LINE, JOB_SET_BY, JOB_REFS, JOB_OWNER, JOB_ARC, JOB_TRACK,
+        DESCRIPTION, EXTENSIONS, MEDIA_CAMERA, MEDIA_LENS, MEDIA_EXPOSURE, MEDIA_ISO, MEDIA_FOCAL_MM, MEDIA_TAKEN, FSNAME, FSNAME_INDEX, VIEW_MODE, VIEW_COLUMNS, VIEW_SORT, VIEW_FRAME, FILETYPES_STAMP, DROPTYPES,
+    ];
+
+    const fn str_eq(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    const fn has_prefix(s: &str, p: &str) -> bool {
+        let (s, p) = (s.as_bytes(), p.as_bytes());
+        if s.len() <= p.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < p.len() {
+            if s[i] != p[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    /// No two keys share a spelling, and every key sits in a registered namespace.
+    pub const fn registry_sound(v: &[&str]) -> bool {
+        let mut i = 0;
+        while i < v.len() {
+            let mut ns = false;
+            let mut n = 0;
+            while n < NAMESPACES.len() {
+                if has_prefix(v[i], NAMESPACES[n]) {
+                    ns = true;
+                }
+                n += 1;
+            }
+            if !ns {
+                return false;
+            }
+            let mut j = i + 1;
+            while j < v.len() {
+                if str_eq(v[i], v[j]) {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        true
+    }
+    const _: () = assert!(registry_sound(ALL), "ATTRKEYS: two attribute keys share a name, or one has no namespace");
+
+    #[cfg(test)]
+    mod tests {
+        extern crate std;
+        use super::*;
+        #[test]
+        fn attrkeys_registry_has_no_duplicates() {
+            for (i, a) in ALL.iter().enumerate() {
+                assert!(NAMESPACES.iter().any(|p| a.starts_with(p) && a.len() > p.len()), "{a}: no namespace");
+                for b in &ALL[i + 1..] {
+                    assert_ne!(a, b, "ATTRKEYS: {a} registered twice");
+                }
+            }
+            assert!(!registry_sound(&[TYPE, TYPE]), "the const control must refuse a duplicate");
+            assert!(!registry_sound(&["nospace"]), "the const control must refuse a bare name");
+            assert!(crate::TRASH_QUERY.starts_with(TRASH_ORIGIN));
+            std::println!(":: ATTRKEYS: keys={} unique namespaces={} -> PASS ::", ALL.len(), NAMESPACES.len());
+        }
+    }
+}
+// =================================================================================================
+// RINGLOGIN (rmbp-ledger B465) — SYS_RINGKEY, the login's door to Holocron's ring. TAIL-APPENDED.
+//
+// The login (kernel `users::login`, the one path holding a verified password) derives the ring key ONCE
+// (SYS_KDF's body, Argon2id) and posts it in a take-once slot; the password is never kept. HOLOCRON.ELF —
+// only the process registered as Holocron's bus fulfiller, running as the door's user — takes it here:
+//
+//   `SYS_RINGKEY(RINGKEY_OP_TAKE, buf, RINGKEY_LEN)` -> `RINGKEY_NONE` (0, nothing posted),
+//       `RINGKEY_KEY` (1, `buf` holds the door below; the kernel's copy is wiped), `RINGKEY_LOCK` (2, lock now),
+//       or `-EACCES` (not Holocron's fulfiller / not the door's user), `-EINVAL`, `-EFAULT`.
+//   `SYS_RINGKEY(RINGKEY_OP_REPORT, status, mode)` -> 0: Holocron's answer to the door (a holocron_core
+//       wire status, 0 = OK) and the mode it applied (`RINGKEY_MODE_*`, or `RINGKEY_MODE_LOCKED` after a lock).
+//
+// Door layout (RINGKEY_LEN = 104): [0] mode (1 create, 2 open, 4 rekey) · [1..4] zero · [4..8] m_kib LE · [8..12]
+// t LE · [12..16] p LE · [16..32] salt · [32..64] the ring key · [64..72] the login's ms clock at the submit (LE) ·
+// [72..104] RINGLOGIN2 (B479): the OLD ring key of a REKEY (a password change; zero otherwise).
+// Both arches under the kernel feature `lumen` (RINGLOGIN2 added the aarch64 arm); elsewhere the unknown-syscall default.
+// =================================================================================================
+
+/// `SYS_RINGKEY(op, a1, a2)` — see the block above.
+pub const SYS_RINGKEY: u64 = 67; // after HOLOCRON2's SYS_KDF (66)
+/// Take the door.
+pub const RINGKEY_OP_TAKE: u64 = 0;
+/// Report Holocron's answer.
+pub const RINGKEY_OP_REPORT: u64 = 1;
+/// Nothing posted.
+pub const RINGKEY_NONE: i64 = 0;
+/// A key was handed over.
+pub const RINGKEY_KEY: i64 = 1;
+/// Lock the ring now (the lock screen).
+pub const RINGKEY_LOCK: i64 = 2;
+/// Door mode: no ring yet — create it at the door's salt and parameters.
+pub const RINGKEY_MODE_CREATE: u8 = 1;
+/// Door mode: open the existing ring.
+pub const RINGKEY_MODE_OPEN: u8 = 2;
+/// Report mode: the ring was locked on a `RINGKEY_LOCK`.
+pub const RINGKEY_MODE_LOCKED: u8 = 3;
+/// RINGLOGIN2 (B479): door mode — a password change: re-wrap the ring from `old_key` to `key` (both derived at the
+/// ring's own salt and parameters, which are kept).
+pub const RINGKEY_MODE_REKEY: u8 = 4;
+/// Door bytes.
+pub const RINGKEY_LEN: usize = 104;
+const _: () = assert!(SYS_RINGKEY == SYS_KDF + 1);
+
+/// A decoded door.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RingDoor {
+    /// `RINGKEY_MODE_CREATE` or `RINGKEY_MODE_OPEN`.
+    pub mode: u8,
+    /// Argon2id memory (KiB), passes, lanes.
+    pub m_kib: u32,
+    pub t: u32,
+    pub p: u32,
+    /// The ring salt.
+    pub salt: [u8; 16],
+    /// The ring key (the KDF's output — never the password).
+    pub key: [u8; 32],
+    /// The login's ms clock when the submit derived it.
+    pub t0_ms: u64,
+    /// RINGLOGIN2: a REKEY's old ring key (zero for create / open).
+    pub old_key: [u8; 32],
+}
+
+/// Encode `d` into `out`.
+pub fn ringdoor_encode(d: &RingDoor, out: &mut [u8; RINGKEY_LEN]) {
+    out.fill(0);
+    out[0] = d.mode;
+    out[4..8].copy_from_slice(&d.m_kib.to_le_bytes());
+    out[8..12].copy_from_slice(&d.t.to_le_bytes());
+    out[12..16].copy_from_slice(&d.p.to_le_bytes());
+    out[16..32].copy_from_slice(&d.salt);
+    out[32..64].copy_from_slice(&d.key);
+    out[64..72].copy_from_slice(&d.t0_ms.to_le_bytes());
+    out[72..104].copy_from_slice(&d.old_key);
+}
+
+/// Decode a door; `None` for an unknown mode or a nonzero reserved byte.
+pub fn ringdoor_parse(b: &[u8; RINGKEY_LEN]) -> Option<RingDoor> {
+    if !(b[0] == RINGKEY_MODE_CREATE || b[0] == RINGKEY_MODE_OPEN || b[0] == RINGKEY_MODE_REKEY) || b[1..4] != [0, 0, 0] {
+        return None;
+    }
+    let u = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&b[16..32]);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&b[32..64]);
+    let mut t0 = [0u8; 8];
+    t0.copy_from_slice(&b[64..72]);
+    let mut old_key = [0u8; 32];
+    old_key.copy_from_slice(&b[72..104]);
+    Some(RingDoor { mode: b[0], m_kib: u(4), t: u(8), p: u(12), salt, key, t0_ms: u64::from_le_bytes(t0), old_key })
+}
+
+#[cfg(test)]
+mod ringlogin_tests {
+    use super::*;
+    #[test]
+    fn ringdoor_round_trip() {
+        let d = RingDoor { mode: RINGKEY_MODE_OPEN, m_kib: WINDOW2_KDF_M_KIB, t: WINDOW2_KDF_T, p: WINDOW2_KDF_P, salt: [3; 16], key: [9; 32], t0_ms: 12345, old_key: [0; 32] };
+        let mut b = [0u8; RINGKEY_LEN];
+        ringdoor_encode(&d, &mut b);
+        assert_eq!(ringdoor_parse(&b), Some(d));
+        let r = RingDoor { mode: RINGKEY_MODE_REKEY, old_key: [5; 32], ..d };
+        ringdoor_encode(&r, &mut b);
+        assert_eq!(ringdoor_parse(&b), Some(r));
+        b[0] = 7;
+        assert_eq!(ringdoor_parse(&b), None);
+    }
+}
+// =================================================================================================
+// DRAGDROP2 (rmbp-ledger B470, MACPARITY row 18) — THE RING-3 DROP PROTOCOL. A drop on a ring-3 program's
+// window: the kernel holds the dropped paths for that program under a token and pushes `INPUT_EV_DROP` to its
+// input ring; the program asks `BUS_VERB_DROP_GET` (body `[token]`) and the reply body is the paths,
+// newline-joined. One parse ([`drop_paths`]) both rings link. Appended at the tail so no existing line moves.
+// =================================================================================================
+
+/// A drop landed on one of the receiver's windows. Payload `[15:8]` = the token to ask for, `[7:0]` = the count
+/// of paths (saturating at 255).
+pub const INPUT_EV_DROP: u64 = 12; // 11 is INPUT_EV_DIALOG_ANSWER; SMALLFIX4 (B466) mints none
+/// Bus verb: fetch a drop's paths. Request body `[token]`; reply body the paths, `\n`-joined (`-ENOENT` = no
+/// such drop for this caller: it was taken, or it never was).
+pub const BUS_VERB_DROP_GET: u8 = 24; // 23 is BUS_VERB_PREF_DECLARE
+const _: () = assert!(BUS_VERB_DROP_GET > BUS_VERB_PREF_DECLARE && BUS_VERB_DROP_GET < BUS_VERB_REGISTER);
+/// Paths one drop carries at most (the reply must fit one bus body).
+pub const DROP_PATHS_MAX: usize = 32;
+
+/// The `INPUT_EV_DROP` payload for `token` and `n` paths.
+pub const fn drop_ev_payload(token: u8, n: usize) -> u64 {
+    ((token as u64) << 8) | (if n > 255 { 255 } else { n as u64 })
+}
+
+/// `(token, count)` from an `INPUT_EV_DROP` payload.
+pub const fn drop_ev_parse(payload: u64) -> (u8, u8) {
+    ((payload >> 8) as u8, payload as u8)
+}
+
+/// Encode `paths` as a DROP_GET reply body into `out` (`\n`-joined). `None` when a path is empty or holds a
+/// newline or a NUL, there are more than [`DROP_PATHS_MAX`], or `out` is too small.
+pub fn drop_body(paths: &[&[u8]], out: &mut [u8]) -> Option<usize> {
+    if paths.len() > DROP_PATHS_MAX {
+        return None;
+    }
+    let mut n = 0usize;
+    for (i, p) in paths.iter().enumerate() {
+        if p.is_empty() || p.contains(&b'\n') || p.contains(&0) {
+            return None;
+        }
+        let need = p.len() + (i > 0) as usize;
+        if n + need > out.len() {
+            return None;
+        }
+        if i > 0 {
+            out[n] = b'\n';
+            n += 1;
+        }
+        out[n..n + p.len()].copy_from_slice(p);
+        n += p.len();
+    }
+    Some(n)
+}
+
+/// The paths of a DROP_GET reply body, in order (empty lines skipped; at most [`DROP_PATHS_MAX`]).
+pub fn drop_paths(body: &[u8]) -> impl Iterator<Item = &[u8]> {
+    body.split(|&c| c == b'\n').filter(|l| !l.is_empty()).take(DROP_PATHS_MAX)
+}
+
+#[cfg(test)]
+mod dragdrop2_tests {
+    use super::*;
+    #[test]
+    fn drop_body_round_trip() {
+        let mut out = [0u8; 64];
+        let n = drop_body(&[b"/home/u/a.txt", b"/home/u/B"], &mut out).unwrap();
+        let v: [&[u8]; 2] = [b"/home/u/a.txt", b"/home/u/B"];
+        assert!(drop_paths(&out[..n]).eq(v.iter().copied()));
+        assert!(drop_body(&[b"a\nb"], &mut out).is_none());
+        assert!(drop_body(&[b""], &mut out).is_none());
+        assert_eq!(drop_ev_parse(drop_ev_payload(7, 3)), (7, 3));
+        assert_eq!(drop_ev_parse(drop_ev_payload(1, 999)), (1, 255));
+    }
+}
+
+// =================================================================================================
+// HOLOCRONARM (rmbp-ledger B484) — the Argon2id parameters a NEW ring is made at, per arch. x86: WINDOW2's
+// (48 MiB, t 3, p 4 — unchanged). aarch64: the kernel heap is 48 MiB (`allocator::HEAP_SIZE`) and both the
+// login's kernel KDF and the ring-3 window's frames come from it, so 48 MiB could never be lent there; the
+// ring is made at holocron_core's FLOOR memory (19 MiB, OWASP's minimum) with WINDOW2's t and p. An OPEN
+// always derives at the ring header's own parameters, so a ring made on either arch opens on both.
+// `keyring::ring_login` (create) and HOLOCRON.ELF's `METAL_KDF` read these. Design:
+// docs/dev/evidence/rmbp-1005/holocronarm.md.
+// =================================================================================================
+
+/// HOLOCRONARM: Argon2id memory in KiB for a new ring on this arch.
+#[cfg(not(target_arch = "aarch64"))]
+pub const RING_KDF_M_KIB: u32 = WINDOW2_KDF_M_KIB;
+/// HOLOCRONARM: Argon2id memory in KiB for a new ring on this arch (19 MiB: the 48 MiB heap's share).
+#[cfg(target_arch = "aarch64")]
+pub const RING_KDF_M_KIB: u32 = 19 * 1024;
+/// HOLOCRONARM: passes for a new ring.
+pub const RING_KDF_T: u32 = WINDOW2_KDF_T;
+/// HOLOCRONARM: lanes for a new ring.
+pub const RING_KDF_P: u32 = WINDOW2_KDF_P;
+const _: () = assert!(RING_KDF_M_KIB <= WINDOW2_KDF_M_KIB && RING_KDF_M_KIB >= 19 * 1024 && RING_KDF_M_KIB >= 8 * RING_KDF_P);

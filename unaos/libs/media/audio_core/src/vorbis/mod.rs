@@ -7,7 +7,7 @@ pub mod tables;
 use crate::bits::LsbReader;
 use crate::math;
 use crate::ogg::{OggReader, Packet};
-use crate::{Codec, Error, Format, Info, Pcm, Result, Source};
+use crate::{Codec, Error, Format, Info, Pcm, Result, SeekPoint, Source};
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -277,6 +277,16 @@ impl Setup {
             return Err(Error::Invalid("Vorbis identification header"));
         }
         Ok((channels, rate, [b0, b1]))
+    }
+
+    /// VPLAYAUDIO (rmbp B475): an audio packet's block size from its mode number (Vorbis I §4.3.1) — no decode; a
+    /// packet's output is a quarter of the previous block plus a quarter of its own (§4.3.8), so a container that
+    /// gives no granules (Matroska) is indexed exactly from the packets themselves.
+    pub fn packet_blocksize(&self, p: &[u8]) -> Option<usize> {
+        let mut r = LsbReader::new(p);
+        if r.read(1).ok()? != 0 { return None; }
+        let n = r.read(ilog(self.modes.len() as u32 - 1)).ok()? as usize;
+        Some(self.blocksize[self.modes.get(n)?.blockflag as usize])
     }
 
     pub fn parse(ident: &[u8], setup: &[u8]) -> Result<Setup> {
@@ -908,6 +918,15 @@ fn decode_residue_inner(res: &Residue, books: &[Codebook], r: &mut LsbReader, dn
 
 // ---------------------------------------------------------------- Ogg Vorbis
 
+/// Vorbis I §4.3.9 orders 3–8 channels L,C,R,…; every API here hands out the WAVE/SMPTE order (L,R,C,LFE,…).
+pub(crate) fn wave_order(planes: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    if !(3..=8).contains(&planes.len()) { return planes; }
+    const ORDER: [&[usize]; 6] = [&[0, 2, 1], &[0, 1, 2, 3], &[0, 2, 1, 3, 4], &[0, 2, 1, 5, 3, 4], &[0, 2, 1, 6, 5, 3, 4], &[0, 2, 1, 7, 5, 6, 3, 4]];
+    let map = ORDER[planes.len() - 3];
+    let mut src: Vec<Option<Vec<f32>>> = planes.into_iter().map(Some).collect();
+    map.iter().map(|&i| src[i].take().unwrap_or_default()).collect()
+}
+
 pub struct OggVorbis {
     r: OggReader,
     dec: VorbisDecoder,
@@ -918,6 +937,12 @@ pub struct OggVorbis {
     held: VecDeque<Vec<Vec<f32>>>,
     done: bool,
     out: Vec<Vec<f32>>,
+    /// SEEKTABLE2 (rmbp B469): the first audio page (the setup header ends its page), and the leading discard the
+    /// first page's granule set (a restart from the top repeats it).
+    data_start: Option<u64>,
+    skip0: u64,
+    /// The output length, once a seek has read the last page's granule.
+    total: Option<u64>,
 }
 
 impl OggVorbis {
@@ -926,18 +951,14 @@ impl OggVorbis {
         if comment.data.len() < 7 || comment.data[0] != 3 || &comment.data[1..7] != b"vorbis" { return Err(Error::Invalid("Vorbis comment header")); }
         let setup = r.next_packet()?.ok_or(Error::Eof)?;
         let s = Setup::parse(ident, &setup.data)?;
-        Ok(OggVorbis { r, dec: VorbisDecoder::new(s), decoded: 0, granule_base: None, skip_start: 0, held: VecDeque::new(), done: false, out: vec![] })
+        let data_start = r.at_page_boundary();
+        Ok(OggVorbis { r, dec: VorbisDecoder::new(s), decoded: 0, granule_base: None, skip_start: 0, held: VecDeque::new(), done: false, out: vec![], data_start, skip0: 0, total: None })
     }
 
     fn emit(&mut self, mut planes: Vec<Vec<f32>>, pcm: &mut Pcm) -> bool {
         // Vorbis I §4.3.9 orders 3–8 channels L,C,R,…; the API hands out the WAVE/SMPTE order every other
         // format here uses (L,R,C,LFE,…), the order FFmpeg and Chromium present too.
-        if (3..=8).contains(&planes.len()) {
-            const ORDER: [&[usize]; 6] = [&[0, 2, 1], &[0, 1, 2, 3], &[0, 2, 1, 3, 4], &[0, 2, 1, 5, 3, 4], &[0, 2, 1, 6, 5, 3, 4], &[0, 2, 1, 7, 5, 6, 3, 4]];
-            let map = ORDER[planes.len() - 3];
-            let mut src: Vec<Option<Vec<f32>>> = planes.into_iter().map(Some).collect();
-            planes = map.iter().map(|&i| src[i].take().unwrap_or_default()).collect();
-        }
+        planes = wave_order(planes);
         if self.skip_start > 0 {
             let n = planes[0].len();
             let s = (self.skip_start as usize).min(n);
@@ -966,7 +987,7 @@ impl OggVorbis {
             // the samples decoded means the stream starts with samples to discard
             // (when that first page is also the last, the spec cuts the end, not the beginning)
             let base = g as i64 - self.decoded as i64;
-            if base < 0 && !p.eos { self.skip_start = (-base) as u64; }
+            if base < 0 && !p.eos { self.skip_start = (-base) as u64; self.skip0 = self.skip_start; }
             self.granule_base = Some(base.max(0));
         }
         if p.eos {
@@ -985,7 +1006,7 @@ impl OggVorbis {
 impl Source for OggVorbis {
     fn info(&self) -> Info {
         let s = &self.dec.setup;
-        Info { rate: s.rate, channels: s.channels as u16, bits: 0, frames: None, format: Format::Ogg, codec: Codec::Vorbis, float: true }
+        Info { rate: s.rate, channels: s.channels as u16, bits: 0, frames: self.total, format: Format::Ogg, codec: Codec::Vorbis, float: true }
     }
     fn block(&mut self, pcm: &mut Pcm) -> Result<bool> {
         loop {
@@ -1003,6 +1024,38 @@ impl Source for OggVorbis {
             if let Some(pl) = self.handle(&p)? { self.held.push_back(pl); }
             if p.eos { self.done = true; }
         }
+    }
+    /// SEEKTABLE2 (rmbp B469): the page granule bisection ([`OggReader::bisect`]) to the last page ending at or before
+    /// the target; its last packet is decoded fresh as the one-block pre-roll (a first block yields no samples, only
+    /// its overlap half), so the next packet's samples start at that page's granule — bit-exact with the full decode.
+    fn seek(&mut self, t: u64) -> Result<Option<SeekPoint>> {
+        let Some(start) = self.data_start else { return Ok(None) };
+        if !self.r.can_seek() { return Ok(None); }
+        if self.granule_base.is_none() && !self.done {
+            let mut scratch = Pcm::default();
+            self.block(&mut scratch)?;
+        }
+        let base = self.granule_base.unwrap_or(0).max(0) as u64;
+        if let Some((_, g)) = self.r.bisect(start, u64::MAX)? { self.total = Some(g.saturating_sub(base)); }
+        let t = self.total.map_or(t, |n| t.min(n));
+        self.dec.reset();
+        self.held.clear();
+        self.done = false;
+        if let Some((pb, g)) = self.r.bisect(start, t + base)?.filter(|&(_, g)| g >= base) {
+            if let Some(p) = self.r.resume(pb)? {
+                let mut out = core::mem::take(&mut self.out);
+                if p.data.first().is_some_and(|b| b & 1 == 0) { let _ = self.dec.decode(&p.data, &mut out); }
+                self.out = out;
+            }
+            self.skip_start = 0;
+            self.decoded = g - base + self.skip0;
+            let sample = g - base;
+            return Ok(Some(SeekPoint { byte: pb, sample, exact: true, table: "ogg", landed: sample }));
+        }
+        if !self.r.reposition(start)? { return Ok(None); }
+        self.skip_start = self.skip0;
+        self.decoded = 0;
+        Ok(Some(SeekPoint { byte: start, sample: 0, exact: true, table: "ogg", landed: 0 }))
     }
 }
 

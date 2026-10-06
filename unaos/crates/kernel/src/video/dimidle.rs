@@ -105,7 +105,7 @@ pub fn service() {
     }
     super::lidsleep::service(); // LIDSLEEP (B431): rung 0's MSLD poll (knob) and the sleep blank's wake
     #[cfg(feature = "witness")]
-    fixture();
+    { dimidle_arm(); fixture(); }
 }
 
 /// The witness: a 1-second test threshold, wait for the blank, inject a key, check the wake and that
@@ -121,7 +121,7 @@ fn fixture() {
     let now = crate::arch::ms();
     match ST.load(Ordering::Relaxed) {
         0 => {
-            if now < START_MS || blanked() { return; }
+            if now < START_MS || blanked() || !FX_ARMED.load(Ordering::Acquire) { return; }
             S0.store(SWALLOWED.load(Ordering::Relaxed), Ordering::Relaxed);
             THRESH_OVERRIDE_MS.store(1000, Ordering::Relaxed);
             LAST_ACTIVITY_MS.store(now.max(1), Ordering::Relaxed);
@@ -153,7 +153,7 @@ fn fixture() {
 }
 
 #[cfg(feature = "witness")]
-fn finish(ok: bool, swallowed: u32) {
+fn finish(ok: bool, swallowed: u32) { FX_DONE.store(true, Ordering::Release);
     THRESH_OVERRIDE_MS.store(0, Ordering::Relaxed);
     LAST_ACTIVITY_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
     serial_println!(
@@ -178,3 +178,38 @@ pub fn set_idle_min(n: u32) {
 
 /// LIDSLEEP (B431): the last key/pointer event's time (ms; 0 = none yet) — the sleep blank's wake reads it.
 pub fn last_activity_ms() -> u64 { LAST_ACTIVITY_MS.load(Ordering::Relaxed) }
+
+// BOOTVERDICTS (rmbp-ledger B472, R80) — TAIL-APPENDED. The DIMIDLE witness BLANKED THE PANEL at 12 s and
+// INJECTED A KEY beneath the set-password screen (flight 25, f25-boots.log 442): a test at boot, and one that
+// touches the very input R86 says is never blocked. The state machine now waits for `tests dimidle` to arm it.
+#[cfg(feature = "witness")]
+static FX_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "witness")]
+static FX_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The service pass's one-shot: register `tests dimidle` (under `tests-at-boot` this arms it at once).
+#[cfg(feature = "witness")]
+fn dimidle_arm() {
+    static REG: AtomicBool = AtomicBool::new(false);
+    if !REG.swap(true, Ordering::AcqRel) {
+        crate::tests::register("dimidle", selftest);
+    }
+}
+
+/// `tests dimidle`: arm the 1 s blank-and-wake witness and wait, bounded, for its one line.
+#[cfg(feature = "witness")]
+pub fn selftest() {
+    if FX_DONE.load(Ordering::Acquire) {
+        serial_println!(":: DIMIDLE: skipped reason=once-per-boot ::");
+        return;
+    }
+    FX_ARMED.store(true, Ordering::Release);
+    if cfg!(feature = "tests-at-boot") { return; }
+    let dl = crate::arch::ms() + 12_000;
+    while !FX_DONE.load(Ordering::Acquire) && crate::arch::ms() < dl {
+        crate::arch::sched::yield_now();
+    }
+    if !FX_DONE.load(Ordering::Acquire) {
+        serial_println!(":: DIMIDLE: skipped reason=service-silent (armed; the line prints when the service lane runs) ::");
+    }
+}

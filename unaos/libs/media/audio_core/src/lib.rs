@@ -17,7 +17,7 @@
 //! | Vorbis (floors 0/1, residues 0/1/2; Ogg mapping) | Xiph Vorbis I specification | [`vorbis`] |
 //! | MP3 (MPEG-1/2/2.5 Layer III; ID3v2, Xing/LAME gapless) | ISO/IEC 11172-3, 13818-3 | [`mp3`] |
 //! | AAC-LC (ADTS; raw in MP4) | ISO/IEC 14496-3, 13818-7 | [`aac`] |
-//! | MP4/M4A container (AAC, MP3; fragmented; edit-list/iTunSMPB gapless) | ISO/IEC 14496-12, -14 | [`mp4`] |
+//! | MP4/M4A container (AAC, MP3; fragmented; edit-list/iTunSMPB gapless) | ISO/IEC 14496-12, -14 | [`container`] (over `demux_core`, MP4ONE B464) |
 //!
 //! One API: [`sniff`] names the format from the first bytes, [`Decoder::open`] picks the codec, and the
 //! [`AudioDecoder`] trait hands out interleaved PCM either as `f32` or as left-justified `i32`.
@@ -41,6 +41,7 @@ use alloc::vec::Vec;
 pub mod aac;
 pub mod aiff;
 pub mod bits;
+pub mod container;
 pub mod crc;
 pub mod facts;
 pub use facts::{facts_of, AudioFacts};
@@ -49,7 +50,6 @@ pub mod io;
 pub mod math;
 pub mod md5;
 pub mod mp3;
-pub mod mp4;
 pub mod ogg;
 pub mod opus;
 pub mod vorbis;
@@ -267,6 +267,8 @@ impl Decoder {
         let mut target = ms.saturating_mul(info.rate as u64) / 1000;
         if let Some(t) = info.frames { target = target.min(t); }
         let Some(mut p) = self.src.seek(target)? else { return Ok(None) };
+        // SEEKTABLE2: a source that learns its length while seeking (an Ogg's last granule, ADTS's header walk) says so
+        if let Some(t) = self.src.info().frames { target = target.min(t); }
         self.pcm.frames = 0;
         self.pos = 0;
         self.done = false;
@@ -387,7 +389,7 @@ mod open_arm {
     #[inline(never)] pub fn flac(s: ByteStream) -> Result<Box<dyn Source>> { Ok(Box::new(flac::FlacDecoder::new(s)?)) }
     #[inline(never)] pub fn ogg(s: ByteStream) -> Result<Box<dyn Source>> { ogg::open(s) }
     #[inline(never)] pub fn adts(s: ByteStream) -> Result<Box<dyn Source>> { Ok(Box::new(aac::AdtsStream::new(s)?)) }
-    #[inline(never)] pub fn mp4(s: ByteStream) -> Result<Box<dyn Source>> { mp4::open(s) }
+    #[inline(never)] pub fn mp4(s: ByteStream) -> Result<Box<dyn Source>> { container::open(s) }
     #[inline(never)] pub fn mp3(s: ByteStream) -> Result<Box<dyn Source>> { Ok(Box::new(mp3::Mp3Stream::new(s)?)) }
     /// An ID3v2 tag can front ADTS as well as MP3: look past it.
     #[inline(never)]

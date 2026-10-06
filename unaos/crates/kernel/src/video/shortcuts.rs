@@ -48,6 +48,7 @@ pub const C_CMD_ALT_ESC: &str = "cmd-alt-esc";
 pub const C_CTRL_CMD_Q: &str = "ctrl-cmd-q";
 pub const C_CMD_I: &str = "cmd-i"; // ATTRCOLUMNS (B402)
 pub const C_CMD_SPACE: &str = "cmd-space"; // LAUNCHER (B417)
+pub const C_CMD_PERIOD: &str = "cmd-."; // SHELLTASK2 (B474)
 
 const fn s(chord: &'static str, scope: &'static str, action: &'static str, arc: &'static str) -> Shortcut {
     Shortcut { chord, scope, action, arc }
@@ -84,6 +85,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     s("right-click tile", "Dock", "Tile menu (Quit)", "DOCKRUN"),
     s("right-click entry", "Quarry", "File operations", "QUARRYOPS"),
     s("Ctrl-C", "Shell", "Cancel line", "SHELLUX"),
+    s(C_CMD_PERIOD, "Shell", "Interrupt the running command", "SHELLTASK2"),
     s("Ctrl-L", "Shell", "Clear screen", "SHELLUX"),
     s("Ctrl-A / Ctrl-E", "Shell", "Line start / end", "SHELLUX"),
     s("Ctrl-U", "Shell", "Kill to line start", "SHELLUX"),

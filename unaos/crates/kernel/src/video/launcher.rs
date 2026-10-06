@@ -15,7 +15,8 @@
 //!   `settings::service`), never in the input router (R88).
 //! * THE SOURCES — Programs: the dock's table apps (`dock::installed_names`, launched by the pin's own post)
 //!   and every `/apps/*.ELF` (the shell line EXECNAME resolves, `dock::post_line_launch`, a glass launch);
-//!   names and icons are APPRES's. Files: `fs::search` (the name trees, one bounded walk per open).
+//!   names and icons are APPRES's. Files: `fs::search` (UnaFS's name index, one range scan per keystroke —
+//!   NAMEINDEX B432; a FAT root keeps one bounded walk per open).
 //!   Settings: `prefs_core::schema::SCHEMA`'s `system.*` keys and docs; a pick opens Settings on that row
 //!   (`settings::request_open_at`). Math: `+ - * / ( )` evaluated inline; Return copies the value.
 //! * RECENCY — a pick moves its token to the front of a 16-entry LRU kept in Principia's store as the
@@ -406,7 +407,7 @@ static FILES: crate::sync::Mutex<Vec<search::Hit>> = crate::sync::Mutex::new(Vec
 static SNAP_OWED: AtomicBool = AtomicBool::new(false);
 static RANK_OWED: AtomicBool = AtomicBool::new(false);
 static PAINT_OWED: AtomicBool = AtomicBool::new(false);
-static PICK: crate::sync::Mutex<Option<Item>> = crate::sync::Mutex::new(None);
+static PICK: crate::sync::Mutex<Option<Item>> = crate::sync::Mutex::new(None); static PICK_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); // SVCLATCH (B462)
 static LRU: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 static LRU_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
 static LRU_OWED: AtomicBool = AtomicBool::new(false);
@@ -613,7 +614,7 @@ fn take_selected() -> Option<Item> {
 }
 
 fn owe_pick(it: Item) {
-    *PICK.lock() = Some(it);
+    *PICK.lock() = Some(it); PICK_POSTED.post(); // SVCLATCH (B462)
     close();
     #[cfg(not(feature = "quarry"))]
     service();
@@ -720,7 +721,7 @@ pub fn press_at(x: i32, y: i32, mask: u8) -> bool {
 // ── The pass (off the router) ───────────────────────────────────────────────────────────────────
 
 fn lru_path() -> Option<String> {
-    crate::prefs::home().filter(|h| !h.is_empty()).map(|h| alloc::format!("{}/settings/launcher", h))
+    crate::prefs::home().filter(|h| !h.is_empty()).map(|_| crate::prefs::domain_path("launcher")) // SMALLFIX4 (LAUNCHERPREFS fold): the store names its own file; no `settings/` literal outside prefs.rs
 }
 
 /// LAUNCHERPREFS (B451): the recency is `app.launcher.recent` in Principia's store (`settings/launcher` by
@@ -890,10 +891,18 @@ fn rerank() {
         None => return,
     };
     let lru = LRU.lock().clone();
+    // NAMEINDEX (B432): per keystroke, ONE range scan of the volume's name index; the open-time snapshot is
+    // only the FAT root's (or a still-building index's) fallback.
+    let indexed = if q.is_empty() { None } else { search::query(&q, 64) };
     let (items, n) = {
         let p = PROGS.lock();
-        let f = FILES.lock();
-        rank(&q, &p, &f, &lru)
+        match &indexed {
+            Some(f) => rank(&q, &p, f, &lru),
+            None => {
+                let f = FILES.lock();
+                rank(&q, &p, &f, &lru)
+            }
+        }
     };
     if let Some(st) = ST.lock().as_mut() {
         if st.query == q {
@@ -911,7 +920,7 @@ fn rerank() {
 
 /// **The pass** — chained from `settings::service` (the desktop's service tick). Idle: four atomic loads.
 pub fn service() {
-    if let Some(it) = PICK.lock().take() {
+    if let Some(it) = PICK_POSTED.take(&PICK) { // SVCLATCH (B462): no lock on a quiet pass
         lru_load();
         let _ = act(&it);
     }
@@ -925,8 +934,10 @@ pub fn service() {
         let t0 = crate::arch::ms();
         lru_load();
         let p = programs();
-        let s = search::snapshot(search::SNAP_BUDGET);
-        serial_println!("[launcher] snapshot programs={} files={} truncated={} ms={}", p.len(), s.hits.len(), s.truncated as u8, crate::arch::ms().saturating_sub(t0));
+        // NAMEINDEX (B432): an indexed root needs no walk — each keystroke asks the index.
+        let idx = search::indexed();
+        let s = if idx { search::Snapshot { hits: Vec::new(), truncated: false } } else { search::snapshot(search::SNAP_BUDGET) };
+        serial_println!("[launcher] snapshot programs={} files={} truncated={} ms={} src={}", p.len(), s.hits.len(), s.truncated as u8, crate::arch::ms().saturating_sub(t0), if idx { search::SRC_INDEX } else { "walk" });
         *PROGS.lock() = p;
         *FILES.lock() = s.hits;
         RANK_OWED.store(true, Ordering::Release);
@@ -948,7 +959,11 @@ pub fn service() {
 pub fn selftest() {
     let t0 = crate::arch::ms();
     let progs = programs();
-    let snap = search::snapshot(search::SNAP_BUDGET);
+    // NAMEINDEX (B432): the files leg asks the name index (one range scan) when `/` has one, else walks.
+    let (snap, files_src) = match search::query("test", 64) {
+        Some(h) => (search::Snapshot { hits: h, truncated: false }, search::SRC_INDEX),
+        None => (search::snapshot(search::SNAP_BUDGET), "walk"),
+    };
     let (items_p, n_p) = rank("set", &progs, &[], &[]);
     let (_, n_f) = rank("test", &[], &snap.hits, &[]);
     let sm = settings_matches("bright");
@@ -984,7 +999,7 @@ pub fn selftest() {
     };
     let recency = lru_witness();
     let ms = crate::arch::ms().saturating_sub(t0);
-    serial_println!("[launcher] fixture set_first={} bright={} testf={} walk={} truncated={}", set_first, bright, testf, snap.hits.len(), snap.truncated as u8);
+    serial_println!("[launcher] fixture set_first={} bright={} testf={} files={} truncated={} src={}", set_first, bright, testf, snap.hits.len(), snap.truncated as u8, files_src);
     let ok = programs_n >= 1 && set_first && (files_n >= 1 || !testf) && settings_n >= 1 && bright && math_ok && open_word != "FAIL" && recency != "FAIL";
     serial_println!(
         ":: LAUNCHER: programs={} files={} settings={} math={} open={} recency={} ms={} -> {} ::",

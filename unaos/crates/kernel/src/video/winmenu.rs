@@ -1633,7 +1633,7 @@ fn app_pick(win: wm::WinId, id: u32) {
                 "[winmenu] app-menu about win={} name={}",
                 win,
                 core::str::from_utf8(&name[..len]).unwrap_or("?")
-            ); crate::fs::appres::about(&name[..len]); // APPRES (B398): name, version, signature — on the wire and in a notice
+            ); about_box(&name[..len]); // SMALLFIX4 (F14): the box is raised here, appres answers facts. APPRES (B398): name, version, signature — on the wire and in a notice
         }
         APP_ITEM_SHORTCUTS => {
             let opened = super::shortcuts::open();
@@ -2247,33 +2247,30 @@ pub fn selftest() {
 // Compile-time sanity
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity(ck: &mut super::metrics::Sane) {
     // The bar cannot lay out more titles than the snapshot can carry.
-    assert!(MENU_TITLES_MAX >= 1);
+    const _: () = assert!(MENU_TITLES_MAX >= 1);
     // The wire caps this registry shares with the protocol design must hold what a tree can be.
-    assert!(MENU_LABEL_MAX >= 1 && MENU_ITEMS_MAX >= 1 && MENU_DEPTH_MAX == 2);
+    const _: () = assert!(MENU_LABEL_MAX >= 1 && MENU_ITEMS_MAX >= 1 && MENU_DEPTH_MAX == 2);
     // The row must clear the glyph it centres, or a label is cut — the crystal's own assert, on the
     // metrics this file imported from it, so an import that ever stops agreeing fails the BUILD.
-    assert!(ITEM_H() >= CELL_H() && (ITEM_H() - CELL_H()) % 2 == 0);
-    assert!(SEP_H() >= 3);
+    ck.t(ITEM_H() >= CELL_H() && (ITEM_H() - CELL_H()) % 2 == 0);
+    ck.t(SEP_H() >= 3);
     // A title box must be wider than its own padding.
-    assert!(TPAD() * 2 < CELL_W() * MENU_LABEL_MAX);
+    ck.t(TPAD() * 2 < CELL_W() * MENU_LABEL_MAX);
     // SO2 — the cell now comes from the BAR and the row metrics still come from the crystal
     // dropdown, so the two sources must agree or `ITEM_H`'s clearance assert above is testing one
     // face against another's rows. This is the assert that keeps the re-sourcing honest.
-    assert!(CELL_W() == crystal::DROP_CELL_W());
-    assert!(CELL_H() == crystal::DROP_CELL_H());
+    ck.t(CELL_W() == crystal::DROP_CELL_W());
+    ck.t(CELL_H() == crystal::DROP_CELL_H());
     // SO3 — the caption is carried in two `u64`s, so the window title must fit in sixteen bytes.
-    assert!(wm::MAX_TITLE <= 16);
-    // SO3 — the snapshot must hold the app box AND the tenant's full complement of titles. APPMENU2 raised
-    // BAR_BOXES_MAX to MENU_TITLES_MAX + 5 (app, File, Edit, Window, Help) and left this assert at + 2: flight 26
-    // (image 19) panicked here on EVERY boot right after the installer stage and rebooted — the first live run of
-    // the assert. The assert now states the APPMENU2 layout.
-    assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 5);
+    const _: () = assert!(wm::MAX_TITLE <= 16);
+    // SO3 — the snapshot must hold the app box AND the tenant's full complement of titles.
+    const _: () = assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 5); // SANITYLEGS (B488): was `+ 2` at runtime and panicked every flight-26 boot; now a compile-time proof
     // SO3 — the default app menu is legal in the registry it is served from.
-    assert!(APP_MENU_DEFAULT.len() <= MENU_ITEMS_MAX);
+    const _: () = assert!(APP_MENU_DEFAULT.len() <= MENU_ITEMS_MAX);
     // SO3 — `Quit` and `About` must be distinguishable, or `app_pick` cannot route.
-    assert!(APP_ITEM_QUIT != APP_ITEM_ABOUT);
+    const _: () = assert!(APP_ITEM_QUIT != APP_ITEM_ABOUT);
 }
 
 // ---------------------------------------------------------------------------
@@ -3044,4 +3041,20 @@ pub fn wl_row_center(id: u32) -> Option<(i32, i32)> {
     let items = super::winlist::rows();
     let i = items.iter().position(|it| it.id == id)?;
     Some(((mx + mw / 2) as i32, (my + item_top(items, i) + ITEM_H() / 2) as i32))
+}
+
+/// **About <app>** — SMALLFIX4 (ARCHREVIEW F14): the About box belongs to the app menu, not to the
+/// registrar. `fs::appres::about` answers the facts (and prints `[appres] about`); this raises the
+/// notice through DIALOG2's one router and says so: `[winmenu] about-box name=<n> shown=<0|1>`.
+fn about_box(win_name: &[u8]) {
+    let (name, version, sig) = crate::fs::appres::about(win_name);
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        let title = alloc::format!("About {}", name);
+        let text = alloc::format!("Version {}\n{}", version, sig);
+        let shown = crate::video::dialog::notice(title.as_bytes(), text.as_bytes());
+        serial_println!("[winmenu] about-box name={} shown={}", name, shown as u8);
+    }
+    #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    let _ = (name, version, sig);
 }

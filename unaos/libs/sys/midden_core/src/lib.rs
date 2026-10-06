@@ -1554,21 +1554,25 @@ pub const APP_RES_NOTE_TYPE: u32 = 2;
 /// The resource block's leading magic: format 1.
 pub const RES_MAGIC: &[u8; 8] = b"UNARES\0\x01";
 /// The display name.
-pub const RES_KEY_NAME: &str = "una:name";
+pub const RES_KEY_NAME: &str = una_abi::attr_keys::NAME;
 /// The app's signature, reverse-DNS (`org.unaos.quarry`).
-pub const RES_KEY_SIGNATURE: &str = "una:signature";
+pub const RES_KEY_SIGNATURE: &str = una_abi::attr_keys::SIGNATURE;
 /// `semver+build`.
-pub const RES_KEY_VERSION: &str = "una:version";
+pub const RES_KEY_VERSION: &str = una_abi::attr_keys::VERSION;
 /// `windowed` · `resident` · `console` — the launch note in words.
-pub const RES_KEY_KIND: &str = "una:kind";
+pub const RES_KEY_KIND: &str = una_abi::attr_keys::KIND;
 /// The icon's SVG source.
-pub const RES_KEY_ICON_SVG: &str = "una:icon.svg";
+pub const RES_KEY_ICON_SVG: &str = una_abi::attr_keys::ICON_SVG;
 /// The icon rendered at 32, 64 and 128 px: RGBA PNGs.
-pub const RES_KEY_ICON_32: &str = "una:icon.32";
-pub const RES_KEY_ICON_64: &str = "una:icon.64";
-pub const RES_KEY_ICON_128: &str = "una:icon.128";
+pub const RES_KEY_ICON_32: &str = una_abi::attr_keys::ICON_32;
+pub const RES_KEY_ICON_64: &str = una_abi::attr_keys::ICON_64;
+pub const RES_KEY_ICON_128: &str = una_abi::attr_keys::ICON_128;
+/// The prefix every icon key shares (`una:icon`, `una:icon.<size>`).
+pub const RES_KEY_ICON_PREFIX: &str = una_abi::attr_keys::ICON;
 /// The MIME types the app opens, newline-separated.
-pub const RES_KEY_DOCTYPES: &str = "una:doctypes";
+pub const RES_KEY_DOCTYPES: &str = una_abi::attr_keys::DOCTYPES;
+/// DROPTYPES (B477): the MIME types the program takes as a drop, newline-separated (`type/*`, `*/*`).
+pub const RES_KEY_DROPTYPES: &str = una_abi::attr_keys::DROPTYPES;
 /// The rendered icon sizes, smallest first, with their keys.
 pub const RES_ICON_SIZES: [(u32, &str); 3] = [(32, RES_KEY_ICON_32), (64, RES_KEY_ICON_64), (128, RES_KEY_ICON_128)];
 

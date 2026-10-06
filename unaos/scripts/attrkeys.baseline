@@ -1,0 +1,17 @@
+# GATE-ATTRKEYS baseline (B452): key-shaped literals outside una_abi::attr_keys. SHRINK-ONLY.
+# arch/x86_64/pci.rs: PCI class labels in lspci output (not attribute keys).
+# unafs tests/boot80_logic.rs: commit-size fixtures over an arbitrary key (unafs links no una-abi).
+attrkey|unaos/crates/kernel/src/arch/x86_64/pci.rs|media:audio-legacy
+attrkey|unaos/crates/kernel/src/arch/x86_64/pci.rs|media:hda
+attrkey|unaos/libs/fs/unafs/tests/boot80_logic.rs|una:icon
+attrkey|unaos/libs/fs/unafs/tests/boot80_logic.rs|una:name
+attrkey|unaos/libs/fs/unafs/tests/boot80_logic.rs|una:opener
+# merge19: dependency-free cores MIRROR the registry (type_core EXTENSIONS_KEY,
+# unafs nameindex NAME_KEY/NAME_MARK_KEY); each crate's tests/attrkeys_pin.rs asserts the mirror equals
+# `una_abi::attr_keys`. The `job:` prefix and the `job:status == open` query strings are UnaFS query text, not keys.
+attrkey|unaos/libs/fs/unafs/src/nameindex.rs|una:fsname
+attrkey|unaos/libs/fs/unafs/src/nameindex.rs|una:fsname-index
+attrkey|unaos/libs/sys/type_core/src/lib.rs|una:extensions
+
+# holocron_core tests/ringlogin.rs (RINGLOGIN B465): a record KIND fixture string, the same spelling as attr_keys::BT_LINKKEY (holocron_core links no una-abi).
+attrkey|unaos/libs/sys/holocron_core/tests/ringlogin.rs|bt.linkkey

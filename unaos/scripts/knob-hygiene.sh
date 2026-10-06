@@ -27,10 +27,11 @@ SRC="$HERE/../crates/kernel/src"
 DEAD_OK="default"
 
 declared="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+[ \t]*=/{sub(/[ \t]*=.*/,"");print}' "$CARGO" | sort -u)"
-used="$(grep -rh --include='*.rs' -E 'feature[[:space:]]*=' "$SRC" \
-        | sed -E 's@//.*@@' \
-        | grep -oE 'feature[[:space:]]*=[[:space:]]*"[A-Za-z0-9_-]+"' \
-        | sed -E 's/.*"([^"]+)"/\1/' | sort -u)"
+# GATEREVIEW F10: lines are JOINED before the match — a `feature =` / `"name"` split over two lines was invisible
+# (a phantom so written passed); the extraction is probed on that shape below, and `--selftest` stops after the probes.
+extract() { sed -E 's@//.*@@' | tr '\n' ' ' | grep -oE 'feature[[:space:]]*=[[:space:]]*"[A-Za-z0-9_-]+"' | sed -E 's/.*"([^"]+)"/\1/' | sort -u; }
+used="$(find "$SRC" -name '*.rs' -exec cat {} + | extract)"
+[ "$(printf '#[cfg(all(x,\n    feature =\n    "zzsplit"))]\n// feature = "zzcomment"\n' | extract)" = zzsplit ] || { echo "GATE-KNOB: control FAILED — a feature split over lines was not extracted (or a comment was). No verdict." >&2; exit 2; }
 
 # CONTROL PROBE, the same idea the knob->leg check uses with `vugpar`, and for the same reason: a
 # regex that matched NOTHING would report "0 phantoms" and read as a clean tree. A zero has to be
@@ -40,6 +41,7 @@ for _probe in wc witness; do
   printf '%s\n' "$used"     | grep -qx "$_probe" || { echo "GATE-KNOB: control FAILED — '$_probe' not found in any cfg; the source scan is broken. No verdict." >&2; exit 2; }
 done
 
+[ "${1:-}" = --selftest ] && { echo "GATE-KNOB selftest: controls ok (manifest parse, cfg scan, split-line extract)"; exit 0; }
 phantom="$(comm -13 <(printf '%s\n' "$declared") <(printf '%s\n' "$used"))"
 dead="$(comm -23 <(printf '%s\n' "$declared") <(printf '%s\n' "$used") | grep -vxF "$DEAD_OK" || true)"
 

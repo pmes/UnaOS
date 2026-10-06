@@ -8,59 +8,63 @@ Principia. A write to a declared key goes through `prefs_core::schema::check`: a
 its range is CLAMPED and answered `clamped=true`; a wrong type, a string outside its enum, an over-long
 or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keeps its own namespace).
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
-operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
+operator (`pref set`, host `PrefSet`, a hand edit).
+
+PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`, the namespace named
+after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
+from ring 3 (`prefs_core::cap`).
 
 Rows: 47.
 
-| key | type | default | writers | reader | meaning |
-| :-- | :-- | :-- | :-- | :-- | :-- |
-| `system.appearance.accent` | enum `crispy \| teal \| moss \| amber \| clay \| rose \| violet \| slate` | `"crispy"` | settings | kernel theme (`video/theme.rs`), Settings > Appearance | The accent colour on the default button, the selection, the focused control's ring, the slider knob and the menu highlight (APPEARANCE B408; eight names, ours). |
-| `system.appearance.highlight` | enum `accent \| crispy \| teal \| moss \| amber \| clay \| rose \| violet \| slate` | `"accent"` | settings | kernel theme (`video/theme.rs`), Settings > Appearance | The text-selection colour: `accent` follows the accent, or one of the eight accent names (APPEARANCE B408). |
-| `system.appearance.mode` | enum `light \| dark \| auto` | `"light"` | settings | kernel theme (`video/theme.rs`), Settings > Appearance | Light or Dark appearance; `auto` is dark 19:00-07:00 by the local clock (the RTC until NETCLOCK gives a real time) (APPEARANCE B408). |
-| `system.audio.amp_holdoff_ms` | int `0..=600000` | consumer: `hda_amp::AMP_HOLDOFF_MS`, 5000 ms | operator | kernel HDA amp (`drivers/hda_amp.rs`) | Milliseconds of silence before the speaker amp powers down (PREFSKERNEL: declared from the kernel scan). |
-| `system.audio.mute` | bool | `false` | settings, keys | kernel settings (audio) | Output muted. |
-| `system.audio.volume` | int `0..=16` | `12` | settings, keys | kernel settings (audio) | Output level in sixteenths. |
-| `system.display.brightness` | int `1..=16` | `12` | settings, keys | kernel settings, backlight | Panel level in sixteenths; never 0 (BRIGHTFLOOR: the backlight's OFF belongs to the idle blank). |
-| `system.display.font` | enum `sans \| serif \| mono` | `"sans"` | operator | kernel `video::text` (KERNELFONT) | The UI typeface family for captions, menus and running text: DejaVu Sans, Serif or Sans Mono (KERNELFONT B359; the console grid is always mono). |
-| `system.display.font_size` | int `9..=32` | `13` | operator | kernel `video::text` (KERNELFONT) | UI text size in CSS px; device px = size x the panel's ppi (EDID) / 96, capped by the 16 px text cell; captions keep the bar-derived size. |
-| `system.display.idle_min` | int `0..=1440` | `10` | settings | kernel settings (DIMIDLE) | Minutes before the idle blank; 0 = never. |
-| `system.display.mode` | string ≤16 printable | consumer: the panel's own density scale (UIMETRICS) | settings | kernel settings (Display > Resolution), `video::dpi` | The looks-like size `WxH` of the chosen mode: the panel's native mode at a UI scale (`prefs_core::modes`); unset = the panel's default scale. |
-| `system.display.wallpaper` | string ≤120 printable | `""` | settings, wallpaper-verb | kernel settings, wallpaper | Wallpaper image path; empty = off. |
-| `system.dock.autohide` | bool | `false` | settings, dock | kernel dock | Hide the dock until the pointer reaches its edge (DOCK2). Edited in Settings > General > Auto-hide dock. |
-| `system.dock.pins` | string ≤256 printable | consumer: every pin the build carries (lumen only on a `lumen` build) | dock | kernel dock | Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen); TOML arrays are outside the subset. |
-| `system.dock.position` | enum `bottom \| left \| right` | `"bottom"` | settings, dock | kernel dock | The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock. |
-| `system.login.items` | string ≤256 printable | `""` | settings, dock | kernel login items (`video/loginitems.rs`) | Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login. |
-| `system.notify.dnd` | bool | `false` | settings | kernel NOTIFY (`video/notify.rs`) | Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows, no sound) (NOTIFY, MACPARITY row 24). Edited in Settings > Notifications; stored in settings/notify (NOTIFYPANE B435). |
-| `system.notify.dnd_from` | int `0..=23` | `0` | settings | kernel NOTIFYPANE (`video/notifypane.rs`) | Do Not Disturb's schedule: the local hour it starts (0..23); equal to `notify.dnd_until` = no schedule (NOTIFYPANE B435). |
-| `system.notify.dnd_until` | int `0..=23` | `0` | settings | kernel NOTIFYPANE (`video/notifypane.rs`) | Do Not Disturb's schedule: the local hour it ends (0..23, wrapping midnight); equal to `notify.dnd_from` = no schedule (NOTIFYPANE B435). |
-| `system.pointer.speed` | int `0..=2` | `1` | settings | kernel settings (pointer) | 0 slow, 1 normal, 2 fast. Legacy (R75): read only while `system.trackpad.speed` is unset (TRACKPADPANE). |
-| `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | operator | kernel POWERMENU | Battery percent at which the machine shuts down; 0 = off. |
-| `system.quarry.favorites` | string ≤512 printable | consumer: none — the sidebar's six built-in favorites only | quarry | kernel Quarry sidebar (`video/quarry/sidebar.rs`) | Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18). |
-| `system.settings.tab` | int `0..=8` | `0` | settings | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications). |
-| `system.trackpad.natural_scroll` | bool | `true` | settings | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Two-finger scrolling moves the content with the fingers (on) or the other way (off). Edited in Settings > Trackpad. |
-| `system.trackpad.secondary_click` | enum `two-finger \| off` | `"two-finger"` | settings | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | A click (or, with tap to click, a tap) made with two fingers down is a secondary click. Edited in Settings > Trackpad. |
-| `system.trackpad.speed` | int `1..=10` | `5` | settings | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Tracking speed: one gain on the TPSPEED curve (5 = the curve as flown, x0.25 at 1 .. x2.5 at 10); the curve's shape never changes. Unset, a stored `system.pointer.speed` maps to 4/5/7. Edited in Settings > Trackpad. |
-| `system.trackpad.tap_to_click` | bool | `false` | settings | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | A short touch with no travel and no press is a click. Edited in Settings > Trackpad. |
-| `system.trackpad.three_finger_drag` | bool | `false` | settings | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Three fingers down hold the primary button and move the pointer (a drag without a press). Edited in Settings > Trackpad. |
-| `vein.claude.api_key_env` | string ≤128 printable | `"ANTHROPIC_API_KEY"` | operator | gneiss_pal ProviderConfig | NAME of the environment variable holding the Claude key (the key is never a preference). |
-| `vein.claude.fallbacks` | bool | `true` | operator | gneiss_pal ProviderConfig | Let the Claude client fall back to the next model on overload. |
-| `vein.claudecode.bin` | string ≤4096 printable | `"claude"` | operator | gneiss_pal ProviderConfig | The Claude Code CLI binary for provider claudecode: a path, or a name looked up on PATH (CLAUDECODE, SR38). |
-| `vein.embed.dims` | int `1..=65536` | consumer: the embedding model's known width | operator | gneiss_pal EmbedConfig | Embedding vector width. |
-| `vein.embed.model` | string ≤128 printable | consumer: `gemini.embed_model` for gemini, `all-MiniLM-L6-v2` for local | operator | gneiss_pal EmbedConfig | The embedding model. |
-| `vein.embed.provider` | enum `gemini \| local \| off` | rule `embedder` | operator | gneiss_pal EmbedConfig | The embedder, its own setting independent of the chat provider (R81); off = recall disabled, said in-chat. |
-| `vein.embed.reembed_batch` | int `1..=100000` | `16` | operator | vein reembed | Memories per re-embed pass. |
-| `vein.endpoint` | string ≤160 printable | `"https://api.anthropic.com/v1/messages"` | operator | vein_ring3 prefs (LUMEN.ELF); kernel tests lumen | Where Vein's ring-3 client POSTs: an https:// URL (the key goes only over a verified TLS connection, VEINTLS) or an http:// relay that holds the key itself (never sent the key). |
-| `vein.gemini.api_key_env` | string ≤128 printable | `"GEMINI_API_KEY"` | operator | gneiss_pal ProviderConfig, EmbedConfig | NAME of the environment variable holding the Gemini key. |
-| `vein.gemini.auth` | enum `gcloud \| api_key \| apikey \| key \| adc \| gcloud_adc` | `"gcloud"` | operator | gneiss_pal ProviderConfig, EmbedConfig | Gemini authentication: gcloud ADC or an API key from `gemini.api_key_env`. |
-| `vein.gemini.embed_model` | string ≤128 printable | `"text-embedding-004"` | operator | gneiss_pal ProviderConfig, EmbedConfig | Gemini's embedding model. |
-| `vein.gemini.embed_region` | string ≤128 printable | `"us-central1"` | operator | gneiss_pal ProviderConfig, EmbedConfig | Vertex region for embeddings. |
-| `vein.gemini.project` | string ≤128 printable | consumer: none: gcloud auth refuses without one | operator | gneiss_pal ProviderConfig, EmbedConfig | Google Cloud project for Vertex. |
-| `vein.gemini.region` | string ≤128 printable | `"global"` | operator | gneiss_pal ProviderConfig | Vertex region for chat. |
-| `vein.key_file` | string ≤40 printable | consumer: unset: no key, the Echo provider answers | operator | vein_ring3 key (LUMEN.ELF); kernel tests lumen | Absolute path of the API key file on the UnaFS volume (read only when it stats with an inode id; refused on FAT). At most 40 bytes: ring 3's SYS_OPEN name bound. |
-| `vein.max_tokens` | int `1..=4294967295` | `16000` | operator | gneiss_pal ProviderConfig | Output token cap per reply. |
-| `vein.model` | string ≤128 printable | rule `chat-model` | operator | gneiss_pal ProviderConfig | The chat model. |
-| `vein.provider` | enum `claude \| gemini \| claudecode \| echo \| relay` | `"claude"` | operator | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired; claudecode = the installed Claude Code CLI on a subscription, host only, SR38). |
-| `vein.temperature` | float `0.0..=2.0` | consumer: the provider's own | operator | gneiss_pal ProviderConfig | Sampling temperature. |
+| key | type | default | writers | ring 3 | reader | meaning |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| `system.appearance.accent` | enum `crispy \| teal \| moss \| amber \| clay \| rose \| violet \| slate` | `"crispy"` | settings, program | yes | kernel theme (`video/theme.rs`), Settings > Appearance | The accent colour on the default button, the selection, the focused control's ring, the slider knob and the menu highlight (APPEARANCE B408; eight names, ours). |
+| `system.appearance.highlight` | enum `accent \| crispy \| teal \| moss \| amber \| clay \| rose \| violet \| slate` | `"accent"` | settings, program | yes | kernel theme (`video/theme.rs`), Settings > Appearance | The text-selection colour: `accent` follows the accent, or one of the eight accent names (APPEARANCE B408). |
+| `system.appearance.mode` | enum `light \| dark \| auto` | `"light"` | settings, program | yes | kernel theme (`video/theme.rs`), Settings > Appearance | Light or Dark appearance; `auto` is dark 19:00-07:00 by the local clock (the RTC until NETCLOCK gives a real time) (APPEARANCE B408). |
+| `system.audio.amp_holdoff_ms` | int `0..=600000` | consumer: `hda_amp::AMP_HOLDOFF_MS`, 5000 ms | operator | — | kernel HDA amp (`drivers/hda_amp.rs`) | Milliseconds of silence before the speaker amp powers down (PREFSKERNEL: declared from the kernel scan). |
+| `system.audio.mute` | bool | `false` | settings, keys, program | yes | kernel settings (audio) | Output muted. |
+| `system.audio.volume` | int `0..=16` | `12` | settings, keys, program | yes | kernel settings (audio) | Output level in sixteenths. |
+| `system.display.brightness` | int `1..=16` | `12` | settings, keys, program | yes | kernel settings, backlight | Panel level in sixteenths; never 0 (BRIGHTFLOOR: the backlight's OFF belongs to the idle blank). |
+| `system.display.font` | enum `sans \| serif \| mono` | `"sans"` | program | yes | kernel `video::text` (KERNELFONT) | The UI typeface family for captions, menus and running text: DejaVu Sans, Serif or Sans Mono (KERNELFONT B359; the console grid is always mono). |
+| `system.display.font_size` | int `9..=32` | `13` | program | yes | kernel `video::text` (KERNELFONT) | UI text size in CSS px; device px = size x the panel's ppi (EDID) / 96, capped by the 16 px text cell; captions keep the bar-derived size. |
+| `system.display.idle_min` | int `0..=1440` | `10` | settings | — | kernel settings (DIMIDLE) | Minutes before the idle blank; 0 = never. |
+| `system.display.mode` | string ≤16 printable | consumer: the panel's own density scale (UIMETRICS) | settings | — | kernel settings (Display > Resolution), `video::dpi` | The looks-like size `WxH` of the chosen mode: the panel's native mode at a UI scale (`prefs_core::modes`); unset = the panel's default scale. |
+| `system.display.wallpaper` | string ≤120 printable | `""` | settings, wallpaper-verb | — | kernel settings, wallpaper | Wallpaper image path; empty = off. |
+| `system.dock.autohide` | bool | `false` | settings, dock, program | yes | kernel dock | Hide the dock until the pointer reaches its edge (DOCK2). Edited in Settings > General > Auto-hide dock. |
+| `system.dock.pins` | string ≤256 printable | consumer: every pin the build carries (lumen only on a `lumen` build) | dock | — | kernel dock | Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen); TOML arrays are outside the subset. |
+| `system.dock.position` | enum `bottom \| left \| right` | `"bottom"` | settings, dock, program | yes | kernel dock | The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock. |
+| `system.login.items` | string ≤256 printable | `""` | settings, dock | — | kernel login items (`video/loginitems.rs`) | Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login. |
+| `system.notify.dnd` | bool | `false` | settings, program | yes | kernel NOTIFY (`video/notify.rs`) | Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows, no sound) (NOTIFY, MACPARITY row 24). Edited in Settings > Notifications; stored in settings/notify (NOTIFYPANE B435). |
+| `system.notify.dnd_from` | int `0..=23` | `0` | settings | — | kernel NOTIFYPANE (`video/notifypane.rs`) | Do Not Disturb's schedule: the local hour it starts (0..23); equal to `notify.dnd_until` = no schedule (NOTIFYPANE B435). |
+| `system.notify.dnd_until` | int `0..=23` | `0` | settings | — | kernel NOTIFYPANE (`video/notifypane.rs`) | Do Not Disturb's schedule: the local hour it ends (0..23, wrapping midnight); equal to `notify.dnd_from` = no schedule (NOTIFYPANE B435). |
+| `system.pointer.speed` | int `0..=2` | `1` | settings, program | yes | kernel settings (pointer) | 0 slow, 1 normal, 2 fast. Legacy (R75): read only while `system.trackpad.speed` is unset (TRACKPADPANE). |
+| `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | operator | — | kernel POWERMENU | Battery percent at which the machine shuts down; 0 = off. |
+| `system.quarry.favorites` | string ≤512 printable | consumer: none — the sidebar's six built-in favorites only | quarry | — | kernel Quarry sidebar (`video/quarry/sidebar.rs`) | Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18). |
+| `system.settings.tab` | int `0..=8` | `0` | settings, program | yes | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications). |
+| `system.trackpad.natural_scroll` | bool | `true` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Two-finger scrolling moves the content with the fingers (on) or the other way (off). Edited in Settings > Trackpad. |
+| `system.trackpad.secondary_click` | enum `two-finger \| off` | `"two-finger"` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | A click (or, with tap to click, a tap) made with two fingers down is a secondary click. Edited in Settings > Trackpad. |
+| `system.trackpad.speed` | int `1..=10` | `5` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Tracking speed: one gain on the TPSPEED curve (5 = the curve as flown, x0.25 at 1 .. x2.5 at 10); the curve's shape never changes. Unset, a stored `system.pointer.speed` maps to 4/5/7. Edited in Settings > Trackpad. |
+| `system.trackpad.tap_to_click` | bool | `false` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | A short touch with no travel and no press is a click. Edited in Settings > Trackpad. |
+| `system.trackpad.three_finger_drag` | bool | `false` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Three fingers down hold the primary button and move the pointer (a drag without a press). Edited in Settings > Trackpad. |
+| `vein.claude.api_key_env` | string ≤128 printable | `"ANTHROPIC_API_KEY"` | operator | — | gneiss_pal ProviderConfig | NAME of the environment variable holding the Claude key (the key is never a preference). |
+| `vein.claude.fallbacks` | bool | `true` | operator | — | gneiss_pal ProviderConfig | Let the Claude client fall back to the next model on overload. |
+| `vein.claudecode.bin` | string ≤4096 printable | `"claude"` | operator | — | gneiss_pal ProviderConfig | The Claude Code CLI binary for provider claudecode: a path, or a name looked up on PATH (CLAUDECODE, SR38). |
+| `vein.embed.dims` | int `1..=65536` | consumer: the embedding model's known width | operator | — | gneiss_pal EmbedConfig | Embedding vector width. |
+| `vein.embed.model` | string ≤128 printable | consumer: `gemini.embed_model` for gemini, `all-MiniLM-L6-v2` for local | operator | — | gneiss_pal EmbedConfig | The embedding model. |
+| `vein.embed.provider` | enum `gemini \| local \| off` | rule `embedder` | operator | — | gneiss_pal EmbedConfig | The embedder, its own setting independent of the chat provider (R81); off = recall disabled, said in-chat. |
+| `vein.embed.reembed_batch` | int `1..=100000` | `16` | operator | — | vein reembed | Memories per re-embed pass. |
+| `vein.endpoint` | string ≤160 printable | `"https://api.anthropic.com/v1/messages"` | operator | — | vein_ring3 prefs (LUMEN.ELF); kernel tests lumen | Where Vein's ring-3 client POSTs: an https:// URL (the key goes only over a verified TLS connection, VEINTLS) or an http:// relay that holds the key itself (never sent the key). |
+| `vein.gemini.api_key_env` | string ≤128 printable | `"GEMINI_API_KEY"` | operator | — | gneiss_pal ProviderConfig, EmbedConfig | NAME of the environment variable holding the Gemini key. |
+| `vein.gemini.auth` | enum `gcloud \| api_key \| apikey \| key \| adc \| gcloud_adc` | `"gcloud"` | operator | — | gneiss_pal ProviderConfig, EmbedConfig | Gemini authentication: gcloud ADC or an API key from `gemini.api_key_env`. |
+| `vein.gemini.embed_model` | string ≤128 printable | `"text-embedding-004"` | operator | — | gneiss_pal ProviderConfig, EmbedConfig | Gemini's embedding model. |
+| `vein.gemini.embed_region` | string ≤128 printable | `"us-central1"` | operator | — | gneiss_pal ProviderConfig, EmbedConfig | Vertex region for embeddings. |
+| `vein.gemini.project` | string ≤128 printable | consumer: none: gcloud auth refuses without one | operator | — | gneiss_pal ProviderConfig, EmbedConfig | Google Cloud project for Vertex. |
+| `vein.gemini.region` | string ≤128 printable | `"global"` | operator | — | gneiss_pal ProviderConfig | Vertex region for chat. |
+| `vein.key_file` | string ≤40 printable | consumer: unset: no key, the Echo provider answers | operator | — | vein_ring3 key (LUMEN.ELF); kernel tests lumen | Absolute path of the API key file on the UnaFS volume (read only when it stats with an inode id; refused on FAT). At most 40 bytes: ring 3's SYS_OPEN name bound. |
+| `vein.max_tokens` | int `1..=4294967295` | `16000` | operator | — | gneiss_pal ProviderConfig | Output token cap per reply. |
+| `vein.model` | string ≤128 printable | rule `chat-model` | operator | — | gneiss_pal ProviderConfig | The chat model. |
+| `vein.provider` | enum `claude \| gemini \| claudecode \| echo \| relay` | `"claude"` | operator | — | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired; claudecode = the installed Claude Code CLI on a subscription, host only, SR38). |
+| `vein.temperature` | float `0.0..=2.0` | consumer: the provider's own | operator | — | gneiss_pal ProviderConfig | Sampling temperature. |
 
 ## Rules (derived defaults)
 

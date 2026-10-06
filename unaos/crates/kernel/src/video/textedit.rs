@@ -42,7 +42,7 @@ const CHUNK: usize = 16 * 1024;
 const WHEEL_ROWS: usize = 3;
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
-static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None); static PENDING_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); // SVCLATCH (B462)
 static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 
 struct State {
@@ -106,12 +106,12 @@ pub fn is_open() -> bool {
 
 /// Latch a path for [`service`] (click-router safe).
 pub fn request_open(path: &str) {
-    *PENDING.lock() = Some(String::from(path));
+    *PENDING.lock() = Some(String::from(path)); PENDING_POSTED.post(); // SVCLATCH (B462)
 }
 
 /// Drain the latch. Chained from `quarry::live::service`.
 pub fn service() {
-    let want = PENDING.lock().take();
+    let want = PENDING_POSTED.take(&PENDING); // SVCLATCH (B462): no lock on a quiet pass
     if let Some(p) = want {
         match open(&p) {
             Ok(_) => serial_println!("[quarry] open TEXT consumed=editor path={}", p),

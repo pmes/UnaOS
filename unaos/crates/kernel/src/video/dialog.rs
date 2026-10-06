@@ -358,7 +358,7 @@ pub fn answer(a: Answer) {
     if d.screen {
         crate::video::crystal::login::screen_regain(); // DIALOG2: the login screen takes its ceiling back
     }
-    let ix = d.resolve(a);
+    let ix = d.resolve(a); LAST_IX.store(ix as u32, Ordering::Relaxed);
     let ok = ix == d.default_ix() && !(a == Answer::Cancel && d.cancel.is_some());
     LAST.store(match a { Answer::Expired => 3, _ if ok => 1, Answer::Cancel => 2, _ => if Some(ix) == d.cancel { 2 } else { 4 } }, Ordering::Relaxed);
     let word = match a { Answer::Expired => "expired", _ if ok => "ok", _ => "cancel" };
@@ -742,7 +742,7 @@ pub fn bus_fulfil(verb: u8, owner: u64, body: &[u8]) -> i64 {
     let ix = match verb { una_abi::BUS_VERB_DIALOG => 0, una_abi::BUS_VERB_SHEET => 1, _ => 2 };
     BUS_POSTED[ix].fetch_add(1, Ordering::Relaxed);
     if verb == una_abi::BUS_VERB_TOAST {
-        return if super::toast::post(title, r.message) { 0 } else { -16 };
+        let posted = if r.nb > 0 { let ix = r.nb - 1; super::toast::post_answer(title, r.message, r.buttons[ix as usize], owner, r.token, ix) } else { super::toast::post(title, r.message) }; return if posted { 0 } else { -16 }; // REFUSALUI (B468): the default button rides the toast; its press answers the poster
     }
     let mut d = Dlg::new(Icon::Caution, title, r.message, r.info, &r.buttons[..(r.nb.max(1) as usize)]);
     d.owner = owner;
@@ -868,4 +868,165 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
         open_pending();
     }
     console.println(&alloc::format!("dialog: {} status={}", args[0], st));
+}
+
+/// APPTRUST (B467): the index of the button the last answer resolved to (an `Act::Hook`'s `fn(bool)` only says
+/// default-or-not; a three-button ask with Cancel the default reads which of the others was pressed here).
+static LAST_IX: AtomicU32 = AtomicU32::new(0);
+pub fn last_button() -> u8 {
+    LAST_IX.load(Ordering::Relaxed) as u8
+}
+// ── REFUSALUI (rmbp-ledger B468) — ONE refusal surface; the toast verb's button answers its poster ─────────
+//
+// A refusal that exists only on the wire is a refusal the person never sees. [`refused`] is THE entry beside
+// [`notice`]: `what` names the refusal (the table [`REFUSALS`] sorts it — information is a toast, a refusal the
+// person caused is the alert, app-modal), `why` is the wire's own words. Once: the same `(what, why)` twice in a
+// row is said on the wire and shown once. Queue-only (try_lock, no `wm`), safe from the VFS and the boot path.
+
+/// OPENERTRUST (B447): a file's `una:preferred` named a program that is not a registrant of its type.
+pub const WHAT_OPENER: &[u8] = b"Opener refused";
+/// FWPIN (B455): a Wi-Fi microcode image failed its layout or its pin.
+pub const WHAT_FIRMWARE: &[u8] = b"Wi-Fi firmware refused";
+/// SECREVIEW F2 today, ROOTACL (B456) at its fold: a write to the root volume's system trees.
+pub const WHAT_SYSTEM_FILES: &[u8] = b"System files are protected";
+
+/// THE refusal table: `(what, kind, the person caused it)`. An untabled `what` is information (a toast).
+pub const REFUSALS: [(&[u8], Kind, bool); 3] = [
+    (WHAT_OPENER, Kind::Error, true),
+    (WHAT_FIRMWARE, Kind::Info, false),
+    (WHAT_SYSTEM_FILES, Kind::Error, false),
+];
+
+static REF_LAST: crate::sync::Mutex<([u8; 96], usize)> = crate::sync::Mutex::new(([0; 96], 0));
+static REF_ALERTS: AtomicU32 = AtomicU32::new(0);
+static REF_TOASTS: AtomicU32 = AtomicU32::new(0);
+
+/// Show a refusal: the alert (an error the person caused, or one the table sorts as an error) or a toast.
+/// Returns `true` when something was queued for the glass (`false`: a repeat, or the queue was full).
+pub fn refused(what: &[u8], why: &[u8]) -> bool {
+    refused_by(what, why, 0)
+}
+
+/// [`refused`], app-modal to `owner` (SMALLFIX5 B480 item 4: the slot that caused it — ROOTACL's writer — not owner 0;
+/// `0` = free-standing). A toast has no owner.
+pub fn refused_by(what: &[u8], why: &[u8], owner: u64) -> bool {
+    let (kind, user) = REFUSALS.iter().find(|e| e.0 == what).map(|e| (e.1, e.2)).unwrap_or((Kind::Info, false));
+    let mut key = [0u8; 96];
+    let mut kn = 0;
+    for &b in what.iter().chain(b"\x1f".iter()).chain(why.iter()).take(key.len()) {
+        key[kn] = b;
+        kn += 1;
+    }
+    let repeat = match REF_LAST.try_lock() {
+        Some(mut g) => {
+            let same = g.1 == kn && g.0[..kn] == key[..kn];
+            *g = (key, kn);
+            same
+        }
+        None => false,
+    };
+    let to = if repeat { "repeat" } else if kind == Kind::Error { "alert" } else { "toast" };
+    serial_println!("[refusal] what={} why={} -> {} owner={}", core::str::from_utf8(what).unwrap_or("?"), core::str::from_utf8(why).unwrap_or("?"), to, owner);
+    if repeat {
+        return false;
+    }
+    match kind {
+        Kind::Error => {
+            REF_ALERTS.fetch_add(1, Ordering::Relaxed);
+            let mut d = Dlg::new(Icon::Caution, what, what, why, &[b"OK"]);
+            d.user = user;
+            d.owner = owner;
+            LAST_REF_OWNER.store(owner, Ordering::Relaxed);
+            post(d)
+        }
+        Kind::Info => {
+            REF_TOASTS.fetch_add(1, Ordering::Relaxed);
+            super::toast::post(what, why)
+        }
+    }
+}
+
+/// NOTIFY's `ACT_ANSWER`: the TOAST verb's button was pressed — the poster gets `INPUT_EV_DIALOG_ANSWER` on its own
+/// ring (by identity, never the focused slot), exactly as an alert's answer.
+pub fn toast_answer(owner: u64, token: u8, ix: u8) {
+    reply(owner, token, ix, "ok");
+}
+
+/// `tests refusalui` (R80: run only when asked; model-only, headless):
+/// `:: REFUSALUI: opener=alert toast_action=answered fwpin=toast rootacl=alert -> PASS :: repeat=<once|why> queued=<n>`.
+pub fn refusalui_selftest() {
+    let was = HEADLESS.swap(true, Ordering::Relaxed);
+    let saved = { let mut g = ST.lock(); (g.cur.take(), g.pend.take(), core::mem::replace(&mut g.win, wm::WIN_NONE), g.deadline) };
+    let tsaved = super::toast::fixture_hold(true);
+    let rsaved = REF_LAST.lock().1;
+    REF_LAST.lock().1 = 0;
+    // an alert leg: `what` is up as an app-modal alert, answered
+    let alert_leg = |what: &[u8], why: &[u8]| -> &'static str {
+        let a0 = REF_ALERTS.load(Ordering::Relaxed);
+        if !refused(what, why) {
+            return "not-posted";
+        }
+        open_pending();
+        let up = matches!(current(), Some((t, n, _, _)) if &t[..n] == what);
+        answer(Answer::Default);
+        if up && REF_ALERTS.load(Ordering::Relaxed) == a0 + 1 { "alert" } else { "FAIL" }
+    };
+    let opener = alert_leg(WHAT_OPENER, b"preferred=/apps/EVIL.ELF refused=not-a-registrant");
+    let rootacl = alert_leg(WHAT_SYSTEM_FILES, b"attr-set path=/system/types refused=system-tree principal=anon");
+    // fwpin: information — a toast, no alert
+    let t0 = super::toast::queued();
+    let fwpin = if refused(WHAT_FIRMWARE, b"b43-ucode reason=unpinned") && super::toast::queued() == t0 + 1 && !is_up() { "toast" } else { "FAIL" };
+    // once: the same refusal again shows nothing
+    let repeat = if !refused(WHAT_FIRMWARE, b"b43-ucode reason=unpinned") && super::toast::queued() == t0 + 1 { "once" } else { "SHOWN-TWICE" };
+    super::toast::fixture_drain();
+    // the TOAST verb: its queued entry carries the button; NOTIFY's press answers the poster with the token
+    let mut toast_action = "FAIL";
+    let mut b = [0u8; 96];
+    if let Some(n) = una_abi::dialog_body(7, b"Saved", b"fixture", &[b"Undo"], &mut b) {
+        let (q0, r0) = (super::toast::queued(), REPLIED.load(Ordering::Relaxed));
+        if bus_fulfil(una_abi::BUS_VERB_TOAST, 0x4242, &b[..n]) == 0 && super::toast::queued() == q0 + 1 && !is_up() {
+            let pressed = super::notify::answer_leg();
+            if pressed && REPLIED.load(Ordering::Relaxed) == r0 + 1 {
+                toast_action = "answered";
+            }
+        }
+        super::toast::fixture_drain();
+    }
+    let queued = super::toast::queued();
+    super::toast::fixture_hold_restore(tsaved);
+    {
+        let mut g = ST.lock();
+        g.cur = saved.0;
+        g.pend = saved.1;
+        g.win = saved.2;
+        g.deadline = saved.3;
+    }
+    REF_LAST.lock().1 = rsaved;
+    HEADLESS.store(was, Ordering::Relaxed);
+    let pass = opener == "alert" && toast_action == "answered" && fwpin == "toast" && rootacl == "alert" && repeat == "once";
+    serial_println!(
+        ":: REFUSALUI: opener={} toast_action={} fwpin={} rootacl={} -> {} :: repeat={} queued={}",
+        opener, toast_action, fwpin, rootacl, if pass { "PASS" } else { "FAIL" }, repeat, queued
+    );
+}
+
+/// SMALLFIX5 (B480): the owner the last refusal alert was posted for (`tests smallfix5` reads it after a headless leg).
+static LAST_REF_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The owner of the last refusal alert posted.
+pub fn last_refusal_owner() -> u64 {
+    LAST_REF_OWNER.load(Ordering::Relaxed)
+}
+
+/// SMALLFIX5 (B480) item 4: the owner app of the slot running the caller now (the writer, in a syscall) — x86: the live
+/// CR3's slot; `0` elsewhere (free-standing, as before).
+pub fn caller_owner() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::memory::current_slot().map(|s| wm::owner_of_launch(s as u64)).unwrap_or(0)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
 }

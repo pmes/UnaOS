@@ -467,7 +467,7 @@ FORBID :: DIRNS: .* -> FAIL
 # LOGINFLOW2 M1 (R64/R65/R77) — boot 2: the lane's seeded store has root's password AND users, so the stage is the LOGIN SCREEN
 # (root is not the assumed login). The "boot2-login" fixture then logs in through that screen (root wrong refused, una wrong
 # refused, una opens HER session) and the swept furniture is re-minted; `login_root` lets root type its own way in.
-REQUIRE :: FIRSTBOOT: stage=login-screen root_set=true users=\d+ desktop_ignited=false why=store-has-users -> PASS ::
+REQUIRE :: FIRSTBOOT: stage=login-screen root_set=true users=\d+ desktop_ignited=false why=store-has-users -> coherent ::
 REQUIRE :: FIRSTBOOT-LOGIN: user=una screen_first=true root_wrong=refused wrong=refused opened=true furniture_reignited=true -> PASS ::
 FORBID :: FIRSTBOOT-LOGIN: .* -> FAIL
 # LOGINFLOW2 M2/M3 — LOGOUTUI M4 ("logout" in `tests`): the refused alert closes on OK; Log Out -> screen over an empty desktop ->
@@ -476,5 +476,5 @@ REQUIRE :: LOGOUT: alert_open=true alert_ok_closes=true session=true screen_back
 FORBID :: LOGOUT: .* -> FAIL
 REQUIRE :: LOGOUTDESK: windows_closed=\d+ reignited=2 console=posted shell=posted -> PASS ::
 FORBID :: LOGOUTDESK: windows_closed=.* -> FAIL
-FORBID :: FIRSTBOOT: .* -> FAIL
+FORBID :: FIRSTBOOT: .* -> incoherent
 FORBID :: FIRSTBOOT: witness chain HELD

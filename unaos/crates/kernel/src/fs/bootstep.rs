@@ -120,6 +120,7 @@ impl Step {
     /// End the step: its one line. `extra` is appended verbatim (empty for none).
     pub fn end(self, extra: &str) -> (u64, Io) {
         let (ms, d) = self.delta();
+        note_span(self.name, self.t0, self.t0 + ms); // SMALLFIX6 (B495): the span, for the lag boot line's `overlaps=`
         serial_println!(
             "[boot] step={} ms={} blocks_read={} blocks_written={} cmds={}{}{}",
             self.name, ms, d.blocks_read(), d.blocks_written(), d.cmds(),
@@ -165,12 +166,18 @@ pub fn boot80_selftest() {
     // window (flight 24's 168 blocks rode a screenshot capture writing beside it — the counters are global). Its
     // bound is the walk it does, not the number of types: `ls` reads ONE directory whatever its count (flight 25:
     // 26 types in 34 blocks) — an inode read and a directory read per level, each at most one read-ahead window.
-    let (types, tio) = crate::fs::unafs::with_unafs(|fs| {
+    // SMALLFIX5 (B480) item 6: the leg is ASSOCSTAMP's own read — the directory resolved and its ONE stamp attribute
+    // (what a login build reads when nothing changed), no longer an `ls` of every type. `types` is the stamp's count.
+    let (have, tio) = crate::fs::unafs::with_unafs(|fs| {
         let i0 = io();
-        let n = fs.resolve_path(crate::fs::assoc::TYPES_DIR).and_then(|id| fs.ls(id)).map(|v| v.len()).unwrap_or(0);
-        (n, io().since(i0))
+        let v = fs.resolve_path(crate::fs::assoc::TYPES_DIR).ok().and_then(|id| fs.get_attribute(id, crate::fs::assoc::STAMP_KEY).ok().flatten());
+        let s = match v { Some(::unafs::inode::AttributeValue::String(s)) => Some(s), _ => None };
+        (s, io().since(i0))
     })
-    .unwrap_or((0, Io::default()));
+    .unwrap_or((None, Io::default()));
+    let want = crate::fs::assoc::stamp_now();
+    let stamp_state = match &have { Some(h) if *h == want => "match", Some(_) => "miss", None => "none" };
+    let types = have.as_deref().and_then(|h| h.rsplit("n=").next()).and_then(|n| n.trim().parse::<usize>().ok()).unwrap_or(0);
     let rms = crate::arch::ms().saturating_sub(t1);
     let rio = io().since(io1);
     let total = mount_ms + rms;
@@ -180,9 +187,49 @@ pub fn boot80_selftest() {
     const STORE_BOUND: u64 = 64; // B350's resolve bound, kept for the store leg it was measured on
     let ok = mounted && tio.blocks_read() <= bound && sio.blocks_read() <= STORE_BOUND && total <= 2000;
     serial_println!(
-        ":: BOOT80: mount_ms={} mount_blocks={} mount_cmds={} blocks_read={} cmds={} ms={} users_store={} stage={} types={} ra_window={} store_blocks={} store_bound={} types_blocks={} bound={} from=walk{}x2xra{} foreign_wr={} -> {} ::",
+        ":: BOOT80: mount_ms={} mount_blocks={} mount_cmds={} blocks_read={} cmds={} ms={} users_store={} stage={} types={} ra_window={} store_blocks={} store_bound={} types_blocks={} bound={} from=walk{}x2xra{} foreign_wr={} types_from=stamp stamp={} -> {} ::",
         mount_ms, mio.blocks_read(), mio.cmds(), rio.blocks_read(), rio.cmds(), total, store, stage, types,
         crate::fs::unafs::ra_window_bound(), sio.blocks_read(), STORE_BOUND, tio.blocks_read(), bound, levels, ra_blocks,
-        rio.blocks_written(), if ok { "PASS" } else { "FAIL" }
+        rio.blocks_written(), stamp_state, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── SMALLFIX6 (rmbp-ledger B495) — the boot's step spans ─────────────────────────────────────────────────
+// Flight 26's `[lag] stall boot_suppressed=… worst_stage=render-handler worst_ms=6094` had no name: the render
+// task made no route, pass or park for ~6.1 s and the wire could not say during what. Every ended step (and the
+// `login ok` type-registry build) keeps its `[t0, t1]` here, the first [`SPAN_CAP`] of the boot, so `video::lag`
+// can name the steps the worst handler interval overlapped. No I/O; a busy lock drops the span (never waits).
+
+/// How many spans the boot keeps.
+pub const SPAN_CAP: usize = 16;
+static SPANS: crate::sync::Mutex<[(&'static str, u64, u64); SPAN_CAP]> = crate::sync::Mutex::new([("", 0, 0); SPAN_CAP]);
+
+/// Keep `name`'s span `[t0_ms, t1_ms]` (kernel ms). Never waits.
+pub fn note_span(name: &'static str, t0_ms: u64, t1_ms: u64) {
+    if let Some(mut g) = SPANS.try_lock() {
+        if let Some(slot) = g.iter_mut().find(|s| s.0.is_empty()) {
+            *slot = (name, t0_ms, t1_ms);
+        }
+    }
+}
+
+/// The kept spans that intersect `[a_ms, b_ms]`, as `name:ms` comma-joined, or `none`. `-` when the lock is busy.
+pub fn overlaps(a_ms: u64, b_ms: u64) -> alloc::string::String {
+    let Some(g) = SPANS.try_lock() else { return alloc::string::String::from("-") };
+    let mut out = alloc::string::String::new();
+    for s in g.iter().filter(|s| !s.0.is_empty() && s.1 <= b_ms && s.2 >= a_ms) {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&alloc::format!("{}:{}", s.0, s.2.saturating_sub(s.1)));
+    }
+    if out.is_empty() {
+        out.push_str("none");
+    }
+    out
+}
+
+/// Every kept span, as [`overlaps`] prints them (`tests smallfix6`).
+pub fn spans() -> alloc::string::String {
+    overlaps(0, u64::MAX)
 }

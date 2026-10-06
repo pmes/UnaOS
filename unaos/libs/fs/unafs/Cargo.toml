@@ -31,3 +31,7 @@ std = [
     "dep:memmap2",
     "thiserror/std",
 ]
+
+# GATE-ATTRKEYS (B452): host-only pin of this core's mirrored keys to `una_abi::attr_keys` (dev-dep; the release shape stays dependency-free).
+[dev-dependencies]
+una-abi = { path = "../../../crates/una-abi" }

@@ -469,3 +469,63 @@ pub fn selftest() {
         hit
     );
 }
+
+/// SMALLFIX4 (COLUMNSVIEW owed): which pane and row of the Columns view is under `(sx, sy)` —
+/// `Some((pane index, row))`, row `None` over a pane's empty tail or the preview. `None` = outside the panes.
+fn pane_row_at(m: &Model, cols: &[Col], sx: usize, sy: usize) -> Option<(usize, Option<usize>)> {
+    let li = m.geom.list_pane().inner();
+    if !li.contains(sx, sy) {
+        return None;
+    }
+    let l = lay(&m.geom, li, cols);
+    let i = (0..cols.len()).find(|&i| l.rects[i].map(|r| r.contains(sx, sy)).unwrap_or(false))?;
+    let (r, c) = (l.rects[i].unwrap_or(li), &cols[i]);
+    if c.kind == Kind::Preview {
+        return Some((i, None));
+    }
+    let rh = m.geom.row_h();
+    let j = top(c.sel, c.rows.len(), (r.h / rh).max(1)) + (sy - r.y) / rh;
+    Some((i, (j < c.rows.len()).then_some(j)))
+}
+
+/// SMALLFIX4 (COLUMNSVIEW owed): a RIGHT press in the Columns view targets the PANE under the pointer, not
+/// the list geometry: a focus-pane row is selected, an ancestor's or the next pane's row is navigated to and
+/// selected (as a primary press does, without the double-click grammar), and the file menu then acts on it.
+/// `true` = the press was over the panes. Witness: `[quarry] columns right-press pane=<i> kind=<k> row=<r|->`.
+pub(super) fn right_select(m: &mut Model, sx: usize, sy: usize) -> bool {
+    let cols = plan(m);
+    let Some((i, row)) = pane_row_at(m, &cols, sx, sy) else { return false };
+    let c = &cols[i];
+    let kind = match c.kind { Kind::Up => "up", Kind::Focus => "focus", Kind::Next => "next", Kind::Preview => "preview" };
+    if let Some(j) = row {
+        if c.kind == Kind::Focus {
+            m.list_sel = j;
+        } else {
+            let (p, name) = (c.path.clone(), c.rows[j].0.clone());
+            m.navigate(&p);
+            select_name(m, &name);
+        }
+        m.focus = Pane::List;
+        m.settle();
+    }
+    serial_println!("[quarry] columns right-press pane={} kind={} row={}", i, kind, row.map(|j| alloc::format!("{}", j)).unwrap_or_else(|| String::from("-")));
+    true
+}
+
+/// SMALLFIX4 (COLUMNSVIEW owed): the wheel over the Columns view moves the PANE under the pointer. A pane
+/// shows the rows around its selection (`top`), so the focus pane's wheel steps the selection by QSCROLL's
+/// `wheel_next` (three rows a detent, positive = away = toward row 0) and the pane follows; an ancestor's selection IS the
+/// path and the next pane has none, so their wheel scrolls nothing (consumed, `moved=false`).
+pub(super) fn wheel(m: &mut Model, sx: usize, sy: usize, detents: i32) -> Option<super::WheelHit> {
+    let cols = plan(m);
+    let (i, _) = pane_row_at(m, &cols, sx, sy)?;
+    let len = m.list.len();
+    if cols[i].kind != Kind::Focus || len == 0 {
+        return Some(super::WheelHit { pane: "columns", scroll: 0, max: 0, moved: false });
+    }
+    let was = m.list_sel.min(len - 1);
+    let next = super::wheel_next(was, len - 1, detents.signum());
+    m.list_sel = next;
+    m.settle();
+    Some(super::WheelHit { pane: "columns", scroll: next, max: len - 1, moved: next != was })
+}

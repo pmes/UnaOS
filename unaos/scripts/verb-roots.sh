@@ -34,15 +34,51 @@ done
 table_of() { # $1 = a midden lib.rs
     grep -o -E '\("[a-z_0-9-]+", *Avail::' "$1" | grep -o -E '"[a-z_0-9-]+"' | tr -d '"' | sort -u
 }
-arms_of() { # $1 = a shell.rs; the body of dispatch_command, comments stripped
-    local s e
-    s=$(grep -n -E '^pub fn dispatch_command\(' "$1" | head -1 | cut -d: -f1)
-    [ -n "$s" ] || return 3
-    e=$(awk -v s="$s" 'NR>s && /^(pub |pub\(crate\) )?fn [a-z_]/ {print NR; exit}' "$1")
-    [ -n "$e" ] || e=$(wc -l < "$1")
-    awk -v s="$s" -v e="$e" 'NR>s && NR<e' "$1" | sed -E 's#//.*$##' \
-        | grep -o -E '"[a-z_0-9-]+"([[:space:]]*\|[[:space:]]*"[a-z_0-9-]+")*[[:space:]]*=>' \
-        | grep -o -E '"[a-z_0-9-]+"' | tr -d '"' | sort -u
+arms_of() { # $1 = a shell.rs; the DEPTH-1 arms of dispatch_command's `match command {` (VERBDEPTH)
+    # GATEREVIEW V1 / arc VERBDEPTH (B476): a `"w" =>` in an INNER match (a sub-verb, a flag, a path
+    # case) is not a verb arm, so only patterns at brace depth 1 of the dispatch match count. A char
+    # scanner skips strings, raw strings, char literals and (nested) comments, keeps the depth-1 text
+    # and blanks everything deeper; the arm regex reads only what is left. No dispatch match: exit 3.
+    python3 - "$1" <<'PY'
+import re, sys
+t = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+f = re.search(r"^pub fn dispatch_command\(", t, re.M)
+m = f and re.compile(r"^[ \t]*match command \{", re.M).search(t, f.end())
+if not m:
+    sys.exit(3)
+i, n, d, out = m.end(), len(t), 1, []
+while i < n and d > 0:
+    c = t[i]
+    if t.startswith("//", i):
+        j = t.find("\n", i); i = n if j < 0 else j; continue
+    if t.startswith("/*", i):
+        k, i = 1, i + 2
+        while i < n and k:
+            if t.startswith("/*", i): k += 1; i += 2
+            elif t.startswith("*/", i): k -= 1; i += 2
+            else: i += 1
+        out.append(" "); continue
+    r = re.compile(r'b?r(#*)"').match(t, i)
+    if r and (i == 0 or not (t[i-1].isalnum() or t[i-1] == "_")):
+        j = t.find('"' + r.group(1), r.end()); j = n if j < 0 else j + 1 + len(r.group(1))
+        out.append(t[i:j] if d == 1 else " "); i = j; continue
+    if c == '"':
+        j = i + 1
+        while j < n and t[j] != '"':
+            j += 2 if t[j] == "\\" else 1
+        out.append(t[i:j+1] if d == 1 else " "); i = j + 1; continue
+    if c == "'":
+        q = re.compile(r"'(?:\\[^']{1,10}|[^'\\])'").match(t, i)
+        if q: out.append(" "); i = q.end(); continue
+    if c == "{": d += 1; out.append(" "); i += 1; continue
+    if c == "}": d -= 1; out.append(" "); i += 1; continue
+    out.append(c if d == 1 else (" " if c != "\n" else "\n")); i += 1
+body = "".join(out)
+words = set()
+for a in re.findall(r'"[a-z_0-9-]+"(?:\s*\|\s*"[a-z_0-9-]+")*\s*=>', body):
+    words.update(re.findall(r'"([a-z_0-9-]+)"', a))
+print("\n".join(sorted(words)))
+PY
 }
 
 # ---- controls first: a gate whose extractor cannot fire has no verdict --------------------------
@@ -50,11 +86,15 @@ tmp=$(mktemp -d "${TMPDIR:-${HOME}/unaos-bench/scratch}/verb-roots.XXXXXX" 2>/de
 trap 'rm -rf "$tmp"' EXIT
 s=$(grep -n -E '^pub fn dispatch_command\(' "$SHELL_RS" | head -1 | cut -d: -f1)
 [ -n "$s" ] || { echo "GATE-VERBS: NO VERDICT — dispatch_command not found in $SHELL_RS"; exit 2; }
-awk -v s="$s" 'NR==s+1 {print "        \"zz-control-arm\" => {} // synthetic"} {print}' "$SHELL_RS" > "$tmp/shell.rs"
+m=$(awk -v s="$s" 'NR>s && /^[ \t]*match command \{/ {print NR; exit}' "$SHELL_RS")
+[ -n "$m" ] || { echo "GATE-VERBS: NO VERDICT — dispatch_command has no \`match command {\`"; exit 2; }
+awk -v s="$m" 'NR==s+1 {print "        \"zz-control-arm\" => {} // synthetic"; print "        /* \"zz-comment-arm\" => {} */ // GATEREVIEW F8"; print "        \"zz-outer-arm\" => match x { \"zz-inner-arm\" => {} _ => {} }, // VERBDEPTH: an inner arm is no verb arm"} {print}' "$SHELL_RS" > "$tmp/shell.rs"
 sed -E '0,/^pub const HOST_VERBS/s//    ("zz-control-word", Avail::Always),\n&/' "$MIDDEN_RS" > "$tmp/lib.rs"
 # the sed above inserts the synthetic tuple BEFORE the declaration line; the extractor is not scoped to
 # the array, so that is the point: a tuple anywhere in the file counts, and this one must be seen.
 c_arms=$(arms_of "$tmp/shell.rs" | grep -c -x 'zz-control-arm')
+[ "$(arms_of "$tmp/shell.rs" | grep -c -x 'zz-comment-arm')" = 0 ] || c_arms=commented   # GATEREVIEW F8: an arm inside /* */ is no arm
+[ "$(arms_of "$tmp/shell.rs" | grep -c -x -e 'zz-inner-arm' -e 'zz-outer-arm')" = 1 ] || c_arms=depth   # VERBDEPTH: the outer arm is seen, its inner arm is not
 c_table=$(table_of "$tmp/lib.rs" | grep -c -x 'zz-control-word')
 c_fact=$(comm -12 <(table_of "$MIDDEN_RS") <(arms_of "$SHELL_RS") | grep -c -x 'date')
 if [ "$c_arms" != 1 ] || [ "$c_table" != 1 ] || [ "$c_fact" != 1 ]; then

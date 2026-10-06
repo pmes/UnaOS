@@ -2621,7 +2621,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), // RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), // RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -7309,7 +7309,7 @@ fn ptrdead_selftest_body() {
 /// **It exists as a function so the witness can drive the REAL chain.** `wmdirect_selftest` asserts
 /// against this call and [`wc_route_tail`], not against a transcription of them — the failure this
 /// closes is a witness that tests the API while the path a pointer report actually takes is inert.
-pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { let _lag = crate::video::lag::route(&raw); #[cfg(feature = "ftdirx")] if let crate::pal::Event::Key(b) = raw { if crate::drivers::xhci::ftdi::ftdirx::claim_origin(b) { #[cfg(feature = "login")] crate::fs::users::serialdoor_principal_note(); /* FIRSTUSER (R100): `[serialdoor] principal=<system or name>` on a change */ static SERIALDOOR_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); if { let secret = crate::pwwire::withhold_fresh(); /* CONSOLEFIX M3 */ !secret } && SERIALDOOR_LOG.fetch_add(1, Ordering::Relaxed) < 256 { serial_println!("[serialdoor] key={} win_focus={:#x} ring={:#x} -> shell (the wire is a console)", crate::pwwire::key_class(b), crate::video::wm::focus_asid(), USER_INPUT_ACTIVE.load(Ordering::Acquire)); } return raw; } } // SERIALDOOR — **THE WIRE IS A CONSOLE, NOT A KEYBOARD** (Peter, 2026-09-17). FIRST in this function, ahead of `strip::key_escape`, `quarry::key_route`, `wc_focus_key` and `user_input_route`, because every one of those is a question about WINDOW FOCUS and a serial byte is not addressed to a window. FTDICR measured the cost of asking them anyway (`docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §FTDICR): on flight 10 a focused Quarry ate every `help\r` at its `b'\r' | b'\n'` arm — `[quarry] key_route key=0x0d focus=1 took=1` — and the SAME byte submitted the line the moment focus left, `focus=0 took=0` with `[midden] cmd=` 19 ms later. Nothing about the byte changed; only `focus` did. So an operator at the cable could not reach the shell at all while a window held focus, and had no way to see why. `return raw` and not `user_input_route(raw)`: the ruling says the SHELL, so the byte skips the focused ring-3 ring too — a program that wants the wire asks for it, it does not inherit it by being frontmost. KEYBOARD-ORIGIN ENTER IS UNTOUCHED: the tag is claimed only for bytes `ftdirx::deliver` actually pushed (`claim_origin` matches the byte at the head of that FIFO), so a keyboard Enter still reaches Quarry and still opens the selection. TWO focus numbers on the witness, because there are two and a reader of flight 10 will otherwise pair the wrong one: `win_focus=` is `wm::focus_asid()`, the WINDOW focus `quarry::key_route` gates on and the one `[quarry] key_route … focus=` reports, while `ring=` is `USER_INPUT_ACTIVE`, the EL0 input ring. A kernel-owned window holds the first and not the second, so `win_focus=0xffffff03 ring=0x0` is the normal shape of this line and is NOT "nothing was focused". Bounded witness, 256 lines — a console being typed into must not spend its own bandwidth narrating itself. Gated `ftdirx` (the module that produces the tag is `#[cfg(feature = "ftdirx")]`, `drivers/xhci/ftdi.rs:547`), so a build without the FTDI console compiles nothing here. ⚠ FOLDED onto this function's signature line, never given a line of its own — this file's panic `Location`s are load-bearing and the line count is unchanged; CODE BEFORE COMMENT (LEDGER P7).
+pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { let _lag = crate::video::lag::route(&raw); #[cfg(feature = "ftdirx")] if let crate::pal::Event::Key(b) = raw { if { let door = crate::drivers::xhci::ftdi::ftdirx::claim_origin(b); crate::serialdoor::note_key(door); door } { #[cfg(feature = "login")] crate::fs::users::serialdoor_principal_note(); /* FIRSTUSER (R100): `[serialdoor] principal=<system or name>` on a change */ static SERIALDOOR_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); if { let secret = crate::pwwire::withhold_fresh(); /* CONSOLEFIX M3 */ !secret } && SERIALDOOR_LOG.fetch_add(1, Ordering::Relaxed) < 256 { serial_println!("[serialdoor] key={} win_focus={:#x} ring={:#x} -> shell({})", crate::pwwire::key_class(b), crate::video::wm::focus_asid(), USER_INPUT_ACTIVE.load(Ordering::Acquire), crate::serialdoor::route_word()); } return raw; } } // SERIALDOOR — **THE WIRE IS A CONSOLE, NOT A KEYBOARD** (Peter, 2026-09-17). FIRST in this function, ahead of `strip::key_escape`, `quarry::key_route`, `wc_focus_key` and `user_input_route`, because every one of those is a question about WINDOW FOCUS and a serial byte is not addressed to a window. FTDICR measured the cost of asking them anyway (`docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §FTDICR): on flight 10 a focused Quarry ate every `help\r` at its `b'\r' | b'\n'` arm — `[quarry] key_route key=0x0d focus=1 took=1` — and the SAME byte submitted the line the moment focus left, `focus=0 took=0` with `[midden] cmd=` 19 ms later. Nothing about the byte changed; only `focus` did. So an operator at the cable could not reach the shell at all while a window held focus, and had no way to see why. `return raw` and not `user_input_route(raw)`: the ruling says the SHELL, so the byte skips the focused ring-3 ring too — a program that wants the wire asks for it, it does not inherit it by being frontmost. KEYBOARD-ORIGIN ENTER IS UNTOUCHED: the tag is claimed only for bytes `ftdirx::deliver` actually pushed (`claim_origin` matches the byte at the head of that FIFO), so a keyboard Enter still reaches Quarry and still opens the selection. TWO focus numbers on the witness, because there are two and a reader of flight 10 will otherwise pair the wrong one: `win_focus=` is `wm::focus_asid()`, the WINDOW focus `quarry::key_route` gates on and the one `[quarry] key_route … focus=` reports, while `ring=` is `USER_INPUT_ACTIVE`, the EL0 input ring. A kernel-owned window holds the first and not the second, so `win_focus=0xffffff03 ring=0x0` is the normal shape of this line and is NOT "nothing was focused". Bounded witness, 256 lines — a console being typed into must not spend its own bandwidth narrating itself. Gated `ftdirx` (the module that produces the tag is `#[cfg(feature = "ftdirx")]`, `drivers/xhci/ftdi.rs:547`), so a build without the FTDI console compiles nothing here. ⚠ FOLDED onto this function's signature line, never given a line of its own — this file's panic `Location`s are load-bearing and the line count is unchanged; CODE BEFORE COMMENT (LEDGER P7).
     // CRYSTAL/WINMENU — Escape dismisses an open menu, addressed to the window system exactly as `<TAB>` is, so it is judged in the same place: before either router or a focused app can swallow it.
     // R21 gave the panel a SECOND modal surface (a window's menus, in the bar), so the question goes to the shared `strip::key_escape` seam — beside `strip::press_route`, asked by BOTH arch routers,
     // rather than each naming one surface. It consumes ONLY a bare `Esc` while one of the two menus is open; every other event, and `Esc` with nothing down, falls straight through to the chain below.
@@ -16336,7 +16336,7 @@ pub fn u6bx_probe_once() {
     // U7x rides the SAME main-loop call sites as this probe (chained here, in-lane, rather than adding a
     // new hook in main.rs): each pass gives the U7x probe its own storage/AP-gated one-shot attempt; the
     // launchers' `U6BX_LAUNCH_DONE` gate orders the demos regardless of which probe fires first.
-    u7x_probe_once();
+    ladder_arm();
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
@@ -16894,7 +16894,7 @@ pub fn run_user_image_argv(
     // before `spawn_user_preemptible` below, for the same reason `spawn_user_image_bg_inner` arms
     // before its spawn: the task can reach `SYS_WIN_CREATE` the instant it is runnable.
     crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1); let _ = crate::origin::note_spawn(mapped.slot); // DIALOG2 (B404): the slot's explicit ORIGIN (`[spawn] origin=`). DIALOG (B395): the slot's glass-launch bit (Quarry's `run <path>` line is the glass's)
-    let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
+    let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new()); let _fg = fg_arm(&kill); // SHELLTASK2 (B474): Ctrl-C in the shell window reaches THIS program (`fg_interrupt`); cleared on every return
     // SMPBAL-X86: a foreground `run` is load-balanced, not stuck on the caller's core. The caller is
     // `x86_render_service` (the shell runs there since SCHED-X86), so `meter_current_cpu()` put every
     // program on the RENDER core and a `run` degraded the panel for its whole duration — the open
@@ -16915,7 +16915,7 @@ pub fn run_user_image_argv(
     // Deadline-bounded wait. Yielding (not sleeping) so this works before the timebase is calibrated and
     // so the shell task stays responsive to its own core's scheduler.
     let deadline = crate::arch::ticks() + deadline_ms;
-    while PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && crate::arch::ticks() < deadline {
+    while PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && crate::arch::ticks() < deadline && !kill.is_reaped() { // SHELLTASK2 (B474): an interrupted program ends the wait
         crate::arch::sched::yield_now();
     }
 
@@ -17643,7 +17643,7 @@ fn winx2_launcher(_demo_cpu: usize) {
             return;
         }
     };
-    let slot = slot as usize;
+    let slot = slot as usize; crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), "/apps/STAT.ELF"); // SMALLFIX5 (B480) item 3: the WINX-2 spawn arms its program name
 
     // Wait (bounded) for the program to prove it is alive: a window of its own AND presents landing.
     let deadline = crate::arch::ticks() + 5_000;
@@ -17892,7 +17892,7 @@ fn winx3_launcher(_demo_cpu: usize) {
             return;
         }
     };
-    let slot = slot as usize;
+    let slot = slot as usize; crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), "WINX3.ELF"); // SMALLFIX5 (B480) item 3: the WINX-3 (synthesized) spawn arms its program name
 
     // The blob exits on its own (unlike STAT.ELF), so wait for the row to settle rather than killing it.
     let deadline = crate::arch::ticks() + 10_000;
@@ -23545,7 +23545,7 @@ fn u11m2_launcher(demo_cpu: usize) {
     #[cfg(feature = "irqstorage")]
     s6_witness_launcher(demo_cpu);
     // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
-    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor2_mv_launcher(demo_cpu); #[cfg(feature = "witness")] lfnmv_launcher(); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); crate::bus::attr::selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
+    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor2_mv_launcher(demo_cpu); #[cfg(feature = "witness")] lfnmv_launcher(); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); crate::bus::attr::selftest(); busx86_stamp_check(); LADDER_DONE.store(true, Ordering::Release); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
 }
 
 /// Build a U6x fixture slot at a given entry symbol — the `u7x_build`/`u11m2_build` shape (allocate a private
@@ -25031,7 +25031,7 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
         // by-name delete and `SYS_RENAME` call — so these legs cannot drift from the syscall's, there
         // being no second implementation to drift from. Body parsing and the fail-closed `-EINVAL` on
         // a malformed one are the aarch64 dispatcher's, verb for verb. ⚠ LINE-NEUTRAL fold (B94).
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "wc")] { crate::video::dialog::bus_fulfil(hdr.verb, row as u64 + 1, body) } #[cfg(not(feature = "wc"))] { EINVAL } } una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil(hdr.verb, body, pref_caller_in_session(row), &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal(row), &mut text), // ATTRSURF (B299): the attribute verbs, the SAME body SYS_ATTR_* calls. PREFS (B300): Principia's verbs, fulfilled over the one store; NOTICE: owner = slot + 1 (the wm key)
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "wc")] { crate::video::dialog::bus_fulfil(hdr.verb, row as u64 + 1, body) } #[cfg(not(feature = "wc"))] { EINVAL } } una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(row), row as u64 + 1, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal(row), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "wc", feature = "quarry"))] { crate::video::dnd::bus_drop_get(row as u64 + 1, body, &mut text) } #[cfg(not(all(feature = "wc", feature = "quarry")))] { EINVAL } } // ATTRSURF (B299): the attribute verbs, the SAME body SYS_ATTR_* calls. PREFS (B300): Principia's verbs, fulfilled over the one store; NOTICE: owner = slot + 1 (the wm key)
         crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL }, #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(row, body, &mut text),
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
@@ -28703,7 +28703,7 @@ pub fn session_end_fixture() -> (u64, usize, usize, usize, bool, bool, &'static 
         Ok(v) => v,
         Err(_) => return (0, 0, 0, 0, false, false, "spawn-refused"),
     };
-    let slot = slot as usize;
+    let slot = slot as usize; crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), "/apps/STAT.ELF"); // SMALLFIX5 (B480) item 3: the SECLOGIN session-end spawn arms its program name
     let deadline = crate::arch::ticks() + 5_000;
     let mut windowed = false;
     while crate::arch::ticks() < deadline {
@@ -29353,7 +29353,7 @@ pub fn root_session_launch() -> Result<(u64, usize, bool, bool), &'static str> {
         return Err("stat-elf-read");
     }
     let (pid, slot, _entry) = spawn_user_image_bg(&bytes).map_err(|_| "spawn-refused")?;
-    let slot = slot as usize;
+    let slot = slot as usize; crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), "/apps/STAT.ELF"); // SMALLFIX5 (B480) item 3: the LOGIN13 root session spawn arms its program name
     let deadline = crate::arch::ticks() + 5_000;
     let mut windowed = false;
     while crate::arch::ticks() < deadline {
@@ -30537,3 +30537,123 @@ pub fn spawnstorm_selftest() {
         why
     );
 }
+
+// =================================================================================================
+// RINGLOGIN (rmbp-ledger B465) — TAIL-APPENDED. `SYS_RINGKEY` (67): the login's door to Holocron's ring
+// (una-abi's RINGLOGIN block). The caller must be the row registered for Holocron's Unlock verb (same
+// generation) and run as the door's user; `crate::keyring` holds the door and says the witness.
+// =================================================================================================
+#[cfg(feature = "lumen")]
+fn sys_ringkey(op: u64, a1: u64, a2: u64) -> i64 {
+    let row = caller_row();
+    #[cfg(feature = "login")]
+    let uid = match crate::arch::memory::current_slot() {
+        Some(s) => slot_user_live(s),
+        None => 0,
+    };
+    #[cfg(not(feature = "login"))]
+    let uid = 0u32;
+    #[cfg(feature = "busreg")]
+    let holder = matches!(crate::bus_route::fulfiller_row(holocron_core::wire::VERB_UNLOCK), Some((r, g)) if r == row && row < BUSX_MBOX.len() && SLOT_GEN[row].load(Ordering::Acquire) == g);
+    #[cfg(not(feature = "busreg"))]
+    let holder = { let _ = row; false };
+    match op {
+        una_abi::RINGKEY_OP_TAKE => {
+            if a2 as usize != una_abi::RINGKEY_LEN {
+                return EINVAL;
+            }
+            let mut out = [0u8; una_abi::RINGKEY_LEN];
+            let r = crate::keyring::door_take(holder, uid, &mut out);
+            if r == una_abi::RINGKEY_KEY {
+                let w = copy_to_user(a1, &out);
+                crate::keyring::wipe(&mut out);
+                if let Err(e) = w {
+                    return e;
+                }
+            }
+            r
+        }
+        una_abi::RINGKEY_OP_REPORT => crate::keyring::door_report(holder, uid, a1 as i64 as i32, a2 as u8),
+        _ => EINVAL,
+    }
+}
+/// DRAGDROP2 (rmbp-ledger B470) — is `owner` (the `slot + 1` wm key) a live ring-3 process? The drag session's
+/// test for a ring-3 window as a drop target (`video::dnd`): kernel furniture and exited apps are not.
+pub fn ring3_owner_live(owner: u64) -> bool {
+    owner != 0 && owner < 64 && appquit_pid(owner).is_some()
+}
+
+// =====================================================================================================
+// BOOTVERDICTS (rmbp-ledger B472, R80) — TAIL-APPENDED. THE U7x LADDER IS A TEST, NOT A BOOT STEP.
+// =====================================================================================================
+//
+// `u6bx_probe_once` used to call `u7x_probe_once` as its FIRST statement — above the INSTALLBARE services
+// gate — so the one-task chain U7x -> U8x -> U9x -> U10/U10c/U10d -> U11x -> CFU2-WGATE -> U11m2 -> U6gx ->
+// STOR1/2 -> LFNMV -> BUSX86-WR/EQ -> BANDY-CODEC/ATTR -> APPMENU -> BUSX86-STAMP printed 22 verdict lines
+// under the set-password screen on flight 25 (f25-boots.log 486..538). The call site now REGISTERS the
+// ladder (`tests ladder`); under `tests-at-boot` (the QEMU lanes) `register` runs it at the old site, in
+// the old order, without waiting (the main loop is the caller there).
+
+/// Set by the chain's last statement (after `busx86_stamp_check`); a declined rung never reaches it, so
+/// the fixture's wait is bounded.
+pub static LADDER_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The call site's one-shot: register `tests ladder` (R80 — nothing tests at boot).
+fn ladder_arm() {
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    if !ARMED.swap(true, Ordering::AcqRel) {
+        crate::tests::register("ladder", ladder_selftest);
+    }
+}
+
+/// `tests ladder`: fire the U7x chain once per boot (its rungs hold one-shot slots and gates) and wait,
+/// bounded, for its last line.
+pub fn ladder_selftest() {
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    if FIRED.swap(true, Ordering::AcqRel) {
+        serial_println!(":: LADDER: skipped reason=once-per-boot (the U7x..APPMENU chain's rungs are one-shot) ::");
+        return;
+    }
+    u7x_probe_once();
+    if cfg!(feature = "tests-at-boot") { return; }
+    let dl = crate::arch::ticks() + 30_000;
+    while !LADDER_DONE.load(Ordering::Acquire) && crate::arch::ticks() < dl {
+        crate::arch::sched::sleep_ms(10);
+    }
+    serial_println!(":: LADDER: chain_done={} ::", LADDER_DONE.load(Ordering::Acquire));
+}
+
+// ── SHELLTASK2 (rmbp-ledger B474): the foreground program's kill switch ─────────────────────────────────
+/// The kill switch of the program a foreground `run` (or a bare-name foreground exec) is waiting on, while it waits.
+static FG_RUN: crate::sync::Mutex<Option<alloc::sync::Arc<crate::arch::sched::KillSwitch>>> = crate::sync::Mutex::new(None);
+
+/// Clears [`FG_RUN`] when the foreground wait returns (any return path).
+pub struct FgGuard;
+impl Drop for FgGuard {
+    fn drop(&mut self) {
+        *FG_RUN.lock() = None;
+    }
+}
+
+fn fg_arm(kill: &alloc::sync::Arc<crate::arch::sched::KillSwitch>) -> FgGuard {
+    *FG_RUN.lock() = Some(kill.clone());
+    FgGuard
+}
+
+/// Ctrl-C on the shell window while a foreground program runs: kill THE PROGRAM (its own TEARDOWN-1 switch; the
+/// `run` wait sees the reap and returns). `false` when no foreground program is waited on.
+pub fn fg_interrupt() -> bool {
+    match FG_RUN.try_lock().and_then(|g| g.clone()) {
+        Some(k) => {
+            k.request();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Is a foreground program being waited on (read only)?
+pub fn fg_live() -> bool {
+    FG_RUN.try_lock().map(|g| g.is_some()).unwrap_or(true)
+}
+

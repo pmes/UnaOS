@@ -633,6 +633,7 @@ fn render_entry(now: u64) {
     let ex = RENDER_EXIT_US.swap(0, Relaxed);
     if ex != 0 && now > ex {
         SEC_R_HANDLER_US.fetch_max(now - ex, Relaxed);
+        boot_handler_note(now - ex); // SMALLFIX6 (B495): the boot's longest handler interval and when it ended
     }
 }
 
@@ -807,7 +808,7 @@ fn sec_roll(now_ms: u64) {
     let strands = SEC_STRANDS.swap(0, Relaxed);
     let yields = SEC_YIELDS.swap(0, Relaxed);
     let beam = crate::video::beam::sec_take();
-    let (seg_h, seg_hu, seg_p, seg_pu) = seg_take(); // INPUTSTALL2 M1
+    let (seg_h, seg_hu, seg_p, seg_pu) = seg_take(); let masked = crate::hidstall::take_sec_masked(); // INPUTSTALL2 M1. HIDSTALL (B485): the second's longest IRQ-masked UnaFS span
     let mut w = worst(&st);
     let mut w_ms = st[w] / 1000;
     let mut w_name = STAGES[w];
@@ -821,7 +822,7 @@ fn sec_roll(now_ms: u64) {
     let stall = w_ms >= STALL_MS || r[rw] / 1000 >= STALL_MS || seg_pu / 1000 >= STALL_MS; // INPUTSTALL2 M1: a pump step that held the HID pass is a stall second
     // M4b (the seat, R86/QUIETBOOT): before `phase=desktop` a stall second is COUNTED, not printed; the first
     // roll at the desktop says the count in one line. R80: a measurement kept, not a test run.
-    let desk = crate::boot::phase() == crate::boot::Phase::Desktop;
+    let desk = crate::boot::phase() == crate::boot::Phase::Desktop; if desk { crate::hidstall::note_sec(hid, MIN_KEYQ_US.load(Relaxed) / 1000); } // HIDSTALL (B485): the desktop's HID stall seconds and key-queue max
     if stall && !desk {
         BOOT_SUPPRESSED.fetch_add(1, Relaxed);
         let bw = w_ms.max(r[rw] / 1000);
@@ -832,13 +833,15 @@ fn sec_roll(now_ms: u64) {
     }
     if desk && !BOOT_SAID.swap(true, Relaxed) {
         let n = BOOT_SUPPRESSED.load(Relaxed);
+        let (h_ms, h_end) = (BOOT_H_US.load(Relaxed) / 1000, BOOT_H_END_MS.load(Relaxed));
         serial_println!(
-            "[lag] stall boot_suppressed={} worst_stage={} worst_ms={}",
-            n, if n == 0 { "none" } else { stage_word(BOOT_WORST_STAGE.load(Relaxed)) }, BOOT_WORST_MS.load(Relaxed)
+            "[lag] stall boot_suppressed={} worst_stage={} worst_ms={} handler_span_ms={}..{} overlaps={}",
+            n, if n == 0 { "none" } else { stage_word(BOOT_WORST_STAGE.load(Relaxed)) }, BOOT_WORST_MS.load(Relaxed),
+            h_end.saturating_sub(h_ms), h_end, crate::fs::bootstep::overlaps(h_end.saturating_sub(h_ms), h_end)
         );
     }
     if stall && desk {
-        let n = STALL_LINES.fetch_add(1, Relaxed);
+        let n = STALL_LINES.fetch_add(1, Relaxed); if r[1] / 1000 >= STALL_MS { HANDLER_STALLS.fetch_add(1, Relaxed); } // SHELLTASK (B458): a render-handler stall second, counted
         if n < STALL_LINES_FREE || n % 64 == 0 {
             let (dw, pr) = if split == 0 {
                 (alloc::string::String::from("-"), alloc::string::String::from("-"))
@@ -846,12 +849,12 @@ fn sec_roll(now_ms: u64) {
                 (ms_str(draw), ms_str(pre))
             };
             serial_println!(
-                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={}",
+                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={} masked_ms={}",
                 t0, now_ms.saturating_sub(t0), w_name, w_ms,
                 ms_str(st[0]), ms_str(st[1]), ms_str(st[2]), ms_str(st[3]), ms_str(st[4]), dw, pr,
                 ["route", "handler", "composite"][rw], ms_str(r[rw]),
                 passes, ms_str(pass_max), beam[3], beam[4], beam[0] / 1000, ms_str(beam[1]), beam[5], yields,
-                valve_word(), hid, strands, frames, seg_h, ms_str(seg_hu), seg_p, ms_str(seg_pu)
+                valve_word(), hid, strands, frames, seg_h, ms_str(seg_hu), seg_p, ms_str(seg_pu), masked
             );
         }
     }
@@ -1024,4 +1027,34 @@ fn seg_take() -> (&'static str, u64, &'static str, u64) {
     let (h, hu) = seg_unpack(SEC_SEG.swap(0, Relaxed), &SEG_NAMES);
     let (p, pu) = seg_unpack(SEC_PUMP.swap(0, Relaxed), &PUMP_NAMES);
     (h, hu, p, pu)
+}
+
+// SHELLTASK (rmbp-ledger B458) — the render-handler stall seconds at the desktop (`[lag] stall … render=handler`
+// class: the render task held over STALL_MS inside a handler — the shell on the render task was the flown cause).
+static HANDLER_STALLS: AtomicU32 = AtomicU32::new(0);
+/// Render-handler stall seconds since boot (`tests shelltask` reads the delta across a running verb).
+pub fn handler_stalls() -> u32 {
+    HANDLER_STALLS.load(Relaxed)
+}
+
+// ── SMALLFIX6 (rmbp-ledger B495): NAME the boot's render-handler stall ───────────────────────────────────
+// Flight 26: `worst_stage=render-handler worst_ms=6094|6086|6115` on all three boots, and nothing said during
+// what. Boot 1 root-mount 590 + assoc-seed 5498 = 6088 and boot 3 552 + 5562 = 6114: the render task made no
+// route/pass/park across `users::service`'s BOOT80 steps on the usb-pump (the flown tree wrote the type registry
+// at boot) — it waited on the UnaFS volume those steps held. The boot line now carries the longest handler
+// interval's span and the boot steps it overlapped (`fs::bootstep::overlaps`), so the next flight names it.
+static BOOT_H_US: AtomicU64 = AtomicU64::new(0);
+static BOOT_H_END_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Before the boot line is said: keep the longest render-handler interval and the kernel ms it ended at.
+fn boot_handler_note(d_us: u64) {
+    if !BOOT_SAID.load(Relaxed) && d_us > BOOT_H_US.load(Relaxed) {
+        BOOT_H_US.store(d_us, Relaxed);
+        BOOT_H_END_MS.store(crate::arch::ms(), Relaxed);
+    }
+}
+
+/// `tests smallfix6`: the boot's longest render-handler interval `(ms, end_ms)`.
+pub fn boot_handler_span() -> (u64, u64) {
+    (BOOT_H_US.load(Relaxed) / 1000, BOOT_H_END_MS.load(Relaxed))
 }

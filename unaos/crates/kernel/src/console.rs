@@ -63,6 +63,9 @@ pub struct Console {
     new_lines: usize,
     /// SCROLLBACK — absolute row below which the LIVE view shows (`clear` / Ctrl-L moves it; the lines above stay reachable by scrolling). `clear --all` drops them instead.
     clear_abs: u64,
+    /// SHELLTASK (B458) — a PRODUCER console: the `shell-job` task's. `println` appends to `shelltask::out` (the
+    /// render pass places it in the shell window's console) and nothing is drained here. `false` everywhere else.
+    task_out: bool,
 }
 
 impl Console {
@@ -81,6 +84,7 @@ impl Console {
             view_off: 0,
             new_lines: 0,
             clear_abs: 0,
+            task_out: false,
         }
     }
 
@@ -159,6 +163,7 @@ impl Console {
     /// array §3 describes rather than a second caller of this method, and it is a precondition to
     /// check before adding one, not a refactor to discover afterwards.
     pub fn drain_output(&mut self) -> u64 {
+        if self.task_out { return 0; } // SHELLTASK: the task's console holds no view; the render pass drains
         let (history, attrs, base, clear_abs, pen) = (&mut self.history, &mut self.attrs, &mut self.hist_base, &mut self.clear_abs, &mut self.pen);
         let mut placed = 0usize;
         let n = crate::termring::drain(|line| { placed += push_parsed(history, attrs, base, clear_abs, pen, line); });
@@ -183,6 +188,7 @@ impl Console {
     /// counted `dropped` charge — the record did not travel by the transport, and the ledger says so
     /// — not the reader's sense of what happened first.
     pub fn println(&mut self, text: &str) {
+        if self.task_out { crate::shelltask::out(text); return; } // SHELLTASK (B458): the shell task's line goes to the render pass
         self.drain_output();
         if !crate::termring::console_out_str(text) {
             self.place(text);
@@ -209,7 +215,7 @@ impl Console {
     /// just under three screenfuls there, and many more on anything smaller.
     pub const HISTORY_MAX: usize = 2000; // SCROLLBACK (R75): was 256 — the store keeps whole lines (they re-wrap on resize), bounded here, oldest dropped.
     /// The console background (Moonstone).
-    const BG: u32 = 0x2D2B55;
+    const BG: u32 = crate::video::theme::DESKTOP_BG;
 
     /// The single source of truth for page height: rows of history that fit on one screen above the
     /// prompt line, derived from the panel's real usable height and the metrics' line pitch.
@@ -288,7 +294,7 @@ impl Console {
             }
             let (a, b) = (lo.max(pc), hi.min(pc + len));
             if a < b {
-                pal.draw_text(m.margin + m.text_w(a - lo), y, self.current_input.get(a - pc..b - pc).unwrap_or(""), 0xFFFFFF);
+                pal.draw_text(m.margin + m.text_w(a - lo), y, self.current_input.get(a - pc..b - pc).unwrap_or(""), crate::video::theme::CONSOLE_BRIGHT);
             }
         }
 
@@ -496,6 +502,7 @@ impl Console {
     /// so the caller can mark its window dirty as it does for a keystroke.
     pub fn act(&mut self, a: crate::video::keymap::Action, pal: &mut TargetPal) -> bool {
         if let Some(painted) = self.scroll_action(a, pal) { return painted; } // SCROLLBACK — view motion, not an edit
+        if matches!(a, crate::video::keymap::Action::Interrupt) { let r = crate::shellux::console_key(0x03, self); return self.repaint(r, pal); } // SHELLTASK2 (B474): ⌘. is Ctrl-C — the running shell job first, else the line
         let (_, r) = crate::video::clipboard::terminal_action_in(
             a,
             &mut self.current_input,
@@ -574,7 +581,7 @@ impl Console {
             let (a, b) = (lo.max(r * cols), hi.min(r * cols + cols));
             let x = m.margin + m.text_w(a - r * cols);
             let y = y0 + r * m.line_h;
-            pal.draw_rect(x, y, m.text_w(b - a), m.cell_h, 0xFFFFFF);
+            pal.draw_rect(x, y, m.text_w(b - a), m.cell_h, crate::video::theme::CONSOLE_BRIGHT);
             let part: String = line.chars().skip(a - base).take(b - a).collect();
             pal.draw_text(x, y, &part, Self::BG);
         }
@@ -679,13 +686,13 @@ impl Console {
         let thumb_h = core::cmp::max(page_h * shown / total, 8).min(page_h);
         let span = total.saturating_sub(shown).max(1);
         let thumb_y = top + (page_h - thumb_h) * skip.min(span) / span;
-        pal.draw_rect(w.saturating_sub(4), top, 4, page_h, 0x3A3868);
+        pal.draw_rect(w.saturating_sub(4), top, 4, page_h, crate::video::theme::painter::CONSOLE_BAND);
         pal.draw_rect(w.saturating_sub(4), thumb_y, 4, thumb_h, crate::video::theme::accent());
         if self.new_lines > 0 {
             let y = top + rows * m.line_h;
-            pal.draw_rect(0, y, w, m.line_h, 0x3A3868);
+            pal.draw_rect(0, y, w, m.line_h, crate::video::theme::painter::CONSOLE_BAND);
             let msg = format!("[{} new lines]", self.new_lines);
-            pal.draw_text(m.margin, y, &msg, 0xFFFFFF);
+            pal.draw_text(m.margin, y, &msg, crate::video::theme::CONSOLE_BRIGHT);
         }
     }
 }
@@ -780,7 +787,7 @@ impl Console {
             if at.bg & tc::SET != 0 {
                 pal.draw_rect(x, y, m.text_w(seg.chars().count()), m.cell_h, at.bg & 0x00FF_FFFF);
             }
-            let mut fg = tc::resolve(at.fg, if at.bold { 0x00FF_FFFF } else { crate::video::theme::TERM_FG });
+            let mut fg = tc::resolve(at.fg, if at.bold { crate::video::theme::CONSOLE_BRIGHT } else { crate::video::theme::TERM_FG });
             if at.bold && at.fg & tc::SET != 0 { fg = tc::lighten(fg); }
             pal.draw_text(x, y, &seg, fg);
         }
@@ -798,4 +805,21 @@ impl Console {
     /// Line `i`'s attribute spans (fixture / test read).
     pub fn spans_of(&self, i: usize) -> alloc::vec::Vec<crate::termcolor::Span> { self.attrs.get(i).cloned().unwrap_or_default() }
     pub fn hist_base_for_fixture(&self) -> u64 { self.hist_base }
+}
+
+// SHELLTASK (rmbp-ledger B458) — the console's side of the seam (shelltask.rs). Tail block.
+impl Console {
+    /// Make this the shell task's PRODUCER console (see `task_out`).
+    pub fn set_task_out(&mut self) {
+        self.task_out = true;
+    }
+    /// SHELLWIN — does this console render into the shell WINDOW (the only console that hands lines off)?
+    pub fn is_in_window(&self) -> bool {
+        self.in_window
+    }
+    /// The render pass: place one line the shell task wrote, after anything the transport still holds.
+    pub fn place_from_task(&mut self, text: &str) {
+        self.drain_output();
+        self.place(text);
+    }
 }

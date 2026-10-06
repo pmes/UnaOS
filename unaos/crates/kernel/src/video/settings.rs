@@ -79,7 +79,7 @@ static SAVED_N: AtomicU32 = AtomicU32::new(0);
 static OPEN_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 /// The session user the file was last loaded for (empty = never loaded).
-static LOADED_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
+static LOADED_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new()); static SESSION_SEEN: crate::prefs::SessionSeen = crate::prefs::SessionSeen::new(); // SESSIONGEN (B462)
 static CUR: crate::sync::Mutex<Values> = crate::sync::Mutex::new(Values::DEFAULT);
 
 /// The persisted values.
@@ -304,7 +304,7 @@ fn change_password() {
         return;
     };
     #[cfg(feature = "login")]
-    { crate::video::crystal::login::open_set_password(n.as_bytes(), false); say("password", "set-password-screen", true); }
+    { let _ = crate::video::crystal::login::open_change_password(n.as_bytes()); say("password", "set-password-screen", true); } // SETTINGSREKEY (B483): the owner's change asks the old password and re-keys the ring
     #[cfg(not(feature = "login"))]
     { let _ = n; say("password", "login-feature-off", false); }
 }
@@ -354,14 +354,15 @@ pub fn service() {
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     super::launcher::service(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::appswitch::service(); /* APPSWITCH (B428): the switcher's pass */ // LAUNCHER (B417): the launcher's pass (snapshot, ranking, picks, the recency file) — off the input router
     if crate::fs::assoc::view_service() && is_open() && cur_tab() == FT_TAB { repaint(); } // FILETYPES (B423): the registry's rows / a preferred-app change, applied off the click path
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))] crate::fs::nameindex::service(); // NAMEINDEX (B432): the login task's chunked name-index build (idle: one load)
     crate::prefs::service(); super::loginitems::service(); super::settingsfiles::service(); super::appearance::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     if super::notifypane::take_stale() && is_open() && cur_tab() == NP_TAB { repaint(); } // NOTIFYPANE (B435): a newly seen app joins the open pane
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
     if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
-    let mut wb = [0u8; crate::prefs::WHO_BUF]; // PERFREVIEW F3 (B443): the per-pass session reads go on the stack
-    if let Some(u) = crate::prefs::user_name_in(&mut wb) {
-        let fresh = { let mut g = LOADED_FOR.lock(); if *g != u { *g = String::from(u); true } else { false } };
+    let mut wb = [0u8; crate::prefs::WHO_BUF]; let (sk, sq) = SESSION_SEEN.check(); let who = if sq.is_none() { crate::prefs::user_name_in(&mut wb) } else { None }; let has = sq.unwrap_or(who.is_some()); if sq.is_none() { SESSION_SEEN.mark(sk, has); } // SESSIONGEN (B462): the session is compared only when the login generation moved; PERFREVIEW F3 (B443): the per-pass session reads go on the stack
+    if has {
+        let fresh = match who { Some(u) => { let mut g = LOADED_FOR.lock(); if *g != u { *g = String::from(u); true } else { false } } None => false }; // SESSIONGEN: quiet => this generation was compared (and recorded) already
         // BRIGHTFLOOR M5: the session opened — the load (and the safe-mode Shift check) waits for the
         // first desktop pass SAFE_SETTLE_MS later, so a Shift still down from the password's last
         // character at Enter is never read as the reset.
@@ -376,7 +377,7 @@ pub fn service() {
     // The brightness keys (F1/F2) and the volume keys (F10-F12) change the live level from the input
     // paths, where no VFS work may run: this pass notices the change and persists it (PREFS B300).
     // BRIGHTFLOOR M5: only once the login's load has run (a key before it must not overwrite the store).
-    if crate::prefs::user_name_in(&mut wb).is_some() && !LOADED_FOR.lock().is_empty() && LOAD_DONE.load(Ordering::Acquire) {
+    if has && LOAD_DONE.load(Ordering::Acquire) { // SESSIONGEN (B462): `has` => LOADED_FOR holds this session's (non-empty) name
         let (lv, m) = crate::video::status::volume();
         let bl = crate::video::brightkeys::level();
         let (dv, db) = {
@@ -676,7 +677,8 @@ fn users_delete(name: &str) -> Result<(), &'static str> {
 fn users_reset(name: &str) {
     #[cfg(feature = "login")]
     {
-        crate::video::crystal::login::open_set_password(name.as_bytes(), false);
+        let reset = crate::video::crystal::login::open_change_password(name.as_bytes()); // SETTINGSREKEY (B483): own row = change (old password, ring re-keyed); another's = reset
+        if reset { if let Some(s) = STATE.lock().as_mut() { s.u.msg = alloc::format!("{}: {}", name, crate::video::crystal::login::RESET_LINE); } }
         users_say("reset", name, true, "set-password-screen");
     }
     #[cfg(not(feature = "login"))]

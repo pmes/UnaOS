@@ -1,5 +1,5 @@
 # EYES suite `metal` (GLASSEYES, rmbp-ledger B343): the KERNEL's own frames. Each case's SUBJECT is a PNG the
-# kernel's `shot <state>` verb wrote to /home/<u>/Shots/ on the card (pulled off by the bench), its ORACLE the
+# kernel's `shot <state>` verb wrote to /home/<u>/Desktop/ on the card (PRTSCR4: was Shots/) (pulled off by the bench), its ORACLE the
 # golden of that state under golden/, its mask the `<STEM>.MSK` PNG the kernel wrote beside it (white = masked).
 # Placeholders: {from} = the directory given to `run.sh metal --from <dir>`, {suite} = this directory.
 # No build step: nothing here renders, it only scores what the metal drew.

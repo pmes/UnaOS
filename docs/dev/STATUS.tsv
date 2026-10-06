@@ -197,8 +197,8 @@ ST195	S20 ORINRX: the Orin copy of the fix (no Orin capture in the gate's eviden
 ST196	S28: the NEUTRAL-TABLE batch is file-scoped (a review fact; no flight)	unflown			STATUSBASELINE 2026-10-06	S28
 ST197	S30 PTRPRESS: the restated-DOWN release synthesis (QEMU cannot produce the defect; no capture names it)	unflown			STATUSBASELINE 2026-10-06	S30
 ST198	SO2: the menubar drop-down placement measured on Orin render8 pixels (orin 17 PIXELS) (an Orin bench capture; the status gate reads rmbp f<N> captures only); the typeface half on a QEMU screendump	open			STATUSBASELINE 2026-10-06	SO2
-ST199	SO4 CRYSTALPUT: the crystal menu sits panel-left (Orin render13/14 logs carry anchor=panel-left) (an Orin bench capture; the status gate reads rmbp f<N> captures only)	open			STATUSBASELINE 2026-10-06	SO4
-ST200	SO5: the sprite divergence measured on Orin render8 (same=0 on 8 of 8 samples) (an Orin bench capture; the status gate reads rmbp f<N> captures only)	open			STATUSBASELINE 2026-10-06	SO5
+ST199	SO4 CRYSTALPUT: the crystal menu sits panel-left (Orin render13 and render14 logs carry anchor=panel-left)	confirmed	r13	[menubar] crystal menu=170x121+0+34 anchor=panel-left glyph=16x22+12 bar_w=1920 menu_x=0	STATUSBASELINE 2026-10-06	SO4
+ST200	SO5: the sprite divergence measured on Orin render8 (same=0 on 8 of 8 samples)	confirmed	r8	compositor=9x9 backbuffer=18x18 same=0 n=8/8	STATUSBASELINE 2026-10-06	SO5
 ST201	SO6 GATEFIX: the probe greens from both directories (a host drill; nothing to fly)	unflown			STATUSBASELINE 2026-10-06	SO6
 ST202	SO9FIX: Quarry key_route gates on focus (re-derived from code; Orin render9 did not score it)	unflown			STATUSBASELINE 2026-10-06	SO9
 ST203	SO13: the reopen mechanism was deleted by R49 before it flew	unflown			STATUSBASELINE 2026-10-06	SO13
@@ -220,7 +220,7 @@ ST218	SO47 NETVERB: arp answers from the neighbour table (proven on virt; no Ori
 ST219	SO43 LOGINBOOT: the login screen ignites on the Orin (proven on the ladder and in the artifact; no Orin capture)	unflown			STATUSBASELINE 2026-10-06	SO43
 ST220	SO44: while the login screen is up the desktop below takes no input (flight 12)	refuted	f12	| 9 | LOGIN | `[login] screen open window=2 box=1330x764 at (775,345)` at 8358 ms — a WINDOW over the live desktop (the desktop app launched at 32152 ms and the dock, menubar and STAT ran under it). NO `[users]` line all boot. One `[login] press at=(1158,491) control=none answered=0 swallowed=1`. Keys (EHCI-HID KEY lines at 260–268 s: Tab, Tab, s,t,o,r,m, Enter) reached the DESKTOP: `[wc-c] focus tab-cycle`, `[winmenu] app-menu owner=4 name=STAT`, then `storm` to USB-DEBUG — the screen never had focus. |	STATUSBASELINE 2026-10-06	SO44
 ST221	SO46: the WITNESS-BOUND / COPY-BOUND verdict (the partition is measured off two captures the cell does not number; only metal settles the verdict)	open			STATUSBASELINE 2026-10-06	SO46
-ST222	SR2 PRTSCR3: the sliced capture passed on Orin render8 (orin-ledger A36) (an Orin bench capture; the status gate reads rmbp f<N> captures only)	open			STATUSBASELINE 2026-10-06	SR2
+ST222	SR2 PRTSCR3: the sliced capture passed on Orin render8 (orin-ledger A36)	confirmed	r8	:: PRTSCR: SCREEN3.PNG 1920x1200 6913793 bytes -> OK ::	STATUSBASELINE 2026-10-06	SR2
 ST223	SR8: the cfg-narrowing refuted by a code census (no flight)	unflown			STATUSBASELINE 2026-10-06	SR8
 ST224	SR13 LEDGERGATES: strict-by-ancestry proven on two detached worktrees (a host drill; nothing to fly)	unflown			STATUSBASELINE 2026-10-06	SR13
 ST225	SR15 GATE-LBA32: the 32-bit LBA refusal fixture passes on x86 metal	confirmed	f13	[      ?ms] :: LBA32: first=0x00000000 last=0xffffffff refused=3/3 wrapto=0x00000000 byteoff=2199023255552 -> PASS ::	STATUSBASELINE 2026-10-06	SR15

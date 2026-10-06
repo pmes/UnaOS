@@ -1251,8 +1251,6 @@ fi
 [ -n "${UNAOS_SVG:-}" ] && _feats="${_feats}svg,"
 # VIDEOPLAYER (B434): UNAOS_VIDEO=1 — the Player plays video (video::vplay over demux_core + vp8_core + av1_core; links av1_core). x86 metal; the K8_FEATS arm in kernel8() compiles the dependency only. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_VIDEO:-}" ] && _feats="${_feats}videoplayer,"
-# KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
-[ "${UNAOS_WC_BLITTER:-}" = "gpu" ] && _feats="${_feats}wc_gpublit,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
@@ -4324,6 +4322,50 @@ build_user_holocron_x86() {
     echo -e "${COLOR_GREEN}✅ x86 ring-3 secrets handler: HOLOCRON-X86.ELF${COLOR_RESET}"
 }
 
+# HOLOCRONARM (rmbp-ledger B484): build the aarch64 HOLOCRON.ELF — the SAME crate, linked at the aarch64 ELF
+# window (user-holocron.ld, VA una_abi::USER_XWIN_VA_ARM, RING3ABI2 M5) → target/HOLOCRON.ELF. Like the other
+# aarch64 images the build IS the staged name (no -ARM suffix): `kernel8` and `esp_jetson` copy it to
+# APPS/HOLOCRON.ELF when `lumen` is armed, so the login (`keyring::after_login`) starts the one fulfiller that
+# takes the RINGLOGIN door. The bare-aarch64 target comes from the crate's .cargo/config.toml, so no --target.
+# Checks: ELF magic, e_machine b700, `_start` = the lowest PT_LOAD = the window VA (the loader's elf-model
+# test), the file within xwin::IMAGE_CAP (12 MiB on the 48 MiB heap) and image + stack within the window.
+USER_XWIN_VA_ARM=$((0x7840200000))
+build_user_holocron_aarch64() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building aarch64 ring-3 secrets handler (crates/user-holocron → target/HOLOCRON.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-holocron"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-holocron/user-holocron.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-holocron/target/aarch64-base/release/user-holocron" \
+      "${WORKSPACE_DIR}/target/HOLOCRON.ELF"
+    local f="${WORKSPACE_DIR}/target/HOLOCRON.ELF" out
+    [ -s "$f" ] || { echo -e "${COLOR_RED}ERROR: HOLOCRON.ELF missing/empty — aarch64 HOLOCRON build failed${COLOR_RESET}"; exit 1; }
+    [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: HOLOCRON.ELF does not start with the ELF magic${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "$f" | tr -d ' \n')"
+    [ "$pmach" = "b700" ] || { echo -e "${COLOR_RED}ERROR: HOLOCRON.ELF e_machine is ${pmach}, want b700 (EM_AARCH64=183 LE)${COLOR_RESET}"; exit 1; }
+    out="$(python3 - "$f" "$USER_WINDOW_BYTES" "$USER_XWIN_VA_ARM" 12582912 <<'PY'
+import struct, sys
+b = open(sys.argv[1], 'rb').read(); win = int(sys.argv[2]); xva = int(sys.argv[3]); fcap = int(sys.argv[4])
+entry, = struct.unpack_from('<Q', b, 24); phoff, = struct.unpack_from('<Q', b, 32); phent, phnum = struct.unpack_from('<HH', b, 54)
+loads, stack = [], 0
+for i in range(phnum):
+    t, fl, off, va, pa, fs, ms, al = struct.unpack_from('<IIQQQQQQ', b, phoff + i * phent)
+    if t == 1: loads.append((va, ms))
+    if t == 0x6474E551: stack = ms
+lo = min(v for v, _ in loads); hi = max(v + m for v, m in loads)
+st = ((stack + 0xFFF) & ~0xFFF) if stack else 65536
+need = (hi - xva) + st + 4096
+print("model=elf entry=%#x lo=%#x span=%d stack=%d need=%d file=%d file_cap=%d" % (entry, lo, hi - lo, st, need, len(b), fcap))
+sys.exit(0 if lo == xva and entry == xva and need <= win and st <= (1 << 20) and len(b) <= fcap else 1)
+PY
+)" || { echo -e "${COLOR_RED}ERROR: HOLOCRON.ELF does not fit the aarch64 ELF window: ${out}${COLOR_RESET}"; exit 1; }
+    echo -e "   HOLOCRON.ELF: ${out}"
+    echo -e "${COLOR_GREEN}✅ aarch64 ring-3 secrets handler: HOLOCRON.ELF${COLOR_RESET}"
+}
+
 # VEINTLS (SR36): NET.ELF runs on vein_ring3 (the transport LUMEN uses: verified TLS 1.3 with tls_core), linked at
 # the ELF window (RING3ABI2's user-net-x86.ld, taken verbatim) and built `--features cryptocore`.
 # NETRING3 M3 (B306): build the x86_64 static ELF64 ring-3 network client (crates/user-net → target/NET-X86.ELF),
@@ -5884,6 +5926,7 @@ USER_CHECK_MATRIX=(
   "user-vug      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-pulse    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-holocron aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-holocron/user-holocron.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
 )
 
 # Type-check every USER_CHECK_MATRIX row whose arch label matches $1, and print one summary line in the
@@ -8955,28 +8998,6 @@ BRACEPY
         _nrc=1
     fi
 
-    if "$WORKSPACE_DIR/scripts/knob-hygiene.sh"; then
-        echo -e "${COLOR_GREEN}  ✅ knob hygiene (no phantom cfg, no knob wired to nothing)${COLOR_RESET}"
-    else
-        _nrc=1
-    fi
-
-    # GATE-K8REACH (rmbp 14, 2026-09-06): LEDGER SR1's CLASS — build coverage is not operator
-    # reachability. `kernel8()` builds from a CURATED $K8_FEATS that deliberately does not draw from
-    # the general `_feats` map above, so a knob added there and never given an arm is UNREACHABLE in
-    # every Pi bare-metal image, with no error and no warning: the operator sets it, flashes, and the
-    # image is byte-identical. Two instances a week apart (`UNAOS_PRTSCRST`, pi 7 — the Print Screen
-    # gate greened about nothing for a week; `UNAOS_BOOTLOG`, orin 15). The gate does NOT decide which
-    # knobs BELONG in the Pi image — that is not mechanical and pi 7 was right to say so — it asserts
-    # that every knob is ACCOUNTED FOR: armed, or written down in scripts/k8-reach.registry as
-    # deliberately unarmed. A knob added tomorrow reds until someone rules on it.
-    local _k8rc=0
-    python3 "$WORKSPACE_DIR/scripts/k8-reach.py" || _k8rc=$?
-    if [ "$_k8rc" -ne 0 ]; then
-        [ "$_k8rc" -eq 2 ] && echo -e "${COLOR_RED}❌ k8-reach gate gave NO VERDICT — it did not run to a verdict, which is not a pass${COLOR_RESET}"
-        _nrc=1
-    fi
-
     # GATE-ROOTS: every BINARY target in the tree is a named root of this gate.
     #
     # `check` covers the dependency graph reachable from the roots it NAMES. The libraries come free —
@@ -9035,51 +9056,16 @@ BRACEPY
         [ "$_srrc" -eq 2 ] && echo -e "${COLOR_RED}❌ spec-roots gate gave NO VERDICT — its control did not fire, which is not a clean tree${COLOR_RESET}"
     fi
 
-    # GATE-VERBS (B47, 2026-09-24): the shell's two verb tables — midden_core's `HOST_VERBS` and
-    #   `dispatch_command`'s match arms — are ONE set, both set differences empty. `scripts/verb-roots.sh`
-    #   extracts both structurally (arms anywhere on a line, comments stripped) and runs three control
-    #   probes first (a synthetic arm, a synthetic table word, `date` in both); a control that does not
-    #   fire is exit 2 and NO verdict. A word in one table and not the other is exit 1, by name.
-    local _vrrc=0
-    "$WORKSPACE_DIR/scripts/verb-roots.sh" "$WORKSPACE_DIR" || _vrrc=$?
-    if [ "$_vrrc" -eq 0 ]; then
-        echo -e "${COLOR_GREEN}  ✅ verb roots (HOST_VERBS and the dispatch arms are one set)${COLOR_RESET}"
-    else
-        [ "$_vrrc" -eq 2 ] && echo -e "${COLOR_RED}❌ verb-roots gate gave NO VERDICT — its controls did not fire, which is not a clean tree${COLOR_RESET}"
-        [ "$_vrrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a shell verb is in one table and not the other (see GATE-VERBS above)${COLOR_RESET}"; return 1; }
-    fi
-
-    # GATE-CHARTER (AUDIT 2026-10-01, B297): every kernel file in the app-domain scope (video/, fs/,
-    #   install/, selfhost/, the shell files, hda_play) names the CODEX handler that owns its domain and
-    #   the seam it sits on (`CHARTER: <Handler> — <seam>` header, or a grandfather row in
-    #   `scripts/charter.registry`), and every `<home>/.name` literal the kernel writes is an allowlisted
-    #   dotfile. Four control probes first; a control that does not fire is exit 2 and NO verdict.
-    local _chrc=0
-    "$WORKSPACE_DIR/scripts/charter-check.sh" "$WORKSPACE_DIR" || _chrc=$?
-    if [ "$_chrc" -ne 0 ]; then
-        [ "$_chrc" -eq 2 ] && echo -e "${COLOR_RED}❌ charter gate gave NO VERDICT — its controls did not fire, which is not a clean tree${COLOR_RESET}"
-        [ "$_chrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a kernel file declares no owning handler, or writes a dotfile off the allowlist (see GATE-CHARTER above)${COLOR_RESET}"; return 1; }
-    fi
-
-    # GATE-ARCH (ARCHREVIEW, B441, 2026-10-06): the CHARTER claims read against the file (a ruling behind
-    #   kernel-by-ruling, a core behind shared-core), `{}/.name` dotfiles, writes into Principia's settings
-    #   folder outside prefs.rs, an undeclared kernel store, a format magic outside the shared cores.
-    #   Shrink-only baseline `scripts/arch.baseline`; selftest first (exit 2 = NO verdict).
-    local _arrc=0
-    python3 "$WORKSPACE_DIR/scripts/arch-check.py" "$WORKSPACE_DIR" || _arrc=$?
-    [ "$_arrc" -eq 2 ] && echo -e "${COLOR_RED}❌ arch gate gave NO VERDICT — its selftest or controls did not fire${COLOR_RESET}"
-    [ "$_arrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a new architecture finding or a stale baseline row (see GATE-ARCH above)${COLOR_RESET}"; return 1; }
-
-    # GATE-STATUS (STATUSTABLE, B425, 2026-10-06; Peter: "one status table to rule them all so a false claim
-    #   ... can never be made"): every flew/unflown/confirmed/refuted claim in a ledger status cell or a queue
-    #   STATE line cites an ST<n> row of docs/dev/STATUS.tsv, and a confirmed/refuted row's quoted line is found
-    #   byte for byte on its flight's capture. `--selftest` first: a fixture line in no log must FAIL.
-    local _strc=0
-    python3 "$WORKSPACE_DIR/../tools/status-check.py" --selftest >/dev/null || _strc=2
-    [ "$_strc" -eq 0 ] && { python3 "$WORKSPACE_DIR/../tools/status-check.py" || _strc=1; }
-    if [ "$_strc" -ne 0 ]; then
-        [ "$_strc" -eq 2 ] && echo -e "${COLOR_RED}❌ status gate gave NO VERDICT — its selftest fixtures did not go red, which is not a clean tree${COLOR_RESET}"
-        echo -e "${COLOR_RED}❌ check FAILED — a status word cites no ST row, or a row's wire line is not on its flight's capture (see GATE-STATUS above)${COLOR_RESET}"; return 1
+    # BANNERROWS (rmbp-ledger B481): the host gates `./arroyo gates` runs — charter, arch, attrkeys, status, prefs,
+    #   appearance, deps, knob, verbs, banner (`--registry` against THIS run's `_feats`), k8reach (GATE-GATEPATH;
+    #   GATES_SET) — run here through that ONE verb, not through copies of their calls that drift from it (check
+    #   carried seven of the eleven and never ran prefs, appearance, deps or banner). One line per gate, full logs in
+    #   target/gates/, and a FAIL of any gate fails check, as each copy's `return 1` did. GATE-K8REACH, GATE-KNOB,
+    #   GATE-VERBS, GATE-CHARTER, GATE-ARCH, GATE-ATTRKEYS and GATE-STATUS are described in docs/dev/STRUCTURAL_GATES.md.
+    local _gtrc=0
+    gates || _gtrc=$?
+    if [ "$_gtrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a host gate is red or missing (./arroyo gates rc=${_gtrc}; see target/gates/<name>.log)${COLOR_RESET}"; return 1
     fi
 
     # GATE-TESTROOTS (TESTROOTS, rmbp, 2026-09-16): GATE-ROOTS' shape applied to the THIRD kind of
@@ -9194,7 +9180,7 @@ BRACEPY
         return 1
     fi
     if [ "$_nrc" -ne 0 ]; then
-        echo -e "${COLOR_RED}❌ check FAILED — knob hygiene, k8 reachability, verb-alias closure or fixture reachability (see above)${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ check FAILED — verb-alias closure or fixture reachability (see above)${COLOR_RESET}"
         return 1
     fi
     if [ "$_rrc" -ne 0 ]; then
@@ -9342,6 +9328,16 @@ esp_x86_unafs_card() {
         [ -d "$src" ] || continue
         cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$src" "$dst" -i "$vol" || {
             echo -e "${COLOR_RED}❌ ROOTDISK2: tools/unafs put ${src#${WORKSPACE_DIR}/} -> ${dst} failed — no card image${COLOR_RESET}"; return 1; }
+    done
+    # ROOTACL (rmbp-ledger B456, SECREVIEW F2): every tree the loop put takes the `system` owner row, so the card is
+    # system-owned from its first boot — the kernel's native ACL lets only `kernel` and the administrator write there
+    # (children carry no row and inherit it; fs/rootacl.rs). The kernel stamps /system/types at the registry build.
+    local tree
+    for tree in /apps /lib /system; do
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- ls -p "$tree" -i "$vol" >/dev/null 2>&1 || continue
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- attr-set "$tree" owner '"system"' -i "$vol" >/dev/null || {
+            echo -e "${COLOR_RED}❌ ROOTACL: tools/unafs attr-set ${tree} owner failed — no card image${COLOR_RESET}"; return 1; }
+        echo -e "${COLOR_YELLOW}⚡ ROOTACL: ${tree} owner=system${COLOR_RESET}"
     done
     # UNAOSVOLUME (B427): the jobs onto the SAME volume — the working drive IS the boot disk's volume. `mica jobs
     # build --into` is the one builder `./arroyo jobs-image` runs (records from STATUS.tsv, the ledgers, the queues;
@@ -9950,6 +9946,13 @@ stage_jetson_el0_images() {
         cp "$src" "${APPS_DIR_ARM}/${img}"
         staged=$((staged + 1))
     done
+    case ",${_feats}" in
+        *",lumen,"*)   # HOLOCRONARM (B484): the Orin's Holocron (the RINGLOGIN door's taker), as kernel8 stages it
+            build_user_holocron_aarch64
+            cp "${WORKSPACE_DIR}/target/HOLOCRON.ELF" "${APPS_DIR_ARM}/HOLOCRON.ELF"
+            staged=$((staged + 1))
+            ;;
+    esac
     # HELLO.BIN: only when `tegra_el0` armed `build_user_blob` above (see the block header).
     if [ -s "${WORKSPACE_DIR}/target/user_blob.bin" ]; then
         case ",${_feats}" in
@@ -11784,7 +11787,7 @@ kernel8() {
     fi
     if [ -n "${UNAOS_LUMEN:-}" ]; then
         K8_FEATS="${K8_FEATS},lumen"
-        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.ELF yet: its aarch64 text exceeds the window; tests lumen is x86)${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.ELF yet; tests lumen is x86) + HOLOCRONARM: APPS/HOLOCRON.ELF and the RINGLOGIN door${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_NETRING3:-}" ]; then
         K8_FEATS="${K8_FEATS},netring3"
@@ -11792,7 +11795,7 @@ kernel8() {
     fi
     if [ -n "${UNAOS_SELFDIAG:-}" ]; then
         K8_FEATS="${K8_FEATS},selfdiag"
-        echo -e "${COLOR_YELLOW}  • UNAOS_SELFDIAG: SELFDIAG — the boot log on disk + tests selfdiag (SYS_PATH_READ/WRITE and DIAG.ELF are x86's)${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SELFDIAG: SELFDIAG — the boot log on disk + tests selfdiag + SYS_PATH_READ/WRITE (HOLOCRONARM: Holocron's store; DIAG.ELF is x86's)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_PANIC_HOLD:-}" ]; then
         K8_FEATS="${K8_FEATS},panic_hold"
@@ -11945,6 +11948,17 @@ kernel8() {
     # PULSE-1: carry the cpu-pulse static ELF64 onto the boot media as PULSE.ELF, same reasoning as STAT
     # above — a distinct 8.3 name, its own IMAGE_SHA256 principal, driven by `bg /apps/PULSE.ELF`.
     cp "${WORKSPACE_DIR}/target/PULSE.ELF" "$KERNEL8_DIR/APPS/PULSE.ELF"
+
+    # HOLOCRONARM (B484): with `lumen` (the RINGLOGIN door, SYS_KDF, the login launch) the Pi card carries
+    # Holocron — the aarch64 HOLOCRON.ELF in the ELF window, which `keyring::after_login` starts and which takes
+    # the door. Its store is SYS_PATH_READ/WRITE (`selfdiag`, as on x86), the ring lives on a UnaFS home.
+    case ",${K8_FEATS}," in
+        *",lumen,"*)
+            build_user_holocron_aarch64
+            cp "${WORKSPACE_DIR}/target/HOLOCRON.ELF" "$KERNEL8_DIR/APPS/HOLOCRON.ELF"
+            case ",${K8_FEATS}," in *",selfdiag,"*) ;; *) echo -e "${COLOR_YELLOW}  ⚠ HOLOCRON.ELF staged without UNAOS_SELFDIAG=1: its store (SYS_PATH_READ/WRITE) answers -ENOSYS on this image${COLOR_RESET}" ;; esac
+            ;;
+    esac
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it
@@ -13592,6 +13606,102 @@ jobs_image() {
     echo -e "${COLOR_GREEN}✅ UNAOSVOLUME: ${img}${COLOR_RESET}"
 }
 
+# GATEPATH (rmbp-ledger B471; GATES-2026-10-06 F15): `./arroyo gates` — THE pre-commit leg for the seat and every
+# executor. Every host gate the tree carries, in order, no cargo build; one line per gate
+#   gate=<name> rc=<n> <its last line>
+# and one verdict line, `GATES: <n> run <n> green -> PASS|FAIL`; the verb exits with the worst gate's code. A gate
+# script missing from the tree (or no python3) is rc=127, a FAIL that names it, never a skip. Each gate's full
+# output is target/gates/<name>.log. The banner leg certifies THIS run's `⚡ kernel features:` list against the
+# banner-cert registry (`<knob line> ./arroyo gates` asks, before the media build, whether that build's banner can
+# be certified). `gates --list` prints the set; `gates --selftest` (GATE-GATEPATH) plants one defect per gate (the
+# plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
+# `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
+#   GATEPATH selftest: plants=<n> caught=<n> -> PASS
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py"
+_gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary line, returns the gate's rc
+    local R="$1" n="$2" log="$3" p rc=0 e
+    p="$(printf '%s\n' $GATES_SET | awk -F: -v n="$n" '$1==n{print $2}')"
+    if [ -z "$p" ] || [ ! -f "$R/$p" ]; then echo "gate=${n} rc=127 MISSING ${p:-<not in GATES_SET>}"; return 127; fi
+    case "$p" in *.py) command -v python3 >/dev/null 2>&1 || { echo "gate=${n} rc=127 MISSING python3"; return 127; } ;; esac
+    case "$n" in
+        charter|arch|attrkeys|appearance|verbs|sanity) e=("$R/unaos") ;;
+        deps) e=(--check) ;;
+        banner) e=(--registry "${_feats%,}") ;;
+        *) e=() ;;
+    esac
+    case "$p" in
+        *.py) python3 "$R/$p" "${e[@]}" > "$log" 2>&1 || rc=$? ;;
+        *)    bash "$R/$p" "${e[@]}" > "$log" 2>&1 || rc=$? ;;
+    esac
+    echo "gate=${n} rc=${rc} $(sed 's/\x1b\[[0-9;]*m//g' "$log" | awk 'NF{l=$0} END{sub(/^[ \t]+/,"",l); print l}')"
+    return $rc
+}
+_gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints the token its log must name
+    local C="$1" K="$1/unaos/crates/kernel/src"
+    case "$2" in
+        charter)    printf '//! CHARTER: Kernel — owed\npub fn p(h: &str) -> alloc::string::String { alloc::format!("{}.Recents", h) }\n' > "$K/video/zz_gateplant_charter.rs"; echo Recents ;;
+        arch)       printf '//! CHARTER: Kernel — owed\npub fn p(home: &str) -> alloc::string::String { alloc::format!("{home}/.zzgateplant") }\n' > "$K/video/zz_gateplant_arch.rs"; echo zzgateplant ;;
+        attrkeys)   printf 'pub const P: &str = "media:zzgateplant";\n' > "$K/video/zz_gateplant_attr.rs"; echo zzgateplant ;;
+        status)     printf 'ST99999\tGATEPATH plant: a confirmed row whose line no wire printed\tconfirmed\tf24\t:: GATEPATH plant: a line nobody printed on any wire ::\tGATEPATH selftest\tB471\n' >> "$C/docs/dev/STATUS.tsv"; echo ST99999 ;;
+        prefs)      printf 'pub fn p() { crate::prefs::set_sys("ghost.zzgateplant", "1"); }\n' > "$K/video/zz_gateplant_prefs.rs"; echo zzgateplant ;;
+        appearance) printf '//! CHARTER: Kernel — owed\npub fn p(f: &mut [u32]) { f[0] = 0x0012_3456; }\n' > "$K/video/zz_gateplant_app.rs"; echo zz_gateplant_app ;;
+        deps)       mkdir -p "$C/zzgateplant" && printf '[package]\nname = "zzgateplant"\nversion = "0.1.0"\n\n[dependencies]\nleftpad = { git = "https://x.invalid/leftpad" }\n' > "$C/zzgateplant/Cargo.toml"; echo leftpad ;;
+        knob)       printf 'pub fn p() -> bool { cfg!(feature = "zzgateplant") }\n' > "$K/video/zz_gateplant_knob.rs"; echo zzgateplant ;;
+        verbs)      printf '// GATEPATH plant\nconst _P: (&str, Avail) = ("zzgateplant", Avail::Both);\n' >> "$C/unaos/libs/sys/midden_core/src/lib.rs"; echo zzgateplant ;;
+        banner)     sed -i '/^bc_table() {$/,/^TABLE$/ s/^\(ahci|AHCI: selfcheck|-|measured\)$/\1\nzzgateplant|:: ZZGATEPLANT: row for no feature|-|measured/' "$C/unaos/scripts/banner-cert.sh"; echo zzgateplant ;;
+        k8reach)    sed -i 's/^_feats=""$/&\n[ -n "${UNAOS_ZZGATEPLANT:-}" ] \&\& _feats="${_feats}zzgateplant,"/' "$C/unaos/arroyo"; echo ZZGATEPLANT ;;
+        sanity)     printf 'pub fn p() { assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 2); }\n' > "$K/video/zz_gateplant_sanity.rs"; echo zz_gateplant_sanity ;; # SANITYLEGS (B488): flight 26's reboot-loop assert, planted as a runtime assert over consts
+        *) return 1 ;;
+    esac
+}
+gates() {
+    local R; R="$(cd "$WORKSPACE_DIR/.." && pwd)"
+    local n p rc worst=0 run=0 green=0 line
+    case "${1:-}" in
+        --list) for p in $GATES_SET; do echo "${p%%:*}  ${p#*:}"; done; return 0 ;;
+        --selftest) local _st=0; gates_selftest || _st=$?; return $_st ;;
+        "") ;;
+        *) echo "usage: ./arroyo gates [--list|--selftest]"; return 2 ;;
+    esac
+    mkdir -p "$WORKSPACE_DIR/target/gates"
+    for p in $GATES_SET; do
+        n="${p%%:*}"; rc=0
+        line="$(_gates_one "$R" "$n" "$WORKSPACE_DIR/target/gates/$n.log")" || rc=$?
+        echo "$line"
+        run=$((run+1)); [ "$rc" -eq 0 ] && green=$((green+1)); [ "$rc" -gt "$worst" ] && worst=$rc
+    done
+    echo "GATES: ${run} run ${green} green -> $([ "$green" -eq "$run" ] && echo PASS || echo FAIL)  (logs: target/gates/)"
+    return $worst
+}
+gates_selftest() {
+    local R C n p tok rc plants=0 caught=0 log line
+    R="$(cd "$WORKSPACE_DIR/.." && pwd)"
+    C="$(mktemp -d "${TMPDIR:-/tmp}/gatepath.XXXXXX")" || { echo "GATEPATH selftest: NO VERDICT — no scratch dir"; return 2; }
+    # The scratch copy is the working tree as git sees it (tracked + untracked, not ignored), so uncommitted gate
+    # edits are what is proven. Deleted on every exit path.
+    trap 'rm -rf "$C" "$C.bak"; trap - RETURN' RETURN
+    (cd "$R" && git ls-files -z --cached --others --exclude-standard | tar --null -T - --ignore-failed-read -cf - 2>/dev/null) | tar -xf - -C "$C" \
+        && [ -f "$C/unaos/arroyo" ] || { echo "GATEPATH selftest: NO VERDICT — the tree copy failed"; return 2; }
+    for p in $GATES_SET; do
+        n="${p%%:*}"; plants=$((plants+1)); log="$C/.gate-$n.log"
+        rm -rf "$C.bak"; mkdir -p "$C.bak"
+        cp -p "$C/docs/dev/STATUS.tsv" "$C/unaos/libs/sys/midden_core/src/lib.rs" "$C/unaos/scripts/banner-cert.sh" "$C/unaos/arroyo" "$C.bak/"
+        tok="$(_gates_plant "$C" "$n")" || tok=""
+        rc=0; line="$(_gates_one "$C" "$n" "$log")" || rc=$?
+        if [ -n "$tok" ] && [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ] && LC_ALL=C grep -a -q -F -- "$tok" "$log"; then
+            caught=$((caught+1)); echo "plant=${n} token=${tok} rc=${rc} -> CAUGHT"
+        else
+            echo "plant=${n} token=${tok:-<none>} rc=${rc} -> MISSED  (${line})"
+        fi
+        rm -f "$C"/unaos/crates/kernel/src/video/zz_gateplant_*.rs; rm -rf "$C/zzgateplant"
+        cp -p "$C.bak/STATUS.tsv" "$C/docs/dev/"; cp -p "$C.bak/lib.rs" "$C/unaos/libs/sys/midden_core/src/"
+        cp -p "$C.bak/banner-cert.sh" "$C/unaos/scripts/"; cp -p "$C.bak/arroyo" "$C/unaos/"
+    done
+    rm -rf "$C.bak"
+    echo "GATEPATH selftest: plants=${plants} caught=${caught} -> $([ "$caught" -eq "$plants" ] && echo PASS || echo FAIL)"
+    [ "$caught" -eq "$plants" ]
+}
+
 # --- Entry Point ---
 
 case "${1:-}" in
@@ -13723,6 +13833,9 @@ case "${1:-}" in
         ;;
     jobs-image)
         jobs_image
+        ;;
+    gates)
+        gates "${2:-}" || exit $?   # GATEPATH (B471): every host gate, one line each; exit = the worst gate's rc
         ;;
     clean)
         clean_all

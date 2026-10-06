@@ -21,7 +21,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::read::Reader;
-use crate::{Codec, Error, Format, Parsed, Sample, Timebase, Track, TrackKind};
+use crate::{Codec, Edit, Error, Format, Parsed, Sample, Timebase, Track, TrackKind};
 
 /// One box: its type and where its payload lies in the file.
 #[derive(Debug, Clone, Copy)]
@@ -102,8 +102,34 @@ struct TrakState {
 
 const NON_SYNC: u32 = 0x0001_0000;
 
-pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
-    let top = boxes(data, 0, data.len())?;
+/// MP4ONE (rmbp B464): the top level of a file cut short — the last box clamped to the end of the data.
+fn boxes_partial(data: &[u8]) -> Vec<BoxHeader> {
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    while data.len() - p >= 8 {
+        let mut r = Reader::new(&data[p..]);
+        let (Ok(size32), Ok(kind)) = (r.u32(), r.fourcc()) else { break };
+        let (size, hdr) = match size32 {
+            0 => ((data.len() - p) as u64, 8usize),
+            1 => match r.u64() {
+                Ok(s) => (s, 16usize),
+                Err(_) => break,
+            },
+            n => (n as u64, 8usize),
+        };
+        let hdr = if &kind == b"uuid" { hdr + 16 } else { hdr };
+        if size < hdr as u64 || p + hdr > data.len() {
+            break;
+        }
+        let end = p + (size.min((data.len() - p) as u64) as usize);
+        out.push(BoxHeader { kind, start: p, body: p + hdr, end });
+        p = end;
+    }
+    out
+}
+
+pub(crate) fn parse(data: &[u8], partial: bool) -> Result<Parsed, Error> {
+    let top = if partial { boxes_partial(data) } else { boxes(data, 0, data.len())? };
     let moov = child(&top, b"moov").ok_or(Error::Invalid("no moov box"))?;
     let moov_kids = children(data, moov)?;
 
@@ -166,6 +192,9 @@ pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
     // AUDIOTRACK (SR45): Apple's gapless tag (`moov/udta/meta/ilst/----` "iTunSMPB") for audio
     // tracks no edit list already trimmed: priming to drop and the presented sample count.
     if let Some((pri, total)) = itunsmpb(&data[moov.body..moov.end]) {
+        for t in traks.iter_mut().filter(|t| t.track.kind == TrackKind::Audio) {
+            t.track.smpb = Some((pri, total)); // MP4ONE (B464): the raw tag, for a decoder's own sample units
+        }
         for t in traks.iter_mut() {
             let first = t.samples.iter().map(|s| s.pts).min().unwrap_or(0);
             if t.track.kind == TrackKind::Audio && t.track.sample_rate > 0 && first >= 0 && t.track.play_ns.is_none() {
@@ -227,6 +256,7 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
     let mut shift = 0i64;
     // AUDIOTRACK (SR45): the media edit's segment duration is the presented length (gapless end).
     let mut play_ns: Option<u64> = None;
+    let mut edit: Option<Edit> = None;
     if let Some(edts) = child(&kids, b"edts") {
         if let Some(elst) = child(&children(data, edts)?, b"elst") {
             let mut r = body(data, elst);
@@ -244,6 +274,7 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
                         .to_ns(empty_movie);
                     let empty_media = Timebase { num: 1, den: timescale as u64 }.from_ns(empty_media);
                     shift = media_time - empty_media;
+                    edit = Some(Edit { media_time, segment: dur as u64, movie_timescale: movie_ts });
                     if dur > 0 {
                         play_ns = Some(Timebase { num: 1, den: movie_ts as u64 }.to_ns(dur) as u64);
                     }
@@ -270,6 +301,8 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
         frame_prefix: Vec::new(),
         trim_start_ns: 0,
         play_ns,
+        edit,
+        smpb: None,
     };
 
     let minf = child(&mdia_kids, b"minf").ok_or(Error::Invalid("mdia without minf"))?;
@@ -377,7 +410,11 @@ fn parse_stsd(data: &[u8], stsd: &BoxHeader, track: &mut Track) -> Result<(), Er
             track.config = c;
             Codec::Pcm { bits, float: &fourcc == b"fpcm", big_endian: !le }
         }
-        b"mp4a" => match child(&kids, b"esds") {
+        // MP4ONE (B464): QuickTime wraps the `esds` in a `wave` box (the retired audio_core reader read both).
+        b"mp4a" => match child(&kids, b"esds").copied().or_else(|| {
+            let w = child(&kids, b"wave")?;
+            child(&boxes(data, w.body, w.end).ok()?, b"esds").copied()
+        }) {
             Some(b) => {
                 let (oti, dsi) = parse_esds(&data[b.body..b.end])?;
                 track.config = dsi;

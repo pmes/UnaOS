@@ -64,7 +64,7 @@ fs/fatperf.rs | Kernel | fs-core | FAT bench
 fs/holocron.rs | Holocron | owed | B296 (the kernel-side record store; the handler is design-only)
 fs/mod.rs | Kernel | fs-core | module root
 fs/sdhc4c.rs | Kernel | driver | card seam
-fs/trash.rs | Matrix | owed | B288
+fs/trash.rs | Matrix | shared-core | B449 (TRASHCORE)
 fs/unafs.rs | Kernel | fs-core | the UnaFS mount (shared-core: unaos/libs/fs/unafs)
 fs/users.rs | Holocron | owed | B296
 fs/vfs.rs | Kernel | fs-core | the mount table
@@ -86,11 +86,8 @@ shellux.rs | Midden | shared-core | line editing
 shell.rs | Midden | shared-core | the verb dispatch (GATE-VERBS keeps it one set with HOST_VERBS)
 drivers/hda_play.rs | Stria | owed | B289
 # dotfile | <name as the literal spells it> | <ref> — every `<home>/.name` literal the kernel writes
-dotfile | .settings | B287 (moves to Principia's store)
-dotfile | .dock | B287
 dotfile | .holocron | B448 (HOLOCRONROOT: the one secrets root, named in holocron_core::root)
 dotfile | .Trash | B288
 dotfile | .Trash/.index | B288 → TRASHTIME (B308): FAT fallback only; on UnaFS trash state is attributes on the object
 dotfile | .index | B288 → TRASHTIME (B308): FAT fallback only
-dotfile | .config/unaos/preferences.toml | B300 (Principia's path — the ONE preference store, PREFS)
 dotfile | .new | swap-temp suffix of the atomic write pattern (USERS.NEW shape; prefs.rs), not a dotfile

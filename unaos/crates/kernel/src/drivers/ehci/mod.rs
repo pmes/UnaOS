@@ -4713,6 +4713,9 @@ impl Controller {
         // GUI-WITNESS: the report-protocol pointer (the rMBP trackpad, incl. the Apple
         // vendor-multitouch interface) is armed — the trackpad-input milestone.
         crate::bootlog::record("ehci:trackpad-armed");
+        if layout.vendor_mt && cfg!(not(feature = "mtraw")) {
+            tpmode_witness(self.idx, crate::arch::ms());
+        }
         if layout.vendor_mt {
             // EHCI-5 M1: the Apple vendor-multitouch interface (Report ID 0x44, page 0xFF00). The
             // descriptor does not describe the finger layout — arm to CAPTURE the raw body and
@@ -4792,9 +4795,16 @@ impl Controller {
         // Attempt 1 — HID 1.11 §7.2.2: wIndex is the INTERFACE this Feature report belongs to.
         // Attempt 2 — the legacy index this driver has always sent. Reached only when the
         // conformant request did not latch, and never a third time.
-        let latched = self.bcm5974_mode_attempt(t, intf, intf as u16, "hid1.11-intf")
+        // TPMODE (B459): the ORDER is the index that latched first. Flights 24/25 (6 of 6 boots):
+        // `wIndex = intf` NAKs the data stage of the GET and the SET until the 2 s budget expires
+        // (`STOP-NOTE EP0 DATA timeout … req=0xa1/0x01`, then `0x21/0x09`), 4 s per boot, and
+        // index 0 then latches (`[tp] mode-mismatch readback=vendor`). The conformant index stays
+        // the fallback, reached only when index 0 does not latch.
+        tp_mode_reset();
+        let latched = self.bcm5974_mode_attempt(t, intf, BCM5974_MODE_REQ_INDEX, "legacy-index0")
             || (intf as u16 != BCM5974_MODE_REQ_INDEX
-                && self.bcm5974_mode_attempt(t, intf, BCM5974_MODE_REQ_INDEX, "legacy-index0"));
+                && self.bcm5974_mode_attempt(t, intf, intf as u16, "hid1.11-intf"));
+        TP_MODE_LATCHED.store(latched as u32, Ordering::Relaxed);
         crate::bootlog_println!(
             ":: EHCI-HID: [{}] [tp] mt route={} latched={} (addr={} intf={}; the readback's route — a stream that disagrees is routed by the stream) == witness ::",
             self.idx, if latched { "vendor" } else { "legacy" }, if latched { "yes" } else { "no" },
@@ -4821,10 +4831,7 @@ impl Controller {
     ) -> bool {
         const N: usize = BCM5974_MODE_LEN as usize;
         // Stage 1 — read the current feature report (HID 1.11 §7.2.1).
-        let read = self.control(
-            t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, w_index,
-            BCM5974_MODE_LEN, true,
-        );
+        let read = self.tp_mode_req(t, intf, 0xA1, BCM5974_MODE_READ_REQ, w_index, true);
         match read {
             Ok(got) => {
                 let n = (got as usize).min(N);
@@ -4855,10 +4862,7 @@ impl Controller {
             wrote[k] = self.data_buf.add(k).read();
         }
         // Stage 3 — write the report back (SET_REPORT, class, interface recipient).
-        let set_ok = match self.control(
-            t, 0x21, BCM5974_MODE_WRITE_REQ, BCM5974_MODE_REQ_VALUE, w_index,
-            BCM5974_MODE_LEN, false,
-        ) {
+        let set_ok = match self.tp_mode_req(t, intf, 0x21, BCM5974_MODE_WRITE_REQ, w_index, false) {
             Ok(_) => true,
             Err(e) => {
                 serial_println!(
@@ -4872,12 +4876,7 @@ impl Controller {
         // term flight 11 had no line for.
         let mut back = [0u8; N];
         let read_back = set_ok
-            && self
-                .control(
-                    t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, w_index,
-                    BCM5974_MODE_LEN, true,
-                )
-                .is_ok();
+            && self.tp_mode_req(t, intf, 0xA1, BCM5974_MODE_READ_REQ, w_index, true).is_ok();
         if read_back {
             for k in 0..N {
                 back[k] = self.data_buf.add(k).read();
@@ -4894,6 +4893,35 @@ impl Controller {
             t.addr, intf, w_index, why, set_ok, read_back
         );
         latched
+    }
+
+    /// TPMODE (B459) — one EP0 request of the mode handshake, timed and dumped on the metal wire:
+    /// `[tp] mode req=<seq> … status=<ok|stall|timeout|hse> ms=<n>`. The same `control` call the
+    /// handshake always made; the line is what tells the next flight which index answered and how fast.
+    unsafe fn tp_mode_req(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        bm_req: u8,
+        b_req: u8,
+        w_index: u16,
+        dir_in: bool,
+    ) -> Result<u32, &'static str> {
+        let t0 = crate::arch::ms();
+        let r = self.control(
+            t, bm_req, b_req, BCM5974_MODE_REQ_VALUE, w_index, BCM5974_MODE_LEN, dir_in,
+        );
+        let ms = crate::arch::ms().saturating_sub(t0);
+        let seq = TP_MODE_REQS.fetch_add(1, Ordering::Relaxed) + 1;
+        if r == Err("timeout") {
+            TP_MODE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        }
+        serial_println!(
+            ":: EHCI-HID: [{}] [tp] mode req={} rt={:#04x}/{:#04x} addr={} if={} widx={} wValue={:#06x} status={} got={}b ms={} ::",
+            self.idx, seq, bm_req, b_req, t.addr, intf, w_index, BCM5974_MODE_REQ_VALUE,
+            match r { Ok(_) => "ok", Err(e) => e }, match r { Ok(n) => n, Err(_) => 0 }, ms
+        );
+        r
     }
 
     /// MT-INVESTIGATION (IVY) — write ONE value into byte 0 of the 8-byte mode feature report and
@@ -13636,7 +13664,7 @@ impl Controller {
         // toggle came to have two owners in the first place.
         ISR_EPS[slot].toggle.store(1, Ordering::Relaxed);
         isr_rearm(&ISR_EPS[slot]);
-        isr_release_poll(slot);
+        isr_release_poll(slot); crate::hidstall::note_recovered(self.idx, self.int_eps[ep_i].kbd_target.addr, ((core::ptr::read_volatile(&(*self.int_eps[ep_i].qh).ep_chars) >> 8) & 0xF) as u8, ep_i); // HIDSTALL (B485): `[hid] recovered addr= ep= after_ms=`
     }
 
     /// Main-loop poll: ack USBSTS, then for each armed endpoint consume a completed report,
@@ -13855,12 +13883,12 @@ impl Controller {
                             // print on every boot; see the KBDFLAP section comment for the full derivation.
                             let h_chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
                             let (h_addr, h_ep) = (h_chars & 0x7F, (h_chars >> 8) & 0xF);
-                            let (h_class, h_recoverable) = halt_class(tok);
+                            let (h_class, h_recoverable) = halt_class(tok); let h_proxy = crate::hidstall::is_proxy(h_class, e.reports, e.mps, self.bt_radio.is_some()); crate::hidstall::note_halt(ep_i); // HIDSTALL (B485): the BT HID proxy told apart; the halt stamped for `after_ms=`
                             // Recover only the class §9.4.5 actually answers, only while budget remains, and
                             // only if the deferred-clear array has room. `n_clr` can reach `MAX_INT_EPS` only
                             // if every armed endpoint stalls in the SAME pass, in which case the last one is
                             // retired rather than dropped in silence — the `-> retire` word says which.
-                            let h_clear = h_recoverable
+                            let h_clear = (h_recoverable || crate::hidstall::xact_recoverable(h_class, h_proxy, e.reports)) // HIDSTALL (B485): a burst of bus errors on an endpoint that has carried input is cleared and re-armed, not retired
                                 && e.halt_clears < HALT_CLEARS_MAX
                                 && n_clr < clear_halts.len();
                             serial_println!(
@@ -13884,7 +13912,7 @@ impl Controller {
                                 e.halt_clears += 1;
                                 break;
                             }
-                            e.dead = true;
+                            e.dead = true; crate::hidstall::note_retired(idx, h_addr as u8, h_ep as u8, int_ep_kind(e), h_proxy, e.reports); // HIDSTALL (B485)
                             // DEADKBD5: record the retire for the post-walk consequence line. The
                             // STOP-NOTE above says WHAT died; the deferred line says what that
                             // MEANS — which surviving endpoint input rides now, or that none does.
@@ -14396,7 +14424,7 @@ impl Controller {
                     // unrecoverable halt has always landed — retired, with its held keys flushed.
                     let ctl = self.idx;
                     let e = &mut self.int_eps[ep_i];
-                    e.dead = true;
+                    e.dead = true; crate::hidstall::note_retired(ctl, t.addr, ep, int_ep_kind(e), false, e.reports); // HIDSTALL (B485): the clear was refused
                     // DEADKBD5: this is the second retire site — a device that refused §9.4.5's
                     // own recovery leaves the boot exactly as an unrecoverable halt does, so it
                     // owes the same consequence line (emitted just below, after this borrow ends).
@@ -19385,20 +19413,20 @@ impl Controller {
         let addr = t.addr;
         // SET_CONFIGURATION 1 (the vendor configuration of the part).
         if self.control(t, 0x00, 0x09, 1, 0, 0, false).is_err() {
-            serial_println!(":: USBNET-EHCI: addr={} stage=SET_CONFIGURATION -> FAIL ::", addr);
+            serial_println!(":: USBNET-EHCI: addr={} stage=SET_CONFIGURATION -> declined ::", addr);
             return;
         }
         let mut x = EhciAx { c: self, t: *t };
         let mac = match ax_xport::identity(&mut x) {
             Ok(m) => m,
             Err(stage) => {
-                serial_println!(":: USBNET-EHCI: addr={} stage={} -> FAIL ::", addr, stage);
+                serial_println!(":: USBNET-EHCI: addr={} stage={} -> declined ::", addr, stage);
                 return;
             }
         };
         let up = ax_xport::link(&mut x).map(|(u, _)| u).unwrap_or(false);
         serial_println!(
-            ":: USBNET-EHCI: addr={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} -> PASS ::",
+            ":: USBNET-EHCI: addr={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} -> armed ::",
             addr, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], if up { "up" } else { "down" }
         );
         crate::bootlog_println!(":: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::");
@@ -19608,3 +19636,30 @@ pub mod tpgest;
 /// BTKEYSEAL (rmbp-ledger B446) — the bond store's link keys as Holocron records (the kernel asks Holocron's verbs). Tail append.
 #[cfg(feature = "btc")]
 pub mod btkeyseal;
+
+// TPMODE (rmbp-ledger B459) — the mode handshake's per-boot meter and its one witness. Requests and
+// timeouts are counted by `tp_mode_req`; reset at the top of `bcm5974_mode_switch`. Expected shape
+// (index 0 answers, as on flights 24/25): GET, SET, readback GET = 3 requests, 0 timeouts, latched,
+// and the trackpad armed within the PERF-2026-10-06 §F2 bound.
+static TP_MODE_REQS: AtomicU32 = AtomicU32::new(0);
+static TP_MODE_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+static TP_MODE_LATCHED: AtomicU32 = AtomicU32::new(0);
+const TPMODE_ARMED_BOUND_MS: u64 = 2500; // PERF-2026-10-06 §F2 · capture f24/f25 kbd-armed 1.92-2.29 s [ONE-SOURCE: review + capture]
+
+fn tp_mode_reset() {
+    TP_MODE_REQS.store(0, Ordering::Relaxed);
+    TP_MODE_TIMEOUTS.store(0, Ordering::Relaxed);
+    TP_MODE_LATCHED.store(0, Ordering::Relaxed);
+}
+
+fn tpmode_witness(idx: usize, armed_ms: u64) {
+    let reqs = TP_MODE_REQS.load(Ordering::Relaxed);
+    let tos = TP_MODE_TIMEOUTS.load(Ordering::Relaxed);
+    let latched = TP_MODE_LATCHED.load(Ordering::Relaxed) != 0;
+    let pass = tos == 0 && latched && armed_ms <= TPMODE_ARMED_BOUND_MS;
+    serial_println!(
+        ":: TPMODE: requests={} timeouts={} first=index0 latched={} armed_ms={} bound={} (ctl={}; expect requests=3 timeouts=0 latched=yes) -> {} ::",
+        reqs, tos, if latched { "yes" } else { "no" }, armed_ms, TPMODE_ARMED_BOUND_MS, idx,
+        if pass { "PASS" } else { "FAIL" }
+    );
+}

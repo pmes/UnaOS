@@ -393,42 +393,42 @@ pub const LINE_HEIGHT_PCT: usize = 165;
 // ---------------------------------------------------------------------------
 
 /// Metrics that must be strictly positive for any chrome to be drawable.
-#[allow(dead_code)] pub(crate) fn uimetrics_assert_positive() {
-    assert!(FRAME() > 0);
-    assert!(BEVEL() > 0);
-    assert!(TITLE_HEIGHT() > 0);
-    assert!(SCROLLBAR_WIDTH() > 0);
-    assert!(BUTTON_HEIGHT() > 0);
-    assert!(BUTTON_PAD_X() > 0);
-    assert!(GAP() > 0);
-    assert!(CONTROL_BOX() > 0);
-    assert!(TEXT_PX() > 0);
-    assert!(LINE_HEIGHT_PCT > 0);
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity_positive(ck: &mut super::metrics::Sane) {
+    ck.t(FRAME() > 0);
+    ck.t(BEVEL() > 0);
+    ck.t(TITLE_HEIGHT() > 0);
+    ck.t(SCROLLBAR_WIDTH() > 0);
+    ck.t(BUTTON_HEIGHT() > 0);
+    ck.t(BUTTON_PAD_X() > 0);
+    ck.t(GAP() > 0);
+    ck.t(CONTROL_BOX() > 0);
+    ck.t(TEXT_PX() > 0);
+    const _: () = assert!(LINE_HEIGHT_PCT > 0);
     // The three radii (`corner_radius`, `widget_radius`, `well_radius`) may each
     // legitimately be 0 (a square head, a square widget, a square well), so they are
     // bounded below rather than required positive.
 }
 
 /// Relationships the json's own numbers imply, and that the chrome geometry relies on.
-#[allow(dead_code)] pub(crate) fn uimetrics_assert_relations() {
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity_relations(ck: &mut super::metrics::Sane) {
     // The bevel is drawn inside the frame.
-    assert!(BEVEL() < FRAME());
+    ck.t(BEVEL() < FRAME());
     // The rounded head must fit inside the title bar: 12 < 34.
-    assert!(CORNER_RADIUS() < TITLE_HEIGHT());
+    ck.t(CORNER_RADIUS() < TITLE_HEIGHT());
     // Title-bar controls must fit inside the title bar: 24 < 34 since the size ruling.
-    assert!(CONTROL_BOX() < TITLE_HEIGHT());
+    ck.t(CONTROL_BOX() < TITLE_HEIGHT());
     // …and must leave a real clearance band, not merely fit. `(34 - 24)/2` = 5 px each side, which
     // is tight (see the note on `CONTROL_BOX`: raising `TITLE_HEIGHT` is a proposed taste-gate
     // question). One bevel of clearance is the floor below which the disc would touch the frame.
-    assert!(TITLE_HEIGHT() >= CONTROL_BOX() + 2 * BEVEL());
+    ck.t(TITLE_HEIGHT() >= CONTROL_BOX() + 2 * BEVEL());
     // A circular control needs a non-degenerate radius, or it cannot be drawn round.
-    assert!(CONTROL_RADIUS() > 0);
+    ck.t(CONTROL_RADIUS() > 0);
     // Both of a widget's corners must fit within its own height: 2*8 <= 28.
-    assert!(2 * WIDGET_RADIUS() <= BUTTON_HEIGHT());
+    ck.t(2 * WIDGET_RADIUS() <= BUTTON_HEIGHT());
     // A well's corner is a chrome-scale radius, not a window-scale one.
-    assert!(WELL_RADIUS() < TITLE_HEIGHT());
+    ck.t(WELL_RADIUS() < TITLE_HEIGHT());
     // A line of text is taller than the glyph box.
-    assert!(LINE_HEIGHT_PCT > 100);
+    const _: () = assert!(LINE_HEIGHT_PCT > 100);
 }
 
 /// Every colour is a packed `0x00RRGGBB`: the alpha byte is zero, because the json
@@ -638,6 +638,8 @@ pub static CRISPY_ROWS: &[Binding] = &[ // SMALLFIX3 (B416): a slice — the cou
     Binding { roles: CMD, usage: 0x38, action: Action::ShowShortcuts, token: super::shortcuts::C_CMD_SLASH },
     // LAUNCHER (B417) — ⌘Space opens the Launcher (usage 0x2C = Space; no other row watches it).
     Binding { roles: CMD, usage: 0x2C, action: Action::Launcher, token: super::shortcuts::C_CMD_SPACE },
+    // SHELLTASK2 (B474) — ⌘. interrupts the shell window's running command (usage 0x37 = `.`; no other row watches it).
+    Binding { roles: CMD, usage: 0x37, action: Action::Interrupt, token: super::shortcuts::C_CMD_PERIOD },
 ];
 
 /// **The desktop's live table.** `cmd_role` is `HID_MOD_GUI`, so every `CMD` above is the Command
@@ -801,7 +803,7 @@ pub const TERM_DIM: u8 = 90;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering as AOrd};
 
-/// The colour literals under `video/` outside this file — certified by `unaos/scripts/appearance-check.py`.
+/// The colour literals under `video/` outside this file and in the listed painters (`scripts/appearance.painters`) — certified by `unaos/scripts/appearance-check.py`.
 pub const AUDIT_LITERALS_OUTSIDE: usize = 0;
 
 /// One palette token. Light = the kit (crispy) values above, unchanged; Dark = ours (neutral greys, the same accent).
@@ -1043,3 +1045,55 @@ const _: () = {
     assert!(Tok::SyntaxLit as usize + 1 == TOKENS);
     assert!(ACCENTS.len() == 8);
 };
+
+// ── PAINTERSCOPE (rmbp-ledger B482) — the painters OUTSIDE video/ read their colours here ──────────────────────────
+// `unaos/scripts/appearance.painters` lists every kernel file outside `video/` that puts a colour on the glass;
+// `appearance-check.py` scans them with `video/` and counts toward [`AUDIT_LITERALS_OUTSIDE`]. Their roles live in
+// `painter` (one look each: the console, the status bands, the boot splash, the Orin probes); the format-check
+// primaries a panel bring-up paints live in `testcard`. Values are the literals they replaced, unchanged.
+pub mod painter {
+    /// `console.rs` — the scrollback page band and its thumb.
+    pub const CONSOLE_BAND: u32 = 0x003A_3868;
+    /// `ui_status.rs` — a core meter's unfilled segment, its idle breath, its parked dash.
+    pub const METER_DIM: u32 = 0x002A_2432;
+    pub const METER_BREATH: u32 = 0x005F_4E86;
+    pub const METER_PARKED: u32 = 0x003A_3550;
+    /// `ui_status.rs` — the status strip (ground, aqua text) and the pulse instrument panel under it.
+    pub const STATUS_STRIP_BG: u32 = 0x001B_1A3A;
+    pub const STATUS_STRIP_FG: u32 = 0x007B_D0E0;
+    pub const PULSE_PANEL_BG: u32 = 0x000E_0D22;
+    pub const PULSE_PANEL_FG: u32 = 0x009F_B4C8;
+    /// `ui_status.rs` — the instrument LED ramp, green through amber to red.
+    pub const LED_GREEN: u32 = 0x002E_CC71;
+    pub const LED_AMBER: u32 = 0x00F1_C40F;
+    pub const LED_RED: u32 = 0x00E7_4C3C;
+    /// `splash.rs` — the boot splash: backdrop, facet edge, inner facet, the white beam, the edge glint.
+    pub const SPLASH_BG: u32 = 0x0006_0608;
+    pub const SPLASH_EDGE: u32 = 0x004A_4658;
+    pub const SPLASH_FACET: u32 = 0x002C_2936;
+    pub const SPLASH_BEAM: u32 = 0x00F2_F2EE;
+    pub const SPLASH_GLINT: u32 = 0x00FF_FFFF;
+    /// `splash.rs` — the refracted spectrum, red to violet (one per ray sample).
+    pub const SPLASH_SPECTRUM: [u32; 9] = [
+        0x00E8_1414, 0x00F0_5810, 0x00F8_9008, 0x00F0_D010, 0x0060_D818, //
+        0x0018_C860, 0x0018_B8C8, 0x002E_58E8, 0x0090_28D8,
+    ];
+    /// `splash.rs` — the takeover caption band and its ink.
+    pub const SPLASH_CAPTION_BG: u32 = 0x0010_1418;
+    pub const SPLASH_CAPTION_INK: u32 = 0x00E8_E8F0;
+    /// `display_tegra.rs` ORIN-RASTGLASS — `rast_demo`'s `RW_CLEAR` (0x10, 0x10, 0x18) as the packed word.
+    pub const RAST_PAPER: u32 = 0x0010_1018;
+}
+
+/// The pure primaries a panel bring-up paints to prove the pixel format (`display_tegra.rs`'s bars and quadrant
+/// card): in the named order the format is right, red/blue swapped names it wrong. Not a theme — a test card.
+pub mod testcard {
+    pub const BLACK: u32 = 0x0000_0000;
+    pub const BLUE: u32 = 0x0000_00FF;
+    pub const GREEN: u32 = 0x0000_FF00;
+    pub const CYAN: u32 = 0x0000_FFFF;
+    pub const RED: u32 = 0x00FF_0000;
+    pub const MAGENTA: u32 = 0x00FF_00FF;
+    pub const YELLOW: u32 = 0x00FF_FF00;
+    pub const WHITE: u32 = 0x00FF_FFFF;
+}

@@ -16,7 +16,7 @@
 //! * The play stays the HDA driver's (`drivers/hda_play.rs`, its PLAYER tail: `pause`, `seek_to`, `position_ms`,
 //!   `facts`). A seek is `method=table`: a WAV's byte offset (`table=pcm`), a coded file's container index through
 //!   `audio_core::Decoder::seek` in the `play-dec` job (SEEKTABLE B433: `table=flac|xing|vbri|cbr|mp4`); a format
-//!   with no table there (Ogg, ADTS) is `method=decode-skip table=none`.
+//!   with no table there is `method=decode-skip table=none` (Ogg and ADTS have one since SEEKTABLE2, B469: `table=ogg|adts`).
 //! * F7/F8/F9 (previous / play-pause / next) reach [`media_key`] from `status::volkey_usage` (atomics only); the
 //!   next pass acts and arms BEZEL's play/pause glyph. With no player open the keys do nothing (said once).
 //! * The info line reads ATTRCOLUMNS' `media:duration_ms` / `media:codec` through `get_attr`; without them, the
@@ -61,7 +61,7 @@ const DIM_TEXT: u32 = super::theme::PLAYER_DIM_TEXT;
 const KNOB_EDGE: u32 = super::theme::PLAYER_KNOB_EDGE;
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
-static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None); static PENDING_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); static ACT_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); // SVCLATCH (B462): the posted flags the pass reads before the locks
 static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 /// F7/F8/F9 latched by the HID service: 0 none, 1 previous, 2 play/pause, 3 next.
 static MEDIA: AtomicU8 = AtomicU8::new(0);
@@ -76,7 +76,7 @@ enum Act {
 }
 
 fn post(a: Act) {
-    *ACT.lock() = Some(a);
+    *ACT.lock() = Some(a); ACT_POSTED.post(); // SVCLATCH (B462)
 }
 
 /// What the pointer holds: nothing, the scrubber, the volume knob.
@@ -168,7 +168,7 @@ pub fn shown() -> String {
 
 /// Latch `path` for [`service`] (click-router safe). Quarry's `play` opener.
 pub fn request_open(path: &str) {
-    *PENDING.lock() = Some(String::from(path));
+    *PENDING.lock() = Some(String::from(path)); PENDING_POSTED.post(); // SVCLATCH (B462)
 }
 
 /// F7 (`0`), F8 (`1`), F9 (`2`) went down. Atomics only (the HID service's context).
@@ -292,7 +292,7 @@ pub fn open(path: &str) -> Result<u32, String> {
         id, path, if st.codec.is_empty() { "-" } else { &st.codec }, st.dur_ms, st.src, lv, muted as u8,
         match &st.err { None => String::from("started"), Some(e) => alloc::format!("refused ({})", e) }
     );
-    *STATE.lock() = Some(st);
+    *STATE.lock() = Some(st); PLAYER_OPEN.store(true, Ordering::Release); // SMALLFIX5 (B480): the posted `player open` flag
     WIN.store(id, Ordering::Relaxed);
     wm::winid_register_holder(&WIN, "player");
     wm::focus_changed(OWNER);
@@ -303,7 +303,7 @@ pub fn open(path: &str) -> Result<u32, String> {
 /// Close the window (if any) and stop the play. `by` names the door on the wire.
 pub fn close(by: &str) {
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
-    let had = STATE.lock().take();
+    let had = STATE.lock().take(); PLAYER_OPEN.store(false, Ordering::Release); // SMALLFIX5 (B480)
     if let Some(st) = had.as_ref() {
         if st.drag != Drag::None {
             super::capture::cancel();
@@ -326,7 +326,7 @@ pub fn close(by: &str) {
 /// clock and the end of the play.
 pub fn service() {
     ensure_registered();
-    let want = PENDING.lock().take();
+    let want = PENDING_POSTED.take(&PENDING); // SVCLATCH (B462): no lock on a quiet pass
     if let Some(p) = want {
         match open(&p) {
             Ok(_) => serial_println!("[quarry] open PLAY consumed=player path={}", p),
@@ -334,14 +334,14 @@ pub fn service() {
         }
     }
     // the WM closed the row (Cmd-W, File > Close Window, Quit): its holder cleared WIN — the play stops with it
-    if WIN.load(Ordering::Relaxed) == wm::WIN_NONE && STATE.try_lock().map(|g| g.is_some()).unwrap_or(false) {
+    if WIN.load(Ordering::Relaxed) == wm::WIN_NONE && PLAYER_OPEN.load(Ordering::Acquire) && STATE.try_lock().map(|g| g.is_some()).unwrap_or(false) {
         close("wm");
     }
     let k = MEDIA.swap(0, Ordering::AcqRel);
     if k != 0 {
         media(k);
     }
-    let a = ACT.lock().take();
+    let a = ACT_POSTED.take(&ACT); // SVCLATCH (B462)
     match a {
         Some(Act::Toggle) => toggle(),
         Some(Act::Seek(ms)) => {
@@ -928,16 +928,17 @@ pub fn fixture() {
     if let Some(c) = scratch {
         let _ = mt.unlink(&c, p);
     }
-    let ok = open_ok && transport_ok && seek_ok && shared && close_stops;
+    let (coded, coded_ok, probe_timeout) = coded_tables(); // SEEKTABLE2 (B469): Ogg and ADTS seek from their own data; SMALLFIX5 (B480): a hung probe FAILS, never wedges
+    let ok = open_ok && transport_ok && seek_ok && shared && close_stops && coded_ok;
     let w = |b: bool| if b { "ok" } else { "bad" };
     serial_println!(
         "[player] fixture path={} ran={} paused={} resumed={} seek={:?} vol={}->{} {} ",
         path, ran as u8, paused_ok as u8, resumed_ok as u8, sk, l0, target, amp
     );
     serial_println!(
-        ":: PLAYER: open={} transport={} seek={} method={} volume={} close_stops={} -> {} ::",
-        w(open_ok), w(transport_ok), w(seek_ok), sk.map(|v| v.1).unwrap_or("none"), if shared { "shared" } else { "split" }, close_stops as u8,
-        if ok { "PASS" } else { "FAIL" }
+        ":: PLAYER: open={} transport={} seek={} method={} volume={} close_stops={} coded={}{} -> {} ::",
+        w(open_ok), w(transport_ok), w(seek_ok), sk.map(|v| v.1).unwrap_or("none"), if shared { "shared" } else { "split" }, close_stops as u8, coded,
+        if probe_timeout { " probe=timeout" } else { "" }, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -1019,22 +1020,44 @@ mod vid {
         repaint();
     }
 
-    /// 0 (F7, Home) restarts; any other point is owed until the container's tables land (SEEKTABLE B433).
+    /// 0 (F7, Home) restarts. VPLAYAUDIO (B475): any other point seeks the picture (the job's keyframe seek,
+    /// `vplay::start_at`) and the sound together — the sound through `play::seek_to` → `play-dec` → `Decoder::seek`
+    /// over the job's shared Demuxer (`[play] seek … table=mp4|matroska`); the audio clock resumes from the landing.
     pub fn seek(ms: u64) -> Option<(u64, &'static str)> {
-        let out = {
+        let (path, sound) = {
             let mut g = STATE.lock();
             let st = g.as_mut()?;
             if ms == 0 {
                 restart(st);
                 serial_println!("[player] seek to_ms=0 landed_ms=0 method=restart video=1");
-                Some((0, "restart"))
-            } else {
-                serial_println!("[player] seek to_ms={} video=owed (SEEKTABLE B433: keyframe seek rides the container's tables)", ms);
-                None
+                drop(g);
+                repaint();
+                return Some((0, "restart"));
             }
+            let ms = if st.dur_ms > 0 { ms.min(st.dur_ms.saturating_sub(1)) } else { ms };
+            let sound = vplay::facts().is_some_and(|f| f.audio_ok);
+            hw::stop();
+            vplay::start_at(&st.path, ms);
+            st.base_ms = ms;
+            st.shown_ms = ms;
+            st.ended = false;
+            st.playing = true;
+            st.err = None;
+            ((st.path.clone(), ms), sound)
         };
+        let (path, ms) = path;
+        // the sound after the picture's job is minted: play-dec's first door is the new job's share
+        let r = if sound { Some(hw::seek(&path, ms)) } else { None };
+        vplay::audio_expected(matches!(r, Some(Ok(_))));
+        if let (Some(Ok((landed, _))), Some(st)) = (r.as_ref(), STATE.lock().as_mut()) {
+            st.base_ms = *landed;
+        }
+        serial_println!(
+            "[player] seek to_ms={} video=keyframe sound={} path={}",
+            ms, match &r { Some(Ok((_, m))) => *m, Some(Err(_)) => "refused", None => "none" }, path
+        );
         repaint();
-        out
+        Some((ms, "keyframe"))
     }
 
     /// The pass: the container's facts (once — the info line, the glass line, the sound), then the clock and at
@@ -1174,4 +1197,69 @@ mod vid {
             f.as_ref().map(|f| f.codec).unwrap_or("-"), if ok { "PASS" } else { "FAIL" }
         );
     }
+}
+
+// ── SEEKTABLE2 (rmbp-ledger B469) — `tests player` reads the coded tables (Ogg Vorbis, Ogg Opus, ADTS) ────────────
+
+/// Each staged coded sample through the core's own index (`play::table_probe_*`, on a worker task): its `[player]
+/// coded seek` line and the token `ogg:table,opus:table,adts:table` (`:none` = decode-skip, `:-` = not staged).
+/// `ok` = every staged one answered from a table.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn coded_tables() -> (String, bool, bool) {
+    use crate::drivers::hda::play;
+    let mt = crate::shell::vfs_mount_table();
+    let mut tok = String::new();
+    let mut ok = true;
+    for (name, key, want) in [("TEST.OGG", "ogg", "ogg"), ("TEST.OPUS", "opus", "ogg"), ("TEST.AAC", "adts", "adts")] {
+        if !tok.is_empty() {
+            tok.push(',');
+        }
+        let Some(path) = crate::fs::volumes::testf_find(&mt, name) else {
+            tok.push_str(key);
+            tok.push_str(":-");
+            continue;
+        };
+        // SMALLFIX5 (B480) item 7: a probe that does not answer in 3 s (or one still hung from an earlier run) ends
+        // the walk — no further file read, no further task — and PLAYER prints `probe=timeout` and FAILS.
+        if !play::table_probe_start(&path, 200) {
+            serial_println!("[player] coded seek path={} probe=timeout reason=earlier-probe-unanswered -> rest skipped", path);
+            tok.push_str(key);
+            tok.push_str(":skip");
+            return (tok, false, true);
+        }
+        let done = play::pump_until(3000, || play::table_probe_done().is_some());
+        let v = play::table_probe_done();
+        if v.is_none() {
+            serial_println!("[player] coded seek path={} probe=timeout ms=3000 done={} -> rest skipped", path, done as u8);
+            tok.push_str(key);
+            tok.push_str(":none");
+            return (tok, false, true);
+        }
+        let good = matches!(v, Some(Ok((t, true, _, _, _))) if t == want);
+        match &v {
+            Some(Ok((t, e, l, b, s))) => serial_println!("[player] coded seek path={} table={} exact={} to_ms=200 landed_ms={} byte={} sample={}", path, t, *e as u8, l, b, s),
+            Some(Err(e)) => serial_println!("[player] coded seek path={} refused ({})", path, e),
+            None => {} // SMALLFIX5 (B480): answered above (probe=timeout)
+        }
+        ok &= good;
+        tok.push_str(key);
+        tok.push_str(if good { ":table" } else { ":none" });
+    }
+    (tok, ok, false)
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "hda-tone")))]
+fn coded_tables() -> (String, bool, bool) {
+    (String::from("-"), true, false)
+}
+
+// ── SMALLFIX5 (rmbp-ledger B480) item 2 — the `player open` flag (the SVCLATCH latch shape) ─────────────────────
+/// Raised beside the one store of `Some` into [`STATE`], lowered beside its one `take`: the desktop pass's "did the
+/// WM close the row" check reads it before `STATE.try_lock()`, so with no Player open the pass takes no lock.
+static PLAYER_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `tests smallfix5`: the flag agrees with the state it fronts (`None` when the state is locked by someone else).
+pub fn open_flag_agrees() -> Option<bool> {
+    let flag = PLAYER_OPEN.load(Ordering::Acquire);
+    STATE.try_lock().map(|g| g.is_some() == flag)
 }

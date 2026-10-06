@@ -46,6 +46,10 @@ pub const EIO: i64 = -5;
 pub const E2BIG: i64 = -7;
 pub const EACCES: i64 = -13;
 pub const EINVAL: i64 = -22;
+/// PREFSCAP (B454): the declared-stanza registry is full ([`crate::declare::MAX_PROGRAMS`]).
+pub const ENOSPC: i64 = -28;
+
+pub use crate::cap::Caller;
 
 /// Why a [`Store::set`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,9 +163,17 @@ pub fn parse_set_reply(body: &[u8]) -> Option<(PrefValue, bool)> {
     (&body[z + 1..] == b"clamped=true").then_some((v, true))
 }
 
-/// Fulfil one PREF verb over `store`. `in_session`: the caller runs in the open session (the transport
-/// decides from the stamped principal). Reply body into `out`; returns the status (0 or a negative errno).
+/// Fulfil one PREF verb over `store` for a TRUSTED caller (the kernel, Settings, host Principia):
+/// [`fulfil_as`] with [`Caller::Kernel`]. A ring-3 transport calls [`fulfil_as`] with the stamped caller.
 pub fn fulfil(store: &mut dyn Store, verb: u8, body: &[u8], in_session: bool, out: &mut Vec<u8>) -> i64 {
+    fulfil_as(store, verb, body, in_session, Caller::Kernel, out)
+}
+
+/// Fulfil one PREF verb over `store`. `in_session`: the caller runs in the open session (the transport
+/// decides from the stamped principal). `caller`: who the transport stamped (PREFSCAP, B454) — a SET
+/// outside [`crate::cap::may_set`] and a DECLARE outside [`crate::cap::may_declare`] answer -EACCES before
+/// the store is touched. Reply body into `out`; returns the status (0 or a negative errno).
+pub fn fulfil_as(store: &mut dyn Store, verb: u8, body: &[u8], in_session: bool, caller: Caller, out: &mut Vec<u8>) -> i64 {
     match verb {
         VERB_GET => match parse_get(body) {
             Some((ns, k)) => match store.get(ns, k) {
@@ -175,7 +187,7 @@ pub fn fulfil(store: &mut dyn Store, verb: u8, body: &[u8], in_session: bool, ou
         },
         VERB_SET => match parse_set(body) {
             Some((ns, k, v)) => {
-                if !in_session {
+                if !in_session || !crate::cap::may_set(caller, ns, k) {
                     return EACCES;
                 }
                 match store.set(ns, k, v) {
@@ -210,7 +222,7 @@ pub fn fulfil(store: &mut dyn Store, verb: u8, body: &[u8], in_session: bool, ou
             None => EINVAL,
         },
         VERB_DECLARE => match crate::declare::parse(body) {
-            Some((name, keys)) if in_session => store.declare(&name, keys),
+            Some((name, keys)) if in_session && crate::cap::may_declare(caller, &name) => store.declare(&name, keys),
             Some(_) => EACCES,
             None => EINVAL,
         },
@@ -430,6 +442,79 @@ system.trackpad.three_finger_drag = false\n";
 #[cfg(test)]
 mod secreview_fuzz {
     use super::*;
+    // PREFSCAP (B454, SECREVIEW F4): the capability cases share this module (merge19: one Rng, one store).
+    // PREFSCAP (B454, SECREVIEW F4): the capability cases share this module (merge19: one Rng, one store).
+    use crate::declare::{self, Registry, MAX_PROGRAMS};
+
+    /// The reference store with a declared-stanza registry (the kernel's `DECLARED`, in RAM).
+    #[derive(Default)]
+    struct DeclStore(TreeStore, Registry);
+    impl Store for DeclStore {
+        fn get(&self, ns: &str, k: &str) -> Option<PrefValue> {
+            self.0.get(ns, k)
+        }
+        fn set(&mut self, ns: &str, k: &str, v: PrefValue) -> Result<Applied, SetFail> {
+            self.0.set(ns, k, v)
+        }
+        fn list(&self, ns: &str) -> Vec<(String, PrefValue)> {
+            self.0.list(ns)
+        }
+        fn namespaces(&self) -> Vec<String> {
+            self.0.namespaces()
+        }
+        fn declare(&mut self, name: &str, keys: Vec<declare::DeclKey>) -> i64 {
+            declare::insert(&mut self.1, name, keys)
+        }
+    }
+
+    fn set(s: &mut DeclStore, c: Caller, body: &[u8]) -> i64 {
+        fulfil_as(s, VERB_SET, body, true, c, &mut Vec::new())
+    }
+
+    #[test]
+    fn a_program_sets_only_what_it_owns() {
+        let mut s = DeclStore::default();
+        let l = Caller::Program("LUMEN");
+        assert_eq!(set(&mut s, l, b"app.lumen.window.frame\x00\"1,2,3,4\""), 0);
+        assert_eq!(set(&mut s, l, b"system.audio.volume\x009"), 0, "a ring-3-settable system row");
+        for foreign in [
+            b"vein.endpoint\x00\"https://evil.example/\"".as_slice(),
+            b"vein.claudecode.bin\x00\"/home/x/sh\"",
+            b"vein.key_file\x00\"/home/x/k\"",
+            b"system.login.items\x00\"/apps/EVIL.ELF\"",
+            b"system.display.mode\x00\"1x1\"",
+            b"app.vug.window.frame\x00\"0,0,1,1\"",
+            b"aether.homepage\x00\"x\"",
+        ] {
+            assert_eq!(set(&mut s, l, foreign), EACCES, "{}", core::str::from_utf8(foreign).unwrap());
+        }
+        assert_eq!(s.get("vein", "endpoint"), None, "a refusal touches nothing");
+        assert_eq!(set(&mut s, Caller::Program("vein"), b"vein.endpoint\x00\"https://api.example/\""), 0, "vein from vein");
+        assert_eq!(set(&mut s, Caller::Anon, b"app.lumen.zoom\x001"), EACCES);
+        assert_eq!(set(&mut s, Caller::Anon, b"system.audio.mute\x00true"), 0);
+        assert_eq!(set(&mut s, Caller::Kernel, b"system.login.items\x00\"\""), 0, "Settings keeps its path");
+        assert_eq!(set(&mut s, Caller::Program("prefs"), b"system.dock.position\x00\"left\""), 0, "Principia's fulfiller");
+        // Outside the session the old rule still answers first.
+        assert_eq!(fulfil_as(&mut s, VERB_SET, b"app.lumen.zoom\x001", false, l, &mut Vec::new()), EACCES);
+    }
+
+    #[test]
+    fn a_program_declares_only_its_own_stanza_and_the_registry_is_capped() {
+        let mut s = DeclStore::default();
+        let st = |n: &str| alloc::format!("{n}\0zoom\tint:1:4\t1\tzoom\n").into_bytes();
+        let decl = |s: &mut DeclStore, c: Caller, n: &str| fulfil_as(s, VERB_DECLARE, &st(n), true, c, &mut Vec::new());
+        assert_eq!(decl(&mut s, Caller::Program("LUMEN"), "lumen"), 0);
+        assert_eq!(decl(&mut s, Caller::Program("VUG"), "lumen"), EACCES, "B cannot replace A's stanza");
+        assert_eq!(decl(&mut s, Caller::Anon, "anon"), EACCES);
+        assert_eq!(decl(&mut s, Caller::Program("LUMEN"), "lumen"), 0, "re-declaring its own is a replace");
+        for i in 1..MAX_PROGRAMS {
+            assert_eq!(decl(&mut s, Caller::Kernel, &alloc::format!("p{i}")), 0);
+        }
+        assert_eq!(s.1.len(), MAX_PROGRAMS);
+        assert_eq!(decl(&mut s, Caller::Kernel, "one-more"), ENOSPC, "the 65th program is refused on the wire");
+        assert_eq!(decl(&mut s, Caller::Kernel, "p7"), 0, "a held name still replaces at the cap");
+        assert_eq!(s.1.len(), MAX_PROGRAMS);
+    }
 
     struct Rng(u64);
     impl Rng {
@@ -462,6 +547,30 @@ mod secreview_fuzz {
                     let _ = crate::login::parse(t);
                     let _ = PrefValue::from_literal(t);
                     let _ = crate::PrefTree::parse(t);
+                }
+            }
+        }
+    }
+
+    /// Bounded fuzz: random SET/DECLARE bodies under a stamped program never write outside its capability.
+    #[test]
+    fn fuzz_a_stamped_program_never_writes_outside_its_capability() {
+        const NS: [&str; 5] = ["app", "system", "vein", "lumen", "aether"];
+        const K: [&str; 8] = ["lumen.zoom", "vug.zoom", "audio.volume", "login.items", "endpoint", "display.mode", "x", "key_file"];
+        for seed in [7u64, 0xDEAD_BEEF, 0x1234_5678_9ABC] {
+            let mut r = Rng(seed);
+            let mut s = DeclStore::default();
+            for _ in 0..5_000 {
+                let (ns, k) = (NS[(r.next() % 5) as usize], K[(r.next() % 8) as usize]);
+                let c = [Caller::Program("lumen"), Caller::Anon][(r.next() % 2) as usize];
+                let st = set(&mut s, c, &set_body(ns, k, &PrefValue::Int((r.next() % 50) as i64)));
+                if !crate::cap::may_set(c, ns, k) {
+                    assert_eq!(st, EACCES);
+                }
+            }
+            for ns in s.namespaces() {
+                for (k, _) in s.list(&ns) {
+                    assert!(crate::cap::may_set(Caller::Program("lumen"), &ns, &k) || crate::cap::settable(&ns, &k), "{ns}.{k}");
                 }
             }
         }

@@ -1757,9 +1757,9 @@ FORBID :: VOLKEYS: .* -> FAIL ::
 # --- ride UNAOS_USBNET=1 AND the AX88179 (0b95:1790) enumerating on EHCI, so they are OPTIONAL (a boot
 # --- without the dongle never emits them) and the FAIL twin is FORBIDDEN.
 REQUIRE :: PORTROUTE: xusb2pr=0x[0-9a-f]+ pssen=0x[0-9a-f]+ mask=0x[0-9a-f]+ switched=\[[0-9,]*\] ehci_only=\[[0-9,]*\] ::
-OPTIONAL :: USBNET-EHCI: addr=\d+ mac=[0-9a-f:]{17} link=(up|down) -> PASS ::
+OPTIONAL :: USBNET-EHCI: addr=\d+ mac=[0-9a-f:]{17} link=(up|down) -> armed ::
 OPTIONAL :: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::
-FORBID :: USBNET-EHCI: .* -> FAIL ::
+FORBID :: USBNET-EHCI: .* -> declined ::
 # USBNET3: the xHCI-path AX88179 reading. QEMU has no AX88179, so no QEMU lane can produce it: OPTIONAL (metal, UNAOS_USBNET=1 + the dongle on an xHCI port).
 OPTIONAL :: USBNET: bus=xhci slot=\d+ mac=[0-9a-f:]{17} link=(up|down) speed=\d+ usb=(ss|hs|fs|\?) rx=\d+ tx=\d+ .* -> PASS ::
 FORBID :: USBNET: bus=xhci .* -> FAIL ::

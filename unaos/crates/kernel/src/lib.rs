@@ -315,3 +315,18 @@ pub mod origin;
 pub mod sync;
 // SMALLFIX3 (rmbp-ledger B416): the fold's unique-code checks, the fixture arcs for `tests list` / `help tests`, `tests smallfix3`. Tail statement.
 pub mod smallfix3;
+// SHELLTASK (rmbp-ledger B458): the shell's dispatch on its own task; the render task composes only. Tail statement.
+pub mod shelltask;
+// SMALLFIX4 (rmbp-ledger B466): `tests smallfix4` — the wave's minted codes unique, a path launch's name. Tail statement.
+pub mod smallfix4;
+// SMALLFIX5 (rmbp-ledger B480): `tests smallfix5` — the merge19 wave's small owed items, read back. Tail statement.
+pub mod smallfix5;
+// DOORHEADLESS (rmbp-ledger B487): the serial door's headless console on SHELLTASK's job task. Tail statement.
+pub mod serialdoor;
+// HIDSTALL (rmbp-ledger B485, R103): the pointer's halt, stall and dock-release counters and `tests hidstall`. Tail statement.
+pub mod hidstall;
+// LOADERSTALL (rmbp-ledger B490): the loader's stage record read back — `:: LOADER:` and `tests loader`. Tail statement.
+#[cfg(target_arch = "x86_64")]
+pub mod loaderstage;
+// SMALLFIX6 (rmbp-ledger B495): `tests windowcap`, `tests smallfix6` — flight 26's small reds, read back. Tail statement.
+pub mod smallfix6;

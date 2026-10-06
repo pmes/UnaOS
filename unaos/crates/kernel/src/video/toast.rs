@@ -22,6 +22,7 @@ pub const TOAST_MS: u64 = 3000;
 const TL: usize = 24;
 const LL: usize = 52;
 const QCAP: usize = 4;
+const AL: usize = 12; // REFUSALUI (B468): an action button's label (NOTIFY's `BL`)
 
 #[derive(Clone, Copy)]
 pub struct T {
@@ -29,10 +30,16 @@ pub struct T {
     tl: u8,
     line: [u8; LL],
     ll: u8,
+    /// REFUSALUI (B468): the bus poster's default button (`bl == 0`: none), its owner, token and index.
+    label: [u8; AL],
+    bl: u8,
+    owner: u64,
+    token: u8,
+    ix: u8,
 }
 
 impl T {
-    const EMPTY: T = T { title: [0; TL], tl: 0, line: [0; LL], ll: 0 };
+    const EMPTY: T = T { title: [0; TL], tl: 0, line: [0; LL], ll: 0, label: [0; AL], bl: 0, owner: 0, token: 0, ix: 0 };
     fn make(title: &[u8], body: &[u8]) -> T {
         let mut t = T::EMPTY;
         for &b in title.iter().take(TL) {
@@ -137,10 +144,7 @@ pub fn current_is_glass() -> bool {
 
 /// Expire the toast on the glass at the next service pass (the fixture's clock).
 pub fn expire_now() {
-    let mut g = TQ.lock();
-    if g.cur.is_some() {
-        g.until = 1;
-    }
+    super::notify::expire_now(); // NOTICEFIX (B491): the card lives in NOTIFY's stack, not `TQ.cur` (never set since B418)
 }
 
 /// Toasts waiting (not counting the one showing).
@@ -173,4 +177,50 @@ pub fn fixture_hold_restore(s: Held) {
     g.until = s.4;
     drop(g);
     HEADLESS.store(s.5, Ordering::Relaxed);
+}
+
+// ── REFUSALUI (rmbp-ledger B468) — the TOAST verb's button answers its poster ──────────────────────────────
+
+/// Queue a toast that carries the bus poster's default button: pressing it answers `owner` with
+/// `INPUT_EV_DIALOG_ANSWER` (`token`, button `ix`) — the same queue, so [`queued`] counts it (DIALOG2's fixture).
+pub fn post_answer(title: &[u8], body: &[u8], label: &[u8], owner: u64, token: u8, ix: u8) -> bool {
+    let mut t = T::make(title, body);
+    for &b in label.iter().take(AL) {
+        t.label[t.bl as usize] = if (0x20..0x7f).contains(&b) { b } else { b'?' };
+        t.bl += 1;
+    }
+    t.owner = owner;
+    t.token = token;
+    t.ix = ix;
+    let Some(mut g) = TQ.try_lock() else {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    if g.n >= QCAP {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let i = g.n;
+    g.q[i] = t;
+    g.n += 1;
+    true
+}
+
+/// A queued toast's answer: `(label, owner, token, button)`; `None` for a plain toast.
+pub type Answer = Option<(alloc::vec::Vec<u8>, u64, u8, u8)>;
+
+/// [`take`] with the poster's answer (NOTIFY's inbound pass): `(title, line, answer)`.
+pub fn take_full() -> Option<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, Answer)> {
+    let mut g = TQ.try_lock()?;
+    if g.n == 0 {
+        return None;
+    }
+    let first = g.q[0];
+    let n = g.n;
+    for i in 1..n {
+        g.q[i - 1] = g.q[i];
+    }
+    g.n -= 1;
+    let ans = if first.bl > 0 { Some((first.label[..first.bl as usize].to_vec(), first.owner, first.token, first.ix)) } else { None };
+    Some((first.title().to_vec(), first.line[..first.ll as usize].to_vec(), ans))
 }

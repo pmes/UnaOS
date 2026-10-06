@@ -218,6 +218,9 @@ pub fn route_request(ops: &Ops, caller_row: usize, caller_gen: u64, caller_prin:
     if hdr.verb < BUS_VERB_FULFIL_MIN {
         return Route::Kernel;
     }
+    if let Some(st) = pref_gate(hdr.verb, caller_row) {
+        return Route::Reply(st); // PREFSCAP (B454): the deputy door is shut
+    }
     let Some((ful_row, ful_gen)) = lookup(ops, hdr.verb) else {
         return Route::Reply(ENOENT); // no fulfiller: an answer, never a hang
     };
@@ -522,4 +525,28 @@ pub fn selftest(fx: &Fixture) {
 /// that died since is reaped at the next REGISTER; `tests holocron` and the login launch only read it.)
 pub fn registered(verb: u8) -> bool {
     locked(|| REGS.lock().iter().flatten().any(|r| r.verb == verb))
+}
+
+// PREFSCAP (rmbp-ledger B454, SECREVIEW F4): `R3PREF_SET` (130) exists so the kernel's preference client
+// (Settings, `prefs_client`) reaches Principia's ring-3 fulfiller, which forwards it to `PREF_SET` under
+// ITS OWN name — a confused deputy for any other caller. A ring-3 program writes through `PREF_SET` (17)
+// itself, under its own stamped name (`prefs::bus_fulfil_from`); 130 from any row but the client is -EACCES.
+const EACCES: i64 = -13;
+
+/// The PREF tags' caller gate: `Some(status)` = answered here, never relayed.
+pub fn pref_gate(verb: u8, caller_row: usize) -> Option<i64> {
+    (verb == una_abi::BUS_VERB_R3PREF_SET && caller_row != crate::prefs_client::KCLIENT_ROW).then_some(EACCES)
+}
+
+#[allow(dead_code)] // a no-witness build has no caller
+/// `tests prefscap`' deputy leg: a ring-3 row's `R3PREF_SET` is refused, the kernel client's is routed.
+pub fn r3pref_set_refused() -> bool {
+    pref_gate(una_abi::BUS_VERB_R3PREF_SET, 0) == Some(EACCES)
+        && pref_gate(una_abi::BUS_VERB_R3PREF_SET, crate::prefs_client::KCLIENT_ROW).is_none()
+        && pref_gate(una_abi::BUS_VERB_R3PREF_GET, 0).is_none()
+}
+/// RINGLOGIN (rmbp-ledger B465): the row registered for `verb` right now (SYS_RINGKEY hands the login's ring
+/// key only to the process holding Holocron's verbs). Tail append.
+pub fn fulfiller_row(verb: u8) -> Option<(usize, u64)> {
+    locked(|| REGS.lock().iter().flatten().find(|r| r.verb == verb).map(|r| (r.row, r.rgen)))
 }

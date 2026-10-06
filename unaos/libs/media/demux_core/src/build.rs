@@ -584,6 +584,9 @@ pub struct MkvOptions {
     pub lacing: Lacing,
     /// Write Info/Duration.
     pub duration: bool,
+    /// VPLAYAUDIO (rmbp B475): > 0 writes the LAST audio block as a BlockGroup carrying this `DiscardPadding` (ns;
+    /// RFC 9559 §5.1.3.5.6) — the Opus/Vorbis end trim inside Matroska.
+    pub discard_last_ns: u64,
 }
 
 impl Default for MkvOptions {
@@ -598,6 +601,7 @@ impl Default for MkvOptions {
             lace: 0,
             lacing: Lacing::Xiph,
             duration: true,
+            discard_last_ns: 0,
         }
     }
 }
@@ -741,12 +745,14 @@ pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
         blocks.push(alloc::vec![f]);
     }
 
+    let last_audio = blocks.iter().rposition(|b| tracks[b[0].track].spec.kind != TrackKind::Video);
     let per_cluster = if opts.cluster_blocks == 0 { 30 } else { opts.cluster_blocks };
     let mut clusters = Vec::new();
-    for group in blocks.chunks(per_cluster) {
+    for (gi, group) in blocks.chunks(per_cluster).enumerate() {
         let cluster_ticks = group.iter().map(|b| b[0].ns / scale as i64).min().unwrap_or(0).max(0);
         let mut body = el_uint(0xE7, cluster_ticks as u64);
-        for b in group {
+        for (bi, b) in group.iter().enumerate() {
+            let pad = if opts.discard_last_ns > 0 && last_audio == Some(gi * per_cluster + bi) { opts.discard_last_ns } else { 0 };
             let f0 = b[0];
             let t = &tracks[f0.track];
             let rel = (f0.ns / scale as i64 - cluster_ticks) as i16;
@@ -766,7 +772,7 @@ pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
             let video = t.spec.kind == TrackKind::Video;
             let use_group = opts.block_groups && video;
             let key = b.iter().all(|f| f.s.keyframe);
-            let flags = lacing_bits | if key && !use_group { 0x80 } else { 0 };
+            let flags = lacing_bits | if key && !use_group && pad == 0 { 0x80 } else { 0 };
             blk.push(flags);
             if laced {
                 blk.push((b.len() - 1) as u8);
@@ -811,6 +817,10 @@ pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
                 if !key {
                     g.extend_from_slice(&el(0xFB, &[0xFF])); // −1: the previous frame
                 }
+                body.extend_from_slice(&el(0xA0, &g));
+            } else if pad > 0 {
+                let mut g = el(0xA1, &blk);
+                g.extend_from_slice(&el(0x75A2, &(pad as i64).to_be_bytes())); // DiscardPadding, a signed integer
                 body.extend_from_slice(&el(0xA0, &g));
             } else {
                 body.extend_from_slice(&el(0xA3, &blk));

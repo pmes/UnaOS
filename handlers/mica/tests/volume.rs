@@ -32,7 +32,7 @@ fn verbs_on_a_volume() {
     // the saved query QUERYFOLDER opens
     let q = fs.resolve_path("/jobs/queries/Open jobs").unwrap();
     assert_eq!(fs.get_attribute(q, jc::TYPE_KEY).unwrap(), Some(unafs::AttributeValue::String(jc::QUERY_TYPE.into())));
-    let open = mica::query(&mut fs, "job:status == open").unwrap();
+    let open = mica::query(&mut fs, &format!("{} == open", jc::K_STATUS)).unwrap();
     assert!(!open.is_empty());
     // add + cite: the gate's rules hold on the volume, and the export carries the new row
     let r = mica::add_claim(&mut fs, "a new claim", "UNAOSVOLUME test", "B1").unwrap();

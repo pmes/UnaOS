@@ -40,6 +40,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 pub mod build;
@@ -167,6 +168,24 @@ pub struct Track {
     /// decoder discards what lies past it. Zero / `None` when the file says nothing.
     pub trim_start_ns: u64,
     pub play_ns: Option<u64>,
+    /// MP4ONE (rmbp B464): the media edit as the file states it (MP4 `elst`), the raw numbers the ns fields
+    /// above are derived from — an audio decoder trims in its own sample units from these, with no ns round
+    /// trip (`audio_core`'s MP4 path). `None` without an edit list (and for Matroska).
+    pub edit: Option<Edit>,
+    /// MP4ONE (rmbp B464): Apple's `iTunSMPB` (priming, total samples) as the file states it, on every
+    /// audio track of an MP4 that carries one; `None` elsewhere.
+    pub smpb: Option<(u64, u64)>,
+}
+
+/// MP4ONE (rmbp B464): the first media edit of an MP4 `elst` (ISO/IEC 14496-12 §8.6.6) — the edit the
+/// presentation shift and [`Track::play_ns`] come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edit {
+    /// `media_time` in media (mdhd) ticks.
+    pub media_time: i64,
+    /// `segment_duration` in movie (mvhd) ticks.
+    pub segment: u64,
+    pub movie_timescale: u32,
 }
 
 impl Track {
@@ -215,7 +234,9 @@ pub(crate) struct Parsed {
 }
 
 pub struct Demuxer {
-    data: Vec<u8>,
+    /// VPLAYAUDIO (rmbp B475): the file's bytes, shared — [`Demuxer::share`] hands a second cursor over the same
+    /// bytes and tables (the picture job and the sound job of one video: one read, one parse, no byte copy).
+    data: Arc<Vec<u8>>,
     format: Format,
     tracks: Vec<Track>,
     /// All tracks' samples merged in decode-time order (ties: track order).
@@ -241,12 +262,29 @@ pub fn probe(data: &[u8]) -> Option<Format> {
 
 impl Demuxer {
     pub fn open(data: Vec<u8>) -> Result<Demuxer, Error> {
+        Demuxer::open_with(data, false)
+    }
+
+    /// MP4ONE (rmbp B464): a file cut short (a partial copy, an interrupted download) opens up to its cut —
+    /// an MP4 top-level box that runs past the end is clamped to it and the samples past the end are dropped,
+    /// where [`Demuxer::open`] refuses the file. A whole file opens exactly as with [`Demuxer::open`].
+    pub fn open_partial(data: Vec<u8>) -> Result<Demuxer, Error> {
+        Demuxer::open_with(data, true)
+    }
+
+    fn open_with(data: Vec<u8>, partial: bool) -> Result<Demuxer, Error> {
         let parsed = match probe(&data) {
-            Some(Format::Mp4) => mp4::parse(&data)?,
+            Some(Format::Mp4) => mp4::parse(&data, partial)?,
             Some(_) => mkv::parse(&data)?,
             None => return Err(Error::UnknownFormat),
         };
-        let Parsed { format, mut tracks, samples, declared_duration_ns } = parsed;
+        let Parsed { format, mut tracks, mut samples, declared_duration_ns } = parsed;
+        if partial {
+            let len = data.len() as u64;
+            for s in samples.iter_mut() {
+                s.retain(|x| x.offset.checked_add(x.size as u64).is_some_and(|e| e <= len));
+            }
+        }
         for (i, t) in tracks.iter_mut().enumerate() {
             let s = &samples[i];
             t.sample_count = s.len() as u64;
@@ -264,11 +302,31 @@ impl Demuxer {
                 return Err(Error::Truncated);
             }
         }
-        Ok(Demuxer { data, format, tracks, order, pos: 0, declared_duration_ns })
+        Ok(Demuxer { data: Arc::new(data), format, tracks, order, pos: 0, declared_duration_ns })
     }
 
     pub fn format(&self) -> Format {
         self.format
+    }
+    /// MP4ONE (rmbp B464): the file's bytes back, for a caller that keeps the sample table's offsets and reads
+    /// the payloads itself (`audio_core`'s MP4 path) — no second copy of the file.
+    /// A shared file's bytes are copied once here (prefer [`Demuxer::bytes`]).
+    pub fn into_data(self) -> Vec<u8> {
+        Arc::try_unwrap(self.data).unwrap_or_else(|a| (*a).clone())
+    }
+    /// VPLAYAUDIO (rmbp B475): the file's bytes, shared (no copy) — the sample table's offsets index them.
+    pub fn bytes(&self) -> Arc<Vec<u8>> {
+        self.data.clone()
+    }
+    /// VPLAYAUDIO (rmbp B475): a second cursor over the same bytes and tables (from the first packet). The picture
+    /// job keeps the file; the sound job reads its own track through the share — one parse, no byte copy.
+    pub fn share(&self) -> Demuxer {
+        Demuxer { data: self.data.clone(), format: self.format, tracks: self.tracks.clone(), order: self.order.clone(), pos: 0, declared_duration_ns: self.declared_duration_ns }
+    }
+    /// VPLAYAUDIO (rmbp B475): a sample's payload as a slice of the file (no copy; no `frame_prefix`).
+    pub fn sample_data(&self, s: &Sample) -> &[u8] {
+        let (o, n) = (s.offset as usize, s.size as usize);
+        self.data.get(o..o.saturating_add(n)).unwrap_or(&[])
     }
     pub fn tracks(&self) -> &[Track] {
         &self.tracks

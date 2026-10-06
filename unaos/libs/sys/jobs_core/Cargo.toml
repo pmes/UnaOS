@@ -5,10 +5,13 @@ edition = "2024"
 license = "LGPL-3.0-or-later"
 description = "Jobs core (UNAOSVOLUME, rmbp-ledger B427): the record model of the jobs on the UnaOS volume — STATUS.tsv, the ledgers and the queues as typed records, their byte-identical export, verify and the query translation. Shared by Mica (Ring 3, the writer) and the kernel (the reader)."
 
-# The `midden_core` shape: `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies, a member of the
+# The `midden_core` shape: `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, no dependencies but una-abi (the key registry), a member of the
 # root host workspace, pulled by the kernel as a path dep with `default-features = false`.
 [dependencies]
+# SMALLFIX4 item 13 (ATTRKEYS B452): the K_* keys alias una-abi's one attribute-key registry (no deps, no code).
+una-abi = { path = "../../../crates/una-abi" }
 
 [features]
 default = ["std"]
 std = []
+

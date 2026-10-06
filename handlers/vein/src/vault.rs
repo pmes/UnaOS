@@ -35,9 +35,9 @@ use tokio::task;
 use unafs::{AttributeValue, FileSystem, UnaFS, FileDevice};
 
 /// EMBED (B317): the model that made a memory's vector (`<provider>/<model>`).
-pub const ATTR_EMBED_MODEL: &str = "una:embed-model";
+pub const ATTR_EMBED_MODEL: &str = una_abi::attr_keys::EMBED_MODEL;
 /// EMBED (B317): that vector's width.
-pub const ATTR_EMBED_DIMS: &str = "una:embed-dims";
+pub const ATTR_EMBED_DIMS: &str = una_abi::attr_keys::EMBED_DIMS;
 /// The memory types the vault holds vectors for.
 pub const MEMORY_TYPES: [&str; 3] = ["chat", "directive", "engram"];
 

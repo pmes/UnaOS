@@ -77,6 +77,7 @@ pub fn read(bytes: &[u8], format: Format) -> Meta {
         Format::Bmp => bmp(bytes),
         Format::Qoi => qoi(bytes),
         Format::WebP => webp(bytes),
+        Format::Svg => Meta::default(), // markup carries no pixel metadata Facet reads; svg_core renders it
     }
 }
 

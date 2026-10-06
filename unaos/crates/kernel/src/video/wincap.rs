@@ -235,6 +235,26 @@ pub fn witness() {
         proc_limit(),
         MEM_MIB.load(Relaxed),
         refused,
+        if limit >= 11 && refused == 0 { "armed" } else { "declined" }
+    );
+}
+
+/// SMALLFIX6 (rmbp-ledger B495) — `tests windowcap` (R80: run only when asked). Flight 26 typed it and got
+/// `TESTS: ran=0`: WINDOWCAP was a boot verdict ([`witness`], latched once), never a fixture. This re-reads the
+/// live limit and the refusal count NOW and prints the verdict: PASS when the eleventh window fits and nothing
+/// has been refused since boot.
+///
+/// `:: WINDOWCAP: fixed_cap=<none|type:u32> limit=<n> procs=<n> from=mem:<MiB> opens_refused=<k> -> PASS|FAIL :: via=tests`
+pub fn tests_verdict() {
+    let limit = win_limit();
+    let refused = OPENS_REFUSED.load(Relaxed);
+    serial_println!(
+        ":: WINDOWCAP: fixed_cap={} limit={} procs={} from=mem:{} opens_refused={} -> {} :: via=tests",
+        if limit == MEM_WIN.load(Relaxed) { "none" } else { "type:u32" },
+        limit,
+        proc_limit(),
+        MEM_MIB.load(Relaxed),
+        refused,
         if limit >= 11 && refused == 0 { "PASS" } else { "FAIL" }
     );
 }

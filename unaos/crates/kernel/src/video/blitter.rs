@@ -21,8 +21,8 @@
 //! (`drivers/gpu/kepler_gpublit.rs`, a 64x64 self-test compared byte for byte with the CPU blit, one
 //! `:: GPUBLIT:` line); [`ignite`] runs at compositor ignition (x86: `desktop_uefi`, task context, beside
 //! `wcpar::start`; elsewhere lazily), once, asks [`GpuBlitter::probe`] — which answers from that self-test
-//! — and prints `[wc] blitter=<cpu|gpu> reason=<…>` once. `wc_gpublit` (`UNAOS_WC_BLITTER=gpu`) is inert
-//! since GPUBLIT; the seat retires it.
+//! — and prints `[wc] blitter=<cpu|gpu> reason=<…>` once. `wc_gpublit` (`UNAOS_WC_BLITTER=gpu`), inert
+//! since GPUBLIT, is retired (SMALLFIX4 B466).
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
 
 use super::FrameBuffer;

@@ -890,8 +890,8 @@ FORBID :: IMGVIEW: .* -> FAIL ::
 REQUIRE :: DOCKRUN: tiles=\d+ running=\d+ pinned=\d+ raise=ok quit=ok menu_drawn=1 -> PASS ::
 FORBID :: DOCKRUN: .* -> FAIL ::
 # --- DOCKPIN (R75) — the dock's pinned apps are a table persisted at `<home>/.dock`: the line prints on login and on each Keep/Remove change.
-REQUIRE :: DOCKPIN: tiles=\d+ pinned=\d+ running=\d+ loaded=\d+ saved=-?\d+ .*-> PASS ::
-FORBID :: DOCKPIN: .* -> FAIL ::
+REQUIRE :: DOCKPIN: tiles=\d+ pinned=\d+ running=\d+ loaded=\d+ saved=-?\d+ .*-> held ::
+FORBID :: DOCKPIN: .* -> short ::
 # --- QUARRYOPS (R75) — Quarry's file operations: mkdir / rename (a LONG name, the LFNMV2 `[fs] mv ... lfn=1` path) /
 # --- copy / delete on a scratch folder under /home, verified by LISTING, plus two DIRNS refusals (outside /home, the home
 # --- itself). The fixture is a `tests` registry entry the lane runs at boot; a SKIP (no /home volume) is not a pass.
@@ -948,7 +948,7 @@ FORBID :: SHELLUX: .* -> FAIL ::
 REQUIRE :: HELPVERB: verbs=[0-9]+ documented=[0-9]+ missing=\[\] groups=[0-9]+ -> PASS ::
 FORBID :: HELPVERB: .* -> FAIL ::
 # --- SPLASHX86 (R74): the boot splash rendered by the cross-arch ray tracer at the compositor takeover and HELD above the furniture until the stage is known.
-REQUIRE :: SPLASH: arch=x86_64 WxH=[0-9]+x[0-9]+ ms=[0-9]+ -> PASS ::
+REQUIRE :: SPLASH: arch=x86_64 WxH=[0-9]+x[0-9]+ ms=[0-9]+ -> painted ::
 # --- SPLASH2: the splash owns the glass from the GOP frame, through the takeover, to the first real screen (witness lines of boot 19).
 REQUIRE :: SPLASH: stage=gop at_ms=[0-9]+ 
 REQUIRE :: SPLASH: stage=takeover at_ms=[0-9]+ ::

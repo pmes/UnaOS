@@ -3794,17 +3794,8 @@ lidsleep = ["smc"]
 # in sync with `unaos/arroyo` (the x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 svg = ["pixel_core/svg"]
 
-# KCOMP (rmbp-ledger B321; docs/dev/evidence/rmbp-1005/KCOMP.md): UNAOS_WC_BLITTER=gpu asks the compositor
-# for the Kepler copy-engine blitter (video/blitter.rs GpuBlitter). Until KBLIT binds its channel the probe
-# answers `kblit-channel-absent` and the CPU blitter is selected (`[wc] blitter=cpu reason=…` once at the
-# compositor ignition); any GPU blit error falls back to the CPU for that frame (`gpu_fallback=`). x86 only,
-# pairs with UNAOS_WC=1. Off: the probe answers `feature-off` and nothing else changes. Kept in sync with
-# `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`. GPUTESTS M3 (B334): implies `wc` —
-# the blitter sits under the window compositor and is meaningless without it.
-# GPUBLIT (B371): INERT. The GPU blitter now keys on the takeover build (`nvidia-kepler` +
-# `nvidia-kepler-takeover`) and arms itself from the boot self-test — no knob. Kept declared so existing knob
-# lines still build; the seat retires it (Cargo, arroyo, builder, the k8-reach row) at the fold.
-wc_gpublit = ["wc"]
+# KCOMP (B321)'s `wc_gpublit` (UNAOS_WC_BLITTER=gpu) is RETIRED (SMALLFIX4 B466): inert since GPUBLIT (B371) — the
+# GPU blitter keys on the takeover build and arms itself from the boot self-test. Drop it from any knob line.
 
 # VIDEOPLAYER (rmbp-ledger B434, MACPARITY row 30): UNAOS_VIDEO=1 — the Player plays video. `video::vplay` is
 # Stria's fulfiller over the shared cores (demux_core + vp8_core + av1_core; the Matroska Vorbis track through
@@ -3847,6 +3838,8 @@ exfat_core = { path = "../../libs/fs/exfat_core", default-features = false }
 # PREFS (rmbp-ledger B300): Principia's shared preference core — value model + TOML subset codec, the
 # same crate `handlers/principia` links. no_std + alloc, zero deps; arch-neutral.
 prefs_core = { path = "../../libs/sys/prefs_core" }
+# TRASHCORE (B449, R79): the one Trash core — fs/trash.rs is only its I/O over the mount table; Matrix's VaultTrash links the same crate.
+trash_core = { path = "../../libs/fs/trash_core" }
 # LUMENAPP (B323): Vein's shared no_std core — `tests lumen` applies the SAME provider/key rule the ring-3
 # LUMEN.ELF applies (vein_core::prefs::plan). Zero deps; only under feature `lumen`.
 vein_core = { path = "../../libs/sys/vein_core", default-features = false, optional = true }
@@ -3875,6 +3868,9 @@ amber_core = { path = "../../libs/sys/amber_core", default-features = false }
 # STORMFAULT (rmbp-ledger B351, R79): the ring-3 ELF segment plan — bss tails, PT_GNU_STACK, the args page,
 # the window edge, and the fault line's seg= classifier — the SAME crate the host tests link. no_std, zero deps.
 elf_core = { path = "../../libs/sys/elf_core" }
+# TYPECORE (rmbp-ledger B450, R79): the one extension-to-MIME table, the built-in sniff order and the ELF split —
+# `fs/filetype.rs` reads it, and so does the host's `libs/bandy`. no_std, no allocator; depends only on elf_core.
+type_core = { path = "../../libs/sys/type_core" }
 # SELFBUILD6 (B360): the dynamic loader core (`linuxabi/ldso.rs` fulfils its Space over the process VMAs; the host runner
 # `ldrun` runs the same core). no_std + alloc, no deps; `default-features = false` drops the host runner binary.
 ldso_core = { path = "../../libs/sys/ldso_core", default-features = false }

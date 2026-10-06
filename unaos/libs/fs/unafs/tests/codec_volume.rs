@@ -137,12 +137,15 @@ fn check(version: u32, image: u64, readback: u64) {
 
 #[test]
 fn v7_volume_is_byte_identical_to_the_bincode_era_image() {
-    check(7, 0xe605fd3f4d00e53b, 0x595c3ca52d9e1fdc);
+    // NAMEINDEX (B432): the v6+ catalog trees now carry the name facts (`una:fsname`, the marker), so the IMAGE
+    // digest was re-cut (bincode era 0xe605fd3f4d00e53b); the read-back digest — every record decoded — is unchanged.
+    check(7, 0x7f8e1c92c1087a6e, 0x595c3ca52d9e1fdc);
 }
 
 #[test]
 fn v6_volume_is_byte_identical_to_the_bincode_era_image() {
-    check(6, 0x9fd7ba0da19302b1, 0xb518397df279dc7f);
+    // NAMEINDEX (B432): image re-cut as v7 (bincode era 0x9fd7ba0da19302b1); read-back unchanged.
+    check(6, 0x729d2854b01b21cc, 0xb518397df279dc7f);
 }
 
 #[test]

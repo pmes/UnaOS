@@ -29,6 +29,9 @@ pub enum Format {
     Bmp,
     Qoi,
     WebP,
+    /// SVG markup (pixel_core's `svg` route; the variant exists only when that feature is on, so the
+    /// map below takes it through a catch-all — merge19: the workspace test build unifies the feature in).
+    Svg,
 }
 
 impl Format {
@@ -41,6 +44,7 @@ impl Format {
             Format::Bmp => "bmp",
             Format::Qoi => "qoi",
             Format::WebP => "webp",
+            Format::Svg => "svg",
         }
     }
 }
@@ -54,6 +58,8 @@ impl From<pixel_core::Format> for Format {
             pixel_core::Format::Bmp => Format::Bmp,
             pixel_core::Format::Qoi => Format::Qoi,
             pixel_core::Format::WebP => Format::WebP,
+            #[allow(unreachable_patterns)]
+            _ => Format::Svg, // `pixel_core::Format::Svg` under feature `svg`; absent otherwise
         }
     }
 }
@@ -244,8 +250,14 @@ mod tests {
             (b"", None),
             (b"\0\0\x01\0\0\0", None),
         ];
+        // pixel_core sniffs SVG itself when its `svg` feature is on (a workspace test build unifies it in through
+        // svg_core); then the two svg rows are NATIVE, not foreign, and the facet table's answer is unused.
+        let svg_native = sniff(b"<svg xmlns='http://www.w3.org/2000/svg'/>").is_some();
         for (bytes, want) in cases {
             assert_eq!(foreign_format(bytes), *want, "{bytes:?}");
+            if svg_native && *want == Some("svg") {
+                continue;
+            }
             assert_eq!(sniff(bytes), None);
             let e = PixelCoreSource.decode(bytes).unwrap_err();
             match want {
@@ -259,13 +271,14 @@ mod tests {
     }
 
     #[test]
-    fn lossy_webp_is_refused_by_name() {
-        // RIFF/WEBP with a `VP8 ` (lossy) chunk: pixel_core recognises it and refuses it (VP8CORE owed).
+    fn truncated_lossy_webp_is_refused_by_name() {
+        // RIFF/WEBP with a `VP8 ` (lossy) chunk: pixel_core decodes lossy WebP through vp8_core since VIDEOPLAYER
+        // (B434); this 14-byte frame is cut short, so the refusal names the format and reads `truncated`.
         let mut b = b"RIFF\x1A\0\0\0WEBPVP8 \x0E\0\0\0".to_vec();
         b.extend([0x30, 0x01, 0x00, 0x9D, 0x01, 0x2A, 0x01, 0x00, 0x01, 0x00, 0, 0, 0, 0]);
         assert_eq!(sniff(&b), Some(Format::WebP));
         let e = PixelCoreSource.decode(&b).unwrap_err();
-        assert!(matches!(&e, SourceError::Decode { format: "webp", reason } if reason.contains("lossy")), "{e:?}");
+        assert!(matches!(&e, SourceError::Decode { format: "webp", reason } if reason.contains("truncated")), "{e:?}");
         assert!(e.to_string().starts_with("webp: "), "{e}");
     }
 

@@ -27,6 +27,20 @@ pub const SYSTEM_DOMAINS: [&str; 7] = ["display", "login", "desktop", "sound", "
 /// The namespace a program's own settings live in: `app.<name>.<key>` -> `settings/<name>`.
 pub const APP_NS: &str = "app";
 
+/// PRINCIPIAFILES (B445): the single file before R98, relative to the home — migrated ONCE into the domain
+/// files and deleted, by the kernel at load and by Principia (the host's writer of record). Both rings name it here.
+pub const LEGACY: &str = ".config/unaos/preferences.toml";
+
+/// PRINCIPIAFILES (B445): the `by` of a domain's `# auto-saved` line when no explicit writer is named — the pane
+/// that owns a system domain, else the program the domain belongs to. The kernel and Principia both stamp with it.
+pub fn writer_of(domain: &str) -> String {
+    if SYSTEM_DOMAINS.contains(&domain) {
+        String::from(pane_of(domain))
+    } else {
+        alloc::format!("the program {}", domain)
+    }
+}
+
 /// The domain (the file name under [`DIR`]) `ns`/`key` is stored in.
 pub fn domain_of(ns: &str, key: &str) -> String {
     let first = key.split('.').next().unwrap_or("");

@@ -1,0 +1,43 @@
+# CAPTURES.pin — CAPTUREPIN (rmbp-ledger B476): a capture log under docs/dev/evidence is WIRE for GATE-STATUS only
+# when a row here holds its sha256 and size. Rows are appended by unaos/scripts/capture-pin.sh at the bench (by=capture-pin);
+# the rows marked by=gatefix-grandfather pin the captures already in git at merge19 5da57a2d (2026-10-06).
+# <sha256> <bytes> <path> <provenance…>
+35df93e1cad77ee3494f51f68a1c2a0f55ad682204af347ceb12dc1313d97939 103001 docs/dev/evidence/orin13/render2-boot.log src=git@5da57a2d by=gatefix-grandfather
+bd087c140079e55904b2b65bda61c91295db1231e7f687095b52a7667e9f8ebb 28053 docs/dev/evidence/orin13/render3-boot1.log src=git@5da57a2d by=gatefix-grandfather
+9fb821d602a9d0b0c7326c684027067bad32ada35122db2d7e198ad481a36064 57801 docs/dev/evidence/orin13/render3b-boot1.log src=git@5da57a2d by=gatefix-grandfather
+841143690c3528d2d2286a1b69f7ef0174de4f7480616ba948a781acc9275a0b 219810 docs/dev/evidence/orin14/render4-boot1.log src=git@5da57a2d by=gatefix-grandfather
+ff7db9541090e5d47388dc7b52176d0715138e99f4c8c60e4cd1b8221799659d 584199 docs/dev/evidence/orin15/render6-boot1.log src=git@5da57a2d by=gatefix-grandfather
+ab711ab118c31cf1463aa581616789b8dfb6642b6ea2f1233068b8f00e8f95cb 935885 docs/dev/evidence/orin15/render6-boot2.log src=git@5da57a2d by=gatefix-grandfather
+a7a1eb0a1977bb08f9cdd0988722d6a201ebf016c86760447787340e6c9500d7 1965461 docs/dev/evidence/orin16/render7-boot1.log src=git@5da57a2d by=gatefix-grandfather
+323dfb4a71dd90b548c329ab524e04a4cbfe944e66f96d6d8c025c4547cdd939 2969658 docs/dev/evidence/orin16/render8-boot1.log src=git@5da57a2d by=gatefix-grandfather
+060c7cb461b1fe7225a9b641c5683fab2c7b7e1bede677d5b6279bb8827d22cf 432234 docs/dev/evidence/orin23/boot-render11-A1.log src=git@5da57a2d by=gatefix-grandfather
+d054424f5042ee1f03b89d7c017943c96ec9bec0ec3ace60bf6823d9e15b216b 235835 docs/dev/evidence/orin24/boot-render12-A1.log src=git@5da57a2d by=gatefix-grandfather
+b446b8f73f36375be2e0b07441ed2aac1c11111fd6d73c7bd7fae4de2774fadc 2148561 docs/dev/evidence/orin24/boot-render12-A2.log src=git@5da57a2d by=gatefix-grandfather
+63420e28c4957bd7e4bdea7492846e4b13d4fb0d34905cde80f53a481eaa8ab9 1535930 docs/dev/evidence/orin24/boot-render12-A3.log src=git@5da57a2d by=gatefix-grandfather
+d9ce124a48b4cd923135b38c9aa22addefdb6d088f7324a71dcbc323fc8f95ca 282427 docs/dev/evidence/orin27/render13-boot1-comp.log src=git@5da57a2d by=gatefix-grandfather
+c50757719afbeb7a5006d0edebac5ffb568e4dbcefe3c89fa9a6b182d649d56a 345735 docs/dev/evidence/orin27/render13-boot2.log src=git@5da57a2d by=gatefix-grandfather
+ecd8aed6290acc8d2345c60b7a1ec6660e5b7496547bf1c2562d80729495d98f 847815 docs/dev/evidence/orin28/render14-boot1-desktop-menubar.log src=git@5da57a2d by=gatefix-grandfather
+41b78f325ac1abc6ff1a72ee28b747604c27be4c19edea64c0a70ecd81a99697 450794 docs/dev/evidence/orin28/render14-boot3-shutdown-rung4e.log src=git@5da57a2d by=gatefix-grandfather
+55db769fb8bb1a3c8a0bbd80b1c15b828d38a11a756ed582d02ce270d74849d4 2174627 docs/dev/evidence/orin28/render14-boot5-ptrlost-nohit-latched.log src=git@5da57a2d by=gatefix-grandfather
+ed5b7a4bf13041a58677268e4d74929861614e5b04ce120cb858a127c903aadb 125336 docs/dev/evidence/orin28/render14-usblun-two-lun-reader.log src=git@5da57a2d by=gatefix-grandfather
+97fa93e0fb67ce6d1f137b6f8e926f97b7765408e17e626572c462f514813e09 65452 docs/dev/evidence/orin28/render15-4f-brfetch.log src=git@5da57a2d by=gatefix-grandfather
+630d5c6d0dcf4077cc26cad22f656f540124e828ea3fc5585a0f09780a54d816 122035 docs/dev/evidence/orin28/render15-5a-vendor-ignition.log src=git@5da57a2d by=gatefix-grandfather
+b1c0ccfb973cb724701b35f794181b9d588fdf3d02e5ec52f3027727684df1d5 83035 docs/dev/evidence/orin28/render15-5m-swapped-map.log src=git@5da57a2d by=gatefix-grandfather
+1c0383ef2a87002bff953b01a0c6500ae6886812ceb70be5f3b9532fd7ff522c 83389 docs/dev/evidence/orin28/render15-5s-boot1-safety-scheduler.log src=git@5da57a2d by=gatefix-grandfather
+4cbefc48d1d224576f268777657a76f4435b9a4de6273389db8017a10a387082 83229 docs/dev/evidence/orin28/render15-5s-boot2-safety-scheduler.log src=git@5da57a2d by=gatefix-grandfather
+3b61b09988015909b8b47876a61d9d8cc619c00211352f498b865a86d52cf34b 778245 docs/dev/evidence/rmbp-0915/flight13/f13-boot1.log src=git@5da57a2d by=gatefix-grandfather
+87570a0735c91c39a77aaae80634fe4955a34fd99d848dfbac4efe77e7e7a956 1560440 docs/dev/evidence/rmbp-0915/flight14/f14-boot1.log src=git@5da57a2d by=gatefix-grandfather
+417ff01b5d083636a57ca948f4fdadc4379e989ba99dd1e60183eb7c2c7608aa 4281748 docs/dev/evidence/rmbp-0915/flight15/f15-boots.log src=git@5da57a2d by=gatefix-grandfather
+df7be2f0875e15060fa7c7d4466d1d787f22f320839c80b8b856b66e24320d60 1438587 docs/dev/evidence/rmbp-0915/flight17/f17-boot1.log src=git@5da57a2d by=gatefix-grandfather
+9c525de444182eea2caacda04ef24b59c8638530107c9d641bd25b5b8d211bb7 4225769 docs/dev/evidence/rmbp-0915/flight18/f18-boot1.log src=git@5da57a2d by=gatefix-grandfather
+a50b915284d87cc7ef1abfcdc01b5001cc68f4395b5aeb61826e6df73b5f2441 4986815 docs/dev/evidence/rmbp-0915/flight19/f19-boots.log src=git@5da57a2d by=gatefix-grandfather
+a067a5aa983ee93b371bb8f0d77e36068d459ac34b4417d51fbc0e852c6d0ad4 2004244 docs/dev/evidence/rmbp-0915/flight20/f20-boots.log src=git@5da57a2d by=gatefix-grandfather
+6d04a38e394f45eefd857152cdeffea22c86dc015e862ba655c3029dff7fcb24 659436 docs/dev/evidence/rmbp-0915/flight21/f21-boots.log src=git@5da57a2d by=gatefix-grandfather
+2049ab22a08d8be9e22b7a12e9bb96777a00c8192dc47740279396d8bcb16ddf 2641872 docs/dev/evidence/rmbp-0915/flight22/f22-boots.log src=git@5da57a2d by=gatefix-grandfather
+a628cbab252277e34741d0c80d564a00115e7f7a43092467a2b92fa55eac997d 1697971 docs/dev/evidence/rmbp-0915/flight23/f23-boots.log src=git@5da57a2d by=gatefix-grandfather
+4bdda3d3951a5600bbad8696cc97a4e16dcd2fbb5bac9e57aff6368e8c3c4edd 1736825 docs/dev/evidence/rmbp-0915/flight24/f24-boots.log src=git@5da57a2d by=gatefix-grandfather
+b43f32b1e55cb964026b35a2877c056e18dca69b121bbde3f9e4738d4eaa6b49 565655 docs/dev/evidence/rmbp-0915/flight25/f25-boots.log src=git@5da57a2d by=gatefix-grandfather
+600c08b14442263b986f513f9c4d08d9b8325ee39a7ba53fff4f18437e32db19 1308234 docs/dev/evidence/rmbp-0929/flight16/f16-boot.log src=git@5da57a2d by=gatefix-grandfather
+888705bc5e0d13f3ce2e2515ac2ebdb6dcfaac93b22a963516b3b9d35059065a 65944 docs/dev/evidence/rmbp-0915/flight26/f26-boot.log src=git@bc5efac2 by=seat-fold-from-hw-rmbp
+2044221162536a6a43e1d07130c42feb572eb9a806746a1d1f95d62e08b58897 246716 docs/dev/evidence/rmbp-0915/flight26/f26-boot2.log src=git@bc5efac2 by=seat-fold-from-hw-rmbp
+0483ad4416954369e7fd84183a256ca399e65226a9af6f9df1ba03a64340dc72 508207 docs/dev/evidence/rmbp-0915/flight26/f26-boot3.log src=git@bc5efac2 by=seat-fold-from-hw-rmbp

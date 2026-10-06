@@ -1,38 +1,32 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! CHARTER: Matrix — owed B288 (R50 rules Quarry the Finder, not the Trash; handlers/matrix/src/trash.rs is the twin — ARCHREVIEW F2)
+//! CHARTER: Matrix — shared-core (TRASHCORE B449: trash_core is the one Trash; handlers/matrix/src/trash.rs is its other I/O)
 //!
 //! TRASH (R75) — a desktop Trash. `/home/<user>/.Trash/` is created on first use through the mount
 //! table under the user's namespace (DIRNS); `trash` MOVES an entry there with the same `rename`
-//! the shell's `mv` uses (LFNMV2; a collision appends `~1`, `~2`). Quarry's menu and the shell's
-//! `trash` verb call these same bodies.
+//! the shell's `mv` uses (LFNMV2). Quarry's menu, the Dock's Trash tile (DOCK2), the Trash query
+//! folder (QUERYFOLDER) and the shell's `trash` verb call these same bodies.
 //!
-//! TRASHTIME (B308, audit B288/B294): WHAT a trashed object is depends on the volume, chosen in ONE
-//! function, [`store`]:
-//! * **attrs** — a volume with object ids (UnaFS): the object itself carries `una:trash-origin`
-//!   (the original absolute path), `una:trash-time` (unix seconds, Int) and `una:trash-by` (the
-//!   session user), key literals from `una-abi` (Matrix's host Finder stamps the same ones). The
-//!   rename into `.Trash/` is a rekey, so the inode id survives; the listing is
-//!   `query("una:trash-origin != \"\"")` scoped to the Trash's direct children; restore moves the
-//!   id's CURRENT path back (a renamed trashed item still restores); empty drops the keys with the
-//!   unlink. No index file is written.
-//! * **index** — the FAT FALLBACK (no attributes): `.Trash/.index`, one
-//!   `original-path<TAB>trashed-name<TAB>unix-time` line per item (appended on trash, rewritten on
-//!   restore/empty).
+//! TRASHCORE (B449, ARCHREVIEW F5, R79): every Trash RULE lives in `trash_core`
+//! (`unaos/libs/fs/trash_core`), the `no_std` core Matrix's `VaultTrash` links too — what a trashed
+//! object is (TRASHTIME B308: `una:trash-origin`/`una:trash-time`/`una:trash-by` on a volume with
+//! object ids, found by `TRASH_QUERY` scoped to the Trash, restored by id; the FAT `.Trash/.index`
+//! fallback), the store choice, refusals, collision names (TESTFIX3's 8.3 form), restore and empty.
+//! This file is only the core's I/O over the [`MountTable`] ([`Mt`]), the session user, the clock,
+//! the shell verb and the `tests trash` fixture.
 //!
-//! Each op prints `[trash] store=attrs|index op=trash|restore|empty path= ok= reason=`.
+//! Each op prints `[trash] store=attrs|index op=trash|restore|empty path= ok= reason= core=trash_core`.
 
 use crate::fs::vfs::{AttrValue, MountTable, NodeKind, KERNEL_PRINCIPAL};
 use alloc::string::String;
 use alloc::vec::Vec;
-use una_abi::{ATTR_KEY_TRASH_BY, ATTR_KEY_TRASH_ORIGIN, ATTR_KEY_TRASH_TIME, TRASH_DIR_NAME, TRASH_QUERY};
+use trash_core::{Attr, Ctx, Node, TrashFs, ATTR_KEY_TRASH_ORIGIN, INDEX, TRASH_QUERY};
+pub use trash_core::{Entry, Store};
 
 const P: &str = KERNEL_PRINCIPAL;
-const INDEX: &str = ".index";
-const DIRNAME: &str = TRASH_DIR_NAME;
+/// The kernel stack bounds how deep `empty` descends.
 const MAX_TREE_DEPTH: usize = 6;
-const KEYS: [&str; 3] = [ATTR_KEY_TRASH_ORIGIN, ATTR_KEY_TRASH_TIME, ATTR_KEY_TRASH_BY];
 
 fn mt() -> MountTable {
     crate::shell::vfs_mount_table()
@@ -63,153 +57,129 @@ pub fn home_base() -> String {
 
 /// The Trash folder path.
 pub fn trash_dir() -> String {
-    alloc::format!("{}/{}", home_base(), DIRNAME)
+    trash_core::trash_dir(&home_base())
 }
 
 fn index_path() -> String {
-    alloc::format!("{}/{}", trash_dir(), INDEX)
+    trash_core::join(&trash_dir(), INDEX)
 }
 
-fn join(d: &str, n: &str) -> String {
-    if d.ends_with('/') { alloc::format!("{}{}", d, n) } else { alloc::format!("{}/{}", d, n) }
-}
+use trash_core::{join, leaf, parent};
 
-fn leaf(p: &str) -> &str {
-    p.rsplit('/').next().unwrap_or(p)
-}
+/// `trash_core`'s I/O seam over the kernel mount table (FAT and UnaFS homes alike).
+pub struct Mt(pub MountTable);
 
-fn parent(p: &str) -> &str {
-    match p.rfind('/') {
-        Some(0) => "/",
-        Some(i) => &p[..i],
-        None => "/",
+impl Mt {
+    fn read_all(&self, p: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut off = 0u64;
+        while let Ok(c) = self.0.read(p, off, 16 * 1024) {
+            if c.is_empty() {
+                break;
+            }
+            off += c.len() as u64;
+            out.extend_from_slice(&c);
+        }
+        out
     }
 }
 
-fn starts_ci(path: &str, prefix: &str) -> bool {
-    path.len() >= prefix.len()
-        && path.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-        && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
-}
-
-/// Where a trashed object's record lives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Store {
-    /// On the object: `una:trash-*` attributes (a volume with object ids — UnaFS).
-    Attrs,
-    /// The FAT fallback: `.Trash/.index`.
-    Index,
-}
-
-impl Store {
-    pub fn name(self) -> &'static str {
-        match self {
-            Store::Attrs => "attrs",
-            Store::Index => "index",
+impl TrashFs for Mt {
+    fn stat(&mut self, path: &str) -> Option<Node> {
+        self.0.stat(path).ok().map(|st| Node { dir: matches!(st.kind, NodeKind::Dir), id: st.id })
+    }
+    fn mkdir(&mut self, path: &str) -> Result<(), String> {
+        self.0.create(path, NodeKind::Dir, P).map(|_| ()).map_err(err_s)
+    }
+    fn rename(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        let before = crate::fs::fat::sector_write_count();
+        let r = self.0.rename(src, dst, P);
+        if crate::fs::fat::is_long_name(leaf(dst)) {
+            serial_println!("[fs] mv {} -> {} lfn=1 ok={} sectors_written={}", src, dst, r.is_ok(), crate::fs::fat::sector_write_count().wrapping_sub(before));
+        }
+        r.map_err(err_s)
+    }
+    fn set_attr(&mut self, path: &str, key: &str, v: Attr) -> Result<(), String> {
+        let v = match v {
+            Attr::Str(s) => AttrValue::Str(s),
+            Attr::Int(i) => AttrValue::Int(i),
+        };
+        self.0.set_attr(path, key, v, P).map_err(err_s)
+    }
+    fn get_attr(&mut self, path: &str, key: &str) -> Option<Attr> {
+        match self.0.get_attr(path, key, P) {
+            Ok(AttrValue::Str(s)) => Some(Attr::Str(s)),
+            Ok(AttrValue::Int(i)) => Some(Attr::Int(i)),
+            _ => None,
         }
     }
-}
-
-/// THE one choice (TRASHTIME): attributes where the home volume gives objects an identity, else the
-/// `.index` fallback.
-pub fn store() -> Store {
-    match mt().stat(&home_base()) {
-        Ok(st) if st.id.is_some() => Store::Attrs,
-        _ => Store::Index,
+    fn remove_attr(&mut self, path: &str, key: &str) {
+        let _ = self.0.remove_attr(path, key, P);
+    }
+    fn query(&mut self, q: &str) -> Vec<(u64, String)> {
+        self.0.query(q, P).unwrap_or_default()
+    }
+    fn list(&mut self, dir: &str) -> Result<Vec<String>, String> {
+        Ok(self.0.read_dir(dir).map_err(err_s)?.into_iter().map(|e| e.name).collect())
+    }
+    fn unlink(&mut self, path: &str) -> Result<(), String> {
+        self.0.unlink(path, P).map_err(err_s)
+    }
+    fn rmdir(&mut self, path: &str) -> Result<(), String> {
+        self.0.remove_dir(path, P).map_err(err_s)
+    }
+    fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
+        self.0.stat(path).ok()?;
+        Some(self.read_all(path))
+    }
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        if self.0.stat(path).is_ok() {
+            self.0.unlink(path, P).map_err(err_s)?;
+        }
+        self.0.create(path, NodeKind::File, P).map_err(err_s)?;
+        if !bytes.is_empty() {
+            self.0.write(path, 0, bytes, P).map_err(err_s)?;
+        }
+        Ok(())
+    }
+    fn append_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let off = match self.0.stat(path) {
+            Ok(st) => st.size,
+            Err(_) => {
+                self.0.create(path, NodeKind::File, P).map_err(err_s)?;
+                0
+            }
+        };
+        self.0.write(path, off, bytes, P).map(|_| ()).map_err(err_s)
+    }
+    fn case_insensitive(&self) -> bool {
+        true // FAT homes fold case; the kernel has always compared Trash names without it
+    }
+    fn short_names(&self, leaf: &str) -> bool {
+        !crate::fs::fat::is_long_name(leaf) // TESTFIX3: keep a collision name 8.3 when the leaf is
+    }
+    fn max_depth(&self) -> usize {
+        MAX_TREE_DEPTH
     }
 }
 
-/// One trashed item.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entry {
-    pub orig: String,
-    pub name: String,
-    pub when: u64,
-    /// The object's inode id on an attribute store (`None` on the index fallback).
-    pub id: Option<u64>,
+/// THE one choice (TRASHTIME, now `trash_core::store`): attributes where the home volume gives
+/// objects an identity, else the `.index` fallback.
+pub fn store() -> Store {
+    trash_core::store(&mut Mt(mt()), &home_base())
 }
 
 fn log(op: &str, path: &str, r: &Result<(), String>) {
     let s = store().name();
     match r {
-        Ok(()) => serial_println!("[trash] store={} op={} path={} ok=1 reason=-", s, op, path),
-        Err(e) => serial_println!("[trash] store={} op={} path={} ok=0 reason={}", s, op, path, e),
+        Ok(()) => serial_println!("[trash] store={} op={} path={} ok=1 reason=- core=trash_core", s, op, path),
+        Err(e) => serial_println!("[trash] store={} op={} path={} ok=0 reason={} core=trash_core", s, op, path, e),
     }
-}
-
-/// Create `.Trash` on first use.
-fn ensure_dir(t: &MountTable) -> Result<(), String> {
-    let d = trash_dir();
-    match t.stat(&d) {
-        Ok(st) if matches!(st.kind, NodeKind::Dir) => Ok(()),
-        Ok(_) => Err(String::from(".Trash is a file")),
-        Err(_) => {
-            let h = home_base();
-            if t.stat(&h).is_err() {
-                let _ = t.create(&h, NodeKind::Dir, P);
-            }
-            t.create(&d, NodeKind::Dir, P).map(|_| ()).map_err(err_s)
-        }
-    }
-}
-
-fn read_all(t: &MountTable, p: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut off = 0u64;
-    while let Ok(c) = t.read(p, off, 16 * 1024) {
-        if c.is_empty() {
-            break;
-        }
-        off += c.len() as u64;
-        out.extend_from_slice(&c);
-    }
-    out
-}
-
-fn parse(text: &str) -> Vec<Entry> {
-    let mut v = Vec::new();
-    for l in text.lines() {
-        let mut it = l.split('\t');
-        if let (Some(o), Some(n), Some(w)) = (it.next(), it.next(), it.next()) {
-            if !o.is_empty() && !n.is_empty() {
-                v.push(Entry { orig: String::from(o), name: String::from(n), when: w.trim().parse().unwrap_or(0), id: None });
-            }
-        }
-    }
-    v
-}
-
-/// The attribute store's listing: the query, scoped to the direct children of this user's Trash.
-fn attr_entries(t: &MountTable) -> Vec<Entry> {
-    let td = trash_dir();
-    let mut v = Vec::new();
-    for (id, path) in t.query(TRASH_QUERY, P).unwrap_or_default() {
-        if !parent(&path).eq_ignore_ascii_case(&td) {
-            continue; // another user's Trash, or a stamped object moved out by hand
-        }
-        let orig = match t.get_attr(&path, ATTR_KEY_TRASH_ORIGIN, P) {
-            Ok(AttrValue::Str(s)) => s,
-            _ => continue,
-        };
-        let when = match t.get_attr(&path, ATTR_KEY_TRASH_TIME, P) {
-            Ok(AttrValue::Int(i)) if i > 0 => i as u64,
-            _ => 0,
-        };
-        v.push(Entry { orig, name: String::from(leaf(&path)), when, id: Some(id) });
-    }
-    v
 }
 
 /// What the Trash holds. Empty when there is nothing.
 pub fn entries() -> Vec<Entry> {
-    let t = mt();
-    match store() {
-        Store::Attrs => attr_entries(&t),
-        Store::Index => {
-            let b = read_all(&t, &index_path());
-            parse(core::str::from_utf8(&b).unwrap_or(""))
-        }
-    }
+    trash_core::entries(&mut Mt(mt()), &home_base())
 }
 
 /// How many items the Trash holds.
@@ -217,210 +187,29 @@ pub fn count() -> usize {
     entries().len()
 }
 
-fn write_index(t: &MountTable, es: &[Entry]) -> Result<(), String> {
-    let ip = index_path();
-    if t.stat(&ip).is_ok() {
-        t.unlink(&ip, P).map_err(err_s)?;
-    }
-    t.create(&ip, NodeKind::File, P).map_err(err_s)?;
-    let mut s = String::new();
-    for e in es {
-        s.push_str(&alloc::format!("{}\t{}\t{}\n", e.orig, e.name, e.when));
-    }
-    if !s.is_empty() {
-        t.write(&ip, 0, s.as_bytes(), P).map_err(err_s)?;
-    }
-    Ok(())
-}
-
-fn append_index(t: &MountTable, e: &Entry) -> Result<(), String> {
-    let ip = index_path();
-    let off = match t.stat(&ip) {
-        Ok(st) => st.size,
-        Err(_) => {
-            t.create(&ip, NodeKind::File, P).map_err(err_s)?;
-            0
-        }
-    };
-    let line = alloc::format!("{}\t{}\t{}\n", e.orig, e.name, e.when);
-    t.write(&ip, off, line.as_bytes(), P).map(|_| ()).map_err(err_s)
-}
-
-fn move_logged(t: &MountTable, src: &str, dst: &str) -> Result<(), String> {
-    let before = crate::fs::fat::sector_write_count();
-    let r = t.rename(src, dst, P);
-    if crate::fs::fat::is_long_name(leaf(dst)) {
-        serial_println!("[fs] mv {} -> {} lfn=1 ok={} sectors_written={}", src, dst, r.is_ok(), crate::fs::fat::sector_write_count().wrapping_sub(before));
-    }
-    r.map_err(err_s)
-}
-
-/// Drop the three trash keys from the object at `path` (absent keys are not an error).
-fn strip_keys(t: &MountTable, path: &str) {
-    for k in KEYS {
-        let _ = t.remove_attr(path, k, P);
-    }
-}
-
-/// Stamp the three trash keys on the object at `path`.
-fn stamp_keys(t: &MountTable, path: &str, when: u64) -> Result<(), String> {
-    let by = session_user().unwrap_or_else(|| String::from(KERNEL_PRINCIPAL));
-    t.set_attr(path, ATTR_KEY_TRASH_ORIGIN, AttrValue::Str(String::from(path)), P).map_err(err_s)?;
-    t.set_attr(path, ATTR_KEY_TRASH_TIME, AttrValue::Int(when as i64), P).map_err(err_s)?;
-    t.set_attr(path, ATTR_KEY_TRASH_BY, AttrValue::Str(by), P).map_err(err_s)
-}
-
 /// Move `path` into the Trash. Returns the trashed name.
 pub fn trash(path: &str) -> Result<String, String> {
-    let r = trash_inner(path);
-    log("trash", path, &r.clone().map(|_| ()));
+    let home = home_base();
+    let user = session_user().unwrap_or_else(|| String::from(KERNEL_PRINCIPAL));
+    let cx = Ctx { home: &home, user: &user, now: crate::clock::unix_now().unwrap_or(0) };
+    let r = trash_core::trash(&mut Mt(mt()), &cx, path);
+    log("trash", path, &r.clone().map(|_| ())); TRASH_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // HIDSTALL (B485): the Dock reads the Trash on this change, not on a clock
     r
-}
-
-fn trash_inner(path: &str) -> Result<String, String> {
-    let base = home_base();
-    if path.split('/').any(|c| c == "..") {
-        return Err(String::from("a path with .. leaves the home folder"));
-    }
-    if !starts_ci(path, &base) {
-        return Err(alloc::format!("files are trashed only under {}", base));
-    }
-    if path.len() == base.len() {
-        return Err(String::from("the home folder itself cannot be trashed"));
-    }
-    let td = trash_dir();
-    if starts_ci(path, &td) {
-        return Err(String::from("already in the trash"));
-    }
-    if leaf(path).contains('\t') || leaf(path).contains('\n') {
-        return Err(String::from("bad-name"));
-    }
-    let t = mt();
-    t.stat(path).map_err(err_s)?;
-    ensure_dir(&t)?;
-    let mut name = String::from(leaf(path));
-    let mut n = 0u32;
-    while t.stat(&join(&td, &name)).is_ok() {
-        n += 1;
-        if n > 99 {
-            return Err(String::from("too-many-collisions"));
-        }
-        name = collision_name(leaf(path), n); // TESTFIX3: 8.3-safe on FAT (see collision_name)
-    }
-    let when = crate::clock::unix_now().unwrap_or(0);
-    let dst = join(&td, &name);
-    match store() {
-        Store::Attrs => {
-            // The record goes ON the object first, then the rekeying rename: a failure between the
-            // two leaves a stamped object outside the Trash, which the scoped query ignores and the
-            // strip below removes.
-            if let Err(why) = stamp_keys(&t, path, when) {
-                strip_keys(&t, path);
-                return Err(alloc::format!("attrs: {}", why));
-            }
-            if let Err(why) = move_logged(&t, path, &dst) {
-                strip_keys(&t, path);
-                return Err(why);
-            }
-        }
-        Store::Index => {
-            move_logged(&t, path, &dst)?;
-            let e = Entry { orig: String::from(path), name: name.clone(), when, id: None };
-            if let Err(why) = append_index(&t, &e) {
-                let _ = move_logged(&t, &dst, path); // never leave an unindexed item
-                return Err(alloc::format!("index: {}", why));
-            }
-        }
-    }
-    Ok(name)
 }
 
 /// Move the trashed `name` back to its original path.
 pub fn restore(name: &str) -> Result<String, String> {
-    let r = restore_inner(name);
-    log("restore", name, &r.clone().map(|_| ()));
+    let r = trash_core::restore(&mut Mt(mt()), &home_base(), name);
+    log("restore", name, &r.clone().map(|_| ())); TRASH_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // HIDSTALL (B485): the Dock reads the Trash on this change, not on a clock
     r
-}
-
-fn restore_inner(name: &str) -> Result<String, String> {
-    let t = mt();
-    let mut es = entries();
-    let i = es.iter().position(|e| e.name.eq_ignore_ascii_case(name)).ok_or_else(|| String::from("not-in-trash"))?;
-    let orig = es[i].orig.clone();
-    let pd = parent(&orig);
-    match t.stat(pd) {
-        Ok(st) if matches!(st.kind, NodeKind::Dir) => {}
-        _ => return Err(alloc::format!("the original folder {} is gone", pd)),
-    }
-    if t.stat(&orig).is_ok() {
-        return Err(alloc::format!("{} already exists", orig));
-    }
-    match es[i].id {
-        Some(id) => {
-            // The id's CURRENT path, from the query that just named it (renamed items included).
-            let cur = join(&trash_dir(), &es[i].name);
-            if t.stat(&cur).ok().and_then(|s| s.id) != Some(id) {
-                return Err(String::from("trashed object moved"));
-            }
-            move_logged(&t, &cur, &orig)?;
-            strip_keys(&t, &orig);
-        }
-        None => {
-            move_logged(&t, &join(&trash_dir(), &es[i].name), &orig)?;
-            es.remove(i);
-            write_index(&t, &es)?;
-        }
-    }
-    Ok(orig)
-}
-
-fn delete_tree(t: &MountTable, path: &str, depth: usize) -> Result<(), String> {
-    let st = t.stat(path).map_err(err_s)?;
-    if matches!(st.kind, NodeKind::File) {
-        return t.unlink(path, P).map_err(err_s);
-    }
-    if depth > MAX_TREE_DEPTH {
-        return Err(String::from("too-deep"));
-    }
-    for e in t.read_dir(path).map_err(err_s)? {
-        if e.name == "." || e.name == ".." {
-            continue;
-        }
-        delete_tree(t, &join(path, &e.name), depth + 1)?;
-    }
-    t.remove_dir(path, P).map_err(err_s)
 }
 
 /// Unlink everything in the Trash. Returns how many items were emptied.
 pub fn empty() -> Result<usize, String> {
     let td = trash_dir();
-    let r = empty_inner(&td);
-    log("empty", &td, &r.clone().map(|_| ()));
+    let r = trash_core::empty(&mut Mt(mt()), &home_base());
+    log("empty", &td, &r.clone().map(|_| ())); TRASH_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // HIDSTALL (B485): the Dock reads the Trash on this change, not on a clock
     r
-}
-
-fn empty_inner(td: &str) -> Result<usize, String> {
-    let t = mt();
-    if t.stat(td).is_err() {
-        return Ok(0);
-    }
-    let s = store();
-    let mut n = 0usize;
-    for e in t.read_dir(td).map_err(err_s)? {
-        if e.name == "." || e.name == ".." || e.name.eq_ignore_ascii_case(INDEX) {
-            continue;
-        }
-        let p = join(td, &e.name);
-        if s == Store::Attrs {
-            strip_keys(&t, &p); // the keys leave the attribute index with the object
-        }
-        delete_tree(&t, &p, 0)?;
-        n += 1;
-    }
-    if s == Store::Index {
-        write_index(&t, &[])?;
-    }
-    Ok(n)
 }
 
 /// The shell verb: `trash <path>` · `trash list` · `trash restore <name>` · `trash empty`.
@@ -555,21 +344,20 @@ pub fn selftest() {
     );
 }
 
-/// TESTFIX3 (FLIGHT 19 `tests trash`): the `n`th collision name for `leaf`. The old `<leaf>~<n>`
-/// (`TRASHFX.TXT~1`) is not an 8.3 name, and FAT's cross-directory `move_entry` refuses a non-8.3
-/// destination (`[fs] mv … lfn=1 ok=false` -> `reason=Unsupported`), so the SECOND trash of a name
-/// failed on the metal's FAT home. When `leaf` is itself 8.3 the suffix goes inside the stem
-/// (`TRASHF~1.TXT`, the stem cut to keep 8 bytes) so the move stays representable; a leaf that is
-/// already long keeps `<leaf>~<n>` (the volume either takes long names or refused the leaf already).
-fn collision_name(leaf: &str, n: u32) -> String {
-    let suffix = alloc::format!("~{}", n);
-    if crate::fs::fat::is_long_name(leaf) {
-        return alloc::format!("{}{}", leaf, suffix);
+// ── HIDSTALL (rmbp-ledger B485): the Trash's change generation ───────────────────────────────────────────────────────
+//
+// Flight 26: the Dock re-read the Trash every 2 s (`fs::trash::count()`, a query over the volume), and on a UnaFS home
+// every UnaFS transaction is IRQ-masked — 49 ms of no HID pass on the service core every 2 s. The Dock now reads the
+// Trash when this generation moves: bumped by every trash / restore / empty here (Quarry, Facet, the Dock, the shell
+// verb all come through these bodies), and folded with the session's home so a login reads it once.
+
+static TRASH_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The Trash's change generation: the op count in the high half, the session home's FNV-1a in the low half.
+pub fn generation() -> u64 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in home_base().bytes() {
+        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
     }
-    let (stem, ext) = match leaf.find('.') {
-        Some(i) => (&leaf[..i], &leaf[i..]),
-        None => (leaf, ""),
-    };
-    let keep = stem.len().min(8usize.saturating_sub(suffix.len()));
-    alloc::format!("{}{}{}", &stem[..keep], suffix, ext)
+    ((TRASH_GEN.load(core::sync::atomic::Ordering::Relaxed) as u64) << 32) | h as u64
 }

@@ -36,26 +36,35 @@ pub const QUERIES_DIR: &str = "queries";
 /// QUERYFOLDER's saved-query type (`fs/query.rs` UNA_QUERY on exec-rmbp-queryfolder).
 pub const QUERY_TYPE: &str = "application/x-vnd.una-query";
 /// The type attribute key (`fs/filetype.rs` TYPE_KEY).
-pub const TYPE_KEY: &str = "una:type";
+pub const TYPE_KEY: &str = una_abi::attr_keys::TYPE; // SMALLFIX4 item 13
 /// ATTRCOLUMNS' folder view attribute (B402): the folder's chosen columns, comma-separated.
-pub const VIEW_KEY: &str = "una:view";
+pub const VIEW_KEY: &str = una_abi::attr_keys::VIEW; // SMALLFIX4 item 13
 /// The type a record's body carries (it is text).
 pub const RECORD_TYPE: &str = "text/plain";
-/// The saved queries the builder writes: (name, UnaFS query text).
-pub const SAVED_QUERIES: &[(&str, &str)] = &[("Open jobs", "job:status == open")];
+/// The saved queries the builder writes: (name, UnaFS query text). SMALLFIX4 item 13 (ATTRKEYS): the text is
+/// built from the registered key, never a `job:` literal (GATE-ATTRKEYS).
+pub fn saved_queries() -> Vec<(&'static str, String)> {
+    alloc::vec![("Open jobs", format!("{} == open", K_STATUS))]
+}
 
 /// The `job:*` attribute names (typed: `job:seq` is an Int, every other one a String).
-pub const K_KIND: &str = "job:kind";
-pub const K_ID: &str = "job:id";
-pub const K_SEQ: &str = "job:seq";
-pub const K_STATUS: &str = "job:status";
-pub const K_FLIGHT: &str = "job:flight";
-pub const K_LINE: &str = "job:line";
-pub const K_SET_BY: &str = "job:set_by";
-pub const K_REFS: &str = "job:refs";
-pub const K_OWNER: &str = "job:owner";
-pub const K_ARC: &str = "job:arc";
-pub const K_TRACK: &str = "job:track";
+/// SMALLFIX4 item 13 (ATTRKEYS B452): aliases of `una_abi::attr_keys`, the one key registry.
+pub const K_KIND: &str = una_abi::attr_keys::JOB_KIND;
+pub const K_ID: &str = una_abi::attr_keys::JOB_ID;
+pub const K_SEQ: &str = una_abi::attr_keys::JOB_SEQ;
+pub const K_STATUS: &str = una_abi::attr_keys::JOB_STATUS;
+pub const K_FLIGHT: &str = una_abi::attr_keys::JOB_FLIGHT;
+pub const K_LINE: &str = una_abi::attr_keys::JOB_LINE;
+pub const K_SET_BY: &str = una_abi::attr_keys::JOB_SET_BY;
+pub const K_REFS: &str = una_abi::attr_keys::JOB_REFS;
+pub const K_OWNER: &str = una_abi::attr_keys::JOB_OWNER;
+pub const K_ARC: &str = una_abi::attr_keys::JOB_ARC;
+pub const K_TRACK: &str = una_abi::attr_keys::JOB_TRACK;
+/// The `job:` namespace, read off the registry (no literal): the part of a registered key up to its colon.
+pub fn job_ns() -> &'static str {
+    let i = K_KIND.find(':').map(|i| i + 1).unwrap_or(0);
+    &K_KIND[..i]
+}
 /// Every string key a record may carry, in the order a listing prints them.
 pub const STRING_KEYS: &[&str] =
     &[K_KIND, K_ID, K_STATUS, K_FLIGHT, K_LINE, K_SET_BY, K_REFS, K_OWNER, K_ARC, K_TRACK];
@@ -181,7 +190,7 @@ pub fn record_from_volume(attrs: &[(String, String)], seq: i64, body: String) ->
     let kind = Kind::from_word(get(K_KIND))?;
     let mut r = Record::new(kind, get(K_ID), get(K_TRACK), seq, body);
     for (k, v) in attrs {
-        if k != K_KIND && k != K_ID && k != K_TRACK && k.starts_with("job:") {
+        if k != K_KIND && k != K_ID && k != K_TRACK && k.starts_with(job_ns()) {
             r.set(k, v);
         }
     }
@@ -571,7 +580,7 @@ pub fn query_text(q: &str) -> Result<String, String> {
         if k.is_empty() || v.is_empty() || v.contains('"') {
             return Err(format!("'{}' is not key=value", w));
         }
-        let key = if k.starts_with("job:") { k.to_string() } else { format!("job:{}", k.replace('-', "_")) };
+        let key = if k.starts_with(job_ns()) { k.to_string() } else { format!("{}{}", job_ns(), k.replace('-', "_")) };
         terms.push(format!("{} == \"{}\"", key, v));
     }
     if terms.is_empty() {

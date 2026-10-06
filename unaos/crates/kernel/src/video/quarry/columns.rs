@@ -357,9 +357,9 @@ fn listing_mime(mt: &MountTable, path: &str, e: &DirEnt, attrs: bool, sniffs: &m
     String::from(ft::OCTET)
 }
 
-/// Is `cwd` the session user's Trash?
+/// Is `cwd` the session user's Trash? SMALLFIX4 (TRASHCORE fold): the ONE rule, `trash_core::is_trash_folder`.
 pub fn is_trash(cwd: &str) -> bool {
-    cwd.eq_ignore_ascii_case(&crate::fs::trash::trash_dir())
+    trash_core::is_trash_folder(&crate::fs::trash::Mt(crate::shell::vfs_mount_table()), cwd, &crate::fs::trash::home_base())
 }
 
 /// Compute the facts for `list` in directory `cwd`. `origins` = the Trash's `(name, origin)` pairs
@@ -444,7 +444,7 @@ fn resort(m: &mut Model, st: &mut ColState) {
         Some(i) => super::attrcols::sort_rows_by(&mut m.list, &mut st.meta, i, st.desc), // ATTRCOLUMNS (B402)
         None => sort_rows(&mut m.list, &mut st.meta, st.key, st.desc),
     }
-    if let Some(n) = sel {
+    super::livedir::resplice(m, st); if let Some(n) = sel { // QUARRYLIVE (B494): the expanded folders' children, back under their parents after every sort
         if let Some(i) = m.list.iter().position(|e| e.name == n) {
             m.list_sel = i;
         }
@@ -612,7 +612,7 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
         let ink = if sel && m.focus == super::Pane::List { theme::chrome_face() } else { theme::content_text() };
         let dir = matches!(ent.kind, NodeKind::Dir);
         let mut nm: Vec<u8> = Vec::new();
-        nm.extend_from_slice(ent.name.as_bytes());
+        nm.extend_from_slice(super::livedir::leaf_of(&ent.name).as_bytes()); // QUARRYLIVE (B494): an inline row draws its leaf
         // `ls -F`'s two marks: `/` descends, `*` RUNS (see the pre-QUARRY2 painter's note).
         if dir {
             nm.push(crate::fs::rootdisk::mark(&m.cwd, &ent.name)); // ROOTDISK (B390, R94): the root's links draw `@`
@@ -620,9 +620,9 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
             nm.push(b'*');
         }
         nm.truncate(c.name_cols);
-        let nx = text(px, g, c.name_x, y + g.ts, &nm, size_x.min(clip), ink); if dir && crate::fs::bootfat::shows_lock(&m.cwd, &ent.name) { lock_glyph(px, g, nx + g.cell_w() / 2, y + g.ts, size_x.min(clip), ink); } // ROOTDISK2 (R99): the sacred boot volume draws a lock (read-only)
+        let nx0 = super::livedir::mark(px, g, c.name_x, y, row_h, ent, ink); let nx = text(px, g, nx0, y + g.ts, &nm, size_x.min(clip), ink); if dir && crate::fs::bootfat::shows_lock(&m.cwd, &ent.name) { lock_glyph(px, g, nx + g.cell_w() / 2, y + g.ts, size_x.min(clip), ink); } // ROOTDISK2 (R99): the sacred boot volume draws a lock (read-only)
        
-        if !dir && meta.map(|mm| mm.mime == crate::fs::filetype::UNAOS_ELF).unwrap_or(false) { let (ix, sz) = (c.name_x + (nm.len() + 1) * g.cell_w(), row_h.saturating_sub(4)); if ix + sz <= size_x.min(clip) { crate::fs::appres::blit_path_icon(px, g.w, g.h, ix, y + 2, sz, &join(&m.cwd, &ent.name)); } } // APPRES (B398): the program's icon (its own, else the generic one) after its name
+        if !dir && meta.map(|mm| mm.mime == crate::fs::filetype::UNAOS_ELF).unwrap_or(false) { let (ix, sz) = (super::livedir::name_x(g, c.name_x, ent) + (nm.len() + 1) * g.cell_w(), row_h.saturating_sub(4)); if ix + sz <= size_x.min(clip) { crate::fs::appres::blit_path_icon(px, g.w, g.h, ix, y + 2, sz, &join(&m.cwd, &ent.name)); } } // APPRES (B398): the program's icon (its own, else the generic one) after its name
         for (k, &(col, x, w)) in c.cols.iter().enumerate() {
             let cell: Vec<u8> = match col {
                 Col::Size => {

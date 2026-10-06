@@ -487,47 +487,6 @@ pub fn program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
     }
 }
 
-/// PSRC: the OTHER populated program-source handle — the one [`program_source`] did NOT choose.
-///
-/// `None` when there is no second populated handle (the overwhelmingly common case: one disk).
-///
-/// This exists for exactly one caller and one class of read. `wifi::firmware` stages user-supplied
-/// b43 blobs, and those blobs live wherever the OPERATOR put them — which, in the workflow this arc
-/// was written during, is a USB stick carried to a machine whose boot volume is the internal card.
-/// Making the preference above authoritative for that read would mean "to try a firmware blob,
-/// re-flash your boot card", which is a worse OS. The firmware search is READ-ONLY, its whole job is
-/// "find a user-supplied file wherever it is" (it already walks three directories per volume for the
-/// same reason), and none of the hazards the preference closes — `/boot` meaning the wrong volume for
-/// an exec, a write landing on a foreign medium — apply to it.
-///
-/// Nothing else should use this. A caller that means "the volume this system is bound to" wants
-/// [`program_source`], and a caller that means a SPECIFIC disk wants [`lookup`] with a
-/// [`BlockDeviceId`].
-pub fn alternate_program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
-    match program_source()?.1 {
-        BlockHandle::Global => {
-            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-            {
-                sdhc_info().map(|d| (d, BlockHandle::Sdhc))
-            }
-            #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
-            {
-                None
-            }
-        }
-        // `program_source` never returns `Usb` (see its precedence note); mapped for totality.
-        BlockHandle::Usb => None,
-        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-        BlockHandle::Sdhc => info().map(|d| (d, BlockHandle::Global)).or_else(|| usb_info().map(|d| (d, BlockHandle::Usb))), // USBSTOR (B384): a stick is no longer in the global slot when the boot card is the Sdhc handle, so the second volume (the wifi firmware-on-a-stick search) is the USB handle itself.
-        // TEGRA-SDBLK: `program_source` never returns `SdMmc` either — the Orin's program volume is
-        // the boot medium in the global slot, and the microSD is a SEPARATE disk that this arc gives a
-        // read path, not a program-loading precedence (see the census note on `source_census`). Mapped
-        // for totality, exactly as `Usb` is, and it means the same thing: this arm cannot be reached.
-        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::SdMmc => None, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => None, // AHCIBOOT: `program_source` never returns a SATA handle (this arc publishes no program-source rung for it), so this arm is mapped for totality and cannot be reached.
-    }
-}
-
 /// APPLOAD: what [`program_source`] LOOKED AT, for the witness lines that report its `None`.
 ///
 /// The defect this arc fixes was invisible for exactly one reason: the decline line asserted "no

@@ -14,20 +14,16 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! CHARTER: Matrix — kernel-by-ruling R50
+//! CHARTER: Matrix — shared-core
 //!
-//! TRASHTIME M3 (B308): the Trash on a UnaFS vault, the host twin of the kernel's `fs/trash.rs`.
-//!
-//! A trashed object IS an object carrying three attributes, whose key literals live ONCE in
-//! `una-abi` (linked by both rings): `una:trash-origin` (String, the original absolute vault path),
-//! `una:trash-time` (Int, unix seconds) and `una:trash-by` (String, the user). Trashing stamps them
-//! and renames the object into `/home/<user>/.Trash/` (a UnaFS rename is a rekey: same inode id);
-//! the listing is `query("una:trash-origin != \"\"")` scoped to that folder's direct children;
-//! restore finds the trashed name's inode id and moves the id's CURRENT path back to the origin;
-//! empty drops the keys and unlinks. No index file, no second store: the kernel Finder (Quarry) and
-//! this one agree on what a trashed file is because they read the same attributes.
+//! TRASHTIME M3 (B308) + TRASHCORE (B449): the Trash on a UnaFS vault. Every Trash RULE — what a
+//! trashed object is (`una:trash-origin` / `una:trash-time` / `una:trash-by`, literals once in
+//! `una-abi`), the refusals, the collision name, stamp-then-rekey into `/home/<user>/.Trash/`, the
+//! query scoped to that folder, restore by inode id, strip-then-unlink on empty — lives in
+//! `trash_core`, the `no_std` core the kernel's `fs/trash.rs` links too. This file is only the core's
+//! I/O over `UnaFS` ([`Vault`]) and the Finder's [`TrashStore`] verbs.
 
-use una_abi::{ATTR_KEY_TRASH_BY, ATTR_KEY_TRASH_ORIGIN, ATTR_KEY_TRASH_TIME, TRASH_DIR_NAME, TRASH_QUERY};
+use trash_core::{Attr, Ctx, Node, TrashFs};
 use unafs::{AttributeValue, BlockDevice, FileKind, UnaFS};
 
 /// One trashed object, as the query finds it.
@@ -62,22 +58,98 @@ fn e<E: core::fmt::Debug>(x: E) -> String {
     format!("{x:?}")
 }
 
-fn leaf(p: &str) -> &str {
-    p.rsplit('/').next().unwrap_or(p)
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
-fn parent(p: &str) -> &str {
-    match p.rfind('/') {
-        Some(0) | None => "/",
-        Some(i) => &p[..i],
+/// `trash_core`'s I/O seam over a UnaFS vault, by absolute path.
+pub struct Vault<'a, D: BlockDevice>(pub &'a mut UnaFS<D>);
+
+impl<D: BlockDevice> Vault<'_, D> {
+    fn id(&mut self, path: &str) -> Result<u64, String> {
+        self.0.resolve_path(path).map_err(e)
+    }
+    fn at(&mut self, path: &str) -> Result<(u64, String), String> {
+        Ok((self.id(trash_core::parent(path))?, trash_core::leaf(path).to_string()))
     }
 }
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+impl<D: BlockDevice> TrashFs for Vault<'_, D> {
+    fn stat(&mut self, path: &str) -> Option<Node> {
+        let id = self.0.resolve_path(path).ok()?;
+        let dir = self.0.read_inode(id).ok()?.kind == FileKind::Directory;
+        Some(Node { dir, id: Some(id) })
+    }
+    fn mkdir(&mut self, path: &str) -> Result<(), String> {
+        let (pid, n) = self.at(path)?;
+        self.0.mkdir(pid, n).map(|_| ()).map_err(e)
+    }
+    fn rename(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        let (sp, sn) = self.at(src)?;
+        let (dp, dn) = self.at(dst)?;
+        self.0.rename(sp, &sn, dp, &dn).map(|_| ()).map_err(e)
+    }
+    fn set_attr(&mut self, path: &str, key: &str, v: Attr) -> Result<(), String> {
+        let id = self.id(path)?;
+        let v = match v {
+            Attr::Str(s) => AttributeValue::String(s),
+            Attr::Int(i) => AttributeValue::Int(i),
+        };
+        self.0.set_attribute(id, key.into(), v).map(|_| ()).map_err(e)
+    }
+    fn get_attr(&mut self, path: &str, key: &str) -> Option<Attr> {
+        let id = self.0.resolve_path(path).ok()?;
+        match self.0.get_attribute(id, key) {
+            Ok(Some(AttributeValue::String(s))) => Some(Attr::Str(s)),
+            Ok(Some(AttributeValue::Int(i))) => Some(Attr::Int(i)),
+            _ => None,
+        }
+    }
+    fn remove_attr(&mut self, path: &str, key: &str) {
+        if let Ok(id) = self.0.resolve_path(path) {
+            let _ = self.0.remove_attribute(id, key);
+        }
+    }
+    fn query(&mut self, q: &str) -> Vec<(u64, String)> {
+        self.0.query(q).map(|v| v.into_iter().map(|h| (h.inode_id, h.path)).collect()).unwrap_or_default()
+    }
+    fn list(&mut self, dir: &str) -> Result<Vec<String>, String> {
+        let id = self.id(dir)?;
+        Ok(self.0.ls(id).map_err(e)?.into_iter().map(|c| c.name).collect())
+    }
+    fn unlink(&mut self, path: &str) -> Result<(), String> {
+        let (pid, n) = self.at(path)?;
+        self.0.unlink(pid, &n).map(|_| ()).map_err(e)
+    }
+    fn rmdir(&mut self, path: &str) -> Result<(), String> {
+        let (pid, n) = self.at(path)?;
+        self.0.rmdir(pid, &n).map(|_| ()).map_err(e)
+    }
+    fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
+        let id = self.0.resolve_path(path).ok()?;
+        let size = self.0.read_inode(id).ok()?.size;
+        self.0.read_data(id, 0, size).ok()
+    }
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        if self.0.resolve_path(path).is_ok() {
+            self.unlink(path)?;
+        }
+        self.append_file(path, bytes)
+    }
+    fn append_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let id = match self.0.resolve_path(path) {
+            Ok(id) => id,
+            Err(_) => {
+                let (pid, n) = self.at(path)?;
+                self.0.create_file(pid, n).map_err(e)?
+            }
+        };
+        let off = self.0.read_inode(id).map_err(e)?.size;
+        self.0.write_data(id, off, bytes).map_err(e)
+    }
 }
 
 impl<D: BlockDevice> VaultTrash<D> {
@@ -95,137 +167,40 @@ impl<D: BlockDevice> VaultTrash<D> {
     }
 
     pub fn trash_dir(&self) -> String {
-        format!("{}/{}", self.home(), TRASH_DIR_NAME)
-    }
-
-    fn ensure_dir(&mut self, path: &str) -> Result<u64, String> {
-        if let Ok(id) = self.fs.resolve_path(path) {
-            return Ok(id);
-        }
-        let pid = self.ensure_dir(parent(path))?;
-        self.fs.mkdir(pid, leaf(path).to_string()).map_err(e)
-    }
-
-    fn str_attr(&mut self, id: u64, key: &str) -> String {
-        match self.fs.get_attribute(id, key) {
-            Ok(Some(AttributeValue::String(s))) => s,
-            _ => String::new(),
-        }
-    }
-
-    fn strip(&mut self, id: u64) {
-        for k in [ATTR_KEY_TRASH_ORIGIN, ATTR_KEY_TRASH_TIME, ATTR_KEY_TRASH_BY] {
-            let _ = self.fs.remove_attribute(id, k);
-        }
-    }
-
-    fn remove_tree(&mut self, path: &str, depth: usize) -> Result<(), String> {
-        if depth > 32 {
-            return Err("too-deep".into());
-        }
-        let id = self.fs.resolve_path(path).map_err(e)?;
-        let pid = self.fs.resolve_path(parent(path)).map_err(e)?;
-        if self.fs.read_inode(id).map_err(e)?.kind == FileKind::Directory {
-            for c in self.fs.ls(id).map_err(e)? {
-                if c.name == "." || c.name == ".." {
-                    continue;
-                }
-                self.remove_tree(&format!("{path}/{}", c.name), depth + 1)?;
-            }
-            self.fs.rmdir(pid, leaf(path)).map(|_| ()).map_err(e)
-        } else {
-            self.fs.unlink(pid, leaf(path)).map(|_| ()).map_err(e)
-        }
+        trash_core::trash_dir(&self.home())
     }
 }
 
 impl<D: BlockDevice + Send> TrashStore for VaultTrash<D> {
     fn trash(&mut self, path: &str) -> Result<String, String> {
         let home = self.home();
-        let td = self.trash_dir();
-        if path.split('/').any(|c| c == "..") || !path.starts_with(&format!("{home}/")) {
-            return Err(format!("files are trashed only under {home}"));
-        }
-        if path == td || path.starts_with(&format!("{td}/")) {
-            return Err("already in the trash".into());
-        }
-        let id = self.fs.resolve_path(path).map_err(|_| format!("no such path: {path}"))?;
-        let tid = self.ensure_dir(&td)?;
-        let mut name = leaf(path).to_string();
-        let mut n = 0u32;
-        while self.fs.resolve_path(&format!("{td}/{name}")).is_ok() {
-            n += 1;
-            if n > 99 {
-                return Err("too-many-collisions".into());
-            }
-            name = format!("{}~{n}", leaf(path));
-        }
-        self.fs.set_attribute(id, ATTR_KEY_TRASH_ORIGIN.into(), AttributeValue::String(path.into())).map_err(e)?;
-        self.fs.set_attribute(id, ATTR_KEY_TRASH_TIME.into(), AttributeValue::Int(now_secs())).map_err(e)?;
-        self.fs.set_attribute(id, ATTR_KEY_TRASH_BY.into(), AttributeValue::String(self.user.clone())).map_err(e)?;
-        let pid = self.fs.resolve_path(parent(path)).map_err(e)?;
-        if let Err(why) = self.fs.rename(pid, leaf(path), tid, &name) {
-            self.strip(id); // never leave a stamped object outside the Trash
-            return Err(e(why));
-        }
-        Ok(name)
+        let cx = Ctx { home: &home, user: &self.user, now: now_secs() };
+        trash_core::trash(&mut Vault(&mut self.fs), &cx, path)
     }
 
     fn items(&mut self) -> Result<Vec<TrashItem>, String> {
-        let td = self.trash_dir();
-        let mut out = Vec::new();
-        for h in self.fs.query(TRASH_QUERY).map_err(e)? {
-            if parent(&h.path) != td {
-                continue; // another user's Trash, or a stamped object that was moved out
-            }
-            let when = match self.fs.get_attribute(h.inode_id, ATTR_KEY_TRASH_TIME) {
-                Ok(Some(AttributeValue::Int(i))) => i,
-                _ => 0,
-            };
-            let origin = self.str_attr(h.inode_id, ATTR_KEY_TRASH_ORIGIN);
-            let by = self.str_attr(h.inode_id, ATTR_KEY_TRASH_BY);
-            out.push(TrashItem { id: h.inode_id, name: leaf(&h.path).to_string(), origin, when, by });
-        }
-        Ok(out)
+        let home = self.home();
+        Ok(trash_core::entries(&mut Vault(&mut self.fs), &home)
+            .into_iter()
+            .map(|x| TrashItem { id: x.id.unwrap_or(0), name: x.name, origin: x.orig, when: x.when as i64, by: x.by })
+            .collect())
     }
 
     fn restore(&mut self, name: &str) -> Result<String, String> {
-        let it = self.items()?.into_iter().find(|i| i.name == name).ok_or("not-in-trash")?;
-        // The id's CURRENT path (a renamed trashed item still restores).
-        let cur = self.fs.path_of(it.id).map_err(e)?;
-        let pd = parent(&it.origin).to_string();
-        let did = match self.fs.resolve_path(&pd) {
-            Ok(d) if self.fs.read_inode(d).map(|i| i.kind == FileKind::Directory).unwrap_or(false) => d,
-            _ => return Err(format!("the original folder {pd} is gone")),
-        };
-        if self.fs.resolve_path(&it.origin).is_ok() {
-            return Err(format!("{} already exists", it.origin));
-        }
-        let sid = self.fs.resolve_path(parent(&cur)).map_err(e)?;
-        self.fs.rename(sid, leaf(&cur), did, leaf(&it.origin)).map_err(e)?;
-        self.strip(it.id);
-        Ok(it.origin)
+        let home = self.home();
+        trash_core::restore(&mut Vault(&mut self.fs), &home, name)
     }
 
     fn empty(&mut self) -> Result<usize, String> {
-        let td = self.trash_dir();
-        let Ok(tid) = self.fs.resolve_path(&td) else { return Ok(0) };
-        let mut n = 0;
-        for c in self.fs.ls(tid).map_err(e)? {
-            if c.name == "." || c.name == ".." {
-                continue;
-            }
-            self.strip(c.inode_id); // the keys leave the index with the object
-            self.remove_tree(&format!("{td}/{}", c.name), 0)?;
-            n += 1;
-        }
-        Ok(n)
+        let home = self.home();
+        trash_core::empty(&mut Vault(&mut self.fs), &home)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use una_abi::{ATTR_KEY_TRASH_BY, ATTR_KEY_TRASH_ORIGIN, ATTR_KEY_TRASH_TIME, TRASH_QUERY};
     use unafs::MemDevice;
 
     fn vault() -> VaultTrash<MemDevice> {
@@ -240,9 +215,9 @@ mod tests {
 
     #[test]
     fn keys_are_the_kernel_literals() {
-        assert_eq!(ATTR_KEY_TRASH_ORIGIN, "una:trash-origin");
-        assert_eq!(ATTR_KEY_TRASH_TIME, "una:trash-time");
-        assert_eq!(ATTR_KEY_TRASH_BY, "una:trash-by");
+        assert_eq!(ATTR_KEY_TRASH_ORIGIN, una_abi::attr_keys::TRASH_ORIGIN); // ATTRKEYS (B452): the one registry
+        assert_eq!(ATTR_KEY_TRASH_TIME, una_abi::attr_keys::TRASH_TIME);
+        assert_eq!(ATTR_KEY_TRASH_BY, una_abi::attr_keys::TRASH_BY);
     }
 
     #[test]

@@ -1324,7 +1324,7 @@ pub mod battery {
         total_sum: 0,
         total_ms: 0,
     });
-    const PWR_ROLLUP_MS: u64 = 10_000;
+    const PWR_ROLLUP_MS: u64 = crate::drivers::smc::PWR_WINDOW_MS; // SMALLFIX5 (B480) item 5: was 10 s — see `PWR_WINDOW_MS`
 
     const REFRESH_MS: u64 = 1000;
     /// QUIET-HOLD threshold. On the 2012 rMBP's flaky SMC a ONE-SWEEP drop-out is the normal case,
@@ -2045,5 +2045,84 @@ pub mod battery {
             b0av: raw_b2(b"B0AV"),
             b0tf: raw_b2(b"B0TF"),
         }
+    }
+}
+
+/// SMALLFIX5 (rmbp-ledger B480) item 5 — WIREDIET's follow-up: `:: PWR:` was the one PERIODIC line among the six
+/// heavy tags (flight 24: 229 lines, flight 25: 56, every 10 s). The window is now 60 s; a state change (plugged,
+/// unplugged) or a presence drop still flushes at once, and the cumulative `total:` sums are the same samples.
+pub const PWR_WINDOW_MS: u64 = 60_000;
+
+/// BATTLIVE (rmbp-ledger B492, R103 §1) — **the power coming in**: the DC-in keys, for the battery menu's live rows.
+///
+/// The 2012 rMBP carries no `AC-W` (SMC-SCOUT, flight 14: `key AC-W absent`), so adapter power was never read. Its
+/// own key enumeration (flight 14, `SMC-SCOUT: idx …`) carries the DC-in block: `PDTR` (idx 344, DC-in total
+/// power), `ID0R` (idx 196, DC-in current) and `VD0R` (idx 474, DC-in voltage). Decoded from Apple's key
+/// catalogue: `PDTR` sp96 (W = raw/64), `ID0R` sp5a (A = raw/1024), `VD0R` sp4b (V = raw/2048). The driver has no
+/// key-info (0x13) read, so the RAW bytes are returned with the decode and ride the `[battery] live` line until a
+/// flight confirms it. Bounded: three keys, each the same three-attempt budget as the battery sweep, from the
+/// device-service pass only (never a composite), and only while the battery menu is open.
+pub mod adapter {
+    use super::{read_key, SmcError};
+
+    /// One DC-in reading. `mw` is `None` when no key answered or the decode is implausible (over 200 W).
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct DcIn {
+        pub mw: Option<u32>,
+        /// `"PDTR"`, `"ID0R*VD0R"` or `"none"`.
+        pub src: &'static str,
+        pub pdtr: Option<[u8; 2]>,
+        pub id0r: Option<[u8; 2]>,
+        pub vd0r: Option<[u8; 2]>,
+    }
+
+    /// The ceiling a DC-in reading may claim: the 2012 rMBP ships an 85 W MagSafe; 200 W is past any adapter it takes.
+    pub const MAX_MW: u32 = 200_000;
+
+    fn b2(key: &[u8; 4]) -> Option<[u8; 2]> {
+        if super::shape_of(key) == super::SHAPE_ABSENT {
+            return None; // learned absent this boot — not re-asked
+        }
+        for _ in 0..3 {
+            let mut b = [0u8; 2];
+            match read_key(key, &mut b) {
+                Ok(2) => return Some(b),
+                Err(SmcError::Absent) => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Pure decode (the fixture drives it): `PDTR` first, the `ID0R`x`VD0R` product second.
+    pub fn decode(pdtr: Option<[u8; 2]>, id0r: Option<[u8; 2]>, vd0r: Option<[u8; 2]>) -> (Option<u32>, &'static str) {
+        if let Some(p) = pdtr {
+            let raw = i16::from_be_bytes(p) as i64;
+            let mw = raw.max(0) * 1000 / 64;
+            if mw as u32 <= MAX_MW {
+                return (Some(mw as u32), "PDTR");
+            }
+        }
+        if let (Some(i), Some(v)) = (id0r, vd0r) {
+            let ia = i16::from_be_bytes(i) as i64;
+            let vv = i16::from_be_bytes(v) as i64;
+            let mw = (ia.max(0) * vv.max(0) * 1000) / (1024 * 2048);
+            if mw as u32 <= MAX_MW {
+                return (Some(mw as u32), "ID0R*VD0R");
+            }
+        }
+        (None, "none")
+    }
+
+    /// Read the DC-in keys (device-service pass only).
+    pub fn read() -> DcIn {
+        let pdtr = b2(b"PDTR");
+        let (mw, src) = decode(pdtr, None, None);
+        if mw.is_some() {
+            return DcIn { mw, src, pdtr, id0r: None, vd0r: None };
+        }
+        let (id0r, vd0r) = (b2(b"ID0R"), b2(b"VD0R")); // PDTR absent or implausible: the product, cited above
+        let (mw, src) = decode(None, id0r, vd0r);
+        DcIn { mw, src, pdtr, id0r, vd0r }
     }
 }

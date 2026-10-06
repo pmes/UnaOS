@@ -25,6 +25,7 @@
 extern crate alloc;
 
 pub mod clock;
+pub mod drop; // DRAGDROP2 (B470): the ring-3 drop protocol's client (BUS_VERB_DROP_GET)
 pub mod heap;
 pub mod files;
 pub mod holocron;

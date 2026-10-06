@@ -360,18 +360,18 @@ const MAX_STRIP_W: usize = strip::MAX_STRIP_W;
 
 /// The layout cannot ask for a strip the scratch cannot hold. A `const` proof rather than a runtime
 /// clamp, so a future `LABEL_MAX` or `MAX_WINDOWS` raise fails the BUILD. WINDOWCAP (B378, R90): the proof is for the pins + the eleven app windows R90 promises; past that the dock row count is `wincap::dock_rows`, whose `for_panel` refuses (via `strip::frame_centred`) any strip wider than the scratch — so the id space (32) at scale 4 is never asked for.
-#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
-    assert!(2 * PAD() + (super::wincap::DOCK_PINS + 11) * (2 * PAD() + CELL_W()) + ((super::wincap::DOCK_PINS + 11) - 1) * PAD()
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity(ck: &mut super::metrics::Sane) {
+    ck.t(2 * PAD() + (super::wincap::DOCK_PINS + 11) * (2 * PAD() + CELL_W()) + ((super::wincap::DOCK_PINS + 11) - 1) * PAD()
         <= MAX_STRIP_W); // UIMETRICS (B372): ONE-glyph tiles — at a large scale `Layout::for_panel` steps the caption down to fit, so the full-caption worst case (3318 px at 2.5) is no longer the bound; a full table of one-glyph tiles is
     // The caption must fit inside the tile it is centred in, or there is nothing to draw.
-    assert!(CELL_H() <= TILE_H());
+    ck.t(CELL_H() <= TILE_H());
     // The indicator must fit in the padding band below the tile.
-    assert!(IND_D() < PAD());
+    ck.t(IND_D() < PAD());
     // Both of a tile's corners must fit within its own height — the kit asserts this for buttons and
     // a tile IS a button; restated here because the tile is the object being cut.
-    assert!(2 * TILE_R() <= TILE_H());
-    assert!(2 * STRIP_R() <= STRIP_H());
-    assert!(LABEL_MAX <= wm::MAX_TITLE);
+    ck.t(2 * TILE_R() <= TILE_H());
+    ck.t(2 * STRIP_R() <= STRIP_H());
+    const _: () = assert!(LABEL_MAX <= wm::MAX_TITLE);
 }
 
 // ---------------------------------------------------------------------------
@@ -999,7 +999,7 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
             continue;
         }
         // The tile face — the material at the CONTROL gain (see the module header).
-        let base = if r.id == pressed {
+        let base = if r.id == pressed || dnd_app_lit(r.id) {
             theme::button_face_pressed()
         } else {
             theme::button_face()
@@ -3083,7 +3083,7 @@ fn lp_arm(t: usize, owner: u64) {
 pub fn lp_release() { LP_OWNER.store(0, Ordering::Release); }
 /// Poll from the input-drain task: after [`LONGPRESS_MS`] of hold the menu opens. Returns true when it did.
 pub fn lp_service(now_ms: u64) -> bool {
-    dock2_service(now_ms); // DOCK2 (B394): the launch pulse and its bound, auto-hide's reveal
+    dock2_service(now_ms); pin_timeout_service(now_ms); // HIDSTALL (B485): DOCKRELEASE. DOCK2 (B394): the launch pulse and its bound, auto-hide's reveal
     let o = LP_OWNER.load(Ordering::Acquire);
     if o == 0 || now_ms.wrapping_sub(LP_T0.load(Ordering::Relaxed)) < LONGPRESS_MS { return false; }
     LP_OWNER.store(0, Ordering::Release);
@@ -3408,7 +3408,7 @@ fn dp_witness(why: &str) {
     let ok = saved >= 0 && shown == pinned; // WINDOWCAP-2: no full strip — a pin is always in the model
     serial_println!("[dock] dockpin {}", why);
     let (left, minz) = (rows[..n].iter().filter(|r| dock2_group(r) == 0).count(), rows[..n].iter().filter(|r| dock2_group(r) == 1).count());
-    serial_println!(":: DOCKPIN: left={} minimized={} pinned={} running={} loaded={} saved={} -> {} ::", left, minz, pinned, running, DP_LOADED.load(Ordering::Relaxed), saved, if ok { "PASS" } else { "FAIL" });
+    serial_println!(":: DOCKPIN: left={} minimized={} pinned={} running={} loaded={} saved={} -> {} ::", left, minz, pinned, running, DP_LOADED.load(Ordering::Relaxed), saved, if ok { "held" } else { "short" });
 }
 
 /// The service pass (called from `desktop_app_service`, never from a click path): drain an owed load
@@ -3743,8 +3743,8 @@ const MENU_QUIT: usize = 5;
 const LAUNCH_BOUND_MS: u64 = 10_000;
 /// The launch pulse's half period.
 const PULSE_MS: u64 = 300;
-/// The Trash's full/empty state is re-read at most this often (a directory read; service pass only).
-const TRASH_POLL_MS: u64 = 2_000;
+/// HIDSTALL (B485): the generation of the Trash last read (`fs::trash::generation()`; it was a 2 s clock — a masked UnaFS query that held the HID pass 49 ms every 2 s on flight 26).
+static TRASH_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
 
 static TRASH_FULL: AtomicBool = AtomicBool::new(false);
 static TRASH_POLLED: AtomicU64 = AtomicU64::new(0);
@@ -3854,7 +3854,7 @@ impl Layout {
 fn dock2_sig() -> u64 {
     let pend = LAUNCH_APP.load(Ordering::Relaxed) as u64;
     let phase = if pend != 0 { LAUNCH_PHASE.load(Ordering::Relaxed) as u64 & 1 } else { 0 };
-    (position() as u64) | (TRASH_FULL.load(Ordering::Relaxed) as u64) << 2 | phase << 3 | (DND_HOT.load(Ordering::Relaxed) as u64) << 4 | pend << 8 // DRAGDROP (B440): the hovered Trash relights
+    (position() as u64) | (TRASH_FULL.load(Ordering::Relaxed) as u64) << 2 | phase << 3 | (DND_HOT.load(Ordering::Relaxed) as u64) << 4 | pend << 8 | (DND_APP.load(Ordering::Relaxed) & 0xFFFF) << 40 // DRAGDROP (B440): the hovered Trash relights
 }
 
 /// The pin id of the pending launch's tile, or `WIN_NONE`.
@@ -4100,10 +4100,10 @@ fn dock2_service(now: u64) {
 /// Quarry opens, the position/auto-hide save.
 fn dock2_store_service() {
     let now = crate::arch::ms();
-    if now.wrapping_sub(TRASH_POLLED.load(Ordering::Relaxed)) >= TRASH_POLL_MS || TRASH_POLLED.load(Ordering::Relaxed) == 0 {
-        TRASH_POLLED.store(now.max(1), Ordering::Relaxed);
+    let tgen = crate::fs::trash::generation(); let tseen = TRASH_SEEN.load(Ordering::Relaxed); let _ = now;
+    if tgen != tseen { TRASH_SEEN.store(tgen, Ordering::Relaxed); let t0 = crate::arch::ms();
         let full = crate::fs::trash::count() > 0;
-        if TRASH_FULL.swap(full, Ordering::Relaxed) != full { PASS_OWED.store(true, Ordering::Release); }
+        if TRASH_FULL.swap(full, Ordering::Relaxed) != full { PASS_OWED.store(true, Ordering::Release); } serial_println!("[dock] trash state why={} full={} took_ms={} (HIDSTALL: read on a change, never on a clock)", if tseen == u64::MAX { "first" } else { "change" }, full as u8, crate::arch::ms().saturating_sub(t0));
     }
     let reveal = REVEAL_OWED.lock().take();
     let open = if TRASH_OPEN_OWED.swap(false, Ordering::AcqRel) { Some(crate::fs::trash::trash_dir()) } else { reveal };
@@ -4314,7 +4314,7 @@ fn pin_press_defer(r: &wm::DockEntry, x: i32, y: i32) -> bool {
     let Some(i) = (0..DP_PINS.len()).find(|&i| DP_PINS[i].id == r.id) else { return false };
     PIN_X0.store(x, Ordering::Relaxed); PIN_Y0.store(y, Ordering::Relaxed);
     PIN_DRAG.store(false, Ordering::Relaxed);
-    PIN_IX.store(i as u32, Ordering::Release);
+    PIN_T0.store(crate::arch::ms().max(1), Ordering::Relaxed); PIN_IX.store(i as u32, Ordering::Release); // HIDSTALL (B485): the press time the release timeout reads
     crate::video::capture::begin(pin_motion, pin_release);
     serial_println!("[dock] press at ({},{}) app={} -> armed (launches on release)", x, y, DP_PINS[i].name);
     true
@@ -4422,4 +4422,103 @@ pub(crate) fn dnd_drop(path: &str) -> Result<alloc::string::String, alloc::strin
         PASS_OWED.store(true, Ordering::Release);
     }
     r
+}
+
+// ── DRAGDROP2 (rmbp-ledger B470, MACPARITY row 18) — an APP tile as a drop target ─────────────────────────────────
+// A tile names its program (`appres::key_of_title`, the same key its icon is drawn from); the program's resources
+// declare its document types (FILETYPES' registrants); a drag whose every file is of a declared type may drop
+// there, and the drop opens each file with that program (`video::dnd` runs the one dispatch). The hovered tile
+// takes the pressed face.
+
+/// The hovered app tile's row id + 1 (`0` = none).
+static DND_APP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The last answer, so a drag resting on a tile reads the types once: `(tile id, first path, n, answer)`.
+static DND_APP_MEMO: spin::Mutex<Option<(wm::WinId, alloc::string::String, usize, Option<(alloc::string::String, alloc::string::String)>)>> = spin::Mutex::new(None);
+
+fn dnd_app_lit(id: wm::WinId) -> bool {
+    DND_APP.load(Ordering::Relaxed) == id as u64 + 1
+}
+
+/// Does a program declaring `doctypes` take a file of type `mime`? Exact, `type/*`, or `*/*`.
+pub(crate) fn dnd_takes(doctypes: &[alloc::string::String], mime: &str) -> bool {
+    doctypes.iter().any(|d| {
+        let d = d.trim();
+        d == mime || d == "*/*" || (d.ends_with("/*") && mime.len() > d.len() - 1 && mime.as_bytes()[..d.len() - 1].eq_ignore_ascii_case(d[..d.len() - 1].as_bytes()))
+    })
+}
+
+/// The app tile at panel `(x, y)` that takes every one of `paths`: `(tile id, app key, opener)`.
+pub(crate) fn dnd_app_at(x: i32, y: i32, paths: &[alloc::string::String]) -> Option<(wm::WinId, alloc::string::String, alloc::string::String)> {
+    if x < 0 || y < 0 || paths.is_empty() {
+        return None;
+    }
+    let (id, title) = {
+        let mut rows = ModelBuf::take();
+        let (n, l) = router_model(&mut rows)?;
+        let t = l.tile_at(x as usize, y as usize)?;
+        if t >= n || l.is_overflow(t) || rows[t].id == TRASH_PIN_ID {
+            return None;
+        }
+        let r = &rows[t];
+        (r.id, alloc::vec::Vec::from(&r.title[..r.title_len.min(r.title.len())]))
+    };
+    if let Some((mid, mp, mn, ans)) = DND_APP_MEMO.lock().as_ref() {
+        if *mid == id && *mn == paths.len() && *mp == paths[0] {
+            return ans.clone().map(|(k, o)| (id, k, o));
+        }
+    }
+    let ans = (|| {
+        let key = crate::fs::appres::key_of_title(&title)?;
+        let app = crate::fs::appres::app(&key)?;
+        let opener = if app.path.starts_with("builtin:") { key.clone() } else { app.path.clone() };
+        #[cfg(feature = "quarry")] if !crate::video::quarry::live::openers::available(&opener) { return None; }
+        #[cfg(not(feature = "quarry"))] { let _ = &opener; return None; } // no file manager, no opener to hand a drop to
+        let mt = crate::shell::vfs_mount_table();
+        paths.iter().all(|p| dnd_takes(&app.doctypes, &crate::fs::filetype::type_of_in(&mt, p).0)).then_some((key, opener))
+    })();
+    *DND_APP_MEMO.lock() = Some((id, paths[0].clone(), paths.len(), ans.clone()));
+    ans.map(|(k, o)| (id, k, o))
+}
+
+/// The session's hover moved on or off an app tile (`WIN_NONE` = off): relight on the next pass.
+pub(crate) fn dnd_app_hover(tile: wm::WinId) {
+    let v = if tile == wm::WIN_NONE { 0 } else { tile as u64 + 1 };
+    if DND_APP.swap(v, Ordering::AcqRel) != v {
+        PASS_OWED.store(true, Ordering::Release);
+    }
+}
+
+// ── HIDSTALL (rmbp-ledger B485): DOCKRELEASE ─────────────────────────────────────────────────────────────────────────
+//
+// Flight 26: `[dock] press … app=console -> armed (launches on release)` and the release never came (a halted or
+// late pointer button; boot 3's came 3 s later as a drag), so the Dock launched nothing until the power dialog's
+// capture swap delivered a synthetic one. A pin press that has seen neither its release nor travel past
+// `PIN_DRAG_PX` within `hidstall::DOCK_RELEASE_TIMEOUT_MS` is a click: the capture is let go and the launch is taken
+// here, on the service pass (`lp_service`, the same pass that opens the hold menu). A press that has travelled stays
+// a drag and waits for its release. The CAS on `PIN_IX` makes the release and the timeout take the press once.
+
+static PIN_T0: AtomicU64 = AtomicU64::new(0);
+
+fn pin_timeout_service(now: u64) {
+    let i = PIN_IX.load(Ordering::Acquire);
+    if i == u32::MAX || PIN_DRAG.load(Ordering::Relaxed) {
+        return;
+    }
+    let t0 = PIN_T0.load(Ordering::Relaxed);
+    if t0 == 0 || now.saturating_sub(t0) < crate::hidstall::DOCK_RELEASE_TIMEOUT_MS {
+        return;
+    }
+    if PIN_IX.compare_exchange(i, u32::MAX, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    crate::video::capture::cancel();
+    let (x, y) = (PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed));
+    PIN_BYPASS.store(true, Ordering::Release);
+    let ok = press_at(x, y);
+    PIN_BYPASS.store(false, Ordering::Release);
+    crate::hidstall::note_dock_timeout();
+    serial_println!(
+        "[dock] press at ({},{}) app={} release=timeout after_ms={} -> {}",
+        x, y, DP_PINS[i as usize].name, now.saturating_sub(t0), if ok { "launched" } else { "declined" }
+    );
 }

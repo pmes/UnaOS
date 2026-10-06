@@ -9,6 +9,9 @@ version = "0.1.0"
 [[package]]
 name = "audio_core"
 version = "0.1.0"
+dependencies = [
+ "demux_core",
+]
 
 [[package]]
 name = "av1_core"
@@ -37,6 +40,7 @@ name = "bootloader"
 version = "0.1.0"
 dependencies = [
  "fdt",
+ "font8x8",
  "log",
  "uefi",
  "unaos-boot-info",
@@ -146,6 +150,9 @@ dependencies = [
 [[package]]
 name = "jobs_core"
 version = "0.1.0"
+dependencies = [
+ "una-abi",
+]
 
 [[package]]
 name = "lazy_static"
@@ -199,6 +206,9 @@ checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 [[package]]
 name = "midden_core"
 version = "0.1.0"
+dependencies = [
+ "una-abi",
+]
 
 [[package]]
 name = "net"
@@ -366,6 +376,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "trash_core"
+version = "0.1.0"
+dependencies = [
+ "una-abi",
+]
+
+[[package]]
+name = "type_core"
+version = "0.1.0"
+dependencies = [
+ "elf_core",
+]
+
+[[package]]
 name = "uart_16550"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -480,6 +504,8 @@ dependencies = [
  "rast",
  "smoltcp",
  "spin 0.12.3",
+ "trash_core",
+ "type_core",
  "uart_16550",
  "una-abi",
  "unafs",

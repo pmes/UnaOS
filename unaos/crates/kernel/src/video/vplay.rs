@@ -5,7 +5,7 @@
 //!
 //! VIDEOPLAYER (rmbp-ledger B434, MACPARITY row 30). CODEX §2: moving pictures are Stria's. R79: the kernel plays
 //! a video as Stria's FULFILLER over the shared cores — `demux_core` (MP4 / Matroska / WebM), `vp8_core` and
-//! `av1_core` (the pictures), `audio_core::vorbis` (a WebM's sound) — never a second decoder and never a store of
+//! `av1_core` (the pictures), `audio_core` (the sound, `container::open_demuxed`) — never a second decoder and never a store of
 //! its own. This file is the job, the queue, the clock and two adapters; the window is PLAYER's (`video/player.rs`).
 //!
 //! * THE JOB (the DECJOB shape, DECJOBHANG B386): `play-vdec`, its own task on a worker core (never cpu 0 — the
@@ -18,9 +18,13 @@
 //! * THE CLOCK: the audio ring's position while the container's sound plays (a/v sync by the audio clock); a
 //!   pause-aware wall clock without sound (TEST.MP4 is AV1 alone) or after it ends. Until the ring arms (≤ 1.5 s)
 //!   the picture waits at its first frame.
-//! * SOUND: [`container_audio`] — when `audio_core` refuses a container (a WebM), `play-dec` (hda_play.rs) asks
-//!   here: the Matroska Vorbis track as an `audio_core::Source` (the codec mapping's Xiph-laced headers → the
-//!   core's `VorbisDecoder`, packets from `demux_core`). MP4 sound rides audio_core's own MP4 reader.
+//! * SOUND (VPLAYAUDIO B475): the job keeps a `Demuxer::share` of the file it opened; `play-dec` (hda_play.rs) asks
+//!   [`shared_audio`] FIRST (no I/O) and takes `audio_core::container::open_demuxed` over that share — one read, one
+//!   parse, the bytes shared — for MP4 (AAC, MP3) and Matroska/WebM (Opus, Vorbis) alike, through audio_core's one
+//!   `Decoder` (its seek is the container's table: `table=mp4|matroska`). [`container_audio`] is the same door for a
+//!   Matroska file opened with no picture job. No decoder adapter lives here (R79).
+//! * SEEK (VPLAYAUDIO B475): [`start_at`] — the job keyframe-seeks (`Demuxer::seek`), decodes up to the target
+//!   unseen, and the clock starts there; the Player seeks the sound through the same door (player.rs `vid::seek`).
 //! * QUICK LOOK: [`poster`] — the first frame and the facts, decoded on a `vposter` job (never on the 32 KiB render
 //!   task); Quick Look's pass re-renders when it lands ([`poster_fresh`]).
 //!
@@ -70,7 +74,7 @@ pub struct Facts {
     pub frames: u64,
     /// The sound track's codec token, `none` without one.
     pub audio: &'static str,
-    /// The sound can be played here: Vorbis in Matroska ([`container_audio`]), or an MP4 track audio_core reads.
+    /// The sound can be played here: whatever `audio_core::container::plays` (VPLAYAUDIO B475: the one predicate).
     pub audio_ok: bool,
 }
 
@@ -103,11 +107,7 @@ fn facts_of(d: &Demuxer) -> Option<Facts> {
     let a = d.audio_track();
     let dur_ns = if v.duration_ns > 0 { v.duration_ns } else { d.duration_ns() };
     let fps_x100 = if dur_ns > 0 { (v.sample_count as u128 * 100_000_000_000 / dur_ns as u128) as u32 } else { 0 };
-    let audio_ok = match (d.format(), a.map(|t| &t.codec)) {
-        (demux_core::Format::Mp4, Some(Codec::Aac | Codec::Mp3)) => true,
-        (demux_core::Format::Matroska | demux_core::Format::WebM, Some(Codec::Vorbis)) => true,
-        _ => false,
-    };
+    let audio_ok = a.is_some_and(|t| audio_core::container::plays(d.format(), &t.codec)); // VPLAYAUDIO (B475): the Decoder's own predicate
     Some(Facts {
         codec: tok(&v.codec),
         w: v.width,
@@ -229,6 +229,9 @@ struct Job {
     decoded: u64,
     err: Option<String>,
     eos: bool,
+    /// VPLAYAUDIO (B475): the opened file's share for the sound (`shared_audio`), and where the picture starts.
+    sound: Option<Demuxer>,
+    seek_ms: u64,
 }
 
 static JOB: spin::Mutex<Option<Job>> = spin::Mutex::new(None);
@@ -296,11 +299,18 @@ fn spawn(name: &'static str, entry: fn(usize), jid: u32, path: &str) {
 
 /// **Start playing `path`'s pictures** (replaces any job). The window's pass calls [`present`] from here on.
 pub fn start(path: &str) -> u32 {
+    start_at(path, 0)
+}
+
+/// VPLAYAUDIO (B475): **start playing `path`'s pictures at `ms`** — the job seeks to the last keyframe at or before
+/// it (`Demuxer::seek`, the container's own table), decodes the frames before `ms` without queueing them, and the
+/// clock starts at `ms`.
+pub fn start_at(path: &str, ms: u64) -> u32 {
     stop();
     let jid = GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-    *JOB.lock() = Some(Job { jid, path: String::from(path), facts: None, queue: VecDeque::new(), decoded: 0, err: None, eos: false });
+    *JOB.lock() = Some(Job { jid, path: String::from(path), facts: None, queue: VecDeque::new(), decoded: 0, err: None, eos: false, sound: None, seek_ms: ms });
     let t = now();
-    *PLAY.lock() = Play { open_ms: t, wall_ms: t, ..Play::new() };
+    *PLAY.lock() = Play { open_ms: t, wall_ms: t, media_ms: ms, ..Play::new() };
     PAUSED.store(false, Ordering::Release);
     SPAWN_MS.store(t, Ordering::Release);
     DRAIN_MS.store(t, Ordering::Release);
@@ -423,8 +433,8 @@ fn job_task(arg: usize) {
     let jid = arg as u32;
     let mine = || GEN.load(Ordering::Acquire) == jid;
     let paint = stack_paint();
-    let path = match JOB.lock().as_ref() {
-        Some(j) if j.jid == jid => j.path.clone(),
+    let (path, seek_ms) = match JOB.lock().as_ref() {
+        Some(j) if j.jid == jid => (j.path.clone(), j.seek_ms),
         _ => return job_exit(jid, paint, "superseded", 0, 0),
     };
     serial_println!("[vplay] job run jid={} cpu={} wait_ms={}", jid, crate::arch::percpu::this_cpu().cpu_index, now().saturating_sub(SPAWN_MS.load(Ordering::Acquire)));
@@ -452,8 +462,16 @@ fn job_task(arg: usize) {
         return job_exit(jid, paint, "no-video", 0, 0);
     };
     let f = facts_of(&d);
+    let sound = f.as_ref().filter(|f| f.audio_ok).map(|_| d.share()); // VPLAYAUDIO (B475): the sound's door, same bytes
     if let Some(j) = JOB.lock().as_mut().filter(|j| j.jid == jid) {
         j.facts = f;
+        j.sound = sound;
+    }
+    // the clock's zero: the picture track's first presentation time (a seek keeps it)
+    let vpts0 = d.track_index(vt.id).and_then(|i| d.track_samples(i).map(|s| s.pts).min());
+    if seek_ms > 0 {
+        let key = d.seek((seek_ms as i64).saturating_mul(1_000_000)).map(|k| k.saturating_sub(vt.to_ns(vpts0.unwrap_or(0))).max(0) as u64 / 1_000_000);
+        serial_println!("[vplay] seek jid={} to_ms={} key_ms={} table=container", jid, seek_ms, key.map(|k| k as i64).unwrap_or(-1));
     }
     let mut pic = match Pic::new(&vt) {
         Ok(p) => p,
@@ -464,7 +482,7 @@ fn job_task(arg: usize) {
     };
     let t0 = now();
     let (mut decoded, mut errs) = (0u64, 0u64);
-    let mut first_pts: Option<i64> = None;
+    let mut first_pts: Option<i64> = vpts0;
     let mut prefixed: Vec<u8> = Vec::new();
     while let Some(p) = d.next_packet() {
         if p.track != vt.id {
@@ -496,6 +514,7 @@ fn job_task(arg: usize) {
         let fp = *first_pts.get_or_insert(p.pts);
         let pts_ms = (vt.to_ns(p.pts - fp).max(0) as u64) / 1_000_000;
         match out {
+            Ok(Some(_)) if pts_ms < seek_ms => decoded += 1, // VPLAYAUDIO: a seek's run-up from the keyframe, unseen
             Ok(Some((w, h, px))) => {
                 decoded += 1;
                 let mut g = JOB.lock();
@@ -564,100 +583,64 @@ fn stack_high(paint: Option<(u64, u64)>) -> u64 {
     top - a
 }
 
-// ── the container's sound (Matroska Vorbis) as an audio_core::Source ────────────────────────────────────────
+// ── the container's sound (VPLAYAUDIO B475): audio_core's one door over the job's Demuxer ─────────────────────
 
-/// The Matroska codec mapping's Xiph lacing (CodecPrivate of `A_VORBIS`): count-1, then the sizes of all but
-/// the last in 255-runs, then the packets.
-fn xiph_split(c: &[u8]) -> Option<Vec<&[u8]>> {
-    let n = *c.first()? as usize + 1;
-    let mut i = 1;
-    let mut sizes = Vec::new();
-    for _ in 0..n - 1 {
-        let mut s = 0usize;
-        loop {
-            let b = *c.get(i)?;
-            i += 1;
-            s += b as usize;
-            if b != 255 {
-                break;
-            }
+/// `[vplay] sound …` and the `Source` — `audio_core::container::open_demuxed` (MP4 AAC/MP3, Matroska Opus/Vorbis).
+fn sound_of(d: Demuxer, parse: &str) -> Option<Box<dyn audio_core::Source>> {
+    let t = d.audio_track()?.clone();
+    let container = if d.format() == demux_core::Format::Mp4 { "mp4" } else { "matroska" };
+    match audio_core::container::open_demuxed(d) {
+        Ok(s) => {
+            let i = s.info();
+            serial_println!(
+                "[vplay] sound container={} codec={} rate={} ch={} packets={} delay_ns={} parse={} -> play-dec",
+                container, tok(&t.codec), i.rate, i.channels, t.sample_count, t.codec_delay_ns, parse
+            );
+            Some(s)
         }
-        sizes.push(s);
-    }
-    let mut out = Vec::new();
-    for s in sizes {
-        out.push(c.get(i..i + s)?);
-        i += s;
-    }
-    out.push(c.get(i..)?);
-    Some(out)
-}
-
-struct MkvVorbis {
-    d: Demuxer,
-    track: u32,
-    dec: audio_core::vorbis::VorbisDecoder,
-    rate: u32,
-    ch: u16,
-    out: Vec<Vec<f32>>,
-}
-
-impl audio_core::Source for MkvVorbis {
-    fn info(&self) -> audio_core::Info {
-        audio_core::Info { rate: self.rate, channels: self.ch, bits: 0, frames: None, format: audio_core::Format::Unknown, codec: audio_core::Codec::Vorbis, float: true }
-    }
-    fn block(&mut self, pcm: &mut audio_core::Pcm) -> audio_core::Result<bool> {
-        loop {
-            let Some(p) = self.d.next_packet() else { return Ok(false) };
-            if p.track != self.track {
-                continue;
-            }
-            let n = self.dec.decode(&p.data, &mut self.out).unwrap_or(0); // a corrupt packet decodes to nothing (OggVorbis's rule)
-            if n == 0 {
-                continue;
-            }
-            let ch = self.ch as usize;
-            pcm.float = true;
-            pcm.frames = n;
-            pcm.flt.resize_with(ch, Vec::new);
-            pcm.flt.truncate(ch);
-            for (c, dst) in pcm.flt.iter_mut().enumerate() {
-                dst.clear();
-                dst.extend_from_slice(&self.out[c][..n.min(self.out[c].len())]);
-                dst.resize(n, 0.0);
-            }
-            return Ok(true);
+        Err(e) => {
+            serial_println!("[vplay] sound container={} codec={} -> none ({:?})", container, tok(&t.codec), e);
+            None
         }
     }
 }
 
-/// `play-dec`'s second door (hda_play.rs): a container `audio_core` does not read — the Matroska/WebM Vorbis
-/// track — as a `Source`. `None` for anything else (the play is refused by audio_core's own reason).
+/// `play-dec`'s FIRST door (hda_play.rs): the live picture job's share of `path` (no I/O, no second parse). `None`
+/// when no job plays `path` or its sound is not one audio_core plays.
+/// A seek mints the picture job and the sound job together: the sound waits (on its own task, ≤ [`SHARE_WAIT_MS`])
+/// while the picture job is still reading and parsing.
+pub fn shared_audio(path: &str) -> Option<Box<dyn audio_core::Source>> {
+    let t0 = now();
+    let d = loop {
+        {
+            let g = JOB.lock();
+            let j = g.as_ref().filter(|j| j.path == path && j.jid == GEN.load(Ordering::Acquire))?;
+            if let Some(d) = j.sound.as_ref() {
+                break d.share();
+            }
+            if j.facts.is_some() || j.err.is_some() || !LIVE.load(Ordering::Acquire) {
+                return None;
+            }
+        }
+        if now().saturating_sub(t0) > SHARE_WAIT_MS {
+            return None;
+        }
+        crate::arch::sched::sleep_ms(5);
+    };
+    sound_of(d, "shared")
+}
+
+/// How long `play-dec` waits for a just-minted picture job's parse before reading the file itself.
+const SHARE_WAIT_MS: u64 = 3_000;
+
+/// `play-dec`'s last door: a Matroska/WebM file `audio_core` does not sniff, opened with no picture job — one read,
+/// the same `open_demuxed`. `None` for anything else (the play is refused by audio_core's own reason).
 pub fn container_audio(path: &str) -> Option<Box<dyn audio_core::Source>> {
     let bytes = read_all(path).ok()?;
     if demux_core::probe(&bytes) != Some(demux_core::Format::Matroska) {
         return None;
     }
-    let d = Demuxer::open(bytes).ok()?;
-    let t = d.audio_track()?.clone();
-    if t.codec != Codec::Vorbis {
-        serial_println!("[vplay] sound codec={} -> none (Vorbis is the Matroska sound this tree plays)", tok(&t.codec));
-        return None;
-    }
-    let h = xiph_split(&t.config)?;
-    if h.len() != 3 {
-        return None;
-    }
-    let setup = match audio_core::vorbis::Setup::parse(h[0], h[2]) {
-        Ok(s) => s,
-        Err(e) => {
-            serial_println!("[vplay] sound vorbis headers refused ({})", e);
-            return None;
-        }
-    };
-    let (rate, ch) = (setup.rate, setup.channels as u16);
-    serial_println!("[vplay] sound container=matroska codec=vorbis rate={} ch={} packets={} -> play-dec", rate, ch, t.sample_count);
-    Some(Box::new(MkvVorbis { d, track: t.id, dec: audio_core::vorbis::VorbisDecoder::new(setup), rate, ch, out: Vec::new() }))
+    sound_of(Demuxer::open(bytes).ok()?, "own")
 }
 
 // ── Quick Look's poster: the first frame and the facts, on a job ─────────────────────────────────────────────

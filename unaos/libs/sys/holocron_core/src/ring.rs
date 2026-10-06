@@ -89,11 +89,28 @@ impl<S: Sealer> Ring<S> {
         }
         let mut salt = [0u8; SALT_LEN];
         rng.fill(&mut salt).map_err(|_| RingError::Entropy)?;
+        let k = self.sealer.derive_key(password, &salt, &params).map_err(|_| RingError::Params)?;
+        self.create_keyed(owner, params, salt, k, rng)
+    }
+
+    /// RINGLOGIN (B465): [`Ring::create`] with the ring key `k` ALREADY derived from the password at `salt` and
+    /// `params` (by the login's one derivation — the kernel's SYS_KDF body, the same Argon2id call
+    /// `CryptoCore::derive_key` makes). The ONE place a ring file is built; `create` derives, then comes here.
+    pub fn create_keyed(
+        &mut self,
+        owner: &str,
+        params: KdfParams,
+        salt: [u8; SALT_LEN],
+        k: Key,
+        rng: &mut dyn Entropy,
+    ) -> Result<Vec<u8>, RingError> {
+        if !params.acceptable() || owner.is_empty() || owner.len() > 255 {
+            return Err(RingError::Invalid);
+        }
         let mut nonce = [0u8; NONCE_LEN];
         rng.fill(&mut nonce).map_err(|_| RingError::Entropy)?;
         let hdr = RingHeader { suite: S::SUITE, kdf: params, salt, nonce, owner: owner.into() };
         let hbytes = hdr.encode();
-        let k = self.sealer.derive_key(password, &salt, &params).map_err(|_| RingError::Params)?;
         let vk = self.sealer.subkey(&k, &salt, INFO_VERIFIER);
         let ver = self.sealer.seal(&vk, &nonce, &hbytes, VERIFIER_PLAINTEXT);
         let mut file = hbytes;
@@ -106,7 +123,7 @@ impl<S: Sealer> Ring<S> {
     /// Unlock with `password` against the ring file bytes. On any failure the ring stays locked.
     pub fn unlock(&mut self, ring_file: &[u8], password: &[u8]) -> Result<(), RingError> {
         self.lock();
-        let (hdr, hbytes, ver) = format::parse_ring(ring_file)?;
+        let (hdr, _, _) = format::parse_ring(ring_file)?;
         if hdr.suite != S::SUITE {
             return Err(RingError::Suite);
         }
@@ -114,6 +131,24 @@ impl<S: Sealer> Ring<S> {
             return Err(RingError::Params);
         }
         let k = self.sealer.derive_key(password, &hdr.salt, &hdr.kdf).map_err(|_| RingError::Params)?;
+        self.unlock_keyed(ring_file, k, &hdr.salt)
+    }
+
+    /// RINGLOGIN (B465): [`Ring::unlock`] with the ring key `k` already derived at `salt` (which must be the
+    /// ring file's own salt — a key derived for another ring is refused as a bad password). The ONE verifier
+    /// check; `unlock` derives, then comes here. On any failure the ring stays locked.
+    pub fn unlock_keyed(&mut self, ring_file: &[u8], k: Key, salt: &[u8; SALT_LEN]) -> Result<(), RingError> {
+        self.lock();
+        let (hdr, hbytes, ver) = format::parse_ring(ring_file)?;
+        if hdr.suite != S::SUITE {
+            return Err(RingError::Suite);
+        }
+        if !hdr.kdf.acceptable() {
+            return Err(RingError::Params);
+        }
+        if !crate::ct_eq(salt, &hdr.salt) {
+            return Err(RingError::BadPassword);
+        }
         let vk = self.sealer.subkey(&k, &hdr.salt, INFO_VERIFIER);
         match self.sealer.open(&vk, &hdr.nonce, hbytes, ver) {
             Ok(pt) if crate::ct_eq(&pt, VERIFIER_PLAINTEXT) => {
@@ -150,6 +185,22 @@ impl<S: Sealer> Ring<S> {
         rng: &mut dyn Entropy,
     ) -> Result<Vec<u8>, RingError> {
         let (k, hdr) = self.unlocked()?;
+        self.seal_with(k, hdr, ns, name_, meta, plaintext, rng)
+    }
+
+    /// [`Ring::seal_secret`]'s body under an explicit key and ring header (RINGLOGIN2: the re-wrap seals under
+    /// the NEW key before the ring holds it).
+    #[allow(clippy::too_many_arguments)]
+    fn seal_with(
+        &self,
+        k: &Key,
+        hdr: &RingHeader,
+        ns: &str,
+        name_: &str,
+        meta: &Meta,
+        plaintext: &[u8],
+        rng: &mut dyn Entropy,
+    ) -> Result<Vec<u8>, RingError> {
         if !name::valid(ns) || !name::valid(name_) || meta.kind.len() > 255 || meta.label.len() > 255 {
             return Err(RingError::Invalid);
         }
@@ -180,6 +231,12 @@ impl<S: Sealer> Ring<S> {
     /// Open the secret file `bytes` as `ns/name`.
     pub fn open_secret(&self, ns: &str, name_: &str, bytes: &[u8]) -> Result<(Meta, SecretBytes), RingError> {
         let (k, ring) = self.unlocked()?;
+        self.open_with(k, ring, ns, name_, bytes)
+    }
+
+    /// [`Ring::open_secret`]'s body under an explicit key and ring header (RINGLOGIN2: the re-wrap opens under
+    /// the OLD key while the ring is still the old one).
+    fn open_with(&self, k: &Key, ring: &RingHeader, ns: &str, name_: &str, bytes: &[u8]) -> Result<(Meta, SecretBytes), RingError> {
         let (sh, hbytes, sealed) = format::parse_secret(bytes)?;
         if sh.suite != S::SUITE {
             return Err(RingError::Suite);
@@ -194,6 +251,55 @@ impl<S: Sealer> Ring<S> {
             SealError::Param => RingError::Invalid,
         })?;
         Ok((sh.meta, SecretBytes::new(pt)))
+    }
+
+    /// RINGLOGIN2 (B479): re-wrap the ring from the key `old` to the key `new` — a password change. Beside
+    /// [`Ring::create_keyed`] and [`Ring::unlock_keyed`], and like them handed keys ALREADY derived (by the
+    /// kernel's one derivation, SYS_KDF's body) at the ring file's own salt and parameters, which are KEPT: the
+    /// salt, the KDF parameters and the owner do not change, only the verifier (a fresh nonce, under `new`) and
+    /// every secret (opened under `old`, resealed under `new` with a fresh salt and nonce, its `Meta` kept).
+    ///
+    /// `old` must open the ring file's verifier (else `BadPassword`) and every secret in `secrets`
+    /// (`(ns, name, file)`; else that secret's error). ALL OR NOTHING, in memory: on any failure `self` is
+    /// untouched and nothing is returned to write. On success the ring holds `new` (UNLOCKED) and the caller
+    /// gets the new ring file and the resealed secrets (same order as `secrets`) to write — the ring LAST.
+    pub fn rewrap_keyed(
+        &mut self,
+        ring_file: &[u8],
+        old: Key,
+        new: Key,
+        secrets: &[(String, String, Vec<u8>)],
+        rng: &mut dyn Entropy,
+    ) -> Result<(Vec<u8>, Vec<(Vec<u8>, Meta)>), RingError> {
+        let (hdr, hbytes, ver) = format::parse_ring(ring_file)?;
+        if hdr.suite != S::SUITE {
+            return Err(RingError::Suite);
+        }
+        if !hdr.kdf.acceptable() {
+            return Err(RingError::Params);
+        }
+        let vk = self.sealer.subkey(&old, &hdr.salt, INFO_VERIFIER);
+        match self.sealer.open(&vk, &hdr.nonce, hbytes, ver) {
+            Ok(pt) if crate::ct_eq(&pt, VERIFIER_PLAINTEXT) => {}
+            _ => return Err(RingError::BadPassword),
+        }
+        let mut nonce = [0u8; NONCE_LEN];
+        rng.fill(&mut nonce).map_err(|_| RingError::Entropy)?;
+        let hdr2 = RingHeader { suite: hdr.suite, kdf: hdr.kdf, salt: hdr.salt, nonce, owner: hdr.owner.clone() };
+        let mut out = Vec::with_capacity(secrets.len());
+        for (ns, nm, file) in secrets {
+            let (meta, pt) = self.open_with(&old, &hdr, ns, nm, file)?;
+            let sealed = self.seal_with(&new, &hdr2, ns, nm, &meta, pt.expose(), rng)?;
+            out.push((sealed, meta));
+        }
+        let h2 = hdr2.encode();
+        let vk2 = self.sealer.subkey(&new, &hdr2.salt, INFO_VERIFIER);
+        let ver2 = self.sealer.seal(&vk2, &nonce, &h2, VERIFIER_PLAINTEXT);
+        let mut file = h2;
+        file.extend_from_slice(&ver2);
+        self.header = Some(hdr2);
+        self.key = Some(new);
+        Ok((file, out))
     }
 
     fn unlocked(&self) -> Result<(&Key, &RingHeader), RingError> {

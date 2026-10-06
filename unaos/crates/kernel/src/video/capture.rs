@@ -79,3 +79,32 @@ fn cursor() -> (i32, i32) {
         None => (0, 0),
     }
 }
+
+/// DROPTYPES (rmbp-ledger B477) — aarch64's feed: the focused-app drain in `main.rs` hands every event here (after
+/// it moved the cursor), and the shell path's `render_service` its motion arms (after the cursor moved there), so a
+/// capture held on the Pi (a drag, a slider) sees motion at the live cursor; the shell drain's release goes through
+/// [`feed_release`]. One relaxed load when nothing is held.
+pub fn feed(ev: crate::pal::Event) {
+    if !held() {
+        return;
+    }
+    match ev {
+        crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. } => {
+            let (x, y) = cursor();
+            motion(x, y);
+        }
+        crate::pal::Event::Button(mask) if mask & 0x01 == 0 => {
+            let (x, y) = cursor();
+            release(x, y);
+        }
+        _ => {}
+    }
+}
+
+/// The shell-focus drain's half: the primary release only (its motion reaches [`feed`] in `render_service`).
+pub fn feed_release(ev: crate::pal::Event) {
+    if held() && matches!(ev, crate::pal::Event::Button(m) if m & 0x01 == 0) {
+        let (x, y) = cursor();
+        release(x, y);
+    }
+}

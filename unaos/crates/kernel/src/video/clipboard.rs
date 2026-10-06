@@ -164,7 +164,7 @@ pub fn set(bytes: &[u8]) -> bool {
         c.buf[..bytes.len()].copy_from_slice(bytes);
         c.len = bytes.len();
         c.epoch = epoch;
-        c.stamped = true;
+        c.stamped = true; FILE_REF.store(false, core::sync::atomic::Ordering::Release); // SMALLFIX4 (F13): any set is TEXT until set_file_ref marks it
     }
     serial_println!("[clip] set len={} epoch={}", bytes.len(), epoch);
     true
@@ -177,7 +177,7 @@ pub fn clear(reason: &str) {
         let mut c = CLIP.lock();
         let had = c.len;
         c.len = 0;
-        c.stamped = false;
+        c.stamped = false; FILE_REF.store(false, core::sync::atomic::Ordering::Release); // SMALLFIX4 (F13)
         had
     };
     serial_println!("[clip] clear len={} reason={}", had, reason);
@@ -364,7 +364,7 @@ pub fn terminal_action_in(
         | Action::Deselect => ("ok", if !sel.apply(act, line.len()) { 0 } else if scroll { 2 } else { 1 }),
         // Not this consumer's business: the capture actions are delivered and acted on at the
         // decoder (`Action::is_capture`), and `LogOut` is KEYMAP's slot, bound by nobody.
-        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut | Action::BrightnessDown | Action::BrightnessUp | Action::CycleWindow | Action::LockScreen | Action::ShowShortcuts | Action::ScrollPageUp | Action::ScrollPageDown | Action::ScrollTop | Action::ScrollBottom | Action::SnapLeft | Action::SnapRight | Action::SnapZoom | Action::SnapRestore | Action::ScreenshotWindow | Action::WinNudgeLeft | Action::WinNudgeRight | Action::WinNudgeUp | Action::WinNudgeDown | Action::WinSizeLeft | Action::WinSizeRight | Action::WinSizeUp | Action::WinSizeDown | Action::Minimize | Action::CycleApp | Action::ClearView | Action::QuitApp | Action::CloseWindow | Action::HideApp | Action::OpenSettings | Action::ForceQuit | Action::GetInfo | Action::Launcher => ("ignored", 0),
+        Action::Interrupt | Action::Screenshot | Action::ScreenshotRegion | Action::LogOut | Action::BrightnessDown | Action::BrightnessUp | Action::CycleWindow | Action::LockScreen | Action::ShowShortcuts | Action::ScrollPageUp | Action::ScrollPageDown | Action::ScrollTop | Action::ScrollBottom | Action::SnapLeft | Action::SnapRight | Action::SnapZoom | Action::SnapRestore | Action::ScreenshotWindow | Action::WinNudgeLeft | Action::WinNudgeRight | Action::WinNudgeUp | Action::WinNudgeDown | Action::WinSizeLeft | Action::WinSizeRight | Action::WinSizeUp | Action::WinSizeDown | Action::Minimize | Action::CycleApp | Action::ClearView | Action::QuitApp | Action::CloseWindow | Action::HideApp | Action::OpenSettings | Action::ForceQuit | Action::GetInfo | Action::Launcher => ("ignored", 0),
         // TERMSEL2 M3 — the caret (`LineSel::caret_action`).
         Action::CursorLeft | Action::CursorRight | Action::CursorLineStart | Action::CursorLineEnd => {
             ("ok", sel.caret_action(act, line.len()))
@@ -418,7 +418,7 @@ pub const fn action_code(a: Action) -> u64 {
         Action::WinSizeLeft => 35,
         Action::WinSizeRight => 36,
         Action::WinSizeUp => 37,
-        Action::WinSizeDown => 38, Action::Minimize => 39, Action::CycleApp => 40, Action::ClearView => 41, Action::QuitApp => 42, Action::CloseWindow => 43, Action::HideApp => 44, Action::OpenSettings => 45, Action::ForceQuit => 46, Action::GetInfo => 47, Action::Launcher => 48, // APPMENU2 (B393): the WM's system chords, consumed by `sysmenu::key` before ring 3; codes reserved for a router that declines // WINDOWLIST · LUMENBIN (⌘K, delivered to ring 3 as INPUT_EV_ACTION 41) // ATTRCOLUMNS (B402): ⌘I Get Info, code 47 (42 was taken by APPMENU2 QuitApp)
+        Action::WinSizeDown => 38, Action::Minimize => 39, Action::CycleApp => 40, Action::ClearView => 41, Action::QuitApp => 42, Action::CloseWindow => 43, Action::HideApp => 44, Action::OpenSettings => 45, Action::ForceQuit => 46, Action::GetInfo => 47, Action::Launcher => 48, Action::Interrupt => 49, // APPMENU2 (B393): the WM's system chords, consumed by `sysmenu::key` before ring 3; codes reserved for a router that declines // WINDOWLIST · LUMENBIN (⌘K, delivered to ring 3 as INPUT_EV_ACTION 41) // ATTRCOLUMNS (B402): ⌘I Get Info, code 47 (42 was taken by APPMENU2 QuitApp)
     }
 }
 
@@ -550,4 +550,36 @@ pub fn selftest() {
         if epoch_clear { "ok" } else { "no" },
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+/// SMALLFIX4 (ARCHREVIEW F13) — the clipboard's one TYPE fact: is the text on it a FILE REFERENCE (a
+/// path Quarry copied) rather than typed text? Quarry kept its own `CLIP` beside this buffer, so a copy
+/// in Quarry and a paste in the editor never met. Now Quarry's Copy is [`set_file_ref`] — the path goes
+/// on the ONE buffer, epoch-stamped like any text, so the editor's `⌘V` pastes the path — and Quarry's
+/// Paste asks [`get_file_ref`], which answers only while the buffer still holds that reference (any
+/// later [`set`] or [`clear`] drops the mark). Witness: `[clip] set-ref len=<n> ok=<0|1>` and
+/// `[clip] get-ref len=<n> ref=<0|1>` beside the `[clip] set`/`[clip] get` lines the buffer prints.
+static FILE_REF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Put a file reference (a path) on the one clipboard, typed as such.
+pub fn set_file_ref(path: &str) -> bool {
+    let ok = set(path.as_bytes());
+    if ok {
+        FILE_REF.store(true, core::sync::atomic::Ordering::Release);
+    }
+    serial_println!("[clip] set-ref len={} ok={}", path.len(), ok as u8);
+    ok
+}
+
+/// The file reference on the clipboard, epoch-checked; `None` for text, empty, or a closed session.
+pub fn get_file_ref() -> Option<String> {
+    let mut buf = alloc::vec![0u8; CLIP_CAP];
+    let n = get(&mut buf);
+    let is_ref = n > 0 && FILE_REF.load(core::sync::atomic::Ordering::Acquire);
+    serial_println!("[clip] get-ref len={} ref={}", n, is_ref as u8);
+    if !is_ref {
+        return None;
+    }
+    buf.truncate(n);
+    String::from_utf8(buf).ok()
 }

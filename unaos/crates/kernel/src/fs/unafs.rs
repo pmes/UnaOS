@@ -897,7 +897,7 @@ pub fn with_unafs<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, Moun
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        match with_unafs_attempt(&mut f) {
+        match { let t_mask = crate::hidstall::now_us(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked_since(t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
@@ -1410,7 +1410,7 @@ pub fn read_authz(fs: &mut KernelUnaFS, live_id: u64, principal: &str) -> ReadAu
         return ReadAuthz::Permit;
     }
     let owner = match ino.attributes.get("owner") {
-        Some(AttributeValue::String(s)) => s.clone(),
+        Some(AttributeValue::String(s)) if s != crate::fs::rootacl::SYSTEM_OWNER => s.clone(), // ROOTACL (B456): `system` reads for everyone
         // No owner row: a public live object, readable by all (unchanged public
         // semantics). Only ABSENCE OF THE OBJECT (above) fails closed.
         _ => return ReadAuthz::Permit,

@@ -813,18 +813,18 @@ pub fn key_escape(ev: crate::pal::Event) -> bool {
 // Compile-time sanity
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity(ck: &mut super::metrics::Sane) {
     // A registry with no room for the tenants declared above is a registry that silently drops one.
-    assert!(STRIP_MAX >= 1);
+    const _: () = assert!(STRIP_MAX >= 1);
     // Every named slot must be inside the registry, or a witness indexes past its own tenant table.
-    assert!(DOCK_SLOT < STRIP_MAX);
-    assert!(MENUBAR_SLOT < STRIP_MAX);
-    assert!(DOCK_SLOT != MENUBAR_SLOT);
+    const _: () = assert!(DOCK_SLOT < STRIP_MAX);
+    const _: () = assert!(MENUBAR_SLOT < STRIP_MAX);
+    const _: () = assert!(DOCK_SLOT != MENUBAR_SLOT);
     // The scratch must hold the widest strip any constructor can hand the painter. `frame_flush`
     // returns the panel's full width, so this is the panel bound the painter declines above.
-    assert!(MAX_STRIP_W >= 2048);
+    const _: () = assert!(MAX_STRIP_W >= 2048);
     // A margin of zero would make `frame_centred` and `frame_flush` the same function.
-    assert!(PAD() > 0);
+    ck.t(PAD() > 0);
 }
 
 // ---------------------------------------------------------------------------

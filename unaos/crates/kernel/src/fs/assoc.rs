@@ -31,14 +31,14 @@ use crate::fs::appres::{self, Registrant};
 use crate::fs::filetype as ft;
 use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL};
 
-pub const DESCRIPTION_KEY: &str = "una:description";
-pub const EXTENSIONS_KEY: &str = "una:extensions";
-pub const ICON_KEY: &str = "una:icon";
+pub const DESCRIPTION_KEY: &str = una_abi::attr_keys::DESCRIPTION;
+pub const EXTENSIONS_KEY: &str = una_abi::attr_keys::EXTENSIONS;
+pub const ICON_KEY: &str = una_abi::attr_keys::ICON;
 /// On a type object: the preferred app's signature. On a file: that file's own choice (signature, or the B307
 /// opener id / program path).
-pub const PREFERRED_KEY: &str = "una:preferred";
+pub const PREFERRED_KEY: &str = una_abi::attr_keys::PREFERRED;
 /// The registry's directory on the system volume (ROOTDISK2: `/system` is UnaFS).
-pub const TYPES_DIR: &str = "/system/filetypes";
+pub use type_core::TYPES_DIR; // SMALLFIX4 item 12 (TYPECORE fold): the one table owns the registry path
 
 /// `(mime, icon glyph, description)` — the type FACTS. No opener column: who opens a type is its registrants'.
 pub const TYPE_FACTS: &[(&str, &str, &str)] = &[
@@ -90,12 +90,13 @@ pub fn object_path(mime: &str) -> String {
 
 /// The MIME type a registry leaf names (`image-png` → `image/png`; a top-level type never carries a dash). Pure.
 pub fn mime_of_leaf(leaf: &str) -> String {
-    leaf.replacen('-', "/", 1)
+    match type_core::mime_leaf(leaf) { Some((t, st)) => alloc::format!("{}/{}", t, st), None => String::from(leaf) } // SMALLFIX4 item 12: type_core's leaf rule
 }
 
-/// `filetype::EXT_TABLE`'s extensions for `mime`, comma-separated (`md, markdown`). Pure.
+/// type_core's one table's extensions for `mime`, comma-separated (`md, markdown`). Pure. SMALLFIX4 item 12: walks
+/// `type_core::extensions_of` (TYPECORE fold), no second filter over the table.
 pub fn extensions_of(mime: &str) -> String {
-    let v: Vec<&str> = ft::EXT_TABLE.iter().filter(|(_, m)| *m == mime).map(|(e, _)| *e).collect();
+    let v: Vec<&str> = type_core::extensions_of(mime).collect();
     v.join(", ")
 }
 
@@ -125,7 +126,8 @@ pub fn opener_for_in(mt: &MountTable, path: &str, mime: &str) -> (String, &'stat
         }
     }
     if let Some(v) = str_attr(mt, &obj, PREFERRED_KEY) {
-        return (appres::opener_of_preferred(mt, &v), "db");
+        let op = appres::opener_of_preferred(mt, &v);
+        if !crate::fs::apptrust::is_foreign(mt, &op) { return (op, "db"); } // APPTRUST (B467): the registry's choice never names a program off the system volume
     }
     match registrants_in(mt, mime).into_iter().next() {
         Some(r) => (r.opener, "registrant"),
@@ -218,7 +220,7 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
     }
     let mut missing: Vec<(String, Vec<(String, AttrValue)>)> = Vec::new();
     let mut filled = 0usize;
-    for mime in known_types_in(mt) {
+    for mime in seed_types_in(mt) { // SMALLFIX5 (B480): + the types only a ring-3 program's signature object declares
         let obj = object_path(&mime);
         let want = keys_for(mt, &mime);
         if mt.stat(&obj).is_err() {
@@ -264,20 +266,10 @@ pub fn builds() -> usize {
     BUILDS.load(Ordering::Relaxed)
 }
 
-/// Build the registry now, one wire line. `why` = `login` · `tests` · `verb`.
+/// Build the registry now, one wire line. `why` = `login` · `tests` · `verb`. ASSOCSTAMP (B460): `login`/`verb` read the
+/// generation stamp first and skip the walk when it matches; `tests` always builds in full.
 pub fn build(why: &str) -> usize {
-    let t0 = crate::arch::ms();
-    let mt = crate::shell::vfs_mount_table();
-    BUILDS.fetch_add(1, Ordering::Relaxed);
-    match seed_in(&mt) {
-        Ok((n, f)) => {
-            serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} ms={}", why, TYPES_DIR, n, f,
-                known_types_in(&mt).len(), crate::arch::ms().saturating_sub(t0));
-            n
-        }
-        Err(VfsError::Unsupported) => { serial_println!("[filetypes] built at={} dir=none reason=enotsup (root takes no attributes) source=registrants", why); 0 }
-        Err(e) => { serial_println!("[filetypes] built at={} FAILED ({}) source=registrants", why, crate::fs::attrsys::refusal(&e)); 0 }
-    }
+    build_stamped(why, why == "tests").0
 }
 
 /// `login ok` (`login::close_into_session`): the registry is owed. On x86 with the compositor the device-service
@@ -633,4 +625,201 @@ pub fn openertrust_selftest() {
         ":: OPENERTRUST: registrant={} foreign_path={} carried={} -> {} :: kept={} foreign={} default={}",
         registrant, foreign_path, carried, if pass { "PASS" } else { "FAIL" }, kept, foreign, default
     );
+}
+
+// ── ASSOCSTAMP (rmbp-ledger B460): the registry's generation stamp ───────────────────────────────────────────────
+//
+// PERFREVIEW F4: a build with nothing to create re-walked every type (flight 24: `blocks_read=1191 … created=0
+// ms=1662`). The registry directory carries ONE attribute naming what it was built from; when the compiled-in type
+// set is unchanged the build is a single attribute read.
+
+/// The stamp's key, on [`TYPES_DIR`] itself.
+pub const STAMP_KEY: &str = una_abi::attr_keys::FILETYPES_STAMP;
+/// The builder's version: bump when `seed_in` changes what it writes (the stamp then differs and the build runs once).
+pub const BUILDER_VERSION: u32 = 1;
+
+fn fnv(mut h: u64, b: &[u8]) -> u64 {
+    for &x in b.iter().chain([0u8].iter()) {
+        h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// The compiled-in type count: [`TYPE_FACTS`] ∪ every built-in's declared doc type. Pure.
+pub fn builtin_type_count() -> usize {
+    let mut n = TYPE_FACTS.len();
+    for m in appres::builtin_doctypes() {
+        if facts(&m).is_none() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The stamp this build would write: `v<version> h=<FNV-1a 64 of TYPE_FACTS, EXT_TABLE and APPRES's BUILTIN> n=<types>`.
+/// Pure (no I/O): everything `seed_in` derives an object from that is compiled in.
+pub fn stamp_now() -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    h = fnv(h, &BUILDER_VERSION.to_le_bytes());
+    for (m, g, d) in TYPE_FACTS.iter() {
+        h = fnv(fnv(fnv(h, m.as_bytes()), g.as_bytes()), d.as_bytes());
+    }
+    for (e, m) in ft::EXT_TABLE.iter() {
+        h = fnv(fnv(h, e.as_bytes()), m.as_bytes());
+    }
+    h = appres::builtin_hash(h);
+    alloc::format!("v{} h={:016x} n={}", BUILDER_VERSION, h, builtin_type_count())
+}
+
+/// The stamp the registry carries (ONE attribute read on one inode), `None` when absent or unreadable.
+pub fn stamp_on_disk(mt: &MountTable) -> Option<String> {
+    str_attr(mt, TYPES_DIR, STAMP_KEY)
+}
+
+/// Build unless the stamp matches (`force` builds regardless). `(created, skipped)`; one wire line either way.
+pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
+    let t0 = crate::arch::ms();
+    let io0 = crate::fs::bootstep::io();
+    let mt = crate::shell::vfs_mount_table();
+    BUILDS.fetch_add(1, Ordering::Relaxed);
+    let want = stamp_now();
+    if !force && stamp_on_disk(&mt).as_deref() == Some(want.as_str()) {
+        let d = crate::fs::bootstep::io().since(io0);
+        serial_println!("[filetypes] built at={} dir={} created=0 filled=0 types={} skipped=stamp stamp=v{} blocks_read={} cmds={} ms={}",
+            why, TYPES_DIR, builtin_type_count(), BUILDER_VERSION, d.blocks_read(), d.cmds(), crate::arch::ms().saturating_sub(t0));
+        return (0, true);
+    }
+    match seed_in(&mt) {
+        Ok((n, f)) => {
+            let _ = crate::fs::rootacl::stamp(&mt); // ROOTACL (B456): the system trees take the `system` owner once the registry is built
+            let st = match mt.set_attr(TYPES_DIR, STAMP_KEY, AttrValue::Str(want), KERNEL_PRINCIPAL) {
+                Ok(()) => "written",
+                Err(_) => "refused",
+            };
+            let d = crate::fs::bootstep::io().since(io0);
+            crate::fs::bootstep::note_span("filetypes-build", t0, crate::arch::ms()); // SMALLFIX6 (B495): the full build's span, beside the boot steps
+            serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} stamp={} blocks_read={} cmds={} ms={}", why, TYPES_DIR, n, f,
+                known_types_in(&mt).len(), st, d.blocks_read(), d.cmds(), crate::arch::ms().saturating_sub(t0));
+            (n, false)
+        }
+        Err(VfsError::Unsupported) => { serial_println!("[filetypes] built at={} dir=none reason=enotsup (root takes no attributes) source=registrants", why); (0, false) }
+        Err(e) => { serial_println!("[filetypes] built at={} FAILED ({}) source=registrants", why, crate::fs::attrsys::refusal(&e)); (0, false) }
+    }
+}
+
+/// `tests assocstamp` (R80: run only when asked) — the registry built in full (the stamp written), the stamp check
+/// MEASURED (one attribute read: `blocks_read`, `cmds`, `ms`), then a stale stamp forcing exactly one full build that
+/// re-writes it, then a hit again.
+///
+/// `:: ASSOCSTAMP: stamp=<match|miss|none> blocks_read=<n> ms=<n> -> PASS|FAIL|SKIP reason= :: cmds=<n> stale=<rebuilt|why> rehit=<ok|why> bound_ms=10 stamp=<v> n=<n>`
+pub fn stamp_selftest() {
+    let mt = crate::shell::vfs_mount_table();
+    if !root_takes_attrs(&mt) {
+        serial_println!(":: ASSOCSTAMP: stamp=none blocks_read=0 ms=0 -> SKIP reason=no-attr-root ::");
+        return;
+    }
+    let _ = build_stamped("tests", true);
+    let want = stamp_now();
+    let t0 = crate::arch::ms();
+    let io0 = crate::fs::bootstep::io();
+    let have = stamp_on_disk(&mt);
+    let d = crate::fs::bootstep::io().since(io0);
+    let ms = crate::arch::ms().saturating_sub(t0);
+    let state = match &have { Some(h) if *h == want => "match", Some(_) => "miss", None => "none" };
+    // A stale stamp (an arc changed the type set): the next build must NOT skip, and must leave the stamp current.
+    let stale = if mt.set_attr(TYPES_DIR, STAMP_KEY, AttrValue::Str(String::from("v0 h=stale n=0")), KERNEL_PRINCIPAL).is_err() {
+        "set-refused"
+    } else {
+        match build_stamped("tests", false) {
+            (_, true) => "skipped-stale",
+            (_, false) if stamp_on_disk(&mt).as_deref() == Some(want.as_str()) => "rebuilt",
+            _ => "not-rewritten",
+        }
+    };
+    let rehit = if build_stamped("tests", false).1 { "ok" } else { "built-again" };
+    let pass = state == "match" && stale == "rebuilt" && rehit == "ok" && ms <= 10;
+    serial_println!(":: ASSOCSTAMP: stamp={} blocks_read={} ms={} -> {} :: cmds={} stale={} rehit={} bound_ms=10 stamp=v{} n={}",
+        state, d.blocks_read(), ms, if pass { "PASS" } else { "FAIL" }, d.cmds(), stale, rehit, BUILDER_VERSION, builtin_type_count());
+}
+
+/// REFUSALUI (B468): the wire's words when `path`'s own `una:preferred` is refused for type `mime`
+/// (`preferred=<v> refused=not-a-registrant`), `None` when it has none or it is honoured. Read on the OPEN only
+/// (the person's act), never by the per-row resolver a listing runs.
+pub fn override_refusal(path: &str, mime: &str) -> Option<String> {
+    let mt = crate::shell::vfs_mount_table();
+    if path == object_path(mime) {
+        return None;
+    }
+    let v = str_attr(&mt, path, PREFERRED_KEY)?;
+    match trusted_override_in(&mt, &v, mime) {
+        Some(_) => None,
+        None => Some(alloc::format!("preferred={} refused=not-a-registrant", v)),
+    }
+}
+
+// ── SMALLFIX5 (rmbp-ledger B480) item 1 — a ring-3 program's own doc type and the stamp ─────────────────────────
+//
+// The stamp hashes what is compiled in. A type only a ring-3 program declares (its APPRES block, cached on its
+// signature object `application-x-vnd.*` in this directory) is outside the hash, so a stamp match never fills its
+// `una:preferred`. A ROOT sighting outside the per-boot memo that declares such a type, with the type's object
+// missing or carrying no preferred app, replaces the stamp (ONE attribute write); the next login build then runs
+// `seed_in` in full, which creates the object from the signature object's declared types and fills the missing keys.
+// A filled type never invalidates, so the steady state stays the one-attribute read.
+
+/// The stamp an invalidation writes (never equal to [`stamp_now`]: version 0).
+pub const STAMP_INVALID: &str = "v0 h=invalidated n=0";
+
+/// `doctypes` the stamp's hash does not cover: not in [`TYPE_FACTS`], not a built-in's declared doc type. Pure.
+pub fn uncovered_types(doctypes: &[String]) -> Vec<String> {
+    let built = appres::builtin_doctypes();
+    doctypes.iter().filter(|m| !m.is_empty() && facts(m).is_none() && !built.iter().any(|b| b == *m)).cloned().collect()
+}
+
+/// [`known_types_in`] plus every uncovered type a ring-3 program's signature object in [`TYPES_DIR`] declares
+/// (`seed_in`'s set: a full build creates their objects). One attribute read per signature object, full builds only.
+pub fn seed_types_in(mt: &MountTable) -> Vec<String> {
+    let mut v = known_types_in(mt);
+    if let Ok(ents) = mt.read_dir(TYPES_DIR) {
+        for e in ents.iter().filter(|e| e.name.starts_with("application-x-vnd.")) {
+            let obj = alloc::format!("{}/{}", TYPES_DIR, e.name);
+            let decl: Vec<String> = str_attr(mt, &obj, midden_core::RES_KEY_DOCTYPES).unwrap_or_default().lines().map(String::from).collect();
+            for m in uncovered_types(&decl) {
+                if !v.contains(&m) {
+                    v.push(m);
+                }
+            }
+        }
+    }
+    v
+}
+
+/// Should a sighting declaring `doctypes` invalidate the stamp? The first uncovered type whose object is missing or
+/// has no `una:preferred`, `None` when every one is filled (or none is uncovered).
+pub fn stamp_owed_type(mt: &MountTable, doctypes: &[String]) -> Option<String> {
+    uncovered_types(doctypes).into_iter().find(|m| str_attr(mt, &object_path(m), PREFERRED_KEY).is_none())
+}
+
+static INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many stamp invalidations this boot wrote (`tests smallfix5`).
+pub fn invalidations() -> usize {
+    INVALIDATIONS.load(Ordering::Relaxed)
+}
+
+/// APPRES's root sighting of `program` (not in the per-boot memo) declaring `doctypes`: replace the stamp when an
+/// uncovered type is unfilled. One line when it writes: `[filetypes] stamp invalidated by=<program> type=<mime> written=<0|1>`.
+/// `true` when the stamp was replaced.
+pub fn stamp_invalidate_for(mt: &MountTable, program: &str, doctypes: &[String]) -> bool {
+    let Some(m) = stamp_owed_type(mt, doctypes) else { return false };
+    match stamp_on_disk(mt) {
+        None => return false,                             // no stamp: the next build runs in full anyway
+        Some(s) if s == STAMP_INVALID => return false,    // already invalidated this boot or an earlier one
+        Some(_) => {}
+    }
+    let ok = mt.set_attr(TYPES_DIR, STAMP_KEY, AttrValue::Str(String::from(STAMP_INVALID)), KERNEL_PRINCIPAL).is_ok();
+    if ok {
+        INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    serial_println!("[filetypes] stamp invalidated by={} type={} written={}", program, m, ok as u8);
+    ok
 }

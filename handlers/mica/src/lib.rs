@@ -90,14 +90,16 @@ pub fn mkdirs<D: BlockDevice>(fs: &mut UnaFS<D>, path: &str) -> Result<u64> {
 }
 
 /// The folders' ATTRCOLUMNS view (`una:view`), so Quarry opens `/jobs/...` with the job columns shown.
-fn view_for(dir: &str) -> &'static str {
-    if dir.ends_with(jc::STATUS_DIR) {
-        "job:status,job:flight,job:set_by,job:refs"
+fn view_for(dir: &str) -> String {
+    // SMALLFIX4 item 13 (ATTRKEYS): the columns are the registered keys, joined — no `job:` literal.
+    let cols: &[&str] = if dir.ends_with(jc::STATUS_DIR) {
+        &[jc::K_STATUS, jc::K_FLIGHT, jc::K_SET_BY, jc::K_REFS]
     } else if dir.contains("/ledger/") {
-        "job:status,job:owner,job:arc,job:refs"
+        &[jc::K_STATUS, jc::K_OWNER, jc::K_ARC, jc::K_REFS]
     } else {
-        "job:status,job:arc,job:refs"
-    }
+        &[jc::K_STATUS, jc::K_ARC, jc::K_REFS]
+    };
+    cols.join(",")
 }
 
 /// Write one record (create or replace): the body as the file's data, every `job:*` as an attribute, `job:seq`
@@ -149,7 +151,7 @@ pub fn populate<D: BlockDevice>(fs: &mut UnaFS<D>, records: &[Record]) -> Result
     }
     let qdir = format!("{}/{}", jc::ROOT, jc::QUERIES_DIR);
     let qid = mkdirs(fs, &qdir)?;
-    for (name, text) in jc::SAVED_QUERIES {
+    for (name, text) in jc::saved_queries() { // SMALLFIX4 item 13: built from the registered key
         let id = match fs.resolve_path(&format!("{qdir}/{name}")) {
             Ok(id) => {
                 fs.truncate_data(id, 0).map_err(fe)?;
@@ -171,7 +173,7 @@ fn read_record<D: BlockDevice>(fs: &mut UnaFS<D>, id: u64) -> Result<Option<Reco
     keys.extend(ino.large_attributes.keys().cloned());
     let mut attrs: Vec<(String, String)> = Vec::new();
     let mut seq = 0i64;
-    for k in keys.iter().filter(|k| k.starts_with("job:")) {
+    for k in keys.iter().filter(|k| k.starts_with(jc::job_ns())) {
         match fs.get_attribute(id, k).map_err(fe)? {
             Some(AttributeValue::String(s)) => attrs.push((k.clone(), s)),
             Some(AttributeValue::Int(i)) if k == jc::K_SEQ => seq = i,

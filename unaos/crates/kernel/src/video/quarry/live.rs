@@ -511,7 +511,7 @@ static MODEL: crate::sync::Mutex<Option<Model>> = crate::sync::Mutex::new(None);
 /// INVARIANT: once [`open`] has published it, the `Vec` is at its final length and never grows, so the
 /// address `wm` holds stays valid for the window's whole life. [`close`] drops it only after
 /// `wm::close` has removed the row.
-static SURF: crate::sync::Mutex<Vec<u8>> = crate::sync::Mutex::new(Vec::new());
+static SURF: crate::sync::Mutex<Vec<u32>> = crate::sync::Mutex::new(Vec::new()); // SMALLFIX4 (SECREVIEW F6): ARGB8888 WORDS, so the `[u32]` view needs no cast and no alignment promise the allocator never made
 
 /// Repaint sequence — the wire's proof that a scroll or a navigation actually redrew, and the number
 /// `quarry.md` §5's cost note is counted against.
@@ -1827,13 +1827,9 @@ fn repaint() {
         return;
     }
     {
-        // SAFETY: `surf` is a `Vec<u8>` of exactly `w * h * 4` bytes, allocated by `open` and never
-        // resized; a `[u32]` view over it is in-bounds and correctly aligned (a `Vec<u8>` from the
-        // global allocator meets `u32`'s alignment for a 4-byte-multiple length, and `wm` reads the
-        // same bytes as ARGB8888 words).
-        let px: &mut [u32] = unsafe {
-            core::slice::from_raw_parts_mut(surf.as_mut_ptr() as *mut u32, m.geom.w * m.geom.h)
-        };
+        // SMALLFIX4 (SECREVIEW F6): `surf` IS `w * h` ARGB8888 words (allocated by `open`, never resized), so
+        // the view is a plain reborrow — the old `Vec<u8>`-as-`[u32]` cast leaned on an alignment Rust does not promise.
+        let px: &mut [u32] = &mut surf[..];
         repaint_locked(m, px);
     }
     drop(surf);
@@ -1977,11 +1973,11 @@ pub fn open() {
     {
         let mut surf = SURF.lock();
         surf.clear();
-        if surf.try_reserve_exact(len).is_err() {
+        if surf.try_reserve_exact(g.w * g.h).is_err() {
             serial_println!("[quarry] DECLINE reason=alloc len={}", len);
             return;
         }
-        surf.resize(len, 0);
+        surf.resize(g.w * g.h, 0); // SMALLFIX4 (F6): words; `len` stays the byte length `wm` is handed
     }
     // The model, then the first full paint, then the row. `repaint` needs no window (it presents only
     // when one exists), so this ordering costs nothing and buys the "never composite a blank surface"
@@ -2605,7 +2601,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         if r >= tvis || i >= m.tree.len() {
             return Act::None;
         }
-        m.tree_sel = i;
+        m.tree_sel = i; let (prev_ms, prev_row, prev_tree) = (m.click_ms, m.click_row, m.click_pane == Pane::Tree); // QUARRYLIVE (B494): the previous press, for the tree's double-click
         // The tree stamps the click too, so a press here followed by a press in the LIST can never
         // combine into a double-click. `is_double` tests the PANE as well as the row, and this is
         // what makes that test load-bearing rather than decorative.
@@ -2623,7 +2619,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
             }
         } else {
             let p = m.tree[i].path.clone();
-            m.show(&p);
+            m.show(&p); livedir::tree_double(m, i, prev_ms, prev_row, prev_tree); // QUARRYLIVE (B494): Peter, flight 26 — a double-click on a tree row expands it
         }
         m.settle();
         return Act::None;
@@ -2665,7 +2661,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         // Two presses, same pane, same ROW, inside DOUBLE_CLICK_MS. The row test is what makes this
         // a gesture rather than a timer: a rapid press on row 3 then row 4 is two selections, which
         // is what an operator scanning a list is doing, and it must never run anything.
-        let now = crate::arch::ms();
+        if livedir::press(m, sx, i) { m.click_ms = 0; m.settle(); return Act::None; } let now = crate::arch::ms(); // QUARRYLIVE (B494): a press on a folder row's triangle expands it in place
         let dbl = is_double(m.click_ms, now, m.click_row, i, m.click_pane == Pane::List);
         if dbl { ops::cancel_attr_edit(); } else if i == m.list_sel && m.click_pane == Pane::List && attrcols::press_cell(m, sx, i) { m.click_row = i; m.click_ms = now; m.settle(); return Act::None; } // ATTRCOLUMNS (B402): a press on the selected row's attribute cell edits it in place; a double-click opens instead
         m.list_sel = i;
@@ -2724,6 +2720,9 @@ fn wheel_scroll(m: &mut Model, sx: usize, sy: usize, detents: i32) -> Option<Whe
     let tree = g.tree_pane().contains(sx, sy);
     if !tree && !g.list_pane().contains(sx, sy) {
         return None;
+    }
+    if !tree && toolbar::view() == toolbar::View::Columns {
+        return millercols::wheel(m, sx, sy, detents); // SMALLFIX4 (COLUMNSVIEW owed): the wheel moves the pane under the pointer
     }
     let (len, vis, scroll) = if tree {
         (m.tree.len(), m.tree_visible(), m.tree_scroll)
@@ -2894,7 +2893,7 @@ pub fn service() {
     // its own pixels repaints once (the login screen, Quarry, Settings, Activity, the viewer/editor, the installer)
     // and the console repaints its screenful from its cell store. See `font_repaint_pass` at this file's tail.
     font_repaint_pass();
-    quicklook::service(); columns::service(); // QUARRY3 (B413): the Quick Look panel renders here (I/O); QUARRY2 (B336): the latched column-width / sort preference write
+    quicklook::service(); columns::service(); openwith::service(); livedir::service(); // QUARRY3 (B413): the Quick Look panel renders here (I/O); QUARRY2 (B336): the latched column-width / sort preference write
 }
 
 // ── The witness ─────────────────────────────────────────────────────────────────────────────────
@@ -4327,7 +4326,7 @@ fn q3_paint(m: &Model, px: &mut [u32], li: Rect) {
 
 /// `tests quarry3` registration (rides `fs::filetype::ensure_tests`, no tests.rs line).
 pub fn quarry3_tests() {
-    crate::tests::register("quarry3", quarry3_selftest); dragdrop::tests(); // DRAGDROP (B440): `tests dragdrop`
+    crate::tests::register("quarry3", quarry3_selftest); dragdrop::tests(); livedir::tests(); // DRAGDROP (B440): `tests dragdrop`
     millercols::register(); // COLUMNSVIEW (B436): `tests columnsview` rides this registration
 }
 
@@ -4442,3 +4441,7 @@ pub mod millercols;
 // DRAGDROP (rmbp-ledger B440, MACPARITY row 18) — Quarry as the drag session's first participant (`video::dnd`).
 #[path = "dragdrop.rs"]
 pub mod dragdrop;
+
+// QUARRYLIVE (rmbp-ledger B494): the live relist, the list view's disclosure triangle, the tree double-click.
+#[path = "livedir.rs"]
+pub mod livedir;

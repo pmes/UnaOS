@@ -1465,8 +1465,8 @@ fn census_refresh(id: u32, i: usize) {
     // compositing at frame rate, arriving here dozens of times a second — costs one clock read and a
     // compare.
     let last = H_LASTROLL.get(i).load(Ordering::Relaxed);
-    let now = now_cycles();
-    if cycles_to_us(now.saturating_sub(last)) < CENSUS_PERIOD_US {
+    let now = now_cycles(); let period = wirediet_period_us(i); // WIREDIET (B461): 5 s unless a verdict-bearing counter moved
+    if cycles_to_us(now.saturating_sub(last)) < period {
         return;
     }
     // STORM-R1 — rate gate, the SYSTEM's. Everything above this point is per-id and therefore permits
@@ -1474,7 +1474,7 @@ fn census_refresh(id: u32, i: usize) {
     // its own documentation says it means. See [`H_LASTROLL_ANY`] for the boot-11 measurement.
     let any = H_LASTROLL_ANY.load(Ordering::Relaxed);
     let since_any = cycles_to_us(now.saturating_sub(any));
-    if since_any < CENSUS_PERIOD_US {
+    if since_any < period {
         return;
     }
     // …and the rotation, so the one slot per period is not simply taken every time by whichever
@@ -1868,7 +1868,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // stores happen on every emission — including the two latched ones — so the first refresh is
     // measured from the window's first rollup rather than from boot, and a window whose first rollup
     // is its last activity never refreshes at all.
-    H_LASTCENSUS.get(i).store(census_total(i), Ordering::Relaxed);
+    H_LASTCENSUS.get(i).store(census_total(i), Ordering::Relaxed); H_SAIDFOLD.get(i).store(verdict_fold(i), Ordering::Relaxed); // WIREDIET (B461): what this rollup said
     // STORM-R1 — one clock reading for both cells. Two readings would let the system's cell trail the
     // window's by the cost of the read, which is nothing on its own but makes the two gates describe
     // fractionally different periods for no reason.
@@ -4587,4 +4587,32 @@ pub fn blit_note(id: u32, cyc: u64, fell_back: bool) {
             H_GPUFB.get(i).fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+// ---- WIREDIET (rmbp-ledger B461, PERFREVIEW F5) — the census refresh on a MOVE or every 5 s ------
+
+/// WIREDIET: the refresh's heartbeat. A window whose verdict-bearing counters have not moved since its
+/// last rollup re-states its census at most this often (flights 24/25: every 2 s, 2884 lines); a window
+/// whose `torn=`/`declines=`/`stalls=`/`longpres=`/`gpu_fallback=` moved still speaks at [`CENSUS_PERIOD_US`].
+const WIREDIET_HEARTBEAT_US: u64 = 5_000_000;
+
+/// WIREDIET: the verdict fold this window's last rollup printed — one atomic per row.
+static H_SAIDFOLD: SegVec<AtomicU64> = SegVec::new(|| AtomicU64::new(0));
+
+/// WIREDIET: the counters a reader acts on, folded into one word (presents and samples are left out —
+/// they move every frame, which is why the delta gate alone never let an idle-but-animating window rest).
+#[inline]
+fn verdict_fold(i: usize) -> u64 {
+    let f = |c: &SegVec<AtomicU32>| c.get(i).load(Ordering::Relaxed) as u64;
+    f(&H_TORN)
+        ^ f(&H_DECLINE).rotate_left(13)
+        ^ f(&H_STALL).rotate_left(26)
+        ^ f(&H_LONGPRES).rotate_left(39)
+        ^ f(&H_GPUFB).rotate_left(52)
+}
+
+/// WIREDIET: the period `census_refresh` gates on for window `i`.
+#[inline]
+fn wirediet_period_us(i: usize) -> u64 {
+    if verdict_fold(i) != H_SAIDFOLD.get(i).load(Ordering::Relaxed) { CENSUS_PERIOD_US } else { WIREDIET_HEARTBEAT_US }
 }

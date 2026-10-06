@@ -653,7 +653,7 @@ impl App {
         let page = (self.rows_vis - 1).max(1);
         match input_ev_type(ev) {
             INPUT_EV_KEY_DOWN => self.key(p as u8),
-            INPUT_EV_CLOSE_REQ => exit(0), // APPMENU2 M6: the WM asks us to quit — nothing unsaved, so leave now
+            una_abi::INPUT_EV_DROP => self.dropped(p), INPUT_EV_CLOSE_REQ => exit(0), // APPMENU2 M6: the WM asks us to quit — nothing unsaved, so leave now
             INPUT_EV_ACTION => match p {
                 ACTION_CLEAR_VIEW if !self.busy => new_conversation(),
                 ACTION_CURSOR_LEFT => self.caret = self.caret.saturating_sub(1),
@@ -1467,6 +1467,7 @@ fn landmark_base() -> u64 {
 pub extern "C" fn _start() -> ! {
     let _ = &APP_NOTE;
     let base = landmark_base();
+    let t_start = now_ms(); // SMALLFIX6 (B495): the start's split, said before the first line
     let win = sys(SYS_WIN_CREATE, MAX_W as u64, MAX_H as u64, 0, 0);
     if win < 0 {
         Line::new(b":: LUMEN: SYS_WIN_CREATE refused ::").wire();
@@ -1484,11 +1485,13 @@ pub extern "C" fn _start() -> ! {
         a.paint();
     }
 
+    let t_win = now_ms();
     // The session: Principia's `vein` namespace, the key file, the rule.
     let cfg = vein_ring3::prefs::Config::read();
     // SETTINGSFILES (B407, R98): Lumen's own settings stanza, declared once — `app.lumen.*` in `<home>/settings/lumen`.
     let declared = vein_ring3::prefs::declare(vein_ring3::prefs::LUMEN_STANZA);
     unsafe { DECLARED = declared.err().unwrap_or(0) };
+    let t_bus = now_ms();
     let keybuf = unsafe { &mut *core::ptr::addr_of_mut!(KEY) };
     let mut kpath = [0u8; 128];
     // HOLOCRON2 M2 (B355): Holocron first (`vein/claude.api_key`, keysource::decide); the key file only on
@@ -1502,13 +1505,16 @@ pub extern "C" fn _start() -> ! {
             vein_ring3::key::read(kfile, keybuf)
         }
     };
+    let t_key = now_ms();
     let tls = vein_ring3::TlsSetup::load(); // VEINTLS (SR36)
+    let t_tls = now_ms();
     let plan = cfg.plan(key, tls.verify());
     let sess = Session { plan, key, key_n, cfg, tls };
     vein_ring3::net::set_tick(Some(tick));
 
     // M4: the newest conversation comes back.
     hist_init();
+    let t_hist = now_ms();
 
     // KERNELFONT2 (B363): the faces on the volume, into the heap the 64 MiB window holds; else the font8x8 grid.
     let font_why = match txt::load() {
@@ -1520,6 +1526,7 @@ pub extern "C" fn _start() -> ! {
         }
         Err(w) => Some(w),
     };
+    split_line(&[t_start, t_win, t_bus, t_key, t_tls, t_hist, now_ms()]);
 
     let mut l = Line::new(b":: LUMEN: start provider=");
     l.put(sess.provider()).put(b" model=").put(sess.model()).put(b" key=").put(match hk { vein_ring3::holocron::KeyFrom::Holocron(_) => b"holocron" as &[u8], _ => key.as_str().as_bytes() }).put(b" transport=").put(sess.transport());
@@ -1654,3 +1661,67 @@ static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(una_abi::APP_FLAG_WIND
 
 /// SETTINGSFILES (rmbp-ledger B407): the PrefDeclare status of Lumen's stanza (0 = declared).
 static mut DECLARED: i64 = 0;
+
+// DRAGDROP2 (rmbp-ledger B470) — Lumen is the first ring-3 drop participant: a file dropped on its window arrives
+// as `INPUT_EV_DROP`; the paths come over `BUS_VERB_DROP_GET` and land in the input line as `open <path> ...`
+// (`:: LUMEN: drop n=<n> first=<path> ::`, or `:: LUMEN: drop fail code=<n> ::`).
+impl App {
+    fn dropped(&mut self, payload: u64) {
+        let (token, _) = una_abi::drop_ev_parse(payload);
+        let mut body = [0u8; 2048];
+        let n = match vein_ring3::drop::get(token, &mut body) {
+            Ok(n) => n,
+            Err(e) => {
+                let mut l = Line::new(b":: LUMEN: drop fail code=");
+                l.dec(e).put(b" ::");
+                l.wire();
+                self.flash(&[b"drop refused"]);
+                return;
+            }
+        };
+        let mut count = 0i64;
+        let mut first: &[u8] = b"";
+        let put = |c: u8, a: &mut App| {
+            if a.inp_n < INP_CAP {
+                a.inp.copy_within(a.caret..a.inp_n, a.caret + 1);
+                a.inp[a.caret] = c;
+                a.caret += 1;
+                a.inp_n += 1;
+            }
+        };
+        for path in una_abi::drop_paths(&body[..n]) {
+            if count == 0 {
+                first = path;
+                for &c in b"open" {
+                    put(c, self);
+                }
+            }
+            put(b' ', self);
+            for &c in path {
+                if (0x20..0x7f).contains(&c) {
+                    put(c, self);
+                }
+            }
+            count += 1;
+        }
+        let mut l = Line::new(b":: LUMEN: drop n=");
+        l.dec(count).put(b" first=").put(first).put(b" ::");
+        l.wire();
+    }
+}
+
+/// SMALLFIX6 (rmbp-ledger B495): flight 26 read `LUMENCRASH first_line=12262` with no split. One line before the
+/// first, the start's cost by phase (ms on the kernel clock): `win` the window, `bus` Principia's prefs and the
+/// stanza declaration (bus round trips), `key` Holocron and the key file, `tls` the trust roots, `hist` the newest
+/// conversation, `font` the faces read off the volume. `start_at_ms` is `_start` on the kernel clock, so the seat
+/// reads the ELF load + APPRES sight as `start_at_ms` minus the spawn (the kernel's `[lumencrash] … spawn_ms=`).
+///
+/// `[lumen] first_line_ms=<n> start_at_ms=<n> win_ms=<n> bus_ms=<n> key_ms=<n> tls_ms=<n> hist_ms=<n> font_ms=<n>`
+fn split_line(t: &[u64; 7]) {
+    let d = |i: usize| t[i + 1].saturating_sub(t[i]) as i64;
+    let mut l = Line::new(b"[lumen] first_line_ms=");
+    l.dec(t[6].saturating_sub(t[0]) as i64).put(b" start_at_ms=").dec(t[0] as i64);
+    l.put(b" win_ms=").dec(d(0)).put(b" bus_ms=").dec(d(1)).put(b" key_ms=").dec(d(2));
+    l.put(b" tls_ms=").dec(d(3)).put(b" hist_ms=").dec(d(4)).put(b" font_ms=").dec(d(5));
+    l.wire();
+}

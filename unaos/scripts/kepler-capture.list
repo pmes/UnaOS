@@ -8,6 +8,41 @@
 # first, restored after). One line per read on the capture:
 #     <offset> <value> <name>
 #
+# ---- THE BENCH'S HOW (KEPLERGR2, rmbp-ledger B463): a Linux/nouveau boot on the rMBP, commands only, no values ----
+# 1. Boot any Linux live USB whose kernel carries nouveau (6.x), kernel command line + `nouveau.runpm=0` (the GK107 stays
+#    powered between reads). On this MacBookPro10,1 the gmux may leave the dGPU off: as root,
+#        cat /sys/kernel/debug/vgaswitcheroo/switch        # the 10de line must read Pwr; if Off:
+#        echo ON > /sys/kernel/debug/vgaswitcheroo/switch
+# 2. Confirm the driver owns the part and has initialised fifo:
+#        lspci -nnk -d 10de:                                # "Kernel driver in use: nouveau"
+#        dmesg | grep -i -E 'nouveau .*(fifo|gr|ce|fb)'     # keep the whole dmesg beside the capture
+# 3. Make at least one channel LIVE and leave it running through the reads (a GR channel and a CE channel):
+#        DRI_PRIME=1 glxgears &                             # GR; or: kmscube -D /dev/dri/card<N> (the 10de card)
+#        DRI_PRIME=1 glxinfo -B                             # names the renderer: must be NVE7 / GK107, not the iGPU
+# 4. The device:  bdf=$(lspci -D -d 10de: | awk '/VGA|3D/{print $1; exit}')
+# 5. Read every row below (count words at stride), one "<offset> <value> <name>" line each, as root:
+#        envytools:  nvapeek <offset> [<bytes>]            # e.g. a row of count 8 stride 0x8 is 8 single nvapeeks
+#        or plain python (read-only mmap of BAR0, 32-bit little-endian):
+#        python3 - "$bdf" < unaos/scripts/kepler-capture.list > regs.txt <<'PY'
+#        import mmap, os, struct, sys
+#        fd = os.open("/sys/bus/pci/devices/%s/resource0" % sys.argv[1], os.O_RDONLY | os.O_SYNC)
+#        m = mmap.mmap(fd, 16 << 20, mmap.MAP_SHARED, mmap.PROT_READ)
+#        for ln in sys.stdin:
+#            f = ln.split()
+#            if not f or f[0].startswith("#"): continue
+#            off, n, st, name = int(f[0], 16), int(f[1]), int(f[2], 16), f[3]
+#            for i in range(n):
+#                o = off + i * st
+#                print("%06x %08x %s[%d]" % (o, struct.unpack_from("<I", m, o)[0], name, i))
+#        PY
+#    (the script is here, the file it writes is not: there is no value in this repo until the bench has one)
+# 6. The DERIVED step (RAMFC + USERD of each VALID channel) needs the ONE write: with envytools, per instance page,
+#        nvapeek 0x1700                                    # the pre-image, written down first
+#        nvapoke 0x1700 <inst >> 16>; nvapeek 0x700000+(inst & 0xffff) 0x100; nvapeek 0x700200+(inst & 0xffff) 0x10
+#        nvapoke 0x1700 <the pre-image>; nvapeek 0x1700     # restored AND read back
+# 7. Keep: regs.txt, derived.txt, the full dmesg, `cat /sys/kernel/debug/dri/*/name`, `uname -a`, in
+#    docs/dev/evidence/<round>/gk107-capture/ — the reference image DRIVERS-METHOD §2 diffs our boot against.
+#
 # Columns: offset (BAR0, hex) · count (consecutive 32-bit words) · stride (hex, between words) · name · source
 #
 # ---- PMC / PTOP -----------------------------------------------------------------------------------------------
