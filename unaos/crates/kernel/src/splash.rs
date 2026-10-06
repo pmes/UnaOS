@@ -58,26 +58,26 @@ pub fn active() -> bool {
 static HOLD_GLASS: AtomicBool = AtomicBool::new(false);
 
 /// Splash backdrop — near-black, so the beam and spectrum carry the frame.
-const SPLASH_BG: u32 = 0x0006_0608;
+const SPLASH_BG: u32 = crate::video::theme::painter::SPLASH_BG;
 /// Facet edge line — faint cool grey, drawn last so the crystal reads over the rays.
-const SPLASH_EDGE: u32 = 0x004A_4658;
+const SPLASH_EDGE: u32 = crate::video::theme::painter::SPLASH_EDGE;
 /// Inner facet line — dimmer still.
-const SPLASH_FACET: u32 = 0x002C_2936;
+const SPLASH_FACET: u32 = crate::video::theme::painter::SPLASH_FACET;
 /// The white beam (pre-entry).
-const SPLASH_BEAM: u32 = 0x00F2_F2EE;
+const SPLASH_BEAM: u32 = crate::video::theme::painter::SPLASH_BEAM;
 
 /// Spectrum sample count and colours, red → violet.
 const NRAYS: usize = 9;
 const SPECTRUM: [u32; NRAYS] = [
-    0x00E8_1414, // deep red
-    0x00F0_5810, // red-orange
-    0x00F8_9008, // orange
-    0x00F0_D010, // yellow
-    0x0060_D818, // yellow-green
-    0x0018_C860, // green
-    0x0018_B8C8, // cyan
-    0x002E_58E8, // blue
-    0x0090_28D8, // violet
+    crate::video::theme::painter::SPLASH_SPECTRUM[0], // deep red
+    crate::video::theme::painter::SPLASH_SPECTRUM[1], // red-orange
+    crate::video::theme::painter::SPLASH_SPECTRUM[2], // orange
+    crate::video::theme::painter::SPLASH_SPECTRUM[3], // yellow
+    crate::video::theme::painter::SPLASH_SPECTRUM[4], // yellow-green
+    crate::video::theme::painter::SPLASH_SPECTRUM[5], // green
+    crate::video::theme::painter::SPLASH_SPECTRUM[6], // cyan
+    crate::video::theme::painter::SPLASH_SPECTRUM[7], // blue
+    crate::video::theme::painter::SPLASH_SPECTRUM[8], // violet
 ];
 /// Per-sample refractive index, Q16.16. Physically red bends least; the spread is exaggerated
 /// (1.30 → ~1.79) so the fans read at panel size across a room.
@@ -638,7 +638,7 @@ pub fn advance(tag: &str) { #[cfg(feature = "wc")] if ANIM.load(Ordering::Relaxe
             let seed = (pi as i64 * 5 + i as i64) * 17;
             let g = (((p * 3 + seed) % steps) + steps) % steps;
             let gl = (steps / 6).max(4);
-            edge_run(&fb, a, b, g - gl / 2, g + gl / 2, dim(0x00FF_FFFF, inten as u32));
+            edge_run(&fb, a, b, g - gl / 2, g + gl / 2, dim(crate::video::theme::painter::SPLASH_GLINT, inten as u32));
         }
     }
 }
@@ -894,20 +894,20 @@ pub fn step_label(text: &str) {
         let put = |s: &mut alloc::vec::Vec<u8>, o: usize, px: u32| s[o..o + 4].copy_from_slice(&px.to_le_bytes());
         for y in y0..y0 + band_h {
             for x in 0..w {
-                put(surf, (y * w + x) * 4, 0x0010_1418);
+                put(surf, (y * w + x) * 4, crate::video::theme::painter::SPLASH_CAPTION_BG);
             }
         }
         let bytes = text.as_bytes();
         let n = crate::video::text::fit(bytes, true, crate::video::text::Face::Chrome, w); // KERNELFONT (B359): through `video::text`
         let x0 = (w - crate::video::text::advance(&bytes[..n], true, crate::video::text::Face::Chrome).min(w)) / 2;
         let ty = y0 + (band_h - ch) / 2;
-        let _ = crate::video::text::draw_with(&bytes[..n], true, crate::video::text::Face::Chrome, x0, ty as isize, w - x0, 0x00E8_E8F0, &mut |px, py, a| {
+        let _ = crate::video::text::draw_with(&bytes[..n], true, crate::video::text::Face::Chrome, x0, ty as isize, w - x0, crate::video::theme::painter::SPLASH_CAPTION_INK, &mut |px, py, a| {
             if px < 0 || py < 0 || px as usize >= w || py as usize >= h {
                 return;
             }
             let o = (py as usize * w + px as usize) * 4;
             let bg = u32::from_le_bytes([surf[o], surf[o + 1], surf[o + 2], surf[o + 3]]);
-            put(surf, o, font::blend(bg, 0x00E8_E8F0, a));
+            put(surf, o, font::blend(bg, crate::video::theme::painter::SPLASH_CAPTION_INK, a));
         });
         let _ = face;
         //

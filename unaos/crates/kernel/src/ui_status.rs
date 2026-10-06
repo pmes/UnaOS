@@ -226,12 +226,12 @@ use crate::sync::Mutex;
 // ---------------------------------------------------------------------------------------------
 
 /// Meter palette — an unfilled segment: alive-but-empty, never blank.
-pub(crate) const METER_DIM: u32 = 0x00_2A2432;
+pub(crate) const METER_DIM: u32 = crate::video::theme::painter::METER_DIM;
 /// PULSE-ALIVE breath colour — clearly brighter than `METER_DIM`, dimmer than a load fill: the one
 /// sweeping segment an idle-but-scheduled core lights so "alive and idle" reads at a glance.
-pub(crate) const METER_BREATH: u32 = 0x00_5F4E86;
+pub(crate) const METER_BREATH: u32 = crate::video::theme::painter::METER_BREATH;
 /// Parked dash colour — cooler/dimmer than `METER_DIM` so a broken track reads as "not participating".
-pub(crate) const METER_PARKED: u32 = 0x00_3A3550;
+pub(crate) const METER_PARKED: u32 = crate::video::theme::painter::METER_PARKED;
 
 /// VUG-HONESTY parked-core marker (a load-array sentinel, disjoint from the 0..=100 percent range). A
 /// core whose pulse counters are frozen this window AND that is NOT the demo core is parked /
@@ -319,15 +319,15 @@ const HOSTNAME: &str = "unaos.local";
 
 /// Strip background (a shade darker than the Moonstone console background, so the bar reads as a
 /// distinct chrome band rather than more terminal).
-const STRIP_BG: u32 = 0x1B1A3A;
+const STRIP_BG: u32 = crate::video::theme::painter::STATUS_STRIP_BG;
 /// Strip foreground text (Aqua — legible on the dark band, distinct from the grey history text).
-const STRIP_FG: u32 = 0x7BD0E0;
+const STRIP_FG: u32 = crate::video::theme::painter::STATUS_STRIP_FG;
 
 /// PULSE-2 instrument-panel background — darker than the status band, so the two bottom bands read as
 /// two distinct instruments rather than one thick smear of chrome.
-const PANEL_BG: u32 = 0x0E0D22;
+const PANEL_BG: u32 = crate::video::theme::painter::PULSE_PANEL_BG;
 /// PULSE-2 label / percent text.
-const PANEL_FG: u32 = 0x9FB4C8;
+const PANEL_FG: u32 = crate::video::theme::painter::PULSE_PANEL_FG;
 
 /// The settled interface IPv4 (leased or static-fallback), or `None` before any bring-up completed.
 /// Wrapped so the strip compiles on a net-less kernel (the `net_phy` module is gated on the net
@@ -796,9 +796,9 @@ fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
 
 // The instrument scale: green through amber to red across the bar. A VU-meter ramp, not chrome — the
 // level reads before any digit does, which is the whole job of a bench instrument.
-const LED_GREEN: u32 = 0x00_2ECC71;
-const LED_AMBER: u32 = 0x00_F1C40F;
-const LED_RED: u32 = 0x00_E74C3C;
+const LED_GREEN: u32 = crate::video::theme::painter::LED_GREEN;
+const LED_AMBER: u32 = crate::video::theme::painter::LED_AMBER;
+const LED_RED: u32 = crate::video::theme::painter::LED_RED;
 
 /// The base colour of LED `s` of `n`: green below 60% of full scale, ramping through amber to red at
 /// the top. Position on the SCALE, not on the load — so a given LED is always the same colour and the

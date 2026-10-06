@@ -208,21 +208,21 @@ pub fn jd1_test_pattern(fb: &ScanoutFb) {
     // Colours are written as 0x00RRGGBB; `put_pixel` reorders per the pixel format, so a *correct*
     // format shows them in the named order and a wrong one swaps red/blue — the point of the bars.
     let bars = [
-        0x0000_0000u32, // black
-        0x0000_00FF,    // blue
-        0x0000_FF00,    // green
-        0x0000_FFFF,    // cyan
-        0x00FF_0000,    // red
-        0x00FF_00FF,    // magenta
-        0x00FF_FF00,    // yellow
-        0x00FF_FFFF,    // white
+        crate::video::theme::testcard::BLACK, // black
+        crate::video::theme::testcard::BLUE, // blue
+        crate::video::theme::testcard::GREEN, // green
+        crate::video::theme::testcard::CYAN, // cyan
+        crate::video::theme::testcard::RED, // red
+        crate::video::theme::testcard::MAGENTA, // magenta
+        crate::video::theme::testcard::YELLOW, // yellow
+        crate::video::theme::testcard::WHITE, // white
     ];
     let bw = (w / bars.len()).max(1);
     for (i, &c) in bars.iter().enumerate() {
         surf.fill_rect(i * bw, 0, bw, h, c);
     }
     // A bright 4-pixel frame around the visible area — a wrong stride/height makes it wrap or shear.
-    let edge = 0x00FF_FFFFu32;
+    let edge = crate::video::theme::testcard::WHITE;
     surf.fill_rect(0, 0, w, 4, edge);
     surf.fill_rect(0, h.saturating_sub(4), w, 4, edge);
     surf.fill_rect(0, 0, 4, h, edge);
@@ -451,16 +451,16 @@ pub fn orin_wm1() -> crate::video::wm::WinId {
     //    mean the compositor's panel conversion is right, and swapped red/blue would name it wrong.
     //    A white frame proves the box's extent, and the magenta centre proves the interior is ours and
     //    not a stale boot-log glyph showing through.
-    surf.fill_screen(0x0000_00FF); // blue field
-    surf.fill_rect(0, 0, cw / 2, ch / 2, 0x00FF_0000); // red    — top-left
-    surf.fill_rect(cw / 2, 0, cw - cw / 2, ch / 2, 0x0000_FF00); // green  — top-right
-    surf.fill_rect(cw / 2, ch / 2, cw - cw / 2, ch - ch / 2, 0x00FF_FF00); // yellow — bottom-right
-    surf.fill_rect(cw / 4, ch / 4, cw / 2, ch / 2, 0x00FF_00FF); // magenta centre block
+    surf.fill_screen(crate::video::theme::testcard::BLUE); // blue field
+    surf.fill_rect(0, 0, cw / 2, ch / 2, crate::video::theme::testcard::RED); // red    — top-left
+    surf.fill_rect(cw / 2, 0, cw - cw / 2, ch / 2, crate::video::theme::testcard::GREEN); // green  — top-right
+    surf.fill_rect(cw / 2, ch / 2, cw - cw / 2, ch - ch / 2, crate::video::theme::testcard::YELLOW); // yellow — bottom-right
+    surf.fill_rect(cw / 4, ch / 4, cw / 2, ch / 2, crate::video::theme::testcard::MAGENTA); // magenta centre block
     let f = 4usize;
-    surf.fill_rect(0, 0, cw, f, 0x00FF_FFFF);
-    surf.fill_rect(0, ch.saturating_sub(f), cw, f, 0x00FF_FFFF);
-    surf.fill_rect(0, 0, f, ch, 0x00FF_FFFF);
-    surf.fill_rect(cw.saturating_sub(f), 0, f, ch, 0x00FF_FFFF);
+    surf.fill_rect(0, 0, cw, f, crate::video::theme::testcard::WHITE);
+    surf.fill_rect(0, ch.saturating_sub(f), cw, f, crate::video::theme::testcard::WHITE);
+    surf.fill_rect(0, 0, f, ch, crate::video::theme::testcard::WHITE);
+    surf.fill_rect(cw.saturating_sub(f), 0, f, ch, crate::video::theme::testcard::WHITE);
 
     // 6. SPAWN-PLACE — the outer box is sized BEFORE any row exists and the row is created THERE,
     //    pinned, so no pixel of this window is ever presented at a position it will not occupy.
@@ -643,7 +643,7 @@ fn orin_chrome_probe(
         oy + wm::TITLE_H() + wm::BORDER() + ch * scale / 2,
     );
     let content = fb.read_pixel(cx, cy);
-    let content_ok = content == Some(0x00FF_00FF);
+    let content_ok = content == Some(crate::video::theme::testcard::MAGENTA);
 
     // CERAMIC'S POPULATION — printed raw, never judged.
     let strip = fb.read_pixel(ox + ow - wm::BORDER() - 2, oy + wm::BORDER() + wm::TITLE_H() / 2);
@@ -3535,9 +3535,9 @@ const LAD_GLASS_PERIOD: u32 = 6;
 /// `ink` alone would be satisfied by any foreign window overlapping the box; `stem` is what makes it
 /// this console's own text.
 #[cfg(feature = "orinladder")]
-const LAD_PAPER: u32 = 0x0000_0000;
+const LAD_PAPER: u32 = crate::video::theme::CONSOLE_BG;
 #[cfg(feature = "orinladder")]
-const LAD_INK: u32 = 0x00C0_C0C0;
+const LAD_INK: u32 = crate::video::theme::CONSOLE_TEXT;
 
 // ── ORIN-GLASSINK — why the two constants above are not enough, and what was added ───────────────
 //
@@ -4713,7 +4713,7 @@ pub fn sup_present_census(tick: u64) {
 
 /// ORIN-RASTGLASS — `rast_demo`'s backdrop, restated (rast_demo.rs:96). See the ⚠ note above.
 #[cfg(feature = "rast")]
-const RG_PAPER: u32 = 0x0010_1018;
+const RG_PAPER: u32 = crate::video::theme::painter::RAST_PAPER;
 /// ORIN-RASTGLASS — **A67: the restated geometry is GONE, and that is the repair.**
 ///
 /// These two constants used to be `rast_demo`'s render size copied by hand (`320` x `240`), with the

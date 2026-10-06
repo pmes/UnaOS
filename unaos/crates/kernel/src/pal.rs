@@ -215,8 +215,8 @@ pub mod cursor {
         0b1101_1000,
         0b1000_1100,
     ];
-    const FILL: u32 = 0x00FF_FFFF; // white arrow
-    const SHADOW: u32 = 0x0010_1014; // near-black drop shadow — visible on any light content
+    const FILL: u32 = crate::video::theme::POINTER_FILL; // white arrow
+    const SHADOW: u32 = crate::video::theme::POINTER_SHADOW; // near-black drop shadow — visible on any light content
 
     /// Hot-spot position (arrow tip), lazily centred on first use. One shared position: the
     /// console loop and the full-screen demos all move/draw the same cursor.

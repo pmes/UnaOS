@@ -803,7 +803,7 @@ pub const TERM_DIM: u8 = 90;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering as AOrd};
 
-/// The colour literals under `video/` outside this file — certified by `unaos/scripts/appearance-check.py`.
+/// The colour literals under `video/` outside this file and in the listed painters (`scripts/appearance.painters`) — certified by `unaos/scripts/appearance-check.py`.
 pub const AUDIT_LITERALS_OUTSIDE: usize = 0;
 
 /// One palette token. Light = the kit (crispy) values above, unchanged; Dark = ours (neutral greys, the same accent).
@@ -1045,3 +1045,55 @@ const _: () = {
     assert!(Tok::SyntaxLit as usize + 1 == TOKENS);
     assert!(ACCENTS.len() == 8);
 };
+
+// ── PAINTERSCOPE (rmbp-ledger B482) — the painters OUTSIDE video/ read their colours here ──────────────────────────
+// `unaos/scripts/appearance.painters` lists every kernel file outside `video/` that puts a colour on the glass;
+// `appearance-check.py` scans them with `video/` and counts toward [`AUDIT_LITERALS_OUTSIDE`]. Their roles live in
+// `painter` (one look each: the console, the status bands, the boot splash, the Orin probes); the format-check
+// primaries a panel bring-up paints live in `testcard`. Values are the literals they replaced, unchanged.
+pub mod painter {
+    /// `console.rs` — the scrollback page band and its thumb.
+    pub const CONSOLE_BAND: u32 = 0x003A_3868;
+    /// `ui_status.rs` — a core meter's unfilled segment, its idle breath, its parked dash.
+    pub const METER_DIM: u32 = 0x002A_2432;
+    pub const METER_BREATH: u32 = 0x005F_4E86;
+    pub const METER_PARKED: u32 = 0x003A_3550;
+    /// `ui_status.rs` — the status strip (ground, aqua text) and the pulse instrument panel under it.
+    pub const STATUS_STRIP_BG: u32 = 0x001B_1A3A;
+    pub const STATUS_STRIP_FG: u32 = 0x007B_D0E0;
+    pub const PULSE_PANEL_BG: u32 = 0x000E_0D22;
+    pub const PULSE_PANEL_FG: u32 = 0x009F_B4C8;
+    /// `ui_status.rs` — the instrument LED ramp, green through amber to red.
+    pub const LED_GREEN: u32 = 0x002E_CC71;
+    pub const LED_AMBER: u32 = 0x00F1_C40F;
+    pub const LED_RED: u32 = 0x00E7_4C3C;
+    /// `splash.rs` — the boot splash: backdrop, facet edge, inner facet, the white beam, the edge glint.
+    pub const SPLASH_BG: u32 = 0x0006_0608;
+    pub const SPLASH_EDGE: u32 = 0x004A_4658;
+    pub const SPLASH_FACET: u32 = 0x002C_2936;
+    pub const SPLASH_BEAM: u32 = 0x00F2_F2EE;
+    pub const SPLASH_GLINT: u32 = 0x00FF_FFFF;
+    /// `splash.rs` — the refracted spectrum, red to violet (one per ray sample).
+    pub const SPLASH_SPECTRUM: [u32; 9] = [
+        0x00E8_1414, 0x00F0_5810, 0x00F8_9008, 0x00F0_D010, 0x0060_D818, //
+        0x0018_C860, 0x0018_B8C8, 0x002E_58E8, 0x0090_28D8,
+    ];
+    /// `splash.rs` — the takeover caption band and its ink.
+    pub const SPLASH_CAPTION_BG: u32 = 0x0010_1418;
+    pub const SPLASH_CAPTION_INK: u32 = 0x00E8_E8F0;
+    /// `display_tegra.rs` ORIN-RASTGLASS — `rast_demo`'s `RW_CLEAR` (0x10, 0x10, 0x18) as the packed word.
+    pub const RAST_PAPER: u32 = 0x0010_1018;
+}
+
+/// The pure primaries a panel bring-up paints to prove the pixel format (`display_tegra.rs`'s bars and quadrant
+/// card): in the named order the format is right, red/blue swapped names it wrong. Not a theme — a test card.
+pub mod testcard {
+    pub const BLACK: u32 = 0x0000_0000;
+    pub const BLUE: u32 = 0x0000_00FF;
+    pub const GREEN: u32 = 0x0000_FF00;
+    pub const CYAN: u32 = 0x0000_FFFF;
+    pub const RED: u32 = 0x00FF_0000;
+    pub const MAGENTA: u32 = 0x00FF_00FF;
+    pub const YELLOW: u32 = 0x00FF_FF00;
+    pub const WHITE: u32 = 0x00FF_FFFF;
+}
