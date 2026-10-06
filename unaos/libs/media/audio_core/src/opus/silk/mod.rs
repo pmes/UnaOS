@@ -189,7 +189,7 @@ impl SilkDecoder {
         }
         if nci == 2 && !decode_only_middle && self.prev_decode_only_middle {
             let c1 = &mut self.ch[1];
-            c1.out_buf = [0; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH];
+            c1.out_buf.fill(0);
             c1.slpc_q14_buf = [0; MAX_LPC_ORDER];
             c1.lag_prev = 100;
             c1.last_gain_index = 10;
