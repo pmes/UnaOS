@@ -351,6 +351,8 @@ pub fn request_open() {
 
 /// Drain the open latch and load the store once per login. Chained from `quarry::live::service`.
 pub fn service() {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    super::launcher::service(); // LAUNCHER (B417): the launcher's pass (snapshot, ranking, picks, the recency file) — off the input router
     crate::prefs::service(); super::loginitems::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
@@ -789,7 +791,8 @@ pub fn open() -> Result<(), String> {
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
     let tab0 = CUR.lock().tab as usize;
-    let mut st = State { sel: tab_ctrls(tab0).first().copied().unwrap_or(0), strip: true, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf };
+    let (sel0, strip0) = take_at(tab0); // LAUNCHER (B417): a launcher pick opens on its row
+    let mut st = State { sel: sel0, strip: strip0, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf };
     paint(&mut st, &CUR.lock().clone());
     let base = st.surf.as_ptr() as usize;
     let id = wm::create_at_native(OWNER, base, len * 4, sw as u32, sh as u32, (sw * 4) as u32, b"Settings", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
@@ -1705,4 +1708,54 @@ fn dock_rows_press(row: usize, cx: usize) {
         return;
     }
     repaint();
+}
+
+// ── LAUNCHER (B417): open on the row a preference key names ──────────────────────────────────
+
+/// `(tab << 8) | control` latched by [`request_open_at`]; `u32::MAX` = none.
+static AT: AtomicU32 = AtomicU32::new(u32::MAX);
+const AT_FIRST: usize = 0xFF;
+
+/// The tab and control a `system.*` schema key lives on (`AT_FIRST` = the tab's first control).
+pub fn row_of_key(key: &str) -> (usize, usize) {
+    match key {
+        "display.brightness" => (2, 0),
+        "display.idle_min" => (2, 3),
+        "display.font" => (2, 9),
+        "display.font_size" => (2, 10),
+        "audio.volume" | "audio.amp_holdoff_ms" => (0, 1),
+        "audio.mute" => (0, 2),
+        "pointer.speed" => (0, 4),
+        "display.wallpaper" => (0, 5),
+        k if k.starts_with("display.") => (2, AT_FIRST),
+        k if k.starts_with("login.") => (4, AT_FIRST),
+        _ => (0, AT_FIRST),
+    }
+}
+
+/// Open Settings (latched for [`service`], router-safe) on the row `key` names. Returns `(tab, control)`.
+pub fn request_open_at(key: &str) -> (usize, usize) {
+    let (tab, ctrl) = row_of_key(key);
+    AT.store(((tab as u32) << 8) | ctrl as u32, Ordering::Release);
+    if let Some(mut c) = CUR.try_lock() {
+        c.tab = tab as u8;
+    }
+    request_open();
+    (tab, ctrl)
+}
+
+/// The opening selection on `tab`: the latched row when one is owed for this tab (focus on the row), else the
+/// tab's first control with focus on the strip (the old open).
+fn take_at(tab: usize) -> (usize, bool) {
+    let first = tab_ctrls(tab).first().copied().unwrap_or(0);
+    let a = AT.swap(u32::MAX, Ordering::AcqRel);
+    if a != u32::MAX && (a >> 8) as usize == tab {
+        let c = (a & 0xFF) as usize;
+        if c != AT_FIRST && tab_ctrls(tab).contains(&c) {
+            serial_println!("[settings] open at tab={} control={} (launcher)", tab, NAMES[c]);
+            return (c, false);
+        }
+        return (first, false);
+    }
+    (first, true)
 }

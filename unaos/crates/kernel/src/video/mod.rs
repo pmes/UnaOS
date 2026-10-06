@@ -1209,3 +1209,6 @@ pub mod bezel;
 // PANICSCREEN (B406, MACPARITY row 37, R95): the plain panic screen, the panic log, the restart. At the tail so no line above moves.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod panicscreen;
+// LAUNCHER (B417, MACPARITY row 36): Cmd-Space — one field over programs, files, settings and math. x86 `wc` (the overlay row and the key door are x86's); at the tail so no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod launcher;

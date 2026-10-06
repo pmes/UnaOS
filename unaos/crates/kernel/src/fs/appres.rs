@@ -554,6 +554,8 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("appres", selftest);
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        crate::video::launcher::ensure_tests(); // LAUNCHER (B417): `tests launcher` rides this registration (no tests.rs line)
     }
 }
 
@@ -625,3 +627,23 @@ pub fn selftest() {
         if lumen_seen { "staged" } else { "absent" }, root_attrs, SIGHTS.load(Ordering::Relaxed), DRAWN.load(Ordering::Relaxed));
 }
 
+
+/// LAUNCHER (B417): draw the icon of the app `key` (a built-in or a sighted program) at `(x, y)`, `size`
+/// square, into a `stride`-wide surface of `h` rows. `false` when nothing was drawn (never waits on a lock).
+pub fn blit_key_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: usize, size: usize, key: &str) -> bool {
+    with_pix(key, size, |argb| {
+        for r in 0..size {
+            if y + r >= h {
+                break;
+            }
+            for c in 0..size {
+                if x + c >= stride {
+                    break;
+                }
+                let d = &mut px[(y + r) * stride + x + c];
+                *d = over(argb[r * size + c], *d);
+            }
+        }
+    })
+    .is_some()
+}
