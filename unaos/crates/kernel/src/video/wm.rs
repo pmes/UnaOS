@@ -6073,7 +6073,7 @@ fn composite_inner() -> CursorTail {
     }
 
     #[cfg(feature = "witness")]
-    let mut seed = Scratch::take(&SEED_POOL, dirty.len()); seed.extend_from_slice(&dirty); // COMPSCRATCH (B462): the copy lands in a pooled buffer; WINDOWCAP-2: a Vec now, so the seed is an explicit copy
+    let seed = { let mut s = Scratch::take(&SEED_POOL, dirty.len()); s.extend_from_slice(&dirty); s }; // COMPSCRATCH (B462): the copy lands in a pooled buffer; WINDOWCAP-2: a Vec now, so the seed is an explicit copy
     // NOATT — the discriminator, taken HERE: `seed` is the damage set as the table snapshot found it,
     // so every row in it was marked by something OUTSIDE this pass, and `bands` still holds each
     // row's OWN declared extent (the closure below only ever widens rows ABOVE a dragger). Both facts
@@ -30379,6 +30379,7 @@ const SCRATCH_POOL_N: usize = 4;
 type ScratchPool<T> = [Mutex<alloc::vec::Vec<T>>; SCRATCH_POOL_N];
 static PAINT_POOL: ScratchPool<(usize, usize, usize, usize)> = [const { Mutex::new(alloc::vec::Vec::new()) }; SCRATCH_POOL_N];
 static DIRTY_POOL: ScratchPool<bool> = [const { Mutex::new(alloc::vec::Vec::new()) }; SCRATCH_POOL_N];
+#[cfg(feature = "witness")]
 static SEED_POOL: ScratchPool<bool> = [const { Mutex::new(alloc::vec::Vec::new()) }; SCRATCH_POOL_N];
 static BANDS_POOL: ScratchPool<Option<(usize, usize)>> = [const { Mutex::new(alloc::vec::Vec::new()) }; SCRATCH_POOL_N];
 static ORDER_POOL: ScratchPool<usize> = [const { Mutex::new(alloc::vec::Vec::new()) }; SCRATCH_POOL_N];

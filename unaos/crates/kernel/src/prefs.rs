@@ -1156,6 +1156,7 @@ impl SessionSeen {
         self.seen.store(k | some as u64, Ordering::Release);
     }
 
+    #[allow(dead_code)] // used by the selftest and login items, absent on some arms
     pub(crate) fn forget(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
     }
