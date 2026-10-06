@@ -125,6 +125,7 @@ fn complete(line: &mut String, sel: &mut LineSel, caret: usize, verbs: &[&str],
 
 /// The real binding: `Console` line + caret, the shell's history, the verb table, the mount table.
 pub fn console_key(c: u8, console: &mut crate::console::Console) -> u8 {
+    if c == 0x03 && crate::shelltask::interrupt(console) { return 2; } // SHELLTASK2 (B474): Ctrl-C aborts the shell window's running job (the line is kept)
     let hist = crate::shell::history_lines();
     let verbs = crate::shell::verb_names();
     let o = { let mut nav = NAV.lock(); key(c, &mut console.current_input, &mut console.sel, &hist, &mut nav, &verbs, &crate::shell::complete_ls) };

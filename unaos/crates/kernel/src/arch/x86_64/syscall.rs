@@ -16894,7 +16894,7 @@ pub fn run_user_image_argv(
     // before `spawn_user_preemptible` below, for the same reason `spawn_user_image_bg_inner` arms
     // before its spawn: the task can reach `SYS_WIN_CREATE` the instant it is runnable.
     crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1); let _ = crate::origin::note_spawn(mapped.slot); // DIALOG2 (B404): the slot's explicit ORIGIN (`[spawn] origin=`). DIALOG (B395): the slot's glass-launch bit (Quarry's `run <path>` line is the glass's)
-    let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
+    let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new()); let _fg = fg_arm(&kill); // SHELLTASK2 (B474): Ctrl-C in the shell window reaches THIS program (`fg_interrupt`); cleared on every return
     // SMPBAL-X86: a foreground `run` is load-balanced, not stuck on the caller's core. The caller is
     // `x86_render_service` (the shell runs there since SCHED-X86), so `meter_current_cpu()` put every
     // program on the RENDER core and a `run` degraded the panel for its whole duration — the open
@@ -16915,7 +16915,7 @@ pub fn run_user_image_argv(
     // Deadline-bounded wait. Yielding (not sleeping) so this works before the timebase is calibrated and
     // so the shell task stays responsive to its own core's scheduler.
     let deadline = crate::arch::ticks() + deadline_ms;
-    while PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && crate::arch::ticks() < deadline {
+    while PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && crate::arch::ticks() < deadline && !kill.is_reaped() { // SHELLTASK2 (B474): an interrupted program ends the wait
         crate::arch::sched::yield_now();
     }
 
@@ -30582,3 +30582,38 @@ fn sys_ringkey(op: u64, a1: u64, a2: u64) -> i64 {
 pub fn ring3_owner_live(owner: u64) -> bool {
     owner != 0 && owner < 64 && appquit_pid(owner).is_some()
 }
+
+// ── SHELLTASK2 (rmbp-ledger B474): the foreground program's kill switch ─────────────────────────────────
+/// The kill switch of the program a foreground `run` (or a bare-name foreground exec) is waiting on, while it waits.
+static FG_RUN: crate::sync::Mutex<Option<alloc::sync::Arc<crate::arch::sched::KillSwitch>>> = crate::sync::Mutex::new(None);
+
+/// Clears [`FG_RUN`] when the foreground wait returns (any return path).
+pub struct FgGuard;
+impl Drop for FgGuard {
+    fn drop(&mut self) {
+        *FG_RUN.lock() = None;
+    }
+}
+
+fn fg_arm(kill: &alloc::sync::Arc<crate::arch::sched::KillSwitch>) -> FgGuard {
+    *FG_RUN.lock() = Some(kill.clone());
+    FgGuard
+}
+
+/// Ctrl-C on the shell window while a foreground program runs: kill THE PROGRAM (its own TEARDOWN-1 switch; the
+/// `run` wait sees the reap and returns). `false` when no foreground program is waited on.
+pub fn fg_interrupt() -> bool {
+    match FG_RUN.try_lock().and_then(|g| g.clone()) {
+        Some(k) => {
+            k.request();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Is a foreground program being waited on (read only)?
+pub fn fg_live() -> bool {
+    FG_RUN.try_lock().map(|g| g.is_some()).unwrap_or(true)
+}
+

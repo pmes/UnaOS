@@ -638,6 +638,8 @@ pub static CRISPY_ROWS: &[Binding] = &[ // SMALLFIX3 (B416): a slice — the cou
     Binding { roles: CMD, usage: 0x38, action: Action::ShowShortcuts, token: super::shortcuts::C_CMD_SLASH },
     // LAUNCHER (B417) — ⌘Space opens the Launcher (usage 0x2C = Space; no other row watches it).
     Binding { roles: CMD, usage: 0x2C, action: Action::Launcher, token: super::shortcuts::C_CMD_SPACE },
+    // SHELLTASK2 (B474) — ⌘. interrupts the shell window's running command (usage 0x37 = `.`; no other row watches it).
+    Binding { roles: CMD, usage: 0x37, action: Action::Interrupt, token: super::shortcuts::C_CMD_PERIOD },
 ];
 
 /// **The desktop's live table.** `cmd_role` is `HID_MOD_GUI`, so every `CMD` above is the Command
