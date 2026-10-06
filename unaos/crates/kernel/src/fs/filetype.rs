@@ -440,7 +440,7 @@ pub fn ensure_tests() {
         // QUARRY2 (B336): `tests quarry2` rides this registration (no tests.rs line).
         #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
         crate::video::quarry::live::columns::ensure_tests();
-        #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::quarry::live::quarry3_tests(); crate::fs::appres::ensure_tests(); // QUARRY3 (B413): `tests quarry3` rides this registration too. APPRES (B398): `tests appres` rides this registration (no tests.rs line).
+        #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::quarry::live::quarry3_tests(); crate::fs::appres::ensure_tests(); crate::tests::register("filetypes", crate::fs::assoc::selftest); // QUARRY3 (B413): `tests quarry3` rides this · FILETYPES (B423): `tests filetypes` too registration too. APPRES (B398): `tests appres` rides this registration (no tests.rs line).
     }
 }
 
@@ -530,16 +530,17 @@ pub fn selftest() {
     let override_ok;
     if attrs && asrc == "db" {
         let obj = assoc::object_path(TEXT_PLAIN);
-        let changed = mt.set_attr(&obj, assoc::OPENER_KEY, AttrValue::Str(String::from("fileview")), k).is_ok()
-            && assoc::opener_for_in(&mt, &note, TEXT_PLAIN).0 == "fileview";
-        let _ = mt.set_attr(&obj, assoc::OPENER_KEY, AttrValue::Str(op0.clone()), k);
+        let was = mt.get_attr(&obj, assoc::PREFERRED_KEY, k).ok();
+        let changed = mt.set_attr(&obj, assoc::PREFERRED_KEY, AttrValue::Str(String::from("org.unaos.fileview")), k).is_ok()
+            && assoc::opener_for_in(&mt, &note, TEXT_PLAIN).0 == "fileview"; // FILETYPES (B423): the registry names a signature
+        if let Some(v) = was { let _ = mt.set_attr(&obj, assoc::PREFERRED_KEY, v, k); }
         assoc_ok = changed && op0 == "textedit";
         // Per-file override wins over the database.
         let set = mt.set_attr(&note, assoc::PREFERRED_KEY, AttrValue::Str(String::from("fileview")), k).is_ok();
         let (op1, s1) = assoc::opener_for_in(&mt, &note, TEXT_PLAIN);
         override_ok = set && op1 == "fileview" && s1 == "override";
     } else {
-        assoc_ok = !attrs && asrc == "builtin" && op0 == "textedit";
+        assoc_ok = !attrs && asrc == "registrant" && op0 == "textedit"; // FILETYPES (B423): no registry → the first registrant
         override_ok = !attrs; // SKIP leg on FAT: there is nowhere to put a per-file choice
     }
     // Quarry's handler function agrees with `opener_for` on every case file.

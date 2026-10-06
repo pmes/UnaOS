@@ -221,6 +221,7 @@ fn refuse_notice(why: &str) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Item {
     Open,
+    OpenWith,
     Rename,
     Delete,
     DeletePerm,
@@ -240,6 +241,7 @@ impl Item {
         }
         String::from(match self {
             Item::Open => "Open",
+            Item::OpenWith => "Open With...", // FILETYPES (B423)
             Item::Rename => "Rename",
             Item::Delete => "Move to Trash",
             Item::DeletePerm => "Delete Permanently",
@@ -254,7 +256,7 @@ impl Item {
     }
 }
 
-const ITEMS: [Item; 11] = [Item::Open, Item::Rename, Item::Delete, Item::DeletePerm, Item::NewFolder, Item::Copy, Item::Paste, Item::Info, Item::ShowTrash, Item::Restore, Item::EmptyTrash];
+const ITEMS: [Item; 12] = [Item::Open, Item::OpenWith, Item::Rename, Item::Delete, Item::DeletePerm, Item::NewFolder, Item::Copy, Item::Paste, Item::Info, Item::ShowTrash, Item::Restore, Item::EmptyTrash];
 
 /// TRASH (R75) — `Empty Trash` is a TWO-STEP (no yes/no alert exists; `login::open_alert` is OK-only): the
 /// first press arms it (uptime seconds + 1), a second within [`EMPTY_WINDOW_S`] empties.
@@ -344,6 +346,7 @@ pub fn paint_overlay(m: &Model, px: &mut [u32]) {
         }
     }
     super::getinfo::paint(m, px); // ATTRCOLUMNS (B402): the inspector
+    super::openwith::paint(m, px); // FILETYPES (B423): Open With…
     super::attrcols::paint_menu(m, px); // ATTRCOLUMNS (B402): the header's Add column… menu
 }
 
@@ -448,6 +451,17 @@ pub fn menu_press(x: i32, y: i32) -> bool {
         super::attrcols::menu_press_at(hit);
         return hit.is_some();
     }
+    if super::openwith::is_up() {
+        // FILETYPES (B423): a press while Open With… is up picks a registrant or dismisses the list.
+        let hit = to_source(x, y);
+        let act = match MODEL.lock().as_ref() {
+            Some(m) => super::openwith::press(hit, &m.geom),
+            None => { super::openwith::dismiss(); Act::None }
+        };
+        run_act(act);
+        repaint();
+        return hit.is_some();
+    }
     if super::getinfo::is_up() {
         // ATTRCOLUMNS (B402): any press dismisses the inspector; one inside Quarry is consumed by it.
         super::getinfo::dismiss();
@@ -462,6 +476,7 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     let Some(mn) = mn else { return false };
     let hit = to_source(x, y);
     let mut picked = None;
+    let origin = (mn.x, mn.y);
     if let Some((sx, sy)) = hit {
         let g = match MODEL.lock().as_ref() {
             Some(m) => (menu_w(&m.geom), m.geom.row_h()),
@@ -475,6 +490,10 @@ pub fn menu_press(x: i32, y: i32) -> bool {
         }
     }
     match picked {
+        Some(Item::OpenWith) => {
+            if let Some((_, path, false)) = selection() { super::openwith::open(&path, origin.0, origin.1); } // FILETYPES (B423)
+            repaint();
+        }
         Some(it) => run_item(it),
         None => repaint(),
     }
@@ -510,6 +529,7 @@ fn run_item(it: Item) {
         Item::Copy => do_copy(),
         Item::Paste => do_paste(),
         Item::Info => do_info(),
+        Item::OpenWith => {} // FILETYPES (B423): taken in `menu_press` (it needs the menu's origin)
     }
     repaint();
 }

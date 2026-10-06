@@ -1236,8 +1236,8 @@ impl Model {
             Act::None
         } else {
             // FILETYPE (B307): OPEN BY TYPE. The type (attribute → sniff → extension table →
-            // unknown), then the opener (the file's `una:preferred` → `/system/types/<type>` →
-            // the builtin table), then ONE act that `openers::open` performs outside the lock. The
+            // unknown), then the opener (the file's `una:preferred` → `/system/filetypes/<type>` →
+            // the first registrant, FILETYPES B423), then ONE act that `openers::open` performs outside the lock. The
             // per-extension if-chain that stood here is deleted, not kept beside it; a dotless file
             // is whatever its bytes say.
             let mt = crate::shell::vfs_mount_table();
@@ -4424,3 +4424,6 @@ pub fn quarry3_selftest() {
 // inherits its parent's, and Quarry's `View` menu carries Use as Default / Reset to Default — a child like `attrcols`.
 #[path = "folderview.rs"]
 pub mod folderview;
+// FILETYPES (B423): Open With… — every registrant of the selected file's type (a child module like `getinfo`).
+#[path = "openwith.rs"]
+pub mod openwith;

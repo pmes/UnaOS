@@ -232,9 +232,9 @@ pub static SCHEMA: &[Key] = &[
         doc: "Battery percent at which the machine shuts down; 0 = off.",
     },
     Key {
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 6 }, default: Default::Int(0),
+        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 7 }, default: Default::Int(0),
         writers: &[Writer::Settings], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types).",
     },
     // ── TRACKPADPANE (B412, MACPARITY row 16): the Trackpad pane; the rules are `crate::trackpad` ──────────────
     Key {

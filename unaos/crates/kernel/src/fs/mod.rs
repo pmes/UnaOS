@@ -165,7 +165,7 @@ pub mod attrsys;
 
 /// FILETYPE (B307): `una:type` — the file's MIME type as an attribute; sniff and extension fallbacks.
 pub mod filetype;
-/// FILETYPE M2 (B307): the type database — type → opener as attributes on `/system/types/*`.
+/// FILETYPE M2 (B307) → FILETYPES (B423): the type registry — attributes on `/system/filetypes/*`; openers are registrants.
 pub mod assoc;
 /// BOOT80 (B350): the boot's own store-step lines and the medium counters behind them.
 pub mod bootstep;

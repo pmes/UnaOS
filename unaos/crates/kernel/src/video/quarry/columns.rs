@@ -6,7 +6,7 @@
 //! QUARRY2 (rmbp-ledger B336) — the list view's COLUMNS and its SORT. Quarry is the Finder by ruling
 //! (R50); what a Finder's list shows about a file is the Finder's business, and it is done here.
 //!
-//! * **TYPE** — the file's type, by its short name (`una:name` of `/system/types/<mime>`, else the
+//! * **TYPE** — the file's type, by its short name (`una:description` of `/system/filetypes/<mime>`, else the
 //!   builtin association row: `Markdown`, `PNG image`). The type is `fs::filetype`'s: the `una:type`
 //!   attribute on a volume that takes attributes (UnaFS), else the one extension table, else the sniff
 //!   (only for a name the table does not know, at most [`SNIFF_CAP`] per listing, so a navigation never
@@ -784,9 +784,9 @@ fn leg_types() -> Result<&'static str, String> {
         }
     }
     for (mime, op) in [(ft::TEXT_MARKDOWN, "markdown"), (ft::APP_JSON, "json"), (ft::IMAGE_GIF, "facet")] {
-        match assoc::builtin(mime) {
-            Some(r) if r.1 == op => {}
-            other => return Err(alloc::format!("assoc {} -> {:?}", mime, other.map(|r| r.1))),
+        match assoc::registrants_in(&crate::shell::vfs_mount_table(), mime).first() {
+            Some(r) if r.opener == op => {} // FILETYPES (B423): the first registrant, by its own resources
+            other => return Err(alloc::format!("assoc {} -> {:?}", mime, other.map(|r| r.opener.clone()))),
         }
         if op != "facet" && !super::openers::available(op) {
             return Err(alloc::format!("opener {} not available", op));
