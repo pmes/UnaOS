@@ -576,7 +576,7 @@ pub fn selftest_codecs() {
 /// under 16 KiB); MP3's is under 8 KiB (`decode_frame` 5384). The VFS read under `VfsSrc` runs the same chain the
 /// 32 KiB render task runs today (RENDSTACK measured that task at 15600 high). 64 KiB = the two plus margin;
 /// `[play] dec stack high=` reports the real high-water of every play, so the next flight checks the number.
-const DEC_STACK: usize = 160 * 1024; // DECJOBHANG (B386): 64 KiB overflowed on metal (flight 24, AAC: `[stack] OVERFLOW task=play-dec … via=df`); measured worst constructor chain mp4::open 40424 + AacSource::new 39496 B (ADTS 39352 + 39528) + the VFS read chain (~16 KiB) ~ 97 KiB, + margin
+const DEC_STACK: usize = 64 * 1024; // AUDIOCORE (B396): re-derived after audio_core moved its decoder state to the heap (`-Z emit-stack-sizes`, kernel target, release): worst constructor chain ogg::open 6040 + OggOpus::new 2312 + OpusDecoder::new 3064 + SilkDecoder::new 1512 + ChannelState::new 792 ~ 14 KiB (AAC mp4::open 3944 + AacSource::new 3016 + AacDecoder::new 1240); worst decode chain Mp3Decoder::decode_frame 5048 / AacDecoder::decode_ics 4888 ~ 6 KiB; + the VFS read chain (~16 KiB) ~ 30 KiB, x2 margin; was 160 KiB (DECJOBHANG B386, 40 KiB AAC values on the stack)
 /// A decoder that has not advanced in this long while it holds the CPU-side stages (demux/frame/synth) is stalled.
 const DEC_STALL_MS: u64 = 2_000;
 /// The PCM queue between `play-dec` and `feed()`: at most this many bytes decoded ahead (~0.7 s at 48 kHz stereo).
