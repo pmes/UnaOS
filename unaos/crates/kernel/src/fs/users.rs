@@ -1084,6 +1084,7 @@ pub fn shell_verb(verb: &str, args: &[&str], console: &mut crate::console::Conso
 pub fn screen_key(c: u8) -> bool {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
+        if !crate::video::crystal::login::is_open() && crate::video::dialog::key(c) { return true; } // DIALOG (B395): the alert's Return/Esc — only while it (or its owner app) holds focus; the login screen first
         return crate::video::crystal::login::consume_key(c);
     }
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1125,6 +1126,7 @@ pub fn screen_key(c: u8) -> bool {
 pub fn screen_press(x: i32, y: i32) -> bool {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
+        if !crate::video::crystal::login::is_open() && crate::video::dialog::press(x, y) { return true; } // DIALOG (B395): the alert's buttons, and the app-modal block on its owner's windows; the login screen first
         return crate::video::crystal::login::press_swallow(x, y);
     }
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -2765,7 +2767,7 @@ pub fn screen_notice_from(owner: u64, body: &[u8]) {
     {
         let mut t = [0u8; crate::video::wm::MAX_TITLE];
         let n = crate::video::wm::app_name_of(owner, &mut t);
-        crate::video::crystal::login::notice_post(if n == 0 { b"Program" } else { &t[..n] }, body);
+        crate::video::toast::post(if n == 0 { b"Program" } else { &t[..n] }, body); // DIALOG M3 (B395): an app's bus notice (the holocron client's start/answer line) is a one-line TOAST, never a dialog
     }
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let _ = (owner, body);

@@ -739,9 +739,9 @@ pub fn press_at(x: i32, y: i32) -> bool {
             if menu_contains(r, px, py) {
                 if super::powerui::panel_open() { PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed); return true; } // POWERMENU M2: a press inside the battery panel is swallowed
                 return match item_at(r, px, py) {
-                    Some(verb) if matches!(verb, Verb::Restart | Verb::ShutDown) && verb.real() && !super::powerui::confirm(if matches!(verb, Verb::Restart) { 1 } else { 2 }) => { // POWERMENU M1: first click arms, the menu stays open and the row re-reads
-                        PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed);
-                        super::wm::composite();
+                    Some(verb) if verb.real() && power_ask(verb) => { // DIALOG (B395): Restart / Shut Down / Log Out ASK — the confirm dialog with its 60 s countdown (was POWERMENU M1's click-again arming)
+                        PRESS_OUTCOME.store(OUT_PICK, Ordering::Relaxed); PICKS.fetch_add(1, Ordering::Relaxed);
+                        dismiss("confirm");
                         true
                     }
                     Some(verb) => {
@@ -1430,3 +1430,25 @@ pub fn power_panel_selftest() -> bool {
 }
 #[cfg(not(feature = "witness"))]
 pub fn power_panel_selftest() -> bool { false }
+
+// ── DIALOG (B395, MACPARITY row 34) — Restart / Shut Down / Log Out ASK first ─────────────────────────────
+
+/// The press arm's guard: a pick of Restart / Shut Down / Log Out opens the confirm dialog (60 s countdown)
+/// instead of acting; `true` when the dialog took the pick (the menu then dismisses). Every other verb: `false`.
+fn power_ask(verb: Verb) -> bool {
+    let kind = match verb { Verb::Restart => 1, Verb::ShutDown => 2, _ if verb.name() == "LogOut" => 3, _ => return false };
+    serial_println!(":: SHARD-MENU: crystal_pick verb={} action=confirm ::", verb.name());
+    super::dialog::power_confirm(kind);
+    true
+}
+
+/// The confirm's OK (or its countdown's expiry): the verb fires through [`fire`], the one place an action happens.
+pub fn power_fire(kind: u8) {
+    match kind {
+        1 => fire(Verb::Restart),
+        2 => fire(Verb::ShutDown),
+        #[cfg(feature = "login")]
+        3 => fire(Verb::LogOut),
+        _ => {}
+    }
+}

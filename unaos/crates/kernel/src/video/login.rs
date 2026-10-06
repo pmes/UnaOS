@@ -1909,6 +1909,7 @@ fn notice_current() -> Note {
 /// Queue a notice; never opens a window, never allocates, never waits on a lock (a contended queue drops it,
 /// counted). Returns whether it was queued.
 pub fn notice_post(title: &[u8], text: &[u8]) -> bool {
+    if title == b"Program stopped" { let glass = crate::video::toast::current_is_glass(); serial_println!("[dialog] program-stopped glass={} -> {}", glass as u8, if glass { "dialog" } else { "toast" }); return if glass { crate::video::dialog::post_program_stopped(text) } else { crate::video::toast::post(title, text) }; } // DIALOG M3 (B395): a dialog ONLY for a program launched from the glass, else a toast
     let note = Note::make(title, text);
     let Some(mut g) = NOTICES.try_lock() else {
         NOTICE_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2321,6 +2322,7 @@ fn notice_press(x: i32, y: i32) -> bool {
 /// The notice service (the storage passes, beside `users::service`): close a session notice whose time is
 /// up, and open a queued notice while no form is up. One relaxed load when nothing is armed.
 pub fn notice_service() {
+    crate::video::dialog::service(); crate::video::toast::service(); // DIALOG (B395): the alert's open/slide/countdown and the toast's show/expire, on the same window-safe pass
     let d = NOTICE_DEADLINE.load(Ordering::Relaxed);
     if d != 0 && crate::arch::ms() >= d {
         if notice_nonmodal() {
@@ -2344,7 +2346,7 @@ pub fn notice_typing_fixture() {
     let prev_alert = ALERT_PREV.load(Ordering::Relaxed);
     let saved = { let mut g = NOTICES.lock(); let c = (g.cur.take(), g.q, g.n); g.n = 0; c };
     FORM.lock().state = State::Session;
-    notice_show(b"Program stopped", b"fixture.elf");
+    notice_show(b"Fixture notice", b"fixture.elf"); // DIALOG M3: `Program stopped` routes to the dialog/toast now; the session-notice surface is proven under its own title
     let up = FORM.lock().state == State::Alert && notice_nonmodal();
     let modal = users::screen_up() || users::secret_input();
     const LINE: &[u8] = b"echo typed-through-notice\r\x1b";
@@ -2375,6 +2377,20 @@ pub fn notice_typing_fixture() {
     serial_println!(
         ":: NOTICE: typed_through={} modal={} flash={} -> {} ::",
         if typed { "ok" } else { "lost" }, if modal { "screen" } else { "none" }, if flash { "yes" } else { "none" }, if ok { "PASS" } else { "FAIL" }
+    );
+    dialog_fixture();
+}
+
+/// DIALOG M4 (B395): `tests notice`'s second line — the alert widget's anatomy, the default on the right, Esc,
+/// app-modal, the focus rule, the power confirm's countdown (a fixture action; nothing powers off) and the toast.
+fn dialog_fixture() {
+    let (anatomy, right, esc, modal, theft, confirm) = crate::video::dialog::fixture();
+    let toast = crate::video::toast::fixture();
+    let ok = anatomy && right && esc && modal && theft == 0 && confirm && toast;
+    serial_println!(
+        ":: DIALOG: anatomy={} default={} esc={} modal={} focus_theft={} confirm={} toast={} -> {} ::",
+        if anatomy { "ok" } else { "FAIL" }, if right { "right" } else { "FAIL" }, if esc { "cancel" } else { "FAIL" }, if modal { "app" } else { "FAIL" },
+        theft, if confirm { "ok" } else { "FAIL" }, if toast { "ok" } else { "FAIL" }, if ok { "PASS" } else { "FAIL" }
     );
 }
 

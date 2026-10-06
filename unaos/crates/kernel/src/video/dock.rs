@@ -3317,11 +3317,11 @@ fn dp_launch(i: usize) -> &'static str {
 /// Drained by the render body that owns the shell `Console` AFTER its shell launch arm: the verb line of
 /// the next owed ring-3 table app, or `None`.
 pub fn take_verb_launch() -> Option<&'static str> {
-    if let Some(l) = take_line_launch() { return Some(l); } // RING3ABI2 M6 (B333): a posted shell line (Quarry's `run <path>`) first
+    if let Some(l) = take_line_launch() { crate::video::toast::note_glass(l); return Some(l); } // DIALOG (B395): a glass launch, armed for the spawn's provenance. RING3ABI2 M6 (B333): a posted shell line (Quarry's `run <path>`) first
     let m = DP_VERB_OWED.load(Ordering::Acquire);
     let i = (DP_FIRST_EXTRA..DP_PINS.len()).find(|&i| m & (1 << i) != 0)?;
     DP_VERB_OWED.fetch_and(!(1 << i), Ordering::AcqRel);
-    Some(DP_PINS[i].verb)
+    crate::video::toast::note_glass(DP_PINS[i].verb); Some(DP_PINS[i].verb) // DIALOG (B395): a glass launch, armed for the spawn's provenance
 }
 /// Is a verb launch owed (read; clears nothing)? The shell-owning body runs it only once its window is live.
 pub fn verb_launch_posted() -> bool { DP_VERB_OWED.load(Ordering::Acquire) != 0 || LINE_OWED.load(Ordering::Acquire) }
