@@ -697,6 +697,7 @@ pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
                 Err(_) => "refused",
             };
             let d = crate::fs::bootstep::io().since(io0);
+            crate::fs::bootstep::note_span("filetypes-build", t0, crate::arch::ms()); // SMALLFIX6 (B495): the full build's span, beside the boot steps
             serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} stamp={} blocks_read={} cmds={} ms={}", why, TYPES_DIR, n, f,
                 known_types_in(&mt).len(), st, d.blocks_read(), d.cmds(), crate::arch::ms().saturating_sub(t0));
             (n, false)

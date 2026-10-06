@@ -633,6 +633,7 @@ fn render_entry(now: u64) {
     let ex = RENDER_EXIT_US.swap(0, Relaxed);
     if ex != 0 && now > ex {
         SEC_R_HANDLER_US.fetch_max(now - ex, Relaxed);
+        boot_handler_note(now - ex); // SMALLFIX6 (B495): the boot's longest handler interval and when it ended
     }
 }
 
@@ -832,9 +833,11 @@ fn sec_roll(now_ms: u64) {
     }
     if desk && !BOOT_SAID.swap(true, Relaxed) {
         let n = BOOT_SUPPRESSED.load(Relaxed);
+        let (h_ms, h_end) = (BOOT_H_US.load(Relaxed) / 1000, BOOT_H_END_MS.load(Relaxed));
         serial_println!(
-            "[lag] stall boot_suppressed={} worst_stage={} worst_ms={}",
-            n, if n == 0 { "none" } else { stage_word(BOOT_WORST_STAGE.load(Relaxed)) }, BOOT_WORST_MS.load(Relaxed)
+            "[lag] stall boot_suppressed={} worst_stage={} worst_ms={} handler_span_ms={}..{} overlaps={}",
+            n, if n == 0 { "none" } else { stage_word(BOOT_WORST_STAGE.load(Relaxed)) }, BOOT_WORST_MS.load(Relaxed),
+            h_end.saturating_sub(h_ms), h_end, crate::fs::bootstep::overlaps(h_end.saturating_sub(h_ms), h_end)
         );
     }
     if stall && desk {
@@ -1032,4 +1035,26 @@ static HANDLER_STALLS: AtomicU32 = AtomicU32::new(0);
 /// Render-handler stall seconds since boot (`tests shelltask` reads the delta across a running verb).
 pub fn handler_stalls() -> u32 {
     HANDLER_STALLS.load(Relaxed)
+}
+
+// ── SMALLFIX6 (rmbp-ledger B495): NAME the boot's render-handler stall ───────────────────────────────────
+// Flight 26: `worst_stage=render-handler worst_ms=6094|6086|6115` on all three boots, and nothing said during
+// what. Boot 1 root-mount 590 + assoc-seed 5498 = 6088 and boot 3 552 + 5562 = 6114: the render task made no
+// route/pass/park across `users::service`'s BOOT80 steps on the usb-pump (the flown tree wrote the type registry
+// at boot) — it waited on the UnaFS volume those steps held. The boot line now carries the longest handler
+// interval's span and the boot steps it overlapped (`fs::bootstep::overlaps`), so the next flight names it.
+static BOOT_H_US: AtomicU64 = AtomicU64::new(0);
+static BOOT_H_END_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Before the boot line is said: keep the longest render-handler interval and the kernel ms it ended at.
+fn boot_handler_note(d_us: u64) {
+    if !BOOT_SAID.load(Relaxed) && d_us > BOOT_H_US.load(Relaxed) {
+        BOOT_H_US.store(d_us, Relaxed);
+        BOOT_H_END_MS.store(crate::arch::ms(), Relaxed);
+    }
+}
+
+/// `tests smallfix6`: the boot's longest render-handler interval `(ms, end_ms)`.
+pub fn boot_handler_span() -> (u64, u64) {
+    (BOOT_H_US.load(Relaxed) / 1000, BOOT_H_END_MS.load(Relaxed))
 }
