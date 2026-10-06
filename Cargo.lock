@@ -3064,6 +3064,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "trash_core",
  "una-abi",
  "unafs",
 ]
