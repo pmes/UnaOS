@@ -4070,7 +4070,7 @@ fn dock2_service(now: u64) {
             serial_println!("[dock] launch app={} first_window_ms=timeout bound_ms={}", DP_PINS[i].name, LAUNCH_BOUND_MS);
             let mut body = alloc::string::String::from(DP_PINS[i].name);
             body.push_str(" did not open a window in 10 s.");
-            crate::video::crystal::login::notice_post(b"Dock", body.as_bytes());
+            let _ = crate::video::dialog::notice(b"Dock", body.as_bytes()); // DIALOG2 (B404): THE router; notice_post retired
             PASS_OWED.store(true, Ordering::Release);
         } else {
             let ph = (dt / PULSE_MS) as u32;
@@ -4351,7 +4351,7 @@ static EMPTY_OWED: AtomicBool = AtomicBool::new(false);
 
 /// The Trash menu's one item: the confirm (DIALOG's alert, Cancel left, Empty Trash the default on the right).
 fn empty_trash_ask() {
-    let mut d = crate::video::dialog::Dlg::new(crate::video::dialog::Icon::Caution, b"Trash", b"Are you sure you want to permanently erase the items in the Trash?", b"You can't undo this action.", &["Cancel", "Empty Trash"]);
+    let mut d = crate::video::dialog::Dlg::new(crate::video::dialog::Icon::Caution, b"Trash", b"Are you sure you want to permanently erase the items in the Trash?", b"You can't undo this action.", &[b"Cancel", b"Empty Trash"]);
     d.user = true;
     d.act = crate::video::dialog::Act::Hook(empty_trash_answer as fn(bool) as usize);
     let posted = crate::video::dialog::post(d);

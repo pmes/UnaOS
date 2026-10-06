@@ -535,7 +535,7 @@ pub fn next_boot_service() {
         DLG_TITLE,
         b"The last session stopped unexpectedly.",
         &info[..il],
-        &["OK", "Show log"],
+        &[b"OK", b"Show log"],
     );
     let posted = super::dialog::post(d);
     let _ = mt.unlink(MARKER, crate::fs::vfs::KERNEL_PRINCIPAL); // said once
