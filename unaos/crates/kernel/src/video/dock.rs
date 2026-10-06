@@ -3913,7 +3913,7 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
         if pip_band && row_running(r) && !r.visible && dock2_group(r) == 0 { // DOCK2 M6: a minimised pinned app is still RUNNING
             let d = IND_D();
             let (px0, py0) = (bx + tw / 2 - d / 2, by + th + (PAD() - d) / 2);
-            for i in px0..(px0 + d).min(l.w) { if strip::in_disc(i, j, px0, py0, d) { out[i] = theme::ACCENT; } }
+            for i in px0..(px0 + d).min(l.w) { if strip::in_disc(i, j, px0, py0, d) { out[i] = theme::accent(); } }
             continue;
         }
         if pip_band && (r.id == TRASH_PIN_ID || (pend != wm::WIN_NONE && r.id == pend)) {

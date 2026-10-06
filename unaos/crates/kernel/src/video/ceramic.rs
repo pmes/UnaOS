@@ -398,7 +398,7 @@ pub fn selftest() {
     // Leg 4 — the reference rows: the kit's window-body role under this material.
     const REF8: [u32; 8] = crate::video::theme::fixture::CERAMIC_REF8;
     for (y, &want) in REF8.iter().enumerate() {
-        if shade(super::theme::CHROME_FACE, y) != want {
+        if shade(super::theme::chrome_face(), y) != want {
             fails += 1;
         }
     }
@@ -419,7 +419,7 @@ pub fn selftest() {
     let t0 = crate::clock::mono_ticks();
     let mut acc = 0u32;
     for i in 0..ITERS {
-        acc = acc.wrapping_add(shade(super::theme::CHROME_FACE, i));
+        acc = acc.wrapping_add(shade(super::theme::chrome_face(), i));
     }
     let t1 = crate::clock::mono_ticks();
     let per_1k = match (t0, t1) {

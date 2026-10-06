@@ -22,8 +22,8 @@ pub fn avatar(fill: &mut dyn FnMut(usize, usize, usize, usize, u32), x: usize, y
     if d < 8 {
         return 0;
     }
-    let disc = if picked { theme::BEVEL_LIGHT } else { theme::TITLE_TEXT_INACTIVE };
-    let figure = if picked { theme::ACCENT } else { theme::CONTENT_FILL };
+    let disc = if picked { theme::bevel_light() } else { theme::title_text_inactive() };
+    let figure = if picked { theme::accent() } else { theme::content_fill() };
     let r = d as isize / 2;
     let (cx, cy) = (r, r);
     // the disc, one horizontal span per row (r² - dy² ≥ dx²)

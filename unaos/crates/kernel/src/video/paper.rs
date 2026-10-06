@@ -195,7 +195,7 @@ const _: () = assert!(ENV_A_Q16 + ENV_B_Q16 == 65536);
 /// is what `palette.content_fill` rounds to as well. `theme.rs` and engine.md §9 both state the
 /// two agree by construction and that the paper reads its base from `CONTENT_FILL`; this is the
 /// tripwire that says so out loud if a future kit ever separates them.
-const _: () = assert!(theme::CONTENT_FILL == crate::video::theme::fixture::PAPER_BASE);
+const _: () = assert!(theme::content_fill() == crate::video::theme::fixture::PAPER_BASE);
 
 // ---------------------------------------------------------------------------
 // The tile
@@ -404,7 +404,7 @@ fn field_q16(px: i64, py: i64) -> i64 {
 /// `u8` channel re-expanded as `c * 65536 / 255`, round-half-up.
 #[inline]
 fn base_q16(shift: u32) -> i64 {
-    let c = ((theme::CONTENT_FILL >> shift) & 0xFF) as i64;
+    let c = ((theme::content_fill() >> shift) & 0xFF) as i64;
     (c * 65536 + 127) / 255
 }
 
@@ -469,7 +469,7 @@ fn witness(px: &[u32]) {
         SCALE,
         AMP_Q16,
         SEED,
-        theme::CONTENT_FILL,
+        theme::content_fill(),
         TILE_W,
         TILE_H,
         fnv1a(px),

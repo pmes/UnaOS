@@ -306,27 +306,27 @@ fn inside(px: usize, py: usize, r: (usize, usize, usize, usize)) -> bool {
 // ── painting ─────────────────────────────────────────────────────────────────────────────────────────────
 
 fn frame(px: &mut [u32], pw: usize, w: usize, h: usize) {
-    metrics::fill(px, pw, 0, 0, w, h, theme::CHROME_FACE);
+    metrics::fill(px, pw, 0, 0, w, h, theme::chrome_face());
     for (x, y, fw, fh) in [(0, 0, w, 1), (0, h - 1, w, 1), (0, 0, 1, h), (w - 1, 0, 1, h)] {
-        metrics::fill(px, pw, x, y, fw, fh, theme::FRAME_LINE);
+        metrics::fill(px, pw, x, y, fw, fh, theme::frame_line());
     }
 }
 
 fn icon(px: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, size: usize, app: &[u8]) {
     let key = if app.is_empty() { "generic" } else { s(app) };
     if !crate::fs::appres::blit_key_icon(px, pw, ph, metrics::size(x), metrics::size(y), metrics::size(size), key) {
-        metrics::fill(px, pw, x, y, size, size, theme::ACCENT);
+        metrics::fill(px, pw, x, y, size, size, theme::accent());
     }
 }
 
 fn button(px: &mut [u32], pw: usize, ph: usize, clip: usize, r: (usize, usize, usize, usize), t: &[u8]) {
     let face = super::text::Face::Ui;
-    metrics::fill(px, pw, r.0, r.1, r.2, r.3, theme::BUTTON_FACE);
+    metrics::fill(px, pw, r.0, r.1, r.2, r.3, theme::button_face());
     for (x, y, w, h) in [(r.0, r.1, r.2, 1), (r.0, r.1 + r.3 - 1, r.2, 1), (r.0, r.1, 1, r.3), (r.0 + r.2 - 1, r.1, 1, r.3)] {
-        metrics::fill(px, pw, x, y, w, h, theme::FRAME_LINE);
+        metrics::fill(px, pw, x, y, w, h, theme::frame_line());
     }
     let ty = r.1 + r.3.saturating_sub(metrics::lcell_h(face)) / 2;
-    let _ = metrics::text(px, pw, ph, clip, r.0 + 8, ty, t, theme::CONTENT_TEXT, false, face);
+    let _ = metrics::text(px, pw, ph, clip, r.0 + 8, ty, t, theme::content_text(), false, face);
 }
 
 fn paint_card(i: usize, n: &Note) {
@@ -336,8 +336,8 @@ fn paint_card(i: usize, n: &Note) {
     icon(px, pw, ph, 12, (H - ICON) / 2, ICON, n.app());
     let face = super::text::Face::Ui;
     let clip = if n.has_button() { btn_rect().0 - 6 } else { W - 8 };
-    let _ = metrics::text(px, pw, ph, clip, 62, 10, n.title(), theme::CONTENT_TEXT, true, face);
-    let _ = metrics::text(px, pw, ph, clip, 62, 34, n.line(), theme::TITLE_TEXT_ACTIVE, false, face);
+    let _ = metrics::text(px, pw, ph, clip, 62, 10, n.title(), theme::content_text(), true, face);
+    let _ = metrics::text(px, pw, ph, clip, 62, 34, n.line(), theme::title_text_active(), false, face);
     if n.has_button() {
         button(px, pw, ph, W - 4, btn_rect(), n.label());
     }
@@ -374,12 +374,12 @@ fn paint_center(ring: &[Note]) -> (usize, usize) {
     frame(px, pw, CW, CH);
     let face = super::text::Face::Ui;
     let ch = metrics::lcell_h(face);
-    let _ = metrics::text(px, pw, ph, CW, 12, (HEAD_H - ch) / 2, b"Notifications", theme::CONTENT_TEXT, true, face);
+    let _ = metrics::text(px, pw, ph, CW, 12, (HEAD_H - ch) / 2, b"Notifications", theme::content_text(), true, face);
     button(px, pw, ph, CW - 4, clear_rect(), b"Clear");
-    metrics::fill(px, pw, 0, HEAD_H, CW, 1, theme::FRAME_LINE);
+    metrics::fill(px, pw, 0, HEAD_H, CW, 1, theme::frame_line());
     let (items, apps, rows) = center_model(ring);
     if items == 0 {
-        let _ = metrics::text(px, pw, ph, CW, 12, HEAD_H + 16, b"No Notifications", theme::TITLE_TEXT_INACTIVE, false, face);
+        let _ = metrics::text(px, pw, ph, CW, 12, HEAD_H + 16, b"No Notifications", theme::title_text_inactive(), false, face);
         return (0, 0);
     }
     let mut y = HEAD_H + 4;
@@ -390,11 +390,11 @@ fn paint_center(ring: &[Note]) -> (usize, usize) {
             break;
         }
         if head {
-            let _ = metrics::text(px, pw, ph, CW, 12, y + (GROUP_H - ch) / 2, n.app(), theme::TITLE_TEXT_INACTIVE, true, face);
+            let _ = metrics::text(px, pw, ph, CW, 12, y + (GROUP_H - ch) / 2, n.app(), theme::title_text_inactive(), true, face);
         } else {
             icon(px, pw, ph, 14, y + 6, 28, n.app());
-            let _ = metrics::text(px, pw, ph, CW - 8, 52, y + 2, n.title(), theme::CONTENT_TEXT, true, face);
-            let _ = metrics::text(px, pw, ph, CW - 8, 52, y + 2 + ch, n.line(), theme::TITLE_TEXT_ACTIVE, false, face);
+            let _ = metrics::text(px, pw, ph, CW - 8, 52, y + 2, n.title(), theme::content_text(), true, face);
+            let _ = metrics::text(px, pw, ph, CW - 8, 52, y + 2 + ch, n.line(), theme::title_text_active(), false, face);
         }
         y += need;
     }

@@ -472,7 +472,7 @@ fn paint(st: &mut State, v: &Values) {
     // SETTINGSFILES (B407, R98): the pane's file, as a link that reveals `<home>/settings` in Quarry.
     if let Some((r, x, t)) = super::settingsfiles::footer(v.tab as usize, ROWS, WIN_W, LABEL_X) {
         let fc = super::metrics::lcell_h(face);
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - fc) / 2, t.as_bytes(), theme::ACCENT, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - fc) / 2, t.as_bytes(), theme::accent(), false, face);
     }
     if !st.strip && matches!(v.tab, 0 | 2) {
         let r = row_of(st.sel);
@@ -1906,8 +1906,8 @@ fn paint_trackpad(st: &mut State) {
         let r = 1 + k;
         txt(st, LABEL_X, r, TP_ROW_NAMES[k]);
         let bx = TRACK_X + 110;
-        fill(&mut st.surf, w, bx, TOP + r * ROW_H + 8, 24, 24, theme::SCROLL_TRACK);
-        if b { fill(&mut st.surf, w, bx + 4, TOP + r * ROW_H + 12, 16, 16, theme::ACCENT); }
+        fill(&mut st.surf, w, bx, TOP + r * ROW_H + 8, 24, 24, theme::scroll_track());
+        if b { fill(&mut st.surf, w, bx + 4, TOP + r * ROW_H + 12, 16, 16, theme::accent()); }
         txt(st, bx + 36, r, if b { "on" } else { "off" });
     }
     txt(st, LABEL_X, 5, if tp_live().is_some() { "Applied live to the internal trackpad." } else { "No Wellspring trackpad path on this build; stored only." });

@@ -3168,7 +3168,7 @@ fn bell_row(out: &mut [u32], w: usize, h: usize, j: usize) {
         return;
     }
     let lit = super::notify::center_open() || super::notify::unread() > 0;
-    let ink = if lit { theme::TITLE_TEXT_ACTIVE } else { theme::TITLE_TEXT_INACTIVE };
+    let ink = if lit { theme::title_text_active() } else { theme::title_text_inactive() };
     let bits = BELL_BITS[((j - y0) * 12 / g).min(11)];
     for u in 0..g {
         let b = (u * 12 / g).min(11);
@@ -3188,5 +3188,5 @@ fn bell_count(out: &mut [u32], w: usize, sy: usize) {
     }
     let mut d = [b' '; 2];
     let k = if n > 9 { d = *b"9+"; 2 } else { d[0] = b'0' + n as u8; 1 };
-    super::text::draw_row(out, w, &d[..k], x0 + BELL_G() + BATT_GAP(), sy, theme::ACCENT, true, FACE);
+    super::text::draw_row(out, w, &d[..k], x0 + BELL_G() + BATT_GAP(), sy, theme::accent(), true, FACE);
 }

@@ -177,9 +177,9 @@ fn card(px: &mut [u32], w: usize, h: usize, top: usize, path: &str, dir: bool, f
     let tx = x + s + crate::ui::px(24);
     let lh = face().cell_h() + crate::ui::px(4);
     let leaf = path.rsplit('/').next().unwrap_or(path);
-    line(px, w, h, tx, y, leaf.as_bytes(), theme::CONTENT_TEXT, true);
+    line(px, w, h, tx, y, leaf.as_bytes(), theme::content_text(), true);
     for (i, f) in facts.iter().enumerate() {
-        line(px, w, h, tx, y + (i + 1) * lh + crate::ui::px(4), f.as_bytes(), theme::TITLE_TEXT_INACTIVE, false);
+        line(px, w, h, tx, y + (i + 1) * lh + crate::ui::px(4), f.as_bytes(), theme::title_text_inactive(), false);
     }
 }
 
@@ -200,7 +200,7 @@ fn blit(px: &mut [u32], w: usize, h: usize, src: &[u32], bw: usize, bh: usize, x
 pub(super) fn render_into(path: &str, px: &mut [u32], w: usize, h: usize) -> (&'static str, String) {
     let t0 = crate::arch::ms();
     for p in px.iter_mut() {
-        *p = theme::CONTENT_FILL;
+        *p = theme::content_fill();
     }
     let mt = crate::shell::vfs_mount_table();
     let st = mt.stat(path).ok();
@@ -210,11 +210,11 @@ pub(super) fn render_into(path: &str, px: &mut [u32], w: usize, h: usize) -> (&'
     // The title strip: the name and the type.
     let pad = crate::ui::px(8);
     let strip = face().cell_h() + 2 * pad;
-    fill(px, w, h, 0, 0, w, strip, theme::CHROME_FACE);
-    fill(px, w, h, 0, strip - 1, w, 1, theme::FRAME_LINE);
+    fill(px, w, h, 0, 0, w, strip, theme::chrome_face());
+    fill(px, w, h, 0, strip - 1, w, 1, theme::frame_line());
     let leaf = path.rsplit('/').next().unwrap_or(path);
     let head = alloc::format!("{}   {}", leaf, mime);
-    line(px, w, h, pad, pad, head.as_bytes(), theme::TITLE_TEXT_ACTIVE, true);
+    line(px, w, h, pad, pad, head.as_bytes(), theme::title_text_active(), true);
     let (bx, by) = (pad, strip + pad);
     let (bw, bh) = (w.saturating_sub(2 * pad), h.saturating_sub(strip + 2 * pad));
     let opener = if dir { String::from("none") } else { crate::fs::assoc::opener_for(path, &mime).0 };
@@ -319,7 +319,7 @@ fn show(path: &str) {
         serial_println!("[quarry3] quicklook DECLINE reason=oom bytes={}", w * h * 4);
         return;
     }
-    surf.resize(w * h, theme::CONTENT_FILL);
+    surf.resize(w * h, theme::content_fill());
     render_into(path, &mut surf, w, h);
     let (x, y) = (pw.saturating_sub(w) / 2, ph.saturating_sub(h) / 3);
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]

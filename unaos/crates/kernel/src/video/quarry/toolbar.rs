@@ -403,14 +403,14 @@ pub(super) fn press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
 // ── Paint ───────────────────────────────────────────────────────────────────────────────────────
 
 fn button(px: &mut [u32], g: &Geom, r: Rect, label: &[u8], on: bool, live: bool) {
-    fill(px, g, r.x, r.y, r.w, r.h, if on { theme::ACCENT } else { theme::BUTTON_FACE });
-    super::keyline(px, g, r, theme::FRAME_LINE);
+    fill(px, g, r.x, r.y, r.w, r.h, if on { theme::accent() } else { theme::button_face() });
+    super::keyline(px, g, r, theme::frame_line());
     let ink = if on {
-        theme::CHROME_FACE
+        theme::chrome_face()
     } else if live {
-        theme::BUTTON_TEXT
+        theme::button_text()
     } else {
-        theme::TITLE_TEXT_INACTIVE
+        theme::title_text_inactive()
     };
     let tw = label.len() * g.cell_w();
     let x = r.x + r.w.saturating_sub(tw) / 2;
@@ -422,20 +422,20 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     let g = &m.geom;
     let l = layout(g);
     let t = TB.lock();
-    fill(px, g, 0, 0, g.w, g.bar_h(), theme::CHROME_FACE);
-    fill(px, g, 0, l.path.y.saturating_sub(1), g.w, 1, theme::FRAME_LINE);
-    fill(px, g, 0, g.bar_h() - 1, g.w, 1, theme::FRAME_LINE);
+    fill(px, g, 0, 0, g.w, g.bar_h(), theme::chrome_face());
+    fill(px, g, 0, l.path.y.saturating_sub(1), g.w, 1, theme::frame_line());
+    fill(px, g, 0, g.bar_h() - 1, g.w, 1, theme::frame_line());
     button(px, g, l.back, b"<", false, t.hist.can_back());
     button(px, g, l.fwd, b">", false, t.hist.can_forward());
     button(px, g, l.list, b"List", t.view == View::List, true);
     button(px, g, l.icons, b"Icons", t.view == View::Icons, true);
     // The search field.
     let s = l.search;
-    fill(px, g, s.x, s.y, s.w, s.h, theme::CONTENT_FILL);
-    super::keyline(px, g, s, if t.search.focused { theme::ACCENT } else { theme::FRAME_LINE });
+    fill(px, g, s.x, s.y, s.w, s.h, theme::content_fill());
+    super::keyline(px, g, s, if t.search.focused { theme::accent() } else { theme::frame_line() });
     let ty = s.y + s.h.saturating_sub(g.cell_h()) / 2;
     if t.search.q.is_empty() && !t.search.focused {
-        text(px, g, s.x + PAD(), ty, b"Search", s.x + s.w - PAD(), theme::TITLE_TEXT_INACTIVE);
+        text(px, g, s.x + PAD(), ty, b"Search", s.x + s.w - PAD(), theme::title_text_inactive());
     } else {
         let mut q: Vec<u8> = Vec::from(t.search.q.as_bytes());
         if t.search.focused {
@@ -444,13 +444,13 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
         // Keep the tail in view when the query is longer than the field.
         let fit = (s.w.saturating_sub(2 * PAD()) / g.cell_w().max(1)).max(1);
         let from = q.len().saturating_sub(fit);
-        text(px, g, s.x + PAD(), ty, &q[from..], s.x + s.w - PAD(), theme::CONTENT_TEXT);
+        text(px, g, s.x + PAD(), ty, &q[from..], s.x + s.w - PAD(), theme::content_text());
     }
     // The path bar.
     let py = l.path.y + l.path.h.saturating_sub(g.cell_h()) / 2;
     if t.search.active {
         let line = alloc::format!("Search \"{}\": {} found ({})", t.search.q, t.search.hits, t.search.src);
-        text(px, g, PAD(), py, line.as_bytes(), g.w - PAD(), theme::TITLE_TEXT_ACTIVE);
+        text(px, g, PAD(), py, line.as_bytes(), g.w - PAD(), theme::title_text_active());
         return;
     }
     let segs = segments(&m.cwd, PAD(), g.cell_w());
@@ -460,10 +460,10 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
             break;
         }
         if i > 0 {
-            text(px, g, x0 - 3 * g.cell_w(), py, b" > ", *x0, theme::TITLE_TEXT_INACTIVE);
+            text(px, g, x0 - 3 * g.cell_w(), py, b" > ", *x0, theme::title_text_inactive());
         }
         let last = i + 1 == segs.len();
-        text(px, g, *x0, py, label.as_bytes(), *x1 + g.cell_w(), if last { theme::TITLE_TEXT_ACTIVE } else { theme::ACCENT });
+        text(px, g, *x0, py, label.as_bytes(), *x1 + g.cell_w(), if last { theme::title_text_active() } else { theme::accent() });
         end = *x1;
     }
     let mut tail: Vec<u8> = Vec::new();
@@ -475,6 +475,6 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
         tail.extend_from_slice(st.as_bytes());
     }
     if !tail.is_empty() {
-        text(px, g, end, py, &tail, g.w - PAD(), theme::TITLE_TEXT_ACTIVE);
+        text(px, g, end, py, &tail, g.w - PAD(), theme::title_text_active());
     }
 }

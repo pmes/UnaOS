@@ -229,7 +229,7 @@ pub fn open(path: &str) -> Result<u32, String> {
     if surf.try_reserve_exact(len).is_err() {
         return Err(String::from("out of memory"));
     }
-    surf.resize(len, theme::CONTENT_FILL);
+    surf.resize(len, theme::content_fill());
     if is_open() || STATE.lock().is_some() {
         close("replace");
     }
@@ -704,26 +704,26 @@ fn text(st: &mut State, x: usize, y: usize, s: &str, ink: u32, bold: bool) -> us
 
 fn slider(st: &mut State, x0: usize, x1: usize, y: usize, done: usize, knob: bool) {
     let th = px(4).max(2);
-    fill(st, x0, y - th / 2, x1 - x0, th, theme::SCROLL_THUMB);
-    fill(st, x0, y - th / 2, done.min(x1) - x0, th, theme::ACCENT);
+    fill(st, x0, y - th / 2, x1 - x0, th, theme::scroll_thumb());
+    fill(st, x0, y - th / 2, done.min(x1) - x0, th, theme::accent());
     if knob {
-        disc(st, done, y, px(8), theme::FRAME_LINE);
+        disc(st, done, y, px(8), theme::frame_line());
         disc(st, done, y, px(7), KNOB_EDGE);
-        disc(st, done, y, px(4), theme::ACCENT);
+        disc(st, done, y, px(4), theme::accent());
     }
 }
 
 fn paint(st: &mut State) {
     for p in st.surf.iter_mut() {
-        *p = theme::CONTENT_FILL;
+        *p = theme::content_fill();
     }
     let (w, h) = (st.w, st.h);
     // the opener's APPRES icon (the player block), a plain tile when the registrar is busy this frame
     if !crate::fs::appres::blit_key_icon(&mut st.surf, w, h, px(16), px(14), px(ICON_L), "player") {
-        fill(st, px(16), px(14), px(ICON_L), px(ICON_L), theme::ACCENT);
+        fill(st, px(16), px(14), px(ICON_L), px(ICON_L), theme::accent());
     }
     let name = st.name.clone();
-    text(st, px(TEXT_X), px(16), &name, theme::CONTENT_TEXT, true);
+    text(st, px(TEXT_X), px(16), &name, theme::content_text(), true);
     let info = if let Some(e) = &st.err {
         alloc::format!("cannot play: {}", e)
     } else if st.src == "pending" {
@@ -742,20 +742,20 @@ fn paint(st: &mut State) {
     let done = s0 + if st.dur_ms > 0 { ((s1 - s0) as u64 * el.min(st.dur_ms) / st.dur_ms) as usize } else { 0 };
     slider(st, s0, s1, px(SCRUB_Y), done, st.dur_ms > 0);
     let ty = px(SCRUB_Y).saturating_sub(px(8));
-    text(st, px(16), ty, &mmss(el), theme::CONTENT_TEXT, false);
+    text(st, px(16), ty, &mmss(el), theme::content_text(), false);
     let rem = alloc::format!("-{}", mmss(st.dur_ms.saturating_sub(el)));
-    text(st, s1 + px(10), ty, &rem, theme::CONTENT_TEXT, false);
+    text(st, s1 + px(10), ty, &rem, theme::content_text(), false);
     // play / pause
     let (bx, by, bd) = (px(BTN_X), px(BTN_Y), px(BTN_D));
-    disc(st, bx + bd / 2, by + bd / 2, bd / 2, theme::FRAME_LINE);
-    disc(st, bx + bd / 2, by + bd / 2, bd / 2 - px(1).max(1), theme::BUTTON_FACE);
+    disc(st, bx + bd / 2, by + bd / 2, bd / 2, theme::frame_line());
+    disc(st, bx + bd / 2, by + bd / 2, bd / 2 - px(1).max(1), theme::button_face());
     if st.playing {
         let (gw, gh) = (px(5), px(16));
-        fill(st, bx + bd / 2 - px(7), by + (bd - gh) / 2, gw, gh, theme::BUTTON_TEXT);
-        fill(st, bx + bd / 2 + px(2), by + (bd - gh) / 2, gw, gh, theme::BUTTON_TEXT);
+        fill(st, bx + bd / 2 - px(7), by + (bd - gh) / 2, gw, gh, theme::button_text());
+        fill(st, bx + bd / 2 + px(2), by + (bd - gh) / 2, gw, gh, theme::button_text());
     } else {
         let g = px(16);
-        wedge(st, bx + (bd - g) / 2 + px(2), by + (bd - g) / 2, g, theme::BUTTON_TEXT);
+        wedge(st, bx + (bd - g) / 2 + px(2), by + (bd - g) / 2, g, theme::button_text());
     }
     // the state word beside the button
     let word = if st.err.is_some() { "stopped" } else if st.ended { "ended" } else if st.playing { "playing" } else { "paused" };
@@ -763,14 +763,14 @@ fn paint(st: &mut State) {
     // mute glyph: a speaker, crossed when muted
     let (lv, muted) = crate::video::status::volume();
     let (mx, my) = (px(MUTE_X), px(CTRL_Y));
-    fill(st, mx, my - px(4), px(6), px(8), theme::BUTTON_TEXT);
+    fill(st, mx, my - px(4), px(6), px(8), theme::button_text());
     for i in 0..px(8) {
-        fill(st, mx + px(6) + i, my - px(4) - i, 1, px(8) + 2 * i, theme::BUTTON_TEXT);
+        fill(st, mx + px(6) + i, my - px(4) - i, 1, px(8) + 2 * i, theme::button_text());
     }
     if muted {
         for i in 0..px(10) {
-            fill(st, mx + px(15) + i, my - px(5) + i, px(2), px(2), theme::CTRL_CLOSE);
-            fill(st, mx + px(15) + i, my + px(5) - i, px(2), px(2), theme::CTRL_CLOSE);
+            fill(st, mx + px(15) + i, my - px(5) + i, px(2), px(2), theme::ctrl_close());
+            fill(st, mx + px(15) + i, my + px(5) - i, px(2), px(2), theme::ctrl_close());
         }
     }
     // volume slider: the model's 0..16, the scale BEZEL's segments and the amp readback share

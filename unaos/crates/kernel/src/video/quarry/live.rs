@@ -4374,7 +4374,7 @@ pub fn quarry3_selftest() {
                 m.navigate(dir);
                 let mut px: Vec<u32> = alloc::vec![0; g.w * g.h];
                 repaint_locked(&m, &mut px);
-                let list_ink = px.iter().filter(|&&p| p != theme::CONTENT_FILL).count();
+                let list_ink = px.iter().filter(|&&p| p != theme::content_fill()).count();
                 let li = g.list_pane().inner();
                 let drawn = iconview::paint(&m, &mut px, li);
                 let all_hit = (0..drawn).all(|i| iconview::centre_of(&g, li, m.list.len(), m.list_scroll, i).and_then(|(x, y)| iconview::hit(&g, li, m.list.len(), m.list_scroll, x, y)) == Some(i));

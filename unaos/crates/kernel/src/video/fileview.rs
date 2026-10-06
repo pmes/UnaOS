@@ -548,7 +548,7 @@ pub fn quicklook_body(path: &str, kind: &str, w: usize, h: usize) -> Result<(Vec
     if surf.try_reserve_exact(w * h).is_err() {
         return Err(String::from("out of memory"));
     }
-    surf.resize(w * h, theme::CONTENT_FILL);
+    surf.resize(w * h, theme::content_fill());
     let rows_n = lay.rows.len();
     let mut st = State { path: String::from(path), rows: lay.rows, text, top: 0, vis, cols, w, h, surf, spans };
     paint(&mut st);
