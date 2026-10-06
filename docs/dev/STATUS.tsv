@@ -375,3 +375,6 @@ ST373	DOORHEADLESS (B487): built on exec-rmbp-doorheadless @4fd82b76, not flown 
 ST374	NOTICEFIX (B491): built on exec-rmbp-noticefix @406dcba7, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B491
 ST375	PRTSCR4 (B493): built on exec-rmbp-prtscr4 @e3a2f5ee, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B493
 ST376	BATTLIVE (B492): built on exec-rmbp-battlive @1e2b4e8b, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B492
+ST377	HIDSTALL (B485): built on exec-rmbp-hidstall @ccf5e8d3, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B485
+ST378	GEN7WAKE (B489): built on exec-rmbp-gen7wake @7384d799, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B489
+ST379	QUARRYLIVE (B494): built on exec-rmbp-quarrylive @1f678275, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B494
