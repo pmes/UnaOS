@@ -2176,7 +2176,7 @@ pub fn close() {
 pub fn key_route(ev: crate::pal::Event) -> bool {
     // FILEVIEW — the text viewer's arrows / wheel / paging, asked first; it consumes only while ITS
     // window holds focus, so a closed viewer changes nothing below.
-    if crate::video::fileview::key_route(ev) || crate::video::player::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) || crate::flightring::console_route(ev) {
+    if crate::video::dnd::key(ev) || crate::video::fileview::key_route(ev) || crate::video::player::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) || crate::flightring::console_route(ev) {
         return true;
     }
     #[cfg(feature = "facet")]
@@ -2458,7 +2458,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         match q3_press(m, sx, sy) { Some(a) => a, None => press_and_witness(m, sx, sy).0 } // QUARRY3 (B413): toolbar, path bar, sidebar, icon grid first
     };
     // Outside the lock, always: `run_act` may reach the ELF loader and the scheduler.
-    run_act(act);
+    run_act(act); dragdrop::arm_after_press(x, y, sx, sy); // DRAGDROP (B440): a single press on a list row / icon arms a drag (starts past the threshold)
     reap_jobs();
     repaint();
     true
@@ -4322,11 +4322,12 @@ fn q3_paint(m: &Model, px: &mut [u32], li: Rect) {
     }
     sidebar::paint(m, px);
     toolbar::paint(m, px);
+    dragdrop::paint(m, px); // DRAGDROP (B440): the hovered target's outline
 }
 
 /// `tests quarry3` registration (rides `fs::filetype::ensure_tests`, no tests.rs line).
 pub fn quarry3_tests() {
-    crate::tests::register("quarry3", quarry3_selftest);
+    crate::tests::register("quarry3", quarry3_selftest); dragdrop::tests(); // DRAGDROP (B440): `tests dragdrop`
     millercols::register(); // COLUMNSVIEW (B436): `tests columnsview` rides this registration
 }
 
@@ -4347,7 +4348,7 @@ pub fn quarry3_selftest() {
     let favs = rows.iter().filter(|e| !e.path.is_empty() && !e.path.starts_with(crate::fs::bootdisk::VOLUMES)).count();
     let fav_ok = rows.iter().filter(|e| e.present && !e.path.starts_with(crate::fs::bootdisk::VOLUMES)).count();
     let locs: Vec<String> = rows.iter().filter(|e| e.path.starts_with(crate::fs::bootdisk::VOLUMES)).map(|e| e.label.clone()).collect();
-    let sidebar_ok = favs == 6 && !locs.is_empty();
+    let sidebar_ok = favs >= 6 && !locs.is_empty(); // DRAGDROP (B440): the six built in, plus any the user dropped
     if !sidebar_ok {
         fails.push("sidebar");
     }
@@ -4438,3 +4439,6 @@ pub mod openwith;
 // hooks are the view switcher's dispatch in `q3_key` / `q3_press` / `q3_paint` and its service in `quicklook::service`.
 #[path = "millercols.rs"]
 pub mod millercols;
+// DRAGDROP (rmbp-ledger B440, MACPARITY row 18) — Quarry as the drag session's first participant (`video::dnd`).
+#[path = "dragdrop.rs"]
+pub mod dragdrop;

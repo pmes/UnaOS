@@ -508,3 +508,9 @@ pub fn set_pc(on: bool) -> &'static Table {
 pub fn pc_selected() -> bool {
     PC_ROLE.load(core::sync::atomic::Ordering::Relaxed)
 }
+
+/// DRAGDROP (B440) — is Option down per the latest HID report (either side)? Option is physically `HID_MOD_ALT`
+/// on both shipped tables; a drag reads it at the drop (Option forces a copy).
+pub fn option_held() -> bool {
+    HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & HID_MOD_ALT != 0
+}

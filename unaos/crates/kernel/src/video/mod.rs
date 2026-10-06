@@ -1244,3 +1244,6 @@ pub mod appswitch;
 // LIDSLEEP (B431): the lid read (MSLD, rung 0, knob `lidsleep`) and the backlight-only sleep. Same gate as backlight.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod lidsleep;
+// DRAGDROP (B440, MACPARITY row 18): the WM drag session (rides PREFSUI's capture; Quarry and the dock participate). At the tail so no line above moves.
+#[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub mod dnd;

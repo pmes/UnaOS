@@ -79,6 +79,8 @@ pub enum Writer {
     /// The operator: the kernel `pref set` verb, a session program's PREF_SET / host `PrefSet`, a hand
     /// edit of the file.
     Operator,
+    /// The kernel Quarry window (`video/quarry/dragdrop.rs`: a folder dropped on the sidebar's Favorites).
+    Quarry,
 }
 
 impl Writer {
@@ -89,6 +91,7 @@ impl Writer {
             Writer::Keys => "keys",
             Writer::WallpaperVerb => "wallpaper-verb",
             Writer::Operator => "operator",
+            Writer::Quarry => "quarry",
         }
     }
 }
@@ -240,6 +243,12 @@ pub static SCHEMA: &[Key] = &[
         default: Default::Consumer("the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset"),
         writers: OP, reader: "kernel POWERMENU",
         doc: "Battery percent at which the machine shuts down; 0 = off.",
+    },
+    Key {
+        ns: "system", key: "quarry.favorites", kind: Kind::Str { max_len: 512, printable: true },
+        default: Default::Consumer("none — the sidebar's six built-in favorites only"),
+        writers: &[Writer::Quarry], reader: "kernel Quarry sidebar (`video/quarry/sidebar.rs`)",
+        doc: "Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18).",
     },
     Key {
         ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 8 }, default: Default::Int(0),
