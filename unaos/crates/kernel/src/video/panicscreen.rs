@@ -351,6 +351,7 @@ fn write_log() {
         serial_println!("[panic] log not written reason=masked (a fault gate: the block pump needs interrupts)");
         return;
     }
+    { let tid = crate::arch::sched::current_id().unwrap_or(0); crate::arch::stackguard::release_held(tid); crate::sync::release_task(tid, "panic"); } // LOCKREG (B414): the dying task's locks back (the named three, then every other) before the log needs VFS/UnaFS
     if !heap_free(crate::arch::apic::tsc_hz()) {
         serial_println!("[panic] log not written reason=heap-held");
         return;

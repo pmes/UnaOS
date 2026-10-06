@@ -670,7 +670,7 @@ fn dec_beat(stage: u8) {
 /// downmix — runs here, in bounded steps (one `next_i32` call of at most 4096 frames), with a heartbeat between.
 fn dec_task(arg: usize) {
     use audio_core::AudioDecoder;
-    let jid = arg as u32;
+    let jid = arg as u32; #[cfg(target_arch = "x86_64")] DEC_TID.store(crate::sync::here_tid(), Ordering::Release); // LOCKREG (B414): the decoder's task id, so an abort can NAME what it holds and waits on
     let mine = || DEC_GEN.load(Ordering::Acquire) == jid && !DEC_ABORT.load(Ordering::Acquire);
     let paint = dec_stack_paint();
     let path = match DEC_OUT.lock().as_ref() { Some(o) if o.jid == jid => o.path.clone(), _ => { dec_exit(jid, paint, "superseded"); return; } };
@@ -854,7 +854,7 @@ fn dec_watch(jid: u32) -> bool {
             };
             serial_println!("[play] {} stall stage={} frame={} calls={} ms={} -> ABORT", codec, stage_name(stage), frames, DEC_CALLS.load(Ordering::Acquire), silent);
             DEC_STALL.store(stage, Ordering::Release);
-            DEC_ABORT.store(true, Ordering::Release);
+            DEC_ABORT.store(true, Ordering::Release); #[cfg(target_arch = "x86_64")] crate::sync::name_task(DEC_TID.load(Ordering::Acquire), "dec-abort"); // LOCKREG (B414): the wedged decoder's holds and its wait, named (a live task: never released)
             DEC_LIVE.store(false, Ordering::Release); // DECJOBHANG M1: a job the guard ended (a halted task never reaches `dec_exit`) frees the decoder for the next open
             stop();
             dec_end_play();
@@ -1063,3 +1063,7 @@ fn tq_tick() {
     }
     TQ_IN.store(false, Ordering::Release);
 }
+
+/// LOCKREG (rmbp-ledger B414): the running decoder job's task id (0 = untracked), for `sync::name_task` at an abort.
+#[cfg(target_arch = "x86_64")]
+static DEC_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

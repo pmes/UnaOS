@@ -223,6 +223,7 @@ extern "C" fn overflow_exit() -> ! {
     // STACKGUARD2 M3: release what the dead task is KNOWN to hold BEFORE its line, so the line reaches the
     // wire (the FTDI ring is the rMBP's wire). Replaces the 20M-spin wait on SERIAL1 + machine-wide panic mode.
     let released = release_held(super::sched::current_task_id(cpu).unwrap_or(0));
+    crate::sync::release_task(super::sched::current_task_id(cpu).unwrap_or(0), "stack-overflow"); // LOCKREG (B414): every OTHER lock the registry holds in the dead task's name, one line
     if let Some((name, base, len)) = super::sched::current_named_slab(cpu) {
         serial_println!(
             "[stack] OVERFLOW task={} stack={:#x}..{:#x} fault={:#x} rip={:#x} via={} -> task halted",
@@ -535,7 +536,7 @@ fn df_reentry(cpu: usize, cr2: u64, rip: u64) -> ! {
 // ── M3: what a halted task is known to hold ───────────────────────────────────────────────────────────
 
 /// Force-release every `lockowner` lock whose recorded holder is `tid`; the bit set of what was released.
-fn release_held(tid: u64) -> u32 {
+pub(crate) fn release_held(tid: u64) -> u32 {
     use crate::lockowner as lo;
     let mut out = 0u32;
     if lo::held_by(lo::SINK, tid) {
