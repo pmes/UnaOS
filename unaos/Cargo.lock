@@ -83,6 +83,10 @@ name = "elf_core"
 version = "0.1.0"
 
 [[package]]
+name = "exfat_core"
+version = "0.1.0"
+
+[[package]]
 name = "fatfs"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -437,6 +441,7 @@ dependencies = [
  "demux_core",
  "diag_core",
  "elf_core",
+ "exfat_core",
  "fdt",
  "font8x8",
  "font_core",

@@ -42,3 +42,11 @@ Write (bitmap allocation, the entry-set rewrite and its checksum, the FAT chain 
 NoFatChain, the VolumeDirty flag); TexFAT (second FAT, NumberOfFats=2: read uses the active FAT only); a FAT-walk
 cursor cache for long chained reads (each read walks the chain from its first cluster, one FAT sector per 128 links);
 exFAT on aarch64's USB path (the Pi's loop runs `piusb27_service`, not `removable::service`).
+
+## Built (legs on this branch)
+- M1 `0b335b41`-era commit: `exfat_core` + `tests/mkfixture.sh` + `tests/image.rs`. `EXFAT_FIXTURE=<4 MiB image> cargo test -p
+  exfat_core`: 5 unit + 6 image KATs, exit 0 (label, 8/8 audit, 7 root entries, 151-entry multi-cluster `Sub`,
+  case-blind lookup through the volume's up-case table incl. non-ASCII, a NoFatChain file and two FAT-chained
+  interleaved files byte-exact, MBR part_type=7 locate, backup boot region fallback, a damaged set skipped+counted).
+- M2+M3: `fs/exfat.rs`, the `removable.rs` exFAT arm (mount line, `bind` → `ExfatBackend`, `tests exfat`
+  registered on the first service pass), `exfat_mounts()` at the file tail.

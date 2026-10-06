@@ -176,3 +176,5 @@ pub mod unafsgrow;
 pub mod volumes;
 /// USBSTOR (B384, R95): a removable disk is mounted under `/volumes` when it attaches and dropped when it leaves.
 pub mod removable;
+/// EXFAT (B392): the kernel half of the shared exFAT reader (`unaos/libs/fs/exfat_core`) — removable volumes, read-only.
+pub mod exfat;
