@@ -85,9 +85,11 @@ fn cite_follows_the_gate() {
 
 #[test]
 fn query_translates() {
-    assert_eq!(query_text("status=confirmed flight=f24").unwrap(), "job:status == \"confirmed\" AND job:flight == \"f24\"");
-    assert_eq!(query_text("set-by=x").unwrap(), "job:set_by == \"x\"");
-    assert_eq!(query_text("job:status == open").unwrap(), "job:status == open");
+    // SMALLFIX4 item 13 (ATTRKEYS): the expected texts are built from the registered keys.
+    assert_eq!(query_text("status=confirmed flight=f24").unwrap(), format!("{} == \"confirmed\" AND {} == \"f24\"", K_STATUS, K_FLIGHT));
+    assert_eq!(query_text("set-by=x").unwrap(), format!("{} == \"x\"", K_SET_BY));
+    let open = format!("{} == open", K_STATUS);
+    assert_eq!(query_text(&open).unwrap(), open);
     assert!(query_text("status").is_err());
     assert_eq!(cited("cites ST1 and ST12, not XST3 or ST4a"), "ST1,ST12");
     assert_eq!(ledger_head("**open** — x"), "open");

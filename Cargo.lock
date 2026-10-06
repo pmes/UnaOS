@@ -2794,6 +2794,9 @@ dependencies = [
 [[package]]
 name = "jobs_core"
 version = "0.1.0"
+dependencies = [
+ "una-abi",
+]
 
 [[package]]
 name = "jobserver"
