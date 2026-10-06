@@ -88,3 +88,56 @@ fn ringlogin_a_typed_init_ring_opens_with_the_login_key() {
     assert_eq!(h.unlock_with_key(false, hdr.salt, hdr.kdf, Key::from_bytes(k)), Ok(()));
     assert!(h.is_unlocked());
 }
+
+/// RINGLOGIN2 (B479): a password change re-wraps the ring. The kernel derives BOTH keys at the ring's own salt
+/// and parameters; `rekey_with_keys` (→ `Ring::rewrap_keyed`) keeps the salt, the parameters and the owner,
+/// reseals every secret, and after it the NEW password opens the ring and every secret while the OLD one is
+/// BAD_PASSWORD. A wrong old key, or a store write that fails, keeps the old ring byte for byte.
+#[test]
+fn ringlogin2_rekey_keeps_salt_and_secrets() {
+    const NEW: &[u8] = b"a new password, typed twice";
+    let salt = [0x33; 16];
+    let k_old = kernel_kdf(PW, &salt, &P);
+    let k_new = kernel_kdf(NEW, &salt, &P);
+    let mut h = svc(MemStore::default());
+    assert_eq!(h.unlock_with_key(true, salt, P, Key::from_bytes(k_old)), Ok(()));
+    for (ns, nm) in [("bt", "a1b2c3d4e5f6"), ("vein", "claude.api_key")] {
+        let put = Request::Put { ns: ns.into(), name: nm.into(), kind: "k".into(), label: "l".into(), data: nm.as_bytes().to_vec() };
+        assert_eq!(h.handle(Some(OWNER), put.verb(), &put.encode_body(), 0, 0).status, status::OK);
+    }
+    let before = h.store_mut().read_ring().unwrap().unwrap();
+
+    // A wrong old key: refused, nothing written.
+    let wrong = kernel_kdf(b"not the password", &salt, &P);
+    assert_eq!(h.rekey_with_keys(Key::from_bytes(wrong), Key::from_bytes(k_new)), Err(status::BAD_PASSWORD));
+    assert_eq!(h.store_mut().read_ring().unwrap().unwrap(), before);
+
+    // The re-wrap.
+    assert_eq!(h.rekey_with_keys(Key::from_bytes(k_old), Key::from_bytes(k_new)), Ok(2));
+    assert!(h.is_unlocked());
+    let after = h.store_mut().read_ring().unwrap().unwrap();
+    let (h0, _, _) = format::parse_ring(&before).unwrap();
+    let (h1, _, _) = format::parse_ring(&after).unwrap();
+    assert_eq!((h0.salt, h0.kdf, &h0.owner), (h1.salt, h1.kdf, &h1.owner), "salt, parameters and owner are kept");
+    assert_ne!(before, after);
+
+    // The next login: the new password opens it and every secret; the old one is refused.
+    let store = h.store_mut().clone();
+    let mut h2 = svc(store);
+    assert_eq!(h2.unlock_with_key(false, salt, P, Key::from_bytes(k_old)), Err(status::BAD_PASSWORD));
+    assert_eq!(h2.unlock_with_key(false, salt, P, Key::from_bytes(k_new)), Ok(()));
+    for nm in ["a1b2c3d4e5f6", "claude.api_key"] {
+        let ns = if nm == "claude.api_key" { "vein" } else { "bt" };
+        let get = Request::Get { ns: ns.into(), name: nm.into() };
+        let r = h2.handle(Some(OWNER), get.verb(), &get.encode_body(), 0, 0);
+        assert_eq!((r.status, r.body.as_slice()), (status::OK, nm.as_bytes()));
+    }
+    // And the typed password path agrees.
+    h2.lock_now();
+    let unlock = Request::Unlock { create: false, password: NEW.to_vec() };
+    assert_eq!(h2.handle(Some(OWNER), unlock.verb(), &unlock.encode_body(), 0, 0).status, status::OK);
+
+    // No ring: NO_RING, nothing made.
+    let mut h3 = svc(MemStore::default());
+    assert_eq!(h3.rekey_with_keys(Key::from_bytes(k_old), Key::from_bytes(k_new)), Err(status::NO_RING));
+}

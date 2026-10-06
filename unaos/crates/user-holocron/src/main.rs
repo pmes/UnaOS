@@ -337,6 +337,19 @@ impl Store for PathStore {
             .filter_map(|l| core::str::from_utf8(l).ok().map(String::from))
             .collect())
     }
+    fn namespaces(&mut self) -> Result<Vec<String>, StoreError> {
+        // RINGLOGIN2 (B479): the re-wrap's walk — the root's directory entries (a `/` suffix marks one).
+        if !self.ok {
+            return Ok(Vec::new());
+        }
+        let Some(b) = read_all(&self.root, PATH_R_LIST)? else { return Ok(Vec::new()) };
+        Ok(b.split(|&c| c == b'\n')
+            .filter_map(|l| l.strip_suffix(b"/"))
+            .filter_map(|l| core::str::from_utf8(l).ok())
+            .filter(|n| holocron_core::name::valid(n))
+            .map(String::from)
+            .collect())
+    }
     fn remove(&mut self, ns: &str, name: &str) -> Result<bool, StoreError> {
         self.gate()?;
         unlink(&self.file(ns, name))
@@ -734,6 +747,18 @@ fn ringlogin_door(svc: &mut Svc) {
     let params = KdfParams { m_kib: d.m_kib, t: d.t, p: d.p };
     let key = Key::from_bytes(d.key);
     holocron_core::zero::wipe(&mut d.key);
+    if d.mode == una_abi::RINGKEY_MODE_REKEY {
+        // RINGLOGIN2 (B479): a password change — holocron_core's ONE re-wrap (salt and parameters kept; a failure
+        // keeps the old ring). The kernel says `ring=rekeyed at=passwd` or the refusal on this report.
+        let old = Key::from_bytes(d.old_key);
+        holocron_core::zero::wipe(&mut d.old_key);
+        let st = match svc.rekey_with_keys(old, key) {
+            Ok(_) => 0,
+            Err(s) => s,
+        };
+        sys(una_abi::SYS_RINGKEY, una_abi::RINGKEY_OP_REPORT, st as i64 as u64, d.mode as u64, 0);
+        return;
+    }
     let create = d.mode == una_abi::RINGKEY_MODE_CREATE;
     let st = match svc.unlock_with_key(create, d.salt, params, key) {
         Ok(()) => 0,

@@ -58,6 +58,11 @@ pub trait Store {
     fn remove_ring(&mut self) -> Result<bool, StoreError> {
         Ok(false)
     }
+    /// RINGLOGIN2 (B479): the namespaces that hold secrets (the re-wrap's walk). A store that cannot say
+    /// refuses — and a refused walk keeps the old ring, never a half-re-keyed one.
+    fn namespaces(&mut self) -> Result<Vec<String>, StoreError> {
+        Err(StoreError)
+    }
 }
 
 /// An in-memory store (tests; and the shape every other store mirrors).
@@ -92,6 +97,11 @@ impl Store for MemStore {
     }
     fn remove_ring(&mut self) -> Result<bool, StoreError> {
         Ok(self.ring.take().is_some())
+    }
+    fn namespaces(&mut self) -> Result<Vec<String>, StoreError> {
+        let mut v: Vec<String> = self.files.keys().map(|(n, _)| n.clone()).collect();
+        v.dedup();
+        Ok(v)
     }
 }
 
@@ -338,6 +348,54 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
         self.ring.unlock_keyed(&file, key, &salt).map_err(ring_status)?;
         self.limiter.succeed();
         Ok(())
+    }
+
+    /// RINGLOGIN2 (B479): a password change — re-wrap the ring from `old` to `new` (both derived by the kernel at
+    /// the ring's own salt and parameters, which are kept) through [`Ring::rewrap_keyed`], the ONE re-wrap.
+    /// Every secret is read, re-wrapped in memory, written; the ring file is written LAST. Any failure keeps the
+    /// OLD ring: nothing is written before the re-wrap succeeds, and a write that fails puts back every secret
+    /// already rewritten (from the bytes read) and leaves the ring file alone. `Ok(n)` = secrets re-wrapped; the
+    /// ring is then unlocked under `new`.
+    pub fn rekey_with_keys(&mut self, old: crate::zero::Key, new: crate::zero::Key) -> Result<usize, i32> {
+        let Some(ring_file) = self.store.read_ring().map_err(|_| status::IO)? else { return Err(status::NO_RING) };
+        let mut secrets: Vec<(String, String, Vec<u8>)> = Vec::new();
+        for ns in self.store.namespaces().map_err(|_| status::IO)? {
+            if !name::valid(&ns) {
+                continue;
+            }
+            for nm in self.store.list(&ns).map_err(|_| status::IO)? {
+                if let Some(f) = self.store.read(&ns, &nm).map_err(|_| status::IO)? {
+                    secrets.push((ns.clone(), nm, f));
+                }
+            }
+        }
+        let keep = crate::zero::Key::from_bytes(*old.bytes());
+        let was_unlocked = self.ring.is_unlocked();
+        let (file, sealed) = self.ring.rewrap_keyed(&ring_file, old, new, &secrets, &mut self.rng).map_err(ring_status)?;
+        let mut done = 0usize;
+        let mut failed = false;
+        for ((ns, nm, _), (f, meta)) in secrets.iter().zip(sealed.iter()) {
+            if self.store.write(ns, nm, f, meta).is_err() {
+                failed = true;
+                break;
+            }
+            done += 1;
+        }
+        if !failed && self.store.write_ring(&file).is_err() {
+            failed = true;
+        }
+        if failed {
+            for ((ns, nm, orig), (_, meta)) in secrets.iter().zip(sealed.iter()).take(done) {
+                let _ = self.store.write(ns, nm, orig, meta);
+            }
+            self.ring.lock();
+            if was_unlocked {
+                let salt = self.ring.header().map(|h| h.salt).unwrap_or_default();
+                let _ = self.ring.unlock_keyed(&ring_file, keep, &salt);
+            }
+            return Err(status::IO);
+        }
+        Ok(done)
     }
 
     /// Read and open `ns/name`.

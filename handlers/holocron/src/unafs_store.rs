@@ -144,6 +144,20 @@ impl<D: BlockDevice> Store for UnaFsStore<D> {
             .collect())
     }
 
+    fn namespaces(&mut self) -> Result<Vec<String>, StoreError> {
+        // RINGLOGIN2 (B479): the re-wrap's walk — every valid-named directory under the base.
+        let base = self.base.clone();
+        let Some(d) = self.dir(&base, false)? else { return Ok(Vec::new()) };
+        Ok(self
+            .fs
+            .ls(d)
+            .map_err(e)?
+            .into_iter()
+            .filter(|x| x.kind == FileKind::Directory && name::valid(&x.name))
+            .map(|x| x.name)
+            .collect())
+    }
+
     fn remove(&mut self, ns: &str, name_: &str) -> Result<bool, StoreError> {
         if !name::valid(ns) || !name::valid(name_) {
             return Err(StoreError);

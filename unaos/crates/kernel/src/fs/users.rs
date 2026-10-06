@@ -2097,10 +2097,16 @@ struct Prompt {
     b: [u8; PW_MAX],
     blen: usize,
     over: bool,
+    /// RINGLOGIN2 (B479): stage 0 — the CURRENT password of a `passwd` on the session's own row (verified at its
+    /// Enter, kept until the commit re-keys the ring with it, zeroed with the rest).
+    o: [u8; PW_MAX],
+    olen: usize,
+    /// The current password verified: the commit re-keys the ring.
+    rekey: bool,
 }
 
 /// The idle prompt — every exit path writes this back, which is what zeroes both entries.
-const PROMPT_IDLE: Prompt = Prompt { live: false, stage: 0, name: [0; NAME_MAX], nlen: 0, a: [0; PW_MAX], alen: 0, b: [0; PW_MAX], blen: 0, over: false };
+const PROMPT_IDLE: Prompt = Prompt { live: false, stage: 0, name: [0; NAME_MAX], nlen: 0, a: [0; PW_MAX], alen: 0, b: [0; PW_MAX], blen: 0, over: false, o: [0; PW_MAX], olen: 0, rekey: false };
 
 static PROMPT: Mutex<Prompt> = Mutex::new(PROMPT_IDLE);
 
@@ -2220,10 +2226,12 @@ fn passwd_begin(args: &[&str], console: &mut crate::console::Console) {
     if password_unset(target).is_none() {
         return passwd_refuse(target, "no-such-user", console);
     }
+    let ask_old = is_own && target != ROOT_NAME; // RINGLOGIN2 (B479): your own password — the current one first (it re-keys the ring)
     {
         let mut p = PROMPT.lock();
+        *p = PROMPT_IDLE;
         p.live = true;
-        p.stage = 1;
+        p.stage = if ask_old { 0 } else { 1 };
         p.name = [0; NAME_MAX];
         p.name[..target.len()].copy_from_slice(target);
         p.nlen = target.len();
@@ -2232,6 +2240,9 @@ fn passwd_begin(args: &[&str], console: &mut crate::console::Console) {
         p.b = [0; PW_MAX];
         p.blen = 0;
         p.over = false;
+    }
+    if ask_old {
+        return console.println(&alloc::format!("passwd: current password for {} (not shown; Enter ends it, Ctrl-C cancels):", wire_name(target)));
     }
     console.println(&alloc::format!("passwd: new password for {} (not shown; Enter ends it, Ctrl-C cancels):", wire_name(target)));
 }
@@ -2255,7 +2266,9 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
             2
         }
         8 | 0x7f => {
-            if p.stage == 1 {
+            if p.stage == 0 {
+                p.olen = p.olen.saturating_sub(1);
+            } else if p.stage == 1 {
                 p.alen = p.alen.saturating_sub(1);
             } else {
                 p.blen = p.blen.saturating_sub(1);
@@ -2263,6 +2276,28 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
             1
         }
         b'\n' | b'\r' => {
+            if p.stage == 0 {
+                // RINGLOGIN2: the current password — verified with no lock held (the store's PBKDF2), kept for the
+                // commit's re-key; a wrong one refuses the change here, as the Mac does.
+                let (n, nl, mut o, ol, over) = (p.name, p.nlen, p.o, p.olen, p.over);
+                drop(p);
+                let ok = !over && ol > 0 && verify(&n[..nl], &o[..ol]);
+                for x in o.iter_mut() {
+                    *x = 0;
+                }
+                let mut p = PROMPT.lock();
+                if !ok {
+                    *p = PROMPT_IDLE;
+                    drop(p);
+                    passwd_refuse(&n[..nl], "bad-old-password", console);
+                    return 2;
+                }
+                p.stage = 1;
+                p.rekey = true;
+                drop(p);
+                console.println(&alloc::format!("passwd: new password for {}:", wire_name(&n[..nl])));
+                return 2;
+            }
             if p.stage == 1 && p.alen > 0 && !p.over {
                 p.stage = 2;
                 drop(p);
@@ -2272,6 +2307,7 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
             // Finished (or refused at the first Enter): copy out, ZERO the prompt, then decide with no
             // lock held — `create_user` runs the calibrated KDF (~250 ms) and takes `TABLE`.
             let (n, nl, a, al, b, bl, over, stage) = (p.name, p.nlen, p.a, p.alen, p.b, p.blen, p.over, p.stage);
+            let (mut o, ol, rekey) = (p.o, p.olen, p.rekey);
             *p = PROMPT_IDLE;
             drop(p);
             let name = &n[..nl];
@@ -2284,9 +2320,19 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
             } else {
                 passwd_commit(name, &a[..al])
             };
+            #[cfg(not(feature = "lumen"))]
+            let _ = (ol, rekey);
+            #[cfg(feature = "lumen")]
+            if verdict.is_ok() {
+                if rekey {
+                    crate::keyring::ring_rekey(name, &o[..ol], &a[..al]); // RINGLOGIN2 (B479): the ring follows the password
+                } else {
+                    crate::keyring::ring_kept_admin_reset(name);
+                }
+            }
             let mut a = a;
             let mut b = b;
-            for x in a.iter_mut().chain(b.iter_mut()) {
+            for x in a.iter_mut().chain(b.iter_mut()).chain(o.iter_mut()) {
                 *x = 0;
             }
             match verdict {
@@ -2296,7 +2342,9 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
             2
         }
         0x20..=0x7e => {
-            if p.stage == 1 {
+            if p.stage == 0 {
+                if p.olen < PW_MAX { let i = p.olen; p.o[i] = c; p.olen += 1; } else { p.over = true; }
+            } else if p.stage == 1 {
                 if p.alen < PW_MAX { let i = p.alen; p.a[i] = c; p.alen += 1; } else { p.over = true; }
             } else if p.blen < PW_MAX {
                 let i = p.blen;
@@ -2859,6 +2907,7 @@ pub fn login_usermgmt_fixture() {
         shell_verb("deluser", &[N], &mut con);
         let self_refused = *USERMGMT_LAST.lock() == "self" && id_of(N.as_bytes()).is_some();
         shell_verb("passwd", &[], &mut con);
+        feed(&mut con, b"umg1-old\n"); // RINGLOGIN2 (B479): the current password first
         feed(&mut con, b"umg1-new\n");
         feed(&mut con, b"umg1-new\n");
         let own = logged && verify(N.as_bytes(), b"umg1-new") && !verify(N.as_bytes(), b"umg1-old");
