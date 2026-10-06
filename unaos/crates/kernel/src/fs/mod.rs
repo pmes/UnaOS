@@ -182,3 +182,5 @@ pub mod rootdisk;
 pub mod exfat;
 /// APPRES (B398): the registrar — a program's resources (name, signature, version, kind, icon, doc types) as attributes.
 pub mod appres;
+/// SEARCH (B417 LAUNCHER; QUARRY3 B413 joins): `by_name(prefix, limit)` — files by name, one bounded walk of the name trees.
+pub mod search;
