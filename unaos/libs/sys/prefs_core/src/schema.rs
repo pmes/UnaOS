@@ -255,11 +255,8 @@ pub static SCHEMA: &[Key] = &[
     },
     Key {
         ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 8 }, default: Default::Int(0),
-        writers: &[Writer::Settings], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications).",
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 6 }, default: Default::Int(0),
         writers: &[Writer::Settings, Writer::Program], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications).",
     },
     // ── TRACKPADPANE (B412, MACPARITY row 16): the Trackpad pane; the rules are `crate::trackpad` ──────────────
     Key {

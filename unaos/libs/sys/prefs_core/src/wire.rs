@@ -443,6 +443,7 @@ system.trackpad.three_finger_drag = false\n";
 mod secreview_fuzz {
     use super::*;
     // PREFSCAP (B454, SECREVIEW F4): the capability cases share this module (merge19: one Rng, one store).
+    // PREFSCAP (B454, SECREVIEW F4): the capability cases share this module (merge19: one Rng, one store).
     use crate::declare::{self, Registry, MAX_PROGRAMS};
 
     /// The reference store with a declared-stanza registry (the kernel's `DECLARED`, in RAM).
@@ -546,7 +547,9 @@ mod secreview_fuzz {
                     let _ = crate::login::parse(t);
                     let _ = PrefValue::from_literal(t);
                     let _ = crate::PrefTree::parse(t);
-    // PREFSCAP (B454, SECREVIEW F4): the capability cases share this module (merge19: one Rng, one store).
+                }
+            }
+        }
     }
 
     /// Bounded fuzz: random SET/DECLARE bodies under a stamped program never write outside its capability.
