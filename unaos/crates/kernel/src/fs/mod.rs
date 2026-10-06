@@ -190,3 +190,5 @@ pub mod bootfat;
 pub mod bootlog;
 /// SEARCH (B417 LAUNCHER; QUARRY3 B413 joins): `by_name(prefix, limit)` — files by name, one bounded walk of the name trees.
 pub mod search;
+/// BOOTFATSEAM (B453, R99): the kernel's own stores (USERS.DAT, the holocron store) as kernel-owned leaves of UnaFS `/system`.
+pub mod sysleaf;

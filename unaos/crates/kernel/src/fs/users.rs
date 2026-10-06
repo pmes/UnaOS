@@ -607,6 +607,7 @@ fn try_load() -> Result<(), FatError> {
 /// leaf. A failure anywhere leaves the previous live leaf in place and the RAM table as written.
 /// Always writes v2 (`USERS_VER`): a v1 image adopted at load goes to disk as v2 at its first flush.
 fn flush(t: &mut Table) -> Result<(), UsersError> {
+    if seat_with(t) == SEAT_UNAFS { return flush_unafs(t); } // BOOTFATSEAM (B453, R99): on a native root the store is /system/USERS.DAT; the FAT body below is the FAT-root boot's
     let fs = store_mount().map_err(|_| UsersError::Volume)?;
     let mut img = [0u8; USERS_IMAGE_MAX];
     t.seq = t.seq.wrapping_add(1);
@@ -1955,6 +1956,7 @@ static ROOT_PW_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// At the store's load: make root's row if it is absent; open (or defer) the set-password screen if its
 /// password is not chosen yet. Nothing happens in a user session (the store loaded after a login).
 pub fn root_credential_ignition() {
+    seat_on_root(); // BOOTFATSEAM (B453, R99): the store moves to UnaFS /system before anything here may save it
     migrate_r100(); // FIRSTUSER (R100): an R77 card (root's row, no administrator) is migrated at the store's load, before the stage is read
     if !root_session() {
         return;
@@ -3471,3 +3473,117 @@ pub fn serialdoor_principal_note() {
         None => serial_println!("[serialdoor] principal=system (R100: no session is open)"),
     }
 }
+
+// =========================================================================================
+// BOOTFATSEAM (rmbp-ledger B453, SECREVIEW F3, R99) — the store on UnaFS `/system` (tail)
+// =========================================================================================
+// The store LOADS from the FAT exactly as before (`try_load`: the bare-boot path, before the root binds — the
+// installer's boot reads it there). The first pass after the root binds SEATS it: on a native root (the boot FAT is
+// sacred) `/system/USERS.DAT` is the store from then on — adopted when it is there (kernel-owned), else written ONCE
+// from the FAT-loaded table (the migration). The FAT copy is never written again; it stays, read-only, for the
+// installer's bare-boot path, and the wire says so. A FAT-root boot (no UnaFS: the FAT is `/`) keeps the FAT store.
+
+const SEAT_UNKNOWN: u8 = 0;
+const SEAT_FAT: u8 = 1;
+const SEAT_UNAFS: u8 = 2;
+static SEAT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(SEAT_UNKNOWN);
+/// `tests bootfatseam`: how the UnaFS store came to be (`unafs` adopted, `migrated` from the FAT, `fresh`, `-`).
+static SEAT_SRC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// The first users pass after the root binds (`root_credential_ignition`): seat the store. Idempotent.
+pub fn seat_on_root() {
+    use core::sync::atomic::Ordering;
+    if SEAT.load(Ordering::Acquire) != SEAT_UNKNOWN {
+        return;
+    }
+    let _ = crate::shell::vfs_mount_table(); // binds the root (arms R99 on a native one) BEFORE the table lock is taken
+    let mut t = TABLE.lock();
+    if !t.loaded {
+        return;
+    }
+    seat_with(&mut t);
+}
+
+/// `tests bootfatseam`'s `users=`: `unafs`, `fat` (a FAT-root boot), or `-` (not seated yet).
+pub fn seat_word() -> &'static str {
+    match SEAT.load(core::sync::atomic::Ordering::Acquire) {
+        SEAT_UNAFS => "unafs",
+        SEAT_FAT => "fat",
+        _ => "-",
+    }
+}
+
+fn seat_with(t: &mut Table) -> u8 {
+    use crate::fs::sysleaf::{self, Leaf};
+    use core::sync::atomic::Ordering;
+    let s = SEAT.load(Ordering::Acquire);
+    if s != SEAT_UNKNOWN {
+        return s;
+    }
+    let _ = crate::shell::vfs_mount_table();
+    if !sysleaf::active() {
+        SEAT.store(SEAT_FAT, Ordering::Release);
+        serial_println!("[users] seat store=fat:/USERS.DAT (no UnaFS root: the FAT is /) ::");
+        return SEAT_FAT;
+    }
+    SEAT.store(SEAT_UNAFS, Ordering::Release);
+    let mut img = match sysleaf::read(USERS_FILE, USERS_IMAGE_MAX) {
+        Leaf::Kernel(b) => Some(b),
+        Leaf::Foreign => {
+            serial_println!("[users] /system/USERS.DAT REFUSED reason=not-kernel-owned (never adopted; replaced by the kernel's own) ::");
+            None
+        }
+        _ => None,
+    };
+    if img.is_none() {
+        if let Leaf::Kernel(b) = sysleaf::read(USERS_TMP_FILE, USERS_IMAGE_MAX) {
+            img = Some(b); // the interrupted swap's temp, exactly as the FAT load adopts USERS.NEW
+        }
+    }
+    if let Some(b) = img {
+        match parse_image(&b) {
+            Ok(p) => {
+                t.seq = p.seq;
+                t.count = p.count;
+                t.rows = p.rows;
+                t.next_uid = p.next_uid;
+                SEAT_SRC.store(1, Ordering::Relaxed);
+                serial_println!("[users] seat store=unafs:/system/USERS.DAT src=unafs users={} seq={} (FAT copy read-only: installer bare-boot path, R99) ::", p.count, p.seq);
+                return SEAT_UNAFS;
+            }
+            Err(e) => serial_println!("[users] /system/USERS.DAT REFUSED reason={} (the FAT-loaded table is written over it) ::", users_reason(e)),
+        }
+    }
+    // The migration: the table the FAT load adopted goes to UnaFS once. A fresh store (no rows) writes nothing.
+    if t.count == 0 {
+        SEAT_SRC.store(3, Ordering::Relaxed);
+        serial_println!("[users] seat store=unafs:/system/USERS.DAT src=fresh users=0 (the first save writes it; FAT copy untouched, R99) ::");
+        return SEAT_UNAFS;
+    }
+    let r = flush_unafs(t);
+    SEAT_SRC.store(2, Ordering::Relaxed);
+    serial_println!(
+        "[users] migrate USERS.DAT fat -> unafs:/system/USERS.DAT users={} -> {}; the FAT copy stays read-only for the installer's bare-boot path (R99) ::",
+        t.count,
+        if r.is_ok() { "ok" } else { "FAILED (kept in RAM; the next save retries)" }
+    );
+    SEAT_UNAFS
+}
+
+/// `flush` on a native root: the same image, published to `/system/USERS.DAT` (temp, read back, swap).
+fn flush_unafs(t: &mut Table) -> Result<(), UsersError> {
+    let mut img = [0u8; USERS_IMAGE_MAX];
+    t.seq = t.seq.wrapping_add(1);
+    let n = serialize_into(t.seq, t.next_uid, &t.rows[..t.count as usize], &mut img);
+    if let Err(why) = crate::fs::sysleaf::publish(USERS_FILE, USERS_TMP_FILE, &img[..n]) {
+        serial_println!("[users] save store=unafs:/system/USERS.DAT FAILED reason={} ::", why);
+        screen_notice(b"Storage error", b"changes were not saved");
+        return Err(UsersError::Volume);
+    }
+    let p = parse_image(&img[..n])?;
+    if p.seq != t.seq || p.count != t.count || p.next_uid != t.next_uid {
+        return Err(UsersError::Volume);
+    }
+    Ok(())
+}
+

@@ -676,6 +676,7 @@ pub fn clear() {
 
 /// Read `/HCRON/<leaf>` off the writable FAT volume into `out`.
 fn read_store_file(leaf: &str, out: &mut alloc::vec::Vec<u8>) -> Result<(), HcronError> {
+    if crate::fs::sysleaf::active() { return seat_read(leaf, out); } // BOOTFATSEAM (B453, R99): on a native root the store is /system/<leaf> (kernel-owned); the FAT body below is the FAT-root boot's and the migration's source
     let fs = crate::fs::fat::mount().map_err(|_| HcronError::NoStorage)?;
     let (dir, _, _) = fs
         .locate_in_dir(0, HCRON_DIR)
@@ -734,6 +735,7 @@ fn store_dir(fs: &crate::fs::fat::FatFs, create: bool) -> Result<u32, HcronError
 /// that name a leaf directly are that publish and the selftest's own scratch leaf, neither of which
 /// has a previous generation worth protecting.
 fn write_store_file(leaf: &str, data: &[u8]) -> Result<(), HcronError> {
+    if crate::fs::sysleaf::active() { return crate::fs::sysleaf::write(leaf, data).map_err(seat_err); } // BOOTFATSEAM (B453, R99)
     let fs = crate::fs::fat::mount().map_err(|_| HcronError::NoStorage)?;
     if fs.write_veto().is_some() {
         return Err(HcronError::ReadOnly);
@@ -775,6 +777,7 @@ fn write_store_file(leaf: &str, data: &[u8]) -> Result<(), HcronError> {
 /// the store's own paths never delete a leaf outright, they swap over it.
 #[cfg(feature = "hcronst")]
 fn unlink_store_file(leaf: &str) -> Result<(), HcronError> {
+    if crate::fs::sysleaf::active() { return crate::fs::sysleaf::unlink(leaf).map_err(seat_err); } // BOOTFATSEAM (B453, R99)
     let fs = crate::fs::fat::mount().map_err(|_| HcronError::NoStorage)?;
     if fs.write_veto().is_some() {
         return Err(HcronError::ReadOnly);
@@ -822,6 +825,7 @@ fn unlink_store_file(leaf: &str) -> Result<(), HcronError> {
 /// Nothing here is atomic in the hardware sense; FAT cannot be. What it is, is recoverable at every
 /// point, which the previous sequence was not.
 fn publish_store_file(data: &[u8]) -> Result<(), HcronError> {
+    if crate::fs::sysleaf::active() { return seat_publish(data); } // BOOTFATSEAM (B453, R99): the proof (parse) and the swap, on /system
     // 1. Stage.
     write_store_file(HCRON_TMP_FILE, data)?;
 
@@ -873,6 +877,7 @@ fn publish_store_file(data: &[u8]) -> Result<(), HcronError> {
 /// and a failure here is reported to the caller rather than swallowed: the witness says whether the
 /// evidence survived.
 fn quarantine_store_file(leaf: &str) -> Result<(), HcronError> {
+    if crate::fs::sysleaf::active() { return if matches!(crate::fs::sysleaf::read(leaf, HCRON_IMAGE_MAX), crate::fs::sysleaf::Leaf::Absent) { Ok(()) } else { crate::fs::sysleaf::rename(leaf, HCRON_BAD_FILE).map_err(seat_err) }; } // BOOTFATSEAM (B453, R99)
     let fs = crate::fs::fat::mount().map_err(|_| HcronError::NoStorage)?;
     if fs.write_veto().is_some() {
         return Err(HcronError::ReadOnly);
@@ -935,7 +940,7 @@ pub fn load_once() {
             return;
         }
     }
-    if crate::drivers::block::info().is_none() {
+    if crate::drivers::block::info().is_none() && !crate::fs::sysleaf::active() { // BOOTFATSEAM (B453): a native root answers without the global slot (the rMBP's card is `sdhc`)
         return; // storage not up yet — try again next pass, without latching
     }
 
@@ -1751,3 +1756,81 @@ pub fn service() {
 
     flush_if_dirty();
 }
+
+// =========================================================================================
+// BOOTFATSEAM (rmbp-ledger B453, SECREVIEW F3, R99) — the store on UnaFS `/system` (tail)
+// =========================================================================================
+// On a native root (the boot FAT is sacred) the store's leaves are `/system/BTBOND.DAT` (and `.NEW`, `.BAD`),
+// kernel-owned (`fs::sysleaf`). The MIGRATION is in the read: a live leaf absent from `/system` but present on the
+// FAT (`/HCRON/BTBOND.DAT`, through `fat::mount()` as before) is read from the FAT ONCE and published to `/system`;
+// the FAT copy is left as it is (read-only for the installer's bare-boot path) and the wire says so.
+
+/// `tests bootfatseam`'s `holocron=`: where every store operation goes this boot.
+pub fn seat_word() -> &'static str {
+    if crate::fs::sysleaf::active() { "unafs" } else { "fat" }
+}
+
+fn seat_err(_why: &'static str) -> HcronError {
+    HcronError::Io
+}
+
+fn seat_read(leaf: &str, out: &mut alloc::vec::Vec<u8>) -> Result<(), HcronError> {
+    use crate::fs::sysleaf::{self, Leaf};
+    match sysleaf::read(leaf, HCRON_IMAGE_MAX) {
+        Leaf::Kernel(b) => {
+            out.extend_from_slice(&b);
+            Ok(())
+        }
+        Leaf::Foreign => {
+            serial_println!("[hcron] /system/{} REFUSED reason=not-kernel-owned (never adopted) ::", leaf);
+            Err(HcronError::NotFound)
+        }
+        Leaf::Error("oversize") => Err(HcronError::TrailingBytes),
+        Leaf::Error(_) => Err(HcronError::Io),
+        Leaf::Absent if leaf == HCRON_FILE => {
+            // The one-time move: the FAT generation (if any) becomes the /system one.
+            let mut fat = alloc::vec::Vec::new();
+            match fat_read(leaf, &mut fat) {
+                Ok(()) => {
+                    let r = sysleaf::publish(HCRON_FILE, HCRON_TMP_FILE, &fat);
+                    serial_println!(
+                        "[hcron] migrate /HCRON/{} fat -> unafs:/system/{} bytes={} -> {}; the FAT copy stays read-only for the installer's bare-boot path (R99) ::",
+                        leaf, leaf, fat.len(), match r { Ok(()) => "ok", Err(w) => w }
+                    );
+                    out.extend_from_slice(&fat);
+                    for b in fat.iter_mut() {
+                        *b = 0;
+                    }
+                    Ok(())
+                }
+                Err(_) => Err(HcronError::NotFound),
+            }
+        }
+        Leaf::Absent => Err(HcronError::NotFound),
+    }
+}
+
+/// The FAT read the migration takes its source from (`read_store_file`'s FAT body, without the seat test).
+fn fat_read(leaf: &str, out: &mut alloc::vec::Vec<u8>) -> Result<(), HcronError> {
+    let fs = crate::fs::fat::mount().map_err(|_| HcronError::NoStorage)?;
+    let (dir, _, _) = fs.locate_in_dir(0, HCRON_DIR).map_err(|e| map_fat(e, HcronError::NotFound))?;
+    if !dir.is_dir {
+        return Err(HcronError::Io);
+    }
+    let (de, _, _) = fs.locate_in_dir(dir.first_cluster(), leaf).map_err(|e| map_fat(e, HcronError::NotFound))?;
+    if de.is_dir || de.size as usize > HCRON_IMAGE_MAX {
+        return Err(HcronError::Io);
+    }
+    fs.read_at(de.first_cluster(), de.size, 0, out, de.size as usize).map_err(|e| map_fat(e, HcronError::Io))?;
+    if out.len() != de.size as usize {
+        return Err(HcronError::Truncated);
+    }
+    Ok(())
+}
+
+/// `publish_store_file` on `/system`: the staged image must PARSE before the live leaf is replaced.
+fn seat_publish(data: &[u8]) -> Result<(), HcronError> {
+    parse_image(data)?;
+    crate::fs::sysleaf::publish(HCRON_FILE, HCRON_TMP_FILE, data).map_err(seat_err)
+}
+
