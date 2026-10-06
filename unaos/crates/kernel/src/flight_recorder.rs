@@ -606,3 +606,13 @@ pub fn service() {
         }
     }
 }
+
+/// PANICSCREEN (B406): the newest captured bytes into `out` (`try_lock` inside `boot_ring::tail`; 0 when contended), for
+/// `/var/log/panic-<n>.txt`. FLIGHTRING (B400) landed first, so this reads the rolling ring's tail — the pinned head is in
+/// `UNAOS.LOG`/`boot_ring::file_image`. Called only where the panic path has found the heap free (the tail is a Vec).
+pub fn panic_tail(out: &mut [u8]) -> usize {
+    let Some(t) = crate::boot_ring::tail(4096, 0) else { return 0 };
+    let k = out.len().min(t.bytes.len());
+    out[..k].copy_from_slice(&t.bytes[t.bytes.len() - k..]);
+    k
+}

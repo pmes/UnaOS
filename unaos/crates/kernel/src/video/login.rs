@@ -2322,7 +2322,7 @@ fn notice_press(x: i32, y: i32) -> bool {
 /// The notice service (the storage passes, beside `users::service`): close a session notice whose time is
 /// up, and open a queued notice while no form is up. One relaxed load when nothing is armed.
 pub fn notice_service() {
-    crate::video::dialog::service(); crate::video::toast::service(); // DIALOG (B395): the alert's open/slide/countdown and the toast's show/expire, on the same window-safe pass
+    #[cfg(target_arch = "x86_64")] { crate::video::panicscreen::register(); crate::video::panicscreen::next_boot_service(); } crate::video::dialog::service(); crate::video::toast::service(); // PANICSCREEN (B406): `tests panicscreen` and the previous boot's panic line + dialog, once. DIALOG (B395): the alert's open/slide/countdown and the toast's show/expire, on the same window-safe pass
     let d = NOTICE_DEADLINE.load(Ordering::Relaxed);
     if d != 0 && crate::arch::ms() >= d {
         if notice_nonmodal() {

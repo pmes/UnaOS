@@ -155,3 +155,9 @@ pub fn heap_census(align: usize) -> HeapCensus {
     });
     c
 }
+
+/// PANICSCREEN (B406): the heap lock is held right now (the panic log is written only when it is free — a
+/// panic inside the allocator holds it for good).
+pub fn heap_busy() -> bool {
+    ALLOCATOR.inner.is_locked()
+}

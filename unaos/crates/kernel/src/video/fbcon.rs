@@ -119,7 +119,7 @@ const CELL_H: usize = 8;
 
 const FG_DEFAULT: u32 = 0x00C0_C0C0; // light grey text
 const BG_DEFAULT: u32 = 0x0000_0000; // black background
-const PANIC_BG: u32 = 0x0030_0000; // dark red
+const PANIC_BG: u32 = super::PANEL_BG; // PANICSCREEN (B406, R95): the panel's dark neutral #1E1E1E, never the midnight red
 
 /// A unit of PIXEL work, produced by the layout pass and executed by the paint pass. Splitting
 /// the two is what lets the expensive half run outside the interrupt-masked region (see `_print`).
@@ -676,7 +676,7 @@ pub fn _print(args: core::fmt::Arguments) {
     // Before this arc there was no counter of any kind, so a panel that was quiet because policy said
     // so was indistinguishable from a panel that was quiet because it lost the lock.
     let tap = &crate::serial_ring::TAP_FBCON;
-    tap.submit();
+    tap.submit(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if super::panicscreen::sealed() { super::panicscreen::capture(args); tap.suppress(); return; } // PANICSCREEN (B406): sealed — the panicking core's lines go to the log buffer, nothing paints the glass
     // Once the GUI owns the screen, don't mirror to the framebuffer (serial still gets it).
     if gui_held() || panel_mirror_held() || conquiet_held() { // CONSOLEQUIET — the THIRD term is aarch64's half of x86's QUIET-PANEL rule, and it covers the case the second one deliberately does not: a console that is ROUTED INTO A WINDOW. `panel_mirror_held`'s `unrouted` term lifts the hold the instant `panel_console_window_open` installs the glyph route, on the argument that a blank console window is worse than the defect; Peter's render6 ruling is the opposite (the cascade's largest window was a scrolling census log), so from the route install onwards the full serial stream stops reaching the console on aarch64 too. Compile-time `false` on x86, on `bootlog`, and on every aarch64 build without `desktop_firmware` (kernel8's DEFAULT curated K8_FEATS has none; `arroyo:5990` adds it under `UNAOS_PIDESK=1` alone, and that Pi desktop is covered by this rule too — ONE OS), so those images are byte-identical. Panic override THREE times over — see `conquiet_held` at the file tail. DESKHOLD — the second half is the Pi's counterpart of x86's QUIET-PANEL gate: once `desktop_firmware::activate` has cleared the glass to `DESKTOP_BG` the compositor owns those pixels and the panel mirror is a SECOND writer on them. Serial is untouched, the panic mirror overrides, and the test is a compile-time `false` off aarch64+desktop_firmware. See `panel_mirror_held` at the file tail. LINE-NEUTRAL fold, PARITY §5.3 — this file is compiled into the knob-off image and a line added here renumbers every panic `Location` below it.
         tap.suppress();
@@ -2109,7 +2109,7 @@ pub fn panic_screen() {
     // below is best-effort on a dying machine (`FBCON.try_lock()`), so a capture reads the seizure
     // even from a boot whose backdrop never painted. One added statement, no lock held, no
     // restructuring of this function — the `without_interrupts` block is below, untouched.
-    publish_panel_owner(PanelOwner::Panic, "fbcon::panic_screen");
+    publish_panel_owner(PanelOwner::Panic, "fbcon::panic_screen"); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::panicscreen::seal(); // PANICSCREEN (B406): the console is detached from the glass before any panic byte prints
     GUI_ACTIVE.store(false, Ordering::Relaxed);
     // Re-arm the full mirror on quiet-panel builds: the panic text must paint whatever the build.
     #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // PANICARM — the store now matches `PANIC_MIRROR`'s OWN declaration predicate (line 44), which the CONSWIN-PI arc widened without widening this writer. The bare `x86_64` term left the flag DECLARED-BUT-UNWRITABLE on every aarch64 `desktop_firmware` build — permanently `false`, with four readers compiled there reading it: `draw_fb`'s belt, `pace_due`, `panel_mirror_held`'s `overridden`, `present_deferred`. THE ONE THAT BIT: `desktop_firmware::activate` arms `PANEL_MIRROR_HOLD` at DESKTOP-CLEAR and never clears it, and the `CONSOLE_WIN` store on the line below flips `panel_mirror_held()`'s `unrouted` term back TRUE — so on a routed desk boot every panic line was suppressed in `_print` before it touched the console lock. Red backdrop, no words, on the one path that has to work. No lock and no compositor is added here: one relaxed store on the panicking core, ahead of the `try_lock`, so the PANIC PATH LAW and LOCKFIX both stand. `defer_route_open`'s aarch64 arm deliberately stays on `in_panic_mode()` — set EARLIER, in the `#[panic_handler]` before this call, and it also covers a panic that never reaches `panic_screen`. ⚠ SAME-LINE fold, line-NEUTRAL: a line added to this file renumbers every panic `Location` below it.
@@ -2156,7 +2156,7 @@ pub fn panic_screen() {
                 // The panic backdrop covers the FULL panel even when the videocap lever caps the
                 // text viewport (the message itself renders within the capped viewport).
                 c.full_fb().fill_screen(PANIC_BG);
-                c.full_fb().flush_all();
+                c.full_fb().flush_all(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::panicscreen::draw_panic(c.full_fb()); // PANICSCREEN (B406): the one plain screen over the fill
             }
         }
     });

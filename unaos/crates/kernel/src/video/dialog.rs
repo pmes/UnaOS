@@ -345,7 +345,7 @@ pub fn answer(a: Answer) {
             }
         }
         Act::None => {
-            serial_println!("[dialog] answer={} button={} title={}", word, d.btn[ix as usize], core::str::from_utf8(d.title).unwrap_or("?"));
+            serial_println!("[dialog] answer={} button={} title={}", word, d.btn[ix as usize], core::str::from_utf8(d.title).unwrap_or("?")); #[cfg(target_arch = "x86_64")] if ok && d.title == super::panicscreen::DLG_TITLE { super::panicscreen::show_log(); } // PANICSCREEN (B406): `Show log`
         }
         Act::Hook(f) => {
             serial_println!("[dialog] answer={} button={} title={}", word, d.btn[ix as usize], core::str::from_utf8(d.title).unwrap_or("?"));
