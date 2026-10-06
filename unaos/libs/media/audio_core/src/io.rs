@@ -9,6 +9,10 @@ use alloc::vec::Vec;
 pub trait Read: Send {
     /// Fill as much of `buf` as is available; `Ok(0)` is end of stream.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+    /// SEEKTABLE (rmbp B433): reposition to absolute byte `off`; `Ok(false)` = this source cannot (the default).
+    fn seek(&mut self, _off: u64) -> Result<bool> { Ok(false) }
+    /// The source's total length in bytes, when known (a CBR estimate needs it).
+    fn len(&self) -> Option<u64> { None }
 }
 
 /// An owned in-memory source.
@@ -26,6 +30,8 @@ impl Read for VecReader {
         self.pos += n;
         Ok(n)
     }
+    fn seek(&mut self, off: u64) -> Result<bool> { self.pos = (off.min(self.data.len() as u64)) as usize; Ok(true) }
+    fn len(&self) -> Option<u64> { Some(self.data.len() as u64) }
 }
 
 /// A refillable window over a [`Read`]: `fill(n)` makes `n` bytes visible (or all that remain), `data()` is
@@ -91,4 +97,27 @@ impl ByteStream {
         self.pos = self.buf.len();
         Ok(v)
     }
+}
+
+/// SEEKTABLE (rmbp B433): repositioning. The window is kept when the target lies inside it.
+impl ByteStream {
+    /// Move to absolute stream offset `off`. `Ok(false)` when the target is outside the window and the source
+    /// cannot seek (the stream is then unchanged).
+    pub fn seek(&mut self, off: u64) -> Result<bool> {
+        if off >= self.base && off <= self.base + self.buf.len() as u64 {
+            self.pos = (off - self.base) as usize;
+            return Ok(true);
+        }
+        if !self.src.seek(off)? { return Ok(false); }
+        self.buf.clear();
+        self.pos = 0;
+        self.base = off;
+        self.eof = false;
+        Ok(true)
+    }
+    /// Can this stream reposition outside its window? (Asked by seeking the source to where it already is: the
+    /// window's end.)
+    pub fn seekable(&mut self) -> bool { let end = self.base + self.buf.len() as u64; self.src.seek(end).unwrap_or(false) }
+    /// The source's total length, when known.
+    pub fn len(&self) -> Option<u64> { self.src.len() }
 }
