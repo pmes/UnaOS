@@ -4276,3 +4276,6 @@ pub fn open_at(dir: &str) -> bool {
 pub mod attrcols;
 #[path = "getinfo.rs"]
 pub mod getinfo;
+// FILETYPES (B423): Open With… — every registrant of the selected file's type (a child module like `getinfo`).
+#[path = "openwith.rs"]
+pub mod openwith;
