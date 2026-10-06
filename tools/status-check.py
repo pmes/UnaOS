@@ -24,7 +24,16 @@
 #      row and fails until it is deleted. A NEW claiming cell never gets a baseline row.
 #
 #   tools/status-check.py              check the tree (exit 0 clean, 1 failures, 2 control failed)
-#   tools/status-check.py --selftest   prove T2/T3/T4/T5 go red on fixtures (a line in no log MUST fail)
+#   T6 (CAPTUREPIN, B476) a capture log (f<N>-boot*.log; Orin render<N>-*.log) is wire only when
+#      docs/dev/evidence/CAPTURES.pin holds its sha256 and size (unaos/scripts/capture-pin.sh writes the row at the
+#      bench); an unpinned or edited log fails, a pin naming no log fails as stale.
+#   STATUSWIRE (B476): a flight that HAS a pinned log is quoted from the log; a quote found only in the FLIGHT<N>.md
+#      prose fails. A flight with no log (11, 3-7) is still quoted from its FLIGHT md.
+#   STATUSORIN (B476): flight `r<N>` (r3b for render3b) is Orin render N: orin*/**/render<N>-*.log,
+#      boot-render<N>-*.log and FLIGHT-RESULT-render<N>.md.
+#   STATUSWORDS (B476): T5's words also read `verified on (the) metal`, `PASS(ED) on (the / its first) metal`,
+#      `PASS(ED)(,) (on) flight N`.
+#   tools/status-check.py --selftest   prove T2/T3/T4/T5/T6 go red on fixtures (a line in no log MUST fail)
 #   tools/status-check.py --flagged    print every claiming cell without a citation (baseline or not)
 #   tools/status-check.py --baseline   print the baseline the current tree would need (for the seat)
 import glob
@@ -38,7 +47,10 @@ import tempfile
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 HEADER = ["id", "claim", "status", "flight", "line", "set-by", "row-refs"]
 STATUSES = {"open", "confirmed", "refuted", "parked", "unflown"}
-WORDS = re.compile(r"\b(never flew|flew|unflown|proven|confirmed|refuted|landed on metal)\b", re.I)
+WORDS = re.compile(r"\b(never flew|flew|unflown|proven|confirmed|refuted|landed on metal"
+                   # STATUSWORDS (B476, GATEREVIEW S4): a metal verdict in other words is the same claim
+                   r"|verified on (?:the )?metal|pass(?:ed)? on (?:the |its first )?metal|pass(?:ed)?,? (?:on )?flight \d+)\b",
+                   re.I)
 ENUM_HEAD = re.compile(r"^\W*(open|fixed-unflown|flown|landed|dropped)\b\W*", re.I)
 CITE = re.compile(r"\bST(\d+)\b")
 STATE_LINE = re.compile(r"^[#*\s>·-]*(?:[A-Z]+\s+)?STATE\b")
@@ -108,8 +120,29 @@ def claims(text):
     return [w.lower() for w in WORDS.findall(text)]
 
 
-def flight_files(root, n):
+FLIGHT_RE = re.compile(r"f\d+|r\d+[a-z]?")  # STATUSORIN (B476): `r<N>` is Orin render N (render3b -> r3b)
+
+
+def is_log(path):
+    """A capture LOG (wire, pinned by CAPTUREPIN) as opposed to a FLIGHT*.md (the bench's prose about it)."""
+    b = os.path.basename(path)
+    return bool(re.fullmatch(r"f\d+-boot[^/]*\.log", b) or re.fullmatch(r"(?:boot-)?render\d+[a-z]?-[^/]*\.log", b)
+                or re.fullmatch(r"render\d+[a-z]?-boot[^/]*\.log", b))
+
+
+def flight_files(root, fl):
+    """Every capture of flight `fl` (`f<N>` rMBP, `r<N>` Orin render N; a bare int is `f<N>`), sorted."""
+    if isinstance(fl, int):
+        fl = "f%d" % fl
     out = []
+    if fl.startswith("r"):  # STATUSORIN: orin*/ render<N>-*.log, boot-render<N>-*.log, FLIGHT-RESULT-render<N>.md
+        rid = fl[1:]
+        for p in glob.glob(os.path.join(root, "docs/dev/evidence/orin*/**/*"), recursive=True):
+            b = os.path.basename(p)
+            if re.fullmatch(r"(?:boot-)?render%s-[^/]*\.log" % re.escape(rid), b) or b == "FLIGHT-RESULT-render%s.md" % rid:
+                out.append(p)
+        return sorted(out)
+    n = int(fl[1:])
     for p in glob.glob(os.path.join(root, "docs/dev/evidence/**/*"), recursive=True):
         b = os.path.basename(p)
         m = re.fullmatch(r"f(\d+)-boot[^/]*\.log", b)
@@ -120,6 +153,52 @@ def flight_files(root, n):
         if m and int(m.group(1)) <= n <= int(m.group(2) or m.group(1)):
             out.append(p)
     return sorted(out)
+
+
+PIN = "docs/dev/evidence/CAPTURES.pin"
+
+
+def load_pins(root, errs):
+    """CAPTUREPIN (B476, GATEREVIEW S6): rel -> (sha256, bytes) from the bench's pin file (unaos/scripts/capture-pin.sh)."""
+    pins = {}
+    path = os.path.join(root, PIN)
+    if not os.path.exists(path):
+        errs.append("%s: missing — no capture log is wire until the bench pins it" % PIN)
+        return pins
+    for i, ln in enumerate(open(path, encoding="utf-8"), 1):
+        if not ln.strip() or ln.startswith("#"):
+            continue
+        c = ln.split()
+        if len(c) < 4 or not re.fullmatch(r"[0-9a-f]{64}", c[0]) or not c[1].isdigit():
+            errs.append("%s:%d: a pin row is `<sha256> <bytes> <path> <provenance…>`" % (PIN, i))
+            continue
+        if c[2] in pins:
+            errs.append("%s:%d: %s pinned twice" % (PIN, i, c[2]))
+        pins[c[2]] = (c[0], int(c[1]))
+    return pins
+
+
+def all_logs(root):
+    return sorted(p for p in glob.glob(os.path.join(root, "docs/dev/evidence/**/*.log"), recursive=True) if is_log(p))
+
+
+def check_pins(root, errs):
+    """Every capture log must carry a pin row whose sha256 and size match; a pin naming no file is stale."""
+    pins = load_pins(root, errs)
+    good = set()
+    for p in all_logs(root):
+        rel = os.path.relpath(p, root)
+        blob = open(p, "rb").read()
+        pin = pins.get(rel)
+        if pin is None:
+            errs.append("%s: capture log NOT PINNED — a log is wire only when the bench pins it (unaos/scripts/capture-pin.sh)" % rel)
+        elif pin != (hashlib.sha256(blob).hexdigest(), len(blob)):
+            errs.append("%s: capture log does not match its pin (sha256/bytes) — the log was edited after capture" % rel)
+        else:
+            good.add(p)
+    for rel in sorted(set(pins) - {os.path.relpath(p, root) for p in all_logs(root)}):
+        errs.append("%s: pin row %s names no capture log (stale) — delete the row" % (PIN, rel))
+    return good
 
 
 def load_table(root, errs):
@@ -148,6 +227,7 @@ def check(root, baseline_path=None, flagged_only=False, emit_baseline=False):
     errs = []
     rows = load_table(root, errs)
     known = ledger_ids(root)
+    pinned = check_pins(root, errs)
     ids = {}
     cache = {}
     for i, r in rows:
@@ -163,8 +243,8 @@ def check(root, baseline_path=None, flagged_only=False, emit_baseline=False):
             errs.append("%s: status '%s' not in %s" % (where, st, "/".join(sorted(STATUSES))))
         if not r["claim"] or not r["set-by"]:
             errs.append("%s: claim and set-by are required" % where)
-        if fl and not re.fullmatch(r"f\d+", fl):
-            errs.append("%s: flight '%s' is not f<n>" % (where, fl))
+        if fl and not FLIGHT_RE.fullmatch(fl):
+            errs.append("%s: flight '%s' is not f<n> (rMBP) or r<n> (Orin render n)" % (where, fl))
             fl = ""
         if st in ("confirmed", "refuted") and (not fl or not line):
             errs.append("%s: %s requires a flight AND a quoted wire line" % (where, st))
@@ -175,12 +255,20 @@ def check(root, baseline_path=None, flagged_only=False, emit_baseline=False):
         if line and len(line.strip()) < 20:  # GATEREVIEW F6: `[` is in every capture; a quote must identify a line
             errs.append("%s: quoted line '%s' is under 20 characters — quote the whole wire line" % (where, line))
         if line and fl:
-            n = int(fl[1:])
-            if n not in cache:
-                cache[n] = [open(p, "rb").read() for p in flight_files(root, n)]
-            if not cache[n]:
-                errs.append("%s: flight %s has no capture in git (f%d-boot*.log / FLIGHT%d.md)" % (where, fl, n, n))
-            elif not any(line.encode("utf-8") in blob for blob in cache[n]):
+            if fl not in cache:
+                fs = flight_files(root, fl)
+                cache[fl] = ([open(p, "rb").read() for p in fs if is_log(p) and p in pinned],
+                             [open(p, "rb").read() for p in fs if not is_log(p)], [p for p in fs if is_log(p)])
+            logs, prose, anylog = cache[fl]
+            q = line.encode("utf-8")
+            if not logs and not prose:
+                errs.append("%s: flight %s has no capture in git (f<N>-boot*.log / FLIGHT<N>.md; Orin: render<N>-*.log / FLIGHT-RESULT-render<N>.md)%s"
+                            % (where, fl, " — its logs are not pinned" if anylog else ""))
+            elif anylog and not any(q in b for b in logs):
+                # STATUSWIRE (B476, GATEREVIEW S2): a flight that has a log is quoted from the log, never from the prose
+                errs.append("%s: line NOT on the wire of %s%s: %s" % (
+                    where, fl, " (it is in the FLIGHT prose only — quote the log line)" if any(q in b for b in prose) else "", line[:120]))
+            elif not anylog and not any(q in b for b in prose):
                 errs.append("%s: line NOT on the wire of %s: %s" % (where, fl, line[:120]))
         for ref in [x.strip() for x in r["row-refs"].split(",") if x.strip()]:
             if ref not in known:
@@ -227,12 +315,28 @@ def check(root, baseline_path=None, flagged_only=False, emit_baseline=False):
 
 def selftest():
     """Fixtures: each must go red for the reason named, and a good fixture must pass."""
-    def tree(tsv, ledger_status, log_line="[  1ms] :: real wire line ::"):
+    def pinrow(d, rel):
+        b = open(os.path.join(d, rel), "rb").read()
+        with open(os.path.join(d, PIN), "a") as f:
+            f.write("%s %d %s by=fixture\n" % (hashlib.sha256(b).hexdigest(), len(b), rel))
+
+    def tree(tsv, ledger_status, log_line="[  1ms] :: real wire line ::", extra=None):
         d = tempfile.mkdtemp(prefix="statuscheck-")
         os.makedirs(os.path.join(d, "docs/dev/OS"))
         os.makedirs(os.path.join(d, "docs/dev/evidence/r/flight7"))
+        os.makedirs(os.path.join(d, "docs/dev/evidence/orin16"))
         with open(os.path.join(d, "docs/dev/evidence/r/flight7/f7-boots.log"), "w") as f:
             f.write("noise\n%s\nmore\n" % log_line)
+        with open(os.path.join(d, "docs/dev/evidence/r/flight7/FLIGHT7.md"), "w") as f:
+            f.write("- prose: `only the bench prose says this` and `:: real wire line ::`\n")
+        with open(os.path.join(d, "docs/dev/evidence/r/FLIGHT8.md"), "w") as f:
+            f.write("- prose: `a flight eight line with no log at all`\n")
+        with open(os.path.join(d, "docs/dev/evidence/orin16/render8-boot1.log"), "w") as f:
+            f.write(":: PRTSCR: SCREEN3.PNG 1920x1200 6913793 bytes -> OK ::\n")
+        pinrow(d, "docs/dev/evidence/r/flight7/f7-boots.log")
+        pinrow(d, "docs/dev/evidence/orin16/render8-boot1.log")
+        if extra:
+            extra(d)
         with open(os.path.join(d, "docs/dev/OS/rmbp-ledger.md"), "w") as f:
             f.write("| id | item | owner | flies-on | status | evidence | closed by |\n|---|---|---|---|---|---|---|\n")
             f.write("| B1 | thing | rmbp | rmbp | %s | e | — |\n" % ledger_status)
@@ -253,6 +357,20 @@ def selftest():
         ("vacuous short quote", "ST1\tc\tconfirmed\tf7\t[\ts\tB1\n", "open", 1, "under 20"),
         ("baseline grandfathers", ok_row, "open — flew once", 0, None, "rmbp-ledger.md B1"),
         ("baseline stale once cited", ok_row, "open — flew ST1", 1, "stale", "rmbp-ledger.md B1"),
+        # B476 GATEFIX: the GATEREVIEW plants S2, S4, S6 and the Orin model
+        ("S4 verified on metal", ok_row, "flown — verified on metal, PASS on flight 7", 1, "says 'verified on metal'"),
+        ("S4 PASS on flight N", ok_row, "flown — the fixture printed PASS, flight 7", 1, "says 'pass, flight 7'"),
+        ("S2 prose-only quote", "ST1\tc\tconfirmed\tf7\tonly the bench prose says this\ts\tB1\n", "open", 1, "FLIGHT prose only"),
+        ("prose is the capture when no log", "ST1\tc\tconfirmed\tf8\ta flight eight line with no log at all\ts\tB1\n", "open", 0, None),
+        ("S6 unpinned hand-made log", "ST1\tc\tconfirmed\tf7\t:: a typed line in a typed log ::\ts\tB1\n", "open", 1, "NOT PINNED",
+         None, lambda d: open(os.path.join(d, "docs/dev/evidence/r/flight7/f7-boot9.log"), "w").write(":: a typed line in a typed log ::\n")),
+        ("log edited after its pin", ok_row, "open", 1, "does not match its pin",
+         None, lambda d: open(os.path.join(d, "docs/dev/evidence/r/flight7/f7-boots.log"), "a").write("edit\n")),
+        ("stale pin", ok_row, "open", 1, "names no capture log",
+         None, lambda d: open(os.path.join(d, PIN), "a").write("%s 1 docs/dev/evidence/gone/f9-boot1.log by=fixture\n" % ("0" * 64))),
+        ("Orin r8 quote", "ST1\tc\tconfirmed\tr8\tSCREEN3.PNG 1920x1200 6913793 bytes -> OK\ts\tB1\n", "open", 0, None),
+        ("Orin r8 line in no log", "ST1\tc\tconfirmed\tr8\tSCREEN9.PNG 1920x1200 never printed\ts\tB1\n", "open", 1, "NOT on the wire of r8"),
+        ("Orin r3 is not r3b", "ST1\tc\tconfirmed\tr3\tSCREEN3.PNG 1920x1200 6913793 bytes -> OK\ts\tB1\n", "open", 1, "no capture"),
     ]
     fails = 0
     pm = tempfile.mkdtemp(prefix="statuscheck-")  # GATEREVIEW F7: a flight-5 postmortem is that flight's capture
@@ -263,9 +381,9 @@ def selftest():
         print("status-check selftest: FAIL postmortem capture — FLIGHT5-POSTMORTEM.md not read as flight 5")
     shutil.rmtree(pm, ignore_errors=True)
     for name, tsv, cell, want, why, *bl in cases:
-        d = tree(tsv, cell)
+        d = tree(tsv, cell, extra=bl[1] if len(bl) > 1 else None)
         bp = None
-        if bl:
+        if bl and bl[0]:
             bp = os.path.join(d, "docs/dev/STATUS.baseline")
             with open(bp, "w") as f:
                 f.write("# fixture\n%s\n" % bl[0])
