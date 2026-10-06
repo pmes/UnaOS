@@ -415,6 +415,7 @@ pub fn right_press(x: i32, y: i32) -> bool {
     {
         let mut guard = MODEL.lock();
         let Some(m) = guard.as_mut() else { return true };
+        let cols_hit = super::toolbar::view() == super::toolbar::View::Columns && super::millercols::right_select(m, sx, sy); // SMALLFIX4 (COLUMNSVIEW owed): the Columns view's panes, not the list geometry, take the right press
         let g = &m.geom;
         let li = g.list_pane().inner();
         let body_y = li.y + g.row_h();
@@ -425,8 +426,8 @@ pub fn right_press(x: i32, y: i32) -> bool {
             repaint();
             return true;
         }
-        if super::toolbar::view() == super::toolbar::View::Columns && super::millercols::right_select(m, sx, sy) {
-            // SMALLFIX4 (COLUMNSVIEW owed): the Columns view's panes, not the list geometry, take the right press.
+        if cols_hit {
+            // SMALLFIX4: the pane under the pointer already took the selection (above, before `g` borrows the model).
         } else if sx >= li.x && sx < li.x + li.w && sy >= body_y {
             let i = m.list_scroll + (sy - body_y) / g.row_h();
             if i < m.list.len() {
