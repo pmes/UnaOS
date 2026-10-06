@@ -7347,7 +7347,7 @@ pub fn wc_route_tail(raw: crate::pal::Event) {
         raw,
         crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }
     ) {
-        wc_drag_motion(); #[cfg(feature = "wc")] crate::video::shotsel::motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
+        wc_drag_motion(); #[cfg(feature = "wc")] crate::video::shotsel::motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } #[cfg(feature = "wc")] if crate::video::capture::held() { let (x, y) = click_pointer_pos(); crate::video::capture::motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
     }
 }
 
@@ -7757,7 +7757,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         // off the NEXT gesture waiting for an edge that has already been and gone. Ahead of the
         // witness too, so `pend=` reads "another release is queued behind this one" rather than
         // always counting the edge that is being served.
-        crate::pal::note_release_edge_drained(); crate::video::termsel::pointer_release(x, y); // TERMSEL2 — the release that ends a press HELD on the shell's text (`termsel::pointer_press` above) becomes that press's `up` note, for the window the press went to; any other release is one atomic swap and nothing. ⚠ FOLDED, line-neutral.
+        crate::pal::note_release_edge_drained(); crate::video::termsel::pointer_release(x, y); #[cfg(feature = "wc")] crate::video::capture::release(x, y); // TERMSEL2 — the release that ends a press HELD on the shell's text (`termsel::pointer_press` above) becomes that press's `up` note, for the window the press went to; any other release is one atomic swap and nothing. ⚠ FOLDED, line-neutral.
         if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE {
             let (sx, sy) = drag_settle_point();
             drag_settle_apply(sx, sy);

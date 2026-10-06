@@ -20,8 +20,9 @@
 //! `<home>/.settings` this window used to keep is gone, imported once and deleted). [`service`] applies the
 //! store's keys once per login (`[settings] loaded n=<n>`). Absent keys keep the OS defaults.
 //!
-//! Mouse: press a slider track to set it, a toggle/segment/button to act. (No drag: the wm drag seam
-//! belongs to window frames; a press-to-set is the claim.) Keyboard: Up/Down/Tab move the selection,
+//! Mouse: press a slider track to set it and keep the button down to DRAG it (PREFSUI, R93: the press captures
+//! the pointer through `video::capture`; every motion sample moves the knob and applies live; the release commits
+//! and stores); a toggle/segment/button to act. Keyboard: Up/Down/Tab move the selection,
 //! Left/Right adjust, Enter toggles/applies; typing edits the wallpaper path while it is selected.
 //!
 //! SETTINGS2: four TABS (General · Users · Display · About; Left/Right on the strip or a click switches, the choice
@@ -800,6 +801,7 @@ pub fn open() -> Result<(), String> {
 pub fn close() {
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id == wm::WIN_NONE { return; }
+    if DRAG.lock().take().is_some() { super::capture::cancel(); } // PREFSUI: a drag dies with its window
     wm::close(id);
     *STATE.lock() = None;
     serial_println!("[settings] closed win={}", id);
@@ -972,8 +974,8 @@ pub fn press_route(x: i32, y: i32) -> bool {
         1 => press_users(row, cx),
         2 => {
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
-            if row == 0 && on_track { select(0); bright_click(cx); }
-            if row == 1 && on_track { select(3); set(3, slider_at(cx, IDLE_STEPS.len() - 1)); }
+            if row == 0 && on_track { select(0); bright_click(cx); drag_begin(0, cx); } // PREFSUI (R93): the press sets AND captures — the knob follows the hand until the release
+            if row == 1 && on_track { select(3); drag_begin(3, cx); }
             if row == 4 && cx >= TRACK_X && cx < TRACK_X + TRACK_W { select(9); set_font(9, ((cx - TRACK_X) / (TRACK_W / 3)).min(2) as i64); } // KERNELFONT2: the family segments
             if row == 5 && cx >= TRACK_X && cx < TRACK_X + BTN_W { select(10); set_font(10, (font_size() - 1).max(FONT_MIN)); } // KERNELFONT2: size −
             if row == 5 && cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 { select(10); set_font(10, (font_size() + 1).min(FONT_MAX)); } // size +
@@ -986,7 +988,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
 fn press_general(row: usize, cx: usize) {
     // BRIGHTFLOOR M5: rows moved up one (Brightness is on the Display tab).
     match row {
-        0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(1); set(1, slider_at(cx, 16)); }
+        0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(1); drag_begin(1, cx); } // PREFSUI (R93): press-and-drag
         1 => { select(2); if cx >= TRACK_X && cx < TRACK_X + 24 { let m = CUR.lock().mute; set(2, (!m) as usize); } }
         2 => { select(4); if cx >= TRACK_X && cx < TRACK_X + TRACK_W { set(4, (cx - TRACK_X) / (TRACK_W / 3)); } }
         3 => select(5),
@@ -1339,4 +1341,133 @@ pub fn slider_sync(reg: u32) -> bool {
     }
     let back = crate::video::backlight::raw_for_pos(crate::video::backlight::pos_for_raw(reg, max, TRACK_W), TRACK_W, max);
     back.abs_diff(reg) <= max / TRACK_W as u32 + 1
+}
+
+// ── PREFSUI (rmbp-ledger B389, R93) — A SLIDER DRAGS ─────────────────────────────────────────────────────────────
+// Flight 24: `[backlight] slider click pos=16%` 13:12:14, `pos=35%` 13:12:16 — a drag was a run of presses, because
+// the window saw only the press edge. Now a press on a slider track CAPTURES the pointer (`video::capture`): every
+// motion sample while the button is held moves the knob and applies the value LIVE (the backlight follows the
+// hand; the volume and the idle blank likewise), paced at [`DRAG_PACE_MS`]; the release applies the last position
+// and COMMITS — one `[settings] <name>=<v>` line, one store write (brightness: BRIGHTSLIDER's debounce), and
+// `[settings] slider drag key=<k> samples=<n> ms=<n> from=<v> to=<v>`.
+
+/// The least time between two live applies of a drag (the release always applies the last position).
+pub const DRAG_PACE_MS: u64 = 16;
+
+#[derive(Clone, Copy)]
+struct Drag {
+    /// The control (0 brightness, 1 volume, 3 idle minutes).
+    ctrl: usize,
+    t0: u64,
+    samples: u32,
+    from: i64,
+    /// The last logical x applied, and when.
+    cx: usize,
+    at: u64,
+    /// The latest logical x seen (applied or paced out).
+    want: usize,
+}
+
+static DRAG: spin::Mutex<Option<Drag>> = spin::Mutex::new(None);
+/// Completed drags (the witness reads it).
+static DRAGS: AtomicU32 = AtomicU32::new(0);
+
+/// The control's value as the drag line prints it: brightness %, volume /16, idle minutes.
+fn drag_value(ctrl: usize) -> i64 {
+    match ctrl {
+        0 => { let (r, m) = (crate::video::backlight::cur_raw(), crate::video::backlight::panel_range()); crate::video::backlight::pct_of(r.min(m), m) as i64 }
+        1 => CUR.lock().vol as i64,
+        _ => CUR.lock().idle_min as i64,
+    }
+}
+
+/// Apply control `ctrl` at logical `cx` LIVE: the device follows, the knob repaints, nothing is printed or stored.
+fn drag_apply(ctrl: usize, cx: usize) {
+    match ctrl {
+        0 => {
+            let pos = cx.saturating_sub(TRACK_X).min(TRACK_W);
+            let max = crate::video::backlight::max_now();
+            let a = crate::video::backlight::set_raw_via(crate::video::backlight::raw_for_pos(pos, TRACK_W, max), "slider-drag");
+            CUR.lock().bright = a.level;
+        }
+        1 => { let v = slider_at(cx, 16) as u8; let mut c = CUR.lock(); if c.vol == v && !c.mute { return; } c.vol = v; c.mute = false; drop(c); apply_volume(v, false); }
+        _ => { let m = IDLE_STEPS[slider_at(cx, IDLE_STEPS.len() - 1)]; let mut c = CUR.lock(); if c.idle_min == m { return; } c.idle_min = m; drop(c); apply_idle(m); }
+    }
+    repaint();
+}
+
+/// A press on slider `ctrl` at logical `cx`: apply it (brightness: [`bright_click`] already did) and capture.
+fn drag_begin(ctrl: usize, cx: usize) {
+    let now = crate::arch::ms();
+    let from = drag_value(ctrl);
+    if ctrl != 0 { drag_apply(ctrl, cx); }
+    *DRAG.lock() = Some(Drag { ctrl, t0: now, samples: 0, from, cx, at: now, want: cx });
+    super::capture::begin(drag_motion, drag_release);
+}
+
+/// A panel x as this window's logical x (left of the window = 0; the slider clamps the rest).
+fn logical_x(x: i32) -> Option<usize> {
+    let info = wm::info(WIN.load(Ordering::Relaxed))?;
+    let sc = info.scale.max(1);
+    Some(super::metrics::to_logical((x.max(0) as usize).saturating_sub(info.x) / sc))
+}
+
+/// The capture's motion: one more sample; applied when [`DRAG_PACE_MS`] has passed since the last apply.
+fn drag_motion(x: i32, _y: i32) {
+    let Some(cx) = logical_x(x) else { return };
+    drag_step(cx, false);
+}
+
+fn drag_step(cx: usize, force: bool) {
+    let now = crate::arch::ms();
+    let go = {
+        let mut g = DRAG.lock();
+        let Some(d) = g.as_mut() else { return };
+        d.samples += 1;
+        d.want = cx;
+        if cx == d.cx || (!force && now.saturating_sub(d.at) < DRAG_PACE_MS) { None } else { d.cx = cx; d.at = now; Some(d.ctrl) }
+    };
+    if let Some(c) = go { drag_apply(c, cx); }
+}
+
+/// The capture's release: the last position, then the commit (print + store) and the drag line.
+fn drag_release(x: i32, _y: i32) {
+    if let Some(cx) = logical_x(x) { if let Some(d) = DRAG.lock().as_mut() { d.want = cx; } }
+    drag_finish();
+}
+
+fn drag_finish() {
+    let Some(d) = DRAG.lock().take() else { return };
+    if d.want != d.cx { drag_apply(d.ctrl, d.want); }
+    let to = drag_value(d.ctrl);
+    match d.ctrl {
+        0 => { let l = CUR.lock().bright; say("brightness", &alloc::format!("{}", l), true); bright_persist_later(); }
+        1 => { let v = CUR.lock().vol; say("volume", &alloc::format!("{}", v), true); persist(1); }
+        _ => { let m = CUR.lock().idle_min; say("idle_min", &alloc::format!("{}", m), true); persist(3); }
+    }
+    DRAGS.fetch_add(1, Ordering::Relaxed);
+    serial_println!("[settings] slider drag key={} samples={} ms={} from={} to={}", NAMES[d.ctrl], d.samples, crate::arch::ms().saturating_sub(d.t0), d.from, to);
+}
+
+/// `tests settings` leg: drive a drag on the Blank-screen slider THROUGH the capture seam (press, two motion
+/// samples at panel coordinates, release) and read the value back; restores the operator's value. `"ok"` / why not.
+#[cfg(feature = "witness")]
+fn drag_selftest() -> &'static str {
+    let before = CUR.lock().idle_min;
+    let was_open = is_open();
+    if !was_open && open().is_err() { return "no-window"; }
+    let Some(info) = wm::info(WIN.load(Ordering::Relaxed)) else { return "no-window" };
+    let px = |cx: usize| (info.x + super::metrics::size(cx) * info.scale.max(1)) as i32;
+    let d0 = DRAGS.load(Ordering::Relaxed);
+    drag_begin(3, TRACK_X);
+    let a = CUR.lock().idle_min;
+    super::capture::motion(px(TRACK_X + TRACK_W / 2), 0);
+    for _ in 0..3 { let t = crate::arch::ms(); while crate::arch::ms() < t + DRAG_PACE_MS + 1 { core::hint::spin_loop(); } }
+    super::capture::motion(px(TRACK_X + TRACK_W), 0);
+    super::capture::release(px(TRACK_X + TRACK_W), 0);
+    let b = CUR.lock().idle_min;
+    let ok = a == IDLE_STEPS[0] && b == IDLE_STEPS[IDLE_STEPS.len() - 1] && DRAGS.load(Ordering::Relaxed) == d0 + 1 && !super::capture::held();
+    set(3, idle_index(before));
+    if !was_open { close(); }
+    if ok { "ok" } else { "no" }
 }
