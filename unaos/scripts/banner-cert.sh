@@ -266,6 +266,19 @@ fi
 # without `uvc`): `LC_ALL=C grep -a -o -F '[uvc] commit=withheld' | wc -l` = 1 knob-on, 0 knob-off,
 # while the `ehcihid` row's own token measured 1 on BOTH as the positive control proving the
 # knob-off artifact was a real EHCI-carrying build and not an empty one.
+#
+# BANNERROWS (rmbp-ledger B481, 2026-10-06): the ten features GATEPATH's `--registry` named against the seat's x86
+# metal line with no row. Every token MEASURED with `LC_ALL=C grep -a -o -F` on ONE x86 kernel ELF built from
+# c191d8d7 with that metal line verbatim (16,596,688 bytes; the hit count is each row's N), and each token occurs
+# exactly once in crates/ + libs/, under the feature's own cfg: installdemo `shell.rs` INSTALLVERB census (the
+# `install` verb arm); instgui `video/instgui.rs` (module gated wc+instgui); ahciroot `install/ahciroot.rs`
+# (module gated x86_64+ahciroot); kvblank_trace the trace task's name in `kepler_vblank.rs::kv8_pump_hook`;
+# lidsleep `video/lidsleep.rs::poll`, reachable only when `read_msld` can answer NoKey (x86_64+lidsleep);
+# videoplayer `video/player.rs` `vid` (x86_64+videoplayer, inside the wc player module); ahci-write
+# `drivers/ahci.rs` write-path banner; holocron `fs/holocron.rs::seat_read` (module gated holocron); svg an XML
+# error in `svg_core`, linked only by `pixel_core/svg` and called only through facet's decode (facet needs wc on
+# x86, desktop_firmware on aarch64). prefs_reset has no gated literal (`cfg!` picks a 4-byte word) and is
+# NOWITNESS, the `wedge2` shape. The OFF polarity is read from the cfg, not measured on a knob-off ELF.
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
@@ -352,6 +365,16 @@ unafs|:: UNAFSX86: root=|-|measured
 lumen|:: LUMEN:|-|measured
 netring3|:: ENTROPY:|-|measured
 selfdiag|:: SELFDIAG:|-|measured
+installdemo|:: INSTALLVERB: census disk=|-|measured(4)
+instgui|[wc-x] instgui DECLINE reason=create-failed|-|measured(1)
+ahciroot|:: AHCIROOT: grant=|-|measured(9)
+kvblank_trace|kvblank8-trace|-|measured(1)
+lidsleep|[smc] lid=no-key key=MSLD|@arch:x86_64|measured(1)
+videoplayer|:: VIDEOPLAYER: path=|wc,@arch:x86_64|measured(1)
+ahci-write|:: AHCI: write path ARMED|-|measured(1)
+holocron|[hcron] /system/|-|measured(1)
+svg|more than one root element|facet,wc+desktop_firmware|measured(1)
+prefs_reset|-|no gated string literal: cfg!(feature = "prefs_reset") in video/settings.rs safe_mode_check only selects the 4-byte word knob; certify it from its serial line [prefs] display reset=1 reason=knob|unmeasured-here
 TABLE
 }
 
