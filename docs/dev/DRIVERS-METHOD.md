@@ -20,10 +20,22 @@ else that talks to silicon through registers, rings, firmware or context blobs.
   flight wasted when the dump could have discriminated all three.
 - **Gates written to pass what was built.** VOLUMES passed `shown=EFI,UnaOS,boot` because the gate encoded the seat's reading,
   not the spec's or Peter's shape (R89). A witness checks the expected shape from the source, never the output we happened to get.
+- **A premise never tested, no blob involved** (Peter: "it has happened with hardware we didn't need to use blobs with so there's
+  definitely room for improvement"). NETFRAME (B368) built a four-rung RX stall ladder against the AX88179 — kicks, Stop Endpoint,
+  dequeue resets — and USBNET8/9 then read the same wire and found 43 of 52 completions had arrived with no kick: the "stall" was a
+  quiet LAN, and the ladder's resets were dropping the frames it was built to recover. The xHCI hub walk (`enumerate_downstream`) had
+  no USB-net arm for the whole of the usbnet work, so a dongle behind any hub stayed unconfigured through several flights while the
+  ladder looked at the ring. INPUTSTALL's 16 s "HID gap" was a test ladder spinning in the same pump loop as the HID pass. The
+  users store mounted a USB stick because the global slot was first-come. In each case a fix was built before the fault's premise
+  had been checked against what the wire could already show.
 - **Blobs treated as opaque.** RAMFC, the instance block, falcon DMEM, the channel control page: words we did not understand were
   zero-filled or guessed instead of being copied from a state that worked and mutated one field at a time.
 
 ## 2. The ground truth is a state that works
+
+This holds for blob-free hardware too: the bench can read the AX88179's registers after Linux brought it up, the xHCI's slot and
+endpoint contexts after Linux enumerated the hub and its children, the HDA codec's node graph after Linux set it, the SMC's
+keys as macOS leaves them. A working state is the capture; the spec is what names its words.
 
 Before writing a register, CAPTURE the device as something that works left it: UEFI GOP's Kepler state after the firmware
 initialised the display, the iGPU after firmware, the AX88179 after Linux brought it up on the bench (the bench can read it over
@@ -42,6 +54,11 @@ Every ladder (one per device, in its `docs/dev/OS/...` doc) is a table of rungs.
 - **discriminator** (the wire observation that CONFIRMS it and the one that REFUTES it — both named before the flight);
 - **status** ∈ {`open`, `confirmed <flight/line>`, `refuted <flight/line>`, `parked: <why, and what reopens it>`};
 - **alternatives** (the other hypotheses for the same wall, each with its own discriminator).
+
+**Rung 0 is the premise.** Every ladder's first rung is the fault's premise stated as a hypothesis with its own discriminator:
+what the wire would show if the premise were FALSE (for NETFRAME: "if the link is merely quiet, completions arrive without kicks
+and `needed=` reads 0"). Rung 0 is read from the wire ALREADY CAPTURED before any fix is written; a ladder whose rung 0 is `open`
+builds measurement, not fixes. Where the wire cannot decide it, the first boot carries the measurement alone.
 
 Rules: a rung is `confirmed` or `refuted` ONLY by a quoted wire line from a boot; a rung is never "settled" by reading. A rung may
 be `parked` only with the alternatives listed and the reopening condition named — a `parked` rung is reopened the moment a later
