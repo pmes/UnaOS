@@ -163,3 +163,58 @@ impl Source for OggOpus {
         Ok(Some(SeekPoint { byte: start, sample: 0, exact: true, table: "ogg", landed: 0 }))
     }
 }
+
+// ---------------------------------------------------------------- Opus outside Ogg (SEEKTABLE2, rmbp B469)
+
+/// A container's Opus packets, in decode order (Matroska/WebM's track through demux_core in the kernel's
+/// `vplay::container_audio`; any other packet container). `None` = end of the track.
+pub trait Packets: Send {
+    fn next_packet(&mut self) -> Option<Vec<u8>>;
+}
+
+/// Opus from bare packets: the Matroska codec mapping (CodecPrivate = the `OpusHead` of RFC 7845 §5.1, CodecDelay =
+/// the pre-skip in ns). The same decoder, output gain and pre-skip rule as [`OggOpus`]; end trimming (Matroska
+/// DiscardPadding) is OWED, so the tail plays its padding (at most one packet).
+pub struct OpusPackets {
+    head: OpusHead,
+    dec: OpusDecoder,
+    src: alloc::boxed::Box<dyn Packets>,
+    skip: u64,
+    buf: Vec<i16>,
+}
+
+impl OpusPackets {
+    /// `head`: the `OpusHead` bytes; `codec_delay_ns`: the container's own pre-skip (0 = take `OpusHead`'s).
+    pub fn new(head: &[u8], codec_delay_ns: u64, src: alloc::boxed::Box<dyn Packets>) -> Result<OpusPackets> {
+        let head = OpusHead::parse(head)?;
+        let mut dec = OpusDecoder::new(head.channels);
+        dec.decode_gain = head.output_gain as i32;
+        let skip = if codec_delay_ns > 0 { codec_delay_ns * 48 / 1_000_000 } else { head.pre_skip as u64 };
+        let ch = head.channels;
+        Ok(OpusPackets { head, dec, src, skip, buf: vec![0; 5760 * ch] })
+    }
+}
+
+impl Source for OpusPackets {
+    fn info(&self) -> Info {
+        Info { rate: 48000, channels: self.head.channels as u16, bits: 16, frames: None, format: Format::Unknown, codec: Codec::Opus, float: false }
+    }
+    fn block(&mut self, pcm: &mut Pcm) -> Result<bool> {
+        let ch = self.head.channels;
+        loop {
+            let Some(p) = self.src.next_packet() else { return Ok(false) };
+            let n = match self.dec.decode(Some(&p), &mut self.buf, 5760) {
+                Ok(n) => n,
+                Err(_) => self.dec.decode(None, &mut self.buf, 960)?, // a corrupt packet: conceal one 20 ms frame
+            };
+            let s = (self.skip as usize).min(n);
+            self.skip -= s as u64;
+            if n == s { continue; }
+            pcm.set_int(ch, n - s, 16);
+            for c in 0..ch {
+                for i in 0..n - s { pcm.int[c][i] = self.buf[(s + i) * ch + c] as i32; }
+            }
+            return Ok(true);
+        }
+    }
+}
