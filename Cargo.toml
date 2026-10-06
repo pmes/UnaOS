@@ -25,6 +25,7 @@ members = [
     "unaos/libs/web/js_core", # JSCORE (SR55): ECMAScript 2025 from the specification, no_std, zero deps
 
     "unaos/libs/sys/elf_core", # STORMFAULT (B351): the ring-3 ELF segment plan both loaders share
+    "unaos/libs/sys/type_core", # TYPECORE (B450): the one extension-to-MIME table, sniff order and ELF split both rings read
     "unaos/libs/sys/ldso_core", # SELFBUILD6 (B360): the dynamic loader core the kernel shim and the host runner share
     # VEINTLS (SR36): the ring-3 Vein library joins the host workspace so its offline TLS + Messages test runs here.
     "unaos/libs/sys/vein_ring3",

@@ -1,0 +1,19 @@
+[package]
+name = "type_core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "TYPECORE's shared core: the one extension-to-MIME table, the built-in sniff order and the ELF split — linked by the kernel's fs/filetype.rs and the host's bandy, tested on the host."
+
+# TYPECORE (rmbp-ledger B450, R79, ARCH-2026-10-06 F6): the midden_core / elf_core shape. `#![no_std]`,
+# `#![forbid(unsafe_code)]`, no allocator, one dependency: `elf_core` (the ELF split reads the loaders' own program-
+# header parse). A member of the ROOT host workspace (`cargo test -p type_core`) and a path dep of the kernel and
+# of `libs/bandy`.
+[dependencies]
+elf_core = { path = "../elf_core" }
+
+# The KATs check this table's strings against the decoding cores' own (`mime_of`), host-only.
+[dev-dependencies]
+pixel_core = { path = "../../media/pixel_core" }
+audio_core = { path = "../../media/audio_core" }
+demux_core = { path = "../../media/demux_core" }
