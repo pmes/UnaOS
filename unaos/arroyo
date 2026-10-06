@@ -13601,6 +13601,101 @@ jobs_image() {
     echo -e "${COLOR_GREEN}✅ UNAOSVOLUME: ${img}${COLOR_RESET}"
 }
 
+# GATEPATH (rmbp-ledger B471; GATES-2026-10-06 F15): `./arroyo gates` — THE pre-commit leg for the seat and every
+# executor. Every host gate the tree carries, in order, no cargo build; one line per gate
+#   gate=<name> rc=<n> <its last line>
+# and one verdict line, `GATES: <n> run <n> green -> PASS|FAIL`; the verb exits with the worst gate's code. A gate
+# script missing from the tree (or no python3) is rc=127, a FAIL that names it, never a skip. Each gate's full
+# output is target/gates/<name>.log. The banner leg certifies THIS run's `⚡ kernel features:` list against the
+# banner-cert registry (`<knob line> ./arroyo gates` asks, before the media build, whether that build's banner can
+# be certified). `gates --list` prints the set; `gates --selftest` (GATE-GATEPATH) plants one defect per gate (the
+# plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
+# `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
+#   GATEPATH selftest: plants=<n> caught=<n> -> PASS
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py"
+_gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary line, returns the gate's rc
+    local R="$1" n="$2" log="$3" p rc=0 e
+    p="$(printf '%s\n' $GATES_SET | awk -F: -v n="$n" '$1==n{print $2}')"
+    if [ -z "$p" ] || [ ! -f "$R/$p" ]; then echo "gate=${n} rc=127 MISSING ${p:-<not in GATES_SET>}"; return 127; fi
+    case "$p" in *.py) command -v python3 >/dev/null 2>&1 || { echo "gate=${n} rc=127 MISSING python3"; return 127; } ;; esac
+    case "$n" in
+        charter|arch|attrkeys|appearance|verbs) e=("$R/unaos") ;;
+        deps) e=(--check) ;;
+        banner) e=(--registry "${_feats%,}") ;;
+        *) e=() ;;
+    esac
+    case "$p" in
+        *.py) python3 "$R/$p" "${e[@]}" > "$log" 2>&1 || rc=$? ;;
+        *)    bash "$R/$p" "${e[@]}" > "$log" 2>&1 || rc=$? ;;
+    esac
+    echo "gate=${n} rc=${rc} $(sed 's/\x1b\[[0-9;]*m//g' "$log" | awk 'NF{l=$0} END{sub(/^[ \t]+/,"",l); print l}')"
+    return $rc
+}
+_gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints the token its log must name
+    local C="$1" K="$1/unaos/crates/kernel/src"
+    case "$2" in
+        charter)    printf '//! CHARTER: Kernel — owed\npub fn p(h: &str) -> alloc::string::String { alloc::format!("{}.Recents", h) }\n' > "$K/video/zz_gateplant_charter.rs"; echo Recents ;;
+        arch)       printf '//! CHARTER: Kernel — owed\npub fn p(home: &str) -> alloc::string::String { alloc::format!("{home}/.zzgateplant") }\n' > "$K/video/zz_gateplant_arch.rs"; echo zzgateplant ;;
+        attrkeys)   printf 'pub const P: &str = "media:zzgateplant";\n' > "$K/video/zz_gateplant_attr.rs"; echo zzgateplant ;;
+        status)     printf 'ST99999\tGATEPATH plant: a confirmed row whose line no wire printed\tconfirmed\tf24\t:: GATEPATH plant: a line nobody printed on any wire ::\tGATEPATH selftest\tB471\n' >> "$C/docs/dev/STATUS.tsv"; echo ST99999 ;;
+        prefs)      printf 'pub fn p() { crate::prefs::set_sys("ghost.zzgateplant", "1"); }\n' > "$K/video/zz_gateplant_prefs.rs"; echo zzgateplant ;;
+        appearance) printf '//! CHARTER: Kernel — owed\npub fn p(f: &mut [u32]) { f[0] = 0x0012_3456; }\n' > "$K/video/zz_gateplant_app.rs"; echo zz_gateplant_app ;;
+        deps)       mkdir -p "$C/zzgateplant" && printf '[package]\nname = "zzgateplant"\nversion = "0.1.0"\n\n[dependencies]\nleftpad = { git = "https://x.invalid/leftpad" }\n' > "$C/zzgateplant/Cargo.toml"; echo leftpad ;;
+        knob)       printf 'pub fn p() -> bool { cfg!(feature = "zzgateplant") }\n' > "$K/video/zz_gateplant_knob.rs"; echo zzgateplant ;;
+        verbs)      printf '// GATEPATH plant\nconst _P: (&str, Avail) = ("zzgateplant", Avail::Both);\n' >> "$C/unaos/libs/sys/midden_core/src/lib.rs"; echo zzgateplant ;;
+        banner)     sed -i '/^bc_table() {$/,/^TABLE$/ s/^\(ahci|AHCI: selfcheck|-|measured\)$/\1\nzzgateplant|:: ZZGATEPLANT: row for no feature|-|measured/' "$C/unaos/scripts/banner-cert.sh"; echo zzgateplant ;;
+        k8reach)    sed -i 's/^_feats=""$/&\n[ -n "${UNAOS_ZZGATEPLANT:-}" ] \&\& _feats="${_feats}zzgateplant,"/' "$C/unaos/arroyo"; echo ZZGATEPLANT ;;
+        *) return 1 ;;
+    esac
+}
+gates() {
+    local R; R="$(cd "$WORKSPACE_DIR/.." && pwd)"
+    local n p rc worst=0 run=0 green=0 line
+    case "${1:-}" in
+        --list) for p in $GATES_SET; do echo "${p%%:*}  ${p#*:}"; done; return 0 ;;
+        --selftest) local _st=0; gates_selftest || _st=$?; return $_st ;;
+        "") ;;
+        *) echo "usage: ./arroyo gates [--list|--selftest]"; return 2 ;;
+    esac
+    mkdir -p "$WORKSPACE_DIR/target/gates"
+    for p in $GATES_SET; do
+        n="${p%%:*}"; rc=0
+        line="$(_gates_one "$R" "$n" "$WORKSPACE_DIR/target/gates/$n.log")" || rc=$?
+        echo "$line"
+        run=$((run+1)); [ "$rc" -eq 0 ] && green=$((green+1)); [ "$rc" -gt "$worst" ] && worst=$rc
+    done
+    echo "GATES: ${run} run ${green} green -> $([ "$green" -eq "$run" ] && echo PASS || echo FAIL)  (logs: target/gates/)"
+    return $worst
+}
+gates_selftest() {
+    local R C n p tok rc plants=0 caught=0 log line
+    R="$(cd "$WORKSPACE_DIR/.." && pwd)"
+    C="$(mktemp -d "${TMPDIR:-/tmp}/gatepath.XXXXXX")" || { echo "GATEPATH selftest: NO VERDICT — no scratch dir"; return 2; }
+    # The scratch copy is the working tree as git sees it (tracked + untracked, not ignored), so uncommitted gate
+    # edits are what is proven. Deleted on every exit path.
+    trap 'rm -rf "$C" "$C.bak"; trap - RETURN' RETURN
+    (cd "$R" && git ls-files -z --cached --others --exclude-standard | tar --null -T - --ignore-failed-read -cf - 2>/dev/null) | tar -xf - -C "$C" \
+        && [ -f "$C/unaos/arroyo" ] || { echo "GATEPATH selftest: NO VERDICT — the tree copy failed"; return 2; }
+    for p in $GATES_SET; do
+        n="${p%%:*}"; plants=$((plants+1)); log="$C/.gate-$n.log"
+        rm -rf "$C.bak"; mkdir -p "$C.bak"
+        cp -p "$C/docs/dev/STATUS.tsv" "$C/unaos/libs/sys/midden_core/src/lib.rs" "$C/unaos/scripts/banner-cert.sh" "$C/unaos/arroyo" "$C.bak/"
+        tok="$(_gates_plant "$C" "$n")" || tok=""
+        rc=0; line="$(_gates_one "$C" "$n" "$log")" || rc=$?
+        if [ -n "$tok" ] && [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ] && LC_ALL=C grep -a -q -F -- "$tok" "$log"; then
+            caught=$((caught+1)); echo "plant=${n} token=${tok} rc=${rc} -> CAUGHT"
+        else
+            echo "plant=${n} token=${tok:-<none>} rc=${rc} -> MISSED  (${line})"
+        fi
+        rm -f "$C"/unaos/crates/kernel/src/video/zz_gateplant_*.rs; rm -rf "$C/zzgateplant"
+        cp -p "$C.bak/STATUS.tsv" "$C/docs/dev/"; cp -p "$C.bak/lib.rs" "$C/unaos/libs/sys/midden_core/src/"
+        cp -p "$C.bak/banner-cert.sh" "$C/unaos/scripts/"; cp -p "$C.bak/arroyo" "$C/unaos/"
+    done
+    rm -rf "$C.bak"
+    echo "GATEPATH selftest: plants=${plants} caught=${caught} -> $([ "$caught" -eq "$plants" ] && echo PASS || echo FAIL)"
+    [ "$caught" -eq "$plants" ]
+}
+
 # --- Entry Point ---
 
 case "${1:-}" in
@@ -13732,6 +13827,9 @@ case "${1:-}" in
         ;;
     jobs-image)
         jobs_image
+        ;;
+    gates)
+        gates "${2:-}" || exit $?   # GATEPATH (B471): every host gate, one line each; exit = the worst gate's rc
         ;;
     clean)
         clean_all
