@@ -3106,6 +3106,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mica"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jobs_core",
+ "unafs",
+]
+
+[[package]]
 name = "midden"
 version = "0.1.0"
 dependencies = [
