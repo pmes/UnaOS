@@ -2558,3 +2558,32 @@ longer claims, fails as stale — the baseline only shrinks, and a new claiming 
 uncited claiming cell, a citation of a missing row, a bad status, and a stale baseline key; the good tree, the
 enum head and a grandfathered cell pass. At the cut: 42 rows (23 confirmed, 5 refuted, 4 parked, 3 open,
 7 unflown), every quoted line found; 188 claiming cells grandfathered; under 1 s.
+
+
+## GATE-ARCH — a CHARTER claim is read against the file; a store, a dotfile or a parser outside its seam is refused (B441, 2026-10-06)
+
+**The hole.** GATE-CHARTER takes the seam word as a claim and reads only the app-domain scope. The ARCHREVIEW
+(`docs/dev/review/ARCH-2026-10-06.md`) found: `kernel-by-ruling` lines naming no ruling, `shared-core` on files
+that link no core, `{}/.config/unaos/holocron/.ring` and the BT link-key folder invisible to the dotfile regex
+(it matches `{}.name` and `".Name"`, never `{}/.name`), a launcher writing straight into Principia's
+`<home>/settings/` beside prefs.rs, and format magics outside the shared cores.
+
+**The gate.** `python3 unaos/scripts/arch-check.py [<unaos dir>]`, run by `./arroyo check` after GATE-CHARTER.
+Scope: every `crates/kernel/src/**/*.rs`. Six legs, each a key: `seamcite` (kernel-by-ruling without `R<n>`/`B<n>`
+on the CHARTER line, owed without `B<n>`), `sharedcore` (a shared-core claim on a file naming no `*_core`/`unafs`/
+`una_abi`), `dotslash` (a `"{}/.name"` or `"/.name"` literal), `settings` (a `"{}/settings/…"` literal outside
+prefs.rs), `store` (a Mutex/RwLock static of Vec/BTreeMap/String AND a volume write, with no CHARTER line and no
+charter.registry row), `parser` (a MIME table or a PNG/GIF/ELF/RIFF/fLaC/OggS/ID3/ftyp magic). Today's 28 keys are
+`unaos/scripts/arch.baseline`, each naming its finding; SHRINK-ONLY — a new key fails, a baseline key that no longer
+matches fails as stale.
+
+**Controls (exit 2, no verdict).** `--selftest` plants one finding per leg in a fixture tree and must see exactly
+those six, a baselined fixture must be clean, a stale row must be seen; the scope must enumerate ≥ 200 files.
+
+**Go-red, measured at the cut (exec-rmbp-archreview).** A planted `zz_plant.rs` with `CHARTER: Kernel —
+kernel-by-ruling` and `format!("{}/.recents", h)`: exit 1 with `new dotslash|{}/.recents` and `new
+seamcite|zz_plant.rs`; deleting the launcher's baseline row: exit 1 `new settings|video/launcher.rs`. Clean tree:
+exit 0, 317 files.
+
+**What it does not do.** It cannot tell a store that is the owner's fulfiller from one that is a twin, nor read a
+ring-3 handler for its kernel twin; those stay the reviewer's (the findings file's F1–F7).

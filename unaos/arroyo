@@ -9041,6 +9041,15 @@ BRACEPY
         [ "$_chrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a kernel file declares no owning handler, or writes a dotfile off the allowlist (see GATE-CHARTER above)${COLOR_RESET}"; return 1; }
     fi
 
+    # GATE-ARCH (ARCHREVIEW, B441, 2026-10-06): the CHARTER claims read against the file (a ruling behind
+    #   kernel-by-ruling, a core behind shared-core), `{}/.name` dotfiles, writes into Principia's settings
+    #   folder outside prefs.rs, an undeclared kernel store, a format magic outside the shared cores.
+    #   Shrink-only baseline `scripts/arch.baseline`; selftest first (exit 2 = NO verdict).
+    local _arrc=0
+    python3 "$WORKSPACE_DIR/scripts/arch-check.py" "$WORKSPACE_DIR" || _arrc=$?
+    [ "$_arrc" -eq 2 ] && echo -e "${COLOR_RED}❌ arch gate gave NO VERDICT — its selftest or controls did not fire${COLOR_RESET}"
+    [ "$_arrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a new architecture finding or a stale baseline row (see GATE-ARCH above)${COLOR_RESET}"; return 1; }
+
     # GATE-STATUS (STATUSTABLE, B425, 2026-10-06; Peter: "one status table to rule them all so a false claim
     #   ... can never be made"): every flew/unflown/confirmed/refuted claim in a ledger status cell or a queue
     #   STATE line cites an ST<n> row of docs/dev/STATUS.tsv, and a confirmed/refuted row's quoted line is found

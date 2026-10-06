@@ -1,0 +1,32 @@
+# arch.baseline — GATE-ARCH's grandfather table (scripts/arch-check.py; ARCHREVIEW B441, 2026-10-06).
+# One finding key per line, as `arch-check.py --emit-baseline` prints it, then `  # <finding>` naming the
+# row of docs/dev/review/ARCH-2026-10-06.md that owns it. SHRINK-ONLY: a fixed finding's row is deleted
+# (a stale row fails the gate); a NEW finding never gets a row — it is fixed instead.
+dotslash|/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
+dotslash|{}/.config  # F2 BTKEYSEAL (the BT link-key folder)
+dotslash|{}/.config/unaos  # F2 BTKEYSEAL (the BT link-key folder)
+dotslash|{}/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
+dotslash|{}/.config/unaos/holocron/.ring  # F4 HOLOCRONROOT
+dotslash|{}/.config/unaos/preferences.toml  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
+dotslash|{}/.dock  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
+dotslash|{}/.settings  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
+parser|drivers/hda_play.rs|riff  # F6 TYPECORE (a format magic outside the shared cores)
+parser|fs/bootdisk.rs|elf  # F6 TYPECORE
+parser|fs/filetype.rs|elf  # F6 TYPECORE
+parser|fs/filetype.rs|gif  # F6 TYPECORE
+parser|fs/filetype.rs|isobmff  # F6 TYPECORE
+parser|fs/filetype.rs|png  # F6 TYPECORE
+parser|fs/filetype.rs|riff  # F6 TYPECORE
+parser|video/facet.rs|png  # F6 TYPECORE (a format magic outside the shared cores)
+parser|video/facet_anim.rs|png  # F6 TYPECORE (a format magic outside the shared cores)
+parser|video/prtscr.rs|png  # F6 TYPECORE (a format magic outside the shared cores)
+parser|video/quarry/columns.rs|gif  # F6 TYPECORE (a format magic outside the shared cores)
+parser|video/shotmask.rs|png  # F6 TYPECORE (a format magic outside the shared cores)
+seamcite|bootwit.rs  # F12 (kernel-by-ruling with no ruling cited)
+seamcite|lockowner.rs  # F12 (kernel-by-ruling with no ruling cited)
+seamcite|origin.rs  # F12 (kernel-by-ruling with no ruling cited)
+seamcite|ring3abi.rs  # F12 (kernel-by-ruling with no ruling cited)
+seamcite|video/panicscreen.rs  # F12 (kernel-by-ruling with no ruling cited)
+seamcite|wifi/status.rs  # F12 (kernel-by-ruling with no ruling cited)
+seamcite|wifi/verb.rs  # F12 (kernel-by-ruling with no ruling cited)
+settings|video/launcher.rs  # F7 LAUNCHERPREFS
