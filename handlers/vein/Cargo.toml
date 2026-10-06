@@ -20,6 +20,7 @@ local-embed = ["gneiss_pal/local-embed"]
 bandy = { path = "../../libs/bandy" }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
 unafs = { path = "../../unaos/libs/fs/unafs" }
+una-abi = { path = "../../unaos/crates/una-abi" } # ATTRKEYS (B452): the embed keys live in the one registry
 elessar = { path = "../../libs/elessar" }
 # VEINCORE (B304): the shared no_std core — conversation model, pure context assembler, chat bus codec —
 # the SAME crate the ring-3 VEIN.BIN and the kernel link.

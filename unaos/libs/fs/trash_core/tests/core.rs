@@ -158,7 +158,8 @@ fn cx(now: u64) -> Ctx<'static> {
 
 #[test]
 fn keys_are_the_abi_literals() {
-    assert_eq!(KEYS, ["una:trash-origin", "una:trash-time", "una:trash-by"]);
+    use una_abi::attr_keys as k;
+    assert_eq!(KEYS, [k::TRASH_ORIGIN, k::TRASH_TIME, k::TRASH_BY]);
     assert_eq!(trash_dir(H), "/home/una/.Trash");
 }
 

@@ -29,27 +29,27 @@ use alloc::vec::Vec;
 use crate::fs::filetype as ft;
 use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL};
 
-pub const WIDTH: &str = "media:width";
-pub const HEIGHT: &str = "media:height";
-pub const DURATION: &str = "media:duration_ms";
-pub const CODEC: &str = "media:codec";
-pub const TITLE: &str = "doc:title";
-pub const ANIMATED: &str = "image:animated";
+pub const WIDTH: &str = una_abi::attr_keys::MEDIA_WIDTH;
+pub const HEIGHT: &str = una_abi::attr_keys::MEDIA_HEIGHT;
+pub const DURATION: &str = una_abi::attr_keys::MEDIA_DURATION_MS;
+pub const CODEC: &str = una_abi::attr_keys::MEDIA_CODEC;
+pub const TITLE: &str = una_abi::attr_keys::DOC_TITLE;
+pub const ANIMATED: &str = una_abi::attr_keys::IMAGE_ANIMATED;
 /// RAWCORE (B444): a photograph's EXIF facts (`raw_core::Facts`, through pixel_core) — camera, lens, exposure
 /// (`1/250`), ISO (int), focal length (int mm), and when it was taken (int unix seconds: QUERYFOLDER's
 /// `media:taken > now-7d` finds a shoot).
-pub const CAMERA: &str = "media:camera";
-pub const LENS: &str = "media:lens";
-pub const EXPOSURE: &str = "media:exposure";
-pub const ISO: &str = "media:iso";
-pub const FOCAL: &str = "media:focal_mm";
-pub const TAKEN: &str = "media:taken";
+pub const CAMERA: &str = una_abi::attr_keys::MEDIA_CAMERA;
+pub const LENS: &str = una_abi::attr_keys::MEDIA_LENS;
+pub const EXPOSURE: &str = una_abi::attr_keys::MEDIA_EXPOSURE;
+pub const ISO: &str = una_abi::attr_keys::MEDIA_ISO;
+pub const FOCAL: &str = una_abi::attr_keys::MEDIA_FOCAL_MM;
+pub const TAKEN: &str = una_abi::attr_keys::MEDIA_TAKEN;
 /// The sniffed facts, in the order Get Info and the witness print them.
 pub const FACT_KEYS: [&str; 12] = [WIDTH, HEIGHT, DURATION, CODEC, TITLE, ANIMATED, CAMERA, LENS, EXPOSURE, ISO, FOCAL, TAKEN];
-pub const FACTS_MTIME: &str = "una:facts-mtime";
-pub const TIMES: &str = "una:attrtimes";
+pub const FACTS_MTIME: &str = una_abi::attr_keys::FACTS_MTIME;
+pub const TIMES: &str = una_abi::attr_keys::ATTRTIMES;
 /// The folder's chosen attribute columns, comma-separated (Be's `_trk` attribute; the seed of FOLDERVIEW B6).
-pub const VIEW: &str = "una:view";
+pub const VIEW: &str = una_abi::attr_keys::VIEW;
 
 /// A file at most this long is read whole; a longer one gives its head and tail (header facts, Ogg end granule).
 pub const READ_CAP: u64 = 4 << 20;

@@ -2416,15 +2416,15 @@ fn store_load(dir: &str) -> Vec<Bond> {
         let mut plain = false;
         for (k, val) in attrs {
             match (k.as_str(), val) {
-                ("bt.linkkey", AttrValue::Blob(mut x)) if x.len() == 16 => {
+                (una_abi::attr_keys::BT_LINKKEY, AttrValue::Blob(mut x)) if x.len() == 16 => {
                     b.key.copy_from_slice(&x);
                     holocron_wipe(&mut x);
                     plain = true;
                 }
-                ("bt.keytype", AttrValue::Int(t)) => b.ktype = t as u8,
-                ("bt.class", AttrValue::Int(t)) => b.cod = t as u32,
-                ("bt.name", AttrValue::Str(s)) => b.name = s,
-                ("bt.hiddesc", AttrValue::Blob(x)) => b.desc = x,
+                (una_abi::attr_keys::BT_KEYTYPE, AttrValue::Int(t)) => b.ktype = t as u8,
+                (una_abi::attr_keys::BT_CLASS, AttrValue::Int(t)) => b.cod = t as u32,
+                (una_abi::attr_keys::BT_NAME, AttrValue::Str(s)) => b.name = s,
+                (una_abi::attr_keys::BT_HIDDESC, AttrValue::Blob(x)) => b.desc = x,
                 _ => {}
             }
         }
@@ -2471,14 +2471,14 @@ fn store_write(dir: &str, b: &Bond) {
     // BTKEYSEAL (B446): the key is NEVER written here — it is queued for Holocron (sealed on this pass).
     seal_queue(b.addr, false);
     SEAL_RETRY_AT.store(0, Ordering::Release);
-    let mut res = mt.set_attr(&p, "bt.keytype", AttrValue::Int(b.ktype as i64), K);
+    let mut res = mt.set_attr(&p, una_abi::attr_keys::BT_KEYTYPE, AttrValue::Int(b.ktype as i64), K);
     if res.is_ok() {
-        let _ = mt.set_attr(&p, "bt.class", AttrValue::Int(b.cod as i64), K);
+        let _ = mt.set_attr(&p, una_abi::attr_keys::BT_CLASS, AttrValue::Int(b.cod as i64), K);
         if !b.name.is_empty() {
-            let _ = mt.set_attr(&p, "bt.name", AttrValue::Str(b.name.clone()), K);
+            let _ = mt.set_attr(&p, una_abi::attr_keys::BT_NAME, AttrValue::Str(b.name.clone()), K);
         }
         if !b.desc.is_empty() && b.desc.len() <= crate::fs::vfs::ATTR_VALUE_MAX {
-            res = mt.set_attr(&p, "bt.hiddesc", AttrValue::Blob(b.desc.clone()), K);
+            res = mt.set_attr(&p, una_abi::attr_keys::BT_HIDDESC, AttrValue::Blob(b.desc.clone()), K);
         }
     }
     match res {
@@ -2726,7 +2726,7 @@ fn seal_pass(dir: &str) {
         match ks::put(&a12, &label, &key) {
             Answer::Ok(_) if plain => {
                 let p = format!("{}/{}", dir, a12);
-                let r = crate::shell::vfs_mount_table().remove_attr(&p, "bt.linkkey", crate::fs::vfs::KERNEL_PRINCIPAL);
+                let r = crate::shell::vfs_mount_table().remove_attr(&p, una_abi::attr_keys::BT_LINKKEY, crate::fs::vfs::KERNEL_PRINCIPAL);
                 serial_println!(":: BTKEYSEAL: migrate {} plain=read sealed=ok plain_removed={} ::", fmt_addr(&addr), if r.is_ok() { "ok" } else { "refused" });
                 if r.is_err() {
                     left.push((addr, true));
@@ -2808,7 +2808,7 @@ pub fn btkeyseal_selftest() {
                 let p = format!("{}/{}", dir, ent.name);
                 if let Ok(attrs) = mt.list_attrs(&p, crate::fs::vfs::KERNEL_PRINCIPAL) {
                     for (k, mut v) in attrs {
-                        if k == "bt.linkkey" {
+                        if k == una_abi::attr_keys::BT_LINKKEY {
                             plain_left += 1;
                         }
                         if let crate::fs::vfs::AttrValue::Blob(x) = &mut v {

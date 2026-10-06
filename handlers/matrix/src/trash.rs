@@ -215,9 +215,9 @@ mod tests {
 
     #[test]
     fn keys_are_the_kernel_literals() {
-        assert_eq!(ATTR_KEY_TRASH_ORIGIN, "una:trash-origin");
-        assert_eq!(ATTR_KEY_TRASH_TIME, "una:trash-time");
-        assert_eq!(ATTR_KEY_TRASH_BY, "una:trash-by");
+        assert_eq!(ATTR_KEY_TRASH_ORIGIN, una_abi::attr_keys::TRASH_ORIGIN); // ATTRKEYS (B452): the one registry
+        assert_eq!(ATTR_KEY_TRASH_TIME, una_abi::attr_keys::TRASH_TIME);
+        assert_eq!(ATTR_KEY_TRASH_BY, una_abi::attr_keys::TRASH_BY);
     }
 
     #[test]

@@ -1,0 +1,40 @@
+# GATE-ATTRKEYS baseline (B452): key-shaped literals outside una_abi::attr_keys. SHRINK-ONLY.
+# arch/x86_64/pci.rs: PCI class labels in lspci output (not attribute keys).
+# unafs tests/boot80_logic.rs: commit-size fixtures over an arbitrary key (unafs links no una-abi).
+attrkey|unaos/crates/kernel/src/arch/x86_64/pci.rs|media:audio-legacy
+attrkey|unaos/crates/kernel/src/arch/x86_64/pci.rs|media:hda
+attrkey|unaos/libs/fs/unafs/tests/boot80_logic.rs|una:icon
+attrkey|unaos/libs/fs/unafs/tests/boot80_logic.rs|una:name
+attrkey|unaos/libs/fs/unafs/tests/boot80_logic.rs|una:opener
+# merge19: dependency-free cores MIRROR the registry (jobs_core K_*/TYPE_KEY/VIEW_KEY, type_core EXTENSIONS_KEY,
+# unafs nameindex NAME_KEY/NAME_MARK_KEY); each crate's tests/attrkeys_pin.rs asserts the mirror equals
+# `una_abi::attr_keys`. The `job:` prefix and the `job:status == open` query strings are UnaFS query text, not keys.
+attrkey|unaos/libs/fs/unafs/src/nameindex.rs|una:fsname
+attrkey|unaos/libs/fs/unafs/src/nameindex.rs|una:fsname-index
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:arc
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:flight
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:id
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:kind
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:line
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:owner
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:refs
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:seq
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:set_by
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:status
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:status == open
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:track
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|job:{}
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|una:type
+attrkey|unaos/libs/sys/jobs_core/src/lib.rs|una:view
+attrkey|unaos/libs/sys/jobs_core/tests/roundtrip.rs|job:set_by == 
+attrkey|unaos/libs/sys/jobs_core/tests/roundtrip.rs|job:status == 
+attrkey|unaos/libs/sys/jobs_core/tests/roundtrip.rs|job:status == open
+attrkey|unaos/libs/sys/type_core/src/lib.rs|una:extensions
+# handlers/mica (UNAOSVOLUME, Ring 3, links no una-abi): saved-query column lists and the `job:` prefix/query text are
+# query strings over jobs_core's keys (pinned to the registry by jobs_core/tests/attrkeys_pin.rs), not key declarations.
+attrkey|handlers/mica/src/lib.rs|job:
+attrkey|handlers/mica/src/lib.rs|job:status,job:arc,job:refs
+attrkey|handlers/mica/src/lib.rs|job:status,job:flight,job:set_by,job:refs
+attrkey|handlers/mica/src/lib.rs|job:status,job:owner,job:arc,job:refs
+attrkey|handlers/mica/tests/volume.rs|job:status == open

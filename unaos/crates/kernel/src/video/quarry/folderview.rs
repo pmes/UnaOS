@@ -33,10 +33,10 @@ use crate::fs::vfs::{AttrValue, MountTable, VfsError, KERNEL_PRINCIPAL};
 use crate::video::winmenu;
 use core::sync::atomic::AtomicU32;
 
-pub const MODE: &str = "una:view.mode";
-pub const COLUMNS: &str = "una:view.columns";
-pub const SORT: &str = "una:view.sort";
-pub const FRAME: &str = "una:view.frame";
+pub const MODE: &str = una_abi::attr_keys::VIEW_MODE;
+pub const COLUMNS: &str = una_abi::attr_keys::VIEW_COLUMNS;
+pub const SORT: &str = una_abi::attr_keys::VIEW_SORT;
+pub const FRAME: &str = una_abi::attr_keys::VIEW_FRAME;
 const KEYS: [&str; 4] = [MODE, COLUMNS, SORT, FRAME];
 
 /// The frame poll's period (a read of the window table, never a write).
@@ -569,7 +569,7 @@ fn leg_codec() -> Result<(), &'static str> {
     if dec_sort(&enc_sort(&v)) != Some((SortKey::Mtime, true, None)) {
         return Err("sort");
     }
-    if dec_sort("@media:duration_ms") != Some((SortKey::Name, false, Some(String::from("media:duration_ms")))) {
+    if dec_sort("@media:duration_ms") != Some((SortKey::Name, false, Some(String::from(una_abi::attr_keys::MEDIA_DURATION_MS)))) {
         return Err("attr-sort");
     }
     if dec_frame(&enc_frame((10, 20, 800, 600))) != Some((10, 20, 800, 600)) || dec_frame("1,2,0,4").is_some() {

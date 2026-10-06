@@ -1164,11 +1164,11 @@ mod ring3win_tests {
 // Trash, `fs/trash.rs`, and Matrix's host Finder over a UnaFS vault): three attributes ON the object,
 // found by one query scoped to `/home/<user>/.Trash/`. Strings, not code: zero bytes in an EL0 blob.
 /// The original absolute path (String).
-pub const ATTR_KEY_TRASH_ORIGIN: &str = "una:trash-origin";
+pub const ATTR_KEY_TRASH_ORIGIN: &str = attr_keys::TRASH_ORIGIN;
 /// When it was trashed, unix seconds (Int).
-pub const ATTR_KEY_TRASH_TIME: &str = "una:trash-time";
+pub const ATTR_KEY_TRASH_TIME: &str = attr_keys::TRASH_TIME;
 /// The session user who trashed it (String).
-pub const ATTR_KEY_TRASH_BY: &str = "una:trash-by";
+pub const ATTR_KEY_TRASH_BY: &str = attr_keys::TRASH_BY;
 /// The Trash folder's name under the user's home.
 pub const TRASH_DIR_NAME: &str = ".Trash";
 /// The listing query (every object carrying an origin; callers scope it to their Trash folder).
@@ -1996,6 +1996,191 @@ mod secreview_fuzz {
                 let d = dialog_parse(&out[..n]).expect("an encoded dialog parses");
                 assert!(d.message == &m[..] && d.info == &i[..] && d.nb as usize == nb);
             }
+        }
+    }
+}
+
+// ATTRKEYS (B452, ARCH-2026-10-06 F9, R79) — THE attribute-key registry, one home for both rings. Every
+// attribute name the kernel, a shared core or a ring-3 handler reads or writes is declared HERE and nowhere
+// else; the old homes (fs/filetype, fs/assoc, fs/attrfacts, fs/appres, midden_core RES_KEY_*, vein's vault)
+// alias these constants. The spellings are ON-DISK FORMAT (UnaFS attributes on flown cards): never respell
+// one in place. GATE-ATTRKEYS (`scripts/attrkeys-check.py`) refuses a key-shaped literal outside this file.
+pub mod attr_keys {
+    // ---- una: — the system's own keys
+    /// A file's MIME type (FILETYPE).
+    pub const TYPE: &str = "una:type";
+    /// On a type object: the opener program (ASSOC).
+    pub const OPENER: &str = "una:opener";
+    /// On a type object: its icon; also the prefix of the resource block's rendered icons.
+    pub const ICON: &str = "una:icon";
+    /// A display name: a type object's (ASSOC) and an app resource block's (APPRES).
+    pub const NAME: &str = "una:name";
+    /// On a FILE: the program it prefers over its type's opener (ASSOC).
+    pub const PREFERRED: &str = "una:preferred";
+    /// The mtime the sniffed facts were taken at (ATTRCOLUMNS).
+    pub const FACTS_MTIME: &str = "una:facts-mtime";
+    /// Per-key change times (ATTRCOLUMNS).
+    pub const ATTRTIMES: &str = "una:attrtimes";
+    /// A folder's chosen attribute columns, comma-separated (ATTRCOLUMNS).
+    pub const VIEW: &str = "una:view";
+    /// APPRES cache: the program path a type object's icon came from.
+    pub const APP_PATH: &str = "una:app.path";
+    /// APPRES cache: that program's stamp.
+    pub const APP_STAMP: &str = "una:app.stamp";
+    /// On a type object: the programs that declare they open it (newline-separated).
+    pub const APPS: &str = "una:apps";
+    /// APPRES resource block: the app's signature, reverse-DNS.
+    pub const SIGNATURE: &str = "una:signature";
+    /// APPRES resource block: `semver+build`.
+    pub const VERSION: &str = "una:version";
+    /// APPRES resource block: `windowed` · `resident` · `console`.
+    pub const KIND: &str = "una:kind";
+    /// APPRES resource block: the icon's SVG source.
+    pub const ICON_SVG: &str = "una:icon.svg";
+    /// APPRES resource block: the icon at 32, 64, 128 px (RGBA PNG).
+    pub const ICON_32: &str = "una:icon.32";
+    pub const ICON_64: &str = "una:icon.64";
+    pub const ICON_128: &str = "una:icon.128";
+    /// APPRES resource block: the MIME types the app opens, newline-separated.
+    pub const DOCTYPES: &str = "una:doctypes";
+    /// TRASHTIME (B308): the original absolute path (String).
+    pub const TRASH_ORIGIN: &str = "una:trash-origin";
+    /// TRASHTIME: when it was trashed, unix seconds (Int).
+    pub const TRASH_TIME: &str = "una:trash-time";
+    /// TRASHTIME: the session user who trashed it (String).
+    pub const TRASH_BY: &str = "una:trash-by";
+    /// EMBED (B317): the model that made a memory's vector (`<provider>/<model>`).
+    pub const EMBED_MODEL: &str = "una:embed-model";
+    /// EMBED: that vector's width.
+    pub const EMBED_DIMS: &str = "una:embed-dims";
+    // ---- media: / doc: / image: — the sniffed facts (ATTRCOLUMNS)
+    pub const MEDIA_WIDTH: &str = "media:width";
+    pub const MEDIA_HEIGHT: &str = "media:height";
+    pub const MEDIA_DURATION_MS: &str = "media:duration_ms";
+    pub const MEDIA_CODEC: &str = "media:codec";
+    pub const DOC_TITLE: &str = "doc:title";
+    pub const IMAGE_ANIMATED: &str = "image:animated";
+    // ---- bt. — a Bluetooth bond's record (BTHID). Un-namespaced spelling kept: it is on the flown cards.
+    pub const BT_LINKKEY: &str = "bt.linkkey";
+    pub const BT_KEYTYPE: &str = "bt.keytype";
+    pub const BT_CLASS: &str = "bt.class";
+    pub const BT_NAME: &str = "bt.name";
+    pub const BT_HIDDESC: &str = "bt.hiddesc";
+    // ---- job: — the jobs volume's records (UNAOSVOLUME, `jobs_core` K_*; it aliases these at the fold)
+    pub const JOB_KIND: &str = "job:kind";
+    pub const JOB_ID: &str = "job:id";
+    pub const JOB_SEQ: &str = "job:seq";
+    pub const JOB_STATUS: &str = "job:status";
+    pub const JOB_FLIGHT: &str = "job:flight";
+    pub const JOB_LINE: &str = "job:line";
+    pub const JOB_SET_BY: &str = "job:set_by";
+    pub const JOB_REFS: &str = "job:refs";
+    pub const JOB_OWNER: &str = "job:owner";
+    pub const JOB_ARC: &str = "job:arc";
+    pub const JOB_TRACK: &str = "job:track";
+
+    /// FILETYPES (B423): a type object's description and its user-added extensions (merge19).
+    pub const DESCRIPTION: &str = "una:description";
+    pub const EXTENSIONS: &str = "una:extensions";
+    /// RAWCORE (B444): a photograph's EXIF facts (merge19).
+    pub const MEDIA_CAMERA: &str = "media:camera";
+    pub const MEDIA_LENS: &str = "media:lens";
+    pub const MEDIA_EXPOSURE: &str = "media:exposure";
+    pub const MEDIA_ISO: &str = "media:iso";
+    pub const MEDIA_FOCAL_MM: &str = "media:focal_mm";
+    pub const MEDIA_TAKEN: &str = "media:taken";
+    /// NAMEINDEX (B432): the one-name-per-directory index (merge19; `unafs::nameindex` mirrors these).
+    pub const FSNAME: &str = "una:fsname";
+    pub const FSNAME_INDEX: &str = "una:fsname-index";
+    /// FOLDERVIEW (B424): a folder's remembered view (merge19).
+    pub const VIEW_MODE: &str = "una:view.mode";
+    pub const VIEW_COLUMNS: &str = "una:view.columns";
+    pub const VIEW_SORT: &str = "una:view.sort";
+    pub const VIEW_FRAME: &str = "una:view.frame";
+    /// The namespaces a key may live in.
+    pub const NAMESPACES: &[&str] = &["una:", "media:", "doc:", "image:", "bt.", "job:"];
+    /// Every registered key, once.
+    pub const ALL: &[&str] = &[
+        TYPE, OPENER, ICON, NAME, PREFERRED, FACTS_MTIME, ATTRTIMES, VIEW, APP_PATH, APP_STAMP, APPS, SIGNATURE,
+        VERSION, KIND, ICON_SVG, ICON_32, ICON_64, ICON_128, DOCTYPES, TRASH_ORIGIN, TRASH_TIME, TRASH_BY,
+        EMBED_MODEL, EMBED_DIMS, MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_DURATION_MS, MEDIA_CODEC, DOC_TITLE,
+        IMAGE_ANIMATED, BT_LINKKEY, BT_KEYTYPE, BT_CLASS, BT_NAME, BT_HIDDESC, JOB_KIND, JOB_ID, JOB_SEQ,
+        JOB_STATUS, JOB_FLIGHT, JOB_LINE, JOB_SET_BY, JOB_REFS, JOB_OWNER, JOB_ARC, JOB_TRACK,
+        DESCRIPTION, EXTENSIONS, MEDIA_CAMERA, MEDIA_LENS, MEDIA_EXPOSURE, MEDIA_ISO, MEDIA_FOCAL_MM, MEDIA_TAKEN, FSNAME, FSNAME_INDEX, VIEW_MODE, VIEW_COLUMNS, VIEW_SORT, VIEW_FRAME,
+    ];
+
+    const fn str_eq(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    const fn has_prefix(s: &str, p: &str) -> bool {
+        let (s, p) = (s.as_bytes(), p.as_bytes());
+        if s.len() <= p.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < p.len() {
+            if s[i] != p[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    /// No two keys share a spelling, and every key sits in a registered namespace.
+    pub const fn registry_sound(v: &[&str]) -> bool {
+        let mut i = 0;
+        while i < v.len() {
+            let mut ns = false;
+            let mut n = 0;
+            while n < NAMESPACES.len() {
+                if has_prefix(v[i], NAMESPACES[n]) {
+                    ns = true;
+                }
+                n += 1;
+            }
+            if !ns {
+                return false;
+            }
+            let mut j = i + 1;
+            while j < v.len() {
+                if str_eq(v[i], v[j]) {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        true
+    }
+    const _: () = assert!(registry_sound(ALL), "ATTRKEYS: two attribute keys share a name, or one has no namespace");
+
+    #[cfg(test)]
+    mod tests {
+        extern crate std;
+        use super::*;
+        #[test]
+        fn attrkeys_registry_has_no_duplicates() {
+            for (i, a) in ALL.iter().enumerate() {
+                assert!(NAMESPACES.iter().any(|p| a.starts_with(p) && a.len() > p.len()), "{a}: no namespace");
+                for b in &ALL[i + 1..] {
+                    assert_ne!(a, b, "ATTRKEYS: {a} registered twice");
+                }
+            }
+            assert!(!registry_sound(&[TYPE, TYPE]), "the const control must refuse a duplicate");
+            assert!(!registry_sound(&["nospace"]), "the const control must refuse a bare name");
+            assert!(crate::TRASH_QUERY.starts_with(TRASH_ORIGIN));
+            std::println!(":: ATTRKEYS: keys={} unique namespaces={} -> PASS ::", ALL.len(), NAMESPACES.len());
         }
     }
 }

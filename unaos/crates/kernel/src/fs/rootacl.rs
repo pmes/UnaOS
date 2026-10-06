@@ -129,7 +129,7 @@ pub fn selftest() {
     let tok = |r: bool| if r { "refused" } else { "ADMITTED" };
     let w = matches!(mt.write(F, 0, b"x", anon), Err(VfsError::Denied));
     let c = matches!(mt.create(G, NodeKind::File, anon), Err(VfsError::Denied));
-    let a = matches!(mt.set_attr(F, "una:opener", AttrValue::Str(String::from("X")), anon), Err(VfsError::Denied));
+    let a = matches!(mt.set_attr(F, una_abi::attr_keys::OPENER, AttrValue::Str(String::from("X")), anon), Err(VfsError::Denied));
     let u = matches!(mt.unlink(F, anon), Err(VfsError::Denied));
     let r = mt.open_read(F, anon).is_ok();
     let mut nb = [0u8; crate::fs::users::NAME_MAX];

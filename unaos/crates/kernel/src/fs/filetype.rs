@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL};
 
 /// The type attribute's key.
-pub const TYPE_KEY: &str = "una:type";
+pub const TYPE_KEY: &str = una_abi::attr_keys::TYPE;
 
 // TYPECORE (B450, R79): the MIME strings, THE extension table, the built-in magics and their order, the text heads
 // and the ELF split are `type_core`'s — the one table the host's bandy reads too. This file keeps what needs a volume.

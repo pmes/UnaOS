@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 /// Holocron's namespace for Bluetooth bonds.
 pub const NS: &str = "bt";
 /// The record kind.
-pub const KIND: &str = "bt.linkkey";
+pub const KIND: &str = una_abi::attr_keys::BT_LINKKEY;
 /// How long one storage pass waits for HOLOCRON.ELF's answer.
 pub const WAIT_MS: u64 = 250;
 

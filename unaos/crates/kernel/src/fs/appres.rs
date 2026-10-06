@@ -59,10 +59,10 @@ const BUILTIN: &[(&str, &[u8])] = &[
 const GENERIC: &[u8] = include_bytes!("../../../../res/generic/generic.unares");
 
 /// Cache keys beside the `RES_KEY_*` ones.
-pub const KEY_APP_PATH: &str = "una:app.path";
-pub const KEY_APP_STAMP: &str = "una:app.stamp";
+pub const KEY_APP_PATH: &str = una_abi::attr_keys::APP_PATH;
+pub const KEY_APP_STAMP: &str = una_abi::attr_keys::APP_STAMP;
 /// On a type object: the programs that declare they open it (newline-separated paths).
-pub const KEY_APPS: &str = "una:apps";
+pub const KEY_APPS: &str = una_abi::attr_keys::APPS;
 
 /// Largest note section the registrar will read (an icon set is a few KiB; this bounds a hostile header).
 const NOTE_CAP: usize = 256 * 1024;

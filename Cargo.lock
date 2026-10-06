@@ -2794,6 +2794,9 @@ dependencies = [
 [[package]]
 name = "jobs_core"
 version = "0.1.0"
+dependencies = [
+ "una-abi",
+]
 
 [[package]]
 name = "jobserver"
@@ -3135,6 +3138,9 @@ dependencies = [
 [[package]]
 name = "midden_core"
 version = "0.1.0"
+dependencies = [
+ "una-abi",
+]
 
 [[package]]
 name = "mime"
@@ -5495,6 +5501,7 @@ dependencies = [
  "demux_core",
  "elf_core",
  "pixel_core",
+ "una-abi",
 ]
 
 [[package]]
@@ -5555,6 +5562,7 @@ dependencies = [
  "libm",
  "memmap2",
  "thiserror 2.0.21",
+ "una-abi",
 ]
 
 [[package]]
@@ -5749,6 +5757,7 @@ dependencies = [
  "syn 3.0.6",
  "tempfile",
  "tokio",
+ "una-abi",
  "unafs",
  "vein_core",
 ]

@@ -31,12 +31,12 @@ use crate::fs::appres::{self, Registrant};
 use crate::fs::filetype as ft;
 use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL};
 
-pub const DESCRIPTION_KEY: &str = "una:description";
-pub const EXTENSIONS_KEY: &str = "una:extensions";
-pub const ICON_KEY: &str = "una:icon";
+pub const DESCRIPTION_KEY: &str = una_abi::attr_keys::DESCRIPTION;
+pub const EXTENSIONS_KEY: &str = una_abi::attr_keys::EXTENSIONS;
+pub const ICON_KEY: &str = una_abi::attr_keys::ICON;
 /// On a type object: the preferred app's signature. On a file: that file's own choice (signature, or the B307
 /// opener id / program path).
-pub const PREFERRED_KEY: &str = "una:preferred";
+pub const PREFERRED_KEY: &str = una_abi::attr_keys::PREFERRED;
 /// The registry's directory on the system volume (ROOTDISK2: `/system` is UnaFS).
 pub const TYPES_DIR: &str = "/system/filetypes";
 
