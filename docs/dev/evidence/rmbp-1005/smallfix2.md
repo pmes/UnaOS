@@ -23,8 +23,7 @@ pre-QUARRY2 order exactly). One line names the fixture: `[quarry2] fixture panel
 
 **(3) BOOT80 FAIL.** The row's hypothesis (26 types cost 26 reads) is wrong: `ls` reads ONE directory, whatever
 its count — flight 25 resolved the same 26-type database in `blocks_read=34` and PASSED (`users_store=nomount`).
-Flight 24's 168 blocks / 77 cmds / 353 ms ran at 12:42:10 beside `PRTSCR: refused — capture in flight`: the
-counters are GLOBAL, so a concurrent capture writing to UnaFS landed in the resolve's window. Fix: the type-db
+Flight 24's 168 blocks / 77 cmds / 353 ms are one GLOBAL count over the store probe (FAT, p1), the type walk and anything else on the card in that window (the `PRTSCR` lines beside it are the harness's fixtures, so a concurrent writer is possible, not proven): the old line cannot say which. Fix: the type-db
 leg is measured INSIDE the one UnaFS mount lock (no other UnaFS traffic can interleave) and bounded by the walk
 it does: `bound = 2 x depth x ra_blocks` (an inode read and a directory read per level of `/system/types`, each at
 most one read-ahead window); the users-store leg (FAT, p1) keeps B350's 64. The window's writes are said
