@@ -4713,6 +4713,9 @@ impl Controller {
         // GUI-WITNESS: the report-protocol pointer (the rMBP trackpad, incl. the Apple
         // vendor-multitouch interface) is armed — the trackpad-input milestone.
         crate::bootlog::record("ehci:trackpad-armed");
+        if layout.vendor_mt && cfg!(not(feature = "mtraw")) {
+            tpmode_witness(self.idx, crate::arch::ms());
+        }
         if layout.vendor_mt {
             // EHCI-5 M1: the Apple vendor-multitouch interface (Report ID 0x44, page 0xFF00). The
             // descriptor does not describe the finger layout — arm to CAPTURE the raw body and
@@ -4792,9 +4795,16 @@ impl Controller {
         // Attempt 1 — HID 1.11 §7.2.2: wIndex is the INTERFACE this Feature report belongs to.
         // Attempt 2 — the legacy index this driver has always sent. Reached only when the
         // conformant request did not latch, and never a third time.
-        let latched = self.bcm5974_mode_attempt(t, intf, intf as u16, "hid1.11-intf")
+        // TPMODE (B459): the ORDER is the index that latched first. Flights 24/25 (6 of 6 boots):
+        // `wIndex = intf` NAKs the data stage of the GET and the SET until the 2 s budget expires
+        // (`STOP-NOTE EP0 DATA timeout … req=0xa1/0x01`, then `0x21/0x09`), 4 s per boot, and
+        // index 0 then latches (`[tp] mode-mismatch readback=vendor`). The conformant index stays
+        // the fallback, reached only when index 0 does not latch.
+        tp_mode_reset();
+        let latched = self.bcm5974_mode_attempt(t, intf, BCM5974_MODE_REQ_INDEX, "legacy-index0")
             || (intf as u16 != BCM5974_MODE_REQ_INDEX
-                && self.bcm5974_mode_attempt(t, intf, BCM5974_MODE_REQ_INDEX, "legacy-index0"));
+                && self.bcm5974_mode_attempt(t, intf, intf as u16, "hid1.11-intf"));
+        TP_MODE_LATCHED.store(latched as u32, Ordering::Relaxed);
         crate::bootlog_println!(
             ":: EHCI-HID: [{}] [tp] mt route={} latched={} (addr={} intf={}; the readback's route — a stream that disagrees is routed by the stream) == witness ::",
             self.idx, if latched { "vendor" } else { "legacy" }, if latched { "yes" } else { "no" },
@@ -4821,10 +4831,7 @@ impl Controller {
     ) -> bool {
         const N: usize = BCM5974_MODE_LEN as usize;
         // Stage 1 — read the current feature report (HID 1.11 §7.2.1).
-        let read = self.control(
-            t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, w_index,
-            BCM5974_MODE_LEN, true,
-        );
+        let read = self.tp_mode_req(t, intf, 0xA1, BCM5974_MODE_READ_REQ, w_index, true);
         match read {
             Ok(got) => {
                 let n = (got as usize).min(N);
@@ -4855,10 +4862,7 @@ impl Controller {
             wrote[k] = self.data_buf.add(k).read();
         }
         // Stage 3 — write the report back (SET_REPORT, class, interface recipient).
-        let set_ok = match self.control(
-            t, 0x21, BCM5974_MODE_WRITE_REQ, BCM5974_MODE_REQ_VALUE, w_index,
-            BCM5974_MODE_LEN, false,
-        ) {
+        let set_ok = match self.tp_mode_req(t, intf, 0x21, BCM5974_MODE_WRITE_REQ, w_index, false) {
             Ok(_) => true,
             Err(e) => {
                 serial_println!(
@@ -4872,12 +4876,7 @@ impl Controller {
         // term flight 11 had no line for.
         let mut back = [0u8; N];
         let read_back = set_ok
-            && self
-                .control(
-                    t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, w_index,
-                    BCM5974_MODE_LEN, true,
-                )
-                .is_ok();
+            && self.tp_mode_req(t, intf, 0xA1, BCM5974_MODE_READ_REQ, w_index, true).is_ok();
         if read_back {
             for k in 0..N {
                 back[k] = self.data_buf.add(k).read();
@@ -4894,6 +4893,35 @@ impl Controller {
             t.addr, intf, w_index, why, set_ok, read_back
         );
         latched
+    }
+
+    /// TPMODE (B459) — one EP0 request of the mode handshake, timed and dumped on the metal wire:
+    /// `[tp] mode req=<seq> … status=<ok|stall|timeout|hse> ms=<n>`. The same `control` call the
+    /// handshake always made; the line is what tells the next flight which index answered and how fast.
+    unsafe fn tp_mode_req(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        bm_req: u8,
+        b_req: u8,
+        w_index: u16,
+        dir_in: bool,
+    ) -> Result<u32, &'static str> {
+        let t0 = crate::arch::ms();
+        let r = self.control(
+            t, bm_req, b_req, BCM5974_MODE_REQ_VALUE, w_index, BCM5974_MODE_LEN, dir_in,
+        );
+        let ms = crate::arch::ms().saturating_sub(t0);
+        let seq = TP_MODE_REQS.fetch_add(1, Ordering::Relaxed) + 1;
+        if r == Err("timeout") {
+            TP_MODE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        }
+        serial_println!(
+            ":: EHCI-HID: [{}] [tp] mode req={} rt={:#04x}/{:#04x} addr={} if={} widx={} wValue={:#06x} status={} got={}b ms={} ::",
+            self.idx, seq, bm_req, b_req, t.addr, intf, w_index, BCM5974_MODE_REQ_VALUE,
+            match r { Ok(_) => "ok", Err(e) => e }, match r { Ok(n) => n, Err(_) => 0 }, ms
+        );
+        r
     }
 
     /// MT-INVESTIGATION (IVY) — write ONE value into byte 0 of the 8-byte mode feature report and
@@ -19604,3 +19632,30 @@ pub fn service_ehci_hid_pump() {
 /// TRACKPADPANE (rmbp-ledger B412) — the Trackpad pane's gesture stage (speed gain, two-finger scroll, secondary
 /// click, tap to click, three-finger drag), applied after `mt_step` on the vendor route. Tail append.
 pub mod tpgest;
+
+// TPMODE (rmbp-ledger B459) — the mode handshake's per-boot meter and its one witness. Requests and
+// timeouts are counted by `tp_mode_req`; reset at the top of `bcm5974_mode_switch`. Expected shape
+// (index 0 answers, as on flights 24/25): GET, SET, readback GET = 3 requests, 0 timeouts, latched,
+// and the trackpad armed within the PERF-2026-10-06 §F2 bound.
+static TP_MODE_REQS: AtomicU32 = AtomicU32::new(0);
+static TP_MODE_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+static TP_MODE_LATCHED: AtomicU32 = AtomicU32::new(0);
+const TPMODE_ARMED_BOUND_MS: u64 = 2500; // PERF-2026-10-06 §F2 · capture f24/f25 kbd-armed 1.92-2.29 s [ONE-SOURCE: review + capture]
+
+fn tp_mode_reset() {
+    TP_MODE_REQS.store(0, Ordering::Relaxed);
+    TP_MODE_TIMEOUTS.store(0, Ordering::Relaxed);
+    TP_MODE_LATCHED.store(0, Ordering::Relaxed);
+}
+
+fn tpmode_witness(idx: usize, armed_ms: u64) {
+    let reqs = TP_MODE_REQS.load(Ordering::Relaxed);
+    let tos = TP_MODE_TIMEOUTS.load(Ordering::Relaxed);
+    let latched = TP_MODE_LATCHED.load(Ordering::Relaxed) != 0;
+    let pass = tos == 0 && latched && armed_ms <= TPMODE_ARMED_BOUND_MS;
+    serial_println!(
+        ":: TPMODE: requests={} timeouts={} first=index0 latched={} armed_ms={} bound={} (ctl={}; expect requests=3 timeouts=0 latched=yes) -> {} ::",
+        reqs, tos, if latched { "yes" } else { "no" }, armed_ms, TPMODE_ARMED_BOUND_MS, idx,
+        if pass { "PASS" } else { "FAIL" }
+    );
+}
