@@ -16928,7 +16928,7 @@ pub fn run_user_image_argv(
     // has exactly one caller, the shell's `run` verb — so its first window takes focus. Armed here,
     // before `spawn_user_preemptible` below, for the same reason `spawn_user_image_bg_inner` arms
     // before its spawn: the task can reach `SYS_WIN_CREATE` the instant it is runnable.
-    crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1); #[cfg(feature = "wc")] crate::video::toast::note_spawn(mapped.slot); // DIALOG (B395): the slot's glass-launch bit (Quarry's `run <path>` line is the glass's)
+    crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1); let _ = crate::origin::note_spawn(mapped.slot); // DIALOG2 (B404): the slot's explicit ORIGIN (`[spawn] origin=`). DIALOG (B395): the slot's glass-launch bit (Quarry's `run <path>` line is the glass's)
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // SMPBAL-X86: a foreground `run` is load-balanced, not stuck on the caller's core. The caller is
     // `x86_render_service` (the shell runs there since SCHED-X86), so `meter_current_cpu()` put every
@@ -17055,8 +17055,8 @@ fn spawn_user_image_bg_inner(
     // arming, as well as at the grant — it never holds a token to consume, so its exemption does not
     // depend on `slot_is_focus_exempt` alone.
     if !no_autofocus {
-        crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1); #[cfg(feature = "wc")] crate::video::toast::note_spawn(mapped.slot); // DIALOG (B395): the slot's glass-launch bit (a `Program stopped` dialog only for the glass's own launch)
-    }
+        crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1); let _ = crate::origin::note_spawn(mapped.slot); // DIALOG2 (B404): the slot's explicit ORIGIN. DIALOG (B395): the slot's glass-launch bit (a `Program stopped` dialog only for the glass's own launch)
+    } else { let _ = crate::origin::note_spawn(mapped.slot); } // DIALOG2 (B404): the no-autofocus spawn (the desktop app) is stamped too — no scope around it reads `system`
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // SMPBAL-X86: load-balanced placement. See `bg_place_cpu`.
     let cpu = bg_place_cpu();
@@ -25072,7 +25072,7 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
         // by-name delete and `SYS_RENAME` call — so these legs cannot drift from the syscall's, there
         // being no second implementation to drift from. Body parsing and the fail-closed `-EINVAL` on
         // a malformed one are the aarch64 dispatcher's, verb for verb. ⚠ LINE-NEUTRAL fold (B94).
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST => crate::prefs::bus_fulfil(hdr.verb, body, pref_caller_in_session(row), &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal(row), &mut text), // ATTRSURF (B299): the attribute verbs, the SAME body SYS_ATTR_* calls. PREFS (B300): Principia's verbs, fulfilled over the one store; NOTICE: owner = slot + 1 (the wm key)
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "wc")] { crate::video::dialog::bus_fulfil(hdr.verb, row as u64 + 1, body) } #[cfg(not(feature = "wc"))] { EINVAL } } una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST => crate::prefs::bus_fulfil(hdr.verb, body, pref_caller_in_session(row), &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal(row), &mut text), // ATTRSURF (B299): the attribute verbs, the SAME body SYS_ATTR_* calls. PREFS (B300): Principia's verbs, fulfilled over the one store; NOTICE: owner = slot + 1 (the wm key)
         crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL }, #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(row, body, &mut text),
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };

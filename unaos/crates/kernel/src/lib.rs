@@ -298,3 +298,5 @@ pub mod boot;
 pub mod pwwire;
 // LOGINFURN (rmbp-ledger B374, R88): the bare login, the console's boot-text prefill, `tests loginfurn`. Tail statement, so no existing line moves.
 pub mod loginfurn;
+// DIALOG2 (rmbp-ledger B404): the spawn's explicit ORIGIN (glass / door / system). Tail statement, so no existing line moves.
+pub mod origin;
