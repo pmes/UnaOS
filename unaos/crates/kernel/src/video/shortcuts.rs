@@ -56,8 +56,8 @@ const fn s(chord: &'static str, scope: &'static str, action: &'static str, arc: 
 /// The table. Order is display order within a scope; scopes appear in first-use order.
 pub static SHORTCUTS: &[Shortcut] = &[
     s(C_CMD_SLASH, "Desktop", "Keyboard Shortcuts", "SHORTCUTS"),
-    s(C_ALT_TAB, "Desktop", "Next window", "WINCYCLE"),
-    s(C_CMD_TAB, "Desktop", "Next window", "WINCYCLE"),
+    s(C_ALT_TAB, "Desktop", "Next app", "APPSWITCH"),
+    s(C_CMD_TAB, "Desktop", "Next app", "APPSWITCH"),
     s(C_CMD_L, "Desktop", "Lock screen", "SCREENLOCK"),
     s(C_CTRL_ALT_L, "Desktop", "Lock screen", "SCREENLOCK"),
     s(C_CTRL_CMD_Q, "Desktop", "Lock Screen", "APPMENU2"),

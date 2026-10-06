@@ -556,7 +556,7 @@ pub fn ensure_tests() {
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("appres", selftest);
         #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-        crate::video::launcher::ensure_tests(); // LAUNCHER (B417): `tests launcher` rides this registration (no tests.rs line)
+        { crate::video::launcher::ensure_tests(); crate::video::appswitch::ensure_tests(); } // APPSWITCH (B428): `tests appswitch` rides it too. LAUNCHER (B417): `tests launcher` rides this registration (no tests.rs line)
     }
 }
 

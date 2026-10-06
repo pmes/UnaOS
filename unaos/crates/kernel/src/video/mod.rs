@@ -1231,3 +1231,6 @@ pub fn notify(app: &[u8], title: &[u8], line: &[u8], label: &[u8], act: u8, arg:
     #[allow(unreachable_code)]
     false
 }
+// APPSWITCH (B428, MACPARITY row 10): Cmd-Tab cycles apps on one strip of icons. x86 `wc` (the key door and the overlay row are x86's, as LAUNCHER's); at the tail so no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod appswitch;
