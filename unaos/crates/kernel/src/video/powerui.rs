@@ -86,7 +86,14 @@ pub fn battery_lines(reading: Option<crate::video::status::Battery>) -> Vec<Stri
     #[cfg(all(target_arch = "x86_64", feature = "smc"))]
     { let e = crate::drivers::smc::battery::extras(); cycles = e.0; design = e.1; full = e.2; rem = e.3; }
     v.push(format!("Battery: {}%", b.percent));
-    v.push(String::from(if b.charging { "State: charging" } else { "State: discharging" }));
+    let (mw, _) = crate::video::status::dcin(); // BATTLIVE (B492, R103 §1): four states and the power coming in
+    v.push(String::from(match crate::video::status::state_word(&b, mw) { "charging" => "State: charging", "fully-charged" => "State: fully charged", "not-charging" => "State: not charging", _ => "State: discharging" }));
+    match (crate::video::status::plugged(&b, mw), mw) {
+        (true, Some(w)) => v.push(format!("Power: adapter, {}.{} W in", w / 1000, (w % 1000) / 100)),
+        (true, None) => v.push(String::from("Power: adapter")),
+        (false, _) => v.push(String::from("Power: battery")),
+    }
+    if let Some(age) = crate::video::status::held_age() { v.push(format!("Reading held {} s (SMC silent)", age / 1000)); }
     match (b.charging, b.minutes) {
         (true, Some(m)) => v.push(format!("Time to full: {} min", m)),
         (false, _) if b.ma < 0 && rem.is_some() => v.push(format!("Time remaining: {} min", rem.unwrap() as u32 * 60 / (-(b.ma as i32)) as u32)),
@@ -103,7 +110,7 @@ pub fn battery_lines(reading: Option<crate::video::status::Battery>) -> Vec<Stri
 
 /// Fill the panel text from the live model.
 pub fn panel_fill() -> usize {
-    let lines = battery_lines(crate::video::status::reading().map(|(b, _)| b));
+    let lines = battery_lines(crate::video::status::latest().map(|(b, _)| b));
     let n = lines.len();
     *TEXT.lock() = lines;
     n
@@ -111,7 +118,7 @@ pub fn panel_fill() -> usize {
 
 /// The `battery` shell verb: the same lines the panel shows.
 pub fn shell_verb(console: &mut crate::console::Console) {
-    let lines = battery_lines(crate::video::status::reading().map(|(b, _)| b));
+    let lines = battery_lines(crate::video::status::latest().map(|(b, _)| b));
     for l in lines.iter() { console.println(l); }
     serial_println!(":: BATTERY: lines={} first={} ::", lines.len(), lines.first().map(|s| s.as_str()).unwrap_or(""));
 }

@@ -413,6 +413,7 @@ pub fn poll() {
         return; // INSTALLBARE (R86): the bar's status poll is furniture's — nothing polls the SMC under the setter / the login screen
     }
     let now = crate::arch::ms();
+    live_service(now); // BATTLIVE (B492): the battery menu's 1 s sweep while it is open, and `tests battery`'s registration
     let last = LAST_POLL_MS.load(Ordering::Relaxed);
     if last != 0 && now.wrapping_sub(last) < POLL_MS {
         return;
@@ -548,7 +549,7 @@ pub fn reading() -> Option<(Battery, u64)> {
 /// from `strip::compose_all`. The age is consulted (the staleness ceiling is part of *is there an
 /// item*) but never returned: an age in the damage signature would repaint the bar every second.
 pub fn bar_item() -> Option<BarItem> {
-    let (b, _age) = reading()?;
+    let (b, _age) = latest()?; // BATTLIVE (B492): a stale SMC reading is HELD on the bar, never dropped silently
     Some(BarItem { percent: b.percent, charging: b.charging })
 }
 
@@ -894,4 +895,231 @@ pub fn tray_restore(r: (u8, u64, u8, u8)) {
     TRAY_NET.store(r.1, Ordering::Relaxed);
     TRAY_CLOCK.store(r.2, Ordering::Relaxed);
     TRAY_SEEN.store(r.3, Ordering::Relaxed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// BATTLIVE (rmbp-ledger B492, R103 §1) — the battery menu LIVE while it is down; the power coming in; the item HELD
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Flight 26: the menu was filled once at open (`powerui::panel_fill`) from a model swept every 10 s, and its state
+// had two words, so a plugged-in full pack (`SMC-BATT: soc=100% amp=0mA ac=derived:idle`) read "discharging". And
+// BATTGONE: the item left the bar silently when the held reading passed `STALE_MS` (the service pass that sweeps it
+// had gone quiet). Here: while the battery menu is open, the device-service pass sweeps the battery keys and the
+// DC-in keys (`drivers::smc::adapter`) once a second, stores them in this model, rebuilds the menu's rows and bumps
+// the menu's generation (the crystal repaints); the bar reads the same store, so its glyph tracks. A stale SMC
+// reading is HELD (`latest`), and the bar's item-set line (`menubar::strip_items_witness`) says `battery=held`.
+
+/// The live sweep's period while the battery menu is open.
+pub const LIVE_MS: u64 = 1_000;
+static LIVE_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static LIVE_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Whether the menu was open on the previous pass (the first live line of an open carries the raw DC-in bytes).
+static LIVE_WAS_OPEN: AtomicU8 = AtomicU8::new(0);
+/// The DC-in power, mW; `u32::MAX` = never read / no key answered.
+static DCIN_MW: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// 0 = none, 1 = `PDTR`, 2 = `ID0R*VD0R`.
+static DCIN_SRC: AtomicU8 = AtomicU8::new(0);
+
+/// The reading the bar and the menus show: the live one, or a stale SMC reading HELD (its age is the second term).
+/// `None` only when there is no source (or a fixture's reading has aged out).
+pub fn latest() -> Option<(Battery, u64)> {
+    if let Some(r) = reading() {
+        return Some(r);
+    }
+    if VALID.load(Ordering::Relaxed) == 0 || SRC.load(Ordering::Relaxed) != SRC_SMC {
+        return None;
+    }
+    Some((unpack(READING.load(Ordering::Relaxed)), crate::arch::ms().wrapping_sub(AT_MS.load(Ordering::Relaxed))))
+}
+
+/// Is the shown reading HELD (older than [`STALE_MS`])? `Some(age_ms)` when it is.
+pub fn held_age() -> Option<u64> {
+    match latest() {
+        Some((_, age)) if age > STALE_MS => Some(age),
+        _ => None,
+    }
+}
+
+/// The power coming in, mW, and the key it came from (`"PDTR"`, `"ID0R*VD0R"`, `"none"`).
+pub fn dcin() -> (Option<u32>, &'static str) {
+    let mw = DCIN_MW.load(Ordering::Relaxed);
+    let src = match DCIN_SRC.load(Ordering::Relaxed) { 1 => "PDTR", 2 => "ID0R*VD0R", _ => "none" };
+    (if mw == u32::MAX { None } else { Some(mw) }, src)
+}
+
+/// On the adapter? The DC-in reading when a key answered (over 1 W); otherwise derived from the pack's current
+/// (a pack taking no current, or charge, is on the adapter — IVY-AC's derivation).
+pub fn plugged(b: &Battery, mw: Option<u32>) -> bool {
+    match mw {
+        Some(w) => w >= 1_000 || b.charging,
+        None => b.ma > -DEADBAND_MA,
+    }
+}
+
+/// The state word: `charging`, `fully-charged`, `not-charging` (on the adapter, below full), `discharging`.
+pub fn state_word(b: &Battery, mw: Option<u32>) -> &'static str {
+    if b.charging {
+        "charging"
+    } else if plugged(b, mw) && b.percent >= 99 {
+        "fully-charged"
+    } else if plugged(b, mw) {
+        "not-charging"
+    } else {
+        "discharging"
+    }
+}
+
+/// The battery menu is down (the status item's menu, or the battery panel opened from the crystal).
+fn live_open() -> bool {
+    let i = super::statusmenu::open_item();
+    i == ITEM_BATTERY || (i == ITEM_NONE && super::powerui::panel_open())
+}
+
+/// mW as `W.d` (`none` when unknown).
+struct Watts(Option<u32>);
+impl core::fmt::Display for Watts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(mw) => write!(f, "{}.{}", mw / 1000, (mw % 1000) / 100),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// The DC-in sweep (the driver's, x86 + `smc`): stores the reading; returns the raw bytes for the first live line.
+#[cfg(all(target_arch = "x86_64", feature = "smc"))]
+fn dcin_sweep() -> [Option<[u8; 2]>; 3] {
+    let d = crate::drivers::smc::adapter::read();
+    DCIN_MW.store(d.mw.unwrap_or(u32::MAX), Ordering::Relaxed);
+    DCIN_SRC.store(match d.src { "PDTR" => 1, "ID0R*VD0R" => 2, _ => 0 }, Ordering::Relaxed);
+    [d.pdtr, d.id0r, d.vd0r]
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "smc")))]
+fn dcin_sweep() -> [Option<[u8; 2]>; 3] {
+    [None, None, None]
+}
+
+struct RawB(Option<[u8; 2]>);
+impl core::fmt::Display for RawB {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(b) => write!(f, "[{:02x} {:02x}]", b[0], b[1]),
+            None => f.write_str("-"),
+        }
+    }
+}
+
+/// One live sweep: the battery keys, the DC-in keys, stored. `real` = the menu is really down (rebuild its rows and
+/// repaint it); the fixture passes `false`. Returns `true` when it ran.
+fn live_tick(now: u64, real: bool) -> bool {
+    let last = LIVE_LAST_MS.load(Ordering::Relaxed);
+    if real && last != 0 && now.wrapping_sub(last) < LIVE_MS {
+        return false;
+    }
+    if LIVE_LAST_MS.compare_exchange(last, now.max(1), Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return false;
+    }
+    if let Some(b) = board_raw() {
+        store(b, now, SRC_SMC);
+    }
+    let raw = dcin_sweep();
+    LIVE_TICKS.fetch_add(1, Ordering::Relaxed);
+    let (mw, src) = dcin();
+    let first = LIVE_WAS_OPEN.swap(1, Ordering::Relaxed) == 0;
+    match latest() {
+        Some((b, _)) => serial_println!(
+            "[battery] live pct={} state={} watts_in={} src=smc:{}{}",
+            b.percent,
+            state_word(&b, mw),
+            Watts(mw),
+            src,
+            FirstRaw(first, raw),
+        ),
+        None => serial_println!("[battery] live pct=- state=none watts_in={} src=none", Watts(mw)),
+    }
+    if real {
+        let _ = super::powerui::panel_set_lines(super::powerui::battery_lines(latest().map(|(b, _)| b)));
+        super::statusmenu::touch();
+    }
+    true
+}
+
+/// The DC-in keys' raw bytes, on the FIRST live line of an open only (the decode's falsifier — see `smc::adapter`).
+struct FirstRaw(bool, [Option<[u8; 2]>; 3]);
+impl core::fmt::Display for FirstRaw {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if !self.0 {
+            return Ok(());
+        }
+        write!(f, " raw PDTR={} ID0R={} VD0R={}", RawB(self.1[0]), RawB(self.1[1]), RawB(self.1[2]))
+    }
+}
+
+/// Called from [`poll`] on every service pass (behind its services gate): the live sweep while the menu is down,
+/// and `tests battery`'s registration (R80: registered on the desktop pass, never run at boot).
+fn live_service(now: u64) {
+    #[cfg(feature = "witness")]
+    {
+        static REG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !REG.swap(true, Ordering::AcqRel) {
+            crate::tests::register("battery", battery_fixture);
+        }
+    }
+    if !live_open() {
+        LIVE_WAS_OPEN.store(0, Ordering::Relaxed);
+        return;
+    }
+    let _ = live_tick(now, true);
+}
+
+/// `tests battery` — (1) LIVE: a live sweep runs through the real tick (the menu-open condition passed, no panel
+/// written), the menu's rows built from what it stored carry a state and a power row; the state words on
+/// fixed readings (100 % idle = fully charged, charge in = charging, 80 % on 60 W = not charging, current out =
+/// discharging) and the DC-in decode on fixed bytes (`PDTR` 0c 40 = 49 W; nothing = none) are checked; (2)
+/// STRIP_KEPT: an SMC reading aged past `STALE_MS` is still the bar's item (`bar_item`) and reads as held. The
+/// model and the DC-in store are restored.
+#[cfg(feature = "witness")]
+fn battery_fixture() {
+    let saved = snapshot_state();
+    let dc0 = (DCIN_MW.load(Ordering::Relaxed), DCIN_SRC.load(Ordering::Relaxed));
+    let t0 = LIVE_TICKS.load(Ordering::Relaxed);
+    let ran = live_tick(crate::arch::ms(), false);
+    let watts_src = dcin().1;
+    let rows = super::powerui::battery_lines(latest().map(|(b, _)| b));
+    let rows_ok = latest().is_none() || (rows.iter().any(|l| l.starts_with("State: ")) && rows.iter().any(|l| l.starts_with("Power: ")));
+    let ticked = ran && LIVE_TICKS.load(Ordering::Relaxed) > t0;
+    let bat = |percent: u16, charging: bool, ma: i16| Battery { percent, charging, minutes: None, ma, mv: 12_000 };
+    let states_ok = state_word(&bat(100, false, 0), None) == "fully-charged"
+        && state_word(&bat(50, true, 1_200), Some(60_000)) == "charging"
+        && state_word(&bat(80, false, 0), Some(60_000)) == "not-charging"
+        && state_word(&bat(80, false, -900), None) == "discharging"
+        && state_word(&bat(80, false, -900), Some(0)) == "discharging";
+    #[cfg(all(target_arch = "x86_64", feature = "smc"))]
+    let decode_ok = crate::drivers::smc::adapter::decode(Some([0x0c, 0x40]), None, None) == (Some(49_000), "PDTR")
+        && crate::drivers::smc::adapter::decode(None, None, None) == (None, "none")
+        && crate::drivers::smc::adapter::decode(Some([0x7f, 0xff]), None, None).1 == "none";
+    #[cfg(not(all(target_arch = "x86_64", feature = "smc")))]
+    let decode_ok = true;
+    let live_ok = ticked && rows_ok && states_ok && decode_ok;
+    // STRIP_KEPT — an SMC reading older than the staleness ceiling stays on the bar, and says it is held.
+    let now = crate::arch::ms();
+    let kept_ok = if now > STALE_MS + 1_000 {
+        store(bat(64, false, -700), now - STALE_MS - 1_000, SRC_SMC);
+        reading().is_none() && bar_item() == Some(BarItem { percent: 64, charging: false }) && held_age().is_some()
+    } else {
+        false
+    };
+    restore_state(saved);
+    DCIN_MW.store(dc0.0, Ordering::Relaxed);
+    DCIN_SRC.store(dc0.1, Ordering::Relaxed);
+    let ok = live_ok && kept_ok;
+    let w = |b: bool| if b { "ok" } else { "no" };
+    serial_println!(
+        ":: BATTERY: live={} watts_src={} strip_kept={} -> {} ::",
+        w(live_ok), watts_src, w(kept_ok), if ok { "PASS" } else { "FAIL" }
+    );
+    if !live_ok {
+        serial_println!(":: BATTERY: live legs ticked={} rows={} states={} decode={} ::", w(ticked), w(rows_ok), w(states_ok), w(decode_ok));
+    }
 }
