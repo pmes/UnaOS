@@ -384,11 +384,17 @@ pub fn stamp(path: &str) -> bool {
 }
 
 /// Carry `src`'s `una:type` to `dst` (the `cp` leg; `rename` keeps attributes by inode). Copies
-/// `una:preferred` too: a per-file opener choice belongs to the file. Silent when there is nothing to
-/// carry or the destination takes no attributes.
+/// `una:preferred` too WITHIN one volume (a per-file opener choice belongs to the file); across volumes it is
+/// stripped (OPENERTRUST B447). Silent when there is nothing to carry or the destination takes no attributes.
 pub fn carry_in(mt: &MountTable, src: &str, dst: &str) {
     for k in [TYPE_KEY, crate::fs::assoc::PREFERRED_KEY] {
         if let Ok(v) = mt.get_attr(src, k, KERNEL_PRINCIPAL) {
+            // OPENERTRUST (B447): a per-file opener does not cross volumes — a file brought in from a card or another
+            // disk does not bring its own program. An unknown storage identity counts as foreign (`same_storage`).
+            if k == crate::fs::assoc::PREFERRED_KEY && !matches!(mt.same_volume(src, dst), Ok(true)) {
+                serial_println!("[filetype] carry=strip key={} reason=foreign-volume {} -> {}", k, src, dst);
+                continue;
+            }
             match mt.set_attr(dst, k, v, KERNEL_PRINCIPAL) {
                 Ok(()) => serial_println!("[filetype] carry {} {} -> {}", k, src, dst),
                 Err(VfsError::Unsupported) => serial_println!("[filetype] carry=skip reason=enotsup key={} dst={}", k, dst),

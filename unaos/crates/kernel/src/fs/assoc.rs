@@ -110,13 +110,16 @@ pub fn registrants_in(mt: &MountTable, mime: &str) -> Vec<Registrant> {
 }
 
 /// The opener for `path` of type `mime`, and the source that decided: `override` (the file's own
-/// `una:preferred`), `db` (the registry's `una:preferred` for the type), `registrant` (no preference: the first
+/// `una:preferred`, honoured only when it names a REGISTRANT of `mime` — OPENERTRUST B447, else ignored with a line), `db` (the registry's `una:preferred` for the type), `registrant` (no preference: the first
 /// program that declares the type) or `none` (nothing declares it — a video in this tree).
 pub fn opener_for_in(mt: &MountTable, path: &str, mime: &str) -> (String, &'static str) {
     let obj = object_path(mime);
     if path != obj {
         if let Some(v) = str_attr(mt, path, PREFERRED_KEY) {
-            return (appres::opener_of_preferred(mt, &v), "override");
+            match trusted_override_in(mt, &v, mime) {
+                Some(op) => return (op, "override"),
+                None => refused_wire(path, &v, mime),
+            }
         }
     }
     if let Some(v) = str_attr(mt, &obj, PREFERRED_KEY) {
@@ -520,4 +523,31 @@ pub fn selftest() {
         types.len(), preferred, resolved, if pass { "PASS" } else { "FAIL" },
         if attrs { TYPES_DIR } else { "none" }, objects, if attrs { "db" } else { "registrants" }, sticky, amend, openwith, builds()
     );
+}
+
+// ── OPENERTRUST (B447, ARCHREVIEW F3) ────────────────────────────────────────────────────────────────────────────
+//
+// A FILE's `una:preferred` is the document's wish, not the user's act on a PROGRAM: it is honoured only when it
+// names a REGISTRANT of the file's type (a built-in that declares the type, or a ring-3 program APPRES sighted and
+// published in the type object's `una:apps`). Anything else — an absolute path to an arbitrary ELF, an opener id
+// that does not declare the type — is ignored and the type's own default opens the file. Be's PREFERRED_APP named
+// a signature the registrar knew, never a path.
+
+/// The opener a file's `una:preferred` value `v` names, when that opener is a registrant of `mime`; `None` = refused.
+pub fn trusted_override_in(mt: &MountTable, v: &str, mime: &str) -> Option<String> {
+    let op = appres::opener_of_preferred(mt, v);
+    if registrants_in(mt, mime).iter().any(|r| r.opener == op) { Some(op) } else { None }
+}
+
+/// The last path whose override was refused (the resolver runs per row and per frame; one line per file).
+static REFUSED_LAST: spin::Mutex<String> = spin::Mutex::new(String::new());
+
+fn refused_wire(path: &str, v: &str, mime: &str) {
+    let mut last = REFUSED_LAST.lock();
+    if last.as_str() != path {
+        last.clear();
+        last.push_str(path);
+        drop(last);
+        serial_println!("[openers] preferred={} refused=not-a-registrant path={} type={}", v, path, mime);
+    }
 }

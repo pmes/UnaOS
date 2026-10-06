@@ -16,7 +16,7 @@
 //! | `play` | `drivers::hda::play::request_open` (x86 `UNAOS_HDA` + `UNAOS_HDATONE`) |
 //! | `launch` | Quarry's `launch` — `arch::syscall::spawn_user_image_bg`, the seam `bg` takes |
 //! | `linux` | refused from the desktop: the Linux ABI runs a foreground session; the line names `linux <path>` |
-//! | `/a/PROGRAM.BIN` | launch that program, then hand it the file (below) |
+//! | `/a/PROGRAM.BIN` | launch that program, then hand it the file (below) — reached only for a REGISTRANT of the file's type (OPENERTRUST B447: `assoc::opener_for_in` refuses any other path a file's `una:preferred` names) |
 //!
 //! A RING-3 PROGRAM CANNOT BE GIVEN AN ARGV: `quarry.md` §7 item 8 — there is no `SYS_EXEC` with an
 //! argv. So the file path is delivered as one `BUS_VERB_NOTICE` frame in the spawned program's
