@@ -102,8 +102,8 @@ pub fn open(id: &str, path: &str, mime: &str) -> String {
         "play" => {
             #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
             {
-                crate::drivers::hda::play::request_open(path);
-                serial_println!("[quarry] open PLAY path={} type={} -> play (latched for the service tick)", path, mime);
+                crate::video::player::request_open(path); // PLAYER (B419): the window owns the play (was the headless `hda::play::request_open`)
+                serial_println!("[quarry] open PLAY path={} type={} -> player (latched for the render pass)", path, mime);
             }
             #[cfg(not(all(target_arch = "x86_64", feature = "hda-tone")))]
             serial_println!("[quarry] open PLAY path={} -> no audio in this build (UNAOS_HDA+UNAOS_HDATONE arm it)", path);

@@ -50,7 +50,7 @@ impl St {
 }
 static ST: spin::Mutex<St> = spin::Mutex::new(St::new());
 
-struct Wav { path: String, rate: u32, ch: usize, bits: usize, data_off: u64, data_len: u64, pos: u64, chunk: usize, fed_end: bool }
+struct Wav { path: String, rate: u32, ch: usize, bits: usize, data_off: u64, data_len: u64, pos: u64, chunk: usize, fed_end: bool, start: u64 }
 static WAV: spin::Mutex<Option<Wav>> = spin::Mutex::new(None);
 static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
 
@@ -197,7 +197,7 @@ pub fn stop() {
         if s.armed { hw_stop(&mut s); }
         s.armed = false; s.running = false; s.done = true;
     }
-    super::amp::amp_release(super::amp::PLAY); // AUDIO8 (B329): idempotent — a stop with nothing armed still closes the owner bit
+    PAUSED.store(false, Ordering::Release); super::amp::amp_release(super::amp::PLAY); // AUDIO8 (B329): idempotent — a stop with nothing armed still closes the owner bit
     ACTIVE.store(false, Ordering::Release);
     *WAV.lock() = None; *CODED.lock() = None; // after the ST guard drops: wav_pump takes WAV then ST, so never the other order
 }
@@ -227,7 +227,7 @@ fn refill(s: &mut St, i: usize, prefill: bool) {
 }
 
 fn ring_pump(s: &mut St) {
-    if !s.armed || s.done { return; }
+    if !s.armed || s.done || PAUSED.load(Ordering::Acquire) { return; } // PLAYER (B419): a paused stream is left alone (RUN is clear)
     let (b, sd) = (s.base, s.sd);
     if !s.running {
         // AUDIO7 M3: start once a whole ring is queued, OR the producer is done, OR another chunk could not fit.
@@ -295,7 +295,7 @@ fn parse(path: &str) -> Result<Wav, String> {
             let fin = (ch * bits / 8) as u64;
             let frames = (8192 * rate as u64 / 48_000).max(64);
             return Ok(Wav { path: String::from(path), rate, ch: ch as usize, bits: bits as usize, data_off,
-                            data_len: data_len / fin * fin, pos: 0, chunk: (frames * fin) as usize, fed_end: false });
+                            data_len: data_len / fin * fin, pos: 0, chunk: (frames * fin) as usize, fed_end: false, start: 0 });
         }
         off += 8 + len + (len & 1);
     }
@@ -341,7 +341,7 @@ fn report() {
     let Some(w) = w else { return };
     let s = ST.lock();
     let frames = s.in_frames;
-    let want = w.data_len / (w.ch * w.bits / 8) as u64;
+    let want = (w.data_len - w.start) / (w.ch * w.bits / 8) as u64; // PLAYER (B419): a seek starts the stream at `start`
     let ms = frames * 1000 / w.rate as u64;
     let ok = frames == want && s.underruns == 0 && s.err == 0 && s.completed >= 1 && s.lpib_moved && s.done;
     serial_println!("[play] done resampled={} eff_rate={} entries={} fifoe_dese={} run_bit={} lpib_moved={} level={}", s.resampled as u8, s.eff_rate, s.completed, s.err, s.run_bit as u8, s.lpib_moved as u8, s.level);
@@ -702,6 +702,7 @@ fn dec_task(arg: usize) {
     let t0 = crate::arch::ms();
     let mut calls = 0u32;
     let mut waited_ms = 0u64;
+    let mut skip = seek_skip(jid, info.rate); // PLAYER (B419): a seek's decode-skip (0 for every other open)
     loop {
         if !mine() { dec_exit(jid, paint, "aborted"); return; }
         // the bounded queue: decode ahead no further than DEC_QUEUE; a consumer gone for DEC_ORPHAN_MS ends the task
@@ -710,7 +711,7 @@ fn dec_task(arg: usize) {
             dec_beat(STAGE_DMA);
             crate::arch::sched::sleep_ms(2);
             waited_ms += 2;
-            if waited_ms > DEC_ORPHAN_MS { dec_exit(jid, paint, "consumer-gone"); return; }
+            if waited_ms > DEC_ORPHAN_MS && !PAUSED.load(Ordering::Acquire) { dec_exit(jid, paint, "consumer-gone"); return; } // PLAYER (B419): a paused consumer is not gone
             continue;
         }
         waited_ms = 0;
@@ -724,7 +725,8 @@ fn dec_task(arg: usize) {
         // downmix: the first two channels carry, every further one adds half weight to both; scaled so a full
         // scale input cannot clip (Q15) — the arithmetic `coded_pump` ran before MP3HANG, unchanged
         let w0: i64 = if ch <= 2 { 32_768 } else { 65_536 / ch as i64 };
-        for i in 0..n {
+        let s0 = (skip.min(n as u64)) as usize; skip -= s0 as u64; // PLAYER (B419): frames before the seek target are decoded and dropped
+        for i in s0..n {
             let ph = phase; phase = (phase + 1) % step;
             if ph != 0 { continue; }
             let f = &buf[i * ch..i * ch + ch];
@@ -1063,3 +1065,138 @@ fn tq_tick() {
     }
     TQ_IN.store(false, Ordering::Release);
 }
+
+// ── PLAYER (rmbp-ledger B419, MACPARITY row 30) — the transport the Player window drives: pause, seek, position ──────
+// The window is `video/player.rs`; the play stays here. Pause clears the stream's RUN bit (the amp ramped down first)
+// and `ring_pump` leaves a paused stream alone; the decoder waits instead of calling its consumer gone. Seek: a WAV
+// re-arms the stream at the target frame (`method=pcm-exact`); a coded file has NO seek table in audio_core (and
+// `demux_core::Demuxer::seek` is the video container's keyframe seek — audio_core's MP4 does not route through it),
+// so a superseding `play-dec` job decodes from the start and drops the frames before the target (`method=decode-skip
+// table=none`): exact, at the cost of decode time. Design: docs/dev/evidence/rmbp-1005/player.md.
+
+static PAUSED: AtomicBool = AtomicBool::new(false);
+/// The job a seek's skip belongs to (the jid `dec_open` is about to mint) and the target in ms.
+static SEEK_JID: AtomicU32 = AtomicU32::new(0);
+static SEEK_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `play-dec`'s skip for job `jid` at the source `rate`: frames to drop, and the seek line on the wire.
+fn seek_skip(jid: u32, rate: u32) -> u64 {
+    if SEEK_JID.load(Ordering::Acquire) != jid || jid == 0 { return 0; }
+    let ms = SEEK_MS.load(Ordering::Acquire);
+    let frames = ms * rate as u64 / 1000;
+    let landed = if rate == 0 { 0 } else { frames * 1000 / rate as u64 };
+    serial_println!("[play] seek to_ms={} landed_ms={} method=decode-skip table=none frames={} jid={} (audio_core has no seek table)", ms, landed, frames, jid);
+    frames
+}
+
+/// Pause (`on`) or resume the stream. `Some(run_bit readback)` while a stream is armed; `None` when nothing is.
+pub fn pause(on: bool) -> Option<bool> {
+    PAUSED.store(on, Ordering::Release);
+    let mut s = ST.lock();
+    if !s.armed || s.done { return None; }
+    if !s.running {
+        serial_println!("[play] pause on={} run_bit=0 (stream not yet running)", on as u8);
+        return Some(false);
+    }
+    let (b, sd) = (s.base, s.sd);
+    if on {
+        super::amp::ramp_svc(false);
+        w8(b, sd + SD_CTL, r8(b, sd + SD_CTL) & !(SDCTL_RUN as u8));
+        wait_us(10_000, || r8(b, sd + SD_CTL) & SDCTL_RUN as u8 == 0);
+    } else {
+        w8(b, sd + SD_CTL, r8(b, sd + SD_CTL) | SDCTL_RUN as u8);
+        super::amp::ramp_svc(true);
+        s.moved_ms = crate::arch::ms();
+    }
+    let rb = r8(b, sd + SD_CTL) & SDCTL_RUN as u8 != 0;
+    serial_println!("[play] pause on={} run_bit={}", on as u8, rb as u8);
+    Some(rb)
+}
+
+/// Is the stream paused?
+pub fn paused() -> bool { PAUSED.load(Ordering::Acquire) }
+
+/// Is a play in flight (decoder opening, stream armed or draining)?
+pub fn busy() -> bool { ACTIVE.load(Ordering::Acquire) }
+
+/// The stream's RUN bit, read back (false when nothing is armed).
+pub fn run_bit() -> bool {
+    let s = ST.lock();
+    s.armed && !s.done && s.running && r8(s.base, s.sd + SD_CTL) & SDCTL_RUN as u8 != 0
+}
+
+/// Milliseconds the ring has played since this stream's RUN (entries completed + LPIB within the current one).
+pub fn position_ms() -> u64 {
+    let Some(s) = ST.try_lock() else { return u64::MAX };
+    if !s.running { return 0; }
+    let bytes = s.completed * ENTRY_BYTES as u64 + (s.lpib_last as u64 % ENTRY_BYTES as u64);
+    bytes / 4 * 1000 / s.eff_rate.max(1) as u64
+}
+
+/// What the file is, from the player's own parse: a WAV's `(rate, ch, bits, frames)` header facts, or for a coded
+/// file the decoder's `Info` once `play-dec` has opened it (`None` until then, or for another path).
+pub fn facts(path: &str) -> Option<(u32, u16, u16, Option<u64>, &'static str)> {
+    if let Ok(w) = parse(path) {
+        return Some((w.rate, w.ch as u16, w.bits as u16, Some(w.data_len / (w.ch * w.bits / 8) as u64), "pcm"));
+    }
+    let g = DEC_OUT.lock();
+    let o = g.as_ref().filter(|o| o.path == path)?;
+    let i = o.info?;
+    let codec = match i.codec {
+        audio_core::Codec::Pcm => "pcm", audio_core::Codec::Flac => "flac", audio_core::Codec::Opus => "opus",
+        audio_core::Codec::Vorbis => "vorbis", audio_core::Codec::Mp3 => "mp3", audio_core::Codec::Aac => "aac",
+    };
+    Some((i.rate, i.channels, i.bits, i.frames, codec))
+}
+
+/// Seek `path` to `ms`: re-arm the play there. `Ok((landed_ms, method))`. Whatever was playing stops first.
+pub fn seek_to(path: &str, ms: u64) -> Result<(u64, &'static str), String> {
+    if let Ok(mut w) = parse(path) {
+        let fin = (w.ch * w.bits / 8) as u64;
+        let total = w.data_len / fin;
+        let frame = (ms * w.rate as u64 / 1000).min(total);
+        let landed = frame * 1000 / w.rate.max(1) as u64;
+        if DEC_LIVE.load(Ordering::Acquire) { dec_stop(); }
+        let eff = start(w.rate, w.ch as u8, w.bits as u8).map_err(String::from)?;
+        w.pos = frame * fin;
+        w.start = w.pos;
+        serial_println!("[play] seek to_ms={} landed_ms={} method=pcm-exact table=pcm frame={} of {} eff_rate={} path={}", ms, landed, frame, total, eff, path);
+        *WAV.lock() = Some(w);
+        ACTIVE.store(true, Ordering::Release);
+        return Ok((landed, "pcm-exact"));
+    }
+    // coded: supersede the live job (its `mine()` goes false at its next step; its exit leaves the new job's liveness)
+    DEC_LIVE.store(false, Ordering::Release);
+    SEEK_MS.store(ms, Ordering::Release);
+    SEEK_JID.store(DEC_GEN.load(Ordering::Acquire).wrapping_add(1), Ordering::Release);
+    dec_open(path, String::from("seek: not a PCM WAV"))?;
+    Ok((ms, "decode-skip"))
+}
+
+/// The Player's open: whatever plays stops (a live decoder is aborted and superseded, never "busy"), then the
+/// ordinary `open_wav` (WAV pump, else the coded `play-dec` job).
+pub fn open_player(path: &str) -> Result<(), String> {
+    dec_stop();
+    DEC_LIVE.store(false, Ordering::Release);
+    open_wav(path)
+}
+
+/// The Player's close: the stream and any decoder end now.
+pub fn stop_all() {
+    stop();
+    dec_stop();
+}
+
+/// Drive the service tick from a typed fixture until `until()` holds or `ms` pass (`tests player`).
+pub fn pump_until(ms: u64, until: impl Fn() -> bool) -> bool {
+    let t0 = tms();
+    loop {
+        service();
+        if until() { return true; }
+        if tms().saturating_sub(t0) > ms { return false; }
+        delay_us(2_000);
+    }
+}
+
+/// The PLAYWAV fixture's 2.0 s, 48 kHz stereo body (for `tests player` when no TEST.WAV is staged).
+pub fn fixture_wav() -> Vec<u8> { synth_wav() }

@@ -43,6 +43,7 @@ const BUILTIN: &[(&str, &[u8])] = &[
     ("console", include_bytes!("../../../../res/console/console.unares")),
     ("shell", include_bytes!("../../../../res/shell/shell.unares")),
     ("facet", include_bytes!("../../../../res/facet/facet.unares")),
+    ("player", include_bytes!("../../../../res/player/player.unares")), // PLAYER (B419): the audio player window
 ];
 /// The icon a program without a block is drawn with.
 const GENERIC: &[u8] = include_bytes!("../../../../res/generic/generic.unares");

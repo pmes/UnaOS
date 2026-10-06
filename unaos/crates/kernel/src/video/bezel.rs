@@ -31,6 +31,9 @@ pub const K_NONE: u8 = 0;
 pub const K_BRIGHT: u8 = 1;
 pub const K_VOL: u8 = 2;
 pub const K_MUTE: u8 = 3;
+/// PLAYER (B419): F8 on the open player — the state it landed on (no level bar).
+pub const K_PLAY: u8 = 4;
+pub const K_PAUSE: u8 = 5;
 
 // Logical geometry (the Mac's bezel is ~200 pt square).
 const W: usize = 200;
@@ -82,6 +85,8 @@ fn kind_name(k: u8) -> &'static str {
         K_BRIGHT => "brightness",
         K_VOL => "volume",
         K_MUTE => "mute",
+        K_PLAY => "play",
+        K_PAUSE => "pause",
         _ => "none",
     }
 }
@@ -119,6 +124,10 @@ pub fn service() {
     let Some(_g) = GATE.try_lock() else { return };
     let k = ARMED.swap(K_NONE, Ordering::AcqRel);
     let now = crate::arch::ms();
+    if k == K_PLAY || k == K_PAUSE {
+        show(k, 0, "player", now);
+        return;
+    }
     if k != K_NONE {
         let (lv, muted, src) = live(k);
         let kind = if k != K_BRIGHT && muted { K_MUTE } else if k == K_MUTE { K_VOL } else { k };
@@ -249,7 +258,18 @@ fn paint(kind: u8, lv: u8) {
                 }
             }
         }
+        K_PLAY => {
+            // the play wedge, pointing right
+            p.shape(76, 50, 132, 110, INK, move |x, y| { let dx = x - 78 * U; dx >= 0 && (y - cy).abs() * 52 <= 30 * (52 * U - dx) });
+        }
+        K_PAUSE => {
+            p.shape(78, 54, 94, 106, INK, |_, _| true);
+            p.shape(106, 54, 122, 106, INK, |_, _| true);
+        }
         _ => {}
+    }
+    if kind == K_PLAY || kind == K_PAUSE {
+        return; // no level bar for the transport glyphs
     }
     // The level bar: 16 segments, lit to `lv` (mute lights none).
     let lit = if kind == K_MUTE { 0 } else { lv.min(SEGS) as usize };
@@ -357,4 +377,9 @@ pub fn fixture() {
         w(b_ok), w(v_ok), w(m_ok), if fade_ok { BEZEL_MS } else { 0 }, if shared { "shared" } else { "split" },
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+/// PLAYER (B419): F8 toggled the open player; show what it landed on. Atomics only.
+pub fn arm_transport(playing: bool) {
+    arm(if playing { K_PLAY } else { K_PAUSE });
 }

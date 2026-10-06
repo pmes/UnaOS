@@ -1218,3 +1218,6 @@ pub mod appearance;
 // LAUNCHER (B417, MACPARITY row 36): Cmd-Space — one field over programs, files, settings and math. x86 `wc` (the overlay row and the key door are x86's); at the tail so no line above moves.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod launcher;
+// PLAYER (B419, MACPARITY row 30): the audio player window Quarry's `play` opener opens (transport, scrubber, volume). Same gate as fileview; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod player;

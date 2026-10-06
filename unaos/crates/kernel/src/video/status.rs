@@ -641,6 +641,10 @@ pub fn volume() -> (u8, bool) {
 /// Decoder seam: a key usage that just went DOWN. Returns `Some((key, amp_written))` when it was a
 /// volume key (0 up / 1 down / 2 mute). Runs in the polled HID service, never an interrupt.
 pub fn volkey_usage(usage: u8) -> Option<(u8, bool)> {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    if (0x40..=0x42).contains(&usage) {
+        crate::video::player::media_key(usage - 0x40); // PLAYER (B419): F7/F8/F9 = previous / play-pause / next, latched for the open player
+    }
     let key = match usage {
         0x45 => 0u8,
         0x44 => 1,

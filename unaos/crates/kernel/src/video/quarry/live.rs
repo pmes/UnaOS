@@ -2176,7 +2176,7 @@ pub fn close() {
 pub fn key_route(ev: crate::pal::Event) -> bool {
     // FILEVIEW — the text viewer's arrows / wheel / paging, asked first; it consumes only while ITS
     // window holds focus, so a closed viewer changes nothing below.
-    if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) || crate::flightring::console_route(ev) {
+    if crate::video::fileview::key_route(ev) || crate::video::player::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) || crate::flightring::console_route(ev) {
         return true;
     }
     #[cfg(feature = "facet")]
@@ -2405,7 +2405,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         return true;
     }
     // FILEVIEW — the text viewer's close box / raise, chained here for FACET's reason.
-    if crate::video::fileview::press_route(x, y) || crate::video::settings::press_route(x, y) {
+    if crate::video::fileview::press_route(x, y) || crate::video::player::press_route(x, y) || crate::video::settings::press_route(x, y) {
         return true;
     }
     // TEXTEDIT — the editor's close box / caret placement / raise.
@@ -2885,7 +2885,7 @@ pub fn service() {
     #[cfg(feature = "facet")]
     crate::video::facet::service();
     // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
-    crate::video::fileview::service(); crate::video::settings::service(); crate::video::text::service(); crate::video::metrics::ignite(); // UIMETRICS (B372): the furniture's runtime asserts on the latched metrics + `[ui] metrics`, once, on the first desktop service pass
+    crate::video::fileview::service(); crate::video::player::service(); crate::video::settings::service(); crate::video::text::service(); crate::video::metrics::ignite(); // UIMETRICS (B372): the furniture's runtime asserts on the latched metrics + `[ui] metrics`, once, on the first desktop service pass
     // TEXTEDIT — the editor's latch drains on the same pass.
     crate::video::textedit::service();
     // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.
