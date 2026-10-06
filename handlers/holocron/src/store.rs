@@ -22,15 +22,16 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// The ring file's name inside the root.
-pub const RING_FILE: &str = ".ring";
+/// The ring file's name inside the root (`holocron_core::root::RING`).
+pub const RING_FILE: &str = holocron_core::root::RING;
 
-/// The default root: `$HOLOCRON_HOME`, else `$HOME/.holocron`.
+/// The default root: `$HOLOCRON_HOME`, else `$HOME/.holocron` — THE root `holocron_core::root` names for both
+/// rings (HOLOCRONROOT, B448).
 pub fn default_root() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("HOLOCRON_HOME") {
         return Some(PathBuf::from(p));
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".holocron"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(holocron_core::root::DIR))
 }
 
 /// The effective uid of this process (the owner of `/proc/self`), without libc.

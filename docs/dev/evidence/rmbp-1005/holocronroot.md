@@ -37,3 +37,12 @@ directory listing (`root::namespaces`), filtered by `name::valid` — this carri
 ## Owed
 - the `dotfile | .holocron | B448` row in `unaos/scripts/charter.registry` (seat-held).
 - `fs/holocron.rs` (`/HCRON/BTBOND.DAT`, FAT, BT-BOND M1) is a third, non-home store — BTKEYSEAL (B446)'s.
+
+## Result
+- M1 `holocron_core::root` + `Store::remove_ring` + tests/root.rs (6 tests); M2 keyring.rs, HOLOCRON.ELF, host
+  store/unafs_store read it; M3 SECURITY.md.
+- Legs: `cargo test -p holocron_core` 0, `cargo test -p holocron` 0, HOLOCRON.ELF x86 build 0, x86 kernel (the seat's
+  metal line) 0, aarch64 `login,loginst,virt_el0,lumen,desktop_firmware,quarry,facet,usbnet` 0 (tegra leg: keyring
+  is not compiled without `lumen`). charter-check 0.
+- BTKEYSEAL (B446, exec-rmbp-btkeyseal M1) seals `bt/<addr12>` through HOLOCRON.ELF's bus verbs, so its records land
+  in whatever root HOLOCRON.ELF opens; the migration moves every valid namespace (`bt` included, tested).

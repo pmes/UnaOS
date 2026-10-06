@@ -16,7 +16,7 @@
 //!    hold. The blocks come from the kernel heap FALLIBLY (`-ENOMEM`, never a panic) and are zeroed before
 //!    they go back.
 //! 2. [`after_login`] — the login path's launch: when the user's ring file exists
-//!    (`<home>/.config/unaos/holocron/.ring`) and `/apps/HOLOCRON.ELF` is staged, the fulfiller starts in
+//!    (`<home>/.holocron/.ring`, `holocron_core::root`; a legacy root counts — B448) and `/apps/HOLOCRON.ELF` is staged, the fulfiller starts in
 //!    the new session (locked; `holocron unlock <pw>` opens it). The session's end ends it (SECLOGIN).
 //! 3. [`selftest`] — `tests holocron`: `holocron_core`'s service on a RAM ring (the production suite,
 //!    floor parameters): put/get round trip, a second principal DENIED before its body is decoded, a
@@ -56,9 +56,24 @@ pub fn kdf(req: &[u8]) -> Result<[u8; 32], i64> {
     }
 }
 
-/// The ring file's path under `home` (no trailing slash).
+/// The ring file's path under `home`: THE root, named once in `holocron_core::root` (HOLOCRONROOT, B448 —
+/// this file used to spell `<home>/.config/unaos/holocron` while the host used `<home>/.holocron`).
 fn ring_path(home: &str) -> String {
-    alloc::format!("{}/.config/unaos/holocron/.ring", home.trim_end_matches('/'))
+    holocron_core::root::ring_path(home)
+}
+
+/// Where `home`'s ring is: `".holocron"` (THE root), `"legacy"` (only under a `holocron_core::root::LEGACY`
+/// root — HOLOCRON.ELF moves it on its next start), or `"none"`.
+fn ring_root(home: &str) -> &'static str {
+    let mt = crate::shell::vfs_mount_table();
+    let has = |p: &str| matches!(mt.stat(p), Ok(st) if st.id.is_some());
+    if has(&ring_path(home)) {
+        return holocron_core::root::DIR;
+    }
+    if holocron_core::root::legacy_roots(home).iter().any(|r| has(&alloc::format!("{}/{}", r, holocron_core::root::RING))) {
+        return "legacy";
+    }
+    "none"
 }
 
 /// `(name, uid, home)` of the open session.
@@ -77,13 +92,10 @@ fn session() -> Option<(String, u32, String)> {
     None
 }
 
-/// `"unafs"` when `home` holds a ring file on a volume with inode ids (UnaFS), else `"none"`.
+/// `"unafs"` when `home` holds a ring file on a volume with inode ids (UnaFS) — at THE root or a legacy one,
+/// so the fulfiller starts and moves a legacy ring (B448) — else `"none"`.
 fn ring_state(home: &str) -> &'static str {
-    let mt = crate::shell::vfs_mount_table();
-    match mt.stat(&ring_path(home)) {
-        Ok(st) if st.id.is_some() => "unafs",
-        _ => "none",
-    }
+    if ring_root(home) == "none" { "none" } else { "unafs" }
 }
 
 /// The login path's launch (called by `fs::users::login` once the session is open).
@@ -131,9 +143,9 @@ pub fn selftest() {
     use holocron_core::service::{Holocron, MemStore};
     use holocron_core::wire::{status, Request};
 
-    let (owner, ring) = match session() {
-        Some((n, uid, home)) => (holocron_core::wire::user_principal(&n, uid), ring_state(&home)),
-        None => (String::from("user:fixture#1000"), "none"),
+    let (owner, ring, root) = match session() {
+        Some((n, uid, home)) => (holocron_core::wire::user_principal(&n, uid), ring_state(&home), ring_root(&home)),
+        None => (String::from("user:fixture#1000"), "none", "none"),
     };
     let verbs = holocron_verbs_live();
     let Ok(rng) = DrbgEntropy::new(crate::rand::KernelEntropy, b"holocron2 tests holocron") else {
@@ -177,7 +189,7 @@ pub fn selftest() {
     let pass = created == status::OK && put == status::OK && get_ok && denied == 1 && corrupt == 1 && lock == status::OK && after == status::LOCKED;
     let user = owner.strip_prefix("user:").unwrap_or(&owner);
     serial_println!(
-        ":: HOLOCRON: ring={} verbs={} owner={} put={} get={} denied={} corrupt={} -> {} ::",
-        ring, verbs, user, ok(put), if get_ok { "ok" } else { "FAIL" }, denied, corrupt, if pass { "PASS" } else { "FAIL" }
+        ":: HOLOCRON: ring={} root={} verbs={} owner={} put={} get={} denied={} corrupt={} -> {} ::",
+        ring, root, verbs, user, ok(put), if get_ok { "ok" } else { "FAIL" }, denied, corrupt, if pass { "PASS" } else { "FAIL" }
     );
 }
