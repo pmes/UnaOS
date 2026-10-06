@@ -3043,6 +3043,6 @@ fn unafsx86_witness(src: BlockSource, native_root: bool) {
         blocks,
         generation,
         if native_root { "/home" } else { "/HOME" },
-        if native_root { "PASS" } else { "SKIP" }
+        if native_root { "mounted" } else { "skipped reason=fat-root" }
     );
 }

@@ -19413,20 +19413,20 @@ impl Controller {
         let addr = t.addr;
         // SET_CONFIGURATION 1 (the vendor configuration of the part).
         if self.control(t, 0x00, 0x09, 1, 0, 0, false).is_err() {
-            serial_println!(":: USBNET-EHCI: addr={} stage=SET_CONFIGURATION -> FAIL ::", addr);
+            serial_println!(":: USBNET-EHCI: addr={} stage=SET_CONFIGURATION -> declined ::", addr);
             return;
         }
         let mut x = EhciAx { c: self, t: *t };
         let mac = match ax_xport::identity(&mut x) {
             Ok(m) => m,
             Err(stage) => {
-                serial_println!(":: USBNET-EHCI: addr={} stage={} -> FAIL ::", addr, stage);
+                serial_println!(":: USBNET-EHCI: addr={} stage={} -> declined ::", addr, stage);
                 return;
             }
         };
         let up = ax_xport::link(&mut x).map(|(u, _)| u).unwrap_or(false);
         serial_println!(
-            ":: USBNET-EHCI: addr={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} -> PASS ::",
+            ":: USBNET-EHCI: addr={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} -> armed ::",
             addr, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], if up { "up" } else { "down" }
         );
         crate::bootlog_println!(":: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::");

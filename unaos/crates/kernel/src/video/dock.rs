@@ -3408,7 +3408,7 @@ fn dp_witness(why: &str) {
     let ok = saved >= 0 && shown == pinned; // WINDOWCAP-2: no full strip — a pin is always in the model
     serial_println!("[dock] dockpin {}", why);
     let (left, minz) = (rows[..n].iter().filter(|r| dock2_group(r) == 0).count(), rows[..n].iter().filter(|r| dock2_group(r) == 1).count());
-    serial_println!(":: DOCKPIN: left={} minimized={} pinned={} running={} loaded={} saved={} -> {} ::", left, minz, pinned, running, DP_LOADED.load(Ordering::Relaxed), saved, if ok { "PASS" } else { "FAIL" });
+    serial_println!(":: DOCKPIN: left={} minimized={} pinned={} running={} loaded={} saved={} -> {} ::", left, minz, pinned, running, DP_LOADED.load(Ordering::Relaxed), saved, if ok { "held" } else { "short" });
 }
 
 /// The service pass (called from `desktop_app_service`, never from a click path): drain an owed load

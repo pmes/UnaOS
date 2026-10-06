@@ -235,6 +235,6 @@ pub fn witness() {
         proc_limit(),
         MEM_MIB.load(Relaxed),
         refused,
-        if limit >= 11 && refused == 0 { "PASS" } else { "FAIL" }
+        if limit >= 11 && refused == 0 { "armed" } else { "declined" }
     );
 }

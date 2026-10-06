@@ -395,7 +395,7 @@ pub fn set_up(slot: u8, filter_ok: bool, failed_at: Option<&'static str>) {
         None => {
             STATE.store(ST_UP, Ordering::Relaxed);
             serial_println!(
-                ":: USBNET: up kind={} slot={} cfg={} ctrl={} data={} alt={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} filter={} -> PASS ::",
+                ":: USBNET: up kind={} slot={} cfg={} ctrl={} data={} alt={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} filter={} -> armed ::",
                 kind_name(), slot, CFG_VALUE.load(Ordering::Relaxed), CTRL_IFACE.load(Ordering::Relaxed),
                 DATA_IFACE.load(Ordering::Relaxed), DATA_ALT.load(Ordering::Relaxed),
                 m[0], m[1], m[2], m[3], m[4], m[5], if filter_ok { "ok" } else { "refused" }
@@ -405,8 +405,8 @@ pub fn set_up(slot: u8, filter_ok: bool, failed_at: Option<&'static str>) {
         }
         Some(why) => {
             STATE.store(ST_FAILED, Ordering::Relaxed);
-            serial_println!(":: USBNET: bring-up kind={} slot={} refused at {} -> FAIL ::", kind_name(), slot, why);
-            serial_println!(":: USBNET: bus=xhci slot={} mac=00:00:00:00:00:00 link=down speed=0 usb=? rx=0 tx=0 refused={} -> FAIL ::", slot, why);
+            serial_println!(":: USBNET: bring-up kind={} slot={} refused at {} -> declined ::", kind_name(), slot, why);
+            serial_println!(":: USBNET: bus=xhci slot={} mac=00:00:00:00:00:00 link=down speed=0 usb=? rx=0 tx=0 refused={} -> declined ::", slot, why);
         }
     }
 }

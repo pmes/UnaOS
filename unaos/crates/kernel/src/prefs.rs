@@ -279,7 +279,7 @@ fn witness(ok: bool) {
     }
     serial_println!(
         ":: PREFS: path={} domains={} loaded={} saved={} ns={} -> {} ::",
-        path(), ON_DISK.lock().len(), LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed), NS, if ok { "PASS" } else { "FAIL" }
+        path(), ON_DISK.lock().len(), LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed), NS, if ok { "loaded" } else { "refused" }
     );
 }
 

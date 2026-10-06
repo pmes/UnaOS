@@ -780,7 +780,7 @@ fn bring_up_port(abar: u64, port: u8, cap: u32, next_ix: usize) -> Option<usize>
 
     // ── IDENTIFY DEVICE ─────────────────────────────────────────────────────────────────────────
     if issue(&p, ATA_IDENTIFY_DEVICE, 0, 0, SECTOR_BYTES, false).is_err() {
-        serial_println!(":: AHCI: selfcheck port={} identify=bad sector0=none -> FAIL ::", port);
+        serial_println!(":: AHCI: selfcheck port={} identify=bad sector0=none -> declined reason=identify ::", port);
         return None;
     }
     let mut idbuf = [0u8; SECTOR_BYTES];
@@ -827,7 +827,7 @@ fn bring_up_port(abar: u64, port: u8, cap: u32, next_ix: usize) -> Option<usize>
         port,
         if identify_ok { "ok" } else { "bad" },
         kind,
-        if identify_ok && kind != "none" { "PASS" } else { "FAIL" }
+        if !identify_ok { "declined reason=identify" } else if kind == "none" { "armed sector0=unread" } else { "armed" }
     );
 
     if identify_ok { Some(next_ix) } else { None }
