@@ -963,7 +963,7 @@ pub fn desktop_app_service() {
 /// The probe surface for [`move_vacate_probe`] — one flat colour, chosen to be nothing else on the
 /// panel: not [`wm::DESKTOP_BG`], not the chrome, not any bar the desktop app draws.
 #[cfg(feature = "witness")]
-const PROBE_COL: u32 = 0x00FF_00FF;
+const PROBE_COL: u32 = crate::video::theme::fixture::MAGENTA;
 #[cfg(feature = "witness")]
 #[repr(align(4))]
 struct ProbeSurface([u32; 64]);

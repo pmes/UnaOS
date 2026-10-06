@@ -964,9 +964,9 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
 
     // The whole-row base: keyline on the top and bottom border rows, menu face elsewhere.
     let base = if j < BORDER || j + 1 > h - BORDER {
-        theme::FRAME_LINE
+        theme::frame_line()
     } else {
-        theme::CHROME_FACE
+        theme::chrome_face()
     };
     for i in 0..w {
         out[i] = base;
@@ -974,7 +974,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
     // The two side borders, on every row.
     for i in 0..w {
         if i < BORDER || i + BORDER >= w {
-            out[i] = theme::FRAME_LINE;
+            out[i] = theme::frame_line();
         }
     }
     if j < BORDER || j + 1 > h - BORDER {
@@ -987,7 +987,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
         if sy >= (ITEM_H() - CELL_H()) / 2 && sy < (ITEM_H() - CELL_H()) / 2 + CELL_H() {
             let mut buf = [0u8; 48];
             let n = super::powerui::panel_line(li, &mut buf);
-            super::text::draw_row(out, w, &buf[..n], BORDER + PADX(), sy - (ITEM_H() - CELL_H()) / 2, theme::TITLE_TEXT_ACTIVE, false, FACE);
+            super::text::draw_row(out, w, &buf[..n], BORDER + PADX(), sy - (ITEM_H() - CELL_H()) / 2, theme::title_text_active(), false, FACE);
         }
         return;
     }
@@ -1001,7 +1001,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
         None => {
             if j == top + SEP_H() / 2 {
                 for i in (BORDER + PADX())..(w - BORDER - PADX()) {
-                    out[i] = theme::FRAME_LINE;
+                    out[i] = theme::frame_line();
                 }
             }
         }
@@ -1017,7 +1017,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
             // painted (RAM scratch — the blend's read is cached). Regular weight: menu items are
             // body text, not a caption.
             let label = match ROWS[row].verb { Some(Verb::Restart) => super::powerui::armed_label(1), Some(Verb::ShutDown) => super::powerui::armed_label(2), _ => None }.unwrap_or(ROWS[row].label).as_bytes(); // POWERMENU M1: the armed row re-reads
-            super::text::draw_row(out, w, label, BORDER + PADX(), sy, theme::TITLE_TEXT_ACTIVE, false, FACE);
+            super::text::draw_row(out, w, label, BORDER + PADX(), sy, theme::title_text_active(), false, FACE);
         }
     }
 }
@@ -1418,7 +1418,7 @@ pub fn power_panel_selftest() -> bool {
         open_battery_panel(pw, ph);
         let rect = menu_rect(pw, ph);
         let mut row = [0u32; 512];
-        let drew = rect.map(|r| { let mut any = false; if r.2 <= row.len() { compose_row(&mut row, r, BORDER + (ITEM_H() - CELL_H()) / 2 + CELL_H() / 2); any = row[BORDER + PADX()..r.2 - BORDER].iter().any(|&c| c != theme::CHROME_FACE); } any }).unwrap_or(false);
+        let drew = rect.map(|r| { let mut any = false; if r.2 <= row.len() { compose_row(&mut row, r, BORDER + (ITEM_H() - CELL_H()) / 2 + CELL_H() / 2); any = row[BORDER + PADX()..r.2 - BORDER].iter().any(|&c| c != theme::chrome_face()); } any }).unwrap_or(false);
         ok = ok && OPEN.load(Ordering::Relaxed) && super::powerui::panel_open() && rect.is_some() && drew;
         dismiss("fixture");
         ok = ok && !OPEN.load(Ordering::Relaxed) && !super::powerui::panel_open();

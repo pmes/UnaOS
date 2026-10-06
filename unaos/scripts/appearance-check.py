@@ -6,7 +6,8 @@
 # literals are stripped first. A COLOUR LITERAL is a hex literal whose digits (underscores dropped) are
 # six, or eight with a top byte of 00 or FF (0x00RRGGBB / 0xFFRRGGBB — the packed pixel forms the
 # compositor and the surfaces carry). A BIT MASK is not a colour: a literal whose every nibble is 0 or F
-# written as an operand of `&`, `|` or `^` (the alpha bit, the RGB mask). Everything else counts.
+# written as an operand of `|` (the alpha bit), or any operand of `&` / `^` (a channel mask). A literal
+# 0xFFFF_xxxx is a sentinel, not a pixel. Everything else counts.
 # The count must equal `theme::AUDIT_LITERALS_OUTSIDE` (0), which the kernel's `tests appearance`
 # witness prints as `literals_outside_theme=` — the committed constant is certified here, the way
 # PREFS-SCHEMA.md is certified by prefs_core's schema gate.
@@ -61,31 +62,37 @@ def strip(src):
     return ''.join(out)
 
 def is_colour(lit):
-    d = lit[2:].replace('_', '')
+    d = lit[2:].replace('_', '').upper()
     if len(d) == 6:
         return True
-    return len(d) == 8 and d[:2].upper() in ('00', 'FF')
+    # 0xFFFF_xxxx is a sentinel / an all-ones word, never a packed pixel the glass paints.
+    return len(d) == 8 and d[:2] in ('00', 'FF') and not d.startswith('FFFF')
 
-def is_mask_use(line, s, e, lit):
+def is_mask_use(text, s, e, lit):
+    """An operand of `&` / `^` is a mask; an operand of `|` is one when every nibble is 0 or F (the alpha bit)."""
     d = lit[2:].replace('_', '').upper()
-    if any(ch not in '0F' for ch in d):
-        return False
-    before = line[:s].rstrip()
-    after = line[e:].lstrip()
-    return before.endswith(('&', '|', '^', '&=', '|=')) or after.startswith(('&', '|', '^'))
+    before = text[:s].rstrip()
+    after = text[e:].lstrip()
+    if before.endswith(('&', '^', '&=', '^=')) or after.startswith(('&', '^')):
+        return not after.startswith('&&') and not before.endswith('&&')
+    if all(ch in '0F' for ch in d):
+        return before.endswith(('|', '|=')) or (after.startswith('|') and not after.startswith('||'))
+    return False
 
 def scan_text(text):
     hits = []
-    for ln, line in enumerate(strip(text).split('\n'), 1):
-        for m in HEX.finditer(line):
-            lit = m.group(0)
-            if is_colour(lit) and not is_mask_use(line, m.start(), m.end(), lit):
-                hits.append((ln, lit))
+    t = strip(text)
+    for m in HEX.finditer(t):
+        lit = m.group(0)
+        if is_colour(lit) and not is_mask_use(t, m.start(), m.end(), lit):
+            hits.append((t.count('\n', 0, m.start()) + 1, lit))
     return hits
 
 def probes():
     ok = len(scan_text('fn f() { fill(px, 0x0012_3456); }')) == 1
     ok &= len(scan_text('let v = p & 0x00FF_FFFF;')) == 0
+    ok &= len(scan_text('let p = 0xFF00_0000\n    | r;')) == 0
+    ok &= len(scan_text('let p = px.unwrap_or(0xFF00_0000);')) == 1
     ok &= len(scan_text('// 0x0012_3456\nlet s = "0x00AB_CDEF";')) == 0
     return ok
 

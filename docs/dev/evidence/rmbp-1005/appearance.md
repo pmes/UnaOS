@@ -5,11 +5,15 @@
 **Finding.** `video/theme.rs` carries ONE palette (crispy, 25 roles) as `pub const`s read at 645 sites; a `const`
 cannot change at run time, so no dark set or accent is possible without a token read. The audit
 (`unaos/scripts/appearance-check.py`, comments and strings stripped; a colour = a six-digit hex literal or an
-eight-digit one with top byte 00/FF, not an all-0/F mask on `&`/`|`/`^`) counts **before: 107 colour literals in
-23 files under `video/` outside theme.rs** (activity 3, ceramic 12, cursor 2, desktop_uefi 1, dock 12, facet 9,
-facet_anim 5, fbcon 4, fileview 3, knurl 15, mod 1, paper 17, pulsewin 3, quarry/ops 1, screen 1, shotsel 2,
-text 2, vperf 1, wcf 2, winmenu 1, winsnap 2, witness 2, wm 6; three of them are sentinels, not colours, and the
-rule is tightened to drop 0xFFFF_xxxx). No `system.appearance.*` key exists; no Settings pane names appearance.
+eight-digit one with top byte 00/FF, not an all-0/F mask on `&`/`|`/`^`) counts **before: 103 colour literals in
+21 files under `video/` outside theme.rs** (activity 3, ceramic 12, cursor 2, desktop_uefi 1, dock 12, facet 8,
+facet_anim 6, fbcon 4, fileview 3, knurl 15, mod 1, paper 17, pulsewin 3, quarry/ops 1, shotsel 1, text 2, wcf 2,
+winmenu 1, winsnap 2, witness 2, wm 5). **After: 0** (`appearance-check: literals_outside_theme=0 files=0
+certified=0`): 32 live tokens (`theme::Tok`), 16 same-in-both consts (console, pointer, Pulse, Facet's media
+ground, desktop/panel backdrop), and the selftest vectors as `theme::fixture` (goldens of ceramic/knurl/paper,
+synthetic window surfaces). 379 role reads in 24 files became token calls (`theme::CHROME_FACE` →
+`theme::chrome_face()`); the material selftests (ceramic, knurl, paper) keep the kit consts on purpose.
+No `system.appearance.*` key exists; no Settings pane names appearance.
 
 **The seams (R79).**
 - THE PREFERENCE is Principia's: `system.appearance.mode` (light / dark / auto), `system.appearance.accent`

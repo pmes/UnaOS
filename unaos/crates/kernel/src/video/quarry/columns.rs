@@ -532,8 +532,8 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
     let size_x = c.cols.first().map(|t| t.1).unwrap_or(clip);
 
     // Header — outside the scrolled band by construction, so a scrolled list never loses its columns.
-    fill(px, g, li.x, li.y, li.w, row_h, theme::CHROME_FACE);
-    fill(px, g, li.x, li.y + row_h - 1, li.w, 1, theme::FRAME_LINE);
+    fill(px, g, li.x, li.y, li.w, row_h, theme::chrome_face());
+    fill(px, g, li.x, li.y + row_h - 1, li.w, 1, theme::frame_line());
     let chev = if st.desc { " v" } else { " ^" };
     let label = |col: Col| -> Vec<u8> {
         let mut s = Vec::from(col.label().as_bytes());
@@ -542,13 +542,13 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
         }
         s
     };
-    text(px, g, c.name_x, li.y + g.ts, &label(Col::Name), size_x.min(clip), theme::TITLE_TEXT_INACTIVE);
+    text(px, g, c.name_x, li.y + g.ts, &label(Col::Name), size_x.min(clip), theme::title_text_inactive());
     for (i, &(col, x, _)) in c.cols.iter().enumerate() {
-        text(px, g, x, li.y + g.ts, &label(col), next_x(i), theme::TITLE_TEXT_INACTIVE);
+        text(px, g, x, li.y + g.ts, &label(col), next_x(i), theme::title_text_inactive());
     }
     let body_y = li.y + row_h;
     if let Some(e) = &m.err {
-        text(px, g, c.name_x, body_y + g.ts, e.as_bytes(), clip, theme::CONTROL_CLOSE);
+        text(px, g, c.name_x, body_y + g.ts, e.as_bytes(), clip, theme::control_close());
         return body_y;
     }
     for r in 0..lvis {
@@ -561,10 +561,10 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
         let y = body_y + r * row_h;
         let sel = i == m.list_sel;
         if sel {
-            let col = if m.focus == super::Pane::List { theme::ACCENT } else { theme::SCROLL_THUMB };
+            let col = if m.focus == super::Pane::List { theme::accent() } else { theme::scroll_thumb() };
             fill(px, g, li.x, y, li.w - lsb, row_h, col);
         }
-        let ink = if sel && m.focus == super::Pane::List { theme::CHROME_FACE } else { theme::CONTENT_TEXT };
+        let ink = if sel && m.focus == super::Pane::List { theme::chrome_face() } else { theme::content_text() };
         let dir = matches!(ent.kind, NodeKind::Dir);
         let mut nm: Vec<u8> = Vec::new();
         nm.extend_from_slice(ent.name.as_bytes());

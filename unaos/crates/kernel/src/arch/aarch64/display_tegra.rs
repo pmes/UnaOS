@@ -600,12 +600,12 @@ fn orin_chrome_probe(
     let mx = ox + ow / 2; // mid-edge column — clear of both top corner arcs
     let my = oy + oh / 2; // mid-edge row
     let probes: [(&str, usize, usize, u32); 6] = [
-        ("kl_top", mx, oy, theme::FRAME_LINE),
-        ("kl_bot", mx, oy + oh - kw, theme::FRAME_LINE),
-        ("kl_left", ox, my, theme::FRAME_LINE),
-        ("kl_right", ox + ow - kw, my, theme::FRAME_LINE),
-        ("bev_lt", mx, oy + kw, theme::BEVEL_LIGHT),
-        ("bev_sh", mx, oy + oh - kw - theme::BEVEL(), theme::BEVEL_SHADOW),
+        ("kl_top", mx, oy, theme::frame_line()),
+        ("kl_bot", mx, oy + oh - kw, theme::frame_line()),
+        ("kl_left", ox, my, theme::frame_line()),
+        ("kl_right", ox + ow - kw, my, theme::frame_line()),
+        ("bev_lt", mx, oy + kw, theme::bevel_light()),
+        ("bev_sh", mx, oy + oh - kw - theme::BEVEL(), theme::bevel_shadow()),
     ];
     let mut hit = 0usize;
     let mut read = 0usize;
@@ -3913,12 +3913,12 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
     let mx = ox + ow / 2;
     let my = oy + oh / 2;
     let probes: [(&str, usize, usize, u32); 6] = [
-        ("kl_top", mx, oy, theme::FRAME_LINE),
-        ("kl_bot", mx, oy + oh.saturating_sub(kw), theme::FRAME_LINE),
-        ("kl_left", ox, my, theme::FRAME_LINE),
-        ("kl_right", ox + ow.saturating_sub(kw), my, theme::FRAME_LINE),
-        ("bev_lt", mx, oy + kw, theme::BEVEL_LIGHT),
-        ("bev_sh", mx, oy + oh.saturating_sub(kw + theme::BEVEL()), theme::BEVEL_SHADOW),
+        ("kl_top", mx, oy, theme::frame_line()),
+        ("kl_bot", mx, oy + oh.saturating_sub(kw), theme::frame_line()),
+        ("kl_left", ox, my, theme::frame_line()),
+        ("kl_right", ox + ow.saturating_sub(kw), my, theme::frame_line()),
+        ("bev_lt", mx, oy + kw, theme::bevel_light()),
+        ("bev_sh", mx, oy + oh.saturating_sub(kw + theme::BEVEL()), theme::bevel_shadow()),
     ];
     let mut fhit = 0usize;
     let mut fread = 0usize;

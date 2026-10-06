@@ -1663,7 +1663,7 @@ pub fn draw_bar_row(out: &mut [u32], w: usize, s: &BarSnapshot, j: usize, ty0: u
         // dropdown reads as hanging from a lit title rather than floating under a flat strip.
         if open && j + 1 < bh {
             for i in x0..(x0 + bw_k).min(w) {
-                out[i] = theme::ACCENT;
+                out[i] = theme::accent();
             }
         }
         if j < ty0 || j >= ty0 + CELL_H() {
@@ -1677,7 +1677,7 @@ pub fn draw_bar_row(out: &mut [u32], w: usize, s: &BarSnapshot, j: usize, ty0: u
         if s.is_app_box(k) {
             continue;
         }
-        let ink = if open { theme::BEVEL_LIGHT } else { theme::TITLE_TEXT_ACTIVE };
+        let ink = if open { theme::bevel_light() } else { theme::title_text_active() };
         // SO2 — the BAR'S weight. See [`BOLD`].
         super::text::draw_row(out, w, s.label_of(k), x0 + TPAD(), j - ty0, ink, BOLD, FACE);
     }
@@ -1840,13 +1840,13 @@ fn repaint_vacated(r: strip::Rect) {
 /// label and a dim ink for a disabled row.
 fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, name: &[u8]) {
     let (_mx, _my, w, h) = r;
-    let base = if j < BORDER || j + BORDER >= h { theme::FRAME_LINE } else { theme::CHROME_FACE };
+    let base = if j < BORDER || j + BORDER >= h { theme::frame_line() } else { theme::chrome_face() };
     for i in 0..w {
         out[i] = base;
     }
     for i in 0..w {
         if i < BORDER || i + BORDER >= w {
-            out[i] = theme::FRAME_LINE;
+            out[i] = theme::frame_line();
         }
     }
     if j < BORDER || j + BORDER >= h {
@@ -1860,7 +1860,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     if it.flags & FLAG_SEPARATOR != 0 {
         if j == top + SEP_H() / 2 {
             for i in (BORDER + PADX())..(w - BORDER - PADX()) {
-                out[i] = theme::FRAME_LINE;
+                out[i] = theme::frame_line();
             }
         }
         return;
@@ -1872,9 +1872,9 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     }
     let sy = j - gtop;
     let ink = if it.flags & FLAG_DISABLED != 0 {
-        theme::TITLE_TEXT_INACTIVE
+        theme::title_text_inactive()
     } else {
-        theme::TITLE_TEXT_ACTIVE
+        theme::title_text_active()
     };
     // SO2 — every glyph on this surface is now drawn at the BAR'S weight, the check mark included:
     // the drop-down is the bar's own text hanging below the bar, not a second typeface.
@@ -1896,7 +1896,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     // SHORTCUTS M3 — the row's chord, right-aligned inside the padding.
     if let Some(c) = item_chord(&it) {
         let cx = w.saturating_sub(BORDER + PADX() + super::text::advance(c.as_bytes(), BOLD, FACE)); // KERNELFONT: right-aligned by the shaped width
-        super::text::draw_row(out, w, c.as_bytes(), cx, sy, theme::TITLE_TEXT_INACTIVE, BOLD, FACE);
+        super::text::draw_row(out, w, c.as_bytes(), cx, sy, theme::title_text_inactive(), BOLD, FACE);
     }
 }
 
@@ -2926,7 +2926,7 @@ pub fn shotmenu_selftest() {
     // `selftest`'s fixture surface, same shape and the same extent contract (`w * 4 <= stride`,
     // `h * stride <= len`). Opaque mid-slate so the 8x8 row is findable on the capture if anyone
     // ever wants to confirm which window owned the bar.
-    static SURF: [u32; 64] = [0x0033_3355; 64];
+    static SURF: [u32; 64] = [crate::video::theme::fixture::DUSK; 64];
     const FIX_W: usize = 8;
     const FIX_STRIDE: usize = 32;
     const _: () = assert!(FIX_W * 4 <= FIX_STRIDE && FIX_W * FIX_STRIDE <= 64 * 4);

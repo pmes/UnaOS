@@ -117,9 +117,9 @@ const CELL_H: usize = 8;
 /// ledger above stands as the record of how the 16 px height was chosen, and the open bench
 /// judgement transfers to the face unchanged; reversing it is `video::font::SIZE` now.
 
-const FG_DEFAULT: u32 = 0x00C0_C0C0; // light grey text
-const BG_DEFAULT: u32 = 0x0000_0000; // black background
-const PANIC_BG: u32 = 0x0030_0000; // dark red
+const FG_DEFAULT: u32 = crate::video::theme::CONSOLE_TEXT; // light grey text
+const BG_DEFAULT: u32 = crate::video::theme::CONSOLE_BG; // black background
+const PANIC_BG: u32 = crate::video::theme::PANIC_BG; // dark red
 
 /// A unit of PIXEL work, produced by the layout pass and executed by the paint pass. Splitting
 /// the two is what lets the expensive half run outside the interrupt-masked region (see `_print`).
@@ -2150,7 +2150,7 @@ pub fn panic_screen() {
                     }
                 }
                 c.bg = PANIC_BG;
-                c.fg = 0x00FF_FFFF;
+                c.fg = crate::video::theme::CONSOLE_BRIGHT;
                 c.col = 0;
                 c.row = 0;
                 // The panic backdrop covers the FULL panel even when the videocap lever caps the

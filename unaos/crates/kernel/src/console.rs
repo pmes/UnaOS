@@ -307,7 +307,7 @@ impl Console {
         if self.sel.cols_on(crate::video::termsel::EDIT_ROW, len, len).is_none() {
             let (cr, cc) = crate::video::termsel::wrap_rc(pc + self.sel.caret_col(len), cols);
             let cursor_x = m.margin + m.text_w(cc);
-            pal.draw_rect(cursor_x, prompt_y + cr * m.line_h, m.scale.max(1), m.cell_h, crate::video::theme::ACCENT);
+            pal.draw_rect(cursor_x, prompt_y + cr * m.line_h, m.scale.max(1), m.cell_h, crate::video::theme::accent());
         }
     }
 
@@ -680,7 +680,7 @@ impl Console {
         let span = total.saturating_sub(shown).max(1);
         let thumb_y = top + (page_h - thumb_h) * skip.min(span) / span;
         pal.draw_rect(w.saturating_sub(4), top, 4, page_h, 0x3A3868);
-        pal.draw_rect(w.saturating_sub(4), thumb_y, 4, thumb_h, crate::video::theme::ACCENT);
+        pal.draw_rect(w.saturating_sub(4), thumb_y, 4, thumb_h, crate::video::theme::accent());
         if self.new_lines > 0 {
             let y = top + rows * m.line_h;
             pal.draw_rect(0, y, w, m.line_h, 0x3A3868);

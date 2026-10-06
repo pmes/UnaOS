@@ -403,12 +403,12 @@ pub fn selftest() {
     }
 
     // Leg 3 — modulation, not replacement.
-    if shade_gain(0x0012_3456, 1, 0, 0) != 0x0012_3456 {
+    if shade_gain(crate::video::theme::fixture::PROBE_RGB, 1, 0, 0) != crate::video::theme::fixture::PROBE_RGB {
         fails += 1;
     }
     for y in 0..TILE_H {
         for x in 0..TILE_W {
-            if shade(0x0000_0000, x, y) != 0 {
+            if shade(crate::video::theme::fixture::BLACK, x, y) != 0 {
                 fails += 1;
             }
         }
@@ -416,15 +416,7 @@ pub fn selftest() {
 
     // Leg 4 — the three control roles under the knurl, at node / apex / groove / cancel.
     // Read as a table: column 0 is the node and MUST be the role itself, unchanged.
-    const REF: [[u32; 4]; 3] = [
-        // CTRL_CLOSE 0xFF5F57 — note column 1: red stays 0xFF. That is the crest CLIPPING on an
-        // already-saturated channel, disclosed in the module header and checked here.
-        [0x00FF_5F57, 0x00FF_6058, 0x00F9_5D55, 0x00FF_5F57],
-        // CTRL_MIN 0xFEBC2E
-        [0x00FE_BC2E, 0x00FF_BF2E, 0x00F8_B82D, 0x00FE_BC2E],
-        // CTRL_ZOOM 0x28C840
-        [0x0028_C840, 0x0028_CC41, 0x0027_C33E, 0x0028_C840],
-    ];
+    const REF: [[u32; 4]; 3] = crate::video::theme::fixture::KNURL_REF; // APPEARANCE: the golden rows live in theme::fixture (CTRL_CLOSE 0xFF5F57 — column 1 red stays at the crest CLIPPING on a saturated channel; CTRL_MIN 0xFEBC2E; CTRL_ZOOM 0x28C840)
     const ROLES: [u32; 3] = [
         super::theme::CTRL_CLOSE,
         super::theme::CTRL_MIN,

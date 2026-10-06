@@ -455,7 +455,7 @@ pub fn panel_info_nonblocking() -> Option<FrameBufferInfo> {
 }
 
 /// The panel background the GUI paints over — Can-Am dark grey, `#1E1E1E`.
-pub const PANEL_BG: u32 = 0x001E_1E1E;
+pub const PANEL_BG: u32 = crate::video::theme::PANEL_BG;
 
 /// Paint the panel background once at boot, and witness the framebuffer geometry the bootloader
 /// handed us.

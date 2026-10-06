@@ -206,38 +206,38 @@ fn fill(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
 
 fn paint(d: &Dlg, left_s: u32) {
     let px = surf();
-    fill(px, 0, 0, W, H, theme::CHROME_FACE);
+    fill(px, 0, 0, W, H, theme::chrome_face());
     // the icon: the app's mark (a rounded tile and its glyph)
-    let (ic, glyph): (u32, &[u8]) = match d.icon { Icon::Stop => (theme::CTRL_CLOSE, b"!"), Icon::Caution => (theme::CTRL_MIN, b"!"), Icon::System => (theme::ACCENT, b"U") };
+    let (ic, glyph): (u32, &[u8]) = match d.icon { Icon::Stop => (theme::ctrl_close(), b"!"), Icon::Caution => (theme::ctrl_min(), b"!"), Icon::System => (theme::accent(), b"U") };
     fill(px, 22, 22, 48, 48, ic);
-    fill(px, 22, 22, 48, 1, theme::CHROME_FACE);
-    fill(px, 22, 69, 48, 1, theme::CHROME_FACE);
+    fill(px, 22, 22, 48, 1, theme::chrome_face());
+    fill(px, 22, 69, 48, 1, theme::chrome_face());
     let gw = metrics::ladvance(glyph, true, crate::video::text::Face::Ui);
-    text(px, 22 + 24usize.saturating_sub(gw / 2), 36, glyph, theme::BEVEL_LIGHT, true);
+    text(px, 22 + 24usize.saturating_sub(gw / 2), 36, glyph, theme::bevel_light(), true);
     // the bold message, then the informative text
-    text(px, 88, 22, d.message(), theme::CONTENT_TEXT, true);
+    text(px, 88, 22, d.message(), theme::content_text(), true);
     let mut y = 48;
     for i in 0..IL {
         if d.il[i] != 0 {
-            text(px, 88, y, &d.info[i][..d.il[i] as usize], theme::TITLE_TEXT_ACTIVE, false);
+            text(px, 88, y, &d.info[i][..d.il[i] as usize], theme::title_text_active(), false);
             y += 18;
         }
     }
     if d.countdown_s != 0 {
         let line = alloc::format!("automatically in {} second{}.", left_s, if left_s == 1 { "" } else { "s" });
-        text(px, 88, y, line.as_bytes(), theme::TITLE_TEXT_ACTIVE, false);
+        text(px, 88, y, line.as_bytes(), theme::title_text_active(), false);
     }
     for i in 0..d.nb {
         let (x, by, w, h) = btn_rect(i, d.nb);
         let def = i == d.default_ix();
-        fill(px, x, by, w, h, if def { theme::ACCENT } else { theme::BUTTON_FACE });
-        fill(px, x, by, w, 1, theme::FRAME_LINE);
-        fill(px, x, by + h - 1, w, 1, theme::FRAME_LINE);
-        fill(px, x, by, 1, h, theme::FRAME_LINE);
-        fill(px, x + w - 1, by, 1, h, theme::FRAME_LINE);
+        fill(px, x, by, w, h, if def { theme::accent() } else { theme::button_face() });
+        fill(px, x, by, w, 1, theme::frame_line());
+        fill(px, x, by + h - 1, w, 1, theme::frame_line());
+        fill(px, x, by, 1, h, theme::frame_line());
+        fill(px, x + w - 1, by, 1, h, theme::frame_line());
         let l = d.btn[i as usize].as_bytes();
         let tw = metrics::ladvance(l, false, crate::video::text::Face::Ui);
-        text(px, x + w.saturating_sub(tw) / 2, by + 5, l, if def { theme::BEVEL_LIGHT } else { theme::BUTTON_TEXT }, false);
+        text(px, x + w.saturating_sub(tw) / 2, by + 5, l, if def { theme::bevel_light() } else { theme::button_text() }, false);
     }
 }
 

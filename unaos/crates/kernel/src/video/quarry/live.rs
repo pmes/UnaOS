@@ -1723,10 +1723,10 @@ fn paint_scrollbar(
         w: SBW(),
         h: (inner.y + inner.h).saturating_sub(top),
     };
-    fill(px, g, track.x, track.y, track.w, track.h, theme::SCROLL_TRACK);
-    fill(px, g, track.x, track.y, 1, track.h, theme::FRAME_LINE);
+    fill(px, g, track.x, track.y, track.w, track.h, theme::scroll_track());
+    fill(px, g, track.x, track.y, 1, track.h, theme::frame_line());
     if let Some((ty, th)) = thumb(track.h, len, visible, scroll) {
-        fill(px, g, track.x + 2, track.y + ty, track.w.saturating_sub(4), th, theme::SCROLL_THUMB);
+        fill(px, g, track.x + 2, track.y + ty, track.w.saturating_sub(4), th, theme::scroll_thumb());
     }
 }
 
@@ -1740,8 +1740,8 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     let row_h = g.row_h();
 
     // ── the path bar ────────────────────────────────────────────────────────────────────────────
-    fill(px, g, 0, 0, g.w, g.bar_h(), theme::CHROME_FACE);
-    fill(px, g, 0, g.bar_h() - 1, g.w, 1, theme::FRAME_LINE);
+    fill(px, g, 0, 0, g.w, g.bar_h(), theme::chrome_face());
+    fill(px, g, 0, g.bar_h() - 1, g.w, 1, theme::frame_line());
     let mut label: Vec<u8> = Vec::new();
     label.extend_from_slice(m.cwd.as_bytes());
     if m.list_truncated {
@@ -1753,13 +1753,13 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         label.extend_from_slice(b"  -  ");
         label.extend_from_slice(s.as_bytes());
     }
-    text(px, g, PAD(), g.ts, &label, g.w - PAD(), theme::TITLE_TEXT_ACTIVE);
+    text(px, g, PAD(), g.ts, &label, g.w - PAD(), theme::title_text_active());
 
     // ── the tree pane ───────────────────────────────────────────────────────────────────────────
     let tp = g.tree_pane();
     let ti = tp.inner();
-    fill(px, g, tp.x, tp.y, tp.w, tp.h, theme::CONTENT_FILL);
-    keyline(px, g, tp, theme::FRAME_LINE);
+    fill(px, g, tp.x, tp.y, tp.w, tp.h, theme::content_fill());
+    keyline(px, g, tp, theme::frame_line());
     let tvis = m.tree_visible();
     let tsb = if m.tree.len() > tvis { SBW() } else { 0 };
     for r in 0..tvis {
@@ -1771,13 +1771,13 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         let y = ti.y + r * row_h;
         let sel = i == m.tree_sel;
         if sel {
-            let c = if m.focus == Pane::Tree { theme::ACCENT } else { theme::SCROLL_THUMB };
+            let c = if m.focus == Pane::Tree { theme::accent() } else { theme::scroll_thumb() };
             fill(px, g, ti.x, y, ti.w - tsb, row_h, c);
         }
         let ink = if sel && m.focus == Pane::Tree {
-            theme::CHROME_FACE
+            theme::chrome_face()
         } else {
-            theme::CONTENT_TEXT
+            theme::content_text()
         };
         let indent = PAD() + row.depth * mark_w;
         // Both triangle forms have their centre at `y + 4 * ts` by construction (column/row `i`
@@ -1797,13 +1797,13 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     paint_scrollbar(px, g, ti, ti.y, m.tree.len(), tvis, m.tree_scroll);
 
     // ── the divider ─────────────────────────────────────────────────────────────────────────────
-    fill(px, g, tp.x + tp.w, tp.y, 1, tp.h, theme::FRAME_LINE);
+    fill(px, g, tp.x + tp.w, tp.y, 1, tp.h, theme::frame_line());
 
     // ── the list pane ───────────────────────────────────────────────────────────────────────────
     let lp = g.list_pane();
     let li = lp.inner();
-    fill(px, g, lp.x, lp.y, lp.w, lp.h, theme::CONTENT_FILL);
-    keyline(px, g, lp, theme::FRAME_LINE);
+    fill(px, g, lp.x, lp.y, lp.w, lp.h, theme::content_fill());
+    keyline(px, g, lp, theme::frame_line());
     let lvis = m.list_visible();
     let lsb = if m.list.len() > lvis { SBW() } else { 0 };
     let body_y = columns::paint_list(m, px, li, lsb, lvis); // QUARRY2 (B336): the header (sortable, with a chevron) and the NAME SIZE MODIFIED TYPE ORIGIN columns

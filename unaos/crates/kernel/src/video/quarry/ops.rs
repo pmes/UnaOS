@@ -316,20 +316,20 @@ pub fn paint_overlay(m: &Model, px: &mut [u32]) {
             Target::NewFolder => (0, "New folder: "),
         };
         let (x, w) = if y == 0 { (0, g.w) } else { (li.x, li.w) };
-        fill(px, g, x, y, w, rh, 0x00FF_FFFF);
-        keyline(px, g, Rect { x, y, w, h: rh }, theme::ACCENT);
+        fill(px, g, x, y, w, rh, crate::video::theme::field_bg());
+        keyline(px, g, Rect { x, y, w, h: rh }, theme::accent());
         let mut s: Vec<u8> = Vec::new();
         s.extend_from_slice(label.as_bytes());
         s.extend_from_slice(e.buf.as_bytes());
         s.push(b'_');
-        text(px, g, x + PAD(), y + g.ts, &s, x + w, theme::CONTENT_TEXT);
+        text(px, g, x + PAD(), y + g.ts, &s, x + w, theme::content_text());
     }
     if let Some(mn) = MENU.lock().as_ref() {
         let (w, h) = (menu_w(g), menu_h(g));
-        fill(px, g, mn.x, mn.y, w, h, theme::BUTTON_FACE);
-        keyline(px, g, Rect { x: mn.x, y: mn.y, w, h }, theme::FRAME_LINE);
+        fill(px, g, mn.x, mn.y, w, h, theme::button_face());
+        keyline(px, g, Rect { x: mn.x, y: mn.y, w, h }, theme::frame_line());
         for (i, it) in ITEMS.iter().enumerate() {
-            text(px, g, mn.x + PAD(), mn.y + 1 + i * g.row_h() + g.ts, it.label().as_bytes(), mn.x + w, theme::BUTTON_TEXT);
+            text(px, g, mn.x + PAD(), mn.y + 1 + i * g.row_h() + g.ts, it.label().as_bytes(), mn.x + w, theme::button_text());
         }
     }
 }

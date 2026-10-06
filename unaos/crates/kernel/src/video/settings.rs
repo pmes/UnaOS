@@ -415,50 +415,50 @@ fn fill(s: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize, c: u3
 fn txt(st: &mut State, x: usize, r: usize, t: &str) {
     let face = super::text::Face::Ui; // KERNELFONT: labels in the UI face
     let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::content_text(), false, face);
 }
 
 fn btn(st: &mut State, r: usize, x: usize, t: &str) {
     let face = super::text::Face::Ui; // KERNELFONT: button captions in the UI face
     let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
     let y = TOP + r * ROW_H + (ROW_H - BTN_H) / 2;
-    fill(&mut st.surf, w, x, y, BTN_W, BTN_H, theme::BUTTON_FACE);
-    fill(&mut st.surf, w, x, y, BTN_W, 1, theme::FRAME_LINE);
-    fill(&mut st.surf, w, x, y + BTN_H - 1, BTN_W, 1, theme::FRAME_LINE);
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::BUTTON_TEXT, false, face);
+    fill(&mut st.surf, w, x, y, BTN_W, BTN_H, theme::button_face());
+    fill(&mut st.surf, w, x, y, BTN_W, 1, theme::frame_line());
+    fill(&mut st.surf, w, x, y + BTN_H - 1, BTN_W, 1, theme::frame_line());
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::button_text(), false, face);
 }
 
 fn field(st: &mut State, r: usize, t: &str, focus: bool) {
     let face = super::text::Face::Body;
     let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
-    fill(&mut st.surf, w, TRACK_X, TOP + r * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::BUTTON_FACE);
+    fill(&mut st.surf, w, TRACK_X, TOP + r * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::button_face());
     let mut shown = String::from(t);
     if focus { shown.push('_'); }
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 14, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::BUTTON_TEXT, false, face);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 14, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::button_text(), false, face);
 }
 
 fn slider(st: &mut State, r: usize, pos: usize, max: usize) {
     let w = st.w;
     let y = TOP + r * ROW_H + ROW_H / 2;
-    fill(&mut st.surf, w, TRACK_X, y - 2, TRACK_W, 4, theme::SCROLL_TRACK);
+    fill(&mut st.surf, w, TRACK_X, y - 2, TRACK_W, 4, theme::scroll_track());
     let kx = TRACK_X + pos * TRACK_W / max.max(1);
-    fill(&mut st.surf, w, TRACK_X, y - 2, kx - TRACK_X, 4, theme::ACCENT);
-    fill(&mut st.surf, w, kx.saturating_sub(KNOB_W / 2), y - 9, KNOB_W, 18, theme::ACCENT);
+    fill(&mut st.surf, w, TRACK_X, y - 2, kx - TRACK_X, 4, theme::accent());
+    fill(&mut st.surf, w, kx.saturating_sub(KNOB_W / 2), y - 9, KNOB_W, 18, theme::accent());
 }
 
 fn paint(st: &mut State, v: &Values) {
     let (w, h) = (st.w, st.h);
-    for p in st.surf.iter_mut() { *p = theme::CONTENT_FILL; }
+    for p in st.surf.iter_mut() { *p = theme::content_fill(); }
     let face = super::text::Face::Ui; // KERNELFONT: tab names in the UI face
     let ch = super::metrics::lcell_h(face);
     // The tab strip.
     let tw = w / TABS;
     for k in 0..TABS {
         let on = k == v.tab as usize;
-        fill(&mut st.surf, w, k * tw, 0, tw - 2, TAB_H, if on { theme::ACCENT } else { theme::SCROLL_TRACK });
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        fill(&mut st.surf, w, k * tw, 0, tw - 2, TAB_H, if on { theme::accent() } else { theme::scroll_track() });
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::content_text(), false, face);
     }
-    if st.strip { fill(&mut st.surf, w, 0, TAB_H - 3, w, 2, theme::ACCENT); }
+    if st.strip { fill(&mut st.surf, w, 0, TAB_H - 3, w, 2, theme::accent()); }
     match v.tab {
         0 => paint_general(st, v),
         1 => paint_users(st),
@@ -468,8 +468,8 @@ fn paint(st: &mut State, v: &Values) {
     }
     if !st.strip && matches!(v.tab, 0 | 2) {
         let r = row_of(st.sel);
-        fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::ACCENT);
-        if st.sel == 7 { fill(&mut st.surf, w, TRACK_X + BTN_W + 10, TOP + 4 * ROW_H + ROW_H - 8, BTN_W, 2, theme::ACCENT); }
+        fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::accent());
+        if st.sel == 7 { fill(&mut st.surf, w, TRACK_X + BTN_W + 10, TOP + 4 * ROW_H + ROW_H - 8, BTN_W, 2, theme::accent()); }
     }
 }
 
@@ -481,15 +481,15 @@ fn paint_general(st: &mut State, v: &Values) {
     slider(st, 0, v.vol as usize, 16);
     txt(st, VAL_X, 0, &alloc::format!("{}/16", v.vol));
     txt(st, LABEL_X, 1, "Mute");
-    fill(&mut st.surf, w, TRACK_X, TOP + ROW_H + 8, 24, 24, theme::SCROLL_TRACK);
-    if v.mute { fill(&mut st.surf, w, TRACK_X + 4, TOP + ROW_H + 12, 16, 16, theme::ACCENT); }
+    fill(&mut st.surf, w, TRACK_X, TOP + ROW_H + 8, 24, 24, theme::scroll_track());
+    if v.mute { fill(&mut st.surf, w, TRACK_X + 4, TOP + ROW_H + 12, 16, 16, theme::accent()); }
     txt(st, VAL_X, 1, if v.mute { "muted" } else { "sound on" });
     txt(st, LABEL_X, 2, "Pointer");
     let seg = TRACK_W / 3;
     for k in 0..3usize {
-        let c = if k as u8 == v.ptr { theme::ACCENT } else { theme::SCROLL_TRACK };
+        let c = if k as u8 == v.ptr { theme::accent() } else { theme::scroll_track() };
         fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 2 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 2 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 2 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::content_text(), false, face);
     }
     txt(st, LABEL_X, 3, "Wallpaper");
     let (focus, wall) = (!st.strip && st.sel == 5, v.wall.clone());
@@ -530,9 +530,9 @@ fn paint_display(st: &mut State, v: &Values) {
     let (fam, size) = (font_fam(), font_size());
     let seg = TRACK_W / 3;
     for k in 0..3usize {
-        let c = if k == fam { theme::ACCENT } else { theme::SCROLL_TRACK };
+        let c = if k == fam { theme::accent() } else { theme::scroll_track() };
         fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 4 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 4 * ROW_H + (ROW_H - ch) / 2, FONT_FAMS[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 4 * ROW_H + (ROW_H - ch) / 2, FONT_FAMS[k].as_bytes(), theme::content_text(), false, face);
     }
     txt(st, VAL_X, 4, &super::text::face_name(face));
     txt(st, LABEL_X, 5, "Font size");
@@ -543,8 +543,8 @@ fn paint_display(st: &mut State, v: &Values) {
     let (cw, chh) = super::text::grid_cell();
     let s2 = super::dpi::scale_x2();
     txt(st, TRACK_X, 6, &alloc::format!("{} in {}x{} cells, {} ppi x{}", super::text::face_name(super::text::Face::Grid), cw, chh, super::dpi::ppi(), super::dpi::scale_str(s2)));
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 12, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, face);
-    if !st.strip && st.sel == 10 { fill(&mut st.surf, w, TRACK_X, TOP + 5 * ROW_H + ROW_H - 8, 2 * BTN_W + 10, 2, theme::ACCENT); }
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 12, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::content_text(), false, face);
+    if !st.strip && st.sel == 10 { fill(&mut st.surf, w, TRACK_X, TOP + 5 * ROW_H + ROW_H - 8, 2 * BTN_W + 10, 2, theme::accent()); }
     if st.modes_open { mode_list(st); } // PREFSUI: the open dropdown paints over the rows below it
 }
 
@@ -696,7 +696,7 @@ fn paint_users(st: &mut State) {
             let r = 1 + i;
             let tag = if *nm == me { " (you)" } else if *unset { " (no password)" } else { "" };
             let w = st.w;
-            if i == sel { fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::ACCENT); }
+            if i == sel { fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::accent()); }
             txt(st, LABEL_X, r, &alloc::format!("{}{}", nm, tag));
             if st.u.confirm.as_deref() == Some(nm.as_str()) {
                 txt(st, TRACK_X + 130, r, "delete?");
@@ -780,7 +780,7 @@ pub fn open() -> Result<(), String> {
     let len = sw * sh;
     let mut surf: Vec<u32> = Vec::new();
     if surf.try_reserve_exact(len).is_err() { return Err(String::from("out of memory")); }
-    surf.resize(len, theme::CONTENT_FILL);
+    surf.resize(len, theme::content_fill());
     if is_open() { close(); }
     // Pick up the file's values (and apply them) if the login hook has not yet.
     if user_name().is_some() && LOADED_FOR.lock().is_empty() { service(); }
@@ -1573,7 +1573,7 @@ fn mode_caption(m: &prefs_core::modes::Mode) -> String {
 fn mode_field(st: &mut State) {
     let ms = display_modes();
     let w = st.w;
-    fill(&mut st.surf, w, TRACK_X, TOP + 2 * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::BUTTON_FACE);
+    fill(&mut st.surf, w, TRACK_X, TOP + 2 * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::button_face());
     let t = match ms.get(mode_cur(&ms)) { Some(m) => mode_caption(m), None => String::from("panel busy") };
     txt(st, TRACK_X + 6, 2, &t);
     txt(st, w - 30, 2, "v");
@@ -1589,8 +1589,8 @@ fn mode_list(st: &mut State) {
     let (w, cur) = (st.w, mode_cur(&ms));
     for (k, m) in ms.iter().enumerate().take(ROWS - 3) {
         let y = TOP + (3 + k) * ROW_H;
-        fill(&mut st.surf, w, TRACK_X, y, w - TRACK_X - 12, ROW_H, theme::FRAME_LINE);
-        fill(&mut st.surf, w, TRACK_X + 1, y + 1, w - TRACK_X - 14, ROW_H - 2, if k == cur { theme::ACCENT } else { theme::BUTTON_FACE });
+        fill(&mut st.surf, w, TRACK_X, y, w - TRACK_X - 12, ROW_H, theme::frame_line());
+        fill(&mut st.surf, w, TRACK_X + 1, y + 1, w - TRACK_X - 14, ROW_H - 2, if k == cur { theme::accent() } else { theme::button_face() });
         txt(st, TRACK_X + 6, 3 + k, &mode_caption(m));
     }
 }
@@ -1680,14 +1680,14 @@ fn paint_dock_rows(st: &mut State) {
     let seg = TRACK_W / 3;
     let p = super::dock::position() as usize;
     for k in 0..3usize {
-        let c = if k == p { theme::ACCENT } else { theme::SCROLL_TRACK };
+        let c = if k == p { theme::accent() } else { theme::scroll_track() };
         fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 6 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 6 * ROW_H + (ROW_H - ch) / 2, DOCK_POS_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 6 * ROW_H + (ROW_H - ch) / 2, DOCK_POS_NAMES[k].as_bytes(), theme::content_text(), false, face);
     }
     txt(st, LABEL_X, 7, "Auto-hide dock");
-    fill(&mut st.surf, w, TRACK_X, TOP + 7 * ROW_H + 8, 24, 24, theme::SCROLL_TRACK);
+    fill(&mut st.surf, w, TRACK_X, TOP + 7 * ROW_H + 8, 24, 24, theme::scroll_track());
     let on = super::dock::autohide();
-    if on { fill(&mut st.surf, w, TRACK_X + 4, TOP + 7 * ROW_H + 12, 16, 16, theme::ACCENT); }
+    if on { fill(&mut st.surf, w, TRACK_X + 4, TOP + 7 * ROW_H + 12, 16, 16, theme::accent()); }
     txt(st, VAL_X, 7, if on { "on" } else { "off" });
 }
 
