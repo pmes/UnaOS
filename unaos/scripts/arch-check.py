@@ -29,10 +29,10 @@ import os, re, sys, tempfile
 
 SEAM_RE = re.compile(r'CHARTER:\s*([^—|-]+?)\s*(?:—|--|-|\|)\s*([a-z-]+)(.*)')
 SHARED_RE = re.compile(r'\b[a-z0-9_]+_core::|\bunafs::|\buna_abi::|\b[a-z0-9_]+_core\b')
-DOTSLASH_RE = re.compile(r'"(?:\{\})?/\.[A-Za-z][A-Za-z0-9_./-]*"')
+DOTSLASH_RE = re.compile(r'"(?:\{[A-Za-z_]*\})?/\.[A-Za-z][A-Za-z0-9_./-]*"')  # GATEREVIEW F2: `{home}/.x` too
 SETTINGS_RE = re.compile(r'"\{\}/settings/[A-Za-z0-9_.-]*"')
 STORE_STATIC_RE = re.compile(r'^\s*(?:pub(?:\([a-z]+\))?\s+)?static\s+[A-Z0-9_]+\s*:\s*(?:spin::)?(?:Mutex|RwLock)<[^;]*\b(?:Vec|BTreeMap|String)\b', re.M)
-STORE_WRITE_RE = re.compile(r'\.(?:write|create|set_attr)\(\s*&?[a-z_]+\s*,')
+STORE_WRITE_RE = re.compile(r'\.(?:write|create|set_attr)\(\s*&?[A-Za-z_][A-Za-z0-9_.]*(?:\(\))?\s*,')  # GATEREVIEW F4: PATH consts, p.as_str()
 PARSERS = [
     ('mime-table', re.compile(r'&\[\(&str,\s*&str\)\]\s*=\s*&\[[^\]]*"(?:image|audio|video)/', re.S)),
     ('png', re.compile(r'0x89,\s*b\'P\',\s*b\'N\',\s*b\'G\'|b"\\x89PNG')),
@@ -78,10 +78,10 @@ def scan(k):
                     keys.add(f'seamcite|{rel}')
                 if seam == 'owed' and not re.search(r'\bB\d+', rest):
                     keys.add(f'seamcite|{rel}')
-                if seam == 'shared-core' and not SHARED_RE.search(text):
+                if seam == 'shared-core' and not SHARED_RE.search(re.sub(r'//[^\n]*', '', text)):  # GATEREVIEW F3: a core named in a comment links nothing
                     keys.add(f'sharedcore|{rel}')
             for lit in sorted(set(DOTSLASH_RE.findall(text))):
-                keys.add(f'dotslash|{lit.strip(chr(34))}')
+                keys.add(f'dotslash|{rel}|{lit.strip(chr(34))}')  # GATEREVIEW F1: keyed by FILE, so a baselined literal in a new file is new
             if rel != 'prefs.rs' and SETTINGS_RE.search(text):
                 keys.add(f'settings|{rel}')
             if not m and rel not in reg and STORE_STATIC_RE.search(text) and STORE_WRITE_RE.search(text):
@@ -131,17 +131,19 @@ def selftest():
         open(os.path.join(d, 'scripts', 'charter.registry'), 'w').write('old.rs | Kernel | driver | x\n')
         plants = {
             'a.rs': '//! CHARTER: Kernel — kernel-by-ruling\n',
-            'b.rs': '//! CHARTER: Kernel — shared-core\nfn x() {}\n',
+            'b.rs': '//! CHARTER: Kernel — shared-core\n// one day this links stria_core\nfn x() {}\n',
             'c.rs': 'fn p(h: &str) -> String { format!("{}/.secret", h) }\n',
             'd.rs': '//! CHARTER: Kernel — wm\nfn p(h: &str) -> String { format!("{}/settings/mine", h) }\n',
-            'e.rs': 'static S: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());\nfn w() { mt.write(&p, 0, b, k); }\n',
+            'e.rs': 'static S: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());\nfn w() { mt.write(p.as_str(), 0, b, k); }\n',
             'f.rs': '//! CHARTER: Kernel — driver\nfn s(b: &[u8]) -> bool { &b[..4] == b"OggS" }\n',
             'g.rs': '//! CHARTER: Kernel — owed B1\n//! CHARTER is fine\nfn x() { holo_core::y(); }\n',
+            'i.rs': '//! CHARTER: Kernel — wm\nfn p(home: &str) -> String { format!("{home}/.recents") }\n',  # GATEREVIEW F2
+            'h.rs': '//! CHARTER: Kernel — wm\nfn p(h: &str) -> String { format!("{}/.secret", h) }\n',  # GATEREVIEW F1: c.rs's literal reused
         }
         for f, t in plants.items():
             open(os.path.join(k, f), 'w').write(t)
         keys, _ = scan(k)
-        want = {'seamcite|a.rs', 'sharedcore|b.rs', 'dotslash|{}/.secret', 'settings|d.rs', 'store|e.rs', 'parser|f.rs|ogg'}
+        want = {'seamcite|a.rs', 'sharedcore|b.rs', 'dotslash|c.rs|{}/.secret', 'dotslash|h.rs|{}/.secret', 'dotslash|i.rs|{home}/.recents', 'settings|d.rs', 'store|e.rs', 'parser|f.rs|ogg'}
         if keys != want:
             print(f'arch-check: SELFTEST FAILED — planted {sorted(want)}, scanned {sorted(keys)}')
             return 2

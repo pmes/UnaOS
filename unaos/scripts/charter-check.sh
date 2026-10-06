@@ -58,6 +58,10 @@ header_ok $'// no charter here\nfn x() {}\n' && { echo "charter-check: CONTROL F
 reg_ok "video/__synthetic__.rs" && { echo "charter-check: CONTROL FAILED — synthetic file has a row"; exit 2; }
 dot_ok ".nowhere" && { echo "charter-check: CONTROL FAILED — synthetic dotfile allowed"; exit 2; }
 
+# GATEREVIEW F5: the extraction regex is itself probed (the `.nowhere` control above only tested the row lookup), and it
+# reads the Capitalised path-join form `{}.Recents` that `{}\.[a-z]` missed.
+DOTRE='\{\}\.[a-z][A-Za-z_./]*"|\{\}\.[A-Z][a-z][A-Za-z_]*"|"\.[A-Z][a-z][A-Za-z_]*(/[A-Za-z_.]*)?"'
+[ "$(printf '%s\n' 'format!("{}.nowhere", h); format!("{}.Recents", h); x(".Trash/.index"); y("{}.PNG")' | grep -oE "$DOTRE" | wc -l)" -eq 3 ] || { echo "charter-check: CONTROL FAILED — the dotfile regex did not extract its three synthetic literals"; exit 2; }
 rc=0
 scope() { ( cd "$K" && find video fs install selfhost -name '*.rs' 2>/dev/null; for f in help.rs termcolor.rs shellux.rs clipboard.rs shell.rs drivers/hda_play.rs; do [ -f "$f" ] && echo "$f"; done ) | sort -u; }
 n=0
@@ -77,7 +81,7 @@ while IFS= read -r m; do
   name=$(printf '%s' "$m" | sed 's/^.*://; s/^{}//; s/"$//; s/^"//')
   case "$name" in .*) ;; *) continue;; esac
   dot_ok "$name" || { echo "  ❌ GATE-CHARTER: kernel writes a dotfile not on the allowlist: '$name' ($m) — a preference belongs in Principia's store; if it is not one, add a \`dotfile |\` row with its ledger id"; rc=1; }
-done < <(grep -rhoE '\{\}\.[a-z][A-Za-z_./]*"|"\.[A-Z][a-z][A-Za-z_]*(/[A-Za-z_.]*)?"' "$K" --include='*.rs' | sort -u)
+done < <(grep -rhoE "$DOTRE" "$K" --include='*.rs' | sort -u)
 
 [ "$rc" -eq 0 ] && echo "  ✅ charter (GATE-CHARTER: $n app-domain files declare an owner; every kernel dotfile is on the allowlist)"
 exit $rc

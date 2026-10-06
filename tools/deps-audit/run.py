@@ -281,6 +281,24 @@ def parse_lock(p: Path) -> dict[str, list[Ver]]:
     return out
 
 
+UNSEEN: list[str] = []
+
+
+def selftest() -> int:
+    """GATEREVIEW F12: a git dependency and an unparsable manifest must each be named (no network needed)."""
+    global ROOT
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        ROOT = Path(d)
+        (ROOT / "a").mkdir(); (ROOT / "b").mkdir()
+        (ROOT / "a/Cargo.toml").write_text('[package]\nname="a"\nversion="0.1.0"\n[dependencies]\nleft = { git = "https://x.invalid/l" }\n')
+        (ROOT / "b/Cargo.toml").write_text('[package]\nname="b"\n[dependencies]\nserde = \n')
+        collect()
+    ok = any("git dependency" in u for u in UNSEEN) and any("unparsable" in u for u in UNSEEN)
+    print(f"deps-audit selftest: {UNSEEN} -> {'PASS' if ok else 'FAIL'}")
+    return 0 if ok else 1
+
+
 def collect() -> list[Use]:
     tomls = {}
     for m in manifests():
@@ -288,6 +306,7 @@ def collect() -> list[Use]:
             tomls[m] = tomllib.loads(m.read_text())
         except tomllib.TOMLDecodeError as e:
             print(f"deps-audit: {m}: {e}", file=sys.stderr)
+            UNSEEN.append(f"{m.relative_to(ROOT).as_posix()}: unparsable manifest ({e})")  # GATEREVIEW F12
     locks: dict[Path, dict] = {}
     uses: list[Use] = []
     for m, t in tomls.items():
@@ -312,6 +331,8 @@ def collect() -> list[Use]:
                     base = {"version": base} if isinstance(base, str) else dict(base)
                     base.update({k: v for k, v in spec.items() if k != "workspace"})
                     spec = base
+                if "git" in spec:  # GATEREVIEW F12: a git dependency has no index row to lag — it was invisible
+                    UNSEEN.append(f"{rel}: `{key}` is a git dependency (no crates.io version to audit)")
                 if "path" in spec or "git" in spec or "version" not in spec:
                     continue  # in-tree crate (or git pin: none in this tree)
                 name = spec.get("package", key)
@@ -486,7 +507,10 @@ def main() -> int:
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--stdout", action="store_true")
     ap.add_argument("--json", action="store_true", help="dump rows as JSON (for tooling)")
+    ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
+    if a.selftest:
+        return selftest()
     rows = build_rows(a.offline, a.refresh, a.policy)
     if a.json:
         print(json.dumps([{"crate": r.crate, "stable": str(r.stable) if r.stable else None,
@@ -514,6 +538,9 @@ def main() -> int:
             if not p.get("reason") or not p.get("ledger"):
                 print(f"PIN WITHOUT REASON/LEDGER: {p.get('crate')}")
                 bad += 1
+        for u in UNSEEN:
+            print(f"UNAUDITED {u}")
+            bad += 1
         if unknown:
             print(f"UNRESOLVED (index unreachable, no cache): {', '.join(unknown)}")
             bad += len(unknown)

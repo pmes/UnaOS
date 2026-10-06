@@ -116,7 +116,7 @@ def flight_files(root, n):
         if m and int(m.group(1)) == n:
             out.append(p)
             continue
-        m = re.fullmatch(r"FLIGHT(\d+)(?:-(\d+))?\.md", b)
+        m = re.fullmatch(r"FLIGHT(\d+)(?:-(\d+))?(?:-POSTMORTEM)?\.md", b)  # GATEREVIEW F7: flights 3-7 are postmortems
         if m and int(m.group(1)) <= n <= int(m.group(2) or m.group(1)):
             out.append(p)
     return sorted(out)
@@ -172,6 +172,8 @@ def check(root, baseline_path=None, flagged_only=False, emit_baseline=False):
             errs.append("%s: unflown carries no flight (it names %s)" % (where, fl))
         if line and not fl and st != "unflown":
             errs.append("%s: a quoted line needs its flight" % where)
+        if line and len(line.strip()) < 20:  # GATEREVIEW F6: `[` is in every capture; a quote must identify a line
+            errs.append("%s: quoted line '%s' is under 20 characters — quote the whole wire line" % (where, line))
         if line and fl:
             n = int(fl[1:])
             if n not in cache:
@@ -248,10 +250,18 @@ def selftest():
         ("cites missing row", ok_row, "open — flew ST9", 1, "not a row"),
         ("enum head is no claim", ok_row, "fixed-unflown — built", 0, None),
         ("bad status", "ST1\tc\tsettled\t\t\ts\t\n", "open", 1, "not in"),
+        ("vacuous short quote", "ST1\tc\tconfirmed\tf7\t[\ts\tB1\n", "open", 1, "under 20"),
         ("baseline grandfathers", ok_row, "open — flew once", 0, None, "rmbp-ledger.md B1"),
         ("baseline stale once cited", ok_row, "open — flew ST1", 1, "stale", "rmbp-ledger.md B1"),
     ]
     fails = 0
+    pm = tempfile.mkdtemp(prefix="statuscheck-")  # GATEREVIEW F7: a flight-5 postmortem is that flight's capture
+    os.makedirs(os.path.join(pm, "docs/dev/evidence/rmbp9"))
+    open(os.path.join(pm, "docs/dev/evidence/rmbp9/FLIGHT5-POSTMORTEM.md"), "w").write("x\n")
+    if len(flight_files(pm, 5)) != 1:
+        fails += 1
+        print("status-check selftest: FAIL postmortem capture — FLIGHT5-POSTMORTEM.md not read as flight 5")
+    shutil.rmtree(pm, ignore_errors=True)
     for name, tsv, cell, want, why, *bl in cases:
         d = tree(tsv, cell)
         bp = None
