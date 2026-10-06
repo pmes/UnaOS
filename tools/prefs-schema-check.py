@@ -32,6 +32,10 @@
 #   R4 also reads Principia's ring-3 tags (`BUS_VERB_R3PREF_GET|SET`).
 #   R10 the user-prefs demo TABLE rows `(b"<ns>.<key>", b"<value>")` (crates/user-prefs): its keys are
 #      schema keys since PREFSKERNEL (its five namespace-less demo keys drifted from the schema).
+# SETTINGSFILES (rmbp-ledger B407, R98): the store is split by DOMAIN (`<home>/settings/<domain>`,
+# `prefs_core::files::domain_of`, mirrored by `domain_of` below) and the report says declared=referenced per
+# domain. A program's own keys (`app.<name>.<key>`) are declared by its PrefDeclare stanza, not the table:
+#   R12 a stanza byte literal `b"<name>\0<key>\t<spec>\t<default>\t<doc>\n…"` DECLARES app.<name>.<key>.
 import os
 import re
 import sys
@@ -180,6 +184,48 @@ def load_tree():
     return files
 
 
+SYSTEM_DOMAINS = ("display", "login", "desktop", "sound", "trackpad", "general")
+
+
+def domain_of(full):
+    """`prefs_core::files::domain_of` for `<ns>.<key>` (the Rust test pins the Rust side to the schema)."""
+    ns, _, key = full.partition(".")
+    first = key.split(".")[0]
+    if ns == "system":
+        if key == "display.wallpaper":
+            return "desktop"
+        return {"display": "display", "dock": "desktop", "login": "login", "audio": "sound",
+                "pointer": "trackpad", "trackpad": "trackpad"}.get(first, "general")
+    if ns == "app":
+        return first
+    return ns
+
+
+STANZA = re.compile(r'b"(' + SEG + r')\\0((?:[^"\\]|\\.)*)"')
+
+
+def stanzas(files):
+    """R12: every app.<name>.<key> a PrefDeclare stanza literal declares."""
+    keys = set()
+    for _rel, src in files:
+        for m in STANZA.finditer(src):
+            for line in m.group(2).split("\\n"):
+                f = line.split("\\t")
+                k = f[0]
+                if len(f) >= 3 and re.fullmatch(KEY, k) and re.match(r"(int|float|bool|str|enum)\b", f[1]):
+                    keys.add("app.%s.%s" % (m.group(1), k))
+    return keys
+
+
+def per_domain(found, keys):
+    doms = {}
+    for k in keys:
+        doms.setdefault(domain_of(k), [0, 0])[0] += 1
+    for k in found:
+        doms.setdefault(domain_of(k), [0, 0])[1] += 1
+    return " ".join("%s=%d/%d" % (d, v[0], v[1]) for d, v in sorted(doms.items()))
+
+
 def scan(files):
     consts = ns_consts(files)
     found = {}
@@ -196,6 +242,7 @@ def report(found, keys, show_all):
             print("%s %s  %s" % ("ok     " if k in keys else "MISSING", k, found[k][0]))
     for k in missing:
         print("undeclared %s  referenced at %s" % (k, ", ".join(found[k])))
+    print("prefs-schema-check: domains (declared/referenced) %s" % per_domain(found, keys))
     print("prefs-schema-check: declared=%d referenced=%d undeclared=%d -> %s"
           % (len(keys), len(found), len(missing), "PASS" if not missing else "FAIL"))
     return 0 if not missing else 1
@@ -217,14 +264,19 @@ def selftest(keys):
          'fn c() { ask(BUS_VERB_R3PREF_GET, 1, b"ui.font_scale"); }\n'),
         # R11: the deleted `vein.tls` (VEINTLS) must go red if a ring-3 PREF_GET client asks for it again.
         ("unaos/libs/sys/x_ring3/src/prefs.rs", 'use una_abi::BUS_VERB_PREF_GET;\nlet a = one("vein.model", &mut v, &mut e);\nlet b = one("vein.tls", &mut v, &mut e);\n'),
+        # SETTINGSFILES R12: a stanza declares app.demo.zoom; app.demo.ghost is referenced, never declared.
+        ("unaos/crates/kernel/src/y.rs", 'const S: &[u8] = b"demo\\0zoom\\tint:1:4\\t1\\tthe zoom\\n";\n'
+         'fn d() { crate::prefs::get("app", "demo.zoom"); crate::prefs::get("app", "demo.ghost"); }\n'),
     ]
     files = [(p, strip_tests(s)) for p, s in fake]
     found = scan(files)
-    want_missing = {"system.display.ghost_key", "vein.phantom.knob", "quarry.view", "vein.tls",
+    keys = keys | stanzas(files)
+    want_missing = {"app.demo.ghost", "system.display.ghost_key", "vein.phantom.knob", "quarry.view", "vein.tls",
                     "system.audio.ghost_ms", "vein.ghost_url", "vein.phantom_tls", "ui.theme", "ui.font_scale"}
     missing = {k for k in found if k not in keys}
     ok = (missing == want_missing and "vein.only.in_tests" not in found and "system.display.brightness" in found
-          and "vein.model" in found and "system.audio.volume" in found and "vein.provider" in found)
+          and "vein.model" in found and "system.audio.volume" in found and "vein.provider" in found
+          and "app.demo.zoom" in found and domain_of("app.demo.zoom") == "demo" and domain_of("system.dock.pins") == "desktop")
     print("prefs-schema-check selftest: found=%s missing=%s -> %s" % (sorted(found), sorted(missing), "PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -241,7 +293,8 @@ def main(argv):
         return 2
     if "--selftest" in argv:
         return selftest(keys)
-    return report(scan(load_tree()), keys, "--list" in argv)
+    tree = load_tree()
+    return report(scan(tree), keys | stanzas(tree), "--list" in argv)
 
 
 if __name__ == "__main__":

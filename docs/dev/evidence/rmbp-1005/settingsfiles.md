@@ -41,10 +41,17 @@ First boot of the image (once): `[prefs] migrated preferences.toml -> settings/<
 `:: PREFS: path=<home>/settings domains=<n> loaded=<n> saved=<n> ns=system -> PASS ::`; per write
 `[prefs] saved settings/<domain> keys=<n> by=<who>`; a deleted file
 `[prefs] settings/display absent -> defaults (deleted by the user)`; `tests prefs` ->
-`:: SETTINGSFILES: domains=<n> files=<n> migrated=<0/1> readable=1 reset_on_delete=ok app_ns=ok -> PASS ::`.
+`:: SETTINGSFILES: domains=<n> files=<n> migrated=<0/1> readable=1 reset_on_delete=ok app_ns=ok alone=1 dir=<home>/settings -> PASS ::`
+(`alone=1`: the app write touched no other domain file). Lumen's wire line carries ` declared=0` and the kernel says
+`[prefs] declared app.lumen keys=1 -> settings/lumen (R98)`. Settings link: `[settingsfiles] reveal dir=<home>/settings opened=1 from=tab<n>`;
+Show Info on a settings file: `[settingsfiles] info path=<p> keys=<n> saved=<iso>`. `tools/prefs-schema-check.py` prints
+`domains (declared/referenced) desktop=4/4 display=5/5 general=2/2 login=1/1 lumen=1/0 sftest=1/1 sound=3/3 trackpad=1/1 vein=19/19`.
 
 ## Owed
 - Host Principia (`handlers/principia/src/prefs.rs`) still writes its one `preferences.toml`; it adopts
   `prefs_core::files` next (the same functions).
 - Lumen DECLARES its frame key; writing the frame on move/close is the wm's (WINMEMORY row 12).
 - Live reload of a hand-edited file (only a delete is noticed live; an edit is read at the next login).
+- PrefDeclare took bus verb 20 (una-abi `BUS_VERB_PREF_DECLARE`): the seat checks no other wave-arc minted 20.
+- A deleted file resets the TREE (every reader answers the schema default at its next read); a live consumer that
+  holds a hardware level (volume, brightness) re-applies on its next PrefChanged/login, not at the delete.

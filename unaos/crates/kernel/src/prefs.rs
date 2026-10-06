@@ -1030,12 +1030,9 @@ fn settingsfiles_selftest() {
     let dp = domain_path(NAME);
     let mt = crate::shell::vfs_mount_table();
     let others: Vec<(String, Option<Vec<u8>>)> = ON_DISK.lock().iter().map(|d| (d.clone(), read_all(&domain_path(d)))).collect();
-    let body = prefs_core::declare::body(NAME, &[prefs_core::declare::DeclKey {
-        key: String::from("level"),
-        kind: prefs_core::declare::DeclKind::Int { min: 0, max: 10 },
-        default: PrefValue::Int(5),
-        doc: String::from(DOC),
-    }]);
+    // The stanza as a program sends it (`tools/prefs-schema-check.py` R12 reads the literal as the declaration).
+    const STANZA: &[u8] = b"sftest\0level\tint:0:10\t5\tthe fixture's level (SETTINGSFILES)\n";
+    let body = prefs_core::declare::parse(STANZA).map(|(n, k)| prefs_core::declare::body(&n, &k)).unwrap_or_default();
     let mut out = Vec::new();
     let declared = prefs_core::wire::fulfil(&mut KernelStore, prefs_core::wire::VERB_DECLARE, &body, true, &mut out) == 0
         && prefs_core::wire::fulfil(&mut KernelStore, prefs_core::wire::VERB_DECLARE, &body, false, &mut out) == prefs_core::wire::EACCES;
