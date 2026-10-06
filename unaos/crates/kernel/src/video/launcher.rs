@@ -15,7 +15,8 @@
 //!   `settings::service`), never in the input router (R88).
 //! * THE SOURCES — Programs: the dock's table apps (`dock::installed_names`, launched by the pin's own post)
 //!   and every `/apps/*.ELF` (the shell line EXECNAME resolves, `dock::post_line_launch`, a glass launch);
-//!   names and icons are APPRES's. Files: `fs::search` (the name trees, one bounded walk per open).
+//!   names and icons are APPRES's. Files: `fs::search` (UnaFS's name index, one range scan per keystroke —
+//!   NAMEINDEX B432; a FAT root keeps one bounded walk per open).
 //!   Settings: `prefs_core::schema::SCHEMA`'s `system.*` keys and docs; a pick opens Settings on that row
 //!   (`settings::request_open_at`). Math: `+ - * / ( )` evaluated inline; Return copies the value.
 //! * RECENCY — a pick moves its token to the front of a 16-entry LRU kept in ONE file,
@@ -851,10 +852,18 @@ fn rerank() {
         None => return,
     };
     let lru = LRU.lock().clone();
+    // NAMEINDEX (B432): per keystroke, ONE range scan of the volume's name index; the open-time snapshot is
+    // only the FAT root's (or a still-building index's) fallback.
+    let indexed = if q.is_empty() { None } else { search::query(&q, 64) };
     let (items, n) = {
         let p = PROGS.lock();
-        let f = FILES.lock();
-        rank(&q, &p, &f, &lru)
+        match &indexed {
+            Some(f) => rank(&q, &p, f, &lru),
+            None => {
+                let f = FILES.lock();
+                rank(&q, &p, &f, &lru)
+            }
+        }
     };
     if let Some(st) = ST.lock().as_mut() {
         if st.query == q {
@@ -886,8 +895,10 @@ pub fn service() {
         let t0 = crate::arch::ms();
         lru_load();
         let p = programs();
-        let s = search::snapshot(search::SNAP_BUDGET);
-        serial_println!("[launcher] snapshot programs={} files={} truncated={} ms={}", p.len(), s.hits.len(), s.truncated as u8, crate::arch::ms().saturating_sub(t0));
+        // NAMEINDEX (B432): an indexed root needs no walk — each keystroke asks the index.
+        let idx = search::indexed();
+        let s = if idx { search::Snapshot { hits: Vec::new(), truncated: false } } else { search::snapshot(search::SNAP_BUDGET) };
+        serial_println!("[launcher] snapshot programs={} files={} truncated={} ms={} src={}", p.len(), s.hits.len(), s.truncated as u8, crate::arch::ms().saturating_sub(t0), if idx { search::SRC_INDEX } else { "walk" });
         *PROGS.lock() = p;
         *FILES.lock() = s.hits;
         RANK_OWED.store(true, Ordering::Release);
@@ -909,7 +920,11 @@ pub fn service() {
 pub fn selftest() {
     let t0 = crate::arch::ms();
     let progs = programs();
-    let snap = search::snapshot(search::SNAP_BUDGET);
+    // NAMEINDEX (B432): the files leg asks the name index (one range scan) when `/` has one, else walks.
+    let (snap, files_src) = match search::query("test", 64) {
+        Some(h) => (search::Snapshot { hits: h, truncated: false }, search::SRC_INDEX),
+        None => (search::snapshot(search::SNAP_BUDGET), "walk"),
+    };
     let (items_p, n_p) = rank("set", &progs, &[], &[]);
     let (_, n_f) = rank("test", &[], &snap.hits, &[]);
     let sm = settings_matches("bright");
@@ -944,7 +959,7 @@ pub fn selftest() {
         }
     };
     let ms = crate::arch::ms().saturating_sub(t0);
-    serial_println!("[launcher] fixture set_first={} bright={} testf={} walk={} truncated={}", set_first, bright, testf, snap.hits.len(), snap.truncated as u8);
+    serial_println!("[launcher] fixture set_first={} bright={} testf={} files={} truncated={} src={}", set_first, bright, testf, snap.hits.len(), snap.truncated as u8, files_src);
     let ok = programs_n >= 1 && set_first && (files_n >= 1 || !testf) && settings_n >= 1 && bright && math_ok && open_word != "FAIL";
     serial_println!(
         ":: LAUNCHER: programs={} files={} settings={} math={} open={} ms={} -> {} ::",

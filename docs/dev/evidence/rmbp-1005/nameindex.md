@@ -42,3 +42,25 @@ nameindex`), `fs/search.rs` + Quarry toolbar + launcher on the index, x86 leg.
 **Owed.** QUERYFOLDER's `name` fact term (a scan today) could ride this index; FAT roots keep the walk;
 non-ASCII case folding is ASCII-only (as `find_names` was); substring (mid-word) search is gone by design
 (prefix / word-prefix, the launcher's semantics).
+
+## Built (M1–M3)
+
+- M1 `unaos/libs/fs/unafs/src/nameindex.rs` (+ hooks in `fs.rs` add_entry / create_files_batch / unlink / rmdir /
+  rename / relink_inode / format; `index_apply` keeps name facts out of the equality tree and `entries`;
+  `fsck.rs` `name_index_missing` / `name_index_stale`, repair reindexes). QUARRY3's walk deleted.
+  KATs `tests/name_index.rs` + `tests/find_names.rs` (rewritten for prefix semantics). `codec_volume` v6/v7 IMAGE
+  digests re-cut (index bytes moved; READ-BACK digests unchanged — the codec oracle holds; v3/v5 untouched).
+- M2 `tools/unafs`: `unafs reindex --img <img>` → `[unafs] name-index built names=<n> keys=<n> ms=<n>`; `fsck` prints
+  `name index : ready= keys= expected= missing= stale=`.
+- M3 kernel: `fs/nameindex.rs` (login task + `tests nameindex`), `fs/search.rs` `query`/`by_name_src`
+  (`src=una-name-index`, walk only on a FAT root or an unbuilt index), Quarry toolbar, launcher (per-keystroke
+  index query, no open-time walk on an indexed root; fixture prints `src=`), `users::login` post, `settings::service`
+  chain, `filetype::ensure_tests` registration.
+
+## Legs
+
+`cargo test -p unafs -p unafs-cli`: 240 passed, 1 failed — `refmap_two_level::data_crosses_the_old_2gib_boundary`
+`No space left on device` (the shared disk, 1.6 GB free; not this arc). x86 seat line exit 0 and both aarch64
+legs exit 0 — x86 only after LOCAL, UNCOMMITTED patches to the tip's own merge17 reds (`video/settings.rs`
+`press_appearance` missing its `}` and `TP_TAB` usize-vs-u8 at line 470; `video/paper.rs:198` and
+`video/knurl.rs:421` const calls to the now non-const theme token fns) — the seat's, not in this arc.

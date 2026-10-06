@@ -436,6 +436,7 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("filetype", selftest);
+        #[cfg(any(target_arch = "aarch64", feature = "unafs"))] crate::fs::nameindex::ensure_tests(); // NAMEINDEX (B432): `tests nameindex` rides this registration
         crate::fs::attrfacts::ensure_tests(); // ATTRCOLUMNS (B402): `tests attrcolumns` rides this registration
         // QUARRY2 (B336): `tests quarry2` rides this registration (no tests.rs line).
         #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]

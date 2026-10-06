@@ -9,14 +9,14 @@
 //!   directory; a travel through the history does not record itself). `<` / `>` keys too.
 //! * **The view switcher** — List | Icons (`v` toggles). The icon view is `iconview.rs`.
 //! * **Search** — a field at the right of the toolbar (a press, or `/`, focuses it); every keystroke re-runs a
-//!   NAME match through UnaFS's name tree (`UnaFS::find_names`, the shared core both rings link — LAUNCHER row 36
-//!   reuses it), else a bounded walk of the namespace on a FAT root. The hits replace the list (their paths as
+//!   NAME match through UnaFS's name index (`fs::search::query` → `UnaFS::find_names`, ONE range scan, NAMEINDEX
+//!   B432 — the launcher's seam too), else a bounded walk of the namespace on a FAT root. The hits replace the list (their paths as
 //!   names, under `/`), Return keeps them, Esc (or emptying the field) puts the directory back.
 //! * **The path bar** — under the toolbar, the current place as segments `/ > volumes > UnaOS`; a press on a
 //!   segment goes there. The last activation's result (the only feedback a launch has) still rides it.
 //!
 //! Window state, not a preference (no store, R79). Lock order: `MODEL` then `TB`.
-//! Witness: `[quarry3] search q=<q> hits=<n> src=<unafs-names|walk> dirs=<n> ms=<n>` per keystroke.
+//! Witness: `[quarry3] search q=<q> hits=<n> src=<una-name-index|walk> dirs=<n> ms=<n>` per keystroke.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -207,14 +207,10 @@ fn set_view(v: View) {
 
 /// Every name containing `q`: `(absolute path, is_dir)`, the source, and the directories read.
 pub(super) fn search_names(q: &str, max: usize) -> (Vec<(String, bool)>, &'static str, usize) {
-    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
-    {
-        let mt = crate::shell::vfs_mount_table();
-        if mt.volume_name("/").map(|n| n == "native").unwrap_or(false) {
-            if let Ok(Ok((hits, dirs))) = crate::fs::unafs::with_unafs(|fs| fs.find_names(q, max, DIRS_MAX)) {
-                return (hits, "unafs-names", dirs);
-            }
-        }
+    // NAMEINDEX (B432): a native root with its name index answers in ONE range scan (`fs::search::query`,
+    // the launcher's seam too) — leaf prefix, then word prefix; no directory is read.
+    if let Some(hits) = crate::fs::search::query(q, max) {
+        return (hits.into_iter().map(|h| (h.path, h.dir)).collect(), crate::fs::search::SRC_INDEX, 0);
     }
     // A FAT root: a bounded breadth-first walk of the namespace through the one listing seam.
     let ql = q.to_ascii_lowercase();

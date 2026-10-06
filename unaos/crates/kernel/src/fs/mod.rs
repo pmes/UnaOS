@@ -188,5 +188,8 @@ pub mod attrfacts;
 pub mod bootfat;
 /// ROOTDISK2 (B401, R99): the boot log on UnaFS (`/var/log/boot-<n>.log`), not `UNAOS.LOG` on the boot FAT.
 pub mod bootlog;
-/// SEARCH (B417 LAUNCHER; QUARRY3 B413 joins): `by_name(prefix, limit)` — files by name, one bounded walk of the name trees.
+/// SEARCH (B417 LAUNCHER; QUARRY3 B413 joins): `by_name(prefix, limit)` — files by name, ONE range scan of UnaFS's name index (NAMEINDEX B432); a FAT root walks.
 pub mod search;
+/// NAMEINDEX (B432): the name index's login-time build on a volume written before it, and `tests nameindex`.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub mod nameindex;
