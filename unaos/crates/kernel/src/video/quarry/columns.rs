@@ -616,7 +616,8 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
             nm.push(b'*');
         }
         nm.truncate(c.name_cols);
-        text(px, g, c.name_x, y + g.ts, &nm, size_x.min(clip), ink);
+        let nx = text(px, g, c.name_x, y + g.ts, &nm, size_x.min(clip), ink); if dir && crate::fs::bootfat::shows_lock(&m.cwd, &ent.name) { lock_glyph(px, g, nx + g.cell_w() / 2, y + g.ts, size_x.min(clip), ink); } // ROOTDISK2 (R99): the sacred boot volume draws a lock (read-only)
+       
         if !dir && meta.map(|mm| mm.mime == crate::fs::filetype::UNAOS_ELF).unwrap_or(false) { let (ix, sz) = (c.name_x + (nm.len() + 1) * g.cell_w(), row_h.saturating_sub(4)); if ix + sz <= size_x.min(clip) { crate::fs::appres::blit_path_icon(px, g.w, g.h, ix, y + 2, sz, &join(&m.cwd, &ent.name)); } } // APPRES (B398): the program's icon (its own, else the generic one) after its name
         for (k, &(col, x, w)) in c.cols.iter().enumerate() {
             let cell: Vec<u8> = match col {
@@ -896,4 +897,21 @@ pub fn selftest() {
         origin,
         if fails.is_empty() { "PASS" } else { "FAIL" }
     );
+}
+
+/// ROOTDISK2 (B401, R99 "Quarry shows `boot` with a lock glyph"): a padlock one glyph cell wide after the name — a
+/// shackle (two posts and a bar) over a solid body, in the row's ink; clipped at `max_x`.
+fn lock_glyph(px: &mut [u32], g: &Geom, x: usize, y: usize, max_x: usize, ink: u32) {
+    let (w, h) = (g.cell_w().max(5), g.cell_h().max(8));
+    if x + w > max_x {
+        return;
+    }
+    let t = (w / 6).max(1);
+    let body_y = y + h * 9 / 20;
+    let body_h = (h * 8 / 20).max(3);
+    let top = y + h * 3 / 20;
+    fill(px, g, x, body_y, w, body_h, ink);
+    fill(px, g, x + t, top, w.saturating_sub(2 * t), t, ink);
+    fill(px, g, x + t, top, t, body_y - top, ink);
+    fill(px, g, x + w - 2 * t, top, t, body_y - top, ink);
 }

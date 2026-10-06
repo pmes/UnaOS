@@ -1528,25 +1528,25 @@ pub(crate) fn bind_root(
 
     let boot = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src);
     let boot_rw = !boot.read_only();
-    mt.mount("/boot", alloc::boxed::Box::new(boot)); crate::fs::rootdisk::bind_lib(mt, src, announce); // ROOTDISK (B390, R94): `/lib` = the boot FAT rooted at `LIB/` (was `/apps/LIB`)
-    mt.mount(
+    mt.mount("/boot", alloc::boxed::Box::new(boot)); let native_root = crate::fs::rootdisk::apps_on_root(native_root); if !native_root { crate::fs::rootdisk::bind_lib(mt, src, announce); } else { crate::fs::bootfat::arm(announce); if announce { crate::fs::rootdisk::announce_native(src); } } // ROOTDISK2 (B401, R94): on a native root `/apps` and `/lib` are the UnaFS volume's own directories — no FAT mounts, no links
+    if !native_root { mt.mount(
         "/apps",
         alloc::boxed::Box::new(
             FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src)
                 .rooted(crate::fs::fat::APPS_DIR),
         ),
-    );
+    ); }
     if announce {
         serial_println!(
             "[vfs] boot mount /boot = fat boot volume source={} rw={} ::",
             src.name(),
             if boot_rw { "yes" } else { "no" }
         );
-        serial_println!(
+        if !native_root { serial_println!(
             "[vfs] apps mount /apps = fat boot volume source={} rooted={} ::",
             src.name(),
             crate::fs::fat::APPS_DIR
-        );
+        ); }
     }
 }
 
@@ -2086,10 +2086,13 @@ pub fn unafsroot_selftest() { if crate::tests::defer("unafsroot", unafsroot_self
     // is derived the same way from the same constant rather than compared to the bare name.
     let apps_root_want = alloc::format!("/{}", crate::fs::fat::APPS_DIR);
     let fat_rooted = |s: &(String, String, String, String, usize)| {
-        s.1 == "boot" && s.2 == "boot" && s.3 == apps_root_want && s.4 == 3
+        s.1 == "boot" && s.2 == "boot" && s.3 == apps_root_want && s.4 == 4 // `/`, `/boot`, `/lib` (ROOTDISK), `/apps`
     };
+    // ROOTDISK2 (B401, R94): an x86 native root carries `/apps` and `/lib` as its OWN directories — `/apps` resolves
+    // on the native root and only `/` and `/boot` are mounted; aarch64's native root keeps the FAT program source.
+    let native_owns = |s: &(String, String, String, String, usize)| s.1 == "boot" && s.2 == "native" && s.4 == 2;
     let leg6 = sp.0 == ROOT_WHEN_PRESENT
-        && fat_rooted(&sp)
+        && (if crate::fs::rootdisk::apps_on_root(sp.0 == "native") { native_owns(&sp) } else { fat_rooted(&sp) })
         && sa.0 == "boot"
         && fat_rooted(&sa)
         && so.0 == "boot"

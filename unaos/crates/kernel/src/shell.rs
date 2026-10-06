@@ -2342,16 +2342,16 @@ impl midden_core::Volume for FatVolume {
         // namespace because this probe must keep binding `mount_program_source()` and STAMPING
         // [`EXEC_BIND`] (the FATVERB witness reads that stamp); x86's `/` IS the volume root, so
         // `/APPS/VUG.ELF` on the volume and `/apps/VUG.ELF` in the namespace are one file.
-        let from_cwd = normalize_path(&cwd_path(), name);
-        if fat_path_is_file(&fs, &from_cwd) {
+        let from_cwd = vfs_path(name); let _ = &fs; let ns = vfs_mount_table(); let ns_file = |p: &str| matches!(ns.stat(p), Ok(st) if !matches!(st.kind, crate::fs::vfs::NodeKind::Dir)); // ROOTDISK2 (B401, R94): the probe asks the NAMESPACE (cwd, then EXEC_ROOT) — `/apps` is a UnaFS directory on the card; the bind above still stamps EXEC_BIND
+        if ns_file(&from_cwd) {
             return true;
         }
         if name.starts_with('/') {
             return false; // an absolute token means what it says; the second probe is for bare names
         }
         let from_apps = normalize_path(
-            &alloc::format!("/{}", crate::fs::fat::APPS_DIR), name);
-        from_apps != from_cwd && fat_path_is_file(&fs, &from_apps)
+            EXEC_ROOT, name);
+        from_apps != from_cwd && ns_file(&from_apps)
     }
     /// BARENAME (PARITY §6.6a): the aarch64 twin — the SAME question, asked of the namespace this
     /// arch actually has.

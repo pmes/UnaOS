@@ -9262,15 +9262,28 @@ pack_source_along() {
 # target/unaos-x86-card.img, GPT: p1 = EFI System FAT32 (the ESP tree + the data tree, so the firmware
 # still finds the ESP as partition 1 and the kernel mounts it at /boot and /apps), p2 = a `tools/unafs
 # init` volume the kernel's `locate_unafs` finds by superblock magic and `bind_root` makes `/`.
-# UNAOS_X86_UNAFS_MB sizes p2 (default 512, capped at 2048 per LAWS' 2 GiB image cap). Write the
+# p2 is sized by ROOTDISK2 below (content + headroom, floor 4096 MiB; UNAOS_X86_UNAFS_MB raises it). Write the
 # whole image to the card (`dd`), not the trees. Boot witness:
 #   :: UNAFSX86: root=unafs disk=<source> blocks=<n> gen=<g> home=/home -> PASS ::
+# ROOTDISK2 (rmbp-ledger B401, R94 "where the new folder is for real"): /apps and /lib live ON the UnaFS volume — the
+# ESP's APPS/ (+ the data tree's APPS/, which mcopy used to merge over it), LIB/ and system/ (R99) are put recursively
+# into /apps, /lib and /system, and `una-card --skip APPS --skip LIB --skip system` leaves them off p1. unafs_mb is DERIVED: content + 25% + 512 MiB headroom,
+# floor 4096 (the card is 64 GB; LIB/rustc alone is ~420 MB); UNAOS_X86_UNAFS_MB raises it, never lowers it below the
+# content. una-card copies p2 sparse. Boot witness: `[vfs] apps+lib on the native root …`; `tests rootdisk` →
+#   :: ROOTDISK2: apps=unafs lib=unafs links=volumes-only rmdir=ok image_mb=<n> -> PASS ::
 esp_x86_unafs_card() {
-    local unafs_mb="${UNAOS_X86_UNAFS_MB:-512}"
-    if [ "$unafs_mb" -gt 2048 ] 2>/dev/null; then
-        echo -e "${COLOR_YELLOW}⚠ UNAOS_X86_UNAFS_MB=${unafs_mb} capped at 2048 (the 2 GiB image cap)${COLOR_RESET}"
-        unafs_mb=2048
+    local esp_t="${WORKSPACE_DIR}/target/x86_64_esp" data_t="${WORKSPACE_DIR}/target/x86_64_data"
+    local content_kb=0 d
+    for d in "$esp_t/APPS" "$data_t/APPS" "$esp_t/LIB" "$esp_t/system" "$data_t/system"; do
+        [ -d "$d" ] && content_kb=$(( content_kb + $(du -sk "$d" | cut -f1) ))
+    done
+    local content_mb=$(( content_kb / 1024 ))
+    local unafs_mb=$(( content_mb + content_mb / 4 + 512 ))
+    [ "$unafs_mb" -lt 4096 ] && unafs_mb=4096
+    if [ -n "${UNAOS_X86_UNAFS_MB:-}" ] && [ "${UNAOS_X86_UNAFS_MB}" -gt "$unafs_mb" ] 2>/dev/null; then
+        unafs_mb="${UNAOS_X86_UNAFS_MB}"
     fi
+    echo -e "${COLOR_YELLOW}⚡ ROOTDISK2: UnaFS volume ${unafs_mb} MiB (content ${content_mb} MiB: apps + lib + system; floor 4096)${COLOR_RESET}"
     local vol="${WORKSPACE_DIR}/target/unafs-x86.img"
     local card="${WORKSPACE_DIR}/target/unaos-x86-card.img"
     local UNAFS_CLI_MANIFEST="${WORKSPACE_DIR}/../tools/unafs/Cargo.toml"
@@ -9278,31 +9291,27 @@ esp_x86_unafs_card() {
     rm -f "$vol" "$card"
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$vol" -s "$unafs_mb" || {
         echo -e "${COLOR_RED}❌ UNAFSX86: tools/unafs init failed — no card image${COLOR_RESET}"; return 1; }
-    # VOLUMES (B366) M3: the builder's system/test-f (free format samples, builder/testf.list) onto the UnaFS root, so
-    # /system/test-f is on the volume `/` is — `tests testf` / `tests play` find it there before /boot/system/test-f.
-    local testf_dir="${WORKSPACE_DIR}/target/x86_64_data/system/test-f"
-    if [ -d "$testf_dir" ]; then
-        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- mkdir /system/test-f -i "$vol" >/dev/null || {
-            echo -e "${COLOR_RED}❌ VOLUMES: tools/unafs mkdir /system/test-f failed — no card image${COLOR_RESET}"; return 1; }
-        local tf_n=0 tf
-        for tf in "$testf_dir"/*; do
-            [ -f "$tf" ] || continue
-            cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$tf" /system/test-f -i "$vol" >/dev/null || {
-                echo -e "${COLOR_RED}❌ VOLUMES: tools/unafs put ${tf##*/} failed — no card image${COLOR_RESET}"; return 1; }
-            tf_n=$((tf_n + 1))
-        done
-        echo -e "${COLOR_GREEN}  • TEST-F: ${tf_n} file(s) onto the UnaFS root at /system/test-f (VOLUMES, B366)${COLOR_RESET}"
-    fi
+    # ROOTDISK2 (B401): the programs and the libraries onto the volume `/` is — real directories, not ESP links.
+    # R99 ("the boot fat partition is sacred"): `system/` too (fonts, witness-owners.txt, and VOLUMES' test-f — the
+    # builder's free format samples, builder/testf.list — which used to be put file by file); the kernel reads
+    # /system/fonts and /system/test-f first. p1 keeps the loader, the kernel, the firmware blobs and the EL0 fixtures.
+    local src dst
+    for src in "$esp_t/APPS:/apps" "$data_t/APPS:/apps" "$esp_t/LIB:/lib" "$esp_t/system:/system" "$data_t/system:/system"; do
+        dst="${src##*:}"; src="${src%:*}"
+        [ -d "$src" ] || continue
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$src" "$dst" -i "$vol" || {
+            echo -e "${COLOR_RED}❌ ROOTDISK2: tools/unafs put ${src#${WORKSPACE_DIR}/} -> ${dst} failed — no card image${COLOR_RESET}"; return 1; }
+    done
     # SELFINSTALL2 (B310): the card's GPT is laid by `tools/una-card` over `amber_core` — the SAME core the
     # kernel's `install ssd --write` lays the SSD with (it replaced scripts/make-x86-card.py, byte-identical).
     cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/una-card/Cargo.toml" -- \
         --esp "${WORKSPACE_DIR}/target/x86_64_esp" --data "${WORKSPACE_DIR}/target/x86_64_data" \
-        --unafs "$vol" -o "$card" || {
+        --skip APPS --skip LIB --skip system --unafs "$vol" -o "$card" || {
         echo -e "${COLOR_RED}❌ UNAFSX86: tools/una-card failed — no card image${COLOR_RESET}"; return 1; }
     rm -f "$vol"
     echo -e "${COLOR_GREEN}✅ x86 CARD (UnaFS root): ${card}${COLOR_RESET}"
     echo -e "   sha256: $(sha256_of "$card")"
-    echo -e "   p1 = ESP (FAT32, boot + data trees) · p2 = UnaFS system volume (${unafs_mb} MiB) — dd the whole image"
+    echo -e "   p1 = ESP (FAT32, loader + kernel + firmware + EL0 fixtures; R99: no APPS/LIB/system) · p2 = UnaFS system volume (${unafs_mb} MiB: /apps /lib /system) — dd the whole image"
 }
 
 # KERNELFONT2 (rmbp-ledger B363, R85 item 12: "fonts-noto-core on the builder host"): the four Noto script faces

@@ -101,7 +101,7 @@ fn check() -> Option<alloc::vec::Vec<u8>> {
         None
     };
     let why = |r: &str| serial_println!(":: LUMENAPP: reason={} ::", r);
-    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+    let Ok(fs) = crate::fs::rootdisk::program_source() else {
         why("no-program-volume");
         return verdict("bad", "SKIP");
     };

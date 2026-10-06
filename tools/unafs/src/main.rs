@@ -48,7 +48,10 @@ enum Commands {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
-    /// Inject a file from the host into the vault (destination must be a directory)
+    /// Inject a file from the host into the vault (destination must be a directory).
+    /// ROOTDISK2 (B401): a DIRECTORY source is put recursively — its CONTENTS land in DESTINATION
+    /// (made with every missing parent, like `mkdir -p`; rsync's `SRC/` sense), a file already there is
+    /// replaced, symlinks are skipped, and each directory is one commit.
     Put {
         source: String,
         destination: String,
@@ -603,6 +606,68 @@ fn run_bench_batch(source: &str, out_dir: &str, size_mb: u64) -> Result<()> {
     Ok(())
 }
 
+/// `mkdir -p` inside the vault: every missing component of `path` is made; returns the final id.
+fn mkdir_p(fs: &mut FileSystem, path: &str) -> Result<u64> {
+    let mut at = String::new();
+    let mut parent = fs.resolve_path("/").context("No root")?;
+    for c in path.split('/').filter(|c| !c.is_empty()) {
+        at.push('/');
+        at.push_str(c);
+        parent = match fs.resolve_path(&at) {
+            Ok(id) => id,
+            Err(_) => fs.mkdir(parent, c.to_string()).with_context(|| format!("mkdir {at}"))?,
+        };
+    }
+    Ok(parent)
+}
+
+/// ROOTDISK2 (B401): the recursive `put` — the CONTENTS of host directory `src` into vault directory
+/// `dest` (made if missing). A file of the same name is replaced (unlink + create, so the old blocks are
+/// released); a directory is merged. One commit per directory, so a large tree (LIB/rustc, ~420 MB) never
+/// stages more than one directory's files. Returns (directories made or merged, files, bytes).
+fn put_tree(fs: &mut FileSystem, src: &Path, dest: &str) -> Result<(usize, usize, u64)> {
+    fs.set_autocommit(false);
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((src.to_path_buf(), dest.trim_end_matches('/').to_string()));
+    let (mut dirs, mut files, mut bytes) = (0usize, 0usize, 0u64);
+    while let Some((host, vault)) = queue.pop_front() {
+        let dir_id = mkdir_p(fs, if vault.is_empty() { "/" } else { &vault })?;
+        dirs += 1;
+        let mut rows: Vec<_> = std::fs::read_dir(&host)
+            .with_context(|| format!("read_dir {}", host.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        rows.sort_by_key(|e| e.file_name());
+        let existing = fs.ls(dir_id).map_err(|e| anyhow::anyhow!("ls {vault}: {e:?}"))?;
+        for e in rows {
+            let ft = e.file_type()?;
+            let name = e.file_name().to_string_lossy().to_string();
+            if ft.is_symlink() {
+                continue; // never followed (the scan_tree rule)
+            }
+            if ft.is_dir() {
+                queue.push_back((e.path(), format!("{}/{}", vault, name)));
+            } else if ft.is_file() {
+                if let Some(old) = existing.iter().find(|x| x.name == name) {
+                    if old.kind == unafs::FileKind::Directory {
+                        anyhow::bail!("{vault}/{name} is a directory in the vault and a file on the host");
+                    }
+                    fs.unlink(dir_id, &name).map_err(|e| anyhow::anyhow!("replace {vault}/{name}: {e:?}"))?;
+                }
+                let data = std::fs::read(e.path()).with_context(|| format!("read {}", e.path().display()))?;
+                let fid = fs.create_file(dir_id, name.clone()).with_context(|| format!("create {vault}/{name}"))?;
+                if !data.is_empty() {
+                    fs.write_data(fid, 0, &data).with_context(|| format!("write {vault}/{name}"))?;
+                }
+                files += 1;
+                bytes += data.len() as u64;
+            }
+        }
+        fs.commit().with_context(|| format!("commit {vault}"))?;
+    }
+    fs.set_autocommit(true);
+    Ok((dirs, files, bytes))
+}
+
 /// Split a vault path into (parent path, entry name). "/a/b/c" -> ("/a/b", "c").
 fn split_parent(path: &str) -> Result<(&str, &str)> {
     let trimmed = path.trim_end_matches('/');
@@ -691,6 +756,14 @@ async fn main() -> Result<()> {
             let device = FileDevice::open(img).context("Failed to open device")?;
             let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
 
+            if Path::new(source).is_dir() {
+                let (dirs, files, bytes) = put_tree(&mut fs, Path::new(source), destination)?;
+                println!(
+                    "✅ [OPERATOR] Put tree '{}' into '{}' ({} dirs, {} files, {} bytes)",
+                    source, destination, dirs, files, bytes
+                );
+                return Ok(());
+            }
             let parent_id = fs
                 .resolve_path(destination)
                 .context("Destination directory not found")?;

@@ -184,3 +184,7 @@ pub mod exfat;
 pub mod appres;
 /// ATTRCOLUMNS (B402): a file's sniffed facts as typed attributes (`media:*`, `doc:title`), the edit in place, `una:view`.
 pub mod attrfacts;
+/// ROOTDISK2 (B401, R99): the boot FAT is sacred — read-only for every principal, `fat_unlock` for the installer.
+pub mod bootfat;
+/// ROOTDISK2 (B401, R99): the boot log on UnaFS (`/var/log/boot-<n>.log`), not `UNAOS.LOG` on the boot FAT.
+pub mod bootlog;
