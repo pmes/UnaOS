@@ -393,42 +393,42 @@ pub const LINE_HEIGHT_PCT: usize = 165;
 // ---------------------------------------------------------------------------
 
 /// Metrics that must be strictly positive for any chrome to be drawable.
-#[allow(dead_code)] pub(crate) fn uimetrics_assert_positive() {
-    assert!(FRAME() > 0);
-    assert!(BEVEL() > 0);
-    assert!(TITLE_HEIGHT() > 0);
-    assert!(SCROLLBAR_WIDTH() > 0);
-    assert!(BUTTON_HEIGHT() > 0);
-    assert!(BUTTON_PAD_X() > 0);
-    assert!(GAP() > 0);
-    assert!(CONTROL_BOX() > 0);
-    assert!(TEXT_PX() > 0);
-    assert!(LINE_HEIGHT_PCT > 0);
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity_positive(ck: &mut super::metrics::Sane) {
+    ck.t(FRAME() > 0);
+    ck.t(BEVEL() > 0);
+    ck.t(TITLE_HEIGHT() > 0);
+    ck.t(SCROLLBAR_WIDTH() > 0);
+    ck.t(BUTTON_HEIGHT() > 0);
+    ck.t(BUTTON_PAD_X() > 0);
+    ck.t(GAP() > 0);
+    ck.t(CONTROL_BOX() > 0);
+    ck.t(TEXT_PX() > 0);
+    const _: () = assert!(LINE_HEIGHT_PCT > 0);
     // The three radii (`corner_radius`, `widget_radius`, `well_radius`) may each
     // legitimately be 0 (a square head, a square widget, a square well), so they are
     // bounded below rather than required positive.
 }
 
 /// Relationships the json's own numbers imply, and that the chrome geometry relies on.
-#[allow(dead_code)] pub(crate) fn uimetrics_assert_relations() {
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity_relations(ck: &mut super::metrics::Sane) {
     // The bevel is drawn inside the frame.
-    assert!(BEVEL() < FRAME());
+    ck.t(BEVEL() < FRAME());
     // The rounded head must fit inside the title bar: 12 < 34.
-    assert!(CORNER_RADIUS() < TITLE_HEIGHT());
+    ck.t(CORNER_RADIUS() < TITLE_HEIGHT());
     // Title-bar controls must fit inside the title bar: 24 < 34 since the size ruling.
-    assert!(CONTROL_BOX() < TITLE_HEIGHT());
+    ck.t(CONTROL_BOX() < TITLE_HEIGHT());
     // …and must leave a real clearance band, not merely fit. `(34 - 24)/2` = 5 px each side, which
     // is tight (see the note on `CONTROL_BOX`: raising `TITLE_HEIGHT` is a proposed taste-gate
     // question). One bevel of clearance is the floor below which the disc would touch the frame.
-    assert!(TITLE_HEIGHT() >= CONTROL_BOX() + 2 * BEVEL());
+    ck.t(TITLE_HEIGHT() >= CONTROL_BOX() + 2 * BEVEL());
     // A circular control needs a non-degenerate radius, or it cannot be drawn round.
-    assert!(CONTROL_RADIUS() > 0);
+    ck.t(CONTROL_RADIUS() > 0);
     // Both of a widget's corners must fit within its own height: 2*8 <= 28.
-    assert!(2 * WIDGET_RADIUS() <= BUTTON_HEIGHT());
+    ck.t(2 * WIDGET_RADIUS() <= BUTTON_HEIGHT());
     // A well's corner is a chrome-scale radius, not a window-scale one.
-    assert!(WELL_RADIUS() < TITLE_HEIGHT());
+    ck.t(WELL_RADIUS() < TITLE_HEIGHT());
     // A line of text is taller than the glyph box.
-    assert!(LINE_HEIGHT_PCT > 100);
+    const _: () = assert!(LINE_HEIGHT_PCT > 100);
 }
 
 /// Every colour is a packed `0x00RRGGBB`: the alpha byte is zero, because the json

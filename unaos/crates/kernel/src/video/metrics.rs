@@ -21,10 +21,9 @@
 //! from.
 //!
 //! * [`ignite`] — called where the console takes the panel's face (`fbcon`'s two arm sites, which latch
-//!   `video::dpi`): the theme's relations (the old `const` assertions of `theme`, `wm`, `menubar`, `dock`,
-//!   `crystal`, `strip`, `winmenu`) run on the LATCHED metrics — they were proven at compile time for every
-//!   scale 1.0..=4.0 (`ui.rs`), so a failure here is a table edit that escaped that proof — and the boot says
-//!   `[ui] metrics ppi=… scale=… bar=… title=… frame=… gap=… disc=… chrome=WxH cell=WxH glyph=k asserts=ok`.
+//!   `video::dpi`): the boot says `[ui] metrics ppi=… scale=… bar=… title=… frame=… gap=… disc=… chrome=WxH
+//!   cell=WxH glyph=k asserts=tests`. The furniture's relations no longer run here (SANITYLEGS, B488 — a stale
+//!   one rebooted every flight-26 boot): the constant ones are `const _` asserts, the metric ones `tests sanity`.
 //! * [`consts_disagreeing`] — the furniture readers (`theme::*()`, `wm::TITLE_H()`, `strip::PAD()`, the chrome
 //!   and grid cells, the bar / dock / crystal cells) that do not answer what `ui::Metrics::panel()` says: 0 is
 //!   "no const left behind".
@@ -34,28 +33,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 static IGNITED: AtomicBool = AtomicBool::new(false);
 
-/// The furniture's runtime asserts on the latched metrics, once per boot, and the `[ui] metrics` line.
+/// The `[ui] metrics` line, once per boot (no checks: R80, SANITYLEGS).
 pub fn ignite() {
     if IGNITED.swap(true, Ordering::AcqRel) {
         return;
     }
     let m = crate::ui::Metrics::panel();
-    if let Err(why) = m.check() {
-        panic!("UIMETRICS: ui::Metrics relation `{}` fails at s2={} — the compile-time proof in ui.rs was bypassed", why, m.s2);
-    }
-    crate::video::theme::uimetrics_assert_positive();
-    crate::video::theme::uimetrics_assert_relations();
-    crate::video::wm::uimetrics_assert_title_cell();
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-    {
-        crate::video::strip::uimetrics_assert();
-        crate::video::dock::uimetrics_assert();
-        crate::video::menubar::uimetrics_assert();
-        crate::video::crystal::uimetrics_assert();
-        crate::video::winmenu::uimetrics_assert();
-    }
+    // SANITYLEGS (B488, R80): the relation checks that used to run (and PANIC, i.e. reboot) here are `tests sanity`
+    // now — flight 26 looped on one of them. The constant halves are `const _` asserts the compile legs prove.
     serial_println!(
-        "[ui] metrics ppi={} scale={} s2={} bar={} title={} frame={} gap={} disc={} chrome={}x{} cell={}x{} glyph={} win={}x{} consts={} asserts=ok",
+        "[ui] metrics ppi={} scale={} s2={} bar={} title={} frame={} gap={} disc={} chrome={}x{} cell={}x{} glyph={} win={}x{} consts={} asserts=tests",
         m.ppi,
         crate::video::dpi::scale_str(m.s2),
         m.s2,
@@ -157,6 +144,7 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("metrics", fixture);
+        crate::tests::register("sanity", sanity_fixture); // SANITYLEGS (B488)
     }
 }
 
@@ -261,4 +249,74 @@ pub fn leaked_surf(at: &core::sync::atomic::AtomicUsize, n: usize) -> &'static m
         b[0] = n as u32;
         let _ = at.compare_exchange(p, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire);
     }
+}
+
+// ── SANITYLEGS (rmbp-ledger B488) — the furniture's layout relations, as a `tests` leg ───────────────────────
+//
+// Flight 26 (image 19) rebooted on EVERY boot at `winmenu.rs:2269 assertion failed: BAR_BOXES_MAX ==
+// MENU_TITLES_MAX + 2`: a runtime assert over constants, run once at boot by `ignite`, that no compile leg ever
+// evaluated. Every such assert whose operands are `const` items is now a `const _: () = assert!(…)` in place (the
+// compile legs prove it); the ones over the DPI-latched metric readers record into a [`Sane`] here, run by
+// `tests sanity` and never at boot (R80). GATE-SANITY (`unaos/scripts/sanity-legs.py`) refuses a new runtime assert
+// over consts. Witness: `:: SANITY: const_asserts=<n> runtime_moved=<n> left=<n> -> PASS|FAIL ::`, `left` = the
+// moved relations that do NOT hold on this boot's latched metrics.
+
+/// The `const _` sanity asserts SANITYLEGS placed in the furniture files (GATE-SANITY counts them and refuses a
+/// mismatch, so this number cannot drift from the tree).
+pub const SANITY_CONST_ASSERTS: usize = 17;
+
+/// A relation recorder: `t(cond)` counts a checked relation and names the first that fails by its source line.
+pub struct Sane {
+    pub n: usize,
+    pub bad: usize,
+    pub first: Option<&'static core::panic::Location<'static>>,
+}
+
+impl Sane {
+    pub const fn new() -> Self {
+        Sane { n: 0, bad: 0, first: None }
+    }
+    #[track_caller]
+    pub fn t(&mut self, ok: bool) {
+        self.n += 1;
+        if !ok {
+            self.bad += 1;
+            if self.first.is_none() {
+                self.first = Some(core::panic::Location::caller());
+            }
+        }
+    }
+}
+
+/// Every moved relation, on the latched metrics. Returns the recorder.
+pub fn sanity_run() -> Sane {
+    let mut ck = Sane::new();
+    ck.t(crate::ui::Metrics::panel().check().is_ok());
+    crate::video::theme::uimetrics_sanity_positive(&mut ck);
+    crate::video::theme::uimetrics_sanity_relations(&mut ck);
+    crate::video::wm::uimetrics_sanity_title_cell(&mut ck);
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        crate::video::strip::uimetrics_sanity(&mut ck);
+        crate::video::dock::uimetrics_sanity(&mut ck);
+        crate::video::menubar::uimetrics_sanity(&mut ck);
+        crate::video::crystal::uimetrics_sanity(&mut ck);
+        crate::video::winmenu::uimetrics_sanity(&mut ck);
+    }
+    ck
+}
+
+/// `tests sanity`.
+pub fn sanity_fixture() {
+    let ck = sanity_run();
+    if let Some(l) = ck.first {
+        serial_println!("[sanity] first failing relation at {}:{} (of {} failing)", l.file(), l.line(), ck.bad);
+    }
+    serial_println!(
+        ":: SANITY: const_asserts={} runtime_moved={} left={} -> {} ::",
+        SANITY_CONST_ASSERTS,
+        ck.n,
+        ck.bad,
+        if ck.bad == 0 { "PASS" } else { "FAIL" }
+    );
 }
