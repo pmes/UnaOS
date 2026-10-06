@@ -1536,3 +1536,264 @@ mod consolefix_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// APPRES (rmbp-ledger B398, MACPARITY §16 B4 / row 38): a program's RESOURCES
+// ---------------------------------------------------------------------------
+//
+// On BeOS an app's signature, icons and version lived in the executable's resources and the registrar
+// published them, so Tracker and the Deskbar showed the icon before the app ever ran. Here the block is a
+// second UnaOS note (owner "UnaOS", type [`APP_RES_NOTE_TYPE`]) in a NON-ALLOC `SHT_NOTE` section
+// `.note.unaos.res` that `tools/una-res` appends after the strip — no program header, so the loader never
+// maps it. The desc is [`RES_MAGIC`], a LE u32 record count, then `(u16 key_len, u32 val_len, key, value)`
+// records, unpadded. The parse and the builder live here (both rings and the host tool link this crate), and
+// every read is bounds-checked: the bytes are UNTRUSTED.
+
+/// `una_abi::APP_RES_NOTE_TYPE`.
+pub const APP_RES_NOTE_TYPE: u32 = 2;
+/// The resource block's leading magic: format 1.
+pub const RES_MAGIC: &[u8; 8] = b"UNARES\0\x01";
+/// The display name.
+pub const RES_KEY_NAME: &str = "una:name";
+/// The app's signature, reverse-DNS (`org.unaos.quarry`).
+pub const RES_KEY_SIGNATURE: &str = "una:signature";
+/// `semver+build`.
+pub const RES_KEY_VERSION: &str = "una:version";
+/// `windowed` · `resident` · `console` — the launch note in words.
+pub const RES_KEY_KIND: &str = "una:kind";
+/// The icon's SVG source.
+pub const RES_KEY_ICON_SVG: &str = "una:icon.svg";
+/// The icon rendered at 32, 64 and 128 px: RGBA PNGs.
+pub const RES_KEY_ICON_32: &str = "una:icon.32";
+pub const RES_KEY_ICON_64: &str = "una:icon.64";
+pub const RES_KEY_ICON_128: &str = "una:icon.128";
+/// The MIME types the app opens, newline-separated.
+pub const RES_KEY_DOCTYPES: &str = "una:doctypes";
+/// The rendered icon sizes, smallest first, with their keys.
+pub const RES_ICON_SIZES: [(u32, &str); 3] = [(32, RES_KEY_ICON_32), (64, RES_KEY_ICON_64), (128, RES_KEY_ICON_128)];
+
+/// The records of a resource block, in order. `None` when the block is not one (bad magic, a record that
+/// runs off the end, a key that is not UTF-8, trailing bytes, or a count that disagrees with the records).
+pub fn res_records(block: &[u8]) -> Option<Vec<(&str, &[u8])>> {
+    if block.get(..8)? != RES_MAGIC {
+        return None;
+    }
+    let count = le32(block, 8)? as usize;
+    let mut out = Vec::with_capacity(count.min(64));
+    let mut i = 12usize;
+    for _ in 0..count {
+        let kl = le16(block, i)? as usize;
+        let vl = le32(block, i + 2)? as usize;
+        let k_at = i.checked_add(6)?;
+        let v_at = k_at.checked_add(kl)?;
+        let end = v_at.checked_add(vl)?;
+        let key = core::str::from_utf8(block.get(k_at..v_at)?).ok()?;
+        if key.is_empty() {
+            return None;
+        }
+        out.push((key, block.get(v_at..end)?));
+        i = end;
+    }
+    if i != block.len() {
+        return None;
+    }
+    Some(out)
+}
+
+/// One value of a resource block (the first record with `key`).
+pub fn res_get<'a>(block: &'a [u8], key: &str) -> Option<&'a [u8]> {
+    res_records(block)?.into_iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+}
+
+/// One value as UTF-8 text.
+pub fn res_str<'a>(block: &'a [u8], key: &str) -> Option<&'a str> {
+    res_get(block, key).and_then(|v| core::str::from_utf8(v).ok())
+}
+
+/// Build a resource block from records (the host tool's writer and the tests). `None` when a key or value
+/// cannot be encoded (key over u16, value over u32, empty key).
+pub fn res_build(records: &[(&str, &[u8])]) -> Option<Vec<u8>> {
+    let mut b = Vec::new();
+    b.extend_from_slice(RES_MAGIC);
+    b.extend_from_slice(&u32::try_from(records.len()).ok()?.to_le_bytes());
+    for (k, v) in records {
+        if k.is_empty() {
+            return None;
+        }
+        b.extend_from_slice(&u16::try_from(k.len()).ok()?.to_le_bytes());
+        b.extend_from_slice(&u32::try_from(v.len()).ok()?.to_le_bytes());
+        b.extend_from_slice(k.as_bytes());
+        b.extend_from_slice(v);
+    }
+    Some(b)
+}
+
+/// The desc of the first UnaOS note of `ntype` inside one note area, if any.
+fn find_note(area: &[u8], ntype: u32) -> Option<&[u8]> {
+    let mut i = 0usize;
+    while i.checked_add(12)? <= area.len() {
+        let namesz = le32(area, i)? as usize;
+        let descsz = le32(area, i + 4)? as usize;
+        let t = le32(area, i + 8)?;
+        let name_at = i + 12;
+        let desc_at = name_at.checked_add(align4(namesz)?)?;
+        let next = desc_at.checked_add(align4(descsz)?)?;
+        if desc_at.checked_add(descsz)? > area.len() {
+            return None;
+        }
+        if t == ntype && area.get(name_at..name_at + namesz) == Some(APP_NOTE_NAME) {
+            return area.get(desc_at..desc_at + descsz);
+        }
+        i = next;
+    }
+    None
+}
+
+/// The resource block inside ONE note area (a `.note.unaos.res` section's bytes), if any.
+pub fn res_in_note_area(area: &[u8]) -> Option<&[u8]> {
+    find_note(area, APP_RES_NOTE_TYPE)
+}
+
+/// Where an ELF64 LE image's section-header table lies: `(offset, entries)`, from the 64-byte header
+/// alone. `None` for a non-ELF64-LE header or an entry size other than 64.
+pub fn elf_shdr_table(ehdr: &[u8]) -> Option<(usize, usize)> {
+    if ehdr.len() < 64 || ehdr[0..4] != [0x7F, b'E', b'L', b'F'] || ehdr[4] != 2 || ehdr[5] != 1 {
+        return None;
+    }
+    let (shoff, shent, shnum) = (le64(ehdr, 40)?, le16(ehdr, 58)? as usize, le16(ehdr, 60)? as usize);
+    if shent != 64 || shoff == 0 || shnum == 0 {
+        return None;
+    }
+    Some((shoff, shnum))
+}
+
+/// The `(offset, size)` of every `SHT_NOTE` section in a section-header table's bytes. The kernel reads
+/// the header, then the table, then only these areas — never the whole program.
+pub fn elf_note_sections(shdrs: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for sh in shdrs.chunks_exact(64) {
+        if le32(sh, 4) == Some(7) {
+            if let (Some(o), Some(s)) = (le64(sh, 24), le64(sh, 32)) {
+                out.push((o, s));
+            }
+        }
+    }
+    out
+}
+
+/// The resource block of a whole ELF image in memory (the launch path already holds the bytes), via its
+/// section table. `None` when it carries none.
+pub fn app_res(b: &[u8]) -> Option<&[u8]> {
+    let (off, n) = elf_shdr_table(b)?;
+    let table = b.get(off..off.checked_add(n.checked_mul(64)?)?)?;
+    for (o, s) in elf_note_sections(table) {
+        if let Some(area) = b.get(o..o.checked_add(s)?) {
+            if let Some(r) = res_in_note_area(area) {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
+
+/// A note record wrapping `desc` as the UnaOS resource note (what the host tool appends as the section).
+pub fn res_note(desc: &[u8]) -> Option<Vec<u8>> {
+    let mut n = Vec::with_capacity(desc.len() + 24);
+    n.extend_from_slice(&6u32.to_le_bytes());
+    n.extend_from_slice(&u32::try_from(desc.len()).ok()?.to_le_bytes());
+    n.extend_from_slice(&APP_RES_NOTE_TYPE.to_le_bytes());
+    n.extend_from_slice(APP_NOTE_NAME);
+    n.extend_from_slice(&[0, 0]);
+    n.extend_from_slice(desc);
+    while n.len() % 4 != 0 {
+        n.push(0);
+    }
+    Some(n)
+}
+
+#[cfg(test)]
+mod appres_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn block() -> Vec<u8> {
+        res_build(&[(RES_KEY_NAME, b"Lumen"), (RES_KEY_SIGNATURE, b"org.unaos.lumen"), (RES_KEY_ICON_32, &[0x89, b'P', b'N', b'G'])]).unwrap()
+    }
+
+    /// An ELF64 LE header + one SHT_NOTE section header pointing at `area` placed at 0x100.
+    fn elf_with(area: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 0x100];
+        b[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        b[4] = 2;
+        b[5] = 1;
+        b.extend_from_slice(area);
+        while b.len() % 8 != 0 {
+            b.push(0);
+        }
+        let shoff = b.len();
+        b.extend_from_slice(&[0u8; 64]); // SHN_UNDEF
+        let mut sh = [0u8; 64];
+        sh[4..8].copy_from_slice(&7u32.to_le_bytes());
+        sh[24..32].copy_from_slice(&0x100u64.to_le_bytes());
+        sh[32..40].copy_from_slice(&(area.len() as u64).to_le_bytes());
+        b.extend_from_slice(&sh);
+        b[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        b[58..60].copy_from_slice(&64u16.to_le_bytes());
+        b[60..62].copy_from_slice(&2u16.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn a_block_round_trips() {
+        let b = block();
+        let r = res_records(&b).unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(res_str(&b, RES_KEY_NAME), Some("Lumen"));
+        assert_eq!(res_str(&b, RES_KEY_SIGNATURE), Some("org.unaos.lumen"));
+        assert_eq!(res_get(&b, RES_KEY_ICON_32), Some(&[0x89, b'P', b'N', b'G'][..]));
+        assert_eq!(res_get(&b, RES_KEY_VERSION), None);
+    }
+
+    #[test]
+    fn a_malformed_block_is_none_never_a_panic() {
+        let b = block();
+        for cut in 0..b.len() {
+            assert!(res_records(&b[..cut]).is_none(), "cut {cut}");
+        }
+        let mut extra = b.clone();
+        extra.push(0);
+        assert!(res_records(&extra).is_none());
+        let mut lie = b.clone();
+        lie[8] = 0xFF; // the count claims more records than there are
+        assert!(res_records(&lie).is_none());
+        assert!(res_records(b"UNARES\0\x02\0\0\0\0").is_none());
+        assert!(res_build(&[("", b"x")]).is_none());
+    }
+
+    #[test]
+    fn the_block_is_found_through_the_section_table_and_not_confused_with_the_launch_note() {
+        let mut area = Vec::new();
+        // The launch note first (type 1), then the resource note (type 2), in one note area.
+        area.extend_from_slice(&6u32.to_le_bytes());
+        area.extend_from_slice(&4u32.to_le_bytes());
+        area.extend_from_slice(&APP_NOTE_TYPE.to_le_bytes());
+        area.extend_from_slice(b"UnaOS\0\0\0");
+        area.extend_from_slice(&APP_FLAG_WINDOWED.to_le_bytes());
+        area.extend_from_slice(&res_note(&block()).unwrap());
+        let img = elf_with(&area);
+        assert_eq!(app_res(&img), Some(&block()[..]));
+        let (off, n) = elf_shdr_table(&img[..64]).unwrap();
+        let secs = elf_note_sections(&img[off..off + n * 64]);
+        assert_eq!(secs, vec![(0x100, area.len())]);
+        // No resource note: None. A foreign owner: None.
+        assert_eq!(app_res(&elf_with(&area[..24])), None);
+        let mut foreign = res_note(&block()).unwrap();
+        foreign[12] = b'X';
+        assert_eq!(app_res(&elf_with(&foreign)), None);
+        // A desc that runs off the area: None.
+        let mut short = res_note(&block()).unwrap();
+        short.truncate(40);
+        assert_eq!(app_res(&elf_with(&short)), None);
+        assert_eq!(app_res(b"\x7fELF"), None);
+    }
+}
