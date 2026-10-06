@@ -176,6 +176,8 @@ pub struct UserRec {
     iters: u32,
     /// SECLOGIN M1: `KDF_LEGACY` (v1: one SHA-256) or `KDF_PBKDF2`.
     kdf: u8,
+    /// FIRSTUSER (R100): `ROLE_STANDARD` or `ROLE_ADMIN` — the v2 row's byte 115 (inside the CRC span).
+    role: u8,
 }
 
 impl UserRec {
@@ -189,6 +191,7 @@ impl UserRec {
         uid: 0,
         iters: 1,
         kdf: KDF_LEGACY,
+        role: ROLE_STANDARD,
     };
 
     pub fn name(&self) -> &[u8] {
@@ -211,6 +214,7 @@ impl UserRec {
         out[106..110].copy_from_slice(&self.uid.to_le_bytes());
         out[110..114].copy_from_slice(&self.iters.to_le_bytes());
         out[114] = self.kdf;
+        out[115] = self.role;
         let c = crc32(&out[..USERS_ROW_CRC_SPAN]);
         out[120..124].copy_from_slice(&c.to_le_bytes());
     }
@@ -264,6 +268,7 @@ impl UserRec {
         r.uid = u32::from_le_bytes([b[106], b[107], b[108], b[109]]);
         r.iters = u32::from_le_bytes([b[110], b[111], b[112], b[113]]);
         r.kdf = b[114];
+        r.role = if b[115] == ROLE_ADMIN { ROLE_ADMIN } else { ROLE_STANDARD }; // FIRSTUSER (R100): every row written before the role read standard
         match r.kdf {
             KDF_LEGACY => {}
             KDF_UNSET => {} // LOGIN14: a row whose password is not chosen yet
@@ -652,6 +657,9 @@ pub fn password_unset(name: &[u8]) -> Option<bool> {
 /// publish. The store does not decide WHO may: the set-password screen calls it only for an unset row
 /// (`set_first_password`), the `passwd` verb for the session's own row or, from root, any row.
 pub fn set_password(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
+    if name == ROOT_NAME {
+        return Err(root_locked_refusal("set-password")); // FIRSTUSER (R100): root has no password to set
+    }
     if password.is_empty() {
         return Err(UsersError::Refused);
     }
@@ -731,6 +739,9 @@ pub fn create_user_unset(name: &[u8]) -> Result<u32, UsersError> {
 }
 
 fn create_row(name: &[u8], password: Option<&[u8]>) -> Result<u32, UsersError> {
+    if name == ROOT_NAME {
+        return Err(root_locked_refusal("create")); // FIRSTUSER (R100): root is a principal, never a row
+    }
     if !name_ok(name) {
         return Err(UsersError::BadName);
     }
@@ -1944,34 +1955,17 @@ static ROOT_PW_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// At the store's load: make root's row if it is absent; open (or defer) the set-password screen if its
 /// password is not chosen yet. Nothing happens in a user session (the store loaded after a login).
 pub fn root_credential_ignition() {
+    migrate_r100(); // FIRSTUSER (R100): an R77 card (root's row, no administrator) is migrated at the store's load, before the stage is read
     if !root_session() {
         return;
     }
-    let row = if password_unset(ROOT_NAME).is_none() {
-        match create_user_unset(ROOT_NAME) {
-            Ok(_) => "created",
-            Err(e) => {
-                serial_println!("[login] root row NOT created reason={} (LOGIN14: no set-password screen; root has no credential this boot)", users_reason(e));
-                return;
-            }
-        }
-    } else {
-        "present"
-    };
-    if password_unset(ROOT_NAME) != Some(true) {
-        serial_println!("[login] root password set row={} (LOGIN14: nothing to ask)", row);
-        return;
-    }
-    if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
-        serial_println!("[login] root password unset row={} -> set-password screen (LOGIN14/R65: chosen at the keyboard, twice; never on the wire)", row);
-        screen_set_password(ROOT_NAME);
-    } else {
-        ROOT_PW_PENDING.store(true, core::sync::atomic::Ordering::Release);
-        serial_println!("[login] root password unset row={} -> set-password screen deferred to the desktop ignition (LOGIN14)", row);
-    }
+    // FIRSTUSER (R100) — root is LOCKED: no row is made, no password is asked for, no set-password screen opens. The
+    // first boot's one prompt is the first-user form (`stage_resolve`, Installer), and that user is the administrator.
+    serial_println!("[login] root locked (R100: no row, no prompt, no set-password; the first user is the administrator)");
 }
 
 fn screen_set_password(name: &[u8]) {
+    FU_PROMPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // FIRSTUSER (R100): a boot-time set-password screen is a second prompt (never under R100)
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     crate::video::crystal::login::open_set_password(name, false);
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -2011,67 +2005,21 @@ pub fn fixture_unset_password(name: &[u8]) -> bool {
 /// assumes the screen is down.
 #[cfg(feature = "loginst")]
 pub fn login_rootpw_fixture() {
-    const PW: &[u8] = b"root13-pw";
-    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-    {
-        serial_println!(":: LOGIN-ROOTPW: -> SKIP — no screen built in this image (the x86 `wc` lane is where this claim is proven) ::");
-        return;
-    }
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-    {
-        use crate::video::crystal::login as screen;
-        fn key(b: u8) -> bool {
-            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-            {
-                return matches!(crate::arch::syscall::wc_route_event(crate::pal::Event::Key(b)), crate::pal::Event::Unknown);
-            }
-            #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
-            screen_key(b)
-        }
-        let feed = |s: &[u8]| {
-            let mut ok = true;
-            for &b in s {
-                ok &= key(b);
-            }
-            ok
-        };
-        let reset = fixture_unset_password(ROOT_NAME);
-        // THE DEFERRED LEG (R48's open question on the rMBP's order): with the desktop "not up", the
-        // ignition must ARM and open nothing; the desktop ignition's own step must then open it.
-        let was_ignited = DESKTOP_IGNITED.swap(false, core::sync::atomic::Ordering::AcqRel);
-        if screen_up() {
-            screen::fixture_reset(); // the real ignition already opened root's prompt in this lane: close it, the leg re-drives both orders
-        }
-        root_credential_ignition();
-        let armed = ROOT_PW_PENDING.load(core::sync::atomic::Ordering::Acquire) && !screen_up();
-        DESKTOP_IGNITED.store(true, core::sync::atomic::Ordering::Release);
-        let opened_by_desktop = open_pending_root_prompt();
-        if !was_ignited {
-            DESKTOP_IGNITED.store(false, core::sync::atomic::Ordering::Release); // the real desktop ignition has not run yet in this lane: let it print its own line later
-        }
-        let deferred = armed && opened_by_desktop;
-        let opened = screen_up() && screen::fixture_setpw_for(ROOT_NAME);
-        let mut routed = feed(PW);
-        routed &= key(b'\t');
-        routed &= feed(b"other-pw");
-        routed &= key(b'\n');
-        let mismatch_kept = screen_up() && password_unset(ROOT_NAME) == Some(true) && screen::fixture_setpw_for(ROOT_NAME);
-        routed &= feed(PW);
-        routed &= key(b'\t');
-        routed &= feed(PW);
-        routed &= key(b'\n');
-        let set = password_unset(ROOT_NAME) == Some(false);
-        let verify_ok = verify(ROOT_NAME, PW);
-        let wrong_refused = !verify(ROOT_NAME, b"other-pw");
-        let closed = !screen_up();
-        let root_after = root_session();
-        let ok = reset && deferred && opened && routed && mismatch_kept && set && verify_ok && wrong_refused && closed && root_after;
-        serial_println!(
-            ":: LOGIN-ROOTPW: reset={} deferred_leg={} opened={} keys_routed={} mismatch_kept={} set={} verify={} wrong={} screen={} root_after={} -> {} ::",
-            reset, if deferred { "armed-then-opened" } else { "FAILED" }, opened, routed, mismatch_kept, set, if verify_ok { "ok" } else { "FAIL" }, if wrong_refused { "refused" } else { "ACCEPTED" },
-            if closed { "closed" } else { "OPEN" }, root_after, if ok { "PASS" } else { "FAIL —" }
-        );
-    }
+    // FIRSTUSER (R100): root is LOCKED — the ignition makes no row and opens no screen; every root-credential
+    // write and root's login are refused; the session the boot began with is untouched.
+    let ignited_before = screen_up();
+    root_credential_ignition();
+    let no_row = password_unset(ROOT_NAME).is_none();
+    let no_screen = screen_up() == ignited_before && !ROOT_PW_PENDING.load(core::sync::atomic::Ordering::Acquire);
+    let create_refused = create_user_unset(ROOT_NAME).is_err() && password_unset(ROOT_NAME).is_none();
+    let set_refused = set_password(ROOT_NAME, b"root13-pw").is_err();
+    let login_refused = login_root(b"root13-pw").is_err() && !verify(ROOT_NAME, b"root13-pw");
+    let ok = no_row && no_screen && create_refused && set_refused && login_refused;
+    serial_println!(
+        ":: LOGIN-ROOTPW: root=locked row={} screen={} create={} set_password={} login={} -> {} ::",
+        if no_row { "absent" } else { "PRESENT" }, if no_screen { "none" } else { "OPENED" }, if create_refused { "refused" } else { "ACCEPTED" },
+        if set_refused { "refused" } else { "ACCEPTED" }, if login_refused { "refused" } else { "ACCEPTED" }, if ok { "PASS" } else { "FAIL —" }
+    );
 }
 
 /// LOGIN-BOOTROOT (`loginst`, LOGIN13 M1) — the boot opens no screen and the session is root. Runs FIRST
@@ -2208,7 +2156,7 @@ fn adduser_begin(args: &[&str], console: &mut crate::console::Console) {
         // it would make that the normal way to add a user; refusing it makes the prompt the only way.
         return adduser_refuse(nb, "password-on-line", console);
     }
-    if !root_session() {
+    if !privileged() { // FIRSTUSER (R100): an administrator's session, or the system principal before login
         return adduser_refuse(nb, "not-root", console);
     }
     if !load_once() {
@@ -2260,7 +2208,7 @@ fn passwd_begin(args: &[&str], console: &mut crate::console::Console) {
     }
     let mut mine = [0u8; NAME_MAX];
     let is_own = matches!(whoami(&mut mine), Some(n) if &mine[..n] == target) || (root_session() && target == ROOT_NAME);
-    if !is_own && !root_session() {
+    if !is_own && !privileged() { // FIRSTUSER (R100): the administrator resets another's password
         return passwd_refuse(target, "not-root", console);
     }
     if !load_once() {
@@ -2371,7 +2319,7 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
 fn passwd_commit(name: &[u8], password: &[u8]) -> Result<(), &'static str> {
     let mut mine = [0u8; NAME_MAX];
     let is_own = matches!(whoami(&mut mine), Some(n) if &mine[..n] == name) || (root_session() && name == ROOT_NAME);
-    if !is_own && !root_session() {
+    if !is_own && !privileged() { // FIRSTUSER (R100): the administrator resets another's password
         return Err("not-root");
     }
     if password.is_empty() {
@@ -2384,7 +2332,7 @@ fn passwd_commit(name: &[u8], password: &[u8]) -> Result<(), &'static str> {
 
 /// LOGIN14: root adds a user with NO credential; `/home/<name>` is made at once.
 pub fn adduser_commit(name: &[u8]) -> Result<(u32, bool), &'static str> {
-    if !root_session() {
+    if !privileged() { // FIRSTUSER (R100)
         return Err("not-root");
     }
     let uid = create_user_unset(name).map_err(adduser_reason)?;
@@ -2830,7 +2778,7 @@ fn usermgmt_verb(verb: &str, args: &[&str], console: &mut crate::console::Consol
             if matches!(whoami(&mut nb), Some(n) if &nb[..n] == name) {
                 return usermgmt_refuse("deluser", name, "self", console);
             }
-            if !root_session() {
+            if !privileged() { // FIRSTUSER (R100)
                 return usermgmt_refuse("deluser", name, "not-root", console);
             }
             if !load_once() {
@@ -2965,10 +2913,11 @@ const STAGE_WAIT_MS: u64 = 30_000;
 /// The stage the LOADED store says (pure read; `Installer` while the store is not loaded).
 pub fn stage_of_store() -> BootStage {
     let loaded = TABLE.lock().loaded;
-    if !loaded || password_unset(ROOT_NAME) != Some(false) {
+    // FIRSTUSER (R100): no root step — the Installer's one screen is the first-user form, and a store with a user is a Desktop.
+    if !loaded || user_count() == 0 {
         return BootStage::Installer;
     }
-    if user_count() == 0 { BootStage::CreateUser } else { BootStage::Desktop }
+    BootStage::Desktop
 }
 
 /// The published stage. Unresolved (the store not read yet) reads `Installer`: nothing runs until known.
@@ -3008,13 +2957,13 @@ pub fn furniture_held() -> bool {
 fn stage_witness(why: &str) {
     let st = boot_stage();
     let users = user_count();
-    let root_set = password_unset(ROOT_NAME) == Some(false);
+    let root_set = password_unset(ROOT_NAME).is_none(); // FIRSTUSER (R100): "root=locked" — root has no row, so no password
     let login = why == "store-has-users"; // LOGINFLOW2 M1 — boot 2: the store has root's password and users, so the LOGIN SCREEN is the boot session (R64/R65/R77), not root's desktop
     let up = st == BootStage::Desktop && !login;
     serial_println!(
-        ":: FIRSTBOOT: stage={} root_set={} users={} desktop_ignited={} why={} -> {} ::",
-        if login { "login-screen" } else { st.word() }, root_set, users, up, why,
-        if (st == BootStage::Installer && !root_set && !up) || (st == BootStage::CreateUser && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || why == "no-store" { "PASS" } else { "FAIL" }
+        ":: FIRSTBOOT: stage={} root={} users={} desktop_ignited={} why={} -> {} ::",
+        if login { "login-screen" } else { st.word() }, if root_set { "locked" } else { "ROW" }, users, up, why,
+        if (st == BootStage::Installer && root_set && users == 0 && !up) || (st == BootStage::CreateUser && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || why == "no-store" { "PASS" } else { "FAIL" }
     ); crate::bootpace::boot_line(); // QUIETBOOT M4 (R80): the boot's one measurement, after its first stage line.
 }
 
@@ -3030,7 +2979,7 @@ fn stage_publish(st: BootStage, why: &str) {
         serial_println!("[login] installer: stage=login-screen (R86: the login dialog only; the desktop ignites at the first login)"); // INSTALLBARE: was the stray `stage=desktop` at boot 2's login screen
     } else {
     serial_println!("[login] installer: stage={} (R77: {})", st.word(), match st {
-        BootStage::Installer => "no root password — the setter is the whole glass; no desktop, no programs, no fixtures",
+        BootStage::Installer => "R100: no user — the first-user form is the whole glass (that user is the administrator; root is locked); no desktop, no programs, no fixtures",
         BootStage::CreateUser => "root's password is set and there is no user — the create-user form",
         BootStage::Desktop => "the desktop ignites",
     });
@@ -3064,7 +3013,7 @@ pub fn stage_resolve(why: &str) {
             serial_println!("[login] boot 2: login screen deferred to the glass (the screen's window needs the surface)");
         }
     }
-    if st == BootStage::CreateUser {
+    if st == BootStage::CreateUser || (st == BootStage::Installer && TABLE.lock().loaded) { // FIRSTUSER (R100): the Installer's one screen is the first-user form
         if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
             screen_create_user();
         } else {
@@ -3105,6 +3054,7 @@ fn screen_boot2() {
     {
         ROOT_LIVE.store(false, core::sync::atomic::Ordering::Release);
         crate::video::crystal::login::open_boot2();
+        firstuser_witness("login-window"); // FIRSTUSER (R100): a later boot — the login window with the users, no prompt
     }
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     serial_println!("[login] boot 2: login screen not built in this image (the root session stays the boot session)");
@@ -3123,14 +3073,9 @@ pub fn stage_name() -> &'static str {
 /// LOGINFLOW2 M1 — the screen logs ROOT in when its password is set and typed right (R64: root can log in too;
 /// R77: it is not the assumed login). The root session is "no user session + `ROOT_LIVE`" (uid 0, the current epoch).
 pub fn login_root(password: &[u8]) -> Result<(), UsersError> {
-    if !verify(ROOT_NAME, password) {
-        serial_println!("[users] login refused");
-        return Err(UsersError::Refused);
-    }
-    SESSION_LOCAL.lock().1 = 0;
-    ROOT_LIVE.store(true, core::sync::atomic::Ordering::Release);
-    serial_println!("[users] login ok user=root id=0 principal=root (R64: root typed at the login screen)");
-    Ok(())
+    let _ = password; // FIRSTUSER (R100): root is an internal principal with no password — never a login, whatever is typed
+    serial_println!("[users] login refused user=root reason=locked (R100: root is an internal principal; no login)");
+    Err(UsersError::Refused)
 }
 
 /// The root password setter (the Installer's only screen) has WRITTEN root's password: advance. A no-op
@@ -3147,11 +3092,12 @@ pub fn installer_root_password_set() {
 /// the session for THAT user and the desktop. `Err` is a one-line reason for the form; nothing is printed
 /// of the password.
 pub fn installer_create_user(name: &[u8], password: &[u8]) -> Result<(), &'static str> {
-    if boot_stage() != BootStage::CreateUser {
+    if !matches!(boot_stage(), BootStage::CreateUser | BootStage::Installer) || !TABLE.lock().loaded || user_count() != 0 {
         return Err("not the create-user stage");
     }
     create_user_rules(name, password)?;
     let made = adduser_commit(name).map_err(|_| "Could not create the user")?;
+    mark_admin(name); // FIRSTUSER (R100): the first user is the ADMINISTRATOR — the role rides the password's flush below
     if set_first_password(name, password).is_err() {
         serial_println!("[login] installer: create-user user={} row made but the password was NOT written (the form stays)", wire_name(name));
         return Err("Could not save the password");
@@ -3163,9 +3109,11 @@ pub fn installer_create_user(name: &[u8], password: &[u8]) -> Result<(), &'stati
 /// After the create-user form logged the new user in: the desktop ignites for them.
 pub fn installer_desktop_ignite() {
     stage_resolve("user-created");
+    firstuser_witness("first-user"); // FIRSTUSER (R100): the flow's one line, at the first user's session
 }
 
 fn screen_create_user() {
+    FU_PROMPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // FIRSTUSER (R100): the boot's setter prompts — one, the first-user form
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     crate::video::crystal::login::open_create_user();
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -3220,7 +3168,7 @@ pub fn usermgmt_last() -> &'static str {
 /// SETTINGS2: may the set-password screen WRITE `name`'s password? An unset row (the first choice), any row
 /// from the root session (Reset password), or the session's own row (Change password).
 pub fn setpw_allowed(name: &[u8]) -> bool {
-    if password_unset(name) == Some(true) || root_session() {
+    if password_unset(name) == Some(true) || privileged() { // FIRSTUSER (R100): the administrator's Reset
         return true;
     }
     let mut nb = [0u8; NAME_MAX];
@@ -3305,3 +3253,225 @@ pub fn boot2_resolved() -> bool {
     BOOT2.load(core::sync::atomic::Ordering::Acquire)
 }
 
+
+// =========================================================================================
+// FIRSTUSER (rmbp-ledger B409, R100) — THE MAC'S FIRST BOOT: THE FIRST USER IS THE ADMINISTRATOR
+// =========================================================================================
+//
+// Peter, 2026-10-06 (R100, amending R77): "we can move to the mac boot process since i don't expect root will be
+// used by people". The first boot's one prompt is the first-user form; that user is the ADMINISTRATOR (the row's
+// role byte); root is an internal principal with no row and no password (`create_row`/`set_password` refuse the
+// name, `login_root` refuses). The privileged paths ask ONE question, [`admin_authority`], and say the answer.
+
+/// The row's role byte (offset 115). Every row written before FIRSTUSER reads `ROLE_STANDARD`.
+pub const ROLE_STANDARD: u8 = 0;
+pub const ROLE_ADMIN: u8 = 1;
+
+/// A user's role (R100): the administrator may install, update, unlock the boot FAT and manage users.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Standard,
+    Admin,
+}
+
+impl Role {
+    pub fn word(self) -> &'static str {
+        match self {
+            Role::Standard => "standard",
+            Role::Admin => "admin",
+        }
+    }
+}
+
+/// The setter prompts this boot put on the glass before its Desktop (R100: one — the first-user form; zero on a later boot).
+static FU_PROMPTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The R77->R100 migration ran on this boot's store (said on its own line; the witness reads it).
+static FU_MIGRATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The refusal every root-credential write takes (R100), said once per caller kind.
+fn root_locked_refusal(op: &str) -> UsersError {
+    serial_println!("[users] {} user=root REFUSED reason=locked (R100: root is an internal principal; no row, no password)", op);
+    UsersError::Refused
+}
+
+/// `name`'s role, or `None` for no such row.
+pub fn role_of(name: &[u8]) -> Option<Role> {
+    let t = TABLE.lock();
+    (0..t.count as usize).find(|&i| t.rows[i].name() == name).map(|i| if t.rows[i].role == ROLE_ADMIN { Role::Admin } else { Role::Standard })
+}
+
+/// Mark `name` the administrator IN RAM; the next flush (the first password's) carries it to the card.
+fn mark_admin(name: &[u8]) {
+    let mut t = TABLE.lock();
+    if let Some(i) = (0..t.count as usize).find(|&i| t.rows[i].name() == name) {
+        t.rows[i].role = ROLE_ADMIN;
+    }
+    drop(t);
+    serial_println!("[users] role user={} role=admin (R100: the first user is the administrator)", wire_name(name));
+}
+
+/// Set `name`'s role and publish (Settings > Users' Admin toggle). The last administrator is never demoted.
+pub fn set_role(name: &[u8], role: Role) -> Result<(), UsersError> {
+    let mut t = TABLE.lock();
+    if !t.loaded {
+        return Err(UsersError::Volume);
+    }
+    let Some(i) = (0..t.count as usize).find(|&i| t.rows[i].name() == name) else { return Err(UsersError::Refused) };
+    let admins = (0..t.count as usize).filter(|&j| t.rows[j].role == ROLE_ADMIN).count();
+    if role == Role::Standard && t.rows[i].role == ROLE_ADMIN && admins <= 1 {
+        return Err(UsersError::Refused);
+    }
+    let saved = t.rows[i];
+    t.rows[i].role = if role == Role::Admin { ROLE_ADMIN } else { ROLE_STANDARD };
+    match flush(&mut t) {
+        Ok(()) => {
+            drop(t);
+            serial_println!("[users] role user={} role={}", wire_name(name), role.word());
+            Ok(())
+        }
+        Err(e) => {
+            t.rows[i] = saved;
+            Err(e)
+        }
+    }
+}
+
+/// The first administrator's name (the store's order), copied into `out`.
+pub fn admin_name(out: &mut [u8; NAME_MAX]) -> Option<usize> {
+    let t = TABLE.lock();
+    let i = (0..t.count as usize).find(|&i| t.rows[i].role == ROLE_ADMIN && t.rows[i].name() != ROOT_NAME)?;
+    let n = t.rows[i].name();
+    out[..n.len()].copy_from_slice(n);
+    Some(n.len())
+}
+
+/// The open session is an administrator's (pure).
+pub fn admin_session() -> bool {
+    let mut nb = [0u8; NAME_MAX];
+    matches!(whoami(&mut nb), Some(n) if role_of(&nb[..n]) == Some(Role::Admin))
+}
+
+/// May the caller manage users and the machine? An administrator's session, or the SYSTEM principal (the boot
+/// before any login: the installer's own first-user form, the serial door before login) — the verbs that were
+/// root-only read this (pure).
+pub fn privileged() -> bool {
+    root_session() || admin_session()
+}
+
+/// **THE ADMINISTRATOR'S AUTHORITY (R100).** Every privileged path (`install ssd --write`, Settings > Users, the
+/// updater and R99's boot-FAT unlock when they land) asks this once and the wire says the answer:
+/// `[auth] admin=<name> for=<action>` — or, on a machine with no administrator yet (no store, a QEMU lane, the
+/// first boot before its form), `[auth] admin=system for=<action>`; else `[auth] refused … reason=…`.
+pub fn admin_authority(action: &str) -> Result<(), &'static str> {
+    let mut nb = [0u8; NAME_MAX];
+    if let Some(n) = whoami(&mut nb) {
+        if role_of(&nb[..n]) == Some(Role::Admin) {
+            serial_println!("[auth] admin={} for={}", wire_name(&nb[..n]), action);
+            return Ok(());
+        }
+        serial_println!("[auth] refused for={} principal=user:{} reason=not-admin (R100)", action, wire_name(&nb[..n]));
+        return Err("not-admin");
+    }
+    let mut ab = [0u8; NAME_MAX];
+    if TABLE.lock().loaded && admin_name(&mut ab).is_some() {
+        serial_println!("[auth] refused for={} principal=system reason=no-admin-session (R100: log in as the administrator)", action);
+        return Err("no-admin-session");
+    }
+    serial_println!("[auth] admin=system for={} (R100: no administrator on this machine yet)", action);
+    Ok(())
+}
+
+/// R77 -> R100 at the store's load: a store with root's row, or with users and no administrator, promotes its
+/// first user to administrator and drops root's row (root locked). Idempotent; the RAM table is R100's this boot
+/// even when the card refuses the write (`persisted=0`: the next write carries it).
+pub fn migrate_r100() {
+    static REG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !REG.swap(true, core::sync::atomic::Ordering::AcqRel) { crate::tests::register("firstuser", firstuser_selftest); } // FIRSTUSER: `tests firstuser`, once
+    let mut t = TABLE.lock();
+    if !t.loaded {
+        return;
+    }
+    let cnt = t.count as usize;
+    let root_i = (0..cnt).find(|&i| t.rows[i].name() == ROOT_NAME);
+    let admin_i = (0..cnt).find(|&i| t.rows[i].name() != ROOT_NAME && t.rows[i].role == ROLE_ADMIN);
+    let first_i = (0..cnt).find(|&i| t.rows[i].name() != ROOT_NAME);
+    if root_i.is_none() && (admin_i.is_some() || first_i.is_none()) {
+        return;
+    }
+    let pick = admin_i.or(first_i);
+    let mut ab = [0u8; NAME_MAX];
+    let mut al = 0;
+    if let Some(i) = pick {
+        t.rows[i].role = ROLE_ADMIN;
+        let n = t.rows[i].name();
+        al = n.len();
+        ab[..al].copy_from_slice(n);
+    }
+    if let Some(ri) = root_i {
+        for j in ri..cnt - 1 {
+            t.rows[j] = t.rows[j + 1];
+        }
+        t.rows[cnt - 1] = UserRec::EMPTY;
+        t.count -= 1;
+    }
+    let persisted = flush(&mut t).is_ok();
+    drop(t);
+    FU_MIGRATED.store(true, core::sync::atomic::Ordering::Release);
+    serial_println!(
+        "[users] migrated R77->R100 admin={} root=locked persisted={} (R100: the first user is the administrator; root has no row)",
+        if al == 0 { "none" } else { wire_name(&ab[..al]) }, persisted as u8
+    );
+}
+
+/// The login window's word for the witness: `users` + `power` as the glass carries them (`none` with no glass).
+fn login_window_word() -> (&'static str, bool) {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        crate::video::crystal::loginwindow::word()
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        ("none", false)
+    }
+}
+
+/// `:: FIRSTUSER: flow=mac first_user=<name> role=admin root=locked prompts=<n> login_window=<w> -> PASS ::` — at the
+/// first user's session (`first-user`: one prompt), at a later boot's login window (`login-window`: none), and by `tests firstuser`.
+pub fn firstuser_witness(why: &str) {
+    let mut ab = [0u8; NAME_MAX];
+    let an = admin_name(&mut ab);
+    let root_locked = password_unset(ROOT_NAME).is_none();
+    let prompts = FU_PROMPTS.load(core::sync::atomic::Ordering::Relaxed);
+    let (lw, lw_ok) = login_window_word();
+    let want = match why { "first-user" => Some(1), "login-window" => Some(0), _ => None };
+    let prompts_ok = want.map_or(prompts <= 1, |w| prompts == w);
+    let ok = an.is_some() && root_locked && prompts_ok && lw_ok;
+    serial_println!(
+        ":: FIRSTUSER: flow=mac first_user={} role={} root={} prompts={} login_window={} migrated={} at={} -> {} ::",
+        an.map(|n| wire_name(&ab[..n])).unwrap_or("none"), if an.is_some() { "admin" } else { "NONE" }, if root_locked { "locked" } else { "ROW" },
+        prompts, lw, FU_MIGRATED.load(core::sync::atomic::Ordering::Acquire) as u8, why, if ok { "PASS" } else { "FAIL —" }
+    );
+}
+
+fn firstuser_selftest() {
+    firstuser_witness("tests");
+}
+
+/// `[serialdoor] principal=<system or name>` — the principal the serial door's shell runs as, said when it changes
+/// (R100: the administrator's session once one is open; the system principal before login).
+pub fn serialdoor_principal_note() {
+    static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+    let mut nb = [0u8; NAME_MAX];
+    let n = whoami(&mut nb);
+    let mut key = 0u64;
+    if let Some(n) = n {
+        for &b in &nb[..n] { key = (key << 8) | b as u64; }
+    }
+    if LAST.swap(key, core::sync::atomic::Ordering::AcqRel) == key {
+        return;
+    }
+    match n {
+        Some(n) => serial_println!("[serialdoor] principal={} role={} (R100: the logged-in session)", wire_name(&nb[..n]), role_of(&nb[..n]).map(|r| r.word()).unwrap_or("none")),
+        None => serial_println!("[serialdoor] principal=system (R100: no session is open)"),
+    }
+}
