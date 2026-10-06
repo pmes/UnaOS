@@ -627,7 +627,7 @@ fn test_video_geometry() -> Outcome {
     let mut off = OffscreenPal::new(32, 32);
 
     // A horizontal line of 10 pixels: expect exactly 10 set, all on row 0.
-    off.draw_line(0, 0, 9, 0, 0x00FF00);
+    off.draw_line(0, 0, 9, 0, crate::video::theme::fixture::RGB_GREEN);
     let after_line = off.count_nonzero();
     if after_line != 10 {
         return Outcome::Fail(format!("draw_line set {} px (want 10)", after_line));
@@ -638,7 +638,7 @@ fn test_video_geometry() -> Outcome {
 
     // A filled triangle: expect a positive count, bounded by the surface, and its interior set.
     let mut off2 = OffscreenPal::new(32, 32);
-    off2.fill_triangle((2, 2), (28, 6), (10, 28), 0xFF0000);
+    off2.fill_triangle((2, 2), (28, 6), (10, 28), crate::video::theme::fixture::RGB_RED);
     let tri = off2.count_nonzero();
     if tri == 0 {
         return Outcome::Fail(String::from("fill_triangle set 0 px"));
@@ -1036,8 +1036,8 @@ pub(crate) fn test_font_aa() -> Outcome {
 
     const SW: usize = 96;
     const SH: usize = 48;
-    const BG: u32 = 0x0000_0000;
-    const INK: u32 = 0x00FF_FFFF;
+    const BG: u32 = crate::video::theme::fixture::BLACK;
+    const INK: u32 = crate::video::theme::fixture::WHITE;
     const S: &[u8] = b"Ago";
 
     // ⚠ `black_box` ON THE STRING, and NOT on the face. Both halves of that were measured.

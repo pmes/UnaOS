@@ -16,3 +16,8 @@ paper.rs        0x68E3_1DA4     the per-octave hash offset
 statusmenu.rs   u32::from_be_bytes([10,0,1,2])  the selftest's DHCP lease 10.0.1.2, an IPv4 address
 vperf.rs        0x2000_0000     a 512 MiB BAR window bound (an address span)
 wm.rs           0x165667B1      the xxhash32 PRIME32_5 in the window-identity hash
+../arch/aarch64/display_tegra.rs  0x8000_0000  the DRAM floor a simple-framebuffer base must sit above (an address)
+../arch/aarch64/display_tegra.rs  0x0003_0004  the aperture span that covers the FE cap word (a byte length)
+../selftest.rs  0x9E37_79B9  the golden-ratio hash prime that fills the heap vector
+../selftest.rs  0x1234_5678  the RwLock round-trip marker word
+../selftest.rs  0xC0FFEE     the channel round-trip token

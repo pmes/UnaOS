@@ -29,9 +29,16 @@ A listed file's colour literals move to `theme.rs` tokens; its format constants 
 existing `theme::fixture` / console tokens); remaining format constants become allow rows; the gate reads 0.
 
 **Witness (host).** `python3 unaos/scripts/appearance-check.py` -> `appearance-check: literals_outside_theme=0
-files=0 certified=0 allow_rows=<n> allowed_hits=<n> stale=0 plants=<n> painters=7 unlisted=0` (rc 0). The kernel's
+files=0 certified=0 allow_rows=17 allowed_hits=20 stale=0 plants=31 painters=7 unlisted=0` (rc 0); `--selftest` -> `plants=31 -> ok`. The kernel's
 `tests appearance` line keeps printing `literals_outside_theme=0` (the certified constant, unchanged).
 
 **Owed.** Dark-mode variants of the painter roles (they are LIGHT-only consts, not `Tok` rows — the console and
 splash have one look); `termcolor.rs` is a colour SOURCE with no sink (xterm 256-cube arithmetic + parse fixtures),
 not listed; Ring-3 painters (`vessels/`, `handlers/`) are out of this gate's scope.
+
+**Built.** M1 3bd04ef1-era gate (the painter list, the sink scan, 10 new plants; three `video/` allow rows went
+stale under the u64 rule and were removed: the dock and pace-pin owner tags are `u64`). M2: 62 literals in six
+painters moved to `theme::painter` / `theme::testcard` / existing roles (`DESKTOP_BG`, `CONSOLE_BRIGHT`,
+`CONSOLE_BG`, `CONSOLE_TEXT`, `POINTER_FILL`, `POINTER_SHADOW`, `fixture::*`), line-neutral at every site; eight
+format literals in two (`display_tegra.rs` 2, `selftest.rs` 6) are allow rows. `rast_demo.rs` paints through its own
+`Rgba::rgb(r, g, b)` rasteriser, which no sink names: that spelling is the next widening (owed).

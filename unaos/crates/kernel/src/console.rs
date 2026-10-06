@@ -215,7 +215,7 @@ impl Console {
     /// just under three screenfuls there, and many more on anything smaller.
     pub const HISTORY_MAX: usize = 2000; // SCROLLBACK (R75): was 256 — the store keeps whole lines (they re-wrap on resize), bounded here, oldest dropped.
     /// The console background (Moonstone).
-    const BG: u32 = 0x2D2B55;
+    const BG: u32 = crate::video::theme::DESKTOP_BG;
 
     /// The single source of truth for page height: rows of history that fit on one screen above the
     /// prompt line, derived from the panel's real usable height and the metrics' line pitch.
@@ -294,7 +294,7 @@ impl Console {
             }
             let (a, b) = (lo.max(pc), hi.min(pc + len));
             if a < b {
-                pal.draw_text(m.margin + m.text_w(a - lo), y, self.current_input.get(a - pc..b - pc).unwrap_or(""), 0xFFFFFF);
+                pal.draw_text(m.margin + m.text_w(a - lo), y, self.current_input.get(a - pc..b - pc).unwrap_or(""), crate::video::theme::CONSOLE_BRIGHT);
             }
         }
 
@@ -581,7 +581,7 @@ impl Console {
             let (a, b) = (lo.max(r * cols), hi.min(r * cols + cols));
             let x = m.margin + m.text_w(a - r * cols);
             let y = y0 + r * m.line_h;
-            pal.draw_rect(x, y, m.text_w(b - a), m.cell_h, 0xFFFFFF);
+            pal.draw_rect(x, y, m.text_w(b - a), m.cell_h, crate::video::theme::CONSOLE_BRIGHT);
             let part: String = line.chars().skip(a - base).take(b - a).collect();
             pal.draw_text(x, y, &part, Self::BG);
         }
@@ -686,13 +686,13 @@ impl Console {
         let thumb_h = core::cmp::max(page_h * shown / total, 8).min(page_h);
         let span = total.saturating_sub(shown).max(1);
         let thumb_y = top + (page_h - thumb_h) * skip.min(span) / span;
-        pal.draw_rect(w.saturating_sub(4), top, 4, page_h, 0x3A3868);
+        pal.draw_rect(w.saturating_sub(4), top, 4, page_h, crate::video::theme::painter::CONSOLE_BAND);
         pal.draw_rect(w.saturating_sub(4), thumb_y, 4, thumb_h, crate::video::theme::accent());
         if self.new_lines > 0 {
             let y = top + rows * m.line_h;
-            pal.draw_rect(0, y, w, m.line_h, 0x3A3868);
+            pal.draw_rect(0, y, w, m.line_h, crate::video::theme::painter::CONSOLE_BAND);
             let msg = format!("[{} new lines]", self.new_lines);
-            pal.draw_text(m.margin, y, &msg, 0xFFFFFF);
+            pal.draw_text(m.margin, y, &msg, crate::video::theme::CONSOLE_BRIGHT);
         }
     }
 }
@@ -787,7 +787,7 @@ impl Console {
             if at.bg & tc::SET != 0 {
                 pal.draw_rect(x, y, m.text_w(seg.chars().count()), m.cell_h, at.bg & 0x00FF_FFFF);
             }
-            let mut fg = tc::resolve(at.fg, if at.bold { 0x00FF_FFFF } else { crate::video::theme::TERM_FG });
+            let mut fg = tc::resolve(at.fg, if at.bold { crate::video::theme::CONSOLE_BRIGHT } else { crate::video::theme::TERM_FG });
             if at.bold && at.fg & tc::SET != 0 { fg = tc::lighten(fg); }
             pal.draw_text(x, y, &seg, fg);
         }
