@@ -216,7 +216,7 @@ pub fn route(ev: &Event) -> RouteGuard {
     let now = now_us();
     let r = render_here();
     if r {
-        render_entry(now); // INPUTSTALL M1: the previous event's handler ended here
+        render_entry(now); seg_anchor(now, true); // INPUTSTALL M1: the previous event's handler ended here (INPUTSTALL2 M1: the route's first door is timed from here)
     }
     let Some((c, _)) = class_of(ev) else {
         return RouteGuard(None, now, r);
@@ -643,6 +643,7 @@ fn render_route_done(t0: u64, now: u64) {
 pub fn render_idle() {
     if ON {
         render_entry(now_us());
+        seg_anchor(0, false); // INPUTSTALL2 M1: the park is not a step
     }
 }
 
@@ -802,6 +803,7 @@ fn sec_roll(now_ms: u64) {
     let strands = SEC_STRANDS.swap(0, Relaxed);
     let yields = SEC_YIELDS.swap(0, Relaxed);
     let beam = crate::video::beam::sec_take();
+    let (seg_h, seg_hu, seg_p, seg_pu) = seg_take(); // INPUTSTALL2 M1
     let mut w = worst(&st);
     let mut w_ms = st[w] / 1000;
     let mut w_name = STAGES[w];
@@ -812,7 +814,7 @@ fn sec_roll(now_ms: u64) {
     }
     let _ = w;
     let rw = if r[0] >= r[1] && r[0] >= r[2] { 0 } else if r[1] >= r[2] { 1 } else { 2 };
-    let stall = w_ms >= STALL_MS || r[rw] / 1000 >= STALL_MS;
+    let stall = w_ms >= STALL_MS || r[rw] / 1000 >= STALL_MS || seg_pu / 1000 >= STALL_MS; // INPUTSTALL2 M1: a pump step that held the HID pass is a stall second
     // M4b (the seat, R86/QUIETBOOT): before `phase=desktop` a stall second is COUNTED, not printed; the first
     // roll at the desktop says the count in one line. R80: a measurement kept, not a test run.
     let desk = crate::boot::phase() == crate::boot::Phase::Desktop;
@@ -840,12 +842,12 @@ fn sec_roll(now_ms: u64) {
                 (ms_str(draw), ms_str(pre))
             };
             serial_println!(
-                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{}",
+                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={}",
                 t0, now_ms.saturating_sub(t0), w_name, w_ms,
                 ms_str(st[0]), ms_str(st[1]), ms_str(st[2]), ms_str(st[3]), ms_str(st[4]), dw, pr,
                 ["route", "handler", "composite"][rw], ms_str(r[rw]),
                 passes, ms_str(pass_max), beam[3], beam[4], beam[0] / 1000, ms_str(beam[1]), beam[5], yields,
-                valve_word(), hid, strands, frames
+                valve_word(), hid, strands, frames, seg_h, ms_str(seg_hu), seg_p, ms_str(seg_pu)
             );
         }
     }
@@ -903,4 +905,116 @@ fn stage_word(code: u8) -> &'static str {
         12 => "render-composite",
         _ => "hid",
     }
+}
+
+// ── INPUTSTALL2 M1 (rmbp-ledger B388): NAME the step ──────────────────────────────────────────────────
+//
+// Flight 24's chart said `render=handler render_ms=119.0` and `stage=hid hid_gap_ms=16016` and could not say
+// WHICH handler or WHICH pump step. A step is named by a mark placed AFTER it: [`seg`] on the render task
+// (the route doors, the drain tail, the drains, the panel render, the rollups) and [`pump_seg`] on the
+// `usb-pump` loop. The interval since the previous mark is charged to the mark's name; the second's worst
+// rides the stall line as `handler=<step> handler_ms=<n> pump=<step> pump_ms=<n>`. Max and name travel as
+// ONE packed word (`us << 8 | id`) so a racing `fetch_max` can never pair one step's time with another's
+// name. R80: a reading of the live path, never a test.
+
+/// Render-task step names ([`seg`] ids index this).
+pub const SEG_NAMES: [&str; 14] = [
+    "-", "route-doors", "route-focus", "route-click", "route-ring", "drain-tail", "console-launch",
+    "shell-launch", "cursor-instgui", "login-drain", "panel-render", "shell-present", "rollups-5s", "termsel",
+];
+pub const S_DOORS: u8 = 1;
+pub const S_FOCUS: u8 = 2;
+pub const S_CLICK: u8 = 3;
+pub const S_RING: u8 = 4;
+pub const S_DRAIN: u8 = 5;
+pub const S_CONSOLE: u8 = 6;
+pub const S_SHELL: u8 = 7;
+pub const S_INSTGUI: u8 = 8;
+pub const S_LOGIN: u8 = 9;
+pub const S_RENDER: u8 = 10;
+pub const S_PRESENT: u8 = 11;
+pub const S_ROLLUPS: u8 = 12;
+pub const S_TERMSEL: u8 = 13;
+
+/// `usb-pump` step names ([`pump_seg`] ids index this).
+pub const PUMP_NAMES: [&str; 17] = [
+    "-", "xhci", "ehci-hid", "store-services", "prtscr", "selfhost", "desktop-app", "root-pass", "fatverb",
+    "wifi", "bootlog", "console", "flight-recorder", "u-probes", "usb-summary", "net-hda", "typematic-smc",
+];
+pub const P_XHCI: u8 = 1;
+pub const P_HID: u8 = 2;
+pub const P_STORE: u8 = 3;
+pub const P_PRTSCR: u8 = 4;
+pub const P_SELFHOST: u8 = 5;
+pub const P_DESKAPP: u8 = 6;
+pub const P_ROOT: u8 = 7;
+pub const P_FATVERB: u8 = 8;
+pub const P_WIFI: u8 = 9;
+pub const P_BOOTLOG: u8 = 10;
+pub const P_CONSOLE: u8 = 11;
+pub const P_FLIGHT: u8 = 12;
+pub const P_UPROBES: u8 = 13;
+pub const P_SUMMARY: u8 = 14;
+pub const P_NET: u8 = 15;
+pub const P_TYPEMATIC: u8 = 16;
+
+/// The render task's last mark (0 = none open: parked, or not yet routed).
+static SEG_LAST_US: AtomicU64 = AtomicU64::new(0);
+/// The second's worst render step, packed `us << 8 | id`.
+static SEC_SEG: AtomicU64 = AtomicU64::new(0);
+/// The pump's last mark (the loop top re-arms it).
+static PUMP_LAST_US: AtomicU64 = AtomicU64::new(0);
+/// The second's worst pump step, packed `us << 8 | id`.
+static SEC_PUMP: AtomicU64 = AtomicU64::new(0);
+
+/// A route began on the render task (or the task is about to park: `open = false`).
+fn seg_anchor(now: u64, open: bool) {
+    SEG_LAST_US.store(if open { now } else { 0 }, Relaxed);
+}
+
+/// The render task finished step `id`: the interval since its previous mark is charged to `id`.
+#[inline]
+pub fn seg(id: u8) {
+    if !ON || !render_here() {
+        return;
+    }
+    let now = now_us();
+    let last = SEG_LAST_US.swap(now, Relaxed);
+    if last != 0 && now > last {
+        SEC_SEG.fetch_max(((now - last) << 8) | id as u64, Relaxed);
+    }
+}
+
+/// The `usb-pump` loop's top (after its nap): the first step's interval starts here.
+#[inline]
+pub fn pump_top() {
+    if ON {
+        PUMP_LAST_US.store(now_us(), Relaxed);
+    }
+}
+
+/// The `usb-pump` loop finished step `id`.
+#[inline]
+pub fn pump_seg(id: u8) {
+    if !ON {
+        return;
+    }
+    let now = now_us();
+    let last = PUMP_LAST_US.swap(now, Relaxed);
+    if last != 0 && now > last {
+        SEC_PUMP.fetch_max(((now - last) << 8) | id as u64, Relaxed);
+    }
+}
+
+/// Unpack `(name, us)` from a packed step word. Pure.
+pub fn seg_unpack(w: u64, names: &[&'static str]) -> (&'static str, u64) {
+    let id = (w & 0xff) as usize;
+    (names.get(id).copied().unwrap_or("-"), w >> 8)
+}
+
+/// The second's two worst steps, taken (reset) at the roll: `(handler, handler_us, pump, pump_us)`.
+fn seg_take() -> (&'static str, u64, &'static str, u64) {
+    let (h, hu) = seg_unpack(SEC_SEG.swap(0, Relaxed), &SEG_NAMES);
+    let (p, pu) = seg_unpack(SEC_PUMP.swap(0, Relaxed), &PUMP_NAMES);
+    (h, hu, p, pu)
 }
