@@ -900,3 +900,8 @@ pub fn fixture() {
         if ok { "PASS" } else { "FAIL" }
     );
 }
+
+/// XHCIMEDIA (B438): take the pending media latch (`0` none, `1 + key`) — `tests xhcimedia` reads the router's effect.
+pub fn media_take() -> u8 {
+    MEDIA.swap(0, Ordering::AcqRel)
+}

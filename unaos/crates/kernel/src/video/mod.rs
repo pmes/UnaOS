@@ -1234,3 +1234,6 @@ pub fn notify(app: &[u8], title: &[u8], line: &[u8], label: &[u8], act: u8, arg:
 // STATUSTRAY (B426, MACPARITY row 3): the status items' menus (input, network, volume, battery, clock) through the SHARD dropdown's panel mode. Same gate as crystal/status; at the tail so no line above moves.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod statusmenu;
+// XHCIMEDIA (B438): THE fn-row router both HID pumps call (F1/F2, F7–F9, F10–F12). Same gate as brightkeys; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod fnrow;
