@@ -71,8 +71,8 @@ static LAST_VIA_R3: AtomicBool = AtomicBool::new(false);
 static NEXT_CORR: AtomicU32 = AtomicU32::new(1);
 static SUBSCRIBED: AtomicBool = AtomicBool::new(false);
 
-static REPLIES: spin::Mutex<VecDeque<Box<[u8]>>> = spin::Mutex::new(VecDeque::new());
-static CHANGES: spin::Mutex<VecDeque<Box<[u8]>>> = spin::Mutex::new(VecDeque::new());
+static REPLIES: crate::sync::Mutex<VecDeque<Box<[u8]>>> = crate::sync::Mutex::new(VecDeque::new());
+static CHANGES: crate::sync::Mutex<VecDeque<Box<[u8]>>> = crate::sync::Mutex::new(VecDeque::new());
 
 #[inline]
 fn locked<T>(f: impl FnOnce() -> T) -> T {
@@ -495,7 +495,7 @@ pub fn selftest() {
 // Witness per flush: `[prefsbus] flush n=<keys> ms=<n> on=worker queued_ms=<oldest wait> (INPUTSTALL M5)`.
 // This is the seam, not `settings.rs`: every kernel `sys_set` caller on the render task is covered.
 
-static DEFERRED: spin::Mutex<Vec<(String, PrefValue)>> = spin::Mutex::new(Vec::new());
+static DEFERRED: crate::sync::Mutex<Vec<(String, PrefValue)>> = crate::sync::Mutex::new(Vec::new());
 #[cfg(target_arch = "x86_64")]
 static FLUSHER: AtomicBool = AtomicBool::new(false);
 static DEFER_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

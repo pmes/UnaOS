@@ -3763,6 +3763,18 @@ netring3 = []
 # `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 prefs_reset = []
 
+# PANICSCREEN (rmbp-ledger B406, R95): UNAOS_PANIC_HOLD=1 — the bench hold: the plain panic screen stays up and the
+# machine waits for the power button instead of the 10 s countdown and restart (the seat's capture needs the
+# machine up). Off (default): restart. Both arches (x86 reads it; aarch64 keeps its own panic path). Kept in sync
+# with `unaos/arroyo` (the x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+panic_hold = []
+
+# SMALLFIX2 (rmbp-ledger B391, R94 §3): UNAOS_SVG=1 — SVG is a picture: pixel_core's `svg` format (UnaOS's own
+# no_std svg_core) is linked, so `fs::filetype` types `image/svg+xml` by its markup and facet renders it (shapes;
+# SVG text needs the faces passed to `decode_at`, owed). Off: an .svg types as the text it is. Both arches. Kept
+# in sync with `unaos/arroyo` (the x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+svg = ["pixel_core/svg"]
+
 # KCOMP (rmbp-ledger B321; docs/dev/evidence/rmbp-1005/KCOMP.md): UNAOS_WC_BLITTER=gpu asks the compositor
 # for the Kepler copy-engine blitter (video/blitter.rs GpuBlitter). Until KBLIT binds its channel the probe
 # answers `kblit-channel-absent` and the CPU blitter is selected (`[wc] blitter=cpu reason=…` once at the
@@ -3800,6 +3812,9 @@ una-abi = { path = "../una-abi" }
 # `midden_core::Facts` built with `cfg!()`, so ONE compiled core tells the truth
 # on x86 and aarch64 both.
 midden_core = { path = "../../libs/sys/midden_core", default-features = false }
+# EXFAT (rmbp-ledger B392, R79): the shared exFAT reader — the same no_std core the host KATs link. Unconditional (no knob):
+# `fs/removable.rs` reaches it only when an attached disk carries no FAT volume and its boot sector says `EXFAT`.
+exfat_core = { path = "../../libs/fs/exfat_core", default-features = false }
 # PREFS (rmbp-ledger B300): Principia's shared preference core — value model + TOML subset codec, the
 # same crate `handlers/principia` links. no_std + alloc, zero deps; arch-neutral.
 prefs_core = { path = "../../libs/sys/prefs_core" }

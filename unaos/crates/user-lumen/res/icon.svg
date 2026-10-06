@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Lumen (UnaOS's own design): a lamp's light with rays on an indigo tile. -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#2b2d6e"/>
+<rect x="30" y="7" width="4" height="9" rx="2" fill="#ffd166" transform="rotate(0 32 32)"/><rect x="30" y="7" width="4" height="9" rx="2" fill="#ffd166" transform="rotate(45 32 32)"/><rect x="30" y="7" width="4" height="9" rx="2" fill="#ffd166" transform="rotate(90 32 32)"/><rect x="30" y="7" width="4" height="9" rx="2" fill="#ffd166" transform="rotate(135 32 32)"/><rect x="30" y="7" width="4" height="9" rx="2" fill="#ffd166" transform="rotate(180 32 32)"/><rect x="30" y="7" width="4" height="9" rx="2" fill="#ffd166" transform="rotate(225 32 32)"/><rect x="30" y="7" width="4" height="9" rx="2" fill="#ffd166" transform="rotate(270 32 32)"/><rect x="30" y="7" width="4" height="9" rx="2" fill="#ffd166" transform="rotate(315 32 32)"/>
+<circle cx="32" cy="32" r="11" fill="#ffd166"/>
+<circle cx="29" cy="29" r="4" fill="#fff3c4"/>
+</svg>

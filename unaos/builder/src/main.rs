@@ -959,6 +959,10 @@ fn main() {
     if std::env::var("UNAOS_SELFDIAG").is_ok() { feats.push("selfdiag"); }
     // BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* at every login (safe-mode knob). Kept in sync with arroyo.
     if std::env::var("UNAOS_PREFS_RESET").is_ok() { feats.push("prefs_reset"); }
+    // PANICSCREEN (B406): UNAOS_PANIC_HOLD=1 holds the panic screen for the bench (no restart). Kept in sync with arroyo.
+    if std::env::var("UNAOS_PANIC_HOLD").is_ok() { feats.push("panic_hold"); }
+    // SMALLFIX2 (B391, R94): UNAOS_SVG=1 arms pixel_core's `svg` format in the kernel (SVG opens in facet). Kept in sync with arroyo.
+    if std::env::var("UNAOS_SVG").is_ok() { feats.push("svg"); }
     // KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the copy-engine blitter (cpu until KBLIT binds its channel). Kept in sync with arroyo.
     if std::env::var("UNAOS_WC_BLITTER").map(|v| v == "gpu").unwrap_or(false) { feats.push("wc_gpublit"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words
@@ -1203,7 +1207,7 @@ fn main() {
 
     // SELFBUILD3 (B353): the lazy-memory KAT, the printf fixture tcc compiles against musl, and the musl libc itself as DATA —
     // target/LIB (crt1.o crti.o crtn.o libc.a, include/, tcc/{libtcc1.a,include/}, built by arroyo's build_selfbuild_x86 at the
-    // pinned musl and tinycc commits) copied whole to APPS/LIB, the paths TCC.LNX is configured with. Absent = skipped
+    // pinned musl and tinycc commits) copied whole to LIB/ (seen at /lib), the paths TCC.LNX is configured with. Absent = skipped
     // (`tests selfbuild3` then reports libc=none). Headers keep their long names (VFAT LFN, read by the kernel's FAT walkers).
     for (src, dst) in [("SYSKAT3.LNX", "SYSKAT3.LNX"), ("PRINTF.C", "PRINTF.C")] {
         let f = target_dir.join(src);
@@ -1215,6 +1219,10 @@ fn main() {
         }
     }
     let musl_lib = target_dir.join("LIB");
+    // ROOTDISK (B390, R94 "apps/lib should be moved to lib"): the libraries go to the boot partition's root `LIB/`, mounted
+    // at `/lib` by the kernel (`fs::rootdisk::bind_lib`); a stale `APPS/LIB` from an earlier build is removed, not shipped.
+    let esp_lib = esp_dir.join("LIB");
+    let _ = std::fs::remove_dir_all(esp_apps.join("LIB"));
     if musl_lib.join("libc.a").exists() {
         fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> u64 {
             std::fs::create_dir_all(to).unwrap();
@@ -1231,16 +1239,16 @@ fn main() {
             }
             n
         }
-        let n = copy_tree(&musl_lib, &esp_apps.join("LIB"));
-        println!("   SELFBUILD3: staged APPS/LIB ({n} files: musl crt + libc.a + headers, tcc's libtcc1.a + headers)");
+        let n = copy_tree(&musl_lib, &esp_lib);
+        println!("   SELFBUILD3: staged LIB (/lib, {n} files: musl crt + libc.a + headers, tcc's libtcc1.a + headers)");
     } else {
-        println!("   SELFBUILD3: target/LIB absent — ESP has no APPS/LIB (musl not built: no egress at build time?)");
+        println!("   SELFBUILD3: target/LIB absent — ESP has no LIB (musl not built: no egress at build time?)");
     }
     // SELFBUILD5 (B357): target/LIB/rust (RUST.LNX's objects, the std rlibs, the musl crt + libc.a + libunwind.a, link.rsp) rides
-    // the APPS/LIB copy above; staged here on its own when the musl LIB was not built.
+    // the LIB copy above; staged here on its own when the musl LIB was not built.
     let rust_lib = musl_lib.join("rust");
     if rust_lib.join("link.rsp").exists() {
-        let to = esp_apps.join("LIB").join("rust");
+        let to = esp_lib.join("rust");
         if !to.join("link.rsp").exists() {
             std::fs::create_dir_all(&to).unwrap();
             for e in std::fs::read_dir(&rust_lib).unwrap() {
@@ -1248,19 +1256,19 @@ fn main() {
                 std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
             }
         }
-        println!("   SELFBUILD5: APPS/LIB/rust staged (LLD.LNX -flavor gnu @/apps/LIB/rust/link.rsp)");
+        println!("   SELFBUILD5: LIB/rust staged (LLD.LNX -flavor gnu @/lib/rust/link.rsp)");
     } else {
-        println!("   SELFBUILD5: target/LIB/rust absent — ESP has no APPS/LIB/rust (tests selfbuild5 reports lld=skip)");
+        println!("   SELFBUILD5: target/LIB/rust absent — ESP has no LIB/rust (tests selfbuild5 reports lld=skip)");
     }
     // SELFBUILD6 (B360): target/LIB/dyn (libc.so + libgcc_s.so.1 relinked from the Rust musl target's self-contained archives —
     // the kernel loader's search dir — and the dyn probe) and, with UNAOS_SELFBUILD6_RUSTC=1, target/LIB/rustc (the musl-host
     // rustc tree: bin/rustc, the stripped librustc_driver, rust-lld, the musl std rlibs, hello.rs, pm/), both built and
-    // host-proven under `ldrun` by arroyo's build_selfbuild6_x86. They ride the APPS/LIB copy above; staged here on their own
+    // host-proven under `ldrun` by arroyo's build_selfbuild6_x86. They ride the LIB copy above; staged here on their own
     // when the musl LIB was not built. Absent = `tests selfbuild6` reports skip.
     for (sub, probe, what) in [("dyn", "hello", "libc.so, libgcc_s.so.1, the dyn probe"), ("rustc", "bin/rustc", "the musl-host rustc tree")] {
         let from = musl_lib.join(sub);
         if from.join(probe).exists() {
-            let to = esp_apps.join("LIB").join(sub);
+            let to = esp_lib.join(sub);
             if !to.join(probe).exists() {
                 fn copy_all(from: &std::path::Path, to: &std::path::Path) {
                     std::fs::create_dir_all(to).unwrap();
@@ -1275,9 +1283,9 @@ fn main() {
                 }
                 copy_all(&from, &to);
             }
-            println!("   SELFBUILD6: APPS/LIB/{sub} staged ({what})");
+            println!("   SELFBUILD6: LIB/{sub} staged ({what})");
         } else {
-            println!("   SELFBUILD6: target/LIB/{sub} absent — ESP has no APPS/LIB/{sub} (tests selfbuild6 reports skip)");
+            println!("   SELFBUILD6: target/LIB/{sub} absent — ESP has no LIB/{sub} (tests selfbuild6 reports skip)");
         }
     }
 

@@ -22,10 +22,10 @@
 // and main.rs. M6f adds a real copy_from_user and a wider surface.
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
-// U11-M2: the low-level SPINLOCK (spin::Mutex) guarding the GLOBAL cross-ASID open-file refcount table. Same
+// U11-M2: the low-level SPINLOCK (crate::sync::Mutex) guarding the GLOBAL cross-ASID open-file refcount table. Same
 // primitive the scheduler uses for RUN_QUEUES/SLEEPERS (`sched.rs`), imported directly because that module's
 // alias is private. It is safe to take IRQ-masked (the teardown decrement path) — never held across block I/O.
-use spin::Mutex as SpinMutex;
+use crate::sync::Mutex as SpinMutex;
 
 // --- Syscall numbers. WRITE/EXIT are the M6a/M6b core; REPORT is the M6d demo channel; YIELD/SLEEP_MS/
 // GETPID/GETINFO are the M6f "real" surface (all thin over existing scheduler/timer primitives). The
@@ -3532,7 +3532,7 @@ const PORPHANED: u8 = 3;
 ///
 /// PROCS-6 — raised 4 -> 6, so the operator can fill the panel with background vugs. What the raise had to
 /// clear, and why 6 and not more:
-///   * EVERY consumer is parametric. The reserve/free/find/census loops are `0..MAX_PROCS`, the reap
+///   * EVERY consumer is parametric. The reserve/free/find/census loops are `0..procs_rows()`, the reap
 ///     accounting is per-row CAS, and both scavenges (BGRUN-SCAV's PEXITED reclaim, KILLBOUND's PORPHANED
 ///     reclaim behind its quiescence witness) sweep the same range. There is no bitmask, no packed index,
 ///     no fixed-width field anywhere keyed on the old 4 — nothing to widen.
@@ -3549,7 +3549,7 @@ const PORPHANED: u8 = 3;
 ///     the two extra `done.init()` waiter reservations of `WAIT_CAPACITY` boxes — a few hundred bytes of
 ///     BSS and heap, entirely off the per-slot `SLOT_BACKING` budget, which `USER_SLOTS` governs and this
 ///     change does not touch.
-const MAX_PROCS: usize = super::uslots::USER_SLOTS - 2; // WINDOWCAP-2 (B378, R90) — derived from the EL0 slot pool (its 2-slot reserve kept), as on x86; `sched::MAX_KILL_REQS` follows the same expression; the live limit is `video::wincap::proc_limit()`
+// WINDOWCAP3 (B399, R90): there is no MAX_PROCS — `PROCS` is a heap-grown `SegVec` (a row appended when none is free), and the live limit is memory's (`video::wincap::proc_limit`, asked by `proc_reserve`).
 struct Proc {
     /// The child task id; the sys_wait key. 0 while an entry is FREE or a claim's pid is not yet stored.
     pid: AtomicU64,
@@ -3565,44 +3565,19 @@ struct Proc {
     /// scheduler-post wake makes sys_wait work under QEMU (unlike a timer-driven `sleep_ticks`).
     done: super::sched::Semaphore,
 }
-static PROCS: [Proc; MAX_PROCS] = [const {
-    Proc {
-        pid: AtomicU64::new(0),
-        status: AtomicI32::new(0),
-        state: AtomicU8::new(PFREE),
-        asid: AtomicU64::new(0),
-        done: super::sched::Semaphore::new(0),
-    }
-}; MAX_PROCS];
+static PROCS: crate::video::rowstore::SegVec<Proc> = crate::video::rowstore::SegVec::new(|| Proc {
+    pid: AtomicU64::new(0),
+    status: AtomicI32::new(0),
+    state: AtomicU8::new(PFREE),
+    asid: AtomicU64::new(0),
+    done: { let d = super::sched::Semaphore::new(0); d.init(); d }, // waiter capacity reserved at the row's birth (process context)
+});
+/// WINDOWCAP3: rows the process table has grown to — every `Proc` sweep's bound.
+#[inline]
+fn procs_rows() -> usize {
+    PROCS.hwm()
+}
 
-/// PROCS-6 — the cap's two structural neighbours, enforced at compile time rather than left to a comment.
-/// A row that cannot be given an address space is a row that can only ever hand back `-EAGAIN` from deeper
-/// in the launch, and a kernel row the shell cannot record is a job the operator can neither see nor reap
-/// (`bg` kills such a spawn rather than leak it). Both must stay strictly above the cap.
-///
-/// SCOPE, so nobody reads more into a green `arroyo check` than is there: this module is gated behind
-/// `baremetal`, so these asserts are evaluated by the `kernel8` build and NOT by `check` (which builds
-/// aarch64 without the feature). That is the right place for them — it is the only configuration in
-/// which a `Proc` table, an EL0 slot pool and a kill table all exist — but `check` alone does not
-/// witness them. Each was verified to fire by negative test rather than assumed.
-const _: () = {
-    // Strictly below, by the margin the doc actually promises: two slots kept free so a foreground
-    // `run` and the launcher fixtures' scratch tenancies can still get an address space with every
-    // background row occupied. `< USER_SLOTS` alone would have permitted 7, which satisfies the letter
-    // of "leaves slots free" while starving exactly the two callers that need one.
-    assert!(MAX_PROCS <= super::uslots::USER_SLOTS - 2, "MAX_PROCS must leave 2 EL0 slots free");
-    assert!(MAX_PROCS <= WIN_MAX, "every bg program must be able to own a window"); // WINDOWCAP-2: against the EL0 window table (the compositor's has no width)
-    // The KILL table, which is coupled to this one in the FAILURE direction: a row that can be killed
-    // needs a slot to be killed through, or `bg_kill` arms nothing, falls back to PORPHANED and parks
-    // the row — recoverable then only via KILLBOUND's narrower quiescence witness. `sched.rs` cannot
-    // name `MAX_PROCS` (it compiles in non-baremetal builds, where `syscall` is gated out), so the
-    // coupling is asserted from this side, which is also the only configuration where a `Proc` table
-    // exists and a shortfall could mean anything.
-    assert!(
-        MAX_PROCS <= super::sched::MAX_KILL_REQS,
-        "every killable Proc row must have a kill slot to be killed through"
-    );
-};
 
 /// The parent's WITNESS (reported via SYS_REPORT): `U4_WITNESS_TOKEN` (nonzero) iff it reaped BOTH children
 /// by handle with exit status 0, else 0. `u4_launcher`'s verdict demands it be non-zero (and no kill). A
@@ -3823,7 +3798,10 @@ static EL0_UOWNER_KILLED: AtomicU32 = AtomicU32::new(0);
 /// child is spawned (see `sys_spawn` — the child cannot be dispatched until the parent yields, so the real
 /// pid is always in place before any lookup). `None` if the table is full (-> `-EAGAIN`, never grow the pool).
 fn proc_reserve() -> Option<usize> {
-    for i in 0..MAX_PROCS {
+    if !proc_admit() {
+        return None; // WINDOWCAP3 (B399): memory's limit, said on the wire by the valve
+    }
+    for i in 0..procs_rows() {
         if PROCS[i]
             .state
             .compare_exchange(PFREE, PRUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -3834,6 +3812,9 @@ fn proc_reserve() -> Option<usize> {
             PROCS[i].asid.store(0, Ordering::Release);
             return Some(i);
         }
+    }
+    if let Some(i) = proc_reserve_grow() {
+        return Some(i); // WINDOWCAP3 (B399): no free row — the table grows before it scavenges
     }
     // BGRUN-SCAV: no FREE row. Before failing, reclaim a row belonging to a program that has ALREADY
     // EXITED and that nobody has reaped. BGRUN-1's stated position was that holding those rows is
@@ -3852,7 +3833,7 @@ fn proc_reserve() -> Option<usize> {
     // The `done` permit is consumed here for the same reason `bg_poll(reap=true)` consumes it — a reused
     // entry must start at zero permits. It cannot block: `PEXITED` is published strictly AFTER the permit
     // is posted on every path that sets it, and the CAS means no one else can have taken it.
-    for i in 0..MAX_PROCS {
+    for i in 0..procs_rows() {
         if PROCS[i]
             .state
             .compare_exchange(PEXITED, PRUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -3900,7 +3881,7 @@ fn proc_reserve() -> Option<usize> {
     // The CAS PORPHANED->PRUNNING claims the row exclusively, exactly as the BGRUN-SCAV CAS above does.
     // No `done` permit is consumed: a PORPHANED row's task never posts one (`sys_exit`'s orphan arm and
     // `note_killed_task_retired` both free the row without posting), so waiting here would hang.
-    for i in 0..MAX_PROCS {
+    for i in 0..procs_rows() {
         if PROCS[i].state.load(Ordering::Acquire) != PORPHANED {
             continue;
         }
@@ -3970,7 +3951,7 @@ pub fn proc_table_headroom() -> (usize, usize, usize, usize) {
     let mut running = 0usize;
     let mut exited = 0usize;
     let mut porphaned = 0usize;
-    for i in 0..MAX_PROCS {
+    for i in 0..procs_rows() {
         match PROCS[i].state.load(Ordering::Acquire) {
             PFREE => free += 1,
             PEXITED => exited += 1,
@@ -3983,14 +3964,14 @@ pub fn proc_table_headroom() -> (usize, usize, usize, usize) {
 
 /// STORM-HEADROOM: the process-table cap — the denominator for [`proc_table_headroom`]. See the
 /// `MAX_PROCS` block for why it is 6 and why raising it is not a tuning knob.
-pub const fn proc_table_rows() -> usize {
-    MAX_PROCS
+pub fn proc_table_rows() -> usize {
+    crate::video::wincap::proc_limit() // WINDOWCAP3 (B399): the denominator is memory's limit — the table itself has no width
 }
 
 /// Find the RUNNING Proc entry whose pid matches — the child-exit / child-kill lookup. Called with a live
 /// task id (`> 0`), so it never spuriously matches a fresh claim's pid=0 placeholder.
 fn proc_find_running(pid: u64) -> Option<usize> {
-    (0..MAX_PROCS).find(|&i| {
+    (0..procs_rows()).find(|&i| {
         PROCS[i].state.load(Ordering::Acquire) == PRUNNING && PROCS[i].pid.load(Ordering::Acquire) == pid
     })
 }
@@ -4038,7 +4019,7 @@ fn proc_find_unpublished(asid: u64) -> Option<usize> {
     if asid == 0 {
         return None;
     }
-    (0..MAX_PROCS).find(|&i| {
+    (0..procs_rows()).find(|&i| {
         PROCS[i].state.load(Ordering::Acquire) == PRUNNING
             && PROCS[i].pid.load(Ordering::Acquire) == 0
             && PROCS[i].asid.load(Ordering::Acquire) == asid
@@ -4048,7 +4029,7 @@ fn proc_find_unpublished(asid: u64) -> Option<usize> {
 /// Find the non-FREE (RUNNING or EXITED) Proc entry whose pid matches — the sys_wait lookup. `None` => the
 /// caller has no such child (`-ECHILD`).
 fn proc_find_child(pid: u64) -> Option<usize> {
-    (0..MAX_PROCS).find(|&i| {
+    (0..procs_rows()).find(|&i| {
         PROCS[i].state.load(Ordering::Acquire) != PFREE && PROCS[i].pid.load(Ordering::Acquire) == pid
     })
 }
@@ -4059,7 +4040,7 @@ fn proc_find_child(pid: u64) -> Option<usize> {
 /// `proc_find_running` so the orphan's exit takes the reclaim path and NEVER the status/`done`-post path —
 /// there is no parent left waiting, and the row must not be treated as a live child.
 fn proc_find_orphaned(pid: u64) -> Option<usize> {
-    (0..MAX_PROCS).find(|&i| {
+    (0..procs_rows()).find(|&i| {
         PROCS[i].state.load(Ordering::Acquire) == PORPHANED && PROCS[i].pid.load(Ordering::Acquire) == pid
     })
 }
@@ -4158,14 +4139,16 @@ pub fn note_killed_task_retired(pid: u64) {
 #[cfg_attr(not(feature = "baremetal"), allow(dead_code))]
 pub fn kill_wake_parked_semaphores() -> u32 {
     let mut n = 0u32;
-    for i in 0..MAX_PROCS {
+    for i in 0..procs_rows() {
         n += PROCS[i].done.wake_killed();
     }
     // Only mailboxes that were actually initialised can hold a parked waiter (`sys_mrecv` calls
     // `bus_sem_init_once` before it can block), so this is a no-op on a boot with no bus traffic.
     if BUS_SEM_INIT.load(Ordering::Acquire) == 2 {
-        for s in &BUS_SEM {
-            n += s.wake_killed();
+        for r in 0..BUS_SEM.hwm() {
+            if let Some(s) = BUS_SEM.peek(r) {
+                n += s.wake_killed();
+            }
         }
     }
     if let Some(tab) = THREAD_TABLE.try_lock() {
@@ -4223,8 +4206,7 @@ const NHANDLE: usize = 8; // handle slots per process (small, static — like MA
 /// (0 = Empty would let a re-scan re-claim it; a real pid is never `u64::MAX`). Overwritten with the pid
 /// once the child is spawned, or cleared if the load fails — never observed by any other task (single-writer).
 const HANDLE_RESERVING: u64 = u64::MAX;
-static HANDLES: [[AtomicU64; NHANDLE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NHANDLE] }; super::uslots::USER_SLOTS + 1];
+static HANDLES: crate::procslot::SlotVec<[AtomicU64; NHANDLE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU64::new(0) }; NHANDLE], [const { AtomicU64::new(0) }; NHANDLE]);
 
 // ---------------------------------------------------------------------------------------------
 // U5 — handles as CAPABILITIES: rights, a resource target beyond "child pid", the enforcement CHECK
@@ -4279,8 +4261,7 @@ const CONSOLE_FD: usize = 1;
 /// `0`/`RESERVING` sentinel semantics and the rights ride alongside. Written with Release beside the value
 /// store (rights published BEFORE the value that makes a handle live, so a resolver that observes the value
 /// also observes the rights), cleared in `handle_clear` / `clear_handle_row`. `0` rights == an inert handle.
-static HANDLE_RIGHTS: [[AtomicU32; NHANDLE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NHANDLE] }; super::uslots::USER_SLOTS + 1];
+static HANDLE_RIGHTS: crate::procslot::SlotVec<[AtomicU32; NHANDLE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NHANDLE], [const { AtomicU32::new(0) }; NHANDLE]);
 
 // ---------------------------------------------------------------------------------------------
 // U6 — the general OBJECT descriptor: a handle is (kind, target, rights), first-free allocated for ALL kinds
@@ -4309,8 +4290,7 @@ const KIND_SOCKET: u8 = 4; // U6 scaffold: a socket object (value word = an opaq
 /// object id) and keeps U4/U5's `0`=Empty / `u64::MAX`=RESERVING sentinels intact. Written with Release BEFORE
 /// the value store that makes a handle live (so a resolver observing the live value also observes the kind),
 /// cleared in `handle_clear` / `clear_handle_row`. `KIND_EMPTY` (0) == an inert/absent slot (the const-init).
-static HANDLE_KIND: [[AtomicU8; NHANDLE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU8::new(KIND_EMPTY) }; NHANDLE] }; super::uslots::USER_SLOTS + 1];
+static HANDLE_KIND: crate::procslot::SlotVec<[AtomicU8; NHANDLE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU8::new(KIND_EMPTY) }; NHANDLE], [const { AtomicU8::new(KIND_EMPTY) }; NHANDLE]);
 
 /// `-EACCES`: a capability check failed — no such handle / wrong kind / missing right / an attenuation
 /// violation (a grant that would amplify rights). The single errno U5's CHECK returns to EL0.
@@ -4685,28 +4665,22 @@ const NFILE: usize = 4; // open files per process (small, static — a demo open
 /// Per-descriptor presence flag: `true` == this `[asid][idx]` slot holds a live open file. Claimed
 /// (`false`->`true`) in `files_alloc`, cleared in `files_free`/`clear_files_row`. The single source of truth
 /// for "is this file-id valid" — `sys_read` re-checks it after decoding a handle's file-id (defense in depth).
-static FILE_USED: [[AtomicBool; NFILE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicBool::new(false) }; NFILE] }; super::uslots::USER_SLOTS + 1];
+static FILE_USED: crate::procslot::SlotVec<[AtomicBool; NFILE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicBool::new(false) }; NFILE], [const { AtomicBool::new(false) }; NFILE]);
 /// The open file's first data cluster (chain head for a `read_at` walk). Meaningful only where `FILE_USED`.
-static FILE_CLUSTER: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
+static FILE_CLUSTER: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// The open file's total byte size (the EOF bound `sys_read` clamps against). Meaningful only where `FILE_USED`.
-static FILE_SIZE: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
+static FILE_SIZE: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// The descriptor's byte offset — advanced by the count each `sys_read`/File `sys_write` delivers, and set
 /// absolutely by `SYS_SEEK` (U9). Meaningful only where `FILE_USED`. Always kept `<= FILE_SIZE`: reads/writes
 /// clamp to the bytes remaining, and `sys_seek` rejects an offset past `size` with `-EINVAL`.
-static FILE_OFFSET: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
+static FILE_OFFSET: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// U10: the on-disk LOCATION of this file's directory entry — the absolute LBA of its directory sector and
 /// (in `FILE_DIR_OFF`) the byte offset of its 32-byte slot within that sector, both captured at `sys_open`
 /// (from `fat::find_located`). A GROW republishes the file's `size`/`first_cluster` into that slot, so the
 /// on-disk directory stays the reader's source of truth. Meaningful only where `FILE_USED`; unused (both `0`)
 /// for descriptors that never grow (the U6b no-cap negative, the U9 revoke check).
-static FILE_DIR_LBA: [[AtomicU64; NFILE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
-static FILE_DIR_OFF: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
+static FILE_DIR_LBA: crate::procslot::SlotVec<[AtomicU64; NFILE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU64::new(0) }; NFILE], [const { AtomicU64::new(0) }; NFILE]);
+static FILE_DIR_OFF: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// U11: per-descriptor GENERATION counter. A `File` handle's value word packs `(gen << 32) | (idx + 1)`, and
 /// `file_desc_validate` rejects a handle whose packed gen != the slot's CURRENT gen — so a stale sibling handle
 /// to a slot that was freed and then FIRST-FIT-REUSED by a different file is `-EACCES` (a gen mismatch), never a
@@ -4715,8 +4689,7 @@ static FILE_DIR_OFF: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
 /// through or mirror) so the very next reuse of the slot lands on a fresh generation. Const-init `0`; monotone
 /// within a boot (a u32 wrap is ~4 billion frees away — unreachable for the demo). Acquire/Release-paired with
 /// `FILE_USED` (published last on alloc, cleared on free) so a validator that sees a live slot sees its gen.
-static FILE_GEN: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
+static FILE_GEN: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 
 /// U11-M2: per-descriptor pointer to the GLOBAL open-file refcount row this descriptor increments (`OPEN_FILES`
 /// index, or `OPENROW_NONE` for a scaffold/free slot). Recorded by `sys_open` right after `files_alloc` (the row
@@ -4725,8 +4698,7 @@ static FILE_GEN: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
 /// `(dir_lba, dir_off)` identifies a slot, not a file, so a new file created in an unlinked-but-still-open file's
 /// recycled `0xE5` slot would collide on the key; keying the decrement/mark on the row INDEX the descriptor
 /// actually claimed keeps each file's refcount + deferred-free strictly its own. Const-init `OPENROW_NONE`.
-static FILE_OPENROW: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(OPENROW_NONE) }; NFILE] }; super::uslots::USER_SLOTS + 1];
+static FILE_OPENROW: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(OPENROW_NONE) }; NFILE], [const { AtomicU32::new(OPENROW_NONE) }; NFILE]);
 
 /// U11-M2: the `FILE_OPENROW` sentinel for "this descriptor increments no open-file row" (a scaffold with no file
 /// identity, or a free slot). `u32::MAX` is unreachable as a real `OPEN_FILES` index (`NOPENFILE` is tiny).
@@ -5210,7 +5182,7 @@ impl DeferredFree {
 static DEFERRED_FREE: SpinMutex<DeferredFree> = SpinMutex::new(DeferredFree::EMPTY);
 
 /// U11-M2b (deadlock fix): an RAII IRQ-mask guard for the two `DEFERRED_FREE` critical sections.
-/// `DEFERRED_FREE` is a bare `spin::Mutex` acquired in two IRQ-ASYMMETRIC contexts: `deferred_free_push`
+/// `DEFERRED_FREE` is a bare `crate::sync::Mutex` acquired in two IRQ-ASYMMETRIC contexts: `deferred_free_push`
 /// runs in the IRQ-masked teardown path, but `deferred_free_pop` runs in the reaper TASK body, which the
 /// metal generic timer can PREEMPT (kernel task bodies run I-unmasked; `SCHED_ACTIVE` enables preemption).
 /// Without masking, a timer preempt of the reaper WHILE it holds the lock, followed by a SAME-CORE teardown
@@ -5743,7 +5715,7 @@ static NAMESPACE: SpinMutex<()> = SpinMutex::new(());
 /// order is load-bearing: `_lock` drops FIRST (release the mutex), `_irq` LAST (restore DAIF) — the
 /// lock is never held with IRQs unmasked.
 struct NsGuard {
-    _lock: spin::mutex::MutexGuard<'static, (), spin::relax::Spin>,
+    _lock: crate::sync::MutexGuard<'static, (), spin::relax::Spin>,
     _irq: IrqGuard,
 }
 
@@ -8174,7 +8146,7 @@ pub fn run_user_image_argv(
                 if !KILL_EXHAUSTED.swap(true, Ordering::AcqRel) {
                     serial_println!(
                         "[skill] slot table EXHAUSTED — reverting to PORPHANED (all {} kill requests consumed by targets that never reached a boundary)",
-                        super::sched::MAX_KILL_REQS
+                        crate::procslot::SLOT_ID_MAX
                     );
                 }
             }
@@ -8426,7 +8398,7 @@ pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64
 /// Scans by pid rather than trusting a cached index: rows recycle, and a stale index could name a row
 /// that now belongs to someone else — the pid is the key every other lookup uses.
 pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
-    for pi in 0..PROCS.len() {
+    for pi in 0..procs_rows() {
         if PROCS[pi].state.load(Ordering::Acquire) == PFREE {
             continue;
         }
@@ -8460,7 +8432,7 @@ pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
 /// PORPHANED fallback with the kill left armed). Returns an operator string for the shell.
 pub fn bg_kill(pid: u64, asid: u64) -> &'static str {
     let mut row: Option<usize> = None;
-    for pi in 0..PROCS.len() {
+    for pi in 0..procs_rows() {
         if PROCS[pi].state.load(Ordering::Acquire) != PFREE
             && PROCS[pi].pid.load(Ordering::Acquire) == pid
         {
@@ -9668,20 +9640,15 @@ const MAX_XFERS: usize = 8;
 const XFER_REVOKED_BIT: u64 = 1 << 63;
 
 /// The inbox slot's STATE word: 0 = free, `HANDLE_RESERVING` = mid-claim, else = the transfer id (live).
-static XFER_SLOT_TX: [[AtomicU64; NXFER]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
+static XFER_SLOT_TX: crate::procslot::SlotVec<[AtomicU64; NXFER]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU64::new(0) }; NXFER], [const { AtomicU64::new(0) }; NXFER]);
 /// The pending descriptor: what kind of object the transferred cap names. Meaningful only where TX is live.
-static XFER_SLOT_KIND: [[AtomicU8; NXFER]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU8::new(KIND_EMPTY) }; NXFER] }; super::uslots::USER_SLOTS + 1];
+static XFER_SLOT_KIND: crate::procslot::SlotVec<[AtomicU8; NXFER]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU8::new(KIND_EMPTY) }; NXFER], [const { AtomicU8::new(KIND_EMPTY) }; NXFER]);
 /// The pending descriptor's target payload (the value word the received handle will carry).
-static XFER_SLOT_TARGET: [[AtomicU64; NXFER]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
+static XFER_SLOT_TARGET: crate::procslot::SlotVec<[AtomicU64; NXFER]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU64::new(0) }; NXFER], [const { AtomicU64::new(0) }; NXFER]);
 /// The pending descriptor's (already attenuated) rights.
-static XFER_SLOT_RIGHTS: [[AtomicU32; NXFER]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
+static XFER_SLOT_RIGHTS: crate::procslot::SlotVec<[AtomicU32; NXFER]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NXFER], [const { AtomicU32::new(0) }; NXFER]);
 /// The record index + 1 backing this pending transfer (0 = none — a kernel bug on a live slot).
-static XFER_SLOT_REC: [[AtomicU32; NXFER]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
+static XFER_SLOT_REC: crate::procslot::SlotVec<[AtomicU32; NXFER]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NXFER], [const { AtomicU32::new(0) }; NXFER]);
 
 /// A record's STATE word: 0 = free, `HANDLE_RESERVING` = mid-claim, `txid` = the live transfer it
 /// ledgers, `txid | XFER_REVOKED_BIT` = that transfer, revoked (read by `handle_resolve` — the received
@@ -9698,8 +9665,7 @@ static XFER_NEXT_TX: AtomicU64 = AtomicU64::new(1);
 /// revocation hook `handle_resolve` reads. Keyed `[asid][idx]` like the other handle sidecars, and — the
 /// point — written ONLY by the row's own task (`sys_recv`) or its teardown: the sender reaches a received
 /// cap exclusively through the record, never through this row.
-static HANDLE_XFER_REC: [[AtomicU32; NHANDLE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NHANDLE] }; super::uslots::USER_SLOTS + 1];
+static HANDLE_XFER_REC: crate::procslot::SlotVec<[AtomicU32; NHANDLE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NHANDLE], [const { AtomicU32::new(0) }; NHANDLE]);
 
 /// Claim a free transfer record and mint its transfer id: CAS the state word 0 -> RESERVING, publish the
 /// sender (Release), then the tx LAST (live-last, the handle_install discipline; the revoked flag needs no
@@ -10092,17 +10058,14 @@ static DERIV_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Which derivation node (index + 1; 0 = a root with no node yet) a handle's capability is. Keyed
 /// `[asid][idx]` like every handle sidecar; written only by the row's own task (mid-SVC) or its teardown.
-static HANDLE_DERIV: [[AtomicU32; NHANDLE]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NHANDLE] }; super::uslots::USER_SLOTS + 1];
+static HANDLE_DERIV: crate::procslot::SlotVec<[AtomicU32; NHANDLE]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NHANDLE], [const { AtomicU32::new(0) }; NHANDLE]);
 
 /// The derivation node riding a PENDING deposit (index + 1) — ownership passes inbox-slot -> received handle
 /// at RECV; every discard path (revoked-pending, generation-stale, retract, teardown sweep) drops it instead.
-static XFER_SLOT_DERIV: [[AtomicU32; NXFER]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
+static XFER_SLOT_DERIV: crate::procslot::SlotVec<[AtomicU32; NXFER]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU32::new(0) }; NXFER], [const { AtomicU32::new(0) }; NXFER]);
 /// The recipient GENERATION stamped into a pending deposit — RECV delivers only on an exact match with the
 /// recipient's CURRENT generation (see `ASID_GEN`).
-static XFER_SLOT_GEN: [[AtomicU64; NXFER]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
+static XFER_SLOT_GEN: crate::procslot::SlotVec<[AtomicU64; NXFER]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU64::new(0) }; NXFER], [const { AtomicU64::new(0) }; NXFER]);
 
 /// The transfer record's derivation node (index + 1) + that node's ID at publish time — what
 /// `sys_cap_xrevoke` marks so the revoke reaches everything DERIVED from the transferred cap (re-grants,
@@ -10115,8 +10078,7 @@ static XFER_REC_DERIV_ID: [AtomicU64; MAX_XFERS] = [const { AtomicU64::new(0) };
 /// Per-ASID inbox GENERATION: bumped (AcqRel) at the TOP of `clear_handle_row` — i.e. strictly before the
 /// teardown's inbox sweep — so any deposit stamped with the old generation is dead-on-arrival for the ASID's
 /// next tenant even if it lands after the sweep passed its slot. ASID 0 (the shared window) never tears down.
-static ASID_GEN: [AtomicU64; super::uslots::USER_SLOTS + 1] =
-    [const { AtomicU64::new(0) }; super::uslots::USER_SLOTS + 1];
+static ASID_GEN: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new_asid(|| AtomicU64::new(0), AtomicU64::new(0));
 
 /// Claim a free derivation node under `parent_ref` (a node index + 1, or 0 for a root): CAS the ID word
 /// 0 -> RESERVING, publish the edge + zeroed counters, bump the parent's KIDS (the parent is pinned — the
@@ -10691,13 +10653,12 @@ fn bgrun_witness(_demo_cpu: usize) {
     // capacity once so a log tells you which table the leg was actually exercising.
     {
         serial_println!(
-            ":: BGRUN-ST: process table capacity = {} rows (bg programs alive at once; EL0 slots {}) ::",
-            MAX_PROCS,
-            super::uslots::USER_SLOTS
+            ":: BGRUN-ST: process table capacity = {} rows (bg programs alive at once; EL0 slots=heap, R90) ::",
+            proc_table_rows()
         );
         let mut spawned = 0usize;
         let mut failed_at = usize::MAX;
-        for n in 0..(MAX_PROCS + 2) {
+        for n in 0..(proc_table_rows() + 2) {
             match spawn_user_image_bg(&hello) {
                 Err(_) => {
                     failed_at = n;
@@ -10718,7 +10679,7 @@ fn bgrun_witness(_demo_cpu: usize) {
                 }
             }
         }
-        if spawned == MAX_PROCS + 2 {
+        if spawned == proc_table_rows() + 2 {
             serial_println!(
                 ":: BGRUN-ST: slot reclaim PASS ({} bg launches, none reaped, no false table-full) ::",
                 spawned
@@ -10726,11 +10687,11 @@ fn bgrun_witness(_demo_cpu: usize) {
         } else {
             serial_println!(
                 ":: BGRUN-ST: slot reclaim — spawn {} of {} refused (table full on corpses) -> FAIL ::",
-                failed_at, MAX_PROCS + 2
+                failed_at, proc_table_rows() + 2
             );
         }
         // Leave the table clean for the legs below: reap whatever this leg left behind.
-        for pi in 0..PROCS.len() {
+        for pi in 0..procs_rows() {
             if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
                 let pid = PROCS[pi].pid.load(Ordering::Acquire);
                 let _ = bg_poll(pid, true);
@@ -11028,7 +10989,7 @@ struct ThreadRec {
 }
 
 /// The thread-handle table: a small fixed pool of live joinable threads, index = the handle returned to EL0.
-/// A `spin::Mutex` (not per-ASID atomics like `HANDLES`) because a `JoinHandle` is a non-Copy owned value that
+/// A `crate::sync::Mutex` (not per-ASID atomics like `HANDLES`) because a `JoinHandle` is a non-Copy owned value that
 /// `join` must MOVE out; the lock is held only for the claim/take, never across the blocking `join`.
 static THREAD_TABLE: SpinMutex<[Option<ThreadRec>; NTHREAD]> = SpinMutex::new([const { None }; NTHREAD]);
 
@@ -11924,7 +11885,7 @@ fn sys_fb_map() -> i64 {
 /// A bitmask rather than a `Proc` field because the reader is the FB info-page writer, which is reached
 /// from `sys_win_create`/`sys_fb_map` with the window table lock held — it has an ASID in hand and no
 /// business walking the process table under that lock.
-static DETACHED_ASIDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DETACHED_ASIDS: crate::video::rowstore::SlotBits = crate::video::rowstore::SlotBits::new(); // WINDOWCAP3 (B399): one growable bit per ASID (was a u64 word, ASIDs 1..=63)
 
 /// VUG-BG — record whether ASID `asid` was launched detached. ASIDs outside the bitmask's 64-bit range
 /// are ignored (the process table is far smaller; this is a bound, not an expected case), which fails in
@@ -11935,18 +11896,13 @@ fn set_detached(asid: u64, on: bool) {
     // so an unrepresentable ASID would give the operator a desktop vug that still dies at the cap. It is
     // unreachable today (`boot::USER_SLOTS` = 8, ASID = slot + 1, so ASID <= 8) and the assert pins that
     // relationship: if the slot table is ever widened past 63, this bitmask must widen with it.
-    debug_assert!(
-        asid < 64,
-        "VUG-BG detached bitmask is 64-wide; USER_SLOTS grew past it"
-    );
-    if asid == 0 || asid >= 64 {
-        return;
+    if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
+        return; // WINDOWCAP3: the ASID TYPE (slot + 1 <= SLOT_ID_MAX), not a 64-bit word
     }
-    let bit = 1u64 << asid;
     if on {
-        DETACHED_ASIDS.fetch_or(bit, Ordering::Release);
+        DETACHED_ASIDS.set(asid as usize);
     } else {
-        DETACHED_ASIDS.fetch_and(!bit, Ordering::Release);
+        DETACHED_ASIDS.clear(asid as usize);
     }
 }
 
@@ -11960,10 +11916,7 @@ pub fn clear_detached(asid: u64) {
 
 /// VUG-BG — is ASID `asid` a detached (backgrounded) address space?
 fn is_detached(asid: u64) -> bool {
-    if asid == 0 || asid >= 64 {
-        return false;
-    }
-    DETACHED_ASIDS.load(Ordering::Acquire) & (1u64 << asid) != 0
+    asid != 0 && DETACHED_ASIDS.test(asid as usize)
 }
 
 /// VUGMIN — one bit per ASID: set while every window that address space owns is HIDDEN, i.e. sitting
@@ -11982,7 +11935,7 @@ fn is_detached(asid: u64) -> bool {
 /// it raised), and `wm::present` reads the same predicate off the window table to suppress a composite
 /// no one can see. Headless QEMU still reads a constant 0 — no HID means nothing ever TABs to the
 /// shell, so nothing is ever hidden there and the deterministic checksum is unchanged.
-static HIDDEN_ASIDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HIDDEN_ASIDS: crate::video::rowstore::SlotBits = crate::video::rowstore::SlotBits::new(); // WINDOWCAP3 (B399): one growable bit per ASID
 
 /// VUGMIN — record whether ASID `asid`'s windows are currently hidden below the shell. Public because
 /// its callers are VUGMIN-B's, in `video::wm`: this module owns the bitmask and the info page, `wm` owns
@@ -11993,18 +11946,13 @@ static HIDDEN_ASIDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// should not is a vug that stops responding; a vug that renders when it could idle merely wastes the
 /// core it wastes today. The cheap failure is the one to fail into.
 pub fn set_hidden(asid: u64, on: bool) {
-    debug_assert!(
-        asid < 64,
-        "VUGMIN hidden bitmask is 64-wide; USER_SLOTS grew past it"
-    );
-    if asid == 0 || asid >= 64 {
-        return;
+    if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
+        return; // WINDOWCAP3: the ASID TYPE, not a 64-bit word
     }
-    let bit = 1u64 << asid;
     if on {
-        HIDDEN_ASIDS.fetch_or(bit, Ordering::Release);
+        HIDDEN_ASIDS.set(asid as usize);
     } else {
-        HIDDEN_ASIDS.fetch_and(!bit, Ordering::Release);
+        HIDDEN_ASIDS.clear(asid as usize);
     }
     // THE SETTER IS THE PUBLISHER, and it has to be. Bit 0 could leave publication to the info-page
     // writers because "was I launched detached" is fixed before the process runs, so the write that
@@ -12022,7 +11970,7 @@ pub fn set_hidden(asid: u64, on: bool) {
     // kernel backing that exists for the slot's whole life, teardown zeroes it, and `clear_hidden` at the
     // teardown funnel means a dead slot's word cannot outlive its owner.
     let slot = (asid - 1) as usize;
-    if slot < super::uslots::USER_SLOTS {
+    if super::uslots::slot_known(slot) { // WINDOWCAP3: a slot with a record has an info page
         let info = super::uslots::slot_fb_info_ptr(slot) as *mut u32;
         // SAFETY: `slot < USER_SLOTS` is the bound `slot_fb_info_ptr` itself asserts, and `FB_INFO_FLAGS`
         // is inside the info page — the same pointer and index the two info-page writers use.
@@ -12057,10 +12005,7 @@ pub fn clear_hidden(asid: u64) {
 
 /// VUGMIN — are ASID `asid`'s windows currently hidden below the shell?
 fn is_hidden(asid: u64) -> bool {
-    if asid == 0 || asid >= 64 {
-        return false;
-    }
-    HIDDEN_ASIDS.load(Ordering::Acquire) & (1u64 << asid) != 0
+    asid != 0 && HIDDEN_ASIDS.test(asid as usize)
 }
 
 /// VUG-BG — u32 index of the PROCESS-FLAGS word in the RO info page, in the reserved gap between the
@@ -12146,7 +12091,7 @@ fn sys_fb_present() -> i64 {
     // region-slot-0 row says — `win_bind_compat` never binds a `wm` window, and this is the path whose panel
     // output the pre-WC UVUG baseline pins. Looking the row up is still worth doing (it is the F2 identity
     // hold WC-B documents), but its `wm_id` is `WIN_NONE` by construction; asserted rather than assumed.
-    let win = (0..WIN_MAX).find(|&i| t[i].owner == asid && t[i].rslot == 0);
+    let win = t.iter().position(|e| e.owner == asid && e.rslot == 0);
     debug_assert!(
         win.map(|i| t[i].wm_id == crate::video::wm::WIN_NONE).unwrap_or(true),
         "compat row must carry no wm window"
@@ -12277,8 +12222,8 @@ fn present_surface_common(
 /// follow it. What is load-bearing is the SAFE direction, asserted here exactly as the x86 twin
 /// asserts it: a region slot is indexed per address space and a window id is global, so a region
 /// slot index must never be able to exceed the global table.
-const WIN_MAX: usize = super::uslots::USER_SLOTS * super::uslots::FB_WIN_SLOTS; // WINDOWCAP-2 (B378, R90) — no literal: every EL0 window lives in an address-space slot's FB region, so the EL0 table is exactly (slots x windows per slot) wide — the VA layout's count, as on x86
-const _: () = assert!(super::uslots::FB_WIN_SLOTS <= WIN_MAX);
+// WINDOWCAP3 (B399, R90): `WIN_MAX` (slots x windows per slot) is gone — the EL0 window table is a heap `Vec` that grows when no row is free ([`WINDOWS`], [`win_rows`]); an id is bounded by the table it was minted from, the live limit is `video::wincap`.
+
 /// WC-B: a `FB_WIN_MAX_W` × `FB_WIN_MAX_H` ARGB8888 surface must fit a window's VA slot exactly.
 const _: () = assert!(
     (super::uslots::FB_WIN_MAX_W * super::uslots::FB_WIN_MAX_H * 4) as usize
@@ -12325,14 +12270,14 @@ impl WinEntry {
 /// asymmetry `IrqGuard` exists to close. Held across the `map`/`unmap` MMU maintenance so a create and a
 /// close on two cores can never interleave their break-before-make sequences on the same leaf; it is a
 /// LEAF lock (nothing inside it calls back into any other lock).
-static WINDOWS: SpinMutex<[WinEntry; WIN_MAX]> = SpinMutex::new([WinEntry::FREE; WIN_MAX]);
+static WINDOWS: SpinMutex<alloc::vec::Vec<WinEntry>> = SpinMutex::new(alloc::vec::Vec::new()); // WINDOWCAP3 (B399): grows by one row when none is free
 
 /// WC-B: resolve + range-check the caller's ASID for a window verb. `-EINVAL` from the shared/boot
 /// context (ASID 0) or an out-of-range ASID — the same refusal `SYS_FB_MAP` has always given, kept
 /// identical so no existing caller sees a new errno.
 fn win_caller_slot() -> Result<u64, i64> {
     let asid = current_asid();
-    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
+    if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
         return Err(EINVAL);
     }
     Ok(asid)
@@ -12363,10 +12308,13 @@ fn win_pages_for(w: u32, h: u32) -> Option<usize> {
 fn win_bind_compat(asid: u64, _slot: usize) -> Option<usize> {
     let _irq = IrqGuard::mask_save();
     let mut t = WINDOWS.lock();
-    if let Some(i) = (0..WIN_MAX).find(|&i| t[i].owner == asid && t[i].rslot == 0) {
+    if let Some(i) = t.iter().position(|e| e.owner == asid && e.rslot == 0) {
         return Some(i);
     }
-    let id = (0..WIN_MAX).find(|&i| t[i].owner == 0)?;
+    let id = match t.iter().position(|e| e.owner == 0) {
+        Some(i) => i,
+        None => win_table_grow(&mut t)?,
+    };
     t[id] = WinEntry {
         owner: asid,
         rslot: 0,
@@ -12385,7 +12333,7 @@ fn win_bind_compat(asid: u64, _slot: usize) -> Option<usize> {
 /// shape for an unresolvable id); `-EACCES` live but owned by another ASID (the rights-denial shape).
 /// Returns the row by value — every verb re-reads the table under the lock before mutating.
 fn win_resolve(asid: u64, win: u64) -> Result<(usize, WinEntry), i64> {
-    if win >= WIN_MAX as u64 {
+    if win >= win_rows() as u64 {
         return Err(EBADF);
     }
     let id = win as usize;
@@ -12475,14 +12423,17 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // backing store. The x86 twin took the same correction when its caps diverged; the fifth window
     // now gets the honest `-EMFILE` this verb already documents.
     let rslot = match (0..super::uslots::FB_WIN_SLOTS)
-        .find(|&r| !(0..WIN_MAX).any(|i| t[i].owner == asid && t[i].rslot as usize == r))
+        .find(|&r| !t.iter().any(|e| e.owner == asid && e.rslot as usize == r))
     {
         Some(r) => r,
         None => return EMFILE,
     };
-    let id = match (0..WIN_MAX).find(|&i| t[i].owner == 0) {
+    let id = match t.iter().position(|e| e.owner == 0) {
         Some(i) => i,
-        None => return ENFILE,
+        None => match win_table_grow(&mut t) {
+            Some(i) => i,
+            None => return ENFILE, // WINDOWCAP3: the heap refused the row (or the id TYPE is spent)
+        },
     };
     let mut e = WinEntry {
         owner: asid,
@@ -12562,7 +12513,7 @@ fn sys_win_present(win: u64) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if win >= WIN_MAX as u64 {
+    if win >= win_rows() as u64 {
         return EBADF;
     }
     let id = win as usize;
@@ -12656,7 +12607,7 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if win >= WIN_MAX as u64 {
+    if win >= win_rows() as u64 {
         return EBADF;
     }
     let id = win as usize;
@@ -12780,15 +12731,15 @@ fn sys_win_close(win: u64) -> i64 {
 /// program's private memory would be composited to the panel under the dead program's window. Unmaps
 /// first, exactly as `SYS_WIN_CLOSE` does, so a REUSED ASID starts with the reserved (EL1-only) leaves.
 pub fn win_close_asid(asid: u64) {
-    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
+    if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
         return;
     }
     let slot = (asid - 1) as usize;
-    let mut closed = [crate::video::wm::WIN_NONE; WIN_MAX];
+    let mut closed = alloc::vec![crate::video::wm::WIN_NONE; win_rows()]; // WINDOWCAP3: sized before the lock; a row minted meanwhile is past it and not this ASID's
     {
         let _irq = IrqGuard::mask_save();
         let mut t = WINDOWS.lock();
-        for id in 0..WIN_MAX {
+        for id in 0..t.len().min(closed.len()) {
             if t[id].owner != asid {
                 continue;
             }
@@ -12956,14 +12907,11 @@ const INPUT_RING_CAP: usize = 32;
 
 /// The per-process input rings, keyed by ASID (0 = the shared/boot context, never a delivery target). One
 /// producer (the router) + one consumer (the EL0 task) per ring => a lock-free SPSC ring.
-static USER_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; super::uslots::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; super::uslots::USER_SLOTS + 1];
+static USER_INPUT_BUF: crate::procslot::SlotVec<[AtomicU64; INPUT_RING_CAP]> = crate::procslot::SlotVec::new_asid(|| [const { AtomicU64::new(0) }; INPUT_RING_CAP], [const { AtomicU64::new(0) }; INPUT_RING_CAP]);
 /// Consumer index (free-running; advanced by SYS_INPUT_POLL). Real slot = `head & (CAP-1)`.
-static USER_INPUT_HEAD: [AtomicU32; super::uslots::USER_SLOTS + 1] =
-    [const { AtomicU32::new(0) }; super::uslots::USER_SLOTS + 1];
+static USER_INPUT_HEAD: crate::procslot::SlotVec<AtomicU32> = crate::procslot::SlotVec::new_asid(|| AtomicU32::new(0), AtomicU32::new(0));
 /// Producer index (free-running; advanced by `user_input_enqueue`). Occupancy = `tail - head`.
-static USER_INPUT_TAIL: [AtomicU32; super::uslots::USER_SLOTS + 1] =
-    [const { AtomicU32::new(0) }; super::uslots::USER_SLOTS + 1];
+static USER_INPUT_TAIL: crate::procslot::SlotVec<AtomicU32> = crate::procslot::SlotVec::new_asid(|| AtomicU32::new(0), AtomicU32::new(0));
 
 /// VUGPAUSE-2: per-slot "this ASID has a task parked in `SYS_INPUT_WAIT`" flag. Set immediately before the
 /// futex park, cleared immediately after it returns — and ALSO cleared on slot teardown by
@@ -12987,8 +12935,7 @@ static USER_INPUT_TAIL: [AtomicU32; super::uslots::USER_SLOTS + 1] =
 /// key with no waiters; a stale-clear flag costs a task that never runs again, so the two are traded
 /// against each other in that direction on purpose. The backstop no longer reads it at all
 /// (`user_input_wake_backstop`), which caps the whole failure class at one backstop period.
-static USER_INPUT_PARKED: [AtomicBool; super::uslots::USER_SLOTS + 1] =
-    [const { AtomicBool::new(false) }; super::uslots::USER_SLOTS + 1];
+static USER_INPUT_PARKED: crate::procslot::SlotVec<AtomicBool> = crate::procslot::SlotVec::new_asid(|| AtomicBool::new(false), AtomicBool::new(false));
 
 /// VUGPAUSE-2: how many times a task has PARKED in `SYS_INPUT_WAIT`, and how many waiters the wake seam
 /// has released. Both are cumulative for the boot and drive the `[vugpause2]` witness.
@@ -13007,13 +12954,12 @@ static USER_INPUT_WAKE_EDGES: AtomicU64 = AtomicU64::new(0);
 /// reports is `USER_INPUT_WAKES` above and is unaffected by anything here. Per-ASID rather than global
 /// because the question the line answers ("did THIS vug resume, or is it stranded?") is per-ASID: a
 /// global cadence would let a busy vug's traffic silence a newly launched one's first resume.
-static USER_INPUT_RESUMES: [AtomicU64; super::uslots::USER_SLOTS + 1] =
-    [const { AtomicU64::new(0) }; super::uslots::USER_SLOTS + 1];
+static USER_INPUT_RESUMES: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new_asid(|| AtomicU64::new(0), AtomicU64::new(0));
 
 /// VUGMIN-C: drop `asid`'s resume-print pacing count. Called from slot teardown ONLY — the count paces a
 /// witness line across a whole tenancy, so nothing on the running path may reset it.
 fn clear_input_resumes(asid: u64) {
-    if asid != 0 && asid as usize <= super::uslots::USER_SLOTS {
+    if asid != 0 && asid as usize <= crate::procslot::SLOT_ID_MAX {
         USER_INPUT_RESUMES[asid as usize].store(0, Ordering::Relaxed);
     }
 }
@@ -13067,7 +13013,7 @@ fn user_input_wake(asid: u64) -> usize {
 /// lines and know how many were elided. The first two resumes of every ASID print, which is what the
 /// "was this vug stranded or resumed?" read actually needs; a flood is what it does not.
 fn user_input_wake_edge(asid: u64, edge: &str) -> usize {
-    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
+    if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
         return 0;
     }
     // CLICK-SWALLOW: count the NAMED edges — the focus arrival and the unhide, i.e. exactly the two
@@ -13121,7 +13067,7 @@ fn user_input_wake_edge(asid: u64, edge: &str) -> usize {
 /// measured idle win, and it is the price of the failure class being bounded at one period rather than
 /// unbounded. Any future stale-clear of the hint now costs an idle vug ~256 ms of latency, once.
 pub fn user_input_wake_backstop() {
-    for asid in 1..=super::uslots::USER_SLOTS as u64 {
+    for asid in 1..=super::uslots::user_slots() as u64 { // WINDOWCAP3: every ASID ever claimed (slot + 1)
         let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
         if n != 0 {
             USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
@@ -13261,7 +13207,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
         return false; // consumed, not queued — `[el0in] routed` must stay truthful
     }
     let asid = USER_INPUT_ACTIVE.load(Ordering::Acquire);
-    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
+    if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
         return false;
     }
     let Some(packed) = pack_input(ev) else {
@@ -13518,7 +13464,7 @@ pub fn user_input_set_active(asid: u64) {
     // BEFORE the app existed were never meant for it. Bounded by the queue's own 64-slot cap, so this
     // terminates even against a live producer. Only on a real focus (asid != 0); clearing focus leaves the
     // queue alone, since from then on those events legitimately belong to the shell/GUI channel.
-    if asid != 0 && (asid as usize) <= super::uslots::USER_SLOTS {
+    if asid != 0 && (asid as usize) <= crate::procslot::SLOT_ID_MAX {
         clear_input_row(asid); // fresh focus starts clean
         let mut drained = 0u32;
         while drained < 64 && crate::pal::next_event().is_some() {
@@ -13611,7 +13557,7 @@ pub fn user_input_set_active(asid: u64) {
 fn key_sink_drains(asid: u64) -> bool {
     // 0 = the SHELL/console drain (always live, see above); 1..=USER_SLOTS = a private EL0 ring, which is
     // precisely the set `user_input_enqueue` will push into. Anything else drains nothing, ever.
-    (asid as usize) <= super::uslots::USER_SLOTS
+    (asid as usize) <= crate::procslot::SLOT_ID_MAX
 }
 
 /// SINKVALID — witness budget for the deflection line. Operator-rate by nature (a hand on a furniture
@@ -14099,7 +14045,7 @@ fn wc_close_click(win: crate::video::wm::WinId, owner: u64) -> &'static str { //
     crate::video::wm::focus_after_close(win, owner, // CLOSEMIN — ⚠ THREE LINES REPLACING THREE, line-NEUTRAL by construction (`wm.rs`'s own additions are not, and the commit says so). **THIS BLOCK WAS THE DEFECT.** It read `if wm::focus_asid() == owner { wm::focus_changed(0); }` — and `focus_changed(0)` is the SHELL ARM: a fresh `SHELL_Z` above every SURVIVING window, their boxes erased to `DESKTOP_BG`, `vugmin_scan` publishing `hidden=true` to every owner. On the glass that is every sibling minimised by a gesture aimed at ONE window.
         "route=close-box shell-raise=skipped siblings=untouched", // Peter, Jetson Orin Nano, render11, 2026-09-08: "closing one window minimizes others" — and before him GR27 Boot A, same words. The render11 wire shows it three times, e.g. `[wc-a] close_owner asid=0x3 closed=1 ids=[7]` followed immediately by `[wm-act] park win=5/8/9 cause=shell-raise` and `[wc-fv] focus shell z=45 hidden=3`. x86's twin took `focus_release` at CLOSE-TEARDOWN; this arch never did, because `focus_release` had exactly one aarch64 caller and it was `wc_close_furniture`, not this.
     ); // `focus_after_close` is the cure and the promotion in one verb: release the highlight with NO shell raise, hand focus to the top-most surviving VISIBLE window, and print `[wm] close-scope`. The owner-held-focus guard moved INSIDE it (a CAS in `focus_release`, plus its own `held` read), which is why the `if` is gone rather than merely re-pointed — a guard no caller can forget. Pinned by `wm::closemin_selftest`, which reds against the old verb.
-    if owner == 0 || owner as usize > super::uslots::USER_SLOTS {
+    if owner == 0 || owner as usize > crate::procslot::SLOT_ID_MAX {
         // CLOSE-FIX: synthetic owner — no process CAN be behind it, the row close was the whole
         // effect, and the tag says so distinguishably (see the doc block's discriminator note).
         return "noproc-selftest";
@@ -14108,7 +14054,7 @@ fn wc_close_click(win: crate::video::wm::WinId, owner: u64) -> &'static str { //
     // a tid to name, and the publish window is microseconds wide; the operator's next click lands
     // after it.
     let mut target: Option<(usize, u64)> = None;
-    for pi in 0..MAX_PROCS {
+    for pi in 0..procs_rows() {
         if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING
             && PROCS[pi].asid.load(Ordering::Acquire) == owner
         {
@@ -14545,7 +14491,7 @@ pub fn user_input_active() -> u64 {
 /// (`user_input_push`) and the consumer (`sys_input_poll`) are the only writers, and neither runs while
 /// the selftest drives a synthetic edge, so the difference across one press is exactly the delivery.
 pub fn user_input_depth(asid: u64) -> u32 {
-    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
+    if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
         return 0;
     }
     let a = asid as usize;
@@ -14619,7 +14565,7 @@ fn clear_input_row(asid: u64) {
 /// event that proves the parker is gone — its slot being torn down, which is also the path where the
 /// parker `exit()`s out of `sched::futex_wait`'s pre-park kill boundary and never reaches its own clear.
 fn clear_input_parked(asid: u64) {
-    if asid != 0 && asid as usize <= super::uslots::USER_SLOTS {
+    if asid != 0 && asid as usize <= crate::procslot::SLOT_ID_MAX {
         USER_INPUT_PARKED[asid as usize].store(false, Ordering::Release);
     }
 }
@@ -14644,7 +14590,7 @@ fn sys_input_poll() -> i64 {
     // LATER app of that boot, and it is the one part of the P54b orphan residue that outlives the run. Only the
     // app that actually OWNS INPUT can be making screen progress, which is exactly this predicate.
     let asid = current_asid();
-    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
+    if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
         return EAGAIN;
     }
     //
@@ -14699,7 +14645,7 @@ fn sys_input_poll() -> i64 {
 ///     polling a few times a second — see there for the full argument.
 fn sys_input_wait() -> i64 {
     let asid = current_asid();
-    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
+    if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
         return EINVAL;
     }
     // The same two liveness stamps `sys_input_poll` makes, under the same focus predicate and for the
@@ -15602,8 +15548,8 @@ struct U4Demo {
 /// distinct rows of `HANDLES` — the substrate the negative proves: handle #0 means the parent's child A in
 /// the parent's table, and Empty in the orphan's.
 fn u4_setup() -> Option<U4Demo> {
-    for p in &PROCS {
-        p.done.init();
+    for i in 0..procs_rows() {
+        PROCS[i].done.init(); // WINDOWCAP3: a grown row arrives initialised; this re-run is idempotent
     }
     let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // 16-aligned window top = shared initial SP_EL0
@@ -17095,27 +17041,26 @@ fn grantee_from_grant_key(key: &[u8]) -> Option<PrincipalRecord> {
 // load name, or a torn-down slot) is ANONYMOUS = public-only: it may still own files at RUNTIME via (asid,gen)
 // [U6 unchanged], but its ownership does not PERSIST across reboot. Its own SpinMutex, taken IRQ-masked via
 // IrqGuard (stamped in syscall/boot context, cleared in the IRQ-masked teardown path — the OWNED_FILES idiom).
-static SLOT_PPID: SpinMutex<[PrincipalRecord; super::uslots::USER_SLOTS + 1]> =
-    SpinMutex::new([PrincipalRecord::NONE; super::uslots::USER_SLOTS + 1]);
+static SLOT_PPID: crate::procslot::SlotVec<SpinMutex<PrincipalRecord>> = crate::procslot::SlotVec::new_asid(|| SpinMutex::new(PrincipalRecord::NONE), SpinMutex::new(PrincipalRecord::NONE)); // WINDOWCAP3 (B399): one lock per ASID row, heap-grown
 
 /// M2.1: stamp `asid`'s persistent principal at spawn (called from `load_program_into_slot` with the
 /// loader-resolved name). ASID 0 (boot/shared) is never a spawned program — ignored defensively.
 fn slot_ppid_stamp(asid: u64, rec: PrincipalRecord) {
-    if asid == 0 || asid as usize >= super::uslots::USER_SLOTS + 1 {
+    if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
         return;
     }
     let _irq = IrqGuard::mask_save();
-    SLOT_PPID.lock()[asid as usize] = rec;
+    *SLOT_PPID[asid as usize].lock() = rec;
 }
 
 /// M2.1: clear `asid`'s stamp at teardown (the slot's next tenant is a DIFFERENT program). Called from
 /// `clear_handle_row`, alongside `owned_clear_owner_asid`.
 fn slot_ppid_clear(asid: u64) {
-    if asid as usize >= super::uslots::USER_SLOTS + 1 {
+    if asid as usize > crate::procslot::SLOT_ID_MAX {
         return;
     }
     let _irq = IrqGuard::mask_save();
-    SLOT_PPID.lock()[asid as usize] = PrincipalRecord::NONE; #[cfg(feature = "login")] slot_epoch_clear(asid); // SO37 — the epoch goes with the stamp it qualifies. Not load-bearing (a NONE kind already declines the filter and a re-stamp writes a fresh epoch), but a side table that can outlive its record is the shape a later reader gets wrong. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
+    *SLOT_PPID[asid as usize].lock() = PrincipalRecord::NONE; #[cfg(feature = "login")] slot_epoch_clear(asid); // SO37 — the epoch goes with the stamp it qualifies. Not load-bearing (a NONE kind already declines the filter and a re-stamp writes a fresh epoch), but a side table that can outlive its record is the shape a later reader gets wrong. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
 }
 
 /// M2.3: the stamped persistent principal of an ARBITRARY address-space slot (NONE = anonymous / out of
@@ -17123,11 +17068,11 @@ fn slot_ppid_clear(asid: u64) {
 /// under the IRQ-masked SLOT_PPID lock; the caller must NOT already hold OWNED_FILES/NAMESPACE (SLOT_PPID is an
 /// inner lock, captured before those — never nested under them).
 fn slot_ppid_of(asid: u64) -> PrincipalRecord {
-    if asid as usize >= super::uslots::USER_SLOTS + 1 {
+    if asid as usize > crate::procslot::SLOT_ID_MAX {
         return PrincipalRecord::NONE;
     }
     let _irq = IrqGuard::mask_save();
-    let p = SLOT_PPID.lock()[asid as usize]; session_epoch_filter(asid, p) // SO37 — the stamp is QUALIFIED by the session EPOCH it was taken in: a slot stamped in a session that has since CLOSED reads ANONYMOUS from here down, so SYS_OPEN's by-name branch, the O_CREAT owner persist and the grantee capture all see NONE. Knob-off this is the identity function and the read is the bare table entry. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
+    let p = *SLOT_PPID[asid as usize].lock(); session_epoch_filter(asid, p) // SO37 — the stamp is QUALIFIED by the session EPOCH it was taken in: a slot stamped in a session that has since CLOSED reads ANONYMOUS from here down, so SYS_OPEN's by-name branch, the O_CREAT owner persist and the grantee capture all see NONE. Knob-off this is the identity function and the read is the bare table entry. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
 }
 
 /// M2: the CALLER's stamped persistent principal (NONE = anonymous/public-only). Captured at O_CREAT (persist
@@ -22541,14 +22486,12 @@ impl BusMbox {
 
 /// Per-ASID reply mailboxes (row = ASID, like HANDLES). Static table of Options — the frames
 /// themselves are heap boxes, so the static footprint is pointers only.
-static BUS_MBOX: [SpinMutex<BusMbox>; super::uslots::USER_SLOTS + 1] =
-    [const { SpinMutex::new(BusMbox::EMPTY) }; super::uslots::USER_SLOTS + 1];
+static BUS_MBOX: crate::procslot::SlotVec<SpinMutex<BusMbox>> = crate::procslot::SlotVec::new_asid(|| SpinMutex::new(BusMbox::EMPTY), SpinMutex::new(BusMbox::EMPTY));
 
 /// Per-ASID "replies pending" semaphores — the MRECV blocking primitive (the sys_wait idiom:
 /// Semaphore::wait parks the task; every enqueue posts). Lazily init()'d once (waiter-capacity
 /// reservation) before first use.
-static BUS_SEM: [super::sched::Semaphore; super::uslots::USER_SLOTS + 1] =
-    [const { super::sched::Semaphore::new(0) }; super::uslots::USER_SLOTS + 1];
+static BUS_SEM: crate::procslot::SlotVec<super::sched::Semaphore> = crate::procslot::SlotVec::new_asid(|| { let m = super::sched::Semaphore::new(0); m.init(); m }, super::sched::Semaphore::new(0)); // WINDOWCAP3: a row is born initialised
 static BUS_SEM_INIT: AtomicU8 = AtomicU8::new(0); // 0 = untouched, 1 = initializing, 2 = ready
 
 /// One-shot waiter-capacity reservation for BUS_SEM (Semaphore::init's contract: reserve before
@@ -22556,9 +22499,7 @@ static BUS_SEM_INIT: AtomicU8 = AtomicU8::new(0); // 0 = untouched, 1 = initiali
 fn bus_sem_init_once() {
     match BUS_SEM_INIT.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
-            for s in &BUS_SEM {
-                s.init();
-            }
+            BUS_SEM[0].init(); // WINDOWCAP3: every row is born initialised (`BUS_SEM`'s row builder); the shared row 0 here, idempotent
             BUS_SEM_INIT.store(2, Ordering::Release);
         }
         Err(_) => {
@@ -23168,7 +23109,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST => crate::prefs::bus_fulfil(hdr.verb, body, pref_caller_in_session(ppid), &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal_of(&ppid), &mut text), // ATTRSURF (B299): the attribute verbs under the STAMPED principal. PREFS (B300): Principia's verbs over the one store. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "desktop_firmware")] { crate::video::dialog::bus_fulfil(hdr.verb, asid as u64, body) } #[cfg(not(feature = "desktop_firmware"))] { EINVAL } } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil(hdr.verb, body, pref_caller_in_session(ppid), &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal_of(&ppid), &mut text), // ATTRSURF (B299): the attribute verbs under the STAMPED principal. PREFS (B300): Principia's verbs over the one store. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)
@@ -24636,8 +24577,7 @@ static SESSION_EPOCH: AtomicU64 = AtomicU64::new(1); // SECLOGIN M5: u64 — a u
 
 /// SO37: the epoch each slot's principal stamp was taken in (0 = never stamped, which never matches).
 #[cfg(feature = "login")]
-static SLOT_EPOCH: [AtomicU64; super::uslots::USER_SLOTS + 1] =
-    [const { AtomicU64::new(0) }; super::uslots::USER_SLOTS + 1]; // SECLOGIN M5: u64 with SESSION_EPOCH
+static SLOT_EPOCH: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new_asid(|| AtomicU64::new(0), AtomicU64::new(0)); // SECLOGIN M5: u64 with SESSION_EPOCH
 
 /// SO37: record the live epoch on `asid`, beside [`slot_ppid_stamp`]. Called ONLY from [`session_restamp`],
 /// the sole path that can put a `PRIN_USER` record into `SLOT_PPID`.
@@ -25222,7 +25162,7 @@ fn user_from_native_uid(rest: &[u8]) -> Option<PrincipalRecord> {
 fn session_end_processes(closing: u64) -> (usize, usize) {
     let mut ended = 0usize;
     let mut windows = 0usize;
-    for pi in 0..MAX_PROCS {
+    for pi in 0..procs_rows() {
         if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING {
             continue;
         }
@@ -25712,7 +25652,7 @@ fn fixture_abs<'a>(path: &'a str, buf: &'a mut [u8; 48]) -> &'a str {
 /// owner IS the asid) — by identity, not focus. Twin of `x86_64::syscall::user_input_push_owner`.
 #[cfg(feature = "desktop_firmware")]
 pub fn user_input_push_owner(owner: u64, packed: u64) -> bool {
-    if owner == 0 || owner as usize > super::uslots::USER_SLOTS {
+    if owner == 0 || owner as usize > crate::procslot::SLOT_ID_MAX {
         return false;
     }
     user_input_push(owner, packed)
@@ -25966,4 +25906,95 @@ fn sys_time() -> i64 {
 /// arch's validated `copy_to_user` as the only path into the caller's buffer.
 fn sys_prof(op: u64, buf: u64, len: u64) -> i64 {
     crate::prof::sys_prof(op, buf, len, |p, b| copy_to_user(p, b, b.len()).is_ok())
+}
+
+// =====================================================================================================
+// WINDOWCAP3 (rmbp-ledger B399, R90) — the process table's growth, the launch valve, and the ASID-keyed
+// sidecars' warm-up. File tail: nothing above moves.
+// =====================================================================================================
+
+/// WINDOWCAP3: every launch asks memory's limit (`video::wincap::proc_limit`) before a row is claimed — the
+/// table grows, so it can no longer be what stops a storm. A refusal is said on the wire by the valve.
+fn proc_admit() -> bool {
+    let running = proc_table_headroom().1;
+    if running >= crate::video::wincap::proc_limit() {
+        crate::video::wincap::note_spawn_refused(running);
+        return false;
+    }
+    crate::video::wincap::note_spawn_admitted();
+    true
+}
+
+/// WINDOWCAP3: append a process-table row (none free), bounded by the ASID TYPE only.
+fn proc_reserve_grow() -> Option<usize> {
+    loop {
+        let n = procs_rows();
+        if n >= crate::procslot::SLOT_ID_MAX {
+            return None;
+        }
+        let row = &PROCS[n];
+        if row.state.compare_exchange(PFREE, PRUNNING, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            row.pid.store(0, Ordering::Release);
+            row.status.store(0, Ordering::Release);
+            row.asid.store(0, Ordering::Release);
+            return Some(n);
+        }
+    }
+}
+
+/// WINDOWCAP3: rows the EL0 window table has grown to — the bound every id is checked against. Published
+/// under the `WINDOWS` lock, read lock-free.
+static WIN_ROWS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[inline]
+fn win_rows() -> usize {
+    WIN_ROWS.load(Ordering::Acquire)
+}
+
+/// WINDOWCAP3: append a FREE row to the EL0 window table (none free), returning its id. `None` = the heap
+/// said no, or the id would leave the `u32` the info page carries.
+fn win_table_grow(t: &mut alloc::vec::Vec<WinEntry>) -> Option<usize> {
+    let id = t.len();
+    if id >= u32::MAX as usize || t.try_reserve(1).is_err() {
+        return None;
+    }
+    t.push(WinEntry::FREE);
+    WIN_ROWS.store(t.len(), Ordering::Release);
+    Some(id)
+}
+
+/// WINDOWCAP3: allocate every ASID-keyed sidecar row of `asid` at its slot's claim (both backends'
+/// `alloc_user_slot`, process context) — the input router and the dispatch paths never allocate.
+pub fn slot_tables_warm(asid: u64) {
+    let a = asid as usize;
+    HANDLES.warm(a);
+    HANDLE_RIGHTS.warm(a);
+    HANDLE_KIND.warm(a);
+    FILE_USED.warm(a);
+    FILE_CLUSTER.warm(a);
+    FILE_SIZE.warm(a);
+    FILE_OFFSET.warm(a);
+    FILE_DIR_LBA.warm(a);
+    FILE_DIR_OFF.warm(a);
+    FILE_GEN.warm(a);
+    FILE_OPENROW.warm(a);
+    XFER_SLOT_TX.warm(a);
+    XFER_SLOT_KIND.warm(a);
+    XFER_SLOT_TARGET.warm(a);
+    XFER_SLOT_RIGHTS.warm(a);
+    XFER_SLOT_REC.warm(a);
+    HANDLE_XFER_REC.warm(a);
+    HANDLE_DERIV.warm(a);
+    XFER_SLOT_DERIV.warm(a);
+    XFER_SLOT_GEN.warm(a);
+    ASID_GEN.warm(a);
+    USER_INPUT_BUF.warm(a);
+    USER_INPUT_HEAD.warm(a);
+    USER_INPUT_TAIL.warm(a);
+    USER_INPUT_PARKED.warm(a);
+    USER_INPUT_RESUMES.warm(a);
+    BUS_MBOX.warm(a);
+    BUS_SEM.warm(a);
+    #[cfg(feature = "login")]
+    SLOT_EPOCH.warm(a);
+    SLOT_PPID.warm(a);
 }

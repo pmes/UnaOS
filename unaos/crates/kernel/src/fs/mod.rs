@@ -174,3 +174,19 @@ pub mod bootstep;
 pub mod unafsgrow;
 /// VOLUMES (B366): the Volumes view (`/volumes/boot`, `/volumes/UnaOS`), `tests volumes`, `system/test-f` and `tests testf`.
 pub mod volumes;
+/// USBSTOR (B384, R95): a removable disk is mounted under `/volumes` when it attaches and dropped when it leaves.
+pub mod removable;
+/// ROOTDISK (B390, R94): `/volumes/UnaOS` IS `/`, `/lib`, the root's links marked, `tests rootdisk`.
+pub mod rootdisk;
+/// EXFAT (B392): the kernel half of the shared exFAT reader (`unaos/libs/fs/exfat_core`) — removable volumes, read-only.
+pub mod exfat;
+/// APPRES (B398): the registrar — a program's resources (name, signature, version, kind, icon, doc types) as attributes.
+pub mod appres;
+/// ATTRCOLUMNS (B402): a file's sniffed facts as typed attributes (`media:*`, `doc:title`), the edit in place, `una:view`.
+pub mod attrfacts;
+/// ROOTDISK2 (B401, R99): the boot FAT is sacred — read-only for every principal, `fat_unlock` for the installer.
+pub mod bootfat;
+/// ROOTDISK2 (B401, R99): the boot log on UnaFS (`/var/log/boot-<n>.log`), not `UNAOS.LOG` on the boot FAT.
+pub mod bootlog;
+/// SEARCH (B417 LAUNCHER; QUARRY3 B413 joins): `by_name(prefix, limit)` — files by name, one bounded walk of the name trees.
+pub mod search;

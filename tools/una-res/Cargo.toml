@@ -1,0 +1,17 @@
+[package]
+name = "una-res"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "APPRES (B398): write a program's resource block (name, signature, version, kind, icon, document types) into a built UnaOS ELF, or pack it as a standalone block for the kernel's own apps."
+
+[[bin]]
+name = "una-res"
+path = "src/main.rs"
+
+# UnaOS's own cores only (R83): the block format (midden_core), the icon renderer (svg_core) and the PNG
+# writer (pixel_core).
+[dependencies]
+midden_core = { path = "../../unaos/libs/sys/midden_core" }
+svg_core = { path = "../../unaos/libs/media/svg_core" }
+pixel_core = { path = "../../unaos/libs/media/pixel_core" }

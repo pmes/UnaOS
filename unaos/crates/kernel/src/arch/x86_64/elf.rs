@@ -581,10 +581,10 @@ const Z: AtomicU64 = AtomicU64::new(0);
 #[allow(clippy::declare_interior_mutable_const)]
 const ZROW: [AtomicU64; SEGMAP_WORDS] = [Z; SEGMAP_WORDS];
 /// Per slot: bss0 lo/hi, bss1 lo/hi, stack lo/hi (window offsets). All-zero = nothing to name.
-static SEGMAP: [[AtomicU64; SEGMAP_WORDS]; memory::USER_SLOTS] = [ZROW; memory::USER_SLOTS];
+static SEGMAP: crate::procslot::SlotVec<[AtomicU64; SEGMAP_WORDS]> = crate::procslot::SlotVec::new(|| ZROW, ZROW); // WINDOWCAP3 (B399): per-slot, heap-grown
 
 fn seg_map_set(slot: usize, m: elf_core::FaultMap) {
-    let Some(row) = SEGMAP.get(slot) else { return };
+    if !memory::slot_known(slot) { return; } let row = &SEGMAP[slot];
     let w = [m.bss[0].lo, m.bss[0].hi, m.bss[1].lo, m.bss[1].hi, m.stack.lo, m.stack.hi];
     for (a, v) in row.iter().zip(w) {
         a.store(v, Ordering::Release);
@@ -710,4 +710,9 @@ pub fn elfbss_selftest() {
         ":: STORMFAULT: elfbss bss={} exit={} seg_last={} refuse_window={} refuse_stack={} -> {} ::",
         BSS, ex, seg_last, refuse_window as u8, refuse_stack as u8, if pass { "PASS" } else { "FAIL" }
     );
+}
+
+/// WINDOWCAP3 (rmbp-ledger B399): allocate slot `s`'s fault-map row at its claim (the fault handler never allocates).
+pub fn slot_tables_warm(s: usize) {
+    SEGMAP.warm(s);
 }

@@ -18,7 +18,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::arch::{acpi, apic, gdt, interrupts, percpu, sched, syscall};
 
@@ -36,10 +36,10 @@ const AP_STACK_SIZE: usize = 4096 * 4; // 16 KiB
 
 /// 16-byte-aligned AP kernel stacks in `.bss`, one per logical CPU (index 0 / the BSP is unused).
 /// Static, not heap: APs touch no shared allocator state during bring-up.
-#[repr(C, align(16))]
-struct ApStack([u8; AP_STACK_SIZE]);
+#[repr(C, align(4096))] // STACKGUARD2 (B403): page-aligned, so the slab's first page is a whole guard page (`stackguard::arm_cpu`)
+struct ApStack([u8; AP_GUARD + AP_STACK_SIZE]);
 static mut AP_STACKS: [ApStack; gdt::MAX_CPUS] =
-    [const { ApStack([0; AP_STACK_SIZE]) }; gdt::MAX_CPUS];
+    [const { ApStack([0; AP_GUARD + AP_STACK_SIZE]) }; gdt::MAX_CPUS];
 
 /// Count of APs that have reached `ap_entry` and finished their own bring-up. The BSP waits on
 /// this between SIPIs so the shared trampoline handoff slot (stack/index) is reused safely.
@@ -342,7 +342,7 @@ pub fn worker_cpu(nth: usize) -> Option<usize> {
     worker_pool().0.get(nth).copied()
 }
 
-/// The `n`th core for a PREEMPTIBLE task that takes `XHCI_CONTROLLER` (a raw `spin::Mutex`).
+/// The `n`th core for a PREEMPTIBLE task that takes `XHCI_CONTROLLER` (a raw `crate::sync::Mutex`).
 ///
 /// Excludes BOTH the render core and the service core: `x86_usb_pump` holds that lock on the service
 /// core and the render/shell task holds it on the render core, and two preemptible takers of a raw
@@ -696,7 +696,7 @@ pub extern "C" fn ap_entry(cpu_index: u64) -> ! {
     // WXN-x86 M1: this core's NX witness, taken the instant after `syscall::init` armed EFER.NXE and
     // BEFORE the `AP_ONLINE` handshake — so no core can be advertised online without its bit in the
     // mask, and `cores` vs `nxe` in the rollup line can never be out of step for handshake reasons.
-    wxn_record_core(idx);
+    wxn_record_core(idx); super::clockcore::ap_sync(idx); // CLOCKCORE (B397): this core's TSC offset vs the BSP, before the handshake
 
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
     crate::bootlog_println!("SMP: AP {} online (apic id {}).", idx, apic_id);
@@ -757,7 +757,7 @@ pub fn start_aps() {
         return;
     }
 
-    let bsp_id = apic::apic_id_u32();
+    let bsp_id = apic::apic_id_u32(); super::stackguard::arm_cpu(0); // STACKGUARD2 (B403): the BSP's stack + IST guards (the heap is up; tasks are not running)
 
     // Validate the fixed trampoline page against the real UEFI map. 0x8000 is free conventional RAM
     // on QEMU/OVMF, but Apple EFI fragments low memory and may mark it Reserved/Bootloader — in
@@ -807,14 +807,14 @@ pub fn start_aps() {
         // function entry reached via call; we arrive via jmp, so bias by 8) and the logical index.
         let stack_top = unsafe {
             let base = &raw const AP_STACKS[index] as usize;
-            (base + AP_STACK_SIZE - 8) as u64
+            (base + AP_GUARD + AP_STACK_SIZE - 8) as u64
         };
         unsafe {
             patch_param(&raw const ap_param_stack, stack_top);
             patch_param(&raw const ap_param_index, index as u64);
         }
 
-        let target = AP_ONLINE.load(Ordering::SeqCst) + 1;
+        let target = AP_ONLINE.load(Ordering::SeqCst) + 1; super::stackguard::arm_cpu(index); // STACKGUARD2 (B403): this AP's stack + IST guard pages go NOT-PRESENT before it runs on them
         init_sipi_sipi(id);
 
         // Wait (bounded) for this AP to report in before reusing the handoff slot.
@@ -824,7 +824,7 @@ pub fn start_aps() {
                 came_online = true;
                 break;
             }
-            core::hint::spin_loop();
+            super::clockcore::bsp_publish(); core::hint::spin_loop(); // CLOCKCORE (B397): the BSP's TSC for the AP's offset sample
         }
         if came_online {
             online_aps[n_online] = index;
@@ -915,6 +915,17 @@ pub fn ap_stack_bounds(cpu: usize) -> Option<(u64, u64)> {
     if cpu == 0 || cpu >= gdt::MAX_CPUS {
         return None;
     }
-    let base = unsafe { &raw const AP_STACKS[cpu] } as u64;
+    let base = unsafe { &raw const AP_STACKS[cpu] } as u64 + AP_GUARD as u64;
     Some((base, base + AP_STACK_SIZE as u64))
+}
+
+// ── STACKGUARD2 (rmbp-ledger B403): the AP stacks' guard page ────────────────────────────────────────────
+
+/// The unmapped page under each AP stack (the slab's first page; the usable 16 KiB sits above it).
+const AP_GUARD: usize = 4096;
+
+/// `(guard page, usable lo, usable top)` of AP `cpu`'s static stack; `None` for the BSP / out of range.
+pub fn ap_guard_bounds(cpu: usize) -> Option<(u64, u64, u64)> {
+    let (lo, top) = ap_stack_bounds(cpu)?;
+    Some((lo - AP_GUARD as u64, lo, top))
 }

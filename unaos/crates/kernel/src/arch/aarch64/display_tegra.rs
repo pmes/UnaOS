@@ -348,7 +348,7 @@ fn jd1_dc_survey(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
 /// idiom (a module static, not a `mem::forget`) is used verbatim: moving the `Vec` in here moves the
 /// three-word header, never the heap block the row points at.
 #[cfg(feature = "orindesk")]
-static ORINWM1_STORE: spin::Mutex<Option<alloc::vec::Vec<u8>>> = spin::Mutex::new(None);
+static ORINWM1_STORE: crate::sync::Mutex<Option<alloc::vec::Vec<u8>>> = crate::sync::Mutex::new(None);
 
 /// ORIN-WM1 — the row's id, and the idempotence latch: a second call hands back the existing window
 /// rather than minting a second one (and, more to the point, rather than leaking a second surface).
@@ -600,12 +600,12 @@ fn orin_chrome_probe(
     let mx = ox + ow / 2; // mid-edge column — clear of both top corner arcs
     let my = oy + oh / 2; // mid-edge row
     let probes: [(&str, usize, usize, u32); 6] = [
-        ("kl_top", mx, oy, theme::FRAME_LINE),
-        ("kl_bot", mx, oy + oh - kw, theme::FRAME_LINE),
-        ("kl_left", ox, my, theme::FRAME_LINE),
-        ("kl_right", ox + ow - kw, my, theme::FRAME_LINE),
-        ("bev_lt", mx, oy + kw, theme::BEVEL_LIGHT),
-        ("bev_sh", mx, oy + oh - kw - theme::BEVEL(), theme::BEVEL_SHADOW),
+        ("kl_top", mx, oy, theme::frame_line()),
+        ("kl_bot", mx, oy + oh - kw, theme::frame_line()),
+        ("kl_left", ox, my, theme::frame_line()),
+        ("kl_right", ox + ow - kw, my, theme::frame_line()),
+        ("bev_lt", mx, oy + kw, theme::bevel_light()),
+        ("bev_sh", mx, oy + oh - kw - theme::BEVEL(), theme::bevel_shadow()),
     ];
     let mut hit = 0usize;
     let mut read = 0usize;
@@ -2879,7 +2879,7 @@ pub fn orin_tenant_arm() {
         info.width, info.height, info.bytes_per_pixel,
         staged, wm::count(),
         crate::arch::aarch64::uslots::FB_WIN_MAX_W, crate::arch::aarch64::uslots::FB_WIN_MAX_H,
-        crate::arch::aarch64::uslots::FB_WIN_SLOTS, crate::arch::aarch64::uslots::USER_SLOTS,
+        crate::arch::aarch64::uslots::FB_WIN_SLOTS, crate::video::wincap::proc_limit(), // WINDOWCAP3 (B399): `uslots=` is the live process limit (memory's), the pool has no width
         cfg!(feature = "orindesk") as u8, cfg!(feature = "orinclick") as u8,
         cfg!(feature = "orinconwin") as u8, cfg!(feature = "desktop_firmware") as u8
     );
@@ -3199,7 +3199,7 @@ pub fn orin_tenant_census(tick: u64) {
 //
 // WHAT THIS MODULE IS. The ownership half of Candidate A: a module-owned handle for the console
 // surface, so the state OUTLIVES whichever task is currently driving it and a successor task COULD
-// adopt it. It follows the `ORINWM1_STORE` mould already in this file — a `spin::Mutex` static in
+// adopt it. It follows the `ORINWM1_STORE` mould already in this file — a `crate::sync::Mutex` static in
 // this track's lane — not a new invention. `TargetPal` is NOT stored: it is a borrow
 // (`pub surface: &'a mut Screen`), i.e. a VIEW, and storing it would make the handle
 // self-referential. It is reconstructed per lock scope from the stored `Screen` — via the public
@@ -3244,9 +3244,9 @@ pub struct SupSurface {
 }
 
 /// ORIN-SUPSTATE — the handle. `None` until the pump's phase 2 installs the surface it built.
-/// `spin::Mutex` in the `ORINWM1_STORE` mould; every access obeys the module header's discipline.
+/// `crate::sync::Mutex` in the `ORINWM1_STORE` mould; every access obeys the module header's discipline.
 #[cfg(feature = "supstate")]
-static SUP_SURFACE: spin::Mutex<Option<SupSurface>> = spin::Mutex::new(None);
+static SUP_SURFACE: crate::sync::Mutex<Option<SupSurface>> = crate::sync::Mutex::new(None);
 
 /// ORIN-SUPSTATE — install (or re-install: adoption) the console surface into the module handle.
 /// Called once from the pump's phase 2 today; arc 2's restart path would call it again, which is
@@ -3298,7 +3298,7 @@ pub fn sup_with_surface<R>(
 /// ORIN-SUPSTATE — acquire a supstate lock under the cooperative-core rule: `try_lock`, and give
 /// the core back on failure. Never a bare `lock()` spin (see the module header's livelock note).
 #[cfg(feature = "supstate")]
-fn sup_lock<T>(m: &spin::Mutex<T>) -> impl core::ops::DerefMut<Target = T> + '_ {
+fn sup_lock<T>(m: &crate::sync::Mutex<T>) -> impl core::ops::DerefMut<Target = T> + '_ {
     loop {
         if let Some(g) = m.try_lock() {
             return g;
@@ -3312,8 +3312,8 @@ fn sup_lock<T>(m: &spin::Mutex<T>) -> impl core::ops::DerefMut<Target = T> + '_ 
 /// never popped-then-lost — when the dispatcher is 64 keys behind, events simply stay in the PAL
 /// ring exactly as they do today while the monolithic pump is busy.
 #[cfg(feature = "supstate")]
-static SUP_KEYQ: spin::Mutex<alloc::collections::VecDeque<u8>> =
-    spin::Mutex::new(alloc::collections::VecDeque::new());
+static SUP_KEYQ: crate::sync::Mutex<alloc::collections::VecDeque<u8>> =
+    crate::sync::Mutex::new(alloc::collections::VecDeque::new());
 #[cfg(feature = "supstate")]
 const SUP_KEYQ_CAP: usize = 64;
 
@@ -3366,8 +3366,8 @@ pub struct SupFrameBoard {
 }
 
 #[cfg(feature = "supstate")]
-static SUP_FRAMES: spin::Mutex<SupFrameBoard> =
-    spin::Mutex::new(SupFrameBoard { rel: None, abs: None, key_repaint: false });
+static SUP_FRAMES: crate::sync::Mutex<SupFrameBoard> =
+    crate::sync::Mutex::new(SupFrameBoard { rel: None, abs: None, key_repaint: false });
 
 /// ORIN-SUPSTATE — post one input frame's coalesced pointer activity (input source side).
 #[cfg(feature = "supstate")]
@@ -3913,12 +3913,12 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
     let mx = ox + ow / 2;
     let my = oy + oh / 2;
     let probes: [(&str, usize, usize, u32); 6] = [
-        ("kl_top", mx, oy, theme::FRAME_LINE),
-        ("kl_bot", mx, oy + oh.saturating_sub(kw), theme::FRAME_LINE),
-        ("kl_left", ox, my, theme::FRAME_LINE),
-        ("kl_right", ox + ow.saturating_sub(kw), my, theme::FRAME_LINE),
-        ("bev_lt", mx, oy + kw, theme::BEVEL_LIGHT),
-        ("bev_sh", mx, oy + oh.saturating_sub(kw + theme::BEVEL()), theme::BEVEL_SHADOW),
+        ("kl_top", mx, oy, theme::frame_line()),
+        ("kl_bot", mx, oy + oh.saturating_sub(kw), theme::frame_line()),
+        ("kl_left", ox, my, theme::frame_line()),
+        ("kl_right", ox + ow.saturating_sub(kw), my, theme::frame_line()),
+        ("bev_lt", mx, oy + kw, theme::bevel_light()),
+        ("bev_sh", mx, oy + oh.saturating_sub(kw + theme::BEVEL()), theme::bevel_shadow()),
     ];
     let mut fhit = 0usize;
     let mut fread = 0usize;

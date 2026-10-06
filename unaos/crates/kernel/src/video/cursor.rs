@@ -87,7 +87,7 @@
 
 use super::FrameBuffer;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// 8×8 arrow mask, MSB = leftmost pixel. The same SHAPE `pal::cursor` draws, so the pointer is
 /// recognisably the same arrow on the full-screen demo paths and on the desktop — but not the same
@@ -107,9 +107,9 @@ const ARROW: [u8; 8] = [
 ];
 
 /// Arrow fill.
-const FILL: u32 = 0x00FF_FFFF;
+const FILL: u32 = crate::video::theme::POINTER_FILL;
 /// Drop shadow, one block down-right of the fill.
-const SHADOW: u32 = 0x0010_1014;
+const SHADOW: u32 = crate::video::theme::POINTER_SHADOW;
 
 /// The sprite's box is `8 * scale` (one glyph cell) plus one `scale` block of shadow, so the
 /// save-under buffer is sized for the scale cap. Derived, not chosen: `(8 + 1) * SCALE_MAX`.

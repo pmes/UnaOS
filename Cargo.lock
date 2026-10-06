@@ -1502,6 +1502,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "exfat_core"
+version = "0.1.0"
+
+[[package]]
 name = "exr"
 version = "1.74.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5489,6 +5493,15 @@ name = "una-card"
 version = "0.1.0"
 dependencies = [
  "amber_core",
+]
+
+[[package]]
+name = "una-res"
+version = "0.1.0"
+dependencies = [
+ "midden_core",
+ "pixel_core",
+ "svg_core",
 ]
 
 [[package]]

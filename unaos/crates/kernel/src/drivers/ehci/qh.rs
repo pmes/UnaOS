@@ -117,13 +117,13 @@ pub struct Buf256(pub [u8; 256]);
 // `buf[1..5]` stay zero (the invariant the `Qtd` doc-comment states). That is what makes the
 // multi-packet accumulation below safe with the existing single-qTD re-arm idiom.
 #[cfg(not(feature = "mtraw"))]
-pub const INT_BUF_LEN: usize = 64;
+pub const INT_BUF_LEN: usize = 256; // TRACKPADPANE (B412) rung 1: 64 -> 256. A TYPE2 frame is 30 + 28*n B (two fingers 86, wsp.c `WSP_BUFFER_MAX`); at 64 the vendor qTD retired after one packet and every multi-finger frame was split and dropped (flight 14 census `sizes=2/64`)
 /// Alignment `phys_of` enforces on the interrupt receive buffer (see `IntBuf`).
 #[cfg(not(feature = "mtraw"))]
-pub const INT_BUF_ALIGN: u64 = 64;
+pub const INT_BUF_ALIGN: u64 = 256; // TRACKPADPANE: 256-aligned 256 B never crosses a 4 KiB page, so one qTD buffer pointer still covers it
 /// The interrupt-endpoint receive buffer (see the `INT_BUF_LEN` block above).
 #[cfg(not(feature = "mtraw"))]
-#[repr(C, align(64))]
+#[repr(C, align(256))]
 pub struct IntBuf(pub [u8; INT_BUF_LEN]);
 
 #[cfg(feature = "mtraw")]

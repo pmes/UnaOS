@@ -688,6 +688,13 @@ pub const INPUT_EV_MENU_PICK: u64 = 8;
 /// surface slot and stride are unchanged: the program redraws `w` x `h` of it. Programs that do not
 /// resize ignore the unknown type. Numbered 9, the next free code.
 pub const INPUT_EV_WIN_RESIZE: u64 = 9;
+/// APPMENU2 (B393): the window manager asks this process to QUIT (Cmd-Q, the app menu's Quit, the dock
+/// tile's Quit). Payload `[31:0]` = the window id the request was taken on. The app may save and close its
+/// windows itself and exit; the WM kills the process if it is still running 3 s later. Programs that do not
+/// handle it are killed at the bound, exactly as before. Numbered 10, the next free code.
+pub const INPUT_EV_CLOSE_REQ: u64 = 10;
+/// APPMENU2 — the bound, in milliseconds, between a close request and the WM's kill.
+pub const CLOSE_REQ_BOUND_MS: u64 = 3000;
 
 /// The wire encoding's version. A bump is a protocol break: rule on it, never bump silently.
 pub const MENU_WIRE_VERSION: u8 = 1;
@@ -1746,3 +1753,184 @@ mod window2_tests {
         std::println!(":: WINDOW2-ABI: bytes={} kdf_m_kib={} alloc={} -> PASS ::", USER_WINDOW_BYTES, WINDOW2_KDF_M_KIB, WINDOW2_ALLOC_BYTES);
     }
 }
+// APPRES (rmbp-ledger B398, MACPARITY §16 B4 / row 38) — a program's RESOURCES: a second UnaOS note, type
+// APP_RES_NOTE_TYPE, in a NON-ALLOC SHT_NOTE section `.note.unaos.res` with no program header (the loader maps
+// PT_LOAD only and never sees it). `tools/una-res` writes it after the strip; the kernel's registrar
+// (`fs/appres.rs`) reads it through the section table and caches it as attributes. Desc layout and keys:
+// `midden_core::RES_MAGIC` and the `RES_KEY_*` constants (the parse lives there). Appended at the tail.
+/// The resource note's section name.
+pub const APP_RES_SECTION: &str = ".note.unaos.res";
+/// The resource note's type (owner "UnaOS", like APP_NOTE_TYPE's).
+pub const APP_RES_NOTE_TYPE: u32 = 2;
+
+// =================================================================================================
+// DIALOG2 (rmbp-ledger B404) — a ring-3 program raises its OWN alert, sheet or toast, and hears the answer.
+// Appended at the file tail so no existing line moves.
+// =================================================================================================
+
+/// Bus verb: a free-standing alert owned by the caller (app-modal to the caller's windows). Body: [`dialog_body`].
+pub const BUS_VERB_DIALOG: u8 = 20;
+/// Bus verb: the same alert as a SHEET on the caller's front window.
+pub const BUS_VERB_SHEET: u8 = 21;
+/// Bus verb: a one-line toast titled with the caller's (kernel-stamped) name; buttons are ignored, no answer.
+pub const BUS_VERB_TOAST: u8 = 22;
+const _: () = assert!(BUS_VERB_DIALOG > BUS_VERB_PREF_CHANGED && BUS_VERB_TOAST < BUS_VERB_REGISTER);
+/// The answer to a dialog/sheet, delivered to the POSTER's input ring (never to the focused slot). Payload
+/// `[15:8]` = the caller's token, `[7:0]` = the button index (left to right; the default is the last).
+pub const INPUT_EV_DIALOG_ANSWER: u64 = 11; // 10 is INPUT_EV_CLOSE_REQ (APPMENU2); renumbered at merge17
+/// The field separator inside a dialog body (ASCII unit separator).
+pub const DIALOG_SEP: u8 = 0x1F;
+/// Buttons per dialog (the default is the rightmost — the last).
+pub const DIALOG_BTN_MAX: usize = 3;
+
+/// A parsed dialog request: `token` comes back in the answer; `info` may hold up to three `\n` lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DialogReq<'a> {
+    pub token: u8,
+    pub message: &'a [u8],
+    pub info: &'a [u8],
+    pub buttons: [&'a [u8]; DIALOG_BTN_MAX],
+    pub nb: u8,
+}
+
+/// Encode: `[token][nb] message SEP info (SEP button){nb}`. `None` when a field holds the separator, there are
+/// more than three buttons, or `out` is too small.
+pub fn dialog_body(token: u8, message: &[u8], info: &[u8], buttons: &[&[u8]], out: &mut [u8]) -> Option<usize> {
+    if buttons.len() > DIALOG_BTN_MAX || message.contains(&DIALOG_SEP) || info.contains(&DIALOG_SEP) || buttons.iter().any(|b| b.contains(&DIALOG_SEP)) {
+        return None;
+    }
+    let need = 2 + message.len() + 1 + info.len() + buttons.iter().map(|b| b.len() + 1).sum::<usize>();
+    if out.len() < need {
+        return None;
+    }
+    out[0] = token;
+    out[1] = buttons.len() as u8;
+    let mut n = 2;
+    let mut put = |s: &[u8], n: &mut usize| {
+        out[*n..*n + s.len()].copy_from_slice(s);
+        *n += s.len();
+    };
+    put(message, &mut n);
+    put(&[DIALOG_SEP], &mut n);
+    put(info, &mut n);
+    for b in buttons {
+        put(&[DIALOG_SEP], &mut n);
+        put(b, &mut n);
+    }
+    Some(n)
+}
+
+/// Decode a [`dialog_body`] frame; refused whole (`None`) when the field count does not match `nb`.
+pub fn dialog_parse(body: &[u8]) -> Option<DialogReq<'_>> {
+    if body.len() < 2 || body[1] as usize > DIALOG_BTN_MAX {
+        return None;
+    }
+    let (token, nb) = (body[0], body[1]);
+    let mut it = body[2..].split(|&b| b == DIALOG_SEP);
+    let message = it.next()?;
+    let info = it.next()?;
+    let mut buttons: [&[u8]; DIALOG_BTN_MAX] = [&[]; DIALOG_BTN_MAX];
+    for slot in buttons.iter_mut().take(nb as usize) {
+        *slot = it.next()?;
+    }
+    if it.next().is_some() {
+        return None;
+    }
+    Some(DialogReq { token, message, info, buttons, nb })
+}
+
+/// The packed answer event a poster reads from its input ring.
+pub const fn dialog_answer_pack(token: u8, button: u8) -> u64 {
+    input_ev_pack(INPUT_EV_DIALOG_ANSWER, ((token as u64) << 8) | button as u64)
+}
+
+#[cfg(test)]
+mod dialog2_tests {
+    use super::*;
+    #[test]
+    fn dialog_body_round_trip() {
+        let mut b = [0u8; 128];
+        let n = dialog_body(7, b"Save changes?", b"Your changes will be lost.", &[b"Don't Save", b"Cancel", b"Save"], &mut b).unwrap();
+        let r = dialog_parse(&b[..n]).unwrap();
+        assert_eq!((r.token, r.nb, r.message, r.info), (7, 3, &b"Save changes?"[..], &b"Your changes will be lost."[..]));
+        assert_eq!(r.buttons[2], b"Save");
+        let n = dialog_body(1, b"hello", b"", &[], &mut b).unwrap();
+        assert_eq!(dialog_parse(&b[..n]).unwrap().nb, 0);
+        assert!(dialog_body(1, b"a\x1fb", b"", &[], &mut b).is_none());
+        assert!(dialog_parse(&[1, 2, b'm', DIALOG_SEP, b'i', DIALOG_SEP, b'x']).is_none(), "two buttons declared, one sent");
+        assert_eq!(dialog_answer_pack(7, 2) >> INPUT_EV_TYPE_SHIFT, INPUT_EV_DIALOG_ANSWER);
+        assert_eq!(dialog_answer_pack(7, 2) & 0xFFFF, 0x0702);
+    }
+}
+
+// =================================================================================================
+// SETTINGSFILES (rmbp-ledger B407, R98): a program declares its own settings stanza (`app.<name>.*`,
+// stored in `<home>/settings/<name>`). Body: `<name>` NUL then `<key>\t<spec>\t<default literal>\t<doc>`
+// lines (prefs_core::declare). Kernel-fulfilled beside PREF_GET/SET/LIST; -EACCES outside the session,
+// -EINVAL malformed. Appended at the file tail.
+// =================================================================================================
+
+/// Bus verb: declare a program's settings stanza.
+pub const BUS_VERB_PREF_DECLARE: u8 = 23; // 20..=22 are DIALOG2's dialog/sheet/toast; renumbered at merge17
+const _: () = assert!(BUS_VERB_PREF_DECLARE > BUS_VERB_TOAST && BUS_VERB_PREF_DECLARE < BUS_VERB_REGISTER);
+// SMALLFIX3 (rmbp-ledger B416) — THE CODES ARE UNIQUE BY CONSTRUCTION. Three arcs of one wave each took the
+// next free number from their own branch (event 10 twice, bus verb 20 twice): a clash only showed at the fold.
+// Every input-ring event type and every kernel bus verb is listed here and a duplicate fails the BUILD on both
+// arches and the host. An arc minting a code appends its constant to the list (tail-neutral); the kernel's
+// `tests smallfix3` prints `event_codes=unique bus_verbs=unique` from the same lists.
+/// Every input-ring event type (`INPUT_EV_*` the ring carries).
+pub const INPUT_EV_ALL: &[u64] = &[
+    INPUT_EV_KEY_DOWN, INPUT_EV_KEY_UP, INPUT_EV_MOUSE_REL, INPUT_EV_MOUSE_ABS, INPUT_EV_BUTTON, INPUT_EV_WHEEL,
+    INPUT_EV_ACTION, INPUT_EV_MENU_PICK, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, INPUT_EV_DIALOG_ANSWER,
+];
+/// Every kernel bus verb tag (the registrable range `>= BUS_VERB_FULFIL_MIN` is the bus's, not listed). The
+/// HOLOCRON band is listed by its two ends; [`codes_unique_u8`] also refuses any other tag inside the band.
+pub const BUS_VERB_ALL: &[u8] = &[
+    BUS_VERB_LS, BUS_VERB_CAT, BUS_VERB_CP, BUS_VERB_WRITE, BUS_VERB_RM, BUS_VERB_MV, BUS_VERB_MENU_PUBLISH,
+    BUS_VERB_MENU_CLEAR, BUS_VERB_MENU_GET, BUS_VERB_NOTICE, BUS_VERB_ATTR_SET, BUS_VERB_ATTR_GET, BUS_VERB_ATTR_LIST,
+    BUS_VERB_ATTR_QUERY, BUS_VERB_ATTR_STAT, BUS_VERB_PREF_GET, BUS_VERB_PREF_SET, BUS_VERB_PREF_LIST,
+    BUS_VERB_PREF_CHANGED, BUS_VERB_REGISTER, BUS_VERB_HOLOCRON_FIRST, BUS_VERB_HOLOCRON_LAST, BUS_VERB_DIALOG,
+    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE,
+];
+/// No two entries equal (and none zero). `const` so the assertion below runs in the compiler.
+pub const fn codes_unique_u64(v: &[u64]) -> bool {
+    let mut i = 0;
+    while i < v.len() {
+        if v[i] == 0 {
+            return false;
+        }
+        let mut j = i + 1;
+        while j < v.len() {
+            if v[i] == v[j] {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+/// The bus-verb form: unique, non-zero, below the registrable range, and nothing but the band's own two ends
+/// inside the HOLOCRON band.
+pub const fn codes_unique_u8(v: &[u8]) -> bool {
+    let mut i = 0;
+    while i < v.len() {
+        let x = v[i];
+        let in_band = x >= BUS_VERB_HOLOCRON_FIRST && x <= BUS_VERB_HOLOCRON_LAST;
+        let band_end = x == BUS_VERB_HOLOCRON_FIRST || x == BUS_VERB_HOLOCRON_LAST;
+        if x == 0 || (x >= BUS_VERB_FULFIL_MIN && !in_band) || (in_band && !band_end) {
+            return false;
+        }
+        let mut j = i + 1;
+        while j < v.len() {
+            if x == v[j] {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(codes_unique_u64(INPUT_EV_ALL), "SMALLFIX3: two INPUT_EV_* event types share a code");
+const _: () = assert!(codes_unique_u8(BUS_VERB_ALL), "SMALLFIX3: two BUS_VERB_* verbs share a tag");

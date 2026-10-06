@@ -38,7 +38,7 @@
 //!
 //! x86_64 only; the whole module is unlinked when the knob is off (media byte-identical).
 
-use spin::Mutex;
+use crate::sync::Mutex;
 use x86_64::instructions::port::Port;
 
 /// Data port (key bytes out, value bytes in). Brief write surface.
@@ -1143,7 +1143,7 @@ pub fn scout() {
 pub mod battery {
     use super::{read_key, SmcError};
     use core::sync::atomic::{AtomicU32, Ordering};
-    use spin::Mutex;
+    use crate::sync::Mutex;
 
     /// IVY-AC — charge state *inferred* from the `B0AC` amperage sign, for machines where the
     /// `AC-W` key is ABSENT (metal fact: the 2012 rMBP has no AC-W, so `ac_present` can never

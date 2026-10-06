@@ -124,7 +124,7 @@ pub fn publish(path: &str, rows: Vec<DirEnt>) -> Vec<DirEnt> {
     if path.trim_end_matches('/') == BOOT_POINT { efi_only(rows) } else { rows }
 }
 
-static WITHDRAWN: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static WITHDRAWN: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 
 /// VOLUMES2 (B376, R89 "it should only have the unaos and boot volumes"): on a native UnaFS root, a non-root disk's
 /// FAT volume named `EFI` — another OS's firmware system partition (flight 23: the internal SSD's, `source=ahci0`)

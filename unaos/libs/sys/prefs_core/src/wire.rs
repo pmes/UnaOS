@@ -36,6 +36,8 @@ pub const VERB_GET: u8 = 16;
 pub const VERB_SET: u8 = 17;
 pub const VERB_LIST: u8 = 18;
 pub const VERB_CHANGED: u8 = 19;
+/// SETTINGSFILES (B407, R98): a program declares its `app.<name>.*` stanza (body: [`crate::declare::body`]).
+pub const VERB_DECLARE: u8 = 23; // merge17: 20..=22 are DIALOG2 verbs (una_abi::BUS_VERB_PREF_DECLARE)
 /// una-abi `BUS_BODY_MAX`: the reply ceiling.
 pub const BODY_MAX: usize = 4096;
 
@@ -65,6 +67,10 @@ pub trait Store {
     fn list(&self, ns: &str) -> Vec<(String, PrefValue)>;
     /// Every namespace holding a value, sorted.
     fn namespaces(&self) -> Vec<String>;
+    /// SETTINGSFILES (B407): adopt a program's declared stanza. A store with no `app` registry refuses.
+    fn declare(&mut self, _name: &str, _keys: Vec<crate::declare::DeclKey>) -> i64 {
+        EINVAL
+    }
 }
 
 /// `<ns>.<key>` (the bus's and the `pref` verb's address form), both halves validated.
@@ -201,6 +207,11 @@ pub fn fulfil(store: &mut dyn Store, verb: u8, body: &[u8], in_session: bool, ou
                     0
                 }
             }
+            None => EINVAL,
+        },
+        VERB_DECLARE => match crate::declare::parse(body) {
+            Some((name, keys)) if in_session => store.declare(&name, keys),
+            Some(_) => EACCES,
             None => EINVAL,
         },
         _ => EINVAL,
@@ -352,15 +363,27 @@ mod tests {
                 assert_eq!(run(&mut s, VERB_SET, &set_body(k.ns, k.key, &v), true), (0, Vec::new()), "{}", k.key);
             }
         }
-        const GOLDEN: &[u8] = b"system.audio.mute = false\n\
+        const GOLDEN: &[u8] = b"system.appearance.accent = \"crispy\"\n\
+system.appearance.highlight = \"accent\"\n\
+system.appearance.mode = \"light\"\n\
+system.audio.mute = false\n\
 system.audio.volume = 12\n\
 system.display.brightness = 12\n\
 system.display.font = \"sans\"\n\
 system.display.font_size = 13\n\
 system.display.idle_min = 10\n\
 system.display.wallpaper = \"\"\n\
+system.dock.autohide = false\n\
+system.dock.position = \"bottom\"\n\
+system.login.items = \"\"\n\
+system.notify.dnd = false\n\
 system.pointer.speed = 1\n\
-system.settings.tab = 0\n";
+system.settings.tab = 0\n\
+system.trackpad.natural_scroll = true\n\
+system.trackpad.secondary_click = \"two-finger\"\n\
+system.trackpad.speed = 5\n\
+system.trackpad.tap_to_click = false\n\
+system.trackpad.three_finger_drag = false\n";
         assert_eq!(run(&mut s, VERB_LIST, b"system", false), (0, GOLDEN.to_vec()));
         // An empty LIST body lists every namespace; another namespace lists only itself.
         run(&mut s, VERB_SET, b"vein.provider\x00\"claude\"", true);

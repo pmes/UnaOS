@@ -3676,3 +3676,63 @@ impl<D: BlockDevice> UnaFS<D> {
         self.commit_inner()
     }
 }
+
+// =====================================================================
+// QUARRY3 (rmbp-ledger B413) — the name search
+// =====================================================================
+
+impl<D: BlockDevice> UnaFS<D> {
+    /// Every object whose NAME contains `needle` (ASCII case-insensitive), as
+    /// `(absolute path, is_dir)`, walking the name tree from the root
+    /// breadth-first. Bounded twice: at most `max_hits` hits and at most
+    /// `max_dirs` directory reads, so a keystroke in a search field never
+    /// costs more than the caller allows. Returns the hits and the number of
+    /// directories read. Shared by the kernel's file manager (Quarry's
+    /// search field) and, later, the launcher (MACPARITY row 36). An empty
+    /// needle matches nothing.
+    pub fn find_names(
+        &mut self,
+        needle: &str,
+        max_hits: usize,
+        max_dirs: usize,
+    ) -> Result<(Vec<(String, bool)>, usize), FileSystemError> {
+        let mut hits: Vec<(String, bool)> = Vec::new();
+        let n = needle.as_bytes();
+        if n.is_empty() || max_hits == 0 {
+            return Ok((hits, 0));
+        }
+        let has = |name: &str| -> bool {
+            let h = name.as_bytes();
+            h.len() >= n.len()
+                && h.windows(n.len()).any(|w| w.iter().zip(n.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+        };
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        // Breadth-first: shallow names first, which is what a search field wants at the top of its list.
+        let mut queue: alloc::collections::VecDeque<(u64, String)> = alloc::collections::VecDeque::new();
+        queue.push_back((self.superblock.root_inode, String::new()));
+        let mut dirs = 0usize;
+        while let Some((dir, prefix)) = queue.pop_front() {
+            if dirs >= max_dirs || !seen.insert(dir) {
+                continue;
+            }
+            dirs += 1;
+            let mut ents = self.ls(dir)?;
+            // Name order, so the walk (and the hit order) is the same on every volume.
+            ents.sort_by(|a, b| a.name.cmp(&b.name));
+            for e in ents.iter() {
+                let path = format!("{}/{}", prefix, e.name);
+                let is_dir = e.kind == FileKind::Directory;
+                if has(&e.name) {
+                    hits.push((path.clone(), is_dir));
+                    if hits.len() >= max_hits {
+                        return Ok((hits, dirs));
+                    }
+                }
+                if is_dir {
+                    queue.push_back((e.inode_id, path));
+                }
+            }
+        }
+        Ok((hits, dirs))
+    }
+}

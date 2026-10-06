@@ -6510,6 +6510,17 @@ mod r8 {
                     out.csum_match = copy_full && spill == 0 && dst_crc == src_crc_drain;
                     out.us = r8_cycles_to_us(cyc.saturating_add(drain_cyc));
                 }
+                // GEN7 M2 (B411) — R8b, the band: only on a fully verified R8 attempt, still armed and
+                // under the same hold, before the teardown below restores the ring. Its drain joins
+                // `ring_idle`, so the reclaim gate never sees an engine the band left busy.
+                if armed && ring_idle && copy_full && spill == 0 && sentinel_hit && dst_crc == src_crc_drain {
+                    let b = band(
+                        bar0, ring_page, dst_page, dst_bytes, dst_gtt_addr, dst_pitch_bytes, fb_w, fb_h,
+                        sentinel_dw, sentinel_gtt_addr, XY_SRC_COPY_BLT_DW0, br13, MI_FLUSH_DW_DW0,
+                    );
+                    ring_idle &= b.idle;
+                    out.band = b;
+                }
                 wr(bar0, g7regs::BCS_RING_CTL, 0);
                 let ctl_off = rd(bar0, g7regs::BCS_RING_CTL);
                 let ring_disabled = ctl_off & 1 == 0;
@@ -6920,12 +6931,14 @@ mod r8 {
         csum_match: bool,
         us: u64,
         verdict: &'static str,
+        /// GEN7 M2 (B411): R8b's reading; `ran=false` when R8 did not verify.
+        band: Band,
     }
 
-    static STASH: spin::Mutex<Option<Ctx>> = spin::Mutex::new(None);
+    static STASH: crate::sync::Mutex<Option<Ctx>> = crate::sync::Mutex::new(None);
     /// The first armed run's witness. R8's pages are `reclaim=held` (GEN7TLB HOLD, gen7.md §2.6), so a
     /// second armed run would hold another ~1 MiB for an answer this boot already has: it replays.
-    static DONE: spin::Mutex<Option<Witness>> = spin::Mutex::new(None);
+    static DONE: crate::sync::Mutex<Option<Witness>> = crate::sync::Mutex::new(None);
 
     fn r8_cycles_to_us(dt: u64) -> u64 {
         let hz = crate::arch::apic::tsc_hz();
@@ -6954,7 +6967,7 @@ mod r8 {
         *STASH.lock() = Some(Ctx { bar0, bar0_size, bus, slot, func, wake, r7: r7_verdict, geo });
     }
 
-    static BANKED_GEO: spin::Mutex<Option<Geo>> = spin::Mutex::new(None);
+    static BANKED_GEO: crate::sync::Mutex<Option<Geo>> = crate::sync::Mutex::new(None);
 
     /// GPUTESTS M1: bank the panel geometry at boot (`gen7::bank`). Prints nothing.
     pub(super) fn bank_geo() {
@@ -6999,12 +7012,14 @@ mod r8 {
         result
     }
 
-    /// `tests gen7`: run R8 once from the boot stash and print the witness.
-    pub(super) fn test() {
+    /// `tests gen7`: run R8 once from the boot stash and print the witness. GEN7 (B411): returns the
+    /// result word and the witness so the ladder can print the arc's `:: GEN7: ::` line.
+    pub(super) fn test() -> (&'static str, Witness) {
         if let Some(w) = *DONE.lock() {
             serial_println!(":: gen7: r8 replay=1 note=this-boot-already-armed-R8-and-its-pages-are-held-a-second-run-would-hold-another-window ::");
-            print_witness(&w, true);
-            return;
+            let r = print_witness(&w, true);
+            print_band(&w);
+            return (r, w);
         }
         let ctx = *STASH.lock();
         let mut w = Witness::default();
@@ -7022,17 +7037,193 @@ mod r8 {
                 unsafe { fb_blit(c.bar0, c.bar0_size, c.bus, c.slot, c.func, c.wake, c.r7, c.geo, &mut w) };
             }
         }
-        print_witness(&w, false);
+        let r = print_witness(&w, false);
+        print_band(&w);
         if w.armed {
             *DONE.lock() = Some(w);
         }
+        (r, w)
+    }
+
+    // =================================================================================
+    // GEN7 M2 (B411) — R8b "band" and R0-GEN7: is a sysmem->sysmem BCS copy at the panel's width
+    // faster than the CPU copying the same bytes? (docs/dev/evidence/rmbp-1005/gen7.md §2-§3)
+    // =================================================================================
+    //
+    // The band lives INSIDE R8's verified destination window (sysmem pages behind R8's GGTT PTEs): rows
+    // 0..BAND_ROWS are the source, rows BAND_ROWS..2*BAND_ROWS the destination, columns 0..fb_w — a
+    // full-width copy between two sysmem surfaces, which is exactly the shape KCOMP would hand the BCS
+    // while the Kepler owns the panel. No new register, PTE or opcode: the encodings are R8's (metal-
+    // exercised on 13 boots), written at ring dwords 16..31 and submitted by moving TAIL 0x40 -> 0x80
+    // (IVB PRM Vol1 Pt3 §1.1.11.1 p.75: TAIL is a QWord-aligned byte offset). Row 2*BAND_ROWS (R8's
+    // slack row) still holds the sentinel slot, outside the band.
+
+    /// Rows per band — half of R8's rectangle, so source and destination both fit R8's 64 rows.
+    const BAND_ROWS: usize = R8_RECT_H / 2;
+    /// The band's MI_STORE_DATA_IMM value — distinct from R5..R8's, so a hit is THIS submission's.
+    const BAND_SENTINEL: u32 = 0x0B8D_BA4D;
+    /// TAIL after the band: R8's 16 dwords + the band's 16 = 32 dwords = 128 bytes.
+    const BAND_TAIL_BYTES: u32 = 0x80;
+    const _: () = assert!(2 * BAND_ROWS < R8_DST_ROWS);
+
+    fn band_seed(i: usize) -> u32 {
+        0xBA4D_0000u32 ^ (i as u32).wrapping_mul(0xC2B2_AE35)
+    }
+
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct Band {
+        ran: bool,
+        w: usize,
+        fb_h: usize,
+        pre_match: u32,
+        matched: u32,
+        total: u32,
+        sentinel: bool,
+        idle: bool,
+        head: u32,
+        gpu_us: u64,
+        cpu_us: u64,
+    }
+
+    pub(super) fn band_ok(w: &Witness) -> bool {
+        let b = &w.band;
+        b.ran && b.pre_match == 0 && b.total > 0 && b.matched == b.total && b.sentinel && b.idle
+    }
+
+    /// Submit the band on R8's armed BCS ring and time it against the CPU copy of the same bytes.
+    ///
+    /// # Safety
+    /// Called only from `fb_blit`, with the ring armed, R8's window claimed and verified, the hold held,
+    /// and HEAD == TAIL == 0x40 (R8 drained). `ring_page`/`dst_page` are R8's live allocations.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn band(
+        bar0: usize,
+        ring_page: *mut u8,
+        dst_page: *mut u8,
+        dst_bytes: usize,
+        dst_gtt_addr: u32,
+        pitch_bytes: usize,
+        fb_w: usize,
+        fb_h: usize,
+        sentinel_dw: usize,
+        sentinel_gtt_addr: u32,
+        blt_dw0: u32,
+        br13: u32,
+        flush_dw0: u32,
+    ) -> Band {
+        let mut b = Band { ran: true, w: fb_w, fb_h, ..Band::default() };
+        let pitch_dw = pitch_bytes / 4;
+        let dst_u32 = dst_page as *mut u32;
+        // Seed the destination band so a match is a transition, then the pre-control (must read 0).
+        for r in 0..BAND_ROWS {
+            for c in 0..fb_w {
+                let i = (BAND_ROWS + r) * pitch_dw + c;
+                core::ptr::write_volatile(dst_u32.add(i), band_seed(i));
+            }
+        }
+        core::ptr::write_volatile(dst_u32.add(sentinel_dw), R8_DST_SENTINEL_SEED);
+        clflush_range(dst_page as usize, dst_bytes);
+        let compare = || -> u32 {
+            let mut m = 0u32;
+            for r in 0..BAND_ROWS {
+                for c in 0..fb_w {
+                    let s = core::ptr::read_volatile(dst_u32.add(r * pitch_dw + c) as *const u32);
+                    let d = core::ptr::read_volatile(dst_u32.add((BAND_ROWS + r) * pitch_dw + c) as *const u32);
+                    m += (s == d) as u32;
+                }
+            }
+            m
+        };
+        b.total = (BAND_ROWS * fb_w) as u32;
+        b.pre_match = compare();
+
+        // The commands: R8's three, field content only changed (IVB PRM Vol1 Pt4 §1.9.14 pp.62-63 for the
+        // blit, §2.2.5 pp.137-139 for MI_FLUSH_DW; Vol1 Pt3 §1.2.17 p.186 for MI_STORE_DATA_IMM).
+        let ring_u32 = ring_page as *mut u32;
+        let cmds: [u32; 16] = [
+            blt_dw0,
+            br13,                                             // BR13: 32bpp | ROP S | dst pitch (bytes)
+            (BAND_ROWS as u32) << 16,                         // dst Y1 | X1 = 0
+            ((2 * BAND_ROWS) as u32) << 16 | fb_w as u32,     // dst Y2 | X2 (exclusive: R8 spill=0 x13)
+            dst_gtt_addr,                                     // dst base
+            0,                                                // src Y1 | X1 = 0
+            pitch_bytes as u32,                               // BR11: src pitch (bytes)
+            dst_gtt_addr,                                     // src base: the same sysmem window
+            flush_dw0, 0, 0, 0,                               // the barrier before the store
+            MI_STORE_DATA_IMM_DW0, 0, sentinel_gtt_addr, BAND_SENTINEL,
+        ];
+        for (k, v) in cmds.iter().enumerate() {
+            core::ptr::write_volatile(ring_u32.add(16 + k), *v);
+        }
+        clflush_range(ring_page as usize, 4096);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        let mut head = 0u32;
+        let mut sent = R8_DST_SENTINEL_SEED;
+        wr(bar0, g7regs::BCS_RING_TAIL, BAND_TAIL_BYTES);
+        let (done, _it, cyc) = poll_cycles(EXEC_BUDGET_CYC, || {
+            head = rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+            clflush_range(dst_page as usize + sentinel_dw * 4, 4);
+            sent = core::ptr::read_volatile(dst_u32.add(sentinel_dw) as *const u32);
+            sent == BAND_SENTINEL && head == BAND_TAIL_BYTES
+        });
+        b.gpu_us = r8_cycles_to_us(cyc);
+        if !done {
+            // Not drained inside the budget: give it the drain budget before the teardown disables.
+            let (idle, _, _) = poll_cycles(DRAIN_BUDGET_CYC, || {
+                (rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK) == BAND_TAIL_BYTES
+            });
+            b.idle = idle;
+        } else {
+            b.idle = true;
+        }
+        b.head = rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+        clflush_range(dst_page as usize, dst_bytes);
+        b.sentinel = core::ptr::read_volatile(dst_u32.add(sentinel_dw) as *const u32) == BAND_SENTINEL;
+        b.matched = compare();
+
+        // The CPU leg: the same bytes, row by row, one core (`copy_nonoverlapping`, as a compositor row
+        // copy does). The destination already holds these values, so this rewrites them unchanged.
+        clflush_range(dst_page as usize, dst_bytes);
+        let t1 = crate::arch::now_cycles();
+        for r in 0..BAND_ROWS {
+            core::ptr::copy_nonoverlapping(
+                dst_u32.add(r * pitch_dw) as *const u32,
+                dst_u32.add((BAND_ROWS + r) * pitch_dw),
+                fb_w,
+            );
+        }
+        b.cpu_us = r8_cycles_to_us(crate::arch::now_cycles().saturating_sub(t1));
+        b
+    }
+
+    /// The band's two lines: the raw reading and the R0-GEN7 decision.
+    fn print_band(w: &Witness) {
+        let b = &w.band;
+        if !b.ran {
+            serial_println!(":: GEN7BLIT: band=none why=r8-not-verified-this-run -> candidate=none ::");
+            return;
+        }
+        serial_println!(
+            "[gen7] band rows={} w={} pre_match={} band_match={}/{} sentinel={} head={:08X} idle={} gpu_us={} cpu_us={}",
+            BAND_ROWS, b.w, b.pre_match, b.matched, b.total, b.sentinel as u32, b.head, b.idle as u32, b.gpu_us, b.cpu_us
+        );
+        let ok = band_ok(w);
+        let rows = BAND_ROWS as u64;
+        let h = b.fb_h as u64;
+        let (pg, pc) = (b.gpu_us * h / rows, b.cpu_us * h / rows);
+        let cand = if !ok { "none" } else if b.gpu_us < b.cpu_us { "bcs" } else { "cpu" };
+        serial_println!(
+            ":: GEN7BLIT: band={}x{} bytes={} gpu_us={} cpu_us={} proj_gpu_us={} proj_cpu_us={} at={}x{} match={} -> candidate={} ::",
+            b.w, BAND_ROWS, BAND_ROWS * b.w * 4, b.gpu_us, b.cpu_us, pg, pc, b.w, b.fb_h, ok as u32, cand
+        );
     }
 }
 
 /// GEN7R8 (B320): the `tests gen7` fixture — rung R8 from the boot stash, one witness line.
 #[cfg(feature = "gen7r8")]
 pub fn r8_test() {
-    r8::test()
+    let _ = r8::test();
 }
 
 // =====================================================================================
@@ -7076,6 +7267,12 @@ pub unsafe fn bank(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
     *ladder::BANK.lock() = Some(ladder::Bank { bar0, bar0_size, bus, slot, func, ggtt, ggtt_ok: ok });
     #[cfg(feature = "gen7r8")]
     r8::bank_geo();
+    // GEN7 M1 (B411, R80/R87): the arming decision, ONE line. The boot banks; no ring is armed and no
+    // register or PTE is written here — the BCS/RCS rungs run under `tests gen7`.
+    serial_println!(
+        "[gen7] arm=banked bdf={}:{}.{} ggtt_banked={} r8={} writes=0 ladder=tests-gen7",
+        bus, slot, func, ok as u32, if cfg!(feature = "gen7r8") { "built" } else { "absent" }
+    );
 }
 
 /// GPUTESTS M1: `tests gen7` — R1..R7 from the boot bank, then R8 (gen7r8), one witness line each.
@@ -7097,10 +7294,10 @@ mod ladder {
         pub(super) ggtt_ok: bool,
     }
 
-    pub(super) static BANK: spin::Mutex<Option<Bank>> = spin::Mutex::new(None);
-    static R7: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
+    pub(super) static BANK: crate::sync::Mutex<Option<Bank>> = crate::sync::Mutex::new(None);
+    static R7: crate::sync::Mutex<Option<&'static str>> = crate::sync::Mutex::new(None);
     /// `(wake name, r7 verdict, us)` of the run this boot already made.
-    static DONE: spin::Mutex<Option<(&'static str, &'static str, u64)>> = spin::Mutex::new(None);
+    static DONE: crate::sync::Mutex<Option<(&'static str, &'static str, u64)>> = crate::sync::Mutex::new(None);
     /// True only while `run` drives the rungs, so R1 answers from the bank exactly then.
     static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -7136,8 +7333,7 @@ mod ladder {
         if let Some((w, r7, us)) = *DONE.lock() {
             serial_println!(":: gen7: ladder replay=1 note=R1-R7-ran-once-this-boot-R5-R8-hold-GGTT-pages-a-second-run-would-hold-more ::");
             witness(w, r7, us, true);
-            #[cfg(feature = "gen7r8")]
-            super::r8::test();
+            gen7_line(r7, crate::arch::now_cycles());
             return;
         }
         let Some(b) = *BANK.lock() else {
@@ -7173,7 +7369,23 @@ mod ladder {
         let r7 = (*R7.lock()).unwrap_or("not-reached");
         *DONE.lock() = Some((wake.name(), r7, us));
         witness(wake.name(), r7, us, false);
+        gen7_line(r7, t0);
+    }
+
+    /// GEN7 M1 (B411): the arc's witness — the BCS blits this `tests gen7` verified (R7's 1 KiB, R8's
+    /// panel-pitch rectangle, R8b's full-width band) and the run's wall time. `r8=` is R8's own result
+    /// word (`not-built` without `gen7r8`).
+    fn gen7_line(r7: &str, t0: u64) {
+        #[allow(unused_mut)]
+        let mut blits = (r7 == "r7-blit-verified") as u32;
         #[cfg(feature = "gen7r8")]
-        super::r8::test();
+        let r8 = {
+            let (r, w) = super::r8::test();
+            blits += (r == "PASS") as u32 + super::r8::band_ok(&w) as u32;
+            r
+        };
+        #[cfg(not(feature = "gen7r8"))]
+        let r8 = "not-built";
+        serial_println!(":: GEN7: ring=bcs r8={} blits={} us={} ::", r8, blits, us_since(t0));
     }
 }

@@ -28,7 +28,10 @@ pub fn service_tick() {
     #[cfg(target_arch = "x86_64")]
     {
         if !NET_TASK.swap(true, Ordering::AcqRel) {
-            let cpu = crate::arch::smp::service_cpu().unwrap_or(0);
+            // INPUTSTALL2 M3 (B388): off the service core where one exists — that core runs the HID pass and the
+            // input task; the net drive (lease, SNTP, the SOCK ladder) spins `pump_until` for seconds. The xHCI-safe
+            // worker rule (`xhci_worker_cpu`: neither render nor service), falling back to the service core.
+            let cpu = crate::arch::smp::xhci_worker_cpu(0).or(crate::arch::smp::service_cpu()).unwrap_or(0);
             crate::arch::sched::spawn("net-tick", net_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
             serial_println!("[net] tick task=net-tick cpu={} cadence_ms={} (GLASSLAG: off the render service)", cpu, NET_TICK_MS);
         }
@@ -58,6 +61,8 @@ fn net_task(_: usize) {
 fn tick_body() {
     #[cfg(all(feature = "smolnet", feature = "usbnet", target_arch = "x86_64"))]
     crate::smolnet::dhcp_link_tick(); // USBNET6 M3: the dongle's lease is asked for once its PHY has link (no-op once leased / with an e1000)
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    crate::drivers::e1000::witness_ladder(); // INPUTSTALL2 M3 (B388): the SOCK ladder off the usb-pump loop (no-op with an e1000)
     if WITNESSED.load(Ordering::Relaxed) {
         return;
     }

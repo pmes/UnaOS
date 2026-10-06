@@ -83,7 +83,7 @@
 //! Landed: PARTINSTALL (the partition-mode installer) and AHCIWRITE (`WRITE DMA EXT` behind
 //! `ahci-write`). Next is multi-sector PRDT runs and the attended operator flow on real metal.
 
-use spin::Mutex;
+use crate::sync::Mutex;
 
 // ── AHCI 1.3.1 §3.1: Generic Host Control ───────────────────────────────────────────────────────
 const REG_CAP: u64 = 0x00;

@@ -80,7 +80,7 @@ use alloc::sync::Arc;
 use lazy_static::lazy_static;
 // Aliased so the public `Mutex<T>` (a sleeping mutex, below) can own the nicer name. This spin
 // lock guards the internal run/sleeper queues only.
-use spin::Mutex as SpinMutex;
+use crate::sync::Mutex as SpinMutex;
 
 use crate::arch::gdt::MAX_CPUS;
 use crate::arch::{apic, percpu};
@@ -1438,7 +1438,7 @@ impl core::fmt::Write for LineBuf {
 /// ("this core is dispatching"), i.e. structurally rather than evidentially.
 ///
 /// WHY THE SNAPSHOT IS TAKEN WITH INTERRUPTS MASKED (R1/H1) — this is a correctness requirement, not
-/// tidiness. `run_queue_len` acquires `RUN_QUEUES[c]`, a plain `spin::Mutex` with NO IRQ masking, and
+/// tidiness. `run_queue_len` acquires `RUN_QUEUES[c]`, a plain `crate::sync::Mutex` with NO IRQ masking, and
 /// its own doc names it a WEDGE-4 `<W1>` hazard site. This witness runs from `x86_render_service` — a
 /// PREEMPTIBLE task on the core that owns the panel — so unmasked it would be a permanent, silent
 /// self-deadlock waiting to happen: preempt the render task while it holds `RUN_QUEUES[1]`, and `run()`
@@ -1627,7 +1627,7 @@ pub fn emit_load_witness(tag: &str) {
 /// `mh == 0` means the floor was. Anything else is a joint result and must be reported as one.
 ///
 /// SNAPSHOT DISCIPLINE is `emit_load_witness`'s, verbatim and for its reasons: the scan takes
-/// `RUN_QUEUES[c]` (a plain `spin::Mutex` with no IRQ masking) from a preemptible task on the render
+/// `RUN_QUEUES[c]` (a plain `crate::sync::Mutex` with no IRQ masking) from a preemptible task on the render
 /// core, so it runs inside `without_interrupts` or it is a latent self-deadlock. Bounded: `n <=
 /// MAX_CPUS` iterations of one relaxed load plus one lock held across a walk of `NUM_PRIORITIES`
 /// short deques, taken and released one at a time, no allocation and no UART inside. The census walks
@@ -2257,7 +2257,7 @@ mod wedge4 {
     /// W4-B: acquire `m` with a bounded spin; name the stall on the wire if the bound trips, then
     /// block exactly as the un-instrumented path would. The bound (~2e8 polls) is seconds of wall
     /// clock — three orders of magnitude past any legitimate hold of this lock.
-    pub fn lock_or_squawk<'a, T>(m: &'a super::SpinMutex<T>) -> spin::MutexGuard<'a, T, spin::Spin> {
+    pub fn lock_or_squawk<'a, T>(m: &'a super::SpinMutex<T>) -> crate::sync::MutexGuard<'a, T, spin::Spin> {
         let mut spins: u64 = 0;
         loop {
             if let Some(g) = m.try_lock() {
@@ -2775,8 +2775,8 @@ fn spawn_user_inner(
 /// Relaxed-free accounting is deliberately NOT used: `retain` and `release` can run on different
 /// cores (a parent spawning on core A while a worker exits on core B), and the decision the counter
 /// drives is "may I free this address space?", so both sides are `AcqRel`.
-static USER_SPACE_REFS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+static USER_SPACE_REFS: crate::procslot::SlotVec<AtomicU32> =
+    crate::procslot::SlotVec::new(|| AtomicU32::new(0), AtomicU32::new(0)); // WINDOWCAP3 (B399): per-slot, heap-grown
 
 /// TEARDOWN-1: per-slot ADDRESS-SPACE DOOM — "every ring-3 task under this slot is owed its death".
 ///
@@ -2798,8 +2798,8 @@ static USER_SPACE_REFS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
 /// QUIESCENCE IS PRESERVED, NOT WEAKENED. Nothing is reclaimed here. Each sibling still retires through
 /// `reap_killed` and decrements `USER_SPACE_REFS` itself; only when that reaches zero does the slot free.
 /// This makes that edge REACHABLE — it does not move it earlier.
-static SLOT_DOOMED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+static SLOT_DOOMED: crate::procslot::SlotVec<AtomicBool> =
+    crate::procslot::SlotVec::new(|| AtomicBool::new(false), AtomicBool::new(false)); // WINDOWCAP3 (B399): per-slot, heap-grown
 
 /// TEARDOWN-1: arm the address-space doom for the slot rooted at `cr3`. Idempotent; a `cr3` that is not a
 /// live slot root is ignored (there is no address space to scope to). Disarmed on the slot's real free
@@ -2827,7 +2827,7 @@ fn task_kill_armed(task: &Task) -> bool {
 /// `user_cr3` field is the authority on which address space it belongs to, and at reap time the live
 /// CR3 has already been restored to the kernel's.
 fn cr3_slot(cr3: u64) -> Option<usize> {
-    (0..crate::arch::memory::USER_SLOTS).find(|&s| crate::arch::memory::slot_cr3(s) == cr3)
+    (0..crate::arch::memory::user_slots()).find(|&s| crate::arch::memory::slot_known(s) && crate::arch::memory::slot_cr3(s) == cr3)
 }
 
 /// WINX-7: claim one extra hold on the address space `cr3` — called by the syscall layer BEFORE it
@@ -4382,7 +4382,7 @@ pub fn futex_waiters_on(key: u64) -> usize {
 // slot — so a stale-or-reused value is a benign wrong-target boost that self-corrects, never UB.
 //
 // THE PROTOCOL (minimal, soft-RT — the BEOS-SMP-FLOW R3 shape). Only the sleeping `Mutex`
-// participates (the counting `Semaphore`/futex have no single owner; the IRQ-masked `spin::Mutex`es
+// participates (the counting `Semaphore`/futex have no single owner; the IRQ-masked `crate::sync::Mutex`es
 // in `video/wm.rs` cannot be preempted mid-hold — both out of scope):
 //
 //   1. ACQUIRE-TIME DONATION (`pi_donate`, from a blocker in `Mutex::lock`). A task blocking on a
@@ -7759,7 +7759,7 @@ pub fn current_stack_bounds() -> Option<(u64, u64)> {
 /// single-core machine — `tests prof2` places its load task off the shell's core, which a busy-waiting
 /// shell would otherwise starve.
 pub fn other_dispatching_cpu() -> usize {
-    let here = percpu::this_cpu().cpu_index as usize;
+    let here = percpu::this_cpu().cpu_index as usize; if let Some(w) = (0..MAX_CPUS).map_while(super::smp::worker_cpu).find(|&c| c != here && cpu_dispatching(c)) { return w; } // CLOCKCORE (B397): a worker-pool core first — never the BSP/render core when a worker exists
     (0..MAX_CPUS).find(|&c| c != here && cpu_dispatching(c)).unwrap_or(CPU_AUTO)
 }
 
@@ -7823,4 +7823,11 @@ pub fn slab_high(base: u64, len: usize) -> Option<usize> {
         let _ = (base, len);
         None
     }
+}
+
+/// WINDOWCAP3 (rmbp-ledger B399): allocate this file's per-slot rows for slot `s` at its claim (process
+/// context), so the dispatcher's later reads never allocate.
+pub fn slot_tables_warm(s: usize) {
+    USER_SPACE_REFS.warm(s);
+    SLOT_DOOMED.warm(s);
 }

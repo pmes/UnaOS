@@ -529,6 +529,10 @@ pub fn write_ssd(out: &mut dyn FnMut(&str), _force: bool) {
 
 /// The shell arm: `install ssd [--dry-run|--write]` (`args` is what follows `ssd`).
 pub fn verb(out: &mut dyn FnMut(&str), args: &[&str]) {
+    #[cfg(feature = "login")]
+    if args.first().copied() == Some("--write") && crate::fs::users::admin_authority("install-ssd-write").is_err() {
+        return out("install ssd --write: an administrator's session is required (R100: log in as the administrator)"); // FIRSTUSER (B409)
+    }
     match args.first().copied() {
         Some("--dry-run") if args.len() == 1 => {
             let _ = dry_run(out);

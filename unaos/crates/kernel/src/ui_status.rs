@@ -213,7 +213,7 @@
 use crate::pal::GneissPal;
 use alloc::format;
 use alloc::string::String;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 // ---------------------------------------------------------------------------------------------
 // The meter palette and the VUG-HONESTY display rule.

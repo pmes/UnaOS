@@ -8,9 +8,9 @@
 //!    old range gone), MREMAP_FIXED, MREMAP_DONTUNMAP, the error answers; the alternate signal stack at delivery (the frame
 //!    on it, SS_ONSTACK inside the handler, EPERM to change it there, uc_stack, a handler without SA_ONSTACK on the normal
 //!    stack, SS_DISABLE); getcpu, madvise(MADV_HUGEPAGE), sched_yield.
-//! 2. `LLD.LNX -flavor gnu @/apps/LIB/rust/link.rsp -o <home>rust2.lnx` — a static `ld.lld` (LLVM 22.1.8, the toolchain's
+//! 2. `LLD.LNX -flavor gnu @/lib/rust/link.rsp -o <home>rust2.lnx` — a static `ld.lld` (LLVM 22.1.8, the toolchain's
 //!    LLVM release, built by arroyo) links RUST.LNX's own object files against the staged musl crt, libc.a, libunwind.a and
-//!    the std rlibs under /apps/LIB/rust (the response file is the host rustc's own ld.lld line with UnaOS paths).
+//!    the std rlibs under /lib/rust (the response file is the host rustc's own ld.lld line with UnaOS paths).
 //! 3. `<home>rust2.lnx /apps/HELLO.C` — the relinked program runs: `rust ok threads=4 counter=400000 …`, exit 0.
 //!
 //! Wire: `:: SELFBUILD5: mremap=ok altstack=ok lld=ok link_ms=<n> link_peak_mib=<n> relink_runs=1 -> PASS ::`, after
@@ -23,7 +23,7 @@ use core::sync::atomic::Ordering;
 
 pub const KAT5: &str = "/apps/SYSKAT5.LNX";
 pub const LLD: &str = "/apps/LLD.LNX";
-pub const RSP: &str = "/apps/LIB/rust/link.rsp";
+pub const RSP: &str = "/lib/rust/link.rsp";
 
 fn exists(path: &str) -> Option<u64> {
     crate::shell::vfs_mount_table().stat(&crate::shell::vfs_path(path)).ok().map(|s| s.size)

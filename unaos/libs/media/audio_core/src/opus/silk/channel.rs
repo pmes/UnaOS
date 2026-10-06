@@ -7,6 +7,7 @@ use super::macros::*;
 use super::resampler::Resampler;
 use super::tables::*;
 use alloc::vec;
+use alloc::vec::Vec;
 
 pub const MAX_LPC_ORDER: usize = 16;
 pub const MAX_NB_SUBFR: usize = 4;
@@ -66,7 +67,8 @@ pub struct Plc {
 
 #[derive(Clone)]
 pub struct Cng {
-    pub exc_buf_q14: [i32; MAX_FRAME_LENGTH],
+    /// AUDIOCORE (B396): heap, allocated once at `new` (MAX_FRAME_LENGTH).
+    pub exc_buf_q14: Vec<i32>,
     pub smth_nlsf_q15: [i16; MAX_LPC_ORDER],
     pub synth_state: [i32; MAX_LPC_ORDER],
     pub smth_gain_q16: i32,
@@ -77,9 +79,11 @@ pub struct Cng {
 #[derive(Clone)]
 pub struct ChannelState {
     pub prev_gain_q16: i32,
-    pub exc_q14: [i32; MAX_FRAME_LENGTH],
+    /// AUDIOCORE (B396): the large per-channel buffers live on the heap, allocated once at `new`
+    /// (MAX_FRAME_LENGTH / MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH) and zeroed in place by `reset`.
+    pub exc_q14: Vec<i32>,
     pub slpc_q14_buf: [i32; MAX_LPC_ORDER],
-    pub out_buf: [i16; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH],
+    pub out_buf: Vec<i16>,
     pub lag_prev: i32,
     pub last_gain_index: i8,
     pub fs_khz: i32,
@@ -113,9 +117,9 @@ impl ChannelState {
     pub fn new() -> ChannelState {
         let mut s = ChannelState {
             prev_gain_q16: 0,
-            exc_q14: [0; MAX_FRAME_LENGTH],
+            exc_q14: vec![0; MAX_FRAME_LENGTH],
             slpc_q14_buf: [0; MAX_LPC_ORDER],
-            out_buf: [0; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH],
+            out_buf: vec![0; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH],
             lag_prev: 0,
             last_gain_index: 0,
             fs_khz: 0,
@@ -139,7 +143,7 @@ impl ChannelState {
             resampler: Resampler::default(),
             nlsf_cb: &NLSF_CB_NB_MB,
             indices: Indices::default(),
-            cng: Cng { exc_buf_q14: [0; MAX_FRAME_LENGTH], smth_nlsf_q15: [0; MAX_LPC_ORDER], synth_state: [0; MAX_LPC_ORDER], smth_gain_q16: 0, rand_seed: 0, fs_khz: 0 },
+            cng: Cng { exc_buf_q14: vec![0; MAX_FRAME_LENGTH], smth_nlsf_q15: [0; MAX_LPC_ORDER], synth_state: [0; MAX_LPC_ORDER], smth_gain_q16: 0, rand_seed: 0, fs_khz: 0 },
             loss_cnt: 0,
             prev_signal_type: 0,
             plc: Plc { pitch_l_q8: 0, ltp_coef_q14: [0; LTP_ORDER], prev_lpc_q12: [0; MAX_LPC_ORDER], last_frame_lost: false, rand_seed: 0, rand_scale_q14: 0,
@@ -154,9 +158,9 @@ impl ChannelState {
     pub fn reset(&mut self) {
         let keep_pitch_icdf = (self.pitch_lag_low_bits_icdf, self.pitch_contour_icdf, self.nlsf_cb);
         self.prev_gain_q16 = 65536;
-        self.exc_q14 = [0; MAX_FRAME_LENGTH];
+        self.exc_q14.fill(0);
         self.slpc_q14_buf = [0; MAX_LPC_ORDER];
-        self.out_buf = [0; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH];
+        self.out_buf.fill(0);
         self.lag_prev = 0;
         self.last_gain_index = 0;
         self.fs_khz = 0;
@@ -180,7 +184,12 @@ impl ChannelState {
         self.lbrr_flags = [0; 3];
         self.resampler = Resampler::default();
         self.indices = Indices::default();
-        self.cng = Cng { exc_buf_q14: [0; MAX_FRAME_LENGTH], smth_nlsf_q15: [0; MAX_LPC_ORDER], synth_state: [0; MAX_LPC_ORDER], smth_gain_q16: 0, rand_seed: 0, fs_khz: 0 };
+        self.cng.exc_buf_q14.fill(0);
+        self.cng.smth_nlsf_q15 = [0; MAX_LPC_ORDER];
+        self.cng.synth_state = [0; MAX_LPC_ORDER];
+        self.cng.smth_gain_q16 = 0;
+        self.cng.rand_seed = 0;
+        self.cng.fs_khz = 0;
         self.loss_cnt = 0;
         self.prev_signal_type = 0;
         self.plc = Plc { pitch_l_q8: 0, ltp_coef_q14: [0; LTP_ORDER], prev_lpc_q12: [0; MAX_LPC_ORDER], last_frame_lost: false, rand_seed: 0, rand_scale_q14: 0,
@@ -234,7 +243,7 @@ impl ChannelState {
                 self.lag_prev = 100;
                 self.last_gain_index = 10;
                 self.prev_signal_type = TYPE_NO_VOICE_ACTIVITY;
-                self.out_buf = [0; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH];
+                self.out_buf.fill(0);
                 self.slpc_q14_buf = [0; MAX_LPC_ORDER];
             }
             self.fs_khz = fs_khz;

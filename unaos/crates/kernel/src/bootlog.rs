@@ -18,7 +18,7 @@
 // `&'static str` so an entry is `Copy` and no per-entry buffer or formatting is needed.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// Ring capacity. Far more than the handful of boot milestones we record; drop-oldest on overflow
 /// keeps the LATEST milestones (the ones nearest a late failure) if a build ever records more.

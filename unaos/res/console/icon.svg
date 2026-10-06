@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Console (UnaOS's own design): the boot's log, lines of text on a dark pane. -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#1f2329"/>
+<rect x="2" y="2" width="60" height="12" rx="13" fill="#3b4048"/>
+<rect x="2" y="9" width="60" height="5" fill="#3b4048"/>
+<rect x="10" y="22" width="34" height="4" rx="2" fill="#9ae6b4"/>
+<rect x="10" y="31" width="44" height="4" rx="2" fill="#cbd5e0"/>
+<rect x="10" y="40" width="26" height="4" rx="2" fill="#cbd5e0"/>
+<rect x="10" y="49" width="38" height="4" rx="2" fill="#f6ad55"/>
+</svg>

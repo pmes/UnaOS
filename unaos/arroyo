@@ -1239,6 +1239,10 @@ fi
 [ -n "${UNAOS_SELFDIAG:-}" ] && _feats="${_feats}selfdiag,"
 # BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* to defaults at every login (the safe-mode boot knob; `[prefs] display reset=1 reason=knob`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_PREFS_RESET:-}" ] && _feats="${_feats}prefs_reset,"
+# PANICSCREEN (B406, R95): UNAOS_PANIC_HOLD=1 holds the plain panic screen for the bench (no countdown, no restart). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_PANIC_HOLD:-}" ] && _feats="${_feats}panic_hold,"
+# SMALLFIX2 (B391, R94 §3): UNAOS_SVG=1 arms SVG as a picture — pixel_core's `svg` format (svg_core) in the kernel, so `image/svg+xml` types and opens in facet. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_SVG:-}" ] && _feats="${_feats}svg,"
 # KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
 [ "${UNAOS_WC_BLITTER:-}" = "gpu" ] && _feats="${_feats}wc_gpublit,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
@@ -3770,14 +3774,14 @@ SELFBUILD_TCC_REV="43c7708b85681a2fd4451c8a541af4494a8919b2"
 SELFBUILD_BB_URL="https://github.com/mirror/busybox.git"
 SELFBUILD_BB_REV="371fe9f71d445d18be28c82a2a6d82115c8af19d"
 # SELFBUILD3 (B353): musl 1.2.5 (MIT) — tag v1.2.5 is this commit on every mirror; git.musl-libc.org and musl.libc.org are refused by
-# the egress proxy, so a GitHub mirror carries the fetch (the commit id pins the bytes). Built here, staged as DATA under /apps/LIB.
+# the egress proxy, so a GitHub mirror carries the fetch (the commit id pins the bytes). Built here, staged as DATA under /lib.
 SELFBUILD_MUSL_URL="https://github.com/kraj/musl.git"
 SELFBUILD_MUSL_REV="0784374d561435f7c787a555aeab8ede699ed298"
 _selfbuild_fetch() { # dir url rev
     [ -d "$1/.git" ] && [ "$(git -C "$1" rev-parse HEAD 2>/dev/null)" = "$3" ] && return 0
     rm -rf "$1" && mkdir -p "$1" && git -C "$1" init -q && git -C "$1" fetch -q --depth 1 "$2" "$3" && git -C "$1" checkout -q FETCH_HEAD
 }
-# SMALLFIX (B380): flight 23's bench staged no APPS/LIB, TCC.LNX, SYSKAT.LNX, LIB/dyn, LIB/rustc or LLD.LNX and no line said WHY
+# SMALLFIX (B380): flight 23's bench staged no LIB (now /lib), TCC.LNX, SYSKAT.LNX, LIB/dyn, LIB/rustc or LLD.LNX and no line said WHY
 # (no clang; the rustc fetch never ran because LIB/dyn gates it). Every selfbuild product that is not staged now prints ONE line,
 #   SELFBUILD<n>: not staged <product> reason=<tool missing: X | musl target missing | fetch failed <url> | sha256 mismatch <url> |
 #                                             build failed <step> | host proof failed <step> | needs <product> | UNAOS_…=0>
@@ -3819,7 +3823,7 @@ build_selfbuild_x86() {
     else
         _sb_skip 2 SYSKAT2.LNX "$(_sb_kat_why "$sb/SYSKAT2.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
     fi
-    # SELFBUILD3 (B353): the musl libc as DATA under /apps/LIB (crt1.o crti.o crtn.o libc.a + include/), built before tcc so tcc's
+    # SELFBUILD3 (B353): the musl libc as DATA under /lib (crt1.o crti.o crtn.o libc.a + include/), built before tcc so tcc's
     # libtcc1.a can be compiled against it. No egress = no LIB = `tests selfbuild3` reports libc=none tcc_libc=skip.
     local lib="${WORKSPACE_DIR}/target/LIB"
     if [ ! -f "$lib/libc.a" ]; then
@@ -3833,13 +3837,13 @@ build_selfbuild_x86() {
             _sb_skip 3 LIB "$(_sb_fetch_why "$sb/musl" "$SELFBUILD_MUSL_URL" "$SELFBUILD_MUSL_REV" "musl configure/make" make gcc)"; rm -rf "$lib"
         fi
     fi
-    # SELFBUILD1 tcc; SELFBUILD3 configures its search paths onto the volume: tccdir /apps/LIB/tcc ({B}), crt + libs {B}/.. = /apps/LIB,
+    # SELFBUILD1 tcc; SELFBUILD3 configures its search paths onto the volume: tccdir /lib/tcc ({B}), crt + libs {B}/.. = /lib,
     # headers {B}/../include (musl) then {B}/include (tcc's own) — so on UnaOS a bare `TCC.LNX -static -o prog prog.c` links musl, and
     # on the host `-B target/LIB/tcc` points the SAME binary at the staged tree (the host proof below). Rebuilt when LIB lacks libtcc1.a.
-    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; }; then
+    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; } || LC_ALL=C grep -a -q -F /apps/LIB/tcc "${WORKSPACE_DIR}/target/TCC.LNX"; then  # ROOTDISK (B390, R94): a TCC.LNX configured for /apps/LIB is rebuilt for /lib
         if _selfbuild_fetch "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" \
             && ( cd "$sb/tinycc" && ./configure --cc=gcc --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" \
-                   --tccdir=/apps/LIB/tcc --crtprefix='{B}/..' --libpaths='{B}:{B}/..' --sysincludepaths='{B}/../include:{B}/include' --config-musl >/dev/null \
+                   --tccdir=/lib/tcc --crtprefix='{B}/..' --libpaths='{B}:{B}/..' --sysincludepaths='{B}/../include:{B}/include' --config-musl >/dev/null \
                  && make -s tcc >/dev/null 2>&1 ); then
             strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
             if [ -f "$lib/libc.a" ]; then
@@ -3936,9 +3940,9 @@ build_selfbuild4_x86() {
 #   plugins, X86 only), stripped. It is a multi-flavour driver: `LLD.LNX -flavor gnu …` is ld.lld. Built ONCE (target/LLD.LNX is
 #   kept; ~1960 ninja steps, about an hour on 4 idle cores). `UNAOS_LLD_LNX=<path>` stages an operator-supplied static ld.lld
 #   instead; no egress / no cmake+ninja = LLD.LNX absent = `tests selfbuild5` reports lld=skip.
-# * target/LIB/rust (staged as /apps/LIB/rust): RUST.LNX's own objects from a rebuild of crates/user-linux-rust whose linker is a
+# * target/LIB/rust (staged as /lib/rust): RUST.LNX's own objects from a rebuild of crates/user-linux-rust whose linker is a
 #   recording wrapper around the toolchain's rust-lld, the std rlibs it links (lib.rmeta dropped, --strip-debug), the musl crt
-#   objects + libc.a + libunwind.a from the target's self-contained dir, and link.rsp = that exact ld.lld line with /apps/LIB/rust
+#   objects + libc.a + libunwind.a from the target's self-contained dir, and link.rsp = that exact ld.lld line with /lib/rust
 #   paths (`-flavor` and `-o` left to the caller). Host proof: LLD.LNX links the SAME response file (host paths) into a binary that
 #   prints `rust ok …`, or LIB/rust is not staged.
 SELFBUILD_LLVM_VER="22.1.8"
@@ -4051,10 +4055,10 @@ open(os.path.join(out, "link.rsp.in"), "w").write("\n".join(rsp) + "\n")
 PY
     then
         cp "$selfc/libc.a" "$selfc/libunwind.a" "$out/" && strip --strip-debug "$out/libc.a" "$out/libunwind.a"
-        sed "s|@LIB@|/apps/LIB/rust|g" "$out/link.rsp.in" > "$out/link.rsp"
+        sed "s|@LIB@|/lib/rust|g" "$out/link.rsp.in" > "$out/link.rsp"
         sed "s|@LIB@|$out|g" "$out/link.rsp.in" > "$rec/host.rsp"
         rm -f "$out/link.rsp.in"
-        printf 'RUST.LNX objects + std rlibs (rustc %s, x86_64-unknown-linux-musl; rmeta dropped, --strip-debug) + musl crt/libc.a/libunwind.a\nfrom the Rust target self-contained dir, for LLD.LNX -flavor gnu @/apps/LIB/rust/link.rsp -o <out> (SELFBUILD5, B357)\n' \
+        printf 'RUST.LNX objects + std rlibs (rustc %s, x86_64-unknown-linux-musl; rmeta dropped, --strip-debug) + musl crt/libc.a/libunwind.a\nfrom the Rust target self-contained dir, for LLD.LNX -flavor gnu @/lib/rust/link.rsp -o <out> (SELFBUILD5, B357)\n' \
             "$(rustc +nightly -V | awk '{print $2, $3, $4}')" > "$out/RUST.TXT"
         # Host proof: the staged linker (or rust-lld when LLD.LNX is absent) links the staged inputs into a program that runs.
         local hl="$lld"; [ -f "$hl" ] || hl="$rlld"
@@ -4078,11 +4082,11 @@ PY
 # SELFBUILD6 (B360): DYNAMIC Linux programs through the shared loader core (unaos/libs/sys/ldso_core; the kernel's
 # linuxabi/ldso.rs and the host runner `ldrun` link the same core), then the musl-host rustc. Every product is proven on the HOST
 # kernel by `ldrun` before it is staged:
-# * target/LIB/dyn (staged as /apps/LIB/dyn, the kernel loader's search dir): libc.so + libgcc_s.so.1 (+ libgcc_s.so, the
+# * target/LIB/dyn (staged as /lib/dyn, the kernel loader's search dir): libc.so + libgcc_s.so.1 (+ libgcc_s.so, the
 #   link-time name) relinked -shared from the Rust musl target's self-contained libc.a (+ libgcc.a's complex-multiply helpers) and
 #   libunwind.a (+ fixtures/dyn/gcc_helpers.c), each with --eh-frame-hdr (without PT_GNU_EH_FRAME the unwinder cannot find its
 #   own frames and every rustc panic aborts); and the dyn probe (fixtures/dyn: hello PIE + libdyn.so + libplug.so).
-# * target/LIB/rustc (staged as /apps/LIB/rustc) BY DEFAULT (R87; UNAOS_SELFBUILD6_RUSTC=0 opts out; about 420 MB on the ESP): upstream's
+# * target/LIB/rustc (staged as /lib/rustc) BY DEFAULT (R87; UNAOS_SELFBUILD6_RUSTC=0 opts out; about 420 MB on the ESP): upstream's
 #   musl-host rustc for the pinned nightly (fetched here, sha256 pinned below; payload never in git), librustc_driver stripped of
 #   debug info and the static symbol table (301 MB -> 232 MB; the dynamic tables and relocations are untouched), the musl
 #   rust-lld, the x86_64-unknown-linux-musl std rlibs of the SAME build (the host toolchain's when its commit matches, else the
@@ -4244,6 +4248,18 @@ build_user_prefs_x86() {
 # VA (user-lumen-x86.ld, the user-big shape: no PHDRS, so lld fills PT_GNU_STACK from -z stack-size) — the
 # BIGAPPS relink RING3WIN owed for LUMEN. target/LUMEN-X86.ELF, staged by the builder as APPS/LUMEN.ELF.
 # Inert until launched (`lumen`); UNAOS_LUMEN=1 adds the dock pin and the `tests lumen` fixture.
+# APPRES (rmbp-ledger B398): stamp a program's RESOURCES (name, signature, version, kind, icon, doc types) into
+# its stripped ELF as the non-alloc note section `.note.unaos.res` — `tools/una-res stamp <crate>/res <elf>`,
+# version suffixed with $UNAOS_GIT_SHA. A crate with no `res/` dir is left as it is (the kernel's registrar
+# gives it the generic icon and its file name). Called after the strip by every build_user_*_x86 whose crate
+# may carry one.
+una_res_stamp() {
+    local crate_dir="$1" elf="$2"
+    [ -d "${crate_dir}/res" ] || return 0
+    ( cd "${WORKSPACE_DIR}/.." && cargo run --release -q -p una-res -- stamp "${crate_dir}/res" "$elf" ) \
+      || { echo -e "${COLOR_RED}ERROR: una-res could not stamp ${elf}${COLOR_RESET}"; exit 1; }
+}
+
 build_user_lumen_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Lumen app (crates/user-lumen → target/LUMEN-X86.ELF, ELF window)...${COLOR_RESET}"
@@ -4260,6 +4276,7 @@ build_user_lumen_x86() {
     local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" | tr -d ' \n')"
     [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
     user_elf_window_check "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" "LUMEN-X86.ELF"
+    una_res_stamp "${WORKSPACE_DIR}/crates/user-lumen" "${WORKSPACE_DIR}/target/LUMEN-X86.ELF"  # APPRES (B398): Lumen's icon, name, signature, version
     echo -e "${COLOR_GREEN}✅ x86 ring-3 Lumen app: LUMEN-X86.ELF${COLOR_RESET}"
 }
 
@@ -9024,6 +9041,18 @@ BRACEPY
         [ "$_chrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a kernel file declares no owning handler, or writes a dotfile off the allowlist (see GATE-CHARTER above)${COLOR_RESET}"; return 1; }
     fi
 
+    # GATE-STATUS (STATUSTABLE, B425, 2026-10-06; Peter: "one status table to rule them all so a false claim
+    #   ... can never be made"): every flew/unflown/confirmed/refuted claim in a ledger status cell or a queue
+    #   STATE line cites an ST<n> row of docs/dev/STATUS.tsv, and a confirmed/refuted row's quoted line is found
+    #   byte for byte on its flight's capture. `--selftest` first: a fixture line in no log must FAIL.
+    local _strc=0
+    python3 "$WORKSPACE_DIR/../tools/status-check.py" --selftest >/dev/null || _strc=2
+    [ "$_strc" -eq 0 ] && { python3 "$WORKSPACE_DIR/../tools/status-check.py" || _strc=1; }
+    if [ "$_strc" -ne 0 ]; then
+        [ "$_strc" -eq 2 ] && echo -e "${COLOR_RED}❌ status gate gave NO VERDICT — its selftest fixtures did not go red, which is not a clean tree${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ check FAILED — a status word cites no ST row, or a row's wire line is not on its flight's capture (see GATE-STATUS above)${COLOR_RESET}"; return 1
+    fi
+
     # GATE-TESTROOTS (TESTROOTS, rmbp, 2026-09-16): GATE-ROOTS' shape applied to the THIRD kind of
     # root, and the CLASS that GATE-FOREMAN one leg above closed for exactly one file. A `#[test]`
     # is nobody's dependency either — `cargo build` never compiles it and no kernel leg links it —
@@ -9245,15 +9274,28 @@ pack_source_along() {
 # target/unaos-x86-card.img, GPT: p1 = EFI System FAT32 (the ESP tree + the data tree, so the firmware
 # still finds the ESP as partition 1 and the kernel mounts it at /boot and /apps), p2 = a `tools/unafs
 # init` volume the kernel's `locate_unafs` finds by superblock magic and `bind_root` makes `/`.
-# UNAOS_X86_UNAFS_MB sizes p2 (default 512, capped at 2048 per LAWS' 2 GiB image cap). Write the
+# p2 is sized by ROOTDISK2 below (content + headroom, floor 4096 MiB; UNAOS_X86_UNAFS_MB raises it). Write the
 # whole image to the card (`dd`), not the trees. Boot witness:
 #   :: UNAFSX86: root=unafs disk=<source> blocks=<n> gen=<g> home=/home -> PASS ::
+# ROOTDISK2 (rmbp-ledger B401, R94 "where the new folder is for real"): /apps and /lib live ON the UnaFS volume — the
+# ESP's APPS/ (+ the data tree's APPS/, which mcopy used to merge over it), LIB/ and system/ (R99) are put recursively
+# into /apps, /lib and /system, and `una-card --skip APPS --skip LIB --skip system` leaves them off p1. unafs_mb is DERIVED: content + 25% + 512 MiB headroom,
+# floor 4096 (the card is 64 GB; LIB/rustc alone is ~420 MB); UNAOS_X86_UNAFS_MB raises it, never lowers it below the
+# content. una-card copies p2 sparse. Boot witness: `[vfs] apps+lib on the native root …`; `tests rootdisk` →
+#   :: ROOTDISK2: apps=unafs lib=unafs links=volumes-only rmdir=ok image_mb=<n> -> PASS ::
 esp_x86_unafs_card() {
-    local unafs_mb="${UNAOS_X86_UNAFS_MB:-512}"
-    if [ "$unafs_mb" -gt 2048 ] 2>/dev/null; then
-        echo -e "${COLOR_YELLOW}⚠ UNAOS_X86_UNAFS_MB=${unafs_mb} capped at 2048 (the 2 GiB image cap)${COLOR_RESET}"
-        unafs_mb=2048
+    local esp_t="${WORKSPACE_DIR}/target/x86_64_esp" data_t="${WORKSPACE_DIR}/target/x86_64_data"
+    local content_kb=0 d
+    for d in "$esp_t/APPS" "$data_t/APPS" "$esp_t/LIB" "$esp_t/system" "$data_t/system"; do
+        [ -d "$d" ] && content_kb=$(( content_kb + $(du -sk "$d" | cut -f1) ))
+    done
+    local content_mb=$(( content_kb / 1024 ))
+    local unafs_mb=$(( content_mb + content_mb / 4 + 512 ))
+    [ "$unafs_mb" -lt 4096 ] && unafs_mb=4096
+    if [ -n "${UNAOS_X86_UNAFS_MB:-}" ] && [ "${UNAOS_X86_UNAFS_MB}" -gt "$unafs_mb" ] 2>/dev/null; then
+        unafs_mb="${UNAOS_X86_UNAFS_MB}"
     fi
+    echo -e "${COLOR_YELLOW}⚡ ROOTDISK2: UnaFS volume ${unafs_mb} MiB (content ${content_mb} MiB: apps + lib + system; floor 4096)${COLOR_RESET}"
     local vol="${WORKSPACE_DIR}/target/unafs-x86.img"
     local card="${WORKSPACE_DIR}/target/unaos-x86-card.img"
     local UNAFS_CLI_MANIFEST="${WORKSPACE_DIR}/../tools/unafs/Cargo.toml"
@@ -9261,20 +9303,37 @@ esp_x86_unafs_card() {
     rm -f "$vol" "$card"
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$vol" -s "$unafs_mb" || {
         echo -e "${COLOR_RED}❌ UNAFSX86: tools/unafs init failed — no card image${COLOR_RESET}"; return 1; }
-    # VOLUMES (B366) M3: the builder's system/test-f (free format samples, builder/testf.list) onto the UnaFS root, so
-    # /system/test-f is on the volume `/` is — `tests testf` / `tests play` find it there before /boot/system/test-f.
-    local testf_dir="${WORKSPACE_DIR}/target/x86_64_data/system/test-f"
-    if [ -d "$testf_dir" ]; then
-        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- mkdir /system/test-f -i "$vol" >/dev/null || {
-            echo -e "${COLOR_RED}❌ VOLUMES: tools/unafs mkdir /system/test-f failed — no card image${COLOR_RESET}"; return 1; }
-        local tf_n=0 tf
-        for tf in "$testf_dir"/*; do
-            [ -f "$tf" ] || continue
-            cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$tf" /system/test-f -i "$vol" >/dev/null || {
-                echo -e "${COLOR_RED}❌ VOLUMES: tools/unafs put ${tf##*/} failed — no card image${COLOR_RESET}"; return 1; }
-            tf_n=$((tf_n + 1))
+    # ROOTDISK2 (B401): the programs and the libraries onto the volume `/` is — real directories, not ESP links.
+    # R99 ("the boot fat partition is sacred"): `system/` too (fonts, witness-owners.txt, and VOLUMES' test-f — the
+    # builder's free format samples, builder/testf.list — which used to be put file by file); the kernel reads
+    # /system/fonts and /system/test-f first. p1 keeps the loader, the kernel, the firmware blobs and the EL0 fixtures.
+    local src dst
+    for src in "$esp_t/APPS:/apps" "$data_t/APPS:/apps" "$esp_t/LIB:/lib" "$esp_t/system:/system" "$data_t/system:/system"; do
+        dst="${src##*:}"; src="${src%:*}"
+        [ -d "$src" ] || continue
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$src" "$dst" -i "$vol" || {
+            echo -e "${COLOR_RED}❌ ROOTDISK2: tools/unafs put ${src#${WORKSPACE_DIR}/} -> ${dst} failed — no card image${COLOR_RESET}"; return 1; }
+    done
+    # WIFI-FW (R95/Peter 2026-10-06 "we have the bunker for this"): the BCM4331 b43 firmware set is BENCH-ONLY and never
+    # in-tree (CLEAN_ROOM_POLICY §4; bcm4331.md §S4 option 1). UNAOS_WIFI_FW_PATH=<absolute dir in the bunker> holding
+    # ucode29_mimo.fw + ht0initvals29.fw + ht0bsinitvals29.fw stages the three files onto the UnaFS root at /FIRMWARE/
+    # (one of the three dirs the kernel's WIFI-1 pass searches — /, /B43/, /FIRMWARE/ — on the program-source volume),
+    # so the dd carries them. Unset => nothing staged, the image byte-identical; set but not absolute, unreadable, or a
+    # file missing => the build FAILS LOUDLY naming it (the same rule as UNAOS_XUSB_FW_PATH). No copy lands in the tree.
+    # Re-added at merge17 after ROOTDISK2 rewrote this build (the block had landed at bbecdc12 on the dev branch).
+    if [ -n "${UNAOS_WIFI_FW_PATH:-}" ]; then
+        case "$UNAOS_WIFI_FW_PATH" in /*) ;; *) echo -e "${COLOR_RED}❌ WIFI-FW: UNAOS_WIFI_FW_PATH must be absolute: ${UNAOS_WIFI_FW_PATH}${COLOR_RESET}"; return 1;; esac
+        local fw
+        for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do
+            [ -r "${UNAOS_WIFI_FW_PATH}/${fw}" ] || { echo -e "${COLOR_RED}❌ WIFI-FW: ${UNAOS_WIFI_FW_PATH}/${fw} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
         done
-        echo -e "${COLOR_GREEN}  • TEST-F: ${tf_n} file(s) onto the UnaFS root at /system/test-f (VOLUMES, B366)${COLOR_RESET}"
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- mkdir /FIRMWARE -i "$vol" >/dev/null || {
+            echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs mkdir /FIRMWARE failed — no card image${COLOR_RESET}"; return 1; }
+        for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do
+            cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${UNAOS_WIFI_FW_PATH}/${fw}" /FIRMWARE -i "$vol" >/dev/null || {
+                echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs put ${fw} failed — no card image${COLOR_RESET}"; return 1; }
+        done
+        echo -e "${COLOR_YELLOW}⚡ WIFI-FW: b43 set (3 files) from ${UNAOS_WIFI_FW_PATH} onto the UnaFS root at /FIRMWARE/ (bench-only, never in-tree)${COLOR_RESET}"
     fi
     # WIFI-FW (R95/Peter 2026-10-06 "we have the bunker for this"): the BCM4331 b43 firmware set is BENCH-ONLY and never
     # in-tree (CLEAN_ROOM_POLICY §4; bcm4331.md §S4 option 1). UNAOS_WIFI_FW_PATH=<absolute dir in the bunker> holding
@@ -9300,12 +9359,12 @@ esp_x86_unafs_card() {
     # kernel's `install ssd --write` lays the SSD with (it replaced scripts/make-x86-card.py, byte-identical).
     cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/una-card/Cargo.toml" -- \
         --esp "${WORKSPACE_DIR}/target/x86_64_esp" --data "${WORKSPACE_DIR}/target/x86_64_data" \
-        --unafs "$vol" -o "$card" || {
+        --skip APPS --skip LIB --skip system --unafs "$vol" -o "$card" || {
         echo -e "${COLOR_RED}❌ UNAFSX86: tools/una-card failed — no card image${COLOR_RESET}"; return 1; }
     rm -f "$vol"
     echo -e "${COLOR_GREEN}✅ x86 CARD (UnaFS root): ${card}${COLOR_RESET}"
     echo -e "   sha256: $(sha256_of "$card")"
-    echo -e "   p1 = ESP (FAT32, boot + data trees) · p2 = UnaFS system volume (${unafs_mb} MiB) — dd the whole image"
+    echo -e "   p1 = ESP (FAT32, loader + kernel + firmware + EL0 fixtures; R99: no APPS/LIB/system) · p2 = UnaFS system volume (${unafs_mb} MiB: /apps /lib /system) — dd the whole image"
 }
 
 # KERNELFONT2 (rmbp-ledger B363, R85 item 12: "fonts-noto-core on the builder host"): the four Noto script faces
@@ -11700,9 +11759,17 @@ kernel8() {
         K8_FEATS="${K8_FEATS},selfdiag"
         echo -e "${COLOR_YELLOW}  • UNAOS_SELFDIAG: SELFDIAG — the boot log on disk + tests selfdiag (SYS_PATH_READ/WRITE and DIAG.ELF are x86's)${COLOR_RESET}"
     fi
+    if [ -n "${UNAOS_PANIC_HOLD:-}" ]; then
+        K8_FEATS="${K8_FEATS},panic_hold"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PANIC_HOLD: PANICSCREEN bench hold — the panic screen stays, no restart${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_PREFS_RESET:-}" ]; then
         K8_FEATS="${K8_FEATS},prefs_reset"
         echo -e "${COLOR_YELLOW}  • UNAOS_PREFS_RESET: BRIGHTFLOOR safe mode — system.display.* reset to defaults at every login${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_SVG:-}" ]; then
+        K8_FEATS="${K8_FEATS},svg"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SVG: SMALLFIX2 — SVG opens as a picture (pixel_core svg / svg_core)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"

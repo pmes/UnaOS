@@ -49,6 +49,8 @@ pub const IMAGE_JPEG: &str = "image/jpeg";
 pub const IMAGE_BMP: &str = "image/bmp";
 pub const IMAGE_WEBP: &str = "image/webp";
 pub const IMAGE_QOI: &str = "image/qoi";
+/// SMALLFIX2 (B391, R94): pixel_core's SVG type (`pixel_core::mime_of` under the `svg` feature).
+pub const IMAGE_SVG: &str = "image/svg+xml";
 pub const AUDIO_FLAC: &str = "audio/flac";
 pub const AUDIO_OGG: &str = "audio/ogg";
 pub const AUDIO_MPEG: &str = "audio/mpeg";
@@ -116,6 +118,7 @@ pub const EXT_TABLE: &[(&str, &str)] = &[
     ("bmp", IMAGE_BMP),
     ("webp", IMAGE_WEBP),
     ("qoi", IMAGE_QOI),
+    ("svg", IMAGE_SVG), // SMALLFIX2 (B391): the bytes speak first — without the `svg` feature an .svg sniffs as its text
     ("flac", AUDIO_FLAC),
     ("ogg", AUDIO_OGG),
     ("oga", AUDIO_OGG),
@@ -433,9 +436,11 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("filetype", selftest);
+        crate::fs::attrfacts::ensure_tests(); // ATTRCOLUMNS (B402): `tests attrcolumns` rides this registration
         // QUARRY2 (B336): `tests quarry2` rides this registration (no tests.rs line).
         #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
         crate::video::quarry::live::columns::ensure_tests();
+        #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::quarry::live::quarry3_tests(); crate::fs::appres::ensure_tests(); // QUARRY3 (B413): `tests quarry3` rides this registration too. APPRES (B398): `tests appres` rides this registration (no tests.rs line).
     }
 }
 

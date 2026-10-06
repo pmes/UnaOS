@@ -125,7 +125,7 @@ use super::super::{fbcon, font, theme, wm};
 use crate::fs::users;
 
 const W: usize = 440;
-const H: usize = 240;
+const H: usize = 300; // DIALOG2 (B404): +60 for the power row (Sleep · Restart · Shut Down) under the form
 /// LOGINFONT (R64: *"the font in the login window was super huge and blocky"*) — the screen's text is the
 /// shared anti-aliased face (`video/font.rs`, the one Quarry took in QUARRYFONT), not font8x8 at 2x. The
 /// vertical rhythm stays 16 px (`Face::Body.cell_h()` is `CELL_H` = 16, what the 2x cell was); the
@@ -162,8 +162,6 @@ enum State {
     Session,
     /// LOGIN14: the set-password form is up for `Form::name` (root's at boot, a user's at first login).
     SetPw,
-    /// LOGOUTUI (R70): a refused Log Out says why — one line of `Form::message` and an OK, the set-password screen's shape.
-    Alert,
     /// FIRSTBOOT (R77): the create-user form — name, password, retype — the Installer's second screen.
     CreateUser,
 }
@@ -194,7 +192,7 @@ struct Form {
     windowed: bool,
 }
 
-static FORM: spin::Mutex<Form> = spin::Mutex::new(Form {
+static FORM: crate::sync::Mutex<Form> = crate::sync::Mutex::new(Form {
     state: State::Closed,
     focus: Focus::Name,
     name: [0; FIELD_MAX],
@@ -256,8 +254,8 @@ enum Ctl {
     /// A user's row: the screen SHOWS who lives on this machine (the Mac model), and a press picks
     /// that name into the field and moves to the password. The `usize` is the store's row index.
     User(usize),
-    /// LOGOUTUI: the alert's OK — a press IS [`alert_ok`], the same call Enter and Esc make.
-    AlertOk,
+    /// DIALOG2 (B404, MACPARITY row 33): the power row under the password field — 0 Sleep, 1 Restart, 2 Shut Down.
+    Power(u8),
 }
 
 const LX: usize = 24;
@@ -273,6 +271,13 @@ const FIELD_W: usize = W - 2 * LX - 100;
 const FIELD_H: usize = CELL + 8;
 const BTN_W: usize = 120;
 const BTN_H: usize = 28;
+/// DIALOG2: the power row — three buttons centred along the bottom of the log-in form.
+const PWR_W: usize = 96;
+const PWR_H: usize = 26;
+const PWR_GAP: usize = 12;
+const PWR_X: usize = (W - (3 * PWR_W + 2 * PWR_GAP)) / 2;
+const PWR_Y: usize = 238;
+const PWR_LABEL: [&[u8]; 3] = [b"Sleep", b"Restart", b"Shut Down"];
 
 /// SECLOGIN M6 — THE ROSTER POLICY. Names on the pre-session glass are a THEME/POLICY choice, not a
 /// mechanism: the Mac model shows who lives on the machine (the name field becomes optional for the
@@ -305,7 +310,8 @@ fn ctl_rect(c: Ctl, setpw: bool) -> (usize, usize, usize, usize) {
         (Ctl::PwField, false) => (FIELD_X, 112, FIELD_W, FIELD_H),
         (Ctl::PwField, true) => (FIELD_X, 76, FIELD_W, FIELD_H),
         (Ctl::Pw2Field, true) => (FIELD_X, 112, FIELD_W, FIELD_H),
-        (Ctl::Button, _) | (Ctl::AlertOk, _) => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+        (Ctl::Button, _) => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+        (Ctl::Power(i), false) if i < 3 => (PWR_X + i as usize * (PWR_W + PWR_GAP), PWR_Y, PWR_W, PWR_H),
         _ => (0, 0, 0, 0),
     }
 }
@@ -347,7 +353,7 @@ fn ctl_at(lx: i32, ly: i32, setpw: bool) -> Option<Ctl> {
     if setpw {
         return [Ctl::PwField, Ctl::Pw2Field, Ctl::Button].into_iter().find(|&c| inside(c));
     }
-    for c in [Ctl::NameField, Ctl::PwField, Ctl::Button] {
+    for c in [Ctl::NameField, Ctl::PwField, Ctl::Button, Ctl::Power(0), Ctl::Power(1), Ctl::Power(2)] {
         if inside(c) {
             return Some(c);
         }
@@ -364,7 +370,9 @@ fn ctl_name(c: Option<Ctl>) -> &'static str {
         Some(Ctl::Button) => "button",
         Some(Ctl::Pw2Field) => "retype-field",
         Some(Ctl::User(_)) => "user-row",
-        Some(Ctl::AlertOk) => "alert-ok",
+        Some(Ctl::Power(0)) => "power-sleep",
+        Some(Ctl::Power(1)) => "power-restart",
+        Some(Ctl::Power(_)) => "power-shutdown",
         None => "none",
     }
 }
@@ -415,18 +423,18 @@ fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
 }
 
 fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: bool, secret: bool) {
-    fill(px, x, y, w, CELL + 8, theme::CONTENT_FILL);
-    rect(px, x, y, w, CELL + 8, if focused { theme::ACCENT } else { theme::FRAME_LINE });
+    fill(px, x, y, w, CELL + 8, theme::content_fill());
+    rect(px, x, y, w, CELL + 8, if focused { theme::accent() } else { theme::frame_line() });
     let n = content.len().min(FIELD_MAX);
     if secret {
         let dots = [b'*'; FIELD_MAX];
-        text(px, x + 6, y + 4, &dots[..n], theme::CONTENT_TEXT);
+        text(px, x + 6, y + 4, &dots[..n], theme::content_text());
     } else {
-        text(px, x + 6, y + 4, content, theme::CONTENT_TEXT);
+        text(px, x + 6, y + 4, content, theme::content_text());
     }
     if focused {
         let cx = x + 6 + if secret { super::super::metrics::ladvance(&[b'*'; FIELD_MAX][..n], false, FACE) } else { super::super::metrics::ladvance(&content[..n], false, FACE) }; // KERNELFONT: the caret sits at the shaped advance. LOGINFONT: the caret sits at the face's advance, not the old square cell
-        fill(px, cx, y + 4, 2, CELL, theme::CONTENT_TEXT);
+        fill(px, cx, y + 4, 2, CELL, theme::content_text());
     }
 }
 
@@ -436,12 +444,12 @@ fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: 
 /// password has no reason to know it is the only way in.
 fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
     let (x, y, w, h) = ctl_rect(c, setpw);
-    fill(px, x, y, w, h, if primary { theme::ACCENT } else { theme::BUTTON_FACE });
-    rect(px, x, y, w, h, theme::FRAME_LINE);
+    fill(px, x, y, w, h, if primary { theme::accent() } else { theme::button_face() });
+    rect(px, x, y, w, h, theme::frame_line());
     let tw = super::super::metrics::ladvance(label, false, FACE); // KERNELFONT: the shaped width. LOGINFONT
     let tx = x + w.saturating_sub(tw) / 2;
     let ty = y + h.saturating_sub(CELL) / 2;
-    text(px, tx, ty, label, if primary { theme::BEVEL_LIGHT } else { theme::BUTTON_TEXT });
+    text(px, tx, ty, label, if primary { theme::bevel_light() } else { theme::button_text() });
 }
 
 /// LOGINFLOW M1 — one user's row. The screen says WHO lives on this machine, which is the Mac model
@@ -451,11 +459,13 @@ fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
 /// wire line for a press on one says `user-row` and an INDEX, never the name.
 fn user_row(px: &mut [u32], i: usize, name: &[u8], picked: bool) {
     let (x, y, w, h) = ctl_rect(Ctl::User(i), false);
-    fill(px, x, y, w, h, if picked { theme::ACCENT } else { theme::CONTENT_FILL });
-    rect(px, x, y, w, h, if picked { theme::ACCENT } else { theme::FRAME_LINE });
+    fill(px, x, y, w, h, if picked { theme::accent() } else { theme::content_fill() });
+    rect(px, x, y, w, h, if picked { theme::accent() } else { theme::frame_line() });
     let max = crate::video::text::fit(name, false, FACE, super::super::metrics::size(w - 12)); // UIMETRICS: the physical width // KERNELFONT: whole glyphs that fit. LOGINFONT
+    let ax = super::loginwindow::avatar(&mut |ax, ay, aw, ah, c| fill(px, ax, ay, aw, ah, c), x + 3, y + 3, h.saturating_sub(6), picked); // FIRSTUSER (R100): the generic avatar on every user tile (`loginwindow.rs`)
+    let max = max.min(crate::video::text::fit(name, false, FACE, super::super::metrics::size(w.saturating_sub(12 + ax)))); // FIRSTUSER: the name fits beside the avatar
     let n = name.len().min(max);
-    text(px, x + 6, y + 4, &name[..n], if picked { theme::BEVEL_LIGHT } else { theme::CONTENT_TEXT });
+    text(px, x + 6 + ax, y + 4, &name[..n], if picked { theme::bevel_light() } else { theme::content_text() });
 }
 
 fn repaint() {
@@ -465,43 +475,27 @@ fn repaint() {
     }
     // SAFETY: see `SURF`.
     let px: &mut [u32] = surf();
-    fill(px, 0, 0, W, H, theme::CHROME_FACE);
-    rect(px, 2, 2, W - 4, H - 4, theme::FRAME_LINE);
-    if f.state == State::Alert {
-        // LOGOUTUI (R70): the alert — "Log Out", one line of the reason, OK.
-        let n = notice_current(); // NOTICE: title + up to two lines of the notice on the glass
-        text(px, LX, 14, n.title(), theme::CONTENT_TEXT);
-        fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
-        text(px, LX, 76, n.line(0), theme::ACCENT);
-        text(px, LX, 100, n.line(1), theme::ACCENT);
-        button(px, Ctl::AlertOk, b"OK", true, false);
-        text(px, LX, 186, if ALERT_PREV.load(Ordering::Relaxed) == 0 { b"OK, or it closes itself" as &[u8] } else { b"Enter, Esc or OK" }, theme::TITLE_TEXT_INACTIVE); // CONSOLEFIX M2: a session notice takes no keys
-        drop(f);
-        let id = WIN.load(Ordering::Relaxed);
-        if id != wm::WIN_NONE {
-            let _ = wm::present(id);
-        }
-        return;
-    }
+    fill(px, 0, 0, W, H, theme::chrome_face());
+    rect(px, 2, 2, W - 4, H - 4, theme::frame_line());
     if f.state == State::CreateUser {
         // FIRSTBOOT (R77): "Create your account" — name, password, retype, Create.
-        text(px, LX, 14, b"Create your account", theme::CONTENT_TEXT);
-        fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
+        text(px, LX, 14, b"Create your administrator account", theme::content_text()); // FIRSTUSER (R100): the first user is the administrator
+        fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
         let (nx, ny, nw, _) = cu_rect(Ctl::NameField);
-        text(px, LX, ny + 4, b"Name", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, ny + 4, b"Name", theme::title_text_inactive());
         field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
         let (pxf, py, pwf, _) = cu_rect(Ctl::PwField);
-        text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, py + 4, b"Password", theme::title_text_inactive());
         field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
         let (p2x, p2y, p2w, _) = cu_rect(Ctl::Pw2Field);
-        text(px, LX, p2y + 4, b"Retype", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, p2y + 4, b"Retype", theme::title_text_inactive());
         field(px, p2x, p2y, p2w, &f.pw2[..f.pw2_len], f.focus == Focus::Retype, true);
         let (bx, by, _, _) = cu_rect(Ctl::Button);
         let _ = (bx, by);
         button(px, Ctl::Button, b"Create", true, false);
-        text(px, LX, 186, b"Enter or Create   Tab switches", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, 186, b"Enter or Create   Tab switches", theme::title_text_inactive());
         if !f.message.is_empty() {
-            text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
+            text(px, LX, 212, f.message.as_bytes(), theme::accent());
         }
         drop(f);
         let id = WIN.load(Ordering::Relaxed);
@@ -516,19 +510,19 @@ fn repaint() {
         title[..19].copy_from_slice(b"Set a password for ");
         let n = f.name_len.min(users::NAME_MAX);
         title[19..19 + n].copy_from_slice(&f.name[..n]);
-        text(px, LX, 14, &title[..19 + n], theme::CONTENT_TEXT);
-        fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
+        text(px, LX, 14, &title[..19 + n], theme::content_text());
+        fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
         let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField, true);
-        text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, py + 4, b"Password", theme::title_text_inactive());
         field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
         let (p2x, p2y, p2w, _) = ctl_rect(Ctl::Pw2Field, true);
-        text(px, LX, p2y + 4, b"Retype", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, p2y + 4, b"Retype", theme::title_text_inactive());
         field(px, p2x, p2y, p2w, &f.pw2[..f.pw2_len], f.focus == Focus::Retype, true);
         button(px, Ctl::Button, b"Set", true, true);
         let hint: &[u8] = b"Enter or Set   Tab switches";
-        text(px, LX, 186, hint, theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, 186, hint, theme::title_text_inactive());
         if !f.message.is_empty() {
-            text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
+            text(px, LX, 212, f.message.as_bytes(), theme::accent());
         }
         drop(f);
         let id = WIN.load(Ordering::Relaxed);
@@ -541,8 +535,8 @@ fn repaint() {
     // create-first-user title, button label and hint that keyed on `users::count() == 0` are gone.
     let locked = LOCKED.load(Ordering::Relaxed);
     let title: &[u8] = if locked { b"Locked" } else { b"Log in to UnaOS" };
-    text(px, LX, 14, title, theme::CONTENT_TEXT);
-    fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
+    text(px, LX, 14, title, theme::content_text());
+    fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
     // The user rows, when there are users. `name_at` is the store's own accessor, so the row a press
     // picks and the row the painter draws are the same row by construction — the `ctl_rect` argument
     // one layer up, applied to the CONTENT as well as to the geometry.
@@ -552,24 +546,26 @@ fn repaint() {
             user_row(px, i, &nb[..n], f.name_len == n && f.name[..n] == nb[..n]);
         }
     }
+    if locked { if let Some(n) = users::whoami(&mut nb) { user_row(px, 0, &nb[..n], true); } } // FIRSTUSER (R100): the lock screen has the login window's look — the session's own tile and avatar
     let (nx, ny, nw, _) = ctl_rect(Ctl::NameField, false);
-    text(px, LX, ny + 4, b"Name", theme::TITLE_TEXT_INACTIVE);
+    text(px, LX, ny + 4, b"Name", theme::title_text_inactive());
     field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
     let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField, false);
-    text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
-    field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
+    text(px, LX, py + 4, b"Password", theme::title_text_inactive());
+    field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password && PFOCUS.load(Ordering::Relaxed) == 0, true);
     button(px, Ctl::Button, if locked { b"Unlock" } else { b"Log In" }, true, false);
+    power_row(px);
     let hint: &[u8] = b"Enter or Log In   Tab switches";
-    text(px, LX, 186, hint, theme::TITLE_TEXT_INACTIVE);
+    text(px, LX, 186, hint, theme::title_text_inactive());
     if !f.message.is_empty() {
-        text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
+        text(px, LX, 212, f.message.as_bytes(), theme::accent());
     } else if !locked {
         // BRIGHTFLOOR M5 — the safe-mode escape, in small text on the footer (`settings::safe_mode_check`).
         let fy = H.saturating_sub(super::super::metrics::lcell_h(crate::video::text::Face::Chrome) + 4); // UIMETRICS: the chrome cell in logical px
         const LONG: &[u8] = b"hold Shift after login to reset display settings";
         const SHORT: &[u8] = b"Shift after login: reset display";
         let msg = if LX + super::super::metrics::ladvance(LONG, false, crate::video::text::Face::Chrome) <= W { LONG } else { SHORT };
-        let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, LX, fy, msg, theme::TITLE_TEXT_INACTIVE, false, crate::video::text::Face::Chrome);
+        let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, LX, fy, msg, theme::title_text_inactive(), false, crate::video::text::Face::Chrome);
     }
     drop(f);
     let id = WIN.load(Ordering::Relaxed);
@@ -635,15 +631,14 @@ pub fn open_set_password(name: &[u8], login_after: bool) {
 pub fn open_create_user() {
     FORM.lock().state = State::Closed;
     open_as(State::CreateUser);
-    serial_println!("[login] installer: create-user form open (R77: name, password, retype; the adduser path; the desktop ignites for that user)");
+    serial_println!("[login] installer: first-user form open (R100: name, password, retype; that user is the administrator; root is locked; the desktop ignites for them)");
     repaint();
 }
 
 fn open_as(state: State) {
-    if state != State::Alert && notice_nonmodal() { notice_yield(); } // CONSOLEFIX M2: a session notice never blocks the screen opening — it steps aside (requeued) and the form opens
     {
         let mut f = FORM.lock();
-        if f.state == State::Open || f.state == State::SetPw || f.state == State::Alert || f.state == State::CreateUser {
+        if f.state == State::Open || f.state == State::SetPw || f.state == State::CreateUser {
             return;
         }
         f.state = state;
@@ -686,8 +681,7 @@ fn open_as(state: State) {
     // argument gives the login screen a close box and gives a one-click route to a machine with no
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
-    let nt = notice_current(); // NOTICE: the alert's window is titled by the notice
-    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::CreateUser { b"Create account" } else if state == State::Alert { nt.title() } else { b"Log in" };
+    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::CreateUser { b"Create account" } else { b"Log in" };
     let id = wm::create_at_native(OWNER, surf, sw * sh * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
@@ -695,12 +689,12 @@ fn open_as(state: State) {
         crate::splash::hold_release("first-screen");
         return;
     }
-    let nonmodal = state == State::Alert && ALERT_PREV.load(Ordering::Relaxed) == 0; WIN.store(id, Ordering::Relaxed); crate::boot::note_screen(true); if !nonmodal { wm::set_modal_top(id); } // CONSOLEFIX M2: a session notice is NOT pinned. LOGINZ (B223): the screen and the alert are the ceiling — a later create or focus-raise cannot pass them (flight 15 §2: "the pw dialog got covered up")
+    WIN.store(id, Ordering::Relaxed); crate::boot::note_screen(true); wm::set_modal_top(id); PFOCUS.store(0, Ordering::Relaxed); // DIALOG2 (B404): the login Alert window is gone, so every row this opens is the screen. LOGINZ (B223): the screen and the alert are the ceiling — a later create or focus-raise cannot pass them (flight 15 §2: "the pw dialog got covered up")
     wm::winid_register_holder(&WIN, "login");
     // Modal over the glass: the console keeps taking glyphs, serial keeps every line, but it stops
     // presenting until the session opens (instgui's rule and reason).
-    if !nonmodal { fbcon::console_present_suspend(true); } // CONSOLEFIX M2: the console keeps presenting under a session notice
-    crate::bootlog_println!("[login] screen open window={} box={}x{} at ({},{}) modal={}", id, ow, oh, ox, oy, !nonmodal);
+    fbcon::console_present_suspend(true);
+    crate::bootlog_println!("[login] screen open window={} box={}x{} at ({},{}) modal=true power_row={}", id, ow, oh, ox, oy, (state == State::Open) as u8);
     repaint();
     crate::splash::hold_release("first-screen"); // SPLASH2 M3: the first real screen (setter / create-user / login) is PAINTED — the splash gives the glass up now
 }
@@ -722,13 +716,14 @@ fn take_down() {
 
 fn close_into_session() {
     take_down();
-    crate::boot::session_opened(); users::bar_release(); // INSTALLBARE M3 (R86): the Desktop phase begins here — the furniture is re-minted below FIRST; the services open when the shell has launched (or the bound)
+    crate::boot::session_opened(); // INSTALLBARE M3 (R86): the Desktop phase begins here; the services open when the shell has launched (or the bound)
     if SWEPT.swap(false, Ordering::AcqRel) {
         REIGNITED.fetch_add(1, Ordering::Relaxed); // LOGINFURN (R88): a session opened over a swept desktop — and it stays BARE: nothing is posted
     }
     crate::loginfurn::desktop_bare("session"); // LOGINFURN (R88): no console, no shell, no STAT at login — the user opens what they want
-    take_down(); #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::wallpaper::rearm(); // WALLPAPER — the session user's ~/Desktop/WALL.PNG is probed on the next desktop flush
+    take_down();
     FORM.lock().state = State::Session;
+    crate::video::desktopbuild::build("login ok"); // DESKTOPBUILT (B387, R93): the desktop — bar with its battery, dock with its pins, the wallpaper (rearmed by the build) — is BUILT here and painted in one pass
 }
 
 /// M4: Log Out — close the session and put the screen back up. LOGIN13 M3 (R63): the ROOT session's
@@ -748,6 +743,7 @@ pub fn reopen_after_logout() {
     users::logout();
     take_down(); // LOGOUTUI: an alert left up by an earlier refusal goes with the session (no-op with no window)
     let (closed, kernel) = wm::close_all_furniture(); // LOGOUTDESK (R69): the desktop closes down COMPLETELY — every row, kernel furniture included
+    crate::video::desktopbuild::teardown("logout"); // DESKTOPBUILT (R93): the desktop object goes with the session; the next login builds it fresh
     SWEPT.store(true, Ordering::Release); SWEPT_N.store(closed as u32, Ordering::Relaxed);
     let remaining = wm::live_window_count();
     serial_println!(":: LOGOUTDESK: closed={} kernel={} remaining={} -> {} ::", closed, kernel, remaining, if remaining == 0 { "PASS" } else { "FAIL" });
@@ -757,7 +753,7 @@ pub fn reopen_after_logout() {
 }
 
 pub fn is_open() -> bool {
-    let s = FORM.lock().state; matches!(s, State::Open | State::SetPw | State::CreateUser) || (s == State::Alert && ALERT_PREV.load(Ordering::Relaxed) != 0) // CONSOLEFIX M2 (B365): a notice over the SESSION is not "the screen" — it takes no key, no press outside itself, and is not secret input
+    let s = FORM.lock().state; matches!(s, State::Open | State::SetPw | State::CreateUser) // DIALOG2 (B404): the Alert state is deleted — a notice is the dialog or a toast, never the screen
 }
 
 /// SO36 + SO44 — **the screen's answer to a PRESS, and it is the same answer everywhere.**
@@ -810,21 +806,16 @@ pub fn is_open() -> bool {
 /// edge, once, the grammar the close disc and every furniture arm already follow.
 pub fn press_swallow(x: i32, y: i32) -> bool {
     if !is_open() {
-        return notice_press(x, y); // CONSOLEFIX M2: a session notice answers only presses on its own row
+        return false; // DIALOG2: no session notice lives here any more (the dialog answers its own presses)
     }
     // LOGINCLOSE — the same belt [`consume_key`] runs, for the same reason and one layer earlier: a
     // press routed into a screen that is not on the glass is a press into nothing, and the row's
     // geometry is exactly what [`local_of`] is about to read.
     heal_if_row_gone();
-    let alert = FORM.lock().state == State::Alert;
-    let hit = local_of(x, y).and_then(|(lx, ly)| {
-        if alert {
-            // LOGOUTUI: the alert carries exactly one control; the form's rects are not live under it.
-            let (rx, ry, rw, rh) = ctl_rect(Ctl::AlertOk, false);
-            return (lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32).then_some(Ctl::AlertOk);
-        }
-        ctl_at(lx, ly, setpw_form())
-    });
+    let hit = local_of(x, y).and_then(|(lx, ly)| ctl_at(lx, ly, setpw_form()));
+    if matches!(hit, Some(Ctl::NameField | Ctl::PwField | Ctl::Pw2Field | Ctl::User(_))) {
+        PFOCUS.store(0, Ordering::Relaxed); // DIALOG2: a press on a field takes the keyboard back from the power row
+    }
     match hit {
         Some(Ctl::NameField) if LOCKED.load(Ordering::Relaxed) => FORM.lock().focus = Focus::Password, // SCREENLOCK: read-only name
         Some(Ctl::User(_)) if LOCKED.load(Ordering::Relaxed) => {} // SCREENLOCK: no user switching while locked
@@ -835,7 +826,7 @@ pub fn press_swallow(x: i32, y: i32) -> bool {
         // there is no second submit path to keep in step with `consume_key`'s.
         Some(Ctl::Button) => { if !submit_busy() { submit() } }
         Some(Ctl::User(i)) => pick_user(i),
-        Some(Ctl::AlertOk) => alert_ok(),
+        Some(Ctl::Power(i)) => power_pick(i, "click"),
         None => {}
     }
     if hit.is_some() {
@@ -922,7 +913,6 @@ fn heal_if_row_gone() -> bool {
 
 /// Keys are offered here first on every route; `true` = consumed (the screen is up).
 pub fn consume_key(c: u8) -> bool {
-    notice_pump(); // NOTICE: queued notices (posted from paths that may not open a window) open here
     if !is_open() {
         return false;
     }
@@ -939,14 +929,9 @@ pub fn consume_key(c: u8) -> bool {
         serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
     }
     match c {
-        b'\x1b' if FORM.lock().state == State::Alert => {
-            alert_ok();
-            return true;
-        }
-        b'\n' | b'\r' if FORM.lock().state == State::Alert => {
-            alert_ok();
-            return true;
-        }
+        b'\t' if power_tab() => {} // DIALOG2: Tab walks Name -> Password -> Sleep -> Restart -> Shut Down -> Name
+        b'\n' | b'\r' | b' ' if PFOCUS.load(Ordering::Relaxed) != 0 => power_pick(PFOCUS.load(Ordering::Relaxed) - 1, "key"),
+        0x20..=0x7e | 8 | 0x7f if PFOCUS.load(Ordering::Relaxed) != 0 => {} // a power button has the keyboard: it takes no text
         b'\x1b' => {} // R24: Esc dismisses menus only; the screen stays
         b'\t' if LOCKED.load(Ordering::Relaxed) => {} // SCREENLOCK: one editable field
         b'\t' => {
@@ -1104,7 +1089,7 @@ fn apply_create(n: &[u8], made: Result<(), &'static str>, session: bool) {
     match session {
         true => {
             LOGINS.fetch_add(1, Ordering::Relaxed);
-            serial_println!("[login] session open user={} (R77: the first user; root is not the assumed login)", who);
+            serial_println!("[login] session open user={} role=admin (R100: the first user is the administrator; root is locked)", who);
             close_into_session();
             users::installer_desktop_ignite();
         }
@@ -1758,231 +1743,46 @@ pub fn fixture_reset() {
 }
 
 // ---------------------------------------------------------------------------
-// LOGOUTUI (R70) — the refused Log Out's alert
+// LOGOUTUI (R70) — the refused Log Out says why. DIALOG2 (B404): through the alert widget, not a login window
 // ---------------------------------------------------------------------------
 
-/// The state the alert came from, so OK returns to it: 0 = Session (the usual case: Log Out pressed with
-/// the screen down), 1 = Open, 2 = SetPw.
-static ALERT_PREV: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// LOGOUTUI: a refused Log Out says why, in an alert of the set-password screen's shape. `reason` is
-/// [`users::root_logout_reason`]'s answer; the copy is R70's.
-pub fn open_alert() {
-    let text: &'static str = ""; // NOTICE: the copy lives in the notice queue now
-    let switched = {
-        let mut f = FORM.lock();
-        if f.state == State::Alert {
-            f.message = text;
-            true
-        } else {
-            let prev = match f.state {
-                State::Open => 1,
-                State::SetPw => 2,
-                _ => 0,
-            };
-            if prev != 0 {
-                ALERT_PREV.store(prev, Ordering::Relaxed);
-                f.state = State::Alert;
-                f.message = text;
-                true
-            } else {
-                ALERT_PREV.store(0, Ordering::Relaxed);
-                false
-            }
-        }
-    };
-    if !switched {
-        open_as(State::Alert); // inherits LOGINZ's modal pin (`wm::set_modal_top` in `open_as`)
-        FORM.lock().message = text;
-    }
-    repaint();
-}
-
-/// LOGOUTUI: OK / Enter / Esc — back to the state the alert came from (the screen down over the session,
-/// or the form it interrupted).
-fn alert_ok() {
-    let prev = ALERT_PREV.swap(0, Ordering::Relaxed);
-    match prev {
-        1 | 2 => {
-            FORM.lock().state = if prev == 1 { State::Open } else { State::SetPw };
-            repaint();
-        }
-        _ => {
-            take_down();
-            FORM.lock().state = State::Session;
-        }
-    }
-    serial_println!(":: LOGOUTUI: close=ok -> PASS ::");
-    notice_dismissed(); // NOTICE: the next queued notice (if any) opens now
-}
-
 /// LOGOUTUI: the refused Log Out's alert plus its witness — the ONE call both refusal routes make
-/// (`reopen_after_logout`, and the shell's `logout` through `users::log_out_to_screen`).
+/// (`reopen_after_logout`, and the shell's `logout` through `users::log_out_to_screen`). DIALOG2: an ERROR, so it
+/// is the alert widget (`dialog::notice` sorts `Log Out` as an error), opened at once (both callers are window-safe).
 pub fn refused_alert(reason: &'static str) {
     let text: &[u8] = match reason {
         "no-users" => b"add a user first (adduser <name>)",
         "storage-not-up" => b"the user store is not mounted",
         _ => b"Log Out was refused",
     };
-    notice_show(b"Log Out", text); // NOTICE: the one notice surface (was a one-purpose alert)
+    let _ = crate::video::dialog::notice(b"Log Out", text);
+    crate::video::dialog::open_now();
     serial_println!(":: LOGOUTUI: reason={} alert=open -> PASS ::", reason);
 }
 
-// ---------------------------------------------------------------------------
-// NOTICE — the OS's notice surface (generalises LOGOUTUI's one-purpose alert)
-// ---------------------------------------------------------------------------
-//
-// One modal-pinned window (the alert), any title, up to two lines, an OK button. A notice raised while one
-// is open QUEUES (up to `NQ_CAP`; the rest are counted and dropped). Two entries:
-//   * `notice::show`  = [`notice_show`]: post + try to open now — for callers on a window-safe path.
-//   * [`notice_post`]: QUEUE ONLY (`try_lock`, no heap, no `wm`) — for the xHCI event path, a fault handler,
-//     a store flush and the bus verb; [`notice_pump`] (head of `consume_key`, and every dismissal) opens it.
-// OK / Enter / Esc dismiss ([`alert_ok`] -> [`notice_dismissed`]) and the next queued notice opens.
-
-/// Title / line bounds (a 440 px window at the 8 px face holds ~49 glyphs; 46 leaves the gutter).
-const NT_MAX: usize = 24;
-const NL_MAX: usize = 46;
-const NQ_CAP: usize = 4;
-
-#[derive(Clone, Copy)]
-struct Note {
-    title: [u8; NT_MAX],
-    tl: u8,
-    ln: [[u8; NL_MAX]; 2],
-    ll: [u8; 2],
-}
-
-impl Note {
-    const EMPTY: Note = Note { title: [0; NT_MAX], tl: 0, ln: [[0; NL_MAX]; 2], ll: [0; 2] };
-    fn title(&self) -> &[u8] {
-        &self.title[..self.tl as usize]
-    }
-    fn line(&self, i: usize) -> &[u8] {
-        &self.ln[i][..self.ll[i] as usize]
-    }
-    fn lines(&self) -> usize {
-        (self.ll[0] > 0) as usize + (self.ll[1] > 0) as usize
-    }
-    /// Printable ASCII only (a caller's bytes reach the glass); `\n` splits line 0 from line 1; the rest is cut.
-    fn make(title: &[u8], text: &[u8]) -> Note {
-        let mut n = Note::EMPTY;
-        for &b in title.iter().take(NT_MAX) {
-            n.title[n.tl as usize] = if (0x20..0x7f).contains(&b) { b } else { b'?' };
-            n.tl += 1;
-        }
-        let mut li = 0usize;
-        for &b in text {
-            if b == b'\n' {
-                li += 1;
-                if li > 1 {
-                    break;
-                }
-                continue;
-            }
-            if (n.ll[li] as usize) < NL_MAX {
-                n.ln[li][n.ll[li] as usize] = if (0x20..0x7f).contains(&b) { b } else { b'?' };
-                n.ll[li] += 1;
-            }
-        }
-        n
-    }
-}
-
-struct NQ {
-    cur: Option<Note>,
-    q: [Note; NQ_CAP],
-    n: usize,
-}
-
-static NOTICES: spin::Mutex<NQ> = spin::Mutex::new(NQ { cur: None, q: [Note::EMPTY; NQ_CAP], n: 0 });
-static NOTICE_SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static NOTICE_DISMISSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static NOTICE_DROPPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-/// The notice on the glass (empty when none — a bare `open_alert`).
-fn notice_current() -> Note {
-    NOTICES.lock().cur.unwrap_or(Note::EMPTY)
-}
-
-/// Queue a notice; never opens a window, never allocates, never waits on a lock (a contended queue drops it,
-/// counted). Returns whether it was queued.
-pub fn notice_post(title: &[u8], text: &[u8]) -> bool {
-    let note = Note::make(title, text);
-    let Some(mut g) = NOTICES.try_lock() else {
-        NOTICE_DROPPED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
-    if g.n >= NQ_CAP {
-        NOTICE_DROPPED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    let i = g.n;
-    g.q[i] = note;
-    g.n += 1;
-    true
-}
-
-/// Open the oldest queued notice if none is on the glass. Window-safe callers only.
-pub fn notice_pump() {
-    let note = {
-        let Some(mut g) = NOTICES.try_lock() else { return };
-        if g.cur.is_some() || g.n == 0 {
-            return;
-        }
-        let first = g.q[0];
-        let n = g.n;
-        for i in 1..n {
-            g.q[i - 1] = g.q[i];
-        }
-        g.n -= 1;
-        g.cur = Some(first);
-        first
-    };
-    NOTICE_SHOWN.fetch_add(1, Ordering::Relaxed);
-    open_alert();
-    let nm = notice_nonmodal(); NOTICE_DEADLINE.store(if nm { crate::arch::ms().saturating_add(NOTICE_TIMEOUT_MS).max(1) } else { 0 }, Ordering::Relaxed); // CONSOLEFIX M2
-    serial_println!(":: NOTICE-OPEN: title={} lines={} modal={} -> PASS ::", core::str::from_utf8(note.title()).unwrap_or("?"), note.lines(), if nm { "none" } else { "screen" });
-}
-
-/// `video::notice::show(title, text)`: `text` is up to two `\n`-separated lines. Opens now, or queues behind
-/// the one on the glass (up to 4).
-pub fn notice_show(title: &[u8], text: &[u8]) {
-    if notice_post(title, text) {
-        notice_pump();
-    }
-}
-
-/// The notice on the glass was dismissed (OK / Enter / Esc): clear it and open the next.
-fn notice_dismissed() {
-    NOTICES.lock().cur = None;
-    NOTICE_DISMISSED.fetch_add(1, Ordering::Relaxed);
-    notice_pump();
-}
-
-/// NOTICE fixture (headless form, so it needs no window): two notices back to back — the second QUEUES
-/// behind the first — each dismissed by the OK path ([`alert_ok`]), the second opening when the first goes.
+/// NOTICE fixture (DIALOG2): two notices through THE router — information becomes a toast, an error the alert
+/// (app-modal, answered by its default) — and the login screen never opens for either.
 #[cfg(feature = "loginst")]
 fn notice_fixture() {
-    let (s0, d0) = (NOTICE_SHOWN.load(Ordering::Relaxed), NOTICE_DISMISSED.load(Ordering::Relaxed));
-    let was = HEADLESS.swap(true, Ordering::Relaxed);
+    let dwas = crate::video::dialog::headless(true);
+    let held = crate::video::toast::fixture_hold(true);
     FORM.lock().state = State::Closed;
-    { let mut g = NOTICES.lock(); g.cur = None; g.n = 0; } // compiler: an earlier fixture's `Log Out` notice may still be on the glass — start from an empty queue
-    notice_show(b"Fixture-A", b"first line\nsecond line");
-    let a_up = FORM.lock().state == State::Alert && notice_current().title() == b"Fixture-A" && notice_current().lines() == 2;
-    notice_show(b"Fixture-B", b"only line");
-    let queued = NOTICES.lock().n;
-    alert_ok(); // first dismissed by the OK path; the queued one opens
-    let b_up = FORM.lock().state == State::Alert && notice_current().title() == b"Fixture-B" && notice_current().lines() == 1;
-    alert_ok();
-    let clear = FORM.lock().state == State::Session && NOTICES.lock().cur.is_none() && NOTICES.lock().n == 0;
-    FORM.lock().state = State::Closed;
-    HEADLESS.store(was, Ordering::Relaxed);
-    let shown = NOTICE_SHOWN.load(Ordering::Relaxed) - s0;
-    let dismissed = NOTICE_DISMISSED.load(Ordering::Relaxed) - d0;
-    let ok = a_up && b_up && clear && queued == 1 && shown == 2 && dismissed == 2;
+    let t0 = crate::video::toast::queued();
+    let _ = crate::video::dialog::notice(b"Fixture-A", b"first line\nsecond line");
+    let to_toast = crate::video::toast::queued() == t0 + 1 && !crate::video::dialog::is_up();
+    let _ = crate::video::dialog::notice(b"Storage read-only", b"changes were not saved");
+    crate::video::dialog::open_now();
+    let to_dialog = crate::video::dialog::is_up();
+    crate::video::dialog::answer(crate::video::dialog::Answer::Default);
+    let dismissed = !crate::video::dialog::is_up();
+    let screen = is_open();
+    crate::video::toast::fixture_drain();
+    crate::video::toast::fixture_hold_restore(held);
+    crate::video::dialog::headless(dwas);
+    let ok = to_toast && to_dialog && dismissed && !screen;
     serial_println!(
-        ":: NOTICE: title=Fixture-A lines=2 queued={} shown={} dismissed={} -> {} ::",
-        queued, (shown == 2) as u8, (dismissed == 2) as u8, if ok { "PASS" } else { "FAIL" }
+        ":: NOTICE: title=Fixture-A to=toast:{} error=dialog:{} dismissed={} screen={} -> {} ::",
+        to_toast as u8, to_dialog as u8, dismissed as u8, screen as u8, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -2095,31 +1895,13 @@ pub fn lock_fixture(name: &[u8], password: &[u8], wrong: &[u8]) -> bool {
     pass
 }
 
-/// FIRSTBOOT (R77): the Installer / CreateUser stage is known — close every window that already exists but the
-/// screen's own (the console minted at the takeover), and owe the furniture back (`SWEPT`, the LOGOUTDESK latch).
-pub fn installer_sweep() {
-    let keep = WIN.load(Ordering::Relaxed);
-    let n = wm::close_all_furniture_except(keep);
-    SWEPT.store(true, Ordering::Release); SWEPT_N.store(n as u32, Ordering::Relaxed);
-    serial_println!("[login] installer: furniture swept n={} re-minted=0 (R77: nothing but the setter / the form on the glass; the console is re-minted when the desktop is released)", n);
-}
-
-/// FIRSTBOOT (R77): the desktop is released — re-mint the furniture the way Log In after Log Out does, unless
-/// `close_into_session` already did.
-pub fn installer_release() {
-    if SWEPT.swap(false, Ordering::AcqRel) {
-        crate::loginfurn::desktop_bare("installer"); // LOGINFURN (R88): the desktop is released BARE — was `dock::relaunch_furniture` (console+shell)
-    }
-}
-
 /// LOGINFLOW2 M1 — BOOT 2: the store has users, so the login screen is the boot session. Opens the screen, then
 /// sweeps the desktop empty (no furniture until a session opens — the LOGOUTDESK state); the next login re-mints it.
 pub fn open_boot2() {
     FORM.lock().state = State::Closed;
     OPENED_ONCE.store(true, Ordering::Release);
     open();
-    installer_sweep();
-    serial_println!("[login] boot 2: the login screen is the boot session (R64/R65/R77: root is not the assumed login; the furniture returns when a session opens)");
+    serial_println!("[login] boot 2: the login screen is the boot session (R64/R65/R77: root is not the assumed login; the desktop is built when a session opens)");
 }
 
 /// LOGINFLOW2 M1 fixture (`loginst`): the boot-2 screen is up with no session; `root` with a wrong password and
@@ -2160,12 +1942,12 @@ pub fn logout_fixture(name: &[u8], password: &[u8]) {
     let mut nb = [0u8; users::NAME_MAX];
     // 1 — the refused Log Out's alert
     FORM.lock().state = State::Closed;
-    { let mut g = NOTICES.lock(); g.cur = None; g.n = 0; }
-    let d0 = NOTICE_DISMISSED.load(Ordering::Relaxed);
+    let dwas = crate::video::dialog::headless(true); // DIALOG2: the refusal is the alert widget now — model-only here
     refused_alert("no-users");
-    let alert_up = FORM.lock().state == State::Alert;
-    let passes = !consume_key(b'\n'); alert_ok(); // CONSOLEFIX M2: the refusal is a session notice — Enter goes to the console, OK closes it
-    let alert_closed = passes && !is_open() && NOTICE_DISMISSED.load(Ordering::Relaxed).wrapping_sub(d0) == 1;
+    let alert_up = crate::video::dialog::is_up() && !is_open();
+    let passes = !consume_key(b'\n'); crate::video::dialog::answer(crate::video::dialog::Answer::Default); // the screen takes nothing; OK closes the alert
+    let alert_closed = passes && !is_open() && !crate::video::dialog::is_up();
+    crate::video::dialog::headless(dwas);
     FORM.lock().state = State::Closed;
     // 2 — the accepted Log Out round trip
     let _ = users::logout();
@@ -2223,12 +2005,6 @@ pub fn font_repaint() {
 
 // ── INSTALLBARE (rmbp-ledger B364, R86) ─────────────────────────────────────────────────────────────────────────
 
-/// INSTALLBARE M1: the takeover minted NO furniture (the phase was not Desktop) — owe it, exactly as a sweep does, so
-/// the first Desktop advance (`installer_release`) or the first login (`close_into_session`) mints console + shell.
-pub fn furniture_owed() {
-    SWEPT.store(true, Ordering::Release);
-}
-
 /// INSTALLBARE M4 (GLASSEYES `shot setter` / `shot login`): which form the bare shot put up, so [`shot_bare_close`]
 /// only ever takes down a screen IT opened.
 static SHOT_BARE_OPEN: AtomicBool = AtomicBool::new(false);
@@ -2243,7 +2019,7 @@ pub fn shot_bare_open(setter: bool) -> bool {
     }
     FORM.lock().state = State::Closed;
     if setter {
-        open_set_password(users::ROOT_NAME, false);
+        open_create_user(); // FIRSTUSER (R100): boot 1's one screen is the first-user form (root has no setter)
     } else {
         open_as(State::Open);
         repaint();
@@ -2272,102 +2048,35 @@ pub fn field_rect_panel() -> Option<(usize, usize, usize, usize)> {
 }
 
 // ---------------------------------------------------------------------------
-// CONSOLEFIX M2 (rmbp-ledger B365) — A NOTICE NEVER TAKES THE CONSOLE'S KEYS
+// CONSOLEFIX M2 (rmbp-ledger B365) — A NOTICE NEVER TAKES THE CONSOLE'S KEYS. DIALOG2 (B404): and never a login window
 // ---------------------------------------------------------------------------
 //
-// Flight 22: every notice was the login screen's `State::Alert`, and `is_open()` counted it, so every
-// route's `screen_key` handed the key to the screen ("[login] key taken by the screen"), the row was
-// pinned modal and the console stopped presenting. Four seat-typed lines vanished; the holocron client's
-// answer (queued) opened on the NEXT typed byte and that line's own `\r` closed it — "a flash".
-//
-// Now a notice raised over the SESSION (`ALERT_PREV == 0`) is NON-MODAL: `is_open()` leaves it out (so
-// `users::screen_up`/`secret_input` and every key route pass through to the console, which keeps its
-// input queue), `open_as` neither pins it nor suspends the console, a press is its own only on its row
-// (OK closes it), and it closes itself after `NOTICE_TIMEOUT_MS`. Queued notices open from
-// `notice_service` (the storage passes, beside `users::service`) without waiting for a key. A notice
-// over the login form or the setter keeps that screen's modality: the screen owns the keys anyway.
+// Flight 22: every notice was the login screen's `State::Alert`; CONSOLEFIX made the session notice non-modal.
+// DIALOG2 deleted that window kind: an error is the alert widget (`video/dialog.rs`, app-modal to its owner,
+// focus taken only by the person's own act) and information a toast (`video/toast.rs`, never focused). The
+// service below is theirs; the login screen is only the screen.
 
-/// How long a session notice stays on the glass before it closes itself.
-const NOTICE_TIMEOUT_MS: u64 = 8000;
-/// `arch::ms()` at which the session notice on the glass closes itself (`0` = none armed).
-static NOTICE_DEADLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// A notice is on the glass over the session (not over the login form / setter): non-modal.
-pub fn notice_nonmodal() -> bool {
-    FORM.lock().state == State::Alert && ALERT_PREV.load(Ordering::Relaxed) == 0
-}
-
-/// Close the session notice on the glass (`by` = click / timeout) and open the next queued one.
-fn notice_close(by: &str) {
-    let t = notice_current();
-    NOTICE_DEADLINE.store(0, Ordering::Relaxed);
-    take_down();
-    FORM.lock().state = State::Session;
-    serial_println!("[notice] closed by={} title={}", by, core::str::from_utf8(t.title()).unwrap_or("?"));
-    notice_dismissed();
-}
-
-/// The screen is about to open a form over a session notice: the notice steps aside — its row goes,
-/// and it goes back to the HEAD of the queue so it shows again once the session is back.
-fn notice_yield() {
-    NOTICE_DEADLINE.store(0, Ordering::Relaxed);
-    take_down();
-    FORM.lock().state = State::Closed;
-    let mut g = NOTICES.lock();
-    if let Some(cur) = g.cur.take() {
-        let n = g.n.min(NQ_CAP - 1);
-        for i in (0..n).rev() {
-            g.q[i + 1] = g.q[i];
-        }
-        g.q[0] = cur;
-        g.n = n + 1;
-    }
-    drop(g);
-    serial_println!("[notice] yielded to the screen (requeued)");
-}
-
-/// A press while no form is up: the session notice's row answers presses ON it (OK closes it); every
-/// other press belongs to the desktop. `false` when no session notice is up.
-fn notice_press(x: i32, y: i32) -> bool {
-    if !notice_nonmodal() {
-        return false;
-    }
-    let Some((lx, ly)) = local_of(x, y) else { return false };
-    let (rx, ry, rw, rh) = ctl_rect(Ctl::AlertOk, false);
-    if lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32 {
-        notice_close("click");
-    }
-    true
-}
-
-/// The notice service (the storage passes, beside `users::service`): close a session notice whose time is
-/// up, and open a queued notice while no form is up. One relaxed load when nothing is armed.
+/// The notice service (the storage passes, beside `users::service`): the dialog's open/slide/countdown and the
+/// toast's show/expire, on the same window-safe pass.
 pub fn notice_service() {
-    let d = NOTICE_DEADLINE.load(Ordering::Relaxed);
-    if d != 0 && crate::arch::ms() >= d {
-        if notice_nonmodal() {
-            notice_close("timeout");
-        } else {
-            NOTICE_DEADLINE.store(0, Ordering::Relaxed);
-        }
-    }
-    if !is_open() && !notice_nonmodal() {
-        notice_pump();
-    }
+    #[cfg(target_arch = "x86_64")] { crate::video::panicscreen::register(); crate::video::panicscreen::next_boot_service(); } crate::video::dialog::service(); crate::video::toast::service(); // PANICSCREEN (B406): `tests panicscreen` and the previous boot's panic line + dialog, once. DIALOG (B395): the alert's open/slide/countdown and the toast's show/expire, on the same window-safe pass
 }
 
-/// `tests notice` (CONSOLEFIX M2): a notice opens over the session, a console line is typed THROUGH it on the
-/// route every key path asks first (`users::screen_key`), and the line must come back whole: nothing taken,
-/// nothing modal, the notice still up after the line's own `\r` and an Esc (no flash), then it closes
-/// itself on its timeout. Headless (no `wm` row), so it runs on any build that has the screen.
+/// `tests notice` (CONSOLEFIX M2, on DIALOG2's surfaces): an ERROR alert (owned by nobody the console is) and an
+/// INFORMATION toast are up, and a console line typed THROUGH them on the route every key path asks first
+/// (`users::screen_key`) comes back whole: nothing taken, nothing modal, the alert still up after the line's own
+/// `\r` and an Esc (no flash), then the toast closes on its time. Model-only, so it runs on any build with the screen.
 pub fn notice_typing_fixture() {
     let was = HEADLESS.swap(true, Ordering::Relaxed);
     let prev_state = FORM.lock().state;
-    let prev_alert = ALERT_PREV.load(Ordering::Relaxed);
-    let saved = { let mut g = NOTICES.lock(); let c = (g.cur.take(), g.q, g.n); g.n = 0; c };
+    let dwas = crate::video::dialog::headless(true);
+    let held = crate::video::toast::fixture_hold(true);
     FORM.lock().state = State::Session;
-    notice_show(b"Program stopped", b"fixture.elf");
-    let up = FORM.lock().state == State::Alert && notice_nonmodal();
+    let _ = crate::video::dialog::notice(b"Storage read-only", b"fixture.elf");
+    crate::video::dialog::open_now();
+    let _ = crate::video::dialog::notice(b"Fixture notice", b"fixture.elf");
+    crate::video::toast::service();
+    let up = crate::video::dialog::is_up() && crate::video::toast::showing();
     let modal = users::screen_up() || users::secret_input();
     const LINE: &[u8] = b"echo typed-through-notice\r\x1b";
     let mut got = [0u8; 32];
@@ -2379,24 +2088,35 @@ pub fn notice_typing_fixture() {
         }
     }
     let typed = &got[..n] == LINE;
-    let flash = !(FORM.lock().state == State::Alert && NOTICES.lock().cur.is_some());
-    NOTICE_DEADLINE.store(1, Ordering::Relaxed); // its time is up
-    notice_service();
-    let timed_out = FORM.lock().state == State::Session && NOTICES.lock().cur.is_none();
-    {
-        let mut g = NOTICES.lock();
-        g.cur = saved.0;
-        g.q = saved.1;
-        g.n = saved.2;
-    }
+    let flash = !crate::video::dialog::is_up();
+    crate::video::dialog::answer(crate::video::dialog::Answer::Default);
+    crate::video::toast::expire_now();
+    crate::video::toast::service();
+    let timed_out = !crate::video::toast::showing() && !crate::video::dialog::is_up();
+    crate::video::toast::fixture_hold_restore(held);
+    crate::video::dialog::headless(dwas);
     FORM.lock().state = prev_state;
-    ALERT_PREV.store(prev_alert, Ordering::Relaxed);
     HEADLESS.store(was, Ordering::Relaxed);
     serial_println!("[notice] fixture up={} typed={}/{} timeout_close={}", up, n, LINE.len(), timed_out);
     let ok = up && !modal && typed && !flash && timed_out;
     serial_println!(
         ":: NOTICE: typed_through={} modal={} flash={} -> {} ::",
         if typed { "ok" } else { "lost" }, if modal { "screen" } else { "none" }, if flash { "yes" } else { "none" }, if ok { "PASS" } else { "FAIL" }
+    );
+    dialog_fixture();
+    dialog2_fixture();
+}
+
+/// DIALOG M4 (B395): `tests notice`'s second line — the alert widget's anatomy, the default on the right, Esc,
+/// app-modal, the focus rule, the power confirm's countdown (a fixture action; nothing powers off) and the toast.
+fn dialog_fixture() {
+    let (anatomy, right, esc, modal, theft, confirm) = crate::video::dialog::fixture();
+    let toast = crate::video::toast::fixture();
+    let ok = anatomy && right && esc && modal && theft == 0 && confirm && toast;
+    serial_println!(
+        ":: DIALOG: anatomy={} default={} esc={} modal={} focus_theft={} confirm={} toast={} -> {} ::",
+        if anatomy { "ok" } else { "FAIL" }, if right { "right" } else { "FAIL" }, if esc { "cancel" } else { "FAIL" }, if modal { "app" } else { "FAIL" },
+        theft, if confirm { "ok" } else { "FAIL" }, if toast { "ok" } else { "FAIL" }, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -2457,8 +2177,8 @@ struct Done {
     blocked_ms: u64,
 }
 
-static WORK: spin::Mutex<Option<Work>> = spin::Mutex::new(None);
-static DONE: spin::Mutex<Option<Done>> = spin::Mutex::new(None);
+static WORK: crate::sync::Mutex<Option<Work>> = crate::sync::Mutex::new(None);
+static DONE: crate::sync::Mutex<Option<Done>> = crate::sync::Mutex::new(None);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static BUSY_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The longest a submit may be on the worker before the form is released (adduser + two KDFs measured 2.2 s).
@@ -2637,4 +2357,131 @@ pub fn submit_drain() {
     apply(&d);
     BUSY.store(false, Ordering::Release);
     repaint();
+}
+
+/// DESKTOPBUILT (B387): how many windows the last sweep closed (Log Out's LOGOUTDESK sweep; nothing else sweeps).
+pub fn swept_n() -> u32 {
+    SWEPT_N.load(Ordering::Relaxed)
+}
+
+// ── DIALOG2 (rmbp-ledger B404, MACPARITY row 33) — the login screen's POWER ROW ─────────────────────────────────
+//
+// Sleep · Restart · Shut Down along the bottom of the log-in form (and the Locked screen), the Mac's login window.
+// Clicked (the `Ctl::Power` rects, one accessor for paint and press) and KEYED: Tab walks Name -> Password ->
+// Sleep -> Restart -> Shut Down -> Name, Return or Space presses the one with the keyboard. Sleep is instant (the
+// crystal's own `fire`); Restart and Shut Down CONFIRM through DIALOG's 60 s countdown, raised over the screen
+// (`dialog::power_confirm_on_screen`: the dialog holds the modal ceiling while up, [`screen_regain`] after).
+// Witness: `[login] power row pick=<sleep/restart/shutdown> via=<click/key>`.
+
+/// The power button holding the keyboard: 0 none (a field has it), 1 Sleep, 2 Restart, 3 Shut Down.
+static PFOCUS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// The row is on this form: the log-in form (and Locked), not the setter or the create-user form.
+fn power_row_on() -> bool {
+    FORM.lock().state == State::Open
+}
+
+fn power_row(px: &mut [u32]) {
+    if !power_row_on() {
+        return;
+    }
+    super::loginwindow::POWER_ROW.store(true, Ordering::Release); // SMALLFIX3 (B416): FIRSTUSER's `login_window=users+power` reads DIALOG2's row
+    let k = PFOCUS.load(Ordering::Relaxed);
+    for i in 0..3u8 {
+        let (x, y, w, h) = ctl_rect(Ctl::Power(i), false);
+        fill(px, x, y, w, h, theme::button_face());
+        rect(px, x, y, w, h, if k == i + 1 { theme::accent() } else { theme::frame_line() });
+        if k == i + 1 {
+            rect(px, x + 1, y + 1, w - 2, h - 2, theme::accent()); // the keyboard ring
+        }
+        let l = PWR_LABEL[i as usize];
+        let tw = super::super::metrics::ladvance(l, false, FACE);
+        text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL) / 2, l, theme::button_text());
+    }
+}
+
+/// Tab on the log-in form: `true` when the power row took it (Password -> Sleep, along the row, Shut Down -> Name).
+fn power_tab() -> bool {
+    if !power_row_on() {
+        return false;
+    }
+    let k = PFOCUS.load(Ordering::Relaxed);
+    let pw = FORM.lock().focus == Focus::Password;
+    let next = match k {
+        0 if pw => 1,
+        0 => return false,
+        3 => {
+            FORM.lock().focus = Focus::Name;
+            0
+        }
+        n => n + 1,
+    };
+    PFOCUS.store(next, Ordering::Relaxed);
+    true
+}
+
+/// HEADLESS model: the action is said, not done (the fixture walks the row; nothing sleeps or powers off).
+static POWER_PICKED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// A power button pressed (`i`: 0 Sleep, 1 Restart, 2 Shut Down).
+fn power_pick(i: u8, via: &str) {
+    let word = match i { 0 => "sleep", 1 => "restart", _ => "shutdown" };
+    serial_println!("[login] power row pick={} via={}", word, via);
+    POWER_PICKED.store(i + 1, Ordering::Relaxed);
+    if HEADLESS.load(Ordering::Relaxed) {
+        return;
+    }
+    match i {
+        0 => crate::video::crystal::power_fire(4), // Sleep: instant, as on the Mac
+        1 => { let _ = crate::video::dialog::power_confirm_on_screen(1); }
+        _ => { let _ = crate::video::dialog::power_confirm_on_screen(2); }
+    }
+}
+
+/// The power confirm raised over the screen was answered: the screen takes its modal ceiling back.
+pub fn screen_regain() {
+    let id = WIN.load(Ordering::Relaxed);
+    if id != wm::WIN_NONE && is_open() {
+        wm::set_modal_top(id);
+        let _ = wm::raise_one(id);
+        repaint();
+    }
+}
+
+/// DIALOG2 M6: the power row's proof (headless form): three rects inside the window, each a press target of its own
+/// name; Tab from Password reaches all three and wraps to Name; Return presses the keyed one (said, not done).
+fn power_row_fixture() -> bool {
+    let was = HEADLESS.swap(true, Ordering::Relaxed);
+    let prev = FORM.lock().state;
+    FORM.lock().state = State::Open;
+    let rects = (0..3u8).all(|i| {
+        let (x, y, w, h) = ctl_rect(Ctl::Power(i), false);
+        w > 0 && x + w <= W && y + h <= H && ctl_at((x + w / 2) as i32, (y + h / 2) as i32, false) == Some(Ctl::Power(i))
+    }) && ctl_rect(Ctl::Power(0), true).2 == 0;
+    FORM.lock().focus = Focus::Password;
+    PFOCUS.store(0, Ordering::Relaxed);
+    let walk = [power_tab(), PFOCUS.load(Ordering::Relaxed) == 1, power_tab(), power_tab(), PFOCUS.load(Ordering::Relaxed) == 3];
+    POWER_PICKED.store(0, Ordering::Relaxed);
+    power_pick(PFOCUS.load(Ordering::Relaxed) - 1, "key");
+    let keyed = POWER_PICKED.load(Ordering::Relaxed) == 3;
+    let wrapped = power_tab() && PFOCUS.load(Ordering::Relaxed) == 0 && FORM.lock().focus == Focus::Name;
+    FORM.lock().state = State::SetPw;
+    let setter_free = !power_tab();
+    FORM.lock().state = prev;
+    PFOCUS.store(0, Ordering::Relaxed);
+    HEADLESS.store(was, Ordering::Relaxed);
+    rects && walk.iter().all(|&b| b) && keyed && wrapped && setter_free
+}
+
+/// DIALOG2 M6 (B404): `tests notice`'s third line.
+fn dialog2_fixture() {
+    let (errs, infos, verbs) = crate::video::dialog::fixture2();
+    let row = power_row_fixture();
+    let origin = crate::origin::fixture();
+    let alert_window = "deleted"; // the `State::Alert` variant, `Ctl::AlertOk` and the notice queue are gone: this line compiles only without them
+    let ok = errs == 3 && infos == 4 && row && verbs == 3 && origin;
+    serial_println!(
+        ":: DIALOG2: alert_window={} errors_to_dialog={} info_to_toast={} login_power_row={} bus_verbs={} origin={} -> {} ::",
+        alert_window, errs, infos, row as u8, verbs, if origin { "explicit" } else { "FAIL" }, if ok { "PASS" } else { "FAIL" }
+    );
 }

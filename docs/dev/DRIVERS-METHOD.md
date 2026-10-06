@@ -47,12 +47,15 @@ capture verbatim and marked `observed=<value> source=capture`, never zero-filled
 
 ## 3. The rung ledger — a rung has an exhaustion status, not a verdict by inference
 
-Every ladder (one per device, in its `docs/dev/OS/...` doc) is a table of rungs. A rung carries:
+Every ladder (one per device, in its `docs/dev/OS/...` doc) is a table of rungs, and every rung's STATUS is a row of
+the ONE table, `docs/dev/STATUS.tsv` (`docs/dev/STATUS.md`; GATE-STATUS, `tools/status-check.py`): the doc cites
+`ST<n>`, the table holds the flight and the whole wire line, and the gate finds the line on that flight's capture
+byte for byte or fails. A rung carries:
 
 - **hypothesis** (one sentence: what we believe the device needs and why — spec page, driver line, or capture word);
 - **writes** (the exact registers/words it touches, with pre-image and restore);
 - **discriminator** (the wire observation that CONFIRMS it and the one that REFUTES it — both named before the flight);
-- **status** ∈ {`open`, `confirmed <flight/line>`, `refuted <flight/line>`, `parked: <why, and what reopens it>`};
+- **status** — its `ST<n>` row: `open`, `confirmed`/`refuted` (flight + quoted line, checked), `parked` (why, and what reopens it), `unflown`;
 - **alternatives** (the other hypotheses for the same wall, each with its own discriminator).
 
 **Rung 0 is the premise.** Every ladder's first rung is the fault's premise stated as a hypothesis with its own discriminator:

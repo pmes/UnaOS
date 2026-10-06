@@ -984,7 +984,7 @@ fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatErr
 /// x86 side carries its own U11x concurrency model in `arch/x86_64` regardless. Full traced citation chain:
 /// `docs/dev/OS/01_BOOT_HAL/arch_arm64.md` ("PH-3 — is the aarch64 block-write path 'fully polled emmc2'?").
 #[cfg(target_arch = "aarch64")]
-static FAT_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
+static FAT_MUTATION: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 /// Run `f` under the FAT-table mutation lock (aarch64), or unchanged (other arches).
 ///
@@ -1118,7 +1118,7 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 /// one for directories is deliberate: they guard DISJOINT sectors and the two are never nested. Same arch
 /// reasoning as `FAT_MUTATION` (aarch64-only; the x86 FAT path `hlt`-waits, masking across it would hang).
 #[cfg(target_arch = "aarch64")]
-static DIR_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
+static DIR_MUTATION: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 /// Run `f` under the directory-sector mutation lock (aarch64), or unchanged (other arches). Same IRQ-masked,
 /// non-preemptible discipline as [`with_fat_lock`] (see its doc for the deadlock reasoning). LOCK SPAN: only

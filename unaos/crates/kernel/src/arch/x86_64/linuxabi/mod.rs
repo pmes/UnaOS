@@ -437,7 +437,7 @@ static EXIT_CODE: AtomicI64 = AtomicI64::new(-1);
 static FAULT: AtomicU64 = AtomicU64::new(0);
 static FAULT_CR2: AtomicU64 = AtomicU64::new(0);
 static NSYS: AtomicU64 = AtomicU64::new(0);
-static ENOSYS_LIST: spin::Mutex<Vec<u32>> = spin::Mutex::new(Vec::new());
+static ENOSYS_LIST: crate::sync::Mutex<Vec<u32>> = crate::sync::Mutex::new(Vec::new());
 
 pub fn note_enosys(nr: u64) {
     let n = nr as u32;
@@ -499,7 +499,7 @@ pub fn on_dispatch(cr3: u64) {
 
 // ---- fork child register files, keyed by the child's PML4 ----
 /// SELFBUILD2: 12 registers — rbx rbp r12-r15, then rdi rsi rdx r10 r8 r9 (a thread gets its creator's; a fork child zeros).
-static FORK_REGS: spin::Mutex<Vec<(u64, [u64; 12])>> = spin::Mutex::new(Vec::new());
+static FORK_REGS: crate::sync::Mutex<Vec<(u64, [u64; 12])>> = crate::sync::Mutex::new(Vec::new());
 
 pub fn push_fork_regs(key: u64, r: &[u64]) {
     let mut a = [0u64; 12];

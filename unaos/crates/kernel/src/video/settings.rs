@@ -20,8 +20,9 @@
 //! `<home>/.settings` this window used to keep is gone, imported once and deleted). [`service`] applies the
 //! store's keys once per login (`[settings] loaded n=<n>`). Absent keys keep the OS defaults.
 //!
-//! Mouse: press a slider track to set it, a toggle/segment/button to act. (No drag: the wm drag seam
-//! belongs to window frames; a press-to-set is the claim.) Keyboard: Up/Down/Tab move the selection,
+//! Mouse: press a slider track to set it and keep the button down to DRAG it (PREFSUI, R93: the press captures
+//! the pointer through `video::capture`; every motion sample moves the knob and applies live; the release commits
+//! and stores); a toggle/segment/button to act. Keyboard: Up/Down/Tab move the selection,
 //! Left/Right adjust, Enter toggles/applies; typing edits the wallpaper path while it is selected.
 //!
 //! SETTINGS2: four TABS (General · Users · Display · About; Left/Right on the strip or a click switches, the choice
@@ -55,14 +56,14 @@ pub const IDLE_STEPS: [u32; 8] = [0, 1, 2, 5, 10, 15, 30, 60];
 const PTR_NAMES: [&str; 3] = ["slow", "normal", "fast"];
 const WALL_MAX: usize = 120;
 
-const WIN_W: usize = 520;
+const WIN_W: usize = 600; // APPEARANCE (B408): 520 -> 600 for the sixth tab
 const TAB_H: usize = 28;
 const TOP: usize = 12 + TAB_H;
 const ROW_H: usize = 40;
 const ROWS: usize = 10;
 /// The tab strip: General · Users · Display · About.
-pub const TABS: usize = 4;
-const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About"];
+pub const TABS: usize = 7;
+const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad"]; // PREFSUI (R91): Login Items · APPEARANCE (B408) tab 5 · TRACKPADPANE (B412) tab 6
 const WIN_H: usize = TOP + ROWS * ROW_H + 8;
 const LABEL_X: usize = 12;
 const TRACK_X: usize = 150;
@@ -76,10 +77,10 @@ static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 static LOADED_N: AtomicU32 = AtomicU32::new(0);
 static SAVED_N: AtomicU32 = AtomicU32::new(0);
 static OPEN_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 /// The session user the file was last loaded for (empty = never loaded).
-static LOADED_FOR: spin::Mutex<String> = spin::Mutex::new(String::new());
-static CUR: spin::Mutex<Values> = spin::Mutex::new(Values::DEFAULT);
+static LOADED_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
+static CUR: crate::sync::Mutex<Values> = crate::sync::Mutex::new(Values::DEFAULT);
 
 /// The persisted values.
 #[derive(Clone)]
@@ -103,6 +104,10 @@ struct State {
     /// Focus is on the tab strip (Left/Right switch tabs).
     strip: bool,
     u: UsersUi,
+    /// PREFSUI: the Login Items tab's Add chooser (an index into `loginitems::installed()`), and the Display
+    /// tab's Resolution dropdown (open or not).
+    li_add: usize,
+    modes_open: bool,
     w: usize,
     h: usize,
     surf: Vec<u32>,
@@ -259,8 +264,9 @@ fn load_for_login() {
     CUR.lock().bright = kept;
     if mask & 2 != 0 || mask & 4 != 0 { apply_volume(v.vol, v.mute); }
     if mask & 8 != 0 { apply_idle(v.idle_min); }
-    if mask & 16 != 0 { apply_ptr(v.ptr); }
+    tp_load(if mask & 16 != 0 { Some(v.ptr) } else { None }); // TRACKPADPANE (B412): the five trackpad keys; a legacy pointer.speed stands in for an unset speed
     if mask & 32 != 0 && !v.wall.is_empty() { apply_wall(&v.wall); }
+    mode_at_login(); super::appearance::load_at_login(); // PREFSUI (R93): a stored `system.display.mode` is this session's scale
 }
 
 /// Set control `i` to `val` (slider position, toggle 0/1, chooser index), apply, print, save, repaint.
@@ -345,7 +351,9 @@ pub fn request_open() {
 
 /// Drain the open latch and load the store once per login. Chained from `quarry::live::service`.
 pub fn service() {
-    crate::prefs::service();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    super::launcher::service(); // LAUNCHER (B417): the launcher's pass (snapshot, ranking, picks, the recency file) — off the input router
+    crate::prefs::service(); super::loginitems::service(); super::settingsfiles::service(); super::appearance::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
     if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
@@ -381,7 +389,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { persist(0); }
     }
-    bus_changes(); if OPEN_REQ.swap(false, Ordering::AcqRel) {
+    mode_service(); tp_service(); bus_changes(); if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -393,7 +401,7 @@ pub fn service() {
 /// Control indices on `tab`, in keyboard order (BRIGHTFLOOR M5: General = volume, mute, pointer,
 /// wallpaper, apply, off, password; Display = brightness, idle blank; Users/About: none).
 fn tab_ctrls(tab: usize) -> &'static [usize] {
-    match tab { 0 => &[1, 2, 4, 5, 6, 7, 8], 2 => &[0, 3, 9, 10], _ => &[] } // KERNELFONT2: 9 font, 10 font size
+    match tab { 0 => &[1, 2, 5, 6, 7, 8], 2 => &[0, 3, 9, 10], _ => &[] } // KERNELFONT2: 9 font, 10 font size
 }
 
 /// Row of control `i` on its tab (General: 1→0, 2→1, 4→2, 5→3, 6|7→4, 8→5; Display: 0→0, 3→1).
@@ -409,60 +417,67 @@ fn fill(s: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize, c: u3
 fn txt(st: &mut State, x: usize, r: usize, t: &str) {
     let face = super::text::Face::Ui; // KERNELFONT: labels in the UI face
     let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::content_text(), false, face);
 }
 
 fn btn(st: &mut State, r: usize, x: usize, t: &str) {
     let face = super::text::Face::Ui; // KERNELFONT: button captions in the UI face
     let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
     let y = TOP + r * ROW_H + (ROW_H - BTN_H) / 2;
-    fill(&mut st.surf, w, x, y, BTN_W, BTN_H, theme::BUTTON_FACE);
-    fill(&mut st.surf, w, x, y, BTN_W, 1, theme::FRAME_LINE);
-    fill(&mut st.surf, w, x, y + BTN_H - 1, BTN_W, 1, theme::FRAME_LINE);
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::BUTTON_TEXT, false, face);
+    fill(&mut st.surf, w, x, y, BTN_W, BTN_H, theme::button_face());
+    fill(&mut st.surf, w, x, y, BTN_W, 1, theme::frame_line());
+    fill(&mut st.surf, w, x, y + BTN_H - 1, BTN_W, 1, theme::frame_line());
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::button_text(), false, face);
 }
 
 fn field(st: &mut State, r: usize, t: &str, focus: bool) {
     let face = super::text::Face::Body;
     let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
-    fill(&mut st.surf, w, TRACK_X, TOP + r * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::BUTTON_FACE);
+    fill(&mut st.surf, w, TRACK_X, TOP + r * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::button_face());
     let mut shown = String::from(t);
     if focus { shown.push('_'); }
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 14, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::BUTTON_TEXT, false, face);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 14, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::button_text(), false, face);
 }
 
 fn slider(st: &mut State, r: usize, pos: usize, max: usize) {
     let w = st.w;
     let y = TOP + r * ROW_H + ROW_H / 2;
-    fill(&mut st.surf, w, TRACK_X, y - 2, TRACK_W, 4, theme::SCROLL_TRACK);
+    fill(&mut st.surf, w, TRACK_X, y - 2, TRACK_W, 4, theme::scroll_track());
     let kx = TRACK_X + pos * TRACK_W / max.max(1);
-    fill(&mut st.surf, w, TRACK_X, y - 2, kx - TRACK_X, 4, theme::ACCENT);
-    fill(&mut st.surf, w, kx.saturating_sub(KNOB_W / 2), y - 9, KNOB_W, 18, theme::ACCENT);
+    fill(&mut st.surf, w, TRACK_X, y - 2, kx - TRACK_X, 4, theme::accent());
+    fill(&mut st.surf, w, kx.saturating_sub(KNOB_W / 2), y - 9, KNOB_W, 18, theme::accent());
 }
 
 fn paint(st: &mut State, v: &Values) {
     let (w, h) = (st.w, st.h);
-    for p in st.surf.iter_mut() { *p = theme::CONTENT_FILL; }
+    for p in st.surf.iter_mut() { *p = theme::content_fill(); }
     let face = super::text::Face::Ui; // KERNELFONT: tab names in the UI face
     let ch = super::metrics::lcell_h(face);
     // The tab strip.
     let tw = w / TABS;
     for k in 0..TABS {
         let on = k == v.tab as usize;
-        fill(&mut st.surf, w, k * tw, 0, tw - 2, TAB_H, if on { theme::ACCENT } else { theme::SCROLL_TRACK });
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        fill(&mut st.surf, w, k * tw, 0, tw - 2, TAB_H, if on { theme::accent() } else { theme::scroll_track() });
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::content_text(), false, face);
     }
-    if st.strip { fill(&mut st.surf, w, 0, TAB_H - 3, w, 2, theme::ACCENT); }
+    if st.strip { fill(&mut st.surf, w, 0, TAB_H - 3, w, 2, theme::accent()); }
     match v.tab {
         0 => paint_general(st, v),
         1 => paint_users(st),
         2 => paint_display(st, v),
+        4 => paint_login(st), 5 => paint_appearance(st), // APPEARANCE (B408)
+        6 => paint_trackpad(st), // TRACKPADPANE (B412): TP_TAB = 6 (v.tab is u8)
         _ => paint_about(st),
+    }
+    // SETTINGSFILES (B407, R98): the pane's file, as a link that reveals `<home>/settings` in Quarry.
+    if let Some((r, x, t)) = super::settingsfiles::footer(v.tab as usize, ROWS, WIN_W, LABEL_X) {
+        let fc = super::metrics::lcell_h(face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - fc) / 2, t.as_bytes(), theme::accent(), false, face);
     }
     if !st.strip && matches!(v.tab, 0 | 2) {
         let r = row_of(st.sel);
-        fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::ACCENT);
-        if st.sel == 7 { fill(&mut st.surf, w, TRACK_X + BTN_W + 10, TOP + 4 * ROW_H + ROW_H - 8, BTN_W, 2, theme::ACCENT); }
+        fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::accent());
+        if st.sel == 7 { fill(&mut st.surf, w, TRACK_X + BTN_W + 10, TOP + 4 * ROW_H + ROW_H - 8, BTN_W, 2, theme::accent()); }
     }
 }
 
@@ -474,16 +489,11 @@ fn paint_general(st: &mut State, v: &Values) {
     slider(st, 0, v.vol as usize, 16);
     txt(st, VAL_X, 0, &alloc::format!("{}/16", v.vol));
     txt(st, LABEL_X, 1, "Mute");
-    fill(&mut st.surf, w, TRACK_X, TOP + ROW_H + 8, 24, 24, theme::SCROLL_TRACK);
-    if v.mute { fill(&mut st.surf, w, TRACK_X + 4, TOP + ROW_H + 12, 16, 16, theme::ACCENT); }
+    fill(&mut st.surf, w, TRACK_X, TOP + ROW_H + 8, 24, 24, theme::scroll_track());
+    if v.mute { fill(&mut st.surf, w, TRACK_X + 4, TOP + ROW_H + 12, 16, 16, theme::accent()); }
     txt(st, VAL_X, 1, if v.mute { "muted" } else { "sound on" });
     txt(st, LABEL_X, 2, "Pointer");
-    let seg = TRACK_W / 3;
-    for k in 0..3usize {
-        let c = if k as u8 == v.ptr { theme::ACCENT } else { theme::SCROLL_TRACK };
-        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 2 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 2 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
-    }
+    let _ = (h, ch, face, PTR_NAMES); btn(st, 2, TRACK_X, "Trackpad"); txt(st, TRACK_X + BTN_W + 12, 2, &alloc::format!("speed {}/10", TPV.lock().speed)); // TRACKPADPANE (B412): the R75 3-step became the Trackpad tab's speed slider
     txt(st, LABEL_X, 3, "Wallpaper");
     let (focus, wall) = (!st.strip && st.sel == 5, v.wall.clone());
     field(st, 3, &wall, focus);
@@ -493,6 +503,7 @@ fn paint_general(st: &mut State, v: &Values) {
     let who = user_name().unwrap_or_else(|| String::from("(no session)"));
     txt(st, TRACK_X, 5, &who);
     btn(st, 5, VAL_X - 30, "Password");
+    paint_dock_rows(st); paint_dnd_row(st); // NOTIFY (B418): row 8 — Do Not Disturb. DOCK2 (B394): rows 6/7 — the dock's edge and auto-hide
 }
 
 fn paint_display(st: &mut State, v: &Values) {
@@ -507,9 +518,8 @@ fn paint_display(st: &mut State, v: &Values) {
     slider(st, 1, idle_index(v.idle_min), IDLE_STEPS.len() - 1);
     let it = if v.idle_min == 0 { String::from("never") } else { alloc::format!("{} min", v.idle_min) };
     txt(st, VAL_X, 1, &it);
-    txt(st, LABEL_X, 2, "UI scale");
-    let m = crate::ui::Metrics::panel(); // UIMETRICS (B372): the panel's dpi scale, not a window magnification
-    txt(st, TRACK_X, 2, &alloc::format!("{}x ({} ppi) - follows the panel", super::dpi::scale_str(m.s2), m.ppi));
+    txt(st, LABEL_X, 2, "Resolution"); // PREFSUI (R93): the dropdown of the modes the display path can set (was the read-only UI scale row)
+    mode_field(st);
     txt(st, LABEL_X, 3, "Menubar clock");
     txt(st, TRACK_X, 3, "24h - fixed, no runtime switch");
     // KERNELFONT M3 (B359) -> KERNELFONT2 M4 (B363): the Font row is a PICKER — the family as three segments (the
@@ -523,9 +533,9 @@ fn paint_display(st: &mut State, v: &Values) {
     let (fam, size) = (font_fam(), font_size());
     let seg = TRACK_W / 3;
     for k in 0..3usize {
-        let c = if k == fam { theme::ACCENT } else { theme::SCROLL_TRACK };
+        let c = if k == fam { theme::accent() } else { theme::scroll_track() };
         fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 4 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 4 * ROW_H + (ROW_H - ch) / 2, FONT_FAMS[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 4 * ROW_H + (ROW_H - ch) / 2, FONT_FAMS[k].as_bytes(), theme::content_text(), false, face);
     }
     txt(st, VAL_X, 4, &super::text::face_name(face));
     txt(st, LABEL_X, 5, "Font size");
@@ -536,8 +546,9 @@ fn paint_display(st: &mut State, v: &Values) {
     let (cw, chh) = super::text::grid_cell();
     let s2 = super::dpi::scale_x2();
     txt(st, TRACK_X, 6, &alloc::format!("{} in {}x{} cells, {} ppi x{}", super::text::face_name(super::text::Face::Grid), cw, chh, super::dpi::ppi(), super::dpi::scale_str(s2)));
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 12, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, face);
-    if !st.strip && st.sel == 10 { fill(&mut st.surf, w, TRACK_X, TOP + 5 * ROW_H + ROW_H - 8, 2 * BTN_W + 10, 2, theme::ACCENT); }
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 12, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::content_text(), false, face);
+    if !st.strip && st.sel == 10 { fill(&mut st.surf, w, TRACK_X, TOP + 5 * ROW_H + ROW_H - 8, 2 * BTN_W + 10, 2, theme::accent()); }
+    if st.modes_open { mode_list(st); } // PREFSUI: the open dropdown paints over the rows below it
 }
 
 /// KERNELFONT M3: the Display tab's sample line.
@@ -578,11 +589,13 @@ struct UsersUi {
     pw2: String,
     confirm: Option<String>,
     msg: String,
+    /// FIRSTUSER (R100): the new user's role — the form's Admin toggle (standard by default).
+    admin: bool,
 }
 
 impl UsersUi {
     fn new() -> Self {
-        UsersUi { sel: 0, form: false, focus: 0, name: String::new(), pw: String::new(), pw2: String::new(), confirm: None, msg: String::new() }
+        UsersUi { sel: 0, form: false, focus: 0, name: String::new(), pw: String::new(), pw2: String::new(), confirm: None, msg: String::new(), admin: false }
     }
 }
 
@@ -612,7 +625,7 @@ fn user_list() -> Vec<(String, bool)> {
 
 fn is_root() -> bool {
     #[cfg(feature = "login")]
-    { crate::fs::users::root_session() }
+    { crate::fs::users::privileged() } // FIRSTUSER (R100): the administrator's session (or the system principal before login)
     #[cfg(not(feature = "login"))]
     { false }
 }
@@ -623,19 +636,21 @@ fn users_say(op: &str, name: &str, ok: bool, reason: &str) {
 }
 
 /// Add a user (root only): the create-user form's rules, then the `adduser` path and a first password.
-fn users_add(name: &str, pw: &str, pw2: &str) -> Result<(), &'static str> {
+fn users_add(name: &str, pw: &str, pw2: &str, admin: bool) -> Result<(), &'static str> {
     #[cfg(feature = "login")]
     {
         use crate::fs::users;
+        users::admin_authority("settings-users-add")?; // FIRSTUSER (R100): `[auth] admin=<name> for=settings-users-add`
         users::create_user_rules(name.as_bytes(), pw.as_bytes())?;
         if pw != pw2 { return Err("Passwords do not match"); }
         users::adduser_commit(name.as_bytes())?;
         if users::set_first_password(name.as_bytes(), pw.as_bytes()).is_err() { return Err("Could not save the password"); }
+        if admin && users::set_role(name.as_bytes(), users::Role::Admin).is_err() { return Err("Created, but not as an administrator"); }
         U_ADDED.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
     #[cfg(not(feature = "login"))]
-    { let _ = (name, pw, pw2); Err("login-feature-off") }
+    { let _ = (name, pw, pw2, admin); Err("login-feature-off") }
 }
 
 /// Delete through the real `deluser` verb (so its refusals and its `[users]` witness are the verb's own).
@@ -680,15 +695,17 @@ fn paint_users(st: &mut State) {
         field(st, 3, &p, f);
         btn(st, 4, TRACK_X, "Create");
         btn(st, 4, TRACK_X + BTN_W + 10, "Cancel");
+        let role = if st.u.admin { "Admin: yes" } else { "Admin: no" };
+        btn(st, 4, TRACK_X + 2 * (BTN_W + 10), role); // FIRSTUSER (R100): admin or standard — Settings > Users is the one place
     } else {
         txt(st, LABEL_X, 0, &alloc::format!("Users ({})", list.len()));
-        if root { btn(st, 0, TRACK_X, "Add user"); } else { txt(st, TRACK_X, 0, "(only root can change the list)"); }
+        if root { btn(st, 0, TRACK_X, "Add user"); } else { txt(st, TRACK_X, 0, "(only an administrator can change the list)"); }
         let sel = st.u.sel.min(list.len().saturating_sub(1));
         for (i, (nm, unset)) in list.iter().enumerate().take(8) {
             let r = 1 + i;
-            let tag = if *nm == me { " (you)" } else if *unset { " (no password)" } else { "" };
+            let tag = if *nm == me { " (you)" } else if *unset { " (no password)" } else if users_is_admin(nm) { " (admin)" } else { "" };
             let w = st.w;
-            if i == sel { fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::ACCENT); }
+            if i == sel { fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::accent()); }
             txt(st, LABEL_X, r, &alloc::format!("{}{}", nm, tag));
             if st.u.confirm.as_deref() == Some(nm.as_str()) {
                 txt(st, TRACK_X + 130, r, "delete?");
@@ -707,8 +724,8 @@ fn paint_users(st: &mut State) {
 }
 
 fn users_form_submit() {
-    let (n, p, p2) = { let s = STATE.lock(); match s.as_ref() { Some(s) => (s.u.name.clone(), s.u.pw.clone(), s.u.pw2.clone()), None => return } };
-    let r = users_add(&n, &p, &p2);
+    let (n, p, p2, adm) = { let s = STATE.lock(); match s.as_ref() { Some(s) => (s.u.name.clone(), s.u.pw.clone(), s.u.pw2.clone(), s.u.admin), None => return } };
+    let r = users_add(&n, &p, &p2, adm);
     if let Some(s) = STATE.lock().as_mut() {
         match r {
             Ok(()) => { s.u.form = false; s.u.msg = alloc::format!("added {}", n); }
@@ -772,7 +789,7 @@ pub fn open() -> Result<(), String> {
     let len = sw * sh;
     let mut surf: Vec<u32> = Vec::new();
     if surf.try_reserve_exact(len).is_err() { return Err(String::from("out of memory")); }
-    surf.resize(len, theme::CONTENT_FILL);
+    surf.resize(len, theme::content_fill());
     if is_open() { close(); }
     // Pick up the file's values (and apply them) if the login hook has not yet.
     if user_name().is_some() && LOADED_FOR.lock().is_empty() { service(); }
@@ -781,7 +798,8 @@ pub fn open() -> Result<(), String> {
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
     let tab0 = CUR.lock().tab as usize;
-    let mut st = State { sel: tab_ctrls(tab0).first().copied().unwrap_or(0), strip: true, u: UsersUi::new(), w, h, surf };
+    let (sel0, strip0) = take_at(tab0); // LAUNCHER (B417): a launcher pick opens on its row
+    let mut st = State { sel: sel0, strip: strip0, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf };
     paint(&mut st, &CUR.lock().clone());
     let base = st.surf.as_ptr() as usize;
     let id = wm::create_at_native(OWNER, base, len * 4, sw as u32, sh as u32, (sw * 4) as u32, b"Settings", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
@@ -800,6 +818,7 @@ pub fn open() -> Result<(), String> {
 pub fn close() {
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id == wm::WIN_NONE { return; }
+    if DRAG.lock().take().is_some() | TPD.lock().take().is_some() { super::capture::cancel(); } // PREFSUI: a drag dies with its window (TRACKPADPANE: the speed slider's too)
     wm::close(id);
     *STATE.lock() = None;
     serial_println!("[settings] closed win={}", id);
@@ -967,13 +986,17 @@ pub fn press_route(x: i32, y: i32) -> bool {
     }
     if cy < TOP { return true; }
     let row = (cy - TOP) / ROW_H;
+    if !STATE.lock().as_ref().is_some_and(|s| s.modes_open) && super::settingsfiles::press(cur_tab(), row, cx, ROWS, WIN_W, LABEL_X) { return true; } // SETTINGSFILES (B407): the pane's `Stored in settings/<domain>` link
     match cur_tab() {
         0 => press_general(row, cx),
         1 => press_users(row, cx),
+        4 => press_login(row, cx), 5 => press_appearance(row, cx), // APPEARANCE (B408)
+        TP_TAB => press_trackpad(row, cx), // TRACKPADPANE (B412)
         2 => {
+            if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
-            if row == 0 && on_track { select(0); bright_click(cx); }
-            if row == 1 && on_track { select(3); set(3, slider_at(cx, IDLE_STEPS.len() - 1)); }
+            if row == 0 && on_track { select(0); bright_click(cx); drag_begin(0, cx); } // PREFSUI (R93): the press sets AND captures — the knob follows the hand until the release
+            if row == 1 && on_track { select(3); drag_begin(3, cx); }
             if row == 4 && cx >= TRACK_X && cx < TRACK_X + TRACK_W { select(9); set_font(9, ((cx - TRACK_X) / (TRACK_W / 3)).min(2) as i64); } // KERNELFONT2: the family segments
             if row == 5 && cx >= TRACK_X && cx < TRACK_X + BTN_W { select(10); set_font(10, (font_size() - 1).max(FONT_MIN)); } // KERNELFONT2: size −
             if row == 5 && cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 { select(10); set_font(10, (font_size() + 1).min(FONT_MAX)); } // size +
@@ -986,15 +1009,17 @@ pub fn press_route(x: i32, y: i32) -> bool {
 fn press_general(row: usize, cx: usize) {
     // BRIGHTFLOOR M5: rows moved up one (Brightness is on the Display tab).
     match row {
-        0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(1); set(1, slider_at(cx, 16)); }
+        0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(1); drag_begin(1, cx); } // PREFSUI (R93): press-and-drag
         1 => { select(2); if cx >= TRACK_X && cx < TRACK_X + 24 { let m = CUR.lock().mute; set(2, (!m) as usize); } }
-        2 => { select(4); if cx >= TRACK_X && cx < TRACK_X + TRACK_W { set(4, (cx - TRACK_X) / (TRACK_W / 3)); } }
+        2 => { if cx >= TRACK_X && cx < TRACK_X + BTN_W { switch_tab(TP_TAB); } } // TRACKPADPANE (B412): the Trackpad tab holds the speed now
         3 => select(5),
         4 => {
             if cx >= TRACK_X && cx < TRACK_X + BTN_W { select(6); do_wallpaper(false); }
             else if cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 { select(7); do_wallpaper(true); }
         }
         5 => { if cx >= VAL_X - 30 && cx < VAL_X - 30 + BTN_W { select(8); change_password(); } }
+        6 | 7 => dock_rows_press(row, cx), // DOCK2 (B394)
+        8 => dnd_row_press(cx), // NOTIFY (B418)
         _ => {}
     }
 }
@@ -1008,6 +1033,7 @@ fn press_users(row: usize, cx: usize) {
             4 => {
                 if in_b(TRACK_X) { users_form_submit(); }
                 else if in_b(TRACK_X + BTN_W + 10) { if let Some(s) = STATE.lock().as_mut() { s.u.form = false; } repaint(); }
+                else if in_b(TRACK_X + 2 * (BTN_W + 10)) { if let Some(s) = STATE.lock().as_mut() { s.u.admin = !s.u.admin; } repaint(); } // FIRSTUSER (R100): the role toggle
             }
             _ => {}
         }
@@ -1080,7 +1106,7 @@ pub fn selftest_users() {
     let listed = list.len();
     let root = is_root();
     let had = list.iter().any(|x| x.0 == T);
-    let add = users_add(T, "tmp-pw1", "tmp-pw1");
+    let add = users_add(T, "tmp-pw1", "tmp-pw1", false);
     users_say("add", T, add.is_ok(), add.err().unwrap_or("created"));
     let present = user_list().iter().any(|x| x.0 == T);
     let del = users_delete(T);
@@ -1107,6 +1133,7 @@ pub fn selftest_users() {
 pub fn selftest_all() {
     selftest();
     selftest_users();
+    selftest_prefsui();
 }
 
 // ── BRIGHTFLOOR (B312): the floor, the load clamp, safe mode ───────────────────────────────────
@@ -1193,7 +1220,7 @@ fn bus_changes_inner() -> (usize, usize, usize) {
     let mut keys: Vec<&'static str> = Vec::new();
     let mut idle = 0usize;
     let frames = crate::prefs_client::changes_drain(|ns, k| {
-        if ns != crate::prefs::NS { return; }
+        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } // APPEARANCE (B408): another client chose
         if let Some(s) = SHOWN.iter().find(|s| **s == k) {
             if *s == crate::prefs::key::IDLE_MIN { idle += 1; }
             if !keys.contains(s) { keys.push(s); }
@@ -1339,4 +1366,719 @@ pub fn slider_sync(reg: u32) -> bool {
     }
     let back = crate::video::backlight::raw_for_pos(crate::video::backlight::pos_for_raw(reg, max, TRACK_W), TRACK_W, max);
     back.abs_diff(reg) <= max / TRACK_W as u32 + 1
+}
+
+// ── PREFSUI (rmbp-ledger B389, R93) — A SLIDER DRAGS ─────────────────────────────────────────────────────────────
+// Flight 24: `[backlight] slider click pos=16%` 13:12:14, `pos=35%` 13:12:16 — a drag was a run of presses, because
+// the window saw only the press edge. Now a press on a slider track CAPTURES the pointer (`video::capture`): every
+// motion sample while the button is held moves the knob and applies the value LIVE (the backlight follows the
+// hand; the volume and the idle blank likewise), paced at [`DRAG_PACE_MS`]; the release applies the last position
+// and COMMITS — one `[settings] <name>=<v>` line, one store write (brightness: BRIGHTSLIDER's debounce), and
+// `[settings] slider drag key=<k> samples=<n> ms=<n> from=<v> to=<v>`.
+
+/// The least time between two live applies of a drag (the release always applies the last position).
+pub const DRAG_PACE_MS: u64 = 16;
+
+#[derive(Clone, Copy)]
+struct Drag {
+    /// The control (0 brightness, 1 volume, 3 idle minutes).
+    ctrl: usize,
+    t0: u64,
+    samples: u32,
+    from: i64,
+    /// The last logical x applied, and when.
+    cx: usize,
+    at: u64,
+    /// The latest logical x seen (applied or paced out).
+    want: usize,
+}
+
+static DRAG: crate::sync::Mutex<Option<Drag>> = crate::sync::Mutex::new(None);
+/// Completed drags (the witness reads it).
+static DRAGS: AtomicU32 = AtomicU32::new(0);
+
+/// The control's value as the drag line prints it: brightness %, volume /16, idle minutes.
+fn drag_value(ctrl: usize) -> i64 {
+    match ctrl {
+        0 => { let (r, m) = (crate::video::backlight::cur_raw(), crate::video::backlight::panel_range()); crate::video::backlight::pct_of(r.min(m), m) as i64 }
+        1 => CUR.lock().vol as i64,
+        _ => CUR.lock().idle_min as i64,
+    }
+}
+
+/// Apply control `ctrl` at logical `cx` LIVE: the device follows, the knob repaints, nothing is printed or stored.
+fn drag_apply(ctrl: usize, cx: usize) {
+    match ctrl {
+        0 => {
+            let pos = cx.saturating_sub(TRACK_X).min(TRACK_W);
+            let max = crate::video::backlight::max_now();
+            let a = crate::video::backlight::set_raw_via(crate::video::backlight::raw_for_pos(pos, TRACK_W, max), "slider-drag");
+            CUR.lock().bright = a.level;
+        }
+        1 => { let v = slider_at(cx, 16) as u8; let mut c = CUR.lock(); if c.vol == v && !c.mute { return; } c.vol = v; c.mute = false; drop(c); apply_volume(v, false); }
+        _ => { let m = IDLE_STEPS[slider_at(cx, IDLE_STEPS.len() - 1)]; let mut c = CUR.lock(); if c.idle_min == m { return; } c.idle_min = m; drop(c); apply_idle(m); }
+    }
+    repaint();
+}
+
+/// A press on slider `ctrl` at logical `cx`: apply it (brightness: [`bright_click`] already did) and capture.
+fn drag_begin(ctrl: usize, cx: usize) {
+    let now = crate::arch::ms();
+    let from = drag_value(ctrl);
+    if ctrl != 0 { drag_apply(ctrl, cx); }
+    *DRAG.lock() = Some(Drag { ctrl, t0: now, samples: 0, from, cx, at: now, want: cx });
+    super::capture::begin(drag_motion, drag_release);
+}
+
+/// A panel x as this window's logical x (left of the window = 0; the slider clamps the rest).
+fn logical_x(x: i32) -> Option<usize> {
+    let info = wm::info(WIN.load(Ordering::Relaxed))?;
+    let sc = info.scale.max(1);
+    Some(super::metrics::to_logical((x.max(0) as usize).saturating_sub(info.x) / sc))
+}
+
+/// The capture's motion: one more sample; applied when [`DRAG_PACE_MS`] has passed since the last apply.
+fn drag_motion(x: i32, _y: i32) {
+    let Some(cx) = logical_x(x) else { return };
+    drag_step(cx, false);
+}
+
+fn drag_step(cx: usize, force: bool) {
+    let now = crate::arch::ms();
+    let go = {
+        let mut g = DRAG.lock();
+        let Some(d) = g.as_mut() else { return };
+        d.samples += 1;
+        d.want = cx;
+        if cx == d.cx || (!force && now.saturating_sub(d.at) < DRAG_PACE_MS) { None } else { d.cx = cx; d.at = now; Some(d.ctrl) }
+    };
+    if let Some(c) = go { drag_apply(c, cx); }
+}
+
+/// The capture's release: the last position, then the commit (print + store) and the drag line.
+fn drag_release(x: i32, _y: i32) {
+    if let Some(cx) = logical_x(x) { if let Some(d) = DRAG.lock().as_mut() { d.want = cx; } }
+    drag_finish();
+}
+
+fn drag_finish() {
+    let Some(d) = DRAG.lock().take() else { return };
+    if d.want != d.cx { drag_apply(d.ctrl, d.want); }
+    let to = drag_value(d.ctrl);
+    match d.ctrl {
+        0 => { let l = CUR.lock().bright; say("brightness", &alloc::format!("{}", l), true); bright_persist_later(); }
+        1 => { let v = CUR.lock().vol; say("volume", &alloc::format!("{}", v), true); persist(1); }
+        _ => { let m = CUR.lock().idle_min; say("idle_min", &alloc::format!("{}", m), true); persist(3); }
+    }
+    DRAGS.fetch_add(1, Ordering::Relaxed);
+    serial_println!("[settings] slider drag key={} samples={} ms={} from={} to={}", NAMES[d.ctrl], d.samples, crate::arch::ms().saturating_sub(d.t0), d.from, to);
+}
+
+/// `tests settings` leg: drive a drag on the Blank-screen slider THROUGH the capture seam (press, two motion
+/// samples at panel coordinates, release) and read the value back; restores the operator's value. `"ok"` / why not.
+#[cfg(feature = "witness")]
+fn drag_selftest() -> &'static str {
+    let before = CUR.lock().idle_min;
+    let was_open = is_open();
+    if !was_open && open().is_err() { return "no-window"; }
+    let Some(info) = wm::info(WIN.load(Ordering::Relaxed)) else { return "no-window" };
+    let px = |cx: usize| (info.x + super::metrics::size(cx) * info.scale.max(1)) as i32;
+    let d0 = DRAGS.load(Ordering::Relaxed);
+    drag_begin(3, TRACK_X);
+    let a = CUR.lock().idle_min;
+    super::capture::motion(px(TRACK_X + TRACK_W / 2), 0);
+    for _ in 0..3 { let t = crate::arch::ms(); while crate::arch::ms() < t + DRAG_PACE_MS + 1 { core::hint::spin_loop(); } }
+    super::capture::motion(px(TRACK_X + TRACK_W), 0);
+    super::capture::release(px(TRACK_X + TRACK_W), 0);
+    let b = CUR.lock().idle_min;
+    let ok = a == IDLE_STEPS[0] && b == IDLE_STEPS[IDLE_STEPS.len() - 1] && DRAGS.load(Ordering::Relaxed) == d0 + 1 && !super::capture::held();
+    set(3, idle_index(before));
+    if !was_open { close(); }
+    if ok { "ok" } else { "no" }
+}
+
+// ── PREFSUI (rmbp-ledger B389, R91) — the Login Items tab ───────────────────────────────────────────────────────
+// Row 0: what it is. Rows 1..=LI_ROWS: the list in launch order, each with Up / Down / Remove. Row 9: Add — a
+// chooser over the installed programs not yet in the list (< name >) and the Add button. Every edit is
+// `loginitems::edit` (one latched store write of `system.login.items`, the key the dock menu's Open at Login edits).
+
+const LI_ROWS: usize = 7;
+const LI_UP_X: usize = 230;
+const LI_DOWN_X: usize = LI_UP_X + BTN_W + 10;
+const LI_DEL_X: usize = LI_DOWN_X + BTN_W + 10;
+const LI_ADD_ROW: usize = 9;
+
+/// The installed programs not yet in the list (the Add chooser's choices).
+fn li_candidates() -> Vec<&'static str> {
+    let l = super::loginitems::items();
+    super::loginitems::installed().into_iter().filter(|n| !prefs_core::login::contains(&l, n)).collect()
+}
+
+fn paint_login(st: &mut State) {
+    let l = super::loginitems::items();
+    txt(st, LABEL_X, 0, &alloc::format!("Open at login ({}), in this order:", l.len()));
+    if l.is_empty() { txt(st, LABEL_X + 12, 1, "None - nothing opens itself at login."); }
+    for (k, n) in l.iter().take(LI_ROWS).enumerate() {
+        txt(st, LABEL_X + 12, 1 + k, n);
+        btn(st, 1 + k, LI_UP_X, "Up");
+        btn(st, 1 + k, LI_DOWN_X, "Down");
+        btn(st, 1 + k, LI_DEL_X, "Remove");
+    }
+    if l.len() > LI_ROWS { txt(st, LABEL_X + 12, 1 + LI_ROWS, &alloc::format!("+{} more", l.len() - LI_ROWS)); }
+    let c = li_candidates();
+    txt(st, LABEL_X, LI_ADD_ROW, "Add");
+    if c.is_empty() { txt(st, TRACK_X, LI_ADD_ROW, "every program is in the list"); return; }
+    let i = st.li_add % c.len();
+    btn(st, LI_ADD_ROW, TRACK_X - 70, "  <");
+    txt(st, LI_UP_X - 70, LI_ADD_ROW, c[i]);
+    btn(st, LI_ADD_ROW, LI_DOWN_X, "  >");
+    btn(st, LI_ADD_ROW, LI_DEL_X, "Add");
+}
+
+fn press_login(row: usize, cx: usize) {
+    let in_b = |x0: usize| cx >= x0 && cx < x0 + BTN_W;
+    if (1..=LI_ROWS).contains(&row) {
+        let l = super::loginitems::items();
+        let Some(n) = l.get(row - 1) else { return };
+        let op = if in_b(LI_UP_X) { "up" } else if in_b(LI_DOWN_X) { "down" } else if in_b(LI_DEL_X) { "remove" } else { return };
+        super::loginitems::edit(op, n, "settings");
+    } else if row == LI_ADD_ROW {
+        let c = li_candidates();
+        if c.is_empty() { return; }
+        let mut g = STATE.lock();
+        let Some(st) = g.as_mut() else { return };
+        let i = st.li_add % c.len();
+        if in_b(TRACK_X - 70) { st.li_add = (i + c.len() - 1) % c.len(); }
+        else if in_b(LI_DOWN_X) { st.li_add = (i + 1) % c.len(); }
+        else if in_b(LI_DEL_X) { drop(g); super::loginitems::edit("add", c[i], "settings"); }
+    } else { return; }
+    repaint();
+}
+
+// ── PREFSUI (rmbp-ledger B389, R93) — the Resolution dropdown ───────────────────────────────────────────────────
+// "i was seeing if i could change the monitor resolution. i guess we need to put adding a dropdown of the supported
+// resolutions?" The display path sets ONE panel mode (the native one: after the Kepler takeover the GOP's list is
+// gone and the panel runs 2880x1800); what a user can choose is the UI scale, so the entries are
+// `prefs_core::modes::modes` — the native mode at each scale, a scaled one captioned `Looks like WxH`. A choice is
+// latched in the router and applied by the service pass ([`mode_service`]): `dpi::set_live`, the faces re-size
+// (`text::rescale`), every window repaints, this window re-opens at the new scale, and `system.display.mode` is
+// stored. `[settings] display mode=<WxH> looks_like=<WxH> scale=<s> applied=<0|1> via=<settings|login>`.
+
+/// A chosen entry owed to the service pass (index + 1; 0 = none).
+static MODE_APPLY: AtomicU32 = AtomicU32::new(0);
+
+/// The dropdown's entries for the live panel (empty while the panel is busy or unknown).
+fn display_modes() -> Vec<prefs_core::modes::Mode> {
+    let (w, h) = crate::video::panel_info_nonblocking().map_or((0, 0), |i| (i.width as u32, i.height as u32));
+    prefs_core::modes::modes(w, h, super::dpi::native_s2())
+}
+
+/// The entry the live scale is.
+fn mode_cur(ms: &[prefs_core::modes::Mode]) -> usize {
+    let s2 = super::dpi::s2();
+    ms.iter().position(|m| m.s2 == s2).unwrap_or_else(|| prefs_core::modes::default_index(ms))
+}
+
+fn mode_caption(m: &prefs_core::modes::Mode) -> String {
+    alloc::format!("{} ({}x)", m.label(), super::dpi::scale_str(m.s2))
+}
+
+/// The closed dropdown: the current entry and a `v`.
+fn mode_field(st: &mut State) {
+    let ms = display_modes();
+    let w = st.w;
+    fill(&mut st.surf, w, TRACK_X, TOP + 2 * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::button_face());
+    let t = match ms.get(mode_cur(&ms)) { Some(m) => mode_caption(m), None => String::from("panel busy") };
+    txt(st, TRACK_X + 6, 2, &t);
+    txt(st, w - 30, 2, "v");
+    // PREFSUI M6 (seat): the panel's own mode, said once, so no one reads a scale choice as the panel changing.
+    txt(st, LABEL_X, 8, "Panel");
+    let native = match ms.first() { Some(m) => alloc::format!("{}x{} native (a choice above is a scale)", m.w, m.h), None => String::from("panel busy") };
+    txt(st, TRACK_X, 8, &native);
+}
+
+/// The open dropdown: one row per entry under the field, the current one in the accent.
+fn mode_list(st: &mut State) {
+    let ms = display_modes();
+    let (w, cur) = (st.w, mode_cur(&ms));
+    for (k, m) in ms.iter().enumerate().take(ROWS - 3) {
+        let y = TOP + (3 + k) * ROW_H;
+        fill(&mut st.surf, w, TRACK_X, y, w - TRACK_X - 12, ROW_H, theme::frame_line());
+        fill(&mut st.surf, w, TRACK_X + 1, y + 1, w - TRACK_X - 14, ROW_H - 2, if k == cur { theme::accent() } else { theme::button_face() });
+        txt(st, TRACK_X + 6, 3 + k, &mode_caption(m));
+    }
+}
+
+/// A press on the Display tab while the dropdown is open (any press closes it; an entry is chosen) or on its
+/// field (opens it). `true` when consumed.
+fn mode_press(row: usize, cx: usize) -> bool {
+    let open = STATE.lock().as_ref().map(|s| s.modes_open).unwrap_or(false);
+    if open {
+        if let Some(s) = STATE.lock().as_mut() { s.modes_open = false; }
+        let n = display_modes().len();
+        if cx >= TRACK_X && row >= 3 && row < 3 + n { MODE_APPLY.store((row - 3 + 1) as u32, Ordering::Release); serial_println!("[settings] display mode chosen entry={} of={}", row - 3, n); }
+        repaint();
+        return true;
+    }
+    if row == 2 && cx >= TRACK_X {
+        if let Some(s) = STATE.lock().as_mut() { s.modes_open = true; s.strip = false; }
+        repaint();
+        return true;
+    }
+    false
+}
+
+/// Apply entry `i` LIVE; `store` = persist it as `system.display.mode`. Returns whether the scale moved.
+fn apply_mode(i: usize, via: &str, store: bool) -> bool {
+    let ms = display_modes();
+    let Some(m) = ms.get(i).copied() else { return false };
+    let (before, after) = super::dpi::set_live(m.s2);
+    let moved = before != after;
+    if moved {
+        super::text::rescale();
+        let _ = wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+    }
+    if store {
+        if m.default { let _ = crate::prefs_client::pref_set(crate::prefs::NS, crate::prefs::key::DISPLAY_MODE, crate::prefs::PrefValue::Str(String::new())); }
+        else { crate::prefs_client::sys_set(crate::prefs::key::DISPLAY_MODE, crate::prefs::PrefValue::Str(m.value())); }
+    }
+    serial_println!("[settings] display mode={}x{} looks_like={} scale={} applied={} via={}", m.w, m.h, m.value(), super::dpi::scale_str(after), (super::dpi::s2() == m.s2) as u8, via);
+    moved
+}
+
+/// The service pass: a chosen entry is applied, stored, and this window re-opens at the new scale.
+fn mode_service() {
+    let k = MODE_APPLY.swap(0, Ordering::AcqRel);
+    if k == 0 { return; }
+    if apply_mode(k as usize - 1, "settings", true) && is_open() {
+        close();
+        if let Err(e) = open() { serial_println!("[settings] refuse reason={}", e); }
+    }
+}
+
+/// The login's load: the user's stored mode (a looks-like size this panel offers) becomes the session's scale.
+fn mode_at_login() {
+    let Some(v) = crate::prefs_client::sys_text(crate::prefs::key::DISPLAY_MODE) else { return };
+    let ms = display_modes();
+    if let Some(i) = prefs_core::modes::index_of(&ms, &v) {
+        if ms[i].s2 != super::dpi::s2() { apply_mode(i, "login", false); }
+    }
+}
+
+/// PREFSUI (B389) — the `tests settings` leg: a drag through the capture seam, a login-items round trip, the
+/// Resolution dropdown's entries. `:: PREFSUI: slider_drag=<ok|no|no-window> login_items=<n> modes=<n> -> PASS ::`.
+#[cfg(feature = "witness")]
+pub fn selftest_prefsui() {
+    let drag = drag_selftest();
+    let li = super::loginitems::selftest();
+    let modes = display_modes().len();
+    let ok = drag == "ok" && li.is_some() && modes >= 1;
+    serial_println!(
+        ":: PREFSUI: slider_drag={} login_items={} modes={} -> {} ::",
+        drag, li.map(|n| n as i64).unwrap_or(-1), modes, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// ── DOCK2 (rmbp-ledger B394, MACPARITY row 25) — Desktop & Dock: the dock's edge and auto-hide on the General tab ─────
+// `system.dock.position` (Bottom · Left · Right, the Pointer row's segments) and `system.dock.autohide` (the Mute row's
+// box). A press applies LIVE through the dock's own cells (`dock::set_position` / `set_autohide`) and latches ONE store
+// write, drained on the dock's service pass (never a bus write in the click router).
+
+const DOCK_POS_NAMES: [&str; 3] = ["Bottom", "Left", "Right"];
+
+fn paint_dock_rows(st: &mut State) {
+    let (w, h) = (st.w, st.h);
+    let face = super::text::Face::Body;
+    let ch = super::metrics::lcell_h(face);
+    txt(st, LABEL_X, 6, "Dock");
+    let seg = TRACK_W / 3;
+    let p = super::dock::position() as usize;
+    for k in 0..3usize {
+        let c = if k == p { theme::accent() } else { theme::scroll_track() };
+        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 6 * ROW_H + 6, seg - 2, ROW_H - 12, c);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 6 * ROW_H + (ROW_H - ch) / 2, DOCK_POS_NAMES[k].as_bytes(), theme::content_text(), false, face);
+    }
+    txt(st, LABEL_X, 7, "Auto-hide dock");
+    fill(&mut st.surf, w, TRACK_X, TOP + 7 * ROW_H + 8, 24, 24, theme::scroll_track());
+    let on = super::dock::autohide();
+    if on { fill(&mut st.surf, w, TRACK_X + 4, TOP + 7 * ROW_H + 12, 16, 16, theme::accent()); }
+    txt(st, VAL_X, 7, if on { "on" } else { "off" });
+}
+
+fn dock_rows_press(row: usize, cx: usize) {
+    if row == 6 && cx >= TRACK_X && cx < TRACK_X + TRACK_W {
+        let k = ((cx - TRACK_X) / (TRACK_W / 3)).min(2);
+        let p = ["bottom", "left", "right"][k];
+        let ok = super::dock::set_position(p, true);
+        say("dock_position", p, ok);
+    } else if row == 7 && cx >= TRACK_X && cx < TRACK_X + 24 {
+        let on = !super::dock::autohide();
+        super::dock::set_autohide(on, true);
+        say("dock_autohide", if on { "1" } else { "0" }, true);
+    } else {
+        return;
+    }
+    repaint();
+}
+
+/// FIRSTUSER (R100): is `name` an administrator (the Users list's ` (admin)` tag)?
+fn users_is_admin(name: &str) -> bool {
+    #[cfg(feature = "login")]
+    { crate::fs::users::role_of(name.as_bytes()) == Some(crate::fs::users::Role::Admin) }
+    #[cfg(not(feature = "login"))]
+    { let _ = name; false }
+}
+
+// ── APPEARANCE (rmbp-ledger B408, MACPARITY rows 21/22) — the Appearance tab ─────────────────────────────────────────
+// Light · Dark · Auto (the Dock row's segment shape), the accent swatches, the highlight swatches (the first follows
+// the accent), and a selection sample. A press latches the choice (`appearance::choose`); the settings service pass
+// stores the key and repaints everything once (`[appearance] … via=settings repaint_ms=<n>`). Mouse only: the tab has
+// no keyboard controls (Left/Right on the strip still switch tabs).
+
+const AP_MODES: [&str; 3] = ["Light", "Dark", "Auto"];
+const SW: usize = 20;
+const SW_PITCH: usize = 26;
+
+fn swatch(st: &mut State, r: usize, k: usize, c: u32, on: bool) {
+    let w = st.w;
+    let (x, y) = (TRACK_X + k * SW_PITCH, TOP + r * ROW_H + (ROW_H - SW) / 2);
+    if on { fill(&mut st.surf, w, x - 3, y - 3, SW + 6, SW + 6, theme::content_text()); fill(&mut st.surf, w, x - 1, y - 1, SW + 2, SW + 2, theme::content_fill()); }
+    fill(&mut st.surf, w, x, y, SW, SW, c);
+}
+
+fn paint_appearance(st: &mut State) {
+    use prefs_core::appearance as ap;
+    let (w, h) = (st.w, st.h);
+    let face = super::text::Face::Body;
+    let ch = super::metrics::lcell_h(face);
+    let m = super::appearance::mode().index();
+    txt(st, LABEL_X, 0, "Appearance");
+    let seg = TRACK_W / 3;
+    for k in 0..3usize {
+        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 6, seg - 2, ROW_H - 12, if k == m { theme::accent() } else { theme::scroll_track() });
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + (ROW_H - ch) / 2, AP_MODES[k].as_bytes(), theme::content_text(), false, face);
+    }
+    txt(st, VAL_X, 0, if theme::is_dark() { "dark now" } else { "light now" });
+    let clock = match super::appearance::local_hour() { Some(hr) => alloc::format!("now {:02}h", hr), None => String::from("no clock: light") };
+    txt(st, LABEL_X + 12, 1, &alloc::format!("Auto = dark {:02}:00-{:02}:00 by the RTC until NETCLOCK sets the time ({})", ap::AUTO_DARK_FROM, ap::AUTO_DARK_UNTIL, clock));
+    txt(st, LABEL_X, 2, "Accent colour");
+    let a = super::appearance::accent_ix();
+    for k in 0..theme::ACCENTS.len() { swatch(st, 2, k, theme::ACCENTS[k], k == a); }
+    txt(st, VAL_X, 2, ap::ACCENTS[a.min(7)]);
+    txt(st, LABEL_X, 3, "Highlight colour");
+    let hr = super::appearance::highlight_raw();
+    for k in 0..ap::HIGHLIGHTS.len() { swatch(st, 3, k, if k == 0 { theme::ACCENTS[a.min(7)] } else { theme::ACCENTS[k - 1] }, k == hr); }
+    txt(st, VAL_X, 3, super::appearance::highlight_name());
+    let sx = TRACK_X;
+    fill(&mut st.surf, w, sx, TOP + 4 * ROW_H + 8, TRACK_W, ROW_H - 16, theme::selection());
+    txt(st, sx + 6, 4, "Selected text looks like this");
+    txt(st, LABEL_X, 5, "The accent marks the default button, the selection, the focus ring,");
+    txt(st, LABEL_X, 6, "the slider knob and the menu highlight; the highlight is text selection.");
+}
+
+fn press_appearance(row: usize, cx: usize) {
+    use prefs_core::appearance as ap;
+    if cx < TRACK_X { return; }
+    let k = cx - TRACK_X;
+    let (kind, i, key, name) = match row {
+        0 if k < TRACK_W => { let i = (k / (TRACK_W / 3)).min(2); (0, i, "appearance_mode", ap::MODES[i]) }
+        2 if k < ap::ACCENTS.len() * SW_PITCH => { let i = k / SW_PITCH; (1, i, "appearance_accent", ap::ACCENTS[i]) }
+        3 if k < ap::HIGHLIGHTS.len() * SW_PITCH => { let i = k / SW_PITCH; (2, i, "appearance_highlight", ap::HIGHLIGHTS[i]) }
+        _ => return,
+    };
+    super::appearance::choose(kind, i);
+    say(key, name, true);
+}
+
+// ── TRACKPADPANE (rmbp-ledger B412, MACPARITY row 16) — the Trackpad tab ───────────────────────────────────────────
+// Row 0 Tracking speed (a slider 1..10 that DRAGS through PREFSUI's capture seam, applied live as one gain on the
+// TPSPEED curve); rows 1-4 toggles: Tap to click (off), Natural scrolling (on), Secondary click with two fingers (on),
+// Three-finger drag (off); row 5 says where the values go. Every change applies LIVE to the gesture stage
+// (`drivers::ehci::tpgest`), prints `[settings] trackpad.<key>=<v> applied=<0|1>`, and latches ONE store write of
+// Principia's `system.trackpad.*`, drained by [`tp_service`] (never a bus write in the click router). The rules
+// (gain table, legacy `pointer.speed` mapping, the wheel sign) are `prefs_core::trackpad`.
+
+/// The Trackpad tab's index on the strip.
+pub const TP_TAB: usize = 6; // merge17: APPEARANCE holds 5
+
+#[derive(Clone, Copy)]
+struct TpVals { speed: u8, tap: bool, natural: bool, secondary: bool, three: bool }
+
+static TPV: crate::sync::Mutex<TpVals> = crate::sync::Mutex::new(TpVals {
+    speed: prefs_core::trackpad::SPEED_DEFAULT,
+    tap: prefs_core::trackpad::TAP_DEFAULT,
+    natural: prefs_core::trackpad::NATURAL_DEFAULT,
+    secondary: true,
+    three: prefs_core::trackpad::THREE_DRAG_DEFAULT,
+});
+/// Store writes owed: bit k = row k (0 speed, 1 tap, 2 natural, 3 secondary, 4 three-finger drag).
+static TP_PERSIST: AtomicU32 = AtomicU32::new(0);
+const TP_ROW_NAMES: [&str; 5] = ["Tap to click", "Natural scrolling", "Secondary click (two fingers)", "Three-finger drag", ""];
+
+/// Hand the pane's values to the driver's gesture stage. `true` when a Wellspring stage exists on this build.
+fn tp_apply(v: TpVals) -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+    {
+        use crate::drivers::ehci::tpgest as g;
+        g::set_speed(v.speed); g::set_tap(v.tap); g::set_natural(v.natural); g::set_secondary(v.secondary); g::set_three_drag(v.three);
+        true
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "ehcihid")))]
+    { let _ = v; false }
+}
+
+/// The values the driver holds now (`None` where no Wellspring stage is built).
+fn tp_live() -> Option<TpVals> {
+    #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+    { let (speed, tap, natural, secondary, three) = crate::drivers::ehci::tpgest::get(); Some(TpVals { speed, tap, natural, secondary, three }) }
+    #[cfg(not(all(target_arch = "x86_64", feature = "ehcihid")))]
+    { None }
+}
+
+/// Login: read the five keys (a stored legacy `pointer.speed` stands in for an unset speed) and apply them.
+fn tp_load(legacy_ptr: Option<u8>) {
+    use crate::prefs::key; use crate::prefs_client::{sys_flag as flag, sys_int as int, sys_text as text};
+    let t = &prefs_core::trackpad::SECONDARY_CHOICES;
+    let mut v = *TPV.lock();
+    v.speed = match int(key::TP_SPEED, 1, 10) { Some(s) => s as u8, None => legacy_ptr.map_or(prefs_core::trackpad::SPEED_DEFAULT, |p| prefs_core::trackpad::speed_from_legacy(p as i64)) };
+    if let Some(x) = flag(key::TP_TAP) { v.tap = x; }
+    if let Some(x) = flag(key::TP_NATURAL) { v.natural = x; }
+    if let Some(x) = text(key::TP_SECONDARY).filter(|s| t.contains(&s.as_str())) { v.secondary = prefs_core::trackpad::secondary_on(&x); }
+    if let Some(x) = flag(key::TP_THREE_DRAG) { v.three = x; }
+    *TPV.lock() = v;
+    let a = tp_apply(v);
+    serial_println!(
+        "[settings] trackpad loaded speed={} tap={} natural={} secondary={} three_drag={} applied={}",
+        v.speed, v.tap as u8, v.natural as u8, if v.secondary { "two-finger" } else { "off" }, v.three as u8, a as u8
+    );
+}
+
+/// Set row `row` (0 speed = `val`; 1..=4 toggles = `val != 0`), apply live, print, latch the store write, repaint.
+fn tp_set(row: usize, val: usize, store: bool) {
+    let v = {
+        let mut g = TPV.lock();
+        match row {
+            0 => g.speed = prefs_core::trackpad::clamp_speed(val as i64),
+            1 => g.tap = val != 0,
+            2 => g.natural = val != 0,
+            3 => g.secondary = val != 0,
+            4 => g.three = val != 0,
+            _ => return,
+        }
+        *g
+    };
+    let a = tp_apply(v);
+    if store {
+        let (k, s) = match row {
+            0 => (prefs_core::trackpad::KEY_SPEED, alloc::format!("{}", v.speed)),
+            1 => (prefs_core::trackpad::KEY_TAP, alloc::format!("{}", v.tap as u8)),
+            2 => (prefs_core::trackpad::KEY_NATURAL, alloc::format!("{}", v.natural as u8)),
+            3 => (prefs_core::trackpad::KEY_SECONDARY, String::from(if v.secondary { "two-finger" } else { "off" })),
+            _ => (prefs_core::trackpad::KEY_THREE_DRAG, alloc::format!("{}", v.three as u8)),
+        };
+        say(k, &s, a);
+        TP_PERSIST.fetch_or(1 << row, Ordering::AcqRel);
+    }
+    repaint();
+}
+
+/// The service pass: the owed store writes (one PrefSet per changed key).
+fn tp_service() {
+    let owed = TP_PERSIST.swap(0, Ordering::AcqRel);
+    if owed == 0 { return; }
+    use crate::prefs::{key, PrefValue as P}; use crate::prefs_client::sys_set as set_sys;
+    let v = *TPV.lock();
+    if owed & 1 != 0 { set_sys(key::TP_SPEED, P::Int(v.speed as i64)); }
+    if owed & 2 != 0 { set_sys(key::TP_TAP, P::Bool(v.tap)); }
+    if owed & 4 != 0 { set_sys(key::TP_NATURAL, P::Bool(v.natural)); }
+    if owed & 8 != 0 { set_sys(key::TP_SECONDARY, P::Str(String::from(if v.secondary { "two-finger" } else { "off" }))); }
+    if owed & 16 != 0 { set_sys(key::TP_THREE_DRAG, P::Bool(v.three)); }
+}
+
+fn paint_trackpad(st: &mut State) {
+    let v = *TPV.lock();
+    let w = st.w;
+    txt(st, LABEL_X, 0, "Tracking speed");
+    slider(st, 0, (v.speed - 1) as usize, 9);
+    let g = prefs_core::trackpad::gain8(v.speed);
+    txt(st, VAL_X, 0, &alloc::format!("{}/10 x{}.{:02}", v.speed, g / 8, g % 8 * 100 / 8));
+    let on = [v.tap, v.natural, v.secondary, v.three];
+    for (k, &b) in on.iter().enumerate() {
+        let r = 1 + k;
+        txt(st, LABEL_X, r, TP_ROW_NAMES[k]);
+        let bx = TRACK_X + 110;
+        fill(&mut st.surf, w, bx, TOP + r * ROW_H + 8, 24, 24, theme::scroll_track());
+        if b { fill(&mut st.surf, w, bx + 4, TOP + r * ROW_H + 12, 16, 16, theme::accent()); }
+        txt(st, bx + 36, r, if b { "on" } else { "off" });
+    }
+    txt(st, LABEL_X, 5, if tp_live().is_some() { "Applied live to the internal trackpad." } else { "No Wellspring trackpad path on this build; stored only." });
+    txt(st, LABEL_X, 6, "Speed scales the pointer curve; its shape stays as flown.");
+}
+
+/// A press on the Trackpad tab: the speed slider captures; a toggle box (or its label) flips.
+fn press_trackpad(row: usize, cx: usize) {
+    if row == 0 {
+        if cx + 6 >= TRACK_X && cx <= TRACK_X + TRACK_W + 6 { tp_drag_begin(cx); }
+        return;
+    }
+    if (1..=4).contains(&row) {
+        let v = *TPV.lock();
+        let cur = [v.tap, v.natural, v.secondary, v.three][row - 1];
+        tp_set(row, (!cur) as usize, true);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TpDrag { t0: u64, samples: u32, from: u8, at: u64, want: usize, cx: usize }
+static TPD: crate::sync::Mutex<Option<TpDrag>> = crate::sync::Mutex::new(None);
+static TP_DRAGS: AtomicU32 = AtomicU32::new(0);
+
+fn tp_speed_at(cx: usize) -> usize { 1 + slider_at(cx, 9) }
+
+fn tp_drag_begin(cx: usize) {
+    let now = crate::arch::ms();
+    let from = TPV.lock().speed;
+    tp_set(0, tp_speed_at(cx), false);
+    *TPD.lock() = Some(TpDrag { t0: now, samples: 0, from, at: now, want: cx, cx });
+    super::capture::begin(tp_drag_motion, tp_drag_release);
+}
+
+fn tp_drag_motion(x: i32, _y: i32) {
+    let Some(cx) = logical_x(x) else { return };
+    let now = crate::arch::ms();
+    let go = {
+        let mut g = TPD.lock();
+        let Some(d) = g.as_mut() else { return };
+        d.samples += 1;
+        d.want = cx;
+        if cx == d.cx || now.saturating_sub(d.at) < DRAG_PACE_MS { false } else { d.cx = cx; d.at = now; true }
+    };
+    if go { tp_set(0, tp_speed_at(cx), false); }
+}
+
+fn tp_drag_release(x: i32, _y: i32) {
+    let Some(mut d) = TPD.lock().take() else { return };
+    if let Some(cx) = logical_x(x) { d.want = cx; }
+    tp_set(0, tp_speed_at(d.want), true);
+    TP_DRAGS.fetch_add(1, Ordering::Relaxed);
+    serial_println!(
+        "[settings] slider drag key=trackpad.speed samples={} ms={} from={} to={}",
+        d.samples, crate::arch::ms().saturating_sub(d.t0), d.from, TPV.lock().speed
+    );
+}
+
+/// `tests trackpad`: drive the speed slider THROUGH the capture seam (press at the left end, a motion sample to the
+/// right end, release), flip each toggle and read every value back from the gesture stage; then restore the
+/// operator's values (no store write is left behind: the restore re-latches the original values).
+/// `:: TRACKPADPANE: speed=<n> tap=<0/1> natural=<0/1> secondary=two-finger three_drag=<0/1> applied=live -> PASS ::`
+pub fn selftest_trackpad() {
+    let before = *TPV.lock();
+    let was_open = is_open();
+    if !was_open && open().is_err() { serial_println!(":: TRACKPADPANE: window=none -> FAIL ::"); return; }
+    let Some(info) = wm::info(WIN.load(Ordering::Relaxed)) else { serial_println!(":: TRACKPADPANE: window=none -> FAIL ::"); return; };
+    let px = |cx: usize| (info.x + super::metrics::size(cx) * info.scale.max(1)) as i32;
+    let d0 = TP_DRAGS.load(Ordering::Relaxed);
+    tp_drag_begin(TRACK_X);
+    let low = tp_live().map_or(TPV.lock().speed, |l| l.speed);
+    let t = crate::arch::ms(); while crate::arch::ms() < t + DRAG_PACE_MS + 1 { core::hint::spin_loop(); }
+    super::capture::motion(px(TRACK_X + TRACK_W), 0);
+    super::capture::release(px(TRACK_X + TRACK_W), 0);
+    let high = tp_live().map_or(TPV.lock().speed, |l| l.speed);
+    let drag_ok = low == 1 && high == 10 && TP_DRAGS.load(Ordering::Relaxed) == d0 + 1 && !super::capture::held();
+    // The toggles: flip each away from its value and read the stage back.
+    let flips = [(1, !before.tap), (2, !before.natural), (3, !before.secondary), (4, !before.three)];
+    let mut tog_ok = true;
+    for &(r, want) in flips.iter() {
+        tp_set(r, want as usize, false);
+        if let Some(l) = tp_live() { tog_ok &= [l.tap, l.natural, l.secondary, l.three][r - 1] == want; }
+    }
+    // The gain law at the default speed is the flown curve, pixel for pixel.
+    let mut res = 0; let curve_ok = (-40..=40).all(|d| prefs_core::trackpad::gain_step(d, prefs_core::trackpad::SPEED_DEFAULT, &mut res) == d && res == 0);
+    // Restore the operator's values (and the store, if this run latched a write).
+    tp_set(0, before.speed as usize, false);
+    for &(r, _) in flips.iter() { tp_set(r, [before.tap, before.natural, before.secondary, before.three][r - 1] as usize, false); }
+    TP_PERSIST.fetch_or(1, Ordering::AcqRel);
+    if !was_open { close(); }
+    let live = tp_live();
+    let applied = match live { Some(_) => "live", None => "none" };
+    let v = live.unwrap_or(before);
+    let ok = drag_ok && tog_ok && curve_ok && live.is_some();
+    serial_println!(
+        ":: TRACKPADPANE: speed={} tap={} natural={} secondary={} three_drag={} applied={} -> {} :: drag={}->{} toggles={} curve_default=x1",
+        v.speed, v.tap as u8, v.natural as u8, if v.secondary { "two-finger" } else { "off" }, v.three as u8, applied,
+        if ok { "PASS" } else if live.is_none() { "SKIP reason=no-wellspring-stage" } else { "FAIL" },
+        low, high, if tog_ok { "ok" } else { "bad" }
+    );
+}
+
+// ── LAUNCHER (B417): open on the row a preference key names ──────────────────────────────────
+
+/// `(tab << 8) | control` latched by [`request_open_at`]; `u32::MAX` = none.
+static AT: AtomicU32 = AtomicU32::new(u32::MAX);
+const AT_FIRST: usize = 0xFF;
+
+/// The tab and control a `system.*` schema key lives on (`AT_FIRST` = the tab's first control).
+pub fn row_of_key(key: &str) -> (usize, usize) {
+    match key {
+        "display.brightness" => (2, 0),
+        "display.idle_min" => (2, 3),
+        "display.font" => (2, 9),
+        "display.font_size" => (2, 10),
+        "audio.volume" | "audio.amp_holdoff_ms" => (0, 1),
+        "audio.mute" => (0, 2),
+        "pointer.speed" => (0, 4),
+        "display.wallpaper" => (0, 5),
+        k if k.starts_with("display.") => (2, AT_FIRST),
+        k if k.starts_with("login.") => (4, AT_FIRST),
+        _ => (0, AT_FIRST),
+    }
+}
+
+/// Open Settings (latched for [`service`], router-safe) on the row `key` names. Returns `(tab, control)`.
+pub fn request_open_at(key: &str) -> (usize, usize) {
+    let (tab, ctrl) = row_of_key(key);
+    AT.store(((tab as u32) << 8) | ctrl as u32, Ordering::Release);
+    if let Some(mut c) = CUR.try_lock() {
+        c.tab = tab as u8;
+    }
+    request_open();
+    (tab, ctrl)
+}
+
+/// The opening selection on `tab`: the latched row when one is owed for this tab (focus on the row), else the
+/// tab's first control with focus on the strip (the old open).
+fn take_at(tab: usize) -> (usize, bool) {
+    let first = tab_ctrls(tab).first().copied().unwrap_or(0);
+    let a = AT.swap(u32::MAX, Ordering::AcqRel);
+    if a != u32::MAX && (a >> 8) as usize == tab {
+        let c = (a & 0xFF) as usize;
+        if c != AT_FIRST && tab_ctrls(tab).contains(&c) {
+            serial_println!("[settings] open at tab={} control={} (launcher)", tab, NAMES[c]);
+            return (c, false);
+        }
+        return (first, false);
+    }
+    (first, true)
+}
+
+// ── NOTIFY (rmbp-ledger B418) — Do Not Disturb on the General tab (row 8): `system.notify.dnd` ───────────────────────
+// The box applies LIVE through NOTIFY's cell (`notify::set_dnd`) and latches ONE store write, drained on NOTIFY's
+// service pass (never a bus write in the click router). A Settings > Notifications pane is owed.
+
+fn paint_dnd_row(st: &mut State) {
+    txt(st, LABEL_X, 8, "Do Not Disturb");
+    fill(&mut st.surf, st.w, TRACK_X, TOP + 8 * ROW_H + 8, 24, 24, theme::scroll_track());
+    let on = super::notify::dnd();
+    if on { fill(&mut st.surf, st.w, TRACK_X + 4, TOP + 8 * ROW_H + 12, 16, 16, theme::accent()); }
+    txt(st, VAL_X, 8, if on { "on" } else { "off" });
+}
+
+fn dnd_row_press(cx: usize) {
+    if cx < TRACK_X || cx >= TRACK_X + 24 {
+        return;
+    }
+    let on = !super::notify::dnd();
+    super::notify::set_dnd(on, true);
+    say("notify_dnd", if on { "1" } else { "0" }, true);
+    repaint();
 }

@@ -69,8 +69,8 @@ struct Deferred {
     len: [u16; DEFER_SLOTS],
     n: usize,
 }
-static DEFER: spin::Mutex<Deferred> =
-    spin::Mutex::new(Deferred { buf: [[0; LINE_MAX]; DEFER_SLOTS], len: [0; DEFER_SLOTS], n: 0 });
+static DEFER: crate::sync::Mutex<Deferred> =
+    crate::sync::Mutex::new(Deferred { buf: [[0; LINE_MAX]; DEFER_SLOTS], len: [0; DEFER_SLOTS], n: 0 });
 
 #[inline]
 fn irq_masked() -> bool {
@@ -222,15 +222,22 @@ pub fn by_source() -> (u64, u64, u64, u64) {
     (e, u, sub.saturating_sub(e + u), t.dropped.load(Relaxed) + t.torn.load(Relaxed))
 }
 
-const USER_SLOTS: usize = 16;
 /// Per-process partial-line bound (SERIAL2 M3).
 const USER_LINE_MAX: usize = 1536;
 struct UserLine {
     b: [u8; USER_LINE_MAX],
     n: usize,
 }
-static USER_LINES: [spin::Mutex<UserLine>; USER_SLOTS] =
-    [const { spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }) }; USER_SLOTS];
+#[cfg(target_arch = "aarch64")]
+static USER_LINES: crate::procslot::SlotVec<crate::sync::Mutex<UserLine>> = crate::procslot::SlotVec::new_asid(
+    || crate::sync::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
+    crate::sync::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
+); // WINDOWCAP3 (B399, R90): aarch64 rows are ASIDs (0 = the shared context, inline)
+#[cfg(not(target_arch = "aarch64"))]
+static USER_LINES: crate::procslot::SlotVec<crate::sync::Mutex<UserLine>> = crate::procslot::SlotVec::new(
+    || crate::sync::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
+    crate::sync::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
+); // WINDOWCAP3 (B399, R90): one partial line per slot row (and the shared row), heap-grown — was `[_; 16]`
 
 /// SERIAL2 M3 — the ring-3 console write path. `sys_write` used to hand each raw write to `serial_print!`;
 /// a vug whose line exceeds one write (or two vugs' writes) could split a line across the lock. Now the
@@ -239,7 +246,7 @@ static USER_LINES: [spin::Mutex<UserLine>; USER_SLOTS] =
 /// syscall runs IF-masked: the slot is `try_lock`ed and on contention the text goes out directly.
 pub fn emit_user(row: usize, text: &str) {
     line_watch_check(text); // LUMENCRASH M3 (B326): a fixture may be waiting for this line (file tail)
-    let mut guard = match USER_LINES.get(row).and_then(|m| m.try_lock()) {
+    let mut guard = match (row == crate::procslot::SHARED_ROW || row <= crate::procslot::ROW_ID_MAX).then(|| &USER_LINES[row]).and_then(|m| m.try_lock()) {
         Some(g) => g,
         None => return emit_src(format_args!("{}", text), false, true),
     };
@@ -404,7 +411,7 @@ fn line_note(b: &[u8]) {
 // the console (`nethang -> PASS`), so the glass reads the wire's own word, never a paraphrase of a tally.
 static TAIL_ARM: AtomicBool = AtomicBool::new(false);
 const TAIL_MAX: usize = 120;
-static TAIL: spin::Mutex<([u8; TAIL_MAX], usize)> = spin::Mutex::new(([0; TAIL_MAX], 0));
+static TAIL: crate::sync::Mutex<([u8; TAIL_MAX], usize)> = crate::sync::Mutex::new(([0; TAIL_MAX], 0));
 
 /// Arm the recorder for one fixture (clears the last tail).
 pub fn tail_arm() {
@@ -466,7 +473,7 @@ const FOLD_SHOWN: usize = 16;
 static FOLD_ON: AtomicBool = AtomicBool::new(false);
 /// A folded fragment left its line open (a `serial_print!` piece): its continuation folds too.
 static FOLD_MID: AtomicBool = AtomicBool::new(false);
-static FOLD_PREFIX: spin::Mutex<&'static [u8]> = spin::Mutex::new(b"");
+static FOLD_PREFIX: crate::sync::Mutex<&'static [u8]> = crate::sync::Mutex::new(b"");
 
 struct FoldStore {
     fam: [[u8; FOLD_FAM_LEN]; FOLD_FAMS],
@@ -483,7 +490,7 @@ struct FoldStore {
     dropped: u32,
 }
 
-static FOLD: spin::Mutex<FoldStore> = spin::Mutex::new(FoldStore {
+static FOLD: crate::sync::Mutex<FoldStore> = crate::sync::Mutex::new(FoldStore {
     fam: [[0; FOLD_FAM_LEN]; FOLD_FAMS],
     fam_len: [0; FOLD_FAMS],
     n: [0; FOLD_FAMS],

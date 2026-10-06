@@ -1716,8 +1716,8 @@ pub static TAP_FLIGHTREC: TapCounters = TapCounters::new();
 fn tap_inflight(name: &str) -> u64 {
     match name {
         "ftdi" => crate::drivers::xhci::ftdi::staged_in_flight(),
-        #[cfg(target_arch = "x86_64")]
-        "flightrec" => crate::flight_recorder::staged_in_flight(),
+        "flightrec" => crate::boot_ring::staged_in_flight(),
+        // FLIGHTRING (B400): the recorder's ring is arch-neutral now (`boot_ring.rs`); both arches stage into it.
         _ => 0,
     }
 }
@@ -1771,7 +1771,7 @@ pub fn mirror_service() {
             );
         }
     }
-    mirror_verdict_once(); crate::serial_line::census_poll();
+    mirror_verdict_once(); crate::serial_line::census_poll(); crate::boot_ring::arm_once();
     // SO29/DRAINCAP — the drain-cap fixture, one-shot, riding this poll for the same reason the
     // SERWIT-2 verdict does: `mirror_service`'s stated contract is IRQs unmasked, no locks held, not
     // a print context, and it is reached on BOTH arches (x86 via `flight_recorder::service`'s first

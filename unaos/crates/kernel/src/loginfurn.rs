@@ -4,7 +4,7 @@
 //! login. console is doubly wrong because it is blank. it should load the text from the current boot."
 //!
 //! * [`desktop_bare`] — the login (or the installer's release) opens NOTHING: no console, no shell, no STAT. The
-//!   R77/R86 furniture re-mint (`dock::relaunch_furniture` from `login::close_into_session` / `installer_release`)
+//!   R77/R86 furniture re-mint (`dock::relaunch_furniture` from `login::close_into_session` and the installer's release, both deleted by DESKTOPBUILT B387)
 //!   is gone; the services do not wait the furniture bound for furniture that is not coming
 //!   (`boot::furniture_none`). One line: `[login] desktop bare: furniture=none (R88) why=<session|installer>`.
 //! * [`console_prefill`] — every console mint replays the CURRENT BOOT's text from the one ring the kernel already
@@ -24,7 +24,7 @@ static BARE: AtomicU32 = AtomicU32::new(0);
 static AT_LOGIN_WINDOWS: AtomicU32 = AtomicU32::new(0);
 static FIRST_AT_LOGIN_OWNER: AtomicU64 = AtomicU64::new(0);
 static SELF_LAUNCHES: AtomicU32 = AtomicU32::new(0);
-static FIRST_SELF: spin::Mutex<&'static str> = spin::Mutex::new("");
+static FIRST_SELF: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("");
 /// The first prefill's painted lines (`u64::MAX` = the console has not been opened since the boot).
 static PREFILL_FIRST: AtomicU64 = AtomicU64::new(u64::MAX);
 static PREFILLS: AtomicU32 = AtomicU32::new(0);
@@ -44,6 +44,7 @@ pub fn desktop_bare(why: &'static str) {
 /// `boot::note_window`: a row is being minted (pure apart from atomics; called under the window table).
 pub fn note_window(owner: u64) {
     if owner != 0 && in_login_window() {
+        if take_item_credit() { return; } // PREFSUI M6 (R91): a window the user's login items asked for is not a window that opened itself
         if AT_LOGIN_WINDOWS.fetch_add(1, Relaxed) == 0 {
             FIRST_AT_LOGIN_OWNER.store(owner, Relaxed);
         }
@@ -79,52 +80,59 @@ pub fn nothing_posted() -> bool {
 /// re-adopted a cell store that already carries text (no replay — it would print the boot twice).
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn console_prefill(id: crate::video::wm::WinId, rows: usize, retained_rows: usize) {
+    // FLIGHTRING (B400): the ring is `boot_ring` on both arches now — a pinned head + the rolling newest bytes — so
+    // the tail painted here is the LIVE tail however late the console opens (flight 24 card 3 read `ring_full=1`).
     use crate::video::fbcon;
-    #[cfg(target_arch = "x86_64")]
-    let tail = crate::flight_recorder::tail_lines(rows.max(1));
-    #[cfg(not(target_arch = "x86_64"))]
-    let tail: Option<(alloc::vec::Vec<u8>, usize, bool)> = {
-        let _ = rows;
-        None
-    };
+    crate::flightring::note_rows(rows);
+    let tail = crate::boot_ring::tail(rows.max(1), 0);
     let live = fbcon::console_takes_glyphs();
-    let Some((bytes, ring_bytes, full)) = tail else {
-        serial_println!("[console] prefill win={} lines=0 painted=0 ring=none live={} (R88: no boot-log ring on this arch, or it was contended)", id, live as u32);
+    let Some(t) = tail else {
+        serial_println!("[console] prefill win={} lines=0 painted=0 ring=none live={} (R88: the boot-log ring was contended)", id, live as u32);
         return;
     };
     let mut lines = 0usize;
     let mut painted = 0u64;
     if retained_rows == 0 {
-        let was = fbcon::console_present_suspended();
-        fbcon::console_present_suspend(true); // one present for the whole replay, not one per line
-        let tap = &crate::serial_ring::TAP_FBCON;
-        let a0 = tap.absorbed.load(Relaxed);
-        for raw in bytes.split(|&b| b == b'\n') {
-            let line = match raw.last() {
-                Some(b'\r') => &raw[..raw.len() - 1],
-                _ => raw,
-            };
-            if line.is_empty() {
-                continue;
-            }
-            let s = match core::str::from_utf8(line) {
-                Ok(s) => s,
-                Err(e) => core::str::from_utf8(&line[..e.valid_up_to()]).unwrap_or(""),
-            };
-            fbcon::_print(format_args!("{}\n", s));
-            lines += 1;
-        }
-        painted = tap.absorbed.load(Relaxed).saturating_sub(a0);
-        if !was {
-            fbcon::console_present_suspend(false); // resuming forces the one present
-        }
+        (lines, painted) = console_replay(&t.bytes);
         let _ = PREFILL_FIRST.compare_exchange(u64::MAX, painted, Relaxed, Relaxed);
         PREFILLS.fetch_add(1, Relaxed);
     }
+    crate::flightring::note_prefill(lines);
     serial_println!(
-        "[console] prefill win={} lines={} painted={} ring_bytes={} ring_full={} live={} retained_rows={} (R88: the current boot's text, scrolled to the tail)",
-        id, lines, painted, ring_bytes, full as u32, live as u32, retained_rows
+        "[console] prefill win={} lines={} painted={} ring_bytes={} wrapped={} joined={} rolling_kib={} tail_live=1 live={} retained_rows={} (R88/FLIGHTRING: the current boot's newest text, scrolled to the tail)",
+        id, lines, painted, t.total, t.wrapped as u32, t.joined as u32, t.rolling_kib, live as u32, retained_rows
     );
+}
+
+/// Paint `bytes` (whole lines) into the console through `fbcon::_print` under ONE present. Returns (lines, painted).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn console_replay(bytes: &[u8]) -> (usize, u64) {
+    use crate::video::fbcon;
+    let was = fbcon::console_present_suspended();
+    fbcon::console_present_suspend(true); // one present for the whole replay, not one per line
+    let tap = &crate::serial_ring::TAP_FBCON;
+    let a0 = tap.absorbed.load(Relaxed);
+    let mut lines = 0usize;
+    for raw in bytes.split(|&b| b == b'\n') {
+        let line = match raw.last() {
+            Some(b'\r') => &raw[..raw.len() - 1],
+            _ => raw,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let s = match core::str::from_utf8(line) {
+            Ok(s) => s,
+            Err(e) => core::str::from_utf8(&line[..e.valid_up_to()]).unwrap_or(""),
+        };
+        fbcon::_print(format_args!("{}\n", s));
+        lines += 1;
+    }
+    let painted = tap.absorbed.load(Relaxed).saturating_sub(a0);
+    if !was {
+        fbcon::console_present_suspend(false); // resuming forces the one present
+    }
+    (lines, painted)
 }
 
 /// Register `tests loginfurn` once (folded into `boot::ensure_tests`).
@@ -133,13 +141,14 @@ pub fn ensure_tests() {
     if !DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
         crate::tests::register("loginfurn", loginfurn_selftest);
     }
+    crate::flightring::ensure_tests(); // FLIGHTRING (B400): `tests flightring`
 }
 
 /// `tests loginfurn` — what the login opened by itself, and what the console showed when it was opened.
 /// SKIP when the boot had no login (a Desktop from the first instruction).
 pub fn loginfurn_selftest() {
     if crate::boot::ignite_ms() == 0 {
-        serial_println!(":: LOGINFURN: at_login windows=- services=- console_prefill_lines=- -> SKIP reason=no-login-this-boot ::");
+        serial_println!(":: LOGINFURN: at_login windows=- login_items=- services=- console_prefill_lines=- -> SKIP reason=no-login-this-boot ::");
         return;
     }
     let w = AT_LOGIN_WINDOWS.load(Relaxed);
@@ -155,11 +164,36 @@ pub fn loginfurn_selftest() {
         );
     }
     serial_println!(
-        ":: LOGINFURN: at_login windows={} services={} console_prefill_lines={} -> {} ::{}",
+        ":: LOGINFURN: at_login windows={} login_items={} services={} console_prefill_lines={} -> {} ::{}",
         w,
+        ITEM_WINDOWS.load(Relaxed),
         s,
         if opened { alloc::format!("{}", p) } else { alloc::string::String::from("none") },
         if pass { "PASS" } else { "FAIL" },
         if opened { "" } else { " console=unopened (open the console and rerun for the prefill count)" }
     );
+}
+
+// ── PREFSUI M6 (rmbp-ledger B389, R88 + R91) — the user's login items are not furniture ─────────────────────────
+// `loginitems::launch` posts the user's `system.login.items` through the dock's seams and hands this module a
+// CREDIT: one window per item, plus the shell window a ring-3 item's verb runs in. A row minted in the login's
+// settle window spends a credit first (counted as `login_items=`), and only a row with no credit left counts as a
+// window that opened itself (`windows=`). An empty list hands no credit, so the gate reads exactly as before.
+
+/// Windows the login items may still mint inside the settle window.
+static ITEM_CREDIT: AtomicU32 = AtomicU32::new(0);
+/// Rows minted in the settle window on a login item's credit.
+static ITEM_WINDOWS: AtomicU32 = AtomicU32::new(0);
+
+/// `loginitems::launch`: `n` windows were asked for by the user's login items (`via=login-items`).
+pub fn login_items_posted(n: u32) {
+    ITEM_CREDIT.store(n, Relaxed);
+}
+
+fn take_item_credit() -> bool {
+    if ITEM_CREDIT.fetch_update(Relaxed, Relaxed, |c| c.checked_sub(1)).is_ok() {
+        ITEM_WINDOWS.fetch_add(1, Relaxed);
+        return true;
+    }
+    false
 }

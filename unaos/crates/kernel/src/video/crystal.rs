@@ -115,7 +115,7 @@ pub enum Verb {
     /// Restart — a warm reboot. REAL where PSCI answers (aarch64 non-Pi); an honest STUB elsewhere.
     Restart,
     /// Shut Down — ACPI S5 (x86) or PSCI SYSTEM_OFF (aarch64 non-Pi). The one action that halts the box.
-    ShutDown, #[cfg(feature = "login")] #[doc = "Log Out (LOGIN M4, R21 + R51) — tear the session down and put the login screen back. REAL: `login::reopen_after_logout` is the action."] LogOut, #[cfg(feature = "login")] #[doc = "Lock (SCREENLOCK) — the login screen over the live session; nothing is swept. REAL: `login::lock`."] Lock, #[cfg(feature = "login")] #[doc = "Settings (SETTINGS, R75) — open the settings window. REAL on the desktop gates."] Settings, // LOGIN M4 — the crystal is where Log Out lives (R21: menus belong in the MENU BAR). ⚠ LINE-NEUTRAL append; an inline `#[doc]` because a `///` must PRECEDE its item and a new line would move every panic::Location below it.
+    ShutDown, #[cfg(feature = "login")] #[doc = "Log Out (LOGIN M4, R21 + R51) — tear the session down and put the login screen back. REAL: `login::reopen_after_logout` is the action."] LogOut, #[cfg(feature = "login")] #[doc = "Lock (SCREENLOCK) — the login screen over the live session; nothing is swept. REAL: `login::lock`."] Lock, #[cfg(feature = "login")] #[doc = "Settings (SETTINGS, R75) — open the settings window. REAL on the desktop gates."] Settings, #[doc = "Force Quit... (APPMENU2, B393) — Activity on the process list, posted to the shell. REAL on the desktop gates."] ForceQuit, // LOGIN M4 — the crystal is where Log Out lives (R21: menus belong in the MENU BAR). ⚠ LINE-NEUTRAL append; an inline `#[doc]` because a `///` must PRECEDE its item and a new line would move every panic::Location below it.
 }
 
 impl Verb {
@@ -125,14 +125,14 @@ impl Verb {
             Verb::About => "About",
             Verb::Sleep => "Sleep",
             Verb::Restart => "Restart",
-            Verb::ShutDown => "ShutDown", #[cfg(feature = "login")] Verb::LogOut => "LogOut", #[cfg(feature = "login")] Verb::Lock => "Lock", #[cfg(feature = "login")] Verb::Settings => "Settings", // LOGIN M4. ⚠ LINE-NEUTRAL append.
+            Verb::ShutDown => "ShutDown", #[cfg(feature = "login")] Verb::LogOut => "LogOut", #[cfg(feature = "login")] Verb::Lock => "Lock", #[cfg(feature = "login")] Verb::Settings => "Settings", Verb::ForceQuit => "ForceQuit", // LOGIN M4. ⚠ LINE-NEUTRAL append.
         }
     }
 
     /// `true` when the verb is BACKED by a real action, `false` when it is an honest stub. On the
     /// witness so a capture reads `action=real` or `action=stub` beside the pick.
     const fn real(self) -> bool {
-        #[cfg(not(feature = "login"))] { return matches!(self, Verb::About) || (matches!(self, Verb::Restart) && cfg!(not(all(target_arch = "aarch64", feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))); } #[cfg(feature = "login")] { matches!(self, Verb::About) || matches!(self, Verb::LogOut) || matches!(self, Verb::Lock) || (matches!(self, Verb::Settings) && cfg!(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))) || (matches!(self, Verb::Restart) && cfg!(not(all(target_arch = "aarch64", feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))) } // LOGIN M4 — Log Out is REAL wherever the knob is on (the screen it returns to is built by the DESKTOP gate, but the teardown runs headless too), and A34's rule is why this is not left at `stub`: a verb announcing `real` and doing nothing spends the operator's trust, and so does the reverse. The knob-off arm is the original expression VERBATIM, early-returned so no line moves. ⚠ LINE-NEUTRAL fold. // A34: arch-TRUE, not arch-blind — the flat `About | ShutDown` printed `action=real` for a Shut Down that only printed a line (render7). Restart is real wherever PSCI answers; Shut Down everywhere except the Pi.
+        #[cfg(not(feature = "login"))] { return matches!(self, Verb::About) || matches!(self, Verb::ForceQuit) || (matches!(self, Verb::Restart) && cfg!(not(all(target_arch = "aarch64", feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))); } #[cfg(feature = "login")] { matches!(self, Verb::About) || matches!(self, Verb::LogOut) || matches!(self, Verb::Lock) || matches!(self, Verb::ForceQuit) || (matches!(self, Verb::Settings) && cfg!(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))) || (matches!(self, Verb::Restart) && cfg!(not(all(target_arch = "aarch64", feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))) } // LOGIN M4 — Log Out is REAL wherever the knob is on (the screen it returns to is built by the DESKTOP gate, but the teardown runs headless too), and A34's rule is why this is not left at `stub`: a verb announcing `real` and doing nothing spends the operator's trust, and so does the reverse. The knob-off arm is the original expression VERBATIM, early-returned so no line moves. ⚠ LINE-NEUTRAL fold. // A34: arch-TRUE, not arch-blind — the flat `About | ShutDown` printed `action=real` for a Shut Down that only printed a line (render7). Restart is real wherever PSCI answers; Shut Down everywhere except the Pi.
     }
 
     /// The verb's stable ordinal for the witness (`u8`), independent of its row index.
@@ -141,7 +141,7 @@ impl Verb {
             Verb::About => 0,
             Verb::Sleep => 1,
             Verb::Restart => 2,
-            Verb::ShutDown => 3, #[cfg(feature = "login")] Verb::LogOut => 4, #[cfg(feature = "login")] Verb::Lock => 5, #[cfg(feature = "login")] Verb::Settings => 6, // LOGIN M4. ⚠ LINE-NEUTRAL append.
+            Verb::ShutDown => 3, #[cfg(feature = "login")] Verb::LogOut => 4, #[cfg(feature = "login")] Verb::Lock => 5, #[cfg(feature = "login")] Verb::Settings => 6, Verb::ForceQuit => 7, // LOGIN M4. ⚠ LINE-NEUTRAL append.
         }
     }
 }
@@ -153,13 +153,13 @@ struct Row {
 }
 
 /// **The SHARD tree.** Order is Peter's, LOCKED: About first, a separator, then the power verbs.
-#[cfg(not(feature = "login"))] const ROWS: [Row; 5] = [
+#[cfg(not(feature = "login"))] const ROWS: [Row; 6] = [
     Row { label: "About This Shard", verb: Some(Verb::About) },
     Row { label: "", verb: None },
     Row { label: "Sleep", verb: Some(Verb::Sleep) },
     Row { label: "Restart", verb: Some(Verb::Restart) },
-    Row { label: "Shut Down", verb: Some(Verb::ShutDown) },
-]; #[cfg(feature = "login")] const ROWS: [Row; 10] = [ Row { label: "About This Shard", verb: Some(Verb::About) }, Row { label: "", verb: None }, Row { label: "Sleep", verb: Some(Verb::Sleep) }, Row { label: "Restart", verb: Some(Verb::Restart) }, Row { label: "Shut Down", verb: Some(Verb::ShutDown) }, Row { label: "", verb: None }, Row { label: "Log Out", verb: Some(Verb::LogOut) }, Row { label: "Lock", verb: Some(Verb::Lock) }, Row { label: "", verb: None }, Row { label: "Settings", verb: Some(Verb::Settings) }, ]; // LOGIN M4 — the whole knob-on tree on ONE line beside the knob-off one, because a `const ROWS` cannot be extended in place and a SECOND ARRAY ON ITS OWN LINES WOULD MOVE EVERY panic::Location BELOW IT (LEDGER P7). Peter's LOCKED order is kept and only appended to: About, separator, the power verbs, then a separator and Log Out — the Mac shard menu's own shape. Every derived metric (`MENU_W`, `MENU_H`, `row_top`, `row_at`) walks `ROWS` in a const loop, so the menu grows by itself; `selftest` leg 3 walks it too, so the new row is resolved on every witness boot with no fixture change. ⚠ LINE-NEUTRAL fold.
+    Row { label: "Shut Down", verb: Some(Verb::ShutDown) }, Row { label: "Force Quit...", verb: Some(Verb::ForceQuit) }, // APPMENU2 M6 — Force Quit on EVERY image (the seat)
+]; #[cfg(feature = "login")] const ROWS: [Row; 11] = [ Row { label: "About This Shard", verb: Some(Verb::About) }, Row { label: "", verb: None }, Row { label: "Sleep", verb: Some(Verb::Sleep) }, Row { label: "Restart", verb: Some(Verb::Restart) }, Row { label: "Shut Down", verb: Some(Verb::ShutDown) }, Row { label: "", verb: None }, Row { label: "Log Out", verb: Some(Verb::LogOut) }, Row { label: "Lock Screen", verb: Some(Verb::Lock) }, Row { label: "", verb: None }, Row { label: "Settings", verb: Some(Verb::Settings) }, Row { label: "Force Quit...", verb: Some(Verb::ForceQuit) }, ]; // LOGIN M4 — the whole knob-on tree on ONE line beside the knob-off one, because a `const ROWS` cannot be extended in place and a SECOND ARRAY ON ITS OWN LINES WOULD MOVE EVERY panic::Location BELOW IT (LEDGER P7). Peter's LOCKED order is kept and only appended to: About, separator, the power verbs, then a separator and Log Out — the Mac shard menu's own shape. Every derived metric (`MENU_W`, `MENU_H`, `row_top`, `row_at`) walks `ROWS` in a const loop, so the menu grows by itself; `selftest` leg 3 walks it too, so the new row is resolved on every witness boot with no fixture change. ⚠ LINE-NEUTRAL fold.
 
 // ---------------------------------------------------------------------------
 // Metrics — all derived, none guessed
@@ -695,7 +695,7 @@ fn fire(verb: Verb) {
             { crate::power::prelude("shutdown"); crate::power::crystal_shutdown(); }
             #[cfg(all(target_arch = "aarch64", feature = "pi"))]
             serial_println!(":: SHARD: unimplemented: Shut Down (no PSCI SYSTEM_OFF — Pi 4 bare-metal runs at EL2 with no secure monitor; PM_RSTS/watchdog halt is the wiring this needs) ::");
-        } #[cfg(feature = "login")] Verb::LogOut => { serial_println!(":: SHARD: log out — the session closes and the login screen returns ::"); login::reopen_after_logout(); } #[cfg(feature = "login")] Verb::Lock => { serial_println!(":: SHARD: lock — the login screen covers the live session ::"); let _ = login::lock(); } #[cfg(feature = "login")] Verb::Settings => { serial_println!(":: SHARD: settings — the settings window opens ::"); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::settings::request_open(); } // LOGIN M4 — the ACTION, not a print: `reopen_after_logout` calls `fs::users::logout()` (the session principal is dropped, so every later launch is anonymous and every owned file is refused it) and puts the screen back up, where a second login opens a NEW session. ⚠ LINE-NEUTRAL append.
+        } #[cfg(feature = "login")] Verb::LogOut => { serial_println!(":: SHARD: log out — the session closes and the login screen returns ::"); login::reopen_after_logout(); } #[cfg(feature = "login")] Verb::Lock => { serial_println!(":: SHARD: lock — the login screen covers the live session ::"); let _ = login::lock(); } #[cfg(feature = "login")] Verb::Settings => { serial_println!(":: SHARD: settings — the settings window opens ::"); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::settings::request_open(); } Verb::ForceQuit => { serial_println!(":: SHARD: force quit — Activity opens on the process list ::"); super::sysmenu::force_quit("crystal"); } // LOGIN M4 — the ACTION, not a print: `reopen_after_logout` calls `fs::users::logout()` (the session principal is dropped, so every later launch is anonymous and every owned file is refused it) and puts the screen back up, where a second login opens a NEW session. ⚠ LINE-NEUTRAL append.
     }
 }
 
@@ -739,9 +739,9 @@ pub fn press_at(x: i32, y: i32) -> bool {
             if menu_contains(r, px, py) {
                 if super::powerui::panel_open() { PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed); return true; } // POWERMENU M2: a press inside the battery panel is swallowed
                 return match item_at(r, px, py) {
-                    Some(verb) if matches!(verb, Verb::Restart | Verb::ShutDown) && verb.real() && !super::powerui::confirm(if matches!(verb, Verb::Restart) { 1 } else { 2 }) => { // POWERMENU M1: first click arms, the menu stays open and the row re-reads
-                        PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed);
-                        super::wm::composite();
+                    Some(verb) if verb.real() && power_ask(verb) => { // DIALOG (B395): Restart / Shut Down / Log Out ASK — the confirm dialog with its 60 s countdown (was POWERMENU M1's click-again arming)
+                        PRESS_OUTCOME.store(OUT_PICK, Ordering::Relaxed); PICKS.fetch_add(1, Ordering::Relaxed);
+                        dismiss("confirm");
                         true
                     }
                     Some(verb) => {
@@ -964,9 +964,9 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
 
     // The whole-row base: keyline on the top and bottom border rows, menu face elsewhere.
     let base = if j < BORDER || j + 1 > h - BORDER {
-        theme::FRAME_LINE
+        theme::frame_line()
     } else {
-        theme::CHROME_FACE
+        theme::chrome_face()
     };
     for i in 0..w {
         out[i] = base;
@@ -974,7 +974,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
     // The two side borders, on every row.
     for i in 0..w {
         if i < BORDER || i + BORDER >= w {
-            out[i] = theme::FRAME_LINE;
+            out[i] = theme::frame_line();
         }
     }
     if j < BORDER || j + 1 > h - BORDER {
@@ -987,7 +987,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
         if sy >= (ITEM_H() - CELL_H()) / 2 && sy < (ITEM_H() - CELL_H()) / 2 + CELL_H() {
             let mut buf = [0u8; 48];
             let n = super::powerui::panel_line(li, &mut buf);
-            super::text::draw_row(out, w, &buf[..n], BORDER + PADX(), sy - (ITEM_H() - CELL_H()) / 2, theme::TITLE_TEXT_ACTIVE, false, FACE);
+            super::text::draw_row(out, w, &buf[..n], BORDER + PADX(), sy - (ITEM_H() - CELL_H()) / 2, theme::title_text_active(), false, FACE);
         }
         return;
     }
@@ -1001,7 +1001,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
         None => {
             if j == top + SEP_H() / 2 {
                 for i in (BORDER + PADX())..(w - BORDER - PADX()) {
-                    out[i] = theme::FRAME_LINE;
+                    out[i] = theme::frame_line();
                 }
             }
         }
@@ -1017,7 +1017,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
             // painted (RAM scratch — the blend's read is cached). Regular weight: menu items are
             // body text, not a caption.
             let label = match ROWS[row].verb { Some(Verb::Restart) => super::powerui::armed_label(1), Some(Verb::ShutDown) => super::powerui::armed_label(2), _ => None }.unwrap_or(ROWS[row].label).as_bytes(); // POWERMENU M1: the armed row re-reads
-            super::text::draw_row(out, w, label, BORDER + PADX(), sy, theme::TITLE_TEXT_ACTIVE, false, FACE);
+            super::text::draw_row(out, w, label, BORDER + PADX(), sy, theme::title_text_active(), false, FACE);
         }
     }
 }
@@ -1418,7 +1418,7 @@ pub fn power_panel_selftest() -> bool {
         open_battery_panel(pw, ph);
         let rect = menu_rect(pw, ph);
         let mut row = [0u32; 512];
-        let drew = rect.map(|r| { let mut any = false; if r.2 <= row.len() { compose_row(&mut row, r, BORDER + (ITEM_H() - CELL_H()) / 2 + CELL_H() / 2); any = row[BORDER + PADX()..r.2 - BORDER].iter().any(|&c| c != theme::CHROME_FACE); } any }).unwrap_or(false);
+        let drew = rect.map(|r| { let mut any = false; if r.2 <= row.len() { compose_row(&mut row, r, BORDER + (ITEM_H() - CELL_H()) / 2 + CELL_H() / 2); any = row[BORDER + PADX()..r.2 - BORDER].iter().any(|&c| c != theme::chrome_face()); } any }).unwrap_or(false);
         ok = ok && OPEN.load(Ordering::Relaxed) && super::powerui::panel_open() && rect.is_some() && drew;
         dismiss("fixture");
         ok = ok && !OPEN.load(Ordering::Relaxed) && !super::powerui::panel_open();
@@ -1430,3 +1430,35 @@ pub fn power_panel_selftest() -> bool {
 }
 #[cfg(not(feature = "witness"))]
 pub fn power_panel_selftest() -> bool { false }
+
+// ── DIALOG (B395, MACPARITY row 34) — Restart / Shut Down / Log Out ASK first ─────────────────────────────
+
+/// The press arm's guard: a pick of Restart / Shut Down / Log Out opens the confirm dialog (60 s countdown)
+/// instead of acting; `true` when the dialog took the pick (the menu then dismisses). Every other verb: `false`.
+fn power_ask(verb: Verb) -> bool {
+    let kind = match verb { Verb::Restart => 1, Verb::ShutDown => 2, _ if verb.name() == "LogOut" => 3, _ => return false };
+    serial_println!(":: SHARD-MENU: crystal_pick verb={} action=confirm ::", verb.name());
+    super::dialog::power_confirm(kind);
+    true
+}
+
+/// The confirm's OK (or its countdown's expiry): the verb fires through [`fire`], the one place an action happens.
+pub fn power_fire(kind: u8) {
+    match kind {
+        1 => fire(Verb::Restart),
+        2 => fire(Verb::ShutDown),
+        #[cfg(feature = "login")]
+        3 => fire(Verb::LogOut),
+        4 => fire(Verb::Sleep), _ => {} // DIALOG2 (B404): 4 = the login power row's Sleep (instant, no confirm)
+    }
+}
+
+/// APPMENU2 (B393) — does the system menu carry a row labelled `label`? The `tests appmenu` probe.
+pub fn has_row(label: &str) -> bool {
+    ROWS.iter().any(|r| r.label == label)
+}
+/// FIRSTUSER (B409, R100): the login window's users list — the generic avatar, the lock screen's look, the power-row hook.
+/// Beside `login`, under its gate; `#[path]` resolves to `video/loginwindow.rs`.
+#[cfg(feature = "login")]
+#[path = "loginwindow.rs"]
+pub mod loginwindow;

@@ -17,7 +17,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use linked_list_allocator::Heap;
-use spin::Mutex;
+use crate::sync::Mutex;
 use crate::arch;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
@@ -154,4 +154,10 @@ pub fn heap_census(align: usize) -> HeapCensus {
         c.largest_run = lo;
     });
     c
+}
+
+/// PANICSCREEN (B406): the heap lock is held right now (the panic log is written only when it is free — a
+/// panic inside the allocator holds it for good).
+pub fn heap_busy() -> bool {
+    ALLOCATOR.inner.is_locked()
 }

@@ -84,7 +84,7 @@ pub use una_abi::BUS_VERB_NOTICE; pub mod attr; // ATTRSURF (B299): the five att
 pub fn verb_valid(verb: u8) -> bool {
     matches!(
         verb,
-        BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP | BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV | BUS_VERB_NOTICE | una_abi::BUS_VERB_MENU_PUBLISH | una_abi::BUS_VERB_MENU_CLEAR | una_abi::BUS_VERB_MENU_GET | una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT | una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_CHANGED
+        BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP | BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV | BUS_VERB_NOTICE | una_abi::BUS_VERB_MENU_PUBLISH | una_abi::BUS_VERB_MENU_CLEAR | una_abi::BUS_VERB_MENU_GET | una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT | una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE | una_abi::BUS_VERB_PREF_CHANGED | una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST
     ) || (cfg!(feature = "busreg") && (verb == una_abi::BUS_VERB_REGISTER || verb >= una_abi::BUS_VERB_FULFIL_MIN)) // BANDY3: the register verb + the registrable range, ONLY under `busreg` (knob off: refused exactly as before). ATTRSURF 11..=15, PREFS 16..=18 (merge9 fold). SETTINGSBUS (B337): PrefChanged 19 — the kernel builds it for its subscribers; a ring-3 REQUEST of it is -EINVAL in both dispatchers. LINE-NEUTRAL: folded onto the matches! close.
 }
 

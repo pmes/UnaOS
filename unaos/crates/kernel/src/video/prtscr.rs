@@ -254,7 +254,7 @@
 //!    board (~31 ms on x86, ~37 ms on QEMU virt, ~43 ms on the Pi, ~75 ms on the Orin) without this
 //!    module learning any board's clock rate.
 //!
-//! **No lock is held across a slice.** The open job lives in [`JOB`], a `spin::Mutex<Option<Job>>`
+//! **No lock is held across a slice.** The open job lives in [`JOB`], a `crate::sync::Mutex<Option<Job>>`
 //! that is locked exactly twice per slice — once to move the job out, once to move it back — and
 //! never while a pixel is read or a byte written. The FAT/BOT layer takes and releases its own loan
 //! inside each `write_grow` exactly as it did for the single big write.
@@ -313,7 +313,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use spin::Mutex;
+use crate::sync::Mutex;
 use unaos_boot_info::PixelFormat;
 
 use crate::fs::fat::{BlockSource, FatError, FatFs};
@@ -611,7 +611,7 @@ fn finish(verdict: Result<Shot, Refusal>) {
             // SHOTREGION M3: a region/window capture says where it went (B229 `notice_show`); the whole-panel path stays silent as before.
             #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             if shot.kind != 0 {
-                crate::video::crystal::login::notice_show(b"Screenshot saved", alloc::format!("{}\nDesktop", shot.name).as_bytes());
+                let _ = crate::video::dialog::notice(b"Screenshot saved", alloc::format!("{}\nDesktop", shot.name).as_bytes()); // DIALOG2 (B404): THE router — sorted error -> dialog, information -> toast
             }
         }
         Err(why) => {

@@ -71,7 +71,7 @@
 //! cfg-gated append or a `#[inline(always)] false` helper, so the knob-off image is unchanged.
 
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// One Ethernet frame with room for a VLAN tag — `net_phy::FRAME_CAP`'s value, restated here so this
 /// file compiles on a build that has no smoltcp seam at all.
@@ -299,6 +299,10 @@ pub fn note_cs(slot: u8, d: &[u8]) {
 /// The walk of configuration index `CFG_INDEX` ended for `slot`. `true` when it produced an ECM
 /// candidate (the caller configures its bulk pair); `false` otherwise, and then `other_config`
 /// says whether a second configuration is worth asking for.
+/// USBNET9: `slot` is the link's — taken as a candidate, configured or up (the hub witness names it `net`).
+pub fn is_link_slot(slot: u8) -> bool {
+    SLOT.load(Ordering::Relaxed) == slot && STATE.load(Ordering::Relaxed) != ST_ABSENT
+}
 pub fn walk_is_candidate(slot: u8) -> bool {
     SLOT.load(Ordering::Relaxed) == slot && STATE.load(Ordering::Relaxed) == ST_CANDIDATE
 }
@@ -415,7 +419,7 @@ pub fn disconnect(slot: u8) {
     let was_up = STATE.load(Ordering::Relaxed) == ST_UP;
     STATE.store(ST_ABSENT, Ordering::Relaxed);
     SLOT.store(0, Ordering::Relaxed);
-    reset_arm();
+    reset_arm(); U9_CARRY.store(0, Ordering::Relaxed); // USBNET9 M2: a carried burst dies with the slot
     tx_reset(); // NETCLOCK: an in-flight OUT TD dies with the slot
     for m in MAC.iter() {
         m.store(0, Ordering::Relaxed);
@@ -485,6 +489,7 @@ pub fn take_done() -> Option<(u8, u32)> {
     Some((CODE.load(Ordering::Relaxed), RESIDUE.load(Ordering::Relaxed)))
 }
 pub fn note_error(code: u8) {
+    U9_CARRY.store(0, Ordering::Relaxed); // USBNET9 M2: an error completion ends any carried burst
     let n = ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n.is_power_of_two() {
         serial_println!(":: USBNET: IN completion code={} errors={} — re-arming ::", code, n);
@@ -509,7 +514,9 @@ pub fn deliver(frame: &[u8]) {
 }
 /// The controller's service pass takes the next frame to send, if any.
 pub fn next_tx(out: &mut [u8]) -> Option<usize> {
-    TXQ.lock().pop(out)
+    let n = TXQ.lock().pop(out);
+    if let Some(k) = n { u9_tx_seen(&out[..k.min(out.len())]); } // USBNET9: a solicited frame opens the answer-owed clock; a DHCP client frame goes on the wire
+    n
 }
 pub fn tx_pending() -> bool {
     !TXQ.lock().is_empty()
@@ -929,7 +936,7 @@ fn note_ethertype(f: &[u8]) {
         0x0800 => {
             RX_V4.fetch_add(1, Ordering::Relaxed); u8_v4_seen(f); // USBNET8: a LAN peer for the txprobe
             let ihl = ((f.get(14).copied().unwrap_or(0) & 0x0f) as usize) * 4;
-            if f.len() >= 14 + ihl + 4 && f[23] == 17 && u16::from_be_bytes([f[14 + ihl], f[15 + ihl]]) == 67 { RX_DHCP.fetch_add(1, Ordering::Relaxed); }
+            if f.len() >= 14 + ihl + 4 && f[23] == 17 && u16::from_be_bytes([f[14 + ihl], f[15 + ihl]]) == 67 { RX_DHCP.fetch_add(1, Ordering::Relaxed); u9_rx_dhcp(f, ihl); }
         }
         _ => {}
     }
@@ -1260,9 +1267,11 @@ impl core::fmt::Display for HexRun<'_> {
 fn netframe_note_xfer(n: usize) {
     let now = crate::arch::ms().max(1);
     NF_RX_LAST.store(now, Ordering::Relaxed);
+    U9_OWED_AT.store(0, Ordering::Relaxed); // USBNET9: any completion proves the ring alive — nothing is owed now
     if NF_STALLED.swap(false, Ordering::Relaxed) {
         NF_RESUMED.store(true, Ordering::Relaxed);
         let (after, needed) = u8_answered(now); // USBNET8: a completion within U8_NEEDED_MS of the rung = the rung was needed
+        if needed && U8_RUNG_KIND.load(Ordering::Relaxed) == 2 { U9_BACKOFF_MS.store(U9_BACKOFF_MIN_MS, Ordering::Relaxed); } // USBNET9: a reset that was needed earns the short back-off back
         let gap = U8_PASS_GAP_MAX.swap(0, Ordering::Relaxed); // the longest data-pass interval since the rung: over 50 ms, `needed` can undercount
         let pass = if after > U8_NEEDED_MS && gap > U8_NEEDED_MS { alloc::format!(" pass_ms={}", gap) } else { alloc::string::String::new() };
         serial_println!("[usbnet] rx resumed len={} kicks={} resets={} after_ms={} needed={}{}", n, NF_KICKS.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed), after, needed as u8, pass);
@@ -1274,8 +1283,13 @@ fn netframe_note_xfer(n: usize) {
     }
 }
 /// M3: the data pass asks this when the IN TD is still outstanding. 0 = nothing; 1 = rung one, ring the IN doorbell
-/// again (the TD has waited `NF_KICK_MS` since its arm); 2 = rung two, the kick drew no completion within a further
-/// `NF_KICK_MS`: Stop Endpoint + Set TR Dequeue Pointer on the IN endpoint, then re-arm (`usbnet_rx_reset`).
+/// again; 2 = rung two, Stop Endpoint + Set TR Dequeue Pointer on the IN endpoint, then re-arm (`usbnet_rx_reset`).
+/// USBNET9 (B385): rung one keeps its cadence (a doorbell on a Running endpoint is harmless, xHCI 1.2 §4.7, and it is
+/// USBNET8's `needed=` measurement): `NF_KICK_MS` after the arm, and again `NF_KICK_MS` after an answer became owed.
+/// Rung two fires ONLY when a frame is expected — an answer is owed (`u9_owed_ms`: a solicited TX issued after the last
+/// RX completion, at least `U9_OWED_MS` ago), a kick fired after the owe began and drew nothing for `NF_KICK_MS`, and
+/// the back-off since the last reset has passed. On a quiet link nothing is owed: no reset, ever (flight 24/25: a reset
+/// every ~4 s on an idle LAN, `needed=0` on nearly every resume).
 pub fn rx_stall_action() -> u8 {
     if !ARMED.load(Ordering::Relaxed) || DONE.load(Ordering::Relaxed) || (kind() == KIND_AX88179 && !link_up()) {
         return 0;
@@ -1283,27 +1297,44 @@ pub fn rx_stall_action() -> u8 {
     let now = crate::arch::ms();
     let arm_at = NF_ARM_AT.load(Ordering::Relaxed);
     let kick_at = NF_KICK_AT.load(Ordering::Relaxed);
-    if kick_at <= arm_at {
-        if now.saturating_sub(arm_at) < NF_KICK_MS { return 0; }
-        NF_KICK_AT.store(now.max(arm_at + 1), Ordering::Relaxed);
+    let owed_at = U9_OWED_AT.load(Ordering::Relaxed);
+    let owed_ms = if owed_at == 0 { 0 } else { now.saturating_sub(owed_at) };
+    let first = kick_at <= arm_at;
+    if first || (owed_at != 0 && kick_at < owed_at) {
+        let since = if first { now.saturating_sub(arm_at) } else { owed_ms };
+        if since < NF_KICK_MS { return 0; }
+        NF_KICK_AT.store(now.max(arm_at + 1).max(owed_at), Ordering::Relaxed);
         NF_STALLED.store(true, Ordering::Relaxed);
         let k = NF_KICKS.fetch_add(1, Ordering::Relaxed) + 1; u8_rung(1, now); // USBNET8: when, and which rung
         if k <= 2 || k.is_power_of_two() {
-            serial_println!("[usbnet] rx kick n={} pending_ms={} xfers={} rx_ok={} resets={}", k, now.saturating_sub(arm_at), RX_XFERS.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed));
+            serial_println!("[usbnet] rx kick n={} pending_ms={} owed_ms={} xfers={} rx_ok={} resets={}", k, now.saturating_sub(arm_at), owed_ms, RX_XFERS.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed));
         }
         return 1;
     }
     if now.saturating_sub(kick_at) < NF_KICK_MS { return 0; }
+    if owed_at == 0 || owed_ms < U9_OWED_MS {
+        u9_idle(now, owed_at != 0);
+        return 0;
+    }
+    let last = U9_RESET_AT.load(Ordering::Relaxed);
+    let backoff = U9_BACKOFF_MS.load(Ordering::Relaxed).max(U9_BACKOFF_MIN_MS);
+    if last != 0 && now.saturating_sub(last) < backoff { return 0; }
+    U9_RESET_AT.store(now.max(1), Ordering::Relaxed);
+    U9_BACKOFF_MS.store((backoff * 2).min(U9_BACKOFF_MAX_MS), Ordering::Relaxed);
+    U9_RESET_OWED_MS.store(owed_ms, Ordering::Relaxed);
     2
 }
-/// Rung two's outcome, from the controller (`usbnet_rx_reset`): the stranded TD is abandoned and the next data pass
-/// posts a fresh one. `[usbnet] rx reset n= stop_cc= deq_cc= in_state=` on the first two and every power of two.
+/// Rung two's outcome, from the controller (`usbnet_rx_reset`), after the Stop and the dequeue move. USBNET9 M2: a reset
+/// loses nothing it can keep — a real completion (cc 1 Success / 13 Short Packet) that raced the Stop stays DONE and the
+/// next data pass delivers it; a Stopped TD (cc 26) whose bytes are a whole number of max packets is CARRIED: the next
+/// arm posts its TD at the offset after those bytes, so the AX88179 burst completes contiguously and is delivered whole.
+/// `[usbnet] rx reset n= stop_cc= deq_cc= in_state= … owed_ms= kept=` on the first two and every power of two.
 pub fn note_rx_reset(stop_cc: u8, deq_cc: u8, in_state: u8) {
     let r = NF_RESETS.fetch_add(1, Ordering::Relaxed) + 1; u8_rung(2, crate::arch::ms()); // USBNET8: when, and which rung
+    let kept = u9_keep();
     if r <= 2 || r.is_power_of_two() {
-        serial_println!("[usbnet] rx reset n={} stop_cc={} deq_cc={} in_state={} kicks={} xfers={} rx_ok={}", r, stop_cc, deq_cc, in_state, NF_KICKS.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed));
+        serial_println!("[usbnet] rx reset n={} stop_cc={} deq_cc={} in_state={} kicks={} xfers={} rx_ok={} owed_ms={} backoff_ms={} kept={}", r, stop_cc, deq_cc, in_state, NF_KICKS.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed), U9_RESET_OWED_MS.load(Ordering::Relaxed), U9_BACKOFF_MS.load(Ordering::Relaxed), kept);
     }
-    reset_arm(); // a Stopped transfer event the commands drained may have set DONE (code 26): not a frame, not an error
 }
 /// True once after RX completes again following a kick or a reset (the DHCP link tries re-arm on it).
 pub fn take_rx_resumed() -> bool { NF_RESUMED.swap(false, Ordering::Relaxed) }
@@ -1516,4 +1547,173 @@ fn u8_pass_tick() {
     let now = crate::arch::ms();
     let last = U8_PASS_LAST.swap(now, Ordering::Relaxed);
     if last != 0 { U8_PASS_GAP_MAX.fetch_max(now.saturating_sub(last), Ordering::Relaxed); }
+}
+
+// ── USBNET9 (rmbp-ledger B385) ──────────────────────────────────────────────────────────────────────
+// Flights 24/25: the NETFRAME ladder reset the IN endpoint every ~4 s on a quiet LAN (`needed=0` on nearly every
+// resume), and each reset discarded whatever the Stop caught. M1: rung two needs an ANSWER OWED — the AX88179 has no
+// RX-FIFO-level register in Linux `ax88179_178a.c` (R83: none invented), so "a frame is expected" is a solicited TX
+// (ARP request, DHCP to 67, DNS, NTP, ICMP echo, TCP SYN) issued after the last RX completion. M2: what a reset catches
+// is kept (`u9_keep`). M3: the DHCP client's frames on the wire, checksums verified here, and the first server reply.
+/// An answer owed this long (with a kick that drew nothing) is a stall worth rung two.
+const U9_OWED_MS: u64 = 2_000;
+/// Rung two's back-off: from this, doubling per reset that was not needed, to the cap.
+const U9_BACKOFF_MIN_MS: u64 = 8_000;
+const U9_BACKOFF_MAX_MS: u64 = 256_000;
+/// `[usbnet] rx idle …` at most this often.
+const U9_IDLE_EVERY_MS: u64 = 60_000;
+static U9_OWED_AT: AtomicU64 = AtomicU64::new(0);
+static U9_RESET_AT: AtomicU64 = AtomicU64::new(0);
+static U9_BACKOFF_MS: AtomicU64 = AtomicU64::new(U9_BACKOFF_MIN_MS);
+static U9_RESET_OWED_MS: AtomicU64 = AtomicU64::new(0);
+static U9_IDLE_AT: AtomicU64 = AtomicU64::new(0);
+static U9_SOLICITED: AtomicU64 = AtomicU64::new(0);
+/// The byte count a Stopped TD left in the RX buffer; the next arm continues after it (M2).
+static U9_CARRY: AtomicU32 = AtomicU32::new(0);
+/// The TD length the current arm posted (rx_len minus the carry it continues).
+static U9_TD_LEN: AtomicU32 = AtomicU32::new(0);
+static U9_KEPT: AtomicU64 = AtomicU64::new(0);
+static U9_DHCP_TX: AtomicU64 = AtomicU64::new(0);
+static U9_DHCP_RX: AtomicBool = AtomicBool::new(false);
+
+/// M1: the quiet-link line, once a minute at most: the IN TD is pending, nothing is owed (or not yet long enough), no reset.
+fn u9_idle(now: u64, owed: bool) {
+    let last_rx = NF_RX_LAST.load(Ordering::Relaxed).max(NF_ARM_AT.load(Ordering::Relaxed));
+    let quiet = now.saturating_sub(last_rx);
+    if quiet < 10_000 { return; }
+    let at = U9_IDLE_AT.load(Ordering::Relaxed);
+    if at != 0 && now.saturating_sub(at) < U9_IDLE_EVERY_MS { return; }
+    U9_IDLE_AT.store(now.max(1), Ordering::Relaxed);
+    serial_println!("[usbnet] rx idle quiet_s={} pending=1 owed={} solicited={} kicks={} resets={}",
+        quiet / 1000, owed as u8, U9_SOLICITED.load(Ordering::Relaxed), NF_KICKS.load(Ordering::Relaxed), NF_RESETS.load(Ordering::Relaxed));
+}
+
+/// M2: the controller's IN TD for the next arm — (byte offset into the RX buffer, length). After a carried Stop the TD
+/// continues the burst at the offset where the stopped one ended.
+pub fn rx_td() -> (usize, usize) {
+    let rxl = rx_len();
+    let c = (U9_CARRY.load(Ordering::Relaxed) as usize).min(rxl);
+    let len = rxl - c;
+    U9_TD_LEN.store(len as u32, Ordering::Relaxed);
+    (c, len)
+}
+/// M2: the bytes a completion leaves in the RX buffer from its start: the carry plus what this TD moved. Clears the carry.
+pub fn rx_take_len(residue: u32) -> usize {
+    let c = U9_CARRY.swap(0, Ordering::Relaxed) as usize;
+    let td = match U9_TD_LEN.load(Ordering::Relaxed) as usize { 0 => rx_len() - c.min(rx_len()), v => v };
+    (c + td.saturating_sub(residue as usize)).min(rx_len())
+}
+/// M2: after rung two's commands drained the Stopped transfer event. Returns what was kept, for the reset line.
+fn u9_keep() -> alloc::string::String {
+    if !DONE.load(Ordering::Relaxed) {
+        reset_arm(); // the TD was never touched (or the event did not come): nothing to keep
+        return alloc::string::String::from("none");
+    }
+    let code = CODE.load(Ordering::Relaxed);
+    let residue = RESIDUE.load(Ordering::Relaxed) as usize;
+    if code == 1 || code == 13 {
+        U9_KEPT.fetch_add(1, Ordering::Relaxed);
+        return alloc::string::String::from("complete"); // DONE stays: the next data pass delivers it like any completion
+    }
+    let carry = U9_CARRY.load(Ordering::Relaxed) as usize;
+    let td = U9_TD_LEN.load(Ordering::Relaxed) as usize;
+    let moved = td.saturating_sub(residue);
+    let mps = (IN_MPS.load(Ordering::Relaxed) as usize).max(1);
+    reset_arm();
+    if code == 26 && moved > 0 && moved < td && moved % mps == 0 {
+        U9_CARRY.store((carry + moved) as u32, Ordering::Relaxed);
+        U9_KEPT.fetch_add(1, Ordering::Relaxed);
+        return alloc::format!("carry:{}", carry + moved);
+    }
+    U9_CARRY.store(0, Ordering::Relaxed);
+    if moved > 0 || carry > 0 { alloc::format!("lost:{}:cc{}", carry + moved, code) } else { alloc::string::String::from("none") }
+}
+
+/// M1 + M3: every frame the data pass issues. Solicited frames open the answer-owed clock; DHCP client frames are dumped.
+fn u9_tx_seen(f: &[u8]) {
+    if f.len() < 14 { return; }
+    let et = u16::from_be_bytes([f[12], f[13]]);
+    let solicited = match et {
+        0x0806 => f.len() >= 22 && u16::from_be_bytes([f[20], f[21]]) == 1, // ARP request
+        0x0800 if f.len() >= 34 => {
+            let ihl = ((f[14] & 0x0f) as usize) * 4;
+            let l4 = 14 + ihl;
+            match f[23] {
+                1 => f.len() > l4 && f[l4] == 8, // ICMP echo request
+                17 if f.len() >= l4 + 8 => {
+                    let dport = u16::from_be_bytes([f[l4 + 2], f[l4 + 3]]);
+                    if dport == 67 { u9_dhcp_dump(f, ihl); }
+                    dport == 67 || dport == 53 || dport == 123
+                }
+                6 if f.len() >= l4 + 14 => f[l4 + 13] & 0x12 == 0x02, // TCP SYN (not SYN-ACK)
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if solicited {
+        U9_SOLICITED.fetch_add(1, Ordering::Relaxed);
+        let _ = U9_OWED_AT.compare_exchange(0, crate::arch::ms().max(1), Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+/// RFC 1071 one's-complement sum, folded.
+fn u9_sum(mut acc: u32, b: &[u8]) -> u32 {
+    let mut i = 0;
+    while i + 1 < b.len() { acc += u16::from_be_bytes([b[i], b[i + 1]]) as u32; i += 2; }
+    if i < b.len() { acc += (b[i] as u32) << 8; }
+    while acc > 0xffff { acc = (acc & 0xffff) + (acc >> 16); }
+    acc
+}
+/// The DHCP option 53 (message type) of a BOOTP payload, and its options run (after the magic cookie).
+fn u9_dhcp_type(bootp: &[u8]) -> (u8, &[u8]) {
+    if bootp.len() < 240 || bootp[236..240] != [0x63, 0x82, 0x53, 0x63] { return (0, &[]); }
+    let opts = &bootp[240..];
+    let mut i = 0;
+    let mut ty = 0u8;
+    while i < opts.len() {
+        match opts[i] {
+            0 => { i += 1; continue; }
+            255 => { i += 1; break; }
+            code => {
+                if i + 1 >= opts.len() { break; }
+                let l = opts[i + 1] as usize;
+                if code == 53 && l >= 1 && i + 2 < opts.len() { ty = opts[i + 2]; }
+                i += 2 + l;
+            }
+        }
+    }
+    (ty, &opts[..i.min(opts.len())])
+}
+/// M3: `[usbnet] tx dhcp <discover|request|type=N> xid= len= ipsum= udpsum= flags= bytes=<first 64 of the frame> opts=<options>`,
+/// the first two and every power of two — the next flight lays it beside RFC 2131 §4.1 / §4.3.1.
+fn u9_dhcp_dump(f: &[u8], ihl: usize) {
+    let n = U9_DHCP_TX.fetch_add(1, Ordering::Relaxed) + 1;
+    if !(n <= 2 || n.is_power_of_two()) { return; }
+    let l4 = 14 + ihl;
+    let ipsum = if u9_sum(0, &f[14..l4]) == 0xffff { "ok" } else { "bad" };
+    let ulen = u16::from_be_bytes([f[l4 + 4], f[l4 + 5]]) as usize;
+    let udpsum = if u16::from_be_bytes([f[l4 + 6], f[l4 + 7]]) == 0 {
+        "none"
+    } else if l4 + ulen <= f.len() {
+        let mut acc = u9_sum(0, &f[26..34]); // source + destination address
+        acc += 17 + ulen as u32;
+        if u9_sum(acc, &f[l4..l4 + ulen]) == 0xffff { "ok" } else { "bad" }
+    } else {
+        "short"
+    };
+    let bootp = &f[(l4 + 8).min(f.len())..];
+    let (ty, opts) = u9_dhcp_type(bootp);
+    let name = match ty { 1 => "discover", 3 => "request", _ => "other" };
+    let xid = if bootp.len() >= 8 { u32::from_be_bytes([bootp[4], bootp[5], bootp[6], bootp[7]]) } else { 0 };
+    let flags = if bootp.len() >= 12 { u16::from_be_bytes([bootp[10], bootp[11]]) } else { 0 };
+    serial_println!("[usbnet] tx dhcp {} n={} type={} xid={:08x} len={} ipsum={} udpsum={} flags={:04x} bytes={} opts={}",
+        name, n, ty, xid, f.len(), ipsum, udpsum, flags, HexRun(&f[..f.len().min(64)]), HexRun(&opts[..opts.len().min(96)]));
+}
+/// M3: the first DHCP server reply that reaches the ring: `[usbnet] rx dhcp from=<ip> type=<2 offer|5 ack|6 nak> xid= len=`.
+fn u9_rx_dhcp(f: &[u8], ihl: usize) {
+    if U9_DHCP_RX.swap(true, Ordering::Relaxed) || f.len() < 34 { return; }
+    let bootp = &f[(14 + ihl + 8).min(f.len())..];
+    let (ty, _) = u9_dhcp_type(bootp);
+    let xid = if bootp.len() >= 8 { u32::from_be_bytes([bootp[4], bootp[5], bootp[6], bootp[7]]) } else { 0 };
+    serial_println!("[usbnet] rx dhcp from={}.{}.{}.{} type={} xid={:08x} len={}", f[26], f[27], f[28], f[29], ty, xid, f.len());
 }

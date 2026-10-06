@@ -356,6 +356,13 @@ pub trait VfsBackend {
         Err(VfsError::Unsupported)
     }
 
+    /// ATTRCOLUMNS (rmbp-ledger B402): set several typed attributes (`None` = remove that key) on the object at
+    /// `rel` in ONE transaction where the volume has one — a sniffer's facts with `una:type`, an inline edit with
+    /// its change time. Default `Unsupported` (FAT carries no typed attributes).
+    fn set_attrs(&self, _rel: &str, _kv: &[(String, Option<AttrValue>)], _principal: &str) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
     /// BOOT80 (rmbp B350): create `files` — each a name plus its typed attributes, no data — under the
     /// directory at `rel` in ONE transaction where the volume has one (UnaFS's `create_files_batch`:
     /// one root flip instead of a flip per create and per attribute). Returns how many were created.
@@ -552,7 +559,7 @@ impl MountTable {
     /// as long as a root mount exists this never returns
     /// [`VfsError::NoSuchVolume`].
     pub fn resolve<'a>(&'a self, path: &'a str) -> Result<(&'a dyn VfsBackend, &'a str), VfsError> {
-        let path = if path.is_empty() { "/" } else { path };
+        let path = if path.is_empty() { "/" } else { path }; if let Some(r) = crate::fs::rootdisk::redirect(self, path) { return r; } // ROOTDISK (B390, R94): `/volumes/UnaOS/…` IS `/…` through the whole table; (ROOTDISK2: the one-image `/apps/LIB` compat is deleted). Folded: this file's panic Locations are line-pinned.
         let mut best: Option<&Mount> = None;
         for m in &self.mounts {
             if prefix_claims(&m.prefix, path) {
@@ -801,6 +808,12 @@ impl MountTable {
     pub fn get_attr(&self, path: &str, key: &str, principal: &str) -> Result<AttrValue, VfsError> {
         let (b, rel) = self.resolve(path)?;
         b.get_attr(rel, key, principal)
+    }
+
+    /// ATTRCOLUMNS (B402): [`VfsBackend::set_attrs`] on the volume that holds `path` — one transaction.
+    pub fn set_attrs(&self, path: &str, kv: &[(String, Option<AttrValue>)], principal: &str) -> Result<(), VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.set_attrs(rel, kv, principal)
     }
 
     /// BOOT80 (B350): [`VfsBackend::create_files_batch`] on the volume that holds directory `path`.
@@ -1408,7 +1421,7 @@ impl VfsBackend for FatBackend {
         // surfacing from deep in `write_grow`. This is not an ACL refusal
         // (`Denied`): the principal may be perfectly authorized; the VOLUME has
         // no writable surface. A future world-writable USB flag would relax this.
-        if self.read_only() {
+        if crate::fs::bootfat::refuse(&self.volume, &self.root, _rel, principal) || self.read_only() { // ROOTDISK2 (B401, R99): the boot FAT is sacred — refused for every principal, root included, unless `fat_unlock` is held
             return Err(VfsError::Unsupported);
         }
         // FOREIGN-VOLUME WRITE POSTURE (doc §5, extended by VFS-2): the volume's
@@ -1524,7 +1537,7 @@ impl VfsBackend for FatBackend {
     /// the same answer the block layer gives, with the REASON attached, so the operator line names
     /// the mechanism that said no instead of a bare `-ENOTSUP`.
     fn write_veto(&self) -> Option<&'static str> {
-        self.source.write_veto()
+        crate::fs::bootfat::veto(&self.volume).or_else(|| self.source.write_veto()) // SMALLFIX3 (B416): R99 asked BEFORE the write, so a fixture's skip guard (XVOL's `write_veto`) sees the sacred FAT
     }
 
     fn rename(&self, from_rel: &str, to_rel: &str, principal: &str) -> Result<(), VfsError> {
@@ -2018,6 +2031,42 @@ impl VfsBackend for NativeBackend {
             native_write_authz(fs, id, principal)?;
             fs.set_attribute(id, key.to_string(), value.clone().into_native()) // `with_unafs` takes FnMut
                 .map_err(|_| VfsError::Backend("unafs-setattr"))
+        })
+        .map_err(unafs_err)?
+    }
+
+    /// ATTRCOLUMNS (B402): every key guarded and checked like `set_attr`, the write authorized once, then the keys
+    /// staged with autocommit OFF and ONE commit (the K9 batch shape: `native_acl_write_on`). No early return
+    /// between the two `set_autocommit` calls; a failed stage commits nothing and discards the cached mount.
+    fn set_attrs(&self, rel: &str, kv: &[(String, Option<AttrValue>)], principal: &str) -> Result<(), VfsError> {
+        for (k, v) in kv.iter() {
+            attr_key_guard(k, principal)?;
+            if let Some(v) = v {
+                v.check()?;
+            }
+        }
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_write_authz(fs, id, principal)?;
+            fs.set_autocommit(false);
+            let mut staged = true;
+            for (k, v) in kv.iter() {
+                let r = match v {
+                    Some(v) => fs.set_attribute(id, k.clone(), v.clone().into_native()).is_ok(),
+                    None => matches!(fs.get_attribute(id, k), Ok(None)) || fs.remove_attribute(id, k).is_ok(),
+                };
+                if !r {
+                    staged = false;
+                    break;
+                }
+            }
+            let ok = staged && fs.commit().is_ok();
+            if !ok {
+                crate::fs::unafs::request_mount_discard();
+            }
+            fs.set_autocommit(true);
+            if ok { Ok(()) } else { Err(VfsError::Backend("unafs-setattrs")) }
         })
         .map_err(unafs_err)?
     }
@@ -2917,14 +2966,14 @@ pub fn rmdir_unafs_witness() {
 pub struct NsMockBackend {
     name: String,
     /// `(volume-relative path, kind, size)`. The root is implicit and is never an entry.
-    nodes: spin::Mutex<Vec<(String, NodeKind, u64)>>,
+    nodes: crate::sync::Mutex<Vec<(String, NodeKind, u64)>>,
 }
 
 #[cfg(feature = "witness")]
 #[doc(hidden)]
 impl NsMockBackend {
     fn new(name: &str) -> Self {
-        Self { name: name.to_string(), nodes: spin::Mutex::new(Vec::new()) }
+        Self { name: name.to_string(), nodes: crate::sync::Mutex::new(Vec::new()) }
     }
     /// The parent directory of `rel`, volume-relative; `""` for a name directly under the root.
     fn parent_of(rel: &str) -> String {

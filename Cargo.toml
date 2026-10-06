@@ -11,6 +11,7 @@ members = [
     "libs/input/ibus",
     "unaos/libs/sys/helm",
     "unaos/libs/sys/midden_core",
+    "unaos/libs/fs/exfat_core", # EXFAT (B392): the exFAT reader the kernel's removable volumes and the host KATs share
     "unaos/libs/sys/prefs_core",
     "unaos/libs/sys/wifi_core",
     "unaos/libs/sys/usbnet_core", # NETFRAME (B368): the USB Ethernet rx framing core the kernel driver and the host KATs share
@@ -78,6 +79,7 @@ members = [
     "tools/holocron",
     "tools/crypto-check",
     "tools/eyes",
+    "tools/una-res", # APPRES (B398): the program resource writer
     "vessels/lumen",
     "vessels/pulse",
     "vessels/phonolite",

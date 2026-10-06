@@ -83,6 +83,10 @@ name = "elf_core"
 version = "0.1.0"
 
 [[package]]
+name = "exfat_core"
+version = "0.1.0"
+
+[[package]]
 name = "fatfs"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -202,6 +206,7 @@ checksum = "f102c477fd4ec864c149803bf606ecc23bc9329602ec0f99073a728abf454abc"
 name = "pixel_core"
 version = "0.1.0"
 dependencies = [
+ "svg_core",
  "vp8_core",
 ]
 
@@ -308,6 +313,13 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "svg_core"
+version = "0.1.0"
+dependencies = [
+ "font_core",
+]
 
 [[package]]
 name = "syn"
@@ -437,6 +449,7 @@ dependencies = [
  "demux_core",
  "diag_core",
  "elf_core",
+ "exfat_core",
  "fdt",
  "font8x8",
  "font_core",

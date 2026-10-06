@@ -220,11 +220,12 @@ struct Tns {
     length: [[u8; 4]; 8],
     order: [[u8; 4]; 8],
     direction: [[bool; 4]; 8],
-    lpc: [[[f32; 20]; 4]; 8],
+    /// AUDIOCORE (B396): [window][filter][coef], on the heap (2.5 KiB per channel), allocated once.
+    lpc: Vec<[[f32; 20]; 4]>,
 }
 
 impl Default for Tns {
-    fn default() -> Tns { Tns { n_filt: [0; 8], length: [[0; 4]; 8], order: [[0; 4]; 8], direction: [[false; 4]; 8], lpc: [[[0.0; 20]; 4]; 8] } }
+    fn default() -> Tns { Tns { n_filt: [0; 8], length: [[0; 4]; 8], order: [[0; 4]; 8], direction: [[false; 4]; 8], lpc: vec![[[0.0; 20]; 4]; 8] } }
 }
 
 #[derive(Clone)]
@@ -250,16 +251,18 @@ impl Default for Ics {
 /// One decoded individual_channel_stream, before the filterbank.
 struct Chan {
     ics: Ics,
-    band_type: [u8; 8 * 64],
+    /// AUDIOCORE (B396): band_type / sf / coef on the heap, allocated once at `new` (a `Chan` was ~9 KiB of
+    /// inline arrays, two per decoder; the constructor chains built ~40 KiB values on the stack).
+    band_type: Vec<u8>,
     /// scalefactor (normal), noise energy (PNS) or intensity position, per [group][sfb]
-    sf: [i32; 8 * 64],
+    sf: Vec<i32>,
     tns_present: bool,
     tns: Tns,
-    coef: [f32; 1024],
+    coef: Vec<f32>,
 }
 
 impl Chan {
-    fn new() -> Chan { Chan { ics: Ics::default(), band_type: [0; 512], sf: [0; 512], tns_present: false, tns: Tns::default(), coef: [0.0; 1024] } }
+    fn new() -> Chan { Chan { ics: Ics::default(), band_type: vec![0; 512], sf: vec![0; 512], tns_present: false, tns: Tns::default(), coef: vec![0.0; 1024] } }
 }
 
 /// Filterbank state of one output channel.
@@ -399,7 +402,7 @@ impl AacDecoder {
         // overlap out), so a dropped element fades rather than clicks
         for ch in 0..self.layout.channels {
             if !done[ch] {
-                self.chans[0].coef = [0.0; 1024];
+                self.chans[0].coef.fill(0.0);
                 self.chans[0].ics = Ics { window_shape: self.ov[ch].prev_shape, ..Ics::default() };
                 self.synth(0, ch);
             }
@@ -514,7 +517,7 @@ impl AacDecoder {
         // section_data
         let bits = if ics.window_sequence == EIGHT_SHORT { 3 } else { 5 };
         let esc = (1u32 << bits) - 1;
-        ch.band_type = [0; 512];
+        ch.band_type.fill(0);
         for g in 0..ng {
             let mut k = 0;
             while k < ics.max_sfb {
@@ -533,7 +536,7 @@ impl AacDecoder {
         let mut noise = global_gain - 90;
         let mut is_pos = 0i32;
         let mut noise_first = true;
-        ch.sf = [0; 512];
+        ch.sf.fill(0);
         for g in 0..ng {
             for sfb in 0..ics.max_sfb {
                 let i = g * ics.max_sfb + sfb;
@@ -677,7 +680,7 @@ impl AacDecoder {
             if q[p] > 0 { q[p] += amp; } else { q[p] -= amp; }
         }
         // inverse quantisation and scaling (§4.6.1.3, §4.6.2.3); PNS (§4.6.13)
-        ch.coef = [0.0; 1024];
+        ch.coef.fill(0.0);
         let mut gw = 0usize;
         for g in 0..ng {
             let gl = ics.group_len[g];
@@ -827,7 +830,7 @@ impl AacDecoder {
         let _sign = r.bit()?;
         let _scale = r.read(2)?;
         // decode the ICS into slot 1's scratch (its result is discarded)
-        let save = core::mem::replace(&mut self.chans[1].coef, [0.0; 1024]);
+        let save = core::mem::replace(&mut self.chans[1].coef, vec![0.0; 1024]);
         self.decode_ics(r, 1, false)?;
         self.chans[1].coef = save;
         let ics = self.chans[1].ics.clone();

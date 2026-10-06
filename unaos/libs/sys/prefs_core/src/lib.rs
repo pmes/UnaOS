@@ -39,8 +39,14 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod declare;
+pub mod files;
+pub mod appearance;
+pub mod login;
+pub mod modes;
 pub mod rules;
 pub mod schema;
+pub mod trackpad; // TRACKPADPANE (B412): the Trackpad pane's rules
 pub mod wire;
 
 use alloc::collections::BTreeMap;

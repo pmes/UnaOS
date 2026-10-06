@@ -314,7 +314,7 @@ pub fn calibrate(pm: &crate::arch::acpi::PmTimer) {
     // calibrated 1 kHz count (initcnt ≈ APIC_TIMER_HZ / 1000). This line lands immediately AFTER the
     // "APIC: calibrated over ..." line above (the gate depends on that order — re-arming between the
     // stores and the print would put the armed line before the calibrated line).
-    init_timer();
+    init_timer(); super::clockcore::start(tsc_hz); // CLOCKCORE (B397): the global ms clock moves to the TSC here (BSP, before the APs)
 
     // CLOCK-X1 (M1): note the wall-clock timebase honestly. The invariant-TSC bit is what gates
     // `clock::monotonic()` on x86 — with it the JD17 wall clock advances here; without it a set clock
@@ -363,7 +363,7 @@ pub fn apic_timer_hz() -> u64 {
 /// Milliseconds since boot (the global 1 kHz timebase; see `APIC_TICKS`).
 #[inline]
 pub fn ticks() -> u64 {
-    APIC_TICKS.load(Ordering::Relaxed)
+    super::clockcore::ms() // CLOCKCORE (B397): the invariant TSC once calibrated (no core's masked span stops it); `APIC_TICKS` before that
 }
 
 /// One-time diagnostic: measure the *global* ms-clock rate (`ticks()`) against the PM timer over a
@@ -386,7 +386,7 @@ pub fn report_tick_rate(pm: &crate::arch::acpi::PmTimer) {
     let target_pm = (pm_hz * WINDOW_MS / 1000) as u32;
     let pm_start = pm.read();
     let tsc_start = crate::arch::now_cycles();
-    let ticks_start = ticks();
+    let ticks_start = APIC_TICKS.load(Ordering::Relaxed); // CLOCKCORE: the BSP heartbeat itself, not the TSC clock
 
     // Busy-wait a real PM-timer window with interrupts ENABLED, so the periodic timer ISR advances
     // the global clock while we watch. (Not `without_interrupts` — the whole point is to count ticks.)
@@ -405,14 +405,14 @@ pub fn report_tick_rate(pm: &crate::arch::acpi::PmTimer) {
         return;
     }
 
-    let ticks_delta = ticks().wrapping_sub(ticks_start);
+    let ticks_delta = APIC_TICKS.load(Ordering::Relaxed).wrapping_sub(ticks_start);
     let observed_hz = (ticks_delta as u128 * pm_hz as u128 / elapsed_pm as u128) as u64;
     crate::bootlog_println!(
         "APIC: global ms-clock {} ticks / {} ms => {} Hz (single-rate; want ~1000 on metal, lower under QEMU/TCG timer coalescing).",
         ticks_delta,
         elapsed_pm as u64 * 1000 / pm_hz,
         observed_hz
-    );
+    ); super::clockcore::boot_witness(); // CLOCKCORE (B397): after SMP — offsets applied if any AP is out of sync, the masked-section watch armed, `[clock]` printed
 }
 
 /// Signal End-Of-Interrupt to the local APIC. Called from every APIC-delivered handler (the

@@ -1143,7 +1143,7 @@ mod metal {
     /// identity: the SDHCI register file is a single shared resource, so two overlapping readers would
     /// interleave BLKSIZECNT/CMDTM/INTERRUPT writes on the same controller. Serialising here means the
     /// block layer above needs no rule of its own. Nothing in this file locks it re-entrantly.
-    static SD_BLK: spin::Mutex<Option<SdBlk>> = spin::Mutex::new(None);
+    static SD_BLK: crate::sync::Mutex<Option<SdBlk>> = crate::sync::Mutex::new(None);
 
     /// Read one arbitrary block `lba` via polled single-block CMD17 into `buf` (512 bytes). READ-ONLY —
     /// the only card command it can issue is CMD17. Returns whether the block was read. The unarmed twin
@@ -1606,7 +1606,7 @@ mod metal {
     /// `None` at the deferred site means the census never identified a card (no controller / no card), so
     /// the install site prints an honest skip and does nothing.
     #[cfg(feature = "install_target")]
-    static PENDING_INSTALL: spin::Mutex<Option<(u64, Card, [u8; 512])>> = spin::Mutex::new(None);
+    static PENDING_INSTALL: crate::sync::Mutex<Option<(u64, Card, [u8; 512])>> = crate::sync::Mutex::new(None);
 
     // ── ORIN-SDMMC-3: multi-block transfer primitives (CMD18 READ_MULTIPLE / CMD25 WRITE_MULTIPLE) ──
     //

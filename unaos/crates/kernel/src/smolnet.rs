@@ -46,7 +46,7 @@ use smoltcp::wire::{
     EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
     IpListenEndpoint, Ipv4Address, Ipv4Cidr,
 };
-use spin::Mutex as SpinMutex;
+use crate::sync::Mutex as SpinMutex;
 
 use crate::drivers::e1000::{self, PingOutcome};
 use crate::net_phy::{RawNic, RxObserver, SmoltcpPhy};
@@ -324,7 +324,7 @@ pub fn witness_tick() {
 // SOCK-1's ICMP path builds a THROWAWAY Interface + one socket per blocking op. A
 // UDP socket has to survive BETWEEN `bind` and `recvfrom` (separate syscalls), so
 // SOCK-2 promotes the interface + a real `SocketSet` to a persistent, static-backed
-// singleton behind `STACK` (a `spin::Mutex<Option<SmolStack>>`, the `NET_DEVICE`
+// singleton behind `STACK` (a `crate::sync::Mutex<Option<SmolStack>>`, the `NET_DEVICE`
 // mirror). EVERYTHING is static / BSS: the socket-set storage, every UDP socket's
 // packet buffers, and the device RX/TX scratch (the ~3 KiB of frame buffers live in
 // the `SmolStack` field, NOT on any stack — so the ~5-7 KiB smolnet frame budget the
@@ -631,6 +631,7 @@ fn dhcp_apply(stack: &mut SmolStack, cidr: Ipv4Cidr, router: Option<Ipv4Address>
         CURRENT_DNS.store(u32::from_be_bytes([o[0], o[1], o[2], o[3]]), Ordering::Relaxed);
     }
     let addr = cidr.address().octets();
+    crate::video::notify(b"system", b"Network connected", alloc::format!("Address {}.{}.{}.{} (DHCP lease)", addr[0], addr[1], addr[2], addr[3]).as_bytes(), b"", 0, b""); // NOTIFY (B418): NETCLOCK's lease is a notification
     serial_println!(
         ":: SOCK-5: smoltcp dhcpv4 lease {}.{}.{}.{}/{} gw {} — witness OK ::",
         addr[0], addr[1], addr[2], addr[3], cidr.prefix_len(),

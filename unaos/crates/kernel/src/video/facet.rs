@@ -1002,7 +1002,7 @@ const BASE_H: usize = 1536;
 /// Zoom steps, percent of the BASE image.
 const ZSTEPS: [u32; 8] = [25, 50, 75, 100, 150, 200, 300, 400];
 /// Letterbox colour.
-const BG: u32 = 0xFF20_2020;
+const BG: u32 = crate::video::theme::opaque(crate::video::theme::MEDIA_BG);
 
 /// Everything the window needs to re-render itself.
 struct View {
@@ -1030,17 +1030,17 @@ struct View {
     info: bool,
 }
 
-static VIEW: spin::Mutex<Option<View>> = spin::Mutex::new(None);
+static VIEW: crate::sync::Mutex<Option<View>> = crate::sync::Mutex::new(None);
 
 /// The viewport surface — the window's own buffer, ARGB8888 `vw * vh` words. Re-rendered IN PLACE (it
 /// is never reallocated while the row names it) and freed by [`close`].
-static SURF: spin::Mutex<Vec<u32>> = spin::Mutex::new(Vec::new());
+static SURF: crate::sync::Mutex<Vec<u32>> = crate::sync::Mutex::new(Vec::new());
 
 /// The path currently on the glass, for the census line, browse and the idempotent re-open.
-static SHOWN: spin::Mutex<String> = spin::Mutex::new(String::new());
+static SHOWN: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
 
 /// The path a gesture asked for, waiting for a pass that is allowed to open it.
-static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
 
 /// Ask for `path` to be opened. **This is what a click or a key press calls, and [`open_path`] is
 /// not.** THE LATCH IS NOT CEREMONY — it is `dock::press_at`'s law: the click router runs on a 16 KiB
@@ -1065,7 +1065,7 @@ enum Cmd {
     Wheel(i8),
 }
 
-static CMDS: spin::Mutex<Vec<Cmd>> = spin::Mutex::new(Vec::new());
+static CMDS: crate::sync::Mutex<Vec<Cmd>> = crate::sync::Mutex::new(Vec::new());
 /// Drag anchor (screen coordinates of the last sample); `DRAG_ON` says whether a drag is live.
 static DRAG_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static DRAG_X: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
@@ -1223,7 +1223,7 @@ fn render(v: &mut View) {
         let h = (ch + 4).min(v.vh);
         let y0 = v.vh - h;
         for p in s[y0 * v.vw..].iter_mut() {
-            *p = 0xFF10_1010;
+            *p = crate::video::theme::opaque(crate::video::theme::MEDIA_MATTE);
         }
         let t = match v.mtime {
             Some(t) => alloc::format!("{:04}-{:02}-{:02} {:02}:{:02}", t.year, t.month, t.day, t.hour, t.min),
@@ -1234,7 +1234,7 @@ fn render(v: &mut View) {
             v.src_w, v.src_h, v.bytes, v.ihdr.depth, colour_name(v.ihdr.colour), t
         );
         let vw = v.vw;
-        crate::video::text::draw_text(&mut s, vw, vw, v.vh, 4, y0 + 2, line.as_bytes(), 0x00F0_F0F0, false, face);
+        crate::video::text::draw_text(&mut s, vw, vw, v.vh, 4, y0 + 2, line.as_bytes(), crate::video::theme::MEDIA_CAPTION, false, face);
     }
 }
 
@@ -1299,13 +1299,13 @@ fn show_message(path: &str, reason: &str) {
     if surf.try_reserve_exact(vw * vh).is_err() {
         return;
     }
-    surf.resize(vw * vh, 0xFFF5_F2EA);
+    surf.resize(vw * vh, crate::video::theme::opaque(crate::video::theme::content_fill()));
     let face = crate::video::text::Face::Body;
     let ch = face.cell_h();
     let l1 = alloc::format!("Cannot show {}", title_of(path));
     let l2 = alloc::format!("reason: {}", reason);
-    crate::video::text::draw_text(&mut surf, vw, vw - 8, vh, 8, 8, l1.as_bytes(), 0x0021_201E, false, face);
-    crate::video::text::draw_text(&mut surf, vw, vw - 8, vh, 8, 8 + ch + 4, l2.as_bytes(), 0x00A0_2020, false, face);
+    crate::video::text::draw_text(&mut surf, vw, vw - 8, vh, 8, 8, l1.as_bytes(), crate::video::theme::content_text(), false, face);
+    crate::video::text::draw_text(&mut surf, vw, vw - 8, vh, 8, 8 + ch + 4, l2.as_bytes(), crate::video::theme::error_text(), false, face);
     *SURF.lock() = surf;
     match mint(&title_of(path), vw, vh) {
         Ok(id) => {
@@ -1401,7 +1401,7 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
         if px.try_reserve_exact(bw * bh).is_err() {
             return Err(FacetError::OutOfMemory(bw * bh * 4));
         }
-        px.resize(bw * bh, 0xFF00_0000);
+        px.resize(bw * bh, crate::video::theme::OPAQUE_BLACK);
         let mut src = IdatSource::new(&mt, path, &spans);
         let r = decode_into(ihdr, &palette, &mut src, k, bw, bh, &mut px);
         let d = match (r, src.io_error.take()) {
@@ -2105,7 +2105,7 @@ pub fn imgview_selftest() {
     apply(Cmd::Next);
     let browsed = n >= 2 && shown() != pa && is_open();
     open_path(&pb);
-    let pal_ok = shown() == pb && view(&|v| v.src_w == 16 && v.ihdr.colour == 3 && v.px[0] == 0xFF00_FF00);
+    let pal_ok = shown() == pb && view(&|v| v.src_w == 16 && v.ihdr.colour == 3 && v.px[0] == crate::video::theme::fixture::OPAQUE_GREEN);
     apply(Cmd::Prev);
     let back = shown() != pb && is_open();
     // A refused file shows a message window, not nothing.
@@ -2131,3 +2131,8 @@ pub fn imgview_selftest() {
 // a child module, so no `video/mod.rs` line.
 #[path = "facet_anim.rs"]
 pub mod anim;
+
+/// APPRES (B398): the live Facet window id (the dock draws its icon on that tile), or [`wm::WIN_NONE`].
+pub fn win() -> wm::WinId {
+    WIN.load(Ordering::Relaxed)
+}

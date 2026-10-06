@@ -174,7 +174,7 @@ pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 use unaos_boot_info::FrameBufferInfo;
 
 /// The primary display surface. The GUI renderer (`pal::TargetPal` → `console`) draws here.
@@ -455,7 +455,7 @@ pub fn panel_info_nonblocking() -> Option<FrameBufferInfo> {
 }
 
 /// The panel background the GUI paints over — Can-Am dark grey, `#1E1E1E`.
-pub const PANEL_BG: u32 = 0x001E_1E1E;
+pub const PANEL_BG: u32 = crate::video::theme::PANEL_BG;
 
 /// Paint the panel background once at boot, and witness the framebuffer geometry the bootloader
 /// handed us.
@@ -906,7 +906,7 @@ pub(crate) fn note_panel_write_refused(_tier: u8, _term: &'static str, _site: &'
 // feature. So the gate is a DEPENDENCY fact, not a policy one, and it moves the day the furniture
 // family's does — together, in one place.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub mod winmenu; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod appmenu; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod winlist; // WINDOWLIST (R75)
+pub mod winmenu; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod appmenu; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod winlist; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod sysmenu; // WINDOWLIST (R75) // APPMENU2 (B393): the WM default menus' actions + the system chords
 
 // ── FACET (`facet` / UNAOS_FACET=1, implied by `deskcascade`) — the IMAGE VIEWER ────────────────
 //
@@ -979,8 +979,8 @@ pub mod status;
 //
 // Flight 12's menubar census moved `decl_lock` 0 -> 16 across the menubar fixture and the wire could
 // not say WHICH lock refused (the panel, `WRITER`; or the strip scratch, `strip::SCRATCH`) nor WHO
-// held it. Both are plain `spin::Mutex`es: nothing about a refused `try_lock` names the holder. This
-// type is that `spin::Mutex` plus a holder record written on every successful acquire and cleared on
+// held it. Both are plain `crate::sync::Mutex`es: nothing about a refused `try_lock` names the holder. This
+// type is that `crate::sync::Mutex` plus a holder record written on every successful acquire and cleared on
 // release: the acquiring SITE (`#[track_caller]`, so every existing `WRITER.lock()` call site names
 // itself with no edit there), a caller-supplied TAG (the strip scratch sets its tenant), the CORE,
 // the acquire time in `arch::now_cycles()` units, and whether interrupts were MASKED at acquire — an
@@ -1009,7 +1009,7 @@ pub(crate) fn held_core_arm() {
     }
 }
 
-/// MENULOCK — a `spin::Mutex` with a holder record. See the block above.
+/// MENULOCK — a `crate::sync::Mutex` with a holder record. See the block above.
 pub struct HeldMutex<T> {
     inner: Mutex<T>,
     /// `&'static Location` of the acquiring call, as an address; `0` = free (or not yet recorded).
@@ -1039,7 +1039,7 @@ pub struct Holder {
 /// MENULOCK — the guard: `spin`'s guard plus the record's release.
 pub struct HeldGuard<'a, T> {
     lock: &'a HeldMutex<T>,
-    g: spin::MutexGuard<'a, T, spin::Spin>,
+    g: crate::sync::MutexGuard<'a, T, spin::Spin>,
 }
 
 impl<T> HeldMutex<T> {
@@ -1073,7 +1073,7 @@ impl<T> HeldMutex<T> {
         self.site.store(at as *const _ as usize, Ordering::Release);
     }
 
-    /// `spin::Mutex::lock`, recording the caller as the holder.
+    /// `crate::sync::Mutex::lock`, recording the caller as the holder.
     #[track_caller]
     #[inline]
     pub fn lock(&self) -> HeldGuard<'_, T> {
@@ -1083,7 +1083,7 @@ impl<T> HeldMutex<T> {
         HeldGuard { lock: self, g }
     }
 
-    /// `spin::Mutex::try_lock`, recording the caller as the holder on success.
+    /// `crate::sync::Mutex::try_lock`, recording the caller as the holder on success.
     #[track_caller]
     #[inline]
     pub fn try_lock(&self) -> Option<HeldGuard<'_, T>> {
@@ -1190,3 +1190,44 @@ pub mod wincap; pub mod rowstore; // WINDOWCAP (B378, R90): the one dynamic limi
 // KFONTPPI (B382): `video::edidsrc` — the EDID carry's source tag (fw / aux / none), the iGPU lane's AUX offer
 // into `EDID_BLOCK`, and the `:: KFONTPPI:` witness. Unconditional; at the tail so no line above moves.
 pub mod edidsrc;
+// DESKTOPBUILT (B387, R93): the desktop object — built at `login ok`, torn down at Log Out. Same gate as `strip`; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod desktopbuild;
+// PREFSUI (B389, R91/R93): the pointer capture a slider drag holds, and Principia's login items. Same gate as settings.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod capture;
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod loginitems;
+// DIALOG (B395, MACPARITY rows 23/34): THE alert widget (app-modal, sheets, the power confirms) and the one-line toast NOTIFY grows from. Same gate as crystal; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod dialog;
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod toast; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod notify; // NOTIFY (B418, MACPARITY row 24): the stack, the Center, the bell's count — the toast's queue grows into it. Same-line fold, code before comment.
+// BEZEL (B405, MACPARITY row 26): the brightness / volume bezel — a compositor draw (the toast's row), armed by the keys. Same gate as brightkeys; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod bezel;
+// PANICSCREEN (B406, MACPARITY row 37, R95): the plain panic screen, the panic log, the restart. At the tail so no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod panicscreen;
+// SETTINGSFILES (B407, R98): the Settings panel's `Stored in settings/<domain>` link and Quarry's Show Info pane for a settings file. Same gate as settings; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod settingsfiles;
+// APPEARANCE (B408, MACPARITY rows 21/22): Principia's `system.appearance.*` applied — Light/Dark, the accent, the highlight, one repaint. Same gate as settings; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod appearance;
+// LAUNCHER (B417, MACPARITY row 36): Cmd-Space — one field over programs, files, settings and math. x86 `wc` (the overlay row and the key door are x86's); at the tail so no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod launcher;
+// PLAYER (B419, MACPARITY row 30): the audio player window Quarry's `play` opener opens (transport, scrubber, volume). Same gate as fileview; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod player;
+
+/// NOTIFY (B418): post a notification from anywhere (a driver, the net stack, the panic marker) — QUEUE ONLY, no heap,
+/// no `wm`; a no-op on a build without the notification module. `act` is a `notify::ACT_*` code (0 = no button).
+#[allow(unused_variables)]
+pub fn notify(app: &[u8], title: &[u8], line: &[u8], label: &[u8], act: u8, arg: &[u8]) -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    return notify::post_full(app, title, line, label, act, arg);
+    #[allow(unreachable_code)]
+    false
+}

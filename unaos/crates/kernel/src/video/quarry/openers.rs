@@ -66,6 +66,7 @@ pub(super) fn act(opener: String, path: String, mime: String) -> Act {
 /// THE dispatch: run opener `id` on `path` (of type `mime`). Returns the path-bar line.
 pub fn open(id: &str, path: &str, mime: &str) -> String {
     let leaf = super::leaf(path);
+    super::attrcols::queue_open(path); // ATTRCOLUMNS (B402): an opened file's facts are refreshed on the next service pass
     match id {
         "launch" => {
             // Reap first, then test the ceiling (rmbp-7 QUARRY) — moved here unchanged from run_act.
@@ -101,8 +102,8 @@ pub fn open(id: &str, path: &str, mime: &str) -> String {
         "play" => {
             #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
             {
-                crate::drivers::hda::play::request_open(path);
-                serial_println!("[quarry] open PLAY path={} type={} -> play (latched for the service tick)", path, mime);
+                crate::video::player::request_open(path); // PLAYER (B419): the window owns the play (was the headless `hda::play::request_open`)
+                serial_println!("[quarry] open PLAY path={} type={} -> player (latched for the render pass)", path, mime);
             }
             #[cfg(not(all(target_arch = "x86_64", feature = "hda-tone")))]
             serial_println!("[quarry] open PLAY path={} -> no audio in this build (UNAOS_HDA+UNAOS_HDATONE arm it)", path);
@@ -112,8 +113,13 @@ pub fn open(id: &str, path: &str, mime: &str) -> String {
         "facet" => {
             #[cfg(feature = "facet")]
             {
+                #[cfg(not(feature = "svg"))]
+                if mime == crate::fs::filetype::IMAGE_SVG {
+                    serial_println!("[quarry] open VIEW path={} type={} kind=svg handler=none -> no svg renderer in this build (UNAOS_SVG arms it)", path, mime);
+                    return String::from("no svg renderer in this build");
+                }
                 crate::video::facet::request_open(path);
-                serial_println!("[quarry] open VIEW path={} type={} -> facet (latched for the render pass)", path, mime);
+                serial_println!("[quarry] open VIEW path={} type={} kind={} handler=facet -> facet (latched for the render pass)", path, mime, super::kind_token(mime)); // SMALLFIX2 (B391): kind + handler named
                 alloc::format!("opening {}", leaf)
             }
             #[cfg(not(feature = "facet"))]

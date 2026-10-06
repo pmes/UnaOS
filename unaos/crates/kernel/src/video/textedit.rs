@@ -14,7 +14,9 @@
 //! Text is bytes: printable ASCII only; on load `\t` becomes four spaces, `\r` is dropped, a file
 //! with NUL or a byte >= 0x80 is REFUSED (the face has no glyph and a save would corrupt it).
 //!
-//! Close prints `[edit] closed dirty=<0|1>` and asks nothing: a dirty close is lost work.
+//! Close prints `[edit] closed dirty=<0|1>`. DIALOG2 (B404): a DIRTY close by the close box ASKS — a sheet on the
+//! window, "Do you want to save the changes…" (Don't Save · Cancel · Save) — and the dirty state is declared to
+//! `dialog::unsaved_declare` on every flip, so Log Out's confirm lists it.
 //! The dirty mark in the title is `*` (the face carries no `•` glyph).
 //!
 //! Witness: `:: TEXTEDIT: path=<p> bytes=<n> lines=<n> edits=<n> saved=<n> -> PASS ::`.
@@ -40,8 +42,8 @@ const CHUNK: usize = 16 * 1024;
 const WHEEL_ROWS: usize = 3;
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
-static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
-static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 
 struct State {
     path: String,
@@ -207,7 +209,7 @@ pub fn open(path: &str) -> Result<(usize, usize), String> {
     if surf.try_reserve_exact(len).is_err() {
         return Err(String::from("out of memory"));
     }
-    surf.resize(len, theme::CONTENT_FILL);
+    surf.resize(len, theme::content_fill());
     if is_open() {
         close();
     }
@@ -247,6 +249,7 @@ pub fn close() {
     let (dirty, path, edits) = STATE.lock().as_ref().map(|s| (s.dirty, s.path.clone(), s.edits)).unwrap_or((false, String::new(), 0));
     wm::close(id);
     *STATE.lock() = None;
+    crate::video::dialog::unsaved_declare(OWNER, b"", false); // DIALOG2: nothing of ours is unsaved any more
     serial_println!("[edit] closed dirty={} path={} edits={} win={}", dirty as u8, path, edits, id);
 }
 
@@ -265,7 +268,7 @@ fn paint(st: &mut State) {
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let (w, h) = (st.w, st.h);
     for p in st.surf.iter_mut() {
-        *p = theme::CONTENT_FILL;
+        *p = theme::content_fill();
     }
     let sel = sel_range(st);
     let crow = row_of(&st.rows, st.caret);
@@ -278,12 +281,12 @@ fn paint(st: &mut State) {
             let lo = core::cmp::max(s, a);
             let hi = core::cmp::min(e, b + (st.text.get(b) == Some(&b'\n')) as usize);
             if lo < hi {
-                fill(st, PAD() + (lo - a) * cw, y, (hi - lo) * cw, ch, theme::ACCENT);
+                fill(st, PAD() + (lo - a) * cw, y, (hi - lo) * cw, ch, theme::selection());
             }
         }
-        super::text::draw_text(&mut st.surf, w, w - crate::ui::px(6), h, PAD(), y, &st.text[a..b], theme::CONTENT_TEXT, false, face);
+        super::text::draw_text(&mut st.surf, w, w - crate::ui::px(6), h, PAD(), y, &st.text[a..b], theme::content_text(), false, face);
         if ri == crow {
-            fill(st, PAD() + (st.caret - a) * cw, y, crate::ui::px(2), ch, theme::CONTENT_TEXT);
+            fill(st, PAD() + (st.caret - a) * cw, y, crate::ui::px(2), ch, theme::content_text());
         }
     }
     let total = st.rows.len().max(1);
@@ -291,7 +294,7 @@ fn paint(st: &mut State) {
     let th = if total <= st.vis { h } else { (h * st.vis / total).max(crate::ui::px(8)) };
     let ty = if total <= st.vis { 0 } else { (h - th) * st.top / (total - st.vis) };
     for y in 0..h {
-        let c = if y >= ty && y < ty + th { theme::SCROLL_THUMB } else { theme::SCROLL_TRACK };
+        let c = if y >= ty && y < ty + th { theme::scroll_thumb() } else { theme::scroll_track() };
         for x in x0..x1 {
             st.surf[y * w + x] = c;
         }
@@ -450,6 +453,7 @@ fn run(op: Op) -> bool {
     let changed = apply(st, op);
     let retitle = if st.dirty != st.title_dirty {
         st.title_dirty = st.dirty;
+        crate::video::dialog::unsaved_declare(OWNER, leaf_of(&st.path).as_bytes(), st.dirty); // DIALOG2 (B404): the first real caller
         Some(title_of(&st.path, st.dirty))
     } else {
         None
@@ -501,6 +505,7 @@ pub fn save(print: bool) -> Result<(usize, usize, usize), String> {
         wm::retitle(id, t.as_bytes());
         let _ = wm::present(id);
     }
+    crate::video::dialog::unsaved_declare(OWNER, b"", false); // DIALOG2: saved — clean
     serial_println!("[edit] saved path={} bytes={} lines={} edits={}", path, off, lines, edits);
     if print {
         serial_println!(":: TEXTEDIT: path={} bytes={} lines={} edits={} saved={} -> PASS ::", path, off, lines, edits, off);
@@ -581,7 +586,9 @@ pub fn press_route(x: i32, y: i32) -> bool {
     }
     if wm::close_box_hit(id, x, y) {
         serial_println!("[edit] press close win={} at ({},{})", id, x, y);
-        close();
+        if !ask_close() {
+            close();
+        }
         return true;
     }
     let Some(info) = wm::info(id) else { return false };
@@ -676,4 +683,46 @@ pub fn font_repaint() {
     paint(st);
     drop(g);
     let _ = wm::present(id);
+}
+
+// ── DIALOG2 (rmbp-ledger B404) — a dirty close ASKS (the dialog's first real app caller) ──────────────────────────
+
+fn leaf_of(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The close box on a DIRTY buffer: a SHEET on this window — Don't Save · Cancel · Save (Save the default, Esc =
+/// Cancel). `false` when the buffer is clean (close at once) or the sheet could not be raised (closes as before).
+fn ask_close() -> bool {
+    let (dirty, name) = match STATE.lock().as_ref() {
+        Some(st) => (st.dirty, String::from(leaf_of(&st.path))),
+        None => return false,
+    };
+    if !dirty {
+        return false;
+    }
+    let msg = alloc::format!("Do you want to save the changes you made to {}?", name);
+    let mut d = crate::video::dialog::Dlg::new(crate::video::dialog::Icon::Caution, b"Text Editor", msg.as_bytes(), b"Your changes will be lost if you don't save them.", &[b"Don't Save", b"Cancel", b"Save"]);
+    d.owner = OWNER;
+    d.sheet_win = WIN.load(Ordering::Relaxed);
+    d.user = true;
+    d.act = crate::video::dialog::Act::EditClose;
+    if !crate::video::dialog::post(d) {
+        return false;
+    }
+    crate::video::dialog::open_now();
+    serial_println!("[edit] close asks (dirty) -> sheet path={}", name);
+    true
+}
+
+/// The close sheet's answer (`ix`: 0 Don't Save, 1 Cancel, 2 Save).
+pub fn close_answer(ix: u8) {
+    match ix {
+        0 => close(),
+        2 => match save(true) {
+            Ok(_) => close(),
+            Err(e) => serial_println!("[edit] save on close FAILED ({}) — the window stays", e),
+        },
+        _ => serial_println!("[edit] close cancelled — the window stays"),
+    }
 }

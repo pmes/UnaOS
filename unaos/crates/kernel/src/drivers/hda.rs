@@ -2361,11 +2361,11 @@ pub mod vol {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     pub(super) static BASE: AtomicU64 = AtomicU64::new(0);
-    static CAD: AtomicU32 = AtomicU32::new(0);
+    pub(super) static CAD: AtomicU32 = AtomicU32::new(0);
     /// Per path node: bit16 valid, bits15:8 steps, bits7:0 nid.
     const Z: AtomicU32 = AtomicU32::new(0);
-    static NODES: [AtomicU32; MAX_PATH_DEPTH] = [Z; MAX_PATH_DEPTH];
-    static RINGS: spin::Mutex<Option<Rings>> = spin::Mutex::new(None);
+    pub(super) static NODES: [AtomicU32; MAX_PATH_DEPTH] = [Z; MAX_PATH_DEPTH];
+    pub(super) static RINGS: crate::sync::Mutex<Option<Rings>> = crate::sync::Mutex::new(None);
 
     pub(super) fn capture(base: u64, walk: Option<&CodecWalk>, ws: &[Widget; MAX_NODES], rings: &mut Rings, a: &mut Audit) {
         let Some(w) = walk else { return };
@@ -2642,3 +2642,30 @@ pub mod stream;
 #[cfg(feature = "hda-tone")]
 #[path = "hda_amp.rs"]
 pub mod amp;
+
+// ===================== BEZEL (B405) — THE AMP, READ BACK =====================
+// The volume bezel shows what the codec HOLDS, not a second mixer state: one GET_AMPLIFIER_GAIN_MUTE
+// (verb 0xB, payload bit15 output, bit13 left, index 0) on the first output amp `vol::capture` recorded,
+// over the same CORB/RIRB rings `vol::apply` drives. Returns `(level 0..=16, muted, gain, steps)`; the level
+// inverts `apply`'s `gain = level * steps / 16` (the least level that writes this gain). `None`: no captured
+// amp, no rings, or no answer. [HDA-SPEC §7.3.3.7]
+pub fn vol_readback() -> Option<(u8, bool, u8, u8)> {
+    let base = vol::BASE.load(core::sync::atomic::Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    let v = vol::NODES.iter().map(|n| n.load(core::sync::atomic::Ordering::Relaxed)).find(|v| v & (1 << 16) != 0)?;
+    let (nid, steps) = ((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8);
+    let cad = vol::CAD.load(core::sync::atomic::Ordering::Relaxed) as u8;
+    let mut a = Audit::default();
+    let mut g = vol::RINGS.lock();
+    if g.is_none() {
+        *g = Rings::init(base, &mut a);
+    }
+    let rings = g.as_mut()?;
+    let word = ((cad as u32 & 0xF) << 28) | ((nid as u32) << 20) | (0xB << 16) | (1 << 15) | (1 << 13);
+    let r = rings.issue(word, &mut a)?;
+    let (muted, gain) = (r & 0x80 != 0, (r & 0x7F) as u8);
+    let level = if steps == 0 { 16 } else { ((gain as u32 * 16).div_ceil(steps as u32)).min(16) as u8 };
+    Some((level, muted, gain, steps))
+}

@@ -298,3 +298,19 @@ pub mod boot;
 pub mod pwwire;
 // LOGINFURN (rmbp-ledger B374, R88): the bare login, the console's boot-text prefill, `tests loginfurn`. Tail statement, so no existing line moves.
 pub mod loginfurn;
+// FLIGHTRING (rmbp-ledger B400, R88): the one rolling ring of the boot's text (both arches) and the console's scroll-back over it, `tests flightring`. Tail statements, so no existing line moves.
+pub mod boot_ring;
+pub mod flightring;
+
+// WINDOWCAP3 (rmbp-ledger B399, R90): `SlotVec` — per-address-space sidecars keyed by slot, heap-grown, no `[_; USER_SLOTS]`. Tail statement, so no existing line moves.
+pub mod procslot;
+
+// STACKGUARD2 (rmbp-ledger B403): the holder registry a stack-overflowed task's locks are released from. Tail statement, so no existing line moves.
+pub mod lockowner;
+
+// DIALOG2 (rmbp-ledger B404): the spawn's explicit ORIGIN (glass / door / system). Tail statement, so no existing line moves.
+pub mod origin;
+// LOCKREG (rmbp-ledger B414): the ONE kernel spin lock type (`sync::Mutex`, over spin's) and its holder registry. Tail statement, so no existing line moves.
+pub mod sync;
+// SMALLFIX3 (rmbp-ledger B416): the fold's unique-code checks, the fixture arcs for `tests list` / `help tests`, `tests smallfix3`. Tail statement.
+pub mod smallfix3;

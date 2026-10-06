@@ -67,7 +67,7 @@ struct SigProc {
     suspend_saved: Option<u64>,
 }
 
-static SIGS: spin::Mutex<Vec<SigProc>> = spin::Mutex::new(Vec::new());
+static SIGS: crate::sync::Mutex<Vec<SigProc>> = crate::sync::Mutex::new(Vec::new());
 pub static DELIVERED: AtomicU64 = AtomicU64::new(0);
 pub static RETURNS: AtomicU64 = AtomicU64::new(0);
 

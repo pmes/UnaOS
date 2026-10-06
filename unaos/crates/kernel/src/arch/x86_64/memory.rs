@@ -427,26 +427,33 @@ pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
 // identity map is fixed at boot; the only per-process PML4 entry is [2]). If that ever changes, the
 // new region must be mirrored into every live slot PML4 (or force a rebuild).
 
-/// Number of concurrent per-process address spaces. Hard cap — a STOP tripwire, like M6d's 8.
+/// WINDOWCAP3 (rmbp-ledger B399, R90 "no hardcoding!!!"): there is no slot COUNT. This line was
+/// `USER_SLOTS = 12` — a `.bss` pool of 12 x (four page tables + 1.3 MiB backing) and the `asids` term of
+/// every flight's `[wm] limit … from=mem:189,asids:10`. A slot is now ONE heap record ([`SlotMem`]: its
+/// page tables, its args page, its backing) allocated on the first claim of its index and recycled by
+/// index after (the tegra model, `aarch64::mmu_tegra_el0`); the per-slot sidecars are
+/// [`SlotVec`](crate::procslot::SlotVec)s. A slot index is bounded by its TYPE (`procslot::SLOT_ID_MAX`,
+/// the futex key's tag byte) and the live process limit is memory's (`video::wincap`).
 ///
-/// HEADROOM (Boot AL, rMBP) — raised 8 -> 12. Boot AL showed the machine refusing work it had the
-/// RAM to do: with the desktop app resident, `storm` fleets capped at 5 because `MAX_PROCS = 6` sits
-/// under `MAX_PROCS <= USER_SLOTS - 2`, and the slot pool was the term that pinned it. 12 slots put
-/// `MAX_PROCS` at 10 with the SAME 2-slot reserve intact, which is 8 vugs + the desktop app + one
-/// foreground `run`, i.e. the fleet an operator actually asks for plus a margin.
+/// The record is not returned to the heap at exit: a core may still hold the dead slot's CR3 loaded until
+/// its next dispatch, and freeing a live PML4 frame under a hardware walker is the one thing the pool must
+/// never do. Recycling by index makes the pool's peak the peak of CONCURRENT programs, not of launches.
 ///
-/// WHAT ONE MORE SLOT COSTS. A slot is `USER_STATIC_SIZE` (0x149000 ≈ 1.3 MiB) of `.bss` backing plus
-/// four 4 KiB page tables (PML4/PDPT/PD/PT) = 548 KiB. 8 -> 12 is therefore +2.14 MiB of `.bss`
-/// (4.28 MiB -> 6.42 MiB) on a machine with GiBs; the pool is `.bss` (NOBITS), so the boot image on
-/// the ESP does not grow by a byte. Nothing else scales with the count: the per-slot sidecars in
-/// `arch::syscall` (`SLOT_USED`/`SLOT_GEN`/`SLOT_DETACHED`/`SLOT_HIDDEN`/the input rings) are all
-/// written `[_; USER_SLOTS]` or `[_; USER_SLOTS + 1]` and widen with this line, and every sweep over
-/// the pool is a `0..USER_SLOTS` scan of at most 12 iterations off the fast path.
-///
-/// STILL a STOP tripwire, and still not a knob: it is raised HERE, with the `MAX_PROCS` block and
-/// the `storm` clamp recomputed against it in the same change. A blind bump of this line alone
-/// leaves the process table — not the pool — as the ceiling, and says nothing about the reserve.
-pub const USER_SLOTS: usize = 12;
+/// One past the highest slot index ever claimed — every "all slots" sweep's bound.
+#[inline]
+pub fn user_slots() -> usize {
+    SLOT_USED.hwm()
+}
+/// WINDOWCAP3: slot `s` has a record (was ever claimed) — the range check every caller-supplied slot
+/// index takes in place of `s < USER_SLOTS`. Never allocates.
+#[inline]
+pub fn slot_known(s: usize) -> bool {
+    slot_rec(s).is_some()
+}
+/// WINDOWCAP3: slot records allocated (the pool's peak), for the witness.
+pub fn slot_records() -> usize {
+    SLOT_RECORDS.load(Ordering::Acquire)
+}
 /// Pages in a user window: code, data, and two stack pages. MUST match `syscall::USER_WINDOW_PAGES`.
 const U3_WINDOW_PAGES: usize = 4;
 pub const PAGE_4K: u64 = 0x1000;
@@ -558,20 +565,64 @@ const _: () = assert!((FB_WIN_MAX_W * FB_WIN_MAX_H * 4) as usize == FB_WIN_SLOT_
 /// array stride keeps every slot's frames page-aligned.
 #[repr(C, align(4096))]
 struct Backing([u8; USER_STATIC_SIZE]);
-impl Backing {
-    const fn zeroed() -> Self {
-        Backing([0; USER_STATIC_SIZE])
-    }
-}
 
 // One PML4 + one PDPT + one PD + one PT per slot: the USER_BASE window only ever touches PML4[2] →
 // PDPT[0] → PD[0] → PT[0..U3_WINDOW_PAGES], so a single next-level table at each level suffices.
-static mut SLOT_PML4: [PageTable; USER_SLOTS] = [const { PageTable::zeroed() }; USER_SLOTS];
-static mut SLOT_PDPT: [PageTable; USER_SLOTS] = [const { PageTable::zeroed() }; USER_SLOTS];
-static mut SLOT_PD: [PageTable; USER_SLOTS] = [const { PageTable::zeroed() }; USER_SLOTS];
-static mut SLOT_PT: [PageTable; USER_SLOTS] = [const { PageTable::zeroed() }; USER_SLOTS];
-static mut SLOT_BACKING: [Backing; USER_SLOTS] = [const { Backing::zeroed() }; USER_SLOTS];
-static SLOT_USED: [AtomicBool; USER_SLOTS] = [const { AtomicBool::new(false) }; USER_SLOTS];
+// WINDOWCAP3: the five live in ONE 4 KiB-aligned heap record per slot (the x86 heap is identity-mapped,
+// so a record's address IS its physical address — `table_pa` holds unchanged).
+#[repr(C, align(4096))]
+struct SlotMem {
+    pml4: PageTable,
+    pdpt: PageTable,
+    pd: PageTable,
+    pt: PageTable,
+    args: ArgsPage,
+    backing: Backing,
+}
+static SLOT_MEM: crate::procslot::SlotVec<core::sync::atomic::AtomicPtr<SlotMem>> = crate::procslot::SlotVec::new(
+    || core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+);
+static SLOT_USED: crate::procslot::SlotVec<AtomicBool> =
+    crate::procslot::SlotVec::new(|| AtomicBool::new(false), AtomicBool::new(true));
+static SLOT_RECORDS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// WINDOWCAP3: one slot's heap record in bytes — `video::wincap`'s per-process memory cost carries it.
+pub const SLOT_RECORD_BYTES: usize = core::mem::size_of::<SlotMem>();
+
+/// WINDOWCAP3: slot `s`'s record, if one was ever allocated. Never allocates (safe from an ISR).
+#[inline]
+fn slot_rec(s: usize) -> Option<*mut SlotMem> {
+    if s >= crate::procslot::SLOT_ID_MAX {
+        return None;
+    }
+    let p = SLOT_MEM.peek(s)?.load(Ordering::Acquire);
+    if p.is_null() { None } else { Some(p) }
+}
+
+/// WINDOWCAP3: give slot `s` its record (first claim of the index), zeroed. `false` = the heap said no.
+fn slot_rec_ensure(s: usize) -> bool {
+    if slot_rec(s).is_some() {
+        return true;
+    }
+    // SAFETY: non-zero size, power-of-two alignment.
+    let p = unsafe { alloc_zeroed(Layout::new::<SlotMem>()) } as *mut SlotMem;
+    if p.is_null() {
+        return false;
+    }
+    // Only the claimant of `s` (its `SLOT_USED` CAS) reaches here, so no second writer races this store.
+    SLOT_MEM[s].store(p, Ordering::Release);
+    SLOT_RECORDS.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+/// WINDOWCAP3: field pointer inside slot `s`'s record (null for a slot with none — every caller holds a claim).
+#[inline]
+fn slot_field(s: usize, off: usize) -> *mut u8 {
+    match slot_rec(s) {
+        Some(p) => unsafe { p.cast::<u8>().add(off) },
+        None => core::ptr::null_mut(),
+    }
+}
 
 /// The kernel (firmware) PML4 physical base, captured once on the BSP at boot BEFORE any process CR3
 /// is installed. Restoring it on task teardown returns the CPU to the shared kernel address space.
@@ -584,25 +635,25 @@ fn table_pa(p: *const u64) -> u64 {
 }
 #[inline]
 fn slot_pml4_ptr(s: usize) -> *mut u64 {
-    unsafe { (&raw mut SLOT_PML4[s]).cast::<u64>() }
+    slot_field(s, core::mem::offset_of!(SlotMem, pml4)).cast::<u64>()
 }
 #[inline]
 fn slot_pdpt_ptr(s: usize) -> *mut u64 {
-    unsafe { (&raw mut SLOT_PDPT[s]).cast::<u64>() }
+    slot_field(s, core::mem::offset_of!(SlotMem, pdpt)).cast::<u64>()
 }
 #[inline]
 fn slot_pd_ptr(s: usize) -> *mut u64 {
-    unsafe { (&raw mut SLOT_PD[s]).cast::<u64>() }
+    slot_field(s, core::mem::offset_of!(SlotMem, pd)).cast::<u64>()
 }
 #[inline]
 fn slot_pt_ptr(s: usize) -> *mut u64 {
-    unsafe { (&raw mut SLOT_PT[s]).cast::<u64>() }
+    slot_field(s, core::mem::offset_of!(SlotMem, pt)).cast::<u64>()
 }
 
 /// Kernel identity pointer to slot `s`'s user backing — write a loaded program / plant a sentinel
 /// through THIS, never through USER_BASE, so the process code mapping stays read-only (W^X holds).
 pub fn slot_backing_ptr(s: usize) -> *mut u8 {
-    unsafe { (&raw mut SLOT_BACKING[s]).cast::<u8>() }
+    slot_field(s, core::mem::offset_of!(SlotMem, backing))
 }
 
 /// The per-process CR3 value (its PML4 physical base) for slot `s`.
@@ -648,7 +699,7 @@ pub unsafe fn protect_user_slot_range(
     writable: bool,
     exec: bool,
 ) {
-    assert!(s < USER_SLOTS, "protect_user_slot_range: slot out of range");
+    assert!(slot_known(s), "protect_user_slot_range: slot out of range");
     assert!(!(writable && exec), "protect_user_slot_range: W^X violation");
     let win = U3_WINDOW_PAGES * 4096;
     let end = off.checked_add(len).expect("protect_user_slot_range: range overflow");
@@ -681,13 +732,16 @@ pub unsafe fn protect_user_slot_range(
 
 /// WINX-1: kernel identity pointer to slot `s`'s RO info page.
 pub fn slot_fb_info_ptr(s: usize) -> *mut u8 {
-    debug_assert!(s < USER_SLOTS);
+    debug_assert!(slot_known(s));
     unsafe { slot_backing_ptr(s).add(FB_INFO_OFF) }
 }
 
 /// WINX-1: kernel identity pointer to slot `s`'s window surface slot `w`.
 pub fn slot_fb_win_surface_ptr(s: usize, w: usize) -> *mut u8 {
-    debug_assert!(s < USER_SLOTS && w < FB_WIN_SLOTS);
+    debug_assert!(slot_known(s) && w < FB_WIN_ROWS);
+    if w >= FB_WIN_SLOTS {
+        return ovf_surface(s, w - FB_WIN_SLOTS); // WINDOWCAP3: a window past the record's four has its own heap surface
+    }
     unsafe { slot_backing_ptr(s).add(FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE) }
 }
 
@@ -696,8 +750,8 @@ pub fn slot_fb_win_surface_ptr(s: usize, w: usize) -> *mut u8 {
 /// computes as `its own window base + 0x5000 + w * FB_WIN_SLOT_SIZE` (slot 0 — the only slot any
 /// shipped program uses — is `base + 0x5000` on both arches, the shared-ABI fact).
 pub fn fb_win_surface_va(w: usize) -> u64 {
-    debug_assert!(w < FB_WIN_SLOTS);
-    super::syscall::USER_BASE + (FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE) as u64
+    debug_assert!(w < FB_WIN_ROWS);
+    super::syscall::USER_BASE + fb_win_off(w) as u64 // WINDOWCAP3: 0..4 at the ABI VAs, 4.. in the band above the ELF window
 }
 
 /// WINX-1: install one leaf of slot `s`'s FB region at byte offset `off` from the window base.
@@ -717,7 +771,7 @@ pub fn fb_win_surface_va(w: usize) -> u64 {
 /// ANOTHER core can be left holding cached leaves for this slot. The local `invlpg` stands; what
 /// covers the other cores is the `bump_as_gen()` below (see `AS_GEN`).
 unsafe fn map_slot_fb_page(s: usize, off: usize, writable: bool) {
-    debug_assert!(s < USER_SLOTS && off + 4096 <= USER_STATIC_SIZE);
+    debug_assert!(slot_known(s) && off + 4096 <= USER_STATIC_SIZE);
     let va = super::syscall::USER_BASE + off as u64;
     let frame = slot_backing_ptr(s) as u64 + off as u64;
     let mut flags = PTE_PRESENT | PTE_USER | PTE_NX;
@@ -742,7 +796,11 @@ pub unsafe fn map_slot_fb_info(s: usize) {
 /// NEGOTIATED page-multiple size is mapped; the rest of the 64 KiB VA slot stays unmapped, so a program
 /// that walks past its own surface takes a contained ring-3 fault instead of reading a neighbour window.
 pub unsafe fn map_slot_fb_win(s: usize, w: usize, pages: usize) {
-    debug_assert!(w < FB_WIN_SLOTS && pages <= FB_WIN_SLOT_SIZE / 4096);
+    debug_assert!(w < FB_WIN_ROWS && pages <= FB_WIN_SLOT_SIZE / 4096);
+    if w >= FB_WIN_SLOTS {
+        unsafe { ovf_map(s, w - FB_WIN_SLOTS, pages, true) }; // WINDOWCAP3
+        return;
+    }
     let base = FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE;
     for p in 0..pages {
         unsafe { map_slot_fb_page(s, base + p * 4096, true) };
@@ -754,7 +812,11 @@ pub unsafe fn map_slot_fb_win(s: usize, w: usize, pages: usize) {
 /// live and is cached. The backing bytes are left as they are; `build_slot`'s next tenant zeroes what it
 /// maps, and an unmapped frame is unreachable from ring 3 regardless.
 pub unsafe fn unmap_slot_fb_win(s: usize, w: usize, pages: usize) {
-    debug_assert!(s < USER_SLOTS && w < FB_WIN_SLOTS && pages <= FB_WIN_SLOT_SIZE / 4096);
+    debug_assert!(slot_known(s) && w < FB_WIN_ROWS && pages <= FB_WIN_SLOT_SIZE / 4096);
+    if w >= FB_WIN_SLOTS {
+        unsafe { ovf_map(s, w - FB_WIN_SLOTS, pages, false) }; // WINDOWCAP3
+        return;
+    }
     let base = FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE;
     for p in 0..pages {
         let va = super::syscall::USER_BASE + (base + p * 4096) as u64;
@@ -775,9 +837,12 @@ pub unsafe fn unmap_slot_fb_win(s: usize, w: usize, pages: usize) {
 /// window, so without this a fresh tenant's first `SYS_WIN_CREATE` would map a slot still holding the
 /// last tenant's frame.
 pub unsafe fn clear_slot_fb(s: usize) {
-    debug_assert!(s < USER_SLOTS);
+    debug_assert!(slot_known(s));
     for w in 0..FB_WIN_SLOTS {
         unsafe { unmap_slot_fb_win(s, w, FB_WIN_SLOT_SIZE / 4096) };
+    }
+    for k in 0..ovf_count(s) {
+        unsafe { ovf_map(s, k, FB_WIN_SLOT_SIZE / 4096, false) }; // WINDOWCAP3: the band's leaves go; its surfaces stay with the record (recycled, zeroed at the next create)
     }
     let info_va = super::syscall::USER_BASE + FB_INFO_OFF as u64;
     unsafe {
@@ -798,7 +863,7 @@ pub unsafe fn clear_slot_fb(s: usize) {
 /// (CR4.PCIDE is off), so the CR3 base compares directly against `slot_cr3`.
 pub fn current_slot() -> Option<usize> {
     let live = cr3_table() as u64;
-    (0..USER_SLOTS).find(|&s| slot_cr3(s) == live)
+    (0..user_slots()).find(|&s| slot_known(s) && slot_cr3(s) == live)
 }
 
 /// Capture (once) and return the kernel PML4 physical base. First call MUST be on the BSP at boot
@@ -937,10 +1002,36 @@ unsafe fn build_slot(s: usize) {
 /// Allocate a fresh per-process address space from the static pool and build its window. Returns the
 /// slot index, or `None` when the pool is exhausted (a STOP tripwire — the hard cap is deliberate).
 pub fn alloc_user_space() -> Option<usize> {
-    for s in 0..USER_SLOTS {
-        if SLOT_USED[s]
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    // WINDOWCAP3: the lowest recyclable index, else a NEW index at the high-water mark (CAS-claimed, so two
+    // cores can never take the same one), bounded by the slot TYPE only; its record is allocated on the
+    // first claim and the heap's refusal is the pool's only "full".
+    let s = loop {
+        let hwm = user_slots();
+        if let Some(s) = (0..hwm)
+            .find(|&s| SLOT_USED[s].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok())
+        {
+            break s;
+        }
+        if hwm >= crate::procslot::SLOT_ID_MAX {
+            return None;
+        }
+        if SLOT_USED[hwm].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            break hwm;
+        }
+    };
+    if !slot_rec_ensure(s) {
+        SLOT_USED[s].store(false, Ordering::Release);
+        return None;
+    }
+    // Every per-slot sidecar's row for `s` exists before the slot can be dispatched — an ISR or the
+    // dispatcher indexing a claimed slot never allocates.
+    for t in [&XWIN_PAGES, &XWIN_BRK, &XWIN_BRK_LO, &XWIN_BRK_MAX] {
+        t.warm(s);
+    }
+    super::syscall::slot_tables_warm(s);
+    super::sched::slot_tables_warm(s);
+    super::elf::slot_tables_warm(s);
+    {
         {
             unsafe { build_slot(s) };
             // WXAUDIT: verify the window we just built against the LIVE table bytes before the slot can
@@ -952,10 +1043,9 @@ pub fn alloc_user_space() -> Option<usize> {
             // on the CR3 reload at the new tenant's first dispatch, which under migration may be
             // skipped on a core still standing on this slot's (recycled, fixed) CR3. Publish.
             bump_as_gen();
-            return Some(s);
+            Some(s)
         }
     }
-    None
 }
 
 /// STORM-X86 — how many of the [`USER_SLOTS`] address-space slots are UNCLAIMED right now. The
@@ -976,7 +1066,7 @@ pub fn alloc_user_space() -> Option<usize> {
 /// in `memory` rather than in a boot module, which is why the `storm` verb reaches it through a
 /// per-arch module alias instead of one fixed path.
 pub fn user_slots_free() -> usize {
-    (0..USER_SLOTS).filter(|&s| !SLOT_USED[s].load(Ordering::Acquire)).count()
+    (0..user_slots()).filter(|&s| !SLOT_USED[s].load(Ordering::Acquire)).count()
 }
 
 /// Allocate `out.len()` slots, filling `out` with their indices. FULL UNWIND on partial failure
@@ -1014,8 +1104,8 @@ pub fn alloc_user_spaces(out: &mut [usize]) -> bool {
 /// previous tenant. Without that, the next tenant of this slot — same CR3 value, same backing frames
 /// — would run under the previous tenant's cached leaves on such a core.
 pub fn free_user_space_by_cr3(cr3: u64) {
-    for s in 0..USER_SLOTS {
-        if slot_cr3(s) == cr3 {
+    for s in 0..user_slots() {
+        if slot_known(s) && slot_cr3(s) == cr3 {
             // U5x teardown-clear: wipe the slot's per-process handle row (values + rights) BEFORE
             // releasing the used-flag (clear-before-release), so no capability outlives its owning slot
             // and no concurrent `alloc_user_space` can claim the slot and populate the row in between.
@@ -1342,7 +1432,7 @@ static WX_SLOT_LOGGED: AtomicBool = AtomicBool::new(false);
 /// address space in this kernel is ever dispatched without its W^X shape having been verified against
 /// the LIVE table bytes — not against the constants `build_slot` intended to write.
 pub fn wx_check_slot(s: usize) -> (u32, u32) {
-    assert!(s < USER_SLOTS, "wx_check_slot: slot out of range");
+    assert!(slot_known(s), "wx_check_slot: slot out of range");
     let nxe = efer_nxe();
     let ui = pml4_index(super::syscall::USER_BASE);
     // SAFETY: the slot tables are `.bss` arrays, identity-mapped; reads only.
@@ -1702,7 +1792,7 @@ pub fn wx_probe_report() {
     // live here; a `base` of 0 would mean the firmware gave us no framebuffer.
     let fb = crate::video::WRITER.try_lock().map(|w| w.base() as u64).unwrap_or(0);
     wx_probe_addr("fb", fb, nxe);
-    wx_probe_addr("bss", &raw const SLOT_BACKING as *const u8 as u64, nxe);
+    wx_probe_addr("bss", &raw const KERNEL_CR3 as *const u8 as u64, nxe); // WINDOWCAP3: the slot backing left `.bss` for the heap; any `.bss` static answers the same question
     wx_probe_addr("lapic", 0xFEE0_0000, nxe);
     wx_probe_elf();
 }
@@ -4072,19 +4162,19 @@ const _: () = assert!(XWIN_PTS >= 1 && XWIN_OFF / (512 * 4096) + XWIN_PTS <= 512
 /// WINDOW2: PT frames (heap) wired into ELF windows across every slot right now.
 static XWIN_PT_LIVE: AtomicU64 = AtomicU64::new(0);
 /// Frames each slot holds in its ELF window right now.
-static XWIN_PAGES: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
+static XWIN_PAGES: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 /// Frames held across ALL slots — the number `tests ring3win` watches return after an exit.
 static XWIN_LIVE: AtomicU64 = AtomicU64::new(0);
 /// The heap break and its ceiling, as byte offsets from the window base. `brk_max == 0` = no heap (a
 /// slot the loader did not place, e.g. an inline fixture) — `SYS_SBRK` answers `-ENOMEM`.
-static XWIN_BRK: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
-static XWIN_BRK_LO: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
-static XWIN_BRK_MAX: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
+static XWIN_BRK: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
+static XWIN_BRK_LO: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
+static XWIN_BRK_MAX: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 /// What the last `xwin_free` released: frames, and the heap bytes the tenant had grown.
 static XWIN_LAST_FREED: AtomicU64 = AtomicU64::new(0);
 static XWIN_LAST_HEAP: AtomicU64 = AtomicU64::new(0);
 /// Serialises `SYS_SBRK` (sibling ELF-2 threads share one slot's break).
-static XWIN_SBRK_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static XWIN_SBRK_LOCK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 /// WINDOW2: the PT behind window PT index `i` of slot `s` (a heap frame, identity-addressed), or null when
 /// that 2 MiB was never touched.
@@ -4138,7 +4228,7 @@ unsafe fn xwin_leaf(s: usize, off: usize) -> *mut u64 {
 /// (two segments sharing a page) — refused if that union is W+X. `Err(())` = the heap is out of frames
 /// or the union is W+X; nothing is half-done for that page.
 pub unsafe fn xwin_map_page(s: usize, off: usize, writable: bool, exec: bool) -> Result<(), ()> {
-    assert!(s < USER_SLOTS && off % 4096 == 0, "xwin_map_page: bad slot/offset");
+    assert!(slot_known(s) && off % 4096 == 0, "xwin_map_page: bad slot/offset");
     if off < XWIN_OFF || off >= XWIN_OFF + XWIN_BYTES {
         return Err(());
     }
@@ -4183,7 +4273,7 @@ pub unsafe fn xwin_map_page(s: usize, off: usize, writable: bool, exec: bool) ->
 /// RING3WIN: kernel identity pointer to the frame behind window offset `off` of slot `s` (page-aligned
 /// `off`), or `None` if unmapped. Loader copies go through this, never the ring-3 VA (W^X by construction).
 pub fn xwin_frame_ptr(s: usize, off: usize) -> Option<*mut u8> {
-    if s >= USER_SLOTS || off < XWIN_OFF || off >= XWIN_OFF + XWIN_BYTES {
+    if !slot_known(s) || off < XWIN_OFF || off >= XWIN_OFF + XWIN_BYTES {
         return None;
     }
     let va = super::syscall::USER_BASE + off as u64;
@@ -4236,7 +4326,7 @@ unsafe fn xwin_unmap_page(s: usize, off: usize) {
 /// state. Idempotent. Called from `free_user_space_by_cr3` (kernel CR3 live) and by the loader before it
 /// places an image (a defensive reset — a correctly torn-down slot holds nothing).
 pub unsafe fn xwin_free(s: usize) {
-    debug_assert!(s < USER_SLOTS);
+    debug_assert!(slot_known(s));
     let held = XWIN_PAGES[s].load(Ordering::Acquire);
     let heap = XWIN_BRK[s].load(Ordering::Acquire).saturating_sub(XWIN_BRK_LO[s].load(Ordering::Acquire));
     for i in 0..XWIN_PTS {
@@ -4341,11 +4431,10 @@ const _: () = assert!(ARGS_OFF >= USER_STATIC_SIZE && ARGS_OFF + 4096 <= 512 * 4
 
 #[repr(C, align(4096))]
 struct ArgsPage([u8; 4096]);
-static mut SLOT_ARGS: [ArgsPage; USER_SLOTS] = [const { ArgsPage([0; 4096]) }; USER_SLOTS];
 
 /// RING3ABI2: kernel identity pointer to slot `s`'s args page (write through THIS, never the RO ring-3 VA).
 fn slot_args_ptr(s: usize) -> *mut u8 {
-    unsafe { (&raw mut SLOT_ARGS[s]).cast::<u8>() }
+    slot_field(s, core::mem::offset_of!(SlotMem, args))
 }
 
 /// RING3ABI2: map slot `s`'s args page (ring-3 RO + NX) and reset it to the empty header. Called by
@@ -4362,7 +4451,7 @@ unsafe fn args_map(s: usize) {
 /// RING3ABI2: lay `words` out in slot `s`'s args page. `false` (page left with argc 0) when they do not
 /// fit (`una_abi::ARGS_MAX` words, one page) — the caller refuses the launch rather than truncating.
 pub fn args_write(s: usize, words: &[&str]) -> bool {
-    if s >= USER_SLOTS {
+    if !slot_known(s) {
         return false;
     }
     let page = unsafe { core::slice::from_raw_parts_mut(slot_args_ptr(s), 4096) };
@@ -4376,7 +4465,7 @@ pub fn args_write(s: usize, words: &[&str]) -> bool {
 
 /// RING3ABI2: the argc slot `s`'s args page carries (the `tests ring3abi` read-back).
 pub fn args_argc(s: usize) -> usize {
-    if s >= USER_SLOTS {
+    if !slot_known(s) {
         return 0;
     }
     let page = unsafe { core::slice::from_raw_parts(slot_args_ptr(s), 4096) };
@@ -4506,4 +4595,117 @@ pub fn stack_guard_frame_free(f: u64) {
     if f != 0 {
         unsafe { alloc::alloc::dealloc(f as *mut u8, Layout::from_size_align(4096, 4096).expect("page layout")) };
     }
+}
+
+// =================================================================================================
+// WINDOWCAP3 (rmbp-ledger B399, R90) — WINDOWS PER PROCESS PAST THE RECORD'S FOUR.
+// -------------------------------------------------------------------------------------------------
+// `FB_WIN_SLOTS` (4) is how many surfaces the slot RECORD carries at the ABI VAs (`base + 0x5000 + w *
+// 0x51000` — slot 0 is what every shipped program computes). It is no longer the per-process window
+// limit: region slot `w >= FB_WIN_SLOTS` gets its own zeroed 4 KiB-aligned heap surface (contiguous, so the
+// compositor reads it exactly as it reads a record surface) mapped ring-3 RW+NX in a band clear of
+// everything else — `USER_BASE + OVF_OFF`, the PD entries above the ELF window, one heap PT per 2 MiB wired
+// on first touch. The info page's entry for `w` carries the band offset, so a program reads where its
+// surface is. The per-process bound is the info page's own row count ([`FB_WIN_ROWS`], its TYPE); the
+// live limit is memory's (`video::wincap`). Surfaces and PTs live with the record (recycled by index, as
+// the record is); window close and teardown clear the leaves.
+// =================================================================================================
+
+/// WINDOWCAP3: region slots a process may hold — the info page's per-window rows (`0x40 + w * 0x20`).
+pub const FB_WIN_ROWS: usize = (FB_INFO_SIZE - 0x40) / 0x20;
+/// WINDOWCAP3: the band's offset from the window base — the first 2 MiB above the ELF window.
+const OVF_OFF: usize = XWIN_OFF + XWIN_BYTES;
+const _: () = assert!(OVF_OFF % (512 * 4096) == 0);
+const _: () = assert!(OVF_OFF + (FB_WIN_ROWS - FB_WIN_SLOTS) * FB_WIN_SLOT_SIZE <= 512 * 512 * 4096); // one PD (1 GiB)
+
+/// Per slot: the kernel identity address of band surface `k` (0 = never allocated).
+static FB_OVF: crate::procslot::SlotVec<crate::sync::Mutex<alloc::vec::Vec<usize>>> =
+    crate::procslot::SlotVec::new(|| crate::sync::Mutex::new(alloc::vec::Vec::new()), crate::sync::Mutex::new(alloc::vec::Vec::new()));
+
+/// WINDOWCAP3: region slot `w`'s byte offset from the window base.
+#[inline]
+fn fb_win_off(w: usize) -> usize {
+    if w < FB_WIN_SLOTS {
+        FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE
+    } else {
+        OVF_OFF + (w - FB_WIN_SLOTS) * FB_WIN_SLOT_SIZE
+    }
+}
+
+/// WINDOWCAP3: the info-page entry's `surface_offset` for region slot `w` (relative to the info page).
+pub fn fb_win_info_off(w: usize) -> usize {
+    fb_win_off(w) - FB_INFO_OFF
+}
+
+/// WINDOWCAP3: make region slot `w` of slot `s` backable — a no-op for the record's four, a heap surface
+/// for the rest. `false` = past the info page's rows, or the heap said no.
+pub fn fb_win_ensure(s: usize, w: usize) -> bool {
+    if w < FB_WIN_SLOTS {
+        return true;
+    }
+    if w >= FB_WIN_ROWS || !slot_known(s) {
+        return false;
+    }
+    let k = w - FB_WIN_SLOTS;
+    let mut v = FB_OVF[s].lock();
+    if v.len() <= k {
+        let need = k + 1 - v.len();
+        if v.try_reserve(need).is_err() {
+            return false;
+        }
+        v.resize(k + 1, 0);
+    }
+    if v[k] == 0 {
+        // SAFETY: non-zero size, page alignment.
+        let p = unsafe { alloc_zeroed(Layout::from_size_align_unchecked(FB_WIN_SLOT_SIZE, 4096)) };
+        if p.is_null() {
+            return false;
+        }
+        v[k] = p as usize;
+    }
+    true
+}
+
+fn ovf_surface(s: usize, k: usize) -> *mut u8 {
+    FB_OVF.peek(s).and_then(|m| m.lock().get(k).copied()).unwrap_or(0) as *mut u8
+}
+
+fn ovf_count(s: usize) -> usize {
+    FB_OVF.peek(s).map_or(0, |m| m.lock().len())
+}
+
+/// WINDOWCAP3: map (`on`) or clear the first `pages` leaves of band surface `k` of slot `s`. A PT is wired
+/// on first touch of its 2 MiB (zeroed heap frame); a clear never allocates.
+unsafe fn ovf_map(s: usize, k: usize, pages: usize, on: bool) {
+    let frame0 = ovf_surface(s, k) as u64;
+    if on && frame0 == 0 {
+        return; // never ensured — nothing to map (the caller's `fb_win_ensure` refused)
+    }
+    let base = OVF_OFF + k * FB_WIN_SLOT_SIZE;
+    for p in 0..pages {
+        let va = super::syscall::USER_BASE + (base + p * 4096) as u64;
+        unsafe {
+            let pde = slot_pd_ptr(s).add(pd_index(va));
+            if *pde & PTE_PRESENT == 0 {
+                if !on {
+                    continue;
+                }
+                let pt = alloc_zeroed(Layout::from_size_align_unchecked(4096, 4096)) as *mut u64;
+                if pt.is_null() {
+                    return;
+                }
+                *pde = (table_pa(pt) & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            }
+            let leaf = ((*pde & PTE_ADDR) as *mut u64).add(pt_index(va));
+            *leaf = if on { ((frame0 + (p as u64) * PAGE_4K) & PTE_ADDR) | PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NX } else { 0 };
+            invlpg(va);
+        }
+    }
+    bump_as_gen(); // SMPBAL-X86: the leaf edits above are core-local
+}
+
+/// STACKGUARD2 (rmbp-ledger B403): `[start, end)` of the `Reserved` UEFI descriptor holding `addr` (the
+/// bootloader writes one region per descriptor, unmerged), or `None`. The BSP's firmware stack lives in one.
+pub fn stackguard_reserved_region(addr: u64) -> Option<(u64, u64)> {
+    REGIONS.get()?.iter().find(|r| r.kind == MemoryRegionKind::Reserved && r.phys_start <= addr && addr < r.phys_start + r.page_count * 4096).map(|r| (r.phys_start, r.phys_start + r.page_count * 4096))
 }

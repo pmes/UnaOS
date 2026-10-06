@@ -677,7 +677,7 @@ struct PressQ {
     dropped: u64,
 }
 
-static PRESSQ: spin::Mutex<PressQ> = spin::Mutex::new(PressQ {
+static PRESSQ: crate::sync::Mutex<PressQ> = crate::sync::Mutex::new(PressQ {
     q: [Press { win: 0, lx: 0, ly: 0, kind: PressKind::Up, ms: 0 }; PRESSQ_CAP],
     n: 0,
     dropped: 0,

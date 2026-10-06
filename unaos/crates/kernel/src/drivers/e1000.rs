@@ -30,7 +30,7 @@
 use core::alloc::Layout;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::drivers::pci::PciScanner;
 use net::arp::{ArpCache, ArpStateMachine};
@@ -1192,28 +1192,28 @@ pub fn service_net() {
     }
     // SOCK-1 (knob-on): the smoltcp boot connectivity witness. Runs AFTER the NET_DEVICE guard
     // above is dropped — its blocking ICMP pump short-locks NET_DEVICE per ring op, so holding the
-    // lock here would deadlock (spin::Mutex is not reentrant). One-shot; no-op knob-off / no NIC.
+    // lock here would deadlock (crate::sync::Mutex is not reentrant). One-shot; no-op knob-off / no NIC.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-    crate::smolnet::witness_tick();
+    if nic_present() && ladder_armed() { crate::smolnet::witness_tick(); } // INPUTSTALL2 M3 (B388): inline only on the e1000; with no e1000 the ladder runs on `net-tick` ([`witness_ladder`]), never inside the usb-pump loop
     // SOCK-2 (knob-on): the smoltcp persistent-socket UDP round-trip witness. Same one-shot,
     // post-guard discipline as SOCK-1's — its pump short-locks NET_DEVICE per ring op.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-    crate::smolnet::witness_tick2();
+    if nic_present() && ladder_armed() { crate::smolnet::witness_tick2(); } // INPUTSTALL2 M3 (B388): inline only on the e1000; with no e1000 the ladder runs on `net-tick` ([`witness_ladder`]), never inside the usb-pump loop
     // SOCK-3 (knob-on): the smoltcp persistent-socket TCP round-trip witness. Same one-shot,
     // post-guard discipline — its connect/recv pumps short-lock NET_DEVICE per ring op.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-    crate::smolnet::witness_tick3();
+    if nic_present() && ladder_armed() { crate::smolnet::witness_tick3(); } // INPUTSTALL2 M3 (B388): inline only on the e1000; with no e1000 the ladder runs on `net-tick` ([`witness_ladder`]), never inside the usb-pump loop
     // SOCK-6 (knob-on): the smoltcp TCP SERVER witness — STATEFUL (arms a listener, then polls accept
     // across passes). Awaits an inbound connect from scripts/net-inject.py under UNAOS_NET=socket;
     // hermetic slirp never connects in, so it prints an honest PENDING note and keeps listening cheaply.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-    crate::smolnet::witness_tick6(); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] crate::smolnet::service_poll(); // NETCLOCK (B335): the stack's idle service — one poll when smoltcp's `poll_delay` ran out or a frame waits, never per pass; LINE-NEUTRAL same-line append
+    if nic_present() && ladder_armed() { crate::smolnet::witness_tick6(); } #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] crate::smolnet::service_poll(); // NETCLOCK (B335): the stack's idle service — one poll when smoltcp's `poll_delay` ran out or a frame waits, never per pass; LINE-NEUTRAL same-line append
     // SOCK-8 (knob-on): the smoltcp DNS client — one-shot, resolves `pool.ntp.org` via the DHCP-provided
     // DNS server (gateway fallback). Runs before the SNTP witness (which reuses the resolver). Same
     // post-guard discipline (its UDP pump short-locks NET_DEVICE per ring op). Under slirp the resolve may
     // succeed (10.0.2.3 forwards to the host); otherwise it prints the honest `no answer` note.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-    crate::smolnet::witness_tick_dns();
+    if nic_present() && ladder_armed() { crate::smolnet::witness_tick_dns(); } // INPUTSTALL2 M3 (B388): inline only on the e1000; with no e1000 the ladder runs on `net-tick` ([`witness_ladder`]), never inside the usb-pump loop
     // SNTPDRV M3: the SNTP hang-off is RETIRED from this driver tick — a NIC driver only moves frames.
     // The client is driven by `crate::net_tick::service_tick()` from the scheduler's 5 s periodic hook
     // (main.rs, beside `emit_load_witness`), so changing the NIC (e1000 / USB Ethernet) cannot lose the clock.
@@ -1325,4 +1325,50 @@ pub fn rx_ready() -> bool {
         .as_ref()
         .map(|n| unsafe { read_volatile(n.rx_ring.add(n.rx_cur)) }.status & RX_STATUS_DD != 0)
         .unwrap_or(false)
+}
+
+/// INPUTSTALL2 M3 (rmbp-ledger B388): the smoltcp boot ladder (SOCK-1/2/3/6, SOCK-8) for a boot with NO e1000
+/// (the metal: the USB dongle), driven from the `net-tick` task instead of `service_net`. Flight 24 card 3:
+/// the ladder's `pump_until` spins (`SOCK-2` 12:38:52 … `SOCK-3 … REFUSED` 12:39:08) ran inside the
+/// `usb-pump` loop and held its HID step for 16 s after login (`hid_gap_ms=16016`). The e1000 keeps the inline
+/// order (its hand-rolled `poll()` in this function must not race the ladder's pumps). Each rung is its own
+/// one-shot latch, so the call is idempotent per tick. R80: the ladder is a test and belongs in `tests`; this
+/// only takes it off the input path.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub fn witness_ladder() {
+    static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if nic_present() || !ladder_armed() || !crate::boot::services_gate("net") {
+        return;
+    }
+    if !SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!("[net] ladder on=net-tick (INPUTSTALL2: the SOCK witnesses never run inside the usb-pump loop)");
+    }
+    crate::smolnet::witness_tick();
+    crate::smolnet::witness_tick2();
+    crate::smolnet::witness_tick3();
+    crate::smolnet::witness_tick6();
+    crate::smolnet::witness_tick_dns();
+}
+
+/// INPUTSTALL2 M4 (rmbp-ledger B388, R80 — the seat's ruling): the SOCK ladder is a TEST, so it never runs at
+/// boot. `tests sock` arms it; the next net pass then runs it on the path the NIC dictates (e1000: inline in
+/// [`service_net`], its order unchanged; no e1000: the `net-tick` task via [`witness_ladder`]). Each rung keeps
+/// its own one-shot latch. The lease (`SOCK-5`) is the stack's service, not a rung, and is untouched.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static LADDER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// INPUTSTALL2 M4: has `tests sock` armed the ladder?
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub fn ladder_armed() -> bool {
+    LADDER_ARMED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// INPUTSTALL2 M4: `tests sock` — arm the SOCK ladder (SOCK-1/2/3/6/8) for the next net pass.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub fn sock_selftest() {
+    LADDER_ARMED.store(true, core::sync::atomic::Ordering::Release);
+    serial_println!(
+        "[tests] sock armed path={} (INPUTSTALL2/R80: the SOCK ladder runs only when typed; its lines follow on the next net pass)",
+        if nic_present() { "e1000-inline" } else { "net-tick" }
+    );
 }

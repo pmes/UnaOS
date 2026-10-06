@@ -662,7 +662,7 @@ impl RwWin {
 /// It is also how the two renderers SHARE one row: on tegra `run_mc` runs first, opens the window
 /// and parks it; `run` then takes it back out and keeps spinning in the same row rather than
 /// minting a second one. One 3D window per boot, not two in sequence.
-static RW_KEEP: spin::Mutex<Option<RwWin>> = spin::Mutex::new(None);
+static RW_KEEP: crate::sync::Mutex<Option<RwWin>> = crate::sync::Mutex::new(None);
 
 /// RASTWIN — the parked row's id, registered with `wm::winid_register_holder` so ANY close route
 /// (the title-bar close disc, a Quit, `wc_close_furniture`) clears it through `wm::close`, and this

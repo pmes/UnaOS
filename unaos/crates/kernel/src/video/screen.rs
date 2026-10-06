@@ -31,7 +31,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::sync::Mutex;
 use unaos_boot_info::FrameBufferInfo;
 
 use super::FrameBuffer;
@@ -583,7 +583,7 @@ static BRACKETQ_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// order question is answered the same way — `try_lock` cannot participate in a cycle, so there is
 /// no order to reason about. (For the record there is no cycle to avoid either: `PRESENT_RECTS` is
 /// taken by exactly two writers, [`request_present_rect`] and `present_background`'s drain block,
-/// neither of which calls `flush`, and `present_background` runs strictly AFTER this. A `spin::Mutex`
+/// neither of which calls `flush`, and `present_background` runs strictly AFTER this. A `crate::sync::Mutex`
 /// is not reentrant, so had this been `lock()` an ISR-borne `request_present_rect` interrupting a
 /// holder would have been a hard hang; `try_lock` makes that unreachable by construction.)
 ///

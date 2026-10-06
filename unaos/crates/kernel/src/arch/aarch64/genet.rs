@@ -1246,7 +1246,7 @@ mod metal {
     /// The one registered GENET NIC (populated by [`genet_bringup`]). Mirrors NET-4's `NET4_DEVICE` /
     /// VNET's `VNET_DEVICE` / the x86 e1000 `NET_DEVICE`; the smoltcp Device adapter reaches the rings
     /// through it.
-    pub static GENET_DEVICE: spin::Mutex<Option<Genet>> = spin::Mutex::new(None);
+    pub static GENET_DEVICE: crate::sync::Mutex<Option<Genet>> = crate::sync::Mutex::new(None);
 
     /// PI-GENET entry point (metal): resolve + probe the GENET (M1); bring up UMAC + rings (M2); bind
     /// smoltcp + DHCP/ping (M3). Graceful (an honest skip line) on any absent decode / unmapped window.
@@ -1620,7 +1620,7 @@ mod metal {
     unsafe impl<D: Device> Send for NetService<D> {}
     // The default type parameter resolves `NetService` here to `NetService<SmoltcpPhy<GenetNic>>` — the
     // exact concrete type the metal service used before PI-NET-13.
-    static NET_SERVICE: spin::Mutex<Option<NetService>> = spin::Mutex::new(None);
+    static NET_SERVICE: crate::sync::Mutex<Option<NetService>> = crate::sync::Mutex::new(None);
 
     // ── PI-NET-10: the Pi's first TCP service — a listening socket that serves a status page ──────────
     //
@@ -4301,18 +4301,18 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
         //    `P_RX` = frames destined for the PEER (kernel TX). `VecDeque::new` is not `const`, so they
         //    are `Option`-wrapped and initialised at `run()` entry. A hard cap drops frames rather than
         //    growing unbounded if some pathology loops (a test must never OOM the boot). ──
-        static K_RX: spin::Mutex<Option<VecDeque<Vec<u8>>>> = spin::Mutex::new(None);
-        static P_RX: spin::Mutex<Option<VecDeque<Vec<u8>>>> = spin::Mutex::new(None);
+        static K_RX: crate::sync::Mutex<Option<VecDeque<Vec<u8>>>> = crate::sync::Mutex::new(None);
+        static P_RX: crate::sync::Mutex<Option<VecDeque<Vec<u8>>>> = crate::sync::Mutex::new(None);
         const QUEUE_CAP: usize = 256;
 
-        fn push(q: &spin::Mutex<Option<VecDeque<Vec<u8>>>>, frame: &[u8]) {
+        fn push(q: &crate::sync::Mutex<Option<VecDeque<Vec<u8>>>>, frame: &[u8]) {
             if let Some(dq) = q.lock().as_mut() {
                 if dq.len() < QUEUE_CAP {
                     dq.push_back(frame.to_vec());
                 }
             }
         }
-        fn pop(q: &spin::Mutex<Option<VecDeque<Vec<u8>>>>, out: &mut [u8]) -> Option<usize> {
+        fn pop(q: &crate::sync::Mutex<Option<VecDeque<Vec<u8>>>>, out: &mut [u8]) -> Option<usize> {
             let frame = q.lock().as_mut()?.pop_front()?;
             let n = frame.len().min(out.len());
             out[..n].copy_from_slice(&frame[..n]);

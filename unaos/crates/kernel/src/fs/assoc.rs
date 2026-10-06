@@ -49,6 +49,7 @@ pub const BUILTIN: &[(&str, &str, &str, &str)] = &[
     (ft::IMAGE_BMP, "facet", "image", "BMP image"),
     (ft::IMAGE_WEBP, "facet", "image", "WebP image"),
     (ft::IMAGE_QOI, "facet", "image", "QOI image"),
+    (ft::IMAGE_SVG, "facet", "image", "SVG image"), // SMALLFIX2 (B391, R94): SVG is a picture (UNAOS_SVG links pixel_core's svg format)
     (ft::AUDIO_FLAC, "play", "sound", "FLAC audio"),
     (ft::AUDIO_OGG, "play", "sound", "Ogg audio"),
     (ft::AUDIO_MPEG, "play", "sound", "MP3 audio"),
@@ -91,6 +92,9 @@ pub fn opener_for_in(mt: &MountTable, path: &str, mime: &str) -> (String, &'stat
     }
     if let Some(o) = str_attr(mt, &object_path(mime), OPENER_KEY) {
         return (o, "db");
+    }
+    if let Some(o) = str_attr(mt, &object_path(mime), crate::fs::appres::KEY_APPS).and_then(|v| v.lines().next().map(String::from)) {
+        return (o, "app"); // APPRES (B398): a program that declares this type in its `una:doctypes`
     }
     match builtin(mime) {
         Some(r) => (String::from(r.1), "builtin"),

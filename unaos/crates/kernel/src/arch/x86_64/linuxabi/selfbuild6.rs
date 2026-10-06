@@ -6,15 +6,15 @@
 //! (`ldso_core`, fulfilled by `ldso.rs`), then the musl-host `rustc` on UnaOS. Each probe was proven first on the HOST kernel
 //! by `ldrun` (the same core over `mmap`); here it runs under the shim:
 //!
-//! 1. `dyn` — `/apps/LIB/dyn/hello`, a musl PIE + `libdyn.so` (+ `libplug.so` it dlopens), built by arroyo from
+//! 1. `dyn` — `/lib/dyn/hello`, a musl PIE + `libdyn.so` (+ `libplug.so` it dlopens), built by arroyo from
 //!    `ldso_core/fixtures/dyn`: constructors before main, the seven relocation types, static TLS in the main thread and a new
 //!    one, `dl_iterate_phdr`, `dlopen`/`dlsym`/`dlerror`/`dladdr`, destructors. Prints `dyn=ok objects=3 after_dlopen=4`.
 //! 2. `lld_dyn` — the musl `rust-lld` (ET_EXEC 0x400000, 141 MB) `-flavor gnu --version`: `skip(window)` while the image window
 //!    refuses it, else ok when it prints `LLD `.
-//! 3. `rustc_version` — `/apps/LIB/rustc/bin/rustc --version` (librustc_driver 301 MB, 265481 relocations).
+//! 3. `rustc_version` — `/lib/rustc/bin/rustc --version` (librustc_driver 301 MB, 265481 relocations).
 //! 4. `rustc_hello` — `rustc -C codegen-units=1 -O hello.rs --target x86_64-unknown-linux-musl -C linker=/apps/LLD.LNX …` under
 //!    busybox `sh` (TMPDIR in the home), then the output runs.
-//! 5. `proc_macro` — `rustc user.rs --extern pm=/apps/LIB/rustc/pm/libpm.so …` (`#[derive(Hello)]` from the staged proc-macro
+//! 5. `proc_macro` — `rustc user.rs --extern pm=/lib/rustc/pm/libpm.so …` (`#[derive(Hello)]` from the staged proc-macro
 //!    `.so`, loaded through the trampoline's `dlopen`), then the output runs.
 //!
 //! Wire: `:: SELFBUILD6: dyn=ok lld_dyn=<ok|skip> rustc_version=<ok|oom> rustc_hello=<ok|oom> proc_macro=<ok|oom> relocs=<n> ms=<n>
@@ -25,12 +25,12 @@ use super::{run_path, vm, Report};
 use alloc::string::String;
 use core::sync::atomic::Ordering;
 
-pub const DYN: &str = "/apps/LIB/dyn/hello";
-pub const RUSTC: &str = "/apps/LIB/rustc/bin/rustc";
-pub const RLLD: &str = "/apps/LIB/rustc/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld";
-pub const HELLO_RS: &str = "/apps/LIB/rustc/hello.rs";
-pub const PM_SO: &str = "/apps/LIB/rustc/pm/libpm.so";
-pub const USER_RS: &str = "/apps/LIB/rustc/pm/user.rs";
+pub const DYN: &str = "/lib/dyn/hello";
+pub const RUSTC: &str = "/lib/rustc/bin/rustc";
+pub const RLLD: &str = "/lib/rustc/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld";
+pub const HELLO_RS: &str = "/lib/rustc/hello.rs";
+pub const PM_SO: &str = "/lib/rustc/pm/libpm.so";
+pub const USER_RS: &str = "/lib/rustc/pm/user.rs";
 pub const LLD: &str = "/apps/LLD.LNX";
 pub const SH: &str = "/apps/PROBE.LNX";
 

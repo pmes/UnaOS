@@ -51,7 +51,7 @@ struct Entry {
     snapped: (usize, usize, usize),
 }
 const NO_ENTRY: Entry = Entry { live: false, owner: 0, saved: (0, 0, 0), snapped: (0, 0, 0) };
-static SNAP: spin::Mutex<alloc::vec::Vec<Entry>> = spin::Mutex::new(alloc::vec::Vec::new()); // WINDOWCAP-2: one entry per slot, grown on first snap
+static SNAP: crate::sync::Mutex<alloc::vec::Vec<Entry>> = crate::sync::Mutex::new(alloc::vec::Vec::new()); // WINDOWCAP-2: one entry per slot, grown on first snap
 
 /// The zone the live drag's pointer is in (preview armed), or `Z_NONE`.
 static ZONE: AtomicU8 = AtomicU8::new(Z_NONE);
@@ -350,7 +350,7 @@ fn paint(r: (usize, usize, usize, usize)) {
         return;
     }
     const RING: usize = 3;
-    const INK: u32 = 0x004A_90D9;
+    const INK: u32 = crate::video::theme::SNAP_INK;
     let (x0, y0, x1, y1) = (r.0 + 2, r.1 + 2, r.0 + r.2 - 2, r.1 + r.3 - 2);
     let mut y = y0;
     while y < y1 {
@@ -374,7 +374,7 @@ fn paint(r: (usize, usize, usize, usize)) {
 #[repr(align(16))]
 struct Surf([u32; FIX_W * FIX_H]);
 #[cfg(feature = "witness")]
-static SURF: Surf = Surf([0x0030_70A0; FIX_W * FIX_H]);
+static SURF: Surf = Surf([crate::video::theme::fixture::STEEL; FIX_W * FIX_H]);
 
 /// Drives a real drag through the router (`wc_click_route_at` grab, a routed `MouseAbsolute` to the
 /// left edge, `Button(0)` release), asserts the row sits in the left half and the preview painted;

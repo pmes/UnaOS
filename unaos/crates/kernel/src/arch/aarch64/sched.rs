@@ -32,7 +32,7 @@ use core::sync::atomic::{
 };
 // spin's Mutex is the low-level SPINLOCK guarding the run queues / sleeper lists; alias it so this
 // module's own sleeping `Mutex<T>` (below) owns the bare name — same split as x86's sched.rs.
-use spin::Mutex as SpinMutex;
+use crate::sync::Mutex as SpinMutex;
 
 use super::percpu::{self, NUM_CPUS};
 use super::timer;
@@ -1474,7 +1474,7 @@ const RQ_STALL_SPINS: u64 = 1 << 26;
 const W4A_PRINT_MAX: u32 = 8;
 static W4A_PRINTS: AtomicU32 = AtomicU32::new(0);
 
-type RqLockGuard = spin::MutexGuard<'static, RunQueue, spin::Spin>;
+type RqLockGuard = crate::sync::MutexGuard<'static, RunQueue, spin::Spin>;
 
 /// WEDGE-4 — one raw byte at the UART, taking NO lock. Same seam as WEDGE-2's breadcrumbs
 /// (`crate::arch::serial::wedge2_raw_byte` is this call): a bounded volatile poll of the PL011 TX-full
@@ -1586,7 +1586,7 @@ impl DerefMut for RqGuard {
 /// WEDGE-4 — take `queue`'s run-queue lock with IRQ MASKED for exactly the length of the hold. This is
 /// the only admissible way to acquire `RUN_QUEUES`.
 ///
-/// `RUN_QUEUES` is a bare `spin::Mutex` with no interrupt discipline of its own, while the scheduler
+/// `RUN_QUEUES` is a bare `crate::sync::Mutex` with no interrupt discipline of its own, while the scheduler
 /// side (`dispatch_next`, `make_ready`, `try_steal`) takes it IRQ-masked. Before this, the spawn and
 /// placement paths took the same lock from ordinary preemptible task context: a timer preempt landing
 /// inside one of those sections froze the holder, and every masked acquisition of that queue then span
@@ -1922,7 +1922,7 @@ static AUTO_ROTATE: AtomicUsize = AtomicUsize::new(0);
 #[repr(align(64))]
 struct PaddedUsize(AtomicUsize);
 #[repr(align(64))]
-struct PaddedSlotRow([AtomicU32; KILL_ASID_SLOTS]);
+struct PaddedSlotCell(AtomicU32); // WINDOWCAP3 (B399): one line per (ASID, core) — the per-core padding kept, the ASID width gone
 
 static EL0_RESIDENTS: [PaddedUsize; NUM_CPUS] =
     [const { PaddedUsize(AtomicUsize::new(0)) }; NUM_CPUS];
@@ -2142,8 +2142,10 @@ fn el0_committed(cpu: usize) -> usize {
 /// (1..=`boot::USER_SLOTS`; index 0 — kernel tasks and the shared window — is never counted and never
 /// biases). Enter/leave sites mirror `EL0_RESIDENTS` exactly: both EL0 spawn paths, the `make_ready`
 /// move (transfer home -> target), and every reap path. Lock-free; same saturating-leave discipline.
-static SLOT_CORE_RES: [PaddedSlotRow; NUM_CPUS] =
-    [const { PaddedSlotRow([const { AtomicU32::new(0) }; KILL_ASID_SLOTS]) }; NUM_CPUS];
+static SLOT_CORE_RES: crate::procslot::SlotVec<[PaddedSlotCell; NUM_CPUS]> = crate::procslot::SlotVec::new_asid(
+    || [const { PaddedSlotCell(AtomicU32::new(0)) }; NUM_CPUS],
+    [const { PaddedSlotCell(AtomicU32::new(0)) }; NUM_CPUS],
+); // WINDOWCAP3 (B399): ASID-keyed and heap-grown (was `[_; 9]` per core — ASIDs past 8 got no bias)
 
 /// SPREAD-10 — placements the co-residency bonus DECIDED: rewake moves that qualified only through
 /// the sibling lane, plus spawns whose winner differs from what the bonus-free key would have picked.
@@ -2157,7 +2159,7 @@ static SPREAD10_CO_MOVES: AtomicU64 = AtomicU64::new(0);
 #[inline]
 fn slot_of(user_ttbr0: u64) -> usize {
     let asid = (user_ttbr0 >> 48) as usize;
-    if asid != 0 && asid < KILL_ASID_SLOTS { asid } else { 0 }
+    if asid != 0 && asid <= crate::procslot::SLOT_ID_MAX { asid } else { 0 } // WINDOWCAP3: the ASID TYPE
 }
 
 /// SPREAD-10 — commit one slot resident to `cpu`. Called beside every `el0_resident_enter`.
@@ -2170,7 +2172,7 @@ fn slot_of(user_ttbr0: u64) -> usize {
 fn slot_res_enter(cpu: usize, user_ttbr0: u64) {
     let slot = slot_of(user_ttbr0);
     if slot != 0 && cpu < NUM_CPUS {
-        SLOT_CORE_RES[cpu].0[slot].fetch_add(1, Ordering::AcqRel);
+        SLOT_CORE_RES[slot][cpu].0.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -2181,9 +2183,11 @@ fn slot_res_enter(cpu: usize, user_ttbr0: u64) {
 fn slot_res_leave(cpu: usize, user_ttbr0: u64) {
     let slot = slot_of(user_ttbr0);
     if slot != 0 && cpu < NUM_CPUS {
-        let _ = SLOT_CORE_RES[cpu].0[slot].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            if n == 0 { None } else { Some(n - 1) }
-        });
+        if let Some(row) = SLOT_CORE_RES.peek(slot) {
+            let _ = row[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                if n == 0 { None } else { Some(n - 1) }
+            });
+        }
     }
 }
 
@@ -2193,7 +2197,7 @@ fn slot_res(cpu: usize, slot: usize) -> u32 {
     if slot == 0 || cpu >= NUM_CPUS {
         return 0;
     }
-    SLOT_CORE_RES[cpu].0[slot].load(Ordering::Acquire)
+    SLOT_CORE_RES.peek(slot).map_or(0, |row| row[cpu].0.load(Ordering::Acquire))
 }
 
 /// SPREAD-4 — how much less loaded another core must be before a waking EL0 task is moved onto it,
@@ -4627,12 +4631,8 @@ pub fn run_queue_len(cpu: usize) -> usize {
 /// all, hence the only one where a shortfall could mean anything. Drift fails the build there. The
 /// assert is an inequality rather than an equality on purpose: a future arc may want kill headroom
 /// ABOVE the row count, but never below it.
-#[cfg(feature = "aarch64_el0")]
-pub const MAX_KILL_REQS: usize = super::uslots::USER_SLOTS - 2; // WINDOWCAP-2 (B378, R90): FOLLOWS the derived process table (`syscall::MAX_PROCS = USER_SLOTS - 2`) — the same expression, through the same facade, so the two cannot drift; the `syscall.rs` const assert still guards it
-/// WINDOWCAP-2 — a build with no EL0 slot backend has no `Proc` table and no killable rows; the table
-/// keeps a non-zero size so its statics stay well-formed, and nothing can reach it.
-#[cfg(not(feature = "aarch64_el0"))]
-pub const MAX_KILL_REQS: usize = 1;
+// WINDOWCAP3 (B399, R90): there is no MAX_KILL_REQS — `KILLS` is a heap-grown `SegVec`; `kill` appends a
+// row when none is free, bounded by the ASID TYPE (one request per process at most is ever outstanding).
 
 const KILL_FREE: u8 = 0;
 /// Armed and owned by a live requester; the retiring task publishes `KILL_DONE` for it to observe.
@@ -4655,13 +4655,11 @@ struct KillReq {
     state: AtomicU8,
 }
 
-static KILLS: [KillReq; MAX_KILL_REQS] = [const {
-    KillReq {
-        tid: AtomicU64::new(0),
-        asid: AtomicU64::new(0),
-        state: AtomicU8::new(KILL_FREE),
-    }
-}; MAX_KILL_REQS];
+static KILLS: crate::video::rowstore::SegVec<KillReq> = crate::video::rowstore::SegVec::new(|| KillReq {
+    tid: AtomicU64::new(0),
+    asid: AtomicU64::new(0),
+    state: AtomicU8::new(KILL_FREE),
+});
 
 /// SKILL-1 — LIVE EL0 THREADS PER ADDRESS-SPACE SLOT, indexed by ASID.
 ///
@@ -4677,9 +4675,7 @@ static KILLS: [KillReq; MAX_KILL_REQS] = [const {
 /// Kept here rather than reading `boot::SLOT_REFCOUNT` because that is private, is baremetal-only, and
 /// counts slot RETAINS (which include the pre-spawn retain `SYS_THREAD_SPAWN` takes before a task exists);
 /// this counts TASKS, which is exactly the set a kill has to drain.
-const KILL_ASID_SLOTS: usize = 9;
-static ASID_THREADS: [AtomicU32; KILL_ASID_SLOTS] =
-    [const { AtomicU32::new(0) }; KILL_ASID_SLOTS];
+static ASID_THREADS: crate::procslot::SlotVec<AtomicU32> = crate::procslot::SlotVec::new_asid(|| AtomicU32::new(0), AtomicU32::new(0)); // WINDOWCAP3 (B399): ASID-keyed, heap-grown (was `[_; 9]`)
 
 /// Count a freshly spawned EL0 task against its slot. Called from both user-task spawn paths BEFORE the
 /// run-queue push, so the task is countable before it can ever be dispatched. Kernel tasks (ASID 0) and
@@ -4687,7 +4683,7 @@ static ASID_THREADS: [AtomicU32; KILL_ASID_SLOTS] =
 #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")), allow(dead_code))] // both user-spawn paths are baremetal-only — EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
 fn asid_thread_enter(user_ttbr0: u64) {
     let asid = (user_ttbr0 >> 48) as usize;
-    if asid != 0 && asid < KILL_ASID_SLOTS {
+    if asid != 0 && asid <= crate::procslot::SLOT_ID_MAX {
         ASID_THREADS[asid].fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -4698,10 +4694,11 @@ fn asid_thread_enter(user_ttbr0: u64) {
 /// tid-scoped request: "no siblings outstanding".
 fn asid_thread_leave(user_ttbr0: u64) -> u32 {
     let asid = (user_ttbr0 >> 48) as usize;
-    if asid == 0 || asid >= KILL_ASID_SLOTS {
+    if asid == 0 || asid > crate::procslot::SLOT_ID_MAX {
         return 0;
     }
-    let prev = ASID_THREADS[asid].fetch_sub(1, Ordering::AcqRel);
+    let Some(row) = ASID_THREADS.peek(asid) else { return 0 };
+    let prev = row.fetch_sub(1, Ordering::AcqRel);
     debug_assert!(prev > 0, "asid_thread_leave: underflow (a task retired twice?)");
     prev.saturating_sub(1)
 }
@@ -4709,10 +4706,10 @@ fn asid_thread_leave(user_ttbr0: u64) -> u32 {
 /// How many EL0 tasks are still live under `asid`. Introspection for the kill witness.
 pub fn asid_live_threads(asid: u64) -> u32 {
     let a = asid as usize;
-    if a == 0 || a >= KILL_ASID_SLOTS {
+    if a == 0 || a > crate::procslot::SLOT_ID_MAX {
         return 0;
     }
-    ASID_THREADS[a].load(Ordering::Acquire)
+    ASID_THREADS.peek(a).map_or(0, |n| n.load(Ordering::Acquire))
 }
 
 /// A requester's claim on one `KILLS` slot. Not `Copy`: it must be surrendered exactly once, via
@@ -4727,7 +4724,7 @@ pub struct KillTicket {
 /// four acquire loads, cheap enough for the dispatch fast path.
 fn kill_slot_for(tid: u64, user_ttbr0: u64) -> Option<usize> {
     let asid = user_ttbr0 >> 48;
-    (0..MAX_KILL_REQS).find(|&i| {
+    (0..KILLS.hwm()).find(|&i| {
         let st = KILLS[i].state.load(Ordering::Acquire);
         if st != KILL_PENDING && st != KILL_DETACHED {
             return false;
@@ -4796,7 +4793,7 @@ pub fn kill(tid: u64, asid: u64) -> Option<KillTicket> {
     if tid == 0 {
         return None;
     }
-    for i in 0..MAX_KILL_REQS {
+    for i in 0..=KILLS.hwm().min(crate::procslot::SLOT_ID_MAX) { // WINDOWCAP3: the free rows, then ONE new row (task context — a grown row is born here, never on the dispatch path)
         if KILLS[i]
             .state
             .compare_exchange(KILL_FREE, KILL_PENDING, Ordering::AcqRel, Ordering::Acquire)
@@ -8029,7 +8026,7 @@ fn skill_rerun_body(_: usize) {
 pub fn skill_kill_witness(cpu: usize) {
     let queue_empty = || rq(cpu).len() == 0;
     let slots_free = || {
-        (0..MAX_KILL_REQS).all(|i| KILLS[i].state.load(Ordering::Acquire) == KILL_FREE)
+        (0..KILLS.hwm()).all(|i| KILLS[i].state.load(Ordering::Acquire) == KILL_FREE)
     };
 
     // --- 1 + 2: the OFF-CPU arm -----------------------------------------------------------------
@@ -9269,10 +9266,10 @@ fn spread10_witness() {
     let mut on1 = 0u32;
     let mut on2 = 0u32;
     let mut on3 = 0u32;
-    for slot in 1..KILL_ASID_SLOTS {
+    for slot in 1..SLOT_CORE_RES.hwm() {
         let mut cores = 0u32;
         for cpu in 0..NUM_CPUS {
-            if SLOT_CORE_RES[cpu].0[slot].load(Ordering::Relaxed) > 0 {
+            if SLOT_CORE_RES.peek(slot).is_some_and(|row| row[cpu].0.load(Ordering::Relaxed) > 0) {
                 cores += 1;
             }
         }
@@ -11115,7 +11112,7 @@ fn el0_host_mask() -> u64 {
 //      IN the guard, `BlitGuard`'s idiom in `video/wm.rs`), so a migration cannot decrement a
 //      stranger's counter. A holder that blocks would still leave the hold standing on its old core
 //      until it resumes — which is why the compositor's critical section is verified yield-free:
-//      every lock it takes inside the pass is a `spin::Mutex`, and every `DrainBarrier` (the one
+//      every lock it takes inside the pass is a `crate::sync::Mutex`, and every `DrainBarrier` (the one
 //      structure in that module that can yield) is taken by the MOVE and TEARDOWN paths, outside
 //      `composite_once`.
 //   3. **STARVATION.** The hold is bounded by the pass, and a pass is bounded by the panel: the
@@ -11218,4 +11215,11 @@ pub fn current_stack_bounds() -> Option<(u64, u64)> {
 pub fn other_dispatching_cpu() -> usize {
     let here = percpu::this_cpu().cpu_index as usize;
     (0..NUM_CPUS).find(|&c| c != here && ONLINE_MASK[c].load(Ordering::Acquire)).unwrap_or(CPU_AUTO)
+}
+
+/// WINDOWCAP3 (rmbp-ledger B399): allocate this file's ASID-keyed rows for `asid` at the slot's claim
+/// (process context), so the placement and kill paths never allocate on dispatch.
+pub fn slot_tables_warm(asid: usize) {
+    SLOT_CORE_RES.warm(asid);
+    ASID_THREADS.warm(asid);
 }

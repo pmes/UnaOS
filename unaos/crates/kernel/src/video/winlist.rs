@@ -56,7 +56,7 @@ static COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Show Desktop is holding windows down.
 static SD_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Bit `id-1` = window `id` was minimised by Show Desktop.
-static SD_MASK: spin::Mutex<alloc::vec::Vec<wm::WinId>> = spin::Mutex::new(alloc::vec::Vec::new()); // WINDOWCAP-2: the ids Show Desktop moved (was a u64 bit per id)
+static SD_MASK: crate::sync::Mutex<alloc::vec::Vec<wm::WinId>> = crate::sync::Mutex::new(alloc::vec::Vec::new()); // WINDOWCAP-2: the ids Show Desktop moved (was a u64 bit per id)
 /// The owner that held focus when Show Desktop went down.
 static SD_FOCUS: AtomicU64 = AtomicU64::new(0);
 

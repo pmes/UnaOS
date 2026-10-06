@@ -68,7 +68,7 @@
 // ---------------------------------------------------------------------------------------------
 // ABIFREEZE: the numbers are IMPORTED, not re-typed. This block used to be six local `const`s that
 // nothing compared against the kernel's — see `una_abi`'s divergence ledger for what that cost.
-use una_abi::{SYS_EXIT, SYS_GETINFO, SYS_SLEEP_MS, SYS_WIN_CREATE, SYS_WIN_PRESENT, SYS_WRITE};
+use una_abi::{SYS_EXIT, SYS_GETINFO, SYS_INPUT_POLL, SYS_SLEEP_MS, SYS_WIN_CREATE, SYS_WIN_PRESENT, SYS_WRITE};
 
 // WITSWEEP — REGISTER-SURVIVAL INVARIANT (sys1..sys3): the `in("x1")`/`in("x2")`/`in("x8")`
 // constraints below PROMISE the compiler those registers survive the `svc`. That is sound today only
@@ -481,8 +481,18 @@ pub extern "C" fn _start() -> ! {
             b.put(b" ::\n");
             b.flush();
         }
+        // APPMENU2 M6: the one exit — the WM's close request (Cmd-Q, Quit, the dock); everything else is dropped.
+        loop {
+            let ev = unsafe { sys1(SYS_INPUT_POLL, 0) };
+            if ev >> 63 != 0 {
+                break;
+            }
+            if una_abi::input_ev_type(ev) == una_abi::INPUT_EV_CLOSE_REQ {
+                exit(0);
+            }
+        }
         sleep_ms(PAINT_INTERVAL_MS);
-        // No exit condition. `kill <pid>` is the whole remedy — BGRUN-1's stated contract for a bg app.
+        // Beyond the close request, no exit condition. `kill <pid>` is the other remedy — BGRUN-1's stated contract for a bg app.
     }
 }
 

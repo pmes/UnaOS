@@ -128,6 +128,21 @@ pub const GEMINI_DEFAULT_KEY_ENV: &str = "GEMINI_API_KEY";
 pub static SCHEMA: &[Key] = &[
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     Key {
+        ns: "system", key: "appearance.accent", kind: Kind::Enum(&crate::appearance::ACCENTS), default: Default::Str("crispy"),
+        writers: &[Writer::Settings], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
+        doc: "The accent colour on the default button, the selection, the focused control's ring, the slider knob and the menu highlight (APPEARANCE B408; eight names, ours).",
+    },
+    Key {
+        ns: "system", key: "appearance.highlight", kind: Kind::Enum(&crate::appearance::HIGHLIGHTS), default: Default::Str("accent"),
+        writers: &[Writer::Settings], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
+        doc: "The text-selection colour: `accent` follows the accent, or one of the eight accent names (APPEARANCE B408).",
+    },
+    Key {
+        ns: "system", key: "appearance.mode", kind: Kind::Enum(&crate::appearance::MODES), default: Default::Str("light"),
+        writers: &[Writer::Settings], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
+        doc: "Light or Dark appearance; `auto` is dark 19:00-07:00 by the local clock (the RTC until NETCLOCK gives a real time) (APPEARANCE B408).",
+    },
+    Key {
         ns: "system", key: "audio.amp_holdoff_ms", kind: Kind::Int { min: 0, max: 600_000 },
         default: Default::Consumer("`hda_amp::AMP_HOLDOFF_MS`, 5000 ms"),
         writers: OP, reader: "kernel HDA amp (`drivers/hda_amp.rs`)",
@@ -167,10 +182,21 @@ pub static SCHEMA: &[Key] = &[
         doc: "Minutes before the idle blank; 0 = never.",
     },
     Key {
+        ns: "system", key: "display.mode", kind: Kind::Str { max_len: 16, printable: true },
+        default: Default::Consumer("the panel's own density scale (UIMETRICS)"),
+        writers: &[Writer::Settings], reader: "kernel settings (Display > Resolution), `video::dpi`",
+        doc: "The looks-like size `WxH` of the chosen mode: the panel's native mode at a UI scale (`prefs_core::modes`); unset = the panel's default scale.",
+    },
+    Key {
         ns: "system", key: "display.wallpaper", kind: Kind::Str { max_len: 120, printable: true },
         default: Default::Str(""),
         writers: &[Writer::Settings, Writer::WallpaperVerb], reader: "kernel settings, wallpaper",
         doc: "Wallpaper image path; empty = off.",
+    },
+    Key {
+        ns: "system", key: "dock.autohide", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings, Writer::Dock], reader: "kernel dock",
+        doc: "Hide the dock until the pointer reaches its edge (DOCK2). Edited in Settings > General > Auto-hide dock.",
     },
     Key {
         ns: "system", key: "dock.pins", kind: Kind::Str { max_len: 256, printable: true },
@@ -179,9 +205,25 @@ pub static SCHEMA: &[Key] = &[
         doc: "Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen); TOML arrays are outside the subset.",
     },
     Key {
+        ns: "system", key: "dock.position", kind: Kind::Enum(&["bottom", "left", "right"]), default: Default::Str("bottom"),
+        writers: &[Writer::Settings, Writer::Dock], reader: "kernel dock",
+        doc: "The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock.",
+    },
+    Key {
+        ns: "system", key: "login.items", kind: Kind::Str { max_len: crate::login::VALUE_MAX, printable: true },
+        default: Default::Str(""),
+        writers: &[Writer::Settings, Writer::Dock], reader: "kernel login items (`video/loginitems.rs`)",
+        doc: "Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login.",
+    },
+    Key {
+        ns: "system", key: "notify.dnd", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings], reader: "kernel NOTIFY (`video/notify.rs`)",
+        doc: "Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows) (NOTIFY, MACPARITY row 24). Edited in Settings > General > Do Not Disturb.",
+    },
+    Key {
         ns: "system", key: "pointer.speed", kind: Kind::Int { min: 0, max: 2 }, default: Default::Int(1),
         writers: &[Writer::Settings], reader: "kernel settings (pointer)",
-        doc: "0 slow, 1 normal, 2 fast.",
+        doc: "0 slow, 1 normal, 2 fast. Legacy (R75): read only while `system.trackpad.speed` is unset (TRACKPADPANE).",
     },
     Key {
         ns: "system", key: "power.lowbat_shutdown_pct", kind: Kind::Int { min: 0, max: 100 },
@@ -190,9 +232,35 @@ pub static SCHEMA: &[Key] = &[
         doc: "Battery percent at which the machine shuts down; 0 = off.",
     },
     Key {
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 3 }, default: Default::Int(0),
+        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 6 }, default: Default::Int(0),
         writers: &[Writer::Settings], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad).",
+    },
+    // ── TRACKPADPANE (B412, MACPARITY row 16): the Trackpad pane; the rules are `crate::trackpad` ──────────────
+    Key {
+        ns: "system", key: "trackpad.natural_scroll", kind: Kind::Bool, default: Default::Bool(true),
+        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        doc: "Two-finger scrolling moves the content with the fingers (on) or the other way (off). Edited in Settings > Trackpad.",
+    },
+    Key {
+        ns: "system", key: "trackpad.secondary_click", kind: Kind::Enum(&["two-finger", "off"]), default: Default::Str("two-finger"),
+        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        doc: "A click (or, with tap to click, a tap) made with two fingers down is a secondary click. Edited in Settings > Trackpad.",
+    },
+    Key {
+        ns: "system", key: "trackpad.speed", kind: Kind::Int { min: 1, max: 10 }, default: Default::Int(5),
+        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        doc: "Tracking speed: one gain on the TPSPEED curve (5 = the curve as flown, x0.25 at 1 .. x2.5 at 10); the curve's shape never changes. Unset, a stored `system.pointer.speed` maps to 4/5/7. Edited in Settings > Trackpad.",
+    },
+    Key {
+        ns: "system", key: "trackpad.tap_to_click", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        doc: "A short touch with no travel and no press is a click. Edited in Settings > Trackpad.",
+    },
+    Key {
+        ns: "system", key: "trackpad.three_finger_drag", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        doc: "Three fingers down hold the primary button and move the pointer (a drag without a press). Edited in Settings > Trackpad.",
     },
     // ── vein — the conversation handler's provider slot (VEINPROV B303, EMBED B317, R81) ───────────────
     Key {

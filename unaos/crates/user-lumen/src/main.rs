@@ -43,7 +43,7 @@
 // The window's footer shows the provider and the first token's latency.
 
 use una_abi::{
-    input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_KEY_DOWN, INPUT_EV_WHEEL, INPUT_EV_WIN_RESIZE, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP,
+    input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_KEY_DOWN, INPUT_EV_WHEEL, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP,
     SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
 };
 use vein_core::claude::{Event, Msg, Params, Stop};
@@ -653,6 +653,7 @@ impl App {
         let page = (self.rows_vis - 1).max(1);
         match input_ev_type(ev) {
             INPUT_EV_KEY_DOWN => self.key(p as u8),
+            INPUT_EV_CLOSE_REQ => exit(0), // APPMENU2 M6: the WM asks us to quit — nothing unsaved, so leave now
             INPUT_EV_ACTION => match p {
                 ACTION_CLEAR_VIEW if !self.busy => new_conversation(),
                 ACTION_CURSOR_LEFT => self.caret = self.caret.saturating_sub(1),
@@ -1485,6 +1486,9 @@ pub extern "C" fn _start() -> ! {
 
     // The session: Principia's `vein` namespace, the key file, the rule.
     let cfg = vein_ring3::prefs::Config::read();
+    // SETTINGSFILES (B407, R98): Lumen's own settings stanza, declared once — `app.lumen.*` in `<home>/settings/lumen`.
+    let declared = vein_ring3::prefs::declare(vein_ring3::prefs::LUMEN_STANZA);
+    unsafe { DECLARED = declared.err().unwrap_or(0) };
     let keybuf = unsafe { &mut *core::ptr::addr_of_mut!(KEY) };
     let mut kpath = [0u8; 128];
     // HOLOCRON2 M2 (B355): Holocron first (`vein/claude.api_key`, keysource::decide); the key file only on
@@ -1548,6 +1552,7 @@ pub extern "C" fn _start() -> ! {
     if sess.cfg.bus_err != 0 {
         l.put(b" prefs=").dec(sess.cfg.bus_err);
     }
+    l.put(b" declared=").dec(unsafe { DECLARED }); // SETTINGSFILES (B407): 0 = app.lumen held by Principia
     match (tt(), &font_why) {
         (Some(t), _) => {
             l.put(b" font=").put(t.name().as_bytes()).put(b" font_kib=").dec((t.bytes / 1024) as i64);
@@ -1646,3 +1651,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[used]
 #[link_section = ".note.unaos.app"]
 static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(una_abi::APP_FLAG_WINDOWED);
+
+/// SETTINGSFILES (rmbp-ledger B407): the PrefDeclare status of Lumen's stanza (0 = declared).
+static mut DECLARED: i64 = 0;

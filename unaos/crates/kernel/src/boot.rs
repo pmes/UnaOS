@@ -8,7 +8,7 @@
 //!
 //! ONE gate, [`phase`], answers for the whole boot:
 //!
-//! * [`Phase::Setter`] — the store is not read yet, or it says Installer / CreateUser (root's password, the first user);
+//! * [`Phase::Setter`] — the store is not read yet, or it says Installer (the first-user form, R100);
 //! * [`Phase::LoginScreen`] — the store has users (boot 2) and no session has opened since the boot;
 //! * [`Phase::Desktop`] — otherwise; LATCHED by the first session open ([`session_opened`], from
 //!   `login::close_into_session`) or the installer's own `user-created` advance ([`ignite`]), so a later Log Out
@@ -77,7 +77,7 @@ pub fn phase() -> Phase {
             return Phase::Setter;
         }
         match users::boot_stage() {
-            users::BootStage::Installer | users::BootStage::CreateUser => Phase::Setter,
+            users::BootStage::Installer => Phase::Setter,
             users::BootStage::Desktop => {
                 if users::boot2_resolved() {
                     Phase::LoginScreen
@@ -195,9 +195,9 @@ static PRE_STARTS: AtomicU32 = AtomicU32::new(0);
 /// WC-D valve episodes that closed while the phase was not Desktop.
 static PRE_VALVE: AtomicU32 = AtomicU32::new(0);
 /// The first pre-Desktop service start's name (for the FAIL line).
-static FIRST_START: spin::Mutex<&'static str> = spin::Mutex::new("");
+static FIRST_START: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("");
 /// Distinct starters the gate held, and the total asks.
-static HELD: spin::Mutex<[&'static str; 16]> = spin::Mutex::new([""; 16]);
+static HELD: crate::sync::Mutex<[&'static str; 16]> = crate::sync::Mutex::new([""; 16]);
 static HELD_ASKS: AtomicU32 = AtomicU32::new(0);
 
 /// `wm::create_inner`: a row is being minted. Pure apart from one atomic add.

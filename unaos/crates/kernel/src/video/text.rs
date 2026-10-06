@@ -414,7 +414,7 @@ mod tt {
         pub scripts_missing: String,
     }
 
-    static TT: spin::Mutex<Option<Tt>> = spin::Mutex::new(None);
+    static TT: crate::sync::Mutex<Option<Tt>> = crate::sync::Mutex::new(None);
     static READY: AtomicBool = AtomicBool::new(false);
     static GAVE_UP: AtomicBool = AtomicBool::new(false);
     static TRIES: AtomicU32 = AtomicU32::new(0);
@@ -719,6 +719,28 @@ mod tt {
     }
 
     /// UIMETRICS (B372): re-derive the console's grid from the restyled cell and say so (no lock held here).
+    /// PREFSUI (B389): the UI scale moved live (`dpi::set_live`) — the faces re-size to the scale's effective ppi,
+    /// the console regrids, every window repaints once. `true` when the faces moved.
+    pub fn rescale() -> bool {
+        let ppi = crate::video::dpi::ppi();
+        let moved = with(|t| {
+            if ppi == 0 || t.ppi == ppi {
+                return false;
+            }
+            t.ppi = ppi;
+            restyle(t);
+            true
+        })
+        .unwrap_or(false);
+        if moved {
+            serial_println!("[kfont] rescale ppi={} scale={}", ppi, crate::video::dpi::scale_str(crate::video::dpi::s2()));
+            regrid_console();
+            super::EPOCH.fetch_add(1, Ordering::AcqRel);
+            let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+        }
+        moved
+    }
+
     fn regrid_console() {
         if let Some((oc, or, nc, nr)) = crate::video::fbcon::regrid() {
             let (gw, gh) = super::grid_cell();
@@ -748,8 +770,8 @@ pub fn fixture() {
         let mut drawn = 0u64;
         while drawn < 1000 {
             for (i, l) in lines.iter().enumerate() {
-                surf.iter_mut().for_each(|p| *p = 0x00FF_FFFF);
-                let _ = draw_text(&mut surf, W, W, H, 4, 4 + (i % 2) * 20, l, 0x0020_2020, false, Face::Ui);
+                surf.iter_mut().for_each(|p| *p = crate::video::theme::fixture::WHITE);
+                let _ = draw_text(&mut surf, W, W, H, 4, 4 + (i % 2) * 20, l, crate::video::theme::fixture::INK, false, Face::Ui);
             }
             let now = tt::stats().map_or(0, |s| s.1.glyphs_drawn);
             if now == before {
@@ -823,4 +845,12 @@ pub fn volume_face(file: &str) -> Option<&'static str> {
         let _ = file;
         None
     }
+}
+
+/// PREFSUI (B389, R93): the UI scale moved live — re-size the faces to it (no engine: nothing). `true` = moved.
+pub fn rescale() -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    return tt::rescale();
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    false
 }

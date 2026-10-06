@@ -60,7 +60,7 @@
 //! one.
 
 use spin::relax::Spin as SpinRelax;
-use spin::{Mutex, MutexGuard}; use super::rowstore::{SegVec, SlotBits}; // WINDOWCAP-2: per-row side storage
+use crate::sync::{Mutex, MutexGuard}; use super::rowstore::{SegVec, SlotBits}; // WINDOWCAP-2: per-row side storage
 
 /// WC-A — the window table is fixed-size and statically allocated: the compositor runs from syscall
 /// context on a non-coherent scan-out path where a heap allocation (or a growable table) would be
@@ -2841,7 +2841,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
 /// console happens to paint". The crispy theme will hand the compositor real desktop data; until then
 /// this is the compositor's own theme value that happens to agree — and any drift between the two shows
 /// up instantly, as a visible rectangle where a window used to be.
-pub const DESKTOP_BG: u32 = 0x002D_2B55;
+pub const DESKTOP_BG: u32 = crate::video::theme::DESKTOP_BG;
 
 /// WC-K2 — HAND the given outer boxes to the compositor as DEFERRED DESKTOP DAMAGE. This function
 /// writes no pixel. The desktop fill is published by [`drain_deferred`], at the head of the
@@ -5699,7 +5699,7 @@ fn composite_inner() -> CursorTail {
                             }
                         }
                         if let Some(b) =
-                            super::dock::Layout::for_panel(sprite_dock_tiles, info.width, info.height)
+                            super::dock::Layout::for_glass(sprite_dock_tiles, info.width, info.height)
                                 .map(|l| l.rect())
                         {
                             if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
@@ -14605,19 +14605,19 @@ fn crispy_witness() {
         theme::CORNER_RADIUS(),
         theme::CONTROL_BOX(),
         theme::GAP(),
-        theme::CHROME_FACE,
-        theme::FRAME_LINE,
-        theme::BEVEL_LIGHT,
-        theme::BEVEL_SHADOW,
-        theme::TITLE_ACTIVE_TOP,
-        theme::TITLE_ACTIVE_BOTTOM,
-        theme::TITLE_INACTIVE_TOP,
-        theme::TITLE_INACTIVE_BOTTOM,
-        theme::TITLE_TEXT_ACTIVE,
-        theme::TITLE_TEXT_INACTIVE,
-        theme::CONTROL_CLOSE,
-        theme::CONTROL_MID,
-        theme::CONTROL_ZOOM,
+        theme::chrome_face(),
+        theme::frame_line(),
+        theme::bevel_light(),
+        theme::bevel_shadow(),
+        theme::title_active_top(),
+        theme::title_active_bottom(),
+        theme::title_inactive_top(),
+        theme::title_inactive_bottom(),
+        theme::title_text_active(),
+        theme::title_text_inactive(),
+        theme::control_close(),
+        theme::control_mid(),
+        theme::control_zoom(),
         theme::GLOSS_TOP_ALPHA_Q16,
         theme::GLOSS_FALLOFF_Q16,
         theme::GLOSS_BOTTOM_ALPHA_Q16,
@@ -14700,9 +14700,9 @@ fn blend_q16(a: u32, b: u32, t: u32) -> u32 {
 pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
     use super::theme;
     let (top, bot) = if focused {
-        (theme::TITLE_ACTIVE_TOP, theme::TITLE_ACTIVE_BOTTOM)
+        (theme::title_active_top(), theme::title_active_bottom())
     } else {
-        (theme::TITLE_INACTIVE_TOP, theme::TITLE_INACTIVE_BOTTOM)
+        (theme::title_inactive_top(), theme::title_inactive_bottom())
     };
     let span = h.saturating_sub(1).max(1);
     let t = ((j.min(span) as u64 * theme::Q16_ONE as u64) / span as u64) as u32;
@@ -14725,7 +14725,7 @@ pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
     if g == 0 {
         base
     } else {
-        blend_q16(base, theme::GLOSS_HIGHLIGHT, g)
+        blend_q16(base, theme::gloss_highlight(), g)
     }
 }
 
@@ -14741,9 +14741,9 @@ pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
 #[inline]
 fn title_ink(focused: bool) -> u32 {
     if focused {
-        super::theme::TITLE_TEXT_ACTIVE
+        super::theme::title_text_active()
     } else {
-        super::theme::TITLE_TEXT_INACTIVE
+        super::theme::title_text_inactive()
     }
 }
 
@@ -18101,7 +18101,7 @@ fn occ_clip(rows: &[Window], i: usize, shell: u32, pw: usize, ph: usize) -> OccC
         // `crystal` were already declared on that gate; this is the consumer catching up.
         #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
         {
-            let rect = super::dock::Layout::for_panel(dock_tiles(rows), pw, ph).map(|l| l.rect());
+            let rect = super::dock::Layout::for_glass(dock_tiles(rows), pw, ph).map(|l| l.rect());
             // WCK4-D1's lesson, restated on this side: the strip's geometry goes on the wire whether
             // or not there IS one, so `occclip_dock=0` beside a live strip is loud rather than silent.
             // Published from the same `rect` the clip is built from, and BEFORE the overlap test — a
@@ -20412,7 +20412,7 @@ fn paint_window(
         // (WC-H), still the four-rect subtraction (COMPOSITE-2), and still focus-independent, since
         // the material is a function of the row and nothing else. The cost is per chrome ROW, not
         // per pixel — see `fill_rect_ceramic`.
-        let border = super::theme::CHROME_FACE;
+        let border = super::theme::chrome_face();
         crispy_witness();
         // PHASE31 — CHROMEBAND's own loop begins here. `fill_rect_ceramic` stamps `row=` per
         // machined row, so a wedge in the face fill names the row it stopped on.
@@ -20482,7 +20482,7 @@ fn paint_window(
         // each of `kl`, `bl` and `bs`.
         comp_mark(r.id, mk + PW_FRAME);
         let bev = super::theme::BEVEL();
-        let kl = super::theme::FRAME_LINE;
+        let kl = super::theme::frame_line();
         // CRISPYWIRE-REVIEW — the keyline's THICKNESS is `theme::BEVEL` too, not a literal `1`.
         // `metrics.bevel` is the kit's hairline metric ("iteration 3 makes the bevel a true
         // hairline"), and the keyline is the frame's other hairline; there is no second metric in
@@ -20498,7 +20498,7 @@ fn paint_window(
         fill_rect_v(dst, lbx + bw.saturating_sub(kw), lby, kw, bh, kl);
         // Bevel, inside the keyline. `theme::BEVEL < theme::FRAME` is a const-assert, so these can
         // never reach the strip.
-        let (bl, bs) = (super::theme::BEVEL_LIGHT, super::theme::BEVEL_SHADOW);
+        let (bl, bs) = (super::theme::bevel_light(), super::theme::bevel_shadow());
         fill_rect_v(dst, lbx + kw, lby + kw as isize, bw.saturating_sub(2 * kw), bev, bl);
         fill_rect_v(dst, lbx + kw, lby + kw as isize, bev, bh.saturating_sub(2 * kw), bl);
         fill_rect_v(
@@ -20580,9 +20580,9 @@ fn paint_window(
                 // symbol reads as the surface showing through rather than as a fourth colour. It
                 // invents nothing — see the SHARED-SOURCE note above `ctrl_glyph`.
                 let punch = if focused {
-                    super::theme::TITLE_ACTIVE_TOP
+                    super::theme::title_active_top()
                 } else {
-                    super::theme::TITLE_INACTIVE_TOP
+                    super::theme::title_inactive_top()
                 };
                 //
                 // CERAMIC — the discs are machined too, at `ceramic::CONTROL_GAIN_Q16` (half), so
@@ -20618,9 +20618,9 @@ fn paint_window(
                     // `theme::CTRL_CLOSE` for the provenance, for the reversal, and for why the
                     // kit's three blue steps are kept but no longer painted.
                     let col = match which {
-                        Ctrl::Close => super::theme::CTRL_CLOSE,
-                        Ctrl::Minimise => super::theme::CTRL_MIN,
-                        Ctrl::Zoom => super::theme::CTRL_ZOOM,
+                        Ctrl::Close => super::theme::ctrl_close(),
+                        Ctrl::Minimise => super::theme::ctrl_min(),
+                        Ctrl::Zoom => super::theme::ctrl_zoom(),
                     };
                     let cly = cby as isize - oy as isize;
                     let clx = bxn.saturating_sub(ox);
@@ -21803,9 +21803,9 @@ fn draw_title(
 /// The colours are chosen to be distinguishable from each other AND from [`DESKTOP_BG`], because
 /// telling those three apart at one pixel is the entire verdict.
 #[cfg(feature = "witness")]
-static FV_SURF_A: [u32; 64] = [0x00FF_2020; 64];
+static FV_SURF_A: [u32; 64] = [crate::video::theme::fixture::ROSE; 64];
 #[cfg(feature = "witness")]
-static FV_SURF_B: [u32; 64] = [0x0020_FF20; 64];
+static FV_SURF_B: [u32; 64] = [crate::video::theme::fixture::LIME; 64];
 
 /// FOCUS-VIS — the RAISE-IS-VISIBLE witness. Four legs, each a scan-out READ-BACK at one pixel: the
 /// content origin of two windows placed at the SAME point, so exactly one of them can own that pixel and
@@ -22299,7 +22299,7 @@ fn movevacate_selftest() {
     // is the desktop at every one of them and the rule is byte-identical to the one this replaced.
     // `gone` is the KEYLINE rather than the content colour: these three points are on the old box's
     // OUTER EDGE, so an unerased sliver shows `theme::FRAME_LINE`, not the surface.
-    let (sliver_ok, clean, covered) = vacated_points(&pts, super::theme::FRAME_LINE);
+    let (sliver_ok, clean, covered) = vacated_points(&pts, super::theme::frame_line());
     // Half 1b — and the window is genuinely THERE, at the new origin, rather than the panel having
     // simply gone quiet. Content and kernel-drawn chrome both, since the move re-lays both.
     let new_window = read(ox + STEP + 1, oy + STEP + 1) == a_col
@@ -24456,7 +24456,7 @@ pub fn retile_on_ready() -> usize {
 /// `const` assertion: a fourth move of the metric fails the BUILD rather than turning leg 10 and
 /// the close-box leg into silent SKIPs, which is the exact failure this comment has now recorded
 /// three times.
-static HT_SURF: [u32; FIX_W * FIX_H] = [0x0020_C080; FIX_W * FIX_H];
+static HT_SURF: [u32; FIX_W * FIX_H] = [crate::video::theme::fixture::JADE; FIX_W * FIX_H];
 
 /// The fixture surfaces' SOURCE width, in pixels. Sized from the shipping geometry rather than
 /// picked: it must clear [`CLUSTER_MIN_SRC_W`] (148 px at the current metrics) so that every
@@ -25413,7 +25413,7 @@ fn dock_tiles(rows: &[Window]) -> usize {
     // scan the pins actually run against admit the same rows (a `compat` row is in neither).
     super::dock::pins_applied(n, |o| {
         rows.iter().any(|r| dock_addressable(r) && r.owner_asid == o)
-    })
+    }) + super::dock::thumb_copies_of(rows.iter().filter(|r| dock_addressable(r) && !above_shell(r, SHELL_Z.load(core::sync::atomic::Ordering::Acquire))).map(|r| r.owner_asid)) // DOCK2 M6: a minimised pinned app's thumbnail copy
 }
 
 // ---- CTRLWIT fixture ---------------------------------------------------------------------------
@@ -29535,26 +29535,8 @@ fn wcd_heap_tick() {
 #[cfg(not(feature = "witness"))]
 #[inline(always)]
 fn wcd_heap_tick() {}
-/// FIRSTBOOT (R77): [`close_all_furniture`] except `keep` (the installer's own window). Returns the closed count.
-pub fn close_all_furniture_except(keep: WinId) -> usize {
-    let mut ids = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
-    let mut n = 0usize;
-    {
-        let t = table();
-        for r in t.rows.iter() {
-            if r.used && !r.compat && r.id != keep {
-                ids.push(r.id);
-                n += 1;
-            }
-        }
-    }
-    for &id in &ids[..n] {
-        close(id);
-    }
-    n
-}
 /// SPLASHX86: the boot splash's row — a full-panel, CHROMELESS compat row (no title, no controls, `hit_test`
-/// never names it, `close_all_furniture_except` spares it, `COMPAT_WIN` is not touched so `close_compat` /
+/// never names it, `close_all_furniture` spares it, `COMPAT_WIN` is not touched so `close_compat` /
 /// `compat_live` never see it). The caller pins it with [`set_modal_top`] and closes it with [`close`].
 /// `surf` is a `w * h * 4` xRGB buffer that must outlive the row. Returns [`WIN_NONE`] on refusal.
 pub fn splash_open(surf: usize, surf_len: usize, w: usize, h: usize) -> WinId {
@@ -30177,7 +30159,7 @@ pub const FIX_WIDE_W: usize = 448;
 #[cfg(feature = "witness")]
 pub const FIX_WIDE_STRIDE: usize = FIX_WIDE_W * 4;
 #[cfg(feature = "witness")]
-static HT_WIDE: [u32; FIX_WIDE_W * FIX_H] = [0x0020_C080; FIX_WIDE_W * FIX_H];
+static HT_WIDE: [u32; FIX_WIDE_W * FIX_H] = [crate::video::theme::fixture::JADE; FIX_WIDE_W * FIX_H];
 #[cfg(feature = "witness")]
 const _: () = { let m = crate::ui::Metrics::at(crate::video::dpi::S2_MAX, 0); assert!(FIX_WIDE_W >= 5 * m.gap + 3 * m.ctrl_box + m.chrome_cw && FIX_WIDE_W >= FIX_W); };
 /// The width a scale-pinned fixture row uses: `FIX_W`, or the cluster floor when the dpi scale has raised it past.
@@ -30301,4 +30283,50 @@ fn alloc_slot(t: &mut Table) -> Option<usize> {
     t.rows.push(Window::empty());
     ROWS_HWM.store(t.rows.len(), core::sync::atomic::Ordering::Release);
     Some(t.rows.len() - 1)
+}
+
+/// DOCK2 (B394) — **a minimised window's thumbnail**: the window's own surface (the one the compositor blits),
+/// sampled nearest-neighbour and aspect-fit into `out` (`tw` x `th`, logical `0x00RRGGBB`); the letterbox is left
+/// untouched. Under the table lock, bounded by `surf_len` like `draw_window`'s read. `false` = no row or no surface.
+pub fn thumb(id: WinId, out: &mut [u32], tw: usize, th: usize) -> bool {
+    let t = table();
+    let Some(r) = row(&t, id) else { return false };
+    if r.surf == 0 || r.w == 0 || r.h == 0 || r.stride < 4 || tw == 0 || th == 0 || out.len() < tw * th {
+        return false;
+    }
+    let (sw, sh) = (r.w.min(r.stride / 4), r.h.min(r.surf_len / r.stride));
+    if sw == 0 || sh == 0 {
+        return false;
+    }
+    // Aspect fit: the larger of the two ratios decides, the other axis is centred.
+    let (dw, dh) = if sw * th >= sh * tw { (tw, (sh * tw / sw).max(1)) } else { ((sw * th / sh).max(1), th) };
+    let (ox, oy) = ((tw - dw) / 2, (th - dh) / 2);
+    let p = r.surf as *const u8;
+    for v in 0..dh {
+        let sy = v * sh / dh;
+        for u in 0..dw {
+            let sx = u * sw / dw;
+            let off = sy * r.stride + sx * 4;
+            if off + 4 > r.surf_len {
+                continue;
+            }
+            // SAFETY: `off + 4 <= surf_len`, the real byte length of the mapped slot (the bound `draw_window` reads under).
+            let px: u32 = unsafe { core::ptr::read_unaligned(p.add(off) as *const u32) };
+            out[(oy + v) * tw + ox + u] = px & 0x00FF_FFFF;
+        }
+    }
+    true
+}
+
+/// DIALOG2 (rmbp-ledger B404): `owner`'s frontmost (highest-z) window — the anchor a bus SHEET slides from.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn front_of_owner(owner: u64) -> Option<WinId> {
+    let t = table();
+    let mut best: Option<(u32, WinId)> = None;
+    for r in t.rows.iter() {
+        if r.used && !r.compat && r.owner_asid == owner && best.map_or(true, |(z, _)| r.z >= z) {
+            best = Some((r.z, r.id));
+        }
+    }
+    best.map(|b| b.1)
 }

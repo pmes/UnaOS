@@ -39,7 +39,6 @@
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::uslots::USER_SLOTS;
 
 /// The L1 index of the extension GiB (481).
 pub const EXT_L1: usize = (una_abi::USER_EXT_BASE_ARM >> 30) as usize;
@@ -89,28 +88,44 @@ struct Table([u64; 512]);
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
 
-static mut XL2: [Table; USER_SLOTS] = [const { Table([0; 512]) }; USER_SLOTS];
-/// Covers ext+0 .. ext+2 MiB (the args page). The ELF window's L3s are heap frames (WINDOW2).
-static mut XL3: [Table; USER_SLOTS] = [const { Table([0; 512]) }; USER_SLOTS];
+// WINDOWCAP3 (B399, R90): a slot's extension L2, its L3 (ext+0 .. ext+2 MiB, the args page — the ELF window's
+// L3s are heap frames, WINDOW2) and its args page are ONE heap record (identity-mapped, so its address is
+// its PA), taken at the slot's first claim (`slot_tables_warm`) and recycled by index.
+#[repr(C, align(4096))]
+struct XRec {
+    l2: Table,
+    l3: Table,
+    args: Page,
+}
+static XREC: crate::procslot::SlotVec<core::sync::atomic::AtomicPtr<XRec>> = crate::procslot::SlotVec::new(
+    || core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+);
 /// WINDOW2: window L3 frames (heap) wired across every slot right now.
 static L3_LIVE: AtomicU64 = AtomicU64::new(0);
-static mut ARGS: [Page; USER_SLOTS] = [const { Page([0; 4096]) }; USER_SLOTS];
 
-static PAGES: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
+static PAGES: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 static LIVE: AtomicU64 = AtomicU64::new(0);
-static BRK: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
-static BRK_LO: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
-static BRK_MAX: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
-/// 1 when slot `s`'s extension GiB is installed in its L1.
-static PLACED: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
-static SBRK_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static BRK: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
+static BRK_LO: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
+static BRK_MAX: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
+static PLACED: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0)); // 1 when slot `s`'s extension GiB is installed in its L1.
+static SBRK_LOCK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
+fn xrec(s: usize) -> Option<*mut XRec> {
+    let p = XREC.peek(s)?.load(Ordering::Acquire);
+    if p.is_null() { None } else { Some(p) }
+}
+/// WINDOWCAP3: slot `s` has its extension record (the range check that was `s < USER_SLOTS`).
+fn known(s: usize) -> bool {
+    s < crate::procslot::SLOT_ID_MAX && xrec(s).is_some()
+}
 fn xl2(s: usize) -> *mut u64 {
-    unsafe { (&raw mut XL2[s]).cast::<u64>() }
+    xrec(s).map_or(core::ptr::null_mut(), |p| unsafe { (&raw mut (*p).l2).cast::<u64>() })
 }
 /// The args-page L3 of slot `s`.
 fn xl3(s: usize) -> *mut u64 {
-    unsafe { (&raw mut XL3[s]).cast::<u64>() }
+    xrec(s).map_or(core::ptr::null_mut(), |p| unsafe { (&raw mut (*p).l3).cast::<u64>() })
 }
 /// WINDOW2: the window L3 behind L2 index `i` of slot `s` (a heap frame, identity-addressed), or null.
 fn wl3(s: usize, i: usize) -> *mut u64 {
@@ -122,7 +137,7 @@ pub fn l3_live() -> u64 {
     L3_LIVE.load(Ordering::Acquire)
 }
 fn args_ptr(s: usize) -> *mut u8 {
-    unsafe { (&raw mut ARGS[s]).cast::<u8>() }
+    xrec(s).map_or(core::ptr::null_mut(), |p| unsafe { (&raw mut (*p).args).cast::<u8>() })
 }
 /// Slot `s`'s own L1 table (the TTBR0 base, ASID bits masked off).
 fn slot_l1(s: usize) -> *mut u64 {
@@ -151,7 +166,7 @@ fn current_slot() -> Option<usize> {
     let t: u64;
     unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) t, options(nomem, nostack, preserves_flags)) };
     let asid = (t >> 48) as usize;
-    if asid >= 1 && asid <= USER_SLOTS { Some(asid - 1) } else { None }
+    if asid >= 1 && known(asid - 1) { Some(asid - 1) } else { None }
 }
 
 /// RING3ABI2: install slot `s`'s extension GiB (args page + empty ELF window), write the empty args header
@@ -159,7 +174,7 @@ fn current_slot() -> Option<usize> {
 /// program's heap, as on x86). Called by the loader for every image it places, before the task exists.
 /// `false` (nothing installed, a wire line) if the slot's `L1[EXT_L1]` is already in use.
 pub fn slot_placed(s: usize, window_base: u64) -> bool {
-    if s >= USER_SLOTS {
+    if !known(s) {
         return false;
     }
     let l1 = slot_l1(s);
@@ -185,12 +200,12 @@ pub fn slot_placed(s: usize, window_base: u64) -> bool {
     set_heap(s, XWIN_OFF as u64, (XWIN_OFF + XWIN_BYTES) as u64);
     true
 }
-static WINDOW_BASE: [AtomicU64; USER_SLOTS] = [const { AtomicU64::new(0) }; USER_SLOTS];
+static WINDOW_BASE: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 
 /// RING3ABI2 M2: lay `words` out in slot `s`'s args page (`una_abi::args_build`). `false` when they do not
 /// fit (the page keeps argc 0) or the slot was not placed.
 pub fn args_write(s: usize, words: &[&str]) -> bool {
-    if s >= USER_SLOTS || PLACED[s].load(Ordering::Acquire) == 0 {
+    if !known(s) || PLACED[s].load(Ordering::Acquire) == 0 {
         return false;
     }
     let page = unsafe { core::slice::from_raw_parts_mut(args_ptr(s), 4096) };
@@ -210,7 +225,7 @@ pub fn argv_fits(argv: &[&str]) -> bool {
 
 /// The argc slot `s`'s args page carries.
 pub fn args_argc(s: usize) -> usize {
-    if s >= USER_SLOTS {
+    if !known(s) {
         return 0;
     }
     let page = unsafe { core::slice::from_raw_parts(args_ptr(s), 4096) };
@@ -328,7 +343,7 @@ unsafe fn unmap_page(s: usize, off: usize, live: bool) {
 /// backends' `teardown_user_slot` on the FINAL release, after the ASID flush (no core can walk the root),
 /// and by `slot_placed` as a reset. Idempotent; a slot never placed holds nothing.
 pub unsafe fn slot_free(s: usize) {
-    if s >= USER_SLOTS {
+    if !known(s) {
         return;
     }
     for i in XWIN_OFF / (512 * 4096)..XWIN_OFF / (512 * 4096) + XWIN_PTS {
@@ -662,4 +677,21 @@ pub fn args_probe(words: &[&str]) -> Option<usize> {
     let n = if ok { args_argc(s) } else { 0 };
     unsafe { super::uslots::teardown_user_slot(asid_of(s)) };
     Some(n)
+}
+
+/// WINDOWCAP3 (rmbp-ledger B399): give slot `s` its extension record and every per-slot row of this file at
+/// its claim (process context — both backends' `alloc_user_slot`). `false` = the heap said no.
+pub fn slot_tables_warm(s: usize) -> bool {
+    if xrec(s).is_none() {
+        // SAFETY: non-zero size, power-of-two alignment.
+        let p = unsafe { alloc_zeroed(Layout::new::<XRec>()) } as *mut XRec;
+        if p.is_null() {
+            return false;
+        }
+        XREC[s].store(p, Ordering::Release); // only the claimant of `s` reaches here
+    }
+    for t in [&PAGES, &BRK, &BRK_LO, &BRK_MAX, &PLACED, &WINDOW_BASE] {
+        t.warm(s);
+    }
+    true
 }

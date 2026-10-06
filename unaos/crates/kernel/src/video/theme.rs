@@ -557,9 +557,9 @@ use super::keymap::{Action, Binding, Table, ALT, CMD, CTRL, SHIFT};
 /// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
-pub static CRISPY_ROWS: [Binding; 54] = [
+pub static CRISPY_ROWS: &[Binding] = &[ // SMALLFIX3 (B416): a slice — the count is derived (`.len()`), so an arc adding a row never edits this line
     // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
-    Binding { roles: CMD | ALT, usage: 0x50, action: Action::SnapLeft, token: "cmd-alt-left" },
+    Binding { roles: CMD | ALT, usage: 0x50, action: Action::SnapLeft, token: "cmd-alt-left" }, Binding { roles: CTRL | CMD, usage: 0x14, action: Action::LockScreen, token: super::shortcuts::C_CTRL_CMD_Q }, Binding { roles: CMD, usage: 0x1A, action: Action::CloseWindow, token: super::shortcuts::C_CMD_W }, Binding { roles: CMD, usage: 0x0B, action: Action::HideApp, token: super::shortcuts::C_CMD_H }, Binding { roles: CMD, usage: 0x36, action: Action::OpenSettings, token: super::shortcuts::C_CMD_COMMA }, Binding { roles: CMD | ALT, usage: 0x29, action: Action::ForceQuit, token: super::shortcuts::C_CMD_ALT_ESC }, // APPMENU2 (B393) — the WM's system chords (Q W H comma, Opt-Esc; Ctrl-Cmd-Q locks). ABOVE the bare Esc row (`no_shadow`), Ctrl-Cmd-Q above Cmd-Q (whose row sits below Cmd-Shift-Q's LogOut).
     Binding { roles: CMD | ALT, usage: 0x4F, action: Action::SnapRight, token: "cmd-alt-right" },
     Binding { roles: CMD | ALT, usage: 0x52, action: Action::SnapZoom, token: "cmd-alt-up" },
     Binding { roles: CMD | ALT, usage: 0x51, action: Action::SnapRestore, token: "cmd-alt-down" },
@@ -584,7 +584,7 @@ pub static CRISPY_ROWS: [Binding; 54] = [
     Binding { roles: CMD | SHIFT, usage: 0x21, action: Action::ScreenshotRegion, token: super::shortcuts::C_CMD_SHIFT_4 },
     Binding { roles: CMD | SHIFT, usage: 0x22, action: Action::ScreenshotWindow, token: "cmd-shift-5" }, // SHOTREGION M2
     // The SLOT (R60). LOGINFLOW may bind it; nothing else may, and nothing acts on it today.
-    Binding { roles: CMD | SHIFT, usage: 0x14, action: Action::LogOut, token: "cmd-shift-q" },
+    Binding { roles: CMD | SHIFT, usage: 0x14, action: Action::LogOut, token: "cmd-shift-q" }, Binding { roles: CMD, usage: 0x14, action: Action::QuitApp, token: super::shortcuts::C_CMD_Q }, // APPMENU2 — BELOW Cmd-Shift-Q (`no_shadow`)
     // SCROLLBACK (R75) — ABOVE every bare Home/End row (`no_shadow`). Cmd+Home/End and Ctrl+Home/End jump, Shift+PgUp/PgDn page.
     Binding { roles: SHIFT, usage: 0x4B, action: Action::ScrollPageUp, token: "shift-pgup" },
     Binding { roles: SHIFT, usage: 0x4E, action: Action::ScrollPageDown, token: "shift-pgdn" },
@@ -623,7 +623,7 @@ pub static CRISPY_ROWS: [Binding; 54] = [
     Binding { roles: 0, usage: 0x29, action: Action::Deselect, token: "esc" },
     // WINCYCLE — Alt+Tab and the Mac's own ⌘Tab. Above the bare rows on usage 0x2B (none exist).
     Binding { roles: ALT, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB },
-    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_CMD_TAB }, Binding { roles: CMD, usage: 0x10, action: Action::Minimize, token: super::shortcuts::C_CMD_M }, Binding { roles: CMD, usage: 0x35, action: Action::CycleApp, token: super::shortcuts::C_CMD_GRAVE }, Binding { roles: CMD, usage: 0x0E, action: Action::ClearView, token: super::shortcuts::C_CMD_K } /* LUMENBIN: ⌘K (HID 0x0E) */, // WINDOWLIST — ⌘M minimise, ⌘` next window of the same app (CRISPY)
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_CMD_TAB }, Binding { roles: CMD, usage: 0x10, action: Action::Minimize, token: super::shortcuts::C_CMD_M }, Binding { roles: CMD, usage: 0x35, action: Action::CycleApp, token: super::shortcuts::C_CMD_GRAVE }, Binding { roles: CMD, usage: 0x0E, action: Action::ClearView, token: super::shortcuts::C_CMD_K } /* LUMENBIN: ⌘K (HID 0x0E) */, Binding { roles: CMD, usage: 0x0C, action: Action::GetInfo, token: super::shortcuts::C_CMD_I } /* ATTRCOLUMNS: ⌘I (HID 0x0C) */, // WINDOWLIST — ⌘M minimise, ⌘` next window of the same app (CRISPY)
     // Print Screen. `roles: 0` — the key means capture whatever else is held, which is precisely
     // what the `0x46` edge did before it was a row. A theme that drops this row disarms the key.
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: super::shortcuts::C_PRINT_SCREEN },
@@ -636,6 +636,8 @@ pub static CRISPY_ROWS: [Binding; 54] = [
     Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CTRL_ALT_L },
     // SHORTCUTS — ⌘/ opens the help overlay (usage 0x38 = `/`; no other row watches it).
     Binding { roles: CMD, usage: 0x38, action: Action::ShowShortcuts, token: super::shortcuts::C_CMD_SLASH },
+    // LAUNCHER (B417) — ⌘Space opens the Launcher (usage 0x2C = Space; no other row watches it).
+    Binding { roles: CMD, usage: 0x2C, action: Action::Launcher, token: super::shortcuts::C_CMD_SPACE },
 ];
 
 /// **The desktop's live table.** `cmd_role` is `HID_MOD_GUI`, so every `CMD` above is the Command
@@ -643,7 +645,7 @@ pub static CRISPY_ROWS: [Binding; 54] = [
 pub static CRISPY_BINDINGS: &Table = &Table {
     name: "crispy",
     cmd_role: crate::drivers::xhci::HID_MOD_GUI,
-    rows: &CRISPY_ROWS,
+    rows: CRISPY_ROWS,
 };
 
 /// A PC-shaped table. IT EXISTS TO PROVE THE SEAM AND IS SELECTED BY NOTHING — compiled,
@@ -653,7 +655,7 @@ pub static CRISPY_BINDINGS: &Table = &Table {
 /// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
 /// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
 /// moves to Alt there, not because a second Copy row was written.
-pub static PC_ROWS: [Binding; 36] = [
+pub static PC_ROWS: &[Binding] = &[ // SMALLFIX3 (B416): a slice — the count is derived (`.len()`)
     // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
     Binding { roles: CTRL | ALT, usage: 0x50, action: Action::SnapLeft, token: "ctrl-alt-left" },
     Binding { roles: CTRL | ALT, usage: 0x4F, action: Action::SnapRight, token: "ctrl-alt-right" },
@@ -675,7 +677,7 @@ pub static PC_ROWS: [Binding; 36] = [
     // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
     Binding { roles: SHIFT, usage: 0x46, action: Action::ScreenshotRegion, token: "shift-prtsc" },
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "prtsc" },
-    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB }, Binding { roles: CMD, usage: 0x10, action: Action::Minimize, token: super::shortcuts::C_CMD_M }, Binding { roles: CMD, usage: 0x35, action: Action::CycleApp, token: super::shortcuts::C_CMD_GRAVE }, Binding { roles: CMD, usage: 0x0E, action: Action::ClearView, token: super::shortcuts::C_CMD_K } /* LUMENBIN: ⌘K (HID 0x0E) */, // WINCYCLE — Alt is the PC's cmd role; WINDOWLIST — Alt+M / Alt+` on the PC table
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB }, Binding { roles: CMD, usage: 0x10, action: Action::Minimize, token: super::shortcuts::C_CMD_M }, Binding { roles: CMD, usage: 0x35, action: Action::CycleApp, token: super::shortcuts::C_CMD_GRAVE }, Binding { roles: CMD, usage: 0x0E, action: Action::ClearView, token: super::shortcuts::C_CMD_K } /* LUMENBIN: ⌘K (HID 0x0E) */, Binding { roles: CMD, usage: 0x0C, action: Action::GetInfo, token: super::shortcuts::C_CMD_I } /* ATTRCOLUMNS: ⌘I (HID 0x0C) */, // WINCYCLE — Alt is the PC's cmd role; WINDOWLIST — Alt+M / Alt+` on the PC table
     Binding { roles: SHIFT, usage: 0x4B, action: Action::ScrollPageUp, token: "shift-pgup" }, // SCROLLBACK (R75) — above the bare Home/End rows
     Binding { roles: SHIFT, usage: 0x4E, action: Action::ScrollPageDown, token: "shift-pgdn" },
     Binding { roles: CTRL, usage: 0x4A, action: Action::ScrollTop, token: "ctrl-home" },
@@ -704,7 +706,7 @@ pub static PC_ROWS: [Binding; 36] = [
 pub static PC_BINDINGS: &Table = &Table {
     name: "pc",
     cmd_role: crate::drivers::xhci::HID_MOD_ALT,
-    rows: &PC_ROWS,
+    rows: PC_ROWS,
 };
 
 /// The tables' two structural contracts, checked at compile time beside the kit's own colour
@@ -716,8 +718,8 @@ const _: () = {
     // No row may shadow a later one (see `keymap::no_shadow`). This is what stops a bare-modifier
     // row being written above a chord that needs one — the failure that disarms a binding in
     // silence.
-    assert!(super::keymap::no_shadow(&CRISPY_ROWS));
-    assert!(super::keymap::no_shadow(&PC_ROWS));
+    assert!(super::keymap::no_shadow(CRISPY_ROWS));
+    assert!(super::keymap::no_shadow(PC_ROWS));
 };
 // ══════════════ SCRSHOT-DESKTOP — WHERE A SCREEN CAPTURE LANDS (R60, 2026-09-22) ══════════════
 //
@@ -788,3 +790,256 @@ pub const TERM_RED: u8 = 31;
 pub const TERM_GREEN: u8 = 32;
 pub const TERM_BLUE: u8 = 94;
 pub const TERM_DIM: u8 = 90;
+
+// ── APPEARANCE (rmbp-ledger B408, MACPARITY rows 21/22) — the system palette as TOKENS ─────────────────────────────
+// The Mac's rule: every colour on the glass comes from the system's palette, never a literal, so Light / Dark, the
+// accent and the highlight reach every control at once. The kit roles above stay as the LIGHT set's provenance (and
+// for the const contexts — selftest goldens, const asserts); every PAINTER reads the live value through the role
+// functions below (`chrome_face()` … `accent()`), which index the active set. `unaos/scripts/appearance-check.py`
+// certifies [`AUDIT_LITERALS_OUTSIDE`]: the colour literals under `video/` outside this file (before: 103).
+// The preference is Principia's (`system.appearance.*`, `prefs_core::appearance`); `video::appearance` applies it.
+
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering as AOrd};
+
+/// The colour literals under `video/` outside this file — certified by `unaos/scripts/appearance-check.py`.
+pub const AUDIT_LITERALS_OUTSIDE: usize = 0;
+
+/// One palette token. Light = the kit (crispy) values above, unchanged; Dark = ours (neutral greys, the same accent).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Tok {
+    WindowBg, BevelLight, BevelShadow, FrameLine, TitleActiveTop, TitleActiveBottom, TitleInactiveTop, TitleInactiveBottom,
+    TitleTextActive, TitleTextInactive, ButtonFace, ButtonFacePressed, ButtonText, ContentFill, ContentText, ScrollTrack,
+    ScrollThumb, ControlClose, ControlMid, ControlZoom, CtrlClose, CtrlMin, CtrlZoom, GlossHighlight, FieldBg, ErrorText,
+    MeterHigh, MeterMid, MeterLow, SyntaxCode, SyntaxNum, SyntaxLit,
+}
+
+/// Tokens in a set (the `tokens=` of the witness, plus the accent and the selection, which are chosen, not set rows).
+pub const TOKENS: usize = 32;
+pub const TOKEN_NAMES: [&str; TOKENS] = [
+    "WindowBg", "BevelLight", "BevelShadow", "FrameLine", "TitleActiveTop", "TitleActiveBottom", "TitleInactiveTop", "TitleInactiveBottom",
+    "TitleTextActive", "TitleTextInactive", "ButtonFace", "ButtonFacePressed", "ButtonText", "ContentFill", "ContentText", "ScrollTrack",
+    "ScrollThumb", "ControlClose", "ControlMid", "ControlZoom", "CtrlClose", "CtrlMin", "CtrlZoom", "GlossHighlight", "FieldBg", "ErrorText",
+    "MeterHigh", "MeterMid", "MeterLow", "SyntaxCode", "SyntaxNum", "SyntaxLit",
+];
+
+/// The LIGHT set: the kit's crispy roles as they are, plus the roles the audit lifted out of the painters.
+pub const LIGHT: [u32; TOKENS] = [
+    CHROME_FACE, BEVEL_LIGHT, BEVEL_SHADOW, FRAME_LINE, TITLE_ACTIVE_TOP, TITLE_ACTIVE_BOTTOM, TITLE_INACTIVE_TOP, TITLE_INACTIVE_BOTTOM,
+    TITLE_TEXT_ACTIVE, TITLE_TEXT_INACTIVE, BUTTON_FACE, BUTTON_FACE_PRESSED, BUTTON_TEXT, CONTENT_FILL, CONTENT_TEXT, SCROLL_TRACK,
+    SCROLL_THUMB, CONTROL_CLOSE, CONTROL_MID, CONTROL_ZOOM, CTRL_CLOSE, CTRL_MIN, CTRL_ZOOM, GLOSS_HIGHLIGHT,
+    0x00FF_FFFF, // FieldBg — Quarry's rename / new-folder field (was a literal in quarry/ops.rs)
+    0x00A0_2020, // ErrorText — Facet's failure line (was a literal in facet.rs)
+    0x00C8_4B3C, 0x00D9_A22E, 0x0043_A05A, // MeterHigh / Mid / Low — Activity's load ink (activity.rs)
+    0x0020_8040, 0x00B0_5000, 0x0080_30A0, // SyntaxCode / Num / Lit — FileView's tints (fileview.rs)
+];
+
+/// The DARK set: ours — neutral greys, the window controls' semantic hues kept, inks lifted for a dark ground.
+pub const DARK: [u32; TOKENS] = [
+    0x002A_2A2D, 0x003A_3A3E, 0x0016_1618, 0x004A_4A50, 0x003C_3C41, 0x0034_3438, 0x0030_3033, 0x002B_2B2E,
+    0x00E8_E8EC, 0x008E_8E94, 0x0048_484D, 0x005C_5C62, 0x00EE_EEF1, 0x001E_1E20, 0x00E6_E4DF, 0x0032_3236,
+    0x0060_6066, CONTROL_CLOSE, CONTROL_MID, CONTROL_ZOOM, CTRL_CLOSE, CTRL_MIN, CTRL_ZOOM, GLOSS_HIGHLIGHT,
+    0x002C_2C2F, 0x00E5_7373,
+    0x00D9_604F, 0x00E0_AE45, 0x0052_B86A,
+    0x006C_C88A, 0x00E3_9A55, 0x00C3_8BE0,
+];
+
+/// The eight accents (`prefs_core::appearance::ACCENTS` order), ours. Index 0 is the kit's own [`ACCENT`].
+pub const ACCENTS: [u32; 8] = [ACCENT, 0x002E_8C8C, 0x005B_8C3A, 0x00C0_8A1E, 0x00C0_603A, 0x00B0_4A6A, 0x007A_5AB0, 0x006E_6E73];
+
+/// Colours that are the same in both sets (the console is dark in both; the pointer is un-themed, PA38; Pulse and
+/// Facet's media ground are dark instruments) — consts, so the const contexts that read them keep compiling.
+pub const DESKTOP_BG: u32 = 0x002D_2B55;
+pub const PANEL_BG: u32 = 0x001E_1E1E;
+pub const CONSOLE_BG: u32 = 0x0000_0000;
+pub const CONSOLE_TEXT: u32 = 0x00C0_C0C0;
+pub const CONSOLE_BRIGHT: u32 = 0x00FF_FFFF;
+pub const PANIC_BG: u32 = 0x0030_0000;
+// BEZEL (B405) and PANICSCREEN (B406) are fixed-look overlays, the same in Light and Dark (APPEARANCE B408 moved
+// their literals here at merge17 so `appearance-check.py` holds at literals_outside_theme=0).
+pub const BEZEL_FACE: u32 = 0x0026_2629;
+pub const BEZEL_EDGE: u32 = 0x003C_3C40;
+pub const BEZEL_INK: u32 = 0x00EE_EEF0;
+pub const BEZEL_DIM: u32 = 0x004A_4A50;
+pub const PANIC_INK: u32 = 0x00EC_ECEE;
+pub const PANIC_INK_SMALL: u32 = 0x00A0_A0A6;
+// PLAYER (B419): the player's dim caption and the scrubber knob's edge (moved here at merge17).
+pub const PLAYER_DIM_TEXT: u32 = 0x0070_6E6A;
+pub const PLAYER_KNOB_EDGE: u32 = 0x00FF_FFFF;
+pub const POINTER_FILL: u32 = 0x00FF_FFFF;
+pub const POINTER_SHADOW: u32 = 0x0010_1014;
+pub const PULSE_BG: u32 = 0x0010_0E16;
+pub const PULSE_METER: u32 = 0x009B_59B6;
+pub const PULSE_LABEL: u32 = 0x008A_8296;
+pub const MEDIA_BG: u32 = 0x0020_2020;
+pub const MEDIA_MATTE: u32 = 0x0010_1010;
+pub const MEDIA_CAPTION: u32 = 0x00F0_F0F0;
+pub const SNAP_INK: u32 = 0x004A_90D9;
+pub const SHOT_BORDER: u32 = 0x00FF_FFFF;
+/// An opaque black pixel (a decoded image's empty canvas).
+pub const OPAQUE_BLACK: u32 = 0xFF00_0000;
+
+/// The packed-ARGB form of an `0x00RRGGBB` role (Facet's surfaces carry alpha).
+#[inline]
+pub const fn opaque(c: u32) -> u32 {
+    0xFF00_0000 | c
+}
+
+static DARK_ON: AtomicBool = AtomicBool::new(false);
+static ACCENT_IX: AtomicU8 = AtomicU8::new(0);
+static HL_IX: AtomicU8 = AtomicU8::new(0);
+/// Bumped on every change of set, accent or highlight — `strip::seal` and Quarry's repaint pass read it.
+static EPOCH: AtomicU32 = AtomicU32::new(0);
+
+/// The live value of token `t`.
+#[inline]
+pub fn tok(t: Tok) -> u32 {
+    if DARK_ON.load(AOrd::Relaxed) { DARK[t as usize] } else { LIGHT[t as usize] }
+}
+
+/// Is the Dark set live?
+pub fn is_dark() -> bool {
+    DARK_ON.load(AOrd::Relaxed)
+}
+
+/// The chosen accent's index / colour.
+pub fn accent_index() -> usize {
+    (ACCENT_IX.load(AOrd::Relaxed) as usize).min(ACCENTS.len() - 1)
+}
+
+/// The highlight's accent index.
+pub fn highlight_index() -> usize {
+    (HL_IX.load(AOrd::Relaxed) as usize).min(ACCENTS.len() - 1)
+}
+
+/// Change epoch (0 = never changed).
+pub fn epoch() -> u32 {
+    EPOCH.load(AOrd::Acquire)
+}
+
+/// Install a set / accent / highlight. Returns whether anything moved (the epoch is bumped only then).
+pub fn set(dark: bool, accent: usize, highlight: usize) -> bool {
+    let a = accent.min(ACCENTS.len() - 1) as u8;
+    let h = highlight.min(ACCENTS.len() - 1) as u8;
+    let moved = DARK_ON.swap(dark, AOrd::AcqRel) != dark;
+    let moved = (ACCENT_IX.swap(a, AOrd::AcqRel) != a) | moved;
+    let moved = (HL_IX.swap(h, AOrd::AcqRel) != h) | moved;
+    if moved {
+        EPOCH.fetch_add(1, AOrd::AcqRel);
+    }
+    moved
+}
+
+/// `a` and `b` mixed `num/den` of the way to `b`, per channel.
+fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
+    let ch = |s: u32| {
+        let (x, y) = ((a >> s) & 0xFF, (b >> s) & 0xFF);
+        ((x * (den - num) + y * num) / den) << s
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
+#[inline] pub fn chrome_face() -> u32 { tok(Tok::WindowBg) }
+#[inline] pub fn bevel_light() -> u32 { tok(Tok::BevelLight) }
+#[inline] pub fn bevel_shadow() -> u32 { tok(Tok::BevelShadow) }
+#[inline] pub fn frame_line() -> u32 { tok(Tok::FrameLine) }
+#[inline] pub fn title_active_top() -> u32 { tok(Tok::TitleActiveTop) }
+#[inline] pub fn title_active_bottom() -> u32 { tok(Tok::TitleActiveBottom) }
+#[inline] pub fn title_inactive_top() -> u32 { tok(Tok::TitleInactiveTop) }
+#[inline] pub fn title_inactive_bottom() -> u32 { tok(Tok::TitleInactiveBottom) }
+#[inline] pub fn title_text_active() -> u32 { tok(Tok::TitleTextActive) }
+#[inline] pub fn title_text_inactive() -> u32 { tok(Tok::TitleTextInactive) }
+#[inline] pub fn button_face() -> u32 { tok(Tok::ButtonFace) }
+#[inline] pub fn button_face_pressed() -> u32 { tok(Tok::ButtonFacePressed) }
+#[inline] pub fn button_text() -> u32 { tok(Tok::ButtonText) }
+#[inline] pub fn content_fill() -> u32 { tok(Tok::ContentFill) }
+#[inline] pub fn content_text() -> u32 { tok(Tok::ContentText) }
+#[inline] pub fn scroll_track() -> u32 { tok(Tok::ScrollTrack) }
+#[inline] pub fn scroll_thumb() -> u32 { tok(Tok::ScrollThumb) }
+#[inline] pub fn control_close() -> u32 { tok(Tok::ControlClose) }
+#[inline] pub fn control_mid() -> u32 { tok(Tok::ControlMid) }
+#[inline] pub fn control_zoom() -> u32 { tok(Tok::ControlZoom) }
+#[inline] pub fn ctrl_close() -> u32 { tok(Tok::CtrlClose) }
+#[inline] pub fn ctrl_min() -> u32 { tok(Tok::CtrlMin) }
+#[inline] pub fn ctrl_zoom() -> u32 { tok(Tok::CtrlZoom) }
+#[inline] pub fn gloss_highlight() -> u32 { tok(Tok::GlossHighlight) }
+#[inline] pub fn field_bg() -> u32 { tok(Tok::FieldBg) }
+#[inline] pub fn error_text() -> u32 { tok(Tok::ErrorText) }
+#[inline] pub fn meter_high() -> u32 { tok(Tok::MeterHigh) }
+#[inline] pub fn meter_mid() -> u32 { tok(Tok::MeterMid) }
+#[inline] pub fn meter_low() -> u32 { tok(Tok::MeterLow) }
+#[inline] pub fn syntax_code() -> u32 { tok(Tok::SyntaxCode) }
+#[inline] pub fn syntax_num() -> u32 { tok(Tok::SyntaxNum) }
+#[inline] pub fn syntax_lit() -> u32 { tok(Tok::SyntaxLit) }
+/// ControlAccent — the default button, the selected segment, the focused control's ring, the slider knob, the
+/// menu highlight: `system.appearance.accent`.
+#[inline] pub fn accent() -> u32 { ACCENTS[accent_index()] }
+/// Selection — text selection behind ink: `system.appearance.highlight`, mixed toward the content ground so the
+/// ink stays legible in both sets (5/8 of the way to the ground in Light, 3/8 in Dark).
+#[inline] pub fn selection() -> u32 {
+    let (num, den) = if is_dark() { (3, 8) } else { (5, 8) };
+    mix(ACCENTS[highlight_index()], content_fill(), num, den)
+}
+
+/// SELFTEST VECTORS — pixel values the painters' selftests feed in or expect back (golden rows of the materials,
+/// synthetic window surfaces). Not chrome; here so the glass's sources name no literal (the audit's rule).
+pub mod fixture {
+    pub const PROBE_RGB: u32 = 0x0012_3456;
+    pub const BLACK: u32 = 0x0000_0000;
+    pub const WHITE: u32 = 0x00FF_FFFF;
+    pub const INK: u32 = 0x0020_2020;
+    pub const MAGENTA: u32 = 0x00FF_00FF;
+    pub const OPAQUE_GREEN: u32 = 0xFF00_FF00;
+    pub const RGB_RED: u32 = 0x00FF_0000;
+    pub const RGB_GREEN: u32 = 0x0000_FF00;
+    pub const RGB_BLUE: u32 = 0x0000_00FF;
+    pub const RAMP_BASE: u32 = 0x0000_FF80;
+    pub const BLUE: u32 = 0x0020_40FF;
+    pub const GREEN: u32 = 0x0040_FF20;
+    pub const RED: u32 = 0x00FF_4020;
+    pub const YELLOW: u32 = 0x00FF_FF20;
+    pub const CYAN: u32 = 0x0020_FFFF;
+    pub const PINK: u32 = 0x00FF_20FF;
+    pub const SKY: u32 = 0x0030_90F0;
+    pub const LEAF: u32 = 0x0040_A060;
+    pub const DUSK: u32 = 0x0033_3355;
+    pub const STEEL: u32 = 0x0030_70A0;
+    pub const ROSE: u32 = 0x00FF_2020;
+    pub const LIME: u32 = 0x0020_FF20;
+    pub const JADE: u32 = 0x0020_C080;
+    pub const TEST_COLOR: u32 = 0x0011_2233;
+    pub const SENTINEL: u32 = 0x00AB_CDEF;
+    /// The kit's paper `base_rgb` under the pinned rounding — `paper.rs`'s tripwire against `CONTENT_FILL`.
+    pub const PAPER_BASE: u32 = 0x00F5_F2EA;
+    /// `ceramic.rs` leg 4: `CHROME_FACE` under the material, rows 0..8.
+    pub const CERAMIC_REF8: [u32; 8] = [
+        0x00EC_ECEE, 0x00EB_EBED, 0x00EC_ECEE, 0x00EB_EBED, //
+        0x00EC_ECEE, 0x00EA_EAEC, 0x00EA_EAEC, 0x00EA_EAEC,
+    ];
+    /// `knurl.rs` leg 4: the three control roles at node / apex / groove / cancel.
+    pub const KNURL_REF: [[u32; 4]; 3] = [
+        [0x00FF_5F57, 0x00FF_6058, 0x00F9_5D55, 0x00FF_5F57],
+        [0x00FE_BC2E, 0x00FF_BF2E, 0x00F8_B82D, 0x00FE_BC2E],
+        [0x0028_C840, 0x0028_CC41, 0x0027_C33E, 0x0028_C840],
+    ];
+    /// `paper.rs` leg 2: the reference corner.
+    pub const PAPER_REF4: [u32; 16] = [
+        0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, //
+        0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, //
+        0x00F3_F0E9, 0x00F4_F1E9, 0x00F4_F1E9, 0x00F4_F1E9, //
+        0x00F3_F0E9, 0x00F4_F1E9, 0x00F4_F1E9, 0x00F4_F1E9,
+    ];
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < TOKENS {
+        assert!(LIGHT[i] <= 0x00FF_FFFF && DARK[i] <= 0x00FF_FFFF);
+        i += 1;
+    }
+    assert!(LIGHT[Tok::ContentText as usize] != LIGHT[Tok::ContentFill as usize]);
+    assert!(DARK[Tok::ContentText as usize] != DARK[Tok::ContentFill as usize]);
+    assert!(DARK[Tok::WindowBg as usize] != LIGHT[Tok::WindowBg as usize]);
+    assert!(Tok::SyntaxLit as usize + 1 == TOKENS);
+    assert!(ACCENTS.len() == 8);
+};

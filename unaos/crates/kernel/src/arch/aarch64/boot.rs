@@ -424,17 +424,97 @@ pub unsafe fn protect_user_code(va: u64, len: usize) -> (bool, bool) {
 // struct-of-slot array) keep every PageTable 4 KiB-aligned and every UserRegion 16 KiB-aligned (a packed
 // 28 KiB slot would misalign the backing on slots >= 1). ~224 KiB BSS, zeroed by `_start`.
 
-/// Number of per-task user address-space slots (STOP tripwire: this cap is deliberate — do not raise it
-/// to satisfy a demo; a real allocator/paged user memory is a later arc).
-pub const USER_SLOTS: usize = 8;
+/// WINDOWCAP3 (rmbp-ledger B399, R90): there is no slot COUNT. This was `USER_SLOTS = 8` — the `asids`
+/// term of the process limit. A slot's tables (and, on the Pi, its backing) are one heap record taken on the
+/// first claim of its index and recycled by index after; a slot index is bounded by its TYPE
+/// (`procslot::SLOT_ID_MAX`, ASID = slot + 1) and the live process limit is memory's (`video::wincap`). The
+/// record is not returned to the heap at exit: `teardown_user_slot`'s ASID flush covers the TLBs, but a
+/// freed L1 frame under a core's speculative walker is the one hazard a recycled record never has.
 
-static mut SLOT_L1: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
-static mut SLOT_L2: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
-static mut SLOT_L3: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
-static mut SLOT_BACKING: [SlotBacking; USER_SLOTS] =
-    [const { SlotBacking([0; USER_STATIC_SIZE]) }; USER_SLOTS];
+// WINDOWCAP3 (B399): the three tables live in ONE 4 KiB-aligned heap record per slot (identity-mapped
+// heap, so a record's address IS its PA — the walkers read it exactly as they read the `.bss` arrays).
+#[repr(C, align(4096))]
+struct SlotTables {
+    l1: PageTable,
+    l2: PageTable,
+    l3: PageTable,
+    backing: SlotBacking,
+}
+static SLOT_TABLES: crate::procslot::SlotVec<core::sync::atomic::AtomicPtr<SlotTables>> = crate::procslot::SlotVec::new(
+    || core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+);
+static SLOT_RECORDS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// WINDOWCAP3: one slot's heap record in bytes (`video::wincap`'s per-process cost carries it).
+pub const SLOT_RECORD_BYTES: usize = core::mem::size_of::<SlotTables>();
+
+/// WINDOWCAP3: slot `s`'s record, if one was ever allocated. Never allocates (safe from any context).
+#[inline]
+fn slot_rec(s: usize) -> Option<*mut SlotTables> {
+    if s >= crate::procslot::SLOT_ID_MAX {
+        return None;
+    }
+    let p = SLOT_TABLES.peek(s)?.load(Ordering::Acquire);
+    if p.is_null() { None } else { Some(p) }
+}
+#[inline]
+fn slot_l1(s: usize) -> *mut PageTable {
+    slot_rec(s).map_or(core::ptr::null_mut(), |p| unsafe { &raw mut (*p).l1 })
+}
+#[inline]
+fn slot_l2(s: usize) -> *mut PageTable {
+    slot_rec(s).map_or(core::ptr::null_mut(), |p| unsafe { &raw mut (*p).l2 })
+}
+#[inline]
+fn slot_l3(s: usize) -> *mut PageTable {
+    slot_rec(s).map_or(core::ptr::null_mut(), |p| unsafe { &raw mut (*p).l3 })
+}
+/// WINDOWCAP3: give slot `s` its table record on the first claim of its index. `false` = the heap said no.
+fn slot_rec_ensure(s: usize) -> bool {
+    if slot_rec(s).is_some() {
+        return true;
+    }
+    // SAFETY: non-zero size, power-of-two alignment.
+    let p = unsafe { alloc::alloc::alloc_zeroed(alloc::alloc::Layout::new::<SlotTables>()) } as *mut SlotTables;
+    if p.is_null() {
+        return false;
+    }
+    SLOT_TABLES[s].store(p, Ordering::Release); // only the claimant of `s` reaches here
+    SLOT_RECORDS.fetch_add(1, Ordering::AcqRel);
+    true
+}
+/// WINDOWCAP3: one past the highest slot index ever claimed — every "all slots" sweep's bound.
+#[inline]
+pub fn user_slots() -> usize {
+    SLOT_USED.hwm()
+}
+/// WINDOWCAP3: slot `s` has a record (was ever claimed). Never allocates.
+#[inline]
+pub fn slot_known(s: usize) -> bool {
+    slot_rec(s).is_some()
+}
+/// WINDOWCAP3: slot records the pool holds (its peak).
+pub fn slot_records() -> usize {
+    SLOT_RECORDS.load(Ordering::Acquire)
+}
+/// WINDOWCAP3: claim the lowest recyclable slot index, else a new one at the high-water mark, bounded by the
+/// slot TYPE (`procslot::SLOT_ID_MAX`; ASID = slot + 1 <= 127) — never by a pool width.
+fn slot_claim() -> Option<usize> {
+    loop {
+        let hwm = user_slots();
+        if let Some(s) = (0..hwm).find(|&s| SLOT_USED[s].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()) {
+            return Some(s);
+        }
+        if hwm >= crate::procslot::SLOT_ID_MAX {
+            return None;
+        }
+        if SLOT_USED[hwm].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return Some(hwm);
+        }
+    }
+}
 /// Allocation state, one flag per slot. Atomic so `alloc`/`teardown` are race-free across cores.
-static SLOT_USED: [AtomicBool; USER_SLOTS] = [const { AtomicBool::new(false) }; USER_SLOTS];
+static SLOT_USED: crate::procslot::SlotVec<AtomicBool> = crate::procslot::SlotVec::new(|| AtomicBool::new(false), AtomicBool::new(true)); // WINDOWCAP3 (B399): per-slot, heap-grown
 
 /// ELF-2 — the LIVE-TASK refcount for each slot (its shared address space). ELF-1 ran one task per slot,
 /// so a slot's lifetime was "alloc … single task exits … teardown". ELF-2 lets several EL0 THREADS share
@@ -444,7 +524,7 @@ static SLOT_USED: [AtomicBool; USER_SLOTS] = [const { AtomicBool::new(false) }; 
 /// `teardown_user_slot` decrements — doing the real ASID-flush + slot-free only on the 1->0 edge. Indexed by
 /// slot (`asid - 1`). Untouched by the shared-window (ASID 0) / kernel (ttbr0 0) tasks, which never call
 /// teardown.
-static SLOT_REFCOUNT: [AtomicU32; USER_SLOTS] = [const { AtomicU32::new(0) }; USER_SLOTS];
+static SLOT_REFCOUNT: crate::procslot::SlotVec<AtomicU32> = crate::procslot::SlotVec::new(|| AtomicU32::new(0), AtomicU32::new(0)); // WINDOWCAP3 (B399): per-slot, heap-grown
 
 /// STORM-HEADROOM — how many of the `USER_SLOTS` address-space slots are unclaimed right now. Reads
 /// only (one relaxed-ordered flag per slot), safe from any core; never consulted on an allocation
@@ -457,7 +537,7 @@ static SLOT_REFCOUNT: [AtomicU32; USER_SLOTS] = [const { AtomicU32::new(0) }; US
 /// `storm` verb samples it at its launch boundaries so a bench capture says whether the reserve
 /// actually survived a full fleet, rather than whether it was intended to.
 pub fn user_slots_free() -> usize {
-    (0..USER_SLOTS).filter(|&s| !SLOT_USED[s].load(Ordering::Acquire)).count()
+    (0..user_slots()).filter(|&s| !SLOT_USED[s].load(Ordering::Acquire)).count()
 }
 
 /// ELF-2 — register one more live EL0 thread against the slot owning `asid` (the shared address space a
@@ -465,7 +545,7 @@ pub fn user_slots_free() -> usize {
 /// MUST be called on a live slot (refcount already >= 1 from the initial owner) BEFORE the new thread can be
 /// dispatched, so no thread exit can drive the count to 0 while another is still being wired up.
 pub fn slot_thread_retain(asid: u64) {
-    debug_assert!(asid >= 1 && asid as usize <= USER_SLOTS, "retain: asid out of range");
+    debug_assert!(asid >= 1 && slot_known((asid - 1) as usize), "retain: asid out of range");
     let prev = SLOT_REFCOUNT[(asid - 1) as usize].fetch_add(1, Ordering::AcqRel);
     debug_assert!(prev >= 1, "slot_thread_retain on a slot with no live owner");
 }
@@ -484,8 +564,8 @@ fn slot_asid(s: usize) -> u64 {
 
 /// The TTBR0 value that installs slot `s`'s address space: `slot_l1_pa | (asid << 48)`.
 pub fn slot_ttbr0(s: usize) -> u64 {
-    debug_assert!(s < USER_SLOTS);
-    let l1_pa = unsafe { (&raw const SLOT_L1).cast::<PageTable>().add(s) as u64 };
+    debug_assert!(slot_known(s));
+    let l1_pa = slot_l1(s) as u64;
     l1_pa | (slot_asid(s) << 48)
 }
 
@@ -494,17 +574,24 @@ pub fn slot_ttbr0(s: usize) -> u64 {
 /// never through the (ASID-tagged, EL0) user-window VA. A72 L1 caches are PIPT, so writes here are
 /// coherent with the EL0 fetch/read of the same frame at the aliased user VA.
 pub fn slot_backing_ptr(s: usize) -> *mut u8 {
-    debug_assert!(s < USER_SLOTS);
-    unsafe { (&raw mut SLOT_BACKING).cast::<SlotBacking>().add(s).cast::<u8>() }
+    debug_assert!(slot_known(s));
+    slot_rec(s).map_or(core::ptr::null_mut(), |p| unsafe { (&raw mut (*p).backing).cast::<u8>() }) // WINDOWCAP3: the backing is the record's tail
 }
 
 /// Claim a free slot and build its private translation tables, returning the slot id. Pool-only (no heap),
 /// so it is safe to call off the dispatch path. Returns `None` if all 8 slots are in use (STOP tripwire).
 pub fn alloc_user_slot() -> Option<usize> {
-    for s in 0..USER_SLOTS {
-        if SLOT_USED[s]
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    if let Some(s) = slot_claim() {
+        if !slot_rec_ensure(s) {
+            SLOT_USED[s].store(false, Ordering::Release); // never installed -> no TLBI owed
+            return None;
+        }
+        super::syscall::slot_tables_warm(s as u64 + 1); // WINDOWCAP3: every ASID-keyed sidecar row exists before dispatch
+        super::sched::slot_tables_warm(s + 1);
+        if !super::xwin::slot_tables_warm(s) {
+            SLOT_USED[s].store(false, Ordering::Release); // never installed -> no TLBI owed
+            return None;
+        }
         {
             // ELF-2: seed the live-task refcount to 1 for the initial owner. The store precedes
             // `build_slot`'s publishing barrier and any dispatch onto this slot, so a
@@ -567,9 +654,9 @@ unsafe fn build_slot(s: usize) {
     let boot_l1 = &raw const L1 as *const u64;
     let boot_l2 = &raw const L2_USER as *const u64;
     let boot_l3 = &raw const L3_USER as *const u64;
-    let sl1 = unsafe { (&raw mut SLOT_L1).cast::<PageTable>().add(s).cast::<u64>() };
-    let sl2 = unsafe { (&raw mut SLOT_L2).cast::<PageTable>().add(s).cast::<u64>() };
-    let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    let sl1 = slot_l1(s).cast::<u64>();
+    let sl2 = slot_l2(s).cast::<u64>();
+    let sl3 = slot_l3(s).cast::<u64>();
     unsafe {
         // WC-B (F1): SCRUB this slot's FB REGION before the new tenant can reach it. A slot is RECYCLED —
         // `teardown_user_slot` retires the ASID and its mappings but never touches the backing bytes, and
@@ -603,10 +690,10 @@ unsafe fn build_slot(s: usize) {
         }
         // Redirect the table branch into the slot's own L2/L3.
         sl2.add(l2_idx).write_volatile(table_desc(unsafe {
-            (&raw const SLOT_L3).cast::<PageTable>().add(s) as u64
+            slot_l3(s) as u64
         }));
         sl1.add(0).write_volatile(table_desc(unsafe {
-            (&raw const SLOT_L2).cast::<PageTable>().add(s) as u64
+            slot_l2(s) as u64
         }));
         // Publish the descriptors to every Inner-Shareable table walker before any core's TTBR0 walks
         // them (a slot built on the BSP is first used by a task on an AP). No TLBI: fresh ASID, no stale.
@@ -636,11 +723,11 @@ pub unsafe fn protect_user_slot_code(s: usize, len: usize) {
 /// (descriptor write -> `dsb ishst` -> per-page broadcast `tlbi vaae1is` -> `dsb ish` -> `isb`), and the
 /// same break-before-make exemption (the slot's task does not yet run, so no concurrent walk under its ASID).
 pub unsafe fn protect_user_slot_code_range(s: usize, off: usize, len: usize) {
-    debug_assert!(s < USER_SLOTS);
+    debug_assert!(slot_known(s));
     debug_assert!(off + len <= USER_REGION_SIZE, "protect range outside the slot window");
     let user_pa = &raw const USER_REGION as u64;
     let backing = slot_backing_ptr(s) as u64;
-    let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    let sl3 = slot_l3(s).cast::<u64>();
     let start = user_pa + (off as u64 & !0xFFF); // first page of the range
     let end = user_pa + off as u64 + len as u64; // exclusive
     unsafe {
@@ -684,19 +771,19 @@ pub fn fb_win_surface_va(w: usize) -> u64 {
 /// reads it to composite / checksum, EL0 draws through the aliased EL0-RW VA — A72 PIPT caches keep the
 /// two coherent, exactly as for the single ELF-3 surface).
 pub fn slot_fb_win_surface_ptr(s: usize, w: usize) -> *mut u8 {
-    debug_assert!(s < USER_SLOTS && w < FB_WIN_SLOTS);
+    debug_assert!(slot_known(s) && w < FB_WIN_SLOTS);
     unsafe { slot_backing_ptr(s).add(USER_REGION_SIZE + FB_INFO_SIZE + w * FB_WIN_SLOT_SIZE) }
 }
 /// ELF-3: kernel-side identity pointer to slot `s`'s FB info page (EL1-RW, the kernel writes geometry
 /// here; the EL0 alias is read-only).
 pub fn slot_fb_info_ptr(s: usize) -> *mut u8 {
-    debug_assert!(s < USER_SLOTS);
+    debug_assert!(slot_known(s));
     unsafe { slot_backing_ptr(s).add(USER_REGION_SIZE) }
 }
 /// ELF-3: kernel-side identity pointer to slot `s`'s FB surface (EL1-RW; the kernel reads it to composite
 /// / checksum, EL0 draws into the aliased EL0-RW VA — A72 PIPT caches keep the two coherent).
 pub fn slot_fb_surface_ptr(s: usize) -> *mut u8 {
-    debug_assert!(s < USER_SLOTS);
+    debug_assert!(slot_known(s));
     unsafe { slot_backing_ptr(s).add(USER_REGION_SIZE + FB_INFO_SIZE) }
 }
 
@@ -711,7 +798,7 @@ pub fn slot_fb_surface_ptr(s: usize) -> *mut u8 {
 /// walker before the first draw. Editing only USER leaves in the slot's PRIVATE L3 (in-lane; the per-slot
 /// freeze note in `build_slot` is about KERNEL mappings).
 pub unsafe fn map_slot_fb(s: usize) {
-    debug_assert!(s < USER_SLOTS);
+    debug_assert!(slot_known(s));
     unsafe { map_slot_fb_info(s) };
     // WC-B: the ELF-3 compat surface is window slot 0's FIRST page — byte-identical mapping to before.
     unsafe { map_slot_fb_win(s, 0, FB_SURFACE_SIZE / 0x1000) };
@@ -729,10 +816,10 @@ pub unsafe fn map_slot_fb(s: usize) {
 /// (the first map, from the reserved identity descriptor) has by definition never been a valid EL0 info
 /// page for this tenant, so the BBM below is unreachable by a legitimate concurrent reader.
 pub unsafe fn map_slot_fb_info(s: usize) {
-    debug_assert!(s < USER_SLOTS);
+    debug_assert!(slot_known(s));
     let info_va = fb_info_va();
     let info_pa = slot_fb_info_ptr(s) as u64;
-    let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    let sl3 = slot_l3(s).cast::<u64>();
     let info_idx = ((info_va >> 12) & 0x1FF) as usize;
     if unsafe { sl3.add(info_idx).read_volatile() } == user_ro_page(info_pa) {
         return; // already mapped for this slot — no leaf edit, so no break window
@@ -756,11 +843,11 @@ pub unsafe fn map_slot_fb_info(s: usize) {
 /// Same proper BREAK-BEFORE-MAKE as `map_slot_fb` (the output address changes on a live valid leaf):
 /// invalidate, broadcast-TLBI, then write the new leaf and publish.
 pub unsafe fn map_slot_fb_win(s: usize, w: usize, pages: usize) {
-    debug_assert!(s < USER_SLOTS && w < FB_WIN_SLOTS);
+    debug_assert!(slot_known(s) && w < FB_WIN_SLOTS);
     debug_assert!(pages >= 1 && pages <= FB_WIN_SLOT_SIZE / 0x1000);
     let base_va = fb_win_surface_va(w);
     let base_pa = slot_fb_win_surface_ptr(s, w) as u64;
-    let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    let sl3 = slot_l3(s).cast::<u64>();
     unsafe {
         // Break: invalidate the old (reserved identity, EL1-only) leaves for the whole negotiated range.
         for p in 0..pages {
@@ -793,10 +880,10 @@ pub unsafe fn map_slot_fb_win(s: usize, w: usize, pages: usize) {
 /// ORDER is load-bearing: any concurrent EL0 access to a closed surface must fault, never read a stale
 /// mapping. That fault is the intended fail-closed outcome, not a regression.
 pub unsafe fn unmap_slot_fb_win(s: usize, w: usize, pages: usize) {
-    debug_assert!(s < USER_SLOTS && w < FB_WIN_SLOTS);
+    debug_assert!(slot_known(s) && w < FB_WIN_SLOTS);
     debug_assert!(pages >= 1 && pages <= FB_WIN_SLOT_SIZE / 0x1000);
     let base_va = fb_win_surface_va(w);
-    let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    let sl3 = slot_l3(s).cast::<u64>();
     let boot_l3 = &raw const L3_USER as *const u64;
     unsafe {
         for p in 0..pages {
@@ -822,8 +909,8 @@ pub unsafe fn unmap_slot_fb_win(s: usize, w: usize, pages: usize) {
 /// an executable segment's page landed as a CODE leaf (RO-both + EL0-executable) and a data segment's page
 /// as a DATA leaf (EL0+EL1 RW, never executable) — the per-segment permission proof.
 pub fn slot_leaf_desc(s: usize, va: u64) -> u64 {
-    debug_assert!(s < USER_SLOTS);
-    let sl3 = unsafe { (&raw const SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    debug_assert!(slot_known(s));
+    let sl3 = slot_l3(s).cast::<u64>();
     unsafe { sl3.add(((va >> 12) & 0x1FF) as usize).read_volatile() }
 }
 
@@ -861,7 +948,7 @@ pub fn slot_page_is_data(s: usize, va: u64) -> bool {
 /// ELF-1 behavior is a special case: one task, refcount 1, so the first (and only) release is the final one
 /// and the flush+free run exactly as before.
 pub unsafe fn teardown_user_slot(asid: u64) {
-    debug_assert!(asid >= 1 && asid as usize <= USER_SLOTS, "teardown: asid out of range"); crate::video::wm::app_name_forget(asid); // SO22: on aarch64 the wm owner IS the asid (slot + 1) — the name dies with the slot, so a recycled slot cannot wear its predecessor's
+    debug_assert!(asid >= 1 && slot_known((asid - 1) as usize), "teardown: asid out of range"); crate::video::wm::app_name_forget(asid); // SO22: on aarch64 the wm owner IS the asid (slot + 1) — the name dies with the slot, so a recycled slot cannot wear its predecessor's
     // The ASIDE1IS operand carries the ASID in Xt[63:48]; assert `asid << 48` round-trips (a mis-encoded
     // operand would flush the wrong ASID — silent on QEMU, a stale-entry bug on metal).
     debug_assert_eq!((asid << 48) >> 48, asid, "teardown: ASID does not fit Xt[63:48]");
@@ -928,7 +1015,7 @@ pub unsafe fn teardown_user_slot(asid: u64) {
 /// the right frame -> `true`. Returns whether both reads matched their planted sentinels (and the two
 /// differ). Cleans up its cached entries with an all-ASID broadcast TLBI of the probe VA.
 pub unsafe fn probe_slot_isolation(a: usize, b: usize, off: u64, expect_a: u64, expect_b: u64) -> bool {
-    debug_assert!(a < USER_SLOTS && b < USER_SLOTS);
+    debug_assert!(slot_known(a) && slot_known(b));
     // The no-TLBI TTBR0 swap between the two roots is architecturally legal ONLY because they carry
     // DISTINCT ASIDs: that is what lets the second (ASID-b) load miss the ASID-a entry the first load
     // cached and re-walk to slot b. Two equal slots would share an ASID and the probe would read slot a's

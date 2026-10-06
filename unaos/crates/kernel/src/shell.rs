@@ -46,7 +46,7 @@ use crate::arch::memory as storm_slots;
 /// cluster: every command re-resolves it from the root, so a swapped or remounted card can
 /// never leave the shell holding a stale chain head — the worst case is an honest `-ENOENT`.
 /// `None` means the root (no heap touched until the first `cd`).
-static CWD: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static CWD: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
 
 /// The current working directory as a display/join-ready absolute path.
 fn cwd_path() -> String {
@@ -1897,7 +1897,7 @@ fn parse_wallclock(args: &[&str]) -> Option<crate::clock::WallTime> {
 #[allow(clippy::type_complexity)]
 pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::DirEnt>), String> {
     use crate::fs::vfs::{DirEnt, NodeKind};
-    let mt = vfs_mount_table();
+    let mt = vfs_mount_table(); let orig = path; let ra = crate::fs::rootdisk::unalias(&mt, path); let path: &str = ra.as_deref().unwrap_or(path); // ROOTDISK (B390, R94): `/volumes/UnaOS/…` lists as `/…` (one directory, two paths)
     // VFS-4: a path naming a reserved volume that is not currently bound reports the VOLUME as
     // missing, not a bare -ENOENT off the native root. `ls` shares the guard the mutating `mount`
     // verb has had since VFS-4 rather than re-deriving it.
@@ -1977,7 +1977,7 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok((true, crate::fs::volumes::publish(path, rows))) // VOLUMES2 (B376, R89): `/volumes/boot` publishes `efi` only, one listing for ls, Quarry and the gate
+    Ok((true, crate::fs::rootdisk::present(orig, crate::fs::volumes::publish(path, rows)))) // VOLUMES2 (B376, R89): `/volumes/boot` publishes `efi` only, one listing for ls, Quarry and the gate
 }
 
 /// VFS-1 (adoption): render a [`DirEnt`](crate::fs::vfs::DirEnt)'s last-write stamp as the
@@ -2342,16 +2342,16 @@ impl midden_core::Volume for FatVolume {
         // namespace because this probe must keep binding `mount_program_source()` and STAMPING
         // [`EXEC_BIND`] (the FATVERB witness reads that stamp); x86's `/` IS the volume root, so
         // `/APPS/VUG.ELF` on the volume and `/apps/VUG.ELF` in the namespace are one file.
-        let from_cwd = normalize_path(&cwd_path(), name);
-        if fat_path_is_file(&fs, &from_cwd) {
+        let from_cwd = vfs_path(name); let _ = &fs; let ns = vfs_mount_table(); let ns_file = |p: &str| matches!(ns.stat(p), Ok(st) if !matches!(st.kind, crate::fs::vfs::NodeKind::Dir)); // ROOTDISK2 (B401, R94): the probe asks the NAMESPACE (cwd, then EXEC_ROOT) — `/apps` is a UnaFS directory on the card; the bind above still stamps EXEC_BIND
+        if ns_file(&from_cwd) {
             return true;
         }
         if name.starts_with('/') {
             return false; // an absolute token means what it says; the second probe is for bare names
         }
         let from_apps = normalize_path(
-            &alloc::format!("/{}", crate::fs::fat::APPS_DIR), name);
-        from_apps != from_cwd && fat_path_is_file(&fs, &from_apps)
+            EXEC_ROOT, name);
+        from_apps != from_cwd && ns_file(&from_apps)
     }
     /// BARENAME (PARITY §6.6a): the aarch64 twin — the SAME question, asked of the namespace this
     /// arch actually has.
@@ -2430,7 +2430,7 @@ fn render_message(console: &mut Console, msg: &midden_core::Message) {
 /// This is deliberately NOT `Console::history`, which is the SCROLLBACK (every output line the view
 /// is holding). Two different questions — "what did I type" vs "what is on screen" — and conflating
 /// them is why `history` could not simply read the console.
-static CMD_HISTORY: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static CMD_HISTORY: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 
 /// BASICS: how many command lines `history` retains. Small and fixed: this is a bench console, the
 /// store is heap, and a run-away paste must not be able to grow it without bound.
@@ -2443,7 +2443,7 @@ const HISTORY_CAP: usize = 64;
 /// the help text implied substitution would be worse than no store. What it is good for today is
 /// what an operator at a bench actually uses it for — writing down a path, an address or a pid
 /// between commands, on a machine with no notepad.
-static ENV_VARS: spin::Mutex<Vec<(String, String)>> = spin::Mutex::new(Vec::new());
+static ENV_VARS: crate::sync::Mutex<Vec<(String, String)>> = crate::sync::Mutex::new(Vec::new());
 
 /// BASICS: caps on the variable store. A shell variable is a convenience, not a database.
 const ENV_MAX_VARS: usize = 32;
@@ -3015,7 +3015,7 @@ pub fn midden_witness() { if crate::tests::defer("tste", midden_witness) { retur
 /// BASICS: where a captured console's lines land. `Console::set_output_sink` takes a bare `fn`
 /// pointer (no captured state, by its own contract), so the buffer has to be a static.
 #[cfg(feature = "witness")]
-static WITNESS_CAPTURE: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static WITNESS_CAPTURE: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 
 /// BASICS: the sink itself. Touches nothing but its own lock, which satisfies the sink contract's
 /// "must not call back into this `Console` and must hold no lock the call site could already hold".
@@ -6168,7 +6168,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("shutting down: invoking the platform firmware mechanism...");
             crate::power::shutdown();
         },
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "view" => { view_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "edit" => { edit_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "settings" => { settings_verb(console); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "activity" => { match crate::video::activity::open() { Ok(()) => console.println("activity: open (q closes, k kills the selected process)"), Err(e) => console.println(&alloc::format!("activity: {}", e)) } } "pref" => { crate::prefs::verb(&args, &mut |l: &str| console.println(l)); } "bt" => { #[cfg(all(target_arch = "x86_64", feature = "btc"))] crate::drivers::ehci::bthid::verb(&args, &mut |l: &str| console.println(l)); #[cfg(not(all(target_arch = "x86_64", feature = "btc")))] console.println("bt: Bluetooth BR/EDR is not built into this image (UNAOS_BTC=1)"); } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail.
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "dialog" => { crate::video::dialog::shell_verb(&args, console); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "view" => { view_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "edit" => { edit_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "settings" => { settings_verb(console); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "activity" => { match crate::video::activity::open() { Ok(()) => console.println("activity: open (q closes, k kills the selected process)"), Err(e) => console.println(&alloc::format!("activity: {}", e)) } } "pref" => { crate::prefs::verb(&args, &mut |l: &str| console.println(l)); } "bt" => { #[cfg(all(target_arch = "x86_64", feature = "btc"))] crate::drivers::ehci::bthid::verb(&args, &mut |l: &str| console.println(l)); #[cfg(not(all(target_arch = "x86_64", feature = "btc")))] console.println("bt: Bluetooth BR/EDR is not built into this image (UNAOS_BTC=1)"); } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail.
             console.println("rebooting: invoking the platform firmware mechanism...");
             crate::power::reboot();
         },
@@ -6282,12 +6282,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println(&alloc::format!(
                 "storm: n={} — {}/{} process rows free, {}/{} job rows, {}/{} user slots",
                 n, rows_free, rows, jobs_free, jobs_rows,
-                slots_free, storm_slots::USER_SLOTS
+                slots_free, storm_slots::user_slots()
             ));
             serial_println!(
                 ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} dead={} | user slots free={}/{} ::",
                 n, rows_free, rows_running, rows_exited, rows_orphaned, rows,
-                jobs_free, jobs_rows, jobs_dead, slots_free, storm_slots::USER_SLOTS
+                jobs_free, jobs_rows, jobs_dead, slots_free, storm_slots::user_slots()
             );
             crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
@@ -6324,7 +6324,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 serial_println!(
                     ":: STORM: end | proc rows free={} running={} exited={} porphaned={} of {} | user slots free={}/{} ::",
                     f, r, e, o, crate::arch::syscall::proc_table_rows(),
-                    storm_slots::user_slots_free(), storm_slots::USER_SLOTS
+                    storm_slots::user_slots_free(), storm_slots::user_slots()
                 );
             }
             // `post` is taken immediately, so its busy percents still carry the pre-burst window —
@@ -6703,12 +6703,12 @@ struct BgJob {
 /// DIFFERENT core: `adopt_bg_job` runs from the device-service task (`x86_usb_pump`, service core)
 /// while the shell runs in `x86_render_service` (render core). The Mutex is now load-bearing — do
 /// not drop it. No live hazard today (the service-core call happens once, at boot, before an
-/// operator can type `jobs`), and cross-core contention on a raw `spin::Mutex` is bounded spin that
+/// operator can type `jobs`), and cross-core contention on a raw `crate::sync::Mutex` is bounded spin that
 /// progresses — the SCHED-X86 deadlock rule is about two preemptible takers on ONE core. But note
 /// that `bg_jobs` holds this lock across `console.println`, which on a `wc` build routes through the
 /// compositor: a future second cross-core caller could spin for the length of a repaint.
 #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
-static BG_JOBS: spin::Mutex<[Option<BgJob>; 12]> = spin::Mutex::new([None; 12]);
+static BG_JOBS: crate::sync::Mutex<[Option<BgJob>; 12]> = crate::sync::Mutex::new([None; 12]);
 
 /// BGREAP-CLOSE: claim a row in [`BG_JOBS`], reclaiming provably-finished rows when the table is
 /// full. **Every insert into that table must come through here** — `jobs` is the only path that
@@ -6953,7 +6953,7 @@ fn bg_program(console: &mut Console, path: &str, rest: &[&str]) -> bool {
 fn bg_image(console: &mut Console, path: &str, bytes: &[u8], argv: &[&str]) -> Option<(u64, u64, u64)> {
     let n = bytes.len(); serial_println!("[bg] spawn path={} bytes={} pid=pending", path, n); // NETHANG M1: the breadcrumb AHEAD of the spawn — boot 20 went dark after `[gui] app-enter` with no line naming which step it reached
     crate::prof::launching(path); match crate::arch::syscall::spawn_user_image_bg_argv(bytes, argv) {
-        Ok((pid, asid, entry)) => { serial_println!("[bg] spawn path={} pid={} asid={:#x} -> started", path, pid, asid); crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL: no `panic::Location` in this shared file moves. Name the launch BEFORE the job row is claimed — the task is runnable the instant the spawn returns and may reach its window create first, and a name armed late is a title the operator watches change. `owner_of_launch` corrects the per-arch off-by-one in the spawn handle; the rule and that correction are both stated at `wm::app_name_arm`. Fail-closed: a full name table costs the window its name, never the launch.
+        Ok((pid, asid, entry)) => { serial_println!("[bg] spawn path={} pid={} asid={:#x} -> started", path, pid, asid); crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path); crate::fs::appres::sight(path); // APPRES (B398): first sight publishes the program's resources as attributes. // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL: no `panic::Location` in this shared file moves. Name the launch BEFORE the job row is claimed — the task is runnable the instant the spawn returns and may reach its window create first, and a name armed late is a title the operator watches change. `owner_of_launch` corrects the per-arch off-by-one in the spawn handle; the rule and that correction are both stated at `wm::app_name_arm`. Fail-closed: a full name table costs the window its name, never the launch.
             let mut jobs = BG_JOBS.lock();
             // BGREAP-CLOSE: `bg_jobs_claim` reclaims rows whose job is provably finished before it
             // reports the table full — a close-box press retires the kernel row without telling this

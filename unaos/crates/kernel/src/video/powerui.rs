@@ -55,7 +55,7 @@ pub fn disarm() { ARMED_VERB.store(0, Ordering::Release); }
 
 // ── M2: the battery panel ──────────────────────────────────────────────────────────────────────
 static PANEL: AtomicBool = AtomicBool::new(false);
-static TEXT: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static TEXT: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 /// Panel width in glyphs.
 pub const PANEL_GLYPHS: usize = 34;
 
@@ -117,15 +117,15 @@ pub fn shell_verb(console: &mut crate::console::Console) {
 }
 
 // ── M3: low-battery notice and optional clean shutdown ─────────────────────────────────────────
-static DONE_MASK: AtomicU8 = AtomicU8::new(0); // bit0 = 10 % notice shown, bit1 = 5 % notice shown
+static DONE_MASK: AtomicU8 = AtomicU8::new(0); // bit0 = 20 % notice shown, bit1 = 10 % notice shown (DIALOG2, B404: the Mac's 20 then 10)
 static SHUT_REQ: AtomicBool = AtomicBool::new(false);
 
-/// Pure threshold logic over a caller-owned mask: returns 10 or 5 when a NOTICE is newly owed (0 otherwise). Discharging only; dropping
-/// straight below 5 owes only the 5 notice (and marks both).
+/// Pure threshold logic over a caller-owned mask: returns 20 or 10 when a NOTICE is newly owed (0 otherwise). Discharging only; dropping
+/// straight below 10 owes only the 10 notice (and marks both). DIALOG2 (B404): was 10 / 5; the notice is a toast now.
 pub fn threshold_hit(pct: u16, charging: bool, done: &mut u8) -> u8 {
     if charging { return 0; }
-    if pct <= 5 && *done & 2 == 0 { *done |= 3; return 5; }
-    if pct <= 10 && *done & 1 == 0 { *done |= 1; return 10; }
+    if pct <= 10 && *done & 2 == 0 { *done |= 3; return 10; }
+    if pct <= 20 && *done & 1 == 0 { *done |= 1; return 20; }
     0
 }
 
@@ -151,7 +151,7 @@ pub fn lowbat_shutdown_pct() -> u16 {
 
 fn post_notice(level: u8, pct: u16) {
     #[cfg(feature = "login")]
-    crate::video::crystal::login::notice_show(b"Low Battery", format!("Battery at {}% ({} threshold)\nPlug in the charger", pct, level).as_bytes());
+    let _ = crate::video::dialog::notice(b"Low Battery", format!("Battery at {}% ({} threshold)\nPlug in the charger", pct, level).as_bytes()); // DIALOG2 (B404): THE router — sorted error -> dialog, information -> toast
     serial_println!(":: POWER-UI: lowbat notice level={} pct={} ::", level, pct);
 }
 
@@ -176,11 +176,11 @@ pub fn lowbat_service() {
 /// Battery panel open/close through the real crystal path on a forced reading, the NOTICE threshold logic with forced percents.
 /// No real shutdown: the confirm is exercised, never fired.
 pub fn selftest() {
-    // notice logic: 12 -> none; 10 -> 10; 9 -> none (once); 4 -> 5; 3 -> none; charging at 2 -> none.
+    // notice logic: 22 -> none; 20 -> 20; 19 -> none (once); 9 -> 10; 8 -> none; charging at 2 -> none.
     let mut m = 0u8;
-    let notice_ok = threshold_hit(12, false, &mut m) == 0 && threshold_hit(10, false, &mut m) == 10 && threshold_hit(9, false, &mut m) == 0
-        && threshold_hit(4, false, &mut m) == 5 && threshold_hit(3, false, &mut m) == 0 && { let mut c = 0u8; threshold_hit(2, true, &mut c) == 0 && c == 0 }
-        && { let mut d = 0u8; threshold_hit(3, false, &mut d) == 5 && threshold_hit(8, false, &mut d) == 0 };
+    let notice_ok = threshold_hit(22, false, &mut m) == 0 && threshold_hit(20, false, &mut m) == 20 && threshold_hit(19, false, &mut m) == 0
+        && threshold_hit(9, false, &mut m) == 10 && threshold_hit(8, false, &mut m) == 0 && { let mut c = 0u8; threshold_hit(2, true, &mut c) == 0 && c == 0 }
+        && { let mut d = 0u8; threshold_hit(8, false, &mut d) == 10 && threshold_hit(15, false, &mut d) == 0 };
     // confirm: first click arms, second fires; a different verb re-arms.
     let confirm_ok = !confirm(2) && armed_label(2).is_some() && armed_label(1).is_none() && confirm(2) && !confirm(1) && { disarm(); armed_code() == 0 };
     // panel: forced model reading -> open -> rows drawn -> close.

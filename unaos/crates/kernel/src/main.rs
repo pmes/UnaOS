@@ -1510,7 +1510,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(target_arch = "x86_64", not(feature = "rast")))]
     if framebuffer_addr != 0 {
         let online = unaos_kernel::arch::smp::online_aps();
-        // Two DISTINCT cores or nothing. `XHCI_CONTROLLER` is a raw `spin::Mutex` and both the
+        // Two DISTINCT cores or nothing. `XHCI_CONTROLLER` is a raw `unaos_kernel::sync::Mutex` and both the
         // service task and the render/shell task take it (the latter through `fat` block reads,
         // `pal::pump_and_poll` inside a full-screen app, and `lsusb`). Kernel tasks are preempted
         // like any other, so two preemptible takers of a raw spinlock on ONE core deadlock it: the
@@ -2763,7 +2763,7 @@ fn handle_key(
         // command has already restored the console by the time it returns).
         SCREEN_APP_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
         unaos_kernel::gui_watchdog::on_app_enter();
-        let took_screen = unaos_kernel::shell::dispatch_command(&cmd, console, pal);
+        let took_screen = unaos_kernel::origin::with(unaos_kernel::origin::Origin::Door, || unaos_kernel::shell::dispatch_command(&cmd, console, pal)); // DIALOG2 (B404): a typed line (console window or serial door) — its spawns are the DOOR's
         unaos_kernel::gui_watchdog::on_app_exit();
         SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed); unaos_kernel::pwwire::refresh(); // CONSOLEFIX M3: a verb may have opened a password prompt or the screen
         // TERM_RING (MIDDEN_CONVERGENCE §3, M2): THE DRAIN SITE. `dispatch_command` has returned, so
@@ -3746,7 +3746,7 @@ fn serial_to_shell(byte: u8) {
 // established, and phase 6 (`SPIN8_TASK`) says the core was inside a task, not inside its own
 // scheduler loop. The three already-witnessed masked spins all read CLEAN on that capture
 // (`sem_stalls=0`, `futex_stalls=0`, no `[wedge4] preempt-in-section` line), so the spin was on a
-// raw `spin::Mutex` that none of WEDGE-4/5/6 watches.
+// raw `unaos_kernel::sync::Mutex` that none of WEDGE-4/5/6 watches.
 //
 // THE INTERLEAVING, on ONE core:
 //
@@ -5804,7 +5804,7 @@ fn usb_pump(_: usize) {
 // spawn site rather than left to comments:
 //
 //  1. `usb_pump` and `x86_render_service` MUST be on DIFFERENT cores. `XHCI_CONTROLLER` is a raw
-//     `spin::Mutex`, not the scheduler's sleeping `Mutex`, and both tasks take it (the pump directly;
+//     `unaos_kernel::sync::Mutex`, not the scheduler's sleeping `Mutex`, and both tasks take it (the pump directly;
 //     the render side transitively, through `fat` block reads, `pal::pump_and_poll` inside a
 //     full-screen app, and the `lsusb` verb). Kernel tasks ARE preempted (`timer_preempt` acts on
 //     any `current`, not just ring 3), so co-locating two preemptible takers of a raw spinlock on one
@@ -5878,11 +5878,11 @@ fn x86_typematic_pump() {
 /// per tick — so this is a faithful translation of the service rate and not a boot-pace regression.
 #[cfg(target_arch = "x86_64")]
 fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, two cfg-EXCLUSIVE definitions — this x86 body and the Pi body above; `usb_pump` is gone.
-    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu);
+    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu); #[cfg(feature = "ehcihid")] unaos_kernel::drivers::ehci::hid_task_start(cpu); // INPUTSTALL2 M2 (B388): the EHCI HID pass gets its own task, so no step of this loop can hold the keyboard and the pad (same-line fold)
     loop {
         // Nap first: `spawn` puts us on the run queue immediately, and the framebuffer handoff on the
         // BSP is still finishing. One tick costs nothing and keeps the first pass off that seam.
-        unaos_kernel::arch::sched::sleep_ticks(1);
+        unaos_kernel::arch::sched::sleep_ticks(1); unaos_kernel::video::lag::pump_top(); // INPUTSTALL2 M1 (B388): each pump step is named by a mark after it (same-line folds), so a stall second says which step held the loop
         // Poll xHCI, then run any deferred storage work (synchronous BOT transactions run here, in a
         // safe non-event context).
         //
@@ -5904,11 +5904,11 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
             xhci.service_hid_setproto();
             xhci.service_slot_disposal();
             xhci.service_enum();
-        }
+        } unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_XHCI);
         // EHCI-3 (ehcihid knob): poll the EHCI HID interrupt endpoints (internal rMBP
         // keyboard/trackpad). Same polled-service spot as the xHCI hooks above.
         #[cfg(feature = "ehcihid")]
-        unaos_kernel::drivers::ehci::service_ehci_hid();
+        unaos_kernel::drivers::ehci::service_ehci_hid_pump(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_HID);
         // WEDGEINJ (wedgeinj knob, default OFF) — keep a LIVE core asking for the gate after the
         // injected park, because the steal is a branch inside `composite` and not a timer. On metal
         // this lane supplied that condition for free (`pace_service` / `console_service` above);
@@ -5937,7 +5937,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // `ui_tick_service()` lands this moves there; the call belongs on a per-pass service body
         // either way, and this task is that body.
         #[cfg(all(target_arch = "x86_64", feature = "smc"))]
-        unaos_kernel::drivers::smc::battery::refresh_if_due();
+        unaos_kernel::drivers::smc::battery::refresh_if_due(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_TYPEMATIC);
         // STOR-1 (irqstorage knob): bring up the interrupt-driven storage service task once a block
         // device is present, then run the `bx-blockreq` self-test once. Both one-shot + gated.
         #[cfg(feature = "irqstorage")]
@@ -5962,7 +5962,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
         // because which pass a given build reaches depends on its knobs.
         #[cfg(feature = "holocron")]
-        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); unaos_kernel::pwwire::refresh(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ /* CONSOLEFIX M3: the raw-key echoes' cached LOGIN13 state */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
+        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); unaos_kernel::pwwire::refresh(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ /* CONSOLEFIX M3: the raw-key echoes' cached LOGIN13 state */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_STORE); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
         // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
         // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
         // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -5972,7 +5972,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // decoder sets a flag; THIS call site does the work. Ungated and arch-neutral, at all
         // THREE storage-ready passes this file carries, because which pass a given build reaches
         // depends on its knobs. Idle cost: one relaxed atomic load per iteration.
-        unaos_kernel::video::prtscr::service();
+        unaos_kernel::video::prtscr::service(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_PRTSCR);
         // PRTSCR-ST (prtscrst knob, default OFF): the capture's BOOT-TIME-WRITE witness — one
         // real capture through the same `capture()` the verb and the key call, then a read-back
         // of what landed on the medium. Here for the same reason `service` is here: it writes the
@@ -5983,7 +5983,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
         // the first loop site. This is the pass the GUI/desktop boot reaches, i.e. the metal boot.
         #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
-        unaos_kernel::selfhost::verify_source_once();
+        unaos_kernel::selfhost::verify_source_once(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_SELFHOST);
         // DESKTOP-APP (wc knob): the deferred half of kernel-apps eviction move #1. `desktop_uefi::activate`
         // used to open a kernel-drawn demo window at the Kepler takeover seam; it now ARMS a launch
         // there and this pass performs it, putting `STAT.ELF` on the desktop as a real ring-3 process
@@ -5996,21 +5996,21 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // SCHED-X86 finding), and it must WAIT for xHCI to enumerate storage, which only a repeating
         // service pass can do. One-shot inside; two atomic loads on every pass but one.
         #[cfg(feature = "wc")]
-        unaos_kernel::video::desktop_uefi::desktop_app_service();
+        unaos_kernel::video::desktop_uefi::desktop_app_service(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_DESKAPP);
         // SDHC-4b (x86, sdhcblk knob): mount the INTERNAL SD card READ-ONLY once registered (one-shot).
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-        unaos_kernel::fs::fat::sdhc_probe_once(); #[cfg(feature = "witness")] unaos_kernel::fs::bootdisk::root_pass_fixture(); #[cfg(target_arch = "x86_64")] unaos_kernel::fs::bootdisk::root_pass_service(); // BOOTSLOW (rmbp-ledger B201): THE ROOT PASS — on the first pass that has a block source, bind the root by content (`fs::bootdisk::locate`, the one survey every caller uses) and give the probes that do not serve it (the Bluetooth campaign, the audio tone) their verdict. Beside the storage probes and ahead of every consumer below; at all THREE x86 service loops, because which loop a build reaches depends on its knobs and a loop without it would hold those probes until the settle. The witness-only `root_pass_fixture` rides AHEAD of it on this loop alone (the one the wc QEMU lane and the metal desktop reach): a synthetic held probe that makes the ordering falsifiable on a machine with no radio. ⚠ LINE-NEUTRAL append, statements BEFORE the comment.
+        unaos_kernel::fs::fat::sdhc_probe_once(); #[cfg(feature = "witness")] unaos_kernel::fs::bootdisk::root_pass_fixture(); #[cfg(target_arch = "x86_64")] unaos_kernel::fs::bootdisk::root_pass_service(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_ROOT); // BOOTSLOW (rmbp-ledger B201): THE ROOT PASS — on the first pass that has a block source, bind the root by content (`fs::bootdisk::locate`, the one survey every caller uses) and give the probes that do not serve it (the Bluetooth campaign, the audio tone) their verdict. Beside the storage probes and ahead of every consumer below; at all THREE x86 service loops, because which loop a build reaches depends on its knobs and a loop without it would hold those probes until the settle. The witness-only `root_pass_fixture` rides AHEAD of it on this loop alone (the one the wc QEMU lane and the metal desktop reach): a synthetic held probe that makes the ordering falsifiable on a machine with no radio. ⚠ LINE-NEUTRAL append, statements BEFORE the comment.
         // FATVERB: the shell's storage witness (one-shot) — see the note at the first loop site.
         // This file carries THREE storage-ready passes and which one a given x86 build reaches
         // depends on its knobs, so the call sits at all three and the latch inside makes it speak
         // exactly once. Mutates nothing.
         #[cfg(all(target_arch = "x86_64", feature = "witness"))]
-        unaos_kernel::shell::fatverb_storage_witness();
+        unaos_kernel::shell::fatverb_storage_witness(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_FATVERB);
         // WIFI-1 (wifi knob): the Broadcom/bcma firmware-load path — see the note at the second loop
         // site. Third of the three storage-ready passes; the forward-only state machine inside makes
         // it speak exactly once whichever pass a given build reaches. Read-only in arc 1.
         #[cfg(all(target_arch = "x86_64", feature = "wifi"))] unaos_kernel::wifi::service();
-        #[cfg(all(target_arch = "x86_64", feature = "wifi", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::note_wifi_census(); #[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::sticky_clear_post_enum(); // WIFISWEEP (rmbp-ledger B113, shut-out register §6 P7): SECSTA2's post-enumeration sticky clear, MOVED here from the tail of `pci::init` — see the note at the second loop site. Third of the three storage-ready passes; both calls latch inside `pcihealth`, so whichever pass a given build reaches, each speaks exactly once. Appended to THIS line, before the comment: knob-off both are cfg-erased and no panic `Location` below moves.
+        #[cfg(all(target_arch = "x86_64", feature = "wifi", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::note_wifi_census(); #[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::sticky_clear_post_enum(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_WIFI); // WIFISWEEP (rmbp-ledger B113, shut-out register §6 P7): SECSTA2's post-enumeration sticky clear, MOVED here from the tail of `pci::init` — see the note at the second loop site. Third of the three storage-ready passes; both calls latch inside `pcihealth`, so whichever pass a given build reaches, each speaks exactly once. Appended to THIS line, before the comment: knob-off both are cfg-erased and no panic `Location` below moves.
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial on growth.
         //
         // USBDBG-INVERT — and on `usbdebug` too, which is the ONE service the terminal loop provided
@@ -6023,14 +6023,14 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // BPACE: re-emit the boot-phase timing ledger whenever it grows. Deliberately NOT under the
         // witness gate — the media `./arroyo esp-x86` writes carries neither `witness` nor
         // `usbdebug`, and this is the only build that reaches the bench.
-        unaos_kernel::bootpace::service_dump();
+        unaos_kernel::bootpace::service_dump(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_BOOTLOG);
         // FBCON-PACE: retire held console damage on THIS lane too. The usbdebug loop got this call
         // first, but the bench media carries `wc` without `usbdebug` — the console routes and THIS
         // pump is its only always-running service loop, so without the paced hook here a burst's
         // trailing band waits for the next print. Paced, not forced; free on a clean ledger.
-        unaos_kernel::video::fbcon::console_service();
+        unaos_kernel::video::fbcon::console_service(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_CONSOLE);
         // FLIGHT-RECORDER: flush the captured serial boot log to UNAOS.LOG on the FAT volume.
-        unaos_kernel::flight_recorder::service(); #[cfg(feature = "selfdiag")] unaos_kernel::bootwit::service(); // SELFDIAG M1 (B324): the armed desktop-ready boot-log write (same-line fold)
+        unaos_kernel::flight_recorder::service(); #[cfg(feature = "selfdiag")] unaos_kernel::bootwit::service(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_FLIGHT); // SELFDIAG M1 (B324): the armed desktop-ready boot-log write (same-line fold)
         // U2/U4x/U5x/U6x/U6bx (witness knob): the ring-3 fixture ladder, each one-shot and gated on
         // storage. These used to run on the BSP; they now run inside a kernel task, which is strictly
         // better for them — `spawn_user`'s target-core choice and the bounded `ticks()` waits are
@@ -6042,7 +6042,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
             unaos_kernel::arch::syscall::u5x_probe_once();
             unaos_kernel::arch::syscall::u6x_probe_once();
             unaos_kernel::arch::syscall::u6bx_probe_once();
-        }
+        } unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_UPROBES);
         // INSTALL-CORE (installdemo knob): run the installer engine end-to-end once a blank scratch
         // disk is present. INSTGUI supersedes it — there the attended Enter is the only trigger.
         #[cfg(all(feature = "installdemo", not(feature = "instgui")))]
@@ -6051,9 +6051,9 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         unaos_kernel::drivers::xhci::log_summary_once();
         // FBCON-PACE: the console's present census, once, beside the xHCI summary — same placement
         // and reasoning as the usbdebug loop's copy, because THIS is the loop the bench media runs.
-        unaos_kernel::video::fbcon::console_pace_census_once();
+        unaos_kernel::video::fbcon::console_pace_census_once(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_SUMMARY);
         // Drain any frames the NIC has received into the network stack (no-op with no NIC).
-        unaos_kernel::drivers::e1000::service_net(); #[cfg(all(target_arch = "x86_64", feature = "hda"))] unaos_kernel::drivers::hda::probe_after_root(); // BOOTSLOW (rmbp-ledger B201): the HDA bring-up and its 1.2 s tone, MOVED here from `arch/x86_64/pci.rs` (flight 12: 7116 -> 8325 ms on the boot core, between the SD card registering and the service loop that binds the root). One-shot, late in the pass, and only once the root pass has its verdict (`fs::bootdisk::root_pass_open`); at all THREE x86 service loops for the root pass's reason. ⚠ LINE-NEUTRAL append on its own cfg (GATE-FC2 lexes one cfg per line).
+        unaos_kernel::drivers::e1000::service_net(); #[cfg(all(target_arch = "x86_64", feature = "hda"))] unaos_kernel::drivers::hda::probe_after_root(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_NET); // BOOTSLOW (rmbp-ledger B201): the HDA bring-up and its 1.2 s tone, MOVED here from `arch/x86_64/pci.rs` (flight 12: 7116 -> 8325 ms on the boot core, between the SD card registering and the service loop that binds the root). One-shot, late in the pass, and only once the root pass has its verdict (`fs::bootdisk::root_pass_open`); at all THREE x86 service loops for the root pass's reason. ⚠ LINE-NEUTRAL append on its own cfg (GATE-FC2 lexes one cfg per line).
     }
 }
 
@@ -6434,7 +6434,7 @@ fn x86_render_service(cpu: usize) {
                 unaos_kernel::video::wm::WIN_NONE,
             )
         };
-        if desktop && !rescue && unaos_kernel::boot::desktop() { // INSTALLBARE (R86): no shell window before the Desktop phase — the furniture is owed (`login::furniture_owed`) and the first login mints it. SAME-LINE fold.
+        if desktop && !rescue && unaos_kernel::boot::desktop() { // INSTALLBARE (R86): no shell window before the Desktop phase — the desktop is built at login (`video::desktopbuild`, DESKTOPBUILT B387 / R93). SAME-LINE fold.
             let info = front_fb.info();
             match open_shell_window(info.width, info.height) {
                 Some((store, fb, id)) => {
@@ -6883,7 +6883,7 @@ fn x86_render_service(cpu: usize) {
             //
             // Costs one `matches!` on non-pointer events and one atomic load when no drag is live,
             // which is every report on a boot where nobody grabbed a title bar.
-            unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw); #[cfg(feature = "wc")] ptrinstall_drained(raw); #[cfg(feature = "wc")] while let Some(p) = unaos_kernel::video::termsel::take_press(shell_id) { let r = shell_console.pointer(&p, &shell_pal); if shell_console.repaint(r, &mut shell_pal) { shell_dirty = true; } } // TERMSEL2 — THE SHELL'S CLICK MODEL ATTACHES HERE. A press on the shell window's text is consumed by the click router (kernel furniture), which NOTES it for this window (`termsel::pointer_press`/`_motion`/`_release`); the notes are taken after the routed event and its drag tail, in order, and the shell's own `Console` turns each into a cell and a selection change (`Console::pointer`), repainting what the model says moved and marking the window dirty as a keystroke does. `take_press(shell_id)` takes only THIS window's notes, so a fixture's probe row cannot be fed to the shell. The `Event::Button` arm below the router stays empty: a press on the shell never reaches it. ⚠ FOLDED, line-neutral, code first. // PTRINSTALL (B117) — the DRAIN stamp: the moment this dispatch has run its arms and the drag tail. PTRINSTALL2 moved the relative INSTALL to the producer, so a drain no longer installs anything relative; what `lag_max_ms` now reads is how long the channel and this core held the report behind its install — the delivery lag a focused app's drag sees, not the pointer's. Counts post-fold dispatches. ⚠ LINE-NEUTRAL fold, `wc`-erased; the fn is at this file's tail.
+            unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw); unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_DRAIN); #[cfg(feature = "wc")] ptrinstall_drained(raw); #[cfg(feature = "wc")] while let Some(p) = unaos_kernel::video::termsel::take_press(shell_id) { let r = shell_console.pointer(&p, &shell_pal); if shell_console.repaint(r, &mut shell_pal) { shell_dirty = true; } } unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_TERMSEL); // TERMSEL2 — THE SHELL'S CLICK MODEL ATTACHES HERE. A press on the shell window's text is consumed by the click router (kernel furniture), which NOTES it for this window (`termsel::pointer_press`/`_motion`/`_release`); the notes are taken after the routed event and its drag tail, in order, and the shell's own `Console` turns each into a cell and a selection change (`Console::pointer`), repainting what the model says moved and marking the window dirty as a keystroke does. `take_press(shell_id)` takes only THIS window's notes, so a fixture's probe row cannot be fed to the shell. The `Event::Button` arm below the router stays empty: a press on the shell never reaches it. ⚠ FOLDED, line-neutral, code first. // PTRINSTALL (B117) — the DRAIN stamp: the moment this dispatch has run its arms and the drag tail. PTRINSTALL2 moved the relative INSTALL to the producer, so a drain no longer installs anything relative; what `lag_max_ms` now reads is how long the channel and this core held the report behind its install — the delivery lag a focused app's drag sees, not the pointer's. Counts post-fold dispatches. ⚠ LINE-NEUTRAL fold, `wc`-erased; the fn is at this file's tail.
 
             // Take the next queued event if one is already waiting; otherwise the burst is drained
             // and we fall through to the single present. Never parks, so an empty channel costs one
@@ -6896,7 +6896,7 @@ fn x86_render_service(cpu: usize) {
                 Some(next) => raw = next,
                 None => break,
             }
-        } console_launch_drain("x86_render_service"); // APPPIN — the DOCK'S CONSOLE launch drains here, beside the shell's and for the identical reason: `dock::press_at` latches rather than opens because the input path may not take a blocking panel lock (LOCKFIX 7847ceea) and `fbcon::panel_console_window_open` takes two, plus the window TABLE. Costs one relaxed swap on a quiet pass. The drain fn has a knob-off `#[inline(always)]` empty twin (this file's tail), so the fold erases to nothing without the desktop and needs no `#[cfg]` here. ⚠ FOLDED onto this line, never added below it — panic `Location`s, PARITY.md §5.3.
+        } console_launch_drain("x86_render_service"); unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_CONSOLE); // APPPIN — the DOCK'S CONSOLE launch drains here, beside the shell's and for the identical reason: `dock::press_at` latches rather than opens because the input path may not take a blocking panel lock (LOCKFIX 7847ceea) and `fbcon::panel_console_window_open` takes two, plus the window TABLE. Costs one relaxed swap on a quiet pass. The drain fn has a knob-off `#[inline(always)]` empty twin (this file's tail), so the fold erases to nothing without the desktop and needs no `#[cfg]` here. ⚠ FOLDED onto this line, never added below it — panic `Location`s, PARITY.md §5.3.
 
         // APPPIN (R49, 2026-09-12) — the SHELL is a pinned app; this is its QUIT and its LAUNCH, at
         // the tail of the same event burst that routed the press (`wc_route_event` ->
@@ -6958,7 +6958,7 @@ fn x86_render_service(cpu: usize) {
                         dock::app_launched(PinnedApp::Shell, id, "x86_render_service", 1);
                     }
                 }
-            } if unaos_kernel::video::dock::verb_launch_posted() && shell_id != unaos_kernel::video::wm::WIN_NONE { if let Some(v) = unaos_kernel::video::dock::take_verb_launch() { serial_println!("[dock] dockpin verb {}", v); let _ = unaos_kernel::shell::dispatch_command(v, &mut shell_console, &mut shell_pal); shell_console.draw(&mut shell_pal); shell_pal.render(); } } // DOCKPIN — LINE-NEUTRAL fold (main.rs is line-sensitive). A ring-3 table app's tile (activity, settings) latched its VERB; the shell window is the seam that runs it, exactly as if typed. Held until the shell is live (the press also posted the shell launch above).
+            } if unaos_kernel::video::dock::verb_launch_posted() && shell_id != unaos_kernel::video::wm::WIN_NONE { if let Some(v) = unaos_kernel::video::dock::take_verb_launch() { serial_println!("[dock] dockpin verb {}", v); let _ = unaos_kernel::origin::with(unaos_kernel::origin::Origin::Glass, || unaos_kernel::shell::dispatch_command(v, &mut shell_console, &mut shell_pal)); shell_console.draw(&mut shell_pal); shell_pal.render(); } } unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_SHELL); // DOCKPIN — LINE-NEUTRAL fold (main.rs is line-sensitive). A ring-3 table app's tile (activity, settings) latched its VERB; the shell window is the seam that runs it, exactly as if typed. Held until the shell is live (the press also posted the shell launch above).
         }
 
         // CURSOR-HIDE: restore the pixels under the sprite once when the auto-hide delay expires
@@ -6972,11 +6972,11 @@ fn x86_render_service(cpu: usize) {
         // INSTGUI: pick up disks that enumerate after the dialog opened (repaints only on change).
         // Rides the pulse, which is why the pulse exists.
         #[cfg(all(feature = "wc", feature = "instgui"))]
-        unaos_kernel::video::instgui::service(); #[cfg(all(feature = "wc", feature = "login"))] unaos_kernel::video::crystal::login::submit_drain(); // INPUTSTALL M5 (B375): a login submit computed on the worker is applied here, on the pulse (same-line fold).
+        unaos_kernel::video::instgui::service(); unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_INSTGUI); #[cfg(all(feature = "wc", feature = "login"))] unaos_kernel::video::crystal::login::submit_drain(); unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_LOGIN); // INPUTSTALL M5 (B375): a login submit computed on the worker is applied here, on the pulse (same-line fold).
 
         // Present: flush the damaged region of the back buffer to the framebuffer. A no-op when
         // nothing was drawn, so a pure cursor pass (front-buffer sprite) costs almost nothing.
-        pal.render();
+        pal.render(); unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_RENDER); // INPUTSTALL2 M1 (B388): each render-loop step is named by a mark after it (same-line folds)
 
         // SHELLWIN — flush the shell window's surface and composite it ONCE per drained burst, the same
         // drain-then-present-once discipline the backdrop above follows: `handle_key` drew into the
@@ -7004,7 +7004,7 @@ fn x86_render_service(cpu: usize) {
                 unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
             );
             shell_dirty = false;
-        }
+        } unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_PRESENT);
 
         // SCHED-X86 depth witness. `sent - recv` is the LIVE occupancy of the 64-slot channel, and it
         // is the number that separates "the render task is keeping up" from "the render task is
@@ -7044,7 +7044,7 @@ fn x86_render_service(cpu: usize) {
             // R0 / rtwit: the WORST-CASE RULER's rollup, riding the same ~5 s gate. Emits the
             // `[rtwit]` line (input→present max/p99, per-lock max holds, max interrupt-mask span,
             // ruler overhead) and resets every per-span slot. A no-op inline shim when `rtwit` is off.
-            unaos_kernel::rtwit::rollup();
+            unaos_kernel::rtwit::rollup(); unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_ROLLUPS);
             // R1 / rtpi: the PRIORITY-INHERITANCE witness rollup, riding the same ~5 s gate. Emits
             // `[rtpi] inherits=<n> max_jump=<lvl> chain_max=<d> active=<gauge>` (0 / `--` honestly
             // when no inversion occurred) plus the span's rate-limited `[rtpi] inherit …` traces.
@@ -7105,13 +7105,13 @@ fn panic(info: &PanicInfo) -> ! {
     // these two lines reach the wire even when this very core died holding it (the old shape lost the
     // `try_lock` to itself and dropped the whole panic message: red screen, no words). It also flushes
     // anything other cores had staged just before the fault. Takes no lock, so it cannot deadlock.
-    unaos_kernel::serial_ring::enter_panic_mode();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] unaos_kernel::video::panicscreen::note_panic(info); unaos_kernel::serial_ring::enter_panic_mode(); // PANICSCREEN (B406): the reason and its file:line, first (only the first entry counts)
     // Paint a red panic backdrop on the framebuffer (visible on hardware with no serial), then
     // print the message — serial_println! mirrors it onto that backdrop via fbcon.
     unaos_kernel::video::fbcon::panic_screen();
     serial_println!("=== KERNEL PANIC ===");
     serial_println!("{}", info);
-    unaos_kernel::arch::hlt_loop();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] unaos_kernel::video::panicscreen::finish(); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] unaos_kernel::arch::hlt_loop(); // PANICSCREEN (B406): the log, the 10 s countdown, the restart (UNAOS_PANIC_HOLD holds)
 }
 
 // ── JETSON-EL0 (M1b): the Orin's first EL0 round trip ───────────────────────────────────────────────
@@ -10142,7 +10142,7 @@ fn ptrinstall_rollup() {
 ///
 /// ### PTRLAG (rmbp-ledger B134) — "`WRITER` is copied" was true of the HOLD and false of the ACQUIRE
 /// The paragraph above accounts for every lock on this path except the one it opens with. `*WRITER.lock()`
-/// is a BLOCKING acquire of a raw `spin::Mutex` on the PREEMPTIBLE INPUT BAND — the boot-8 shape LOCKFIX
+/// is a BLOCKING acquire of a raw `unaos_kernel::sync::Mutex` on the PREEMPTIBLE INPUT BAND — the boot-8 shape LOCKFIX
 /// removed from `click_pointer_pos` one function over (`arch/x86_64/syscall.rs`, the `WAS
 /// WRITER.lock().info()` note) while `video/mod.rs`'s door comment already named the input path as the
 /// place that must not make it. PTRINSTALL2 moved the install onto the input core and carried the
@@ -10245,7 +10245,7 @@ fn ptrlag_panel_wh() -> Option<(i32, i32)> {
 /// reach.
 ///
 /// WHY IT IS A GATE AND NOT A TAUTOLOGY. At the pre-PTRLAG code this leg does not FAIL, it HANGS:
-/// `*WRITER.lock()` is a non-reentrant `spin::Mutex` this very block is holding, on one core. That hang
+/// `*WRITER.lock()` is a non-reentrant `unaos_kernel::sync::Mutex` this very block is holding, on one core. That hang
 /// is the boot-8 wedge reproduced with no HID at all, the wall is the bound, and a truncated run is not
 /// a pass (QUEUE §5) — so re-introducing the dependency scores RED by construction rather than by a
 /// threshold somebody has to choose. This is the go-red the B134 row cites.

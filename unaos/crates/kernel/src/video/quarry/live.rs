@@ -342,7 +342,7 @@ impl Geom {
     /// The path bar across the top of the surface.
     #[inline]
     fn bar_h(&self) -> usize {
-        self.row_h() + 2 * self.ts
+        2 * (self.row_h() + 2 * self.ts) // QUARRY3 (B413): the toolbar row over the path bar (`toolbar::layout`)
     }
     /// Tree pane width. 5/16 of the surface, floored at ten columns and capped at half — so the list
     /// pane, which carries three columns, is never squeezed by the one that carries one.
@@ -355,7 +355,7 @@ impl Geom {
     /// `(x, y, w, h)` of the tree pane, in source pixels.
     #[inline]
     fn tree_pane(&self) -> Rect {
-        Rect { x: 0, y: self.bar_h(), w: self.tree_w(), h: self.h - self.bar_h() }
+        Rect { x: 0, y: self.bar_h() + sidebar::h(self), w: self.tree_w(), h: self.h - self.bar_h() - sidebar::h(self) } // QUARRY3 (B413): the sidebar (Favorites, Locations) sits above the tree
     }
     /// `(x, y, w, h)` of the list pane. One pixel of divider sits between the two.
     #[inline]
@@ -501,7 +501,7 @@ struct Model {
     status: Option<String>,
 }
 
-static MODEL: spin::Mutex<Option<Model>> = spin::Mutex::new(None);
+static MODEL: crate::sync::Mutex<Option<Model>> = crate::sync::Mutex::new(None);
 
 /// The surface. A heap allocation sized from the live panel rather than a `[u32; W * H]` static,
 /// because the two panels this must serve differ by 7.5x in area (QEMU raspi4b 640x480, the bench Pi
@@ -511,7 +511,7 @@ static MODEL: spin::Mutex<Option<Model>> = spin::Mutex::new(None);
 /// INVARIANT: once [`open`] has published it, the `Vec` is at its final length and never grows, so the
 /// address `wm` holds stays valid for the window's whole life. [`close`] drops it only after
 /// `wm::close` has removed the row.
-static SURF: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+static SURF: crate::sync::Mutex<Vec<u8>> = crate::sync::Mutex::new(Vec::new());
 
 /// Repaint sequence — the wire's proof that a scroll or a navigation actually redrew, and the number
 /// `quarry.md` §5's cost note is counted against.
@@ -712,6 +712,7 @@ fn kind_token(mime: &str) -> &'static str {
         ft::IMAGE_BMP => "bmp", // OPENERS (B379)
         ft::IMAGE_WEBP => "webp", // OPENERS (B379)
         ft::IMAGE_QOI => "qoi", // OPENERS (B379)
+        ft::IMAGE_SVG => "svg", // SMALLFIX2 (B391)
         m if m.starts_with("audio/") => "audio", // OPENERS (B379)
         m if m.starts_with("video/") => "video", // OPENERS (B379)
         m if m.starts_with("text/") => "text",
@@ -1164,7 +1165,7 @@ impl Model {
                 self.err = Some(e);
             }
         }
-        columns::after_show(self); // QUARRY2 (B336): the TYPE/ORIGIN facts and the sort, derived from the listing just read
+        toolbar::after_show(self); columns::after_show(self); // QUARRY3 (B413): history + sidebar refresh, then QUARRY2 (B336): the TYPE/ORIGIN facts and the sort, derived from the listing just read
     }
 
     /// Navigate the list pane into `path` AND reveal it in the tree when the tree already carries it,
@@ -1271,7 +1272,7 @@ struct Job {
 
 /// The jobs Quarry has outstanding. Small, bounded, and Quarry's OWN — see [`MAX_JOBS`] for why it
 /// cannot be the shell's table. Arch-neutral for the reason stated on [`Job`].
-static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
+static JOBS: crate::sync::Mutex<Vec<Job>> = crate::sync::Mutex::new(Vec::new());
 
 /// Poll every outstanding job and free the kernel rows of the ones that have finished.
 ///
@@ -1507,7 +1508,7 @@ fn launch(path: &str) -> String {
     // (A console program on a build whose render body does not drain the line seam — every aarch64 build
     // today, `dock::LINE_LAUNCH_DRAINED` — still detaches, as every double-click did before M6.)
     let n = bytes.len();
-    match crate::arch::syscall::spawn_user_image_bg(&bytes) {
+    match crate::origin::with(crate::origin::Origin::Glass, || crate::arch::syscall::spawn_user_image_bg(&bytes)) { // DIALOG2 (B404): a Quarry double-click is the GLASS's launch
         Ok((pid, asid, entry)) => {
             // WINTITLE — a double-click launch names its windows exactly as `bg` does; the file
             // manager knows the path, so the window it opens carries the program's name rather than
@@ -1722,10 +1723,10 @@ fn paint_scrollbar(
         w: SBW(),
         h: (inner.y + inner.h).saturating_sub(top),
     };
-    fill(px, g, track.x, track.y, track.w, track.h, theme::SCROLL_TRACK);
-    fill(px, g, track.x, track.y, 1, track.h, theme::FRAME_LINE);
+    fill(px, g, track.x, track.y, track.w, track.h, theme::scroll_track());
+    fill(px, g, track.x, track.y, 1, track.h, theme::frame_line());
     if let Some((ty, th)) = thumb(track.h, len, visible, scroll) {
-        fill(px, g, track.x + 2, track.y + ty, track.w.saturating_sub(4), th, theme::SCROLL_THUMB);
+        fill(px, g, track.x + 2, track.y + ty, track.w.saturating_sub(4), th, theme::scroll_thumb());
     }
 }
 
@@ -1739,8 +1740,8 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     let row_h = g.row_h();
 
     // ── the path bar ────────────────────────────────────────────────────────────────────────────
-    fill(px, g, 0, 0, g.w, g.bar_h(), theme::CHROME_FACE);
-    fill(px, g, 0, g.bar_h() - 1, g.w, 1, theme::FRAME_LINE);
+    fill(px, g, 0, 0, g.w, g.bar_h(), theme::chrome_face());
+    fill(px, g, 0, g.bar_h() - 1, g.w, 1, theme::frame_line());
     let mut label: Vec<u8> = Vec::new();
     label.extend_from_slice(m.cwd.as_bytes());
     if m.list_truncated {
@@ -1752,13 +1753,13 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         label.extend_from_slice(b"  -  ");
         label.extend_from_slice(s.as_bytes());
     }
-    text(px, g, PAD(), g.ts, &label, g.w - PAD(), theme::TITLE_TEXT_ACTIVE);
+    text(px, g, PAD(), g.ts, &label, g.w - PAD(), theme::title_text_active());
 
     // ── the tree pane ───────────────────────────────────────────────────────────────────────────
     let tp = g.tree_pane();
     let ti = tp.inner();
-    fill(px, g, tp.x, tp.y, tp.w, tp.h, theme::CONTENT_FILL);
-    keyline(px, g, tp, theme::FRAME_LINE);
+    fill(px, g, tp.x, tp.y, tp.w, tp.h, theme::content_fill());
+    keyline(px, g, tp, theme::frame_line());
     let tvis = m.tree_visible();
     let tsb = if m.tree.len() > tvis { SBW() } else { 0 };
     for r in 0..tvis {
@@ -1770,13 +1771,13 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         let y = ti.y + r * row_h;
         let sel = i == m.tree_sel;
         if sel {
-            let c = if m.focus == Pane::Tree { theme::ACCENT } else { theme::SCROLL_THUMB };
+            let c = if m.focus == Pane::Tree { theme::accent() } else { theme::scroll_thumb() };
             fill(px, g, ti.x, y, ti.w - tsb, row_h, c);
         }
         let ink = if sel && m.focus == Pane::Tree {
-            theme::CHROME_FACE
+            theme::chrome_face()
         } else {
-            theme::CONTENT_TEXT
+            theme::content_text()
         };
         let indent = PAD() + row.depth * mark_w;
         // Both triangle forms have their centre at `y + 4 * ts` by construction (column/row `i`
@@ -1796,18 +1797,18 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     paint_scrollbar(px, g, ti, ti.y, m.tree.len(), tvis, m.tree_scroll);
 
     // ── the divider ─────────────────────────────────────────────────────────────────────────────
-    fill(px, g, tp.x + tp.w, tp.y, 1, tp.h, theme::FRAME_LINE);
+    fill(px, g, tp.x + tp.w, tp.y, 1, tp.h, theme::frame_line());
 
     // ── the list pane ───────────────────────────────────────────────────────────────────────────
     let lp = g.list_pane();
     let li = lp.inner();
-    fill(px, g, lp.x, lp.y, lp.w, lp.h, theme::CONTENT_FILL);
-    keyline(px, g, lp, theme::FRAME_LINE);
+    fill(px, g, lp.x, lp.y, lp.w, lp.h, theme::content_fill());
+    keyline(px, g, lp, theme::frame_line());
     let lvis = m.list_visible();
     let lsb = if m.list.len() > lvis { SBW() } else { 0 };
     let body_y = columns::paint_list(m, px, li, lsb, lvis); // QUARRY2 (B336): the header (sortable, with a chevron) and the NAME SIZE MODIFIED TYPE ORIGIN columns
     paint_scrollbar(px, g, li, body_y, m.list.len(), lvis, m.list_scroll);
-    ops::paint_overlay(m, px); // QUARRYOPS — the context menu and the inline edit field, over the finished frame
+    q3_paint(m, px, li); ops::paint_overlay(m, px); // QUARRY3 (B413): icon view, sidebar, toolbar + path bar; then QUARRYOPS — the context menu and the inline edit field, over the finished frame
 }
 
 /// Repaint the whole surface and present it.
@@ -2175,7 +2176,7 @@ pub fn close() {
 pub fn key_route(ev: crate::pal::Event) -> bool {
     // FILEVIEW — the text viewer's arrows / wheel / paging, asked first; it consumes only while ITS
     // window holds focus, so a closed viewer changes nothing below.
-    if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) {
+    if crate::video::fileview::key_route(ev) || crate::video::player::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) || crate::flightring::console_route(ev) {
         return true;
     }
     #[cfg(feature = "facet")]
@@ -2214,7 +2215,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
         key_witness(c, true, true);
         return true;
     }
-    if columns::key(c) { key_witness(c, true, true); repaint(); return true; } // QUARRY2 (B336): `s` sort column, `[`/`]` column width
+    if q3_key(c) { key_witness(c, true, true); repaint(); return true; } if columns::key(c) { key_witness(c, true, true); repaint(); return true; } // QUARRY3 (B413): search field, Quick Look, icon arrows, `<` `>` `v` `/` first; QUARRY2 (B336): `s` sort column, `[`/`]` column width
     let mut acted = true;
     let mut refreshed = false;
     // Decided under the lock, run without it — see [`Act`].
@@ -2404,14 +2405,14 @@ pub fn press_route(x: i32, y: i32) -> bool {
         return true;
     }
     // FILEVIEW — the text viewer's close box / raise, chained here for FACET's reason.
-    if crate::video::fileview::press_route(x, y) || crate::video::settings::press_route(x, y) {
+    if crate::video::fileview::press_route(x, y) || crate::video::player::press_route(x, y) || crate::video::settings::press_route(x, y) {
         return true;
     }
     // TEXTEDIT — the editor's close box / caret placement / raise.
     if crate::video::activity::press_route(x, y) {
         return true;
     }
-    if crate::video::textedit::press_route(x, y) {
+    if quicklook::press_route(x, y) || crate::video::textedit::press_route(x, y) { // QUARRY3 (B413): a press on the Quick Look panel is swallowed
         return true;
     }
     let id = WIN.load(Ordering::Relaxed);
@@ -2454,7 +2455,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         //
         // QUARRYCLICK — the before/after pair [`press_witness`] reads, taken inside the one lock the
         // press already holds so the reading cannot race a repaint or a second press.
-        press_and_witness(m, sx, sy).0
+        match q3_press(m, sx, sy) { Some(a) => a, None => press_and_witness(m, sx, sy).0 } // QUARRY3 (B413): toolbar, path bar, sidebar, icon grid first
     };
     // Outside the lock, always: `run_act` may reach the ELF loader and the scheduler.
     run_act(act);
@@ -2666,6 +2667,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         // is what an operator scanning a list is doing, and it must never run anything.
         let now = crate::arch::ms();
         let dbl = is_double(m.click_ms, now, m.click_row, i, m.click_pane == Pane::List);
+        if dbl { ops::cancel_attr_edit(); } else if i == m.list_sel && m.click_pane == Pane::List && attrcols::press_cell(m, sx, i) { m.click_row = i; m.click_ms = now; m.settle(); return Act::None; } // ATTRCOLUMNS (B402): a press on the selected row's attribute cell edits it in place; a double-click opens instead
         m.list_sel = i;
         m.click_row = i;
         m.click_pane = Pane::List;
@@ -2883,7 +2885,7 @@ pub fn service() {
     #[cfg(feature = "facet")]
     crate::video::facet::service();
     // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
-    crate::video::fileview::service(); crate::video::settings::service(); crate::video::text::service(); crate::video::metrics::ignite(); // UIMETRICS (B372): the furniture's runtime asserts on the latched metrics + `[ui] metrics`, once, on the first desktop service pass
+    crate::video::fileview::service(); crate::video::player::service(); crate::video::settings::service(); crate::video::text::service(); crate::video::metrics::ignite(); // UIMETRICS (B372): the furniture's runtime asserts on the latched metrics + `[ui] metrics`, once, on the first desktop service pass
     // TEXTEDIT — the editor's latch drains on the same pass.
     crate::video::textedit::service();
     // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.
@@ -2892,7 +2894,7 @@ pub fn service() {
     // its own pixels repaints once (the login screen, Quarry, Settings, Activity, the viewer/editor, the installer)
     // and the console repaints its screenful from its cell store. See `font_repaint_pass` at this file's tail.
     font_repaint_pass();
-    columns::service(); // QUARRY2 (B336): the latched column-width / sort preference write
+    quicklook::service(); columns::service(); // QUARRY3 (B413): the Quick Look panel renders here (I/O); QUARRY2 (B336): the latched column-width / sort preference write
 }
 
 // ── The witness ─────────────────────────────────────────────────────────────────────────────────
@@ -2934,7 +2936,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         if tp.x + tp.w + 1 != lp.x || lp.x + lp.w != g.w {
             return Err("panes do not tile the surface");
         }
-        if tp.y != g.bar_h() || tp.h != g.h - g.bar_h() || lp.h != tp.h {
+        if tp.y != g.bar_h() + sidebar::h(&g) || tp.y + tp.h != g.h || lp.y != g.bar_h() || lp.h != g.h - g.bar_h() { // QUARRY3 (B413): the sidebar takes the tree pane's top
             return Err("panes do not fill below the path bar");
         }
     }
@@ -4228,8 +4230,8 @@ pub fn win_id() -> wm::WinId {
 // again. The epoch `video::text` bumps is compared here, on the pass that loaded them, and each owner repaints.
 static FONT_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-fn font_repaint_pass() {
-    let e = crate::video::text::epoch();
+pub fn font_repaint_pass() {
+    let e = crate::video::text::epoch() ^ (crate::video::theme::epoch() << 20); // APPEARANCE (B408): a theme switch repaints the same windows once (`video::appearance`)
     if e == 0 || FONT_SEEN.swap(e, Ordering::AcqRel) == e {
         return;
     }
@@ -4250,5 +4252,170 @@ fn font_repaint_pass() {
         if cfg!(feature = "login") { ",login" } else { "" },
         if cfg!(all(target_arch = "x86_64", feature = "wc", feature = "instgui")) { ",instgui" } else { "" },
         crate::video::text::face_name(crate::video::text::Face::Ui)
+    );
+}
+
+/// DOCK2 (B394) — open (or raise) Quarry AT `dir`: the dock's Trash tile and its tile menu's Show in Quarry. Called
+/// from the dock's service pass, never from the click router (it reads directories). Returns whether a window shows it.
+pub fn open_at(dir: &str) -> bool {
+    open();
+    if !is_open() {
+        return false;
+    }
+    if let Some(m) = MODEL.lock().as_mut() {
+        m.navigate(dir);
+    }
+    repaint();
+    wm::focus_changed(OWNER);
+    true
+}
+
+// ATTRCOLUMNS (B402): the attribute columns (Add column…, typed cells, sort, edit in place, `una:view`) and Get Info —
+// child modules like `columns`, so they reach the model and the painter's helpers without widening them.
+#[path = "attrcols.rs"]
+pub mod attrcols;
+#[path = "getinfo.rs"]
+pub mod getinfo;
+
+// ── QUARRY3 (rmbp-ledger B413, MACPARITY row 27) — sidebar, toolbar + path bar, icon view, Quick Look ─────────────
+// Child modules like `columns`/`ops`/`openers`: they reach the model and the painter's helpers without widening them.
+// The hooks are one call each on lines above (bar_h, tree_pane, show, repaint_locked, key_route, press_route, service).
+#[path = "sidebar.rs"]
+pub mod sidebar;
+#[path = "toolbar.rs"]
+pub mod toolbar;
+#[path = "iconview.rs"]
+pub mod iconview;
+#[path = "quicklook.rs"]
+pub mod quicklook;
+
+/// QUARRY3 — the keys the new furniture takes before the list's own: the search field while it holds the keyboard,
+/// Quick Look (Space, Esc, the arrows while the panel shows), the icon grid's arrows, then `<` `>` `v` `/`.
+fn q3_key(c: u8) -> bool {
+    toolbar::key_search(c) || quicklook::key(c) || (toolbar::view() == toolbar::View::Icons && iconview::key(c)) || toolbar::key(c)
+}
+
+/// QUARRY3 — a press the new furniture takes before the panes: toolbar and path bar, sidebar, the icon grid.
+fn q3_press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
+    if let Some(a) = toolbar::press(m, sx, sy) {
+        return Some(a);
+    }
+    if let Some(a) = sidebar::press(m, sx, sy) {
+        return Some(a);
+    }
+    if toolbar::view() == toolbar::View::Icons {
+        return iconview::press(m, sx, sy);
+    }
+    None
+}
+
+/// QUARRY3 — paint over the finished panes: the icon grid (Icons view), the sidebar, the toolbar and path bar.
+fn q3_paint(m: &Model, px: &mut [u32], li: Rect) {
+    if toolbar::view() == toolbar::View::Icons {
+        iconview::paint(m, px, li);
+    }
+    sidebar::paint(m, px);
+    toolbar::paint(m, px);
+}
+
+/// `tests quarry3` registration (rides `fs::filetype::ensure_tests`, no tests.rs line).
+pub fn quarry3_tests() {
+    crate::tests::register("quarry3", quarry3_selftest);
+}
+
+/// M6 — `tests quarry3`, over the live table and the test-f set:
+///
+/// `:: QUARRY3: sidebar=ok toolbar=ok views=list,icons search=ok quicklook=<n>/24 -> PASS :: …`
+///
+/// * sidebar — the rows re-derive: six favorites, at least one location, every location a directory;
+/// * toolbar — a [`toolbar::History`] visits/back/forward round trip, and the path bar's segments invert;
+/// * views — an off-glass model on the test-f directory paints in both views, and every icon's centre hits it;
+/// * search — `TEST` through the name search finds the test-f samples;
+/// * quicklook — every sample previews; PASS needs every sample whose opener this build carries drawn by it.
+pub fn quarry3_selftest() {
+    let mut fails: Vec<&str> = Vec::new();
+    // sidebar
+    sidebar::refresh(true);
+    let rows = sidebar::rows();
+    let favs = rows.iter().filter(|e| !e.path.is_empty() && !e.path.starts_with(crate::fs::bootdisk::VOLUMES)).count();
+    let fav_ok = rows.iter().filter(|e| e.present && !e.path.starts_with(crate::fs::bootdisk::VOLUMES)).count();
+    let locs: Vec<String> = rows.iter().filter(|e| e.path.starts_with(crate::fs::bootdisk::VOLUMES)).map(|e| e.label.clone()).collect();
+    let sidebar_ok = favs == 6 && !locs.is_empty();
+    if !sidebar_ok {
+        fails.push("sidebar");
+    }
+    sidebar::witness();
+    // toolbar
+    let mut h = toolbar::History::default();
+    h.visit("/a");
+    h.visit("/a/b");
+    h.visit("/a/b/c");
+    let hist_ok = h.back().as_deref() == Some("/a/b") && h.back().as_deref() == Some("/a") && h.can_forward() && h.forward().as_deref() == Some("/a/b") && {
+        h.visit("/x");
+        !h.can_forward() && h.back().as_deref() == Some("/a/b")
+    };
+    let segs = toolbar::segments("/volumes/UnaOS/apps", 10, 7);
+    let seg_ok = segs.len() == 4 && segs[2].3 == "/volumes/UnaOS" && segs.iter().all(|s| toolbar::segments("/volumes/UnaOS/apps", 10, 7).iter().filter(|t| s.0 >= t.0 && s.0 < t.1).count() == 1);
+    let toolbar_ok = hist_ok && seg_ok;
+    if !toolbar_ok {
+        fails.push("toolbar");
+    }
+    // views + quicklook over the test-f set
+    let mt = crate::shell::vfs_mount_table();
+    let dir = crate::fs::volumes::TESTF_DIRS.iter().copied().find(|d| mt.stat(d).is_ok());
+    let mut views = String::from("skip(no-test-f)");
+    let mut ql = (0usize, 0usize, Vec::new());
+    let total = crate::fs::volumes::TESTF_CLAIMED.len();
+    if let Some(dir) = dir {
+        views = match geometry(crate::ui::px(1920), crate::ui::px(1200)) {
+            None => String::from("FAIL(no-geometry)"),
+            Some(g) => {
+                let mut m = Model::new(g);
+                m.navigate(dir);
+                let mut px: Vec<u32> = alloc::vec![0; g.w * g.h];
+                repaint_locked(&m, &mut px);
+                let list_ink = px.iter().filter(|&&p| p != theme::content_fill()).count();
+                let li = g.list_pane().inner();
+                let drawn = iconview::paint(&m, &mut px, li);
+                let all_hit = (0..drawn).all(|i| iconview::centre_of(&g, li, m.list.len(), m.list_scroll, i).and_then(|(x, y)| iconview::hit(&g, li, m.list.len(), m.list_scroll, x, y)) == Some(i));
+                serial_println!("[quarry3] views list_ink={} icons_drawn={} of={} hit_roundtrip={}", list_ink, drawn, m.list.len(), all_hit);
+                if list_ink > 0 && drawn > 0 && all_hit { String::from("list,icons") } else { String::from("FAIL") }
+            }
+        };
+        ql = quicklook::preview_set(dir, &crate::fs::volumes::TESTF_CLAIMED);
+    }
+    if views.starts_with("FAIL") {
+        fails.push("views");
+    }
+    // search
+    let t0 = crate::arch::ms();
+    let (hits, src, dirs) = toolbar::search_names("TEST.", 64);
+    let found = hits.iter().filter(|(p, _)| p.contains("test-f/TEST.")).count();
+    let search_ok = found > 0;
+    serial_println!("[quarry3] search q=TEST. hits={} test_f={} src={} dirs={} ms={}", hits.len(), found, src, dirs, crate::arch::ms().saturating_sub(t0));
+    if !search_ok {
+        fails.push("search");
+    }
+    let (viewer, routed, owed) = ql;
+    let ql_ok = dir.is_some() && viewer >= routed;
+    if !ql_ok {
+        fails.push("quicklook");
+    }
+    let ok = |b: bool| if b { "ok" } else { "FAIL" };
+    serial_println!(
+        ":: QUARRY3: sidebar={} toolbar={} views={} search={} quicklook={}/{} -> {} :: favorites={}/{} locations={} search_src={} routed={} owed={} ::",
+        ok(sidebar_ok),
+        ok(toolbar_ok),
+        views,
+        ok(search_ok),
+        viewer,
+        total,
+        if fails.is_empty() { "PASS" } else { "FAIL" },
+        fav_ok,
+        favs,
+        if locs.is_empty() { String::from("-") } else { locs.join(",") },
+        src,
+        routed,
+        if owed.is_empty() { String::from("-") } else { owed.join(",") }
     );
 }

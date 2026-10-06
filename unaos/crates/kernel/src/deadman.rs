@@ -301,11 +301,11 @@ mod imp {
     pub fn tick() {
         // The BSP is the only core that advances `APIC_TICKS`, so it is the only core whose clock
         // reading is the wall clock; letting an AP emit would produce lines on a different rate.
-        if crate::arch::percpu::this_cpu().cpu_index != 0 {
+        if !crate::arch::clockcore::duty_core() { // CLOCKCORE (B397): any ticking core once the clock is the TSC (cpu 0 masked no longer silences this)
             return;
         }
-        let now = crate::arch::ms();
-        if now < NEXT_DUE_MS.load(Relaxed) {
+        let now = crate::arch::ms(); let due = NEXT_DUE_MS.load(Relaxed);
+        if now < due || NEXT_DUE_MS.compare_exchange(due, now.saturating_add(PERIOD_MS), Relaxed, Relaxed).is_err() { // CLOCKCORE: one claimant per period
             return;
         }
         // Re-base off `now`, not off the old deadline: if the ISR was starved for several seconds

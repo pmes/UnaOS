@@ -86,7 +86,7 @@ use alloc::vec::Vec;
 // bury the ordering annotations, which are the part a reader has to check.
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use qh::*;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// EHCI class code (base 0x0C Serial Bus, subclass 0x03 USB, prog-IF 0x20 EHCI).
 const EHCI_CLASS: u8 = 0x0C;
@@ -13433,7 +13433,7 @@ impl Controller {
         // frame length whenever the frame is short of `total`, exactly the datum the decoder
         // length-validates on.
         #[cfg(not(feature = "mtraw"))]
-        let rx_total = mps as u32;
+        let rx_total = if layout.as_ref().is_some_and(|l| l.vendor_mt) { INT_BUF_LEN as u32 } else { mps as u32 }; // TRACKPADPANE (B412) rung 1: the vendor-multitouch qTD takes a WHOLE TYPE2 frame (EHCI 3.5.3: the controller keeps issuing IN until a short packet), not one 64 B packet — a two-finger frame is 86 B
         #[cfg(feature = "mtraw")]
         let rx_total = if layout.as_ref().is_some_and(|l| l.vendor_mt) {
             INT_BUF_LEN as u32
@@ -14023,7 +14023,7 @@ impl Controller {
                     // still a hard cap, never larger than the allocation, so the slice below can
                     // never run off the buffer even if the controller reported nonsense residue.
                     #[cfg(not(feature = "mtraw"))]
-                    let cap = if e.layout.is_some() { len.min(64) } else { len.min(8) };
+                    let cap = if e.layout.is_some() { len.min(INT_BUF_LEN) } else { len.min(8) }; // TRACKPADPANE: the grown buffer (was 64)
                     #[cfg(feature = "mtraw")]
                     let cap = if e.layout.is_some() { len.min(INT_BUF_LEN) } else { len.min(8) };
                     // ISRARM: `rpt_ptr` is `e.buf` on the poll arm (read in place, as before) and the
@@ -14195,7 +14195,7 @@ impl Controller {
                                     let mut hb = [0u8; TP_RAW2_HEX_MAX];
                                     serial_println!(":: TPRAW2: fingers={} bytes={} ::", report[WSP2_NFINGER_OFF], tp_hex_raw2(&mut hb, report));
                                 }
-                                let (buttons, dx, dy, wit) = e.tp.mt_step(f);
+                                let (buttons, dx, dy, wit) = e.tp.mt_step(f); let (buttons, dx, dy) = tpgest::shape(f, buttons, dx, dy, report.len(), idx); // TRACKPADPANE (B412): the Trackpad pane's gain, scroll, secondary, tap and three-finger drag, after the curve
                                 if wit {
                                     crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] [tp] mt fingers={} mover={} x={} y={} dx={} dy={} curve={}/{}@{} frame={} == witness ::", // TPSCALE (B214): dx/dy are the SCALED pixels the router takes; div= names the divisor so a glass reading can re-derive raw units
@@ -14851,7 +14851,7 @@ const ISR_RING: usize = 64; // PTRSTUTTER M1: 8 -> 64 (boot 17: the 8-deep ring 
 /// completion can ever exceed it. Knob-on (`mtraw`, 1024) the vendor-multitouch endpoint's frames
 /// can, and those are DECLINED by the ISR (`ISR_OVERSIZE`) and left for the pass — a bounded,
 /// counted, knob-only degradation to today's behaviour rather than a 96 KiB static.
-const ISR_SLOT_LEN: usize = 64;
+const ISR_SLOT_LEN: usize = 256; // TRACKPADPANE (B412): = the knob-off INT_BUF_LEN, so a whole multi-finger frame rides the hand-off ring (mtraw's 1024 still declines to the pass)
 
 /// One hand-off slot: the report bytes plus the two clock facts the EHCIDARK census needs, taken at
 /// the moment of CONSUMPTION rather than at decode time. Without `gap_ms` the census would measure
@@ -19542,8 +19542,8 @@ static TP_SPEED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::ne
 pub fn tp_speed_set(n: u8) { TP_SPEED.store(n.min(2), core::sync::atomic::Ordering::Relaxed); }
 /// SETTINGS: the current speed step.
 pub fn tp_speed_get() -> u8 { TP_SPEED.load(core::sync::atomic::Ordering::Relaxed) }
-fn tp_div_low() -> i32 { match tp_speed_get() { 0 => 12, 2 => 5, _ => TP_MT_DIV_LOW } }
-fn tp_div_high() -> i32 { match tp_speed_get() { 0 => 4, 2 => 2, _ => TP_MT_DIV_HIGH } }
+fn tp_div_low() -> i32 { TP_MT_DIV_LOW } // TRACKPADPANE (B412): the curve's divisors are fixed again — the R75 steps changed its SHAPE; speed is one gain after it (`tpgest`)
+fn tp_div_high() -> i32 { TP_MT_DIV_HIGH }
 
 /// QUIETBOOT (R80): `tests ehci` — the hardening self-test chain `init` used to run at every boot.
 fn ehci_selftest() {
@@ -19560,3 +19560,47 @@ fn ehci_isr_test() {
 /// reconnect). A child module so it reuses this file's HCI/ACL transport and its HID report parser. Tail append.
 #[cfg(feature = "btc")]
 pub mod bthid;
+
+// ── INPUTSTALL2 M2 (rmbp-ledger B388): THE HID PASS ON ITS OWN TASK ─────────────────────────────────────
+//
+// Flight 24 card 3: `stage=hid hid_gap_ms=16016` after login, on every boot the same 16 s, and the first
+// report after it `dx=-614` — the pad's own accumulated motion, i.e. nobody polled it. `service_ehci_hid`
+// was one STEP of the `usb-pump` loop (main.rs), so any other step that held the loop held the keyboard and
+// the pad: the window is exactly the smoltcp boot ladder (`SOCK-1` … `SOCK-7`) spinning `pump_until`
+// inside `e1000::service_net`. The HID pass now runs on its own task on the service core, one tick per
+// pass, and `usb_pump` stops calling it once the task is live. The EHCI_HID lock is unchanged (the
+// full-screen apps' `pal::pump_and_poll` still takes it from the render core, as before); the service core
+// is round-robin preemptive, so a spinning neighbour costs the pass a quantum, never the session.
+
+static HID_TASK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Start the `hid-pump` task once, on `cpu` (the caller's: the service core). Called from `usb_pump`'s
+/// entry; the first pass happens before the loop's first `service_ehci_hid_pump`.
+pub fn hid_task_start(cpu: usize) {
+    if HID_TASK.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    crate::arch::sched::spawn("hid-pump", hid_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+    serial_println!(
+        "[hid] pump task=hid-pump cpu={} cadence=1tick (INPUTSTALL2: the HID pass never waits on the device-service loop)",
+        cpu
+    );
+}
+
+fn hid_task(_: usize) {
+    loop {
+        crate::arch::sched::sleep_ticks(1);
+        service_ehci_hid();
+    }
+}
+
+/// The `usb-pump` loop's HID step: a no-op once the `hid-pump` task owns the pass.
+pub fn service_ehci_hid_pump() {
+    if !HID_TASK.load(core::sync::atomic::Ordering::Acquire) {
+        service_ehci_hid();
+    }
+}
+
+/// TRACKPADPANE (rmbp-ledger B412) — the Trackpad pane's gesture stage (speed gain, two-finger scroll, secondary
+/// click, tap to click, three-finger drag), applied after `mt_step` on the vendor route. Tail append.
+pub mod tpgest;

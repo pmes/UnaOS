@@ -325,7 +325,7 @@ pub fn fnv1a_u64(mut h: u64, v: u64) -> u64 {
 /// colliding with it would leave the strip un-repainted forever.
 #[inline]
 pub fn seal(h: u64) -> u64 {
-    if h == 0 { 1 } else { h }
+    let h = h ^ ((super::theme::epoch() as u64) << 40); if h == 0 { 1 } else { h } // APPEARANCE (B408): a theme switch changes every strip's signature, so the bar, dock and menus repaint once
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +346,7 @@ struct Scratch {
     raw: [u32; MAX_STRIP_W],
 }
 
-static SCRATCH: super::HeldMutex<Scratch> = super::HeldMutex::new(Scratch { // MENULOCK (B200) — WAS `spin::Mutex`; the same lock plus a holder record, so a refused paint names who holds it (`super::HeldMutex`). ⚠ SAME-LINE fold.
+static SCRATCH: super::HeldMutex<Scratch> = super::HeldMutex::new(Scratch { // MENULOCK (B200) — WAS `crate::sync::Mutex`; the same lock plus a holder record, so a refused paint names who holds it (`super::HeldMutex`). ⚠ SAME-LINE fold.
     log: [0; MAX_STRIP_W],
     raw: [0; MAX_STRIP_W],
 });
@@ -700,11 +700,18 @@ pub fn rects(pw: usize, ph: usize, out: &mut [Option<Rect>; STRIP_MAX]) -> usize
 /// deliberately not `||`: both tenants must run, because a short-circuit would let the first
 /// repainting strip starve the second's damage test for the whole pass.
 pub fn compose_all() -> bool {
-    // FIRSTBOOT (R77): the bar, dock and menus are desktop furniture — nothing paints while the boot stage is the
-    // installer or the create-user form (the setter / the form is the whole glass).
+    // DESKTOPBUILT (B387, R93): the bar, dock and menus are the DESKTOP, an object built at `login ok`
+    // (`desktopbuild::build`) — before it is built (the setter, the create-user form, the login screen, after Log
+    // Out) nothing of it paints, and what it last painted is vacated. A GLASSEYES bare shot holds the strips as before.
     #[cfg(feature = "login")]
-    if crate::fs::users::furniture_held() {
+    if crate::boot::shot_bare_held() {
         return false;
+    }
+    #[cfg(feature = "login")]
+    if !super::desktopbuild::built() {
+        let a = super::dock::vacate_off();
+        let b = if super::menubar::enabled() { false } else { super::menubar::compose() }; // OFF: its own one-shot erase
+        return a | b;
     }
     let a = super::dock::compose();
     let b = super::menubar::compose();
@@ -783,7 +790,7 @@ pub fn compose_all() -> bool {
 /// this order plus those two declines, and it is what `menubar::open_dropdown_rect` reads.
 #[inline]
 pub fn press_route(x: i32, y: i32) -> bool {
-    #[cfg(feature = "login")] if crate::fs::users::screen_press(x, y) { return true; } super::winmenu::press_at(x, y) || super::crystal::press_at(x, y) || super::dock::press_at(x, y) // SO36/SO44 — THE SESSION GATE, a NEW FIRST TERM ahead of the three furniture arms and therefore ahead of every window arm in both routers. Written as a short-circuiting `if` rather than a fourth `||` operand for one reason: `#[cfg]` cannot gate an operand of `||`, and the whole session model must vanish knob-off (`./arroyo knoboff login`). The semantics are the OR-chain's exactly — first term true, nothing below it is evaluated. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
+    #[cfg(feature = "login")] if crate::fs::users::screen_press(x, y) { return true; } super::notify::press_at(x, y) || super::winmenu::press_at(x, y) || super::crystal::press_at(x, y) || super::dock::press_at(x, y) // SO36/SO44 — THE SESSION GATE, a NEW FIRST TERM ahead of the three furniture arms and therefore ahead of every window arm in both routers. Written as a short-circuiting `if` rather than a fourth `||` operand for one reason: `#[cfg]` cannot gate an operand of `||`, and the whole session model must vanish knob-off (`./arroyo knoboff login`). The semantics are the OR-chain's exactly — first term true, nothing below it is evaluated. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
 }
 
 /// **The KEY seam: every furniture surface's `<Esc>` arm.** The twin of [`press_route`], extracted for
@@ -1735,9 +1742,9 @@ pub fn bar_decl_lock(name: &str) -> u64 {
 //
 //  * `lock=panel` — `video::WRITER`, refused by `panel_snapshot` ONLY when the caller runs MASKED
 //    (an open caller blocks on it instead, so a fixture driving `compose` from a task can never be
-//    refused here); a `spin::Mutex` taken with `lock`/`try_lock` at ~120 sites, nearly all of them
+//    refused here); a `crate::sync::Mutex` taken with `lock`/`try_lock` at ~120 sites, nearly all of them
 //    copy-out (`*WRITER.lock()`, the guard dropped in the same statement).
-//  * `lock=strip-scratch` — [`SCRATCH`], a `spin::Mutex` taken ONLY by `try_lock` in [`paint`] and
+//  * `lock=strip-scratch` — [`SCRATCH`], a `crate::sync::Mutex` taken ONLY by `try_lock` in [`paint`] and
 //    [`erase_rect`] and held for one strip's compose + blit + flush, INCLUDING the beam hold
 //    (`beam::hold`, which spins with the scratch held on a board that can see its raster).
 //

@@ -40,6 +40,14 @@ pub const C_CMD_SLASH: &str = "cmd-/";
 pub const C_CMD_M: &str = "cmd-m";
 pub const C_CMD_GRAVE: &str = "cmd-`";
 pub const C_CMD_K: &str = "cmd-k"; // LUMENBIN
+pub const C_CMD_Q: &str = "cmd-q"; // APPMENU2 (B393) — the WM's system chords
+pub const C_CMD_W: &str = "cmd-w";
+pub const C_CMD_H: &str = "cmd-h";
+pub const C_CMD_COMMA: &str = "cmd-,";
+pub const C_CMD_ALT_ESC: &str = "cmd-alt-esc";
+pub const C_CTRL_CMD_Q: &str = "ctrl-cmd-q";
+pub const C_CMD_I: &str = "cmd-i"; // ATTRCOLUMNS (B402)
+pub const C_CMD_SPACE: &str = "cmd-space"; // LAUNCHER (B417)
 
 const fn s(chord: &'static str, scope: &'static str, action: &'static str, arc: &'static str) -> Shortcut {
     Shortcut { chord, scope, action, arc }
@@ -52,6 +60,9 @@ pub static SHORTCUTS: &[Shortcut] = &[
     s(C_CMD_TAB, "Desktop", "Next window", "WINCYCLE"),
     s(C_CMD_L, "Desktop", "Lock screen", "SCREENLOCK"),
     s(C_CTRL_ALT_L, "Desktop", "Lock screen", "SCREENLOCK"),
+    s(C_CTRL_CMD_Q, "Desktop", "Lock Screen", "APPMENU2"),
+    s(C_CMD_ALT_ESC, "Desktop", "Force Quit...", "APPMENU2"),
+    s(C_CMD_SPACE, "Desktop", "Launcher", "LAUNCHER"),
     s("F1 / F2", "Desktop", "Brightness down / up", "BRIGHTKEYS"),
     s("F10 / F11 / F12", "Desktop", "Volume", "AUDIOKEYS"),
     s(C_CMD_SHIFT_3, "Capture", "Screenshot", "PRTSCR"),
@@ -62,6 +73,14 @@ pub static SHORTCUTS: &[Shortcut] = &[
     s(C_CMD_GRAVE, "Window", "Next window of app", "WINDOWLIST"),
     s("cmd-alt-left", "Window", "Snap Left", "WINSNAP"),
     s("cmd-alt-right", "Window", "Snap Right", "WINSNAP"),
+    s(C_CMD_Q, "App", "Quit", "APPMENU2"),
+    s(C_CMD_H, "App", "Hide", "APPMENU2"),
+    s(C_CMD_COMMA, "App", "Settings...", "APPMENU2"),
+    s(C_CMD_W, "App", "Close Window", "APPMENU2"),
+    s("cmd-x", "Edit", "Cut", "APPCLIP"),
+    s("cmd-c", "Edit", "Copy", "APPCLIP"),
+    s("cmd-v", "Edit", "Paste", "APPCLIP"),
+    s("cmd-a", "Edit", "Select All", "APPCLIP"),
     s("right-click tile", "Dock", "Tile menu (Quit)", "DOCKRUN"),
     s("right-click entry", "Quarry", "File operations", "QUARRYOPS"),
     s("Ctrl-C", "Shell", "Cancel line", "SHELLUX"),
@@ -74,6 +93,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     s("q", "Activity", "Quit", "ACTIVITY"),
     s("k", "Activity", "Kill selected", "ACTIVITY"),
     s(C_CMD_K, "Lumen", "Clear transcript", "LUMENBIN"),
+    s(C_CMD_I, "Quarry", "Get Info", "ATTRCOLUMNS"),
 ];
 
 /// The chord an app-menu row labelled `label` shows on its right (first table entry whose action matches).
@@ -168,7 +188,7 @@ mod ov {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
     pub static WIN: AtomicU32 = AtomicU32::new(0);
-    pub static SURF: spin::Mutex<Option<Vec<u32>>> = spin::Mutex::new(None);
+    pub static SURF: crate::sync::Mutex<Option<Vec<u32>>> = crate::sync::Mutex::new(None);
 }
 
 /// Is the overlay up?
@@ -208,20 +228,20 @@ pub fn open() -> bool {
     if buf.try_reserve_exact(w * h).is_err() {
         return false;
     }
-    buf.resize(w * h, theme::CHROME_FACE);
+    buf.resize(w * h, theme::chrome_face());
     for x in 0..w {
-        buf[x] = theme::FRAME_LINE;
-        buf[(h - 1) * w + x] = theme::FRAME_LINE;
+        buf[x] = theme::frame_line();
+        buf[(h - 1) * w + x] = theme::frame_line();
     }
     for y in 0..h {
-        buf[y * w] = theme::FRAME_LINE;
-        buf[y * w + w - 1] = theme::FRAME_LINE;
+        buf[y * w] = theme::frame_line();
+        buf[y * w + w - 1] = theme::frame_line();
     }
     let draw = |buf: &mut [u32], text: &[u8], x: usize, top: usize, bold: bool| {
         for sy in 0..ch {
             let y = top + sy;
             if y < h {
-                super::text::draw_row(&mut buf[y * w..(y + 1) * w], w, text, x, sy, theme::TITLE_TEXT_ACTIVE, bold, menubar::BAR_FACE);
+                super::text::draw_row(&mut buf[y * w..(y + 1) * w], w, text, x, sy, theme::title_text_active(), bold, menubar::BAR_FACE);
             }
         }
     };

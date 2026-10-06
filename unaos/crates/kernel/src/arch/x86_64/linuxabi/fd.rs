@@ -16,7 +16,7 @@ pub const O_APPEND: u32 = 0o2000;
 
 /// A 64 KiB kernel ring. `readers`/`writers` count live DESCRIPTIONS (not fds): the last writer's drop is EOF.
 pub struct Pipe {
-    pub buf: spin::Mutex<VecDeque<u8>>,
+    pub buf: crate::sync::Mutex<VecDeque<u8>>,
     pub readers: AtomicUsize,
     pub writers: AtomicUsize,
 }
@@ -34,13 +34,13 @@ pub enum Kind {
 }
 
 pub struct Desc {
-    pub k: spin::Mutex<Kind>,
+    pub k: crate::sync::Mutex<Kind>,
     pub flags: AtomicU32,
 }
 
 impl Desc {
     pub fn new(k: Kind, flags: u32) -> Arc<Desc> {
-        Arc::new(Desc { k: spin::Mutex::new(k), flags: AtomicU32::new(flags) })
+        Arc::new(Desc { k: crate::sync::Mutex::new(k), flags: AtomicU32::new(flags) })
     }
     pub fn nonblock(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & O_NONBLOCK != 0
@@ -64,7 +64,7 @@ impl Drop for Desc {
 
 /// A fresh pipe: `(read end, write end)`.
 pub fn new_pipe(flags: u32) -> (Arc<Desc>, Arc<Desc>) {
-    let p = Arc::new(Pipe { buf: spin::Mutex::new(VecDeque::new()), readers: AtomicUsize::new(1), writers: AtomicUsize::new(1) });
+    let p = Arc::new(Pipe { buf: crate::sync::Mutex::new(VecDeque::new()), readers: AtomicUsize::new(1), writers: AtomicUsize::new(1) });
     (Desc::new(Kind::PipeR(p.clone()), flags), Desc::new(Kind::PipeW(p), flags))
 }
 
@@ -79,9 +79,9 @@ pub struct FdEnt {
 // ---------------------------------------------------------------------------------------------
 
 /// Lines typed (or injected by a test) for `read(0)`. Each entry ends in `\n`.
-pub static STDIN: spin::Mutex<VecDeque<u8>> = spin::Mutex::new(VecDeque::new());
+pub static STDIN: crate::sync::Mutex<VecDeque<u8>> = crate::sync::Mutex::new(VecDeque::new());
 /// Everything the session wrote to fd 1/2 and has not yet been shown in the shell window / captured.
-pub static OUT: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+pub static OUT: crate::sync::Mutex<Vec<u8>> = crate::sync::Mutex::new(Vec::new());
 
 pub fn stdin_push(bytes: &[u8]) {
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -135,7 +135,7 @@ pub fn out_take() -> Vec<u8> {
 
 /// Lock that never spins against a PREEMPTED holder on this core (IF can be open after a `yield_now` inside a syscall): on contention,
 /// yield and retry.
-pub fn lk<T>(m: &spin::Mutex<T>) -> spin::MutexGuard<'_, T, spin::Spin> {
+pub fn lk<T>(m: &crate::sync::Mutex<T>) -> crate::sync::MutexGuard<'_, T, spin::Spin> {
     loop {
         if let Some(g) = m.try_lock() {
             return g;

@@ -314,7 +314,7 @@ fn fallocate(p: &mut LinuxProc, fdn: u64, mode: u64, off: i64, len: i64) -> i64 
 // flock (advisory, per open file description)
 // ---------------------------------------------------------------------------------------------
 
-static FLOCKS: spin::Mutex<Vec<(String, usize, bool)>> = spin::Mutex::new(Vec::new());
+static FLOCKS: crate::sync::Mutex<Vec<(String, usize, bool)>> = crate::sync::Mutex::new(Vec::new());
 static NFLOCK: AtomicUsize = AtomicUsize::new(0);
 
 fn locks<R>(f: impl FnOnce(&mut Vec<(String, usize, bool)>) -> R) -> R {
@@ -478,7 +478,7 @@ fn socketpair(p: &mut LinuxProc, domain: u64, ty: u64, sv: u64) -> i64 {
     if !p.asp.writable_range(sv, 8) {
         return -EFAULT;
     }
-    let mk = || Arc::new(Pipe { buf: spin::Mutex::new(alloc::collections::VecDeque::new()), readers: AtomicUsize::new(1), writers: AtomicUsize::new(1) });
+    let mk = || Arc::new(Pipe { buf: crate::sync::Mutex::new(alloc::collections::VecDeque::new()), readers: AtomicUsize::new(1), writers: AtomicUsize::new(1) });
     let (ab, ba) = (mk(), mk());
     let fl = if ty & SOCK_NONBLOCK != 0 { fd::O_NONBLOCK } else { 0 };
     let cx = ty & O_CLOEXEC != 0;

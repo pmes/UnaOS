@@ -12,8 +12,12 @@
 // `Plan::gpt` — byte-for-byte the table the retired script wrote (the core's golden KAT pins it) —
 // laid by `amber_core::plan_apply::apply` (AMBER1), the same write list `amber plan` dry-runs.
 //
-// Usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N]
-//        una-card show IMG          (print the plan read back off an image)
+// Usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N] [--skip NAME]...
+//        una-card show IMG
+//
+// ROOTDISK2 (rmbp-ledger B401, R94): `--skip NAME` leaves a top-level entry of either tree off p1 (arroyo passes
+// `--skip APPS --skip LIB`: those live on the UnaFS volume, staged by `tools/unafs put`), and p2 is copied SPARSE —
+// an all-zero MiB of the UnaFS image is seeked over, not written, so a 4 GiB volume costs the host what it holds.          (print the plan read back off an image)
 
 use amber_core::plan::{PartKind, PartReq, Plan, Size};
 use std::fs::{self, File};
@@ -54,7 +58,29 @@ fn run(cmd: &mut Command) {
     }
 }
 
-fn build_fat(path: &Path, sectors: u64, trees: &[PathBuf]) {
+fn skipped(p: &Path, skip: &[String]) -> bool {
+    p.file_name().is_some_and(|n| skip.iter().any(|s| n.to_string_lossy().eq_ignore_ascii_case(s)))
+}
+
+fn trees_bytes(trees: &[PathBuf], skip: &[String]) -> u64 {
+    let mut total = 0;
+    for d in trees {
+        for e in fs::read_dir(d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if skipped(&p, skip) {
+                continue;
+            }
+            match e.metadata() {
+                Ok(m) if m.is_dir() => total += tree_bytes(&p),
+                Ok(m) => total += m.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
+fn build_fat(path: &Path, sectors: u64, trees: &[PathBuf], skip: &[String]) {
     for t in ["mkfs.vfat", "mcopy"] {
         if !which(t) {
             die(&format!("'{t}' not found — install dosfstools + mtools"));
@@ -65,7 +91,7 @@ fn build_fat(path: &Path, sectors: u64, trees: &[PathBuf]) {
     for d in trees {
         let mut names: Vec<_> = fs::read_dir(d).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
         names.sort();
-        for e in names {
+        for e in names.into_iter().filter(|e| !skipped(e, skip)) {
             run(Command::new("mcopy").args(["-s", "-b", "-o", "-Q", "-i"]).arg(path).arg(&e).arg("::/"));
         }
     }
@@ -80,7 +106,11 @@ fn copy_into(out: &mut File, src: &Path, first_lba: u64) -> io::Result<()> {
         if n == 0 {
             return Ok(());
         }
-        out.write_all(&buf[..n])?;
+        if buf[..n].iter().all(|b| *b == 0) {
+            out.seek(SeekFrom::Current(n as i64))?; // ROOTDISK2: sparse — the image file is pre-sized (zeros)
+        } else {
+            out.write_all(&buf[..n])?;
+        }
     }
 }
 
@@ -108,6 +138,7 @@ fn main() {
         }
     }
     let (mut esp, mut data, mut unafs, mut out, mut fat_mb) = (None, None, None, None, 0u64);
+    let mut skip: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().unwrap_or_else(|| die(&format!("{a} needs a value")));
@@ -117,15 +148,16 @@ fn main() {
             "--unafs" => unafs = Some(PathBuf::from(val())),
             "-o" | "--out" => out = Some(PathBuf::from(val())),
             "--fat-mb" => fat_mb = val().parse().unwrap_or_else(|_| die("--fat-mb takes a number")),
-            _ => die("usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N] | una-card show IMG"),
+            "--skip" => skip.push(val()),
+            _ => die("usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N] [--skip NAME]... | una-card show IMG"),
         }
     }
     let (Some(esp), Some(data), Some(unafs), Some(out)) = (esp, data, unafs, out) else {
-        die("usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N]");
+        die("usage: una-card --esp DIR --data DIR --unafs IMG -o OUT [--fat-mb N] [--skip NAME]...");
     };
 
     let trees: Vec<PathBuf> = [esp, data].into_iter().filter(|d| d.is_dir()).collect();
-    let fat_mb = if fat_mb > 0 { fat_mb } else { 128.max((trees.iter().map(|d| tree_bytes(d)).sum::<u64>() >> 20) + 64) };
+    let fat_mb = if fat_mb > 0 { fat_mb } else { 128.max((trees_bytes(&trees, &skip) >> 20) + 64) };
     let fat_sectors = fat_mb * 2048;
     let unafs_bytes = fs::metadata(&unafs).unwrap_or_else(|e| die(&format!("{}: {e}", unafs.display()))).len();
     if unafs_bytes % 4096 != 0 {
@@ -144,7 +176,7 @@ fn main() {
     let (p1, p2) = (&plan.parts[0], &plan.parts[1]);
 
     let tmp = out.with_extension("esp.fat.tmp");
-    build_fat(&tmp, fat_sectors, &trees);
+    build_fat(&tmp, fat_sectors, &trees, &skip);
     let res = (|| -> io::Result<()> {
         File::create(&out)?.set_len(plan.disk_sectors * SECTOR)?;
         // AMBER1 (SR34): the table goes down through `amber_core::plan_apply::apply` — the write
@@ -175,4 +207,7 @@ fn main() {
         p2.sectors(),
         plan.disk_sectors / 2048
     );
+    if !skip.is_empty() {
+        println!(":: X86-CARD: p1 skipped={} (ROOTDISK2, R94: they live on the UnaFS volume) ::", skip.join(","));
+    }
 }

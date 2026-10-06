@@ -12,11 +12,11 @@
 //!    Mutex<u64> to 400000, a HashMap, std::fs::read_to_string, env::args, println!, Instant, a caught panic.
 //! 3. `PROBE.LNX sh -c 'sh -c "echo a; echo b" | cat'` — busybox ash forks both sides of a pipe; `a` then `b` come out.
 //! 4. `PROBE.LNX sh -c "/apps/TCC.LNX -static -o <home>hello4.lnx -x c /apps/PRINTF.C && <home>hello4.lnx"` — ash forks, execs tcc
-//!    (lazily), waits, execs the output: `hello printf from tcc+musl on unaos 42`. Needs `/apps/LIB` (SELFBUILD3); else skip.
+//!    (lazily), waits, execs the output: `hello printf from tcc+musl on unaos 42`. Needs `/lib` (SELFBUILD3); else skip.
 //!
 //! Wire: `:: SELFBUILD4: rust=ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 fork=ok pipe=ok exec_lazy=1
 //! cow_pages=<n> -> PASS ::`, after `:: LINUXABI-KAT4: … ::`, `[selfbuild4] exec: …`, `[selfbuild4] tcc_run=…` and
-//! `[selfbuild4] kernel: …`. PASS also needs the KAT and (when `/apps/LIB` is staged) the tcc line. Absent RUST.LNX = SKIP.
+//! `[selfbuild4] kernel: …`. PASS also needs the KAT and (when `/lib` is staged) the tcc line. Absent RUST.LNX = SKIP.
 
 use super::{cow, exec, run_path, vm, Report};
 use alloc::string::String;

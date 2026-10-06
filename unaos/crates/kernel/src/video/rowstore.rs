@@ -145,3 +145,14 @@ impl Default for SlotBits {
         Self::new()
     }
 }
+
+/// WINDOWCAP3 (rmbp-ledger B399): `v[i]` for a `SegVec` — the allocating [`SegVec::get`], so the ring-3
+/// window table's and the process table's per-row statics keep their `X[i]` call shape. A row is always
+/// touched first by its claimant (process context), so an indexed read of a claimed row never allocates.
+impl<T: 'static> core::ops::Index<usize> for SegVec<T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, i: usize) -> &T {
+        self.get(i)
+    }
+}
