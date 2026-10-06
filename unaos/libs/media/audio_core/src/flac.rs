@@ -157,6 +157,9 @@ fn residual(r: &mut BitReader, out: &mut [i64], order: usize) -> Result<()> {
         } else {
             while i < end {
                 let q = r.unary()? as u64;
+                // AUDIOCORE (B396): a residual is a 32-bit signed quantity (RFC 9639 §9.2.7); a longer unary
+                // run is a damaged frame, not a value to carry into the predictor.
+                if q >> (32 - k.min(32)) != 0 { return Err(Error::Invalid("residual exceeds 32 bits")); }
                 let v = (q << k) | r.read(k)? as u64;
                 out[i] = ((v >> 1) as i64) ^ -((v & 1) as i64);
                 i += 1;
@@ -173,6 +176,10 @@ fn subframe(r: &mut BitReader, out: &mut [i64], bps: u32) -> Result<()> {
     if wasted >= bps { return Err(Error::Invalid("wasted bits >= sample size")); }
     let bps = bps - wasted;
     let n = out.len();
+    // AUDIOCORE (B396): a decoded subframe sample lies within the subframe's bit depth (RFC 9639 §9.2: the
+    // subframe's samples ARE `bps`-bit values). Checked per predicted sample, so a mutated frame whose predictor
+    // walks out of range is an error at that sample, and every predictor sum (≤ 32 * 2^15 * 2^33) stays in i64.
+    let lim = 1i64 << (bps - 1);
     match t {
         0 => {
             let v = r.signed(bps)?;
@@ -186,12 +193,15 @@ fn subframe(r: &mut BitReader, out: &mut [i64], bps: u32) -> Result<()> {
             if order > n { return Err(Error::Invalid("fixed order > block size")); }
             for s in out[..order].iter_mut() { *s = r.signed(bps)?; }
             residual(r, out, order)?;
-            match order {
-                0 => {}
-                1 => for i in 1..n { out[i] += out[i - 1]; },
-                2 => for i in 2..n { out[i] += 2 * out[i - 1] - out[i - 2]; },
-                3 => for i in 3..n { out[i] += 3 * out[i - 1] - 3 * out[i - 2] + out[i - 3]; },
-                _ => for i in 4..n { out[i] += 4 * out[i - 1] - 6 * out[i - 2] + 4 * out[i - 3] - out[i - 4]; },
+            for i in order..n {
+                out[i] += match order {
+                    0 => 0,
+                    1 => out[i - 1],
+                    2 => 2 * out[i - 1] - out[i - 2],
+                    3 => 3 * out[i - 1] - 3 * out[i - 2] + out[i - 3],
+                    _ => 4 * out[i - 1] - 6 * out[i - 2] + 4 * out[i - 3] - out[i - 4],
+                };
+                if out[i] < -lim || out[i] >= lim { return Err(Error::Invalid("subframe sample outside its bit depth")); }
             }
         }
         32..=63 => {
@@ -210,6 +220,7 @@ fn subframe(r: &mut BitReader, out: &mut [i64], bps: u32) -> Result<()> {
                 let mut acc = 0i64;
                 for j in 0..order { acc += coef[j] * out[i - 1 - j]; }
                 out[i] += acc >> shift;
+                if out[i] < -lim || out[i] >= lim { return Err(Error::Invalid("subframe sample outside its bit depth")); }
             }
         }
         _ => return Err(Error::Invalid("reserved subframe type")),
