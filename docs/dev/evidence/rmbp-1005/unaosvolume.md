@@ -39,3 +39,22 @@ ledger=<n> queue=<n> queries=<n>` (records=0 / `volume=absent` on a card built w
 
 **Owed.** UnaOS running the seat's workflow (the roadmap); a kernel WRITER (the bus verbs Mica's fulfiller would
 answer); the `Open jobs` folder opens as a live query only once QUERYFOLDER folds (until then it is a text file).
+
+## Built (exec-rmbp-unaosvolume, cut from 6f19ddda)
+
+- M1 `unaos/libs/sys/jobs_core` (no_std, zero deps): records, `job:*`, the closed set, parse/export of STATUS.tsv,
+  the four ledgers and the four queues, `cite` (T2/T4 rules), `verify_line` (T3), `query_text`, the witness format.
+  `cargo test -p jobs_core` 6/6: STATUS.tsv and all four ledgers export byte-identical from their records.
+- M2 `handlers/mica` (lib + `mica` bin): `mica jobs build|add|cite|verify|list|query|export|witness` over `unafs`.
+  `cargo test -p mica` 2/2 (repo → in-memory volume → export identical; query by typed attribute; add + cite refuse a
+  line on no wire and accept ST3's line; the export carries the new row). On this tree:
+  `:: UNAOSVOLUME: records=1223 claims=42 queue=519 export=identical verify=32/32 ::` (ledger rows = 662).
+- M3 `./arroyo jobs-image` → `target/jobs-unafs.img` (67 MiB, 6 s); the x86 card build runs `mica jobs build --into`
+  on p2 after ROOTDISK2's put loop (a second `--into` on a volume that has `/jobs` is refused: the volume is the store).
+- M4 kernel `fs/jobs.rs` (`feature = "unafs"`, no new knob), `jobs_core` a kernel path dep, one call in
+  `video/login.rs` `close_into_session`. Metal wire at login: `[jobs] volume=/jobs records=1223 claims=42 ledger=662
+  queue=519 queries=1` (on a card built from this tree; the counts follow the tree the card is cut from).
+- M5 STATUS.md: the volume is the store, the TSV its export.
+- Legs: x86 (the seat's gate line) exit 0 ONLY with two seat-side merge17 reds patched locally and reverted
+  (`video/settings.rs` `press_appearance` lost its closing brace before TRACKPADPANE; `TP_TAB` usize in a `u8`
+  match); with the tree as cut it is exit 101 on those. charter-check exit 0. aarch64 not run (no non-x86 code).
