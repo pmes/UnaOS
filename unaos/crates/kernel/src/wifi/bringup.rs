@@ -1008,7 +1008,11 @@ pub fn bringup_once() {
         return;
     }
     serial_println!(
-        ":: wifi2: unwind-selftest PASS discriminating={} probe={:#010x} probe-readback={:#010x} restore-readback={:#010x} — the probe differs from the pre-image only in the low 12 bits the selector ignores, so the window provably did NOT move{} ::",
+        ":: wifi2: unwind-selftest {} discriminating={} probe={:#010x} probe-readback={:#010x} restore-readback={:#010x} — the probe differs from the pre-image only in the low 12 bits the selector ignores, so the window provably did NOT move{} ::",
+        // WIFI5 M4 (B415, R89): a PASS that cannot discriminate is not a PASS — `ADVISORY` when the
+        // silicon masks the probe bits (every flight f13-f25); the window's unwind is proven instead by
+        // the R8 `RESTORE … restored=MATCH` line (bcm4331.md §7 rows S1/S1u).
+        if discriminating { "PASS" } else { "ADVISORY" },
         discriminating as u8, probe, probe_back, selftest,
         if discriminating {
             ", and the readback proves the write path took"
@@ -2365,25 +2369,33 @@ fn phy_once(bar0: u64) {
         D11_RADIO_ADDR, addr_pre, addr_post, if restored { "MATCH" } else { "FAILED" }
     );
 
-    let mfg = id_a & RADIO_ID_MFG;
-    let ver = (id_a & RADIO_ID_VER) >> 12;
-    let rev = (id_a & RADIO_ID_REV) >> 28;
-    let dark = id_a == 0x0000_0000 || id_a == 0xFFFF_FFFF;
+    // WIFI5 M4 (B415, R89): the gate decodes the V4-order word. Flights 13-20 read V3 order
+    // hi-then-lo=0x0000917f and V4 order lo-then-hi=0x0205917f on every boot: the V3 order's hi half
+    // reads 0, which is what a lo read that LATCHES hi returns, and the V4 word decodes to radio
+    // 0x2059 mfg 0x17F. The old gate demanded the two orders agree and so failed a correct device
+    // (`verdict=INVALID` on every flown boot). V4 ([SPEC-V4 802.11/Radio/Registers]) is gated; V3's
+    // word is printed as the alternative, and `v3-agree=` stays on the wire as the discriminator
+    // that would reopen the choice (bcm4331.md §7 row S5a).
+    let id_v = id_b;
+    let mfg = id_v & RADIO_ID_MFG;
+    let ver = (id_v & RADIO_ID_VER) >> 12;
+    let rev = (id_v & RADIO_ID_REV) >> 28;
+    let dark = id_v == 0x0000_0000 || id_v == 0xFFFF_FFFF;
     let order_agree = id_a == id_b;
     let echo_ok = echo_a == RADIO_REG_ID && echo_b == RADIO_REG_ID;
-    let id_ok = !dark && order_agree && echo_ok && mfg == RADIO_MFG_BROADCOM;
+    let id_ok = !dark && echo_ok && mfg == RADIO_MFG_BROADCOM;
 
     serial_println!(
-        ":: wifi4: radio-id raw={:#010x} hi={:#06x} lo={:#06x} rev={} ver={:#06x} mfg={:#05x} expected-mfg={:#05x} {} — field layout [SPEC-V3 RadioID] + [SPEC-V4 802.11/Radio/RadioID], both generations agreeing: rev=bits31:28, ver=bits27:12, mfg=bits11:0 ::",
-        id_a, hi_a, lo_a, rev, ver, mfg, RADIO_MFG_BROADCOM,
+        ":: wifi4: radio-id raw={:#010x} order=V4(lo-then-hi) hi={:#06x} lo={:#06x} rev={} ver={:#06x} mfg={:#05x} expected-mfg={:#05x} {} — field layout [SPEC-V3 RadioID] + [SPEC-V4 802.11/Radio/RadioID], both generations agreeing: rev=bits31:28, ver=bits27:12, mfg=bits11:0 ::",
+        id_v, hi_b, lo_b, rev, ver, mfg, RADIO_MFG_BROADCOM,
         if mfg == RADIO_MFG_BROADCOM { "MATCH" } else { "MISMATCH" }
     );
     serial_println!(
-        ":: wifi4: radio-id cross-check order-agree={} (V3 order hi-then-lo={:#010x} vs V4 order lo-then-hi={:#010x} — the two spec generations state OPPOSITE read orders for this one 32-bit register and neither says whether a data port latches on read, so both are executed; agreement means the value is not an artefact of our sequencing) addr-echo={} (0x3F6 read back {:#06x} and {:#06x}, want {:#06x} — a MISMATCH means the running PSM moved the shared latch between our write and our read and the word above is not ours to decode) dark={} ::",
+        ":: wifi4: radio-id cross-check v3-agree={} (V3 order hi-then-lo={:#010x} vs V4 order lo-then-hi={:#010x} — the two spec generations state OPPOSITE read orders for this one 32-bit register and neither says whether a data port latches on read, so both are executed; agreement means the value is not an artefact of our sequencing) addr-echo={} (0x3F6 read back {:#06x} and {:#06x}, want {:#06x} — a MISMATCH means the running PSM moved the shared latch between our write and our read and the word above is not ours to decode) dark={} ::",
         order_agree as u8, id_a, id_b, echo_ok as u8, echo_a, echo_b, RADIO_REG_ID, dark as u8
     );
     serial_println!(
-        ":: wifi4: radio-id verdict={} gated-on=mfg-is-0x17F+addr-echo+order-agree+not-dark — those four are the WHOLE gate, and every one of them is a Group-A fact or a property of our own reads. The radio VERSION is deliberately NOT in it ::",
+        ":: wifi4: radio-id verdict={} gated-on=mfg-is-0x17F+addr-echo+not-dark order=V4 — those three are the WHOLE gate, on the V4-order word; the V3 order is the printed alternative (f13-f20: hi=0, the latch shape), not a term. The radio VERSION is deliberately NOT in it ::",
         if id_ok { "VALID" } else { "INVALID" }
     );
     serial_println!(
@@ -2432,7 +2444,7 @@ fn phy_once(bar0: u64) {
         &dl,
         id_ok && alive && restored,
         if id_ok { "phy" } else { "radio-id" },
-        id_a,
+        id_v,
         &pw,
         if restored { "MATCH" } else { "FAILED" },
     );
