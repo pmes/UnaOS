@@ -78,7 +78,7 @@ pub static DOCS: &[VerbDoc] = &[
     d("man", "windows", "open a verb's help text in the viewer window", "man <verb>", &["man ls"]),
     d("activity", "windows", "open the activity monitor window (q closes, k kills the selected process)", "activity", &["activity"]),
     d("settings", "windows", "open the settings window", "settings", &["settings"]),
-    d("pref", "windows", "read or set a preference in Principia's store (<home>/.config/unaos/preferences.toml)", "pref get <ns.key> | pref set <ns.key> <value> | pref list [<ns>]", &["pref list system", "pref get system.display.brightness", "pref set system.display.idle_min 5"]),
+    d("pref", "windows", "read or set a preference in Principia's store (<home>/settings/<domain> files, R98)", "pref get <ns.key> | pref set <ns.key> <value> | pref list [<ns>]", &["pref list system", "pref get system.display.brightness", "pref set system.display.idle_min 5"]),
     d("bt", "network", "Bluetooth: scan for devices, pair a keyboard or mouse, connect, list (BR/EDR HID; UNAOS_BTC=1 images)", "bt [list] | bt scan | bt pair <addr|#n> [yes|no] | bt connect <addr|#n> | bt disconnect <addr> | bt forget <addr> | bt reset", &["bt scan", "bt pair #1", "bt pair 88:c6:26:cc:2d:3c yes", "bt connect #1"]),
     d("shortcuts", "windows", "print the desktop keyboard shortcuts", "shortcuts", &["shortcuts"]),
     d("wallpaper", "windows", "set the desktop backdrop from a PNG (<= 4 MB), or `off` for the flat colour", "wallpaper <path.png> | wallpaper off", &["wallpaper /home/ann/SKY.PNG", "wallpaper off"]),

@@ -12,6 +12,17 @@
 //! `<home>/.dock`, two private stores in two private formats; their reading is DELETED (a one-shot import
 //! on first load is the only thing that still opens them, and it deletes them: `[prefs] migrated=<n>`).
 //!
+//! # SETTINGSFILES (B407, R98) — the store is a FOLDER of files, one per domain
+//!
+//! Since R98 the ONE store above lives as `<home>/settings/<domain>` files (`display`, `login`, `desktop`,
+//! `sound`, `trackpad`, `general`, and `<program>` for `app.<program>.*` / a program's own namespace) —
+//! `prefs_core::files::domain_of` is the rule. The tree, the keys, the schema and the bus are unchanged; a
+//! write rewrites ONLY its domain's file (the swap below, per file), human-readable (`# auto-saved <ISO> by
+//! <who>`, the schema's description above each key). The old `preferences.toml` is migrated once and
+//! deleted (`[prefs] migrated preferences.toml -> settings/<n> files`); a file the user deletes resets its
+//! domain at the next service read (`[prefs] settings/<d> absent -> defaults (deleted by the user)`). The
+//! paragraphs below that say "the file" mean each domain file.
+//!
 //! # Where and when
 //!
 //! The home comes from `fs::users::home_of` for the session user (never a `/home/<name>` literal — the
@@ -126,8 +137,19 @@ fn base() -> String {
     home().unwrap_or_default()
 }
 
-/// `<home>/.config/unaos/preferences.toml` (Principia's path), or `/.config/unaos/preferences.toml`.
+/// SETTINGSFILES (B407, R98): `<home>/settings` — the folder of domain files (`settings/display`, …), or
+/// `/settings` with no session. The store IS this folder; there is no other file.
 pub fn path() -> String {
+    alloc::format!("{}/{}", base(), prefs_core::files::DIR)
+}
+
+/// `<home>/settings/<domain>`.
+pub fn domain_path(d: &str) -> String {
+    alloc::format!("{}/{}", path(), d)
+}
+
+/// The single file before R98 (Principia's path), migrated ONCE into the domain files and deleted.
+pub fn legacy_path() -> String {
     alloc::format!("{}/.config/unaos/preferences.toml", base())
 }
 
@@ -162,15 +184,74 @@ fn write_all(p: &str, b: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// `<home>/settings` — a plain folder in the home (R98: no link, no dot).
 fn ensure_dirs() {
     use crate::fs::vfs::NodeKind;
     let mt = crate::shell::vfs_mount_table();
-    let b = base();
-    for d in [alloc::format!("{}/.config", b), alloc::format!("{}/.config/unaos", b)] {
-        if mt.stat(&d).is_err() {
-            let _ = mt.create(&d, NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
-        }
+    let d = path();
+    if mt.stat(&d).is_err() {
+        let _ = mt.create(&d, NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
     }
+}
+
+// ── SETTINGSFILES state ─────────────────────────────────────────────────────────────────────────
+
+/// Domains whose file refused at load: their saves are HELD so the user's file is never overwritten.
+static HELD_D: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+/// Domains whose file is on the volume (at the last load / save) — the reset-on-delete watch list.
+static ON_DISK: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+/// The domain the write in flight saves (set by [`set_applied`], read by `KernelPersist::save`).
+static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+/// Who made the write in flight when it was not the domain's own pane (the `pref` verb, the fixture).
+static BY: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
+/// One save (or the delete watch) at a time: the swap's unlink window must not read as a user delete.
+static SAVE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+/// The programs' declared stanzas (`PrefDeclare`, `app.<name>.*`).
+static DECLARED: spin::Mutex<prefs_core::declare::Registry> = spin::Mutex::new(prefs_core::declare::Registry::new());
+/// The old single file was migrated at this boot.
+static MIGRATED: AtomicBool = AtomicBool::new(false);
+static WATCH_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The delete watch runs at most this often (a service-pass read, never a timer).
+const WATCH_EVERY_MS: u64 = 2000;
+
+fn held(d: &str) -> bool {
+    HELD_D.lock().iter().any(|h| h == d)
+}
+
+fn on_disk_add(d: &str) {
+    let mut g = ON_DISK.lock();
+    if !g.iter().any(|x| x == d) {
+        g.push(String::from(d));
+    }
+}
+
+/// The writer named in the file's `# auto-saved … by <who>` line: the explicit one, else the pane that owns
+/// the domain (`system.*`), else the program (`app.<name>`, `vein`).
+fn by_of(d: &str) -> String {
+    if let Some(b) = *BY.lock() {
+        return String::from(b);
+    }
+    if prefs_core::files::SYSTEM_DOMAINS.contains(&d) {
+        String::from(prefs_core::files::pane_of(d))
+    } else {
+        alloc::format!("the program {}", d)
+    }
+}
+
+fn now_iso() -> String {
+    let mut b = [0u8; 32];
+    match crate::clock::iso8601_now(&mut b) {
+        Some(n) => String::from(core::str::from_utf8(&b[..n]).unwrap_or("?")),
+        None => alloc::format!("(clock unsynced, uptime {} ms)", crate::arch::ms()),
+    }
+}
+
+/// The comment above a key: the schema's `doc`, or the program's declared one.
+fn doc_of(ns: &str, k: &str) -> Option<String> {
+    if ns == prefs_core::files::APP_NS {
+        return prefs_core::declare::lookup(&DECLARED.lock(), k).map(|d| d.doc.clone()).filter(|d| !d.is_empty());
+    }
+    prefs_core::files::schema_doc(ns, k)
 }
 
 // ── Load ─────────────────────────────────────────────────────────────────────────────────────
@@ -185,8 +266,8 @@ fn witness(ok: bool) {
         return;
     }
     serial_println!(
-        ":: PREFS: path={} loaded={} saved={} ns={} -> {} ::",
-        path(), LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed), NS, if ok { "PASS" } else { "FAIL" }
+        ":: PREFS: path={} domains={} loaded={} saved={} ns={} -> {} ::",
+        path(), ON_DISK.lock().len(), LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed), NS, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -196,41 +277,100 @@ fn parse_said(p: &str, text: &[u8]) -> Result<PrefTree, prefs_core::ParseError> 
     PrefTree::parse(s).inspect_err(|e| serial_println!("[prefs] refused path={} line={} why={}", p, e.line, e.why))
 }
 
-/// Read the file (or an orphaned `.new`) into the tree, then run the one-shot import.
-fn load() {
-    let p = path();
+/// The domains in `<home>/settings` (a `<d>.new` alone counts: its swap was interrupted).
+fn domains_on_volume() -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if let Ok(ents) = crate::shell::vfs_mount_table().read_dir(&path()) {
+        for e in ents {
+            if !matches!(e.kind, crate::fs::vfs::NodeKind::File) {
+                continue;
+            }
+            let d = e.name.strip_suffix(".new").unwrap_or(&e.name);
+            if prefs_core::files::valid_domain(d) && !v.iter().any(|x| x == d) {
+                v.push(String::from(d));
+            }
+        }
+    }
+    v
+}
+
+/// Read one domain file (or its orphaned `.new`): `Ok(None)` = absent, `Err` = refused.
+fn read_domain(d: &str) -> Result<Option<PrefTree>, ()> {
+    let p = domain_path(d);
     let tmp = alloc::format!("{}.new", p);
-    let (tree, ok) = match read_all(&p) {
-        Some(t) => match parse_said(&p, &t) {
-            Ok(tr) => (tr, true),
-            Err(_) => (PrefTree::new(), false),
-        },
+    match read_all(&p) {
+        Some(t) => parse_said(&p, &t).map(Some).map_err(|_| ()),
         None => match read_all(&tmp).map(|t| parse_said(&tmp, &t)) {
             Some(Ok(tr)) => {
                 serial_println!("[prefs] adopted {} (the swap was interrupted)", tmp);
-                (tr, true)
+                Ok(Some(tr))
             }
-            _ => (PrefTree::new(), true),
+            _ => Ok(None),
         },
-    };
+    }
+}
+
+/// Read every domain file into the tree (or migrate the old single file, once), then the private-store import.
+fn load() {
+    let mut tree = PrefTree::new();
+    let (mut held_v, mut disk) = (Vec::new(), Vec::new());
+    for d in domains_on_volume() {
+        match read_domain(&d) {
+            Ok(Some(t)) => {
+                prefs_core::files::merge(&mut tree, &t);
+                disk.push(d);
+            }
+            Ok(None) => {}
+            Err(()) => held_v.push(d),
+        }
+    }
+    // R98: the old single file, migrated ONCE — only when no domain file exists yet.
+    let mut migrate_legacy = false;
+    if disk.is_empty() && held_v.is_empty() {
+        let lp = legacy_path();
+        if let Some(t) = read_all(&lp) {
+            match parse_said(&lp, &t) {
+                Ok(tr) => {
+                    tree = tr;
+                    migrate_legacy = true;
+                }
+                Err(_) => serial_println!("[prefs] {} refused: not migrated, left in place (R98)", lp),
+            }
+        }
+    }
+    let ok = held_v.is_empty();
+    for d in &held_v {
+        serial_println!("[prefs] settings/{} refused: its saves are held; fix or delete it", d);
+    }
     // PREFSKERNEL M3 (B345): a value outside its schema range (a hand edit, a file older than the
-    // schema) is clamped ONCE, here, by the shared rule — and re-saved, so the file holds the clamp. A
-    // refused file is not touched (its saves are held).
-    let mut tree = tree;
-    let clamped = if ok { prefs_core::schema::clamp_tree(&mut tree) } else { 0 };
+    // schema) is clamped ONCE, here, by the shared rule — and re-saved, so the file holds the clamp.
+    let clamped = prefs_core::schema::clamp_tree(&mut tree);
     LOAD_CLAMPED.store(clamped as u32, Ordering::Relaxed);
     serial_println!("[prefs] load clamped={}", clamped);
     HELD.store(!ok, Ordering::Release);
+    *HELD_D.lock() = held_v;
+    *ON_DISK.lock() = disk;
     LOADED_N.store(tree.len() as u32, Ordering::Relaxed);
     SAVED_N.store(0, Ordering::Relaxed);
     *TREE.lock() = tree;
     witness(ok);
-    if ok && clamped > 0 {
+    if migrate_legacy {
+        let saved = save();
+        let n = ON_DISK.lock().len();
+        if saved.is_ok() {
+            let mt = crate::shell::vfs_mount_table();
+            let lp = legacy_path();
+            let _ = mt.unlink(&lp, crate::fs::vfs::KERNEL_PRINCIPAL);
+            let _ = mt.unlink(&alloc::format!("{}.new", lp), crate::fs::vfs::KERNEL_PRINCIPAL);
+            MIGRATED.store(true, Ordering::Release);
+            serial_println!("[prefs] migrated preferences.toml -> settings/<n> files n={} (R98)", n);
+        } else {
+            serial_println!("[prefs] migrate preferences.toml -> settings/ failed: {:?}; the old file stays (R98)", saved.err());
+        }
+    } else if clamped > 0 {
         let _ = save();
     }
-    if ok {
-        migrate();
-    }
+    migrate();
 }
 
 /// PREFSKERNEL M3: values the last load clamped into their schema range.
@@ -254,9 +394,28 @@ pub fn ensure_loaded() {
 }
 
 /// The desktop service passes call this (settings, dock): the per-login load happens here, off the
-/// click paths.
+/// click paths — and the SETTINGSFILES delete watch.
 pub fn service() {
     ensure_loaded();
+    let now = crate::arch::ms();
+    if now.saturating_sub(WATCH_MS.load(Ordering::Relaxed)) >= WATCH_EVERY_MS {
+        WATCH_MS.store(now, Ordering::Relaxed);
+        let _ = watch_deleted();
+    }
+}
+
+/// R98: a domain file the user deleted resets that domain to the schema defaults (the store never holds a
+/// default, so the keys simply leave the tree and every reader answers its default). Returns the domains reset.
+fn watch_deleted() -> Vec<String> {
+    let Some(_g) = SAVE_LOCK.try_lock() else { return Vec::new() };
+    let mt = crate::shell::vfs_mount_table();
+    let gone: Vec<String> = ON_DISK.lock().iter().filter(|d| mt.stat(&domain_path(d)).is_err() && mt.stat(&alloc::format!("{}.new", domain_path(d))).is_err()).cloned().collect();
+    for d in &gone {
+        let keys = prefs_core::files::clear(&mut TREE.lock(), d);
+        ON_DISK.lock().retain(|x| x != d);
+        serial_println!("[prefs] settings/{} absent -> defaults (deleted by the user) keys={}", d, keys.len());
+    }
+    gone
 }
 
 // ── The one-shot import of the two retired private stores ───────────────────────────────────────
@@ -319,27 +478,53 @@ fn migrate() {
 
 // ── Save ─────────────────────────────────────────────────────────────────────────────────────
 
-/// Serialize the tree and replace the file by the swap. `Ok(keys written)`.
+/// Save EVERY domain (the load-time clamp, the migrations, the fixture). `Ok(keys written)`.
 pub fn save() -> Result<usize, String> {
-    if HELD.load(Ordering::Acquire) {
-        serial_println!("[prefs] save held: {} was refused at load; fix or remove it", path());
-        return Err(String::from("held: the file on disk was refused at load"));
+    let mut ds: Vec<String> = prefs_core::files::split(&TREE.lock()).into_keys().collect();
+    for d in ON_DISK.lock().iter() {
+        if !ds.contains(d) {
+            ds.push(d.clone());
+        }
     }
-    let (text, want, n) = {
-        let t = TREE.lock();
-        (t.to_toml(), t.clone(), t.len())
-    };
-    let p = path();
+    let mut n = 0usize;
+    let mut first_err = None;
+    for d in &ds {
+        match save_domain(d) {
+            Ok(k) => n += k,
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(n),
+    }
+}
+
+/// R98: write ONE domain's file by the swap (`<d>.new`, read back, parse = the domain's tree, rename) —
+/// human-readable, the auto-saved line on top and the schema's description above each key. `Ok(keys)`.
+pub fn save_domain(d: &str) -> Result<usize, String> {
+    if held(d) {
+        serial_println!("[prefs] save held: settings/{} was refused at load; fix or delete it", d);
+        return Err(alloc::format!("held: settings/{} was refused at load", d));
+    }
+    let _g = SAVE_LOCK.lock();
+    let want = prefs_core::files::part(&TREE.lock(), d);
+    let by = by_of(d);
+    let text = prefs_core::files::render(d, &want, &now_iso(), &by, &doc_of);
+    let n = want.len();
+    let p = domain_path(d);
     let tmp = alloc::format!("{}.new", p);
     ensure_dirs();
     write_all(&tmp, text.as_bytes())?;
-    // Read back and parse: the temp must BE the tree before the real file is touched.
+    // Read back and parse: the temp must BE the domain's tree before the real file is touched.
     let back = read_all(&tmp).ok_or_else(|| String::from("read-back failed"))?;
     if back != text.as_bytes() {
         return Err(String::from("read-back differs"));
     }
     match core::str::from_utf8(&back).ok().map(PrefTree::parse) {
-        Some(Ok(t)) if t == want || t.to_toml() == text => {} // re-emit equality covers a NaN value
+        Some(Ok(t)) if t == want || t.to_toml() == want.to_toml() => {} // re-emit equality covers a NaN value
         _ => return Err(String::from("read-back does not parse to the tree")),
     }
     let mt = crate::shell::vfs_mount_table();
@@ -355,7 +540,9 @@ pub fn save() -> Result<usize, String> {
         }
         Err(e) => return Err(alloc::format!("rename: {:?}", e)),
     }
+    on_disk_add(d);
     SAVED_N.store(n as u32, Ordering::Relaxed);
+    serial_println!("[prefs] saved settings/{} keys={} by={}", d, n, by);
     witness(true);
     Ok(n)
 }
@@ -365,13 +552,21 @@ pub fn snapshot() -> PrefTree {
     TREE.lock().clone()
 }
 
-/// The file on the volume, read through the VFS and parsed with prefs_core: `None` = no file,
-/// `Some(Err)` = refused.
+/// The files on the volume, read through the VFS, parsed with prefs_core and merged: `None` = no file,
+/// `Some(Err)` = a file refused.
 pub fn read_file() -> Option<Result<PrefTree, prefs_core::ParseError>> {
-    read_all(&path()).map(|b| match core::str::from_utf8(&b) {
-        Ok(t) => PrefTree::parse(t),
-        Err(_) => Err(prefs_core::ParseError { line: 1, why: "not UTF-8" }),
-    })
+    let mut t = PrefTree::new();
+    let mut any = false;
+    for d in domains_on_volume() {
+        let Some(b) = read_all(&domain_path(&d)) else { continue };
+        any = true;
+        match core::str::from_utf8(&b).map(PrefTree::parse) {
+            Ok(Ok(x)) => prefs_core::files::merge(&mut t, &x),
+            Ok(Err(e)) => return Some(Err(e)),
+            Err(_) => return Some(Err(prefs_core::ParseError { line: 1, why: "not UTF-8" })),
+        }
+    }
+    any.then_some(Ok(t))
 }
 
 // ── Get / set / list ─────────────────────────────────────────────────────────────────────────
@@ -445,7 +640,12 @@ impl prefs_core::wire::Persist for KernelPersist {
         f(&mut TREE.lock())
     }
     fn save(&mut self) -> Result<(), ()> {
-        save().map(|_| ()).map_err(|e| self.err = Some(e))
+        // SETTINGSFILES (R98): a key's write rewrites ONLY its domain's file.
+        let r = match PENDING.lock().take() {
+            Some(d) => save_domain(&d),
+            None => save(),
+        };
+        r.map(|_| ()).map_err(|e| self.err = Some(e))
     }
 }
 
@@ -456,8 +656,29 @@ impl prefs_core::wire::Persist for KernelPersist {
 /// never disagree). Prints the set line, and on a change the PrefChanged (which carries `clamped`).
 pub fn set_applied(ns: &str, k: &str, v: PrefValue) -> Result<prefs_core::schema::Applied, SetError> {
     ensure_loaded();
+    // SETTINGSFILES (B407): `app.<name>.<key>` is checked by the program's declared stanza (its clamp kept).
+    let mut pre_clamp = false;
+    let v = if ns == prefs_core::files::APP_NS {
+        match prefs_core::declare::check(&DECLARED.lock(), k, v.clone()) {
+            Ok(a) => {
+                pre_clamp = a.clamped;
+                a.value
+            }
+            Err(x) => {
+                serial_println!("[prefs] set {}.{}={} ok=0 why={:?} (declared stanza)", ns, k, v, x);
+                return Err(SetError::Refused(x));
+            }
+        }
+    } else {
+        v
+    };
+    *PENDING.lock() = Some(prefs_core::files::domain_of(ns, k));
     let mut kp = KernelPersist { err: None };
-    let r = prefs_core::wire::persisted_set(&mut kp, ns, k, v.clone());
+    let mut r = prefs_core::wire::persisted_set(&mut kp, ns, k, v.clone());
+    *PENDING.lock() = None;
+    if let Ok(st) = r.as_mut() {
+        st.applied.clamped |= pre_clamp;
+    }
     match &r {
         Ok(st) if st.applied.clamped => serial_println!("[prefs] set {}.{}={} ok=1 clamped=1 sent={}", ns, k, st.applied.value, v),
         Ok(st) => serial_println!("[prefs] set {}.{}={} ok=1", ns, k, st.applied.value),
@@ -537,7 +758,10 @@ pub fn verb(args: &[&str], out: &mut dyn FnMut(&str)) {
         ["set", a, rest @ ..] if !rest.is_empty() => match split_addr(a) {
             Some((ns, k)) => {
                 let raw = rest.join(" ");
-                match set_applied(ns, k, PrefValue::infer(&raw)) {
+                *BY.lock() = Some("the pref verb");
+                let r = set_applied(ns, k, PrefValue::infer(&raw));
+                *BY.lock() = None;
+                match r {
                     Ok(ap) if ap.clamped => out(&alloc::format!("{} = {} (clamped to the schema's range)", a, ap.value.to_literal())),
                     Ok(_) => out(&alloc::format!("{} = {}", a, get(ns, k).map(|v| v.to_literal()).unwrap_or_default())),
                     Err(e) => out(&alloc::format!("pref: {} refused: {}", a, e)),
@@ -606,6 +830,14 @@ impl prefs_core::wire::Store for KernelStore {
     fn namespaces(&self) -> Vec<String> {
         namespaces()
     }
+    /// SETTINGSFILES (B407): PrefDeclare — the program's stanza is held for its `app.<name>.*` writes and
+    /// its descriptions head the keys in `settings/<name>`.
+    fn declare(&mut self, name: &str, keys: Vec<prefs_core::declare::DeclKey>) -> i64 {
+        let n = keys.len();
+        DECLARED.lock().insert(String::from(name), keys);
+        serial_println!("[prefs] declared app.{} keys={} -> settings/{} (R98)", name, n, name);
+        0
+    }
 }
 
 // The shared wire's numbers are the kernel bus's (prefs_core's dev-test pins them to una-abi too).
@@ -627,7 +859,7 @@ const _: () = assert!(
 /// or held. LIST: `<ns>.<key> = <literal>` lines, -E2BIG past the 4 KiB body ceiling.
 pub fn bus_fulfil(verb: u8, body: &[u8], in_session: bool, text: &mut Vec<u8>) -> i64 {
     ensure_loaded();
-    if verb == prefs_core::wire::VERB_SET && !in_session {
+    if (verb == prefs_core::wire::VERB_SET || verb == prefs_core::wire::VERB_DECLARE) && !in_session {
         if let Some((ns, k, _)) = prefs_core::wire::parse_set(body) {
             serial_println!("[prefs] set {}.{} refused: caller is not the session user", ns, k);
         }
@@ -688,13 +920,19 @@ pub fn selftest() {
     ensure_loaded();
     #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] let codec = codec_selftest();
     #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64")))] let codec = true; // no bus on this build: the codec leg is vacuous, not failed
-    let p = path();
+    // SETTINGSFILES (R98): the legs below run on the `general` domain file (power.lowbat_shutdown_pct's)
+    // and the fixture's own `settings/fixturens`; every other domain file is untouched.
+    let p = domain_path("general");
+    let fp = domain_path("fixturens");
     let original = read_all(&p);
+    let (held_d0, on_disk0) = (HELD_D.lock().clone(), ON_DISK.lock().clone());
+    *BY.lock() = Some("tests prefs");
     let tree0 = TREE.lock().clone();
     let load_clamped0 = LOAD_CLAMPED.load(Ordering::Relaxed);
     let held0 = HELD.load(Ordering::Acquire);
     let (loaded0, saved0) = (LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed));
     HELD.store(false, Ordering::Release);
+    HELD_D.lock().clear();
     // Leg 1 — the four types, through set (which saves by the swap).
     let vals = [
         ("fixture.s", PrefValue::Str(String::from("a \"quoted\" path\\x"))),
@@ -707,13 +945,13 @@ pub fn selftest() {
         set_ok &= set("fixturens", k, v.clone()).is_ok() && get("fixturens", k).as_ref() == Some(v);
     }
     // Leg 2 — the file on the volume IS the tree.
-    let file = read_all(&p);
+    let file = read_all(&fp);
     let reread = file.as_deref().and_then(|b| core::str::from_utf8(b).ok()).map(PrefTree::parse);
     let file_ok = match &reread {
-        Some(Ok(t)) => vals.iter().all(|(k, v)| t.get("fixturens", k) == Some(v)) && *t == *TREE.lock(),
+        Some(Ok(t)) => vals.iter().all(|(k, v)| t.get("fixturens", k) == Some(v)) && *t == prefs_core::files::part(&TREE.lock(), "fixturens"),
         _ => false,
     };
-    let no_temp = read_all(&alloc::format!("{}.new", p)).is_none();
+    let no_temp = read_all(&alloc::format!("{}.new", fp)).is_none();
     // PREFSKERNEL (B345) — Leg C, the set clamp: an out-of-range write stores the schema's clamp and says
     // so. The key is `power.lowbat_shutdown_pct` (0..=100): read by the power check only, so the fixture
     // dims no panel and moves no window.
@@ -747,8 +985,8 @@ pub fn selftest() {
     FIXTURE_QUIET.store(true, Ordering::Release);
     ensure_loaded();
     FIXTURE_QUIET.store(false, Ordering::Release);
-    let refused = HELD.load(Ordering::Acquire) && TREE.lock().is_empty() && int(key::BRIGHTNESS, 0, 16).is_none();
-    let held = save().is_err() && read_all(&p).as_deref() == Some(&bad[..]);
+    let refused = HELD.load(Ordering::Acquire) && held("general") && get(NS, lk).is_none();
+    let held = save_domain("general").is_err() && read_all(&p).as_deref() == Some(&bad[..]);
     // Restore the operator's file and tree exactly.
     let mt = crate::shell::vfs_mount_table();
     match &original {
@@ -759,17 +997,70 @@ pub fn selftest() {
             let _ = mt.unlink(&p, crate::fs::vfs::KERNEL_PRINCIPAL);
         }
     }
+    let _ = mt.unlink(&fp, crate::fs::vfs::KERNEL_PRINCIPAL);
     *TREE.lock() = tree0;
+    *HELD_D.lock() = held_d0;
+    *ON_DISK.lock() = on_disk0;
+    *BY.lock() = None;
     HELD.store(held0, Ordering::Release);
     LOADED_N.store(loaded0, Ordering::Relaxed);
     LOAD_CLAMPED.store(load_clamped0, Ordering::Relaxed);
     SAVED_N.store(saved0, Ordering::Relaxed);
-    let restored = read_all(&p) == original;
+    let restored = read_all(&p) == original && read_all(&fp).is_none();
     let rows = prefs_core::schema::SCHEMA.len();
     let ok = codec && set_ok && file_ok && no_temp && refused && held && restored && loadclamp_ok && clamp_ok && wire_ok;
     serial_println!(
         ":: PREFS-FIXTURE: codec={} types={} file={} temp_gone={} malformed_refused={} save_held={} restored={} loadclamp={} clamp={} wire={} schema_rows={} -> {} ::",
         codec as u8, set_ok as u8, file_ok as u8, no_temp as u8, refused as u8, held as u8, restored as u8,
         loadclamp_ok as u8, clamp_ok as u8, if wire_ok { "shared" } else { "diverged" }, rows, if ok { "PASS" } else { "FAIL" }
+    );
+    settingsfiles_selftest();
+}
+
+/// SETTINGSFILES (B407, R98) — `tests prefs`' second line (never at boot, R80): a program declares a stanza
+/// over the wire (`PrefDeclare`), its out-of-range write is clamped by the DECLARED range and lands in
+/// `settings/<name>` alone; the file is human-readable (the auto-saved line, the declared description above
+/// the key) and parses back to the domain; deleting it resets the domain at the next watch. Then everything
+/// the leg made is removed. `:: SETTINGSFILES: domains=<n> files=<n> migrated=<0/1> readable=1
+/// reset_on_delete=ok app_ns=ok -> PASS ::`.
+#[cfg(feature = "witness")]
+fn settingsfiles_selftest() {
+    const NAME: &str = "sftest";
+    const DOC: &str = "the fixture's level (SETTINGSFILES)";
+    let dp = domain_path(NAME);
+    let mt = crate::shell::vfs_mount_table();
+    let others: Vec<(String, Option<Vec<u8>>)> = ON_DISK.lock().iter().map(|d| (d.clone(), read_all(&domain_path(d)))).collect();
+    let body = prefs_core::declare::body(NAME, &[prefs_core::declare::DeclKey {
+        key: String::from("level"),
+        kind: prefs_core::declare::DeclKind::Int { min: 0, max: 10 },
+        default: PrefValue::Int(5),
+        doc: String::from(DOC),
+    }]);
+    let mut out = Vec::new();
+    let declared = prefs_core::wire::fulfil(&mut KernelStore, prefs_core::wire::VERB_DECLARE, &body, true, &mut out) == 0
+        && prefs_core::wire::fulfil(&mut KernelStore, prefs_core::wire::VERB_DECLARE, &body, false, &mut out) == prefs_core::wire::EACCES;
+    let set = set_applied(prefs_core::files::APP_NS, "sftest.level", PrefValue::Int(99));
+    let app_ok = declared
+        && matches!(set, Ok(ref a) if a.clamped && a.value == PrefValue::Int(10))
+        && set_applied(prefs_core::files::APP_NS, "sftest.level", PrefValue::Bool(true)).is_err();
+    let text = read_all(&dp).and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+    let parsed = PrefTree::parse(&text).ok();
+    let readable = prefs_core::files::stamp_of(&text).is_some()
+        && text.contains(&alloc::format!("# {}\nsftest.level = 10\n", DOC))
+        && parsed.as_ref().and_then(|t| t.get(prefs_core::files::APP_NS, "sftest.level").cloned()) == Some(PrefValue::Int(10))
+        && parsed.as_ref().map(|t| t.namespaces().len()) == Some(1);
+    // Only `settings/sftest` changed: every other domain file is byte-for-byte what it was.
+    let alone = others.iter().all(|(d, b)| read_all(&domain_path(d)) == *b);
+    let _ = mt.unlink(&dp, crate::fs::vfs::KERNEL_PRINCIPAL);
+    WATCH_MS.store(0, Ordering::Relaxed);
+    let reset = watch_deleted().iter().any(|d| d == NAME) && get(prefs_core::files::APP_NS, "sftest.level").is_none();
+    DECLARED.lock().remove(NAME);
+    let files = domains_on_volume().len();
+    let domains = ON_DISK.lock().len();
+    let ok = app_ok && readable && alone && reset && read_all(&dp).is_none();
+    serial_println!(
+        ":: SETTINGSFILES: domains={} files={} migrated={} readable={} reset_on_delete={} app_ns={} alone={} dir={} -> {} ::",
+        domains, files, MIGRATED.load(Ordering::Acquire) as u8, readable as u8, if reset { "ok" } else { "fail" },
+        if app_ok { "ok" } else { "fail" }, alone as u8, path(), if ok { "PASS" } else { "FAIL" }
     );
 }
