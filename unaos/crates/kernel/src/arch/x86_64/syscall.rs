@@ -3236,7 +3236,7 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 /// plus the console: 10 + 1 = 11, and 12 leaves a row of margin. Raising it alone would have been
 /// pointless (the process table would still refuse the 7th launch) and raising the others without it
 /// would have traded a `-EAGAIN` at spawn for an `-ENFILE` at the first `SYS_WIN_CREATE`.
-const WIN_MAX: usize = crate::arch::memory::USER_SLOTS * crate::arch::x86_64::memory::FB_WIN_SLOTS; // WINDOWCAP-2 (B378, R90) — ⚠ SAME-LINE fold: no literal; every ring-3 window lives in an address-space slot's FB region, so the ring-3 table is exactly (slots x windows per slot) wide — the VA layout's own count, not a policy. The compositor table (`video::wm`) has no width at all; the live limit is `video::wincap`.
+// WINDOWCAP3 (B399, R90): `WIN_MAX` (slots x windows per slot) is gone — the ring-3 window table is a heap `Vec` that grows when no row is free ([`WINDOWS`], [`win_rows`]); an id is bounded by the table it was minted from, and the live limit is `video::wincap`.
 /// HEADROOM: was `WIN_MAX == FB_WIN_SLOTS`. That equality was never the requirement — it was two
 /// caps that happened to share a value, and it silently made every per-address-space REGION SLOT
 /// index legal as a global window id and vice versa. The real requirement is one-directional and is
@@ -3245,8 +3245,8 @@ const WIN_MAX: usize = crate::arch::memory::USER_SLOTS * crate::arch::x86_64::me
 /// `FB_WIN_SLOTS`. So `FB_WIN_SLOTS` may be smaller than `WIN_MAX` (a process may not open every
 /// window in the machine — that is `-EMFILE`) but never larger. See `memory::FB_WIN_SLOTS` for why
 /// the per-process cap stayed at 8 while the global one grew.
-const _: () = assert!(crate::arch::x86_64::memory::FB_WIN_SLOTS <= WIN_MAX);
-const _: () = assert!(WIN_MAX <= 64); // WINDOWCAP-2: the DMG-REFUSE fixture's two masks are u64
+
+
 
 /// WINX-1: one window table row. `owner == WIN_OWNER_FREE` means FREE. Unlike aarch64 — where ASID 0 is
 /// the shared context and so doubles as the free marker — x86 slot 0 is a REAL address space, so the
@@ -3285,7 +3285,7 @@ impl WinEntry {
 /// `win_close_slot`), the exact asymmetry `IrqGuard` exists to close. Held across the page-table
 /// maintenance in `sys_win_create` so a create and a teardown on two cores cannot interleave their
 /// leaf edits on the same slot.
-static WINDOWS: SpinMutex<[WinEntry; WIN_MAX]> = SpinMutex::new([WinEntry::FREE; WIN_MAX]);
+static WINDOWS: SpinMutex<alloc::vec::Vec<WinEntry>> = SpinMutex::new(alloc::vec::Vec::new()); // WINDOWCAP3 (B399): grows by one row when none is free
 
 /// WINX-1: resolve the caller's address-space slot for a window verb. `-EINVAL` from the shared kernel
 /// window (no private slot => no FB region), matching aarch64's refusal for ASID 0.
@@ -3315,8 +3315,11 @@ fn win_pages_for(w: u32, h: u32) -> Option<usize> {
 /// serve `SYS_FB_MAP` and `bg`-detached launches, neither of which x86 has this arc) and stay zeroed.
 fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
     use crate::arch::x86_64::memory as mem;
+    if !mem::slot_known(slot) {
+        return; // WINDOWCAP3 (B399): no record, no info page
+    }
     let info = mem::slot_fb_info_ptr(slot) as *mut u32;
-    let off = mem::FB_INFO_SIZE + (e.rslot as usize) * mem::FB_WIN_SLOT_SIZE;
+    let off = mem::fb_win_info_off(e.rslot as usize); // WINDOWCAP3: a band window's offset is the band's
     unsafe {
         let p = info.add(0x40 / 4 + (e.rslot as usize) * (0x20 / 4));
         p.add(0).write_volatile(FB_MAGIC);
@@ -3346,8 +3349,7 @@ const FB_MAGIC: u32 = 0x4E49_5755;
 /// It is published in the RO info page's process-flags word rather than returned from a syscall so a
 /// program can read it once, cheaply, with no new verb — and it is read-only to ring 3, so a program can
 /// learn how it was launched but cannot claim to have been launched some other way.
-static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+static SLOT_DETACHED: crate::procslot::SlotVec<AtomicBool> = crate::procslot::SlotVec::new(|| AtomicBool::new(false), AtomicBool::new(false));
 
 /// DESKTOP-APP: which slots are exempt from the FIRST-WINDOW focus grant in [`sys_win_create`].
 ///
@@ -3394,8 +3396,7 @@ static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
 /// `arroyo`'s knob comment says so now; it used to claim byte-identity, and that would have been
 /// false. aarch64 IS byte-identical — no aarch64 file is touched at all.
 #[cfg(feature = "wc")]
-static SLOT_NO_AUTOFOCUS: [AtomicBool; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+static SLOT_NO_AUTOFOCUS: crate::procslot::SlotVec<AtomicBool> = crate::procslot::SlotVec::new(|| AtomicBool::new(false), AtomicBool::new(false));
 
 /// DESKTOP-APP: is `slot` exempt from the first-window focus grant — and SAY SO if it is.
 ///
@@ -3437,7 +3438,7 @@ fn owner_is_focus_exempt(owner: u64) -> bool {
         return false;
     }
     let slot = (owner - 1) as usize;
-    slot < crate::arch::memory::USER_SLOTS && SLOT_NO_AUTOFOCUS[slot].load(Ordering::Acquire)
+    slot_in_range(slot) && SLOT_NO_AUTOFOCUS[slot].load(Ordering::Acquire)
 }
 #[cfg(not(feature = "wc"))]
 fn owner_is_focus_exempt(_owner: u64) -> bool {
@@ -3470,8 +3471,7 @@ const FB_FLAG_HIDDEN: u32 = 1 << 1;
 /// Fail-safe direction is aarch64's, and for aarch64's reason: an out-of-range owner reads back "not
 /// hidden", i.e. keeps rendering. A vug that idles when it should not is a vug that stops responding;
 /// a vug that renders when it could idle merely wastes what it wastes today.
-static SLOT_HIDDEN: [AtomicBool; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+static SLOT_HIDDEN: crate::procslot::SlotVec<AtomicBool> = crate::procslot::SlotVec::new(|| AtomicBool::new(false), AtomicBool::new(false));
 
 /// VUGMIN/x86: the PROCESS-FLAGS word for `slot`, as published into its RO info page. Factored out
 /// because BOTH publishers must write the identical word — [`fb_info_write_flags`] on window create
@@ -3493,6 +3493,9 @@ fn fb_info_flags(slot: usize) -> u32 {
 /// is what maps the info page in the first place, so the word is present the moment a program can read
 /// it and never before.
 fn fb_info_write_flags(slot: usize) {
+    if !crate::arch::memory::slot_known(slot) {
+        return; // WINDOWCAP3 (B399): a slot with no record has no info page (a fixture's table-only row)
+    }
     let info = crate::arch::x86_64::memory::slot_fb_info_ptr(slot) as *mut u32;
     unsafe { info.add(0x20 / 4).write_volatile(fb_info_flags(slot)) };
 }
@@ -3519,7 +3522,7 @@ fn fb_info_write_flags(slot: usize) {
 /// and exists for the slot's whole life, and [`clear_hidden`] at the teardown funnel means a dead
 /// slot's word cannot outlive its owner.
 pub fn set_hidden(asid: u64, on: bool) {
-    if asid == 0 || asid > crate::arch::memory::USER_SLOTS as u64 {
+    if asid == 0 || !slot_in_range((asid - 1) as usize) {
         return;
     }
     let slot = (asid - 1) as usize;
@@ -3543,7 +3546,7 @@ pub fn set_hidden(asid: u64, on: bool) {
 /// worse of the two failure directions (a window that draws nothing), so it is closed at the funnel
 /// rather than at each launcher.
 fn clear_hidden(slot: usize) {
-    if slot < crate::arch::memory::USER_SLOTS {
+    if slot_in_range(slot) {
         SLOT_HIDDEN[slot].store(false, Ordering::Release);
         fb_info_write_flags(slot);
     }
@@ -3584,15 +3587,21 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // were both `WIN_MAX` while the caps were equal; once `WIN_MAX` grew to 12 with `FB_WIN_SLOTS`
     // at 8, a candidate range of `WIN_MAX` would have handed out region slot 8..11 and walked off
     // the end of the slot's FB region — the `-EMFILE` this arm documents would never have fired.
-    let rslot = match (0..mem::FB_WIN_SLOTS)
-        .find(|&r| !(0..WIN_MAX).any(|i| t[i].owner == slot && t[i].rslot as usize == r))
+    let rslot = match (0..mem::FB_WIN_ROWS) // WINDOWCAP3: the info page's rows, not the record's four
+        .find(|&r| !t.iter().any(|e| e.owner == slot && e.rslot as usize == r))
     {
         Some(r) => r,
         None => return EMFILE,
     };
-    let id = match (0..WIN_MAX).find(|&i| t[i].owner == WIN_OWNER_FREE) {
+    if !mem::fb_win_ensure(slot, rslot) {
+        return ENFILE; // WINDOWCAP3: a system limit — the heap had no surface for a window past the record's four
+    }
+    let id = match t.iter().position(|e| e.owner == WIN_OWNER_FREE) {
         Some(i) => i,
-        None => return ENFILE,
+        None => match win_table_grow(&mut t) {
+            Some(i) => i,
+            None => return ENFILE, // WINDOWCAP3: the heap refused the row (or the id TYPE is spent)
+        },
     };
     // VSYNC-PACE: a freshly allocated row starts with no cadence, so this window's first present is never
     // delayed and it inherits nothing from the previous tenant of the id.
@@ -3753,7 +3762,7 @@ fn sys_win_present(win: u64) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    crate::video::lag::app_drew(slot); if win >= WIN_MAX as u64 { // GLASSLAG M1 (B370): the app drew (same-line fold).
+    crate::video::lag::app_drew(slot); if win >= win_rows() as u64 { // GLASSLAG M1 (B370): the app drew (same-line fold).
         return EBADF;
     }
     let id = win as usize;
@@ -3867,8 +3876,7 @@ const HIDDEN_PRESENT_GRACE: u32 = 8;
 const HIDDEN_PRESENT_SLEEP_MS: u64 = 1;
 
 /// PRESSURE-1: per-slot count of consecutive presents the compositor declined.
-static SLOT_HIDDEN_PRESENTS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+static SLOT_HIDDEN_PRESENTS: crate::procslot::SlotVec<AtomicU32> = crate::procslot::SlotVec::new(|| AtomicU32::new(0), AtomicU32::new(0));
 
 /// PRESSURE-1: charge `slot` for the present it just made, and give it the answer.
 ///
@@ -4114,7 +4122,7 @@ const PACE_SLACK_US: u64 = 1_000;
 /// of the surface the panel scans out: two windows owned by one process are two independent streams to
 /// the beam and each is entitled to its own frame slot.
 #[cfg(all(feature = "wc", feature = "vsyncpace"))]
-static WIN_PACE_DUE_US: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
+static WIN_PACE_DUE_US: crate::video::rowstore::SegVec<AtomicU64> = crate::video::rowstore::SegVec::new(|| AtomicU64::new(0)); // WINDOWCAP3 (B399): per-row, heap-grown
 
 /// VSYNC-PACE: the focus generation each window has already honoured — the input-latency escape.
 ///
@@ -4140,13 +4148,12 @@ static WIN_PACE_DUE_US: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN
 /// can consume one focus exemption belonging to another slot's window, costing that window at most
 /// one frame.
 #[cfg(all(feature = "wc", feature = "vsyncpace"))]
-static WIN_PACE_SEQ: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
+static WIN_PACE_SEQ: crate::video::rowstore::SegVec<AtomicU64> = crate::video::rowstore::SegVec::new(|| AtomicU64::new(0)); // WINDOWCAP3 (B399): per-row, heap-grown
 
 /// VSYNC-PACE: per-slot focus generation, bumped on every focus ARRIVAL. Starts equal to every window's
 /// recorded generation (both 0), so the exemption fires on a real arrival and never on boot.
 #[cfg(all(feature = "wc", feature = "vsyncpace"))]
-static SLOT_FOCUS_SEQ: [AtomicU64; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+static SLOT_FOCUS_SEQ: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 
 /// VSYNC-PACE: sleep the caller until window `id`'s next frame boundary, if it has already presented
 /// inside the current one. Called with NO lock held and IF unmasked.
@@ -4333,7 +4340,7 @@ fn pace_advance(id: usize) {
 /// to a recycled input ring.
 #[cfg(all(feature = "wc", feature = "vsyncpace"))]
 fn pace_reset(id: usize) {
-    if id < WIN_MAX {
+    if id < win_rows() {
         WIN_PACE_DUE_US[id].store(0, Ordering::Relaxed);
         // Review C4: the SEQ must be reset with the deadline. Window ids are recycled, and a new
         // tenant inheriting the previous one's focus generation would miss (or gain) exactly one
@@ -4438,11 +4445,11 @@ const WPACE_FREE: bool = !cfg!(feature = "vsyncpace");
 
 /// VSYNC-PACE: per-window `[wpace]` accumulators — presents seen, presents delayed, ms slept.
 #[cfg(all(feature = "wc", feature = "witness"))]
-static WPACE_PRES: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
+static WPACE_PRES: crate::video::rowstore::SegVec<AtomicU64> = crate::video::rowstore::SegVec::new(|| AtomicU64::new(0)); // WINDOWCAP3 (B399): per-row, heap-grown
 #[cfg(all(feature = "wc", feature = "witness"))]
-static WPACE_PACED: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
+static WPACE_PACED: crate::video::rowstore::SegVec<AtomicU64> = crate::video::rowstore::SegVec::new(|| AtomicU64::new(0)); // WINDOWCAP3 (B399): per-row, heap-grown
 #[cfg(all(feature = "wc", feature = "witness"))]
-static WPACE_SLEPT_MS: [AtomicU64; WIN_MAX] = [const { AtomicU64::new(0) }; WIN_MAX];
+static WPACE_SLEPT_MS: crate::video::rowstore::SegVec<AtomicU64> = crate::video::rowstore::SegVec::new(|| AtomicU64::new(0)); // WINDOWCAP3 (B399): per-row, heap-grown
 /// VSYNC-PACE: aggregate-only — focus exemptions taken, and cadence resynchronisations.
 #[cfg(all(feature = "wc", feature = "witness"))]
 static WPACE_FOCUS: AtomicU64 = AtomicU64::new(0);
@@ -4524,9 +4531,9 @@ fn wpace_emit(span: u64) {
     let mut t_pres = 0u64;
     let mut t_paced = 0u64;
     let mut t_slept = 0u64;
-    let mut rows: [(usize, u64, u64, u64); WIN_MAX] = [(0, 0, 0, 0); WIN_MAX];
+    let mut rows: alloc::vec::Vec<(usize, u64, u64, u64)> = alloc::vec::Vec::new(); // WINDOWCAP3: no lock held here (see above), so the scratch may allocate
     let mut n = 0usize;
-    for i in 0..WIN_MAX {
+    for i in 0..win_rows() {
         let pres = WPACE_PRES[i].swap(0, Ordering::Relaxed);
         let paced = WPACE_PACED[i].swap(0, Ordering::Relaxed);
         let slept = WPACE_SLEPT_MS[i].swap(0, Ordering::Relaxed);
@@ -4534,7 +4541,7 @@ fn wpace_emit(span: u64) {
         t_paced += paced;
         t_slept += slept;
         if pres != 0 {
-            rows[n] = (i, pres, paced, slept);
+            rows.push((i, pres, paced, slept));
             n += 1;
         }
     }
@@ -4673,7 +4680,7 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    crate::video::lag::app_drew(slot); if win >= WIN_MAX as u64 { // GLASSLAG M1 (B370): the app drew (same-line fold).
+    crate::video::lag::app_drew(slot); if win >= win_rows() as u64 { // GLASSLAG M1 (B370): the app drew (same-line fold).
         return EBADF;
     }
     let id = win as usize;
@@ -4740,12 +4747,12 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
 
 /// WINX-1: total `SYS_WIN_PRESENT` calls that reached the compositor — the headless witness's proof that a present actually happened, independent of whether a panel was attached. PRESENTSLOT (2026-09-22, rmbp-ledger B178): and BESIDE it, the SAME event ATTRIBUTED — one `AtomicU64` per address-space row, bumped at the same two sites inside the same `WINDOWS` hold and after the same ownership proof, so a witness can count ITS OWN presents on a machine it shares. DMGYIELD (B172) is why: the global counter is shared with every co-tenant (`/STAT.ELF` presents every 50 ms), so `presents == DMG_ACCEPTS` could only be claimed EXACTLY on an empty table, and no metal boot has had one since STARTHOLD.
 /// a present actually happened, independent of whether a panel was attached. WHY `Relaxed` ON THE PER-SLOT ARM AND NOT A WEAKENING: this counter publishes nothing. It carries no data dependency — no reader uses it to decide whether some OTHER memory is visible — so it has no release/acquire duty to discharge; it is a single location whose only value is its own. The increments are already totally ordered with respect to one another by the `WINDOWS` spinlock they all sit inside (an AcqRel pair per present), and the one reader, `dmg_refuse_witness`, brackets its two samples with a full scheduler handshake in each direction (`spawn_user_in_space` before, the prober's SWEPT publication through its param page plus `DMG_DONE`'s Acquire load after). `AcqRel` here would buy a fence the lock already pays for, on two of the hottest paths in the kernel. The GLOBAL counter keeps its `AcqRel` untouched — not because it needs it either, but because changing it is not this arc's question.
-static FB_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0); static FB_PRESENT_COUNT_SLOT: [AtomicU64; crate::arch::memory::USER_SLOTS] = [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+static FB_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0); static FB_PRESENT_COUNT_SLOT: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 
 /// WINX-1: read the present counter (the fixture verdict reads it). PRESENTSLOT: and `fb_present_count_slot(row)` reads ONE address-space row's own count. NOT RESET on slot release — a recycled row inherits its predecessor's total — so every caller takes a DELTA across a window in which it can prove the slot is the one it built. An out-of-range row reads 0, which is not a silent pass: a delta of 0 grades FAIL against `DMG_ACCEPTS`, loudly, and `win_caller_slot()` bounds every writer by construction so the arm cannot be reached from the syscall side at all.
 pub fn fb_present_count() -> u64 {
     FB_PRESENT_COUNT.load(Ordering::Acquire)
-} pub fn fb_present_count_slot(row: usize) -> u64 { if row >= crate::arch::memory::USER_SLOTS { return 0; } FB_PRESENT_COUNT_SLOT[row].load(Ordering::Relaxed) }
+} pub fn fb_present_count_slot(row: usize) -> u64 { if !slot_in_range(row) { return 0; } FB_PRESENT_COUNT_SLOT[row].load(Ordering::Relaxed) }
 
 /// WINX-1: retire every window owned by address-space slot `s`. Called from
 /// `memory::free_user_space_by_cr3` before the FB leaves are dropped and the slot released, so a
@@ -4757,11 +4764,11 @@ pub fn fb_present_count() -> u64 {
 /// lock-order rule the aarch64 twin states — `wm::close`/`close_owner` are the one pair that must NOT be
 /// called with the window table held.
 pub fn win_close_slot(s: usize) {
-    let mut doomed = [crate::video::wm::WIN_NONE; WIN_MAX];
+    let mut doomed = alloc::vec![crate::video::wm::WIN_NONE; win_rows()]; // WINDOWCAP3: sized before the lock (no allocation under it); a row minted meanwhile is past it and not this slot's
     {
         let _irq = IrqGuard::mask_save();
         let mut t = WINDOWS.lock();
-        for i in 0..WIN_MAX {
+        for i in 0..t.len().min(doomed.len()) {
             if t[i].owner == s {
                 doomed[i] = t[i].wm_id;
                 t[i] = WinEntry::FREE;
@@ -4891,14 +4898,11 @@ const INPUT_RING_CAP: usize = 32;
 
 /// The per-process input rings, keyed by address-space SLOT. One producer (the router) + one consumer
 /// (the owning ring-3 task) per ring => lock-free SPSC.
-static USER_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; crate::arch::memory::USER_SLOTS] =
-    [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; crate::arch::memory::USER_SLOTS];
+static USER_INPUT_BUF: crate::procslot::SlotVec<[AtomicU64; INPUT_RING_CAP]> = crate::procslot::SlotVec::new(|| [const { AtomicU64::new(0) }; INPUT_RING_CAP], [const { AtomicU64::new(0) }; INPUT_RING_CAP]);
 /// Consumer index (free-running; advanced by `sys_input_poll`). Real slot = `head & (CAP - 1)`.
-static USER_INPUT_HEAD: [AtomicU32; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+static USER_INPUT_HEAD: crate::procslot::SlotVec<AtomicU32> = crate::procslot::SlotVec::new(|| AtomicU32::new(0), AtomicU32::new(0));
 /// Producer index (free-running; advanced by `user_input_push`). Occupancy = `tail - head`.
-static USER_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+static USER_INPUT_TAIL: crate::procslot::SlotVec<AtomicU32> = crate::procslot::SlotVec::new(|| AtomicU32::new(0), AtomicU32::new(0));
 
 /// VUGPAUSE-2/x86: per-slot "this slot has a task parked in [`sys_input_wait`]" flag. Set immediately
 /// before the futex park, cleared immediately after it returns — and ALSO cleared on slot teardown by
@@ -4918,8 +4922,7 @@ static USER_INPUT_TAIL: [AtomicU32; crate::arch::memory::USER_SLOTS] =
 /// A stale-SET flag costs one wasted `futex_wake` per backstop period on a key with no waiters; a
 /// stale-CLEAR flag costs a task that never runs again. The two are traded in that direction on
 /// purpose, and [`user_input_wake_backstop`] does not consult it at all.
-static USER_INPUT_PARKED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+static USER_INPUT_PARKED: crate::procslot::SlotVec<AtomicBool> = crate::procslot::SlotVec::new(|| AtomicBool::new(false), AtomicBool::new(false));
 
 /// VUGPAUSE-2/x86: how many times a task has PARKED in [`sys_input_wait`], and how many waiters the
 /// wake seam has released. Cumulative for the boot; they drive the `[vugpause2]` witness and should
@@ -4933,8 +4936,7 @@ static USER_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
 /// than global because the question the line answers ("did THIS app resume, or is it stranded?") is
 /// per-slot: a global cadence would let a busy app's traffic silence a newly launched one's first
 /// resume. Cleared on teardown beside the park flag — the count paces a witness across one tenancy.
-static USER_INPUT_RESUMES: [AtomicU64; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+static USER_INPUT_RESUMES: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 
 // ---- RESUMEPAINT (D-3) — the resume-edge first-present witness --------------------------------
 //
@@ -5006,19 +5008,15 @@ const VUGRES_BOUND_MS: u64 = 2000;
 /// D-3: ms timestamp of the resume edge, per slot. `0` = no witness pending — the whole state
 /// machine keys off this word, and both emit paths claim it with an atomic exchange so exactly one
 /// line is ever printed per arm.
-static VUGRES_RESUME_MS: [AtomicU64; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+static VUGRES_RESUME_MS: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 /// D-3: the furthest stage the pending resume reached (the ladder above).
-static VUGRES_STAGE: [AtomicU32; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+static VUGRES_STAGE: crate::procslot::SlotVec<AtomicU32> = crate::procslot::SlotVec::new(|| AtomicU32::new(0), AtomicU32::new(0));
 /// D-3: [`VUGRES_ACTIVITY`]'s value at the arm — the "has anyone presented since?" baseline.
-static VUGRES_ACTIVITY_AT: [AtomicU64; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+static VUGRES_ACTIVITY_AT: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 /// D-3: the last window id this slot carried through a present verb's ownership proof —
 /// `u32::MAX` = never presented. Stamped unconditionally (one relaxed store per present) so the
 /// NEGATIVE line can name the window of a slot that never presents after its resume.
-static VUGRES_LAST_WIN: [AtomicU32; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU32::new(u32::MAX) }; crate::arch::memory::USER_SLOTS];
+static VUGRES_LAST_WIN: crate::procslot::SlotVec<AtomicU32> = crate::procslot::SlotVec::new(|| AtomicU32::new(u32::MAX), AtomicU32::new(u32::MAX));
 /// D-3: presents (any slot, any outcome) that reached the present verbs' tail — the "composition
 /// is answering" clock the negative arm's bound is measured against.
 static VUGRES_ACTIVITY: AtomicU64 = AtomicU64::new(0);
@@ -5103,7 +5101,7 @@ fn vugres_present_outcome(slot: usize, id: usize, outcome: crate::video::wm::Pre
             let t0 = VUGRES_RESUME_MS[slot].swap(0, Ordering::AcqRel);
             if t0 != 0 {
                 VUGRES_STAGE[slot].store(VUGRES_STAGE_NONE, Ordering::Release);
-                VUGRES_EMITTED_POS.fetch_add(1, Ordering::Relaxed); if slot == crate::arch::memory::USER_SLOTS - 1 { VUGRES_POS_FIX.fetch_add(1, Ordering::Relaxed); }
+                VUGRES_EMITTED_POS.fetch_add(1, Ordering::Relaxed); if slot == VUGRES_FIX_SLOT.load(Ordering::Relaxed) { VUGRES_POS_FIX.fetch_add(1, Ordering::Relaxed); }
                 serial_println!(
                     "[vugres] first present win={} asid={} gap_ms={}",
                     id,
@@ -5124,7 +5122,7 @@ fn vugres_present_outcome(slot: usize, id: usize, outcome: crate::video::wm::Pre
 fn vugres_backstop() {
     let now = crate::arch::ms();
     let act = VUGRES_ACTIVITY.load(Ordering::Relaxed);
-    for slot in 0..crate::arch::memory::USER_SLOTS {
+    for slot in 0..crate::arch::memory::user_slots() {
         let t0 = VUGRES_RESUME_MS[slot].load(Ordering::Acquire);
         if t0 == 0 || now.saturating_sub(t0) < VUGRES_BOUND_MS {
             continue;
@@ -5252,7 +5250,8 @@ fn vugres_selftest(cpu: usize) {
     }
     // The TOP slot and its neighbour: no other fixture in the battery occupies them, and both are
     // pure static state — `set_hidden`'s doc says a slot with no live tenant is harmless to write.
-    let slot = crate::arch::memory::USER_SLOTS - 1;
+    let slot = crate::procslot::SLOT_ID_MAX - 1; // WINDOWCAP3 (B399): the top of the slot TYPE — no live program reaches it
+    VUGRES_FIX_SLOT.store(slot, Ordering::Relaxed);
     let bslot = slot - 1;
     let asid = (slot as u64) + 1;
     let basid = (bslot as u64) + 1;
@@ -5381,7 +5380,7 @@ fn vugres_selftest(cpu: usize) {
 #[inline]
 fn input_futex_key(slot: usize) -> u64 {
     const _: () = assert!(
-        crate::arch::memory::USER_SLOTS < 128,
+        crate::procslot::SLOT_ID_MAX < 128,
         "input futex keys claim bit 63; a slot tag that reaches it would collide with a user key"
     );
     (1u64 << 63) | ((slot as u64) + 1)
@@ -5420,7 +5419,7 @@ fn user_input_wake(slot: usize) -> usize {
 /// carries `n=`, this slot's cumulative resume count, so a reader can subtract across two lines and
 /// know how many were elided.
 fn user_input_wake_edge(slot: usize, edge: &str) -> usize {
-    if slot >= crate::arch::memory::USER_SLOTS {
+    if !slot_in_range(slot) {
         return 0;
     }
     if !USER_INPUT_PARKED[slot].load(Ordering::Acquire) {
@@ -5462,7 +5461,7 @@ fn user_input_wake_edge(slot: usize, edge: &str) -> usize {
 /// bucket array, and a wake on a key with no waiters allocates nothing and readies nobody. Any future
 /// stale clear therefore costs an idle app one backstop period of latency, once, rather than its life.
 pub fn user_input_wake_backstop() {
-    for slot in 0..crate::arch::memory::USER_SLOTS {
+    for slot in 0..crate::arch::memory::user_slots() {
         let n = crate::arch::sched::futex_wake(input_futex_key(slot), usize::MAX);
         if n != 0 {
             USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
@@ -5665,7 +5664,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
         return false; // the shell owns the keyboard
     }
     let slot = (active - 1) as usize;
-    if slot >= crate::arch::memory::USER_SLOTS {
+    if !slot_in_range(slot) {
         return false; // impossible unless the focus word was corrupted — fail to the shell
     }
     let Some(packed) = pack_input(ev) else {
@@ -5949,7 +5948,7 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
 /// on teardown no producer runs for the dying slot, and on a focus change the router only ever
 /// targets the newly-active slot.
 fn clear_input_row(slot: usize) {
-    if slot >= crate::arch::memory::USER_SLOTS {
+    if !slot_in_range(slot) {
         return;
     }
     USER_INPUT_HEAD[slot].store(0, Ordering::Release);
@@ -5966,7 +5965,7 @@ fn clear_input_row(slot: usize) {
 pub fn user_input_set_active(slot_plus1: u64) {
     if slot_plus1 != 0 {
         let slot = (slot_plus1 - 1) as usize;
-        if slot >= crate::arch::memory::USER_SLOTS {
+        if !slot_in_range(slot) {
             return; // not a real slot — refuse rather than publish a focus nobody can drain
         }
         clear_input_row(slot); // a fresh focus starts clean
@@ -6028,7 +6027,7 @@ fn user_input_revoke_slot(slot: usize) {
 /// never re-sets it. So it may be cleared only by the parker itself (on the normal return from
 /// [`sys_input_wait`]) or by the one event that proves the parker is gone.
 fn clear_input_parked(slot: usize) {
-    if slot < crate::arch::memory::USER_SLOTS {
+    if slot_in_range(slot) {
         USER_INPUT_PARKED[slot].store(false, Ordering::Release);
         USER_INPUT_RESUMES[slot].store(0, Ordering::Relaxed);
         // D-3 RESUMEPAINT: a dead slot's pending resume witness dies with it — the next tenant must
@@ -6171,7 +6170,7 @@ pub fn user_input_depth(active: u64) -> u32 {
         return 0;
     }
     let slot = (active - 1) as usize;
-    if slot >= crate::arch::memory::USER_SLOTS {
+    if !slot_in_range(slot) {
         return 0;
     }
     USER_INPUT_TAIL[slot]
@@ -6446,7 +6445,7 @@ fn wc_close_click(win: crate::video::wm::WinId, owner: u64) -> &'static str { //
     // (see that field), so the owner IS the key — no arithmetic, and therefore no bias to get wrong.
     // Kernel furniture (`is_kernel_owner`) and owner 0 can never match a live row and fall out here.
     let mut target: Option<u64> = None;
-    for pi in 0..MAX_PROCS {
+    for pi in 0..procs_rows() {
         if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING
             && PROCS[pi].slot.load(Ordering::Acquire) as u64 == owner
         {
@@ -8832,7 +8831,7 @@ pub fn wmdirect_selftest() {
     // its no-process arm, and report NOPROC — while `close_owner` still removes the row, which is the
     // "closing the windows was the whole effect" contract.
     CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NONE_X86, Ordering::Release);
-    let owner_c: u64 = { let mut pick = (MAX_PROCS as u64) + 1; let mut cand = MAX_PROCS as u64; while cand >= 1 { let mut live = false; for pi in 0..MAX_PROCS { if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && PROCS[pi].slot.load(Ordering::Acquire) as u64 == cand { live = true; break; } } if !live { pick = cand; break; } cand -= 1; } pick }; // TESTFIX2 — the close leg's owner must carry NO live Proc row: `OWNER_D`=3 (slot 2) is free headless but a REAL process holds it under the live desktop (boot 17 `close=false`: `wc_close_click` took the KILL arm, settle=KILLED not NOPROC, and killed a live window's process). Pick a free slot.
+    let owner_c: u64 = { let top = crate::arch::memory::user_slots().max(1) as u64; let mut pick = top + 1; let mut cand = top; while cand >= 1 { let mut live = false; for pi in 0..procs_rows() { if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && PROCS[pi].slot.load(Ordering::Acquire) as u64 == cand { live = true; break; } } if !live { pick = cand; break; } cand -= 1; } pick }; // TESTFIX2 — the close leg's owner must carry NO live Proc row: `OWNER_D`=3 (slot 2) is free headless but a REAL process holds it under the live desktop (boot 17 `close=false`: `wc_close_click` took the KILL arm, settle=KILLED not NOPROC, and killed a live window's process). Pick a free slot.
     let wc = wm::create(owner_c, s, len, wm::FIX_W as u32, wm::FIX_H as u32, wm::FIX_STRIDE as u32, b"wmc");
     let close_ok = if wc == wm::WIN_NONE {
         None
@@ -10256,7 +10255,7 @@ fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
     let Some(grantee_slot) = PROCS[pi].slot.load(Ordering::Acquire).checked_sub(1) else {
         return ECHILD; // no private slot recorded (a shared-window task is not a grant recipient)
     };
-    if grantee_slot >= crate::arch::memory::USER_SLOTS {
+    if !slot_in_range(grantee_slot) {
         return ECHILD; // defensive: never the shared row (sys_spawn only records private slots)
     }
     let grantee_gen = SLOT_GEN[grantee_slot].load(Ordering::Acquire);
@@ -11616,39 +11615,32 @@ const NFILE: usize = 4; // open files per task (small, static — the demo opens
 /// Per-descriptor presence: `true` == `[row][idx]` holds a live open file. Claimed (CAS false->true) in
 /// `files_alloc`, cleared in `files_free`/`clear_files_row`. The single source of truth for "is this
 /// file-id valid" — `sys_read` re-checks it after decoding a handle's file-id (defense in depth).
-static FILE_USED: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicBool::new(false) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_USED: crate::procslot::SlotVec<[AtomicBool; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicBool::new(false) }; NFILE], [const { AtomicBool::new(false) }; NFILE]);
 /// The open file's STAGED-SET index (which staged source serves it — the x86 stand-in for pi4's
 /// `FILE_CLUSTER` chain head). Meaningful only where `FILE_USED`.
-static FILE_STAGED: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_STAGED: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// The open file's total byte size (the EOF bound `sys_read` clamps against). Meaningful only where `FILE_USED`.
-static FILE_SIZE: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_SIZE: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// The sequential read/write offset — advanced by exactly the count each `sys_read`/`sys_write` delivers,
 /// or set absolutely by `SYS_SEEK` (U9x). Meaningful only where `FILE_USED`. Always kept `<= FILE_SIZE`:
 /// reads/writes clamp to the bytes remaining, and `sys_seek` rejects an offset past `size` with `-EINVAL`.
-static FILE_OFFSET: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_OFFSET: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// U9x: the open file's WRITABLE staging-pool slot, `+1`-biased (`0` == a READ-ONLY descriptor with no
 /// writable buffer). Set by `files_alloc` when a File is opened RW; a File `SYS_WRITE` overwrites
 /// `WSTAGE_BUF[wstage-1]` in place, and `SYS_READ` serves from it (read-back witnesses writes). The x86
 /// stand-in for pi4's on-disk backing — pi4 writes straight to FAT in-handler (PIO), x86 CANNOT (the
 /// IF-masked handler / hlt-ing xHCI BOT pump), so the write lands in this in-memory buffer instead. M2 adds
 /// the BSP flush pump that persists it to FAT. Meaningful only where `FILE_USED`.
-static FILE_WSTAGE: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_WSTAGE: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// U9x M2: the open file's on-disk FAT chain head (the flush target for a dirty RW descriptor), captured at
 /// `sys_open` from `staged_cluster(sidx)`. `0` == no disk backing (in-memory mode / no FAT) — a dirty write
 /// on a `0`-cluster descriptor is never flushed. The x86 twin of pi4's `FILE_CLUSTER`. Meaningful where `FILE_USED`.
-static FILE_CLUSTER: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_CLUSTER: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// U9x M2: the descriptor's DIRTY flag — set by `sys_write_file` when a File write lands in the writable
 /// staging buffer. A dirty descriptor's bytes are flushed to disk at whole-task TEARDOWN (`clear_files_row`
 /// enqueues them for the launcher's IF=1 flush pump); a REVOKE / open-unwind (`files_free`) DISCARDS them
 /// (revoke repudiates the write — the brief's revoke ordering). Meaningful where `FILE_USED`.
-static FILE_DIRTY: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicBool::new(false) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_DIRTY: crate::procslot::SlotVec<[AtomicBool; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicBool::new(false) }; NFILE], [const { AtomicBool::new(false) }; NFILE]);
 /// U9x M2: the dirty byte range [LO, HI) covering every byte the descriptor's writes touched — the exact span
 /// the flush persists. `fat::write_at` read-modify-writes precisely the SECTORS this span overlaps; for the
 /// demo's single contiguous write that is exactly one sector (ALL it dirtied, NONE it didn't). NOTE: two
@@ -11657,10 +11649,8 @@ static FILE_DIRTY: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
 /// byte-for-byte); a future writable file whose staged image diverges from disk would need per-run tracking.
 /// Set FRESH on the first write (NOT min/max'd against the 0 init — else the first write's range would start
 /// at offset 0 and RMW an un-dirtied sector); widened on later writes. Meaningful where `FILE_USED && FILE_DIRTY`.
-static FILE_DIRTY_LO: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
-static FILE_DIRTY_HI: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_DIRTY_LO: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
+static FILE_DIRTY_HI: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// U11x: per-descriptor GENERATION counter. A `File` handle's value word packs `(gen << 32) | (idx + 1)`, and
 /// `file_desc_validate` rejects a handle whose packed gen != the slot's CURRENT gen — so a stale sibling handle
 /// to a slot that was freed (e.g. by a File revoke or SYS_CLOSE) and then FIRST-FIT-REUSED by a different file is
@@ -11670,8 +11660,7 @@ static FILE_DIRTY_HI: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] 
 /// generation. Const-init `0`; monotone within a boot (a u32 wrap is ~4 billion frees away — unreachable for the
 /// demo). Acquire/Release-paired with `FILE_USED` (published last on alloc, cleared on free) so a validator that
 /// sees a live slot sees its gen. Meaningful for every slot (a fresh, never-freed slot reads gen 0). ---
-static FILE_GEN: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_GEN: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 
 /// U10: the descriptor's GROWABLE-file identity — a `+1`-biased index into `U10_NAMES` (`0` == NOT growable).
 /// Set at `sys_open` for a RW open of a growable file (staged GROW.BIN, or a runtime-CREATED file); NEVER for
@@ -11680,20 +11669,17 @@ static FILE_GEN: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
 /// AND a RW holder of a non-growable file can never mint a deferred op targeting a DIFFERENT file (the deferred
 /// Grow/CreateGrow/CreateGrowDelete op always names the descriptor's OWN file, resolved through THIS field — the
 /// handle->file binding the single CAP_WRITE CHECK gives). Reset (to 0) on every alloc/free/teardown.
-static FILE_OPNAME: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_OPNAME: crate::procslot::SlotVec<[AtomicU32; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NFILE], [const { AtomicU32::new(0) }; NFILE]);
 /// U10: the descriptor GREW past its original EOF (a `sys_write_file` grow branch fired). Routes the dirty
 /// descriptor to a deferred `Grow` op (in-place `fat::write_grow`, allocating+chaining as needed) at teardown
 /// instead of the U9x in-place `write_at` flush. Reset on every alloc/free/teardown. Meaningful where `FILE_USED`.
-static FILE_GREW: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicBool::new(false) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_GREW: crate::procslot::SlotVec<[AtomicBool; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicBool::new(false) }; NFILE], [const { AtomicBool::new(false) }; NFILE]);
 /// U10 M2/M3: the descriptor names a runtime-CREATED file (O_CREAT of a name absent from the staged set), not a
 /// staged-backed one. Routes teardown to a `CreateGrow` deferred op (create the dir entry + grow-from-empty on
 /// disk). ALSO the ONLY thing that admits `sys_unlink` (a staged/immutable file — e.g. HELLO.BIN ring-3 code — has
 /// `FILE_CREATED == false` and is refused with `-EACCES`), so it MUST reset on slot reuse or a recycled slot
 /// would let an unrelated staged RW open be unlinked. Reset on every alloc/free/teardown. Where `FILE_USED`.
-static FILE_CREATED: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicBool::new(false) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_CREATED: crate::procslot::SlotVec<[AtomicBool; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicBool::new(false) }; NFILE], [const { AtomicBool::new(false) }; NFILE]);
 
 /// STOR-1 S7: the descriptor names a DYNAMIC on-disk file — a PRE-EXISTING file on the mounted FAT volume
 /// that is neither in the staged set nor a U10 created name. Opened READ-ONLY (`open_dynamic_ondisk`), it
@@ -11705,16 +11691,14 @@ static FILE_CREATED: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] 
 /// dynamic path off), so the whole dynamic mechanism is `irqstorage`-gated — a knob-off build has neither
 /// this nor `FILE_DYNNAME` (and never enters the dynamic branch). Meaningful where `FILE_USED`.
 #[cfg(feature = "irqstorage")]
-static FILE_DYNLEN: [[AtomicU8; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU8::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_DYNLEN: crate::procslot::SlotVec<[AtomicU8; NFILE]> = crate::procslot::SlotVec::new(|| [const { AtomicU8::new(0) }; NFILE], [const { AtomicU8::new(0) }; NFILE]);
 /// STOR-1 S7: the dynamic on-disk descriptor's 8.3 name (`[..FILE_DYNLEN]`), the read source `sys_read`
 /// resolves live. Written ONCE at open by the descriptor's own task (before the handle publish — the
 /// FILE_OPNAME/FILE_CREATED stamping discipline), then read-only for the descriptor's life; published via
 /// the `FILE_DYNLEN` Release/Acquire pair. `static mut` (a byte matrix, like `HELLO_BYTES`/`U10_BUF`);
 /// single-writer per `[row][idx]` at any instant (the FILES-row discipline), so raw access is sound.
 #[cfg(feature = "irqstorage")]
-static mut FILE_DYNNAME: [[[u8; MAX_NAME]; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
-    [[[0u8; MAX_NAME]; NFILE]; crate::arch::memory::USER_SLOTS + 1];
+static FILE_DYNNAME: crate::procslot::SlotVec<DynNames> = crate::procslot::SlotVec::new(|| DynNames::ZERO, DynNames::ZERO); // WINDOWCAP3 (B399): per-slot, heap-grown
 
 /// U11x M2 (was U10 M3's per-row overlay): GLOBAL per-U10-name "this created file was UNLINKED" flag — the x86
 /// twin of pi4's 0xE5'd directory entry. `sys_unlink` sets it IN-HANDLER, so the name vanishes for EVERY row
@@ -12805,7 +12789,7 @@ fn files_free(row: usize, idx: usize) {
 /// descriptor's writable staging slot is freed too. `slot` is a PRIVATE slot (0..USER_SLOTS); `SHARED_ROW`
 /// is never torn down (its opens persist, like its caps).
 fn clear_files_row(slot: usize) {
-    debug_assert!(slot < crate::arch::memory::USER_SLOTS, "clear_files_row: not a private slot");
+    debug_assert!(slot_in_range(slot), "clear_files_row: not a private slot");
     // STOR-1 S4c: may an S4 synchronous last-close DELETE block on the storage service task in THIS teardown?
     // Only when this is NOT the current task tearing down its OWN address space — `exit`/reap runs IF=0
     // mid-death (blocking there would resume a task whose CR3 is being freed: corruption) and the scheduler
@@ -12971,12 +12955,12 @@ fn created_desc_any_row(prefer_row: usize, nameid: u32) -> Option<(usize, usize)
                 && FILE_OPNAME[r][k].load(Ordering::Acquire) == nameid + 1
         })
     };
-    if prefer_row < crate::arch::memory::USER_SLOTS {
+    if slot_in_range(prefer_row) {
         if let Some(k) = find_in(prefer_row) {
             return Some((prefer_row, k));
         }
     }
-    (0..crate::arch::memory::USER_SLOTS)
+    (0..crate::arch::memory::user_slots())
         .filter(|&r| r != prefer_row)
         .find_map(|r| find_in(r).map(|k| (r, k)))
 }
@@ -13229,7 +13213,7 @@ fn dyn_name_set(row: usize, idx: usize, name: &[u8]) -> usize {
     // SAFETY: single-writer per slot (this task, pre-handle-publish); the slot is in range (`files_alloc`
     // returned `idx < NFILE`, `row` is the caller's row).
     unsafe {
-        let dst = (&raw mut FILE_DYNNAME[row][idx]).cast::<u8>();
+        let dst = (*FILE_DYNNAME[row].0.get())[idx].as_mut_ptr();
         core::ptr::copy_nonoverlapping(name.as_ptr(), dst, n);
     }
     FILE_DYNLEN[row][idx].store(n as u8, Ordering::Release); // publish LAST — the name bytes are now visible
@@ -13248,7 +13232,7 @@ fn dyn_name_get(row: usize, idx: usize, out: &mut [u8; MAX_NAME]) -> usize {
     // SAFETY: `FILE_DYNNAME` is written once before the handle that reached this read was published, and the
     // name is stable for the descriptor's life (dynamic descriptors are read-only), so this read races nothing.
     unsafe {
-        let src = (&raw const FILE_DYNNAME[row][idx]).cast::<u8>();
+        let src = (*FILE_DYNNAME[row].0.get())[idx].as_ptr();
         core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
     }
     n
@@ -13796,20 +13780,15 @@ const XFER_REVOKED_BIT: u64 = 1 << 63;
 /// The inbox slot's STATE word: 0 = free, `HANDLE_RESERVING` = mid-claim, else = the transfer id (live).
 /// `USER_SLOTS + 1` rows for index symmetry with HANDLES; the SHARED_ROW row exists but is refused as an
 /// endpoint (see the section note), so it stays permanently clear.
-static XFER_SLOT_TX: [[AtomicU64; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+static XFER_SLOT_TX: crate::procslot::SlotVec<[AtomicU64; NXFER]> = crate::procslot::SlotVec::new(|| [const { AtomicU64::new(0) }; NXFER], [const { AtomicU64::new(0) }; NXFER]);
 /// The pending descriptor: what kind of object the transferred cap names. Meaningful only where TX is live.
-static XFER_SLOT_KIND: [[AtomicU8; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU8::new(KIND_EMPTY) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+static XFER_SLOT_KIND: crate::procslot::SlotVec<[AtomicU8; NXFER]> = crate::procslot::SlotVec::new(|| [const { AtomicU8::new(KIND_EMPTY) }; NXFER], [const { AtomicU8::new(KIND_EMPTY) }; NXFER]);
 /// The pending descriptor's target payload (the value word the received handle will carry).
-static XFER_SLOT_TARGET: [[AtomicU64; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+static XFER_SLOT_TARGET: crate::procslot::SlotVec<[AtomicU64; NXFER]> = crate::procslot::SlotVec::new(|| [const { AtomicU64::new(0) }; NXFER], [const { AtomicU64::new(0) }; NXFER]);
 /// The pending descriptor's (already attenuated) rights.
-static XFER_SLOT_RIGHTS: [[AtomicU32; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+static XFER_SLOT_RIGHTS: crate::procslot::SlotVec<[AtomicU32; NXFER]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NXFER], [const { AtomicU32::new(0) }; NXFER]);
 /// The record index + 1 backing this pending transfer (0 = none — a kernel bug on a live slot).
-static XFER_SLOT_REC: [[AtomicU32; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+static XFER_SLOT_REC: crate::procslot::SlotVec<[AtomicU32; NXFER]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NXFER], [const { AtomicU32::new(0) }; NXFER]);
 
 /// A record's STATE word: 0 = free, `HANDLE_RESERVING` = mid-claim, `txid` = the live transfer it
 /// ledgers, `txid | XFER_REVOKED_BIT` = that transfer, revoked (read by `handle_resolve` — the received
@@ -13826,8 +13805,7 @@ static XFER_NEXT_TX: AtomicU64 = AtomicU64::new(1);
 /// revocation hook `handle_resolve` reads. Keyed `[row][idx]` like the other handle sidecars, and — the
 /// point — written ONLY by the row's own task (`sys_recv`) or its teardown: the sender reaches a received
 /// cap exclusively through the record, never through this row.
-static HANDLE_XFER_REC: [[AtomicU32; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
+static HANDLE_XFER_REC: crate::procslot::SlotVec<[AtomicU32; NHANDLE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NHANDLE], [const { AtomicU32::new(0) }; NHANDLE]);
 
 /// Claim a free transfer record and mint its transfer id: CAS the state word 0 -> RESERVING, publish the
 /// sender (Release), then the tx LAST (live-last, the handle_install discipline; the revoked flag needs no
@@ -13999,7 +13977,7 @@ fn sys_xfer_from(row: usize, dest: u64, src: u64, req_rights: u64) -> i64 {
     let Some(dst_row) = PROCS[pi].slot.load(Ordering::Acquire).checked_sub(1) else {
         return ECHILD;
     };
-    if dst_row >= crate::arch::memory::USER_SLOTS {
+    if !slot_in_range(dst_row) {
         return ECHILD; // never a private row (defensive; sys_spawn only records private slots)
     }
     // U8x: snapshot the recipient's inbox GENERATION before depositing — the deposit is stamped with it,
@@ -14250,17 +14228,14 @@ static DERIV_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Which derivation node (index + 1; 0 = a root with no node yet) a handle's capability is. Keyed
 /// `[row][idx]` like every handle sidecar; written only by the row's own task (mid-syscall) or its teardown.
-static HANDLE_DERIV: [[AtomicU32; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
+static HANDLE_DERIV: crate::procslot::SlotVec<[AtomicU32; NHANDLE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NHANDLE], [const { AtomicU32::new(0) }; NHANDLE]);
 
 /// The derivation node riding a PENDING deposit (index + 1) — ownership passes inbox-slot -> received handle
 /// at RECV; every discard path (revoked-pending, generation-stale, retract, teardown sweep) drops it instead.
-static XFER_SLOT_DERIV: [[AtomicU32; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+static XFER_SLOT_DERIV: crate::procslot::SlotVec<[AtomicU32; NXFER]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NXFER], [const { AtomicU32::new(0) }; NXFER]);
 /// The recipient GENERATION stamped into a pending deposit — RECV delivers only on an exact match with the
 /// recipient's CURRENT generation (see `SLOT_GEN`).
-static XFER_SLOT_GEN: [[AtomicU64; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+static XFER_SLOT_GEN: crate::procslot::SlotVec<[AtomicU64; NXFER]> = crate::procslot::SlotVec::new(|| [const { AtomicU64::new(0) }; NXFER], [const { AtomicU64::new(0) }; NXFER]);
 
 /// The transfer record's derivation node (index + 1) + that node's ID at publish time — what
 /// `sys_cap_xrevoke` marks so the revoke reaches everything DERIVED from the transferred cap (re-grants,
@@ -14274,8 +14249,7 @@ static XFER_REC_DERIV_ID: [AtomicU64; MAX_XFERS] = [const { AtomicU64::new(0) };
 /// teardown's inbox sweep — so any deposit stamped with the old generation is dead-on-arrival for the slot's
 /// next tenant even if it lands after the sweep passed its slot. `SHARED_ROW` never tears down. Sized
 /// `USER_SLOTS + 1` for index symmetry with the other row-keyed sidecars.
-static SLOT_GEN: [AtomicU64; crate::arch::memory::USER_SLOTS + 1] =
-    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS + 1];
+static SLOT_GEN: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 
 /// Claim a free derivation node under `parent_ref` (a node index + 1, or 0 for a root): CAS the ID word
 /// 0 -> RESERVING, publish the edge + zeroed counters, bump the parent's KIDS (the parent is pinned — the
@@ -14510,7 +14484,7 @@ struct Proc {
 /// PROCREAP — raised 4 -> 6, matching aarch64's PROCS-6, so the operator can keep a panel of
 /// background programs and still launch. What the raise had to clear on THIS arch:
 ///   * EVERY consumer is parametric. `proc_reserve`/`proc_free`/`proc_find_*`/`bg_poll`/`bg_kill` and
-///     the BGRUN-SCAV sweep are all `0..MAX_PROCS`; the semaphore reservations are `for p in &PROCS`.
+///     the BGRUN-SCAV sweep are all `0..procs_rows()`; the semaphore reservations are `for p in &PROCS`.
 ///     `BG_KILLS` is `[Option<BgKill>; MAX_PROCS]` and widens with it. There is no bitmap, no packed
 ///     index and no fixed-width field keyed on the old 4.
 ///   * ADDRESS SPACES still bind last. Each live row costs one ring-3 slot out of
@@ -14541,42 +14515,29 @@ struct Proc {
 ///     line again.
 /// Everything else was already parametric and needed no edit: the reserve/free/find/census loops,
 /// `BG_KILLS`, and the per-slot sidecar arrays.
-const MAX_PROCS: usize = crate::arch::memory::USER_SLOTS - 2; // WINDOWCAP (B378, R90) — ⚠ SAME-LINE fold: derived from the address-space pool (its 2-slot reserve kept), not written down; the live limit is `video::wincap::proc_limit()`
-static PROCS: [Proc; MAX_PROCS] = [const {
-    Proc {
-        pid: AtomicU64::new(0),
-        status: AtomicI32::new(0),
-        state: AtomicU8::new(PFREE),
-        slot: AtomicUsize::new(0),
-        done: crate::arch::sched::Semaphore::new(0),
-        bg_owned: AtomicBool::new(false),
-    }
-}; MAX_PROCS];
-
-/// PROCREAP: the cap's two structural neighbours, enforced at compile time rather than left to a
-/// comment. A row that cannot be given an address space can only ever hand back `-EAGAIN` from deeper
-/// in the launch, and a background row that cannot own a window is one the compositor would refuse.
-const _: () = {
-    // Strictly below, by the margin the doc above actually promises: two slots kept free so a
-    // foreground `run` and the fixtures' scratch tenancies can still get an address space with every
-    // background row occupied. `< USER_SLOTS` alone would permit 7, which satisfies the letter of
-    // "leaves slots free" while starving exactly the two callers that need one.
-    assert!(
-        MAX_PROCS <= crate::arch::memory::USER_SLOTS - 2,
-        "MAX_PROCS must leave 2 ring-3 slots free"
-    );
-    assert!(
-        MAX_PROCS <= WIN_MAX,
-        "every bg program must be able to own a window" // WINDOWCAP-2: against the ring-3 table (the compositor's has no width)
-    );
-};
+// WINDOWCAP3 (B399, R90) — there is no MAX_PROCS: the table is a heap-grown `SegVec`, a row is appended when
+// none is free or reclaimable, and the live limit is memory's (`video::wincap::proc_limit`, asked by
+// `sys_spawn` before `proc_reserve`). A row index is bounded by the slot TYPE (every program owns a slot).
+static PROCS: crate::video::rowstore::SegVec<Proc> = crate::video::rowstore::SegVec::new(|| Proc {
+    pid: AtomicU64::new(0),
+    status: AtomicI32::new(0),
+    state: AtomicU8::new(PFREE),
+    slot: AtomicUsize::new(0),
+    done: { let d = crate::arch::sched::Semaphore::new(0); d.init(); d }, // waiter capacity reserved at the row's birth (process context)
+    bg_owned: AtomicBool::new(false),
+});
+/// WINDOWCAP3: rows the process table has ever grown to — every `Proc` sweep's bound.
+#[inline]
+fn procs_rows() -> usize {
+    PROCS.hwm()
+}
 
 /// Claim a FREE Proc entry, returning its index. The CAS on `state` (FREE->RUNNING) is the atomic
 /// ownership token; the pid=0 placeholder is overwritten with the real child pid (Release) by
 /// `sys_spawn` AFTER the child is spawned (the child cannot be dispatched until the parent yields, so
 /// the real pid is always in place before any lookup). `None` if the table is full (-> -EAGAIN).
 fn proc_reserve() -> Option<usize> {
-    for i in 0..MAX_PROCS {
+    for i in 0..procs_rows() {
         if PROCS[i]
             .state
             .compare_exchange(PFREE, PRUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -14588,6 +14549,9 @@ fn proc_reserve() -> Option<usize> {
             PROCS[i].bg_owned.store(false, Ordering::Release);
             return Some(i);
         }
+    }
+    if let Some(i) = proc_reserve_grow() {
+        return Some(i); // WINDOWCAP3 (B399): no free row — the table grows before it scavenges
     }
     // BGRUN-SCAV (ported from `arch::aarch64::syscall::proc_reserve`): no FREE row. Before failing,
     // reclaim a row belonging to a BACKGROUND program that has ALREADY EXITED and that nobody has
@@ -14613,7 +14577,7 @@ fn proc_reserve() -> Option<usize> {
     //     `bg_poll(reap = true)` consumes it — a reused entry must start at zero permits — and with
     //     `try_wait`, not `wait`: this must never park under a caller that may hold a lock, and a row
     //     whose permit is somehow absent must cost a dropped permit, not the shell task.
-    for i in 0..MAX_PROCS {
+    for i in 0..procs_rows() {
         if !PROCS[i].bg_owned.load(Ordering::Acquire) {
             continue;
         }
@@ -14672,7 +14636,7 @@ fn proc_table_full_reason() -> &'static str {
 /// through a per-task `Arc<KillSwitch>`, never parked in a table), so the fourth field is always 0.
 pub fn proc_table_headroom() -> (usize, usize, usize, usize) {
     let (mut free, mut running, mut exited) = (0usize, 0usize, 0usize);
-    for i in 0..MAX_PROCS {
+    for i in 0..procs_rows() {
         match PROCS[i].state.load(Ordering::Acquire) {
             PFREE => free += 1,
             PRUNNING => running += 1,
@@ -14688,14 +14652,14 @@ pub fn proc_table_headroom() -> (usize, usize, usize, usize) {
 /// PROCREAP: the process-table cap — the denominator for [`proc_table_headroom`]. See the `MAX_PROCS`
 /// block for why it is 10 and why moving it is an arc, not a tuning step (HEADROOM raised it 6 -> 10;
 /// `shell`'s `storm` clamp is derived from THIS function so the two cannot drift apart again).
-pub const fn proc_table_rows() -> usize {
-    MAX_PROCS
+pub fn proc_table_rows() -> usize {
+    crate::video::wincap::proc_limit() // WINDOWCAP3 (B399): the denominator is memory's limit — the table itself has no width
 }
 
 /// Find the RUNNING Proc entry whose pid matches — the child-exit / child-kill lookup. Called with a
 /// live task id (`> 0`), so it never spuriously matches a fresh claim's pid=0 placeholder.
 fn proc_find_running(pid: u64) -> Option<usize> {
-    (0..MAX_PROCS).find(|&i| {
+    (0..procs_rows()).find(|&i| {
         PROCS[i].state.load(Ordering::Acquire) == PRUNNING
             && PROCS[i].pid.load(Ordering::Acquire) == pid
     })
@@ -14704,7 +14668,7 @@ fn proc_find_running(pid: u64) -> Option<usize> {
 /// Find the non-FREE (RUNNING or EXITED) Proc entry whose pid matches — the sys_wait lookup. `None`
 /// => the caller has no such child.
 fn proc_find_child(pid: u64) -> Option<usize> {
-    (0..MAX_PROCS).find(|&i| {
+    (0..procs_rows()).find(|&i| {
         // REVIEW-1: `!= PFREE` would have admitted `PREAPING` — a row some releaser is settling, whose
         // `done` permit is already spoken for. A `sys_wait` landing on one would park on a permit that
         // will never come. A row being released is not a waitable child; only these two states are.
@@ -14773,12 +14737,11 @@ const HANDLE_RESERVING: u64 = u64::MAX;
 /// so `current_slot()` is None and they have no private slot). One extra row (index `USER_SLOTS`) gives
 /// them a home for the console cap `setup()` endows; `caller_row()` maps None -> `SHARED_ROW`. This row
 /// is never torn down, so its endowment persists for the whole boot.
-const SHARED_ROW: usize = crate::arch::memory::USER_SLOTS;
+const SHARED_ROW: usize = crate::procslot::SHARED_ROW; // WINDOWCAP3 (B399): the shared row is a sentinel past every slot, no longer index `USER_SLOTS`
 /// `HANDLES[row][idx]`: 0 (Empty), a child pid (`Child`), `HANDLE_CONSOLE` (the console resource), or
 /// `HANDLE_RESERVING` (an in-flight `sys_spawn` reservation). `USER_SLOTS + 1` rows: one per private slot
 /// plus `SHARED_ROW`.
-static HANDLES: [[AtomicU64; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
+static HANDLES: crate::procslot::SlotVec<[AtomicU64; NHANDLE]> = crate::procslot::SlotVec::new(|| [const { AtomicU64::new(0) }; NHANDLE], [const { AtomicU64::new(0) }; NHANDLE]);
 
 // =============================================================================================
 // U5x — handles as CAPABILITIES: rights, a resource target beyond "child pid", the enforcement CHECK,
@@ -14833,8 +14796,7 @@ const CONSOLE_FD: usize = 1;
 /// `0`/`RESERVING` sentinel semantics and the rights ride alongside. Written Release beside the value
 /// store (rights published BEFORE the value that makes a handle live, so a resolver that observes the
 /// value also observes the rights), cleared in `handle_clear`/`clear_handle_row`. `0` == an inert handle.
-static HANDLE_RIGHTS: [[AtomicU32; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
+static HANDLE_RIGHTS: crate::procslot::SlotVec<[AtomicU32; NHANDLE]> = crate::procslot::SlotVec::new(|| [const { AtomicU32::new(0) }; NHANDLE], [const { AtomicU32::new(0) }; NHANDLE]);
 
 // ---------------------------------------------------------------------------------------------
 // U6x — the general OBJECT descriptor: a handle is (kind, target, rights), first-free allocated for ALL
@@ -14865,8 +14827,7 @@ const KIND_SOCKET: u8 = 4; // U6x scaffold: a socket object (value word = an opa
 /// with Release BEFORE the value store that makes a handle live (so a resolver observing the live value
 /// also observes the kind), cleared in `handle_clear`/`clear_handle_row`. `KIND_EMPTY` (0) == an
 /// inert/absent slot (the const-init).
-static HANDLE_KIND: [[AtomicU8; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicU8::new(KIND_EMPTY) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
+static HANDLE_KIND: crate::procslot::SlotVec<[AtomicU8; NHANDLE]> = crate::procslot::SlotVec::new(|| [const { AtomicU8::new(KIND_EMPTY) }; NHANDLE], [const { AtomicU8::new(KIND_EMPTY) }; NHANDLE]);
 
 /// What a resolved handle NAMES — the general object descriptor's kind + payload. `Child(pid)` (U4x) and
 /// `Console` (U5x) are the live kinds every consumer routes through; `File(id)`/`Socket(id)` are U6x
@@ -15019,7 +14980,7 @@ fn handle_row_is_clear(row: usize) -> bool {
 /// and populate the row between the clear and the release. `slot` is a PRIVATE slot (0..USER_SLOTS);
 /// `SHARED_ROW` is never torn down.
 pub fn clear_handle_row(slot: usize) {
-    debug_assert!(slot < crate::arch::memory::USER_SLOTS, "clear_handle_row: not a private slot");
+    debug_assert!(slot_in_range(slot), "clear_handle_row: not a private slot");
     // U8x: bump this slot's inbox GENERATION first — strictly BEFORE the inbox sweep below — so every
     // deposit stamped for the dying tenant is dead-on-arrival for the slot's next tenant even if it lands
     // after the sweep passed its slot (RECV verifies the stamp; the sender's post-check re-reads this word).
@@ -15718,8 +15679,8 @@ struct U4xDemo {
 fn u4x_setup() -> Option<U4xDemo> {
     // Reserve each Proc semaphore's waiter capacity (the park-side push must not reallocate under the
     // held lock). Done before any child can block a parent on it.
-    for p in &PROCS {
-        p.done.init();
+    for i in 0..procs_rows() {
+        PROCS[i].done.init(); // WINDOWCAP3: a grown row arrives initialised (`PROCS`' row builder); this re-run is idempotent
     }
     let mut slots = [0usize; 2];
     if !crate::arch::memory::alloc_user_spaces(&mut slots) {
@@ -16007,8 +15968,8 @@ struct U6xDemo {
 fn u6x_setup() -> Option<U6xDemo> {
     // Reserve each Proc semaphore's waiter capacity before any child can block the parent on it (the
     // u4x_setup discipline; idempotent when u4x already ran, which it has by the U5x -> U6x gate chain).
-    for p in &PROCS {
-        p.done.init();
+    for i in 0..procs_rows() {
+        PROCS[i].done.init(); // WINDOWCAP3: a grown row arrives initialised (`PROCS`' row builder); this re-run is idempotent
     }
     let slot = crate::arch::memory::alloc_user_space()?;
     let blob_start = &raw const unaos_user_u6x_blob_start as usize;
@@ -16838,8 +16799,7 @@ struct BgKill {
 /// WINX-2: the background kill registry. Bounded by `MAX_PROCS` — a bg job always owns a Proc row, so a
 /// row is the binding resource and this can never need to be larger. Guarded by a plain `SpinMutex`
 /// (never taken from an IRQ-masked path: only the shell task and the `run` deadline arm touch it).
-static BG_KILLS: SpinMutex<[Option<BgKill>; MAX_PROCS]> =
-    SpinMutex::new([const { None }; MAX_PROCS]);
+static BG_KILLS: SpinMutex<alloc::vec::Vec<Option<BgKill>>> = SpinMutex::new(alloc::vec::Vec::new()); // WINDOWCAP3 (B399): grows with the process table
 
 /// WINX-2: record a live job's kill handle. Drops the oldest completed entry if the table is full, which
 /// cannot lose a live job (the table is sized to `MAX_PROCS` and every live job holds a Proc row).
@@ -16852,7 +16812,9 @@ fn bg_kill_register(pid: u64, kill: alloc::sync::Arc<crate::arch::sched::KillSwi
     // Full: evict a reaped entry (its job is gone, so its switch is dead weight).
     if let Some(s) = t.iter_mut().find(|s| s.as_ref().is_some_and(|b| b.kill.is_reaped())) {
         *s = Some(BgKill { pid, kill });
+        return;
     }
+    t.push(Some(BgKill { pid, kill })); // WINDOWCAP3: a live job is never dropped for want of a row
 }
 
 /// WINX-2: take a job's kill handle out of the registry (the kill consumes it — a second `kill` on the
@@ -16883,6 +16845,9 @@ fn bg_kill_forget(pid: u64) {
 fn load_program_common(bytes: &[u8]) -> Result<(super::elf::Mapped, usize), &'static str> {
     if bytes.len() > user_image_cap() {
         return Err("image larger than the user image cap (USER_WINDOW_BYTES)");
+    }
+    if !proc_admit() {
+        return Err("process limit reached (R90: memory's limit, `[wm] limit` line) — the launcher was paused");
     }
     let Some(pi) = proc_reserve() else {
         // PROCREAP: `proc_reserve` has already run the BGRUN-SCAV sweep, so this refusal names what is
@@ -17107,7 +17072,7 @@ fn bg_place_cpu() -> usize {
 /// trusting a cached index: rows recycle, and a stale index could name a row that now belongs to someone
 /// else — the pid is the key every other lookup uses.
 pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
-    for pi in 0..MAX_PROCS {
+    for pi in 0..procs_rows() {
         // REVIEW-1: `PREAPING` skips too — a row another releaser is settling is already gone as far
         // as this caller is concerned, and falling through would report it `Running`.
         if !matches!(PROCS[pi].state.load(Ordering::Acquire), PRUNNING | PEXITED) {
@@ -17164,7 +17129,7 @@ pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
 /// Returns an operator string for the shell.
 pub fn bg_kill(pid: u64, _slot: u64) -> &'static str {
     let mut row: Option<usize> = None;
-    for pi in 0..MAX_PROCS {
+    for pi in 0..procs_rows() {
         // REVIEW-1: a `PREAPING` row is being released by someone else and is not a killable job.
         if matches!(PROCS[pi].state.load(Ordering::Acquire), PRUNNING | PEXITED)
             && PROCS[pi].pid.load(Ordering::Acquire) == pid
@@ -18882,7 +18847,7 @@ unaos_user_dmg_probe:
     mov  [r15 + 16], rax                      // sel 2 = the OWNER's window (planted)
     mov  rax, [rbx + 16]
     mov  [r15 + 24], rax                      // sel 3 = a provably-free row (planted)
-    mov  qword ptr [r15 + 32], 12             // sel 4 = WIN_MAX, the first out-of-range id
+    mov  qword ptr [r15 + 32], 0x7fffffff     // sel 4 = an id past any table the heap can grow (WINDOWCAP3: no WIN_MAX)
     mov  qword ptr [r15 + 40], -1             // sel 5 = u64::MAX, wildly out of range
 
     // (4) Report our own ids BACK through the param block, so the launcher can cross-check them
@@ -18980,7 +18945,7 @@ unaos_user_dmg_table:
     .quad 2, 64,  32                          // P13 EACCES — the owner's window, a MALFORMED band (ORDER)
     .quad 3, 0,   11                          // P14 EBADF  — a free row, a valid band
     .quad 3, 64,  32                          // P15 EBADF  — a free row, a malformed band (ORDER)
-    .quad 4, 0,   11                          // P16 EBADF  — id 12 == WIN_MAX, the first out-of-range id
+    .quad 4, 0,   11                          // P16 EBADF  — an id past the grown table
     .quad 5, 0,   11                          // P17 EBADF  — id u64::MAX
     .quad 0, 0,   128                         // P18 accept — LAST: the window still presents after 13 refusals
 
@@ -19035,12 +19000,12 @@ fn dmg_build(entry_sym: *const u8) -> Option<U7xFix> {
 /// DMG-REFUSE: the live window table, as two bitmaps — every OCCUPIED row, and the rows owned by slot
 /// `s`. This is the launcher's GROUND TRUTH: the expectation table is built from it and re-verified
 /// against it, so no probe is graded against a prediction.
-fn dmg_win_masks(s: usize) -> (u64, u64) { // WINDOWCAP-2: u64, WIN_MAX is the VA layout's count
+fn dmg_win_masks(s: usize) -> (u64, u64) { // WINDOWCAP3: u64 masks over the first DMG_MASK_ROWS rows (a row past the table is free)
     let _irq = IrqGuard::mask_save();
     let t = WINDOWS.lock();
     let mut occ = 0u64;
     let mut own = 0u64;
-    for i in 0..WIN_MAX {
+    for i in 0..t.len().min(DMG_MASK_ROWS) {
         if t[i].owner != WIN_OWNER_FREE {
             occ |= 1 << i;
             if t[i].owner == s {
@@ -19098,18 +19063,18 @@ fn dmg_refuse_witness(demo_cpu: usize) {
     }
 
     let presents_before = fb_present_count();
-    let (occ_entry, _) = dmg_win_masks(usize::MAX); const DMG_ROWS_NEEDED: u32 = 4; let free_entry = WIN_MAX as u32 - occ_entry.count_ones(); // DMGYIELD: the fixture's WHOLE claim on the table, read off its own steps — 1 row the owner takes, 2 the prober takes, 1 that must stay FREE as `id_free`. An EMPTY table was never the need; it was the sufficient condition that came free of charge while nothing else had launched, and since STARTHOLD every metal boot launches the desktop app first.
+    let (occ_entry, _) = dmg_win_masks(usize::MAX); const DMG_ROWS_NEEDED: u32 = 4; let free_entry = DMG_MASK_ROWS as u32 - occ_entry.count_ones(); // DMGYIELD: the fixture's WHOLE claim on the table, read off its own steps — 1 row the owner takes, 2 the prober takes, 1 that must stay FREE as `id_free`. An EMPTY table was never the need; it was the sufficient condition that came free of charge while nothing else had launched, and since STARTHOLD every metal boot launches the desktop app first.
     if free_entry < DMG_ROWS_NEEDED {
         serial_println!(
             ":: DMG-REFUSE: only {} of {} window rows are free at entry, fewer than the {} this fixture needs (occupied={:#04x}) — refusal witness NOT RUN ::",
-            free_entry, WIN_MAX, DMG_ROWS_NEEDED, occ_entry
+            free_entry, DMG_MASK_ROWS, DMG_ROWS_NEEDED, occ_entry
         );
         return;
     }
 
     serial_println!(
         ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refusal arms — two ring-3 slots, {} probes across -EBADF/-EACCES/-EINVAL and their accepting twins, yielding to occupied={:#04x} ({} of {} rows free) ::",
-        DMG_PROBES, occ_entry, free_entry, WIN_MAX
+        DMG_PROBES, occ_entry, free_entry, DMG_MASK_ROWS
     );
 
     // 2. The OWNER half. Its core: a sibling if the pool has one, else this demo's — neither half spins
@@ -19139,7 +19104,7 @@ fn dmg_refuse_witness(demo_cpu: usize) {
     let id_a = own_a.trailing_zeros() as u64;
     // The HIGHEST free row. `sys_win_create` scans lowest-first, so this row cannot be allocated to the
     // prober's two windows while lower rows remain free — it is free at plant time and provably stays so.
-    let Some(id_free) = (0..WIN_MAX).rev().find(|&i| occ_a & (1 << i) == 0).map(|i| i as u64).filter(|_| WIN_MAX as u32 - occ_a.count_ones() >= 3) else { // DMGYIELD: and the lowest-first argument needs THREE free rows here, not one — the prober's two plus this one strictly above them. Re-derived on `occ_a` rather than inherited from the entry count, because a co-tenant may have created a window while the owner was coming up.
+    let Some(id_free) = (0..win_rows().min(DMG_MASK_ROWS)).rev().find(|&i| occ_a & (1 << i) == 0).map(|i| i as u64).filter(|_| DMG_MASK_ROWS as u32 - occ_a.count_ones() >= 3) else { // DMGYIELD: and the lowest-first argument needs THREE free rows here, not one — the prober's two plus this one strictly above them. Re-derived on `occ_a` rather than inherited from the entry count, because a co-tenant may have created a window while the owner was coming up.
         serial_println!(
             ":: DMG-REFUSE: fewer than 3 free window rows once the owner has its own — the prober's two plus a free row to probe -EBADF with do not fit (occupied={:#04x}) — refusal witness NOT RUN ::",
             occ_a
@@ -19212,8 +19177,8 @@ fn dmg_refuse_witness(demo_cpu: usize) {
     let (_, own_probe) = dmg_win_masks(probe.slot);
     // The two ids below are RING 3's report, so they are bound-checked BEFORE they reach a shift — a
     // fixture bug must not become a kernel shift-overflow panic in the launcher that grades it.
-    let ids_ok = rep_b0 < WIN_MAX as u64
-        && rep_b1 < WIN_MAX as u64
+    let ids_ok = rep_b0 < DMG_MASK_ROWS as u64
+        && rep_b1 < DMG_MASK_ROWS as u64
         && rep_b0 != id_a
         && rep_b1 != id_a
         && rep_b0 != rep_b1;
@@ -19651,7 +19616,7 @@ fn pulsew_launcher(_demo_cpu: usize) {
 fn winx_slot_has_window(s: usize) -> bool {
     let _irq = IrqGuard::mask_save();
     let t = WINDOWS.lock();
-    (0..WIN_MAX).any(|i| t[i].owner == s)
+    t.iter().any(|e| e.owner == s)
 }
 
 // =============================================================================
@@ -23848,8 +23813,7 @@ pub fn u7x_probe_once() {
 static SESSION_USER: AtomicU32 = AtomicU32::new(0);
 /// LOGIN M1: per-slot user stamp, taken at load from `SESSION_USER` (0 = anonymous).
 #[cfg(feature = "login")]
-static SLOT_USER: [AtomicU32; crate::arch::memory::USER_SLOTS + 1] =
-    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS + 1];
+static SLOT_USER: crate::procslot::SlotVec<AtomicU32> = crate::procslot::SlotVec::new(|| AtomicU32::new(0), AtomicU32::new(0));
 /// LOGIN M1: the creator's user per owned name-id (0 = none), written beside `owned_set_owner`.
 #[cfg(feature = "login")]
 static OWNED_USER: [AtomicU32; N_U10_NAMES] = [const { AtomicU32::new(0) }; N_U10_NAMES];
@@ -23905,7 +23869,7 @@ pub fn session_name(out: &mut [u8]) -> Option<usize> {
 /// without the session that gave it.
 #[cfg(feature = "login")]
 fn slot_user_stamp(slot: usize) {
-    if slot <= crate::arch::memory::USER_SLOTS {
+    if row_known(slot) {
         SLOT_USER[slot].store(SESSION_USER.load(Ordering::Acquire), Ordering::Release);
         SLOT_EPOCH[slot].store(SESSION_EPOCH.load(Ordering::Acquire), Ordering::Release);
     }
@@ -23914,7 +23878,7 @@ fn slot_user_stamp(slot: usize) {
 /// LOGIN M1: clear `slot`'s user stamp at teardown, beside its generation bump.
 #[cfg(feature = "login")]
 fn slot_user_clear(slot: usize) {
-    if slot <= crate::arch::memory::USER_SLOTS {
+    if row_known(slot) {
         SLOT_USER[slot].store(0, Ordering::Release);
         SLOT_EPOCH[slot].store(0, Ordering::Release);
     }
@@ -23925,7 +23889,7 @@ fn slot_user_clear(slot: usize) {
 /// the logged-out user's name onto it — it creates anonymously, exactly as it opens anonymously.
 #[cfg(feature = "login")]
 fn owned_user_stamp(nameid: usize, slot: usize) {
-    if nameid < N_U10_NAMES && slot <= crate::arch::memory::USER_SLOTS {
+    if nameid < N_U10_NAMES && row_known(slot) {
         OWNED_USER[nameid].store(slot_user_live(slot), Ordering::Release);
     }
 }
@@ -23936,7 +23900,7 @@ fn owned_user_stamp(nameid: usize, slot: usize) {
 /// admit path: this whole function is only reached on a live-incarnation DENY.
 #[cfg(feature = "login")]
 fn owned_user_ok(nameid: usize, slot: usize) -> bool {
-    if nameid >= N_U10_NAMES || slot > crate::arch::memory::USER_SLOTS {
+    if nameid >= N_U10_NAMES || !row_known(slot) {
         return false;
     }
     let u = slot_user_live(slot);
@@ -23975,8 +23939,7 @@ static SESSION_EPOCH: AtomicU64 = AtomicU64::new(1); // SECLOGIN M5: u64 — a u
 
 /// SO37: the epoch each slot's user stamp was taken in (0 = never stamped, which never matches).
 #[cfg(feature = "login")]
-static SLOT_EPOCH: [AtomicU64; crate::arch::memory::USER_SLOTS + 1] =
-    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS + 1]; // SECLOGIN M5: u64 with SESSION_EPOCH
+static SLOT_EPOCH: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0)); // SECLOGIN M5: u64 with SESSION_EPOCH
 
 /// SO37: the LIVE epoch as a NUMBER, for the wire — never a decision. Read by `fs::users::logout`, so
 /// every Log Out names the epoch it just opened and a boot's session boundaries are countable on serial.
@@ -23989,7 +23952,7 @@ pub fn session_epoch() -> u64 {
 /// when the session it was stamped in has closed.
 #[cfg(feature = "login")]
 fn slot_user_live(slot: usize) -> u32 {
-    if slot > crate::arch::memory::USER_SLOTS
+    if !row_known(slot)
         || SLOT_EPOCH[slot].load(Ordering::Acquire) != SESSION_EPOCH.load(Ordering::Acquire)
     {
         return 0;
@@ -24005,9 +23968,9 @@ fn slot_user_live(slot: usize) -> u32 {
 /// table, away from the battery's first-fit launches. Cleaned up: row cleared, stamps cleared.
 #[cfg(feature = "loginst")]
 pub fn home_acl_fixture(user_id: u32) -> bool {
-    const A: usize = crate::arch::memory::USER_SLOTS - 2;
-    const B: usize = crate::arch::memory::USER_SLOTS - 1;
-    const C: usize = crate::arch::memory::USER_SLOTS;
+    const A: usize = crate::procslot::SLOT_ID_MAX - 2; // WINDOWCAP3 (B399): the top of the slot TYPE, as `USER_SLOTS - 2` was the top of the pool
+    const B: usize = crate::procslot::SLOT_ID_MAX - 1;
+    const C: usize = crate::procslot::SHARED_ROW;
     let Some(nameid) = u10_name_id(U6GX_NAME) else { return false };
     let nameid = nameid as usize;
     SLOT_USER[A].store(user_id, Ordering::Release);
@@ -24505,9 +24468,9 @@ fn wc_quarry_press(x: i32, y: i32, cur: u64) -> bool {
 /// Leaves session 2 open (the caller's `logout()` closes it), row cleared, all three stamps cleared.
 #[cfg(feature = "loginst")]
 pub fn session_epoch_fixture(user_id: u32, name: &[u8]) -> bool {
-    const A_OWN: usize = crate::arch::memory::USER_SLOTS - 2;
-    const A_STALE: usize = crate::arch::memory::USER_SLOTS - 1;
-    const A_FRESH: usize = crate::arch::memory::USER_SLOTS;
+    const A_OWN: usize = crate::procslot::SLOT_ID_MAX - 2; // WINDOWCAP3 (B399): the top of the slot TYPE
+    const A_STALE: usize = crate::procslot::SLOT_ID_MAX - 1;
+    const A_FRESH: usize = crate::procslot::SHARED_ROW;
     let Some(nameid) = u10_name_id(U6GX_NAME) else { return false };
     let nameid = nameid as usize;
     let epoch_open = SESSION_EPOCH.load(Ordering::Acquire);
@@ -24642,15 +24605,13 @@ impl BusxMbox {
 
 /// Per-ROW reply mailboxes (row = the HANDLES row, like every other x86 per-tenant sidecar). Static
 /// table of Options — the frames are heap boxes, so the static footprint is pointers only.
-static BUSX_MBOX: [SpinMutex<BusxMbox>; crate::arch::memory::USER_SLOTS + 1] =
-    [const { SpinMutex::new(BusxMbox::EMPTY) }; crate::arch::memory::USER_SLOTS + 1];
+static BUSX_MBOX: crate::procslot::SlotVec<SpinMutex<BusxMbox>> = crate::procslot::SlotVec::new(|| SpinMutex::new(BusxMbox::EMPTY), SpinMutex::new(BusxMbox::EMPTY));
 
 /// Per-row "replies pending" semaphores — the MRECV blocking primitive. `crate::arch::sched::Semaphore`
 /// on x86 carries the SAME contract aarch64's does (`init` reserves waiter capacity before any task can
 /// block; `wait` parks and returns false off a scheduled task; `post` wakes cross-core), which is why
 /// this is a port and not a re-design.
-static BUSX_SEM: [crate::arch::sched::Semaphore; crate::arch::memory::USER_SLOTS + 1] =
-    [const { crate::arch::sched::Semaphore::new(0) }; crate::arch::memory::USER_SLOTS + 1];
+static BUSX_SEM: crate::procslot::SlotVec<crate::arch::sched::Semaphore> = crate::procslot::SlotVec::new(|| { let m = crate::arch::sched::Semaphore::new(0); m.init(); m }, crate::arch::sched::Semaphore::new(0)); // WINDOWCAP3: a slot row is born initialised; the shared row by `busx_sem_init_once`
 static BUSX_SEM_INIT: AtomicU8 = AtomicU8::new(0); // 0 = untouched, 1 = initializing, 2 = ready
 
 /// One-shot waiter-capacity reservation for `BUSX_SEM`. Gate-and-spin so a second core entering
@@ -24658,9 +24619,7 @@ static BUSX_SEM_INIT: AtomicU8 = AtomicU8::new(0); // 0 = untouched, 1 = initial
 fn busx_sem_init_once() {
     match BUSX_SEM_INIT.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
-            for s in &BUSX_SEM {
-                s.init();
-            }
+            BUSX_SEM[SHARED_ROW].init(); // WINDOWCAP3: the slot rows are born initialised (`BUSX_SEM`'s row builder)
             BUSX_SEM_INIT.store(2, Ordering::Release);
         }
         Err(_) => {
@@ -28654,9 +28613,9 @@ fn stor1_wr_launcher(demo_cpu: usize) {
 /// never reissued. `(owner_ok, same_slot_refused, same_name_refused)`. Cleaned up.
 #[cfg(feature = "loginst")]
 pub fn ident_fixture(uid_a: u32, uid_b: u32, uid_a2: u32) -> (bool, bool, bool) {
-    const A: usize = crate::arch::memory::USER_SLOTS - 2;
-    const B: usize = crate::arch::memory::USER_SLOTS - 1;
-    const C: usize = crate::arch::memory::USER_SLOTS;
+    const A: usize = crate::procslot::SLOT_ID_MAX - 2; // WINDOWCAP3 (B399): the top of the slot TYPE, as `USER_SLOTS - 2` was the top of the pool
+    const B: usize = crate::procslot::SLOT_ID_MAX - 1;
+    const C: usize = crate::procslot::SHARED_ROW;
     let Some(nameid) = u10_name_id(U6GX_NAME) else { return (false, false, false) };
     let nameid = nameid as usize;
     let epoch = SESSION_EPOCH.load(Ordering::Acquire);
@@ -28695,13 +28654,13 @@ pub fn ident_fixture(uid_a: u32, uid_b: u32, uid_a2: u32) -> (bool, bool, bool) 
 fn session_end_processes(closing: u64, root: bool) -> (usize, usize) {
     let mut ended = 0usize;
     let mut windows = 0usize;
-    for pi in 0..MAX_PROCS {
+    for pi in 0..procs_rows() {
         if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING {
             continue;
         }
         let owner = PROCS[pi].slot.load(Ordering::Acquire) as u64; // `slot + 1`-biased: the wm owner key
         let Some(s) = (owner as usize).checked_sub(1) else { continue };
-        if s > crate::arch::memory::USER_SLOTS || (SLOT_USER[s].load(Ordering::Acquire) == 0) != root || SLOT_EPOCH[s].load(Ordering::Acquire) != closing { // LOGIN13 M3: a USER session's Log Out ends its uid's rows (non-zero), the ROOT session's ends the uid-0 rows of the root epoch — never both, so a user's Log Out still leaves anonymous programs alone
+        if !row_known(s) || (SLOT_USER[s].load(Ordering::Acquire) == 0) != root || SLOT_EPOCH[s].load(Ordering::Acquire) != closing { // LOGIN13 M3: a USER session's Log Out ends its uid's rows (non-zero), the ROOT session's ends the uid-0 rows of the root epoch — never both, so a user's Log Out still leaves anonymous programs alone
             continue;
         }
         let pid = PROCS[pi].pid.load(Ordering::Acquire);
@@ -29404,7 +29363,7 @@ pub fn root_session_launch() -> Result<(u64, usize, bool, bool), &'static str> {
         }
         crate::arch::sched::yield_now();
     }
-    let root_stamped = slot <= crate::arch::memory::USER_SLOTS
+    let root_stamped = row_known(slot)
         && SLOT_USER[slot].load(Ordering::Acquire) == 0
         && SLOT_EPOCH[slot].load(Ordering::Acquire) == SESSION_EPOCH.load(Ordering::Acquire);
     Ok((pid, slot, windowed, root_stamped))
@@ -29416,10 +29375,10 @@ pub fn root_session_launch() -> Result<(u64, usize, bool, bool), &'static str> {
 #[cfg(all(feature = "loginst", feature = "login"))]
 pub fn root_session_others(except: usize) -> usize {
     let live = SESSION_EPOCH.load(Ordering::Acquire);
-    (0..MAX_PROCS)
+    (0..procs_rows())
         .filter(|&pi| PROCS[pi].state.load(Ordering::Acquire) == PRUNNING)
         .filter_map(|pi| (PROCS[pi].slot.load(Ordering::Acquire) as usize).checked_sub(1))
-        .filter(|&s| s != except && s <= crate::arch::memory::USER_SLOTS && SLOT_USER[s].load(Ordering::Acquire) == 0 && SLOT_EPOCH[s].load(Ordering::Acquire) == live)
+        .filter(|&s| s != except && row_known(s) && SLOT_USER[s].load(Ordering::Acquire) == 0 && SLOT_EPOCH[s].load(Ordering::Acquire) == live)
         .count()
 }
 
@@ -29473,7 +29432,7 @@ fn lfnmv_launcher() {
 /// menu bar's press router), the ring's sole producer, exactly as `user_input_enqueue` is.
 pub fn user_input_push_owner(owner: u64, packed: u64) -> bool {
     let Some(slot) = (owner as usize).checked_sub(1) else { return false };
-    if slot >= crate::arch::memory::USER_SLOTS {
+    if !slot_in_range(slot) {
         return false;
     }
     user_input_push(slot, packed)
@@ -29508,7 +29467,7 @@ fn appmenu_fixture() {
     use una_abi::{MenuWireItem as W, BUS_VERB_MENU_GET, BUS_VERB_MENU_PUBLISH, INPUT_EV_MENU_PICK, MENU_FLAG_SUBMENU};
     let row: usize = 6;
     let owner: u64 = row as u64 + 1;
-    if row >= BUSX_MBOX.len() || row >= crate::arch::memory::USER_SLOTS {
+    if !slot_in_range(row) {
         return;
     }
     let cgen = SLOT_GEN[row].load(Ordering::Acquire);
@@ -29537,14 +29496,12 @@ fn appmenu_fixture() {
     serial_println!(":: APPMENU: refuse items=65 principal=caller registry_unchanged={} -> {} ::", again == body, if refused { "PASS" } else { "FAIL" });
     // Leg 1: the pick lands in the OWNER's ring; every other ring is untouched.
     clear_input_row(row);
-    let mut before = [0u32; crate::arch::memory::USER_SLOTS];
-    for (s, b) in before.iter_mut().enumerate() {
-        *b = USER_INPUT_TAIL[s].load(Ordering::Acquire);
-    }
+    let n_rows = crate::arch::memory::user_slots().max(row + 1); // WINDOWCAP3 (B399): every slot row there is, not a constant
+    let before: alloc::vec::Vec<u32> = (0..n_rows).map(|s| USER_INPUT_TAIL[s].load(Ordering::Acquire)).collect();
     let sent = crate::video::appmenu::deliver_pick(owner, 10);
     let tail = USER_INPUT_TAIL[row].load(Ordering::Acquire);
     let ev = USER_INPUT_BUF[row][(before[row] as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
-    let others_quiet = (0..crate::arch::memory::USER_SLOTS).all(|s| s == row || USER_INPUT_TAIL[s].load(Ordering::Acquire) == before[s]);
+    let others_quiet = (0..n_rows).all(|s| s == row || USER_INPUT_TAIL[s].load(Ordering::Acquire) == before[s]);
     let ok = sent && tail == before[row].wrapping_add(1) && ev == una_abi::input_ev_pack(INPUT_EV_MENU_PICK, 10) && others_quiet;
     clear_input_row(row);
     serial_println!(":: APPMENU: owner={} items=3 pick_to=owner others_quiet={} -> {} ::", owner, others_quiet, if ok { "PASS" } else { "FAIL" });
@@ -29567,12 +29524,11 @@ static TESTS_DEMO_CPU: AtomicUsize = AtomicUsize::new(0);
 // `vsyncpace`) was whatever it was when the window went quiet. `repace_arm` (called from `set_hidden` on unhide) flags
 // the slot; the next present of that slot, BEFORE it takes any lock, waits for the first vblank.
 
-static SLOT_REPACE: [AtomicBool; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+static SLOT_REPACE: crate::procslot::SlotVec<AtomicBool> = crate::procslot::SlotVec::new(|| AtomicBool::new(false), AtomicBool::new(false));
 static REPACE_LINES: AtomicU64 = AtomicU64::new(0);
 
 fn repace_arm(slot: usize) {
-    if let Some(f) = SLOT_REPACE.get(slot) {
+    if let Some(f) = slot_in_range(slot).then(|| &SLOT_REPACE[slot]) {
         f.store(true, Ordering::Release);
     }
 }
@@ -29580,7 +29536,7 @@ fn repace_arm(slot: usize) {
 /// Consume the flag; on a restore, wait for the next vblank (bounded two frames; without a vblank counter, sleep to the
 /// next 16 ms boundary) and print `[wpace] restore win= repaced=1`. Returns whether it re-paced.
 fn restore_gate(slot: usize, id: usize) -> bool {
-    let armed = match SLOT_REPACE.get(slot) {
+    let armed = match SLOT_REPACE.peek(slot) {
         Some(f) => f.swap(false, Ordering::AcqRel),
         None => false,
     };
@@ -29612,7 +29568,7 @@ pub struct ActProc { pub pid: u64, pub slot: u64, pub running: bool, pub bg: boo
 /// Copy the claimed rows (`PRUNNING`/`PEXITED`, pid known) into `out`; returns how many. Lock-free.
 pub fn act_proc_rows(out: &mut [ActProc]) -> usize {
     let mut n = 0usize;
-    for pi in 0..MAX_PROCS {
+    for pi in 0..procs_rows() {
         let st = PROCS[pi].state.load(Ordering::Acquire);
         if st != PRUNNING && st != PEXITED { continue; }
         let pid = PROCS[pi].pid.load(Ordering::Acquire);
@@ -29627,7 +29583,7 @@ pub fn act_proc_rows(out: &mut [ActProc]) -> usize {
 /// (`bg_owned`) one. Returns the verdict word the window prints.
 pub fn act_kill(pid: u64) -> &'static str {
     let mut found: Option<(u64, bool)> = None;
-    for pi in 0..MAX_PROCS {
+    for pi in 0..procs_rows() {
         if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && PROCS[pi].pid.load(Ordering::Acquire) == pid {
             found = Some((PROCS[pi].slot.load(Ordering::Acquire) as u64, PROCS[pi].bg_owned.load(Ordering::Acquire)));
             break;
@@ -30348,4 +30304,235 @@ fn appquit_bound_task(arg: usize) {
     let settle = if appquit_pid(owner) == Some(pid) { wc_close_click(win, owner) } else { "exited" };
     APPQUIT_PENDING.fetch_and(!(1u64 << owner), Ordering::AcqRel);
     serial_println!("[sysmenu] quit owner={:#x} answer=killed-after-ms={} settle={}", owner, una_abi::CLOSE_REQ_BOUND_MS, settle);
+
+// =====================================================================================================
+// WINDOWCAP3 (rmbp-ledger B399, R90) — the per-slot sidecars' warm-up, the row predicates and the process
+// table's growth. File tail: nothing above moves.
+// =====================================================================================================
+
+/// WINDOWCAP3: a slot index inside the slot TYPE (`procslot::SLOT_ID_MAX`) — the range check that was
+/// `s < USER_SLOTS`. Liveness is the caller's (a table row of a never-claimed slot is zero state).
+#[inline]
+fn slot_in_range(s: usize) -> bool {
+    s < crate::procslot::SLOT_ID_MAX
+}
+
+/// WINDOWCAP3: a private slot or the shared row — the range check that was `row <= USER_SLOTS`.
+#[inline]
+fn row_known(r: usize) -> bool {
+    r == SHARED_ROW || slot_in_range(r)
+}
+
+/// WINDOWCAP3: `FILE_DYNNAME`'s per-row byte matrix (single-writer per `[row][idx]`, see its doc).
+#[cfg(feature = "irqstorage")]
+struct DynNames(core::cell::UnsafeCell<[[u8; MAX_NAME]; NFILE]>);
+// SAFETY: the FILES-row discipline — one writer per `[row][idx]` at a time, published by `FILE_DYNLEN`.
+#[cfg(feature = "irqstorage")]
+unsafe impl Sync for DynNames {}
+#[cfg(feature = "irqstorage")]
+unsafe impl Send for DynNames {}
+#[cfg(feature = "irqstorage")]
+impl DynNames {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: DynNames = DynNames(core::cell::UnsafeCell::new([[0u8; MAX_NAME]; NFILE]));
+}
+
+/// WINDOWCAP3: append a process-table row (none free). Bounded by the slot TYPE only — the live limit was
+/// asked before the reserve (`sys_spawn`), and the heap's refusal is the table's "full".
+fn proc_reserve_grow() -> Option<usize> {
+    loop {
+        let n = procs_rows();
+        if n >= crate::procslot::SLOT_ID_MAX {
+            return None;
+        }
+        let row = &PROCS[n];
+        if row.state.compare_exchange(PFREE, PRUNNING, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            row.pid.store(0, Ordering::Release);
+            row.status.store(0, Ordering::Release);
+            row.slot.store(0, Ordering::Release);
+            row.bg_owned.store(false, Ordering::Release);
+            return Some(n);
+        }
+    }
+}
+
+/// WINDOWCAP3: allocate every per-slot sidecar row of slot `s` at its claim (`memory::alloc_user_space`,
+/// process context) — an ISR or the input router indexing a claimed slot never allocates.
+pub fn slot_tables_warm(s: usize) {
+    SLOT_DETACHED.warm(s);
+    #[cfg(feature = "wc")]
+    SLOT_NO_AUTOFOCUS.warm(s);
+    SLOT_HIDDEN.warm(s);
+    SLOT_HIDDEN_PRESENTS.warm(s);
+    #[cfg(all(feature = "wc", feature = "vsyncpace"))]
+    SLOT_FOCUS_SEQ.warm(s);
+    USER_INPUT_BUF.warm(s);
+    USER_INPUT_HEAD.warm(s);
+    USER_INPUT_TAIL.warm(s);
+    USER_INPUT_PARKED.warm(s);
+    USER_INPUT_RESUMES.warm(s);
+    VUGRES_RESUME_MS.warm(s);
+    VUGRES_STAGE.warm(s);
+    VUGRES_ACTIVITY_AT.warm(s);
+    VUGRES_LAST_WIN.warm(s);
+    FILE_USED.warm(s);
+    FILE_STAGED.warm(s);
+    FILE_SIZE.warm(s);
+    FILE_OFFSET.warm(s);
+    FILE_WSTAGE.warm(s);
+    FILE_CLUSTER.warm(s);
+    FILE_DIRTY.warm(s);
+    FILE_DIRTY_LO.warm(s);
+    FILE_DIRTY_HI.warm(s);
+    FILE_GEN.warm(s);
+    FILE_OPNAME.warm(s);
+    FILE_GREW.warm(s);
+    FILE_CREATED.warm(s);
+    #[cfg(feature = "irqstorage")]
+    {
+        FILE_DYNLEN.warm(s);
+        FILE_DYNNAME.warm(s);
+    }
+    XFER_SLOT_TX.warm(s);
+    XFER_SLOT_KIND.warm(s);
+    XFER_SLOT_TARGET.warm(s);
+    XFER_SLOT_RIGHTS.warm(s);
+    XFER_SLOT_REC.warm(s);
+    HANDLE_XFER_REC.warm(s);
+    HANDLE_DERIV.warm(s);
+    XFER_SLOT_DERIV.warm(s);
+    XFER_SLOT_GEN.warm(s);
+    SLOT_GEN.warm(s);
+    HANDLES.warm(s);
+    HANDLE_RIGHTS.warm(s);
+    HANDLE_KIND.warm(s);
+    #[cfg(feature = "login")]
+    SLOT_USER.warm(s);
+    #[cfg(feature = "login")]
+    SLOT_EPOCH.warm(s);
+    BUSX_MBOX.warm(s);
+    BUSX_SEM.warm(s);
+    SLOT_REPACE.warm(s);
+}
+
+/// WINDOWCAP3 (B399): the DMG-REFUSE fixture's ground-truth masks are `u64`, so it reads the table's first
+/// 64 rows — the mask TYPE, not a table width (a row past the table's length reads free, which is what the
+/// lowest-first `sys_win_create` will grow into).
+const DMG_MASK_ROWS: usize = 64;
+
+/// WINDOWCAP3: rows the ring-3 window table has grown to — the bound every id is checked against before it
+/// indexes a per-row static. Published under the `WINDOWS` lock, read lock-free by the present verbs.
+static WIN_ROWS: AtomicUsize = AtomicUsize::new(0);
+#[inline]
+fn win_rows() -> usize {
+    WIN_ROWS.load(Ordering::Acquire)
+}
+
+/// WINDOWCAP3: append a FREE row to the window table (none free), returning its id. The per-row pace
+/// statics get their row first, so a present on the new id never allocates. `None` = the heap said no, or
+/// the id would leave the `u32` the info page carries.
+fn win_table_grow(t: &mut alloc::vec::Vec<WinEntry>) -> Option<usize> {
+    let id = t.len();
+    if id >= u32::MAX as usize || t.try_reserve(1).is_err() {
+        return None;
+    }
+    #[cfg(all(feature = "wc", feature = "vsyncpace"))]
+    {
+        let _ = WIN_PACE_DUE_US.get(id);
+        let _ = WIN_PACE_SEQ.get(id);
+    }
+    #[cfg(all(feature = "wc", feature = "witness"))]
+    {
+        let _ = WPACE_PRES.get(id);
+        let _ = WPACE_PACED.get(id);
+        let _ = WPACE_SLEPT_MS.get(id);
+    }
+    t.push(WinEntry::FREE);
+    WIN_ROWS.store(t.len(), Ordering::Release);
+    Some(id)
+}
+
+/// WINDOWCAP3: the `vugres_selftest` scratch slot (was `USER_SLOTS - 1`), so the present outcome can tell
+/// the fixture's first present from a real program's. `usize::MAX` until the fixture runs.
+static VUGRES_FIX_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// WINDOWCAP3 (B399): the kernel launchers' (`run`, `bg`, the desktop app, the fixtures) half of the spawn
+/// valve `sys_spawn` already has. The process table grows now, so it can no longer be what stops a storm:
+/// memory's limit (`video::wincap::proc_limit`) is asked here, and a refusal says so on the wire and PAUSES
+/// the launching task (`note_spawn_refused`'s doubling backoff), never the machine.
+fn proc_admit() -> bool {
+    let running = proc_table_headroom().1;
+    if running >= crate::video::wincap::proc_limit() {
+        crate::video::wincap::note_spawn_refused(running);
+        return false;
+    }
+    crate::video::wincap::note_spawn_admitted();
+    true
+}
+
+/// WINDOWCAP3 — `tests spawnstorm`: a ring-3 storm against the process limit. Launches a one-page flat
+/// program that parks forever (`SYS_SLEEP_MS(1000)` in a loop) through the production `bg` path until the
+/// launch is REFUSED, timing the refused launch (the valve's pause), then kills every tenant and waits for
+/// the rows and slots to come back. One line:
+/// `:: WINDOWCAP3: fixed_pools=none procs_limit=<n> from=mem spawned=<n> refused_at=<n> paused_ms=<n> machine_alive=1 -> PASS ::`
+/// PASS: at least one tenant launched, the refusal came exactly at the limit (`refused_at == procs_limit`,
+/// counting the programs already running), the valve paused the launcher (`paused_ms >= 50`), every
+/// tenant was reaped, and the heap still has room (`machine_alive`). Owed reading: `slots=` (address-space
+/// records the pool holds) and `heap_free_mib=` before/after, for the stack-and-heap measure.
+#[cfg(feature = "witness")]
+pub fn spawnstorm_selftest() {
+    if crate::tests::defer("spawnstorm", spawnstorm_selftest) {
+        return;
+    }
+    // mov eax, SYS_SLEEP_MS ; mov edi, 1000 ; syscall ; jmp <start>   (position-independent, one page)
+    const IMG: [u8; 14] = [0xB8, SYS_SLEEP_MS as u8, 0, 0, 0, 0xBF, 0xE8, 0x03, 0, 0, 0x0F, 0x05, 0xEB, 0xF2];
+    let limit = crate::video::wincap::proc_limit();
+    let base = proc_table_headroom().1;
+    let heap0 = crate::allocator::heap_census(4096).free;
+    let mut tenants: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    let mut refused_at = 0usize;
+    let mut paused_ms = 0u64;
+    let mut why = "none";
+    // Bounded by the limit itself plus a margin: a valve that never refuses ends the storm as a FAIL, not a hang.
+    for _ in 0..limit.saturating_add(4) {
+        let running = proc_table_headroom().1;
+        let t0 = crate::arch::ms();
+        match spawn_user_image_bg(&IMG) {
+            Ok((pid, slot, _)) => tenants.push((pid, slot)),
+            Err(e) => {
+                paused_ms = crate::arch::ms().saturating_sub(t0);
+                refused_at = running;
+                why = e;
+                break;
+            }
+        }
+    }
+    let spawned = tenants.len();
+    let slots = crate::arch::memory::slot_records();
+    for &(pid, slot) in &tenants {
+        let _ = bg_kill(pid, slot);
+    }
+    let dl = crate::arch::ticks() + 3000;
+    while proc_table_headroom().1 > base && crate::arch::ticks() < dl {
+        crate::arch::sched::yield_now();
+    }
+    let reaped = proc_table_headroom().1 <= base;
+    let heap1 = crate::allocator::heap_census(4096).free;
+    let alive = heap1 > 0;
+    let ok = spawned >= 1 && refused_at == limit && paused_ms >= 50 && reaped && alive;
+    serial_println!(
+        ":: WINDOWCAP3: fixed_pools=none procs_limit={} from=mem spawned={} refused_at={} paused_ms={} machine_alive={} -> {} :: base={} reaped={} slots={} heap_free_mib={}->{} refusal=\"{}\"",
+        limit,
+        spawned,
+        refused_at,
+        paused_ms,
+        alive as u8,
+        if ok { "PASS" } else { "FAIL" },
+        base,
+        reaped as u8,
+        slots,
+        heap0 >> 20,
+        heap1 >> 20,
+        why
+    );
 }

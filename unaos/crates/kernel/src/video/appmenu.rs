@@ -60,12 +60,12 @@ static LEAKS: AtomicU32 = AtomicU32::new(0);
 /// The kernel-derived owner id of the calling bus row, or `None` for the shared window / a bad row.
 #[cfg(target_arch = "x86_64")]
 fn owner_of_row(row: usize) -> Option<u64> {
-    if row < crate::arch::memory::USER_SLOTS { Some(row as u64 + 1) } else { None }
+    if row < crate::procslot::SLOT_ID_MAX { Some(row as u64 + 1) } else { None } // WINDOWCAP3 (B399): the slot TYPE, not a pool width
 }
 /// aarch64 (ARMROUTER): the wm owner IS the asid, and the bus passes the sender's asid as `row`.
 #[cfg(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0")))]
 fn owner_of_row(row: usize) -> Option<u64> {
-    if row >= 1 && row <= crate::arch::aarch64::uslots::USER_SLOTS { Some(row as u64) } else { None }
+    if row >= 1 && row <= crate::procslot::SLOT_ID_MAX { Some(row as u64) } else { None } // WINDOWCAP3 (B399): the slot TYPE, not a pool width
 }
 
 /// aarch64 desktop with no EL0 chain (no `uslots`, no syscall module): there are no owners to name.

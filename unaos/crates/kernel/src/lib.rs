@@ -301,3 +301,6 @@ pub mod loginfurn;
 // FLIGHTRING (rmbp-ledger B400, R88): the one rolling ring of the boot's text (both arches) and the console's scroll-back over it, `tests flightring`. Tail statements, so no existing line moves.
 pub mod boot_ring;
 pub mod flightring;
+
+// WINDOWCAP3 (rmbp-ledger B399, R90): `SlotVec` — per-address-space sidecars keyed by slot, heap-grown, no `[_; USER_SLOTS]`. Tail statement, so no existing line moves.
+pub mod procslot;

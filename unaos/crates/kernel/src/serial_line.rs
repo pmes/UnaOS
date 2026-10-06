@@ -222,15 +222,22 @@ pub fn by_source() -> (u64, u64, u64, u64) {
     (e, u, sub.saturating_sub(e + u), t.dropped.load(Relaxed) + t.torn.load(Relaxed))
 }
 
-const USER_SLOTS: usize = 16;
 /// Per-process partial-line bound (SERIAL2 M3).
 const USER_LINE_MAX: usize = 1536;
 struct UserLine {
     b: [u8; USER_LINE_MAX],
     n: usize,
 }
-static USER_LINES: [spin::Mutex<UserLine>; USER_SLOTS] =
-    [const { spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }) }; USER_SLOTS];
+#[cfg(target_arch = "aarch64")]
+static USER_LINES: crate::procslot::SlotVec<spin::Mutex<UserLine>> = crate::procslot::SlotVec::new_asid(
+    || spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
+    spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
+); // WINDOWCAP3 (B399, R90): aarch64 rows are ASIDs (0 = the shared context, inline)
+#[cfg(not(target_arch = "aarch64"))]
+static USER_LINES: crate::procslot::SlotVec<spin::Mutex<UserLine>> = crate::procslot::SlotVec::new(
+    || spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
+    spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
+); // WINDOWCAP3 (B399, R90): one partial line per slot row (and the shared row), heap-grown — was `[_; 16]`
 
 /// SERIAL2 M3 — the ring-3 console write path. `sys_write` used to hand each raw write to `serial_print!`;
 /// a vug whose line exceeds one write (or two vugs' writes) could split a line across the lock. Now the
@@ -239,7 +246,7 @@ static USER_LINES: [spin::Mutex<UserLine>; USER_SLOTS] =
 /// syscall runs IF-masked: the slot is `try_lock`ed and on contention the text goes out directly.
 pub fn emit_user(row: usize, text: &str) {
     line_watch_check(text); // LUMENCRASH M3 (B326): a fixture may be waiting for this line (file tail)
-    let mut guard = match USER_LINES.get(row).and_then(|m| m.try_lock()) {
+    let mut guard = match (row == crate::procslot::SHARED_ROW || row <= crate::procslot::ROW_ID_MAX).then(|| &USER_LINES[row]).and_then(|m| m.try_lock()) {
         Some(g) => g,
         None => return emit_src(format_args!("{}", text), false, true),
     };
