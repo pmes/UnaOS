@@ -1763,7 +1763,8 @@ pub const APP_RES_SECTION: &str = ".note.unaos.res";
 /// The resource note's type (owner "UnaOS", like APP_NOTE_TYPE's).
 pub const APP_RES_NOTE_TYPE: u32 = 2;
 
-// ==========================================================================================// DIALOG2 (rmbp-ledger B404) — a ring-3 program raises its OWN alert, sheet or toast, and hears the answer.
+// =================================================================================================
+// DIALOG2 (rmbp-ledger B404) — a ring-3 program raises its OWN alert, sheet or toast, and hears the answer.
 // Appended at the file tail so no existing line moves.
 // =================================================================================================
 
@@ -1872,7 +1873,6 @@ mod dialog2_tests {
 /// Bus verb: declare a program's settings stanza.
 pub const BUS_VERB_PREF_DECLARE: u8 = 23; // 20..=22 are DIALOG2's dialog/sheet/toast; renumbered at merge17
 const _: () = assert!(BUS_VERB_PREF_DECLARE > BUS_VERB_TOAST && BUS_VERB_PREF_DECLARE < BUS_VERB_REGISTER);
-=======
 // SMALLFIX3 (rmbp-ledger B416) — THE CODES ARE UNIQUE BY CONSTRUCTION. Three arcs of one wave each took the
 // next free number from their own branch (event 10 twice, bus verb 20 twice): a clash only showed at the fold.
 // Every input-ring event type and every kernel bus verb is listed here and a duplicate fails the BUILD on both

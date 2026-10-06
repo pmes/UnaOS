@@ -624,7 +624,7 @@ fn dhcp_apply(stack: &mut SmolStack, cidr: Ipv4Cidr, router: Option<Ipv4Address>
         GATEWAY_IP[3],
     ));
     apply_ipv4_config(stack, cidr, gw);
-    LEASED.store(true, Ordering::Relaxed);
+    LEASED.store(true, Ordering::Relaxed); { let o = cidr.address().octets(); LEASE_IP.store(u32::from_be_bytes([o[0], o[1], o[2], o[3]]), Ordering::Relaxed); } // STATUSTRAY (B426): the leased address, for the network item's menu
     // SOCK-8: record the leased DNS server (if any) so the resolver targets the real nameserver.
     if let Some(d) = dns_srv {
         let o = d.octets();
@@ -2238,4 +2238,13 @@ pub fn usbnet7_poll() -> bool {
     }
     service_poll();
     true
+}
+
+/// STATUSTRAY (B426) — the address the DHCP lease applied (0 = none yet). Written in `dhcp_apply` beside `LEASED`.
+static LEASE_IP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// STATUSTRAY (B426) — the leased IPv4 address, or `None` before a lease (the static slirp config is not an address
+/// the network item may state: it is a placeholder for the hand-rolled ARP pump, not a fact about the network).
+pub fn lease_ip() -> Option<[u8; 4]> {
+    if !LEASED.load(Ordering::Relaxed) { return None; }
+    match LEASE_IP.load(Ordering::Relaxed) { 0 => None, v => Some(v.to_be_bytes()) }
 }

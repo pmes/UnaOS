@@ -187,3 +187,10 @@ pub fn selftest() {
     let panel_ok = confirm_ok && crate::video::crystal::power_panel_selftest();
     serial_println!(":: POWER-UI: panel_ok={} notice_ok={} -> {} ::", panel_ok, notice_ok, if panel_ok && notice_ok { "PASS" } else { "FAIL" });
 }
+
+/// STATUSTRAY (B426) — fill the panel text with a status item's rows (`statusmenu::lines_for`). Returns the row count.
+pub fn panel_set_lines(lines: Vec<String>) -> usize {
+    let n = lines.len();
+    *TEXT.lock() = lines;
+    n
+}

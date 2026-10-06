@@ -70,13 +70,13 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     let h = n * rh + 2;
     let x = l.x.min(g.w.saturating_sub(w));
     let y = l.y.min(g.h.saturating_sub(h));
-    fill(px, g, x, y, w, h, theme::BUTTON_FACE);
-    keyline(px, g, Rect { x, y, w, h }, theme::ACCENT);
+    fill(px, g, x, y, w, h, theme::button_face());
+    keyline(px, g, Rect { x, y, w, h }, theme::accent());
     let head = alloc::format!("Open With ({})", l.mime);
-    text(px, g, x + PAD(), y + 1 + g.ts, head.as_bytes(), x + w, theme::CONTENT_TEXT);
+    text(px, g, x + PAD(), y + 1 + g.ts, head.as_bytes(), x + w, theme::content_text());
     if l.rows.is_empty() {
         let s = alloc::format!("(no app opens {})", l.mime);
-        text(px, g, x + PAD(), y + 1 + rh + g.ts, s.as_bytes(), x + w, theme::BUTTON_TEXT);
+        text(px, g, x + PAD(), y + 1 + rh + g.ts, s.as_bytes(), x + w, theme::button_text());
     }
     for (i, r) in l.rows.iter().enumerate() {
         let mut s = r.name.clone();
@@ -86,7 +86,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
         if !super::openers::available(&r.opener) {
             s.push_str("  (not in this build)");
         }
-        text(px, g, x + PAD(), y + 1 + (i + 1) * rh + g.ts, s.as_bytes(), x + w, theme::BUTTON_TEXT);
+        text(px, g, x + PAD(), y + 1 + (i + 1) * rh + g.ts, s.as_bytes(), x + w, theme::button_text());
     }
 }
 
