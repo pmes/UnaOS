@@ -179,10 +179,20 @@ pub static SCHEMA: &[Key] = &[
         doc: "Wallpaper image path; empty = off.",
     },
     Key {
+        ns: "system", key: "dock.autohide", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings, Writer::Dock], reader: "kernel dock",
+        doc: "Hide the dock until the pointer reaches its edge (DOCK2). Edited in Settings > General > Auto-hide dock.",
+    },
+    Key {
         ns: "system", key: "dock.pins", kind: Kind::Str { max_len: 256, printable: true },
         default: Default::Consumer("every pin the build carries (lumen only on a `lumen` build)"),
         writers: &[Writer::Dock], reader: "kernel dock",
         doc: "Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen); TOML arrays are outside the subset.",
+    },
+    Key {
+        ns: "system", key: "dock.position", kind: Kind::Enum(&["bottom", "left", "right"]), default: Default::Str("bottom"),
+        writers: &[Writer::Settings, Writer::Dock], reader: "kernel dock",
+        doc: "The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock.",
     },
     Key {
         ns: "system", key: "login.items", kind: Kind::Str { max_len: crate::login::VALUE_MAX, printable: true },

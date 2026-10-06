@@ -10,7 +10,7 @@ or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keep
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
 operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
 
-Rows: 33.
+Rows: 35.
 
 | key | type | default | writers | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -23,7 +23,9 @@ Rows: 33.
 | `system.display.idle_min` | int `0..=1440` | `10` | settings | kernel settings (DIMIDLE) | Minutes before the idle blank; 0 = never. |
 | `system.display.mode` | string ≤16 printable | consumer: the panel's own density scale (UIMETRICS) | settings | kernel settings (Display > Resolution), `video::dpi` | The looks-like size `WxH` of the chosen mode: the panel's native mode at a UI scale (`prefs_core::modes`); unset = the panel's default scale. |
 | `system.display.wallpaper` | string ≤120 printable | `""` | settings, wallpaper-verb | kernel settings, wallpaper | Wallpaper image path; empty = off. |
+| `system.dock.autohide` | bool | `false` | settings, dock | kernel dock | Hide the dock until the pointer reaches its edge (DOCK2). Edited in Settings > General > Auto-hide dock. |
 | `system.dock.pins` | string ≤256 printable | consumer: every pin the build carries (lumen only on a `lumen` build) | dock | kernel dock | Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen); TOML arrays are outside the subset. |
+| `system.dock.position` | enum `bottom \| left \| right` | `"bottom"` | settings, dock | kernel dock | The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock. |
 | `system.login.items` | string ≤256 printable | `""` | settings, dock | kernel login items (`video/loginitems.rs`) | Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login. |
 | `system.pointer.speed` | int `0..=2` | `1` | settings | kernel settings (pointer) | 0 slow, 1 normal, 2 fast. |
 | `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | operator | kernel POWERMENU | Battery percent at which the machine shuts down; 0 = off. |

@@ -500,6 +500,7 @@ fn paint_general(st: &mut State, v: &Values) {
     let who = user_name().unwrap_or_else(|| String::from("(no session)"));
     txt(st, TRACK_X, 5, &who);
     btn(st, 5, VAL_X - 30, "Password");
+    paint_dock_rows(st); // DOCK2 (B394): rows 6/7 — the dock's edge and auto-hide
 }
 
 fn paint_display(st: &mut State, v: &Values) {
@@ -1005,6 +1006,7 @@ fn press_general(row: usize, cx: usize) {
             else if cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 { select(7); do_wallpaper(true); }
         }
         5 => { if cx >= VAL_X - 30 && cx < VAL_X - 30 + BTN_W { select(8); change_password(); } }
+        6 | 7 => dock_rows_press(row, cx), // DOCK2 (B394)
         _ => {}
     }
 }
@@ -1661,4 +1663,46 @@ pub fn selftest_prefsui() {
         ":: PREFSUI: slider_drag={} login_items={} modes={} -> {} ::",
         drag, li.map(|n| n as i64).unwrap_or(-1), modes, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── DOCK2 (rmbp-ledger B394, MACPARITY row 25) — Desktop & Dock: the dock's edge and auto-hide on the General tab ─────
+// `system.dock.position` (Bottom · Left · Right, the Pointer row's segments) and `system.dock.autohide` (the Mute row's
+// box). A press applies LIVE through the dock's own cells (`dock::set_position` / `set_autohide`) and latches ONE store
+// write, drained on the dock's service pass (never a bus write in the click router).
+
+const DOCK_POS_NAMES: [&str; 3] = ["Bottom", "Left", "Right"];
+
+fn paint_dock_rows(st: &mut State) {
+    let (w, h) = (st.w, st.h);
+    let face = super::text::Face::Body;
+    let ch = super::metrics::lcell_h(face);
+    txt(st, LABEL_X, 6, "Dock");
+    let seg = TRACK_W / 3;
+    let p = super::dock::position() as usize;
+    for k in 0..3usize {
+        let c = if k == p { theme::ACCENT } else { theme::SCROLL_TRACK };
+        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 6 * ROW_H + 6, seg - 2, ROW_H - 12, c);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 6 * ROW_H + (ROW_H - ch) / 2, DOCK_POS_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+    }
+    txt(st, LABEL_X, 7, "Auto-hide dock");
+    fill(&mut st.surf, w, TRACK_X, TOP + 7 * ROW_H + 8, 24, 24, theme::SCROLL_TRACK);
+    let on = super::dock::autohide();
+    if on { fill(&mut st.surf, w, TRACK_X + 4, TOP + 7 * ROW_H + 12, 16, 16, theme::ACCENT); }
+    txt(st, VAL_X, 7, if on { "on" } else { "off" });
+}
+
+fn dock_rows_press(row: usize, cx: usize) {
+    if row == 6 && cx >= TRACK_X && cx < TRACK_X + TRACK_W {
+        let k = ((cx - TRACK_X) / (TRACK_W / 3)).min(2);
+        let p = ["bottom", "left", "right"][k];
+        let ok = super::dock::set_position(p, true);
+        say("dock_position", p, ok);
+    } else if row == 7 && cx >= TRACK_X && cx < TRACK_X + 24 {
+        let on = !super::dock::autohide();
+        super::dock::set_autohide(on, true);
+        say("dock_autohide", if on { "1" } else { "0" }, true);
+    } else {
+        return;
+    }
+    repaint();
 }
