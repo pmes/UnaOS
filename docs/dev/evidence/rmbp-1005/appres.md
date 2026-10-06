@@ -60,3 +60,28 @@ version=<v> signature=<s>` on About.
 **Owed.** Every other ELF (PREFS, HOLOCRON, NET, BIG, DIAG, VUG…) gets a `res/` dir as its icon is designed;
 the aarch64 programs; a bundle directory (row 38's "later"); the dock's tile width still sizes from the
 caption budget (DOCK2's layout), so a tile is as wide as before with the icon centred.
+
+## Built (M1–M4, no knob: the registrar is a few KiB of code and six ~5 KiB blocks, compiled in every image)
+
+- M1 `midden_core` `res_records`/`res_get`/`res_build`/`app_res`/`elf_shdr_table`/`elf_note_sections`/`res_note`
+  (`cargo test -p midden_core`: 29 pass, 3 new). `una_abi::APP_RES_NOTE_TYPE = 2`, asserted equal in `fs/appres.rs`.
+- M2 `tools/una-res` (`cargo test -p una-res`: 2 pass — stamp round trip, every icon decodes, a second stamp refused;
+  a stamped host `/bin/true` still runs and `readelf -S` lists `.note.unaos.res NOTE` with flags none).
+  `pixel_core::png::encode::encode_rgba` (colour type 6; `cargo test -p pixel_core` exit 0). Icons (ours):
+  `unaos/res/{quarry,settings,console,shell,facet,generic}/icon.svg` + `unaos/crates/user-lumen/res/icon.svg`;
+  32/64 px PNGs fit the 3072-byte attribute bound, the 128 px ones do not always (facet 3338, lumen 3594) and stay
+  in the block only. arroyo `una_res_stamp` runs after Lumen's strip.
+- M3 `fs/appres.rs`: sight at `bg` spawn (shell.rs, same-line) and in Quarry's `compute_meta` for every
+  `application/x-unaos-elf` row; a new signature object is created with all its attributes in ONE
+  `create_files_batch`; `assoc::opener_for_in` reads `una:apps` (source `app`). `tests appres` rides
+  `filetype::ensure_tests`.
+- M4 dock (`dock_icon_row`, one line before the caption comment), Quarry (`blit_path_icon` after the name),
+  About (`winmenu` app-menu arm, same-line) + `facet::win()`.
+
+**What the next flight reads** (after `tests appres`, or a Quarry open of `/apps`):
+`[appres] sight path=/apps/LUMEN.ELF res=yes source=elf attrs=<n> on=types sig=org.unaos.lumen` (the first time on a
+card; `source=attrs … on=cached` on later boots), one `:: APPRES: <app> sig=… version=… kind=… icon=32px+|generic
+source=builtin|elf|attrs drawn=true cache=types|- ::` per program, then
+`:: APPRES: programs=<5 + ELFs in /apps> with_res=6 icons_drawn=<programs> cached_attrs=1 -> PASS :: lumen=staged
+root_attrs=true …`; App menu → About on a Lumen window: `[appres] about app=lumen name=Lumen version=0.1.0+<sha>
+signature=org.unaos.lumen res=yes` and a notice "About Lumen".
