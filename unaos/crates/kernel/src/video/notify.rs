@@ -989,3 +989,25 @@ fn bell_switch() {
     super::crystal::dismiss_for_switch();
     serial_println!("[notify] switch from={} to=center", super::status::item_name(i));
 }
+
+// ── NOTICEFIX (rmbp-ledger B491) — `tests notice` drives the REAL card store, model-only ──────────────────
+
+/// The live stack, ring and Center set aside while a fixture runs headless ([`fixture_restore`] puts them back).
+pub struct FixtureHeld(Held);
+
+/// Hold the live notification state and go headless: a fixture's card never reaches the glass, the ring or the badge.
+pub fn fixture_hold() -> FixtureHeld {
+    FixtureHeld(hold())
+}
+
+pub fn fixture_restore(h: FixtureHeld) {
+    restore(h.0)
+}
+
+/// Run one pass at the latest card's own `until` (the clock it was shown on), so the time-close is the real one.
+pub fn expire_now() {
+    let due = ST.lock().cards.iter().flatten().map(|c| c.until).max();
+    if let Some(t) = due {
+        pass(t.max(crate::arch::ms()));
+    }
+}
