@@ -1237,3 +1237,6 @@ pub mod statusmenu;
 // XHCIMEDIA (B438): THE fn-row router both HID pumps call (F1/F2, F7–F9, F10–F12). Same gate as brightkeys; at the tail so no line above moves.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod fnrow;
+// APPSWITCH (B428, MACPARITY row 10): Cmd-Tab cycles apps on one strip of icons. x86 `wc` (the key door and the overlay row are x86's, as LAUNCHER's); at the tail so no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod appswitch;
