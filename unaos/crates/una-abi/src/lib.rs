@@ -1746,3 +1746,103 @@ mod window2_tests {
         std::println!(":: WINDOW2-ABI: bytes={} kdf_m_kib={} alloc={} -> PASS ::", USER_WINDOW_BYTES, WINDOW2_KDF_M_KIB, WINDOW2_ALLOC_BYTES);
     }
 }
+
+// =================================================================================================
+// DIALOG2 (rmbp-ledger B404) — a ring-3 program raises its OWN alert, sheet or toast, and hears the answer.
+// Appended at the file tail so no existing line moves.
+// =================================================================================================
+
+/// Bus verb: a free-standing alert owned by the caller (app-modal to the caller's windows). Body: [`dialog_body`].
+pub const BUS_VERB_DIALOG: u8 = 20;
+/// Bus verb: the same alert as a SHEET on the caller's front window.
+pub const BUS_VERB_SHEET: u8 = 21;
+/// Bus verb: a one-line toast titled with the caller's (kernel-stamped) name; buttons are ignored, no answer.
+pub const BUS_VERB_TOAST: u8 = 22;
+const _: () = assert!(BUS_VERB_DIALOG > BUS_VERB_PREF_CHANGED && BUS_VERB_TOAST < BUS_VERB_REGISTER);
+/// The answer to a dialog/sheet, delivered to the POSTER's input ring (never to the focused slot). Payload
+/// `[15:8]` = the caller's token, `[7:0]` = the button index (left to right; the default is the last).
+pub const INPUT_EV_DIALOG_ANSWER: u64 = 10;
+/// The field separator inside a dialog body (ASCII unit separator).
+pub const DIALOG_SEP: u8 = 0x1F;
+/// Buttons per dialog (the default is the rightmost — the last).
+pub const DIALOG_BTN_MAX: usize = 3;
+
+/// A parsed dialog request: `token` comes back in the answer; `info` may hold up to three `\n` lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DialogReq<'a> {
+    pub token: u8,
+    pub message: &'a [u8],
+    pub info: &'a [u8],
+    pub buttons: [&'a [u8]; DIALOG_BTN_MAX],
+    pub nb: u8,
+}
+
+/// Encode: `[token][nb] message SEP info (SEP button){nb}`. `None` when a field holds the separator, there are
+/// more than three buttons, or `out` is too small.
+pub fn dialog_body(token: u8, message: &[u8], info: &[u8], buttons: &[&[u8]], out: &mut [u8]) -> Option<usize> {
+    if buttons.len() > DIALOG_BTN_MAX || message.contains(&DIALOG_SEP) || info.contains(&DIALOG_SEP) || buttons.iter().any(|b| b.contains(&DIALOG_SEP)) {
+        return None;
+    }
+    let need = 2 + message.len() + 1 + info.len() + buttons.iter().map(|b| b.len() + 1).sum::<usize>();
+    if out.len() < need {
+        return None;
+    }
+    out[0] = token;
+    out[1] = buttons.len() as u8;
+    let mut n = 2;
+    let mut put = |s: &[u8], n: &mut usize| {
+        out[*n..*n + s.len()].copy_from_slice(s);
+        *n += s.len();
+    };
+    put(message, &mut n);
+    put(&[DIALOG_SEP], &mut n);
+    put(info, &mut n);
+    for b in buttons {
+        put(&[DIALOG_SEP], &mut n);
+        put(b, &mut n);
+    }
+    Some(n)
+}
+
+/// Decode a [`dialog_body`] frame; refused whole (`None`) when the field count does not match `nb`.
+pub fn dialog_parse(body: &[u8]) -> Option<DialogReq<'_>> {
+    if body.len() < 2 || body[1] as usize > DIALOG_BTN_MAX {
+        return None;
+    }
+    let (token, nb) = (body[0], body[1]);
+    let mut it = body[2..].split(|&b| b == DIALOG_SEP);
+    let message = it.next()?;
+    let info = it.next()?;
+    let mut buttons: [&[u8]; DIALOG_BTN_MAX] = [&[]; DIALOG_BTN_MAX];
+    for slot in buttons.iter_mut().take(nb as usize) {
+        *slot = it.next()?;
+    }
+    if it.next().is_some() {
+        return None;
+    }
+    Some(DialogReq { token, message, info, buttons, nb })
+}
+
+/// The packed answer event a poster reads from its input ring.
+pub const fn dialog_answer_pack(token: u8, button: u8) -> u64 {
+    input_ev_pack(INPUT_EV_DIALOG_ANSWER, ((token as u64) << 8) | button as u64)
+}
+
+#[cfg(test)]
+mod dialog2_tests {
+    use super::*;
+    #[test]
+    fn dialog_body_round_trip() {
+        let mut b = [0u8; 128];
+        let n = dialog_body(7, b"Save changes?", b"Your changes will be lost.", &[b"Don't Save", b"Cancel", b"Save"], &mut b).unwrap();
+        let r = dialog_parse(&b[..n]).unwrap();
+        assert_eq!((r.token, r.nb, r.message, r.info), (7, 3, &b"Save changes?"[..], &b"Your changes will be lost."[..]));
+        assert_eq!(r.buttons[2], b"Save");
+        let n = dialog_body(1, b"hello", b"", &[], &mut b).unwrap();
+        assert_eq!(dialog_parse(&b[..n]).unwrap().nb, 0);
+        assert!(dialog_body(1, b"a\x1fb", b"", &[], &mut b).is_none());
+        assert!(dialog_parse(&[1, 2, b'm', DIALOG_SEP, b'i', DIALOG_SEP, b'x']).is_none(), "two buttons declared, one sent");
+        assert_eq!(dialog_answer_pack(7, 2) >> INPUT_EV_TYPE_SHIFT, INPUT_EV_DIALOG_ANSWER);
+        assert_eq!(dialog_answer_pack(7, 2) & 0xFFFF, 0x0702);
+    }
+}
