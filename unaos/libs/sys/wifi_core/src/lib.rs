@@ -13,6 +13,9 @@
 //! * [`ieee80211`] — the management and data frames a station needs to scan and join an OPEN network:
 //!   beacon / probe-response parse, open-system authentication, association request/response, and the
 //!   data-frame <-> Ethernet (LLC/SNAP) conversion a smoltcp device needs.
+//! * [`sprom`] — WIFI6 (B439): the SPROM shadow's identity fields (rung S2r). Its offsets are the
+//!   tree's own transcription in `bcm4331.md` §S2r, marked `[ONE-SOURCE]`, and corroborated on metal
+//!   by the PCI subsystem id; a read-path layout only.
 //!
 //! SOURCES: IEEE Std 802.11 frame formats (`[PUBLIC]`) and the tree's metal pins. **No Linux driver
 //! source was read for this crate**, and nothing here is Broadcom-specific beyond the container the
@@ -25,3 +28,4 @@ extern crate alloc;
 
 pub mod fw;
 pub mod ieee80211;
+pub mod sprom;

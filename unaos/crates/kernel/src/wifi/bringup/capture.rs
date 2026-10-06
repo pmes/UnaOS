@@ -37,8 +37,15 @@ use crate::sync::Mutex;
 /// C2's MMIO capture, kept for C3's post-image diff (single writer: `bringup_once`, once per boot).
 static C2_MMIO: Mutex<Vec<Option<u16>>> = Mutex::new(Vec::new());
 
-/// C2's MMIO extent (bytes): 0x000..0x800, 16-bit reads.
-const C2_MMIO_END: u16 = 0x0800;
+/// C2's MMIO extent (bytes), 16-bit reads. WIFI5 fixed it at 0x800; WIFI6 (B439) derives it from the
+/// EROM walk (`derive_c2_bound` in `bringup.rs`: the d11 slave port's decoded size, only when the
+/// walk's base gap agrees, clipped to the 4 KiB aperture) and falls back to 0x800 otherwise.
+fn c2_mmio_end() -> u16 {
+    match super::super::status::c2_bound() {
+        0 => 0x0800,
+        b => b.min(0x1000) as u16,
+    }
+}
 /// C2's shared-memory extent: 1024 dwords = shared bytes 0x0000..0x1000.
 const C2_SHARED_DWORDS: usize = 1024;
 /// Words per printed row.
@@ -82,15 +89,20 @@ fn dump32(tag: &str, words: &[u32], unit: u32) {
 
 /// The pre-image captures. `words`/`staged_fnv` are the staged ucode's stream facts.
 pub(super) fn pre_image(bar0: u64, words: u32, staged_fnv: u32, w: &mut Writes) {
+    let c2_end = c2_mmio_end();
     serial_println!(
-        ":: WIFI5: capture begin — C2 (d11 MMIO 0x000-0x7fe x16, shared 0x0000-0x0fff) then C1 (ucode memory, {} words) — READ-ONLY on the data side; SHM_CONTROL is the one register written ::",
+        "[wifi6] c2 mmio extent 0x000-{:#05x} x16 (bound from the EROM, see `[wifi6] c2-bound`)",
+        c2_end - 2
+    );
+    serial_println!(
+        ":: WIFI5: capture begin — C2 (d11 MMIO from 0x000 x16, shared 0x0000-0x0fff) then C1 (ucode memory, {} words) — READ-ONLY on the data side; SHM_CONTROL is the one register written ::",
         words
     );
 
     // ── C2a: MMIO. ──────────────────────────────────────────────────────────────────────────────
-    let mut mmio: Vec<Option<u16>> = Vec::with_capacity((C2_MMIO_END / 2) as usize);
+    let mut mmio: Vec<Option<u16>> = Vec::with_capacity((c2_end / 2) as usize);
     let mut off = 0u16;
-    while off < C2_MMIO_END {
+    while off < c2_end {
         mmio.push(if skipped(off) { None } else { Some(unsafe { r16(bar0, off as u64) }) });
         off += 2;
     }
@@ -158,7 +170,7 @@ pub(super) fn pre_image(bar0: u64, words: u32, staged_fnv: u32, w: &mut Writes) 
     );
 
     // ── S5i rung 0: initvals records vs the EFI's captured words. ───────────────────────────────
-    let at = |o: u16| -> Option<u16> { if o < C2_MMIO_END { mmio[(o / 2) as usize] } else { None } };
+    let at = |o: u16| -> Option<u16> { if o < c2_end { mmio[(o / 2) as usize] } else { None } };
     for role in ["initvals", "bsinitvals"] {
         let parsed = super::super::firmware::with_staged(role, |d| wifi_core::fw::records(d));
         let Some(Ok(recs)) = parsed else {
@@ -245,4 +257,11 @@ pub(super) fn post_image(bar0: u64) {
         ":: WIFI5: c3 post-upload+initvals mmio regs={} same={} changed={} (delta rows: offset=efi/now) — S5 rung 0's MMIO half: compare the changed set with the s5i-delta offsets ::",
         regs, same, changed
     );
+}
+
+/// WIFI6 (B439): C2's captured word at an MMIO byte offset — the S4i unwind's pre-image source
+/// (`unwind.rs`), read from the ONE store C2 filled. `None`: not captured (skipped or past the bound).
+#[cfg(feature = "wifi5")]
+pub(super) fn c2_word(off: u16) -> Option<u16> {
+    C2_MMIO.lock().get((off / 2) as usize).copied().flatten()
 }

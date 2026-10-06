@@ -654,6 +654,8 @@ fn main() {
     // the absence of `:: wifi4:` lines is indistinguishable from a radio that never answered.
     // Default OFF => rung unlinked, media byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WIFI4").is_ok() { feats.push("wifi4"); }
+    // WIFI-5 (WIFI6, B439): the S4i MMIO unwind of a failed S5i step. Implies wifi3; x86_64-only.
+    if std::env::var("UNAOS_WIFI5").is_ok() { feats.push("wifi5"); }
     // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
     // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
     // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the

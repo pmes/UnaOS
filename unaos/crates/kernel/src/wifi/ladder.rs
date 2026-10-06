@@ -63,6 +63,9 @@ pub fn witness() {
     for (id, st, _) in LEDGER.iter() {
         // F is the one row this boot measures: the set on THIS medium.
         let st = if *id == "F" && staged >= 3 { St::Confirmed } else { *st };
+        // WIFI6 (B439): S2r is the second live row — this boot's SPROM read, PLAUSIBLE on all three
+        // corroboration terms (rev 8..11, board == PCI ssid device, unicast MAC).
+        let st = if *id == "S2r" && status::sprom_token() == "ok" { St::Confirmed } else { st };
         match st {
             St::Confirmed => c += 1,
             St::Refuted => r += 1,
@@ -78,5 +81,10 @@ pub fn witness() {
         LEDGER.len(), c, r, o, p, unwind, staged, uploaded as u8,
         if reason.is_none() { "READY" } else { "NOT-READY" },
         reason.map(|s| alloc::format!(" reason={} (UNAOS_WIFI_FW_PATH stages the set onto the card's /FIRMWARE/)", s)).unwrap_or_default()
+    );
+    // WIFI6 (B439): the arc's three deliverables as measured this boot.
+    serial_println!(
+        ":: WIFI6: rungs={} confirmed={} refuted={} open={} parked={} sprom={} c2_bound={:#x} unwind={} ::",
+        LEDGER.len(), c, r, o, p, status::sprom_token(), status::c2_bound(), status::unwind_token()
     );
 }
