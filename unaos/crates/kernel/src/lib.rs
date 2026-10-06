@@ -321,3 +321,6 @@ pub mod shelltask;
 pub mod smallfix4;
 // SMALLFIX5 (rmbp-ledger B480): `tests smallfix5` — the merge19 wave's small owed items, read back. Tail statement.
 pub mod smallfix5;
+// LOADERSTALL (rmbp-ledger B490): the loader's stage record read back — `:: LOADER:` and `tests loader`. Tail statement.
+#[cfg(target_arch = "x86_64")]
+pub mod loaderstage;
