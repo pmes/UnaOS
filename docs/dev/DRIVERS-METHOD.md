@@ -30,6 +30,14 @@ else that talks to silicon through registers, rings, firmware or context blobs.
   had been checked against what the wire could already show.
 - **Blobs treated as opaque.** RAMFC, the instance block, falcon DMEM, the channel control page: words we did not understand were
   zero-filled or guessed instead of being copied from a state that worked and mutated one field at a time.
+- **A status set by the image or the hand-back, never re-read from the wire** (STATUSBASELINE, B437, read the 188 cells
+  STATUSTABLE grandfathered). Thirty-four rows were stamped "the arc flew" for boot 19 in one sweep; five had not
+  (UnaFS read `unafs=unbuilt` all boot, ATTRSURF SKIPPED, SELFINSTALL never ran, GATE-CHARTER is a host gate). Nine rows
+  stayed `done-unflown` after flight 24 flew them, and a dozen kept "unflown — wire `<the line we expect>`" after a flight
+  printed a different one (KAT2 FAIL twice, `ppi=0 scale=1.0`, a decoder job that hangs). One cell quoted a witness with a
+  number the capture does not carry (QUIETBOOT `bound=250` for the wire's `bound=2500`), and one "REFUTED" was a
+  derivation (SO29). Every one is now a row of `docs/dev/STATUS.tsv` (ST43–ST265) or cites one; the list is
+  `docs/dev/evidence/rmbp-1005/statusbaseline.md`.
 
 ## 2. The ground truth is a state that works
 
