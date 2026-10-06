@@ -1324,7 +1324,7 @@ pub mod battery {
         total_sum: 0,
         total_ms: 0,
     });
-    const PWR_ROLLUP_MS: u64 = 10_000;
+    const PWR_ROLLUP_MS: u64 = PWR_WINDOW_MS; // SMALLFIX5 (B480) item 5: was 10 s — see `PWR_WINDOW_MS`
 
     const REFRESH_MS: u64 = 1000;
     /// QUIET-HOLD threshold. On the 2012 rMBP's flaky SMC a ONE-SWEEP drop-out is the normal case,
@@ -2047,3 +2047,8 @@ pub mod battery {
         }
     }
 }
+
+/// SMALLFIX5 (rmbp-ledger B480) item 5 — WIREDIET's follow-up: `:: PWR:` was the one PERIODIC line among the six
+/// heavy tags (flight 24: 229 lines, flight 25: 56, every 10 s). The window is now 60 s; a state change (plugged,
+/// unplugged) or a presence drop still flushes at once, and the cumulative `total:` sums are the same samples.
+pub const PWR_WINDOW_MS: u64 = 60_000;
