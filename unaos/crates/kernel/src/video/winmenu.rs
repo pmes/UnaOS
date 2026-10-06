@@ -1493,7 +1493,7 @@ fn app_pick(win: wm::WinId, id: u32) {
                 "[winmenu] app-menu about win={} name={}",
                 win,
                 core::str::from_utf8(&name[..len]).unwrap_or("?")
-            );
+            ); crate::fs::appres::about(&name[..len]); // APPRES (B398): name, version, signature — on the wire and in a notice
         }
         APP_ITEM_SHORTCUTS => {
             let opened = super::shortcuts::open();

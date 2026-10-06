@@ -1024,7 +1024,7 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
                 }
             }
         }
-        // The caption, overlaid. Vertically centred in the tile, left-padded by one `PAD`, and
+        if crate::fs::appres::dock_icon_row(out, l.w, r.id, &r.title[..r.title_len.min(r.title.len())], bx, by, tw, th, j) { continue; } // APPRES (B398): the app's icon owns the tile; a tile naming no known program keeps its caption. // The caption, overlaid. Vertically centred in the tile, left-padded by one `PAD`, and
         // truncated to the layout's glyph budget — the budget the layout SIZED the tile from, so the
         // text can never overrun the box it is in.
         let ty0 = by + (th - CELL_H()) / 2;
