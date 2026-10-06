@@ -14,7 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! The preference store: namespaced, typed, TOML-backed, atomically written.
+//! The preference store: namespaced, typed, TOML-backed, atomically written —
+//! ONE store with the kernel's (PRINCIPIAFILES, rmbp-ledger B445; R79, R98).
 //!
 //! # Shape
 //!
@@ -24,37 +25,41 @@
 //! ([`PrefValue`]) — exactly what a TOML scalar carries losslessly, so nothing
 //! is retyped by a save/load cycle.
 //!
-//! On disk that maps to the obvious hand-editable TOML: one table per
-//! namespace, dotted keys expanded into sub-tables.
-//!
-//! ```toml
-//! [aether]
-//! homepage = "https://una.os/"
-//!
-//! [aether.window]
-//! width = 1280
-//! height = 800
-//! ```
+//! On disk the store is a FOLDER, `<home>/settings/`, one human-readable TOML
+//! file per DOMAIN (`display`, `login`, `desktop`, `sound`, `trackpad`,
+//! `general`, and a program's own: `vein`, `aether`, `app.<name>.*` -> `<name>`).
+//! Everything about that shape is `prefs_core::files` — the domain rule, the
+//! split, the text (`# auto-saved <ISO> by <who>`, the schema's doc above each
+//! key) — and every file is read with `prefs_core::PrefTree::parse`: the very
+//! code the kernel (`unaos/crates/kernel/src/prefs.rs`) reads and writes the
+//! same folder with. The single `~/.config/unaos/preferences.toml` of before
+//! R98 is migrated ONCE into the folder and deleted, by the writer of record
+//! ([`PrefStore::settle`], which `Principia` runs), exactly as the kernel does.
 //!
 //! # Rules
 //!
 //! - **Defaults live with the consumer.** The store never invents a value;
 //!   [`PrefStore::get`] answers `Option`, and an unset key is simply unset.
-//! - **Every write is atomic.** A set serializes the whole document into a
-//!   sibling temp file, fsyncs it, and `rename`s it over the real one — a
-//!   reader (or a crash) sees the old file or the new one, never a partial.
+//! - **Every write is atomic, and touches one domain.** A set renders its
+//!   domain's file into `<domain>.new` (the kernel's swap name), fsyncs it,
+//!   reads it back (it must parse to the domain's tree), and `rename`s it over
+//!   the real one — a reader (or a crash) sees the old file or the new one.
+//! - **A refused file is never overwritten.** A domain file outside the subset
+//!   is not adopted; its writes are HELD (the kernel's rule), so the user's
+//!   file survives until they fix or delete it.
 //! - **A key is a leaf.** `window` and `window.width` cannot both hold values,
 //!   because TOML cannot express it; the collision is rejected at set time
 //!   rather than at save time, so the in-memory state never diverges from what
 //!   is persistable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use bandy::PrefValue;
+use prefs_core::{PrefTree, files};
 
 /// One namespace's flat key → value map (sorted: a stable file diff).
 type Namespace = BTreeMap<String, PrefValue>;
@@ -69,47 +74,135 @@ pub struct SetOutcome {
     pub clamped: bool,
 }
 
-/// The namespaced preference store, cached in memory and backed by a TOML file.
+/// The namespaced preference store, cached in memory and backed by the
+/// `<home>/settings/` folder of domain files.
 ///
 /// Reload-on-external-change is **not** implemented: the store is the writer of
-/// record, and an edit made to the file underneath a running Principia is not
+/// record, and an edit made to a file underneath a running Principia is not
 /// noticed until the next load. (Queued — see the README.)
 pub struct PrefStore {
-    path: PathBuf,
+    dir: PathBuf,
     namespaces: BTreeMap<String, Namespace>,
+    /// Domains whose file `prefs_core` refused at load: their writes are held.
+    held: BTreeSet<String>,
+    /// The tree came from the pre-R98 single file: [`PrefStore::settle`] writes the folder and deletes it.
+    migrate_from: Option<PathBuf>,
+    /// Values the load clamped into their schema range (re-saved by [`PrefStore::settle`]).
+    clamped: usize,
+    /// The `<iso>` of the auto-saved line (the UTC clock; a fixed one in tests).
+    clock: fn() -> String,
 }
 
 impl PrefStore {
-    /// Load the store from `path`. A missing file is an empty store, not an
-    /// error — first boot has no preferences. A malformed file IS an error:
-    /// silently starting empty would let a save overwrite a user's settings
-    /// with nothing.
-    pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        let namespaces = match fs::read_to_string(&path) {
-            Ok(text) => parse_document(&text)
-                .with_context(|| format!("parsing preferences at {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => {
-                return Err(e).with_context(|| format!("reading {}", path.display()));
+    /// Load the store from the folder `dir` (`<home>/settings`). READ-ONLY: a
+    /// reader (Vein, Quartzite) may call it. A missing folder is an empty
+    /// store — first boot has no preferences. Each `<domain>` file (or, when it
+    /// is absent, an orphaned `<domain>.new`: its swap was interrupted) is
+    /// parsed by `prefs_core`; a refused one is NOT adopted and its domain is
+    /// held. With no domain file at all, the pre-R98 single file
+    /// (`<dir>/../` + [`files::LEGACY`]) is read in its place, and
+    /// [`PrefStore::settle`] migrates it. Values outside their schema range are
+    /// clamped by the shared rule, as the kernel's load does.
+    pub fn load(dir: impl Into<PathBuf>) -> Result<Self> {
+        let dir = dir.into();
+        let mut tree = PrefTree::new();
+        let (mut held, mut found) = (BTreeSet::new(), false);
+        for d in domains_in(&dir)? {
+            match read_domain(&dir, &d) {
+                Ok(Some(t)) => {
+                    files::merge(&mut tree, &t);
+                    found = true;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log::error!("[PRINCIPIA] :: settings/{d} refused ({e:#}); its writes are held — fix or delete it");
+                    held.insert(d);
+                }
             }
-        };
-        Ok(Self { path, namespaces })
+        }
+        let mut migrate_from = None;
+        if !found && held.is_empty() {
+            let lp = legacy_of(&dir);
+            match fs::read_to_string(&lp) {
+                Ok(text) => match PrefTree::parse(&text) {
+                    Ok(t) => {
+                        tree = t;
+                        migrate_from = Some(lp);
+                    }
+                    Err(e) => log::error!(
+                        "[PRINCIPIA] :: {} refused (line {}: {}): not migrated, left in place (R98)",
+                        lp.display(), e.line, e.why
+                    ),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("reading {}", lp.display())),
+            }
+        }
+        let clamped = prefs_core::schema::clamp_tree(&mut tree);
+        let mut s = Self::empty(dir);
+        s.held = held;
+        s.migrate_from = migrate_from;
+        s.clamped = clamped;
+        for (ns, k, v) in tree.entries() {
+            s.namespaces.entry(ns.to_string()).or_default().insert(k.to_string(), from_core(v));
+        }
+        Ok(s)
     }
 
-    /// An empty store bound to `path`, without reading anything — the honest
-    /// fallback when the real file cannot be trusted (see
-    /// `Principia::with_config_dir`'s quarantine path).
-    pub fn empty(path: impl Into<PathBuf>) -> Self {
+    /// An empty store bound to the folder `dir`, without reading anything.
+    pub fn empty(dir: impl Into<PathBuf>) -> Self {
         Self {
-            path: path.into(),
+            dir: dir.into(),
             namespaces: BTreeMap::new(),
+            held: BTreeSet::new(),
+            migrate_from: None,
+            clamped: 0,
+            clock: now_iso,
         }
     }
 
-    /// The file this store persists to.
+    /// The writer of record's step after [`PrefStore::load`] (the kernel's
+    /// load does the same): a tree read from the pre-R98 single file is
+    /// written as the domain files and the old file (and its `.new`) is
+    /// DELETED; a load that clamped re-saves, so the files hold the clamp.
+    /// Answers whether the legacy file was migrated.
+    pub fn settle(&mut self) -> Result<bool> {
+        if let Some(lp) = self.migrate_from.clone() {
+            let n = self.save_all()?;
+            let _ = fs::remove_file(&lp);
+            let mut tmp = lp.clone().into_os_string();
+            tmp.push(".new");
+            let _ = fs::remove_file(PathBuf::from(tmp));
+            self.migrate_from = None;
+            self.clamped = 0;
+            log::info!("[PRINCIPIA] :: migrated {} -> {} ({n} keys, R98)", lp.display(), self.dir.display());
+            return Ok(true);
+        }
+        if self.clamped > 0 {
+            self.save_all()?;
+            self.clamped = 0;
+        }
+        Ok(false)
+    }
+
+    /// Replace the auto-saved line's clock (tests pin it to compare bytes).
+    pub fn set_clock(&mut self, clock: fn() -> String) {
+        self.clock = clock;
+    }
+
+    /// The folder this store persists to (`<home>/settings`).
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.dir
+    }
+
+    /// `<dir>/<domain>`.
+    pub fn domain_path(&self, domain: &str) -> PathBuf {
+        self.dir.join(domain)
+    }
+
+    /// Domains whose file was refused at load (their writes are held).
+    pub fn held(&self) -> Vec<String> {
+        self.held.iter().cloned().collect()
     }
 
     /// The value of `ns`/`key`, or `None` if unset. The caller owns the
@@ -153,7 +246,7 @@ impl PrefStore {
         prefs_core::schema::effective(ns, key, &host).map(|(v, src)| (from_core(&v), src))
     }
 
-    /// Set `ns`/`key` and persist the whole document atomically.
+    /// Set `ns`/`key` and persist its DOMAIN's file atomically.
     ///
     /// The write first goes through the ONE schema validator both rings run,
     /// `prefs_core::schema::check` (PRINCIPIA2, SR32): a declared key written
@@ -162,9 +255,9 @@ impl PrefStore {
     /// unprintable string is refused. An undeclared key is stored as given.
     ///
     /// Errors on a malformed namespace/key, a schema refusal, a key that
-    /// collides with an existing dotted path, or a failed write — and on error
-    /// the in-memory cache is left exactly as it was, so cache and file never
-    /// disagree.
+    /// collides with an existing dotted path, a held domain, or a failed write
+    /// — and on error the in-memory cache is left exactly as it was, so cache
+    /// and files never disagree.
     pub fn set(&mut self, ns: &str, key: &str, value: PrefValue) -> Result<SetOutcome> {
         validate_ns(ns)?;
         validate_key(key)?;
@@ -172,6 +265,13 @@ impl PrefStore {
             .map_err(|r| anyhow::anyhow!("refused `{ns}`.`{key}` = {}: {r}", to_core(&value)))?;
         let outcome = SetOutcome { value: from_core(&applied.value), clamped: applied.clamped };
         let value = outcome.value.clone();
+        let domain = files::domain_of(ns, key);
+        if !files::valid_domain(&domain) {
+            bail!("`{ns}`.`{key}` has no settings file (domain `{domain}`)");
+        }
+        if self.held.contains(&domain) {
+            bail!("held: settings/{domain} was refused at load; fix or delete it");
+        }
 
         let entry = self.namespaces.entry(ns.to_string()).or_default();
         if let Some(other) = colliding_key(entry, key) {
@@ -182,7 +282,7 @@ impl PrefStore {
         }
 
         let previous = entry.insert(key.to_string(), value);
-        if let Err(e) = self.persist() {
+        if let Err(e) = self.save_domain(&domain) {
             // Roll the cache back to the persisted truth.
             let entry = self.namespaces.entry(ns.to_string()).or_default();
             match previous {
@@ -201,59 +301,147 @@ impl PrefStore {
         Ok(outcome)
     }
 
-    /// Serialize the store and replace the file atomically: write a sibling
-    /// temp file, flush + fsync it, then `rename` it into place.
-    fn persist(&self) -> Result<()> {
-        let text = self.to_toml()?;
-
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+    /// The whole store as `prefs_core`'s tree (the value model both rings share).
+    pub fn tree(&self) -> PrefTree {
+        let mut t = PrefTree::new();
+        for (ns, entries) in &self.namespaces {
+            for (k, v) in entries {
+                let _ = t.set(ns, k, to_core(v));
+            }
         }
-
-        // Same directory as the target, so the rename is within one filesystem
-        // (a cross-device rename is not atomic and would fail outright).
-        let mut tmp = self.path.clone().into_os_string();
-        tmp.push(format!(".tmp.{}", std::process::id()));
-        let tmp = PathBuf::from(tmp);
-
-        {
-            let mut f = fs::File::create(&tmp)
-                .with_context(|| format!("creating {}", tmp.display()))?;
-            f.write_all(text.as_bytes())
-                .with_context(|| format!("writing {}", tmp.display()))?;
-            f.sync_all()
-                .with_context(|| format!("syncing {}", tmp.display()))?;
-        }
-
-        fs::rename(&tmp, &self.path).with_context(|| {
-            format!("renaming {} onto {}", tmp.display(), self.path.display())
-        })?;
-        Ok(())
+        t
     }
 
-    /// The whole store as TOML text (dotted keys expanded into sub-tables).
-    pub fn to_toml(&self) -> Result<String> {
-        let mut doc = toml::Table::new();
-        for (ns, entries) in &self.namespaces {
-            let mut table = toml::Table::new();
-            for (key, value) in entries {
-                insert_dotted(&mut table, key, to_toml_value(value))
-                    .with_context(|| format!("serializing `{ns}`.`{key}`"))?;
+    /// The text of `domain`'s file as it would be written now.
+    pub fn render_domain(&self, domain: &str) -> String {
+        let part = files::part(&self.tree(), domain);
+        files::render(domain, &part, &(self.clock)(), &files::writer_of(domain), &doc_of)
+    }
+
+    /// Write EVERY domain the store holds (the migration, the load-time clamp).
+    /// `Ok(keys written)`; a held domain is skipped.
+    pub fn save_all(&self) -> Result<usize> {
+        let mut n = 0;
+        for d in files::split(&self.tree()).into_keys() {
+            if !self.held.contains(&d) {
+                n += self.save_domain(&d)?;
             }
-            doc.insert(ns.clone(), toml::Value::Table(table));
         }
-        let body = toml::to_string_pretty(&doc).context("serializing preferences")?;
-        Ok(format!("{HEADER}{body}"))
+        Ok(n)
+    }
+
+    /// Write ONE domain's file by the kernel's swap: `<d>.new` written and
+    /// fsynced, READ BACK and parsed (it must be the domain's tree), then
+    /// renamed over `<d>`. `Ok(keys written)`.
+    fn save_domain(&self, domain: &str) -> Result<usize> {
+        let part = files::part(&self.tree(), domain);
+        let text = files::render(domain, &part, &(self.clock)(), &files::writer_of(domain), &doc_of);
+        fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
+        let path = self.domain_path(domain);
+        let tmp = self.dir.join(format!("{domain}.new"));
+        {
+            let mut f = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+            f.write_all(text.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
+            f.sync_all().with_context(|| format!("syncing {}", tmp.display()))?;
+        }
+        let back = fs::read_to_string(&tmp).with_context(|| format!("reading back {}", tmp.display()))?;
+        match PrefTree::parse(&back) {
+            Ok(t) if back == text && (t == part || t.to_toml() == part.to_toml()) => {}
+            _ => bail!("read-back of {} is not the domain's tree", tmp.display()),
+        }
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("renaming {} onto {}", tmp.display(), path.display()))?;
+        Ok(part.len())
+    }
+
+    /// The whole store as ONE TOML document (`prefs_core`'s emission of the
+    /// tree) — the pre-R98 single file's shape; the files are per domain.
+    pub fn to_toml(&self) -> Result<String> {
+        Ok(self.tree().to_toml())
     }
 }
 
-const HEADER: &str = "\
-# UnaOS preferences — written by the principia handler.
-# One table per namespace; dotted keys are expanded into sub-tables.
-# Hand edits are read on next load (live reload is not implemented yet).
+/// The comment above a key: the schema's `doc`. A program's declared doc
+/// (`PrefDeclare`, `app.<name>.*`) is the kernel's registry; Principia has
+/// none yet, so an `app` key is written without one.
+fn doc_of(ns: &str, key: &str) -> Option<String> {
+    if ns == files::APP_NS {
+        return None;
+    }
+    files::schema_doc(ns, key)
+}
 
-";
+/// `<dir>/..` + [`files::LEGACY`]: the pre-R98 single file of the home that
+/// holds `dir` (the kernel's `legacy_path`).
+pub fn legacy_of(dir: &Path) -> PathBuf {
+    dir.parent().unwrap_or(Path::new("")).join(files::LEGACY)
+}
+
+/// The domains in `dir` (a `<d>.new` alone counts: its swap was interrupted).
+fn domains_in(dir: &Path) -> Result<Vec<String>> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
+    };
+    let mut v = BTreeSet::new();
+    for e in rd.flatten() {
+        if !e.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        let d = name.strip_suffix(".new").unwrap_or(&name);
+        if files::valid_domain(d) {
+            v.insert(d.to_string());
+        }
+    }
+    Ok(v.into_iter().collect())
+}
+
+/// One domain file (or its orphaned `.new`): `Ok(None)` = absent, `Err` = refused.
+fn read_domain(dir: &Path, d: &str) -> Result<Option<PrefTree>> {
+    let parse = |p: &Path, text: &str| {
+        PrefTree::parse(text).map_err(|e| anyhow::anyhow!("{} line {}: {}", p.display(), e.line, e.why))
+    };
+    let p = dir.join(d);
+    match fs::read_to_string(&p) {
+        Ok(t) => return parse(&p, &t).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", p.display())),
+    }
+    let tmp = dir.join(format!("{d}.new"));
+    match fs::read_to_string(&tmp).ok().map(|t| parse(&tmp, &t)) {
+        Some(Ok(t)) => {
+            log::info!("[PRINCIPIA] :: adopted {} (the swap was interrupted)", tmp.display());
+            Ok(Some(t))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// UTC now as `YYYY-MM-DDTHH:MM:SSZ` (the kernel's `clock::iso8601_now` shape).
+pub fn now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    iso_of(secs)
+}
+
+/// Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (civil-from-days, proleptic Gregorian).
+pub fn iso_of(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
 
 // ---------------------------------------------------------------------------
 // DEFAULT RULES — what a prefs_core rule may see on the host
@@ -355,99 +543,6 @@ pub fn from_core(v: &prefs_core::PrefValue) -> PrefValue {
 }
 
 // ---------------------------------------------------------------------------
-// TOML <-> PrefValue
-// ---------------------------------------------------------------------------
-
-fn to_toml_value(v: &PrefValue) -> toml::Value {
-    match v {
-        PrefValue::Str(s) => toml::Value::String(s.clone()),
-        PrefValue::Int(i) => toml::Value::Integer(*i),
-        PrefValue::Float(f) => toml::Value::Float(*f),
-        PrefValue::Bool(b) => toml::Value::Boolean(*b),
-    }
-}
-
-/// The four scalar types the store carries. Anything else in the file (array,
-/// datetime) is outside the value domain and is skipped on load rather than
-/// coerced into a lie.
-fn from_toml_value(v: &toml::Value) -> Option<PrefValue> {
-    match v {
-        toml::Value::String(s) => Some(PrefValue::Str(s.clone())),
-        toml::Value::Integer(i) => Some(PrefValue::Int(*i)),
-        toml::Value::Float(f) => Some(PrefValue::Float(*f)),
-        toml::Value::Boolean(b) => Some(PrefValue::Bool(*b)),
-        _ => None,
-    }
-}
-
-/// Expand `a.b.c = v` into nested tables, failing rather than clobbering if a
-/// path segment is already a value (the collision `set` rejects up front).
-fn insert_dotted(table: &mut toml::Table, key: &str, value: toml::Value) -> Result<()> {
-    let mut segments = key.split('.').peekable();
-    let mut cursor = table;
-    while let Some(segment) = segments.next() {
-        if segments.peek().is_none() {
-            cursor.insert(segment.to_string(), value);
-            return Ok(());
-        }
-        let next = cursor
-            .entry(segment.to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        cursor = match next {
-            toml::Value::Table(t) => t,
-            _ => bail!("path segment `{segment}` of `{key}` is already a value"),
-        };
-    }
-    unreachable!("a validated key has at least one segment")
-}
-
-/// Flatten a namespace's (possibly nested) table back into dotted keys.
-fn flatten_into(prefix: &str, table: &toml::Table, out: &mut Namespace) {
-    for (name, value) in table {
-        let key = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}.{name}")
-        };
-        match value {
-            toml::Value::Table(inner) => flatten_into(&key, inner, out),
-            other => {
-                if let Some(v) = from_toml_value(other) {
-                    out.insert(key, v);
-                } else {
-                    log::warn!(
-                        "[PRINCIPIA] :: ignoring `{key}`: unsupported preference value type"
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn parse_document(text: &str) -> Result<BTreeMap<String, Namespace>> {
-    let doc: toml::Table = toml::from_str(text)?;
-    let mut namespaces = BTreeMap::new();
-    for (ns, value) in &doc {
-        match value {
-            toml::Value::Table(table) => {
-                let mut entries = Namespace::new();
-                flatten_into("", table, &mut entries);
-                if !entries.is_empty() {
-                    namespaces.insert(ns.clone(), entries);
-                }
-            }
-            _ => {
-                log::warn!(
-                    "[PRINCIPIA] :: ignoring top-level `{ns}`: preferences live under \
-                     a [namespace] table"
-                );
-            }
-        }
-    }
-    Ok(namespaces)
-}
-
-// ---------------------------------------------------------------------------
 // TESTS
 // ---------------------------------------------------------------------------
 
@@ -456,7 +551,7 @@ mod tests {
     use super::*;
 
     fn store(dir: &tempfile::TempDir) -> PrefStore {
-        PrefStore::load(dir.path().join("preferences.toml")).expect("fresh store loads")
+        PrefStore::load(dir.path().join(files::DIR)).expect("fresh store loads")
     }
 
     #[test]
@@ -470,16 +565,15 @@ mod tests {
         s.set("system", "scale", PrefValue::Float(1.5)).unwrap();
         s.set("system", "verbose", PrefValue::Bool(true)).unwrap();
 
-        // The atomic write landed, and left no temp file behind.
-        let path = dir.path().join("preferences.toml");
-        assert!(path.exists(), "the store file must exist after a set");
-        let strays: Vec<_> = fs::read_dir(dir.path())
+        // The atomic writes landed, one file per domain, and left no temp file behind.
+        let path = s.path().to_path_buf();
+        let mut names: Vec<_> = fs::read_dir(&path)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n != "preferences.toml")
             .collect();
-        assert!(strays.is_empty(), "temp files must be renamed away: {strays:?}");
+        names.sort();
+        assert_eq!(names, ["aether", "general"], "one file per domain, temp files renamed away");
 
         // A fresh load sees exactly what was set, with types intact.
         let reloaded = PrefStore::load(&path).unwrap();
@@ -671,33 +765,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = store(&dir);
         s.set("aether", "window.width", PrefValue::Int(1280)).unwrap();
-        let text = fs::read_to_string(s.path()).unwrap();
-        assert!(text.contains("[aether.window]"), "dotted keys nest: {text}");
-        assert!(text.contains("width = 1280"), "{text}");
+        let text = fs::read_to_string(s.domain_path("aether")).unwrap();
+        assert!(text.starts_with("# settings/aether"), "{text}");
+        assert!(text.contains("# auto-saved ") && text.contains(" by the program aether\n"), "{text}");
+        assert!(text.contains("\n[aether]\nwindow.width = 1280\n"), "dotted keys on their own line: {text}");
     }
 
-    /// A file written by hand (or by a future version) with a value type the
-    /// store does not carry must not poison the load.
+    /// A domain file written by hand with a value type outside the subset is
+    /// REFUSED as the kernel refuses it: its domain is held (never overwritten),
+    /// every other domain loads.
     #[test]
-    fn unsupported_value_types_are_skipped_not_fatal() {
+    fn a_refused_domain_is_held_not_wiped() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("preferences.toml");
-        fs::write(
-            &path,
-            "[aether]\nhomepage = \"x\"\nrecents = [\"a\", \"b\"]\n",
-        )
-        .unwrap();
-        let s = PrefStore::load(&path).unwrap();
-        assert_eq!(s.get("aether", "homepage"), Some(PrefValue::Str("x".into())));
-        assert_eq!(s.get("aether", "recents"), None);
-    }
-
-    #[test]
-    fn a_malformed_file_is_an_error_not_a_silent_wipe() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("preferences.toml");
-        fs::write(&path, "this is not = = toml").unwrap();
-        assert!(PrefStore::load(&path).is_err());
+        let sd = dir.path().join(files::DIR);
+        fs::create_dir_all(&sd).unwrap();
+        let bad = "[aether]\nhomepage = \"x\"\nrecents = [\"a\", \"b\"]\n";
+        fs::write(sd.join("aether"), bad).unwrap();
+        fs::write(sd.join("sound"), "[system]\naudio.volume = 7\n").unwrap();
+        let mut s = PrefStore::load(&sd).unwrap();
+        assert_eq!(s.held(), ["aether"]);
+        assert_eq!(s.get("aether", "homepage"), None);
+        assert_eq!(s.get("system", "audio.volume"), Some(PrefValue::Int(7)));
+        assert!(s.set("aether", "homepage", PrefValue::Str("y".into())).is_err(), "held");
+        assert_eq!(fs::read_to_string(sd.join("aether")).unwrap(), bad, "the user's file is untouched");
+        s.set("system", "audio.volume", PrefValue::Int(9)).unwrap();
+        assert!(!s.settle().unwrap());
+        assert_eq!(fs::read_to_string(sd.join("aether")).unwrap(), bad);
     }
 
     /// PREFS (B300): the tree `prefs_core`'s golden test uses, built through THIS store.
@@ -749,22 +842,128 @@ mod tests {
         assert_eq!(prefs_core::PrefTree::parse(&t1).unwrap().to_toml(), t1);
     }
 
-    /// PREFS (B300): a file the KERNEL wrote (prefs_core's emitter) loads here to the same values.
+    fn fixed_clock() -> String {
+        String::from("2026-10-06T12:00:00Z")
+    }
+
+    /// The kernel's load (`unaos/crates/kernel/src/prefs.rs` `load`), minus the VFS: every domain file
+    /// parsed by `prefs_core` and merged; then its `save_domain` text for each domain with the file's
+    /// own stamp. What a kernel would write back after reading this folder.
+    fn kernel_reads_and_rewrites(dir: &Path) -> BTreeMap<String, String> {
+        let mut tree = PrefTree::new();
+        let mut stamps = BTreeMap::new();
+        for d in domains_in(dir).unwrap() {
+            let text = fs::read_to_string(dir.join(&d)).unwrap();
+            let (iso, by) = files::stamp_of(&text).expect("an auto-saved line");
+            stamps.insert(d.clone(), (iso.to_string(), by.to_string()));
+            files::merge(&mut tree, &PrefTree::parse(&text).expect("the kernel accepts principia's file"));
+        }
+        let kdoc = |ns: &str, k: &str| if ns == files::APP_NS { None } else { files::schema_doc(ns, k) };
+        files::split(&tree)
+            .iter()
+            .map(|(d, part)| {
+                let (iso, by) = &stamps[d];
+                assert_eq!(by, &files::writer_of(d), "the kernel's by for {d}");
+                (d.clone(), files::render(d, part, iso, by, &kdoc))
+            })
+            .collect()
+    }
+
+    fn folder_bytes(dir: &Path) -> BTreeMap<String, String> {
+        domains_in(dir).unwrap().into_iter().map(|d| (d.clone(), fs::read_to_string(dir.join(&d)).unwrap())).collect()
+    }
+
+    /// PRINCIPIAFILES (B445): Principia writes the folder → the kernel's reader reads it and re-renders
+    /// every domain BYTE FOR BYTE → Principia loads that and re-saves it byte for byte. One store.
     #[test]
-    fn a_prefs_core_file_loads_in_principia() {
-        let mut t = prefs_core::PrefTree::new();
+    fn principia_kernel_principia_round_trip_is_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = golden_store(&dir);
+        s.set_clock(fixed_clock);
+        s.set("app", "lumen.window.frame", PrefValue::Str("10,20,800,600".into())).unwrap();
+        s.set("vein", "temperature", PrefValue::Float(0.5)).unwrap();
+        s.set("system", "login.items", PrefValue::Str("shell".into())).unwrap();
+        s.set("system", "pointer.speed", PrefValue::Int(2)).unwrap();
+        s.save_all().unwrap();
+        let mine = folder_bytes(s.path());
+        assert_eq!(
+            mine.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["aether", "desktop", "display", "login", "lumen", "sound", "trackpad", "vein"]
+        );
+        let kern = kernel_reads_and_rewrites(s.path());
+        assert_eq!(kern, mine, "the kernel re-renders principia's folder byte for byte");
+
+        // ...and back: the kernel's bytes in a fresh home, loaded and re-saved by Principia.
+        let home2 = tempfile::tempdir().unwrap();
+        let d2 = home2.path().join(files::DIR);
+        fs::create_dir_all(&d2).unwrap();
+        for (d, text) in &kern {
+            fs::write(d2.join(d), text).unwrap();
+        }
+        let mut back = PrefStore::load(&d2).unwrap();
+        back.set_clock(fixed_clock);
+        assert!(back.held().is_empty());
+        assert_eq!(back.tree(), s.tree());
+        back.save_all().unwrap();
+        assert_eq!(folder_bytes(&d2), kern, "principia re-writes the kernel's folder byte for byte");
+        for (d, text) in &kern {
+            assert_eq!(&back.render_domain(d), text);
+        }
+    }
+
+    /// PRINCIPIAFILES (B445), the migration both rings run: a pre-R98 `preferences.toml` (Principia's
+    /// old single file; the kernel's emitter wrote the same bytes) becomes the domain files, once, and
+    /// is deleted — by the writer of record. A reader (`load` alone) sees the values and writes nothing.
+    #[test]
+    fn the_legacy_single_file_migrates_once_and_is_deleted() {
+        let mut t = PrefTree::new();
         t.set("system", "display.brightness", prefs_core::PrefValue::Int(9)).unwrap();
         t.set("system", "display.wallpaper", prefs_core::PrefValue::Str("/home/ann/SKY.PNG".into())).unwrap();
         t.set("system", "audio.mute", prefs_core::PrefValue::Bool(true)).unwrap();
         t.set("system", "dock.pins", prefs_core::PrefValue::Str("console,shell".into())).unwrap();
         t.set("system", "pointer.speed", prefs_core::PrefValue::Int(2)).unwrap();
+        t.set("system", "audio.volume", prefs_core::PrefValue::Int(99)).unwrap(); // outside 0..16: clamped
+        let home = tempfile::tempdir().unwrap();
+        let sd = home.path().join(files::DIR);
+        let lp = home.path().join(files::LEGACY);
+        assert_eq!(legacy_of(&sd), lp);
+        fs::create_dir_all(lp.parent().unwrap()).unwrap();
+        fs::write(&lp, t.to_toml()).unwrap();
+
+        let reader = PrefStore::load(&sd).unwrap();
+        assert_eq!(reader.get("system", "display.brightness"), Some(PrefValue::Int(9)));
+        assert_eq!(reader.get("system", "audio.volume"), Some(PrefValue::Int(16)), "the shared clamp");
+        assert!(lp.exists() && !sd.exists(), "a reader migrates nothing");
+
+        let mut w = PrefStore::load(&sd).unwrap();
+        w.set_clock(fixed_clock);
+        assert!(w.settle().unwrap());
+        assert!(!lp.exists(), "the old file is deleted");
+        assert_eq!(folder_bytes(&sd).keys().map(String::as_str).collect::<Vec<_>>(), ["desktop", "display", "sound", "trackpad"]);
+        let again = PrefStore::load(&sd).unwrap();
+        assert_eq!(again.tree(), w.tree());
+        assert_eq!(again.get("system", "audio.volume"), Some(PrefValue::Int(16)));
+        assert_eq!(kernel_reads_and_rewrites(&sd), folder_bytes(&sd));
+        // A legacy file that reappears beside domain files is ignored (migrated ONCE).
+        fs::write(&lp, "[system]\ndisplay.brightness = 3\n").unwrap();
+        assert_eq!(PrefStore::load(&sd).unwrap().get("system", "display.brightness"), Some(PrefValue::Int(9)));
+    }
+
+    /// An interrupted swap (`<d>.new` alone) is adopted, as the kernel adopts it.
+    #[test]
+    fn an_orphaned_swap_is_adopted() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("preferences.toml");
-        fs::write(&path, t.to_toml()).unwrap();
-        let s = PrefStore::load(&path).unwrap();
-        for (ns, key, v) in t.entries() {
-            assert_eq!(s.get(ns, key).map(|v| to_core(&v)), Some(v.clone()), "{ns}.{key}");
-        }
-        assert_eq!(s.to_toml().unwrap(), t.to_toml(), "and principia re-writes it byte for byte");
+        let sd = dir.path().join(files::DIR);
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(sd.join("sound.new"), "[system]\naudio.volume = 5\n").unwrap();
+        let s = PrefStore::load(&sd).unwrap();
+        assert_eq!(s.get("system", "audio.volume"), Some(PrefValue::Int(5)));
+    }
+
+    #[test]
+    fn iso_is_the_civil_utc_date() {
+        assert_eq!(iso_of(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_of(1_791_288_000), "2026-10-06T12:00:00Z");
+        assert_eq!(iso_of(951_782_400), "2000-02-29T00:00:00Z");
     }
 }

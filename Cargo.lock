@@ -3915,7 +3915,6 @@ dependencies = [
  "prefs_core",
  "tempfile",
  "tokio",
- "toml",
 ]
 
 [[package]]
