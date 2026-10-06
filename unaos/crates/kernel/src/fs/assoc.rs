@@ -264,21 +264,10 @@ pub fn builds() -> usize {
     BUILDS.load(Ordering::Relaxed)
 }
 
-/// Build the registry now, one wire line. `why` = `login` · `tests` · `verb`.
+/// Build the registry now, one wire line. `why` = `login` · `tests` · `verb`. ASSOCSTAMP (B460): `login`/`verb` read the
+/// generation stamp first and skip the walk when it matches; `tests` always builds in full.
 pub fn build(why: &str) -> usize {
-    let t0 = crate::arch::ms();
-    let mt = crate::shell::vfs_mount_table();
-    BUILDS.fetch_add(1, Ordering::Relaxed);
-    match seed_in(&mt) {
-        Ok((n, f)) => {
-            let _ = crate::fs::rootacl::stamp(&mt); // ROOTACL (B456): the system trees take the `system` owner once the registry is built
-            serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} ms={}", why, TYPES_DIR, n, f,
-                known_types_in(&mt).len(), crate::arch::ms().saturating_sub(t0));
-            n
-        }
-        Err(VfsError::Unsupported) => { serial_println!("[filetypes] built at={} dir=none reason=enotsup (root takes no attributes) source=registrants", why); 0 }
-        Err(e) => { serial_println!("[filetypes] built at={} FAILED ({}) source=registrants", why, crate::fs::attrsys::refusal(&e)); 0 }
-    }
+    build_stamped(why, why == "tests").0
 }
 
 /// `login ok` (`login::close_into_session`): the registry is owed. On x86 with the compositor the device-service
@@ -634,4 +623,118 @@ pub fn openertrust_selftest() {
         ":: OPENERTRUST: registrant={} foreign_path={} carried={} -> {} :: kept={} foreign={} default={}",
         registrant, foreign_path, carried, if pass { "PASS" } else { "FAIL" }, kept, foreign, default
     );
+}
+
+// ── ASSOCSTAMP (rmbp-ledger B460): the registry's generation stamp ───────────────────────────────────────────────
+//
+// PERFREVIEW F4: a build with nothing to create re-walked every type (flight 24: `blocks_read=1191 … created=0
+// ms=1662`). The registry directory carries ONE attribute naming what it was built from; when the compiled-in type
+// set is unchanged the build is a single attribute read.
+
+/// The stamp's key, on [`TYPES_DIR`] itself.
+pub const STAMP_KEY: &str = "una:filetypes.stamp";
+/// The builder's version: bump when `seed_in` changes what it writes (the stamp then differs and the build runs once).
+pub const BUILDER_VERSION: u32 = 1;
+
+fn fnv(mut h: u64, b: &[u8]) -> u64 {
+    for &x in b.iter().chain([0u8].iter()) {
+        h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// The compiled-in type count: [`TYPE_FACTS`] ∪ every built-in's declared doc type. Pure.
+pub fn builtin_type_count() -> usize {
+    let mut n = TYPE_FACTS.len();
+    for m in appres::builtin_doctypes() {
+        if facts(&m).is_none() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The stamp this build would write: `v<version> h=<FNV-1a 64 of TYPE_FACTS, EXT_TABLE and APPRES's BUILTIN> n=<types>`.
+/// Pure (no I/O): everything `seed_in` derives an object from that is compiled in.
+pub fn stamp_now() -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    h = fnv(h, &BUILDER_VERSION.to_le_bytes());
+    for (m, g, d) in TYPE_FACTS.iter() {
+        h = fnv(fnv(fnv(h, m.as_bytes()), g.as_bytes()), d.as_bytes());
+    }
+    for (e, m) in ft::EXT_TABLE.iter() {
+        h = fnv(fnv(h, e.as_bytes()), m.as_bytes());
+    }
+    h = appres::builtin_hash(h);
+    alloc::format!("v{} h={:016x} n={}", BUILDER_VERSION, h, builtin_type_count())
+}
+
+/// The stamp the registry carries (ONE attribute read on one inode), `None` when absent or unreadable.
+pub fn stamp_on_disk(mt: &MountTable) -> Option<String> {
+    str_attr(mt, TYPES_DIR, STAMP_KEY)
+}
+
+/// Build unless the stamp matches (`force` builds regardless). `(created, skipped)`; one wire line either way.
+pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
+    let t0 = crate::arch::ms();
+    let io0 = crate::fs::bootstep::io();
+    let mt = crate::shell::vfs_mount_table();
+    BUILDS.fetch_add(1, Ordering::Relaxed);
+    let want = stamp_now();
+    if !force && stamp_on_disk(&mt).as_deref() == Some(want.as_str()) {
+        let d = crate::fs::bootstep::io().since(io0);
+        serial_println!("[filetypes] built at={} dir={} created=0 filled=0 types={} skipped=stamp stamp=v{} blocks_read={} cmds={} ms={}",
+            why, TYPES_DIR, builtin_type_count(), BUILDER_VERSION, d.blocks_read(), d.cmds(), crate::arch::ms().saturating_sub(t0));
+        return (0, true);
+    }
+    match seed_in(&mt) {
+        Ok((n, f)) => {
+            let _ = crate::fs::rootacl::stamp(&mt); // ROOTACL (B456): the system trees take the `system` owner once the registry is built
+            let st = match mt.set_attr(TYPES_DIR, STAMP_KEY, AttrValue::Str(want), KERNEL_PRINCIPAL) {
+                Ok(()) => "written",
+                Err(_) => "refused",
+            };
+            let d = crate::fs::bootstep::io().since(io0);
+            serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} stamp={} blocks_read={} cmds={} ms={}", why, TYPES_DIR, n, f,
+                known_types_in(&mt).len(), st, d.blocks_read(), d.cmds(), crate::arch::ms().saturating_sub(t0));
+            (n, false)
+        }
+        Err(VfsError::Unsupported) => { serial_println!("[filetypes] built at={} dir=none reason=enotsup (root takes no attributes) source=registrants", why); (0, false) }
+        Err(e) => { serial_println!("[filetypes] built at={} FAILED ({}) source=registrants", why, crate::fs::attrsys::refusal(&e)); (0, false) }
+    }
+}
+
+/// `tests assocstamp` (R80: run only when asked) — the registry built in full (the stamp written), the stamp check
+/// MEASURED (one attribute read: `blocks_read`, `cmds`, `ms`), then a stale stamp forcing exactly one full build that
+/// re-writes it, then a hit again.
+///
+/// `:: ASSOCSTAMP: stamp=<match|miss|none> blocks_read=<n> ms=<n> -> PASS|FAIL|SKIP reason= :: cmds=<n> stale=<rebuilt|why> rehit=<ok|why> bound_ms=10 stamp=<v> n=<n>`
+pub fn stamp_selftest() {
+    let mt = crate::shell::vfs_mount_table();
+    if !root_takes_attrs(&mt) {
+        serial_println!(":: ASSOCSTAMP: stamp=none blocks_read=0 ms=0 -> SKIP reason=no-attr-root ::");
+        return;
+    }
+    let _ = build_stamped("tests", true);
+    let want = stamp_now();
+    let t0 = crate::arch::ms();
+    let io0 = crate::fs::bootstep::io();
+    let have = stamp_on_disk(&mt);
+    let d = crate::fs::bootstep::io().since(io0);
+    let ms = crate::arch::ms().saturating_sub(t0);
+    let state = match &have { Some(h) if *h == want => "match", Some(_) => "miss", None => "none" };
+    // A stale stamp (an arc changed the type set): the next build must NOT skip, and must leave the stamp current.
+    let stale = if mt.set_attr(TYPES_DIR, STAMP_KEY, AttrValue::Str(String::from("v0 h=stale n=0")), KERNEL_PRINCIPAL).is_err() {
+        "set-refused"
+    } else {
+        match build_stamped("tests", false) {
+            (_, true) => "skipped-stale",
+            (_, false) if stamp_on_disk(&mt).as_deref() == Some(want.as_str()) => "rebuilt",
+            _ => "not-rewritten",
+        }
+    };
+    let rehit = if build_stamped("tests", false).1 { "ok" } else { "built-again" };
+    let pass = state == "match" && stale == "rebuilt" && rehit == "ok" && ms <= 10;
+    serial_println!(":: ASSOCSTAMP: stamp={} blocks_read={} ms={} -> {} :: cmds={} stale={} rehit={} bound_ms=10 stamp=v{} n={}",
+        state, d.blocks_read(), ms, if pass { "PASS" } else { "FAIL" }, d.cmds(), stale, rehit, BUILDER_VERSION, builtin_type_count());
 }

@@ -771,3 +771,14 @@ pub fn blit_icon_known(px: &mut [u32], stride: usize, h: usize, x: usize, y: usi
 pub fn knows(key: &str) -> bool {
     builtin_app(key).is_some() || REG.try_lock().map(|r| r.iter().any(|a| a.key == key)).unwrap_or(false)
 }
+
+/// ASSOCSTAMP (rmbp-ledger B460): fold every built-in's key and packed resource block into the FNV-1a 64 state `h`
+/// (the FILETYPES registry's generation stamp: a changed doc type, signature or name changes the hash). Pure.
+pub fn builtin_hash(mut h: u64) -> u64 {
+    for (k, b) in BUILTIN.iter() {
+        for &x in k.as_bytes().iter().chain([0u8].iter()).chain(b.iter()) {
+            h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}

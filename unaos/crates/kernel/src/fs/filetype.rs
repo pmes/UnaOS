@@ -260,7 +260,7 @@ pub fn ensure_tests() {
         // QUARRY2 (B336): `tests quarry2` rides this registration (no tests.rs line).
         #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
         crate::video::quarry::live::columns::ensure_tests();
-        #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::quarry::live::quarry3_tests(); crate::fs::appres::ensure_tests(); crate::tests::register("filetypes", crate::fs::assoc::selftest); // QUARRY3 (B413): `tests quarry3` rides this · FILETYPES (B423): `tests filetypes` too registration too. APPRES (B398): `tests appres` rides this registration (no tests.rs line).
+        #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::quarry::live::quarry3_tests(); crate::fs::appres::ensure_tests(); crate::tests::register("filetypes", crate::fs::assoc::selftest); crate::tests::register("assocstamp", crate::fs::assoc::stamp_selftest); // QUARRY3 (B413): `tests quarry3` rides this · FILETYPES (B423): `tests filetypes` too registration too. APPRES (B398): `tests appres` rides this registration (no tests.rs line).
         crate::tests::register("openertrust", crate::fs::assoc::openertrust_selftest); // OPENERTRUST (B447): `tests openertrust` rides this registration (no tests.rs line)
     }
 }
