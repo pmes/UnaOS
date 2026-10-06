@@ -1215,3 +1215,6 @@ pub mod settingsfiles;
 // APPEARANCE (B408, MACPARITY rows 21/22): Principia's `system.appearance.*` applied — Light/Dark, the accent, the highlight, one repaint. Same gate as settings; at the tail so no line above moves.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod appearance;
+// LAUNCHER (B417, MACPARITY row 36): Cmd-Space — one field over programs, files, settings and math. x86 `wc` (the overlay row and the key door are x86's); at the tail so no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod launcher;

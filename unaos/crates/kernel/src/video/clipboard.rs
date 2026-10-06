@@ -364,7 +364,7 @@ pub fn terminal_action_in(
         | Action::Deselect => ("ok", if !sel.apply(act, line.len()) { 0 } else if scroll { 2 } else { 1 }),
         // Not this consumer's business: the capture actions are delivered and acted on at the
         // decoder (`Action::is_capture`), and `LogOut` is KEYMAP's slot, bound by nobody.
-        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut | Action::BrightnessDown | Action::BrightnessUp | Action::CycleWindow | Action::LockScreen | Action::ShowShortcuts | Action::ScrollPageUp | Action::ScrollPageDown | Action::ScrollTop | Action::ScrollBottom | Action::SnapLeft | Action::SnapRight | Action::SnapZoom | Action::SnapRestore | Action::ScreenshotWindow | Action::WinNudgeLeft | Action::WinNudgeRight | Action::WinNudgeUp | Action::WinNudgeDown | Action::WinSizeLeft | Action::WinSizeRight | Action::WinSizeUp | Action::WinSizeDown | Action::Minimize | Action::CycleApp | Action::ClearView | Action::QuitApp | Action::CloseWindow | Action::HideApp | Action::OpenSettings | Action::ForceQuit | Action::GetInfo => ("ignored", 0),
+        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut | Action::BrightnessDown | Action::BrightnessUp | Action::CycleWindow | Action::LockScreen | Action::ShowShortcuts | Action::ScrollPageUp | Action::ScrollPageDown | Action::ScrollTop | Action::ScrollBottom | Action::SnapLeft | Action::SnapRight | Action::SnapZoom | Action::SnapRestore | Action::ScreenshotWindow | Action::WinNudgeLeft | Action::WinNudgeRight | Action::WinNudgeUp | Action::WinNudgeDown | Action::WinSizeLeft | Action::WinSizeRight | Action::WinSizeUp | Action::WinSizeDown | Action::Minimize | Action::CycleApp | Action::ClearView | Action::QuitApp | Action::CloseWindow | Action::HideApp | Action::OpenSettings | Action::ForceQuit | Action::GetInfo | Action::Launcher => ("ignored", 0),
         // TERMSEL2 M3 — the caret (`LineSel::caret_action`).
         Action::CursorLeft | Action::CursorRight | Action::CursorLineStart | Action::CursorLineEnd => {
             ("ok", sel.caret_action(act, line.len()))
@@ -418,7 +418,7 @@ pub const fn action_code(a: Action) -> u64 {
         Action::WinSizeLeft => 35,
         Action::WinSizeRight => 36,
         Action::WinSizeUp => 37,
-        Action::WinSizeDown => 38, Action::Minimize => 39, Action::CycleApp => 40, Action::ClearView => 41, Action::QuitApp => 42, Action::CloseWindow => 43, Action::HideApp => 44, Action::OpenSettings => 45, Action::ForceQuit => 46, Action::GetInfo => 47, // APPMENU2 (B393): the WM's system chords, consumed by `sysmenu::key` before ring 3; codes reserved for a router that declines // WINDOWLIST · LUMENBIN (⌘K, delivered to ring 3 as INPUT_EV_ACTION 41) // ATTRCOLUMNS (B402): ⌘I Get Info, code 47 (42 was taken by APPMENU2 QuitApp)
+        Action::WinSizeDown => 38, Action::Minimize => 39, Action::CycleApp => 40, Action::ClearView => 41, Action::QuitApp => 42, Action::CloseWindow => 43, Action::HideApp => 44, Action::OpenSettings => 45, Action::ForceQuit => 46, Action::GetInfo => 47, Action::Launcher => 48, // APPMENU2 (B393): the WM's system chords, consumed by `sysmenu::key` before ring 3; codes reserved for a router that declines // WINDOWLIST · LUMENBIN (⌘K, delivered to ring 3 as INPUT_EV_ACTION 41) // ATTRCOLUMNS (B402): ⌘I Get Info, code 47 (42 was taken by APPMENU2 QuitApp)
     }
 }
 

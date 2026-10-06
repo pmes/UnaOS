@@ -47,6 +47,7 @@ pub const C_CMD_COMMA: &str = "cmd-,";
 pub const C_CMD_ALT_ESC: &str = "cmd-alt-esc";
 pub const C_CTRL_CMD_Q: &str = "ctrl-cmd-q";
 pub const C_CMD_I: &str = "cmd-i"; // ATTRCOLUMNS (B402)
+pub const C_CMD_SPACE: &str = "cmd-space"; // LAUNCHER (B417)
 
 const fn s(chord: &'static str, scope: &'static str, action: &'static str, arc: &'static str) -> Shortcut {
     Shortcut { chord, scope, action, arc }
@@ -61,6 +62,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     s(C_CTRL_ALT_L, "Desktop", "Lock screen", "SCREENLOCK"),
     s(C_CTRL_CMD_Q, "Desktop", "Lock Screen", "APPMENU2"),
     s(C_CMD_ALT_ESC, "Desktop", "Force Quit...", "APPMENU2"),
+    s(C_CMD_SPACE, "Desktop", "Launcher", "LAUNCHER"),
     s("F1 / F2", "Desktop", "Brightness down / up", "BRIGHTKEYS"),
     s("F10 / F11 / F12", "Desktop", "Volume", "AUDIOKEYS"),
     s(C_CMD_SHIFT_3, "Capture", "Screenshot", "PRTSCR"),
