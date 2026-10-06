@@ -48,3 +48,14 @@ REQUIRE the reworded lines are updated by pattern only (R78: not run).
 - `python3 unaos/scripts/verdictwords.py --selftest` -> `boots=2 counts=[2, 0] tags=['PLANT', 'PLANT2'] -> ok`, exit 0.
 - f25-boots.log: `boot=1 from=1 until=deferred@539 before_deferred=32 tags=26 [AHCI APPMENU BANDY-ATTR BUSX86-EQ CFU2-WGATE DIMIDLE DOCKPIN FIRSTBOOT KFONTPPI LFNMV LOGWIT-1 PREFS SERWIT-2 SPLASH U10 U10c U10d U11m2 U11x U6gx U7x U8x U9x UNAFSX86 USBNET-EHCI XHCIHUB]`, `-> REFUSED`, exit 1.
 - f24-boots.log: four boots, before_deferred=14/13/14/17 (tags 13/13/13/16; boot 4, the login-screen boot, adds HDA, USBNET, WINDOWCAP), exit 1.
+
+## M2/M3 — legs (inline, sequential, target removed after each)
+- x86 metal shape (the seat's gate line, verbatim): `cargo +nightly check` exit 0.
+- aarch64 `login,loginst,virt_el0,lumen,desktop_firmware,quarry,facet,usbnet` (user_blob head 280080d2): exit 0.
+- aarch64 `tegra,login,loginst,virt_el0`: exit 0.
+- charter-check exit 0; attrkeys-check exit 0 (new=0); arch-check exit 0 (none new).
+
+## STATUS.tsv rows whose `line` quotes a changed line (the seat edits)
+ST66 (AHCI selfcheck: `-> armed`), ST86 (SERWIT-2: now `tests serwit2`), ST114 (DOCKPIN: `-> held`),
+ST133 and ST159 (UNAFSX86: `-> mounted`), ST188 (KFONTPPI: `-> armed`), ST240 (FIRSTBOOT: `-> coherent`).
+The quoted historical lines stay true of their flights; a re-quote from flight 26 carries the new word.
