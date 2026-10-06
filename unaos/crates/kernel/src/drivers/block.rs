@@ -518,7 +518,7 @@ pub fn alternate_program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
         // `program_source` never returns `Usb` (see its precedence note); mapped for totality.
         BlockHandle::Usb => None,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-        BlockHandle::Sdhc => info().map(|d| (d, BlockHandle::Global)),
+        BlockHandle::Sdhc => info().map(|d| (d, BlockHandle::Global)).or_else(|| usb_info().map(|d| (d, BlockHandle::Usb))), // USBSTOR (B384): a stick is no longer in the global slot when the boot card is the Sdhc handle, so the second volume (the wifi firmware-on-a-stick search) is the USB handle itself.
         // TEGRA-SDBLK: `program_source` never returns `SdMmc` either — the Orin's program volume is
         // the boot medium in the global slot, and the microSD is a SEPARATE disk that this arc gives a
         // read path, not a program-loading precedence (see the census note on `source_census`). Mapped
@@ -844,7 +844,7 @@ pub fn publish_usb_geometry_lun(dev: BlockDeviceInfo, lun: u8) -> usize {
     // claimed it, so the last mass-storage unit to configure owned the boot volume — the coin flip
     // trunk QUEUE §2 records. Index 0 is the first disk published since the slot was last empty, so
     // on a one-disk machine this is the same claim by the same call in the same order.
-    if ix == 0 {
+    if ix == 0 && !usb_global_closed(dev.slot_id) { // USBSTOR (B384, R95): once the boot medium is pinned on another handle, a USB disk is a SEPARATE disk and never the global slot — see `pin_boot_medium_once` at the file tail.
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BOOT_MEDIUM_VERDICT.store(BM_UNKNOWN, core::sync::atomic::Ordering::Release);
         *BLOCK_DEVICE.lock() = Some(dev);
@@ -3798,3 +3798,89 @@ pub fn ahci_port_write(port: u8, lba: u64, buf: &[u8]) -> Result<(), BlockError>
     }
     Ok(())
 }
+
+// ===================== USBSTOR (rmbp-ledger B384, R95) — the boot medium is never displaced ==========
+//
+// Flight 25 (f25-boots.log :327–:628): a 64 GB card in the hub's USB reader enumerated at boot, took
+// registry index 0 and with it the GLOBAL slot (`publish_usb_geometry_lun`, x86 arm). The rMBP boots
+// from the INTERNAL Sdhc card, and the users store's ladder (`fs/users.rs` `store_via_from`) prefers
+// `Global` whenever it exists, so the store mounted the STICK and `set-password … NOT written
+// reason=volume` twice; FRGUARD refused Default writes, correctly, against a slot the stick should
+// never have held. The shape :523 already names is the rule here: the boot medium keeps its handle
+// and its write path for the whole boot, and a USB disk that claims is a SEPARATE disk.
+//
+// `pin_boot_medium_once` proves ONCE, from the main loop (it reads sectors), whether the boot volume
+// serial the loader handed over lives on the Sdhc card. Pinned there: a later USB publish declines the
+// global slot (`usb_global_closed`), and a stick that claimed it before the pin is evicted — it stays
+// registry index 0, `BlockSource::Usb`, where Volumes mounts it. Not pinned there (booted from a card
+// in a USB reader, no Sdhc card, no serial): byte-identical to before — index 0 claims the global.
+
+/// USBSTOR: 0 = not yet proven, 1 = the boot volume is on the Sdhc card (global slot closed to USB),
+/// 2 = it is not (the legacy claim stands).
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+static BOOT_PIN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// USBSTOR: is the boot medium pinned on a handle other than the global slot?
+pub fn boot_medium_kept() -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    {
+        return BOOT_PIN.load(core::sync::atomic::Ordering::Acquire) == 1;
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+    false
+}
+
+/// USBSTOR: the x86 publish asks this before claiming the global slot for registry index 0. One line
+/// per declined claim, naming the slot — the `[block] … separate (R95)` witness.
+#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+fn usb_global_closed(slot: u8) -> bool {
+    if !boot_medium_kept() {
+        return false;
+    }
+    serial_println!("[block] boot medium=sdhc kept; usb slot={} separate (R95)", slot);
+    true
+}
+
+/// USBSTOR: derive the pin. MUST run from an unmasked, lock-free main-loop context (sector reads) —
+/// `fs::removable::service` is its caller, on every x86 service loop. One acquire load once decided.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn pin_boot_medium_once() {
+    if BOOT_PIN.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        return;
+    }
+    let serial = BOOT_VOLUME_SERIAL.load(core::sync::atomic::Ordering::Acquire);
+    if serial == 0 {
+        BOOT_PIN.store(2, core::sync::atomic::Ordering::Release);
+        return; // the loader named nothing: no proof, the legacy claim stands (FRGUARD says DISARMED)
+    }
+    if sdhc_info().is_none() {
+        return; // no card registered yet; asked again next pass
+    }
+    if !crate::fs::fat::volume_serials(crate::fs::fat::BlockSource::Sdhc).contains(&serial) {
+        BOOT_PIN.store(2, core::sync::atomic::Ordering::Release);
+        serial_println!("[block] boot medium=not-sdhc serial=0x{:08x}; usb index 0 may hold the global slot (legacy)", serial);
+        return;
+    }
+    BOOT_PIN.store(1, core::sync::atomic::Ordering::Release);
+    let evicted = {
+        let mut g = BLOCK_DEVICE.lock();
+        match *g {
+            Some(d) if d.slot_id != 0 => {
+                *g = None;
+                Some(d.slot_id)
+            }
+            _ => None,
+        }
+    };
+    if let Some(slot) = evicted {
+        BOOT_MEDIUM_VERDICT.store(BM_UNKNOWN, core::sync::atomic::Ordering::Release);
+        USB_PUBLISH_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); // a registry change: Quarry and Volumes re-read
+        serial_println!("[block] boot medium=sdhc kept; usb slot={} separate (R95) evicted=global", slot);
+    } else {
+        serial_println!("[block] boot medium=sdhc kept; usb slot=- separate (R95)");
+    }
+}
+
+/// USBSTOR: no Sdhc handle in this image — nothing to pin.
+#[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+pub fn pin_boot_medium_once() {}
