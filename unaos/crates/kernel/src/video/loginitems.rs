@@ -31,17 +31,6 @@ static LAUNCH_OWED: AtomicBool = AtomicBool::new(false);
 /// Items launched at the last login (the witness reads it).
 static LAUNCHED_N: AtomicU32 = AtomicU32::new(0);
 
-fn user_name() -> Option<String> {
-    #[cfg(feature = "login")]
-    {
-        let mut nm = [0u8; crate::fs::users::NAME_MAX];
-        let n = crate::fs::users::whoami(&mut nm)?;
-        return core::str::from_utf8(&nm[..n]).ok().map(String::from);
-    }
-    #[cfg(not(feature = "login"))]
-    None
-}
-
 /// `users::login`: the session opened — read this user's list and launch it once the desktop is built.
 pub fn post_login() {
     LOADED_FOR.lock().clear();
@@ -95,12 +84,13 @@ pub fn edit(op: &str, name: &str, via: &str) -> bool {
 /// The settings service pass: read the session's list (once per login), drain an owed store write, and run the
 /// login's launch once the desktop is built.
 pub fn service() {
-    let Some(u) = user_name() else { return };
+    let mut wb = [0u8; crate::prefs::WHO_BUF]; // PERFREVIEW F3 (B443): compared on the stack; a String only when the session changed
+    let Some(u) = crate::prefs::user_name_in(&mut wb) else { return };
     let fresh = { let g = LOADED_FOR.lock(); *g != u };
     if fresh {
         let l = crate::prefs_client::sys_text(crate::prefs::key::LOGIN_ITEMS).map(|t| prefs_core::login::parse(&t)).unwrap_or_default();
         *ITEMS.lock() = l;
-        *LOADED_FOR.lock() = u;
+        *LOADED_FOR.lock() = String::from(u);
         SAVE_OWED.store(false, Ordering::Release);
     }
     if SAVE_OWED.swap(false, Ordering::AcqRel) {
