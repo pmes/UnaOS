@@ -52,3 +52,13 @@ the minimised window's tile moves right (count-neutral; the pin returns when it 
 windows (UnaOS has no hidden-but-not-minimised state); Show All Windows raises, it does not arrange (no Exposé);
 reorder is within the app band (Quarry stays first, console/shell anchor the tail — the DOCKID ranks); aarch64 has
 no capture feed (PREFSUI's owed line), so the Pi reorders nothing.
+
+## M6 (seat's answers)
+- A minimised window of a PINNED app keeps the app's left tile (running pip) and adds a thumbnail COPY in the right
+  group (`stamp == THUMB_COPY`); an unpinned app's minimised window is the thumbnail only. Counted for `wm::dock_tiles`
+  and `strip_rect` by `dock::thumb_copies_of`. `:: DOCKPIN: left=<n> minimized=<n> …` and `:: DOCK2: left=<n> … minimized=<n>`.
+- Pins launch on RELEASE (x86): a pin press captures (`[dock] press … app=<a> -> armed (launches on release)`); a
+  release within 2·PAD of the press launches through the old arm (the pulse starts then); more travel is a drag
+  (`[dock] pin drag app=<a> -> reorder|none launch=0`). Fixtures press with `Immediate` held; aarch64 keeps launch-on-press.
+- The Trash tile's right-click menu: one item, Empty Trash…, through DIALOG's alert (`dialog::Act::Hook`, a
+  caller's `fn(bool)`); the empty runs on the dock's service pass: `[dock] menu empty-trash answer=<ok|cancel> removed=<n>`.
