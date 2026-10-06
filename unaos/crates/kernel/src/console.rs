@@ -63,6 +63,9 @@ pub struct Console {
     new_lines: usize,
     /// SCROLLBACK — absolute row below which the LIVE view shows (`clear` / Ctrl-L moves it; the lines above stay reachable by scrolling). `clear --all` drops them instead.
     clear_abs: u64,
+    /// SHELLTASK (B458) — a PRODUCER console: the `shell-job` task's. `println` appends to `shelltask::out` (the
+    /// render pass places it in the shell window's console) and nothing is drained here. `false` everywhere else.
+    task_out: bool,
 }
 
 impl Console {
@@ -81,6 +84,7 @@ impl Console {
             view_off: 0,
             new_lines: 0,
             clear_abs: 0,
+            task_out: false,
         }
     }
 
@@ -159,6 +163,7 @@ impl Console {
     /// array §3 describes rather than a second caller of this method, and it is a precondition to
     /// check before adding one, not a refactor to discover afterwards.
     pub fn drain_output(&mut self) -> u64 {
+        if self.task_out { return 0; } // SHELLTASK: the task's console holds no view; the render pass drains
         let (history, attrs, base, clear_abs, pen) = (&mut self.history, &mut self.attrs, &mut self.hist_base, &mut self.clear_abs, &mut self.pen);
         let mut placed = 0usize;
         let n = crate::termring::drain(|line| { placed += push_parsed(history, attrs, base, clear_abs, pen, line); });
@@ -183,6 +188,7 @@ impl Console {
     /// counted `dropped` charge — the record did not travel by the transport, and the ledger says so
     /// — not the reader's sense of what happened first.
     pub fn println(&mut self, text: &str) {
+        if self.task_out { crate::shelltask::out(text); return; } // SHELLTASK (B458): the shell task's line goes to the render pass
         self.drain_output();
         if !crate::termring::console_out_str(text) {
             self.place(text);
@@ -798,4 +804,21 @@ impl Console {
     /// Line `i`'s attribute spans (fixture / test read).
     pub fn spans_of(&self, i: usize) -> alloc::vec::Vec<crate::termcolor::Span> { self.attrs.get(i).cloned().unwrap_or_default() }
     pub fn hist_base_for_fixture(&self) -> u64 { self.hist_base }
+}
+
+// SHELLTASK (rmbp-ledger B458) — the console's side of the seam (shelltask.rs). Tail block.
+impl Console {
+    /// Make this the shell task's PRODUCER console (see `task_out`).
+    pub fn set_task_out(&mut self) {
+        self.task_out = true;
+    }
+    /// SHELLWIN — does this console render into the shell WINDOW (the only console that hands lines off)?
+    pub fn is_in_window(&self) -> bool {
+        self.in_window
+    }
+    /// The render pass: place one line the shell task wrote, after anything the transport still holds.
+    pub fn place_from_task(&mut self, text: &str) {
+        self.drain_output();
+        self.place(text);
+    }
 }
