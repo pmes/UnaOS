@@ -7,7 +7,8 @@
 //!
 //! * **Back / Forward** — a [`History`] of the places the list pane showed (every `show` that changed the
 //!   directory; a travel through the history does not record itself). `<` / `>` keys too.
-//! * **The view switcher** — List | Icons (`v` toggles). The icon view is `iconview.rs`.
+//! * **The view switcher** — List | Icons | Columns (`v` cycles). The icon view is `iconview.rs`; the columns view
+//!   (Miller columns, COLUMNSVIEW B436) is `millercols.rs`.
 //! * **Search** — a field at the right of the toolbar (a press, or `/`, focuses it); every keystroke re-runs a
 //!   NAME match through UnaFS's name tree (`UnaFS::find_names`, the shared core both rings link — LAUNCHER row 36
 //!   reuses it), else a bounded walk of the namespace on a FAT root. The hits replace the list (their paths as
@@ -37,6 +38,8 @@ const DIRS_MAX: usize = 512;
 pub(super) enum View {
     List,
     Icons,
+    /// COLUMNSVIEW (B436): Miller columns (`millercols.rs`).
+    Columns,
 }
 
 /// Back/forward over visited places. Pure: the fixture drives its own instance.
@@ -119,6 +122,7 @@ pub(super) struct Layout {
     pub fwd: Rect,
     pub list: Rect,
     pub icons: Rect,
+    pub columns: Rect,
     pub search: Rect,
     /// The path bar row.
     pub path: Rect,
@@ -133,9 +137,10 @@ pub(super) fn layout(g: &Geom) -> Layout {
     let seg = 6 * g.cell_w();
     let list = Rect { x: fwd.x + bs + 4 * PAD(), y, w: seg, h: bs };
     let icons = Rect { x: list.x + seg, y, w: seg, h: bs };
+    let columns = Rect { x: icons.x + seg, y, w: seg + 2 * g.cell_w(), h: bs };
     let sw = (g.w / 4).max(16 * g.cell_w()).min(g.w / 3);
     let search = Rect { x: g.w.saturating_sub(PAD() + sw), y, w: sw, h: bs };
-    Layout { back, fwd, list, icons, search, path: Rect { x: 0, y: tb_h, w: g.w, h: g.bar_h() - tb_h } }
+    Layout { back, fwd, list, icons, columns, search, path: Rect { x: 0, y: tb_h, w: g.w, h: g.bar_h() - tb_h } }
 }
 
 /// The path bar's segments: `(x0, x1, path)` for `cwd`, drawn from `x` at advance `cw`, `" > "` between.
@@ -199,8 +204,8 @@ fn set_view(v: View) {
     let mut t = TB.lock();
     if t.view != v {
         t.view = v;
-        serial_println!("[quarry3] view={}", if v == View::Icons { "icons" } else { "list" });
-        drop(t); super::folderview::set_mode(if v == View::Icons { "icons" } else { "list" }); // FOLDERVIEW (B424): the folder's mode, latched
+        serial_println!("[quarry3] view={}", mode_name(v));
+        drop(t); super::folderview::set_mode(mode_name(v)); // FOLDERVIEW (B424): the folder's mode, latched · COLUMNSVIEW (B436): by name
     }
 }
 
@@ -356,7 +361,7 @@ pub(super) fn key(c: u8) -> bool {
             true
         }
         b'v' | b'V' => {
-            let v = if view() == View::List { View::Icons } else { View::List };
+            let v = match view() { View::List => View::Icons, View::Icons => View::Columns, View::Columns => View::List };
             set_view(v);
             true
         }
@@ -385,6 +390,8 @@ pub(super) fn press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
         set_view(View::List);
     } else if l.icons.contains(sx, sy) {
         set_view(View::Icons);
+    } else if l.columns.contains(sx, sy) {
+        set_view(View::Columns);
     } else if l.search.contains(sx, sy) {
         TB.lock().search.focused = true;
     } else if l.path.contains(sx, sy) && !TB.lock().search.active {
@@ -430,6 +437,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     button(px, g, l.fwd, b">", false, t.hist.can_forward());
     button(px, g, l.list, b"List", t.view == View::List, true);
     button(px, g, l.icons, b"Icons", t.view == View::Icons, true);
+    button(px, g, l.columns, b"Columns", t.view == View::Columns, true);
     // The search field.
     let s = l.search;
     fill(px, g, s.x, s.y, s.w, s.h, theme::content_fill());
@@ -482,10 +490,28 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
 
 /// FOLDERVIEW (B424): the folder just entered carries `mode` — show it, without latching a change.
 pub(super) fn apply_mode(mode: &str) {
-    TB.lock().view = if mode == "icons" { View::Icons } else { View::List };
+    TB.lock().view = view_of(mode); // COLUMNSVIEW (B436): list / icons / columns
 }
 
 /// FOLDERVIEW (B424): a search's results are not a folder — no view is resolved or saved for them.
 pub(super) fn search_active() -> bool {
     TB.lock().search.active
+}
+
+/// COLUMNSVIEW (B436): the view's name in FOLDERVIEW's `una:view.mode` and on the wire (`list` / `icons` / `columns`).
+pub(super) fn mode_name(v: View) -> &'static str {
+    match v {
+        View::List => "list",
+        View::Icons => "icons",
+        View::Columns => "columns",
+    }
+}
+
+/// COLUMNSVIEW (B436): the view a stored mode names; anything else is the list.
+pub(super) fn view_of(mode: &str) -> View {
+    match mode {
+        "icons" => View::Icons,
+        "columns" => View::Columns,
+        _ => View::List,
+    }
 }

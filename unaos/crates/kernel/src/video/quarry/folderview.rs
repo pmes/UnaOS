@@ -64,7 +64,7 @@ pub struct View {
 // ── The codec (pure) ────────────────────────────────────────────────────────────────────────────
 
 fn mode_ok(s: &str) -> bool {
-    matches!(s, "list" | "icons")
+    matches!(s, "list" | "icons" | "columns") // COLUMNSVIEW (B436)
 }
 
 pub fn enc_columns(w: &Widths) -> String {

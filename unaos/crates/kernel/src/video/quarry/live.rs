@@ -4292,7 +4292,7 @@ pub mod quicklook;
 /// QUARRY3 — the keys the new furniture takes before the list's own: the search field while it holds the keyboard,
 /// Quick Look (Space, Esc, the arrows while the panel shows), the icon grid's arrows, then `<` `>` `v` `/`.
 fn q3_key(c: u8) -> bool {
-    toolbar::key_search(c) || quicklook::key(c) || (toolbar::view() == toolbar::View::Icons && iconview::key(c)) || toolbar::key(c)
+    toolbar::key_search(c) || quicklook::key(c) || (toolbar::view() == toolbar::View::Icons && iconview::key(c)) || (toolbar::view() == toolbar::View::Columns && millercols::key(c)) || toolbar::key(c)
 }
 
 /// QUARRY3 — a press the new furniture takes before the panes: toolbar and path bar, sidebar, the icon grid.
@@ -4306,6 +4306,9 @@ fn q3_press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
     if toolbar::view() == toolbar::View::Icons {
         return iconview::press(m, sx, sy);
     }
+    if toolbar::view() == toolbar::View::Columns {
+        return millercols::press(m, sx, sy);
+    }
     None
 }
 
@@ -4314,6 +4317,9 @@ fn q3_paint(m: &Model, px: &mut [u32], li: Rect) {
     if toolbar::view() == toolbar::View::Icons {
         iconview::paint(m, px, li);
     }
+    if toolbar::view() == toolbar::View::Columns {
+        millercols::paint(m, px, li);
+    }
     sidebar::paint(m, px);
     toolbar::paint(m, px);
 }
@@ -4321,6 +4327,7 @@ fn q3_paint(m: &Model, px: &mut [u32], li: Rect) {
 /// `tests quarry3` registration (rides `fs::filetype::ensure_tests`, no tests.rs line).
 pub fn quarry3_tests() {
     crate::tests::register("quarry3", quarry3_selftest);
+    millercols::register(); // COLUMNSVIEW (B436): `tests columnsview` rides this registration
 }
 
 /// M6 — `tests quarry3`, over the live table and the test-f set:
@@ -4427,3 +4434,7 @@ pub mod folderview;
 // FILETYPES (B423): Open With… — every registrant of the selected file's type (a child module like `getinfo`).
 #[path = "openwith.rs"]
 pub mod openwith;
+// COLUMNSVIEW (rmbp-ledger B436, MACPARITY row 27): the third view, Miller columns — a child like `iconview`; its
+// hooks are the view switcher's dispatch in `q3_key` / `q3_press` / `q3_paint` and its service in `quicklook::service`.
+#[path = "millercols.rs"]
+pub mod millercols;

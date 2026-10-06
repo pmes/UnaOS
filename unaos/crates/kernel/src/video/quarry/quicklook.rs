@@ -343,6 +343,7 @@ fn show(path: &str) {
 /// Quarry's service pass: drain the latched request (the render is I/O, never in the router), and close the
 /// panel when Quarry has gone.
 pub(super) fn service() {
+    super::millercols::service(); // COLUMNSVIEW (B436): the columns view's preview card renders on the same pass
     if is_open() && !super::is_open() {
         close("quarry-closed");
         return;
