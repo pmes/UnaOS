@@ -202,3 +202,13 @@ pub fn flightring_selftest() {
         if pass { "PASS" } else { "FAIL" }
     );
 }
+
+/// WIREDIET (rmbp-ledger B461, PERFREVIEW F5): the wire's diet, once, at the desktop (`boot::ignite`) —
+/// every `_print` so far (`serial_ring::SUBMITTED`) over the boot's uptime, so the next review reads the rate
+/// in one line instead of counting a capture. `[flightring] diet lines=<n> up_ms=<ms> per_min=<n>`.
+pub fn diet_line() {
+    let lines = crate::serial_ring::SUBMITTED.load(core::sync::atomic::Ordering::Relaxed);
+    let up_ms = crate::arch::ms().max(1);
+    serial_println!("[flightring] diet lines={} up_ms={} per_min={}", lines, up_ms, lines.saturating_mul(60_000) / up_ms);
+}
+

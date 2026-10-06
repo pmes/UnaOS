@@ -1547,7 +1547,7 @@ fn art_score(g: u32) {
     if A_T0.load(Ordering::Relaxed) == 0 {
         A_T0.store((getinfo_ticks() as u32).max(1), Ordering::Relaxed); // fps clock starts at the first scored frame
     }
-    if n.is_power_of_two() || n % VUGART_PERIOD == 0 {
+    if n.is_power_of_two() || (n % VUGART_PERIOD == 0 && wirediet_art_due()) {
         art_emit();
     }
 }
@@ -3021,7 +3021,7 @@ fn fps_refresh(ticks: &mut u64, mark: &mut u32, fps: u32, frame: u32, win: u32) 
             let v = ((frame.wrapping_sub(*mark) as u64 * TICK_HZ as u64 + (dt / 2) as u64) / dt as u64) as u32;
             *ticks = now;
             *mark = frame;
-            if v != fps {
+            if v != fps && wirediet_fps_due(v, now) {
                 sayn(b"[vugfps] wf=", win * 1000 + v.min(999));
             }
             return v;
@@ -4054,3 +4054,47 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[used]
 #[link_section = ".note.unaos.app"]
 static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(una_abi::APP_FLAG_WINDOWED);
+
+// ---------------------------------------------------------------------------------------------
+// WIREDIET (rmbp-ledger B461, PERFREVIEW F5) — the periodic lines print on a MOVE or every 5 s.
+// ---------------------------------------------------------------------------------------------
+
+/// WIREDIET: the heartbeat, in this arch's ticks — a periodic line that has not moved says so at most this often.
+const WIREDIET_HEARTBEAT_TICKS: u64 = 5 * TICK_HZ as u64;
+
+/// WIREDIET M1: what `[vugfps]` last printed — (tick of the print << 32) | the rate. One atomic.
+static VUG_SAID: AtomicU64 = AtomicU64::new(0);
+
+/// WIREDIET M1: `[vugfps]` speaks when the rate moved by more than a tenth of what it last said (at least 2/s),
+/// or when 5 s have passed and the rate differs at all. A 30 fps window jittering 29..34 is quiet; 30 -> 18 is not.
+fn wirediet_fps_due(v: u32, now: u64) -> bool {
+    let said = VUG_SAID.load(Ordering::Relaxed);
+    let (last_t, last_v) = ((said >> 32) as u32, said as u32);
+    let band = (last_v / 10).max(2);
+    let moved = said == 0 || v.abs_diff(last_v) > band;
+    let aged = (now as u32).wrapping_sub(last_t) as u64 >= WIREDIET_HEARTBEAT_TICKS;
+    if moved || (aged && v != last_v) {
+        VUG_SAID.store(((now as u32 as u64) << 32) | v as u64, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// WIREDIET M2: what the every-64-frames `:: VUGART:` last printed — (tick << 32) | mixed_frames. One atomic.
+#[cfg(target_arch = "x86_64")]
+static ART_SAID: AtomicU64 = AtomicU64::new(0);
+
+/// WIREDIET M2: the periodic VUGART line speaks when `mixed_frames` changed since it last spoke, or after 5 s.
+/// The power-of-two lines (frames=1,2,4,...) are not routed here: they are the first-frame witness.
+#[cfg(target_arch = "x86_64")]
+fn wirediet_art_due() -> bool {
+    let now = getinfo_ticks() as u32;
+    let mixed = A_MIXED.load(Ordering::Relaxed);
+    let said = ART_SAID.load(Ordering::Relaxed);
+    let (last_t, last_m) = ((said >> 32) as u32, said as u32);
+    if said == 0 || mixed != last_m || now.wrapping_sub(last_t) as u64 >= WIREDIET_HEARTBEAT_TICKS {
+        ART_SAID.store(((now as u64) << 32) | mixed as u64, Ordering::Relaxed);
+        return true;
+    }
+    false
+}

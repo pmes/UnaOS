@@ -161,6 +161,7 @@ pub fn ignite(why: &'static str) {
         "[boot] phase=desktop from={} why={} at={}ms pre_windows={} pre_starts={} pre_valve={} (R86: the furniture first, then the services)",
         before.word(), why, crate::arch::ms(), PRE_WINDOWS.load(Ordering::Relaxed), PRE_STARTS.load(Ordering::Relaxed), PRE_VALVE.load(Ordering::Relaxed)
     );
+    crate::flightring::diet_line(); // WIREDIET (B461): the wire's lines per minute, once, at the desktop
 }
 
 /// A session opened at a login screen / the create-user form (`login::close_into_session`).
