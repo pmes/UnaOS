@@ -4253,3 +4253,18 @@ fn font_repaint_pass() {
         crate::video::text::face_name(crate::video::text::Face::Ui)
     );
 }
+
+/// DOCK2 (B394) — open (or raise) Quarry AT `dir`: the dock's Trash tile and its tile menu's Show in Quarry. Called
+/// from the dock's service pass, never from the click router (it reads directories). Returns whether a window shows it.
+pub fn open_at(dir: &str) -> bool {
+    open();
+    if !is_open() {
+        return false;
+    }
+    if let Some(m) = MODEL.lock().as_mut() {
+        m.navigate(dir);
+    }
+    repaint();
+    wm::focus_changed(OWNER);
+    true
+}

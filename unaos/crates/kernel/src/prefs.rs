@@ -76,6 +76,9 @@ pub mod key {
     /// PREFSUI (B389): R91's login items and R93's Resolution dropdown.
     pub const LOGIN_ITEMS: &str = "login.items";
     pub const DISPLAY_MODE: &str = "display.mode";
+    /// DOCK2 (B394): the dock's edge and auto-hide.
+    pub const DOCK_POSITION: &str = "dock.position";
+    pub const DOCK_AUTOHIDE: &str = "dock.autohide";
 }
 
 static TREE: spin::Mutex<PrefTree> = spin::Mutex::new(PrefTree::new());
