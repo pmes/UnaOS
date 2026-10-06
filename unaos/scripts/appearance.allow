@@ -1,0 +1,20 @@
+# appearance.allow — FORMAT constants under crates/kernel/src/video/ that appearance-check.py's colour shapes match
+# but that no painter paints (APPEARANCE2, B473). One row per file + literal as written:
+#   <path under video/>  <literal>  <reason>
+# A colour is never allowed here: it moves to video/theme.rs (a role fn, or theme::fixture for a selftest vector).
+# A row that no longer matches the tree is STALE and fails the gate.
+ceramic.rs      0x75AE_10B7     the grain hash SEED (a PRNG seed, not a pixel)
+dock.rs         0xD0C0_0000     DP_PIN_OWNER, a wm owner tag (u64 id space)
+dock.rs         0xD0C2_0000     TRASH_OWNER, a wm owner tag (u64 id space)
+facet.rs        0x7FFF_FFFF     the PNG spec's 2^31-1 chunk-length bound
+menubar.rs      [1,2,3]         KINDS, the three menu-extra kind ids, not an RGB triple
+paper.rs        0xFBB6_0E9F     the paper grain hash SEED
+paper.rs        0x9E37_79B1     the golden-ratio multiplicative hash prime (x)
+paper.rs        0x85EB_CA77     the murmur3 fmix prime (y)
+paper.rs        0x2C1B_3C6D     a hash avalanche multiplier
+paper.rs        0x297A_2D39     a hash avalanche multiplier
+paper.rs        0x68E3_1DA4     the per-octave hash offset
+statusmenu.rs   u32::from_be_bytes([10,0,1,2])  the selftest's DHCP lease 10.0.1.2, an IPv4 address
+vperf.rs        0x2000_0000     a 512 MiB BAR window bound (an address span)
+wm.rs           0x5655_4750     the pace-pin probe's owner tag ("VUGP")
+wm.rs           0x165667B1      the xxhash32 PRIME32_5 in the window-identity hash

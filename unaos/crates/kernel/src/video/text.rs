@@ -763,7 +763,7 @@ pub fn fixture() {
         tt::service();
         const W: usize = 480;
         const H: usize = 64;
-        let mut surf = alloc::vec![0x00FF_FFFFu32; W * H];
+        let mut surf = alloc::vec![crate::video::theme::fixture::WHITE; W * H];
         let lines: [&[u8]; 4] = [b"The quick brown fox jumps over the lazy dog 0123456789", b"UnaOS - Log In - Password - Settings", "Ελληνικά Кириллица".as_bytes(), "مرحبا שלום नमस्ते สวัสดี".as_bytes()];
         let t0 = crate::arch::ms();
         let before = tt::stats().map_or(0, |s| s.1.glyphs_drawn);
