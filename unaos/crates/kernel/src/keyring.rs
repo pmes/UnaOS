@@ -278,7 +278,7 @@ pub fn ring_login(name: &[u8], password: &[u8]) {
             Ok(None) => {
                 let mut s = [0u8; 16];
                 crate::rand::drbg_fill(&mut s);
-                (una_abi::RINGKEY_MODE_CREATE, s, una_abi::WINDOW2_KDF_M_KIB, una_abi::WINDOW2_KDF_T, una_abi::WINDOW2_KDF_P)
+                (una_abi::RINGKEY_MODE_CREATE, s, una_abi::RING_KDF_M_KIB, una_abi::RING_KDF_T, una_abi::RING_KDF_P) // HOLOCRONARM (B484): the per-arch create parameters (x86 = WINDOW2's; aarch64 19 MiB, its heap is 48)
             }
             Err(why) => {
                 serial_println!("[holocron] door none reason={}", why);

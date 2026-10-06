@@ -6871,7 +6871,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), una_abi::SYS_SBRK => super::xwin::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), // VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), // HOLOCRONARM (B484): SYS_KDF + the path I/O pair HOLOCRON.ELF's store is, bodies at the FILE TAIL. VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
@@ -26075,5 +26075,60 @@ fn ringkey_uid(asid: u64) -> u32 {
     {
         let _ = asid;
         0
+    }
+}
+
+// =====================================================================================================
+// HOLOCRONARM (rmbp-ledger B484) — the two services HOLOCRON.ELF needs beside `SYS_RINGKEY`, on aarch64:
+// `SYS_PATH_READ` / `SYS_PATH_WRITE` (59/60; its whole store) fulfilled by the SAME body x86 calls
+// (`crate::selfdiag::path_fulfil`, under the ATTRSURF caller principal), and `SYS_KDF` (66; the legacy
+// ring whose memory the window cannot hold) through the SAME `crate::keyring::kdf`. The arms are folded onto
+// the `SYS_CLOSE` dispatch line (code before its `//`); the bodies are appended here at the TAIL.
+// Design: docs/dev/evidence/rmbp-1005/holocronarm.md.
+// =====================================================================================================
+#[cfg(feature = "selfdiag")]
+fn sys_pathio(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let n = a1 as usize;
+    if n < una_abi::PATH_IO_HDR_LEN || n > una_abi::PATH_IO_HDR_LEN + una_abi::PATH_IO_PATH_MAX + una_abi::PATH_IO_MAX {
+        return EINVAL;
+    }
+    let mut inb = alloc::vec![0u8; n];
+    if copy_from_user(&mut inb, a0, n).is_err() {
+        return EFAULT;
+    }
+    let cap = if nr == una_abi::SYS_PATH_READ { (a3 as usize).min(una_abi::PATH_IO_MAX) } else { 0 };
+    let principal = attrsurf_principal_of(&current_principal());
+    match crate::selfdiag::path_fulfil(nr, &inb, &principal, cap) {
+        Ok((out, ret)) => {
+            if !out.is_empty() && copy_to_user(a2, &out, out.len()).is_err() {
+                return EFAULT;
+            }
+            ret
+        }
+        Err(e) => e,
+    }
+}
+
+/// HOLOCRONARM: `SYS_KDF(req, req_len, out, out_len)` — una-abi's HOLOCRON2 layout; x86's `sys_kdf` twin.
+#[cfg(feature = "lumen")]
+fn sys_kdf(a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let n = a1 as usize;
+    if n < una_abi::KDF_HDR_LEN || n > una_abi::KDF_HDR_LEN + una_abi::KDF_PW_MAX + una_abi::KDF_SALT_MAX || a3 as usize != una_abi::KDF_OUT_LEN {
+        return EINVAL;
+    }
+    let mut inb = alloc::vec![0u8; n];
+    if copy_from_user(&mut inb, a0, n).is_err() {
+        crate::keyring::wipe(&mut inb);
+        return EFAULT;
+    }
+    let r = crate::keyring::kdf(&inb);
+    crate::keyring::wipe(&mut inb);
+    match r {
+        Ok(mut key) => {
+            let w = copy_to_user(a2, &key, key.len());
+            crate::keyring::wipe(&mut key);
+            if w.is_err() { EFAULT } else { 0 }
+        }
+        Err(e) => e,
     }
 }
