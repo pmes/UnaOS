@@ -1095,3 +1095,17 @@ words on the wire:
 thirteen boots old. The paragraph below is the rule this section was written under: each
 verdict string and its falsifier are stated here first, which is the only order in which a flight can
 settle anything.
+
+## 5. GEN7 (B411, R101) — the acceleration route, carried forward
+
+Design and rung ledger: [`docs/dev/evidence/rmbp-1005/gen7.md`](../../evidence/rmbp-1005/gen7.md) (DRIVERS-METHOD §6).
+What landed: the boot prints ONE arming line (`[gen7] arm=banked … writes=0 ladder=tests-gen7`); `tests gen7`
+ends with `:: GEN7: ring=bcs r8=<PASS|FAIL|REFUSED> blits=<n> us=<n> ::`. **R8b (band)**: on a verified R8 attempt,
+still armed and under the same hold, a full-panel-width 32-row copy between two sysmem halves of R8's window
+(ring dwords 16..31, TAIL 0x40→0x80, R8's encodings unchanged) and the same bytes copied by the CPU:
+`[gen7] band …` and `:: GEN7BLIT: … gpu_us= cpu_us= proj_gpu_us= proj_cpu_us= at=<w>x<h> -> candidate=bcs|cpu ::`
+— rung 0 of KCOMP's second blitter candidate; `candidate=cpu` closes the blit route and the gen7 route is 3D.
+**R9 (3D, RCS)**: parked — no PRM page for PIPELINE_SELECT / STATE_BASE_ADDRESS / 3DPRIMITIVE / the EU pixel
+shader was in reach (the PRM hosts answered 403 to this session); its walls are listed in the design doc §4.
+**PPS**: rungs 03/07 of the `igpu-dpy` ladder now print `why=panel-not-handed-to-igd bits=cited` — the bits were
+cited at rung 07b all along; the write still waits on a gmux hand-off and a T-value source.
