@@ -407,7 +407,7 @@ fn migrate_legacy(home: &str, to: &mut PathStore) {
 /// WINDOW2: the parameters HOLOCRON.ELF makes new rings with — RFC 9106's second recommended option (t 3,
 /// p 4) at 48 MiB, the memory the 64 MiB window holds beside the image, the heap and the stack. Above
 /// `KdfParams::FLOOR` (19 MiB, t 2, p 1).
-const METAL_KDF: KdfParams = KdfParams { m_kib: una_abi::WINDOW2_KDF_M_KIB, t: una_abi::WINDOW2_KDF_T, p: una_abi::WINDOW2_KDF_P };
+const METAL_KDF: KdfParams = KdfParams { m_kib: una_abi::RING_KDF_M_KIB, t: una_abi::RING_KDF_T, p: una_abi::RING_KDF_P }; // HOLOCRONARM (B484): per arch (x86 = WINDOW2's 48 MiB; aarch64 19 MiB — the Pi/Orin kernel heap the window borrows is 48)
 const _: () = assert!(METAL_KDF.m_kib >= KdfParams::FLOOR.m_kib && METAL_KDF.t >= KdfParams::FLOOR.t && METAL_KDF.p >= KdfParams::FLOOR.p);
 const _: () = assert!((METAL_KDF.m_kib as u64) * 1024 + (8 << 20) <= una_abi::USER_WINDOW_BYTES);
 

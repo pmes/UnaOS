@@ -2370,3 +2370,25 @@ mod dragdrop2_tests {
         assert_eq!(drop_ev_parse(drop_ev_payload(1, 999)), (1, 255));
     }
 }
+
+// =================================================================================================
+// HOLOCRONARM (rmbp-ledger B484) — the Argon2id parameters a NEW ring is made at, per arch. x86: WINDOW2's
+// (48 MiB, t 3, p 4 — unchanged). aarch64: the kernel heap is 48 MiB (`allocator::HEAP_SIZE`) and both the
+// login's kernel KDF and the ring-3 window's frames come from it, so 48 MiB could never be lent there; the
+// ring is made at holocron_core's FLOOR memory (19 MiB, OWASP's minimum) with WINDOW2's t and p. An OPEN
+// always derives at the ring header's own parameters, so a ring made on either arch opens on both.
+// `keyring::ring_login` (create) and HOLOCRON.ELF's `METAL_KDF` read these. Design:
+// docs/dev/evidence/rmbp-1005/holocronarm.md.
+// =================================================================================================
+
+/// HOLOCRONARM: Argon2id memory in KiB for a new ring on this arch.
+#[cfg(not(target_arch = "aarch64"))]
+pub const RING_KDF_M_KIB: u32 = WINDOW2_KDF_M_KIB;
+/// HOLOCRONARM: Argon2id memory in KiB for a new ring on this arch (19 MiB: the 48 MiB heap's share).
+#[cfg(target_arch = "aarch64")]
+pub const RING_KDF_M_KIB: u32 = 19 * 1024;
+/// HOLOCRONARM: passes for a new ring.
+pub const RING_KDF_T: u32 = WINDOW2_KDF_T;
+/// HOLOCRONARM: lanes for a new ring.
+pub const RING_KDF_P: u32 = WINDOW2_KDF_P;
+const _: () = assert!(RING_KDF_M_KIB <= WINDOW2_KDF_M_KIB && RING_KDF_M_KIB >= 19 * 1024 && RING_KDF_M_KIB >= 8 * RING_KDF_P);
