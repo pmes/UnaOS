@@ -29,6 +29,9 @@ pub enum Format {
     Bmp,
     Qoi,
     WebP,
+    /// SVG markup (pixel_core's `svg` route; the variant exists only when that feature is on, so the
+    /// map below takes it through a catch-all — merge19: the workspace test build unifies the feature in).
+    Svg,
 }
 
 impl Format {
@@ -41,6 +44,7 @@ impl Format {
             Format::Bmp => "bmp",
             Format::Qoi => "qoi",
             Format::WebP => "webp",
+            Format::Svg => "svg",
         }
     }
 }
@@ -54,6 +58,8 @@ impl From<pixel_core::Format> for Format {
             pixel_core::Format::Bmp => Format::Bmp,
             pixel_core::Format::Qoi => Format::Qoi,
             pixel_core::Format::WebP => Format::WebP,
+            #[allow(unreachable_patterns)]
+            _ => Format::Svg, // `pixel_core::Format::Svg` under feature `svg`; absent otherwise
         }
     }
 }
