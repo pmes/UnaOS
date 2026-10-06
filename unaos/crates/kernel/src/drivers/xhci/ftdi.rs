@@ -255,7 +255,7 @@ pub fn mirror(args: fmt::Arguments) {
     let bound = if crate::serial_ring::in_panic_mode() { 1 } else { crate::serial_ring::BACKPRESSURE_SPINS };
     let mut spins: u32 = 0;
     loop {
-        if let Some(mut ring) = RING.try_lock() {
+        if let Some(mut ring) = RING.try_lock() { let _own = crate::lockowner::own(crate::lockowner::SINK); // STACKGUARD2 (B403): the holder, so an overflowed holder's ring is released
             drain_staged_into(&mut ring);
             let _ = ring_write(&mut ring, args);
             tap.absorb();
@@ -449,7 +449,7 @@ pub fn set_live(v: bool) {
 /// # Safety
 /// `dst` must point to a writable region of at least `max` bytes.
 pub unsafe fn drain_into(dst: *mut u8, max: usize) -> usize {
-    let mut ring = RING.lock();
+    let mut ring = RING.lock(); let _own = crate::lockowner::own(crate::lockowner::SINK); // STACKGUARD2 (B403)
     // SERWIT-2: fold anything staged by a contended `mirror` into the capture BEFORE deciding what to
     // push out the cable, so a staged line reaches the wire on this pass rather than waiting for the
     // next print. A quiet machine that stopped printing must not leave its last lines in the ring.
@@ -840,4 +840,13 @@ pub mod ftdirx {
     pub fn tag_serial_byte(b: u8) {
         note_origin(b);
     }
+}
+
+// ── STACKGUARD2 (rmbp-ledger B403): release the capture ring a stack-overflowed holder took with it ─────────
+
+/// Force-release `RING` — ONLY from the overflow path, and only when `lockowner` names the dead task as its
+/// holder (that task never runs again, so nothing else is inside the hold). A half-written line stays a
+/// half-written line; the ring's own counters are byte-granular.
+pub fn lockowner_release() {
+    unsafe { RING.force_unlock() };
 }

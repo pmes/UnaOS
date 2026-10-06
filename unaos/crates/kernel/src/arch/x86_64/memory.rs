@@ -4507,3 +4507,9 @@ pub fn stack_guard_frame_free(f: u64) {
         unsafe { alloc::alloc::dealloc(f as *mut u8, Layout::from_size_align(4096, 4096).expect("page layout")) };
     }
 }
+
+/// STACKGUARD2 (rmbp-ledger B403): `[start, end)` of the `Reserved` UEFI descriptor holding `addr` (the
+/// bootloader writes one region per descriptor, unmerged), or `None`. The BSP's firmware stack lives in one.
+pub fn stackguard_reserved_region(addr: u64) -> Option<(u64, u64)> {
+    REGIONS.get()?.iter().find(|r| r.kind == MemoryRegionKind::Reserved && r.phys_start <= addr && addr < r.phys_start + r.page_count * 4096).map(|r| (r.phys_start, r.phys_start + r.page_count * 4096))
+}
