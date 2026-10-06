@@ -172,6 +172,8 @@ enum Focus {
     Password,
     /// LOGIN14: the retype field of the set-password form.
     Retype,
+    /// SETTINGSREKEY (B483): the change form's current-password field (own row, from Settings).
+    Old,
 }
 
 struct Form {
@@ -187,6 +189,11 @@ struct Form {
     /// LOGIN14: after the password is written, log `name` in (a user's first login) rather than close
     /// back onto the root desktop (root's boot prompt).
     setpw_login: bool,
+    /// SETTINGSREKEY (B483): the set form's mode ([`CHG_FIRST`], [`CHG_OWN`], [`CHG_RESET`]) and the change
+    /// form's current password (own row only; zeroed with the others).
+    chg: u8,
+    old: [u8; FIELD_MAX],
+    old_len: usize,
     message: &'static str,
     /// The screen was drawn with a real `wm` window (else headless).
     windowed: bool,
@@ -202,6 +209,9 @@ static FORM: crate::sync::Mutex<Form> = crate::sync::Mutex::new(Form {
     pw2: [0; FIELD_MAX],
     pw2_len: 0,
     setpw_login: false,
+    chg: CHG_FIRST,
+    old: [0; FIELD_MAX],
+    old_len: 0,
     message: "",
     windowed: false,
 });
@@ -251,6 +261,8 @@ enum Ctl {
     Button,
     /// LOGIN14: the retype field of the set-password form (that form only).
     Pw2Field,
+    /// SETTINGSREKEY (B483): the change form's current-password field (that form only).
+    OldField,
     /// A user's row: the screen SHOWS who lives on this machine (the Mac model), and a press picks
     /// that name into the field and moves to the password. The `usize` is the store's row index.
     User(usize),
@@ -350,6 +362,12 @@ fn ctl_at(lx: i32, ly: i32, setpw: bool) -> Option<Ctl> {
             rw > 0 && lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32
         });
     }
+    if setpw && chg_form() {
+        return [Ctl::OldField, Ctl::PwField, Ctl::Pw2Field, Ctl::Button].into_iter().find(|&c| {
+            let (rx, ry, rw, rh) = chg_rect(c);
+            rw > 0 && lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32
+        });
+    }
     if setpw {
         return [Ctl::PwField, Ctl::Pw2Field, Ctl::Button].into_iter().find(|&c| inside(c));
     }
@@ -369,6 +387,7 @@ fn ctl_name(c: Option<Ctl>) -> &'static str {
         Some(Ctl::PwField) => "password-field",
         Some(Ctl::Button) => "button",
         Some(Ctl::Pw2Field) => "retype-field",
+        Some(Ctl::OldField) => "old-password-field",
         Some(Ctl::User(_)) => "user-row",
         Some(Ctl::Power(0)) => "power-sleep",
         Some(Ctl::Power(1)) => "power-restart",
@@ -504,6 +523,15 @@ fn repaint() {
         }
         return;
     }
+    if f.state == State::SetPw && f.chg == CHG_OWN {
+        paint_change(px, &f);
+        drop(f);
+        let id = WIN.load(Ordering::Relaxed);
+        if id != wm::WIN_NONE {
+            let _ = wm::present(id);
+        }
+        return;
+    }
     if f.state == State::SetPw {
         // LOGIN14: the set-password form — "Set a password for <name>", the password, its retype, Set.
         let mut title = [0u8; 19 + users::NAME_MAX];
@@ -601,6 +629,9 @@ pub fn open_set_password(name: &[u8], login_after: bool) {
         f.name[..n].copy_from_slice(&name[..n]);
         f.name_len = n;
         f.setpw_login = login_after;
+        f.chg = CHG_FIRST; // SETTINGSREKEY: `open_change_password` sets its mode after this
+        f.old = [0; FIELD_MAX];
+        f.old_len = 0;
         if f.state == State::Open {
             f.state = State::SetPw;
             f.focus = Focus::Password;
@@ -713,6 +744,9 @@ fn take_down() {
     f.pw2 = [0; FIELD_MAX];
     f.pw_len = 0;
     f.pw2_len = 0;
+    f.old = [0; FIELD_MAX]; // SETTINGSREKEY
+    f.old_len = 0;
+    f.chg = CHG_FIRST;
 }
 
 fn close_into_session() {
@@ -817,7 +851,7 @@ pub fn press_swallow(x: i32, y: i32) -> bool {
     // geometry is exactly what [`local_of`] is about to read.
     heal_if_row_gone();
     let hit = local_of(x, y).and_then(|(lx, ly)| ctl_at(lx, ly, setpw_form()));
-    if matches!(hit, Some(Ctl::NameField | Ctl::PwField | Ctl::Pw2Field | Ctl::User(_))) {
+    if matches!(hit, Some(Ctl::NameField | Ctl::PwField | Ctl::Pw2Field | Ctl::OldField | Ctl::User(_))) {
         PFOCUS.store(0, Ordering::Relaxed); // DIALOG2: a press on a field takes the keyboard back from the power row
     }
     match hit {
@@ -826,6 +860,7 @@ pub fn press_swallow(x: i32, y: i32) -> bool {
         Some(Ctl::NameField) => FORM.lock().focus = Focus::Name,
         Some(Ctl::PwField) => FORM.lock().focus = Focus::Password,
         Some(Ctl::Pw2Field) => FORM.lock().focus = Focus::Retype,
+        Some(Ctl::OldField) => FORM.lock().focus = Focus::Old,
         // A press on the button IS Enter. One call, so the two routes into a session cannot drift:
         // there is no second submit path to keep in step with `consume_key`'s.
         Some(Ctl::Button) => { if !submit_busy() { submit() } }
@@ -948,7 +983,9 @@ pub fn consume_key(c: u8) -> bool {
         b'\t' => {
             let mut f = FORM.lock();
             f.focus = match (f.state, f.focus) {
+                (State::SetPw, Focus::Old) => Focus::Password,
                 (State::SetPw, Focus::Password) => Focus::Retype,
+                (State::SetPw, Focus::Retype) if f.chg == CHG_OWN => Focus::Old, // SETTINGSREKEY: Old -> New -> Verify -> Old
                 (State::SetPw, _) => Focus::Password,
                 (State::CreateUser, Focus::Name) => Focus::Password,
                 (State::CreateUser, Focus::Password) => Focus::Retype,
@@ -964,6 +1001,7 @@ pub fn consume_key(c: u8) -> bool {
                 Focus::Name => f.name_len = f.name_len.saturating_sub(1),
                 Focus::Password => f.pw_len = f.pw_len.saturating_sub(1),
                 Focus::Retype => f.pw2_len = f.pw2_len.saturating_sub(1),
+                Focus::Old => f.old_len = f.old_len.saturating_sub(1),
             }
         }
         b'\n' | b'\r' => submit(),
@@ -992,6 +1030,13 @@ pub fn consume_key(c: u8) -> bool {
                         f.pw2_len += 1;
                     }
                 }
+                Focus::Old => {
+                    if f.old_len < FIELD_MAX {
+                        let i = f.old_len;
+                        f.old[i] = c;
+                        f.old_len += 1;
+                    }
+                }
             }
         }
         _ => {}
@@ -1005,17 +1050,25 @@ fn clear_passwords(f: &mut Form) {
     f.pw2 = [0; FIELD_MAX];
     f.pw_len = 0;
     f.pw2_len = 0;
-    f.focus = Focus::Password;
+    f.old = [0; FIELD_MAX]; // SETTINGSREKEY: the current password goes with the others
+    f.old_len = 0;
+    f.focus = if f.state == State::SetPw && f.chg == CHG_OWN { Focus::Old } else { Focus::Password };
 }
 
 /// LOGIN14: the set-password form's Enter/Set. Empty and mismatched pairs write nothing and keep the
 /// form; a matching pair goes through `users::set_first_password` (refused unless the row is unset), then
 /// either logs the user in (a first login) or closes back onto the root desktop (root's boot prompt).
 fn submit_setpw() {
-    let (name, nlen, pw, plen, pw2, p2len, login_after) = {
+    let (name, nlen, pw, plen, pw2, p2len, login_after, chg, old, olen) = {
         let f = FORM.lock();
-        (f.name, f.name_len, f.pw, f.pw_len, f.pw2, f.pw2_len, f.setpw_login)
+        (f.name, f.name_len, f.pw, f.pw_len, f.pw2, f.pw2_len, f.setpw_login, f.chg, f.old, f.old_len)
     };
+    if chg == CHG_OWN && olen == 0 {
+        let mut f = FORM.lock();
+        f.message = "Type your current password";
+        f.focus = Focus::Old;
+        return;
+    }
     let n = &name[..nlen];
     let who = core::str::from_utf8(n).unwrap_or("?");
     if plen == 0 {
@@ -1029,7 +1082,7 @@ fn submit_setpw() {
         clear_passwords(&mut f);
         return;
     }
-    dispatch(Job::SetPw { login_after }, n, &pw[..plen]);
+    dispatch_old(Job::SetPw { login_after, chg }, n, &pw[..plen], &old[..olen]);
 }
 
 /// INPUTSTALL M5: the set-password form's outcome, applied on the render task (the worker computed it).
@@ -1038,7 +1091,7 @@ fn apply_setpw(n: &[u8], login_after: bool, written: Result<(), &'static str>, s
     if let Err(reason) = written {
         serial_println!("[login] set-password user={} NOT written reason={} (the form stays)", who, reason);
         let mut f = FORM.lock();
-        f.message = "Could not save the password";
+        f.message = if reason == "bad-old-password" { "Current password is wrong" } else { "Could not save the password" }; // SETTINGSREKEY
         clear_passwords(&mut f);
         return;
     }
@@ -2152,7 +2205,7 @@ fn dialog_fixture() {
 
 #[derive(Clone, Copy)]
 enum Job {
-    SetPw { login_after: bool },
+    SetPw { login_after: bool, chg: u8 },
     Create,
     Root,
     User,
@@ -2175,6 +2228,9 @@ struct Work {
     nlen: usize,
     pw: [u8; FIELD_MAX],
     plen: usize,
+    /// SETTINGSREKEY (B483): the change form's current password (empty for every other job).
+    old: [u8; FIELD_MAX],
+    olen: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -2219,9 +2275,9 @@ fn compute(w: &Work) -> (Outcome, u64, u64) {
     let p = &w.pw[..w.plen];
     let ms = crate::arch::ms;
     match w.job {
-        Job::SetPw { login_after } => {
+        Job::SetPw { login_after, chg } => {
             let t = ms();
-            let written = users::set_password_checked(n, p).map_err(users::users_reason);
+            let written = setpw_change(n, p, &w.old[..w.olen], chg); // SETTINGSREKEY (B483): verify -> write -> re-key, as `passwd`
             let kdf1 = ms().saturating_sub(t);
             let t = ms();
             let session = written.is_ok() && login_after && users::login(n, p).is_ok();
@@ -2286,16 +2342,22 @@ fn outcome_word(o: &Outcome) -> &'static str {
 
 /// Hand a submit over: to the worker when the form is on the glass and a worker core exists, else inline.
 fn dispatch(job: Job, n: &[u8], p: &[u8]) {
+    dispatch_old(job, n, p, &[]);
+}
+
+/// [`dispatch`] with the change form's current password (SETTINGSREKEY); it travels and is scrubbed with `pw`.
+fn dispatch_old(job: Job, n: &[u8], p: &[u8], o: &[u8]) {
     let t0 = crate::arch::ms();
-    let mut w = Work { job, name: [0; FIELD_MAX], nlen: n.len().min(FIELD_MAX), pw: [0; FIELD_MAX], plen: p.len().min(FIELD_MAX) };
+    let mut w = Work { job, name: [0; FIELD_MAX], nlen: n.len().min(FIELD_MAX), pw: [0; FIELD_MAX], plen: p.len().min(FIELD_MAX), old: [0; FIELD_MAX], olen: o.len().min(FIELD_MAX) };
     w.name[..w.nlen].copy_from_slice(&n[..w.nlen]);
     w.pw[..w.plen].copy_from_slice(&p[..w.plen]);
+    w.old[..w.olen].copy_from_slice(&o[..w.olen]);
     let windowed = FORM.lock().windowed;
     if windowed && worker_core().is_some() && !BUSY.swap(true, Ordering::AcqRel) {
         let _ = DONE.lock().take(); // a late outcome of a released submit is never applied to this one
         *WORK.lock() = Some(w);
         // SAFETY: a plain store into our own local; volatile so the scrub of the password copy is not elided.
-        unsafe { core::ptr::write_volatile(&mut w.pw, [0; FIELD_MAX]) };
+        unsafe { core::ptr::write_volatile(&mut w.pw, [0; FIELD_MAX]); core::ptr::write_volatile(&mut w.old, [0; FIELD_MAX]) };
         BUSY_T0_MS.store(t0, Ordering::Relaxed);
         FORM.lock().message = "Working...";
         repaint();
@@ -2307,6 +2369,7 @@ fn dispatch(job: Job, n: &[u8], p: &[u8]) {
     }
     let (out, kdf_ms, adduser_ms) = compute(&w);
     w.pw = [0; FIELD_MAX];
+    w.old = [0; FIELD_MAX];
     let d = Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: false, blocked_ms: crate::arch::ms().saturating_sub(t0) };
     say(&d, job_word(job));
     apply(&d);
@@ -2333,6 +2396,7 @@ fn submit_worker(_: usize) {
     };
     let (out, kdf_ms, adduser_ms) = compute(&w);
     w.pw = [0; FIELD_MAX];
+    w.old = [0; FIELD_MAX];
     *DONE.lock() = Some(Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: true, blocked_ms: 0 });
 }
 
@@ -2624,4 +2688,137 @@ pub fn keys_selftest() -> bool {
     PFOCUS.store(pf, Ordering::Relaxed);
     HEADLESS.store(was, Ordering::Relaxed);
     !lk && right && opened && back && left
+}
+
+// =================================================================================================
+// SETTINGSREKEY (rmbp-ledger B483) — SETTINGS' PASSWORD CHANGE RE-KEYS THE RING, AS `passwd` DOES.
+//
+// Settings (General's Password, the Users pane's own-row Password and other-row Reset) opened the set form,
+// which asked no current password and only wrote the credential: the ring stayed under the old key and the
+// next login read `ring=refused … bad-password`. Now [`open_change_password`] picks the mode: the session's OWN
+// row (not root) gets the change form — Old password · New · Verify, the Mac's shape — and the worker
+// ([`setpw_change`], on `login-submit`, never the render core) makes the three calls `passwd` makes: verify the
+// old password (a wrong one writes nothing), write, then `keyring::ring_rekey_at(.., "settings")` (both
+// Argon2id derivations, the REKEY door). Another user's row (an administrator's Reset) and root's own keep the
+// set form and say so in one line; the worker says `keyring::ring_kept_admin_reset_at(.., "settings")`.
+// Design: docs/dev/evidence/rmbp-1005/settingsrekey.md.
+// =================================================================================================
+
+/// The set form's modes: a first password (boot / first login), the owner's change, an administrator's reset.
+const CHG_FIRST: u8 = 0;
+const CHG_OWN: u8 = 1;
+const CHG_RESET: u8 = 2;
+
+/// The one line an administrator's reset says (the Settings pane carries it whole; the form, its short half).
+pub const RESET_LINE: &str = "the user's secrets stay under the old password until they log in with it";
+
+/// The change form is up (own row: Old · New · Verify).
+fn chg_form() -> bool {
+    let f = FORM.lock();
+    f.state == State::SetPw && f.chg == CHG_OWN
+}
+
+/// The change form's rects — three fields stacked as the create-user form's, the button where every form has it.
+fn chg_rect(c: Ctl) -> (usize, usize, usize, usize) {
+    match c {
+        Ctl::OldField => (FIELD_X, 46, FIELD_W, FIELD_H),
+        Ctl::PwField => (FIELD_X, 82, FIELD_W, FIELD_H),
+        Ctl::Pw2Field => (FIELD_X, 118, FIELD_W, FIELD_H),
+        Ctl::Button => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+        _ => (0, 0, 0, 0),
+    }
+}
+
+fn paint_change(px: &mut [u32], f: &Form) {
+    let mut title = [0u8; 23 + users::NAME_MAX];
+    title[..23].copy_from_slice(b"Change the password of ");
+    let n = f.name_len.min(users::NAME_MAX);
+    title[23..23 + n].copy_from_slice(&f.name[..n]);
+    text(px, LX, 14, &title[..23 + n], theme::content_text());
+    fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
+    for (c, label, buf, len, focus) in [
+        (Ctl::OldField, &b"Old password"[..], &f.old, f.old_len, Focus::Old),
+        (Ctl::PwField, &b"New"[..], &f.pw, f.pw_len, Focus::Password),
+        (Ctl::Pw2Field, &b"Verify"[..], &f.pw2, f.pw2_len, Focus::Retype),
+    ] {
+        let (x, y, w, _) = chg_rect(c);
+        text(px, LX, y + 4, label, theme::title_text_inactive());
+        field(px, x, y, w, &buf[..len], f.focus == focus, true);
+    }
+    button(px, Ctl::Button, b"Change", true, true);
+    text(px, LX, 186, b"Enter or Change   Tab switches", theme::title_text_inactive());
+    if !f.message.is_empty() {
+        text(px, LX, 212, f.message.as_bytes(), theme::accent());
+    }
+}
+
+/// The mode for changing `target`'s password while `me` is the session's user — `passwd`'s rule
+/// (`ask_old = is_own && target != root`): the owner (not root) changes it, anyone else resets it.
+pub fn change_mode(target: &[u8], me: Option<&[u8]>) -> u8 {
+    if me == Some(target) && target != users::ROOT_NAME { CHG_OWN } else { CHG_RESET }
+}
+
+/// Settings' entry (General's Password, the Users pane's Password / Reset): the change form for the session's
+/// own row, the set form with the reset line for any other. Returns `true` when it is an administrator's reset.
+pub fn open_change_password(name: &[u8]) -> bool {
+    let mut me = [0u8; users::NAME_MAX];
+    let mine = users::whoami(&mut me).map(|n| &me[..n]);
+    let chg = change_mode(name, mine);
+    open_set_password(name, false);
+    {
+        let mut f = FORM.lock();
+        f.chg = chg;
+        f.old = [0; FIELD_MAX];
+        f.old_len = 0;
+        f.focus = if chg == CHG_OWN { Focus::Old } else { Focus::Password };
+        f.message = if chg == CHG_OWN { "Old password, then the new one twice" } else { "Reset: their secrets keep the old password" };
+    }
+    serial_println!(
+        "[login] change-password screen open user={} mode={} (SETTINGSREKEY: {})",
+        core::str::from_utf8(name).unwrap_or("?"),
+        if chg == CHG_OWN { "own" } else { "admin-reset" },
+        if chg == CHG_OWN { "the current password first; the ring is re-keyed with the change" } else { RESET_LINE }
+    );
+    repaint();
+    chg == CHG_RESET
+}
+
+/// The worker's set/change: `passwd`'s order — the owner's current password verified FIRST (a wrong one writes
+/// nothing), the credential written, then the ring re-keyed (own) or the reset said (another's). Both Argon2id
+/// derivations run here, on the caller's thread: the `login-submit` worker where one exists.
+fn setpw_change(n: &[u8], p: &[u8], o: &[u8], chg: u8) -> Result<(), &'static str> {
+    if chg == CHG_OWN && (o.is_empty() || !users::verify(n, o)) {
+        return Err("bad-old-password");
+    }
+    let written = users::set_password_checked(n, p).map_err(users::users_reason);
+    #[cfg(feature = "lumen")]
+    if written.is_ok() {
+        match chg {
+            CHG_OWN => crate::keyring::ring_rekey_at(n, o, p, "settings"),
+            CHG_RESET => crate::keyring::ring_kept_admin_reset_at(n, "settings"),
+            _ => {}
+        }
+    }
+    written
+}
+
+/// `tests ringlogin`'s `settings_rekey=`: the mode map is `passwd`'s, and the REAL worker body ([`compute`],
+/// Job::SetPw in the owner's mode) with a wrong current password refuses `bad-old-password` on the session's
+/// row and writes nothing (the typed new password does not verify after). `no-session` with no session user.
+pub fn settings_rekey_fixture() -> &'static str {
+    let map = change_mode(b"rk", Some(b"rk")) == CHG_OWN
+        && change_mode(b"rk", Some(b"other")) == CHG_RESET
+        && change_mode(b"rk", None) == CHG_RESET
+        && change_mode(users::ROOT_NAME, Some(users::ROOT_NAME)) == CHG_RESET;
+    let mut me = [0u8; users::NAME_MAX];
+    let Some(ml) = users::whoami(&mut me) else { return if map { "no-session" } else { "FAIL" } };
+    const OLD: &[u8] = b"\x7fsettingsrekey-wrong";
+    const NEW: &[u8] = b"\x7fsettingsrekey-new";
+    let mut w = Work { job: Job::SetPw { login_after: false, chg: CHG_OWN }, name: [0; FIELD_MAX], nlen: ml.min(FIELD_MAX), pw: [0; FIELD_MAX], plen: NEW.len(), old: [0; FIELD_MAX], olen: OLD.len() };
+    w.name[..w.nlen].copy_from_slice(&me[..w.nlen]);
+    w.pw[..NEW.len()].copy_from_slice(NEW);
+    w.old[..OLD.len()].copy_from_slice(OLD);
+    let refused = matches!(compute(&w).0, Outcome::SetPw { written: Err("bad-old-password"), .. });
+    let unwritten = !users::verify(&me[..ml], NEW);
+    if map && refused && unwritten { "ok" } else { "FAIL" }
 }
