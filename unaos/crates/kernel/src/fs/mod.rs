@@ -176,3 +176,5 @@ pub mod unafsgrow;
 pub mod volumes;
 /// USBSTOR (B384, R95): a removable disk is mounted under `/volumes` when it attaches and dropped when it leaves.
 pub mod removable;
+/// APPRES (B398): the registrar — a program's resources (name, signature, version, kind, icon, doc types) as attributes.
+pub mod appres;
