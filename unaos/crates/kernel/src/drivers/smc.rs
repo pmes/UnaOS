@@ -1324,7 +1324,7 @@ pub mod battery {
         total_sum: 0,
         total_ms: 0,
     });
-    const PWR_ROLLUP_MS: u64 = PWR_WINDOW_MS; // SMALLFIX5 (B480) item 5: was 10 s — see `PWR_WINDOW_MS`
+    const PWR_ROLLUP_MS: u64 = crate::drivers::smc::PWR_WINDOW_MS; // SMALLFIX5 (B480) item 5: was 10 s — see `PWR_WINDOW_MS`
 
     const REFRESH_MS: u64 = 1000;
     /// QUIET-HOLD threshold. On the 2012 rMBP's flaky SMC a ONE-SWEEP drop-out is the normal case,

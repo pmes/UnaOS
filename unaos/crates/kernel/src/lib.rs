@@ -319,3 +319,5 @@ pub mod smallfix3;
 pub mod shelltask;
 // SMALLFIX4 (rmbp-ledger B466): `tests smallfix4` — the wave's minted codes unique, a path launch's name. Tail statement.
 pub mod smallfix4;
+// SMALLFIX5 (rmbp-ledger B480): `tests smallfix5` — the merge19 wave's small owed items, read back. Tail statement.
+pub mod smallfix5;
