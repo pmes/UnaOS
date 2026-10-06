@@ -51,3 +51,14 @@ On the glass: `[attrcols] view dir=… cols=…`, `[attrcols] edit path=… key=
   volume-wide and the list is one folder (design question for the seat).
 - FAT volumes get no facts (UNAFS.ATR sidecar is the bridge, out of scope).
 - `doc:title` from plain text/JSON/CSV: none (no title in the format).
+
+## Built (1a035683 -> M1 733b0557, M2+M5 090c014a, M3 91c8f4e4, M4 0c8c3346)
+- Host: `cargo test -p pixel_core -p audio_core -p demux_core --test facts_testf` rc=0 over the 18 fetched samples: every
+  image's header size equals its decoded size and `animated` equals frames>1 (APNG 6, ANIM.WEBP 3); every audio
+  length within the tolerance of this core's own decode (WAV/FLAC/OPUS 288 ms, OGG 350, MP3 250 after the LAME
+  delay+padding rule the decoder applies, AAC 325, AIF 1034, also from a 4 KiB head+tail); TEST.MP4 av1 320x240
+  2736 ms, TEST.WEBM vp8 320x240 2744 ms, TEST.M4A aac 312 ms. No test-f audio sample carries a title tag.
+- Kernel: x86 metal shape rc=0; aarch64 `login,loginst,virt_el0,lumen,desktop_firmware,quarry,facet,usbnet` rc=0;
+  `tegra,login,loginst,virt_el0` rc=0. No knob: facts ride fs-core (every build), the columns ride `quarry`.
+- Cmd-I: `Action::GetInfo` (code 42 on the input ring), CRISPY and PC rows (HID 0x0C) — the binding arrays grow to
+  55 and 36+1=37 (a fold with another arc adding a binding re-counts them).
