@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
-//! CHARTER: Kernel — shared-core
+//! CHARTER: Kernel — driver (a `tests` probe; the shared core it drives is ldso_core, fulfilled by ldso.rs)
 //! SELFBUILD6 (B360, ROADMAP §1c SH-5) — `tests selfbuild6`: DYNAMIC Linux programs through the shared loader core
 //! (`ldso_core`, fulfilled by `ldso.rs`), then the musl-host `rustc` on UnaOS. Each probe was proven first on the HOST kernel
 //! by `ldrun` (the same core over `mmap`); here it runs under the shim:

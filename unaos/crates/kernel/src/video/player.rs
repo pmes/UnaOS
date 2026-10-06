@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! CHARTER: Kernel — wm
+//! CHARTER: Stria — owed B289 (an A/V player window: Stria's domain, CODEX §2; ARCHREVIEW F3 — was declared `Kernel — wm`)
 //!
 //! PLAYER (rmbp-ledger B419, MACPARITY row 30; cloud review §15 "(b) PLAYER (a window with transport controls)").
 //! Quarry's double-click on a sound opened nothing: `hda::play::request_open` played it headless and the only stop
@@ -182,11 +182,11 @@ fn mmss(ms: u64) -> String {
 fn attr_facts(path: &str) -> (Option<u64>, Option<String>) {
     use crate::fs::vfs::{AttrValue, KERNEL_PRINCIPAL};
     let mt = crate::shell::vfs_mount_table();
-    let d = match mt.get_attr(path, "media:duration_ms", KERNEL_PRINCIPAL) {
+    let d = match mt.get_attr(path, crate::fs::attrfacts::DURATION, KERNEL_PRINCIPAL) {
         Ok(AttrValue::Int(v)) if v > 0 => Some(v as u64),
         _ => None,
     };
-    let c = match mt.get_attr(path, "media:codec", KERNEL_PRINCIPAL) {
+    let c = match mt.get_attr(path, crate::fs::attrfacts::CODEC, KERNEL_PRINCIPAL) {
         Ok(AttrValue::Str(s)) if !s.is_empty() => Some(s),
         _ => None,
     };
