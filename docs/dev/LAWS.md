@@ -823,7 +823,7 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   versus bench 1920x1200 (`UNAOS_FBW=1920 UNAOS_FBH=1200`); desktop build line of record 2026-08-18:
   `UNAOS_WITNESS=1 UNAOS_PIUSB=1 UNAOS_GENET=1 UNAOS_SMP7=1 UNAOS_NETTEST=1 UNAOS_V3D=1 UNAOS_VUGPAR=1
   UNAOS_WEDGE2=1 UNAOS_PIDESK=1 UNAOS_PIRAST=1 UNAOS_QUARRY=1 ./arroyo kernel8`; boot series `v3d boot
-  N` and `dsktp boot N`, media `<series>-boot<N>-<git7>.img`; unafs v3 volume capped at 2 GiB;
+  N` and `dsktp boot N`, media `<series>-boot<N>-<git7>.img`; unafs v3 volume capped at 2 GiB (the Pi's; the x86 card's v7 image is sized content + 25 % + 512 MiB, floor 4 GiB, ROOTDISK2 B401 — `UNAOS_X86_UNAFS_MB` raises it, never lowers);
   `[vugfps]` divisor is arch-conditional; click grammar: click = select + ack, SPACE = stop/start,
   focus never stops anything; `vug.rs` is deleted (pi 5 2026-08-28).
 - **Orin:** fifteen-knob flight line is in each staged image's MANIFEST `# KNOBS:` line; the Pi

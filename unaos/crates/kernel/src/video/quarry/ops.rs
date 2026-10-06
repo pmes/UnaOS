@@ -805,7 +805,7 @@ pub fn selftest() {
         ok += 1;
     }
     // the refusals
-    if ns_check("/boot/QOPS.TXT", true).is_err() {
+    if ns_check("/var/tmp/QOPS.TXT", true).is_err() { // SMALLFIX3 (B416): outside the home, off the sacred boot FAT (R99) — a namespace refusal, never a write
         refused += 1;
     }
     if op_delete(&base).is_err() {
