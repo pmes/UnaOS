@@ -1128,6 +1128,7 @@ pub fn compose() -> bool {
     // cost, and a reader grepping `[menubar] battery` should get one line per interval with only
     // the battery on it.
     battery_witness();
+    strip_items_witness(&model, rect); // BATTLIVE (B492): which items this paint draws, on every change of the set
 
     // The damage conditions, in the order the dock states them: a signature that MATCHES and a pass
     // that did not touch the strip is the common case and returns here having read no pixel.
@@ -3323,5 +3324,57 @@ fn tray_speaker(out: &mut [u32], w: usize, sy: usize, x0: usize, lv: u8, muted: 
             let xk = x0 + 2 * u + (2 * k - 1) * u;
             put(xk, xk + (u / 2).max(1));
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// BATTLIVE (rmbp-ledger B492) — BATTGONE: the bar's paint SAYS which items it draws
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Flight 26 boot 2: `[desktop] built … battery=painted`, then the battery gone and no line said so. The bar now
+// states its drawn item set on every CHANGE of that set (an edge, never periodic):
+// `[strip] paint tenant=menubar items=input,net,volume,battery,clock battery=live` — `battery=` is `live`, `held
+// age_s=<n>` (a stale SMC reading kept on the bar — `status::latest`), `none` (no source) or `noseat` (the panel
+// cannot seat it). The tray's item list (`status::ITEMS`, STATUSTRAY B426) is what is enumerated.
+
+static ITEMS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn strip_items_witness(m: &Model, rect: Option<strip::Rect>) {
+    use super::status::{self, ITEMS, ITEM_BATTERY, ITEM_CLOCK};
+    let Some((_, _, w, _)) = rect else { return };
+    let mut mask = 0u64;
+    for i in 0..ITEMS {
+        let drawn = match i {
+            ITEM_BATTERY => m.batt.is_some() && batt_slot(w).is_some(),
+            ITEM_CLOCK => clock_slot(w).is_some(),
+            _ => m.tray.map(|t| status::item_known(&t, i)).unwrap_or(false) && tray_slot(i, w).is_some(),
+        };
+        if drawn {
+            mask |= 1 << i;
+        }
+    }
+    let held = status::held_age();
+    let bword: u64 = if batt_slot(w).is_none() { 3 } else if m.batt.is_none() { 2 } else if held.is_some() { 1 } else { 0 };
+    let key = mask | (bword << 8);
+    if ITEMS_KEY.swap(key, Ordering::Relaxed) == key {
+        return;
+    }
+    let mut list = alloc::string::String::new();
+    for i in 0..ITEMS {
+        if mask & (1 << i) != 0 {
+            if !list.is_empty() {
+                list.push(',');
+            }
+            list.push_str(status::item_name(i));
+        }
+    }
+    if list.is_empty() {
+        list.push('-');
+    }
+    match bword {
+        0 => serial_println!("[strip] paint tenant=menubar items={} battery=live", list),
+        1 => serial_println!("[strip] paint tenant=menubar items={} battery=held age_s={}", list, held.unwrap_or(0) / 1000),
+        2 => serial_println!("[strip] paint tenant=menubar items={} battery=none src={}", list, status::source().as_str()),
+        _ => serial_println!("[strip] paint tenant=menubar items={} battery=noseat", list),
     }
 }

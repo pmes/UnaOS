@@ -170,7 +170,7 @@ pub fn lines_for(i: u8, t: Option<Tray>, now: Option<u64>) -> Vec<String> {
                 v.push(String::from("Output: HDA codec"));
             }
         },
-        ITEM_BATTERY => v = super::powerui::battery_lines(status::reading().map(|(b, _)| b)),
+        ITEM_BATTERY => v = super::powerui::battery_lines(status::latest().map(|(b, _)| b)), // BATTLIVE (B492): the held reading too
         ITEM_CLOCK => match now {
             Some(secs) => clock_lines(secs, &mut v),
             None => {
@@ -425,4 +425,10 @@ pub fn fixture() {
         w(volume_ok), w(slid), w(muted), w(net_ok), w(input_ok), w(clock_ok), w(unset_ok), w(absent_ok),
         OPENS.load(Ordering::Relaxed), PICKS.load(Ordering::Relaxed), if ok { "PASS" } else { "FAIL" }
     );
+}
+
+/// BATTLIVE (rmbp-ledger B492) — the open menu's rows were rebuilt off the press path (the battery menu's 1 s live
+/// sweep, `status::live_tick`): bump the generation so the crystal's damage test repaints the panel.
+pub fn touch() {
+    GEN.fetch_add(1, Ordering::Relaxed);
 }

@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::console::Console;
 
 /// Registry capacity — a full table is loud (`:: TESTS: table full … -> FAIL ::`), never silent.
-const CAP: usize = 128; // QUIETBOOT2: 80 -> 128, the ~20 boot fixtures B325 moved here. // QUIETBOOT: 48 -> 80, the boot witnesses R80 moved here (flight 19 registered 45).
+const CAP: usize = 160; // BATTLIVE (B492): 128 -> 160, flight 26 filled it (`table full (cap=128)` — selfdiag, srcextract NOT registered). // QUIETBOOT2: 80 -> 128, the ~20 boot fixtures B325 moved here. // QUIETBOOT: 48 -> 80, the boot witnesses R80 moved here (flight 19 registered 45).
 
 static TABLE: crate::sync::Mutex<[Option<(&'static str, fn())>; CAP]> = crate::sync::Mutex::new([None; CAP]);
 static DEFERRED: AtomicUsize = AtomicUsize::new(0);
