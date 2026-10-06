@@ -1,7 +1,7 @@
 # GATEREVIEW (rmbp-ledger B457) — design
 
 **Finding.** Eleven gates run on this tree, and none had been checked for what it misses. Every gate was given a
-planted defect (fixture or temporary tree edit, reverted), and the exit code was recorded. 24 plants: 17 pass a gate
+planted defect (fixture or temporary tree edit, reverted), and the exit code was recorded. 25 plants: 20 pass a gate
 that should refuse them. Three gates are red on the clean tip (knob-hygiene `DEAD: wc_gpublit`, deps-audit `objc2`
 lock lag, GATE-LEDGER 218 of 384 findings from a shallow clone), so a new red there looks the same as the old one.
 Appearance-check, prefs-schema-check and deps-audit run in no `check` path. Before the first `tests` fires, flight 25
