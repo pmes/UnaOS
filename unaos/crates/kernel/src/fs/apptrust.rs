@@ -281,6 +281,32 @@ pub fn take_pending() -> Option<(Ask, bool)> {
     PENDING.try_lock().and_then(|mut p| p.take())
 }
 
+// ── APPTRUST2 (B478) — a foreign program opened DIRECTLY asks the same question ─────────────────────────────────
+
+/// The direct-launch door (`quarry::openers::open("launch", …)` — Quarry's double-click and the Launcher's file
+/// pick): `true` = launch now (a root program, or this foreign program granted this session); `false` = the DIALOG2
+/// ask was posted (file = the program; the answer runs on Quarry's service pass) or could not be, and nothing runs.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn launch_gate(mt: &MountTable, prog: &str) -> bool {
+    if !is_foreign(mt, prog) {
+        return true;
+    }
+    let volume = volume_of(mt, prog);
+    let ok = request(Ask { prog: String::from(prog), file: String::from(prog), mime: String::from(crate::fs::filetype::UNAOS_ELF), volume: volume.clone() });
+    serial_println!("[apptrust] launch prog={} volume={} -> {}", prog, volume, if ok { "granted=session" } else { "ask" });
+    ok
+}
+
+/// No dialog in this build: a foreign program is never launched directly (fail closed, said once per try).
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn launch_gate(mt: &MountTable, prog: &str) -> bool {
+    if !is_foreign(mt, prog) {
+        return true;
+    }
+    serial_println!("[apptrust] launch prog={} volume={} -> refused=no-dialog", prog, volume_of(mt, prog));
+    false
+}
+
 // ── `tests apptrust` (R80: run only when asked) ───────────────────────────────────────────────────────────────────
 
 /// The probe's type — its own object in the registry, created and removed by the test.
