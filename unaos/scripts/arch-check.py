@@ -32,7 +32,7 @@ SHARED_RE = re.compile(r'\b[a-z0-9_]+_core::|\bunafs::|\buna_abi::|\b[a-z0-9_]+_
 DOTSLASH_RE = re.compile(r'"(?:\{[A-Za-z_]*\})?/\.[A-Za-z][A-Za-z0-9_./-]*"')  # GATEREVIEW F2: `{home}/.x` too
 SETTINGS_RE = re.compile(r'"\{\}/settings/[A-Za-z0-9_.-]*"')
 STORE_STATIC_RE = re.compile(r'^\s*(?:pub(?:\([a-z]+\))?\s+)?static\s+[A-Z0-9_]+\s*:\s*(?:spin::)?(?:Mutex|RwLock)<[^;]*\b(?:Vec|BTreeMap|String)\b', re.M)
-STORE_WRITE_RE = re.compile(r'\.(?:write|create|set_attr)\(\s*&?[a-z_]+\s*,')
+STORE_WRITE_RE = re.compile(r'\.(?:write|create|set_attr)\(\s*&?[A-Za-z_][A-Za-z0-9_.]*(?:\(\))?\s*,')  # GATEREVIEW F4: PATH consts, p.as_str()
 PARSERS = [
     ('mime-table', re.compile(r'&\[\(&str,\s*&str\)\]\s*=\s*&\[[^\]]*"(?:image|audio|video)/', re.S)),
     ('png', re.compile(r'0x89,\s*b\'P\',\s*b\'N\',\s*b\'G\'|b"\\x89PNG')),
@@ -134,7 +134,7 @@ def selftest():
             'b.rs': '//! CHARTER: Kernel — shared-core\n// one day this links stria_core\nfn x() {}\n',
             'c.rs': 'fn p(h: &str) -> String { format!("{}/.secret", h) }\n',
             'd.rs': '//! CHARTER: Kernel — wm\nfn p(h: &str) -> String { format!("{}/settings/mine", h) }\n',
-            'e.rs': 'static S: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());\nfn w() { mt.write(&p, 0, b, k); }\n',
+            'e.rs': 'static S: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());\nfn w() { mt.write(p.as_str(), 0, b, k); }\n',
             'f.rs': '//! CHARTER: Kernel — driver\nfn s(b: &[u8]) -> bool { &b[..4] == b"OggS" }\n',
             'g.rs': '//! CHARTER: Kernel — owed B1\n//! CHARTER is fine\nfn x() { holo_core::y(); }\n',
             'i.rs': '//! CHARTER: Kernel — wm\nfn p(home: &str) -> String { format!("{home}/.recents") }\n',  # GATEREVIEW F2
