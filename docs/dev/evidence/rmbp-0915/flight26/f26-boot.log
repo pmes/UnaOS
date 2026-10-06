@@ -1,0 +1,581 @@
+[    158ms] :: BOOTCLOCK: firmware->loader=13171ms loader-read=2191ms loader-jump=18ms kernel-entry=41435771351 tsc_hz=2693852305(measured) ::
+[13:31:31Z] [tlb] shootdown pages=1 cpus=1 acked=1 us=0
+[13:31:31Z] :: LOGWIT-1 probe seq=1 ::
+[13:31:31Z] :: LOGWIT-1: tap prefix reached the FTDI capture — marker seq=1 read back with a well-formed 12-col prefix (kind=civil), unprefixed + malformed controls rejected, attempts=1 bare=0 absent=0 unread=0 -> PASS ::
+[13:31:31Z] [clock] source=tsc hz=2693852305 invariant=1 per_core_tick=1 cores=8 skew_max_cycles=44 sync_timeouts=0 offsets=none (CLOCKCORE)
+[13:31:31Z] :: EHCI-HID: [0] EP0 DATA error addr=2 req=0xa1/0x82 token=0x80228d40 (halted/xact — likely STALL) ::
+[13:31:31Z] [uvc] probe stage=min req=0x82 wValue=0x0100 wIndex=1 wLength=34 STALLED reason=stall — sequence ended, NOT retried
+[13:31:32Z] :: USBNET-EHCI: addr=2 mac=9c:69:d3:28:6e:f4 link=up -> PASS ::
+[13:31:32Z] :: bt-l0: [1] census addr=8 intf=0 alt=0 alts=1 class=0xff/0x01/0x01 neps=3 eps=[IN1/int/16 IN2/blk/64 OUT2/blk/64] == witness ::
+[13:31:32Z] :: bt-l0: [1] census addr=8 intf=1 alt=0 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/0 OUT3/iso/0] == witness ::
+[13:31:32Z] :: bt-l0: [1] census addr=8 intf=1 alt=1 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/9 OUT3/iso/9] == witness ::
+[13:31:32Z] :: bt-l0: [1] census addr=8 intf=1 alt=2 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/17 OUT3/iso/17] == witness ::
+[13:31:32Z] :: bt-l0: [1] census addr=8 intf=1 alt=3 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/25 OUT3/iso/25] == witness ::
+[13:31:32Z] :: bt-l0: [1] census addr=8 intf=1 alt=4 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/33 OUT3/iso/33] == witness ::
+[13:31:32Z] :: bt-l0: [1] census addr=8 intf=1 alt=5 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/49 OUT3/iso/49] == witness ::
+[13:31:32Z] :: bt-l0: [1] census addr=8 intf=2 alt=0 alts=1 class=0xff/0xff/0xff neps=2 eps=[IN4/blk/32 OUT4/blk/32] == witness ::
+[13:31:32Z] :: bt-l0: [1] census addr=8 intf=3 alt=0 alts=1 class=0xfe/0x01/0x01 neps=0 eps=[] == witness ::
+[13:31:32Z] :: bt-l0: [1] claim addr=8 intf=0 alt=0 class=0xff/0x01/0x01 evt_ep=IN1 -> selected by ENDPOINT EVIDENCE, tier 2 (vendor-classed: RF/Bluetooth subclass+protocol + int-IN/bulk-IN/bulk-OUT HCI fingerprint) == witness ::
+[13:31:32Z] :: bt-l0: [1] reachability addr=8 spd=FS intf=0 class=0xff/0x01/0x01 evt_ep=IN1 mps=16 interval=1 bulk_in=IN2/64 bulk_out=OUT2/64 parent=(hub 5 port 3) tt=(hub 4 port 1) -> TT-INHERITED(parent hub is not high speed; TT is the nearest HS ancestor) == witness ::
+[13:31:34Z] :: EHCI-HID: [1] STOP-NOTE EP0 DATA timeout addr=9 req=0xa1/0x01 token=0x80088d82 USBCMD=0x00080011 USBSTS=0x0000600b ASS on=true off=true — not forced ::
+[13:31:34Z] :: EHCI-HID: [1] M1 bcm5974 GET_REPORT(feature) addr=9 intf=1 widx=1 FAILED (timeout) — writing anyway ::
+[13:31:36Z] :: EHCI-HID: [1] STOP-NOTE EP0 DATA timeout addr=9 req=0x21/0x09 token=0x80088c80 USBCMD=0x00080011 USBSTS=0x0000400b ASS on=true off=true — not forced ::
+[13:31:36Z] :: EHCI-HID: [1] M1 bcm5974 SET_REPORT(feature) addr=9 intf=1 widx=1 FAILED (timeout) — endpoint armed, stream may stay silent ::
+[13:31:37Z] :: SMC-BATT: present=true soc=100% volt=12843mV amp=0mA full=9962mAh rem=9962mAh ac=derived:idle retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=1541 busy=43 late=0 == witness ::
+[13:31:37Z] :: igpu: VERDICT: Device reachable and powered (D-State: D0)
+[13:31:37Z] [gen7] arm=banked bdf=0:2.0 ggtt_banked=1 r8=built writes=0 ladder=tests-gen7
+[13:31:37Z] [pcih] aspm cleared rp 0043->0040 ep 0043->0040
+[13:31:37Z] :: SPLASH: arch=x86_64 WxH=2880x1800 ms=9 -> PASS ::
+[13:31:37Z] :: SPLASH: stage=takeover at_ms=6284 ::
+[13:31:37Z] [irq] masked section fn=fbcon.rs:1765 ms=23 cpu=0 live=0
+[13:31:37Z] :: fbcon: glyphs-active base=90020000 pitch=16384 cell=7x16 cols=411 rows=112 face=noto16-aa ::
+[13:31:37Z] :: [    1923 ms] ehci:kbd-armed ::
+[13:31:37Z] :: [    1948 ms] ehci:mouse-armed ::
+[13:31:37Z] :: [    2003 ms] ehci:kbd-armed ::
+[13:31:37Z] :: [    6005 ms] ehci:trackpad-armed ::
+[13:31:37Z] :: [    6109 ms] portsw:flip ::
+[13:31:37Z] :: BEAMX86: head=0 vtotal=1852 samples=21677 vblank_delta=3 -> ARMED :: max_vline=1851 adv=5064 panel_h=1800 evo_size=00000000 size_hi=0 size_lo=0 sample_ms=45 census_adv=[5064,0,0,0] census_vbd=[3,0,0,0] — vtotal is SAMPLED (max vline + 1 over 45 ms, rnndb cites no lines-per-frame register in HEAD_STAT); evo_size is the ACTIVE raster readback, so vtotal >= the matching half by the vblank rows is the expected relation, never equality. arch::scanout_beam() now answers and every panel present is bracketed. READ-ONLY: writes=0 ::
+[13:31:37Z] [splash] hold OPEN win=1 2880x1800 (until users::stage_resolve; 5000 ms bound)
+[13:31:37Z] [wc-x] activate bare phase=setter console=none bar=none (R93: nothing of the desktop exists; it is built at login)
+[13:31:37Z] :: GPUBLIT: selftest=ok ce_us=22 cpu_us=197 -> blitter=gpu ::
+[13:31:37Z] :: KEPLER: fold family=ucode n=152 last=ucode-poke POISON img=POKE wrcmd_cmd=BADF1000 ::
+[13:31:37Z] :: KEPLER: fold family=fence n=40 last=FENCE end cpuctl=00000010 ::
+[13:31:37Z] :: KEPLER: fold family=fal n=10 last=fal-port b=41A000 dmem rb w0=DEADBEEF w1=CAFEF00D w2=12345678 w3=A5A55A5A ::
+[13:31:37Z] :: KEPLER: fold family=recon n=9 last=recon-post cpuctl=00000010 ::
+[13:31:37Z] :: KEPLER: fold family=beacon n=8 last=beacon-restore at=pb off=02413000 w=[FFFFFFFF FFFFFF7F F5FFFFFF F5FFFFFF DFFDBFFF FFFFFFFF BFF7FFFF FFFFFFBB] words=8 beacon_resid=0 mismatch=0 restored=CLEAN ::
+[13:31:37Z] :: KEPLER: fold family=runlist n=5 last=runlist-scan verdict occupied_mask=4 alias_i2_base=match alias_i2_len=match ::
+[13:31:37Z] :: KEPLER: fold family=witness n=5 last=witness-rematch end err=00000001 stat=00000005 valid=80002410 ::
+[13:31:37Z] :: KEPLER: fold family=bind n=4 last=bind-post ENGINE_STATUS=00000000 ::
+[13:31:37Z] :: KEPLER: fold family=pgraph n=3 last=pgraph-pulse on rb=E011316D ::
+[13:31:37Z] :: KEPLER: fold family=sched n=3 last=sched-status post-submit err=00000001 (present) stat=00000005 ::
+[13:31:37Z] :: KEPLER: fold family=discriminator n=3 last=DISCRIMINATOR pbdma2 ch=00002002 (CHID=2 ACTIVE=1) ::
+[13:31:37Z] :: KEPLER: fold family=pbdma n=2 last=pbdma-eng-mask set ::
+[13:31:37Z] :: KEPLER: fold family=h2 n=2 last=H2/H3 ENGINE_TRIGGER readback=00000000 ::
+[13:31:37Z] :: KEPLER: fold family=ctx n=2 last=ctx-poke img=POKE ack=BADF1000 mb0=BADF1000 phase=BADF1000 scratch0=BADF1000(severed) cpuctl=BADF1000(severed) gpccs=00000010(alive) iters=1 class=POISON ::
+[13:31:37Z] :: KEPLER: fold family=dmactl n=2 last=dmactl post=00000000 ::
+[13:31:37Z] :: KEPLER: fold family=pfifo n=2 last=PFIFO_CHAN[1] post-submit: 00=80002410 04=11000001 ::
+[13:31:37Z] :: KEPLER: fold rest=[bar1:2,latch:1,inst:1,disp:1,hb:1,h4:1,h3:1,post:1,poll:1,terminal:1] ::
+[13:31:37Z] :: KEPLER: fold lines=263 families=26 kept=263 dropped=0 replay=tests keplerlog ::
+[13:31:37Z] :: igpu-dpy: pre-switch state DDC=0x02 SW_DISP=0x03 SW_EXT=0x01 SW_EXT_ST=0x21 DISP=0x03 EXT=0x21 sw_ext_state=UNACCEPTED ext_state=kepler-owned gate=ACCEPT ::
+[13:31:37Z] :: igpu-dpy: restore ext=SKIPPED (write-target port, no state read) SW_EXT=0x01 SW_EXT_ST=0x21 ext_state=kepler-owned ::
+[13:31:37Z] :: igpu-dpy: rung=00 name=census ok=1 bdsm=0x8BA00001 ggc=0x00000211 ggtt0=0x8BA00003 ggtt1=0x8BA01003 aux_ctl=0x014300C8 frmcnt=0x00000000 ::
+[13:31:37Z] :: igpu: [GMUX] running Unwind stack self-test ::
+[13:31:37Z] :: igpu: [GMUX] Unwind stack MMIO self-test passed ::
+[13:31:37Z] :: igpu: [GMUX] Unwind stack gmux-dispatch=REACHED (Gmux restore path executed without faulting, not implying restore verified) ::
+[13:31:37Z] :: igpu-dpy: rung=03 name=pp ok=1 pp_write=DECLINED why=panel-not-handed-to-igd bits=cited:IHD-OS-V3-Pt4-sec2.4-pp38-43 pp_window=KEYED delays_programmed=0 pp_unwind=0 pp_ctl=0xABCD0008 pp_sts=0x00000000 on_delays=0x00000000 off_delays=0x00000000 div=0x00186904 ::
+[13:31:37Z] :: igpu-dpy: rung=03 name=pp SETTLE ms=210 budget=not-a-cited-T3 moved=0 pp_ctl=0xABCD0008->0xABCD0008 pp_sts=0x00000000->0x00000000 elapsed_ms=214 ::
+[13:31:37Z] :: igpu-dpy: rung=04 name=dpcd try=1/7 ok=1 dpcd_rev=0x11 elapsed_ms=214 ::
+[13:31:37Z] :: igpu-dpy: rung=06 name=link ok=1 window=DPCD(0x000-0x00F) dpcd_rev=0x11 rate_raw=0x0A rate_decode=TBV-tree-table lanes=4 lanes_plausible=1 enhanced_frame=1 tps3=0 downspread=1 no_aux_tl=1 edp_cfg_cap=0x01 elapsed_ms=217 ::
+[13:31:37Z] :: igpu-dpy: rung=06 name=link CAP 000: 11 0A 84 41 00 00 01 C0 02 00 00 00 0F 01 00 00 ::
+[13:31:37Z] :: igpu-dpy: rung=06 name=link STATUS addr=DPCD(0x202-0x207) bits=uncited lane01=0x33 lane23=0x33 align=0x80 sink=0x00 adj01=0x00 adj23=0x00 ::
+[13:31:37Z] :: igpu-dpy: rung=07 name=pps-on ok=1 pp_write=DECLINED why=panel-not-handed-to-igd bits=cited writes=0 pp_unwind=0 t_source=NONE t_dpcd=absent t_edid=absent pp_ctl=0xABCD0008 pp_sts=0x00000000 on_delays=0x00000000 off_delays=0x00000000 div=0x00186904 elapsed_ms=217 ::
+[13:31:37Z] :: igpu-dpy: rung=07 name=pps-on CITED doc=IHD-OS-V3-Pt4-05-12 pp_control=0xC7204:[31:16]=key,bit3=vdd-override,bit2=backlight,bit1=pd-on-reset,bit0=power-target:sec2.4.2-pp39-41 on_delays=0xC7208:[31:30]=port-sel,[28:16]=T3,[12:0]=pwron-to-bl:sec2.4.3-pp41-42 off_delays=0xC720C:[28:16]=T10,[12:0]=T9:sec2.4.4-p42 divisor=0xC7210:[4:0]=T12:sec2.4.5-p43 gmux=kepler t_source=NONE — the write waits for a gmux hand-off to the IGD and a T-value source; no PPS write on any boot of this build ::
+[13:31:37Z] :: igpu-dpy: rung=07b name=pps-read ok=1 writes=0 sample=rung07 doc=IHD-OS-V3-Pt-4-05-12 cite=sec2.4-pp38-43 elapsed_ms=217 ::
+[13:31:37Z] :: igpu-dpy: rung=07b name=pps-read REG pp_status@0xC7200=0x00000000 power_on=OFF assets=not-ready(ignored-on-DPA-p38) seq=none cycle_delay_t4=not-active cite=sec2.4.1-pp38-39 ::
+[13:31:37Z] :: igpu-dpy: rung=07b name=pps-read REG pp_control@0xC7204=0xABCD0008 wp_key=0xABCD write_protect=DISABLED-key-ABCD vdd_override=FORCE backlight=disable pd_on_reset=do-not-run power_target=OFF cite=sec2.4.2-pp39-41 ::
+[13:31:37Z] :: igpu-dpy: rung=07b name=pps-read REG pp_on_delays@0xC7208=0x00000000 port_sel=LVDS t3_powerup_raw=0 t3_us=0 pwron_to_bl_raw=0 pwron_to_bl_us=0 unit=100us cite=sec2.4.3-pp41-42 ::
+[13:31:37Z] :: igpu-dpy: rung=07b name=pps-read REG pp_off_delays@0xC720C=0x00000000 t10_video_off_to_power_off_raw=0 t10_us=0 t9_bl_off_to_video_off_raw=0 t9_us=0 unit=100us cite=sec2.4.4-p42 ::
+[13:31:37Z] :: igpu-dpy: rung=07b name=pps-read REG pp_divisor@0xC7210=0x00186904 refdiv=0x001869 refclk_mhz=125 t12_power_cycle_raw=0x04 t12_ms=300 t12_law=prm-two-points unit=100ms cite=sec2.4.5-p43 ::
+[13:31:37Z] :: igpu-dpy: rung=07b name=pps-read ROLLUP panel_powered_by_fw=no vdd_forced_by_fw=yes wp_window=KEYED delays_programmed=1/3 t_source=PRM-fields-not-firmware-values port_sel_conflict=key-ABCD-but-port-sel-not-DPA preserve=pp_control=0xABCD0008 ::
+[13:31:37Z] :: igpu-dpy: rung=08 name=link-train-dry ok=1 DRY writes=0 aux_writes=0 pp_unwind=0 gated_on=pps=DECLINED:panel-not-handed-to-igd elapsed_ms=217 ::
+[13:31:37Z] :: igpu-dpy: rung=08 name=link-train-dry WOULD-SET rate=0x0A(DPCD 0x001 verbatim; no MHz conversion, decode TBV) lanes=4 enhanced_frame=1 tps3=0 downspread=1 seq=TPS1-CR/TPS2-EQ/pattern-off cite=LADDER-igpu-bringup.md-rung5-NEEDS-VERIFICATION ::
+[13:31:37Z] :: igpu-dpy: rung=08 name=link-train-dry WOULD-WRITE-DPCD link_bw_set=0x100 lane_count_set=0x101 training_pattern_set=0x102 training_lane0_3_set=0x103-0x106 cite=LADDER-igpu-bringup.md-rung5-NEEDS-VERIFICATION ::
+[13:31:37Z] :: igpu-dpy: rung=08 name=link-train-dry WOULD-TOUCH dp_a@0x64000=0x0000001C dplla@0x06014=0x00000000 fpa0@0x06040=0x00000000 fpa1@0x06044=0x00000000 pipeaconf@0x70008=0x00000000 pipeasrc@0x6001C=0x00000000 ::
+[13:31:37Z] :: igpu-dpy: rung=08 name=link-train-dry WOULD-TOUCH dspacntr@0x70180=0x00000000 dspastride@0x70188=0x00000000 dspalinoff@0x70184=0x00000000 dspatileoff@0x701A4=0x00000000 dspasurf@0x7019C=0x00000000 ::
+[13:31:37Z] :: igpu-dpy: rung=08 name=link-train-dry NOT-IN-TREE (none) LANDED-BY-GMUX8 htotal hblank hsync vtotal vblank vsync link_m link_n — population=igpu.rs-regs-module, read decoded at rung=08b; NOT-IN-IVB-PRM transcoder dp_tp_ctl dp_tp_status — population=IVB-PRM-V3Pt3+V3Pt4, hits=0, so they are absent from the SILICON's public spec and not merely from this tree ::
+[13:31:37Z] :: igpu-dpy: rung=08b name=modeset-read ok=1 writes=0 doc=IHD-OS-V3-Pt-3-05-12 pipe=A pipe_sel_raw=0 elapsed_ms=217 ::
+[13:31:37Z] :: igpu-dpy: rung=08b name=modeset-read PORT dp_a@0x64000=0x0000001C enable=disabled pipe=A lanes=x1 enhanced_frame=disable pll_freq=270mhz pll_enable=disable reversed=not-reversed train_pattern=pattern1 sync_pol=0x3 detected=detected cite=sec4.4.1-pp82-86 ::
+[13:31:37Z] :: igpu-dpy: rung=08b name=modeset-read PIPECONF conf@0x70008=0x00000000 pipe_enable=disabled pipe_state=disabled bpc=8bpc interlace=0x0 drrs_power_mode=normal mn_set=1 frame_start_delay=0 cite=sec5.1.3-pp100-103 ::
+[13:31:37Z] :: igpu-dpy: rung=08b name=modeset-read TIMING-H htotal@0x60000=0x00000000 hblank@0x60004=0x00000000 hsync@0x60008=0x00000000 active=1 total=1 blank_start=0 blank_end=0 sync_start=0 sync_end=0 minus_one_undone=yes cite=sec4.1.1-4.1.3-pp66-68 ::
+[13:31:37Z] :: igpu-dpy: rung=08b name=modeset-read TIMING-V vtotal@0x6000C=0x00000000 vblank@0x60010=0x00000000 vsync@0x60014=0x00000000 active=1 total=1 blank_start=0 blank_end=0 sync_start=0 sync_end=0 minus_one_undone=yes cite=sec4.1.4-4.1.6-pp69-71 ::
+[13:31:37Z] :: igpu-dpy: rung=08b name=modeset-read SRCSZ srcsz@0x6001C=0x00000000 h=1 v=1 minus_one_undone=yes cite=sec4.1.7-p72 ::
+[13:31:37Z] :: igpu-dpy: rung=08b name=modeset-read MN1 datam1@0x60030=0x00000000 tu_size=1 data_m=0 datan1@0x60034=0x00000000 data_n=0 linkm1@0x60040=0x00000000 link_m=0 linkn1@0x60044=0x00000000 link_n=0 cite=sec4.2.1-4.2.4-pp74-77 ::
+[13:31:37Z] :: igpu-dpy: rung=08b name=modeset-read MN2 datam2@0x60038=0x00000000 tu_size=1 data_m=0 datan2@0x6003C=0x00000000 data_n=0 linkm2@0x60048=0x00000000 link_m=0 linkn2@0x6004C=0x00000000 link_n=0 cite=sec4.2.1-4.2.4-pp74-77 ::
+[13:31:37Z] :: igpu-dpy: rung=08b name=modeset-read MODE active=1x1 total=1x1 mn_set=1 ls_clk_khz=270000 dot_clock_khz=0 refresh_mhz=0 undefined_why=link_n=0 law=LinkM/N=dotclock/ls_clk(sec4.2-p74)+DP_CTL[17:16](sec4.4.1-p85) dpcd_rate_raw=0x0A(rate_decode=TBV-tree-table) dpcd_lanes=4 ::
+[13:31:37Z] :: igpu-dpy: rung=08b name=modeset-read NOT-IN-IVB-PRM dp_tp_ctl dp_tp_status trans_ddi_func_ctl — population=IVB-PRM-V3Pt3(North)+V3Pt4(South), hits=0; those are Haswell DDI registers, and on Ivy Bridge eDP link training is DP_CTL_A[9:8] (sec4.4.1 pp.85-86) with the port CPU-attached, so no PCH transcoder is in the eDP path and the write rung must not look for one ::
+[13:31:37Z] :: igpu: [AUX] PRE-SWITCH DPCD Read Failed: aux-timeout-error (status: 0x5D4000C8) ::
+[13:31:37Z] :: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD (panel BLANKED/FLICKERED) ::
+[13:31:37Z] :: igpu: [GMUX] switch read-back mismatch (DDC is the only echo proven on this machine; DISP/EXT are advisory — see the AUX rungs for whether the mux moved): DDC=0x01 DISP=0x02 EXT=0x01 ::
+[13:31:37Z] :: igpu: [AUX] PCH_PP_STATUS/CONTROL Before AUX: STATUS=0x00000000 CONTROL=0xABCD0008 ::
+[13:31:37Z] :: igpu: [AUX] PCH_PP_STATUS/CONTROL After AUX:  STATUS=0x00000000 CONTROL=0xABCD0008 ::
+[13:31:37Z] :: igpu: [AUX] DPCD REV: 0x11 ::
+[13:31:37Z] :: igpu: [AUX] EDID Dump ::
+[13:31:37Z] :: igpu: [AUX] 000: 00 FF FF FF FF FF FF 00 06 10 0E A0 00 00 00 00 ::
+[13:31:37Z] :: igpu: [AUX] 010: 10 15 01 04 A5 21 15 78 02 6F B1 A7 55 4C 9E 25 ::
+[13:31:37Z] :: igpu: [AUX] 020: 0C 50 54 00 00 00 01 01 01 01 01 01 01 01 01 01 ::
+[13:31:37Z] :: igpu: [AUX] 030: 01 01 01 01 01 01 EF 83 40 A0 B0 08 34 70 30 20 ::
+[13:31:37Z] :: igpu: [AUX] 040: 36 00 4B CF 10 00 00 1A 00 00 00 FC 00 43 6F 6C ::
+[13:31:37Z] :: igpu: [AUX] 050: 6F 72 20 4C 43 44 0A 20 20 20 00 00 00 10 00 00 ::
+[13:31:37Z] :: igpu: [AUX] 060: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10 ::
+[13:31:37Z] :: igpu: [AUX] 070: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 E8 ::
+[13:31:37Z] :: video: edid-aux hdr=OK sum=OK native=2880x1800 ppi=221 fw=absent -> published relatch=1.0->2.5 console=160x45 ::
+[13:31:37Z] :: igpu: [GMUX] revert read-back: DDC=0x02 SWITCH_DISP=0x03 READ_DISP=0x03 SWITCH_EXT=0x01 READ_EXT=0x21 (TBV) ::
+[13:31:37Z] :: igpu: [GMUX] EXTERNAL restore=SKIPPED (write-target port, no state read) — SWITCH_EXT(0x40) 0x01->0x01 was NOT written back and does not vote; READ_EXT(0x41) 0x21->0x21 state kepler-owned->kepler-owned ::
+[13:31:37Z] :: igpu-dpy: LADDER highest=10/10 name=end ok=1 pending=2 gmux=MATCH why=none elapsed_ms=219 pp_seen=both pp=0xABCD0008/0x00000000->0xABCD0008/0x00000000 pp_settle_ms=210 aux_port=DPA(0x64010) aux_div=0x0C8 dpcd_tries=1 pps=DECLINED:panel-not-handed-to-igd pending_items=gmux:SWITCH_DDC@0x28<-0x02,gmux:SWITCH_DISPLAY@0x10<-0x03 ::
+[13:31:37Z] :: sdhc: card v2.00+ SDHC block-addressed blocks=60868608 size=29721 MiB rca=0x59b4 ::
+[13:31:37Z] :: SDHCREG: handle=built register=ok blocks=60868608 addressing=block — the internal card IS a program source this boot ::
+[13:31:37Z] :: AHCI: selfcheck port=0 identify=ok sector0=GPT -> PASS ::
+[13:31:37Z] :: USBDBG-INVERT: debug instruments riding the real desktop == witness ::
+[13:31:37Z] [hid] pump task=hid-pump cpu=7 cadence=1tick (INPUTSTALL2: the HID pass never waits on the device-service loop)
+[13:31:37Z] [stack] guards armed tasks=12 aps=7 ist=32 bsp=armed page=4096
+[13:31:37Z] [lock] registry armed classes=0 cap=256 (LOCKREG)
+[13:31:37Z] xHCI: [Port 1] reset completed with PED=0 (failed).
+[13:31:37Z] xHCI: !!! ENUM RECOVERY: port 1 failed at 'await-reset' (reset-failed, code 0) PORTSC=0x000002a0 !!!
+[13:31:37Z] [vfs] root-pass HOLD probe=bt-campaign at=6820ms :: BOOTSLOW: this probe does not serve the root and waits for the root pass's verdict ::
+[13:31:37Z] :: SDHCPOST: posture sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=rw reason=none (the pin is read ONCE, at the mount; 4a/4b re-read it at every write — SDHCPOST/SDHCRW, first, once) ::
+[13:31:37Z] [boot] step=users-load ms=83 blocks_read=36 blocks_written=0 cmds=79 store=fat via=sdhc users=0
+[13:31:37Z] [login] root locked (R100: no row, no prompt, no set-password; the first user is the administrator)
+[13:31:38Z] [irq] masked section fn=with_unafs@unafs.rs:793 ms=23 cpu=1 live=1
+[13:31:38Z] :: PART: unafs span check — base LBA 264192 is NOT the start of any accepted MBR partition (blocks=1048576) ::
+[13:31:38Z] [lock] held-too-long name=unafs.rs:567 at=unafs.rs:794 by=12@cpu1 ms=74 waiters=0
+[13:31:38Z] :: [unafsbind] mount=native handle=sdhc ::
+[13:31:38Z] [vfs] root = boot volume serial=0x18cbbb88 source=sdhc match=/KERNEL.ELF sha=b976af1b unafs=present matches=1 home=- files=1 aliased=- window_off=0x79b2aa70 window_len=4096 file_off=0x187a70 candidates=3 disks=global=absent usb=absent sdhc=present tegra-sd=unbuilt ahci0=present ::
+[13:31:38Z] [vfs] volume mounted /volumes/EFI source=ahci0 rw=no ::
+[13:31:38Z] [vfs] root mount / = native unafs volume source=sdhc rw=yes ::
+[13:31:38Z] :: UNAFSX86: root=unafs disk=sdhc blocks=1048576 gen=15 home=/home -> PASS ::
+[13:31:38Z] [boot] fat sacred: /boot and /volumes/boot are read-only for every principal; writes only through fat_unlock (R99) ::
+[13:31:38Z] [vfs] apps+lib on the native root: /apps /lib are directories of / source=sdhc (R94: real, no links) ::
+[13:31:38Z] [vfs] boot mount /boot = fat boot volume source=sdhc rw=yes ::
+[13:31:38Z] [vfs] volume alias /volumes/boot = fat boot volume source=sdhc (Volumes shows boot/efi only) ::
+[13:31:38Z] [vfs] volume alias /volumes/UnaOS = native unafs root source=sdhc ::
+[13:31:38Z] [vfs] volume /volumes/EFI withdrawn — another disk's EFI system partition is not a volume (R89: Volumes = UnaOS + boot) ::
+[13:31:38Z] :: PTRLOST: window=1:0 furniture=0:1 backdrop=0:0 furn_subtracted=1 sprite_owns_paint=1 lost_reachable=0 :: PASS ::
+[13:31:38Z] [lock] spin-wait name=unafs.rs:567 at=unafs.rs:794 waiter=9@cpu7 on=12@cpu1 ms=11
+[13:31:38Z] [vfs] root = boot volume serial=0x18cbbb88 source=sdhc match=/KERNEL.ELF sha=b976af1b unafs=present matches=1 home=- files=1 aliased=- window_off=0x79b2aa70 window_len=4096 file_off=0x187a70 candidates=3 disks=global=absent usb=absent sdhc=present tegra-sd=unbuilt ahci0=present ::
+[13:31:38Z] [wc-h] vbl_src=irq why=first-need irq=61 vbl_delta=60 ratio_pct=101 wire=msi armed_ms=1003
+[13:31:38Z] [prefs] load clamped=0
+[13:31:38Z] :: PREFS: path=/settings domains=0 loaded=0 saved=0 ns=system -> PASS ::
+[13:31:38Z] [boot] step=root-mount ms=590 blocks_read=353 blocks_written=0 cmds=276 root=attrs
+[13:31:38Z] [lock] held-too-long name=prefs.rs:216 at=prefs.rs:418 by=12@cpu1 ms=86 waiters=0
+[13:31:44Z] [boot] step=assoc-seed ms=5498 blocks_read=3632 blocks_written=211 cmds=666 created=27
+[13:31:44Z] :: FIRSTBOOT: stage=installer root=locked users=0 desktop_ignited=false why=store-loaded -> PASS ::
+[13:31:44Z] :: BOOT: firmware->loader=13171ms loader->desktop=15414ms total=28585ms lines=156 ::
+[13:31:44Z] [login] installer: stage=installer (R77: R100: no user — the first-user form is the whole glass (that user is the administrator; root is locked); no desktop, no programs, no fixtures)
+[13:31:44Z] [lock] held-too-long name=wm.rs:30196 at=wm.rs:30207 by=9@cpu7 ms=64 waiters=0
+[13:31:44Z] [login] installer: first-user form open (R100: name, password, retype; that user is the administrator; root is locked; the desktop ignites for them)
+[13:31:44Z] [wc-h] rollup win=2 scope=window emit=1 age_ms=283 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,0,0,0,0,0,0,1] beam=obs beamobs=4 beamwaits=3 beamwait_us=18477 beammaxwait_us=9756 beamgiveup=0 beamcross_ppk=1908 blitter=cpu blit_us=7896 gpu_fallback=0 fixture=1 whole=3 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=2639 minpresent_us=2636 presspread=1 presspop=3 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[13:31:44Z] [boot] step=stage-resolve ms=300 blocks_read=216 blocks_written=0 cmds=27 installer
+[13:31:44Z] [kfont] load dir=/system/fonts faces=10/10 fallback=none scripts_missing=none font_kib=3341 cache_kib=2048 ppi=221 scale=2.5 cell=18x40 grid=160x45 panel=2880x1800 font=sans font_size=13 body=dejavu-mono-11.50 chrome=dejavu-sans-36.00 ui=dejavu-sans-29.93 console=dejavu-mono-29.75 ms=5464
+[13:31:44Z] :: KFONTPPI: edid_src=aux ppi=221 scale=2.5 cell=18x40 grid=160x45 -> PASS ::
+[13:31:44Z] [ui] metrics ppi=221 scale=2.5 s2=5 bar=85 title=85 frame=13 gap=30 disc=30 chrome=23x50 cell=18x40 glyph=2 win=1300x1120 consts=0 asserts=ok
+[13:31:44Z] [kfont] repaint epoch=1 console_rows=0 windows=quarry,settings,activity,fileview,textedit,login face=dejavu-sans-29.93
+[13:31:44Z] [dock] prefs position=bottom autohide=0 via=login
+[13:31:44Z] [dock] dockpin login
+[13:31:44Z] :: DOCKPIN: left=7 minimized=0 pinned=7 running=0 loaded=0 saved=0 -> PASS ::
+[13:31:44Z] [backlight] seed readback=160 max=1023 level=2 (GLASSLAG: the first step moves from the panel's own level)
+[13:31:44Z] :: SDHCBLK: FAT mounted READ-WRITE on the internal SD card (29721 MiB): FAT32 vol@LBA2048 volsec=262144 bps=512 spc=1 nfat=2 fatsz=2017sec reserved=32 fat@LBA2080 data@LBA6114 clusters=258078 rootclus=2 ::
+[13:31:44Z] :: SDHCBLK: sdhc root directory (11 entries) ::
+[13:31:44Z] :: SDHCBLK:   <DIR>              EFI ::
+[13:31:44Z] :: SDHCBLK:             72       HELLO.BIN ::
+[13:31:44Z] :: SDHCBLK:            156       SRC.SHA ::
+[13:31:44Z] :: SDHCBLK:       34941974       SRC.TGZ ::
+[13:31:44Z] :: SDHCBLK:            109       HELLO.TXT ::
+[13:31:44Z] :: SDHCBLK:       13154168       KERNEL.ELF ::
+[13:31:44Z] :: SDHCBLK:            197       BLOCK.TXT ::
+[13:31:44Z] :: SDHCBLK:            512       GROW.BIN ::
+[13:31:44Z] :: SDHCBLK:             64       S8W.BIN ::
+[13:31:44Z] :: SDHCBLK:           1024       SCRATCH.BIN ::
+[13:31:44Z] :: SDHCBLK:             59       README.TXT ::
+[13:31:44Z] :: SDHC4C-ROOT: NAME=UNALOG.BIN not matched on vol=FAT32@LBA2048 volsec=262144 label=UNAOS serial=0x18cbbb88 | walk: read=OK sectors=1 slots=12 entries=11 terminator=slot#12 | first8: EFI HELLO.BIN SRC.SHA SRC.TGZ HELLO.TXT KERNEL.ELF BLOCK.TXT GROW.BIN ::
+[13:31:44Z] [vfs] root-pass HOLD probe=witness-fixture at=13648ms :: BOOTSLOW: this probe does not serve the root and waits for the root pass's verdict ::
+[13:31:44Z] [vfs] root-pass BOUND source=sdhc match=/KERNEL.ELF at=13648ms source_seen_at=13648ms wait_ms=0ms pass=1 held=bt-campaign,witness-fixture :: BOOTSLOW: the root is bound on its own pass; the probes named in held= run after it ::
+[13:31:44Z] :: BOOTLOG: 6 milestone(s) recorded (GUI-WITNESS ring) ::
+[13:31:44Z] :: BOOTLOG: [    1923 ms] ehci:kbd-armed ::
+[13:31:44Z] :: BOOTLOG: [    1948 ms] ehci:mouse-armed ::
+[13:31:44Z] :: BOOTLOG: [    2003 ms] ehci:kbd-armed ::
+[13:31:44Z] :: BOOTLOG: [    6005 ms] ehci:trackpad-armed ::
+[13:31:44Z] :: BOOTLOG: [    6109 ms] portsw:flip ::
+[13:31:44Z] :: BOOTLOG: [    6815 ms] gui:handoff ::
+[13:31:44Z] :: CLOCK-X1: TSC invariant, ~2693 MHz; monotone (rdtsc +36592018276); uptime 15->29 s (JD17 x86-frozen clock now advances) [paygo: deferred 13583 ms TSC / 13583 ms APIC, uptime +14 s, core=7 — CONSISTENT] == witness ::
+[13:31:44Z] :: BPACE: entry t=0ms d=0ms ::
+[13:31:44Z] :: BPACE: fb-wc t=0ms d=0ms ::
+[13:31:44Z] :: BPACE: fb-wc-done t=0ms d=0ms ::
+[13:31:44Z] :: BPACE: core-init t=14ms d=13ms ::
+[13:31:44Z] :: BPACE: mem-init t=57ms d=42ms ::
+[13:31:44Z] :: BPACE: heap t=57ms d=0ms ::
+[13:31:44Z] :: BPACE: acpi t=58ms d=0ms ::
+[13:31:44Z] :: BPACE: calib t=158ms d=100ms ::
+[13:31:44Z] :: BPACE: smp t=218ms d=59ms ::
+[13:31:44Z] :: BPACE: sched t=218ms d=0ms ::
+[13:31:44Z] :: BPACE: pci-enter t=268ms d=50ms ::
+[13:31:44Z] :: BPACE: ehci-hid t=268ms d=0ms ::
+[13:31:44Z] :: BPACE: ehci-hid-done t=6158ms d=5890ms ::
+[13:31:44Z] :: BPACE: pci-probes t=6263ms d=104ms ::
+[13:31:44Z] :: BPACE: pci-scan t=6263ms d=0ms ::
+[13:31:44Z] :: BPACE: portsw t=6263ms d=0ms ::
+[13:31:44Z] :: BPACE: xhci-handoff t=6263ms d=0ms ::
+[13:31:44Z] :: BPACE: xhci-halt t=6263ms d=0ms ::
+[13:31:44Z] :: BPACE: xhci-hcrst t=6264ms d=1ms ::
+[13:31:44Z] :: BPACE: xhci-cnr t=6264ms d=0ms ::
+[13:31:44Z] :: BPACE: xhci-ptrs t=6264ms d=0ms ::
+[13:31:44Z] :: BPACE: xhci-run t=6264ms d=0ms ::
+[13:31:44Z] :: BPACE: xhci-portpwr t=6264ms d=0ms ::
+[13:31:44Z] :: BPACE: xhci-settle t=6364ms d=100ms ::
+[13:31:44Z] :: BPACE: enum:p1 t=6364ms d=0ms ::
+[13:31:44Z] :: BPACE: pci-usb t=6953ms d=589ms ::
+[13:31:44Z] :: BPACE: gui t=6969ms d=15ms ::
+[13:31:44Z] :: BPACE: enum:p2 t=6969ms d=0ms ::
+[13:31:44Z] :: BPACE: root-bind t=7339ms d=369ms ::
+[13:31:44Z] :: BPACE: total gui=6969ms ftdi=none n=29 dropped=0 hz=2693852305 result=LEDGER ::
+[13:31:44Z] :: SERWIT-2 tap fbcon: submitted=407 absorbed=0 staged=0 dropped=0 suppressed=407 torn=0 inflight=0 in_progress=0 ::
+[13:31:44Z] :: SERWIT-2 tap ftdi: submitted=407 absorbed=407 staged=0 dropped=0 suppressed=0 torn=0 inflight=0 in_progress=0 ::
+[13:31:44Z] :: SERWIT-2 tap tste: submitted=407 absorbed=9 staged=0 dropped=0 suppressed=398 torn=0 inflight=0 in_progress=0 ::
+[13:31:44Z] :: SERWIT-2 tap flightrec: submitted=407 absorbed=407 staged=0 dropped=0 suppressed=0 torn=0 inflight=0 in_progress=0 ::
+[13:31:44Z] :: SERWIT-2: mirror taps — every line accounted for on all 4 taps, 0 lost on the 3 evidence taps (ftdi/tste/flightrec) -> PASS ::
+[13:31:44Z] [flight] ring rolling_kib=3021 pinned_head_kib=64 heap_free_mib=188 captured=28191 (FLIGHTRING B400: the newest 3021 KiB always held, the boot's first 64 KiB pinned)
+[13:31:44Z] :: DRAINCAP: SKIP — no 16550 on this machine, nothing is ever staged (SERWIT-1D); budget=192 B still compiled and its truth table still asserted ::
+[13:31:44Z] :: SERWIT-1B: SKIP — no 16550 on this machine, the contended path is DECLINED before it is reached (SERWIT-1D); the policy truth table is asserted at compile time ::
+[13:31:44Z] :: PWRDRAIN: SKIP — no 16550 on this machine, so there is no staged line for a power verb to lose (SERWIT-1D); the budget arithmetic is asserted at compile time ::
+[13:31:44Z] :: S5DRAIN: SKIP — no 16550 on this machine, so there is no staged line for the direct S5 route to lose (SERWIT-1D); the flush is compiled and its arithmetic asserted ::
+[13:31:44Z] :: SERWIRE: SKIP — no 16550 on this machine, so no drain reaches a wire to be charged for (SERWIT-1D); the cap arithmetic is asserted at compile time ::
+[13:31:44Z] :: SERIALTX: SKIP — no 16550 on this machine, so no byte of this transport reaches a wire masked or unmasked (SERWIT-1D); the one-FIFO budget is asserted at compile time and the `[sertx]` census still reports the post-mask taps, which are that board's only carrier ::
+[13:31:44Z] [block] boot medium=sdhc kept; usb slot=- separate (R95)
+[13:31:46Z] [vfs] root-pass fixture n=1 held_ms=1200 at=14382ms verdict=bound :: BOOTSLOW: a synthetic probe that does not serve the root; bound is the ordering; a pending verdict is a probe that ran ahead of the root ::
+[13:31:46Z] [panel-owner] panel-write-refused term=idle-blank owner=owner-gui-screen site=wm::composite
+[13:31:46Z] xHCI: after ENABLE_SLOT — completion posted to event ring=true controller-error=false
+[13:31:46Z] xHCI HEALTH [post ENABLE_SLOT]: USBCMD=0x5(RS=1 INTE=1) USBSTS=0x18(HCH=0 HSE=0 EINT=1 CNR=0 HCE=0) CRCR.CRR=1 DBOFF=0x3000
+[13:31:46Z] xHCI HEALTH [post ENABLE_SLOT]: IMAN=0x3(IP=1 IE=1) ERDP_lo=0x2020fd88(EHB=1)
+[13:31:46Z] [wc-h] rollup win=2 scope=window emit=2 age_ms=2620 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,0,0,0,0,0,0,1] beam=obs beamobs=6 beamwaits=4 beamwait_us=18524 beammaxwait_us=9756 beamgiveup=0 beamcross_ppk=3186 blitter=cpu blit_us=13255 gpu_fallback=0 fixture=1 whole=5 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=2732 minpresent_us=2635 presspread=1 presspop=5 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[13:31:46Z] :: DIMIDLE: idle_min=10 blanked_at_ms=15582 woke_at_ms=15595 wake_key_swallowed=1 -> PASS ::
+[13:31:46Z] >>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+[13:31:46Z] >>> [CONTACT ESTABLISHED] SLOT 1
+[13:31:46Z] >>> VENDOR ID : [0403]
+[13:31:46Z] >>> PRODUCT ID: [6001]
+[13:31:46Z] :: U2.5: FTDI console up (0403:6001, 115200 8N1) ::
+[13:31:46Z] :: FTDI: tx pump budget=5387704610 used=2193540 n=1 timeouts=0 yields=0 result=OK ::
+[13:31:46Z] :: FTDI: tx pump budget=5387704610 used=10755248 n=3 timeouts=0 yields=0 result=OK ::
+[13:31:46Z] :: BOOTLOG: 7 milestone(s) recorded (GUI-WITNESS ring) ::
+[13:31:46Z] :: BOOTLOG: [    1923 ms] ehci:kbd-armed ::
+[13:31:46Z] :: BOOTLOG: [    1948 ms] ehci:mouse-armed ::
+[13:31:46Z] :: BOOTLOG: [    2003 ms] ehci:kbd-armed ::
+[13:31:46Z] :: BOOTLOG: [    6005 ms] ehci:trackpad-armed ::
+[13:31:46Z] :: BOOTLOG: [    6109 ms] portsw:flip ::
+[13:31:46Z] :: BOOTLOG: [    6815 ms] gui:handoff ::
+[13:31:46Z] :: BOOTLOG: [   15692 ms] ftdi:console-up ::
+[13:31:46Z] :: BPACE: entry t=0ms d=0ms ::
+[13:31:46Z] :: BPACE: fb-wc t=0ms d=0ms ::
+[13:31:46Z] :: BPACE: fb-wc-done t=0ms d=0ms ::
+[13:31:46Z] :: BPACE: core-init t=14ms d=13ms ::
+[13:31:46Z] :: BPACE: mem-init t=57ms d=42ms ::
+[13:31:46Z] :: BPACE: heap t=57ms d=0ms ::
+[13:31:46Z] :: BPACE: acpi t=58ms d=0ms ::
+[13:31:46Z] :: BPACE: calib t=158ms d=100ms ::
+[13:31:46Z] :: BPACE: smp t=218ms d=59ms ::
+[13:31:46Z] :: BPACE: sched t=218ms d=0ms ::
+[13:31:46Z] :: BPACE: pci-enter t=268ms d=50ms ::
+[13:31:46Z] :: BPACE: ehci-hid t=268ms d=0ms ::
+[13:31:46Z] :: BPACE: ehci-hid-done t=6158ms d=5890ms ::
+[13:31:46Z] :: BPACE: pci-probes t=6263ms d=104ms ::
+[13:31:46Z] :: BPACE: pci-scan t=6263ms d=0ms ::
+[13:31:46Z] :: BPACE: portsw t=6263ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-handoff t=6263ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-halt t=6263ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-hcrst t=6264ms d=1ms ::
+[13:31:46Z] :: BPACE: xhci-cnr t=6264ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-ptrs t=6264ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-run t=6264ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-portpwr t=6264ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-settle t=6364ms d=100ms ::
+[13:31:46Z] :: BPACE: enum:p1 t=6364ms d=0ms ::
+[13:31:46Z] :: BPACE: pci-usb t=6953ms d=589ms ::
+[13:31:46Z] :: BPACE: gui t=6969ms d=15ms ::
+[13:31:46Z] :: BPACE: enum:p2 t=6969ms d=0ms ::
+[13:31:46Z] :: BPACE: root-bind t=7339ms d=369ms ::
+[13:31:46Z] :: BPACE: enum:p2-done t=15845ms d=8506ms ::
+[13:31:46Z] :: BPACE: enum:p5 t=15845ms d=0ms ::
+[13:31:46Z] :: BPACE: ftdi-up t=15845ms d=0ms ::
+[13:31:46Z] :: BPACE: total gui=6969ms ftdi=15845ms n=32 dropped=0 hz=2693852305 result=LEDGER ::
+[13:31:46Z] xHCI: after ENABLE_SLOT — completion posted to event ring=true controller-error=false
+[13:31:46Z] xHCI HEALTH [post ENABLE_SLOT]: USBCMD=0x5(RS=1 INTE=1) USBSTS=0x18(HCH=0 HSE=0 EINT=1 CNR=0 HCE=0) CRCR.CRR=1 DBOFF=0x3000
+[13:31:46Z] xHCI HEALTH [post ENABLE_SLOT]: IMAN=0x3(IP=1 IE=1) ERDP_lo=0x202100f8(EHB=1)
+[13:31:46Z] >>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+[13:31:46Z] >>> [CONTACT ESTABLISHED] SLOT 2
+[13:31:46Z] >>> VENDOR ID : [0b95]
+[13:31:46Z] >>> PRODUCT ID: [1790]
+[13:31:46Z] :: USBNET: candidate kind=ax88179 slot=2 vidpid=0b95:1790 cfg=1 ctrl=0 data=0 alt=0 imac=0 mss=0 in_mps=1024 out_mps=1024 ::
+[13:31:46Z] :: BPACE: entry t=0ms d=0ms ::
+[13:31:46Z] :: BPACE: fb-wc t=0ms d=0ms ::
+[13:31:46Z] :: BPACE: fb-wc-done t=0ms d=0ms ::
+[13:31:46Z] :: BPACE: core-init t=14ms d=13ms ::
+[13:31:46Z] :: BPACE: mem-init t=57ms d=42ms ::
+[13:31:46Z] :: BPACE: heap t=57ms d=0ms ::
+[13:31:46Z] :: BPACE: acpi t=58ms d=0ms ::
+[13:31:46Z] :: BPACE: calib t=158ms d=100ms ::
+[13:31:46Z] :: BPACE: smp t=218ms d=59ms ::
+[13:31:46Z] :: BPACE: sched t=218ms d=0ms ::
+[13:31:46Z] :: BPACE: pci-enter t=268ms d=50ms ::
+[13:31:46Z] :: BPACE: ehci-hid t=268ms d=0ms ::
+[13:31:46Z] :: BPACE: ehci-hid-done t=6158ms d=5890ms ::
+[13:31:46Z] :: BPACE: pci-probes t=6263ms d=104ms ::
+[13:31:46Z] :: BPACE: pci-scan t=6263ms d=0ms ::
+[13:31:46Z] :: BPACE: portsw t=6263ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-handoff t=6263ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-halt t=6263ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-hcrst t=6264ms d=1ms ::
+[13:31:46Z] :: BPACE: xhci-cnr t=6264ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-ptrs t=6264ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-run t=6264ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-portpwr t=6264ms d=0ms ::
+[13:31:46Z] :: BPACE: xhci-settle t=6364ms d=100ms ::
+[13:31:46Z] :: BPACE: enum:p1 t=6364ms d=0ms ::
+[13:31:46Z] :: BPACE: pci-usb t=6953ms d=589ms ::
+[13:31:46Z] :: BPACE: gui t=6969ms d=15ms ::
+[13:31:46Z] :: BPACE: enum:p2 t=6969ms d=0ms ::
+[13:31:46Z] :: BPACE: root-bind t=7339ms d=369ms ::
+[13:31:46Z] :: BPACE: enum:p2-done t=15845ms d=8506ms ::
+[13:31:46Z] :: BPACE: enum:p5 t=15845ms d=0ms ::
+[13:31:46Z] :: BPACE: ftdi-up t=15845ms d=0ms ::
+[13:31:46Z] :: BPACE: enum:p5-done t=16023ms d=177ms ::
+[13:31:46Z] :: BPACE: total gui=6969ms ftdi=15845ms n=33 dropped=0 hz=2693852305 result=LEDGER ::
+[13:31:47Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:47Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:47Z] [login] key latency ms=5 max=5 n=1 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:47Z] [login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)
+[13:31:47Z] :: PWR: window_ms=10490 state=idle samples=3 unknown=0 sum=0 min=0 max=0 (total: time=10490 sum=0 samples=3) (ac_derived: inferred, no hardware key) == rollup ::
+[13:31:47Z] [lag] key→echo ms=1058.0 queue=974.5 wm=16.7 app=0.0 comp=50.3 present=16.4 worst=queue
+[13:31:47Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:47Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:47Z] [login] key latency ms=5 max=5 n=2 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:48Z] [lag] key→echo ms=259.9 queue=4.9 wm=8.8 app=0.0 comp=230.1 present=15.8 worst=comp
+[13:31:48Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:48Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:48Z] [login] key latency ms=6 max=6 n=3 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:48Z] [lag] key→echo ms=226.6 queue=5.0 wm=8.9 app=0.0 comp=196.1 present=16.6 worst=comp
+[13:31:48Z] [wc-h] rollup win=2 scope=window emit=3 age_ms=4654 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,0,0,0,0,0,0,1] beam=obs beamobs=17 beamwaits=12 beamwait_us=66679 beammaxwait_us=9756 beamgiveup=0 beamcross_ppk=10197 blitter=cpu blit_us=42466 gpu_fallback=0 fixture=1 whole=16 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=2732 minpresent_us=2634 presspread=1 presspop=16 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[13:31:49Z] :: LAG: n=3 key=3 click=0 launch=0 menu=0 p50=259 p95=1058 max=1058 max_kind=key→echo worst_stage=queue stage_ms=[queue:984,wm:34,app:0,comp:476,present:48] timeout=0 orphan=0 coalesced=1 lost=0 span=5s ::
+[13:31:49Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:49Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:49Z] [login] key latency ms=8 max=8 n=4 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:50Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:50Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:50Z] [login] key latency ms=5 max=8 n=5 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:50Z] [wedge1] dwell drains=1 spun=0 spin_max=0 note=65536 in_spin=0 tripwire=silent bound=1073741824 abandoned=0 mvbound=33554432 mvgiveup=0 mvskip=0 ywait=0 ydrain=0 scskip=0 rescued=0 grace=2097152 latched=false span=5803ms -> QUIET
+[13:31:50Z] :: FTDI-CAP: replayed=39068 cap=1048576 lost=0 head_cut=n ::
+[13:31:50Z] [lag] key→echo ms=232.5 queue=4.9 wm=10.7 app=0.0 comp=200.2 present=16.4 worst=comp
+[13:31:50Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:50Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:50Z] [login] key latency ms=2 max=8 n=6 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:50Z] [lag] key→echo ms=193.2 queue=1.9 wm=8.8 app=0.0 comp=166.2 present=16.2 worst=comp
+[13:31:50Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:50Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:50Z] [login] key latency ms=80 max=80 n=7 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:50Z] [wc-h] rollup win=2 scope=window emit=4 age_ms=6720 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,1,0,0,0,0,0,0] beam=obs beamobs=28 beamwaits=22 beamwait_us=127230 beammaxwait_us=9756 beamgiveup=0 beamcross_ppk=17193 blitter=cpu blit_us=71410 gpu_fallback=0 fixture=1 whole=27 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=2732 minpresent_us=2634 presspread=1 presspop=27 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[13:31:50Z] [lag] key→echo ms=180.0 queue=80.2 wm=16.3 app=0.0 comp=67.3 present=15.9 worst=queue
+[13:31:50Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:50Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:50Z] [login] key latency ms=2 max=80 n=8 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:51Z] [lag] key→echo ms=167.7 queue=1.9 wm=15.6 app=0.0 comp=134.3 present=15.7 worst=comp
+[13:31:51Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:51Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:51Z] [login] key latency ms=2 max=80 n=9 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:51Z] [lag] key→echo ms=150.4 queue=1.9 wm=15.0 app=0.0 comp=116.9 present=16.4 worst=comp
+[13:31:51Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:51Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:51Z] [login] key latency ms=2 max=80 n=10 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:51Z] [lag] key→echo ms=133.2 queue=1.9 wm=14.4 app=0.0 comp=100.5 present=16.2 worst=comp
+[13:31:51Z] :: BOT: pump budget=0 peak=0 sum=0 mean=0 n=0 nowait=0 timeouts=0 storage_slot=0 route=0x0 depth=0 tag_mismatch=0 bad_sig=0 abandoned_in=0 abandoned_out=0 undrained=0 short_in=0 short_out=0 ev_late=0 ev_unaddressed=0 cbw_fault=0 db_in=0 db_out=0 ev_stopped=0 ev_stopped_li=0 ev_any=991 wrap_push=66 wrap_db=0 w=0/0/0/0/0/0/0/0/0/0/0/0 result=SUMMARY ::
+[13:31:51Z] :: USB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>=2 (the ladder's verdict on two whole generations) | ladders>=6 (retry entries across all generations) | ms>=45000 (pump wall-clock charged to the identity) | dead>=8 (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>=2 additionally CUTS the pump budget to 1/8 of base — read dead= not dead_streak= when asking why a device did or did not park. named=no used to mean hub-downstream (no VID:PID banner) and be normal; XHCIHUB (S2) stores the downstream identity, so named=no is now a real anomaly. BOTLATCH M2: the dead clause is the only one with a forgiveness rule, because it is the only one that can be wrong about a HEALTHY device (a NAKing spin-up posts no event, exactly like a dead ring) — a COMPLETED transfer zeroes dead=, and a dead-ring park unparks itself once after 60000 ms for a single probe at the cut budget (reprobe= says none/armed/spent; a second park on the same identity is permanent) ::
+[13:31:51Z] :: BOT: park rollup accounts=0 parked=0 refused=0 backoff_refused=0 pass_refused=0 aborts=0 capped=0 yields=0 pump_refused=0 anon=0 ladder_max=6 surrender_max=2 cycle_max_ms=45000 dead_max=8 pass_ms=10000 pass_pump_ms=2000 reprobes=0 dead_forgiven=0 reprobe_ms=60000 result=CENSUS ::
+[13:31:51Z] :: BOT: tx single=0 multi=0 maxlen=0 wrapped_tx=0 rd_sectors=0 wr_sectors=0 max_blocks=64 result=SIZES ::
+[13:31:52Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:52Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:52Z] [login] key latency ms=2 max=80 n=11 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:52Z] [lag] key→echo ms=245.4 queue=1.9 wm=10.0 app=0.0 comp=217.0 present=16.4 worst=comp
+[13:31:52Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:52Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:52Z] [login] key latency ms=5 max=80 n=12 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:52Z] [lag] key→echo ms=132.1 queue=4.9 wm=11.5 app=0.0 comp=99.4 present=16.1 worst=comp
+[13:31:52Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:52Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:52Z] [login] key latency ms=2 max=80 n=13 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:52Z] [wc-h] rollup win=2 scope=window emit=5 age_ms=8854 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,1,0,0,0,0,0,0] beam=obs beamobs=42 beamwaits=36 beamwait_us=203735 beammaxwait_us=9756 beamgiveup=0 beamcross_ppk=26097 blitter=cpu blit_us=108251 gpu_fallback=0 fixture=1 whole=41 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=2732 minpresent_us=2634 presspread=1 presspop=41 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[13:31:52Z] [lag] key→echo ms=98.9 queue=1.9 wm=13.5 app=0.0 comp=67.4 present=15.9 worst=comp
+[13:31:53Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:53Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:53Z] [login] key latency ms=2 max=80 n=14 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:53Z] [lag] key→echo ms=85.6 queue=1.9 wm=16.9 app=0.0 comp=50.0 present=16.6 worst=comp
+[13:31:53Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:53Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:53Z] [login] key latency ms=2 max=80 n=15 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:53Z] [lag] key→echo ms=92.4 queue=2.0 wm=8.8 app=0.0 comp=65.1 present=16.3 worst=comp
+[13:31:53Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:53Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:53Z] [login] key latency ms=2 max=80 n=16 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:53Z] [lag] key→echo ms=59.1 queue=1.9 wm=8.8 app=0.0 comp=32.1 present=16.1 worst=comp
+[13:31:53Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:53Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:53Z] [login] key latency ms=2 max=80 n=17 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:54Z] [lag] key→echo ms=69.8 queue=1.9 wm=17.8 app=0.0 comp=34.1 present=15.8 worst=comp
+[13:31:54Z] :: LAG: n=14 key=14 click=0 launch=0 menu=0 p50=132 p95=245 max=245 max_kind=key→echo worst_stage=comp stage_ms=[queue:118,wm:169,app:0,comp:1351,present:210] timeout=0 orphan=0 coalesced=0 lost=0 span=5s ::
+[13:31:54Z] EHCI-HID: KEY withheld (a secret is being typed)
+[13:31:54Z] USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)
+[13:31:54Z] [login] key latency ms=1 max=80 n=18 hid_gap_max_ms=405 bound=50 (R86: the screen's input is never blocked)
+[13:31:54Z] [lock] held-too-long name=users.rs:364 at=users.rs:748 by=14@cpu2 ms=93 waiters=0
+[13:31:54Z] [lag] key→echo ms=268.3 queue=0.9 wm=33.9 app=0.0 comp=216.1 present=17.3 worst=comp
+[13:31:54Z] [users] home=/home/una created volume=unafs
+[13:31:54Z] [users] adduser user=una id=14888694 home=/home/una created=true password=unset (R63/R65: root added it; the password is chosen at the first login, never on the line)
+[13:31:54Z] [users] role user=una role=admin (R100: the first user is the administrator)
+[13:31:54Z] [users] kdf calibrated iters=166666 ms=250 (probe=16000 took 24 ms; target 250 ms; floor 10000)
+[13:31:55Z] [wc-h] rollup win=2 scope=window emit=6 age_ms=11071 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,0,0,0,0,0,0,1] beam=obs beamobs=57 beamwaits=49 beamwait_us=292383 beammaxwait_us=9756 beamgiveup=0 beamcross_ppk=35637 blitter=cpu blit_us=147726 gpu_fallback=0 fixture=1 whole=56 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=2732 minpresent_us=2633 presspread=1 presspop=56 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[13:31:55Z] :: WXAUDIT-SLOT: ring-3 window W^X verified (slot 0, leaves=5, wx=0, nxe=1) ::
+[13:31:55Z] :: U7x: cross-process transfer — inbox-mediated SYS_XFER/SYS_RECV + sender revoke (single-writer preserved) ::
+[13:31:55Z] :: SYSCALL: nr=13 — ring-3 -> ring-0 path live ::
+[13:31:55Z] u7x: child prints via the transferred cap
+[13:31:55Z] :: U7x: cross-process transfer — SYS_XFER attenuated, child received + used the cap, revoke enforced, single-writer intact -> PASS ::
+[13:31:55Z] :: U8x: revocation trees — derivation ledger + generation-tagged inboxes (revoke chases the subtree) ::
+[13:31:55Z] u8x: write via the grandchild cap
+[13:31:55Z] u8x: right-less revoke stays local
+[13:31:55Z] :: U8x: revocation trees — parent revoke kills re-grant + re-transfer, generation-tagged inbox, ledger clean -> PASS ::
+[13:31:55Z] :: U9x: block device not ready at the file-lifecycle gate — waiting (bounded 5000 ms) for storage ::
+[13:31:55Z] [users] password set user=una first=true (LOGIN14/R65: chosen at the keyboard, never on the line or the wire)
+[13:31:55Z] [login] installer: create-user user=una id=14888694 home_created=true
+[13:31:55Z] [users] home=/home/una exists volume=unafs
+[13:31:55Z] [users] login ok user=una id=14888694 principal=user:una#14888694
+[13:31:56Z] [prefs] load clamped=0
+[13:31:56Z] :: PREFS: path=/home/una/settings domains=0 loaded=0 saved=0 ns=system -> PASS ::
+[13:31:56Z] [notify] dnd=0 via=login
+[13:31:56Z] [login] submit kdf_ms=485 adduser_ms=976 on=worker input_blocked_ms=0 kind=create
+[13:31:56Z] [login] session open user=una role=admin (R100: the first user is the administrator; root is locked)
+[13:31:56Z] :: BTHID: store loaded bonds=0 from /home/una/.config/unaos/bt ::
+[13:31:56Z] [wm] limit windows=142 procs=45 from=mem:181 (R90)
+[13:31:56Z] :: WINDOWCAP: fixed_cap=none limit=142 procs=45 from=mem:181 opens_refused=0 -> PASS ::
+[13:31:56Z] [boot] phase=desktop from=setter why=session at=25457ms pre_windows=0 pre_starts=0 pre_valve=0 (R86: the furniture first, then the services)
+[13:31:56Z] [login] desktop bare: furniture=none (R88) why=session — no console, shell or STAT opens itself; the user opens what they want
+[13:31:56Z] :: FIRSTBOOT: stage=desktop root=locked users=1 desktop_ignited=true why=user-created -> PASS ::
+[13:31:56Z] [login] installer: stage=desktop (R77: the desktop ignites)
+[13:31:56Z] :: FIRSTUSER: flow=mac first_user=una role=admin root=locked prompts=1 login_window=users migrated=0 at=first-user -> FAIL — ::
+[13:31:56Z] [boot] services up first=bt at=25461ms held_starters=8 (R86: nothing but the setter / the login dialog ran before this)
+[13:31:56Z] :: BOOT: phase=desktop from=setter login->desktop=0ms services_after_ms=4 why=furniture-none ::
+[13:31:56Z] :: bt-sched: campaign start at 25461 ms (gui at 6969 ms) ::
+[13:31:56Z] :: bt-sched: [1] FIRING — the chain the enumeration walk deferred at 1972 ms runs now, 23489 ms of boot path it did not hold; addr=8; its bt-l2 scan summary and (under btc) its bt-c1 page summary below are its outcome == witness ::
+[13:31:56Z] :: BTHID: bring-up at 25462 ms on controller [1] addr=8 — under btc this REPLACES the legacy LE-scan/inquiry/page chain at boot (it stays on Ctrl+Alt+B); nothing is paged here ::
+[13:31:56Z] :: bt-retry: [1] event-EP toggle resync — ClearFeature(ENDPOINT_HALT) on IN1 -> CONFIRMED (device toggle now DATA0, matching the host's per-run DATA0 start) == witness ::
+[13:31:56Z] :: bt-retry: [1] ACL toggle resync — ClearFeature(ENDPOINT_HALT) on bulk_in=IN2 bulk_out=OUT2 confirmed=2/2, host bt_acl_tog reset to (DATA0,DATA0) so C2 and the device agree == witness ::
+[13:31:56Z] :: bthid: HCI Reset (0x0c03) CmdComplete status=0x00 ::
+[13:31:56Z] :: bthid: HCI Read_BD_ADDR (0x1009) CmdComplete status=0x00 ::
+[13:31:56Z] :: bthid: HCI Read_Buffer_Size (0x1005) CmdComplete status=0x00 ::
+[13:31:56Z] :: bthid: HCI Set_Event_Mask (0x0c01) CmdComplete status=0x00 ::
+[13:31:56Z] [usbnet] reg PHYPWR_RSTCTL=0x0020/0x0000
+[13:31:56Z] :: bthid: HCI Write_Simple_Pairing_Mode (0x0c56) CmdComplete status=0x00 ::
+[13:31:56Z] :: bthid: HCI Write_Inquiry_Mode (0x0c45) CmdComplete status=0x00 ::
+[13:31:56Z] :: bthid: HCI Write_Class_of_Device (0x0c24) CmdComplete status=0x00 ::
+[13:31:56Z] :: bthid: HCI Write_Local_Name (0x0c13) CmdComplete status=0x00 ::
+[13:31:56Z] :: bthid: HCI Write_Page_Timeout (0x0c18) CmdComplete status=0x00 ::
+[13:31:56Z] [lock] held-too-long name=mod.rs:3387 at=mod.rs:19032 by=11@cpu7 ms=54 waiters=0
+[13:31:56Z] :: bthid: HCI Write_Scan_Enable (0x0c1a) CmdComplete status=0x00 ::
+[13:31:56Z] :: BTHID: up bd_addr=14:10:9f:d7:05:68 acl=1021x6 ssp=on page_scan=on at=25517 took=55ms ::
+[13:31:56Z] :: bt-sched: [1] COMPLETE at 25517 ms — the chain returned == witness ::
+[13:31:56Z] :: BTHID: reconnect — no bonded device; nothing paged ::
+[13:31:56Z] :: EHCI-HID: [1] STOP-NOTE interrupt endpoint halted addr=6 ep=IN1 kind=kbd mps=8 class=xact-err-burn tok=0x00088141 cerr=0 halted=1 xact=0 babble=0 dbuf=0 missed=0 err=1 reports=0 clears=0/2 -> retire == witness ::
+[13:31:56Z] :: EHCI-HID: [1] STOP-NOTE interrupt endpoint halted addr=7 ep=IN1 kind=boot-mouse mps=4 class=xact-err-burn tok=0x00048141 cerr=0 halted=1 xact=0 babble=0 dbuf=0 missed=0 err=1 reports=0 clears=0/2 -> retire == witness ::
+[13:31:56Z] [login] items n=0 launched=none (R91: Settings > Login Items)
+[13:31:56Z] [settings] loaded n=0 user=una store=/home/una/settings
+[13:31:56Z] [backlight] login keep readback=160 max=1023 slider=16% stored=- wrote=0
+[13:31:56Z] [settings] trackpad loaded speed=5 tap=0 natural=1 secondary=two-finger three_drag=0 applied=1
+[13:31:56Z] [usbnet] reg CLK_SELECT=0x03/0xd9
+[13:31:56Z] [usbnet] reg NODE_ID=0x9c69d3286ef4/0x9c69d3286ef4
+[13:31:56Z] [usbnet] rx buf=20480 qctrl=[07, 4f, 00, 12, ff]
+[13:31:56Z] [usbnet] reg RX_BULKIN_QCTRL=0x074f0012ff/0x07650009ff
+[13:31:56Z] [usbnet] reg PAUSE_WATERLVL_LOW=0x34/0x04
+[13:31:56Z] [usbnet] reg PAUSE_WATERLVL_HIGH=0x52/0x10
+[13:31:56Z] [usbnet] reg RXCOE_CTL=0x00/0x00
+[13:31:56Z] [usbnet] reg TXCOE_CTL=0x00/0x00
+[13:31:56Z] [usbnet] reg RX_CTL=0x03aa/0x02aa
+[13:31:56Z] [usbnet] reg MONITOR_MODE=0x00/0x00
+[13:31:56Z] [usbnet] reg MEDIUM_STATUS_MODE=0x0133/0x0133
+[13:31:56Z] [usbnet] ax88179 link_status=0x04 medium(readback)=0x0133 qctrl=ss phy_aneg=1 adv=0x05e1/0x05e1 ctrl1000=0x0200/0x0200 bmcr=0x1200/0x1000 — UNFLOWN register map, confirm on the bench
+[13:31:56Z] :: USBNET: up kind=ax88179 slot=2 cfg=1 ctrl=0 data=0 alt=0 mac=9c:69:d3:28:6e:f4 filter=ok -> PASS ::
+[13:31:56Z] [usbnet] rx_arm n=1 ep=0x82 mps=1024 buf=20480
+[13:31:56Z] [usbnet] rx arm trb=0 cycle=1 buf=0x20540000 len=20480 cross64k=0 n=1
+[13:31:57Z] [dock] group left=7 minimized=0 trash=empty separator=1 position=bottom autohide=0
+[13:31:57Z] [desktop] built at=login ok bar_ms=595 battery=unpainted dock=painted pins=7
+[13:31:57Z] :: DESKTOPBUILT: prebuilt=0 built_at=login bar_first_paint_ms=595 battery=0 dock=1 swept=0 -> FAIL ::
+[13:31:57Z] [status] poll n=1 answered=1 src=smc took_us=1292
+[13:31:57Z] :: wifi: brcm net function 03:00.0 device=0x16a3 subclass=0x00 (Ethernet) — NOT the radio, skipped ::
+[13:31:57Z] :: wifi: radio 04:00.0 device=0x4331 expected=0x4331 MATCH rev=0x02 expected=0x02 MATCH subsys=0x106b:0x00ef expected=0x106b:0x00ef MATCH ::
+[13:31:57Z] :: wifi: radio 04:00.0 bar0=0x00000000c1900000 expected=0x00000000c1900000 kind=mem64 expected=mem64 MATCH ::
+[13:31:57Z] :: wifi: radio SELECTED 04:00.0 matches=1 expected=1 MATCH cross-check=PASS (vs bcm4331.md §0, Boots AF/AJ) — config-space read-only, no MMIO ::
+[13:31:57Z] [hda] probe deferred-start at=26059ms :: BOOTSLOW: the HDA bring-up runs after the root pass, not on the boot core ::
+[13:31:57Z] [hda] census bdf=0:27.0 id=8086:1e20 class=04 sub=03 progif=00 (hd-audio) bar0=0xc1c10000 irq=0
+[13:31:57Z] [hda] census bdf=1:0.1 id=10de:0e1b class=04 sub=03 progif=00 (hd-audio) bar0=0xc1080000 irq=0
+[13:31:57Z] [hda] claim bdf 0:27.0 cmd 0x0000 -> 0x0006 (mem-decode + bus-master; DMA is the only data path HDA has)
+[13:31:57Z] [hda] map bdf 0:27.0 bar0=0xc1c10000 len=0x2000 uncacheable
+[13:31:57Z] [hda] gcap=0x4401 oss=4 iss=4 bss=0 nsdo=0 64ok=1 version=1.0
+[13:31:57Z] [hda] reset crst=1 statests=0x0001 codecs=[0]
+[13:31:57Z] [hda] rings corb=0x2054cf00 rirb=0x2055b100 entries=256/256 corbctl=0x02 rirbctl=0x03 rintcnt=1 intctl=0x00000000(untouched)
+[13:31:57Z] [hda] ring-state after-first-verb corbwp=0x0001 corbrp=0x0001 rirbwp=0x0001 rirbsts=0x01->0x00 corbctl=0x02 rirbctl=0x03 rintcnt=0x0001
+[13:31:57Z] [hda] codec=0 vid=1013:4206 rev=0x00100302
+[13:31:57Z] [hda] codec=0 fg=0x01 type=0x01 (audio)
+[13:31:57Z] [hda] node=0x02 type=audio-out conns=[] caps=0x000d041d out-amp=1 in-amp=0 amp-override=1 power-ctl=1 digital=0 pincfg=-
+[13:31:57Z] [hda] node=0x03 type=audio-out conns=[] caps=0x000d041d out-amp=1 in-amp=0 amp-override=1 power-ctl=1 digital=0 pincfg=-
+[13:31:57Z] [hda] node=0x04 type=audio-out conns=[] caps=0x000d041d out-amp=1 in-amp=0 amp-override=1 power-ctl=1 digital=0 pincfg=-
+[13:31:57Z] [hda] node=0x05 type=audio-in conns=[12, 18] caps=0x0018051b out-amp=0 in-amp=1 amp-override=1 power-ctl=1 digital=0 pincfg=-
+[13:31:57Z] [hda] node=0x06 type=audio-in conns=[13, 14] caps=0x0018051b out-amp=0 in-amp=1 amp-override=1 power-ctl=1 digital=0 pincfg=-
+[13:31:57Z] [hda] node=0x07 type=audio-in conns=[15] caps=0x00180791 out-amp=0 in-amp=0 amp-override=0 power-ctl=1 digital=1 pincfg=-
+[13:31:57Z] [hda] node=0x08 type=audio-out conns=[] caps=0x00040611 out-amp=0 in-amp=0 amp-override=0 power-ctl=1 digital=1 pincfg=-
+[13:31:57Z] [hda] node=0x09 type=pin conns=[2] pincap=0x0000001c out=1 hp=1 eapd=0 pincfg=0x002b4020 (dev=hp-out loc=external conn=combination colour=green portconn=0 assoc=2 seq=0)
+[13:31:57Z] [hda] node=0x0a type=pin conns=[3] pincap=0x00000054 out=1 hp=0 eapd=0 pincfg=0x90100112 (dev=speaker loc=internal conn=unknown colour=unknown portconn=2 assoc=1 seq=2)
+[13:31:57Z] [hda] node=0x0b type=pin conns=[4] pincap=0x00000050 out=1 hp=0 eapd=0 pincfg=0x90100110 (dev=speaker loc=internal conn=unknown colour=unknown portconn=2 assoc=1 seq=0)
+[13:31:57Z] [hda] node=0x0c type=pin conns=[] pincap=0x00000024 out=0 hp=0 eapd=0 pincfg=0x400000f0 (dev=line-out loc=external conn=unknown colour=unknown portconn=1 assoc=15 seq=0)
+[13:31:57Z] [hda] node=0x0d type=pin conns=[] pincap=0x00001764 out=0 hp=0 eapd=0 pincfg=0x400000f0 (dev=line-out loc=external conn=unknown colour=unknown portconn=1 assoc=15 seq=0)
+[13:31:57Z] [hda] node=0x0e type=pin conns=[] pincap=0x00000020 out=0 hp=0 eapd=0 pincfg=0x90a60100 (dev=mic-in loc=internal conn=other-digital colour=unknown portconn=2 assoc=0 seq=0)
+[13:31:57Z] [hda] node=0x0f type=pin conns=[] pincap=0x00000024 out=0 hp=0 eapd=0 pincfg=0x400000f0 (dev=line-out loc=external conn=unknown colour=unknown portconn=1 assoc=15 seq=0)
+[13:31:57Z] [hda] node=0x10 type=pin conns=[8] pincap=0x00000010 out=1 hp=0 eapd=0 pincfg=0x004be030 (dev=spdif-out loc=external conn=combination colour=white portconn=0 assoc=3 seq=0)
+[13:31:57Z] [hda] node=0x11 type=vendor-defined conns=[] caps=0x00f00040 out-amp=0 in-amp=0 amp-override=0 power-ctl=0 digital=0 pincfg=-
+[13:31:57Z] [hda] node=0x12 type=pin conns=[] pincap=0x00000020 out=0 hp=0 eapd=0 pincfg=0x400000f0 (dev=line-out loc=external conn=unknown colour=unknown portconn=1 assoc=15 seq=0)
+[13:31:57Z] [hda] node=0x13 type=beep conns=[] caps=0x00700000 out-amp=0 in-amp=0 amp-override=0 power-ctl=0 digital=0 pincfg=-
+[13:31:57Z] [hda] node=0x14 type=audio-out conns=[] caps=0x00040611 out-amp=0 in-amp=0 amp-override=0 power-ctl=1 digital=1 pincfg=-
+[13:31:57Z] [hda] node=0x15 type=pin conns=[20] pincap=0x00000010 out=1 hp=0 eapd=0 pincfg=0x400000f0 (dev=line-out loc=external conn=unknown colour=unknown portconn=1 assoc=15 seq=0)
+[13:31:57Z] [hda] path codec=0 dac=0x04 -> [11, 4] -> pin=0x0b dev=speaker hops=2
+[13:31:57Z] [hda] walk codecs=1 nodes=20 dacs=5 pins=10 speaker_pin=0x0a hp_pin=0x09 path=found
+[13:31:57Z] [hda] audit stage=walk wrote-cfg=1 wrote-ctrl=144 wrote-stream=0 verbs-get=61 verbs-set=1 wrote-intctl=0(audited) wrote-wallclk=0(audited) wrote-dplbase=0(audited)
+[13:31:57Z] :: HDA: codecs=1 nodes=20 dacs=5 pins=10 path=found -> PASS ::
+[13:31:57Z] [hda] tone deferred :: R77: the tone runs from `tests hda` (hda::hda_tone_test), the census/walk above stays a boot fact ::
+[13:31:57Z] [hda] vol path captured amps=1 cad=0
+[13:31:57Z] [hda] audit stage=end wrote-cfg=1 wrote-ctrl=148 wrote-stream=0 verbs-get=61 verbs-set=1 wrote-intctl=0(audited) wrote-wallclk=0(audited) wrote-dplbase=0(audited)
+[13:31:57Z] :: PSRC: psrc=sdhc reason=serial-unproven verdict=undecided boot_serial=0x18cbbb88 handles=global=absent sdhc=present ::
+[13:31:57Z] :: wifi: ucode ABSENT — none of ucode29_mimo.fw|UCODE29.FW|B43.FW in /, /B43/, /FIRMWARE/ on source=sdhc label='UNAOS' fp=0x18cbbb88:0x0003f01e ::
+[13:31:57Z] :: wifi: initvals ABSENT — none of ht0initvals29.fw|HT0IV29.FW in /, /B43/, /FIRMWARE/ on source=sdhc label='UNAOS' fp=0x18cbbb88:0x0003f01e ::
+[13:31:57Z] :: wifi: bsinitvals ABSENT — none of ht0bsinitvals29.fw|HT0BSI29.FW in /, /B43/, /FIRMWARE/ on source=sdhc label='UNAOS' fp=0x18cbbb88:0x0003f01e ::
+[13:31:57Z] :: wifi: firmware set INCOMPLETE on the program source and NO second populated handle present yet — HELD up to 30000ms for a late-publishing volume (e.g. a USB stick carrying the b43 set); terminal verdict and arc 2 DEFERRED until its storage-ready edge fires or the deadline expires ::
+[13:31:57Z] [lag] stall boot_suppressed=12 worst_stage=render-handler worst_ms=6094
+[13:31:57Z] [lag] stall at_ms=25438 span_ms=1152 stage=hid stage_ms=64 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=114.9 passes=4 pass_ms_max=16.6 rows=2022 full=0 beam_ms=10 beam_max_ms=8.6 capped=0 yielded=4 valve=open hid_gap_ms=64 strand=0/0 handler=login-drain handler_ms=129.7 pump=xhci pump_ms=346.4
+[13:31:57Z] :: PWR: window_ms=10208 state=idle samples=10 unknown=0 sum=0 min=0 max=0 (total: time=20698 sum=0 samples=13) (ac_derived: inferred, no hardware key) == rollup ::
+[13:31:59Z] [usbnet] link up speed=1000M duplex=full physr=0xa400 usb_plsr=0x04 medium=0x013b
+[13:31:59Z] [usbnet] reg MEDIUM_STATUS_MODE=0x013b/0x0133
+[13:31:59Z] [usbnet] link reset order=linux rxctl=0x028a/0x028a txfifo=0x00000000 tries=1 ms=1 medium=0x013b ok=1
+[13:31:59Z] [usbnet] regs when=linkup rxctl=0x028a medium=0x0133 rxcoe=0x00 monitor=0x00 pause=0x04/0x10 qctrl=[07, 65, 00, 09, ff] re=1 ok=1
+[13:31:59Z] [usbnet] link=up speed=1000 mac=9c:69:d3:28:6e:f4 rx_ctl=0x028a rx_ok=0 rx_drop=0 rx_pad=0
+[13:31:59Z] :: LAG: n=1 key=1 click=0 launch=0 menu=0 p50=268 p95=268 max=268 max_kind=key→echo worst_stage=comp stage_ms=[queue:0,wm:33,app:0,comp:216,present:17] timeout=0 orphan=0 coalesced=0 lost=0 span=5s ::
+[13:31:59Z] [lag] stall at_ms=27590 span_ms=1001 stage=hid stage_ms=49 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=108.7 passes=0 pass_ms_max=0.0 rows=0 full=0 beam_ms=0 beam_max_ms=0.0 capped=0 yielded=0 valve=open hid_gap_ms=49 strand=0/0 handler=panel-render handler_ms=108.7 pump=desktop-app pump_ms=220.3
+[13:31:59Z] [usbnet] rx0 len=128 hdr=0x00700002 pkt_cnt=2 hdr_off=112 bytes=eeee333300000016c8a362ec63b186dd600000000038000100000000000000000000000000000000ff02000000000000 tail=00887000008000800000000002007000
+[13:31:59Z] [usbnet] rx arm trb=1 cycle=1 buf=0x20540000 len=20480 cross64k=0 n=2
+[13:31:59Z] [usbnet] rx arm trb=3 cycle=1 buf=0x20540000 len=20480 cross64k=0 n=4
+[13:31:59Z] [net] tick task=net-tick cpu=2 cadence_ms=5000 (GLASSLAG: off the render service)
+[13:31:59Z] [usbnet] tx dhcp discover n=1 type=1 xid=eb178b8f len=304 ipsum=ok udpsum=ok flags=0000 bytes=ffffffffffff9c69d3286ef408004500012200004000401139cc00000000ffffffff00440043010e50df01010600eb178b8f0000000000000000000000000000 opts=3501013d07019c69d3286ef43902058a3703010306ff
+[13:31:59Z] [usbnet] tx done n=1 len=312 cc=1 residual=0
+[13:31:59Z] [usbnet] rx arm trb=7 cycle=1 buf=0x20540000 len=20480 cross64k=0 n=8
+[13:32:00Z] :: U9x: storage bound expired (5000 ms) — no block device, file-lifecycle battery skipped cleanly (device-less control path) ::
+[13:32:00Z] :: TESTS: deferred=93 fire=tests at_boot=0 ::
+[13:32:00Z] :: SOCK-2: ring-3 udp sockets — sys_socket(40)/bind(41)/sendto(42)/recvfrom(43), a datagram round-trip over the persistent smoltcp stack ::
+[13:32:00Z] [net] poll enter op=sendto sid=0 len=24 masked=1
+[13:32:00Z] [lock] spin-wait name=usbnet.rs:209 at=usbnet.rs:560 waiter=20@cpu2 on=untracked ms=27
+[13:32:00Z] [lock] held-too-long name=smolnet.rs:480 at=smolnet.rs:833 by=20@cpu2 ms=77 waiters=0
+
+=== SQUAWK MARK 2026-10-06T19:34:42Z mark seat-type: tests gen7 ===
+
+=== SQUAWK MARK 2026-10-06T19:35:47Z mark seat-type: tests wifi ===
+
+=== SQUAWK MARK 2026-10-06T19:36:53Z mark seat-type: tests installbare ===
+
+=== SQUAWK MARK 2026-10-06T19:37:59Z mark seat-type: tests loginfurn ===
+
+=== SQUAWK MARK 2026-10-06T19:39:05Z mark seat-type: tests quietboot ===
+
+=== SQUAWK MARK 2026-10-06T19:40:11Z mark seat-type: tests boot80 ===
+
+=== SQUAWK MARK 2026-10-06T19:41:17Z mark seat-type: tests kvblank8 ===
+
+=== SQUAWK MARK 2026-10-06T19:42:22Z mark seat-type: tests volumes ===
+
+=== SQUAWK MARK 2026-10-06T19:43:28Z mark seat-type: tests brightstep ===
