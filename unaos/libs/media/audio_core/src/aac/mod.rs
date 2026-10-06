@@ -7,7 +7,7 @@
 //!   spectral Huffman decoding, inverse quantisation, M/S, intensity stereo, PNS, filterbank.
 //! * [`AdtsStream`] — ADTS framing (sync confirmed by the next header, CRC skipped, several raw blocks
 //!   per frame), ID3v2 in front tolerated.
-//! * [`AacSource`] — access units from MP4 ([`crate::mp4`]) with an AudioSpecificConfig; edit-list /
+//! * [`AacSource`] — access units from MP4 ([`crate::container`], over `demux_core`) with an AudioSpecificConfig; edit-list /
 //!   iTunSMPB gapless trimming.
 //!
 //! Output channel order is the WAVE order (FL FR FC LFE BL BR FLC FRC BC SL SR), mapped from the

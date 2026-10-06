@@ -305,6 +305,11 @@ impl Demuxer {
     pub fn format(&self) -> Format {
         self.format
     }
+    /// MP4ONE (rmbp B464): the file's bytes back, for a caller that keeps the sample table's offsets and reads
+    /// the payloads itself (`audio_core`'s MP4 path) — no second copy of the file.
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
     pub fn tracks(&self) -> &[Track] {
         &self.tracks
     }

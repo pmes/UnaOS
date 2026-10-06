@@ -70,3 +70,119 @@ fn mp4_byte_identical() {
     }
     eprintln!("MP4ONE: {seen}/{} byte-identical", PINNED.len());
 }
+
+fn decode(b: &[u8]) -> (u32, u16, Vec<f32>) {
+    let (i, pcm) = audio_core::decode_all(b).expect("decode");
+    (i.rate, i.channels, pcm)
+}
+
+fn desc(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![tag, body.len() as u8];
+    v.extend_from_slice(body);
+    v
+}
+
+/// An `esds` body (ISO/IEC 14496-1 §7.2.6.5) around a DecoderSpecificInfo.
+fn esds(oti: u8, dsi: &[u8]) -> Vec<u8> {
+    let mut dcd = vec![oti, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    if !dsi.is_empty() { dcd.extend_from_slice(&desc(5, dsi)); }
+    let mut es = vec![0, 1, 0];
+    es.extend_from_slice(&desc(4, &dcd));
+    es.extend_from_slice(&desc(6, &[2]));
+    let mut v = vec![0, 0, 0, 0];
+    v.extend_from_slice(&desc(3, &es));
+    v
+}
+
+fn audio_track(id: u32, fourcc: [u8; 4], oti: u8, dsi: &[u8], ts: u32, rate: u32, ch: u16, units: Vec<(Vec<u8>, u32)>) -> demux_core::build::MediaTrack {
+    use demux_core::build::{MediaTrack, SampleSpec, TrackSpec};
+    let mut dts = 0i64;
+    let samples = units
+        .into_iter()
+        .map(|(data, dur)| {
+            let s = SampleSpec { data, dts, pts: dts, duration: dur, keyframe: true };
+            dts += dur as i64;
+            s
+        })
+        .collect();
+    let spec = TrackSpec {
+        id,
+        kind: demux_core::TrackKind::Audio,
+        fourcc,
+        config_box: (&fourcc == b"mp4a").then_some(*b"esds"),
+        codec_id: "A_AAC",
+        config: if &fourcc == b"mp4a" { esds(oti, dsi) } else { Vec::new() },
+        timescale: ts,
+        width: 0,
+        height: 0,
+        sample_rate: rate,
+        channels: ch,
+        bit_depth: 16,
+        default_duration_ns: 0,
+    };
+    MediaTrack { spec, samples }
+}
+
+fn with_video(audio: demux_core::build::MediaTrack, edit: Option<i64>, fragment: usize) -> Vec<u8> {
+    let video = demux_core::build::test_pattern_track(1, 64, 48, 30, 12, 6);
+    let opts = demux_core::build::Mp4Options {
+        movie_timescale: 1000,
+        chunk: 4,
+        edits: edit.map(|m| vec![(audio.spec.id, 0, m)]).unwrap_or_default(),
+        co64: false,
+        fragment,
+    };
+    demux_core::build::mp4(&[video, audio], &opts)
+}
+
+/// VIDEOPLAYER (B434) left AAC beside a video track unproven: TEST.M4A's AAC access units, rewritten beside a
+/// test-pattern video track (progressive and fragmented), decode to the audio-only file's PCM.
+#[test]
+fn aac_beside_video() {
+    let Ok(b) = std::fs::read(testf().join("TEST.M4A")) else { eprintln!("SKIP TEST.M4A: not staged"); return };
+    let (rate, ch, want) = decode(&b);
+    let d = demux_core::Demuxer::open(b).unwrap();
+    let ai = d.tracks().iter().position(|t| t.kind == demux_core::TrackKind::Audio).unwrap();
+    let t = d.tracks()[ai].clone();
+    let units: Vec<_> = d.track_samples(ai).map(|s| (d.packet_at(s).data, s.duration as u32)).collect();
+    let mt = t.edit.map(|e| e.media_time).expect("TEST.M4A carries an edit list");
+    for frag in [0usize, 5] {
+        let f = with_video(audio_track(2, *b"mp4a", 0x40, &t.config, t.timebase.den as u32, t.sample_rate, t.channels, units.clone()), Some(mt), frag);
+        let v = demux_core::Demuxer::open(f.clone()).unwrap();
+        assert_eq!(v.tracks()[0].kind, demux_core::TrackKind::Video);
+        let (r2, c2, got) = decode(&f);
+        assert_eq!((r2, c2), (rate, ch));
+        let n = want.len().min(got.len());
+        assert!(n >= want.len() - ch as usize * 1024, "aac beside video (fragment={frag}): {} of {}", got.len(), want.len());
+        assert!(want[..n] == got[..n], "aac beside video (fragment={frag}): PCM differs");
+        eprintln!("MP4ONE aac beside video fragment={frag}: {} frames identical", n / ch as usize);
+    }
+}
+
+/// MP3 in MP4 (`.mp3` sample entry, and `mp4a` with ObjectTypeIndication 0x6B) beside a video track: TEST.MP3's
+/// frames, one access unit each, decode to the bare frames' PCM.
+#[test]
+fn mp3_beside_video() {
+    let Ok(b) = std::fs::read(testf().join("TEST.MP3")) else { eprintln!("SKIP TEST.MP3: not staged"); return };
+    let mut p = if b.len() >= 10 && &b[..3] == b"ID3" { 10 + ((b[6] as usize & 127) << 21 | (b[7] as usize & 127) << 14 | (b[8] as usize & 127) << 7 | (b[9] as usize & 127)) } else { 0 };
+    let mut frames = Vec::new();
+    let mut rate = 0;
+    while p + 4 <= b.len() {
+        let Some(h) = audio_core::mp3::Header::parse(u32::from_be_bytes(b[p..p + 4].try_into().unwrap())) else { p += 1; continue };
+        let n = h.frame_len();
+        if n == 0 || p + n > b.len() { break; }
+        rate = h.rate();
+        frames.push((b[p..p + n].to_vec(), h.samples() as u32));
+        p += n;
+    }
+    assert!(frames.len() > 4, "TEST.MP3: frames");
+    let bare: Vec<u8> = frames.iter().flat_map(|f| f.0.clone()).collect();
+    let (r0, c0, want) = decode(&bare);
+    for (fourcc, oti) in [(*b".mp3", 0u8), (*b"mp4a", 0x6B)] {
+        let f = with_video(audio_track(2, fourcc, oti, &[], rate, rate, c0, frames.clone()), None, 0);
+        let (r, c, got) = decode(&f);
+        assert_eq!((r, c), (r0, c0));
+        assert!(got == want, "mp3 beside video ({}): PCM differs", String::from_utf8_lossy(&fourcc));
+        eprintln!("MP4ONE mp3 beside video entry={}: {} frames identical", String::from_utf8_lossy(&fourcc), got.len() / c as usize);
+    }
+}
