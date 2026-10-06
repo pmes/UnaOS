@@ -32,6 +32,12 @@
 //! the multi-line bit; the page table is indexed from the PDE's VA origin.
 
 use super::kepler::{mmio_read, mmio_write, VramAllocator};
+// KEPLERGR (B421): the fifo-init walls, RAMFC, bind, commit, PTOP walk, PDE/PTE and the decode line live ONCE in
+// `kepler_fifo::host`; this leg (chid 2) and the GR leg (chid 1, `kepler_fifo::kgr`) both call it.
+use super::kepler_fifo::host as kf;
+use kf::{USERD_BAR1, R2A04, SCHED_DISABLE, PB_13C, PB_STRIDE, PB_RUNM, PFIFO_CHAN};
+use kf::{pb_hdr, M_HOST_SEM, SEM_RELEASE_WFI, FB_BIGPAGE};
+use kf::{RUNLIST_BASE, RUNLIST_SUBMIT, RUNLIST_INFO, PMC_ENABLE, PMC_PBDMA_ENABLE, USERD_GP_GET, USERD_GP_PUT, pde, pte};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 
 // ---- window layout (offsets from the window base, a VRAM offset) -------------------------------------
@@ -60,8 +66,7 @@ const GPFIFO_N: u32 = 512;
 /// GPUBLIT3 reads which one the firmware left from 0x100c80 bit 0 at arm (`pde_span`).
 /// // nouveau vmmgk104.c:41,55 (desc_17_12 / desc_16_12), fb/gf100.c:72-73 [ONE-SOURCE: nouveau; refuted by a PDE fault]
 const PDE_SPAN: usize = 128 << 20;
-const PDE_SPAN_64K: usize = 64 << 20;
-const FB_BIGPAGE: usize = 0x10_0c80; // bit 0 = 64 KiB big pages // nouveau fb/gf100.c:72-73
+// FB_BIGPAGE 0x100c80 and the span choice: `kepler_fifo::host::pde_span` (KEPLERGR; nouveau fb/gf100.c:72-73).
 /// The sysmem window: 512 MiB of GPU VA starting at 128 MiB (PDE[1..5] at 128 MiB span, PDE[2..10] at 64 MiB); its small-page
 /// entries are ONE flat array at W_PTS (131072 x 8 B), each PDE pointing at its slice.
 const SYS_VA: usize = 128 << 20;
@@ -69,6 +74,7 @@ const SYS_BYTES: usize = 512 << 20;
 const SYS_PAGES: usize = SYS_BYTES >> 12;
 /// The channel id. Channel 1 is the fifo leg's (`kepler.rs`); 2 is free on every build. [TREE]
 const CHID: u32 = 2;
+const _: () = assert!(CHID == kf::CHID_CE, "KEPLERGR: the GR leg's guard reads the CE's bind by kf::CHID_CE");
 // The copy engine's runlist, engine id and PMC reset bit are READ FROM PTOP at arm time (GPUBLIT2,
 // B383) — `ptop_ce` below, nouveau top/gk104.c:45-81. B371's `CE_RUNLIST = 1` was a hypothesis.
 
@@ -85,55 +91,15 @@ const M_PITCH_IN: u32 = 0x0410; // cla0b5.h:131..137 PITCH_IN, PITCH_OUT, LINE_L
 /// PITCH (bit 7) | DST_MEMORY_LAYOUT PITCH (bit 8) | MULTI_LINE_ENABLE (bit 9). // open-gpu-doc
 /// cla0b5.h:67-90. The bit KBLIT's `0x186` lacked is bit 9, so its 256-row copy would have moved one line.
 const LAUNCH_PITCH_MULTI: u32 = 0x0000_0386;
-/// Host semaphore SEMAPHOREA..D (ADDR_HI, ADDR_LO, PAYLOAD, OPERATION). // open-gpu-doc cla06f.h:77-83
-const M_HOST_SEM: u32 = 0x0010;
-/// SEMAPHORED: OPERATION RELEASE (2, bits 3:0) | ACQUIRE_SWITCH (bit 12, inert on a release) |
-/// RELEASE_WFI EN (bit 20 = 0) | RELEASE_SIZE 16BYTE (bit 24 = 0). // open-gpu-doc cla06f.h:84-97
-const SEM_RELEASE_WFI: u32 = 0x0000_1002;
-/// USERD GP_GET / GP_PUT. // nouveau gf100.c:129-130 (`gf100_chan_userd_clear` 0x088 / 0x08c)
-const USERD_GP_GET: usize = 0x88;
-const USERD_GP_PUT: usize = 0x8C;
-/// The channel table `0x800000 + chid*8`: lo = VALID 0x80000000 | inst >> 12, hi = RUNLIST in bits
-/// 16..19, ENABLE_SET bit 10. // nouveau gk104.c:52,68,77
-const PFIFO_CHAN: usize = 0x80_0000;
-const CHAN_HI_RUNLIST_SHIFT: u32 = 16; // nouveau gk104.c:77 (`mask 0x000f0000, runl->id << 16`)
-const CHAN_HI_RUNLIST_MASK: u32 = 0x000F_0000; // nouveau gk104.c:77
-const CHAN_HI_ENABLE_SET: u32 = 0x0000_0400; // nouveau gk104.c:52
-/// RUNLIST_SUBMIT pair: base = target << 28 | addr >> 12 (VRAM 0); submit = runl << 20 | count.
-/// // nouveau gk104.c:446-447
-const RUNLIST_BASE: usize = 0x2270;
-const RUNLIST_SUBMIT: usize = 0x2274;
-/// Per-runlist pending bit: `0x2284 + rl*8` & 0x00100000. // nouveau gk104.c:426
-const RUNLIST_INFO: usize = 0x2284;
-const RUNLIST_PENDING: u32 = 0x0010_0000;
-const PMC_ENABLE: usize = 0x200;
-/// PBDMA enable mask. // nouveau gk104.c:739
-const PMC_PBDMA_ENABLE: usize = 0x204;
+// Host SEMAPHOREA..D (M_HOST_SEM 0x0010) and its RELEASE operation word (SEM_RELEASE_WFI 0x1002), and the pushbuffer
+// header pb_hdr(): `kepler_fifo::host` (KEPLERGR — the GR leg pushes the same host methods; open-gpu-doc cla06f.h:77-97, :160-174).
+// USERD GP_GET/GP_PUT, the channel table (PFIFO_CHAN + its hi-word fields), RUNLIST_BASE/SUBMIT/INFO/PENDING,
+// PMC_ENABLE and PMC_PBDMA_ENABLE: `kepler_fifo::host` (KEPLERGR), each cited there (nouveau gk104.c:52,68,77,426,446-447,739;
+// gf100.c:129-130).
 /// PFIFO's PMC bit. // nouveau mc/gk104.c `gk104_mc_reset` { 0x00000100, NVKM_ENGINE_FIFO }
 const PMC_PFIFO: u32 = 0x100;
-/// PTOP device-info table, 64 words. // nouveau top/gk104.c:37,45
-const PTOP_INFO: usize = 0x02_2700;
 
-#[inline]
-fn pb_hdr(subc: u32, method: u32, count: u32) -> u32 {
-    // SEC_OP INC_METHOD (1, bits 31:29) | METHOD_COUNT 28:16 | SUBCHANNEL 15:13 | ADDRESS 11:0 (dwords).
-    // open-gpu-doc cla06f.h:160-174
-    0x2000_0000 | (count << 16) | (subc << 13) | (method >> 2)
-}
-/// PDE: no big-page table (dw0 = 0); small-page table pointer in dw1, `addr >> 8 | 1` (VRAM).
-/// Matches nouveau vmmgf100.c:126-138 (`gf100_vmm_pgd_pde`: SPT target VRAM `1 << 32`, `addr << 24`).
-#[inline]
-fn pde(spt: usize) -> (u32, u32) {
-    (0, ((spt >> 8) as u32) | 1)
-}
-/// PTE: `addr >> 8 | VALID` (vmmgf100.c:35,314); dw1 for coherent sysmem = VOL (bit 32) | aperture HOST 2 at bit 33 = 5.
-/// GPUBLIT3 (R8) applies what GPUBLIT2 read: B371 wrote 2 (aperture 1). VRAM dw1 = 0 (aperture 0, no VOL).
-/// // nouveau vmmgf100.c:263 (vol = HOST), :317-318 (vol << 32, aper << 33), :328 (HOST = 2) [ONE-SOURCE: nouveau]
-const PTE_HI_SYSMEM: u32 = 1 | (2 << 1);
-#[inline]
-fn pte(pa: u64, sysmem: bool) -> (u32, u32) {
-    (((pa >> 8) as u32) | 1, if sysmem { PTE_HI_SYSMEM } else { 0 })
-}
+// pde() / pte() / PTE_HI_SYSMEM (5): `kepler_fifo::host` (KEPLERGR — one source; nouveau vmmgf100.c:126-138, :263, :317-318, :328).
 
 // ---- state ---------------------------------------------------------------------------------------------
 
@@ -290,7 +256,7 @@ pub fn arm(bar0: usize, bar1: usize, bar1_size: usize, vram_size: usize, fb_offs
     // GPUBLIT3 (R9): the big-page size the firmware left decides the PDE span. // nouveau fb/gf100.c:72-73
     let fbp = mr(FB_BIGPAGE);
     FB_PAGE.store(fbp, Release);
-    let span = if fbp & 1 != 0 { PDE_SPAN_64K } else { PDE_SPAN };
+    let span = kf::pde_span(fbp);
     SPAN.store(span, Release);
     if vhi > span || vlo > w {
         return refuse("window-beyond-pde0");
@@ -365,25 +331,9 @@ fn build(w: usize, vlo: usize, vhi: usize) {
     // — GPUBLIT3 (R4) applies the five words GPUBLIT2 read — plus the page directory (inst+0x200 base, +0x208 limit:
     // nouveau vmmgf100.c:342-360 `gf100_vmm_join_`, VRAM target 0). USERD is the BAR1 table's slot for our chid.
     let (inst, userd, gpf, pd) = (w + W_INST, w + userd_off(), w + W_GPFIFO, w + W_PD);
-    vw(inst + 0x08, userd as u32); // gk104.c:88
-    vw(inst + 0x0C, (userd >> 32) as u32); // gk104.c:89 (B371 ORed 0x80000000)
-    vw(inst + 0x10, 0x0000_face); // gk104.c:90
-    vw(inst + 0x30, 0xffff_f902); // gk104.c:91
-    vw(inst + 0x48, gpf as u32); // gk104.c:92
-    vw(inst + 0x4C, ((gpf >> 32) as u32) | (9 << 16)); // gk104.c:93, limit2 = log2(512)
-    vw(inst + 0x84, 0x2040_0000); // gk104.c:94
-    vw(inst + 0x94, 0x3000_0000 | 0xfff); // gk104.c:95 + devm gk104.c:110
-    vw(inst + 0x9C, 0x0000_0100); // gk104.c:96
-    vw(inst + 0xAC, 0x0000_001f); // gk104.c:97
-    vw(inst + 0xE4, 0x0000_0020); // gk104.c:98, priv = true gk104.c:111
-    vw(inst + 0xB8, 0xf800_0000); // gk104.c:100
-    vw(inst + 0xE8, CHID); // gk104.c:99
-    vw(inst + 0xF8, 0x1000_3080); // gk104.c:101
-    vw(inst + 0xFC, 0x1000_0010); // gk104.c:102
-    vw(inst + 0x200, (pd as u32) & 0xFFFF_F000);
-    vw(inst + 0x204, (pd >> 32) as u32);
-    vw(inst + 0x208, 0xFFFF_FFFF);
-    vw(inst + 0x20C, 0x0000_00FF);
+    // KEPLERGR: RAMFC (`gk104_chan_ramfc_write`, the 15 words GPUBLIT3 applied) and the PD pointer are `kepler_fifo::host`'s.
+    kf::ramfc_write(&vw, inst, userd, gpf, 9, CHID); // limit2 = log2(512) entries
+    kf::inst_pd(&vw, inst, pd);
     // Runlist: one entry, our channel: (chid, 0). // nouveau gk104.c:454-455
     vw(w + W_RUNL, CHID);
     vw(w + W_RUNL + 4, 0);
@@ -400,82 +350,37 @@ fn build(w: usize, vlo: usize, vhi: usize) {
     // word (B371 wrote the whole word 0x400, leaving runlist 0 = GR's: flight 23 read `11000001`);
     // VALID | inst page; commit the runlist; only then ENABLE_SET.
     // nouveau gk104.c:60 (unbind), :77 + :68 (gk104_chan_bind), :446-447 (commit), :52 (start).
-    let c = PFIFO_CHAN + CHID as usize * 8;
-    mw(c, 0);
-    mw(c + 4, (mr(c + 4) & !CHAN_HI_RUNLIST_MASK) | ((rl << CHAN_HI_RUNLIST_SHIFT) & CHAN_HI_RUNLIST_MASK));
-    mw(c, 0x8000_0000 | ((inst >> 12) as u32));
+    // KEPLERGR: the bind, its verdict, the runlist commit (2 ms bound) and ENABLE_SET are `kepler_fifo::host`'s —
+    // the same writes in the same order (unbind; runlist into hi; VALID | inst; read 0x2100/0x252c; commit; start).
+    let b0 = BAR0.load(Relaxed);
+    let bo = kf::bind(b0, CHID, rl, inst);
     // GPUBLIT3 (R3c): OUR bind's verdict, read before the runlist commit. // nouveau gk104.c:612-613
-    INTR_POST.store(mr(PFIFO_INTR), Release);
-    BIND_POST.store(mr(PFIFO_BIND_ERR), Release);
-    // Runlist submit: base page (VRAM target 0), then (runlist << 20) | entries.
-    mw(RUNLIST_BASE, ((w + W_RUNL) >> 12) as u32);
-    mw(RUNLIST_SUBMIT, (rl << 20) | 1);
-    // The commit's pending bit, bounded 2 ms on the TSC (nouveau nv50_runl_wait polls the same bit).
-    let t0 = crate::arch::now_cycles();
-    let lim = tsc_hz() / 500;
-    let pend = RUNLIST_INFO + rl as usize * 8;
-    loop {
-        let dt = crate::arch::now_cycles().saturating_sub(t0);
-        if mr(pend) & RUNLIST_PENDING == 0 {
-            COMMIT_US.store(cyc_us(dt) as u32, Release);
-            break;
-        }
-        if dt >= lim {
-            break; // COMMIT_US stays NONE: "stuck" on the dump
-        }
-        core::hint::spin_loop();
+    INTR_POST.store(bo.intr_post, Release);
+    BIND_POST.store(bo.bind_post, Release);
+    // Runlist submit: base page (VRAM target 0), then (runlist << 20) | entries; COMMIT_US stays NONE on "stuck".
+    if let Some(us) = kf::runlist_commit(b0, rl, w + W_RUNL, 1) {
+        COMMIT_US.store(us, Release);
     }
-    mw(c + 4, mr(c + 4) | CHAN_HI_ENABLE_SET);
+    kf::start(b0, CHID);
 }
 
-/// PFIFO_INTR (W1C) and the bind error code. // nouveau gk104.c:658,662 / :612-613
-const PFIFO_INTR: usize = 0x2100;
-const PFIFO_BIND_ERR: usize = 0x252c;
-/// USERD BAR1 table: ENABLE bit 28 | BAR1 VA >> 12. // nouveau gk104.c:749 [wire: 0x252c = 2 SNOOP_WITHOUT_BAR1, gk104.c:600]
-const USERD_BAR1: usize = 0x2254;
-const USERD_BAR1_EN: u32 = 0x1000_0000;
-/// The OR nouveau writes beside the PBDMA enable. // nouveau gk104.c:740 [ONE-SOURCE]
-const R2A04: usize = 0x2a04;
-const R2A04_OR: u32 = 0xbfff_ffff;
-/// SCHED_DISABLE: one bit per runlist; nouveau clears it to let a runlist run. // nouveau gk104.c:412,418 [ONE-SOURCE]
-const SCHED_DISABLE: usize = 0x2630;
-/// PBDMA init: clear bits 8 and 28 of 0x04013c on each PBDMA. // nouveau gf100.c:357 [ONE-SOURCE]
-const PB_13C: usize = 0x04_013c;
-const PB_13C_CLR: u32 = 0x1000_0100;
-const PB_STRIDE: usize = 0x2000;
-/// PBDMA i's runlist mask. // nouveau gk104.c:392
-const PB_RUNM: usize = 0x2390;
-
-/// GPUBLIT3 (B410) M1 — the fifo-init state nouveau writes and we never did, before the bind (R3, R5, R6, R7). Every
-/// pre-image is kept for the walls line. Order is nouveau's: `init_pbdmas` (0x204, 0x2a04), runq init (0x04013c), fifo
-/// init (0x2254, 0x2100 W1C) — nvkm_fifo_init base.c:146-162 — then the runlist allow (0x2630) before the bind.
+/// GPUBLIT3 (B410) M1 — the fifo-init state nouveau writes and we never did, before the bind (R3, R5, R6, R7).
+/// KEPLERGR: the writes are `kepler_fifo::host::fifo_init` (one source; it also registers this window's table as THE
+/// USERD table the GR leg's chid 1 uses); this keeps every pre-image for the walls line, as before.
 fn fifo_init(w: usize, rl: u32) {
-    let r2a04 = mr(R2A04);
-    R2A04_PRE.store(r2a04, Release);
-    mw(R2A04, r2a04 | R2A04_OR); // gk104.c:740
-    let en = mr(PMC_PBDMA_ENABLE);
+    let b0 = BAR0.load(Relaxed);
+    let mut pre = kf::Pre::new();
+    let Some(io) = kf::fifo_init(b0, w + W_UTAB, rl, &mut pre) else { return };
+    R2A04_PRE.store(pre.get(R2A04).unwrap_or(0), Release);
     for i in 0..4usize {
-        if en & (1 << i) == 0 || rl >= 32 || mr(PB_RUNM + i * 4) & (1 << rl) == 0 {
-            continue; // only the PBDMA(s) serving the CE's runlist; GR's PBDMA0 is the fifo leg's
+        if let Some(v) = pre.get(PB_13C + i * PB_STRIDE) {
+            PB13C_PRE[i].store(v, Release);
         }
-        let a = PB_13C + i * PB_STRIDE;
-        let v = mr(a);
-        PB13C_PRE[i].store(v, Release);
-        mw(a, v & !PB_13C_CLR); // gf100.c:357
     }
-    R2254_PRE.store(mr(USERD_BAR1), Release);
-    // BAR1 offset == VRAM offset (KF24 identity), so the table's BAR1 VA is its window offset. // gk104.c:749
-    mw(USERD_BAR1, USERD_BAR1_EN | (((w + W_UTAB) >> 12) as u32));
-    // A BIND_ERROR latched before us (the GR leg's chid 1 reads `err=00000002` every boot) is recorded, then cleared,
-    // so `bind_post` is OUR bind's. W1C bit 0 only. // gk104.c:660-662
-    INTR_PRE.store(mr(PFIFO_INTR), Release);
-    BIND_PRE.store(mr(PFIFO_BIND_ERR), Release);
-    mw(PFIFO_INTR, 0x0000_0001);
-    if rl < 32 {
-        let sd = mr(SCHED_DISABLE);
-        R2630_PRE.store(sd, Release);
-        mw(SCHED_DISABLE, sd & !(1u32 << rl)); // gk104.c:412
-    }
+    R2254_PRE.store(pre.get(USERD_BAR1).unwrap_or(0), Release);
+    INTR_PRE.store(io.intr_pre, Release);
+    BIND_PRE.store(io.bind_pre, Release);
+    R2630_PRE.store(pre.get(SCHED_DISABLE).unwrap_or(0), Release);
 }
 
 /// One PTOP device: the CE this channel runs on.
@@ -491,37 +396,11 @@ struct CeTop {
 /// return CE0 (engine type 1), else CE1 (type 2). CE2 (type 3) is NOT taken: on Kepler it is the GR
 /// copy engine and shares GR's runlist with the fifo leg's channel.
 fn ptop_ce() -> Option<CeTop> {
-    let (mut ty, mut eng, mut rl, mut rst) = (NONE, NONE, NONE, NONE);
-    let mut best: Option<CeTop> = None;
-    for i in 0..64 {
-        let d = mr(PTOP_INFO + i * 4); // top/gk104.c:45
-        match d & 3 {
-            0 => continue, // NOT_VALID, top/gk104.c:48
-            1 => {}        // DATA (fault/addr), top/gk104.c:50
-            2 => {
-                // ENUM, top/gk104.c:56-64
-                if d & 0x20 != 0 {
-                    eng = (d & 0x3c00_0000) >> 26;
-                }
-                if d & 0x10 != 0 {
-                    rl = (d & 0x01e0_0000) >> 21;
-                }
-                if d & 0x04 != 0 {
-                    rst = (d & 0x0000_3e00) >> 9;
-                }
-            }
-            _ => ty = (d & 0x7fff_fffc) >> 2, // ENGINE_TYPE, top/gk104.c:66
-        }
-        if d & 0x8000_0000 != 0 {
-            continue; // chained: more words for this device, top/gk104.c:71
-        }
-        // types 1/2 = CE0/CE1, top/gk104.c:79-80
-        if (ty == 1 || ty == 2) && rl != NONE && best.map_or(true, |b| ty - 1 < b.idx) {
-            best = Some(CeTop { idx: ty - 1, engine: eng, runlist: rl, reset: rst });
-        }
-        (ty, eng, rl, rst) = (NONE, NONE, NONE, NONE);
-    }
-    best
+    // KEPLERGR: the walk is `kepler_fifo::host::ptop_engine` (one source, top/gk104.c:37-81); types 1/2 = CE0/CE1
+    // (top/gk104.c:79-80), the lower index wins as before.
+    let b0 = BAR0.load(Relaxed);
+    let t = kf::ptop_engine(b0, 1).or_else(|| kf::ptop_engine(b0, 2))?;
+    Some(CeTop { idx: t.ty - 1, engine: t.engine, runlist: t.runlist, reset: t.reset })
 }
 
 // ---- submission ----------------------------------------------------------------------------------------
@@ -887,121 +766,12 @@ fn detail(st: &StOut) {
 
 // ---- M3 — the PBDMA / channel path read again from the top, every word decoded (DRIVERS-METHOD §7) --------------
 
-/// PFIFO_INTR bits as nouveau `gk104_fifo_intr` takes them. // nouveau gk104.c:660-720
-const PFIFO_INTR_NAMES: &[(u32, &str)] = &[
-    (0x0000_0001, "BIND_ERROR"), (0x0000_0010, "PIO_ERROR"), (0x0000_0100, "SCHED_ERROR"), (0x0001_0000, "CHSW_ERROR"),
-    (0x0080_0000, "FB_FLUSH_TIMEOUT"), (0x0100_0000, "LB_ERROR"), (0x0800_0000, "DROPPED_MMU_FAULT"),
-    (0x1000_0000, "MMU_FAULT"), (0x2000_0000, "PBDMA_INTR"), (0x4000_0000, "RUNLIST_EVENT"), (0x8000_0000, "NONSTALL"),
-];
-/// 0x252c bits 7:0. // nouveau gk104.c:598-605
-const BIND_NAMES: &[(u32, &str)] = &[
-    (0x01, "BIND_NOT_UNBOUND"), (0x02, "SNOOP_WITHOUT_BAR1"), (0x03, "UNBIND_WHILE_RUNNING"), (0x05, "INVALID_RUNLIST"),
-    (0x06, "INVALID_CTX_TGT"), (0x0b, "UNBIND_WHILE_PARKED"),
-];
-/// PBDMA INTR_0 bits. // nouveau gk104.c:335-366
-const PB_INTR0_NAMES: &[(u32, &str)] = &[
-    (0x0000_0001, "MEMREQ"), (0x0000_0002, "MEMACK_TIMEOUT"), (0x0000_0004, "MEMACK_EXTRA"), (0x0000_0008, "MEMDAT_TIMEOUT"),
-    (0x0000_0010, "MEMDAT_EXTRA"), (0x0000_0020, "MEMFLUSH"), (0x0000_0040, "MEMOP"), (0x0000_0080, "LBCONNECT"),
-    (0x0000_0100, "LBREQ"), (0x0000_0200, "LBACK_TIMEOUT"), (0x0000_0400, "LBACK_EXTRA"), (0x0000_0800, "LBDAT_TIMEOUT"),
-    (0x0000_1000, "LBDAT_EXTRA"), (0x0000_2000, "GPFIFO"), (0x0000_4000, "GPPTR"), (0x0000_8000, "GPENTRY"),
-    (0x0001_0000, "GPCRC"), (0x0002_0000, "PBPTR"), (0x0004_0000, "PBENTRY"), (0x0008_0000, "PBCRC"),
-    (0x0010_0000, "XBARCONNECT"), (0x0020_0000, "METHOD"), (0x0040_0000, "METHODCRC"), (0x0080_0000, "DEVICE"),
-    (0x0200_0000, "SEMAPHORE"), (0x0400_0000, "ACQUIRE"), (0x0800_0000, "PRI"), (0x2000_0000, "NO_CTXSW_SEG"),
-    (0x4000_0000, "PBSEG"), (0x8000_0000, "SIGNATURE"),
-];
-/// MMU fault reason (type & 0xf). // nouveau gk104.c:504-521
-const FAULT_REASONS: [&str; 16] = [
-    "PDE", "PDE_SIZE", "PTE", "VA_LIMIT_VIOLATION", "UNBOUND_INST_BLOCK", "PRIV_VIOLATION", "RO_VIOLATION", "WO_VIOLATION",
-    "PITCH_MASK_VIOLATION", "WORK_CREATION", "UNSUPPORTED_APERTURE", "COMPRESSION_FAILURE", "UNSUPPORTED_KIND",
-    "REGION_VIOLATION", "BOTH_PTES_VALID", "INFO_TYPE_POISONED",
-];
-/// Hub clients the CE path can name (type bits 12:8 with hub bit 6). // nouveau gk104.c:525-558
-fn hub_client(c: u32) -> &'static str {
-    match c {
-        0x01 => "CE0", 0x02 => "CE1", 0x06 => "HOST", 0x07 => "HOST_CPU", 0x08 => "HOST_CPU_NB", 0x0a => "MMU",
-        0x0e => "NISO", 0x18 => "GR_CE", 0x19 => "CE2", 0x1b => "MMU_NB", _ => "other",
-    }
-}
-/// MMU fault units (0x259c bit = unit). CE0 0x15, CE1 0x16, HOST0..7 0x07..0x0e. // nouveau gk104.c:473-500
-const FAULT_UNIT_CE0: u32 = 0x15;
-const FAULT_MASK: usize = 0x259c; // gf100.c:723
-const FAULT_BASE: usize = 0x2800; // + unit*0x10: inst, valo, vahi, type — gf100.c:699-702
-const PBDMA_INTR_MASK: usize = 0x25a0; // gf100.c:737
-const PREEMPT: usize = 0x2634; // pending bit 20, gf100.c:372
-const PB_IDLE: usize = 0x3080; // + i*4, busy bits 0xe000, gk104.c:293
-
-fn names(v: u32, t: &[(u32, &str)]) -> alloc::string::String {
-    let mut s = alloc::string::String::new();
-    let mut rest = v;
-    for &(b, n) in t {
-        if v & b != 0 {
-            if !s.is_empty() {
-                s.push('|');
-            }
-            s.push_str(n);
-            rest &= !b;
-        }
-    }
-    if rest != 0 {
-        let sep = if s.is_empty() { "" } else { "|" };
-        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{}unk:{:08X}", sep, rest));
-    }
-    if s.is_empty() { "-".into() } else { s }
-}
-
-fn fault_word(unit: u32) -> alloc::string::String {
-    let b = FAULT_BASE + unit as usize * 0x10;
-    let (inst, valo, vahi, ty) = (mr(b), mr(b + 4), mr(b + 8), mr(b + 0xc));
-    let hub = ty & 0x40 != 0;
-    alloc::format!(
-        "u{:02X}:inst={:08X}:va={:X}{:08X}:type={:08X}[{} {} {}{}]",
-        unit, inst, vahi, valo, ty, FAULT_REASONS[(ty & 0xf) as usize], if ty & 0x80 != 0 { "write" } else { "read" },
-        if hub { "hub:" } else { "gpc:" }, if hub { hub_client((ty >> 8) & 0x1f) } else { "-" }
-    )
-}
-
-/// GPUBLIT3 M3: one line, every status word on the path named. Reading (gpublit3.md §3): `bind=` then `rl_pend`, then
-/// the PBDMA serving the CE's runlist (`pbN_intr0`, `pbN_idle`), then the MMU fault units (the CE's own unit always shown).
+/// GPUBLIT3 M3, lifted by KEPLERGR (B421) into `kepler_fifo::host::pfifo_decode` — one decoder for both legs; the line
+/// is now `[kfifo] decode chid=2 ...` (was `[gpublit] decode`). The CE's own MMU fault unit is CE0 0x15 + idx.
 fn detail_decode() {
-    let intr = mr(PFIFO_INTR);
-    let bind = mr(PFIFO_BIND_ERR);
-    let bname = BIND_NAMES.iter().find(|(c, _)| *c == bind & 0xff).map_or("-", |(_, n)| *n);
     let (eng, rl, idx) = (CE_ENG.load(Relaxed), CE_RL.load(Relaxed), CE_IDX.load(Relaxed));
-    let es = if eng < 32 { mr(0x2640 + eng as usize * 8) } else { 0 };
-    // gk104.c:208-216
-    let estr = alloc::format!(
-        "{:08X}[busy={} faulted={} chsw={} load={} save={} prev={} next={}]",
-        es, (es >> 31) & 1, (es >> 30) & 1, (es >> 15) & 1, (es >> 13) & 1, (es >> 14) & 1, es & 0xfff, (es >> 16) & 0xfff
-    );
-    let hi = mr(PFIFO_CHAN + CHID as usize * 8 + 4);
-    let mut pb = alloc::string::String::new();
-    for i in 0..4usize {
-        if rl < 32 && mr(PB_RUNM + i * 4) & (1 << rl) != 0 {
-            let b = 0x04_0000 + i * PB_STRIDE;
-            let i0 = mr(b + 0x108);
-            let idle = mr(PB_IDLE + i * 4);
-            let _ = core::fmt::Write::write_fmt(
-                &mut pb,
-                format_args!(" pb{}_intr0={:08X}[{}] pb{}_intr1={:08X} pb{}_idle={:08X}[{}]", i, i0, names(i0, PB_INTR0_NAMES), i, mr(b + 0x148), i, idle,
-                    if idle & 0xe000 == 0 { "idle" } else { "busy" }),
-            );
-        }
-    }
-    let fm = mr(FAULT_MASK);
-    let ce_unit = if idx < 2 { FAULT_UNIT_CE0 + idx } else { FAULT_UNIT_CE0 };
-    let mut faults = fault_word(ce_unit);
-    if fm != 0 {
-        let first = fm.trailing_zeros();
-        if first != ce_unit {
-            faults.push(' ');
-            faults.push_str(&fault_word(first));
-        }
-    }
-    serial_println!(
-        "[gpublit] decode pfifo_intr={:08X}[{}] bind={:02X}[{}] chan_hi={:08X}[rl={} en={}] eng{}={} pbdma_intr={:08X} preempt={:08X} sched_dis={:08X}[rl{}={}]{} mmu={:08X} fault={}",
-        intr, names(intr, PFIFO_INTR_NAMES), bind & 0xff, bname, hi, (hi >> 16) & 0xf, hi & 1, if eng == NONE { 0 } else { eng }, estr,
-        mr(PBDMA_INTR_MASK), mr(PREEMPT), mr(SCHED_DISABLE), rl, if rl < 32 { (mr(SCHED_DISABLE) >> rl) & 1 } else { 0 }, pb, fm, faults
-    );
+    let ce_unit = if idx < 2 { kf::FAULT_UNIT_CE0 + idx } else { kf::FAULT_UNIT_CE0 };
+    kf::pfifo_decode(BAR0.load(Relaxed), CHID, eng, rl, ce_unit);
 }
 
 /// GPUBLIT3 M1: every wall this boot applied, pre-image -> readback, so flight 26 tells R3..R9 apart (gpublit3.md §3).
