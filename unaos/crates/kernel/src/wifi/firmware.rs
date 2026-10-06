@@ -947,3 +947,30 @@ fn refused_ui(role: &str, why: &str) {
     #[cfg(feature = "wc")] let _ = crate::video::dialog::refused(crate::video::dialog::WHAT_FIRMWARE, w.as_bytes());
     let _ = w;
 }
+
+/// SMALLFIX6 (rmbp-ledger B495) — FWVOL read back for `tests smallfix6`, no read of the set: would pass 2
+/// ([`stage_boot_root`]) search the boot card's native UnaFS root NOW? `searchable` when `/` answers, is the
+/// `native` volume and rides the program-source handle (then `/FIRMWARE/` on that volume — arroyo's WIFI-FW
+/// target — is searched, and the ESP copy is redundant); else the reason pass 2 would print.
+#[cfg(feature = "unafs")]
+pub fn boot_root_reach() -> String {
+    let Some((_, boot)) = crate::drivers::block::program_source() else { return String::from("no-program-source") };
+    let mt = crate::shell::vfs_mount_table();
+    if mt.stat("/").is_err() {
+        return String::from("root-unbound");
+    }
+    let name = mt.volume_name("/").unwrap_or_default();
+    if name != "native" {
+        return alloc::format!("skipped(volume={})", name);
+    }
+    match crate::fs::unafs::mount_bound_handle() {
+        Some(h) if h == boot => alloc::format!("searchable(dirs={} handle={:?})", dirs_description(), boot),
+        other => alloc::format!("refused(handle={:?})", other),
+    }
+}
+
+/// SMALLFIX6: a build without UnaFS has no pass 2; the program-source FAT pass is the whole search.
+#[cfg(not(feature = "unafs"))]
+pub fn boot_root_reach() -> String {
+    String::from("no-unafs(fat-pass-only)")
+}

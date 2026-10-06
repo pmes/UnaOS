@@ -321,3 +321,5 @@ pub mod shelltask;
 pub mod smallfix4;
 // SMALLFIX5 (rmbp-ledger B480): `tests smallfix5` — the merge19 wave's small owed items, read back. Tail statement.
 pub mod smallfix5;
+// SMALLFIX6 (rmbp-ledger B495): `tests windowcap`, `tests smallfix6` — flight 26's small reds, read back. Tail statement.
+pub mod smallfix6;
