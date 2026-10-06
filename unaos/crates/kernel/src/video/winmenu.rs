@@ -268,23 +268,15 @@ struct Tree {
 // The registry
 // ---------------------------------------------------------------------------
 
-/// How many windows may publish at once. Four, because [`MENU_TITLES_MAX`] windows' worth of kernel
-/// furniture is already more than this desktop has; a fifth publisher is REFUSED on the wire rather
-/// than silently evicting a live one.
-const WINMENU_MAX: usize = 4;
+/// APPMENU2 (B393) — **no cap on publishers** (R90, the WINDOWCAP-2 way). Bit `id-1` set = window
+/// `id` holds a tree. **Lock-free on purpose**: [`has_tree`] is asked once per window per bar compose,
+/// from inside `menubar::Model::read`'s existing table scan, and a lock there would be a second lock
+/// nested under `wm`'s table. Growable ([`super::rowstore::SlotBits`]); a read never allocates.
+static HAS: super::rowstore::SlotBits = super::rowstore::SlotBits::new();
 
-/// The owner of each slot, or [`wm::WIN_NONE`]. **Lock-free on purpose**: [`has_tree`] is asked once
-/// per window per bar compose, from inside `menubar::Model::read`'s existing table scan, and a lock
-/// there would be a second lock nested under `wm`'s table.
-static OWNERS: [AtomicU32; WINMENU_MAX] = [
-    AtomicU32::new(wm::WIN_NONE),
-    AtomicU32::new(wm::WIN_NONE),
-    AtomicU32::new(wm::WIN_NONE),
-    AtomicU32::new(wm::WIN_NONE),
-];
-
-/// The trees themselves. Guarded, and **never acquired blocking** — see the module header.
-static TREES: spin::Mutex<[Option<Tree>; WINMENU_MAX]> = spin::Mutex::new([None; WINMENU_MAX]);
+/// The trees themselves, one entry per publishing window, growable. Guarded, and **never acquired
+/// blocking** — see the module header. A removal is a `swap_remove` (no free on the masked reap path).
+static TREES: spin::Mutex<alloc::vec::Vec<(wm::WinId, Tree)>> = spin::Mutex::new(alloc::vec::Vec::new());
 
 /// How many slots are live. The whole of the fast path: a boot with no publisher answers every
 /// question from this one relaxed load and never reaches the table.
@@ -380,13 +372,13 @@ fn note_refusal(site: &str) {
     }
 }
 
-/// Is `id` a live publisher? Lock-free, [`WINMENU_MAX`] relaxed loads, and short-circuited to nothing
-/// by [`LIVE`] on a boot where no window ever published.
+/// Is `id` a live publisher? Lock-free, one bit test, and short-circuited to nothing by [`LIVE`] on a
+/// boot where no window ever published.
 pub fn has_tree(id: wm::WinId) -> bool {
     if id == wm::WIN_NONE || LIVE.load(Ordering::Relaxed) == 0 {
         return false;
     }
-    OWNERS.iter().any(|o| o.load(Ordering::Relaxed) == id)
+    HAS.test(id as usize - 1)
 }
 
 /// **The registry's answer, and it is THREE-VALUED on purpose** (PANEL V-3).
@@ -419,15 +411,10 @@ fn tree_of(id: wm::WinId, site: &str) -> Look {
             return Look::Busy;
         }
     };
-    for (k, slot) in g.iter().enumerate() {
-        if OWNERS[k].load(Ordering::Relaxed) == id {
-            return match *slot {
-                Some(t) => Look::Found(t),
-                None => Look::Absent,
-            };
-        }
+    match g.iter().find(|e| e.0 == id) {
+        Some(e) => Look::Found(e.1),
+        None => Look::Absent,
     }
-    Look::Absent
 }
 
 /// **Publish `owner`'s menu tree.** `true` when the registry took it.
@@ -484,34 +471,30 @@ pub fn publish(owner: wm::WinId, titles: &'static [MenuTitle], on_pick: fn(u32))
             return false;
         }
     };
-    // Replace in place if this owner already holds a slot, else take a free one.
-    let mut idx = None;
-    for k in 0..WINMENU_MAX {
-        if OWNERS[k].load(Ordering::Relaxed) == owner {
-            idx = Some(k);
-            break;
-        }
-    }
+    // Replace in place if this owner already holds an entry, else grow (APPMENU2: no registry-full).
+    let idx = g.iter().position(|e| e.0 == owner);
     let replaced = idx.is_some();
-    if idx.is_none() {
-        for k in 0..WINMENU_MAX {
-            if OWNERS[k].load(Ordering::Relaxed) == wm::WIN_NONE {
-                idx = Some(k);
-                break;
-            }
-        }
-    }
-    let Some(k) = idx else {
-        serial_println!("[winmenu] publish REFUSE owner={} reason=registry-full slots={}", owner, WINMENU_MAX);
-        return false;
-    };
     // SO3 — a re-publish must not silently drop the tenant's app menu. Re-publishing is how a
     // publisher moves a `FLAG_CHECKED` mark (see this function's doc), so it happens on every pick;
     // rebuilding the slot from scratch would make a custom app menu survive exactly until the first
     // selection in some unrelated title.
-    let app = g[k].and_then(|t| t.app);
-    g[k] = Some(Tree { titles, on_pick, app });
-    OWNERS[k].store(owner, Ordering::Release);
+    let k = match idx {
+        Some(k) => {
+            let app = g[k].1.app;
+            g[k].1 = Tree { titles, on_pick, app };
+            k
+        }
+        None => {
+            if g.try_reserve(1).is_err() {
+                serial_println!("[winmenu] publish REFUSE owner={} reason=no-memory", owner);
+                return false;
+            }
+            g.push((owner, Tree { titles, on_pick, app: None }));
+            g.len() - 1
+        }
+    };
+    let app = g[k].1.app;
+    HAS.set(owner as usize - 1);
     if !replaced {
         LIVE.fetch_add(1, Ordering::Relaxed);
     }
@@ -564,17 +547,14 @@ pub fn publish_app(owner: wm::WinId, items: &'static [MenuItem]) -> bool {
             return false;
         }
     };
-    for k in 0..WINMENU_MAX {
-        if OWNERS[k].load(Ordering::Relaxed) == owner {
-            if let Some(t) = g[k].as_mut() {
-                t.app = Some(items);
-                serial_println!(
-                    "[winmenu] publish owner={} titles={} items={} slot={} replaced=true app-menu=custom",
-                    owner, t.titles.len(), items.len(), k
-                );
-                return true;
-            }
-        }
+    if let Some(k) = g.iter().position(|e| e.0 == owner) {
+        let t = &mut g[k].1;
+        t.app = Some(items);
+        serial_println!(
+            "[winmenu] publish owner={} titles={} items={} slot={} replaced=true app-menu=custom",
+            owner, t.titles.len(), items.len(), k
+        );
+        return true;
     }
     false
 }
@@ -628,6 +608,14 @@ pub fn set_app_window(id: wm::WinId, name: &[u8]) {
             if app_menu_is_custom(id) { "custom" } else { "default" }
         );
     }
+}
+
+/// APPMENU2 — the window a tenant pick is being delivered for (set just before the sink is called).
+static PICK_WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
+
+/// APPMENU2 — the window the pick now being delivered was taken on (`appmenu`'s one ring-3 sink).
+pub fn picking_window() -> wm::WinId {
+    PICK_WIN.load(Ordering::Acquire)
 }
 
 /// APPMENU2 — the window the bar's app title names, or [`wm::WIN_NONE`]. Lock-free.
@@ -685,12 +673,10 @@ pub fn clear(owner: wm::WinId) -> bool {
         }
     };
     let mut gone = false;
-    for k in 0..WINMENU_MAX {
-        if OWNERS[k].load(Ordering::Relaxed) == owner {
-            OWNERS[k].store(wm::WIN_NONE, Ordering::Release);
-            g[k] = None;
-            gone = true;
-        }
+    if let Some(k) = g.iter().position(|e| e.0 == owner) {
+        HAS.clear(owner as usize - 1);
+        g.swap_remove(k); // APPMENU2 — no free here: this runs on the masked reap path
+        gone = true;
     }
     if gone {
         LIVE.fetch_sub(1, Ordering::Relaxed);
@@ -1540,6 +1526,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
                             }
                             Sink::Tenant(f) => {
                                 serial_println!("[winmenu] pick owner={} id={} label={}", owner, id, items[i].label);
+                                PICK_WIN.store(owner, Ordering::Release); // APPMENU2 — the one ring-3 sink reads its owner from here
                                 f(id);
                             }
                             // SO3 — the WM's own app menu. The witness names the ROUTE, not just the
@@ -2261,8 +2248,6 @@ pub fn selftest() {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)] pub(crate) fn uimetrics_assert() {
-    // A registry with no slots would be a registry that refuses every publisher.
-    assert!(WINMENU_MAX >= 1);
     // The bar cannot lay out more titles than the snapshot can carry.
     assert!(MENU_TITLES_MAX >= 1);
     // The wire caps this registry shares with the protocol design must hold what a tree can be.
