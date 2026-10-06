@@ -42,3 +42,12 @@ Host: `VPLAYAUDIO:` lines from `cargo test -p audio_core --test vplayaudio_kat -
 **Owed.** FLAC/PCM inside Matroska/MP4 (audio_core owns the decoders; no codec mapping yet — `plays` says no, the facts
 say `audio_ok=false`); Opus multistream; a video seek's frames between the keyframe and the target are decoded
 unseen (no dropping by reference); the first metal line (DECJOBHANG must fly first).
+
+**Legs.** `cargo test --release -p audio_core -p demux_core` exit 0 (with `UNAOS_TESTF_DIR` = the staged test-f set;
+`vplayaudio_kat`: aac+video 13312 samples and mp3+video 11025 identical through `open_demuxed(share)` and audio_core
+alone, seeks equal (`table=mp4`, `table=xing`); TEST.WEBM Vorbis 121024 frames = the packet decode, nine seeks
+`table=matroska exact=1` bit-exact; TEST.OPUS in WebM with `DiscardPadding` (244 samples) = the Ogg decode, end trim
+included, nine seeks exact, converged 0 from 250 ms); `cargo check -p gneiss_pal -p audio-check -p type_core` 0; kernel
+x86 metal shape 0, aarch64 `login,loginst,virt_el0,lumen,desktop_firmware,quarry,facet,usbnet` 0, aarch64
+`tegra,login,loginst,virt_el0` 0; charter-check 0; arch-check 0 (no MP4 key in the baseline on this tip — MP4ONE
+already noted it: nothing to drop); attrkeys-check 0.
