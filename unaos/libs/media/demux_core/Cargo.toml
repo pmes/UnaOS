@@ -9,3 +9,11 @@ description = "Stria's container core: ISOBMFF/MP4 (progressive and fragmented) 
 # from ISO/IEC 14496-12 and the Matroska specification (RFC 9559). A member of the ROOT host workspace
 # (Stria links it); the kernel may link it by path.
 [dependencies]
+
+# VIDEOPLAYER (rmbp-ledger B434): the test-f KAT drives the kernel Player's exact chain on the host — these
+# containers through the picture cores and a WebM's Vorbis track through audio_core. Test-only; the crate itself
+# keeps NO dependencies.
+[dev-dependencies]
+vp8_core = { path = "../vp8_core" }
+av1_core = { path = "../av1_core" }
+audio_core = { path = "../audio_core" }
