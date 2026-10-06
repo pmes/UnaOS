@@ -198,3 +198,5 @@ pub mod rootacl;
 /// NAMEINDEX (B432): the name index's login-time build on a volume written before it, and `tests nameindex`.
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 pub mod nameindex;
+/// BOOTFATSEAM (B453, R99): the kernel's own stores (USERS.DAT, the holocron store) as kernel-owned leaves of UnaFS `/system`.
+pub mod sysleaf;
