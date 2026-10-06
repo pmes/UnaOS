@@ -10,7 +10,7 @@ pub mod tables;
 use crate::bits::BitReader;
 use crate::io::ByteStream;
 use crate::math;
-use crate::{Codec, Error, Format, Info, Pcm, Result, Source};
+use crate::{SeekPoint, Codec, Error, Format, Info, Pcm, Result, Source};
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -807,6 +807,14 @@ pub struct Mp3Stream {
     done: bool,
     /// The previous frame ended exactly where the stream now is (no resync needed).
     in_sync: bool,
+    /// SEEKTABLE (rmbp B433): the first audio frame's byte (past ID3v2 and the Xing/Info/VBRI frame), the tag
+    /// frame's own byte, the gapless skip at the top, the Xing TOC with its frame and byte counts, and the VBRI
+    /// TOC as absolute frame-start bytes every `fpe` frames.
+    first_byte: u64,
+    tag_byte: u64,
+    skip0: u64,
+    xing: Option<([u8; 100], u64, Option<u64>)>,
+    vbri: Option<(Vec<u64>, u64)>,
 }
 
 fn skip_id3v2(s: &mut ByteStream) -> Result<()> {
@@ -824,8 +832,9 @@ fn skip_id3v2(s: &mut ByteStream) -> Result<()> {
 impl Mp3Stream {
     pub fn new(mut s: ByteStream) -> Result<Mp3Stream> {
         skip_id3v2(&mut s)?;
-        let mut st = Mp3Stream { s, dec: Mp3Decoder::new(), first: Header::parse(0xFFFB_9000).unwrap(), channels: 0, rate: 0, free_len: 0, skip: 0, total: None, emitted: 0, planes: vec![], done: false, in_sync: false };
+        let mut st = Mp3Stream { s, dec: Mp3Decoder::new(), first: Header::parse(0xFFFB_9000).unwrap(), channels: 0, rate: 0, free_len: 0, skip: 0, total: None, emitted: 0, planes: vec![], done: false, in_sync: false, first_byte: 0, tag_byte: 0, skip0: 0, xing: None, vbri: None };
         let (h, len) = st.sync(None)?.ok_or(Error::Invalid("MP3: no frame found"))?;
+        st.tag_byte = st.s.offset();
         st.first = h;
         st.rate = h.rate();
         st.channels = st.scan_channels(&h)?;
@@ -837,8 +846,13 @@ impl Mp3Stream {
             let mut q = off + 8;
             let mut frames = None;
             if flags & 1 != 0 && frame.len() >= q + 4 { frames = Some(u32::from_be_bytes(frame[q..q + 4].try_into().unwrap()) as u64); q += 4; }
-            if flags & 2 != 0 { q += 4; }
-            if flags & 4 != 0 { q += 100; }
+            let mut bytes = None;
+            if flags & 2 != 0 && frame.len() >= q + 4 { bytes = Some(u32::from_be_bytes(frame[q..q + 4].try_into().unwrap()) as u64); q += 4; }
+            if flags & 4 != 0 {
+                // SEEKTABLE: the 100-entry TOC (byte fraction of `bytes`, in 1/256, at each percent of the time)
+                if let (Some(f), Some(t)) = (frames, frame.get(q..q + 100)) { if f > 0 { st.xing = Some((t.try_into().unwrap(), f, bytes)); } }
+                q += 100;
+            }
             if flags & 8 != 0 { q += 4; }
             // LAME tag: 9-byte version string, then (at +21) 12-bit delay and 12-bit padding
             if frame.len() >= q + 24 && (&frame[q..q + 4] == b"LAME" || &frame[q..q + 4] == b"Lavc" || &frame[q..q + 4] == b"Lavf") {
@@ -856,7 +870,24 @@ impl Mp3Stream {
                 st.total = Some(f * h.samples() as u64);
             }
             st.s.consume(len);
+        } else if frame.len() >= 36 + 26 && &frame[36..40] == b"VBRI" {
+            // SEEKTABLE: Fraunhofer's VBRI frame (32 bytes after the header): version, delay, quality, bytes, frames,
+            // TOC entries, scale, entry size, frames per entry, then the TOC — each entry the byte length of the
+            // next `frames per entry` frames (times scale), counted from the frame after this one.
+            let be = |o: usize, n: usize| frame[o..o + n].iter().fold(0u64, |a, &b| (a << 8) | b as u64);
+            let frames = be(36 + 14, 4);
+            let (entries, scale, esz, fpe) = (be(36 + 18, 2) as usize, be(36 + 20, 2), be(36 + 22, 2) as usize, be(36 + 24, 2));
+            let base = st.tag_byte + len as u64;
+            if (1..=4).contains(&esz) && fpe > 0 && frame.len() >= 62 + entries * esz {
+                let mut offs = vec![base];
+                for k in 0..entries { let o = *offs.last().unwrap(); offs.push(o + be(62 + k * esz, esz) * scale); }
+                st.vbri = Some((offs, fpe));
+            }
+            if frames > 0 { st.total = Some(frames * h.samples() as u64); }
+            st.s.consume(len);
         }
+        st.first_byte = st.s.offset();
+        st.skip0 = st.skip;
         Ok(st)
     }
 
@@ -970,6 +1001,52 @@ impl Source for Mp3Stream {
             self.emitted += frames as u64;
             return Ok(true);
         }
+    }
+    /// SEEKTABLE (rmbp B433): the frame holding the target, two frames earlier for the pre-roll (the bit reservoir
+    /// reaches back up to 511 bytes; the IMDCT overlap and the synthesis window one frame), found from the VBRI TOC
+    /// (frame counts: exact), the Xing TOC (a byte fraction per percent of the time: an estimate), or the first
+    /// frame's bitrate (CBR: an estimate). The pre-roll frames' PCM is dropped.
+    fn seek(&mut self, t: u64) -> Result<Option<SeekPoint>> {
+        let spf = self.first.samples() as u64;
+        let n = (t + self.skip0) / spf;
+        let mut l = n.saturating_sub(2);
+        let end = self.s.len().unwrap_or(u64::MAX);
+        let named = if self.vbri.is_some() { "vbri" } else if self.xing.is_some() { "xing" } else { "cbr" };
+        let (byte, mut exact) = if l == 0 {
+            (self.first_byte, true)
+        } else if let Some((offs, fpe)) = &self.vbri {
+            let e = ((l / fpe) as usize).min(offs.len() - 1);
+            l = e as u64 * fpe;
+            (offs[e], true)
+        } else if let Some((toc, frames, bytes)) = &self.xing {
+            let bytes = bytes.unwrap_or(end.saturating_sub(self.tag_byte)) as u128;
+            let a = (l.min(*frames) * 100) as u128;
+            let f = *frames as u128;
+            let i = ((a / f) as usize).min(99);
+            let frac = a - i as u128 * f;
+            let t0 = toc[i] as u128;
+            let t1 = if i < 99 { toc[i + 1] as u128 } else { 256 };
+            let scaled = t0 * f + (t1.max(t0) - t0) * frac; // the TOC value times `frames`
+            ((self.tag_byte as u128 + bytes * scaled / (256 * f)) as u64, false)
+        } else {
+            let br = match self.first.frame_len() { 0 => (self.free_len as u64) * 8 * self.rate as u64 / spf, fl => (fl as u64 - self.first.padding as u64) * 8 * self.rate as u64 / spf };
+            (self.first_byte + l * spf * br / 8 / self.rate.max(1) as u64, false)
+        };
+        let byte = byte.max(self.first_byte).min(end);
+        if !self.s.seek(byte)? { return Ok(None); }
+        if exact && l > 0 {
+            // a VBRI point must be a frame start, or the landing is only an estimate
+            let ok = self.s.fill(4)? >= 4 && { let d = self.s.data(); Header::parse(u32::from_be_bytes([d[0], d[1], d[2], d[3]])).map(|h| h.compatible(&self.first)).unwrap_or(false) };
+            exact = ok;
+        }
+        self.dec.reset();
+        self.in_sync = false;
+        self.done = false;
+        let d0 = (n * spf).max(self.skip0);
+        self.skip = d0 - l * spf;
+        let sample = d0 - self.skip0;
+        self.emitted = sample;
+        Ok(Some(SeekPoint { byte, sample, exact, table: named, landed: sample }))
     }
 }
 
