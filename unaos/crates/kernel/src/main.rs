@@ -5878,7 +5878,7 @@ fn x86_typematic_pump() {
 /// per tick — so this is a faithful translation of the service rate and not a boot-pace regression.
 #[cfg(target_arch = "x86_64")]
 fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, two cfg-EXCLUSIVE definitions — this x86 body and the Pi body above; `usb_pump` is gone.
-    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu);
+    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu); #[cfg(feature = "ehcihid")] unaos_kernel::drivers::ehci::hid_task_start(cpu); // INPUTSTALL2 M2 (B388): the EHCI HID pass gets its own task, so no step of this loop can hold the keyboard and the pad (same-line fold)
     loop {
         // Nap first: `spawn` puts us on the run queue immediately, and the framebuffer handoff on the
         // BSP is still finishing. One tick costs nothing and keeps the first pass off that seam.
@@ -5908,7 +5908,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // EHCI-3 (ehcihid knob): poll the EHCI HID interrupt endpoints (internal rMBP
         // keyboard/trackpad). Same polled-service spot as the xHCI hooks above.
         #[cfg(feature = "ehcihid")]
-        unaos_kernel::drivers::ehci::service_ehci_hid(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_HID);
+        unaos_kernel::drivers::ehci::service_ehci_hid_pump(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_HID);
         // WEDGEINJ (wedgeinj knob, default OFF) — keep a LIVE core asking for the gate after the
         // injected park, because the steal is a branch inside `composite` and not a timer. On metal
         // this lane supplied that condition for free (`pace_service` / `console_service` above);

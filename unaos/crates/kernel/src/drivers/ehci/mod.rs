@@ -19560,3 +19560,43 @@ fn ehci_isr_test() {
 /// reconnect). A child module so it reuses this file's HCI/ACL transport and its HID report parser. Tail append.
 #[cfg(feature = "btc")]
 pub mod bthid;
+
+// ── INPUTSTALL2 M2 (rmbp-ledger B388): THE HID PASS ON ITS OWN TASK ─────────────────────────────────────
+//
+// Flight 24 card 3: `stage=hid hid_gap_ms=16016` after login, on every boot the same 16 s, and the first
+// report after it `dx=-614` — the pad's own accumulated motion, i.e. nobody polled it. `service_ehci_hid`
+// was one STEP of the `usb-pump` loop (main.rs), so any other step that held the loop held the keyboard and
+// the pad: the window is exactly the smoltcp boot ladder (`SOCK-1` … `SOCK-7`) spinning `pump_until`
+// inside `e1000::service_net`. The HID pass now runs on its own task on the service core, one tick per
+// pass, and `usb_pump` stops calling it once the task is live. The EHCI_HID lock is unchanged (the
+// full-screen apps' `pal::pump_and_poll` still takes it from the render core, as before); the service core
+// is round-robin preemptive, so a spinning neighbour costs the pass a quantum, never the session.
+
+static HID_TASK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Start the `hid-pump` task once, on `cpu` (the caller's: the service core). Called from `usb_pump`'s
+/// entry; the first pass happens before the loop's first `service_ehci_hid_pump`.
+pub fn hid_task_start(cpu: usize) {
+    if HID_TASK.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    crate::arch::sched::spawn("hid-pump", hid_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+    serial_println!(
+        "[hid] pump task=hid-pump cpu={} cadence=1tick (INPUTSTALL2: the HID pass never waits on the device-service loop)",
+        cpu
+    );
+}
+
+fn hid_task(_: usize) {
+    loop {
+        crate::arch::sched::sleep_ticks(1);
+        service_ehci_hid();
+    }
+}
+
+/// The `usb-pump` loop's HID step: a no-op once the `hid-pump` task owns the pass.
+pub fn service_ehci_hid_pump() {
+    if !HID_TASK.load(core::sync::atomic::Ordering::Acquire) {
+        service_ehci_hid();
+    }
+}
