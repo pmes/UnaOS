@@ -6,7 +6,6 @@ dotslash|/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
 dotslash|{}/.config  # F2 BTKEYSEAL (the BT link-key folder)
 dotslash|{}/.config/unaos  # F2 BTKEYSEAL (the BT link-key folder)
 dotslash|{}/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
-dotslash|{}/.config/unaos/holocron/.ring  # F4 HOLOCRONROOT
 dotslash|{}/.config/unaos/preferences.toml  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
 dotslash|{}/.dock  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
 dotslash|{}/.settings  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
