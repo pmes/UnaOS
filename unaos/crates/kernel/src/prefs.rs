@@ -679,6 +679,15 @@ pub fn set_applied(ns: &str, k: &str, v: PrefValue) -> Result<prefs_core::schema
                 return Err(SetError::Refused(x));
             }
         }
+    } else if ns == NS && prefs_core::notify::parse_key(k).is_some() {
+        // NOTIFYPANE (B435): `system.notify.<app>.<field>` is checked by the per-app stanza (`prefs_core::notify`).
+        match prefs_core::notify::check(k, v.clone()) {
+            Ok(a) => a.value,
+            Err(x) => {
+                serial_println!("[prefs] set {}.{}={} ok=0 why={:?} (notify stanza)", ns, k, v, x);
+                return Err(SetError::Refused(x));
+            }
+        }
     } else {
         v
     };
