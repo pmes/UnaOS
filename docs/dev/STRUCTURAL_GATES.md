@@ -2604,3 +2604,38 @@ says the same on the host. Shaped as one leg for GATE-ARCH (arch-check.py) to ab
 
 **Go-red.** `--selftest`: a planted `"media:planted"` fails; baselined it passes; a stale baseline row fails; an
 unparsable row and a scope under its floor are exit 2; a literal inside a `//` comment is not a finding.
+
+## GATE-GATEPATH — every host gate runs on one verb, before every commit (B471, 2026-10-06)
+
+**Invariant.** The seat and every executor run the same set of host gates before a commit, and a gate that is
+not in the tree is a FAIL, never a skip. GATES-2026-10-06 F15: executors ran charter-check only; appearance,
+prefs-schema, deps-audit, attrkeys and knob-hygiene ran when someone remembered them; banner-cert ran only
+inside the esp media builds.
+
+**The gate.** `./arroyo gates` (from `unaos/`; a shell function, no cargo, ~30 s) runs, in order: charter
+(`charter-check.sh`), arch (`arch-check.py`), attrkeys (`attrkeys-check.py`), status (`tools/status-check.py`),
+prefs (`tools/prefs-schema-check.py`), appearance (`appearance-check.py`), deps (`tools/deps-audit/run.py
+--check`), knob (`knob-hygiene.sh`), verbs (`verb-roots.sh`), banner (`banner-cert.sh --registry <this run's
+⚡ kernel features: list>`), k8reach (`k8-reach.py`). One line each, `gate=<name> rc=<n> <its last line>`, the
+full output in `target/gates/<name>.log`, then `GATES: <n> run <n> green -> PASS|FAIL`; the exit code is the
+worst gate's. A script missing from the tree, or no python3, is `rc=127 MISSING <path>`. `gates --list` prints
+the set (`GATES_SET` in arroyo). `<knob line> ./arroyo gates` asks, before the hour-long media build, whether
+that build's banner has a banner-cert row for every feature it names.
+
+**banner-cert `--registry [<feature-list>]`** (host, no artifact): the registry self-check (cond grammar, a token
+of at least 9 bytes), every table and control row names a declared kernel Cargo feature (a row for a retired
+feature can never fire: `vein` and `root-prefer` were removed at the seeding), every listed feature has a row.
+Exit 0 clean, 1 a stale row or an unregistered feature, 2 broken. With the seat's x86 metal line it names 10
+features with no row today (prefs_reset installdemo instgui ahciroot kvblank_trace lidsleep videoplayer
+ahci-write holocron svg), each owed a row measured on an artifact.
+
+**Go-red.** `./arroyo gates --selftest` copies the working tree (git's tracked and untracked files) to a scratch
+dir and plants one defect per gate, the plants GATEREVIEW's table proved each catches: charter `{}.Recents`;
+arch `{home}/.x`; attrkeys `"media:…"`; status a confirmed ST row quoting a line no wire printed; prefs
+`set_sys("ghost.…")`; appearance `0x0012_3456` in video/; deps a git dependency; knob a phantom `cfg!(feature)`;
+verbs a table word with no arm; banner a row for no feature; k8reach a `_feats` knob with no K8 arm and no
+registry row. Each runs through `_gates_one` (the verb's own runner) and is CAUGHT only with a non-zero rc whose
+log names the plant. Witness: `GATEPATH selftest: plants=11 caught=11 -> PASS`; any MISSED is exit 1, a failed
+copy exit 2.
+
+**Today.** `GATES: 11 run 10 green -> FAIL`, rc 1: deps (objc2 0.6.4 behind 0.6.5, ARC DEPSLAG).
