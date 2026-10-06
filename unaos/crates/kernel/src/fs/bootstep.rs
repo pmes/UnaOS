@@ -136,7 +136,9 @@ impl Step {
 ///
 /// `:: BOOT80: mount_ms=<n> mount_blocks=<n> mount_cmds=<n> blocks_read=<n> cmds=<n> ms=<n> users_store=<dat|none|nomount> stage=<s> types=<n> ra_window=<n> -> PASS|FAIL ::`
 ///
-/// Bound (B350): `blocks_read <= 64` for the resolve and `ms <= 2000` for mount + resolve. The cold
+/// Bound (B350, re-derived by SMALLFIX2 B391): the users-store leg `store_blocks <= 64`, the type-database leg
+/// `types_blocks <= 2 x levels x ra-window blocks` (measured under the mount lock), and `ms <= 2000` for mount + resolve;
+/// `foreign_wr` is the window's writes (the resolve writes nothing: non-zero names a concurrent writer). The cold
 /// mount's own blocks are said separately: by format it reads the whole refcount map (128 leaves on the
 /// card's 512 MiB volume), which BOOT80 makes cheap per command but does not shrink.
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
@@ -149,21 +151,38 @@ pub fn boot80_selftest() {
     let mio = io().since(io0);
     let t1 = crate::arch::ms();
     let io1 = io();
+    // SMALLFIX2 (rmbp-ledger B391): the users store (FAT, p1) is its own leg, measured on the global counters.
     #[cfg(feature = "login")]
-    let (store, stage) = (crate::fs::users::boot80_store_probe(), crate::fs::users::stage_name());
+    let store = crate::fs::users::boot80_store_probe();
     #[cfg(not(feature = "login"))]
-    let (store, stage) = ("none", "no-login");
-    let types = crate::fs::unafs::with_unafs(|fs| {
-        fs.resolve_path(crate::fs::assoc::TYPES_DIR).and_then(|id| fs.ls(id)).map(|v| v.len()).unwrap_or(0)
+    let store = "none";
+    let sio = io().since(io1);
+    #[cfg(feature = "login")]
+    let stage = crate::fs::users::stage_name();
+    #[cfg(not(feature = "login"))]
+    let stage = "no-login";
+    // The type database is measured INSIDE the one UnaFS mount lock: no other task's UnaFS traffic can land in this
+    // window (flight 24's 168 blocks rode a screenshot capture writing beside it — the counters are global). Its
+    // bound is the walk it does, not the number of types: `ls` reads ONE directory whatever its count (flight 25:
+    // 26 types in 34 blocks) — an inode read and a directory read per level, each at most one read-ahead window.
+    let (types, tio) = crate::fs::unafs::with_unafs(|fs| {
+        let i0 = io();
+        let n = fs.resolve_path(crate::fs::assoc::TYPES_DIR).and_then(|id| fs.ls(id)).map(|v| v.len()).unwrap_or(0);
+        (n, io().since(i0))
     })
-    .unwrap_or(0);
+    .unwrap_or((0, Io::default()));
     let rms = crate::arch::ms().saturating_sub(t1);
     let rio = io().since(io1);
     let total = mount_ms + rms;
-    let ok = mounted && rio.blocks_read() <= 64 && total <= 2000;
+    let levels = 1 + crate::fs::assoc::TYPES_DIR.split('/').filter(|c| !c.is_empty()).count() as u64;
+    let ra_blocks = crate::fs::unafs::ra_window_bound().div_ceil(8).max(1);
+    let bound = 2 * levels * ra_blocks;
+    const STORE_BOUND: u64 = 64; // B350's resolve bound, kept for the store leg it was measured on
+    let ok = mounted && tio.blocks_read() <= bound && sio.blocks_read() <= STORE_BOUND && total <= 2000;
     serial_println!(
-        ":: BOOT80: mount_ms={} mount_blocks={} mount_cmds={} blocks_read={} cmds={} ms={} users_store={} stage={} types={} ra_window={} -> {} ::",
+        ":: BOOT80: mount_ms={} mount_blocks={} mount_cmds={} blocks_read={} cmds={} ms={} users_store={} stage={} types={} ra_window={} store_blocks={} store_bound={} types_blocks={} bound={} from=walk{}x2xra{} foreign_wr={} -> {} ::",
         mount_ms, mio.blocks_read(), mio.cmds(), rio.blocks_read(), rio.cmds(), total, store, stage, types,
-        crate::fs::unafs::ra_window_bound(), if ok { "PASS" } else { "FAIL" }
+        crate::fs::unafs::ra_window_bound(), sio.blocks_read(), STORE_BOUND, tio.blocks_read(), bound, levels, ra_blocks,
+        rio.blocks_written(), if ok { "PASS" } else { "FAIL" }
     );
 }

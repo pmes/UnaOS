@@ -4,7 +4,7 @@
 //! login. console is doubly wrong because it is blank. it should load the text from the current boot."
 //!
 //! * [`desktop_bare`] — the login (or the installer's release) opens NOTHING: no console, no shell, no STAT. The
-//!   R77/R86 furniture re-mint (`dock::relaunch_furniture` from `login::close_into_session` / `installer_release`)
+//!   R77/R86 furniture re-mint (`dock::relaunch_furniture` from `login::close_into_session` and the installer's release, both deleted by DESKTOPBUILT B387)
 //!   is gone; the services do not wait the furniture bound for furniture that is not coming
 //!   (`boot::furniture_none`). One line: `[login] desktop bare: furniture=none (R88) why=<session|installer>`.
 //! * [`console_prefill`] — every console mint replays the CURRENT BOOT's text from the one ring the kernel already

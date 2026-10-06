@@ -49,6 +49,8 @@ pub const IMAGE_JPEG: &str = "image/jpeg";
 pub const IMAGE_BMP: &str = "image/bmp";
 pub const IMAGE_WEBP: &str = "image/webp";
 pub const IMAGE_QOI: &str = "image/qoi";
+/// SMALLFIX2 (B391, R94): pixel_core's SVG type (`pixel_core::mime_of` under the `svg` feature).
+pub const IMAGE_SVG: &str = "image/svg+xml";
 pub const AUDIO_FLAC: &str = "audio/flac";
 pub const AUDIO_OGG: &str = "audio/ogg";
 pub const AUDIO_MPEG: &str = "audio/mpeg";
@@ -116,6 +118,7 @@ pub const EXT_TABLE: &[(&str, &str)] = &[
     ("bmp", IMAGE_BMP),
     ("webp", IMAGE_WEBP),
     ("qoi", IMAGE_QOI),
+    ("svg", IMAGE_SVG), // SMALLFIX2 (B391): the bytes speak first — without the `svg` feature an .svg sniffs as its text
     ("flac", AUDIO_FLAC),
     ("ogg", AUDIO_OGG),
     ("oga", AUDIO_OGG),

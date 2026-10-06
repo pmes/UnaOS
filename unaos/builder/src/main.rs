@@ -959,6 +959,8 @@ fn main() {
     if std::env::var("UNAOS_SELFDIAG").is_ok() { feats.push("selfdiag"); }
     // BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* at every login (safe-mode knob). Kept in sync with arroyo.
     if std::env::var("UNAOS_PREFS_RESET").is_ok() { feats.push("prefs_reset"); }
+    // SMALLFIX2 (B391, R94): UNAOS_SVG=1 arms pixel_core's `svg` format in the kernel (SVG opens in facet). Kept in sync with arroyo.
+    if std::env::var("UNAOS_SVG").is_ok() { feats.push("svg"); }
     // KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the copy-engine blitter (cpu until KBLIT binds its channel). Kept in sync with arroyo.
     if std::env::var("UNAOS_WC_BLITTER").map(|v| v == "gpu").unwrap_or(false) { feats.push("wc_gpublit"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words

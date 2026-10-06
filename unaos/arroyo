@@ -1239,6 +1239,8 @@ fi
 [ -n "${UNAOS_SELFDIAG:-}" ] && _feats="${_feats}selfdiag,"
 # BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* to defaults at every login (the safe-mode boot knob; `[prefs] display reset=1 reason=knob`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_PREFS_RESET:-}" ] && _feats="${_feats}prefs_reset,"
+# SMALLFIX2 (B391, R94 §3): UNAOS_SVG=1 arms SVG as a picture — pixel_core's `svg` format (svg_core) in the kernel, so `image/svg+xml` types and opens in facet. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_SVG:-}" ] && _feats="${_feats}svg,"
 # KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
 [ "${UNAOS_WC_BLITTER:-}" = "gpu" ] && _feats="${_feats}wc_gpublit,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
@@ -11683,6 +11685,10 @@ kernel8() {
     if [ -n "${UNAOS_PREFS_RESET:-}" ]; then
         K8_FEATS="${K8_FEATS},prefs_reset"
         echo -e "${COLOR_YELLOW}  • UNAOS_PREFS_RESET: BRIGHTFLOOR safe mode — system.display.* reset to defaults at every login${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_SVG:-}" ]; then
+        K8_FEATS="${K8_FEATS},svg"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SVG: SMALLFIX2 — SVG opens as a picture (pixel_core svg / svg_core)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"

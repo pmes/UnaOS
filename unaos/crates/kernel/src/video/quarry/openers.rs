@@ -112,8 +112,13 @@ pub fn open(id: &str, path: &str, mime: &str) -> String {
         "facet" => {
             #[cfg(feature = "facet")]
             {
+                #[cfg(not(feature = "svg"))]
+                if mime == crate::fs::filetype::IMAGE_SVG {
+                    serial_println!("[quarry] open VIEW path={} type={} kind=svg handler=none -> no svg renderer in this build (UNAOS_SVG arms it)", path, mime);
+                    return String::from("no svg renderer in this build");
+                }
                 crate::video::facet::request_open(path);
-                serial_println!("[quarry] open VIEW path={} type={} -> facet (latched for the render pass)", path, mime);
+                serial_println!("[quarry] open VIEW path={} type={} kind={} handler=facet -> facet (latched for the render pass)", path, mime, super::kind_token(mime)); // SMALLFIX2 (B391): kind + handler named
                 alloc::format!("opening {}", leaf)
             }
             #[cfg(not(feature = "facet"))]

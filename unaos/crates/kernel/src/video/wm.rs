@@ -29535,26 +29535,8 @@ fn wcd_heap_tick() {
 #[cfg(not(feature = "witness"))]
 #[inline(always)]
 fn wcd_heap_tick() {}
-/// FIRSTBOOT (R77): [`close_all_furniture`] except `keep` (the installer's own window). Returns the closed count.
-pub fn close_all_furniture_except(keep: WinId) -> usize {
-    let mut ids = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
-    let mut n = 0usize;
-    {
-        let t = table();
-        for r in t.rows.iter() {
-            if r.used && !r.compat && r.id != keep {
-                ids.push(r.id);
-                n += 1;
-            }
-        }
-    }
-    for &id in &ids[..n] {
-        close(id);
-    }
-    n
-}
 /// SPLASHX86: the boot splash's row — a full-panel, CHROMELESS compat row (no title, no controls, `hit_test`
-/// never names it, `close_all_furniture_except` spares it, `COMPAT_WIN` is not touched so `close_compat` /
+/// never names it, `close_all_furniture` spares it, `COMPAT_WIN` is not touched so `close_compat` /
 /// `compat_live` never see it). The caller pins it with [`set_modal_top`] and closes it with [`close`].
 /// `surf` is a `w * h * 4` xRGB buffer that must outlive the row. Returns [`WIN_NONE`] on refusal.
 pub fn splash_open(surf: usize, surf_len: usize, w: usize, h: usize) -> WinId {

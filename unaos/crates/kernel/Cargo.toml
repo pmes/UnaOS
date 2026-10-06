@@ -3763,6 +3763,12 @@ netring3 = []
 # `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 prefs_reset = []
 
+# SMALLFIX2 (rmbp-ledger B391, R94 §3): UNAOS_SVG=1 — SVG is a picture: pixel_core's `svg` format (UnaOS's own
+# no_std svg_core) is linked, so `fs::filetype` types `image/svg+xml` by its markup and facet renders it (shapes;
+# SVG text needs the faces passed to `decode_at`, owed). Off: an .svg types as the text it is. Both arches. Kept
+# in sync with `unaos/arroyo` (the x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+svg = ["pixel_core/svg"]
+
 # KCOMP (rmbp-ledger B321; docs/dev/evidence/rmbp-1005/KCOMP.md): UNAOS_WC_BLITTER=gpu asks the compositor
 # for the Kepler copy-engine blitter (video/blitter.rs GpuBlitter). Until KBLIT binds its channel the probe
 # answers `kblit-channel-absent` and the CPU blitter is selected (`[wc] blitter=cpu reason=…` once at the
