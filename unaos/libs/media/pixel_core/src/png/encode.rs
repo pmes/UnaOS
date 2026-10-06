@@ -214,6 +214,8 @@ const FIXED_DIST: [u8; 32] = {
 pub struct PngEncoder {
     width: u32,
     height: u32,
+    /// APPRES (B398): bytes per pixel — 3 (truecolour, colour type 2) or 4 (RGBA, colour type 6, [`PngEncoder::new_rgba`]).
+    bpp: u8,
     rows_pushed: u32,
     ring: Vec<u8>,
     head: Vec<u32>,
@@ -261,13 +263,23 @@ impl PngEncoder {
     /// Start an encoder. All of its memory is taken here, so `Err(OutOfMemory)` means no pixel was
     /// ever read.
     pub fn new(width: u32, height: u32) -> Result<Self, PngError> {
+        Self::with_bpp(width, height, 3)
+    }
+
+    /// APPRES (B398): an RGBA writer (colour type 6) — `push_row` takes `width * 4` bytes. The program icons
+    /// `tools/una-res` renders carry alpha.
+    pub fn new_rgba(width: u32, height: u32) -> Result<Self, PngError> {
+        Self::with_bpp(width, height, 4)
+    }
+
+    fn with_bpp(width: u32, height: u32, bpp: u8) -> Result<Self, PngError> {
         let total = match PngEncoder::encoded_len(width, height) {
             Some(n) => n,
             None if width == 0 || height == 0 => return Err(PngError::EmptyImage),
             None => return Err(PngError::TooLarge),
         };
         let _ = total;
-        let row = width as usize * 3 + 1;
+        let row = width as usize * bpp as usize + 1;
         let mut ring: Vec<u8> = Vec::new();
         let mut head: Vec<u32> = Vec::new();
         let mut prev: Vec<u32> = Vec::new();
@@ -291,6 +303,7 @@ impl PngEncoder {
         let mut enc = Self {
             width,
             height,
+            bpp,
             rows_pushed: 0,
             ring,
             head,
@@ -460,7 +473,8 @@ impl PngEncoder {
 
     /// Push one scanline: exactly `width * 3` bytes, R,G,B per pixel, top row first.
     pub fn push_row(&mut self, rgb: &[u8]) -> Result<(), PngError> {
-        if rgb.len() != self.width as usize * 3 {
+        let bpp = self.bpp as usize;
+        if rgb.len() != self.width as usize * bpp {
             return Err(PngError::BadRowLength);
         }
         if self.rows_pushed >= self.height {
@@ -469,7 +483,7 @@ impl PngEncoder {
         let mut f = core::mem::take(&mut self.filt);
         f[0] = 1; // filter type 1: Sub
         for i in 0..rgb.len() {
-            f[1 + i] = if i >= 3 { rgb[i].wrapping_sub(rgb[i - 3]) } else { rgb[i] };
+            f[1 + i] = if i >= bpp { rgb[i].wrapping_sub(rgb[i - bpp]) } else { rgb[i] };
         }
         self.feed(&f);
         self.filt = f;
@@ -513,7 +527,7 @@ impl PngEncoder {
             ihdr[0..4].copy_from_slice(&self.width.to_be_bytes());
             ihdr[4..8].copy_from_slice(&self.height.to_be_bytes());
             ihdr[8] = 8;
-            ihdr[9] = 2;
+            ihdr[9] = if self.bpp == 4 { 6 } else { 2 };
             push_chunk(out, b"IHDR", &ihdr);
             self.head_sent = true;
             return true;
@@ -764,4 +778,26 @@ impl Verify {
     fn ok(&self, raw_in: u64, enc_adler: u32) -> bool {
         self.state == 4 && self.out == raw_in && (((self.b % ADLER_BASE) << 16) | (self.a % ADLER_BASE)) == self.want && self.want == enc_adler
     }
+}
+
+/// APPRES (B398): encode a whole straight-RGBA image (`width * height * 4` bytes) as one PNG (colour type 6).
+pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, PngError> {
+    let mut e = PngEncoder::new_rgba(width, height)?;
+    let row = width as usize * 4;
+    if rgba.len() != row * height as usize {
+        return Err(PngError::BadRowLength);
+    }
+    let mut out = Vec::new();
+    let mut piece = Vec::new();
+    for r in rgba.chunks_exact(row) {
+        e.push_row(r)?;
+        while e.ready() && !e.finished() && e.next_piece(&mut piece) {
+            out.extend_from_slice(&piece);
+        }
+    }
+    e.finish()?;
+    while e.next_piece(&mut piece) {
+        out.extend_from_slice(&piece);
+    }
+    Ok(out)
 }

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- A program without its own icon (UnaOS's own design): an outlined diamond on a grey tile. -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#8a919c"/>
+<polygon points="32,12 52,32 32,52 12,32" fill="none" stroke="#ffffff" stroke-width="5" stroke-linejoin="round"/>
+<circle cx="32" cy="32" r="5" fill="#ffffff"/>
+</svg>

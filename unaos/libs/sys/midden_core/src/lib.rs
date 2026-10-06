@@ -1797,3 +1797,6 @@ mod appres_tests {
         assert_eq!(app_res(b"\x7fELF"), None);
     }
 }
+
+/// `una_abi::APP_RES_SECTION`: the resource note's section name.
+pub const APPRES_SECTION_NAME: &str = ".note.unaos.res";
