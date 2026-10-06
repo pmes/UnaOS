@@ -798,3 +798,21 @@ the startup volume: on this firmware that is the operator's `bless` from Recover
 (R3, rmbp-ledger A4). And whether this machine's picker lists a FAT volume that is not ESP-typed is a
 **firmware fact we have not measured** — `docs/dev/OS/10_INSTALL/partition-install.md` marks it
 metal-unproven and `--as-esp` exists as the answer if it turns out to be required.
+
+### The sacred boot FAT, enforced at the FAT layer (BOOTFATSEAM, rmbp-ledger B453 — SECREVIEW F3)
+
+R99: the boot FAT is read-only for every principal, root included. ROOTDISK2 (B401) and SMALLFIX3 (B416) enforced it
+on the VFS path only (`FatBackend::authorize_write` / `write_veto`); a raw `FatFs` never passed it. Now, once
+`bootdisk::bind_root` binds an x86 native UnaFS root, `fs::bootfat` holds the boot FAT's `BlockSource` and the FAT
+layer itself asks it: `FatFs::write_veto` answers R99 first (the question every raw writer already asks), and
+`fat::write_sector` / `write_sectors` refuse a write to that medium while the gate is shut (`[boot] fat raw write
+refused … (R99: sacred; a direct writer) ::`, counted). `fat_unlock` opens both layers, takes a typed
+`Writer::{Installer, Updater}` and asks `users::admin_authority`. The former direct writers: `USERS.DAT` and the
+holocron store (`BTBOND.DAT`) are kernel-owned leaves of UnaFS `/system` (`fs::sysleaf`: stamped `owner=kernel`
+before a byte lands; a leaf without that owner is never adopted), migrated ONCE from the FAT at the first users pass
+after the root binds — the FAT copy is left read-only for the installer's bare-boot path; the FAT-LFN boot witness
+SKIPs `reason=r99-sacred`; `src extract` onto the boot FAT is refused by its own veto. Witness: `tests bootfatseam` →
+`:: BOOTFATSEAM: direct_writers=0 users=unafs holocron=unafs lfn=skip fat_unlock=authority -> PASS ::`.
+Not claimed: `/system` itself is still public under the native ACL (a program may create OTHER names there —
+ROOTACL, B456); a FAT-root boot (no UnaFS) keeps its FAT stores, by R99's own scope; the FAT-LFN witness still runs at
+boot on a FAT-root boot (R80, owed to its knob).

@@ -37,3 +37,11 @@ already asks `FatFs::write_veto()` — which forwards to `BlockSource::write_vet
 - `[hcron] seat store=unafs:/system/BTBOND.DAT src=<...> ::` (holocron knob)
 - `[boot] fat raw write refused source=<src> lba=<n> site=<write_sector|write_sectors> (R99: sacred; a direct writer) ::` (must NOT appear)
 - `tests bootfatseam` → `:: BOOTFATSEAM: direct_writers=0 users=unafs holocron=unafs lfn=skip fat_unlock=authority -> PASS ::`
+
+## Landed (tail)
+- M1 a2852510-line: `fs/sysleaf.rs`; users `seat_on_root`/`seat_with`/`flush_unafs`; holocron `seat_read`/`seat_publish`.
+- M2: `bootfat::{arm_on, veto_source, raw_guard, Writer, SACRED_VETO}`; `fat.rs` same-line folds (write_sector, write_sectors,
+  FatFs::write_veto, FAT-LFN); `bootdisk.rs` `arm` -> `arm_on(src, …)`.
+- M3: `tests bootfatseam`; SECURITY.md §BOOTFATSEAM.
+- Owed: `/system`'s own ACL (ROOTACL B456); `src extract` onto UnaFS (today: refused by R99 on a native root);
+  the FAT-LFN witness at boot on a FAT-root boot (R80); no x86 updater exists yet to hold `Writer::Updater`.

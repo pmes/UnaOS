@@ -462,5 +462,5 @@ pub fn arg() -> Option<alloc::string::String> { ARG.lock().clone() }
 /// the fixtures SKIP or FAIL with their reason from the mounted tree.
 fn ensure_volumes() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if !DONE.swap(true, Ordering::AcqRel) { register("volumes", crate::fs::volumes::selftest); register("testf", crate::fs::volumes::testf_selftest); register("rootdisk", crate::fs::rootdisk::selftest); register("bootfat", crate::fs::bootfat::selftest); }
+    if !DONE.swap(true, Ordering::AcqRel) { register("volumes", crate::fs::volumes::selftest); register("testf", crate::fs::volumes::testf_selftest); register("rootdisk", crate::fs::rootdisk::selftest); register("bootfat", crate::fs::bootfat::selftest); register("bootfatseam", crate::fs::bootfat::bootfatseam_selftest); }
 }
