@@ -33,7 +33,7 @@ table (open + seek, over the kernel's `VfsSrc`), and the hda_play/player docs dr
 
 **Witness (the wire a metal boot prints).** A scrub from the Player on an Ogg or ADTS file:
 `[play] seek to_ms=<n> landed_ms=<n> method=table table=<ogg|adts> exact=1 byte=<n> sample=<n> jid=<n>`;
-`tests player` → `[player] coded seek path=/system/test-f/TEST.OGG table=ogg exact=1 to_ms=1000 landed_ms=1000 …`
+`tests player` → `[player] coded seek path=/system/test-f/TEST.OGG table=ogg exact=1 to_ms=200 landed_ms=200 byte=<n> sample=<n>`
 (and TEST.OPUS, TEST.AAC) then `:: PLAYER: open=ok transport=ok seek=ok method=table … coded=ogg:table,opus:table,adts:table -> PASS ::`;
 a WebM with an Opus track: `[vplay] sound container=matroska codec=opus rate=48000 ch=<n> … -> play-dec`.
 

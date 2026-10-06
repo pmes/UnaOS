@@ -16,7 +16,7 @@
 //! * The play stays the HDA driver's (`drivers/hda_play.rs`, its PLAYER tail: `pause`, `seek_to`, `position_ms`,
 //!   `facts`). A seek is `method=table`: a WAV's byte offset (`table=pcm`), a coded file's container index through
 //!   `audio_core::Decoder::seek` in the `play-dec` job (SEEKTABLE B433: `table=flac|xing|vbri|cbr|mp4`); a format
-//!   with no table there (Ogg, ADTS) is `method=decode-skip table=none`.
+//!   with no table there is `method=decode-skip table=none` (Ogg and ADTS have one since SEEKTABLE2, B469: `table=ogg|adts`).
 //! * F7/F8/F9 (previous / play-pause / next) reach [`media_key`] from `status::volkey_usage` (atomics only); the
 //!   next pass acts and arms BEZEL's play/pause glyph. With no player open the keys do nothing (said once).
 //! * The info line reads ATTRCOLUMNS' `media:duration_ms` / `media:codec` through `get_attr`; without them, the
@@ -928,15 +928,16 @@ pub fn fixture() {
     if let Some(c) = scratch {
         let _ = mt.unlink(&c, p);
     }
-    let ok = open_ok && transport_ok && seek_ok && shared && close_stops;
+    let (coded, coded_ok) = coded_tables(); // SEEKTABLE2 (B469): Ogg and ADTS seek from their own data
+    let ok = open_ok && transport_ok && seek_ok && shared && close_stops && coded_ok;
     let w = |b: bool| if b { "ok" } else { "bad" };
     serial_println!(
         "[player] fixture path={} ran={} paused={} resumed={} seek={:?} vol={}->{} {} ",
         path, ran as u8, paused_ok as u8, resumed_ok as u8, sk, l0, target, amp
     );
     serial_println!(
-        ":: PLAYER: open={} transport={} seek={} method={} volume={} close_stops={} -> {} ::",
-        w(open_ok), w(transport_ok), w(seek_ok), sk.map(|v| v.1).unwrap_or("none"), if shared { "shared" } else { "split" }, close_stops as u8,
+        ":: PLAYER: open={} transport={} seek={} method={} volume={} close_stops={} coded={} -> {} ::",
+        w(open_ok), w(transport_ok), w(seek_ok), sk.map(|v| v.1).unwrap_or("none"), if shared { "shared" } else { "split" }, close_stops as u8, coded,
         if ok { "PASS" } else { "FAIL" }
     );
 }
@@ -1174,4 +1175,45 @@ mod vid {
             f.as_ref().map(|f| f.codec).unwrap_or("-"), if ok { "PASS" } else { "FAIL" }
         );
     }
+}
+
+// ── SEEKTABLE2 (rmbp-ledger B469) — `tests player` reads the coded tables (Ogg Vorbis, Ogg Opus, ADTS) ────────────
+
+/// Each staged coded sample through the core's own index (`play::table_probe_*`, on a worker task): its `[player]
+/// coded seek` line and the token `ogg:table,opus:table,adts:table` (`:none` = decode-skip, `:-` = not staged).
+/// `ok` = every staged one answered from a table.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn coded_tables() -> (String, bool) {
+    use crate::drivers::hda::play;
+    let mt = crate::shell::vfs_mount_table();
+    let mut tok = String::new();
+    let mut ok = true;
+    for (name, key, want) in [("TEST.OGG", "ogg", "ogg"), ("TEST.OPUS", "opus", "ogg"), ("TEST.AAC", "adts", "adts")] {
+        if !tok.is_empty() {
+            tok.push(',');
+        }
+        let Some(path) = crate::fs::volumes::testf_find(&mt, name) else {
+            tok.push_str(key);
+            tok.push_str(":-");
+            continue;
+        };
+        play::table_probe_start(&path, 200);
+        let done = play::pump_until(3000, || play::table_probe_done().is_some());
+        let v = play::table_probe_done();
+        let good = matches!(v, Some(Ok((t, true, _, _, _))) if t == want);
+        match &v {
+            Some(Ok((t, e, l, b, s))) => serial_println!("[player] coded seek path={} table={} exact={} to_ms=200 landed_ms={} byte={} sample={}", path, t, *e as u8, l, b, s),
+            Some(Err(e)) => serial_println!("[player] coded seek path={} refused ({})", path, e),
+            None => serial_println!("[player] coded seek path={} timeout=3000ms done={}", path, done as u8),
+        }
+        ok &= good;
+        tok.push_str(key);
+        tok.push_str(if good { ":table" } else { ":none" });
+    }
+    (tok, ok)
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "hda-tone")))]
+fn coded_tables() -> (String, bool) {
+    (String::from("-"), true)
 }
