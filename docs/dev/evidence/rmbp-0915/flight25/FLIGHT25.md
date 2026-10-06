@@ -1,0 +1,22 @@
+# FLIGHT 25 — image 18 on the UNAFS CARD IMAGE (rmbp12flight25, hw-rmbp@9c3271db), 2026-10-06, main bench — Peter's "boot 25"
+
+Capture: `f25-boots.log` (one boot; the flight ends with the shell wedged by `tests play flac`, the GUI alive). Medium: the dd'd card image. Knob line unchanged since image 15. Tree = flight 24's flown c237d6fd + the cloud's a0486e00 (removable media are volumes while inserted; filed as **R95**). The cloud had NOT read flight 24 when this tree was cut. The seat typed 31 lines over the serial door. New on the bench: Peter's USB hub with a 64 GB stick (MBR) and the net dongle.
+
+## Peter, verbatim (the glass)
+- "can't get past root set password. error, could not save pw"
+- "unplugged the stick, pw saved, desktop, replugged stick, nothing in volumes. let me know what else i need to do"
+- (to the seat and the cloud) "we were able to do a truly stunning amount of work last week because of our running more efficiently please keep it up. no more blowing through credits" → **R96**.
+
+## 1. Green (the same as flight 24's third card, re-proven)
+`INSTALLBARE … windows=0 first_key_ms=0 key_max_ms=1 keys=60 -> PASS` · `LOGINFURN at_login windows=0 services=0 console_prefill_lines=16 -> PASS` · `QUIETBOOT lines=147 -> PASS` · `VOLUMES shown=UnaOS,boot efi=boot/efi … removable=- -> PASS` · `BRIGHTSTEP slider_sync=ok -> PASS` · `KVBLANK8 lost_at=none isr_calls=58 -> PASS` · `TESTF 24/24`, `OPENERS opened=22 cores=22/22 owed=WEBM,MP4` · `NOTICE typed_through=ok` · `PWWIRE hits=0` · `LINUXABI-KAT2 checks=26 fail=0 -> PASS` · `SELFBUILD4 rust=ok threads=4` · `KERNELFONT faces=10` · `LUMENCRASH first_line=67 -> PASS`, `LUMENUX … font=dejavu-sans` · `PLAYWAV … under=0 -> PASS` · `EXECNAME 6/6` · `UNAFSX86-T` · `HOLOCRON` · `SELFDIAG fails=0` · storm coherent. 31 typed lines, none eaten.
+
+## 2. Findings
+- **USBSLOT (the password that would not save)**: with the stick on the hub at boot, `:: STORSLOT: claim slot=4 … mass-storage record taken`, `[usbw] scratch geometry: USB last_lba=124735487 … [mbr-partition-table]`, then `:: FR: UNAOS.LOG NOT reserved — the block layer refuses Default WRITEs here (the global slot is not the medium this kernel booted from)` and `[login] set-password user=root NOT written reason=volume (the form stays)` ×2. Peter unplugged the stick → the save landed, `login ok`. A plugged-in USB disk took the block layer's write path away from the boot medium; the users store on the boot card became unwritable. Replugged after login: `STORSLOT: claim slot=6`, and `BOOT80 … users_store=nomount` — the store is unmountable again while the stick is in. The boot medium's slot must never be displaced by a hot or cold USB disk.
+- **USBVOL (R95 unmet)**: the replugged stick is claimed (`slot=6 … diag=armed`) and NOTHING mounts it — no `[volumes]` line, `VOLUMES … removable=-`; Peter: "nothing in volumes". The cloud's a0486e00 taught the gate to accept a mounted removable; there is no path that mounts one.
+- **NODONGLE**: `USBNET7 … reason=no-dongle -> SKIP`, `NETCLOCK -> SKIP reason=no-dongle` — the net dongle was not enumerated at all this boot (it is on the hub with the stick; flight 24 saw it directly on the port).
+- **DECJOBHANG reproduced on a clean boot**: `tests play flac` → `[play] dec spawn path=/system/test-f/TEST.FLAC jid=1 stack=65536 cpu=0` and nothing more; the shell never returned; `tests play mp3` was never taken. Same as flight 24. The GUI lived.
+- **QUARRY2 columns=FAIL** (second flight), **GPUBLIT timeout** (expected), **WEBM/MP4** no opener.
+- **R95 id clash**: the cloud wrote its 2026-10-06 ruling as R91 while the seat's R91–R94 were already pushed; filed as R95 with its citations repointed (the merge e1f79a73/9c3271db).
+
+## 3. Owed (the cloud's, in Peter's order)
+USBSLOT first (the boot medium keeps the write path; a USB disk is never the global slot), USBVOL (mount a removable when it attaches, before or after boot, and show it in Volumes — R95), NODONGLE on the hub, DECJOBHANG (unchanged from flight 24), then flight 24's list (R93 DESKTOPBUILT, INPUTSTALL, R91/R93/R94, QUARRY2 columns, BOOT80 bound, WEBM/MP4, GPUBLIT). R96 binds the pace.
