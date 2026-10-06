@@ -14324,7 +14324,7 @@ impl XhciController {
             if pstatus & 1 == 0 {
                 continue; // nothing connected
             }
-            crate::bootlog_println!("xHCI: HUB slot {} port {}: device connected; enumerating...", hub_slot, port);
+            hubwit_connected(hub_slot, port); crate::bootlog_println!("xHCI: HUB slot {} port {}: device connected; enumerating...", hub_slot, port);
             if let Some(mut speed) = self.reset_downstream_port(hub_slot, port, buf, is_ss) {
                 // ORIN-USB-FIX (R22 sitting-2): a SuperSpeed hub's wPortStatus does NOT carry
                 // the USB2 LS/HS speed bits — bit 9 is PORT_POWER on an SS hub, which
@@ -14354,7 +14354,7 @@ impl XhciController {
         // plugged into a downstream port AFTER this one-shot boot walk is noticed (its change
         // bitmap raises an interrupt-IN completion, serviced by service_hub_changes). Boot-present
         // devices were already enumerated by the walk above; this covers everything after.
-        self.configure_hub_interrupt_ep(hub_slot);
+        self.hubwit_report(hub_slot); self.configure_hub_interrupt_ep(hub_slot);
 
         crate::bootlog_println!("xHCI: === HUB slot {} bring-up complete ===", hub_slot);
     }
@@ -14809,7 +14809,7 @@ impl XhciController {
                     }
                     let child_route = hub_route | (((port as u32).min(15)) << (4 * hub_depth));
                     let child_depth = hub_depth + 1;
-                    self.enumerate_downstream(hub_slot, port, root_hub_port, child_route, child_depth, speed);
+                    hubwit_connected(hub_slot, port); self.enumerate_downstream(hub_slot, port, root_hub_port, child_route, child_depth, speed); self.hubwit_report(hub_slot);
                 } else {
                     crate::bootlog_println!("xHCI: HUB slot {} port {} did not enable after reset; leaving unconfigured.", hub_slot, port);
                 }
@@ -15334,7 +15334,7 @@ impl XhciController {
         // kbd+mouse dongle: keyboard on iface0, mouse on iface1) that lands behind a hub arms
         // both, not just the first interface. Then configure them together in one
         // Configure-Endpoint (root_fsm = false: this is the hub-downstream FSM).
-        if self.record_hid_interfaces(slot_id, buf) {
+        #[cfg(feature = "usbnet")] { if self.usbnet_downstream(slot_id as u8) { return; } } if self.record_hid_interfaces(slot_id, buf) {
             self.configure_hid_endpoints(slot_id, false);
         } else {
             crate::bootlog_println!("xHCI: HUB downstream slot {}: no HID interrupt endpoint", slot_id);
@@ -17276,7 +17276,7 @@ impl XhciController {
             let wait_trb_phys = {
                 let ring = match self.slots[slot as usize].bulk_in_ring.as_mut() { Some(r) => r, None => return };
                 let base = ring.get_ptr();
-                match ring.push(Trb { parameter: rx_phys, status: usbnet::rx_len() as u32, control: (1 << 10) | (1 << 5) }) {
+                match ring.push(Trb { parameter: rx_phys + td_off as u64, status: td_len as u32, control: (1 << 10) | (1 << 5) }) {
                     Ok(idx) => base + (idx as u64) * core::mem::size_of::<Trb>() as u64,
                     Err(_) => return,
                 }
@@ -17656,3 +17656,132 @@ impl XhciController {
         Some(u32::from_le_bytes(b))
     }
 }
+
+// ===================== USBNET9 (rmbp-ledger B385) — NODONGLE: a USB-net device behind a hub =====================
+//
+// Flight 25: the dongle on the hub beside the stick was never a link (`USBNET7 … reason=no-dongle`, `XHCIHUB …
+// downstream=2`, one STORSLOT claim). Read: `enumerate_downstream` knew hub, mass storage and HID; the USB-net hooks
+// (`note_device`, the config walk, `usbnet_after_walk`) ride only the root port's async FSM, so a dongle behind ANY hub
+// found "no HID interrupt endpoint" and was left unconfigured. Direct, the root path claimed it. `usbnet_downstream` is
+// the synchronous twin of that root walk (same `usbnet::` hooks, same order); the class bring-up is the root path's
+// (`service_usbnet` → `usbnet_bringup`: SET_CONFIGURATION, the register walk). One line per hub walk names every
+// connected port's outcome: `[xhci] hub slot=<n> ports=<n> enumerated=[<port>:<msc|net|hub|vid:pid|none>@<slot>,…]`.
+#[cfg(feature = "usbnet")]
+impl XhciController {
+    /// Called by `enumerate_downstream` for a device that is neither a hub nor mass storage, before the HID walk.
+    /// `true` = this slot is the USB-net link's (configured, bring-up pending, or refused and named); `false` = not a
+    /// USB-net device, the HID walk proceeds as before.
+    fn usbnet_downstream(&mut self, slot_id: u8) -> bool {
+        let buf = self.slots[slot_id as usize].descriptor_buffer as u64;
+        if buf == 0 {
+            return false;
+        }
+        unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 18); }
+        if self.sync_control(slot_id, 0x80, 0x06, 0x0100, 0, 18, buf, true).is_err() || self.last_control_len < 18 {
+            return false;
+        }
+        let (class, ncfg, vid, pid) = unsafe {
+            let p = buf as *const u8;
+            (*p.add(4), *p.add(17), (*p.add(8) as u16) | ((*p.add(9) as u16) << 8), (*p.add(10) as u16) | ((*p.add(11) as u16) << 8))
+        };
+        usbnet::note_device(slot_id, class, ncfg, vid, pid);
+        if class != 0x00 && !usbnet::device_class_wants_walk(class) {
+            return false;
+        }
+        for idx in 0..2u8 {
+            unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 256); }
+            if self.sync_control(slot_id, 0x80, 0x06, 0x0200 | idx as u16, 0, 256, buf, true).is_err() {
+                return false;
+            }
+            let d = unsafe { core::slice::from_raw_parts(buf as *const u8, 256) };
+            let total = (((d[2] as usize) | ((d[3] as usize) << 8)).min(self.last_control_len as usize)).min(256);
+            usbnet::note_config_header(slot_id, d[5]);
+            let (mut is_net, mut bulk_in, mut bulk_out) = (false, None, None);
+            let mut off = 0usize;
+            while off + 2 <= total {
+                let len = d[off] as usize;
+                if len == 0 { break; }
+                let ty = d[off + 1];
+                if ty == 0x04 && off + 8 <= total {
+                    if usbnet::note_interface(slot_id, d[off + 2], d[off + 3], d[off + 5], d[off + 6], d[off + 7]) { is_net = true; }
+                } else if ty == 0x05 && is_net && off + 6 <= total && (d[off + 3] & 0x03) == 0x02 {
+                    let (addr, mps) = (d[off + 2], ((d[off + 4] as u16) | ((d[off + 5] as u16) << 8)) & 0x07FF);
+                    if addr & 0x80 != 0 { bulk_in = Some((addr, mps)); } else { bulk_out = Some((addr, mps)); }
+                    usbnet::note_bulk_ep(slot_id, addr, mps);
+                } else if ty == 0x24 && off + len <= total {
+                    usbnet::note_cs(slot_id, &d[off..off + len]);
+                }
+                off += len;
+            }
+            let (bulk_in, bulk_out) = usbnet::first_bulk(slot_id, bulk_in, bulk_out);
+            if is_net && usbnet::walk_is_candidate(slot_id) {
+                let (Some((ia, im)), Some((oa, om))) = (bulk_in, bulk_out) else {
+                    serial_println!(":: USBNET: hub-downstream candidate slot={} has no bulk pair (in={:?}, out={:?}) — skipping device ::", slot_id, bulk_in, bulk_out);
+                    usbnet::disconnect(slot_id);
+                    return true;
+                };
+                usbnet::taken(slot_id, im, om);
+                if !self.configure_bulk_endpoints_sync(slot_id, ia, im, oa, om) {
+                    serial_println!(":: USBNET: hub-downstream slot={} Configure-Endpoint refused — the link stays down ::", slot_id);
+                    usbnet::disconnect(slot_id);
+                    return true;
+                }
+                usbnet::configured(slot_id);
+                serial_println!(":: USBNET: hub-downstream slot={} vidpid={:04x}:{:04x} endpoints configured — bring-up pending ::", slot_id, vid, pid);
+                return true;
+            }
+            match usbnet::other_config(slot_id) {
+                Some(1) if idx == 0 => continue,
+                _ => return false,
+            }
+        }
+        false
+    }
+}
+
+/// The hub whose walk is being witnessed, and the ports of it that had a device connected (bit N = port N).
+static HUBWIT_HUB: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static HUBWIT_MASK: AtomicU32 = AtomicU32::new(0);
+/// A connected downstream port is about to be reset and enumerated.
+fn hubwit_connected(hub_slot: u8, port: u8) {
+    if HUBWIT_HUB.swap(hub_slot, Ordering::Relaxed) != hub_slot {
+        HUBWIT_MASK.store(0, Ordering::Relaxed);
+    }
+    if port < 32 { HUBWIT_MASK.fetch_or(1 << port, Ordering::Relaxed); }
+}
+impl XhciController {
+    /// USBNET9 M4: `[xhci] hub slot=<n> ports=<n> enumerated=[<port>:<kind>@<slot>,…]` — what each connected port became.
+    fn hubwit_report(&mut self, hub_slot: u8) {
+        let mask = if HUBWIT_HUB.load(Ordering::Relaxed) == hub_slot { HUBWIT_MASK.swap(0, Ordering::Relaxed) } else { 0 };
+        let mut list = alloc::string::String::new();
+        for port in 1..32u8 {
+            if mask & (1 << port) == 0 { continue; }
+            let child = (1..self.slots.len()).find(|&i| {
+                let s = &self.slots[i];
+                s.active && s.is_downstream && s.parent_hub_slot == hub_slot && s.parent_hub_port == port
+            });
+            if !list.is_empty() { list.push(','); }
+            let _ = match child {
+                None => core::fmt::Write::write_fmt(&mut list, format_args!("{}:none", port)),
+                Some(i) => {
+                    let s = &self.slots[i];
+                    let kind = if self.storage_ix(i as u8).is_some() {
+                        alloc::string::String::from("msc")
+                    } else if hubwit_is_net(i as u8) {
+                        alloc::string::String::from("net")
+                    } else if s.hub_nbr_ports != 0 || self.hubs_pending.contains(&(i as u8)) {
+                        alloc::string::String::from("hub")
+                    } else {
+                        alloc::format!("{:04x}:{:04x}", s.vid, s.pid)
+                    };
+                    core::fmt::Write::write_fmt(&mut list, format_args!("{}:{}@{}", port, kind, i))
+                }
+            };
+        }
+        serial_println!("[xhci] hub slot={} ports={} enumerated=[{}]", hub_slot, self.slots[hub_slot as usize].hub_nbr_ports, list);
+    }
+}
+#[cfg(feature = "usbnet")]
+fn hubwit_is_net(slot: u8) -> bool { usbnet::is_link_slot(slot) }
+#[cfg(not(feature = "usbnet"))]
+fn hubwit_is_net(_slot: u8) -> bool { false }
