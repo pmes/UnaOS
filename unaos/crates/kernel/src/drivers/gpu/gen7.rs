@@ -7361,9 +7361,20 @@ mod ladder {
 
     fn witness(wake: &str, r7: &str, us: u64, replay: bool) {
         let pass = r7 == "r7-blit-verified";
+        // GEN7WAKE (B489): an ack-confirmed wake reads `wake=acked`; an UNACKED wake withholds every
+        // write behind it by design, so the ladder DECLINES with the reads that prove it, not FAIL.
+        let word = if wake == "gt-woke" { "acked" } else { wake };
+        if !pass && wake == "gt-woke-noack" {
+            let (ack, eco, rc, why) = super::wake_decline().unwrap_or((0, 0, 0, "no-wake-record"));
+            serial_println!(
+                ":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={} -> DECLINED reason={} ack=130040:{:08X} ecobus={:08X} rc={} ::",
+                word, r7, us, replay as u32, why, ack, eco, rc
+            );
+            return;
+        }
         serial_println!(
             ":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={} -> {} ::",
-            wake, r7, us, replay as u32, if pass { "PASS" } else { "FAIL" }
+            word, r7, us, replay as u32, if pass { "PASS" } else { "FAIL" }
         );
     }
 
@@ -7473,4 +7484,9 @@ fn wake_witness(h: &FwHold, rc_entry: u32, ecobus: u32, live: bool) {
         reason
     );
     *WAKE_WIT.lock() = Some((h.ack_post, ecobus, rc_entry & 7, reason));
+}
+
+/// The ladder's DECLINED reason for an unacked wake: the reads that prove it.
+fn wake_decline() -> Option<(u32, u32, u32, &'static str)> {
+    *WAKE_WIT.lock()
 }
