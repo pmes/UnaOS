@@ -22,8 +22,8 @@ FORBID :: USBNET: link down
 # e1000e's netdev hands out 10.0.2.20 and is not attached on this leg at all (FORBID below), so the
 # lease address is the proof that DHCP, and everything after it, went through the dongle.
 REQUIRE :: SOCK-5: smoltcp dhcpv4 lease 10\.0\.2\.30/24 gw 10\.0\.2\.2 — witness OK ::
-REQUIRE :: SOCK-1: smoltcp icmp echo 10\.0\.2\.2 4/4 replies — witness OK ::
-REQUIRE :: SOCK-2: smoltcp udp dns query 10\.0\.2\.3:53 -> \d+ bytes back — witness OK ::
+# INPUTSTALL2 M4 (B388, R80): moved under `tests sock` — the ladder no longer runs at boot; was: REQUIRE :: SOCK-1: smoltcp icmp echo 10\.0\.2\.2 4/4 replies — witness OK ::
+# INPUTSTALL2 M4 (B388, R80): moved under `tests sock` — the ladder no longer runs at boot; was: REQUIRE :: SOCK-2: smoltcp udp dns query 10\.0\.2\.3:53 -> \d+ bytes back — witness OK ::
 REQUIRE :: SOCK-2: ring-3 udp round-trip — socket/bind/sendto OK, recvfrom returned a datagram FROM 10\.0\.2\.3:53, socket teardown clean -> PASS ::
 REQUIRE :: SOCK-4: transferable sockets — grantee received \+ round-tripped the moved socket, .* -> PASS ::
 FORBID \[e1000\] up:

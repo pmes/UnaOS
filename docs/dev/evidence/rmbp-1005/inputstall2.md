@@ -42,3 +42,18 @@ the network drive seam (`net_tick.rs`, which already owns the off-render net wor
 press is the console window's open (prefill + composite), DESKTOPBUILT's furniture. VUGFITS strand_pct is
 measured by the flight with M1–M3 in. The SOCK ladder belongs in `tests` (R80); M3 only takes it off the
 input path.
+
+**M4 (the seat's ruling, R80): the SOCK ladder is a test — `tests sock`.** The ladder (SOCK-1 icmp, SOCK-2 udp
+dns, SOCK-3 tcp, SOCK-6/7 listener, SOCK-8 dns) no longer runs at boot on either path: `tests sock` arms it
+(`[tests] sock armed path=<e1000-inline|net-tick> …`) and the next net pass runs it where M3 put it (e1000:
+inline in `service_net`, its order unchanged; no e1000: `net-tick`, which then prints `[net] ladder
+on=net-tick`). The lease (SOCK-5, `dhcp_link_tick`/`dhcp_acquire`) is the stack's service and is untouched.
+Spec lines that change (R78: QEMU proves nothing; named so the bench's QEMU lanes are not surprised):
+- `scripts/specs/x86-usbnet.spec` — the `REQUIRE :: SOCK-1: smoltcp icmp echo … 4/4 replies` and
+  `REQUIRE :: SOCK-2: smoltcp udp dns query …` lines are commented out (moved under `tests sock`); a lane
+  that wants them types `tests sock` and re-pins them.
+- `scripts/banner-cert.sh:285` — `smolnet|:: SOCK-1: smoltcp icmp echo|-|measured(1)` seeds the smolnet banner
+  cert on the boot SOCK-1 line, which no longer prints at boot: OWED to the seat (re-seed on SOCK-5 or
+  `[tests] sock armed`). Not edited here.
+- Not affected: `SOCK-2: ring-3 udp round-trip` and `SOCK-4` (u-probe fixtures in syscall.rs, not this
+  ladder), `SOCK-5` (the lease).
