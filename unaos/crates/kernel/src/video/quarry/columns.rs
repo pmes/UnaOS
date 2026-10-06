@@ -222,6 +222,7 @@ fn load(st: &mut ColState) {
 /// pass — chained from `live::service`, never from a router.
 pub fn service() {
     super::attrcols::service(); // ATTRCOLUMNS (B402): the listed folder's facts, a few files a pass
+    super::folderview::service(); // FOLDERVIEW (B424): the View menu's latch, the window frame, the folder's latched view write
     if !PERSIST.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -456,6 +457,7 @@ pub(super) fn after_show(m: &mut Model) {
     let mut st = COLS.lock();
     load(&mut st);
     st.trash = is_trash(&m.cwd);
+    super::folderview::enter(&m.cwd, &mut st); // FOLDERVIEW (B424): a new folder resolves its own view (own, inherited, default)
     if m.list.is_empty() {
         st.meta.clear();
         return;
@@ -468,6 +470,7 @@ pub(super) fn after_show(m: &mut Model) {
     };
     st.meta = compute_meta(&mt, &m.cwd, &m.list, &origins);
     super::attrcols::after_meta(&mt, &m.cwd, &m.list, &mut st.meta); // ATTRCOLUMNS (B402): the folder's attribute columns and their cells
+    super::folderview::after_attrs(); // FOLDERVIEW (B424): the folder's attribute-column sort, once its keys are read
     let st = &mut *st;
     resort(m, st);
     let typed = st.meta.iter().filter(|r| r.mime != crate::fs::filetype::OCTET).count();
@@ -493,6 +496,7 @@ pub(super) fn header_press(m: &mut Model, sx: usize) -> bool {
         let st = &mut *st;
         resort(m, st);
         serial_println!("[attrcols] header press col={} sort=attr desc={}", super::attrcols::key_at(i).unwrap_or_default(), st.desc as u8);
+        super::folderview::changed(); // FOLDERVIEW (B424): the folder's sort, latched
         return true;
     }
     let Some(col) = header_hit(&c, sx) else { return false };
@@ -509,7 +513,7 @@ pub(super) fn header_press(m: &mut Model, sx: usize) -> bool {
     }
     let st = &mut *st;
     resort(m, st);
-    PERSIST.store(true, Ordering::Release);
+    super::folderview::changed(); // FOLDERVIEW (B424): the FOLDER's view (the default is `View ▸ Use as Default`)
     serial_println!("[quarry2] header press col={} sort={} desc={}", col.label(), st.key.name(), st.desc as u8);
     true
 }
@@ -542,7 +546,7 @@ pub(super) fn key(c: u8) -> bool {
             st.widths.set(col, nw);
         }
     }
-    PERSIST.store(true, Ordering::Release);
+    super::folderview::changed(); // FOLDERVIEW (B424): the FOLDER's view (the default is `View ▸ Use as Default`)
     serial_println!(
         "[quarry2] key={} sort={} desc={} widths={},{},{},{}",
         c as char, st.key.name(), st.desc as u8, st.widths.size, st.widths.modified, st.widths.ty, st.widths.origin
@@ -646,7 +650,7 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
 pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
-        crate::tests::register("quarry2", selftest);
+        crate::tests::register("quarry2", selftest); super::folderview::ensure_tests(); // FOLDERVIEW (B424): `tests folderview`
         // FACETANIM (B358): `tests facetanim` rides this registration (no tests.rs line).
         #[cfg(feature = "facet")]
         crate::tests::register("facetanim", crate::video::facet::anim::selftest);
@@ -914,4 +918,10 @@ fn lock_glyph(px: &mut [u32], g: &Geom, x: usize, y: usize, max_x: usize, ink: u
     fill(px, g, x + t, top, w.saturating_sub(2 * t), t, ink);
     fill(px, g, x + t, top, t, body_y - top, ink);
     fill(px, g, x + w - 2 * t, top, t, body_y - top, ink);
+}
+
+/// FOLDERVIEW (B424): `View ▸ Use as Default` — the current widths and sort become Principia's default, written on
+/// the next service pass (the same latched write QUARRY2's header press used to make).
+pub(super) fn persist_default() {
+    PERSIST.store(true, Ordering::Release);
 }

@@ -4276,3 +4276,8 @@ pub fn open_at(dir: &str) -> bool {
 pub mod attrcols;
 #[path = "getinfo.rs"]
 pub mod getinfo;
+
+// FOLDERVIEW (B424): a folder remembers its view in attributes on the folder (`una:view.mode/.columns/.sort/.frame`),
+// inherits its parent's, and Quarry's `View` menu carries Use as Default / Reset to Default — a child like `attrcols`.
+#[path = "folderview.rs"]
+pub mod folderview;
