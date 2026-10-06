@@ -265,13 +265,14 @@ mod tests {
     }
 
     #[test]
-    fn lossy_webp_is_refused_by_name() {
-        // RIFF/WEBP with a `VP8 ` (lossy) chunk: pixel_core recognises it and refuses it (VP8CORE owed).
+    fn truncated_lossy_webp_is_refused_by_name() {
+        // RIFF/WEBP with a `VP8 ` (lossy) chunk: pixel_core decodes lossy WebP through vp8_core since VIDEOPLAYER
+        // (B434); this 14-byte frame is cut short, so the refusal names the format and reads `truncated`.
         let mut b = b"RIFF\x1A\0\0\0WEBPVP8 \x0E\0\0\0".to_vec();
         b.extend([0x30, 0x01, 0x00, 0x9D, 0x01, 0x2A, 0x01, 0x00, 0x01, 0x00, 0, 0, 0, 0]);
         assert_eq!(sniff(&b), Some(Format::WebP));
         let e = PixelCoreSource.decode(&b).unwrap_err();
-        assert!(matches!(&e, SourceError::Decode { format: "webp", reason } if reason.contains("lossy")), "{e:?}");
+        assert!(matches!(&e, SourceError::Decode { format: "webp", reason } if reason.contains("truncated")), "{e:?}");
         assert!(e.to_string().starts_with("webp: "), "{e}");
     }
 
