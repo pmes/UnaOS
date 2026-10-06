@@ -49,6 +49,7 @@ pub fn key(act: Action) {
     let up = matches!(act, Action::BrightnessUp);
     // GLASSLAG M3 (B370): the step is judged against the register's known value — a Down that would not
     // darken (the panel already at or below the floor) writes nothing; see `backlight::next_level`.
+    crate::video::bezel::arm(crate::video::bezel::K_BRIGHT); // BEZEL (B405): the bezel shows on every press, at the limit too
     let Some(lv) = crate::video::backlight::stage_step(up) else {
         status::bright_show(crate::video::backlight::level());
         return;
@@ -62,6 +63,8 @@ pub fn key(act: Action) {
 pub fn service() {
     crate::video::backlight::seed_from_hw(); // GLASSLAG M3 (B370): once — the panel's own level, before the first step
     apply(true);
+    crate::video::bezel::ensure_registered(); // BEZEL (B405): `tests bezel`, registered on the desktop pass (R80)
+    crate::video::bezel::service(); // after the write: the bezel reads the register's readback
 }
 
 /// The BRIGHTKEYS key-path fixture (an up step and a down step through the real [`key`] path, no
@@ -73,6 +76,7 @@ pub fn selftest() {
         apply(false);
     }
     status::bright_clear();
+    crate::video::bezel::arm(crate::video::bezel::K_NONE); // BEZEL: the fixture's keys do not flash the bezel
     let _ = crate::video::backlight::stage(prev);
 }
 
