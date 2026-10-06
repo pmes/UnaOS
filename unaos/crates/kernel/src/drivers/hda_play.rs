@@ -352,6 +352,7 @@ fn report() {
 /// The service tick (folded at the top of `probe_after_root`): latched opens, file pump, ring refill.
 pub fn service() {
     super::amp::tick(); // AUDIO8 (B329) M1: the amp's idle hold-off (idle cost: one atomic load)
+    if TQ_LIVE.load(Ordering::Acquire) { tq_tick(); } // DECJOBHANG M3: `tests play`'s queue (idle cost: one atomic load)
     if !ACTIVE.load(Ordering::Acquire) { return; }
     if let Some(p) = PENDING.try_lock().and_then(|mut g| g.take()) { let _ = open_wav(&p); }
     wav_pump(); coded_pump();
@@ -371,7 +372,7 @@ pub fn request_open(path: &str) { *PENDING.lock() = Some(String::from(path)); AC
 pub fn shell_verb(args: &[&str], path: &str, console: &mut crate::console::Console) {
     match args.first().copied() {
         None => console.println("usage: play <file: wav flac ogg opus mp3 aac m4a aiff> | play stop"),
-        Some("stop") => { stop(); dec_stop(); console.println("play: stopped"); }
+        Some("stop") => { let q = { let mut t = TQ.lock(); let n = t.len(); t.clear(); n }; stop(); dec_stop(); console.println(&alloc::format!("play: stopped (tests queue dropped {})", q)); } // DECJOBHANG M3: stop ends the `tests play` queue too
         Some(_) => match open_wav(path) {
             Ok(()) => console.println(&alloc::format!("play: {} — streaming (watch the serial for :: PLAYWAV ::)", path)),
             Err(r) => console.println(&alloc::format!("play: {}: {}", path, r)),
@@ -534,6 +535,7 @@ fn coded_report() { dec_report() }
 /// /home or / for each format; a format with no such file SKIPs. The completion is the ring's drain, as in `tests playwav`.
 pub fn selftest_codecs() {
     const FMTS: [(&str, &str); 8] = [("wav", "WAV"), ("flac", "FLAC"), ("opus", "OPUS"), ("vorbis", "OGG"), ("mp3", "MP3"), ("aac", "AAC"), ("m4a", "M4A"), ("aiff", "AIF")];
+    let t0 = tms(); // DECJOBHANG M3: the shell's time inside this verb (DECJOB shell_blocked_ms)
     let want = crate::tests::arg();
     let mt = crate::shell::vfs_mount_table();
     for (fmt, ext) in FMTS {
@@ -553,30 +555,9 @@ pub fn selftest_codecs() {
             serial_println!(":: PLAYCODEC: fmt={} path=- reason=no-file (put TEST.{} in /home, /system/test-f or /) -> SKIP ::", fmt, ext);
             continue;
         };
-        let jid0 = DEC_GEN.load(Ordering::Acquire); // MP3HANG: a coded play bumps the decoder generation
-        match open_wav(&path) {
-            Ok(()) => {
-                let mut stalled = false;
-                let (mut last, mut gap) = (crate::arch::ms(), 0u64); // MP3HANG: this loop's longest pass (MP3GUARD keys_alive)
-                while ACTIVE.load(Ordering::Acquire) {
-                    let armed0 = DEC_ARMED.load(Ordering::Acquire);
-                    service();
-                    let (_done, _moved, st) = progress();
-                    if st { stalled = true; break; }
-                    delay_us(2_000);
-                    // the one pass that arms the stream runs the HDA bring-up (`start()`), not a decoder: not counted
-                    let now = crate::arch::ms(); if armed0 == DEC_ARMED.load(Ordering::Acquire) { gap = gap.max(now.saturating_sub(last)); } last = now;
-                }
-                if stalled {
-                    let (lp, run_bit, fifo) = { let s = ST.lock(); (s.lpib_last, s.run_bit as u8, s.fifo.len()) };
-                    stop(); dec_stop();
-                    serial_println!(":: PLAYCODEC: fmt={} path={} reason=stalled lpib={} run_bit={} fifo={} -> FAIL ::", fmt, path, lp, run_bit, fifo);
-                }
-                if DEC_GEN.load(Ordering::Acquire) != jid0 { dec_guard(fmt, &path, gap); }
-            }
-            Err(r) => serial_println!(":: PLAYCODEC: fmt={} path={} reason={} -> SKIP ::", fmt, path, r),
-        }
+        TQ.lock().push_back((fmt, path)); // DECJOBHANG M3: queued; the service tick plays them, the shell returns now
     }
+    tq_arm(t0);
 }
 
 // ── MP3HANG (rmbp-ledger B373) — the coded player's decode on its OWN task ──────────────────────────────────────
@@ -595,7 +576,7 @@ pub fn selftest_codecs() {
 /// under 16 KiB); MP3's is under 8 KiB (`decode_frame` 5384). The VFS read under `VfsSrc` runs the same chain the
 /// 32 KiB render task runs today (RENDSTACK measured that task at 15600 high). 64 KiB = the two plus margin;
 /// `[play] dec stack high=` reports the real high-water of every play, so the next flight checks the number.
-const DEC_STACK: usize = 64 * 1024;
+const DEC_STACK: usize = 160 * 1024; // DECJOBHANG (B386): 64 KiB overflowed on metal (flight 24, AAC: `[stack] OVERFLOW task=play-dec … via=df`); measured worst constructor chain mp4::open 40424 + AacSource::new 39496 B (ADTS 39352 + 39528) + the VFS read chain (~16 KiB) ~ 97 KiB, + margin
 /// A decoder that has not advanced in this long while it holds the CPU-side stages (demux/frame/synth) is stalled.
 const DEC_STALL_MS: u64 = 2_000;
 /// The PCM queue between `play-dec` and `feed()`: at most this many bytes decoded ahead (~0.7 s at 48 kHz stereo).
@@ -612,9 +593,10 @@ const STAGE_FRAME: u8 = 3; // inside `next_i32` (the codec's frame decode, synth
 const STAGE_SYNTH: u8 = 4; // our side: downmix / decimate / pack to 16-bit
 const STAGE_DMA: u8 = 5; // the queue is full: waiting on the ring to drain (not a decoder stall)
 const STAGE_DONE: u8 = 6;
+const STAGE_QUEUED: u8 = 7; // DECJOBHANG (B386): spawned, its first instruction not yet run
 
 fn stage_name(s: u8) -> &'static str {
-    match s { STAGE_DEMUX => "demux", STAGE_ARM => "arm", STAGE_FRAME => "frame", STAGE_SYNTH => "synth", STAGE_DMA => "dma", STAGE_DONE => "done", _ => "idle" }
+    match s { STAGE_QUEUED => "queued", STAGE_DEMUX => "demux", STAGE_ARM => "arm", STAGE_FRAME => "frame", STAGE_SYNTH => "synth", STAGE_DMA => "dma", STAGE_DONE => "done", _ => "idle" }
 }
 
 static DEC_STAGE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(STAGE_IDLE);
@@ -667,11 +649,13 @@ fn dec_open(path: &str, wav_reason: String) -> Result<(), String> {
     DEC_STALL.store(0, Ordering::Release);
     DEC_BEATS.store(0, Ordering::Release);
     DEC_HIGH.store(0, Ordering::Release);
-    DEC_STAGE.store(STAGE_DEMUX, Ordering::Release);
-    DEC_BEAT_MS.store(crate::arch::ms(), Ordering::Release);
+    DEC_STAGE.store(STAGE_QUEUED, Ordering::Release); // DECJOBHANG M2: the guard's clock starts at the task's first beat
+    DEC_BEAT_MS.store(tms(), Ordering::Release);
+    DEC_SPAWN_MS.store(tms(), Ordering::Release);
     DEC_LIVE.store(true, Ordering::Release);
-    let cpu = crate::arch::sched::other_dispatching_cpu();
-    serial_println!("[play] dec spawn path={} jid={} stack={} cpu={}", path, jid, DEC_STACK, if cpu == crate::arch::sched::CPU_AUTO { -1 } else { cpu as i64 });
+    let (cpu, on) = dec_cpu();
+    dj_spawned(on == "worker", jid); DEC_CPU.store(if cpu == crate::arch::sched::CPU_AUTO { u32::MAX } else { cpu as u32 }, Ordering::Release);
+    serial_println!("[play] dec spawn path={} jid={} stack={} cpu={} on={}", path, jid, DEC_STACK, if cpu == crate::arch::sched::CPU_AUTO { -1 } else { cpu as i64 }, on);
     crate::arch::sched::spawn_stack("play-dec", dec_task, jid as usize, cpu, crate::arch::sched::PRIO_NORMAL, DEC_STACK);
     ACTIVE.store(true, Ordering::Release);
     Ok(())
@@ -679,7 +663,7 @@ fn dec_open(path: &str, wav_reason: String) -> Result<(), String> {
 
 fn dec_beat(stage: u8) {
     DEC_STAGE.store(stage, Ordering::Release);
-    DEC_BEAT_MS.store(crate::arch::ms(), Ordering::Release);
+    DEC_BEAT_MS.store(tms(), Ordering::Release);
 }
 
 /// The `play-dec` task. Everything that can run long or deep — the container parse, every frame decode, the
@@ -690,6 +674,7 @@ fn dec_task(arg: usize) {
     let mine = || DEC_GEN.load(Ordering::Acquire) == jid && !DEC_ABORT.load(Ordering::Acquire);
     let paint = dec_stack_paint();
     let path = match DEC_OUT.lock().as_ref() { Some(o) if o.jid == jid => o.path.clone(), _ => { dec_exit(jid, paint, "superseded"); return; } };
+    dec_ran(jid);
     dec_beat(STAGE_DEMUX);
     let opened = audio_core::Decoder::open(alloc::boxed::Box::new(VfsSrc { path: path.clone(), off: 0 }));
     let mut dec = match opened {
@@ -707,7 +692,7 @@ fn dec_task(arg: usize) {
     // `[play] open` is printed by `dec_pump` when it arms the stream: no frame is decoded before it is on the wire.
     dec_beat(STAGE_ARM);
     while mine() && !DEC_ARMED.load(Ordering::Acquire) {
-        if crate::arch::ms().saturating_sub(DEC_BEAT_MS.load(Ordering::Acquire)) > DEC_ORPHAN_MS { dec_exit(jid, paint, "never-armed"); return; }
+        if tms().saturating_sub(DEC_BEAT_MS.load(Ordering::Acquire)) > DEC_ORPHAN_MS { dec_exit(jid, paint, "never-armed"); return; }
         crate::arch::sched::sleep_ms(2);
     }
     let ch = info.channels as usize;
@@ -777,8 +762,7 @@ fn dec_exit(jid: u32, paint: Option<(u64, u64)>, why: &str) {
     let high = dec_stack_high(paint);
     DEC_HIGH.store(high, Ordering::Release);
     serial_println!("[play] dec exit jid={} why={} stage={} calls={} stack high={} of {}", jid, why, stage_name(DEC_STAGE.load(Ordering::Acquire)), DEC_CALLS.load(Ordering::Acquire), high, DEC_STACK);
-    if DEC_GEN.load(Ordering::Acquire) == jid { DEC_STAGE.store(STAGE_DONE, Ordering::Release); }
-    DEC_LIVE.store(false, Ordering::Release);
+    if DEC_GEN.load(Ordering::Acquire) == jid { DEC_STAGE.store(STAGE_DONE, Ordering::Release); DEC_LIVE.store(false, Ordering::Release); } // DECJOBHANG M1: a straggler of an older jid never releases the current one
 }
 
 const DEC_PAINT: u8 = 0xC3;
@@ -859,8 +843,9 @@ fn dec_pump() {
 /// the play ends. Returns true when it ended the play.
 fn dec_watch(jid: u32) -> bool {
     let stage = DEC_STAGE.load(Ordering::Acquire);
+    if DEC_LIVE.load(Ordering::Acquire) && stage == STAGE_QUEUED && dec_queued_watch(jid) { return true; }
     if DEC_LIVE.load(Ordering::Acquire) && matches!(stage, STAGE_DEMUX | STAGE_FRAME | STAGE_SYNTH) {
-        let silent = crate::arch::ms().saturating_sub(DEC_BEAT_MS.load(Ordering::Acquire));
+        let silent = tms().saturating_sub(DEC_BEAT_MS.load(Ordering::Acquire));
         if silent > DEC_STALL_MS {
             let (codec, frames) = {
                 let g = DEC_OUT.lock();
@@ -870,6 +855,7 @@ fn dec_watch(jid: u32) -> bool {
             serial_println!("[play] {} stall stage={} frame={} calls={} ms={} -> ABORT", codec, stage_name(stage), frames, DEC_CALLS.load(Ordering::Acquire), silent);
             DEC_STALL.store(stage, Ordering::Release);
             DEC_ABORT.store(true, Ordering::Release);
+            DEC_LIVE.store(false, Ordering::Release); // DECJOBHANG M1: a job the guard ended (a halted task never reaches `dec_exit`) frees the decoder for the next open
             stop();
             dec_end_play();
             return true;
@@ -950,4 +936,130 @@ fn dec_guard(fmt: &str, path: &str, gap_ms: u64) {
         serial_println!("[play] guard fmt={} stall={} keys_alive={} sink_alive={} gap_ms={} beats={} dec_stack_high={} of {}",
             fmt, st, keys_alive as u8, sink_alive as u8, gap_ms, beats, DEC_HIGH.load(Ordering::Acquire), DEC_STACK);
     }
+}
+
+// ── DECJOBHANG (rmbp-ledger B386) — the decoder job's placement, its own clock, and a `tests play` that never ──────
+// blocks the shell. Flights 24/25: `dec spawn … cpu=0` — `other_dispatching_cpu()` is the lowest core that is not the
+// caller's, i.e. always the BSP, the one core that advances `arch::ms()`; every UnaFS read runs masked
+// (`with_unafs`), so the decoder's reads put masked spans on the clock every guard here was measured with, while
+// the shell spun in `tests play` waiting on that clock. Flight 24's reboot: the job ran and overflowed 64 KiB in
+// the AAC constructor, never reached `dec_exit`, and held `DEC_LIVE` for the rest of the boot (every later open
+// "decoder busy"). Design and measurements: docs/dev/evidence/rmbp-1005/decjobhang.md.
+
+/// Milliseconds from the TSC — not the BSP's tick, so a masked or wedged clock core cannot blind the guard.
+fn tms() -> u64 {
+    let hz = crate::arch::apic::tsc_hz();
+    if hz >= 1000 { crate::arch::now_cycles() / (hz / 1000) } else { crate::arch::ms() }
+}
+
+/// `play-dec`'s core: the first worker-pool core (`smp::worker_cpu` — neither the render nor the service core)
+/// that is not the caller's and not the BSP; `CPU_AUTO` (named `on=auto`) only when the pool has none.
+fn dec_cpu() -> (usize, &'static str) {
+    let here = crate::arch::percpu::this_cpu().cpu_index as usize;
+    for n in 0..crate::arch::gdt::MAX_CPUS {
+        match crate::arch::smp::worker_cpu(n) {
+            Some(c) if c != here && c != 0 => return (c, "worker"),
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    (crate::arch::sched::CPU_AUTO, "auto")
+}
+
+static DEC_SPAWN_MS: AtomicU64 = AtomicU64::new(0);
+/// The jid `[play] dec not-scheduled` was printed for (once per job).
+static DEC_NS_SAID: AtomicU32 = AtomicU32::new(0);
+/// `DECJOB` counters since the last `tests play`: spawned, ran, spawned on a worker core.
+static DJ_SPAWNED: AtomicU32 = AtomicU32::new(0);
+static DJ_RAN: AtomicU32 = AtomicU32::new(0);
+static DJ_WORKER: AtomicU32 = AtomicU32::new(0);
+
+fn dj_spawned(worker: bool, _jid: u32) {
+    DJ_SPAWNED.fetch_add(1, Ordering::AcqRel);
+    if worker { DJ_WORKER.fetch_add(1, Ordering::AcqRel); }
+}
+
+/// The task's first act: one line — it ran, where, and how long after its spawn.
+fn dec_ran(jid: u32) {
+    DJ_RAN.fetch_add(1, Ordering::AcqRel);
+    let cpu = crate::arch::percpu::this_cpu().cpu_index;
+    serial_println!("[play] dec run jid={} cpu={} wait_ms={}", jid, cpu, tms().saturating_sub(DEC_SPAWN_MS.load(Ordering::Acquire)));
+}
+
+/// A job still queued: named once at 500 ms (a scheduling fault, told apart from a decode fault), ended at
+/// `DEC_ORPHAN_MS`. Returns true when it ended the play.
+fn dec_queued_watch(jid: u32) -> bool {
+    let waited = tms().saturating_sub(DEC_SPAWN_MS.load(Ordering::Acquire));
+    if waited > 500 && DEC_NS_SAID.swap(jid, Ordering::AcqRel) != jid {
+        let cpu = match DEC_CPU.load(Ordering::Acquire) { u32::MAX => -1, c => c as i64 };
+        serial_println!("[play] dec not-scheduled jid={} cpu={} ms={}", jid, cpu, waited);
+    }
+    if waited > DEC_ORPHAN_MS {
+        serial_println!("[play] coded stall stage=queued frame=0 calls=0 ms={} -> ABORT", waited);
+        DEC_STALL.store(STAGE_QUEUED, Ordering::Release);
+        DEC_ABORT.store(true, Ordering::Release);
+        DEC_LIVE.store(false, Ordering::Release);
+        stop();
+        dec_end_play();
+        return true;
+    }
+    false
+}
+static DEC_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// `tests play`'s queue: (fmt, path) to play in order, the one now playing (fmt, path, decoder generation before
+/// it), and the shell's own time in the verb. The service tick drives it; the shell is never in it.
+static TQ: spin::Mutex<VecDeque<(&'static str, String)>> = spin::Mutex::new(VecDeque::new());
+static TQ_CUR: spin::Mutex<Option<(&'static str, String, u32)>> = spin::Mutex::new(None);
+static TQ_LIVE: AtomicBool = AtomicBool::new(false);
+static TQ_IN: AtomicBool = AtomicBool::new(false);
+static TQ_SHELL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// End of `tests play`: reset the counters, arm the first entry, and return to the shell.
+fn tq_arm(t0: u64) {
+    DJ_SPAWNED.store(0, Ordering::Release);
+    DJ_RAN.store(0, Ordering::Release);
+    DJ_WORKER.store(0, Ordering::Release);
+    let n = TQ.lock().len();
+    TQ_LIVE.store(n > 0, Ordering::Release);
+    TQ_SHELL_MS.store(tms().saturating_sub(t0), Ordering::Release);
+    serial_println!("[play] tests queued n={} shell_ms={} (the plays run on the service tick; `play stop` ends one)", n, TQ_SHELL_MS.load(Ordering::Acquire));
+}
+
+/// One service tick of the queue: close the entry that finished (its guard verdict), then open the next; when the
+/// queue is empty, the `DECJOB` verdict. Re-entry (`start()` → `probe()` → `service()`) is skipped.
+fn tq_tick() {
+    if TQ_IN.swap(true, Ordering::AcqRel) { return; }
+    let cur = TQ_CUR.lock().clone();
+    if let Some((fmt, path, jid0)) = cur {
+        let (_done, _moved, st) = progress();
+        if st {
+            let (lp, run_bit, fifo) = { let s = ST.lock(); (s.lpib_last, s.run_bit as u8, s.fifo.len()) };
+            stop(); dec_stop();
+            serial_println!(":: PLAYCODEC: fmt={} path={} reason=stalled lpib={} run_bit={} fifo={} -> FAIL ::", fmt, path, lp, run_bit, fifo);
+        }
+        if ACTIVE.load(Ordering::Acquire) { TQ_IN.store(false, Ordering::Release); return; }
+        if DEC_GEN.load(Ordering::Acquire) != jid0 { dec_guard(fmt, &path, TQ_SHELL_MS.load(Ordering::Acquire)); }
+        *TQ_CUR.lock() = None;
+    }
+    let next = TQ.lock().pop_front();
+    match next {
+        Some((fmt, path)) => {
+            let jid0 = DEC_GEN.load(Ordering::Acquire);
+            *TQ_CUR.lock() = Some((fmt, path.clone(), jid0));
+            if let Err(r) = open_wav(&path) {
+                serial_println!(":: PLAYCODEC: fmt={} path={} reason={} -> SKIP ::", fmt, path, r);
+                *TQ_CUR.lock() = None;
+            }
+        }
+        None => {
+            TQ_LIVE.store(false, Ordering::Release);
+            let (sp, ran, wk) = (DJ_SPAWNED.load(Ordering::Acquire), DJ_RAN.load(Ordering::Acquire), DJ_WORKER.load(Ordering::Acquire));
+            let shell = TQ_SHELL_MS.load(Ordering::Acquire);
+            let on = if sp == 0 { "-" } else if wk == sp { "worker" } else { "auto" };
+            let v = if sp == 0 { "SKIP" } else if ran == sp && wk == sp && shell <= 250 { "PASS" } else { "FAIL" };
+            serial_println!(":: DECJOB: spawned={} ran={} on={} shell_blocked_ms={} -> {} ::", sp, ran, on, shell, v);
+        }
+    }
+    TQ_IN.store(false, Ordering::Release);
 }
