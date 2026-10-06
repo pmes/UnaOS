@@ -42,7 +42,8 @@ pub const BOOT_SHOWN: &str = "EFI";
 /// VOLUMES2 (B376, R89 "OBVIOUSLY it should be boot/efi"): the name the EFI tree is published under in `/volumes/boot`.
 /// FAT lookup is case-insensitive, so `/volumes/boot/efi/BOOT/BOOTX64.EFI` resolves on the medium's `EFI/BOOT/`.
 pub const BOOT_EFI_NAME: &str = "efi";
-/// VOLUMES2 (R89): the ONLY entries `/volumes` holds on a native root, in listing order.
+/// VOLUMES2 (R89): the entries `/volumes` holds first on a native root, in listing order; R95: a mounted removable
+/// medium (a stick, a card in the USB SD reader) follows them while inserted.
 pub const SHOWN_R89: [&str; 2] = ["UnaOS", "boot"];
 
 /// `system/test-f`, on the root first (the card's UnaFS root, or a FAT root), then on the boot partition's data tree.
@@ -192,8 +193,12 @@ pub fn selftest() {
     let root = names("/", under).unwrap_or_default();
     let once = |w: &str| root.iter().filter(|n| n.eq_ignore_ascii_case(w)).count();
     let withdrawn = WITHDRAWN.lock().join(",");
+    // R95 (Peter, 2026-10-06: the USB hub carries the net dongle AND a USB SD reader): a removable medium that is
+    // mounted is a volume while it is inserted — it follows the two R89 entries and the gate names it; the first
+    // two entries must still be exactly UnaOS, boot.
+    let removable: Vec<&String> = shown.iter().skip(SHOWN_R89.len()).collect();
     let ok = pure_ok
-        && shown.len() == SHOWN_R89.len()
+        && shown.len() >= SHOWN_R89.len()
         && shown.iter().zip(SHOWN_R89.iter()).all(|(a, b)| a == b)
         && efi_tok == "boot/efi"
         && home_on_fat == 0
@@ -201,14 +206,15 @@ pub fn selftest() {
         && once("system") <= 1
         && once("boot") == 0;
     serial_println!(
-        ":: VOLUMES: shown={} efi={} -> {} :: root_view={} pure={} home_on_fat={} withdrawn={} ::",
+        ":: VOLUMES: shown={} efi={} -> {} :: root_view={} pure={} home_on_fat={} withdrawn={} removable={} ::",
         if shown.is_empty() { String::from("-") } else { shown.join(",") },
         efi_tok,
         if ok { "PASS" } else { "FAIL" },
         root.join(","),
         pure_ok,
         home_on_fat,
-        if withdrawn.is_empty() { "-" } else { withdrawn.as_str() }
+        if withdrawn.is_empty() { "-" } else { withdrawn.as_str() },
+        if removable.is_empty() { String::from("-") } else { removable.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",") }
     );
 }
 
