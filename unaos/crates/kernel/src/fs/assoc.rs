@@ -69,6 +69,8 @@ pub const TYPE_FACTS: &[(&str, &str, &str)] = &[
     (ft::VIDEO_MP4, "video", "MPEG-4 video"),
     (ft::VIDEO_WEBM, "video", "WebM video"),
     (ft::VIDEO_MATROSKA, "video", "Matroska video"),
+    (ft::IMAGE_ARW, "image", "Sony raw image"), // RAWCORE (B444)
+    (ft::IMAGE_TIFF, "image", "TIFF image"), // RAWCORE (B444)
 ];
 
 /// The facts row for `mime`, if any. Pure.

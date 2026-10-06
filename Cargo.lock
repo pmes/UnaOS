@@ -3047,7 +3047,7 @@ version = "0.1.0"
 dependencies = [
  "memmap2",
  "png",
- "rayon",
+ "raw_core",
  "zune-core",
  "zune-jpeg",
 ]
@@ -3784,6 +3784,7 @@ name = "pixel_core"
 version = "0.1.0"
 dependencies = [
  "image",
+ "raw_core",
  "svg_core",
  "vp8_core",
 ]
@@ -4292,6 +4293,10 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
 ]
+
+[[package]]
+name = "raw_core"
+version = "0.1.0"
 
 [[package]]
 name = "rayon"

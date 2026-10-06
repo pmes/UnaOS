@@ -32,6 +32,7 @@ members = [
     "unaos/libs/sys/vein_ring3",
     "unaos/libs/media/audio_core",
     "unaos/libs/media/pixel_core",
+    "unaos/libs/media/raw_core", # RAWCORE (B444): camera raw (TIFF/ARW) — container, preview, EXIF facts, demosaic; no_std, both rings
     "unaos/libs/media/vp8_core",
     "unaos/libs/media/av1_core",
     # SVGCORE (SR52): the no_std SVG renderer (XML, paths, painting, text via font_core) behind pixel_core's `svg` format.

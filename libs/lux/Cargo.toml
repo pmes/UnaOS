@@ -5,8 +5,9 @@ edition = "2024"
 license = "LGPL-3.0-or-later"
 
 [dependencies]
+# RAWCORE (B444): the ARW path is UnaOS's no_std raw core, re-exported (one decoder for both rings).
+raw_core = { path = "../../unaos/libs/media/raw_core" }
 memmap2 = "0.9.11"
 png = "0.18.1"
-rayon = "1.12.0"
 zune-core = "0.5.1"
 zune-jpeg = "0.5.15"

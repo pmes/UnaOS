@@ -41,6 +41,7 @@ pub mod inflate;
 pub mod jpeg;
 pub mod png;
 pub mod qoi;
+pub mod raw;
 #[cfg(feature = "svg")]
 pub mod svg;
 pub mod webp;
@@ -158,7 +159,11 @@ pub fn sniff(bytes: &[u8]) -> Option<Format> {
 
 /// Decode any supported format, chosen by [`sniff`].
 pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
-    match sniff(bytes).ok_or(Error::UnknownFormat)? {
+    let Some(format) = sniff(bytes) else {
+        // RAWCORE (B444): a TIFF container — a camera raw developed by raw_core, or a plain TIFF's preview.
+        return if raw::is_raw(bytes) { raw::decode(bytes) } else { Err(Error::UnknownFormat) };
+    };
+    match format {
         Format::Png => decode_png(bytes),
         Format::Jpeg => decode_jpeg(bytes),
         Format::Gif => decode_gif(bytes),
@@ -379,7 +384,10 @@ pub(crate) fn le16(b: &[u8], i: usize) -> u16 {
 /// and the DIB header that follows has a size the format defines (BITMAPCOREHEADER 12, OS/2 2.x 16 and 64,
 /// BITMAPINFOHEADER 40, V2 52, V3 56, V4 108, V5 124) — a text file that starts "BM" is not an image. Pure.
 pub fn mime_of(bytes: &[u8]) -> Option<&'static str> {
-    Some(match sniff(bytes)? {
+    let Some(format) = sniff(bytes) else {
+        return raw::mime_of(bytes); // RAWCORE (B444): image/x-sony-arw or image/tiff
+    };
+    Some(match format {
         Format::Png => "image/png",
         Format::Jpeg => "image/jpeg",
         Format::Gif => "image/gif",
