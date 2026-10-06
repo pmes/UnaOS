@@ -567,7 +567,7 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
         nm.extend_from_slice(ent.name.as_bytes());
         // `ls -F`'s two marks: `/` descends, `*` RUNS (see the pre-QUARRY2 painter's note).
         if dir {
-            nm.push(b'/');
+            nm.push(crate::fs::rootdisk::mark(&m.cwd, &ent.name)); // ROOTDISK (B390, R94): the root's links draw `@`
         } else if super::is_executable(&ent.name) {
             nm.push(b'*');
         }
