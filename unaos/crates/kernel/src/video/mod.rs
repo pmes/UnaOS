@@ -1198,3 +1198,8 @@ pub mod desktopbuild;
 pub mod capture;
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod loginitems;
+// DIALOG (B395, MACPARITY rows 23/34): THE alert widget (app-modal, sheets, the power confirms) and the one-line toast NOTIFY grows from. Same gate as crystal; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod dialog;
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod toast;
