@@ -100,6 +100,8 @@ pub mod key {
     pub const TP_NATURAL: &str = "trackpad.natural_scroll";
     pub const TP_SECONDARY: &str = "trackpad.secondary_click";
     pub const TP_THREE_DRAG: &str = "trackpad.three_finger_drag";
+    /// DRAGDROP (B440): the folders the user dropped on Quarry's sidebar Favorites (R79: a preference is Principia's).
+    pub const QUARRY_FAVORITES: &str = "quarry.favorites";
 }
 
 static TREE: spin::Mutex<PrefTree> = spin::Mutex::new(PrefTree::new());

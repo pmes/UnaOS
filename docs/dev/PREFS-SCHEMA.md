@@ -10,7 +10,7 @@ or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keep
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
 operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
 
-Rows: 44.
+Rows: 45.
 
 | key | type | default | writers | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -33,6 +33,7 @@ Rows: 44.
 | `system.notify.dnd` | bool | `false` | settings | kernel NOTIFY (`video/notify.rs`) | Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows) (NOTIFY, MACPARITY row 24). Edited in Settings > General > Do Not Disturb. |
 | `system.pointer.speed` | int `0..=2` | `1` | settings | kernel settings (pointer) | 0 slow, 1 normal, 2 fast. Legacy (R75): read only while `system.trackpad.speed` is unset (TRACKPADPANE). |
 | `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | operator | kernel POWERMENU | Battery percent at which the machine shuts down; 0 = off. |
+| `system.quarry.favorites` | string ≤512 printable | consumer: none — the sidebar's six built-in favorites only | quarry | kernel Quarry sidebar (`video/quarry/sidebar.rs`) | Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18). |
 | `system.settings.tab` | int `0..=6` | `0` | settings | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad). |
 | `system.trackpad.natural_scroll` | bool | `true` | settings | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Two-finger scrolling moves the content with the fingers (on) or the other way (off). Edited in Settings > Trackpad. |
 | `system.trackpad.secondary_click` | enum `two-finger \| off` | `"two-finger"` | settings | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | A click (or, with tap to click, a tap) made with two fingers down is a secondary click. Edited in Settings > Trackpad. |
