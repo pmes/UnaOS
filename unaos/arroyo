@@ -9335,6 +9335,12 @@ esp_x86_unafs_card() {
         for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do cp "${UNAOS_WIFI_FW_PATH}/${fw}" "$fwdir/"; done
         cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$fwdir" /FIRMWARE -i "$vol" >/dev/null || {
             echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs put target/wifi-fw -> /FIRMWARE failed — no card image${COLOR_RESET}"; return 1; }
+        # FWVOL (flight 26, image 19): the kernel's WIFI-1 pass searches /, /B43/, /FIRMWARE/ on the PROGRAM-SOURCE volume —
+        # the FAT boot partition (`source=sdhc label='UNAOS'`), not the UnaFS root — and read `ucode ABSENT` with the set
+        # sitting on p2. Until the pass reads the UnaFS root (FWPIN B455 names the same gap), the set ALSO goes onto the
+        # ESP tree at /FIRMWARE/ so p1 carries it; bench-only, the staged tree, never git.
+        mkdir -p "$esp_t/FIRMWARE" && cp "$fwdir"/*.fw "$esp_t/FIRMWARE/" || {
+            echo -e "${COLOR_RED}❌ WIFI-FW: copying the set onto the ESP tree failed — no card image${COLOR_RESET}"; return 1; }
         echo -e "${COLOR_YELLOW}⚡ WIFI-FW: b43 set (3 files) from ${UNAOS_WIFI_FW_PATH} onto the UnaFS root at /FIRMWARE/ (bench-only, never in-tree)${COLOR_RESET}"
     fi
     # SELFINSTALL2 (B310): the card's GPT is laid by `tools/una-card` over `amber_core` — the SAME core the
