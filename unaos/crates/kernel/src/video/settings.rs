@@ -56,14 +56,14 @@ pub const IDLE_STEPS: [u32; 8] = [0, 1, 2, 5, 10, 15, 30, 60];
 const PTR_NAMES: [&str; 3] = ["slow", "normal", "fast"];
 const WALL_MAX: usize = 120;
 
-const WIN_W: usize = 520;
+const WIN_W: usize = 600; // APPEARANCE (B408): 520 -> 600 for the sixth tab
 const TAB_H: usize = 28;
 const TOP: usize = 12 + TAB_H;
 const ROW_H: usize = 40;
 const ROWS: usize = 10;
 /// The tab strip: General · Users · Display · About.
-pub const TABS: usize = 5;
-const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items"]; // PREFSUI (R91): Login Items
+pub const TABS: usize = 6;
+const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance"]; // PREFSUI (R91): Login Items
 const WIN_H: usize = TOP + ROWS * ROW_H + 8;
 const LABEL_X: usize = 12;
 const TRACK_X: usize = 150;
@@ -266,7 +266,7 @@ fn load_for_login() {
     if mask & 8 != 0 { apply_idle(v.idle_min); }
     if mask & 16 != 0 { apply_ptr(v.ptr); }
     if mask & 32 != 0 && !v.wall.is_empty() { apply_wall(&v.wall); }
-    mode_at_login(); // PREFSUI (R93): a stored `system.display.mode` is this session's scale
+    mode_at_login(); super::appearance::load_at_login(); // PREFSUI (R93): a stored `system.display.mode` is this session's scale
 }
 
 /// Set control `i` to `val` (slider position, toggle 0/1, chooser index), apply, print, save, repaint.
@@ -351,7 +351,7 @@ pub fn request_open() {
 
 /// Drain the open latch and load the store once per login. Chained from `quarry::live::service`.
 pub fn service() {
-    crate::prefs::service(); super::loginitems::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
+    crate::prefs::service(); super::loginitems::service(); super::appearance::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
     if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
@@ -463,7 +463,7 @@ fn paint(st: &mut State, v: &Values) {
         0 => paint_general(st, v),
         1 => paint_users(st),
         2 => paint_display(st, v),
-        4 => paint_login(st),
+        4 => paint_login(st), 5 => paint_appearance(st), // APPEARANCE (B408)
         _ => paint_about(st),
     }
     if !st.strip && matches!(v.tab, 0 | 2) {
@@ -979,7 +979,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
     match cur_tab() {
         0 => press_general(row, cx),
         1 => press_users(row, cx),
-        4 => press_login(row, cx),
+        4 => press_login(row, cx), 5 => press_appearance(row, cx), // APPEARANCE (B408)
         2 => {
             if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
@@ -1206,7 +1206,7 @@ fn bus_changes_inner() -> (usize, usize, usize) {
     let mut keys: Vec<&'static str> = Vec::new();
     let mut idle = 0usize;
     let frames = crate::prefs_client::changes_drain(|ns, k| {
-        if ns != crate::prefs::NS { return; }
+        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } // APPEARANCE (B408): another client chose
         if let Some(s) = SHOWN.iter().find(|s| **s == k) {
             if *s == crate::prefs::key::IDLE_MIN { idle += 1; }
             if !keys.contains(s) { keys.push(s); }
@@ -1705,4 +1705,65 @@ fn dock_rows_press(row: usize, cx: usize) {
         return;
     }
     repaint();
+}
+
+// ── APPEARANCE (rmbp-ledger B408, MACPARITY rows 21/22) — the Appearance tab ─────────────────────────────────────────
+// Light · Dark · Auto (the Dock row's segment shape), the accent swatches, the highlight swatches (the first follows
+// the accent), and a selection sample. A press latches the choice (`appearance::choose`); the settings service pass
+// stores the key and repaints everything once (`[appearance] … via=settings repaint_ms=<n>`). Mouse only: the tab has
+// no keyboard controls (Left/Right on the strip still switch tabs).
+
+const AP_MODES: [&str; 3] = ["Light", "Dark", "Auto"];
+const SW: usize = 20;
+const SW_PITCH: usize = 26;
+
+fn swatch(st: &mut State, r: usize, k: usize, c: u32, on: bool) {
+    let w = st.w;
+    let (x, y) = (TRACK_X + k * SW_PITCH, TOP + r * ROW_H + (ROW_H - SW) / 2);
+    if on { fill(&mut st.surf, w, x - 3, y - 3, SW + 6, SW + 6, theme::content_text()); fill(&mut st.surf, w, x - 1, y - 1, SW + 2, SW + 2, theme::content_fill()); }
+    fill(&mut st.surf, w, x, y, SW, SW, c);
+}
+
+fn paint_appearance(st: &mut State) {
+    use prefs_core::appearance as ap;
+    let (w, h) = (st.w, st.h);
+    let face = super::text::Face::Body;
+    let ch = super::metrics::lcell_h(face);
+    let m = super::appearance::mode().index();
+    txt(st, LABEL_X, 0, "Appearance");
+    let seg = TRACK_W / 3;
+    for k in 0..3usize {
+        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 6, seg - 2, ROW_H - 12, if k == m { theme::accent() } else { theme::scroll_track() });
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + (ROW_H - ch) / 2, AP_MODES[k].as_bytes(), theme::content_text(), false, face);
+    }
+    txt(st, VAL_X, 0, if theme::is_dark() { "dark now" } else { "light now" });
+    let clock = match super::appearance::local_hour() { Some(hr) => alloc::format!("now {:02}h", hr), None => String::from("no clock: light") };
+    txt(st, LABEL_X + 12, 1, &alloc::format!("Auto = dark {:02}:00-{:02}:00 by the RTC until NETCLOCK sets the time ({})", ap::AUTO_DARK_FROM, ap::AUTO_DARK_UNTIL, clock));
+    txt(st, LABEL_X, 2, "Accent colour");
+    let a = super::appearance::accent_ix();
+    for k in 0..theme::ACCENTS.len() { swatch(st, 2, k, theme::ACCENTS[k], k == a); }
+    txt(st, VAL_X, 2, ap::ACCENTS[a.min(7)]);
+    txt(st, LABEL_X, 3, "Highlight colour");
+    let hr = super::appearance::highlight_raw();
+    for k in 0..ap::HIGHLIGHTS.len() { swatch(st, 3, k, if k == 0 { theme::ACCENTS[a.min(7)] } else { theme::ACCENTS[k - 1] }, k == hr); }
+    txt(st, VAL_X, 3, super::appearance::highlight_name());
+    let sx = TRACK_X;
+    fill(&mut st.surf, w, sx, TOP + 4 * ROW_H + 8, TRACK_W, ROW_H - 16, theme::selection());
+    txt(st, sx + 6, 4, "Selected text looks like this");
+    txt(st, LABEL_X, 5, "The accent marks the default button, the selection, the focus ring,");
+    txt(st, LABEL_X, 6, "the slider knob and the menu highlight; the highlight is text selection.");
+}
+
+fn press_appearance(row: usize, cx: usize) {
+    use prefs_core::appearance as ap;
+    if cx < TRACK_X { return; }
+    let k = cx - TRACK_X;
+    let (kind, i, key, name) = match row {
+        0 if k < TRACK_W => { let i = (k / (TRACK_W / 3)).min(2); (0, i, "appearance_mode", ap::MODES[i]) }
+        2 if k < ap::ACCENTS.len() * SW_PITCH => { let i = k / SW_PITCH; (1, i, "appearance_accent", ap::ACCENTS[i]) }
+        3 if k < ap::HIGHLIGHTS.len() * SW_PITCH => { let i = k / SW_PITCH; (2, i, "appearance_highlight", ap::HIGHLIGHTS[i]) }
+        _ => return,
+    };
+    super::appearance::choose(kind, i);
+    say(key, name, true);
 }

@@ -4229,8 +4229,8 @@ pub fn win_id() -> wm::WinId {
 // again. The epoch `video::text` bumps is compared here, on the pass that loaded them, and each owner repaints.
 static FONT_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-fn font_repaint_pass() {
-    let e = crate::video::text::epoch();
+pub fn font_repaint_pass() {
+    let e = crate::video::text::epoch() ^ (crate::video::theme::epoch() << 20); // APPEARANCE (B408): a theme switch repaints the same windows once (`video::appearance`)
     if e == 0 || FONT_SEEN.swap(e, Ordering::AcqRel) == e {
         return;
     }

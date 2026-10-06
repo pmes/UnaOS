@@ -1203,3 +1203,6 @@ pub mod loginitems;
 pub mod dialog;
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod toast;
+// APPEARANCE (B408, MACPARITY rows 21/22): Principia's `system.appearance.*` applied — Light/Dark, the accent, the highlight, one repaint. Same gate as settings; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod appearance;
