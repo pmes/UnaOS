@@ -32,6 +32,10 @@ use super::{r16, r32, w32, Writes, D11_MACCTL, D11_SHM_CONTROL, D11_SHM_DATA, MA
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
+use spin::Mutex;
+
+/// C2's MMIO capture, kept for C3's post-image diff (single writer: `bringup_once`, once per boot).
+static C2_MMIO: Mutex<Vec<Option<u16>>> = Mutex::new(Vec::new());
 
 /// C2's MMIO extent (bytes): 0x000..0x800, 16-bit reads.
 const C2_MMIO_END: u16 = 0x0800;
@@ -100,6 +104,8 @@ pub(super) fn pre_image(bar0: u64, words: u32, staged_fnv: u32, w: &mut Writes) 
         }
         serial_println!("[wifi5] c2-mmio +{:#05x}{}", i * ROW * 2, s);
     }
+
+    *C2_MMIO.lock() = mmio.clone();
 
     // ── C2b: shared memory through routing 0x0001, auto-incrementing from byte 0 (fact 2). ───────
     unsafe { w32(bar0, D11_SHM_CONTROL, SHM_ROUTE_SHARED << 16) };
@@ -194,4 +200,49 @@ pub(super) fn pre_image(bar0: u64, words: u32, staged_fnv: u32, w: &mut Writes) 
             role, recs.len(), agree, differ, outside
         );
     }
+}
+
+/// C3 — the post-image (WIFI5 M5, S5's first boot): the SAME MMIO extent and skips as C2, re-read
+/// after the upload + initvals, from `phy_once` (wifi4) once its gate passed. Prints ONLY the words
+/// that differ from the EFI's C2, with their offsets. Read-only, no select written.
+///
+/// Reading: `changed` ⊆ the s5i-delta offsets ∪ the ucode's own MAC state ⇒ our core reset left the
+/// rest of the EFI's MAC state standing (S5 rung 0's MMIO half); a changed word OUTSIDE both is a
+/// state the reset or the ucode cleared that the EFI had set — the first candidate S5 write, with
+/// its value already captured (`observed=<efi> source=capture`, DRIVERS-METHOD §2).
+#[cfg(feature = "wifi4")]
+pub(super) fn post_image(bar0: u64) {
+    let c2 = C2_MMIO.lock();
+    if c2.is_empty() {
+        serial_println!(":: WIFI5: c3 SKIP reason=no-c2-this-boot ::");
+        return;
+    }
+    let (mut same, mut changed, mut regs) = (0u32, 0u32, 0u32);
+    let mut row = String::new();
+    let mut n = 0;
+    for (i, efi) in c2.iter().enumerate() {
+        let off = (i * 2) as u16;
+        let Some(efi) = efi else { continue };
+        regs += 1;
+        let now = unsafe { r16(bar0, off as u64) };
+        if now == *efi {
+            same += 1;
+            continue;
+        }
+        changed += 1;
+        let _ = write!(row, " {:03x}={:04x}/{:04x}", off, efi, now);
+        n += 1;
+        if n == 8 {
+            serial_println!("[wifi5] c3-delta{}", row);
+            row.clear();
+            n = 0;
+        }
+    }
+    if n > 0 {
+        serial_println!("[wifi5] c3-delta{}", row);
+    }
+    serial_println!(
+        ":: WIFI5: c3 post-upload+initvals mmio regs={} same={} changed={} (delta rows: offset=efi/now) — S5 rung 0's MMIO half: compare the changed set with the s5i-delta offsets ::",
+        regs, same, changed
+    );
 }

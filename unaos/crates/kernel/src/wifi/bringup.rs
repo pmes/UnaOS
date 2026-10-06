@@ -2333,6 +2333,7 @@ fn phy_once(bar0: u64) {
         phy_end(&dl, false, "gate", 0, &pw, "N/A");
         return;
     }
+    capture::post_image(bar0); // WIFI5 M5 (B415): C3, the post-image diffed against the EFI's C2.
 
     // ── S5(a): the radio identity. ──────────────────────────────────────────────────────────────
     let addr_pre = unsafe { r16(bar0, D11_RADIO_ADDR) };
