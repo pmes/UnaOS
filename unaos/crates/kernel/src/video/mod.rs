@@ -1202,7 +1202,7 @@ pub mod loginitems;
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod dialog;
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub mod toast; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod notify; // NOTIFY (B418, MACPARITY row 24): the stack, the Center, the bell's count — the toast's queue grows into it. Same-line fold, code before comment.
+pub mod toast; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod notify; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod notifypane; // NOTIFYPANE (B435): the per-app rules, the DND schedule, the alert sound. NOTIFY (B418, MACPARITY row 24): the stack, the Center, the bell's count — the toast's queue grows into it. Same-line fold, code before comment.
 // BEZEL (B405, MACPARITY row 26): the brightness / volume bezel — a compositor draw (the toast's row), armed by the keys. Same gate as brightkeys; at the tail so no line above moves.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod bezel;

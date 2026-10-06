@@ -189,6 +189,7 @@ pub fn post(d: Dlg) -> bool {
         return false;
     }
     g.pend = Some(d);
+    if !HEADLESS.load(Ordering::Relaxed) { super::notifypane::alert(); } // NOTIFYPANE (B435): an alert sounds (latched; NOTIFY's pass decides)
     true
 }
 
