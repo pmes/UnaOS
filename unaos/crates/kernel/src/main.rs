@@ -7105,13 +7105,13 @@ fn panic(info: &PanicInfo) -> ! {
     // these two lines reach the wire even when this very core died holding it (the old shape lost the
     // `try_lock` to itself and dropped the whole panic message: red screen, no words). It also flushes
     // anything other cores had staged just before the fault. Takes no lock, so it cannot deadlock.
-    unaos_kernel::serial_ring::enter_panic_mode();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] unaos_kernel::video::panicscreen::note_panic(info); unaos_kernel::serial_ring::enter_panic_mode(); // PANICSCREEN (B406): the reason and its file:line, first (only the first entry counts)
     // Paint a red panic backdrop on the framebuffer (visible on hardware with no serial), then
     // print the message — serial_println! mirrors it onto that backdrop via fbcon.
     unaos_kernel::video::fbcon::panic_screen();
     serial_println!("=== KERNEL PANIC ===");
     serial_println!("{}", info);
-    unaos_kernel::arch::hlt_loop();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] unaos_kernel::video::panicscreen::finish(); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] unaos_kernel::arch::hlt_loop(); // PANICSCREEN (B406): the log, the 10 s countdown, the restart (UNAOS_PANIC_HOLD holds)
 }
 
 // ── JETSON-EL0 (M1b): the Orin's first EL0 round trip ───────────────────────────────────────────────

@@ -1239,6 +1239,8 @@ fi
 [ -n "${UNAOS_SELFDIAG:-}" ] && _feats="${_feats}selfdiag,"
 # BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* to defaults at every login (the safe-mode boot knob; `[prefs] display reset=1 reason=knob`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_PREFS_RESET:-}" ] && _feats="${_feats}prefs_reset,"
+# PANICSCREEN (B406, R95): UNAOS_PANIC_HOLD=1 holds the plain panic screen for the bench (no countdown, no restart). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_PANIC_HOLD:-}" ] && _feats="${_feats}panic_hold,"
 # SMALLFIX2 (B391, R94 §3): UNAOS_SVG=1 arms SVG as a picture — pixel_core's `svg` format (svg_core) in the kernel, so `image/svg+xml` types and opens in facet. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_SVG:-}" ] && _feats="${_feats}svg,"
 # KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
@@ -11681,6 +11683,10 @@ kernel8() {
     if [ -n "${UNAOS_SELFDIAG:-}" ]; then
         K8_FEATS="${K8_FEATS},selfdiag"
         echo -e "${COLOR_YELLOW}  • UNAOS_SELFDIAG: SELFDIAG — the boot log on disk + tests selfdiag (SYS_PATH_READ/WRITE and DIAG.ELF are x86's)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_PANIC_HOLD:-}" ]; then
+        K8_FEATS="${K8_FEATS},panic_hold"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PANIC_HOLD: PANICSCREEN bench hold — the panic screen stays, no restart${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_PREFS_RESET:-}" ]; then
         K8_FEATS="${K8_FEATS},prefs_reset"

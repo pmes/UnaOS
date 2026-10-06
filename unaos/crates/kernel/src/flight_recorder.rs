@@ -771,3 +771,13 @@ pub fn tail_lines(max_lines: usize) -> Option<(alloc::vec::Vec<u8>, usize, bool)
     }
     None
 }
+
+/// PANICSCREEN (B406): the last `out.len()` captured bytes into `out` (no heap, `try_lock`: 0 when contended),
+/// for `/var/log/panic-<n>.txt`. FLIGHTRING SEAM: today the ring keeps the HEAD, so this is the end of what it
+/// held; FLIGHTRING replaces this body with its pinned head + rolling tail.
+pub fn panic_tail(out: &mut [u8]) -> usize {
+    let Some(r) = RING.try_lock() else { return 0 };
+    let k = out.len().min(r.len);
+    out[..k].copy_from_slice(&r.buf[r.len - k..r.len]);
+    k
+}

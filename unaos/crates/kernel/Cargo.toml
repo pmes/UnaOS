@@ -3763,6 +3763,12 @@ netring3 = []
 # `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 prefs_reset = []
 
+# PANICSCREEN (rmbp-ledger B406, R95): UNAOS_PANIC_HOLD=1 — the bench hold: the plain panic screen stays up and the
+# machine waits for the power button instead of the 10 s countdown and restart (the seat's capture needs the
+# machine up). Off (default): restart. Both arches (x86 reads it; aarch64 keeps its own panic path). Kept in sync
+# with `unaos/arroyo` (the x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+panic_hold = []
+
 # SMALLFIX2 (rmbp-ledger B391, R94 §3): UNAOS_SVG=1 — SVG is a picture: pixel_core's `svg` format (UnaOS's own
 # no_std svg_core) is linked, so `fs::filetype` types `image/svg+xml` by its markup and facet renders it (shapes;
 # SVG text needs the faces passed to `decode_at`, owed). Off: an .svg types as the text it is. Both arches. Kept
