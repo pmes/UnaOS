@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
-//! CHARTER: Kernel — driver (the radio is hardware on the EHCI controller; the link-key object it writes is Holocron's charter, carried as typed attributes until Holocron exists — owed)
+//! CHARTER: Kernel — driver (the radio is hardware on the EHCI controller; the link key is Holocron's: sealed as the record `bt/<addr12>` through Holocron's verbs, BTKEYSEAL B446)
 //!
 //! BTHID (rmbp-ledger B339) — a Bluetooth HID host over BR/EDR, written from the Bluetooth Core
 //! specification (Vol 4 Part E: HCI commands and events; Vol 3 Part A: L2CAP; Vol 3 Part B: SDP;
@@ -23,9 +23,10 @@
 //! host-side wait carries a deadline; nothing at boot but the bounded 5 s reconnect of a bonded device,
 //! and that only after the desktop.
 //!
-//! THE LINK KEY. Stored as typed attributes on one object per bonded device under
-//! `<home>/.config/unaos/bt/<addr12>` (`bt.linkkey` Blob, `bt.keytype` Int, `bt.name` Str, `bt.class`
-//! Int, `bt.hiddesc` Blob when it fits). All file I/O happens in [`store_service`], called from the
+//! THE LINK KEY. A Holocron record `bt/<addr12>` sealed under the session user's ring ([`super::btkeyseal`],
+//! BTKEYSEAL B446); the bond's non-secret facts are typed attributes on one object per bonded device under
+//! `<home>/.config/unaos/bt/<addr12>` (`bt.keytype` Int, `bt.name` Str, `bt.class` Int, `bt.hiddesc` Blob
+//! when it fits). A legacy plain `bt.linkkey` attribute is read once, sealed, and removed. All file I/O happens in [`store_service`], called from the
 //! storage-ready passes in `main.rs` — never under the `EHCI_HID` lock (the holocron rule). Key bytes
 //! never appear on the wire.
 
@@ -1076,7 +1077,7 @@ impl Bt {
                 }
                 self.paired += 1;
                 STORE_DIRTY.store(true, Ordering::Release);
-                serial_println!(":: BTHID: link key {} type={:#04x} -> bonded; staged for <home>/.config/unaos/bt/{} (attribute bt.linkkey) ::", fmt_addr(&addr), ktype, addr12(&addr));
+                serial_println!(":: BTHID: link key {} type={:#04x} -> bonded; staged — the storage pass seals it as Holocron bt/{} ::", fmt_addr(&addr), ktype, addr12(&addr));
             }
             _ => {}
         }
@@ -2347,7 +2348,7 @@ fn store_dir() -> Option<String> {
 /// runs inside a service pass.
 pub fn store_service() {
     let need_load = !STORE_LOADED.load(Ordering::Acquire);
-    if !need_load && !STORE_DIRTY.load(Ordering::Acquire) {
+    if !need_load && !STORE_DIRTY.load(Ordering::Acquire) && !seal_due() {
         return;
     }
     if EHCI_HID.is_locked() {
@@ -2368,7 +2369,9 @@ pub fn store_service() {
             }
         }
         bt.bonds_loaded = true;
-        serial_println!(":: BTHID: store loaded bonds={} from {} ::", bt.bonds.len(), dir);
+        serial_println!(":: BTHID: store loaded bonds={} sealed_pending={} from {} ::", bt.bonds.len(), PENDING.lock().len(), dir);
+        drop(g);
+        seal_pass(&dir);
         return;
     }
     STORE_DIRTY.store(false, Ordering::Release);
@@ -2388,7 +2391,12 @@ pub fn store_service() {
         let mt = crate::shell::vfs_mount_table();
         let p = format!("{}/{}", dir, addr12(&a));
         let r = mt.unlink(&p, crate::fs::vfs::KERNEL_PRINCIPAL);
-        serial_println!(":: BTHID: store forget {} -> {} ::", p, if r.is_ok() { "removed" } else { "absent or refused" });
+        UNSEALED.lock().retain(|e| e.0 != a);
+        let d = super::btkeyseal::delete(&addr12(&a));
+        serial_println!(":: BTHID: store forget {} -> {} sealed_key={} ::", p, if r.is_ok() { "removed" } else { "absent or refused" }, d.reason());
+    }
+    if seal_due() {
+        seal_pass(&dir);
     }
 }
 
@@ -2405,12 +2413,13 @@ fn store_load(dir: &str) -> Vec<Bond> {
             continue;
         };
         let mut b = Bond { addr, key: [0; 16], ktype: 0, cod: 0, name: String::new(), desc: Vec::new(), dirty: false };
-        let mut have_key = false;
+        let mut plain = false;
         for (k, val) in attrs {
             match (k.as_str(), val) {
-                ("bt.linkkey", AttrValue::Blob(x)) if x.len() == 16 => {
+                ("bt.linkkey", AttrValue::Blob(mut x)) if x.len() == 16 => {
                     b.key.copy_from_slice(&x);
-                    have_key = true;
+                    holocron_wipe(&mut x);
+                    plain = true;
                 }
                 ("bt.keytype", AttrValue::Int(t)) => b.ktype = t as u8,
                 ("bt.class", AttrValue::Int(t)) => b.cod = t as u32,
@@ -2419,8 +2428,24 @@ fn store_load(dir: &str) -> Vec<Bond> {
                 _ => {}
             }
         }
-        if have_key {
+        if plain {
+            // BTKEYSEAL MIGRATION: the plain key is read ONCE (the bond works this boot), queued to be
+            // sealed, and its attribute removed only after Holocron answered OK.
+            seal_queue(b.addr, true);
             v.push(b);
+            continue;
+        }
+        match super::btkeyseal::get(&addr12(&addr)) {
+            Ok(mut k) => {
+                b.key = k;
+                holocron_wipe(&mut k);
+                serial_println!(":: BTKEYSEAL: unseal {} -> ok ::", fmt_addr(&addr));
+                v.push(b);
+            }
+            Err(super::btkeyseal::Answer::NotFound) => {
+                serial_println!(":: BTKEYSEAL: unseal {} -> not-found (no sealed key: `bt pair {}` again) ::", fmt_addr(&addr), fmt_addr(&addr));
+            }
+            Err(_) => PENDING.lock().push(b), // locked / no Holocron yet: the seal pass retries
         }
     }
     v
@@ -2443,9 +2468,11 @@ fn store_write(dir: &str, b: &Bond) {
         serial_println!(":: BTHID: store {} create/write REFUSED ({:?}) — the key is held in RAM for this session ::", p, e);
         return;
     }
-    let mut res = mt.set_attr(&p, "bt.linkkey", AttrValue::Blob(b.key.to_vec()), K);
+    // BTKEYSEAL (B446): the key is NEVER written here — it is queued for Holocron (sealed on this pass).
+    seal_queue(b.addr, false);
+    SEAL_RETRY_AT.store(0, Ordering::Release);
+    let mut res = mt.set_attr(&p, "bt.keytype", AttrValue::Int(b.ktype as i64), K);
     if res.is_ok() {
-        let _ = mt.set_attr(&p, "bt.keytype", AttrValue::Int(b.ktype as i64), K);
         let _ = mt.set_attr(&p, "bt.class", AttrValue::Int(b.cod as i64), K);
         if !b.name.is_empty() {
             let _ = mt.set_attr(&p, "bt.name", AttrValue::Str(b.name.clone()), K);
@@ -2455,8 +2482,8 @@ fn store_write(dir: &str, b: &Bond) {
         }
     }
     match res {
-        Ok(()) => serial_println!(":: BTHID: store wrote {} attrs=bt.linkkey,bt.keytype,bt.class,bt.name{} -> OK ::", p, if b.desc.is_empty() { "" } else { ",bt.hiddesc" }),
-        Err(e) => serial_println!(":: BTHID: store {} attributes REFUSED ({:?}; a FAT volume carries no typed attributes) — the key is held in RAM for this session ::", p, e),
+        Ok(()) => serial_println!(":: BTHID: store wrote {} attrs=bt.keytype,bt.class,bt.name{} key=holocron:bt/{} -> OK ::", p, if b.desc.is_empty() { "" } else { ",bt.hiddesc" }, addr12(&b.addr)),
+        Err(e) => serial_println!(":: BTHID: store {} attributes REFUSED ({:?}; a FAT volume carries no typed attributes) — the key still goes to Holocron ::", p, e),
     }
 }
 
@@ -2639,4 +2666,164 @@ fn combo_desc() -> Vec<u8> {
         0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
         0xC0, 0xC0,
     ]
+}
+
+// ── BTKEYSEAL (rmbp-ledger B446): the link key goes to Holocron, never to the store's attributes ───────
+// Every Holocron call runs from `store_service` (the storage pass, no driver lock held) through
+// `super::btkeyseal`. Bonds whose key is to be sealed wait in UNSEALED (the key stays in `bt.bonds`, RAM,
+// for the session); objects whose sealed key could not be opened yet wait in PENDING. A pass that meets a
+// refusal stops at the first one (the reason applies to the rest) and retries after SEAL_RETRY_MS; the
+// `waiting` witness prints once per reason change, never per pass.
+
+/// `(addr, plain)`: a key to seal; `plain` = a legacy `bt.linkkey` attribute to remove after the OK.
+static UNSEALED: crate::sync::Mutex<Vec<([u8; 6], bool)>> = crate::sync::Mutex::new(Vec::new());
+/// Bonds whose sealed key is not open yet (Holocron locked or not running).
+static PENDING: crate::sync::Mutex<Vec<Bond>> = crate::sync::Mutex::new(Vec::new());
+static SEAL_RETRY_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SEAL_REASON: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("");
+const SEAL_RETRY_MS: u64 = 3000;
+
+fn holocron_wipe(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        unsafe { core::ptr::write_volatile(x, 0) };
+    }
+}
+
+fn seal_queue(addr: [u8; 6], plain: bool) {
+    let mut q = UNSEALED.lock();
+    match q.iter_mut().find(|e| e.0 == addr) {
+        Some(e) => e.1 |= plain,
+        None => q.push((addr, plain)),
+    }
+}
+
+fn seal_due() -> bool {
+    (!UNSEALED.lock().is_empty() || !PENDING.lock().is_empty()) && crate::arch::ms() >= SEAL_RETRY_AT.load(Ordering::Acquire)
+}
+
+/// `(sealed_queue, plain_left, pending)` for the witnesses.
+fn seal_counts() -> (usize, usize, usize) {
+    let q = UNSEALED.lock();
+    (q.len(), q.iter().filter(|e| e.1).count(), PENDING.lock().len())
+}
+
+fn seal_pass(dir: &str) {
+    use super::btkeyseal::{self as ks, Answer};
+    SEAL_RETRY_AT.store(crate::arch::ms() + SEAL_RETRY_MS, Ordering::Release);
+    let mut why: Option<&'static str> = None;
+    // 1. Seal what is queued.
+    let queue = core::mem::take(&mut *UNSEALED.lock());
+    let mut left: Vec<([u8; 6], bool)> = Vec::new();
+    for (addr, plain) in queue {
+        if why.is_some() {
+            left.push((addr, plain));
+            continue;
+        }
+        let snap = BT.lock().as_ref().and_then(|bt| bt.bond(&addr).map(|b| (b.key, b.name.clone())));
+        let Some((mut key, name)) = snap else { continue }; // forgotten meanwhile
+        let a12 = addr12(&addr);
+        let label = format!("{} {}", fmt_addr(&addr), name);
+        match ks::put(&a12, &label, &key) {
+            Answer::Ok(_) if plain => {
+                let p = format!("{}/{}", dir, a12);
+                let r = crate::shell::vfs_mount_table().remove_attr(&p, "bt.linkkey", crate::fs::vfs::KERNEL_PRINCIPAL);
+                serial_println!(":: BTKEYSEAL: migrate {} plain=read sealed=ok plain_removed={} ::", fmt_addr(&addr), if r.is_ok() { "ok" } else { "refused" });
+                if r.is_err() {
+                    left.push((addr, true));
+                }
+            }
+            Answer::Ok(_) => serial_println!(":: BTKEYSEAL: seal {} -> sealed bt/{} ::", fmt_addr(&addr), a12),
+            other => {
+                why = Some(other.reason());
+                left.push((addr, plain));
+            }
+        }
+        holocron_wipe(&mut key);
+    }
+    for (a, p) in left {
+        seal_queue(a, p);
+    }
+    // 2. Open what is pending.
+    if why.is_none() && !PENDING.lock().is_empty() {
+        let pend = core::mem::take(&mut *PENDING.lock());
+        let mut got: Vec<Bond> = Vec::new();
+        let mut keep: Vec<Bond> = Vec::new();
+        for mut b in pend {
+            if why.is_some() {
+                keep.push(b);
+                continue;
+            }
+            match ks::get(&addr12(&b.addr)) {
+                Ok(mut k) => {
+                    b.key = k;
+                    holocron_wipe(&mut k);
+                    serial_println!(":: BTKEYSEAL: unseal {} -> ok ::", fmt_addr(&b.addr));
+                    got.push(b);
+                }
+                Err(Answer::NotFound) => serial_println!(":: BTKEYSEAL: unseal {} -> not-found (no sealed key: `bt pair` again) ::", fmt_addr(&b.addr)),
+                Err(a) => {
+                    why = Some(a.reason());
+                    keep.push(b);
+                }
+            }
+        }
+        PENDING.lock().extend(keep);
+        if !got.is_empty() {
+            let mut g = BT.lock();
+            let bt = g.get_or_insert_with(|| Box::new(Bt::new()));
+            for b in got {
+                if bt.bond(&b.addr).is_none() && bt.bonds.len() < MAX_BONDS {
+                    bt.bonds.push(b);
+                }
+            }
+            if bt.rc == Rc::Done {
+                bt.rc = Rc::Wait; // the keys arrived after the reconnect ran: page the newly opened bonds
+            }
+        }
+    }
+    let r = why.unwrap_or("none");
+    let mut last = SEAL_REASON.lock();
+    if *last != r {
+        *last = r;
+        let (q, pl, pe) = seal_counts();
+        serial_println!(":: BTKEYSEAL: waiting reason={} pending={} unsealed={} plain_left={} ::", r, pe, q, pl);
+    }
+}
+
+/// `tests btkeyseal`: how many bonds Holocron holds sealed, how many plain `bt.linkkey` attributes are
+/// left in the store, and the codec leg. PASS = plain_left 0 and Holocron answered; FAIL = a plain key left
+/// or the codec broke; SKIP = no Holocron to count with (no ring / locked / not running).
+pub fn btkeyseal_selftest() {
+    let codec = super::btkeyseal::codec_ok();
+    let mut plain_left = 0usize;
+    let mut objects = 0usize;
+    if let Some(dir) = store_dir() {
+        let mt = crate::shell::vfs_mount_table();
+        if let Ok(ents) = mt.read_dir(&dir) {
+            for ent in ents {
+                if parse_addr(&ent.name).is_none() {
+                    continue;
+                }
+                objects += 1;
+                let p = format!("{}/{}", dir, ent.name);
+                if let Ok(attrs) = mt.list_attrs(&p, crate::fs::vfs::KERNEL_PRINCIPAL) {
+                    for (k, mut v) in attrs {
+                        if k == "bt.linkkey" {
+                            plain_left += 1;
+                        }
+                        if let crate::fs::vfs::AttrValue::Blob(x) = &mut v {
+                            holocron_wipe(x);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (q, _, pe) = seal_counts();
+    let (sealed, holo) = match super::btkeyseal::count() {
+        Ok(n) => (alloc::format!("{}", n), "answered"),
+        Err(a) => (String::from("n/a"), a.reason()),
+    };
+    let verdict = if plain_left > 0 || !codec { "FAIL" } else if holo == "answered" { "PASS" } else { "SKIP" };
+    serial_println!(":: BTKEYSEAL: sealed={} plain_left={} objects={} pending={} unsealed={} holocron={} codec={} -> {} ::", sealed, plain_left, objects, pe, q, holo, if codec { "ok" } else { "FAIL" }, verdict);
 }
