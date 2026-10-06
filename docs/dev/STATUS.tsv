@@ -343,3 +343,6 @@ ST341	APPTRUST (B467): built on exec-rmbp-apptrust @a347e044, not flown — no f
 ST342	REFUSALUI (B468): built on exec-rmbp-refusalui @faae5df1, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B468
 ST343	SEEKTABLE2 (B469): built on exec-rmbp-seektable2 @9068e7f5, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B469
 ST344	DRAGDROP2 (B470): built on exec-rmbp-dragdrop2 @78caf01d, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B470
+ST345	GATEPATH (B471): built on exec-rmbp-gatepath @3f2f7184, host gates only — nothing of it flies (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B471
+ST346	GATEFIX (B476): built on exec-rmbp-gatefix @14b21a6a, host gates only — nothing of it flies (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B476
+ST347	APPEARANCE2 (B473): built on exec-rmbp-appearancegate @879fd525, host gate only — nothing of it flies (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B473
