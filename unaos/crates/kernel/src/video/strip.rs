@@ -790,7 +790,7 @@ pub fn compose_all() -> bool {
 /// this order plus those two declines, and it is what `menubar::open_dropdown_rect` reads.
 #[inline]
 pub fn press_route(x: i32, y: i32) -> bool {
-    #[cfg(feature = "login")] if crate::fs::users::screen_press(x, y) { return true; } super::winmenu::press_at(x, y) || super::crystal::press_at(x, y) || super::dock::press_at(x, y) // SO36/SO44 — THE SESSION GATE, a NEW FIRST TERM ahead of the three furniture arms and therefore ahead of every window arm in both routers. Written as a short-circuiting `if` rather than a fourth `||` operand for one reason: `#[cfg]` cannot gate an operand of `||`, and the whole session model must vanish knob-off (`./arroyo knoboff login`). The semantics are the OR-chain's exactly — first term true, nothing below it is evaluated. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
+    #[cfg(feature = "login")] if crate::fs::users::screen_press(x, y) { return true; } super::notify::press_at(x, y) || super::winmenu::press_at(x, y) || super::crystal::press_at(x, y) || super::dock::press_at(x, y) // SO36/SO44 — THE SESSION GATE, a NEW FIRST TERM ahead of the three furniture arms and therefore ahead of every window arm in both routers. Written as a short-circuiting `if` rather than a fourth `||` operand for one reason: `#[cfg]` cannot gate an operand of `||`, and the whole session model must vanish knob-off (`./arroyo knoboff login`). The semantics are the OR-chain's exactly — first term true, nothing below it is evaluated. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
 }
 
 /// **The KEY seam: every furniture surface's `<Esc>` arm.** The twin of [`press_route`], extracted for

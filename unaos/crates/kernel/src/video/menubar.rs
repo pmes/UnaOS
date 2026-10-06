@@ -987,6 +987,7 @@ impl Model {
             }
             None => h = strip::fnv1a(h, 0),
         }
+        h = strip::fnv1a_u64(h, super::notify::bar_sig()); // NOTIFY (B418): the bell's badge and lit state are drawn, so they are in the test
         strip::seal(h)
     }
 }
@@ -1669,6 +1670,7 @@ pub fn menus_right_limit(bar: strip::Rect) -> usize {
     // It is a function of RUNTIME state (is there an item), which is new for this accessor and is
     // accounted for: `Model::signature` folds the item's presence, so an item appearing or going
     // absent repaints the bar and re-lays the titles in the same pass.
+    if let Some(x0) = bell_slot(bw) { return bx + x0.saturating_sub(strip::PAD()); } // NOTIFY (B418): the bell is the status area's leftmost item
     if super::status::bar_item().is_some() {
         if let Some(x0) = batt_slot(bw) {
             return bx + x0.saturating_sub(strip::PAD());
@@ -1929,6 +1931,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     if let (Some(it), Some(bx0)) = (m.batt, batt_slot(w)) {
         draw_battery_glyph(out, w, h, j, bx0, it);
     }
+    bell_row(out, w, h, j); // NOTIFY (B418): the bell status item, left of the battery's slot
 
     // The two texts share a baseline: vertically centred in the bar.
     let ty0 = (h - CELL_H()) / 2;
@@ -1988,6 +1991,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         let tx = bx0 + BATT_GLYPH_W() + BATT_GAP();
         super::text::draw_row(out, w, &pct, (tx + BATT_PCT_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&pct, false, FACE)), sy, theme::TITLE_TEXT_INACTIVE, false, FACE); // KERNELFONT: right-aligned in its slot by the shaped width
     }
+    bell_count(out, w, sy); // NOTIFY (B418): the bell's unread badge
 
     // Clock, right, at one PAD from the far edge — the crystal holds the LEFT corner, so nothing of
     // the brand sits out here. Secondary ink: the title is what the operator is reading, the clock is
@@ -3114,4 +3118,75 @@ pub fn volatile_rects(pw: usize, ph: usize) -> (Option<strip::Rect>, Option<stri
     let gx = bright_slot(w).or_else(|| batt_slot(w));
     let glyphs = gx.map(|x0| (rx + x0, ry, cx.saturating_sub(x0), h));
     (clock, glyphs)
+}
+
+// ── NOTIFY (rmbp-ledger B418, MACPARITY row 24) — THE BELL: the Notification Center's status item ─────────────────
+//
+// Left of the battery's slot (reserved whether or not the board has a battery, as the battery item reserves its
+// own), inside the status area `volatile_rects` already masks. The glyph is ours (a 12-cell bell); the badge is
+// the unread count in accent ink (`9+` past nine). Lit (active ink) while the Center is open or anything is
+// unread. The press cell is [`bell_box_abs`], read by `notify::press_at` — the first furniture arm.
+
+const BELL_BITS: [u16; 12] = [
+    0b0000_0110_0000,
+    0b0000_1111_0000,
+    0b0001_1111_1000,
+    0b0011_1111_1100,
+    0b0011_1111_1100,
+    0b0011_1111_1100,
+    0b0011_1111_1100,
+    0b0111_1111_1110,
+    0b1111_1111_1111,
+    0b0000_0000_0000,
+    0b0000_0110_0000,
+    0b0000_0000_0000,
+];
+#[allow(non_snake_case)] #[inline] fn BELL_G() -> usize { crate::ui::px(12).min(BAR_H().saturating_sub(4)).max(6) }
+#[allow(non_snake_case)] #[inline] fn BELL_ITEM_W() -> usize { BELL_G() + BATT_GAP() + 2 * CELL_W() }
+
+/// The bell item's left inset inside a bar `w` px wide, or `None` when the bar cannot seat it.
+fn bell_slot(w: usize) -> Option<usize> {
+    let x0 = batt_slot(w)?.checked_sub(strip::PAD() + BELL_ITEM_W())?;
+    if x0 < TITLE_X0() + CELL_W() {
+        return None;
+    }
+    Some(x0)
+}
+
+/// NOTIFY — the bell's PRESS cell on the panel (`None` when the bar is off or cannot seat it).
+pub fn bell_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
+    let (rx, ry, w, h) = strip_rect(pw, ph)?;
+    let x0 = bell_slot(w)?;
+    Some((rx + x0, ry, BELL_ITEM_W(), h))
+}
+
+fn bell_row(out: &mut [u32], w: usize, h: usize, j: usize) {
+    let Some(x0) = bell_slot(w) else { return };
+    let g = BELL_G();
+    let y0 = (h - g.min(h)) / 2;
+    if j < y0 || j >= y0 + g {
+        return;
+    }
+    let lit = super::notify::center_open() || super::notify::unread() > 0;
+    let ink = if lit { theme::TITLE_TEXT_ACTIVE } else { theme::TITLE_TEXT_INACTIVE };
+    let bits = BELL_BITS[((j - y0) * 12 / g).min(11)];
+    for u in 0..g {
+        let b = (u * 12 / g).min(11);
+        if bits & (1 << (11 - b)) != 0 {
+            if let Some(d) = out.get_mut(x0 + u).filter(|_| x0 + u < w) {
+                *d = ink;
+            }
+        }
+    }
+}
+
+fn bell_count(out: &mut [u32], w: usize, sy: usize) {
+    let n = super::notify::unread();
+    let Some(x0) = bell_slot(w) else { return };
+    if n == 0 {
+        return;
+    }
+    let mut d = [b' '; 2];
+    let k = if n > 9 { d = *b"9+"; 2 } else { d[0] = b'0' + n as u8; 1 };
+    super::text::draw_row(out, w, &d[..k], x0 + BELL_G() + BATT_GAP(), sy, theme::ACCENT, true, FACE);
 }
