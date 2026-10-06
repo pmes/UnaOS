@@ -254,6 +254,22 @@ pub mod g7regs {
     // that 0xA180 is GPM control, NOT forcewake, even on the silicon where it is pinned.
     pub const HYP_MISC_CTRL0: usize = 0x0A180;
 
+    // [IVB-EXT-I915] GEN7WAKE (B489). The PRM never published the Gen7 GPM block (above), so
+    // the Ivy Bridge forcewake pair is pinned from the open-source driver (Linux i915, the IVB
+    // forcewake domain): request `FORCEWAKE_MT 0xA188` (mask form, the same register as BDW),
+    // ack `FORCEWAKE_MT_ACK 0x130040`, data bit 0 = the kernel thread's bit, ack timeout 50 ms.
+    // Flight 26 boot 3 proved the request half on THIS part: under the `0xA188` hold the BCS
+    // ring block read structured (`RING_CTL 0000F001`) and `0xA188` read back `00010001`; the
+    // ack was polled on BDW's GTSP1 `0x130044`, which is not IVB's ack.
+    pub const IVB_FORCEWAKE_MT_ACK: usize = 0x130040;
+    // [IVB-EXT-I915] ECOBUS: bit 5 `FORCEWAKE_MT_ENABLE` set (read under a hold) means the part
+    // runs the MT pair; clear means the legacy pair (`0xA18C` / `0x130090`). Read-only here.
+    pub const IVB_ECOBUS: usize = 0x0A180;
+    pub const IVB_ECOBUS_MT_ENABLE: u32 = 1 << 5;
+    // [IVB-EXT-I915] GEN6_GT_CORE_STATUS: bits 2:0 = the GT's RC state (0 RC0, 2 RC3, 3 RC6,
+    // 4 RC7). Always-on block; read FIRST, before any request, as the wake's entry state.
+    pub const IVB_GT_CORE_STATUS: usize = 0x138060;
+
     // [CHV-ONLY] Intel Open Source Graphics PRM, Volume 2c: Command Reference: Registers
     // (Cherryview/Braswell), Doc Ref # IHD-OS-CHV-BSW-Vol 2c-10.15.
     // URL: https://cdrdv2-public.intel.com/689936/intel-gfx-bspec-osrc-chv-bsw-vol-2-c-command-reference-registers.pdf
@@ -1600,6 +1616,10 @@ fn motion_filtered(
 /// R6 runs up to three candidates, so the worst case this term contributes to boot is ~24 ms.
 const FW_ACK_BUDGET_CYC: u64 = 20_000_000;
 
+/// GEN7WAKE (B489): R3's MT-candidate ack budget — the IVB driver's 50 ms forcewake-ack timeout at
+/// this part's ~2.5 GHz invariant TSC. A real ack ends the poll early; only a silent ack pays it.
+const FW_ACK_BUDGET_IVB_CYC: u64 = 125_000_000;
+
 /// Ring-execution budget (head reaching tail, or the sentinel landing). ~20 ms.
 const EXEC_BUDGET_CYC: u64 = 50_000_000;
 
@@ -1668,6 +1688,8 @@ struct FwHold {
     /// The ack register's value when the poll ended.
     ack_post: u32,
     class: FwClass,
+    /// GEN7WAKE: TSC cycles from the request write to the end of the ack poll.
+    ack_cyc: u64,
 }
 
 impl FwHold {
@@ -1793,6 +1815,7 @@ unsafe fn fw_acquire(
         acq_post,
         ack_post: ack,
         class,
+        ack_cyc: cyc,
     }
 }
 
@@ -1869,9 +1892,13 @@ unsafe fn try_candidate(
     // The preheld guard that used to stand here is RETIRED — see the block above `fw_acquire`
     // for why, and for what replaces it (an additive write plus an exact-dword restore, which
     // protect a hypothetical other owner strictly better than a skip did).
+    // GEN7WAKE: the GT's RC state, read FIRST (always-on block), before the request.
+    let rc_entry = rd(bar0, g7regs::IVB_GT_CORE_STATUS);
     let hold = fw_acquire(
         bar0, "r3", cand, class_pin, req_off, ack_off, ack_mask, src, mask_form, ack_budget_cyc,
     );
+    // GEN7WAKE: ECOBUS read UNDER the hold (a GT-domain register reads zero in RC6).
+    let ecobus = rd(bar0, g7regs::IVB_ECOBUS);
 
     // ---- The held column -------------------------------------------------------------------
     // Read whether or not the ack asserted: an ack register in the wrong place would not stop
@@ -1896,6 +1923,9 @@ unsafe fn try_candidate(
     // Together they return the register to its entry value under EITHER semantics, which
     // matters because which semantics this part implements is precisely what is unpinned.
     let (restored, evidence) = fw_release(bar0, "r3", &hold);
+    if cand == "mt" {
+        wake_witness(&hold, rc_entry, ecobus, m.live());
+    }
 
     // ⚠ WALL D, APPLIED TO THIS RUNG'S OWN SAFETY WITNESS (review, GR26). `restored=1` above
     // is `req_post == req_pre` AND `ack_post == ack_pre` — and on the readings Boot D
@@ -2044,13 +2074,13 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
     let (out_a, m_a, rest_a, ev_a) = try_candidate(
         bar0,
         "mt",
-        "BDW-ONLY",
+        "IVB-EXT-I915",
         g7regs::HYP_FORCEWAKE_MT,
-        g7regs::HYP_FORCEWAKE_MT_ACK,
-        0x0000_FFFF,
-        "BDW-2c-11.15-p493/p703",
+        g7regs::IVB_FORCEWAKE_MT_ACK, // GEN7WAKE: IVB's MT ack, not BDW's GTSP1 0x130044 (flight 26)
+        0x0000_0001,
+        "BDW-2c-11.15-p493/IVB-EXT-I915-FORCEWAKE_MT_ACK",
         true, // mask-write form, per BDW p.493
-        FW_ACK_BUDGET_CYC,
+        FW_ACK_BUDGET_IVB_CYC,
         &before,
         &before_var,
     );
@@ -3809,11 +3839,11 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
 const R6_CANDS: &[(&str, &str, usize, usize, u32, &str, bool)] = &[
     (
         "mt",
-        "BDW-ONLY",
+        "IVB-EXT-I915",
         g7regs::HYP_FORCEWAKE_MT,
-        g7regs::HYP_FORCEWAKE_MT_ACK,
-        0x0000_FFFF,
-        "BDW-2c-11.15-p493/p703",
+        g7regs::IVB_FORCEWAKE_MT_ACK, // GEN7WAKE: IVB's MT ack, data bit 0 (flight 26 polled BDW's 0x130044)
+        0x0000_0001,
+        "BDW-2c-11.15-p493/IVB-EXT-I915-FORCEWAKE_MT_ACK",
         true,
     ),
     (
@@ -7403,3 +7433,44 @@ mod ladder {
 #[cfg(feature = "gen7blit")]
 #[path = "gen7_blit.rs"]
 pub mod blit;
+
+// ===================================================================================
+// GEN7WAKE (B489) — the IVB forcewake witness. One line per `tests gen7`, printed by R3's MT
+// candidate after its release; the ladder line reads the same record for its DECLINED reason.
+// ===================================================================================
+
+/// `(ack dword, ECOBUS under the hold, GT_CORE_STATUS at entry, reason)` of this boot's R3 MT hold.
+static WAKE_WIT: crate::sync::Mutex<Option<(u32, u32, u32, &'static str)>> = crate::sync::Mutex::new(None);
+
+/// The `[gen7] wake` witness: the request, the ack (IVB's `0x130040`), how long the poll took, the
+/// RC state read before the request and ECOBUS read under it, and the one-word reason.
+fn wake_witness(h: &FwHold, rc_entry: u32, ecobus: u32, live: bool) {
+    let hz = crate::arch::apic::tsc_hz();
+    let hz = if hz == 0 { 2_500_000_000 } else { hz };
+    let after_us = h.ack_cyc.saturating_mul(1_000_000) / hz;
+    let mt_enable = (ecobus & g7regs::IVB_ECOBUS_MT_ENABLE) != 0;
+    let acked = h.class == FwClass::AckTransition;
+    let reason = match (h.class, live, mt_enable) {
+        (FwClass::AckTransition, true, _) => "mt-ack-bit0-set",
+        (FwClass::AckTransition, false, _) => "mt-ack-bit0-set-battery-dark",
+        (FwClass::AckUnreadable, _, _) => "ack-bit0-already-set-at-entry",
+        (_, true, false) => "ecobus-mt-disabled-legacy-pair-owed",
+        (_, true, true) => "mt-enabled-ack-silent",
+        (_, false, _) => "gt-did-not-wake",
+    };
+    serial_println!(
+        "[gen7] wake req={:06X}:{:08X} ack={:06X}:{:08X} after_us={} rc={} ecobus={:08X} mt_enable={} live={} -> {} reason={}",
+        h.req_off,
+        h.wrote,
+        h.ack_off,
+        h.ack_post,
+        after_us,
+        rc_entry & 7,
+        ecobus,
+        mt_enable as u32,
+        live as u32,
+        if acked { "acked" } else { "noack" },
+        reason
+    );
+    *WAKE_WIT.lock() = Some((h.ack_post, ecobus, rc_entry & 7, reason));
+}
