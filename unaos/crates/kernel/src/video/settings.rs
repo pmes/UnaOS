@@ -586,11 +586,13 @@ struct UsersUi {
     pw2: String,
     confirm: Option<String>,
     msg: String,
+    /// FIRSTUSER (R100): the new user's role — the form's Admin toggle (standard by default).
+    admin: bool,
 }
 
 impl UsersUi {
     fn new() -> Self {
-        UsersUi { sel: 0, form: false, focus: 0, name: String::new(), pw: String::new(), pw2: String::new(), confirm: None, msg: String::new() }
+        UsersUi { sel: 0, form: false, focus: 0, name: String::new(), pw: String::new(), pw2: String::new(), confirm: None, msg: String::new(), admin: false }
     }
 }
 
@@ -620,7 +622,7 @@ fn user_list() -> Vec<(String, bool)> {
 
 fn is_root() -> bool {
     #[cfg(feature = "login")]
-    { crate::fs::users::root_session() }
+    { crate::fs::users::privileged() } // FIRSTUSER (R100): the administrator's session (or the system principal before login)
     #[cfg(not(feature = "login"))]
     { false }
 }
@@ -631,19 +633,21 @@ fn users_say(op: &str, name: &str, ok: bool, reason: &str) {
 }
 
 /// Add a user (root only): the create-user form's rules, then the `adduser` path and a first password.
-fn users_add(name: &str, pw: &str, pw2: &str) -> Result<(), &'static str> {
+fn users_add(name: &str, pw: &str, pw2: &str, admin: bool) -> Result<(), &'static str> {
     #[cfg(feature = "login")]
     {
         use crate::fs::users;
+        users::admin_authority("settings-users-add")?; // FIRSTUSER (R100): `[auth] admin=<name> for=settings-users-add`
         users::create_user_rules(name.as_bytes(), pw.as_bytes())?;
         if pw != pw2 { return Err("Passwords do not match"); }
         users::adduser_commit(name.as_bytes())?;
         if users::set_first_password(name.as_bytes(), pw.as_bytes()).is_err() { return Err("Could not save the password"); }
+        if admin && users::set_role(name.as_bytes(), users::Role::Admin).is_err() { return Err("Created, but not as an administrator"); }
         U_ADDED.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
     #[cfg(not(feature = "login"))]
-    { let _ = (name, pw, pw2); Err("login-feature-off") }
+    { let _ = (name, pw, pw2, admin); Err("login-feature-off") }
 }
 
 /// Delete through the real `deluser` verb (so its refusals and its `[users]` witness are the verb's own).
@@ -688,13 +692,15 @@ fn paint_users(st: &mut State) {
         field(st, 3, &p, f);
         btn(st, 4, TRACK_X, "Create");
         btn(st, 4, TRACK_X + BTN_W + 10, "Cancel");
+        let role = if st.u.admin { "Admin: yes" } else { "Admin: no" };
+        btn(st, 4, TRACK_X + 2 * (BTN_W + 10), role); // FIRSTUSER (R100): admin or standard — Settings > Users is the one place
     } else {
         txt(st, LABEL_X, 0, &alloc::format!("Users ({})", list.len()));
-        if root { btn(st, 0, TRACK_X, "Add user"); } else { txt(st, TRACK_X, 0, "(only root can change the list)"); }
+        if root { btn(st, 0, TRACK_X, "Add user"); } else { txt(st, TRACK_X, 0, "(only an administrator can change the list)"); }
         let sel = st.u.sel.min(list.len().saturating_sub(1));
         for (i, (nm, unset)) in list.iter().enumerate().take(8) {
             let r = 1 + i;
-            let tag = if *nm == me { " (you)" } else if *unset { " (no password)" } else { "" };
+            let tag = if *nm == me { " (you)" } else if *unset { " (no password)" } else if users_is_admin(nm) { " (admin)" } else { "" };
             let w = st.w;
             if i == sel { fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::ACCENT); }
             txt(st, LABEL_X, r, &alloc::format!("{}{}", nm, tag));
@@ -715,8 +721,8 @@ fn paint_users(st: &mut State) {
 }
 
 fn users_form_submit() {
-    let (n, p, p2) = { let s = STATE.lock(); match s.as_ref() { Some(s) => (s.u.name.clone(), s.u.pw.clone(), s.u.pw2.clone()), None => return } };
-    let r = users_add(&n, &p, &p2);
+    let (n, p, p2, adm) = { let s = STATE.lock(); match s.as_ref() { Some(s) => (s.u.name.clone(), s.u.pw.clone(), s.u.pw2.clone(), s.u.admin), None => return } };
+    let r = users_add(&n, &p, &p2, adm);
     if let Some(s) = STATE.lock().as_mut() {
         match r {
             Ok(()) => { s.u.form = false; s.u.msg = alloc::format!("added {}", n); }
@@ -1020,6 +1026,7 @@ fn press_users(row: usize, cx: usize) {
             4 => {
                 if in_b(TRACK_X) { users_form_submit(); }
                 else if in_b(TRACK_X + BTN_W + 10) { if let Some(s) = STATE.lock().as_mut() { s.u.form = false; } repaint(); }
+                else if in_b(TRACK_X + 2 * (BTN_W + 10)) { if let Some(s) = STATE.lock().as_mut() { s.u.admin = !s.u.admin; } repaint(); } // FIRSTUSER (R100): the role toggle
             }
             _ => {}
         }
@@ -1092,7 +1099,7 @@ pub fn selftest_users() {
     let listed = list.len();
     let root = is_root();
     let had = list.iter().any(|x| x.0 == T);
-    let add = users_add(T, "tmp-pw1", "tmp-pw1");
+    let add = users_add(T, "tmp-pw1", "tmp-pw1", false);
     users_say("add", T, add.is_ok(), add.err().unwrap_or("created"));
     let present = user_list().iter().any(|x| x.0 == T);
     let del = users_delete(T);
@@ -1705,4 +1712,12 @@ fn dock_rows_press(row: usize, cx: usize) {
         return;
     }
     repaint();
+}
+
+/// FIRSTUSER (R100): is `name` an administrator (the Users list's ` (admin)` tag)?
+fn users_is_admin(name: &str) -> bool {
+    #[cfg(feature = "login")]
+    { crate::fs::users::role_of(name.as_bytes()) == Some(crate::fs::users::Role::Admin) }
+    #[cfg(not(feature = "login"))]
+    { let _ = name; false }
 }

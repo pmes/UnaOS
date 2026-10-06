@@ -1457,3 +1457,8 @@ pub fn power_fire(kind: u8) {
 pub fn has_row(label: &str) -> bool {
     ROWS.iter().any(|r| r.label == label)
 }
+/// FIRSTUSER (B409, R100): the login window's users list — the generic avatar, the lock screen's look, the power-row hook.
+/// Beside `login`, under its gate; `#[path]` resolves to `video/loginwindow.rs`.
+#[cfg(feature = "login")]
+#[path = "loginwindow.rs"]
+pub mod loginwindow;

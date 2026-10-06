@@ -462,8 +462,10 @@ fn user_row(px: &mut [u32], i: usize, name: &[u8], picked: bool) {
     fill(px, x, y, w, h, if picked { theme::ACCENT } else { theme::CONTENT_FILL });
     rect(px, x, y, w, h, if picked { theme::ACCENT } else { theme::FRAME_LINE });
     let max = crate::video::text::fit(name, false, FACE, super::super::metrics::size(w - 12)); // UIMETRICS: the physical width // KERNELFONT: whole glyphs that fit. LOGINFONT
+    let ax = super::loginwindow::avatar(&mut |ax, ay, aw, ah, c| fill(px, ax, ay, aw, ah, c), x + 3, y + 3, h.saturating_sub(6), picked); // FIRSTUSER (R100): the generic avatar on every user tile (`loginwindow.rs`)
+    let max = max.min(crate::video::text::fit(name, false, FACE, super::super::metrics::size(w.saturating_sub(12 + ax)))); // FIRSTUSER: the name fits beside the avatar
     let n = name.len().min(max);
-    text(px, x + 6, y + 4, &name[..n], if picked { theme::BEVEL_LIGHT } else { theme::CONTENT_TEXT });
+    text(px, x + 6 + ax, y + 4, &name[..n], if picked { theme::BEVEL_LIGHT } else { theme::CONTENT_TEXT });
 }
 
 fn repaint() {
@@ -477,7 +479,7 @@ fn repaint() {
     rect(px, 2, 2, W - 4, H - 4, theme::FRAME_LINE);
     if f.state == State::CreateUser {
         // FIRSTBOOT (R77): "Create your account" — name, password, retype, Create.
-        text(px, LX, 14, b"Create your account", theme::CONTENT_TEXT);
+        text(px, LX, 14, b"Create your administrator account", theme::CONTENT_TEXT); // FIRSTUSER (R100): the first user is the administrator
         fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
         let (nx, ny, nw, _) = cu_rect(Ctl::NameField);
         text(px, LX, ny + 4, b"Name", theme::TITLE_TEXT_INACTIVE);
@@ -544,6 +546,7 @@ fn repaint() {
             user_row(px, i, &nb[..n], f.name_len == n && f.name[..n] == nb[..n]);
         }
     }
+    if locked { if let Some(n) = users::whoami(&mut nb) { user_row(px, 0, &nb[..n], true); } } // FIRSTUSER (R100): the lock screen has the login window's look — the session's own tile and avatar
     let (nx, ny, nw, _) = ctl_rect(Ctl::NameField, false);
     text(px, LX, ny + 4, b"Name", theme::TITLE_TEXT_INACTIVE);
     field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
@@ -628,7 +631,7 @@ pub fn open_set_password(name: &[u8], login_after: bool) {
 pub fn open_create_user() {
     FORM.lock().state = State::Closed;
     open_as(State::CreateUser);
-    serial_println!("[login] installer: create-user form open (R77: name, password, retype; the adduser path; the desktop ignites for that user)");
+    serial_println!("[login] installer: first-user form open (R100: name, password, retype; that user is the administrator; root is locked; the desktop ignites for them)");
     repaint();
 }
 
@@ -1086,7 +1089,7 @@ fn apply_create(n: &[u8], made: Result<(), &'static str>, session: bool) {
     match session {
         true => {
             LOGINS.fetch_add(1, Ordering::Relaxed);
-            serial_println!("[login] session open user={} (R77: the first user; root is not the assumed login)", who);
+            serial_println!("[login] session open user={} role=admin (R100: the first user is the administrator; root is locked)", who);
             close_into_session();
             users::installer_desktop_ignite();
         }
@@ -2016,7 +2019,7 @@ pub fn shot_bare_open(setter: bool) -> bool {
     }
     FORM.lock().state = State::Closed;
     if setter {
-        open_set_password(users::ROOT_NAME, false);
+        open_create_user(); // FIRSTUSER (R100): boot 1's one screen is the first-user form (root has no setter)
     } else {
         open_as(State::Open);
         repaint();
