@@ -34,6 +34,8 @@ use alloc::vec::Vec;
 pub mod anim;
 pub mod bmp;
 pub mod crc;
+pub mod facts;
+pub use facts::{facts_of, ImageFacts};
 pub mod gif;
 pub mod inflate;
 pub mod jpeg;

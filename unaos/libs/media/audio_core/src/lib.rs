@@ -42,6 +42,8 @@ pub mod aac;
 pub mod aiff;
 pub mod bits;
 pub mod crc;
+pub mod facts;
+pub use facts::{facts_of, AudioFacts};
 pub mod flac;
 pub mod io;
 pub mod math;
