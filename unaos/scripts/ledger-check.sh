@@ -175,6 +175,10 @@ def heads():
                           "refs/remotes/origin/hw-*", "refs/remotes/origin/main"], capture_output=True, text=True).stdout.split()
     return out
 HEADS = heads()
+# GATEREVIEW F11: in a shallow clone `cat-file -e` fails for every sha past the cut — 218 of 384 reds on a depth-50
+# container were that. A missing sha there is NO VERDICT, counted and said, never a red and never a pass.
+SHALLOW = subprocess.run(["git", "rev-parse", "--is-shallow-repository"], capture_output=True, text=True).stdout.strip() == "true"
+SHALLOW_SKIP = set()
 def reachable(s):
     return any(subprocess.run(["git", "merge-base", "--is-ancestor", s, h], capture_output=True).returncode == 0 for h in HEADS)
 
@@ -505,7 +509,9 @@ for path in files:
                     continue   # author-declared artifact digest, not a commit
                 bare.add(m.group(1))
             for s in sorted(bare):
-                if not sha_exists(s):
+                if not sha_exists(s) and SHALLOW:
+                    SHALLOW_SKIP.add(s)
+                elif not sha_exists(s):
                     red.append(f"{where}: {rid} names sha {s} which is not a commit in this repo")
                 elif head in FETCHED and not reachable(s):
                     red.append(f"{where}: {rid} is `{head}` but sha {s} is not an ancestor of any track head")
@@ -1018,6 +1024,8 @@ if deferred:
 # three identical findings, and duplicate findings are how a gate teaches people to skim its output.
 # Order-preserving so the first occurrence still reads in file order.
 red = list(dict.fromkeys(red))
+if SHALLOW_SKIP:
+    say(f"SHALLOW CLONE — {len(SHALLOW_SKIP)} cited sha(s) not in this clone: NO VERDICT on them (unshallow to judge them); NOT a pass")
 deferred = list(dict.fromkeys(deferred))
 def _notation_note():
     # LAST line of either verdict: the escape is only honest if its use is COUNTED and said out loud.
@@ -1030,6 +1038,8 @@ if red:
     for r in red: detail(r)
     _notation_note()
     sys.exit(1)
+if SHALLOW_SKIP:
+    sys.exit(2)  # GATEREVIEW F11: no red, but the shas were not judged — no verdict, never OK
 _defnote = f", {len(deferred)} cross-branch ref(s) deferred" if deferred else ""
 say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS + {len(QUEUES)} queue file(s): ids unique, field counts match their header, absence claims name an enumeration (lexical sampler — see the header), status ∈ enum, owners known, cross-refs resolve{_defnote}, every deferral names an owner and an expiry, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>, no conflict markers, every queue citation resolves, one STATE line per claim, every ledger row ends at its final pipe, no row lost at a fold")
 _notation_note()
