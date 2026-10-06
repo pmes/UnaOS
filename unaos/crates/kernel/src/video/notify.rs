@@ -179,6 +179,8 @@ struct Card {
     win: wm::WinId,
     until: u64,
     surf: usize,
+    /// NOTICEFIX (B491): the pass clock the card was shown at (the timeout close's `after_ms`).
+    at: u64,
 }
 
 struct St {
@@ -456,7 +458,7 @@ fn close_card(st: &mut St, i: usize, by: &str) -> Option<Note> {
     Some(c.n)
 }
 
-fn show_card(st: &mut St, n: Note, pw: usize) {
+fn show_card(st: &mut St, n: Note, pw: usize, now: u64) {
     if st.cards[STACK_MAX - 1].is_some() {
         let _ = close_card(st, STACK_MAX - 1, "overflow");
         restack(st, pw);
@@ -471,7 +473,7 @@ fn show_card(st: &mut St, n: Note, pw: usize) {
     let f0 = wm::focus_asid();
     let (x, y, _, _) = card_rect(pw, 0);
     let win = open_row(sf, x, y);
-    st.cards[0] = Some(Card { n, win, until: crate::arch::ms().saturating_add(CARD_MS).max(1), surf: sf });
+    st.cards[0] = Some(Card { n, win, until: now.saturating_add(CARD_MS).max(1), surf: sf, at: now }); // NOTICEFIX (B491): the pass's clock, never a second read of it
     restack(st, pw);
     let kept = wm::focus_asid() == f0;
     if !kept {
@@ -678,7 +680,7 @@ fn pass(now: u64) {
         }
         if wire() { serial_println!("[notify] post app={} title={} dnd={} -> {}", s(n.app()), s(n.title()), dnd_now as u8, if collect { "collected" } else { "banner" }); }
         if !collect {
-            show_card(&mut st, *n, pw);
+            show_card(&mut st, *n, pw, now);
         }
     }
     if let Some(n) = sound {
@@ -744,6 +746,8 @@ fn pass(now: u64) {
             continue;
         }
         if now >= c.until {
+            let after = now.saturating_sub(c.at);
+            if wire() { serial_println!("[notify] toast close reason=timeout after_ms={}", after); } // NOTICEFIX (B491)
             let _ = close_card(&mut st, i, "timeout");
             closed = true;
         }
@@ -984,4 +988,26 @@ fn bell_switch() {
     }
     super::crystal::dismiss_for_switch();
     serial_println!("[notify] switch from={} to=center", super::status::item_name(i));
+}
+
+// ── NOTICEFIX (rmbp-ledger B491) — `tests notice` drives the REAL card store, model-only ──────────────────
+
+/// The live stack, ring and Center set aside while a fixture runs headless ([`fixture_restore`] puts them back).
+pub struct FixtureHeld(Held);
+
+/// Hold the live notification state and go headless: a fixture's card never reaches the glass, the ring or the badge.
+pub fn fixture_hold() -> FixtureHeld {
+    FixtureHeld(hold())
+}
+
+pub fn fixture_restore(h: FixtureHeld) {
+    restore(h.0)
+}
+
+/// Run one pass at the latest card's own `until` (the clock it was shown on), so the time-close is the real one.
+pub fn expire_now() {
+    let due = ST.lock().cards.iter().flatten().map(|c| c.until).max();
+    if let Some(t) = due {
+        pass(t.max(crate::arch::ms()));
+    }
 }

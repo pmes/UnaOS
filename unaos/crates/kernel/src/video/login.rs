@@ -2135,6 +2135,7 @@ pub fn notice_typing_fixture() {
     let prev_state = FORM.lock().state;
     let dwas = crate::video::dialog::headless(true);
     let held = crate::video::toast::fixture_hold(true);
+    let nheld = crate::video::notify::fixture_hold(); // NOTICEFIX (B491): the fixture's card is model-only, never the glass's
     FORM.lock().state = State::Session;
     let _ = crate::video::dialog::notice(b"Storage read-only", b"fixture.elf");
     crate::video::dialog::open_now();
@@ -2157,6 +2158,7 @@ pub fn notice_typing_fixture() {
     crate::video::toast::expire_now();
     crate::video::toast::service();
     let timed_out = !crate::video::toast::showing() && !crate::video::dialog::is_up();
+    crate::video::notify::fixture_restore(nheld);
     crate::video::toast::fixture_hold_restore(held);
     crate::video::dialog::headless(dwas);
     FORM.lock().state = prev_state;

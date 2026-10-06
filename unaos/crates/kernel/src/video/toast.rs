@@ -144,10 +144,7 @@ pub fn current_is_glass() -> bool {
 
 /// Expire the toast on the glass at the next service pass (the fixture's clock).
 pub fn expire_now() {
-    let mut g = TQ.lock();
-    if g.cur.is_some() {
-        g.until = 1;
-    }
+    super::notify::expire_now(); // NOTICEFIX (B491): the card lives in NOTIFY's stack, not `TQ.cur` (never set since B418)
 }
 
 /// Toasts waiting (not counting the one showing).
