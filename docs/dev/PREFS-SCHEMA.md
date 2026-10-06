@@ -8,7 +8,11 @@ Principia. A write to a declared key goes through `prefs_core::schema::check`: a
 its range is CLAMPED and answered `clamped=true`; a wrong type, a string outside its enum, an over-long
 or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keeps its own namespace).
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
-operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
+operator (`pref set`, host `PrefSet`, a hand edit).
+
+PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`, the namespace named
+after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
+from ring 3 (`prefs_core::cap`).
 
 Rows: 47.
 
