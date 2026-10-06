@@ -16843,6 +16843,9 @@ fn load_program_common(bytes: &[u8]) -> Result<(super::elf::Mapped, usize), &'st
     if bytes.len() > user_image_cap() {
         return Err("image larger than the user image cap (USER_WINDOW_BYTES)");
     }
+    if !proc_admit() {
+        return Err("process limit reached (R90: memory's limit, `[wm] limit` line) — the launcher was paused");
+    }
     let Some(pi) = proc_reserve() else {
         // PROCREAP: `proc_reserve` has already run the BGRUN-SCAV sweep, so this refusal names what is
         // genuinely un-reclaimable rather than advising a `jobs` that cannot help.
@@ -30375,3 +30378,84 @@ fn win_table_grow(t: &mut alloc::vec::Vec<WinEntry>) -> Option<usize> {
 /// WINDOWCAP3: the `vugres_selftest` scratch slot (was `USER_SLOTS - 1`), so the present outcome can tell
 /// the fixture's first present from a real program's. `usize::MAX` until the fixture runs.
 static VUGRES_FIX_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// WINDOWCAP3 (B399): the kernel launchers' (`run`, `bg`, the desktop app, the fixtures) half of the spawn
+/// valve `sys_spawn` already has. The process table grows now, so it can no longer be what stops a storm:
+/// memory's limit (`video::wincap::proc_limit`) is asked here, and a refusal says so on the wire and PAUSES
+/// the launching task (`note_spawn_refused`'s doubling backoff), never the machine.
+fn proc_admit() -> bool {
+    let running = proc_table_headroom().1;
+    if running >= crate::video::wincap::proc_limit() {
+        crate::video::wincap::note_spawn_refused(running);
+        return false;
+    }
+    crate::video::wincap::note_spawn_admitted();
+    true
+}
+
+/// WINDOWCAP3 — `tests spawnstorm`: a ring-3 storm against the process limit. Launches a one-page flat
+/// program that parks forever (`SYS_SLEEP_MS(1000)` in a loop) through the production `bg` path until the
+/// launch is REFUSED, timing the refused launch (the valve's pause), then kills every tenant and waits for
+/// the rows and slots to come back. One line:
+/// `:: WINDOWCAP3: fixed_pools=none procs_limit=<n> from=mem spawned=<n> refused_at=<n> paused_ms=<n> machine_alive=1 -> PASS ::`
+/// PASS: at least one tenant launched, the refusal came exactly at the limit (`refused_at == procs_limit`,
+/// counting the programs already running), the valve paused the launcher (`paused_ms >= 50`), every
+/// tenant was reaped, and the heap still has room (`machine_alive`). Owed reading: `slots=` (address-space
+/// records the pool holds) and `heap_free_mib=` before/after, for the stack-and-heap measure.
+#[cfg(feature = "witness")]
+pub fn spawnstorm_selftest() {
+    if crate::tests::defer("spawnstorm", spawnstorm_selftest) {
+        return;
+    }
+    // mov eax, SYS_SLEEP_MS ; mov edi, 1000 ; syscall ; jmp <start>   (position-independent, one page)
+    const IMG: [u8; 14] = [0xB8, SYS_SLEEP_MS as u8, 0, 0, 0, 0xBF, 0xE8, 0x03, 0, 0, 0x0F, 0x05, 0xEB, 0xF2];
+    let limit = crate::video::wincap::proc_limit();
+    let base = proc_table_headroom().1;
+    let heap0 = crate::allocator::heap_census(4096).free;
+    let mut tenants: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    let mut refused_at = 0usize;
+    let mut paused_ms = 0u64;
+    let mut why = "none";
+    // Bounded by the limit itself plus a margin: a valve that never refuses ends the storm as a FAIL, not a hang.
+    for _ in 0..limit.saturating_add(4) {
+        let running = proc_table_headroom().1;
+        let t0 = crate::arch::ms();
+        match spawn_user_image_bg(&IMG) {
+            Ok((pid, slot, _)) => tenants.push((pid, slot)),
+            Err(e) => {
+                paused_ms = crate::arch::ms().saturating_sub(t0);
+                refused_at = running;
+                why = e;
+                break;
+            }
+        }
+    }
+    let spawned = tenants.len();
+    let slots = crate::arch::memory::slot_records();
+    for &(pid, slot) in &tenants {
+        let _ = bg_kill(pid, slot);
+    }
+    let dl = crate::arch::ticks() + 3000;
+    while proc_table_headroom().1 > base && crate::arch::ticks() < dl {
+        crate::arch::sched::yield_now();
+    }
+    let reaped = proc_table_headroom().1 <= base;
+    let heap1 = crate::allocator::heap_census(4096).free;
+    let alive = heap1 > 0;
+    let ok = spawned >= 1 && refused_at == limit && paused_ms >= 50 && reaped && alive;
+    serial_println!(
+        ":: WINDOWCAP3: fixed_pools=none procs_limit={} from=mem spawned={} refused_at={} paused_ms={} machine_alive={} -> {} :: base={} reaped={} slots={} heap_free_mib={}->{} refusal=\"{}\"",
+        limit,
+        spawned,
+        refused_at,
+        paused_ms,
+        alive as u8,
+        if ok { "PASS" } else { "FAIL" },
+        base,
+        reaped as u8,
+        slots,
+        heap0 >> 20,
+        heap1 >> 20,
+        why
+    );
+}

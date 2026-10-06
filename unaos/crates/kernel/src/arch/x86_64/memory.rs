@@ -586,6 +586,8 @@ static SLOT_MEM: crate::procslot::SlotVec<core::sync::atomic::AtomicPtr<SlotMem>
 static SLOT_USED: crate::procslot::SlotVec<AtomicBool> =
     crate::procslot::SlotVec::new(|| AtomicBool::new(false), AtomicBool::new(true));
 static SLOT_RECORDS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// WINDOWCAP3: one slot's heap record in bytes — `video::wincap`'s per-process memory cost carries it.
+pub const SLOT_RECORD_BYTES: usize = core::mem::size_of::<SlotMem>();
 
 /// WINDOWCAP3: slot `s`'s record, if one was ever allocated. Never allocates (safe from an ISR).
 #[inline]
