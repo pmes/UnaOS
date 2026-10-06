@@ -1,6 +1,6 @@
 # FOLDERVIEW (rmbp-ledger B424) — a folder remembers its view, on the folder (MACPARITY §16 B6)
 
-Branch `exec-rmbp-folderview`, cut from df15f19d. Be's Tracker kept `_trk/pinfo` and `_trk/columns` ON the folder.
+Branch `exec-rmbp-folderview`, cut from df15f19d; merged exec-rmbp-merge17 (QUARRY3) because df15f19d does not compile. Be's Tracker kept `_trk/pinfo` and `_trk/columns` ON the folder.
 
 ## Finding
 Quarry's sort and column widths are ONE global view: QUARRY2's `columns.rs` loads them from Principia's `quarry`
@@ -41,6 +41,8 @@ of `live` attached at live.rs's tail (one tail hunk, no existing line touched); 
 - `tests folderview` → `:: FOLDERVIEW: folder=<test dir> mode=list cols=<n> sort=<k> frame=<w>x<h> restored=<0|1> codec=ok inherit=ok reset=ok fat_writable=0 -> PASS ::`.
 
 ## Owed
-- `mode=icons` is stored and inherited but nothing draws it until QUARRY3's icon view (B413) calls `folderview::set_mode`.
+- The mode is QUARRY3's switcher (`toolbar::View`, merged at merge17): `set_view` latches it, `enter` applies it (`toolbar::apply_mode`).
+  A search's hit list (shown as `/`) is not a folder: nothing is resolved or saved for it.
+- `tests quarry3`'s off-glass `Model::new` + `navigate` passes through `enter` (the view state is global, like ATTRCOLUMNS').
 - Quarry's window is fixed-size: the frame's size is recorded, only its position is restored (clamped).
 - One Quarry window: a frame is restored on REOPEN (Tracker's one-window-per-folder is not this shape).

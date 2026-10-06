@@ -6,6 +6,8 @@
 //! FOLDERVIEW (rmbp-ledger B424) — a folder REMEMBERS ITS VIEW, on the folder (MACPARITY §16 B6; Be's Tracker
 //! kept `_trk/pinfo` and `_trk/columns` as attributes of the folder, so the view travelled with it).
 //!
+//! * **The mode** is QUARRY3's list/icons switcher (`toolbar::View`): applied on entering a folder, latched when
+//!   the switcher changes it.
 //! * **The keys** (attributes ON the folder, written as the kernel — the system's bookkeeping about the folder,
 //!   through the one VFS attribute API ATTRCOLUMNS uses; no dotfile, no second store, R79):
 //!   [`MODE`] `list|icons` · [`COLUMNS`] `size=9,modified=16,type=12,origin=28` · [`SORT`] `name|size|mtime|type`
@@ -282,7 +284,7 @@ static FV: spin::Mutex<Fv> = spin::Mutex::new(Fv {
 /// The menu pick, latched for the service pass (1 = Use as Default, 2 = Reset to Default).
 static ACTION: AtomicU32 = AtomicU32::new(0);
 
-/// The current folder's view mode (`list` / `icons`) — QUARRY3's view switcher reads this.
+/// The current folder's view mode (`list` / `icons`).
 pub fn mode() -> String {
     let m = FV.lock().mode.clone();
     if m.is_empty() { String::from("list") } else { m }
@@ -324,15 +326,21 @@ fn attr_sort_key() -> Option<String> {
 /// own view and applies it to the column state. Inside `MODEL` → `COLS`.
 pub(super) fn enter(cwd: &str, st: &mut ColState) {
     let attr_now = attr_sort_key();
+    let searching = super::toolbar::search_active();
     let flush = {
         let mut f = FV.lock();
-        if f.dir == cwd {
+        if f.dir == cwd && !searching {
             return;
         }
         let out = (f.dirty && f.writable && !f.dir.is_empty()).then(|| (f.dir.clone(), snapshot(st, &f, attr_now)));
         f.dirty = false;
         if let Some(o) = out.clone() {
             f.pending.push(o);
+        }
+        if searching {
+            // QUARRY3's search hits are listed as `/`: not a folder, so nothing is resolved or saved for them.
+            f.dir.clear();
+            return;
         }
         out.is_some()
     };
@@ -346,6 +354,7 @@ pub(super) fn enter(cwd: &str, st: &mut ColState) {
         cwd, src, writable as u8, v.mode, enc_sort(&v), enc_columns(&v.widths),
         if flush { " (flushed the last folder's change)" } else { "" }
     );
+    super::toolbar::apply_mode(&v.mode);
     let mut f = FV.lock();
     f.dir = String::from(cwd);
     f.src = src;
