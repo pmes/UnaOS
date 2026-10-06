@@ -18,14 +18,14 @@
 //!   names and icons are APPRES's. Files: `fs::search` (the name trees, one bounded walk per open).
 //!   Settings: `prefs_core::schema::SCHEMA`'s `system.*` keys and docs; a pick opens Settings on that row
 //!   (`settings::request_open_at`). Math: `+ - * / ( )` evaluated inline; Return copies the value.
-//! * RECENCY — a pick moves its token to the front of a 16-entry LRU kept in ONE file,
-//!   `<home>/settings/launcher` (SETTINGSFILES' shape: Principia's TOML codec, namespace `launcher`).
-//!   Within a group, recent picks rank first, then match quality.
+//! * RECENCY — a pick moves its token to the front of a 16-entry LRU kept in Principia's store as the
+//!   declared key `app.launcher.recent` (`<home>/settings/launcher`), written through `prefs::set` — the one
+//!   store writer (LAUNCHERPREFS B451, ARCHREVIEW F7). Within a group, recent picks rank first, then quality.
 //!
 //! Wire: `[launcher] open win=<id>`, `[launcher] snapshot programs=<n> files=<n> truncated=<0|1> ms=<n>`,
 //! `[launcher] query=<q> hits=p<n>/f<n>/s<n>[/m1] ms=<n>`, `[launcher] pick kind=<k> name=<n> -> <how>`,
-//! `[launcher] close`, `[launcher] saved <path> recent=<n>`; `tests launcher` →
-//! `:: LAUNCHER: programs=<n> files=<n> settings=<n> math=ok open=ok ms=<n> -> PASS ::`.
+//! `[launcher] close`, `[launcher] saved recent=<n> via=prefs ok=<0|1>`; `tests launcher` →
+//! `:: LAUNCHER: programs=<n> files=<n> settings=<n> math=ok open=ok recency=via-prefs ms=<n> -> PASS ::`.
 //! Design: `docs/dev/evidence/rmbp-1005/launcher.md`.
 
 use alloc::string::String;
@@ -723,36 +723,75 @@ fn lru_path() -> Option<String> {
     crate::prefs::home().filter(|h| !h.is_empty()).map(|h| alloc::format!("{}/settings/launcher", h))
 }
 
-/// Load the recency file when the session's home changed since the last load.
+/// LAUNCHERPREFS (B451): the recency is `app.launcher.recent` in Principia's store (`settings/launcher` by
+/// `files::domain_of`), one token per line, newest first — declared once, as the kernel.
+const LRU_NS: &str = prefs_core::files::APP_NS;
+const LRU_KEY: &str = "launcher.recent";
+const LRU_TEXT_MAX: usize = 4096;
+const LRU_STANZA: &[u8] = b"launcher\0recent\tstr:4096\t\"\"\tThe Launcher's recent picks, newest first, one token per line (program:, file:, setting:)\n";
+static LRU_DECLARED: AtomicBool = AtomicBool::new(false);
+
+fn lru_declare() -> bool {
+    if !LRU_DECLARED.load(Ordering::Acquire) && crate::prefs::declare_kernel(LRU_STANZA) {
+        LRU_DECLARED.store(true, Ordering::Release);
+    }
+    LRU_DECLARED.load(Ordering::Acquire)
+}
+
+/// The list as the stored text: newest first, cut from the oldest end to fit the declared length.
+fn lru_text(l: &[String]) -> String {
+    let mut out = String::new();
+    for t in l {
+        let add = t.len() + if out.is_empty() { 0 } else { 1 };
+        if out.len() + add > LRU_TEXT_MAX {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(t);
+    }
+    out
+}
+
+/// Load the recency from the store when the session's home changed since the last load. The B417 shape
+/// (`[launcher] r00..` in the same file, already in the tree) is migrated once to the declared key.
 fn lru_load() {
     let Some(p) = lru_path() else { return };
     if *LRU_FOR.lock() == p {
         return;
     }
-    let mt = crate::shell::vfs_mount_table();
+    crate::prefs::ensure_loaded();
+    lru_declare();
     let mut v: Vec<String> = Vec::new();
-    if let Ok(st) = mt.stat(&p) {
-        if st.size > 0 && st.size < 16 * 1024 {
-            if let Ok(b) = mt.read(&p, 0, st.size as usize) {
-                if let Some(t) = core::str::from_utf8(&b).ok().and_then(|s| prefs_core::PrefTree::parse(s).ok()) {
-                    for i in 0..LRU_MAX {
-                        if let Some(prefs_core::PrefValue::Str(s)) = t.get("launcher", &alloc::format!("r{:02}", i)) {
-                            v.push(s.clone());
-                        }
-                    }
-                } else {
-                    serial_println!("[launcher] recency file {} refused (not Principia TOML) -> empty", p);
+    match crate::prefs::get(LRU_NS, LRU_KEY) {
+        Some(prefs_core::PrefValue::Str(s)) => v.extend(s.split('\n').filter(|t| !t.is_empty()).take(LRU_MAX).map(String::from)),
+        Some(other) => serial_println!("[launcher] recency {}.{}={} refused (not a string) -> empty", LRU_NS, LRU_KEY, other),
+        None => {}
+    }
+    if v.is_empty() {
+        for i in 0..LRU_MAX {
+            if let Some(prefs_core::PrefValue::Str(s)) = crate::prefs::get("launcher", &alloc::format!("r{:02}", i)) {
+                if !s.is_empty() && !s.contains('\n') {
+                    v.push(s);
                 }
             }
         }
     }
-    serial_println!("[launcher] recency loaded {} recent={}", p, v.len());
+    if !crate::prefs::list("launcher").is_empty() {
+        let n = crate::prefs::retire("launcher");
+        // The set rewrites the domain on a change; the domain save covers an unchanged value (the file must
+        // lose the retired table either way). Once per volume.
+        let ok = crate::prefs::set(LRU_NS, LRU_KEY, prefs_core::PrefValue::Str(lru_text(&v))).is_ok() && crate::prefs::save_domain("launcher").is_ok();
+        serial_println!("[launcher] recency migrated rNN -> {}.{} n={} retired={} ok={}", LRU_NS, LRU_KEY, v.len(), n, ok as u8);
+    }
+    serial_println!("[launcher] recency loaded {} recent={} via=prefs", p, v.len());
     *LRU.lock() = v;
     *LRU_FOR.lock() = p;
 }
 
 fn lru_note(token: &str) {
-    if token.is_empty() {
+    if token.is_empty() || token.contains('\n') {
         return;
     }
     let mut l = LRU.lock();
@@ -762,35 +801,35 @@ fn lru_note(token: &str) {
     LRU_OWED.store(true, Ordering::Release);
 }
 
-/// Write the recency file: `<home>/settings/launcher`, Principia's TOML, namespace `launcher`, keys `r00..`.
+/// Write the recency through the one store writer: `prefs::set` (the declared clamp, the `.new` swap and
+/// read-back, the auto-saved line, PrefChanged). An unchanged list is not re-written.
 fn lru_save() -> bool {
-    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as K};
-    let Some(p) = lru_path() else { return false };
-    let mut t = prefs_core::PrefTree::new();
+    if lru_path().is_none() {
+        return false;
+    }
+    lru_declare();
     let l = LRU.lock().clone();
-    for (i, s) in l.iter().enumerate() {
-        let _ = t.set("launcher", &alloc::format!("r{:02}", i), prefs_core::PrefValue::Str(s.clone()));
+    let r = crate::prefs::set(LRU_NS, LRU_KEY, prefs_core::PrefValue::Str(lru_text(&l)));
+    serial_println!("[launcher] saved recent={} via=prefs ok={}{}", l.len(), r.is_ok() as u8, r.as_ref().err().map(|e| alloc::format!(" why={}", e)).unwrap_or_default());
+    r.is_ok()
+}
+
+/// `tests launcher`'s `recency=` word: `via-prefs` when the stanza is declared, the store holds exactly the
+/// in-memory list (or nothing, for an empty one) and no B417 `launcher.*` key is left; `no-session` without a home.
+fn lru_witness() -> &'static str {
+    if lru_path().is_none() {
+        return "no-session";
     }
-    let body = t.to_toml();
-    let mt = crate::shell::vfs_mount_table();
-    let dir = p.trim_end_matches("/launcher");
-    if mt.stat(dir).is_err() {
-        let _ = mt.create(dir, NodeKind::Dir, K);
-    }
-    let _ = mt.unlink(&p, K);
-    let ok = mt.create(&p, NodeKind::File, K).is_ok() && {
-        let b = body.as_bytes();
-        let mut off = 0usize;
-        while off < b.len() {
-            match mt.write(&p, off as u64, &b[off..], K) {
-                Ok(n) if n > 0 => off += n,
-                _ => break,
-            }
-        }
-        off == b.len()
+    lru_load();
+    let want = lru_text(&LRU.lock());
+    let stored = match crate::prefs::get(LRU_NS, LRU_KEY) {
+        Some(prefs_core::PrefValue::Str(s)) => s,
+        None => String::new(),
+        Some(_) => return "FAIL",
     };
-    serial_println!("[launcher] saved {} recent={} ok={}", p, l.len(), ok as u8);
-    ok
+    let ok = lru_declare() && stored == want && crate::prefs::list("launcher").is_empty();
+    serial_println!("[launcher] fixture recency declared={} stored={} mem={} legacy={}", LRU_DECLARED.load(Ordering::Acquire) as u8, stored.lines().count(), LRU.lock().len(), crate::prefs::list("launcher").len());
+    if ok { "via-prefs" } else { "FAIL" }
 }
 
 /// Act on a pick: a program launches, a file opens by its opener, a setting opens Settings on its row, a sum
@@ -943,12 +982,13 @@ pub fn selftest() {
             if ranked && back && closed { "ok" } else { "FAIL" }
         }
     };
+    let recency = lru_witness();
     let ms = crate::arch::ms().saturating_sub(t0);
     serial_println!("[launcher] fixture set_first={} bright={} testf={} walk={} truncated={}", set_first, bright, testf, snap.hits.len(), snap.truncated as u8);
-    let ok = programs_n >= 1 && set_first && (files_n >= 1 || !testf) && settings_n >= 1 && bright && math_ok && open_word != "FAIL";
+    let ok = programs_n >= 1 && set_first && (files_n >= 1 || !testf) && settings_n >= 1 && bright && math_ok && open_word != "FAIL" && recency != "FAIL";
     serial_println!(
-        ":: LAUNCHER: programs={} files={} settings={} math={} open={} ms={} -> {} ::",
-        programs_n, files_n, settings_n, if math_ok { "ok" } else { "FAIL" }, open_word, ms, if ok { "PASS" } else { "FAIL" }
+        ":: LAUNCHER: programs={} files={} settings={} math={} open={} recency={} ms={} -> {} ::",
+        programs_n, files_n, settings_n, if math_ok { "ok" } else { "FAIL" }, open_word, recency, ms, if ok { "PASS" } else { "FAIL" }
     );
 }
 

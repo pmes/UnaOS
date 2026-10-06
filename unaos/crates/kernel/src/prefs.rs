@@ -1113,3 +1113,30 @@ pub fn declare_app_key(name: &str, line: &str) -> bool {
     }
     added > 0
 }
+// ── LAUNCHERPREFS (B451): the kernel's own programs declare and retire through the one store ──────
+
+/// LAUNCHERPREFS (B451, ARCHREVIEW F7): a kernel-resident program (the Launcher) declares its `app.<name>.*`
+/// stanza — the PrefDeclare body (`prefs_core::declare::body`) — into the same registry the bus verb fills,
+/// as the kernel (no frame; PREFSCAP B454's caller-bound declare names this the kernel's row). `false` = a
+/// malformed stanza. Idempotent: a second declare replaces the first.
+pub fn declare_kernel(body: &[u8]) -> bool {
+    let Some((name, keys)) = prefs_core::declare::parse(body) else {
+        serial_println!("[prefs] declare (kernel) refused: malformed stanza");
+        return false;
+    };
+    let n = keys.len();
+    serial_println!("[prefs] declared app.{} keys={} -> settings/{} (kernel)", name, n, name);
+    DECLARED.lock().insert(name, keys);
+    true
+}
+
+/// LAUNCHERPREFS (B451): drop every key of namespace `ns` from the tree (no save: the caller's next
+/// [`set`] in the same domain rewrites that domain's file without them). Answers the keys removed.
+pub fn retire(ns: &str) -> usize {
+    let mut t = TREE.lock();
+    let gone: Vec<String> = t.list(ns).into_iter().map(|(k, _)| String::from(k)).collect();
+    for k in &gone {
+        t.remove(ns, k);
+    }
+    gone.len()
+}

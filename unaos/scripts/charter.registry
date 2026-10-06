@@ -88,6 +88,7 @@ drivers/hda_play.rs | Stria | owed | B289
 # dotfile | <name as the literal spells it> | <ref> — every `<home>/.name` literal the kernel writes
 dotfile | .settings | B287 (moves to Principia's store)
 dotfile | .dock | B287
+dotfile | .holocron | B448 (HOLOCRONROOT: the one secrets root, named in holocron_core::root)
 dotfile | .Trash | B288
 dotfile | .Trash/.index | B288 → TRASHTIME (B308): FAT fallback only; on UnaFS trash state is attributes on the object
 dotfile | .index | B288 → TRASHTIME (B308): FAT fallback only
