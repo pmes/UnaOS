@@ -47,3 +47,28 @@ and at login `[filetypes] built at=login dir=/system/filetypes created=<n> fille
 `EXT_TABLE` — a user-added extension does not yet type a file); attribute templates (Be's per-type
 attribute list for Tracker); a per-type icon picker (the pane shows the glyph name); the seat adds
 §16 B3's "built" note to MACPARITY at the fold (this tree's MACPARITY predates §16).
+
+## Built (branch exec-rmbp-filetypes, M1..M5)
+
+- M1 resources: `unaos/res/{markdown,json,textedit,fileview,play,launch,linux}` (packed `.unares`, compiled into
+  APPRES's built-in list in registrant order); facet declares `image/svg+xml`. `appres::registrants`,
+  `appres::opener_of_preferred`.
+- M2 `fs/assoc.rs` rewritten: `/system/filetypes`, `TYPE_FACTS` (no opener column), resolution
+  override → db → registrant → none; the boot `assoc-seed` step deleted; `login ok` → `assoc::owe()` → the x86
+  device-service pass (`desktop_uefi`) builds it; elsewhere inline. `assoc` verb lists registrants
+  (`assoc <mime>`) and sets a type's app (`assoc <mime> <app>`).
+- M3 `video/quarry/openwith.rs`: the context menu's `Open With...` row.
+- M4 Settings tab "File Types" (`FT_TAB = TABS - 1`), rows snapshot read on `settings::service`, a row press
+  cycles the type's `una:preferred` on that pass. `system.settings.tab` 0..5 here; with APPEARANCE folded:
+  seven tabs, 0..6.
+- M5 `tests filetypes` (rides `filetype::ensure_tests`).
+
+## The next flight's wire
+
+At login: `[filetypes] built at=login dir=/system/filetypes created=<n> filled=0 types=<n> ms=<n>` (first boot of
+a card: created = every type; later logins created=0). `tests filetypes`:
+`:: FILETYPES: types=<n> preferred=<n> resolved=ok -> PASS :: registry=/system/filetypes objects=<n> source=db sticky=ok amend=ok openwith=2 builds=<n>`.
+Quarry right-click → Open With...: `[quarry] openwith path=<p> type=<m> registrants=<n> default=<opener>`, a pick
+`[quarry] openwith pick=<opener> path=<p>`. Settings → File Types press: `[filetypes] pane type=<m> preferred=<opener> via=settings`
+then `[filetypes] preferred type=<m> app=<signature> obj=/system/filetypes/<leaf>`. `tests filetype`,
+`tests quarry2`, `tests openers` keep their lines (the fixtures now read the registry's `una:preferred`).

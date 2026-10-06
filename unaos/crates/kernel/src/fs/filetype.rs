@@ -441,6 +441,7 @@ pub fn ensure_tests() {
         #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
         crate::video::quarry::live::columns::ensure_tests();
         crate::fs::appres::ensure_tests(); // APPRES (B398): `tests appres` rides this registration (no tests.rs line).
+        crate::tests::register("filetypes", crate::fs::assoc::selftest); // FILETYPES (B423): `tests filetypes` rides this registration (no tests.rs line).
     }
 }
 
