@@ -3854,7 +3854,7 @@ impl Layout {
 fn dock2_sig() -> u64 {
     let pend = LAUNCH_APP.load(Ordering::Relaxed) as u64;
     let phase = if pend != 0 { LAUNCH_PHASE.load(Ordering::Relaxed) as u64 & 1 } else { 0 };
-    (position() as u64) | (TRASH_FULL.load(Ordering::Relaxed) as u64) << 2 | phase << 3 | pend << 8
+    (position() as u64) | (TRASH_FULL.load(Ordering::Relaxed) as u64) << 2 | phase << 3 | (DND_HOT.load(Ordering::Relaxed) as u64) << 4 | pend << 8 // DRAGDROP (B440): the hovered Trash relights
 }
 
 /// The pin id of the pending launch's tile, or `WIN_NONE`.
@@ -3929,7 +3929,7 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
         if j < by + 2 || j + 2 >= by + th { continue; }
         let v = j - by - 2;
         if r.id == TRASH_PIN_ID {
-            trash_glyph_row(out, bx, tw, th, j - by, TRASH_FULL.load(Ordering::Relaxed), ceramic::shade_gain(theme::button_face(), j, ceramic::CONTROL_GAIN_Q16));
+            trash_glyph_row(out, bx, tw, th, j - by, TRASH_FULL.load(Ordering::Relaxed), ceramic::shade_gain(dnd_face(), j, ceramic::CONTROL_GAIN_Q16)); // DRAGDROP (B440): the selection face while a drag hovers it
         } else if dock2_group(r) == 1 {
             if let Some(g) = thumbs.as_ref() {
                 if let Some((_, w, h, px)) = g.iter().find(|e| e.0 == r.id) {
@@ -4383,4 +4383,43 @@ fn menu_label_trash_ok() -> bool {
             None => false,
         }
     }
+}
+
+// ── DRAGDROP (rmbp-ledger B440, MACPARITY row 18) — the Trash tile as a drop target ──────────────────────────────
+// The session (`video::dnd`) asks `dnd_drop_ok` at the pointer on every motion (the dock first: the strip composites
+// over the windows); a yes lights the tile (`dnd_hover`, the selection token on the glyph's face, folded into
+// `dock2_sig` so the strip repaints); the release calls `dnd_drop` — DOCK2's own trash path, `fs::trash::trash`.
+
+static DND_HOT: AtomicBool = AtomicBool::new(false);
+
+/// Is the dock's Trash tile at panel `(x, y)` (and the drag a file)? Read on every motion of a started drag.
+pub(crate) fn dnd_drop_ok(x: i32, y: i32, file: bool) -> bool {
+    if x < 0 || y < 0 || !file {
+        return false;
+    }
+    let mut rows = ModelBuf::take();
+    let Some((n, l)) = router_model(&mut rows) else { return false };
+    matches!(l.tile_at(x as usize, y as usize), Some(t) if t < n && !l.is_overflow(t) && rows[t].id == TRASH_PIN_ID)
+}
+
+/// The session's hover moved on or off the Trash tile: relight it on the next pass.
+pub(crate) fn dnd_hover(on: bool) {
+    if DND_HOT.swap(on, Ordering::AcqRel) != on {
+        PASS_OWED.store(true, Ordering::Release);
+    }
+}
+
+/// The Trash glyph's face while a drag hovers it.
+fn dnd_face() -> u32 {
+    if DND_HOT.load(Ordering::Relaxed) { theme::selection() } else { theme::button_face() }
+}
+
+/// A drop on the Trash tile: DOCK2's trash path for one item. `Ok(<name in the Trash>)`.
+pub(crate) fn dnd_drop(path: &str) -> Result<alloc::string::String, alloc::string::String> {
+    let r = crate::fs::trash::trash(path);
+    if r.is_ok() {
+        TRASH_POLLED.store(0, Ordering::Relaxed);
+        PASS_OWED.store(true, Ordering::Release);
+    }
+    r
 }
