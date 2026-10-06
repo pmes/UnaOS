@@ -250,8 +250,14 @@ mod tests {
             (b"", None),
             (b"\0\0\x01\0\0\0", None),
         ];
+        // pixel_core sniffs SVG itself when its `svg` feature is on (a workspace test build unifies it in through
+        // svg_core); then the two svg rows are NATIVE, not foreign, and the facet table's answer is unused.
+        let svg_native = sniff(b"<svg xmlns='http://www.w3.org/2000/svg'/>").is_some();
         for (bytes, want) in cases {
             assert_eq!(foreign_format(bytes), *want, "{bytes:?}");
+            if svg_native && *want == Some("svg") {
+                continue;
+            }
             assert_eq!(sniff(bytes), None);
             let e = PixelCoreSource.decode(bytes).unwrap_err();
             match want {
