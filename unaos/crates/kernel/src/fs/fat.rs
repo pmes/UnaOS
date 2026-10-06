@@ -816,7 +816,7 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
 /// USB-WRITE (supersedes PIUSB-27's blanket refusal): a `Usb`-sourced volume routes to the verified
 /// BOT WRITE(10) path (`write_block_usb`, MISSION-gated with an RMW+restore witness); any source
 /// without a verified write path would still be refused here.
-fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
+fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> { crate::fs::bootfat::raw_guard(source, "write_sector", lba)?; // BOOTFATSEAM (B453, R99): the one place every FAT write passes refuses the sacred boot FAT unless `fat_unlock` is held
     // SDHC-4c: the internal SD card admits a write ONLY inside the reserved extent. Checked BEFORE
     // the block call, so a refused write issues no CMD24 and takes no card lock, however the volume
     // was mounted. Unarmed (the default, and every failure of the reserve pass) => refuses exactly
@@ -917,7 +917,7 @@ fn read_sectors(source: BlockSource, lba: u64, buf: &mut [u8]) -> Result<(), Fat
 /// `MAX_BLOCKS_PER_OP`. The write twin of [`read_sectors`], with the same whole-sector precondition.
 /// Callers reach this ONLY for spans they have proven are fully covered by `buf`, which is what
 /// makes it sound to issue the write with no preceding read.
-fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatError> {
+fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatError> { crate::fs::bootfat::raw_guard(source, "write_sectors", lba)?; // BOOTFATSEAM (B453, R99): see `write_sector`
     if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
         return Err(FatError::Io);
     }
@@ -2330,7 +2330,7 @@ impl FatFs {
     /// FATVERB: may an ORDINARY FILE MUTATION reach this volume? Forwards to
     /// [`BlockSource::write_veto`], which is the single definition — see it for the argument.
     pub fn write_veto(&self) -> Option<&'static str> {
-        self.source.write_veto()
+        crate::fs::bootfat::veto_source(self.source).or_else(|| self.source.write_veto()) // BOOTFATSEAM (B453, R99): the question every raw writer already asks answers the sacred boot FAT first
     }
 
     /// The end-of-chain marker to write into a terminal cluster's FAT entry (`>= 0xFFF8` / `>= 0x0FFFFFF8`
@@ -6180,7 +6180,7 @@ pub fn fatlfn_witness_once() {
         }
     };
     if let Some(why) = fs.write_veto() {
-        serial_println!(":: FAT-LFN: SKIPPED — the volume refuses file mutations ({}) ::", why);
+        if why == crate::fs::bootfat::SACRED_VETO { crate::fs::bootfat::note_lfn_skip(); serial_println!(":: FAT-LFN: SKIPPED reason=r99-sacred — the boot FAT is read-only for every principal (R99); nothing tests at boot (R80) ::"); } else { serial_println!(":: FAT-LFN: SKIPPED — the volume refuses file mutations ({}) ::", why); } // BOOTFATSEAM (B453)
         return;
     }
     match fatlfn_run(&fs) {
