@@ -64,6 +64,13 @@ pub enum Target {
     Favorites,
     /// The dock's Trash tile.
     Trash,
+    /// DRAGDROP2 (B470): a dock APP tile whose program declares every dragged file's type: the drop opens each
+    /// file there (`opener` is what the one dispatch runs — a built-in's key or a ring-3 program's path).
+    Dock { tile: wm::WinId, key: String, opener: String },
+    /// DRAGDROP2: the bare desktop — the session user's Desktop folder.
+    Desktop { dir: String },
+    /// DRAGDROP2: a ring-3 program's window — the paths go to its input ring (`INPUT_EV_DROP` + `BUS_VERB_DROP_GET`).
+    App { win: wm::WinId, owner: u64 },
 }
 
 impl Target {
@@ -73,6 +80,9 @@ impl Target {
             Target::Folder { win, .. } => alloc::format!("{}", win),
             Target::Volume { .. } | Target::Favorites => String::from("sidebar"),
             Target::Trash => String::from("trash"),
+            Target::Dock { key, .. } => alloc::format!("dock:{}", key),
+            Target::Desktop { .. } => String::from("desktop"),
+            Target::App { owner, .. } => alloc::format!("app:{}", owner),
         }
     }
 }
@@ -84,6 +94,10 @@ pub enum Action {
     Copy,
     Favorite,
     Trash,
+    /// DRAGDROP2: opened in a dock app.
+    Open,
+    /// DRAGDROP2: handed to a ring-3 program.
+    Deliver,
 }
 
 impl Action {
@@ -93,6 +107,8 @@ impl Action {
             Action::Copy => "copy",
             Action::Favorite => "favorite",
             Action::Trash => "trash",
+            Action::Open => "open",
+            Action::Deliver => "deliver",
         }
     }
 }
@@ -107,7 +123,16 @@ struct Session {
     started: bool,
     resolve: Resolver,
     ghost: bool,
+    /// DRAGDROP2: show a folder in place (spring-loading); returns the folder shown before, `None` = no change.
+    spring: SpringFn,
+    /// The last pointer point (the spring re-resolves the hover there).
+    last: (i32, i32),
+    /// The folder the drag began in, once a spring moved away from it (Esc backs out to it).
+    sprung_from: Option<String>,
 }
+
+/// Spring-loading's action: show `dir` in place; `Some(<the folder shown before>)` when it moved.
+pub type SpringFn = fn(&str) -> Option<String>;
 
 static S: Mutex<Option<Session>> = Mutex::new(None);
 static HOVER: Mutex<Option<Target>> = Mutex::new(None);
@@ -129,20 +154,35 @@ fn resolve_live(x: i32, y: i32, p: &Payload) -> Option<Target> {
     if crate::video::dock::dnd_drop_ok(x, y, p.kind == Kind::File) {
         return Some(Target::Trash);
     }
-    crate::video::quarry::live::dragdrop::drop_ok(x, y, p)
+    if let Some((tile, key, opener)) = crate::video::dock::dnd_app_at(x, y, &p.paths) {
+        return Some(Target::Dock { tile, key, opener });
+    }
+    if let Some(t) = crate::video::quarry::live::dragdrop::drop_ok(x, y, p) {
+        return Some(t);
+    }
+    resolve_glass(x, y, p)
 }
 
 /// A source's press on a draggable item: capture the pointer. Nothing shows until the travel passes the threshold.
 pub fn arm(p: Payload, x: i32, y: i32) {
-    arm_with(p, x, y, resolve_live, true);
+    arm_full(p, x, y, resolve_live, true, crate::video::quarry::live::dragdrop::spring_to);
 }
 
 /// [`arm`] with a resolver (the fixture's) and the ghost on or off.
 pub(crate) fn arm_with(p: Payload, x: i32, y: i32, resolve: Resolver, ghost: bool) {
+    arm_full(p, x, y, resolve, ghost, spring_none);
+}
+
+fn spring_none(_: &str) -> Option<String> {
+    None
+}
+
+/// [`arm_with`] with the spring action (the fixture's, or Quarry's).
+pub(crate) fn arm_full(p: Payload, x: i32, y: i32, resolve: Resolver, ghost: bool, spring: SpringFn) {
     if p.paths.is_empty() {
         return;
     }
-    *S.lock() = Some(Session { p, x0: x, y0: y, started: false, resolve, ghost });
+    *S.lock() = Some(Session { p, x0: x, y0: y, started: false, resolve, ghost, spring, last: (x, y), sprung_from: None });
     crate::video::capture::begin(on_motion, on_release);
 }
 
@@ -162,7 +202,9 @@ fn option_held() -> bool {
 
 /// Tell the participants the hover moved (each repaints its own highlight).
 fn hover_changed() {
-    crate::video::dock::dnd_hover(matches!(hover(), Some(Target::Trash)));
+    let h = hover();
+    crate::video::dock::dnd_hover(matches!(h, Some(Target::Trash)));
+    crate::video::dock::dnd_app_hover(match h { Some(Target::Dock { tile, .. }) => tile, _ => wm::WIN_NONE });
     crate::video::quarry::live::dragdrop::hover_changed();
 }
 
@@ -172,6 +214,7 @@ fn set_hover(t: Option<Target>) -> bool {
         return false;
     }
     *g = t;
+    HOVER_AT.store(crate::arch::ms(), Ordering::Relaxed);
     true
 }
 
@@ -189,6 +232,7 @@ fn on_motion(x: i32, y: i32) {
             serial_println!("[dnd] start kind={} n={} from={} label={}", s.p.kind.name(), s.p.paths.len(), s.p.from, s.p.label);
             STARTS.fetch_add(1, Ordering::Relaxed);
         }
+        s.last = (x, y);
         let t = (s.resolve)(x, y, &s.p);
         (start, s.ghost, s.p.label.clone(), t)
     };
@@ -241,6 +285,16 @@ fn deliver(p: &Payload, t: &Target, option: bool) -> (Action, bool) {
             }
             (Action::Trash, ok)
         }
+        Target::Dock { key, opener, .. } => {
+            let mt = crate::shell::vfs_mount_table();
+            for path in p.paths.iter() {
+                let (mime, _) = crate::fs::filetype::type_of_in(&mt, path);
+                let line = crate::video::quarry::live::openers::open(opener, path, &mime);
+                serial_println!("[dnd] dock app={} opener={} path={} type={} -> {}", key, opener, path, mime, line);
+            }
+            (Action::Open, true)
+        }
+        Target::App { owner, .. } => (Action::Deliver, ring3_deliver(*owner, &p.paths)),
         _ => crate::video::quarry::live::dragdrop::drop(p, t, option),
     }
 }
@@ -260,6 +314,10 @@ pub fn cancel(why: &str) {
     crate::video::capture::cancel();
     if s.ghost {
         ghost_close();
+    }
+    if let Some(d) = s.sprung_from.as_deref() {
+        let _ = (s.spring)(d); // DRAGDROP2: Esc backs a spring out to the folder the drag began in
+        serial_println!("[dnd] spring back dir={}", d);
     }
     set_hover(None);
     hover_changed();
@@ -359,4 +417,161 @@ pub(crate) fn take_last() -> Option<(Action, bool)> {
 /// Is a session armed or started?
 pub(crate) fn armed() -> bool {
     S.lock().is_some()
+}
+
+// ── DRAGDROP2 (rmbp-ledger B470, MACPARITY row 18) ─────────────────────────────────────────────────────────────
+// The desktop and ring-3 windows as targets, spring-loading, and the ring-3 drop protocol (una_abi
+// `INPUT_EV_DROP` + `BUS_VERB_DROP_GET`; the kernel fulfils the verb from the store below). Design:
+// `docs/dev/evidence/rmbp-1005/dragdrop2.md`.
+
+/// The hover's stamp (ms): when the pointer came to rest on the current target.
+static HOVER_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// A folder hovered this long springs open in place (the Finder's default spring delay).
+pub const SPRING_MS: u64 = 800;
+
+/// The session user's Desktop folder (the desktop target).
+pub fn desktop_dir() -> String {
+    alloc::format!("{}/Desktop", crate::fs::trash::home_base())
+}
+
+/// May `p` drop into the folder `dir` (not the folder itself, not into itself, not back where it is)?
+pub fn into_ok(p: &Payload, dir: &str) -> bool {
+    let parent = |s: &str| -> String { match s.rfind('/') { Some(0) | None => String::from("/"), Some(i) => String::from(&s[..i]) } };
+    let under = |a: &str, d: &str| a.len() > d.len() && a.as_bytes()[..d.len()].eq_ignore_ascii_case(d.as_bytes()) && a.as_bytes()[d.len()] == b'/';
+    p.paths.iter().all(|s| !s.eq_ignore_ascii_case(dir) && !under(dir, s) && !parent(s).eq_ignore_ascii_case(dir))
+}
+
+/// Past Quarry and the dock: a ring-3 program's window (x86), else the bare desktop (no window, no strip, a
+/// session's desktop built).
+fn resolve_glass(x: i32, y: i32, p: &Payload) -> Option<Target> {
+    if x < 0 || y < 0 {
+        return None;
+    }
+    if let Some((win, owner, _)) = wm::hit_test(x, y) {
+        #[cfg(target_arch = "x86_64")]
+        if crate::arch::x86_64::syscall::ring3_owner_live(owner) {
+            return Some(Target::App { win, owner });
+        }
+        let _ = (win, owner);
+        return None;
+    }
+    if !crate::video::desktopbuild::built() {
+        return None;
+    }
+    let (pw, ph) = crate::video::panel_info_nonblocking().map(|i| (i.width, i.height))?;
+    let mut rs = [None; crate::video::strip::STRIP_MAX];
+    crate::video::strip::rects(pw, ph, &mut rs);
+    let (ux, uy) = (x as usize, y as usize);
+    if rs.iter().flatten().any(|&(rx, ry, rw, rh)| ux >= rx && uy >= ry && ux < rx + rw && uy < ry + rh) {
+        return None;
+    }
+    let dir = desktop_dir();
+    into_ok(p, &dir).then_some(Target::Desktop { dir })
+}
+
+/// Spring-loading — the device-service pass (~1 kHz) calls this; cheap when no drag is started.
+pub fn service() {
+    if active() {
+        spring_check(crate::arch::ms());
+    }
+}
+
+/// The hover's stamp, for the fixture.
+pub(crate) fn hover_at() -> u64 {
+    HOVER_AT.load(Ordering::Relaxed)
+}
+
+/// A started drag resting on a folder target for [`SPRING_MS`] at `now` shows that folder in place. `true` = sprang.
+pub(crate) fn spring_check(now: u64) -> bool {
+    let dir = match hover() {
+        Some(Target::Folder { dir, .. }) | Some(Target::Volume { dir }) => dir,
+        _ => return false,
+    };
+    let at = HOVER_AT.load(Ordering::Relaxed);
+    if now < at.saturating_add(SPRING_MS) {
+        return false;
+    }
+    let Some(spring) = S.try_lock().and_then(|g| g.as_ref().filter(|s| s.started).map(|s| s.spring)) else { return false };
+    HOVER_AT.store(now, Ordering::Relaxed); // one spring per rest, whatever it did
+    let Some(prev) = spring(&dir) else { return false };
+    serial_println!("[dnd] spring dir={} after_ms={}", dir, now - at);
+    let t = {
+        let mut g = S.lock();
+        let Some(s) = g.as_mut() else { return true };
+        if s.sprung_from.is_none() {
+            s.sprung_from = Some(prev);
+        }
+        (s.resolve)(s.last.0, s.last.1, &s.p)
+    };
+    if set_hover(t) {
+        hover_changed();
+    }
+    true
+}
+
+// ── the ring-3 drop protocol ────────────────────────────────────────────────────────────────────────────────────
+
+struct Pending {
+    owner: u64,
+    token: u8,
+    paths: Vec<String>,
+}
+
+/// Drops handed to ring-3 programs and not yet asked for (oldest dropped past the bound).
+static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+const PENDING_MAX: usize = 8;
+static TOKEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Hold `paths` for `owner` under a fresh token (non-zero); at most `DROP_PATHS_MAX` paths are kept.
+pub(crate) fn ring3_store(owner: u64, paths: &[String]) -> u8 {
+    let mut t = TOKEN.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if t == 0 {
+        t = TOKEN.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    }
+    let keep: Vec<String> = paths.iter().take(una_abi::DROP_PATHS_MAX).cloned().collect();
+    let mut g = PENDING.lock();
+    g.retain(|d| !(d.owner == owner && d.token == t));
+    if g.len() >= PENDING_MAX {
+        g.remove(0);
+    }
+    g.push(Pending { owner, token: t, paths: keep });
+    t
+}
+
+/// A drop on a ring-3 window: store the paths for `owner`, push `INPUT_EV_DROP` to its ring. `true` = pushed.
+fn ring3_deliver(owner: u64, paths: &[String]) -> bool {
+    let token = ring3_store(owner, paths);
+    let n = paths.len().min(una_abi::DROP_PATHS_MAX);
+    let ev = una_abi::input_ev_pack(una_abi::INPUT_EV_DROP, una_abi::drop_ev_payload(token, n));
+    #[cfg(target_arch = "x86_64")]
+    let pushed = crate::arch::x86_64::syscall::user_input_push_owner(owner, ev);
+    #[cfg(not(target_arch = "x86_64"))]
+    let pushed = {
+        let _ = ev;
+        false // aarch64: no capture feeds a drag there yet, and DROP_GET has no arm (owed)
+    };
+    serial_println!("[dnd] ring3 owner={} token={} n={} pushed={}", owner, token, n, pushed as u8);
+    pushed
+}
+
+/// `BUS_VERB_DROP_GET` for the kernel-stamped `owner`: body `[token]`; the reply text is the paths, newline-joined.
+/// `-2` (ENOENT) = no such drop for this caller; `-22` = malformed.
+pub fn bus_drop_get(owner: u64, body: &[u8], text: &mut Vec<u8>) -> i64 {
+    if body.len() != 1 {
+        return -22;
+    }
+    let token = body[0];
+    let d = {
+        let mut g = PENDING.lock();
+        match g.iter().position(|d| d.owner == owner && d.token == token) {
+            Some(i) => g.remove(i),
+            None => return -2,
+        }
+    };
+    let refs: Vec<&[u8]> = d.paths.iter().map(|s| s.as_bytes()).collect();
+    let mut out = alloc::vec![0u8; crate::bus::BUS_BODY_MAX];
+    let Some(n) = una_abi::drop_body(&refs, &mut out) else { return -22 };
+    text.extend_from_slice(&out[..n]);
+    serial_println!("[dnd] ring3 get owner={} token={} n={}", owner, token, d.paths.len());
+    0
 }

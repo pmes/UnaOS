@@ -1881,7 +1881,7 @@ const _: () = assert!(BUS_VERB_PREF_DECLARE > BUS_VERB_TOAST && BUS_VERB_PREF_DE
 /// Every input-ring event type (`INPUT_EV_*` the ring carries).
 pub const INPUT_EV_ALL: &[u64] = &[
     INPUT_EV_KEY_DOWN, INPUT_EV_KEY_UP, INPUT_EV_MOUSE_REL, INPUT_EV_MOUSE_ABS, INPUT_EV_BUTTON, INPUT_EV_WHEEL,
-    INPUT_EV_ACTION, INPUT_EV_MENU_PICK, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, INPUT_EV_DIALOG_ANSWER,
+    INPUT_EV_ACTION, INPUT_EV_MENU_PICK, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, INPUT_EV_DIALOG_ANSWER, INPUT_EV_DROP,
 ];
 /// Every kernel bus verb tag (the registrable range `>= BUS_VERB_FULFIL_MIN` is the bus's, not listed). The
 /// HOLOCRON band is listed by its two ends; [`codes_unique_u8`] also refuses any other tag inside the band.
@@ -1890,7 +1890,7 @@ pub const BUS_VERB_ALL: &[u8] = &[
     BUS_VERB_MENU_CLEAR, BUS_VERB_MENU_GET, BUS_VERB_NOTICE, BUS_VERB_ATTR_SET, BUS_VERB_ATTR_GET, BUS_VERB_ATTR_LIST,
     BUS_VERB_ATTR_QUERY, BUS_VERB_ATTR_STAT, BUS_VERB_PREF_GET, BUS_VERB_PREF_SET, BUS_VERB_PREF_LIST,
     BUS_VERB_PREF_CHANGED, BUS_VERB_REGISTER, BUS_VERB_HOLOCRON_FIRST, BUS_VERB_HOLOCRON_LAST, BUS_VERB_DIALOG,
-    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE,
+    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE, BUS_VERB_DROP_GET,
 ];
 /// No two entries equal (and none zero). `const` so the assertion below runs in the compiler.
 pub const fn codes_unique_u64(v: &[u64]) -> bool {
@@ -1997,5 +1997,78 @@ mod secreview_fuzz {
                 assert!(d.message == &m[..] && d.info == &i[..] && d.nb as usize == nb);
             }
         }
+    }
+}
+
+// =================================================================================================
+// DRAGDROP2 (rmbp-ledger B470, MACPARITY row 18) — THE RING-3 DROP PROTOCOL. A drop on a ring-3 program's
+// window: the kernel holds the dropped paths for that program under a token and pushes `INPUT_EV_DROP` to its
+// input ring; the program asks `BUS_VERB_DROP_GET` (body `[token]`) and the reply body is the paths,
+// newline-joined. One parse ([`drop_paths`]) both rings link. Appended at the tail so no existing line moves.
+// =================================================================================================
+
+/// A drop landed on one of the receiver's windows. Payload `[15:8]` = the token to ask for, `[7:0]` = the count
+/// of paths (saturating at 255).
+pub const INPUT_EV_DROP: u64 = 12; // 11 is INPUT_EV_DIALOG_ANSWER; SMALLFIX4 (B466) mints none
+/// Bus verb: fetch a drop's paths. Request body `[token]`; reply body the paths, `\n`-joined (`-ENOENT` = no
+/// such drop for this caller: it was taken, or it never was).
+pub const BUS_VERB_DROP_GET: u8 = 24; // 23 is BUS_VERB_PREF_DECLARE
+const _: () = assert!(BUS_VERB_DROP_GET > BUS_VERB_PREF_DECLARE && BUS_VERB_DROP_GET < BUS_VERB_REGISTER);
+/// Paths one drop carries at most (the reply must fit one bus body).
+pub const DROP_PATHS_MAX: usize = 32;
+
+/// The `INPUT_EV_DROP` payload for `token` and `n` paths.
+pub const fn drop_ev_payload(token: u8, n: usize) -> u64 {
+    ((token as u64) << 8) | (if n > 255 { 255 } else { n as u64 })
+}
+
+/// `(token, count)` from an `INPUT_EV_DROP` payload.
+pub const fn drop_ev_parse(payload: u64) -> (u8, u8) {
+    ((payload >> 8) as u8, payload as u8)
+}
+
+/// Encode `paths` as a DROP_GET reply body into `out` (`\n`-joined). `None` when a path is empty or holds a
+/// newline or a NUL, there are more than [`DROP_PATHS_MAX`], or `out` is too small.
+pub fn drop_body(paths: &[&[u8]], out: &mut [u8]) -> Option<usize> {
+    if paths.len() > DROP_PATHS_MAX {
+        return None;
+    }
+    let mut n = 0usize;
+    for (i, p) in paths.iter().enumerate() {
+        if p.is_empty() || p.contains(&b'\n') || p.contains(&0) {
+            return None;
+        }
+        let need = p.len() + (i > 0) as usize;
+        if n + need > out.len() {
+            return None;
+        }
+        if i > 0 {
+            out[n] = b'\n';
+            n += 1;
+        }
+        out[n..n + p.len()].copy_from_slice(p);
+        n += p.len();
+    }
+    Some(n)
+}
+
+/// The paths of a DROP_GET reply body, in order (empty lines skipped; at most [`DROP_PATHS_MAX`]).
+pub fn drop_paths(body: &[u8]) -> impl Iterator<Item = &[u8]> {
+    body.split(|&c| c == b'\n').filter(|l| !l.is_empty()).take(DROP_PATHS_MAX)
+}
+
+#[cfg(test)]
+mod dragdrop2_tests {
+    use super::*;
+    #[test]
+    fn drop_body_round_trip() {
+        let mut out = [0u8; 64];
+        let n = drop_body(&[b"/home/u/a.txt", b"/home/u/B"], &mut out).unwrap();
+        let v: [&[u8]; 2] = [b"/home/u/a.txt", b"/home/u/B"];
+        assert!(drop_paths(&out[..n]).eq(v.iter().copied()));
+        assert!(drop_body(&[b"a\nb"], &mut out).is_none());
+        assert!(drop_body(&[b""], &mut out).is_none());
+        assert_eq!(drop_ev_parse(drop_ev_payload(7, 3)), (7, 3));
+        assert_eq!(drop_ev_parse(drop_ev_payload(1, 999)), (1, 255));
     }
 }
