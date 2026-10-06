@@ -114,18 +114,24 @@ const READ_MAX: usize = 64 * 1024;
 
 // ── Where ────────────────────────────────────────────────────────────────────────────────────
 
-fn user_name() -> Option<String> {
+/// PERFREVIEW F3 (B443): the session name read into `buf` — the per-pass compares (prefs, Settings, login items)
+/// allocate nothing (the String-returning `user_name` it replaced allocated per pass).
+pub(crate) const WHO_BUF: usize = 64;
+pub(crate) fn user_name_in(buf: &mut [u8; WHO_BUF]) -> Option<&str> {
     #[cfg(feature = "login")]
     {
         let mut nm = [0u8; crate::fs::users::NAME_MAX];
-        let n = crate::fs::users::whoami(&mut nm)?;
-        return core::str::from_utf8(&nm[..n]).ok().map(String::from);
+        let n = crate::fs::users::whoami(&mut nm)?.min(WHO_BUF);
+        buf[..n].copy_from_slice(&nm[..n]);
+        return core::str::from_utf8(&buf[..n]).ok();
     }
     #[cfg(not(feature = "login"))]
     {
+        let _ = buf;
         None
     }
 }
+
 
 /// The session user's home (from the users table — never a literal), without a trailing `/`.
 pub fn home() -> Option<String> {
@@ -386,11 +392,12 @@ static LOAD_CLAMPED: AtomicU32 = AtomicU32::new(0);
 
 /// Load once per login (and once with no session). Cheap when nothing changed.
 pub fn ensure_loaded() {
-    let u = user_name().unwrap_or_default();
+    let mut wb = [0u8; WHO_BUF];
+    let u = user_name_in(&mut wb).unwrap_or(""); // PERFREVIEW F3 (B443): compared on the stack; a String only when the session changed
     let fresh = {
         let mut g = LOADED_FOR.lock();
-        if g.as_deref() != Some(u.as_str()) {
-            *g = Some(u);
+        if g.as_deref() != Some(u) {
+            *g = Some(String::from(u));
             true
         } else {
             false

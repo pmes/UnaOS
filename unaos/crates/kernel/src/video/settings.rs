@@ -357,8 +357,9 @@ pub fn service() {
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
     if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
-    if let Some(u) = user_name() {
-        let fresh = { let mut g = LOADED_FOR.lock(); if *g != u { *g = u; true } else { false } };
+    let mut wb = [0u8; crate::prefs::WHO_BUF]; // PERFREVIEW F3 (B443): the per-pass session reads go on the stack
+    if let Some(u) = crate::prefs::user_name_in(&mut wb) {
+        let fresh = { let mut g = LOADED_FOR.lock(); if *g != u { *g = String::from(u); true } else { false } };
         // BRIGHTFLOOR M5: the session opened — the load (and the safe-mode Shift check) waits for the
         // first desktop pass SAFE_SETTLE_MS later, so a Shift still down from the password's last
         // character at Enter is never read as the reset.
@@ -373,7 +374,7 @@ pub fn service() {
     // The brightness keys (F1/F2) and the volume keys (F10-F12) change the live level from the input
     // paths, where no VFS work may run: this pass notices the change and persists it (PREFS B300).
     // BRIGHTFLOOR M5: only once the login's load has run (a key before it must not overwrite the store).
-    if user_name().is_some() && !LOADED_FOR.lock().is_empty() && LOAD_DONE.load(Ordering::Acquire) {
+    if crate::prefs::user_name_in(&mut wb).is_some() && !LOADED_FOR.lock().is_empty() && LOAD_DONE.load(Ordering::Acquire) {
         let (lv, m) = crate::video::status::volume();
         let bl = crate::video::brightkeys::level();
         let (dv, db) = {
