@@ -10,7 +10,7 @@ pub mod silk;
 pub use decoder::OpusDecoder;
 
 use crate::ogg::OggReader;
-use crate::{Codec, Error, Format, Info, Pcm, Result, Source};
+use crate::{Codec, Error, Format, Info, Pcm, Result, SeekPoint, Source};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -56,7 +56,14 @@ pub struct OggOpus {
     granule_base: Option<i64>,
     buf: Vec<i16>,
     done: bool,
+    /// SEEKTABLE2 (rmbp B469): the first audio page (after OpusHead/OpusTags, which end their pages).
+    data_start: Option<u64>,
+    /// The output length, once a seek has read the last page's granule.
+    total: Option<u64>,
 }
+
+/// RFC 7845 §4.6: decode at least 80 ms (3840 samples at 48 kHz) before the target so the decoder converges.
+pub const SEEK_PREROLL: u64 = 3840;
 
 impl OggOpus {
     pub fn new(mut r: OggReader, first: &[u8]) -> Result<OggOpus> {
@@ -67,13 +74,14 @@ impl OggOpus {
         let mut dec = OpusDecoder::new(head.channels);
         dec.decode_gain = head.output_gain as i32;
         let ch = head.channels;
-        Ok(OggOpus { r, skip: head.pre_skip as u64, head, dec, emitted: 0, decoded: 0, granule_base: None, buf: vec![0; 5760 * ch], done: false })
+        let data_start = r.at_page_boundary();
+        Ok(OggOpus { r, skip: head.pre_skip as u64, head, dec, emitted: 0, decoded: 0, granule_base: None, buf: vec![0; 5760 * ch], done: false, data_start, total: None })
     }
 }
 
 impl Source for OggOpus {
     fn info(&self) -> Info {
-        Info { rate: 48000, channels: self.head.channels as u16, bits: 16, frames: None, format: Format::Ogg, codec: Codec::Opus, float: false }
+        Info { rate: 48000, channels: self.head.channels as u16, bits: 16, frames: self.total, format: Format::Ogg, codec: Codec::Opus, float: false }
     }
     fn block(&mut self, pcm: &mut Pcm) -> Result<bool> {
         let ch = self.head.channels;
@@ -120,5 +128,38 @@ impl Source for OggOpus {
             if p.eos { self.done = true; }
             return Ok(true);
         }
+    }
+    /// SEEKTABLE2 (rmbp B469): the page granule bisection ([`OggReader::bisect`]) to the last page ending at or before
+    /// the target granule less the 80 ms pre-roll; a fresh decoder starts with the packet after it, at that page's
+    /// granule — known exactly, so `exact`; the pre-roll's PCM is the residual [`crate::Decoder::seek`] drops.
+    fn seek(&mut self, t: u64) -> Result<Option<SeekPoint>> {
+        let Some(start) = self.data_start else { return Ok(None) };
+        if !self.r.can_seek() { return Ok(None); }
+        if self.granule_base.is_none() {
+            // the first audio page fixes where granule 0 lies (RFC 7845 §4.5): decode it once
+            let mut scratch = Pcm::default();
+            while self.granule_base.is_none() && !self.done { if !self.block(&mut scratch)? { break; } }
+        }
+        let base = self.granule_base.unwrap_or(0).max(0) as u64;
+        let pre = self.head.pre_skip as u64;
+        if let Some((_, g)) = self.r.bisect(start, u64::MAX)? { self.total = Some(g.saturating_sub(base + pre)); }
+        let t = self.total.map_or(t, |n| t.min(n));
+        let want = (t + pre + base).saturating_sub(SEEK_PREROLL);
+        self.dec = OpusDecoder::new(self.head.channels);
+        self.dec.decode_gain = self.head.output_gain as i32;
+        self.done = false;
+        if let Some((pb, g)) = self.r.bisect(start, want)?.filter(|&(_, g)| g >= base + pre) {
+            self.r.resume(pb)?;
+            self.skip = 0;
+            self.decoded = g - base;
+            self.emitted = g - base - pre;
+            return Ok(Some(SeekPoint { byte: pb, sample: self.emitted, exact: true, table: "ogg", landed: self.emitted }));
+        }
+        // the target lies within the first 80 ms: from the top (the pre-skip is the convergence there)
+        if !self.r.reposition(start)? { return Ok(None); }
+        self.skip = pre;
+        self.decoded = 0;
+        self.emitted = 0;
+        Ok(Some(SeekPoint { byte: start, sample: 0, exact: true, table: "ogg", landed: 0 }))
     }
 }
