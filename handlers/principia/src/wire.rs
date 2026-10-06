@@ -89,7 +89,7 @@ mod tests {
             (99, b"", true),
         ];
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("preferences.toml");
+        let path = dir.path().join(prefs_core::files::DIR);
         let mut host = PrefStore::load(&path).unwrap();
         let mut kern = TreeStore::default();
         for (i, (verb, body, sess)) in script.iter().enumerate() {
@@ -105,8 +105,15 @@ mod tests {
             (0, b"1\x00clamped=true".to_vec())
         );
         prefs_core::wire::fulfil(&mut kern, VERB_SET, b"system.display.brightness\x00-1", true, &mut Vec::new());
-        let file = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(prefs_core::PrefTree::parse(&file).unwrap(), kern.0, "the file is the reference tree");
-        assert_eq!(file, kern.0.to_toml(), "and byte-identical to the kernel's emission of it");
+        // PRINCIPIAFILES (B445): the folder is the reference tree, and each domain file is byte-identical to
+        // the kernel's emission of that domain (`prefs_core::files::render`, the file's own stamp).
+        let mut on_disk = prefs_core::PrefTree::new();
+        for (d, part) in prefs_core::files::split(&kern.0) {
+            let file = std::fs::read_to_string(path.join(&d)).unwrap();
+            let (iso, by) = prefs_core::files::stamp_of(&file).unwrap();
+            assert_eq!(file, prefs_core::files::render(&d, &part, iso, by, &prefs_core::files::schema_doc), "settings/{d}");
+            prefs_core::files::merge(&mut on_disk, &prefs_core::PrefTree::parse(&file).unwrap());
+        }
+        assert_eq!(on_disk, kern.0, "the folder is the reference tree");
     }
 }

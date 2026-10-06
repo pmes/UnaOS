@@ -22,8 +22,11 @@
 //!
 //! Two capabilities live here today:
 //!
-//! - **The preference store** ([`prefs::PrefStore`]) — `~/.config/unaos/preferences.toml`,
-//!   addressed by namespace + dotted key, four scalar types, atomically written.
+//! - **The preference store** ([`prefs::PrefStore`]) — `~/settings/<domain>`, one file per
+//!   domain (`prefs_core::files`, R98), the SAME folder the kernel reads and writes
+//!   (PRINCIPIAFILES, rmbp-ledger B445): addressed by namespace + dotted key, four
+//!   scalar types, atomically written. The pre-R98 `~/.config/unaos/preferences.toml`
+//!   is migrated into it once and deleted.
 //!   Defaults belong to the consumer; a `get` on an unset key answers `None`.
 //! - **The system root** — the original capability, unchanged:
 //!   `~/.config/unaos/principia.toml` holds the workspace path the rest of the
@@ -64,36 +67,55 @@ pub struct Principia {
 
 impl Principia {
     /// Open Principia against the standard config lobe
-    /// (`~/.config/unaos/`, via `dirs::config_dir()`), creating it if needed.
+    /// (`~/.config/unaos/`, via `dirs::config_dir()`) for the system root and
+    /// the home's settings folder ([`default_prefs_path`]), creating the lobe if needed.
     pub fn new() -> Self {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("~/.config"))
             .join("unaos");
         fs::create_dir_all(&config_dir).expect("Failed to create Principia config lobe");
 
-        Self::with_config_dir(&config_dir)
+        Self::with_dirs(&config_dir, &default_prefs_path())
     }
 
-    /// Open Principia against an explicit config directory — the seam the
-    /// tests (and any future multi-profile boot) use.
-    pub fn with_config_dir(config_dir: &Path) -> Self {
+    /// Open Principia against an explicit HOME (`<home>/.config/unaos` for the
+    /// system root, `<home>/settings` for the preferences) — the seam the tests
+    /// (and any future multi-profile boot) use.
+    pub fn with_home(home: &Path) -> Self {
+        Self::with_dirs(&home.join(".config").join("unaos"), &home.join(prefs_core::files::DIR))
+    }
+
+    /// Open Principia with the system-root lobe and the settings folder named apart.
+    /// Principia is the host's writer of record: the load is SETTLED here (the
+    /// pre-R98 single file migrated and deleted, a load-time clamp re-saved).
+    pub fn with_dirs(config_dir: &Path, settings_dir: &Path) -> Self {
         let config_path = config_dir.join("principia.toml");
         let current_root = fs::read_to_string(&config_path)
             .ok()
             .map(|s| PathBuf::from(s.trim()));
 
-        let prefs_path = config_dir.join("preferences.toml");
-        let prefs = PrefStore::load(&prefs_path).unwrap_or_else(|e| {
-            // A corrupt file must not take the whole handler down, and must not
-            // be silently overwritten either: refuse to serve from it by
-            // pointing the live store at a quarantine name, and say so loudly.
-            log::error!(
-                "[PRINCIPIA] :: {} is unreadable ({e:#}); serving an empty store and \
-                 writing to preferences.toml.new — the original is untouched.",
-                prefs_path.display()
-            );
-            PrefStore::empty(config_dir.join("preferences.toml.new"))
-        });
+        let prefs = match PrefStore::load(settings_dir) {
+            Ok(mut p) => {
+                if let Err(e) = p.settle() {
+                    log::error!("[PRINCIPIA] :: settling {} failed ({e:#}); the old file stays", settings_dir.display());
+                }
+                p
+            }
+            Err(e) => {
+                // An unreadable folder must not take the whole handler down, and
+                // must not be silently overwritten either: serve an empty store
+                // bound to a quarantine folder, and say so loudly.
+                log::error!(
+                    "[PRINCIPIA] :: {} is unreadable ({e:#}); serving an empty store and \
+                     writing to {}.new — the original is untouched.",
+                    settings_dir.display(),
+                    settings_dir.display()
+                );
+                let mut q = settings_dir.as_os_str().to_owned();
+                q.push(".new");
+                PrefStore::empty(PathBuf::from(q))
+            }
+        };
 
         Self {
             current_root,
@@ -134,6 +156,9 @@ impl Principia {
             PrincipiaCommand::SetSystemRoot(path) => {
                 if self.validate_root(path) {
                     self.current_root = Some(path.clone());
+                    if let Some(lobe) = self.config_path.parent() {
+                        let _ = fs::create_dir_all(lobe);
+                    }
                     let _ = fs::write(&self.config_path, path.to_string_lossy().as_ref());
 
                     // Fire the echo back across the bus
@@ -276,7 +301,7 @@ mod tests {
     use super::*;
 
     fn handler(dir: &tempfile::TempDir) -> Principia {
-        Principia::with_config_dir(dir.path())
+        Principia::with_home(dir.path())
     }
 
     fn pref_reply(msg: Option<SMessage>) -> PrincipiaCommand {
@@ -443,7 +468,7 @@ mod tests {
             other => panic!("expected PrefChanged, got {other:?}"),
         }
         // The clamp is what persisted.
-        let back = PrefStore::load(dir.path().join("preferences.toml")).unwrap();
+        let back = PrefStore::load(dir.path().join(prefs_core::files::DIR)).unwrap();
         assert_eq!(back.get("system", "display.brightness"), Some(PrefValue::Int(1)));
         // A wrong type is refused, and the store is untouched.
         match set(&mut p, "audio.volume", PrefValue::Str("loud".into())) {
@@ -528,7 +553,7 @@ mod tests {
         // nothing fired below can be missed.
         let mut rx = synapse.subscribe();
         let handler_rx = synapse.subscribe();
-        let handler = Principia::with_config_dir(dir.path());
+        let handler = Principia::with_home(dir.path());
         tokio::spawn(serve(synapse.clone(), handler_rx, handler));
 
         synapse.fire(SMessage::Principia(PrincipiaCommand::PrefSet {
@@ -571,18 +596,18 @@ mod tests {
         assert_eq!(value, Some(PrefValue::Str("https://una.os/".into())));
 
         // The set really landed on disk, not just in the cache.
-        assert!(dir.path().join("preferences.toml").exists());
+        assert!(dir.path().join("settings").join("aether").exists());
     }
 }
 
-/// The standard preference file, `~/.config/unaos/preferences.toml` (via
-/// `dirs::config_dir()`): the path [`Principia::new`] serves. A reader that
-/// is not the store's writer (Vein reading its `vein` namespace, VEINPROV
-/// B303) opens it read-only through [`prefs::PrefStore::load`].
+/// The standard preference store, the folder `~/settings` (via
+/// `dirs::home_dir()`; `prefs_core::files::DIR`, the kernel's `<home>/settings`):
+/// the folder [`Principia::new`] serves. A reader that is not the store's
+/// writer (Vein reading its `vein` namespace, VEINPROV B303) opens it
+/// read-only through [`prefs::PrefStore::load`].
 pub fn default_prefs_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("unaos")
-        .join("preferences.toml")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(prefs_core::files::DIR)
 }
 
