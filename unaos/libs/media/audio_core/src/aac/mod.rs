@@ -288,7 +288,8 @@ impl AdtsStream {
 
 /// Access units with an AudioSpecificConfig (MP4 `esds`), plus trimming.
 pub struct AacSource {
-    data: Vec<u8>,
+    /// VPLAYAUDIO (rmbp B475): the file's bytes, shared with the demuxer that indexed them (no copy).
+    data: alloc::sync::Arc<Vec<u8>>,
     units: Vec<(usize, usize)>,
     next: usize,
     dec: AacDecoder,
@@ -302,7 +303,8 @@ pub struct AacSource {
 }
 
 impl AacSource {
-    pub fn new(data: Vec<u8>, units: Vec<(usize, usize)>, asc: &[u8], skip: u64, total: Option<u64>) -> Result<AacSource> {
+    pub fn new(data: impl Into<alloc::sync::Arc<Vec<u8>>>, units: Vec<(usize, usize)>, asc: &[u8], skip: u64, total: Option<u64>) -> Result<AacSource> {
+        let data = data.into();
         let a = Asc::parse(asc)?;
         let layout = a.layout()?;
         let ch = layout.channels as u16;
