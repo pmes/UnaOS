@@ -247,11 +247,18 @@ def selftest():
         ("cites missing row", ok_row, "open — flew ST9", 1, "not a row"),
         ("enum head is no claim", ok_row, "fixed-unflown — built", 0, None),
         ("bad status", "ST1\tc\tsettled\t\t\ts\t\n", "open", 1, "not in"),
+        ("baseline grandfathers", ok_row, "open — flew once", 0, None, "rmbp-ledger.md B1"),
+        ("baseline stale once cited", ok_row, "open — flew ST1", 1, "stale", "rmbp-ledger.md B1"),
     ]
     fails = 0
-    for name, tsv, cell, want, why in cases:
+    for name, tsv, cell, want, why, *bl in cases:
         d = tree(tsv, cell)
-        errs, _r, _f, _b = check(d, None)
+        bp = None
+        if bl:
+            bp = os.path.join(d, "docs/dev/STATUS.baseline")
+            with open(bp, "w") as f:
+                f.write("# fixture\n%s\n" % bl[0])
+        errs, _r, _f, _b = check(d, bp)
         got = 1 if errs else 0
         hit = why is None or any(why in e for e in errs)
         if got != want or not hit:
