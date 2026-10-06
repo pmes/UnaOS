@@ -298,3 +298,5 @@ pub mod boot;
 pub mod pwwire;
 // LOGINFURN (rmbp-ledger B374, R88): the bare login, the console's boot-text prefill, `tests loginfurn`. Tail statement, so no existing line moves.
 pub mod loginfurn;
+// WINDOWCAP3 (rmbp-ledger B399, R90): `SlotVec` — per-address-space sidecars keyed by slot, heap-grown, no `[_; USER_SLOTS]`. Tail statement, so no existing line moves.
+pub mod procslot;

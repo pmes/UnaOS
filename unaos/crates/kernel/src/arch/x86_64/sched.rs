@@ -2775,8 +2775,8 @@ fn spawn_user_inner(
 /// Relaxed-free accounting is deliberately NOT used: `retain` and `release` can run on different
 /// cores (a parent spawning on core A while a worker exits on core B), and the decision the counter
 /// drives is "may I free this address space?", so both sides are `AcqRel`.
-static USER_SPACE_REFS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+static USER_SPACE_REFS: crate::procslot::SlotVec<AtomicU32> =
+    crate::procslot::SlotVec::new(|| AtomicU32::new(0), AtomicU32::new(0)); // WINDOWCAP3 (B399): per-slot, heap-grown
 
 /// TEARDOWN-1: per-slot ADDRESS-SPACE DOOM — "every ring-3 task under this slot is owed its death".
 ///
@@ -2798,8 +2798,8 @@ static USER_SPACE_REFS: [AtomicU32; crate::arch::memory::USER_SLOTS] =
 /// QUIESCENCE IS PRESERVED, NOT WEAKENED. Nothing is reclaimed here. Each sibling still retires through
 /// `reap_killed` and decrements `USER_SPACE_REFS` itself; only when that reaches zero does the slot free.
 /// This makes that edge REACHABLE — it does not move it earlier.
-static SLOT_DOOMED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
-    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+static SLOT_DOOMED: crate::procslot::SlotVec<AtomicBool> =
+    crate::procslot::SlotVec::new(|| AtomicBool::new(false), AtomicBool::new(false)); // WINDOWCAP3 (B399): per-slot, heap-grown
 
 /// TEARDOWN-1: arm the address-space doom for the slot rooted at `cr3`. Idempotent; a `cr3` that is not a
 /// live slot root is ignored (there is no address space to scope to). Disarmed on the slot's real free
@@ -2827,7 +2827,7 @@ fn task_kill_armed(task: &Task) -> bool {
 /// `user_cr3` field is the authority on which address space it belongs to, and at reap time the live
 /// CR3 has already been restored to the kernel's.
 fn cr3_slot(cr3: u64) -> Option<usize> {
-    (0..crate::arch::memory::USER_SLOTS).find(|&s| crate::arch::memory::slot_cr3(s) == cr3)
+    (0..crate::arch::memory::user_slots()).find(|&s| crate::arch::memory::slot_known(s) && crate::arch::memory::slot_cr3(s) == cr3)
 }
 
 /// WINX-7: claim one extra hold on the address space `cr3` — called by the syscall layer BEFORE it
@@ -7823,4 +7823,11 @@ pub fn slab_high(base: u64, len: usize) -> Option<usize> {
         let _ = (base, len);
         None
     }
+}
+
+/// WINDOWCAP3 (rmbp-ledger B399): allocate this file's per-slot rows for slot `s` at its claim (process
+/// context), so the dispatcher's later reads never allocate.
+pub fn slot_tables_warm(s: usize) {
+    USER_SPACE_REFS.warm(s);
+    SLOT_DOOMED.warm(s);
 }

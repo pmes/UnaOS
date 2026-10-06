@@ -6282,12 +6282,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println(&alloc::format!(
                 "storm: n={} — {}/{} process rows free, {}/{} job rows, {}/{} user slots",
                 n, rows_free, rows, jobs_free, jobs_rows,
-                slots_free, storm_slots::USER_SLOTS
+                slots_free, storm_slots::user_slots()
             ));
             serial_println!(
                 ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} dead={} | user slots free={}/{} ::",
                 n, rows_free, rows_running, rows_exited, rows_orphaned, rows,
-                jobs_free, jobs_rows, jobs_dead, slots_free, storm_slots::USER_SLOTS
+                jobs_free, jobs_rows, jobs_dead, slots_free, storm_slots::user_slots()
             );
             crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
@@ -6324,7 +6324,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 serial_println!(
                     ":: STORM: end | proc rows free={} running={} exited={} porphaned={} of {} | user slots free={}/{} ::",
                     f, r, e, o, crate::arch::syscall::proc_table_rows(),
-                    storm_slots::user_slots_free(), storm_slots::USER_SLOTS
+                    storm_slots::user_slots_free(), storm_slots::user_slots()
                 );
             }
             // `post` is taken immediately, so its busy percents still carry the pre-burst window —
