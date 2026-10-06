@@ -6871,7 +6871,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), una_abi::SYS_SBRK => super::xwin::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), // VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), // VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
@@ -25997,4 +25997,67 @@ pub fn slot_tables_warm(asid: u64) {
     #[cfg(feature = "login")]
     SLOT_EPOCH.warm(a);
     SLOT_PPID.warm(a);
+}
+
+// =====================================================================================================
+// RINGLOGIN2 (rmbp-ledger B479) — `SYS_RINGKEY` (67) on aarch64: the login's door to Holocron's ring, the
+// SAME door (`crate::keyring::door_take` / `door_report`) and the SAME holder rule as x86's `sys_ringkey`:
+// only the process registered as Holocron's bus fulfiller (the `bus_route` row for `VERB_UNLOCK`, at the
+// SAME generation — here the ASID and its `ASID_GEN`), running as the door's user. The user is the session's
+// uid only when the caller's stamped principal (`slot_ppid_of`, SO37 epoch-qualified) IS the open session's
+// `user:` principal — a program of a closed session, or an unstamped one, is uid 0 and refused. The arm is
+// folded onto the `SYS_CLOSE` dispatch line (code before its `//`); the body is appended here at the TAIL.
+// =====================================================================================================
+#[cfg(feature = "lumen")]
+fn sys_ringkey(op: u64, a1: u64, a2: u64) -> i64 {
+    let asid = current_asid();
+    let uid = ringkey_uid(asid);
+    #[cfg(feature = "busreg")]
+    let holder = matches!(crate::bus_route::fulfiller_row(holocron_core::wire::VERB_UNLOCK), Some((r, g)) if r as u64 == asid && r < ASID_GEN.len() && ASID_GEN[r].load(Ordering::Acquire) == g);
+    #[cfg(not(feature = "busreg"))]
+    let holder = false;
+    match op {
+        una_abi::RINGKEY_OP_TAKE => {
+            if a2 as usize != una_abi::RINGKEY_LEN {
+                return EINVAL;
+            }
+            let mut out = [0u8; una_abi::RINGKEY_LEN];
+            let r = crate::keyring::door_take(holder, uid, &mut out);
+            if r == una_abi::RINGKEY_KEY {
+                let w = copy_to_user(a1, &out, out.len());
+                crate::keyring::wipe(&mut out);
+                if w.is_err() {
+                    return EFAULT;
+                }
+            }
+            r
+        }
+        una_abi::RINGKEY_OP_REPORT => crate::keyring::door_report(holder, uid, a1 as i64 as i32, a2 as u8),
+        _ => EINVAL,
+    }
+}
+
+/// The caller's user for the door: the session's uid when `asid`'s stamped principal is the session's, else 0.
+#[cfg(feature = "lumen")]
+fn ringkey_uid(asid: u64) -> u32 {
+    #[cfg(feature = "login")]
+    {
+        if asid == 0 {
+            return 0;
+        }
+        let p = slot_ppid_of(asid);
+        let sess = {
+            let _irq = IrqGuard::mask_save();
+            *SESSION.lock()
+        };
+        if p.kind == PRIN_USER && p == sess {
+            return crate::ring3abi::session_uid();
+        }
+        0
+    }
+    #[cfg(not(feature = "login"))]
+    {
+        let _ = asid;
+        0
+    }
 }
