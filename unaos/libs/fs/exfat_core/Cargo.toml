@@ -1,0 +1,15 @@
+[package]
+name = "exfat_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "exFAT core: the on-disk format read from Microsoft's published exFAT specification — one reader both rings link (the kernel's removable volumes, the host KATs)."
+
+# EXFAT (rmbp-ledger B392, R79): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies — the
+# `midden_core` shape. A member of the ROOT host workspace; the kernel pulls it as a path dep with
+# `default-features = false`. The core never touches a device: it asks `SectorRead` for 512-byte sectors.
+[dependencies]
+
+[features]
+default = ["std"]
+std = []

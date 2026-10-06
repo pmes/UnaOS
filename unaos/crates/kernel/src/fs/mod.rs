@@ -178,3 +178,5 @@ pub mod volumes;
 pub mod removable;
 /// ROOTDISK (B390, R94): `/volumes/UnaOS` IS `/`, `/lib`, the root's links marked, `tests rootdisk`.
 pub mod rootdisk;
+/// EXFAT (B392): the kernel half of the shared exFAT reader (`unaos/libs/fs/exfat_core`) — removable volumes, read-only.
+pub mod exfat;

@@ -35,7 +35,7 @@
 //!
 //! What is mounted: the FIRST FAT volume on the disk (superfloppy, GPT or MBR — `fat::mount_source`'s
 //! one rule). A disk with no FAT volume is said on the wire with what it carries instead
-//! (`fs=exfat`, `fs=ntfs`, `fs=unknown`): this tree has no exFAT reader, and a 64 GB SDXC card ships
+//! (`fs=exfat`, `fs=ntfs`, `fs=unknown`); an exFAT disk then mounts through `fs/exfat.rs` (EXFAT, B392) — a 64 GB SDXC card ships
 //! exFAT — which is what flight 25's card most likely was (`0 FAT volume(s)` on it, f25:437).
 
 use alloc::string::String;
@@ -55,7 +55,7 @@ struct RemVol {
     num_blocks: u64,
     /// The unique leaf under `/volumes`.
     name: String,
-    /// `fat16` / `fat32`.
+    /// `fat16` / `fat32` / `exfat` (EXFAT, B392).
     fs: &'static str,
 }
 
@@ -111,6 +111,7 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     let vols = MOUNTED.lock().clone();
     for v in vols.iter() {
         let point = alloc::format!("{}/{}", crate::fs::bootdisk::VOLUMES, v.name);
+        if v.fs == "exfat" { mt.mount(&point, alloc::boxed::Box::new(crate::fs::exfat::ExfatBackend::new(&v.name, v.source()))); continue; } // EXFAT (B392): the shared core's read-only backend
         mt.mount(&point, alloc::boxed::Box::new(FatBackend::new_source(&v.name, KERNEL_PRINCIPAL, true, v.source())));
     }
 }
@@ -163,6 +164,7 @@ pub fn service() {
     crate::drivers::block::pin_boot_medium_once();
     if !REGISTERED.swap(true, Ordering::Relaxed) {
         let _ = crate::tests::defer("usbstor", selftest);
+        let _ = crate::tests::defer("exfat", crate::fs::exfat::selftest); // EXFAT (B392): `tests exfat`, never at boot (R80)
     }
     let g = crate::drivers::block::usb_publish_gen();
     if SEEN_GEN.swap(g, Ordering::AcqRel) == g {
@@ -235,8 +237,20 @@ fn reconcile() {
             }
             Err(e) => {
                 let (kind, ty) = sniff(*ix, d.num_blocks);
+                // EXFAT (B392): no FAT volume and the boot sector says exFAT — the shared core mounts it.
+                let ex = if kind == "exfat" { Some(crate::fs::exfat::probe(*ix)) } else { None };
+                if let Some(Ok(name)) = ex.as_ref() {
+                    let (uniq, _point) = crate::fs::bootdisk::next_volume_point(&mut used, name);
+                    serial_println!(
+                        "[volumes] mounted /volumes/{} source={} slot={} fs=exfat removable=1 ::",
+                        uniq, src.name(), d.slot_id
+                    );
+                    MOUNTED.lock().push(RemVol { ix: *ix, slot_id: d.slot_id, num_blocks: d.num_blocks, name: uniq, fs: "exfat" });
+                    changed = true;
+                    continue;
+                }
                 let reason = match kind {
-                    "exfat" => "no-exfat-reader",
+                    "exfat" => match ex { Some(Err(r)) => r, _ => "no-exfat-reader" },
                     "ntfs" => "no-ntfs-reader",
                     _ => match e { fat::FatError::NotFat => "no-fat-volume", fat::FatError::Io => "io", fat::FatError::Unsupported => "sector-size", _ => "mount-error" },
                 };
@@ -297,4 +311,10 @@ fn witness() {
 /// `tests usbstor` — the same line, on demand.
 pub fn selftest() {
     witness();
+}
+
+/// EXFAT (B392): the exFAT removables mounted now, `(registry index, name under /volumes)` — what
+/// `tests exfat` audits.
+pub fn exfat_mounts() -> Vec<(usize, String)> {
+    MOUNTED.lock().iter().filter(|v| v.fs == "exfat").map(|v| (v.ix, v.name.clone())).collect()
 }
