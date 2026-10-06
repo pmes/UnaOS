@@ -739,6 +739,8 @@ pub fn volkey_usage(usage: u8) -> Option<(u8, bool)> {
     #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
     let written = false;
     if muted { osd_set(OSD_MUTED, lv) } else { osd_set(OSD_VOL, lv) }
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    crate::video::bezel::arm_volume(muted); // BEZEL (B405): the next desktop pass shows the amp's level
     Some((key, written))
 }
 

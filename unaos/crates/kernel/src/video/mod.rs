@@ -1203,3 +1203,6 @@ pub mod loginitems;
 pub mod dialog;
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod toast;
+// BEZEL (B405, MACPARITY row 26): the brightness / volume bezel — a compositor draw (the toast's row), armed by the keys. Same gate as brightkeys; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod bezel;
