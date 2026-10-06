@@ -78,7 +78,7 @@ def scan(k):
                     keys.add(f'seamcite|{rel}')
                 if seam == 'owed' and not re.search(r'\bB\d+', rest):
                     keys.add(f'seamcite|{rel}')
-                if seam == 'shared-core' and not SHARED_RE.search(text):
+                if seam == 'shared-core' and not SHARED_RE.search(re.sub(r'//[^\n]*', '', text)):  # GATEREVIEW F3: a core named in a comment links nothing
                     keys.add(f'sharedcore|{rel}')
             for lit in sorted(set(DOTSLASH_RE.findall(text))):
                 keys.add(f'dotslash|{rel}|{lit.strip(chr(34))}')  # GATEREVIEW F1: keyed by FILE, so a baselined literal in a new file is new
@@ -131,7 +131,7 @@ def selftest():
         open(os.path.join(d, 'scripts', 'charter.registry'), 'w').write('old.rs | Kernel | driver | x\n')
         plants = {
             'a.rs': '//! CHARTER: Kernel — kernel-by-ruling\n',
-            'b.rs': '//! CHARTER: Kernel — shared-core\nfn x() {}\n',
+            'b.rs': '//! CHARTER: Kernel — shared-core\n// one day this links stria_core\nfn x() {}\n',
             'c.rs': 'fn p(h: &str) -> String { format!("{}/.secret", h) }\n',
             'd.rs': '//! CHARTER: Kernel — wm\nfn p(h: &str) -> String { format!("{}/settings/mine", h) }\n',
             'e.rs': 'static S: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());\nfn w() { mt.write(&p, 0, b, k); }\n',
