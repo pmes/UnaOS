@@ -360,18 +360,18 @@ const MAX_STRIP_W: usize = strip::MAX_STRIP_W;
 
 /// The layout cannot ask for a strip the scratch cannot hold. A `const` proof rather than a runtime
 /// clamp, so a future `LABEL_MAX` or `MAX_WINDOWS` raise fails the BUILD. WINDOWCAP (B378, R90): the proof is for the pins + the eleven app windows R90 promises; past that the dock row count is `wincap::dock_rows`, whose `for_panel` refuses (via `strip::frame_centred`) any strip wider than the scratch — so the id space (32) at scale 4 is never asked for.
-#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
-    assert!(2 * PAD() + (super::wincap::DOCK_PINS + 11) * (2 * PAD() + CELL_W()) + ((super::wincap::DOCK_PINS + 11) - 1) * PAD()
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity(ck: &mut super::metrics::Sane) {
+    ck.t(2 * PAD() + (super::wincap::DOCK_PINS + 11) * (2 * PAD() + CELL_W()) + ((super::wincap::DOCK_PINS + 11) - 1) * PAD()
         <= MAX_STRIP_W); // UIMETRICS (B372): ONE-glyph tiles — at a large scale `Layout::for_panel` steps the caption down to fit, so the full-caption worst case (3318 px at 2.5) is no longer the bound; a full table of one-glyph tiles is
     // The caption must fit inside the tile it is centred in, or there is nothing to draw.
-    assert!(CELL_H() <= TILE_H());
+    ck.t(CELL_H() <= TILE_H());
     // The indicator must fit in the padding band below the tile.
-    assert!(IND_D() < PAD());
+    ck.t(IND_D() < PAD());
     // Both of a tile's corners must fit within its own height — the kit asserts this for buttons and
     // a tile IS a button; restated here because the tile is the object being cut.
-    assert!(2 * TILE_R() <= TILE_H());
-    assert!(2 * STRIP_R() <= STRIP_H());
-    assert!(LABEL_MAX <= wm::MAX_TITLE);
+    ck.t(2 * TILE_R() <= TILE_H());
+    ck.t(2 * STRIP_R() <= STRIP_H());
+    const _: () = assert!(LABEL_MAX <= wm::MAX_TITLE);
 }
 
 // ---------------------------------------------------------------------------

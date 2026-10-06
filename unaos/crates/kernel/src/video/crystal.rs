@@ -278,21 +278,21 @@ pub fn is_open() -> bool {
     OPEN.load(Ordering::Relaxed)
 }
 
-#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity(ck: &mut super::metrics::Sane) {
     // The row height must clear the glyph it centres, or the label is cut.
-    assert!(ITEM_H() >= CELL_H());
+    ck.t(ITEM_H() >= CELL_H());
     // FONT-METRIC — was `ITEM_H == 24`, a pin on the 16 px face's arithmetic that a face change is
     // SUPPOSED to move. What actually has to hold is the clearance the row was designed around: 4 px
     // of air above and below the cell, exactly, whatever the cell is.
-    assert!(ITEM_H() == CELL_H() + crate::ui::px(8) && (ITEM_H() - CELL_H()) % 2 == 0);
+    ck.t(ITEM_H() == CELL_H() + crate::ui::px(8) && (ITEM_H() - CELL_H()) % 2 == 0);
     // The separator band must hold its keyline with air either side.
-    assert!(SEP_H() >= 3);
+    ck.t(SEP_H() >= 3);
     // A menu with no pickable item would be a surface with nothing to pick.
-    assert!(ITEM_COUNT >= 1);
+    const _: () = assert!(ITEM_COUNT >= 1);
     // The menu must fit the strip painter's scratch, exactly as any strip must.
-    assert!(MENU_W() <= strip::MAX_STRIP_W);
+    ck.t(MENU_W() <= strip::MAX_STRIP_W);
     // The widest label must be representable — a sanity floor, not a real bound.
-    assert!(max_label_glyphs() >= 1);
+    ck.t(max_label_glyphs() >= 1);
 }
 
 // ---------------------------------------------------------------------------

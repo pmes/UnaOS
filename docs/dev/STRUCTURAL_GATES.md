@@ -2697,3 +2697,15 @@ to a copy: `rows=357 … claiming-uncited=0 -> PASS`, exit 0.
 **What it does not do.** A hand-typed pin row is still possible (it lacks `by=capture-pin` and a bench `src=`; review
 reads it). VERBDEPTH reads the depth of braces, not the meaning of an arm (a `"w" if guard =>` is not an arm at all).
 CHARTERSCOPE's 138 grandfathers declare nothing yet; they only stop the count growing.
+
+## GATE-SANITY — an assert over constants is a compile-time proof, never a boot-time panic (B488, 2026-10-06)
+
+**Why.** Flight 26 (image 19) rebooted on every boot at `winmenu.rs:2269 assertion failed: BAR_BOXES_MAX ==
+MENU_TITLES_MAX + 2`: a runtime assert over consts, run once at boot by `video::metrics::ignite`, that no compile leg
+evaluated. **Gate.** `python3 unaos/scripts/sanity-legs.py unaos` (in `./arroyo gates` as `sanity`, planted by
+`gates --selftest`) refuses (S1) a runtime `assert!`/`assert_eq!`/`assert_ne!` in the kernel whose operands are all
+const-shaped (UPPER items, UPPER() metric readers, literals, paths, `.len()`) outside a `const _`/const item/`const
+fn`/`#[cfg(test)]`/a `*selftest*`/`*fixture*`/`*sanity*` fn; (S2) `ignite` calling a `uimetrics_*` fn or `panic!`;
+(S3) `metrics::SANITY_CONST_ASSERTS` disagreeing with the `const _` asserts in the `uimetrics_sanity*` fns.
+`--selftest` proves each refusal and each allowed shape. The metric relations run under `tests sanity`:
+`:: SANITY: const_asserts=<n> runtime_moved=<n> left=<n> -> PASS ::`.

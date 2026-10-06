@@ -127,7 +127,7 @@ pub const MAX_TITLE: usize = 16;
 #[allow(non_snake_case)] #[inline] pub fn TITLE_CELL_H() -> usize { crate::ui::px(super::font::CHROME_CELL_H) } // UIMETRICS (B372): see TITLE_CELL_W
 // REVIEW (GR27 fonts): back the draw_title comment's "cell shorter than the strip" claim on every
 // arch (menubar's CELL_H<=BAR_H assert is x86+wc-only). draw_title clamps anyway, but assert it.
-#[allow(dead_code)] pub(crate) fn uimetrics_assert_title_cell() { assert!(TITLE_CELL_H() <= TITLE_H(), "title glyph cell must fit the caption strip"); }
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity_title_cell(ck: &mut super::metrics::Sane) { ck.t(TITLE_CELL_H() <= TITLE_H()); }
 
 /// CRISPYWIRE-REVIEW — the strip width the three-disc control cluster RESERVES, measured from the
 /// inner edge of the LEFT frame (WMCTRL, Peter 2026-08-09: the cluster is left-aligned, macOS-side;

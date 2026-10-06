@@ -367,60 +367,60 @@ const BOLT: [u8; 8] = [
 /// matters.
 #[allow(non_snake_case)] #[inline] fn FLOOR_W() -> usize { 2 * strip::PAD() + CRYSTAL_SLOT() + (CLOCK_GLYPHS + 1) * CELL_W() }
 
-#[allow(dead_code)] pub(crate) fn uimetrics_assert() {
+#[allow(dead_code)] pub(crate) fn uimetrics_sanity(ck: &mut super::metrics::Sane) {
     // The caption must fit inside the bar it is centred in, or there is nothing to draw.
-    assert!(CELL_H() <= BAR_H());
+    ck.t(CELL_H() <= BAR_H());
     // The bevel is drawn under the bar's top edge and must not reach its keyline.
-    assert!(theme::BEVEL() < BAR_H());
+    ck.t(theme::BEVEL() < BAR_H());
     // A bar that declines on every panel this kernel drives would be an inert file pretending to be a
     // feature. QEMU's raspi4b 640x480 is the smallest panel in the suites; the floors must admit it.
-    assert!(FLOOR_W() <= 640);
-    assert!(FLOOR_H() <= 480);
+    ck.t(FLOOR_W() <= 640);
+    ck.t(FLOOR_H() <= 480);
     // The title must be representable in what `wm` actually stores.
-    assert!(TITLE_GLYPHS <= wm::MAX_TITLE);
+    const _: () = assert!(TITLE_GLYPHS <= wm::MAX_TITLE);
 
     // The crystal must fit inside the bar with a bevel of clearance each side — the disc's own floor.
-    assert!(CRYSTAL_H() + 2 * theme::BEVEL() <= BAR_H());
+    ck.t(CRYSTAL_H() + 2 * theme::BEVEL() <= BAR_H());
     // A gem needs a non-degenerate silhouette: a crown above the girdle and a pavilion below it, both
     // with real height, and a width the facet split can halve.
-    assert!(CRYSTAL_CROWN_H() > 0);
-    assert!(CRYSTAL_CROWN_H() < CRYSTAL_H());
-    assert!(CRYSTAL_W() >= 4);
+    ck.t(CRYSTAL_CROWN_H() > 0);
+    ck.t(CRYSTAL_CROWN_H() < CRYSTAL_H());
+    ck.t(CRYSTAL_W() >= 4);
     // The crystal and the clock must not collide on the SMALLEST panel the bar draws on. The crystal
     // owns `[PAD, PAD + CRYSTAL_W)` — one PAD in from the left, render9's ruling — and the clock
     // `[FLOOR_W - PAD - CLOCK_GLYPHS*CELL_W, FLOOR_W - PAD)`; this is the gap between them staying
     // positive, so a future metric change that would overlap them fails the BUILD rather than painting
     // the gem over the time.
-    assert!(strip::PAD() + CRYSTAL_W() < FLOOR_W() - strip::PAD() - CLOCK_GLYPHS * CELL_W());
+    ck.t(strip::PAD() + CRYSTAL_W() < FLOOR_W() - strip::PAD() - CLOCK_GLYPHS * CELL_W());
     // The title, shifted past the crystal's slot, must still leave room for at least one glyph before
     // the clock on the floor panel.
-    assert!(TITLE_X0() + CELL_W() <= FLOOR_W() - strip::PAD() - CLOCK_GLYPHS * CELL_W());
+    ck.t(TITLE_X0() + CELL_W() <= FLOOR_W() - strip::PAD() - CLOCK_GLYPHS * CELL_W());
     // FITTS-CORNER: the press cell (`crystal_corner_abs`, CRYSTAL_SLOT wide by the bar's height, at the
     // bar's LEFT end) must CONTAIN the painted glyph box, or a press on the visible mark could miss its
     // own menu. The horizontal half is the load-bearing one; vertical containment is the bevel assert.
     // The cell starts at 0 and the glyph at PAD, so the glyph's RIGHT edge is what must fit.
-    assert!(strip::PAD() + CRYSTAL_W() <= CRYSTAL_SLOT());
+    ck.t(strip::PAD() + CRYSTAL_W() <= CRYSTAL_SLOT());
 
     // MENUSTAT — the status item's silhouette must be drawable inside the bar it sits in, and the
     // charging mark inside the cell it sits in. These are build-time because they are statements
     // about CONSTANTS: a metric change that would draw the cell through the bar's keyline, or the
     // bolt through the cell's outline, fails the build rather than painting it once on the glass.
-    assert!(BATT_BODY_H() + 2 * theme::BEVEL() <= BAR_H());
-    assert!(BATT_BODY_H() >= 4); // an outline, a fill row and an outline
-    assert!(BATT_CAP_H() > 0 && BATT_CAP_H() < BATT_BODY_H());
+    ck.t(BATT_BODY_H() + 2 * theme::BEVEL() <= BAR_H());
+    ck.t(BATT_BODY_H() >= 4); // an outline, a fill row and an outline
+    ck.t(BATT_CAP_H() > 0 && BATT_CAP_H() < BATT_BODY_H());
     // The bolt lives INSIDE the 1-px outline on all four sides, so it can never erase the cell's
     // own edge — the falsifier for the "inverse of whatever is under it" rule, which is only safe
     // while "under it" is fill or face and never outline.
-    assert!(BOLT_H() + 2 <= BATT_BODY_H());
-    assert!(BOLT_W() + 2 <= BATT_BODY_W());
+    ck.t(BOLT_H() + 2 <= BATT_BODY_H());
+    ck.t(BOLT_W() + 2 <= BATT_BODY_W());
     // `100%` must fit the slot the percent is right-aligned in, or a full pack would be truncated.
-    assert!(BATT_PCT_GLYPHS >= 4);
+    const _: () = assert!(BATT_PCT_GLYPHS >= 4);
     // ⛔ THE FLOORS ARE NOT WIDENED: the item is NOT part of `FLOOR_W`. This asserts the consequence
     // that matters — on the floor panel the bar still seats the crystal, a title glyph and the clock
     // WITHOUT the item, which is the state `batt_slot` declines into rather than shrinking anything.
     // If a future edit folds `BATT_ITEM_W` into `FLOOR_W`, this assert stops meaning what it says and
     // the reader is sent to `batt_slot` to find out which rule changed.
-    assert!(FLOOR_W() == 2 * strip::PAD() + CRYSTAL_SLOT() + (CLOCK_GLYPHS + 1) * CELL_W());
+    ck.t(FLOOR_W() == 2 * strip::PAD() + CRYSTAL_SLOT() + (CLOCK_GLYPHS + 1) * CELL_W());
 }
 
 // ---------------------------------------------------------------------------
