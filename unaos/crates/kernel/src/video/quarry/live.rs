@@ -2894,7 +2894,7 @@ pub fn service() {
     // its own pixels repaints once (the login screen, Quarry, Settings, Activity, the viewer/editor, the installer)
     // and the console repaints its screenful from its cell store. See `font_repaint_pass` at this file's tail.
     font_repaint_pass();
-    quicklook::service(); columns::service(); // QUARRY3 (B413): the Quick Look panel renders here (I/O); QUARRY2 (B336): the latched column-width / sort preference write
+    quicklook::service(); columns::service(); openwith::service(); // QUARRY3 (B413): the Quick Look panel renders here (I/O); QUARRY2 (B336): the latched column-width / sort preference write
 }
 
 // ── The witness ─────────────────────────────────────────────────────────────────────────────────

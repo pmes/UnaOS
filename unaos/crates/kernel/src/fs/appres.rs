@@ -350,6 +350,18 @@ pub fn sight_in(mt: &MountTable, path: &str) -> Option<App> {
         return Some(a.clone());
     }
     let key = key_of_path(path);
+    let (volume, root) = crate::fs::apptrust::trust_of(mt, path); // APPTRUST (B467): where it is decides what a sight may write
+    serial_println!("[appres] sighted {} volume={} trust={}", path, volume, if root { "root" } else { "foreign" });
+    if !root {
+        let app = match read_block(mt, path) {
+            Ok(Some(b)) => app_from_block(&key, path, &stamp, &b, "elf"),
+            _ => generic_app(&key, path, &stamp, "elf"),
+        };
+        let _ = admit(mt, &app, &volume, false);
+        SIGHTS.fetch_add(1, Ordering::Relaxed);
+        remember(&app);
+        return Some(app);
+    }
     if let Some(a) = from_cache(mt, &key, path, &stamp) {
         SIGHTS.fetch_add(1, Ordering::Relaxed);
         serial_println!("[appres] sight path={} res=yes source=attrs attrs=0 on=cached sig={}", path, a.signature);
@@ -360,7 +372,7 @@ pub fn sight_in(mt: &MountTable, path: &str) -> Option<App> {
         Ok(Some(b)) => app_from_block(&key, path, &stamp, &b, "elf"),
         _ => generic_app(&key, path, &stamp, "elf"),
     };
-    let (n, on) = cache(mt, &app);
+    let (n, on) = admit(mt, &app, &volume, true);
     SIGHTS.fetch_add(1, Ordering::Relaxed);
     serial_println!("[appres] sight path={} res={} source=elf attrs={} on={} sig={}", path,
         if app.has_res { "yes" } else { "no" }, n, on, if app.signature.is_empty() { "-" } else { &app.signature });
@@ -564,7 +576,7 @@ pub fn ensure_tests() {
     use core::sync::atomic::AtomicBool;
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
-        crate::tests::register("appres", selftest);
+        crate::tests::register("appres", selftest); crate::fs::apptrust::ensure_tests(); // APPTRUST (B467): `tests apptrust` rides it
         #[cfg(all(target_arch = "x86_64", feature = "wc"))]
         { crate::video::launcher::ensure_tests(); crate::video::appswitch::ensure_tests(); } // APPSWITCH (B428): `tests appswitch` rides it too. LAUNCHER (B417): `tests launcher` rides this registration (no tests.rs line)
     }
@@ -720,7 +732,7 @@ pub fn builtin_doctypes() -> Vec<String> {
 pub fn registrants(mt: &MountTable, mime: &str, type_obj: &str) -> Vec<Registrant> {
     let mut out: Vec<Registrant> = BUILTIN.iter().filter(|(_, b)| declares(b, mime)).map(|(k, b)| builtin_registrant(k, b)).collect();
     for p in get_str(mt, type_obj, KEY_APPS).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
-        if out.iter().any(|r| r.opener == p) {
+        if out.iter().any(|r| r.opener == p) || crate::fs::apptrust::is_foreign(mt, p) { // APPTRUST (B467): a foreign path is never a registrant, whoever wrote the line
             continue;
         }
         let (signature, name) = match app_at(p) {
@@ -743,7 +755,7 @@ pub fn opener_of_preferred(mt: &MountTable, v: &str) -> String {
         return String::from(*k);
     }
     if v.contains('.') && !v.starts_with('/') {
-        if let Some(a) = REG.lock().iter().find(|a| a.signature == v) {
+        if let Some(a) = REG.lock().iter().find(|a| a.signature == v && !crate::fs::apptrust::sighted_foreign(&a.path)) { // APPTRUST (B467): a foreign program's signature never names an opener
             return a.path.clone();
         }
         if let Some(p) = get_str(mt, &signature_object(v), KEY_APP_PATH) {
@@ -781,4 +793,38 @@ pub fn builtin_hash(mut h: u64) -> u64 {
         }
     }
     h
+}
+// ── APPTRUST (rmbp-ledger B467) — a sight from a foreign volume writes nothing and registers nothing ──────────────────
+
+/// The one admission a sight makes: a ROOT program is cached (its inode, its signature object) and published in
+/// `una:apps` on its doc types' objects — `(attributes written, where)`, as [`cache`]; a FOREIGN program writes
+/// NOTHING (not on the stick, not in the registry) and joins `apptrust`'s RAM list — `(0, "foreign")`.
+pub fn admit(mt: &MountTable, app: &App, volume: &str, root: bool) -> (usize, &'static str) {
+    if !root {
+        crate::fs::apptrust::note_foreign(&app.path, volume, &app.name, &app.signature, &app.doctypes);
+        return (0, "foreign");
+    }
+    cache(mt, app)
+}
+
+/// `tests apptrust`'s probe: a program at `path` with a block declaring `mime` under `signature` (no icons).
+pub fn probe_app(path: &str, signature: &str, mime: &str) -> App {
+    App {
+        key: key_of_path(path),
+        path: String::from(path),
+        stamp: String::from("probe"),
+        name: String::from("AppTrust Probe"),
+        signature: String::from(signature),
+        version: String::from("1"),
+        kind: String::from("app"),
+        doctypes: alloc::vec![String::from(mime)],
+        icons: Vec::new(),
+        has_res: true,
+        source: "elf",
+    }
+}
+
+/// Drop `path` from the per-boot memo (the test's probe).
+pub fn forget(path: &str) {
+    REG.lock().retain(|a| a.path != path);
 }

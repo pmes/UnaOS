@@ -200,3 +200,5 @@ pub mod rootacl;
 pub mod nameindex;
 /// BOOTFATSEAM (B453, R99): the kernel's own stores (USERS.DAT, the holocron store) as kernel-owned leaves of UnaFS `/system`.
 pub mod sysleaf;
+/// APPTRUST (B467): a program sighted on a removable volume is not a registrant until the user says so.
+pub mod apptrust;
