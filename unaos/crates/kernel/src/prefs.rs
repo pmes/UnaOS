@@ -200,8 +200,6 @@ fn ensure_dirs() {
 static HELD_D: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
 /// Domains whose file is on the volume (at the last load / save) — the reset-on-delete watch list.
 static ON_DISK: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
-/// The domain the write in flight saves (set by [`set_applied`], read by `KernelPersist::save`).
-static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
 /// Who made the write in flight when it was not the domain's own pane (the `pref` verb, the fixture).
 static BY: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
 /// One save (or the delete watch) at a time: the swap's unlink window must not read as a user delete.
@@ -633,6 +631,8 @@ impl core::fmt::Display for SetError {
 /// for the `[prefs] set` line.
 struct KernelPersist {
     err: Option<String>,
+    /// SETTINGSFILES: the domain this write saves (`None` = every domain).
+    domain: Option<String>,
 }
 
 impl prefs_core::wire::Persist for KernelPersist {
@@ -641,7 +641,7 @@ impl prefs_core::wire::Persist for KernelPersist {
     }
     fn save(&mut self) -> Result<(), ()> {
         // SETTINGSFILES (R98): a key's write rewrites ONLY its domain's file.
-        let r = match PENDING.lock().take() {
+        let r = match self.domain.take() {
             Some(d) => save_domain(&d),
             None => save(),
         };
@@ -672,10 +672,8 @@ pub fn set_applied(ns: &str, k: &str, v: PrefValue) -> Result<prefs_core::schema
     } else {
         v
     };
-    *PENDING.lock() = Some(prefs_core::files::domain_of(ns, k));
-    let mut kp = KernelPersist { err: None };
+    let mut kp = KernelPersist { err: None, domain: Some(prefs_core::files::domain_of(ns, k)) };
     let mut r = prefs_core::wire::persisted_set(&mut kp, ns, k, v.clone());
-    *PENDING.lock() = None;
     if let Ok(st) = r.as_mut() {
         st.applied.clamped |= pre_clamp;
     }
