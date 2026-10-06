@@ -1270,6 +1270,11 @@ fi
 # with builder/src/main.rs — a knob armed here but missing there ships the rung DISABLED on MEDIA
 # while the banner claims it is on.
 [ -n "${UNAOS_IVB3D_R8:-}" ] && _feats="${_feats}gen7,gen7r8,"
+# GEN7B (B422): UNAOS_IVB3D_BLIT=1 arms the BCS as KCOMP's second Blitter (drivers/gpu/gen7_blit.rs),
+# run by `tests gen7` only (R80): one BCS job into heap scratch through its own proven-unowned GGTT
+# window, every register restored, the panel never written; plus the read-only `[igpu-dpy] capture`.
+# Kept in sync with builder/src/main.rs. Media is NOT single-use.
+[ -n "${UNAOS_IVB3D_BLIT:-}" ] && _feats="${_feats}gen7,gen7blit,"
 # GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the INTEGRATED GPU with an unwind-stack
 # restore on the same call stack — no dwell, no timer (drivers/gpu/igpu.rs; round 13 removed the
 # timed auto-revert). ⛔ SINGLE-USE TEST MEDIA — the knob is baked into the image and
@@ -3169,6 +3174,10 @@ arm_features() {
     # the two are order-independent (the patterns cannot overlap — `,gen7,` needs a comma where
     # `,gen7r8,` has an `r`) but neither works alone.
     f="${f//,gen7r8,/,}"
+    # GEN7B (B422): `gen7blit` is `drivers/gpu/gen7_blit.rs`, a child of the x86_64-only gen7.rs, and
+    # its `video/blitter.rs` slot is gated `all(target_arch = "x86_64", feature = "gen7blit")` — same
+    # strip, same reason (`gen7blit = ["gen7"]` would resolve `gen7` back ON).
+    f="${f//,gen7blit,/,}"
     # PCIH / NOASPM rides the same strip, for the same reason: every noaspm-gated byte lives in
     # the x86_64-only half of drivers/gpu/pcihealth.rs, so the feature emits not one byte of
     # aarch64 CODE — but an enabled feature is hashed into cargo's -Cmetadata fingerprint, so
