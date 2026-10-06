@@ -5583,7 +5583,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // headless `test-fat` boot must be able to prove the write from the log alone.
             match crate::video::prtscr::capture() {
                 Ok(shot) => {
-                    shot.report_ok(); // SHOTVERB (orin 24's preserved edit, landed as rmbp-ledger B212): the ONE verdict line, `Shot::report_ok`,
+                    shot.report_ok(); crate::video::prtscr::announce(&shot); // SHOTVERB (orin 24's preserved edit, landed as rmbp-ledger B212): the ONE verdict line, `Shot::report_ok`,
                     // whose second `::` segment names the volume (`source= serial=`) and the on-disk `dir=`. The verb used to print a
                     // first-segment-only twin, so a headless `test-fat` log read `-> OK ::` with no device behind it — an OK that said
                     // nothing about WHERE. The first segment is byte-identical, so every scorer keyed on `bytes -> OK ::` still matches.

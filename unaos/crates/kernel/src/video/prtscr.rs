@@ -608,11 +608,7 @@ fn finish(verdict: Result<Shot, Refusal>) {
         Ok(shot) => {
             CAPTURES.fetch_add(1, Ordering::Relaxed);
             shot.report_ok();
-            // SHOTREGION M3: a region/window capture says where it went (B229 `notice_show`); the whole-panel path stays silent as before.
-            #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-            if shot.kind != 0 {
-                let _ = crate::video::dialog::notice(b"Screenshot saved", alloc::format!("{}\nDesktop", shot.name).as_bytes()); // DIALOG2 (B404): THE router — sorted error -> dialog, information -> toast
-            }
+            announce(&shot); // PRTSCR4 (B493): EVERY user capture says where it went — the whole panel too (it was silent; flight 26)
         }
         Err(why) => {
             REFUSALS.fetch_add(1, Ordering::Relaxed);
@@ -641,6 +637,8 @@ pub struct Shot {
     pub kind: u32,
     pub rx: u32,
     pub ry: u32,
+    /// PRTSCR4 (B493) — the file as the mount table spells it (`/home/una/Desktop/<name>`), for [`announce`].
+    pub path: String,
 }
 
 /// Why a capture did not happen. Every variant carries what it inspected, not just what was
@@ -1493,6 +1491,7 @@ impl Job {
                     kind: self.kind,
                     rx: self.rx,
                     ry: self.ry,
+                    path: core::mem::take(&mut self.vpath),
                 }))
             }
             // Unreachable: `slice` is the only caller and it always hands back a live phase.
@@ -2516,4 +2515,36 @@ fn native_readback(shot: &Shot) -> bool {
     let ok = crate::shell::vfs_mount_table().stat(&p).map(|s| s.size as usize == shot.bytes).unwrap_or(false);
     serial_println!(":: PRTSCR-ST: native read-back path={} bytes={} -> {} ::", p, shot.bytes, if ok { "PASS" } else { "FAIL" });
     ok
+}
+
+// ======================== PRTSCR4 (rmbp-ledger B493) — THE GLASS SAYS WHERE ========================
+//
+// Flight 26: "i took a screenshot but apparently screenshot is broken now". The capture lands on the Desktop
+// folder (the theme's word, SCRSHOT-DESKTOP), but the desktop draws no files and the whole-panel capture —
+// the key Peter pressed — was the one shape that posted nothing, so a landed capture looked like no capture.
+// Every USER capture (the key, the chords, region/window, the `screenshot` verb) now ends here: one wire line
+// and one toast through THE notice router (DIALOG2: information -> toast). A named state shot (`shot <state>`)
+// and `tests prtscr` do not come here — a toast on the glass would land in the next state's golden.
+
+/// PRTSCR4 — `[prtscr] saved path=<p> bytes=<n> -> toast`, and the toast `Screenshot saved` / `~/Desktop/<name>`.
+pub fn announce(shot: &Shot) {
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let to = {
+        // A toast is ONE line under a 24-char title (`toast::TL`/`LL`; `Screenshot saved to Desktop` is 27), so the title
+        // says what and the line says WHERE — the file home-relative (`~/Desktop/Screenshot 2026-10-06 at 14.57.18.png`,
+        // 46 of 52); the wire keeps the whole path.
+        if crate::video::dialog::notice(b"Screenshot saved", home_rel(&shot.path).as_bytes()) { "toast" } else { "toast-dropped" } // DIALOG2 (B404): THE router — information -> toast
+    };
+    #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    let to = "no-glass";
+    serial_println!("[prtscr] saved path={} bytes={} -> {}", shot.path, shot.bytes, to);
+}
+
+/// PRTSCR4 — `/home/<u>/rest` -> `~/rest` (the toast's line); any other path as it is.
+#[allow(dead_code)] // the toast arm is feature-gated
+fn home_rel(p: &str) -> String {
+    match p.strip_prefix("/home/").and_then(|r| r.find('/').map(|i| &r[i..])) {
+        Some(rest) => alloc::format!("~{}", rest),
+        None => String::from(p),
+    }
 }
