@@ -1575,6 +1575,10 @@ fn mode_field(st: &mut State) {
     let t = match ms.get(mode_cur(&ms)) { Some(m) => mode_caption(m), None => String::from("panel busy") };
     txt(st, TRACK_X + 6, 2, &t);
     txt(st, w - 30, 2, "v");
+    // PREFSUI M6 (seat): the panel's own mode, said once, so no one reads a scale choice as the panel changing.
+    txt(st, LABEL_X, 8, "Panel");
+    let native = match ms.first() { Some(m) => alloc::format!("{}x{} native (a choice above is a scale)", m.w, m.h), None => String::from("panel busy") };
+    txt(st, TRACK_X, 8, &native);
 }
 
 /// The open dropdown: one row per entry under the field, the current one in the accent.

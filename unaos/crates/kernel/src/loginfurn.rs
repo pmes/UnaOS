@@ -44,6 +44,7 @@ pub fn desktop_bare(why: &'static str) {
 /// `boot::note_window`: a row is being minted (pure apart from atomics; called under the window table).
 pub fn note_window(owner: u64) {
     if owner != 0 && in_login_window() {
+        if take_item_credit() { return; } // PREFSUI M6 (R91): a window the user's login items asked for is not a window that opened itself
         if AT_LOGIN_WINDOWS.fetch_add(1, Relaxed) == 0 {
             FIRST_AT_LOGIN_OWNER.store(owner, Relaxed);
         }
@@ -139,7 +140,7 @@ pub fn ensure_tests() {
 /// SKIP when the boot had no login (a Desktop from the first instruction).
 pub fn loginfurn_selftest() {
     if crate::boot::ignite_ms() == 0 {
-        serial_println!(":: LOGINFURN: at_login windows=- services=- console_prefill_lines=- -> SKIP reason=no-login-this-boot ::");
+        serial_println!(":: LOGINFURN: at_login windows=- login_items=- services=- console_prefill_lines=- -> SKIP reason=no-login-this-boot ::");
         return;
     }
     let w = AT_LOGIN_WINDOWS.load(Relaxed);
@@ -155,11 +156,36 @@ pub fn loginfurn_selftest() {
         );
     }
     serial_println!(
-        ":: LOGINFURN: at_login windows={} services={} console_prefill_lines={} -> {} ::{}",
+        ":: LOGINFURN: at_login windows={} login_items={} services={} console_prefill_lines={} -> {} ::{}",
         w,
+        ITEM_WINDOWS.load(Relaxed),
         s,
         if opened { alloc::format!("{}", p) } else { alloc::string::String::from("none") },
         if pass { "PASS" } else { "FAIL" },
         if opened { "" } else { " console=unopened (open the console and rerun for the prefill count)" }
     );
+}
+
+// ── PREFSUI M6 (rmbp-ledger B389, R88 + R91) — the user's login items are not furniture ─────────────────────────
+// `loginitems::launch` posts the user's `system.login.items` through the dock's seams and hands this module a
+// CREDIT: one window per item, plus the shell window a ring-3 item's verb runs in. A row minted in the login's
+// settle window spends a credit first (counted as `login_items=`), and only a row with no credit left counts as a
+// window that opened itself (`windows=`). An empty list hands no credit, so the gate reads exactly as before.
+
+/// Windows the login items may still mint inside the settle window.
+static ITEM_CREDIT: AtomicU32 = AtomicU32::new(0);
+/// Rows minted in the settle window on a login item's credit.
+static ITEM_WINDOWS: AtomicU32 = AtomicU32::new(0);
+
+/// `loginitems::launch`: `n` windows were asked for by the user's login items (`via=login-items`).
+pub fn login_items_posted(n: u32) {
+    ITEM_CREDIT.store(n, Relaxed);
+}
+
+fn take_item_credit() -> bool {
+    if ITEM_CREDIT.fetch_update(Relaxed, Relaxed, |c| c.checked_sub(1)).is_ok() {
+        ITEM_WINDOWS.fetch_add(1, Relaxed);
+        return true;
+    }
+    false
 }

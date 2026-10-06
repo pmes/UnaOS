@@ -123,12 +123,19 @@ fn launch() {
     let l = items();
     let mut done: Vec<&str> = Vec::new();
     let mut refused = String::new();
+    let mut shell_for_verbs = false;
     for n in l.iter() {
         match crate::video::dock::launch_named(n) {
-            Some(_) => done.push(n.as_str()),
+            Some(how) => {
+                serial_println!("[login] item launch name={} how={} via=login-items", n, how);
+                if how == "verb-posted" { shell_for_verbs = true; }
+                done.push(n.as_str());
+            }
             None => { if !refused.is_empty() { refused.push(','); } refused.push_str(n); }
         }
     }
+    // PREFSUI M6: LOGINFURN's credit — one window per launched item, plus the shell a ring-3 item's verb runs in.
+    crate::loginfurn::login_items_posted(done.len() as u32 + shell_for_verbs as u32);
     LAUNCHED_N.store(done.len() as u32, Ordering::Relaxed);
     let w = if done.is_empty() { String::from("none") } else { done.join(",") };
     serial_println!("[login] items n={} launched={}{}{} (R91: Settings > Login Items)", l.len(), w, if refused.is_empty() { "" } else { " unknown=" }, refused);
