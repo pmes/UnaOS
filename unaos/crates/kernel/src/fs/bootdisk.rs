@@ -1528,7 +1528,7 @@ pub(crate) fn bind_root(
 
     let boot = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src);
     let boot_rw = !boot.read_only();
-    mt.mount("/boot", alloc::boxed::Box::new(boot));
+    mt.mount("/boot", alloc::boxed::Box::new(boot)); crate::fs::rootdisk::bind_lib(mt, src, announce); // ROOTDISK (B390, R94): `/lib` = the boot FAT rooted at `LIB/` (was `/apps/LIB`)
     mt.mount(
         "/apps",
         alloc::boxed::Box::new(

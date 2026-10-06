@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use ldso_core::{Loader, Space, PROT_R, PROT_W, PROT_X};
 
 /// Where the relinked `libc.so` / `libgcc_s.so.1` (and the dyn probe) are staged.
-pub const LIB_DIRS: [&str; 1] = ["/apps/LIB/dyn"];
+pub const LIB_DIRS: [&str; 1] = ["/lib/dyn"];
 /// The fixed-address image window (follows `elf.rs` IMAGE_FLOOR / IMAGE_LIMIT; B361 WINDOW2 raises the limit).
 const EXEC_FLOOR: u64 = 0x1_0000;
 const EXEC_LIMIT: u64 = super::elf::IMAGE_LIMIT; // WINDOW2 (B361): follows the raised window, was 16 MiB
