@@ -337,6 +337,19 @@ impl Store for PathStore {
             .filter_map(|l| core::str::from_utf8(l).ok().map(String::from))
             .collect())
     }
+    fn namespaces(&mut self) -> Result<Vec<String>, StoreError> {
+        // RINGLOGIN2 (B479): the re-wrap's walk — the root's directory entries (a `/` suffix marks one).
+        if !self.ok {
+            return Ok(Vec::new());
+        }
+        let Some(b) = read_all(&self.root, PATH_R_LIST)? else { return Ok(Vec::new()) };
+        Ok(b.split(|&c| c == b'\n')
+            .filter_map(|l| l.strip_suffix(b"/"))
+            .filter_map(|l| core::str::from_utf8(l).ok())
+            .filter(|n| holocron_core::name::valid(n))
+            .map(String::from)
+            .collect())
+    }
     fn remove(&mut self, ns: &str, name: &str) -> Result<bool, StoreError> {
         self.gate()?;
         unlink(&self.file(ns, name))

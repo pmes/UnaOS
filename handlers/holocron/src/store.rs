@@ -198,6 +198,24 @@ impl Store for DirStore {
         Ok(out)
     }
 
+    fn namespaces(&mut self) -> Result<Vec<String>, StoreError> {
+        // RINGLOGIN2 (B479): the re-wrap's walk — every valid-named directory under the root.
+        if !self.ensure_root(false)? {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for e in fs::read_dir(&self.root).map_err(|_| StoreError)? {
+            let e = e.map_err(|_| StoreError)?;
+            if let Some(n) = e.file_name().to_str() {
+                if name::valid(n) && e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    out.push(n.to_string());
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     fn remove(&mut self, ns: &str, name_: &str) -> Result<bool, StoreError> {
         if !name::valid(name_) {
             return Err(StoreError);
