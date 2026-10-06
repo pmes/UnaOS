@@ -1999,3 +1999,101 @@ mod secreview_fuzz {
         }
     }
 }
+
+// =================================================================================================
+// RINGLOGIN (rmbp-ledger B465) — SYS_RINGKEY, the login's door to Holocron's ring. TAIL-APPENDED.
+//
+// The login (kernel `users::login`, the one path holding a verified password) derives the ring key ONCE
+// (SYS_KDF's body, Argon2id) and posts it in a take-once slot; the password is never kept. HOLOCRON.ELF —
+// only the process registered as Holocron's bus fulfiller, running as the door's user — takes it here:
+//
+//   `SYS_RINGKEY(RINGKEY_OP_TAKE, buf, RINGKEY_LEN)` -> `RINGKEY_NONE` (0, nothing posted),
+//       `RINGKEY_KEY` (1, `buf` holds the door below; the kernel's copy is wiped), `RINGKEY_LOCK` (2, lock now),
+//       or `-EACCES` (not Holocron's fulfiller / not the door's user), `-EINVAL`, `-EFAULT`.
+//   `SYS_RINGKEY(RINGKEY_OP_REPORT, status, mode)` -> 0: Holocron's answer to the door (a holocron_core
+//       wire status, 0 = OK) and the mode it applied (`RINGKEY_MODE_*`, or `RINGKEY_MODE_LOCKED` after a lock).
+//
+// Door layout (RINGKEY_LEN = 72): [0] mode (1 create, 2 open) · [1..4] zero · [4..8] m_kib LE · [8..12] t LE ·
+// [12..16] p LE · [16..32] salt · [32..64] the ring key · [64..72] the login's ms clock at the submit (LE).
+// x86_64 under the kernel feature `lumen`; elsewhere the unknown-syscall default.
+// =================================================================================================
+
+/// `SYS_RINGKEY(op, a1, a2)` — see the block above.
+pub const SYS_RINGKEY: u64 = 67; // after HOLOCRON2's SYS_KDF (66)
+/// Take the door.
+pub const RINGKEY_OP_TAKE: u64 = 0;
+/// Report Holocron's answer.
+pub const RINGKEY_OP_REPORT: u64 = 1;
+/// Nothing posted.
+pub const RINGKEY_NONE: i64 = 0;
+/// A key was handed over.
+pub const RINGKEY_KEY: i64 = 1;
+/// Lock the ring now (the lock screen).
+pub const RINGKEY_LOCK: i64 = 2;
+/// Door mode: no ring yet — create it at the door's salt and parameters.
+pub const RINGKEY_MODE_CREATE: u8 = 1;
+/// Door mode: open the existing ring.
+pub const RINGKEY_MODE_OPEN: u8 = 2;
+/// Report mode: the ring was locked on a `RINGKEY_LOCK`.
+pub const RINGKEY_MODE_LOCKED: u8 = 3;
+/// Door bytes.
+pub const RINGKEY_LEN: usize = 72;
+const _: () = assert!(SYS_RINGKEY == SYS_KDF + 1);
+
+/// A decoded door.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RingDoor {
+    /// `RINGKEY_MODE_CREATE` or `RINGKEY_MODE_OPEN`.
+    pub mode: u8,
+    /// Argon2id memory (KiB), passes, lanes.
+    pub m_kib: u32,
+    pub t: u32,
+    pub p: u32,
+    /// The ring salt.
+    pub salt: [u8; 16],
+    /// The ring key (the KDF's output — never the password).
+    pub key: [u8; 32],
+    /// The login's ms clock when the submit derived it.
+    pub t0_ms: u64,
+}
+
+/// Encode `d` into `out`.
+pub fn ringdoor_encode(d: &RingDoor, out: &mut [u8; RINGKEY_LEN]) {
+    out.fill(0);
+    out[0] = d.mode;
+    out[4..8].copy_from_slice(&d.m_kib.to_le_bytes());
+    out[8..12].copy_from_slice(&d.t.to_le_bytes());
+    out[12..16].copy_from_slice(&d.p.to_le_bytes());
+    out[16..32].copy_from_slice(&d.salt);
+    out[32..64].copy_from_slice(&d.key);
+    out[64..72].copy_from_slice(&d.t0_ms.to_le_bytes());
+}
+
+/// Decode a door; `None` for an unknown mode or a nonzero reserved byte.
+pub fn ringdoor_parse(b: &[u8; RINGKEY_LEN]) -> Option<RingDoor> {
+    if !(b[0] == RINGKEY_MODE_CREATE || b[0] == RINGKEY_MODE_OPEN) || b[1..4] != [0, 0, 0] {
+        return None;
+    }
+    let u = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&b[16..32]);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&b[32..64]);
+    let mut t0 = [0u8; 8];
+    t0.copy_from_slice(&b[64..72]);
+    Some(RingDoor { mode: b[0], m_kib: u(4), t: u(8), p: u(12), salt, key, t0_ms: u64::from_le_bytes(t0) })
+}
+
+#[cfg(test)]
+mod ringlogin_tests {
+    use super::*;
+    #[test]
+    fn ringdoor_round_trip() {
+        let d = RingDoor { mode: RINGKEY_MODE_OPEN, m_kib: WINDOW2_KDF_M_KIB, t: WINDOW2_KDF_T, p: WINDOW2_KDF_P, salt: [3; 16], key: [9; 32], t0_ms: 12345 };
+        let mut b = [0u8; RINGKEY_LEN];
+        ringdoor_encode(&d, &mut b);
+        assert_eq!(ringdoor_parse(&b), Some(d));
+        b[0] = 7;
+        assert_eq!(ringdoor_parse(&b), None);
+    }
+}

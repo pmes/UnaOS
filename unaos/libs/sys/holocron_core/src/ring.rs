@@ -123,7 +123,7 @@ impl<S: Sealer> Ring<S> {
     /// Unlock with `password` against the ring file bytes. On any failure the ring stays locked.
     pub fn unlock(&mut self, ring_file: &[u8], password: &[u8]) -> Result<(), RingError> {
         self.lock();
-        let (hdr, hbytes, ver) = format::parse_ring(ring_file)?;
+        let (hdr, _, _) = format::parse_ring(ring_file)?;
         if hdr.suite != S::SUITE {
             return Err(RingError::Suite);
         }

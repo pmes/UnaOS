@@ -523,3 +523,9 @@ pub fn selftest(fx: &Fixture) {
 pub fn registered(verb: u8) -> bool {
     locked(|| REGS.lock().iter().flatten().any(|r| r.verb == verb))
 }
+
+/// RINGLOGIN (rmbp-ledger B465): the row registered for `verb` right now (SYS_RINGKEY hands the login's ring
+/// key only to the process holding Holocron's verbs). Tail append.
+pub fn fulfiller_row(verb: u8) -> Option<(usize, u64)> {
+    locked(|| REGS.lock().iter().flatten().find(|r| r.verb == verb).map(|r| (r.row, r.rgen)))
+}
