@@ -61,9 +61,11 @@ pub mod kepler_ce;
 /// module is present on every build `kepler_gpublit` is (x86_64 + `nvidia-kepler` + `nvidia-kepler-takeover`). The
 /// KF27 recon items at the file's top compile on that arm too and are unused there (allowed in-file); the two
 /// submodules `host`/`kgr` carry the takeover arm as their own gate, and `ctxbind`/`unwedge` keep theirs.
+/// KEPLERGR2 (B463) widens that arm to `nvidia-kepler-fifo` too: the September fifo leg in `kepler::init` binds chid 1
+/// through `host` (the ONE bind path), so `host` exists on every x86_64 build that leg is reachable on.
 #[cfg(any(
     all(feature = "nvidia-kepler", feature = "nvidia-kepler-fifo", any(feature = "nvidia-kepler-kfbind", feature = "nvidia-kepler-kfctxbind", feature = "nvidia-kepler-kfunwedge")),
-    all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover")
+    all(target_arch = "x86_64", feature = "nvidia-kepler", any(feature = "nvidia-kepler-takeover", feature = "nvidia-kepler-fifo"))
 ))]
 pub mod kepler_fifo;
 

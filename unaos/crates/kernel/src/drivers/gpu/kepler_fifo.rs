@@ -1992,7 +1992,8 @@ pub fn kfunwedge(bar0: usize) {
 // Hardware facts (LAWS §licence): nouveau v6.10 file:line and NVIDIA open-gpu-doc, read outside the repo;
 // no text copied. Tags per DRIVERS-METHOD §5.
 
-#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
+// KEPLERGR2 (B463): `host` also serves the September fifo leg (`nvidia-kepler-fifo`, kepler.rs `SeptRoute`).
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", any(feature = "nvidia-kepler-takeover", feature = "nvidia-kepler-fifo")))]
 pub mod host {
     use super::super::kepler::{mmio_read, mmio_write};
     use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
@@ -2273,9 +2274,23 @@ pub mod host {
 
     // ---- bind / commit / start -------------------------------------------------------------------------
     static LAST_BIND: [AtomicU32; 4] = [AtomicU32::new(NONE), AtomicU32::new(NONE), AtomicU32::new(NONE), AtomicU32::new(NONE)];
-    /// The bind verdict (0x252c bits 7:0) the last `bind` of `chid` read on this boot; NONE = never bound.
+    /// The bind verdict (0x252c bits 7:0) the last `bind` of `chid` read on this boot; NONE = never bound. Kept
+    /// across [`unwind`] (KEPLERGR2).
     pub fn last_bind(chid: u32) -> u32 {
         LAST_BIND.get(chid as usize).map_or(NONE, |a| a.load(Acquire))
+    }
+    /// KEPLERGR2 (B463): the September fifo leg's chid-1 state on this boot — 0 never ran, 1 bound (no unwind
+    /// reached), 2 unwound. `tests kgr` prints it (`sept=`): a GR verdict read over the leg's residue is not G6's.
+    static SEPT: AtomicU32 = AtomicU32::new(0);
+    pub fn sept_set(v: u32) {
+        SEPT.store(v, Release);
+    }
+    pub fn sept_word() -> &'static str {
+        match SEPT.load(Acquire) {
+            0 => "off",
+            1 => "bound",
+            _ => "unwound",
+        }
     }
     #[derive(Clone, Copy, Default)]
     pub struct BindOut {
@@ -2285,10 +2300,16 @@ pub mod host {
     /// nouveau's order: unbind (gk104.c:60); the RUNLIST into hi 19:16 (gk104.c:77); VALID | inst page
     /// (gk104.c:68). The bind's verdict is read at once, before any commit. // nouveau gk104.c:612-613
     pub fn bind(bar0: usize, chid: u32, rl: u32, inst: usize) -> BindOut {
+        bind_ext(bar0, chid, rl, inst, 0)
+    }
+    /// KEPLERGR2 (B463): [`bind`] with extra lo-word bits ORed beside VALID — the September leg's experiment
+    /// variable (POLL_ENABLE bit 30, never set by nouveau gk104.c:68) rides through the ONE path instead of a
+    /// second table writer. Only bits 30..28 may be passed; the inst page and VALID are this function's.
+    pub fn bind_ext(bar0: usize, chid: u32, rl: u32, inst: usize, lo_extra: u32) -> BindOut {
         let c = PFIFO_CHAN + chid as usize * 8;
         mw(bar0, c, 0);
         mw(bar0, c + 4, (mr(bar0, c + 4) & !CHAN_HI_RUNLIST_MASK) | ((rl << CHAN_HI_RUNLIST_SHIFT) & CHAN_HI_RUNLIST_MASK));
-        mw(bar0, c, CHAN_LO_VALID | ((inst >> 12) as u32));
+        mw(bar0, c, CHAN_LO_VALID | (lo_extra & 0x7000_0000) | ((inst >> 12) as u32));
         let out = BindOut { intr_post: mr(bar0, PFIFO_INTR), bind_post: mr(bar0, PFIFO_BIND_ERR) };
         if let Some(a) = LAST_BIND.get(chid as usize) {
             a.store(out.bind_post & 0xff, Release);
@@ -2365,9 +2386,8 @@ pub mod host {
         let commit = if rl < 16 { runlist_commit(bar0, rl, rl_base, 0) } else { None };
         let mut s = alloc::string::String::new();
         let (n, bad) = pre.restore(bar0, &mut s);
-        if let Some(a) = LAST_BIND.get(chid as usize) {
-            a.store(NONE, Release);
-        }
+        // KEPLERGR2: LAST_BIND keeps the boot's bind VERDICT across the unwind — kgr's guard asks whether the CE's
+        // bind read 00 on this boot (the shared table proven), not whether chid 2 is still bound.
         let us = |v: Option<u32>| v.map_or(alloc::string::String::from("stuck"), |u| alloc::format!("{}us", u));
         serial_println!(
             "[kfifo] unwind chid={} preempt={} chan={:08X}/{:08X} rl{}_empty={} bind={:02X} intr={:08X} restored={} mismatch={}{}",
@@ -2702,14 +2722,14 @@ pub mod kgr {
         let c = kf::PFIFO_CHAN + kf::CHID_GR as usize * 8;
         let pg = |r: usize| pre.get(r).map_or(alloc::string::String::from("-"), |v| alloc::format!("{:08X}", v));
         serial_println!(
-            "[kgr] walls bind_pre={:02X} intr_pre={:08X} bind_post={:02X} intr_post={:08X} r2254={}->{:08X} r2a04={}->{:08X} r2630={}->{:08X} pmc={}->{:08X} chan={:08X}/{:08X} ramfc_08={:08X} ramfc_0c={:08X} ramfc_94={:08X} ramfc_e4={:08X} utab={:#x} userd={:#x} commit_us={} gp_get={} gp_put={} ramfc_get={} sem={:08X} nop_us={} fb_page={} pde_span_mb={}{}",
+            "[kgr] walls bind_pre={:02X} intr_pre={:08X} bind_post={:02X} intr_post={:08X} r2254={}->{:08X} r2a04={}->{:08X} r2630={}->{:08X} pmc={}->{:08X} chan={:08X}/{:08X} ramfc_08={:08X} ramfc_0c={:08X} ramfc_94={:08X} ramfc_e4={:08X} utab={:#x} userd={:#x} commit_us={} gp_get={} gp_put={} ramfc_get={} sem={:08X} nop_us={} fb_page={} pde_span_mb={} sept={}{}",
             io.bind_pre & 0xff, io.intr_pre, bo.bind_post & 0xff, bo.intr_post,
             pg(kf::USERD_BAR1), mr(kf::USERD_BAR1), pg(kf::R2A04), mr(kf::R2A04), pg(kf::SCHED_DISABLE), mr(kf::SCHED_DISABLE),
             pg(kf::PMC_ENABLE), mr(kf::PMC_ENABLE), mr(c), mr(c + 4),
             vr(inst + 0x08), vr(inst + 0x0C), vr(inst + 0x94), vr(inst + 0xE4), utab, userd,
             commit.map_or(alloc::string::String::from(if bind_ok { "stuck" } else { "-" }), |u| alloc::format!("{}", u)),
             ugt, vr(userd + kf::USERD_GP_PUT), ramfc_get, vr(w + K_SEM), nop_us,
-            if fbp & 1 != 0 { 16 } else { 17 }, span >> 20, pbs
+            if fbp & 1 != 0 { 16 } else { 17 }, span >> 20, kf::sept_word(), pbs
         );
         kf::pfifo_decode(bar0, kf::CHID_GR, GR_ENG.load(Relaxed), rl, kf::FAULT_UNIT_GR);
 

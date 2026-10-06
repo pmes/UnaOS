@@ -141,6 +141,10 @@ static INTR_PRE: AtomicU32 = AtomicU32::new(0);
 static BIND_POST: AtomicU32 = AtomicU32::new(0);
 static INTR_POST: AtomicU32 = AtomicU32::new(0);
 static PB13C_PRE: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+/// KEPLERGR2 (B463): the pre-image record `host::fifo_init` captured for the CE's walls (kept, no longer dropped),
+/// so a non-ok self-test can run `host::unwind`; UNWOUND = the channel is off the hardware (a rerun re-lays it).
+static CE_PRE: crate::sync::Mutex<kf::Pre> = crate::sync::Mutex::new(kf::Pre::new());
+static UNWOUND: AtomicBool = AtomicBool::new(false);
 
 const NCACHE: usize = 16;
 const MAXP: usize = 1024; // 4 MiB per mapping; a larger source is a CPU job
@@ -296,7 +300,19 @@ pub fn arm(bar0: usize, bar1: usize, bar1_size: usize, vram_size: usize, fb_offs
     print_line(&st, if v == 1 { "gpu" } else { "cpu" });
     if v != 1 {
         detail(&st);
+        unwind_ce(); // KEPLERGR2 (keplergr.md §4's question: yes — the same host::unwind, after the dump)
     }
+}
+
+/// KEPLERGR2 (B463): take chid 2 off the hardware through `host::unwind` — preempt, stop, unbind, the CE's runlist
+/// committed EMPTY (count 0) at the unused W_USERD page, every `fifo_init` pre-image restored and read back. One
+/// `[kfifo] unwind chid=2 ...` line. Called only after the dump (`detail`), so the walls/decode lines read the
+/// state the self-test failed in.
+fn unwind_ce() {
+    let rl = CE_RL.load(Acquire);
+    let pre = CE_PRE.lock();
+    let _ = kf::unwind(BAR0.load(Relaxed), CHID, rl, win() + W_USERD, &pre);
+    UNWOUND.store(true, Release);
 }
 
 /// Lay down the VM, the instance block and the runlist; bind the channel; submit the runlist.
@@ -358,6 +374,7 @@ fn build(w: usize, vlo: usize, vhi: usize) {
     INTR_POST.store(bo.intr_post, Release);
     BIND_POST.store(bo.bind_post, Release);
     // Runlist submit: base page (VRAM target 0), then (runlist << 20) | entries; COMMIT_US stays NONE on "stuck".
+    COMMIT_US.store(NONE, Release); // KEPLERGR2: a re-lay reads its own commit, never the boot's
     if let Some(us) = kf::runlist_commit(b0, rl, w + W_RUNL, 1) {
         COMMIT_US.store(us, Release);
     }
@@ -381,6 +398,7 @@ fn fifo_init(w: usize, rl: u32) {
     INTR_PRE.store(io.intr_pre, Release);
     BIND_PRE.store(io.bind_pre, Release);
     R2630_PRE.store(pre.get(SCHED_DISABLE).unwrap_or(0), Release);
+    *CE_PRE.lock() = pre; // KEPLERGR2: kept for `unwind_ce`
 }
 
 /// One PTOP device: the CE this channel runs on.
@@ -862,6 +880,20 @@ pub fn tests_gpublit() {
         serial_println!(":: GPUBLIT-TEST: rerun=busy boot={} -> FAIL ::", boot);
         return;
     };
+    // KEPLERGR2: a boot whose self-test unwound the channel re-lays it through `host` (build: zero, VM, RAMFC,
+    // fifo_init, bind, commit, start) before the rerun, and unwinds again on a non-ok rerun — never a rerun on an
+    // unbound chid. The gpfifo is zeroed by the re-lay, so PUT restarts at 0.
+    let relaid = UNWOUND.load(Acquire);
+    if relaid {
+        build(win(), VLO.load(Acquire), VHI.load(Acquire));
+        ch.put = 0;
+        UNWOUND.store(false, Release);
+        serial_println!(
+            "[gpublit] relay chid={} rl={} bind_post={:02X} commit_us={}",
+            CHID, CE_RL.load(Relaxed), BIND_POST.load(Relaxed) & 0xff,
+            { let c = COMMIT_US.load(Relaxed); if c == NONE { alloc::string::String::from("stuck") } else { alloc::format!("{}", c) } }
+        );
+    }
     let st = selftest(&mut ch);
     let (put, seq) = (ch.put, ch.seq);
     let sys_used_kb = ch.sys_next * 4;
@@ -869,6 +901,9 @@ pub fn tests_gpublit() {
     print_line(&st, if armed() { "gpu" } else { "cpu" });
     if !matches!(st.verdict, St::Ok) {
         detail(&st);
+        if !ARMED.load(Acquire) {
+            unwind_ce(); // KEPLERGR2: a non-ok rerun on a CPU-selected boot goes back off the hardware
+        }
     }
     let jobs = JOBS.load(Relaxed);
     serial_println!(

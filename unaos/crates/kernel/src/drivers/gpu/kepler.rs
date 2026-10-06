@@ -1561,43 +1561,19 @@ pub fn init(gpu: &GpuInfo) {
 
                                     let chan_id = 1;
 
-                                    // Setup Channel Instance Block
-                                    //
-                                    // ⛔ CLEAN-ROOM: UNAUDITED (docs/MANIFESTO/CLEAN_ROOM_POLICY.md §5).
-                                    // The RAMFC instance-block layout below — every offset and every
-                                    // magic constant in the writes that follow, through `+0xFC` — has
-                                    // NO Group-A provenance. The audit claimed for these constants in
-                                    // an earlier round was WITHDRAWN by its own author, who recorded
-                                    // that it was performed by reading GPL `nouveau` sources (a §5
-                                    // Group-B violation) and that it was flawed on its merits besides,
-                                    // having quoted this tree's own code back as if it were canonical.
-                                    // No code here was authored from that source; the constants
-                                    // predate it. But nothing may claim they are validated until they
-                                    // are re-derived from a Group-A-legal source (envytools hwdocs /
-                                    // rnndb) or from vendor documentation.
-                                    //
-                                    // This disclaimer lives HERE, at the writes themselves, and not in
-                                    // a proposal citing a line range — the two ranges cited for it so
-                                    // far were both wrong, and a warning that does not sit on the code
-                                    // it warns about is not a warning.
-                                    unsafe {
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x08) as *mut u32, (userd_off & 0xFFFFFFFF) as u32);
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, ((userd_off >> 32) as u32) | 0x80000000);
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x10) as *mut u32, 0x0000face);
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x30) as *mut u32, 0xfffff902);
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x48) as *mut u32, (gpfifo_off & 0xFFFFFFFF) as u32);
-                                        // limit2 = ORDER 9 (512 entries)
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x4C) as *mut u32, ((gpfifo_off >> 32) as u32) | (9 << 16));
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x84) as *mut u32, 0x20400000);
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x94) as *mut u32, 0x30000000); // VRAM devm=0
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x9C) as *mut u32, 0x00000100);
-                                        core::ptr::write_volatile((bar1 + inst_off + 0xAC) as *mut u32, 0x0000001f);
-                                        core::ptr::write_volatile((bar1 + inst_off + 0xE4) as *mut u32, 0x00000000);
-                                        core::ptr::write_volatile((bar1 + inst_off + 0xE8) as *mut u32, chan_id);
-                                        core::ptr::write_volatile((bar1 + inst_off + 0xB8) as *mut u32, 0xf8000000);
-                                        core::ptr::write_volatile((bar1 + inst_off + 0xF8) as *mut u32, 0x10003080); // 0x002310
-                                        core::ptr::write_volatile((bar1 + inst_off + 0xFC) as *mut u32, 0x10000010); // 0x002350
-                                    }
+                                    // KEPLERGR2 (B463) — the leg's channel half goes through `kepler_fifo::host`, the ONE
+                                    // fifo-init / RAMFC / USERD / bind / commit / unwind path (keplergr2.md). `route` runs
+                                    // `host::fifo_init` for GR's runlist on THE USERD table (GPUBLIT3's when the CE leg armed,
+                                    // else this leg's own page registers as it) and names chid 1's slot in it; the shadow
+                                    // below makes every later USERD use of this leg (beacons, KF27/KF28, the +0x0C restores)
+                                    // that slot — the September page outside the table is no longer the channel's USERD.
+                                    let sept = SeptRoute::route(bar0, bar1, userd_off);
+                                    let userd_off = sept.userd;
+
+                                    // Setup Channel Instance Block — RAMFC exactly as `host::ramfc_write` (nouveau
+                                    // gk104_chan_ramfc_write, gk104.c:88-102, devm/priv :110-111; R95 §2). The September
+                                    // words it replaces differed at +0x0C (bit 31), +0x94 (devm 0) and +0xE4 (priv 0) — G4.
+                                    sept.ramfc(bar1, inst_off, gpfifo_off, chan_id);
 
                                     // Witness instance block raws
                                     let ib_08 = unsafe { core::ptr::read_volatile((bar1 + inst_off + 0x08) as *const u32) };
@@ -1606,24 +1582,19 @@ pub fn init(gpu: &GpuInfo) {
                                     let ib_4c = unsafe { core::ptr::read_volatile((bar1 + inst_off + 0x4C) as *const u32) };
                                     serial_println!(":: kepler: inst-raw 08={:08X} 0C={:08X} 48={:08X} 4C={:08X} ::", ib_08, ib_0c, ib_48, ib_4c);
 
-                                    let chid_0 = 1u32;
-                                    let chid_1 = 2u32;
-                                    let chid_2 = 3u32;
-                                    let entry_0 = chid_0;
-                                    let entry_1 = chid_1 | (1 << 31);
-                                    let entry_2 = (chid_2 << 1) | 1;
-
-                                    // The three runlist entries, six words, in the order the scheduler
-                                    // reads them out of the runlist page.
-                                    let runlist_words: [u32; 6] = [entry_0, 0, entry_1, 0, entry_2, 0];
+                                    // KEPLERGR2 (B463): ONE entry, (chid 1, 0) — nouveau gk104.c:454-455, as kgr and GPUBLIT.
+                                    // The September page carried three (chids 1, 2|bit31, (3<<1)|1): chid 2 is GPUBLIT's CE
+                                    // channel, bound on the CE's runlist, and naming it on GR's runlist is a second owner.
+                                    let entry_0 = chan_id;
+                                    let runlist_words: [u32; 2] = [entry_0, 0];
 
                                     // ENTRIES (not words) handed to RUNLIST_SUBMIT (0x2274). The submit
                                     // and the acceptance poll both derive from THIS — never from a
                                     // literal. They drifted apart once already: the submit was raised
                                     // 1 → 3 while the poll kept demanding `(len & 0xFFF) == 1`, a
                                     // predicate that then could not be satisfied on any boot.
-                                    const RUNLIST_LEN: u32 = 3;
-                                    const _: () = assert!(RUNLIST_LEN as usize * 2 == 6); // words per entry
+                                    const RUNLIST_LEN: u32 = 1;
+                                    const _: () = assert!(RUNLIST_LEN as usize * 2 == 2); // words per entry
 
                                     // Width of the mirror-window beacon plant below: EIGHT words over
                                     // `off + 0..31`, in each of three regions. Everything that undoes
@@ -1633,7 +1604,7 @@ pub fn init(gpu: &GpuInfo) {
                                     // 0xBEAC0007/0xBEAC0008 alive at `runlist_off + 24/28` under a
                                     // `CLEAN` verdict.
                                     const BEACON_PLANT_WORDS: usize = 8;
-                                    const _: () = assert!(BEACON_PLANT_WORDS >= 6); // the six authored words fit
+                                    const _: () = assert!(BEACON_PLANT_WORDS >= RUNLIST_LEN as usize * 2); // the authored words fit
 
                                     // Put the runlist page back the way this driver left it. Called
                                     // twice — here, and again immediately before the submit, because
@@ -1788,7 +1759,7 @@ pub fn init(gpu: &GpuInfo) {
                                             // this seam was carved from. The bringup is re-run, not re-invented.
                                             #[cfg(feature = "nvidia-kepler-ctrlbind")]
                                             {
-                                                let bw = try_bind_and_witness(bar0, inst_off);
+                                                let bw = try_bind_and_witness(bar0, inst_off, &sept);
                                                 serial_println!(":: kepler: ctrlbind pbdma{} target={} ctrl_addr={:08X} bind={} witness={} chan00={:08X} chan04={:08X} sched=err={:08X},stat={:08X} ::",
                                                     pbdma_idx, target, wrote,
                                                     if bw.bound { "ok" } else { "fail" },
@@ -2532,7 +2503,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     // replaces, so not one `panic::Location` below this point moved and the knob-off
                                     // image is measurable against the parent with no line-shift confound in it
                                     // (`./arroyo knoboff nvidia-kepler-ctrlbind` / `… nvidia-kepler-ctrladdr`).
-                                    let bind_witness = try_bind_and_witness(bar0, inst_off);
+                                    let bind_witness = try_bind_and_witness(bar0, inst_off, &sept);
                                     // `ch_1_0_pre` keeps its name — the USERD_SNOOP restore and the witness check
                                     // below read it, and renaming would be churn in code this change does not touch.
                                     let ch_1_0_pre = bind_witness.chan00;
@@ -2555,12 +2526,12 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         serial_println!(":: kepler: WITNESS STRIPPED. Restoring inst_off+0x0C ::");
                                         // The restore must reproduce the CANONICAL write, bit for bit.
                                         // The original at the instance-block setup is
-                                        // `((userd_off >> 32) as u32) | 0x80000000`; this restore
-                                        // dropped the high bit, so a "restored" instance block was
+                                        // `host::ramfc_write`'s +0x0C = upper_32(userd) (KEPLERGR2; the September word ORed 0x80000000); this restore
+                                        // once differed from it, so a "restored" instance block was
                                         // never the one the channel was built with, and every `err=`
                                         // read after a strip has been taken against a *different*
                                         // instance block than the pre-strip reads.
-                                        core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, ((userd_off >> 32) as u32) | 0x80000000);
+                                        core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32, (userd_off >> 32) as u32); // KEPLERGR2: host's +0x0C, gk104.c:89
                                         // Review C5: NO engine_trigger write-back on any exit. 0x409c08 is an
                                         // edge-semantic doorbell (the lane's own STUDY: DAEMON2CTXCTL_REQ /
                                         // CHSW_PENDING) — it has no pre-image to restore; writing eng_trig_pre
@@ -2571,10 +2542,8 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         // honest unwind. This also keeps the post-restore re-test below a
                                         // clean reading of the inst_off restore alone.
 
-                                        // Re-test PFIFO_CHAN[1] to clear state
-                                        mmio_write(bar0, 0x800000 + (1 * 8), 0);
-                                        mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400);
-                                        mmio_write(bar0, 0x800000 + (1 * 8), 0xC0000000 | ((inst_off as u32) >> 12));
+                                        // Re-test PFIFO_CHAN[1] to clear state (KEPLERGR2: through host, the ONE bind path)
+                                        sept.bind(bar0, inst_off, SEPT_POLL, "restore-retest");
                                         
                                         let err = mmio_read(bar0, 0x252c);
                                         let stat = mmio_read(bar0, 0x263c);
@@ -2595,9 +2564,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     // code is a red herring we have honored for 28 sittings. If err CHANGES, the
                                     // new code names the real precondition. Either way it is decisive, and it is
                                     // three writes. The legs above are untouched controls.
-                                    mmio_write(bar0, 0x800000 + (1 * 8), 0);
-                                    mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400);
-                                    mmio_write(bar0, 0x800000 + (1 * 8), 0x80000000 | ((inst_off as u32) >> 12));
+                                    sept.bind(bar0, inst_off, 0, "poll-control"); // KEPLERGR2: VALID-only = nouveau's lo, via host
                                     let poll_rb = mmio_read(bar0, 0x800000 + (1 * 8));
                                     let poll_err = mmio_read(bar0, 0x252c);
                                     let poll_stat = mmio_read(bar0, 0x263c);
@@ -3225,12 +3192,10 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                                         es_hold, phase_hold, if held { "Y" } else { "N" });
                                                     unsafe {
                                                         core::ptr::write_volatile((bar1 + inst_off + 0x0C) as *mut u32,
-                                                            ((userd_off >> 32) as u32) | 0x80000000);
+                                                            (userd_off >> 32) as u32); // KEPLERGR2: host's +0x0C, gk104.c:89
                                                     }
-                                                    mmio_write(bar0, 0x800000 + (1 * 8), 0);
-                                                    mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400);
                                                     let chan_want = 0xC0000000 | ((inst_off as u32) >> 12);
-                                                    mmio_write(bar0, 0x800000 + (1 * 8), chan_want);
+                                                    sept.bind(bar0, inst_off, SEPT_POLL, "fence-revalidate"); // KEPLERGR2: host
                                                     let chan_rb = mmio_read(bar0, 0x800000 + (1 * 8));
                                                     let stuck = (chan_rb & 0xC0000000) == 0xC0000000;
                                                     let err = mmio_read(bar0, 0x252c);
@@ -3373,8 +3338,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                             let pre_rw = mmio_read(bar0, 0x800000 + (1 * 8));
                                             serial_println!(":: kepler: witness pre-rewrite PFIFO_CHAN[1]={:08X} ::", pre_rw);
                                             
-                                            let witness_val = 0xC0000000 | ((inst_off as u32) >> 12);
-                                            mmio_write(bar0, 0x800000 + (1 * 8), witness_val);
+                                            sept.bind(bar0, inst_off, SEPT_POLL, "witness-rewrite"); // KEPLERGR2: host, the ONE bind path
                                             
                                             let witness_post = mmio_read(bar0, 0x800000 + (1 * 8));
                                             serial_println!(":: kepler: witness post-bind PFIFO_CHAN[1]={:08X} ::", witness_post);
@@ -3472,8 +3436,9 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     );
 
                                     let want_base = (runlist_off as u32) >> 12;
-                                    mmio_write(bar0, 0x2270, want_base); // target=0 (VRAM), addr
-                                    mmio_write(bar0, 0x2274, RUNLIST_LEN); // ENG=0 | LEN
+                                    // KEPLERGR2: the submit is `host::runlist_commit` (0x2270 base, 0x2274 = rl<<20 | count,
+                                    // pending bit 20 waited 2 ms — nouveau gk104.c:446-447, :426) on GR's PTOP runlist.
+                                    let _ = sept.commit(bar0, runlist_off, RUNLIST_LEN);
                                     crate::bootlog_println!("[NVIDIA] Configured Runlist and bound channel.");
 
                                     // Wait for PLAYLIST_RD/_RD_LEN to echo the submit.
@@ -3943,6 +3908,12 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     #[cfg(feature = "nvidia-kepler-kfunwedge")]
                                     crate::drivers::gpu::kepler_fifo::unwedge::kfunwedge(bar0);
 
+                                    // KEPLERGR2 (B463): the leg ends by taking chid 1 off the hardware through `host::unwind`
+                                    // (preempt, stop, unbind, GR's runlist committed EMPTY at the runlist page with count 0,
+                                    // the fifo_init pre-images restored and read back) so `tests kgr` binds an unbound chid 1.
+                                    // PFIFO only — no FECS access — so it sits above the terminal poke as that contract asks.
+                                    sept.unwind(bar0, runlist_off);
+
                                     // ================= TERMINAL POKE — MUST BE LAST =================
                                     // ⛔ ORDERING CONTRACT. This is the LAST kepler statement of the
                                     // boot. Nothing below it, and nothing later in `init()`, may touch
@@ -4279,12 +4250,11 @@ struct BindWitness {
 
 /// One channel-1 bind and the witness read that scores it. See the block comment above.
 #[inline(always)]
-unsafe fn try_bind_and_witness(bar0: usize, inst_off: usize) -> BindWitness {
+unsafe fn try_bind_and_witness(bar0: usize, inst_off: usize, sept: &SeptRoute) -> BindWitness {
     unsafe {
-        // 2. Bind and Enable PFIFO_CHAN for channel 1
-        mmio_write(bar0, 0x800000 + (1 * 8), 0);
-        mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400);
-        mmio_write(bar0, 0x800000 + (1 * 8), 0xC0000000 | ((inst_off as u32) >> 12));
+        // 2. Bind and Enable PFIFO_CHAN for channel 1 — KEPLERGR2: through `host::bind_ext` + `host::start`
+        // (the ONE bind path), POLL_ENABLE riding as the September encoding's lo_extra.
+        sept.bind(bar0, inst_off, SEPT_POLL, "init");
 
         let err = mmio_read(bar0, 0x252c);
         let stat = mmio_read(bar0, 0x263c);
@@ -4326,4 +4296,106 @@ unsafe fn try_bind_and_witness(bar0: usize, inst_off: usize) -> BindWitness {
             bound: chan00 != 0xFFFFFFFF && chan00 != 0xBAD0BA20,
         }
     }
+}
+
+// =====================================================================================================
+// KEPLERGR2 (rmbp-ledger B463) — the September fifo leg's channel half through `kepler_fifo::host`.
+// Design, rung ledger and the retire-vs-route table: docs/dev/evidence/rmbp-1005/keplergr2.md.
+// The leg keeps its FECS / display rungs (R19); its fifo init, RAMFC, USERD, every chid-1 bind, the runlist
+// commit and the final unwind are `host`'s — one writer each, one USERD table (0x2254).
+// =====================================================================================================
+
+/// POLL_ENABLE, the September encoding's lo bit 30 — the leg's experiment variable, carried through
+/// `host::bind_ext`. [ONE-SOURCE: the s#9 naming; nouveau never sets it, gk104.c:68; G2 refuted s#37]
+const SEPT_POLL: u32 = 0x4000_0000;
+
+/// The September leg's handle on the ONE fifo path: GR's runlist, chid 1's USERD slot and the pre-images
+/// `host::fifo_init` captured (for the unwind).
+pub(crate) struct SeptRoute {
+    #[cfg_attr(not(all(target_arch = "x86_64", feature = "nvidia-kepler-fifo")), allow(dead_code))]
+    rl: u32,
+    pub userd: usize,
+    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-fifo"))]
+    pre: crate::drivers::gpu::kepler_fifo::host::Pre,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-fifo"))]
+impl SeptRoute {
+    /// `host::fifo_init` for GR's runlist (PTOP engine type 0, top/gk104.c:78; runlist 0 — the September
+    /// assumption — when PTOP names none) on THE table: the CE leg's when registered (`owner=ce`), else
+    /// `page` (this leg's 4 KiB USERD page, chid 1 at +0x200) registers as it (`owner=sept`). chid 1's slot is
+    /// zeroed (gf100_chan_userd_clear, gf100.c:118-131). One line.
+    unsafe fn route(bar0: usize, bar1: usize, page: usize) -> Self {
+        use crate::drivers::gpu::kepler_fifo::host as kf;
+        let top = kf::ptop_engine(bar0, 0);
+        let rl = top.map_or(0, |t| t.runlist);
+        let (utab, owner) = match kf::utab() {
+            Some(t) => (t, "ce"),
+            None => (page, "sept"),
+        };
+        let mut pre = kf::Pre::new();
+        let io = kf::fifo_init(bar0, utab, rl, &mut pre);
+        let userd = kf::userd_slot(utab, kf::CHID_GR);
+        for i in 0..kf::USERD_SLOT / 4 {
+            unsafe { core::ptr::write_volatile((bar1 + userd + i * 4) as *mut u32, 0) };
+        }
+        kf::sept_set(1);
+        serial_println!(
+            "[kfifo] sept route chid={} rl={} src={} utab={:#x} owner={} userd={:#x} init={} bind_pre={} intr_pre={} r2254={:08X}",
+            kf::CHID_GR, rl, if top.is_some() { "ptop" } else { "assumed" }, utab, owner, userd,
+            if io.is_some() { "ok" } else { "refused(utab-mismatch)" },
+            io.map_or(alloc::string::String::from("-"), |o| alloc::format!("{:02X}", o.bind_pre & 0xff)),
+            io.map_or(alloc::string::String::from("-"), |o| alloc::format!("{:08X}", o.intr_pre)),
+            unsafe { mmio_read(bar0, kf::USERD_BAR1) }
+        );
+        Self { rl, userd, pre }
+    }
+    /// RAMFC through `host::ramfc_write` (limit2 = log2(512) entries, as the September leg).
+    unsafe fn ramfc(&self, bar1: usize, inst: usize, gpfifo: usize, chid: u32) {
+        let vw = |o: usize, v: u32| unsafe { core::ptr::write_volatile((bar1 + o) as *mut u32, v) };
+        crate::drivers::gpu::kepler_fifo::host::ramfc_write(&vw, inst, self.userd, gpfifo, 9, chid);
+    }
+    /// chid 1 bound through `host::bind_ext` (unbind; GR's runlist into hi 19:16; VALID | lo_extra | inst),
+    /// then ENABLE_SET (`host::start`, the September channel was enabled). One `[kfifo] sept bind` line.
+    unsafe fn bind(&self, bar0: usize, inst: usize, lo_extra: u32, site: &str) {
+        use crate::drivers::gpu::kepler_fifo::host as kf;
+        let bo = kf::bind_ext(bar0, kf::CHID_GR, self.rl, inst, lo_extra);
+        kf::start(bar0, kf::CHID_GR);
+        let c = kf::PFIFO_CHAN + kf::CHID_GR as usize * 8;
+        serial_println!(
+            "[kfifo] sept bind site={} lo_extra={:08X} bind={:02X}[{}] intr={:08X} chan={:08X}/{:08X}",
+            site, lo_extra, bo.bind_post & 0xff, kf::bind_name(bo.bind_post), bo.intr_post,
+            unsafe { mmio_read(bar0, c) }, unsafe { mmio_read(bar0, c + 4) }
+        );
+    }
+    /// The runlist through `host::runlist_commit` on GR's runlist. One `[kfifo] sept commit` line.
+    unsafe fn commit(&self, bar0: usize, base: usize, count: u32) -> Option<u32> {
+        let r = crate::drivers::gpu::kepler_fifo::host::runlist_commit(bar0, self.rl, base, count);
+        serial_println!(
+            "[kfifo] sept commit rl={} base={:#x} count={} commit_us={}",
+            self.rl, base, count, r.map_or(alloc::string::String::from("stuck"), |u| alloc::format!("{}", u))
+        );
+        r
+    }
+    /// `host::unwind` for chid 1 (prints `[kfifo] unwind chid=1 ...`); `empty` is a page the EMPTY commit names.
+    unsafe fn unwind(&self, bar0: usize, empty: usize) {
+        use crate::drivers::gpu::kepler_fifo::host as kf;
+        let _ = kf::unwind(bar0, kf::CHID_GR, self.rl, empty, &self.pre);
+        kf::sept_set(2);
+    }
+}
+
+/// Builds where the leg is unreachable (`cfg!(feature = "nvidia-kepler-fifo")` false, or not x86_64): the
+/// leg's `if cfg!` body still type-checks, so the seam exists, and does nothing — `host` is not linked here.
+#[cfg(not(all(target_arch = "x86_64", feature = "nvidia-kepler-fifo")))]
+impl SeptRoute {
+    unsafe fn route(_bar0: usize, _bar1: usize, page: usize) -> Self {
+        Self { rl: 0, userd: page }
+    }
+    unsafe fn ramfc(&self, _bar1: usize, _inst: usize, _gpfifo: usize, _chid: u32) {}
+    unsafe fn bind(&self, _bar0: usize, _inst: usize, _lo_extra: u32, _site: &str) {}
+    unsafe fn commit(&self, _bar0: usize, _base: usize, _count: u32) -> Option<u32> {
+        None
+    }
+    unsafe fn unwind(&self, _bar0: usize, _empty: usize) {}
 }
