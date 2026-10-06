@@ -111,7 +111,7 @@ pub const MENU_TITLES_MAX: usize = 4;
 /// tenant's [`MENU_TITLES_MAX`] published titles. The snapshot arrays are sized by this, not by
 /// `MENU_TITLES_MAX`, because Peter's ruling gives every window a name-menu whether or not it ever
 /// publishes one of its own — so the app box is not one of the tenant's four.
-pub const BAR_BOXES_MAX: usize = MENU_TITLES_MAX + 2; // WINDOWLIST — +1 for the Window menu, the LAST box
+pub const BAR_BOXES_MAX: usize = MENU_TITLES_MAX + 5; // APPMENU2 — app, File, Edit, Window, Help; // WINDOWLIST — +1 for the Window menu, the LAST box
 
 /// The item is not pickable; it renders dimmed and a press on it keeps the menu open.
 pub const FLAG_DISABLED: u32 = 1 << 0;
@@ -147,14 +147,84 @@ pub const APP_ITEM_QUIT: u32 = 0xA1;
 /// SHORTCUTS (M3) — the default app menu's `Help > Keyboard Shortcuts` row: opens the help overlay.
 pub const APP_ITEM_SHORTCUTS: u32 = 0xA2;
 
-/// SO3 — **the menu every window gets.** `About <name>`, a keyline, `Quit`.
+/// SO3 — **the menu every window gets.** APPMENU2 (B393): the Mac's app-menu shape in our words —
+/// `About <app>`, `Settings...`, `Hide <app>`, `Hide Others`, `Show All`, `Quit <app>`. Keyboard
+/// Shortcuts moved to the WM's Help menu ([`HELP_MENU_DEFAULT`]).
 const APP_MENU_DEFAULT: &[MenuItem] = &[
     MenuItem { id: APP_ITEM_ABOUT, label: "About", flags: FLAG_APPNAME },
     MenuItem { id: 0, label: "", flags: FLAG_SEPARATOR },
-    MenuItem { id: APP_ITEM_QUIT, label: "Quit", flags: 0 },
+    MenuItem { id: APP_ITEM_SETTINGS, label: "Settings...", flags: 0 },
     MenuItem { id: 0, label: "", flags: FLAG_SEPARATOR },
-    MenuItem { id: APP_ITEM_SHORTCUTS, label: "Help > Keyboard Shortcuts", flags: 0 },
+    MenuItem { id: APP_ITEM_HIDE, label: "Hide", flags: FLAG_APPNAME },
+    MenuItem { id: APP_ITEM_HIDE_OTHERS, label: "Hide Others", flags: 0 },
+    MenuItem { id: APP_ITEM_SHOW_ALL, label: "Show All", flags: 0 },
+    MenuItem { id: 0, label: "", flags: FLAG_SEPARATOR },
+    MenuItem { id: APP_ITEM_QUIT, label: "Quit", flags: FLAG_APPNAME },
 ];
+/// APPMENU2 — `Quit <app>`'s index in [`APP_MENU_DEFAULT`] (the fixtures press it by row).
+pub(crate) const APP_QUIT_IX: usize = 8;
+const _: () = assert!(APP_MENU_DEFAULT[APP_QUIT_IX].id == APP_ITEM_QUIT);
+
+/// APPMENU2 — the app menu's `Settings...` row (Cmd-,).
+pub const APP_ITEM_SETTINGS: u32 = 0xA3;
+/// APPMENU2 — `Hide <app>` (Cmd-H).
+pub const APP_ITEM_HIDE: u32 = 0xA4;
+/// APPMENU2 — `Hide Others`.
+pub const APP_ITEM_HIDE_OTHERS: u32 = 0xA5;
+/// APPMENU2 — `Show All`.
+pub const APP_ITEM_SHOW_ALL: u32 = 0xA6;
+/// APPMENU2 — File: `New`, `Open...`, `Close Window` (Cmd-W), `Save`.
+pub const FILE_ITEM_NEW: u32 = 0xB0;
+pub const FILE_ITEM_OPEN: u32 = 0xB1;
+pub const FILE_ITEM_CLOSE: u32 = 0xB2;
+pub const FILE_ITEM_SAVE: u32 = 0xB3;
+/// APPMENU2 — Edit: Undo, Redo, Cut, Copy, Paste, Select All.
+pub const EDIT_ITEM_UNDO: u32 = 0xC0;
+pub const EDIT_ITEM_REDO: u32 = 0xC1;
+pub const EDIT_ITEM_CUT: u32 = 0xC2;
+pub const EDIT_ITEM_COPY: u32 = 0xC3;
+pub const EDIT_ITEM_PASTE: u32 = 0xC4;
+pub const EDIT_ITEM_SELECT_ALL: u32 = 0xC5;
+/// APPMENU2 — Help: `<app> Help`.
+pub const HELP_ITEM_APP: u32 = 0xD0;
+
+/// APPMENU2 — the LIVE APP NAME is drawn BEFORE this item's label (`<app> Help`), one space between.
+pub const FLAG_APPNAME_PRE: u32 = 1 << 4;
+
+/// APPMENU2 — **the WM's File menu.** New/Open/Save are greyed: an app binds them by publishing its own
+/// `File` title, which then takes this box. Close Window is the WM's (Cmd-W).
+pub(crate) const FILE_MENU_DEFAULT: &[MenuItem] = &[
+    MenuItem { id: FILE_ITEM_NEW, label: "New", flags: FLAG_DISABLED },
+    MenuItem { id: FILE_ITEM_OPEN, label: "Open...", flags: FLAG_DISABLED },
+    MenuItem { id: 0, label: "", flags: FLAG_SEPARATOR },
+    MenuItem { id: FILE_ITEM_CLOSE, label: "Close Window", flags: 0 },
+    MenuItem { id: FILE_ITEM_SAVE, label: "Save", flags: FLAG_DISABLED },
+];
+/// APPMENU2 — **the WM's Edit menu.** Cut/Copy/Paste/Select All are routed as `pal` actions to the
+/// focused consumer (the terminal's line editor, or the focused app's input ring) — the same delivery a
+/// Cmd-C takes. Undo/Redo are greyed: no action exists for them yet.
+pub(crate) const EDIT_MENU_DEFAULT: &[MenuItem] = &[
+    MenuItem { id: EDIT_ITEM_UNDO, label: "Undo", flags: FLAG_DISABLED },
+    MenuItem { id: EDIT_ITEM_REDO, label: "Redo", flags: FLAG_DISABLED },
+    MenuItem { id: 0, label: "", flags: FLAG_SEPARATOR },
+    MenuItem { id: EDIT_ITEM_CUT, label: "Cut", flags: 0 },
+    MenuItem { id: EDIT_ITEM_COPY, label: "Copy", flags: 0 },
+    MenuItem { id: EDIT_ITEM_PASTE, label: "Paste", flags: 0 },
+    MenuItem { id: EDIT_ITEM_SELECT_ALL, label: "Select All", flags: 0 },
+];
+/// APPMENU2 — **the WM's Help menu.** `<app> Help` is greyed until the app's note names a doc (owed).
+pub(crate) const HELP_MENU_DEFAULT: &[MenuItem] = &[
+    MenuItem { id: HELP_ITEM_APP, label: "Help", flags: FLAG_APPNAME_PRE | FLAG_DISABLED },
+    MenuItem { id: APP_ITEM_SHORTCUTS, label: "Keyboard Shortcuts", flags: 0 },
+];
+
+/// APPMENU2 — a bar box's KIND. The app box, the WM's File/Edit/Window/Help, or a tenant's title.
+pub const KIND_TENANT: u8 = 0;
+pub const KIND_APP: u8 = 1;
+pub const KIND_WIN: u8 = 2;
+pub const KIND_FILE: u8 = 3;
+pub const KIND_EDIT: u8 = 4;
+pub const KIND_HELP: u8 = 5;
 
 /// One row of a dropdown.
 #[derive(Clone, Copy)]
@@ -198,23 +268,15 @@ struct Tree {
 // The registry
 // ---------------------------------------------------------------------------
 
-/// How many windows may publish at once. Four, because [`MENU_TITLES_MAX`] windows' worth of kernel
-/// furniture is already more than this desktop has; a fifth publisher is REFUSED on the wire rather
-/// than silently evicting a live one.
-const WINMENU_MAX: usize = 4;
+/// APPMENU2 (B393) — **no cap on publishers** (R90, the WINDOWCAP-2 way). Bit `id-1` set = window
+/// `id` holds a tree. **Lock-free on purpose**: [`has_tree`] is asked once per window per bar compose,
+/// from inside `menubar::Model::read`'s existing table scan, and a lock there would be a second lock
+/// nested under `wm`'s table. Growable ([`super::rowstore::SlotBits`]); a read never allocates.
+static HAS: super::rowstore::SlotBits = super::rowstore::SlotBits::new();
 
-/// The owner of each slot, or [`wm::WIN_NONE`]. **Lock-free on purpose**: [`has_tree`] is asked once
-/// per window per bar compose, from inside `menubar::Model::read`'s existing table scan, and a lock
-/// there would be a second lock nested under `wm`'s table.
-static OWNERS: [AtomicU32; WINMENU_MAX] = [
-    AtomicU32::new(wm::WIN_NONE),
-    AtomicU32::new(wm::WIN_NONE),
-    AtomicU32::new(wm::WIN_NONE),
-    AtomicU32::new(wm::WIN_NONE),
-];
-
-/// The trees themselves. Guarded, and **never acquired blocking** — see the module header.
-static TREES: spin::Mutex<[Option<Tree>; WINMENU_MAX]> = spin::Mutex::new([None; WINMENU_MAX]);
+/// The trees themselves, one entry per publishing window, growable. Guarded, and **never acquired
+/// blocking** — see the module header. A removal is a `swap_remove` (no free on the masked reap path).
+static TREES: spin::Mutex<alloc::vec::Vec<(wm::WinId, Tree)>> = spin::Mutex::new(alloc::vec::Vec::new());
 
 /// How many slots are live. The whole of the fast path: a boot with no publisher answers every
 /// question from this one relaxed load and never reaches the table.
@@ -257,6 +319,8 @@ static APP_NAME_LEN: AtomicUsize = AtomicUsize::new(0);
 static OPEN_APP: AtomicBool = AtomicBool::new(false);
 /// WINDOWLIST — is the OPEN dropdown the Window menu? Stored and cleared beside [`OPEN_APP`].
 static OPEN_WIN: AtomicBool = AtomicBool::new(false);
+/// APPMENU2 — the KIND of the open box when it is one of the WM's File/Edit/Help (else [`KIND_TENANT`]).
+static OPEN_KIND: AtomicU32 = AtomicU32::new(KIND_TENANT as u32);
 /// WINDOWLIST — the pseudo-owner the Window menu opens under (no window owns it; `0` is `WIN_NONE`).
 const WIN_OWNER: wm::WinId = wm::WinId::MAX;
 
@@ -308,13 +372,13 @@ fn note_refusal(site: &str) {
     }
 }
 
-/// Is `id` a live publisher? Lock-free, [`WINMENU_MAX`] relaxed loads, and short-circuited to nothing
-/// by [`LIVE`] on a boot where no window ever published.
+/// Is `id` a live publisher? Lock-free, one bit test, and short-circuited to nothing by [`LIVE`] on a
+/// boot where no window ever published.
 pub fn has_tree(id: wm::WinId) -> bool {
     if id == wm::WIN_NONE || LIVE.load(Ordering::Relaxed) == 0 {
         return false;
     }
-    OWNERS.iter().any(|o| o.load(Ordering::Relaxed) == id)
+    HAS.test(id as usize - 1)
 }
 
 /// **The registry's answer, and it is THREE-VALUED on purpose** (PANEL V-3).
@@ -347,15 +411,10 @@ fn tree_of(id: wm::WinId, site: &str) -> Look {
             return Look::Busy;
         }
     };
-    for (k, slot) in g.iter().enumerate() {
-        if OWNERS[k].load(Ordering::Relaxed) == id {
-            return match *slot {
-                Some(t) => Look::Found(t),
-                None => Look::Absent,
-            };
-        }
+    match g.iter().find(|e| e.0 == id) {
+        Some(e) => Look::Found(e.1),
+        None => Look::Absent,
     }
-    Look::Absent
 }
 
 /// **Publish `owner`'s menu tree.** `true` when the registry took it.
@@ -412,34 +471,30 @@ pub fn publish(owner: wm::WinId, titles: &'static [MenuTitle], on_pick: fn(u32))
             return false;
         }
     };
-    // Replace in place if this owner already holds a slot, else take a free one.
-    let mut idx = None;
-    for k in 0..WINMENU_MAX {
-        if OWNERS[k].load(Ordering::Relaxed) == owner {
-            idx = Some(k);
-            break;
-        }
-    }
+    // Replace in place if this owner already holds an entry, else grow (APPMENU2: no registry-full).
+    let idx = g.iter().position(|e| e.0 == owner);
     let replaced = idx.is_some();
-    if idx.is_none() {
-        for k in 0..WINMENU_MAX {
-            if OWNERS[k].load(Ordering::Relaxed) == wm::WIN_NONE {
-                idx = Some(k);
-                break;
-            }
-        }
-    }
-    let Some(k) = idx else {
-        serial_println!("[winmenu] publish REFUSE owner={} reason=registry-full slots={}", owner, WINMENU_MAX);
-        return false;
-    };
     // SO3 — a re-publish must not silently drop the tenant's app menu. Re-publishing is how a
     // publisher moves a `FLAG_CHECKED` mark (see this function's doc), so it happens on every pick;
     // rebuilding the slot from scratch would make a custom app menu survive exactly until the first
     // selection in some unrelated title.
-    let app = g[k].and_then(|t| t.app);
-    g[k] = Some(Tree { titles, on_pick, app });
-    OWNERS[k].store(owner, Ordering::Release);
+    let k = match idx {
+        Some(k) => {
+            let app = g[k].1.app;
+            g[k].1 = Tree { titles, on_pick, app };
+            k
+        }
+        None => {
+            if g.try_reserve(1).is_err() {
+                serial_println!("[winmenu] publish REFUSE owner={} reason=no-memory", owner);
+                return false;
+            }
+            g.push((owner, Tree { titles, on_pick, app: None }));
+            g.len() - 1
+        }
+    };
+    let app = g[k].1.app;
+    HAS.set(owner as usize - 1);
     if !replaced {
         LIVE.fetch_add(1, Ordering::Relaxed);
     }
@@ -492,17 +547,14 @@ pub fn publish_app(owner: wm::WinId, items: &'static [MenuItem]) -> bool {
             return false;
         }
     };
-    for k in 0..WINMENU_MAX {
-        if OWNERS[k].load(Ordering::Relaxed) == owner {
-            if let Some(t) = g[k].as_mut() {
-                t.app = Some(items);
-                serial_println!(
-                    "[winmenu] publish owner={} titles={} items={} slot={} replaced=true app-menu=custom",
-                    owner, t.titles.len(), items.len(), k
-                );
-                return true;
-            }
-        }
+    if let Some(k) = g.iter().position(|e| e.0 == owner) {
+        let t = &mut g[k].1;
+        t.app = Some(items);
+        serial_println!(
+            "[winmenu] publish owner={} titles={} items={} slot={} replaced=true app-menu=custom",
+            owner, t.titles.len(), items.len(), k
+        );
+        return true;
     }
     false
 }
@@ -558,6 +610,31 @@ pub fn set_app_window(id: wm::WinId, name: &[u8]) {
     }
 }
 
+/// APPMENU2 — the window a tenant pick is being delivered for (set just before the sink is called).
+static PICK_WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
+
+/// APPMENU2 — the window the pick now being delivered was taken on (`appmenu`'s one ring-3 sink).
+pub fn picking_window() -> wm::WinId {
+    PICK_WIN.load(Ordering::Acquire)
+}
+
+/// APPMENU2 — the window the bar's app title names, or [`wm::WIN_NONE`]. Lock-free.
+pub fn app_window() -> wm::WinId {
+    APP_OWNER.load(Ordering::Acquire)
+}
+
+/// APPMENU2 — run a row of the WM's default app menu for `win` (the chord router's door to Quit).
+pub(crate) fn pick_app_row(win: wm::WinId, id: u32) {
+    app_pick(win, id)
+}
+
+/// APPMENU2 — how many of the WM's own boxes (app, File, Edit, Window, Help) the bar lays out now.
+pub fn wm_box_count() -> usize {
+    let (pw, ph) = panel();
+    let s = bar_boxes(pw, ph);
+    (0..s.n).filter(|&k| s.kind[k] != KIND_TENANT).count()
+}
+
 /// SO3 — the caption, as bytes. Lock-free; see [`APP_NAME_LO`].
 fn app_name() -> ([u8; wm::MAX_TITLE], usize) {
     let mut out = [0u8; wm::MAX_TITLE];
@@ -596,12 +673,10 @@ pub fn clear(owner: wm::WinId) -> bool {
         }
     };
     let mut gone = false;
-    for k in 0..WINMENU_MAX {
-        if OWNERS[k].load(Ordering::Relaxed) == owner {
-            OWNERS[k].store(wm::WIN_NONE, Ordering::Release);
-            g[k] = None;
-            gone = true;
-        }
+    if let Some(k) = g.iter().position(|e| e.0 == owner) {
+        HAS.clear(owner as usize - 1);
+        g.swap_remove(k); // APPMENU2 — no free here: this runs on the masked reap path
+        gone = true;
     }
     if gone {
         LIVE.fetch_sub(1, Ordering::Relaxed);
@@ -696,6 +771,10 @@ pub struct BarSnapshot {
     pub app_owner: wm::WinId,
     /// WINDOWLIST — the LAST box is the Window menu (`winlist`).
     pub win: bool,
+    /// APPMENU2 — each box's KIND ([`KIND_APP`] … [`KIND_HELP`], [`KIND_TENANT`]).
+    pub kind: [u8; BAR_BOXES_MAX],
+    /// APPMENU2 — a tenant box's index into its publisher's titles.
+    pub tix: [u8; BAR_BOXES_MAX],
     /// Box origin and width, panel-absolute. Height is the bar's, and `y` is the bar's.
     pub x: [usize; BAR_BOXES_MAX],
     pub w: [usize; BAR_BOXES_MAX],
@@ -716,6 +795,8 @@ impl BarSnapshot {
             app: false,
             app_owner: wm::WIN_NONE,
             win: false,
+            kind: [KIND_TENANT; BAR_BOXES_MAX],
+            tix: [0; BAR_BOXES_MAX],
             x: [0; BAR_BOXES_MAX],
             w: [0; BAR_BOXES_MAX],
             label: [[0; MENU_LABEL_MAX]; BAR_BOXES_MAX],
@@ -737,10 +818,22 @@ impl BarSnapshot {
         self.app && k == 0
     }
 
+    /// APPMENU2 — box `k`'s kind; past `n` it is a tenant box (which resolves to nothing).
+    #[inline]
+    pub fn kind_of(&self, k: usize) -> u8 {
+        if k < self.n { self.kind[k] } else { KIND_TENANT }
+    }
+
+    /// APPMENU2 — is box `k` one of the WM's own (app, File, Edit, Window, Help)? Those need no registry.
+    #[inline]
+    fn is_wm_box(&self, k: usize) -> bool {
+        self.is_app_box(k) || self.kind_of(k) != KIND_TENANT
+    }
+
     /// WINDOWLIST — is box `k` the Window menu?
     #[inline]
     fn is_win_box(&self, k: usize) -> bool {
-        self.win && self.n > 0 && k + 1 == self.n
+        self.win && k < self.n && self.kind[k] == KIND_WIN // APPMENU2 — Help now follows Window
     }
 
     /// Which title box, if any, panel point `(px, py)` lands in.
@@ -857,6 +950,28 @@ impl BarSnapshot {
     }
 }
 
+/// APPMENU2 — lay one WM box out after the last one (or at the no-caption anchor), or decline it when it
+/// would reach the clock or the bar's edge.
+fn push_box(s: &mut BarSnapshot, kind: u8, tix: u8, label: &[u8], limit: usize, right: usize) -> bool {
+    if s.n >= BAR_BOXES_MAX {
+        return false;
+    }
+    let w = label.len() * CELL_W() + 2 * TPAD();
+    let x = if s.n > 0 { s.x[s.n - 1] + s.w[s.n - 1] } else { (s.bar.0 + menubar::menus_x0()).saturating_sub(TPAD()) };
+    if x + w > limit || x + w > right {
+        return false;
+    }
+    let k = s.n;
+    s.x[k] = x;
+    s.w[k] = w;
+    s.label_len[k] = label.len().min(MENU_LABEL_MAX);
+    s.label[k][..s.label_len[k]].copy_from_slice(&label[..s.label_len[k]]);
+    s.kind[k] = kind;
+    s.tix[k] = tix;
+    s.n += 1;
+    true
+}
+
 /// **THE accessor**: the title boxes on a `pw` x `ph` panel.
 ///
 /// Laid out left to right from the APP TITLE BOX's right edge (MENUOWN), so an app's menus sit one
@@ -901,6 +1016,7 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
             s.label[0][..s.label_len[0]].copy_from_slice(&name[..s.label_len[0]]);
             s.app = true;
             s.app_owner = app_owner;
+            s.kind[0] = KIND_APP;
             s.n = 1;
         }
     }
@@ -918,6 +1034,16 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
             None
         }
     };
+    // APPMENU2 — the WM's File and Edit follow the app name for every named window. A tenant title with
+    // the same label TAKES the slot (it is laid out with the tenant's titles), the set is never replaced.
+    let tenant_has = |l: &str| tree.map_or(false, |t: Tree| t.titles.iter().any(|x| x.label == l));
+    if s.app {
+        for (kind, label) in [(KIND_FILE, "File"), (KIND_EDIT, "Edit")] {
+            if !tenant_has(label) {
+                push_box(&mut s, kind, 0, label.as_bytes(), limit, bx + bw);
+            }
+        }
+    }
     if let Some(tree) = tree {
         s.owner = owner;
         // MENUOWN — **the titles follow the APP TITLE BOX, not a fixed column.** Peter, render9:
@@ -931,12 +1057,12 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
         //
         // The fallback is the app box's own origin, for a window with menus and no name: the titles
         // then start where a caption would have, not 153 px into empty chrome.
-        let mut x = if s.app {
-            s.x[0] + s.w[0]
+        let mut x = if s.n > 0 {
+            s.x[s.n - 1] + s.w[s.n - 1] // APPMENU2 — after the last laid-out box (File/Edit)
         } else {
             (bx + menubar::menus_x0()).saturating_sub(TPAD())
         };
-        for t in tree.titles.iter().take(MENU_TITLES_MAX) {
+        for (ti, t) in tree.titles.iter().take(MENU_TITLES_MAX).enumerate() {
             let l = t.label.as_bytes();
             let w = l.len() * CELL_W() + 2 * TPAD();
             if x + w > limit || x + w > bx + bw {
@@ -947,6 +1073,8 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
             s.w[k] = w;
             s.label_len[k] = l.len().min(MENU_LABEL_MAX);
             s.label[k][..s.label_len[k]].copy_from_slice(&l[..s.label_len[k]]);
+            s.kind[k] = KIND_TENANT;
+            s.tix[k] = ti as u8;
             s.n += 1;
             x += w;
         }
@@ -963,8 +1091,13 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
             s.label_len[k] = super::winlist::LABEL.len();
             s.label[k][..super::winlist::LABEL.len()].copy_from_slice(super::winlist::LABEL.as_bytes());
             s.win = true;
+            s.kind[k] = KIND_WIN;
             s.n += 1;
         }
+    }
+    // APPMENU2 — the WM's Help is the LAST box, after Window.
+    if s.app && !tenant_has("Help") {
+        push_box(&mut s, KIND_HELP, 0, b"Help", limit, bx + bw);
     }
     // Which box, if any, is DOWN. SO3 adds the second half of the question: the app menu and a
     // tenant title are different surfaces that share one index space, so "box 1 is open" is only
@@ -974,7 +1107,8 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
     let open = OPEN_TITLE.load(Ordering::Relaxed) as usize;
     let open_owner = OPEN_OWNER.load(Ordering::Relaxed);
     let is_app = OPEN_APP.load(Ordering::Relaxed);
-    let (wanted, kind_ok) = if OPEN_WIN.load(Ordering::Relaxed) { (WIN_OWNER, s.is_win_box(open.saturating_sub(1))) } else if is_app { (s.app_owner, open == 1) } else { (owner, !s.is_app_box(open.saturating_sub(1)) && !s.is_win_box(open.saturating_sub(1))) }; // WINDOWLIST — the Window menu is its own kind
+    let open_kind = OPEN_KIND.load(Ordering::Relaxed) as u8;
+    let (wanted, kind_ok) = if matches!(open_kind, KIND_FILE | KIND_EDIT | KIND_HELP) { (s.app_owner, s.kind_of(open.saturating_sub(1)) == open_kind) } else if OPEN_WIN.load(Ordering::Relaxed) { (WIN_OWNER, s.is_win_box(open.saturating_sub(1))) } else if is_app { (s.app_owner, open == 1) } else { (owner, !s.is_wm_box(open.saturating_sub(1))) }; // WINDOWLIST — the Window menu is its own kind
     s.open = if open != 0 && open <= s.n && kind_ok && wanted != wm::WIN_NONE && open_owner == wanted {
         open
     } else {
@@ -1006,8 +1140,8 @@ const CHECK_MARK: &[u8] = b">";
 
 /// SHORTCUTS (M3) — the chord the table lists for this row, drawn on its right (`None` when it has none).
 fn item_chord(it: &MenuItem) -> Option<&'static str> {
-    if it.flags & (FLAG_SEPARATOR | FLAG_APPNAME) != 0 || it.label.is_empty() {
-        return None;
+    if it.flags & FLAG_SEPARATOR != 0 || it.label.is_empty() || it.id == APP_ITEM_ABOUT {
+        return None; // APPMENU2 — a FLAG_APPNAME row (`Quit <app>`, `Hide <app>`) carries its chord too
     }
     super::shortcuts::chord_for(it.label.strip_prefix("Help > ").unwrap_or(it.label))
 }
@@ -1015,14 +1149,9 @@ fn item_chord(it: &MenuItem) -> Option<&'static str> {
 /// SO3 — an item's rendered width in GLYPHS, with [`FLAG_APPNAME`]'s live suffix folded in.
 #[inline]
 fn item_glyphs(it: &MenuItem, name_len: usize) -> usize {
-    if let Some(c) = item_chord(it) {
-        return it.label.len() + 2 + c.len(); // SHORTCUTS M3 — the chord sits right-aligned, two glyphs clear of the label
-    }
-    if it.flags & FLAG_APPNAME != 0 && name_len > 0 {
-        it.label.len() + 1 + name_len
-    } else {
-        it.label.len()
-    }
+    let named = if it.flags & (FLAG_APPNAME | FLAG_APPNAME_PRE) != 0 && name_len > 0 { 1 + name_len } else { 0 }; // APPMENU2
+    let chord = item_chord(it).map_or(0, |c| 2 + c.len()); // SHORTCUTS M3 — the chord sits right-aligned, two glyphs clear of the label
+    it.label.len() + named + chord
 }
 
 /// The dropdown's extent for one title's `items`, in px. `name_len` is the live app name's length,
@@ -1083,7 +1212,13 @@ fn menu_of(s: &BarSnapshot, k: usize, site: &str) -> Menu {
             Look::Busy => Menu::Busy,
         };
     }
-    let ti = k - (s.app as usize);
+    match s.kind_of(k) { // APPMENU2 — the WM's own File/Edit/Help: no registry, picks to the app box's sink
+        KIND_FILE => return Menu::Found(FILE_MENU_DEFAULT, Sink::App(s.app_owner)),
+        KIND_EDIT => return Menu::Found(EDIT_MENU_DEFAULT, Sink::App(s.app_owner)),
+        KIND_HELP => return Menu::Found(HELP_MENU_DEFAULT, Sink::App(s.app_owner)),
+        _ => {}
+    }
+    let ti = s.tix[k] as usize;
     match tree_of(s.owner, site) {
         Look::Found(t) => match t.titles.get(ti) {
             Some(title) => Menu::Found(title.items, Sink::Tenant(t.on_pick)),
@@ -1152,7 +1287,7 @@ enum Layout {
 /// This is the half that TAKES THE LOCK, so its callers are counted: [`open_title`] (task context)
 /// and [`compose`] (once per pass). The per-window occlusion walk reads [`OPEN_RECT`] instead.
 fn layout_open_rect(pw: usize, ph: usize, s: &BarSnapshot) -> Layout {
-    if s.busy && !s.is_app_box(s.open.saturating_sub(1)) && !s.is_win_box(s.open.saturating_sub(1)) {
+    if s.busy && !s.is_wm_box(s.open.saturating_sub(1)) {
         return Layout::Busy;
     }
     if !is_open() || s.open == 0 {
@@ -1208,7 +1343,9 @@ fn open_title(k: usize, s: &BarSnapshot) { crate::video::lag::menu_opened(); // 
         super::winlist::rebuild();
     }
     OPEN_WIN.store(is_win, Ordering::Release);
-    let owner = if is_win { WIN_OWNER } else if is_app { s.app_owner } else { s.owner };
+    let wm_kind = match s.kind_of(k) { kd @ (KIND_FILE | KIND_EDIT | KIND_HELP) => kd, _ => KIND_TENANT }; // APPMENU2
+    OPEN_KIND.store(wm_kind as u32, Ordering::Release);
+    let owner = if is_win { WIN_OWNER } else if is_app || wm_kind != KIND_TENANT { s.app_owner } else { s.owner };
     OPEN_APP.store(is_app, Ordering::Release);
     OPEN_OWNER.store(owner, Ordering::Release);
     OPEN_TITLE.store((k + 1) as u32, Ordering::Release);
@@ -1230,7 +1367,7 @@ fn open_title(k: usize, s: &BarSnapshot) { crate::video::lag::menu_opened(); // 
         "[winmenu] open title={} items={} at ({},{}) title-x={} font={} kind={} owner={}",
         core::str::from_utf8(s.label_of(k)).unwrap_or("?"),
         items, mx, my, s.text_x(k), menubar::BAR_FONT_NAME,
-        if is_win { "window" } else if is_app { "app" } else { "title" }, owner
+        if is_win { "window" } else if is_app { "app" } else { match wm_kind { KIND_FILE => "file", KIND_EDIT => "edit", KIND_HELP => "help", _ => "title" } }, owner
     );
     drive();
 }
@@ -1272,6 +1409,7 @@ fn dismiss_state(reason: &str) -> bool {
     let owner = OPEN_OWNER.swap(wm::WIN_NONE, Ordering::AcqRel);
     let was_app = OPEN_APP.swap(false, Ordering::AcqRel);
     OPEN_WIN.store(false, Ordering::Release); // WINDOWLIST
+    OPEN_KIND.store(KIND_TENANT as u32, Ordering::Release); // APPMENU2
     DISMISSES.fetch_add(1, Ordering::Relaxed);
     serial_println!(
         "[winmenu] dismiss reason={} kind={} owner={}",
@@ -1373,7 +1511,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
                         return true;
                     }
                 };
-                let owner = if s.is_app_box(k) { s.app_owner } else { s.owner };
+                let owner = if s.is_wm_box(k) && !s.is_win_box(k) { s.app_owner } else { s.owner }; // APPMENU2
                 return match item_at_row(items, py - my, mh) {
                     Some(i)
                         if items[i].flags & (FLAG_SEPARATOR | FLAG_DISABLED) == 0 =>
@@ -1388,6 +1526,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
                             }
                             Sink::Tenant(f) => {
                                 serial_println!("[winmenu] pick owner={} id={} label={}", owner, id, items[i].label);
+                                PICK_WIN.store(owner, Ordering::Release); // APPMENU2 — the one ring-3 sink reads its owner from here
                                 f(id);
                             }
                             // SO3 — the WM's own app menu. The witness names the ROUTE, not just the
@@ -1398,7 +1537,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
                                 serial_println!(
                                     "[winmenu] pick owner={} id={} label={} -> {} win={}",
                                     owner, id, items[i].label,
-                                    if id == APP_ITEM_QUIT { "close" } else { "about" }, win
+                                    if id == APP_ITEM_QUIT { "close" } else if id == APP_ITEM_ABOUT { "about" } else { "wm" }, win
                                 );
                                 app_pick(win, id);
                             }
@@ -1483,6 +1622,7 @@ pub fn key_escape(ev: crate::pal::Event) -> bool {
 fn app_pick(win: wm::WinId, id: u32) {
     match id {
         APP_ITEM_QUIT => {
+            if super::sysmenu::quit_user(win, "menu") { return; } // APPMENU2 — a USER window's Quit is the close box's close-then-kill (the process went on living under `wm::close` alone)
             clear(win); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let closed = (crate::video::pulsewin::win() == win && crate::video::pulsewin::close()) || quarry_quit(win) || instgui_quit(win) || wm::close(win); // QUITLEAK — the A30FIX shape, now applied to EVERY app that owns state outside the window table, not just the pulse instrument. `quarry_quit`/`instgui_quit` are this file's tail-appended owner arms (see them for why they are functions rather than two more folded sub-expressions: each carries a NARROWER `cfg` than this line's, `quarry` needs `feature = "quarry"` on top of the furniture family and `instgui` needs `all(x86_64, wc, instgui)`, and a folded sub-expression cannot carry a `cfg` of its own without becoming a second line). Order is pulse, quarry, instgui, bare — the modules are disjoint owners, so the order is only a search, and `||` short-circuits so exactly one close runs and `wm::close` is never called twice. A30FIX — see this fn's header. The OWNING MODULE's close runs first when this is its window: `pulsewin::close()` disarms the latch BEFORE it swaps the id, then does the same `winmenu::clear` + `wm::close` + surface teardown the red disc does, so Quit and the disc are now ONE path emitting one witness pair. `||` short-circuits, so `wm::close` is not called twice; a non-pulse window (and every window on a desktop that never armed the instrument, where `win()` is `WIN_NONE` and no real id can equal it) takes the right-hand side exactly as before.
             #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] let closed = wm::close(win); // A30FIX — the KNOB-OFF twin, and the reason the arm above is a whole `let` rather than a folded sub-expression. The gate is `video/mod.rs`'s own predicate on `pub mod pulsewin`; `winmenu.rs` is a bare `pub mod` and IS compiled into the knob-off `kernel8.img`, where that module does not exist. This line is token-for-token the statement that stood here before the arc, so the knob-off image gets not one changed byte — not an inference about what LLVM folds. ⚠ Both arms are FOLDED onto lines that already existed: knob-off line numbers are load-bearing (panic `Location`) — PARITY.md §5.3.
             serial_println!("[winmenu] app-menu quit win={} closed={}", win, closed);
@@ -1499,7 +1639,7 @@ fn app_pick(win: wm::WinId, id: u32) {
             let opened = super::shortcuts::open();
             serial_println!("[winmenu] app-menu shortcuts win={} opened={}", win, opened);
         }
-        other => serial_println!("[winmenu] app-menu REFUSE win={} id={} reason=unknown-item", win, other),
+        other => super::sysmenu::pick(win, other), // APPMENU2 — the WM's Settings/Hide/Show All and File/Edit/Help rows
     }
 }
 
@@ -1672,7 +1812,7 @@ fn drop_sig(s: &BarSnapshot, r: strip::Rect) -> u64 {
             }
             // SO3 — a `FLAG_APPNAME` row's rendered text includes the LIVE caption, so the caption is
             // part of this surface's content: a rename with the menu down must repaint it.
-            if it.flags & FLAG_APPNAME != 0 {
+            if it.flags & (FLAG_APPNAME | FLAG_APPNAME_PRE) != 0 {
                 let (name, len) = app_name();
                 for &b in name[..len].iter() {
                     h = strip::fnv1a(h, b);
@@ -1741,7 +1881,11 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     if it.flags & FLAG_CHECKED != 0 {
         super::text::draw_row(out, w, CHECK_MARK, BORDER + PADX(), sy, ink, BOLD, FACE);
     }
-    let lx = BORDER + PADX() + CHECK_GLYPHS * CELL_W();
+    let mut lx = BORDER + PADX() + CHECK_GLYPHS * CELL_W();
+    if it.flags & FLAG_APPNAME_PRE != 0 && !name.is_empty() { // APPMENU2 — `<app> Help`: the name first
+        super::text::draw_row(out, w, name, lx, sy, ink, BOLD, FACE);
+        lx += super::text::advance(name, BOLD, FACE) + super::text::advance(b" ", BOLD, FACE);
+    }
     super::text::draw_row(out, w, it.label.as_bytes(), lx, sy, ink, BOLD, FACE);
     // SO3 — `About <app>`. The suffix is composed HERE, at paint time, from the caption the bar
     // published, because a `MenuItem`'s label is `&'static str` and the registry allocates nothing.
@@ -1992,7 +2136,7 @@ pub fn selftest() {
     let _ = strip::press_route(px, py);
     let leg_quit = match (is_open(), open_rect(pw, ph)) {
         (true, Some((mx, my, mw, _mh))) => {
-            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H() / 2;
+            let qy = my + item_top(APP_MENU_DEFAULT, APP_QUIT_IX) + ITEM_H() / 2;
             let consumed = strip::press_route((mx + mw / 2) as i32, qy as i32);
             consumed && !is_open() && wm::info(win).is_none()
         }
@@ -2104,8 +2248,6 @@ pub fn selftest() {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)] pub(crate) fn uimetrics_assert() {
-    // A registry with no slots would be a registry that refuses every publisher.
-    assert!(WINMENU_MAX >= 1);
     // The bar cannot lay out more titles than the snapshot can carry.
     assert!(MENU_TITLES_MAX >= 1);
     // The wire caps this registry shares with the protocol design must hold what a tree can be.
@@ -2301,7 +2443,7 @@ pub fn pulsequit_selftest() {
         (true, Some((mx, my, mw, _mh))) => {
             // `Quit` is `APP_MENU_DEFAULT`'s index 2, its vertical middle, taken from the same
             // `item_top`/`ITEM_H` the painter and the hit-test use — leg 5's idiom.
-            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H() / 2;
+            let qy = my + item_top(APP_MENU_DEFAULT, APP_QUIT_IX) + ITEM_H() / 2;
             let hit = strip::press_route((mx + mw / 2) as i32, qy as i32);
             let (_, c, sl) = pulsewin::close_census();
             (hit, sl, c)
@@ -2449,7 +2591,7 @@ fn instgui_quit(_win: wm::WinId) -> bool {
 /// same reason — a fixture that called `app_pick` directly would be testing a function, not a
 /// gesture: focus the app's own window and composite (which is what publishes the bar's app box,
 /// through `menubar::compose` -> [`set_app_window`]), press the APP BOX through
-/// [`strip::press_route`], then press the `Quit` ROW at `item_top(APP_MENU_DEFAULT, 2)` through the
+/// [`strip::press_route`], then press the `Quit` ROW at `item_top(APP_MENU_DEFAULT, APP_QUIT_IX)` through the
 /// same router. Everything after that is the real chain: [`press_at`] -> [`app_pick`] -> the owner
 /// arm.
 ///
@@ -2552,7 +2694,7 @@ fn deliver_quit(pw: usize, ph: usize, s: &BarSnapshot, w: wm::WinId, bar_named: 
         (true, Some((mx, my, mw, _mh))) => {
             // `Quit` is `APP_MENU_DEFAULT`'s index 2, its vertical middle, taken from the same
             // `item_top`/`ITEM_H` the painter and the hit-test use — leg 5's idiom.
-            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H() / 2;
+            let qy = my + item_top(APP_MENU_DEFAULT, APP_QUIT_IX) + ITEM_H() / 2;
             strip::press_route((mx + mw / 2) as i32, qy as i32)
         }
         _ => false,

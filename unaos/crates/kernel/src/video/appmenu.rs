@@ -34,8 +34,9 @@ const E_PERM: i64 = -1;
 const E_AGAIN: i64 = -11;
 const E_INVAL: i64 = -22;
 
-/// Registry slots: one per winmenu slot, so every published owner can reach the bar.
-const SLOTS: usize = 4;
+// APPMENU2 (B393) — NO SLOT CAP (R90, the WINDOWCAP-2 way): the slot tables are growable
+// (`rowstore::SegVec`), and a pick reaches its owner through ONE sink that reads the picking window
+// (`winmenu::picking_window`) instead of one `pickN` fn per slot.
 /// Distinct trees that may be leaked into `'static` rows over a boot.
 const LEAK_MAX: u32 = 64;
 
@@ -47,11 +48,11 @@ struct Entry {
 }
 const EMPTY: Entry = Entry { count: 0, items: [MenuWireItem::ZERO; MENU_ITEMS_MAX], titles: None };
 
-/// The owner of each slot (0 = free). Lock-free; the claim and the reap are compare-exchanges.
-static OWN: [AtomicU64; SLOTS] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-/// Bit `id-1` set = window `id` of that slot's owner was handed to `winmenu::publish`.
-static WINS: [super::rowstore::SlotBits; SLOTS] = [const { super::rowstore::SlotBits::new() }; SLOTS]; // WINDOWCAP-2: bit `id-1`, growable (was one u64 word)
-static TREES: spin::Mutex<[Entry; SLOTS]> = spin::Mutex::new([EMPTY; SLOTS]);
+/// The owner of each slot (0 = free). Lock-free; the claim and the reap are compare-exchanges. Growable.
+static OWN: super::rowstore::SegVec<AtomicU64> = super::rowstore::SegVec::new(|| AtomicU64::new(0));
+/// Bit `id-1` set = window `id` of that slot's owner was handed to `winmenu::publish`. Growable both ways.
+static WINS: super::rowstore::SegVec<super::rowstore::SlotBits> = super::rowstore::SegVec::new(super::rowstore::SlotBits::new); // WINDOWCAP-2: bit `id-1`, growable (was one u64 word)
+static TREES: spin::Mutex<Vec<Entry>> = spin::Mutex::new(Vec::new()); // APPMENU2: one entry per slot, grown on claim
 static LEAKS: AtomicU32 = AtomicU32::new(0);
 
 // WINDOWCAP-2: `WINS` is a growable SlotBits per slot — no window-count assertion.
@@ -72,7 +73,19 @@ fn owner_of_row(row: usize) -> Option<u64> {
 fn owner_of_row(_row: usize) -> Option<u64> { None }
 
 fn slot_of(asid: u64) -> Option<usize> {
-    (0..SLOTS).find(|&k| OWN[k].load(Ordering::Acquire) == asid)
+    (0..OWN.hwm()).find(|&k| OWN.peek(k).is_some_and(|o| o.load(Ordering::Acquire) == asid))
+}
+
+/// APPMENU2 — claim a free slot for `asid` (a freed one first, else the next index). Lock-free.
+fn claim(asid: u64) -> Option<usize> {
+    let mut k = 0usize;
+    while k <= OWN.hwm() && k < (1 << 16) {
+        if OWN.get(k).compare_exchange(0, asid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return Some(k);
+        }
+        k += 1;
+    }
+    None
 }
 
 /// Validate a publish body and return `(count, depth)`. WHOLE refusal, with the reason named.
@@ -160,17 +173,20 @@ fn build_titles(items: &[MenuWireItem]) -> &'static [MenuTitle] {
     Box::leak(titles.into_boxed_slice())
 }
 
-macro_rules! pick_fns {
-    ($($f:ident => $k:expr),*) => { $(fn $f(id: u32) { pick_slot($k, id) })* };
+/// APPMENU2 — **the bar's ONE pick sink** for every ring-3 publisher. A bare `fn` cannot carry an
+/// owner, so the owner is read from the window the pick was taken on (`winmenu` sets it before the
+/// call): a property of the published window, fixed by the publish, never of who has focus.
+fn pick_bar(id: u32) {
+    let win = winmenu::picking_window();
+    match wm::owner_of(win).and_then(slot_of) {
+        Some(k) => pick_slot(k, id),
+        None => crate::bootlog_println!("[menubar] pick win={} item={} delivered=false reason=no-owner", win, id),
+    }
 }
-pick_fns!(pick0 => 0, pick1 => 1, pick2 => 2, pick3 => 3);
-/// The bar's pick sink for slot `k`: a bare `fn` cannot carry an owner, so each slot has its own — the
-/// owner is a property of the slot, fixed when the tree was published, not of who has focus.
-static PICK_FNS: [fn(u32); SLOTS] = [pick0, pick1, pick2, pick3];
 
 /// Deliver a pick to slot `k`'s OWNER's input ring, by identity.
 fn pick_slot(k: usize, id: u32) {
-    let asid = OWN[k].load(Ordering::Acquire);
+    let asid = OWN.peek(k).map_or(0, |o| o.load(Ordering::Acquire));
     #[cfg(target_arch = "x86_64")]
     let delivered = asid != 0
         && crate::arch::x86_64::syscall::user_input_push_owner(asid, una_abi::input_ev_pack(INPUT_EV_MENU_PICK, id as u64));
@@ -188,9 +204,9 @@ fn attach(k: usize, asid: u64, titles: &'static [MenuTitle]) -> (u32, u32) {
     for id in 1..=(wm::slots() as u32) { // WINDOWCAP-2: every row the table has
         if wm::owner_of(id) == Some(asid) {
             seen += 1;
-            if winmenu::publish(id, titles, PICK_FNS[k]) {
+            if winmenu::publish(id, titles, pick_bar) {
                 ok += 1;
-                WINS[k].set(id as usize - 1);
+                WINS.get(k).set(id as usize - 1);
             }
         }
     }
@@ -216,7 +232,7 @@ pub fn verb_publish(row: usize, body: &[u8]) -> i64 {
     // Claim (or find) this owner's slot.
     let k = match slot_of(asid) {
         Some(k) => k,
-        None => match (0..SLOTS).find(|&k| OWN[k].compare_exchange(0, asid, Ordering::AcqRel, Ordering::Acquire).is_ok()) {
+        None => match claim(asid) {
             Some(k) => k,
             None => {
                 serial_println!(":: APPMENU: verb=publish owner={} reason=registry-full -> REFUSED ::", asid);
@@ -230,6 +246,13 @@ pub fn verb_publish(row: usize, body: &[u8]) -> i64 {
             return E_AGAIN; // (a fresh claim stays; the app's retry fills it, and `reap` frees it)
         }
     };
+    if g.len() <= k {
+        let grow = k + 1 - g.len();
+        if g.try_reserve(grow).is_err() {
+            return E_AGAIN;
+        }
+        g.resize(k + 1, EMPTY);
+    }
     let same = g[k].count == count && g[k].titles.is_some() && g[k].items[..count] == items[..count];
     let titles = if same {
         g[k].titles.unwrap_or(&[])
@@ -237,7 +260,7 @@ pub fn verb_publish(row: usize, body: &[u8]) -> i64 {
         if LEAKS.load(Ordering::Relaxed) >= LEAK_MAX {
             serial_println!(":: APPMENU: verb=publish owner={} reason=leak-cap -> REFUSED ::", asid);
             if g[k].titles.is_none() {
-                OWN[k].store(0, Ordering::Release); // a claim that never got a tree is not an owner
+                OWN.get(k).store(0, Ordering::Release); // a claim that never got a tree is not an owner
             }
             return E_AGAIN;
         }
@@ -255,12 +278,14 @@ pub fn verb_publish(row: usize, body: &[u8]) -> i64 {
 /// Drop `asid`'s entry and its bar trees. Lock-free (the reap path runs with interrupts masked).
 fn drop_owner(asid: u64) -> bool {
     let Some(k) = slot_of(asid) else { return false };
-    for b in 0..WINS[k].hwm() {
-        if WINS[k].clear(b) { // WINDOWCAP-2: no allocation on this (masked) reap path
-            winmenu::clear(b as u32 + 1);
+    if let Some(w) = WINS.peek(k) {
+        for b in 0..w.hwm() {
+            if w.clear(b) { // WINDOWCAP-2: no allocation on this (masked) reap path
+                winmenu::clear(b as u32 + 1);
+            }
         }
     }
-    OWN[k].compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    OWN.peek(k).is_some_and(|o| o.compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire).is_ok())
 }
 
 /// `BUS_VERB_MENU_CLEAR` for the calling row.
@@ -288,7 +313,7 @@ pub fn verb_get(row: usize, body: &[u8], out: &mut Vec<u8>) -> i64 {
         Some(g) => g,
         None => return E_AGAIN,
     };
-    if OWN[k].load(Ordering::Acquire) != target || g[k].titles.is_none() {
+    if OWN.peek(k).map_or(0, |o| o.load(Ordering::Acquire)) != target || g.get(k).map_or(true, |e| e.titles.is_none()) {
         return 0; // reaped between the two reads
     }
     out.extend_from_slice(&[MENU_WIRE_VERSION, g[k].count as u8, 0, 0]);
