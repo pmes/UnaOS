@@ -167,6 +167,12 @@ pub static SCHEMA: &[Key] = &[
         doc: "Minutes before the idle blank; 0 = never.",
     },
     Key {
+        ns: "system", key: "display.mode", kind: Kind::Str { max_len: 16, printable: true },
+        default: Default::Consumer("the panel's own density scale (UIMETRICS)"),
+        writers: &[Writer::Settings], reader: "kernel settings (Display > Resolution), `video::dpi`",
+        doc: "The looks-like size `WxH` of the chosen mode: the panel's native mode at a UI scale (`prefs_core::modes`); unset = the panel's default scale.",
+    },
+    Key {
         ns: "system", key: "display.wallpaper", kind: Kind::Str { max_len: 120, printable: true },
         default: Default::Str(""),
         writers: &[Writer::Settings, Writer::WallpaperVerb], reader: "kernel settings, wallpaper",
@@ -177,6 +183,12 @@ pub static SCHEMA: &[Key] = &[
         default: Default::Consumer("every pin the build carries (lumen only on a `lumen` build)"),
         writers: &[Writer::Dock], reader: "kernel dock",
         doc: "Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen); TOML arrays are outside the subset.",
+    },
+    Key {
+        ns: "system", key: "login.items", kind: Kind::Str { max_len: crate::login::VALUE_MAX, printable: true },
+        default: Default::Str(""),
+        writers: &[Writer::Settings, Writer::Dock], reader: "kernel login items (`video/loginitems.rs`)",
+        doc: "Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login.",
     },
     Key {
         ns: "system", key: "pointer.speed", kind: Kind::Int { min: 0, max: 2 }, default: Default::Int(1),
@@ -190,9 +202,9 @@ pub static SCHEMA: &[Key] = &[
         doc: "Battery percent at which the machine shuts down; 0 = off.",
     },
     Key {
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 3 }, default: Default::Int(0),
+        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 4 }, default: Default::Int(0),
         writers: &[Writer::Settings], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items).",
     },
     // ── vein — the conversation handler's provider slot (VEINPROV B303, EMBED B317, R81) ───────────────
     Key {
