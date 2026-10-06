@@ -218,7 +218,7 @@ pub static SCHEMA: &[Key] = &[
     Key {
         ns: "system", key: "pointer.speed", kind: Kind::Int { min: 0, max: 2 }, default: Default::Int(1),
         writers: &[Writer::Settings], reader: "kernel settings (pointer)",
-        doc: "0 slow, 1 normal, 2 fast.",
+        doc: "0 slow, 1 normal, 2 fast. Legacy (R75): read only while `system.trackpad.speed` is unset (TRACKPADPANE).",
     },
     Key {
         ns: "system", key: "power.lowbat_shutdown_pct", kind: Kind::Int { min: 0, max: 100 },
@@ -227,9 +227,35 @@ pub static SCHEMA: &[Key] = &[
         doc: "Battery percent at which the machine shuts down; 0 = off.",
     },
     Key {
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 5 }, default: Default::Int(0),
+        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 6 }, default: Default::Int(0),
         writers: &[Writer::Settings], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad).",
+    },
+    // ── TRACKPADPANE (B412, MACPARITY row 16): the Trackpad pane; the rules are `crate::trackpad` ──────────────
+    Key {
+        ns: "system", key: "trackpad.natural_scroll", kind: Kind::Bool, default: Default::Bool(true),
+        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        doc: "Two-finger scrolling moves the content with the fingers (on) or the other way (off). Edited in Settings > Trackpad.",
+    },
+    Key {
+        ns: "system", key: "trackpad.secondary_click", kind: Kind::Enum(&["two-finger", "off"]), default: Default::Str("two-finger"),
+        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        doc: "A click (or, with tap to click, a tap) made with two fingers down is a secondary click. Edited in Settings > Trackpad.",
+    },
+    Key {
+        ns: "system", key: "trackpad.speed", kind: Kind::Int { min: 1, max: 10 }, default: Default::Int(5),
+        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        doc: "Tracking speed: one gain on the TPSPEED curve (5 = the curve as flown, x0.25 at 1 .. x2.5 at 10); the curve's shape never changes. Unset, a stored `system.pointer.speed` maps to 4/5/7. Edited in Settings > Trackpad.",
+    },
+    Key {
+        ns: "system", key: "trackpad.tap_to_click", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        doc: "A short touch with no travel and no press is a click. Edited in Settings > Trackpad.",
+    },
+    Key {
+        ns: "system", key: "trackpad.three_finger_drag", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        doc: "Three fingers down hold the primary button and move the pointer (a drag without a press). Edited in Settings > Trackpad.",
     },
     // ── vein — the conversation handler's provider slot (VEINPROV B303, EMBED B317, R81) ───────────────
     Key {

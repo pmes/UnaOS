@@ -94,6 +94,12 @@ pub mod key {
     pub const APPEARANCE_MODE: &str = "appearance.mode";
     pub const APPEARANCE_ACCENT: &str = "appearance.accent";
     pub const APPEARANCE_HIGHLIGHT: &str = "appearance.highlight";
+    /// TRACKPADPANE (B412): the Trackpad pane (rules: `prefs_core::trackpad`).
+    pub const TP_SPEED: &str = "trackpad.speed";
+    pub const TP_TAP: &str = "trackpad.tap_to_click";
+    pub const TP_NATURAL: &str = "trackpad.natural_scroll";
+    pub const TP_SECONDARY: &str = "trackpad.secondary_click";
+    pub const TP_THREE_DRAG: &str = "trackpad.three_finger_drag";
 }
 
 static TREE: spin::Mutex<PrefTree> = spin::Mutex::new(PrefTree::new());
