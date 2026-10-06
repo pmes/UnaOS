@@ -110,13 +110,16 @@ pub fn registrants_in(mt: &MountTable, mime: &str) -> Vec<Registrant> {
 }
 
 /// The opener for `path` of type `mime`, and the source that decided: `override` (the file's own
-/// `una:preferred`), `db` (the registry's `una:preferred` for the type), `registrant` (no preference: the first
+/// `una:preferred`, honoured only when it names a REGISTRANT of `mime` — OPENERTRUST B447, else ignored with a line), `db` (the registry's `una:preferred` for the type), `registrant` (no preference: the first
 /// program that declares the type) or `none` (nothing declares it — a video in this tree).
 pub fn opener_for_in(mt: &MountTable, path: &str, mime: &str) -> (String, &'static str) {
     let obj = object_path(mime);
     if path != obj {
         if let Some(v) = str_attr(mt, path, PREFERRED_KEY) {
-            return (appres::opener_of_preferred(mt, &v), "override");
+            match trusted_override_in(mt, &v, mime) {
+                Some(op) => return (op, "override"),
+                None => refused_wire(path, &v, mime),
+            }
         }
     }
     if let Some(v) = str_attr(mt, &obj, PREFERRED_KEY) {
@@ -519,5 +522,113 @@ pub fn selftest() {
         ":: FILETYPES: types={} preferred={} resolved={} -> {} :: registry={} objects={} source={} sticky={} amend={} openwith={} builds={}",
         types.len(), preferred, resolved, if pass { "PASS" } else { "FAIL" },
         if attrs { TYPES_DIR } else { "none" }, objects, if attrs { "db" } else { "registrants" }, sticky, amend, openwith, builds()
+    );
+}
+
+// ── OPENERTRUST (B447, ARCHREVIEW F3) ────────────────────────────────────────────────────────────────────────────
+//
+// A FILE's `una:preferred` is the document's wish, not the user's act on a PROGRAM: it is honoured only when it
+// names a REGISTRANT of the file's type (a built-in that declares the type, or a ring-3 program APPRES sighted and
+// published in the type object's `una:apps`). Anything else — an absolute path to an arbitrary ELF, an opener id
+// that does not declare the type — is ignored and the type's own default opens the file. Be's PREFERRED_APP named
+// a signature the registrar knew, never a path.
+
+/// The opener a file's `una:preferred` value `v` names, when that opener is a registrant of `mime`; `None` = refused.
+pub fn trusted_override_in(mt: &MountTable, v: &str, mime: &str) -> Option<String> {
+    let op = appres::opener_of_preferred(mt, v);
+    if registrants_in(mt, mime).iter().any(|r| r.opener == op) { Some(op) } else { None }
+}
+
+/// The last path whose override was refused (the resolver runs per row and per frame; one line per file).
+static REFUSED_LAST: spin::Mutex<String> = spin::Mutex::new(String::new());
+
+fn refused_wire(path: &str, v: &str, mime: &str) {
+    let mut last = REFUSED_LAST.lock();
+    if last.as_str() != path {
+        last.clear();
+        last.push_str(path);
+        drop(last);
+        serial_println!("[openers] preferred={} refused=not-a-registrant path={} type={}", v, path, mime);
+    }
+}
+
+/// `tests openertrust` (B447; R80: run only when asked) — a probe text file on the attribute root:
+/// `registrant` = its `una:preferred=org.unaos.fileview` (a registrant of text) opens the viewer as `override`;
+/// `foreign_path` = `una:preferred=/apps/EVIL.ELF` and `=launch` (not registrants of text) are both refused and the
+/// type's default opens it; `carried` = a copy from ANOTHER attribute-taking volume (the first writable mount that is
+/// not the root's storage) arrives without `una:preferred`, and a copy within the root keeps it.
+///
+/// `:: OPENERTRUST: registrant=<ok|why> foreign_path=<refused|why> carried=<stripped|skip|why> -> PASS|FAIL :: kept=<ok|why> foreign=<mount|none>`.
+pub fn openertrust_selftest() {
+    let mt = crate::shell::vfs_mount_table();
+    let k = KERNEL_PRINCIPAL;
+    if !root_takes_attrs(&mt) {
+        serial_println!(":: OPENERTRUST: registrant=skip foreign_path=skip carried=skip -> PASS :: kept=skip foreign=none (the root takes no attributes: no file can carry una:preferred)");
+        return;
+    }
+    let mk = |p: &str| {
+        let _ = mt.unlink(p, k);
+        mt.create(p, NodeKind::File, k).is_ok() && mt.write(p, 0, b"opener trust probe\n", k).is_ok()
+    };
+    let pref = |p: &str, v: &str| mt.set_attr(p, PREFERRED_KEY, AttrValue::Str(String::from(v)), k).is_ok();
+    let has_pref = |p: &str| mt.get_attr(p, PREFERRED_KEY, k).is_ok();
+    let _ = seed_in(&mt); // `/system` exists on an attribute root (ROOTDISK2); idempotent
+    let probe = "/system/OTPROBE.TXT";
+    let default = opener_for_in(&mt, &object_path(ft::TEXT_PLAIN), ft::TEXT_PLAIN).0;
+    let registrant = if !mk(probe) {
+        String::from("probe-refused")
+    } else if !pref(probe, "org.unaos.fileview") {
+        String::from("set-refused")
+    } else {
+        match opener_for_in(&mt, probe, ft::TEXT_PLAIN) {
+            (op, "override") if op == "fileview" => String::from("ok"),
+            (op, src) => alloc::format!("{}({})", op, src),
+        }
+    };
+    let mut foreign_path = String::from("refused");
+    for v in ["/apps/EVIL.ELF", "launch"] {
+        let r = if pref(probe, v) { opener_for_in(&mt, probe, ft::TEXT_PLAIN) } else { (String::from("set-refused"), "") };
+        if r.1 == "override" || r.0 == v || r.0 != default {
+            foreign_path = alloc::format!("{}:{}({})", v, r.0, r.1);
+            break;
+        }
+    }
+    // A copy within the root keeps the choice; one from another volume does not.
+    let copy = "/system/OTCOPY.TXT";
+    let kept = if pref(probe, "org.unaos.fileview") && mk(copy) {
+        crate::fs::filetype::carry_in(&mt, probe, copy);
+        if has_pref(copy) { "ok" } else { "dropped" }
+    } else {
+        "probe-refused"
+    };
+    let _ = mt.unlink(copy, k);
+    let mut foreign = String::from("none");
+    let mut carried = String::from("skip");
+    let prefixes: Vec<String> = mt.prefixes().into_iter().map(String::from).collect();
+    for pfx in prefixes.iter() {
+        if pfx == "/" || matches!(mt.same_volume(pfx, probe), Ok(true)) || !matches!(mt.write_veto(pfx), Ok(None)) {
+            continue;
+        }
+        let src = alloc::format!("{}/OTPROBE.TXT", pfx.trim_end_matches('/'));
+        if !mk(&src) {
+            continue;
+        }
+        if !pref(&src, "org.unaos.fileview") {
+            let _ = mt.unlink(&src, k);
+            continue; // this volume takes no attributes: nothing to carry
+        }
+        foreign = pfx.clone();
+        let made = mk(copy);
+        crate::fs::filetype::carry_in(&mt, &src, copy);
+        carried = String::from(if !made { "copy-refused" } else if has_pref(copy) { "CARRIED" } else { "stripped" });
+        let _ = mt.unlink(&src, k);
+        let _ = mt.unlink(copy, k);
+        break;
+    }
+    let _ = mt.unlink(probe, k);
+    let pass = registrant == "ok" && foreign_path == "refused" && kept == "ok" && matches!(carried.as_str(), "stripped" | "skip");
+    serial_println!(
+        ":: OPENERTRUST: registrant={} foreign_path={} carried={} -> {} :: kept={} foreign={} default={}",
+        registrant, foreign_path, carried, if pass { "PASS" } else { "FAIL" }, kept, foreign, default
     );
 }

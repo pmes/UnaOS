@@ -384,11 +384,17 @@ pub fn stamp(path: &str) -> bool {
 }
 
 /// Carry `src`'s `una:type` to `dst` (the `cp` leg; `rename` keeps attributes by inode). Copies
-/// `una:preferred` too: a per-file opener choice belongs to the file. Silent when there is nothing to
-/// carry or the destination takes no attributes.
+/// `una:preferred` too WITHIN one volume (a per-file opener choice belongs to the file); across volumes it is
+/// stripped (OPENERTRUST B447). Silent when there is nothing to carry or the destination takes no attributes.
 pub fn carry_in(mt: &MountTable, src: &str, dst: &str) {
     for k in [TYPE_KEY, crate::fs::assoc::PREFERRED_KEY] {
         if let Ok(v) = mt.get_attr(src, k, KERNEL_PRINCIPAL) {
+            // OPENERTRUST (B447): a per-file opener does not cross volumes — a file brought in from a card or another
+            // disk does not bring its own program. An unknown storage identity counts as foreign (`same_storage`).
+            if k == crate::fs::assoc::PREFERRED_KEY && !matches!(mt.same_volume(src, dst), Ok(true)) {
+                serial_println!("[filetype] carry=strip key={} reason=foreign-volume {} -> {}", k, src, dst);
+                continue;
+            }
             match mt.set_attr(dst, k, v, KERNEL_PRINCIPAL) {
                 Ok(()) => serial_println!("[filetype] carry {} {} -> {}", k, src, dst),
                 Err(VfsError::Unsupported) => serial_println!("[filetype] carry=skip reason=enotsup key={} dst={}", k, dst),
@@ -441,6 +447,7 @@ pub fn ensure_tests() {
         #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
         crate::video::quarry::live::columns::ensure_tests();
         #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::quarry::live::quarry3_tests(); crate::fs::appres::ensure_tests(); crate::tests::register("filetypes", crate::fs::assoc::selftest); // QUARRY3 (B413): `tests quarry3` rides this · FILETYPES (B423): `tests filetypes` too registration too. APPRES (B398): `tests appres` rides this registration (no tests.rs line).
+        crate::tests::register("openertrust", crate::fs::assoc::openertrust_selftest); // OPENERTRUST (B447): `tests openertrust` rides this registration (no tests.rs line)
     }
 }
 
