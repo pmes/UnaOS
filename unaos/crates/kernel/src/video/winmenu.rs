@@ -2265,8 +2265,11 @@ pub fn selftest() {
     assert!(CELL_H() == crystal::DROP_CELL_H());
     // SO3 — the caption is carried in two `u64`s, so the window title must fit in sixteen bytes.
     assert!(wm::MAX_TITLE <= 16);
-    // SO3 — the snapshot must hold the app box AND the tenant's full complement of titles.
-    assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 2);
+    // SO3 — the snapshot must hold the app box AND the tenant's full complement of titles. APPMENU2 raised
+    // BAR_BOXES_MAX to MENU_TITLES_MAX + 5 (app, File, Edit, Window, Help) and left this assert at + 2: flight 26
+    // (image 19) panicked here on EVERY boot right after the installer stage and rebooted — the first live run of
+    // the assert. The assert now states the APPMENU2 layout.
+    assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 5);
     // SO3 — the default app menu is legal in the registry it is served from.
     assert!(APP_MENU_DEFAULT.len() <= MENU_ITEMS_MAX);
     // SO3 — `Quit` and `About` must be distinguishable, or `app_pick` cannot route.
