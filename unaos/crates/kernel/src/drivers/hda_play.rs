@@ -53,6 +53,7 @@ static ST: crate::sync::Mutex<St> = crate::sync::Mutex::new(St::new());
 struct Wav { path: String, rate: u32, ch: usize, bits: usize, data_off: u64, data_len: u64, pos: u64, chunk: usize, fed_end: bool, start: u64 }
 static WAV: crate::sync::Mutex<Option<Wav>> = crate::sync::Mutex::new(None);
 static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+static DEC_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); // LOCKREG (B414): the decoder task's id, re-declared at merge17 (the keep-HEAD join dropped it)
 
 /// Converter-format rate bits (BASE/MULT/DIV) for an exact rate, or None. [HDA-SPEC §3.3.41]
 fn rate_bits(rate: u32) -> Option<u16> {
