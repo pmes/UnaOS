@@ -151,7 +151,7 @@ static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// SAFETY: written only from `repaint` on the thread that owns keys (the route that called
 /// `consume_key`, or the ignition that called `open_once`), read by `wm`'s composite — the same benign
 /// present-tear every app surface shares (instgui's contract).
-fn surf() -> &'static mut [u32] { let n = super::super::metrics::size(W) * super::super::metrics::size(H); let mut p = SURF_AT.load(Ordering::Acquire); if p == 0 { let b: &'static mut [u32] = alloc::boxed::Box::leak(alloc::vec![0u32; n].into_boxed_slice()); p = match SURF_AT.compare_exchange(0, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire) { Ok(_) => b.as_mut_ptr() as usize, Err(won) => won }; } unsafe { core::slice::from_raw_parts_mut(p as *mut u32, n) } }
+fn surf() -> &'static mut [u32] { super::super::metrics::leaked_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(H)) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {

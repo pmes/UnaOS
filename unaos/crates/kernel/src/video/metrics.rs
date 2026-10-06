@@ -242,3 +242,23 @@ pub fn text(px: &mut [u32], pw: usize, ph: usize, clip_w: usize, x: usize, y: us
     let pen = crate::video::text::draw_text(px, pw, size(clip_w).min(pw), ph, edge(x), edge(y), s, ink, bold, native_face(face));
     to_logical(pen)
 }
+
+/// SECREVIEW F1 (B442): the leaked per-module surface (`dialog`, `notify`, `bezel`, `instgui`, `login`), sized for
+/// the LIVE scale. Each module used to leak one buffer of `n` words at first use and then build a slice of the
+/// CURRENT `n` over it on every call; `dpi::set_live` (PREFSUI's Resolution dropdown) raises the scale at run time,
+/// so the slice ran past the allocation (a heap overwrite by the painter). Word 0 of each allocation holds its
+/// capacity; a larger `n` leaks a fresh buffer (an old one stays valid for a reader that still holds it).
+pub fn leaked_surf(at: &core::sync::atomic::AtomicUsize, n: usize) -> &'static mut [u32] {
+    use core::sync::atomic::Ordering;
+    loop {
+        let p = at.load(Ordering::Acquire);
+        // SAFETY: a nonzero `p` is only ever a leaked `[u32]` of `cap + 1` words whose word 0 is `cap`, written
+        // before the pointer is published below; `n <= cap` bounds the slice past the header word.
+        if p != 0 && unsafe { *(p as *const u32) } as usize >= n {
+            return unsafe { core::slice::from_raw_parts_mut((p as *mut u32).add(1), n) };
+        }
+        let b: &'static mut [u32] = alloc::boxed::Box::leak(alloc::vec![0u32; n + 1].into_boxed_slice());
+        b[0] = n as u32;
+        let _ = at.compare_exchange(p, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire);
+    }
+}

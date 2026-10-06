@@ -1934,3 +1934,68 @@ pub const fn codes_unique_u8(v: &[u8]) -> bool {
 }
 const _: () = assert!(codes_unique_u64(INPUT_EV_ALL), "SMALLFIX3: two INPUT_EV_* event types share a code");
 const _: () = assert!(codes_unique_u8(BUS_VERB_ALL), "SMALLFIX3: two BUS_VERB_* verbs share a tag");
+
+// SECREVIEW (B442): a bounded host fuzz of every ring-3-facing body parser in this crate — fixed seeds, no
+// dependency, a fixed iteration count. A panic on ring-3 bytes is a finding; the round-trips pin the encoders.
+#[cfg(test)]
+mod secreview_fuzz {
+    extern crate std;
+    use super::*;
+    use std::vec::Vec;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        /// A body biased toward the parsers' structure bytes (separators, small lengths, zeros, high bits).
+        fn body(&mut self, max: usize) -> Vec<u8> {
+            let n = (self.next() as usize) % (max + 1);
+            (0..n).map(|_| match self.next() % 8 { 0 => DIALOG_SEP, 1 => 0, 2 => (self.next() % 8) as u8, 3 => 0xFF, _ => self.next() as u8 }).collect()
+        }
+    }
+
+    #[test]
+    fn parsers_never_panic_on_ring3_bytes() {
+        for seed in [1u64, 0x9E37_79B9_7F4A_7C15, 0xDEAD_BEEF, 42, 7_777_777] {
+            let mut r = Rng(seed);
+            for _ in 0..20_000 {
+                let b = r.body(BUS_BODY_MAX + 64);
+                if let Some(d) = dialog_parse(&b) {
+                    assert!(d.nb as usize <= DIALOG_BTN_MAX);
+                }
+                if let Ok((p, k, rest)) = attr_req_parse(&b) {
+                    assert!(p.len() <= ATTR_PATH_MAX && k.len() <= ATTR_KEY_MAX && p.len() + k.len() + rest.len() + ATTR_REQ_HDR_LEN == b.len());
+                }
+                if let Ok((_, p, used)) = attr_wire_parse(&b) {
+                    assert!(used <= b.len() && p.len() + ATTR_WIRE_HDR_LEN == used);
+                }
+                let _ = whoami_parse(&b);
+                let _ = kdf_parse(&b);
+                let _ = MenuWireItem::from_bytes(&b);
+                if b.len() >= MENU_ITEM_LEN {
+                    let _ = MenuWireItem::from_bytes(&b[..MENU_ITEM_LEN]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dialog_round_trip_under_fuzz() {
+        let mut r = Rng(0x5EC_2026);
+        let mut out = [0u8; 512];
+        for _ in 0..20_000 {
+            let (m, i) = (r.body(60), r.body(60));
+            let nb = (r.next() % 4) as usize;
+            let bs: Vec<Vec<u8>> = (0..nb).map(|_| r.body(12)).collect();
+            let br: Vec<&[u8]> = bs.iter().map(|v| v.as_slice()).collect();
+            if let Some(n) = dialog_body(r.next() as u8, &m, &i, &br, &mut out) {
+                let d = dialog_parse(&out[..n]).expect("an encoded dialog parses");
+                assert!(d.message == &m[..] && d.info == &i[..] && d.nb as usize == nb);
+            }
+        }
+    }
+}
