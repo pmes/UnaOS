@@ -3319,7 +3319,7 @@ fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
         return; // WINDOWCAP3 (B399): no record, no info page
     }
     let info = mem::slot_fb_info_ptr(slot) as *mut u32;
-    let off = mem::FB_INFO_SIZE + (e.rslot as usize) * mem::FB_WIN_SLOT_SIZE;
+    let off = mem::fb_win_info_off(e.rslot as usize); // WINDOWCAP3: a band window's offset is the band's
     unsafe {
         let p = info.add(0x40 / 4 + (e.rslot as usize) * (0x20 / 4));
         p.add(0).write_volatile(FB_MAGIC);
@@ -3587,12 +3587,15 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // were both `WIN_MAX` while the caps were equal; once `WIN_MAX` grew to 12 with `FB_WIN_SLOTS`
     // at 8, a candidate range of `WIN_MAX` would have handed out region slot 8..11 and walked off
     // the end of the slot's FB region — the `-EMFILE` this arm documents would never have fired.
-    let rslot = match (0..mem::FB_WIN_SLOTS)
+    let rslot = match (0..mem::FB_WIN_ROWS) // WINDOWCAP3: the info page's rows, not the record's four
         .find(|&r| !t.iter().any(|e| e.owner == slot && e.rslot as usize == r))
     {
         Some(r) => r,
         None => return EMFILE,
     };
+    if !mem::fb_win_ensure(slot, rslot) {
+        return ENFILE; // WINDOWCAP3: a system limit — the heap had no surface for a window past the record's four
+    }
     let id = match t.iter().position(|e| e.owner == WIN_OWNER_FREE) {
         Some(i) => i,
         None => match win_table_grow(&mut t) {

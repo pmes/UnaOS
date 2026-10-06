@@ -22,13 +22,23 @@ process and every `[_; USER_SLOTS]` sidecar are the same constant.
   their own heap frames in a VA band above the ELF window (the info-page entry's offset field carries
   the VA). WIN_MAX and the ring-3 window table become a growable Vec.
 
-**Milestones:** M1 `SlotVec` + x86 pool heap-backed · M2 x86 sidecars + scratch arrays · M3 x86 windows
-per process + window table growable · M4 wincap `procs=mem` + `tests spawnstorm` · M5 aarch64 (boot.rs,
-mmu_tegra_el0.rs, syscall.rs, xwin.rs) the same.
+**Milestones (as built):** M1+M2 `procslot::SlotVec` (a `SegVec` keyed by slot, the x86 shared row
+inline at a sentinel, aarch64's ASID 0 inline) + the x86 pool as one heap record per slot (`SlotMem`:
+PML4/PDPT/PD/PT + args page + backing) + every x86 per-slot sidecar, the process table (`PROCS`) and the
+ring-3 window table (`WINDOWS`) grown · M4 `wincap`: `procs = min(mem, windows)` (PROC_COST now carries
+the slot record), `asids` gone from the wire, the kernel launchers ask the valve (`proc_admit`), `tests
+spawnstorm` · M5 aarch64: Pi/tegra slot tables (+ Pi backing) heap records, xwin extension records, the
+ASID-keyed sidecars, `PROCS`/`KILLS`/windows grown, the 64-bit DETACHED/HIDDEN ASID words -> `SlotBits`,
+`SLOT_CORE_RES`/`ASID_THREADS` (was `[_; 9]`), every launch asks the valve · M6 x86 windows per process
+past the record's four: region slot >= 4 gets a heap surface in a band above the ELF window
+(`USER_BASE + XWIN_OFF + XWIN_BYTES`), its offset in the info-page entry; bound = the info page's rows
+(126, its TYPE).
 
 **Witness:** `[wm] limit windows=<n> procs=<n> from=mem:<MiB> (R90)` at arming;
 `:: WINDOWCAP3: fixed_pools=none procs_limit=<n> from=mem spawned=<n> refused_at=<n> paused_ms=<n> machine_alive=1 -> PASS ::`
-from `tests spawnstorm`.
+(+ `base= reaped= slots= heap_free_mib=a->b refusal=`) from `tests spawnstorm` (x86).
 
-**Owed:** slot memory returned to the heap on exit (needs CR3 quiescence); stack/heap use measured on
-the next flight.
+**Owed:** slot records returned to the heap on exit (needs a cross-core CR3/TTBR quiescence proof);
+aarch64 windows per process past the four (the band would live in xwin's extension GiB); a
+`tests spawnstorm` twin on aarch64; a 5th-window fixture on x86; stack and heap use measured on the
+next flight.

@@ -738,7 +738,10 @@ pub fn slot_fb_info_ptr(s: usize) -> *mut u8 {
 
 /// WINX-1: kernel identity pointer to slot `s`'s window surface slot `w`.
 pub fn slot_fb_win_surface_ptr(s: usize, w: usize) -> *mut u8 {
-    debug_assert!(slot_known(s) && w < FB_WIN_SLOTS);
+    debug_assert!(slot_known(s) && w < FB_WIN_ROWS);
+    if w >= FB_WIN_SLOTS {
+        return ovf_surface(s, w - FB_WIN_SLOTS); // WINDOWCAP3: a window past the record's four has its own heap surface
+    }
     unsafe { slot_backing_ptr(s).add(FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE) }
 }
 
@@ -747,8 +750,8 @@ pub fn slot_fb_win_surface_ptr(s: usize, w: usize) -> *mut u8 {
 /// computes as `its own window base + 0x5000 + w * FB_WIN_SLOT_SIZE` (slot 0 — the only slot any
 /// shipped program uses — is `base + 0x5000` on both arches, the shared-ABI fact).
 pub fn fb_win_surface_va(w: usize) -> u64 {
-    debug_assert!(w < FB_WIN_SLOTS);
-    super::syscall::USER_BASE + (FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE) as u64
+    debug_assert!(w < FB_WIN_ROWS);
+    super::syscall::USER_BASE + fb_win_off(w) as u64 // WINDOWCAP3: 0..4 at the ABI VAs, 4.. in the band above the ELF window
 }
 
 /// WINX-1: install one leaf of slot `s`'s FB region at byte offset `off` from the window base.
@@ -793,7 +796,11 @@ pub unsafe fn map_slot_fb_info(s: usize) {
 /// NEGOTIATED page-multiple size is mapped; the rest of the 64 KiB VA slot stays unmapped, so a program
 /// that walks past its own surface takes a contained ring-3 fault instead of reading a neighbour window.
 pub unsafe fn map_slot_fb_win(s: usize, w: usize, pages: usize) {
-    debug_assert!(w < FB_WIN_SLOTS && pages <= FB_WIN_SLOT_SIZE / 4096);
+    debug_assert!(w < FB_WIN_ROWS && pages <= FB_WIN_SLOT_SIZE / 4096);
+    if w >= FB_WIN_SLOTS {
+        unsafe { ovf_map(s, w - FB_WIN_SLOTS, pages, true) }; // WINDOWCAP3
+        return;
+    }
     let base = FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE;
     for p in 0..pages {
         unsafe { map_slot_fb_page(s, base + p * 4096, true) };
@@ -805,7 +812,11 @@ pub unsafe fn map_slot_fb_win(s: usize, w: usize, pages: usize) {
 /// live and is cached. The backing bytes are left as they are; `build_slot`'s next tenant zeroes what it
 /// maps, and an unmapped frame is unreachable from ring 3 regardless.
 pub unsafe fn unmap_slot_fb_win(s: usize, w: usize, pages: usize) {
-    debug_assert!(slot_known(s) && w < FB_WIN_SLOTS && pages <= FB_WIN_SLOT_SIZE / 4096);
+    debug_assert!(slot_known(s) && w < FB_WIN_ROWS && pages <= FB_WIN_SLOT_SIZE / 4096);
+    if w >= FB_WIN_SLOTS {
+        unsafe { ovf_map(s, w - FB_WIN_SLOTS, pages, false) }; // WINDOWCAP3
+        return;
+    }
     let base = FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE;
     for p in 0..pages {
         let va = super::syscall::USER_BASE + (base + p * 4096) as u64;
@@ -829,6 +840,9 @@ pub unsafe fn clear_slot_fb(s: usize) {
     debug_assert!(slot_known(s));
     for w in 0..FB_WIN_SLOTS {
         unsafe { unmap_slot_fb_win(s, w, FB_WIN_SLOT_SIZE / 4096) };
+    }
+    for k in 0..ovf_count(s) {
+        unsafe { ovf_map(s, k, FB_WIN_SLOT_SIZE / 4096, false) }; // WINDOWCAP3: the band's leaves go; its surfaces stay with the record (recycled, zeroed at the next create)
     }
     let info_va = super::syscall::USER_BASE + FB_INFO_OFF as u64;
     unsafe {
@@ -4581,4 +4595,111 @@ pub fn stack_guard_frame_free(f: u64) {
     if f != 0 {
         unsafe { alloc::alloc::dealloc(f as *mut u8, Layout::from_size_align(4096, 4096).expect("page layout")) };
     }
+}
+
+// =================================================================================================
+// WINDOWCAP3 (rmbp-ledger B399, R90) — WINDOWS PER PROCESS PAST THE RECORD'S FOUR.
+// -------------------------------------------------------------------------------------------------
+// `FB_WIN_SLOTS` (4) is how many surfaces the slot RECORD carries at the ABI VAs (`base + 0x5000 + w *
+// 0x51000` — slot 0 is what every shipped program computes). It is no longer the per-process window
+// limit: region slot `w >= FB_WIN_SLOTS` gets its own zeroed 4 KiB-aligned heap surface (contiguous, so the
+// compositor reads it exactly as it reads a record surface) mapped ring-3 RW+NX in a band clear of
+// everything else — `USER_BASE + OVF_OFF`, the PD entries above the ELF window, one heap PT per 2 MiB wired
+// on first touch. The info page's entry for `w` carries the band offset, so a program reads where its
+// surface is. The per-process bound is the info page's own row count ([`FB_WIN_ROWS`], its TYPE); the
+// live limit is memory's (`video::wincap`). Surfaces and PTs live with the record (recycled by index, as
+// the record is); window close and teardown clear the leaves.
+// =================================================================================================
+
+/// WINDOWCAP3: region slots a process may hold — the info page's per-window rows (`0x40 + w * 0x20`).
+pub const FB_WIN_ROWS: usize = (FB_INFO_SIZE - 0x40) / 0x20;
+/// WINDOWCAP3: the band's offset from the window base — the first 2 MiB above the ELF window.
+const OVF_OFF: usize = XWIN_OFF + XWIN_BYTES;
+const _: () = assert!(OVF_OFF % (512 * 4096) == 0);
+const _: () = assert!(OVF_OFF + (FB_WIN_ROWS - FB_WIN_SLOTS) * FB_WIN_SLOT_SIZE <= 512 * 512 * 4096); // one PD (1 GiB)
+
+/// Per slot: the kernel identity address of band surface `k` (0 = never allocated).
+static FB_OVF: crate::procslot::SlotVec<spin::Mutex<alloc::vec::Vec<usize>>> =
+    crate::procslot::SlotVec::new(|| spin::Mutex::new(alloc::vec::Vec::new()), spin::Mutex::new(alloc::vec::Vec::new()));
+
+/// WINDOWCAP3: region slot `w`'s byte offset from the window base.
+#[inline]
+fn fb_win_off(w: usize) -> usize {
+    if w < FB_WIN_SLOTS {
+        FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE
+    } else {
+        OVF_OFF + (w - FB_WIN_SLOTS) * FB_WIN_SLOT_SIZE
+    }
+}
+
+/// WINDOWCAP3: the info-page entry's `surface_offset` for region slot `w` (relative to the info page).
+pub fn fb_win_info_off(w: usize) -> usize {
+    fb_win_off(w) - FB_INFO_OFF
+}
+
+/// WINDOWCAP3: make region slot `w` of slot `s` backable — a no-op for the record's four, a heap surface
+/// for the rest. `false` = past the info page's rows, or the heap said no.
+pub fn fb_win_ensure(s: usize, w: usize) -> bool {
+    if w < FB_WIN_SLOTS {
+        return true;
+    }
+    if w >= FB_WIN_ROWS || !slot_known(s) {
+        return false;
+    }
+    let k = w - FB_WIN_SLOTS;
+    let mut v = FB_OVF[s].lock();
+    if v.len() <= k {
+        let need = k + 1 - v.len();
+        if v.try_reserve(need).is_err() {
+            return false;
+        }
+        v.resize(k + 1, 0);
+    }
+    if v[k] == 0 {
+        // SAFETY: non-zero size, page alignment.
+        let p = unsafe { alloc_zeroed(Layout::from_size_align_unchecked(FB_WIN_SLOT_SIZE, 4096)) };
+        if p.is_null() {
+            return false;
+        }
+        v[k] = p as usize;
+    }
+    true
+}
+
+fn ovf_surface(s: usize, k: usize) -> *mut u8 {
+    FB_OVF.peek(s).and_then(|m| m.lock().get(k).copied()).unwrap_or(0) as *mut u8
+}
+
+fn ovf_count(s: usize) -> usize {
+    FB_OVF.peek(s).map_or(0, |m| m.lock().len())
+}
+
+/// WINDOWCAP3: map (`on`) or clear the first `pages` leaves of band surface `k` of slot `s`. A PT is wired
+/// on first touch of its 2 MiB (zeroed heap frame); a clear never allocates.
+unsafe fn ovf_map(s: usize, k: usize, pages: usize, on: bool) {
+    let frame0 = ovf_surface(s, k) as u64;
+    if on && frame0 == 0 {
+        return; // never ensured — nothing to map (the caller's `fb_win_ensure` refused)
+    }
+    let base = OVF_OFF + k * FB_WIN_SLOT_SIZE;
+    for p in 0..pages {
+        let va = super::syscall::USER_BASE + (base + p * 4096) as u64;
+        unsafe {
+            let pde = slot_pd_ptr(s).add(pd_index(va));
+            if *pde & PTE_PRESENT == 0 {
+                if !on {
+                    continue;
+                }
+                let pt = alloc_zeroed(Layout::from_size_align_unchecked(4096, 4096)) as *mut u64;
+                if pt.is_null() {
+                    return;
+                }
+                *pde = (table_pa(pt) & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            }
+            let leaf = ((*pde & PTE_ADDR) as *mut u64).add(pt_index(va));
+            *leaf = if on { ((frame0 + (p as u64) * PAGE_4K) & PTE_ADDR) | PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NX } else { 0 };
+            invlpg(va);
+        }
+    }
+    bump_as_gen(); // SMPBAL-X86: the leaf edits above are core-local
 }
