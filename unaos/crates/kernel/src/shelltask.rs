@@ -49,7 +49,7 @@ pub fn routed(line: &str) -> bool {
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-pub use imp::{ensure_tests, interrupt, out, service, submit, submit_glass};
+pub use imp::{ensure_tests, interrupt, job_tid, out, pending, service, submit, submit_glass};
 
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 mod imp {
@@ -561,6 +561,16 @@ mod imp {
             if reaped { "ok" } else if !held { "no-wedge" } else { "not-reaped" }, locks, kept, DOCK_LINES.load(Relaxed),
             if run_task { "task" } else { "render" }, ABORTS.load(Relaxed), if ok { "PASS" } else { "FAIL" }
         );
+    }
+
+    // ── DOORHEADLESS (B487) — the door's headless console reads the seam ──
+    /// Anything for a render pass to place or start (the idle pass is this load).
+    pub fn pending() -> bool {
+        PENDING.load(Acquire)
+    }
+    /// The last `shell-job` task's id (0 = never spawned).
+    pub fn job_tid() -> u64 {
+        TID.load(Acquire)
     }
 }
 
