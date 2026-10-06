@@ -5,7 +5,7 @@
 //! magic, version or suite, a length that does not add up, trailing bytes or a non-UTF-8 string refuse
 //! the WHOLE file; nothing is partially adopted.
 //!
-//! ## A secret: `/home/<u>/.holocron/<ns>/<name>` (one secret per file)
+//! ## A secret: `/home/<u>/.holocron/<ns>/<name>` (one secret per file; the root is [`crate::root`]'s, B448)
 //!
 //! ```text
 //! off len  field
