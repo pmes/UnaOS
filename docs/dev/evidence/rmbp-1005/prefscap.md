@@ -47,7 +47,7 @@ unless the caller is the kernel client row (the tag exists only for Settings to 
 ## Witness
 
 `tests prefscap` (never at boot, R80):
-`:: PREFSCAP: own=ok foreign=refused system=18-settable declare_cap=64 deputy=<refused/skip> -> PASS ::`
+`:: PREFSCAP: own=ok foreign=refused system=18-settable declare_cap=64 declare_own=1 declare_foreign=refused deputy=refused -> PASS ::` (deputy=skip without `busreg`)
 and at a refusal on the wire: `[prefs] set <ns>.<key> refused: program=<p> may not (PREFSCAP)`.
 
 ## Owed
