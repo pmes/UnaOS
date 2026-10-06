@@ -969,8 +969,6 @@ fn main() {
     if std::env::var("UNAOS_SVG").is_ok() { feats.push("svg"); }
     // VIDEOPLAYER (B434): UNAOS_VIDEO=1 — the Player plays video (video::vplay; links av1_core). Kept in sync with arroyo.
     if std::env::var("UNAOS_VIDEO").is_ok() { feats.push("videoplayer"); }
-    // KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the copy-engine blitter (cpu until KBLIT binds its channel). Kept in sync with arroyo.
-    if std::env::var("UNAOS_WC_BLITTER").map(|v| v == "gpu").unwrap_or(false) { feats.push("wc_gpublit"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words
     // breadcrumbs along the focus-raise/composite chain (x86: bare 16550 at 0x3F8, no lock). Media
     // builds come from THIS list, not arroyo's (the s42/INSTGUI lesson), so the knob is mapped here

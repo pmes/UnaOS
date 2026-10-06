@@ -1251,8 +1251,6 @@ fi
 [ -n "${UNAOS_SVG:-}" ] && _feats="${_feats}svg,"
 # VIDEOPLAYER (B434): UNAOS_VIDEO=1 — the Player plays video (video::vplay over demux_core + vp8_core + av1_core; links av1_core). x86 metal; the K8_FEATS arm in kernel8() compiles the dependency only. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_VIDEO:-}" ] && _feats="${_feats}videoplayer,"
-# KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
-[ "${UNAOS_WC_BLITTER:-}" = "gpu" ] && _feats="${_feats}wc_gpublit,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
