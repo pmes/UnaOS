@@ -17632,7 +17632,7 @@ fn winx2_launcher(_demo_cpu: usize) {
     // APPLOAD: `mount_program_source` — the same ladder the shell's `bg` now walks, which is what
     // "exactly as the shell's x86 `bg` does" was always claiming. The skip line carries the handle
     // census because the old one asserted absence without naming what it had looked at.
-    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+    let Ok(fs) = crate::fs::rootdisk::program_source() else {
         serial_println!(
             ":: WINX-2: no FAT volume on any program-source handle (handles={}) — STAT.ELF end-to-end witness skipped ::",
             crate::drivers::block::source_census()
@@ -19384,7 +19384,7 @@ fn winx8_launcher(_demo_cpu: usize) {
         return;
     }
     // APPLOAD: see `winx2_launcher` — program source, not the global handle alone.
-    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+    let Ok(fs) = crate::fs::rootdisk::program_source() else {
         serial_println!(
             ":: WINX-8: no FAT volume on any program-source handle (handles={}) — VUG.ELF end-to-end witness skipped ::",
             crate::drivers::block::source_census()
@@ -19522,7 +19522,7 @@ fn pulsew_launcher(_demo_cpu: usize) {
         return;
     }
     // APPLOAD: see `winx2_launcher` — program source, not the global handle alone.
-    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+    let Ok(fs) = crate::fs::rootdisk::program_source() else {
         serial_println!(
             ":: PULSE-W: no FAT volume on any program-source handle (handles={}) — PULSE.ELF end-to-end witness skipped ::",
             crate::drivers::block::source_census()
@@ -28730,7 +28730,7 @@ fn session_end_processes(closing: u64, root: bool) -> (usize, usize) {
 /// (no FAT volume, no `STAT.ELF`, loader refused) — the caller prints a SKIP with the reason.
 #[cfg(all(feature = "loginst", feature = "login"))]
 pub fn session_end_fixture() -> (u64, usize, usize, usize, bool, bool, &'static str) {
-    let Ok(fs) = crate::fs::fat::mount_program_source() else { return (0, 0, 0, 0, false, false, "no-fat-volume") };
+    let Ok(fs) = crate::fs::rootdisk::program_source() else { return (0, 0, 0, 0, false, false, "no-fat-volume") };
     let Ok(de) = fs.find_app("STAT.ELF") else { return (0, 0, 0, 0, false, false, "stat-elf-absent") };
     let cap = user_window_size();
     if de.size == 0 || de.size as usize > cap {
@@ -29383,7 +29383,7 @@ fn wc_action_quarry_held(raw: crate::pal::Event) -> bool {
 /// when there is nothing to launch on this medium.
 #[cfg(all(feature = "loginst", feature = "login"))]
 pub fn root_session_launch() -> Result<(u64, usize, bool, bool), &'static str> {
-    let Ok(fs) = crate::fs::fat::mount_program_source() else { return Err("no-fat-volume") };
+    let Ok(fs) = crate::fs::rootdisk::program_source() else { return Err("no-fat-volume") };
     let Ok(de) = fs.find_app("STAT.ELF") else { return Err("stat-elf-absent") };
     let cap = user_window_size();
     if de.size == 0 || de.size as usize > cap {

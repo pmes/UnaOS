@@ -11,35 +11,36 @@
 //!   `/apps` mount (the same backend object and the same relative path: one inode, two paths), a directory made at `/`
 //!   is the one seen under `/volumes/UnaOS/`, and the root's own links (`volumes`, `boot`) are refused under it.
 //!   `shell::vfs_ls_collect` lists the aliased path as `/` ([`unalias`]) minus those links ([`present`]).
-//! * **`/lib`.** The ring-3 libraries leave the program directory: the builder stages `LIB/` at the boot partition's
-//!   root, [`bind_lib`] mounts it at `/lib` (the `/apps` shape: the boot FAT rooted at a directory, volume name `boot`).
-//!   For ONE image `/apps/LIB/…` still resolves on `/lib` ([`compat_rel`]) and says so once per subtree, naming the task.
+//! * **`/lib`.** The ring-3 libraries leave the program directory (`/apps/LIB` → `/lib`). On a FAT root [`bind_lib`]
+//!   mounts the boot FAT's `LIB/` there (the `/apps` shape); the one-image `/apps/LIB` compat is gone (ROOTDISK2).
 //! * **Links drawn as links.** [`mark`]: at `/` (and `/volumes/UnaOS`) the root's special entries take `ls -F`'s `@`.
 //!
-//! Witness: `tests rootdisk` → `:: ROOTDISK: root=UnaOS lib=/lib apps_alias=same-inode
-//! user_dir_at_root=visible-under-volume -> PASS :: …`. Owed (docs/dev/evidence/rmbp-1005/rootdisk.md): `apps`/`lib`
-//! physically on UnaFS, and R94's hot-swap of the system disk.
+//! ROOTDISK2 (rmbp-ledger B401) — R94 in full, "where the new folder is for real": on a NATIVE root `/apps` and `/lib`
+//! are not mounted at all — they are directories of the UnaFS volume (`arroyo` puts them there; `bootdisk::bind_root`
+//! skips the FAT mounts), so the root's only links are `boot` and `volumes`. [`program_source`] is the one place a
+//! ring-0 launcher reads a program: `/apps/<NAME>` through the mount table, whichever volume `/apps` is.
+//!
+//! Witnesses: `tests rootdisk` → `:: ROOTDISK: root=UnaOS lib=/lib apps_alias=same-inode
+//! user_dir_at_root=visible-under-volume -> PASS :: …` and `:: ROOTDISK2: apps=unafs lib=unafs links=volumes-only
+//! rmdir=ok image_mb=<n> -> PASS ::`. Owed: R94's hot swap (docs/dev/evidence/rmbp-1005/rootdisk2.md, design only).
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
-
 use crate::fs::vfs::{MountTable, NodeKind, VfsBackend, VfsError};
 use crate::fs::volumes::ROOT_POINT;
 
 /// Where the ring-3 libraries are seen (R94: "apps/lib should be moved to lib").
 pub const LIB_POINT: &str = "/lib";
-/// Their directory at the boot partition's root (the builder stages `target/LIB` there).
+/// Where programs are seen (`shell::EXEC_ROOT`).
+pub const APPS_POINT: &str = "/apps";
+/// Their directory at the boot partition's root, on a FAT root (the builder stages `target/LIB` there).
 pub const LIB_DIR: &str = "LIB";
-/// The old spelling, resolved on `/lib` for ONE image.
-pub const COMPAT: &str = "/apps/LIB";
-/// The root's special entries: mounts of the boot partition's directories and the Volumes namespace.
-pub const LINKS: [&str; 4] = ["apps", "boot", "lib", "volumes"];
+/// The root's special entries (ROOTDISK2: `apps` and `lib` are real directories of the root volume, not links).
+pub const LINKS: [&str; 2] = ["boot", "volumes"];
 /// The root links that are NOT on the volume (another volume, or the namespace of volumes itself).
 const OFF_VOLUME: [&str; 2] = ["boot", "volumes"];
-
-static COMPAT_HITS: AtomicU32 = AtomicU32::new(0);
-static COMPAT_SAID: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+/// The directory `tests rootdisk` makes and removes to prove `rmdir` (ROOTDISK2).
+const RMDIR_PROBE: &str = "rootdisk2-probe";
 
 /// `path` below `prefix` at a component boundary: the remainder (`/` for the prefix itself).
 fn under<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
@@ -65,46 +66,6 @@ fn alias_live(mt: &MountTable) -> bool {
     mt.prefixes().iter().any(|p| *p == ROOT_POINT) && mt.volume_name("/").map(|n| n == "native").unwrap_or(false)
 }
 
-/// `/apps/LIB…` (FAT spelling, any case) → the remainder below it.
-pub fn compat_rel(path: &str) -> Option<&str> {
-    let head = path.get(..COMPAT.len())?;
-    if !head.eq_ignore_ascii_case(COMPAT) {
-        return None;
-    }
-    let rest = &path[COMPAT.len()..];
-    match rest.as_bytes().first() {
-        None | Some(b'/') => Some(rest),
-        Some(_) => None,
-    }
-}
-
-fn compat_note(path: &str, rest: &str) {
-    COMPAT_HITS.fetch_add(1, Ordering::Relaxed);
-    let sub = String::from(first(rest));
-    let mut said = COMPAT_SAID.lock();
-    if said.iter().any(|s| *s == sub) {
-        return;
-    }
-    said.push(sub);
-    drop(said);
-    serial_println!(
-        "[rootdisk] compat /apps/LIB -> /lib path={} task={} (R94: one image, then it goes) ::",
-        path,
-        current_task()
-    );
-}
-
-fn current_task() -> &'static str {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    {
-        crate::arch::sched::current_name().unwrap_or("kernel")
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        "kernel"
-    }
-}
-
 /// Asked FIRST by `MountTable::resolve`: `Some` when the root disk's rules decide the path, `None` to resolve as before.
 pub fn redirect<'a>(mt: &'a MountTable, path: &'a str) -> Option<Result<(&'a dyn VfsBackend, &'a str), VfsError>> {
     if let Some(inner) = under(path, ROOT_POINT) {
@@ -115,14 +76,6 @@ pub fn redirect<'a>(mt: &'a MountTable, path: &'a str) -> Option<Result<(&'a dyn
             return Some(Err(VfsError::NoSuchPath));
         }
         return Some(mt.resolve(inner));
-    }
-    if let Some(rest) = compat_rel(path) {
-        if !mt.prefixes().iter().any(|p| *p == LIB_POINT) {
-            return None;
-        }
-        let r = mt.resolve(LIB_POINT).map(|(b, _)| (b, rest));
-        compat_note(path, rest);
-        return Some(r);
     }
     None
 }
@@ -155,7 +108,8 @@ pub fn mark(dir: &str, name: &str) -> u8 {
     if is_link(dir, name) { b'@' } else { b'/' }
 }
 
-/// Mount `/lib` — the boot FAT rooted at `LIB/` — beside `/apps`. Called from `bootdisk::bind_root`.
+/// Mount `/lib` — the boot FAT rooted at `LIB/` — beside `/apps`. Called from `bootdisk::bind_root` on a FAT root only
+/// (ROOTDISK2: on a native root `/lib` is the UnaFS volume's own directory).
 pub fn bind_lib(mt: &mut MountTable, src: crate::fs::fat::BlockSource, announce: bool) {
     use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL};
     mt.mount(
@@ -164,7 +118,7 @@ pub fn bind_lib(mt: &mut MountTable, src: crate::fs::fat::BlockSource, announce:
     );
     if announce {
         serial_println!(
-            "[vfs] lib mount /lib = fat boot volume source={} rooted={} (R94: was /apps/LIB) ::",
+            "[vfs] lib mount /lib = fat boot volume source={} rooted={} (R94: fat root) ::",
             src.name(),
             LIB_DIR
         );
@@ -189,11 +143,11 @@ pub fn selftest() {
     }
     let root_tok = if alias_live(&mt) { "UnaOS" } else { "unaliased" };
     let lib_rows = names(LIB_POINT);
-    let stale = mt.stat("/boot/APPS/LIB").is_ok();
+    let stale = mt.stat("/boot/APPS/LIB").is_ok() || mt.stat("/boot/LIB").is_ok() && !mt.prefixes().iter().any(|p| *p == LIB_POINT);
     let lib_tok = match (lib_rows.is_empty(), stale) {
         (false, false) => "/lib",
-        (false, true) => "/lib+stale-apps-LIB",
-        (true, true) => "absent(still-apps-LIB)",
+        (false, true) => "/lib+stale-esp-LIB",
+        (true, true) => "absent(still-on-esp)",
         (true, false) => "absent(unstaged)",
     };
     let alias_rows = names(ROOT_POINT);
@@ -223,7 +177,7 @@ pub fn selftest() {
     let mut made = String::from("-");
     let user = root_rows
         .iter()
-        .find(|(n, d)| *d && !LINKS.iter().chain(["home", "system", "var"].iter()).any(|l| l.eq_ignore_ascii_case(n)))
+        .find(|(n, d)| *d && !LINKS.iter().chain(["apps", "home", "lib", "system", "var", RMDIR_PROBE].iter()).any(|l| l.eq_ignore_ascii_case(n)))
         .map(|(n, _)| n.clone());
     let user = match user {
         Some(u) => Ok(u),
@@ -248,7 +202,7 @@ pub fn selftest() {
     let links: Vec<&str> = root_rows.iter().filter(|(n, d)| *d && is_link("/", n)).map(|(n, _)| n.as_str()).collect();
     let ok = root_tok == "UnaOS" && lib_tok == "/lib" && apps_tok == "same-inode" && user_tok == "visible-under-volume";
     serial_println!(
-        ":: ROOTDISK: root={} lib={} apps_alias={} user_dir_at_root={} -> {} :: made={} user={} compat_hits={} links={} ::",
+        ":: ROOTDISK: root={} lib={} apps_alias={} user_dir_at_root={} -> {} :: made={} user={} links={} ::",
         root_tok,
         lib_tok,
         apps_tok,
@@ -256,7 +210,153 @@ pub fn selftest() {
         if ok { "PASS" } else { "FAIL" },
         made,
         user.as_deref().unwrap_or("-"),
-        COMPAT_HITS.load(Ordering::Relaxed),
         if links.is_empty() { String::from("-") } else { links.join(",") }
     );
+    rootdisk2(&mt, if made == "newfolder" { Some("newfolder") } else { None });
+}
+
+// ── ROOTDISK2 (rmbp-ledger B401, R94 in full) ─────────────────────────────────────────────────────────────────────
+
+/// Does this root carry `/apps` and `/lib` as its own directories? x86 with a native UnaFS root (the rMBP card, the
+/// installed SSD). The Pi and Orin native roots keep the FAT program source by design (their cards stage APPS/ on FAT).
+pub fn apps_on_root(native_root: bool) -> bool {
+    native_root && cfg!(target_arch = "x86_64")
+}
+
+/// `bootdisk::bind_root`, on a NATIVE root: `/apps` and `/lib` are the UnaFS volume's own directories, so nothing is
+/// mounted for them — said once, where the FAT shape says `[vfs] apps mount …` and `[vfs] lib mount …`.
+pub fn announce_native(src: crate::fs::fat::BlockSource) {
+    serial_println!(
+        "[vfs] apps+lib on the native root: /apps /lib are directories of / source={} (R94: real, no links) ::",
+        src.name()
+    );
+}
+
+/// A program as [`program_source`] found it: the `FatFs::find_app` row's two facts the launchers read.
+pub struct AppEnt {
+    pub size: u32,
+    pub is_dir: bool,
+    path: String,
+}
+
+/// The one program source for the ring-0 launchers and witnesses (Lumen, the desktop app, WINX-2/8, PULSE-W, the
+/// loginst STAT fixtures, shotmask): `/apps/<NAME>` through the mount table — the UnaFS directory on a native root,
+/// the boot FAT's `APPS/` on a FAT root. It keeps `FatFs`'s method names so each caller swaps one call on one line.
+pub struct Programs {
+    mt: MountTable,
+}
+
+/// `Err` when no table is bound yet (before any disk enumerated) — the callers' "no program volume" arm.
+pub fn program_source() -> Result<Programs, ()> {
+    let mt = crate::shell::vfs_mount_table();
+    if mt.prefixes().is_empty() {
+        return Err(());
+    }
+    Ok(Programs { mt })
+}
+
+impl Programs {
+    /// `name` in `/apps`, matched exactly first and then case-insensitively (UnaFS names are case-sensitive; the
+    /// callers spell the staged upper-case 8.3 names, and a FAT `APPS/` answers either way).
+    pub fn find_app(&self, name: &str) -> Result<AppEnt, ()> {
+        let exact = alloc::format!("{}/{}", APPS_POINT, name);
+        let path = if self.mt.stat(&exact).is_ok() {
+            exact
+        } else {
+            let rows = self.mt.read_dir(APPS_POINT).map_err(|_| ())?;
+            let hit = rows.iter().find(|r| r.name.eq_ignore_ascii_case(name)).ok_or(())?;
+            alloc::format!("{}/{}", APPS_POINT, hit.name)
+        };
+        let st = self.mt.stat(&path).map_err(|_| ())?;
+        Ok(AppEnt { size: st.size.min(u32::MAX as u64) as u32, is_dir: matches!(st.kind, NodeKind::Dir), path })
+    }
+
+    /// The whole file (at most `max_bytes`) REPLACING `out` — `FatFs::read_file`'s contract (FATREAD-1).
+    pub fn read_file(&self, de: &AppEnt, out: &mut Vec<u8>, max_bytes: usize) -> Result<(), ()> {
+        out.clear();
+        let want = (de.size as usize).min(max_bytes);
+        while out.len() < want {
+            let chunk = self.mt.read(&de.path, out.len() as u64, want - out.len()).map_err(|_| ())?;
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(())
+    }
+}
+
+/// Which volume a root entry is: `unafs` (a directory of the native root, no mount of its own), `fat-link` (a mount
+/// of the boot FAT over the root), `absent`.
+fn home_of(mt: &MountTable, point: &str) -> &'static str {
+    if mt.prefixes().iter().any(|p| *p == point) {
+        return "fat-link";
+    }
+    match mt.stat(point) {
+        Ok(st) if matches!(st.kind, NodeKind::Dir) && mt.volume_name(point).map(|n| n == "native").unwrap_or(false) => "unafs",
+        Ok(_) => "not-native",
+        Err(_) => "absent",
+    }
+}
+
+/// `tests rootdisk`, second line: R94 in full — `/apps` and `/lib` are UnaFS directories, the root's only link is
+/// `volumes` (Quarry's view: `boot` is under Volumes), a directory made at `/` is seen under `/volumes/UnaOS` and is
+/// REMOVED by the VFS `rmdir` (`UnaFS::rmdir`, one CoW transaction) from both paths, and the volume's size.
+/// `made` is the folder ROOTDISK's leg made (removed here too, so the test leaves the root as it found it).
+fn rootdisk2(mt: &MountTable, made: Option<&str>) {
+    use crate::fs::vfs::KERNEL_PRINCIPAL;
+    let apps = home_of(mt, APPS_POINT);
+    let lib = home_of(mt, LIB_POINT);
+    let progs = names(APPS_POINT).iter().filter(|(_, d)| !*d).count();
+    let root = crate::fs::volumes::view("/", names_ents("/"), crate::fs::volumes::boot_alias_bound());
+    let links: Vec<&str> = root.iter().filter(|e| matches!(e.kind, NodeKind::Dir) && is_link("/", &e.name)).map(|e| e.name.as_str()).collect();
+    let links_tok = match links.as_slice() {
+        ["volumes"] => String::from("volumes-only"),
+        [] => String::from("-"),
+        l => l.join("+"),
+    };
+    let probe = alloc::format!("/{}", RMDIR_PROBE);
+    let under = alloc::format!("{}/{}", ROOT_POINT, RMDIR_PROBE);
+    let rmdir_tok: String = match mt.create(&probe, NodeKind::Dir, KERNEL_PRINCIPAL) {
+        Err(e) => alloc::format!("mkdir-failed({:?})", e),
+        Ok(_) => {
+            let seen = mt.stat(&under).is_ok();
+            match mt.remove_dir(&probe, KERNEL_PRINCIPAL) {
+                Err(e) => alloc::format!("rmdir-failed({:?})", e),
+                Ok(()) if !seen => String::from("unseen-under-volume"),
+                Ok(()) if mt.stat(&probe).is_ok() || mt.stat(&under).is_ok() => String::from("still-there"),
+                Ok(()) => String::from("ok"),
+            }
+        }
+    };
+    let cleaned = match made {
+        None => "-",
+        Some(m) => match mt.remove_dir(&alloc::format!("/{}", m), KERNEL_PRINCIPAL) {
+            Ok(()) => "newfolder",
+            Err(_) => "left",
+        },
+    };
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    let image_mb = crate::fs::unafs::with_unafs(|fs| fs.superblock.block_count).map(|b| (b * 4096) >> 20).unwrap_or(0);
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
+    let image_mb = 0u64;
+    let ok = apps == "unafs" && lib == "unafs" && links_tok == "volumes-only" && rmdir_tok == "ok" && cleaned != "left";
+    serial_println!(
+        ":: ROOTDISK2: apps={} lib={} links={} rmdir={} image_mb={} -> {} :: progs={} cleaned={} ::",
+        apps,
+        lib,
+        links_tok,
+        rmdir_tok,
+        image_mb,
+        if ok { "PASS" } else { "FAIL" },
+        progs,
+        cleaned
+    );
+}
+
+fn names_ents(path: &str) -> Vec<crate::fs::vfs::DirEnt> {
+    match crate::shell::vfs_ls_collect(path) {
+        Ok((true, rows)) => rows,
+        _ => Vec::new(),
+    }
 }

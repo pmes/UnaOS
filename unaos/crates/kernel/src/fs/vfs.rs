@@ -552,7 +552,7 @@ impl MountTable {
     /// as long as a root mount exists this never returns
     /// [`VfsError::NoSuchVolume`].
     pub fn resolve<'a>(&'a self, path: &'a str) -> Result<(&'a dyn VfsBackend, &'a str), VfsError> {
-        let path = if path.is_empty() { "/" } else { path }; if let Some(r) = crate::fs::rootdisk::redirect(self, path) { return r; } // ROOTDISK (B390, R94): `/volumes/UnaOS/…` IS `/…` through the whole table; `/apps/LIB/…` resolves on `/lib` for one image. Folded: this file's panic Locations are line-pinned.
+        let path = if path.is_empty() { "/" } else { path }; if let Some(r) = crate::fs::rootdisk::redirect(self, path) { return r; } // ROOTDISK (B390, R94): `/volumes/UnaOS/…` IS `/…` through the whole table; (ROOTDISK2: the one-image `/apps/LIB` compat is deleted). Folded: this file's panic Locations are line-pinned.
         let mut best: Option<&Mount> = None;
         for m in &self.mounts {
             if prefix_claims(&m.prefix, path) {

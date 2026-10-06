@@ -815,7 +815,7 @@ pub fn desktop_app_service() {
 
     // APPLOAD: the same handle ladder the storage gate above cleared — mounting `Default` here after
     // clearing the gate on `program_source` would be the identical defect one line later.
-    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+    let Ok(fs) = crate::fs::rootdisk::program_source() else {
         crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=no-fat-volume name=/{} handles={} — the desktop keeps the console window only",
             DESKTOP_APP, crate::drivers::block::source_census()

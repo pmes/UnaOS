@@ -360,7 +360,7 @@ fn compose(s: State) -> Result<Undo, String> {
         State::Login | State::Setter => Err(String::from("login is not built (UNAOS_LOGIN=1)")),
         #[cfg(all(target_arch = "x86_64", feature = "lumen"))]
         State::Lumen => {
-            let fs = crate::fs::fat::mount_program_source().map_err(|_| String::from("no program volume"))?;
+            let fs = crate::fs::rootdisk::program_source().map_err(|_| String::from("no program volume"))?;
             let cap = crate::arch::syscall::user_image_cap();
             let de = fs.find_app("LUMEN.ELF").map_err(|_| String::from("LUMEN.ELF is not on the volume"))?;
             if de.size == 0 || de.size as usize > cap {
