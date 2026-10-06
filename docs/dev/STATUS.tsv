@@ -91,3 +91,4 @@ ST89	STATUSBASELINE (B437): built on exec-rmbp-statusbaseline @c64d6e77, not flo
 ST90	XHCIMEDIA (B438): built on exec-rmbp-xhcimedia @2c4ff399, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B438
 ST91	DRAGDROP (B440): built on exec-rmbp-dragdrop @52474469, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B440
 ST92	OPENERTRUST (B447): built on exec-rmbp-openertrust @2d433aa7, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B447
+ST93	FWPIN (B455): built on exec-rmbp-fwpin @f22f10d3, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B455
