@@ -3521,8 +3521,8 @@ fn menu_win_focus(_win: wm::WinId) -> bool { false }
 /// nobody will run — Quarry keeps detaching there.
 pub const LINE_LAUNCH_DRAINED: bool = cfg!(all(target_arch = "x86_64", feature = "wc"));
 static LINE_OWED: AtomicBool = AtomicBool::new(false);
-static LINE_SLOT: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
-static LINE_INTERN: spin::Mutex<alloc::vec::Vec<&'static str>> = spin::Mutex::new(alloc::vec::Vec::new());
+static LINE_SLOT: crate::sync::Mutex<Option<&'static str>> = crate::sync::Mutex::new(None);
+static LINE_INTERN: crate::sync::Mutex<alloc::vec::Vec<&'static str>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
 const LINE_INTERN_MAX: usize = 64;
 
 /// POST (never perform) `line` for the shell window, and the shell launch it needs (a live shell raises).
@@ -3625,11 +3625,11 @@ const MODEL_POOL_N: usize = 3;
 
 /// Warm buffers for the per-pass model (`compose` runs every composite tail): a steady desktop reuses
 /// their capacity and never touches the allocator.
-static MODEL_POOL: [spin::Mutex<Model>; MODEL_POOL_N] = [const { spin::Mutex::new(alloc::vec::Vec::new()) }; MODEL_POOL_N];
+static MODEL_POOL: [crate::sync::Mutex<Model>; MODEL_POOL_N] = [const { crate::sync::Mutex::new(alloc::vec::Vec::new()) }; MODEL_POOL_N];
 
 /// A model buffer: a claimed pool buffer, or an owned one when the pool is busy.
 pub(crate) struct ModelBuf {
-    g: Option<spin::MutexGuard<'static, Model>>,
+    g: Option<crate::sync::MutexGuard<'static, Model>>,
     own: Model,
 }
 
@@ -3749,7 +3749,7 @@ const TRASH_POLL_MS: u64 = 2_000;
 static TRASH_FULL: AtomicBool = AtomicBool::new(false);
 static TRASH_POLLED: AtomicU64 = AtomicU64::new(0);
 static TRASH_OPEN_OWED: AtomicBool = AtomicBool::new(false);
-static REVEAL_OWED: spin::Mutex<Option<alloc::string::String>> = spin::Mutex::new(None);
+static REVEAL_OWED: crate::sync::Mutex<Option<alloc::string::String>> = crate::sync::Mutex::new(None);
 static POSITION: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 static AUTOHIDE: AtomicBool = AtomicBool::new(false);
 static REVEALED: AtomicBool = AtomicBool::new(false);
@@ -3770,7 +3770,7 @@ static EXTRA_POS: [core::sync::atomic::AtomicU8; DP_PINS.len()] = {
     a
 };
 static DRAG_FROM: AtomicU32 = AtomicU32::new(u32::MAX);
-static THUMBS: spin::Mutex<alloc::vec::Vec<(wm::WinId, usize, usize, alloc::vec::Vec<u32>)>> = spin::Mutex::new(alloc::vec::Vec::new());
+static THUMBS: crate::sync::Mutex<alloc::vec::Vec<(wm::WinId, usize, usize, alloc::vec::Vec<u32>)>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
 
 const POSITIONS: [&str; 3] = ["bottom", "left", "right"];
 

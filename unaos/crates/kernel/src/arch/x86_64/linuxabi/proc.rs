@@ -40,7 +40,7 @@ pub struct ProcInfo {
     pub reaped: AtomicBool,
     pub freed: AtomicBool,
     pub kill: Arc<crate::arch::sched::KillSwitch>,
-    pub lp: Arc<spin::Mutex<LinuxProc>>,
+    pub lp: Arc<crate::sync::Mutex<LinuxProc>>,
 }
 
 impl ProcInfo {
@@ -55,7 +55,7 @@ impl ProcInfo {
     }
 }
 
-static TABLE: spin::Mutex<Vec<Arc<ProcInfo>>> = spin::Mutex::new(Vec::new());
+static TABLE: crate::sync::Mutex<Vec<Arc<ProcInfo>>> = crate::sync::Mutex::new(Vec::new());
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 pub static FORKS: AtomicU64 = AtomicU64::new(0);
 pub static CHILD_EXIT_OK: AtomicU64 = AtomicU64::new(0);
@@ -122,7 +122,7 @@ pub fn make_info(
         reaped: AtomicBool::new(false),
         freed: AtomicBool::new(false),
         kill,
-        lp: Arc::new(spin::Mutex::new(lp_fill(asp))),
+        lp: Arc::new(crate::sync::Mutex::new(lp_fill(asp))),
     })
 }
 

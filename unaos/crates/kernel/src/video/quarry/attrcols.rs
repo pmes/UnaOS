@@ -66,7 +66,7 @@ pub struct AttrState {
     wrote: u32,
 }
 
-pub static ATTRS: spin::Mutex<AttrState> = spin::Mutex::new(AttrState {
+pub static ATTRS: crate::sync::Mutex<AttrState> = crate::sync::Mutex::new(AttrState {
     dir: String::new(),
     keys: Vec::new(),
     avail: Vec::new(),
@@ -330,7 +330,7 @@ struct Menu {
     items: Vec<Item>,
 }
 
-static MENU: spin::Mutex<Option<Menu>> = spin::Mutex::new(None);
+static MENU: crate::sync::Mutex<Option<Menu>> = crate::sync::Mutex::new(None);
 static MENU_UP: AtomicBool = AtomicBool::new(false);
 
 pub fn menu_up() -> bool {

@@ -54,17 +54,17 @@ const CTRL_Y: usize = 136;
 /// Arrow-key seek step.
 const STEP_MS: u64 = 5_000;
 
-const DIM_TEXT: u32 = 0x0070_6E6A;
-const KNOB_EDGE: u32 = 0x00FF_FFFF;
+const DIM_TEXT: u32 = super::theme::PLAYER_DIM_TEXT;
+const KNOB_EDGE: u32 = super::theme::PLAYER_KNOB_EDGE;
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
-static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
-static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 /// F7/F8/F9 latched by the HID service: 0 none, 1 previous, 2 play/pause, 3 next.
 static MEDIA: AtomicU8 = AtomicU8::new(0);
 /// A transport action the pointer / keys asked for, run on the next pass (an open or a seek re-arms the HDA
 /// stream through the probe: never at click-router depth — `facet::request_open`'s reason).
-static ACT: spin::Mutex<Option<Act>> = spin::Mutex::new(None);
+static ACT: crate::sync::Mutex<Option<Act>> = crate::sync::Mutex::new(None);
 
 #[derive(Clone, Copy)]
 enum Act {

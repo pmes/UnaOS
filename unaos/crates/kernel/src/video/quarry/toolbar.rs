@@ -97,7 +97,7 @@ struct Tb {
     search: Search,
 }
 
-static TB: spin::Mutex<Tb> = spin::Mutex::new(Tb {
+static TB: crate::sync::Mutex<Tb> = crate::sync::Mutex::new(Tb {
     hist: History { back: Vec::new(), fwd: Vec::new(), cur: String::new() },
     view: View::List,
     search: Search { focused: false, active: false, q: String::new(), saved: String::new(), hits: 0, src: "-" },

@@ -57,13 +57,13 @@ impl Thr {
     }
 }
 
-static THREADS: spin::Mutex<Vec<Arc<Thr>>> = spin::Mutex::new(Vec::new());
+static THREADS: crate::sync::Mutex<Vec<Arc<Thr>>> = crate::sync::Mutex::new(Vec::new());
 static NTHR: AtomicUsize = AtomicUsize::new(0);
 /// Scheduler task id -> thread key, for non-leader threads (lock-free: read at the dispatch site).
 static KEYTAB: [(AtomicU64, AtomicU64); 32] = [const { (AtomicU64::new(0), AtomicU64::new(0)) }; 32];
 static NKEY: AtomicUsize = AtomicUsize::new(0);
 /// `set_tid_address` of a leader that has no thread entry yet: `(pid, va)`.
-static LEADER_CTID: spin::Mutex<Vec<(u32, u64)>> = spin::Mutex::new(Vec::new());
+static LEADER_CTID: crate::sync::Mutex<Vec<(u32, u64)>> = crate::sync::Mutex::new(Vec::new());
 pub static SPAWNED: AtomicU64 = AtomicU64::new(0);
 pub static FUTEX_BLOCKED: AtomicU64 = AtomicU64::new(0);
 
@@ -478,7 +478,7 @@ struct Waiter {
     deadline: u64,
 }
 
-static FUTEX: spin::Mutex<Vec<Waiter>> = spin::Mutex::new(Vec::new());
+static FUTEX: crate::sync::Mutex<Vec<Waiter>> = crate::sync::Mutex::new(Vec::new());
 
 fn fx<R>(f: impl FnOnce(&mut Vec<Waiter>) -> R) -> R {
     x86_64::instructions::interrupts::without_interrupts(|| f(&mut FUTEX.lock()))

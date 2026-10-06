@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use lazy_static::lazy_static;
-use spin::Mutex;
+use crate::sync::Mutex;
 use uart_16550::backend::PioBackend;
 use uart_16550::Uart16550Tty;
 

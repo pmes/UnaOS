@@ -77,10 +77,10 @@ static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 static LOADED_N: AtomicU32 = AtomicU32::new(0);
 static SAVED_N: AtomicU32 = AtomicU32::new(0);
 static OPEN_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 /// The session user the file was last loaded for (empty = never loaded).
-static LOADED_FOR: spin::Mutex<String> = spin::Mutex::new(String::new());
-static CUR: spin::Mutex<Values> = spin::Mutex::new(Values::DEFAULT);
+static LOADED_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
+static CUR: crate::sync::Mutex<Values> = crate::sync::Mutex::new(Values::DEFAULT);
 
 /// The persisted values.
 #[derive(Clone)]
@@ -466,7 +466,7 @@ fn paint(st: &mut State, v: &Values) {
         1 => paint_users(st),
         2 => paint_display(st, v),
         4 => paint_login(st), 5 => paint_appearance(st), // APPEARANCE (B408)
-        TP_TAB => paint_trackpad(st), // TRACKPADPANE (B412): TP_TAB = 6
+        6 => paint_trackpad(st), // TRACKPADPANE (B412): TP_TAB = 6 (v.tab is u8)
         _ => paint_about(st),
     }
     // SETTINGSFILES (B407, R98): the pane's file, as a link that reveals `<home>/settings` in Quarry.
@@ -1393,7 +1393,7 @@ struct Drag {
     want: usize,
 }
 
-static DRAG: spin::Mutex<Option<Drag>> = spin::Mutex::new(None);
+static DRAG: crate::sync::Mutex<Option<Drag>> = crate::sync::Mutex::new(None);
 /// Completed drags (the witness reads it).
 static DRAGS: AtomicU32 = AtomicU32::new(0);
 
@@ -1788,6 +1788,7 @@ fn press_appearance(row: usize, cx: usize) {
     };
     super::appearance::choose(kind, i);
     say(key, name, true);
+}
 
 // ── TRACKPADPANE (rmbp-ledger B412, MACPARITY row 16) — the Trackpad tab ───────────────────────────────────────────
 // Row 0 Tracking speed (a slider 1..10 that DRAGS through PREFSUI's capture seam, applied live as one gain on the
@@ -1803,7 +1804,7 @@ pub const TP_TAB: usize = 6; // merge17: APPEARANCE holds 5
 #[derive(Clone, Copy)]
 struct TpVals { speed: u8, tap: bool, natural: bool, secondary: bool, three: bool }
 
-static TPV: spin::Mutex<TpVals> = spin::Mutex::new(TpVals {
+static TPV: crate::sync::Mutex<TpVals> = crate::sync::Mutex::new(TpVals {
     speed: prefs_core::trackpad::SPEED_DEFAULT,
     tap: prefs_core::trackpad::TAP_DEFAULT,
     natural: prefs_core::trackpad::NATURAL_DEFAULT,
@@ -1929,7 +1930,7 @@ fn press_trackpad(row: usize, cx: usize) {
 
 #[derive(Clone, Copy)]
 struct TpDrag { t0: u64, samples: u32, from: u8, at: u64, want: usize, cx: usize }
-static TPD: spin::Mutex<Option<TpDrag>> = spin::Mutex::new(None);
+static TPD: crate::sync::Mutex<Option<TpDrag>> = crate::sync::Mutex::new(None);
 static TP_DRAGS: AtomicU32 = AtomicU32::new(0);
 
 fn tp_speed_at(cx: usize) -> usize { 1 + slider_at(cx, 9) }

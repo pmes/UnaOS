@@ -148,7 +148,7 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 static DEMOTED: AtomicBool = AtomicBool::new(false);
 /// 0 never armed (no takeover on this boot), 1 ok, 2 mismatch, 3 timeout, 4 refused.
 static VERDICT: AtomicU8 = AtomicU8::new(0);
-static REFUSED: spin::Mutex<&'static str> = spin::Mutex::new("-");
+static REFUSED: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("-");
 static JOBS: AtomicU64 = AtomicU64::new(0);
 static GPU_CYC: AtomicU64 = AtomicU64::new(0);
 static BUSY: AtomicU64 = AtomicU64::new(0);
@@ -196,7 +196,7 @@ struct Chan {
     pfn: [[u32; MAXP]; NCACHE],
 }
 
-static CHAN: spin::Mutex<Chan> = spin::Mutex::new(Chan {
+static CHAN: crate::sync::Mutex<Chan> = crate::sync::Mutex::new(Chan {
     put: 0,
     seq: 0,
     sys_next: 0,

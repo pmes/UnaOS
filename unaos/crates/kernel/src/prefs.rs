@@ -102,9 +102,9 @@ pub mod key {
     pub const TP_THREE_DRAG: &str = "trackpad.three_finger_drag";
 }
 
-static TREE: spin::Mutex<PrefTree> = spin::Mutex::new(PrefTree::new());
+static TREE: crate::sync::Mutex<PrefTree> = crate::sync::Mutex::new(PrefTree::new());
 /// The session user the tree was loaded for (`None` = never loaded; `Some("")` = no session).
-static LOADED_FOR: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static LOADED_FOR: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
 static LOADED_N: AtomicU32 = AtomicU32::new(0);
 static SAVED_N: AtomicU32 = AtomicU32::new(0);
 /// The file on disk was refused at load: saves are held so it is never overwritten.
@@ -207,15 +207,15 @@ fn ensure_dirs() {
 // ── SETTINGSFILES state ─────────────────────────────────────────────────────────────────────────
 
 /// Domains whose file refused at load: their saves are HELD so the user's file is never overwritten.
-static HELD_D: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static HELD_D: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 /// Domains whose file is on the volume (at the last load / save) — the reset-on-delete watch list.
-static ON_DISK: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static ON_DISK: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 /// Who made the write in flight when it was not the domain's own pane (the `pref` verb, the fixture).
-static BY: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
+static BY: crate::sync::Mutex<Option<&'static str>> = crate::sync::Mutex::new(None);
 /// One save (or the delete watch) at a time: the swap's unlink window must not read as a user delete.
-static SAVE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static SAVE_LOCK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 /// The programs' declared stanzas (`PrefDeclare`, `app.<name>.*`).
-static DECLARED: spin::Mutex<prefs_core::declare::Registry> = spin::Mutex::new(prefs_core::declare::Registry::new());
+static DECLARED: crate::sync::Mutex<prefs_core::declare::Registry> = crate::sync::Mutex::new(prefs_core::declare::Registry::new());
 /// The old single file was migrated at this boot.
 static MIGRATED: AtomicBool = AtomicBool::new(false);
 static WATCH_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

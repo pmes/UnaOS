@@ -90,7 +90,7 @@
 // which matters because drop-NEWEST would spend any growth on the late boot tags.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// Ring capacity. Sized for the fixed boot phases plus a start/done pair for every root port a real
 /// controller exposes (the rMBP's Panther Point xHCI reports MaxPorts=4..8; QEMU's model reports

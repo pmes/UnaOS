@@ -161,7 +161,7 @@ struct St {
     at: (usize, usize),
 }
 
-static ST: spin::Mutex<St> = spin::Mutex::new(St { cur: None, pend: None, win: wm::WIN_NONE, deadline: 0, shown_s: 0, slide: 0, at: (0, 0) });
+static ST: crate::sync::Mutex<St> = crate::sync::Mutex::new(St { cur: None, pend: None, win: wm::WIN_NONE, deadline: 0, shown_s: 0, slide: 0, at: (0, 0) });
 /// The fixture's model-only mode: no `wm` row, no focus change.
 static HEADLESS: AtomicBool = AtomicBool::new(false);
 static OPENED: AtomicU32 = AtomicU32::new(0);
@@ -495,7 +495,7 @@ pub fn press(x: i32, y: i32) -> bool {
 
 const UN_CAP: usize = 8;
 const UN_NAME: usize = 20;
-static UNSAVED: spin::Mutex<[(u64, [u8; UN_NAME], u8); UN_CAP]> = spin::Mutex::new([(0, [0; UN_NAME], 0); UN_CAP]);
+static UNSAVED: crate::sync::Mutex<[(u64, [u8; UN_NAME], u8); UN_CAP]> = crate::sync::Mutex::new([(0, [0; UN_NAME], 0); UN_CAP]);
 
 /// An app declares (`dirty`) or clears its unsaved state; the Log Out confirm lists the declared names. TEXTEDIT's hook.
 pub fn unsaved_declare(owner: u64, name: &[u8], dirty: bool) {

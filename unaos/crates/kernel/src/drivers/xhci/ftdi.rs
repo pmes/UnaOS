@@ -34,7 +34,7 @@
 
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// FT232 identity as emulated by QEMU `usb-serial` (and the real FT232R cable).
 pub const FTDI_VID: u16 = 0x0403;

@@ -21,7 +21,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::drivers::block::{BlockDeviceInfo, BlockError};
 

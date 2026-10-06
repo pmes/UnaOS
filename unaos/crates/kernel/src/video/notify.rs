@@ -136,7 +136,7 @@ struct In {
     q: [Note; IQ],
     n: usize,
 }
-static INQ: spin::Mutex<In> = spin::Mutex::new(In { q: [Note::EMPTY; IQ], n: 0 });
+static INQ: crate::sync::Mutex<In> = crate::sync::Mutex::new(In { q: [Note::EMPTY; IQ], n: 0 });
 static DROPPED: AtomicU32 = AtomicU32::new(0);
 
 fn enqueue(n: Note) -> bool {
@@ -185,7 +185,7 @@ struct St {
     seq: u32,
 }
 
-static ST: spin::Mutex<St> = spin::Mutex::new(St { cards: [None; STACK_MAX], ring: Vec::new(), center: wm::WIN_NONE, seq: 0 });
+static ST: crate::sync::Mutex<St> = crate::sync::Mutex::new(St { cards: [None; STACK_MAX], ring: Vec::new(), center: wm::WIN_NONE, seq: 0 });
 static HEADLESS: AtomicBool = AtomicBool::new(false);
 static DND: AtomicBool = AtomicBool::new(false);
 static DND_LOADED: AtomicBool = AtomicBool::new(false);

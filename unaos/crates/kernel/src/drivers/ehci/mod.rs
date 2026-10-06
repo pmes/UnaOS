@@ -86,7 +86,7 @@ use alloc::vec::Vec;
 // bury the ordering annotations, which are the part a reader has to check.
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use qh::*;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// EHCI class code (base 0x0C Serial Bus, subclass 0x03 USB, prog-IF 0x20 EHCI).
 const EHCI_CLASS: u8 = 0x0C;

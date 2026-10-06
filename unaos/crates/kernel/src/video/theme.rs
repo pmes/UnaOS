@@ -863,6 +863,9 @@ pub const BEZEL_INK: u32 = 0x00EE_EEF0;
 pub const BEZEL_DIM: u32 = 0x004A_4A50;
 pub const PANIC_INK: u32 = 0x00EC_ECEE;
 pub const PANIC_INK_SMALL: u32 = 0x00A0_A0A6;
+// PLAYER (B419): the player's dim caption and the scrubber knob's edge (moved here at merge17).
+pub const PLAYER_DIM_TEXT: u32 = 0x0070_6E6A;
+pub const PLAYER_KNOB_EDGE: u32 = 0x00FF_FFFF;
 pub const POINTER_FILL: u32 = 0x00FF_FFFF;
 pub const POINTER_SHADOW: u32 = 0x0010_1014;
 pub const PULSE_BG: u32 = 0x0010_0E16;

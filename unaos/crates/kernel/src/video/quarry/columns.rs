@@ -187,7 +187,7 @@ pub struct ColState {
     loaded: bool,
 }
 
-pub static COLS: spin::Mutex<ColState> = spin::Mutex::new(ColState {
+pub static COLS: crate::sync::Mutex<ColState> = crate::sync::Mutex::new(ColState {
     meta: Vec::new(),
     key: SortKey::Name,
     desc: false,

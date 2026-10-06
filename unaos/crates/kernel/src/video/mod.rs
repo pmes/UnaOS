@@ -174,7 +174,7 @@ pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 use unaos_boot_info::FrameBufferInfo;
 
 /// The primary display surface. The GUI renderer (`pal::TargetPal` → `console`) draws here.
@@ -979,8 +979,8 @@ pub mod status;
 //
 // Flight 12's menubar census moved `decl_lock` 0 -> 16 across the menubar fixture and the wire could
 // not say WHICH lock refused (the panel, `WRITER`; or the strip scratch, `strip::SCRATCH`) nor WHO
-// held it. Both are plain `spin::Mutex`es: nothing about a refused `try_lock` names the holder. This
-// type is that `spin::Mutex` plus a holder record written on every successful acquire and cleared on
+// held it. Both are plain `crate::sync::Mutex`es: nothing about a refused `try_lock` names the holder. This
+// type is that `crate::sync::Mutex` plus a holder record written on every successful acquire and cleared on
 // release: the acquiring SITE (`#[track_caller]`, so every existing `WRITER.lock()` call site names
 // itself with no edit there), a caller-supplied TAG (the strip scratch sets its tenant), the CORE,
 // the acquire time in `arch::now_cycles()` units, and whether interrupts were MASKED at acquire — an
@@ -1009,7 +1009,7 @@ pub(crate) fn held_core_arm() {
     }
 }
 
-/// MENULOCK — a `spin::Mutex` with a holder record. See the block above.
+/// MENULOCK — a `crate::sync::Mutex` with a holder record. See the block above.
 pub struct HeldMutex<T> {
     inner: Mutex<T>,
     /// `&'static Location` of the acquiring call, as an address; `0` = free (or not yet recorded).
@@ -1039,7 +1039,7 @@ pub struct Holder {
 /// MENULOCK — the guard: `spin`'s guard plus the record's release.
 pub struct HeldGuard<'a, T> {
     lock: &'a HeldMutex<T>,
-    g: spin::MutexGuard<'a, T, spin::Spin>,
+    g: crate::sync::MutexGuard<'a, T, spin::Spin>,
 }
 
 impl<T> HeldMutex<T> {
@@ -1073,7 +1073,7 @@ impl<T> HeldMutex<T> {
         self.site.store(at as *const _ as usize, Ordering::Release);
     }
 
-    /// `spin::Mutex::lock`, recording the caller as the holder.
+    /// `crate::sync::Mutex::lock`, recording the caller as the holder.
     #[track_caller]
     #[inline]
     pub fn lock(&self) -> HeldGuard<'_, T> {
@@ -1083,7 +1083,7 @@ impl<T> HeldMutex<T> {
         HeldGuard { lock: self, g }
     }
 
-    /// `spin::Mutex::try_lock`, recording the caller as the holder on success.
+    /// `crate::sync::Mutex::try_lock`, recording the caller as the holder on success.
     #[track_caller]
     #[inline]
     pub fn try_lock(&self) -> Option<HeldGuard<'_, T>> {

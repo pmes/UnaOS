@@ -183,7 +183,7 @@ pub mod regs {
 #[cfg(target_arch = "x86_64")]
 use alloc::alloc::{alloc_zeroed, Layout};
 #[cfg(target_arch = "x86_64")]
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

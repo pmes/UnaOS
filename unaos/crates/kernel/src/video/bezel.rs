@@ -60,7 +60,7 @@ static UNTIL: AtomicU64 = AtomicU64::new(0);
 static SHOWN_AT: AtomicU64 = AtomicU64::new(0);
 static WIN: AtomicU32 = AtomicU32::new(0);
 static HEADLESS: AtomicBool = AtomicBool::new(false);
-static GATE: spin::Mutex<()> = spin::Mutex::new(());
+static GATE: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 /// A key moved brightness / volume / mute: show the bezel on the next desktop pass. Atomics only.
 pub fn arm(kind: u8) {

@@ -78,8 +78,8 @@ struct Pend {
     ful_gen: u64,
 }
 
-static REGS: spin::Mutex<[Option<Reg>; REG_CAP]> = spin::Mutex::new([None; REG_CAP]);
-static PEND: spin::Mutex<[Option<Pend>; PEND_CAP]> = spin::Mutex::new([None; PEND_CAP]);
+static REGS: crate::sync::Mutex<[Option<Reg>; REG_CAP]> = crate::sync::Mutex::new([None; REG_CAP]);
+static PEND: crate::sync::Mutex<[Option<Pend>; PEND_CAP]> = crate::sync::Mutex::new([None; PEND_CAP]);
 static NEXT_RELAY: AtomicU32 = AtomicU32::new(1);
 
 /// Witness counters (monotonic since boot).

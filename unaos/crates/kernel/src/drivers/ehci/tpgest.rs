@@ -74,7 +74,7 @@ struct St {
     wit: [u8; 5],
 }
 
-static ST: spin::Mutex<St> = spin::Mutex::new(St {
+static ST: crate::sync::Mutex<St> = crate::sync::Mutex::new(St {
     touching: false, down_ms: 0, travel: 0, max_f: 0, clicked: false, btn_prev: false, held: Held::None,
     three_held: false, res: (0, 0), wheel_acc: 0, wit: [0; 5],
 });

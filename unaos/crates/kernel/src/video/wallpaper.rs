@@ -34,7 +34,7 @@ struct Wall {
     px: Vec<u32>,
 }
 
-static WALL: spin::Mutex<Option<Wall>> = spin::Mutex::new(None);
+static WALL: crate::sync::Mutex<Option<Wall>> = crate::sync::Mutex::new(None);
 /// The desktop layer must repaint (a load or an `off` just changed the backdrop).
 static STALE: AtomicBool = AtomicBool::new(false);
 /// A default-path probe has succeeded or run out of tries (0..=MAX_TRIES attempts; `DONE` latches).

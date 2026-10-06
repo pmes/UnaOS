@@ -32,7 +32,7 @@ use super::{r16, r32, w32, Writes, D11_MACCTL, D11_SHM_CONTROL, D11_SHM_DATA, MA
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// C2's MMIO capture, kept for C3's post-image diff (single writer: `bringup_once`, once per boot).
 static C2_MMIO: Mutex<Vec<Option<u16>>> = Mutex::new(Vec::new());

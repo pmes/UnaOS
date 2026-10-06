@@ -80,7 +80,7 @@ pub struct App {
     pub source: &'static str,
 }
 
-static REG: spin::Mutex<Vec<App>> = spin::Mutex::new(Vec::new());
+static REG: crate::sync::Mutex<Vec<App>> = crate::sync::Mutex::new(Vec::new());
 
 /// A decoded, scaled icon: `argb` is `size * size` straight-alpha pixels (alpha in the top byte).
 struct Pix {
@@ -88,7 +88,7 @@ struct Pix {
     size: usize,
     argb: Vec<u32>,
 }
-static PIX: spin::Mutex<Vec<Pix>> = spin::Mutex::new(Vec::new());
+static PIX: crate::sync::Mutex<Vec<Pix>> = crate::sync::Mutex::new(Vec::new());
 
 static SIGHTS: AtomicUsize = AtomicUsize::new(0);
 static DRAWN: AtomicUsize = AtomicUsize::new(0);

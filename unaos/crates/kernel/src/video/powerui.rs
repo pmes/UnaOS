@@ -55,7 +55,7 @@ pub fn disarm() { ARMED_VERB.store(0, Ordering::Release); }
 
 // ── M2: the battery panel ──────────────────────────────────────────────────────────────────────
 static PANEL: AtomicBool = AtomicBool::new(false);
-static TEXT: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static TEXT: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 /// Panel width in glyphs.
 pub const PANEL_GLYPHS: usize = 34;
 

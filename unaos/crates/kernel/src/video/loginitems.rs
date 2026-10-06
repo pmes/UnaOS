@@ -23,9 +23,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-static ITEMS: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static ITEMS: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 /// The session user the cache was read for (empty = not read).
-static LOADED_FOR: spin::Mutex<String> = spin::Mutex::new(String::new());
+static LOADED_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
 static SAVE_OWED: AtomicBool = AtomicBool::new(false);
 static LAUNCH_OWED: AtomicBool = AtomicBool::new(false);
 /// Items launched at the last login (the witness reads it).

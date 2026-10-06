@@ -400,15 +400,15 @@ struct St {
 }
 
 static WIN: AtomicU32 = AtomicU32::new(0);
-static ST: spin::Mutex<Option<St>> = spin::Mutex::new(None);
-static PROGS: spin::Mutex<Vec<Prog>> = spin::Mutex::new(Vec::new());
-static FILES: spin::Mutex<Vec<search::Hit>> = spin::Mutex::new(Vec::new());
+static ST: crate::sync::Mutex<Option<St>> = crate::sync::Mutex::new(None);
+static PROGS: crate::sync::Mutex<Vec<Prog>> = crate::sync::Mutex::new(Vec::new());
+static FILES: crate::sync::Mutex<Vec<search::Hit>> = crate::sync::Mutex::new(Vec::new());
 static SNAP_OWED: AtomicBool = AtomicBool::new(false);
 static RANK_OWED: AtomicBool = AtomicBool::new(false);
 static PAINT_OWED: AtomicBool = AtomicBool::new(false);
-static PICK: spin::Mutex<Option<Item>> = spin::Mutex::new(None);
-static LRU: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
-static LRU_FOR: spin::Mutex<String> = spin::Mutex::new(String::new());
+static PICK: crate::sync::Mutex<Option<Item>> = crate::sync::Mutex::new(None);
+static LRU: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
+static LRU_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
 static LRU_OWED: AtomicBool = AtomicBool::new(false);
 
 /// Is the Launcher up?

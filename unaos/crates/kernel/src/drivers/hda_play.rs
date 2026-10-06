@@ -48,11 +48,11 @@ impl St {
              run_bit: false, run_ms: 0, lpib0: 0, lpib_last: 0, lpib_moved: false, moved_ms: 0, next_print: 0, level: 0, witnessed: false, tag: 0, armed_ms: 0 }
     }
 }
-static ST: spin::Mutex<St> = spin::Mutex::new(St::new());
+static ST: crate::sync::Mutex<St> = crate::sync::Mutex::new(St::new());
 
 struct Wav { path: String, rate: u32, ch: usize, bits: usize, data_off: u64, data_len: u64, pos: u64, chunk: usize, fed_end: bool, start: u64 }
-static WAV: spin::Mutex<Option<Wav>> = spin::Mutex::new(None);
-static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static WAV: crate::sync::Mutex<Option<Wav>> = crate::sync::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
 
 /// Converter-format rate bits (BASE/MULT/DIV) for an exact rate, or None. [HDA-SPEC §3.3.41]
 fn rate_bits(rate: u32) -> Option<u16> {
@@ -624,11 +624,11 @@ struct DecOut {
     /// `dec_pump` has armed (or refused) this play — it is never armed twice.
     consumed: bool,
 }
-static DEC_OUT: spin::Mutex<Option<DecOut>> = spin::Mutex::new(None);
+static DEC_OUT: crate::sync::Mutex<Option<DecOut>> = crate::sync::Mutex::new(None);
 
 /// The service side's view of the current coded play.
 struct Coded { path: String, info: audio_core::Info, step: usize, armed: bool, fed_end: bool, open_ms: u64 }
-static CODED: spin::Mutex<Option<Coded>> = spin::Mutex::new(None);
+static CODED: crate::sync::Mutex<Option<Coded>> = crate::sync::Mutex::new(None);
 
 /// `open_coded`: hand `path` to a fresh `play-dec` task. Returns at once; the stream is armed by `dec_pump` once the
 /// decoder has read the headers. One decoder at a time: a live (or wedged) one refuses the next open, by name.
@@ -670,7 +670,7 @@ fn dec_beat(stage: u8) {
 /// downmix — runs here, in bounded steps (one `next_i32` call of at most 4096 frames), with a heartbeat between.
 fn dec_task(arg: usize) {
     use audio_core::AudioDecoder;
-    let jid = arg as u32;
+    let jid = arg as u32; #[cfg(target_arch = "x86_64")] DEC_TID.store(crate::sync::here_tid(), Ordering::Release); // LOCKREG (B414): the decoder's task id, so an abort can NAME what it holds and waits on
     let mine = || DEC_GEN.load(Ordering::Acquire) == jid && !DEC_ABORT.load(Ordering::Acquire);
     let paint = dec_stack_paint();
     let path = match DEC_OUT.lock().as_ref() { Some(o) if o.jid == jid => o.path.clone(), _ => { dec_exit(jid, paint, "superseded"); return; } };
@@ -856,7 +856,7 @@ fn dec_watch(jid: u32) -> bool {
             };
             serial_println!("[play] {} stall stage={} frame={} calls={} ms={} -> ABORT", codec, stage_name(stage), frames, DEC_CALLS.load(Ordering::Acquire), silent);
             DEC_STALL.store(stage, Ordering::Release);
-            DEC_ABORT.store(true, Ordering::Release);
+            DEC_ABORT.store(true, Ordering::Release); #[cfg(target_arch = "x86_64")] crate::sync::name_task(DEC_TID.load(Ordering::Acquire), "dec-abort"); // LOCKREG (B414): the wedged decoder's holds and its wait, named (a live task: never released)
             DEC_LIVE.store(false, Ordering::Release); // DECJOBHANG M1: a job the guard ended (a halted task never reaches `dec_exit`) frees the decoder for the next open
             stop();
             dec_end_play();
@@ -1011,8 +1011,8 @@ static DEC_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// `tests play`'s queue: (fmt, path) to play in order, the one now playing (fmt, path, decoder generation before
 /// it), and the shell's own time in the verb. The service tick drives it; the shell is never in it.
-static TQ: spin::Mutex<VecDeque<(&'static str, String)>> = spin::Mutex::new(VecDeque::new());
-static TQ_CUR: spin::Mutex<Option<(&'static str, String, u32)>> = spin::Mutex::new(None);
+static TQ: crate::sync::Mutex<VecDeque<(&'static str, String)>> = crate::sync::Mutex::new(VecDeque::new());
+static TQ_CUR: crate::sync::Mutex<Option<(&'static str, String, u32)>> = crate::sync::Mutex::new(None);
 static TQ_LIVE: AtomicBool = AtomicBool::new(false);
 static TQ_IN: AtomicBool = AtomicBool::new(false);
 static TQ_SHELL_MS: AtomicU64 = AtomicU64::new(0);

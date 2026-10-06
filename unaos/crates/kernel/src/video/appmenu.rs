@@ -52,7 +52,7 @@ const EMPTY: Entry = Entry { count: 0, items: [MenuWireItem::ZERO; MENU_ITEMS_MA
 static OWN: super::rowstore::SegVec<AtomicU64> = super::rowstore::SegVec::new(|| AtomicU64::new(0));
 /// Bit `id-1` set = window `id` of that slot's owner was handed to `winmenu::publish`. Growable both ways.
 static WINS: super::rowstore::SegVec<super::rowstore::SlotBits> = super::rowstore::SegVec::new(super::rowstore::SlotBits::new); // WINDOWCAP-2: bit `id-1`, growable (was one u64 word)
-static TREES: spin::Mutex<Vec<Entry>> = spin::Mutex::new(Vec::new()); // APPMENU2: one entry per slot, grown on claim
+static TREES: crate::sync::Mutex<Vec<Entry>> = crate::sync::Mutex::new(Vec::new()); // APPMENU2: one entry per slot, grown on claim
 static LEAKS: AtomicU32 = AtomicU32::new(0);
 
 // WINDOWCAP-2: `WINS` is a growable SlotBits per slot — no window-count assertion.

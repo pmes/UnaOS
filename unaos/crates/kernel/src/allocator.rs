@@ -17,7 +17,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use linked_list_allocator::Heap;
-use spin::Mutex;
+use crate::sync::Mutex;
 use crate::arch;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;

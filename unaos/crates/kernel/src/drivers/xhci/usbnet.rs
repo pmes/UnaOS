@@ -71,7 +71,7 @@
 //! cfg-gated append or a `#[inline(always)] false` helper, so the knob-off image is unchanged.
 
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// One Ethernet frame with room for a VLAN tag — `net_phy::FRAME_CAP`'s value, restated here so this
 /// file compiles on a build that has no smoltcp seam at all.

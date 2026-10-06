@@ -7,7 +7,7 @@
 // Geometry is published here after SCSI bring-up, and read/write are serviced by locking the xHCI
 // controller.
 
-use spin::Mutex;
+use crate::sync::Mutex;
 use crate::drivers::xhci::{self, CswStatus, XhciClaimError, XhciLoan};
 
 /// MULTIBLK: the largest number of 512-byte blocks ONE `read_blocks`/`write_blocks` call may carry.

@@ -87,7 +87,7 @@
 
 use super::FrameBuffer;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// 8×8 arrow mask, MSB = leftmost pixel. The same SHAPE `pal::cursor` draws, so the pointer is
 /// recognisably the same arrow on the full-screen demo paths and on the desktop — but not the same

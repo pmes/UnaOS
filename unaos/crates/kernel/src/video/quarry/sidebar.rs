@@ -35,7 +35,7 @@ pub(super) struct Ent {
     pub present: bool,
 }
 
-static SIDE: spin::Mutex<Vec<Ent>> = spin::Mutex::new(Vec::new());
+static SIDE: crate::sync::Mutex<Vec<Ent>> = crate::sync::Mutex::new(Vec::new());
 /// Rows the sidebar holds (headers included), read by the GEOMETRY (`Geom::tree_pane`) without a lock.
 static ROWS: AtomicUsize = AtomicUsize::new(10);
 /// The volume generation the rows were derived against. `u64::MAX` = never.

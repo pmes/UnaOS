@@ -57,16 +57,16 @@ static RAMPS_UP: AtomicU32 = AtomicU32::new(0);
 static RAMPS_DOWN: AtomicU32 = AtomicU32::new(0);
 
 /// (afg, mask, data, dir, enable) as the FIRMWARE left them — recorded at the first raise, restored at drop.
-static FW_GPIO: spin::Mutex<Option<(u8, u8, u8, u8, u8)>> = spin::Mutex::new(None);
+static FW_GPIO: crate::sync::Mutex<Option<(u8, u8, u8, u8, u8)>> = crate::sync::Mutex::new(None);
 const MAX_PINS: usize = 4;
 /// Member pins touched this boot: (pin nid, firmware pin control, firmware EAPD word; 0xFFFF = unread).
-static PINS: spin::Mutex<[(u8, u8, u16); MAX_PINS]> = spin::Mutex::new([(0, 0, 0xFFFF); MAX_PINS]);
+static PINS: crate::sync::Mutex<[(u8, u8, u16); MAX_PINS]> = crate::sync::Mutex::new([(0, 0, 0xFFFF); MAX_PINS]);
 /// M2 — the DACs the current stream ramps: (dac nid, target gain, has out amp). Set by [`ramp_prep`].
-static RAMP: spin::Mutex<[(u8, u8, bool); PAIR_MAX]> = spin::Mutex::new([(0, 0, false); PAIR_MAX]);
+static RAMP: crate::sync::Mutex<[(u8, u8, bool); PAIR_MAX]> = crate::sync::Mutex::new([(0, 0, false); PAIR_MAX]);
 /// DACs whose ramp capability line has been printed (bit = nid & 31).
 static RAMP_SAID: AtomicU32 = AtomicU32::new(0);
 /// The amp module's own CORB/RIRB pair (allocated once, re-pointed on every out-of-probe use).
-static SVC: spin::Mutex<Option<(u64, u64)>> = spin::Mutex::new(None);
+static SVC: crate::sync::Mutex<Option<(u64, u64)>> = crate::sync::Mutex::new(None);
 
 pub fn held() -> bool { HELD.load(Ordering::Acquire) }
 pub(super) fn gpio_now() -> u8 { GPIO_UP.load(Ordering::Relaxed) }

@@ -51,8 +51,8 @@ struct Panel {
     path: String,
 }
 
-static REQ: spin::Mutex<Option<Req>> = spin::Mutex::new(None);
-static PANEL: spin::Mutex<Option<Panel>> = spin::Mutex::new(None);
+static REQ: crate::sync::Mutex<Option<Req>> = crate::sync::Mutex::new(None);
+static PANEL: crate::sync::Mutex<Option<Panel>> = crate::sync::Mutex::new(None);
 static OPEN: AtomicBool = AtomicBool::new(false);
 static SHOWN: AtomicU32 = AtomicU32::new(0);
 

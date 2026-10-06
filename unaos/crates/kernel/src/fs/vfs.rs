@@ -2966,14 +2966,14 @@ pub fn rmdir_unafs_witness() {
 pub struct NsMockBackend {
     name: String,
     /// `(volume-relative path, kind, size)`. The root is implicit and is never an entry.
-    nodes: spin::Mutex<Vec<(String, NodeKind, u64)>>,
+    nodes: crate::sync::Mutex<Vec<(String, NodeKind, u64)>>,
 }
 
 #[cfg(feature = "witness")]
 #[doc(hidden)]
 impl NsMockBackend {
     fn new(name: &str) -> Self {
-        Self { name: name.to_string(), nodes: spin::Mutex::new(Vec::new()) }
+        Self { name: name.to_string(), nodes: crate::sync::Mutex::new(Vec::new()) }
     }
     /// The parent directory of `rel`, volume-relative; `""` for a name directly under the root.
     fn parent_of(rel: &str) -> String {

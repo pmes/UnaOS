@@ -67,8 +67,8 @@
 //!
 //! # Locks, and what the input path is allowed to touch
 //!
-//! The registry's slot table is a [`spin::Mutex`], and **every** acquisition on the compose and input
-//! paths is a [`spin::Mutex::try_lock`] whose failure prints a named refusal and declines the pass —
+//! The registry's slot table is a [`crate::sync::Mutex`], and **every** acquisition on the compose and input
+//! paths is a [`crate::sync::Mutex::try_lock`] whose failure prints a named refusal and declines the pass —
 //! LOCKFIX `7847ceea`'s rule (no blocking lock on the input path), and `strip::paint`'s
 //! decline-and-retry shape for the composite one. The *fast* path is cheaper than that: [`LIVE`] is a
 //! relaxed count of published trees, so a boot in which nothing ever publishes touches no lock at all
@@ -276,7 +276,7 @@ static HAS: super::rowstore::SlotBits = super::rowstore::SlotBits::new();
 
 /// The trees themselves, one entry per publishing window, growable. Guarded, and **never acquired
 /// blocking** — see the module header. A removal is a `swap_remove` (no free on the masked reap path).
-static TREES: spin::Mutex<alloc::vec::Vec<(wm::WinId, Tree)>> = spin::Mutex::new(alloc::vec::Vec::new());
+static TREES: crate::sync::Mutex<alloc::vec::Vec<(wm::WinId, Tree)>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
 
 /// How many slots are live. The whole of the fast path: a boot with no publisher answers every
 /// question from this one relaxed load and never reaches the table.

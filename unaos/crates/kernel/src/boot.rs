@@ -195,9 +195,9 @@ static PRE_STARTS: AtomicU32 = AtomicU32::new(0);
 /// WC-D valve episodes that closed while the phase was not Desktop.
 static PRE_VALVE: AtomicU32 = AtomicU32::new(0);
 /// The first pre-Desktop service start's name (for the FAIL line).
-static FIRST_START: spin::Mutex<&'static str> = spin::Mutex::new("");
+static FIRST_START: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("");
 /// Distinct starters the gate held, and the total asks.
-static HELD: spin::Mutex<[&'static str; 16]> = spin::Mutex::new([""; 16]);
+static HELD: crate::sync::Mutex<[&'static str; 16]> = crate::sync::Mutex::new([""; 16]);
 static HELD_ASKS: AtomicU32 = AtomicU32::new(0);
 
 /// `wm::create_inner`: a row is being minted. Pure apart from one atomic add.

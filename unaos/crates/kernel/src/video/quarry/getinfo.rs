@@ -21,7 +21,7 @@ struct Panel {
     note: Option<&'static str>,
 }
 
-static PANEL: spin::Mutex<Option<Panel>> = spin::Mutex::new(None);
+static PANEL: crate::sync::Mutex<Option<Panel>> = crate::sync::Mutex::new(None);
 static UP: AtomicBool = AtomicBool::new(false);
 
 pub fn is_up() -> bool {

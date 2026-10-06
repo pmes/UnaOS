@@ -96,7 +96,7 @@
 //! Its job is that two users with the same password do not share a digest and that no precomputed
 //! table applies; it is not secret and is not claimed to be.
 
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::fs::fat::{FatError, FatFs};
 use crate::hash::crc32;
@@ -1392,7 +1392,7 @@ pub fn login_fixture() {
 /// refuses those at parse time, so a row that is present is a row that is valid).
 ///
 /// This is `home_of`'s shape with the lookup key inverted, and it takes the same one lock for the same
-/// length of time. It is deliberately NOT a slice-returning accessor: `TABLE` is behind a `spin::Mutex`
+/// length of time. It is deliberately NOT a slice-returning accessor: `TABLE` is behind a `crate::sync::Mutex`
 /// and a borrow of a row could not outlive the guard.
 #[cfg(feature = "login")]
 pub fn name_at(i: usize, out: &mut [u8; NAME_MAX]) -> Option<usize> {

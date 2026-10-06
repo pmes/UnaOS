@@ -87,7 +87,7 @@
 use crate::video::keymap::Action;
 use crate::video::termsel::LineSel;
 use alloc::string::String;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// The clipboard's capacity in bytes. A [`set`] longer than this is REFUSED with a witness rather
 /// than truncated: a silently shortened paste is a corrupted one, and the operator has no way to

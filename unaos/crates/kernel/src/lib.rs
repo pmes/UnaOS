@@ -310,3 +310,5 @@ pub mod lockowner;
 
 // DIALOG2 (rmbp-ledger B404): the spawn's explicit ORIGIN (glass / door / system). Tail statement, so no existing line moves.
 pub mod origin;
+// LOCKREG (rmbp-ledger B414): the ONE kernel spin lock type (`sync::Mutex`, over spin's) and its holder registry. Tail statement, so no existing line moves.
+pub mod sync;

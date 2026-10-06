@@ -80,7 +80,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use ::unafs::inode::AttributeValue;
 
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::drivers::block::{self, BlockError};
 use ::unafs::adapter::{

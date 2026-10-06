@@ -51,7 +51,7 @@ struct Entry {
     snapped: (usize, usize, usize),
 }
 const NO_ENTRY: Entry = Entry { live: false, owner: 0, saved: (0, 0, 0), snapped: (0, 0, 0) };
-static SNAP: spin::Mutex<alloc::vec::Vec<Entry>> = spin::Mutex::new(alloc::vec::Vec::new()); // WINDOWCAP-2: one entry per slot, grown on first snap
+static SNAP: crate::sync::Mutex<alloc::vec::Vec<Entry>> = crate::sync::Mutex::new(alloc::vec::Vec::new()); // WINDOWCAP-2: one entry per slot, grown on first snap
 
 /// The zone the live drag's pointer is in (preview armed), or `Z_NONE`.
 static ZONE: AtomicU8 = AtomicU8::new(Z_NONE);

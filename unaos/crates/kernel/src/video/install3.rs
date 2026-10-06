@@ -153,7 +153,7 @@ struct Model {
     mismatch_seen: bool,
 }
 
-static M: spin::Mutex<Option<Model>> = spin::Mutex::new(None);
+static M: crate::sync::Mutex<Option<Model>> = crate::sync::Mutex::new(None);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Set while `tests instgui` drives the screens: `r` never reboots, and the confirm is always DRY.
 static TEST: AtomicBool = AtomicBool::new(false);

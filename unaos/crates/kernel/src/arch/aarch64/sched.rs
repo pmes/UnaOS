@@ -32,7 +32,7 @@ use core::sync::atomic::{
 };
 // spin's Mutex is the low-level SPINLOCK guarding the run queues / sleeper lists; alias it so this
 // module's own sleeping `Mutex<T>` (below) owns the bare name — same split as x86's sched.rs.
-use spin::Mutex as SpinMutex;
+use crate::sync::Mutex as SpinMutex;
 
 use super::percpu::{self, NUM_CPUS};
 use super::timer;
@@ -1474,7 +1474,7 @@ const RQ_STALL_SPINS: u64 = 1 << 26;
 const W4A_PRINT_MAX: u32 = 8;
 static W4A_PRINTS: AtomicU32 = AtomicU32::new(0);
 
-type RqLockGuard = spin::MutexGuard<'static, RunQueue, spin::Spin>;
+type RqLockGuard = crate::sync::MutexGuard<'static, RunQueue, spin::Spin>;
 
 /// WEDGE-4 — one raw byte at the UART, taking NO lock. Same seam as WEDGE-2's breadcrumbs
 /// (`crate::arch::serial::wedge2_raw_byte` is this call): a bounded volatile poll of the PL011 TX-full
@@ -1586,7 +1586,7 @@ impl DerefMut for RqGuard {
 /// WEDGE-4 — take `queue`'s run-queue lock with IRQ MASKED for exactly the length of the hold. This is
 /// the only admissible way to acquire `RUN_QUEUES`.
 ///
-/// `RUN_QUEUES` is a bare `spin::Mutex` with no interrupt discipline of its own, while the scheduler
+/// `RUN_QUEUES` is a bare `crate::sync::Mutex` with no interrupt discipline of its own, while the scheduler
 /// side (`dispatch_next`, `make_ready`, `try_steal`) takes it IRQ-masked. Before this, the spawn and
 /// placement paths took the same lock from ordinary preemptible task context: a timer preempt landing
 /// inside one of those sections froze the holder, and every masked acquisition of that queue then span
@@ -11112,7 +11112,7 @@ fn el0_host_mask() -> u64 {
 //      IN the guard, `BlitGuard`'s idiom in `video/wm.rs`), so a migration cannot decrement a
 //      stranger's counter. A holder that blocks would still leave the hold standing on its old core
 //      until it resumes — which is why the compositor's critical section is verified yield-free:
-//      every lock it takes inside the pass is a `spin::Mutex`, and every `DrainBarrier` (the one
+//      every lock it takes inside the pass is a `crate::sync::Mutex`, and every `DrainBarrier` (the one
 //      structure in that module that can yield) is taken by the MOVE and TEARDOWN paths, outside
 //      `composite_once`.
 //   3. **STARVATION.** The hold is bounded by the pass, and a pass is bounded by the panel: the

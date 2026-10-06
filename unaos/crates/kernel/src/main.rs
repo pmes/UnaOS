@@ -1510,7 +1510,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(target_arch = "x86_64", not(feature = "rast")))]
     if framebuffer_addr != 0 {
         let online = unaos_kernel::arch::smp::online_aps();
-        // Two DISTINCT cores or nothing. `XHCI_CONTROLLER` is a raw `spin::Mutex` and both the
+        // Two DISTINCT cores or nothing. `XHCI_CONTROLLER` is a raw `unaos_kernel::sync::Mutex` and both the
         // service task and the render/shell task take it (the latter through `fat` block reads,
         // `pal::pump_and_poll` inside a full-screen app, and `lsusb`). Kernel tasks are preempted
         // like any other, so two preemptible takers of a raw spinlock on ONE core deadlock it: the
@@ -3746,7 +3746,7 @@ fn serial_to_shell(byte: u8) {
 // established, and phase 6 (`SPIN8_TASK`) says the core was inside a task, not inside its own
 // scheduler loop. The three already-witnessed masked spins all read CLEAN on that capture
 // (`sem_stalls=0`, `futex_stalls=0`, no `[wedge4] preempt-in-section` line), so the spin was on a
-// raw `spin::Mutex` that none of WEDGE-4/5/6 watches.
+// raw `unaos_kernel::sync::Mutex` that none of WEDGE-4/5/6 watches.
 //
 // THE INTERLEAVING, on ONE core:
 //
@@ -5804,7 +5804,7 @@ fn usb_pump(_: usize) {
 // spawn site rather than left to comments:
 //
 //  1. `usb_pump` and `x86_render_service` MUST be on DIFFERENT cores. `XHCI_CONTROLLER` is a raw
-//     `spin::Mutex`, not the scheduler's sleeping `Mutex`, and both tasks take it (the pump directly;
+//     `unaos_kernel::sync::Mutex`, not the scheduler's sleeping `Mutex`, and both tasks take it (the pump directly;
 //     the render side transitively, through `fat` block reads, `pal::pump_and_poll` inside a
 //     full-screen app, and the `lsusb` verb). Kernel tasks ARE preempted (`timer_preempt` acts on
 //     any `current`, not just ring 3), so co-locating two preemptible takers of a raw spinlock on one
@@ -10142,7 +10142,7 @@ fn ptrinstall_rollup() {
 ///
 /// ### PTRLAG (rmbp-ledger B134) — "`WRITER` is copied" was true of the HOLD and false of the ACQUIRE
 /// The paragraph above accounts for every lock on this path except the one it opens with. `*WRITER.lock()`
-/// is a BLOCKING acquire of a raw `spin::Mutex` on the PREEMPTIBLE INPUT BAND — the boot-8 shape LOCKFIX
+/// is a BLOCKING acquire of a raw `unaos_kernel::sync::Mutex` on the PREEMPTIBLE INPUT BAND — the boot-8 shape LOCKFIX
 /// removed from `click_pointer_pos` one function over (`arch/x86_64/syscall.rs`, the `WAS
 /// WRITER.lock().info()` note) while `video/mod.rs`'s door comment already named the input path as the
 /// place that must not make it. PTRINSTALL2 moved the install onto the input core and carried the
@@ -10245,7 +10245,7 @@ fn ptrlag_panel_wh() -> Option<(i32, i32)> {
 /// reach.
 ///
 /// WHY IT IS A GATE AND NOT A TAUTOLOGY. At the pre-PTRLAG code this leg does not FAIL, it HANGS:
-/// `*WRITER.lock()` is a non-reentrant `spin::Mutex` this very block is holding, on one core. That hang
+/// `*WRITER.lock()` is a non-reentrant `unaos_kernel::sync::Mutex` this very block is holding, on one core. That hang
 /// is the boot-8 wedge reproduced with no HID at all, the wall is the bound, and a truncated run is not
 /// a pass (QUEUE §5) — so re-introducing the dependency scores RED by construction rather than by a
 /// threshold somebody has to choose. This is the go-red the B134 row cites.

@@ -34,13 +34,13 @@ pub const PAGE: u64 = 4096;
 static ARMED: AtomicU32 = AtomicU32::new(0);
 static LIVE: AtomicU32 = AtomicU32::new(0);
 static ARM_FAIL: AtomicU32 = AtomicU32::new(0);
-static ARM_WHY: spin::Mutex<&'static str> = spin::Mutex::new("");
+static ARM_WHY: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("");
 /// Serialises the page-table edits (two cores may split the same leaf). Taken with IF=0 only.
-static PT_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static PT_LOCK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 /// The live guarded slabs `(base, len, name)`, for `tests stackroom`. A slab leaves it (under this lock)
 /// before it is freed, so a scan holding the lock never reads freed memory. Full = guarded but unlisted.
 const REG_CAP: usize = 256;
-static REG: spin::Mutex<[(u64, usize, &'static str); REG_CAP]> = spin::Mutex::new([(0, 0, ""); REG_CAP]);
+static REG: crate::sync::Mutex<[(u64, usize, &'static str); REG_CAP]> = crate::sync::Mutex::new([(0, 0, ""); REG_CAP]);
 /// Remote TLB generation: bumped after every unmap; each core drops its global entries when it sees a change.
 static TLB_GEN: AtomicU64 = AtomicU64::new(0);
 static SEEN_GEN: [AtomicU64; crate::arch::gdt::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::arch::gdt::MAX_CPUS];
@@ -155,6 +155,7 @@ pub fn boot_line() {
         serial_println!("[stack] guards armed tasks={} aps={} ist={} bsp={} page={} failed={} why={}", ARMED.load(Ordering::Relaxed), aps, ist, bsp, PAGE, fail, *ARM_WHY.lock());
     }
     crate::tests::register("stackroom", stackroom);
+    crate::sync::arm(); crate::sync::ensure_tests(); // LOCKREG (B414): the holder registry on (per-CPU blocks are up), `tests lockreg`
 }
 
 /// `tests stackroom`: each live task's high mark against its size (the `witness` paint), and the guards.
@@ -222,6 +223,7 @@ extern "C" fn overflow_exit() -> ! {
     // STACKGUARD2 M3: release what the dead task is KNOWN to hold BEFORE its line, so the line reaches the
     // wire (the FTDI ring is the rMBP's wire). Replaces the 20M-spin wait on SERIAL1 + machine-wide panic mode.
     let released = release_held(super::sched::current_task_id(cpu).unwrap_or(0));
+    crate::sync::release_task(super::sched::current_task_id(cpu).unwrap_or(0), "stack-overflow"); // LOCKREG (B414): every OTHER lock the registry holds in the dead task's name, one line
     if let Some((name, base, len)) = super::sched::current_named_slab(cpu) {
         serial_println!(
             "[stack] OVERFLOW task={} stack={:#x}..{:#x} fault={:#x} rip={:#x} via={} -> task halted",
@@ -260,7 +262,7 @@ static CPU_DONE: AtomicU32 = AtomicU32::new(0);
 static BSP_GUARD: AtomicU64 = AtomicU64::new(0);
 static BSP_TOP: AtomicU64 = AtomicU64::new(0);
 static BSP_PAINT_LO: AtomicU64 = AtomicU64::new(0);
-static BSP_WHY: spin::Mutex<&'static str> = spin::Mutex::new("owed(not-reached)");
+static BSP_WHY: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("owed(not-reached)");
 /// Cores that have ticked (IPI-able).
 static ONLINE: AtomicU32 = AtomicU32::new(0);
 /// Per-core #DF depth (reset when a task overflow leaves the #DF path for the dead task's slab).
@@ -534,7 +536,7 @@ fn df_reentry(cpu: usize, cr2: u64, rip: u64) -> ! {
 // ── M3: what a halted task is known to hold ───────────────────────────────────────────────────────────
 
 /// Force-release every `lockowner` lock whose recorded holder is `tid`; the bit set of what was released.
-fn release_held(tid: u64) -> u32 {
+pub(crate) fn release_held(tid: u64) -> u32 {
     use crate::lockowner as lo;
     let mut out = 0u32;
     if lo::held_by(lo::SINK, tid) {

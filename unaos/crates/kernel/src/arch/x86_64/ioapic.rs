@@ -199,12 +199,12 @@ impl Census {
     };
 }
 
-/// A `spin::Mutex` rather than a `Once`: the table is filled INCREMENTALLY by a callback the MADT
+/// A `crate::sync::Mutex` rather than a `Once`: the table is filled INCREMENTALLY by a callback the MADT
 /// walk makes once per entry, and the census writes two fields back into it afterwards. Every taker
 /// runs on the BSP outside interrupt context (the MADT walk at `acpi::init`, the census immediately
 /// after it, and — from rung 2 — a driver's arm during its own `init`), so the lock is never
 /// contended and is never taken from an ISR.
-pub(crate) static CENSUS: spin::Mutex<Census> = spin::Mutex::new(Census::EMPTY);
+pub(crate) static CENSUS: crate::sync::Mutex<Census> = crate::sync::Mutex::new(Census::EMPTY);
 
 /// Census lines emitted. It exists so a boot can say how much of the MADT this module actually
 /// understood without walking the table a second time.

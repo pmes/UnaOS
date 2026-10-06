@@ -18,7 +18,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::arch::{acpi, apic, gdt, interrupts, percpu, sched, syscall};
 
@@ -342,7 +342,7 @@ pub fn worker_cpu(nth: usize) -> Option<usize> {
     worker_pool().0.get(nth).copied()
 }
 
-/// The `n`th core for a PREEMPTIBLE task that takes `XHCI_CONTROLLER` (a raw `spin::Mutex`).
+/// The `n`th core for a PREEMPTIBLE task that takes `XHCI_CONTROLLER` (a raw `crate::sync::Mutex`).
 ///
 /// Excludes BOTH the render core and the service core: `x86_usb_pump` holds that lock on the service
 /// core and the render/shell task holds it on the render core, and two preemptible takers of a raw
