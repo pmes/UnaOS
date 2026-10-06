@@ -2493,3 +2493,247 @@ pub mod host {
     }
 }
 
+// =====================================================================================================
+// KEPLERGR M3 — the GR channel (chid 1) through `host`, behind `tests kgr`. Rung ledger G0..G7, decision
+// tree and unwind: docs/dev/evidence/rmbp-1005/keplergr.md §2/§3/§6. R80: nothing tests at boot — the
+// takeover only reserves the window and prints the one arming line; the fixture runs when the operator asks.
+// DESTRUCTIVE (DRIVERS-METHOD §4): it sets PGRAPH's PMC bit and schedules a channel on GR's runlist with no
+// FECS ucode, so it runs alone, once per boot, after the CE leg, and only when the CE's bind read 00.
+// =====================================================================================================
+
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
+pub mod kgr {
+    use super::host as kf;
+    use super::super::kepler::{mmio_read, mmio_write, VramAllocator};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::*};
+
+    // ---- window layout (offsets from the window base, a VRAM offset == BAR1 offset, KF24) ---------------
+    const K_INST: usize = 0x0000; // instance block (RAMFC + PD pointer)
+    const K_RUNL: usize = 0x1000; // runlist page: one entry (chid 1, 0) — nouveau gk104.c:454-455
+    const K_RUNL0: usize = 0x2000; // the page the unwind's EMPTY commit names (count 0: never read)
+    const K_GPFIFO: usize = 0x3000; // 512 entries x 8 B
+    const K_PUSH: usize = 0x4000; // one pushbuffer page
+    const K_SEM: usize = 0x5000; // the host semaphore the NOP's release writes
+    const K_PD: usize = 0x10000; // page directory (64 KiB reserved like GPUBLIT's, first 4 KiB written)
+    const K_PT: usize = 0x20000; // small-page table under PDE[0]: (span >> 12) x 8 B, at most 256 KiB
+    const K_SPAN: usize = K_PT + ((128usize << 20) >> 12) * 8;
+    const GP_LOG2: u32 = 9; // 512 gpfifo entries
+    /// The NOP's semaphore payload ("KGR1"): any value the zeroed page cannot already hold.
+    const NOP_PAYLOAD: u32 = 0x4B47_5231;
+    /// The GR leg's verdict budget for the semaphore. Generous: the host executes NOP + release itself.
+    const NOP_BUDGET_US: u64 = 20_000;
+    /// PFIFO's PMC bit. // nouveau mc/gk104.c:28 { 0x00000100, NVKM_ENGINE_FIFO }
+    const PMC_PFIFO: u32 = 0x100;
+
+    static BAR0: AtomicUsize = AtomicUsize::new(0);
+    static BAR1: AtomicUsize = AtomicUsize::new(0);
+    static WIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static GR_RL: AtomicU32 = AtomicU32::new(kf::NONE);
+    static GR_ENG: AtomicU32 = AtomicU32::new(kf::NONE);
+    static GR_RST: AtomicU32 = AtomicU32::new(kf::NONE);
+    static RAN: AtomicBool = AtomicBool::new(false);
+
+    #[inline]
+    fn vw(off: usize, v: u32) {
+        let b = BAR1.load(Relaxed);
+        unsafe { core::ptr::write_volatile((b + off) as *mut u32, v) }
+    }
+    #[inline]
+    fn vr(off: usize) -> u32 {
+        let b = BAR1.load(Relaxed);
+        unsafe { core::ptr::read_volatile((b + off) as *const u32) }
+    }
+    #[inline]
+    fn mr(off: usize) -> u32 {
+        unsafe { mmio_read(BAR0.load(Relaxed), off) }
+    }
+    #[inline]
+    fn mw(off: usize, v: u32) {
+        unsafe { mmio_write(BAR0.load(Relaxed), off, v) }
+    }
+    fn opt(v: u32) -> alloc::string::String {
+        if v == kf::NONE { "-".into() } else { alloc::format!("{}", v) }
+    }
+
+    /// Called ONCE from `kepler::init` right after `kepler_gpublit::arm` (the takeover succeeded). Reads PTOP,
+    /// reserves the window, registers `tests kgr`, prints ONE line. No device write (R80/R87).
+    pub fn arm(bar0: usize, bar1: usize, vram: &mut VramAllocator) {
+        BAR0.store(bar0, Release);
+        BAR1.store(bar1, Release);
+        let top = kf::ptop_engine(bar0, 0); // engine type 0 = GR, top/gk104.c:78
+        if let Some(t) = top {
+            GR_RL.store(t.runlist, Release);
+            GR_ENG.store(t.engine, Release);
+            GR_RST.store(t.reset, Release);
+        }
+        let w = vram.alloc(K_SPAN);
+        if let Some(w) = w {
+            WIN.store(w, Release);
+        }
+        crate::tests::register("kgr", tests_kgr);
+        serial_println!(
+            "[kgr] armed chid={} rl={} eng={} reset={} win={} -> tests kgr (destructive: alone, once, after the CE leg)",
+            kf::CHID_GR, opt(GR_RL.load(Relaxed)), opt(GR_ENG.load(Relaxed)), opt(GR_RST.load(Relaxed)),
+            w.map_or(alloc::string::String::from("none"), |w| alloc::format!("{:#x}", w))
+        );
+    }
+
+    fn witness(bind: &str, get: u32, nop: &str, verdict: &str) {
+        serial_println!(":: KGR: bind={} ramfc_get={} nop={} -> {} ::", bind, get, nop, verdict);
+    }
+
+    /// `tests kgr` — the GR channel bound through the ONE path, a host NOP + semaphore release pushed, the
+    /// verdict read, the decode printed, and on any verdict but PASS the unwind EXECUTED.
+    pub fn tests_kgr() {
+        let refuse = |why: &str| witness(&alloc::format!("refused({})", why), 0, "-", "REFUSED");
+        if RAN.swap(true, AcqRel) {
+            return refuse("ran-this-boot");
+        }
+        let (bar0, w, rl) = (BAR0.load(Acquire), WIN.load(Acquire), GR_RL.load(Acquire));
+        if bar0 == 0 || BAR1.load(Acquire) == 0 {
+            return refuse("no-bars");
+        }
+        if w == usize::MAX {
+            return refuse("no-vram-window");
+        }
+        if rl == kf::NONE || rl >= 16 {
+            return refuse("ptop-no-gr");
+        }
+        // DRIVERS-METHOD §4: the destructive rung runs only after the non-destructive one proved the shared table.
+        let ce = kf::last_bind(kf::CHID_CE);
+        if ce != 0 {
+            return refuse(&if ce == kf::NONE { alloc::format!("ce-unbound") } else { alloc::format!("ce-bind={:02X}", ce) });
+        }
+        let Some(utab) = kf::utab() else { return refuse("no-userd-table") };
+        let fbp = mr(kf::FB_BIGPAGE);
+        let span = kf::pde_span(fbp);
+        if w + K_SPAN > span {
+            return refuse("window-beyond-pde0");
+        }
+
+        // ---- lay down: zero, VM (PDE[0] -> identity PT of this window), RAMFC, runlist ------------------
+        for off in [K_INST, K_RUNL, K_RUNL0, K_GPFIFO, K_PUSH, K_SEM, K_PD] {
+            for i in 0..0x400 {
+                vw(w + off + i * 4, 0);
+            }
+        }
+        for i in 0..(span >> 12) * 2 {
+            vw(w + K_PT + i * 4, 0);
+        }
+        let userd = kf::userd_slot(utab, kf::CHID_GR);
+        for i in 0..kf::USERD_SLOT / 4 {
+            vw(userd + i * 4, 0); // gf100_chan_userd_clear: GP_GET/GP_PUT start at 0 (gf100.c:118-131)
+        }
+        let (d0, d1) = kf::pde(w + K_PT);
+        vw(w + K_PD, d0);
+        vw(w + K_PD + 4, d1);
+        let mut p = w;
+        while p < w + K_SPAN {
+            let (e0, e1) = kf::pte(p as u64, false); // VRAM: dw1 0 (the sysmem dw1 5 is GPUBLIT's window's)
+            vw(w + K_PT + (p >> 12) * 8, e0);
+            vw(w + K_PT + (p >> 12) * 8 + 4, e1);
+            p += 0x1000;
+        }
+        let inst = w + K_INST;
+        kf::ramfc_write(&vw, inst, userd, w + K_GPFIFO, GP_LOG2, kf::CHID_GR);
+        kf::inst_pd(&vw, inst, w + K_PD);
+        vw(w + K_RUNL, kf::CHID_GR); // gk104.c:454-455
+        vw(w + K_RUNL + 4, 0);
+
+        // ---- the walls, every pre-image captured by READING it ---------------------------------------------
+        let mut pre = kf::Pre::new();
+        let rst = GR_RST.load(Acquire);
+        let pmc = pre.capture(bar0, kf::PMC_ENABLE);
+        mw(kf::PMC_ENABLE, pmc | PMC_PFIFO | if rst < 32 { 1u32 << rst } else { 0 }); // mc/base.c:57 BIT(reset)
+        let Some(io) = kf::fifo_init(bar0, utab, rl, &mut pre) else {
+            let mut r = alloc::string::String::new();
+            let _ = pre.restore(bar0, &mut r); // nothing bound yet: only the PMC pre-image to put back
+            serial_println!("[kgr] restore{}", r);
+            return refuse("utab-mismatch");
+        };
+        let bo = kf::bind(bar0, kf::CHID_GR, rl, inst);
+        let bind_ok = bo.bind_post & 0xff == 0;
+        let (mut commit, mut nop, mut nop_us) = (None, "-", 0u32);
+        if bind_ok {
+            commit = kf::runlist_commit(bar0, rl, w + K_RUNL, 1);
+            kf::start(bar0, kf::CHID_GR);
+            // NOP, then the host semaphore release of NOP_PAYLOAD at K_SEM (GPU VA == VRAM offset: identity PT).
+            let (push, sem) = (w + K_PUSH, w + K_SEM);
+            let words = [
+                kf::pb_hdr(0, kf::M_HOST_NOP, 1), 0,
+                kf::pb_hdr(0, kf::M_HOST_SEM, 4), (sem >> 32) as u32, sem as u32, NOP_PAYLOAD, kf::SEM_RELEASE_WFI,
+            ];
+            for (i, v) in words.iter().enumerate() {
+                vw(push + i * 4, *v);
+            }
+            // GP entry: ENTRY0 GET 31:2, ENTRY1 GET_HI 7:0 | LENGTH 30:10 (dwords). // cla06f.h:139-148
+            vw(w + K_GPFIFO, (push as u32) & 0xFFFF_FFFC);
+            vw(w + K_GPFIFO + 4, ((push >> 32) as u32) | ((words.len() as u32) << 10));
+            core::sync::atomic::fence(SeqCst);
+            unsafe { core::arch::x86_64::_mm_mfence() };
+            vw(userd + kf::USERD_GP_PUT, 1);
+            let hz = { let h = crate::arch::apic::tsc_hz(); if h == 0 { 1_250_000_000 } else { h } };
+            let (t0, lim) = (crate::arch::now_cycles(), hz.saturating_mul(NOP_BUDGET_US) / 1_000_000);
+            nop = "stuck";
+            loop {
+                let dt = crate::arch::now_cycles().saturating_sub(t0);
+                if vr(sem) == NOP_PAYLOAD {
+                    nop = "ok";
+                    nop_us = kf::cyc_us(dt) as u32;
+                    break;
+                }
+                if dt >= lim {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+
+        // ---- the dump (before any unwind) --------------------------------------------------------------------
+        let (ugt, ramfc_get) = (vr(userd + kf::USERD_GP_GET), vr(inst + 0x14)); // dev_ram.ref:453 (RAMFC GP_GET +0x14)
+        let mut pbs = alloc::string::String::new();
+        for i in 0..4usize {
+            if mr(kf::PB_RUNM + i * 4) & (1 << rl) != 0 {
+                let b = kf::PB_BASE + i * kf::PB_STRIDE;
+                // CHANNEL +0x120 (gf100.c:315-318), live GP_GET +0x14 / GP_PUT +0x00 (gv100 dev_pbdma.ref:425/468)
+                let _ = core::fmt::Write::write_fmt(&mut pbs, format_args!(" pb{}=chan:{:08X}/get:{}/put:{}", i, mr(b + 0x120), mr(b + 0x14), mr(b)));
+            }
+        }
+        let c = kf::PFIFO_CHAN + kf::CHID_GR as usize * 8;
+        let pg = |r: usize| pre.get(r).map_or(alloc::string::String::from("-"), |v| alloc::format!("{:08X}", v));
+        serial_println!(
+            "[kgr] walls bind_pre={:02X} intr_pre={:08X} bind_post={:02X} intr_post={:08X} r2254={}->{:08X} r2a04={}->{:08X} r2630={}->{:08X} pmc={}->{:08X} chan={:08X}/{:08X} ramfc_08={:08X} ramfc_0c={:08X} ramfc_94={:08X} ramfc_e4={:08X} utab={:#x} userd={:#x} commit_us={} gp_get={} gp_put={} ramfc_get={} sem={:08X} nop_us={} fb_page={} pde_span_mb={}{}",
+            io.bind_pre & 0xff, io.intr_pre, bo.bind_post & 0xff, bo.intr_post,
+            pg(kf::USERD_BAR1), mr(kf::USERD_BAR1), pg(kf::R2A04), mr(kf::R2A04), pg(kf::SCHED_DISABLE), mr(kf::SCHED_DISABLE),
+            pg(kf::PMC_ENABLE), mr(kf::PMC_ENABLE), mr(c), mr(c + 4),
+            vr(inst + 0x08), vr(inst + 0x0C), vr(inst + 0x94), vr(inst + 0xE4), utab, userd,
+            commit.map_or(alloc::string::String::from(if bind_ok { "stuck" } else { "-" }), |u| alloc::format!("{}", u)),
+            ugt, vr(userd + kf::USERD_GP_PUT), ramfc_get, vr(w + K_SEM), nop_us,
+            if fbp & 1 != 0 { 16 } else { 17 }, span >> 20, pbs
+        );
+        kf::pfifo_decode(bar0, kf::CHID_GR, GR_ENG.load(Relaxed), rl, kf::FAULT_UNIT_GR);
+
+        // ---- the verdict (keplergr.md §3), then the unwind on anything but PASS -------------------------------
+        let fetched = ugt > 0 || ramfc_get > 0;
+        let verdict = if !bind_ok {
+            "BIND-WALL"
+        } else if commit.is_none() {
+            "COMMIT-WALL"
+        } else if nop == "ok" {
+            "PASS"
+        } else if !fetched {
+            "FETCH-WALL"
+        } else {
+            "EXEC-WALL"
+        };
+        if verdict != "PASS" {
+            let _ = kf::unwind(bar0, kf::CHID_GR, rl, w + K_RUNL0, &pre);
+        }
+        let bname = if bind_ok {
+            alloc::string::String::from("ok")
+        } else {
+            alloc::format!("{}({:02X})", kf::bind_name(bo.bind_post), bo.bind_post & 0xff)
+        };
+        witness(&bname, core::cmp::max(ugt, ramfc_get), nop, verdict);
+    }
+}
