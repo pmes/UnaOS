@@ -2199,9 +2199,10 @@ pub mod attr_keys {
 //   `SYS_RINGKEY(RINGKEY_OP_REPORT, status, mode)` -> 0: Holocron's answer to the door (a holocron_core
 //       wire status, 0 = OK) and the mode it applied (`RINGKEY_MODE_*`, or `RINGKEY_MODE_LOCKED` after a lock).
 //
-// Door layout (RINGKEY_LEN = 72): [0] mode (1 create, 2 open) · [1..4] zero · [4..8] m_kib LE · [8..12] t LE ·
-// [12..16] p LE · [16..32] salt · [32..64] the ring key · [64..72] the login's ms clock at the submit (LE).
-// x86_64 under the kernel feature `lumen`; elsewhere the unknown-syscall default.
+// Door layout (RINGKEY_LEN = 104): [0] mode (1 create, 2 open, 4 rekey) · [1..4] zero · [4..8] m_kib LE · [8..12]
+// t LE · [12..16] p LE · [16..32] salt · [32..64] the ring key · [64..72] the login's ms clock at the submit (LE) ·
+// [72..104] RINGLOGIN2 (B479): the OLD ring key of a REKEY (a password change; zero otherwise).
+// Both arches under the kernel feature `lumen` (RINGLOGIN2 added the aarch64 arm); elsewhere the unknown-syscall default.
 // =================================================================================================
 
 /// `SYS_RINGKEY(op, a1, a2)` — see the block above.
@@ -2222,8 +2223,11 @@ pub const RINGKEY_MODE_CREATE: u8 = 1;
 pub const RINGKEY_MODE_OPEN: u8 = 2;
 /// Report mode: the ring was locked on a `RINGKEY_LOCK`.
 pub const RINGKEY_MODE_LOCKED: u8 = 3;
+/// RINGLOGIN2 (B479): door mode — a password change: re-wrap the ring from `old_key` to `key` (both derived at the
+/// ring's own salt and parameters, which are kept).
+pub const RINGKEY_MODE_REKEY: u8 = 4;
 /// Door bytes.
-pub const RINGKEY_LEN: usize = 72;
+pub const RINGKEY_LEN: usize = 104;
 const _: () = assert!(SYS_RINGKEY == SYS_KDF + 1);
 
 /// A decoded door.
@@ -2241,6 +2245,8 @@ pub struct RingDoor {
     pub key: [u8; 32],
     /// The login's ms clock when the submit derived it.
     pub t0_ms: u64,
+    /// RINGLOGIN2: a REKEY's old ring key (zero for create / open).
+    pub old_key: [u8; 32],
 }
 
 /// Encode `d` into `out`.
@@ -2253,11 +2259,12 @@ pub fn ringdoor_encode(d: &RingDoor, out: &mut [u8; RINGKEY_LEN]) {
     out[16..32].copy_from_slice(&d.salt);
     out[32..64].copy_from_slice(&d.key);
     out[64..72].copy_from_slice(&d.t0_ms.to_le_bytes());
+    out[72..104].copy_from_slice(&d.old_key);
 }
 
 /// Decode a door; `None` for an unknown mode or a nonzero reserved byte.
 pub fn ringdoor_parse(b: &[u8; RINGKEY_LEN]) -> Option<RingDoor> {
-    if !(b[0] == RINGKEY_MODE_CREATE || b[0] == RINGKEY_MODE_OPEN) || b[1..4] != [0, 0, 0] {
+    if !(b[0] == RINGKEY_MODE_CREATE || b[0] == RINGKEY_MODE_OPEN || b[0] == RINGKEY_MODE_REKEY) || b[1..4] != [0, 0, 0] {
         return None;
     }
     let u = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
@@ -2267,7 +2274,9 @@ pub fn ringdoor_parse(b: &[u8; RINGKEY_LEN]) -> Option<RingDoor> {
     key.copy_from_slice(&b[32..64]);
     let mut t0 = [0u8; 8];
     t0.copy_from_slice(&b[64..72]);
-    Some(RingDoor { mode: b[0], m_kib: u(4), t: u(8), p: u(12), salt, key, t0_ms: u64::from_le_bytes(t0) })
+    let mut old_key = [0u8; 32];
+    old_key.copy_from_slice(&b[72..104]);
+    Some(RingDoor { mode: b[0], m_kib: u(4), t: u(8), p: u(12), salt, key, t0_ms: u64::from_le_bytes(t0), old_key })
 }
 
 #[cfg(test)]
@@ -2275,10 +2284,13 @@ mod ringlogin_tests {
     use super::*;
     #[test]
     fn ringdoor_round_trip() {
-        let d = RingDoor { mode: RINGKEY_MODE_OPEN, m_kib: WINDOW2_KDF_M_KIB, t: WINDOW2_KDF_T, p: WINDOW2_KDF_P, salt: [3; 16], key: [9; 32], t0_ms: 12345 };
+        let d = RingDoor { mode: RINGKEY_MODE_OPEN, m_kib: WINDOW2_KDF_M_KIB, t: WINDOW2_KDF_T, p: WINDOW2_KDF_P, salt: [3; 16], key: [9; 32], t0_ms: 12345, old_key: [0; 32] };
         let mut b = [0u8; RINGKEY_LEN];
         ringdoor_encode(&d, &mut b);
         assert_eq!(ringdoor_parse(&b), Some(d));
+        let r = RingDoor { mode: RINGKEY_MODE_REKEY, old_key: [5; 32], ..d };
+        ringdoor_encode(&r, &mut b);
+        assert_eq!(ringdoor_parse(&b), Some(r));
         b[0] = 7;
         assert_eq!(ringdoor_parse(&b), None);
     }

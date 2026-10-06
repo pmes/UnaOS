@@ -301,7 +301,7 @@ pub fn ring_login(name: &[u8], password: &[u8]) {
             }
         };
         let mut door = [0u8; una_abi::RINGKEY_LEN];
-        una_abi::ringdoor_encode(&una_abi::RingDoor { mode, m_kib: m, t, p, salt, key, t0_ms: t0 }, &mut door);
+        una_abi::ringdoor_encode(&una_abi::RingDoor { mode, m_kib: m, t, p, salt, key, t0_ms: t0, old_key: [0; 32] }, &mut door);
         wipe(&mut key);
         {
             let mut d = DOOR.lock();
@@ -375,6 +375,9 @@ pub fn door_report(holder: bool, uid: u32, status: i32, mode: u8) -> i64 {
     if !holder || uid == 0 {
         return una_abi::EACCES;
     }
+    if mode == una_abi::RINGKEY_MODE_REKEY {
+        return rekey_report(status); // RINGLOGIN2 (B479): a password change's answer — its own witness, not the login's
+    }
     RL_STATUS.store(status, core::sync::atomic::Ordering::Relaxed);
     RL_MODE.store(mode, core::sync::atomic::Ordering::Relaxed);
     let user = session().map(|(n, _, _)| n).unwrap_or_default();
@@ -382,6 +385,7 @@ pub fn door_report(holder: bool, uid: u32, status: i32, mode: u8) -> i64 {
     match (mode, status) {
         (una_abi::RINGKEY_MODE_LOCKED, _) => serial_println!("[holocron] ring=locked at=lock-screen user={}", user),
         (_, 0) => serial_println!("[holocron] ring={} at=login user={} ms={}", if mode == una_abi::RINGKEY_MODE_CREATE { "created" } else { "opened" }, user, ms),
+        (_, s) if s == holocron_core::wire::status::BAD_PASSWORD && RL_REFUSAL_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) => {} // RINGLOGIN2: said ONCE per boot (a lock-screen unlock asks again)
         (_, s) => serial_println!("[holocron] ring=refused at=login user={} status={} ({})", user, s, status_word(s)),
     }
     0
@@ -390,7 +394,7 @@ pub fn door_report(holder: bool, uid: u32, status: i32, mode: u8) -> i64 {
 fn status_word(s: i32) -> &'static str {
     use holocron_core::wire::status as st;
     match s {
-        st::BAD_PASSWORD => "bad-password: the ring was made under another password; `holocron unlock` opens it",
+        st::BAD_PASSWORD => "bad-password: the ring is under another password (a `holocron init`, or a password reset by the administrator, which cannot re-key it); `holocron unlock <that password>` opens it",
         st::EXISTS => "exists",
         st::NO_RING => "no-ring",
         st::IO => "io",
@@ -419,10 +423,14 @@ pub fn ringlogin_selftest() {
         una_abi::RINGKEY_MODE_OPEN => "opened",
         _ => "none",
     };
+    let rekey = rekey_fixture(); // RINGLOGIN2 (B479)
+    let arm = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86" };
+    let pass = reconnect && rekey;
     serial_println!(
-        ":: RINGLOGIN: ring={} at={} reconnect_before_unlock={} door={} posted={} taken={} report={} -> {} ::",
-        ring, if at_login { "login" } else { "none" }, if reconnect { "ok" } else { "FAIL" }, made, posted, taken,
-        if st == i32::MIN { "none" } else { status_word_short(st) }, if reconnect { "PASS" } else { "FAIL" }
+        ":: RINGLOGIN: ring={} at={} reconnect_before_unlock={} rekey={} arm={} passwd_rekeyed={} door={} posted={} taken={} report={} -> {} ::",
+        ring, if at_login { "login" } else { "none" }, if reconnect { "ok" } else { "FAIL" }, if rekey { "ok" } else { "FAIL" }, arm,
+        RL_REKEYED.load(Relaxed), made, posted, taken,
+        if st == i32::MIN { "none" } else { status_word_short(st) }, if pass { "PASS" } else { "FAIL" }
     );
 }
 
@@ -450,4 +458,182 @@ fn live_state() -> Option<holocron_core::wire::RingState> {
     }
     #[cfg(not(all(feature = "lumen", feature = "busreg", feature = "login")))]
     None
+}
+
+// =================================================================================================
+// RINGLOGIN2 (rmbp-ledger B479) — THE RING FOLLOWS THE PASSWORD. TAIL-APPENDED.
+//
+// `passwd` (fs::users, the session's own row) asks the CURRENT password first and verifies it; once the new
+// credential is written it calls [`ring_rekey`]: the ring HEADER is read, BOTH keys are derived with [`kdf`] at
+// the header's salt and parameters (which the re-wrap keeps), and a REKEY door (una-abi `RINGKEY_MODE_REKEY`, the
+// old key beside the new) is posted for HOLOCRON.ELF, which re-wraps through `holocron_core`'s ONE re-wrap
+// (`Ring::rewrap_keyed`, via `Holocron::rekey_with_keys`) and reports; [`rekey_report`] says the witness. A
+// failed re-wrap keeps the old ring (holocron_core writes nothing until the re-wrap succeeds, and puts back
+// what a failed write touched). An administrator's reset has no old password: the ring is NOT re-keyed
+// ([`ring_kept_admin_reset`] says so once), and the next login's refusal is said once with the way back.
+// Design: docs/dev/evidence/rmbp-1005/ringlogin2.md.
+// =================================================================================================
+
+/// A login refusal (bad-password) was said this boot — it is said once.
+static RL_REFUSAL_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Re-wraps reported OK this boot, and the posted REKEY's clock.
+static RL_REKEYED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RL_REKEY_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SYS_KDF's body over `password` at `salt` and parameters — the key or the wire's reason word.
+#[cfg(all(feature = "lumen", feature = "login"))]
+fn derive_at(password: &[u8], salt: &[u8; 16], m: u32, t: u32, p: u32) -> Result<[u8; 32], &'static str> {
+    let mut req = alloc::vec![0u8; una_abi::KDF_HDR_LEN + password.len() + salt.len()];
+    let Some(n) = una_abi::kdf_request(m, t, p, password, salt, &mut req) else {
+        wipe(&mut req);
+        return Err("password-length");
+    };
+    let r = kdf(&req[..n]);
+    wipe(&mut req);
+    r.map_err(|e| if e == una_abi::ENOMEM { "kdf-enomem" } else { "kdf-refused" })
+}
+
+/// `passwd`'s half: `name`'s password changed from `old` (verified by the caller) to `new` (already written).
+/// Derives both ring keys and posts a REKEY door; starts HOLOCRON.ELF when it is not running. One line.
+pub fn ring_rekey(name: &[u8], old: &[u8], new: &[u8]) {
+    #[cfg(all(feature = "lumen", feature = "login"))]
+    {
+        let t0 = crate::arch::ms();
+        let Some(uid) = crate::fs::users::id_of(name) else { return };
+        let mut h = [0u8; crate::fs::users::HOME_MAX];
+        let Some(hl) = crate::fs::users::home_of(name, &mut h) else { return };
+        let Ok(home) = core::str::from_utf8(&h[..hl]) else { return };
+        let hdr = match ring_bytes(home) {
+            Ok(Some(b)) => match holocron_core::format::parse_ring(&b) {
+                Ok((hdr, _, _)) => hdr,
+                Err(_) => {
+                    serial_println!("[holocron] door none at=passwd reason=ring-unparsed (the ring is NOT re-keyed; Holocron says CORRUPT on its own read)");
+                    return;
+                }
+            },
+            Ok(None) => {
+                serial_println!("[holocron] ring=none at=passwd (nothing to re-key: the next login makes the ring under the new password)");
+                return;
+            }
+            Err(why) => {
+                serial_println!("[holocron] door none at=passwd reason={} (the ring is NOT re-keyed)", why);
+                return;
+            }
+        };
+        let (m, t, p) = (hdr.kdf.m_kib, hdr.kdf.t, hdr.kdf.p);
+        let mut k_old = match derive_at(old, &hdr.salt, m, t, p) {
+            Ok(k) => k,
+            Err(why) => {
+                serial_println!("[holocron] door none at=passwd reason={} m_kib={} t={} p={} (the ring is NOT re-keyed)", why, m, t, p);
+                return;
+            }
+        };
+        let mut k_new = match derive_at(new, &hdr.salt, m, t, p) {
+            Ok(k) => k,
+            Err(why) => {
+                wipe(&mut k_old);
+                serial_println!("[holocron] door none at=passwd reason={} m_kib={} t={} p={} (the ring is NOT re-keyed)", why, m, t, p);
+                return;
+            }
+        };
+        let mut door = [0u8; una_abi::RINGKEY_LEN];
+        una_abi::ringdoor_encode(&una_abi::RingDoor { mode: una_abi::RINGKEY_MODE_REKEY, m_kib: m, t, p, salt: hdr.salt, key: k_new, t0_ms: t0, old_key: k_old }, &mut door);
+        wipe(&mut k_old);
+        wipe(&mut k_new);
+        {
+            let mut d = DOOR.lock();
+            wipe_door(&mut d);
+            *d = Door::Key { uid, door };
+        }
+        wipe(&mut door);
+        RL_POSTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        RL_REKEY_T0.store(t0, core::sync::atomic::Ordering::Relaxed);
+        serial_println!(
+            "[holocron] door kdf=kernel mode=rekey m_kib={} t={} p={} ms={} -> posted (both passwords are dropped here; HOLOCRON.ELF re-wraps, the salt and parameters kept)",
+            m, t, p, crate::arch::ms().saturating_sub(t0)
+        );
+        after_login(name); // HOLOCRON.ELF takes the door at its start when it is not already running
+    }
+    #[cfg(not(all(feature = "lumen", feature = "login")))]
+    let _ = (name, old, new);
+}
+
+/// `passwd <name>` by the administrator: no old password, so the ring is NOT re-keyed. Said once, at the change.
+pub fn ring_kept_admin_reset(name: &[u8]) {
+    #[cfg(all(feature = "lumen", feature = "login"))]
+    {
+        let mut h = [0u8; crate::fs::users::HOME_MAX];
+        let Some(hl) = crate::fs::users::home_of(name, &mut h) else { return };
+        let Ok(home) = core::str::from_utf8(&h[..hl]) else { return };
+        if ring_root(home) != "none" {
+            serial_println!(
+                "[holocron] ring=kept at=passwd user={} reason=admin-reset (no old password: the ring stays under the old one; the next login says the way back once)",
+                core::str::from_utf8(name).unwrap_or("?")
+            );
+        }
+    }
+    #[cfg(not(all(feature = "lumen", feature = "login")))]
+    let _ = name;
+}
+
+/// HOLOCRON.ELF's answer to a REKEY door. Says the witness.
+fn rekey_report(status: i32) -> i64 {
+    let user = session().map(|(n, _, _)| n).unwrap_or_default();
+    let ms = crate::arch::ms().saturating_sub(RL_REKEY_T0.load(core::sync::atomic::Ordering::Relaxed));
+    if status == 0 {
+        RL_REKEYED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        serial_println!("[holocron] ring=rekeyed at=passwd user={} ms={}", user, ms);
+    } else {
+        serial_println!(
+            "[holocron] ring=rekey-refused at=passwd user={} status={} ({}) -> the old ring is kept: the next login reads bad-password; `holocron unlock <old password>` opens it",
+            user, status, status_word_short(status)
+        );
+    }
+    0
+}
+
+/// `tests ringlogin`'s `rekey=`: holocron_core's ONE re-wrap on a RAM ring (the production suite, floor
+/// parameters, keys from [`kdf`] — the kernel's derivation): a wrong old key keeps the ring byte for byte; the
+/// re-wrap keeps the salt; after it the new key opens the ring and its secret and the old key is refused.
+fn rekey_fixture() -> bool {
+    use holocron_core::cc::{CryptoCore, DrbgEntropy};
+    use holocron_core::seal::KdfParams;
+    use holocron_core::service::{Holocron, MemStore, Store};
+    use holocron_core::wire::{status, Request};
+    use holocron_core::zero::Key;
+    let f = KdfParams::FLOOR;
+    let salt = [0x52u8; 16];
+    let key = |pw: &[u8]| -> Option<[u8; 32]> {
+        let mut req = alloc::vec![0u8; una_abi::KDF_HDR_LEN + pw.len() + 16];
+        let n = una_abi::kdf_request(f.m_kib, f.t, f.p, pw, &salt, &mut req)?;
+        kdf(&req[..n]).ok()
+    };
+    let (Some(k1), Some(k2), Some(kx)) = (key(b"rl2-old"), key(b"rl2-new"), key(b"rl2-wrong")) else { return false };
+    let owner = String::from("user:rl2fixture#4243");
+    let me = Some(owner.as_str());
+    let mk = |store: MemStore| DrbgEntropy::new(crate::rand::KernelEntropy, b"ringlogin2 rekey").ok().map(|rng| Holocron::new(CryptoCore, CryptoCore, store, rng, owner.clone(), f));
+    let Some(mut h) = mk(MemStore::default()) else { return false };
+    if h.unlock_with_key(true, salt, f, Key::from_bytes(k1)).is_err() {
+        return false;
+    }
+    let put = Request::Put { ns: "bt".into(), name: "a1b2c3d4e5f6".into(), kind: "rl2-fixture".into(), label: "rl2".into(), data: alloc::vec![7; 16] };
+    if h.handle(me, put.verb(), &put.encode_body(), 0, 0).status != status::OK {
+        return false;
+    }
+    let before = h.store_mut().read_ring().ok().flatten();
+    let wrong_kept = h.rekey_with_keys(Key::from_bytes(kx), Key::from_bytes(k2)) == Err(status::BAD_PASSWORD) && h.store_mut().read_ring().ok().flatten() == before;
+    let done = h.rekey_with_keys(Key::from_bytes(k1), Key::from_bytes(k2)) == Ok(1);
+    let after = h.store_mut().read_ring().ok().flatten();
+    let salt_kept = match (&before, &after) {
+        (Some(a), Some(b)) => matches!((holocron_core::format::parse_ring(a), holocron_core::format::parse_ring(b)), (Ok((x, _, _)), Ok((y, _, _))) if x.salt == y.salt && x.kdf == y.kdf),
+        _ => false,
+    };
+    let store = h.store_mut().clone();
+    let Some(mut h2) = mk(store) else { return false };
+    let old_refused = h2.unlock_with_key(false, salt, f, Key::from_bytes(k1)) == Err(status::BAD_PASSWORD);
+    let new_opens = h2.unlock_with_key(false, salt, f, Key::from_bytes(k2)) == Ok(());
+    let get = Request::Get { ns: "bt".into(), name: "a1b2c3d4e5f6".into() };
+    let r = h2.handle(me, get.verb(), &get.encode_body(), 0, 0);
+    let secret_ok = r.status == status::OK && r.body.as_slice() == [7u8; 16];
+    wrong_kept && done && salt_kept && old_refused && new_opens && secret_ok
 }
