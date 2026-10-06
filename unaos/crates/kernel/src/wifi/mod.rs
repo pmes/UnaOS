@@ -129,6 +129,7 @@
 pub mod bringup;
 pub mod bus;
 pub mod firmware;
+pub mod ladder;
 pub mod status;
 pub mod verb;
 
