@@ -208,6 +208,7 @@ fn spawn_step(img: &[u8]) {
     const WAIT_MS: u64 = 20_000;
     FAULT_PID.store(0, Ordering::Release);
     crate::serial_line::line_watch_arm(FIRST);
+    let t_spawn = crate::arch::ms(); // SMALLFIX6 (B495): the spawn's own cost (the ELF load + APPRES's sight), on the line below
     let (pid, slot, entry) = match crate::arch::syscall::spawn_user_image_bg(img) {
         Ok(t) => { crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(t.1 as u64), IMAGE); t } // SMALLFIX4 item 11: a path launch arms its APPRES name
         Err(e) => {
@@ -217,6 +218,7 @@ fn spawn_step(img: &[u8]) {
             return;
         }
     };
+    let spawn_ms = crate::arch::ms().saturating_sub(t_spawn);
     let t0 = crate::arch::ticks();
     let deadline = t0 + WAIT_MS;
     let mut fault: Option<(u64, u64)> = None;
@@ -236,7 +238,7 @@ fn spawn_step(img: &[u8]) {
     crate::serial_line::line_watch_disarm();
     // A faulted task is already dead; a live one (PASS or timeout) is killed so the fixture leaves nothing.
     let killed = if fault.is_none() { crate::arch::syscall::bg_kill(pid, slot) } else { "faulted" };
-    serial_println!("[lumencrash] pid={} slot={} entry={:#x} wait_ms={} kill={}", pid, slot, entry, WAIT_MS, killed);
+    serial_println!("[lumencrash] pid={} slot={} entry={:#x} wait_ms={} kill={} spawn_at_ms={} spawn_ms={}", pid, slot, entry, WAIT_MS, killed, t_spawn, spawn_ms);
     match fault {
         Some((vec, rip)) => serial_println!(
             ":: LUMENCRASH: spawned=1 first_line=fault vec={} rip=+{:#x} -> FAIL ::",
