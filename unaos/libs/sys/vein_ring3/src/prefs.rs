@@ -138,3 +138,49 @@ impl Config {
         rules::plan(self.provider, ep.as_ref(), key, verify)
     }
 }
+
+// ── SETTINGSFILES (rmbp-ledger B407, R98): a program's own settings stanza ─────────────────────────────
+
+static mut DTX: [u8; BUS_HDR_LEN + 512] = [0; BUS_HDR_LEN + 512];
+
+/// Lumen's stanza (`app.lumen.*`, stored in `<home>/settings/lumen`): the window frame MACPARITY row 12
+/// (WINMEMORY) remembers per app. The body is `prefs_core::declare::body`'s shape, spelled as bytes.
+pub const LUMEN_STANZA: &[u8] = b"lumen\0window.frame\tstr:32\t\"\"\tLumen's window frame as x,y,w,h in logical px; empty = centred (MACPARITY row 12)\n";
+
+/// PrefDeclare: declare this program's stanza ONCE (`<name>` NUL `<key>\t<spec>\t<default>\t<doc>` lines).
+/// `Ok(())` = held by Principia for the session; `Err` = the bus refused (an older kernel: -EINVAL).
+pub fn declare(body: &[u8]) -> Result<(), i64> {
+    let (tx, rx) = unsafe { (&mut *core::ptr::addr_of_mut!(DTX), &mut *core::ptr::addr_of_mut!(RX)) };
+    if body.len() > tx.len() - BUS_HDR_LEN {
+        return Err(una_abi::EINVAL);
+    }
+    let corr = unsafe {
+        CORR = CORR.wrapping_add(1);
+        CORR
+    };
+    tx[..BUS_HDR_LEN].fill(0);
+    tx[0..4].copy_from_slice(&BUS_MAGIC);
+    tx[4] = BUS_VERSION;
+    tx[5] = BUS_KIND_REQUEST;
+    tx[6] = una_abi::BUS_VERB_PREF_DECLARE;
+    tx[8..12].copy_from_slice(&corr.to_le_bytes());
+    tx[48..52].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    tx[BUS_HDR_LEN..BUS_HDR_LEN + body.len()].copy_from_slice(body);
+    let s = sys(SYS_MSEND, tx.as_ptr() as u64, (BUS_HDR_LEN + body.len()) as u64, 0, 0);
+    if s != 0 {
+        return Err(s);
+    }
+    for _ in 0..8 {
+        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, 0, 0);
+        if n < 0 {
+            return Err(n);
+        }
+        let n = n as usize;
+        if n < BUS_HDR_LEN || rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY || rx[8..12] != corr.to_le_bytes() {
+            continue;
+        }
+        let status = i32::from_le_bytes([rx[12], rx[13], rx[14], rx[15]]) as i64;
+        return if status == 0 { Ok(()) } else { Err(status) };
+    }
+    Err(una_abi::EIO)
+}
