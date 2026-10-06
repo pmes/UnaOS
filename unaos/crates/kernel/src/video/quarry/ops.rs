@@ -909,3 +909,8 @@ pub(super) fn cancel_attr_edit() {
         *e = None;
     }
 }
+
+/// QUARRYLIVE (B494): the folder every op is confined to, for `tests quarrylive`'s scratch folder.
+pub(super) fn home_dir() -> String {
+    home_base()
+}
