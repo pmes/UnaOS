@@ -149,7 +149,7 @@ pub fn do_set(req: &[u8], principal: &str) -> i64 {
     let (path, key) = (tryi!(user_path(p)), tryi!(user_key(k)));
     let v = tryi!(value_from_wire(tag, payload));
     if system_tree(&table(), path) && principal != crate::fs::vfs::KERNEL_PRINCIPAL {
-        return una_abi::EACCES; // SECREVIEW F2 (R94): the root volume's system trees are not ring 3's to retag
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::dialog::refused(crate::video::dialog::WHAT_SYSTEM_FILES, alloc::format!("attr-set path={} refused=system-tree principal={}", path, principal).as_bytes()); return una_abi::EACCES; // REFUSALUI (B468): shown once, app-modal. SECREVIEW F2 (R94): the root volume's system trees are not ring 3's to retag
     }
     match table().set_attr(path, key, v, principal) {
         Ok(()) => 0,

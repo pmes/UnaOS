@@ -48,7 +48,7 @@ pub const ACT_NONE: u8 = 0;
 pub const ACT_SHOW_LOG: u8 = 1;
 /// Open Quarry at the path in `arg` (a mounted volume).
 pub const ACT_OPEN_DIR: u8 = 2;
-/// A program's own action: `arg` = owner (8 bytes LE) + token (4 bytes LE); answered on the dialog bus path.
+/// A program's own action: `arg` = owner (8 bytes LE) + token (4 bytes LE) + button (1); answered on the dialog bus path.
 pub const ACT_ANSWER: u8 = 3;
 
 /// Principia's key (namespace `system`).
@@ -518,7 +518,7 @@ fn run_action(n: &Note) {
             let ok = false;
             if ok { "quarry-opened" } else { "quarry-declined" }
         }
-        ACT_ANSWER => "answer-owed(dialog2-bus-fold)",
+        ACT_ANSWER => answer_poster(n.arg()), // REFUSALUI (B468): the bus poster gets INPUT_EV_DIALOG_ANSWER
         _ => "none",
     };
     serial_println!("[notify] action {} app={} title={} -> {}", s(n.label()), s(n.app()), s(n.title()), what);
@@ -581,9 +581,9 @@ pub fn press_at(x: i32, y: i32) -> bool {
 fn take_inbound(out: &mut [Note; IQ + 4]) -> usize {
     let mut k = 0;
     while k < 4 {
-        let Some((title, line)) = super::toast::take() else { break };
+        let Some((title, line, ans)) = super::toast::take_full() else { break }; // REFUSALUI (B468): the poster's button rides along
         let app = crate::fs::appres::key_of_title(&title).unwrap_or_else(|| String::from("system"));
-        out[k] = Note::make(app.as_bytes(), &title, &line, b"", ACT_NONE, b"");
+        out[k] = match ans { Some((label, owner, token, ix)) => Note::make(app.as_bytes(), &title, &line, &label, ACT_ANSWER, &answer_arg(owner, token, ix)), None => Note::make(app.as_bytes(), &title, &line, b"", ACT_NONE, b"") };
         k += 1;
     }
     if let Some(mut g) = INQ.try_lock() {
@@ -618,7 +618,7 @@ fn dnd_load_service() {
 pub fn service() {
     static REG: AtomicBool = AtomicBool::new(false);
     if !REG.swap(true, Ordering::Relaxed) {
-        crate::tests::register("notify", test);
+        crate::tests::register("notify", test); crate::tests::register("refusalui", super::dialog::refusalui_selftest); // REFUSALUI (B468): `tests refusalui` rides this registration
     }
     dnd_load_service();
     super::notifypane::service(); // NOTIFYPANE (B435): the rules' login load and their latched store writes
@@ -915,4 +915,46 @@ pub fn pane_leg() -> (bool, bool, bool) {
     pass(t0 + 3 + CARD_MS + 1);
     restore(h);
     (block, center, once && silent)
+}
+
+// ── REFUSALUI (rmbp-ledger B468) — ACT_ANSWER answers the TOAST verb's poster ─────────────────────────────
+
+/// [`ACT_ANSWER`]'s `arg`: owner (8 LE) + token (4 LE) + button (1).
+fn answer_arg(owner: u64, token: u8, ix: u8) -> [u8; 13] {
+    let mut a = [0u8; 13];
+    a[..8].copy_from_slice(&owner.to_le_bytes());
+    a[8..12].copy_from_slice(&(token as u32).to_le_bytes());
+    a[12] = ix;
+    a
+}
+
+/// The card's button was pressed: the poster's answer goes down the dialog's own reply path.
+fn answer_poster(arg: &[u8]) -> &'static str {
+    if arg.len() < 13 {
+        return "answer-none(no-poster)";
+    }
+    let mut o = [0u8; 8];
+    o.copy_from_slice(&arg[..8]);
+    let token = arg[8];
+    super::dialog::toast_answer(u64::from_le_bytes(o), token, arg[12]);
+    "answered"
+}
+
+/// `tests refusalui`'s toast leg over the real pass: the queued TOAST-verb entry shows as a card with the
+/// poster's button; a press on the button runs [`answer_poster`]. `true` when the card showed with a button
+/// and the press closed it as an action.
+pub fn answer_leg() -> bool {
+    let h = hold();
+    DND.store(false, Ordering::Relaxed);
+    let t0 = 3_000_000u64;
+    pass(t0);
+    let pk = PANEL.load(Ordering::Relaxed);
+    let pw = (pk >> 32) as usize;
+    let shown = banners() == 1 && ST.lock().cards[0].map(|c| c.n.act == ACT_ANSWER && c.n.has_button()).unwrap_or(false);
+    let r0 = card_rect(pw, 0);
+    let b = btn_rect();
+    let (bx, by) = (r0.0 + metrics::size(b.0 + 4), r0.1 + metrics::size(b.1 + 4));
+    let pressed = shown && SLOT_BTN[0].load(Ordering::Acquire) && press_at(bx as i32, by as i32) && { pass(t0 + 1); banners() == 0 };
+    restore(h);
+    pressed
 }

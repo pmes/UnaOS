@@ -739,3 +739,18 @@ pub fn stamp_selftest() {
     serial_println!(":: ASSOCSTAMP: stamp={} blocks_read={} ms={} -> {} :: cmds={} stale={} rehit={} bound_ms=10 stamp=v{} n={}",
         state, d.blocks_read(), ms, if pass { "PASS" } else { "FAIL" }, d.cmds(), stale, rehit, BUILDER_VERSION, builtin_type_count());
 }
+
+/// REFUSALUI (B468): the wire's words when `path`'s own `una:preferred` is refused for type `mime`
+/// (`preferred=<v> refused=not-a-registrant`), `None` when it has none or it is honoured. Read on the OPEN only
+/// (the person's act), never by the per-row resolver a listing runs.
+pub fn override_refusal(path: &str, mime: &str) -> Option<String> {
+    let mt = crate::shell::vfs_mount_table();
+    if path == object_path(mime) {
+        return None;
+    }
+    let v = str_attr(&mt, path, PREFERRED_KEY)?;
+    match trusted_override_in(&mt, &v, mime) {
+        Some(_) => None,
+        None => Some(alloc::format!("preferred={} refused=not-a-registrant", v)),
+    }
+}
