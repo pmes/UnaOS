@@ -43,6 +43,7 @@ const BUILTIN: &[(&str, &[u8])] = &[
     ("console", include_bytes!("../../../../res/console/console.unares")),
     ("shell", include_bytes!("../../../../res/shell/shell.unares")),
     ("facet", include_bytes!("../../../../res/facet/facet.unares")),
+    ("player", include_bytes!("../../../../res/player/player.unares")), // PLAYER (B419): the audio player window
 ];
 /// The icon a program without a block is drawn with.
 const GENERIC: &[u8] = include_bytes!("../../../../res/generic/generic.unares");
@@ -625,3 +626,23 @@ pub fn selftest() {
         if lumen_seen { "staged" } else { "absent" }, root_attrs, SIGHTS.load(Ordering::Relaxed), DRAWN.load(Ordering::Relaxed));
 }
 
+
+/// PLAYER (B419): draw the icon of the built-in or sighted app `key` at `(x, y)`, `size` square, into a
+/// `stride`-wide surface of `h` rows. `false` when nothing was drawn (a lock held elsewhere: the caller's fallback).
+pub fn blit_key_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: usize, size: usize, key: &str) -> bool {
+    with_pix(key, size, |argb| {
+        for r in 0..size {
+            if y + r >= h {
+                break;
+            }
+            for c in 0..size {
+                if x + c >= stride {
+                    break;
+                }
+                let d = &mut px[(y + r) * stride + x + c];
+                *d = over(argb[r * size + c], *d);
+            }
+        }
+    })
+    .is_some()
+}
