@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! CHARTER: Matrix — kernel-by-ruling R50
+//! CHARTER: Matrix — owed B288 (R50 rules Quarry the Finder, not the Trash; handlers/matrix/src/trash.rs is the twin — ARCHREVIEW F2)
 //!
 //! TRASH (R75) — a desktop Trash. `/home/<user>/.Trash/` is created on first use through the mount
 //! table under the user's namespace (DIRNS); `trash` MOVES an entry there with the same `rename`
