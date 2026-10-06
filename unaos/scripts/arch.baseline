@@ -2,14 +2,14 @@
 # One finding key per line, as `arch-check.py --emit-baseline` prints it, then `  # <finding>` naming the
 # row of docs/dev/review/ARCH-2026-10-06.md that owns it. SHRINK-ONLY: a fixed finding's row is deleted
 # (a stale row fails the gate); a NEW finding never gets a row — it is fixed instead.
-dotslash|/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
-dotslash|{}/.config  # F2 BTKEYSEAL (the BT link-key folder)
-dotslash|{}/.config/unaos  # F2 BTKEYSEAL (the BT link-key folder)
-dotslash|{}/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
-dotslash|{}/.config/unaos/holocron/.ring  # F4 HOLOCRONROOT
-dotslash|{}/.config/unaos/preferences.toml  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
-dotslash|{}/.dock  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
-dotslash|{}/.settings  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
+dotslash|drivers/ehci/bthid.rs|/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
+dotslash|drivers/ehci/bthid.rs|{}/.config  # F2 BTKEYSEAL (the BT link-key folder)
+dotslash|drivers/ehci/bthid.rs|{}/.config/unaos  # F2 BTKEYSEAL (the BT link-key folder)
+dotslash|drivers/ehci/bthid.rs|{}/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
+dotslash|keyring.rs|{}/.config/unaos/holocron/.ring  # F4 HOLOCRONROOT
+dotslash|prefs.rs|{}/.config/unaos/preferences.toml  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
+dotslash|prefs.rs|{}/.dock  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
+dotslash|prefs.rs|{}/.settings  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
 parser|drivers/hda_play.rs|riff  # F6 TYPECORE (a format magic outside the shared cores)
 parser|fs/bootdisk.rs|elf  # F6 TYPECORE
 parser|fs/filetype.rs|elf  # F6 TYPECORE
