@@ -43,11 +43,12 @@ is LEAKED, not dropped); the registry releases everything else.
 ## Milestones
 - M1 `sync::Mutex` + the mechanical sweep (type substitutions only, one commit).
 - M2 the registry: holder entries, waiter records, order edges, the 50 ms scan (hook: `interrupts.rs` timer ISR, after
-  `clockcore::isr_tick`), armed by `stackguard::boot_line` with `[lock] registry armed classes=<n> cap=<n> (LOCKREG)`.
-- M3 death: STACKGUARD halt + panic log release, DECJOB abort names.
-- M4 `tests lockreg` (typed, R80): a scratch task holds a scratch lock 60 ms; the test waits for the scan's line;
-  `:: LOCKREG: locks=<n> wrapped=<tracked>/<acquires> held_max_ms=<n> inversions=<n> released_on_death=ok -> PASS ::`
-  (released_on_death: a scratch task exits holding a scratch lock, `release_task` frees it, the lock is takeable).
+  `clockcore::isr_tick`), armed by `stackguard::boot_line` with `[lock] registry armed classes=<n> cap=<n> (LOCKREG)`;
+  `tests lockreg` (typed, R80): a scratch task holds a scratch lock 60 ms and the scan must have seen it; a scratch task
+  ends holding a lock and `release_task` must give it back;
+  `:: LOCKREG: locks=<n> wrapped=<tracked>/<acquires> held_max_ms=<n> inversions=<n> released_on_death=ok named=ok -> PASS ::`.
+- M3 death: STACKGUARD halt (`release_task` after the named three), the panic log path (the named three + every
+  other, before the heap wait), DECJOB's abort NAMES (`name_task`).
 
 ## Witness (metal)
 ```

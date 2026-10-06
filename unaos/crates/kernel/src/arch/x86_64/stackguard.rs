@@ -155,6 +155,7 @@ pub fn boot_line() {
         serial_println!("[stack] guards armed tasks={} aps={} ist={} bsp={} page={} failed={} why={}", ARMED.load(Ordering::Relaxed), aps, ist, bsp, PAGE, fail, *ARM_WHY.lock());
     }
     crate::tests::register("stackroom", stackroom);
+    crate::sync::arm(); crate::sync::ensure_tests(); // LOCKREG (B414): the holder registry on (per-CPU blocks are up), `tests lockreg`
 }
 
 /// `tests stackroom`: each live task's high mark against its size (the `witness` paint), and the guards.
