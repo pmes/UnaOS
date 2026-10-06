@@ -645,6 +645,13 @@ fn do_info() {
     body.push_str(&l1);
     body.push('\n');
     body.push_str(&l2);
+    // SETTINGSFILES (B407, R98): a settings file's Show Info lists its keys and when it auto-saved (ATTRCOLUMNS'
+    // Get Info inspector joins `settingsfiles::info_lines` at the merge).
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    for l in crate::video::settingsfiles::info_lines(&path) {
+        body.push('\n');
+        body.push_str(&l);
+    }
     #[cfg(feature = "login")]
     crate::video::crystal::login::notice_show(leaf(&path).as_bytes(), body.as_bytes());
     say(l1);
