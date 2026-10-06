@@ -41,9 +41,9 @@ fn choose(mt: &crate::fs::vfs::MountTable) -> Option<u32> {
     let have: Vec<u32> = mt.read_dir(DIR).ok()?.iter().filter_map(|e| num(&e.name)).collect();
     let n = have.iter().copied().max().unwrap_or(0) + 1;
     for old in have.iter().filter(|k| **k + KEEP <= n) {
-        let _ = mt.unlink(&alloc::format!("{}/boot-{}.log", DIR, old), KERNEL_PRINCIPAL);
+        let _ = mt.unlink(&alloc::format!("{}/boot-{}{}", DIR, old, ".log"), KERNEL_PRINCIPAL);
     }
-    let path = alloc::format!("{}/boot-{}.log", DIR, n);
+    let path = alloc::format!("{}/boot-{}{}", DIR, n, ".log");
     mt.create(&path, NodeKind::File, KERNEL_PRINCIPAL).ok()?;
     serial_println!("[boot] log -> {} (R99: the boot log lives on UnaFS; kept={}) ::", path, KEEP);
     Some(n)
@@ -83,7 +83,7 @@ pub fn divert(snapshot: fn() -> Option<(Vec<u8>, usize)>) -> bool {
         },
         n => n,
     };
-    let path: String = alloc::format!("{}/boot-{}.log", DIR, n);
+    let path: String = alloc::format!("{}/boot-{}{}", DIR, n, ".log");
     let k = crate::fs::vfs::KERNEL_PRINCIPAL;
     match mt.write(&path, 0, &body, k) {
         Ok(_) => {
