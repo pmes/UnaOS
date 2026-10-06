@@ -2725,6 +2725,9 @@ fn wheel_scroll(m: &mut Model, sx: usize, sy: usize, detents: i32) -> Option<Whe
     if !tree && !g.list_pane().contains(sx, sy) {
         return None;
     }
+    if !tree && toolbar::view() == toolbar::View::Columns {
+        return millercols::wheel(m, sx, sy, detents); // SMALLFIX4 (COLUMNSVIEW owed): the wheel moves the pane under the pointer
+    }
     let (len, vis, scroll) = if tree {
         (m.tree.len(), m.tree_visible(), m.tree_scroll)
     } else {

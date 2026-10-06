@@ -425,7 +425,9 @@ pub fn right_press(x: i32, y: i32) -> bool {
             repaint();
             return true;
         }
-        if sx >= li.x && sx < li.x + li.w && sy >= body_y {
+        if super::toolbar::view() == super::toolbar::View::Columns && super::millercols::right_select(m, sx, sy) {
+            // SMALLFIX4 (COLUMNSVIEW owed): the Columns view's panes, not the list geometry, take the right press.
+        } else if sx >= li.x && sx < li.x + li.w && sy >= body_y {
             let i = m.list_scroll + (sy - body_y) / g.row_h();
             if i < m.list.len() {
                 m.list_sel = i;
