@@ -44,3 +44,8 @@ Paste; `[winmenu] about-box name=<n> shown=1` after `[appres] about ...`; `tests
   name=lumen via=<appres|path> armed=1`.
 - 12 ROOTACL + TYPECORE merged first: attrsys `system_tree` gone; five filetype parser rows leave the baseline;
   assoc's extensions walk type_core. RAWCORE's arw/tiff carried into type_core's table at the merge.
+- 13 ATTRKEYS: `una_abi::attr_keys` brought in verbatim from exec-rmbp-attrkeys (the full merge conflicts in six
+  files and is the seat's); jobs_core's K_*/TYPE_KEY/VIEW_KEY alias it, `saved_queries()` and mica's view columns
+  are built from the constants (ATTRKEYS' gate, run locally, finds no `job:` literal left in jobs_core/mica).
+- Legs at the tip: x86 metal line (wc_gpublit dropped: retired) exit 0 · aarch64 desktop exit 0 · aarch64 tegra
+  exit 0 · host `cargo test -p jobs_core -p mica -p type_core -p trash_core` exit 0 · charter 0 · arch 0 · knob 0.
