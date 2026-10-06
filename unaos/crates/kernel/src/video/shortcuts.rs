@@ -46,6 +46,7 @@ pub const C_CMD_H: &str = "cmd-h";
 pub const C_CMD_COMMA: &str = "cmd-,";
 pub const C_CMD_ALT_ESC: &str = "cmd-alt-esc";
 pub const C_CTRL_CMD_Q: &str = "ctrl-cmd-q";
+pub const C_CMD_I: &str = "cmd-i"; // ATTRCOLUMNS (B402)
 
 const fn s(chord: &'static str, scope: &'static str, action: &'static str, arc: &'static str) -> Shortcut {
     Shortcut { chord, scope, action, arc }
@@ -90,6 +91,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     s("q", "Activity", "Quit", "ACTIVITY"),
     s("k", "Activity", "Kill selected", "ACTIVITY"),
     s(C_CMD_K, "Lumen", "Clear transcript", "LUMENBIN"),
+    s(C_CMD_I, "Quarry", "Get Info", "ATTRCOLUMNS"),
 ];
 
 /// The chord an app-menu row labelled `label` shows on its right (first table entry whose action matches).

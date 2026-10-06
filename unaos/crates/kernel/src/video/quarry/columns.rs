@@ -173,6 +173,8 @@ pub struct RowMeta {
     pub mime: String,
     pub type_name: String,
     pub origin: Option<String>,
+    /// ATTRCOLUMNS (B402): this row's value for each of the folder's attribute columns, in view order.
+    pub cells: Vec<super::attrcols::Cell>,
 }
 
 /// The column state beside the model.
@@ -219,6 +221,7 @@ fn load(st: &mut ColState) {
 /// Write the widths and the sort (only changed keys are re-saved by `prefs::set`). Quarry's service
 /// pass — chained from `live::service`, never from a router.
 pub fn service() {
+    super::attrcols::service(); // ATTRCOLUMNS (B402): the listed folder's facts, a few files a pass
     if !PERSIST.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -249,12 +252,21 @@ pub(super) struct Cols {
     pub cols: Vec<(Col, usize, usize)>,
     pub clip: usize,
     pub cell_w: usize,
+    /// ATTRCOLUMNS (B402): the attribute columns that fit, `(view index, x, width in glyph columns)`.
+    pub attrs: Vec<(usize, usize, usize)>,
 }
 
 /// The ONE column layout: the painter and the header press both read it. Columns degrade rather
 /// than overlap — SIZE, then MODIFIED (the pre-QUARRY2 thresholds exactly), then TYPE only while the name
 /// keeps [`NAME_FLOOR_WIDE`] columns; the Trash takes ORIGIN and TYPE first (SMALLFIX2). Pure.
 pub(super) fn layout(g: &Geom, li: Rect, lsb: usize, w: &Widths, trash: bool) -> Cols {
+    layout_with(g, li, lsb, w, trash, &[])
+}
+
+/// [`layout`] plus ATTRCOLUMNS' attribute columns (`extra` = their widths, in view order): placed AFTER the
+/// standard columns while the name keeps [`NAME_FLOOR_WIDE`] columns, so a chosen attribute never pushes TYPE
+/// or ORIGIN out. Pure.
+pub(super) fn layout_with(g: &Geom, li: Rect, lsb: usize, w: &Widths, trash: bool, extra: &[usize]) -> Cols {
     let cell_w = g.cell_w().max(1);
     let total = li.w.saturating_sub(lsb).saturating_sub(2 * PAD()) / cell_w;
     // SMALLFIX2 (B391): the Trash ranks its OWN column first — ORIGIN, then TYPE, then SIZE, MODIFIED — so a panel one
@@ -274,6 +286,13 @@ pub(super) fn layout(g: &Geom, li: Rect, lsb: usize, w: &Widths, trash: bool) ->
             chosen[c as usize] = true;
         }
     }
+    let mut fit: Vec<usize> = Vec::new();
+    for (i, &aw) in extra.iter().enumerate() {
+        if total >= used + aw + 1 + NAME_FLOOR_WIDE {
+            used += aw + 1;
+            fit.push(i);
+        }
+    }
     let name_cols = if used == 0 { total.saturating_sub(2) } else { total.saturating_sub(used) };
     let name_x = li.x + PAD();
     let mut x = name_x + (name_cols + 1) * cell_w;
@@ -284,7 +303,12 @@ pub(super) fn layout(g: &Geom, li: Rect, lsb: usize, w: &Widths, trash: bool) ->
             x += (w.of(c) + 1) * cell_w;
         }
     }
-    Cols { name_x, name_cols, cols, clip: li.x + li.w - lsb, cell_w }
+    let mut attrs = Vec::new();
+    for i in fit {
+        attrs.push((i, x, extra[i]));
+        x += (extra[i] + 1) * cell_w;
+    }
+    Cols { name_x, name_cols, cols, clip: li.x + li.w - lsb, cell_w, attrs }
 }
 
 /// The column under source x `sx` in the header (a column owns its gap to the next one). Pure.
@@ -357,7 +381,7 @@ pub fn compute_meta(mt: &MountTable, cwd: &str, list: &[DirEnt], origins: &[(Str
             }
         };
         let origin = origins.iter().find(|(n, _)| n.eq_ignore_ascii_case(&e.name)).map(|(_, o)| o.clone());
-        out.push(RowMeta { name: e.name.clone(), mime, type_name, origin });
+        out.push(RowMeta { name: e.name.clone(), mime, type_name, origin, cells: Vec::new() });
     }
     out
 }
@@ -415,7 +439,10 @@ pub fn sort_rows(list: &mut Vec<DirEnt>, meta: &mut Vec<RowMeta>, key: SortKey, 
 /// Re-sort the model's list by the current key, keeping the selected ROW selected.
 fn resort(m: &mut Model, st: &mut ColState) {
     let sel = m.list.get(m.list_sel).map(|e| e.name.clone());
-    sort_rows(&mut m.list, &mut st.meta, st.key, st.desc);
+    match super::attrcols::sort_index() {
+        Some(i) => super::attrcols::sort_rows_by(&mut m.list, &mut st.meta, i, st.desc), // ATTRCOLUMNS (B402)
+        None => sort_rows(&mut m.list, &mut st.meta, st.key, st.desc),
+    }
     if let Some(n) = sel {
         if let Some(i) = m.list.iter().position(|e| e.name == n) {
             m.list_sel = i;
@@ -440,6 +467,7 @@ pub(super) fn after_show(m: &mut Model) {
         Vec::new()
     };
     st.meta = compute_meta(&mt, &m.cwd, &m.list, &origins);
+    super::attrcols::after_meta(&mt, &m.cwd, &m.list, &mut st.meta); // ATTRCOLUMNS (B402): the folder's attribute columns and their cells
     let st = &mut *st;
     resort(m, st);
     let typed = st.meta.iter().filter(|r| r.mime != crate::fs::filetype::OCTET).count();
@@ -457,8 +485,18 @@ pub(super) fn header_press(m: &mut Model, sx: usize) -> bool {
     let lsb = if m.list.len() > m.list_visible() { super::SBW() } else { 0 };
     let mut st = COLS.lock();
     load(&mut st);
-    let c = layout(&g, li, lsb, &st.widths, st.trash);
+    let c = layout_with(&g, li, lsb, &st.widths, st.trash, &super::attrcols::widths());
+    if let Some(i) = super::attrcols::header_hit(&c, sx) {
+        // ATTRCOLUMNS (B402): a press on an attribute column sorts by it; a second press reverses.
+        st.desc = if super::attrcols::sort_index() == Some(i) { !st.desc } else { false };
+        super::attrcols::set_sort(Some(i));
+        let st = &mut *st;
+        resort(m, st);
+        serial_println!("[attrcols] header press col={} sort=attr desc={}", super::attrcols::key_at(i).unwrap_or_default(), st.desc as u8);
+        return true;
+    }
     let Some(col) = header_hit(&c, sx) else { return false };
+    super::attrcols::set_sort(None);
     let Some(key) = col.sort_key() else {
         serial_println!("[quarry2] header press col={} -> not sortable", col.label());
         return false;
@@ -491,6 +529,7 @@ pub(super) fn key(c: u8) -> bool {
     load(&mut st);
     match c {
         b's' => {
+            super::attrcols::set_sort(None);
             st.key = st.key.next();
             st.desc = false;
             let st = &mut *st;
@@ -526,10 +565,11 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
     let g = &m.geom;
     let row_h = g.row_h();
     let st = COLS.lock();
-    let c = layout(g, li, lsb, &st.widths, st.trash);
+    let c = layout_with(g, li, lsb, &st.widths, st.trash, &super::attrcols::widths());
     let clip = c.clip;
-    let next_x = |i: usize| c.cols.get(i + 1).map(|t| t.1).unwrap_or(clip).min(clip);
-    let size_x = c.cols.first().map(|t| t.1).unwrap_or(clip);
+    let first_attr = c.attrs.first().map(|t| t.1).unwrap_or(clip).min(clip);
+    let next_x = |i: usize| c.cols.get(i + 1).map(|t| t.1).unwrap_or(first_attr).min(clip);
+    let size_x = c.cols.first().map(|t| t.1).unwrap_or(first_attr);
 
     // Header — outside the scrolled band by construction, so a scrolled list never loses its columns.
     fill(px, g, li.x, li.y, li.w, row_h, theme::CHROME_FACE);
@@ -546,6 +586,7 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
     for (i, &(col, x, _)) in c.cols.iter().enumerate() {
         text(px, g, x, li.y + g.ts, &label(col), next_x(i), theme::TITLE_TEXT_INACTIVE);
     }
+    super::attrcols::paint_header(px, g, &c, li.y + g.ts, if st.desc { chev } else { " ^" }); // ATTRCOLUMNS (B402)
     let body_y = li.y + row_h;
     if let Some(e) = &m.err {
         text(px, g, c.name_x, body_y + g.ts, e.as_bytes(), clip, theme::CONTROL_CLOSE);
@@ -593,6 +634,7 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
             };
             text(px, g, x, y + g.ts, &cell, next_x(k), ink);
         }
+        super::attrcols::paint_cells(px, g, &c, meta, y + g.ts, ink); // ATTRCOLUMNS (B402): typed cells
     }
     body_y
 }
@@ -622,7 +664,7 @@ fn ent(name: &str, dir: bool, size: u64, min: u8) -> DirEnt {
 fn meta_of(list: &[DirEnt], ty: &[&str]) -> Vec<RowMeta> {
     list.iter()
         .zip(ty.iter())
-        .map(|(e, t)| RowMeta { name: e.name.clone(), mime: String::new(), type_name: String::from(*t), origin: None })
+        .map(|(e, t)| RowMeta { name: e.name.clone(), mime: String::new(), type_name: String::from(*t), origin: None, cells: Vec::new() })
         .collect()
 }
 

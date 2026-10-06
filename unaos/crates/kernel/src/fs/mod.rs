@@ -182,3 +182,5 @@ pub mod rootdisk;
 pub mod exfat;
 /// APPRES (B398): the registrar — a program's resources (name, signature, version, kind, icon, doc types) as attributes.
 pub mod appres;
+/// ATTRCOLUMNS (B402): a file's sniffed facts as typed attributes (`media:*`, `doc:title`), the edit in place, `una:view`.
+pub mod attrfacts;

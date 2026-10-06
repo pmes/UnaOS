@@ -246,7 +246,7 @@ impl Item {
             Item::NewFolder => "New Folder",
             Item::Copy => "Copy",
             Item::Paste => "Paste",
-            Item::Info => "Show Info",
+            Item::Info => "Get Info",
             Item::ShowTrash => "Show Trash",
             Item::Restore => "Restore",
             Item::EmptyTrash => "",
@@ -286,6 +286,8 @@ static MENU_UP: AtomicBool = AtomicBool::new(false);
 enum Target {
     Rename(String),
     NewFolder,
+    /// ATTRCOLUMNS (B402): an attribute cell — `(path, key, int)`.
+    Attr(String, String, bool),
 }
 struct Edit {
     buf: String,
@@ -314,7 +316,16 @@ pub fn paint_overlay(m: &Model, px: &mut [u32]) {
             }
             Target::Rename(_) => (0, "Rename: "),
             Target::NewFolder => (0, "New folder: "),
+            Target::Attr(..) if m.list_sel >= m.list_scroll && m.list_sel < m.list_scroll + m.list_visible() => {
+                (body_y + (m.list_sel - m.list_scroll) * rh, "")
+            }
+            Target::Attr(..) => (0, ""),
         };
+        let attr_label = match &e.target {
+            Target::Attr(_, k, _) => alloc::format!("{}: ", k),
+            _ => String::new(),
+        };
+        let label: &str = if attr_label.is_empty() { label } else { attr_label.as_str() };
         let (x, w) = if y == 0 { (0, g.w) } else { (li.x, li.w) };
         fill(px, g, x, y, w, rh, 0x00FF_FFFF);
         keyline(px, g, Rect { x, y, w, h: rh }, theme::ACCENT);
@@ -332,6 +343,8 @@ pub fn paint_overlay(m: &Model, px: &mut [u32]) {
             text(px, g, mn.x + PAD(), mn.y + 1 + i * g.row_h() + g.ts, it.label().as_bytes(), mn.x + w, theme::BUTTON_TEXT);
         }
     }
+    super::getinfo::paint(m, px); // ATTRCOLUMNS (B402): the inspector
+    super::attrcols::paint_menu(m, px); // ATTRCOLUMNS (B402): the header's Add column… menu
 }
 
 /// Panel point -> (source x, source y) inside Quarry's content, or None.
@@ -403,6 +416,13 @@ pub fn right_press(x: i32, y: i32) -> bool {
         let g = &m.geom;
         let li = g.list_pane().inner();
         let body_y = li.y + g.row_h();
+        if super::attrcols::on_header(m, sx, sy) {
+            // ATTRCOLUMNS (B402): the header's right-click is the column menu, not the file menu.
+            super::attrcols::open_menu(m, sx, sy);
+            drop(guard);
+            repaint();
+            return true;
+        }
         if sx >= li.x && sx < li.x + li.w && sy >= body_y {
             let i = m.list_scroll + (sy - body_y) / g.row_h();
             if i < m.list.len() {
@@ -423,6 +443,17 @@ pub fn right_press(x: i32, y: i32) -> bool {
 
 /// A primary press while the menu is up: pick an item (consumed) or dismiss (falls through).
 pub fn menu_press(x: i32, y: i32) -> bool {
+    if super::attrcols::menu_up() {
+        let hit = to_source(x, y);
+        super::attrcols::menu_press_at(hit);
+        return hit.is_some();
+    }
+    if super::getinfo::is_up() {
+        // ATTRCOLUMNS (B402): any press dismisses the inspector; one inside Quarry is consumed by it.
+        super::getinfo::dismiss();
+        repaint();
+        return to_source(x, y).is_some();
+    }
     if !MENU_UP.load(Ordering::Acquire) {
         return false;
     }
@@ -620,6 +651,7 @@ fn do_paste() {
 
 fn do_info() {
     let Some((c, path, _)) = selection() else { return };
+    super::getinfo::open(&path); // ATTRCOLUMNS (B402): Get Info — every attribute, typed, with its change time
     let t = mt();
     let (kind, size) = match t.stat(&path) {
         Ok(st) => (if matches!(st.kind, NodeKind::Dir) { "folder" } else { "file" }, st.size),
@@ -645,8 +677,7 @@ fn do_info() {
     body.push_str(&l1);
     body.push('\n');
     body.push_str(&l2);
-    #[cfg(feature = "login")]
-    crate::video::crystal::login::notice_show(leaf(&path).as_bytes(), body.as_bytes());
+    let _ = body; // the inspector (getinfo) shows it; the NOTICE popup would cover it
     say(l1);
 }
 
@@ -655,6 +686,13 @@ fn do_info() {
 fn commit_edit() {
     let Some(e) = EDIT.lock().take() else { return };
     match e.target {
+        Target::Attr(path, key, int) => {
+            let who = session_user();
+            let r = super::attrcols::commit(&path, &key, &e.buf, int, who.as_deref().unwrap_or(P));
+            if let Err(why) = r {
+                say(alloc::format!("{} not changed ({})", key, why));
+            }
+        }
         Target::Rename(src) => {
             let dst = join(&parent(&src), e.buf.trim());
             let r = op_rename(&src, &dst);
@@ -714,6 +752,12 @@ pub fn key_pre(c: u8) -> bool {
         repaint();
         return true;
     }
+    if c == 0x1B && (super::getinfo::is_up() || super::attrcols::menu_up()) {
+        super::getinfo::dismiss();
+        super::attrcols::menu_press_at(None);
+        repaint();
+        return true;
+    }
     if MENU_UP.load(Ordering::Acquire) && c == 0x1B {
         *MENU.lock() = None;
         MENU_UP.store(false, Ordering::Release);
@@ -730,6 +774,7 @@ pub fn key_pre(c: u8) -> bool {
         b'D' => do_delete(),
         b'e' | b'E' => start_rename(),
         b'n' | b'N' => start_new_folder(),
+        b'i' | b'I' => do_info(), // ATTRCOLUMNS (B402): Get Info
         _ => return false,
     }
     repaint();
@@ -742,6 +787,7 @@ pub fn action(a: crate::video::keymap::Action) -> bool {
     match a {
         Action::Copy => do_copy(),
         Action::Paste => do_paste(),
+        Action::GetInfo => do_info(), // ATTRCOLUMNS (B402): Cmd-I
         _ => return false,
     }
     repaint();
@@ -814,4 +860,19 @@ pub fn selftest() {
     serial_println!("[quarryops] lfn_rename={} copy_bytes={}", rn_ok, cp_ok);
     let pass = ok == 4 && refused == 2;
     serial_println!(":: QUARRYOPS: ops=[mkdir,rename,copy,delete] ok={} refused={} -> {} ::", ok, refused, if pass { "PASS" } else { "FAIL" });
+}
+
+// ── ATTRCOLUMNS (B402): the edit field over an attribute cell ───────────────────────────────────
+
+/// Open the edit field on an attribute cell (the caller may hold `MODEL`: this takes only the edit leaf).
+pub(super) fn begin_attr_edit(path: String, key: String, buf: String, int: bool) {
+    *EDIT.lock() = Some(Edit { buf, target: Target::Attr(path, key, int) });
+}
+
+/// A double-click cancels an attribute edit its first press opened.
+pub(super) fn cancel_attr_edit() {
+    let mut e = EDIT.lock();
+    if matches!(e.as_ref().map(|x| &x.target), Some(Target::Attr(..))) {
+        *e = None;
+    }
 }

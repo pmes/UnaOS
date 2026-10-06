@@ -2667,6 +2667,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         // is what an operator scanning a list is doing, and it must never run anything.
         let now = crate::arch::ms();
         let dbl = is_double(m.click_ms, now, m.click_row, i, m.click_pane == Pane::List);
+        if dbl { ops::cancel_attr_edit(); } else if i == m.list_sel && m.click_pane == Pane::List && attrcols::press_cell(m, sx, i) { m.click_row = i; m.click_ms = now; m.settle(); return Act::None; } // ATTRCOLUMNS (B402): a press on the selected row's attribute cell edits it in place; a double-click opens instead
         m.list_sel = i;
         m.click_row = i;
         m.click_pane = Pane::List;
@@ -4268,3 +4269,10 @@ pub fn open_at(dir: &str) -> bool {
     wm::focus_changed(OWNER);
     true
 }
+
+// ATTRCOLUMNS (B402): the attribute columns (Add column…, typed cells, sort, edit in place, `una:view`) and Get Info —
+// child modules like `columns`, so they reach the model and the painter's helpers without widening them.
+#[path = "attrcols.rs"]
+pub mod attrcols;
+#[path = "getinfo.rs"]
+pub mod getinfo;

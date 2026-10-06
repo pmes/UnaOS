@@ -66,6 +66,7 @@ pub(super) fn act(opener: String, path: String, mime: String) -> Act {
 /// THE dispatch: run opener `id` on `path` (of type `mime`). Returns the path-bar line.
 pub fn open(id: &str, path: &str, mime: &str) -> String {
     let leaf = super::leaf(path);
+    super::attrcols::queue_open(path); // ATTRCOLUMNS (B402): an opened file's facts are refreshed on the next service pass
     match id {
         "launch" => {
             // Reap first, then test the ceiling (rmbp-7 QUARRY) — moved here unchanged from run_act.

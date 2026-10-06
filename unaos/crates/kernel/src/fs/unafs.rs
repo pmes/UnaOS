@@ -993,7 +993,7 @@ fn note_txn_busy_durable() {}
 static MOUNT_DISCARD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// K9-PARITY: request the enclosing [`with_unafs`] hold discard the cached mount (see [`MOUNT_DISCARD`]).
-fn request_mount_discard() {
+pub(crate) fn request_mount_discard() {
     MOUNT_DISCARD.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
