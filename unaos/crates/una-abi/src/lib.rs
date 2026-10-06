@@ -2043,6 +2043,9 @@ pub mod attr_keys {
     pub const ICON_128: &str = "una:icon.128";
     /// APPRES resource block: the MIME types the app opens, newline-separated.
     pub const DOCTYPES: &str = "una:doctypes";
+    /// DROPTYPES (B477): APPRES resource block — the MIME types a program's windows take as a drop,
+    /// newline-separated (`type/*` and `*/*` allowed; absent = takes nothing).
+    pub const DROPTYPES: &str = "una:droptypes";
     /// TRASHTIME (B308): the original absolute path (String).
     pub const TRASH_ORIGIN: &str = "una:trash-origin";
     /// TRASHTIME: when it was trashed, unix seconds (Int).
@@ -2108,7 +2111,7 @@ pub mod attr_keys {
         EMBED_MODEL, EMBED_DIMS, MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_DURATION_MS, MEDIA_CODEC, DOC_TITLE,
         IMAGE_ANIMATED, BT_LINKKEY, BT_KEYTYPE, BT_CLASS, BT_NAME, BT_HIDDESC, JOB_KIND, JOB_ID, JOB_SEQ,
         JOB_STATUS, JOB_FLIGHT, JOB_LINE, JOB_SET_BY, JOB_REFS, JOB_OWNER, JOB_ARC, JOB_TRACK,
-        DESCRIPTION, EXTENSIONS, MEDIA_CAMERA, MEDIA_LENS, MEDIA_EXPOSURE, MEDIA_ISO, MEDIA_FOCAL_MM, MEDIA_TAKEN, FSNAME, FSNAME_INDEX, VIEW_MODE, VIEW_COLUMNS, VIEW_SORT, VIEW_FRAME, FILETYPES_STAMP,
+        DESCRIPTION, EXTENSIONS, MEDIA_CAMERA, MEDIA_LENS, MEDIA_EXPOSURE, MEDIA_ISO, MEDIA_FOCAL_MM, MEDIA_TAKEN, FSNAME, FSNAME_INDEX, VIEW_MODE, VIEW_COLUMNS, VIEW_SORT, VIEW_FRAME, FILETYPES_STAMP, DROPTYPES,
     ];
 
     const fn str_eq(a: &str, b: &str) -> bool {

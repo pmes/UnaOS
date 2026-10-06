@@ -1571,6 +1571,8 @@ pub const RES_KEY_ICON_128: &str = una_abi::attr_keys::ICON_128;
 pub const RES_KEY_ICON_PREFIX: &str = una_abi::attr_keys::ICON;
 /// The MIME types the app opens, newline-separated.
 pub const RES_KEY_DOCTYPES: &str = una_abi::attr_keys::DOCTYPES;
+/// DROPTYPES (B477): the MIME types the program takes as a drop, newline-separated (`type/*`, `*/*`).
+pub const RES_KEY_DROPTYPES: &str = una_abi::attr_keys::DROPTYPES;
 /// The rendered icon sizes, smallest first, with their keys.
 pub const RES_ICON_SIZES: [(u32, &str); 3] = [(32, RES_KEY_ICON_32), (64, RES_KEY_ICON_64), (128, RES_KEY_ICON_128)];
 

@@ -83,6 +83,8 @@ pub struct App {
     pub version: String,
     pub kind: String,
     pub doctypes: Vec<String>,
+    /// DROPTYPES (B477): the MIME types the program's windows take as a drop (`type/*`, `*/*`; empty = none).
+    pub droptypes: Vec<String>,
     /// `(px, PNG)` — the program's own, or the generic set when `has_res` is false.
     pub icons: Vec<(u32, Vec<u8>)>,
     pub has_res: bool,
@@ -128,6 +130,7 @@ fn app_from_block(key: &str, path: &str, stamp: &str, block: &[u8], source: &'st
         version: s(mc::RES_KEY_VERSION),
         kind: s(mc::RES_KEY_KIND),
         doctypes: s(mc::RES_KEY_DOCTYPES).lines().map(String::from).filter(|l| !l.is_empty()).collect(),
+        droptypes: s(mc::RES_KEY_DROPTYPES).lines().map(String::from).filter(|l| !l.is_empty()).collect(),
         icons: icons_of(block),
         has_res: true,
         source,
@@ -146,6 +149,7 @@ fn generic_app(key: &str, path: &str, stamp: &str, source: &'static str) -> App 
         version: String::new(),
         kind: String::new(),
         doctypes: Vec::new(),
+        droptypes: Vec::new(),
         icons: icons_of(GENERIC),
         has_res: false,
         source,
@@ -223,6 +227,7 @@ fn from_attrs(mt: &MountTable, obj: &str, key: &str, path: &str, stamp: &str) ->
         version: get_str(mt, obj, mc::RES_KEY_VERSION).unwrap_or_default(),
         kind: get_str(mt, obj, mc::RES_KEY_KIND).unwrap_or_default(),
         doctypes: get_str(mt, obj, mc::RES_KEY_DOCTYPES).unwrap_or_default().lines().map(String::from).filter(|l| !l.is_empty()).collect(),
+        droptypes: get_str(mt, obj, mc::RES_KEY_DROPTYPES).unwrap_or_default().lines().map(String::from).filter(|l| !l.is_empty()).collect(),
         icons,
         has_res: true,
         source: "attrs",
@@ -243,6 +248,9 @@ fn attr_list(app: &App) -> Vec<(String, AttrValue)> {
     put(mc::RES_KEY_KIND, AttrValue::Str(app.kind.clone()));
     if !app.doctypes.is_empty() {
         put(mc::RES_KEY_DOCTYPES, AttrValue::Str(app.doctypes.join("\n")));
+    }
+    if !app.droptypes.is_empty() {
+        put(mc::RES_KEY_DROPTYPES, AttrValue::Str(app.droptypes.join("\n")));
     }
     for (px, png) in app.icons.iter() {
         if png.len() <= ATTR_VALUE_MAX {
@@ -815,6 +823,7 @@ pub fn probe_app(path: &str, signature: &str, mime: &str) -> App {
         version: String::from("1"),
         kind: String::from("app"),
         doctypes: alloc::vec![String::from(mime)],
+        droptypes: Vec::new(),
         icons: Vec::new(),
         has_res: true,
         source: "elf",

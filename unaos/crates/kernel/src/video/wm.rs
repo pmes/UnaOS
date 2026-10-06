@@ -30439,7 +30439,7 @@ impl<T: 'static> core::ops::DerefMut for Scratch<T> {
 /// [`program_name`]. So `app_name_of` answers for it and PREFSCAP's refusal reaches only a program with no
 /// name at all. Witness: `[wm] launch-name owner=<o> path=<p> name=<n> via=<appres|path> armed=<0|1>`.
 pub fn app_name_arm_launch(owner: u64, path: &str) -> bool {
-    let (name, via) = match crate::fs::appres::launch_name(path) {
+    crate::fs::appres::sight(path); let (name, via) = match crate::fs::appres::launch_name(path) { // DROPTYPES (B477): sight the path first (a no-op when its stamp is cached), so a path launch is a registrant whose declarations (`droptypes`) the drag session reads
         Some(n) => (n, "appres"),
         None => (alloc::string::String::from(program_name(path)), "path"),
     };
