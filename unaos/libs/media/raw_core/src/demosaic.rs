@@ -54,6 +54,31 @@ pub fn colour_at(cfa: &[u8; 4], x: usize, y: usize) -> usize {
     cfa[(y & 1) * 2 + (x & 1)] as usize
 }
 
+/// The bilinear estimate of all three channels at `(x, y)`.
+#[inline]
+pub fn bilinear_at(m: &[u16], w: usize, h: usize, cfa: &[u8; 4], x: usize, y: usize) -> [u32; 3] {
+    let (y0, y1) = (y.saturating_sub(1), (y + 1).min(h - 1));
+    let (x0, x1) = (x.saturating_sub(1), (x + 1).min(w - 1));
+    let own = colour_at(cfa, x, y);
+    let mut sum = [0u32; 3];
+    let mut cnt = [0u32; 3];
+    for yy in y0..=y1 {
+        for xx in x0..=x1 {
+            let c = colour_at(cfa, xx, yy);
+            if c == own && (xx != x || yy != y) {
+                continue;
+            }
+            sum[c] += m[yy * w + xx] as u32;
+            cnt[c] += 1;
+        }
+    }
+    let mut v = [0u32; 3];
+    for c in 0..3 {
+        v[c] = if c == own { m[y * w + x] as u32 } else if cnt[c] > 0 { (sum[c] + cnt[c] / 2) / cnt[c] } else { 0 };
+    }
+    v
+}
+
 /// Full-size bilinear demosaic of a `w x h` mosaic to RGBA8.
 pub fn bilinear_rgba(m: &[u16], w: usize, h: usize, cfa: &[u8; 4], tone: &Tone) -> Result<Vec<u8>, Error> {
     if m.len() < w * h || w == 0 || h == 0 {
@@ -61,28 +86,32 @@ pub fn bilinear_rgba(m: &[u16], w: usize, h: usize, cfa: &[u8; 4], tone: &Tone) 
     }
     let mut out = crate::zeroed::<u8>(w * h * 4)?;
     for y in 0..h {
-        let (y0, y1) = (y.saturating_sub(1), (y + 1).min(h - 1));
         for x in 0..w {
-            let (x0, x1) = (x.saturating_sub(1), (x + 1).min(w - 1));
-            let own = colour_at(cfa, x, y);
-            let mut sum = [0u32; 3];
-            let mut cnt = [0u32; 3];
-            for yy in y0..=y1 {
-                for xx in x0..=x1 {
-                    let c = colour_at(cfa, xx, yy);
-                    if c == own && (xx != x || yy != y) {
-                        continue;
-                    }
-                    sum[c] += m[yy * w + xx] as u32;
-                    cnt[c] += 1;
-                }
-            }
+            let v = bilinear_at(m, w, h, cfa, x, y);
             let o = (y * w + x) * 4;
             for c in 0..3 {
-                let v = if c == own { m[y * w + x] as u32 } else if cnt[c] > 0 { (sum[c] + cnt[c] / 2) / cnt[c] } else { 0 };
-                out[o + c] = tone.map(v);
+                out[o + c] = tone.map(v[c]);
             }
             out[o + 3] = 255;
+        }
+    }
+    Ok(out)
+}
+
+/// Full-size bilinear demosaic to LINEAR `f32` RGB, `black..white` -> `0.0..1.0` unclamped above white (lux's
+/// `RgbBuffer` contract).
+pub fn bilinear_linear(m: &[u16], w: usize, h: usize, cfa: &[u8; 4], black: u16, white: u16) -> Result<Vec<f32>, Error> {
+    if m.len() < w * h || w == 0 || h == 0 {
+        return Err(Error::Truncated);
+    }
+    let span = (white.saturating_sub(black)).max(1) as f32;
+    let mut out = crate::zeroed::<f32>(w * h * 3)?;
+    for y in 0..h {
+        for x in 0..w {
+            let v = bilinear_at(m, w, h, cfa, x, y);
+            for c in 0..3 {
+                out[(y * w + x) * 3 + c] = v[c].saturating_sub(black as u32) as f32 / span;
+            }
         }
     }
     Ok(out)

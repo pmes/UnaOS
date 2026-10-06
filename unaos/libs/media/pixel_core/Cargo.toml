@@ -15,6 +15,9 @@ vp8_core = { path = "../vp8_core" }
 # links font_core). Optional so a build that wants no vector path stays as small as before.
 svg_core = { path = "../svg_core", optional = true }
 
+# RAWCORE (B444): camera raw (TIFF/ARW) is a pixel_core route — UnaOS's own no_std raw core (zero deps).
+raw_core = { path = "../raw_core" }
+
 [features]
 default = []
 # The `svg` format: sniff `<svg`/`<?xml`, render with svg_core at the intrinsic (or a requested) size.

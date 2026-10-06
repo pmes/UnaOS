@@ -37,7 +37,7 @@ pub mod synth;
 pub mod tiff;
 
 pub use decode::RowDecoder;
-pub use demosaic::{bilinear_rgba, Binner, Tone};
+pub use demosaic::{bilinear_linear, bilinear_rgba, Binner, Tone};
 pub use exif::Facts;
 pub use tiff::{parse, RawInfo, Strip};
 
@@ -98,7 +98,8 @@ pub fn mime_of(head: &[u8]) -> Option<&'static str> {
     if !is_tiff(head) {
         return None;
     }
-    let info = parse(head).ok()?;
+    // A TIFF whose IFD0 (or its Make) lies past this head is still a TIFF; a longer head decides the make.
+    let Ok(info) = parse(head) else { return Some(MIME_TIFF) };
     if info.facts.make.as_deref().map(|m| m.trim().eq_ignore_ascii_case("SONY")).unwrap_or(false) {
         Some(MIME_ARW)
     } else {
