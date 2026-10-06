@@ -9337,26 +9337,6 @@ esp_x86_unafs_card() {
             echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs put target/wifi-fw -> /FIRMWARE failed — no card image${COLOR_RESET}"; return 1; }
         echo -e "${COLOR_YELLOW}⚡ WIFI-FW: b43 set (3 files) from ${UNAOS_WIFI_FW_PATH} onto the UnaFS root at /FIRMWARE/ (bench-only, never in-tree)${COLOR_RESET}"
     fi
-    # WIFI-FW (R95/Peter 2026-10-06 "we have the bunker for this"): the BCM4331 b43 firmware set is BENCH-ONLY and never
-    # in-tree (CLEAN_ROOM_POLICY §4; bcm4331.md §S4 option 1). UNAOS_WIFI_FW_PATH=<absolute dir in the bunker> holding
-    # ucode29_mimo.fw + ht0initvals29.fw + ht0bsinitvals29.fw stages the three files onto the UnaFS root at /FIRMWARE/
-    # (one of the three dirs the kernel's WIFI-1 pass searches — /, /B43/, /FIRMWARE/ — on the program-source volume),
-    # so the dd carries them. Unset => nothing staged, the image byte-identical; set but not absolute, unreadable, or a
-    # file missing => the build FAILS LOUDLY naming it (the same rule as UNAOS_XUSB_FW_PATH). No copy lands in the tree.
-    if [ -n "${UNAOS_WIFI_FW_PATH:-}" ]; then
-        case "$UNAOS_WIFI_FW_PATH" in /*) ;; *) echo -e "${COLOR_RED}❌ WIFI-FW: UNAOS_WIFI_FW_PATH must be absolute: ${UNAOS_WIFI_FW_PATH}${COLOR_RESET}"; return 1;; esac
-        local fw
-        for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do
-            [ -r "${UNAOS_WIFI_FW_PATH}/${fw}" ] || { echo -e "${COLOR_RED}❌ WIFI-FW: ${UNAOS_WIFI_FW_PATH}/${fw} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
-        done
-        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- mkdir /FIRMWARE -i "$vol" >/dev/null || {
-            echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs mkdir /FIRMWARE failed — no card image${COLOR_RESET}"; return 1; }
-        for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do
-            cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${UNAOS_WIFI_FW_PATH}/${fw}" /FIRMWARE -i "$vol" >/dev/null || {
-                echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs put ${fw} failed — no card image${COLOR_RESET}"; return 1; }
-        done
-        echo -e "${COLOR_YELLOW}⚡ WIFI-FW: b43 set (3 files) from ${UNAOS_WIFI_FW_PATH} onto the UnaFS root at /FIRMWARE/ (bench-only, never in-tree)${COLOR_RESET}"
-    fi
     # SELFINSTALL2 (B310): the card's GPT is laid by `tools/una-card` over `amber_core` — the SAME core the
     # kernel's `install ssd --write` lays the SSD with (it replaced scripts/make-x86-card.py, byte-identical).
     cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/una-card/Cargo.toml" -- \
