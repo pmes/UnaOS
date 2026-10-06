@@ -16,6 +16,7 @@
 //! | `fileview` `textedit` | `video::fileview::quicklook_body` — the viewer's read, sanitise and painter |
 //! | `markdown` `json` | the same, with the viewer's renderer (`richtext`) |
 //! | `play` | the player's own codec sniff (`audio_core::sniff`): a card naming the format; Return plays it |
+//! | `player` | a video's first frame and facts from the Player's cores (`video::vplay::poster`, its own job) |
 //! | anything else | a card: the icon (APPRES for a program), the name, the type, the size |
 //!
 //! THE PANEL is DIALOG's family's chromeless overlay row (`wm::overlay_open`, the toast's and the shortcuts
@@ -256,6 +257,23 @@ pub(super) fn render_into(path: &str, px: &mut [u32], w: usize, h: usize) -> (&'
             card(px, w, h, strip, path, false, &[alloc::format!("Audio: {}", fmt), size_text(size), String::from("Return plays it")]);
             "play"
         }
+        // VIDEOPLAYER (B434): the Player's own cores — the first frame and the container's facts, decoded on the
+        // `vposter` job (never this pass); the panel re-renders when it lands (`service`).
+        #[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+        "player" => match crate::video::vplay::poster(path, px, w, bx, by, bw, bh) {
+            Some((f, err, drawn)) => {
+                if !drawn {
+                    let mut facts: Vec<String> = f.as_ref().map(|f| crate::video::vplay::fact_lines(f).to_vec()).unwrap_or_default();
+                    facts.push(match err { Some(e) => alloc::format!("Player: {}", e), None => String::from("Return plays it") });
+                    card(px, w, h, strip, path, false, &facts);
+                }
+                "player"
+            }
+            None => {
+                card(px, w, h, strip, path, false, &[String::from("Video: reading the first frame..."), size_text(size)]);
+                "player"
+            }
+        },
         _ => "card",
     };
     if via == "card" {
@@ -348,6 +366,10 @@ pub(super) fn service() {
         close("quarry-closed");
         return;
     }
+    #[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+    if is_open() && crate::video::vplay::poster_fresh() {
+        rerender(); // VIDEOPLAYER (B434): a video's poster landed
+    }
     let r = REQ.try_lock().and_then(|mut g| g.take());
     // The panel FOLLOWS the selection however it moved (an arrow, a press, a wheel, a search keystroke).
     let r = match r {
@@ -395,4 +417,16 @@ pub(super) fn preview_set(dir: &str, names: &[&str]) -> (usize, usize, Vec<Strin
         }
     }
     (viewer, routed, owed)
+}
+
+/// VIDEOPLAYER (B434): draw the panel's current file again (a video's poster job finished).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn rerender() {
+    let mut g = PANEL.lock();
+    let Some(p) = g.as_mut() else { return };
+    let (w, h, path) = (p.w, p.h, p.path.clone());
+    render_into(&path, &mut p.surf, w, h);
+    let win = p.win;
+    drop(g);
+    let _ = wm::present(win);
 }

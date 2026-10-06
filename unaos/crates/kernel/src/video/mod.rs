@@ -1247,3 +1247,6 @@ pub mod lidsleep;
 // DRAGDROP (B440, MACPARITY row 18): the WM drag session (rides PREFSUI's capture; Quarry and the dock participate). At the tail so no line above moves.
 #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub mod dnd;
+// VIDEOPLAYER (B434, MACPARITY row 30): the Player's video job — Stria's fulfiller over demux_core + vp8_core + av1_core (UNAOS_VIDEO). x86 `wc` (the Player's window and the worker pool); at the tail so no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "videoplayer"))]
+pub mod vplay;

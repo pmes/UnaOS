@@ -1219,6 +1219,11 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 [[package]]
 name = "demux_core"
 version = "0.1.0"
+dependencies = [
+ "audio_core",
+ "av1_core",
+ "vp8_core",
+]
 
 [[package]]
 name = "der"

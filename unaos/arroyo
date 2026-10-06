@@ -1245,6 +1245,8 @@ fi
 [ -n "${UNAOS_LIDSLEEP:-}" ] && _feats="${_feats}lidsleep,"
 # SMALLFIX2 (B391, R94 §3): UNAOS_SVG=1 arms SVG as a picture — pixel_core's `svg` format (svg_core) in the kernel, so `image/svg+xml` types and opens in facet. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_SVG:-}" ] && _feats="${_feats}svg,"
+# VIDEOPLAYER (B434): UNAOS_VIDEO=1 — the Player plays video (video::vplay over demux_core + vp8_core + av1_core; links av1_core). x86 metal; the K8_FEATS arm in kernel8() compiles the dependency only. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_VIDEO:-}" ] && _feats="${_feats}videoplayer,"
 # KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
 [ "${UNAOS_WC_BLITTER:-}" = "gpu" ] && _feats="${_feats}wc_gpublit,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
@@ -11774,6 +11776,10 @@ kernel8() {
     if [ -n "${UNAOS_SVG:-}" ]; then
         K8_FEATS="${K8_FEATS},svg"
         echo -e "${COLOR_YELLOW}  • UNAOS_SVG: SMALLFIX2 — SVG opens as a picture (pixel_core svg / svg_core)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_VIDEO:-}" ]; then
+        K8_FEATS="${K8_FEATS},videoplayer"
+        echo -e "${COLOR_YELLOW}  • UNAOS_VIDEO: VIDEOPLAYER — the video cores linked (the Player's video window is x86's today)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"

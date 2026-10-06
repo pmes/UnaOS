@@ -11,6 +11,10 @@ name = "audio_core"
 version = "0.1.0"
 
 [[package]]
+name = "av1_core"
+version = "0.1.0"
+
+[[package]]
 name = "bit_field"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -448,6 +452,7 @@ version = "0.1.0"
 dependencies = [
  "amber_core",
  "audio_core",
+ "av1_core",
  "cfg-if",
  "crypto_core",
  "demux_core",
@@ -478,6 +483,7 @@ dependencies = [
  "usbnet_core",
  "vein_core",
  "volatile 0.6.1",
+ "vp8_core",
  "wifi_core",
  "x86_64",
 ]

@@ -3799,6 +3799,13 @@ svg = ["pixel_core/svg"]
 # lines still build; the seat retires it (Cargo, arroyo, builder, the k8-reach row) at the fold.
 wc_gpublit = ["wc"]
 
+# VIDEOPLAYER (rmbp-ledger B434, MACPARITY row 30): UNAOS_VIDEO=1 — the Player plays video. `video::vplay` is
+# Stria's fulfiller over the shared cores (demux_core + vp8_core + av1_core; the Matroska Vorbis track through
+# audio_core::vorbis), no second decoder (R79): video/webm, video/mp4, video/x-matroska open in the Player.
+# Links av1_core. x86 `wc` + `hda-tone` carry the window and the sound; the aarch64 K8_FEATS arm compiles the
+# dependency only. Kept in sync with `unaos/arroyo` (`_feats` and `K8_FEATS`) and `unaos/builder/src/main.rs`.
+videoplayer = ["dep:av1_core", "dep:vp8_core"]
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
@@ -3886,6 +3893,10 @@ rast = { path = "../rast", optional = true }
 # The two lists must move together — a rung in `chrome_raster` without its feature here is a
 # compile error at the `RasterHeight` variant, which is the failure mode we want.
 noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "size_20", "size_24", "unicode-basic-latin"] }
+
+# VIDEOPLAYER (B434): the picture cores the Player's video job decodes with — optional, pulled only by `videoplayer`.
+vp8_core = { path = "../../libs/media/vp8_core", optional = true }
+av1_core = { path = "../../libs/media/av1_core", optional = true }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 unafs = { path = "../../libs/fs/unafs", default-features = false }
