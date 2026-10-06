@@ -352,6 +352,7 @@ fn report() {
 /// The service tick (folded at the top of `probe_after_root`): latched opens, file pump, ring refill.
 pub fn service() {
     super::amp::tick(); // AUDIO8 (B329) M1: the amp's idle hold-off (idle cost: one atomic load)
+    if ALERT.load(Ordering::Acquire) { alert_play(); } // NOTIFYPANE (B435): a latched alert sound (idle cost: one atomic load)
     if TQ_LIVE.load(Ordering::Acquire) { tq_tick(); } // DECJOBHANG M3: `tests play`'s queue (idle cost: one atomic load)
     if !ACTIVE.load(Ordering::Acquire) { return; }
     if let Some(p) = PENDING.try_lock().and_then(|mut g| g.take()) { let _ = open_wav(&p); }
@@ -1200,3 +1201,66 @@ pub fn pump_until(ms: u64, until: impl Fn() -> bool) -> bool {
 
 /// The PLAYWAV fixture's 2.0 s, 48 kHz stereo body (for `tests player` when no TEST.WAV is staged).
 pub fn fixture_wav() -> Vec<u8> { synth_wav() }
+
+// ── NOTIFYPANE (rmbp-ledger B435, MACPARITY row 26) — the alert sound ───────────────────────────────────────────
+// Our own chime (not a copied system sound): 880 Hz + 1320 Hz (a fifth), 180 ms, a fast attack and a squared
+// decay, mono 16-bit at 48 kHz through this file's own `start` / `feed` / `finish`. NOTIFY asks with
+// [`request_alert`] (an atomic latch, safe from its pass); the device-service tick plays it. Never while the
+// output is already sounding (a player, a WAV, a decoder, another alert): refused `busy`, nothing stacked.
+
+static ALERT: AtomicBool = AtomicBool::new(false);
+const ALERT_RATE: u32 = 48_000;
+const ALERT_MS: usize = 180;
+
+/// Ask for one alert sound on the next service tick. `Err("busy")` while the output is sounding or one is latched.
+pub fn request_alert() -> Result<(), &'static str> {
+    if busy() || DEC_LIVE.load(Ordering::Acquire) || ALERT.load(Ordering::Acquire) {
+        return Err("busy");
+    }
+    ALERT.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// One partial of the chime at sample `n` (Bhaskara's sine, as `synth_wav`), amplitude `amp`.
+fn alert_partial(n: usize, hz: u64, amp: i64) -> i64 {
+    const H: i64 = 32_768;
+    let ph = ((n as u64 * hz * 65_536 / ALERT_RATE as u64) % 65_536) as i64;
+    let (h, neg) = if ph < H { (ph, false) } else { (ph - H, true) };
+    let u = h * (H - h);
+    let s = 16 * u * amp / (5 * H * H - 4 * u);
+    if neg { -s } else { s }
+}
+
+/// The chime's PCM (mono, 16-bit LE).
+fn alert_pcm() -> Vec<u8> {
+    let total = ALERT_RATE as usize * ALERT_MS / 1000;
+    let attack = ALERT_RATE as usize / 500; // 2 ms
+    let mut v = Vec::with_capacity(total * 2);
+    for n in 0..total {
+        let rest = (total - n) as i64;
+        let mut x = alert_partial(n, 880, 6000) + alert_partial(n, 1320, 3000);
+        x = x * rest * rest / (total as i64 * total as i64); // squared decay to silence
+        if n < attack { x = x * n as i64 / attack as i64; }
+        v.extend_from_slice(&(x.clamp(-32_767, 32_767) as i16).to_le_bytes());
+    }
+    v
+}
+
+fn alert_play() {
+    if !ALERT.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if busy() {
+        serial_println!("[play] alert -> busy (the output is sounding)");
+        return;
+    }
+    let pcm = alert_pcm();
+    match start(ALERT_RATE, 1, 16) {
+        Ok(eff) => {
+            let took = feed(&pcm);
+            finish();
+            serial_println!("[play] alert hz=880+1320 ms={} bytes={} fed={} eff_rate={} -> started", ALERT_MS, pcm.len(), took, eff);
+        }
+        Err(r) => serial_println!("[play] alert -> REFUSED reason={}", r),
+    }
+}
