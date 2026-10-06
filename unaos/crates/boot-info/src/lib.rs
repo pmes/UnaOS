@@ -73,6 +73,70 @@ pub struct MemoryRegion {
     pub kind: MemoryRegionKind,
 }
 
+/// LOADERSTALL (B490): `LoaderStages::magic` when the record was written ("LSTG").
+pub const LOADER_STAGES_MAGIC: u32 = 0x4754_534C;
+/// LOADERSTALL: how many stage slots the record carries.
+pub const LOADER_STAGE_MAX: usize = 8;
+/// LOADERSTALL: the loader's stages, by id — the ONE name table both sides print from.
+pub const LOADER_STAGE_NAMES: [&str; 7] = ["firmware", "gop", "volumes", "kernel", "elf", "discover", "jump"];
+/// LOADERSTALL: the UART the loader drove (`LoaderStages::uart`), by id.
+pub const LOADER_UART_NAMES: [&str; 3] = ["none", "efi-serial", "com1"];
+
+/// LOADERSTALL (rmbp-ledger B490): the loader's stage record. Stage `i` runs from the end of stage
+/// `i - 1` (stage 0 from `BootInfo::tsc_loader_entry`) to `end_tsc[i]`; every stamp is a RAW TSC
+/// count, converted by the kernel with the rate it measures (the BOOTCLOCK rule). `loader_hz` is the
+/// loader's own rate (a 10 ms firmware stall), used only for the loader's panel lines.
+///
+/// ABI-LOCK: carried by value inside `BootInfo`; its layout is pinned below.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct LoaderStages {
+    /// `LOADER_STAGES_MAGIC` when written; anything else = absent.
+    pub magic: u32,
+    /// Stages recorded (entries of `id`/`end_tsc`/`last_status` in use).
+    pub count: u32,
+    /// Stage budgets that ran out (the watchdog's TIMEOUT lines); 0 on a healthy boot.
+    pub timeouts: u32,
+    /// Index into `LOADER_UART_NAMES`.
+    pub uart: u32,
+    /// SimpleFileSystem volumes the firmware published.
+    pub volumes: u32,
+    /// Chunk reads of `kernel.elf` that failed and were retried.
+    pub retries: u32,
+    /// Bytes of `kernel.elf` read.
+    pub kernel_bytes: u64,
+    /// The loader's TSC rate (Hz) from a firmware stall; 0 = uncalibrated.
+    pub loader_hz: u64,
+    /// Raw TSC at the end of each stage.
+    pub end_tsc: [u64; LOADER_STAGE_MAX],
+    /// Index into `LOADER_STAGE_NAMES` per stage.
+    pub id: [u8; LOADER_STAGE_MAX],
+    /// The last status the stage read (a UEFI status code's low 32 bits, or the read's bytes so far).
+    pub last_status: [u32; LOADER_STAGE_MAX],
+}
+
+impl LoaderStages {
+    /// The absent record (what a loader that wrote nothing would leave: magic 0).
+    pub const EMPTY: LoaderStages = LoaderStages {
+        magic: 0, count: 0, timeouts: 0, uart: 0, volumes: 0, retries: 0, kernel_bytes: 0, loader_hz: 0,
+        end_tsc: [0; LOADER_STAGE_MAX], id: [0; LOADER_STAGE_MAX], last_status: [0; LOADER_STAGE_MAX],
+    };
+    /// Whether a loader wrote this record.
+    pub fn present(&self) -> bool {
+        self.magic == LOADER_STAGES_MAGIC && (self.count as usize) <= LOADER_STAGE_MAX
+    }
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(core::mem::size_of::<LoaderStages>() == 144, "ABI-LOCK: LoaderStages size changed — it sits by value inside BootInfo. See the ABI-LOCK note at the top of this file.");
+    assert!(core::mem::align_of::<LoaderStages>() == 8, "ABI-LOCK: LoaderStages alignment changed — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(LoaderStages, kernel_bytes) == 24, "ABI-LOCK: LoaderStages field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(LoaderStages, end_tsc) == 40, "ABI-LOCK: LoaderStages field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(LoaderStages, id) == 104, "ABI-LOCK: LoaderStages field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(LoaderStages, last_status) == 112, "ABI-LOCK: LoaderStages field offset moved — see the ABI-LOCK note at the top of this file.");
+};
+
 /// The information passed from the UEFI bootloader to the Kernel.
 ///
 /// ABI-LOCK: `#[repr(C)]`, layout pinned by the `const` assertions at the bottom of this file.
@@ -191,6 +255,13 @@ pub struct BootInfo {
     /// `exit_boot_services`. 0 = absent; see [`BootInfo::tsc_loader_entry`].
     #[cfg(target_arch = "x86_64")]
     pub tsc_loader_jump: u64,
+    /// LOADERSTALL (rmbp-ledger B490): the loader's own stage record — what each loader phase took,
+    /// the last status it read, the UART it found and how many stage budgets ran out. Written by the
+    /// x86 UEFI loader (`crates/bootloader/src/stages.rs`), read by the kernel (`loaderstage.rs`:
+    /// the `:: LOADER:` line and `tests loader`). x86_64 only, for the BOOTCLOCK reason above.
+    /// `magic != LOADER_STAGES_MAGIC` is the absent sentinel (a pre-LOADERSTALL `bootloader.efi`).
+    #[cfg(target_arch = "x86_64")]
+    pub loader_stages: LoaderStages,
 
     #[cfg(feature = "unaos_ivb")]
     pub igpu_trace_0: [u32; 11],
@@ -271,6 +342,7 @@ const _: () = {
     assert!(offset_of!(BootInfo, tsc_loader_entry) == 256, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
     assert!(offset_of!(BootInfo, tsc_loader_read) == 264, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
     assert!(offset_of!(BootInfo, tsc_loader_jump) == 272, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
+    assert!(offset_of!(BootInfo, loader_stages) == 280, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
 };
 
 /// The size of the common prefix — everything above the `unaos_ivb` fields, and also
@@ -282,7 +354,7 @@ const _: () = {
 /// `unaos_ivb` tail's first assertion is written against, so keeping it honest per arch is what
 /// keeps THAT check meaningful rather than merely true.
 #[cfg(target_arch = "x86_64")]
-pub const BOOT_INFO_COMMON_LEN: usize = 280;
+pub const BOOT_INFO_COMMON_LEN: usize = 424; // LOADERSTALL (B490): 280 + the 144-byte LoaderStages record
 #[cfg(not(target_arch = "x86_64"))]
 pub const BOOT_INFO_COMMON_LEN: usize = 256;
 
@@ -313,14 +385,14 @@ const _: () = {
     // one-sided `unaos_ivb` arm non-catastrophic. If it ever fails, the two feature legs have
     // diverged in their shared region and the loader and kernel no longer see the same fields.
     assert!(offset_of!(BootInfo, igpu_trace_0) == BOOT_INFO_COMMON_LEN, "ABI-LOCK: the unaos_ivb tail no longer starts at the end of the common prefix — the two feature legs have diverged. See the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_0) == 280, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_1) == 324, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_2) == 368, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, gmux_trace_0) == 412, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_valid) == 440, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, kdisp_trace_0) == 444, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, kdisp_trace_valid) == 472, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(core::mem::size_of::<BootInfo>() == 480, "ABI-LOCK: BootInfo size changed on an unaos_ivb build — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_0) == 424, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_1) == 468, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_2) == 512, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, gmux_trace_0) == 556, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_valid) == 584, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, kdisp_trace_0) == 588, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, kdisp_trace_valid) == 616, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(core::mem::size_of::<BootInfo>() == 624, "ABI-LOCK: BootInfo size changed on an unaos_ivb build — see the ABI-LOCK note at the top of this file.");
 };
 
 #[cfg(all(feature = "unaos_ivb", not(target_arch = "x86_64")))]
