@@ -31,6 +31,7 @@ import glob
 import hashlib
 import os
 import re
+import shutil
 import sys
 import tempfile
 
@@ -259,6 +260,7 @@ def selftest():
             with open(bp, "w") as f:
                 f.write("# fixture\n%s\n" % bl[0])
         errs, _r, _f, _b = check(d, bp)
+        shutil.rmtree(d, ignore_errors=True)
         got = 1 if errs else 0
         hit = why is None or any(why in e for e in errs)
         if got != want or not hit:

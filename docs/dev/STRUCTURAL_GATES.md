@@ -2535,3 +2535,26 @@ brief head (EXECUTOR-BRIEF step 11) makes the executor state it before coding an
 is live and its core is not being shared. The audit's fix program (ATTRSURF, PREFS, BANDY-3) is what
 turns `owed` rows into `fulfiller`/`shared-core` ones; this gate only stops the count growing.
 
+
+## GATE-STATUS — a status word cites a row whose wire line is real (B425, 2026-10-06)
+
+**The hole.** A claim's status was prose in four places (ledger status cells, queue STATE lines, ladder docs,
+evidence files) and nothing compared a status word with the wire: B338/B131/B124 said the BCM4331 upload
+"never flew" while `f13-boot1.log` 33884 ms reads `rev=666 -> UPLOADED`, repeated on flights 14–20 (WIFI5 M1).
+DRIVERS-METHOD §3 was a rule, per ladder, with no gate.
+
+**The gate.** `python3 tools/status-check.py`, run by `./arroyo check` beside GATE-CHARTER. The one table is
+`docs/dev/STATUS.tsv` (`docs/dev/STATUS.md`). Refused, by name: a malformed row (id not `ST<n>` or repeated,
+status outside open/confirmed/refuted/parked/unflown, a flight not `f<n>`, a row-ref naming no ledger row);
+confirmed/refuted without a flight AND a quoted line; a quoted line not found byte-for-byte in that flight's
+capture (`docs/dev/evidence/**/f<N>-boot*.log`, `FLIGHT<N>.md`); unflown with a flight; a status cell of
+rmbp-ledger.md / LEDGER.md or a queue STATE line that says flew / never flew / unflown / proven / confirmed /
+refuted / landed on metal and cites no `ST<n>` row (the GATE-LEDGER enum word at a cell's head is not a claim).
+Cells that predate the gate are keyed in `docs/dev/STATUS.baseline`; a keyed cell that now cites a row, or no
+longer claims, fails as stale — the baseline only shrinks, and a new claiming cell never gets a key.
+
+**Go-red.** `--selftest` builds eleven fixture trees; a row quoting `:: a line nobody printed ::` MUST fail
+(`line NOT on the wire`), as must confirmed-without-flight, unflown-with-flight, a flight with no capture, an
+uncited claiming cell, a citation of a missing row, a bad status, and a stale baseline key; the good tree, the
+enum head and a grandfathered cell pass. At the cut: 42 rows (23 confirmed, 5 refuted, 4 parked, 3 open,
+7 unflown), every quoted line found; 188 claiming cells grandfathered; under 1 s.
