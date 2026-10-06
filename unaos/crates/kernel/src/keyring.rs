@@ -425,10 +425,11 @@ pub fn ringlogin_selftest() {
     };
     let rekey = rekey_fixture(); // RINGLOGIN2 (B479)
     let arm = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86" };
-    let pass = reconnect && rekey;
+    let settings = settings_rekey_word(); // SETTINGSREKEY (B483)
+    let pass = reconnect && rekey && settings != "FAIL";
     serial_println!(
-        ":: RINGLOGIN: ring={} at={} reconnect_before_unlock={} rekey={} arm={} passwd_rekeyed={} door={} posted={} taken={} report={} -> {} ::",
-        ring, if at_login { "login" } else { "none" }, if reconnect { "ok" } else { "FAIL" }, if rekey { "ok" } else { "FAIL" }, arm,
+        ":: RINGLOGIN: ring={} at={} reconnect_before_unlock={} rekey={} settings_rekey={} settings_rekeyed={} arm={} passwd_rekeyed={} door={} posted={} taken={} report={} -> {} ::",
+        ring, if at_login { "login" } else { "none" }, if reconnect { "ok" } else { "FAIL" }, if rekey { "ok" } else { "FAIL" }, settings, RL_REKEYED_SETTINGS.load(Relaxed), arm,
         RL_REKEYED.load(Relaxed), made, posted, taken,
         if st == i32::MIN { "none" } else { status_word_short(st) }, if pass { "PASS" } else { "FAIL" }
     );
@@ -479,6 +480,9 @@ static RL_REFUSAL_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// Re-wraps reported OK this boot, and the posted REKEY's clock.
 static RL_REKEYED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static RL_REKEY_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// SETTINGSREKEY (B483): the posted REKEY's origin (0 `passwd`, 1 `settings`) and Settings' re-wraps reported OK.
+static RL_REKEY_AT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static RL_REKEYED_SETTINGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// SYS_KDF's body over `password` at `salt` and parameters — the key or the wire's reason word.
 #[cfg(all(feature = "lumen", feature = "login"))]
@@ -496,6 +500,12 @@ fn derive_at(password: &[u8], salt: &[u8; 16], m: u32, t: u32, p: u32) -> Result
 /// `passwd`'s half: `name`'s password changed from `old` (verified by the caller) to `new` (already written).
 /// Derives both ring keys and posts a REKEY door; starts HOLOCRON.ELF when it is not running. One line.
 pub fn ring_rekey(name: &[u8], old: &[u8], new: &[u8]) {
+    ring_rekey_at(name, old, new, "passwd");
+}
+
+/// SETTINGSREKEY (B483): [`ring_rekey`] with the change's origin (`passwd` or `settings`) on every line it says
+/// and on HOLOCRON.ELF's answer. Settings' change form calls this from the `login-submit` worker.
+pub fn ring_rekey_at(name: &[u8], old: &[u8], new: &[u8], at: &'static str) {
     #[cfg(all(feature = "lumen", feature = "login"))]
     {
         let t0 = crate::arch::ms();
@@ -507,16 +517,16 @@ pub fn ring_rekey(name: &[u8], old: &[u8], new: &[u8]) {
             Ok(Some(b)) => match holocron_core::format::parse_ring(&b) {
                 Ok((hdr, _, _)) => hdr,
                 Err(_) => {
-                    serial_println!("[holocron] door none at=passwd reason=ring-unparsed (the ring is NOT re-keyed; Holocron says CORRUPT on its own read)");
+                    serial_println!("[holocron] door none at={} reason=ring-unparsed (the ring is NOT re-keyed; Holocron says CORRUPT on its own read)", at);
                     return;
                 }
             },
             Ok(None) => {
-                serial_println!("[holocron] ring=none at=passwd (nothing to re-key: the next login makes the ring under the new password)");
+                serial_println!("[holocron] ring=none at={} (nothing to re-key: the next login makes the ring under the new password)", at);
                 return;
             }
             Err(why) => {
-                serial_println!("[holocron] door none at=passwd reason={} (the ring is NOT re-keyed)", why);
+                serial_println!("[holocron] door none at={} reason={} (the ring is NOT re-keyed)", at, why);
                 return;
             }
         };
@@ -524,7 +534,7 @@ pub fn ring_rekey(name: &[u8], old: &[u8], new: &[u8]) {
         let mut k_old = match derive_at(old, &hdr.salt, m, t, p) {
             Ok(k) => k,
             Err(why) => {
-                serial_println!("[holocron] door none at=passwd reason={} m_kib={} t={} p={} (the ring is NOT re-keyed)", why, m, t, p);
+                serial_println!("[holocron] door none at={} reason={} m_kib={} t={} p={} (the ring is NOT re-keyed)", at, why, m, t, p);
                 return;
             }
         };
@@ -532,7 +542,7 @@ pub fn ring_rekey(name: &[u8], old: &[u8], new: &[u8]) {
             Ok(k) => k,
             Err(why) => {
                 wipe(&mut k_old);
-                serial_println!("[holocron] door none at=passwd reason={} m_kib={} t={} p={} (the ring is NOT re-keyed)", why, m, t, p);
+                serial_println!("[holocron] door none at={} reason={} m_kib={} t={} p={} (the ring is NOT re-keyed)", at, why, m, t, p);
                 return;
             }
         };
@@ -548,18 +558,24 @@ pub fn ring_rekey(name: &[u8], old: &[u8], new: &[u8]) {
         wipe(&mut door);
         RL_POSTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         RL_REKEY_T0.store(t0, core::sync::atomic::Ordering::Relaxed);
+        RL_REKEY_AT.store(if at == "settings" { 1 } else { 0 }, core::sync::atomic::Ordering::Relaxed); // SETTINGSREKEY: the answer says where the change was made
         serial_println!(
-            "[holocron] door kdf=kernel mode=rekey m_kib={} t={} p={} ms={} -> posted (both passwords are dropped here; HOLOCRON.ELF re-wraps, the salt and parameters kept)",
-            m, t, p, crate::arch::ms().saturating_sub(t0)
+            "[holocron] door kdf=kernel mode=rekey m_kib={} t={} p={} ms={} at={} -> posted (both passwords are dropped here; HOLOCRON.ELF re-wraps, the salt and parameters kept)",
+            m, t, p, crate::arch::ms().saturating_sub(t0), at
         );
         after_login(name); // HOLOCRON.ELF takes the door at its start when it is not already running
     }
     #[cfg(not(all(feature = "lumen", feature = "login")))]
-    let _ = (name, old, new);
+    let _ = (name, old, new, at);
 }
 
 /// `passwd <name>` by the administrator: no old password, so the ring is NOT re-keyed. Said once, at the change.
 pub fn ring_kept_admin_reset(name: &[u8]) {
+    ring_kept_admin_reset_at(name, "passwd");
+}
+
+/// SETTINGSREKEY (B483): [`ring_kept_admin_reset`] with the change's origin (Settings' Users pane Reset says `settings`).
+pub fn ring_kept_admin_reset_at(name: &[u8], at: &'static str) {
     #[cfg(all(feature = "lumen", feature = "login"))]
     {
         let mut h = [0u8; crate::fs::users::HOME_MAX];
@@ -567,26 +583,29 @@ pub fn ring_kept_admin_reset(name: &[u8]) {
         let Ok(home) = core::str::from_utf8(&h[..hl]) else { return };
         if ring_root(home) != "none" {
             serial_println!(
-                "[holocron] ring=kept at=passwd user={} reason=admin-reset (no old password: the ring stays under the old one; the next login says the way back once)",
-                core::str::from_utf8(name).unwrap_or("?")
+                "[holocron] ring=kept at={} user={} reason=admin-reset (no old password: the ring stays under the old one; the next login says the way back once)",
+                at, core::str::from_utf8(name).unwrap_or("?")
             );
         }
     }
     #[cfg(not(all(feature = "lumen", feature = "login")))]
-    let _ = name;
+    let _ = (name, at);
 }
 
 /// HOLOCRON.ELF's answer to a REKEY door. Says the witness.
 fn rekey_report(status: i32) -> i64 {
     let user = session().map(|(n, _, _)| n).unwrap_or_default();
     let ms = crate::arch::ms().saturating_sub(RL_REKEY_T0.load(core::sync::atomic::Ordering::Relaxed));
+    let settings = RL_REKEY_AT.load(core::sync::atomic::Ordering::Relaxed) == 1; // SETTINGSREKEY (B483)
+    let at = if settings { "settings" } else { "passwd" };
     if status == 0 {
         RL_REKEYED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        serial_println!("[holocron] ring=rekeyed at=passwd user={} ms={}", user, ms);
+        if settings { RL_REKEYED_SETTINGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+        serial_println!("[holocron] ring=rekeyed at={} user={} ms={}", at, user, ms);
     } else {
         serial_println!(
-            "[holocron] ring=rekey-refused at=passwd user={} status={} ({}) -> the old ring is kept: the next login reads bad-password; `holocron unlock <old password>` opens it",
-            user, status, status_word_short(status)
+            "[holocron] ring=rekey-refused at={} user={} status={} ({}) -> the old ring is kept: the next login reads bad-password; `holocron unlock <old password>` opens it",
+            at, user, status, status_word_short(status)
         );
     }
     0
@@ -636,4 +655,21 @@ fn rekey_fixture() -> bool {
     let r = h2.handle(me, get.verb(), &get.encode_body(), 0, 0);
     let secret_ok = r.status == status::OK && r.body.as_slice() == [7u8; 16];
     wrong_kept && done && salt_kept && old_refused && new_opens && secret_ok
+}
+
+// =================================================================================================
+// SETTINGSREKEY (rmbp-ledger B483) — `tests ringlogin`'s `settings_rekey=`. TAIL-APPENDED.
+// The Settings change form's mode map and its REAL worker body (`video::crystal::login`): see
+// docs/dev/evidence/rmbp-1005/settingsrekey.md.
+// =================================================================================================
+
+fn settings_rekey_word() -> &'static str {
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        crate::video::crystal::login::settings_rekey_fixture()
+    }
+    #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    {
+        "no-form"
+    }
 }
