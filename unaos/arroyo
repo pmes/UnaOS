@@ -4322,6 +4322,50 @@ build_user_holocron_x86() {
     echo -e "${COLOR_GREEN}✅ x86 ring-3 secrets handler: HOLOCRON-X86.ELF${COLOR_RESET}"
 }
 
+# HOLOCRONARM (rmbp-ledger B484): build the aarch64 HOLOCRON.ELF — the SAME crate, linked at the aarch64 ELF
+# window (user-holocron.ld, VA una_abi::USER_XWIN_VA_ARM, RING3ABI2 M5) → target/HOLOCRON.ELF. Like the other
+# aarch64 images the build IS the staged name (no -ARM suffix): `kernel8` and `esp_jetson` copy it to
+# APPS/HOLOCRON.ELF when `lumen` is armed, so the login (`keyring::after_login`) starts the one fulfiller that
+# takes the RINGLOGIN door. The bare-aarch64 target comes from the crate's .cargo/config.toml, so no --target.
+# Checks: ELF magic, e_machine b700, `_start` = the lowest PT_LOAD = the window VA (the loader's elf-model
+# test), the file within xwin::IMAGE_CAP (12 MiB on the 48 MiB heap) and image + stack within the window.
+USER_XWIN_VA_ARM=$((0x7840200000))
+build_user_holocron_aarch64() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building aarch64 ring-3 secrets handler (crates/user-holocron → target/HOLOCRON.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-holocron"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-holocron/user-holocron.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-holocron/target/aarch64-base/release/user-holocron" \
+      "${WORKSPACE_DIR}/target/HOLOCRON.ELF"
+    local f="${WORKSPACE_DIR}/target/HOLOCRON.ELF" out
+    [ -s "$f" ] || { echo -e "${COLOR_RED}ERROR: HOLOCRON.ELF missing/empty — aarch64 HOLOCRON build failed${COLOR_RESET}"; exit 1; }
+    [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: HOLOCRON.ELF does not start with the ELF magic${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "$f" | tr -d ' \n')"
+    [ "$pmach" = "b700" ] || { echo -e "${COLOR_RED}ERROR: HOLOCRON.ELF e_machine is ${pmach}, want b700 (EM_AARCH64=183 LE)${COLOR_RESET}"; exit 1; }
+    out="$(python3 - "$f" "$USER_WINDOW_BYTES" "$USER_XWIN_VA_ARM" 12582912 <<'PY'
+import struct, sys
+b = open(sys.argv[1], 'rb').read(); win = int(sys.argv[2]); xva = int(sys.argv[3]); fcap = int(sys.argv[4])
+entry, = struct.unpack_from('<Q', b, 24); phoff, = struct.unpack_from('<Q', b, 32); phent, phnum = struct.unpack_from('<HH', b, 54)
+loads, stack = [], 0
+for i in range(phnum):
+    t, fl, off, va, pa, fs, ms, al = struct.unpack_from('<IIQQQQQQ', b, phoff + i * phent)
+    if t == 1: loads.append((va, ms))
+    if t == 0x6474E551: stack = ms
+lo = min(v for v, _ in loads); hi = max(v + m for v, m in loads)
+st = ((stack + 0xFFF) & ~0xFFF) if stack else 65536
+need = (hi - xva) + st + 4096
+print("model=elf entry=%#x lo=%#x span=%d stack=%d need=%d file=%d file_cap=%d" % (entry, lo, hi - lo, st, need, len(b), fcap))
+sys.exit(0 if lo == xva and entry == xva and need <= win and st <= (1 << 20) and len(b) <= fcap else 1)
+PY
+)" || { echo -e "${COLOR_RED}ERROR: HOLOCRON.ELF does not fit the aarch64 ELF window: ${out}${COLOR_RESET}"; exit 1; }
+    echo -e "   HOLOCRON.ELF: ${out}"
+    echo -e "${COLOR_GREEN}✅ aarch64 ring-3 secrets handler: HOLOCRON.ELF${COLOR_RESET}"
+}
+
 # VEINTLS (SR36): NET.ELF runs on vein_ring3 (the transport LUMEN uses: verified TLS 1.3 with tls_core), linked at
 # the ELF window (RING3ABI2's user-net-x86.ld, taken verbatim) and built `--features cryptocore`.
 # NETRING3 M3 (B306): build the x86_64 static ELF64 ring-3 network client (crates/user-net → target/NET-X86.ELF),
@@ -5882,6 +5926,7 @@ USER_CHECK_MATRIX=(
   "user-vug      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-pulse    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-holocron aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-holocron/user-holocron.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
 )
 
 # Type-check every USER_CHECK_MATRIX row whose arch label matches $1, and print one summary line in the
@@ -9959,6 +10004,13 @@ stage_jetson_el0_images() {
         cp "$src" "${APPS_DIR_ARM}/${img}"
         staged=$((staged + 1))
     done
+    case ",${_feats}" in
+        *",lumen,"*)   # HOLOCRONARM (B484): the Orin's Holocron (the RINGLOGIN door's taker), as kernel8 stages it
+            build_user_holocron_aarch64
+            cp "${WORKSPACE_DIR}/target/HOLOCRON.ELF" "${APPS_DIR_ARM}/HOLOCRON.ELF"
+            staged=$((staged + 1))
+            ;;
+    esac
     # HELLO.BIN: only when `tegra_el0` armed `build_user_blob` above (see the block header).
     if [ -s "${WORKSPACE_DIR}/target/user_blob.bin" ]; then
         case ",${_feats}" in
@@ -11793,7 +11845,7 @@ kernel8() {
     fi
     if [ -n "${UNAOS_LUMEN:-}" ]; then
         K8_FEATS="${K8_FEATS},lumen"
-        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.ELF yet: its aarch64 text exceeds the window; tests lumen is x86)${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.ELF yet; tests lumen is x86) + HOLOCRONARM: APPS/HOLOCRON.ELF and the RINGLOGIN door${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_NETRING3:-}" ]; then
         K8_FEATS="${K8_FEATS},netring3"
@@ -11801,7 +11853,7 @@ kernel8() {
     fi
     if [ -n "${UNAOS_SELFDIAG:-}" ]; then
         K8_FEATS="${K8_FEATS},selfdiag"
-        echo -e "${COLOR_YELLOW}  • UNAOS_SELFDIAG: SELFDIAG — the boot log on disk + tests selfdiag (SYS_PATH_READ/WRITE and DIAG.ELF are x86's)${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SELFDIAG: SELFDIAG — the boot log on disk + tests selfdiag + SYS_PATH_READ/WRITE (HOLOCRONARM: Holocron's store; DIAG.ELF is x86's)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_PANIC_HOLD:-}" ]; then
         K8_FEATS="${K8_FEATS},panic_hold"
@@ -11954,6 +12006,17 @@ kernel8() {
     # PULSE-1: carry the cpu-pulse static ELF64 onto the boot media as PULSE.ELF, same reasoning as STAT
     # above — a distinct 8.3 name, its own IMAGE_SHA256 principal, driven by `bg /apps/PULSE.ELF`.
     cp "${WORKSPACE_DIR}/target/PULSE.ELF" "$KERNEL8_DIR/APPS/PULSE.ELF"
+
+    # HOLOCRONARM (B484): with `lumen` (the RINGLOGIN door, SYS_KDF, the login launch) the Pi card carries
+    # Holocron — the aarch64 HOLOCRON.ELF in the ELF window, which `keyring::after_login` starts and which takes
+    # the door. Its store is SYS_PATH_READ/WRITE (`selfdiag`, as on x86), the ring lives on a UnaFS home.
+    case ",${K8_FEATS}," in
+        *",lumen,"*)
+            build_user_holocron_aarch64
+            cp "${WORKSPACE_DIR}/target/HOLOCRON.ELF" "$KERNEL8_DIR/APPS/HOLOCRON.ELF"
+            case ",${K8_FEATS}," in *",selfdiag,"*) ;; *) echo -e "${COLOR_YELLOW}  ⚠ HOLOCRON.ELF staged without UNAOS_SELFDIAG=1: its store (SYS_PATH_READ/WRITE) answers -ENOSYS on this image${COLOR_RESET}" ;; esac
+            ;;
+    esac
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it

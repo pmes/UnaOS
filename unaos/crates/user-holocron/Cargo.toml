@@ -7,7 +7,7 @@
 # program brings the metal's I/O: the store over SYS_PATH_READ/WRITE under `<home>/.config/unaos/holocron/`
 # (UnaFS only), entropy from SYS_GETRANDOM through CRYPTOCORE's DRBG, the owner from SYS_WHOAMI, the ring
 # KDF in ring 3 (WINDOW2, B361: Argon2id over SYS_SBRK memory in the 64 MiB window; SYS_KDF only for a ring that does
-# not fit). Linked in the ELF window. x86_64 only.
+# not fit). Linked in the ELF window: x86_64 (user-holocron-x86.ld) and, HOLOCRONARM (B484), aarch64 (user-holocron.ld).
 #
 # The empty [workspace] table makes this crate its OWN workspace root.
 [workspace]
