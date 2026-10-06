@@ -2922,7 +2922,7 @@ fn vacate_settle(pw: usize, ph: usize) -> u64 {
 
 /// Hold time that turns a press on a running tile into the menu, ms.
 const LONGPRESS_MS: u64 = 600;
-const MENU_ITEMS: usize = 2;
+const MENU_ITEMS: usize = 3; // PREFSUI (R91): Quit, Keep in Dock, Open at Login
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 static MENU_OWNER: AtomicU64 = AtomicU64::new(0);
 static MENU_TILE: AtomicU64 = AtomicU64::new(0);
@@ -2990,7 +2990,7 @@ fn menu_geo(l: &Layout, rows: &[wm::DockEntry], dims: Option<(usize, usize)>) ->
     let (t, owner) = (MENU_TILE.load(Ordering::Relaxed) as usize, MENU_OWNER.load(Ordering::Relaxed));
     if t >= rows.len() || rows[t].owner_asid != owner { MENU_OPEN.store(false, Ordering::Release); return None; }
     let (tx, _, _, _) = l.tile(t)?;
-    let mw = (16 * CELL_W() + 2 * PAD()).min(l.w);
+    let mw = (18 * CELL_W() + 2 * PAD()).min(l.w); // PREFSUI: `[x] Open at Login` is the widest row
     let nrows = MENU_ITEMS + menu_win_rows(owner); // WINDOWLIST M3 — one extra row per window when the app has more than one
     let mh = nrows * TILE_H();
     let band = mh + PAD();
@@ -3022,7 +3022,7 @@ fn menu_row(out: &mut [u32], l: &Layout, g: Option<MenuGeo>, j: usize) {
         out[bx + i] = if edge_row || i == 0 || i + 1 == g.mw { theme::FRAME_LINE } else { face };
     }
     let mut wbuf = [0u8; wm::MAX_TITLE];
-    let label: &[u8] = if row == 0 { b"Quit" } else if row == 1 { if g.keep { b"Remove from Dock" } else { b"Keep in Dock" } } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3
+    let label: &[u8] = if row == 0 { b"Quit" } else if row == 1 { if g.keep { b"Remove from Dock" } else { b"Keep in Dock" } } else if row == 2 { if open_at_login(g.owner) { b"[x] Open at Login" } else { b"[ ] Open at Login" } } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3
     if sy0 >= 0 { super::text::draw_row(out, l.w, label, bx + PAD(), sy0 as usize, ink, false, FACE); }
 }
 
@@ -3093,6 +3093,11 @@ pub fn menu_press(x: i32, y: i32) -> bool {
         let win = rows[..n].iter().find(|r| r.owner_asid == owner).map(|r| r.id).unwrap_or(wm::WIN_NONE);
         let how = quit_owner(win, owner);
         serial_println!("[dock] menu quit owner={:#x} -> {}", owner, how);
+    } else if prow == 2 { // PREFSUI (R91): the same `system.login.items` the Settings Login Items tab edits
+        match dp_spec_of_owner(owner) {
+            Some(i) => { let on = crate::video::loginitems::edit("toggle", DP_PINS[i].name, "dock") && crate::video::loginitems::contains(DP_PINS[i].name); serial_println!("[dock] menu open-at-login owner={:#x} app={} -> {}", owner, DP_PINS[i].name, if on { "on" } else { "off" }); }
+            None => serial_println!("[dock] menu open-at-login owner={:#x} -> no-app (not in the dock's app table)", owner),
+        }
     } else {
         let now = toggle_keep(owner);
         serial_println!("[dock] menu {} owner={:#x}", if now { "keep-in-dock" } else { "remove-from-dock" }, owner);
@@ -3629,4 +3634,33 @@ impl core::ops::DerefMut for ModelBuf {
             None => &mut self.own,
         }
     }
+}
+
+// ── PREFSUI (rmbp-ledger B389, R91) — login items launch through the dock's own seams ──────────────────────────
+
+/// Is the table app behind `owner` a login item? (The menu's checkbox; never blocks.)
+fn open_at_login(owner: u64) -> bool {
+    dp_spec_of_owner(owner).map(|i| crate::video::loginitems::contains(DP_PINS[i].name)).unwrap_or(false)
+}
+
+/// The programs this build can launch from the dock's table (what a login item may name).
+pub fn installed_names() -> alloc::vec::Vec<&'static str> {
+    (0..DP_PINS.len()).filter(|&i| dp_available(i)).map(|i| DP_PINS[i].name).collect()
+}
+
+/// Launch the table app `name` exactly as its pin tile would (a POST drained by the owning body). `None` for a
+/// name the table does not carry.
+pub fn launch_named(name: &str) -> Option<&'static str> {
+    let i = (0..DP_PINS.len()).find(|&i| dp_available(i) && DP_PINS[i].name.eq_ignore_ascii_case(name))?;
+    Some(match i {
+        0 => { post_launch(PinnedApp::Console); "console-posted" }
+        1 => { post_launch(PinnedApp::Shell); "shell-posted" }
+        2 => {
+            #[cfg(feature = "quarry")]
+            { crate::video::quarry::request_open(); "quarry-requested" }
+            #[cfg(not(feature = "quarry"))]
+            { return None; }
+        }
+        _ => dp_launch(i),
+    })
 }

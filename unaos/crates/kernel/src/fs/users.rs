@@ -856,6 +856,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
         core::str::from_utf8(&nb[..name.len()]).unwrap_or("?"),
         id
     );
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::loginitems::post_login(); // PREFSUI (B389, R91): the user's login items launch after the desktop is built (`loginitems::service`)
     #[cfg(feature = "lumen")] crate::keyring::after_login(name); // HOLOCRON2 (B355): the secrets handler starts with the session when the user has a ring
     Ok(())
 }

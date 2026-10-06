@@ -62,8 +62,8 @@ const TOP: usize = 12 + TAB_H;
 const ROW_H: usize = 40;
 const ROWS: usize = 10;
 /// The tab strip: General · Users · Display · About.
-pub const TABS: usize = 4;
-const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About"];
+pub const TABS: usize = 5;
+const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items"]; // PREFSUI (R91): Login Items
 const WIN_H: usize = TOP + ROWS * ROW_H + 8;
 const LABEL_X: usize = 12;
 const TRACK_X: usize = 150;
@@ -104,6 +104,10 @@ struct State {
     /// Focus is on the tab strip (Left/Right switch tabs).
     strip: bool,
     u: UsersUi,
+    /// PREFSUI: the Login Items tab's Add chooser (an index into `loginitems::installed()`), and the Display
+    /// tab's Resolution dropdown (open or not).
+    li_add: usize,
+    modes_open: bool,
     w: usize,
     h: usize,
     surf: Vec<u32>,
@@ -346,7 +350,7 @@ pub fn request_open() {
 
 /// Drain the open latch and load the store once per login. Chained from `quarry::live::service`.
 pub fn service() {
-    crate::prefs::service();
+    crate::prefs::service(); super::loginitems::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
     if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
@@ -458,6 +462,7 @@ fn paint(st: &mut State, v: &Values) {
         0 => paint_general(st, v),
         1 => paint_users(st),
         2 => paint_display(st, v),
+        4 => paint_login(st),
         _ => paint_about(st),
     }
     if !st.strip && matches!(v.tab, 0 | 2) {
@@ -782,7 +787,7 @@ pub fn open() -> Result<(), String> {
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
     let tab0 = CUR.lock().tab as usize;
-    let mut st = State { sel: tab_ctrls(tab0).first().copied().unwrap_or(0), strip: true, u: UsersUi::new(), w, h, surf };
+    let mut st = State { sel: tab_ctrls(tab0).first().copied().unwrap_or(0), strip: true, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf };
     paint(&mut st, &CUR.lock().clone());
     let base = st.surf.as_ptr() as usize;
     let id = wm::create_at_native(OWNER, base, len * 4, sw as u32, sh as u32, (sw * 4) as u32, b"Settings", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
@@ -972,6 +977,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
     match cur_tab() {
         0 => press_general(row, cx),
         1 => press_users(row, cx),
+        4 => press_login(row, cx),
         2 => {
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
             if row == 0 && on_track { select(0); bright_click(cx); drag_begin(0, cx); } // PREFSUI (R93): the press sets AND captures — the knob follows the hand until the release
@@ -1470,4 +1476,62 @@ fn drag_selftest() -> &'static str {
     set(3, idle_index(before));
     if !was_open { close(); }
     if ok { "ok" } else { "no" }
+}
+
+// ── PREFSUI (rmbp-ledger B389, R91) — the Login Items tab ───────────────────────────────────────────────────────
+// Row 0: what it is. Rows 1..=LI_ROWS: the list in launch order, each with Up / Down / Remove. Row 9: Add — a
+// chooser over the installed programs not yet in the list (< name >) and the Add button. Every edit is
+// `loginitems::edit` (one latched store write of `system.login.items`, the key the dock menu's Open at Login edits).
+
+const LI_ROWS: usize = 7;
+const LI_UP_X: usize = 230;
+const LI_DOWN_X: usize = LI_UP_X + BTN_W + 10;
+const LI_DEL_X: usize = LI_DOWN_X + BTN_W + 10;
+const LI_ADD_ROW: usize = 9;
+
+/// The installed programs not yet in the list (the Add chooser's choices).
+fn li_candidates() -> Vec<&'static str> {
+    let l = super::loginitems::items();
+    super::loginitems::installed().into_iter().filter(|n| !prefs_core::login::contains(&l, n)).collect()
+}
+
+fn paint_login(st: &mut State) {
+    let l = super::loginitems::items();
+    txt(st, LABEL_X, 0, &alloc::format!("Open at login ({}), in this order:", l.len()));
+    if l.is_empty() { txt(st, LABEL_X + 12, 1, "None - nothing opens itself at login."); }
+    for (k, n) in l.iter().take(LI_ROWS).enumerate() {
+        txt(st, LABEL_X + 12, 1 + k, n);
+        btn(st, 1 + k, LI_UP_X, "Up");
+        btn(st, 1 + k, LI_DOWN_X, "Down");
+        btn(st, 1 + k, LI_DEL_X, "Remove");
+    }
+    if l.len() > LI_ROWS { txt(st, LABEL_X + 12, 1 + LI_ROWS, &alloc::format!("+{} more", l.len() - LI_ROWS)); }
+    let c = li_candidates();
+    txt(st, LABEL_X, LI_ADD_ROW, "Add");
+    if c.is_empty() { txt(st, TRACK_X, LI_ADD_ROW, "every program is in the list"); return; }
+    let i = st.li_add % c.len();
+    btn(st, LI_ADD_ROW, TRACK_X - 70, "  <");
+    txt(st, LI_UP_X - 70, LI_ADD_ROW, c[i]);
+    btn(st, LI_ADD_ROW, LI_DOWN_X, "  >");
+    btn(st, LI_ADD_ROW, LI_DEL_X, "Add");
+}
+
+fn press_login(row: usize, cx: usize) {
+    let in_b = |x0: usize| cx >= x0 && cx < x0 + BTN_W;
+    if (1..=LI_ROWS).contains(&row) {
+        let l = super::loginitems::items();
+        let Some(n) = l.get(row - 1) else { return };
+        let op = if in_b(LI_UP_X) { "up" } else if in_b(LI_DOWN_X) { "down" } else if in_b(LI_DEL_X) { "remove" } else { return };
+        super::loginitems::edit(op, n, "settings");
+    } else if row == LI_ADD_ROW {
+        let c = li_candidates();
+        if c.is_empty() { return; }
+        let mut g = STATE.lock();
+        let Some(st) = g.as_mut() else { return };
+        let i = st.li_add % c.len();
+        if in_b(TRACK_X - 70) { st.li_add = (i + c.len() - 1) % c.len(); }
+        else if in_b(LI_DOWN_X) { st.li_add = (i + 1) % c.len(); }
+        else if in_b(LI_DEL_X) { drop(g); super::loginitems::edit("add", c[i], "settings"); }
+    } else { return; }
+    repaint();
 }
