@@ -7,7 +7,7 @@ These are the reference frames of the `metal` suite: one `<state>.png` per case 
 None exists until a boot has flown the `shot` verbs. **The first flown boot blesses them:**
 
     # on the rMBP, logged in:   shot desktop ; shot login ; shot quarry ; shot settings general ; shot lumen
-    # pull /home/<u>/Shots/ off the card into a directory, then:
+    # pull /home/<u>/Desktop/*.PNG and *.MSK off the card into a directory (PRTSCR4: was /home/<u>/Shots/), then:
     tools/eyes/run.sh metal --from <dir> --accept
 
 `--accept` copies each pulled `<STEM>.PNG` here as `<state>.png` (and the mask beside it as

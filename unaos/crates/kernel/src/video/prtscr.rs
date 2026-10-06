@@ -459,7 +459,7 @@ fn take_rect(pw: u32, ph: u32) -> (u32, u32, u32, u32, u32) {
     (k, x, y, w, h)
 }
 
-/// SHOTREGION M3 — `SHOT-HHMMSS.PNG` when the clock is anchored and the name is free, else the `SHOT<n>.PNG` ladder. Never overwrites.
+/// SHOTREGION M3 — the Mac's name (PRTSCR4) when the clock is set and the name is free, else the `SHOT<n>.PNG` ladder. Never overwrites.
 fn shot_name(fs: &FatFs, dir: u32) -> Result<String, Refusal> {
     let free = |name: &str| -> Result<bool, Refusal> {
         match busy_retry(|| match fs.locate_in_dir(dir, name) {
@@ -486,11 +486,11 @@ fn shot_name(fs: &FatFs, dir: u32) -> Result<String, Refusal> {
     Err(Refusal::AllTaken(vol_id(fs)))
 }
 
-/// SHOTREGION M3 — the clock arm of [`shot_name`]: `None` until the clock is anchored (CLOCKBAR's `try_unix_now`).
+/// SHOTREGION M3 — the clock arm of [`shot_name`]: `None` until the clock is set. PRTSCR4 (B493): the Mac's own name
+/// (`Screenshot <date> at <time>.png`, [`mac_name`]) as the whole-panel capture has — a region is a screenshot too; the
+/// `SHOT-hhmmss.PNG` stamp is retired.
 fn shot_clock_name() -> Option<String> {
-    let secs = crate::clock::try_unix_now()?;
-    let (_y, _mo, _d, h, mi, s) = crate::clock::civil_from_unix(secs);
-    Some(alloc::format!("SHOT-{:02}{:02}{:02}.PNG", h, mi, s))
+    clock_name()
 }
 
 /// PRTSCR — `(requests, captures, refusals)`.
@@ -2111,7 +2111,7 @@ fn ensure_capture_dir(fs: &FatFs, plan: &DirPlan) -> Result<(u32, String), Refus
     // `n + 2` to `n + 1` with it — a bound that still described a two-leaf walk would have left one
     // component of slack nothing uses, which is the kind of stale arithmetic a later reader has to
     // re-derive to trust.
-    comps[n] = cur_leaf(); // GLASSEYES (B343): `Shots` while a named state shot holds the door, else the theme's word
+    comps[n] = cur_leaf(); // GLASSEYES (B343): the named leaf while a state shot holds the door (the theme's word too since PRTSCR4), else the theme's word
     n += 1;
 
     let mut cluster = 0u32; // the volume root, on every FAT kind here
@@ -2357,7 +2357,7 @@ pub fn dir_fixture() { static QB2: AtomicBool = AtomicBool::new(false); if crate
 }
 
 // ================================ GLASSEYES (rmbp-ledger B343) — THE NAMED STATE SHOT ================================
-// `shot <state>` (video/shotmask.rs) needs a DETERMINISTIC file — `/home/<u>/Shots/<STEM>.PNG`, the same name every
+// `shot <state>` (video/shotmask.rs) needs a DETERMINISTIC file — `/home/<u>/Desktop/<STEM>.PNG` (PRTSCR4: was `Shots`), the same name every
 // boot, so the bench can pull it and EYES can score it against a golden — through THIS capture, not a second one.
 // So the job takes a named override: while [`capture_named`] holds the door, `Job::begin` reads [`NAMED`] for the
 // leaf (instead of `theme::CAPTURE_DIR`) and the file name (instead of the never-overwrite ladder), and the old
