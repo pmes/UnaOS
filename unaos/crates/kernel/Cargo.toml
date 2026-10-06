@@ -3818,6 +3818,9 @@ una-abi = { path = "../una-abi" }
 # `midden_core::Facts` built with `cfg!()`, so ONE compiled core tells the truth
 # on x86 and aarch64 both.
 midden_core = { path = "../../libs/sys/midden_core", default-features = false }
+# UNAOSVOLUME (rmbp-ledger B427, R79): the jobs record model Mica (handlers/mica, the only writer) and the kernel (the
+# reader of `/jobs`, `fs/jobs.rs`) share. Unconditional, zero deps; reached only under `unafs`.
+jobs_core = { path = "../../libs/sys/jobs_core", default-features = false }
 # EXFAT (rmbp-ledger B392, R79): the shared exFAT reader — the same no_std core the host KATs link. Unconditional (no knob):
 # `fs/removable.rs` reaches it only when an attached disk carries no FAT volume and its boot sector says `EXFAT`.
 exfat_core = { path = "../../libs/fs/exfat_core", default-features = false }

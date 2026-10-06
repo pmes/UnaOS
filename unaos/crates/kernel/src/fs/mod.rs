@@ -190,3 +190,6 @@ pub mod bootfat;
 pub mod bootlog;
 /// SEARCH (B417 LAUNCHER; QUARRY3 B413 joins): `by_name(prefix, limit)` — files by name, one bounded walk of the name trees.
 pub mod search;
+/// UNAOSVOLUME (B427): `/jobs` on the UnaFS root — the jobs Mica writes, read here; the `[jobs]` line at login.
+#[cfg(feature = "unafs")]
+pub mod jobs;

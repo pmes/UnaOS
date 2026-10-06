@@ -725,6 +725,8 @@ fn close_into_session() {
     FORM.lock().state = State::Session;
     crate::fs::assoc::owe();
     crate::video::desktopbuild::build("login ok"); // DESKTOPBUILT (B387, R93): the desktop — bar with its battery, dock with its pins, the wallpaper (rearmed by the build) — is BUILT here and painted in one pass
+    #[cfg(feature = "unafs")]
+    crate::fs::jobs::announce(); // UNAOSVOLUME (B427, R93): the one `[jobs] volume=/jobs records=<n> …` line — a count, no test (R80)
 }
 
 /// M4: Log Out — close the session and put the screen back up. LOGIN13 M3 (R63): the ROOT session's
