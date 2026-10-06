@@ -1408,7 +1408,7 @@ impl VfsBackend for FatBackend {
         // surfacing from deep in `write_grow`. This is not an ACL refusal
         // (`Denied`): the principal may be perfectly authorized; the VOLUME has
         // no writable surface. A future world-writable USB flag would relax this.
-        if self.read_only() {
+        if crate::fs::bootfat::refuse(&self.volume, &self.root, _rel, principal) || self.read_only() { // ROOTDISK2 (B401, R99): the boot FAT is sacred — refused for every principal, root included, unless `fat_unlock` is held
             return Err(VfsError::Unsupported);
         }
         // FOREIGN-VOLUME WRITE POSTURE (doc §5, extended by VFS-2): the volume's

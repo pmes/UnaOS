@@ -21,8 +21,8 @@
 //! ring-0 launcher reads a program: `/apps/<NAME>` through the mount table, whichever volume `/apps` is.
 //!
 //! Witnesses: `tests rootdisk` → `:: ROOTDISK: root=UnaOS lib=/lib apps_alias=same-inode
-//! user_dir_at_root=visible-under-volume -> PASS :: …` and `:: ROOTDISK2: apps=unafs lib=unafs links=volumes-only
-//! rmdir=ok image_mb=<n> -> PASS ::`. Owed: R94's hot swap (docs/dev/evidence/rmbp-1005/rootdisk2.md, design only).
+//! user_dir_at_root=visible-under-volume -> PASS :: …` and `:: ROOTDISK2: apps=unafs lib=unafs var=unafs
+//! boot_fat=readonly unlock_path=installer rmdir=ok image_mb=<n> -> PASS :: links=volumes-only …` (R99: `fs::bootfat`). Owed: R94's hot swap (docs/dev/evidence/rmbp-1005/rootdisk2.md, design only).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -340,15 +340,28 @@ fn rootdisk2(mt: &MountTable, made: Option<&str>) {
     let image_mb = crate::fs::unafs::with_unafs(|fs| fs.superblock.block_count).map(|b| (b * 4096) >> 20).unwrap_or(0);
     #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
     let image_mb = 0u64;
-    let ok = apps == "unafs" && lib == "unafs" && links_tok == "volumes-only" && rmdir_tok == "ok" && cleaned != "left";
+    let var = home_of(mt, "/var");
+    let boot_fat = crate::fs::bootfat::posture(mt);
+    let unlock = crate::fs::bootfat::unlock_path();
+    let ok = apps == "unafs"
+        && lib == "unafs"
+        && var == "unafs"
+        && boot_fat == "readonly"
+        && unlock == "installer"
+        && links_tok == "volumes-only"
+        && rmdir_tok == "ok"
+        && cleaned != "left";
     serial_println!(
-        ":: ROOTDISK2: apps={} lib={} links={} rmdir={} image_mb={} -> {} :: progs={} cleaned={} ::",
+        ":: ROOTDISK2: apps={} lib={} var={} boot_fat={} unlock_path={} rmdir={} image_mb={} -> {} :: links={} progs={} cleaned={} ::",
         apps,
         lib,
-        links_tok,
+        var,
+        boot_fat,
+        unlock,
         rmdir_tok,
         image_mb,
         if ok { "PASS" } else { "FAIL" },
+        links_tok,
         progs,
         cleaned
     );

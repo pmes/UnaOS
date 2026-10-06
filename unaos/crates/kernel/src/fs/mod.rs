@@ -178,3 +178,7 @@ pub mod volumes;
 pub mod removable;
 /// ROOTDISK (B390, R94): `/volumes/UnaOS` IS `/`, `/lib`, the root's links marked, `tests rootdisk`.
 pub mod rootdisk;
+/// ROOTDISK2 (B401, R99): the boot FAT is sacred — read-only for every principal, `fat_unlock` for the installer.
+pub mod bootfat;
+/// ROOTDISK2 (B401, R99): the boot log on UnaFS (`/var/log/boot-<n>.log`), not `UNAOS.LOG` on the boot FAT.
+pub mod bootlog;

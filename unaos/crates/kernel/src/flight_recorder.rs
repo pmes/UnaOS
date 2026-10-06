@@ -584,7 +584,7 @@ pub fn service() {
     // and already holding the xHCI loan. Idempotent: one acquire load after the first call, re-armed
     // only when a new device claims the global slot.
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-    crate::drivers::block::evaluate_boot_medium_once();
+    crate::drivers::block::evaluate_boot_medium_once(); if crate::fs::bootlog::divert(snapshot) { return; } // ROOTDISK2 (B401, R99): no UNAOS.LOG reservation on the sacred boot FAT — the ring flushes to /var/log/boot-<n>.log on UnaFS
 
     // FRGUARD (GR21): do not even ATTEMPT a reservation on a volume the block layer will refuse to
     // write. The refusal would surface anyway — every mutating path below ends at `write_block` /

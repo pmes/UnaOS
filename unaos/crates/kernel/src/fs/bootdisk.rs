@@ -1528,7 +1528,7 @@ pub(crate) fn bind_root(
 
     let boot = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src);
     let boot_rw = !boot.read_only();
-    mt.mount("/boot", alloc::boxed::Box::new(boot)); let native_root = crate::fs::rootdisk::apps_on_root(native_root); if !native_root { crate::fs::rootdisk::bind_lib(mt, src, announce); } else if announce { crate::fs::rootdisk::announce_native(src); } // ROOTDISK2 (B401, R94): on a native root `/apps` and `/lib` are the UnaFS volume's own directories — no FAT mounts, no links
+    mt.mount("/boot", alloc::boxed::Box::new(boot)); let native_root = crate::fs::rootdisk::apps_on_root(native_root); if !native_root { crate::fs::rootdisk::bind_lib(mt, src, announce); } else { crate::fs::bootfat::arm(announce); if announce { crate::fs::rootdisk::announce_native(src); } } // ROOTDISK2 (B401, R94): on a native root `/apps` and `/lib` are the UnaFS volume's own directories — no FAT mounts, no links
     if !native_root { mt.mount(
         "/apps",
         alloc::boxed::Box::new(
