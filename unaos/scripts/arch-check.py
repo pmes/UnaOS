@@ -13,7 +13,9 @@
 # HOW. Six legs over unaos/crates/kernel/src/**/*.rs; each finding is a key. Today's keys are the
 # BASELINE (scripts/arch.baseline): a key on the baseline passes, a NEW key fails, and a baseline key
 # that no longer matches fails as STALE — the baseline only shrinks (the STATUS.baseline rule).
-#   seamcite   kernel-by-ruling with no R<n>/B<n> on the CHARTER line; owed with no B<n>
+#   seamcite   kernel-by-ruling with no R<n>/B<n> on the CHARTER line; owed with no B<n>; SEAMCITE2 (B476): a cited
+#              id that resolves nowhere (`R<n>` not a row of docs/dev/RULINGS.md, `B<n>` not a row of a ledger) is
+#              `seamcite|<file>|<id>` (a charter.registry owed/kernel-by-ruling row: `seamcite|registry:<file>|<id>`)
 #   sharedcore a `shared-core` CHARTER on a file that names no shared crate (`*_core::`, `unafs::`, `una_abi::`)
 #   dotslash   a `"{}/.name…"` or `"/.name…"` literal
 #   settings   a `/settings/` path literal outside prefs.rs (the store's one writer)
@@ -24,7 +26,9 @@
 # CONTROLS (exit 2, NO verdict): the scope enumerates >= 200 files; the baseline parses; --selftest's
 # fixture tree goes red on one planted finding per leg and green once each is baselined.
 #
-# usage: arch-check.py [--selftest] [--emit-baseline] [<unaos dir>]   exit 0 clean · 1 a new or stale key · 2 control failed
+# usage: arch-check.py [--selftest] [--emit-baseline] [--docs <docs/dev dir>] [<unaos dir>]   (SEAMCITE2 reads <unaos dir>/../docs/dev,
+#        or --docs: an executor's worktree lags the seat's ledger, so it points at the seat's /home/user/UnaOS/docs/dev)
+#   exit 0 clean · 1 a new or stale key · 2 control failed
 import os, re, sys, tempfile
 
 SEAM_RE = re.compile(r'CHARTER:\s*([^—|-]+?)\s*(?:—|--|-|\|)\s*([a-z-]+)(.*)')
@@ -46,8 +50,28 @@ PARSERS = [
 ]
 
 
-def scan(k):
-    """All finding keys of the kernel tree at `k` (crates/kernel/src)."""
+def known_ids(docs):
+    """SEAMCITE2: the rulings (`| R<n> |` rows of RULINGS.md) and the ledger row ids (LEDGER.md, OS/*-ledger.md)."""
+    ids = set()
+    rp = os.path.join(docs, 'RULINGS.md')
+    if os.path.isfile(rp):
+        ids |= set(re.findall(r'^\| (R\d+) \|', open(rp, encoding='utf-8', errors='replace').read(), re.M))
+    led = [os.path.join(docs, 'LEDGER.md')]
+    osd = os.path.join(docs, 'OS')
+    if os.path.isdir(osd):
+        led += [os.path.join(osd, f) for f in sorted(os.listdir(osd)) if f.endswith('-ledger.md')]
+    for lp in led:
+        if os.path.isfile(lp):
+            ids |= set(re.findall(r'^\| \**([A-Z]+\d+)\**\s*\|', open(lp, encoding='utf-8', errors='replace').read(), re.M))
+    return ids
+
+
+def cites(rest, ids):
+    return [i for i in re.findall(r'\b([RB]\d+)\b', rest) if i not in ids]
+
+
+def scan(k, ids=None):
+    """All finding keys of the kernel tree at `k` (crates/kernel/src). `ids`: the ids a seam may cite (None: unchecked)."""
     keys, n = set(), 0
     reg = set()
     regf = os.path.join(k, '..', '..', '..', 'scripts', 'charter.registry')
@@ -55,6 +79,10 @@ def scan(k):
         for line in open(regf, encoding='utf-8'):
             if '|' in line and not line.startswith('#'):
                 reg.add(line.split('|')[0].strip())
+                c = [x.strip() for x in line.split('|')]
+                if ids is not None and len(c) >= 4 and c[2] in ('owed', 'kernel-by-ruling'):
+                    for i in cites(c[3], ids):
+                        keys.add(f'seamcite|registry:{c[0]}|{i}')
     for root, _, files in os.walk(k):
         for f in files:
             if not f.endswith('.rs'):
@@ -78,6 +106,9 @@ def scan(k):
                     keys.add(f'seamcite|{rel}')
                 if seam == 'owed' and not re.search(r'\bB\d+', rest):
                     keys.add(f'seamcite|{rel}')
+                if ids is not None and seam in ('kernel-by-ruling', 'owed'):
+                    for i in cites(rest, ids):  # SEAMCITE2 (B476): `R999` names no ruling
+                        keys.add(f'seamcite|{rel}|{i}')
                 if seam == 'shared-core' and not SHARED_RE.search(re.sub(r'//[^\n]*', '', text)):  # GATEREVIEW F3: a core named in a comment links nothing
                     keys.add(f'sharedcore|{rel}')
             for lit in sorted(set(DOTSLASH_RE.findall(text))):
@@ -102,8 +133,13 @@ def load_baseline(path):
     return keys
 
 
-def verdict(k, base_path, quiet=False):
-    keys, n = scan(k)
+def verdict(k, base_path, docs, quiet=False):
+    ids = known_ids(docs)
+    nr, nb = sum(1 for i in ids if i[0] == 'R'), sum(1 for i in ids if i[0] == 'B')
+    if (nr < 50 or nb < 100) and not quiet:
+        print(f'arch-check: CONTROL FAILED — {docs}: {nr} rulings, {nb} B rows (< 50 / < 100); SEAMCITE2 has no verdict')
+        return 2
+    keys, n = scan(k, ids)
     if n < 200 and not quiet:
         print(f'arch-check: CONTROL FAILED — scope enumerated {n} files (< 200)')
         return 2
@@ -139,17 +175,20 @@ def selftest():
             'g.rs': '//! CHARTER: Kernel — owed B1\n//! CHARTER is fine\nfn x() { holo_core::y(); }\n',
             'i.rs': '//! CHARTER: Kernel — wm\nfn p(home: &str) -> String { format!("{home}/.recents") }\n',  # GATEREVIEW F2
             'h.rs': '//! CHARTER: Kernel — wm\nfn p(h: &str) -> String { format!("{}/.secret", h) }\n',  # GATEREVIEW F1: c.rs's literal reused
+            'j.rs': '//! CHARTER: Kernel — kernel-by-ruling R999\n',  # SEAMCITE2 (GATEREVIEW C6): no such ruling
+            'l.rs': '//! CHARTER: Kernel — kernel-by-ruling R1 B2\n//! CHARTER: Principia — owed B1\n',  # resolves
+            'm.rs': '//! CHARTER: Principia — owed B9999\n',  # SEAMCITE2: no such ledger row
         }
         for f, t in plants.items():
             open(os.path.join(k, f), 'w').write(t)
-        keys, _ = scan(k)
-        want = {'seamcite|a.rs', 'sharedcore|b.rs', 'dotslash|c.rs|{}/.secret', 'dotslash|h.rs|{}/.secret', 'dotslash|i.rs|{home}/.recents', 'settings|d.rs', 'store|e.rs', 'parser|f.rs|ogg'}
+        keys, _ = scan(k, {'R1', 'B1', 'B2'})
+        want = {'seamcite|j.rs|R999', 'seamcite|m.rs|B9999', 'seamcite|a.rs', 'sharedcore|b.rs', 'dotslash|c.rs|{}/.secret', 'dotslash|h.rs|{}/.secret', 'dotslash|i.rs|{home}/.recents', 'settings|d.rs', 'store|e.rs', 'parser|f.rs|ogg'}
         if keys != want:
             print(f'arch-check: SELFTEST FAILED — planted {sorted(want)}, scanned {sorted(keys)}')
             return 2
         base = os.path.join(d, 'base')
         open(base, 'w').write('\n'.join(sorted(want)) + '\n')
-        keys2, _ = scan(k)
+        keys2, _ = scan(k, {'R1', 'B1', 'B2'})
         if keys2 - load_baseline(base) or load_baseline(base) - keys2:
             print('arch-check: SELFTEST FAILED — a baselined tree is not clean')
             return 2
@@ -157,25 +196,27 @@ def selftest():
         if not (load_baseline(base) - keys2):
             print('arch-check: SELFTEST FAILED — a stale row was not seen')
             return 2
-    print('  ✅ arch-check selftest: six planted findings caught, a baselined tree clean, a stale row seen')
+    print('  ✅ arch-check selftest: six planted findings caught (and SEAMCITE2: R999 and B9999 resolve nowhere), a baselined tree clean, a stale row seen')
     return 0
 
 
 def main(argv):
     if '--selftest' in argv:
         return selftest()
-    args = [a for a in argv if not a.startswith('--')]
+    docs_arg = argv[argv.index('--docs') + 1] if '--docs' in argv and argv.index('--docs') + 1 < len(argv) else None
+    args = [a for a in argv if not a.startswith('--') and a != docs_arg]
     u = args[0] if args else os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
     k = os.path.join(u, 'crates', 'kernel', 'src')
     base = os.path.join(u, 'scripts', 'arch.baseline')
+    docs = docs_arg or os.path.normpath(os.path.join(u, '..', 'docs', 'dev'))  # --docs: an executor's worktree lags the seat's ledger
     if '--emit-baseline' in argv:
-        keys, _ = scan(k)
+        keys, _ = scan(k, known_ids(docs))
         sys.stdout.write('\n'.join(sorted(keys)) + '\n')
         return 0
     rc = selftest()
     if rc:
         return rc
-    return verdict(k, base)
+    return verdict(k, base, docs)
 
 
 if __name__ == '__main__':
