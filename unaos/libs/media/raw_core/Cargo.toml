@@ -1,0 +1,10 @@
+[package]
+name = "raw_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "RAWCORE (B444): camera raw (TIFF/EP, Sony ARW) — container, IFDs, raw strips, the embedded preview, EXIF facts, demosaic — no_std + alloc, shared by Ring 0 (through pixel_core) and Ring 3 (lux, pixel_core)."
+
+# RAWCORE (rmbp-ledger B444, R79/R83): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies — the
+# pixel_core shape. pixel_core links it (its `raw` route); lux re-exports it on the host.
+[dependencies]
