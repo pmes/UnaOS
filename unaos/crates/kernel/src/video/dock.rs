@@ -3743,8 +3743,8 @@ const MENU_QUIT: usize = 5;
 const LAUNCH_BOUND_MS: u64 = 10_000;
 /// The launch pulse's half period.
 const PULSE_MS: u64 = 300;
-/// The Trash's full/empty state is re-read at most this often (a directory read; service pass only).
-const TRASH_POLL_MS: u64 = 2_000;
+/// HIDSTALL (B485): the generation of the Trash last read (`fs::trash::generation()`; it was a 2 s clock — a masked UnaFS query that held the HID pass 49 ms every 2 s on flight 26).
+static TRASH_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
 
 static TRASH_FULL: AtomicBool = AtomicBool::new(false);
 static TRASH_POLLED: AtomicU64 = AtomicU64::new(0);
@@ -4100,10 +4100,10 @@ fn dock2_service(now: u64) {
 /// Quarry opens, the position/auto-hide save.
 fn dock2_store_service() {
     let now = crate::arch::ms();
-    if now.wrapping_sub(TRASH_POLLED.load(Ordering::Relaxed)) >= TRASH_POLL_MS || TRASH_POLLED.load(Ordering::Relaxed) == 0 {
-        TRASH_POLLED.store(now.max(1), Ordering::Relaxed);
+    let tgen = crate::fs::trash::generation(); let tseen = TRASH_SEEN.load(Ordering::Relaxed); let _ = now;
+    if tgen != tseen { TRASH_SEEN.store(tgen, Ordering::Relaxed); let t0 = crate::arch::ms();
         let full = crate::fs::trash::count() > 0;
-        if TRASH_FULL.swap(full, Ordering::Relaxed) != full { PASS_OWED.store(true, Ordering::Release); }
+        if TRASH_FULL.swap(full, Ordering::Relaxed) != full { PASS_OWED.store(true, Ordering::Release); } serial_println!("[dock] trash state why={} full={} took_ms={} (HIDSTALL: read on a change, never on a clock)", if tseen == u64::MAX { "first" } else { "change" }, full as u8, crate::arch::ms().saturating_sub(t0));
     }
     let reveal = REVEAL_OWED.lock().take();
     let open = if TRASH_OPEN_OWED.swap(false, Ordering::AcqRel) { Some(crate::fs::trash::trash_dir()) } else { reveal };
