@@ -40,7 +40,7 @@ arms_of() { # $1 = a shell.rs; the body of dispatch_command, comments stripped
     [ -n "$s" ] || return 3
     e=$(awk -v s="$s" 'NR>s && /^(pub |pub\(crate\) )?fn [a-z_]/ {print NR; exit}' "$1")
     [ -n "$e" ] || e=$(wc -l < "$1")
-    awk -v s="$s" -v e="$e" 'NR>s && NR<e' "$1" | sed -E 's#//.*$##' \
+    awk -v s="$s" -v e="$e" 'NR>s && NR<e' "$1" | sed -E 's#/\*([^*]|\*+[^*/])*\*+/##g; s#//.*$##' \
         | grep -o -E '"[a-z_0-9-]+"([[:space:]]*\|[[:space:]]*"[a-z_0-9-]+")*[[:space:]]*=>' \
         | grep -o -E '"[a-z_0-9-]+"' | tr -d '"' | sort -u
 }
@@ -50,11 +50,12 @@ tmp=$(mktemp -d "${TMPDIR:-${HOME}/unaos-bench/scratch}/verb-roots.XXXXXX" 2>/de
 trap 'rm -rf "$tmp"' EXIT
 s=$(grep -n -E '^pub fn dispatch_command\(' "$SHELL_RS" | head -1 | cut -d: -f1)
 [ -n "$s" ] || { echo "GATE-VERBS: NO VERDICT — dispatch_command not found in $SHELL_RS"; exit 2; }
-awk -v s="$s" 'NR==s+1 {print "        \"zz-control-arm\" => {} // synthetic"} {print}' "$SHELL_RS" > "$tmp/shell.rs"
+awk -v s="$s" 'NR==s+1 {print "        \"zz-control-arm\" => {} // synthetic"; print "        /* \"zz-comment-arm\" => {} */ // GATEREVIEW F8"} {print}' "$SHELL_RS" > "$tmp/shell.rs"
 sed -E '0,/^pub const HOST_VERBS/s//    ("zz-control-word", Avail::Always),\n&/' "$MIDDEN_RS" > "$tmp/lib.rs"
 # the sed above inserts the synthetic tuple BEFORE the declaration line; the extractor is not scoped to
 # the array, so that is the point: a tuple anywhere in the file counts, and this one must be seen.
 c_arms=$(arms_of "$tmp/shell.rs" | grep -c -x 'zz-control-arm')
+[ "$(arms_of "$tmp/shell.rs" | grep -c -x 'zz-comment-arm')" = 0 ] || c_arms=commented   # GATEREVIEW F8: an arm inside /* */ is no arm
 c_table=$(table_of "$tmp/lib.rs" | grep -c -x 'zz-control-word')
 c_fact=$(comm -12 <(table_of "$MIDDEN_RS") <(arms_of "$SHELL_RS") | grep -c -x 'date')
 if [ "$c_arms" != 1 ] || [ "$c_table" != 1 ] || [ "$c_fact" != 1 ]; then
