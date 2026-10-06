@@ -176,3 +176,5 @@ pub mod unafsgrow;
 pub mod volumes;
 /// USBSTOR (B384, R95): a removable disk is mounted under `/volumes` when it attaches and dropped when it leaves.
 pub mod removable;
+/// ROOTDISK (B390, R94): `/volumes/UnaOS` IS `/`, `/lib`, the root's links marked, `tests rootdisk`.
+pub mod rootdisk;
