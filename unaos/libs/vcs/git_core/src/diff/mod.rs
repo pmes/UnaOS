@@ -866,7 +866,8 @@ pub fn stat(src: &dyn ObjectSource, pairs: &[Pair], opt: &PatchOptions, width: u
     let n = files.len();
     let mut s = String::new();
     if n == 0 {
-        s.push_str(" 0 files changed\n");
+        // git prints NOTHING for an empty `--stat` (a merge whose tree equals its first parent; flight-26 fold
+        // 07e39937 on this repo): no summary line, not " 0 files changed".
     } else {
         s.push_str(&alloc::format!(" {} file{} changed", n, if n == 1 { "" } else { "s" }));
         if adds != 0 || dels == 0 {
