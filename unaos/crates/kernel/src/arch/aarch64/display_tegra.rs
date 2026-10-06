@@ -2879,7 +2879,7 @@ pub fn orin_tenant_arm() {
         info.width, info.height, info.bytes_per_pixel,
         staged, wm::count(),
         crate::arch::aarch64::uslots::FB_WIN_MAX_W, crate::arch::aarch64::uslots::FB_WIN_MAX_H,
-        crate::arch::aarch64::uslots::FB_WIN_SLOTS, crate::arch::aarch64::uslots::USER_SLOTS,
+        crate::arch::aarch64::uslots::FB_WIN_SLOTS, crate::video::wincap::proc_limit(), // WINDOWCAP3 (B399): `uslots=` is the live process limit (memory's), the pool has no width
         cfg!(feature = "orindesk") as u8, cfg!(feature = "orinclick") as u8,
         cfg!(feature = "orinconwin") as u8, cfg!(feature = "desktop_firmware") as u8
     );

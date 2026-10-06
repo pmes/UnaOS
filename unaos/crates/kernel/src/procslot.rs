@@ -39,6 +39,9 @@ pub const SHARED_ROW: usize = ROW_ID_MAX + 1;
 pub struct SlotVec<T: 'static> {
     rows: SegVec<T>,
     shared: T,
+    /// aarch64 keys rows by ASID, and ASID 0 IS the shared context: row 0 is then the inline `shared`
+    /// element (a static, never a heap row — the shell's and the kernel tasks' row exists from boot).
+    asid_keyed: bool,
 }
 
 // SAFETY: as `SegVec` — elements are only shared as `&T`.
@@ -47,13 +50,23 @@ unsafe impl<T: Sync + Send> Sync for SlotVec<T> {}
 impl<T: 'static> SlotVec<T> {
     /// `init` builds a slot row's zero state; `shared` is the shared row's.
     pub const fn new(init: fn() -> T, shared: T) -> SlotVec<T> {
-        SlotVec { rows: SegVec::new(init), shared }
+        SlotVec { rows: SegVec::new(init), shared, asid_keyed: false }
+    }
+
+    /// An ASID-keyed sidecar (aarch64): row 0 — the shared/boot context — is the inline `shared` element.
+    pub const fn new_asid(init: fn() -> T, shared: T) -> SlotVec<T> {
+        SlotVec { rows: SegVec::new(init), shared, asid_keyed: true }
+    }
+
+    #[inline]
+    fn is_shared(&self, i: usize) -> bool {
+        i == SHARED_ROW || (self.asid_keyed && i == 0)
     }
 
     /// Allocate slot `s`'s segment now (process context), so an ISR's later `X[s]` never allocates.
     #[inline]
     pub fn warm(&self, s: usize) {
-        if s <= ROW_ID_MAX {
+        if s <= ROW_ID_MAX && !self.is_shared(s) {
             let _ = self.rows.get(s);
         }
     }
@@ -61,7 +74,7 @@ impl<T: 'static> SlotVec<T> {
     /// Row `i` if it exists — never allocates.
     #[inline]
     pub fn peek(&self, i: usize) -> Option<&T> {
-        if i == SHARED_ROW {
+        if self.is_shared(i) {
             Some(&self.shared)
         } else if i <= ROW_ID_MAX {
             self.rows.peek(i)
@@ -83,7 +96,7 @@ impl<T: 'static> core::ops::Index<usize> for SlotVec<T> {
     /// validated caller names — every ring-3-derived index is range-checked against the live pool first.
     #[inline]
     fn index(&self, i: usize) -> &T {
-        if i == SHARED_ROW {
+        if self.is_shared(i) {
             return &self.shared;
         }
         assert!(i <= ROW_ID_MAX, "SlotVec index past the slot type");
@@ -96,6 +109,6 @@ impl<T: 'static> SlotVec<T> {
     /// `len()`): every slot/ASID row and the shared row. Not an allocation — rows exist on first touch.
     #[inline]
     pub const fn len(&self) -> usize {
-        SHARED_ROW + 1
+        if self.asid_keyed { ROW_ID_MAX + 1 } else { SHARED_ROW + 1 }
     }
 }

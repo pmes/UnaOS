@@ -228,6 +228,12 @@ struct UserLine {
     b: [u8; USER_LINE_MAX],
     n: usize,
 }
+#[cfg(target_arch = "aarch64")]
+static USER_LINES: crate::procslot::SlotVec<spin::Mutex<UserLine>> = crate::procslot::SlotVec::new_asid(
+    || spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
+    spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
+); // WINDOWCAP3 (B399, R90): aarch64 rows are ASIDs (0 = the shared context, inline)
+#[cfg(not(target_arch = "aarch64"))]
 static USER_LINES: crate::procslot::SlotVec<spin::Mutex<UserLine>> = crate::procslot::SlotVec::new(
     || spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
     spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }),
