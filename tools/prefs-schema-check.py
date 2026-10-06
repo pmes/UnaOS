@@ -140,7 +140,7 @@ def refs_in(path, src, consts):
             yield ns + "." + g.group(1), line_of(g.start()), "R8"
     # R9
     local = {m.group(1): m.group(2) for m in re.finditer(r"const (\w+): &str = \"(" + KEY + r")\"", src)}
-    for g in re.finditer(r"(?:prefs::(?:int|peek_int|flag|text)|(?<![\w])sys_(?:int|flag|text|get|set))\(\s*(\"(" + KEY + r")\"|[A-Z][A-Z0-9_]*)\s*[,)]", src):
+    for g in re.finditer(r"(?:prefs::(?:int|peek_int|flag|text|set_sys)|(?<![\w])(?:sys_(?:int|flag|text|get|set)|set_sys))\(\s*(\"(" + KEY + r")\"|[A-Z][A-Z0-9_]*)\s*[,)]", src):
         key = g.group(2) if g.group(2) else local.get(g.group(1))
         if key:
             yield "system." + key, line_of(g.start()), "R9"
@@ -259,7 +259,7 @@ def selftest(keys):
         # PREFSKERNEL: the kernel shapes R7..R9 and the user-prefs table R10.
         ("unaos/crates/kernel/src/drivers/x.rs",
          'pub const PREF_KEY: &str = "audio.ghost_ms";\nfn a() { crate::prefs::peek_int(PREF_KEY, 0, 9); crate::prefs::int("audio.volume", 0, 16); }\n'
-         'fn b() { crate::prefs::get("vein", "ghost_url"); let s = |k: &str| crate::prefs::get("vein", k).map(|v| v); s("phantom_tls"); s("provider"); }\n'),
+         'fn b() { crate::prefs::set_sys("display.ghost_set", v); crate::prefs::get("vein", "ghost_url"); let s = |k: &str| crate::prefs::get("vein", k).map(|v| v); s("phantom_tls"); s("provider"); }\n'),
         ("unaos/crates/user-prefs/src/main.rs", 'const TABLE: &[(&[u8], &[u8])] = &[\n    (b"system.audio.volume", b"12"),\n    (b"ui.theme", b"dark"),\n];\n'
          'fn c() { ask(BUS_VERB_R3PREF_GET, 1, b"ui.font_scale"); }\n'),
         # R11: the deleted `vein.tls` (VEINTLS) must go red if a ring-3 PREF_GET client asks for it again.
@@ -271,7 +271,7 @@ def selftest(keys):
     files = [(p, strip_tests(s)) for p, s in fake]
     found = scan(files)
     keys = keys | stanzas(files)
-    want_missing = {"app.demo.ghost", "system.display.ghost_key", "vein.phantom.knob", "quarry.view", "vein.tls",
+    want_missing = {"system.display.ghost_set", "app.demo.ghost", "system.display.ghost_key", "vein.phantom.knob", "quarry.view", "vein.tls",
                     "system.audio.ghost_ms", "vein.ghost_url", "vein.phantom_tls", "ui.theme", "ui.font_scale"}
     missing = {k for k in found if k not in keys}
     ok = (missing == want_missing and "vein.only.in_tests" not in found and "system.display.brightness" in found
