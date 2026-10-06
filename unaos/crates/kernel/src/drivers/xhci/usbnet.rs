@@ -206,8 +206,43 @@ impl FrameRing {
     }
 }
 
-static RXQ: Mutex<FrameRing> = Mutex::new(FrameRing::new());
-static TXQ: Mutex<FrameRing> = Mutex::new(FrameRing::new());
+static RXQ: MaskedRing = MaskedRing(Mutex::new(FrameRing::new()));
+static TXQ: MaskedRing = MaskedRing(Mutex::new(FrameRing::new()));
+
+/// USBNETKILLSFTDI (rmbp-ledger B486, flight 26 boot 1): the frame rings are taken by three contexts — the
+/// main loop's controller pass (`deliver`/`next_tx`), the preemptible `net-tick` task (`pump_until` ->
+/// `rx_ready` -> `drive`) and a ring-3 socket syscall that runs MASKED (`[net] poll enter op=sendto … masked=1`).
+/// The wire's last lines were `[lock] spin-wait name=usbnet.rs:209 at=usbnet.rs:560 waiter=20@cpu2 on=untracked`
+/// beside `held-too-long name=smolnet.rs:480 … by=20@cpu2`: the masked syscall spun on RXQ while the holder —
+/// `net-tick`, on the same cpu2 — had been preempted inside its hold, holding the xHCI LOAN around it (`drive`).
+/// A masked spin on a preemptible holder is WEDGE-8's F3 deadlock: cpu2 never ran `net-tick` again, the loan
+/// never came back, and the main loop's FTDI drain (which needs the loan) stopped for good — the wire died while
+/// the glass, off the xHCI, lived. Every hold of either ring is now a masked micro-hold (a memcpy of one frame),
+/// so no holder can be preempted and no masked waiter can outlive it. The guard drops the lock BEFORE the mask.
+struct MaskedRing(Mutex<FrameRing>);
+struct MaskedGuard<'a> {
+    g: crate::sync::MutexGuard<'a, FrameRing>,
+    _m: crate::arch::IrqMask,
+}
+impl MaskedRing {
+    #[track_caller]
+    #[inline]
+    fn lock(&self) -> MaskedGuard<'_> {
+        let m = crate::arch::IrqMask::new();
+        MaskedGuard { g: self.0.lock(), _m: m }
+    }
+}
+impl core::ops::Deref for MaskedGuard<'_> {
+    type Target = FrameRing;
+    fn deref(&self) -> &FrameRing {
+        &self.g
+    }
+}
+impl core::ops::DerefMut for MaskedGuard<'_> {
+    fn deref_mut(&mut self) -> &mut FrameRing {
+        &mut self.g
+    }
+}
 
 // ── Descriptor-walk hooks (called from the controller's enumeration, same-line, cfg-gated) ───────
 
@@ -438,6 +473,7 @@ pub fn disconnect(slot: u8) {
         serial_println!(":: USBNET: link down slot={} (disconnect) — rx={} tx={} ::", slot,
             RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed));
     }
+    serial_println!("[usbnet] detach slot={} was_up={} rings=emptied loan=pass -> clean", slot, was_up as u8); // USBNETKILLSFTDI (B486): the teardown ran to its end inside the controller pass; a stalled glass after a pull shows as this line missing
 }
 
 // ── The bulk-IN arm/claim protocol ───────────────────────────────────────────────────────────────
@@ -578,6 +614,7 @@ pub fn raw_tx(frame: &[u8]) {
 /// DATA pass only (RX reap/arm, TX reap/issue — no PHY poll, no bring-up, which stay on the main loop's
 /// full `service_usbnet`), so the loan is held for the event drain and one enqueue; the hold is measured.
 fn drive() {
+    let _mask = crate::arch::IrqMask::new(); // USBNETKILLSFTDI (B486): the stack-side loan is a MASKED hold — `net-tick` preempted inside it kept the loan (and the FTDI's drain) from the main loop for good on flight 26
     if let Ok(mut x) = crate::drivers::xhci::claim() {
         let t0 = crate::arch::now_cycles();
         x.poll_events();
@@ -1716,4 +1753,65 @@ fn u9_rx_dhcp(f: &[u8], ihl: usize) {
     let (ty, _) = u9_dhcp_type(bootp);
     let xid = if bootp.len() >= 8 { u32::from_be_bytes([bootp[4], bootp[5], bootp[6], bootp[7]]) } else { 0 };
     serial_println!("[usbnet] rx dhcp from={}.{}.{}.{} type={} xid={:08x} len={}", f[26], f[27], f[28], f[29], ty, xid, f.len());
+}
+
+// ── USBNETKILLSFTDI (rmbp-ledger B486) — TAIL-APPENDED ──────────────────────────────────────────────
+// Flight 26 boot 1: the FTDI went silent at the dongle's eighth RX arm (`rx arm trb=7 … n=8`) + the first DHCP
+// discover, and never spoke again. The FTDI's heartbeat is its completed bulk-OUT transfers (`drain_ftdi`'s
+// success arm calls `ftdi_beat`); the first beat after the burst depth says the console survived the burst.
+
+/// The RX-arm depth at which flight 26's wire died.
+const FTDI_BURST_ARMS: u64 = 8;
+/// FTDI bulk-OUT completions this boot (every success, any link state).
+static FTDI_BEATS: AtomicU64 = AtomicU64::new(0);
+static FTDI_ALIVE_SAID: AtomicBool = AtomicBool::new(false);
+
+/// One FTDI bulk-OUT completed (the controller's drain, under the loan). Prints `[ftdi] alive after usbnet arm
+/// rx=<n>` ONCE: the first beat after the link's RX arms passed the burst depth.
+pub fn ftdi_beat() {
+    FTDI_BEATS.fetch_add(1, Ordering::Relaxed);
+    let arms = RX_ARMS.load(Ordering::Relaxed);
+    if arms >= FTDI_BURST_ARMS && !FTDI_ALIVE_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!("[ftdi] alive after usbnet arm rx={} beats={}", arms, FTDI_BEATS.load(Ordering::Relaxed));
+    }
+}
+
+/// `tests usbnetftdi`: with the dongle up, drive the link for 5 s from BOTH sides the flight-26 deadlock needed —
+/// the controller pass (`main_pass`) and a MASKED stack-side drive (`rx_ready(true)` under an `IrqMask`, the
+/// shape of a ring-3 socket syscall) — and read the FTDI's heartbeat over the same window.
+/// `:: USBNETFTDI: ftdi_alive=<0|1> rx_armed=<0|1> events=<n> beats=<n> drives=<n> -> PASS|FAIL ::`;
+/// no dongle -> `SKIP reason=no-dongle`, no FTDI console -> `SKIP reason=no-ftdi`.
+pub fn usbnetftdi_selftest() {
+    if !is_up() {
+        serial_println!(":: USBNETFTDI: ftdi_alive=0 rx_armed=0 events=0 reason=no-dongle -> SKIP ::");
+        return;
+    }
+    if !super::ftdi::is_live() {
+        serial_println!(":: USBNETFTDI: ftdi_alive=0 rx_armed=0 events=0 reason=no-ftdi -> SKIP ::");
+        return;
+    }
+    let (b0, x0, d0, a0) = (FTDI_BEATS.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), DRIVES.load(Ordering::Relaxed), RX_ARMS.load(Ordering::Relaxed));
+    let t0 = crate::arch::ms();
+    let mut tick = 0u64;
+    while crate::arch::ms().saturating_sub(t0) < 5000 && is_up() {
+        main_pass();
+        {
+            let _m = crate::arch::IrqMask::new();
+            let _ = rx_ready(true);
+        }
+        let s = crate::arch::ms().saturating_sub(t0) / 1000;
+        if s > tick {
+            tick = s;
+            serial_println!("[usbnetftdi] heartbeat s={} beats={}", s, FTDI_BEATS.load(Ordering::Relaxed) - b0); // the line itself is an FTDI bulk-OUT: it is the beat it counts
+        }
+        for _ in 0..256 { core::hint::spin_loop(); }
+    }
+    let beats = FTDI_BEATS.load(Ordering::Relaxed) - b0;
+    let events = RX_XFERS.load(Ordering::Relaxed) - x0;
+    let rx_armed = armed() || RX_ARMS.load(Ordering::Relaxed) > a0;
+    let ok = beats > 0 && rx_armed && is_up();
+    serial_println!(
+        ":: USBNETFTDI: ftdi_alive={} rx_armed={} events={} beats={} drives={} -> {} ::",
+        (beats > 0) as u8, rx_armed as u8, events, beats, DRIVES.load(Ordering::Relaxed) - d0, if ok { "PASS" } else { "FAIL" }
+    );
 }
