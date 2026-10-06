@@ -352,7 +352,10 @@ mod tests {
                 assert_eq!(run(&mut s, VERB_SET, &set_body(k.ns, k.key, &v), true), (0, Vec::new()), "{}", k.key);
             }
         }
-        const GOLDEN: &[u8] = b"system.audio.mute = false\n\
+        const GOLDEN: &[u8] = b"system.appearance.accent = \"crispy\"\n\
+system.appearance.highlight = \"accent\"\n\
+system.appearance.mode = \"light\"\n\
+system.audio.mute = false\n\
 system.audio.volume = 12\n\
 system.display.brightness = 12\n\
 system.display.font = \"sans\"\n\
