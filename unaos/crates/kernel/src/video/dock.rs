@@ -999,7 +999,7 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
             continue;
         }
         // The tile face — the material at the CONTROL gain (see the module header).
-        let base = if r.id == pressed {
+        let base = if r.id == pressed || dnd_app_lit(r.id) {
             theme::button_face_pressed()
         } else {
             theme::button_face()
@@ -3854,7 +3854,7 @@ impl Layout {
 fn dock2_sig() -> u64 {
     let pend = LAUNCH_APP.load(Ordering::Relaxed) as u64;
     let phase = if pend != 0 { LAUNCH_PHASE.load(Ordering::Relaxed) as u64 & 1 } else { 0 };
-    (position() as u64) | (TRASH_FULL.load(Ordering::Relaxed) as u64) << 2 | phase << 3 | (DND_HOT.load(Ordering::Relaxed) as u64) << 4 | pend << 8 // DRAGDROP (B440): the hovered Trash relights
+    (position() as u64) | (TRASH_FULL.load(Ordering::Relaxed) as u64) << 2 | phase << 3 | (DND_HOT.load(Ordering::Relaxed) as u64) << 4 | pend << 8 | (DND_APP.load(Ordering::Relaxed) & 0xFFFF) << 40 // DRAGDROP (B440): the hovered Trash relights
 }
 
 /// The pin id of the pending launch's tile, or `WIN_NONE`.
@@ -4422,4 +4422,69 @@ pub(crate) fn dnd_drop(path: &str) -> Result<alloc::string::String, alloc::strin
         PASS_OWED.store(true, Ordering::Release);
     }
     r
+}
+
+// ── DRAGDROP2 (rmbp-ledger B470, MACPARITY row 18) — an APP tile as a drop target ─────────────────────────────────
+// A tile names its program (`appres::key_of_title`, the same key its icon is drawn from); the program's resources
+// declare its document types (FILETYPES' registrants); a drag whose every file is of a declared type may drop
+// there, and the drop opens each file with that program (`video::dnd` runs the one dispatch). The hovered tile
+// takes the pressed face.
+
+/// The hovered app tile's row id + 1 (`0` = none).
+static DND_APP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The last answer, so a drag resting on a tile reads the types once: `(tile id, first path, n, answer)`.
+static DND_APP_MEMO: spin::Mutex<Option<(wm::WinId, alloc::string::String, usize, Option<(alloc::string::String, alloc::string::String)>)>> = spin::Mutex::new(None);
+
+fn dnd_app_lit(id: wm::WinId) -> bool {
+    DND_APP.load(Ordering::Relaxed) == id as u64 + 1
+}
+
+/// Does a program declaring `doctypes` take a file of type `mime`? Exact, `type/*`, or `*/*`.
+pub(crate) fn dnd_takes(doctypes: &[alloc::string::String], mime: &str) -> bool {
+    doctypes.iter().any(|d| {
+        let d = d.trim();
+        d == mime || d == "*/*" || (d.ends_with("/*") && mime.len() > d.len() - 1 && mime.as_bytes()[..d.len() - 1].eq_ignore_ascii_case(d[..d.len() - 1].as_bytes()))
+    })
+}
+
+/// The app tile at panel `(x, y)` that takes every one of `paths`: `(tile id, app key, opener)`.
+pub(crate) fn dnd_app_at(x: i32, y: i32, paths: &[alloc::string::String]) -> Option<(wm::WinId, alloc::string::String, alloc::string::String)> {
+    if x < 0 || y < 0 || paths.is_empty() {
+        return None;
+    }
+    let (id, title) = {
+        let mut rows = ModelBuf::take();
+        let (n, l) = router_model(&mut rows)?;
+        let t = l.tile_at(x as usize, y as usize)?;
+        if t >= n || l.is_overflow(t) || rows[t].id == TRASH_PIN_ID {
+            return None;
+        }
+        let r = &rows[t];
+        (r.id, alloc::vec::Vec::from(&r.title[..r.title_len.min(r.title.len())]))
+    };
+    if let Some((mid, mp, mn, ans)) = DND_APP_MEMO.lock().as_ref() {
+        if *mid == id && *mn == paths.len() && *mp == paths[0] {
+            return ans.clone().map(|(k, o)| (id, k, o));
+        }
+    }
+    let ans = (|| {
+        let key = crate::fs::appres::key_of_title(&title)?;
+        let app = crate::fs::appres::app(&key)?;
+        let opener = if app.path.starts_with("builtin:") { key.clone() } else { app.path.clone() };
+        if !crate::video::quarry::live::openers::available(&opener) {
+            return None;
+        }
+        let mt = crate::shell::vfs_mount_table();
+        paths.iter().all(|p| dnd_takes(&app.doctypes, &crate::fs::filetype::type_of_in(&mt, p).0)).then_some((key, opener))
+    })();
+    *DND_APP_MEMO.lock() = Some((id, paths[0].clone(), paths.len(), ans.clone()));
+    ans.map(|(k, o)| (id, k, o))
+}
+
+/// The session's hover moved on or off an app tile (`WIN_NONE` = off): relight on the next pass.
+pub(crate) fn dnd_app_hover(tile: wm::WinId) {
+    let v = if tile == wm::WIN_NONE { 0 } else { tile as u64 + 1 };
+    if DND_APP.swap(v, Ordering::AcqRel) != v {
+        PASS_OWED.store(true, Ordering::Release);
+    }
 }

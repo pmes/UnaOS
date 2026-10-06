@@ -67,7 +67,31 @@ pub(super) fn arm_after_press(x: i32, y: i32, sx: usize, sy: usize) {
         if e.name == "." || e.name == ".." {
             return;
         }
-        Payload { kind: Kind::File, paths: alloc::vec![join(&m.cwd, &e.name)], dir: matches!(e.kind, NodeKind::Dir), from: WIN.load(Ordering::Relaxed), label: e.name.clone() }
+        // DRAGDROP2 (B470): Cmd toggles, Shift extends; a plain press on a marked row drags the whole selection.
+        let names: Vec<String> = m.list.iter().map(|e| e.name.clone()).collect();
+        let cmd = crate::video::keymap::command_held();
+        let shift = crate::video::keymap::shift_held();
+        let sel = {
+            let mut g = MARKS.lock();
+            let mk = g.get_or_insert_with(Marks::default);
+            if !mk.cwd.eq_ignore_ascii_case(&m.cwd) {
+                *mk = Marks { cwd: m.cwd.clone(), ..Marks::default() };
+            }
+            if !mark_apply(mk, &names, i, cmd, shift) {
+                None // a Cmd/Shift press edits the selection; it never starts a drag
+            } else {
+                Some(selection(mk, &names, i))
+            }
+        };
+        let Some(sel) = sel else {
+            core::mem::drop(g);
+            super::repaint();
+            return;
+        };
+        let dir = sel.iter().all(|&j| matches!(m.list[j].kind, NodeKind::Dir));
+        let paths: Vec<String> = sel.iter().map(|&j| join(&m.cwd, &m.list[j].name)).collect();
+        let label = label_for(&paths);
+        Payload { kind: Kind::File, paths, dir, from: WIN.load(Ordering::Relaxed), label }
     };
     dnd::arm(p, x, y);
 }
@@ -198,7 +222,10 @@ pub fn drop(p: &Payload, t: &Target, option: bool) -> (Action, bool) {
             }
             (Action::Favorite, ok)
         }
-        Target::Folder { dir, .. } | Target::Volume { dir } => {
+        Target::Folder { dir, .. } | Target::Volume { dir } | Target::Desktop { dir } => {
+            if matches!(t, Target::Desktop { .. }) && !exists(dir) {
+                let _ = super::ops::op_mkdir(dir); // DRAGDROP2: the Desktop folder on its first drop
+            }
             let ms = mounts();
             let mut ok = true;
             let mut act = Action::Move;
@@ -218,6 +245,7 @@ pub fn drop(p: &Payload, t: &Target, option: bool) -> (Action, bool) {
             (act, ok)
         }
         Target::Trash => (Action::Trash, false), // the dock's, never routed here
+        Target::Dock { .. } | Target::App { .. } => (Action::Open, false), // the session's own, never routed here
     };
     refresh_after();
     r
@@ -278,6 +306,7 @@ fn outline(px: &mut [u32], m: &Model, r: Rect, c: u32) {
 
 /// Paint the hover outline over the finished surface (from `q3_paint`).
 pub(super) fn paint(m: &Model, px: &mut [u32]) {
+    paint_marks(m, px);
     let Some(t) = dnd::hover() else { return };
     let g = m.geom;
     let row_h = g.row_h();
@@ -362,6 +391,7 @@ fn drag(path: &str, t: Target, esc: bool) -> (bool, Option<(Action, bool)>) {
 /// `tests dragdrop` registration (rides `quarry3_tests`).
 pub fn tests() {
     crate::tests::register("dragdrop", selftest);
+    crate::tests::register("dragdrop2", selftest2); // DRAGDROP2 (B470)
 }
 
 /// `tests dragdrop` — the session over the model; the real ops on `<home>/DragDropTest`.
@@ -413,5 +443,225 @@ pub fn selftest() {
         if pass { "PASS" } else { "FAIL" },
         base,
         dnd::threshold()
+    );
+}
+
+// ── DRAGDROP2 (rmbp-ledger B470, MACPARITY row 18) ─────────────────────────────────────────────────────────────
+// Multi-selection (the marks beside `list_sel`), spring-loading's action, and `tests dragdrop2`.
+
+/// The EXTRA selected rows of the shown folder (by name), and the Shift anchor.
+#[derive(Default)]
+struct Marks {
+    cwd: String,
+    names: Vec<String>,
+    anchor: Option<String>,
+}
+
+static MARKS: spin::Mutex<Option<Marks>> = spin::Mutex::new(None);
+
+/// A press on row `i` of `list` (names in display order) with Cmd/Shift: edit the marks. `true` = a plain press
+/// (the caller arms a drag of [`selection`]); `false` = the press edited the selection only.
+fn mark_apply(mk: &mut Marks, list: &[String], i: usize, cmd: bool, shift: bool) -> bool {
+    let Some(name) = list.get(i).cloned() else { return false };
+    let has = |v: &Vec<String>, n: &str| v.iter().any(|x| x == n);
+    if cmd {
+        if let Some(a) = mk.anchor.clone() {
+            if a != name && list.iter().any(|x| *x == a) && !has(&mk.names, &a) {
+                mk.names.push(a); // the row selected before the first Cmd-press joins the set
+            }
+        }
+        match mk.names.iter().position(|x| *x == name) {
+            Some(k) => {
+                mk.names.remove(k);
+            }
+            None => mk.names.push(name.clone()),
+        }
+        mk.anchor = Some(name);
+        return false;
+    }
+    if shift {
+        let a = mk.anchor.as_ref().and_then(|a| list.iter().position(|x| x == a)).unwrap_or(i);
+        let (lo, hi) = (a.min(i), a.max(i));
+        for n in list[lo..=hi].iter() {
+            if !has(&mk.names, n) {
+                mk.names.push(n.clone());
+            }
+        }
+        return false;
+    }
+    if !has(&mk.names, &name) {
+        mk.names.clear();
+    }
+    mk.anchor = Some(name);
+    true
+}
+
+/// The rows a drag from row `i` carries, in display order: the marks plus `i`.
+fn selection(mk: &Marks, list: &[String], i: usize) -> Vec<usize> {
+    (0..list.len()).filter(|&j| j == i || mk.names.iter().any(|x| *x == list[j])).collect()
+}
+
+/// The ghost's label: the item's name, or `<n> items`.
+fn label_for(paths: &[String]) -> String {
+    if paths.len() == 1 { leaf(&paths[0]) } else { alloc::format!("{} items", paths.len()) }
+}
+
+/// The marked rows' outline (the selection token) — the extra rows of a multi-selection.
+fn paint_marks(m: &Model, px: &mut [u32]) {
+    let Some(g) = MARKS.try_lock() else { return };
+    let Some(mk) = g.as_ref() else { return };
+    if mk.names.is_empty() || !mk.cwd.eq_ignore_ascii_case(&m.cwd) {
+        return;
+    }
+    let geo = m.geom;
+    let li = geo.list_pane().inner();
+    let row_h = geo.row_h();
+    let c = theme::selection();
+    for (i, e) in m.list.iter().enumerate() {
+        if !mk.names.iter().any(|x| *x == e.name) {
+            continue;
+        }
+        if toolbar::view() == toolbar::View::Icons {
+            if let Some((cx, cy)) = super::iconview::centre_of(&geo, li, m.list.len(), m.list_scroll, i) {
+                let (cw, ch) = super::iconview::cell(&geo);
+                outline(px, m, Rect { x: cx - cw / 2, y: cy - ch / 2, w: cw, h: ch }, c);
+            }
+        } else if i >= m.list_scroll && i - m.list_scroll < m.list_visible() {
+            outline(px, m, Rect { x: li.x, y: li.y + row_h + (i - m.list_scroll) * row_h, w: li.w, h: row_h }, c);
+        }
+    }
+}
+
+/// Spring-loading's action (`dnd::SpringFn`): show `dir` in Quarry's window in place. `Some(<the folder shown
+/// before>)` when it moved; `None` when Quarry is closed or already there.
+pub fn spring_to(dir: &str) -> Option<String> {
+    let prev = {
+        let mut g = MODEL.lock();
+        let m = g.as_mut()?;
+        if m.cwd.eq_ignore_ascii_case(dir) {
+            return None;
+        }
+        let prev = m.cwd.clone();
+        m.show(dir);
+        m.settle();
+        prev
+    };
+    super::repaint();
+    Some(prev)
+}
+
+static SPRUNG: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+
+/// The fixture's spring: records the folder, answers a fixed "before".
+fn fix_spring(dir: &str) -> Option<String> {
+    SPRUNG.lock().push(String::from(dir));
+    Some(String::from("/fixture-before"))
+}
+
+fn mkfile(path: &str) -> bool {
+    let mt = crate::shell::vfs_mount_table();
+    mt.create(path, NodeKind::File, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok() && mt.write(path, 0, b"dragdrop2\n", crate::fs::vfs::KERNEL_PRINCIPAL).is_ok()
+}
+
+/// One fixture drag of `paths` to `t` (released over it), through the session.
+fn drag_n(paths: &[String], t: Target) -> Option<(Action, bool)> {
+    *FIX_T.lock() = Some(t);
+    let p = Payload { kind: Kind::File, paths: paths.to_vec(), dir: false, from: wm::WIN_NONE, label: label_for(paths) };
+    dnd::arm_with(p, 10, 10, fix_resolve, false);
+    crate::video::capture::motion(150, 10);
+    crate::video::capture::release(150, 10);
+    dnd::take_last()
+}
+
+/// `tests dragdrop2` — multi-selection, the dock rule, the desktop, spring-loading, the ring-3 protocol, over
+/// fixtures under `<home>/DragDrop2Test` (no app is launched, no ring is pushed):
+/// `:: DRAGDROP2: multi=ok dock=ok desktop=ok spring=ok ring3=ok -> PASS ::`.
+pub fn selftest2() {
+    let base = alloc::format!("{}/DragDrop2Test", crate::fs::trash::home_base());
+    let _ = super::ops::op_delete(&base);
+    let a = alloc::format!("{}/A", base);
+    let names = ["f1.txt", "f2.txt", "f3.txt"];
+    let files: Vec<String> = names.iter().map(|n| alloc::format!("{}/{}", base, n)).collect();
+    let made = super::ops::op_mkdir(&base).is_ok() && super::ops::op_mkdir(&a).is_ok() && files.iter().all(|f| mkfile(f));
+    if !made {
+        serial_println!(":: DRAGDROP2: fixture={} -> SKIP :: reason=no-home-folder ::", base);
+        return;
+    }
+    // multi: plain f1, Cmd f3 = {f1, f3}; Shift from f1 to f3 = {f1, f2, f3}; the three drag to A as one move.
+    let list: Vec<String> = names.iter().map(|n| String::from(*n)).chain(core::iter::once(String::from("A"))).collect();
+    let mut mk = Marks { cwd: base.clone(), ..Marks::default() };
+    let plain = mark_apply(&mut mk, &list, 0, false, false);
+    let cmd_edits = !mark_apply(&mut mk, &list, 2, true, false);
+    let two = selection(&mk, &list, 2) == alloc::vec![0, 2];
+    let _ = mark_apply(&mut mk, &list, 0, false, false); // f1 is marked: a plain press keeps the set
+    let kept = selection(&mk, &list, 0) == alloc::vec![0, 2];
+    let mut mk2 = Marks { cwd: base.clone(), ..Marks::default() };
+    let _ = mark_apply(&mut mk2, &list, 0, false, false);
+    let _ = mark_apply(&mut mk2, &list, 2, false, true);
+    let three = selection(&mk2, &list, 2) == alloc::vec![0, 1, 2];
+    let cleared = { let _ = mark_apply(&mut mk2, &list, 3, false, false); selection(&mk2, &list, 3) == alloc::vec![3] };
+    let sel_paths: Vec<String> = selection(&mk, &list, 0).iter().chain([1usize].iter()).map(|&j| alloc::format!("{}/{}", base, list[j])).collect();
+    let label_ok = label_for(&sel_paths) == "3 items";
+    let l1 = drag_n(&sel_paths, Target::Folder { win: wm::WIN_NONE, dir: a.clone() });
+    let moved = names.iter().all(|n| exists(&alloc::format!("{}/{}", a, n)) && !exists(&alloc::format!("{}/{}", base, n)));
+    let multi_ok = plain && cmd_edits && two && kept && three && cleared && label_ok && l1 == Some((Action::Move, true)) && moved;
+    // dock: TextEdit declares text/plain, Play does not; the wildcards; the session never opens on a refusal.
+    let f1 = alloc::format!("{}/f1.txt", a);
+    let mt = crate::shell::vfs_mount_table();
+    let (mime, _) = crate::fs::filetype::type_of_in(&mt, &f1);
+    let te = crate::fs::appres::app("textedit").map(|x| x.doctypes).unwrap_or_default();
+    let pl = crate::fs::appres::app("play").map(|x| x.doctypes).unwrap_or_default();
+    let wild = alloc::vec![String::from("text/*")];
+    let dock_ok = crate::video::dock::dnd_takes(&te, &mime) && !crate::video::dock::dnd_takes(&pl, &mime) && crate::video::dock::dnd_takes(&wild, "text/plain") && !crate::video::dock::dnd_takes(&wild, "audio/wav");
+    // desktop: f1 and f2 onto a fixture Desktop (created by the drop); a file already there is refused.
+    let desk = alloc::format!("{}/Desktop", base);
+    let two_files = alloc::vec![f1.clone(), alloc::format!("{}/f2.txt", a)];
+    let l3 = drag_n(&two_files, Target::Desktop { dir: desk.clone() });
+    let on_desk = exists(&alloc::format!("{}/f1.txt", desk)) && exists(&alloc::format!("{}/f2.txt", desk));
+    let again = Payload { kind: Kind::File, paths: alloc::vec![alloc::format!("{}/f1.txt", desk)], dir: false, from: wm::WIN_NONE, label: String::new() };
+    let desktop_ok = l3 == Some((Action::Move, true)) && on_desk && !dnd::into_ok(&again, &desk) && dnd::into_ok(&again, &a);
+    // spring: a rest under SPRING_MS does nothing; at SPRING_MS the folder springs; Esc backs out and cancels.
+    SPRUNG.lock().clear();
+    *FIX_T.lock() = Some(Target::Folder { win: wm::WIN_NONE, dir: a.clone() });
+    let p = Payload { kind: Kind::File, paths: alloc::vec![alloc::format!("{}/f3.txt", a)], dir: false, from: wm::WIN_NONE, label: String::from("f3.txt") };
+    dnd::arm_full(p, 10, 10, fix_resolve, false, fix_spring);
+    crate::video::capture::motion(150, 10);
+    let t0 = dnd::hover_at();
+    let early = !dnd::spring_check(t0 + dnd::SPRING_MS - 1);
+    let sprang = dnd::spring_check(t0 + dnd::SPRING_MS);
+    let took = dnd::key(crate::pal::Event::Key(0x1b));
+    crate::video::capture::release(150, 10);
+    let rec = SPRUNG.lock().clone();
+    let spring_ok = early && sprang && took && dnd::take_last().is_none() && rec.len() >= 2 && rec[0] == a && rec.last().map(|s| s.as_str()) == Some("/fixture-before") && exists(&alloc::format!("{}/f3.txt", a));
+    // ring3: stored under a token for its owner only, asked once, the body is the paths; kernel windows are not targets.
+    let owner = 0x7e57u64;
+    let ps = alloc::vec![String::from("/home/u/a.txt"), String::from("/home/u/B")];
+    let tok = dnd::ring3_store(owner, &ps);
+    let mut stranger = Vec::new();
+    let refused = dnd::bus_drop_get(owner + 1, &[tok], &mut stranger) == -2;
+    let mut body = Vec::new();
+    let got = dnd::bus_drop_get(owner, &[tok], &mut body) == 0 && body == b"/home/u/a.txt\n/home/u/B";
+    let mut again2 = Vec::new();
+    let once = dnd::bus_drop_get(owner, &[tok], &mut again2) == -2;
+    #[cfg(target_arch = "x86_64")]
+    let furniture = !crate::arch::x86_64::syscall::ring3_owner_live(super::OWNER);
+    #[cfg(not(target_arch = "x86_64"))]
+    let furniture = true;
+    let ring3_ok = tok != 0 && refused && got && once && furniture && una_abi::INPUT_EV_ALL.contains(&una_abi::INPUT_EV_DROP);
+    let _ = super::ops::op_delete(&base);
+    let w = |b: bool| if b { "ok" } else { "FAIL" };
+    let pass = multi_ok && dock_ok && desktop_ok && spring_ok && ring3_ok;
+    serial_println!(
+        ":: DRAGDROP2: multi={} dock={} desktop={} spring={} ring3={} -> {} :: fixture={} spring_ms={} ev_drop={} verb_drop_get={} ::",
+        w(multi_ok),
+        w(dock_ok),
+        w(desktop_ok),
+        w(spring_ok),
+        w(ring3_ok),
+        if pass { "PASS" } else { "FAIL" },
+        base,
+        dnd::SPRING_MS,
+        una_abi::INPUT_EV_DROP,
+        una_abi::BUS_VERB_DROP_GET
     );
 }
