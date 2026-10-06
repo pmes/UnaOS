@@ -8953,28 +8953,6 @@ BRACEPY
         _nrc=1
     fi
 
-    if "$WORKSPACE_DIR/scripts/knob-hygiene.sh"; then
-        echo -e "${COLOR_GREEN}  ✅ knob hygiene (no phantom cfg, no knob wired to nothing)${COLOR_RESET}"
-    else
-        _nrc=1
-    fi
-
-    # GATE-K8REACH (rmbp 14, 2026-09-06): LEDGER SR1's CLASS — build coverage is not operator
-    # reachability. `kernel8()` builds from a CURATED $K8_FEATS that deliberately does not draw from
-    # the general `_feats` map above, so a knob added there and never given an arm is UNREACHABLE in
-    # every Pi bare-metal image, with no error and no warning: the operator sets it, flashes, and the
-    # image is byte-identical. Two instances a week apart (`UNAOS_PRTSCRST`, pi 7 — the Print Screen
-    # gate greened about nothing for a week; `UNAOS_BOOTLOG`, orin 15). The gate does NOT decide which
-    # knobs BELONG in the Pi image — that is not mechanical and pi 7 was right to say so — it asserts
-    # that every knob is ACCOUNTED FOR: armed, or written down in scripts/k8-reach.registry as
-    # deliberately unarmed. A knob added tomorrow reds until someone rules on it.
-    local _k8rc=0
-    python3 "$WORKSPACE_DIR/scripts/k8-reach.py" || _k8rc=$?
-    if [ "$_k8rc" -ne 0 ]; then
-        [ "$_k8rc" -eq 2 ] && echo -e "${COLOR_RED}❌ k8-reach gate gave NO VERDICT — it did not run to a verdict, which is not a pass${COLOR_RESET}"
-        _nrc=1
-    fi
-
     # GATE-ROOTS: every BINARY target in the tree is a named root of this gate.
     #
     # `check` covers the dependency graph reachable from the roots it NAMES. The libraries come free —
@@ -9033,60 +9011,16 @@ BRACEPY
         [ "$_srrc" -eq 2 ] && echo -e "${COLOR_RED}❌ spec-roots gate gave NO VERDICT — its control did not fire, which is not a clean tree${COLOR_RESET}"
     fi
 
-    # GATE-VERBS (B47, 2026-09-24): the shell's two verb tables — midden_core's `HOST_VERBS` and
-    #   `dispatch_command`'s match arms — are ONE set, both set differences empty. `scripts/verb-roots.sh`
-    #   extracts both structurally (arms anywhere on a line, comments stripped) and runs three control
-    #   probes first (a synthetic arm, a synthetic table word, `date` in both); a control that does not
-    #   fire is exit 2 and NO verdict. A word in one table and not the other is exit 1, by name.
-    local _vrrc=0
-    "$WORKSPACE_DIR/scripts/verb-roots.sh" "$WORKSPACE_DIR" || _vrrc=$?
-    if [ "$_vrrc" -eq 0 ]; then
-        echo -e "${COLOR_GREEN}  ✅ verb roots (HOST_VERBS and the dispatch arms are one set)${COLOR_RESET}"
-    else
-        [ "$_vrrc" -eq 2 ] && echo -e "${COLOR_RED}❌ verb-roots gate gave NO VERDICT — its controls did not fire, which is not a clean tree${COLOR_RESET}"
-        [ "$_vrrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a shell verb is in one table and not the other (see GATE-VERBS above)${COLOR_RESET}"; return 1; }
-    fi
-
-    # GATE-CHARTER (AUDIT 2026-10-01, B297): every kernel file in the app-domain scope (video/, fs/,
-    #   install/, selfhost/, the shell files, hda_play) names the CODEX handler that owns its domain and
-    #   the seam it sits on (`CHARTER: <Handler> — <seam>` header, or a grandfather row in
-    #   `scripts/charter.registry`), and every `<home>/.name` literal the kernel writes is an allowlisted
-    #   dotfile. Four control probes first; a control that does not fire is exit 2 and NO verdict.
-    local _chrc=0
-    "$WORKSPACE_DIR/scripts/charter-check.sh" "$WORKSPACE_DIR" || _chrc=$?
-    if [ "$_chrc" -ne 0 ]; then
-        [ "$_chrc" -eq 2 ] && echo -e "${COLOR_RED}❌ charter gate gave NO VERDICT — its controls did not fire, which is not a clean tree${COLOR_RESET}"
-        [ "$_chrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a kernel file declares no owning handler, or writes a dotfile off the allowlist (see GATE-CHARTER above)${COLOR_RESET}"; return 1; }
-    fi
-
-    # GATE-ARCH (ARCHREVIEW, B441, 2026-10-06): the CHARTER claims read against the file (a ruling behind
-    #   kernel-by-ruling, a core behind shared-core), `{}/.name` dotfiles, writes into Principia's settings
-    #   folder outside prefs.rs, an undeclared kernel store, a format magic outside the shared cores.
-    #   Shrink-only baseline `scripts/arch.baseline`; selftest first (exit 2 = NO verdict).
-    local _arrc=0
-    python3 "$WORKSPACE_DIR/scripts/arch-check.py" "$WORKSPACE_DIR" || _arrc=$?
-    [ "$_arrc" -eq 2 ] && echo -e "${COLOR_RED}❌ arch gate gave NO VERDICT — its selftest or controls did not fire${COLOR_RESET}"
-    [ "$_arrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a new architecture finding or a stale baseline row (see GATE-ARCH above)${COLOR_RESET}"; return 1; }
-    # GATE-ATTRKEYS (ATTRKEYS, B452, ARCH-2026-10-06 F9): every attribute key both rings use is declared once in
-    #   `una_abi::attr_keys`; a `"una:`/`"media:`/`"doc:`/`"image:`/`"job:`/`"bt.` literal elsewhere is refused
-    #   (shrink-only baseline `scripts/attrkeys.baseline`). Selftest controls first; exit 2 is NO verdict.
-    local _akrc=0
-    python3 "$WORKSPACE_DIR/scripts/attrkeys-check.py" "$WORKSPACE_DIR" || _akrc=$?
-    if [ "$_akrc" -ne 0 ]; then
-        [ "$_akrc" -eq 2 ] && echo -e "${COLOR_RED}❌ attrkeys gate gave NO VERDICT — its controls did not fire, which is not a clean tree${COLOR_RESET}"
-        [ "$_akrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — an attribute key is spelled outside una_abi::attr_keys (see GATE-ATTRKEYS above)${COLOR_RESET}"; return 1; }
-    fi
-
-    # GATE-STATUS (STATUSTABLE, B425, 2026-10-06; Peter: "one status table to rule them all so a false claim
-    #   ... can never be made"): every flew/unflown/confirmed/refuted claim in a ledger status cell or a queue
-    #   STATE line cites an ST<n> row of docs/dev/STATUS.tsv, and a confirmed/refuted row's quoted line is found
-    #   byte for byte on its flight's capture. `--selftest` first: a fixture line in no log must FAIL.
-    local _strc=0
-    python3 "$WORKSPACE_DIR/../tools/status-check.py" --selftest >/dev/null || _strc=2
-    [ "$_strc" -eq 0 ] && { python3 "$WORKSPACE_DIR/../tools/status-check.py" || _strc=1; }
-    if [ "$_strc" -ne 0 ]; then
-        [ "$_strc" -eq 2 ] && echo -e "${COLOR_RED}❌ status gate gave NO VERDICT — its selftest fixtures did not go red, which is not a clean tree${COLOR_RESET}"
-        echo -e "${COLOR_RED}❌ check FAILED — a status word cites no ST row, or a row's wire line is not on its flight's capture (see GATE-STATUS above)${COLOR_RESET}"; return 1
+    # BANNERROWS (rmbp-ledger B481): the host gates `./arroyo gates` runs — charter, arch, attrkeys, status, prefs,
+    #   appearance, deps, knob, verbs, banner (`--registry` against THIS run's `_feats`), k8reach (GATE-GATEPATH;
+    #   GATES_SET) — run here through that ONE verb, not through copies of their calls that drift from it (check
+    #   carried seven of the eleven and never ran prefs, appearance, deps or banner). One line per gate, full logs in
+    #   target/gates/, and a FAIL of any gate fails check, as each copy's `return 1` did. GATE-K8REACH, GATE-KNOB,
+    #   GATE-VERBS, GATE-CHARTER, GATE-ARCH, GATE-ATTRKEYS and GATE-STATUS are described in docs/dev/STRUCTURAL_GATES.md.
+    local _gtrc=0
+    gates || _gtrc=$?
+    if [ "$_gtrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a host gate is red or missing (./arroyo gates rc=${_gtrc}; see target/gates/<name>.log)${COLOR_RESET}"; return 1
     fi
 
     # GATE-TESTROOTS (TESTROOTS, rmbp, 2026-09-16): GATE-ROOTS' shape applied to the THIRD kind of
@@ -9201,7 +9135,7 @@ BRACEPY
         return 1
     fi
     if [ "$_nrc" -ne 0 ]; then
-        echo -e "${COLOR_RED}❌ check FAILED — knob hygiene, k8 reachability, verb-alias closure or fixture reachability (see above)${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ check FAILED — verb-alias closure or fixture reachability (see above)${COLOR_RESET}"
         return 1
     fi
     if [ "$_rrc" -ne 0 ]; then

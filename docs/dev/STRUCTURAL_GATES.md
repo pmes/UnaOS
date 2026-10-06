@@ -2625,9 +2625,17 @@ that build's banner has a banner-cert row for every feature it names.
 **banner-cert `--registry [<feature-list>]`** (host, no artifact): the registry self-check (cond grammar, a token
 of at least 9 bytes), every table and control row names a declared kernel Cargo feature (a row for a retired
 feature can never fire: `vein` and `root-prefer` were removed at the seeding), every listed feature has a row.
-Exit 0 clean, 1 a stale row or an unregistered feature, 2 broken. With the seat's x86 metal line it names 10
-features with no row today (prefs_reset installdemo instgui ahciroot kvblank_trace lidsleep videoplayer
-ahci-write holocron svg), each owed a row measured on an artifact.
+Exit 0 clean, 1 a stale row or an unregistered feature, 2 broken. With the seat's x86 metal line it named 10
+features with no row (prefs_reset installdemo instgui ahciroot kvblank_trace lidsleep videoplayer ahci-write
+holocron svg); BANNERROWS (B481) gave each a row measured on one metal-line x86 kernel ELF (prefs_reset NOWITNESS:
+no gated literal), so `--registry <metal line>` reads `rows=98 … findings=0 -> PASS` and the artifact cert of
+that ELF is 49 OK, 0 missing, 1 NOWITNESS (`unaos_ivb`'s `@boot` row needs the media's BOOTX64.EFI).
+
+**`arroyo check` runs `gates`** (BANNERROWS, B481): `check_both` calls the verb once where it carried its own
+copies of seven of the eleven calls (knob, k8reach, verbs, charter, arch, attrkeys, status) and none of the other
+four; a red gate fails check. Its longer legs (fixture-reachable, verb-alias closure, check-roots, spec-roots,
+test-roots, fc2, lba32, ledger-check) stay in check. GATEFIX (B476) added no script — its fixes live inside
+verb-roots, charter-check, arch-check and status-check — so GATES_SET stays eleven and `_gates_plant` gains no case.
 
 **Go-red.** `./arroyo gates --selftest` copies the working tree (git's tracked and untracked files) to a scratch
 dir and plants one defect per gate, the plants GATEREVIEW's table proved each catches: charter `{}.Recents`;
