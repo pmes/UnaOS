@@ -503,7 +503,7 @@ fn paint_general(st: &mut State, v: &Values) {
     let who = user_name().unwrap_or_else(|| String::from("(no session)"));
     txt(st, TRACK_X, 5, &who);
     btn(st, 5, VAL_X - 30, "Password");
-    paint_dock_rows(st); // DOCK2 (B394): rows 6/7 — the dock's edge and auto-hide
+    paint_dock_rows(st); paint_dnd_row(st); // NOTIFY (B418): row 8 — Do Not Disturb. DOCK2 (B394): rows 6/7 — the dock's edge and auto-hide
 }
 
 fn paint_display(st: &mut State, v: &Values) {
@@ -1019,6 +1019,7 @@ fn press_general(row: usize, cx: usize) {
         }
         5 => { if cx >= VAL_X - 30 && cx < VAL_X - 30 + BTN_W { select(8); change_password(); } }
         6 | 7 => dock_rows_press(row, cx), // DOCK2 (B394)
+        8 => dnd_row_press(cx), // NOTIFY (B418)
         _ => {}
     }
 }
@@ -2057,4 +2058,26 @@ fn take_at(tab: usize) -> (usize, bool) {
         return (first, false);
     }
     (first, true)
+}
+
+// ── NOTIFY (rmbp-ledger B418) — Do Not Disturb on the General tab (row 8): `system.notify.dnd` ───────────────────────
+// The box applies LIVE through NOTIFY's cell (`notify::set_dnd`) and latches ONE store write, drained on NOTIFY's
+// service pass (never a bus write in the click router). A Settings > Notifications pane is owed.
+
+fn paint_dnd_row(st: &mut State) {
+    txt(st, LABEL_X, 8, "Do Not Disturb");
+    fill(&mut st.surf, st.w, TRACK_X, TOP + 8 * ROW_H + 8, 24, 24, theme::scroll_track());
+    let on = super::notify::dnd();
+    if on { fill(&mut st.surf, st.w, TRACK_X + 4, TOP + 8 * ROW_H + 12, 16, 16, theme::accent()); }
+    txt(st, VAL_X, 8, if on { "on" } else { "off" });
+}
+
+fn dnd_row_press(cx: usize) {
+    if cx < TRACK_X || cx >= TRACK_X + 24 {
+        return;
+    }
+    let on = !super::notify::dnd();
+    super::notify::set_dnd(on, true);
+    say("notify_dnd", if on { "1" } else { "0" }, true);
+    repaint();
 }

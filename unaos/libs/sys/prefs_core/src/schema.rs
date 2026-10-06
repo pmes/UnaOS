@@ -216,6 +216,11 @@ pub static SCHEMA: &[Key] = &[
         doc: "Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login.",
     },
     Key {
+        ns: "system", key: "notify.dnd", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings], reader: "kernel NOTIFY (`video/notify.rs`)",
+        doc: "Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows) (NOTIFY, MACPARITY row 24). Edited in Settings > General > Do Not Disturb.",
+    },
+    Key {
         ns: "system", key: "pointer.speed", kind: Kind::Int { min: 0, max: 2 }, default: Default::Int(1),
         writers: &[Writer::Settings], reader: "kernel settings (pointer)",
         doc: "0 slow, 1 normal, 2 fast. Legacy (R75): read only while `system.trackpad.speed` is unset (TRACKPADPANE).",

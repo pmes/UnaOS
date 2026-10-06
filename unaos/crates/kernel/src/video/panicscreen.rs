@@ -537,7 +537,7 @@ pub fn next_boot_service() {
         &info[..il],
         &[b"OK", b"Show log"],
     );
-    let posted = super::dialog::post(d);
+    let posted = super::dialog::post(d); let _ = super::notify::post_quiet(b"system", b"Previous session stopped", &info[..il], b"Show log", super::notify::ACT_SHOW_LOG, b""); // NOTIFY (B418): the dialog is on the glass; the Center keeps the record
     let _ = mt.unlink(MARKER, crate::fs::vfs::KERNEL_PRINCIPAL); // said once
     serial_println!("[panic] notice posted={} marker=retired", posted as u8);
 }

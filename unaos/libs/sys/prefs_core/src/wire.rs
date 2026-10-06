@@ -376,6 +376,7 @@ system.display.wallpaper = \"\"\n\
 system.dock.autohide = false\n\
 system.dock.position = \"bottom\"\n\
 system.login.items = \"\"\n\
+system.notify.dnd = false\n\
 system.pointer.speed = 1\n\
 system.settings.tab = 0\n\
 system.trackpad.natural_scroll = true\n\
