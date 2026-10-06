@@ -557,9 +557,9 @@ use super::keymap::{Action, Binding, Table, ALT, CMD, CTRL, SHIFT};
 /// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
-pub static CRISPY_ROWS: [Binding; 54] = [
+pub static CRISPY_ROWS: [Binding; 60] = [
     // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
-    Binding { roles: CMD | ALT, usage: 0x50, action: Action::SnapLeft, token: "cmd-alt-left" },
+    Binding { roles: CMD | ALT, usage: 0x50, action: Action::SnapLeft, token: "cmd-alt-left" }, Binding { roles: CTRL | CMD, usage: 0x14, action: Action::LockScreen, token: super::shortcuts::C_CTRL_CMD_Q }, Binding { roles: CMD, usage: 0x14, action: Action::QuitApp, token: super::shortcuts::C_CMD_Q }, Binding { roles: CMD, usage: 0x1A, action: Action::CloseWindow, token: super::shortcuts::C_CMD_W }, Binding { roles: CMD, usage: 0x0B, action: Action::HideApp, token: super::shortcuts::C_CMD_H }, Binding { roles: CMD, usage: 0x36, action: Action::OpenSettings, token: super::shortcuts::C_CMD_COMMA }, Binding { roles: CMD | ALT, usage: 0x29, action: Action::ForceQuit, token: super::shortcuts::C_CMD_ALT_ESC }, // APPMENU2 (B393) — the WM's system chords (Q W H comma, Opt-Esc; Ctrl-Cmd-Q locks). ABOVE the bare Esc row (`no_shadow`), Ctrl-Cmd-Q above Cmd-Q.
     Binding { roles: CMD | ALT, usage: 0x4F, action: Action::SnapRight, token: "cmd-alt-right" },
     Binding { roles: CMD | ALT, usage: 0x52, action: Action::SnapZoom, token: "cmd-alt-up" },
     Binding { roles: CMD | ALT, usage: 0x51, action: Action::SnapRestore, token: "cmd-alt-down" },
