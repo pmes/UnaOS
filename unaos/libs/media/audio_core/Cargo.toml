@@ -3,7 +3,7 @@ name = "audio_core"
 version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
-description = "AUDIOCODEC (SR30): the audio decoders UnaOS owns — WAV, AIFF, FLAC, Ogg, Opus, Vorbis, MP3, AAC-LC — written from the specifications, no_std + alloc, shared by Ring 0 and Ring 3."
+description = "AUDIOCODEC (SR30): the audio decoders UnaOS owns — WAV, AIFF, FLAC, Ogg, Opus, Vorbis, MP3, AAC-LC — written from the specifications, no_std + alloc, shared by Ring 0 and Ring 3; MP4 is read through demux_core."
 
 # AUDIOCODEC (SR30, R83): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, and NO dependencies — the
 # prefs_core/pixel_core shape: a member of the ROOT host workspace (gneiss_pal::dsp::audio and
@@ -11,4 +11,9 @@ description = "AUDIOCODEC (SR30): the audio decoders UnaOS owns — WAV, AIFF, F
 # No dev-dependencies either: the KATs are fetched files + their published checksums, the MD5 that
 # proves a FLAC decode is our own (src/md5.rs), and the reference PCM comes from Chromium (oracle/) — for
 # AAC, which this Chromium lacks, from faad2, stored as FLAC beside each stream (oracle/gen-aac.sh).
+#
+# MP4ONE (rmbp B464, R79 — one parser): the ONE dependency is demux_core, a sibling shared core (no_std + alloc,
+# forbid(unsafe_code), itself dependency-free) — MP4/M4A sample tables come from it (src/container.rs); the seat's
+# ruling: a core depending on a core is the seam, not a dependency on the world.
 [dependencies]
+demux_core = { path = "../demux_core" }

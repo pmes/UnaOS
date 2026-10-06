@@ -283,6 +283,8 @@ fn parse_track(data: &[u8], te: &El) -> Result<TrackState, Error> {
         frame_prefix: Vec::new(),
         trim_start_ns: 0,
         play_ns: None,
+        edit: None,
+        smpb: None,
     };
     let mut default_duration = 0u64;
     let mut sample_rate = 8000.0f64;
