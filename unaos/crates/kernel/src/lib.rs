@@ -323,3 +323,5 @@ pub mod smallfix4;
 pub mod smallfix5;
 // DOORHEADLESS (rmbp-ledger B487): the serial door's headless console on SHELLTASK's job task. Tail statement.
 pub mod serialdoor;
+// HIDSTALL (rmbp-ledger B485, R103): the pointer's halt, stall and dock-release counters and `tests hidstall`. Tail statement.
+pub mod hidstall;

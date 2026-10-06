@@ -807,7 +807,7 @@ fn sec_roll(now_ms: u64) {
     let strands = SEC_STRANDS.swap(0, Relaxed);
     let yields = SEC_YIELDS.swap(0, Relaxed);
     let beam = crate::video::beam::sec_take();
-    let (seg_h, seg_hu, seg_p, seg_pu) = seg_take(); // INPUTSTALL2 M1
+    let (seg_h, seg_hu, seg_p, seg_pu) = seg_take(); let masked = crate::hidstall::take_sec_masked(); // INPUTSTALL2 M1. HIDSTALL (B485): the second's longest IRQ-masked UnaFS span
     let mut w = worst(&st);
     let mut w_ms = st[w] / 1000;
     let mut w_name = STAGES[w];
@@ -821,7 +821,7 @@ fn sec_roll(now_ms: u64) {
     let stall = w_ms >= STALL_MS || r[rw] / 1000 >= STALL_MS || seg_pu / 1000 >= STALL_MS; // INPUTSTALL2 M1: a pump step that held the HID pass is a stall second
     // M4b (the seat, R86/QUIETBOOT): before `phase=desktop` a stall second is COUNTED, not printed; the first
     // roll at the desktop says the count in one line. R80: a measurement kept, not a test run.
-    let desk = crate::boot::phase() == crate::boot::Phase::Desktop;
+    let desk = crate::boot::phase() == crate::boot::Phase::Desktop; if desk { crate::hidstall::note_sec(hid, MIN_KEYQ_US.load(Relaxed) / 1000); } // HIDSTALL (B485): the desktop's HID stall seconds and key-queue max
     if stall && !desk {
         BOOT_SUPPRESSED.fetch_add(1, Relaxed);
         let bw = w_ms.max(r[rw] / 1000);
@@ -846,12 +846,12 @@ fn sec_roll(now_ms: u64) {
                 (ms_str(draw), ms_str(pre))
             };
             serial_println!(
-                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={}",
+                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={} masked_ms={}",
                 t0, now_ms.saturating_sub(t0), w_name, w_ms,
                 ms_str(st[0]), ms_str(st[1]), ms_str(st[2]), ms_str(st[3]), ms_str(st[4]), dw, pr,
                 ["route", "handler", "composite"][rw], ms_str(r[rw]),
                 passes, ms_str(pass_max), beam[3], beam[4], beam[0] / 1000, ms_str(beam[1]), beam[5], yields,
-                valve_word(), hid, strands, frames, seg_h, ms_str(seg_hu), seg_p, ms_str(seg_pu)
+                valve_word(), hid, strands, frames, seg_h, ms_str(seg_hu), seg_p, ms_str(seg_pu), masked
             );
         }
     }

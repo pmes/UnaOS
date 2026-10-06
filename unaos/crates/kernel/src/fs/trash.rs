@@ -193,14 +193,14 @@ pub fn trash(path: &str) -> Result<String, String> {
     let user = session_user().unwrap_or_else(|| String::from(KERNEL_PRINCIPAL));
     let cx = Ctx { home: &home, user: &user, now: crate::clock::unix_now().unwrap_or(0) };
     let r = trash_core::trash(&mut Mt(mt()), &cx, path);
-    log("trash", path, &r.clone().map(|_| ()));
+    log("trash", path, &r.clone().map(|_| ())); TRASH_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // HIDSTALL (B485): the Dock reads the Trash on this change, not on a clock
     r
 }
 
 /// Move the trashed `name` back to its original path.
 pub fn restore(name: &str) -> Result<String, String> {
     let r = trash_core::restore(&mut Mt(mt()), &home_base(), name);
-    log("restore", name, &r.clone().map(|_| ()));
+    log("restore", name, &r.clone().map(|_| ())); TRASH_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // HIDSTALL (B485): the Dock reads the Trash on this change, not on a clock
     r
 }
 
@@ -208,7 +208,7 @@ pub fn restore(name: &str) -> Result<String, String> {
 pub fn empty() -> Result<usize, String> {
     let td = trash_dir();
     let r = trash_core::empty(&mut Mt(mt()), &home_base());
-    log("empty", &td, &r.clone().map(|_| ()));
+    log("empty", &td, &r.clone().map(|_| ())); TRASH_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // HIDSTALL (B485): the Dock reads the Trash on this change, not on a clock
     r
 }
 
@@ -342,4 +342,22 @@ pub fn selftest() {
         ":: TRASH: store={} trashed={} restored={} emptied={} query_ok={} -> {} ::",
         s.name(), trashed, restored, emptied, query_ok, if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// ── HIDSTALL (rmbp-ledger B485): the Trash's change generation ───────────────────────────────────────────────────────
+//
+// Flight 26: the Dock re-read the Trash every 2 s (`fs::trash::count()`, a query over the volume), and on a UnaFS home
+// every UnaFS transaction is IRQ-masked — 49 ms of no HID pass on the service core every 2 s. The Dock now reads the
+// Trash when this generation moves: bumped by every trash / restore / empty here (Quarry, Facet, the Dock, the shell
+// verb all come through these bodies), and folded with the session's home so a login reads it once.
+
+static TRASH_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The Trash's change generation: the op count in the high half, the session home's FNV-1a in the low half.
+pub fn generation() -> u64 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in home_base().bytes() {
+        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+    ((TRASH_GEN.load(core::sync::atomic::Ordering::Relaxed) as u64) << 32) | h as u64
 }
