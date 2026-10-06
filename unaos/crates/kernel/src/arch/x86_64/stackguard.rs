@@ -34,13 +34,13 @@ pub const PAGE: u64 = 4096;
 static ARMED: AtomicU32 = AtomicU32::new(0);
 static LIVE: AtomicU32 = AtomicU32::new(0);
 static ARM_FAIL: AtomicU32 = AtomicU32::new(0);
-static ARM_WHY: spin::Mutex<&'static str> = spin::Mutex::new("");
+static ARM_WHY: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("");
 /// Serialises the page-table edits (two cores may split the same leaf). Taken with IF=0 only.
-static PT_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static PT_LOCK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 /// The live guarded slabs `(base, len, name)`, for `tests stackroom`. A slab leaves it (under this lock)
 /// before it is freed, so a scan holding the lock never reads freed memory. Full = guarded but unlisted.
 const REG_CAP: usize = 256;
-static REG: spin::Mutex<[(u64, usize, &'static str); REG_CAP]> = spin::Mutex::new([(0, 0, ""); REG_CAP]);
+static REG: crate::sync::Mutex<[(u64, usize, &'static str); REG_CAP]> = crate::sync::Mutex::new([(0, 0, ""); REG_CAP]);
 /// Remote TLB generation: bumped after every unmap; each core drops its global entries when it sees a change.
 static TLB_GEN: AtomicU64 = AtomicU64::new(0);
 static SEEN_GEN: [AtomicU64; crate::arch::gdt::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::arch::gdt::MAX_CPUS];
@@ -260,7 +260,7 @@ static CPU_DONE: AtomicU32 = AtomicU32::new(0);
 static BSP_GUARD: AtomicU64 = AtomicU64::new(0);
 static BSP_TOP: AtomicU64 = AtomicU64::new(0);
 static BSP_PAINT_LO: AtomicU64 = AtomicU64::new(0);
-static BSP_WHY: spin::Mutex<&'static str> = spin::Mutex::new("owed(not-reached)");
+static BSP_WHY: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("owed(not-reached)");
 /// Cores that have ticked (IPI-able).
 static ONLINE: AtomicU32 = AtomicU32::new(0);
 /// Per-core #DF depth (reset when a task overflow leaves the #DF path for the dead task's slab).

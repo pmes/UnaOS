@@ -196,7 +196,7 @@ static mut MBOX: MboxBuf = MboxBuf { words: [0; 48] };
 /// The invariant is grep-checkable, the F1/WEDGE-8 idiom: `MBOX_FREE.lock()` appears ONLY in
 /// [`claim`] and `MboxLoan::drop`, and `MBOX` itself is named only by [`mbox_phys`] and the
 /// [`MboxLoan`] accessors — the statics are private, so the compiler enforces the rest.
-static MBOX_FREE: spin::Mutex<bool> = spin::Mutex::new(true);
+static MBOX_FREE: crate::sync::Mutex<bool> = crate::sync::Mutex::new(true);
 
 #[inline]
 fn mmio_read(addr: usize) -> u32 {

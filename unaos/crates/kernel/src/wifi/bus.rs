@@ -49,7 +49,7 @@
 // and this tree's own metal captures in `bcm4331.md` §0. No Linux driver source was consulted for
 // this file.
 
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::arch::pci::{read_config_16, read_config_32};
 

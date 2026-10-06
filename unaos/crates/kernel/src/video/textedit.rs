@@ -40,8 +40,8 @@ const CHUNK: usize = 16 * 1024;
 const WHEEL_ROWS: usize = 3;
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
-static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
-static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 
 struct State {
     path: String,

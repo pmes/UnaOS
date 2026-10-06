@@ -29,7 +29,7 @@ use ring::TransferRing;
 use self::trb::Trb;
 use self::event::{EventRing, ErstEntry, ErstTable};
 use self::context::{InputContext, DeviceContext, CTX_WORDS};
-use spin::Mutex;
+use crate::sync::Mutex;
 use alloc::vec::Vec;
 
 /// PIUSB-36 step 3: a dedicated static 512-byte buffer living in the kernel image's `.bss`
@@ -624,8 +624,8 @@ fn hub_port_change_feature_selector(bit: u16, is_ss: bool) -> Option<u16> {
 ///
 /// The invariant, checkable by grep (the F1 idiom): `XHCI_CONTROLLER.lock()` appears ONLY in
 /// `claim`/`Drop`/`install` in this file — the static is private, so the compiler enforces it.
-static XHCI_CONTROLLER: spin::Mutex<Option<alloc::boxed::Box<XhciController>>> =
-    spin::Mutex::new(None);
+static XHCI_CONTROLLER: crate::sync::Mutex<Option<alloc::boxed::Box<XhciController>>> =
+    crate::sync::Mutex::new(None);
 
 /// True while the controller is loaned out via [`claim`]. Written only inside the masked mutex
 /// hold, so a `None` in the mutex disambiguates cleanly: loaned (`Busy`) vs never installed

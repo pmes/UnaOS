@@ -414,7 +414,7 @@ mod tt {
         pub scripts_missing: String,
     }
 
-    static TT: spin::Mutex<Option<Tt>> = spin::Mutex::new(None);
+    static TT: crate::sync::Mutex<Option<Tt>> = crate::sync::Mutex::new(None);
     static READY: AtomicBool = AtomicBool::new(false);
     static GAVE_UP: AtomicBool = AtomicBool::new(false);
     static TRIES: AtomicU32 = AtomicU32::new(0);

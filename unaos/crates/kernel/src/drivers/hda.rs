@@ -2365,7 +2365,7 @@ pub mod vol {
     /// Per path node: bit16 valid, bits15:8 steps, bits7:0 nid.
     const Z: AtomicU32 = AtomicU32::new(0);
     pub(super) static NODES: [AtomicU32; MAX_PATH_DEPTH] = [Z; MAX_PATH_DEPTH];
-    pub(super) static RINGS: spin::Mutex<Option<Rings>> = spin::Mutex::new(None);
+    pub(super) static RINGS: crate::sync::Mutex<Option<Rings>> = crate::sync::Mutex::new(None);
 
     pub(super) fn capture(base: u64, walk: Option<&CodecWalk>, ws: &[Widget; MAX_NODES], rings: &mut Rings, a: &mut Audit) {
         let Some(w) = walk else { return };

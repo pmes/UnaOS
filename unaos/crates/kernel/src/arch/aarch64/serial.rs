@@ -1,5 +1,5 @@
 use core::fmt::{self, Write};
-use spin::Mutex;
+use crate::sync::Mutex;
 use lazy_static::lazy_static;
 
 // PL011 UART base. QEMU `virt` puts the PL011 at 0x09000000; the real Pi 4 (BCM2711, low-peripheral
@@ -625,7 +625,7 @@ pub use tegra_guard::{dropped_pre_map, mark_mmio_ready};
 #[cfg(feature = "baremetal")]
 pub mod shell_inbox {
     use core::sync::atomic::{AtomicU64, Ordering};
-    use spin::Mutex;
+    use crate::sync::Mutex;
 
     /// Ring capacity in bytes. See the module header for the arithmetic behind 512.
     pub const CAP: usize = 512;

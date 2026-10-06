@@ -665,7 +665,7 @@ pub fn activate_on(desc: SurfaceDesc) {
 /// From `x86_usb_pump`, the SCHED-X86 DEVICE-SERVICE task, beside `fat::probe_once`. Three
 /// constraints pick that site and together they leave no other:
 ///
-///  1. **It reads the FAT volume**, and a FAT read takes `XHCI_CONTROLLER` — a raw `spin::Mutex`.
+///  1. **It reads the FAT volume**, and a FAT read takes `XHCI_CONTROLLER` — a raw `crate::sync::Mutex`.
 ///     `main.rs`'s placement rule is explicit that no xHCI taker may be added to the RENDER core, so
 ///     the render/shell task is out; the service core is where the xHCI takers live.
 ///  2. **It spawns a ring-3 task**, and `spawn_user_image_bg` places it on `bg_place_cpu()` = the

@@ -1030,17 +1030,17 @@ struct View {
     info: bool,
 }
 
-static VIEW: spin::Mutex<Option<View>> = spin::Mutex::new(None);
+static VIEW: crate::sync::Mutex<Option<View>> = crate::sync::Mutex::new(None);
 
 /// The viewport surface — the window's own buffer, ARGB8888 `vw * vh` words. Re-rendered IN PLACE (it
 /// is never reallocated while the row names it) and freed by [`close`].
-static SURF: spin::Mutex<Vec<u32>> = spin::Mutex::new(Vec::new());
+static SURF: crate::sync::Mutex<Vec<u32>> = crate::sync::Mutex::new(Vec::new());
 
 /// The path currently on the glass, for the census line, browse and the idempotent re-open.
-static SHOWN: spin::Mutex<String> = spin::Mutex::new(String::new());
+static SHOWN: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
 
 /// The path a gesture asked for, waiting for a pass that is allowed to open it.
-static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
 
 /// Ask for `path` to be opened. **This is what a click or a key press calls, and [`open_path`] is
 /// not.** THE LATCH IS NOT CEREMONY — it is `dock::press_at`'s law: the click router runs on a 16 KiB
@@ -1065,7 +1065,7 @@ enum Cmd {
     Wheel(i8),
 }
 
-static CMDS: spin::Mutex<Vec<Cmd>> = spin::Mutex::new(Vec::new());
+static CMDS: crate::sync::Mutex<Vec<Cmd>> = crate::sync::Mutex::new(Vec::new());
 /// Drag anchor (screen coordinates of the last sample); `DRAG_ON` says whether a drag is live.
 static DRAG_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static DRAG_X: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);

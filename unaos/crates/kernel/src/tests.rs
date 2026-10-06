@@ -24,7 +24,7 @@ use crate::console::Console;
 /// Registry capacity — a full table is loud (`:: TESTS: table full … -> FAIL ::`), never silent.
 const CAP: usize = 128; // QUIETBOOT2: 80 -> 128, the ~20 boot fixtures B325 moved here. // QUIETBOOT: 48 -> 80, the boot witnesses R80 moved here (flight 19 registered 45).
 
-static TABLE: spin::Mutex<[Option<(&'static str, fn())>; CAP]> = spin::Mutex::new([None; CAP]);
+static TABLE: crate::sync::Mutex<[Option<(&'static str, fn())>; CAP]> = crate::sync::Mutex::new([None; CAP]);
 static DEFERRED: AtomicUsize = AtomicUsize::new(0);
 static AT_BOOT: AtomicUsize = AtomicUsize::new(0);
 static PASS: AtomicU32 = AtomicU32::new(0);
@@ -55,8 +55,8 @@ pub fn tally(pass: bool) {
 }
 
 /// TESTFIX2 — the fixture `run` is executing now, and the names of those that printed a FAIL this run.
-static CUR: spin::Mutex<&'static str> = spin::Mutex::new("");
-static FAILED: spin::Mutex<[Option<&'static str>; 16]> = spin::Mutex::new([None; 16]);
+static CUR: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("");
+static FAILED: crate::sync::Mutex<[Option<&'static str>; 16]> = crate::sync::Mutex::new([None; 16]);
 
 /// How many fixtures are parked behind the verb.
 pub fn deferred_count() -> usize { DEFERRED.load(Ordering::Relaxed) }
@@ -355,7 +355,7 @@ fn ensure_gen7() {
 // TESTFIX4 (B330) — TAIL-APPENDED. `skipped=[…]` on the summary: a fixture that RAN and printed no `-> PASS`
 // and no `-> FAIL` verdict (its SKIP line, or nothing) is named there, so a read of the summary tells SKIP from
 // FAIL without the log. Counted from the same verdict tap as pass/fail, before and after the fixture.
-static SKIPPED: spin::Mutex<[Option<&'static str>; CAP]> = spin::Mutex::new([None; CAP]);
+static SKIPPED: crate::sync::Mutex<[Option<&'static str>; CAP]> = crate::sync::Mutex::new([None; CAP]);
 
 fn verdicts() -> (u32, u32) { (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed)) }
 
@@ -432,7 +432,7 @@ fn ensure_elfbss() {
 // tail being the wire's own text after the LAST `-> ` of the last verdict line the fixture printed
 // (`serial_line::verdict_tail`): `PASS`, `FAIL …`, `SKIP reason=…`. A fixture that printed no verdict gets a wire
 // line of its own, `:: TESTS: <name> -> SKIP reason=no-verdict ::`, and the glass prints that same tail.
-static RESULTS: spin::Mutex<alloc::vec::Vec<(&'static str, alloc::string::String)>> = spin::Mutex::new(alloc::vec::Vec::new());
+static RESULTS: crate::sync::Mutex<alloc::vec::Vec<(&'static str, alloc::string::String)>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
 
 fn verdict_note(n: &'static str) {
     let tail = match crate::serial_line::tail_take() {
@@ -454,7 +454,7 @@ fn console_verdicts(console: &mut Console) {
 }
 /// AUDIOCODEC (SR30): the word after the fixture name in `tests <name> <arg>` (e.g. `tests play flac`), for fixtures
 /// that take one; `None` from a bare `tests <name>`, from `tests` (all) and at boot.
-static ARG: spin::Mutex<Option<alloc::string::String>> = spin::Mutex::new(None);
+static ARG: crate::sync::Mutex<Option<alloc::string::String>> = crate::sync::Mutex::new(None);
 pub fn arg() -> Option<alloc::string::String> { ARG.lock().clone() }
 
 /// VOLUMES (rmbp-ledger B366) — TAIL-APPENDED: register `tests volumes` (the Volumes layout: boot = EFI only, the

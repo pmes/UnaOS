@@ -79,8 +79,8 @@ static TONE_RUNS: AtomicU32 = AtomicU32::new(0);
 /// (run number, post snapshot) of the previous tone run and the previous play arm.
 /// AUDIO8 (B329) M3: (shape, run, pre, post) of the last run PER SHAPE — see [`shape`].
 const SHAPES: usize = 8;
-static LAST: spin::Mutex<[Option<(u64, u32, Snap, Snap)>; SHAPES]> = spin::Mutex::new([None; SHAPES]);
-static LAST_RES: spin::Mutex<Rearm> = spin::Mutex::new(Rearm { run: 0, stop_ok: false, srst_set: false, srst_clr: false, fmt_match: false, tag_match: false, stable: false, sdfmt_rd: 0 });
+static LAST: crate::sync::Mutex<[Option<(u64, u32, Snap, Snap)>; SHAPES]> = crate::sync::Mutex::new([None; SHAPES]);
+static LAST_RES: crate::sync::Mutex<Rearm> = crate::sync::Mutex::new(Rearm { run: 0, stop_ok: false, srst_set: false, srst_clr: false, fmt_match: false, tag_match: false, stable: false, sdfmt_rd: 0 });
 /// The controller's PCI function, found once by matching BAR0 against `base`. 0 = not looked up.
 static BDF_BASE: AtomicU64 = AtomicU64::new(0);
 static BDF: AtomicU32 = AtomicU32::new(u32::MAX);

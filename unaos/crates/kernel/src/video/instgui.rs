@@ -97,7 +97,7 @@ enum State {
     Closed,
 }
 
-static STATE: spin::Mutex<State> = spin::Mutex::new(State::Closed);
+static STATE: crate::sync::Mutex<State> = crate::sync::Mutex::new(State::Closed);
 static WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(wm::WIN_NONE);
 /// QUITLEAK — **closes that ran [`close`]'s teardown.** A `Quit` that took a bare `wm::close(win)`
 /// leaves A29's WINID holder registry to clear [`WIN`], so every END-STATE question about the
@@ -153,7 +153,7 @@ struct PartRow {
 static OPEN_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// INSTALLVERB: the census the current dialog is showing, or empty when none has been taken.
-static PARTS: spin::Mutex<alloc::vec::Vec<PartRow>> = spin::Mutex::new(alloc::vec::Vec::new());
+static PARTS: crate::sync::Mutex<alloc::vec::Vec<PartRow>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
 /// INSTALLVERB: which partition row is highlighted. Selection can only rest on an installable row
 /// (see [`step_part`]), so the second press can never be aimed at a stranger's volume.
 static PSEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -180,7 +180,7 @@ static WHOLE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 /// slot, geometry — and everything downstream (the warning screen's text, the engine's bind) resolves
 /// THAT against the live registry. A list change between frames can then only make the identity fail
 /// to resolve, which is a refusal; it can never silently retarget the install.
-static PENDING: spin::Mutex<Option<(block::BlockDeviceId, u8)>> = spin::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<(block::BlockDeviceId, u8)>> = crate::sync::Mutex::new(None);
 
 use core::sync::atomic::Ordering;
 
@@ -1150,7 +1150,7 @@ pub fn consume_key(c: u8) -> bool {
 // UnaFS volume, it writes nothing; the write stays the shell verb's (`install ssd --write`).
 
 static PLAN_VIEW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static PLAN_LINES: spin::Mutex<Option<alloc::vec::Vec<alloc::string::String>>> = spin::Mutex::new(None);
+static PLAN_LINES: crate::sync::Mutex<Option<alloc::vec::Vec<alloc::string::String>>> = crate::sync::Mutex::new(None);
 
 fn plan_lines_now() -> alloc::vec::Vec<alloc::string::String> {
     #[cfg(feature = "ahci")]

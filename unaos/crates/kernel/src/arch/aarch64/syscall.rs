@@ -22,10 +22,10 @@
 // and main.rs. M6f adds a real copy_from_user and a wider surface.
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
-// U11-M2: the low-level SPINLOCK (spin::Mutex) guarding the GLOBAL cross-ASID open-file refcount table. Same
+// U11-M2: the low-level SPINLOCK (crate::sync::Mutex) guarding the GLOBAL cross-ASID open-file refcount table. Same
 // primitive the scheduler uses for RUN_QUEUES/SLEEPERS (`sched.rs`), imported directly because that module's
 // alias is private. It is safe to take IRQ-masked (the teardown decrement path) — never held across block I/O.
-use spin::Mutex as SpinMutex;
+use crate::sync::Mutex as SpinMutex;
 
 // --- Syscall numbers. WRITE/EXIT are the M6a/M6b core; REPORT is the M6d demo channel; YIELD/SLEEP_MS/
 // GETPID/GETINFO are the M6f "real" surface (all thin over existing scheduler/timer primitives). The
@@ -5182,7 +5182,7 @@ impl DeferredFree {
 static DEFERRED_FREE: SpinMutex<DeferredFree> = SpinMutex::new(DeferredFree::EMPTY);
 
 /// U11-M2b (deadlock fix): an RAII IRQ-mask guard for the two `DEFERRED_FREE` critical sections.
-/// `DEFERRED_FREE` is a bare `spin::Mutex` acquired in two IRQ-ASYMMETRIC contexts: `deferred_free_push`
+/// `DEFERRED_FREE` is a bare `crate::sync::Mutex` acquired in two IRQ-ASYMMETRIC contexts: `deferred_free_push`
 /// runs in the IRQ-masked teardown path, but `deferred_free_pop` runs in the reaper TASK body, which the
 /// metal generic timer can PREEMPT (kernel task bodies run I-unmasked; `SCHED_ACTIVE` enables preemption).
 /// Without masking, a timer preempt of the reaper WHILE it holds the lock, followed by a SAME-CORE teardown
@@ -5715,7 +5715,7 @@ static NAMESPACE: SpinMutex<()> = SpinMutex::new(());
 /// order is load-bearing: `_lock` drops FIRST (release the mutex), `_irq` LAST (restore DAIF) — the
 /// lock is never held with IRQs unmasked.
 struct NsGuard {
-    _lock: spin::mutex::MutexGuard<'static, (), spin::relax::Spin>,
+    _lock: crate::sync::MutexGuard<'static, (), spin::relax::Spin>,
     _irq: IrqGuard,
 }
 
@@ -10989,7 +10989,7 @@ struct ThreadRec {
 }
 
 /// The thread-handle table: a small fixed pool of live joinable threads, index = the handle returned to EL0.
-/// A `spin::Mutex` (not per-ASID atomics like `HANDLES`) because a `JoinHandle` is a non-Copy owned value that
+/// A `crate::sync::Mutex` (not per-ASID atomics like `HANDLES`) because a `JoinHandle` is a non-Copy owned value that
 /// `join` must MOVE out; the lock is held only for the claim/take, never across the blocking `join`.
 static THREAD_TABLE: SpinMutex<[Option<ThreadRec>; NTHREAD]> = SpinMutex::new([const { None }; NTHREAD]);
 

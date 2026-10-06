@@ -165,7 +165,7 @@ struct Alt {
     armed: bool,
 }
 
-static ALTS: spin::Mutex<Vec<Alt>> = spin::Mutex::new(Vec::new());
+static ALTS: crate::sync::Mutex<Vec<Alt>> = crate::sync::Mutex::new(Vec::new());
 
 fn alt_of(key: u64) -> Option<Alt> {
     x86_64::instructions::interrupts::without_interrupts(|| ALTS.lock().iter().find(|a| a.key == key).copied())

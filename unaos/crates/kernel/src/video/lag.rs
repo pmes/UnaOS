@@ -125,14 +125,14 @@ struct Span {
     max_kind: u8,
     stage_us: [u64; 5],
 }
-static SPAN: spin::Mutex<Span> = spin::Mutex::new(Span { n: 0, by_kind: [0; 4], ms: [0; SAMPLES], max_ms: 0, max_kind: K_KEY, stage_us: [0; 5] });
+static SPAN: crate::sync::Mutex<Span> = crate::sync::Mutex::new(Span { n: 0, by_kind: [0; 4], ms: [0; SAMPLES], max_ms: 0, max_kind: K_KEY, stage_us: [0; 5] });
 static TIMEOUTS: AtomicU32 = AtomicU32::new(0);
 static ORPHANS: AtomicU32 = AtomicU32::new(0);
 static COALESCED: AtomicU32 = AtomicU32::new(0);
 static LOST: AtomicU32 = AtomicU32::new(0);
 static NEXT_ROLLUP_MS: AtomicU64 = AtomicU64::new(0);
 /// A finished event whose line is owed (printed from an unmasked context): packed by `finish`.
-static OWED: spin::Mutex<[Option<Done>; 4]> = spin::Mutex::new([None; 4]);
+static OWED: crate::sync::Mutex<[Option<Done>; 4]> = crate::sync::Mutex::new([None; 4]);
 
 #[derive(Clone, Copy)]
 struct Done {

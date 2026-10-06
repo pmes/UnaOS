@@ -25,7 +25,7 @@ use core::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 
-use spin::Mutex as SpinMutex;
+use crate::sync::Mutex as SpinMutex;
 use x86_64::registers::control::{Cr0, Cr4};
 use x86_64::registers::model_specific::{LStar, Msr};
 use x86_64::VirtAddr;
@@ -11886,7 +11886,7 @@ fn openf_release(nameid: usize, can_block: bool) {
 //
 // LOCK ORDER: `NAMESPACE` ⊃ { `OWNED_FILES`, the FILE_*/handle atomics }. Inner accesses (`owned_*`,
 // `files_alloc`/`files_free` clears, `openf_incref`/`openf_decref`, `install_file_handle`) run freely while
-// NAMESPACE is held; NAMESPACE is never re-acquired while held (spin::Mutex is NOT reentrant — the sequences
+// NAMESPACE is held; NAMESPACE is never re-acquired while held (crate::sync::Mutex is NOT reentrant — the sequences
 // above take it exactly once). x86-only file; no cfg gate needed on the lock itself.
 
 /// STOR-1 S6a: an IRQ-mask RAII (the x86 `IrqGuard` — x86 has only the `without_interrupts` closure form, so
@@ -11936,7 +11936,7 @@ static NAMESPACE: SpinMutex<()> = SpinMutex::new(());
 /// STOR-1 S6a: the RAII hold on [`NAMESPACE`]. Field order is load-bearing: `_lock` drops FIRST (release the
 /// mutex), `_irq` LAST (restore IF) — the lock is never held with IRQs unmasked.
 struct NsGuard {
-    _lock: spin::mutex::MutexGuard<'static, (), spin::relax::Spin>,
+    _lock: crate::sync::MutexGuard<'static, (), spin::relax::Spin>,
     _irq: IrqGuard,
 }
 
@@ -13003,7 +13003,7 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
         // create can interleave inside the resolve->claim (retiring S5's non-atomic source-resolve + re-validate
         // residual). No `submit` runs in this region (the sibling path is pure atomics), so the lock is never
         // held across a service-task block — the S5 deadlock class stays closed. RELEASED before the create path
-        // below (`open_create_new` takes NAMESPACE itself; spin::Mutex is not reentrant).
+        // below (`open_create_new` takes NAMESPACE itself; crate::sync::Mutex is not reentrant).
         let ns = ns_lock();
         // U11x M2: the DELETED check comes FIRST — before the any-row scan and before any resource claim. An
         // unlinked name is gone for EVERY row the moment `sys_unlink` sets the global flag, even while other

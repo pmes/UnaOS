@@ -31,7 +31,7 @@ use crate::video::wm;
 #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // CONSWIN-PI: the routed console's surface store is a `Vec` on the Pi too
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 use unaos_boot_info::FrameBufferInfo;
 
 /// Once the GUI takes ownership of the screen (the double-buffered `Screen`), fbcon must stop

@@ -77,10 +77,10 @@ static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 static LOADED_N: AtomicU32 = AtomicU32::new(0);
 static SAVED_N: AtomicU32 = AtomicU32::new(0);
 static OPEN_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 /// The session user the file was last loaded for (empty = never loaded).
-static LOADED_FOR: spin::Mutex<String> = spin::Mutex::new(String::new());
-static CUR: spin::Mutex<Values> = spin::Mutex::new(Values::DEFAULT);
+static LOADED_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
+static CUR: crate::sync::Mutex<Values> = crate::sync::Mutex::new(Values::DEFAULT);
 
 /// The persisted values.
 #[derive(Clone)]
@@ -1379,7 +1379,7 @@ struct Drag {
     want: usize,
 }
 
-static DRAG: spin::Mutex<Option<Drag>> = spin::Mutex::new(None);
+static DRAG: crate::sync::Mutex<Option<Drag>> = crate::sync::Mutex::new(None);
 /// Completed drags (the witness reads it).
 static DRAGS: AtomicU32 = AtomicU32::new(0);
 

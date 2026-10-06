@@ -203,7 +203,7 @@ struct Anim {
     steps: u64,
 }
 
-static ANIM: spin::Mutex<Option<Anim>> = spin::Mutex::new(None);
+static ANIM: crate::sync::Mutex<Option<Anim>> = crate::sync::Mutex::new(None);
 /// The title's view of the animation (read by `facet::title_for` while [`tick`] holds [`ANIM`], so
 /// it is atomics, never the lock).
 static T_ON: AtomicBool = AtomicBool::new(false);

@@ -5507,7 +5507,7 @@ mod metal {
 
     /// The one registered RTL8168 NIC (populated by [`net4_bringup`]). Mirrors the x86 e1000
     /// `NET_DEVICE` registry; the smoltcp Device adapter reaches the rings through it.
-    pub static NET4_DEVICE: spin::Mutex<Option<Rtl8168>> = spin::Mutex::new(None);
+    pub static NET4_DEVICE: crate::sync::Mutex<Option<Rtl8168>> = crate::sync::Mutex::new(None);
 
     // ── Static FALLBACK addressing (used only if DHCP does not lease within the bounded timeout) ──
     // NET-DHCP made the link's real subnet a DHCP input (the do-it-right fix for the NET-4-landing

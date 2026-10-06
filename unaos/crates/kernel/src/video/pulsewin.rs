@@ -104,7 +104,7 @@ use crate::ui_status::{
 };
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 // ------------------------------------------------------------------------------------------------
 // Palette

@@ -91,7 +91,7 @@ static REASON: Buf<LINE_CAP> = Buf::new();
 static AT: Buf<LINE_CAP> = Buf::new();
 static TEXT: Buf<TEXT_CAP> = Buf::new();
 static FILE: Buf<FILE_CAP> = Buf::new();
-static PANEL: spin::Mutex<Option<FrameBuffer>> = spin::Mutex::new(None);
+static PANEL: crate::sync::Mutex<Option<FrameBuffer>> = crate::sync::Mutex::new(None);
 
 /// GS-FREE core identity (the initial APIC id from CPUID): the #MC and #DB arms keep their GS-free contract,
 /// and a fault in the syscall-entry window may still hold the user's GS.
@@ -494,7 +494,7 @@ fn boot_number(mt: &crate::fs::vfs::MountTable, claim: bool) -> u64 {
 // ── the next boot: the line and the dialog ────────────────────────────────────────────────────────
 
 static NEXT_DONE: AtomicBool = AtomicBool::new(false);
-static SHOW_PATH: spin::Mutex<[u8; 48]> = spin::Mutex::new([0; 48]);
+static SHOW_PATH: crate::sync::Mutex<[u8; 48]> = crate::sync::Mutex::new([0; 48]);
 static SHOW_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// The storage pass (`login::notice_service`), once a session is up: read the marker once.

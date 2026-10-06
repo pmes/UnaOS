@@ -30,7 +30,7 @@
 use core::alloc::Layout;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::drivers::pci::PciScanner;
 use net::arp::{ArpCache, ArpStateMachine};
@@ -1192,7 +1192,7 @@ pub fn service_net() {
     }
     // SOCK-1 (knob-on): the smoltcp boot connectivity witness. Runs AFTER the NET_DEVICE guard
     // above is dropped — its blocking ICMP pump short-locks NET_DEVICE per ring op, so holding the
-    // lock here would deadlock (spin::Mutex is not reentrant). One-shot; no-op knob-off / no NIC.
+    // lock here would deadlock (crate::sync::Mutex is not reentrant). One-shot; no-op knob-off / no NIC.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
     if nic_present() && ladder_armed() { crate::smolnet::witness_tick(); } // INPUTSTALL2 M3 (B388): inline only on the e1000; with no e1000 the ladder runs on `net-tick` ([`witness_ladder`]), never inside the usb-pump loop
     // SOCK-2 (knob-on): the smoltcp persistent-socket UDP round-trip witness. Same one-shot,

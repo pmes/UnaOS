@@ -21,7 +21,7 @@
 //! the clock is whole seconds since 1980-01-01 00:00:00 (no timezone — FAT stores local wall
 //! time with no offset, §JD16).
 
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// The anchor a `date -s` plants: the seeded wall-clock second paired with the counter reading at
 /// the moment of seeding. `now()` = `base_secs` + (ticks since `anchor_ticks`) / freq. One small

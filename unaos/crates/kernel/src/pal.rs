@@ -16,7 +16,7 @@
 
 use crate::video::Screen;
 use lazy_static::lazy_static;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -202,7 +202,7 @@ pub trait GneissPal {
 pub mod cursor {
     use super::GneissPal;
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use spin::Mutex;
+    use crate::sync::Mutex;
 
     /// 8×8 arrow mask, MSB = leftmost pixel.
     const ARROW: [u8; 8] = [

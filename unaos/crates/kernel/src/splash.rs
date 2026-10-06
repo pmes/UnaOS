@@ -485,7 +485,7 @@ pub fn boot_splash(base: usize, len: usize, info: FrameBufferInfo) { paint(base,
 /// without re-deriving it. `FrameBuffer` is `Copy`; the `Mutex` only guards the one-time publish and
 /// gives `advance()` a `try_lock` bail against any (theoretical) re-entrant milestone.
 #[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
-static SPLASH_FB: spin::Mutex<Option<FrameBuffer>> = spin::Mutex::new(None);
+static SPLASH_FB: crate::sync::Mutex<Option<FrameBuffer>> = crate::sync::Mutex::new(None);
 
 /// Set once the base frame is up; cleared at the `gui` handoff stamp. While true, milestone stamps
 /// drive one animation frame each. Never armed on usbdebug/bootlog/witness (`boot_splash` is gated
@@ -713,7 +713,7 @@ static HOLD_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::
 static HOLD_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The rendered surface (xRGB, panel-sized, never grows) and its geometry, from `hold_prepare` until `hold_release`.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-static HOLD_SURF: spin::Mutex<Option<(alloc::vec::Vec<u8>, usize, usize)>> = spin::Mutex::new(None);
+static HOLD_SURF: crate::sync::Mutex<Option<(alloc::vec::Vec<u8>, usize, usize)>> = crate::sync::Mutex::new(None);
 
 #[cfg(target_arch = "x86_64")]
 const ARCH_NAME: &str = "x86_64";

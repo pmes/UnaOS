@@ -35,7 +35,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// The pinned head: the boot's first 64 KiB.
 pub const PINNED_CAP: usize = 64 * 1024;

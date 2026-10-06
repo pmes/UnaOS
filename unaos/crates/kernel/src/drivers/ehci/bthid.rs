@@ -1754,13 +1754,13 @@ impl Bt {
 
 /// The LED byte `decode_boot_keyboard` asked to light, handed from the decode (which borrows the
 /// link) to the send (which borrows the state). One slot; a pass delivers it immediately.
-struct LedSlot(spin::Mutex<Option<u8>>);
+struct LedSlot(crate::sync::Mutex<Option<u8>>);
 impl LedSlot {
     fn with<R>(&self, f: impl FnOnce(&mut Option<u8>) -> R) -> R {
         f(&mut self.0.lock())
     }
 }
-static PENDING_LED: LedSlot = LedSlot(spin::Mutex::new(None));
+static PENDING_LED: LedSlot = LedSlot(crate::sync::Mutex::new(None));
 
 fn ptr_deliver(l: &mut Link, buttons: u8, x: i32, y: i32, relative: bool, wheel: i8) {
     let changed = buttons != l.prev_btn;
@@ -2108,7 +2108,7 @@ unsafe fn build_map(desc: &[u8]) -> HidMap {
 
 // ── The state, the boot bring-up, the per-pass pump ──────────────────────────────────────────────
 
-static BT: spin::Mutex<Option<Box<Bt>>> = spin::Mutex::new(None);
+static BT: crate::sync::Mutex<Option<Box<Bt>>> = crate::sync::Mutex::new(None);
 static STORE_DIRTY: AtomicBool = AtomicBool::new(false);
 static STORE_LOADED: AtomicBool = AtomicBool::new(false);
 static TESTS_REGISTERED: AtomicBool = AtomicBool::new(false);

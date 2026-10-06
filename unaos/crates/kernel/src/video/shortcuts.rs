@@ -184,7 +184,7 @@ mod ov {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
     pub static WIN: AtomicU32 = AtomicU32::new(0);
-    pub static SURF: spin::Mutex<Option<Vec<u32>>> = spin::Mutex::new(None);
+    pub static SURF: crate::sync::Mutex<Option<Vec<u32>>> = crate::sync::Mutex::new(None);
 }
 
 /// Is the overlay up?

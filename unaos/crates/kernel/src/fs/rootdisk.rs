@@ -39,7 +39,7 @@ pub const LINKS: [&str; 4] = ["apps", "boot", "lib", "volumes"];
 const OFF_VOLUME: [&str; 2] = ["boot", "volumes"];
 
 static COMPAT_HITS: AtomicU32 = AtomicU32::new(0);
-static COMPAT_SAID: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static COMPAT_SAID: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 
 /// `path` below `prefix` at a component boundary: the remainder (`/` for the prefix itself).
 fn under<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {

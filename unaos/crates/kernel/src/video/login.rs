@@ -194,7 +194,7 @@ struct Form {
     windowed: bool,
 }
 
-static FORM: spin::Mutex<Form> = spin::Mutex::new(Form {
+static FORM: crate::sync::Mutex<Form> = crate::sync::Mutex::new(Form {
     state: State::Closed,
     focus: Focus::Name,
     name: [0; FIELD_MAX],
@@ -1896,7 +1896,7 @@ struct NQ {
     n: usize,
 }
 
-static NOTICES: spin::Mutex<NQ> = spin::Mutex::new(NQ { cur: None, q: [Note::EMPTY; NQ_CAP], n: 0 });
+static NOTICES: crate::sync::Mutex<NQ> = crate::sync::Mutex::new(NQ { cur: None, q: [Note::EMPTY; NQ_CAP], n: 0 });
 static NOTICE_SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static NOTICE_DISMISSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static NOTICE_DROPPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -2451,8 +2451,8 @@ struct Done {
     blocked_ms: u64,
 }
 
-static WORK: spin::Mutex<Option<Work>> = spin::Mutex::new(None);
-static DONE: spin::Mutex<Option<Done>> = spin::Mutex::new(None);
+static WORK: crate::sync::Mutex<Option<Work>> = crate::sync::Mutex::new(None);
+static DONE: crate::sync::Mutex<Option<Done>> = crate::sync::Mutex::new(None);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static BUSY_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The longest a submit may be on the worker before the form is released (adduser + two KDFs measured 2.2 s).

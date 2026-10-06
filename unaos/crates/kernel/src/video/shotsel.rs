@@ -19,7 +19,7 @@
 //! `motion_at`, which take the pointer as a parameter so the fixture can drive them with no HID.
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::pal::Event;
 use crate::video::keymap::Action;

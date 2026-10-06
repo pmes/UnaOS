@@ -43,8 +43,8 @@ const WHEEL_ROWS: usize = 3;
 const TAIL: &str = "...truncated";
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
-static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
-static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 
 struct State {
     path: String,
@@ -144,7 +144,7 @@ pub fn request_open(path: &str) {
 pub fn request_open_styled(path: &str, kind: &str) {
     *PENDING_STYLED.lock() = Some((String::from(path), String::from(kind)));
 }
-static PENDING_STYLED: spin::Mutex<Option<(String, String)>> = spin::Mutex::new(None);
+static PENDING_STYLED: crate::sync::Mutex<Option<(String, String)>> = crate::sync::Mutex::new(None);
 
 /// QUARRY2 (B336): open `path` rendered by `kind` — read, sanitise, render, then the one window body.
 pub fn open_styled(path: &str, kind: &str) -> Result<(usize, usize, usize, usize), String> {

@@ -43,7 +43,7 @@
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 use alloc::collections::VecDeque;
-use spin::Mutex as SpinMutex;
+use crate::sync::Mutex as SpinMutex;
 
 use crate::arch::sched::{self, Semaphore, PRIO_NORMAL};
 use crate::drivers::block;

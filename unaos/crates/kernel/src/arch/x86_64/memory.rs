@@ -4174,7 +4174,7 @@ static XWIN_BRK_MAX: crate::procslot::SlotVec<AtomicU64> = crate::procslot::Slot
 static XWIN_LAST_FREED: AtomicU64 = AtomicU64::new(0);
 static XWIN_LAST_HEAP: AtomicU64 = AtomicU64::new(0);
 /// Serialises `SYS_SBRK` (sibling ELF-2 threads share one slot's break).
-static XWIN_SBRK_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static XWIN_SBRK_LOCK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 /// WINDOW2: the PT behind window PT index `i` of slot `s` (a heap frame, identity-addressed), or null when
 /// that 2 MiB was never touched.
@@ -4619,8 +4619,8 @@ const _: () = assert!(OVF_OFF % (512 * 4096) == 0);
 const _: () = assert!(OVF_OFF + (FB_WIN_ROWS - FB_WIN_SLOTS) * FB_WIN_SLOT_SIZE <= 512 * 512 * 4096); // one PD (1 GiB)
 
 /// Per slot: the kernel identity address of band surface `k` (0 = never allocated).
-static FB_OVF: crate::procslot::SlotVec<spin::Mutex<alloc::vec::Vec<usize>>> =
-    crate::procslot::SlotVec::new(|| spin::Mutex::new(alloc::vec::Vec::new()), spin::Mutex::new(alloc::vec::Vec::new()));
+static FB_OVF: crate::procslot::SlotVec<crate::sync::Mutex<alloc::vec::Vec<usize>>> =
+    crate::procslot::SlotVec::new(|| crate::sync::Mutex::new(alloc::vec::Vec::new()), crate::sync::Mutex::new(alloc::vec::Vec::new()));
 
 /// WINDOWCAP3: region slot `w`'s byte offset from the window base.
 #[inline]

@@ -1006,7 +1006,7 @@ pub mod net6 {
         reg: [Option<(SocketHandle, u64, Kind)>; NSOCK],
     }
 
-    static STACK: spin::Mutex<Option<Stack>> = spin::Mutex::new(None);
+    static STACK: crate::sync::Mutex<Option<Stack>> = crate::sync::Mutex::new(None);
 
     /// ARMNET (B346): pump budgets in WALL milliseconds (they were poll counts: 400k polls = 400 smoltcp
     /// seconds). recv/connect = the x86 NETHANG cap. A send flushes until its socket's queue is empty,
@@ -1236,8 +1236,8 @@ pub mod net6 {
 
     /// `(entries, next eviction slot)`. Lock order: nothing takes `STACK` while holding this, and the
     /// learn path runs inside `RxObserver::observe`, which is already forbidden to re-enter the NIC.
-    static NEIGH: spin::Mutex<([Option<Neigh>; NEIGH_CAP], usize)> =
-        spin::Mutex::new(([None; NEIGH_CAP], 0));
+    static NEIGH: crate::sync::Mutex<([Option<Neigh>; NEIGH_CAP], usize)> =
+        crate::sync::Mutex::new(([None; NEIGH_CAP], 0));
 
     /// Record `ip -> mac`, refreshing the age if we already knew it.
     fn neigh_learn(ip: [u8; 4], mac: [u8; 6]) {

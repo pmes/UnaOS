@@ -183,7 +183,7 @@ struct Pool {
     ready: bool,
 }
 
-static POOL: spin::Mutex<Pool> = spin::Mutex::new(Pool { regs: [(0, 0); 32], n: 0, cur: 0, bump: 0, free: 0, total: 0, ready: false });
+static POOL: crate::sync::Mutex<Pool> = crate::sync::Mutex::new(Pool { regs: [(0, 0); 32], n: 0, cur: 0, bump: 0, free: 0, total: 0, ready: false });
 static POOL_LOGGED: AtomicBool = AtomicBool::new(false);
 const MIB2: u64 = 2 << 20;
 /// Physical addresses at/above PML4[2] (1 TiB) alias the process's private window in its own CR3: never pooled.

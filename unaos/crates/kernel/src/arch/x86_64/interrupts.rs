@@ -85,7 +85,7 @@ pub const SPURIOUS_VECTOR: u8 = 0xFF;
 pub mod vectors {
     use super::{IPI_VECTOR, SPURIOUS_VECTOR, TIMER_VECTOR};
     use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-    use spin::Mutex;
+    use crate::sync::Mutex;
     use x86_64::structures::idt::{HandlerFunc, InterruptDescriptorTable};
 
     /// The allocator's domain, inclusive. Nothing outside it is ever chosen.

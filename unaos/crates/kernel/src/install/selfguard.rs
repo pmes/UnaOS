@@ -108,7 +108,7 @@ struct Cand {
 /// `(registry signature, evaluated candidates)`. Re-evaluated only when the signature changes, so a
 /// settled machine reads the cache and never re-reads a boot sector; a disk attach/unplug (which
 /// moves the signature) forces a fresh scan before the next verdict is served.
-static CACHE: spin::Mutex<Option<(u64, alloc::vec::Vec<Cand>)>> = spin::Mutex::new(None);
+static CACHE: crate::sync::Mutex<Option<(u64, alloc::vec::Vec<Cand>)>> = crate::sync::Mutex::new(None);
 
 fn matches(c: &Cand, id: BlockDeviceId) -> bool {
     c.usb == matches!(id.handle, BlockHandle::Usb)

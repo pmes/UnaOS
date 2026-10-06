@@ -6922,10 +6922,10 @@ mod r8 {
         verdict: &'static str,
     }
 
-    static STASH: spin::Mutex<Option<Ctx>> = spin::Mutex::new(None);
+    static STASH: crate::sync::Mutex<Option<Ctx>> = crate::sync::Mutex::new(None);
     /// The first armed run's witness. R8's pages are `reclaim=held` (GEN7TLB HOLD, gen7.md §2.6), so a
     /// second armed run would hold another ~1 MiB for an answer this boot already has: it replays.
-    static DONE: spin::Mutex<Option<Witness>> = spin::Mutex::new(None);
+    static DONE: crate::sync::Mutex<Option<Witness>> = crate::sync::Mutex::new(None);
 
     fn r8_cycles_to_us(dt: u64) -> u64 {
         let hz = crate::arch::apic::tsc_hz();
@@ -6954,7 +6954,7 @@ mod r8 {
         *STASH.lock() = Some(Ctx { bar0, bar0_size, bus, slot, func, wake, r7: r7_verdict, geo });
     }
 
-    static BANKED_GEO: spin::Mutex<Option<Geo>> = spin::Mutex::new(None);
+    static BANKED_GEO: crate::sync::Mutex<Option<Geo>> = crate::sync::Mutex::new(None);
 
     /// GPUTESTS M1: bank the panel geometry at boot (`gen7::bank`). Prints nothing.
     pub(super) fn bank_geo() {
@@ -7097,10 +7097,10 @@ mod ladder {
         pub(super) ggtt_ok: bool,
     }
 
-    pub(super) static BANK: spin::Mutex<Option<Bank>> = spin::Mutex::new(None);
-    static R7: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
+    pub(super) static BANK: crate::sync::Mutex<Option<Bank>> = crate::sync::Mutex::new(None);
+    static R7: crate::sync::Mutex<Option<&'static str>> = crate::sync::Mutex::new(None);
     /// `(wake name, r7 verdict, us)` of the run this boot already made.
-    static DONE: spin::Mutex<Option<(&'static str, &'static str, u64)>> = spin::Mutex::new(None);
+    static DONE: crate::sync::Mutex<Option<(&'static str, &'static str, u64)>> = crate::sync::Mutex::new(None);
     /// True only while `run` drives the rungs, so R1 answers from the bank exactly then.
     static RUNNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 

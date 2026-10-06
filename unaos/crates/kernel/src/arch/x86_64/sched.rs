@@ -80,7 +80,7 @@ use alloc::sync::Arc;
 use lazy_static::lazy_static;
 // Aliased so the public `Mutex<T>` (a sleeping mutex, below) can own the nicer name. This spin
 // lock guards the internal run/sleeper queues only.
-use spin::Mutex as SpinMutex;
+use crate::sync::Mutex as SpinMutex;
 
 use crate::arch::gdt::MAX_CPUS;
 use crate::arch::{apic, percpu};
@@ -1438,7 +1438,7 @@ impl core::fmt::Write for LineBuf {
 /// ("this core is dispatching"), i.e. structurally rather than evidentially.
 ///
 /// WHY THE SNAPSHOT IS TAKEN WITH INTERRUPTS MASKED (R1/H1) — this is a correctness requirement, not
-/// tidiness. `run_queue_len` acquires `RUN_QUEUES[c]`, a plain `spin::Mutex` with NO IRQ masking, and
+/// tidiness. `run_queue_len` acquires `RUN_QUEUES[c]`, a plain `crate::sync::Mutex` with NO IRQ masking, and
 /// its own doc names it a WEDGE-4 `<W1>` hazard site. This witness runs from `x86_render_service` — a
 /// PREEMPTIBLE task on the core that owns the panel — so unmasked it would be a permanent, silent
 /// self-deadlock waiting to happen: preempt the render task while it holds `RUN_QUEUES[1]`, and `run()`
@@ -1627,7 +1627,7 @@ pub fn emit_load_witness(tag: &str) {
 /// `mh == 0` means the floor was. Anything else is a joint result and must be reported as one.
 ///
 /// SNAPSHOT DISCIPLINE is `emit_load_witness`'s, verbatim and for its reasons: the scan takes
-/// `RUN_QUEUES[c]` (a plain `spin::Mutex` with no IRQ masking) from a preemptible task on the render
+/// `RUN_QUEUES[c]` (a plain `crate::sync::Mutex` with no IRQ masking) from a preemptible task on the render
 /// core, so it runs inside `without_interrupts` or it is a latent self-deadlock. Bounded: `n <=
 /// MAX_CPUS` iterations of one relaxed load plus one lock held across a walk of `NUM_PRIORITIES`
 /// short deques, taken and released one at a time, no allocation and no UART inside. The census walks
@@ -2257,7 +2257,7 @@ mod wedge4 {
     /// W4-B: acquire `m` with a bounded spin; name the stall on the wire if the bound trips, then
     /// block exactly as the un-instrumented path would. The bound (~2e8 polls) is seconds of wall
     /// clock — three orders of magnitude past any legitimate hold of this lock.
-    pub fn lock_or_squawk<'a, T>(m: &'a super::SpinMutex<T>) -> spin::MutexGuard<'a, T, spin::Spin> {
+    pub fn lock_or_squawk<'a, T>(m: &'a super::SpinMutex<T>) -> crate::sync::MutexGuard<'a, T, spin::Spin> {
         let mut spins: u64 = 0;
         loop {
             if let Some(g) = m.try_lock() {
@@ -4382,7 +4382,7 @@ pub fn futex_waiters_on(key: u64) -> usize {
 // slot — so a stale-or-reused value is a benign wrong-target boost that self-corrects, never UB.
 //
 // THE PROTOCOL (minimal, soft-RT — the BEOS-SMP-FLOW R3 shape). Only the sleeping `Mutex`
-// participates (the counting `Semaphore`/futex have no single owner; the IRQ-masked `spin::Mutex`es
+// participates (the counting `Semaphore`/futex have no single owner; the IRQ-masked `crate::sync::Mutex`es
 // in `video/wm.rs` cannot be preempted mid-hold — both out of scope):
 //
 //   1. ACQUIRE-TIME DONATION (`pi_donate`, from a blocker in `Mutex::lock`). A task blocking on a

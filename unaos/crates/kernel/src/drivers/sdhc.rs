@@ -126,7 +126,7 @@
 
 #![allow(dead_code)]
 
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::drivers::block::BlockError;
 use crate::drivers::pci::PciScanner;

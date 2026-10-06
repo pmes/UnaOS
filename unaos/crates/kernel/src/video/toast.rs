@@ -60,7 +60,7 @@ struct Q {
     until: u64,
 }
 
-static TQ: spin::Mutex<Q> = spin::Mutex::new(Q { q: [T::EMPTY; QCAP], n: 0, cur: None, win: wm::WIN_NONE, until: 0 });
+static TQ: crate::sync::Mutex<Q> = crate::sync::Mutex::new(Q { q: [T::EMPTY; QCAP], n: 0, cur: None, win: wm::WIN_NONE, until: 0 });
 static HEADLESS: AtomicBool = AtomicBool::new(false);
 static SHOWN: AtomicU32 = AtomicU32::new(0);
 static DROPPED: AtomicU32 = AtomicU32::new(0);

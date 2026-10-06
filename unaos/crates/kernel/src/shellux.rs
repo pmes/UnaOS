@@ -27,7 +27,7 @@ pub struct Out {
 /// last placed, so any other edit makes the walk stale without a hook on Enter.
 pub struct Nav { idx: usize, draft: String, shown: String }
 impl Nav { pub const fn new() -> Self { Nav { idx: 0, draft: String::new(), shown: String::new() } } }
-static NAV: spin::Mutex<Nav> = spin::Mutex::new(Nav::new());
+static NAV: crate::sync::Mutex<Nav> = crate::sync::Mutex::new(Nav::new());
 
 /// Does the line editor take this byte?
 pub fn wants(c: u8) -> bool { matches!(c, 0x01 | 0x03 | 0x05 | 0x09 | 0x0C | 0x15 | 0x17 | 0x1E | 0x1F) }

@@ -397,7 +397,7 @@ fn probe_and_init() -> Option<VirtioNet> {
 
 /// The one registered virtio-net device (populated by [`vnet_bringup`]). Mirrors NET-4's `NET4_DEVICE`
 /// / the x86 e1000 `NET_DEVICE` registry; the smoltcp Device adapter reaches the rings through it.
-pub static VNET_DEVICE: spin::Mutex<Option<VirtioNet>> = spin::Mutex::new(None);
+pub static VNET_DEVICE: crate::sync::Mutex<Option<VirtioNet>> = crate::sync::Mutex::new(None);
 
 // ── Static fallback addressing: the slirp subnet (guest is 10.0.2.15; gateway/ping target 10.0.2.2).
 //    Used only if DHCP fails to lease within the timeout — slirp's DHCP server hands out these exact

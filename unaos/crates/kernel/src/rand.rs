@@ -211,7 +211,7 @@ struct Drbg {
     seeded: bool,
 }
 
-static DRBG: spin::Mutex<Drbg> = spin::Mutex::new(Drbg { key: [0; 32], ctr: 0, since_seed: 0, seeded: false });
+static DRBG: crate::sync::Mutex<Drbg> = crate::sync::Mutex::new(Drbg { key: [0; 32], ctr: 0, since_seed: 0, seeded: false });
 static DRBG_SAID: AtomicU8 = AtomicU8::new(0);
 /// The seed source the last reseed used (0 rdseed, else a `Source` + 1).
 static SEED_SRC: AtomicU8 = AtomicU8::new(0xFF);

@@ -50,7 +50,7 @@ pub static LAST_WINDOW_REFUSAL: AtomicU64 = AtomicU64::new(0);
 type KLoader = Loader<Arc<String>>;
 
 /// The loader of every dynamic address space of the session, by PML4.
-static LOADERS: spin::Mutex<BTreeMap<u64, KLoader>> = spin::Mutex::new(BTreeMap::new());
+static LOADERS: crate::sync::Mutex<BTreeMap<u64, KLoader>> = crate::sync::Mutex::new(BTreeMap::new());
 
 /// `ldso_core::Space` over one process's address space.
 pub struct KSpace<'a> {

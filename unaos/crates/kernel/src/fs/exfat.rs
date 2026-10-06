@@ -35,7 +35,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use exfat_core::{Error, SectorRead, Volume};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::fs::fat::BlockSource;
 use crate::fs::vfs::{volid_mix, DirEnt, NodeKind, Stat, VfsBackend, VfsError, VfsTime, VOLID_SEED};

@@ -43,7 +43,7 @@ struct Ring {
     b: [u8; CAP],
     n: usize,
 }
-static RING: spin::Mutex<Ring> = spin::Mutex::new(Ring { b: [0; CAP], n: 0 });
+static RING: crate::sync::Mutex<Ring> = crate::sync::Mutex::new(Ring { b: [0; CAP], n: 0 });
 static KEPT: AtomicU64 = AtomicU64::new(0);
 static LOST: AtomicU64 = AtomicU64::new(0);
 static DESKTOP_PENDING: AtomicBool = AtomicBool::new(false);

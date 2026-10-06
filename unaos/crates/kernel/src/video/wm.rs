@@ -60,7 +60,7 @@
 //! one.
 
 use spin::relax::Spin as SpinRelax;
-use spin::{Mutex, MutexGuard}; use super::rowstore::{SegVec, SlotBits}; // WINDOWCAP-2: per-row side storage
+use crate::sync::{Mutex, MutexGuard}; use super::rowstore::{SegVec, SlotBits}; // WINDOWCAP-2: per-row side storage
 
 /// WC-A — the window table is fixed-size and statically allocated: the compositor runs from syscall
 /// context on a non-coherent scan-out path where a heap allocation (or a growable table) would be

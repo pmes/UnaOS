@@ -346,7 +346,7 @@ struct Scratch {
     raw: [u32; MAX_STRIP_W],
 }
 
-static SCRATCH: super::HeldMutex<Scratch> = super::HeldMutex::new(Scratch { // MENULOCK (B200) — WAS `spin::Mutex`; the same lock plus a holder record, so a refused paint names who holds it (`super::HeldMutex`). ⚠ SAME-LINE fold.
+static SCRATCH: super::HeldMutex<Scratch> = super::HeldMutex::new(Scratch { // MENULOCK (B200) — WAS `crate::sync::Mutex`; the same lock plus a holder record, so a refused paint names who holds it (`super::HeldMutex`). ⚠ SAME-LINE fold.
     log: [0; MAX_STRIP_W],
     raw: [0; MAX_STRIP_W],
 });
@@ -1742,9 +1742,9 @@ pub fn bar_decl_lock(name: &str) -> u64 {
 //
 //  * `lock=panel` — `video::WRITER`, refused by `panel_snapshot` ONLY when the caller runs MASKED
 //    (an open caller blocks on it instead, so a fixture driving `compose` from a task can never be
-//    refused here); a `spin::Mutex` taken with `lock`/`try_lock` at ~120 sites, nearly all of them
+//    refused here); a `crate::sync::Mutex` taken with `lock`/`try_lock` at ~120 sites, nearly all of them
 //    copy-out (`*WRITER.lock()`, the guard dropped in the same statement).
-//  * `lock=strip-scratch` — [`SCRATCH`], a `spin::Mutex` taken ONLY by `try_lock` in [`paint`] and
+//  * `lock=strip-scratch` — [`SCRATCH`], a `crate::sync::Mutex` taken ONLY by `try_lock` in [`paint`] and
 //    [`erase_rect`] and held for one strip's compose + blit + flush, INCLUDING the beam hold
 //    (`beam::hold`, which spins with the scratch held on a board that can see its raster).
 //

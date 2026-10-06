@@ -81,9 +81,9 @@ pub mod key {
     pub const DOCK_AUTOHIDE: &str = "dock.autohide";
 }
 
-static TREE: spin::Mutex<PrefTree> = spin::Mutex::new(PrefTree::new());
+static TREE: crate::sync::Mutex<PrefTree> = crate::sync::Mutex::new(PrefTree::new());
 /// The session user the tree was loaded for (`None` = never loaded; `Some("")` = no session).
-static LOADED_FOR: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static LOADED_FOR: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
 static LOADED_N: AtomicU32 = AtomicU32::new(0);
 static SAVED_N: AtomicU32 = AtomicU32::new(0);
 /// The file on disk was refused at load: saves are held so it is never overwritten.

@@ -42,7 +42,7 @@
 //!   * [`flush_if_dirty`] is the write, and it runs from the main loop with no driver lock held. It
 //!     **defers** rather than write while `EHCI_HID` cannot be proven free (x86; see the guard
 //!     inside), so the invariant is checked instead of trusted — but read the guard's own doc for
-//!     what that check can and cannot say. `spin::Mutex::is_locked` names no holder, so "held" is
+//!     what that check can and cannot say. `crate::sync::Mutex::is_locked` names no holder, so "held" is
 //!     read as UNKNOWN, never as "this call site is inside the pass", and the deferral is bounded in
 //!     what it prints ([`HCRON_DEFER_NOTES`]) so a contended lock can never make the main loop print
 //!     forever.
@@ -102,7 +102,7 @@
 //! explicitly (the API shape the design names) and **refuses** a key that does not equal that span,
 //! so a class codec and the store can never disagree about what a record's identity is.
 
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::hash::crc32;
 
@@ -550,7 +550,7 @@ pub fn put(class: u8, key: &[u8], val: &[u8]) -> Result<(), HcronError> {
 /// Copy the body of the record `class`/`key` into `out`, returning its length.
 ///
 /// **Deviation from the design's `get(class, key) -> Option<&[u8]>`, stated rather than hidden:** the
-/// table lives behind a `spin::Mutex`, so no reference into it can outlive the guard. Copying into a
+/// table lives behind a `crate::sync::Mutex`, so no reference into it can outlive the guard. Copying into a
 /// caller buffer is the same operation with a lifetime the borrow checker can see; it costs one
 /// `memcpy` of at most [`HCRON_MAX_BODY`] bytes and it means no caller can hold the store's lock
 /// open across arbitrary work.
@@ -570,7 +570,7 @@ pub fn get(class: u8, key: &[u8], out: &mut [u8]) -> Option<usize> {
 /// The escape hatch for a class whose lookup is not by primary key — the bond class matches on an LE
 /// identity address as well as the BR/EDR one. `pred` runs **with the store lock held**, so it must
 /// be pure: it may read the body it is handed and nothing else. It must not call back into this
-/// module (`spin::Mutex` is not re-entrant).
+/// module (`crate::sync::Mutex` is not re-entrant).
 pub fn find_body(class: u8, pred: impl Fn(&[u8]) -> bool, out: &mut [u8]) -> Option<usize> {
     let s = STORE.lock();
     for i in 0..s.count {
@@ -1049,7 +1049,7 @@ fn quarantine_note(q: Result<(), HcronError>) -> &'static str {
 
 /// Is the `EHCI_HID` mutex held by SOMEONE right now?
 ///
-/// **Named for what it can actually answer.** `spin::Mutex::is_locked` is a GLOBAL predicate: it
+/// **Named for what it can actually answer.** `crate::sync::Mutex::is_locked` is a GLOBAL predicate: it
 /// reports that the lock is taken, never by whom. It therefore CANNOT distinguish
 ///
 ///   * "this call stack is inside a `service_ehci_hid()` pass" — the bug this seam exists to
@@ -1119,7 +1119,7 @@ fn note_defer() {
     }
     if first {
         serial_println!(
-            ":: [hcron] flush deferred — EHCI_HID is held at this instant, so the store write waits for a pass that can PROVE the lock free. This reading is GLOBAL (spin::Mutex::is_locked names no holder): \"held\" means UNKNOWN, NOT that this call site is inside the service pass. Retries continue every pass; the witness does not, and is capped at {} lines this boot == witness ::",
+            ":: [hcron] flush deferred — EHCI_HID is held at this instant, so the store write waits for a pass that can PROVE the lock free. This reading is GLOBAL (crate::sync::Mutex::is_locked names no holder): \"held\" means UNKNOWN, NOT that this call site is inside the service pass. Retries continue every pass; the witness does not, and is capped at {} lines this boot == witness ::",
             HCRON_DEFER_NOTES
         );
     } else {

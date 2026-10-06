@@ -501,7 +501,7 @@ struct Model {
     status: Option<String>,
 }
 
-static MODEL: spin::Mutex<Option<Model>> = spin::Mutex::new(None);
+static MODEL: crate::sync::Mutex<Option<Model>> = crate::sync::Mutex::new(None);
 
 /// The surface. A heap allocation sized from the live panel rather than a `[u32; W * H]` static,
 /// because the two panels this must serve differ by 7.5x in area (QEMU raspi4b 640x480, the bench Pi
@@ -511,7 +511,7 @@ static MODEL: spin::Mutex<Option<Model>> = spin::Mutex::new(None);
 /// INVARIANT: once [`open`] has published it, the `Vec` is at its final length and never grows, so the
 /// address `wm` holds stays valid for the window's whole life. [`close`] drops it only after
 /// `wm::close` has removed the row.
-static SURF: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+static SURF: crate::sync::Mutex<Vec<u8>> = crate::sync::Mutex::new(Vec::new());
 
 /// Repaint sequence — the wire's proof that a scroll or a navigation actually redrew, and the number
 /// `quarry.md` §5's cost note is counted against.
@@ -1272,7 +1272,7 @@ struct Job {
 
 /// The jobs Quarry has outstanding. Small, bounded, and Quarry's OWN — see [`MAX_JOBS`] for why it
 /// cannot be the shell's table. Arch-neutral for the reason stated on [`Job`].
-static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
+static JOBS: crate::sync::Mutex<Vec<Job>> = crate::sync::Mutex::new(Vec::new());
 
 /// Poll every outstanding job and free the kernel rows of the ones that have finished.
 ///

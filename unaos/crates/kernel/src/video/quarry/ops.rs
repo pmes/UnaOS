@@ -279,7 +279,7 @@ struct Menu {
     x: usize,
     y: usize,
 }
-static MENU: spin::Mutex<Option<Menu>> = spin::Mutex::new(None);
+static MENU: crate::sync::Mutex<Option<Menu>> = crate::sync::Mutex::new(None);
 static MENU_UP: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
@@ -291,8 +291,8 @@ struct Edit {
     buf: String,
     target: Target,
 }
-static EDIT: spin::Mutex<Option<Edit>> = spin::Mutex::new(None);
-static CLIP: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
+static CLIP: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
 
 fn menu_w(g: &Geom) -> usize {
     22 * g.cell_w() + 2 * PAD()

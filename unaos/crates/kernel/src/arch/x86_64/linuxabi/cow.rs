@@ -35,7 +35,7 @@ pub const CW: u64 = 1 << 11;
 pub const SHARED_PREFAULT: u64 = 16384;
 
 /// Frames held by two or more address spaces: frame -> holders.
-static REFS: spin::Mutex<BTreeMap<u64, u32>> = spin::Mutex::new(BTreeMap::new());
+static REFS: crate::sync::Mutex<BTreeMap<u64, u32>> = crate::sync::Mutex::new(BTreeMap::new());
 
 // ---- counters (the `tests selfbuild4` kernel line) ----
 pub static COW_FORKS: AtomicU64 = AtomicU64::new(0);

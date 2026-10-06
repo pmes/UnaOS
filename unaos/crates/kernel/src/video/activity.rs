@@ -42,7 +42,7 @@ const NPRES: usize = 16;
 const BAR_W: usize = 220;
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
-static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 /// Per-window present counts, fed by `sys_win_present` (one relaxed add). ACTIVITY diffs them.
 static PRES: [AtomicU32; NPRES] = [const { AtomicU32::new(0) }; NPRES];
 

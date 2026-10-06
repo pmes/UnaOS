@@ -110,7 +110,7 @@ static BRK: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(
 static BRK_LO: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 static BRK_MAX: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
 static PLACED: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0)); // 1 when slot `s`'s extension GiB is installed in its L1.
-static SBRK_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static SBRK_LOCK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 fn xrec(s: usize) -> Option<*mut XRec> {
     let p = XREC.peek(s)?.load(Ordering::Acquire);

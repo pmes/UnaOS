@@ -46,7 +46,7 @@ use crate::arch::memory as storm_slots;
 /// cluster: every command re-resolves it from the root, so a swapped or remounted card can
 /// never leave the shell holding a stale chain head — the worst case is an honest `-ENOENT`.
 /// `None` means the root (no heap touched until the first `cd`).
-static CWD: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static CWD: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
 
 /// The current working directory as a display/join-ready absolute path.
 fn cwd_path() -> String {
@@ -2430,7 +2430,7 @@ fn render_message(console: &mut Console, msg: &midden_core::Message) {
 /// This is deliberately NOT `Console::history`, which is the SCROLLBACK (every output line the view
 /// is holding). Two different questions — "what did I type" vs "what is on screen" — and conflating
 /// them is why `history` could not simply read the console.
-static CMD_HISTORY: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static CMD_HISTORY: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 
 /// BASICS: how many command lines `history` retains. Small and fixed: this is a bench console, the
 /// store is heap, and a run-away paste must not be able to grow it without bound.
@@ -2443,7 +2443,7 @@ const HISTORY_CAP: usize = 64;
 /// the help text implied substitution would be worse than no store. What it is good for today is
 /// what an operator at a bench actually uses it for — writing down a path, an address or a pid
 /// between commands, on a machine with no notepad.
-static ENV_VARS: spin::Mutex<Vec<(String, String)>> = spin::Mutex::new(Vec::new());
+static ENV_VARS: crate::sync::Mutex<Vec<(String, String)>> = crate::sync::Mutex::new(Vec::new());
 
 /// BASICS: caps on the variable store. A shell variable is a convenience, not a database.
 const ENV_MAX_VARS: usize = 32;
@@ -3015,7 +3015,7 @@ pub fn midden_witness() { if crate::tests::defer("tste", midden_witness) { retur
 /// BASICS: where a captured console's lines land. `Console::set_output_sink` takes a bare `fn`
 /// pointer (no captured state, by its own contract), so the buffer has to be a static.
 #[cfg(feature = "witness")]
-static WITNESS_CAPTURE: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static WITNESS_CAPTURE: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 
 /// BASICS: the sink itself. Touches nothing but its own lock, which satisfies the sink contract's
 /// "must not call back into this `Console` and must hold no lock the call site could already hold".
@@ -6703,12 +6703,12 @@ struct BgJob {
 /// DIFFERENT core: `adopt_bg_job` runs from the device-service task (`x86_usb_pump`, service core)
 /// while the shell runs in `x86_render_service` (render core). The Mutex is now load-bearing — do
 /// not drop it. No live hazard today (the service-core call happens once, at boot, before an
-/// operator can type `jobs`), and cross-core contention on a raw `spin::Mutex` is bounded spin that
+/// operator can type `jobs`), and cross-core contention on a raw `crate::sync::Mutex` is bounded spin that
 /// progresses — the SCHED-X86 deadlock rule is about two preemptible takers on ONE core. But note
 /// that `bg_jobs` holds this lock across `console.println`, which on a `wc` build routes through the
 /// compositor: a future second cross-core caller could spin for the length of a repaint.
 #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
-static BG_JOBS: spin::Mutex<[Option<BgJob>; 12]> = spin::Mutex::new([None; 12]);
+static BG_JOBS: crate::sync::Mutex<[Option<BgJob>; 12]> = crate::sync::Mutex::new([None; 12]);
 
 /// BGREAP-CLOSE: claim a row in [`BG_JOBS`], reclaiming provably-finished rows when the table is
 /// full. **Every insert into that table must come through here** — `jobs` is the only path that

@@ -103,7 +103,7 @@ pub struct Step {
 pub fn begin(name: &'static str, label: &'static str) -> Step {
     // Painted once per distinct label: a step retried across passes (a `Busy` store mount) does not
     // composite the glass on every pass.
-    static LAST: spin::Mutex<&'static str> = spin::Mutex::new("");
+    static LAST: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("");
     let fresh = { let mut l = LAST.lock(); if *l != label { *l = label; true } else { false } };
     if fresh {
         crate::splash::step_label(label);
