@@ -6,10 +6,6 @@ dotslash|/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
 dotslash|{}/.config  # F2 BTKEYSEAL (the BT link-key folder)
 dotslash|{}/.config/unaos  # F2 BTKEYSEAL (the BT link-key folder)
 dotslash|{}/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
-dotslash|{}/.config/unaos/holocron/.ring  # F4 HOLOCRONROOT
-dotslash|{}/.config/unaos/preferences.toml  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
-dotslash|{}/.dock  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
-dotslash|{}/.settings  # F1 PRINCIPIAFILES (the one-shot import of the old stores)
 parser|drivers/hda_play.rs|riff  # F6 TYPECORE (a format magic outside the shared cores)
 parser|fs/bootdisk.rs|elf  # F6 TYPECORE
 parser|fs/filetype.rs|elf  # F6 TYPECORE
@@ -29,4 +25,3 @@ seamcite|ring3abi.rs  # F12 (kernel-by-ruling with no ruling cited)
 seamcite|video/panicscreen.rs  # F12 (kernel-by-ruling with no ruling cited)
 seamcite|wifi/status.rs  # F12 (kernel-by-ruling with no ruling cited)
 seamcite|wifi/verb.rs  # F12 (kernel-by-ruling with no ruling cited)
-settings|video/launcher.rs  # F7 LAUNCHERPREFS

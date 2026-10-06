@@ -720,7 +720,7 @@ pub fn press_at(x: i32, y: i32, mask: u8) -> bool {
 // ── The pass (off the router) ───────────────────────────────────────────────────────────────────
 
 fn lru_path() -> Option<String> {
-    crate::prefs::home().filter(|h| !h.is_empty()).map(|h| alloc::format!("{}/settings/launcher", h))
+    crate::prefs::home().filter(|h| !h.is_empty()).map(|_| crate::prefs::domain_path("launcher")) // SMALLFIX4 (LAUNCHERPREFS fold): the store names its own file; no `settings/` literal outside prefs.rs
 }
 
 /// LAUNCHERPREFS (B451): the recency is `app.launcher.recent` in Principia's store (`settings/launcher` by
