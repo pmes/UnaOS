@@ -418,9 +418,9 @@ pub fn selftest() {
     // Read as a table: column 0 is the node and MUST be the role itself, unchanged.
     const REF: [[u32; 4]; 3] = crate::video::theme::fixture::KNURL_REF; // APPEARANCE: the golden rows live in theme::fixture (CTRL_CLOSE 0xFF5F57 — column 1 red stays at the crest CLIPPING on a saturated channel; CTRL_MIN 0xFEBC2E; CTRL_ZOOM 0x28C840)
     const ROLES: [u32; 3] = [
-        super::theme::ctrl_close(),
-        super::theme::ctrl_min(),
-        super::theme::ctrl_zoom(),
+        super::theme::CTRL_CLOSE,
+        super::theme::CTRL_MIN,
+        super::theme::CTRL_ZOOM,
     ];
     const POS: [(usize, usize); 4] = [(0, 0), (1, 0), (3, 0), (0, 1)];
     for (r, &role) in ROLES.iter().enumerate() {
