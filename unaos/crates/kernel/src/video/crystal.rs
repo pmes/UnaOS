@@ -607,7 +607,7 @@ fn dismiss(reason: &str) {
     if !OPEN.swap(false, Ordering::AcqRel) {
         return;
     }
-    super::powerui::panel_clear(); super::powerui::disarm(); // POWERMENU
+    super::powerui::panel_clear(); super::powerui::disarm(); super::statusmenu::closed(); // STATUSTRAY // POWERMENU
     DISMISSES.fetch_add(1, Ordering::Relaxed);
     serial_println!(":: SHARD-MENU: crystal_press=dismiss reason={} ::", reason);
     // MENU-DRIVE — the mirrored half of [`open`]'s rule. The erase ([`compose`]'s closed path, which
@@ -737,7 +737,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     if OPEN.load(Ordering::Acquire) {
         if let Some(r) = menu_rect(pw, ph) {
             if menu_contains(r, px, py) {
-                if super::powerui::panel_open() { PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed); return true; } // POWERMENU M2: a press inside the battery panel is swallowed
+                if super::powerui::panel_open() { let (rx, ry, rw, _) = r; let row = py.saturating_sub(ry + BORDER) / ITEM_H(); let _ = super::statusmenu::panel_press(row, px.saturating_sub(rx + BORDER + PADX()), rw.saturating_sub(2 * (BORDER + PADX()))); PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed); return true; } // STATUSTRAY (B426): a press on a status menu's row acts through the owner's seam (slider, mute, the table toggle); the panel stays open // POWERMENU M2: a press inside the battery panel is swallowed
                 return match item_at(r, px, py) {
                     Some(verb) if verb.real() && power_ask(verb) => { // DIALOG (B395): Restart / Shut Down / Log Out ASK — the confirm dialog with its 60 s countdown (was POWERMENU M1's click-again arming)
                         PRESS_OUTCOME.store(OUT_PICK, Ordering::Relaxed); PICKS.fetch_add(1, Ordering::Relaxed);
@@ -767,6 +767,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
             }
         }
         // A press anywhere outside the open menu dismisses it, and the click is spent doing so.
+        if let Some(i) = super::statusmenu::item_at(pw, ph, px, py) { if i != super::statusmenu::open_item() { PRESS_OUTCOME.store(OUT_OPEN, Ordering::Relaxed); return super::statusmenu::open(i, pw, ph); } PRESS_OUTCOME.store(OUT_DISMISS, Ordering::Relaxed); dismiss("status-item"); return true; } // STATUSTRAY (B426): a press on ANOTHER status item switches menus (winmenu's sticky rule); on the open one, closes it
         PRESS_OUTCOME.store(OUT_DISMISS, Ordering::Relaxed);
         dismiss("outside");
         return true;
@@ -779,9 +780,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     // bar chrome composited above the windows, so this claims nothing a window's own chrome could
     // own. The DROPDOWN's position is NOT read from the glyph — [`menu_rect`] anchors it at the
     // panel's left edge independently (render9).
-    if let Some((bx, by, bw, bh)) = menubar::batt_box_abs(pw, ph) { // POWERMENU M2: a click on the battery item opens the panel
-        if px >= bx && px < bx + bw && py >= by && py < by + bh { open_battery_panel(pw, ph); return true; }
-    }
+    if let Some(i) = super::statusmenu::item_at(pw, ph, px, py) { PRESS_OUTCOME.store(OUT_OPEN, Ordering::Relaxed); return super::statusmenu::open(i, pw, ph); } // STATUSTRAY (B426): every status item (input, network, volume, battery, clock) opens its menu; the battery's is POWERMENU M2's panel, opened by its own path
     if let Some((zx, zy, zw, zh)) = menubar::crystal_corner_abs(pw, ph) {
         if px >= zx && px < zx + zw && py >= zy && py < zy + zh {
             // The witness's `via=` word: on the painted glyph itself, or in the widened cell.
@@ -926,7 +925,7 @@ pub fn compose() -> bool {
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
     }
-    let sig = strip::seal(strip::fnv1a_u64(strip::fnv1a_u64(strip::FNV_BASIS, strip::pack_rect(Some(r))), super::powerui::armed_code() as u64 | ((super::powerui::panel_open() as u64) << 8))); // POWERMENU: the armed label / panel mode repaint
+    let sig = strip::seal(strip::fnv1a_u64(strip::fnv1a_u64(strip::FNV_BASIS, strip::pack_rect(Some(r))), super::powerui::armed_code() as u64 | ((super::powerui::panel_open() as u64) << 8) | (super::statusmenu::generation() << 16))); // POWERMENU: the armed label / panel mode repaint
     if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(Some(r)) && !clobbered {
         return false;
     }
@@ -984,9 +983,11 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
     if super::powerui::panel_open() { // POWERMENU M2: one text line per ITEM_H band
         let li = (j - BORDER) / ITEM_H();
         let sy = (j - BORDER) % ITEM_H();
+        { let mut b = [0u8; 4]; let n = super::powerui::panel_line(li, &mut b); if n > 0 && b[0] == super::statusmenu::SLIDER_MARK { super::statusmenu::paint_slider(out, w, BORDER + PADX(), w.saturating_sub(2 * (BORDER + PADX())), sy, ITEM_H(), &b[..n]); return; } } // STATUSTRAY: the volume slider row
         if sy >= (ITEM_H() - CELL_H()) / 2 && sy < (ITEM_H() - CELL_H()) / 2 + CELL_H() {
             let mut buf = [0u8; 48];
             let n = super::powerui::panel_line(li, &mut buf);
+            if n > 0 && buf[0] == super::statusmenu::GRID_MARK { super::statusmenu::paint_grid(out, w, BORDER + PADX(), w.saturating_sub(2 * (BORDER + PADX())), sy - (ITEM_H() - CELL_H()) / 2, &buf[1..n]); return; } // STATUSTRAY: the clock's month glance
             super::text::draw_row(out, w, &buf[..n], BORDER + PADX(), sy - (ITEM_H() - CELL_H()) / 2, theme::TITLE_TEXT_ACTIVE, false, FACE);
         }
         return;
@@ -1393,7 +1394,8 @@ fn panel_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     let h = 2 * BORDER + super::powerui::panel_rows().max(1) * ITEM_H();
     let my = by + bh;
     if w > pw || my + h > ph { return None; }
-    Some((pw - w, my, w, h))
+    let x = super::statusmenu::anchor_x().map(|ax| ax.min(pw - w)).unwrap_or(pw - w); // STATUSTRAY: hang under the pressed item (right-clamped)
+    Some((x, my, w, h))
 }
 
 /// Open the battery panel (a click on the menubar battery item). A SHARD menu already open is dismissed first.
@@ -1462,3 +1464,17 @@ pub fn has_row(label: &str) -> bool {
 #[cfg(feature = "login")]
 #[path = "loginwindow.rs"]
 pub mod loginwindow;
+
+// ── STATUSTRAY (B426) — the status items' menus ride THIS panel mode (statusmenu.rs decides which) ─────────
+
+/// Close whatever is down before a status menu opens (the switch is one press).
+pub fn dismiss_for_switch() {
+    if OPEN.load(Ordering::Acquire) { dismiss("switch"); }
+}
+
+/// Open the panel with the rows `statusmenu` just filled (`via` = `status-<item>` on the SHARD-MENU line).
+pub fn open_status_panel(pw: usize, ph: usize, via: &'static str) {
+    if OPEN.load(Ordering::Acquire) { dismiss("switch"); }
+    super::powerui::panel_set();
+    open_via(pw, ph, via);
+}

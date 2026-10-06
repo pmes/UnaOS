@@ -1212,3 +1212,6 @@ pub mod panicscreen;
 // SETTINGSFILES (B407, R98): the Settings panel's `Stored in settings/<domain>` link and Quarry's Show Info pane for a settings file. Same gate as settings; at the tail so no line above moves.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod settingsfiles;
+// STATUSTRAY (B426, MACPARITY row 3): the status items' menus (input, network, volume, battery, clock) through the SHARD dropdown's panel mode. Same gate as crystal/status; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod statusmenu;
