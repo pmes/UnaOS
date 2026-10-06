@@ -312,3 +312,5 @@ pub mod lockowner;
 pub mod origin;
 // LOCKREG (rmbp-ledger B414): the ONE kernel spin lock type (`sync::Mutex`, over spin's) and its holder registry. Tail statement, so no existing line moves.
 pub mod sync;
+// SMALLFIX3 (rmbp-ledger B416): the fold's unique-code checks, the fixture arcs for `tests list` / `help tests`, `tests smallfix3`. Tail statement.
+pub mod smallfix3;

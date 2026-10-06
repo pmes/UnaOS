@@ -1763,8 +1763,7 @@ pub const APP_RES_SECTION: &str = ".note.unaos.res";
 /// The resource note's type (owner "UnaOS", like APP_NOTE_TYPE's).
 pub const APP_RES_NOTE_TYPE: u32 = 2;
 
-// =================================================================================================
-// DIALOG2 (rmbp-ledger B404) — a ring-3 program raises its OWN alert, sheet or toast, and hears the answer.
+// ==========================================================================================// DIALOG2 (rmbp-ledger B404) — a ring-3 program raises its OWN alert, sheet or toast, and hears the answer.
 // Appended at the file tail so no existing line moves.
 // =================================================================================================
 
@@ -1873,3 +1872,64 @@ mod dialog2_tests {
 /// Bus verb: declare a program's settings stanza.
 pub const BUS_VERB_PREF_DECLARE: u8 = 23; // 20..=22 are DIALOG2's dialog/sheet/toast; renumbered at merge17
 const _: () = assert!(BUS_VERB_PREF_DECLARE > BUS_VERB_TOAST && BUS_VERB_PREF_DECLARE < BUS_VERB_REGISTER);
+=======
+// SMALLFIX3 (rmbp-ledger B416) — THE CODES ARE UNIQUE BY CONSTRUCTION. Three arcs of one wave each took the
+// next free number from their own branch (event 10 twice, bus verb 20 twice): a clash only showed at the fold.
+// Every input-ring event type and every kernel bus verb is listed here and a duplicate fails the BUILD on both
+// arches and the host. An arc minting a code appends its constant to the list (tail-neutral); the kernel's
+// `tests smallfix3` prints `event_codes=unique bus_verbs=unique` from the same lists.
+/// Every input-ring event type (`INPUT_EV_*` the ring carries).
+pub const INPUT_EV_ALL: &[u64] = &[
+    INPUT_EV_KEY_DOWN, INPUT_EV_KEY_UP, INPUT_EV_MOUSE_REL, INPUT_EV_MOUSE_ABS, INPUT_EV_BUTTON, INPUT_EV_WHEEL,
+    INPUT_EV_ACTION, INPUT_EV_MENU_PICK, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ,
+];
+/// Every kernel bus verb tag (the registrable range `>= BUS_VERB_FULFIL_MIN` is the bus's, not listed). The
+/// HOLOCRON band is listed by its two ends; [`codes_unique_u8`] also refuses any other tag inside the band.
+pub const BUS_VERB_ALL: &[u8] = &[
+    BUS_VERB_LS, BUS_VERB_CAT, BUS_VERB_CP, BUS_VERB_WRITE, BUS_VERB_RM, BUS_VERB_MV, BUS_VERB_MENU_PUBLISH,
+    BUS_VERB_MENU_CLEAR, BUS_VERB_MENU_GET, BUS_VERB_NOTICE, BUS_VERB_ATTR_SET, BUS_VERB_ATTR_GET, BUS_VERB_ATTR_LIST,
+    BUS_VERB_ATTR_QUERY, BUS_VERB_ATTR_STAT, BUS_VERB_PREF_GET, BUS_VERB_PREF_SET, BUS_VERB_PREF_LIST,
+    BUS_VERB_PREF_CHANGED, BUS_VERB_REGISTER, BUS_VERB_HOLOCRON_FIRST, BUS_VERB_HOLOCRON_LAST,
+];
+/// No two entries equal (and none zero). `const` so the assertion below runs in the compiler.
+pub const fn codes_unique_u64(v: &[u64]) -> bool {
+    let mut i = 0;
+    while i < v.len() {
+        if v[i] == 0 {
+            return false;
+        }
+        let mut j = i + 1;
+        while j < v.len() {
+            if v[i] == v[j] {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+/// The bus-verb form: unique, non-zero, below the registrable range, and nothing but the band's own two ends
+/// inside the HOLOCRON band.
+pub const fn codes_unique_u8(v: &[u8]) -> bool {
+    let mut i = 0;
+    while i < v.len() {
+        let x = v[i];
+        let in_band = x >= BUS_VERB_HOLOCRON_FIRST && x <= BUS_VERB_HOLOCRON_LAST;
+        let band_end = x == BUS_VERB_HOLOCRON_FIRST || x == BUS_VERB_HOLOCRON_LAST;
+        if x == 0 || (x >= BUS_VERB_FULFIL_MIN && !in_band) || (in_band && !band_end) {
+            return false;
+        }
+        let mut j = i + 1;
+        while j < v.len() {
+            if x == v[j] {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(codes_unique_u64(INPUT_EV_ALL), "SMALLFIX3: two INPUT_EV_* event types share a code");
+const _: () = assert!(codes_unique_u8(BUS_VERB_ALL), "SMALLFIX3: two BUS_VERB_* verbs share a tag");
