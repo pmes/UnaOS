@@ -30286,3 +30286,66 @@ fn sys_kdf(a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 pub fn app_quit_owner(win: crate::video::wm::WinId, owner: u64) -> &'static str {
     wc_close_click(win, owner)
 }
+
+/// APPMENU2 M6 — the pid of `owner`'s live process, or `None` (kernel furniture, a fixture, an exited app).
+fn appquit_pid(owner: u64) -> Option<u64> {
+    for pi in 0..MAX_PROCS {
+        if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && PROCS[pi].slot.load(Ordering::Acquire) as u64 == owner {
+            let pid = PROCS[pi].pid.load(Ordering::Acquire);
+            return if pid != 0 { Some(pid) } else { None };
+        }
+    }
+    None
+}
+
+/// APPMENU2 M6 — one quit in flight per owner (bit `owner`); a second Cmd-Q while one waits is a no-op.
+static APPQUIT_PENDING: AtomicU64 = AtomicU64::new(0);
+/// APPMENU2 M6 — the pid each pending quit was asked of, so a reused slot is never killed by mistake.
+static APPQUIT_PID: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+/// APPMENU2 M6 — **ask a ring-3 app to quit**: `una_abi::INPUT_EV_CLOSE_REQ` through its own input ring,
+/// then a kernel task waits up to `CLOSE_REQ_BOUND_MS` for the process to end by itself and, if it has
+/// not, closes and kills it through [`wc_close_click`]. `true` when the request is in flight (or already
+/// was); `false` when there is no live process to ask or the ring refused, and the caller kills now.
+#[cfg(feature = "wc")]
+pub fn app_quit_request(win: crate::video::wm::WinId, owner: u64) -> bool {
+    if owner == 0 || owner >= 64 {
+        return false;
+    }
+    let Some(pid) = appquit_pid(owner) else { return false };
+    let bit = 1u64 << owner;
+    if APPQUIT_PENDING.load(Ordering::Acquire) & bit != 0 {
+        serial_println!("[sysmenu] quit owner={:#x} win={} request=already-pending", owner, win);
+        return true;
+    }
+    if !user_input_push_owner(owner, una_abi::input_ev_pack(una_abi::INPUT_EV_CLOSE_REQ, win as u64)) {
+        return false;
+    }
+    APPQUIT_PID[owner as usize].store(pid, Ordering::Release);
+    APPQUIT_PENDING.fetch_or(bit, Ordering::AcqRel);
+    serial_println!("[sysmenu] quit owner={:#x} win={} pid={} request=sent bound_ms={}", owner, win, pid, una_abi::CLOSE_REQ_BOUND_MS);
+    crate::arch::sched::spawn("appquit", appquit_bound_task, (owner as usize) | ((win as usize) << 8), crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL);
+    true
+}
+
+/// APPMENU2 M6 — the bound: poll every 50 ms for the asked process to be gone; at the bound, kill.
+#[cfg(feature = "wc")]
+fn appquit_bound_task(arg: usize) {
+    let owner = (arg & 0xFF) as u64;
+    let win = (arg >> 8) as crate::video::wm::WinId;
+    let pid = APPQUIT_PID[owner as usize].load(Ordering::Acquire);
+    let step = 50u64;
+    let mut waited = 0u64;
+    while waited < una_abi::CLOSE_REQ_BOUND_MS {
+        if appquit_pid(owner) != Some(pid) {
+            APPQUIT_PENDING.fetch_and(!(1u64 << owner), Ordering::AcqRel);
+            serial_println!("[sysmenu] quit owner={:#x} answer=closed after_ms={}", owner, waited);
+            return;
+        }
+        crate::arch::sched::sleep_ms(step);
+        waited += step;
+    }
+    let settle = if appquit_pid(owner) == Some(pid) { wc_close_click(win, owner) } else { "exited" };
+    APPQUIT_PENDING.fetch_and(!(1u64 << owner), Ordering::AcqRel);
+    serial_println!("[sysmenu] quit owner={:#x} answer=killed-after-ms={} settle={}", owner, una_abi::CLOSE_REQ_BOUND_MS, settle);
+}

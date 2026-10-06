@@ -2259,7 +2259,7 @@ extern "C" fn uvug_worker(arg: usize) -> ! {
 // ABIFREEZE: the packed-event type tags, imported from the crate the kernels pack them with.
 use una_abi::{
     INPUT_EV_BUTTON as EV_BUTTON, INPUT_EV_KEY_DOWN as EV_KEYDOWN, INPUT_EV_KEY_UP as EV_KEYUP,
-    INPUT_EV_MOUSE_REL as EV_MOUSE_REL, INPUT_EV_WHEEL as EV_WHEEL,
+    INPUT_EV_MOUSE_REL as EV_MOUSE_REL, INPUT_EV_WHEEL as EV_WHEEL, INPUT_EV_CLOSE_REQ as EV_CLOSE_REQ,
 };
 
 // Held-state bits.
@@ -2536,6 +2536,7 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
             EV_WHEEL => {
                 fi.wheel += (lo & 0xFF) as u8 as i8 as i32;
             }
+            EV_CLOSE_REQ => fi.exit_key = true, // APPMENU2 M6: the WM asks us to quit — leave the way ESC does
             _ => {}
         }
     }

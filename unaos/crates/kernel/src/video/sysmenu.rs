@@ -84,12 +84,36 @@ pub fn quit_user(win: wm::WinId, route: &str) -> bool {
     quit_user_owner(win, owner, route)
 }
 
+/// M6 — a CLOSE REQUEST first (`una_abi::INPUT_EV_CLOSE_REQ`; the app may save and close itself), the
+/// kill after `CLOSE_REQ_BOUND_MS`; with no live process to ask, the close box's close-then-kill now.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn quit_user_owner(win: wm::WinId, owner: u64, route: &str) -> bool {
+    if quit_request(win, owner, route).is_some() {
+        return true;
+    }
     winmenu::clear(win);
     let settle = crate::arch::x86_64::syscall::app_quit_owner(win, owner);
-    serial_println!("[sysmenu] quit win={} owner={:#x} route={} -> {}", win, owner, route, settle);
+    serial_println!("[sysmenu] quit owner={:#x} win={} route={} answer=killed-after-ms=0 settle={}", owner, win, route, settle);
     true
+}
+
+/// M6 — post the close request for a USER `owner` (the dock tile's Quit asks here too). `Some` when the
+/// request is in flight; `None` when there is no live process to ask (the caller closes/kills itself).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn quit_request(win: wm::WinId, owner: u64, route: &str) -> Option<&'static str> {
+    if !is_user(owner) {
+        return None;
+    }
+    if crate::arch::x86_64::syscall::app_quit_request(win, owner) {
+        serial_println!("[sysmenu] quit owner={:#x} win={} route={} -> close-request", owner, win, route);
+        Some("close-requested")
+    } else {
+        None
+    }
+}
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+pub fn quit_request(_win: wm::WinId, _owner: u64, _route: &str) -> Option<&'static str> {
+    None
 }
 /// aarch64: no user-owner kill path from the WM yet; the Quit arm's `wm::close` stands (owed).
 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]

@@ -40,3 +40,12 @@ windows (more than the old cap of four) and reads all six back. On the glass: ev
 close-then-kill with a zero bound); the app note naming a Help doc (una-abi + midden_core note field);
 Undo/Redo (no action exists); the PC keymap rows for the new chords; the aarch64 router (it has no
 `winlist::key` call either); Force Quit's "stuck" filter in Activity (it opens on the full list).
+
+## M6 (the seat's answers)
+A ring-3 app is ASKED first: Cmd-Q, the app menu's Quit and the dock tile's Quit post
+`una_abi::INPUT_EV_CLOSE_REQ` (10, payload = the window id) to the app's own input ring; a kernel task
+(`syscall::appquit_bound_task`) polls the pid every 50 ms for `CLOSE_REQ_BOUND_MS` (3000) and kills
+through `wc_close_click` only if it is still running. Witness: `[sysmenu] quit owner=… answer=closed
+after_ms=…` or `answer=killed-after-ms=3000 settle=…`; no live process → `answer=killed-after-ms=0`.
+VUG (leaves as on ESC), STAT (drains its ring each frame) and LUMEN exit on the event. Keyboard
+Shortcuts stays the second Help item. Force Quit... is in the crystal menu on every image.

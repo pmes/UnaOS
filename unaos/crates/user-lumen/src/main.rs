@@ -43,7 +43,7 @@
 // The window's footer shows the provider and the first token's latency.
 
 use una_abi::{
-    input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_KEY_DOWN, INPUT_EV_WHEEL, INPUT_EV_WIN_RESIZE, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP,
+    input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_KEY_DOWN, INPUT_EV_WHEEL, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP,
     SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
 };
 use vein_core::claude::{Event, Msg, Params, Stop};
@@ -653,6 +653,7 @@ impl App {
         let page = (self.rows_vis - 1).max(1);
         match input_ev_type(ev) {
             INPUT_EV_KEY_DOWN => self.key(p as u8),
+            INPUT_EV_CLOSE_REQ => exit(0), // APPMENU2 M6: the WM asks us to quit — nothing unsaved, so leave now
             INPUT_EV_ACTION => match p {
                 ACTION_CLEAR_VIEW if !self.busy => new_conversation(),
                 ACTION_CURSOR_LEFT => self.caret = self.caret.saturating_sub(1),

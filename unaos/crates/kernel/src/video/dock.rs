@@ -2957,6 +2957,7 @@ pub fn toggle_keep(owner: u64) -> bool {
 
 /// Quit `owner` through the close-box path when registered, else `wm::close_owner`.
 pub fn quit_owner(win: wm::WinId, owner: u64) -> &'static str {
+    if let Some(s) = super::sysmenu::quit_request(win, owner, "dock") { return s; } // APPMENU2 M6 — a ring-3 app is ASKED first (close request, kill after the bound)
     let h = QUIT_HOOK.load(Ordering::Acquire);
     if h != 0 {
         // SAFETY: only `set_quit_hook` stores here, always a valid `fn(WinId, u64) -> &'static str`.
