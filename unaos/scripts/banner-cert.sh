@@ -217,11 +217,17 @@ set -u
 ART="${1:-}"
 BANNER="${2:-}"
 
-if [ -z "$ART" ] || [ $# -lt 2 ]; then
+# GATEPATH (rmbp-ledger B471): `--registry [<feature-list>]` is the HOST leg `./arroyo gates` runs with no
+# artifact: the registry self-check below, then every row's feature must be a declared kernel Cargo feature
+# (a row for a retired feature can never fire), then every feature of <feature-list> must have a row (the
+# esp build would stop on it as UNREGISTERED). Exit 0 clean · 1 a stale row or an unregistered feature · 2 broken.
+BC_REGISTRY=""
+if [ "$ART" = "--registry" ]; then BC_REGISTRY=1; ART=/dev/null; fi
+if [ -z "$BC_REGISTRY" ] && { [ -z "$ART" ] || [ $# -lt 2 ]; }; then
     echo "banner-cert: usage: banner-cert.sh <artifact> <banner-feature-list>" >&2
     exit 2
 fi
-if [ ! -f "$ART" ]; then
+if [ -z "$BC_REGISTRY" ] && [ ! -f "$ART" ]; then
     echo "banner-cert: NO VERDICT — artifact does not exist: ${ART}" >&2
     exit 2
 fi
@@ -299,7 +305,6 @@ gen7|:: gen7: r6 next=STOP-window-or-register-block-out-of-range|-|measured
 gmux_igd|:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD|intel-ivb|measured
 unaos_ivb|@boot iGPU trace 1 (pre-EBS) collected.|-|measured
 ahci|AHCI: selfcheck|-|measured
-root-prefer|[bootdisk] root candidates:|-|measured
 bar1wedge|:: BAR1WEDGE: rung=first-stall|-|measured
 bar1exp-uc|:: x86 bar1exp: UC arm ARMED via=|-|measured
 beam|:: BEAMX86: head=|nvidia-kepler,nvidia-kepler-takeover|measured
@@ -344,7 +349,6 @@ quarry|[quarry] DECLINE reason=dock-cannot-host-full-strip panel=|-|measured(1)
 wedge2|-|no gated string literal anywhere under cfg(feature="wedge2") — the knob only re-times an existing path; certify it from its serial witness, not from the artifact|unmeasured-here
 selfhost|:: SELFHOST:|-|measured
 unafs|:: UNAFSX86: root=|-|measured
-vein|:: VEINBUS:|-|measured
 lumen|:: LUMEN:|-|measured
 netring3|:: ENTROPY:|-|measured
 selfdiag|:: SELFDIAG:|-|measured
@@ -524,6 +528,24 @@ while IFS='|' read -r f tok cond state; do
     fi
     case "$state" in measured*) nmeas=$((nmeas+1)) ;; *) nunmeas=$((nunmeas+1)) ;; esac
 done < <(bc_table)
+
+if [ -n "$BC_REGISTRY" ]; then
+    _bc_ct="$(dirname "${BASH_SOURCE[0]}")/../crates/kernel/Cargo.toml"
+    _bc_decl="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+ *=/{sub(/ *=.*/,"");print}' "$_bc_ct" 2>/dev/null)"
+    [ "$(printf '%s\n' "$_bc_decl" | awk 'NF' | wc -l)" -ge 100 ] || { echo "❌ banner-cert --registry: NO VERDICT — parsed fewer than 100 features from ${_bc_ct}"; exit 2; }
+    _bc_bad=0; _bc_rows=0
+    while IFS='|' read -r f _; do
+        [ -z "${f:-}" ] && continue
+        _bc_rows=$((_bc_rows+1))
+        printf '%s\n' "$_bc_decl" | awk -v f="$f" '$0==f{x=1} END{exit !x}' || { echo "row=${f} -> STALE (no such kernel Cargo feature; the row can never fire)"; _bc_bad=$((_bc_bad+1)); }
+    done < <(bc_table; bc_controls)
+    for f in ${BANNER//,/ }; do
+        bc_table | awk -F'|' -v f="$f" '$1==f{x=1} END{exit !x}' || { echo "feature=${f} -> UNREGISTERED (an esp build naming it stops with NO VERDICT)"; _bc_bad=$((_bc_bad+1)); }
+    done
+    echo "banner-cert --registry: rows=${_bc_rows} measured=${nmeas} unmeasured=${nunmeas} findings=${_bc_bad} -> $([ "$_bc_bad" -eq 0 ] && echo PASS || echo FAIL)"
+    [ "$_bc_bad" -eq 0 ] || exit 1
+    exit 0
+fi
 
 for f in ${BANNER//,/ }; do
     row="$(bc_table | awk -F'|' -v f="$f" '$1==f{print; exit}')"

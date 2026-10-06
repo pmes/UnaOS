@@ -27,6 +27,10 @@ worktree `../UnaOS` (main), tracks `../UnaOS-orin` (hw-jetson), `../UnaOS-hw-pi4
    touch, the ledger row it opens (next free `A<n>` in the arch ledger or `SO<n>` in LEDGER.md — grep both
    branches first), and "report by final message: sha, parent, `git show --stat`, rc list, wire shape".
    Opus. Fable only for the one key task of the round. Never `pkill -f`.
+   THE pre-commit leg, for the executor before every commit and for the seat before every fold commit:
+   `./arroyo gates > gates.log 2>&1; echo rc=$?` from `unaos/` (GATE-GATEPATH, B471: every host gate, ~30 s, no
+   cargo; one `gate=<name> rc=<n>` line each, `GATES: <n> run <n> green -> PASS|FAIL`, exit = the worst gate's rc).
+   With the flight's knob line in front it also asks whether that build's banner can be certified.
 3. An executor that ends its turn "waiting on its gates" is resumed with: "poll them yourself, commit, report".
 4. Its report is a claim: read its logs (`~/unaos-bench/scratch/<name>-logs/`), not its summary.
 
@@ -37,6 +41,7 @@ worktree `../UnaOS` (main), tracks `../UnaOS-orin` (hw-jetson), `../UnaOS-hw-pi4
 2. `bash unaos/scripts/ledger-check.sh` rc=0 (an unpushed sha in a `fixed-unflown` row reds it: cite by name).
    `bash unaos/scripts/line-neutral.sh <track-tip> exec-<...>` (GATE-LINENEUTRAL, B94): a `.rs` file reported MOVED with
    panic-bearing sites below it means `./arroyo knoboff <knob>` is OWED for any knob that claims byte identity on it.
+   `./arroyo gates` rc=0 on the merged tree (GATE-GATEPATH), the fold's knob line in front of it.
 3. Commit the merge with a message that carries the executor's rc list. One fold gate on the WHOLE fold
    before any card (R38), not one per branch.
 
