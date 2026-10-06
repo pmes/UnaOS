@@ -471,7 +471,7 @@ fn leg(path: &str) -> Result<(usize, usize), String> {
     }
     // An 8x8 file fits the base at k = 1: the base image IS the frame.
     let (k, bw, bh) = super::fit(8, 8, super::BASE_W, super::BASE_H).ok_or_else(|| String::from("fit"))?;
-    let mut base = alloc::vec![0xFF00_0000u32; bw * bh];
+    let mut base = alloc::vec![crate::video::theme::OPAQUE_BLACK; bw * bh];
     let mut plays = 0u32;
     let mut held = 0usize;
     fn step(src: &mut Stream, plays: &mut u32, k: usize, bw: usize, bh: usize, base: &mut [u32], held: &mut usize) -> Result<(usize, u32), String> {
