@@ -141,6 +141,7 @@ fn services_line(who: &'static str) {
             why
         );
     }
+    crate::perf::say(); // PERFREVIEW (B443): the budget line, once, as the session's services start
 }
 
 /// M3 — the Desktop phase begins NOW (`why`: `session` from the first login, `user-created` from the installer).

@@ -416,6 +416,9 @@ fn finish(s: &Slot, timeout_at: Option<u8>) {
             None
         };
         sec_event(kind, &d, split_comp); // INPUTSTALL M1
+        if kind == K_KEY {
+            crate::perf::note_key(total_us); // PERFREVIEW (B443)
+        }
         match SPAN.try_lock() {
             Some(mut sp) => {
                 let ms = (total_us / 1000) as u32;
@@ -651,6 +654,7 @@ fn sec_pass(t0: u64, now: u64, render: bool) {
     let d = now.saturating_sub(t0);
     SEC_PASSES.fetch_add(1, Relaxed);
     SEC_PASS_MAX_US.fetch_max(d, Relaxed);
+    crate::perf::note_frame(d); // PERFREVIEW (B443)
     if render {
         SEC_R_COMP_US.fetch_max(d, Relaxed);
     }
@@ -982,6 +986,9 @@ pub fn seg(id: u8) {
     let last = SEG_LAST_US.swap(now, Relaxed);
     if last != 0 && now > last {
         SEC_SEG.fetch_max(((now - last) << 8) | id as u64, Relaxed);
+        if id == S_CONSOLE {
+            crate::perf::note_svc(now - last); // PERFREVIEW (B443): the service chain's span
+        }
     }
 }
 
