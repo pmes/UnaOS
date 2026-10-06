@@ -4,7 +4,8 @@
 # docs/dev/evidence/<round>/gk107-capture/ and quoted by offset in the next GPU arc's design doc (keplergr.md §1).
 #
 # Reading: BAR0 is /sys/bus/pci/devices/<gk107 bdf>/resource0 (mmap, 32-bit reads, little-endian), or envytools
-# `nvapeek <offset>`. Read only — nothing on this list is written. One line per read on the capture:
+# `nvapeek <offset>`. Reads only, except the PRAMIN window select 0x001700 in the DERIVED step (pre-image read
+# first, restored after). One line per read on the capture:
 #     <offset> <value> <name>
 #
 # Columns: offset (BAR0, hex) · count (consecutive 32-bit words) · stride (hex, between words) · name · source

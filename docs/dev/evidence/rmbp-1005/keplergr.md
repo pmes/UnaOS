@@ -4,7 +4,7 @@ Branch `exec-rmbp-keplergr` (cut from df15f19d; GPUBLIT3 `exec-rmbp-gpublit3` @7
 both branches has one implementation). Files: `drivers/gpu/kepler_fifo.rs` (two new submodules at the tail: `host` = the shared
 bind path, `kgr` = the GR leg), `drivers/gpu/kepler_gpublit.rs` (private copies replaced by calls), `drivers/gpu/mod.rs` (module
 gate widened), `drivers/gpu/kepler.rs` (one arming call after `kepler_gpublit::arm`), `unaos/scripts/kepler-capture.list`.
-No new file under video/ fs/ install/ selftest/ shell (no CHARTER line owed), no knob, no verb, no dotfile. Structured by
+No new file under video/ fs/ install/ selfhost/ or the shell files (no CHARTER line owed), no knob, no verb, no dotfile. Structured by
 DRIVERS-METHOD §6. Sources (scratchpad, never copied): nouveau v6.10 `nvkm/engine/fifo/{gk104,gf100,runl,chan}.c`,
 `nvkm/subdev/top/gk104.c`, `nvkm/subdev/mmu/vmmgf100.c`; open-gpu-doc `cla06f.h`, gv100 `dev_ram.ref`.
 
