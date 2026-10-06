@@ -963,6 +963,11 @@ fn facet_open_image_association() {
     assert_eq!(FacetCommand::image_mime_for("anim.webp"), Some("image/webp"));
     assert_eq!(FacetCommand::image_mime_for("notes.txt"), None);
     assert_eq!(FacetCommand::image_mime_for("png"), None);
+    // TYPECORE (B450): the one table — the spellings the host twin alone knew, and a type Facet does not claim.
+    assert_eq!(FacetCommand::image_mime_for("scan.JFIF"), Some("image/jpeg"));
+    assert_eq!(FacetCommand::image_mime_for("C:\\x\\old.dib"), Some("image/bmp"));
+    assert_eq!(FacetCommand::image_mime_for("logo.svg"), None);
+    assert!(type_core::EXT_TABLE.iter().all(|(e, m)| FacetCommand::image_mime_for(&format!("f.{e}")).map_or(true, |x| x == *m)));
     assert_eq!(FacetCommand::local_image_path("file:///home/una/My%20Photo.jpeg").as_deref(), Some("/home/una/My Photo.jpeg"));
     assert_eq!(FacetCommand::local_image_path("file://localhost/a/b.png?x=1#f").as_deref(), Some("/a/b.png"));
     assert_eq!(FacetCommand::local_image_path("/a/b.webp").as_deref(), Some("/a/b.webp"));
