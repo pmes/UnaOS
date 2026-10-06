@@ -39,3 +39,17 @@ adds one arming fact to that op line: `core=trash_core` — so a metal capture p
 outside this arc (it is workspace housekeeping, not the user Trash); a seat decision whether it goes.
 The FAT `.index` fallback lives in the core now, so a Matrix vault on FAT would get it free — none
 exists yet.
+
+## Landed
+
+- M1 `trash_core` + 8 host tests (`cargo test -p trash_core`: 8 passed, exit 0).
+- M2 Matrix `VaultTrash` over the core (`cargo test -p matrix`: lib 22 passed incl. the three trash
+  tests; the `finder` integration binary has one unrelated red, `write_to_readonly_dir_surfaces_loud_denial`,
+  a 0555-directory test that cannot deny root — the container runs as uid 0; not in this arc's files).
+- M3 kernel `fs/trash.rs` over the core (575 → ~360 lines; the rules, the index codec and
+  `collision_name` left the kernel). Legs: x86 metal feature line exit 0; aarch64
+  `login,loginst,virt_el0,lumen,desktop_firmware,quarry,facet,usbnet` exit 0; `tegra,login,loginst,virt_el0` exit 0.
+- Witness (metal, `tests trash`): `:: TRASH: store=attrs trashed=2 restored=1 emptied=1 query_ok=3 -> PASS ::`
+  (or `store=index` on a FAT home) preceded by `[trash] store=… op=trash path=… ok=1 reason=- core=trash_core`.
+- Seat edit at the fold: `unaos/scripts/charter.registry` row `fs/trash.rs | Matrix | owed | B288` becomes
+  `fs/trash.rs | Matrix | shared-core | B449`.

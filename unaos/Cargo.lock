@@ -353,6 +353,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "trash_core"
+version = "0.1.0"
+dependencies = [
+ "una-abi",
+]
+
+[[package]]
 name = "uart_16550"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -465,6 +472,7 @@ dependencies = [
  "rast",
  "smoltcp",
  "spin 0.12.3",
+ "trash_core",
  "uart_16550",
  "una-abi",
  "unafs",
