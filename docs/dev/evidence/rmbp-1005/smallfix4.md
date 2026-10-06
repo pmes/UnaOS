@@ -25,3 +25,22 @@ Paste; `[winmenu] about-box name=<n> shown=1` after `[appres] about ...`; `tests
 **Owed.** Whatever an item below marks owed.
 
 ## Landed
+- 1 F13: Quarry's Copy is `clipboard::set_file_ref` (a typed file-ref on the one buffer; the editor's ⌘V pastes the
+  path), its Paste `get_file_ref`; Quarry's own CLIP is gone. F14: `appres::about` returns the facts, the box is
+  `winmenu::about_box` (`[winmenu] about-box name=<n> shown=1`).
+- 2 TRASHCORE (merged first): columns' `is_trash` is `trash_core::is_trash_folder`; Matrix's `.una-trash` workspace
+  bin retired — a confirmed Delete is the one Trash's verb, refused with no vault (`cargo test -p matrix`: lib 22
+  ok; finder 17 ok + the pre-existing uid-0 `write_to_readonly_dir_surfaces_loud_denial`); registry row B449.
+- 3 PRINCIPIAFILES (merged first) + LAUNCHERPREFS: four arch.baseline rows go (launcher's key is
+  `prefs::domain_path`), the stale HOLOCRONROOT `.ring` row too; three charter.registry rows go. arch-check exit 0.
+- 4 FWPIN: `S_WAIT_ALT`, `Pending`, `stage_attempt`'s `commit`, `block::alternate_program_source` removed.
+- 5 gpublit3.md §7 step 4 = `[kfifo] decode chid=2 …`. 6 Columns: right press `[quarry] columns right-press
+  pane=<i> kind=<k> row=<r>`; the wheel steps the focus pane. 7 `[notify] switch from=center to=clock` /
+  `from=<item> to=center`. 8 queue build line: drop `UNAOS_USBDEBUG`. 9 Quarry `SURF` is `Vec<u32>`.
+- 10 `wc_gpublit` retired (Cargo, arroyo, builder, k8-reach); knob-hygiene/knob-parity exit 0. `tests smallfix4`:
+  `:: SMALLFIX4: event_codes=unique bus_verbs=unique registrable=unique host_verbs=unique action_codes=unique
+  launch_name=lumen -> PASS ::`.
+- 11 `wm::app_name_arm_launch` (APPRES name for a path launch): `[wm] launch-name owner=<o> path=/apps/LUMEN.ELF
+  name=lumen via=<appres|path> armed=1`.
+- 12 ROOTACL + TYPECORE merged first: attrsys `system_tree` gone; five filetype parser rows leave the baseline;
+  assoc's extensions walk type_core. RAWCORE's arw/tiff carried into type_core's table at the merge.
