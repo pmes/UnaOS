@@ -36,3 +36,16 @@ writable=<0/1> hold=<0/1> -> PASS ::`. A real panic: `[panic] screen=plain reaso
 **Owed.** The stack walk (the x86 target has no frame pointers: RIP + the frame only); a log from a MASKED fault
 path (#PF/#GP/#DF land on the screen and restart, their log says `reason=masked`: the block pump needs IRQs);
 aarch64 keeps its own path (dark neutral backdrop, text on it, hlt).
+
+## Built (M1 9fb7c744, M2 013fa171)
+
+Compile legs (inline, eb7bb461 + this arc): x86 metal line + `panic_hold` exit 0; aarch64
+`login,loginst,virt_el0,panic_hold` exit 0, `…,lumen,desktop_firmware,quarry,facet,usbnet,panic_hold` exit 0,
+`tegra,login,loginst,virt_el0,panic_hold` exit 0. charter-check exit 0 (the log's extension is a const so no
+`.txt` literal reads as a dotfile). Shared lines (all same-line folds, line-neutral): `fbcon.rs` 122 (`PANIC_BG`),
+679 (`_print` seal gate), 2112 (`seal`), 2159 (`draw_panic`); `main.rs` panic handler (first and last statements);
+`interrupts.rs` #PF (enter + `hlt_loop`), #GP (enter + `hlt_loop`), `fatal_fault` (enter + `hlt_loop`), #MC (enter
++ `hlt_loop`), #DF (the `panic!` line); `login.rs` `notice_service` first line; `dialog.rs` `answer` Act::None
+line; tails: `allocator.rs` (`heap_busy`), `flight_recorder.rs` (`panic_tail`, the FLIGHTRING seam), `video/mod.rs`.
+`tests panicscreen` publishes `PanelOwner::Panic` for its 2 s — a SECOND publisher of that word (mod.rs's
+`panel_refuse_term` doc says one); the test hands the previous owner back.
