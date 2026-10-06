@@ -8995,3 +8995,10 @@ pub(crate) fn exec_resolve_display(word: &str) -> Option<String> {
 fn x86bind_test() {
     x86bind_witness(&vfs_mount_table(), true);
 }
+
+/// SHELLTASK2 (rmbp-ledger B474): is `word` NOT a shell verb on this build — a bare program name or a program path
+/// (`Plan::Exec`), or nothing at all? The interpreter's own predicate (`midden_core::is_verb`, the same table and
+/// `Avail` filter `plan` uses), so the shell task's routing cannot disagree with the dispatcher.
+pub fn program_word(word: &str) -> bool {
+    !midden_core::is_verb(&midden_core::canon_verb(word), &midden_facts())
+}

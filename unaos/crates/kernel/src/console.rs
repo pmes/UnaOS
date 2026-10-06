@@ -502,6 +502,7 @@ impl Console {
     /// so the caller can mark its window dirty as it does for a keystroke.
     pub fn act(&mut self, a: crate::video::keymap::Action, pal: &mut TargetPal) -> bool {
         if let Some(painted) = self.scroll_action(a, pal) { return painted; } // SCROLLBACK — view motion, not an edit
+        if matches!(a, crate::video::keymap::Action::Interrupt) { let r = crate::shellux::console_key(0x03, self); return self.repaint(r, pal); } // SHELLTASK2 (B474): ⌘. is Ctrl-C — the running shell job first, else the line
         let (_, r) = crate::video::clipboard::terminal_action_in(
             a,
             &mut self.current_input,

@@ -2397,7 +2397,7 @@ fn spawn_inner(
     target_cpu: usize,
     priority: u8,
     stack_bytes: usize,
-    done_sem: Option<Arc<Semaphore>>,
+    done_sem: Option<Arc<Semaphore>>, kill: Option<Arc<KillSwitch>>, // SHELLTASK2 (B474): a kernel task may carry a TEARDOWN-1 kill switch
 ) -> u64 {
     // SMPBAL-X86: the pin contract is decided from the REQUESTED value, before placement resolves it.
     // A kernel task is never a cooperative ring-3 task, so the core-0 exclusion does not apply.
@@ -2430,7 +2430,7 @@ fn spawn_inner(
         user_rsp: 0,
         user_cr3: 0,
         preemptible: false,
-        kill: None,
+        kill,
         steal_ok,
         migrations: 0,
         steal_esc: 0,
@@ -2455,7 +2455,7 @@ fn spawn_inner(
 /// Create a fire-and-forget kernel thread at `priority` on `target_cpu`. The task runs `entry(arg)`
 /// and is freed when `entry` returns; there is no way to wait for it (use `spawn_joinable` for that).
 pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize, priority: u8) {
-    spawn_inner(name, entry, arg, target_cpu, priority, TASK_STACK_SIZE, None);
+    spawn_inner(name, entry, arg, target_cpu, priority, TASK_STACK_SIZE, None, None);
 }
 
 /// RENDSTACK — [`spawn`] with a CALLER-SIZED kernel stack: the x86 twin of aarch64's `spawn_stack`,
@@ -2474,7 +2474,7 @@ pub fn spawn_stack(
     priority: u8,
     stack_bytes: usize,
 ) {
-    spawn_inner(name, entry, arg, target_cpu, priority, stack_bytes, None);
+    spawn_inner(name, entry, arg, target_cpu, priority, stack_bytes, None, None);
 }
 
 /// Placeholder `entry` for ring-3 tasks: `spawn_user` stores this in `Task.entry`, but
@@ -3124,7 +3124,7 @@ pub fn spawn_joinable(
 ) -> JoinHandle {
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
-    let id = spawn_inner(name, entry, arg, target_cpu, priority, TASK_STACK_SIZE, Some(done.clone()));
+    let id = spawn_inner(name, entry, arg, target_cpu, priority, TASK_STACK_SIZE, Some(done.clone()), None);
     JoinHandle { done, id }
 }
 
@@ -7830,4 +7830,21 @@ pub fn slab_high(base: u64, len: usize) -> Option<usize> {
 pub fn slot_tables_warm(s: usize) {
     USER_SPACE_REFS.warm(s);
     SLOT_DOOMED.warm(s);
+}
+
+// ── SHELLTASK2 (rmbp-ledger B474) ─────────────────────────────────────────────────────────────────────
+/// [`spawn_stack`] carrying a TEARDOWN-1 [`KillSwitch`]: a KERNEL task the kernel may retire. `kill.request()`
+/// retires it at its next preemption, yield or sleep park (`run()`'s READY arm, `park_blocked`'s PARK_SLEEP arm —
+/// the same `reap_killed` a ring-3 task gets); `kill.is_reaped()` confirms. The reap runs no `Drop` on the task's
+/// frames: the caller frees what it held (`stackguard::release_held`, `sync::release_task`). Returns the task id.
+pub fn spawn_stack_killable(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    target_cpu: usize,
+    priority: u8,
+    stack_bytes: usize,
+    kill: Arc<KillSwitch>,
+) -> u64 {
+    spawn_inner(name, entry, arg, target_cpu, priority, stack_bytes, None, Some(kill))
 }
