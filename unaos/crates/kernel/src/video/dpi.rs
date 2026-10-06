@@ -191,3 +191,23 @@ pub fn relatch_edid() -> (u32, u32) {
     S2.store(s2, Ordering::Release);
     (before, s2)
 }
+
+/// PREFSUI (rmbp-ledger B389, R93) — the panel's OWN density scale x2 (the EDID's; what the Resolution dropdown
+/// calls the default), whatever the live scale is now.
+pub fn native_s2() -> u32 {
+    let w = crate::video::panel_info_nonblocking().map_or(0, |i| i.width);
+    compute(w).1
+}
+
+/// PREFSUI: set the UI scale LIVE (the Resolution dropdown: the panel keeps its one native mode; a "looks like"
+/// mode is this scale). The effective ppi becomes the scale's (`s2 * 48`), or the panel's own at its native scale,
+/// so the faces size to it (`text::rescale`). Returns `(scale x2 before, after)`.
+pub fn set_live(s2: u32) -> (u32, u32) {
+    let s2 = s2.clamp(S2_MIN, S2_MAX);
+    let w = crate::video::panel_info_nonblocking().map_or(0, |i| i.width);
+    let (nppi, ns2) = compute(w);
+    let ppi = if s2 == ns2 && nppi != 0 { nppi } else { s2 * BASE_PPI / 2 };
+    PPI.store(ppi, Ordering::Relaxed);
+    let before = S2.swap(s2, Ordering::AcqRel);
+    (before, s2)
+}

@@ -719,6 +719,28 @@ mod tt {
     }
 
     /// UIMETRICS (B372): re-derive the console's grid from the restyled cell and say so (no lock held here).
+    /// PREFSUI (B389): the UI scale moved live (`dpi::set_live`) — the faces re-size to the scale's effective ppi,
+    /// the console regrids, every window repaints once. `true` when the faces moved.
+    pub fn rescale() -> bool {
+        let ppi = crate::video::dpi::ppi();
+        let moved = with(|t| {
+            if ppi == 0 || t.ppi == ppi {
+                return false;
+            }
+            t.ppi = ppi;
+            restyle(t);
+            true
+        })
+        .unwrap_or(false);
+        if moved {
+            serial_println!("[kfont] rescale ppi={} scale={}", ppi, crate::video::dpi::scale_str(crate::video::dpi::s2()));
+            regrid_console();
+            super::EPOCH.fetch_add(1, Ordering::AcqRel);
+            let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+        }
+        moved
+    }
+
     fn regrid_console() {
         if let Some((oc, or, nc, nr)) = crate::video::fbcon::regrid() {
             let (gw, gh) = super::grid_cell();
@@ -823,4 +845,12 @@ pub fn volume_face(file: &str) -> Option<&'static str> {
         let _ = file;
         None
     }
+}
+
+/// PREFSUI (B389, R93): the UI scale moved live — re-size the faces to it (no engine: nothing). `true` = moved.
+pub fn rescale() -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    return tt::rescale();
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    false
 }
