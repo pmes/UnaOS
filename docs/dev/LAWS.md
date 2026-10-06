@@ -36,6 +36,8 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   Principia): every new kernel file in the app-domain scope declares its owning handler and seam in a
   `CHARTER:` header, a preference lives in Principia's store and never in a new `<home>` dotfile;
   GATE-CHARTER (`unaos/scripts/charter-check.sh`, in `./arroyo check`) enforces both; brief head step 11.
+- **A status word without a flight and a line is a lie the gate refuses** (Peter 2026-10-06, B425): every
+  flew / unflown / confirmed / refuted claim is a row of `docs/dev/STATUS.tsv`, cited `ST<n>`; see `docs/dev/STATUS.md`.
 
 ## 1. Focus, seats, sessions
 

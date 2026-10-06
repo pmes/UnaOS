@@ -9041,6 +9041,18 @@ BRACEPY
         [ "$_chrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a kernel file declares no owning handler, or writes a dotfile off the allowlist (see GATE-CHARTER above)${COLOR_RESET}"; return 1; }
     fi
 
+    # GATE-STATUS (STATUSTABLE, B425, 2026-10-06; Peter: "one status table to rule them all so a false claim
+    #   ... can never be made"): every flew/unflown/confirmed/refuted claim in a ledger status cell or a queue
+    #   STATE line cites an ST<n> row of docs/dev/STATUS.tsv, and a confirmed/refuted row's quoted line is found
+    #   byte for byte on its flight's capture. `--selftest` first: a fixture line in no log must FAIL.
+    local _strc=0
+    python3 "$WORKSPACE_DIR/../tools/status-check.py" --selftest >/dev/null || _strc=2
+    [ "$_strc" -eq 0 ] && { python3 "$WORKSPACE_DIR/../tools/status-check.py" || _strc=1; }
+    if [ "$_strc" -ne 0 ]; then
+        [ "$_strc" -eq 2 ] && echo -e "${COLOR_RED}❌ status gate gave NO VERDICT — its selftest fixtures did not go red, which is not a clean tree${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ check FAILED — a status word cites no ST row, or a row's wire line is not on its flight's capture (see GATE-STATUS above)${COLOR_RESET}"; return 1
+    fi
+
     # GATE-TESTROOTS (TESTROOTS, rmbp, 2026-09-16): GATE-ROOTS' shape applied to the THIRD kind of
     # root, and the CLASS that GATE-FOREMAN one leg above closed for exactly one file. A `#[test]`
     # is nobody's dependency either — `cargo build` never compiles it and no kernel leg links it —
