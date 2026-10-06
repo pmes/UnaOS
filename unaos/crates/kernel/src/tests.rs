@@ -227,7 +227,7 @@ fn ensure_lumen() {
     #[cfg(feature = "lumen")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("holocron", crate::keyring::selftest); #[cfg(all(target_arch = "x86_64", feature = "btc"))] register("btkeyseal", crate::drivers::ehci::bthid::btkeyseal_selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("holocron", crate::keyring::selftest); register("ringlogin", crate::keyring::ringlogin_selftest); #[cfg(all(target_arch = "x86_64", feature = "btc"))] register("btkeyseal", crate::drivers::ehci::bthid::btkeyseal_selftest); }
     }
 }
 

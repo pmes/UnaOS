@@ -870,7 +870,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
     );
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::loginitems::post_login(); // PREFSUI (B389, R91): the user's login items launch after the desktop is built (`loginitems::service`)
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))] crate::fs::nameindex::post_login(); // NAMEINDEX (B432): a volume without the name index builds it as a login task (R93), never at boot (R80)
-    #[cfg(feature = "lumen")] crate::keyring::after_login(name); // HOLOCRON2 (B355): the secrets handler starts with the session when the user has a ring
+    #[cfg(feature = "lumen")] crate::keyring::ring_login(name, password); #[cfg(feature = "lumen")] crate::keyring::after_login(name); // RINGLOGIN (B465): the ring key is derived ONCE from the verified password and posted for HOLOCRON.ELF before it starts. HOLOCRON2 (B355): the secrets handler starts with the session when the user has a ring
     Ok(())
 }
 
@@ -972,7 +972,7 @@ fn epoch_proof(name: &[u8]) -> &'static str {
 pub fn logout() -> (usize, usize) {
     // SECLOGIN M3: the session's programs are ENDED first (windows closed, then killed through the close
     // box's own path), THEN the stamps — a program cannot outlive the session that started it.
-    let root = root_session(); if root { ROOT_LIVE.store(false, core::sync::atomic::Ordering::Release); } let (ended, windows) = arch_session_logout(root); // LOGIN13 M3 (R63): the ROOT session's Log Out ends ROOT's programs (uid 0, the root epoch) by the same walk, and root does not come back this boot.
+    #[cfg(feature = "lumen")] crate::keyring::door_logout(); let root = root_session(); if root { ROOT_LIVE.store(false, core::sync::atomic::Ordering::Release); } let (ended, windows) = arch_session_logout(root); // LOGIN13 M3 (R63): the ROOT session's Log Out ends ROOT's programs (uid 0, the root epoch) by the same walk, and root does not come back this boot.
     {
         let mut s = SESSION_LOCAL.lock();
         s.1 = 0;

@@ -314,6 +314,32 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
         }
     }
 
+    /// RINGLOGIN (B465): open — or, with `create`, make — the owner's ring with a key the LOGIN already derived
+    /// from the typed password (`key` = Argon2id(password, `salt`, `params`), one derivation). The transport
+    /// (HOLOCRON.ELF's door) has already scoped it to this owner, so there is no caller check; everything else
+    /// is [`Holocron::handle`]'s Unlock: `EXISTS` when asked to create over a ring, `NO_RING` when asked to open
+    /// none, `BAD_PASSWORD` when the key does not open the verifier (a ring made under another password).
+    pub fn unlock_with_key(&mut self, create: bool, salt: [u8; crate::seal::SALT_LEN], params: KdfParams, key: crate::zero::Key) -> Result<(), i32> {
+        let existing = self.store.read_ring().map_err(|_| status::IO)?;
+        if create {
+            if existing.is_some() {
+                return Err(status::EXISTS);
+            }
+            let owner = self.owner.clone();
+            let file = self.ring.create_keyed(&owner, params, salt, key, &mut self.rng).map_err(ring_status)?;
+            self.store.write_ring(&file).map_err(|_| {
+                self.ring.lock();
+                status::IO
+            })?;
+            self.limiter.succeed();
+            return Ok(());
+        }
+        let Some(file) = existing else { return Err(status::NO_RING) };
+        self.ring.unlock_keyed(&file, key, &salt).map_err(ring_status)?;
+        self.limiter.succeed();
+        Ok(())
+    }
+
     /// Read and open `ns/name`.
     fn get(&mut self, ns: &str, name_: &str) -> Result<(Meta, Vec<u8>), i32> {
         check_names(ns, name_)?;

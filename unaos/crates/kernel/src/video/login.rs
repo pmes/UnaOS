@@ -1828,7 +1828,7 @@ pub fn lock() -> bool {
         let mut f = FORM.lock();
         f.state = State::Closed; // `open_as` starts from a down screen; the session state is restored by the unlock
     }
-    LOCKED.store(true, Ordering::Relaxed);
+    LOCKED.store(true, Ordering::Relaxed); #[cfg(feature = "lumen")] crate::keyring::door_lock("lock-screen"); // RINGLOGIN (B465): the ring locks with the screen
     open_as(State::Open);
     let mut f = FORM.lock();
     f.name[..n].copy_from_slice(&nb[..n]);
@@ -2248,7 +2248,7 @@ fn compute(w: &Work) -> (Outcome, u64, u64) {
         }
         Job::Unlock => {
             let t = ms();
-            let verified = users::verify(n, p);
+            let verified = users::verify(n, p); #[cfg(feature = "lumen")] if verified { crate::keyring::ring_login(n, p); } // RINGLOGIN (B465): the screen's unlock opens the ring again
             (Outcome::Unlock { verified }, ms().saturating_sub(t), 0)
         }
     }

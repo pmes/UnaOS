@@ -545,3 +545,8 @@ pub fn r3pref_set_refused() -> bool {
         && pref_gate(una_abi::BUS_VERB_R3PREF_SET, crate::prefs_client::KCLIENT_ROW).is_none()
         && pref_gate(una_abi::BUS_VERB_R3PREF_GET, 0).is_none()
 }
+/// RINGLOGIN (rmbp-ledger B465): the row registered for `verb` right now (SYS_RINGKEY hands the login's ring
+/// key only to the process holding Holocron's verbs). Tail append.
+pub fn fulfiller_row(verb: u8) -> Option<(usize, u64)> {
+    locked(|| REGS.lock().iter().flatten().find(|r| r.verb == verb).map(|r| (r.row, r.rgen)))
+}

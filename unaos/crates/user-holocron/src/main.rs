@@ -627,6 +627,7 @@ pub extern "C" fn _start() -> ! {
         report(r.verb(), a.status, &a.body, b"in this Holocron");
         holocron_core::zero::wipe(&mut a.body);
     }
+    ringlogin_door(&mut svc); // RINGLOGIN (B465): the login's key, before the serve line says the state
     let st = svc.handle(me, wire::VERB_STATUS, &[], vein_ring3::sys::now_ms(), now_unix());
     let state = wire::decode_status(&st.body).map(|(s, _, _)| state_name(s)).unwrap_or(b"?");
     let mut l = Line::new(b":: HOLOCRON: serve ring=");
@@ -642,6 +643,7 @@ pub extern "C" fn _start() -> ! {
     loop {
         let n = recv();
         if n < 0 {
+            ringlogin_door(&mut svc); // RINGLOGIN (B465): a login / lock-screen unlock posts a key, the lock screen a LOCK
             vein_ring3::sys::sleep_ms(20);
             continue;
         }
@@ -703,3 +705,39 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[used]
 #[link_section = ".note.unaos.app"]
 static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(una_abi::APP_FLAG_RESIDENT);
+
+// ---- RINGLOGIN (rmbp-ledger B465) --------------------------------------------------------------------------
+// The ring opens WITH THE LOGIN. The kernel's login derived the ring key ONCE from the typed password (SYS_KDF's
+// body, at the ring header's salt and parameters, or a fresh salt at METAL_KDF for a user with no ring yet) and
+// posted it in a take-once door; this process — the registered fulfiller, running as the door's user — takes it
+// through SYS_RINGKEY (67) and applies it with `Holocron::unlock_with_key` (create or open: holocron_core's ONE
+// ring code). The lock screen posts a LOCK. The outcome goes back to the kernel, which says the witness
+// (`[holocron] ring=<created|opened> at=login user=<u> ms=<n>`). The key is wiped on every path.
+
+fn ringlogin_door(svc: &mut Svc) {
+    let mut b = [0u8; una_abi::RINGKEY_LEN];
+    let r = sys(una_abi::SYS_RINGKEY, una_abi::RINGKEY_OP_TAKE, b.as_mut_ptr() as u64, b.len() as u64, 0);
+    if r == una_abi::RINGKEY_LOCK {
+        svc.lock_now();
+        sys(una_abi::SYS_RINGKEY, una_abi::RINGKEY_OP_REPORT, 0, una_abi::RINGKEY_MODE_LOCKED as u64, 0);
+        return;
+    }
+    if r != una_abi::RINGKEY_KEY {
+        return; // nothing posted, or not ours (-EACCES), or no SYS_RINGKEY in this kernel (-ENOSYS)
+    }
+    let door = una_abi::ringdoor_parse(&b);
+    holocron_core::zero::wipe(&mut b);
+    let Some(mut d) = door else {
+        sys(una_abi::SYS_RINGKEY, una_abi::RINGKEY_OP_REPORT, wire::status::INVALID as i64 as u64, 0, 0);
+        return;
+    };
+    let params = KdfParams { m_kib: d.m_kib, t: d.t, p: d.p };
+    let key = Key::from_bytes(d.key);
+    holocron_core::zero::wipe(&mut d.key);
+    let create = d.mode == una_abi::RINGKEY_MODE_CREATE;
+    let st = match svc.unlock_with_key(create, d.salt, params, key) {
+        Ok(()) => 0,
+        Err(s) => s,
+    };
+    sys(una_abi::SYS_RINGKEY, una_abi::RINGKEY_OP_REPORT, st as i64 as u64, d.mode as u64, 0);
+}
