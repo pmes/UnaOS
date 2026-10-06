@@ -87,13 +87,7 @@
 //   * **`Retry(stage)`** — a mount, or a root-directory read, failed for a reason that CAN change
 //     (`NoDisk`, `Io`, `Busy`). Nothing terminal was printed; the caller re-attempts under its own
 //     bounded budget and prints the exhaustion line if it runs out.
-//   * **`Pending`** (WIFI-REACH, GR26) — every volume PRESENT this attempt was searched and the set
-//     is still incomplete, but no SECOND handle existed to search, so a volume that has not yet
-//     enumerated could still carry the missing roles. Nothing terminal was printed; the caller holds
-//     arc 2 and the verdict and re-attempts on the USB storage-ready edge or a bounded deadline. It
-//     is returned only on a non-committing attempt — see [`stage_attempt`]'s `commit` argument — so
-//     the "exactly one terminal verdict per boot" rule is preserved: `Pending` is never the last
-//     word, the committing attempt always prints COMPLETE or INCOMPLETE.
+//   * (`Pending`, WIFI-REACH's third outcome, is RETIRED with the second-handle wait — FWPIN B455, SMALLFIX4.)
 //
 // ## PSRC (GR26) meets WIFI-REARM — where the no-double-stage guarantee now lives
 // Pre-PSRC, both `Retry` arms sat ABOVE the `for spec in FW_SET` loop, so a retry was by construction
@@ -704,18 +698,6 @@ pub enum StageOutcome {
     /// Nothing was staged and nothing terminal was printed, for a reason a later pass can change.
     /// The `&'static str` names the stage that deferred, for the caller's retry line.
     Retry(&'static str),
-    /// WIFI-REACH: the set is INCOMPLETE after searching every volume PRESENT this attempt, and no
-    /// second populated handle existed to search — so a volume that has not yet enumerated (the
-    /// classic case: a USB stick carrying the b43 blobs, published many main-loop passes after the
-    /// internal card that is the program source) could still carry the missing roles. NOTHING
-    /// terminal was printed. The caller holds arc 2 and the terminal verdict, and re-attempts when
-    /// the USB storage-ready edge fires or a bounded deadline expires (`crate::wifi`'s second-handle
-    /// wait). Returned ONLY when the caller passed `commit = false`: on the committing attempt the
-    /// verdict is forced, so `Pending` can never be the last word.
-    ///
-    /// FWPIN (B455): RETIRED — no longer returned (the alternate-handle search it waited for is gone, R95);
-    /// kept so `wifi/mod.rs`'s `S_WAIT_ALT` arms compile until the integrator retires that state.
-    Pending,
 }
 
 /// A [`FatError`] that a later pass could plausibly see differently.
@@ -860,28 +842,10 @@ fn stage_volume(src: fat::BlockSource, dirs: &str, label: &str) -> VolOutcome {
 /// The witness names the volume each image came from (`on source=… label=… fp=…`), so a capture
 /// always says which medium fed the radio — the widening is never silent.
 ///
-/// **FWPIN (B455) supersedes the two sections below:** pass 2 is now the boot card's own native UnaFS
-/// root ([`stage_boot_root`]), never another handle, and `Pending` is never returned — `commit` is
-/// kept in the signature for the caller and ignored. The text below is the history.
-///
-/// ## WIFI-REACH (GR26): `commit`, and the `Pending` third outcome
-///
-/// The two-volume search above only helps when BOTH handles are present at attempt time. The bench
-/// timing (`sdhc.md` §13.7) is card-early / stick-late: on the first attempt the program source (the
-/// internal card) is present but the USB stick carrying the blobs has not enumerated, so
-/// [`crate::drivers::block::alternate_program_source`] is `None` and pass 2 finds nothing to search.
-/// Printing the terminal INCOMPLETE verdict there — and letting arc 2 run on that count — is exactly
-/// the premature verdict WIFI-REARM was built to prevent, one main-loop epoch earlier than the stick.
-///
-/// So this pass takes `commit`:
-///   * `commit == false` — the caller can still wait. If the set is incomplete AND no alternate
-///     handle was present to search, return [`StageOutcome::Pending`] and print NOTHING terminal;
-///     the caller holds arc 2 and re-attempts when the stick's storage-ready edge fires or its
-///     deadline expires. If an alternate WAS present and searched and the set is still incomplete,
-///     both handles have been genuinely tried and the verdict IS terminal — printed here, `Settled`.
-///   * `commit == true` — the second-handle deadline has expired; force the terminal verdict whether
-///     or not an alternate ever appeared. `Pending` is never returned on a committing attempt.
-pub fn stage_attempt(_commit: bool) -> StageOutcome {
+/// **FWPIN (B455):** pass 2 is the boot card's own native UnaFS root ([`stage_boot_root`]), never
+/// another handle. WIFI-REACH's `commit` argument and `Pending` outcome (the wait for a late second
+/// handle) are RETIRED with that handle — SMALLFIX4 removed them; every non-`Retry` attempt is terminal.
+pub fn stage_attempt() -> StageOutcome {
     let dirs = dirs_description();
 
     // Pass 1 — the program source. FAT-verb law: reads follow it. See the module note.
