@@ -1449,7 +1449,7 @@ pub fn power_fire(kind: u8) {
         2 => fire(Verb::ShutDown),
         #[cfg(feature = "login")]
         3 => fire(Verb::LogOut),
-        _ => {}
+        4 => fire(Verb::Sleep), _ => {} // DIALOG2 (B404): 4 = the login power row's Sleep (instant, no confirm)
     }
 }
 

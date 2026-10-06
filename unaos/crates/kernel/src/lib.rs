@@ -307,3 +307,6 @@ pub mod procslot;
 
 // STACKGUARD2 (rmbp-ledger B403): the holder registry a stack-overflowed task's locks are released from. Tail statement, so no existing line moves.
 pub mod lockowner;
+
+// DIALOG2 (rmbp-ledger B404): the spawn's explicit ORIGIN (glass / door / system). Tail statement, so no existing line moves.
+pub mod origin;

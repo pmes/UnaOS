@@ -212,7 +212,7 @@ fn log_op(op: &str, src: &str, dst: &str, r: &Result<(), String>) {
 /// B229 — a refusal the operator can read: the NOTICE (when the login stack is built) and the path bar.
 fn refuse_notice(why: &str) {
     #[cfg(feature = "login")]
-    crate::video::crystal::login::notice_show(b"Quarry", why.as_bytes());
+    let _ = crate::video::dialog::notice(b"Quarry", why.as_bytes()); // DIALOG2 (B404): THE router — sorted error -> dialog, information -> toast
     let _ = why;
 }
 
@@ -607,7 +607,7 @@ fn do_empty_trash() {
         EMPTY_ARMED.store(now_s() + 1, Ordering::Relaxed);
         let msg = alloc::format!("Empty Trash again within {} s to delete {} items for good", EMPTY_WINDOW_S, crate::fs::trash::count());
         #[cfg(feature = "login")]
-        crate::video::crystal::login::notice_show(b"Trash", msg.as_bytes());
+        let _ = crate::video::dialog::notice(b"Trash", msg.as_bytes()); // DIALOG2 (B404): THE router — sorted error -> dialog, information -> toast
         say(msg);
     }
 }
@@ -677,7 +677,8 @@ fn do_info() {
     body.push_str(&l1);
     body.push('\n');
     body.push_str(&l2);
-    let _ = body; // the inspector (getinfo) shows it; the NOTICE popup would cover it
+    #[cfg(feature = "login")]
+    let _ = crate::video::dialog::notice(leaf(&path).as_bytes(), body.as_bytes()); // DIALOG2 (B404): THE router — sorted error -> dialog, information -> toast
     say(l1);
 }
 

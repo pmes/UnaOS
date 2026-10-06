@@ -611,7 +611,7 @@ fn finish(verdict: Result<Shot, Refusal>) {
             // SHOTREGION M3: a region/window capture says where it went (B229 `notice_show`); the whole-panel path stays silent as before.
             #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             if shot.kind != 0 {
-                crate::video::crystal::login::notice_show(b"Screenshot saved", alloc::format!("{}\nDesktop", shot.name).as_bytes());
+                let _ = crate::video::dialog::notice(b"Screenshot saved", alloc::format!("{}\nDesktop", shot.name).as_bytes()); // DIALOG2 (B404): THE router — sorted error -> dialog, information -> toast
             }
         }
         Err(why) => {

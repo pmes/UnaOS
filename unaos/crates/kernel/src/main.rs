@@ -2763,7 +2763,7 @@ fn handle_key(
         // command has already restored the console by the time it returns).
         SCREEN_APP_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
         unaos_kernel::gui_watchdog::on_app_enter();
-        let took_screen = unaos_kernel::shell::dispatch_command(&cmd, console, pal);
+        let took_screen = unaos_kernel::origin::with(unaos_kernel::origin::Origin::Door, || unaos_kernel::shell::dispatch_command(&cmd, console, pal)); // DIALOG2 (B404): a typed line (console window or serial door) — its spawns are the DOOR's
         unaos_kernel::gui_watchdog::on_app_exit();
         SCREEN_APP_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed); unaos_kernel::pwwire::refresh(); // CONSOLEFIX M3: a verb may have opened a password prompt or the screen
         // TERM_RING (MIDDEN_CONVERGENCE §3, M2): THE DRAIN SITE. `dispatch_command` has returned, so
@@ -6958,7 +6958,7 @@ fn x86_render_service(cpu: usize) {
                         dock::app_launched(PinnedApp::Shell, id, "x86_render_service", 1);
                     }
                 }
-            } if unaos_kernel::video::dock::verb_launch_posted() && shell_id != unaos_kernel::video::wm::WIN_NONE { if let Some(v) = unaos_kernel::video::dock::take_verb_launch() { serial_println!("[dock] dockpin verb {}", v); let _ = unaos_kernel::shell::dispatch_command(v, &mut shell_console, &mut shell_pal); shell_console.draw(&mut shell_pal); shell_pal.render(); } } unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_SHELL); // DOCKPIN — LINE-NEUTRAL fold (main.rs is line-sensitive). A ring-3 table app's tile (activity, settings) latched its VERB; the shell window is the seam that runs it, exactly as if typed. Held until the shell is live (the press also posted the shell launch above).
+            } if unaos_kernel::video::dock::verb_launch_posted() && shell_id != unaos_kernel::video::wm::WIN_NONE { if let Some(v) = unaos_kernel::video::dock::take_verb_launch() { serial_println!("[dock] dockpin verb {}", v); let _ = unaos_kernel::origin::with(unaos_kernel::origin::Origin::Glass, || unaos_kernel::shell::dispatch_command(v, &mut shell_console, &mut shell_pal)); shell_console.draw(&mut shell_pal); shell_pal.render(); } } unaos_kernel::video::lag::seg(unaos_kernel::video::lag::S_SHELL); // DOCKPIN — LINE-NEUTRAL fold (main.rs is line-sensitive). A ring-3 table app's tile (activity, settings) latched its VERB; the shell window is the seam that runs it, exactly as if typed. Held until the shell is live (the press also posted the shell launch above).
         }
 
         // CURSOR-HIDE: restore the pixels under the sprite once when the auto-hide delay expires

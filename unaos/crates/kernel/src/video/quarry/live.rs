@@ -1508,7 +1508,7 @@ fn launch(path: &str) -> String {
     // (A console program on a build whose render body does not drain the line seam — every aarch64 build
     // today, `dock::LINE_LAUNCH_DRAINED` — still detaches, as every double-click did before M6.)
     let n = bytes.len();
-    match crate::arch::syscall::spawn_user_image_bg(&bytes) {
+    match crate::origin::with(crate::origin::Origin::Glass, || crate::arch::syscall::spawn_user_image_bg(&bytes)) { // DIALOG2 (B404): a Quarry double-click is the GLASS's launch
         Ok((pid, asid, entry)) => {
             // WINTITLE — a double-click launch names its windows exactly as `bg` does; the file
             // manager knows the path, so the window it opens carries the program's name rather than
