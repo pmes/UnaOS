@@ -4471,9 +4471,8 @@ pub(crate) fn dnd_app_at(x: i32, y: i32, paths: &[alloc::string::String]) -> Opt
         let key = crate::fs::appres::key_of_title(&title)?;
         let app = crate::fs::appres::app(&key)?;
         let opener = if app.path.starts_with("builtin:") { key.clone() } else { app.path.clone() };
-        if !crate::video::quarry::live::openers::available(&opener) {
-            return None;
-        }
+        #[cfg(feature = "quarry")] if !crate::video::quarry::live::openers::available(&opener) { return None; }
+        #[cfg(not(feature = "quarry"))] { let _ = &opener; return None; } // no file manager, no opener to hand a drop to
         let mt = crate::shell::vfs_mount_table();
         paths.iter().all(|p| dnd_takes(&app.doctypes, &crate::fs::filetype::type_of_in(&mt, p).0)).then_some((key, opener))
     })();

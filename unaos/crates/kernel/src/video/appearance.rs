@@ -152,7 +152,7 @@ fn install(dark: bool, accent: usize, highlight: usize, via: &str) -> bool {
 /// same list a face restyle repaints, keyed on the theme epoch too), then the panel is damaged so the chrome,
 /// the desktop and the strips (whose signatures carry the epoch) recomposite.
 fn repaint() {
-    crate::video::quarry::live::font_repaint_pass();
+    #[cfg(feature = "quarry")] crate::video::quarry::live::font_repaint_pass(); // quarry::live exists only under `quarry` (a tegra+rast shape has the pane without the file manager)
     let _ = wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
 }
 
