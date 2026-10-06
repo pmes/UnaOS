@@ -70,7 +70,7 @@ pub struct Facts {
     pub frames: u64,
     /// The sound track's codec token, `none` without one.
     pub audio: &'static str,
-    /// The sound can be played here: Vorbis in Matroska ([`container_audio`]), or an MP4 track audio_core reads.
+    /// The sound can be played here: Vorbis or Opus in Matroska ([`container_audio`]), or an MP4 track audio_core reads.
     pub audio_ok: bool,
 }
 
@@ -105,7 +105,7 @@ fn facts_of(d: &Demuxer) -> Option<Facts> {
     let fps_x100 = if dur_ns > 0 { (v.sample_count as u128 * 100_000_000_000 / dur_ns as u128) as u32 } else { 0 };
     let audio_ok = match (d.format(), a.map(|t| &t.codec)) {
         (demux_core::Format::Mp4, Some(Codec::Aac | Codec::Mp3)) => true,
-        (demux_core::Format::Matroska | demux_core::Format::WebM, Some(Codec::Vorbis)) => true,
+        (demux_core::Format::Matroska | demux_core::Format::WebM, Some(Codec::Vorbis | Codec::Opus)) => true, // SEEKTABLE2 (B469): Opus too
         _ => false,
     };
     Some(Facts {
@@ -640,8 +640,11 @@ pub fn container_audio(path: &str) -> Option<Box<dyn audio_core::Source>> {
     }
     let d = Demuxer::open(bytes).ok()?;
     let t = d.audio_track()?.clone();
+    if t.codec == Codec::Opus {
+        return mkv_opus(d, t); // SEEKTABLE2 (B469): audio_core's Opus decoder over the track's packets
+    }
     if t.codec != Codec::Vorbis {
-        serial_println!("[vplay] sound codec={} -> none (Vorbis is the Matroska sound this tree plays)", tok(&t.codec));
+        serial_println!("[vplay] sound codec={} -> none (Vorbis and Opus are the Matroska sounds this tree plays)", tok(&t.codec));
         return None;
     }
     let h = xiph_split(&t.config)?;
@@ -745,4 +748,38 @@ pub fn fact_lines(f: &Facts) -> [String; 2] {
         alloc::format!("Video: {}  {}x{}  {} fps", f.codec.to_ascii_uppercase(), f.w, f.h, f.fps()),
         alloc::format!("{}.{} s, sound: {}", f.dur_ms / 1000, (f.dur_ms % 1000) / 100, if f.audio == "none" { "none" } else { f.audio }),
     ]
+}
+
+// ── SEEKTABLE2 (rmbp-ledger B469): Opus inside Matroska/WebM — demux_core's track into audio_core's decoder ──────
+
+/// The Matroska audio track's packets, in file order, for `audio_core::opus::OpusPackets` (no decoder here, R79).
+struct MkvPackets {
+    d: Demuxer,
+    track: u32,
+}
+
+impl audio_core::opus::Packets for MkvPackets {
+    fn next_packet(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let p = self.d.next_packet()?;
+            if p.track == self.track {
+                return Some(p.data);
+            }
+        }
+    }
+}
+
+fn mkv_opus(d: Demuxer, t: demux_core::Track) -> Option<Box<dyn audio_core::Source>> {
+    let src = Box::new(MkvPackets { d, track: t.id });
+    match audio_core::opus::OpusPackets::new(&t.config, t.codec_delay_ns, src) {
+        Ok(o) => {
+            let ch = audio_core::Source::info(&o).channels;
+            serial_println!("[vplay] sound container=matroska codec=opus rate=48000 ch={} packets={} delay_ns={} -> play-dec", ch, t.sample_count, t.codec_delay_ns);
+            Some(Box::new(o))
+        }
+        Err(e) => {
+            serial_println!("[vplay] sound opus head refused ({})", e);
+            None
+        }
+    }
 }

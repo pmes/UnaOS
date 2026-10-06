@@ -267,6 +267,8 @@ impl Decoder {
         let mut target = ms.saturating_mul(info.rate as u64) / 1000;
         if let Some(t) = info.frames { target = target.min(t); }
         let Some(mut p) = self.src.seek(target)? else { return Ok(None) };
+        // SEEKTABLE2: a source that learns its length while seeking (an Ogg's last granule, ADTS's header walk) says so
+        if let Some(t) = self.src.info().frames { target = target.min(t); }
         self.pcm.frames = 0;
         self.pos = 0;
         self.done = false;

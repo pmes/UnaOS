@@ -1272,7 +1272,7 @@ fn alert_play() {
 // ── SEEKTABLE (rmbp-ledger B433) — a coded seek from the container's own index ─────────────────────────────────
 // `play-dec` asks `audio_core::Decoder::seek` once, after the open: the core repositions `VfsSrc` at a sync point
 // found from the file's own table (FLAC SEEKTABLE/frame headers, MP3 Xing/VBRI/CBR, the MP4 sample table, PCM) and
-// drops the residual itself. A format with no table here (Ogg, ADTS) keeps PLAYER's decode-skip. Design:
+// drops the residual itself; SEEKTABLE2 (B469) adds Ogg (page granules) and ADTS (header walk). A format with no table keeps PLAYER's decode-skip. Design:
 // docs/dev/evidence/rmbp-1005/seektable.md.
 
 /// The last coded seek's verdict: (jid, method, table, landed_ms, exact).
@@ -1303,4 +1303,40 @@ fn seek_table(jid: u32, dec: &mut audio_core::Decoder, rate: u32) -> u64 {
 pub fn seek_result() -> Option<(&'static str, &'static str, u64, bool)> {
     let want = SEEK_JID.load(Ordering::Acquire);
     SEEK_DONE.lock().filter(|r| r.0 == want).map(|r| (r.1, r.2, r.3, r.4))
+}
+
+// ── SEEKTABLE2 (rmbp-ledger B469) — `tests player`'s coded-table probe ─────────────────────────────────────────
+// Typed only (R80). `audio_core::Decoder::open` + `seek(ms)` over `VfsSrc` on a `play-probe` task with play-dec's
+// stack and core choice (never the shell's stack): the Ogg page-granule bisection / the ADTS header walk run on the
+// kernel's own file read; the verdict is the table the core answered with. No ring, no feed.
+
+/// (path, ms, verdict): verdict = (table, exact, landed_ms, byte, sample) or the refusal.
+static PROBE: spin::Mutex<Option<(String, u64, Option<Result<(&'static str, bool, u64, u64, u64), String>>)>> = spin::Mutex::new(None);
+
+/// Start the probe of `path` at `ms` (replaces any earlier one).
+pub fn table_probe_start(path: &str, ms: u64) {
+    *PROBE.lock() = Some((String::from(path), ms, None));
+    let (cpu, _) = dec_cpu();
+    crate::arch::sched::spawn_stack("play-probe", probe_task, 0, cpu, crate::arch::sched::PRIO_NORMAL, DEC_STACK);
+}
+
+/// The probe's verdict, `None` while it runs.
+pub fn table_probe_done() -> Option<Result<(&'static str, bool, u64, u64, u64), String>> {
+    PROBE.lock().as_ref().and_then(|p| p.2.clone())
+}
+
+fn probe_task(_: usize) {
+    let Some((path, ms)) = PROBE.lock().as_ref().map(|p| (p.0.clone(), p.1)) else { return };
+    let r = match <audio_core::Decoder as audio_core::AudioDecoder>::open(alloc::boxed::Box::new(VfsSrc { path: path.clone(), off: 0 })) {
+        Err(e) => Err(alloc::format!("{:?}", e)),
+        Ok(mut d) => {
+            let rate = <audio_core::Decoder as audio_core::AudioDecoder>::info(&d).rate;
+            match d.seek(ms) {
+                Ok(Some(p)) => Ok((p.table, p.exact, p.landed_ms(rate), p.byte, p.landed)),
+                Ok(None) => Ok(("none", false, 0, 0, 0)),
+                Err(e) => Err(alloc::format!("{:?}", e)),
+            }
+        }
+    };
+    if let Some(p) = PROBE.lock().as_mut().filter(|p| p.0 == path) { p.2 = Some(r); }
 }
