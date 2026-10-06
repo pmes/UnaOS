@@ -51,6 +51,9 @@ pub const IMAGE_WEBP: &str = "image/webp";
 pub const IMAGE_QOI: &str = "image/qoi";
 /// SMALLFIX2 (B391, R94): pixel_core's SVG type (`pixel_core::mime_of` under the `svg` feature).
 pub const IMAGE_SVG: &str = "image/svg+xml";
+/// RAWCORE (B444): raw_core's types (`pixel_core::mime_of` -> `raw_core::mime_of`): a Sony raw, a plain TIFF.
+pub const IMAGE_ARW: &str = "image/x-sony-arw";
+pub const IMAGE_TIFF: &str = "image/tiff";
 pub const AUDIO_FLAC: &str = "audio/flac";
 pub const AUDIO_OGG: &str = "audio/ogg";
 pub const AUDIO_MPEG: &str = "audio/mpeg";
@@ -118,6 +121,9 @@ pub const EXT_TABLE: &[(&str, &str)] = &[
     ("bmp", IMAGE_BMP),
     ("webp", IMAGE_WEBP),
     ("qoi", IMAGE_QOI),
+    ("arw", IMAGE_ARW), // RAWCORE (B444)
+    ("tif", IMAGE_TIFF),
+    ("tiff", IMAGE_TIFF),
     ("svg", IMAGE_SVG), // SMALLFIX2 (B391): the bytes speak first — without the `svg` feature an .svg sniffs as its text
     ("flac", AUDIO_FLAC),
     ("ogg", AUDIO_OGG),
@@ -330,6 +336,7 @@ pub fn type_of_in(mt: &MountTable, path: &str) -> (String, Source) {
                     if let (false, Some(e)) = (strong, by_extension(path)) { if e != m { return (String::from(e), Source::Extension); } }
                     // OPENERS (B379): an ISO-BMFF file's `moov` may lie past the sniff window (after the `mdat`):
                     // walk the top-level boxes to it so its tracks decide audio/mp4 against video/mp4.
+                    if m == IMAGE_TIFF && s.size > SNIFF_LEN as u64 { return (String::from(tiff_walk(mt, path, s.size).unwrap_or(m)), Source::Sniffed); } // RAWCORE (B444): IFD0's Make may lie past the sniff window
                     if matches!(m, AUDIO_MP4 | VIDEO_MP4) {
                         return (String::from(iso_walk(mt, path, s.size).unwrap_or(m)), Source::Sniffed);
                     }
@@ -436,6 +443,8 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("filetype", selftest);
+        #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+        crate::tests::register("rawcore", crate::video::facet::raw::selftest); // RAWCORE (B444)
         crate::fs::attrfacts::ensure_tests(); // ATTRCOLUMNS (B402): `tests attrcolumns` rides this registration
         // QUARRY2 (B336): `tests quarry2` rides this registration (no tests.rs line).
         #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -650,7 +659,7 @@ pub fn openers_witness(dir: &str, names: &[&str]) {
         // The decoding core the handler uses must recognise the bytes (the type and the decoder agree).
         let head = mt.read(&path, 0, core::cmp::min(st.size, SNIFF_LEN as u64) as usize).unwrap_or_default();
         let core: Option<(&str, bool)> = match handler.as_str() {
-            "facet" => Some(("pixel_core", pixel_core::sniff(&head).is_some())),
+            "facet" => Some(("pixel_core", pixel_core::sniff(&head).is_some() || pixel_core::raw::is_raw(&head))),
             "play" => Some(("audio_core", audio_core::sniff(&head) != audio_core::Format::Unknown)),
             "textedit" | "fileview" | "markdown" | "json" => Some(("text", looks_text(&head))),
             _ => None,
@@ -688,4 +697,11 @@ pub fn openers_witness(dir: &str, names: &[&str]) {
         if owed.is_empty() { "" } else { " reason=no-opener-in-this-tree(video: Stria's player, SR26)" },
         dir
     );
+}
+
+/// RAWCORE (B444): a TIFF's type from a longer head (IFD0's Make string may lie past [`SNIFF_LEN`]):
+/// `image/x-sony-arw` when the make is SONY, else `image/tiff`.
+fn tiff_walk(mt: &MountTable, path: &str, size: u64) -> Option<&'static str> {
+    let head = mt.read(path, 0, core::cmp::min(size, 64 << 10) as usize).ok()?;
+    pixel_core::mime_of(&head)
 }

@@ -49,6 +49,8 @@ pub const BUILTIN: &[(&str, &str, &str, &str)] = &[
     (ft::IMAGE_BMP, "facet", "image", "BMP image"),
     (ft::IMAGE_WEBP, "facet", "image", "WebP image"),
     (ft::IMAGE_QOI, "facet", "image", "QOI image"),
+    (ft::IMAGE_ARW, "facet", "image", "Sony raw image"), // RAWCORE (B444): raw_core through pixel_core
+    (ft::IMAGE_TIFF, "facet", "image", "TIFF image"),
     (ft::IMAGE_SVG, "facet", "image", "SVG image"), // SMALLFIX2 (B391, R94): SVG is a picture (UNAOS_SVG links pixel_core's svg format)
     (ft::AUDIO_FLAC, "play", "sound", "FLAC audio"),
     (ft::AUDIO_OGG, "play", "sound", "Ogg audio"),

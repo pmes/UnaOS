@@ -35,8 +35,17 @@ pub const DURATION: &str = "media:duration_ms";
 pub const CODEC: &str = "media:codec";
 pub const TITLE: &str = "doc:title";
 pub const ANIMATED: &str = "image:animated";
+/// RAWCORE (B444): a photograph's EXIF facts (`raw_core::Facts`, through pixel_core) — camera, lens, exposure
+/// (`1/250`), ISO (int), focal length (int mm), and when it was taken (int unix seconds: QUERYFOLDER's
+/// `media:taken > now-7d` finds a shoot).
+pub const CAMERA: &str = "media:camera";
+pub const LENS: &str = "media:lens";
+pub const EXPOSURE: &str = "media:exposure";
+pub const ISO: &str = "media:iso";
+pub const FOCAL: &str = "media:focal_mm";
+pub const TAKEN: &str = "media:taken";
 /// The sniffed facts, in the order Get Info and the witness print them.
-pub const FACT_KEYS: [&str; 6] = [WIDTH, HEIGHT, DURATION, CODEC, TITLE, ANIMATED];
+pub const FACT_KEYS: [&str; 12] = [WIDTH, HEIGHT, DURATION, CODEC, TITLE, ANIMATED, CAMERA, LENS, EXPOSURE, ISO, FOCAL, TAKEN];
 pub const FACTS_MTIME: &str = "una:facts-mtime";
 pub const TIMES: &str = "una:attrtimes";
 /// The folder's chosen attribute columns, comma-separated (Be's `_trk` attribute; the seed of FOLDERVIEW B6).
@@ -112,6 +121,9 @@ pub fn facts_for(mime: &str, name: &str, head: &[u8], len: u64, tail: &[u8]) -> 
     } else if mime.starts_with("image/") {
         if let Some(f) = pixel_core::facts_of(head) {
             image(&mut out, f);
+        }
+        if pixel_core::raw::is_raw(head) {
+            raw_facts(&mut out, head);
         }
     } else if mime == ft::TEXT_MARKDOWN {
         if let Some(t) = md_title(head) {
@@ -291,6 +303,7 @@ pub fn fmt_value(key: &str, v: &AttrValue) -> String {
     match v {
         AttrValue::Int(i) if key == DURATION => fmt_duration(*i),
         AttrValue::Int(i) if key == ANIMATED => String::from(if *i != 0 { "yes" } else { "no" }),
+        AttrValue::Int(i) if key == TAKEN => fmt_when(*i as u64),
         AttrValue::Int(i) => alloc::format!("{}", i),
         AttrValue::Float(f) => alloc::format!("{:.3}", f),
         AttrValue::Str(s) => s.replace('\n', " "),
@@ -438,4 +451,27 @@ pub fn selftest() {
         if missing.is_empty() { String::from("-") } else { missing.join(",") },
         dir
     );
+}
+
+/// RAWCORE (B444): a camera raw's EXIF facts (the head holds IFD0 and the EXIF IFD), beside width and height.
+fn raw_facts(out: &mut Vec<(&'static str, AttrValue)>, head: &[u8]) {
+    let Some(x) = pixel_core::raw::facts(head) else { return };
+    if let Some(v) = x.camera() {
+        out.push((CAMERA, AttrValue::Str(v)));
+    }
+    if let Some(v) = x.lens.clone() {
+        out.push((LENS, AttrValue::Str(v)));
+    }
+    if let Some(v) = x.exposure_text() {
+        out.push((EXPOSURE, AttrValue::Str(v)));
+    }
+    if let Some(v) = x.iso {
+        out.push((ISO, AttrValue::Int(v as i64)));
+    }
+    if let Some(v) = x.focal_mm() {
+        out.push((FOCAL, AttrValue::Int(v as i64)));
+    }
+    if let Some(v) = x.taken() {
+        out.push((TAKEN, AttrValue::Int(v)));
+    }
 }

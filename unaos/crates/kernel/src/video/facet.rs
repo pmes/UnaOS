@@ -1369,7 +1369,7 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
     if matches!(st.kind, crate::fs::vfs::NodeKind::Dir) {
         return Err(FacetError::Vfs(String::from("eisdir")));
     }
-    if st.size == 0 || st.size > MAX_FILE {
+    if st.size == 0 || (st.size > MAX_FILE && !raw::takes(&mt, path, st.size)) {
         return Err(FacetError::Size(st.size));
     }
     if let Some(d) = anim::probe(path) { close(); return anim::open_frames(path, st.size, d); } // QUARRY2 (B336) + FACETANIM (B358): GIF / animated WebP / APNG stream through the pixel_core adapter
@@ -1377,7 +1377,7 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
     // `pixel_core::decode` whole (JPEG, GIF frame 0, BMP, QOI, WebP lossless) and is box-reduced into
     // the same base image; a PNG keeps the streaming path below unchanged.
     let (ihdr, k, bw, bh, px) = if is_foreign(&mt, path)? {
-        let (ihdr, k, bw, bh, px) = decode_foreign(&mt, path, st.size, BASE_W, BASE_H)?;
+        let (ihdr, k, bw, bh, px) = if raw::takes(&mt, path, st.size) { raw::develop(&mt, path, st.size, BASE_W, BASE_H)? } else { decode_foreign(&mt, path, st.size, BASE_W, BASE_H)? };
         serial_println!(
             "[facet] open path={} pixel_core={}x{} bytes={} -> DECODED ms={}",
             path, ihdr.width, ihdr.height, st.size, crate::arch::ms().saturating_sub(t0)
@@ -1524,6 +1524,12 @@ fn decode_foreign(
     }
     let img = pixel_core::decode_first_frame(&bytes).map_err(FacetError::Pixel)?;
     drop(bytes);
+    reduce_rgba(&img, bw, bh)
+}
+
+/// Box-reduce a decoded RGBA image by `fit`'s integer `k` into `0xFFRRGGBB` base pixels (alpha dropped).
+/// Shared by [`decode_foreign`] and RAWCORE's preview path (`raw::preview`).
+fn reduce_rgba(img: &pixel_core::Image, bw: usize, bh: usize) -> Result<(Ihdr, usize, usize, usize, Vec<u32>), FacetError> {
     let ihdr = Ihdr { width: img.width, height: img.height, depth: 8, colour: 6, interlaced: false };
     let (k, ow, oh) = fit(img.width, img.height, bw, bh).ok_or(FacetError::NoWindow("fit"))?;
     let mut px: Vec<u32> = Vec::new();
@@ -1988,8 +1994,13 @@ pub fn decode_file(
     if matches!(st.kind, crate::fs::vfs::NodeKind::Dir) {
         return Err(FacetError::Vfs(String::from("eisdir")));
     }
-    if st.size == 0 || st.size > cap.min(MAX_FILE) {
+    if st.size == 0 || (st.size > cap.min(MAX_FILE) && !raw::takes(&mt, path, st.size)) {
         return Err(FacetError::Size(st.size));
+    }
+    // RAWCORE (B444): a camera raw's FAST path — its embedded JPEG (Quick Look, the wallpaper), never the strip.
+    if raw::takes(&mt, path, st.size) {
+        let (ihdr, _k, out_w, out_h, px) = raw::preview(&mt, path, st.size, bw, bh)?;
+        return Ok((px, out_w, out_h, ihdr.width, ihdr.height));
     }
     // FACETANIM (B358): a non-PNG picture (JPEG, GIF, WebP, ...) is its FIRST FRAME only —
     // `decode_first_frame` never composites (or keeps) frames 1..N of an animation.
@@ -2136,3 +2147,8 @@ pub mod anim;
 pub fn win() -> wm::WinId {
     WIN.load(Ordering::Relaxed)
 }
+
+// RAWCORE (B444): camera raw (Sony ARW, TIFF) through raw_core via pixel_core — FULL on open (the strip streamed
+// through the binning developer), FAST for Quick Look (the embedded JPEG). A child module, so no `video/mod.rs` line.
+#[path = "facet_raw.rs"]
+pub mod raw;
