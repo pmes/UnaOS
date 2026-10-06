@@ -27,7 +27,7 @@ RUNTIME (operands are the DPI-latched metric readers `CELL_W()`, `BAR_H()`, `TIT
 scale 1.0..=4.0 by `ui.rs`'s compile-time table proof) -> `ck.t(…)` on a `metrics::Sane` counter, run by `tests sanity`:
 - video/dock.rs:364,367,369,372,373 (5) · video/strip.rs:827 (1) · video/crystal.rs:283,287,289,293,295 (5)
 - video/theme.rs:397-405 (9, `uimetrics_assert_positive`) · :415-429 (7, `uimetrics_assert_relations`)
-- video/winmenu.rs:2257,2258,2260,2264,2265 (5) · video/menubar.rs:372-423 (17 less the 2 const = 17)
+- video/winmenu.rs:2257,2258,2260,2264,2265 (5) · video/menubar.rs:372-423 (17; its other 2 are const)
 - video/wm.rs:130 (1, `uimetrics_assert_title_cell`, same-line edit) · video/metrics.rs `ignite` `m.check()` panic (1)
 The fns are renamed `uimetrics_assert*` -> `uimetrics_sanity*` and take `&mut metrics::Sane`; `ignite` no longer
 calls them nor panics (R80: no test at boot) — it prints `[ui] metrics … asserts=tests` (was `asserts=ok`).
@@ -37,7 +37,7 @@ Kernel — wm (the furniture's own files; no new file, no new store, no new knob
 `metrics::ensure_tests` (already called from `tests::shell_verb`), so `tests.rs` is untouched.
 
 ## Milestones
-- M1 the 17 → `const _`, the 50 → `ck.t`, the boot call and the boot panic removed, `tests sanity` at metrics.rs's tail.
+- M1 (c043154a) the 17 → `const _`, the 50 → `ck.t`, the boot call and the boot panic removed, `tests sanity` at metrics.rs's tail.
 - M2 `unaos/scripts/sanity-legs.py` (GATE-SANITY, `--selftest`): refuses a runtime `assert!`/`assert_eq!`/`assert_ne!`
   whose operands are all const-shaped (UPPER idents, UPPER() metric readers, literals, paths) outside a
   `const _`/`const` item/`const fn`/`#[cfg(test)]`/a tests fixture fn (`*selftest*`, `*fixture*`, `*sanity*`), and any
@@ -51,3 +51,8 @@ Host: `python3 unaos/scripts/sanity-legs.py unaos` -> `GATE-SANITY: … findings
 ## Owed
 The metal reading of `tests sanity` on the next flight; STATUS rows ST179/ST180 quote the old `asserts=ok` (past wires,
 untouched).
+
+## Results (host + compile legs, this branch)
+- x86 metal-shape `cargo check` (the seat's gate line) exit 0; aarch64 `login,loginst,virt_el0,lumen,desktop_firmware,quarry,facet,usbnet` exit 0; `tegra,login,loginst,virt_el0` exit 0.
+- `sanity-legs.py unaos` -> `GATE-SANITY: files=346 const_asserts=17 fixture_asserts=0 findings=0 -> PASS`; on the 21521a53 tree it reads `findings=76 -> FAIL` (the 66 const-shaped asserts incl. `BAR_BOXES_MAX == MENU_TITLES_MAX + 2`, `ignite`'s 8 calls + its `panic!`, the undeclared count). `--selftest` 14 cases PASS; `./arroyo gates --selftest` `plants=12 caught=12 -> PASS`.
+- Seen in passing, not this arc's: `video/menubar.rs` ~2726 `#[cfg(feature = "sntp6")] const _: () = { … TITLE_X0() … CELL_W() … }` calls the (UIMETRICS-runtime) metric fns inside a const block — the `sntp6` knob will not compile; GATE-SANITY does not flag it (it is a const context).
