@@ -30245,7 +30245,7 @@ pub fn app_quit_owner(win: crate::video::wm::WinId, owner: u64) -> &'static str 
 
 /// APPMENU2 M6 — the pid of `owner`'s live process, or `None` (kernel furniture, a fixture, an exited app).
 fn appquit_pid(owner: u64) -> Option<u64> {
-    for pi in 0..MAX_PROCS {
+    for pi in 0..procs_rows() { // WINDOWCAP3 (B399): the heap table, not MAX_PROCS
         if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && PROCS[pi].slot.load(Ordering::Acquire) as u64 == owner {
             let pid = PROCS[pi].pid.load(Ordering::Acquire);
             return if pid != 0 { Some(pid) } else { None };
