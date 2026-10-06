@@ -188,10 +188,13 @@ pub mod attrfacts;
 pub mod bootfat;
 /// ROOTDISK2 (B401, R99): the boot log on UnaFS (`/var/log/boot-<n>.log`), not `UNAOS.LOG` on the boot FAT.
 pub mod bootlog;
-/// SEARCH (B417 LAUNCHER; QUARRY3 B413 joins): `by_name(prefix, limit)` — files by name, one bounded walk of the name trees.
+/// SEARCH (B417 LAUNCHER; QUARRY3 B413 joins): `by_name(prefix, limit)` — files by name, ONE range scan of UnaFS's name index (NAMEINDEX B432); a FAT root walks.
 pub mod search;
 /// UNAOSVOLUME (B427): `/jobs` on the UnaFS root — the jobs Mica writes, read here; the `[jobs]` line at login.
 #[cfg(feature = "unafs")]
 pub mod jobs;
 /// ROOTACL (B456, SECREVIEW F2's sibling): the root's system trees carry a `system` owner in the native ACL.
 pub mod rootacl;
+/// NAMEINDEX (B432): the name index's login-time build on a volume written before it, and `tests nameindex`.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub mod nameindex;

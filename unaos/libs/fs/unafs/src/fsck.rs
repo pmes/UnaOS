@@ -72,6 +72,10 @@ pub struct FsckReport {
     /// v6 (B302 M3): name-reachable inodes whose parent pointer / stored name
     /// disagrees with the directory entry that names them (repair restamps).
     pub bad_parent_links: Vec<u64>,
+    /// NAMEINDEX (B432): on a READY name index, inodes whose `una:fsname` facts
+    /// are missing / stale (repair reindexes). Empty when the index is unbuilt.
+    pub name_index_missing: Vec<u64>,
+    pub name_index_stale: Vec<u64>,
 }
 
 impl FsckReport {
@@ -80,6 +84,8 @@ impl FsckReport {
         self.leaked_blocks.is_empty()
             && self.orphan_inodes.is_empty()
             && self.bad_parent_links.is_empty()
+            && self.name_index_missing.is_empty()
+            && self.name_index_stale.is_empty()
             && !self.dirty_journal
     }
 }
@@ -141,6 +147,7 @@ impl<D: BlockDevice> UnaFS<D> {
         }
 
         let link_faults = self.parent_link_faults()?;
+        let names = self.name_index_check()?;
 
         let mut report = FsckReport {
             dirty_journal: false,
@@ -152,6 +159,8 @@ impl<D: BlockDevice> UnaFS<D> {
             scrubbed_catalog_entries: 0,
             repaired: repair,
             bad_parent_links: link_faults.iter().map(|f| f.0).collect(),
+            name_index_missing: names.missing.clone(),
+            name_index_stale: names.stale.clone(),
         };
 
         if !repair {
@@ -168,6 +177,12 @@ impl<D: BlockDevice> UnaFS<D> {
         // Phase 1b (v6): restamp parent pointers to what the name tree says.
         for (child, dir, name) in link_faults {
             self.relink_inode(child, dir, &name)?;
+        }
+
+        // Phase 1c (NAMEINDEX B432): a ready name index that disagrees with the
+        // names is rebuilt (one commit of its own; the refcount rebuild below re-walks after it).
+        if !names.missing.is_empty() || !names.stale.is_empty() {
+            self.reindex_names()?; // its own commit: a consistent root either side
         }
 
         // Phase 2: re-walk and rebuild the refcount map to the computed

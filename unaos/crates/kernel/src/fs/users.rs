@@ -868,6 +868,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
         id
     );
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::loginitems::post_login(); // PREFSUI (B389, R91): the user's login items launch after the desktop is built (`loginitems::service`)
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))] crate::fs::nameindex::post_login(); // NAMEINDEX (B432): a volume without the name index builds it as a login task (R93), never at boot (R80)
     #[cfg(feature = "lumen")] crate::keyring::after_login(name); // HOLOCRON2 (B355): the secrets handler starts with the session when the user has a ring
     Ok(())
 }

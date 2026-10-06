@@ -255,6 +255,7 @@ pub fn ensure_tests() {
         crate::tests::register("filetype", selftest);
         #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
         crate::tests::register("rawcore", crate::video::facet::raw::selftest); // RAWCORE (B444)
+        #[cfg(any(target_arch = "aarch64", feature = "unafs"))] crate::fs::nameindex::ensure_tests(); // NAMEINDEX (B432): `tests nameindex` rides this registration
         crate::fs::attrfacts::ensure_tests(); // ATTRCOLUMNS (B402): `tests attrcolumns` rides this registration
         // QUARRY2 (B336): `tests quarry2` rides this registration (no tests.rs line).
         #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]

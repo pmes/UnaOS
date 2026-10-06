@@ -354,6 +354,7 @@ pub fn service() {
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     super::launcher::service(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::appswitch::service(); /* APPSWITCH (B428): the switcher's pass */ // LAUNCHER (B417): the launcher's pass (snapshot, ranking, picks, the recency file) — off the input router
     if crate::fs::assoc::view_service() && is_open() && cur_tab() == FT_TAB { repaint(); } // FILETYPES (B423): the registry's rows / a preferred-app change, applied off the click path
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))] crate::fs::nameindex::service(); // NAMEINDEX (B432): the login task's chunked name-index build (idle: one load)
     crate::prefs::service(); super::loginitems::service(); super::settingsfiles::service(); super::appearance::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     if super::notifypane::take_stale() && is_open() && cur_tab() == NP_TAB { repaint(); } // NOTIFYPANE (B435): a newly seen app joins the open pane

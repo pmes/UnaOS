@@ -71,6 +71,7 @@ pub use fs::{
     SnapshotView, Stat, UnaFS, cosine_similarity, grow,
 };
 pub use index::CatalogRecord;
+pub use fs::nameindex::{NAME_KEY, NAME_SRC, NameFind, NameHit, NameIndexCheck, name_keys, name_match}; // NAMEINDEX (B432)
 pub use format::{FormatParams, Formatted, format, format_partition};
 pub use fsck::FsckReport;
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
