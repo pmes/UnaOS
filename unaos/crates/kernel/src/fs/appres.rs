@@ -670,6 +670,7 @@ pub fn blit_key_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: usize
         p.push(Pix { key: String::from("generic"), size, argb });
     }
     true
+}
 
 // ── FILETYPES (rmbp-ledger B423) — the registrants of a type ─────────────────────────────────────────────────────────
 
