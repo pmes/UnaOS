@@ -180,3 +180,5 @@ pub mod removable;
 pub mod rootdisk;
 /// EXFAT (B392): the kernel half of the shared exFAT reader (`unaos/libs/fs/exfat_core`) — removable volumes, read-only.
 pub mod exfat;
+/// ATTRCOLUMNS (B402): a file's sniffed facts as typed attributes (`media:*`, `doc:title`), the edit in place, `una:view`.
+pub mod attrfacts;
