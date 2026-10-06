@@ -9314,6 +9314,10 @@ esp_x86_unafs_card() {
         cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$src" "$dst" -i "$vol" || {
             echo -e "${COLOR_RED}❌ ROOTDISK2: tools/unafs put ${src#${WORKSPACE_DIR}/} -> ${dst} failed — no card image${COLOR_RESET}"; return 1; }
     done
+    # UNAOSVOLUME (B427): the jobs onto the SAME volume — the working drive IS the boot disk's volume. `mica jobs
+    # build --into` is the one builder `./arroyo jobs-image` runs (records from STATUS.tsv, the ledgers, the queues;
+    # `job:*` attributes; `/jobs/queries/Open jobs`); its witness line is printed, its noise kept in the log.
+    jobs_into_volume "$vol" || return 1
     # WIFI-FW (R95/Peter 2026-10-06 "we have the bunker for this"): the BCM4331 b43 firmware set is BENCH-ONLY and never
     # in-tree (CLEAN_ROOM_POLICY §4; bcm4331.md §S4 option 1). UNAOS_WIFI_FW_PATH=<absolute dir in the bunker> holding
     # ucode29_mimo.fw + ht0initvals29.fw + ht0bsinitvals29.fw stages the three files onto the UnaFS root at /FIRMWARE/
@@ -13509,6 +13513,30 @@ knoboff() {
     return $rc
 }
 
+# UNAOSVOLUME (rmbp-ledger B427, Peter 2026-10-06: "we could use the image we write to our boot disk as the working
+# drive so whenever UnaOS is ready to run on its own everything is already in place"): the jobs as a UnaFS volume.
+# `./arroyo jobs-image` builds target/jobs-unafs.img from the repo's records with Mica (handlers/mica, the jobs' only
+# writer, over the shared core unaos/libs/sys/jobs_core): /jobs/status/ST<n>, /jobs/ledger/<track>/<id>,
+# /jobs/queue/<track>/<nnn>-<NAME>, the fields as typed `job:*` attributes, the saved query `/jobs/queries/Open jobs`.
+# The card build puts the same content onto p2 (`jobs_into_volume`). Host witness (both):
+#   :: UNAOSVOLUME: records=<n> claims=<n> queue=<n> export=identical verify=<n>/<n> ::
+# The git text (STATUS.tsv, the ledgers' status cells) is the volume's EXPORT: `mica jobs export --repo .. --img <img>`.
+jobs_into_volume() {
+    local vol="$1" into="${2---into}" log="${WORKSPACE_DIR}/target/jobs-build.log"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cargo run -q --manifest-path "${WORKSPACE_DIR}/../handlers/mica/Cargo.toml" -- \
+        jobs build --repo "${WORKSPACE_DIR}/.." --img "$vol" $into > "$log" 2>&1 || {
+        awk '!index($0,"[UNAFS] Broadcasting")' "$log" | tail -20
+        echo -e "${COLOR_RED}❌ UNAOSVOLUME: mica jobs build failed (${log#${WORKSPACE_DIR}/}) — no volume${COLOR_RESET}"; return 1; }
+    awk 'index($0,"[jobs] ") || index($0,":: UNAOSVOLUME:")' "$log"
+}
+jobs_image() {
+    local img="${WORKSPACE_DIR}/target/jobs-unafs.img"
+    rm -f "$img"
+    jobs_into_volume "$img" "" || return 1
+    echo -e "${COLOR_GREEN}✅ UNAOSVOLUME: ${img}${COLOR_RESET}"
+}
+
 # --- Entry Point ---
 
 case "${1:-}" in
@@ -13638,6 +13666,9 @@ case "${1:-}" in
         # Exit status IS the result (0 identical / 1 moved / 2 no verdict) — see knoboff() above.
         knoboff "${2:-}" "${3:-}" || exit $?
         ;;
+    jobs-image)
+        jobs_image
+        ;;
     clean)
         clean_all
         ;;
@@ -13648,7 +13679,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|jobs-image|clean]"
         exit 1
         ;;
 esac
