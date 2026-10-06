@@ -3770,14 +3770,14 @@ SELFBUILD_TCC_REV="43c7708b85681a2fd4451c8a541af4494a8919b2"
 SELFBUILD_BB_URL="https://github.com/mirror/busybox.git"
 SELFBUILD_BB_REV="371fe9f71d445d18be28c82a2a6d82115c8af19d"
 # SELFBUILD3 (B353): musl 1.2.5 (MIT) — tag v1.2.5 is this commit on every mirror; git.musl-libc.org and musl.libc.org are refused by
-# the egress proxy, so a GitHub mirror carries the fetch (the commit id pins the bytes). Built here, staged as DATA under /apps/LIB.
+# the egress proxy, so a GitHub mirror carries the fetch (the commit id pins the bytes). Built here, staged as DATA under /lib.
 SELFBUILD_MUSL_URL="https://github.com/kraj/musl.git"
 SELFBUILD_MUSL_REV="0784374d561435f7c787a555aeab8ede699ed298"
 _selfbuild_fetch() { # dir url rev
     [ -d "$1/.git" ] && [ "$(git -C "$1" rev-parse HEAD 2>/dev/null)" = "$3" ] && return 0
     rm -rf "$1" && mkdir -p "$1" && git -C "$1" init -q && git -C "$1" fetch -q --depth 1 "$2" "$3" && git -C "$1" checkout -q FETCH_HEAD
 }
-# SMALLFIX (B380): flight 23's bench staged no APPS/LIB, TCC.LNX, SYSKAT.LNX, LIB/dyn, LIB/rustc or LLD.LNX and no line said WHY
+# SMALLFIX (B380): flight 23's bench staged no LIB (now /lib), TCC.LNX, SYSKAT.LNX, LIB/dyn, LIB/rustc or LLD.LNX and no line said WHY
 # (no clang; the rustc fetch never ran because LIB/dyn gates it). Every selfbuild product that is not staged now prints ONE line,
 #   SELFBUILD<n>: not staged <product> reason=<tool missing: X | musl target missing | fetch failed <url> | sha256 mismatch <url> |
 #                                             build failed <step> | host proof failed <step> | needs <product> | UNAOS_…=0>
@@ -3819,7 +3819,7 @@ build_selfbuild_x86() {
     else
         _sb_skip 2 SYSKAT2.LNX "$(_sb_kat_why "$sb/SYSKAT2.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
     fi
-    # SELFBUILD3 (B353): the musl libc as DATA under /apps/LIB (crt1.o crti.o crtn.o libc.a + include/), built before tcc so tcc's
+    # SELFBUILD3 (B353): the musl libc as DATA under /lib (crt1.o crti.o crtn.o libc.a + include/), built before tcc so tcc's
     # libtcc1.a can be compiled against it. No egress = no LIB = `tests selfbuild3` reports libc=none tcc_libc=skip.
     local lib="${WORKSPACE_DIR}/target/LIB"
     if [ ! -f "$lib/libc.a" ]; then
@@ -3833,13 +3833,13 @@ build_selfbuild_x86() {
             _sb_skip 3 LIB "$(_sb_fetch_why "$sb/musl" "$SELFBUILD_MUSL_URL" "$SELFBUILD_MUSL_REV" "musl configure/make" make gcc)"; rm -rf "$lib"
         fi
     fi
-    # SELFBUILD1 tcc; SELFBUILD3 configures its search paths onto the volume: tccdir /apps/LIB/tcc ({B}), crt + libs {B}/.. = /apps/LIB,
+    # SELFBUILD1 tcc; SELFBUILD3 configures its search paths onto the volume: tccdir /lib/tcc ({B}), crt + libs {B}/.. = /lib,
     # headers {B}/../include (musl) then {B}/include (tcc's own) — so on UnaOS a bare `TCC.LNX -static -o prog prog.c` links musl, and
     # on the host `-B target/LIB/tcc` points the SAME binary at the staged tree (the host proof below). Rebuilt when LIB lacks libtcc1.a.
-    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; }; then
+    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; } || LC_ALL=C grep -a -q -F /apps/LIB/tcc "${WORKSPACE_DIR}/target/TCC.LNX"; then  # ROOTDISK (B390, R94): a TCC.LNX configured for /apps/LIB is rebuilt for /lib
         if _selfbuild_fetch "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" \
             && ( cd "$sb/tinycc" && ./configure --cc=gcc --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" \
-                   --tccdir=/apps/LIB/tcc --crtprefix='{B}/..' --libpaths='{B}:{B}/..' --sysincludepaths='{B}/../include:{B}/include' --config-musl >/dev/null \
+                   --tccdir=/lib/tcc --crtprefix='{B}/..' --libpaths='{B}:{B}/..' --sysincludepaths='{B}/../include:{B}/include' --config-musl >/dev/null \
                  && make -s tcc >/dev/null 2>&1 ); then
             strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
             if [ -f "$lib/libc.a" ]; then
@@ -3936,9 +3936,9 @@ build_selfbuild4_x86() {
 #   plugins, X86 only), stripped. It is a multi-flavour driver: `LLD.LNX -flavor gnu …` is ld.lld. Built ONCE (target/LLD.LNX is
 #   kept; ~1960 ninja steps, about an hour on 4 idle cores). `UNAOS_LLD_LNX=<path>` stages an operator-supplied static ld.lld
 #   instead; no egress / no cmake+ninja = LLD.LNX absent = `tests selfbuild5` reports lld=skip.
-# * target/LIB/rust (staged as /apps/LIB/rust): RUST.LNX's own objects from a rebuild of crates/user-linux-rust whose linker is a
+# * target/LIB/rust (staged as /lib/rust): RUST.LNX's own objects from a rebuild of crates/user-linux-rust whose linker is a
 #   recording wrapper around the toolchain's rust-lld, the std rlibs it links (lib.rmeta dropped, --strip-debug), the musl crt
-#   objects + libc.a + libunwind.a from the target's self-contained dir, and link.rsp = that exact ld.lld line with /apps/LIB/rust
+#   objects + libc.a + libunwind.a from the target's self-contained dir, and link.rsp = that exact ld.lld line with /lib/rust
 #   paths (`-flavor` and `-o` left to the caller). Host proof: LLD.LNX links the SAME response file (host paths) into a binary that
 #   prints `rust ok …`, or LIB/rust is not staged.
 SELFBUILD_LLVM_VER="22.1.8"
@@ -4051,10 +4051,10 @@ open(os.path.join(out, "link.rsp.in"), "w").write("\n".join(rsp) + "\n")
 PY
     then
         cp "$selfc/libc.a" "$selfc/libunwind.a" "$out/" && strip --strip-debug "$out/libc.a" "$out/libunwind.a"
-        sed "s|@LIB@|/apps/LIB/rust|g" "$out/link.rsp.in" > "$out/link.rsp"
+        sed "s|@LIB@|/lib/rust|g" "$out/link.rsp.in" > "$out/link.rsp"
         sed "s|@LIB@|$out|g" "$out/link.rsp.in" > "$rec/host.rsp"
         rm -f "$out/link.rsp.in"
-        printf 'RUST.LNX objects + std rlibs (rustc %s, x86_64-unknown-linux-musl; rmeta dropped, --strip-debug) + musl crt/libc.a/libunwind.a\nfrom the Rust target self-contained dir, for LLD.LNX -flavor gnu @/apps/LIB/rust/link.rsp -o <out> (SELFBUILD5, B357)\n' \
+        printf 'RUST.LNX objects + std rlibs (rustc %s, x86_64-unknown-linux-musl; rmeta dropped, --strip-debug) + musl crt/libc.a/libunwind.a\nfrom the Rust target self-contained dir, for LLD.LNX -flavor gnu @/lib/rust/link.rsp -o <out> (SELFBUILD5, B357)\n' \
             "$(rustc +nightly -V | awk '{print $2, $3, $4}')" > "$out/RUST.TXT"
         # Host proof: the staged linker (or rust-lld when LLD.LNX is absent) links the staged inputs into a program that runs.
         local hl="$lld"; [ -f "$hl" ] || hl="$rlld"
@@ -4078,11 +4078,11 @@ PY
 # SELFBUILD6 (B360): DYNAMIC Linux programs through the shared loader core (unaos/libs/sys/ldso_core; the kernel's
 # linuxabi/ldso.rs and the host runner `ldrun` link the same core), then the musl-host rustc. Every product is proven on the HOST
 # kernel by `ldrun` before it is staged:
-# * target/LIB/dyn (staged as /apps/LIB/dyn, the kernel loader's search dir): libc.so + libgcc_s.so.1 (+ libgcc_s.so, the
+# * target/LIB/dyn (staged as /lib/dyn, the kernel loader's search dir): libc.so + libgcc_s.so.1 (+ libgcc_s.so, the
 #   link-time name) relinked -shared from the Rust musl target's self-contained libc.a (+ libgcc.a's complex-multiply helpers) and
 #   libunwind.a (+ fixtures/dyn/gcc_helpers.c), each with --eh-frame-hdr (without PT_GNU_EH_FRAME the unwinder cannot find its
 #   own frames and every rustc panic aborts); and the dyn probe (fixtures/dyn: hello PIE + libdyn.so + libplug.so).
-# * target/LIB/rustc (staged as /apps/LIB/rustc) BY DEFAULT (R87; UNAOS_SELFBUILD6_RUSTC=0 opts out; about 420 MB on the ESP): upstream's
+# * target/LIB/rustc (staged as /lib/rustc) BY DEFAULT (R87; UNAOS_SELFBUILD6_RUSTC=0 opts out; about 420 MB on the ESP): upstream's
 #   musl-host rustc for the pinned nightly (fetched here, sha256 pinned below; payload never in git), librustc_driver stripped of
 #   debug info and the static symbol table (301 MB -> 232 MB; the dynamic tables and relocations are untouched), the musl
 #   rust-lld, the x86_64-unknown-linux-musl std rlibs of the SAME build (the host toolchain's when its commit matches, else the

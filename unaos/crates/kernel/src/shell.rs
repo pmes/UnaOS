@@ -1897,7 +1897,7 @@ fn parse_wallclock(args: &[&str]) -> Option<crate::clock::WallTime> {
 #[allow(clippy::type_complexity)]
 pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::DirEnt>), String> {
     use crate::fs::vfs::{DirEnt, NodeKind};
-    let mt = vfs_mount_table();
+    let mt = vfs_mount_table(); let orig = path; let ra = crate::fs::rootdisk::unalias(&mt, path); let path: &str = ra.as_deref().unwrap_or(path); // ROOTDISK (B390, R94): `/volumes/UnaOS/…` lists as `/…` (one directory, two paths)
     // VFS-4: a path naming a reserved volume that is not currently bound reports the VOLUME as
     // missing, not a bare -ENOENT off the native root. `ls` shares the guard the mutating `mount`
     // verb has had since VFS-4 rather than re-deriving it.
@@ -1977,7 +1977,7 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok((true, crate::fs::volumes::publish(path, rows))) // VOLUMES2 (B376, R89): `/volumes/boot` publishes `efi` only, one listing for ls, Quarry and the gate
+    Ok((true, crate::fs::rootdisk::present(orig, crate::fs::volumes::publish(path, rows)))) // VOLUMES2 (B376, R89): `/volumes/boot` publishes `efi` only, one listing for ls, Quarry and the gate
 }
 
 /// VFS-1 (adoption): render a [`DirEnt`](crate::fs::vfs::DirEnt)'s last-write stamp as the

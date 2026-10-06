@@ -10,8 +10,8 @@
 //!    256 MiB anonymous, touches one page per MiB and counts the resident pages with mincore (256, not 65536), PROT_NONE
 //!    reservations made RW in part, mprotect round trips keeping contents, MADV_DONTNEED re-zeroing, brk past the old 64 MiB,
 //!    and 160 MiB with EVERY page touched (40960 resident: past the 96 MiB heap share, into the user frame pool).
-//! 2. `TCC.LNX -static -o <home>hellop.lnx /apps/PRINTF.C` against musl staged under `/apps/LIB` (crt1.o crti.o crtn.o libc.a,
-//!    headers in /apps/LIB/include, tcc's own headers + libtcc1.a in /apps/LIB/tcc — the paths TCC.LNX is configured with), and
+//! 2. `TCC.LNX -static -o <home>hellop.lnx /apps/PRINTF.C` against musl staged under `/lib` (crt1.o crti.o crtn.o libc.a,
+//!    headers in /lib/include, tcc's own headers + libtcc1.a in /lib/tcc — the paths TCC.LNX is configured with), and
 //!    the output prints `hello printf from tcc+musl on unaos 42`.
 //!
 //! Witness: `:: SELFBUILD3: mmap=ok shared=ok anon_mib=256 resident_pages=<n> libc=musl tcc_libc=ok -> PASS ::`, plus
@@ -25,7 +25,7 @@ use core::sync::atomic::Ordering;
 
 pub const KAT3: &str = "/apps/SYSKAT3.LNX";
 pub const PRINTF_C: &str = "/apps/PRINTF.C";
-pub const LIBC_A: &str = "/apps/LIB/libc.a";
+pub const LIBC_A: &str = "/lib/libc.a";
 pub const PRINTF_LINE: &str = "hello printf from tcc+musl on unaos 42";
 
 fn exists(path: &str) -> Option<u64> {
