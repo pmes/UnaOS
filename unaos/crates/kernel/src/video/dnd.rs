@@ -71,6 +71,9 @@ pub enum Target {
     Desktop { dir: String },
     /// DRAGDROP2: a ring-3 program's window — the paths go to its input ring (`INPUT_EV_DROP` + `BUS_VERB_DROP_GET`).
     App { win: wm::WinId, owner: u64 },
+    /// DROPTYPES (B477): a ring-3 program's window whose program does not declare every dragged file's type
+    /// (`types` = how many distinct types it does not take): the ghost shows the refusal, the release delivers nothing.
+    Refused { win: wm::WinId, owner: u64, types: usize },
 }
 
 impl Target {
@@ -82,7 +85,7 @@ impl Target {
             Target::Trash => String::from("trash"),
             Target::Dock { key, .. } => alloc::format!("dock:{}", key),
             Target::Desktop { .. } => String::from("desktop"),
-            Target::App { owner, .. } => alloc::format!("app:{}", owner),
+            Target::App { owner, .. } | Target::Refused { owner, .. } => alloc::format!("app:{}", owner),
         }
     }
 }
@@ -98,6 +101,8 @@ pub enum Action {
     Open,
     /// DRAGDROP2: handed to a ring-3 program.
     Deliver,
+    /// DROPTYPES (B477): a ring-3 program that does not take the dragged types; nothing was delivered.
+    Refused,
 }
 
 impl Action {
@@ -109,6 +114,7 @@ impl Action {
             Action::Trash => "trash",
             Action::Open => "open",
             Action::Deliver => "deliver",
+            Action::Refused => "refused",
         }
     }
 }
@@ -182,6 +188,7 @@ pub(crate) fn arm_full(p: Payload, x: i32, y: i32, resolve: Resolver, ghost: boo
     if p.paths.is_empty() {
         return;
     }
+    *TYPES_MEMO.lock() = None; // DROPTYPES: a new drag asks each window afresh
     *S.lock() = Some(Session { p, x0: x, y0: y, started: false, resolve, ghost, spring, last: (x, y), sprung_from: None });
     crate::video::capture::begin(on_motion, on_release);
 }
@@ -236,9 +243,13 @@ fn on_motion(x: i32, y: i32) {
         let t = (s.resolve)(x, y, &s.p);
         (start, s.ghost, s.p.label.clone(), t)
     };
+    let refused = matches!(t, Some(Target::Refused { .. }));
     if ghost {
         if start {
+            GHOST_REFUSED.store(false, Ordering::Relaxed);
             ghost_open(&label, x, y);
+        } else if GHOST_REFUSED.load(Ordering::Relaxed) != refused {
+            ghost_refusal(refused, &label, x, y); // DROPTYPES: the ghost says the window will not take it
         } else {
             ghost_move(x, y);
         }
@@ -264,6 +275,11 @@ fn on_release(x: i32, y: i32) {
         serial_println!("[dnd] cancel why=no-target at=({},{})", x, y);
         return;
     };
+    if let Target::Refused { types, .. } = t {
+        *LAST.lock() = Some((Action::Refused, false));
+        serial_println!("[dnd] drop to={} action=refused reason=type-undeclared types={}", t.word(), types);
+        return;
+    }
     let (a, ok) = deliver(&s.p, &t, option_held());
     *LAST.lock() = Some((a, ok));
     serial_println!("[dnd] drop to={} action={} ok={}", t.word(), a.name(), ok as u8);
@@ -295,6 +311,7 @@ fn deliver(p: &Payload, t: &Target, option: bool) -> (Action, bool) {
             (Action::Open, true)
         }
         Target::App { owner, .. } => (Action::Deliver, ring3_deliver(*owner, &p.paths)),
+        Target::Refused { .. } => (Action::Refused, false),
         _ => crate::video::quarry::live::dragdrop::drop(p, t, option),
     }
 }
@@ -448,11 +465,9 @@ fn resolve_glass(x: i32, y: i32, p: &Payload) -> Option<Target> {
         return None;
     }
     if let Some((win, owner, _)) = wm::hit_test(x, y) {
-        #[cfg(target_arch = "x86_64")]
-        if crate::arch::x86_64::syscall::ring3_owner_live(owner) {
-            return Some(Target::App { win, owner });
+        if ring3_live(owner) {
+            return Some(match undeclared(owner, &p.paths) { 0 => Target::App { win, owner }, types => Target::Refused { win, owner, types } }); // DROPTYPES (B477): only a program that declares every type
         }
-        let _ = (win, owner);
         return None;
     }
     if !crate::video::desktopbuild::built() {
@@ -550,7 +565,7 @@ fn ring3_deliver(owner: u64, paths: &[String]) -> bool {
         let _ = ev;
         false // aarch64: no capture feeds a drag there yet, and DROP_GET has no arm (owed)
     };
-    serial_println!("[dnd] ring3 owner={} token={} n={} pushed={}", owner, token, n, pushed as u8);
+    serial_println!("[dnd] ring3 owner={} token={} n={} pushed={} types=declared", owner, token, n, pushed as u8);
     pushed
 }
 
@@ -574,4 +589,70 @@ pub fn bus_drop_get(owner: u64, body: &[u8], text: &mut Vec<u8>) -> i64 {
     text.extend_from_slice(&out[..n]);
     serial_println!("[dnd] ring3 get owner={} token={} n={}", owner, token, d.paths.len());
     0
+}
+
+// ── DROPTYPES (rmbp-ledger B477, MACPARITY row 18) ──────────────────────────────────────────────────────────────
+// A ring-3 window is a drop target only when its program DECLARES every dragged file's type: APPRES's `droptypes`
+// (the resource block's `una:droptypes`, read into `appres::App`), under the dock tile's one rule
+// (`dock::dnd_takes`: exact, `type/*`, `*/*`). Absent = takes nothing. Design:
+// `docs/dev/evidence/rmbp-1005/droptypes.md`.
+
+/// `(owner, first path, count, undeclared)` — the last answer, so a motion sample costs no type lookups.
+static TYPES_MEMO: Mutex<Option<(u64, String, usize, usize)>> = Mutex::new(None);
+/// Is the ghost showing the refusal now?
+static GHOST_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Is `owner` a live ring-3 program (not kernel furniture, not exited)?
+fn ring3_live(owner: u64) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return crate::arch::x86_64::syscall::ring3_owner_live(owner);
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = owner;
+        false
+    }
+}
+
+/// The drop types `owner`'s program declares: its armed name → the APPRES key → the registrant's `droptypes`.
+fn owner_droptypes(owner: u64) -> Vec<String> {
+    let mut b = [0u8; wm::MAX_TITLE];
+    let n = wm::app_name_of(owner, &mut b);
+    crate::fs::appres::key_of_title(&b[..n]).and_then(|k| crate::fs::appres::app(&k)).map(|a| a.droptypes).unwrap_or_default()
+}
+
+/// How many DISTINCT types of `mimes` the declaration `drops` does not take (0 = it takes them all).
+pub(crate) fn undeclared_of(drops: &[String], mimes: &[String]) -> usize {
+    let mut miss: Vec<&str> = Vec::new();
+    for m in mimes.iter() {
+        if !crate::video::dock::dnd_takes(drops, m) && !miss.iter().any(|x| x.eq_ignore_ascii_case(m)) {
+            miss.push(m.as_str());
+        }
+    }
+    miss.len()
+}
+
+/// [`undeclared_of`] for `owner`'s program over `paths`' types, memoised for the drag.
+fn undeclared(owner: u64, paths: &[String]) -> usize {
+    if let Some((o, f, c, n)) = TYPES_MEMO.lock().as_ref() {
+        if *o == owner && *c == paths.len() && paths.first() == Some(f) {
+            return *n;
+        }
+    }
+    let drops = owner_droptypes(owner);
+    let mt = crate::shell::vfs_mount_table();
+    let mimes: Vec<String> = paths.iter().map(|p| crate::fs::filetype::type_of_in(&mt, p).0).collect();
+    let n = undeclared_of(&drops, &mimes);
+    *TYPES_MEMO.lock() = Some((owner, paths.first().cloned().unwrap_or_default(), paths.len(), n));
+    n
+}
+
+/// The ghost on or off the refusal: reopened with `not accepted: <label>` (or the plain label) at the pointer.
+fn ghost_refusal(refused: bool, label: &str, x: i32, y: i32) {
+    GHOST_REFUSED.store(refused, Ordering::Relaxed);
+    ghost_close();
+    if refused {
+        ghost_open(&alloc::format!("not accepted: {}", label), x, y);
+    } else {
+        ghost_open(label, x, y);
+    }
 }
