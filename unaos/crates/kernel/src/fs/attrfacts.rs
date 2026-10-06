@@ -29,18 +29,18 @@ use alloc::vec::Vec;
 use crate::fs::filetype as ft;
 use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL};
 
-pub const WIDTH: &str = "media:width";
-pub const HEIGHT: &str = "media:height";
-pub const DURATION: &str = "media:duration_ms";
-pub const CODEC: &str = "media:codec";
-pub const TITLE: &str = "doc:title";
-pub const ANIMATED: &str = "image:animated";
+pub const WIDTH: &str = una_abi::attr_keys::MEDIA_WIDTH;
+pub const HEIGHT: &str = una_abi::attr_keys::MEDIA_HEIGHT;
+pub const DURATION: &str = una_abi::attr_keys::MEDIA_DURATION_MS;
+pub const CODEC: &str = una_abi::attr_keys::MEDIA_CODEC;
+pub const TITLE: &str = una_abi::attr_keys::DOC_TITLE;
+pub const ANIMATED: &str = una_abi::attr_keys::IMAGE_ANIMATED;
 /// The sniffed facts, in the order Get Info and the witness print them.
 pub const FACT_KEYS: [&str; 6] = [WIDTH, HEIGHT, DURATION, CODEC, TITLE, ANIMATED];
-pub const FACTS_MTIME: &str = "una:facts-mtime";
-pub const TIMES: &str = "una:attrtimes";
+pub const FACTS_MTIME: &str = una_abi::attr_keys::FACTS_MTIME;
+pub const TIMES: &str = una_abi::attr_keys::ATTRTIMES;
 /// The folder's chosen attribute columns, comma-separated (Be's `_trk` attribute; the seed of FOLDERVIEW B6).
-pub const VIEW: &str = "una:view";
+pub const VIEW: &str = una_abi::attr_keys::VIEW;
 
 /// A file at most this long is read whole; a longer one gives its head and tail (header facts, Ogg end granule).
 pub const READ_CAP: u64 = 4 << 20;

@@ -163,7 +163,7 @@ fn show(bytes: &[u8]) {
     let Some(recs) = mc::res_records(block) else { die("no resource block") };
     for (k, v) in recs {
         match std::str::from_utf8(v) {
-            Ok(s) if !k.starts_with("una:icon") => println!("{k} = {}", s.replace('\n', ", ")),
+            Ok(s) if !k.starts_with(midden_core::RES_KEY_ICON_PREFIX) => println!("{k} = {}", s.replace('\n', ", ")),
             _ => println!("{k} = <{} bytes>", v.len()),
         }
     }

@@ -2408,14 +2408,14 @@ fn store_load(dir: &str) -> Vec<Bond> {
         let mut have_key = false;
         for (k, val) in attrs {
             match (k.as_str(), val) {
-                ("bt.linkkey", AttrValue::Blob(x)) if x.len() == 16 => {
+                (una_abi::attr_keys::BT_LINKKEY, AttrValue::Blob(x)) if x.len() == 16 => {
                     b.key.copy_from_slice(&x);
                     have_key = true;
                 }
-                ("bt.keytype", AttrValue::Int(t)) => b.ktype = t as u8,
-                ("bt.class", AttrValue::Int(t)) => b.cod = t as u32,
-                ("bt.name", AttrValue::Str(s)) => b.name = s,
-                ("bt.hiddesc", AttrValue::Blob(x)) => b.desc = x,
+                (una_abi::attr_keys::BT_KEYTYPE, AttrValue::Int(t)) => b.ktype = t as u8,
+                (una_abi::attr_keys::BT_CLASS, AttrValue::Int(t)) => b.cod = t as u32,
+                (una_abi::attr_keys::BT_NAME, AttrValue::Str(s)) => b.name = s,
+                (una_abi::attr_keys::BT_HIDDESC, AttrValue::Blob(x)) => b.desc = x,
                 _ => {}
             }
         }
@@ -2443,15 +2443,15 @@ fn store_write(dir: &str, b: &Bond) {
         serial_println!(":: BTHID: store {} create/write REFUSED ({:?}) — the key is held in RAM for this session ::", p, e);
         return;
     }
-    let mut res = mt.set_attr(&p, "bt.linkkey", AttrValue::Blob(b.key.to_vec()), K);
+    let mut res = mt.set_attr(&p, una_abi::attr_keys::BT_LINKKEY, AttrValue::Blob(b.key.to_vec()), K);
     if res.is_ok() {
-        let _ = mt.set_attr(&p, "bt.keytype", AttrValue::Int(b.ktype as i64), K);
-        let _ = mt.set_attr(&p, "bt.class", AttrValue::Int(b.cod as i64), K);
+        let _ = mt.set_attr(&p, una_abi::attr_keys::BT_KEYTYPE, AttrValue::Int(b.ktype as i64), K);
+        let _ = mt.set_attr(&p, una_abi::attr_keys::BT_CLASS, AttrValue::Int(b.cod as i64), K);
         if !b.name.is_empty() {
-            let _ = mt.set_attr(&p, "bt.name", AttrValue::Str(b.name.clone()), K);
+            let _ = mt.set_attr(&p, una_abi::attr_keys::BT_NAME, AttrValue::Str(b.name.clone()), K);
         }
         if !b.desc.is_empty() && b.desc.len() <= crate::fs::vfs::ATTR_VALUE_MAX {
-            res = mt.set_attr(&p, "bt.hiddesc", AttrValue::Blob(b.desc.clone()), K);
+            res = mt.set_attr(&p, una_abi::attr_keys::BT_HIDDESC, AttrValue::Blob(b.desc.clone()), K);
         }
     }
     match res {

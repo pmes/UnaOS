@@ -17,6 +17,8 @@ description = "Midden core: the ring-neutral shell interpreter — one command t
 # today — the feature is the seam, declared now so the kernel's
 # `default-features = false` spelling is honest rather than decorative.
 [dependencies]
+# ATTRKEYS (B452): the RES_KEY_* names alias una-abi's one attribute-key registry (no deps, no code).
+una-abi = { path = "../../../crates/una-abi" }
 
 [features]
 default = ["std"]

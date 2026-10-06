@@ -19,10 +19,10 @@ use alloc::vec::Vec;
 use crate::fs::filetype as ft;
 use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL};
 
-pub const OPENER_KEY: &str = "una:opener";
-pub const ICON_KEY: &str = "una:icon";
-pub const NAME_KEY: &str = "una:name";
-pub const PREFERRED_KEY: &str = "una:preferred";
+pub const OPENER_KEY: &str = una_abi::attr_keys::OPENER;
+pub const ICON_KEY: &str = una_abi::attr_keys::ICON;
+pub const NAME_KEY: &str = una_abi::attr_keys::NAME;
+pub const PREFERRED_KEY: &str = una_abi::attr_keys::PREFERRED;
 /// The type database's directory on the root volume.
 pub const TYPES_DIR: &str = "/system/types";
 

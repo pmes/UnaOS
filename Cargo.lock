@@ -3115,6 +3115,9 @@ dependencies = [
 [[package]]
 name = "midden_core"
 version = "0.1.0"
+dependencies = [
+ "una-abi",
+]
 
 [[package]]
 name = "mime"
@@ -5708,6 +5711,7 @@ dependencies = [
  "syn 3.0.6",
  "tempfile",
  "tokio",
+ "una-abi",
  "unafs",
  "vein_core",
 ]

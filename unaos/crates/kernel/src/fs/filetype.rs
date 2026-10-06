@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL};
 
 /// The type attribute's key.
-pub const TYPE_KEY: &str = "una:type";
+pub const TYPE_KEY: &str = una_abi::attr_keys::TYPE;
 
 pub const TEXT_PLAIN: &str = "text/plain";
 pub const IMAGE_PNG: &str = "image/png";

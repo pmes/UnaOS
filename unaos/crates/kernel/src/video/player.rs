@@ -182,11 +182,11 @@ fn mmss(ms: u64) -> String {
 fn attr_facts(path: &str) -> (Option<u64>, Option<String>) {
     use crate::fs::vfs::{AttrValue, KERNEL_PRINCIPAL};
     let mt = crate::shell::vfs_mount_table();
-    let d = match mt.get_attr(path, "media:duration_ms", KERNEL_PRINCIPAL) {
+    let d = match mt.get_attr(path, crate::fs::attrfacts::DURATION, KERNEL_PRINCIPAL) {
         Ok(AttrValue::Int(v)) if v > 0 => Some(v as u64),
         _ => None,
     };
-    let c = match mt.get_attr(path, "media:codec", KERNEL_PRINCIPAL) {
+    let c = match mt.get_attr(path, crate::fs::attrfacts::CODEC, KERNEL_PRINCIPAL) {
         Ok(AttrValue::Str(s)) if !s.is_empty() => Some(s),
         _ => None,
     };
