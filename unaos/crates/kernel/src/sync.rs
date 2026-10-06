@@ -19,6 +19,7 @@ pub struct Mutex<T: ?Sized> {
     raw: spin::Mutex<()>,
     site: &'static Location<'static>,
     /// The order class (1-based index of `site` in the registry's class table; 0 = not yet seen).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // aarch64: the wrapper only (no registry)
     class: core::sync::atomic::AtomicU16,
     data: UnsafeCell<T>,
 }
@@ -29,6 +30,7 @@ unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
 /// The held lock. `R` only mirrors spin's relax parameter so `MutexGuard<'_, T, spin::relax::Spin>` reads as before.
 pub struct MutexGuard<'a, T: ?Sized + 'a, R = spin::relax::Spin> {
     /// The registry entry this hold occupies (`u16::MAX` = untracked). Released in `Drop`, BEFORE `_raw`.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // aarch64: the wrapper only (no registry)
     slot: u16,
     _raw: spin::MutexGuard<'a, ()>,
     data: *mut T,
@@ -56,6 +58,7 @@ impl<T: ?Sized> Mutex<T> {
         MutexGuard { slot, _raw: raw, data: self.data.get(), _p: PhantomData }
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // aarch64: the wrapper only (no registry)
     #[inline]
     fn addr(&self) -> usize {
         &self.raw as *const spin::Mutex<()> as usize
