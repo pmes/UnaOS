@@ -893,7 +893,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // monotonic form needs `calib` (step 4b''') behind it — earlier and the honest reading would
         // be the `?ms` form, which passes but proves less.
         #[cfg(all(feature = "witness", feature = "logts"))]
-        unaos_kernel::logts::logwit1();
+        unaos_kernel::tests::register("logwit", unaos_kernel::logts::logwit1); // BOOTVERDICTS (B472, R80): `tests logwit`, never at boot
 
         // SNTP-X86 GATE (witness battery): the deterministic x86 SNTP client battery — canned datagrams
         // through the shared parser + the `crate::clock` anchor path, no NIC/network required. Proves x86

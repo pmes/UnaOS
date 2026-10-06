@@ -41,7 +41,7 @@ static SOURCES_DONE: AtomicU32 = AtomicU32::new(0);
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 /// Called by the verdict tap for every fixture verdict line.
-pub fn tally(pass: bool) {
+pub fn tally(pass: bool) { if !ANNOUNCED.load(Ordering::Relaxed) { BOOT_VERDICTS.fetch_add(1, Ordering::Relaxed); }
     if pass { PASS.fetch_add(1, Ordering::Relaxed); } else {
         FAIL.fetch_add(1, Ordering::Relaxed);
         // TESTFIX2 — remember WHICH fixture failed (the one `run` is executing), de-duplicated, for the summary line.
@@ -156,7 +156,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
-    crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
@@ -463,4 +463,30 @@ pub fn arg() -> Option<alloc::string::String> { ARG.lock().clone() }
 fn ensure_volumes() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) { register("volumes", crate::fs::volumes::selftest); register("testf", crate::fs::volumes::testf_selftest); register("rootdisk", crate::fs::rootdisk::selftest); register("bootfat", crate::fs::bootfat::selftest); register("bootfatseam", crate::fs::bootfat::bootfatseam_selftest); }
+}
+
+// BOOTVERDICTS (rmbp-ledger B472, R80) — TAIL-APPENDED. A verdict word before the deferred line is a test
+// that ran at boot. `tally` (the verdict tap's own count) counts every `-> PASS|FAIL` printed before the
+// `TESTS: deferred` announce; `tests verdicts` reports it beside what this arc moved and reworded. The host
+// twin is `unaos/scripts/verdictwords.py` (GATE-VERDICTWORDS) over the bench wire.
+static BOOT_VERDICTS: AtomicU32 = AtomicU32::new(0);
+/// Tags moved behind `tests` by BOOTVERDICTS: the 14-tag U7x ladder (`ladder`), LOGWIT-1 (`logwit`),
+/// SERWIT-2 (`serwit2`), DIMIDLE (`dimidle`).
+const VERDICTS_MOVED: u32 = 17;
+/// Arming lines reworded off PASS/FAIL: USBNET-EHCI SPLASH AHCI UNAFSX86 PREFS FIRSTBOOT DOCKPIN KFONTPPI
+/// XHCIHUB (flight 25) + WINDOWCAP USBNET HDA (flight 24's login-screen boot).
+const VERDICTS_REWORDED: u32 = 12;
+
+fn ensure_bootverdicts() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) { register("verdicts", verdicts_selftest); }
+}
+
+/// `tests verdicts`: how many verdict lines printed before the deferred line on THIS boot.
+pub fn verdicts_selftest() {
+    let n = BOOT_VERDICTS.load(Ordering::Relaxed);
+    serial_println!(
+        ":: VERDICTS: before_deferred={} moved={} reworded={} -> {} ::",
+        n, VERDICTS_MOVED, VERDICTS_REWORDED, if n == 0 { "PASS" } else { "FAIL" }
+    );
 }

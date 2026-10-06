@@ -16336,7 +16336,7 @@ pub fn u6bx_probe_once() {
     // U7x rides the SAME main-loop call sites as this probe (chained here, in-lane, rather than adding a
     // new hook in main.rs): each pass gives the U7x probe its own storage/AP-gated one-shot attempt; the
     // launchers' `U6BX_LAUNCH_DONE` gate orders the demos regardless of which probe fires first.
-    u7x_probe_once();
+    ladder_arm();
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.load(Ordering::Relaxed) || !crate::boot::services_gate("ring3-probes") { // INSTALLBARE (R86): the ring-3 probe ladder (U5x/U7x/U8x/U9x, the SOCK-2/3/4 chain) waits for the Desktop's services. SAME-LINE fold.
         return;
@@ -23545,7 +23545,7 @@ fn u11m2_launcher(demo_cpu: usize) {
     #[cfg(feature = "irqstorage")]
     s6_witness_launcher(demo_cpu);
     // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
-    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor2_mv_launcher(demo_cpu); #[cfg(feature = "witness")] lfnmv_launcher(); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); crate::bus::attr::selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
+    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor2_mv_launcher(demo_cpu); #[cfg(feature = "witness")] lfnmv_launcher(); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); crate::bus::attr::selftest(); busx86_stamp_check(); LADDER_DONE.store(true, Ordering::Release); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
 }
 
 /// Build a U6x fixture slot at a given entry symbol — the `u7x_build`/`u11m2_build` shape (allocate a private
@@ -30581,4 +30581,44 @@ fn sys_ringkey(op: u64, a1: u64, a2: u64) -> i64 {
 /// test for a ring-3 window as a drop target (`video::dnd`): kernel furniture and exited apps are not.
 pub fn ring3_owner_live(owner: u64) -> bool {
     owner != 0 && owner < 64 && appquit_pid(owner).is_some()
+}
+
+// =====================================================================================================
+// BOOTVERDICTS (rmbp-ledger B472, R80) — TAIL-APPENDED. THE U7x LADDER IS A TEST, NOT A BOOT STEP.
+// =====================================================================================================
+//
+// `u6bx_probe_once` used to call `u7x_probe_once` as its FIRST statement — above the INSTALLBARE services
+// gate — so the one-task chain U7x -> U8x -> U9x -> U10/U10c/U10d -> U11x -> CFU2-WGATE -> U11m2 -> U6gx ->
+// STOR1/2 -> LFNMV -> BUSX86-WR/EQ -> BANDY-CODEC/ATTR -> APPMENU -> BUSX86-STAMP printed 22 verdict lines
+// under the set-password screen on flight 25 (f25-boots.log 486..538). The call site now REGISTERS the
+// ladder (`tests ladder`); under `tests-at-boot` (the QEMU lanes) `register` runs it at the old site, in
+// the old order, without waiting (the main loop is the caller there).
+
+/// Set by the chain's last statement (after `busx86_stamp_check`); a declined rung never reaches it, so
+/// the fixture's wait is bounded.
+pub static LADDER_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The call site's one-shot: register `tests ladder` (R80 — nothing tests at boot).
+fn ladder_arm() {
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    if !ARMED.swap(true, Ordering::AcqRel) {
+        crate::tests::register("ladder", ladder_selftest);
+    }
+}
+
+/// `tests ladder`: fire the U7x chain once per boot (its rungs hold one-shot slots and gates) and wait,
+/// bounded, for its last line.
+pub fn ladder_selftest() {
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    if FIRED.swap(true, Ordering::AcqRel) {
+        serial_println!(":: LADDER: skipped reason=once-per-boot (the U7x..APPMENU chain's rungs are one-shot) ::");
+        return;
+    }
+    u7x_probe_once();
+    if cfg!(feature = "tests-at-boot") { return; }
+    let dl = crate::arch::ticks() + 30_000;
+    while !LADDER_DONE.load(Ordering::Acquire) && crate::arch::ticks() < dl {
+        crate::arch::sched::sleep_ms(10);
+    }
+    serial_println!(":: LADDER: chain_done={} ::", LADDER_DONE.load(Ordering::Acquire));
 }
