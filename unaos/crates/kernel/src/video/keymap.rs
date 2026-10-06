@@ -488,3 +488,9 @@ pub fn note_mods(m: u8) {
 pub fn shift_held() -> bool {
     HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & HID_MOD_SHIFT != 0
 }
+
+/// DRAGDROP (B440) — is Option down per the latest HID report (either side)? Option is physically `HID_MOD_ALT`
+/// on both shipped tables; a drag reads it at the drop (Option forces a copy).
+pub fn option_held() -> bool {
+    HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & HID_MOD_ALT != 0
+}

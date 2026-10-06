@@ -1231,3 +1231,6 @@ pub fn notify(app: &[u8], title: &[u8], line: &[u8], label: &[u8], act: u8, arg:
     #[allow(unreachable_code)]
     false
 }
+// DRAGDROP (B440, MACPARITY row 18): the WM drag session (rides PREFSUI's capture; Quarry and the dock participate). At the tail so no line above moves.
+#[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub mod dnd;
