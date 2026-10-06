@@ -13738,7 +13738,7 @@ impl XhciController {
                 SPACE_FTDI_N.fetch_add(1, Ordering::Relaxed);
             }
             match tx {
-                Ok(1) | Ok(13) => self.ftdi_tx_total += n as u64,
+                Ok(1) | Ok(13) => { self.ftdi_tx_total += n as u64; #[cfg(feature = "usbnet")] usbnet::ftdi_beat(); }
                 Ok(_) => {
                     self.disable_ftdi_tx("bad completion code");
                     return true;
