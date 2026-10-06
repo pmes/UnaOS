@@ -3083,7 +3083,7 @@ fn lp_arm(t: usize, owner: u64) {
 pub fn lp_release() { LP_OWNER.store(0, Ordering::Release); }
 /// Poll from the input-drain task: after [`LONGPRESS_MS`] of hold the menu opens. Returns true when it did.
 pub fn lp_service(now_ms: u64) -> bool {
-    dock2_service(now_ms); // DOCK2 (B394): the launch pulse and its bound, auto-hide's reveal
+    dock2_service(now_ms); pin_timeout_service(now_ms); // HIDSTALL (B485): DOCKRELEASE. DOCK2 (B394): the launch pulse and its bound, auto-hide's reveal
     let o = LP_OWNER.load(Ordering::Acquire);
     if o == 0 || now_ms.wrapping_sub(LP_T0.load(Ordering::Relaxed)) < LONGPRESS_MS { return false; }
     LP_OWNER.store(0, Ordering::Release);
@@ -4314,7 +4314,7 @@ fn pin_press_defer(r: &wm::DockEntry, x: i32, y: i32) -> bool {
     let Some(i) = (0..DP_PINS.len()).find(|&i| DP_PINS[i].id == r.id) else { return false };
     PIN_X0.store(x, Ordering::Relaxed); PIN_Y0.store(y, Ordering::Relaxed);
     PIN_DRAG.store(false, Ordering::Relaxed);
-    PIN_IX.store(i as u32, Ordering::Release);
+    PIN_T0.store(crate::arch::ms().max(1), Ordering::Relaxed); PIN_IX.store(i as u32, Ordering::Release); // HIDSTALL (B485): the press time the release timeout reads
     crate::video::capture::begin(pin_motion, pin_release);
     serial_println!("[dock] press at ({},{}) app={} -> armed (launches on release)", x, y, DP_PINS[i].name);
     true
@@ -4486,4 +4486,39 @@ pub(crate) fn dnd_app_hover(tile: wm::WinId) {
     if DND_APP.swap(v, Ordering::AcqRel) != v {
         PASS_OWED.store(true, Ordering::Release);
     }
+}
+
+// ── HIDSTALL (rmbp-ledger B485): DOCKRELEASE ─────────────────────────────────────────────────────────────────────────
+//
+// Flight 26: `[dock] press … app=console -> armed (launches on release)` and the release never came (a halted or
+// late pointer button; boot 3's came 3 s later as a drag), so the Dock launched nothing until the power dialog's
+// capture swap delivered a synthetic one. A pin press that has seen neither its release nor travel past
+// `PIN_DRAG_PX` within `hidstall::DOCK_RELEASE_TIMEOUT_MS` is a click: the capture is let go and the launch is taken
+// here, on the service pass (`lp_service`, the same pass that opens the hold menu). A press that has travelled stays
+// a drag and waits for its release. The CAS on `PIN_IX` makes the release and the timeout take the press once.
+
+static PIN_T0: AtomicU64 = AtomicU64::new(0);
+
+fn pin_timeout_service(now: u64) {
+    let i = PIN_IX.load(Ordering::Acquire);
+    if i == u32::MAX || PIN_DRAG.load(Ordering::Relaxed) {
+        return;
+    }
+    let t0 = PIN_T0.load(Ordering::Relaxed);
+    if t0 == 0 || now.saturating_sub(t0) < crate::hidstall::DOCK_RELEASE_TIMEOUT_MS {
+        return;
+    }
+    if PIN_IX.compare_exchange(i, u32::MAX, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    crate::video::capture::cancel();
+    let (x, y) = (PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed));
+    PIN_BYPASS.store(true, Ordering::Release);
+    let ok = press_at(x, y);
+    PIN_BYPASS.store(false, Ordering::Release);
+    crate::hidstall::note_dock_timeout();
+    serial_println!(
+        "[dock] press at ({},{}) app={} release=timeout after_ms={} -> {}",
+        x, y, DP_PINS[i as usize].name, now.saturating_sub(t0), if ok { "launched" } else { "declined" }
+    );
 }

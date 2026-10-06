@@ -88,6 +88,23 @@ pub fn note_sec(hid_gap_ms: u64, keyq_ms: u64) {
     KEYQ_MAX_MS.fetch_max(keyq_ms, Relaxed);
 }
 
+/// Microseconds on a clock that runs through a masked span (the TSC on x86; the tick clock elsewhere).
+pub fn now_us() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let hz = crate::arch::x86_64::apic::tsc_hz();
+        if hz >= 1_000_000 {
+            return crate::arch::now_cycles() / (hz / 1_000_000);
+        }
+    }
+    crate::arch::ms().saturating_mul(1000)
+}
+
+/// One UnaFS transaction attempt began at `t0_us` ([`now_us`]) and its IRQ-masked span just ended.
+pub fn note_masked_since(t0_us: u64) {
+    note_masked(now_us().saturating_sub(t0_us) / 1000);
+}
+
 /// One UnaFS transaction attempt's IRQ-masked span (ms).
 pub fn note_masked(ms: u64) {
     SEC_MASKED_MS.fetch_max(ms, Relaxed);

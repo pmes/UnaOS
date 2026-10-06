@@ -897,7 +897,7 @@ pub fn with_unafs<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, Moun
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        match { let t_mask = crate::arch::ms(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked(crate::arch::ms().saturating_sub(t_mask)); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
+        match { let t_mask = crate::hidstall::now_us(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked_since(t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
