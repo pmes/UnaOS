@@ -104,7 +104,7 @@ fn testf_webm_vorbis_sound() {
 /// SEEKTABLE2 (rmbp-ledger B469): Opus inside WebM — the kernel's `vplay::container_audio` chain on the host. TEST.OPUS's
 /// packets (read by audio_core's Ogg reader) go into a WebM (`A_OPUS`, CodecPrivate = the OpusHead) by this crate's
 /// writer, come back out of `Demuxer` as the audio track, and decode through `audio_core::opus::OpusPackets`: the PCM is
-/// TEST.OPUS's own Ogg decode, sample for sample (the Ogg end trim aside: Matroska DiscardPadding is OWED).
+/// TEST.OPUS's own Ogg decode, sample for sample (the Ogg end trim aside here: DiscardPadding is VPLAYAUDIO's, audio_core/tests/vplayaudio_kat.rs).
 #[test]
 fn testf_webm_opus_sound() {
     use audio_core::io::{ByteStream, VecReader};
