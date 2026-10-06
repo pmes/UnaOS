@@ -172,6 +172,8 @@ def check(root, baseline_path=None, flagged_only=False, emit_baseline=False):
             errs.append("%s: unflown carries no flight (it names %s)" % (where, fl))
         if line and not fl and st != "unflown":
             errs.append("%s: a quoted line needs its flight" % where)
+        if line and len(line.strip()) < 20:  # GATEREVIEW F6: `[` is in every capture; a quote must identify a line
+            errs.append("%s: quoted line '%s' is under 20 characters — quote the whole wire line" % (where, line))
         if line and fl:
             n = int(fl[1:])
             if n not in cache:
@@ -248,6 +250,7 @@ def selftest():
         ("cites missing row", ok_row, "open — flew ST9", 1, "not a row"),
         ("enum head is no claim", ok_row, "fixed-unflown — built", 0, None),
         ("bad status", "ST1\tc\tsettled\t\t\ts\t\n", "open", 1, "not in"),
+        ("vacuous short quote", "ST1\tc\tconfirmed\tf7\t[\ts\tB1\n", "open", 1, "under 20"),
         ("baseline grandfathers", ok_row, "open — flew once", 0, None, "rmbp-ledger.md B1"),
         ("baseline stale once cited", ok_row, "open — flew ST1", 1, "stale", "rmbp-ledger.md B1"),
     ]
