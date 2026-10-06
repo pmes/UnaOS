@@ -1746,3 +1746,13 @@ mod window2_tests {
         std::println!(":: WINDOW2-ABI: bytes={} kdf_m_kib={} alloc={} -> PASS ::", USER_WINDOW_BYTES, WINDOW2_KDF_M_KIB, WINDOW2_ALLOC_BYTES);
     }
 }
+
+// =================================================================================================
+// SETTINGSFILES (rmbp-ledger B407, R98): a program declares its own settings stanza (`app.<name>.*`,
+// stored in `<home>/settings/<name>`). Body: `<name>` NUL then `<key>\t<spec>\t<default literal>\t<doc>`
+// lines (prefs_core::declare). Kernel-fulfilled beside PREF_GET/SET/LIST; -EACCES outside the session,
+// -EINVAL malformed. Appended at the file tail.
+// =================================================================================================
+
+/// Bus verb: declare a program's settings stanza.
+pub const BUS_VERB_PREF_DECLARE: u8 = 20;

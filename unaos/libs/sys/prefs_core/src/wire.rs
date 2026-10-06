@@ -36,6 +36,8 @@ pub const VERB_GET: u8 = 16;
 pub const VERB_SET: u8 = 17;
 pub const VERB_LIST: u8 = 18;
 pub const VERB_CHANGED: u8 = 19;
+/// SETTINGSFILES (B407, R98): a program declares its `app.<name>.*` stanza (body: [`crate::declare::body`]).
+pub const VERB_DECLARE: u8 = 20;
 /// una-abi `BUS_BODY_MAX`: the reply ceiling.
 pub const BODY_MAX: usize = 4096;
 
@@ -65,6 +67,10 @@ pub trait Store {
     fn list(&self, ns: &str) -> Vec<(String, PrefValue)>;
     /// Every namespace holding a value, sorted.
     fn namespaces(&self) -> Vec<String>;
+    /// SETTINGSFILES (B407): adopt a program's declared stanza. A store with no `app` registry refuses.
+    fn declare(&mut self, _name: &str, _keys: Vec<crate::declare::DeclKey>) -> i64 {
+        EINVAL
+    }
 }
 
 /// `<ns>.<key>` (the bus's and the `pref` verb's address form), both halves validated.
@@ -201,6 +207,11 @@ pub fn fulfil(store: &mut dyn Store, verb: u8, body: &[u8], in_session: bool, ou
                     0
                 }
             }
+            None => EINVAL,
+        },
+        VERB_DECLARE => match crate::declare::parse(body) {
+            Some((name, keys)) if in_session => store.declare(&name, keys),
+            Some(_) => EACCES,
             None => EINVAL,
         },
         _ => EINVAL,
