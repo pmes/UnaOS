@@ -174,3 +174,5 @@ pub mod bootstep;
 pub mod unafsgrow;
 /// VOLUMES (B366): the Volumes view (`/volumes/boot`, `/volumes/UnaOS`), `tests volumes`, `system/test-f` and `tests testf`.
 pub mod volumes;
+/// USBSTOR (B384, R95): a removable disk is mounted under `/volumes` when it attaches and dropped when it leaves.
+pub mod removable;

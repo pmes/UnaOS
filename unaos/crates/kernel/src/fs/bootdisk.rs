@@ -775,7 +775,7 @@ pub(crate) fn sanitize_label(raw: &[u8; 11]) -> (String, bool) {
 /// so it is not `altered` and it does not reach the witness's `label_raw=`.
 /// Returns `(unique name, full point)` — BOTH, from the one value, so the witness and the mount
 /// cannot come to disagree about what this volume is called.
-fn next_volume_point(used: &mut Vec<String>, name: &str) -> (String, String) {
+pub(crate) fn next_volume_point(used: &mut Vec<String>, name: &str) -> (String, String) {
     let mut candidate = String::from(name);
     let mut n = 0u32;
     while used.iter().any(|u| u == &candidate) {
@@ -1378,7 +1378,7 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     let announce =
         s.root.is_some() && !MOUNTS_ANNOUNCED.swap(true, core::sync::atomic::Ordering::Relaxed);
 
-    for h in s.others.iter() {
+    crate::fs::removable::bind(mt); for h in s.others.iter().filter(|h| !crate::fs::removable::owns(h.source)) { // USBSTOR (B384, R95): a USB disk is mounted by `fs::removable` from the LIVE registry (attach and detach), never from this boot-time cache. ⚠ LINE-NEUTRAL fold.
         // The backend's volume NAME is the point's unique leaf, so `same_volume` answers about the
         // mount a person can see rather than about a bus the path no longer names.
         //
