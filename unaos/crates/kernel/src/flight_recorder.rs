@@ -569,7 +569,7 @@ pub fn service() {
     // this arc's lane owns. It is a few relaxed atomic loads on the idle path and prints nothing at all
     // when no tap has lost anything. It must precede the `block::info()` early return, or a machine
     // with no storage would never announce.
-    crate::serial_ring::mirror_service();
+    crate::serial_ring::mirror_service(); #[cfg(target_arch = "x86_64")] crate::fs::removable::service(); // USBSTOR (B384): pin the boot medium, then mount/unmount removable disks on a registry change — unmasked, lock-free, ahead of the storage gate (a machine whose only disk is the internal card has no global slot).
 
     if crate::drivers::block::info().is_none() {
         return; // storage not up yet — nothing to flush to
