@@ -2604,3 +2604,53 @@ says the same on the host. Shaped as one leg for GATE-ARCH (arch-check.py) to ab
 
 **Go-red.** `--selftest`: a planted `"media:planted"` fails; baselined it passes; a stale baseline row fails; an
 unparsable row and a scope under its floor are exit 2; a literal inside a `//` comment is not a finding.
+
+## GATEFIX — the seven gate arcs GATEREVIEW left unbuilt (B476, 2026-10-06)
+
+**The holes.** `docs/dev/review/GATES-2026-10-06.md` planted 25 defects; seven passed a gate and were named as arcs:
+V1 (a table word whose only arm is an INNER match arm), C1 (a headerless file in a new kernel directory), C6
+(`kernel-by-ruling R999`), S2 (a quote found only in FLIGHT<N>.md prose while the flight has a log), S4 (a cell
+saying "verified on metal … PASS on flight 24"), S6 (a hand-typed `f24-boot9.log`) and the Orin captures outside
+the `f<N>` model. Each fix lives in the gate that owns the property. Design and the seat's corrections:
+`docs/dev/evidence/rmbp-1005/gatefix.md`.
+
+**VERBDEPTH (GATE-VERBS, `unaos/scripts/verb-roots.sh`).** ARMS = the `"w" =>` patterns at brace depth 1 of
+`dispatch_command`'s `match command {`, read by a char scanner that skips strings, raw strings, char literals and
+nested comments. Control (exit 2): the synthetic `"zz-outer-arm" => match x { "zz-inner-arm" => … }` must yield the
+outer arm and not the inner. Go-red: `("gored", Avail::Always)` with only `match q { "gored" => {} … }` inside an arm:
+`RED — in HOST_VERBS with NO dispatch arm … gored`, exit 1. Clean: 103/103.
+
+**CHARTERSCOPE (GATE-CHARTER, `unaos/scripts/charter-check.sh`).** Scope = every `crates/kernel/src/**/*.rs` (345).
+A file passes with a CHARTER header, a `charter.registry` row, or a row of `unaos/scripts/charter-scope.baseline` (138
+files outside the first cut's directories with no header on 2026-10-06; SHRINK-ONLY: a row whose file is gone or now
+declares fails as stale; a new file never gets a row). The header test is fork-free bash (10 s → 0.7 s). `--selftest`
+plants C1 (`desktop/notes.rs`, headerless: exit 1), a declared file (exit 0) and a stale row (exit 1); exit 0 when all
+three behave, 2 otherwise. Control: scope ≥ 300 files.
+
+**SEAMCITE2 (GATE-ARCH seamcite, `unaos/scripts/arch-check.py`).** Every `R<n>`/`B<n>` on a `kernel-by-ruling` or
+`owed` CHARTER line, and in an owed/kernel-by-ruling `charter.registry` row, must resolve: `R<n>` a `| R<n> |` row of
+`docs/dev/RULINGS.md`, `B<n>` a row of `docs/dev/LEDGER.md` or `docs/dev/OS/*-ledger.md`; else
+`seamcite|<file>|<id>` (new key, never baselined). `--docs <docs/dev>`: an executor's worktree lags the seat's ledger
+(the seat holds B-rows outside worktrees), so an executor points it at `/home/user/UnaOS/docs/dev`. Control (exit 2):
+≥ 50 rulings and ≥ 100 B rows parse. Selftest: `R999` and `B9999` are findings, `R1 B2`/`B1` resolve.
+
+**STATUSWORDS, STATUSWIRE, CAPTUREPIN, STATUSORIN (GATE-STATUS, `tools/status-check.py`).**
+- WORDS also reads `verified on (the) metal`, `PASS(ED) on (the / its first) metal`, `PASS(ED)(,) (on) flight N`.
+- A flight that has a capture LOG is quoted from the log; a quote found only in its FLIGHT md is `line NOT on the wire
+  … (it is in the FLIGHT prose only — quote the log line)`. A flight with no log (11; 3–7) is still read from its md.
+- T6: a capture log (`f<N>-boot*.log`, Orin `render<N>-*.log` / `boot-render<N>-*.log`) is wire only when
+  `docs/dev/evidence/CAPTURES.pin` holds its sha256 and size. Unpinned or edited: failure; a pin naming no log: stale.
+  The bench's one writer is `unaos/scripts/capture-pin.sh <dest> <bench log>…` (joins rotated logs in order, refuses
+  a non-capture name, a second pin, a differing existing file). 36 captures pinned at the cut as
+  `by=gatefix-grandfather`.
+- Flight `r<N>` (`r3b` for render3b) is Orin render N: `orin*/**/render<N>-*.log`, `boot-render<N>-*.log`,
+  `FLIGHT-RESULT-render<N>.md`.
+`--selftest` 22/22: S2, S4 (both word forms), S6, a log edited after its pin, a stale pin, an r8 quote (pass), an r8
+line in no log, `r3` not reading `render3b`, and a no-log flight read from its md (pass).
+
+**Go-red on the seat's tree.** 15 findings (13 ledger cells, ST181, ST236); with the corrections in gatefix.md applied
+to a copy: `rows=357 … claiming-uncited=0 -> PASS`, exit 0.
+
+**What it does not do.** A hand-typed pin row is still possible (it lacks `by=capture-pin` and a bench `src=`; review
+reads it). VERBDEPTH reads the depth of braces, not the meaning of an arm (a `"w" if guard =>` is not an arm at all).
+CHARTERSCOPE's 138 grandfathers declare nothing yet; they only stop the count growing.
