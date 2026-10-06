@@ -1209,3 +1209,6 @@ pub mod bezel;
 // PANICSCREEN (B406, MACPARITY row 37, R95): the plain panic screen, the panic log, the restart. At the tail so no line above moves.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod panicscreen;
+// SETTINGSFILES (B407, R98): the Settings panel's `Stored in settings/<domain>` link and Quarry's Show Info pane for a settings file. Same gate as settings; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod settingsfiles;

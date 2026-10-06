@@ -1763,8 +1763,7 @@ pub const APP_RES_SECTION: &str = ".note.unaos.res";
 /// The resource note's type (owner "UnaOS", like APP_NOTE_TYPE's).
 pub const APP_RES_NOTE_TYPE: u32 = 2;
 
-// =================================================================================================
-// DIALOG2 (rmbp-ledger B404) — a ring-3 program raises its OWN alert, sheet or toast, and hears the answer.
+// ==========================================================================================// DIALOG2 (rmbp-ledger B404) — a ring-3 program raises its OWN alert, sheet or toast, and hears the answer.
 // Appended at the file tail so no existing line moves.
 // =================================================================================================
 
@@ -1862,3 +1861,15 @@ mod dialog2_tests {
         assert_eq!(dialog_answer_pack(7, 2) & 0xFFFF, 0x0702);
     }
 }
+=======
+
+// =================================================================================================
+// SETTINGSFILES (rmbp-ledger B407, R98): a program declares its own settings stanza (`app.<name>.*`,
+// stored in `<home>/settings/<name>`). Body: `<name>` NUL then `<key>\t<spec>\t<default literal>\t<doc>`
+// lines (prefs_core::declare). Kernel-fulfilled beside PREF_GET/SET/LIST; -EACCES outside the session,
+// -EINVAL malformed. Appended at the file tail.
+// =================================================================================================
+
+/// Bus verb: declare a program's settings stanza.
+pub const BUS_VERB_PREF_DECLARE: u8 = 23; // 20..=22 are DIALOG2's dialog/sheet/toast; renumbered at merge17
+const _: () = assert!(BUS_VERB_PREF_DECLARE > BUS_VERB_TOAST && BUS_VERB_PREF_DECLARE < BUS_VERB_REGISTER);

@@ -351,7 +351,7 @@ pub fn request_open() {
 
 /// Drain the open latch and load the store once per login. Chained from `quarry::live::service`.
 pub fn service() {
-    crate::prefs::service(); super::loginitems::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
+    crate::prefs::service(); super::loginitems::service(); super::settingsfiles::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
     if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
@@ -465,6 +465,11 @@ fn paint(st: &mut State, v: &Values) {
         2 => paint_display(st, v),
         4 => paint_login(st),
         _ => paint_about(st),
+    }
+    // SETTINGSFILES (B407, R98): the pane's file, as a link that reveals `<home>/settings` in Quarry.
+    if let Some((r, x, t)) = super::settingsfiles::footer(v.tab as usize, ROWS, WIN_W, LABEL_X) {
+        let fc = super::metrics::lcell_h(face);
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - fc) / 2, t.as_bytes(), theme::ACCENT, false, face);
     }
     if !st.strip && matches!(v.tab, 0 | 2) {
         let r = row_of(st.sel);
@@ -982,6 +987,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
     }
     if cy < TOP { return true; }
     let row = (cy - TOP) / ROW_H;
+    if !STATE.lock().as_ref().is_some_and(|s| s.modes_open) && super::settingsfiles::press(cur_tab(), row, cx, ROWS, WIN_W, LABEL_X) { return true; } // SETTINGSFILES (B407): the pane's `Stored in settings/<domain>` link
     match cur_tab() {
         0 => press_general(row, cx),
         1 => press_users(row, cx),

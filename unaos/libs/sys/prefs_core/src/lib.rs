@@ -39,6 +39,8 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod declare;
+pub mod files;
 pub mod login;
 pub mod modes;
 pub mod rules;

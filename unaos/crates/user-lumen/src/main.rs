@@ -1486,6 +1486,9 @@ pub extern "C" fn _start() -> ! {
 
     // The session: Principia's `vein` namespace, the key file, the rule.
     let cfg = vein_ring3::prefs::Config::read();
+    // SETTINGSFILES (B407, R98): Lumen's own settings stanza, declared once — `app.lumen.*` in `<home>/settings/lumen`.
+    let declared = vein_ring3::prefs::declare(vein_ring3::prefs::LUMEN_STANZA);
+    unsafe { DECLARED = declared.err().unwrap_or(0) };
     let keybuf = unsafe { &mut *core::ptr::addr_of_mut!(KEY) };
     let mut kpath = [0u8; 128];
     // HOLOCRON2 M2 (B355): Holocron first (`vein/claude.api_key`, keysource::decide); the key file only on
@@ -1549,6 +1552,7 @@ pub extern "C" fn _start() -> ! {
     if sess.cfg.bus_err != 0 {
         l.put(b" prefs=").dec(sess.cfg.bus_err);
     }
+    l.put(b" declared=").dec(unsafe { DECLARED }); // SETTINGSFILES (B407): 0 = app.lumen held by Principia
     match (tt(), &font_why) {
         (Some(t), _) => {
             l.put(b" font=").put(t.name().as_bytes()).put(b" font_kib=").dec((t.bytes / 1024) as i64);
@@ -1647,3 +1651,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[used]
 #[link_section = ".note.unaos.app"]
 static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(una_abi::APP_FLAG_WINDOWED);
+
+/// SETTINGSFILES (rmbp-ledger B407): the PrefDeclare status of Lumen's stanza (0 = declared).
+static mut DECLARED: i64 = 0;
