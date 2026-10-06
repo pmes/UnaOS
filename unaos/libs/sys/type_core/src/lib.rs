@@ -117,6 +117,17 @@ pub fn ext_in_list(list: &str, ext: &str) -> bool {
         && list.split([',', ' ', '\t']).map(|e| e.strip_prefix('.').unwrap_or(e)).any(|e| !e.is_empty() && e.eq_ignore_ascii_case(ext))
 }
 
+/// The FILETYPES registry (B423): one object per type under this directory, named by [`mime_leaf`]'s inverse
+/// (`image/png` → `image-png`), its user-amendable extension list under [`EXTENSIONS_KEY`].
+pub const TYPES_DIR: &str = "/system/filetypes";
+pub const EXTENSIONS_KEY: &str = "una:extensions";
+
+/// The `(type, subtype)` a registry leaf names (`image-png` → `("image", "png")`; a top-level type never carries a
+/// dash, a subtype may: `video-x-matroska`). `None` for a leaf with no dash or an empty half.
+pub fn mime_leaf(leaf: &str) -> Option<(&str, &str)> {
+    leaf.split_once('-').filter(|(t, s)| !t.is_empty() && !s.is_empty())
+}
+
 /// UnaOS or Linux, for a buffer that starts with the ELF magic: the lowest `PT_LOAD` vaddr through
 /// `elf_core::read_phdrs` (the loaders' parse) against [`LINUX_VADDR_FLOOR`]; when the table yields no `PT_LOAD`
 /// (cut by the sniff window, or malformed) `e_entry` stands in.
@@ -290,6 +301,8 @@ mod tests {
         assert!(ext_in_list(".foo .bar", "bar"));
         assert!(!ext_in_list("txt,foobar", "foo"));
         assert!(!ext_in_list("txt,,", ""));
+        assert_eq!(mime_leaf("video-x-matroska"), Some(("video", "x-matroska")));
+        assert_eq!(mime_leaf("image"), None);
     }
 
     #[test]

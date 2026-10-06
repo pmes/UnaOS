@@ -19,8 +19,8 @@ kernel; the GATE-ARCH `parser|fs/filetype.rs|{elf,gif,isobmff,png,riff}` baselin
 arch.baseline is not on this cut). M3 bandy on type_core. M4 the owed B423 leg: a name the table does not type is
 looked up in the FILETYPES registry's user-added `una:extensions` (`/system/filetypes/*`), before `unknown`.
 
-**Witness.** `file x.foo` after `setfattr /system/filetypes/text-plain una:extensions=txt,foo` prints
-`/home/x.foo: text/plain extension`, and the serial wire carries `[filetype] ext=user foo -> text/plain`.
+**Witness.** `file x.foo` (an EMPTY file, or bytes no sniff recognises — content still beats the name) after `setfattr /system/filetypes/text-plain una:extensions=txt,foo` prints
+`/home/x.foo: text/plain extension`, and the serial wire carries `[filetype] ext=user foo -> text/plain (from /system/filetypes/text-plain)`. On the metal boot nothing prints (R80: it is read on a table miss only).
 
 **Owed.** FILETYPES (merge18) `assoc::extensions_of` swaps its EXT_TABLE walk for `type_core::extensions_of` at the
 fold (its file is not on this cut).

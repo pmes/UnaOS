@@ -147,6 +147,9 @@ pub fn type_of_in(mt: &MountTable, path: &str) -> (String, Source) {
     if let Some(m) = by_extension(path) {
         return (String::from(m), Source::Extension);
     }
+    if let Some(m) = by_user_extension_in(mt, path) {
+        return (m, Source::Extension);
+    }
     (String::from(OCTET), Source::Unknown)
 }
 
@@ -481,4 +484,24 @@ pub fn openers_witness(dir: &str, names: &[&str]) {
         if owed.is_empty() { "" } else { " reason=no-opener-in-this-tree(video: Stria's player, SR26)" },
         dir
     );
+}
+
+/// TYPECORE (B450; B423's owed leg) — a name the built-in table does not type, typed by a USER-ADDED extension: the
+/// first FILETYPES object under `type_core::TYPES_DIR` whose `una:extensions` lists it (`setfattr
+/// /system/filetypes/text-plain una:extensions=txt,foo` makes `x.foo` text). Read only on a table miss; `None` when
+/// the registry is absent (a FAT root, before the first login). One `[filetype] ext=user` line when it decides.
+pub fn by_user_extension_in(mt: &MountTable, path: &str) -> Option<String> {
+    let e = ext_of(path)?;
+    for d in mt.read_dir(type_core::TYPES_DIR).ok()? {
+        let Some((t, st)) = type_core::mime_leaf(&d.name) else { continue };
+        let obj = alloc::format!("{}/{}", type_core::TYPES_DIR, d.name);
+        if let Ok(AttrValue::Str(list)) = mt.get_attr(&obj, type_core::EXTENSIONS_KEY, KERNEL_PRINCIPAL) {
+            if type_core::ext_in_list(&list, e) {
+                let mime = alloc::format!("{}/{}", t, st);
+                serial_println!("[filetype] ext=user {} -> {} (from {})", e, mime, obj);
+                return Some(mime);
+            }
+        }
+    }
+    None
 }
