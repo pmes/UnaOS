@@ -247,7 +247,8 @@ pub fn verb_publish(row: usize, body: &[u8]) -> i64 {
         }
     };
     if g.len() <= k {
-        if g.try_reserve(k + 1 - g.len()).is_err() {
+        let grow = k + 1 - g.len();
+        if g.try_reserve(grow).is_err() {
             return E_AGAIN;
         }
         g.resize(k + 1, EMPTY);

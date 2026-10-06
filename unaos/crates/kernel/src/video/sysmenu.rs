@@ -81,18 +81,20 @@ pub fn quit_user(win: wm::WinId, route: &str) -> bool {
     if !is_user(owner) {
         return false;
     }
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-    {
-        winmenu::clear(win);
-        let settle = crate::arch::x86_64::syscall::app_quit_owner(win, owner);
-        serial_println!("[sysmenu] quit win={} owner={:#x} route={} -> {}", win, owner, route, settle);
-        return true;
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = route;
-        false
-    }
+    quit_user_owner(win, owner, route)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn quit_user_owner(win: wm::WinId, owner: u64, route: &str) -> bool {
+    winmenu::clear(win);
+    let settle = crate::arch::x86_64::syscall::app_quit_owner(win, owner);
+    serial_println!("[sysmenu] quit win={} owner={:#x} route={} -> {}", win, owner, route, settle);
+    true
+}
+/// aarch64: no user-owner kill path from the WM yet; the Quit arm's `wm::close` stands (owed).
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+fn quit_user_owner(_win: wm::WinId, _owner: u64, _route: &str) -> bool {
+    false
 }
 
 /// Quit the app that owns `win`: a user app by the close box's close-then-kill, kernel furniture by
