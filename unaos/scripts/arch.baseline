@@ -8,11 +8,6 @@ dotslash|{}/.config/unaos  # F2 BTKEYSEAL (the BT link-key folder)
 dotslash|{}/.config/unaos/bt  # F2 BTKEYSEAL (the BT link-key folder)
 parser|drivers/hda_play.rs|riff  # F6 TYPECORE (a format magic outside the shared cores)
 parser|fs/bootdisk.rs|elf  # F6 TYPECORE
-parser|fs/filetype.rs|elf  # F6 TYPECORE
-parser|fs/filetype.rs|gif  # F6 TYPECORE
-parser|fs/filetype.rs|isobmff  # F6 TYPECORE
-parser|fs/filetype.rs|png  # F6 TYPECORE
-parser|fs/filetype.rs|riff  # F6 TYPECORE
 parser|video/facet.rs|png  # F6 TYPECORE (a format magic outside the shared cores)
 parser|video/facet_anim.rs|png  # F6 TYPECORE (a format magic outside the shared cores)
 parser|video/prtscr.rs|png  # F6 TYPECORE (a format magic outside the shared cores)

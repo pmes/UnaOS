@@ -32,13 +32,13 @@ use crate::fs::filetype as ft;
 use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL};
 
 pub const DESCRIPTION_KEY: &str = "una:description";
-pub const EXTENSIONS_KEY: &str = "una:extensions";
+pub use type_core::EXTENSIONS_KEY; // SMALLFIX4 item 12 (TYPECORE fold): the key is type_core's, the one table's
 pub const ICON_KEY: &str = "una:icon";
 /// On a type object: the preferred app's signature. On a file: that file's own choice (signature, or the B307
 /// opener id / program path).
 pub const PREFERRED_KEY: &str = "una:preferred";
-/// The registry's directory on the system volume (ROOTDISK2: `/system` is UnaFS).
-pub const TYPES_DIR: &str = "/system/filetypes";
+/// The registry's directory on the system volume (ROOTDISK2: `/system` is UnaFS) — type_core's (SMALLFIX4 item 12).
+pub use type_core::TYPES_DIR;
 
 /// `(mime, icon glyph, description)` — the type FACTS. No opener column: who opens a type is its registrants'.
 pub const TYPE_FACTS: &[(&str, &str, &str)] = &[
@@ -90,12 +90,13 @@ pub fn object_path(mime: &str) -> String {
 
 /// The MIME type a registry leaf names (`image-png` → `image/png`; a top-level type never carries a dash). Pure.
 pub fn mime_of_leaf(leaf: &str) -> String {
-    leaf.replacen('-', "/", 1)
+    match type_core::mime_leaf(leaf) { Some((t, st)) => alloc::format!("{}/{}", t, st), None => String::from(leaf) } // SMALLFIX4 item 12: type_core's leaf rule
 }
 
-/// `filetype::EXT_TABLE`'s extensions for `mime`, comma-separated (`md, markdown`). Pure.
+/// type_core's one table's extensions for `mime`, comma-separated (`md, markdown`). Pure. SMALLFIX4 item 12: walks
+/// `type_core::extensions_of` (TYPECORE fold), no second filter over the table.
 pub fn extensions_of(mime: &str) -> String {
-    let v: Vec<&str> = ft::EXT_TABLE.iter().filter(|(_, m)| *m == mime).map(|(e, _)| *e).collect();
+    let v: Vec<&str> = type_core::extensions_of(mime).collect();
     v.join(", ")
 }
 
