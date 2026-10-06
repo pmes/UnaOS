@@ -865,6 +865,8 @@ struct Model {
     /// current, the voltage and the age are on the wire and nowhere near the damage test, which is
     /// what keeps the bar's `paints=` flat while the meter ticks at 10 s.
     batt: Option<super::status::BarItem>,
+    /// STATUSTRAY (B426) — the tray's facts (`status::tray`): input, network, volume, the clock's anchor.
+    tray: Option<super::status::Tray>,
 }
 
 impl Model {
@@ -877,6 +879,7 @@ impl Model {
             cap_owner: wm::WIN_NONE,
             menus: super::winmenu::BarSnapshot::empty(),
             batt: None,
+            tray: None,
         }
     }
 
@@ -937,7 +940,7 @@ impl Model {
         // the SMC transaction that produced this number ran ten seconds ago on the device-service
         // task (`super::status::poll`). A bar that read the SMC here would wait on six bounded
         // handshakes with interrupts off.
-        m.batt = super::status::bar_item(); // BEZEL (B405): the bar's `BRT nn/16` item and the caption's `vol=N/16` / `muted` are retired — the bezel is the readout
+        m.batt = super::status::bar_item(); m.tray = super::status::tray(); // STATUSTRAY (B426): the tray, read with the rest of the model (relaxed loads) // BEZEL (B405): the bar's `BRT nn/16` item and the caption's `vol=N/16` / `muted` are retired — the bezel is the readout
         m.clock = clock_hhmm(); #[cfg(feature = "sntp6")] if m.clock.is_none() { barclock_note(None); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the UNSYNCED half of the bar's clock witness, latched to one line per boot at the file tail. It is reported from the MODEL, not the painter, because the painter's clock branch never runs when there is nothing to draw — which is precisely the state this half exists to say aloud.
         (m, clobbered)
     }
@@ -987,6 +990,7 @@ impl Model {
             }
             None => h = strip::fnv1a(h, 0),
         }
+        h = strip::fnv1a_u64(h, tray_sig(&self.tray)); // STATUSTRAY (B426): the tray's DRAWN state
         strip::seal(h)
     }
 }
@@ -1159,7 +1163,7 @@ pub fn compose() -> bool {
         return false;
     }
     LEDGER.paint(crate::arch::now_cycles().saturating_sub(t1), (r.2 * r.3) as u64);
-    SLOT.store(sig, Some(r));
+    SLOT.store(sig, Some(r)); super::statusmenu::witness(model.tray, pw, ph); // STATUSTRAY (B426): `:: STATUSTRAY:` once per tray state
     // MENUFIRST — the FIRST paint, once per boot, read off the paint that just landed. Sited AFTER
     // `SLOT.store` so the line can never describe a paint `strip::paint` declined (the `return false`
     // two statements up is the decline arm, and it is above this). One-shot inside the witness.
@@ -1669,6 +1673,7 @@ pub fn menus_right_limit(bar: strip::Rect) -> usize {
     // It is a function of RUNTIME state (is there an item), which is new for this accessor and is
     // accounted for: `Model::signature` folds the item's presence, so an item appearing or going
     // absent repaints the bar and re-lays the titles in the same pass.
+    if let Some(x0) = tray_left(bw) { return bx + x0.saturating_sub(strip::PAD()); } // STATUSTRAY (B426): titles stop before the whole tray (its slots are reserved, so the limit does not move as items come and go)
     if super::status::bar_item().is_some() {
         if let Some(x0) = batt_slot(bw) {
             return bx + x0.saturating_sub(strip::PAD());
@@ -1988,6 +1993,8 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         let tx = bx0 + BATT_GLYPH_W() + BATT_GAP();
         super::text::draw_row(out, w, &pct, (tx + BATT_PCT_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&pct, false, FACE)), sy, theme::TITLE_TEXT_INACTIVE, false, FACE); // KERNELFONT: right-aligned in its slot by the shaped width
     }
+
+    tray_paint(out, w, sy, &m.tray); // STATUSTRAY (B426): input, network and volume, left of the battery
 
     // Clock, right, at one PAD from the far edge — the crystal holds the LEFT corner, so nothing of
     // the brand sits out here. Secondary ink: the title is what the operator is reading, the clock is
@@ -3068,7 +3075,7 @@ fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: boo
             let dw = CLOCKBAR_DATE_GLYPHS * CELL_W();
             // The status item (battery) sits one PAD left of the clock; when the date shares the row
             // it goes one PAD left of that slot's left edge, so the two never overlap.
-            let right = batt_slot(w).unwrap_or(cx);
+            let right = tray_left(w).or_else(|| batt_slot(w)).unwrap_or(cx); // STATUSTRAY: left of the whole tray
             if let Some(dx) = right.checked_sub(strip::PAD() + dw) {
                 let date = clockbar_date(secs);
                 super::text::draw_row(out, w, &date, dx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
@@ -3111,7 +3118,136 @@ pub fn volatile_rects(pw: usize, ph: usize) -> (Option<strip::Rect>, Option<stri
     let Some((rx, ry, w, h)) = strip_rect(pw, ph) else { return (None, None) };
     let Some(cx) = clock_slot(w) else { return (None, None) };
     let clock = Some((rx + cx, ry, (CLOCK_GLYPHS * CELL_W()).min(w - cx), h));
-    let gx = bright_slot(w).or_else(|| batt_slot(w));
+    let gx = tray_left(w).or_else(|| bright_slot(w)).or_else(|| batt_slot(w)); // STATUSTRAY: the tray is volatile too
     let glyphs = gx.map(|x0| (rx + x0, ry, cx.saturating_sub(x0), h));
     (clock, glyphs)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// STATUSTRAY (rmbp-ledger B426, MACPARITY row 3) — the tray's items LEFT of the battery: volume, network, input
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Fixed slots, right to left from the battery's: one PAD, the volume glyph, one PAD, the network label, one
+// PAD, the input label. The slots are RESERVED (they do not close up when an item is unknown), so no item
+// moves when another comes or goes and the titles' right limit is one number. An item whose fact is unknown
+// (`status::item_known`) is not drawn and has no press cell; a slot the panel cannot seat (left of the first
+// title glyph) declines like the battery's. Every colour is the status area's token ink.
+
+#[allow(non_snake_case)] #[inline] fn TRAY_VOL_W() -> usize { 2 * CELL_W() }
+#[allow(non_snake_case)] #[inline] fn TRAY_NET_W() -> usize { 4 * CELL_W() }
+#[allow(non_snake_case)] #[inline] fn TRAY_IN_W() -> usize { 2 * CELL_W() }
+
+/// The battery slot's left edge without its seat test (the tray is placed from it whether or not a battery
+/// exists, so the reserved slots are a function of the width alone).
+fn tray_base(w: usize) -> Option<usize> {
+    clock_slot(w)?.checked_sub(strip::PAD() + BATT_ITEM_W())
+}
+
+/// Item `i`'s slot `(x0, width)` inside a bar `w` wide, or `None` when the panel cannot seat it.
+fn tray_slot(i: u8, w: usize) -> Option<(usize, usize)> {
+    use super::status::{ITEM_BATTERY, ITEM_CLOCK, ITEM_INPUT, ITEM_NET, ITEM_VOLUME};
+    let (x0, sw) = match i {
+        ITEM_CLOCK => return clock_slot(w).map(|x| (x, CLOCK_GLYPHS * CELL_W())),
+        ITEM_BATTERY => return batt_slot(w).map(|x| (x, BATT_ITEM_W())),
+        ITEM_VOLUME => (tray_base(w)?.checked_sub(strip::PAD() + TRAY_VOL_W())?, TRAY_VOL_W()),
+        ITEM_NET => (tray_base(w)?.checked_sub(2 * strip::PAD() + TRAY_VOL_W() + TRAY_NET_W())?, TRAY_NET_W()),
+        ITEM_INPUT => (tray_base(w)?.checked_sub(3 * strip::PAD() + TRAY_VOL_W() + TRAY_NET_W() + TRAY_IN_W())?, TRAY_IN_W()),
+        _ => return None,
+    };
+    if x0 < TITLE_X0() + CELL_W() {
+        return None;
+    }
+    Some((x0, sw))
+}
+
+/// The tray's left edge (the input slot's x), once the tray has been published and the panel seats it.
+fn tray_left(w: usize) -> Option<usize> {
+    super::status::tray()?;
+    tray_slot(super::status::ITEM_INPUT, w)
+        .or_else(|| tray_slot(super::status::ITEM_NET, w))
+        .or_else(|| tray_slot(super::status::ITEM_VOLUME, w))
+        .map(|(x, _)| x)
+}
+
+/// **Item `i`'s PRESS cell on the panel** (full bar height), or `None` when the bar is off, the panel cannot
+/// seat it, or its fact is unknown. `statusmenu::item_at` and the witness's `drawn=` read this.
+pub fn tray_box_abs(i: u8, pw: usize, ph: usize) -> Option<strip::Rect> {
+    let t = super::status::tray()?;
+    if !super::status::item_known(&t, i) {
+        return None;
+    }
+    let (rx, ry, w, h) = strip_rect(pw, ph)?;
+    let (x0, sw) = tray_slot(i, w)?;
+    Some((rx + x0, ry, sw, h))
+}
+
+/// The tray's damage fold: everything [`tray_paint`] draws.
+fn tray_sig(t: &Option<super::status::Tray>) -> u64 {
+    let Some(t) = t else { return 0 };
+    let v = match t.volume { None => 0u64, Some((lv, m)) => 1 | ((lv as u64) << 1) | ((m as u64) << 6) };
+    let n = match t.net { None => 0u64, Some(n) => 1 | ((n.medium as u64) << 1) | ((n.up as u64) << 4) };
+    1 | (v << 1) | (n << 9) | ((t.pc as u64) << 15)
+}
+
+/// One glyph-band scanline (`sy` in `0..CELL_H`) of the tray: the volume glyph, the network label (struck
+/// through while the link is down), the input label.
+fn tray_paint(out: &mut [u32], w: usize, sy: usize, t: &Option<super::status::Tray>) {
+    use super::status::{ITEM_INPUT, ITEM_NET, ITEM_VOLUME, NET_USB};
+    let Some(t) = t else { return };
+    let ink = theme::TITLE_TEXT_INACTIVE;
+    if let (Some((lv, muted)), Some((x0, _))) = (t.volume, tray_slot(ITEM_VOLUME, w)) {
+        tray_speaker(out, w, sy, x0, lv, muted, ink);
+    }
+    if let (Some(n), Some((x0, sw))) = (t.net, tray_slot(ITEM_NET, w)) {
+        let label: &[u8] = if n.medium == NET_USB { b"ETH" } else { b"WiFi" };
+        let tw = super::text::advance(label, false, FACE);
+        let tx = (x0 + sw).saturating_sub(tw);
+        super::text::draw_row(out, w, label, tx, sy, ink, false, FACE);
+        if !n.up && sy == CELL_H() / 2 {
+            for i in tx..(tx + tw).min(w) {
+                out[i] = ink;
+            }
+        }
+    }
+    if let Some((x0, sw)) = tray_slot(ITEM_INPUT, w) {
+        let label: &[u8] = if t.pc { b"PC" } else { b"US" };
+        let tw = super::text::advance(label, false, FACE);
+        super::text::draw_row(out, w, label, (x0 + sw).saturating_sub(tw), sy, ink, false, FACE);
+    }
+}
+
+/// The speaker: a box, a cone, and up to three level bars (none when muted, a cross instead).
+fn tray_speaker(out: &mut [u32], w: usize, sy: usize, x0: usize, lv: u8, muted: bool, ink: u32) {
+    let hh = CELL_H();
+    let u = (CELL_W() / 4).max(1);
+    let mid = hh / 2;
+    let d = if sy >= mid { sy - mid } else { mid - sy };
+    let mut put = |a: usize, b: usize| {
+        for i in a..b.min(w) {
+            out[i] = ink;
+        }
+    };
+    if d < hh / 6 {
+        put(x0, x0 + u);
+    }
+    for k in 0..u {
+        if d < hh / 6 + (hh / 6) * k / u {
+            put(x0 + u + k, x0 + u + k + 1);
+        }
+    }
+    if muted {
+        let xc = x0 + 5 * u;
+        if d <= u + u / 2 {
+            put(xc - d, xc - d + crate::ui::px(1).max(1));
+            put(xc + d, xc + d + crate::ui::px(1).max(1));
+        }
+        return;
+    }
+    let bars = (lv as usize * 3 + 15) / 16;
+    for k in 1..=bars.min(3) {
+        if d < hh / 6 + k * hh / 9 {
+            let xk = x0 + 2 * u + (2 * k - 1) * u;
+            put(xk, xk + (u / 2).max(1));
+        }
+    }
 }
