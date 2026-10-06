@@ -60,7 +60,7 @@ pub fn key(act: Action) {
 pub fn service() {
     crate::video::backlight::seed_from_hw(); // GLASSLAG M3 (B370): once — the panel's own level, before the first step
     apply(true);
-    crate::video::bezel::ensure_registered(); // BEZEL (B405): `tests bezel`, registered on the desktop pass (R80)
+    crate::video::bezel::ensure_registered(); crate::video::fnrow::ensure_registered(); // BEZEL (B405): `tests bezel`, registered on the desktop pass (R80)
     crate::video::bezel::service(); // after the write: the bezel reads the register's readback
 }
 
