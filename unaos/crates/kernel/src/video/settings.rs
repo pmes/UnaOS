@@ -20,8 +20,9 @@
 //! `<home>/.settings` this window used to keep is gone, imported once and deleted). [`service`] applies the
 //! store's keys once per login (`[settings] loaded n=<n>`). Absent keys keep the OS defaults.
 //!
-//! Mouse: press a slider track to set it, a toggle/segment/button to act. (No drag: the wm drag seam
-//! belongs to window frames; a press-to-set is the claim.) Keyboard: Up/Down/Tab move the selection,
+//! Mouse: press a slider track to set it and keep the button down to DRAG it (PREFSUI, R93: the press captures
+//! the pointer through `video::capture`; every motion sample moves the knob and applies live; the release commits
+//! and stores); a toggle/segment/button to act. Keyboard: Up/Down/Tab move the selection,
 //! Left/Right adjust, Enter toggles/applies; typing edits the wallpaper path while it is selected.
 //!
 //! SETTINGS2: four TABS (General · Users · Display · About; Left/Right on the strip or a click switches, the choice
@@ -61,8 +62,8 @@ const TOP: usize = 12 + TAB_H;
 const ROW_H: usize = 40;
 const ROWS: usize = 10;
 /// The tab strip: General · Users · Display · About.
-pub const TABS: usize = 4;
-const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About"];
+pub const TABS: usize = 5;
+const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items"]; // PREFSUI (R91): Login Items
 const WIN_H: usize = TOP + ROWS * ROW_H + 8;
 const LABEL_X: usize = 12;
 const TRACK_X: usize = 150;
@@ -103,6 +104,10 @@ struct State {
     /// Focus is on the tab strip (Left/Right switch tabs).
     strip: bool,
     u: UsersUi,
+    /// PREFSUI: the Login Items tab's Add chooser (an index into `loginitems::installed()`), and the Display
+    /// tab's Resolution dropdown (open or not).
+    li_add: usize,
+    modes_open: bool,
     w: usize,
     h: usize,
     surf: Vec<u32>,
@@ -261,6 +266,7 @@ fn load_for_login() {
     if mask & 8 != 0 { apply_idle(v.idle_min); }
     if mask & 16 != 0 { apply_ptr(v.ptr); }
     if mask & 32 != 0 && !v.wall.is_empty() { apply_wall(&v.wall); }
+    mode_at_login(); // PREFSUI (R93): a stored `system.display.mode` is this session's scale
 }
 
 /// Set control `i` to `val` (slider position, toggle 0/1, chooser index), apply, print, save, repaint.
@@ -345,7 +351,7 @@ pub fn request_open() {
 
 /// Drain the open latch and load the store once per login. Chained from `quarry::live::service`.
 pub fn service() {
-    crate::prefs::service();
+    crate::prefs::service(); super::loginitems::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
     if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
@@ -381,7 +387,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { persist(0); }
     }
-    bus_changes(); if OPEN_REQ.swap(false, Ordering::AcqRel) {
+    mode_service(); bus_changes(); if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -457,6 +463,7 @@ fn paint(st: &mut State, v: &Values) {
         0 => paint_general(st, v),
         1 => paint_users(st),
         2 => paint_display(st, v),
+        4 => paint_login(st),
         _ => paint_about(st),
     }
     if !st.strip && matches!(v.tab, 0 | 2) {
@@ -507,9 +514,8 @@ fn paint_display(st: &mut State, v: &Values) {
     slider(st, 1, idle_index(v.idle_min), IDLE_STEPS.len() - 1);
     let it = if v.idle_min == 0 { String::from("never") } else { alloc::format!("{} min", v.idle_min) };
     txt(st, VAL_X, 1, &it);
-    txt(st, LABEL_X, 2, "UI scale");
-    let m = crate::ui::Metrics::panel(); // UIMETRICS (B372): the panel's dpi scale, not a window magnification
-    txt(st, TRACK_X, 2, &alloc::format!("{}x ({} ppi) - follows the panel", super::dpi::scale_str(m.s2), m.ppi));
+    txt(st, LABEL_X, 2, "Resolution"); // PREFSUI (R93): the dropdown of the modes the display path can set (was the read-only UI scale row)
+    mode_field(st);
     txt(st, LABEL_X, 3, "Menubar clock");
     txt(st, TRACK_X, 3, "24h - fixed, no runtime switch");
     // KERNELFONT M3 (B359) -> KERNELFONT2 M4 (B363): the Font row is a PICKER — the family as three segments (the
@@ -538,6 +544,7 @@ fn paint_display(st: &mut State, v: &Values) {
     txt(st, TRACK_X, 6, &alloc::format!("{} in {}x{} cells, {} ppi x{}", super::text::face_name(super::text::Face::Grid), cw, chh, super::dpi::ppi(), super::dpi::scale_str(s2)));
     super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 12, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::CONTENT_TEXT, false, face);
     if !st.strip && st.sel == 10 { fill(&mut st.surf, w, TRACK_X, TOP + 5 * ROW_H + ROW_H - 8, 2 * BTN_W + 10, 2, theme::ACCENT); }
+    if st.modes_open { mode_list(st); } // PREFSUI: the open dropdown paints over the rows below it
 }
 
 /// KERNELFONT M3: the Display tab's sample line.
@@ -781,7 +788,7 @@ pub fn open() -> Result<(), String> {
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
     let tab0 = CUR.lock().tab as usize;
-    let mut st = State { sel: tab_ctrls(tab0).first().copied().unwrap_or(0), strip: true, u: UsersUi::new(), w, h, surf };
+    let mut st = State { sel: tab_ctrls(tab0).first().copied().unwrap_or(0), strip: true, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf };
     paint(&mut st, &CUR.lock().clone());
     let base = st.surf.as_ptr() as usize;
     let id = wm::create_at_native(OWNER, base, len * 4, sw as u32, sh as u32, (sw * 4) as u32, b"Settings", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
@@ -800,6 +807,7 @@ pub fn open() -> Result<(), String> {
 pub fn close() {
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id == wm::WIN_NONE { return; }
+    if DRAG.lock().take().is_some() { super::capture::cancel(); } // PREFSUI: a drag dies with its window
     wm::close(id);
     *STATE.lock() = None;
     serial_println!("[settings] closed win={}", id);
@@ -970,10 +978,12 @@ pub fn press_route(x: i32, y: i32) -> bool {
     match cur_tab() {
         0 => press_general(row, cx),
         1 => press_users(row, cx),
+        4 => press_login(row, cx),
         2 => {
+            if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
-            if row == 0 && on_track { select(0); bright_click(cx); }
-            if row == 1 && on_track { select(3); set(3, slider_at(cx, IDLE_STEPS.len() - 1)); }
+            if row == 0 && on_track { select(0); bright_click(cx); drag_begin(0, cx); } // PREFSUI (R93): the press sets AND captures — the knob follows the hand until the release
+            if row == 1 && on_track { select(3); drag_begin(3, cx); }
             if row == 4 && cx >= TRACK_X && cx < TRACK_X + TRACK_W { select(9); set_font(9, ((cx - TRACK_X) / (TRACK_W / 3)).min(2) as i64); } // KERNELFONT2: the family segments
             if row == 5 && cx >= TRACK_X && cx < TRACK_X + BTN_W { select(10); set_font(10, (font_size() - 1).max(FONT_MIN)); } // KERNELFONT2: size −
             if row == 5 && cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 { select(10); set_font(10, (font_size() + 1).min(FONT_MAX)); } // size +
@@ -986,7 +996,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
 fn press_general(row: usize, cx: usize) {
     // BRIGHTFLOOR M5: rows moved up one (Brightness is on the Display tab).
     match row {
-        0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(1); set(1, slider_at(cx, 16)); }
+        0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(1); drag_begin(1, cx); } // PREFSUI (R93): press-and-drag
         1 => { select(2); if cx >= TRACK_X && cx < TRACK_X + 24 { let m = CUR.lock().mute; set(2, (!m) as usize); } }
         2 => { select(4); if cx >= TRACK_X && cx < TRACK_X + TRACK_W { set(4, (cx - TRACK_X) / (TRACK_W / 3)); } }
         3 => select(5),
@@ -1107,6 +1117,7 @@ pub fn selftest_users() {
 pub fn selftest_all() {
     selftest();
     selftest_users();
+    selftest_prefsui();
 }
 
 // ── BRIGHTFLOOR (B312): the floor, the load clamp, safe mode ───────────────────────────────────
@@ -1339,4 +1350,311 @@ pub fn slider_sync(reg: u32) -> bool {
     }
     let back = crate::video::backlight::raw_for_pos(crate::video::backlight::pos_for_raw(reg, max, TRACK_W), TRACK_W, max);
     back.abs_diff(reg) <= max / TRACK_W as u32 + 1
+}
+
+// ── PREFSUI (rmbp-ledger B389, R93) — A SLIDER DRAGS ─────────────────────────────────────────────────────────────
+// Flight 24: `[backlight] slider click pos=16%` 13:12:14, `pos=35%` 13:12:16 — a drag was a run of presses, because
+// the window saw only the press edge. Now a press on a slider track CAPTURES the pointer (`video::capture`): every
+// motion sample while the button is held moves the knob and applies the value LIVE (the backlight follows the
+// hand; the volume and the idle blank likewise), paced at [`DRAG_PACE_MS`]; the release applies the last position
+// and COMMITS — one `[settings] <name>=<v>` line, one store write (brightness: BRIGHTSLIDER's debounce), and
+// `[settings] slider drag key=<k> samples=<n> ms=<n> from=<v> to=<v>`.
+
+/// The least time between two live applies of a drag (the release always applies the last position).
+pub const DRAG_PACE_MS: u64 = 16;
+
+#[derive(Clone, Copy)]
+struct Drag {
+    /// The control (0 brightness, 1 volume, 3 idle minutes).
+    ctrl: usize,
+    t0: u64,
+    samples: u32,
+    from: i64,
+    /// The last logical x applied, and when.
+    cx: usize,
+    at: u64,
+    /// The latest logical x seen (applied or paced out).
+    want: usize,
+}
+
+static DRAG: spin::Mutex<Option<Drag>> = spin::Mutex::new(None);
+/// Completed drags (the witness reads it).
+static DRAGS: AtomicU32 = AtomicU32::new(0);
+
+/// The control's value as the drag line prints it: brightness %, volume /16, idle minutes.
+fn drag_value(ctrl: usize) -> i64 {
+    match ctrl {
+        0 => { let (r, m) = (crate::video::backlight::cur_raw(), crate::video::backlight::panel_range()); crate::video::backlight::pct_of(r.min(m), m) as i64 }
+        1 => CUR.lock().vol as i64,
+        _ => CUR.lock().idle_min as i64,
+    }
+}
+
+/// Apply control `ctrl` at logical `cx` LIVE: the device follows, the knob repaints, nothing is printed or stored.
+fn drag_apply(ctrl: usize, cx: usize) {
+    match ctrl {
+        0 => {
+            let pos = cx.saturating_sub(TRACK_X).min(TRACK_W);
+            let max = crate::video::backlight::max_now();
+            let a = crate::video::backlight::set_raw_via(crate::video::backlight::raw_for_pos(pos, TRACK_W, max), "slider-drag");
+            CUR.lock().bright = a.level;
+        }
+        1 => { let v = slider_at(cx, 16) as u8; let mut c = CUR.lock(); if c.vol == v && !c.mute { return; } c.vol = v; c.mute = false; drop(c); apply_volume(v, false); }
+        _ => { let m = IDLE_STEPS[slider_at(cx, IDLE_STEPS.len() - 1)]; let mut c = CUR.lock(); if c.idle_min == m { return; } c.idle_min = m; drop(c); apply_idle(m); }
+    }
+    repaint();
+}
+
+/// A press on slider `ctrl` at logical `cx`: apply it (brightness: [`bright_click`] already did) and capture.
+fn drag_begin(ctrl: usize, cx: usize) {
+    let now = crate::arch::ms();
+    let from = drag_value(ctrl);
+    if ctrl != 0 { drag_apply(ctrl, cx); }
+    *DRAG.lock() = Some(Drag { ctrl, t0: now, samples: 0, from, cx, at: now, want: cx });
+    super::capture::begin(drag_motion, drag_release);
+}
+
+/// A panel x as this window's logical x (left of the window = 0; the slider clamps the rest).
+fn logical_x(x: i32) -> Option<usize> {
+    let info = wm::info(WIN.load(Ordering::Relaxed))?;
+    let sc = info.scale.max(1);
+    Some(super::metrics::to_logical((x.max(0) as usize).saturating_sub(info.x) / sc))
+}
+
+/// The capture's motion: one more sample; applied when [`DRAG_PACE_MS`] has passed since the last apply.
+fn drag_motion(x: i32, _y: i32) {
+    let Some(cx) = logical_x(x) else { return };
+    drag_step(cx, false);
+}
+
+fn drag_step(cx: usize, force: bool) {
+    let now = crate::arch::ms();
+    let go = {
+        let mut g = DRAG.lock();
+        let Some(d) = g.as_mut() else { return };
+        d.samples += 1;
+        d.want = cx;
+        if cx == d.cx || (!force && now.saturating_sub(d.at) < DRAG_PACE_MS) { None } else { d.cx = cx; d.at = now; Some(d.ctrl) }
+    };
+    if let Some(c) = go { drag_apply(c, cx); }
+}
+
+/// The capture's release: the last position, then the commit (print + store) and the drag line.
+fn drag_release(x: i32, _y: i32) {
+    if let Some(cx) = logical_x(x) { if let Some(d) = DRAG.lock().as_mut() { d.want = cx; } }
+    drag_finish();
+}
+
+fn drag_finish() {
+    let Some(d) = DRAG.lock().take() else { return };
+    if d.want != d.cx { drag_apply(d.ctrl, d.want); }
+    let to = drag_value(d.ctrl);
+    match d.ctrl {
+        0 => { let l = CUR.lock().bright; say("brightness", &alloc::format!("{}", l), true); bright_persist_later(); }
+        1 => { let v = CUR.lock().vol; say("volume", &alloc::format!("{}", v), true); persist(1); }
+        _ => { let m = CUR.lock().idle_min; say("idle_min", &alloc::format!("{}", m), true); persist(3); }
+    }
+    DRAGS.fetch_add(1, Ordering::Relaxed);
+    serial_println!("[settings] slider drag key={} samples={} ms={} from={} to={}", NAMES[d.ctrl], d.samples, crate::arch::ms().saturating_sub(d.t0), d.from, to);
+}
+
+/// `tests settings` leg: drive a drag on the Blank-screen slider THROUGH the capture seam (press, two motion
+/// samples at panel coordinates, release) and read the value back; restores the operator's value. `"ok"` / why not.
+#[cfg(feature = "witness")]
+fn drag_selftest() -> &'static str {
+    let before = CUR.lock().idle_min;
+    let was_open = is_open();
+    if !was_open && open().is_err() { return "no-window"; }
+    let Some(info) = wm::info(WIN.load(Ordering::Relaxed)) else { return "no-window" };
+    let px = |cx: usize| (info.x + super::metrics::size(cx) * info.scale.max(1)) as i32;
+    let d0 = DRAGS.load(Ordering::Relaxed);
+    drag_begin(3, TRACK_X);
+    let a = CUR.lock().idle_min;
+    super::capture::motion(px(TRACK_X + TRACK_W / 2), 0);
+    for _ in 0..3 { let t = crate::arch::ms(); while crate::arch::ms() < t + DRAG_PACE_MS + 1 { core::hint::spin_loop(); } }
+    super::capture::motion(px(TRACK_X + TRACK_W), 0);
+    super::capture::release(px(TRACK_X + TRACK_W), 0);
+    let b = CUR.lock().idle_min;
+    let ok = a == IDLE_STEPS[0] && b == IDLE_STEPS[IDLE_STEPS.len() - 1] && DRAGS.load(Ordering::Relaxed) == d0 + 1 && !super::capture::held();
+    set(3, idle_index(before));
+    if !was_open { close(); }
+    if ok { "ok" } else { "no" }
+}
+
+// ── PREFSUI (rmbp-ledger B389, R91) — the Login Items tab ───────────────────────────────────────────────────────
+// Row 0: what it is. Rows 1..=LI_ROWS: the list in launch order, each with Up / Down / Remove. Row 9: Add — a
+// chooser over the installed programs not yet in the list (< name >) and the Add button. Every edit is
+// `loginitems::edit` (one latched store write of `system.login.items`, the key the dock menu's Open at Login edits).
+
+const LI_ROWS: usize = 7;
+const LI_UP_X: usize = 230;
+const LI_DOWN_X: usize = LI_UP_X + BTN_W + 10;
+const LI_DEL_X: usize = LI_DOWN_X + BTN_W + 10;
+const LI_ADD_ROW: usize = 9;
+
+/// The installed programs not yet in the list (the Add chooser's choices).
+fn li_candidates() -> Vec<&'static str> {
+    let l = super::loginitems::items();
+    super::loginitems::installed().into_iter().filter(|n| !prefs_core::login::contains(&l, n)).collect()
+}
+
+fn paint_login(st: &mut State) {
+    let l = super::loginitems::items();
+    txt(st, LABEL_X, 0, &alloc::format!("Open at login ({}), in this order:", l.len()));
+    if l.is_empty() { txt(st, LABEL_X + 12, 1, "None - nothing opens itself at login."); }
+    for (k, n) in l.iter().take(LI_ROWS).enumerate() {
+        txt(st, LABEL_X + 12, 1 + k, n);
+        btn(st, 1 + k, LI_UP_X, "Up");
+        btn(st, 1 + k, LI_DOWN_X, "Down");
+        btn(st, 1 + k, LI_DEL_X, "Remove");
+    }
+    if l.len() > LI_ROWS { txt(st, LABEL_X + 12, 1 + LI_ROWS, &alloc::format!("+{} more", l.len() - LI_ROWS)); }
+    let c = li_candidates();
+    txt(st, LABEL_X, LI_ADD_ROW, "Add");
+    if c.is_empty() { txt(st, TRACK_X, LI_ADD_ROW, "every program is in the list"); return; }
+    let i = st.li_add % c.len();
+    btn(st, LI_ADD_ROW, TRACK_X - 70, "  <");
+    txt(st, LI_UP_X - 70, LI_ADD_ROW, c[i]);
+    btn(st, LI_ADD_ROW, LI_DOWN_X, "  >");
+    btn(st, LI_ADD_ROW, LI_DEL_X, "Add");
+}
+
+fn press_login(row: usize, cx: usize) {
+    let in_b = |x0: usize| cx >= x0 && cx < x0 + BTN_W;
+    if (1..=LI_ROWS).contains(&row) {
+        let l = super::loginitems::items();
+        let Some(n) = l.get(row - 1) else { return };
+        let op = if in_b(LI_UP_X) { "up" } else if in_b(LI_DOWN_X) { "down" } else if in_b(LI_DEL_X) { "remove" } else { return };
+        super::loginitems::edit(op, n, "settings");
+    } else if row == LI_ADD_ROW {
+        let c = li_candidates();
+        if c.is_empty() { return; }
+        let mut g = STATE.lock();
+        let Some(st) = g.as_mut() else { return };
+        let i = st.li_add % c.len();
+        if in_b(TRACK_X - 70) { st.li_add = (i + c.len() - 1) % c.len(); }
+        else if in_b(LI_DOWN_X) { st.li_add = (i + 1) % c.len(); }
+        else if in_b(LI_DEL_X) { drop(g); super::loginitems::edit("add", c[i], "settings"); }
+    } else { return; }
+    repaint();
+}
+
+// ── PREFSUI (rmbp-ledger B389, R93) — the Resolution dropdown ───────────────────────────────────────────────────
+// "i was seeing if i could change the monitor resolution. i guess we need to put adding a dropdown of the supported
+// resolutions?" The display path sets ONE panel mode (the native one: after the Kepler takeover the GOP's list is
+// gone and the panel runs 2880x1800); what a user can choose is the UI scale, so the entries are
+// `prefs_core::modes::modes` — the native mode at each scale, a scaled one captioned `Looks like WxH`. A choice is
+// latched in the router and applied by the service pass ([`mode_service`]): `dpi::set_live`, the faces re-size
+// (`text::rescale`), every window repaints, this window re-opens at the new scale, and `system.display.mode` is
+// stored. `[settings] display mode=<WxH> looks_like=<WxH> scale=<s> applied=<0|1> via=<settings|login>`.
+
+/// A chosen entry owed to the service pass (index + 1; 0 = none).
+static MODE_APPLY: AtomicU32 = AtomicU32::new(0);
+
+/// The dropdown's entries for the live panel (empty while the panel is busy or unknown).
+fn display_modes() -> Vec<prefs_core::modes::Mode> {
+    let (w, h) = crate::video::panel_info_nonblocking().map_or((0, 0), |i| (i.width as u32, i.height as u32));
+    prefs_core::modes::modes(w, h, super::dpi::native_s2())
+}
+
+/// The entry the live scale is.
+fn mode_cur(ms: &[prefs_core::modes::Mode]) -> usize {
+    let s2 = super::dpi::s2();
+    ms.iter().position(|m| m.s2 == s2).unwrap_or_else(|| prefs_core::modes::default_index(ms))
+}
+
+fn mode_caption(m: &prefs_core::modes::Mode) -> String {
+    alloc::format!("{} ({}x)", m.label(), super::dpi::scale_str(m.s2))
+}
+
+/// The closed dropdown: the current entry and a `v`.
+fn mode_field(st: &mut State) {
+    let ms = display_modes();
+    let w = st.w;
+    fill(&mut st.surf, w, TRACK_X, TOP + 2 * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::BUTTON_FACE);
+    let t = match ms.get(mode_cur(&ms)) { Some(m) => mode_caption(m), None => String::from("panel busy") };
+    txt(st, TRACK_X + 6, 2, &t);
+    txt(st, w - 30, 2, "v");
+}
+
+/// The open dropdown: one row per entry under the field, the current one in the accent.
+fn mode_list(st: &mut State) {
+    let ms = display_modes();
+    let (w, cur) = (st.w, mode_cur(&ms));
+    for (k, m) in ms.iter().enumerate().take(ROWS - 3) {
+        let y = TOP + (3 + k) * ROW_H;
+        fill(&mut st.surf, w, TRACK_X, y, w - TRACK_X - 12, ROW_H, theme::FRAME_LINE);
+        fill(&mut st.surf, w, TRACK_X + 1, y + 1, w - TRACK_X - 14, ROW_H - 2, if k == cur { theme::ACCENT } else { theme::BUTTON_FACE });
+        txt(st, TRACK_X + 6, 3 + k, &mode_caption(m));
+    }
+}
+
+/// A press on the Display tab while the dropdown is open (any press closes it; an entry is chosen) or on its
+/// field (opens it). `true` when consumed.
+fn mode_press(row: usize, cx: usize) -> bool {
+    let open = STATE.lock().as_ref().map(|s| s.modes_open).unwrap_or(false);
+    if open {
+        if let Some(s) = STATE.lock().as_mut() { s.modes_open = false; }
+        let n = display_modes().len();
+        if cx >= TRACK_X && row >= 3 && row < 3 + n { MODE_APPLY.store((row - 3 + 1) as u32, Ordering::Release); serial_println!("[settings] display mode chosen entry={} of={}", row - 3, n); }
+        repaint();
+        return true;
+    }
+    if row == 2 && cx >= TRACK_X {
+        if let Some(s) = STATE.lock().as_mut() { s.modes_open = true; s.strip = false; }
+        repaint();
+        return true;
+    }
+    false
+}
+
+/// Apply entry `i` LIVE; `store` = persist it as `system.display.mode`. Returns whether the scale moved.
+fn apply_mode(i: usize, via: &str, store: bool) -> bool {
+    let ms = display_modes();
+    let Some(m) = ms.get(i).copied() else { return false };
+    let (before, after) = super::dpi::set_live(m.s2);
+    let moved = before != after;
+    if moved {
+        super::text::rescale();
+        let _ = wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+    }
+    if store {
+        if m.default { let _ = crate::prefs_client::pref_set(crate::prefs::NS, crate::prefs::key::DISPLAY_MODE, crate::prefs::PrefValue::Str(String::new())); }
+        else { crate::prefs_client::sys_set(crate::prefs::key::DISPLAY_MODE, crate::prefs::PrefValue::Str(m.value())); }
+    }
+    serial_println!("[settings] display mode={}x{} looks_like={} scale={} applied={} via={}", m.w, m.h, m.value(), super::dpi::scale_str(after), (super::dpi::s2() == m.s2) as u8, via);
+    moved
+}
+
+/// The service pass: a chosen entry is applied, stored, and this window re-opens at the new scale.
+fn mode_service() {
+    let k = MODE_APPLY.swap(0, Ordering::AcqRel);
+    if k == 0 { return; }
+    if apply_mode(k as usize - 1, "settings", true) && is_open() {
+        close();
+        if let Err(e) = open() { serial_println!("[settings] refuse reason={}", e); }
+    }
+}
+
+/// The login's load: the user's stored mode (a looks-like size this panel offers) becomes the session's scale.
+fn mode_at_login() {
+    let Some(v) = crate::prefs_client::sys_text(crate::prefs::key::DISPLAY_MODE) else { return };
+    let ms = display_modes();
+    if let Some(i) = prefs_core::modes::index_of(&ms, &v) {
+        if ms[i].s2 != super::dpi::s2() { apply_mode(i, "login", false); }
+    }
+}
+
+/// PREFSUI (B389) — the `tests settings` leg: a drag through the capture seam, a login-items round trip, the
+/// Resolution dropdown's entries. `:: PREFSUI: slider_drag=<ok|no|no-window> login_items=<n> modes=<n> -> PASS ::`.
+#[cfg(feature = "witness")]
+pub fn selftest_prefsui() {
+    let drag = drag_selftest();
+    let li = super::loginitems::selftest();
+    let modes = display_modes().len();
+    let ok = drag == "ok" && li.is_some() && modes >= 1;
+    serial_println!(
+        ":: PREFSUI: slider_drag={} login_items={} modes={} -> {} ::",
+        drag, li.map(|n| n as i64).unwrap_or(-1), modes, if ok { "PASS" } else { "FAIL" }
+    );
 }

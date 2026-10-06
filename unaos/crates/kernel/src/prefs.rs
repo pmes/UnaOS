@@ -73,6 +73,9 @@ pub mod key {
     /// KERNELFONT (B359) schema rows, written by the Settings Font picker since KERNELFONT2 (B363).
     pub const FONT: &str = "display.font";
     pub const FONT_SIZE: &str = "display.font_size";
+    /// PREFSUI (B389): R91's login items and R93's Resolution dropdown.
+    pub const LOGIN_ITEMS: &str = "login.items";
+    pub const DISPLAY_MODE: &str = "display.mode";
 }
 
 static TREE: spin::Mutex<PrefTree> = spin::Mutex::new(PrefTree::new());

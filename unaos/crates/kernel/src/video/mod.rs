@@ -1193,3 +1193,8 @@ pub mod edidsrc;
 // DESKTOPBUILT (B387, R93): the desktop object — built at `login ok`, torn down at Log Out. Same gate as `strip`; at the tail so no line above moves.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod desktopbuild;
+// PREFSUI (B389, R91/R93): the pointer capture a slider drag holds, and Principia's login items. Same gate as settings.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod capture;
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod loginitems;

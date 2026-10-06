@@ -359,6 +359,7 @@ system.display.font = \"sans\"\n\
 system.display.font_size = 13\n\
 system.display.idle_min = 10\n\
 system.display.wallpaper = \"\"\n\
+system.login.items = \"\"\n\
 system.pointer.speed = 1\n\
 system.settings.tab = 0\n";
         assert_eq!(run(&mut s, VERB_LIST, b"system", false), (0, GOLDEN.to_vec()));
