@@ -723,6 +723,7 @@ fn close_into_session() {
     crate::loginfurn::desktop_bare("session"); // LOGINFURN (R88): no console, no shell, no STAT at login — the user opens what they want
     take_down();
     FORM.lock().state = State::Session;
+    crate::fs::assoc::owe();
     crate::video::desktopbuild::build("login ok"); // DESKTOPBUILT (B387, R93): the desktop — bar with its battery, dock with its pins, the wallpaper (rearmed by the build) — is BUILT here and painted in one pass
 }
 

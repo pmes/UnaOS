@@ -1,79 +1,100 @@
 //! CHARTER: Kernel — fs-core
 //!
-//! ASSOC (FILETYPE M2, B307, audit B293) — the TYPE DATABASE: type → opener, as ATTRIBUTES.
+//! FILETYPES (rmbp-ledger B423, MACPARITY §16 B3 / row 29) — THE FILETYPES REGISTRY, as ATTRIBUTES. (The type
+//! database of FILETYPE M2, B307, moved and re-keyed Be's way: one store, never a second one — R79.)
 //!
-//! Each type is one system object `/system/types/<mime with '/' as '.'>` (`/system/types/image.png`)
-//! carrying `una:opener` (an opener id — `facet` `fileview` `textedit` `play` `launch` `linux` `none`
-//! — or a ring-3 program path such as `/apps/LUMEN.ELF`), `una:icon` (a glyph name) and `una:name`
-//! ("PNG image"). They are ordinary attributes: `setfattr /system/types/text.plain una:opener=fileview`
-//! changes the default opener with no code. A file's own `una:preferred` wins over its type's row
-//! (`BEOS:PREFERRED_APP`).
+//! Each type is one system object `/system/filetypes/<mime with '/' as '-'>` (`/system/filetypes/image-png`)
+//! carrying `una:description` ("PNG image"), `una:extensions` (`png`), `una:icon` (a glyph name) and
+//! `una:preferred` — the SIGNATURE of the app that opens it (`org.unaos.facet`; Be's FileTypes "preferred
+//! application"). They are ordinary attributes: `setfattr /system/filetypes/text-plain una:preferred=org.unaos.fileview`
+//! (or the Settings pane's File Types tab, or `assoc text/plain fileview`) changes the default with no code. A
+//! file's own `una:preferred` wins over its type's (`BEOS:PREFERRED_APP`).
 //!
-//! The defaults are [`BUILTIN`] — the table the deleted Quarry if-chain implied. They are written once
-//! (per boot, idempotently: an object that already exists is never touched, so an operator's edit
-//! survives every later boot) when the root takes attributes. On a FAT root there is nowhere to write
-//! them, so [`BUILTIN`] answers directly and the source says `builtin`. No store of its own (R79).
+//! **No type→program table in code.** The programs that open a type are its REGISTRANTS
+//! ([`crate::fs::appres::registrants`]): every kernel opener declares its doc types in its own resource block
+//! (`unaos/res/<id>/app.res`), ring-3 programs through APPRES's `una:apps`. With no `una:preferred` the first
+//! registrant opens the file; with none at all the answer is `none`, said by name. The registry is therefore NOT
+//! needed to open a file (a FAT root, a card before its first login): the registrants answer from the compiled-in
+//! resources and the source says `registrant`.
+//!
+//! **Built at LOGIN** (R93: the desktop is built at login; R80: nothing at boot): `login ok` owes [`build`], the
+//! x86 device-service pass runs it ([`service`]; elsewhere inline) — every known type's object created in ONE
+//! transaction, a present object's MISSING keys filled, a present key never overwritten (the user's amendment
+//! sticks). Known types = [`TYPE_FACTS`] ∪ every type a registrant declares ∪ what the directory already holds.
+//! Descriptions and glyphs are type FACTS (Be's MIME database shipped them); extensions are
+//! `filetype::EXT_TABLE`'s, listed.
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::fs::appres::{self, Registrant};
 use crate::fs::filetype as ft;
 use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL};
 
-pub const OPENER_KEY: &str = "una:opener";
+pub const DESCRIPTION_KEY: &str = "una:description";
+pub const EXTENSIONS_KEY: &str = "una:extensions";
 pub const ICON_KEY: &str = "una:icon";
-pub const NAME_KEY: &str = "una:name";
+/// On a type object: the preferred app's signature. On a file: that file's own choice (signature, or the B307
+/// opener id / program path).
 pub const PREFERRED_KEY: &str = "una:preferred";
-/// The type database's directory on the root volume.
-pub const TYPES_DIR: &str = "/system/types";
+/// The registry's directory on the system volume (ROOTDISK2: `/system` is UnaFS).
+pub const TYPES_DIR: &str = "/system/filetypes";
 
-/// `(mime, opener, icon, name)` — the defaults. `none` is "no opener in this tree yet".
-pub const BUILTIN: &[(&str, &str, &str, &str)] = &[
-    (ft::TEXT_PLAIN, "textedit", "doc", "Plain text"),
-    (ft::IMAGE_PNG, "facet", "image", "PNG image"),
-    (ft::AUDIO_WAV, "play", "sound", "WAV audio"),
-    (ft::UNAOS_ELF, "launch", "app", "UnaOS program"),
-    (ft::UNAOS_BIN, "launch", "app", "UnaOS flat program"),
-    (ft::LINUX_ELF, "linux", "app", "Linux program"),
-    (ft::DIRECTORY, "quarry", "folder", "Folder"),
-    (ft::GZIP, "none", "archive", "gzip archive"),
-    (ft::TAR, "none", "archive", "tar archive"),
-    (ft::OCTET, "none", "file", "Binary data"),
-    // QUARRY2 (B336): the two text types with their own openers (the viewer, rendered), and GIF.
-    (ft::TEXT_MARKDOWN, "markdown", "doc", "Markdown"),
-    (ft::APP_JSON, "json", "doc", "JSON"),
-    (ft::IMAGE_GIF, "facet", "image", "GIF image"),
-    // OPENERS (B379): every format a decoder in this tree reads. Images open in facet (pixel_core, by magic;
-    // animated WebP through FACETANIM), audio in `play` (audio_core, by magic: MP4/M4A AAC through its ISO-BMFF
-    // reader). Video has NO opener in this tree yet (Stria's player, PLAYBACK SR26): `none`, said by name.
-    (ft::IMAGE_JPEG, "facet", "image", "JPEG image"),
-    (ft::IMAGE_BMP, "facet", "image", "BMP image"),
-    (ft::IMAGE_WEBP, "facet", "image", "WebP image"),
-    (ft::IMAGE_QOI, "facet", "image", "QOI image"),
-    (ft::IMAGE_SVG, "facet", "image", "SVG image"), // SMALLFIX2 (B391, R94): SVG is a picture (UNAOS_SVG links pixel_core's svg format)
-    (ft::AUDIO_FLAC, "play", "sound", "FLAC audio"),
-    (ft::AUDIO_OGG, "play", "sound", "Ogg audio"),
-    (ft::AUDIO_MPEG, "play", "sound", "MP3 audio"),
-    (ft::AUDIO_AAC, "play", "sound", "AAC audio"),
-    (ft::AUDIO_MP4, "play", "sound", "MPEG-4 audio"),
-    (ft::AUDIO_AIFF, "play", "sound", "AIFF audio"),
-    (ft::VIDEO_MP4, "none", "video", "MPEG-4 video"),
-    (ft::VIDEO_WEBM, "none", "video", "WebM video"),
-    (ft::VIDEO_MATROSKA, "none", "video", "Matroska video"),
+/// `(mime, icon glyph, description)` — the type FACTS. No opener column: who opens a type is its registrants'.
+pub const TYPE_FACTS: &[(&str, &str, &str)] = &[
+    (ft::TEXT_PLAIN, "doc", "Plain text"),
+    (ft::IMAGE_PNG, "image", "PNG image"),
+    (ft::AUDIO_WAV, "sound", "WAV audio"),
+    (ft::UNAOS_ELF, "app", "UnaOS program"),
+    (ft::UNAOS_BIN, "app", "UnaOS flat program"),
+    (ft::LINUX_ELF, "app", "Linux program"),
+    (ft::DIRECTORY, "folder", "Folder"),
+    (ft::GZIP, "archive", "gzip archive"),
+    (ft::TAR, "archive", "tar archive"),
+    (ft::OCTET, "file", "Binary data"),
+    (ft::TEXT_MARKDOWN, "doc", "Markdown"),
+    (ft::APP_JSON, "doc", "JSON"),
+    (ft::IMAGE_GIF, "image", "GIF image"),
+    (ft::IMAGE_JPEG, "image", "JPEG image"),
+    (ft::IMAGE_BMP, "image", "BMP image"),
+    (ft::IMAGE_WEBP, "image", "WebP image"),
+    (ft::IMAGE_QOI, "image", "QOI image"),
+    (ft::IMAGE_SVG, "image", "SVG image"),
+    (ft::AUDIO_FLAC, "sound", "FLAC audio"),
+    (ft::AUDIO_OGG, "sound", "Ogg audio"),
+    (ft::AUDIO_MPEG, "sound", "MP3 audio"),
+    (ft::AUDIO_AAC, "sound", "AAC audio"),
+    (ft::AUDIO_MP4, "sound", "MPEG-4 audio"),
+    (ft::AUDIO_AIFF, "sound", "AIFF audio"),
+    (ft::VIDEO_MP4, "video", "MPEG-4 video"),
+    (ft::VIDEO_WEBM, "video", "WebM video"),
+    (ft::VIDEO_MATROSKA, "video", "Matroska video"),
 ];
 
-/// The builtin row for `mime`, if any. Pure.
-pub fn builtin(mime: &str) -> Option<&'static (&'static str, &'static str, &'static str, &'static str)> {
-    BUILTIN.iter().find(|r| r.0 == mime)
+/// The facts row for `mime`, if any. Pure.
+pub fn facts(mime: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    TYPE_FACTS.iter().find(|r| r.0 == mime)
 }
 
-/// `/system/types/image.png` for `image/png`. Pure.
+/// `/system/filetypes/image-png` for `image/png`. Pure.
 pub fn object_path(mime: &str) -> String {
     let mut s = String::from(TYPES_DIR);
     s.push('/');
     for c in mime.chars() {
-        s.push(if c == '/' { '.' } else { c });
+        s.push(if c == '/' { '-' } else { c });
     }
     s
+}
+
+/// The MIME type a registry leaf names (`image-png` → `image/png`; a top-level type never carries a dash). Pure.
+pub fn mime_of_leaf(leaf: &str) -> String {
+    leaf.replacen('-', "/", 1)
+}
+
+/// `filetype::EXT_TABLE`'s extensions for `mime`, comma-separated (`md, markdown`). Pure.
+pub fn extensions_of(mime: &str) -> String {
+    let v: Vec<&str> = ft::EXT_TABLE.iter().filter(|(_, m)| *m == mime).map(|(e, _)| *e).collect();
+    v.join(", ")
 }
 
 fn str_attr(mt: &MountTable, path: &str, key: &str) -> Option<String> {
@@ -83,22 +104,27 @@ fn str_attr(mt: &MountTable, path: &str, key: &str) -> Option<String> {
     }
 }
 
+/// The registrants of `mime` (built-ins by their resources, then APPRES's ring-3 programs).
+pub fn registrants_in(mt: &MountTable, mime: &str) -> Vec<Registrant> {
+    appres::registrants(mt, mime, &object_path(mime))
+}
+
 /// The opener for `path` of type `mime`, and the source that decided: `override` (the file's own
-/// `una:preferred`), `db` (`/system/types/<mime>`'s `una:opener`) or `builtin` ([`BUILTIN`]; also the
-/// answer on a FAT root, and for a type the database has no row for).
+/// `una:preferred`), `db` (the registry's `una:preferred` for the type), `registrant` (no preference: the first
+/// program that declares the type) or `none` (nothing declares it — a video in this tree).
 pub fn opener_for_in(mt: &MountTable, path: &str, mime: &str) -> (String, &'static str) {
-    if let Some(o) = str_attr(mt, path, PREFERRED_KEY) {
-        return (o, "override");
+    let obj = object_path(mime);
+    if path != obj {
+        if let Some(v) = str_attr(mt, path, PREFERRED_KEY) {
+            return (appres::opener_of_preferred(mt, &v), "override");
+        }
     }
-    if let Some(o) = str_attr(mt, &object_path(mime), OPENER_KEY) {
-        return (o, "db");
+    if let Some(v) = str_attr(mt, &obj, PREFERRED_KEY) {
+        return (appres::opener_of_preferred(mt, &v), "db");
     }
-    if let Some(o) = str_attr(mt, &object_path(mime), crate::fs::appres::KEY_APPS).and_then(|v| v.lines().next().map(String::from)) {
-        return (o, "app"); // APPRES (B398): a program that declares this type in its `una:doctypes`
-    }
-    match builtin(mime) {
-        Some(r) => (String::from(r.1), "builtin"),
-        None => (String::from("none"), "builtin"),
+    match registrants_in(mt, mime).into_iter().next() {
+        Some(r) => (r.opener, "registrant"),
+        None => (String::from("none"), "none"),
     }
 }
 
@@ -107,29 +133,71 @@ pub fn opener_for(path: &str, mime: &str) -> (String, &'static str) {
     opener_for_in(&crate::shell::vfs_mount_table(), path, mime)
 }
 
-/// The type's short name (`una:name` from the database, else the builtin row, else the MIME string).
+/// The type's description (`una:description` from the registry, else the facts row, else the MIME string).
 pub fn name_of_in(mt: &MountTable, mime: &str) -> String {
-    str_attr(mt, &object_path(mime), NAME_KEY)
-        .or_else(|| builtin(mime).map(|r| String::from(r.3)))
+    str_attr(mt, &object_path(mime), DESCRIPTION_KEY)
+        .or_else(|| facts(mime).map(|r| String::from(r.2)))
         .unwrap_or_else(|| String::from(mime))
 }
 
 /// The type's icon glyph name, same order as [`name_of_in`].
 pub fn icon_of_in(mt: &MountTable, mime: &str) -> String {
     str_attr(mt, &object_path(mime), ICON_KEY)
-        .or_else(|| builtin(mime).map(|r| String::from(r.2)))
+        .or_else(|| facts(mime).map(|r| String::from(r.1)))
         .unwrap_or_else(|| String::from("file"))
 }
 
-/// Does the root volume take attributes (the database can live there)?
+/// The type's extensions (the registry's `una:extensions`, else the extension table's).
+pub fn extensions_in(mt: &MountTable, mime: &str) -> String {
+    str_attr(mt, &object_path(mime), EXTENSIONS_KEY).unwrap_or_else(|| extensions_of(mime))
+}
+
+/// Does the root volume take attributes (the registry can live there)?
 fn root_takes_attrs(mt: &MountTable) -> bool {
     !matches!(mt.list_attrs("/", KERNEL_PRINCIPAL), Err(VfsError::Unsupported) | Err(VfsError::NoSuchVolume) | Err(VfsError::NoSuchPath))
 }
 
-/// Write the defaults: `/system`, `/system/types`, and every [`BUILTIN`] object that does not exist
-/// yet. `Ok(n)` = objects created this call (0 on every boot after the first); `Err(Unsupported)` on
-/// a root that takes no attributes (the builtin table answers there).
-pub fn seed_in(mt: &MountTable) -> Result<usize, VfsError> {
+/// Every type the system knows: the facts, every registrant's declared type, and the registry's own objects
+/// (a type the user added) — signature objects (`application-x-vnd.*`) are APPRES's, not types.
+pub fn known_types_in(mt: &MountTable) -> Vec<String> {
+    let mut v: Vec<String> = TYPE_FACTS.iter().map(|r| String::from(r.0)).collect();
+    for m in appres::builtin_doctypes() {
+        if !v.contains(&m) {
+            v.push(m);
+        }
+    }
+    if let Ok(ents) = mt.read_dir(TYPES_DIR) {
+        for e in ents {
+            if e.name.starts_with("application-x-vnd.") || e.name.starts_with('.') {
+                continue;
+            }
+            let m = mime_of_leaf(&e.name);
+            if !v.contains(&m) {
+                v.push(m);
+            }
+        }
+    }
+    v
+}
+
+/// The four keys a type's object carries, as built (the preferred one only when something declares the type).
+fn keys_for(mt: &MountTable, mime: &str) -> Vec<(String, AttrValue)> {
+    let mut kv = alloc::vec![
+        (String::from(DESCRIPTION_KEY), AttrValue::Str(facts(mime).map(|r| String::from(r.2)).unwrap_or_else(|| String::from(mime)))),
+        (String::from(EXTENSIONS_KEY), AttrValue::Str(extensions_of(mime))),
+        (String::from(ICON_KEY), AttrValue::Str(facts(mime).map(|r| String::from(r.1)).unwrap_or_else(|| String::from("file")))),
+    ];
+    if let Some(r) = registrants_in(mt, mime).into_iter().next() {
+        kv.push((String::from(PREFERRED_KEY), AttrValue::Str(r.preferred_value())));
+    }
+    kv
+}
+
+/// Build the registry: `/system`, `/system/filetypes`, every known type's object that does not exist yet (ONE
+/// transaction where the volume has one — BOOT80's shape), and on a present object every MISSING key (a present
+/// key is the user's or an earlier build's and is never overwritten). `Ok((created, filled))`;
+/// `Err(Unsupported)` on a root that takes no attributes (the registrants answer there).
+pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
     if !root_takes_attrs(mt) {
         return Err(VfsError::Unsupported);
     }
@@ -143,107 +211,143 @@ pub fn seed_in(mt: &MountTable) -> Result<usize, VfsError> {
             }
         }
     }
-    // BOOT80 (B350): the missing objects in ONE transaction where the root has one (UnaFS: one root flip
-    // for the whole table — boot 21 paid 52 flips here, each rewriting the whole refcount map).
-    let missing: Vec<(String, Vec<(String, AttrValue)>)> = BUILTIN
-        .iter()
-        .filter(|(mime, ..)| mt.stat(&object_path(mime)).is_err())
-        .map(|(mime, opener, icon, name)| {
-            let leaf = String::from(&object_path(mime)[TYPES_DIR.len() + 1..]);
-            let attrs = alloc::vec![
-                (String::from(OPENER_KEY), AttrValue::Str(String::from(*opener))),
-                (String::from(ICON_KEY), AttrValue::Str(String::from(*icon))),
-                (String::from(NAME_KEY), AttrValue::Str(String::from(*name))),
-            ];
-            (leaf, attrs)
-        })
-        .collect();
-    if missing.is_empty() {
-        return Ok(0);
+    let mut missing: Vec<(String, Vec<(String, AttrValue)>)> = Vec::new();
+    let mut filled = 0usize;
+    for mime in known_types_in(mt) {
+        let obj = object_path(&mime);
+        let want = keys_for(mt, &mime);
+        if mt.stat(&obj).is_err() {
+            missing.push((String::from(&obj[TYPES_DIR.len() + 1..]), want));
+            continue;
+        }
+        let have: Vec<(String, AttrValue)> = mt.list_attrs(&obj, k).unwrap_or_default();
+        let fill: Vec<(String, Option<AttrValue>)> = want
+            .into_iter()
+            .filter(|(key, _)| !have.iter().any(|(h, v)| h == key && !matches!(v, AttrValue::Str(s) if s.is_empty())))
+            .map(|(key, v)| (key, Some(v)))
+            .collect();
+        if !fill.is_empty() {
+            filled += fill.len();
+            mt.set_attrs(&obj, &fill, k)?;
+        }
     }
-    match mt.create_files_batch(TYPES_DIR, missing, k) {
-        Ok(n) => return Ok(n),
+    if missing.is_empty() {
+        return Ok((0, filled));
+    }
+    match mt.create_files_batch(TYPES_DIR, missing.clone(), k) {
+        Ok(n) => return Ok((n, filled)),
         Err(VfsError::Unsupported) => {} // no batch on this volume: the per-object path below
         Err(e) => return Err(e),
     }
     let mut made = 0usize;
-    for (mime, opener, icon, name) in BUILTIN.iter() {
-        let obj = object_path(mime);
-        if mt.stat(&obj).is_ok() {
-            continue;
-        }
+    for (leaf, attrs) in missing {
+        let obj = alloc::format!("{}/{}", TYPES_DIR, leaf);
         mt.create(&obj, NodeKind::File, k)?;
-        mt.set_attr(&obj, OPENER_KEY, AttrValue::Str(String::from(*opener)), k)?;
-        mt.set_attr(&obj, ICON_KEY, AttrValue::Str(String::from(*icon)), k)?;
-        mt.set_attr(&obj, NAME_KEY, AttrValue::Str(String::from(*name)), k)?;
+        for (key, v) in attrs {
+            mt.set_attr(&obj, &key, v, k)?;
+        }
         made += 1;
     }
-    Ok(made)
+    Ok((made, filled))
 }
 
-/// Seed once per boot, after the root volume answers (called from the users service's ready arm and
-/// from the verbs/fixture, whichever runs first). One wire line either way.
+static BUILDS: AtomicUsize = AtomicUsize::new(0);
+static OWED: AtomicBool = AtomicBool::new(false);
+
+/// How many times the registry was built this boot (the witness reads it).
+pub fn builds() -> usize {
+    BUILDS.load(Ordering::Relaxed)
+}
+
+/// Build the registry now, one wire line. `why` = `login` · `tests` · `verb`.
+pub fn build(why: &str) -> usize {
+    let t0 = crate::arch::ms();
+    let mt = crate::shell::vfs_mount_table();
+    BUILDS.fetch_add(1, Ordering::Relaxed);
+    match seed_in(&mt) {
+        Ok((n, f)) => {
+            serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} ms={}", why, TYPES_DIR, n, f,
+                known_types_in(&mt).len(), crate::arch::ms().saturating_sub(t0));
+            n
+        }
+        Err(VfsError::Unsupported) => { serial_println!("[filetypes] built at={} dir=none reason=enotsup (root takes no attributes) source=registrants", why); 0 }
+        Err(e) => { serial_println!("[filetypes] built at={} FAILED ({}) source=registrants", why, crate::fs::attrsys::refusal(&e)); 0 }
+    }
+}
+
+/// `login ok` (`login::close_into_session`): the registry is owed. On x86 with the compositor the device-service
+/// pass builds it ([`service`]) — VFS work never runs in the click router; elsewhere it builds inline.
+pub fn owe() {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    OWED.store(true, Ordering::Release);
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    build("login");
+}
+
+/// The device-service pass: one relaxed load when nothing is owed.
+pub fn service() {
+    if OWED.load(Ordering::Acquire) && OWED.swap(false, Ordering::AcqRel) {
+        build("login");
+    }
+}
+
+/// Build once per boot unless a login already did (the verbs and fixtures ask before they read).
 pub fn seed_once() -> usize {
-    use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.swap(true, Ordering::AcqRel) {
+    if DONE.swap(true, Ordering::AcqRel) || builds() > 0 {
         return 0;
     }
-    let mt = crate::shell::vfs_mount_table();
-    match seed_in(&mt) {
-        Ok(n) => { crate::bootlog_println!("[assoc] seed dir={} created={} types={} source=db", TYPES_DIR, n, BUILTIN.len()); n }
-        Err(VfsError::Unsupported) => { crate::bootlog_println!("[assoc] seed=skip reason=enotsup (root takes no attributes) source=builtin types={}", BUILTIN.len()); 0 }
-        Err(e) => { serial_println!("[assoc] seed=fail ({}) source=builtin", crate::fs::attrsys::refusal(&e)); 0 }
-    }
+    build("verb")
 }
 
-/// `assoc` — every known type, its opener and the source. `assoc <mime>` — that one row.
-/// `assoc <mime> <opener>` — set the type's opener in the database (an ordinary attribute write).
+/// Set `mime`'s preferred app in the registry (`v` = a signature, an opener id or a program path; a registrant's
+/// opener id is stored as its signature). An ordinary attribute write; the object is created when absent.
+pub fn set_preferred_in(mt: &MountTable, mime: &str, v: &str) -> Result<String, VfsError> {
+    if !root_takes_attrs(mt) {
+        return Err(VfsError::Unsupported);
+    }
+    let obj = object_path(mime);
+    if mt.stat(&obj).is_err() {
+        let _ = seed_in(mt);
+        if mt.stat(&obj).is_err() {
+            mt.create(&obj, NodeKind::File, KERNEL_PRINCIPAL)?;
+        }
+    }
+    let stored = registrants_in(mt, mime).into_iter().find(|r| r.opener == v || r.signature == v).map(|r| r.preferred_value()).unwrap_or_else(|| String::from(v));
+    mt.set_attr(&obj, PREFERRED_KEY, AttrValue::Str(stored.clone()), KERNEL_PRINCIPAL)?;
+    serial_println!("[filetypes] preferred type={} app={} obj={}", mime, stored, obj);
+    Ok(stored)
+}
+
+/// `assoc` — every known type, its opener and the source. `assoc <mime>` — that one row with its registrants.
+/// `assoc <mime> <app>` — set the type's preferred app in the registry (an ordinary attribute write).
 pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
     seed_once();
     let mt = crate::shell::vfs_mount_table();
     let row = |mime: &str| -> String {
+        // `object_path` as the "file" argument: the registry object is skipped as an override, so this reads
+        // db-or-registrant.
         let (op, src) = opener_for_in(&mt, &object_path(mime), mime);
-        // `object_path` as the "file" argument: the database object carries no `una:preferred`, so
-        // this reads db-or-builtin, never an override.
-        alloc::format!("{:<26} {:<12} {:<8} {} ({})", mime, op, src, name_of_in(&mt, mime), icon_of_in(&mt, mime))
+        alloc::format!("{:<26} {:<12} {:<10} {} ({}) [{}]", mime, op, src, name_of_in(&mt, mime), icon_of_in(&mt, mime), extensions_in(&mt, mime))
     };
     match args {
         [] => {
-            let mut mimes: Vec<String> = BUILTIN.iter().map(|r| String::from(r.0)).collect();
-            if let Ok(ents) = mt.read_dir(TYPES_DIR) {
-                for e in ents {
-                    let m = e.name.replacen('.', "/", 1);
-                    if !mimes.contains(&m) {
-                        mimes.push(m);
-                    }
-                }
-            }
+            let mimes = known_types_in(&mt);
             for m in &mimes {
                 console.println(&row(m));
             }
-            console.println(&alloc::format!("assoc: {} type(s)", mimes.len()));
+            console.println(&alloc::format!("assoc: {} type(s) in {}", mimes.len(), TYPES_DIR));
         }
-        [mime] => console.println(&row(mime)),
-        [mime, opener, ..] => {
-            let obj = object_path(mime);
-            if !root_takes_attrs(&mt) {
-                console.println(&alloc::format!("assoc: {}: the root carries no typed attributes, the builtin table is read-only (-ENOTSUP)", mime));
-                return;
-            }
-            if mt.stat(&obj).is_err() {
-                if let Err(e) = mt.create(&obj, NodeKind::File, KERNEL_PRINCIPAL) {
-                    console.println(&alloc::format!("assoc: {}: {}", obj, crate::fs::attrsys::refusal(&e)));
-                    return;
-                }
-            }
-            match mt.set_attr(&obj, OPENER_KEY, AttrValue::Str(String::from(*opener)), KERNEL_PRINCIPAL) {
-                Ok(()) => {
-                    serial_println!("[assoc] set type={} opener={} obj={}", mime, opener, obj);
-                    console.println(&row(mime));
-                }
-                Err(e) => console.println(&alloc::format!("assoc: {}: {}", obj, crate::fs::attrsys::refusal(&e))),
+        [mime] => {
+            console.println(&row(mime));
+            for r in registrants_in(&mt, mime) {
+                console.println(&alloc::format!("  open with: {} ({}) {}", r.name, r.opener, if r.signature.is_empty() { "-" } else { &r.signature }));
             }
         }
+        [mime, app, ..] => match set_preferred_in(&mt, mime, app) {
+            Ok(_) => console.println(&row(mime)),
+            Err(VfsError::Unsupported) => console.println(&alloc::format!("assoc: {}: the root carries no typed attributes, the registrants decide (-ENOTSUP)", mime)),
+            Err(e) => console.println(&alloc::format!("assoc: {}: {}", object_path(mime), crate::fs::attrsys::refusal(&e))),
+        },
     }
 }

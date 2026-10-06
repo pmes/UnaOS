@@ -530,16 +530,17 @@ pub fn selftest() {
     let override_ok;
     if attrs && asrc == "db" {
         let obj = assoc::object_path(TEXT_PLAIN);
-        let changed = mt.set_attr(&obj, assoc::OPENER_KEY, AttrValue::Str(String::from("fileview")), k).is_ok()
-            && assoc::opener_for_in(&mt, &note, TEXT_PLAIN).0 == "fileview";
-        let _ = mt.set_attr(&obj, assoc::OPENER_KEY, AttrValue::Str(op0.clone()), k);
+        let was = mt.get_attr(&obj, assoc::PREFERRED_KEY, k).ok();
+        let changed = mt.set_attr(&obj, assoc::PREFERRED_KEY, AttrValue::Str(String::from("org.unaos.fileview")), k).is_ok()
+            && assoc::opener_for_in(&mt, &note, TEXT_PLAIN).0 == "fileview"; // FILETYPES (B423): the registry names a signature
+        if let Some(v) = was { let _ = mt.set_attr(&obj, assoc::PREFERRED_KEY, v, k); }
         assoc_ok = changed && op0 == "textedit";
         // Per-file override wins over the database.
         let set = mt.set_attr(&note, assoc::PREFERRED_KEY, AttrValue::Str(String::from("fileview")), k).is_ok();
         let (op1, s1) = assoc::opener_for_in(&mt, &note, TEXT_PLAIN);
         override_ok = set && op1 == "fileview" && s1 == "override";
     } else {
-        assoc_ok = !attrs && asrc == "builtin" && op0 == "textedit";
+        assoc_ok = !attrs && asrc == "registrant" && op0 == "textedit"; // FILETYPES (B423): no registry → the first registrant
         override_ok = !attrs; // SKIP leg on FAT: there is nowhere to put a per-file choice
     }
     // Quarry's handler function agrees with `opener_for` on every case file.

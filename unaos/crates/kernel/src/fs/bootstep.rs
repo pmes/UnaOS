@@ -132,7 +132,7 @@ impl Step {
 /// BOOT80 M3 — `tests boot80`: the falsifier. Drops the one UnaFS mount and re-mounts it COLD from the
 /// card (the refcount map, the inode map and the roots read again through the read-ahead window), then
 /// resolves what the stage waits on — the users store (`USERS.DAT`, re-read from its volume), the stage,
-/// and the type database (`/system/types`, through the directory index) — and prints ONE line:
+/// and the type database (`/system/filetypes`, through the directory index) — and prints ONE line:
 ///
 /// `:: BOOT80: mount_ms=<n> mount_blocks=<n> mount_cmds=<n> blocks_read=<n> cmds=<n> ms=<n> users_store=<dat|none|nomount> stage=<s> types=<n> ra_window=<n> -> PASS|FAIL ::`
 ///

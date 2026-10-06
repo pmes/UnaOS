@@ -3234,9 +3234,8 @@ fn boot80_root_and_seed() {
     let mt = crate::shell::vfs_mount_table();
     let attrs = mt.list_attrs("/", crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
     s.end(if attrs { "root=attrs" } else { "root=plain" });
-    let s = crate::fs::bootstep::begin("assoc-seed", "Writing file types");
-    let made = crate::fs::assoc::seed_once();
-    s.end(&alloc::format!("created={}", made));
+    // FILETYPES (B423, R80/R93): the type registry is no longer written at boot — `login ok` builds it
+    // (`assoc::owe`); before then the registrants answer from their compiled-in resources.
 }
 
 /// BOOT80 (`tests boot80`): re-read the users store from its volume — `dat` when `USERS.DAT` (or the

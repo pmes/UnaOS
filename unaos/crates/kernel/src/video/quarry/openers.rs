@@ -4,8 +4,8 @@
 //! routing a file to the thing that opens it is the Finder's job, and it is done here and nowhere
 //! else.
 //!
-//! An opener id comes from `fs::assoc::opener_for` (the file's `una:preferred`, the type database's
-//! `una:opener`, or the builtin table). [`open`] maps it to the request the tree already has:
+//! An opener id comes from `fs::assoc::opener_for` (the file's `una:preferred`, the type
+//! registry's `una:preferred`, or the first registrant — FILETYPES B423). [`open`] maps it to the request the tree already has:
 //!
 //! | id | what runs |
 //! | :--- | :--- |
