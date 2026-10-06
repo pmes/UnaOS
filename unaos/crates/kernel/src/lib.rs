@@ -321,3 +321,5 @@ pub mod shelltask;
 pub mod smallfix4;
 // SMALLFIX5 (rmbp-ledger B480): `tests smallfix5` — the merge19 wave's small owed items, read back. Tail statement.
 pub mod smallfix5;
+// HIDSTALL (rmbp-ledger B485, R103): the pointer's halt, stall and dock-release counters and `tests hidstall`. Tail statement.
+pub mod hidstall;

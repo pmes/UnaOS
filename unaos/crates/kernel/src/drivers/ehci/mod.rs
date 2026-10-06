@@ -13664,7 +13664,7 @@ impl Controller {
         // toggle came to have two owners in the first place.
         ISR_EPS[slot].toggle.store(1, Ordering::Relaxed);
         isr_rearm(&ISR_EPS[slot]);
-        isr_release_poll(slot);
+        isr_release_poll(slot); crate::hidstall::note_recovered(self.idx, self.int_eps[ep_i].kbd_target.addr, ((core::ptr::read_volatile(&(*self.int_eps[ep_i].qh).ep_chars) >> 8) & 0xF) as u8, ep_i); // HIDSTALL (B485): `[hid] recovered addr= ep= after_ms=`
     }
 
     /// Main-loop poll: ack USBSTS, then for each armed endpoint consume a completed report,
@@ -13883,12 +13883,12 @@ impl Controller {
                             // print on every boot; see the KBDFLAP section comment for the full derivation.
                             let h_chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
                             let (h_addr, h_ep) = (h_chars & 0x7F, (h_chars >> 8) & 0xF);
-                            let (h_class, h_recoverable) = halt_class(tok);
+                            let (h_class, h_recoverable) = halt_class(tok); let h_proxy = crate::hidstall::is_proxy(h_class, e.reports, e.mps, self.bt_radio.is_some()); crate::hidstall::note_halt(ep_i); // HIDSTALL (B485): the BT HID proxy told apart; the halt stamped for `after_ms=`
                             // Recover only the class §9.4.5 actually answers, only while budget remains, and
                             // only if the deferred-clear array has room. `n_clr` can reach `MAX_INT_EPS` only
                             // if every armed endpoint stalls in the SAME pass, in which case the last one is
                             // retired rather than dropped in silence — the `-> retire` word says which.
-                            let h_clear = h_recoverable
+                            let h_clear = (h_recoverable || crate::hidstall::xact_recoverable(h_class, h_proxy, e.reports)) // HIDSTALL (B485): a burst of bus errors on an endpoint that has carried input is cleared and re-armed, not retired
                                 && e.halt_clears < HALT_CLEARS_MAX
                                 && n_clr < clear_halts.len();
                             serial_println!(
@@ -13912,7 +13912,7 @@ impl Controller {
                                 e.halt_clears += 1;
                                 break;
                             }
-                            e.dead = true;
+                            e.dead = true; crate::hidstall::note_retired(idx, h_addr as u8, h_ep as u8, int_ep_kind(e), h_proxy, e.reports); // HIDSTALL (B485)
                             // DEADKBD5: record the retire for the post-walk consequence line. The
                             // STOP-NOTE above says WHAT died; the deferred line says what that
                             // MEANS — which surviving endpoint input rides now, or that none does.
@@ -14424,7 +14424,7 @@ impl Controller {
                     // unrecoverable halt has always landed — retired, with its held keys flushed.
                     let ctl = self.idx;
                     let e = &mut self.int_eps[ep_i];
-                    e.dead = true;
+                    e.dead = true; crate::hidstall::note_retired(ctl, t.addr, ep, int_ep_kind(e), false, e.reports); // HIDSTALL (B485): the clear was refused
                     // DEADKBD5: this is the second retire site — a device that refused §9.4.5's
                     // own recovery leaves the boot exactly as an unrecoverable halt does, so it
                     // owes the same consequence line (emitted just below, after this borrow ends).
