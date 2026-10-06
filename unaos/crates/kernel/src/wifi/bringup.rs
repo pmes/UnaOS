@@ -1891,6 +1891,9 @@ fn upload_ucode(bar0: u64, macctl: u32, w: &mut Writes) {
         return;
     }
 
+    // WIFI5 M3 (B415): the pre-image captures C2 + C1 and S5i's rung 0, read-only on the data side.
+    capture::pre_image(bar0, s.words, s.fnv, w);
+
     // ── The point of no return, announced BEFORE the first destructive write. ───────────────────
     serial_println!(
         ":: wifi2: upload BEGIN words={} fnv1a={:#010x} ioctl-found={:#010x} — DESTRUCTIVE from the next write: the prologue reset clears MACCTL.PSM_RUN (currently {}) and the resident image cannot be recovered (bcm4331.md §5 risk 4); the only exit is a successful upload + handshake, or a reboot ::",
@@ -2434,3 +2437,7 @@ fn phy_once(bar0: u64) {
         if restored { "MATCH" } else { "FAILED" },
     );
 }
+
+// WIFI5 M3 (B415): the pre-image captures (bcm4331.md §7 "Capture plan").
+#[cfg(feature = "wifi3")]
+mod capture;
