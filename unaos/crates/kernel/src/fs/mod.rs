@@ -193,3 +193,5 @@ pub mod search;
 /// UNAOSVOLUME (B427): `/jobs` on the UnaFS root — the jobs Mica writes, read here; the `[jobs]` line at login.
 #[cfg(feature = "unafs")]
 pub mod jobs;
+/// APPTRUST (B467): a program sighted on a removable volume is not a registrant until the user says so.
+pub mod apptrust;

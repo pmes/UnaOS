@@ -125,7 +125,8 @@ pub fn opener_for_in(mt: &MountTable, path: &str, mime: &str) -> (String, &'stat
         }
     }
     if let Some(v) = str_attr(mt, &obj, PREFERRED_KEY) {
-        return (appres::opener_of_preferred(mt, &v), "db");
+        let op = appres::opener_of_preferred(mt, &v);
+        if !crate::fs::apptrust::is_foreign(mt, &op) { return (op, "db"); } // APPTRUST (B467): the registry's choice never names a program off the system volume
     }
     match registrants_in(mt, mime).into_iter().next() {
         Some(r) => (r.opener, "registrant"),
