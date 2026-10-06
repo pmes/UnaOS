@@ -2511,9 +2511,13 @@ fn native_pick(fs: &FatFs, dir: &str, named: &Option<(&'static str, String)>, ki
 /// VOLUMES M1 — PRTSCR-ST's read-back for a native-root shot: the size the mount table holds.
 #[allow(dead_code)] // reached from PRTSCR-ST, whose caller is feature-gated
 fn native_readback(shot: &Shot) -> bool {
-    let p = alloc::format!("{}/{}", shot.dir, shot.name);
-    let ok = crate::shell::vfs_mount_table().stat(&p).map(|s| s.size as usize == shot.bytes).unwrap_or(false);
-    serial_println!(":: PRTSCR-ST: native read-back path={} bytes={} -> {} ::", p, shot.bytes, if ok { "PASS" } else { "FAIL" });
+    // PRTSCR4 (B493): read back the path the capture REPORTS (the mount table's, the one the toast names) and score
+    // that it is in the capture folder the theme names (`<home>/Desktop`) — a shot that lands anywhere else FAILs here.
+    let p = if shot.path.is_empty() { alloc::format!("{}/{}", shot.dir, shot.name) } else { shot.path.clone() };
+    let in_dir = p.rsplit_once('/').and_then(|(d, _)| d.rsplit('/').next()).map(|leaf| leaf.eq_ignore_ascii_case(DIR_CAPTURE.0)).unwrap_or(false);
+    let sized = crate::shell::vfs_mount_table().stat(&p).map(|s| s.size as usize == shot.bytes).unwrap_or(false);
+    let ok = sized && in_dir;
+    serial_println!(":: PRTSCR-ST: native read-back path={} bytes={} in_capture_dir={} -> {} ::", p, shot.bytes, if in_dir { "yes" } else { "no" }, if ok { "PASS" } else { "FAIL" });
     ok
 }
 
