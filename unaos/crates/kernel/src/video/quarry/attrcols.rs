@@ -66,7 +66,7 @@ pub struct AttrState {
     wrote: u32,
 }
 
-pub static ATTRS: crate::sync::Mutex<AttrState> = crate::sync::Mutex::new(AttrState {
+static POSTED: crate::video::svclatch::Latch = crate::video::svclatch::Latch::new(); /* SVCLATCH (B462): up while `pending` holds work; raised and lowered under ATTRS */ pub static ATTRS: crate::sync::Mutex<AttrState> = crate::sync::Mutex::new(AttrState {
     dir: String::new(),
     keys: Vec::new(),
     avail: Vec::new(),
@@ -214,6 +214,7 @@ pub fn after_meta(mt: &MountTable, cwd: &str, list: &[DirEnt], meta: &mut Vec<Ro
         for e in list.iter().filter(|e| matches!(e.kind, NodeKind::File)).take(SCAN_CAP) {
             st.pending.push_back(join(cwd, &e.name));
         }
+        POSTED.settle(!st.pending.is_empty()); // SVCLATCH (B462)
     }
     if !keys.is_empty() {
         serial_println!("[attrcols] view dir={} cols={} avail={}", cwd, keys.join(","), st.avail.len());
@@ -222,16 +223,17 @@ pub fn after_meta(mt: &MountTable, cwd: &str, list: &[DirEnt], meta: &mut Vec<Ro
 
 /// A file Quarry just opened: its facts first on the next service pass.
 pub fn queue_open(path: &str) {
-    ATTRS.lock().pending.push_front(String::from(path));
+    let mut st = ATTRS.lock(); st.pending.push_front(String::from(path)); POSTED.post(); // SVCLATCH (B462): raised under the lock the drain lowers it under
 }
 
 /// Quarry's service pass (chained from `columns::service`): refresh up to [`PER_PASS`] queued files' facts; when
 /// the queue drains after a write, re-read the listing so the values show.
 pub fn service() {
+    if !POSTED.open() { return; } // SVCLATCH (B462): a quiet pass is one atomic load, no lock
     let batch: Vec<String> = {
         let mut st = ATTRS.lock();
         let n = st.pending.len().min(PER_PASS);
-        st.pending.drain(..n).collect()
+        let b: Vec<String> = st.pending.drain(..n).collect(); POSTED.settle(!st.pending.is_empty()); crate::video::svclatch::found(!b.is_empty()); b
     };
     if batch.is_empty() {
         return;

@@ -407,7 +407,7 @@ static FILES: crate::sync::Mutex<Vec<search::Hit>> = crate::sync::Mutex::new(Vec
 static SNAP_OWED: AtomicBool = AtomicBool::new(false);
 static RANK_OWED: AtomicBool = AtomicBool::new(false);
 static PAINT_OWED: AtomicBool = AtomicBool::new(false);
-static PICK: crate::sync::Mutex<Option<Item>> = crate::sync::Mutex::new(None);
+static PICK: crate::sync::Mutex<Option<Item>> = crate::sync::Mutex::new(None); static PICK_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); // SVCLATCH (B462)
 static LRU: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 static LRU_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
 static LRU_OWED: AtomicBool = AtomicBool::new(false);
@@ -614,7 +614,7 @@ fn take_selected() -> Option<Item> {
 }
 
 fn owe_pick(it: Item) {
-    *PICK.lock() = Some(it);
+    *PICK.lock() = Some(it); PICK_POSTED.post(); // SVCLATCH (B462)
     close();
     #[cfg(not(feature = "quarry"))]
     service();
@@ -920,7 +920,7 @@ fn rerank() {
 
 /// **The pass** — chained from `settings::service` (the desktop's service tick). Idle: four atomic loads.
 pub fn service() {
-    if let Some(it) = PICK.lock().take() {
+    if let Some(it) = PICK_POSTED.take(&PICK) { // SVCLATCH (B462): no lock on a quiet pass
         lru_load();
         let _ = act(&it);
     }

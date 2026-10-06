@@ -61,7 +61,7 @@ const DIM_TEXT: u32 = super::theme::PLAYER_DIM_TEXT;
 const KNOB_EDGE: u32 = super::theme::PLAYER_KNOB_EDGE;
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
-static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None); static PENDING_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); static ACT_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); // SVCLATCH (B462): the posted flags the pass reads before the locks
 static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 /// F7/F8/F9 latched by the HID service: 0 none, 1 previous, 2 play/pause, 3 next.
 static MEDIA: AtomicU8 = AtomicU8::new(0);
@@ -76,7 +76,7 @@ enum Act {
 }
 
 fn post(a: Act) {
-    *ACT.lock() = Some(a);
+    *ACT.lock() = Some(a); ACT_POSTED.post(); // SVCLATCH (B462)
 }
 
 /// What the pointer holds: nothing, the scrubber, the volume knob.
@@ -168,7 +168,7 @@ pub fn shown() -> String {
 
 /// Latch `path` for [`service`] (click-router safe). Quarry's `play` opener.
 pub fn request_open(path: &str) {
-    *PENDING.lock() = Some(String::from(path));
+    *PENDING.lock() = Some(String::from(path)); PENDING_POSTED.post(); // SVCLATCH (B462)
 }
 
 /// F7 (`0`), F8 (`1`), F9 (`2`) went down. Atomics only (the HID service's context).
@@ -326,7 +326,7 @@ pub fn close(by: &str) {
 /// clock and the end of the play.
 pub fn service() {
     ensure_registered();
-    let want = PENDING.lock().take();
+    let want = PENDING_POSTED.take(&PENDING); // SVCLATCH (B462): no lock on a quiet pass
     if let Some(p) = want {
         match open(&p) {
             Ok(_) => serial_println!("[quarry] open PLAY consumed=player path={}", p),
@@ -341,7 +341,7 @@ pub fn service() {
     if k != 0 {
         media(k);
     }
-    let a = ACT.lock().take();
+    let a = ACT_POSTED.take(&ACT); // SVCLATCH (B462)
     match a {
         Some(Act::Toggle) => toggle(),
         Some(Act::Seek(ms)) => {

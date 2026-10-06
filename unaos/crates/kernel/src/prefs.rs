@@ -388,7 +388,7 @@ fn load() {
 static LOAD_CLAMPED: AtomicU32 = AtomicU32::new(0);
 
 /// Load once per login (and once with no session). Cheap when nothing changed.
-pub fn ensure_loaded() {
+pub fn ensure_loaded() { let (sk, sq) = PREFS_SEEN.check(); if sq.is_some() { return; } PREFS_SEEN.mark(sk, true); // SESSIONGEN (B462): the session and this load's state are unchanged since the last compare — one load, no lock
     let mut wb = [0u8; WHO_BUF];
     let u = user_name_in(&mut wb).unwrap_or(""); // PERFREVIEW F3 (B443): compared on the stack; a String only when the session changed
     let fresh = {
@@ -939,7 +939,7 @@ pub fn selftest() {
     let wire_ok = ks == 0 && ks == rs && kt == rt && kt == b"100\x00clamped=true";
     // Leg L, the load clamp: a file holding an out-of-range value loads clamped, once, and is re-saved so.
     let _ = write_all(&p, b"[system]\npower.lowbat_shutdown_pct = 250\n");
-    *LOADED_FOR.lock() = None;
+    *LOADED_FOR.lock() = None; PREFS_SEEN.forget(); // SESSIONGEN (B462): after the clear
     ensure_loaded();
     let refile = read_all(&p).and_then(|b| String::from_utf8(b).ok()).and_then(|t| PrefTree::parse(&t).ok());
     let loadclamp_ok = LOAD_CLAMPED.load(Ordering::Relaxed) == 1
@@ -948,7 +948,7 @@ pub fn selftest() {
     // Leg 3 — a malformed file: refused with its line, nothing adopted, defaults hold, saves held.
     let bad = b"[system]\ndisplay.brightness = 3\nrecents = [\"a\"]\n";
     let _ = write_all(&p, bad);
-    *LOADED_FOR.lock() = None;
+    *LOADED_FOR.lock() = None; PREFS_SEEN.forget(); // SESSIONGEN (B462): after the clear
     FIXTURE_QUIET.store(true, Ordering::Release);
     ensure_loaded();
     FIXTURE_QUIET.store(false, Ordering::Release);
@@ -1205,4 +1205,52 @@ pub fn prefscap_selftest() {
         if capped { prefs_core::declare::MAX_PROGRAMS } else { 0 }, decl_own as u8, if decl_foreign { "refused" } else { "HELD" },
         deputy, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── SESSIONGEN (rmbp-ledger B462, PERFREVIEW F3's follow-up) ─────────────────────────────────────────────────
+
+/// The login generation (`fs::users::SESSION_GEN`); 0 without `login`.
+pub fn session_gen() -> u32 {
+    #[cfg(feature = "login")]
+    {
+        crate::fs::users::SESSION_GEN.load(Ordering::Acquire)
+    }
+    #[cfg(not(feature = "login"))]
+    {
+        0
+    }
+}
+
+/// One per-pass session consumer's last compare, keyed by (login generation, this consumer's forget epoch).
+/// [`SessionSeen::check`] is read BEFORE the compare and [`SessionSeen::mark`]ed with that key, so a login,
+/// a logout or a [`SessionSeen::forget`] (the consumer cleared its own record — call it AFTER the clear) that
+/// lands mid-pass leaves the key moved and the next pass compares again. Stale marks only ever match a key
+/// that nothing has moved since.
+pub(crate) struct SessionSeen {
+    seen: core::sync::atomic::AtomicU64,
+    epoch: AtomicU32,
+}
+
+static PREFS_SEEN: SessionSeen = SessionSeen::new();
+
+impl SessionSeen {
+    pub(crate) const fn new() -> Self {
+        SessionSeen { seen: core::sync::atomic::AtomicU64::new(0), epoch: AtomicU32::new(0) }
+    }
+
+    /// The pass's key, and — when the last compare was made under the same key — whether a session was open.
+    pub(crate) fn check(&self) -> (u64, Option<bool>) {
+        let k = ((session_gen() as u64) << 32) | (((self.epoch.load(Ordering::Acquire) as u64) & 0x3FFF_FFFF) << 2) | 2;
+        let s = self.seen.load(Ordering::Acquire);
+        (k, if s & !1 == k { Some(s & 1 == 1) } else { None })
+    }
+
+    pub(crate) fn mark(&self, k: u64, some: bool) {
+        self.seen.store(k | some as u64, Ordering::Release);
+    }
+
+    #[allow(dead_code)] // used by the selftest and login items, absent on some arms
+    pub(crate) fn forget(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
 }
