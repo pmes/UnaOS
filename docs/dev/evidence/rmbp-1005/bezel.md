@@ -40,3 +40,20 @@ then `tests bezel` -> `:: BEZEL: … -> PASS ::`.
 an opaque dark face with a drawn rounded frame (a compositor alpha row is the seat's design question). The
 fade is a close at 1500 ms, not an alpha ramp. aarch64: wire-only (no overlay row there — the toast's
 shape). No knob: the bezel rides `wc` (x86) like the toast.
+
+## M4 (the seat's answers, 2026-10-06)
+
+- **(b) The bar's readouts are retired.** The menubar's `BRT nn/16` item (`status::bright_*`, the model's
+  `bright` field, its signature term and its draw) and the caption's `vol=N/16` / `muted` overlay
+  (`status::osd_*`) are deleted; the bezel is the readout and `[bezel] show … level=<n>/16` carries the value.
+  The fixtures that read them now read the bezel: `:: BRIGHTKEYS: … indicator=` is `bezel::indicator()` =
+  brightness right after the key; `:: VOLKEYS: … indicator=` is the bezel armed/showing after each key (disarmed
+  before each key and after the fixture, so a test's key never flashes on the glass). The bar's volatile mask
+  (`volatile_rects`, `bright_slot`) keeps its slot.
+- **(a) COMPALPHA — owed, its own arc after GPUBLIT.** A translucent bezel needs a compat row the compositor
+  BLENDS (per-pixel alpha, or one row alpha) instead of copying. Expected cost on the CPU blitter: the bezel is
+  200x200 logical = 400x400 physical on the rMBP (160k px); a blend reads the backdrop and the surface and
+  writes the result, ~3 memory touches/px, so ~0.5–1 ms per composite that touches the bezel's rect (against
+  ~3.8 ms for a whole pass), and every damage UNDER the bezel (a vug frame, the cursor) re-blends that rect while
+  it shows. An alpha fade (say 12 frames over 200 ms) is 12 such passes. Cheap once GPUBLIT owns the blend;
+  on the CPU blitter it is a measurable tax on the very pass INPUTSTALL is chasing — hence later.

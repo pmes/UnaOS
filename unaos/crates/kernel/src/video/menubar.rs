@@ -865,8 +865,6 @@ struct Model {
     /// current, the voltage and the age are on the wire and nowhere near the damage test, which is
     /// what keeps the bar's `paints=` flat while the meter ticks at 10 s.
     batt: Option<super::status::BarItem>,
-    /// BRIGHTKEYS: the transient backlight level (`0..=16`), `Some` for 1.5 s after a brightness key.
-    bright: Option<u8>,
 }
 
 impl Model {
@@ -879,7 +877,6 @@ impl Model {
             cap_owner: wm::WIN_NONE,
             menus: super::winmenu::BarSnapshot::empty(),
             batt: None,
-            bright: None,
         }
     }
 
@@ -940,9 +937,7 @@ impl Model {
         // the SMC transaction that produced this number ran ten seconds ago on the device-service
         // task (`super::status::poll`). A bar that read the SMC here would wait on six bounded
         // handshakes with interrupts off.
-        m.batt = super::status::bar_item();
-        m.bright = super::status::bright_item(); // BRIGHTKEYS
-        m.batt = super::status::bar_item(); super::status::osd_overlay(&mut m.title, &mut m.title_len); // VOLKEYS: transient vol=N/16 / muted over the caption
+        m.batt = super::status::bar_item(); // BEZEL (B405): the bar's `BRT nn/16` item and the caption's `vol=N/16` / `muted` are retired — the bezel is the readout
         m.clock = clock_hhmm(); #[cfg(feature = "sntp6")] if m.clock.is_none() { barclock_note(None); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the UNSYNCED half of the bar's clock witness, latched to one line per boot at the file tail. It is reported from the MODEL, not the painter, because the painter's clock branch never runs when there is nothing to draw — which is precisely the state this half exists to say aloud.
         (m, clobbered)
     }
@@ -989,14 +984,6 @@ impl Model {
                 h = strip::fnv1a(h, 1);
                 h = strip::fnv1a(h, b.percent as u8);
                 h = strip::fnv1a(h, b.charging as u8);
-            }
-            None => h = strip::fnv1a(h, 0),
-        }
-        // BRIGHTKEYS — the transient level item: drawn state = the level, and its expiry.
-        match self.bright {
-            Some(l) => {
-                h = strip::fnv1a(h, 1);
-                h = strip::fnv1a(h, l);
             }
             None => h = strip::fnv1a(h, 0),
         }
@@ -2000,17 +1987,6 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         }
         let tx = bx0 + BATT_GLYPH_W() + BATT_GAP();
         super::text::draw_row(out, w, &pct, (tx + BATT_PCT_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&pct, false, FACE)), sy, theme::TITLE_TEXT_INACTIVE, false, FACE); // KERNELFONT: right-aligned in its slot by the shaped width
-    }
-
-    // BRIGHTKEYS — the transient `BRT nn/16` item, one PAD left of the battery's slot (which is
-    // reserved whether or not the board has a battery, so the item never lands on the clock).
-    if let (Some(l), Some(bx0)) = (m.bright, bright_slot(w)) {
-        let l = l.min(16);
-        let mut t = *b"BRT 00/16";
-        t[4] = b'0' + l / 10;
-        t[5] = b'0' + l % 10;
-        if l < 10 { t[4] = b' '; }
-        super::text::draw_row(out, w, &t, bx0, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
     }
 
     // Clock, right, at one PAD from the far edge — the crystal holds the LEFT corner, so nothing of

@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! BRIGHTKEYS — the brightness keys (F1/F2) step the panel backlight through the gmux, and the
-//! menu bar shows the level for 1.5 s.
+//! bezel (`video::bezel`, B405) shows the level for 1.5 s.
 //!
 //! Two halves, split by context. [`key`] runs where the HID decoder pushes its `Action` (interrupt
 //! or device-service context): it only moves the level, raises a pending flag and starts the bar's
@@ -24,11 +24,10 @@
 //! writer — floor, gmux register, readback) and prints the witness.
 //!
 //! `:: BRIGHTKEYS: key=<up|down> level=<n>/16 gmux_written=<0|1> indicator=1 -> PASS ::`
-//! `indicator=1` is measured (`status::bright_item()` answers `Some(level)` right after the key),
+//! `indicator=1` is measured (the bezel is armed or showing brightness right after the key),
 //! `gmux_written=1` only when the register READ BACK the value written (BRIGHTFLOOR).
 
 use crate::video::keymap::Action;
-use crate::video::status;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Backlight steps (`0..=16` in the step rule; the lit range is `backlight::FLOOR..=STEPS`).
@@ -50,12 +49,10 @@ pub fn key(act: Action) {
     // GLASSLAG M3 (B370): the step is judged against the register's known value — a Down that would not
     // darken (the panel already at or below the floor) writes nothing; see `backlight::next_level`.
     crate::video::bezel::arm(crate::video::bezel::K_BRIGHT); // BEZEL (B405): the bezel shows on every press, at the limit too
-    let Some(lv) = crate::video::backlight::stage_step(up) else {
-        status::bright_show(crate::video::backlight::level());
+    let Some(_lv) = crate::video::backlight::stage_step(up) else {
         return;
     };
     PENDING.store(if up { 2 } else { 1 }, Ordering::Release);
-    status::bright_show(lv);
 }
 
 /// Desktop service pass: apply a pending step through THE backlight writer and witness it. R80: the
@@ -75,7 +72,6 @@ pub fn selftest() {
         key(act);
         apply(false);
     }
-    status::bright_clear();
     crate::video::bezel::arm(crate::video::bezel::K_NONE); // BEZEL: the fixture's keys do not flash the bezel
     let _ = crate::video::backlight::stage(prev);
 }
@@ -89,7 +85,7 @@ fn apply(write: bool) {
     // BRIGHTFLOOR: `gmux_written` is the READBACK verdict now (the register holds the value written,
     // nonzero), not "the transaction completed".
     let written = write && crate::video::backlight::set_level_via(lv, "keys").on;
-    let indicator = status::bright_item() == Some(lv);
+    let indicator = crate::video::bezel::indicator() == crate::video::bezel::K_BRIGHT;
     serial_println!(
         ":: BRIGHTKEYS: key={} level={}/{} gmux_written={} indicator={} -> {} ::",
         if p == 2 { "up" } else { "down" }, lv, STEPS, written as u8, indicator as u8,
