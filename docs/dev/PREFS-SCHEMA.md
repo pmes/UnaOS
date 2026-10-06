@@ -10,7 +10,7 @@ or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keep
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
 operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
 
-Rows: 35.
+Rows: 36.
 
 | key | type | default | writers | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -27,6 +27,7 @@ Rows: 35.
 | `system.dock.pins` | string ≤256 printable | consumer: every pin the build carries (lumen only on a `lumen` build) | dock | kernel dock | Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen); TOML arrays are outside the subset. |
 | `system.dock.position` | enum `bottom \| left \| right` | `"bottom"` | settings, dock | kernel dock | The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock. |
 | `system.login.items` | string ≤256 printable | `""` | settings, dock | kernel login items (`video/loginitems.rs`) | Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login. |
+| `system.notify.dnd` | bool | `false` | settings | kernel NOTIFY (`video/notify.rs`) | Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows) (NOTIFY, MACPARITY row 24). Edited in Settings > General > Do Not Disturb. |
 | `system.pointer.speed` | int `0..=2` | `1` | settings | kernel settings (pointer) | 0 slow, 1 normal, 2 fast. |
 | `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | operator | kernel POWERMENU | Battery percent at which the machine shuts down; 0 = off. |
 | `system.settings.tab` | int `0..=4` | `0` | settings | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items). |

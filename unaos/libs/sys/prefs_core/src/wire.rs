@@ -362,6 +362,7 @@ system.display.wallpaper = \"\"\n\
 system.dock.autohide = false\n\
 system.dock.position = \"bottom\"\n\
 system.login.items = \"\"\n\
+system.notify.dnd = false\n\
 system.pointer.speed = 1\n\
 system.settings.tab = 0\n";
         assert_eq!(run(&mut s, VERB_LIST, b"system", false), (0, GOLDEN.to_vec()));
