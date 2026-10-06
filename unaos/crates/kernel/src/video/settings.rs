@@ -56,14 +56,14 @@ pub const IDLE_STEPS: [u32; 8] = [0, 1, 2, 5, 10, 15, 30, 60];
 const PTR_NAMES: [&str; 3] = ["slow", "normal", "fast"];
 const WALL_MAX: usize = 120;
 
-const WIN_W: usize = 600; // APPEARANCE (B408): 520 -> 600 for the sixth tab
+const WIN_W: usize = 800; // NOTIFYPANE (B435): 600 -> 800 for "Notifications". APPEARANCE (B408): 520 -> 600 for the sixth tab
 const TAB_H: usize = 28;
 const TOP: usize = 12 + TAB_H;
 const ROW_H: usize = 40;
 const ROWS: usize = 10;
 /// The tab strip: General · Users · Display · About.
-pub const TABS: usize = 7;
-const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad"]; // PREFSUI (R91): Login Items · APPEARANCE (B408) tab 5 · TRACKPADPANE (B412) tab 6
+pub const TABS: usize = 8;
+const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "Notifications"]; // NOTIFYPANE (B435): the last tab, NP_TAB · PREFSUI (R91): Login Items · APPEARANCE (B408) tab 5 · TRACKPADPANE (B412) tab 6
 const WIN_H: usize = TOP + ROWS * ROW_H + 8;
 const LABEL_X: usize = 12;
 const TRACK_X: usize = 150;
@@ -355,6 +355,7 @@ pub fn service() {
     super::launcher::service(); // LAUNCHER (B417): the launcher's pass (snapshot, ranking, picks, the recency file) — off the input router
     crate::prefs::service(); super::loginitems::service(); super::settingsfiles::service(); super::appearance::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
+    if super::notifypane::take_stale() && is_open() && cur_tab() == NP_TAB { repaint(); } // NOTIFYPANE (B435): a newly seen app joins the open pane
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
     if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
     if let Some(u) = user_name() {
@@ -466,7 +467,8 @@ fn paint(st: &mut State, v: &Values) {
         1 => paint_users(st),
         2 => paint_display(st, v),
         4 => paint_login(st), 5 => paint_appearance(st), // APPEARANCE (B408)
-        TP_TAB => paint_trackpad(st), // TRACKPADPANE (B412): TP_TAB = 6
+        t if t as usize == TP_TAB => paint_trackpad(st), // TRACKPADPANE (B412): TP_TAB = 6 (NOTIFYPANE: a guard — `v.tab` is u8, the const usize; 4ead840a did not type-check here)
+        t if t as usize == NP_TAB => paint_notifypane(st), // NOTIFYPANE (B435)
         _ => paint_about(st),
     }
     // SETTINGSFILES (B407, R98): the pane's file, as a link that reveals `<home>/settings` in Quarry.
@@ -503,7 +505,7 @@ fn paint_general(st: &mut State, v: &Values) {
     let who = user_name().unwrap_or_else(|| String::from("(no session)"));
     txt(st, TRACK_X, 5, &who);
     btn(st, 5, VAL_X - 30, "Password");
-    paint_dock_rows(st); paint_dnd_row(st); // NOTIFY (B418): row 8 — Do Not Disturb. DOCK2 (B394): rows 6/7 — the dock's edge and auto-hide
+    paint_dock_rows(st); // NOTIFYPANE (B435): Do Not Disturb moved to the Notifications tab. DOCK2 (B394): rows 6/7 — the dock's edge and auto-hide
 }
 
 fn paint_display(st: &mut State, v: &Values) {
@@ -992,6 +994,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         1 => press_users(row, cx),
         4 => press_login(row, cx), 5 => press_appearance(row, cx), // APPEARANCE (B408)
         TP_TAB => press_trackpad(row, cx), // TRACKPADPANE (B412)
+        t if t == NP_TAB => press_notifypane(row, cx), // NOTIFYPANE (B435)
         2 => {
             if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
@@ -1019,7 +1022,6 @@ fn press_general(row: usize, cx: usize) {
         }
         5 => { if cx >= VAL_X - 30 && cx < VAL_X - 30 + BTN_W { select(8); change_password(); } }
         6 | 7 => dock_rows_press(row, cx), // DOCK2 (B394)
-        8 => dnd_row_press(cx), // NOTIFY (B418)
         _ => {}
     }
 }
@@ -1788,6 +1790,8 @@ fn press_appearance(row: usize, cx: usize) {
     };
     super::appearance::choose(kind, i);
     say(key, name, true);
+    repaint();
+} // NOTIFYPANE: the close merge17 lost (4ead840a did not parse here)
 
 // ── TRACKPADPANE (rmbp-ledger B412, MACPARITY row 16) — the Trackpad tab ───────────────────────────────────────────
 // Row 0 Tracking speed (a slider 1..10 that DRAGS through PREFSUI's capture seam, applied live as one gain on the
@@ -2060,24 +2064,81 @@ fn take_at(tab: usize) -> (usize, bool) {
     (first, true)
 }
 
-// ── NOTIFY (rmbp-ledger B418) — Do Not Disturb on the General tab (row 8): `system.notify.dnd` ───────────────────────
-// The box applies LIVE through NOTIFY's cell (`notify::set_dnd`) and latches ONE store write, drained on NOTIFY's
-// service pass (never a bus write in the click router). A Settings > Notifications pane is owed.
+// ── NOTIFYPANE (rmbp-ledger B435, MACPARITY rows 24/26) — the Notifications tab ─────────────────────────────────────
+// Row 0 Do Not Disturb (NOTIFY's cell, `notify::set_dnd`, moved here from General row 8); row 1 its schedule, from / until
+// a local hour stepped by -/+ (equal = no schedule); row 2 the column heads; rows 3..=8 the apps NOTIFY has seen (its
+// posts) and the stored stanzas: Allow, Banner/Center, Sound; row 9 the `settings/notify` link. Every change applies
+// LIVE in `notifypane`'s cell and latches ONE store write drained on NOTIFY's service pass (never a bus call here).
 
-fn paint_dnd_row(st: &mut State) {
-    txt(st, LABEL_X, 8, "Do Not Disturb");
-    fill(&mut st.surf, st.w, TRACK_X, TOP + 8 * ROW_H + 8, 24, 24, theme::scroll_track());
-    let on = super::notify::dnd();
-    if on { fill(&mut st.surf, st.w, TRACK_X + 4, TOP + 8 * ROW_H + 12, 16, 16, theme::accent()); }
-    txt(st, VAL_X, 8, if on { "on" } else { "off" });
+/// The Notifications tab's index on the strip (the last tab; FILETYPES precedes it at the fold).
+pub const NP_TAB: usize = TABS - 1;
+const NP_ROW0: usize = 3;
+const NP_APP_ROWS: usize = 6;
+const NP_ALLOW_X: usize = 300;
+const NP_STYLE_X: usize = 400;
+const NP_SOUND_X: usize = 540;
+const NP_STEP_W: usize = 28;
+/// Row 1's -/+ boxes: from-, from+, until-, until+ (x of each box).
+const NP_STEPS: [usize; 4] = [TRACK_X, TRACK_X + 90, TRACK_X + 150, TRACK_X + 240];
+
+fn np_box(st: &mut State, r: usize, x: usize, on: bool) {
+    fill(&mut st.surf, st.w, x, TOP + r * ROW_H + 8, 24, 24, theme::scroll_track());
+    if on { fill(&mut st.surf, st.w, x + 4, TOP + r * ROW_H + 12, 16, 16, theme::accent()); }
 }
 
-fn dnd_row_press(cx: usize) {
-    if cx < TRACK_X || cx >= TRACK_X + 24 {
-        return;
+fn np_step(st: &mut State, x: usize, t: &str) {
+    fill(&mut st.surf, st.w, x, TOP + ROW_H + 8, NP_STEP_W, 24, theme::button_face());
+    txt(st, x + 10, 1, t);
+}
+
+fn paint_notifypane(st: &mut State) {
+    let np = super::notifypane::window();
+    let dnd = super::notify::dnd();
+    txt(st, LABEL_X, 0, "Do Not Disturb");
+    np_box(st, 0, TRACK_X, dnd);
+    let sched = super::notifypane::in_window_now();
+    txt(st, TRACK_X + 36, 0, if dnd { "on" } else if sched { "on (scheduled)" } else { "off" });
+    txt(st, LABEL_X, 1, "Scheduled");
+    for (k, x) in NP_STEPS.iter().enumerate() { np_step(st, *x, if k % 2 == 0 { "-" } else { "+" }); }
+    txt(st, NP_STEPS[0] + NP_STEP_W + 8, 1, &alloc::format!("{:02}:00", np.0));
+    txt(st, NP_STEPS[2] + NP_STEP_W + 8, 1, &alloc::format!("{:02}:00", np.1));
+    txt(st, NP_STEPS[3] + NP_STEP_W + 12, 1, if np.0 == np.1 { "no schedule (from = until)" } else { "quiet in this window" });
+    txt(st, LABEL_X, 2, "App");
+    txt(st, NP_ALLOW_X - 4, 2, "Allow");
+    txt(st, NP_STYLE_X, 2, "Style");
+    txt(st, NP_SOUND_X - 4, 2, "Sound");
+    let rows = super::notifypane::rows();
+    if rows.is_empty() { txt(st, LABEL_X, NP_ROW0, "No app has posted a notification yet."); }
+    for (k, (name, r)) in rows.iter().take(NP_APP_ROWS).enumerate() {
+        let row = NP_ROW0 + k;
+        txt(st, LABEL_X, row, name);
+        np_box(st, row, NP_ALLOW_X, r.allow);
+        btn(st, row, NP_STYLE_X, if r.center { "Center" } else { "Banner" });
+        np_box(st, row, NP_SOUND_X, r.sound);
     }
-    let on = !super::notify::dnd();
-    super::notify::set_dnd(on, true);
-    say("notify_dnd", if on { "1" } else { "0" }, true);
+    if rows.len() > NP_APP_ROWS { txt(st, NP_SOUND_X + 40, NP_ROW0 + NP_APP_ROWS - 1, &alloc::format!("+{} more", rows.len() - NP_APP_ROWS)); }
+}
+
+fn press_notifypane(row: usize, cx: usize) {
+    let on_box = |x: usize| cx >= x && cx < x + 24;
+    match row {
+        0 if on_box(TRACK_X) => {
+            let on = !super::notify::dnd();
+            super::notify::set_dnd(on, true);
+            say("notify_dnd", if on { "1" } else { "0" }, true);
+        }
+        1 => {
+            let Some(k) = NP_STEPS.iter().position(|x| cx >= *x && cx < *x + NP_STEP_W) else { return };
+            super::notifypane::step_window(k / 2, if k % 2 == 0 { -1 } else { 1 });
+        }
+        r if (NP_ROW0..NP_ROW0 + NP_APP_ROWS).contains(&r) => {
+            let i = r - NP_ROW0;
+            if on_box(NP_ALLOW_X) { super::notifypane::toggle(i, 0); }
+            else if cx >= NP_STYLE_X && cx < NP_STYLE_X + BTN_W { super::notifypane::toggle(i, 1); }
+            else if on_box(NP_SOUND_X) { super::notifypane::toggle(i, 2); }
+            else { return; }
+        }
+        _ => return,
+    }
     repaint();
 }
