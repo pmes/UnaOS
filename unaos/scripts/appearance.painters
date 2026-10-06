@@ -1,0 +1,13 @@
+# appearance.painters — PAINTERSCOPE (B482): every kernel file OUTSIDE crates/kernel/src/video/ that puts a colour on
+# the glass. appearance-check.py scans video/ plus these files for colour literals (they belong in video/theme.rs).
+# This is a PAINTER-FILE list, not an allowlist: a file outside video/ that calls a colour sink (the FrameBuffer
+# put/fill/line/scroll methods, the text rasteriser's draw_*, the Pal trait's draw/fill/clear) and is NOT named here
+# fails the gate as an `unlisted painter`; a row whose file is gone fails it too.
+#   <path under crates/kernel/src>   <what it paints>
+console.rs                      the shell console: ground, input ink, selection, scrollback band
+ui_status.rs                    the status strip, the pulse instrument panel, the core meters, the LED ramp
+splash.rs                       the boot splash: backdrop, beam, spectrum, facet lines, the takeover caption
+pal.rs                          the Pal trait's default painters and the shared pointer (fill + shadow)
+selftest.rs                     the offscreen pal / glyph vectors
+main.rs                         the desktop clears of the boot pumps
+arch/aarch64/display_tegra.rs   the Orin format bars, the composite quadrant card, the ladder and rastglass papers
