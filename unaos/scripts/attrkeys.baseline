@@ -1,0 +1,8 @@
+# GATE-ATTRKEYS baseline (B452): key-shaped literals outside una_abi::attr_keys. SHRINK-ONLY.
+# arch/x86_64/pci.rs: PCI class labels in lspci output (not attribute keys).
+# unafs tests/boot80_logic.rs: commit-size fixtures over an arbitrary key (unafs links no una-abi).
+attrkey|unaos/crates/kernel/src/arch/x86_64/pci.rs|media:audio-legacy
+attrkey|unaos/crates/kernel/src/arch/x86_64/pci.rs|media:hda
+attrkey|unaos/libs/fs/unafs/tests/boot80_logic.rs|una:icon
+attrkey|unaos/libs/fs/unafs/tests/boot80_logic.rs|una:name
+attrkey|unaos/libs/fs/unafs/tests/boot80_logic.rs|una:opener

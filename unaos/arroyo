@@ -9041,6 +9041,16 @@ BRACEPY
         [ "$_chrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a kernel file declares no owning handler, or writes a dotfile off the allowlist (see GATE-CHARTER above)${COLOR_RESET}"; return 1; }
     fi
 
+    # GATE-ATTRKEYS (ATTRKEYS, B452, ARCH-2026-10-06 F9): every attribute key both rings use is declared once in
+    #   `una_abi::attr_keys`; a `"una:`/`"media:`/`"doc:`/`"image:`/`"job:`/`"bt.` literal elsewhere is refused
+    #   (shrink-only baseline `scripts/attrkeys.baseline`). Selftest controls first; exit 2 is NO verdict.
+    local _akrc=0
+    python3 "$WORKSPACE_DIR/scripts/attrkeys-check.py" "$WORKSPACE_DIR" || _akrc=$?
+    if [ "$_akrc" -ne 0 ]; then
+        [ "$_akrc" -eq 2 ] && echo -e "${COLOR_RED}❌ attrkeys gate gave NO VERDICT — its controls did not fire, which is not a clean tree${COLOR_RESET}"
+        [ "$_akrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — an attribute key is spelled outside una_abi::attr_keys (see GATE-ATTRKEYS above)${COLOR_RESET}"; return 1; }
+    fi
+
     # GATE-STATUS (STATUSTABLE, B425, 2026-10-06; Peter: "one status table to rule them all so a false claim
     #   ... can never be made"): every flew/unflown/confirmed/refuted claim in a ledger status cell or a queue
     #   STATE line cites an ST<n> row of docs/dev/STATUS.tsv, and a confirmed/refuted row's quoted line is found

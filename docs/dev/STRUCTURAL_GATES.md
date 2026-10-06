@@ -2558,3 +2558,20 @@ longer claims, fails as stale — the baseline only shrinks, and a new claiming 
 uncited claiming cell, a citation of a missing row, a bad status, and a stale baseline key; the good tree, the
 enum head and a grandfathered cell pass. At the cut: 42 rows (23 confirmed, 5 refuted, 4 parked, 3 open,
 7 unflown), every quoted line found; 188 claiming cells grandfathered; under 1 s.
+
+## GATE-ATTRKEYS — an attribute key is spelled once, in `una_abi::attr_keys` (B452, 2026-10-06)
+
+**Why.** ARCH-2026-10-06 F9: the attribute names had six homes (fs/filetype, fs/assoc, fs/attrfacts, fs/appres,
+una-abi's trash block, midden_core's RES_KEY_*) and raw literals in player.rs, bthid.rs and vein's vault. The
+spellings are on-disk format; a respelled copy is a silent split (R79).
+
+**The gate.** `python3 unaos/scripts/attrkeys-check.py`, run by `./arroyo check` after GATE-CHARTER. Every `.rs`
+file of both rings (unaos/crates, unaos/libs, libs, handlers, vessels, tools) is read; a code literal beginning
+`"una:` `"media:` `"doc:` `"image:` `"job:` or `"bt.` outside `unaos/crates/una-abi/src/lib.rs` is a finding
+`attrkey|<file>|<literal>`. Today's non-key sites (PCI class labels in pci.rs, unafs commit-size fixtures) are
+`unaos/scripts/attrkeys.baseline`, shrink-only (a gone site fails as STALE). In the registry, a `const` assert
+refuses two equal keys or a key with no namespace at compile time on every leg; `cargo test -p una-abi attrkeys`
+says the same on the host. Shaped as one leg for GATE-ARCH (arch-check.py) to absorb.
+
+**Go-red.** `--selftest`: a planted `"media:planted"` fails; baselined it passes; a stale baseline row fails; an
+unparsable row and a scope under its floor are exit 2; a literal inside a `//` comment is not a finding.
