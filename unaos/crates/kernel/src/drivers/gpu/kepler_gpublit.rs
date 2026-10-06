@@ -882,6 +882,126 @@ fn detail(st: &StOut) {
     );
     detail_host();
     detail_walls();
+    detail_decode();
+}
+
+// ---- M3 — the PBDMA / channel path read again from the top, every word decoded (DRIVERS-METHOD §7) --------------
+
+/// PFIFO_INTR bits as nouveau `gk104_fifo_intr` takes them. // nouveau gk104.c:660-720
+const PFIFO_INTR_NAMES: &[(u32, &str)] = &[
+    (0x0000_0001, "BIND_ERROR"), (0x0000_0010, "PIO_ERROR"), (0x0000_0100, "SCHED_ERROR"), (0x0001_0000, "CHSW_ERROR"),
+    (0x0080_0000, "FB_FLUSH_TIMEOUT"), (0x0100_0000, "LB_ERROR"), (0x0800_0000, "DROPPED_MMU_FAULT"),
+    (0x1000_0000, "MMU_FAULT"), (0x2000_0000, "PBDMA_INTR"), (0x4000_0000, "RUNLIST_EVENT"), (0x8000_0000, "NONSTALL"),
+];
+/// 0x252c bits 7:0. // nouveau gk104.c:598-605
+const BIND_NAMES: &[(u32, &str)] = &[
+    (0x01, "BIND_NOT_UNBOUND"), (0x02, "SNOOP_WITHOUT_BAR1"), (0x03, "UNBIND_WHILE_RUNNING"), (0x05, "INVALID_RUNLIST"),
+    (0x06, "INVALID_CTX_TGT"), (0x0b, "UNBIND_WHILE_PARKED"),
+];
+/// PBDMA INTR_0 bits. // nouveau gk104.c:335-366
+const PB_INTR0_NAMES: &[(u32, &str)] = &[
+    (0x0000_0001, "MEMREQ"), (0x0000_0002, "MEMACK_TIMEOUT"), (0x0000_0004, "MEMACK_EXTRA"), (0x0000_0008, "MEMDAT_TIMEOUT"),
+    (0x0000_0010, "MEMDAT_EXTRA"), (0x0000_0020, "MEMFLUSH"), (0x0000_0040, "MEMOP"), (0x0000_0080, "LBCONNECT"),
+    (0x0000_0100, "LBREQ"), (0x0000_0200, "LBACK_TIMEOUT"), (0x0000_0400, "LBACK_EXTRA"), (0x0000_0800, "LBDAT_TIMEOUT"),
+    (0x0000_1000, "LBDAT_EXTRA"), (0x0000_2000, "GPFIFO"), (0x0000_4000, "GPPTR"), (0x0000_8000, "GPENTRY"),
+    (0x0001_0000, "GPCRC"), (0x0002_0000, "PBPTR"), (0x0004_0000, "PBENTRY"), (0x0008_0000, "PBCRC"),
+    (0x0010_0000, "XBARCONNECT"), (0x0020_0000, "METHOD"), (0x0040_0000, "METHODCRC"), (0x0080_0000, "DEVICE"),
+    (0x0200_0000, "SEMAPHORE"), (0x0400_0000, "ACQUIRE"), (0x0800_0000, "PRI"), (0x2000_0000, "NO_CTXSW_SEG"),
+    (0x4000_0000, "PBSEG"), (0x8000_0000, "SIGNATURE"),
+];
+/// MMU fault reason (type & 0xf). // nouveau gk104.c:504-521
+const FAULT_REASONS: [&str; 16] = [
+    "PDE", "PDE_SIZE", "PTE", "VA_LIMIT_VIOLATION", "UNBOUND_INST_BLOCK", "PRIV_VIOLATION", "RO_VIOLATION", "WO_VIOLATION",
+    "PITCH_MASK_VIOLATION", "WORK_CREATION", "UNSUPPORTED_APERTURE", "COMPRESSION_FAILURE", "UNSUPPORTED_KIND",
+    "REGION_VIOLATION", "BOTH_PTES_VALID", "INFO_TYPE_POISONED",
+];
+/// Hub clients the CE path can name (type bits 12:8 with hub bit 6). // nouveau gk104.c:525-558
+fn hub_client(c: u32) -> &'static str {
+    match c {
+        0x01 => "CE0", 0x02 => "CE1", 0x06 => "HOST", 0x07 => "HOST_CPU", 0x08 => "HOST_CPU_NB", 0x0a => "MMU",
+        0x0e => "NISO", 0x18 => "GR_CE", 0x19 => "CE2", 0x1b => "MMU_NB", _ => "other",
+    }
+}
+/// MMU fault units (0x259c bit = unit). CE0 0x15, CE1 0x16, HOST0..7 0x07..0x0e. // nouveau gk104.c:473-500
+const FAULT_UNIT_CE0: u32 = 0x15;
+const FAULT_MASK: usize = 0x259c; // gf100.c:723
+const FAULT_BASE: usize = 0x2800; // + unit*0x10: inst, valo, vahi, type — gf100.c:699-702
+const PBDMA_INTR_MASK: usize = 0x25a0; // gf100.c:737
+const PREEMPT: usize = 0x2634; // pending bit 20, gf100.c:372
+const PB_IDLE: usize = 0x3080; // + i*4, busy bits 0xe000, gk104.c:293
+
+fn names(v: u32, t: &[(u32, &str)]) -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    let mut rest = v;
+    for &(b, n) in t {
+        if v & b != 0 {
+            if !s.is_empty() {
+                s.push('|');
+            }
+            s.push_str(n);
+            rest &= !b;
+        }
+    }
+    if rest != 0 {
+        let sep = if s.is_empty() { "" } else { "|" };
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{}unk:{:08X}", sep, rest));
+    }
+    if s.is_empty() { "-".into() } else { s }
+}
+
+fn fault_word(unit: u32) -> alloc::string::String {
+    let b = FAULT_BASE + unit as usize * 0x10;
+    let (inst, valo, vahi, ty) = (mr(b), mr(b + 4), mr(b + 8), mr(b + 0xc));
+    let hub = ty & 0x40 != 0;
+    alloc::format!(
+        "u{:02X}:inst={:08X}:va={:X}{:08X}:type={:08X}[{} {} {}{}]",
+        unit, inst, vahi, valo, ty, FAULT_REASONS[(ty & 0xf) as usize], if ty & 0x80 != 0 { "write" } else { "read" },
+        if hub { "hub:" } else { "gpc:" }, if hub { hub_client((ty >> 8) & 0x1f) } else { "-" }
+    )
+}
+
+/// GPUBLIT3 M3: one line, every status word on the path named. Reading (gpublit3.md §3): `bind=` then `rl_pend`, then
+/// the PBDMA serving the CE's runlist (`pbN_intr0`, `pbN_idle`), then the MMU fault units (the CE's own unit always shown).
+fn detail_decode() {
+    let intr = mr(PFIFO_INTR);
+    let bind = mr(PFIFO_BIND_ERR);
+    let bname = BIND_NAMES.iter().find(|(c, _)| *c == bind & 0xff).map_or("-", |(_, n)| *n);
+    let (eng, rl, idx) = (CE_ENG.load(Relaxed), CE_RL.load(Relaxed), CE_IDX.load(Relaxed));
+    let es = if eng < 32 { mr(0x2640 + eng as usize * 8) } else { 0 };
+    // gk104.c:208-216
+    let estr = alloc::format!(
+        "{:08X}[busy={} faulted={} chsw={} load={} save={} prev={} next={}]",
+        es, (es >> 31) & 1, (es >> 30) & 1, (es >> 15) & 1, (es >> 13) & 1, (es >> 14) & 1, es & 0xfff, (es >> 16) & 0xfff
+    );
+    let hi = mr(PFIFO_CHAN + CHID as usize * 8 + 4);
+    let mut pb = alloc::string::String::new();
+    for i in 0..4usize {
+        if rl < 32 && mr(PB_RUNM + i * 4) & (1 << rl) != 0 {
+            let b = 0x04_0000 + i * PB_STRIDE;
+            let i0 = mr(b + 0x108);
+            let idle = mr(PB_IDLE + i * 4);
+            let _ = core::fmt::Write::write_fmt(
+                &mut pb,
+                format_args!(" pb{}_intr0={:08X}[{}] pb{}_intr1={:08X} pb{}_idle={:08X}[{}]", i, i0, names(i0, PB_INTR0_NAMES), i, mr(b + 0x148), i, idle,
+                    if idle & 0xe000 == 0 { "idle" } else { "busy" }),
+            );
+        }
+    }
+    let fm = mr(FAULT_MASK);
+    let ce_unit = if idx < 2 { FAULT_UNIT_CE0 + idx } else { FAULT_UNIT_CE0 };
+    let mut faults = fault_word(ce_unit);
+    if fm != 0 {
+        let first = fm.trailing_zeros();
+        if first != ce_unit {
+            faults.push(' ');
+            faults.push_str(&fault_word(first));
+        }
+    }
+    serial_println!(
+        "[gpublit] decode pfifo_intr={:08X}[{}] bind={:02X}[{}] chan_hi={:08X}[rl={} en={}] eng{}={} pbdma_intr={:08X} preempt={:08X} sched_dis={:08X}[rl{}={}]{} mmu={:08X} fault={}",
+        intr, names(intr, PFIFO_INTR_NAMES), bind & 0xff, bname, hi, (hi >> 16) & 0xf, hi & 1, if eng == NONE { 0 } else { eng }, estr,
+        mr(PBDMA_INTR_MASK), mr(PREEMPT), mr(SCHED_DISABLE), rl, if rl < 32 { (mr(SCHED_DISABLE) >> rl) & 1 } else { 0 }, pb, fm, faults
+    );
 }
 
 /// GPUBLIT3 M1: every wall this boot applied, pre-image -> readback, so flight 26 tells R3..R9 apart (gpublit3.md §3).
