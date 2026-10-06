@@ -363,7 +363,12 @@ system.dock.autohide = false\n\
 system.dock.position = \"bottom\"\n\
 system.login.items = \"\"\n\
 system.pointer.speed = 1\n\
-system.settings.tab = 0\n";
+system.settings.tab = 0\n\
+system.trackpad.natural_scroll = true\n\
+system.trackpad.secondary_click = \"two-finger\"\n\
+system.trackpad.speed = 5\n\
+system.trackpad.tap_to_click = false\n\
+system.trackpad.three_finger_drag = false\n";
         assert_eq!(run(&mut s, VERB_LIST, b"system", false), (0, GOLDEN.to_vec()));
         // An empty LIST body lists every namespace; another namespace lists only itself.
         run(&mut s, VERB_SET, b"vein.provider\x00\"claude\"", true);
