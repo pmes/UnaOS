@@ -17643,7 +17643,7 @@ fn winx2_launcher(_demo_cpu: usize) {
             return;
         }
     };
-    let slot = slot as usize;
+    let slot = slot as usize; crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), "/apps/STAT.ELF"); // SMALLFIX5 (B480) item 3: the WINX-2 spawn arms its program name
 
     // Wait (bounded) for the program to prove it is alive: a window of its own AND presents landing.
     let deadline = crate::arch::ticks() + 5_000;
@@ -17892,7 +17892,7 @@ fn winx3_launcher(_demo_cpu: usize) {
             return;
         }
     };
-    let slot = slot as usize;
+    let slot = slot as usize; crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), "WINX3.ELF"); // SMALLFIX5 (B480) item 3: the WINX-3 (synthesized) spawn arms its program name
 
     // The blob exits on its own (unlike STAT.ELF), so wait for the row to settle rather than killing it.
     let deadline = crate::arch::ticks() + 10_000;
@@ -28703,7 +28703,7 @@ pub fn session_end_fixture() -> (u64, usize, usize, usize, bool, bool, &'static 
         Ok(v) => v,
         Err(_) => return (0, 0, 0, 0, false, false, "spawn-refused"),
     };
-    let slot = slot as usize;
+    let slot = slot as usize; crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), "/apps/STAT.ELF"); // SMALLFIX5 (B480) item 3: the SECLOGIN session-end spawn arms its program name
     let deadline = crate::arch::ticks() + 5_000;
     let mut windowed = false;
     while crate::arch::ticks() < deadline {
@@ -29353,7 +29353,7 @@ pub fn root_session_launch() -> Result<(u64, usize, bool, bool), &'static str> {
         return Err("stat-elf-read");
     }
     let (pid, slot, _entry) = spawn_user_image_bg(&bytes).map_err(|_| "spawn-refused")?;
-    let slot = slot as usize;
+    let slot = slot as usize; crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), "/apps/STAT.ELF"); // SMALLFIX5 (B480) item 3: the LOGIN13 root session spawn arms its program name
     let deadline = crate::arch::ticks() + 5_000;
     let mut windowed = false;
     while crate::arch::ticks() < deadline {
