@@ -7,7 +7,7 @@ pub mod acpi;
 pub mod acpi_power;
 pub mod percpu;
 pub mod smp;
-pub mod sched; pub mod stackguard; // SMALLFIX M6 (STACKGUARD, B380): the unmapped guard page under every kernel task stack
+pub mod sched; pub mod stackguard; pub mod clockcore; // CLOCKCORE (B397): the TSC global clock + named masked sections. SMALLFIX M6 (STACKGUARD, B380): the unmapped guard page under every kernel task stack
 pub mod syscall;
 pub mod pci;
 pub mod memory;
@@ -185,7 +185,7 @@ pub fn hw_wait_budget() -> u64 {
 pub struct IrqMask {
     /// Whether interrupts were enabled at `new()` — i.e. whether this guard owns the OUTERMOST
     /// transition and must re-enable (and, under `rtwit`, time) on drop.
-    was_enabled: bool,
+    was_enabled: bool, clk: (u64, u32), site: &'static core::panic::Location<'static>, // CLOCKCORE (B397): the outermost mask's (t0, cpu) token and its call site
     /// R0 / rtwit — TSC at the enabled→disabled transition, for the interrupt-mask span. Only present
     /// when the ruler is armed; the struct is otherwise byte-identical to the old `IrqMask(bool)`.
     #[cfg(feature = "rtwit")]
@@ -200,12 +200,12 @@ pub fn irqs_masked() -> bool {
 }
 
 impl IrqMask {
-    #[inline]
+    #[inline] #[track_caller]
     pub fn new() -> Self {
-        let was_enabled = x86_64::instructions::interrupts::are_enabled();
-        x86_64::instructions::interrupts::disable();
+        let was_enabled = x86_64::instructions::interrupts::are_enabled(); let site = core::panic::Location::caller();
+        x86_64::instructions::interrupts::disable(); let clk = if was_enabled { clockcore::mask_enter(site) } else { (0, 0) };
         IrqMask {
-            was_enabled,
+            was_enabled, clk, site,
             // R0 / rtwit — stamp the transition only when WE are the outermost mask (interrupts were
             // enabled); a nested mask reads `was_enabled == false` and its span is not timed.
             #[cfg(feature = "rtwit")]
@@ -215,7 +215,7 @@ impl IrqMask {
 }
 
 impl Default for IrqMask {
-    #[inline]
+    #[inline] #[track_caller]
     fn default() -> Self {
         Self::new()
     }
@@ -229,12 +229,12 @@ impl Drop for IrqMask {
             // masked from an enabled state times anything; nested guards restore to "still masked".
             #[cfg(feature = "rtwit")]
             crate::rtwit::note_mask_span(now_cycles().wrapping_sub(self.t0));
-            x86_64::instructions::interrupts::enable();
+            clockcore::mask_exit(self.clk, self.site); x86_64::instructions::interrupts::enable();
         }
     }
 }
 
-pub fn without_interrupts<F, R>(f: F) -> R
+#[track_caller] pub fn without_interrupts<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -251,7 +251,7 @@ where
     }
     #[cfg(not(feature = "rtwit"))]
     {
-        x86_64::instructions::interrupts::without_interrupts(f)
+        let _named = IrqMask::new(); f() // CLOCKCORE (B397): the same mask/run/restore as the crate's, through `IrqMask` so the outermost span is timed and its call site named
     }
 }
 

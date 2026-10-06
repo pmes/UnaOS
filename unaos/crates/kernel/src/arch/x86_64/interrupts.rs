@@ -717,7 +717,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     }
     // Local APIC timer tick. Lock-free. This CPU's own tick counter (each core's timer fires
     // independently at the calibrated 1 kHz) drives the per-CPU `sleep_ticks` deadlines.
-    crate::arch::percpu::note_tick(); crate::prof::sample_tick(stack_frame.instruction_pointer.as_u64(), from_user); super::stackguard::tlb_sync(); // SMALLFIX M6: drop a stale global leaf over a newly unmapped guard page
+    crate::arch::percpu::note_tick(); super::clockcore::isr_tick(); crate::prof::sample_tick(stack_frame.instruction_pointer.as_u64(), from_user); super::stackguard::tlb_sync(); // SMALLFIX M6: drop a stale global leaf over a newly unmapped guard page
     // The GLOBAL millisecond clock (`APIC_TICKS`, read by `ticks()`/`ms()`) is advanced by ONE core
     // only — the BSP (logical cpu 0). Every core ticks at 1 kHz, so summing all of them would run
     // the "ms since boot" clock at (core-count) kHz — 8× fast on the 8-core rMBP. The BSP is always

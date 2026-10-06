@@ -7759,7 +7759,7 @@ pub fn current_stack_bounds() -> Option<(u64, u64)> {
 /// single-core machine — `tests prof2` places its load task off the shell's core, which a busy-waiting
 /// shell would otherwise starve.
 pub fn other_dispatching_cpu() -> usize {
-    let here = percpu::this_cpu().cpu_index as usize;
+    let here = percpu::this_cpu().cpu_index as usize; if let Some(w) = (0..MAX_CPUS).map_while(super::smp::worker_cpu).find(|&c| c != here && cpu_dispatching(c)) { return w; } // CLOCKCORE (B397): a worker-pool core first — never the BSP/render core when a worker exists
     (0..MAX_CPUS).find(|&c| c != here && cpu_dispatching(c)).unwrap_or(CPU_AUTO)
 }
 

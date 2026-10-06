@@ -696,7 +696,7 @@ pub extern "C" fn ap_entry(cpu_index: u64) -> ! {
     // WXN-x86 M1: this core's NX witness, taken the instant after `syscall::init` armed EFER.NXE and
     // BEFORE the `AP_ONLINE` handshake — so no core can be advertised online without its bit in the
     // mask, and `cores` vs `nxe` in the rollup line can never be out of step for handshake reasons.
-    wxn_record_core(idx);
+    wxn_record_core(idx); super::clockcore::ap_sync(idx); // CLOCKCORE (B397): this core's TSC offset vs the BSP, before the handshake
 
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
     crate::bootlog_println!("SMP: AP {} online (apic id {}).", idx, apic_id);
@@ -824,7 +824,7 @@ pub fn start_aps() {
                 came_online = true;
                 break;
             }
-            core::hint::spin_loop();
+            super::clockcore::bsp_publish(); core::hint::spin_loop(); // CLOCKCORE (B397): the BSP's TSC for the AP's offset sample
         }
         if came_online {
             online_aps[n_online] = index;
