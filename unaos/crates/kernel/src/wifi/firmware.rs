@@ -110,6 +110,20 @@
 // per-role skip makes resuming idempotent. The `Retry` return still prints nothing terminal, so the
 // "exactly one terminal verdict" rule holds across the whole two-volume, multi-attempt search.
 //
+// ## FWPIN (rmbp-ledger B455, SEC-2026-10-06 F5) — pinned, boot card only, malformed refused
+// A name is not an identity. Every candidate is SHA-256'd (`crypto_core::sha2`, the kernel's one SHA-256)
+// and admitted ONLY when the digest equals its role's row in `unaos/firmware/b43.pins` — a file of FACTS
+// about Peter's bunker copy (role + digest), never bytes. No row => `REJECTED … reason=unpinned sha256=…`
+// (the digest is printed so the seat can pin it against arroyo's WIFI-FW build line); a different digest
+// => `reason=pin-mismatch`; a `violates-layout`/unrecognized container => `reason=violates-layout`. Nothing
+// refused enters `STAGED`, so no consumer (arc 2's upload) can ever see an unpinned image.
+//
+// The search is the BOOT CARD's own volumes only (R95: a removable volume is data, never a microcode
+// source): pass 1 the program source's FAT (the ESP), pass 2 the same card's native UnaFS root — where
+// arroyo's WIFI-FW block puts the set (`/FIRMWARE/`) — and only when the native volume is bound to the
+// program-source handle. PSRC's alternate-handle pass (a USB stick) is GONE, and with it WIFI-REACH's
+// `Pending`: no second volume is awaited, so every attempt that is not a `Retry` is terminal.
+//
 // ## Sourcing (see the note in `mod.rs`)
 // File names, core revision and PHY type come from `bcm4331.md` §S4, which states its own sourcing
 // separately and differs from this file's — see the cross-reference in `mod.rs`. Nothing here was
@@ -158,6 +172,75 @@ const MIN_BLOB_BYTES: u32 = 128;
 /// Above this we refuse rather than commit the kernel heap. §S4: the ucode is "tens of KB"; 4 MiB is
 /// ~two orders of magnitude of headroom and still bounded.
 const MAX_BLOB_BYTES: u32 = 4 * 1024 * 1024;
+
+/// FWPIN (B455): the pin file, compiled in. Rows `<role> <64 hex>`; `#` lines and blanks ignored. Ships
+/// EMPTY of rows: the digests come from Peter's bunker copy via arroyo's WIFI-FW build line, never invented.
+const PINS: &str = include_str!("../../../../firmware/b43.pins");
+
+fn nib(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// The pinned SHA-256 for `role`, or `None` (no row, or a malformed one — both refuse as `unpinned`).
+fn pin_for(role: &str) -> Option<[u8; 32]> {
+    for line in PINS.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let (Some(r), Some(h), None) = (it.next(), it.next(), it.next()) else { continue };
+        if r != role || h.len() != 64 {
+            continue;
+        }
+        let b = h.as_bytes();
+        let mut out = [0u8; 32];
+        let mut ok = true;
+        for i in 0..32 {
+            match (nib(b[2 * i]), nib(b[2 * i + 1])) {
+                (Some(hi), Some(lo)) => out[i] = (hi << 4) | lo,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            return Some(out);
+        }
+    }
+    None
+}
+
+fn hex32(d: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in d {
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{:02x}", b));
+    }
+    s
+}
+
+/// The worst refusal this boot, for `tests wifi`: 0 none, 1 unpinned, 2 violates-layout, 3 pin-mismatch.
+static REFUSAL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// FWPIN: why a role was refused this boot (the worst one), or `None` when nothing was refused.
+pub fn refusal() -> Option<&'static str> {
+    match REFUSAL.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => Some("unpinned"),
+        2 => Some("violates-layout"),
+        3 => Some("pin-mismatch"),
+        _ => None,
+    }
+}
+
+fn refuse(code: u8) {
+    REFUSAL.fetch_max(code, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// A staged image and what the loader learned about it.
 pub struct StagedImage {
@@ -465,19 +548,149 @@ fn stage_role(fs: &FatFs, root: &[DirEntry], spec: &FwSpec, vol: &str) -> RoleRe
                 return RoleResult::Rejected;
             }
 
-            let v = classify_header(&data);
-            let digest = fnv1a32(&data);
-            let len = data.len();
-            serial_println!(
-                ":: wifi: {} STAGED {} bytes={} on {} fnv1a={:#010x} hdr={} type={:#04x} ver={:#04x} declared={} records={} stream={} ::",
-                spec.role, path, len, vol, digest, v.layout, v.kind, v.ver, v.declared, v.records,
-                if v.stream_ok { "ok" } else { "violates-layout" },
-            );
-            STAGED.lock().push(StagedImage { role: spec.role, path, bytes: data, digest });
-            return RoleResult::Staged;
+            return admit(spec, path, vol, data);
         }
     }
     RoleResult::Absent
+}
+
+/// FWPIN: the one gate every candidate passes, whichever volume it was read from. Layout first (a
+/// malformed container is refused outright), then the SHA-256 pin; only a pinned match enters `STAGED`.
+fn admit(spec: &FwSpec, path: String, vol: &str, data: Vec<u8>) -> RoleResult {
+    let v = classify_header(&data);
+    let digest = fnv1a32(&data);
+    let sha = crypto_core::sha2::sha256(&data);
+    let len = data.len();
+    if !v.stream_ok {
+        refuse(2);
+        serial_println!(
+            ":: wifi: {} REJECTED {} bytes={} on {} — reason=violates-layout hdr={} type={:#04x} declared={} records={} sha256={} ::",
+            spec.role, path, len, vol, v.layout, v.kind, v.declared, v.records, hex32(&sha)
+        );
+        return RoleResult::Rejected;
+    }
+    match pin_for(spec.role) {
+        None => {
+            refuse(1);
+            serial_println!(
+                ":: wifi: {} REJECTED {} bytes={} on {} — reason=unpinned sha256={} (no `{}` row in unaos/firmware/b43.pins; pin it from the WIFI-FW build line) ::",
+                spec.role, path, len, vol, hex32(&sha), spec.role
+            );
+            return RoleResult::Rejected;
+        }
+        Some(pin) if pin != sha => {
+            refuse(3);
+            serial_println!(
+                ":: wifi: {} REJECTED {} bytes={} on {} — reason=pin-mismatch sha256={} pin={} ::",
+                spec.role, path, len, vol, hex32(&sha), hex32(&pin)
+            );
+            return RoleResult::Rejected;
+        }
+        Some(_) => (),
+    }
+    serial_println!(
+        ":: wifi: {} STAGED {} bytes={} on {} fnv1a={:#010x} hdr={} type={:#04x} ver={:#04x} declared={} records={} stream=ok sha256={} pin=match ::",
+        spec.role, path, len, vol, digest, v.layout, v.kind, v.ver, v.declared, v.records, hex32(&sha),
+    );
+    STAGED.lock().push(StagedImage { role: spec.role, path, bytes: data, digest });
+    RoleResult::Staged
+}
+
+/// FWPIN pass 2: the boot card's own native UnaFS root, read through the mount table — where arroyo's
+/// WIFI-FW block stages the set (`/FIRMWARE/`). Searched ONLY when `/` is the native volume AND that
+/// volume rides the program-source handle: a native volume bound on any other handle is not the boot
+/// card, and R95 makes a removable volume data, never a microcode source.
+#[cfg(feature = "unafs")]
+fn stage_boot_root(dirs: &str, boot: crate::drivers::block::BlockHandle) -> VolOutcome {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    let mt = crate::shell::vfs_mount_table();
+    // `stat("/")` binds the native volume lazily if it is not bound yet; a backend error is transport.
+    match mt.stat("/") {
+        Ok(_) => (),
+        Err(VfsError::Backend(why)) => {
+            serial_println!(
+                ":: wifi: staging attempt DEFERRED at boot-root — the root volume did not answer ({}); nothing staged from it, re-attempting ::",
+                why
+            );
+            return VolOutcome::Deferred("boot-root");
+        }
+        Err(_) => {
+            serial_println!(":: wifi: boot-root pass skipped — no root volume bound; searched nothing ::");
+            return VolOutcome::Unusable(String::from("boot-root=unbound"));
+        }
+    }
+    let name = mt.volume_name("/").unwrap_or_default();
+    if name != "native" {
+        serial_println!(
+            ":: wifi: boot-root pass skipped — / is volume '{}' (not the native UnaFS root; the program-source FAT pass already searched the card); searched nothing ::",
+            name
+        );
+        return VolOutcome::Unusable(alloc::format!("boot-root=skipped(volume={})", name));
+    }
+    let bound = crate::fs::unafs::mount_bound_handle();
+    if bound != Some(boot) {
+        serial_println!(
+            ":: wifi: boot-root pass REFUSED — the native volume rides handle={:?}, the boot card is handle={:?}; a removable volume is data, never a microcode source (R95); searched nothing ::",
+            bound, boot
+        );
+        return VolOutcome::Unusable(alloc::format!("boot-root=refused(handle={:?})", bound));
+    }
+    let vol = alloc::format!("source=boot-root volume=native handle={:?}", boot);
+    let mut rejected = 0usize;
+    for spec in FW_SET {
+        if with_staged(spec.role, |_| ()).is_some() {
+            continue;
+        }
+        let mut res = RoleResult::Absent;
+        'search: for dir in SEARCH_DIRS {
+            for nm in spec.names {
+                let path = match dir {
+                    None => alloc::format!("/{}", nm),
+                    Some(d) => alloc::format!("/{}/{}", d, nm),
+                };
+                let Ok(st) = mt.stat(&path) else { continue };
+                if st.kind != NodeKind::File {
+                    continue;
+                }
+                // Bounds gate before the read, exactly as the FAT pass: a bogus size never commits the heap.
+                if st.size < MIN_BLOB_BYTES as u64 || st.size > MAX_BLOB_BYTES as u64 {
+                    serial_println!(
+                        ":: wifi: {} REJECTED {} size={} on {} — reason=out-of-bounds (min {} max {}) ::",
+                        spec.role, path, st.size, vol, MIN_BLOB_BYTES, MAX_BLOB_BYTES
+                    );
+                    res = RoleResult::Rejected;
+                    break 'search;
+                }
+                res = match mt.read(&path, 0, st.size as usize) {
+                    Ok(data) if data.len() == st.size as usize => admit(spec, path, &vol, data),
+                    Ok(data) => {
+                        serial_println!(
+                            ":: wifi: {} REJECTED {} size={} on {} — reason=short-read (got {} bytes) ::",
+                            spec.role, path, st.size, vol, data.len()
+                        );
+                        RoleResult::Rejected
+                    }
+                    Err(e) => {
+                        serial_println!(
+                            ":: wifi: {} REJECTED {} size={} on {} — reason=read-failed ({:?}) ::",
+                            spec.role, path, st.size, vol, e
+                        );
+                        RoleResult::Rejected
+                    }
+                };
+                break 'search; // first existing name wins, per role
+            }
+        }
+        match res {
+            RoleResult::Rejected => rejected += 1,
+            RoleResult::Staged => (),
+            RoleResult::Absent => serial_println!(
+                ":: wifi: {} ABSENT — none of {} in {} on {} ::",
+                spec.role, names_description(spec), dirs, vol
+            ),
+        }
+    }
+    VolOutcome::Searched(rejected, vol)
 }
 
 /// WIFI-REARM: whether a staging attempt produced this boot's answer, or only a "not yet".
@@ -499,6 +712,9 @@ pub enum StageOutcome {
     /// the USB storage-ready edge fires or a bounded deadline expires (`crate::wifi`'s second-handle
     /// wait). Returned ONLY when the caller passed `commit = false`: on the committing attempt the
     /// verdict is forced, so `Pending` can never be the last word.
+    ///
+    /// FWPIN (B455): RETIRED — no longer returned (the alternate-handle search it waited for is gone, R95);
+    /// kept so `wifi/mod.rs`'s `S_WAIT_ALT` arms compile until the integrator retires that state.
     Pending,
 }
 
@@ -644,6 +860,10 @@ fn stage_volume(src: fat::BlockSource, dirs: &str, label: &str) -> VolOutcome {
 /// The witness names the volume each image came from (`on source=… label=… fp=…`), so a capture
 /// always says which medium fed the radio — the widening is never silent.
 ///
+/// **FWPIN (B455) supersedes the two sections below:** pass 2 is now the boot card's own native UnaFS
+/// root ([`stage_boot_root`]), never another handle, and `Pending` is never returned — `commit` is
+/// kept in the signature for the caller and ignored. The text below is the history.
+///
 /// ## WIFI-REACH (GR26): `commit`, and the `Pending` third outcome
 ///
 /// The two-volume search above only helps when BOTH handles are present at attempt time. The bench
@@ -661,15 +881,15 @@ fn stage_volume(src: fat::BlockSource, dirs: &str, label: &str) -> VolOutcome {
 ///     both handles have been genuinely tried and the verdict IS terminal — printed here, `Settled`.
 ///   * `commit == true` — the second-handle deadline has expired; force the terminal verdict whether
 ///     or not an alternate ever appeared. `Pending` is never returned on a committing attempt.
-pub fn stage_attempt(commit: bool) -> StageOutcome {
+pub fn stage_attempt(_commit: bool) -> StageOutcome {
     let dirs = dirs_description();
 
     // Pass 1 — the program source. FAT-verb law: reads follow it. See the module note.
-    let (vol, mut rejected) = match crate::drivers::block::program_source() {
+    let (vol, rejected, boot) = match crate::drivers::block::program_source() {
         Some((_, h)) => match stage_volume(source_of_handle(h), &dirs, "program-source") {
             VolOutcome::Deferred(stage) => return StageOutcome::Retry(stage),
-            VolOutcome::Searched(rej, vol) => (vol, rej),
-            VolOutcome::Unusable(vol) => (vol, 0),
+            VolOutcome::Searched(rej, vol) => (vol, rej, h),
+            VolOutcome::Unusable(vol) => (vol, 0, h),
         },
         None => {
             // The caller gates on `program_source().is_some()`, so this arm is defensive.
@@ -680,32 +900,24 @@ pub fn stage_attempt(commit: bool) -> StageOutcome {
         }
     };
 
-    // Pass 2 — the OTHER populated handle, only for roles still missing. See the doc note above.
-    // `alt_present` records whether there WAS a second handle to search this attempt: it is the
-    // discriminator WIFI-REACH's `Pending` rests on — an incomplete set with `alt_present == false`
-    // is "no second volume yet", worth holding for; with `alt_present == true` both handles were
-    // tried and the verdict is terminal now.
-    let mut alt_vol = String::new();
-    let mut alt_present = false;
-    if staged_count() < FW_SET.len() {
-        if let Some((_, handle)) = crate::drivers::block::alternate_program_source() {
-            alt_present = true;
-            let src = source_of_handle(handle);
-            serial_println!(
-                ":: wifi: firmware set incomplete on the program source ({}/{}) — searching the other \
-                 populated handle (source={}) for the missing roles; READ-ONLY, and a role already \
-                 staged is never replaced ::",
-                staged_count(), FW_SET.len(), src.name()
-            );
-            match stage_volume(src, &dirs, "alternate") {
-                // A deferred alternate mount is still a Retry: not settled until BOTH volumes were
-                // tried. Pass 1's staged roles persist in `STAGED`, so the re-attempt skips them.
-                VolOutcome::Deferred(stage) => return StageOutcome::Retry(stage),
-                VolOutcome::Searched(rej, v) => { rejected += rej; alt_vol = v; }
-                VolOutcome::Unusable(v) => { alt_vol = v; }
-            }
+    // Pass 2 (FWPIN) — the SAME card's native UnaFS root, for roles still missing. Never another
+    // handle: the alternate-handle (USB stick) pass is gone (R95, SEC-2026-10-06 F5).
+    #[cfg(feature = "unafs")]
+    let (alt_rej, alt_vol) = if staged_count() < FW_SET.len() {
+        match stage_boot_root(&dirs, boot) {
+            VolOutcome::Deferred(stage) => return StageOutcome::Retry(stage),
+            VolOutcome::Searched(rej, v) => (rej, v),
+            VolOutcome::Unusable(v) => (0, v),
         }
-    }
+    } else {
+        (0, String::new())
+    };
+    #[cfg(not(feature = "unafs"))]
+    let (alt_rej, alt_vol) = {
+        let _ = boot; // no native volume in this build: the program-source FAT pass is the whole search
+        (0usize, String::new())
+    };
+    let rejected = rejected + alt_rej;
 
     let searched = if alt_vol.is_empty() {
         vol
@@ -721,15 +933,6 @@ pub fn stage_attempt(commit: bool) -> StageOutcome {
             ":: wifi: firmware set COMPLETE {}/{} staged on {} — held in kernel memory, NOT pushed to the core (no MMIO, no device write); arc 2 owns bcma core bring-up ::",
             staged, FW_SET.len(), searched
         );
-    } else if !commit && !alt_present {
-        // WIFI-REACH: incomplete, and no second handle existed to search — a late-publishing volume
-        // (the USB stick with the blobs) may still carry the missing roles. Print NOTHING terminal:
-        // the caller holds arc 2 and the verdict, and re-attempts on the storage-ready edge or a
-        // bounded deadline. The per-role ABSENT lines from pass 1 are already on the wire, so the
-        // capture still says exactly what is missing; only the FINAL word is withheld — the caller's
-        // HELD line names the hold. (`searched` is borrowed by the sibling verdict arms, so it draws
-        // no unused warning here.)
-        return StageOutcome::Pending;
     } else {
         let mut missing = String::new();
         for spec in FW_SET {
