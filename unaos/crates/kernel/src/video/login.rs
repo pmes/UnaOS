@@ -462,7 +462,7 @@ fn user_row(px: &mut [u32], i: usize, name: &[u8], picked: bool) {
     fill(px, x, y, w, h, if picked { theme::accent() } else { theme::content_fill() });
     rect(px, x, y, w, h, if picked { theme::accent() } else { theme::frame_line() });
     let max = crate::video::text::fit(name, false, FACE, super::super::metrics::size(w - 12)); // UIMETRICS: the physical width // KERNELFONT: whole glyphs that fit. LOGINFONT
-    let ax = super::loginwindow::avatar(&mut |ax, ay, aw, ah, c| fill(px, ax, ay, aw, ah, c), x + 3, y + 3, h.saturating_sub(6), picked); // FIRSTUSER (R100): the generic avatar on every user tile (`loginwindow.rs`)
+    let ax = super::loginwindow::tile_avatar(&mut |d| tile_draw(px, d), name, x + 3, y + 3, h.saturating_sub(6), picked); // LOGINWINDOW (B430): the user's own avatar (`una:icon` or initials). FIRSTUSER (R100): the generic avatar on every user tile (`loginwindow.rs`)
     let max = max.min(crate::video::text::fit(name, false, FACE, super::super::metrics::size(w.saturating_sub(12 + ax)))); // FIRSTUSER: the name fits beside the avatar
     let n = name.len().min(max);
     text(px, x + 6 + ax, y + 4, &name[..n], if picked { theme::bevel_light() } else { theme::content_text() });
@@ -651,6 +651,7 @@ fn open_as(state: State) {
         f.message = "";
         f.windowed = false;
     }
+    if state == State::Open { let _ = super::loginwindow::resolve(); super::loginwindow::register(); ARMED.store(false, Ordering::Relaxed); } // LOGINWINDOW (B430): each user's `una:icon` read once per opening; `tests loginwindow`
     MISS_SAID.store(false, Ordering::Relaxed); // LOGINFLOW — the one miss line is per OPEN, not per boot
     KEY_SAID.store(false, Ordering::Relaxed); // LOGIN13 M3 — and so is the one key line
     if HEADLESS.load(Ordering::Relaxed) {
@@ -870,6 +871,9 @@ fn pick_user(i: usize) {
     f.pw_len = 0;
     f.focus = Focus::Password;
     f.message = "";
+    drop(f);
+    ARMED.store(false, Ordering::Relaxed); // LOGINWINDOW: a click opens the field at once
+    super::loginwindow::glass_line(&nb[..n]); // LOGINWINDOW (B430): `[login] window users= picked= avatar=`
 }
 
 /// LOGINCLOSE — **the three pieces of the screen's state move together, or the machine is dead.**
@@ -931,10 +935,14 @@ pub fn consume_key(c: u8) -> bool {
     if !KEY_SAID.swap(true, Ordering::Relaxed) {
         serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
     }
+    if (0x20..=0x7e).contains(&c) && PFOCUS.load(Ordering::Relaxed) == 0 && ARMED.swap(false, Ordering::Relaxed) { FORM.lock().focus = Focus::Password; } // LOGINWINDOW: typing on an arrow-picked tile opens its field
     match c {
         b'\t' if power_tab() => {} // DIALOG2: Tab walks Name -> Password -> Sleep -> Restart -> Shut Down -> Name
         b'\n' | b'\r' | b' ' if PFOCUS.load(Ordering::Relaxed) != 0 => power_pick(PFOCUS.load(Ordering::Relaxed) - 1, "key"),
         0x20..=0x7e | 8 | 0x7f if PFOCUS.load(Ordering::Relaxed) != 0 => {} // a power button has the keyboard: it takes no text
+        0x1C | 0x1D if arrow_pick(c == 0x1C) => {} // LOGINWINDOW (B430): Right/Left pick the next/previous user tile
+        b'\x1b' if esc_back() => {} // LOGINWINDOW: Esc from the password field goes back to picking a tile
+        b'\n' | b'\r' if return_opens() => {} // LOGINWINDOW: Return on an arrow-picked tile opens its password field
         b'\x1b' => {} // R24: Esc dismisses menus only; the screen stays
         b'\t' if LOCKED.load(Ordering::Relaxed) => {} // SCREENLOCK: one editable field
         b'\t' => {
@@ -2399,7 +2407,8 @@ fn power_row(px: &mut [u32]) {
         }
         let l = PWR_LABEL[i as usize];
         let tw = super::super::metrics::ladvance(l, false, FACE);
-        text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL) / 2, l, theme::button_text());
+        let ink = if i == 0 && !crate::power::sleep_armed() { theme::title_text_inactive() } else { theme::button_text() }; // LOGINWINDOW (B430): Sleep greys until LIDSLEEP (B431) arms the lane
+        text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL) / 2, l, ink);
     }
 }
 
@@ -2429,13 +2438,13 @@ static POWER_PICKED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8
 /// A power button pressed (`i`: 0 Sleep, 1 Restart, 2 Shut Down).
 fn power_pick(i: u8, via: &str) {
     let word = match i { 0 => "sleep", 1 => "restart", _ => "shutdown" };
-    serial_println!("[login] power row pick={} via={}", word, via);
+    serial_println!("[login] power row pick={} via={}{}", word, via, if i == 0 && !crate::power::sleep_armed() { " -> unarmed (LIDSLEEP B431)" } else { "" });
     POWER_PICKED.store(i + 1, Ordering::Relaxed);
     if HEADLESS.load(Ordering::Relaxed) {
         return;
     }
     match i {
-        0 => crate::video::crystal::power_fire(4), // Sleep: instant, as on the Mac
+        0 => { let _ = crate::power::sleep_request(); } // LOGINWINDOW (B430): Sleep is LIDSLEEP's lane (`power::sleep_request`, `unarmed` until it lands): instant, as on the Mac
         1 => { let _ = crate::video::dialog::power_confirm_on_screen(1); }
         _ => { let _ = crate::video::dialog::power_confirm_on_screen(2); }
     }
@@ -2487,4 +2496,132 @@ fn dialog2_fixture() {
         ":: DIALOG2: alert_window={} errors_to_dialog={} info_to_toast={} login_power_row={} bus_verbs={} origin={} -> {} ::",
         alert_window, errs, infos, row as u8, verbs, if origin { "explicit" } else { "FAIL" }, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── LOGINWINDOW (rmbp-ledger B430, MACPARITY row 33) — the avatars' painter and the window's keyboard ─────────────
+//
+// Left/Right pick the previous/next user tile (the name is copied from the STORE, as a click's is) and leave the
+// password field closed; Return opens it (focus to Password), typing opens it too; Esc from the password field
+// clears it and goes back to picking. Not on the setter, the create-user form or the Locked screen. Witness on every
+// pick: `[login] window users=<n> picked=<name> avatar=<attr:KEY or initials>` (`loginwindow::glass_line`).
+
+/// A tile picked by an arrow, its password field not yet open.
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// `loginwindow::tile_avatar`'s drawing steps onto the screen's surface (logical px, the surface's clipping).
+fn tile_draw(px: &mut [u32], d: super::loginwindow::Draw) -> bool {
+    use super::loginwindow::Draw;
+    match d {
+        Draw::Fill(x, y, w, h, c) => { fill(px, x, y, w, h, c); true }
+        Draw::TextIn(x, y, w, h, s, c) => {
+            let tw = super::super::metrics::ladvance(s, false, FACE);
+            text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL) / 2, s, c);
+            true
+        }
+        Draw::Icon(x, y, d, key) => {
+            use super::super::metrics::size;
+            crate::fs::appres::blit_icon_known(px, size(W), size(H), size(x), size(y), size(d), key)
+        }
+    }
+}
+
+/// Is the log-in form taking tile picks? (Open, not Locked, no power button holding the keyboard, a roster on glass.)
+fn picks_on() -> bool {
+    FORM.lock().state == State::Open && !LOCKED.load(Ordering::Relaxed) && PFOCUS.load(Ordering::Relaxed) == 0 && user_rows() > 0
+}
+
+/// The roster index of the name in the form, if it is a tile's.
+fn picked_ix() -> Option<usize> {
+    let f = FORM.lock();
+    let mut nb = [0u8; users::NAME_MAX];
+    (0..user_rows()).find(|&i| users::name_at(i, &mut nb).map_or(false, |n| n == f.name_len && f.name[..n] == nb[..n]))
+}
+
+/// Right (`next`) / Left: pick the neighbouring tile, wrapping; the field stays closed until Return. `true` = taken.
+fn arrow_pick(next: bool) -> bool {
+    if !picks_on() {
+        return false;
+    }
+    let rows = user_rows();
+    let i = match (picked_ix(), next) {
+        (None, true) => 0,
+        (None, false) => rows - 1,
+        (Some(i), true) => (i + 1) % rows,
+        (Some(i), false) => (i + rows - 1) % rows,
+    };
+    let mut nb = [0u8; users::NAME_MAX];
+    let Some(n) = users::name_at(i, &mut nb) else { return false };
+    {
+        let mut f = FORM.lock();
+        f.name = [0; FIELD_MAX];
+        f.name[..n].copy_from_slice(&nb[..n]);
+        f.name_len = n;
+        clear_passwords(&mut f);
+        f.focus = Focus::Name;
+        f.message = "";
+    }
+    ARMED.store(true, Ordering::Relaxed);
+    super::loginwindow::glass_line(&nb[..n]);
+    true
+}
+
+/// Return on an arrow-picked tile: open its password field. `true` = taken (Return did not submit).
+fn return_opens() -> bool {
+    if !ARMED.load(Ordering::Relaxed) || !picks_on() || FORM.lock().focus != Focus::Name || picked_ix().is_none() {
+        return false;
+    }
+    ARMED.store(false, Ordering::Relaxed);
+    FORM.lock().focus = Focus::Password;
+    true
+}
+
+/// Esc in a picked tile's password field: clear it and go back to picking. `true` = taken.
+fn esc_back() -> bool {
+    if !picks_on() || FORM.lock().focus != Focus::Password || picked_ix().is_none() {
+        return false;
+    }
+    {
+        let mut f = FORM.lock();
+        clear_passwords(&mut f);
+        f.focus = Focus::Name;
+    }
+    ARMED.store(true, Ordering::Relaxed);
+    true
+}
+
+/// `tests loginwindow`'s power-row leg: DIALOG2's headless fixture (three rects, the Tab walk, the keyed press —
+/// said, not done). The Sleep lane is only ASKED (`sleep_armed`), never requested: a test sleeps nothing.
+pub fn power_row_selftest() -> bool {
+    power_row_fixture()
+}
+
+/// `tests loginwindow`'s keyboard leg (headless; the form is saved and restored): Right picks tile 0 with the field
+/// closed, Return opens it, Esc goes back, Left wraps to the last tile. Needs a roster (`false` on an empty store).
+pub fn keys_selftest() -> bool {
+    if user_rows() == 0 {
+        return false;
+    }
+    let was = HEADLESS.swap(true, Ordering::Relaxed);
+    let saved = { let f = FORM.lock(); (f.state, f.focus, f.name, f.name_len) };
+    let pf = PFOCUS.swap(0, Ordering::Relaxed);
+    let lk = LOCKED.load(Ordering::Relaxed);
+    FORM.lock().state = State::Open;
+    FORM.lock().name_len = 0;
+    let rows = user_rows();
+    let right = arrow_pick(true) && picked_ix() == Some(0) && FORM.lock().focus == Focus::Name && ARMED.load(Ordering::Relaxed);
+    let opened = return_opens() && FORM.lock().focus == Focus::Password && !ARMED.load(Ordering::Relaxed);
+    let back = esc_back() && FORM.lock().focus == Focus::Name && ARMED.load(Ordering::Relaxed);
+    let left = arrow_pick(false) && picked_ix() == Some(rows - 1);
+    ARMED.store(false, Ordering::Relaxed);
+    {
+        let mut f = FORM.lock();
+        clear_passwords(&mut f);
+        f.state = saved.0;
+        f.focus = saved.1;
+        f.name = saved.2;
+        f.name_len = saved.3;
+    }
+    PFOCUS.store(pf, Ordering::Relaxed);
+    HEADLESS.store(was, Ordering::Relaxed);
+    !lk && right && opened && back && left
 }

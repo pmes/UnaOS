@@ -752,3 +752,22 @@ pub fn opener_of_preferred(mt: &MountTable, v: &str) -> String {
     }
     String::from(v)
 }
+/// LOGINWINDOW (B430): draw `key`'s icon (a built-in or sighted program) at `(x, y)`, `size` square, into a
+/// `stride`-wide surface of `h` rows — ONLY when APPRES knows the key (no generic fallback: the caller draws its own,
+/// the user's initials). Never waits on a lock. `false` = nothing drawn.
+pub fn blit_icon_known(px: &mut [u32], stride: usize, h: usize, x: usize, y: usize, size: usize, key: &str) -> bool {
+    with_pix(key, size, |argb| {
+        for r in 0..size.min(h.saturating_sub(y)) {
+            for c in 0..size.min(stride.saturating_sub(x)) {
+                let d = &mut px[(y + r) * stride + x + c];
+                *d = over(argb[r * size + c], *d);
+            }
+        }
+    })
+    .is_some()
+}
+
+/// LOGINWINDOW (B430): does APPRES know `key` (a built-in or a sighted program)? `false` when the registry is busy.
+pub fn knows(key: &str) -> bool {
+    builtin_app(key).is_some() || REG.try_lock().map(|r| r.iter().any(|a| a.key == key)).unwrap_or(false)
+}
