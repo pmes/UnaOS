@@ -321,3 +321,5 @@ pub mod shelltask;
 pub mod smallfix4;
 // SMALLFIX5 (rmbp-ledger B480): `tests smallfix5` — the merge19 wave's small owed items, read back. Tail statement.
 pub mod smallfix5;
+// DOORHEADLESS (rmbp-ledger B487): the serial door's headless console on SHELLTASK's job task. Tail statement.
+pub mod serialdoor;
