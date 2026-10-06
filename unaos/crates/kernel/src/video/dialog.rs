@@ -175,16 +175,7 @@ static LAST_ACT_FIRED: AtomicU64 = AtomicU64::new(0);
 static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn surf() -> &'static mut [u32] {
     let n = metrics::size(W) * metrics::size(H);
-    let mut p = SURF_AT.load(Ordering::Acquire);
-    if p == 0 {
-        let b: &'static mut [u32] = alloc::boxed::Box::leak(alloc::vec![0u32; n].into_boxed_slice());
-        p = match SURF_AT.compare_exchange(0, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => b.as_mut_ptr() as usize,
-            Err(won) => won,
-        };
-    }
-    // SAFETY: one leaked buffer of `n` words, written by the painter on the window-safe path, read by `wm`'s composite (instgui's contract).
-    unsafe { core::slice::from_raw_parts_mut(p as *mut u32, n) }
+    metrics::leaked_surf(&SURF_AT, n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 }
 
 /// Queue a dialog (QUEUE ONLY: `try_lock`, no heap, no `wm`). One pending behind the one on the glass; more are dropped, counted.

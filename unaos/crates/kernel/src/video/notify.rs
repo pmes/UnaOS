@@ -218,17 +218,7 @@ static SURF_AT: [AtomicUsize; SURF_N] = [AtomicUsize::new(0), AtomicUsize::new(0
 fn surf(i: usize) -> &'static mut [u32] {
     let (w, h) = if i == STACK_MAX { (CW, CH) } else { (W, H) };
     let n = metrics::size(w) * metrics::size(h);
-    let mut p = SURF_AT[i].load(Ordering::Acquire);
-    if p == 0 {
-        let b: &'static mut [u32] = alloc::boxed::Box::leak(alloc::vec![0u32; n].into_boxed_slice());
-        p = match SURF_AT[i].compare_exchange(0, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => b.as_mut_ptr() as usize,
-            Err(won) => won,
-        };
-    }
-    // SAFETY: one leaked buffer of `n` words per slot (sized from the scale at first use, as the toast's), painted
-    // on the window-safe pass, read by `wm`'s composite while the row lives.
-    unsafe { core::slice::from_raw_parts_mut(p as *mut u32, n) }
+    metrics::leaked_surf(&SURF_AT[i], n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 }
 
 /// The unread count the bell's badge shows (lock-free: the bar's painter reads it).
