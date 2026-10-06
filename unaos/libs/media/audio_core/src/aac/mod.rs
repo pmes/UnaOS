@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 
 use crate::bits::BitReader;
 use crate::io::ByteStream;
-use crate::{Codec, Error, Format, Info, Pcm, Result, Source};
+use crate::{SeekPoint, Codec, Error, Format, Info, Pcm, Result, Source};
 pub use decoder::{AacDecoder, Layout, Pce};
 
 pub const RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
@@ -228,6 +228,9 @@ pub struct AacSource {
     skip: u64,
     total: Option<u64>,
     emitted: u64,
+    /// SEEKTABLE (rmbp B433): the gapless skip at the top, and the ASC (a seek restarts the decoder from it).
+    skip0: u64,
+    asc: Vec<u8>,
 }
 
 impl AacSource {
@@ -238,7 +241,7 @@ impl AacSource {
         let dec = AacDecoder::new(a.sf_index, layout)?;
         let frames = total.or(Some((units.len() as u64 * 1024).saturating_sub(skip)));
         let info = Info { rate: RATES[a.sf_index], channels: ch, bits: 0, frames, format: Format::Mp4, codec: Codec::Aac, float: true };
-        Ok(AacSource { data, units, next: 0, dec, info, skip, total, emitted: 0 })
+        Ok(AacSource { data, units, next: 0, dec, info, skip, total, emitted: 0, skip0: skip, asc: asc.to_vec() })
     }
     pub fn boxed(self) -> Box<dyn Source> { Box::new(self) }
 }
@@ -268,5 +271,22 @@ impl Source for AacSource {
             self.emitted += (stop - start) as u64;
             return Ok(true);
         }
+    }
+    /// SEEKTABLE (rmbp B433): the MP4 sample table (`stsc`+`stco`/`co64`+`stsz`, or the fragments' `trun`s) is the
+    /// index: access unit `k` starts at decoded sample `1024·k` (AAC-LC, ISO/IEC 14496-3 — the same times `stts`
+    /// gives; `demux_core::Demuxer::seek_track` over the same file lands on the same unit). One unit of pre-roll
+    /// primes the MDCT overlap; its PCM is dropped. Exact.
+    fn seek(&mut self, t: u64) -> Result<Option<SeekPoint>> {
+        let n = ((t + self.skip0) / 1024).min(self.units.len() as u64);
+        let l = n.saturating_sub(1);
+        let a = Asc::parse(&self.asc)?;
+        self.dec = AacDecoder::new(a.sf_index, a.layout()?)?;
+        self.next = l as usize;
+        let d0 = (n * 1024).max(self.skip0);
+        self.skip = d0 - l * 1024;
+        let sample = d0 - self.skip0;
+        self.emitted = sample;
+        let byte = self.units.get(l as usize).map(|u| u.0 as u64).unwrap_or(self.data.len() as u64);
+        Ok(Some(SeekPoint { byte, sample, exact: true, table: "mp4", landed: sample }))
     }
 }
