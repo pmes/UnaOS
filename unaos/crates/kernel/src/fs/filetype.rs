@@ -6,16 +6,17 @@
 //! type and says WHICH SOURCE decided it, in this order:
 //!
 //! 1. **Attribute** — `una:type` on the object (UnaFS volumes; ATTRSURF's `MountTable::get_attr`).
-//! 2. **Sniffed** — the first [`SNIFF_LEN`] bytes: PNG, `RIFF....WAVE`, ELF (UnaOS vs Linux, below),
-//!    gzip, `ustar`, then a UTF-8/ASCII text heuristic. Content beats the name.
-//! 3. **Extension** — ONE static table ([`EXT_TABLE`]); the only place a name decides anything.
+//! 2. **Sniffed** — the first [`SNIFF_LEN`] bytes: `type_core::sniff_magic` (PNG, `RIFF....WAVE`, ELF split,
+//!    gzip, `ustar`, GIF), the cores' own magics, then `type_core::sniff_text`. Content beats the name.
+//! 3. **Extension** — ONE static table (`type_core::EXT_TABLE`, re-exported as [`EXT_TABLE`]), then the
+//!    FILETYPES registry's user-added `una:extensions` (TYPECORE, B423's owed leg).
 //! 4. **Unknown** — `application/octet-stream`.
 //!
 //! On a FAT volume every attribute call answers `-ENOTSUP`, so leg 1 is skipped there and the answer
 //! comes from the sniff or the table — and the source printed says so. Nothing here keeps a store of
 //! its own: the attribute IS the type (R79 — the seam is the volume, not a second table on disk).
 //!
-//! THE ELF SPLIT is the one the two loaders already make. A UnaOS image (`arch/*/elf.rs`) is linked at
+//! THE ELF SPLIT (`type_core::elf_flavour`, over `elf_core::read_phdrs` — the loaders' own parse) is the one the two loaders already make. A UnaOS image (`arch/*/elf.rs`) is linked at
 //! vaddr 0 and biased into a slot window, so its lowest `PT_LOAD` vaddr is below the 64 KiB floor; a
 //! static Linux image (`arch/x86_64/linuxabi/elf.rs`, `IMAGE_FLOOR`) is mapped at its own fixed vaddrs,
 //! at or above it. The floor is the test.
@@ -29,43 +30,16 @@ use crate::fs::vfs::{AttrValue, MountTable, NodeKind, VfsError, KERNEL_PRINCIPAL
 /// The type attribute's key.
 pub const TYPE_KEY: &str = "una:type";
 
-pub const TEXT_PLAIN: &str = "text/plain";
-pub const IMAGE_PNG: &str = "image/png";
-pub const AUDIO_WAV: &str = "audio/wav";
-pub const UNAOS_ELF: &str = "application/x-unaos-elf";
-pub const UNAOS_BIN: &str = "application/x-unaos-bin";
-pub const LINUX_ELF: &str = "application/x-linux-elf";
-pub const DIRECTORY: &str = "inode/directory";
-pub const GZIP: &str = "application/gzip";
-pub const TAR: &str = "application/x-tar";
-pub const OCTET: &str = "application/octet-stream";
-/// QUARRY2 (B336): the two text types FILETYPE owed, and the animated-image type PIXELCORE decodes.
-pub const TEXT_MARKDOWN: &str = "text/markdown";
-pub const APP_JSON: &str = "application/json";
-pub const IMAGE_GIF: &str = "image/gif";
-/// OPENERS (B379): the types the decoders already in the tree read — named by the cores that own the formats
-/// (`pixel_core::mime_of`, `audio_core::mime_of`, `demux_core::mime::mime_of`), so these strings are theirs.
-pub const IMAGE_JPEG: &str = "image/jpeg";
-pub const IMAGE_BMP: &str = "image/bmp";
-pub const IMAGE_WEBP: &str = "image/webp";
-pub const IMAGE_QOI: &str = "image/qoi";
-/// SMALLFIX2 (B391, R94): pixel_core's SVG type (`pixel_core::mime_of` under the `svg` feature).
-pub const IMAGE_SVG: &str = "image/svg+xml";
-pub const AUDIO_FLAC: &str = "audio/flac";
-pub const AUDIO_OGG: &str = "audio/ogg";
-pub const AUDIO_MPEG: &str = "audio/mpeg";
-pub const AUDIO_AAC: &str = "audio/aac";
-pub const AUDIO_AIFF: &str = "audio/aiff";
-pub const AUDIO_MP4: &str = demux_core::mime::AUDIO_MP4;
-pub const VIDEO_MP4: &str = demux_core::mime::VIDEO_MP4;
-pub const VIDEO_WEBM: &str = demux_core::mime::VIDEO_WEBM;
-pub const VIDEO_MATROSKA: &str = demux_core::mime::VIDEO_MATROSKA;
+// TYPECORE (B450, R79): the MIME strings, THE extension table, the built-in magics and their order, the text heads
+// and the ELF split are `type_core`'s — the one table the host's bandy reads too. This file keeps what needs a volume.
+pub use type_core::{
+    by_extension, ext_of, looks_json, looks_markdown, looks_text, APP_JSON, AUDIO_AAC, AUDIO_AIFF, AUDIO_FLAC, AUDIO_MP4, AUDIO_MPEG, AUDIO_OGG,
+    AUDIO_WAV, DIRECTORY, EXT_TABLE, GZIP, IMAGE_BMP, IMAGE_GIF, IMAGE_JPEG, IMAGE_PNG, IMAGE_QOI, IMAGE_SVG, IMAGE_WEBP, LINUX_ELF, OCTET, TAR,
+    TEXT_MARKDOWN, TEXT_PLAIN, UNAOS_BIN, UNAOS_ELF, VIDEO_MATROSKA, VIDEO_MP4, VIDEO_WEBM,
+};
 
 /// How many leading bytes the sniff reads (`ustar` sits at 257..262, so a tar needs 263).
 pub const SNIFF_LEN: usize = 512;
-
-/// The lowest `PT_LOAD` vaddr a static Linux image may carry — `linuxabi::elf::IMAGE_FLOOR`.
-const LINUX_VADDR_FLOOR: u64 = 0x1_0000;
 
 /// Which leg of [`type_of`] decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,118 +59,6 @@ impl Source {
             Source::Unknown => "unknown",
         }
     }
-}
-
-/// THE extension table — every extension the old Quarry if-chains knew, plus the ones they disagreed
-/// on (`.sha/.cfg/.ini`) and the shapes this tree ships (`.lnx`, `.tgz`, `.tar`, `.toml`, `.json`).
-/// Matched case-insensitively against the text after the LAST dot (a leading dot is a name, not an
-/// extension). This is the ONLY name-based routing in the kernel's open path.
-pub const EXT_TABLE: &[(&str, &str)] = &[
-    ("elf", UNAOS_ELF),
-    ("bin", UNAOS_BIN),
-    ("lnx", LINUX_ELF),
-    ("png", IMAGE_PNG),
-    ("wav", AUDIO_WAV),
-    ("txt", TEXT_PLAIN),
-    ("md", TEXT_MARKDOWN),
-    ("markdown", TEXT_MARKDOWN),
-    ("log", TEXT_PLAIN),
-    ("spec", TEXT_PLAIN),
-    ("sha", TEXT_PLAIN),
-    ("cfg", TEXT_PLAIN),
-    ("ini", TEXT_PLAIN),
-    ("toml", TEXT_PLAIN),
-    ("json", APP_JSON),
-    ("gif", IMAGE_GIF),
-    ("tgz", GZIP),
-    ("gz", GZIP),
-    ("tar", TAR),
-    // OPENERS (B379): the image, audio and container extensions — used only when the bytes say nothing
-    // (an empty file, a head no core recognises).
-    ("jpg", IMAGE_JPEG),
-    ("jpeg", IMAGE_JPEG),
-    ("bmp", IMAGE_BMP),
-    ("webp", IMAGE_WEBP),
-    ("qoi", IMAGE_QOI),
-    ("svg", IMAGE_SVG), // SMALLFIX2 (B391): the bytes speak first — without the `svg` feature an .svg sniffs as its text
-    ("flac", AUDIO_FLAC),
-    ("ogg", AUDIO_OGG),
-    ("oga", AUDIO_OGG),
-    ("opus", AUDIO_OGG),
-    ("mp3", AUDIO_MPEG),
-    ("aac", AUDIO_AAC),
-    ("m4a", AUDIO_MP4),
-    ("m4b", AUDIO_MP4),
-    ("aif", AUDIO_AIFF),
-    ("aiff", AUDIO_AIFF),
-    ("aifc", AUDIO_AIFF),
-    ("mp4", VIDEO_MP4),
-    ("m4v", VIDEO_MP4),
-    ("webm", VIDEO_WEBM),
-    ("mkv", VIDEO_MATROSKA),
-];
-
-/// The extension of `name` (without the dot), or `None`. Pure.
-pub fn ext_of(name: &str) -> Option<&str> {
-    let leaf = name.rsplit('/').next().unwrap_or(name);
-    match leaf.rfind('.') {
-        Some(i) if i > 0 && i + 1 < leaf.len() => Some(&leaf[i + 1..]),
-        _ => None,
-    }
-}
-
-/// The table's answer for `name`, or `None`. Pure.
-pub fn by_extension(name: &str) -> Option<&'static str> {
-    let e = ext_of(name)?;
-    EXT_TABLE.iter().find(|(x, _)| e.eq_ignore_ascii_case(x)).map(|(_, m)| *m)
-}
-
-fn u16le(b: &[u8], o: usize) -> Option<u64> {
-    b.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]) as u64)
-}
-fn u64le(b: &[u8], o: usize) -> Option<u64> {
-    b.get(o..o + 8).map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
-}
-
-/// UnaOS or Linux, for a buffer that starts with `\x7fELF`. The lowest `PT_LOAD` vaddr among the
-/// program headers that fit in `b`; when none fit, `e_entry` stands in. Pure.
-fn elf_flavour(b: &[u8]) -> &'static str {
-    let phoff = u64le(b, 32).unwrap_or(0) as usize;
-    let phnum = u16le(b, 56).unwrap_or(0) as usize;
-    let phent = u16le(b, 54).unwrap_or(0) as usize;
-    let mut min: Option<u64> = None;
-    if phent == 56 {
-        for i in 0..phnum.min(16) {
-            let ph = phoff.saturating_add(i * 56);
-            let Some(ty) = b.get(ph..ph + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]])) else { break };
-            if ty != 1 {
-                continue;
-            }
-            if let Some(va) = u64le(b, ph + 16) {
-                min = Some(min.map_or(va, |m: u64| m.min(va)));
-            }
-        }
-    }
-    let va = min.or_else(|| u64le(b, 24)).unwrap_or(0);
-    if va >= LINUX_VADDR_FLOOR { LINUX_ELF } else { UNAOS_ELF }
-}
-
-/// Is `b` (a PREFIX of a file, possibly cut mid-character) text: no NUL, valid UTF-8 up to a cut
-/// tail of at most 3 bytes, and almost no control bytes besides TAB/LF/CR/FF/ESC. Pure.
-pub fn looks_text(b: &[u8]) -> bool {
-    if b.is_empty() || b.contains(&0) {
-        return false;
-    }
-    match core::str::from_utf8(b) {
-        Ok(_) => {}
-        Err(e) => {
-            if e.error_len().is_some() || b.len() - e.valid_up_to() > 3 {
-                return false;
-            }
-        }
-    }
-    let ctl = b.iter().filter(|&&c| c < 0x20 && !matches!(c, b'\t' | b'\n' | b'\r' | 0x0c | 0x1b)).count();
-    ctl * 32 <= b.len()
 }
 
 /// The sniff over a file's leading bytes. `None` = nothing recognised (the table decides). Pure.
@@ -220,32 +82,16 @@ pub fn sniff_strength(b: &[u8]) -> Option<(&'static str, bool)> {
     audio_core::mime_of(b).map(|(m, _)| (m, false))
 }
 
-/// The pre-OPENERS sniff with the cores' strong magics inserted before the text heuristic. Pure.
+/// The sniff order: `type_core`'s built-in magics, then the cores' own strong magics (images, an `ftyp`/`moov`/EBML
+/// container head, audio), then `type_core`'s text heads. Pure.
 fn sniff_core(b: &[u8]) -> Option<&'static str> {
-    if b.len() >= 8 && b[..8] == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a] {
-        return Some(IMAGE_PNG);
+    if let Some(m) = type_core::sniff_magic(b) {
+        return Some(m);
     }
-    if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WAVE" {
-        return Some(AUDIO_WAV);
-    }
-    if b.len() >= 4 && b[..4] == [0x7f, b'E', b'L', b'F'] {
-        return Some(elf_flavour(b));
-    }
-    if b.len() >= 2 && b[0] == 0x1f && b[1] == 0x8b {
-        return Some(GZIP);
-    }
-    if b.len() >= 262 && &b[257..262] == b"ustar" {
-        return Some(TAR);
-    }
-    if b.len() >= 6 && (&b[..6] == b"GIF87a" || &b[..6] == b"GIF89a") {
-        return Some(IMAGE_GIF);
-    }
-    // OPENERS (B379): the cores' own magics — images (JPEG, BMP by its DIB header, QOI, WebP), containers (an
-    // `ftyp`/`moov` at offset 4, the EBML magic), audio (`fLaC` `OggS` `ID3` `FORM…AIFF`).
     if let Some(m) = pixel_core::mime_of(b) {
         return Some(m);
     }
-    if (b.len() >= 8 && matches!(&b[4..8], b"ftyp" | b"moov")) || b.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+    if type_core::container_head(b) {
         if let Some(m) = demux_core::mime::mime_of(b) {
             return Some(m);
         }
@@ -253,16 +99,7 @@ fn sniff_core(b: &[u8]) -> Option<&'static str> {
     if let Some((m, true)) = audio_core::mime_of(b) {
         return Some(m);
     }
-    if looks_text(b) {
-        if looks_json(b) {
-            return Some(APP_JSON);
-        }
-        if looks_markdown(b) {
-            return Some(TEXT_MARKDOWN);
-        }
-        return Some(TEXT_PLAIN);
-    }
-    None
+    type_core::sniff_text(b)
 }
 
 /// QUARRY2 (B336) — the type the text editor stamps on a save: `text/markdown` / `application/json` when
@@ -271,37 +108,6 @@ pub fn saved_text_type(path: &str) -> &'static str {
     match by_extension(path) {
         Some(m @ (TEXT_MARKDOWN | APP_JSON)) => m,
         _ => TEXT_PLAIN,
-    }
-}
-
-/// QUARRY2 (B336) — a Markdown head: an ATX heading `# ` (any level up to six `#`) on the first line,
-/// or YAML front matter (`---` alone on the first line). Pure.
-pub fn looks_markdown(b: &[u8]) -> bool {
-    let b = b.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(b);
-    let line = b.split(|&c| c == b'\n').next().unwrap_or(b);
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    if line == b"---" {
-        return true;
-    }
-    let hashes = line.iter().take_while(|&&c| c == b'#').count();
-    (1..=6).contains(&hashes) && line.get(hashes) == Some(&b' ')
-}
-
-/// QUARRY2 (B336) — a JSON head: after whitespace, `{` followed by `"` or `}`, or `[` followed by a
-/// value's first byte (`"` `{` `[` `]` `-` a digit `t` `f` `n`). Valid FIRST TOKENS, not a parse: the
-/// renderer validates the whole document and says so when it is not one. Pure.
-pub fn looks_json(b: &[u8]) -> bool {
-    let ws = |c: &u8| matches!(*c, b' ' | b'\t' | b'\r' | b'\n');
-    let mut it = b.iter().skip_while(|c| ws(*c));
-    let first = match it.next() {
-        Some(&c) => c,
-        None => return false,
-    };
-    let next = it.find(|c| !ws(*c)).copied();
-    match (first, next) {
-        (b'{', Some(b'"')) | (b'{', Some(b'}')) => true,
-        (b'[', Some(c)) => matches!(c, b'"' | b'{' | b'[' | b']' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n'),
-        _ => false,
     }
 }
 
@@ -460,24 +266,11 @@ pub fn selftest() {
         return;
     };
     let p = |leaf: &str| if dir == "/" { alloc::format!("/{}", leaf) } else { alloc::format!("{}/{}", dir, leaf) };
-    let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
-    let mut wav = Vec::from(&b"RIFF\x24\x00\x00\x00WAVEfmt "[..]);
-    wav.extend_from_slice(&[0u8; 8]);
-    let mut lnx = alloc::vec![0u8; 64 + 56];
-    lnx[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-    lnx[4] = 2;
-    lnx[5] = 1;
-    lnx[32] = 64; // e_phoff
-    lnx[54] = 56; // e_phentsize
-    lnx[56] = 1; // e_phnum
-    lnx[64] = 1; // PT_LOAD
-    lnx[64 + 16..64 + 24].copy_from_slice(&0x40_0000u64.to_le_bytes());
-    let mut una = lnx.clone();
-    una[64 + 16..64 + 24].copy_from_slice(&0u64.to_le_bytes());
+    let (png, wav, lnx, una) = (&type_core::fixture::PNG[..], &type_core::fixture::WAV[..], type_core::fixture::elf(0x40_0000), type_core::fixture::elf(0));
     // (leaf, content, the type it must come out as, the leg that must decide it before any stamp)
     let cases: [(&str, &[u8], &str, Source); 8] = [
         ("FTPIC.DAT", png, IMAGE_PNG, Source::Sniffed),
-        ("FTSND", &wav, AUDIO_WAV, Source::Sniffed),
+        ("FTSND", wav, AUDIO_WAV, Source::Sniffed),
         ("FTNOTE", b"hello, typed world\n", TEXT_PLAIN, Source::Sniffed),
         ("FTLNX.ELF", &lnx, LINUX_ELF, Source::Sniffed),
         ("FTUNA", &una, UNAOS_ELF, Source::Sniffed),
@@ -593,13 +386,13 @@ fn iso_walk(mt: &MountTable, path: &str, size: u64) -> Option<&'static str> {
         let (ty, bsize, hl) = demux_core::mime::iso_box_header(&hdr)?;
         let end = if bsize == 0 { size } else { off.checked_add(bsize)? };
         let body_len = end.min(size).saturating_sub(off + hl as u64);
-        match &ty {
-            b"ftyp" if body_len <= 1024 => ftyp = mt.read(path, off + hl as u64, body_len as usize).ok(),
-            b"moov" if body_len <= ISO_MOOV_CAP => {
+        match ty {
+            type_core::ISO_FTYP if body_len <= 1024 => ftyp = mt.read(path, off + hl as u64, body_len as usize).ok(),
+            type_core::ISO_MOOV if body_len <= ISO_MOOV_CAP => {
                 moov = mt.read(path, off + hl as u64, body_len as usize).ok();
                 break;
             }
-            b"moov" => break,
+            type_core::ISO_MOOV => break,
             _ => {}
         }
         off = end;
