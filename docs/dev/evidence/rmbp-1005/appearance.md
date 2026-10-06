@@ -42,3 +42,28 @@ M3 apply: the login's load, the bus change, the auto clock, the one repaint; M4 
 **Owed.** Ring 3 (quartzite / the host apps) does not yet read `system.appearance.*`; the kit json has no dark set
 (the Dark row is ours, in theme.rs). Auto uses the RTC hour (19:00–07:00 dark) until NETCLOCK gives a real time.
 Translucency (MACPARITY 21 (c)) stays owed. The pointer keeps its two colours in both sets (PA38).
+
+## Built (exec-rmbp-appearance2, cut from 2574cd13)
+
+- M1 `prefs_core::appearance` + three schema rows + `settings.tab` 0..5; PREFS-SCHEMA.md regenerated; `cargo test -p prefs_core` exit 0.
+- M2 `theme::Tok` (32 tokens), `LIGHT` / `DARK`, `ACCENTS` (crispy teal moss amber clay rose violet slate), `accent()`,
+  `selection()`, `theme::fixture`; 379 role reads → token calls; 103 → 0 literals.
+- M3 `video/appearance.rs` (`CHARTER: Principia — shared-core`): the login's load (`settings::load_for_login`), another
+  client's PrefChanged (`settings` bus pass), the Settings choice (latched, stored + applied on the service pass), the
+  auto clock (once a minute). One repaint: `theme::set` → `quarry::live::font_repaint_pass` (now also keyed on the
+  theme epoch) → `wm::damage_intersecting(panel)`; `strip::seal` carries the epoch so the bar/dock/menus repaint.
+- M4 Settings > **Appearance** (sixth tab; the window 520 → 600 logical px): Light/Dark/Auto segments, eight accent
+  swatches, nine highlight swatches (the first follows the accent), a selection sample, the auto rule said in the pane.
+- M5 `tests appearance`: switches live to the other set with another accent and back (the store is not written).
+
+**Next flight reads.** Settings > Appearance > Dark: `[settings] appearance_mode=dark applied=1` then
+`[appearance] mode=dark dark=1 accent=crispy highlight=accent via=settings repaint_ms=<n>`, the chrome, bar, dock and
+Settings window go dark at once; a swatch: `[appearance] … accent=<name> via=settings`; after a reboot and login:
+`[appearance] mode=dark … via=login`; `tests appearance` →
+`:: APPEARANCE: literals_outside_theme=0 tokens=34 sets=2 mode=<m> accent=<name> repaint_ms=<n> -> PASS ::`.
+
+**Owed (said, not hidden).** Kernel windows outside Quarry's repaint list (dialog, toast, window menus, the console)
+take the new set on their next own repaint; Ring-3 windows (Lumen, host apps) do not read `system.appearance.*` yet;
+the material selftests (ceramic, knurl, paper) and the installer's paper read the kit's Light consts; the console,
+the pointer, Pulse and Facet's media ground are the same in both sets; the Appearance tab is mouse-only; the login
+screen after a Log Out keeps the last session's set until the next login loads its own; translucency (21c).
