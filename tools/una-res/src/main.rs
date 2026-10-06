@@ -3,7 +3,7 @@
 //! una-res — APPRES (rmbp-ledger B398, MACPARITY §16 B4 / row 38): a program's RESOURCES.
 //!
 //! A program crate carries a `res/` directory: `app.res` (`key = value` lines: `name`, `signature`,
-//! `version`, `kind`, `doctypes` — a comma list of MIME types) and `icon.svg`. This tool turns it into the
+//! `version`, `kind`, `doctypes` — a comma list of MIME types — and `droptypes`, the same shape, B477) and `icon.svg`. This tool turns it into the
 //! resource block `midden_core::res_build` defines — the four text keys, the SVG source, the icon rendered
 //! by svg_core at 32, 64 and 128 px and written as RGBA PNGs by pixel_core, and the doc types — and either
 //!
@@ -36,7 +36,7 @@ fn parse_app_res(text: &str) -> Result<Vec<(String, String)>, String> {
         let (k, v) = l.split_once('=').ok_or_else(|| format!("app.res line {}: no '='", n + 1))?;
         let (k, v) = (k.trim(), v.trim());
         match k {
-            "name" | "signature" | "version" | "kind" | "doctypes" => out.push((k.to_string(), v.to_string())),
+            "name" | "signature" | "version" | "kind" | "doctypes" | "droptypes" => out.push((k.to_string(), v.to_string())),
             _ => return Err(format!("app.res line {}: unknown key {k}", n + 1)),
         }
     }
@@ -78,10 +78,14 @@ pub fn build_block(dir: &Path, build: Option<&str>) -> Result<Vec<u8>, String> {
     let doctypes: Vec<String> = get("doctypes")
         .map(|d| d.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
+    let droptypes: Vec<String> = get("droptypes")
+        .map(|d| d.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
     let svg = std::fs::read(dir.join("icon.svg")).map_err(|e| format!("{}/icon.svg: {e}", dir.display()))?;
     let pngs: Vec<Vec<u8>> = mc::RES_ICON_SIZES.iter().map(|(px, _)| icon_png(&svg, *px)).collect::<Result<_, _>>()?;
     let (name, sig, kind) = (get("name").unwrap(), get("signature").unwrap(), get("kind").unwrap());
     let doc_join = doctypes.join("\n");
+    let drop_join = droptypes.join("\n");
     let mut recs: Vec<(&str, &[u8])> = vec![
         (mc::RES_KEY_NAME, name.as_bytes()),
         (mc::RES_KEY_SIGNATURE, sig.as_bytes()),
@@ -94,6 +98,9 @@ pub fn build_block(dir: &Path, build: Option<&str>) -> Result<Vec<u8>, String> {
     }
     if !doc_join.is_empty() {
         recs.push((mc::RES_KEY_DOCTYPES, doc_join.as_bytes()));
+    }
+    if !drop_join.is_empty() {
+        recs.push((mc::RES_KEY_DROPTYPES, drop_join.as_bytes())); // DROPTYPES (B477): what the program's windows take as a drop
     }
     mc::res_build(&recs).ok_or_else(|| "a record does not encode".to_string())
 }
@@ -210,7 +217,7 @@ mod tests {
     fn res_dir() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("una-res-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("app.res"), "name = Test\nsignature = org.unaos.test\nversion = 0.1.0\nkind = windowed\ndoctypes = text/plain, image/png\n").unwrap();
+        std::fs::write(d.join("app.res"), "name = Test\nsignature = org.unaos.test\nversion = 0.1.0\nkind = windowed\ndoctypes = text/plain, image/png\ndroptypes = text/*, image/png\n").unwrap();
         std::fs::write(d.join("icon.svg"), SVG).unwrap();
         d
     }
@@ -260,6 +267,7 @@ mod tests {
         assert_eq!(got, &block[..]);
         assert_eq!(mc::res_str(got, mc::RES_KEY_VERSION), Some("0.1.0+abc1234"));
         assert_eq!(mc::res_str(got, mc::RES_KEY_DOCTYPES), Some("text/plain\nimage/png"));
+        assert_eq!(mc::res_str(got, mc::RES_KEY_DROPTYPES), Some("text/*\nimage/png"));
         for (px, key) in mc::RES_ICON_SIZES {
             let png = mc::res_get(got, key).unwrap();
             let im = pixel_core::decode_png(png).unwrap();

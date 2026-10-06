@@ -245,7 +245,7 @@ pub fn drop(p: &Payload, t: &Target, option: bool) -> (Action, bool) {
             (act, ok)
         }
         Target::Trash => (Action::Trash, false), // the dock's, never routed here
-        Target::Dock { .. } | Target::App { .. } => (Action::Open, false), // the session's own, never routed here
+        Target::Dock { .. } | Target::App { .. } | Target::Refused { .. } => (Action::Open, false), // the session's own, never routed here
     };
     refresh_after();
     r
@@ -648,20 +648,46 @@ pub fn selftest2() {
     #[cfg(not(target_arch = "x86_64"))]
     let furniture = true;
     let ring3_ok = tok != 0 && refused && got && once && furniture && una_abi::INPUT_EV_ALL.contains(&una_abi::INPUT_EV_DROP);
+    let (types_ok, lumen) = droptypes_probe(); // DROPTYPES (B477)
     let _ = super::ops::op_delete(&base);
     let w = |b: bool| if b { "ok" } else { "FAIL" };
-    let pass = multi_ok && dock_ok && desktop_ok && spring_ok && ring3_ok;
+    let pass = multi_ok && dock_ok && desktop_ok && spring_ok && ring3_ok && types_ok;
     serial_println!(
-        ":: DRAGDROP2: multi={} dock={} desktop={} spring={} ring3={} -> {} :: fixture={} spring_ms={} ev_drop={} verb_drop_get={} ::",
+        ":: DRAGDROP2: multi={} dock={} desktop={} spring={} ring3={} types={} -> {} :: lumen={} fixture={} spring_ms={} ev_drop={} verb_drop_get={} ::",
         w(multi_ok),
         w(dock_ok),
         w(desktop_ok),
         w(spring_ok),
         w(ring3_ok),
+        w(types_ok),
         if pass { "PASS" } else { "FAIL" },
+        lumen,
         base,
         dnd::SPRING_MS,
         una_abi::INPUT_EV_DROP,
         una_abi::BUS_VERB_DROP_GET
     );
+}
+
+/// DROPTYPES (rmbp-ledger B477) — `tests dragdrop2`'s `types=`: the declaration rule over fixed types (exact,
+/// `type/*`, `*/*`, absent = nothing, distinct counting), the refusal's `to=` word, and Lumen's own declaration when
+/// `/apps/LUMEN.ELF` is on this root (`lumen=declared|nores|absent|FAIL`; only `FAIL` fails).
+fn droptypes_probe() -> (bool, &'static str) {
+    let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|x| String::from(*x)).collect() };
+    let decl = v(&["text/*", "image/png"]);
+    let rule = dnd::undeclared_of(&decl, &v(&["text/plain", "image/png"])) == 0
+        && dnd::undeclared_of(&decl, &v(&["text/plain", "audio/wav", "audio/wav", "video/mp4"])) == 2
+        && dnd::undeclared_of(&[], &v(&["text/plain"])) == 1
+        && dnd::undeclared_of(&v(&["*/*"]), &v(&["audio/wav", "inode/directory"])) == 0;
+    let word = Target::Refused { win: wm::WIN_NONE, owner: 7, types: 1 }.word() == "app:7";
+    let mt = crate::shell::vfs_mount_table();
+    let lumen = match crate::fs::appres::sight_in(&mt, "/apps/LUMEN.ELF") {
+        Some(a) if a.has_res => {
+            let d = &a.droptypes;
+            if crate::video::dock::dnd_takes(d, "text/plain") && crate::video::dock::dnd_takes(d, "image/png") && !crate::video::dock::dnd_takes(d, "audio/wav") { "declared" } else { "FAIL" }
+        }
+        Some(_) => "nores",
+        None => "absent",
+    };
+    (rule && word && lumen != "FAIL", lumen)
 }
