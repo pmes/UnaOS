@@ -856,7 +856,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
         let mut s = SESSION_LOCAL.lock();
         s.0[..name.len()].copy_from_slice(name);
         s.1 = name.len() as u8;
-        s.2 = id; ROOT_LIVE.store(false, core::sync::atomic::Ordering::Release); // R63 (LOGIN13): a user session SUPERSEDES the root session — root is never re-entered this boot (there is no root row in the store; root is reached by booting). See `root_session`.
+        s.2 = id; ROOT_LIVE.store(false, core::sync::atomic::Ordering::Release); SESSION_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); /* SESSIONGEN (B462): under SESSION_LOCAL */ // R63 (LOGIN13): a user session SUPERSEDES the root session — root is never re-entered this boot (there is no root row in the store; root is reached by booting). See `root_session`.
     }
     let mut nb = [0u8; NAME_MAX];
     nb[..name.len()].copy_from_slice(name);
@@ -974,7 +974,7 @@ pub fn logout() -> (usize, usize) {
     {
         let mut s = SESSION_LOCAL.lock();
         s.1 = 0;
-        s.2 = 0;
+        s.2 = 0; SESSION_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); // SESSIONGEN (B462): under SESSION_LOCAL
     }
     // SO37 ON THE WIRE. The epoch printed is the one now LIVE, i.e. the one that has just been opened by
     // this logout — so `epoch=N` says "every stamp carrying N-1 or older is refused from here on", and a
@@ -3470,3 +3470,8 @@ pub fn serialdoor_principal_note() {
         None => serial_println!("[serialdoor] principal=system (R100: no session is open)"),
     }
 }
+
+/// SESSIONGEN (rmbp-ledger B462, PERFREVIEW F3's follow-up) — moved under `SESSION_LOCAL` by the two writers
+/// (login, logout), so a per-pass "did the session change" is one load (`prefs::SessionSeen`), not a locked
+/// `whoami` and a locked compare.
+pub static SESSION_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);

@@ -66,7 +66,7 @@ pub struct AttrState {
     wrote: u32,
 }
 
-static POSTED: super::super::svclatch::Latch = super::super::svclatch::Latch::new(); /* SVCLATCH (B462): up while `pending` holds work; raised and lowered under ATTRS */ pub static ATTRS: crate::sync::Mutex<AttrState> = crate::sync::Mutex::new(AttrState {
+static POSTED: crate::video::svclatch::Latch = crate::video::svclatch::Latch::new(); /* SVCLATCH (B462): up while `pending` holds work; raised and lowered under ATTRS */ pub static ATTRS: crate::sync::Mutex<AttrState> = crate::sync::Mutex::new(AttrState {
     dir: String::new(),
     keys: Vec::new(),
     avail: Vec::new(),
@@ -233,7 +233,7 @@ pub fn service() {
     let batch: Vec<String> = {
         let mut st = ATTRS.lock();
         let n = st.pending.len().min(PER_PASS);
-        let b: Vec<String> = st.pending.drain(..n).collect(); POSTED.settle(!st.pending.is_empty()); super::super::svclatch::found(!b.is_empty()); b
+        let b: Vec<String> = st.pending.drain(..n).collect(); POSTED.settle(!st.pending.is_empty()); crate::video::svclatch::found(!b.is_empty()); b
     };
     if batch.is_empty() {
         return;
