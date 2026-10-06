@@ -353,9 +353,10 @@ pub fn sight_in(mt: &MountTable, path: &str) -> Option<App> {
     let (volume, root) = crate::fs::apptrust::trust_of(mt, path); // APPTRUST (B467): where it is decides what a sight may write
     serial_println!("[appres] sighted {} volume={} trust={}", path, volume, if root { "root" } else { "foreign" });
     if !root {
+        sight_twin(mt, path, &key); // APPTRUST2 (B478): the root program of the same name is sighted first, so its key never draws the stick's icon
         let app = match read_block(mt, path) {
-            Ok(Some(b)) => app_from_block(&key, path, &stamp, &b, "elf"),
-            _ => generic_app(&key, path, &stamp, "elf"),
+            Ok(Some(b)) => app_from_block(&key, path, &stamp, &b, SOURCE_FOREIGN),
+            _ => generic_app(&key, path, &stamp, SOURCE_FOREIGN),
         };
         let _ = admit(mt, &app, &volume, false);
         SIGHTS.fetch_add(1, Ordering::Relaxed);
@@ -385,9 +386,9 @@ pub fn sight(path: &str) {
     let _ = sight_in(&crate::shell::vfs_mount_table(), path);
 }
 
-/// The app a key names: a built-in, or a program already sighted.
+/// The app a key names: a built-in, or a program already sighted (a root sight before a foreign one — APPTRUST2).
 pub fn app(key: &str) -> Option<App> {
-    builtin_app(key).or_else(|| REG.lock().iter().find(|a| a.key == key).cloned())
+    builtin_app(key).or_else(|| by_key(&REG.lock(), key).cloned())
 }
 
 /// The app a sighted path names (no I/O).
@@ -473,8 +474,11 @@ fn with_pix<R>(key: &str, size: usize, f: impl FnOnce(&[u32]) -> R) -> Option<R>
     }
     let a = match builtin_app(key) {
         Some(a) => a,
-        None => REG.try_lock()?.iter().find(|a| a.key == key).cloned()?,
+        None => by_key(&REG.try_lock()?, key).cloned()?,
     };
+    if a.path.starts_with('/') {
+        serial_println!("[appres] icon-for name={} from={} path={} size={}", key, if a.source == SOURCE_FOREIGN { "foreign" } else { "root" }, a.path, size); // APPTRUST2 (B478): once per decode
+    }
     let argb = render(&a, size)?;
     DRAWN.fetch_add(1, Ordering::Relaxed);
     let r = f(&argb);
@@ -838,4 +842,49 @@ pub fn launch_name(path: &str) -> Option<String> {
     }
     let n = a.name.trim();
     (!n.is_empty() && !n.contains(' ') && !n.contains('.')).then(|| n.to_ascii_lowercase())
+}
+
+// ── APPTRUST2 (rmbp-ledger B478) — a foreign sight never lends its icon to a root program's key ──────────────────────
+
+/// `App.source` of a program sighted on a FOREIGN volume (`apptrust::trust_of`): listed, never cached or published.
+pub const SOURCE_FOREIGN: &str = "foreign";
+
+/// THE by-key pick: a root (or cached) sight of `key` before a foreign one, whatever order they were sighted in.
+fn by_key<'a>(r: &'a [App], key: &str) -> Option<&'a App> {
+    r.iter().find(|a| a.key == key && a.source != SOURCE_FOREIGN).or_else(|| r.iter().find(|a| a.key == key))
+}
+
+/// A foreign sight of `path`: when `/apps/<leaf>` exists and no root sight of `key` is in the memo, sight it first
+/// (a root sight), so the key names the root program from the stick's first appearance.
+fn sight_twin(mt: &MountTable, path: &str, key: &str) {
+    let leafn = path.rsplit('/').next().unwrap_or(path);
+    let twin = alloc::format!("{}/{}", crate::fs::apptrust::APPS_DIR, leafn);
+    if twin == path || REG.lock().iter().any(|a| a.key == key && a.source != SOURCE_FOREIGN) {
+        return;
+    }
+    if mt.stat(&twin).is_ok() && crate::fs::apptrust::is_root(mt, &twin) {
+        let _ = sight_in(mt, &twin);
+    }
+}
+
+/// `tests apptrust`'s icon leg: a foreign and a root probe of one key, remembered in both orders — `app(key)` must
+/// name the root one each time. `"root"` or `"FOREIGN"`; leaves nothing in the memo.
+pub fn icon_probe() -> &'static str {
+    let (fp, rp) = ("/volumes/apptrust-probe/APTICON.ELF", "/apps/APTICON.ELF");
+    let mut f = probe_app(fp, "org.unaos.apptrust-icon", "application/x-apptrust-icon");
+    f.source = SOURCE_FOREIGN;
+    let r = probe_app(rp, "org.unaos.apptrust-icon", "application/x-apptrust-icon");
+    let key = f.key.clone();
+    remember(&f);
+    remember(&r);
+    let a = app(&key).map(|a| a.path == rp).unwrap_or(false);
+    forget(fp);
+    forget(rp);
+    remember(&r);
+    remember(&f);
+    let b = app(&key).map(|a| a.path == rp).unwrap_or(false);
+    forget(fp);
+    forget(rp);
+    PIX.lock().retain(|p| p.key != key);
+    if a && b { "root" } else { "FOREIGN" }
 }
