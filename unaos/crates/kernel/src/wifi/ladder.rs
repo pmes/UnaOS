@@ -6,7 +6,7 @@
 //! CHARTER: Kernel — driver. The table below IS `docs/dev/OS/06_NETWORK_STACK/bcm4331.md` §7, row for
 //! row; every `Confirmed`/`Refuted` carries the flight and the wire line it was read from
 //! (DRIVERS-METHOD §3: no rung is settled by reading). Two rows are re-measured LIVE this boot: `F`
-//! (the firmware set is on THIS medium: `staged_count() == 3`) and `R0` (this boot printed
+//! (the firmware set is on THIS medium AND pinned: `staged_count() == 3`, FWPIN B455) and `R0` (this boot printed
 //! `-> UPLOADED`, which re-confirms it rather than leaving it on a September capture). The witness
 //! states the SPEC'S shape of readiness, not the output we happened to get (R89):
 //!
@@ -75,12 +75,25 @@ pub fn witness() {
     }
     // S4u (reboot) is confirmed on metal; S4i (in-boot re-upload of the C1 pre-image) is open.
     let unwind = "reboot-proven";
-    let reason = if staged < 3 { Some("firmware-not-staged") } else { None };
+    // FWPIN (B455): nothing stages unless its SHA-256 equals its `unaos/firmware/b43.pins` row, so a full set
+    // IS a pinned set; short of it, the refusal (unpinned / violates-layout / pin-mismatch) is the reason.
+    let refusal = super::firmware::refusal();
+    let fw = if staged >= 3 {
+        alloc::string::String::from("fw=pinned sha=match")
+    } else {
+        refusal.map(|r| alloc::format!("fw=refused reason={}", r)).unwrap_or_else(|| alloc::string::String::from("fw=absent"))
+    };
+    let reason = if staged < 3 { Some(refusal.unwrap_or("firmware-not-staged")) } else { None };
+    let hint = match reason {
+        Some("unpinned") => " (pin the WIFI-FW build line's sha256 rows into unaos/firmware/b43.pins)",
+        Some(_) => " (UNAOS_WIFI_FW_PATH stages the set onto the card's /FIRMWARE/)",
+        None => "",
+    };
     serial_println!(
-        ":: WIFI5: rungs={} confirmed={} refuted={} open={} parked={} upload_unwind={} staged={}/3 uploaded_this_boot={} -> {}{} ::",
-        LEDGER.len(), c, r, o, p, unwind, staged, uploaded as u8,
+        ":: WIFI5: rungs={} confirmed={} refuted={} open={} parked={} upload_unwind={} staged={}/3 {} uploaded_this_boot={} -> {}{} ::",
+        LEDGER.len(), c, r, o, p, unwind, staged, fw, uploaded as u8,
         if reason.is_none() { "READY" } else { "NOT-READY" },
-        reason.map(|s| alloc::format!(" reason={} (UNAOS_WIFI_FW_PATH stages the set onto the card's /FIRMWARE/)", s)).unwrap_or_default()
+        reason.map(|s| alloc::format!(" reason={}{}", s, hint)).unwrap_or_default()
     );
     // WIFI6 (B439): the arc's three deliverables as measured this boot.
     serial_println!(
