@@ -128,6 +128,21 @@ pub const GEMINI_DEFAULT_KEY_ENV: &str = "GEMINI_API_KEY";
 pub static SCHEMA: &[Key] = &[
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     Key {
+        ns: "system", key: "appearance.accent", kind: Kind::Enum(&crate::appearance::ACCENTS), default: Default::Str("crispy"),
+        writers: &[Writer::Settings], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
+        doc: "The accent colour on the default button, the selection, the focused control's ring, the slider knob and the menu highlight (APPEARANCE B408; eight names, ours).",
+    },
+    Key {
+        ns: "system", key: "appearance.highlight", kind: Kind::Enum(&crate::appearance::HIGHLIGHTS), default: Default::Str("accent"),
+        writers: &[Writer::Settings], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
+        doc: "The text-selection colour: `accent` follows the accent, or one of the eight accent names (APPEARANCE B408).",
+    },
+    Key {
+        ns: "system", key: "appearance.mode", kind: Kind::Enum(&crate::appearance::MODES), default: Default::Str("light"),
+        writers: &[Writer::Settings], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
+        doc: "Light or Dark appearance; `auto` is dark 19:00-07:00 by the local clock (the RTC until NETCLOCK gives a real time) (APPEARANCE B408).",
+    },
+    Key {
         ns: "system", key: "audio.amp_holdoff_ms", kind: Kind::Int { min: 0, max: 600_000 },
         default: Default::Consumer("`hda_amp::AMP_HOLDOFF_MS`, 5000 ms"),
         writers: OP, reader: "kernel HDA amp (`drivers/hda_amp.rs`)",
@@ -212,9 +227,9 @@ pub static SCHEMA: &[Key] = &[
         doc: "Battery percent at which the machine shuts down; 0 = off.",
     },
     Key {
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 4 }, default: Default::Int(0),
+        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 5 }, default: Default::Int(0),
         writers: &[Writer::Settings], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About, Login Items).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance).",
     },
     // ── vein — the conversation handler's provider slot (VEINPROV B303, EMBED B317, R81) ───────────────
     Key {

@@ -195,7 +195,7 @@ const _: () = assert!(ENV_A_Q16 + ENV_B_Q16 == 65536);
 /// is what `palette.content_fill` rounds to as well. `theme.rs` and engine.md §9 both state the
 /// two agree by construction and that the paper reads its base from `CONTENT_FILL`; this is the
 /// tripwire that says so out loud if a future kit ever separates them.
-const _: () = assert!(theme::CONTENT_FILL == 0x00F5_F2EA);
+const _: () = assert!(theme::CONTENT_FILL == crate::video::theme::fixture::PAPER_BASE);
 
 // ---------------------------------------------------------------------------
 // The tile
@@ -516,12 +516,7 @@ pub fn selftest() {
     }
 
     // Leg 2 — the reference corner, and the laid line's direction.
-    const REF4: [u32; 16] = [
-        0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, //
-        0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, //
-        0x00F3_F0E9, 0x00F4_F1E9, 0x00F4_F1E9, 0x00F4_F1E9, //
-        0x00F3_F0E9, 0x00F4_F1E9, 0x00F4_F1E9, 0x00F4_F1E9,
-    ];
+    const REF4: [u32; 16] = crate::video::theme::fixture::PAPER_REF4;
     let px = tile();
     for y in 0..4 {
         for x in 0..4 {

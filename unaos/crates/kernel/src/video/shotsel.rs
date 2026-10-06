@@ -30,7 +30,7 @@ const REGION: u32 = 1;
 const WINDOW: u32 = 2;
 /// Smallest region a release commits; anything smaller is a stray click and cancels.
 const MIN_SIDE: usize = 2;
-const WHITE: u32 = 0x00FF_FFFF;
+const WHITE: u32 = crate::video::theme::SHOT_BORDER;
 
 static MODE: AtomicU32 = AtomicU32::new(OFF);
 static BEGUN: AtomicU32 = AtomicU32::new(0);

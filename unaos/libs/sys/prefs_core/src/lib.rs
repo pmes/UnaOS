@@ -41,6 +41,7 @@ extern crate std;
 
 pub mod declare;
 pub mod files;
+pub mod appearance;
 pub mod login;
 pub mod modes;
 pub mod rules;

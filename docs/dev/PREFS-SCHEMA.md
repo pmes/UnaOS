@@ -10,10 +10,13 @@ or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keep
 Defaults are answered by the schema; the store never holds one. Every key may also be written by the
 operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).
 
-Rows: 35.
+Rows: 38.
 
 | key | type | default | writers | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- |
+| `system.appearance.accent` | enum `crispy \| teal \| moss \| amber \| clay \| rose \| violet \| slate` | `"crispy"` | settings | kernel theme (`video/theme.rs`), Settings > Appearance | The accent colour on the default button, the selection, the focused control's ring, the slider knob and the menu highlight (APPEARANCE B408; eight names, ours). |
+| `system.appearance.highlight` | enum `accent \| crispy \| teal \| moss \| amber \| clay \| rose \| violet \| slate` | `"accent"` | settings | kernel theme (`video/theme.rs`), Settings > Appearance | The text-selection colour: `accent` follows the accent, or one of the eight accent names (APPEARANCE B408). |
+| `system.appearance.mode` | enum `light \| dark \| auto` | `"light"` | settings | kernel theme (`video/theme.rs`), Settings > Appearance | Light or Dark appearance; `auto` is dark 19:00-07:00 by the local clock (the RTC until NETCLOCK gives a real time) (APPEARANCE B408). |
 | `system.audio.amp_holdoff_ms` | int `0..=600000` | consumer: `hda_amp::AMP_HOLDOFF_MS`, 5000 ms | operator | kernel HDA amp (`drivers/hda_amp.rs`) | Milliseconds of silence before the speaker amp powers down (PREFSKERNEL: declared from the kernel scan). |
 | `system.audio.mute` | bool | `false` | settings, keys | kernel settings (audio) | Output muted. |
 | `system.audio.volume` | int `0..=16` | `12` | settings, keys | kernel settings (audio) | Output level in sixteenths. |
@@ -29,7 +32,7 @@ Rows: 35.
 | `system.login.items` | string ≤256 printable | `""` | settings, dock | kernel login items (`video/loginitems.rs`) | Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login. |
 | `system.pointer.speed` | int `0..=2` | `1` | settings | kernel settings (pointer) | 0 slow, 1 normal, 2 fast. |
 | `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | operator | kernel POWERMENU | Battery percent at which the machine shuts down; 0 = off. |
-| `system.settings.tab` | int `0..=4` | `0` | settings | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items). |
+| `system.settings.tab` | int `0..=5` | `0` | settings | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, Appearance). |
 | `vein.claude.api_key_env` | string ≤128 printable | `"ANTHROPIC_API_KEY"` | operator | gneiss_pal ProviderConfig | NAME of the environment variable holding the Claude key (the key is never a preference). |
 | `vein.claude.fallbacks` | bool | `true` | operator | gneiss_pal ProviderConfig | Let the Claude client fall back to the next model on overload. |
 | `vein.claudecode.bin` | string ≤4096 printable | `"claude"` | operator | gneiss_pal ProviderConfig | The Claude Code CLI binary for provider claudecode: a path, or a name looked up on PATH (CLAUDECODE, SR38). |

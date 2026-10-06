@@ -209,7 +209,7 @@ pub fn open(path: &str) -> Result<(usize, usize), String> {
     if surf.try_reserve_exact(len).is_err() {
         return Err(String::from("out of memory"));
     }
-    surf.resize(len, theme::CONTENT_FILL);
+    surf.resize(len, theme::content_fill());
     if is_open() {
         close();
     }
@@ -268,7 +268,7 @@ fn paint(st: &mut State) {
     let (cw, ch) = (face.cell_w(), face.cell_h());
     let (w, h) = (st.w, st.h);
     for p in st.surf.iter_mut() {
-        *p = theme::CONTENT_FILL;
+        *p = theme::content_fill();
     }
     let sel = sel_range(st);
     let crow = row_of(&st.rows, st.caret);
@@ -281,12 +281,12 @@ fn paint(st: &mut State) {
             let lo = core::cmp::max(s, a);
             let hi = core::cmp::min(e, b + (st.text.get(b) == Some(&b'\n')) as usize);
             if lo < hi {
-                fill(st, PAD() + (lo - a) * cw, y, (hi - lo) * cw, ch, theme::ACCENT);
+                fill(st, PAD() + (lo - a) * cw, y, (hi - lo) * cw, ch, theme::selection());
             }
         }
-        super::text::draw_text(&mut st.surf, w, w - crate::ui::px(6), h, PAD(), y, &st.text[a..b], theme::CONTENT_TEXT, false, face);
+        super::text::draw_text(&mut st.surf, w, w - crate::ui::px(6), h, PAD(), y, &st.text[a..b], theme::content_text(), false, face);
         if ri == crow {
-            fill(st, PAD() + (st.caret - a) * cw, y, crate::ui::px(2), ch, theme::CONTENT_TEXT);
+            fill(st, PAD() + (st.caret - a) * cw, y, crate::ui::px(2), ch, theme::content_text());
         }
     }
     let total = st.rows.len().max(1);
@@ -294,7 +294,7 @@ fn paint(st: &mut State) {
     let th = if total <= st.vis { h } else { (h * st.vis / total).max(crate::ui::px(8)) };
     let ty = if total <= st.vis { 0 } else { (h - th) * st.top / (total - st.vis) };
     for y in 0..h {
-        let c = if y >= ty && y < ty + th { theme::SCROLL_THUMB } else { theme::SCROLL_TRACK };
+        let c = if y >= ty && y < ty + th { theme::scroll_thumb() } else { theme::scroll_track() };
         for x in x0..x1 {
             st.surf[y * w + x] = c;
         }

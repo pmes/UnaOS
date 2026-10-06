@@ -423,18 +423,18 @@ fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
 }
 
 fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: bool, secret: bool) {
-    fill(px, x, y, w, CELL + 8, theme::CONTENT_FILL);
-    rect(px, x, y, w, CELL + 8, if focused { theme::ACCENT } else { theme::FRAME_LINE });
+    fill(px, x, y, w, CELL + 8, theme::content_fill());
+    rect(px, x, y, w, CELL + 8, if focused { theme::accent() } else { theme::frame_line() });
     let n = content.len().min(FIELD_MAX);
     if secret {
         let dots = [b'*'; FIELD_MAX];
-        text(px, x + 6, y + 4, &dots[..n], theme::CONTENT_TEXT);
+        text(px, x + 6, y + 4, &dots[..n], theme::content_text());
     } else {
-        text(px, x + 6, y + 4, content, theme::CONTENT_TEXT);
+        text(px, x + 6, y + 4, content, theme::content_text());
     }
     if focused {
         let cx = x + 6 + if secret { super::super::metrics::ladvance(&[b'*'; FIELD_MAX][..n], false, FACE) } else { super::super::metrics::ladvance(&content[..n], false, FACE) }; // KERNELFONT: the caret sits at the shaped advance. LOGINFONT: the caret sits at the face's advance, not the old square cell
-        fill(px, cx, y + 4, 2, CELL, theme::CONTENT_TEXT);
+        fill(px, cx, y + 4, 2, CELL, theme::content_text());
     }
 }
 
@@ -444,12 +444,12 @@ fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: 
 /// password has no reason to know it is the only way in.
 fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
     let (x, y, w, h) = ctl_rect(c, setpw);
-    fill(px, x, y, w, h, if primary { theme::ACCENT } else { theme::BUTTON_FACE });
-    rect(px, x, y, w, h, theme::FRAME_LINE);
+    fill(px, x, y, w, h, if primary { theme::accent() } else { theme::button_face() });
+    rect(px, x, y, w, h, theme::frame_line());
     let tw = super::super::metrics::ladvance(label, false, FACE); // KERNELFONT: the shaped width. LOGINFONT
     let tx = x + w.saturating_sub(tw) / 2;
     let ty = y + h.saturating_sub(CELL) / 2;
-    text(px, tx, ty, label, if primary { theme::BEVEL_LIGHT } else { theme::BUTTON_TEXT });
+    text(px, tx, ty, label, if primary { theme::bevel_light() } else { theme::button_text() });
 }
 
 /// LOGINFLOW M1 — one user's row. The screen says WHO lives on this machine, which is the Mac model
@@ -459,13 +459,13 @@ fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
 /// wire line for a press on one says `user-row` and an INDEX, never the name.
 fn user_row(px: &mut [u32], i: usize, name: &[u8], picked: bool) {
     let (x, y, w, h) = ctl_rect(Ctl::User(i), false);
-    fill(px, x, y, w, h, if picked { theme::ACCENT } else { theme::CONTENT_FILL });
-    rect(px, x, y, w, h, if picked { theme::ACCENT } else { theme::FRAME_LINE });
+    fill(px, x, y, w, h, if picked { theme::accent() } else { theme::content_fill() });
+    rect(px, x, y, w, h, if picked { theme::accent() } else { theme::frame_line() });
     let max = crate::video::text::fit(name, false, FACE, super::super::metrics::size(w - 12)); // UIMETRICS: the physical width // KERNELFONT: whole glyphs that fit. LOGINFONT
     let ax = super::loginwindow::avatar(&mut |ax, ay, aw, ah, c| fill(px, ax, ay, aw, ah, c), x + 3, y + 3, h.saturating_sub(6), picked); // FIRSTUSER (R100): the generic avatar on every user tile (`loginwindow.rs`)
     let max = max.min(crate::video::text::fit(name, false, FACE, super::super::metrics::size(w.saturating_sub(12 + ax)))); // FIRSTUSER: the name fits beside the avatar
     let n = name.len().min(max);
-    text(px, x + 6 + ax, y + 4, &name[..n], if picked { theme::BEVEL_LIGHT } else { theme::CONTENT_TEXT });
+    text(px, x + 6 + ax, y + 4, &name[..n], if picked { theme::bevel_light() } else { theme::content_text() });
 }
 
 fn repaint() {
@@ -475,27 +475,27 @@ fn repaint() {
     }
     // SAFETY: see `SURF`.
     let px: &mut [u32] = surf();
-    fill(px, 0, 0, W, H, theme::CHROME_FACE);
-    rect(px, 2, 2, W - 4, H - 4, theme::FRAME_LINE);
+    fill(px, 0, 0, W, H, theme::chrome_face());
+    rect(px, 2, 2, W - 4, H - 4, theme::frame_line());
     if f.state == State::CreateUser {
         // FIRSTBOOT (R77): "Create your account" — name, password, retype, Create.
-        text(px, LX, 14, b"Create your administrator account", theme::CONTENT_TEXT); // FIRSTUSER (R100): the first user is the administrator
-        fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
+        text(px, LX, 14, b"Create your administrator account", theme::content_text()); // FIRSTUSER (R100): the first user is the administrator
+        fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
         let (nx, ny, nw, _) = cu_rect(Ctl::NameField);
-        text(px, LX, ny + 4, b"Name", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, ny + 4, b"Name", theme::title_text_inactive());
         field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
         let (pxf, py, pwf, _) = cu_rect(Ctl::PwField);
-        text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, py + 4, b"Password", theme::title_text_inactive());
         field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
         let (p2x, p2y, p2w, _) = cu_rect(Ctl::Pw2Field);
-        text(px, LX, p2y + 4, b"Retype", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, p2y + 4, b"Retype", theme::title_text_inactive());
         field(px, p2x, p2y, p2w, &f.pw2[..f.pw2_len], f.focus == Focus::Retype, true);
         let (bx, by, _, _) = cu_rect(Ctl::Button);
         let _ = (bx, by);
         button(px, Ctl::Button, b"Create", true, false);
-        text(px, LX, 186, b"Enter or Create   Tab switches", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, 186, b"Enter or Create   Tab switches", theme::title_text_inactive());
         if !f.message.is_empty() {
-            text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
+            text(px, LX, 212, f.message.as_bytes(), theme::accent());
         }
         drop(f);
         let id = WIN.load(Ordering::Relaxed);
@@ -510,19 +510,19 @@ fn repaint() {
         title[..19].copy_from_slice(b"Set a password for ");
         let n = f.name_len.min(users::NAME_MAX);
         title[19..19 + n].copy_from_slice(&f.name[..n]);
-        text(px, LX, 14, &title[..19 + n], theme::CONTENT_TEXT);
-        fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
+        text(px, LX, 14, &title[..19 + n], theme::content_text());
+        fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
         let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField, true);
-        text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, py + 4, b"Password", theme::title_text_inactive());
         field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
         let (p2x, p2y, p2w, _) = ctl_rect(Ctl::Pw2Field, true);
-        text(px, LX, p2y + 4, b"Retype", theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, p2y + 4, b"Retype", theme::title_text_inactive());
         field(px, p2x, p2y, p2w, &f.pw2[..f.pw2_len], f.focus == Focus::Retype, true);
         button(px, Ctl::Button, b"Set", true, true);
         let hint: &[u8] = b"Enter or Set   Tab switches";
-        text(px, LX, 186, hint, theme::TITLE_TEXT_INACTIVE);
+        text(px, LX, 186, hint, theme::title_text_inactive());
         if !f.message.is_empty() {
-            text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
+            text(px, LX, 212, f.message.as_bytes(), theme::accent());
         }
         drop(f);
         let id = WIN.load(Ordering::Relaxed);
@@ -535,8 +535,8 @@ fn repaint() {
     // create-first-user title, button label and hint that keyed on `users::count() == 0` are gone.
     let locked = LOCKED.load(Ordering::Relaxed);
     let title: &[u8] = if locked { b"Locked" } else { b"Log in to UnaOS" };
-    text(px, LX, 14, title, theme::CONTENT_TEXT);
-    fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
+    text(px, LX, 14, title, theme::content_text());
+    fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
     // The user rows, when there are users. `name_at` is the store's own accessor, so the row a press
     // picks and the row the painter draws are the same row by construction — the `ctl_rect` argument
     // one layer up, applied to the CONTENT as well as to the geometry.
@@ -548,24 +548,24 @@ fn repaint() {
     }
     if locked { if let Some(n) = users::whoami(&mut nb) { user_row(px, 0, &nb[..n], true); } } // FIRSTUSER (R100): the lock screen has the login window's look — the session's own tile and avatar
     let (nx, ny, nw, _) = ctl_rect(Ctl::NameField, false);
-    text(px, LX, ny + 4, b"Name", theme::TITLE_TEXT_INACTIVE);
+    text(px, LX, ny + 4, b"Name", theme::title_text_inactive());
     field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
     let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField, false);
-    text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
+    text(px, LX, py + 4, b"Password", theme::title_text_inactive());
     field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password && PFOCUS.load(Ordering::Relaxed) == 0, true);
     button(px, Ctl::Button, if locked { b"Unlock" } else { b"Log In" }, true, false);
     power_row(px);
     let hint: &[u8] = b"Enter or Log In   Tab switches";
-    text(px, LX, 186, hint, theme::TITLE_TEXT_INACTIVE);
+    text(px, LX, 186, hint, theme::title_text_inactive());
     if !f.message.is_empty() {
-        text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
+        text(px, LX, 212, f.message.as_bytes(), theme::accent());
     } else if !locked {
         // BRIGHTFLOOR M5 — the safe-mode escape, in small text on the footer (`settings::safe_mode_check`).
         let fy = H.saturating_sub(super::super::metrics::lcell_h(crate::video::text::Face::Chrome) + 4); // UIMETRICS: the chrome cell in logical px
         const LONG: &[u8] = b"hold Shift after login to reset display settings";
         const SHORT: &[u8] = b"Shift after login: reset display";
         let msg = if LX + super::super::metrics::ladvance(LONG, false, crate::video::text::Face::Chrome) <= W { LONG } else { SHORT };
-        let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, LX, fy, msg, theme::TITLE_TEXT_INACTIVE, false, crate::video::text::Face::Chrome);
+        let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, LX, fy, msg, theme::title_text_inactive(), false, crate::video::text::Face::Chrome);
     }
     drop(f);
     let id = WIN.load(Ordering::Relaxed);
@@ -2388,14 +2388,14 @@ fn power_row(px: &mut [u32]) {
     let k = PFOCUS.load(Ordering::Relaxed);
     for i in 0..3u8 {
         let (x, y, w, h) = ctl_rect(Ctl::Power(i), false);
-        fill(px, x, y, w, h, theme::BUTTON_FACE);
-        rect(px, x, y, w, h, if k == i + 1 { theme::ACCENT } else { theme::FRAME_LINE });
+        fill(px, x, y, w, h, theme::button_face());
+        rect(px, x, y, w, h, if k == i + 1 { theme::accent() } else { theme::frame_line() });
         if k == i + 1 {
-            rect(px, x + 1, y + 1, w - 2, h - 2, theme::ACCENT); // the keyboard ring
+            rect(px, x + 1, y + 1, w - 2, h - 2, theme::accent()); // the keyboard ring
         }
         let l = PWR_LABEL[i as usize];
         let tw = super::super::metrics::ladvance(l, false, FACE);
-        text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL) / 2, l, theme::BUTTON_TEXT);
+        text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL) / 2, l, theme::button_text());
     }
 }
 

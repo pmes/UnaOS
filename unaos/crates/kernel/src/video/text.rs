@@ -770,8 +770,8 @@ pub fn fixture() {
         let mut drawn = 0u64;
         while drawn < 1000 {
             for (i, l) in lines.iter().enumerate() {
-                surf.iter_mut().for_each(|p| *p = 0x00FF_FFFF);
-                let _ = draw_text(&mut surf, W, W, H, 4, 4 + (i % 2) * 20, l, 0x0020_2020, false, Face::Ui);
+                surf.iter_mut().for_each(|p| *p = crate::video::theme::fixture::WHITE);
+                let _ = draw_text(&mut surf, W, W, H, 4, 4 + (i % 2) * 20, l, crate::video::theme::fixture::INK, false, Face::Ui);
             }
             let now = tt::stats().map_or(0, |s| s.1.glyphs_drawn);
             if now == before {
