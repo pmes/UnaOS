@@ -431,7 +431,7 @@ impl core::ops::Deref for TableGuard {
 impl core::ops::DerefMut for TableGuard {
     #[inline]
     fn deref_mut(&mut self) -> &mut Table {
-        &mut self.inner
+        DMG_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); &mut self.inner // DAMAGEGEN (B462, PERFREVIEW F7): EVERY mutable use of the table moves the generation — a superset of the `.damaged = true` sites, so no damage path can be missed. Bumped under the lock.
     }
 }
 
@@ -4026,7 +4026,7 @@ pub(super) fn occluders_aged(
 /// So the desktop's cadence, not a window present, is what bounds a deferral's latency in the
 /// general case. `DEFER_N` is a relaxed load and the common value is zero, so the added cost on the
 /// idle path is one atomic read ahead of a lock acquisition that was already happening.
-pub fn service_damage() {
+pub fn service_damage() { super::svclatch::ensure_tests(); // SVCLATCH (B462): `tests svclatch` registered from the flush (one relaxed load once done)
     if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) == 0 {
         // MENU-DRIVE / CRYSTAL-DISMISS — the SHARD menu's owed paint/erase is the THIRD thing this
         // backstop must see, exactly as it is the third term in the gate holder's own "is anything
@@ -4041,9 +4041,9 @@ pub fn service_damage() {
             composite();
             return;
         }
-        let t = table();
+        let g = DMG_GEN.load(core::sync::atomic::Ordering::Acquire); if DMG_SEEN.load(core::sync::atomic::Ordering::Acquire) == (g as u64) | (1u64 << 32) { DMG_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); return; } let t = table(); // DAMAGEGEN (B462, PERFREVIEW F7): no mutable use of the table since the last empty walk => nothing can be damaged; the generation is read BEFORE the lock, so a write racing the walk leaves it moved
         if !t.rows.iter().any(|r| r.used && r.damaged) {
-            return;
+            DMG_WALKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); DMG_SEEN.store((g as u64) | (1u64 << 32), core::sync::atomic::Ordering::Release); return; // DAMAGEGEN: this walk found nothing at generation `g`
         }
     }
     composite();
@@ -5566,7 +5566,7 @@ fn composite_inner() -> CursorTail {
     if let Some(p) = sprite_now {
         let sbox = (p.bx, p.by, p.bw, p.bh);
         let shell = shell_z();
-        let mut paint: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::with_capacity(slots() + 1); // WINDOWCAP-2: reserved before the table lock
+        let mut paint = Scratch::take(&PAINT_POOL, slots() + 1); // COMPSCRATCH (B462): a pooled buffer, warm across passes; WINDOWCAP-2: reserved before the table lock
         let mut npaint = 0usize;
         // MENU-UNDER/DOCK — the dock's tile count, snapshotted under the SAME table acquisition the
         // paint set uses, so the arming block below can price the dock's rect without a second
@@ -5918,7 +5918,7 @@ fn composite_inner() -> CursorTail {
     // lock, so the registration is ordered against any teardown that takes the lock afterwards: a
     // `close_owner` that clears rows can then tell whether some other core snapshotted those rows
     // before the clear and is still blitting from their (about to be unmapped) surfaces.
-    let mut rows_snap = RowsSnap::take(); rows_snap.reserve(slots() + 4); let dirty_pre: alloc::vec::Vec<bool> = alloc::vec::Vec::with_capacity(slots() + 4); let bands_pre: alloc::vec::Vec<Option<(usize, usize)>> = alloc::vec::Vec::with_capacity(slots() + 4); let (rows, mut dirty, mut bands, _blit) = { // WINDOWCAP (B378): the snapshot lands in a pooled buffer, not on the stack — ⚠ SAME-LINE fold, code first
+    COMP_PASSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed); let mut rows_snap = RowsSnap::take(); rows_snap.reserve(slots() + 4); let dirty_pre = Scratch::take(&DIRTY_POOL, slots() + 4); let bands_pre = Scratch::take(&BANDS_POOL, slots() + 4); /* COMPSCRATCH (B462): pooled */ let (rows, mut dirty, mut bands, _blit) = { // WINDOWCAP (B378): the snapshot lands in a pooled buffer, not on the stack — ⚠ SAME-LINE fold, code first
         let mut t = table();
         // F4 — the barrier, observed in the SAME critical section as the registration below. A
         // teardown raises it after clearing its rows, so seeing it up means there is nothing of that
@@ -5969,7 +5969,7 @@ fn composite_inner() -> CursorTail {
     // Back-to-front: ascending z, ties by id (creation order).
     //
     // DMG-DISJOINT — HOISTED ABOVE THE CLOSURE, because the closure now walks it. See below.
-    let mut order: alloc::vec::Vec<usize> = alloc::vec![0usize; rows.len()]; // WINDOWCAP-2
+    let mut order = Scratch::take(&ORDER_POOL, rows.len()); order.resize(rows.len(), 0usize); // COMPSCRATCH (B462): pooled; WINDOWCAP-2
     for (i, slot) in order.iter_mut().enumerate() {
         *slot = i;
     }
@@ -6073,7 +6073,7 @@ fn composite_inner() -> CursorTail {
     }
 
     #[cfg(feature = "witness")]
-    let seed = dirty.clone(); // WINDOWCAP-2: a Vec now, so the seed is an explicit copy
+    let mut seed = Scratch::take(&SEED_POOL, dirty.len()); seed.extend_from_slice(&dirty); // COMPSCRATCH (B462): the copy lands in a pooled buffer; WINDOWCAP-2: a Vec now, so the seed is an explicit copy
     // NOATT — the discriminator, taken HERE: `seed` is the damage set as the table snapshot found it,
     // so every row in it was marked by something OUTSIDE this pass, and `bands` still holds each
     // row's OWN declared extent (the closure below only ever widens rows ABOVE a dragger). Both facts
@@ -30334,3 +30334,100 @@ pub fn front_of_owner(owner: u64) -> Option<WinId> {
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 #[path = "winmemory.rs"]
 pub mod winmemory;
+
+// ---- DAMAGEGEN + COMPSCRATCH (rmbp-ledger B462, PERFREVIEW F6/F7) — at the tail so no line above moves ----
+
+/// DAMAGEGEN — moved by every `TableGuard::deref_mut` (under the lock). `service_damage` walks the table only
+/// when it moved since the walk that last found nothing (QUERYFOLDER's counter model).
+static DMG_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The generation of the last empty walk, with bit 32 set (0 = no walk yet, so it never matches).
+static DMG_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DMG_WALKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static DMG_SKIPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `tests svclatch`: (empty walks, skipped walks, the gate is sound). Sound = no used row is damaged while the
+/// generation still equals the last empty walk's, and a mutable table use moves it.
+pub(crate) fn damage_gen_check() -> (u32, u32, bool) {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    let sound_now = {
+        let t = table();
+        let g = DMG_GEN.load(Acquire);
+        let quiet = DMG_SEEN.load(Acquire) == (g as u64) | (1u64 << 32);
+        !(quiet && t.rows.iter().any(|r| r.used && r.damaged))
+    };
+    let g0 = DMG_GEN.load(Acquire);
+    {
+        let mut t = table();
+        let z = t.next_z; t.next_z = z; // a mutable use that writes nothing back changed
+    }
+    let moved = DMG_GEN.load(Acquire) != g0;
+    (DMG_WALKS.load(Relaxed), DMG_SKIPS.load(Relaxed), sound_now && moved)
+}
+
+/// COMPSCRATCH — passes through the snapshot, buffer growths (a pooled buffer below the pass's need, or a
+/// heap fallback), and heap fallbacks (every pool buffer in use by overlapping passes).
+static COMP_PASSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static COMP_GROWS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static COMP_HEAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn comp_scratch_counts() -> (u32, u32, u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (COMP_PASSES.load(Relaxed), COMP_GROWS.load(Relaxed), COMP_HEAP.load(Relaxed))
+}
+
+const SCRATCH_POOL_N: usize = 4;
+type ScratchPool<T> = [Mutex<alloc::vec::Vec<T>>; SCRATCH_POOL_N];
+static PAINT_POOL: ScratchPool<(usize, usize, usize, usize)> = [const { Mutex::new(alloc::vec::Vec::new()) }; SCRATCH_POOL_N];
+static DIRTY_POOL: ScratchPool<bool> = [const { Mutex::new(alloc::vec::Vec::new()) }; SCRATCH_POOL_N];
+static SEED_POOL: ScratchPool<bool> = [const { Mutex::new(alloc::vec::Vec::new()) }; SCRATCH_POOL_N];
+static BANDS_POOL: ScratchPool<Option<(usize, usize)>> = [const { Mutex::new(alloc::vec::Vec::new()) }; SCRATCH_POOL_N];
+static ORDER_POOL: ScratchPool<usize> = [const { Mutex::new(alloc::vec::Vec::new()) }; SCRATCH_POOL_N];
+
+/// COMPSCRATCH — one pass buffer: a claimed pool buffer (cleared, capacity kept) or, when every one is in
+/// use, a heap vector. The `RowsSnap` shape, generic over the row type.
+struct Scratch<T: 'static> {
+    pooled: Option<MutexGuard<'static, alloc::vec::Vec<T>, SpinRelax>>,
+    heap: alloc::vec::Vec<T>,
+}
+
+impl<T: 'static> Scratch<T> {
+    /// Claim a buffer and make room for `cap` rows — called before any table lock is taken.
+    fn take(pool: &'static ScratchPool<T>, cap: usize) -> Scratch<T> {
+        let mut s = Scratch { pooled: None, heap: alloc::vec::Vec::new() };
+        for c in pool.iter() {
+            if let Some(mut g) = c.try_lock() {
+                g.clear();
+                s.pooled = Some(g);
+                break;
+            }
+        }
+        if s.pooled.is_none() {
+            COMP_HEAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        let v: &mut alloc::vec::Vec<T> = &mut s;
+        if v.capacity() < cap {
+            COMP_GROWS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            v.reserve(cap);
+        }
+        s
+    }
+}
+
+impl<T: 'static> core::ops::Deref for Scratch<T> {
+    type Target = alloc::vec::Vec<T>;
+    fn deref(&self) -> &alloc::vec::Vec<T> {
+        match self.pooled.as_ref() {
+            Some(g) => &**g,
+            None => &self.heap,
+        }
+    }
+}
+
+impl<T: 'static> core::ops::DerefMut for Scratch<T> {
+    fn deref_mut(&mut self) -> &mut alloc::vec::Vec<T> {
+        match self.pooled.as_mut() {
+            Some(g) => &mut **g,
+            None => &mut self.heap,
+        }
+    }
+}
