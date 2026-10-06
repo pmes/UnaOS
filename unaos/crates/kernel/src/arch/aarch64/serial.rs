@@ -191,7 +191,7 @@ pub fn _print(args: fmt::Arguments) {
         let _ = raw.write_fmt(args);
         crate::serial_ring::note_emitted();
         crate::video::fbcon::_print(args);
-        crate::selftest::capture(args);
+        crate::selftest::capture(args); crate::boot_ring::capture(args); // FLIGHTRING (B400): the panic text reaches the ring too, as x86's recorder takes it. SAME-LINE fold.
         return;
     }
 
@@ -299,7 +299,7 @@ pub fn _print(args: fmt::Arguments) {
     // TSTE-1 M2b: capture boot-fixture verdict lines (`-> PASS`/`-> FAIL`) into the selftest ring so
     // `tste` can replay them. Additive, alloc-free, `try_lock` only; safe from this IRQ-masked
     // context; zero change to what is printed above.
-    crate::selftest::capture(args);
+    crate::selftest::capture(args); crate::boot_ring::capture(args); // FLIGHTRING (B400): the same ring as x86's recorder — the Pi's console prefill reads it. SAME-LINE fold.
     crate::serial_ring::tx_charge_taps(crate::arch::now_cycles().wrapping_sub(taps_t0)); // SERIALTX (B154) — measurement only.
 }
 

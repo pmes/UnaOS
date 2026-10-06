@@ -80,52 +80,59 @@ pub fn nothing_posted() -> bool {
 /// re-adopted a cell store that already carries text (no replay — it would print the boot twice).
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn console_prefill(id: crate::video::wm::WinId, rows: usize, retained_rows: usize) {
+    // FLIGHTRING (B400): the ring is `boot_ring` on both arches now — a pinned head + the rolling newest bytes — so
+    // the tail painted here is the LIVE tail however late the console opens (flight 24 card 3 read `ring_full=1`).
     use crate::video::fbcon;
-    #[cfg(target_arch = "x86_64")]
-    let tail = crate::flight_recorder::tail_lines(rows.max(1));
-    #[cfg(not(target_arch = "x86_64"))]
-    let tail: Option<(alloc::vec::Vec<u8>, usize, bool)> = {
-        let _ = rows;
-        None
-    };
+    crate::flightring::note_rows(rows);
+    let tail = crate::boot_ring::tail(rows.max(1), 0);
     let live = fbcon::console_takes_glyphs();
-    let Some((bytes, ring_bytes, full)) = tail else {
-        serial_println!("[console] prefill win={} lines=0 painted=0 ring=none live={} (R88: no boot-log ring on this arch, or it was contended)", id, live as u32);
+    let Some(t) = tail else {
+        serial_println!("[console] prefill win={} lines=0 painted=0 ring=none live={} (R88: the boot-log ring was contended)", id, live as u32);
         return;
     };
     let mut lines = 0usize;
     let mut painted = 0u64;
     if retained_rows == 0 {
-        let was = fbcon::console_present_suspended();
-        fbcon::console_present_suspend(true); // one present for the whole replay, not one per line
-        let tap = &crate::serial_ring::TAP_FBCON;
-        let a0 = tap.absorbed.load(Relaxed);
-        for raw in bytes.split(|&b| b == b'\n') {
-            let line = match raw.last() {
-                Some(b'\r') => &raw[..raw.len() - 1],
-                _ => raw,
-            };
-            if line.is_empty() {
-                continue;
-            }
-            let s = match core::str::from_utf8(line) {
-                Ok(s) => s,
-                Err(e) => core::str::from_utf8(&line[..e.valid_up_to()]).unwrap_or(""),
-            };
-            fbcon::_print(format_args!("{}\n", s));
-            lines += 1;
-        }
-        painted = tap.absorbed.load(Relaxed).saturating_sub(a0);
-        if !was {
-            fbcon::console_present_suspend(false); // resuming forces the one present
-        }
+        (lines, painted) = console_replay(&t.bytes);
         let _ = PREFILL_FIRST.compare_exchange(u64::MAX, painted, Relaxed, Relaxed);
         PREFILLS.fetch_add(1, Relaxed);
     }
+    crate::flightring::note_prefill(lines);
     serial_println!(
-        "[console] prefill win={} lines={} painted={} ring_bytes={} ring_full={} live={} retained_rows={} (R88: the current boot's text, scrolled to the tail)",
-        id, lines, painted, ring_bytes, full as u32, live as u32, retained_rows
+        "[console] prefill win={} lines={} painted={} ring_bytes={} wrapped={} joined={} rolling_kib={} tail_live=1 live={} retained_rows={} (R88/FLIGHTRING: the current boot's newest text, scrolled to the tail)",
+        id, lines, painted, t.total, t.wrapped as u32, t.joined as u32, t.rolling_kib, live as u32, retained_rows
     );
+}
+
+/// Paint `bytes` (whole lines) into the console through `fbcon::_print` under ONE present. Returns (lines, painted).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn console_replay(bytes: &[u8]) -> (usize, u64) {
+    use crate::video::fbcon;
+    let was = fbcon::console_present_suspended();
+    fbcon::console_present_suspend(true); // one present for the whole replay, not one per line
+    let tap = &crate::serial_ring::TAP_FBCON;
+    let a0 = tap.absorbed.load(Relaxed);
+    let mut lines = 0usize;
+    for raw in bytes.split(|&b| b == b'\n') {
+        let line = match raw.last() {
+            Some(b'\r') => &raw[..raw.len() - 1],
+            _ => raw,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let s = match core::str::from_utf8(line) {
+            Ok(s) => s,
+            Err(e) => core::str::from_utf8(&line[..e.valid_up_to()]).unwrap_or(""),
+        };
+        fbcon::_print(format_args!("{}\n", s));
+        lines += 1;
+    }
+    let painted = tap.absorbed.load(Relaxed).saturating_sub(a0);
+    if !was {
+        fbcon::console_present_suspend(false); // resuming forces the one present
+    }
+    (lines, painted)
 }
 
 /// Register `tests loginfurn` once (folded into `boot::ensure_tests`).
@@ -134,6 +141,7 @@ pub fn ensure_tests() {
     if !DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
         crate::tests::register("loginfurn", loginfurn_selftest);
     }
+    crate::flightring::ensure_tests(); // FLIGHTRING (B400): `tests flightring`
 }
 
 /// `tests loginfurn` — what the login opened by itself, and what the console showed when it was opened.
