@@ -379,3 +379,5 @@ ST377	HIDSTALL (B485): built on exec-rmbp-hidstall @ccf5e8d3, not flown — no f
 ST378	GEN7WAKE (B489): built on exec-rmbp-gen7wake @7384d799, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B489
 ST379	QUARRYLIVE (B494): built on exec-rmbp-quarrylive @1f678275, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B494
 ST380	SANITYLEGS (B488): built on exec-rmbp-sanitylegs @6c9a4c0f, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B488
+ST381	LOADERSTALL (B490): built on exec-rmbp-loaderstall @b960a5cd, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B490
+ST382	SMALLFIX6 (B495): built on exec-rmbp-smallfix6 @d006c7ae, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B495
