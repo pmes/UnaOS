@@ -557,7 +557,7 @@ use super::keymap::{Action, Binding, Table, ALT, CMD, CTRL, SHIFT};
 /// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
-pub static CRISPY_ROWS: [Binding; 60] = [
+pub static CRISPY_ROWS: &[Binding] = &[ // SMALLFIX3 (B416): a slice — the count is derived (`.len()`), so an arc adding a row never edits this line
     // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
     Binding { roles: CMD | ALT, usage: 0x50, action: Action::SnapLeft, token: "cmd-alt-left" }, Binding { roles: CTRL | CMD, usage: 0x14, action: Action::LockScreen, token: super::shortcuts::C_CTRL_CMD_Q }, Binding { roles: CMD, usage: 0x1A, action: Action::CloseWindow, token: super::shortcuts::C_CMD_W }, Binding { roles: CMD, usage: 0x0B, action: Action::HideApp, token: super::shortcuts::C_CMD_H }, Binding { roles: CMD, usage: 0x36, action: Action::OpenSettings, token: super::shortcuts::C_CMD_COMMA }, Binding { roles: CMD | ALT, usage: 0x29, action: Action::ForceQuit, token: super::shortcuts::C_CMD_ALT_ESC }, // APPMENU2 (B393) — the WM's system chords (Q W H comma, Opt-Esc; Ctrl-Cmd-Q locks). ABOVE the bare Esc row (`no_shadow`), Ctrl-Cmd-Q above Cmd-Q (whose row sits below Cmd-Shift-Q's LogOut).
     Binding { roles: CMD | ALT, usage: 0x4F, action: Action::SnapRight, token: "cmd-alt-right" },
@@ -643,7 +643,7 @@ pub static CRISPY_ROWS: [Binding; 60] = [
 pub static CRISPY_BINDINGS: &Table = &Table {
     name: "crispy",
     cmd_role: crate::drivers::xhci::HID_MOD_GUI,
-    rows: &CRISPY_ROWS,
+    rows: CRISPY_ROWS,
 };
 
 /// A PC-shaped table. IT EXISTS TO PROVE THE SEAM AND IS SELECTED BY NOTHING — compiled,
@@ -653,7 +653,7 @@ pub static CRISPY_BINDINGS: &Table = &Table {
 /// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
 /// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
 /// moves to Alt there, not because a second Copy row was written.
-pub static PC_ROWS: [Binding; 36] = [
+pub static PC_ROWS: &[Binding] = &[ // SMALLFIX3 (B416): a slice — the count is derived (`.len()`)
     // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
     Binding { roles: CTRL | ALT, usage: 0x50, action: Action::SnapLeft, token: "ctrl-alt-left" },
     Binding { roles: CTRL | ALT, usage: 0x4F, action: Action::SnapRight, token: "ctrl-alt-right" },
@@ -704,7 +704,7 @@ pub static PC_ROWS: [Binding; 36] = [
 pub static PC_BINDINGS: &Table = &Table {
     name: "pc",
     cmd_role: crate::drivers::xhci::HID_MOD_ALT,
-    rows: &PC_ROWS,
+    rows: PC_ROWS,
 };
 
 /// The tables' two structural contracts, checked at compile time beside the kit's own colour
@@ -716,8 +716,8 @@ const _: () = {
     // No row may shadow a later one (see `keymap::no_shadow`). This is what stops a bare-modifier
     // row being written above a chord that needs one — the failure that disarms a binding in
     // silence.
-    assert!(super::keymap::no_shadow(&CRISPY_ROWS));
-    assert!(super::keymap::no_shadow(&PC_ROWS));
+    assert!(super::keymap::no_shadow(CRISPY_ROWS));
+    assert!(super::keymap::no_shadow(PC_ROWS));
 };
 // ══════════════ SCRSHOT-DESKTOP — WHERE A SCREEN CAPTURE LANDS (R60, 2026-09-22) ══════════════
 //
