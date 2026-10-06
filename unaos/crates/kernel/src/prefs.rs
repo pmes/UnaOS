@@ -842,7 +842,11 @@ impl prefs_core::wire::Store for KernelStore {
     /// its descriptions head the keys in `settings/<name>`.
     fn declare(&mut self, name: &str, keys: Vec<prefs_core::declare::DeclKey>) -> i64 {
         let n = keys.len();
-        DECLARED.lock().insert(String::from(name), keys);
+        let st = prefs_core::declare::insert(&mut DECLARED.lock(), name, keys); // PREFSCAP (B454): capped at 64 programs
+        if st != 0 {
+            serial_println!("[prefs] declare app.{} refused: {} programs held (PREFSCAP cap)", name, prefs_core::declare::MAX_PROGRAMS);
+            return st;
+        }
         serial_println!("[prefs] declared app.{} keys={} -> settings/{} (R98)", name, n, name);
         0
     }
@@ -1067,5 +1071,130 @@ fn settingsfiles_selftest() {
         ":: SETTINGSFILES: domains={} files={} migrated={} readable={} reset_on_delete={} app_ns={} alone={} dir={} -> {} ::",
         domains, files, MIGRATED.load(Ordering::Acquire) as u8, readable as u8, if reset { "ok" } else { "fail" },
         if app_ok { "ok" } else { "fail" }, alone as u8, path(), if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// ── PREFSCAP (rmbp-ledger B454, SECREVIEW F4): the ring-3 transport stamps the caller ─────────────────
+//
+// Both syscall dispatchers call [`bus_fulfil_from`] with the kernel-stamped wm owner of the calling slot
+// (x86 slot + 1, aarch64 the asid — the key the dialog verbs use); the program is named from
+// `wm::app_name_of(owner)`, the launcher-armed name, never from the body. `prefs_core::cap` decides (one
+// decision, both rings): `app.<own>.*`, the namespace named after the program, the schema's `ring 3` rows.
+// The kernel's own client (`prefs_client`) keeps [`bus_fulfil`] = the trusted caller.
+
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+/// The stamped program name of wm `owner`, lowercased into `buf`; `None` = nothing armed.
+fn caller_name(owner: u64, buf: &mut [u8; crate::video::wm::MAX_TITLE]) -> Option<&str> {
+    let n = crate::video::wm::app_name_of(owner, buf);
+    buf[..n].make_ascii_lowercase();
+    core::str::from_utf8(&buf[..n]).ok().filter(|s| !s.is_empty())
+}
+
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+/// [`bus_fulfil`] for a RING-3 caller: the same fulfiller under the caller the kernel stamped.
+pub fn bus_fulfil_from(verb: u8, body: &[u8], in_session: bool, owner: u64, text: &mut Vec<u8>) -> i64 {
+    ensure_loaded();
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    let caller = match caller_name(owner, &mut nb) {
+        Some(p) => prefs_core::cap::Caller::Program(p),
+        None => prefs_core::cap::Caller::Anon,
+    };
+    if verb == prefs_core::wire::VERB_SET && in_session {
+        if let Some((ns, k, _)) = prefs_core::wire::parse_set(body) {
+            if !prefs_core::cap::may_set(caller, ns, k) {
+                serial_println!("[prefs] set {}.{} refused: program={} may not (PREFSCAP)", ns, k, prefs_caller_text(caller));
+            }
+        }
+    }
+    if verb == prefs_core::wire::VERB_DECLARE && in_session {
+        if let Some((name, _)) = prefs_core::declare::parse(body) {
+            if !prefs_core::cap::may_declare(caller, &name) {
+                serial_println!("[prefs] declare app.{} refused: program={} may not (PREFSCAP)", name, prefs_caller_text(caller));
+            }
+        }
+    }
+    if (verb == prefs_core::wire::VERB_SET || verb == prefs_core::wire::VERB_DECLARE) && !in_session {
+        if let Some((ns, k, _)) = prefs_core::wire::parse_set(body) {
+            serial_println!("[prefs] set {}.{} refused: caller is not the session user", ns, k);
+        }
+    }
+    prefs_core::wire::fulfil_as(&mut KernelStore, verb, body, in_session, caller, text)
+}
+
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+fn prefs_caller_text(c: prefs_core::cap::Caller<'_>) -> &str {
+    match c {
+        prefs_core::cap::Caller::Program(p) => p,
+        prefs_core::cap::Caller::Kernel => "kernel",
+        prefs_core::cap::Caller::Anon => "anon",
+    }
+}
+
+/// PREFSCAP (B454) — `tests prefscap` (never at boot, R80): a program stamped `pcaptest` sets its own
+/// `app.pcaptest.*` and is refused `vein.endpoint`, `system.login.items`, `system.display.mode` and another
+/// program's stanza; it declares its own stanza and not another's; the declared registry refuses the 65th
+/// program; the bus route refuses a ring-3 `R3PREF_SET` (the deputy). Everything it made is removed.
+/// `:: PREFSCAP: own=ok foreign=refused system=<n>-settable declare_cap=64 deputy=<refused/skip> -> PASS ::`.
+#[cfg(feature = "witness")]
+pub fn prefscap_selftest() {
+    use prefs_core::cap::Caller;
+    use prefs_core::wire::{fulfil_as, EACCES, ENOSPC, VERB_DECLARE, VERB_SET};
+    ensure_loaded();
+    const ME: Caller = Caller::Program("pcaptest");
+    let mut o = Vec::new();
+    let own = fulfil_as(&mut KernelStore, VERB_SET, b"app.pcaptest.level\x003", true, ME, &mut o) == 0
+        && get(prefs_core::files::APP_NS, "pcaptest.level") == Some(PrefValue::Int(3));
+    let before: Vec<Option<PrefValue>> = [("vein", "endpoint"), ("system", "login.items"), ("system", "display.mode"), ("app", "lumen.window.frame")]
+        .iter().map(|(n, k)| get(n, k)).collect();
+    let foreign = [
+        b"vein.endpoint\x00\"https://pcaptest.invalid/\"".as_slice(),
+        b"system.login.items\x00\"/apps/PCAPTEST.ELF\"",
+        b"system.display.mode\x00\"1x1\"",
+        b"app.lumen.window.frame\x00\"0,0,1,1\"",
+    ]
+    .iter()
+    .all(|b| fulfil_as(&mut KernelStore, VERB_SET, b, true, ME, &mut o) == EACCES)
+        && [("vein", "endpoint"), ("system", "login.items"), ("system", "display.mode"), ("app", "lumen.window.frame")]
+            .iter().map(|(n, k)| get(n, k)).collect::<Vec<_>>() == before;
+    let st = |n: &str| alloc::format!("{}\0level\tint:0:10\t5\tPREFSCAP fixture\n", n).into_bytes();
+    let held_before = DECLARED.lock().len();
+    let decl_own = fulfil_as(&mut KernelStore, VERB_DECLARE, &st("pcaptest"), true, ME, &mut o) == 0;
+    let decl_foreign = fulfil_as(&mut KernelStore, VERB_DECLARE, &st("pcapother"), true, ME, &mut o) == EACCES
+        && !DECLARED.lock().contains_key("pcapother");
+    // Fill to the cap with throwaway names, ask once more, then remove every name this leg added.
+    let mut added: Vec<String> = alloc::vec![String::from("pcaptest")];
+    let mut i = 0usize;
+    while DECLARED.lock().len() < prefs_core::declare::MAX_PROGRAMS && i < 2 * prefs_core::declare::MAX_PROGRAMS {
+        let n = alloc::format!("pcapfill{}", i);
+        if !DECLARED.lock().contains_key(n.as_str()) && fulfil_as(&mut KernelStore, VERB_DECLARE, &st(&n), true, Caller::Kernel, &mut o) == 0 {
+            added.push(n);
+        }
+        i += 1;
+    }
+    let capped = DECLARED.lock().len() == prefs_core::declare::MAX_PROGRAMS
+        && fulfil_as(&mut KernelStore, VERB_DECLARE, &st("pcapover"), true, Caller::Kernel, &mut o) == ENOSPC;
+    {
+        let mut d = DECLARED.lock();
+        for n in &added {
+            d.remove(n.as_str());
+        }
+    }
+    // The fixture's own domain file goes the way SETTINGSFILES' does: unlinked, then the watch resets it.
+    let _ = crate::shell::vfs_mount_table().unlink(&domain_path("pcaptest"), crate::fs::vfs::KERNEL_PRINCIPAL);
+    WATCH_MS.store(0, Ordering::Relaxed);
+    let _ = watch_deleted();
+    let _ = TREE.lock().remove(prefs_core::files::APP_NS, "pcaptest.level");
+    let restored = DECLARED.lock().len() == held_before.min(prefs_core::declare::MAX_PROGRAMS);
+    #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))]
+    let deputy = if crate::bus_route::r3pref_set_refused() { "refused" } else { "OPEN" };
+    #[cfg(not(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64"))))]
+    let deputy = "skip";
+    let n = prefs_core::cap::settable_count();
+    let ok = own && foreign && decl_own && decl_foreign && capped && restored && deputy != "OPEN";
+    serial_println!(
+        ":: PREFSCAP: own={} foreign={} system={}-settable declare_cap={} declare_own={} declare_foreign={} deputy={} -> {} ::",
+        if own { "ok" } else { "fail" }, if foreign { "refused" } else { "WRITTEN" }, n,
+        if capped { prefs_core::declare::MAX_PROGRAMS } else { 0 }, decl_own as u8, if decl_foreign { "refused" } else { "HELD" },
+        deputy, if ok { "PASS" } else { "FAIL" }
     );
 }

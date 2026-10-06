@@ -798,3 +798,9 @@ the startup volume: on this firmware that is the operator's `bless` from Recover
 (R3, rmbp-ledger A4). And whether this machine's picker lists a FAT volume that is not ESP-typed is a
 **firmware fact we have not measured** — `docs/dev/OS/10_INSTALL/partition-install.md` marks it
 metal-unproven and `--as-esp` exists as the answer if it turns out to be required.
+
+### PREFSCAP (2026-10-06, rmbp-ledger B454 — answers SECREVIEW F4; design `dev/evidence/rmbp-1005/prefscap.md`)
+- [x] **A program sets only what it owns.** The kernel transport stamps the caller (`prefs::bus_fulfil_from`: the launcher-armed name of the slot's wm owner, never the body); `prefs_core::cap` (both rings) admits `app.<own>.*`, the namespace named after the program (`vein` from vein) and the schema's `ring 3` rows (writer `program`, default NOT settable: 18 `system` rows; never `vein.*`, `system.login.items`, `system.display.mode`, `dock.pins`, `display.wallpaper`). Everything else answers `-EACCES` before the store is touched. The kernel, Settings and Principia's own fulfiller (`prefs`) keep every key.
+- [x] **PrefDeclare binds the stanza to the caller** (a program declares only `app.<its name>`; an unnamed caller declares nothing) and the kernel's declared registry stops at 64 programs (`-ENOSPC` on the wire).
+- [x] **The deputy door:** `bus_route` answers ring-3 `R3PREF_SET` (130) `-EACCES` — only the kernel's preference client may reach Principia's forwarder, which writes under its own name.
+- [ ] Owed: the names `prefs` and a namespace's owner are trusted by spelling (a program launched as `VEIN.ELF` is vein); binding them to the system image on the root's kernel-owned tree is the seat's call. Metal-pending (`tests prefscap`).
