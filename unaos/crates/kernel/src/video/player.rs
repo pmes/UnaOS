@@ -1020,22 +1020,44 @@ mod vid {
         repaint();
     }
 
-    /// 0 (F7, Home) restarts; any other point is owed until the container's tables land (SEEKTABLE B433).
+    /// 0 (F7, Home) restarts. VPLAYAUDIO (B475): any other point seeks the picture (the job's keyframe seek,
+    /// `vplay::start_at`) and the sound together — the sound through `play::seek_to` → `play-dec` → `Decoder::seek`
+    /// over the job's shared Demuxer (`[play] seek … table=mp4|matroska`); the audio clock resumes from the landing.
     pub fn seek(ms: u64) -> Option<(u64, &'static str)> {
-        let out = {
+        let (path, sound) = {
             let mut g = STATE.lock();
             let st = g.as_mut()?;
             if ms == 0 {
                 restart(st);
                 serial_println!("[player] seek to_ms=0 landed_ms=0 method=restart video=1");
-                Some((0, "restart"))
-            } else {
-                serial_println!("[player] seek to_ms={} video=owed (SEEKTABLE B433: keyframe seek rides the container's tables)", ms);
-                None
+                drop(g);
+                repaint();
+                return Some((0, "restart"));
             }
+            let ms = if st.dur_ms > 0 { ms.min(st.dur_ms.saturating_sub(1)) } else { ms };
+            let sound = vplay::facts().is_some_and(|f| f.audio_ok);
+            hw::stop();
+            vplay::start_at(&st.path, ms);
+            st.base_ms = ms;
+            st.shown_ms = ms;
+            st.ended = false;
+            st.playing = true;
+            st.err = None;
+            ((st.path.clone(), ms), sound)
         };
+        let (path, ms) = path;
+        // the sound after the picture's job is minted: play-dec's first door is the new job's share
+        let r = if sound { Some(hw::seek(&path, ms)) } else { None };
+        vplay::audio_expected(matches!(r, Some(Ok(_))));
+        if let (Some(Ok((landed, _))), Some(st)) = (r.as_ref(), STATE.lock().as_mut()) {
+            st.base_ms = *landed;
+        }
+        serial_println!(
+            "[player] seek to_ms={} video=keyframe sound={} path={}",
+            ms, match &r { Some(Ok((_, m))) => *m, Some(Err(_)) => "refused", None => "none" }, path
+        );
         repaint();
-        out
+        Some((ms, "keyframe"))
     }
 
     /// The pass: the container's facts (once — the info line, the glass line, the sound), then the clock and at

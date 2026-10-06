@@ -166,20 +166,33 @@ impl Source for OggOpus {
 
 // ---------------------------------------------------------------- Opus outside Ogg (SEEKTABLE2, rmbp B469)
 
-/// A container's Opus packets, in decode order (Matroska/WebM's track through demux_core in the kernel's
-/// `vplay::container_audio`; any other packet container). `None` = end of the track.
+/// A container's Opus packets, in decode order (Matroska/WebM's track through demux_core —
+/// [`crate::container::open_demuxed`]; any other packet container). `None` = end of the track.
 pub trait Packets: Send {
     fn next_packet(&mut self) -> Option<Vec<u8>>;
+    /// VPLAYAUDIO (rmbp B475): samples (48 kHz) to cut from the END of the last returned packet's output — Matroska
+    /// `DiscardPadding` (RFC 9559 §5.1.3.5.6). 0 = none.
+    fn discard(&self) -> u64 { 0 }
+    /// VPLAYAUDIO (rmbp B475): reposition at the last packet that starts at or before decoded sample `at` (48 kHz,
+    /// counted from the track's first packet, pre-skip included); `Some((its start, its byte offset))`. `None` = no
+    /// index here (nothing moved).
+    fn seek_packet(&mut self, _at: u64) -> Option<(u64, u64)> { None }
+    /// The decoded length (48 kHz, pre-skip included, the end padding cut) when the index knows it.
+    fn total(&self) -> Option<u64> { None }
+    /// The index that answers [`Packets::seek_packet`] (`matroska`).
+    fn table(&self) -> &'static str { "packets" }
 }
 
 /// Opus from bare packets: the Matroska codec mapping (CodecPrivate = the `OpusHead` of RFC 7845 §5.1, CodecDelay =
-/// the pre-skip in ns). The same decoder, output gain and pre-skip rule as [`OggOpus`]; end trimming (Matroska
-/// DiscardPadding) is OWED, so the tail plays its padding (at most one packet).
+/// the pre-skip in ns). The same decoder, output gain and pre-skip rule as [`OggOpus`]; the end trim is the
+/// container's (`Packets::discard`, Matroska DiscardPadding); a seek is the container's packet index with the RFC 7845
+/// §4.6 pre-roll (VPLAYAUDIO, rmbp B475).
 pub struct OpusPackets {
     head: OpusHead,
     dec: OpusDecoder,
     src: alloc::boxed::Box<dyn Packets>,
     skip: u64,
+    skip0: u64,
     buf: Vec<i16>,
 }
 
@@ -191,13 +204,14 @@ impl OpusPackets {
         dec.decode_gain = head.output_gain as i32;
         let skip = if codec_delay_ns > 0 { codec_delay_ns * 48 / 1_000_000 } else { head.pre_skip as u64 };
         let ch = head.channels;
-        Ok(OpusPackets { head, dec, src, skip, buf: vec![0; 5760 * ch] })
+        Ok(OpusPackets { head, dec, src, skip, skip0: skip, buf: vec![0; 5760 * ch] })
     }
 }
 
 impl Source for OpusPackets {
     fn info(&self) -> Info {
-        Info { rate: 48000, channels: self.head.channels as u16, bits: 16, frames: None, format: Format::Unknown, codec: Codec::Opus, float: false }
+        let frames = self.src.total().map(|t| t.saturating_sub(self.skip0));
+        Info { rate: 48000, channels: self.head.channels as u16, bits: 16, frames, format: Format::Unknown, codec: Codec::Opus, float: false }
     }
     fn block(&mut self, pcm: &mut Pcm) -> Result<bool> {
         let ch = self.head.channels;
@@ -209,12 +223,32 @@ impl Source for OpusPackets {
             };
             let s = (self.skip as usize).min(n);
             self.skip -= s as u64;
-            if n == s { continue; }
-            pcm.set_int(ch, n - s, 16);
+            let e = n.saturating_sub(self.src.discard() as usize).max(s); // DiscardPadding: the tail is padding
+            if e == s { continue; }
+            pcm.set_int(ch, e - s, 16);
             for c in 0..ch {
-                for i in 0..n - s { pcm.int[c][i] = self.buf[(s + i) * ch + c] as i32; }
+                for i in 0..e - s { pcm.int[c][i] = self.buf[(s + i) * ch + c] as i32; }
             }
             return Ok(true);
         }
+    }
+    /// VPLAYAUDIO (rmbp B475): the container's packet index. A fresh decoder restarts at the last packet starting
+    /// 80 ms (RFC 7845 §4.6) before the target; its start is known exactly (the index counts each packet's samples
+    /// from its TOC), so `exact`; the pre-roll's PCM is the residual [`crate::Decoder::seek`] drops. A target in the
+    /// first 80 ms restarts from the top with the pre-skip.
+    fn seek(&mut self, t: u64) -> Result<Option<SeekPoint>> {
+        let want = (t + self.skip0).saturating_sub(SEEK_PREROLL);
+        let Some((start, byte)) = self.src.seek_packet(want) else { return Ok(None) };
+        self.dec = OpusDecoder::new(self.head.channels);
+        self.dec.decode_gain = self.head.output_gain as i32;
+        let table = self.src.table();
+        if start >= self.skip0 {
+            self.skip = 0;
+            let sample = start - self.skip0;
+            return Ok(Some(SeekPoint { byte, sample, exact: true, table, landed: sample }));
+        }
+        let Some((_, byte)) = self.src.seek_packet(0) else { return Ok(None) };
+        self.skip = self.skip0;
+        Ok(Some(SeekPoint { byte, sample: 0, exact: true, table, landed: 0 }))
     }
 }

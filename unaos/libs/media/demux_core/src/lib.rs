@@ -40,6 +40,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 pub mod build;
@@ -233,7 +234,9 @@ pub(crate) struct Parsed {
 }
 
 pub struct Demuxer {
-    data: Vec<u8>,
+    /// VPLAYAUDIO (rmbp B475): the file's bytes, shared — [`Demuxer::share`] hands a second cursor over the same
+    /// bytes and tables (the picture job and the sound job of one video: one read, one parse, no byte copy).
+    data: Arc<Vec<u8>>,
     format: Format,
     tracks: Vec<Track>,
     /// All tracks' samples merged in decode-time order (ties: track order).
@@ -299,7 +302,7 @@ impl Demuxer {
                 return Err(Error::Truncated);
             }
         }
-        Ok(Demuxer { data, format, tracks, order, pos: 0, declared_duration_ns })
+        Ok(Demuxer { data: Arc::new(data), format, tracks, order, pos: 0, declared_duration_ns })
     }
 
     pub fn format(&self) -> Format {
@@ -307,8 +310,23 @@ impl Demuxer {
     }
     /// MP4ONE (rmbp B464): the file's bytes back, for a caller that keeps the sample table's offsets and reads
     /// the payloads itself (`audio_core`'s MP4 path) — no second copy of the file.
+    /// A shared file's bytes are copied once here (prefer [`Demuxer::bytes`]).
     pub fn into_data(self) -> Vec<u8> {
-        self.data
+        Arc::try_unwrap(self.data).unwrap_or_else(|a| (*a).clone())
+    }
+    /// VPLAYAUDIO (rmbp B475): the file's bytes, shared (no copy) — the sample table's offsets index them.
+    pub fn bytes(&self) -> Arc<Vec<u8>> {
+        self.data.clone()
+    }
+    /// VPLAYAUDIO (rmbp B475): a second cursor over the same bytes and tables (from the first packet). The picture
+    /// job keeps the file; the sound job reads its own track through the share — one parse, no byte copy.
+    pub fn share(&self) -> Demuxer {
+        Demuxer { data: self.data.clone(), format: self.format, tracks: self.tracks.clone(), order: self.order.clone(), pos: 0, declared_duration_ns: self.declared_duration_ns }
+    }
+    /// VPLAYAUDIO (rmbp B475): a sample's payload as a slice of the file (no copy; no `frame_prefix`).
+    pub fn sample_data(&self, s: &Sample) -> &[u8] {
+        let (o, n) = (s.offset as usize, s.size as usize);
+        self.data.get(o..o.saturating_add(n)).unwrap_or(&[])
     }
     pub fn tracks(&self) -> &[Track] {
         &self.tracks

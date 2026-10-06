@@ -279,6 +279,16 @@ impl Setup {
         Ok((channels, rate, [b0, b1]))
     }
 
+    /// VPLAYAUDIO (rmbp B475): an audio packet's block size from its mode number (Vorbis I §4.3.1) — no decode; a
+    /// packet's output is a quarter of the previous block plus a quarter of its own (§4.3.8), so a container that
+    /// gives no granules (Matroska) is indexed exactly from the packets themselves.
+    pub fn packet_blocksize(&self, p: &[u8]) -> Option<usize> {
+        let mut r = LsbReader::new(p);
+        if r.read(1).ok()? != 0 { return None; }
+        let n = r.read(ilog(self.modes.len() as u32 - 1)).ok()? as usize;
+        Some(self.blocksize[self.modes.get(n)?.blockflag as usize])
+    }
+
     pub fn parse(ident: &[u8], setup: &[u8]) -> Result<Setup> {
         let (channels, rate, blocksize) = Setup::parse_ident(ident)?;
         if setup.len() < 7 || setup[0] != 5 || &setup[1..7] != b"vorbis" { return Err(Error::Invalid("Vorbis setup header")); }
@@ -908,6 +918,15 @@ fn decode_residue_inner(res: &Residue, books: &[Codebook], r: &mut LsbReader, dn
 
 // ---------------------------------------------------------------- Ogg Vorbis
 
+/// Vorbis I §4.3.9 orders 3–8 channels L,C,R,…; every API here hands out the WAVE/SMPTE order (L,R,C,LFE,…).
+pub(crate) fn wave_order(planes: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    if !(3..=8).contains(&planes.len()) { return planes; }
+    const ORDER: [&[usize]; 6] = [&[0, 2, 1], &[0, 1, 2, 3], &[0, 2, 1, 3, 4], &[0, 2, 1, 5, 3, 4], &[0, 2, 1, 6, 5, 3, 4], &[0, 2, 1, 7, 5, 6, 3, 4]];
+    let map = ORDER[planes.len() - 3];
+    let mut src: Vec<Option<Vec<f32>>> = planes.into_iter().map(Some).collect();
+    map.iter().map(|&i| src[i].take().unwrap_or_default()).collect()
+}
+
 pub struct OggVorbis {
     r: OggReader,
     dec: VorbisDecoder,
@@ -939,12 +958,7 @@ impl OggVorbis {
     fn emit(&mut self, mut planes: Vec<Vec<f32>>, pcm: &mut Pcm) -> bool {
         // Vorbis I §4.3.9 orders 3–8 channels L,C,R,…; the API hands out the WAVE/SMPTE order every other
         // format here uses (L,R,C,LFE,…), the order FFmpeg and Chromium present too.
-        if (3..=8).contains(&planes.len()) {
-            const ORDER: [&[usize]; 6] = [&[0, 2, 1], &[0, 1, 2, 3], &[0, 2, 1, 3, 4], &[0, 2, 1, 5, 3, 4], &[0, 2, 1, 6, 5, 3, 4], &[0, 2, 1, 7, 5, 6, 3, 4]];
-            let map = ORDER[planes.len() - 3];
-            let mut src: Vec<Option<Vec<f32>>> = planes.into_iter().map(Some).collect();
-            planes = map.iter().map(|&i| src[i].take().unwrap_or_default()).collect();
-        }
+        planes = wave_order(planes);
         if self.skip_start > 0 {
             let n = planes[0].len();
             let s = (self.skip_start as usize).min(n);

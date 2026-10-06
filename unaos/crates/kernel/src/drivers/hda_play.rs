@@ -680,9 +680,13 @@ fn dec_task(arg: usize) {
     let path = match DEC_OUT.lock().as_ref() { Some(o) if o.jid == jid => o.path.clone(), _ => { dec_exit(jid, paint, "superseded"); return; } };
     dec_ran(jid);
     dec_beat(STAGE_DEMUX);
-    let opened = audio_core::Decoder::open(alloc::boxed::Box::new(VfsSrc { path: path.clone(), off: 0 }));
     #[cfg(all(feature = "wc", feature = "videoplayer"))]
-    let opened = opened.or_else(|e| crate::video::vplay::container_audio(&path).map(audio_core::Decoder::from_source).ok_or(e)); // VIDEOPLAYER (B434): a WebM's Vorbis track (demux_core packets → audio_core::vorbis), when audio_core reads no container
+    let shared = crate::video::vplay::shared_audio(&path).map(audio_core::Decoder::from_source); // VPLAYAUDIO (B475): the live picture job's Demuxer share — one read, one parse — through audio_core::container::open_demuxed
+    #[cfg(not(all(feature = "wc", feature = "videoplayer")))]
+    let shared: Option<audio_core::Decoder> = None;
+    let opened = match shared { Some(d) => Ok(d), None => audio_core::Decoder::open(alloc::boxed::Box::new(VfsSrc { path: path.clone(), off: 0 })) };
+    #[cfg(all(feature = "wc", feature = "videoplayer"))]
+    let opened = opened.or_else(|e| crate::video::vplay::container_audio(&path).map(audio_core::Decoder::from_source).ok_or(e)); // VIDEOPLAYER (B434) / VPLAYAUDIO (B475): a Matroska file with no picture job, through the same open_demuxed
     let mut dec = match opened {
         Ok(d) => d,
         Err(e) => {
