@@ -606,104 +606,31 @@ pub fn set_byte_swap(on: bool) {
     SWAP.store(on as u8, Ordering::Relaxed);
 }
 
-// --- BRIGHTKEYS: the transient level indicator ---------------------------------------------------
+// --- BEZEL (B405): the transient readouts moved to the glass --------------------------------------------
 //
-// A second, short-lived status item: `brightness=N/16`, shown for `BRIGHT_SHOW_MS` after a
-// brightness key. Not a battery fact and not polled: `video::brightkeys` (or nothing, on a board
-// with no such keys) calls [`bright_show`]; the bar reads [`bright_item`] once per compose.
+// The bar's `BRT nn/16` item and the caption's `vol=N/16` / `muted` overlay are RETIRED: the brightness and
+// volume keys show `video::bezel` (centre-bottom, 1.5 s), whose `[bezel] show` line carries the values. What
+// stays here is the volume MODEL (F10 / F11 / F12 — HID usages 0x43 / 0x44 / 0x45 in the boot report, the
+// rMBP keyboard sends the fn-row as plain F-keys — are mute / down / up; a boot-static `level` 0..=16 and a
+// mute flag, written to the codec's output amps through `drivers::hda::vol::apply`).
 
-/// How long the level indicator stays on the glass after the last key, ms.
-pub const BRIGHT_SHOW_MS: u64 = 1500;
-/// Last shown level, `0..=16`.
-static BRIGHT_LEVEL: AtomicU8 = AtomicU8::new(0);
-/// `arch::ms()` of the last key; 0 = never shown.
-static BRIGHT_AT_MS: AtomicU64 = AtomicU64::new(0);
-
-/// Show `level/16` on the bar for [`BRIGHT_SHOW_MS`]. Two relaxed stores; legal from any context.
-pub fn bright_show(level: u8) {
-    BRIGHT_LEVEL.store(level.min(16), Ordering::Relaxed);
-    BRIGHT_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
-}
-
-/// The level to draw, or `None` once the indicator has expired. Lock-free, like [`bar_item`].
-pub fn bright_item() -> Option<u8> {
-    let at = BRIGHT_AT_MS.load(Ordering::Relaxed);
-    if at == 0 || crate::arch::ms().wrapping_sub(at) >= BRIGHT_SHOW_MS {
-        return None;
-    }
-    Some(BRIGHT_LEVEL.load(Ordering::Relaxed))
-}
-
-/// Drop the indicator now (the boot self-test's key must not flash on the glass).
-pub fn bright_clear() {
-    BRIGHT_AT_MS.store(0, Ordering::Relaxed);
-}
-
-// ===================== VOLKEYS — the volume model and its transient indicator =====================
-//
-// F10 / F11 / F12 (HID usages 0x43 / 0x44 / 0x45 in the boot report — the rMBP keyboard sends the
-// fn-row as plain F-keys) are mute / down / up. State is a boot-static `level` (0..=16) and a mute flag;
-// each key writes the codec's output amps through `drivers::hda::vol::apply` (x86 `hda` cfg; elsewhere
-// `amp_written` is 0) and arms a TRANSIENT indicator that `menubar` overlays on the bar's caption slot
-// for `OSD_MS`. The indicator is a generic (kind, level) pair so the brightness keys can use the same
-// slot: `osd_set(OSD_BRIGHT, n)` renders `brightness=N/16`. The bar repaints on expiry only when
-// something else recomposes it (the caption is in its signature); a bar with no other damage clears at
-// its next composite, not at the 1.5 s mark.
-
-/// Indicator lifetime after the last key.
-pub const OSD_MS: u64 = 1500;
-pub const OSD_VOL: u8 = 1;
-pub const OSD_MUTED: u8 = 2;
-pub const OSD_BRIGHT: u8 = 3;
 static VOL_LEVEL: AtomicU8 = AtomicU8::new(12);
 static VOL_MUTED: AtomicU8 = AtomicU8::new(0);
-static OSD_KIND: AtomicU8 = AtomicU8::new(0);
-static OSD_LEVEL: AtomicU8 = AtomicU8::new(0);
-static OSD_UNTIL: AtomicU64 = AtomicU64::new(0);
 
-/// Arm the indicator (any kind) for `OSD_MS`.
-pub fn osd_set(kind: u8, level: u8) {
-    OSD_LEVEL.store(level, Ordering::Relaxed);
-    OSD_KIND.store(kind, Ordering::Relaxed);
-    OSD_UNTIL.store(crate::arch::ms().saturating_add(OSD_MS).max(1), Ordering::Relaxed);
+/// The key's indicator: the bezel is armed or showing (`false` on a build with no desktop).
+pub fn bezel_indicator() -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        return crate::video::bezel::indicator() != crate::video::bezel::K_NONE;
+    }
+    #[allow(unreachable_code)]
+    false
 }
 
-/// Indicator text into `buf`, or 0 while it is not showing. No lock, no heap: safe from the composite.
-pub fn osd_text(buf: &mut [u8]) -> usize {
-    let until = OSD_UNTIL.load(Ordering::Relaxed);
-    if until == 0 || crate::arch::ms() >= until {
-        return 0;
-    }
-    let (kind, lv) = (OSD_KIND.load(Ordering::Relaxed), OSD_LEVEL.load(Ordering::Relaxed));
-    let mut n = 0usize;
-    let mut put = |s: &[u8]| {
-        for &c in s {
-            if n < buf.len() {
-                buf[n] = c;
-                n += 1;
-            }
-        }
-    };
-    match kind {
-        OSD_MUTED => put(b"muted"),
-        OSD_VOL | OSD_BRIGHT => {
-            put(if kind == OSD_VOL { b"vol=" } else { b"brightness=" });
-            if lv >= 10 {
-                put(&[b'0' + lv / 10]);
-            }
-            put(&[b'0' + lv % 10, b'/', b'1', b'6']);
-        }
-        _ => {}
-    }
-    n
-}
-
-/// Menubar seam: replace the caption with the indicator while it shows.
-pub fn osd_overlay(title: &mut [u8], len: &mut usize) {
-    let n = osd_text(title);
-    if n > 0 {
-        *len = n;
-    }
+/// Drop the bezel a fixture's key armed (a test's key must not flash on the glass).
+pub fn bezel_disarm() {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    crate::video::bezel::arm(crate::video::bezel::K_NONE);
 }
 
 /// `(level, muted)`.
@@ -738,7 +665,6 @@ pub fn volkey_usage(usage: u8) -> Option<(u8, bool)> {
     let written = crate::drivers::hda::vol::apply(lv, muted) > 0;
     #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
     let written = false;
-    if muted { osd_set(OSD_MUTED, lv) } else { osd_set(OSD_VOL, lv) }
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     crate::video::bezel::arm_volume(muted); // BEZEL (B405): the next desktop pass shows the amp's level
     Some((key, written))
@@ -758,10 +684,10 @@ pub fn volkeys_selftest() {
     #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
     let ready = false;
     for (usage, name) in [(0x45u8, "up"), (0x44, "down"), (0x43, "mute")] {
+        bezel_disarm();
         let r = volkey_usage(usage);
         let (lv, muted) = volume();
-        let mut buf = [0u8; 20];
-        let shown = osd_text(&mut buf) > 0;
+        let shown = bezel_indicator();
         let (key_ok, written) = match r {
             Some((_, w)) => (true, w),
             None => (false, false),
@@ -781,7 +707,7 @@ pub fn volkeys_selftest() {
     VOL_MUTED.store(m0 as u8, Ordering::Relaxed);
     #[cfg(all(target_arch = "x86_64", feature = "hda"))]
     let _ = crate::drivers::hda::vol::apply(l0, m0);
-    OSD_UNTIL.store(0, Ordering::Relaxed);
+    bezel_disarm();
 }
 
 /// SETTINGS (R75): set the volume level (`0..=16`) and mute directly (a slider and a toggle), the same
@@ -794,7 +720,6 @@ pub fn set_volume(level: u8, muted: bool) -> bool {
     let written = crate::drivers::hda::vol::apply(lv, muted) > 0;
     #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
     let written = false;
-    if muted { osd_set(OSD_MUTED, lv) } else { osd_set(OSD_VOL, lv) }
     written
 }
 

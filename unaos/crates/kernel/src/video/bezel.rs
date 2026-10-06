@@ -64,6 +64,14 @@ pub fn arm(kind: u8) {
     ARMED.store(kind, Ordering::Release);
 }
 
+/// What the bezel is about to show (armed) or showing; `K_NONE` when neither. Atomics only.
+pub fn indicator() -> u8 {
+    match ARMED.load(Ordering::Acquire) {
+        K_NONE => SHOWN_KIND.load(Ordering::Acquire),
+        k => k,
+    }
+}
+
 /// The volume key's kind from the model it just wrote (mute wins).
 pub fn arm_volume(muted: bool) {
     arm(if muted { K_MUTE } else { K_VOL });
