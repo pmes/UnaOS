@@ -526,14 +526,12 @@ pub fn activate_on(desc: SurfaceDesc) {
     // Its own witness lines (`[wc-x] console-window …`) report the geometry and the panic fallback.
     // INSTALLBARE (rmbp-ledger B364, R86): NOTHING is constructed but the setter / the login dialog until the boot's phase is
     // Desktop — no console window, no bar (the taskbar's shadow Peter saw both times was these two, painted and swept). fbcon
-    // stops writing the panel (`detach`: the compositor alone owns the glass), and the furniture is OWED: the first Desktop
-    // advance (`installer_release`) or the first login (`close_into_session`) mints console + shell and turns the bar on.
+    // stops writing the panel (`detach`: the compositor alone owns the glass), and nothing is owed: the first
+    // login (`close_into_session`) BUILDS the desktop (`desktopbuild::build`, R93); console and shell are the user's to open (R88).
     let bare = !crate::boot::desktop();
     if bare {
         super::fbcon::detach_bare(); // LOGINFURN (R88): the detach that lets a LATER console window take glyphs (flight 23: the console opened blank)
-        #[cfg(feature = "login")]
-        super::crystal::login::furniture_owed();
-        serial_println!("[wc-x] activate bare phase={} console=owed bar=owed (R86: nothing but the setter / the login dialog)", crate::boot::phase().word());
+        serial_println!("[wc-x] activate bare phase={} console=none bar=none (R93: nothing of the desktop exists; it is built at login)", crate::boot::phase().word());
     }
     let cwin = if bare { wm::WIN_NONE } else { super::fbcon::panel_console_window_open() };
     if cwin == wm::WIN_NONE && !bare {
@@ -564,7 +562,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     // The bar's own witness (`[menubar] rollup …`) reports what it then paints; this line is the
     // decision, so a capture separates "the shell never asked" from "the shell asked and the bar
     // declined the panel" (`geometry` answers `None` below its floors, and says so there).
-    let bar_was = if bare { #[cfg(feature = "login")] crate::fs::users::bar_owed(); false } else { super::menubar::set_enabled(true) };
+    let bar_was = if bare { false } else { super::menubar::set_enabled(true) }; // DESKTOPBUILT (R93): a bare activation builds no bar — `desktopbuild::build` at login does
     crate::census_println!(
         "[wc-x] menubar ENABLED panel={}x{} rect={:?} was={} (the desktop scene owns the top of the glass)",
         pw,
@@ -698,7 +696,7 @@ pub fn desktop_app_service() {
     // already make from this lane. See `wm::pace_service`.
     super::wm::pace_service();
     crate::splash::hold_service(); // SPLASHX86: the 5 s bound on the boot splash hold
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::dock::dockpin_service(); // DOCKPIN — the owed `<home>/.dock` load (login) and save (a Keep/Remove press), VFS work that cannot run in the click router.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::dock::dockpin_service(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::desktopbuild::service(); // DESKTOPBUILT (B387): the desktop's build at login, its first paint's read-back, the battery follow. DOCKPIN — the owed `<home>/.dock` load (login) and save (a Keep/Remove press), VFS work that cannot run in the click router.
 
     // MENUSTAT — the desktop STATUS MODEL's poll, here and for `pace_service`'s reason: this is the
     // `wc`-gated body the ~1 kHz device-service task calls on EVERY pass, and it must run AHEAD of

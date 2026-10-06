@@ -722,13 +722,14 @@ fn take_down() {
 
 fn close_into_session() {
     take_down();
-    crate::boot::session_opened(); users::bar_release(); // INSTALLBARE M3 (R86): the Desktop phase begins here — the furniture is re-minted below FIRST; the services open when the shell has launched (or the bound)
+    crate::boot::session_opened(); // INSTALLBARE M3 (R86): the Desktop phase begins here; the services open when the shell has launched (or the bound)
     if SWEPT.swap(false, Ordering::AcqRel) {
         REIGNITED.fetch_add(1, Ordering::Relaxed); // LOGINFURN (R88): a session opened over a swept desktop — and it stays BARE: nothing is posted
     }
     crate::loginfurn::desktop_bare("session"); // LOGINFURN (R88): no console, no shell, no STAT at login — the user opens what they want
-    take_down(); #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::wallpaper::rearm(); // WALLPAPER — the session user's ~/Desktop/WALL.PNG is probed on the next desktop flush
+    take_down();
     FORM.lock().state = State::Session;
+    crate::video::desktopbuild::build("login ok"); // DESKTOPBUILT (B387, R93): the desktop — bar with its battery, dock with its pins, the wallpaper (rearmed by the build) — is BUILT here and painted in one pass
 }
 
 /// M4: Log Out — close the session and put the screen back up. LOGIN13 M3 (R63): the ROOT session's
@@ -748,6 +749,7 @@ pub fn reopen_after_logout() {
     users::logout();
     take_down(); // LOGOUTUI: an alert left up by an earlier refusal goes with the session (no-op with no window)
     let (closed, kernel) = wm::close_all_furniture(); // LOGOUTDESK (R69): the desktop closes down COMPLETELY — every row, kernel furniture included
+    crate::video::desktopbuild::teardown("logout"); // DESKTOPBUILT (R93): the desktop object goes with the session; the next login builds it fresh
     SWEPT.store(true, Ordering::Release); SWEPT_N.store(closed as u32, Ordering::Relaxed);
     let remaining = wm::live_window_count();
     serial_println!(":: LOGOUTDESK: closed={} kernel={} remaining={} -> {} ::", closed, kernel, remaining, if remaining == 0 { "PASS" } else { "FAIL" });
@@ -2095,31 +2097,13 @@ pub fn lock_fixture(name: &[u8], password: &[u8], wrong: &[u8]) -> bool {
     pass
 }
 
-/// FIRSTBOOT (R77): the Installer / CreateUser stage is known — close every window that already exists but the
-/// screen's own (the console minted at the takeover), and owe the furniture back (`SWEPT`, the LOGOUTDESK latch).
-pub fn installer_sweep() {
-    let keep = WIN.load(Ordering::Relaxed);
-    let n = wm::close_all_furniture_except(keep);
-    SWEPT.store(true, Ordering::Release); SWEPT_N.store(n as u32, Ordering::Relaxed);
-    serial_println!("[login] installer: furniture swept n={} re-minted=0 (R77: nothing but the setter / the form on the glass; the console is re-minted when the desktop is released)", n);
-}
-
-/// FIRSTBOOT (R77): the desktop is released — re-mint the furniture the way Log In after Log Out does, unless
-/// `close_into_session` already did.
-pub fn installer_release() {
-    if SWEPT.swap(false, Ordering::AcqRel) {
-        crate::loginfurn::desktop_bare("installer"); // LOGINFURN (R88): the desktop is released BARE — was `dock::relaunch_furniture` (console+shell)
-    }
-}
-
 /// LOGINFLOW2 M1 — BOOT 2: the store has users, so the login screen is the boot session. Opens the screen, then
 /// sweeps the desktop empty (no furniture until a session opens — the LOGOUTDESK state); the next login re-mints it.
 pub fn open_boot2() {
     FORM.lock().state = State::Closed;
     OPENED_ONCE.store(true, Ordering::Release);
     open();
-    installer_sweep();
-    serial_println!("[login] boot 2: the login screen is the boot session (R64/R65/R77: root is not the assumed login; the furniture returns when a session opens)");
+    serial_println!("[login] boot 2: the login screen is the boot session (R64/R65/R77: root is not the assumed login; the desktop is built when a session opens)");
 }
 
 /// LOGINFLOW2 M1 fixture (`loginst`): the boot-2 screen is up with no session; `root` with a wrong password and
@@ -2222,12 +2206,6 @@ pub fn font_repaint() {
 }
 
 // ── INSTALLBARE (rmbp-ledger B364, R86) ─────────────────────────────────────────────────────────────────────────
-
-/// INSTALLBARE M1: the takeover minted NO furniture (the phase was not Desktop) — owe it, exactly as a sweep does, so
-/// the first Desktop advance (`installer_release`) or the first login (`close_into_session`) mints console + shell.
-pub fn furniture_owed() {
-    SWEPT.store(true, Ordering::Release);
-}
 
 /// INSTALLBARE M4 (GLASSEYES `shot setter` / `shot login`): which form the bare shot put up, so [`shot_bare_close`]
 /// only ever takes down a screen IT opened.
@@ -2637,4 +2615,9 @@ pub fn submit_drain() {
     apply(&d);
     BUSY.store(false, Ordering::Release);
     repaint();
+}
+
+/// DESKTOPBUILT (B387): how many windows the last sweep closed (Log Out's LOGOUTDESK sweep; nothing else sweeps).
+pub fn swept_n() -> u32 {
+    SWEPT_N.load(Ordering::Relaxed)
 }

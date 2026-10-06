@@ -3630,3 +3630,24 @@ impl core::ops::DerefMut for ModelBuf {
         }
     }
 }
+
+/// DESKTOPBUILT (B387, R93): has the dock put pixels on the panel? One packed load (`menubar::owns_pixels`'s twin).
+pub fn owns_pixels() -> bool {
+    SLOT.packed() != 0
+}
+
+/// DESKTOPBUILT: how many pins the dock carries (the `<home>/.dock` set, or the default set).
+pub fn pins_pinned() -> u32 {
+    DP_MASK.load(Ordering::Relaxed).count_ones()
+}
+
+/// DESKTOPBUILT: the desktop is not built (before a session, after Log Out) — the dock owns no pixels. Erases the rect
+/// it last painted, once (the slot is cleared by it); `false` and nothing done when it holds none.
+pub fn vacate_off() -> bool {
+    if SLOT.packed() == 0 {
+        return false;
+    }
+    let r = SLOT.rect();
+    SLOT.clear();
+    strip::vacate("dock", r, None, false)
+}
