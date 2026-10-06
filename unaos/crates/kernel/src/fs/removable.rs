@@ -215,7 +215,7 @@ fn reconcile() {
     }
     for (ix, d) in live.iter() {
         let held = MOUNTED.lock().iter().any(|v| v.ix == *ix && v.slot_id == d.slot_id && v.num_blocks == d.num_blocks);
-        let refused = REFUSED.lock().iter().any(|(s, n)| *s == d.slot_id && *n == d.num_blocks);
+        let refused = REFUSED.lock().iter().any(|(s, n)| *s == d.slot_id && *n == d.num_blocks) || ejected(d.slot_id, d.num_blocks); // QUARRY3 (B413): an ejected disk stays unmounted until it is replugged
         if held || refused {
             continue;
         }
@@ -317,4 +317,41 @@ pub fn selftest() {
 /// `tests exfat` audits.
 pub fn exfat_mounts() -> Vec<(usize, String)> {
     MOUNTED.lock().iter().filter(|v| v.fs == "exfat").map(|v| (v.ix, v.name.clone())).collect()
+}
+
+// ── QUARRY3 (rmbp-ledger B413) — the sidebar's Locations and its eject ──────────────────────────────
+
+/// Disks the person ejected while they stay inserted: `(slot_id, num_blocks)`. A replug is a new slot id and
+/// mounts fresh; the list is bounded (the oldest record goes first).
+static EJECTED: Mutex<Vec<(u8, u64)>> = Mutex::new(Vec::new());
+
+fn ejected(slot_id: u8, num_blocks: u64) -> bool {
+    EJECTED.lock().iter().any(|(s, n)| *s == slot_id && *n == num_blocks)
+}
+
+/// The removable volumes mounted now — their leaves under `/volumes` (Quarry's sidebar marks them ejectable).
+pub fn mounted_names() -> Vec<String> {
+    MOUNTED.lock().iter().map(|v| v.name.clone()).collect()
+}
+
+/// **Eject** `name` (a leaf under `/volumes`): the detach path's unmount — the mount leaves the table on the
+/// next per-verb rebuild (`bind` reads [`MOUNTED`]), `NS_GEN` moves so every listing re-reads, and the disk is
+/// parked so [`reconcile`] does not mount it again while it stays in. `false` = no such removable volume.
+/// `[volumes] unmounted /volumes/<name> reason=eject slot=<n> ::`.
+pub fn eject(name: &str) -> bool {
+    let v = {
+        let mut m = MOUNTED.lock();
+        let Some(i) = m.iter().position(|v| v.name == name) else { return false };
+        m.remove(i)
+    };
+    {
+        let mut e = EJECTED.lock();
+        if e.len() >= 8 {
+            e.remove(0);
+        }
+        e.push((v.slot_id, v.num_blocks));
+    }
+    serial_println!("[volumes] unmounted /volumes/{} reason=eject slot={} ::", v.name, v.slot_id);
+    crate::fs::NS_GEN.fetch_add(1, Ordering::Release);
+    true
 }

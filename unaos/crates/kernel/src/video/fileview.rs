@@ -522,3 +522,35 @@ pub fn font_repaint() {
     drop(g);
     let _ = wm::present(id);
 }
+
+/// QUARRY3 (rmbp-ledger B413): Quick Look's text body — THIS viewer's read, sanitise, renderer (`richtext`, for
+/// `kind` = `markdown` / `json`; `""` = plain) and painter over a caller-sized `w x h` surface, no window. Quarry's
+/// Quick Look blits it into its panel, so a preview is the viewer's own pixels, never a second text renderer.
+/// Returns the surface and the number of wrapped rows the file made.
+pub fn quicklook_body(path: &str, kind: &str, w: usize, h: usize) -> Result<(Vec<u32>, usize), String> {
+    let (raw, _truncated) = read_capped(path)?;
+    let clean = sanitize(&raw);
+    let (text, spans) = if kind.is_empty() {
+        (clean, Vec::new())
+    } else {
+        let r = richtext::render(kind, &clean);
+        (r.text, r.spans)
+    };
+    let face = super::text::Face::Grid;
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    let cols = w.saturating_sub(2 * PAD() + crate::ui::px(6)) / cw.max(1);
+    let vis = h.saturating_sub(2 * PAD()) / ch.max(1);
+    if cols < 8 || vis < 1 {
+        return Err(String::from("panel below floor"));
+    }
+    let lay = layout(&text, cols);
+    let mut surf: Vec<u32> = Vec::new();
+    if surf.try_reserve_exact(w * h).is_err() {
+        return Err(String::from("out of memory"));
+    }
+    surf.resize(w * h, theme::CONTENT_FILL);
+    let rows_n = lay.rows.len();
+    let mut st = State { path: String::from(path), rows: lay.rows, text, top: 0, vis, cols, w, h, surf, spans };
+    paint(&mut st);
+    Ok((st.surf, rows_n))
+}
