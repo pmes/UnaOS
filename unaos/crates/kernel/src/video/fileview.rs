@@ -43,7 +43,7 @@ const WHEEL_ROWS: usize = 3;
 const TAIL: &str = "...truncated";
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
-static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None); static PENDING_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); static STYLED_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); // SVCLATCH (B462)
 static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 
 struct State {
@@ -137,12 +137,12 @@ pub fn shown() -> String {
 
 /// Latch a path for [`service`] (click-router safe).
 pub fn request_open(path: &str) {
-    *PENDING.lock() = Some(String::from(path));
+    *PENDING.lock() = Some(String::from(path)); PENDING_POSTED.post(); // SVCLATCH (B462)
 }
 
 /// QUARRY2 (B336): latch `path` to open with renderer `kind` (`"markdown"` / `"json"`).
 pub fn request_open_styled(path: &str, kind: &str) {
-    *PENDING_STYLED.lock() = Some((String::from(path), String::from(kind)));
+    *PENDING_STYLED.lock() = Some((String::from(path), String::from(kind))); STYLED_POSTED.post(); // SVCLATCH (B462)
 }
 static PENDING_STYLED: crate::sync::Mutex<Option<(String, String)>> = crate::sync::Mutex::new(None);
 
@@ -170,14 +170,14 @@ pub fn open_styled(path: &str, kind: &str) -> Result<(usize, usize, usize, usize
 
 /// Drain the latch. Chained from `quarry::live::service`.
 pub fn service() {
-    let styled = PENDING_STYLED.lock().take();
+    let styled = STYLED_POSTED.take(&PENDING_STYLED); // SVCLATCH (B462): no lock on a quiet pass
     if let Some((p, k)) = styled {
         match open_styled(&p, &k) {
             Ok(_) => serial_println!("[quarry] open TEXT consumed=viewer render={} path={}", k, p),
             Err(e) => serial_println!("[fileview] refuse path={} render={} reason={}", p, k, e),
         }
     }
-    let want = PENDING.lock().take();
+    let want = PENDING_POSTED.take(&PENDING); // SVCLATCH (B462)
     if let Some(p) = want {
         match open(&p) {
             Ok(_) => serial_println!("[quarry] open TEXT consumed=viewer path={}", p),

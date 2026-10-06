@@ -1247,3 +1247,5 @@ pub mod lidsleep;
 // DRAGDROP (B440, MACPARITY row 18): the WM drag session (rides PREFSUI's capture; Quarry and the dock participate). At the tail so no line above moves.
 #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub mod dnd;
+// SVCLATCH (B462, PERFREVIEW F8): the service passes' latches, a posted flag checked before the lock; `tests svclatch`. See video/svclatch.rs.
+pub mod svclatch;

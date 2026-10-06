@@ -1040,7 +1040,7 @@ static SURF: crate::sync::Mutex<Vec<u32>> = crate::sync::Mutex::new(Vec::new());
 static SHOWN: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
 
 /// The path a gesture asked for, waiting for a pass that is allowed to open it.
-static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None); static PENDING_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); static CMDS_POSTED: super::svclatch::Latch = super::svclatch::Latch::new(); // SVCLATCH (B462)
 
 /// Ask for `path` to be opened. **This is what a click or a key press calls, and [`open_path`] is
 /// not.** THE LATCH IS NOT CEREMONY — it is `dock::press_at`'s law: the click router runs on a 16 KiB
@@ -1048,7 +1048,7 @@ static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(Non
 /// gesture stores a path; [`service`] opens it from the render pass. A second request before the
 /// first is drained REPLACES it.
 pub fn request_open(path: &str) {
-    *PENDING.lock() = Some(String::from(path));
+    *PENDING.lock() = Some(String::from(path)); PENDING_POSTED.post(); // SVCLATCH (B462)
 }
 
 /// A viewer command, queued by the router-band input hooks and applied by [`service`].
@@ -1076,6 +1076,7 @@ fn push_cmd(c: Cmd) {
     if q.len() < 16 {
         q.push(c);
     }
+    drop(q); CMDS_POSTED.post(); // SVCLATCH (B462): after the store
 }
 
 /// Drain a pending open request, queued commands and a live drag. Safe to call on every pass: a
@@ -1084,11 +1085,11 @@ fn push_cmd(c: Cmd) {
 /// Chained from [`super::quarry::live::service`], which is already drained from both places this
 /// desktop services furniture, so Facet needs no drain site of its own.
 pub fn service() {
-    let want = PENDING.lock().take();
+    let want = PENDING_POSTED.take(&PENDING); // SVCLATCH (B462): a quiet pass is two atomic loads, no lock
     if let Some(p) = want {
         open_path(&p);
     }
-    let cmds: Vec<Cmd> = core::mem::take(&mut *CMDS.lock());
+    let cmds: Vec<Cmd> = CMDS_POSTED.take_vec(&CMDS); // SVCLATCH (B462)
     for c in cmds {
         apply(c);
     }
