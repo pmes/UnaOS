@@ -2439,6 +2439,7 @@ pub fn screen_regain() {
     let id = WIN.load(Ordering::Relaxed);
     if id != wm::WIN_NONE && is_open() {
         wm::set_modal_top(id);
+        let _ = wm::raise_one(id);
         repaint();
     }
 }

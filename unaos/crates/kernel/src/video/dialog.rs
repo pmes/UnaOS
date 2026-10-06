@@ -309,6 +309,7 @@ fn open_pending() {
             if win != wm::WIN_NONE {
                 if d.screen {
                     wm::set_modal_top(win); // DIALOG2: over the login screen — the ceiling is the dialog's while it is up
+                    let _ = wm::raise_one(win);
                 }
                 let _ = wm::present(win);
                 let mut g = ST.lock();
