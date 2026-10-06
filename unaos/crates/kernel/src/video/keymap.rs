@@ -514,3 +514,9 @@ pub fn pc_selected() -> bool {
 pub fn option_held() -> bool {
     HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & HID_MOD_ALT != 0
 }
+
+/// DRAGDROP2 (B470) — is the Command ROLE down per the latest HID report (the active table's `cmd_role`: the GUI
+/// key on the Mac table, Alt on the PC one)? Quarry's Cmd-press toggles a row into the selection.
+pub fn command_held() -> bool {
+    HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & active().cmd_role != 0
+}

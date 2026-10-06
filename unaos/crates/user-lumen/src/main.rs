@@ -653,7 +653,7 @@ impl App {
         let page = (self.rows_vis - 1).max(1);
         match input_ev_type(ev) {
             INPUT_EV_KEY_DOWN => self.key(p as u8),
-            INPUT_EV_CLOSE_REQ => exit(0), // APPMENU2 M6: the WM asks us to quit — nothing unsaved, so leave now
+            una_abi::INPUT_EV_DROP => self.dropped(p), INPUT_EV_CLOSE_REQ => exit(0), // APPMENU2 M6: the WM asks us to quit — nothing unsaved, so leave now
             INPUT_EV_ACTION => match p {
                 ACTION_CLEAR_VIEW if !self.busy => new_conversation(),
                 ACTION_CURSOR_LEFT => self.caret = self.caret.saturating_sub(1),
@@ -1654,3 +1654,51 @@ static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(una_abi::APP_FLAG_WIND
 
 /// SETTINGSFILES (rmbp-ledger B407): the PrefDeclare status of Lumen's stanza (0 = declared).
 static mut DECLARED: i64 = 0;
+
+// DRAGDROP2 (rmbp-ledger B470) — Lumen is the first ring-3 drop participant: a file dropped on its window arrives
+// as `INPUT_EV_DROP`; the paths come over `BUS_VERB_DROP_GET` and land in the input line as `open <path> ...`
+// (`:: LUMEN: drop n=<n> first=<path> ::`, or `:: LUMEN: drop fail code=<n> ::`).
+impl App {
+    fn dropped(&mut self, payload: u64) {
+        let (token, _) = una_abi::drop_ev_parse(payload);
+        let mut body = [0u8; 2048];
+        let n = match vein_ring3::drop::get(token, &mut body) {
+            Ok(n) => n,
+            Err(e) => {
+                let mut l = Line::new(b":: LUMEN: drop fail code=");
+                l.dec(e).put(b" ::");
+                l.wire();
+                self.flash(&[b"drop refused"]);
+                return;
+            }
+        };
+        let mut count = 0i64;
+        let mut first: &[u8] = b"";
+        let put = |c: u8, a: &mut App| {
+            if a.inp_n < INP_CAP {
+                a.inp.copy_within(a.caret..a.inp_n, a.caret + 1);
+                a.inp[a.caret] = c;
+                a.caret += 1;
+                a.inp_n += 1;
+            }
+        };
+        for path in una_abi::drop_paths(&body[..n]) {
+            if count == 0 {
+                first = path;
+                for &c in b"open" {
+                    put(c, self);
+                }
+            }
+            put(b' ', self);
+            for &c in path {
+                if (0x20..0x7f).contains(&c) {
+                    put(c, self);
+                }
+            }
+            count += 1;
+        }
+        let mut l = Line::new(b":: LUMEN: drop n=");
+        l.dec(count).put(b" first=").put(first).put(b" ::");
+        l.wire();
+    }
+}

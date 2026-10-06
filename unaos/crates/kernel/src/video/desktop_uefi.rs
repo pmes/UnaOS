@@ -697,7 +697,7 @@ pub fn desktop_app_service() {
     super::wm::pace_service();
     crate::splash::hold_service(); // SPLASHX86: the 5 s bound on the boot splash hold
     #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::dock::dockpin_service(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::desktopbuild::service(); // DESKTOPBUILT (B387): the desktop's build at login, its first paint's read-back, the battery follow. DOCKPIN — the owed `<home>/.dock` load (login) and save (a Keep/Remove press), VFS work that cannot run in the click router.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::fs::assoc::service(); // FILETYPES (B423): the registry `login ok` owes, built off the click path
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::fs::assoc::service(); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "quarry"))] super::dnd::service(); // FILETYPES (B423): the registry `login ok` owes, built off the click path
 
     // MENUSTAT — the desktop STATUS MODEL's poll, here and for `pace_service`'s reason: this is the
     // `wc`-gated body the ~1 kHz device-service task calls on EVERY pass, and it must run AHEAD of
