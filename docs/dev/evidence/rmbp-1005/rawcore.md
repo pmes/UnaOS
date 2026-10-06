@@ -10,7 +10,7 @@ Facet refuses it; Quick Look shows a card. The card's exFAT label already names 
 
 **The seam (R79, R83).** `unaos/libs/media/raw_core` — `no_std` + alloc, no dependencies, forbid(unsafe):
 the TIFF container (both byte orders, bounded IFD walk with a visited set: IFD0 chain, SubIFDs, EXIF IFD), the
-raw strip (uncompressed 16-bit containers; cRAW 32767/8 with the curve; packed 12-bit 32767/12), the embedded
+raw strip (uncompressed 16-bit containers; cRAW 32767/8 with the curve; packed 12-bit 32767/12 is owed), the embedded
 JPEG preview (513/514 in any IFD, the largest that starts `FF D8`), the EXIF facts, a bilinear demosaic and a
 streaming binned developer (for a window smaller than the sensor: one row of u16 and one accumulator row,
 never the whole mosaic) to pixel_core's surface (straight RGBA8, sRGB through the EOTF of lux's color.rs,
@@ -38,3 +38,10 @@ Test: `:: RAWCORE: tiff=ok ifds=<n> preview=<ok> demosaic=<ok> facts=<n> -> PASS
 (`Compression 7`), the A100's ARW1 (32767 with 12-bit Huffman) — bilinear with no matrix and no WB is a FLAT,
 greenish first image. A FAT/exFAT card takes no attributes, so the `media:*` facts land only on UnaFS copies.
 Icon-view thumbnails (no icon view draws any picture yet): `pixel_core::raw::decode_preview` is the call.
+
+**Built (e320b590).** Host: `cargo test -p raw_core -p lux -p pixel_core` exit 0 (raw_core 6 KATs, pixel_core
+raw_kat 2, lux unchanged and passing). Kernel: x86 metal shape exit 0; aarch64 `login,loginst,virt_el0,lumen,desktop_firmware,quarry,facet,usbnet`
+exit 0; aarch64 `tegra,…` exit 101 = No space left on device (shared disk), twice. No knob: the route rides `facet`.
+**Bytes wanted from Peter's card:** the first 64 KiB of one ARW (IFD0, the raw SubIFD, the EXIF IFD, the curve/
+black/white tags, the preview's start) for the container KATs, and one whole ARW (the smallest — a compressed
+one, ~25 MB) for the decoder and demosaic KATs; its body model names the colour matrix owed.
