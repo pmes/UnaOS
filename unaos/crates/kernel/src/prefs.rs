@@ -1069,3 +1069,29 @@ fn settingsfiles_selftest() {
         if app_ok { "ok" } else { "fail" }, alone as u8, path(), if ok { "PASS" } else { "FAIL" }
     );
 }
+
+/// WINMEMORY (B429, MACPARITY row 12): declare ONE key of `app.<name>` on the program's behalf — the window
+/// manager owns the frame, so it declares `window.frame` at the app's first window. MERGES: a stanza the
+/// program declared itself (Lumen's) keeps its rows; a key already there is left as it is. `line` is one
+/// PrefDeclare line (`<key>\t<spec>\t<default>\t<doc>`). Returns whether the key was added.
+pub fn declare_app_key(name: &str, line: &str) -> bool {
+    let mut body = Vec::from(name.as_bytes());
+    body.push(0);
+    body.extend_from_slice(line.as_bytes());
+    let Some((n, keys)) = prefs_core::declare::parse(&body) else { return false };
+    let mut reg = DECLARED.lock();
+    let stanza = reg.entry(n).or_default();
+    let mut added = 0usize;
+    for k in keys {
+        if !stanza.iter().any(|d| d.key == k.key) && stanza.len() < prefs_core::declare::MAX_KEYS {
+            stanza.push(k);
+            added += 1;
+        }
+    }
+    let total = stanza.len();
+    drop(reg);
+    if added > 0 {
+        serial_println!("[prefs] declared app.{} keys={} -> settings/{} (R98, by the window manager)", name, total, name);
+    }
+    added > 0
+}
