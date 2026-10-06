@@ -328,3 +328,5 @@ pub mod hidstall;
 // LOADERSTALL (rmbp-ledger B490): the loader's stage record read back — `:: LOADER:` and `tests loader`. Tail statement.
 #[cfg(target_arch = "x86_64")]
 pub mod loaderstage;
+// SMALLFIX6 (rmbp-ledger B495): `tests windowcap`, `tests smallfix6` — flight 26's small reds, read back. Tail statement.
+pub mod smallfix6;

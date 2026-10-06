@@ -494,7 +494,7 @@ pub fn openers_witness(dir: &str, names: &[&str]) {
         cores_ok,
         cores_n,
         if owed.is_empty() { String::from("-") } else { owed.join(",") },
-        if owed.is_empty() { "" } else { " reason=no-opener-in-this-tree(video: Stria's player, SR26)" },
+        if owed.is_empty() { "" } else { " reason=no-registrant(the type has no program that declares it in this build)" },
         dir
     );
 }

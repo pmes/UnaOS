@@ -24,7 +24,7 @@ use crate::console::Console;
 /// Registry capacity — a full table is loud (`:: TESTS: table full … -> FAIL ::`), never silent.
 const CAP: usize = 160; // BATTLIVE (B492): 128 -> 160, flight 26 filled it (`table full (cap=128)` — selfdiag, srcextract NOT registered). // QUIETBOOT2: 80 -> 128, the ~20 boot fixtures B325 moved here. // QUIETBOOT: 48 -> 80, the boot witnesses R80 moved here (flight 19 registered 45).
 
-static TABLE: crate::sync::Mutex<[Option<(&'static str, fn())>; CAP]> = crate::sync::Mutex::new([None; CAP]);
+static TABLE: crate::sync::Mutex<alloc::vec::Vec<Option<(&'static str, fn())>>> = crate::sync::Mutex::new(alloc::vec::Vec::new()); // SMALLFIX6 (B495, R90): heap-grown — flight 26 printed `table full (cap=128)` and dropped `selfdiag`, `srcextract`
 static DEFERRED: AtomicUsize = AtomicUsize::new(0);
 static AT_BOOT: AtomicUsize = AtomicUsize::new(0);
 static PASS: AtomicU32 = AtomicU32::new(0);
@@ -77,7 +77,7 @@ pub fn register(name: &'static str, f: fn()) {
                 *slot = Some((name, f));
                 DEFERRED.fetch_add(1, Ordering::Relaxed);
             }
-            None => serial_println!(":: TESTS: table full (cap={}) — `{}` NOT registered -> FAIL ::", CAP, name),
+            None => { t.push(Some((name, f))); DEFERRED.fetch_add(1, Ordering::Relaxed); } // SMALLFIX6 (B495, R90): no fixed cap — the table grows
         }
     }
 }
@@ -104,7 +104,7 @@ pub fn run(name: Option<&str>) -> usize {
     let mut i = 0usize;
     loop {
         // Copy the entry out so the table lock is NOT held across the fixture (fixtures print, spin, and may register nothing).
-        let ent = { let t = TABLE.lock(); if i >= CAP { None } else { t[i] } };
+        let ent = { let t = TABLE.lock(); t.get(i).copied().flatten() };
         let Some((n, f)) = ent else { break };
         i += 1;
         if let Some(want) = name { if want != n { continue; } }
@@ -117,7 +117,7 @@ pub fn run(name: Option<&str>) -> usize {
     let (p, f) = (PASS.load(Ordering::Relaxed).wrapping_sub(p0), FAIL.load(Ordering::Relaxed).wrapping_sub(f0));
     let mut names = alloc::string::String::new();
     for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
-    serial_println!(":: TESTS: ran={} pass={} fail={} failed=[{}] skipped=[{}] ::", ran, p, f, names, skipped_names());
+    crate::smallfix6::not_found(name, ran); serial_println!(":: TESTS: ran={} pass={} fail={} failed=[{}] skipped=[{}] ::", ran, p, f, names, skipped_names());
     RUNNING.store(false, Ordering::Release);
     ran
 }
@@ -130,7 +130,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         return;
     }
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); crate::pwwire::ensure_tests(); // CONSOLEFIX (B365): `tests pwwire`, `tests notice`. LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
-    ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
+    ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::smallfix6::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); #[cfg(target_arch = "x86_64")] crate::loaderstage::ensure_tests(); // LOADERSTALL (B490): `tests loader`. FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::shotmask::ensure_tests(); crate::video::blitter::ensure_tests(); crate::prof::ensure_tests(); crate::video::text::ensure_tests(); crate::video::metrics::ensure_tests(); // GLASSEYES (B343): `tests shot`. KCOMP (B321): `tests blitter`. PROFILE (B331): `tests prof`.
