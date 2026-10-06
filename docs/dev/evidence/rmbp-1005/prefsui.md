@@ -41,3 +41,9 @@ witness in `tests settings`.
 **Owed.** aarch64 has no motion/release door into the capture (its arch router is byte-identity bound): the Pi's
 sliders stay click-to-set. A live scale change re-lays the furniture and every window opened after it; windows
 already open keep their surfaces until reopened. Reorder by drag in the Login Items list (Up/Down buttons today).
+
+**M6 (seat's answers).** LOGINFURN counts the user's login items apart: `loginitems::launch` prints
+`[login] item launch name=<n> how=<how> via=login-items` per item and hands `loginfurn::login_items_posted` a credit
+(one window per item, plus the shell a ring-3 item's verb runs in); a row minted in the 1500 ms settle window spends
+a credit first. `:: LOGINFURN: at_login windows=0 login_items=<n> services=0 … -> PASS ::` with an empty list and
+with items. The Display pane says the panel's own mode once (row 8: `2880x1800 native (a choice above is a scale)`).
