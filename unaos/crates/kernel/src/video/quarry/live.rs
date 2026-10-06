@@ -4419,3 +4419,8 @@ pub fn quarry3_selftest() {
         if owed.is_empty() { String::from("-") } else { owed.join(",") }
     );
 }
+
+// FOLDERVIEW (B424): a folder remembers its view in attributes on the folder (`una:view.mode/.columns/.sort/.frame`),
+// inherits its parent's, and Quarry's `View` menu carries Use as Default / Reset to Default — a child like `attrcols`.
+#[path = "folderview.rs"]
+pub mod folderview;

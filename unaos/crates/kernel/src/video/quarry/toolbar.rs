@@ -200,6 +200,7 @@ fn set_view(v: View) {
     if t.view != v {
         t.view = v;
         serial_println!("[quarry3] view={}", if v == View::Icons { "icons" } else { "list" });
+        drop(t); super::folderview::set_mode(if v == View::Icons { "icons" } else { "list" }); // FOLDERVIEW (B424): the folder's mode, latched
     }
 }
 
@@ -477,4 +478,14 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     if !tail.is_empty() {
         text(px, g, end, py, &tail, g.w - PAD(), theme::title_text_active());
     }
+}
+
+/// FOLDERVIEW (B424): the folder just entered carries `mode` — show it, without latching a change.
+pub(super) fn apply_mode(mode: &str) {
+    TB.lock().view = if mode == "icons" { View::Icons } else { View::List };
+}
+
+/// FOLDERVIEW (B424): a search's results are not a folder — no view is resolved or saved for them.
+pub(super) fn search_active() -> bool {
+    TB.lock().search.active
 }
