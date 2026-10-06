@@ -4246,6 +4246,18 @@ build_user_prefs_x86() {
 # VA (user-lumen-x86.ld, the user-big shape: no PHDRS, so lld fills PT_GNU_STACK from -z stack-size) — the
 # BIGAPPS relink RING3WIN owed for LUMEN. target/LUMEN-X86.ELF, staged by the builder as APPS/LUMEN.ELF.
 # Inert until launched (`lumen`); UNAOS_LUMEN=1 adds the dock pin and the `tests lumen` fixture.
+# APPRES (rmbp-ledger B398): stamp a program's RESOURCES (name, signature, version, kind, icon, doc types) into
+# its stripped ELF as the non-alloc note section `.note.unaos.res` — `tools/una-res stamp <crate>/res <elf>`,
+# version suffixed with $UNAOS_GIT_SHA. A crate with no `res/` dir is left as it is (the kernel's registrar
+# gives it the generic icon and its file name). Called after the strip by every build_user_*_x86 whose crate
+# may carry one.
+una_res_stamp() {
+    local crate_dir="$1" elf="$2"
+    [ -d "${crate_dir}/res" ] || return 0
+    ( cd "${WORKSPACE_DIR}/.." && cargo run --release -q -p una-res -- stamp "${crate_dir}/res" "$elf" ) \
+      || { echo -e "${COLOR_RED}ERROR: una-res could not stamp ${elf}${COLOR_RESET}"; exit 1; }
+}
+
 build_user_lumen_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Lumen app (crates/user-lumen → target/LUMEN-X86.ELF, ELF window)...${COLOR_RESET}"
@@ -4262,6 +4274,7 @@ build_user_lumen_x86() {
     local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" | tr -d ' \n')"
     [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
     user_elf_window_check "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" "LUMEN-X86.ELF"
+    una_res_stamp "${WORKSPACE_DIR}/crates/user-lumen" "${WORKSPACE_DIR}/target/LUMEN-X86.ELF"  # APPRES (B398): Lumen's icon, name, signature, version
     echo -e "${COLOR_GREEN}✅ x86 ring-3 Lumen app: LUMEN-X86.ELF${COLOR_RESET}"
 }
 

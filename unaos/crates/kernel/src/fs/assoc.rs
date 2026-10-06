@@ -93,6 +93,9 @@ pub fn opener_for_in(mt: &MountTable, path: &str, mime: &str) -> (String, &'stat
     if let Some(o) = str_attr(mt, &object_path(mime), OPENER_KEY) {
         return (o, "db");
     }
+    if let Some(o) = str_attr(mt, &object_path(mime), crate::fs::appres::KEY_APPS).and_then(|v| v.lines().next().map(String::from)) {
+        return (o, "app"); // APPRES (B398): a program that declares this type in its `una:doctypes`
+    }
     match builtin(mime) {
         Some(r) => (String::from(r.1), "builtin"),
         None => (String::from("none"), "builtin"),

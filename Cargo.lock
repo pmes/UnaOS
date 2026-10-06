@@ -5496,6 +5496,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "una-res"
+version = "0.1.0"
+dependencies = [
+ "midden_core",
+ "pixel_core",
+ "svg_core",
+]
+
+[[package]]
 name = "unafs"
 version = "0.1.0"
 dependencies = [

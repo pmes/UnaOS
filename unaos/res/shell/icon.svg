@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Shell (UnaOS's own design): a prompt chevron and cursor on a deep-blue tile. -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#16324f"/>
+<polyline points="14,20 28,32 14,44" fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="32" y="41" width="18" height="5" rx="2.5" fill="#63b3ed"/>
+</svg>

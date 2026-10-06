@@ -1746,3 +1746,12 @@ mod window2_tests {
         std::println!(":: WINDOW2-ABI: bytes={} kdf_m_kib={} alloc={} -> PASS ::", USER_WINDOW_BYTES, WINDOW2_KDF_M_KIB, WINDOW2_ALLOC_BYTES);
     }
 }
+// APPRES (rmbp-ledger B398, MACPARITY §16 B4 / row 38) — a program's RESOURCES: a second UnaOS note, type
+// APP_RES_NOTE_TYPE, in a NON-ALLOC SHT_NOTE section `.note.unaos.res` with no program header (the loader maps
+// PT_LOAD only and never sees it). `tools/una-res` writes it after the strip; the kernel's registrar
+// (`fs/appres.rs`) reads it through the section table and caches it as attributes. Desc layout and keys:
+// `midden_core::RES_MAGIC` and the `RES_KEY_*` constants (the parse lives there). Appended at the tail.
+/// The resource note's section name.
+pub const APP_RES_SECTION: &str = ".note.unaos.res";
+/// The resource note's type (owner "UnaOS", like APP_NOTE_TYPE's).
+pub const APP_RES_NOTE_TYPE: u32 = 2;

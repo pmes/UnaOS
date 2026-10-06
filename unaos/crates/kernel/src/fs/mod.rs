@@ -180,3 +180,5 @@ pub mod removable;
 pub mod rootdisk;
 /// EXFAT (B392): the kernel half of the shared exFAT reader (`unaos/libs/fs/exfat_core`) — removable volumes, read-only.
 pub mod exfat;
+/// APPRES (B398): the registrar — a program's resources (name, signature, version, kind, icon, doc types) as attributes.
+pub mod appres;

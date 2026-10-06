@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Quarry (UnaOS's own design): cut stone blocks stacked on a sand tile. -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#d8b47a"/>
+<rect x="10" y="38" width="20" height="14" rx="2" fill="#7a5a3a"/>
+<rect x="33" y="38" width="21" height="14" rx="2" fill="#8c6a45"/>
+<rect x="20" y="22" width="24" height="14" rx="2" fill="#a07b50"/>
+<rect x="10" y="38" width="20" height="3" fill="#b8936a"/>
+<rect x="33" y="38" width="21" height="3" fill="#c4a077"/>
+<rect x="20" y="22" width="24" height="3" fill="#d6b88f"/>
+</svg>

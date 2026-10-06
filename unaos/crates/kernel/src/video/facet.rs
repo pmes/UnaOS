@@ -2131,3 +2131,8 @@ pub fn imgview_selftest() {
 // a child module, so no `video/mod.rs` line.
 #[path = "facet_anim.rs"]
 pub mod anim;
+
+/// APPRES (B398): the live Facet window id (the dock draws its icon on that tile), or [`wm::WIN_NONE`].
+pub fn win() -> wm::WinId {
+    WIN.load(Ordering::Relaxed)
+}

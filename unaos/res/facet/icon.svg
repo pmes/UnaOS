@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Facet (UnaOS's own design): a cut gem's facets on a teal tile. -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#13807a"/>
+<polygon points="20,16 44,16 54,28 32,52 10,28" fill="#e6fffa"/>
+<polygon points="20,16 26,28 10,28" fill="#b2f5ea"/>
+<polygon points="44,16 38,28 54,28" fill="#81e6d9"/>
+<polygon points="26,28 38,28 32,52" fill="#b2f5ea"/>
+<polygon points="10,28 26,28 32,52" fill="#ffffff"/>
+<polygon points="38,28 54,28 32,52" fill="#4fd1c5"/>
+</svg>

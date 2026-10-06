@@ -347,6 +347,7 @@ pub fn compute_meta(mt: &MountTable, cwd: &str, list: &[DirEnt], origins: &[(Str
     for e in list {
         let path = join(cwd, &e.name);
         let mime = listing_mime(mt, &path, e, attrs, &mut sniffs);
+        if mime == crate::fs::filetype::UNAOS_ELF { let _ = crate::fs::appres::sight_in(mt, &path); } // APPRES (B398): first sight of a program in a listing
         let type_name = match names.iter().find(|(m, _)| *m == mime) {
             Some((_, n)) => n.clone(),
             None => {
@@ -575,6 +576,7 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
         }
         nm.truncate(c.name_cols);
         text(px, g, c.name_x, y + g.ts, &nm, size_x.min(clip), ink);
+        if !dir && meta.map(|mm| mm.mime == crate::fs::filetype::UNAOS_ELF).unwrap_or(false) { let (ix, sz) = (c.name_x + (nm.len() + 1) * g.cell_w(), row_h.saturating_sub(4)); if ix + sz <= size_x.min(clip) { crate::fs::appres::blit_path_icon(px, g.w, g.h, ix, y + 2, sz, &join(&m.cwd, &ent.name)); } } // APPRES (B398): the program's icon (its own, else the generic one) after its name
         for (k, &(col, x, w)) in c.cols.iter().enumerate() {
             let cell: Vec<u8> = match col {
                 Col::Size => {

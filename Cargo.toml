@@ -79,6 +79,7 @@ members = [
     "tools/holocron",
     "tools/crypto-check",
     "tools/eyes",
+    "tools/una-res", # APPRES (B398): the program resource writer
     "vessels/lumen",
     "vessels/pulse",
     "vessels/phonolite",
