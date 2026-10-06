@@ -37,7 +37,7 @@ pub const VERB_SET: u8 = 17;
 pub const VERB_LIST: u8 = 18;
 pub const VERB_CHANGED: u8 = 19;
 /// SETTINGSFILES (B407, R98): a program declares its `app.<name>.*` stanza (body: [`crate::declare::body`]).
-pub const VERB_DECLARE: u8 = 20;
+pub const VERB_DECLARE: u8 = 23; // merge17: 20..=22 are DIALOG2 verbs (una_abi::BUS_VERB_PREF_DECLARE)
 /// una-abi `BUS_BODY_MAX`: the reply ceiling.
 pub const BODY_MAX: usize = 4096;
 
