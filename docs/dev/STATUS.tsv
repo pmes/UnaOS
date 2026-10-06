@@ -363,3 +363,4 @@ ST361	B238 FILEVIEW: the fixture prints PASS on metal (the glass unread)	confirm
 ST362	B239 NETFETCH-PARSE: the parser fixture prints PASS on metal (fetch itself unread)	confirmed	f16	:: NETFETCH-PARSE: url=true basename=true request=true head=true -> PASS ::	GATEFIX 2026-10-06	B239
 ST363	B240 DOCKRUN: the fixture prints PASS on metal (the glass unread)	confirmed	f16	:: DOCKRUN: tiles=5 running=4 pinned=1 raise=ok quit=ok menu_drawn=1 -> PASS ::	GATEFIX 2026-10-06	B240
 ST364	VPLAYAUDIO (B475): built on exec-rmbp-vplayaudio @95917915, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B475
+ST365	SHELLTASK2 (B474): built on exec-rmbp-shelltask2 @91f1542d, not flown — no flight, no line (the seat's hand-back record, 2026-10-06)	unflown			cloud seat 2026-10-06	B474
