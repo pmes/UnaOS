@@ -1240,3 +1240,7 @@ pub mod fnrow;
 // APPSWITCH (B428, MACPARITY row 10): Cmd-Tab cycles apps on one strip of icons. x86 `wc` (the key door and the overlay row are x86's, as LAUNCHER's); at the tail so no line above moves.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod appswitch;
+
+// LIDSLEEP (B431): the lid read (MSLD, rung 0, knob `lidsleep`) and the backlight-only sleep. Same gate as backlight.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod lidsleep;

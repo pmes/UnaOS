@@ -477,3 +477,26 @@ pub fn brightstep() {
         if hw { "gmux" } else { "sim" }, if ok { "PASS" } else { "FAIL" }
     );
 }
+
+/// LIDSLEEP (B431) — the backlight OFF: gmux index 0x74 := 0 (upstream apple-gmux: 0 = off; BRIGHTFLOOR flight 19 saw
+/// it dark), read back. The one writer of a 0, and only for a sleep: `LEVEL` and the known register value are left as
+/// they were so the wake restores them through [`set_raw_via`]. Returns `(wrote, readback, hw)`.
+/// `[backlight] off reg=0 readback=<rb|-> driver=<gmux|sim> via=<who>`
+pub fn off_via(via: &str) -> (bool, Option<u32>, bool) {
+    let (_, hw) = panel_max();
+    #[allow(unused_mut)]
+    let mut r = (false, None, false);
+    #[cfg(all(target_arch = "x86_64", feature = "gmux_igd", feature = "intel-ivb"))]
+    if hw {
+        let wrote = crate::drivers::gpu::igpu::gmux_set_brightness(0);
+        r = (wrote, if wrote { crate::drivers::gpu::igpu::gmux_get_brightness() } else { None }, true);
+    }
+    if !r.2 {
+        let _ = hw;
+        SIM_REG.store(0, Ordering::Relaxed);
+        r = (true, Some(0), false);
+    }
+    let mut rb = [0u8; 12];
+    serial_println!("[backlight] off reg=0 readback={} driver={} via={}", fmt_opt(r.1, &mut rb), if r.2 { "gmux" } else { "sim" }, via);
+    r
+}

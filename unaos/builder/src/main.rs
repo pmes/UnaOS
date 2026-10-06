@@ -961,6 +961,8 @@ fn main() {
     if std::env::var("UNAOS_PREFS_RESET").is_ok() { feats.push("prefs_reset"); }
     // PANICSCREEN (B406): UNAOS_PANIC_HOLD=1 holds the panic screen for the bench (no restart). Kept in sync with arroyo.
     if std::env::var("UNAOS_PANIC_HOLD").is_ok() { feats.push("panic_hold"); }
+    // LIDSLEEP (B431): UNAOS_LIDSLEEP=1 arms the MSLD lid read (rung 0, read-only; implies smc). Kept in sync with arroyo.
+    if std::env::var("UNAOS_LIDSLEEP").is_ok() { feats.push("lidsleep"); }
     // SMALLFIX2 (B391, R94): UNAOS_SVG=1 arms pixel_core's `svg` format in the kernel (SVG opens in facet). Kept in sync with arroyo.
     if std::env::var("UNAOS_SVG").is_ok() { feats.push("svg"); }
     // KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the copy-engine blitter (cpu until KBLIT binds its channel). Kept in sync with arroyo.

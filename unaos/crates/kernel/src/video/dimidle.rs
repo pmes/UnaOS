@@ -103,6 +103,7 @@ pub fn service() {
             }
         }
     }
+    super::lidsleep::service(); // LIDSLEEP (B431): rung 0's MSLD poll (knob) and the sleep blank's wake
     #[cfg(feature = "witness")]
     fixture();
 }
@@ -174,3 +175,6 @@ pub fn set_idle_min(n: u32) {
     IDLE_MIN_RT.store(n.min(1440), Ordering::Relaxed);
     LAST_ACTIVITY_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
 }
+
+/// LIDSLEEP (B431): the last key/pointer event's time (ms; 0 = none yet) — the sleep blank's wake reads it.
+pub fn last_activity_ms() -> u64 { LAST_ACTIVITY_MS.load(Ordering::Relaxed) }
