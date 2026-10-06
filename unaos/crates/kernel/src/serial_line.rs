@@ -601,18 +601,18 @@ pub fn fold_close() {
 
 /// `tests keplerlog`: every line the Kepler fold took off the boot, verbatim.
 pub fn keplerlog_replay() {
-    let (lines, kept, dropped) = {
+    let (lines, kept, dropped, shown) = {
         let f = FOLD.lock();
         let (lines, kept, dropped) = (f.lines, f.kept, f.dropped);
         let text = &f.keep[..f.kept_len];
         let mut owned = alloc::vec::Vec::with_capacity(text.len());
-        owned.extend_from_slice(text);
+        owned.extend_from_slice(text); let mut shown = 0u32;
         drop(f);
         for l in owned.split(|c| *c == b'\n') {
-            if l.is_empty() { continue; }
+            if l.is_empty() { continue; } shown += 1;
             serial_println!("{}", core::str::from_utf8(l).unwrap_or("[keplerlog] utf8?"));
         }
-        (lines, kept, dropped)
+        (lines, kept, dropped, shown)
     };
-    serial_println!(":: KEPLERLOG: lines={} kept={} dropped={} -> PASS ::", lines, kept, dropped);
+    serial_println!(":: KEPLERLOG: lines={} kept={} dropped={} shown={} -> {} ::", lines, kept, dropped, shown, if kept == 0 { "SKIP reason=no-fold" } else if shown >= kept { "PASS" } else { "FAIL" }); // GATEREVIEW F13: PASS was unconditional (it printed); now it is the replay of every kept line
 }
