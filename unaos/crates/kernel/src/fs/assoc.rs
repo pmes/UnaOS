@@ -220,7 +220,7 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
     }
     let mut missing: Vec<(String, Vec<(String, AttrValue)>)> = Vec::new();
     let mut filled = 0usize;
-    for mime in known_types_in(mt) {
+    for mime in seed_types_in(mt) { // SMALLFIX5 (B480): + the types only a ring-3 program's signature object declares
         let obj = object_path(&mime);
         let want = keys_for(mt, &mime);
         if mt.stat(&obj).is_err() {
@@ -754,4 +754,71 @@ pub fn override_refusal(path: &str, mime: &str) -> Option<String> {
         Some(_) => None,
         None => Some(alloc::format!("preferred={} refused=not-a-registrant", v)),
     }
+}
+
+// ── SMALLFIX5 (rmbp-ledger B480) item 1 — a ring-3 program's own doc type and the stamp ─────────────────────────
+//
+// The stamp hashes what is compiled in. A type only a ring-3 program declares (its APPRES block, cached on its
+// signature object `application-x-vnd.*` in this directory) is outside the hash, so a stamp match never fills its
+// `una:preferred`. A ROOT sighting outside the per-boot memo that declares such a type, with the type's object
+// missing or carrying no preferred app, replaces the stamp (ONE attribute write); the next login build then runs
+// `seed_in` in full, which creates the object from the signature object's declared types and fills the missing keys.
+// A filled type never invalidates, so the steady state stays the one-attribute read.
+
+/// The stamp an invalidation writes (never equal to [`stamp_now`]: version 0).
+pub const STAMP_INVALID: &str = "v0 h=invalidated n=0";
+
+/// `doctypes` the stamp's hash does not cover: not in [`TYPE_FACTS`], not a built-in's declared doc type. Pure.
+pub fn uncovered_types(doctypes: &[String]) -> Vec<String> {
+    let built = appres::builtin_doctypes();
+    doctypes.iter().filter(|m| !m.is_empty() && facts(m).is_none() && !built.iter().any(|b| b == *m)).cloned().collect()
+}
+
+/// [`known_types_in`] plus every uncovered type a ring-3 program's signature object in [`TYPES_DIR`] declares
+/// (`seed_in`'s set: a full build creates their objects). One attribute read per signature object, full builds only.
+pub fn seed_types_in(mt: &MountTable) -> Vec<String> {
+    let mut v = known_types_in(mt);
+    if let Ok(ents) = mt.read_dir(TYPES_DIR) {
+        for e in ents.iter().filter(|e| e.name.starts_with("application-x-vnd.")) {
+            let obj = alloc::format!("{}/{}", TYPES_DIR, e.name);
+            let decl: Vec<String> = str_attr(mt, &obj, midden_core::RES_KEY_DOCTYPES).unwrap_or_default().lines().map(String::from).collect();
+            for m in uncovered_types(&decl) {
+                if !v.contains(&m) {
+                    v.push(m);
+                }
+            }
+        }
+    }
+    v
+}
+
+/// Should a sighting declaring `doctypes` invalidate the stamp? The first uncovered type whose object is missing or
+/// has no `una:preferred`, `None` when every one is filled (or none is uncovered).
+pub fn stamp_owed_type(mt: &MountTable, doctypes: &[String]) -> Option<String> {
+    uncovered_types(doctypes).into_iter().find(|m| str_attr(mt, &object_path(m), PREFERRED_KEY).is_none())
+}
+
+static INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many stamp invalidations this boot wrote (`tests smallfix5`).
+pub fn invalidations() -> usize {
+    INVALIDATIONS.load(Ordering::Relaxed)
+}
+
+/// APPRES's root sighting of `program` (not in the per-boot memo) declaring `doctypes`: replace the stamp when an
+/// uncovered type is unfilled. One line when it writes: `[filetypes] stamp invalidated by=<program> type=<mime> written=<0|1>`.
+/// `true` when the stamp was replaced.
+pub fn stamp_invalidate_for(mt: &MountTable, program: &str, doctypes: &[String]) -> bool {
+    let Some(m) = stamp_owed_type(mt, doctypes) else { return false };
+    match stamp_on_disk(mt) {
+        None => return false,                             // no stamp: the next build runs in full anyway
+        Some(s) if s == STAMP_INVALID => return false,    // already invalidated this boot or an earlier one
+        Some(_) => {}
+    }
+    let ok = mt.set_attr(TYPES_DIR, STAMP_KEY, AttrValue::Str(String::from(STAMP_INVALID)), KERNEL_PRINCIPAL).is_ok();
+    if ok {
+        INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+    serial_println!("[filetypes] stamp invalidated by={} type={} written={}", program, m, ok as u8);
+    ok
 }

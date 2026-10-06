@@ -1317,11 +1317,25 @@ pub fn seek_result() -> Option<(&'static str, &'static str, u64, bool)> {
 /// (path, ms, verdict): verdict = (table, exact, landed_ms, byte, sample) or the refusal.
 static PROBE: spin::Mutex<Option<(String, u64, Option<Result<(&'static str, bool, u64, u64, u64), String>>)>> = spin::Mutex::new(None);
 
-/// Start the probe of `path` at `ms` (replaces any earlier one).
-pub fn table_probe_start(path: &str, ms: u64) {
-    *PROBE.lock() = Some((String::from(path), ms, None));
+/// Start the probe of `path` at `ms` (replaces any earlier one that finished). SMALLFIX5 (B480) item 7: `false` and
+/// nothing spawned while an earlier probe has no verdict yet — a hung `play-probe` (DECJOBHANG) is never joined by a
+/// second task on the same file read.
+pub fn table_probe_start(path: &str, ms: u64) -> bool {
+    {
+        let mut g = PROBE.lock();
+        if g.as_ref().map(|p| p.2.is_none()).unwrap_or(false) {
+            return false;
+        }
+        *g = Some((String::from(path), ms, None));
+    }
     let (cpu, _) = dec_cpu();
     crate::arch::sched::spawn_stack("play-probe", probe_task, 0, cpu, crate::arch::sched::PRIO_NORMAL, DEC_STACK);
+    true
+}
+
+/// SMALLFIX5 (B480): a probe started and not yet answered (the guard [`table_probe_start`] keeps).
+pub fn table_probe_running() -> bool {
+    PROBE.lock().as_ref().map(|p| p.2.is_none()).unwrap_or(false)
 }
 
 /// The probe's verdict, `None` while it runs.

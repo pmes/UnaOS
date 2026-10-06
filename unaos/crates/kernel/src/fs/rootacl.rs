@@ -80,7 +80,7 @@ pub fn write_verdict(fs: &mut crate::fs::unafs::KernelUnaFS, ino: &::unafs::inod
         return Some(Ok(()));
     }
     serial_println!("[rootacl] refused id={} principal={} reason=system-owned (B456: kernel and the administrator write here)", ino.id, principal);
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::dialog::refused(crate::video::dialog::WHAT_SYSTEM_FILES, alloc::format!("write id={} principal={} reason=system-owned", ino.id, principal).as_bytes()); // REFUSALUI (B468): the one refusal surface, moved here from attrsys F2 at the ROOTACL fold
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::dialog::refused_by(crate::video::dialog::WHAT_SYSTEM_FILES, alloc::format!("write id={} principal={} reason=system-owned", ino.id, principal).as_bytes(), crate::video::dialog::caller_owner()); // REFUSALUI (B468): the one refusal surface, moved here from attrsys F2 at the ROOTACL fold
     Some(Err(VfsError::Denied))
 }
 

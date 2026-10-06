@@ -292,7 +292,7 @@ pub fn open(path: &str) -> Result<u32, String> {
         id, path, if st.codec.is_empty() { "-" } else { &st.codec }, st.dur_ms, st.src, lv, muted as u8,
         match &st.err { None => String::from("started"), Some(e) => alloc::format!("refused ({})", e) }
     );
-    *STATE.lock() = Some(st);
+    *STATE.lock() = Some(st); PLAYER_OPEN.store(true, Ordering::Release); // SMALLFIX5 (B480): the posted `player open` flag
     WIN.store(id, Ordering::Relaxed);
     wm::winid_register_holder(&WIN, "player");
     wm::focus_changed(OWNER);
@@ -303,7 +303,7 @@ pub fn open(path: &str) -> Result<u32, String> {
 /// Close the window (if any) and stop the play. `by` names the door on the wire.
 pub fn close(by: &str) {
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
-    let had = STATE.lock().take();
+    let had = STATE.lock().take(); PLAYER_OPEN.store(false, Ordering::Release); // SMALLFIX5 (B480)
     if let Some(st) = had.as_ref() {
         if st.drag != Drag::None {
             super::capture::cancel();
@@ -334,7 +334,7 @@ pub fn service() {
         }
     }
     // the WM closed the row (Cmd-W, File > Close Window, Quit): its holder cleared WIN — the play stops with it
-    if WIN.load(Ordering::Relaxed) == wm::WIN_NONE && STATE.try_lock().map(|g| g.is_some()).unwrap_or(false) {
+    if WIN.load(Ordering::Relaxed) == wm::WIN_NONE && PLAYER_OPEN.load(Ordering::Acquire) && STATE.try_lock().map(|g| g.is_some()).unwrap_or(false) {
         close("wm");
     }
     let k = MEDIA.swap(0, Ordering::AcqRel);
@@ -928,7 +928,7 @@ pub fn fixture() {
     if let Some(c) = scratch {
         let _ = mt.unlink(&c, p);
     }
-    let (coded, coded_ok) = coded_tables(); // SEEKTABLE2 (B469): Ogg and ADTS seek from their own data
+    let (coded, coded_ok, probe_timeout) = coded_tables(); // SEEKTABLE2 (B469): Ogg and ADTS seek from their own data; SMALLFIX5 (B480): a hung probe FAILS, never wedges
     let ok = open_ok && transport_ok && seek_ok && shared && close_stops && coded_ok;
     let w = |b: bool| if b { "ok" } else { "bad" };
     serial_println!(
@@ -936,9 +936,9 @@ pub fn fixture() {
         path, ran as u8, paused_ok as u8, resumed_ok as u8, sk, l0, target, amp
     );
     serial_println!(
-        ":: PLAYER: open={} transport={} seek={} method={} volume={} close_stops={} coded={} -> {} ::",
+        ":: PLAYER: open={} transport={} seek={} method={} volume={} close_stops={} coded={}{} -> {} ::",
         w(open_ok), w(transport_ok), w(seek_ok), sk.map(|v| v.1).unwrap_or("none"), if shared { "shared" } else { "split" }, close_stops as u8, coded,
-        if ok { "PASS" } else { "FAIL" }
+        if probe_timeout { " probe=timeout" } else { "" }, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -1205,7 +1205,7 @@ mod vid {
 /// coded seek` line and the token `ogg:table,opus:table,adts:table` (`:none` = decode-skip, `:-` = not staged).
 /// `ok` = every staged one answered from a table.
 #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
-fn coded_tables() -> (String, bool) {
+fn coded_tables() -> (String, bool, bool) {
     use crate::drivers::hda::play;
     let mt = crate::shell::vfs_mount_table();
     let mut tok = String::new();
@@ -1219,23 +1219,47 @@ fn coded_tables() -> (String, bool) {
             tok.push_str(":-");
             continue;
         };
-        play::table_probe_start(&path, 200);
+        // SMALLFIX5 (B480) item 7: a probe that does not answer in 3 s (or one still hung from an earlier run) ends
+        // the walk — no further file read, no further task — and PLAYER prints `probe=timeout` and FAILS.
+        if !play::table_probe_start(&path, 200) {
+            serial_println!("[player] coded seek path={} probe=timeout reason=earlier-probe-unanswered -> rest skipped", path);
+            tok.push_str(key);
+            tok.push_str(":skip");
+            return (tok, false, true);
+        }
         let done = play::pump_until(3000, || play::table_probe_done().is_some());
         let v = play::table_probe_done();
+        if v.is_none() {
+            serial_println!("[player] coded seek path={} probe=timeout ms=3000 done={} -> rest skipped", path, done as u8);
+            tok.push_str(key);
+            tok.push_str(":none");
+            return (tok, false, true);
+        }
         let good = matches!(v, Some(Ok((t, true, _, _, _))) if t == want);
         match &v {
             Some(Ok((t, e, l, b, s))) => serial_println!("[player] coded seek path={} table={} exact={} to_ms=200 landed_ms={} byte={} sample={}", path, t, *e as u8, l, b, s),
             Some(Err(e)) => serial_println!("[player] coded seek path={} refused ({})", path, e),
-            None => serial_println!("[player] coded seek path={} timeout=3000ms done={}", path, done as u8),
+            None => {} // SMALLFIX5 (B480): answered above (probe=timeout)
         }
         ok &= good;
         tok.push_str(key);
         tok.push_str(if good { ":table" } else { ":none" });
     }
-    (tok, ok)
+    (tok, ok, false)
 }
 
 #[cfg(not(all(target_arch = "x86_64", feature = "hda-tone")))]
-fn coded_tables() -> (String, bool) {
-    (String::from("-"), true)
+fn coded_tables() -> (String, bool, bool) {
+    (String::from("-"), true, false)
+}
+
+// ── SMALLFIX5 (rmbp-ledger B480) item 2 — the `player open` flag (the SVCLATCH latch shape) ─────────────────────
+/// Raised beside the one store of `Some` into [`STATE`], lowered beside its one `take`: the desktop pass's "did the
+/// WM close the row" check reads it before `STATE.try_lock()`, so with no Player open the pass takes no lock.
+static PLAYER_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `tests smallfix5`: the flag agrees with the state it fronts (`None` when the state is locked by someone else).
+pub fn open_flag_agrees() -> Option<bool> {
+    let flag = PLAYER_OPEN.load(Ordering::Acquire);
+    STATE.try_lock().map(|g| g.is_some() == flag)
 }

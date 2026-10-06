@@ -374,6 +374,7 @@ pub fn sight_in(mt: &MountTable, path: &str) -> Option<App> {
     if let Some(a) = from_cache(mt, &key, path, &stamp) {
         SIGHTS.fetch_add(1, Ordering::Relaxed);
         serial_println!("[appres] sight path={} res=yes source=attrs attrs=0 on=cached sig={}", path, a.signature);
+        stamp_check(mt, &a); // SMALLFIX5 (B480): a cached program outside the memo is a sighting too
         remember(&a);
         return Some(a);
     }
@@ -382,6 +383,7 @@ pub fn sight_in(mt: &MountTable, path: &str) -> Option<App> {
         _ => generic_app(&key, path, &stamp, "elf"),
     };
     let (n, on) = admit(mt, &app, &volume, true);
+    stamp_check(mt, &app); // SMALLFIX5 (B480): after `una:apps` is published on the type objects that exist
     SIGHTS.fetch_add(1, Ordering::Relaxed);
     serial_println!("[appres] sight path={} res={} source=elf attrs={} on={} sig={}", path,
         if app.has_res { "yes" } else { "no" }, n, on, if app.signature.is_empty() { "-" } else { &app.signature });
@@ -896,4 +898,13 @@ pub fn icon_probe() -> &'static str {
     forget(rp);
     PIX.lock().retain(|p| p.key != key);
     if a && b { "root" } else { "FOREIGN" }
+}
+
+/// SMALLFIX5 (rmbp-ledger B480) item 1 — a ROOT program outside the per-boot memo whose block declares a type the
+/// registry's stamp does not cover: `assoc::stamp_invalidate_for` decides (only a program `cache` publishes — a
+/// resource block and a signature — can ever be filled, so no other sighting can invalidate every boot).
+fn stamp_check(mt: &MountTable, app: &App) {
+    if app.has_res && !app.signature.is_empty() && !app.doctypes.is_empty() {
+        let _ = crate::fs::assoc::stamp_invalidate_for(mt, &app.path, &app.doctypes);
+    }
 }

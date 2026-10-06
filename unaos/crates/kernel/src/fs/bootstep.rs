@@ -165,12 +165,18 @@ pub fn boot80_selftest() {
     // window (flight 24's 168 blocks rode a screenshot capture writing beside it — the counters are global). Its
     // bound is the walk it does, not the number of types: `ls` reads ONE directory whatever its count (flight 25:
     // 26 types in 34 blocks) — an inode read and a directory read per level, each at most one read-ahead window.
-    let (types, tio) = crate::fs::unafs::with_unafs(|fs| {
+    // SMALLFIX5 (B480) item 6: the leg is ASSOCSTAMP's own read — the directory resolved and its ONE stamp attribute
+    // (what a login build reads when nothing changed), no longer an `ls` of every type. `types` is the stamp's count.
+    let (have, tio) = crate::fs::unafs::with_unafs(|fs| {
         let i0 = io();
-        let n = fs.resolve_path(crate::fs::assoc::TYPES_DIR).and_then(|id| fs.ls(id)).map(|v| v.len()).unwrap_or(0);
-        (n, io().since(i0))
+        let v = fs.resolve_path(crate::fs::assoc::TYPES_DIR).ok().and_then(|id| fs.get_attribute(id, crate::fs::assoc::STAMP_KEY).ok().flatten());
+        let s = match v { Some(::unafs::inode::AttributeValue::String(s)) => Some(s), _ => None };
+        (s, io().since(i0))
     })
-    .unwrap_or((0, Io::default()));
+    .unwrap_or((None, Io::default()));
+    let want = crate::fs::assoc::stamp_now();
+    let stamp_state = match &have { Some(h) if *h == want => "match", Some(_) => "miss", None => "none" };
+    let types = have.as_deref().and_then(|h| h.rsplit("n=").next()).and_then(|n| n.trim().parse::<usize>().ok()).unwrap_or(0);
     let rms = crate::arch::ms().saturating_sub(t1);
     let rio = io().since(io1);
     let total = mount_ms + rms;
@@ -180,9 +186,9 @@ pub fn boot80_selftest() {
     const STORE_BOUND: u64 = 64; // B350's resolve bound, kept for the store leg it was measured on
     let ok = mounted && tio.blocks_read() <= bound && sio.blocks_read() <= STORE_BOUND && total <= 2000;
     serial_println!(
-        ":: BOOT80: mount_ms={} mount_blocks={} mount_cmds={} blocks_read={} cmds={} ms={} users_store={} stage={} types={} ra_window={} store_blocks={} store_bound={} types_blocks={} bound={} from=walk{}x2xra{} foreign_wr={} -> {} ::",
+        ":: BOOT80: mount_ms={} mount_blocks={} mount_cmds={} blocks_read={} cmds={} ms={} users_store={} stage={} types={} ra_window={} store_blocks={} store_bound={} types_blocks={} bound={} from=walk{}x2xra{} foreign_wr={} types_from=stamp stamp={} -> {} ::",
         mount_ms, mio.blocks_read(), mio.cmds(), rio.blocks_read(), rio.cmds(), total, store, stage, types,
         crate::fs::unafs::ra_window_bound(), sio.blocks_read(), STORE_BOUND, tio.blocks_read(), bound, levels, ra_blocks,
-        rio.blocks_written(), if ok { "PASS" } else { "FAIL" }
+        rio.blocks_written(), stamp_state, if ok { "PASS" } else { "FAIL" }
     );
 }

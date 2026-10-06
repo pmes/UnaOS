@@ -904,6 +904,12 @@ static REF_TOASTS: AtomicU32 = AtomicU32::new(0);
 /// Show a refusal: the alert (an error the person caused, or one the table sorts as an error) or a toast.
 /// Returns `true` when something was queued for the glass (`false`: a repeat, or the queue was full).
 pub fn refused(what: &[u8], why: &[u8]) -> bool {
+    refused_by(what, why, 0)
+}
+
+/// [`refused`], app-modal to `owner` (SMALLFIX5 B480 item 4: the slot that caused it — ROOTACL's writer — not owner 0;
+/// `0` = free-standing). A toast has no owner.
+pub fn refused_by(what: &[u8], why: &[u8], owner: u64) -> bool {
     let (kind, user) = REFUSALS.iter().find(|e| e.0 == what).map(|e| (e.1, e.2)).unwrap_or((Kind::Info, false));
     let mut key = [0u8; 96];
     let mut kn = 0;
@@ -920,7 +926,7 @@ pub fn refused(what: &[u8], why: &[u8]) -> bool {
         None => false,
     };
     let to = if repeat { "repeat" } else if kind == Kind::Error { "alert" } else { "toast" };
-    serial_println!("[refusal] what={} why={} -> {}", core::str::from_utf8(what).unwrap_or("?"), core::str::from_utf8(why).unwrap_or("?"), to);
+    serial_println!("[refusal] what={} why={} -> {} owner={}", core::str::from_utf8(what).unwrap_or("?"), core::str::from_utf8(why).unwrap_or("?"), to, owner);
     if repeat {
         return false;
     }
@@ -929,6 +935,8 @@ pub fn refused(what: &[u8], why: &[u8]) -> bool {
             REF_ALERTS.fetch_add(1, Ordering::Relaxed);
             let mut d = Dlg::new(Icon::Caution, what, what, why, &[b"OK"]);
             d.user = user;
+            d.owner = owner;
+            LAST_REF_OWNER.store(owner, Ordering::Relaxed);
             post(d)
         }
         Kind::Info => {
@@ -1000,4 +1008,25 @@ pub fn refusalui_selftest() {
         ":: REFUSALUI: opener={} toast_action={} fwpin={} rootacl={} -> {} :: repeat={} queued={}",
         opener, toast_action, fwpin, rootacl, if pass { "PASS" } else { "FAIL" }, repeat, queued
     );
+}
+
+/// SMALLFIX5 (B480): the owner the last refusal alert was posted for (`tests smallfix5` reads it after a headless leg).
+static LAST_REF_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The owner of the last refusal alert posted.
+pub fn last_refusal_owner() -> u64 {
+    LAST_REF_OWNER.load(Ordering::Relaxed)
+}
+
+/// SMALLFIX5 (B480) item 4: the owner app of the slot running the caller now (the writer, in a syscall) — x86: the live
+/// CR3's slot; `0` elsewhere (free-standing, as before).
+pub fn caller_owner() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::memory::current_slot().map(|s| wm::owner_of_launch(s as u64)).unwrap_or(0)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
 }
