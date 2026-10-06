@@ -1,0 +1,52 @@
+# kepler-capture.list — KEPLERGR (rmbp-ledger B421), DRIVERS-METHOD §2: the GK107's WORKING fifo state, to be read
+# on the bench from a Linux boot with nouveau loaded and at least one channel live (e.g. after a glxgears/kmscube run).
+# It names WHAT to read; it carries no values. The values are the reference image, kept in
+# docs/dev/evidence/<round>/gk107-capture/ and quoted by offset in the next GPU arc's design doc (keplergr.md §1).
+#
+# Reading: BAR0 is /sys/bus/pci/devices/<gk107 bdf>/resource0 (mmap, 32-bit reads, little-endian), or envytools
+# `nvapeek <offset>`. Read only — nothing on this list is written. One line per read on the capture:
+#     <offset> <value> <name>
+#
+# Columns: offset (BAR0, hex) · count (consecutive 32-bit words) · stride (hex, between words) · name · source
+#
+# ---- PMC / PTOP -----------------------------------------------------------------------------------------------
+0x000000  1   0x4     PMC_BOOT_0               chip id bracket
+0x000200  1   0x4     PMC_ENABLE               nouveau mc/base.c:57 (BIT(reset))
+0x000204  1   0x4     PMC_PBDMA_ENABLE         nouveau gk104.c:739
+0x022700  64  0x4     PTOP_DEVICE_INFO         nouveau top/gk104.c:37-81
+0x100c80  1   0x4     FB_BIGPAGE               nouveau fb/gf100.c:72-73 (bit 0: 64 KiB big pages)
+# ---- PFIFO init state (the walls GPUBLIT3/KEPLERGR write) -------------------------------------------------------
+0x002100  1   0x4     PFIFO_INTR               nouveau gk104.c:658
+0x002140  1   0x4     PFIFO_INTR_EN            nouveau gk104.c:752
+0x002254  1   0x4     USERD_BAR1               nouveau gk104.c:749 (bit 28 enable | bar1 va >> 12)
+0x00252c  1   0x4     BIND_ERROR               nouveau gk104.c:598-613
+0x00259c  1   0x4     MMU_FAULT_MASK           nouveau gf100.c:723
+0x0025a0  1   0x4     PBDMA_INTR_MASK          nouveau gf100.c:737
+0x002630  1   0x4     SCHED_DISABLE            nouveau gk104.c:412/418
+0x002634  1   0x4     PREEMPT                  nouveau gf100.c:43/372
+0x002a04  1   0x4     R2A04                    nouveau gk104.c:740
+0x002270  2   0x4     RUNLIST_BASE/SUBMIT      nouveau gk104.c:446-447 (last commit)
+0x002284  8   0x8     RUNLIST_INFO[rl]         nouveau gk104.c:426 (pending bit 20)
+0x002390  4   0x4     PBDMA_RUNLIST_MASK[i]    nouveau gk104.c:392
+0x002640  8   0x8     ENGINE_STATUS[eng]       nouveau gk104.c:206-216
+0x003080  4   0x4     PBDMA_IDLE[i]            nouveau gk104.c:293
+# ---- per PBDMA (i = 0..3, stride 0x2000) ------------------------------------------------------------------------
+0x040000  4   0x2000  PBDMA_GP_PUT[i]          open-gpu-doc gv100 dev_pbdma.ref:468
+0x040014  4   0x2000  PBDMA_GP_GET[i]          open-gpu-doc gv100 dev_pbdma.ref:425
+0x040108  4   0x2000  PBDMA_INTR_0[i]          nouveau gf100.c:315-318
+0x04010c  4   0x2000  PBDMA_INTR_EN_0[i]       nouveau gf100.c:358
+0x040120  4   0x2000  PBDMA_CHANNEL[i]         nouveau gf100.c:315-318
+0x04013c  4   0x2000  PBDMA_13C[i]             nouveau gf100.c:357 (bits 8/28 cleared by nouveau)
+0x040148  4   0x2000  PBDMA_HCE_INTR[i]        nouveau gk104.c:385-386
+0x04014c  4   0x2000  PBDMA_HCE_INTR_EN[i]     nouveau gk104.c:385-386
+# ---- the channel table: every chid nouveau has bound (read 0..63; keep the VALID ones) -------------------------
+0x800000  64  0x8     PFIFO_CHAN_LO[chid]      nouveau gk104.c:60/68 (bit 31 VALID | inst >> 12)
+0x800004  64  0x8     PFIFO_CHAN_HI[chid]      nouveau gk104.c:44/52/77 (runlist 19:16, status)
+# ---- DERIVED: the RAMFC + USERD of each VALID channel above ------------------------------------------------------
+# For each chid with VALID: inst = (CHAN_LO & 0x0fffffff) << 12. Read the instance block through PRAMIN: write
+# 0x001700 = inst >> 16 (the bench's ONLY write, restored after: read 0x001700 first), then read BAR0
+# 0x700000 + (inst & 0xffff) + off for:
+#     RAMFC   off 0x000..0x0fc (64 words)        nouveau gk104.c:88-102, open-gpu-doc gv100 dev_ram.ref:448-468
+#     PD ptr  off 0x200..0x20c (4 words)         nouveau vmmgf100.c:342-360
+# and the channel's USERD slot: table = (USERD_BAR1 & 0x0fffffff) << 12, slot = table + chid*0x200, words
+# 0x00..0x1fc through the same PRAMIN window (GP_GET +0x88, GP_PUT +0x8c — nouveau gf100.c:129-130).
