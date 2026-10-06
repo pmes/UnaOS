@@ -562,7 +562,7 @@ fn admit(spec: &FwSpec, path: String, vol: &str, data: Vec<u8>) -> RoleResult {
     let sha = crypto_core::sha2::sha256(&data);
     let len = data.len();
     if !v.stream_ok {
-        refuse(2);
+        refuse(2); refused_ui(spec.role, "violates-layout"); // REFUSALUI (B468): the refusal is shown, not only printed
         serial_println!(
             ":: wifi: {} REJECTED {} bytes={} on {} — reason=violates-layout hdr={} type={:#04x} declared={} records={} sha256={} ::",
             spec.role, path, len, vol, v.layout, v.kind, v.declared, v.records, hex32(&sha)
@@ -571,7 +571,7 @@ fn admit(spec: &FwSpec, path: String, vol: &str, data: Vec<u8>) -> RoleResult {
     }
     match pin_for(spec.role) {
         None => {
-            refuse(1);
+            refuse(1); refused_ui(spec.role, "unpinned"); // REFUSALUI (B468): the refusal is shown, not only printed
             serial_println!(
                 ":: wifi: {} REJECTED {} bytes={} on {} — reason=unpinned sha256={} (no `{}` row in unaos/firmware/b43.pins; pin it from the WIFI-FW build line) ::",
                 spec.role, path, len, vol, hex32(&sha), spec.role
@@ -579,7 +579,7 @@ fn admit(spec: &FwSpec, path: String, vol: &str, data: Vec<u8>) -> RoleResult {
             return RoleResult::Rejected;
         }
         Some(pin) if pin != sha => {
-            refuse(3);
+            refuse(3); refused_ui(spec.role, "pin-mismatch"); // REFUSALUI (B468): the refusal is shown, not only printed
             serial_println!(
                 ":: wifi: {} REJECTED {} bytes={} on {} — reason=pin-mismatch sha256={} pin={} ::",
                 spec.role, path, len, vol, hex32(&sha), hex32(&pin)
@@ -975,4 +975,11 @@ fn source_of_handle(handle: crate::drivers::block::BlockHandle) -> fat::BlockSou
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
         crate::drivers::block::BlockHandle::SdMmc => fat::BlockSource::SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] crate::drivers::block::BlockHandle::Ahci { port } => fat::BlockSource::Ahci(port), // AHCIBOOT: mapped only — neither `program_source` nor `alternate_program_source` returns a SATA handle, so no firmware search reaches this arm; nothing else in this file changes.
     }
+}
+
+/// REFUSALUI (B468): FWPIN's refusal on the glass — information (a toast), in the wire's words.
+fn refused_ui(role: &str, why: &str) {
+    let w = alloc::format!("{} reason={}", role, why);
+    #[cfg(feature = "wc")] let _ = crate::video::dialog::refused(crate::video::dialog::WHAT_FIRMWARE, w.as_bytes());
+    let _ = w;
 }
