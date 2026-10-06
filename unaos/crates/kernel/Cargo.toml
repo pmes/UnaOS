@@ -3769,6 +3769,12 @@ prefs_reset = []
 # with `unaos/arroyo` (the x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 panic_hold = []
 
+# LIDSLEEP (rmbp-ledger B431, MACPARITY row 34): UNAOS_LIDSLEEP=1 — rung 0 of the lid ladder: the SMC key MSLD read
+# READ-ONLY at the first desktop pass and every 1 s, printed on change (`[smc] lid=<open|closed> raw=<byte>`); the
+# lid → backlight-off ladder is written and unapplied (video/lidsleep.rs LADDER_ARMED). Implies `smc`. x86 only (the
+# k8-reach NA row). Kept in sync with `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`.
+lidsleep = ["smc"]
+
 # SMALLFIX2 (rmbp-ledger B391, R94 §3): UNAOS_SVG=1 — SVG is a picture: pixel_core's `svg` format (UnaOS's own
 # no_std svg_core) is linked, so `fs::filetype` types `image/svg+xml` by its markup and facet renders it (shapes;
 # SVG text needs the faces passed to `decode_at`, owed). Off: an .svg types as the text it is. Both arches. Kept

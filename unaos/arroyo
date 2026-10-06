@@ -1241,6 +1241,8 @@ fi
 [ -n "${UNAOS_PREFS_RESET:-}" ] && _feats="${_feats}prefs_reset,"
 # PANICSCREEN (B406, R95): UNAOS_PANIC_HOLD=1 holds the plain panic screen for the bench (no countdown, no restart). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_PANIC_HOLD:-}" ] && _feats="${_feats}panic_hold,"
+# LIDSLEEP (B431): UNAOS_LIDSLEEP=1 arms rung 0 of the lid ladder — MSLD read-only on a 1 s poll, `[smc] lid=` on change (implies smc). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_LIDSLEEP:-}" ] && _feats="${_feats}lidsleep,"
 # SMALLFIX2 (B391, R94 §3): UNAOS_SVG=1 arms SVG as a picture — pixel_core's `svg` format (svg_core) in the kernel, so `image/svg+xml` types and opens in facet. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_SVG:-}" ] && _feats="${_feats}svg,"
 # KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.

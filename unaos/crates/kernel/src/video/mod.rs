@@ -1231,3 +1231,7 @@ pub fn notify(app: &[u8], title: &[u8], line: &[u8], label: &[u8], act: u8, arg:
     #[allow(unreachable_code)]
     false
 }
+
+// LIDSLEEP (B431): the lid read (MSLD, rung 0, knob `lidsleep`) and the backlight-only sleep. Same gate as backlight.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod lidsleep;
