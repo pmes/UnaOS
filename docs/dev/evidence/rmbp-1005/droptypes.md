@@ -25,8 +25,8 @@ feeds `video::capture` there, so a drag armed by Quarry's press never sees a mot
   The answer is memoised per (owner, first path, count) for the session.
 * Lumen declares `droptypes = text/*, image/*` (what its `open` takes).
 * aarch64: `ring3_owner_live` (the asid's live Proc row), the DROP_GET arm (the x86 body: owner = asid),
-  `user_input_push_owner` for the event, and `capture::feed` from both focus drains in `main.rs` (motion at the
-  live cursor, the primary release).
+  `user_input_push_owner` for the event, and `capture::feed` from the focused-app drain and the shell path's
+  `render_service` motion arms (each after the cursor moved), `capture::feed_release` from the shell drain.
 
 ## Milestones
 * M1 — the key: una-abi DROPTYPES, midden_core RES_KEY_DROPTYPES, una-res parse/stamp (+ its test), appres App
@@ -43,6 +43,5 @@ feeds `video::capture` there, so a drag armed by Quarry's press never sees a mot
 * `[wm] launch-name … via=appres` for `lumen` (the sight landed).
 
 ## Owed
-* The Pi's shell-focus drain moves the cursor one GUI hop downstream, so a capture fed there reads the last
-  consumed position (one report late); the focused-app drain is exact.
+* The Pi's shell-drain release reads the cursor as `render_service` last left it (the press's own rule there).
 * The ghost on aarch64 (the overlay row is x86 `wc` only); a per-window (not per-program) declaration; text drags.

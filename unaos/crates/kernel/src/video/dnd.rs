@@ -560,11 +560,8 @@ fn ring3_deliver(owner: u64, paths: &[String]) -> bool {
     let ev = una_abi::input_ev_pack(una_abi::INPUT_EV_DROP, una_abi::drop_ev_payload(token, n));
     #[cfg(target_arch = "x86_64")]
     let pushed = crate::arch::x86_64::syscall::user_input_push_owner(owner, ev);
-    #[cfg(not(target_arch = "x86_64"))]
-    let pushed = {
-        let _ = ev;
-        false // aarch64: no capture feeds a drag there yet, and DROP_GET has no arm (owed)
-    };
+    #[cfg(target_arch = "aarch64")]
+    let pushed = crate::arch::aarch64::syscall::user_input_push_owner(owner, ev); // DROPTYPES (B477): the Pi's ring, by owner (= asid)
     serial_println!("[dnd] ring3 owner={} token={} n={} pushed={} types=declared", owner, token, n, pushed as u8);
     pushed
 }
@@ -606,11 +603,8 @@ static GHOST_REFUSED: AtomicBool = AtomicBool::new(false);
 fn ring3_live(owner: u64) -> bool {
     #[cfg(target_arch = "x86_64")]
     return crate::arch::x86_64::syscall::ring3_owner_live(owner);
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = owner;
-        false
-    }
+    #[cfg(target_arch = "aarch64")]
+    return crate::arch::aarch64::syscall::ring3_owner_live(owner);
 }
 
 /// The drop types `owner`'s program declares: its armed name → the APPRES key → the registrant's `droptypes`.
