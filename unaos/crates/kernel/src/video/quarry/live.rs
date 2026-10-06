@@ -712,6 +712,7 @@ fn kind_token(mime: &str) -> &'static str {
         ft::IMAGE_BMP => "bmp", // OPENERS (B379)
         ft::IMAGE_WEBP => "webp", // OPENERS (B379)
         ft::IMAGE_QOI => "qoi", // OPENERS (B379)
+        ft::IMAGE_SVG => "svg", // SMALLFIX2 (B391)
         m if m.starts_with("audio/") => "audio", // OPENERS (B379)
         m if m.starts_with("video/") => "video", // OPENERS (B379)
         m if m.starts_with("text/") => "text",
