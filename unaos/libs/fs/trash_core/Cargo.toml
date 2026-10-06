@@ -1,0 +1,13 @@
+[package]
+name = "trash_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "The Trash core: what a trashed object is and the trash/restore/empty rules, shared by Ring 0 (fs/trash.rs) and Matrix's VaultTrash."
+
+# TRASHCORE (rmbp-ledger B449, ARCHREVIEW F5, R79): the midden_core/prefs_core shape — `#![no_std]` +
+# `alloc`, `#![forbid(unsafe_code)]`, a member of the ROOT host workspace (Matrix links it, the host tests
+# run here) and a path dep of the kernel. Its only dependency is `una-abi` (zero deps, const-only): the
+# `una:trash-*` key literals stay declared ONCE there and are re-exported here.
+[dependencies]
+una-abi = { path = "../../../crates/una-abi" }
