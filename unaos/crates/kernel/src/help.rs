@@ -217,7 +217,7 @@ pub fn intercept(line: &str, console: &mut Console) -> bool {
     let first = first.to_ascii_lowercase();
     let a1 = it.next();
     match first.as_str() {
-        "help" => { match a1 { None => list(console), Some(w) => help_one(console, w) } true }
+        "help" => { match a1 { None => list(console), Some(w) => { help_one(console, w); if w == "tests" { crate::tests::shell_verb(&["list"], console); } } } true } // SMALLFIX3 (B416): `help tests` lists every registered fixture with its arc
         "man" => { match a1 { None => console.println("usage: man <verb>   (open its help in a window)"), Some(w) => man_one(console, w) } true }
         "echo" => false,
         _ if a1 == Some("--help") && it.next().is_none() && find(&first).is_some() => { help_one(console, &first); true }

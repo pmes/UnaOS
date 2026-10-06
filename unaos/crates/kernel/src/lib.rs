@@ -307,3 +307,6 @@ pub mod procslot;
 
 // STACKGUARD2 (rmbp-ledger B403): the holder registry a stack-overflowed task's locks are released from. Tail statement, so no existing line moves.
 pub mod lockowner;
+
+// SMALLFIX3 (rmbp-ledger B416): the fold's unique-code checks, the fixture arcs for `tests list` / `help tests`, `tests smallfix3`. Tail statement.
+pub mod smallfix3;
