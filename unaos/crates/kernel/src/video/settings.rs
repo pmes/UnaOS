@@ -1117,6 +1117,7 @@ pub fn selftest_users() {
 pub fn selftest_all() {
     selftest();
     selftest_users();
+    selftest_prefsui();
 }
 
 // ── BRIGHTFLOOR (B312): the floor, the load clamp, safe mode ───────────────────────────────────
@@ -1642,4 +1643,18 @@ fn mode_at_login() {
     if let Some(i) = prefs_core::modes::index_of(&ms, &v) {
         if ms[i].s2 != super::dpi::s2() { apply_mode(i, "login", false); }
     }
+}
+
+/// PREFSUI (B389) — the `tests settings` leg: a drag through the capture seam, a login-items round trip, the
+/// Resolution dropdown's entries. `:: PREFSUI: slider_drag=<ok|no|no-window> login_items=<n> modes=<n> -> PASS ::`.
+#[cfg(feature = "witness")]
+pub fn selftest_prefsui() {
+    let drag = drag_selftest();
+    let li = super::loginitems::selftest();
+    let modes = display_modes().len();
+    let ok = drag == "ok" && li.is_some() && modes >= 1;
+    serial_println!(
+        ":: PREFSUI: slider_drag={} login_items={} modes={} -> {} ::",
+        drag, li.map(|n| n as i64).unwrap_or(-1), modes, if ok { "PASS" } else { "FAIL" }
+    );
 }
