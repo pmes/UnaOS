@@ -76,9 +76,11 @@ pub enum Writer {
     Keys,
     /// The kernel `wallpaper <path>|off` verb.
     WallpaperVerb,
-    /// The operator: the kernel `pref set` verb, a session program's PREF_SET / host `PrefSet`, a hand
-    /// edit of the file.
+    /// The operator: the kernel `pref set` verb, host `PrefSet`, a hand edit of the file.
     Operator,
+    /// PREFSCAP (B454): ANY session program over the bus (ring-3 `PREF_SET`) — the schema's `ring 3`
+    /// column ([`crate::cap::settable`]). A row without it is NOT settable from ring 3 (the default).
+    Program,
 }
 
 impl Writer {
@@ -89,6 +91,7 @@ impl Writer {
             Writer::Keys => "keys",
             Writer::WallpaperVerb => "wallpaper-verb",
             Writer::Operator => "operator",
+            Writer::Program => "program",
         }
     }
 }
@@ -129,17 +132,17 @@ pub static SCHEMA: &[Key] = &[
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     Key {
         ns: "system", key: "appearance.accent", kind: Kind::Enum(&crate::appearance::ACCENTS), default: Default::Str("crispy"),
-        writers: &[Writer::Settings], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
         doc: "The accent colour on the default button, the selection, the focused control's ring, the slider knob and the menu highlight (APPEARANCE B408; eight names, ours).",
     },
     Key {
         ns: "system", key: "appearance.highlight", kind: Kind::Enum(&crate::appearance::HIGHLIGHTS), default: Default::Str("accent"),
-        writers: &[Writer::Settings], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
         doc: "The text-selection colour: `accent` follows the accent, or one of the eight accent names (APPEARANCE B408).",
     },
     Key {
         ns: "system", key: "appearance.mode", kind: Kind::Enum(&crate::appearance::MODES), default: Default::Str("light"),
-        writers: &[Writer::Settings], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
         doc: "Light or Dark appearance; `auto` is dark 19:00-07:00 by the local clock (the RTC until NETCLOCK gives a real time) (APPEARANCE B408).",
     },
     Key {
@@ -150,29 +153,29 @@ pub static SCHEMA: &[Key] = &[
     },
     Key {
         ns: "system", key: "audio.mute", kind: Kind::Bool, default: Default::Bool(false),
-        writers: &[Writer::Settings, Writer::Keys], reader: "kernel settings (audio)",
+        writers: &[Writer::Settings, Writer::Keys, Writer::Program], reader: "kernel settings (audio)",
         doc: "Output muted.",
     },
     Key {
         ns: "system", key: "audio.volume", kind: Kind::Int { min: 0, max: 16 }, default: Default::Int(12),
-        writers: &[Writer::Settings, Writer::Keys], reader: "kernel settings (audio)",
+        writers: &[Writer::Settings, Writer::Keys, Writer::Program], reader: "kernel settings (audio)",
         doc: "Output level in sixteenths.",
     },
     Key {
         ns: "system", key: "display.brightness",
         kind: Kind::Int { min: crate::display::BRIGHTNESS_MIN, max: crate::display::BRIGHTNESS_MAX },
         default: Default::Int(crate::display::BRIGHTNESS_DEFAULT),
-        writers: &[Writer::Settings, Writer::Keys], reader: "kernel settings, backlight",
+        writers: &[Writer::Settings, Writer::Keys, Writer::Program], reader: "kernel settings, backlight",
         doc: "Panel level in sixteenths; never 0 (BRIGHTFLOOR: the backlight's OFF belongs to the idle blank).",
     },
     Key {
         ns: "system", key: "display.font", kind: Kind::Enum(&["sans", "serif", "mono"]), default: Default::Str("sans"),
-        writers: OP, reader: "kernel `video::text` (KERNELFONT)",
+        writers: &[Writer::Program], reader: "kernel `video::text` (KERNELFONT)",
         doc: "The UI typeface family for captions, menus and running text: DejaVu Sans, Serif or Sans Mono (KERNELFONT B359; the console grid is always mono).",
     },
     Key {
         ns: "system", key: "display.font_size", kind: Kind::Int { min: 9, max: 32 }, default: Default::Int(13),
-        writers: OP, reader: "kernel `video::text` (KERNELFONT)",
+        writers: &[Writer::Program], reader: "kernel `video::text` (KERNELFONT)",
         doc: "UI text size in CSS px; device px = size x the panel's ppi (EDID) / 96, capped by the 16 px text cell; captions keep the bar-derived size.",
     },
     Key {
@@ -195,7 +198,7 @@ pub static SCHEMA: &[Key] = &[
     },
     Key {
         ns: "system", key: "dock.autohide", kind: Kind::Bool, default: Default::Bool(false),
-        writers: &[Writer::Settings, Writer::Dock], reader: "kernel dock",
+        writers: &[Writer::Settings, Writer::Dock, Writer::Program], reader: "kernel dock",
         doc: "Hide the dock until the pointer reaches its edge (DOCK2). Edited in Settings > General > Auto-hide dock.",
     },
     Key {
@@ -206,7 +209,7 @@ pub static SCHEMA: &[Key] = &[
     },
     Key {
         ns: "system", key: "dock.position", kind: Kind::Enum(&["bottom", "left", "right"]), default: Default::Str("bottom"),
-        writers: &[Writer::Settings, Writer::Dock], reader: "kernel dock",
+        writers: &[Writer::Settings, Writer::Dock, Writer::Program], reader: "kernel dock",
         doc: "The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock.",
     },
     Key {
@@ -217,12 +220,12 @@ pub static SCHEMA: &[Key] = &[
     },
     Key {
         ns: "system", key: "notify.dnd", kind: Kind::Bool, default: Default::Bool(false),
-        writers: &[Writer::Settings], reader: "kernel NOTIFY (`video/notify.rs`)",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel NOTIFY (`video/notify.rs`)",
         doc: "Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows) (NOTIFY, MACPARITY row 24). Edited in Settings > General > Do Not Disturb.",
     },
     Key {
         ns: "system", key: "pointer.speed", kind: Kind::Int { min: 0, max: 2 }, default: Default::Int(1),
-        writers: &[Writer::Settings], reader: "kernel settings (pointer)",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel settings (pointer)",
         doc: "0 slow, 1 normal, 2 fast. Legacy (R75): read only while `system.trackpad.speed` is unset (TRACKPADPANE).",
     },
     Key {
@@ -233,33 +236,33 @@ pub static SCHEMA: &[Key] = &[
     },
     Key {
         ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 6 }, default: Default::Int(0),
-        writers: &[Writer::Settings], reader: "kernel settings",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel settings",
         doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad).",
     },
     // ── TRACKPADPANE (B412, MACPARITY row 16): the Trackpad pane; the rules are `crate::trackpad` ──────────────
     Key {
         ns: "system", key: "trackpad.natural_scroll", kind: Kind::Bool, default: Default::Bool(true),
-        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
         doc: "Two-finger scrolling moves the content with the fingers (on) or the other way (off). Edited in Settings > Trackpad.",
     },
     Key {
         ns: "system", key: "trackpad.secondary_click", kind: Kind::Enum(&["two-finger", "off"]), default: Default::Str("two-finger"),
-        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
         doc: "A click (or, with tap to click, a tap) made with two fingers down is a secondary click. Edited in Settings > Trackpad.",
     },
     Key {
         ns: "system", key: "trackpad.speed", kind: Kind::Int { min: 1, max: 10 }, default: Default::Int(5),
-        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
         doc: "Tracking speed: one gain on the TPSPEED curve (5 = the curve as flown, x0.25 at 1 .. x2.5 at 10); the curve's shape never changes. Unset, a stored `system.pointer.speed` maps to 4/5/7. Edited in Settings > Trackpad.",
     },
     Key {
         ns: "system", key: "trackpad.tap_to_click", kind: Kind::Bool, default: Default::Bool(false),
-        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
         doc: "A short touch with no travel and no press is a click. Edited in Settings > Trackpad.",
     },
     Key {
         ns: "system", key: "trackpad.three_finger_drag", kind: Kind::Bool, default: Default::Bool(false),
-        writers: &[Writer::Settings], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
         doc: "Three fingers down hold the primary button and move the pointer (a drag without a press). Edited in Settings > Trackpad.",
     },
     // ── vein — the conversation handler's provider slot (VEINPROV B303, EMBED B317, R81) ───────────────
@@ -585,10 +588,13 @@ pub fn render_markdown() -> String {
     o.push_str("its range is CLAMPED and answered `clamped=true`; a wrong type, a string outside its enum, an over-long\n");
     o.push_str("or unprintable string is REFUSED. Undeclared keys pass unchanged (every app keeps its own namespace).\n");
     o.push_str("Defaults are answered by the schema; the store never holds one. Every key may also be written by the\n");
-    o.push_str("operator (`pref set`, a session PREF_SET / host `PrefSet`, a hand edit).\n\n");
+    o.push_str("operator (`pref set`, host `PrefSet`, a hand edit).\n\n");
+    o.push_str("PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`, the namespace named\n");
+    o.push_str("after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable\n");
+    o.push_str("from ring 3 (`prefs_core::cap`).\n\n");
     let _ = write!(o, "Rows: {}.\n\n", SCHEMA.len());
-    o.push_str("| key | type | default | writers | reader | meaning |\n");
-    o.push_str("| :-- | :-- | :-- | :-- | :-- | :-- |\n");
+    o.push_str("| key | type | default | writers | ring 3 | reader | meaning |\n");
+    o.push_str("| :-- | :-- | :-- | :-- | :-- | :-- | :-- |\n");
     for k in SCHEMA {
         let _ = write!(o, "| `{}.{}` | ", k.ns, k.key);
         kind_text(&k.kind, &mut o);
@@ -605,7 +611,8 @@ pub fn render_markdown() -> String {
                 o.push_str(w.name());
             }
         }
-        let _ = write!(o, " | {} | {} |\n", k.reader, k.doc);
+        let r3 = if k.writers.contains(&Writer::Program) { "yes" } else { "—" };
+        let _ = write!(o, " | {} | {} | {} |\n", r3, k.reader, k.doc);
     }
     o.push_str("\n## Rules (derived defaults)\n\n");
     for r in Rule::ALL {

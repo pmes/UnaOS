@@ -39,6 +39,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod cap; // PREFSCAP (B454): who may write what
 pub mod declare;
 pub mod files;
 pub mod appearance;
