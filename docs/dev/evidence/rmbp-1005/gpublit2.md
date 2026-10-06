@@ -81,3 +81,4 @@ module is `cfg(target_arch = "x86_64")`, untouched there.
   dump prints both words so the next fix is chosen from the metal, not guessed.
 - The host semaphore OPERATION `0x1002` sets ACQUIRE_SWITCH (bit 12, meaningless on a release);
   RELEASE_SIZE is 16-byte (payload at +0). Correct as is; left.
+- GPUBLIT3 (B410) continues this ladder: `gpublit3.md` (the bind wall SNOOP_WITHOUT_BAR1 read from flight 24/25's `err=00000002`).
