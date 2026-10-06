@@ -541,8 +541,10 @@ pub fn blit_path_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: usiz
     .is_some()
 }
 
-/// **About <app>** — the app's name, version and signature on the wire and in a notice.
-pub fn about(win_name: &[u8]) {
+/// **About <app>** — the FACTS only: `(name, version, signature)` for a window's app, with the
+/// `[appres] about` witness. SMALLFIX4 (ARCHREVIEW F14): the registrar is fs-core and answers facts;
+/// the About box itself is raised by `video::winmenu::about_box`, the app menu's own file.
+pub fn about(win_name: &[u8]) -> (String, String, String) {
     let key = key_of_title(win_name).unwrap_or_else(|| String::from(core::str::from_utf8(win_name).unwrap_or("")).to_ascii_lowercase());
     let a = app(&key);
     let (name, version, sig) = match &a {
@@ -551,12 +553,7 @@ pub fn about(win_name: &[u8]) {
     };
     serial_println!("[appres] about app={} name={} version={} signature={} res={}", key, name, version, sig,
         if a.as_ref().map(|a| a.has_res).unwrap_or(false) { "yes" } else { "no" });
-    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-    {
-        let title = alloc::format!("About {}", name);
-        let text = alloc::format!("Version {}\n{}", version, sig);
-        let _ = crate::video::dialog::notice(title.as_bytes(), text.as_bytes()); // DIALOG2 (B404): THE router; notice_show retired
-    }
+    (name, version, sig)
 }
 
 /// `tests appres` registration, once (rides `filetype::ensure_tests`).

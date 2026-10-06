@@ -11,7 +11,7 @@
 //! and refreshes the listing. Pure op bodies take paths only (no UI), so the `quarryops` fixture drives
 //! exactly what the menu drives.
 //!
-//! Lock discipline: UI state (MENU/EDIT/CLIP) are leaf locks; the op bodies run with NO Quarry lock
+//! Lock discipline: UI state (MENU/EDIT) are leaf locks (the copied path is on video/clipboard.rs, SMALLFIX4 F13); the op bodies run with NO Quarry lock
 //! held; the refresh re-takes `MODEL` afterwards.
 
 use super::*;
@@ -296,7 +296,6 @@ struct Edit {
     target: Target,
 }
 static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
-static CLIP: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
 
 fn menu_w(g: &Geom) -> usize {
     22 * g.cell_w() + 2 * PAD()
@@ -637,16 +636,19 @@ fn do_copy() {
     let r = ns_check(&path, true);
     log_op("copy", &path, "clipboard", &r);
     match r {
-        Ok(()) => {
-            *CLIP.lock() = Some(path.clone());
+        Ok(()) if crate::video::clipboard::set_file_ref(&path) => { // SMALLFIX4 (F13): the ONE clipboard, typed file-ref
             say(alloc::format!("copied {}", leaf(&path)));
+        }
+        Ok(()) => {
+            log_op("copy", &path, "clipboard", &Err(String::from("clipboard-refused")));
+            say(String::from("copy refused (clipboard)"));
         }
         Err(why) => refuse_notice(&why),
     }
 }
 
 fn do_paste() {
-    let Some(src) = CLIP.lock().clone() else {
+    let Some(src) = crate::video::clipboard::get_file_ref() else { // SMALLFIX4 (F13)
         log_op("paste", "-", "-", &Err(String::from("clipboard-empty")));
         say(String::from("nothing to paste"));
         return;

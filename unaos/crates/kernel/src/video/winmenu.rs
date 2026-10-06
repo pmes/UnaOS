@@ -1633,7 +1633,7 @@ fn app_pick(win: wm::WinId, id: u32) {
                 "[winmenu] app-menu about win={} name={}",
                 win,
                 core::str::from_utf8(&name[..len]).unwrap_or("?")
-            ); crate::fs::appres::about(&name[..len]); // APPRES (B398): name, version, signature — on the wire and in a notice
+            ); about_box(&name[..len]); // SMALLFIX4 (F14): the box is raised here, appres answers facts. APPRES (B398): name, version, signature — on the wire and in a notice
         }
         APP_ITEM_SHORTCUTS => {
             let opened = super::shortcuts::open();
@@ -3041,4 +3041,20 @@ pub fn wl_row_center(id: u32) -> Option<(i32, i32)> {
     let items = super::winlist::rows();
     let i = items.iter().position(|it| it.id == id)?;
     Some(((mx + mw / 2) as i32, (my + item_top(items, i) + ITEM_H() / 2) as i32))
+}
+
+/// **About <app>** — SMALLFIX4 (ARCHREVIEW F14): the About box belongs to the app menu, not to the
+/// registrar. `fs::appres::about` answers the facts (and prints `[appres] about`); this raises the
+/// notice through DIALOG2's one router and says so: `[winmenu] about-box name=<n> shown=<0|1>`.
+fn about_box(win_name: &[u8]) {
+    let (name, version, sig) = crate::fs::appres::about(win_name);
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        let title = alloc::format!("About {}", name);
+        let text = alloc::format!("Version {}\n{}", version, sig);
+        let shown = crate::video::dialog::notice(title.as_bytes(), text.as_bytes());
+        serial_println!("[winmenu] about-box name={} shown={}", name, shown as u8);
+    }
+    #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    let _ = (name, version, sig);
 }
