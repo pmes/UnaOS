@@ -25413,7 +25413,7 @@ fn dock_tiles(rows: &[Window]) -> usize {
     // scan the pins actually run against admit the same rows (a `compat` row is in neither).
     super::dock::pins_applied(n, |o| {
         rows.iter().any(|r| dock_addressable(r) && r.owner_asid == o)
-    })
+    }) + super::dock::thumb_copies_of(rows.iter().filter(|r| dock_addressable(r) && !above_shell(r, SHELL_Z.load(core::sync::atomic::Ordering::Acquire))).map(|r| r.owner_asid)) // DOCK2 M6: a minimised pinned app's thumbnail copy
 }
 
 // ---- CTRLWIT fixture ---------------------------------------------------------------------------

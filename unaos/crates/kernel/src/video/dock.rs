@@ -703,7 +703,7 @@ pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     // and it wants the COUNT and nothing else — so it asks for the count rather than assembling the
     // pinned model. `pins_applied` is the ONE definition of that arithmetic: the same four pins, in
     // the same order, under the same per-pin `n < MAX_WINDOWS` cap `compose`'s chain applies.
-    let n = pins_applied(n, |o| tiles[..n].iter().any(|r| r.owner_asid == o));
+    let n = pins_applied(n, |o| tiles[..n].iter().any(|r| r.owner_asid == o)) + thumb_copies_of(tiles[..n].iter().filter(|r| row_running(r) && !r.visible).map(|r| r.owner_asid)); // DOCK2 M6: the thumbnail copies
     Layout::for_glass(n, pw, ph).map(|l| l.rect())
 }
 
@@ -1113,6 +1113,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     if l.is_overflow(t) { return overflow_press(x, y, t, &rows[t..n]); } // WINDOWCAP-2 (R90): the `+<k>` group lists the rest
     let r = rows[t]; crate::video::lag::launch_routed(); // GLASSLAG M1 (B370): a tile press is a launch, an open request or a raise.
     if r.id == TRASH_PIN_ID { return trash_press(x, y, t, n); } // DOCK2 (B394): the Trash opens in Quarry
+    if pin_press_defer(&r, x, y) { return true; } // DOCK2 M6: a pin launches on RELEASE (a moved press is a drag)
     reorder_arm(&r); launch_arm(&r); // DOCK2: an app-band tile can be dragged to a new place; a pin press starts the launch pulse
     // APPPIN — a PIN tile names no row: nothing to raise, nothing to focus yet. POST a launch for the
     // app it names and consume the press; the body that owns that app's instance drains the post on
@@ -1252,6 +1253,7 @@ pub fn rollup(scope: &str) {
 /// `wm::hittest_selftest` states at its own call site.
 #[cfg(feature = "witness")]
 pub fn selftest() {
+    let _imm = Immediate::on(); // DOCK2 M6: a fixture's pin press launches at once (no release follows)
     use core::sync::atomic::AtomicBool as OnceBool;
     static DONE: OnceBool = OnceBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
@@ -1722,6 +1724,7 @@ pub fn app_quits(app: PinnedApp) -> u64 {
 /// ```
 #[cfg(feature = "witness")]
 pub fn apppin_selftest() {
+    let _imm = Immediate::on(); // DOCK2 M6: a fixture's pin press launches at once (no release follows)
     use core::sync::atomic::AtomicBool as OnceBool;
     static DONE: OnceBool = OnceBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
@@ -3002,7 +3005,7 @@ fn menu_geo(l: &Layout, rows: &[wm::DockEntry], dims: Option<(usize, usize)>) ->
     if t >= rows.len() || rows[t].owner_asid != owner { MENU_OPEN.store(false, Ordering::Release); return None; }
     let (tx, ty, _, _) = l.tile(t)?;
     let mw = (18 * CELL_W() + 2 * PAD()).min(if l.vert { MAX_STRIP_W } else { l.w }); // PREFSUI: `[x] Open at Login` is the widest row
-    let nrows = MENU_ITEMS + menu_win_rows(owner); // WINDOWLIST M3 — one extra row per window when the app has more than one
+    let nrows = if owner == TRASH_OWNER { 1 } else { MENU_ITEMS + menu_win_rows(owner) }; // WINDOWLIST M3; DOCK2 M6 the Trash's one item — one extra row per window when the app has more than one
     let mh = nrows * TILE_H();
     let band = if l.vert { 0 } else { mh + PAD() }; // DOCK2: a side dock's menu stands BESIDE the tile, as its own rect
     if l.y < band { return None; }
@@ -3037,7 +3040,7 @@ fn menu_box(out: &mut [u32], ow: usize, bx: usize, g: MenuGeo, j: usize) {
         out[bx + i] = if edge_row || i == 0 || i + 1 == g.mw { theme::FRAME_LINE } else { face };
     }
     let mut wbuf = [0u8; wm::MAX_TITLE];
-    let label: &[u8] = if row < MENU_ITEMS { menu_label(row, g.keep, open_at_login(g.owner)) } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3; DOCK2 the six items
+    let label: &[u8] = if g.owner == TRASH_OWNER { b"Empty Trash..." } else if row < MENU_ITEMS { menu_label(row, g.keep, open_at_login(g.owner)) } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3; DOCK2 the six items
     if sy0 >= 0 { super::text::draw_row(out, ow, label, bx + PAD(), sy0 as usize, ink, false, FACE); }
 }
 
@@ -3063,6 +3066,7 @@ pub fn right_press_at(x: i32, y: i32) -> bool {
     let mut rows = ModelBuf::take();
     let Some((_, l)) = router_model(&mut rows) else { return false };
     let Some(t) = l.tile_at(x as usize, y as usize) else { return false };
+    if rows[t].id == TRASH_PIN_ID { menu_open_at(t, TRASH_OWNER); return true; } // DOCK2 M6: the Trash's own menu (Empty Trash…)
     if !row_running(&rows[t]) && pin_word(rows[t].id).is_none() { return false; } // DOCKPIN — a closed PIN tile opens the menu too, so a default tile can be removed without opening its app first.
     menu_open_at(t, rows[t].owner_asid);
     true
@@ -3096,6 +3100,7 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     if px < mx || px >= mx + mw || py < my || py >= my + mh { return false; }
     let owner = MENU_OWNER.load(Ordering::Relaxed);
     let prow = (py - my) / TILE_H();
+    if owner == TRASH_OWNER { empty_trash_ask(); return true; } // DOCK2 M6
     if prow >= MENU_ITEMS { // WINDOWLIST M3 — a per-window row raises and focuses that window
         let mut wb = [0u8; wm::MAX_TITLE];
         let (win, _) = menu_win_row(owner, prow - MENU_ITEMS, &mut wb);
@@ -3401,13 +3406,14 @@ fn dp_witness(why: &str) {
     // `shown < pinned` only legitimately happens when the strip is full (n == MAX_WINDOWS).
     let ok = saved >= 0 && shown == pinned; // WINDOWCAP-2: no full strip — a pin is always in the model
     serial_println!("[dock] dockpin {}", why);
-    serial_println!(":: DOCKPIN: tiles={} pinned={} running={} loaded={} saved={} -> {} ::", n, pinned, running, DP_LOADED.load(Ordering::Relaxed), saved, if ok { "PASS" } else { "FAIL" });
+    let (left, minz) = (rows[..n].iter().filter(|r| dock2_group(r) == 0).count(), rows[..n].iter().filter(|r| dock2_group(r) == 1).count());
+    serial_println!(":: DOCKPIN: left={} minimized={} pinned={} running={} loaded={} saved={} -> {} ::", left, minz, pinned, running, DP_LOADED.load(Ordering::Relaxed), saved, if ok { "PASS" } else { "FAIL" });
 }
 
 /// The service pass (called from `desktop_app_service`, never from a click path): drain an owed load
 /// and an owed save, each followed by the witness line.
 pub fn dockpin_service() {
-    dock2_store_service(); // DOCK2 (B394): the Trash's state, the Quarry opens, the edge/auto-hide save
+    empty_trash_service(); dock2_store_service(); // DOCK2 (B394): the Trash's state, the Quarry opens, the edge/auto-hide save
     if DP_LOAD_OWED.swap(false, Ordering::AcqRel) {
         dock2_load(); // DOCK2: `system.dock.position` / `system.dock.autohide`, with the pins
         let c = dp_load();
@@ -3429,6 +3435,7 @@ pub fn dockpin_service() {
 /// `tests dockpin` — pin, save, re-read, unpin; pure parse legs plus the real round trip through Principia's store.
 #[cfg(feature = "witness")]
 pub fn dockpin_selftest() {
+    let _imm = Immediate::on(); // DOCK2 M6: a fixture's pin press launches at once (no release follows)
     let saved_mask = DP_MASK.load(Ordering::Relaxed);
     // Leg 1 — pure: render/parse round trip, unknown names ignored, duplicates folded.
     let (m, c) = dp_parse(b"shell,bogus,editor,shell");
@@ -3462,8 +3469,8 @@ pub fn dockpin_selftest() {
     let _ = dp_write(saved_mask);
     DP_MASK.store(saved_mask, Ordering::Release);
     let ok = parse_ok && toggle_ok && file_ok;
-    serial_println!(":: DOCKPIN: tiles={} pinned={} running={} loaded={} saved={} fixture parse={} toggle={} file={} -> {} ::",
-        DP_PINS.len(), DP_ALL.count_ones(), 0, want.count_ones(), bytes, parse_ok as u8, toggle_ok as u8, if skip { "skip" } else if file_ok { "ok" } else { "no" }, if ok { "PASS" } else { "FAIL" });
+    serial_println!(":: DOCKPIN: left={} minimized={} pinned={} running={} loaded={} saved={} fixture parse={} toggle={} file={} -> {} ::",
+        DP_PINS.len(), 0, DP_ALL.count_ones(), 0, want.count_ones(), bytes, parse_ok as u8, toggle_ok as u8, if skip { "skip" } else if file_ok { "ok" } else { "no" }, if ok { "PASS" } else { "FAIL" });
 }
 
 // WINDOWLIST M3 (R75) — TAIL-APPENDED. The running tile's menu lists the app's windows (one row each) when it has more than one.
@@ -3790,11 +3797,12 @@ pub fn set_autohide(on: bool, save: bool) {
 
 /// The sort group of a model row: 0 the left group, 1 a minimised window, 2 the Trash.
 fn dock2_group(r: &wm::DockEntry) -> u8 {
-    if r.id == TRASH_PIN_ID { 2 } else if row_running(r) && !r.visible { 1 } else { 0 }
+    if r.id == TRASH_PIN_ID { 2 } else if r.stamp == THUMB_COPY || (row_running(r) && !r.visible && !pinned_app(r.owner_asid)) { 1 } else { 0 }
 }
 
 /// The Trash tile, appended at the chain's tail (the sort puts it last).
 fn pin_trash(rows: &mut Model, n: usize) -> usize {
+    let n = pin_thumb_copies(rows, n); // DOCK2 M6: a minimised PINNED app keeps its left tile; its window is ALSO a thumbnail on the right
     let mut e = wm::DockEntry::empty();
     e.id = TRASH_PIN_ID;
     e.owner_asid = TRASH_OWNER;
@@ -3901,6 +3909,12 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
         let Some((tx, ty, tw, th)) = l.tile(t) else { continue };
         let (bx, by) = (tx - l.x, ty - l.y);
         let pip_band = j >= by + th && j < by + th + PAD();
+        if pip_band && row_running(r) && !r.visible && dock2_group(r) == 0 { // DOCK2 M6: a minimised pinned app is still RUNNING
+            let d = IND_D();
+            let (px0, py0) = (bx + tw / 2 - d / 2, by + th + (PAD() - d) / 2);
+            for i in px0..(px0 + d).min(l.w) { if strip::in_disc(i, j, px0, py0, d) { out[i] = theme::ACCENT; } }
+            continue;
+        }
         if pip_band && (r.id == TRASH_PIN_ID || (pend != wm::WIN_NONE && r.id == pend)) {
             let d = IND_D();
             let (px0, py0) = (bx + tw / 2 - d / 2, by + th + (PAD() - d) / 2);
@@ -4154,7 +4168,7 @@ fn tile_extra(r: &wm::DockEntry) -> Option<usize> {
 
 /// A press on an app-band tile captures the pointer for a reorder (x86's drain feeds the capture; see `capture`).
 fn reorder_arm(r: &wm::DockEntry) {
-    if !cfg!(target_arch = "x86_64") { return; } // aarch64 feeds no capture (PREFSUI's owed line)
+    if !cfg!(target_arch = "x86_64") || !row_running(r) { return; } // a PIN's drag is `pin_release`'s // aarch64 feeds no capture (PREFSUI's owed line)
     let Some(i) = tile_extra(r) else { return };
     DRAG_FROM.store(i as u32, Ordering::Release);
     crate::video::capture::begin(|_, _| {}, reorder_release);
@@ -4213,17 +4227,19 @@ pub fn dock2_selftest() {
             let min = rows[..n].iter().filter(|r| dock2_group(r) == 1).count();
             let mut px = [0u32; 16];
             let thumb = wm::thumb(win, &mut px, 4, 4) && px.iter().all(|&p| p == 0x0040_A060);
-            let t = rows[..n].iter().position(|r| r.id == win);
+            let t = rows[..n].iter().position(|r| r.id == win && dock2_group(r) == 1);
+            let left_kept = !pinned_app(owner) || rows[..n].iter().any(|r| r.id == win && dock2_group(r) == 0);
             let mut raised = false;
             if let (Some(t), Some(s)) = (t, sep) {
                 if t >= s {
                     if let Some((tx, ty, tw, th)) = l.tile(t) { raised = press_at((tx + tw / 2) as i32, (ty + th / 2) as i32) && wm::info(win).map(|i| i.z > wm::shell_z()).unwrap_or(false); lp_release(); crate::video::capture::cancel(); DRAG_FROM.store(u32::MAX, Ordering::Release); }
                 }
             }
-            (sep.is_some(), trash, min, thumb, raised)
+            (sep.is_some(), trash && left_kept && menu_label_trash_ok(), min, thumb, raised)
         }
         None => (false, false, 0, false, false),
     };
+    let left = rows.iter().filter(|r| dock2_group(r) == 0).count();
     // The menu: six items, the Quit row last.
     let items = (0..MENU_ITEMS).map(|r| menu_label(r, false, false)).filter(|s| !s.is_empty()).count();
     let menu_ok = items == 6 && menu_label(MENU_QUIT, false, false) == b"Quit";
@@ -4238,6 +4254,132 @@ pub fn dock2_selftest() {
     set_position(pos0, false); set_autohide(ah0, false); focus_set(focus0);
     let ok = sep && trash && min >= 1 && thumb && raised && launch_ok && menu_ok && vert_ok && hide_ok && matches!(parked, "parked" | "parked-visible");
     serial_println!("[dock] dock2 legs park={} thumb={} raise={} launch_ms={} vert={} hide={}", parked, thumb as u8, raised as u8, LAUNCH_LAST.load(Ordering::Relaxed), vert_ok as u8, hide_ok as u8);
-    serial_println!(":: DOCK2: separator={} trash={} minimized={} launch_indicator={} menu_items={} position={} autohide={} -> {} ::",
-        sep as u8, trash as u8, min, if launch_ok { "ok" } else { "no" }, if menu_ok { items } else { 0 }, position_word(), autohide() as u8, if ok { "PASS" } else { "FAIL" });
+    serial_println!(":: DOCK2: left={} separator={} trash={} minimized={} launch_indicator={} menu_items={} position={} autohide={} -> {} ::",
+        left, sep as u8, trash as u8, min, if launch_ok { "ok" } else { "no" }, if menu_ok { items } else { 0 }, position_word(), autohide() as u8, if ok { "PASS" } else { "FAIL" });
+}
+
+// ── DOCK2 M6 (seat's answers): the Mac shape for a minimised pinned app, pins launch on RELEASE, Empty Trash… ──────
+//
+// * A minimised window of a PINNED app keeps the app's left tile (running pip) and adds a THUMBNAIL COPY of the
+//   window in the right group (`stamp == THUMB_COPY`); an unpinned app's minimised window is only the thumbnail.
+//   The copies are counted for the two count-only readers by [`thumb_copies_of`] (`wm::dock_tiles`, `strip_rect`).
+// * A press on a pin tile CAPTURES and launches nothing; the release launches (the pulse starts then) unless the
+//   pointer moved past [`PIN_DRAG_PX`] — a drag, which reorders the app band when it ends on another app tile.
+// * The Trash tile's right-click menu: one item, Empty Trash…, through DIALOG's confirm; the empty runs on the
+//   service pass. `[dock] menu empty-trash answer=<ok|cancel> removed=<n>`.
+
+/// The `stamp` that marks a model row as a thumbnail COPY (real stamps are allocation ordinals, never this).
+const THUMB_COPY: u64 = u64::MAX;
+
+/// Is `owner` a pinned app of the dock's table (it keeps its left tile while minimised)?
+fn pinned_app(owner: u64) -> bool { dp_spec_of_owner(owner).map(dp_is_pinned).unwrap_or(false) }
+
+/// How many thumbnail copies a set of minimised owners adds (one per minimised window of a pinned app). Lock-free.
+pub(super) fn thumb_copies_of(owners: impl Iterator<Item = u64>) -> usize { owners.filter(|&o| pinned_app(o)).count() }
+
+/// Append a thumbnail copy of every minimised pinned-app window.
+fn pin_thumb_copies(rows: &mut Model, n: usize) -> usize {
+    let mut n = n;
+    rows.truncate(n);
+    for k in 0..n {
+        let r = rows[k];
+        if row_running(&r) && !r.visible && r.stamp != THUMB_COPY && pinned_app(r.owner_asid) {
+            let mut c = r;
+            c.stamp = THUMB_COPY;
+            rows.push(c);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// RAII: while held, a pin press launches at once (the fixtures press without a release).
+struct Immediate;
+static IMMEDIATE: AtomicU32 = AtomicU32::new(0);
+impl Immediate { fn on() -> Immediate { IMMEDIATE.fetch_add(1, Ordering::AcqRel); Immediate } }
+impl Drop for Immediate { fn drop(&mut self) { IMMEDIATE.fetch_sub(1, Ordering::AcqRel); } }
+
+/// Pointer travel (panel px, either axis summed) past which a pin press is a drag.
+#[allow(non_snake_case)] fn PIN_DRAG_PX() -> i32 { (2 * PAD()) as i32 }
+static PIN_X0: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static PIN_Y0: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static PIN_IX: AtomicU32 = AtomicU32::new(u32::MAX);
+static PIN_DRAG: AtomicBool = AtomicBool::new(false);
+static PIN_BYPASS: AtomicBool = AtomicBool::new(false);
+
+/// A press on a closed PIN tile: capture, launch nothing (x86 — aarch64 feeds no capture and keeps launch-on-press).
+fn pin_press_defer(r: &wm::DockEntry, x: i32, y: i32) -> bool {
+    if !cfg!(target_arch = "x86_64") || row_running(r) || PIN_BYPASS.load(Ordering::Acquire) || IMMEDIATE.load(Ordering::Acquire) != 0 { return false; }
+    let Some(i) = (0..DP_PINS.len()).find(|&i| DP_PINS[i].id == r.id) else { return false };
+    PIN_X0.store(x, Ordering::Relaxed); PIN_Y0.store(y, Ordering::Relaxed);
+    PIN_DRAG.store(false, Ordering::Relaxed);
+    PIN_IX.store(i as u32, Ordering::Release);
+    crate::video::capture::begin(pin_motion, pin_release);
+    serial_println!("[dock] press at ({},{}) app={} -> armed (launches on release)", x, y, DP_PINS[i].name);
+    true
+}
+
+fn pin_motion(x: i32, y: i32) {
+    if (x - PIN_X0.load(Ordering::Relaxed)).abs() + (y - PIN_Y0.load(Ordering::Relaxed)).abs() > PIN_DRAG_PX() { PIN_DRAG.store(true, Ordering::Relaxed); }
+}
+
+/// The pin's release: no travel = the launch (the same arm a press used to take, pulse from now); travel = a drag.
+fn pin_release(x: i32, y: i32) {
+    pin_motion(x, y);
+    let i = PIN_IX.swap(u32::MAX, Ordering::AcqRel);
+    if i == u32::MAX { return; }
+    let i = i as usize;
+    if !PIN_DRAG.load(Ordering::Relaxed) {
+        PIN_BYPASS.store(true, Ordering::Release);
+        let _ = press_at(PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed));
+        PIN_BYPASS.store(false, Ordering::Release);
+        return;
+    }
+    let mut to = None;
+    if i >= DP_FIRST_EXTRA && x >= 0 && y >= 0 {
+        let mut rows = ModelBuf::take();
+        if let Some((n, l)) = router_model(&mut rows) {
+            if let Some(t) = l.tile_at(x as usize, y as usize) { if t < n && !l.is_overflow(t) { to = tile_extra(&rows[t]).filter(|&k| k != i); } }
+        }
+    }
+    serial_println!("[dock] pin drag app={} -> {} launch=0", DP_PINS[i].name, if to.is_some() { "reorder" } else { "none" });
+    if let Some(k) = to { reorder(i, k); }
+}
+
+static EMPTY_OWED: AtomicBool = AtomicBool::new(false);
+
+/// The Trash menu's one item: the confirm (DIALOG's alert, Cancel left, Empty Trash the default on the right).
+fn empty_trash_ask() {
+    let mut d = crate::video::dialog::Dlg::new(crate::video::dialog::Icon::Caution, b"Trash", b"Are you sure you want to permanently erase the items in the Trash?", b"You can't undo this action.", &["Cancel", "Empty Trash"]);
+    d.user = true;
+    d.act = crate::video::dialog::Act::Hook(empty_trash_answer as fn(bool) as usize);
+    let posted = crate::video::dialog::post(d);
+    serial_println!("[dock] menu empty-trash asked={}", posted as u8);
+}
+
+/// DIALOG's answer (press/key route): latch the empty for the service pass, or say the cancel.
+fn empty_trash_answer(ok: bool) {
+    if ok { EMPTY_OWED.store(true, Ordering::Release); } else { serial_println!("[dock] menu empty-trash answer=cancel removed=0"); }
+}
+
+/// The service pass's Empty Trash (a directory walk; never in the router). Called from [`dockpin_service`].
+fn empty_trash_service() {
+    if !EMPTY_OWED.swap(false, Ordering::AcqRel) { return; }
+    match crate::fs::trash::empty() {
+        Ok(n) => serial_println!("[dock] menu empty-trash answer=ok removed={}", n),
+        Err(e) => serial_println!("[dock] menu empty-trash answer=ok removed=0 error={}", e),
+    }
+    TRASH_POLLED.store(0, Ordering::Relaxed);
+}
+
+/// The fixture's leg for the Trash menu: one row, the right label.
+fn menu_label_trash_ok() -> bool {
+    MENU_OPEN.load(Ordering::Relaxed) || {
+        MENU_OWNER.store(TRASH_OWNER, Ordering::Relaxed);
+        let mut rows = ModelBuf::take();
+        match router_model(&mut rows) {
+            Some((n, l)) => { MENU_TILE.store((n - 1) as u64, Ordering::Relaxed); MENU_OPEN.store(true, Ordering::Release); let g = menu_geo(&l, &rows[..n], None); MENU_OPEN.store(false, Ordering::Release); g.map(|g| g.rows == 1).unwrap_or(false) }
+            None => false,
+        }
+    }
 }

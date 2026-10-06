@@ -52,6 +52,9 @@ pub enum Act {
     None,
     /// 1 restart, 2 shut down, 3 log out, 9 the fixture's (acts on nothing).
     Power(u8),
+    /// DOCK2 M6 (B394): a caller's `fn(ok: bool)` (as `usize`), run on the answer — the dock's Empty Trash. Keep it
+    /// queue-only: the answer runs in the press/key route.
+    Hook(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -299,7 +302,7 @@ fn open_pending() {
         FOCUS_THEFT.fetch_add(1, Ordering::Relaxed); // unreachable by `should_focus`; counted so a regression reads on the wire
     }
     let _ = deadline;
-    let kind = match d.act { Act::Power(_) => "power", Act::None => "alert" };
+    let kind = match d.act { Act::Power(_) => "power", Act::None | Act::Hook(_) => "alert" };
     let action = power_word(d.act);
     serial_println!(
         "[dialog] open kind={} action={} owner={} sheet={} focus={} countdown_s={} buttons={} default=right win={}",
@@ -313,7 +316,7 @@ fn power_word(a: Act) -> &'static str {
         Act::Power(2) => "shutdown",
         Act::Power(3) => "logout",
         Act::Power(_) => "fixture",
-        Act::None => "-",
+        Act::None | Act::Hook(_) => "-",
     }
 }
 
@@ -343,6 +346,11 @@ pub fn answer(a: Answer) {
         }
         Act::None => {
             serial_println!("[dialog] answer={} button={} title={}", word, d.btn[ix as usize], core::str::from_utf8(d.title).unwrap_or("?"));
+        }
+        Act::Hook(f) => {
+            serial_println!("[dialog] answer={} button={} title={}", word, d.btn[ix as usize], core::str::from_utf8(d.title).unwrap_or("?"));
+            // SAFETY: only `Act::Hook` producers store here, always a valid `fn(bool)` cast to `usize`.
+            if f != 0 { let h: fn(bool) = unsafe { core::mem::transmute::<usize, fn(bool)>(f) }; h(ok); }
         }
     }
     open_pending();
