@@ -37,7 +37,7 @@ pub const VERB_SET: u8 = 17;
 pub const VERB_LIST: u8 = 18;
 pub const VERB_CHANGED: u8 = 19;
 /// SETTINGSFILES (B407, R98): a program declares its `app.<name>.*` stanza (body: [`crate::declare::body`]).
-pub const VERB_DECLARE: u8 = 20;
+pub const VERB_DECLARE: u8 = 23; // merge17: 20..=22 are DIALOG2 verbs (una_abi::BUS_VERB_PREF_DECLARE)
 /// una-abi `BUS_BODY_MAX`: the reply ceiling.
 pub const BODY_MAX: usize = 4096;
 
@@ -363,7 +363,10 @@ mod tests {
                 assert_eq!(run(&mut s, VERB_SET, &set_body(k.ns, k.key, &v), true), (0, Vec::new()), "{}", k.key);
             }
         }
-        const GOLDEN: &[u8] = b"system.audio.mute = false\n\
+        const GOLDEN: &[u8] = b"system.appearance.accent = \"crispy\"\n\
+system.appearance.highlight = \"accent\"\n\
+system.appearance.mode = \"light\"\n\
+system.audio.mute = false\n\
 system.audio.volume = 12\n\
 system.display.brightness = 12\n\
 system.display.font = \"sans\"\n\
@@ -374,7 +377,12 @@ system.dock.autohide = false\n\
 system.dock.position = \"bottom\"\n\
 system.login.items = \"\"\n\
 system.pointer.speed = 1\n\
-system.settings.tab = 0\n";
+system.settings.tab = 0\n\
+system.trackpad.natural_scroll = true\n\
+system.trackpad.secondary_click = \"two-finger\"\n\
+system.trackpad.speed = 5\n\
+system.trackpad.tap_to_click = false\n\
+system.trackpad.three_finger_drag = false\n";
         assert_eq!(run(&mut s, VERB_LIST, b"system", false), (0, GOLDEN.to_vec()));
         // An empty LIST body lists every namespace; another namespace lists only itself.
         run(&mut s, VERB_SET, b"vein.provider\x00\"claude\"", true);

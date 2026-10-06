@@ -949,11 +949,11 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
     // The strip's material is anchored to the STRIP, not to the panel: index ceramic by the row's
     // offset inside the box, exactly as the window chrome indexes it by the row's offset inside the
     // window. The grain then belongs to the object.
-    let face = ceramic::shade(theme::CHROME_FACE, j);
-    let line = ceramic::shade(theme::FRAME_LINE, j);
+    let face = ceramic::shade(theme::chrome_face(), j);
+    let line = ceramic::shade(theme::frame_line(), j);
     // The row's interior colour: the top bevel hairline for the first `BEVEL` rows under the keyline,
     // the chrome face everywhere else.
-    let fill = if j >= 1 && j < 1 + theme::BEVEL() { theme::BEVEL_LIGHT } else { face };
+    let fill = if j >= 1 && j < 1 + theme::BEVEL() { theme::bevel_light() } else { face };
     if j == 0 || j + 1 == l.h {
         for i in 0..l.w {
             out[i] = line;
@@ -987,7 +987,7 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
             let d = IND_D();
             let px0 = bx + tw / 2 - d / 2;
             let py0 = by + th + (PAD() - d) / 2;
-            let ink = if r.visible { theme::ACCENT } else { theme::SCROLL_THUMB };
+            let ink = if r.visible { theme::accent() } else { theme::scroll_thumb() };
             for i in px0..(px0 + d).min(l.w) {
                 if strip::in_disc(i, j, px0, py0, d) {
                     out[i] = ink;
@@ -1000,9 +1000,9 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         }
         // The tile face — the material at the CONTROL gain (see the module header).
         let base = if r.id == pressed {
-            theme::BUTTON_FACE_PRESSED
+            theme::button_face_pressed()
         } else {
-            theme::BUTTON_FACE
+            theme::button_face()
         };
         let tface = ceramic::shade_gain(base, j, ceramic::CONTROL_GAIN_Q16);
         // Same span-then-patch shape as the strip: the tile's straight middle is a flat run, and the
@@ -1041,9 +1041,9 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         }
         let sy = j - ty0;
         let ink = if r.focused {
-            theme::TITLE_TEXT_ACTIVE
+            theme::title_text_active()
         } else {
-            theme::TITLE_TEXT_INACTIVE
+            theme::title_text_inactive()
         };
         // FONT (GR27) — the shared anti-aliased face, alpha-composited over the tile face the row
         // loop above just painted (a RAM scratch row, so the blend's read is cached). Regular
@@ -1292,7 +1292,7 @@ pub fn selftest() {
     super::strip::vacate_selftest();
 
     /// Three 8x8 ARGB8888 surfaces in rodata — read-only, because the compositor only reads.
-    static SURF: [[u32; 64]; 3] = [[0x0020_40FF; 64], [0x0040_FF20; 64], [0x00FF_4020; 64]];
+    static SURF: [[u32; 64]; 3] = [[crate::video::theme::fixture::BLUE; 64], [crate::video::theme::fixture::GREEN; 64], [crate::video::theme::fixture::RED; 64]];
     /// CONSOLEWIN — the THIRD owner is kernel FURNITURE, and it is the row leg 3 restores.
     ///
     /// It was an ordinary ASID (`0xD0C3`). The change is what makes this fixture the x86 witness for
@@ -2284,8 +2284,8 @@ pub fn dockid_selftest() {
 
     /// Six 8x8 ARGB8888 surfaces in rodata — read-only, because the compositor only reads.
     static SURF: [[u32; 64]; 6] = [
-        [0x0020_40FF; 64], [0x0040_FF20; 64], [0x00FF_4020; 64],
-        [0x00FF_FF20; 64], [0x0020_FFFF; 64], [0x00FF_20FF; 64],
+        [crate::video::theme::fixture::BLUE; 64], [crate::video::theme::fixture::GREEN; 64], [crate::video::theme::fixture::RED; 64],
+        [crate::video::theme::fixture::YELLOW; 64], [crate::video::theme::fixture::CYAN; 64], [crate::video::theme::fixture::PINK; 64],
     ];
     /// Four distinct app owners for legs 1-3, then ONE owner shared by the last two rows for leg 4.
     /// Ordinary ASIDs, deliberately outside the reserved kernel band: [`fixed_rank`] must rank these
@@ -3034,11 +3034,11 @@ fn menu_box(out: &mut [u32], ow: usize, bx: usize, g: MenuGeo, j: usize) {
     if j >= g.mh { return; }
     let (row, sy0) = (j / TILE_H(), (j % TILE_H()) as isize - ((TILE_H() - CELL_H()) / 2) as isize);
     let hot = row == g.hover;
-    let face = if hot { theme::ACCENT } else { theme::BUTTON_FACE };
-    let ink = if hot { theme::BUTTON_FACE } else { theme::TITLE_TEXT_ACTIVE };
+    let face = if hot { theme::accent() } else { theme::button_face() };
+    let ink = if hot { theme::button_face() } else { theme::title_text_active() };
     let edge_row = j == 0 || j + 1 == g.mh;
     for i in 0..g.mw {
-        out[bx + i] = if edge_row || i == 0 || i + 1 == g.mw { theme::FRAME_LINE } else { face };
+        out[bx + i] = if edge_row || i == 0 || i + 1 == g.mw { theme::frame_line() } else { face };
     }
     let mut wbuf = [0u8; wm::MAX_TITLE];
     let label: &[u8] = if g.owner == TRASH_OWNER { b"Empty Trash..." } else if row < MENU_ITEMS { menu_label(row, g.keep, open_at_login(g.owner)) } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3; DOCK2 the six items
@@ -3132,7 +3132,7 @@ pub fn menu_press(x: i32, y: i32) -> bool {
 /// the menu, press Quit, see the tile leave.
 #[cfg(feature = "witness")]
 pub fn dockrun_selftest() {
-    static SURF: [u32; 64] = [0x0030_90F0; 64];
+    static SURF: [u32; 64] = [crate::video::theme::fixture::SKY; 64];
     const OWNER: u64 = 0xD2D1;
     let census = |rows: &mut Model| -> Option<(usize, usize, usize, Layout)> {
         composite_reconciled();
@@ -3883,7 +3883,7 @@ fn thumbs_refresh(l: &Layout, rows: &[wm::DockEntry]) {
         if dock2_group(r) != 1 || l.is_overflow(t) { continue; }
         let mut px = alloc::vec::Vec::new();
         if px.try_reserve_exact(w * h).is_err() { continue; }
-        px.resize(w * h, ceramic::shade_gain(theme::BUTTON_FACE, 0, ceramic::CONTROL_GAIN_Q16));
+        px.resize(w * h, ceramic::shade_gain(theme::button_face(), 0, ceramic::CONTROL_GAIN_Q16));
         if wm::thumb(r.id, &mut px, w, h) { th.push((r.id, w, h, px)); }
     }
 }
@@ -3896,10 +3896,10 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
             let (bx, by) = (tx - l.x, ty - l.y);
             if l.vert {
                 let sy = by.saturating_sub((PAD() / 8).max(1) + 1);
-                if j == sy { for i in bx..(bx + tw).min(l.w) { out[i] = theme::FRAME_LINE; } }
+                if j == sy { for i in bx..(bx + tw).min(l.w) { out[i] = theme::frame_line(); } }
             } else if j >= by && j < by + th {
                 let sx = bx.saturating_sub(PAD() / 2 + 1);
-                if sx < l.w { out[sx] = theme::FRAME_LINE; }
+                if sx < l.w { out[sx] = theme::frame_line(); }
             }
         }
     }
@@ -3920,7 +3920,7 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
             let d = IND_D();
             let (px0, py0) = (bx + tw / 2 - d / 2, by + th + (PAD() - d) / 2);
             let lit = LAUNCH_PHASE.load(Ordering::Relaxed) & 1 == 0;
-            let ink = if r.id == TRASH_PIN_ID { ceramic::shade(theme::CHROME_FACE, j) } else if lit { theme::ACCENT } else { theme::SCROLL_THUMB };
+            let ink = if r.id == TRASH_PIN_ID { ceramic::shade(theme::chrome_face(), j) } else if lit { theme::accent() } else { theme::scroll_thumb() };
             for i in px0.saturating_sub(1)..(px0 + d + 1).min(l.w) {
                 if strip::in_disc(i, j, px0, py0, d) || r.id == TRASH_PIN_ID { out[i] = ink; }
             }
@@ -3929,7 +3929,7 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
         if j < by + 2 || j + 2 >= by + th { continue; }
         let v = j - by - 2;
         if r.id == TRASH_PIN_ID {
-            trash_glyph_row(out, bx, tw, th, j - by, TRASH_FULL.load(Ordering::Relaxed), ceramic::shade_gain(theme::BUTTON_FACE, j, ceramic::CONTROL_GAIN_Q16));
+            trash_glyph_row(out, bx, tw, th, j - by, TRASH_FULL.load(Ordering::Relaxed), ceramic::shade_gain(theme::button_face(), j, ceramic::CONTROL_GAIN_Q16));
         } else if dock2_group(r) == 1 {
             if let Some(g) = thumbs.as_ref() {
                 if let Some((_, w, h, px)) = g.iter().find(|e| e.0 == r.id) {
@@ -3942,7 +3942,7 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
 
 /// Our Trash glyph, one row: a lid with a handle over a can; FULL fills the can, EMPTY draws its ribs.
 fn trash_glyph_row(out: &mut [u32], bx: usize, tw: usize, th: usize, y: usize, full: bool, face: u32) {
-    let ink = theme::TITLE_TEXT_ACTIVE;
+    let ink = theme::title_text_active();
     for i in bx + 2..bx + tw - 2 { if i < out.len() { out[i] = face; } }
     let gh = (th * 2 / 3).max(8);
     let gw = (gh * 3 / 4).max(6);
@@ -4070,7 +4070,7 @@ fn dock2_service(now: u64) {
             serial_println!("[dock] launch app={} first_window_ms=timeout bound_ms={}", DP_PINS[i].name, LAUNCH_BOUND_MS);
             let mut body = alloc::string::String::from(DP_PINS[i].name);
             body.push_str(" did not open a window in 10 s.");
-            crate::video::crystal::login::notice_post(b"Dock", body.as_bytes());
+            let _ = crate::video::dialog::notice(b"Dock", body.as_bytes()); // DIALOG2 (B404): THE router; notice_post retired
             PASS_OWED.store(true, Ordering::Release);
         } else {
             let ph = (dt / PULSE_MS) as u32;
@@ -4205,7 +4205,7 @@ fn reorder(from: usize, to: usize) {
 /// raise), the launch pulse to a landed window, the six menu items, the edge and auto-hide applied live.
 #[cfg(feature = "witness")]
 pub fn dock2_selftest() {
-    static SURF: [u32; 64] = [0x0040_A060; 64];
+    static SURF: [u32; 64] = [crate::video::theme::fixture::LEAF; 64];
     let owner = DP_PIN_OWNER + 3; // the `activity` pin's owner: a window under it is "activity's first window"
     let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) else { serial_println!(":: DOCK2: no panel :: SKIP ::"); return };
     let (pw, ph) = (fb.width(), fb.height());
@@ -4227,7 +4227,7 @@ pub fn dock2_selftest() {
             let trash = rows[..n].last().map(|r| r.id == TRASH_PIN_ID).unwrap_or(false) && l.tile(n - 1).is_some();
             let min = rows[..n].iter().filter(|r| dock2_group(r) == 1).count();
             let mut px = [0u32; 16];
-            let thumb = wm::thumb(win, &mut px, 4, 4) && px.iter().all(|&p| p == 0x0040_A060);
+            let thumb = wm::thumb(win, &mut px, 4, 4) && px.iter().all(|&p| p == crate::video::theme::fixture::LEAF);
             let t = rows[..n].iter().position(|r| r.id == win && dock2_group(r) == 1);
             let left_kept = !pinned_app(owner) || rows[..n].iter().any(|r| r.id == win && dock2_group(r) == 0);
             let mut raised = false;
@@ -4351,7 +4351,7 @@ static EMPTY_OWED: AtomicBool = AtomicBool::new(false);
 
 /// The Trash menu's one item: the confirm (DIALOG's alert, Cancel left, Empty Trash the default on the right).
 fn empty_trash_ask() {
-    let mut d = crate::video::dialog::Dlg::new(crate::video::dialog::Icon::Caution, b"Trash", b"Are you sure you want to permanently erase the items in the Trash?", b"You can't undo this action.", &["Cancel", "Empty Trash"]);
+    let mut d = crate::video::dialog::Dlg::new(crate::video::dialog::Icon::Caution, b"Trash", b"Are you sure you want to permanently erase the items in the Trash?", b"You can't undo this action.", &[b"Cancel", b"Empty Trash"]);
     d.user = true;
     d.act = crate::video::dialog::Act::Hook(empty_trash_answer as fn(bool) as usize);
     let posted = crate::video::dialog::post(d);

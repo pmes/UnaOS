@@ -249,7 +249,7 @@ fn open_inner(path: &str, text: Vec<u8>, spans: Vec<richtext::Span>, n_bytes: us
     if surf.try_reserve_exact(len).is_err() {
         return Err(String::from("out of memory"));
     }
-    surf.resize(len, theme::CONTENT_FILL);
+    surf.resize(len, theme::content_fill());
 
     if is_open() {
         close();
@@ -309,7 +309,7 @@ fn paint(st: &mut State) {
     let _ = cw;
     let (w, h) = (st.w, st.h);
     for p in st.surf.iter_mut() {
-        *p = theme::CONTENT_FILL;
+        *p = theme::content_fill();
     }
     for r in 0..st.vis {
         let Some(&(a, b)) = st.rows.get(st.top + r) else { break };
@@ -318,7 +318,7 @@ fn paint(st: &mut State) {
             continue;
         }
         let s = &st.text[a as usize..b as usize];
-        super::text::draw_text(&mut st.surf, w, w - crate::ui::px(6), h, PAD(), PAD() + r * ch, s, theme::CONTENT_TEXT, false, face);
+        super::text::draw_text(&mut st.surf, w, w - crate::ui::px(6), h, PAD(), PAD() + r * ch, s, theme::content_text(), false, face);
     }
     // Scroll thumb on the right edge (proportional; full height when everything fits).
     let total = st.rows.len().max(1);
@@ -326,7 +326,7 @@ fn paint(st: &mut State) {
     let th = if total <= st.vis { h } else { (h * st.vis / total).max(crate::ui::px(8)) };
     let ty = if total <= st.vis { 0 } else { (h - th) * st.top / (total - st.vis) };
     for y in 0..h {
-        let c = if y >= ty && y < ty + th { theme::SCROLL_THUMB } else { theme::SCROLL_TRACK };
+        let c = if y >= ty && y < ty + th { theme::scroll_thumb() } else { theme::scroll_track() };
         for x in x0..x1 {
             st.surf[y * w + x] = c;
         }
@@ -478,12 +478,12 @@ pub fn open_text(title: &str, text: &str) -> Result<(usize, usize, usize, usize)
 fn tint_ink(t: richtext::Tint) -> u32 {
     use richtext::Tint;
     match t {
-        Tint::Plain | Tint::Punct => theme::CONTENT_TEXT,
-        Tint::Heading | Tint::Key => theme::ACCENT,
-        Tint::Dim | Tint::Quote => theme::TITLE_TEXT_INACTIVE,
-        Tint::Code | Tint::Str => 0x0020_8040,
-        Tint::Num => 0x00B0_5000,
-        Tint::Lit => 0x0080_30A0,
+        Tint::Plain | Tint::Punct => theme::content_text(),
+        Tint::Heading | Tint::Key => theme::accent(),
+        Tint::Dim | Tint::Quote => theme::title_text_inactive(),
+        Tint::Code | Tint::Str => crate::video::theme::syntax_code(),
+        Tint::Num => crate::video::theme::syntax_num(),
+        Tint::Lit => crate::video::theme::syntax_lit(),
     }
 }
 
@@ -497,8 +497,8 @@ fn paint_styled_row(st: &mut State, a: usize, b: usize, y: usize) {
         let k = st.spans.partition_point(|s| (s.end as usize) <= p);
         let (end, ink, bold) = match st.spans.get(k) {
             Some(s) if (s.start as usize) <= p => ((s.end as usize).min(b), tint_ink(s.tint), s.bold),
-            Some(s) => ((s.start as usize).min(b), theme::CONTENT_TEXT, false),
-            None => (b, theme::CONTENT_TEXT, false),
+            Some(s) => ((s.start as usize).min(b), theme::content_text(), false),
+            None => (b, theme::content_text(), false),
         };
         let end = end.max(p + 1);
         super::text::draw_text(&mut st.surf, w, w - crate::ui::px(6), h, PAD() + (p - a) * cw, y, &st.text[p..end], ink, bold, face);
@@ -521,4 +521,36 @@ pub fn font_repaint() {
     paint(st);
     drop(g);
     let _ = wm::present(id);
+}
+
+/// QUARRY3 (rmbp-ledger B413): Quick Look's text body — THIS viewer's read, sanitise, renderer (`richtext`, for
+/// `kind` = `markdown` / `json`; `""` = plain) and painter over a caller-sized `w x h` surface, no window. Quarry's
+/// Quick Look blits it into its panel, so a preview is the viewer's own pixels, never a second text renderer.
+/// Returns the surface and the number of wrapped rows the file made.
+pub fn quicklook_body(path: &str, kind: &str, w: usize, h: usize) -> Result<(Vec<u32>, usize), String> {
+    let (raw, _truncated) = read_capped(path)?;
+    let clean = sanitize(&raw);
+    let (text, spans) = if kind.is_empty() {
+        (clean, Vec::new())
+    } else {
+        let r = richtext::render(kind, &clean);
+        (r.text, r.spans)
+    };
+    let face = super::text::Face::Grid;
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    let cols = w.saturating_sub(2 * PAD() + crate::ui::px(6)) / cw.max(1);
+    let vis = h.saturating_sub(2 * PAD()) / ch.max(1);
+    if cols < 8 || vis < 1 {
+        return Err(String::from("panel below floor"));
+    }
+    let lay = layout(&text, cols);
+    let mut surf: Vec<u32> = Vec::new();
+    if surf.try_reserve_exact(w * h).is_err() {
+        return Err(String::from("out of memory"));
+    }
+    surf.resize(w * h, theme::CONTENT_FILL);
+    let rows_n = lay.rows.len();
+    let mut st = State { path: String::from(path), rows: lay.rows, text, top: 0, vis, cols, w, h, surf, spans };
+    paint(&mut st);
+    Ok((st.surf, rows_n))
 }

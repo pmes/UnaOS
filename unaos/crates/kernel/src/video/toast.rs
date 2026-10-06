@@ -106,13 +106,13 @@ pub fn showing() -> bool {
 fn paint(t: &T) {
     let px = surf();
     let (pw, ph) = (metrics::size(W), metrics::size(H));
-    metrics::fill(px, pw, 0, 0, W, H, theme::CHROME_FACE);
+    metrics::fill(px, pw, 0, 0, W, H, theme::chrome_face());
     for (x, y, w, h) in [(0, 0, W, 1), (0, H - 1, W, 1), (0, 0, 1, H), (W - 1, 0, 1, H)] {
-        metrics::fill(px, pw, x, y, w, h, theme::FRAME_LINE);
+        metrics::fill(px, pw, x, y, w, h, theme::frame_line());
     }
-    metrics::fill(px, pw, 12, 12, 28, 28, theme::ACCENT);
-    let _ = metrics::text(px, pw, ph, W, 50, 8, t.title(), theme::CONTENT_TEXT, true, crate::video::text::Face::Ui);
-    let _ = metrics::text(px, pw, ph, W, 50, 28, &t.line[..t.ll as usize], theme::TITLE_TEXT_ACTIVE, false, crate::video::text::Face::Ui);
+    metrics::fill(px, pw, 12, 12, 28, 28, theme::accent());
+    let _ = metrics::text(px, pw, ph, W, 50, 8, t.title(), theme::content_text(), true, crate::video::text::Face::Ui);
+    let _ = metrics::text(px, pw, ph, W, 50, 28, &t.line[..t.ll as usize], theme::title_text_active(), false, crate::video::text::Face::Ui);
 }
 
 fn open(t: T) -> wm::WinId {

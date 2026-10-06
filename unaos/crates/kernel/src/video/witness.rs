@@ -43,7 +43,7 @@ const LEN: usize = STRIDE * H * BPP;
 
 // A colour with three distinct channels so a byte-order (Rgb vs Bgr) bug can't hide behind equal
 // bytes. Bgr layout writes it to memory as [B, G, R, 0] = [0x33, 0x22, 0x11, 0x00].
-const TEST_COLOR: u32 = 0x0011_2233;
+const TEST_COLOR: u32 = crate::video::theme::fixture::TEST_COLOR;
 
 /// Read the little-endian pixel word at (x, y) out of a tight Bgr/4bpp backing buffer.
 fn px(buf: &[u8], x: usize, y: usize) -> u32 {
@@ -96,7 +96,7 @@ pub fn run() -> Result<(), String> {
     // --- Damage-limited present: a poke OUTSIDE the next draw's bbox must survive a flush. ---
     // Sentinel at (0,0), far from the (10,10) rect below. If flush blitted the whole surface (no
     // damage tracking) it would overwrite this from the still-zero back buffer.
-    const SENTINEL: u32 = 0x00AB_CDEF;
+    const SENTINEL: u32 = crate::video::theme::fixture::SENTINEL;
     let s = 0usize; // (0,0) byte offset
     front_store[s] = 0xEF;
     front_store[s + 1] = 0xCD;

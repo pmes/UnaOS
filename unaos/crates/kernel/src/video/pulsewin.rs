@@ -113,15 +113,15 @@ use spin::Mutex;
 /// The window's content ground. A shade off the desktop band's `PANEL_BG` on purpose: the window is a
 /// second seat for the instrument, not a cut-out of the first, and an operator with both on the glass
 /// should be able to say which is which without reading a title.
-const WIN_BG: u32 = 0x00_100E16;
+const WIN_BG: u32 = crate::video::theme::PULSE_BG;
 
 /// `vug::METER_PURPLE` — the load fill of the ten-segment face. COPIED, with attribution, exactly as
 /// `user-pulse/src/main.rs` copies it: `vug` is aarch64-only and declares it privately, so importing it
 /// would arch-gate this module for a colour. The three colours that ARE shared (`METER_DIM`,
 /// `METER_BREATH`, `METER_PARKED`) are imported from `ui_status`, which owns them.
-const METER_PURPLE: u32 = 0x00_9B59B6;
+const METER_PURPLE: u32 = crate::video::theme::PULSE_METER;
 /// `vug::METER_LABEL` — core numbers and percents. Copied on the same terms.
-const METER_LABEL: u32 = 0x00_8A8296;
+const METER_LABEL: u32 = crate::video::theme::PULSE_LABEL;
 
 /// Fixed segment count of a ten-segment bar — `vug::PULSE_SEGS` / `user-pulse`'s `PULSE_SEGS`. The
 /// number IS the x86 face; it is not a tuning knob.

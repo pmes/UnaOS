@@ -455,7 +455,7 @@ pub fn panel_info_nonblocking() -> Option<FrameBufferInfo> {
 }
 
 /// The panel background the GUI paints over — Can-Am dark grey, `#1E1E1E`.
-pub const PANEL_BG: u32 = 0x001E_1E1E;
+pub const PANEL_BG: u32 = crate::video::theme::PANEL_BG;
 
 /// Paint the panel background once at boot, and witness the framebuffer geometry the bootloader
 /// handed us.
@@ -1212,3 +1212,6 @@ pub mod panicscreen;
 // SETTINGSFILES (B407, R98): the Settings panel's `Stored in settings/<domain>` link and Quarry's Show Info pane for a settings file. Same gate as settings; at the tail so no line above moves.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod settingsfiles;
+// APPEARANCE (B408, MACPARITY rows 21/22): Principia's `system.appearance.*` applied — Light/Dark, the accent, the highlight, one repaint. Same gate as settings; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod appearance;

@@ -1451,7 +1451,10 @@ pub unsafe fn gmux_igd_switch() {
         // is measured rather than remembered: a boot whose firmware DOES program the T-delays
         // would print 1 here and that is the day this rung's write half becomes designable.
         let delays_programmed = if pp_on_entry != 0 && pp_off_entry != 0 { 1 } else { 0 };
-        serial_println!(":: igpu-dpy: rung=03 name=pp ok=1 pp_write=DECLINED why=pp-bits-uncited pp_window={} delays_programmed={} pp_unwind=0 pp_ctl=0x{:08X} pp_sts=0x{:08X} on_delays=0x{:08X} off_delays=0x{:08X} div=0x{:08X} ::",
+        // GEN7 M3 (B411): the bits ARE cited — rung 07b decodes every PPS field from IHD-OS-V3 Pt4 §2.4
+        // pp.38-43 — so the decline names its real legs: the gmux keeps the panel with the Kepler (no
+        // build hands it to the IGD; a GMUX arc's), and no source carries the panel's T values.
+        serial_println!(":: igpu-dpy: rung=03 name=pp ok=1 pp_write=DECLINED why=panel-not-handed-to-igd bits=cited:IHD-OS-V3-Pt4-sec2.4-pp38-43 pp_window={} delays_programmed={} pp_unwind=0 pp_ctl=0x{:08X} pp_sts=0x{:08X} on_delays=0x{:08X} off_delays=0x{:08X} div=0x{:08X} ::",
             pp_window, delays_programmed, pp_ctl_entry, pp_sts_entry, pp_on_entry, pp_off_entry, pp_div_entry);
 
         // The settle. TSC-bounded, never `arch::ms()`-bounded: `now_cycles()` advances regardless
@@ -1668,16 +1671,19 @@ pub unsafe fn gmux_igd_switch() {
         // not hidden by that choice: it rides the rung line AND the rollup as `pps=`.
         highest = 7;
         rung_name = "pps-on";
-        pps_verdict = "DECLINED:pp-bits-uncited";
+        pps_verdict = "DECLINED:panel-not-handed-to-igd";
 
         let pps_ctl = mmio_read(bar0, regs::PCH_PP_CONTROL);
         let pps_sts = mmio_read(bar0, regs::PCH_PP_STATUS);
         let pps_on = mmio_read(bar0, regs::PCH_PP_ON_DELAYS);
         let pps_off = mmio_read(bar0, regs::PCH_PP_OFF_DELAYS);
         let pps_div = mmio_read(bar0, regs::PCH_PP_DIVISOR);
-        serial_println!(":: igpu-dpy: rung=07 name=pps-on ok=1 pp_write=DECLINED why=pp-bits-uncited writes=0 pp_unwind=0 t_source=NONE t_dpcd=absent t_edid=absent pp_ctl=0x{:08X} pp_sts=0x{:08X} on_delays=0x{:08X} off_delays=0x{:08X} div=0x{:08X} elapsed_ms={} ::",
+        serial_println!(":: igpu-dpy: rung=07 name=pps-on ok=1 pp_write=DECLINED why=panel-not-handed-to-igd bits=cited writes=0 pp_unwind=0 t_source=NONE t_dpcd=absent t_edid=absent pp_ctl=0x{:08X} pp_sts=0x{:08X} on_delays=0x{:08X} off_delays=0x{:08X} div=0x{:08X} elapsed_ms={} ::",
             pps_ctl, pps_sts, pps_on, pps_off, pps_div, get_elapsed_ms());
-        serial_println!(":: igpu-dpy: rung=07 name=pps-on MISSING doc=PRM-Vol3-Part4-Panel-Power-Sequencing pp_control=0xC7204:bit0=power-state-target:UNCITED,bit3=vdd-override:UNCITED on_delays=0xC7208:T1-T5:UNCITED off_delays=0xC720C:T:UNCITED — no PPS write is attempted and this ladder raises no panel power on any boot of this build ::");
+        // GEN7 M3 (B411): the MISSING line, answered by rung 07b's own citations (two sources each: the PRM
+        // section and the firmware capture `pp_ctl=0xABCD0008`, flights 8-25). The write stays declined on
+        // the two legs that are NOT citations: `gmux=kepler` and `t_source=NONE`.
+        serial_println!(":: igpu-dpy: rung=07 name=pps-on CITED doc=IHD-OS-V3-Pt4-05-12 pp_control=0xC7204:[31:16]=key,bit3=vdd-override,bit2=backlight,bit1=pd-on-reset,bit0=power-target:sec2.4.2-pp39-41 on_delays=0xC7208:[31:30]=port-sel,[28:16]=T3,[12:0]=pwron-to-bl:sec2.4.3-pp41-42 off_delays=0xC720C:[28:16]=T10,[12:0]=T9:sec2.4.4-p42 divisor=0xC7210:[4:0]=T12:sec2.4.5-p43 gmux=kepler t_source=NONE — the write waits for a gmux hand-off to the IGD and a T-value source; no PPS write on any boot of this build ::");
 
         // ═══════════════════════════════════════════════════════════════════════════════════
         // RUNG 07b — `pps-read`: THE CITATION RUNG 07 COULD NOT MAKE, MADE — AND THE PANEL'S

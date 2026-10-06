@@ -158,7 +158,7 @@ pub fn resample(src: &[u32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<
         let sy = (y * sh / dh.max(1)).min(sh.saturating_sub(1));
         for x in 0..dw {
             let sx = (x * sw / dw.max(1)).min(sw.saturating_sub(1));
-            out.push(src.get(sy * sw + sx).copied().unwrap_or(0xFF00_0000) | 0xFF00_0000);
+            out.push(src.get(sy * sw + sx).copied().unwrap_or(crate::video::theme::OPAQUE_BLACK) | 0xFF00_0000);
         }
     }
     out
@@ -257,7 +257,7 @@ pub(super) fn open_frames(path: &str, bytes: u64, mut src: Stream) -> Result<sup
     if first.try_reserve_exact(bw * bh).is_err() {
         return Err(FacetError::OutOfMemory(bw * bh * 4));
     }
-    first.resize(bw * bh, 0xFF00_0000);
+    first.resize(bw * bh, crate::video::theme::OPAQUE_BLACK);
     reduce_into(src.canvas(), w as usize, k, bw, bh, &mut first);
     let ihdr = Ihdr { width: w, height: h, depth: 8, colour: 6, interlaced: false };
     let n = src.frame_count();
@@ -484,16 +484,16 @@ fn leg(path: &str) -> Result<(usize, usize), String> {
     let at = |base: &[u32], x: usize, y: usize| base[y * bw + x] & 0x00FF_FFFF;
     let (g, r) = (at(&base, 3, 3), at(&base, 0, 0));
     serial_println!("[facetanim] {} steps={},{} delay0={} frame1 px(3,3)={:06x} px(0,0)={:06x}", path, i0, i1, d0, g, r);
-    if (i0, i1, d0) != (0, 1, 200) || g != 0x00_FF00 || r != 0xFF_0000 {
+    if (i0, i1, d0) != (0, 1, 200) || g != crate::video::theme::fixture::RGB_GREEN || r != crate::video::theme::fixture::RGB_RED {
         return Err(alloc::format!("frame 1 read back px(3,3)={:06x} px(0,0)={:06x}", g, r));
     }
     let (i2, _) = step(&mut src, &mut plays, k, bw, bh, &mut base, &mut held)?;
-    if i2 != 2 || at(&base, 3, 3) != 0x00_00FF {
+    if i2 != 2 || at(&base, 3, 3) != crate::video::theme::fixture::RGB_BLUE {
         return Err(String::from("frame 2 is not blue"));
     }
     // Loop forever: the fourth step is frame 0 again, after one complete play.
     let (i3, _) = step(&mut src, &mut plays, k, bw, bh, &mut base, &mut held)?;
-    if i3 != 0 || plays != 1 || at(&base, 3, 3) != 0xFF_0000 {
+    if i3 != 0 || plays != 1 || at(&base, 3, 3) != crate::video::theme::fixture::RGB_RED {
         return Err(alloc::format!("the loop did not come back to frame 0 (index {} plays {})", i3, plays));
     }
     Ok((src.frame_count(), held))

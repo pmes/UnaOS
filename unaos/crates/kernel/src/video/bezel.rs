@@ -43,10 +43,10 @@ const SEG_H: usize = 8;
 const RADIUS: usize = 18;
 
 // Our colours: a dark face (the translucent look owed — the compat row is opaque xRGB), light ink.
-const FACE: u32 = 0x0026_2629;
-const EDGE: u32 = 0x003C_3C40;
-const INK: u32 = 0x00EE_EEF0;
-const DIM: u32 = 0x004A_4A50;
+const FACE: u32 = super::theme::BEZEL_FACE;
+const EDGE: u32 = super::theme::BEZEL_EDGE;
+const INK: u32 = super::theme::BEZEL_INK;
+const DIM: u32 = super::theme::BEZEL_DIM;
 
 /// Armed kind (0 none), set by [`arm`]; the service takes it.
 static ARMED: AtomicU8 = AtomicU8::new(K_NONE);

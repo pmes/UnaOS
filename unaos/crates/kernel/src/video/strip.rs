@@ -325,7 +325,7 @@ pub fn fnv1a_u64(mut h: u64, v: u64) -> u64 {
 /// colliding with it would leave the strip un-repainted forever.
 #[inline]
 pub fn seal(h: u64) -> u64 {
-    if h == 0 { 1 } else { h }
+    let h = h ^ ((super::theme::epoch() as u64) << 40); if h == 0 { 1 } else { h } // APPEARANCE (B408): a theme switch changes every strip's signature, so the bar, dock and menus repaint once
 }
 
 // ---------------------------------------------------------------------------

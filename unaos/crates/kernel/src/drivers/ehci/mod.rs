@@ -13433,7 +13433,7 @@ impl Controller {
         // frame length whenever the frame is short of `total`, exactly the datum the decoder
         // length-validates on.
         #[cfg(not(feature = "mtraw"))]
-        let rx_total = mps as u32;
+        let rx_total = if layout.as_ref().is_some_and(|l| l.vendor_mt) { INT_BUF_LEN as u32 } else { mps as u32 }; // TRACKPADPANE (B412) rung 1: the vendor-multitouch qTD takes a WHOLE TYPE2 frame (EHCI 3.5.3: the controller keeps issuing IN until a short packet), not one 64 B packet — a two-finger frame is 86 B
         #[cfg(feature = "mtraw")]
         let rx_total = if layout.as_ref().is_some_and(|l| l.vendor_mt) {
             INT_BUF_LEN as u32
@@ -14023,7 +14023,7 @@ impl Controller {
                     // still a hard cap, never larger than the allocation, so the slice below can
                     // never run off the buffer even if the controller reported nonsense residue.
                     #[cfg(not(feature = "mtraw"))]
-                    let cap = if e.layout.is_some() { len.min(64) } else { len.min(8) };
+                    let cap = if e.layout.is_some() { len.min(INT_BUF_LEN) } else { len.min(8) }; // TRACKPADPANE: the grown buffer (was 64)
                     #[cfg(feature = "mtraw")]
                     let cap = if e.layout.is_some() { len.min(INT_BUF_LEN) } else { len.min(8) };
                     // ISRARM: `rpt_ptr` is `e.buf` on the poll arm (read in place, as before) and the
@@ -14195,7 +14195,7 @@ impl Controller {
                                     let mut hb = [0u8; TP_RAW2_HEX_MAX];
                                     serial_println!(":: TPRAW2: fingers={} bytes={} ::", report[WSP2_NFINGER_OFF], tp_hex_raw2(&mut hb, report));
                                 }
-                                let (buttons, dx, dy, wit) = e.tp.mt_step(f);
+                                let (buttons, dx, dy, wit) = e.tp.mt_step(f); let (buttons, dx, dy) = tpgest::shape(f, buttons, dx, dy, report.len(), idx); // TRACKPADPANE (B412): the Trackpad pane's gain, scroll, secondary, tap and three-finger drag, after the curve
                                 if wit {
                                     crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] [tp] mt fingers={} mover={} x={} y={} dx={} dy={} curve={}/{}@{} frame={} == witness ::", // TPSCALE (B214): dx/dy are the SCALED pixels the router takes; div= names the divisor so a glass reading can re-derive raw units
@@ -14851,7 +14851,7 @@ const ISR_RING: usize = 64; // PTRSTUTTER M1: 8 -> 64 (boot 17: the 8-deep ring 
 /// completion can ever exceed it. Knob-on (`mtraw`, 1024) the vendor-multitouch endpoint's frames
 /// can, and those are DECLINED by the ISR (`ISR_OVERSIZE`) and left for the pass — a bounded,
 /// counted, knob-only degradation to today's behaviour rather than a 96 KiB static.
-const ISR_SLOT_LEN: usize = 64;
+const ISR_SLOT_LEN: usize = 256; // TRACKPADPANE (B412): = the knob-off INT_BUF_LEN, so a whole multi-finger frame rides the hand-off ring (mtraw's 1024 still declines to the pass)
 
 /// One hand-off slot: the report bytes plus the two clock facts the EHCIDARK census needs, taken at
 /// the moment of CONSUMPTION rather than at decode time. Without `gap_ms` the census would measure
@@ -19542,8 +19542,8 @@ static TP_SPEED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::ne
 pub fn tp_speed_set(n: u8) { TP_SPEED.store(n.min(2), core::sync::atomic::Ordering::Relaxed); }
 /// SETTINGS: the current speed step.
 pub fn tp_speed_get() -> u8 { TP_SPEED.load(core::sync::atomic::Ordering::Relaxed) }
-fn tp_div_low() -> i32 { match tp_speed_get() { 0 => 12, 2 => 5, _ => TP_MT_DIV_LOW } }
-fn tp_div_high() -> i32 { match tp_speed_get() { 0 => 4, 2 => 2, _ => TP_MT_DIV_HIGH } }
+fn tp_div_low() -> i32 { TP_MT_DIV_LOW } // TRACKPADPANE (B412): the curve's divisors are fixed again — the R75 steps changed its SHAPE; speed is one gain after it (`tpgest`)
+fn tp_div_high() -> i32 { TP_MT_DIV_HIGH }
 
 /// QUIETBOOT (R80): `tests ehci` — the hardening self-test chain `init` used to run at every boot.
 fn ehci_selftest() {
@@ -19600,3 +19600,7 @@ pub fn service_ehci_hid_pump() {
         service_ehci_hid();
     }
 }
+
+/// TRACKPADPANE (rmbp-ledger B412) — the Trackpad pane's gesture stage (speed gain, two-finger scroll, secondary
+/// click, tap to click, three-finger drag), applied after `mt_step` on the vendor route. Tail append.
+pub mod tpgest;

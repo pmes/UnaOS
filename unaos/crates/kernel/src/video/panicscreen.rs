@@ -39,8 +39,8 @@ const LOG_EXT: &str = "txt";
 pub const DLG_TITLE: &[u8] = b"Last session";
 
 const BG: u32 = super::PANEL_BG;
-const INK: u32 = 0x00EC_ECEE;
-const INK_SMALL: u32 = 0x00A0_A0A6;
+const INK: u32 = super::theme::PANIC_INK;
+const INK_SMALL: u32 = super::theme::PANIC_INK_SMALL;
 const TEXT_CAP: usize = 16 * 1024;
 const TAIL_CAP: usize = 64 * 1024;
 const FILE_CAP: usize = TEXT_CAP + TAIL_CAP + 1024;
@@ -535,7 +535,7 @@ pub fn next_boot_service() {
         DLG_TITLE,
         b"The last session stopped unexpectedly.",
         &info[..il],
-        &["OK", "Show log"],
+        &[b"OK", b"Show log"],
     );
     let posted = super::dialog::post(d);
     let _ = mt.unlink(MARKER, crate::fs::vfs::KERNEL_PRINCIPAL); // said once

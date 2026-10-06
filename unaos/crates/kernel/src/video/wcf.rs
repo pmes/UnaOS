@@ -528,7 +528,7 @@ fn ramp(base: usize, len: usize, fmt: PixelFormat, k_row: usize, x0: usize, y0: 
     let mut lost = 0usize;
     for i in 0..RAMP_ROWS {
         let color =
-            if i % 16 == 0 { 0x00FF_FFFF } else { 0x0000_FF80 | ((i as u32 & 0xFF) << 16) };
+            if i % 16 == 0 { crate::video::theme::fixture::WHITE } else { crate::video::theme::fixture::RAMP_BASE | ((i as u32 & 0xFF) << 16) };
         let px = match bytes_of(fmt, color) {
             Some(p) => p,
             None => return lost + (RAMP_ROWS - i) * 2,
@@ -677,12 +677,12 @@ fn chrome_probes(
     let strip_x = bx + bw - BORDER() - 2;
     let face_row = BORDER() + TITLE_H() + 8;
     [
-        ("keyline_top", bx + bw / 2, by, super::theme::FRAME_LINE),
+        ("keyline_top", bx + bw / 2, by, super::theme::frame_line()),
         (
             "bevel_light",
             bx + bw / 2,
             by + super::theme::BEVEL(),
-            super::theme::BEVEL_LIGHT,
+            super::theme::bevel_light(),
         ),
         (
             "title_top",
@@ -703,7 +703,7 @@ fn chrome_probes(
             "face_left",
             bx + BORDER() - 2,
             by + face_row,
-            super::ceramic::shade(super::theme::CHROME_FACE, face_row),
+            super::ceramic::shade(super::theme::chrome_face(), face_row),
         ),
     ]
 }
@@ -998,7 +998,7 @@ pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize
         ),
     }
 
-    let face = super::theme::CHROME_FACE;
+    let face = super::theme::chrome_face();
     let ceramic_pp = pp(super::ceramic::TILE_H, |k| super::ceramic::shade(face, k));
     let knurl_pp = pp(super::knurl::TILE_W * super::knurl::TILE_H, |k| {
         super::knurl::shade(face, k % super::knurl::TILE_W, k / super::knurl::TILE_W)

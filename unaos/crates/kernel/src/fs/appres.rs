@@ -544,7 +544,7 @@ pub fn about(win_name: &[u8]) {
     {
         let title = alloc::format!("About {}", name);
         let text = alloc::format!("Version {}\n{}", version, sig);
-        crate::video::crystal::login::notice_show(title.as_bytes(), text.as_bytes());
+        let _ = crate::video::dialog::notice(title.as_bytes(), text.as_bytes()); // DIALOG2 (B404): THE router; notice_show retired
     }
 }
 

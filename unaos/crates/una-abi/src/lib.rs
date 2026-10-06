@@ -1763,7 +1763,8 @@ pub const APP_RES_SECTION: &str = ".note.unaos.res";
 /// The resource note's type (owner "UnaOS", like APP_NOTE_TYPE's).
 pub const APP_RES_NOTE_TYPE: u32 = 2;
 
-// ==========================================================================================// DIALOG2 (rmbp-ledger B404) — a ring-3 program raises its OWN alert, sheet or toast, and hears the answer.
+// =================================================================================================
+// DIALOG2 (rmbp-ledger B404) — a ring-3 program raises its OWN alert, sheet or toast, and hears the answer.
 // Appended at the file tail so no existing line moves.
 // =================================================================================================
 
@@ -1861,7 +1862,6 @@ mod dialog2_tests {
         assert_eq!(dialog_answer_pack(7, 2) & 0xFFFF, 0x0702);
     }
 }
-=======
 
 // =================================================================================================
 // SETTINGSFILES (rmbp-ledger B407, R98): a program declares its own settings stanza (`app.<name>.*`,

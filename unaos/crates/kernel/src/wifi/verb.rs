@@ -117,6 +117,8 @@ fn join(ssid: Option<&str>, console: &mut Console) {
 
 /// `tests wifi` — the fixture. One verdict line in the brief's shape.
 pub fn selftest() {
+    // WIFI5 (B415): the ladder's state as a line, before the WIFI1 verdict (which returns early).
+    super::ladder::witness();
     let present = radio_present();
     let ucode = if status::ucode_ok() { "ok" } else { "refused" };
     let d11 = if status::d11_up() { "up" } else { "down" };

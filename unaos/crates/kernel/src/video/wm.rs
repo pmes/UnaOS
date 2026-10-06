@@ -2841,7 +2841,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
 /// console happens to paint". The crispy theme will hand the compositor real desktop data; until then
 /// this is the compositor's own theme value that happens to agree — and any drift between the two shows
 /// up instantly, as a visible rectangle where a window used to be.
-pub const DESKTOP_BG: u32 = 0x002D_2B55;
+pub const DESKTOP_BG: u32 = crate::video::theme::DESKTOP_BG;
 
 /// WC-K2 — HAND the given outer boxes to the compositor as DEFERRED DESKTOP DAMAGE. This function
 /// writes no pixel. The desktop fill is published by [`drain_deferred`], at the head of the
@@ -14605,19 +14605,19 @@ fn crispy_witness() {
         theme::CORNER_RADIUS(),
         theme::CONTROL_BOX(),
         theme::GAP(),
-        theme::CHROME_FACE,
-        theme::FRAME_LINE,
-        theme::BEVEL_LIGHT,
-        theme::BEVEL_SHADOW,
-        theme::TITLE_ACTIVE_TOP,
-        theme::TITLE_ACTIVE_BOTTOM,
-        theme::TITLE_INACTIVE_TOP,
-        theme::TITLE_INACTIVE_BOTTOM,
-        theme::TITLE_TEXT_ACTIVE,
-        theme::TITLE_TEXT_INACTIVE,
-        theme::CONTROL_CLOSE,
-        theme::CONTROL_MID,
-        theme::CONTROL_ZOOM,
+        theme::chrome_face(),
+        theme::frame_line(),
+        theme::bevel_light(),
+        theme::bevel_shadow(),
+        theme::title_active_top(),
+        theme::title_active_bottom(),
+        theme::title_inactive_top(),
+        theme::title_inactive_bottom(),
+        theme::title_text_active(),
+        theme::title_text_inactive(),
+        theme::control_close(),
+        theme::control_mid(),
+        theme::control_zoom(),
         theme::GLOSS_TOP_ALPHA_Q16,
         theme::GLOSS_FALLOFF_Q16,
         theme::GLOSS_BOTTOM_ALPHA_Q16,
@@ -14700,9 +14700,9 @@ fn blend_q16(a: u32, b: u32, t: u32) -> u32 {
 pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
     use super::theme;
     let (top, bot) = if focused {
-        (theme::TITLE_ACTIVE_TOP, theme::TITLE_ACTIVE_BOTTOM)
+        (theme::title_active_top(), theme::title_active_bottom())
     } else {
-        (theme::TITLE_INACTIVE_TOP, theme::TITLE_INACTIVE_BOTTOM)
+        (theme::title_inactive_top(), theme::title_inactive_bottom())
     };
     let span = h.saturating_sub(1).max(1);
     let t = ((j.min(span) as u64 * theme::Q16_ONE as u64) / span as u64) as u32;
@@ -14725,7 +14725,7 @@ pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
     if g == 0 {
         base
     } else {
-        blend_q16(base, theme::GLOSS_HIGHLIGHT, g)
+        blend_q16(base, theme::gloss_highlight(), g)
     }
 }
 
@@ -14741,9 +14741,9 @@ pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
 #[inline]
 fn title_ink(focused: bool) -> u32 {
     if focused {
-        super::theme::TITLE_TEXT_ACTIVE
+        super::theme::title_text_active()
     } else {
-        super::theme::TITLE_TEXT_INACTIVE
+        super::theme::title_text_inactive()
     }
 }
 
@@ -20412,7 +20412,7 @@ fn paint_window(
         // (WC-H), still the four-rect subtraction (COMPOSITE-2), and still focus-independent, since
         // the material is a function of the row and nothing else. The cost is per chrome ROW, not
         // per pixel — see `fill_rect_ceramic`.
-        let border = super::theme::CHROME_FACE;
+        let border = super::theme::chrome_face();
         crispy_witness();
         // PHASE31 — CHROMEBAND's own loop begins here. `fill_rect_ceramic` stamps `row=` per
         // machined row, so a wedge in the face fill names the row it stopped on.
@@ -20482,7 +20482,7 @@ fn paint_window(
         // each of `kl`, `bl` and `bs`.
         comp_mark(r.id, mk + PW_FRAME);
         let bev = super::theme::BEVEL();
-        let kl = super::theme::FRAME_LINE;
+        let kl = super::theme::frame_line();
         // CRISPYWIRE-REVIEW — the keyline's THICKNESS is `theme::BEVEL` too, not a literal `1`.
         // `metrics.bevel` is the kit's hairline metric ("iteration 3 makes the bevel a true
         // hairline"), and the keyline is the frame's other hairline; there is no second metric in
@@ -20498,7 +20498,7 @@ fn paint_window(
         fill_rect_v(dst, lbx + bw.saturating_sub(kw), lby, kw, bh, kl);
         // Bevel, inside the keyline. `theme::BEVEL < theme::FRAME` is a const-assert, so these can
         // never reach the strip.
-        let (bl, bs) = (super::theme::BEVEL_LIGHT, super::theme::BEVEL_SHADOW);
+        let (bl, bs) = (super::theme::bevel_light(), super::theme::bevel_shadow());
         fill_rect_v(dst, lbx + kw, lby + kw as isize, bw.saturating_sub(2 * kw), bev, bl);
         fill_rect_v(dst, lbx + kw, lby + kw as isize, bev, bh.saturating_sub(2 * kw), bl);
         fill_rect_v(
@@ -20580,9 +20580,9 @@ fn paint_window(
                 // symbol reads as the surface showing through rather than as a fourth colour. It
                 // invents nothing — see the SHARED-SOURCE note above `ctrl_glyph`.
                 let punch = if focused {
-                    super::theme::TITLE_ACTIVE_TOP
+                    super::theme::title_active_top()
                 } else {
-                    super::theme::TITLE_INACTIVE_TOP
+                    super::theme::title_inactive_top()
                 };
                 //
                 // CERAMIC — the discs are machined too, at `ceramic::CONTROL_GAIN_Q16` (half), so
@@ -20618,9 +20618,9 @@ fn paint_window(
                     // `theme::CTRL_CLOSE` for the provenance, for the reversal, and for why the
                     // kit's three blue steps are kept but no longer painted.
                     let col = match which {
-                        Ctrl::Close => super::theme::CTRL_CLOSE,
-                        Ctrl::Minimise => super::theme::CTRL_MIN,
-                        Ctrl::Zoom => super::theme::CTRL_ZOOM,
+                        Ctrl::Close => super::theme::ctrl_close(),
+                        Ctrl::Minimise => super::theme::ctrl_min(),
+                        Ctrl::Zoom => super::theme::ctrl_zoom(),
                     };
                     let cly = cby as isize - oy as isize;
                     let clx = bxn.saturating_sub(ox);
@@ -21803,9 +21803,9 @@ fn draw_title(
 /// The colours are chosen to be distinguishable from each other AND from [`DESKTOP_BG`], because
 /// telling those three apart at one pixel is the entire verdict.
 #[cfg(feature = "witness")]
-static FV_SURF_A: [u32; 64] = [0x00FF_2020; 64];
+static FV_SURF_A: [u32; 64] = [crate::video::theme::fixture::ROSE; 64];
 #[cfg(feature = "witness")]
-static FV_SURF_B: [u32; 64] = [0x0020_FF20; 64];
+static FV_SURF_B: [u32; 64] = [crate::video::theme::fixture::LIME; 64];
 
 /// FOCUS-VIS — the RAISE-IS-VISIBLE witness. Four legs, each a scan-out READ-BACK at one pixel: the
 /// content origin of two windows placed at the SAME point, so exactly one of them can own that pixel and
@@ -22299,7 +22299,7 @@ fn movevacate_selftest() {
     // is the desktop at every one of them and the rule is byte-identical to the one this replaced.
     // `gone` is the KEYLINE rather than the content colour: these three points are on the old box's
     // OUTER EDGE, so an unerased sliver shows `theme::FRAME_LINE`, not the surface.
-    let (sliver_ok, clean, covered) = vacated_points(&pts, super::theme::FRAME_LINE);
+    let (sliver_ok, clean, covered) = vacated_points(&pts, super::theme::frame_line());
     // Half 1b — and the window is genuinely THERE, at the new origin, rather than the panel having
     // simply gone quiet. Content and kernel-drawn chrome both, since the move re-lays both.
     let new_window = read(ox + STEP + 1, oy + STEP + 1) == a_col
@@ -24456,7 +24456,7 @@ pub fn retile_on_ready() -> usize {
 /// `const` assertion: a fourth move of the metric fails the BUILD rather than turning leg 10 and
 /// the close-box leg into silent SKIPs, which is the exact failure this comment has now recorded
 /// three times.
-static HT_SURF: [u32; FIX_W * FIX_H] = [0x0020_C080; FIX_W * FIX_H];
+static HT_SURF: [u32; FIX_W * FIX_H] = [crate::video::theme::fixture::JADE; FIX_W * FIX_H];
 
 /// The fixture surfaces' SOURCE width, in pixels. Sized from the shipping geometry rather than
 /// picked: it must clear [`CLUSTER_MIN_SRC_W`] (148 px at the current metrics) so that every
@@ -30159,7 +30159,7 @@ pub const FIX_WIDE_W: usize = 448;
 #[cfg(feature = "witness")]
 pub const FIX_WIDE_STRIDE: usize = FIX_WIDE_W * 4;
 #[cfg(feature = "witness")]
-static HT_WIDE: [u32; FIX_WIDE_W * FIX_H] = [0x0020_C080; FIX_WIDE_W * FIX_H];
+static HT_WIDE: [u32; FIX_WIDE_W * FIX_H] = [crate::video::theme::fixture::JADE; FIX_WIDE_W * FIX_H];
 #[cfg(feature = "witness")]
 const _: () = { let m = crate::ui::Metrics::at(crate::video::dpi::S2_MAX, 0); assert!(FIX_WIDE_W >= 5 * m.gap + 3 * m.ctrl_box + m.chrome_cw && FIX_WIDE_W >= FIX_W); };
 /// The width a scale-pinned fixture row uses: `FIX_W`, or the cluster floor when the dpi scale has raised it past.
