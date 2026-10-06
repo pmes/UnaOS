@@ -16735,7 +16735,7 @@ impl XhciController {
             if cc == 1 { alloc::format!("CONFIGURED") } else { alloc::format!("FAILED({})", cc) },
             mps, ival, esit, esithi, avgtrb, down, anon, ptr_slot,
             (id >> 16) & 0xFFFF, id & 0xFFFF, evts,
-            if pass { "PASS" } else { "FAIL" }
+            if pass { "armed" } else { "declined" }
         );
     }
 }

@@ -1771,7 +1771,7 @@ pub fn mirror_service() {
             );
         }
     }
-    mirror_verdict_once(); crate::serial_line::census_poll(); crate::boot_ring::arm_once();
+    serwit2_arm(); crate::serial_line::census_poll(); crate::boot_ring::arm_once();
     // SO29/DRAINCAP — the drain-cap fixture, one-shot, riding this poll for the same reason the
     // SERWIT-2 verdict does: `mirror_service`'s stated contract is IRQs unmasked, no locks held, not
     // a print context, and it is reached on BOTH arches (x86 via `flight_recorder::service`'s first
@@ -3543,4 +3543,20 @@ pub fn residual_drain() {
     {
         let _ = crate::arch::serial::drain_owner();
     }
+}
+
+// BOOTVERDICTS (rmbp-ledger B472, R80) — TAIL-APPENDED. SERWIT-2 is an accounting AUDIT, so it is a test:
+// the first mirror poll REGISTERS `tests serwit2` instead of printing the verdict under the setter (flight
+// 25 printed it at line 215). Under `tests-at-boot` `register` runs it at the old site, as before.
+fn serwit2_arm() {
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    if !ARMED.swap(true, Ordering::AcqRel) {
+        crate::tests::register("serwit2", serwit2_selftest);
+    }
+}
+
+/// `tests serwit2`: the SERWIT-2 conservation verdict over every line the taps have carried so far.
+pub fn serwit2_selftest() {
+    MIRROR_VERDICT_DONE.store(false, Ordering::Relaxed);
+    mirror_verdict_once();
 }

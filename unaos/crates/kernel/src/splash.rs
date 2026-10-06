@@ -757,7 +757,7 @@ pub fn hold_prepare() {
     );
     let ms = crate::arch::ms().saturating_sub(t0);
     *HOLD_SURF.lock() = Some((store, w, h));
-    serial_println!(":: SPLASH: arch={} WxH={}x{} ms={} -> PASS ::", ARCH_NAME, w, h, ms);
+    serial_println!(":: SPLASH: arch={} WxH={}x{} ms={} -> painted ::", ARCH_NAME, w, h, ms);
 }
 
 /// Park the prepared surface as the topmost chromeless row. Called AFTER the desktop-clear and BEFORE the

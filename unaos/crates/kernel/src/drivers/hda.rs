@@ -1213,7 +1213,7 @@ pub fn probe() {
         serial_println!(
             ":: HDA: codecs={} nodes={} dacs={} pins={} path={} -> {} ::",
             ncodecs, total_nodes, total_dacs, total_pins, path_desc,
-            if arc1_ok { "PASS" } else { "FAIL" }
+            if arc1_ok { "armed" } else { "declined" }
         ); #[cfg(feature = "hda-tone")] run_tone(base, &mut rings, iss as u8, chosen.as_ref(), &ws, &mut a); // ARC 2's ONE call site, and the ONLY `hda-tone` statement above this file's arc-2 banner. HERE because the tone must run on a walked controller and before the rings are stopped. FOLDED onto the arc-1 statement's closing line rather than given lines of its own so that arc 1's line numbering is identical with and without arc 2 — the same LINE-NEUTRAL discipline the hook in `drivers/pci.rs` uses, for the same `panic::Location` reason. The append goes BEFORE this line's first `//` (LEDGER P7 — after it the statement is a comment, compiles nothing, and the check stays green).
 
         vol::capture(base, chosen.as_ref(), &ws, &mut rings, &mut a); rings.stop(&mut a); // VOLKEYS: keep the output path

@@ -116,9 +116,9 @@ pub fn witness(ppi: u32) {
     let (gw, gh) = super::text::grid_cell();
     let (pw, ph) = super::panel_info_nonblocking().map_or((0, 0), |i| (i.width, i.height));
     let verdict = match (src, ppi) {
-        ("none", _) => "SKIP reason=no-edid",
-        (_, 0) => "FAIL reason=edid-without-ppi",
-        _ => "PASS",
+        ("none", _) => "skipped reason=no-edid",
+        (_, 0) => "declined reason=edid-without-ppi",
+        _ => "armed",
     };
     serial_println!(
         ":: KFONTPPI: edid_src={} ppi={} scale={} cell={}x{} grid={}x{} -> {} ::",

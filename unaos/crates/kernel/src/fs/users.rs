@@ -2963,7 +2963,7 @@ fn stage_witness(why: &str) {
     serial_println!(
         ":: FIRSTBOOT: stage={} root={} users={} desktop_ignited={} why={} -> {} ::",
         if login { "login-screen" } else { st.word() }, if root_set { "locked" } else { "ROW" }, users, up, why,
-        if (st == BootStage::Installer && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || why == "no-store" { "PASS" } else { "FAIL" }
+        if (st == BootStage::Installer && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || why == "no-store" { "coherent" } else { "incoherent" }
     ); crate::bootpace::boot_line(); // QUIETBOOT M4 (R80): the boot's one measurement, after its first stage line.
 }
 
