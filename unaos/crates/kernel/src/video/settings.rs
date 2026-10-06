@@ -304,7 +304,7 @@ fn change_password() {
         return;
     };
     #[cfg(feature = "login")]
-    { crate::video::crystal::login::open_set_password(n.as_bytes(), false); say("password", "set-password-screen", true); }
+    { let _ = crate::video::crystal::login::open_change_password(n.as_bytes()); say("password", "set-password-screen", true); } // SETTINGSREKEY (B483): the owner's change asks the old password and re-keys the ring
     #[cfg(not(feature = "login"))]
     { let _ = n; say("password", "login-feature-off", false); }
 }
@@ -677,7 +677,8 @@ fn users_delete(name: &str) -> Result<(), &'static str> {
 fn users_reset(name: &str) {
     #[cfg(feature = "login")]
     {
-        crate::video::crystal::login::open_set_password(name.as_bytes(), false);
+        let reset = crate::video::crystal::login::open_change_password(name.as_bytes()); // SETTINGSREKEY (B483): own row = change (old password, ring re-keyed); another's = reset
+        if reset { if let Some(s) = STATE.lock().as_mut() { s.u.msg = alloc::format!("{}: {}", name, crate::video::crystal::login::RESET_LINE); } }
         users_say("reset", name, true, "set-password-screen");
     }
     #[cfg(not(feature = "login"))]
