@@ -9327,12 +9327,14 @@ esp_x86_unafs_card() {
         for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do
             [ -r "${UNAOS_WIFI_FW_PATH}/${fw}" ] || { echo -e "${COLOR_RED}❌ WIFI-FW: ${UNAOS_WIFI_FW_PATH}/${fw} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
         done
-        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- mkdir /FIRMWARE -i "$vol" >/dev/null || {
-            echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs mkdir /FIRMWARE failed — no card image${COLOR_RESET}"; return 1; }
-        for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do
-            cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${UNAOS_WIFI_FW_PATH}/${fw}" /FIRMWARE -i "$vol" >/dev/null || {
-                echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs put ${fw} failed — no card image${COLOR_RESET}"; return 1; }
-        done
+        # FWSTAGE (bench, 2026-10-06, the first run with a real bunker): the single-file `put` creates the entry and refuses an
+        # existing name ("File already exists" on the first file), so the three go in as ONE DIRECTORY source — the directory
+        # form lands its contents in /FIRMWARE (made with its parents) and REPLACES what is there (tools/unafs put, ROOTDISK2).
+        local fwdir="${WORKSPACE_DIR}/target/wifi-fw"
+        rm -rf "$fwdir"; mkdir -p "$fwdir"
+        for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do cp "${UNAOS_WIFI_FW_PATH}/${fw}" "$fwdir/"; done
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$fwdir" /FIRMWARE -i "$vol" >/dev/null || {
+            echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs put target/wifi-fw -> /FIRMWARE failed — no card image${COLOR_RESET}"; return 1; }
         echo -e "${COLOR_YELLOW}⚡ WIFI-FW: b43 set (3 files) from ${UNAOS_WIFI_FW_PATH} onto the UnaFS root at /FIRMWARE/ (bench-only, never in-tree)${COLOR_RESET}"
     fi
     # WIFI-FW (R95/Peter 2026-10-06 "we have the bunker for this"): the BCM4331 b43 firmware set is BENCH-ONLY and never
