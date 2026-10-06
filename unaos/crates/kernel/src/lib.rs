@@ -314,3 +314,5 @@ pub mod origin;
 pub mod sync;
 // SMALLFIX3 (rmbp-ledger B416): the fold's unique-code checks, the fixture arcs for `tests list` / `help tests`, `tests smallfix3`. Tail statement.
 pub mod smallfix3;
+// SHELLTASK (rmbp-ledger B458): the shell's dispatch on its own task; the render task composes only. Tail statement.
+pub mod shelltask;

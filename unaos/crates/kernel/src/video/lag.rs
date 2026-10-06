@@ -834,7 +834,7 @@ fn sec_roll(now_ms: u64) {
         );
     }
     if stall && desk {
-        let n = STALL_LINES.fetch_add(1, Relaxed);
+        let n = STALL_LINES.fetch_add(1, Relaxed); if r[1] / 1000 >= STALL_MS { HANDLER_STALLS.fetch_add(1, Relaxed); } // SHELLTASK (B458): a render-handler stall second, counted
         if n < STALL_LINES_FREE || n % 64 == 0 {
             let (dw, pr) = if split == 0 {
                 (alloc::string::String::from("-"), alloc::string::String::from("-"))
@@ -1017,4 +1017,12 @@ fn seg_take() -> (&'static str, u64, &'static str, u64) {
     let (h, hu) = seg_unpack(SEC_SEG.swap(0, Relaxed), &SEG_NAMES);
     let (p, pu) = seg_unpack(SEC_PUMP.swap(0, Relaxed), &PUMP_NAMES);
     (h, hu, p, pu)
+}
+
+// SHELLTASK (rmbp-ledger B458) — the render-handler stall seconds at the desktop (`[lag] stall … render=handler`
+// class: the render task held over STALL_MS inside a handler — the shell on the render task was the flown cause).
+static HANDLER_STALLS: AtomicU32 = AtomicU32::new(0);
+/// Render-handler stall seconds since boot (`tests shelltask` reads the delta across a running verb).
+pub fn handler_stalls() -> u32 {
+    HANDLER_STALLS.load(Relaxed)
 }
