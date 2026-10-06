@@ -1202,10 +1202,20 @@ pub mod loginitems;
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod dialog;
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub mod toast;
+pub mod toast; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod notify; // NOTIFY (B418, MACPARITY row 24): the stack, the Center, the bell's count — the toast's queue grows into it. Same-line fold, code before comment.
 // BEZEL (B405, MACPARITY row 26): the brightness / volume bezel — a compositor draw (the toast's row), armed by the keys. Same gate as brightkeys; at the tail so no line above moves.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod bezel;
 // PANICSCREEN (B406, MACPARITY row 37, R95): the plain panic screen, the panic log, the restart. At the tail so no line above moves.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod panicscreen;
+
+/// NOTIFY (B418): post a notification from anywhere (a driver, the net stack, the panic marker) — QUEUE ONLY, no heap,
+/// no `wm`; a no-op on a build without the notification module. `act` is a `notify::ACT_*` code (0 = no button).
+#[allow(unused_variables)]
+pub fn notify(app: &[u8], title: &[u8], line: &[u8], label: &[u8], act: u8, arg: &[u8]) -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    return notify::post_full(app, title, line, label, act, arg);
+    #[allow(unreachable_code)]
+    false
+}

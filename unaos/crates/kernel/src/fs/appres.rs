@@ -625,3 +625,36 @@ pub fn selftest() {
         if lumen_seen { "staged" } else { "absent" }, root_attrs, SIGHTS.load(Ordering::Relaxed), DRAWN.load(Ordering::Relaxed));
 }
 
+
+/// NOTIFY (B418): draw the icon of app `key` (a built-in or a sighted program) at `(x, y)`, `size` square, into a
+/// `stride`-wide surface of `h` rows — the GENERIC icon when the key names no known program (a notification always
+/// carries an icon). Never waits on a lock; `false` when nothing was drawn (a lock was held: the caller's fallback).
+pub fn blit_key_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: usize, size: usize, key: &str) -> bool {
+    let blit = |argb: &[u32], px: &mut [u32]| {
+        for r in 0..size.min(h.saturating_sub(y)) {
+            for c in 0..size.min(stride.saturating_sub(x)) {
+                let d = &mut px[(y + r) * stride + x + c];
+                *d = over(argb[r * size + c], *d);
+            }
+        }
+    };
+    if with_pix(key, size, |argb| blit(argb, px)).is_some() {
+        return true;
+    }
+    if let Some(p) = PIX.try_lock() {
+        if let Some(g) = p.iter().find(|p| p.key == "generic" && p.size == size) {
+            blit(&g.argb, px);
+            return true;
+        }
+    }
+    let g = app_from_block("generic", "builtin:generic", "builtin", GENERIC, "builtin");
+    let Some(argb) = render(&g, size) else { return false };
+    blit(&argb, px);
+    if let Some(mut p) = PIX.try_lock() {
+        if p.len() >= 64 {
+            p.remove(0);
+        }
+        p.push(Pix { key: String::from("generic"), size, argb });
+    }
+    true
+}
