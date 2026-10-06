@@ -677,6 +677,8 @@ fn dec_task(arg: usize) {
     dec_ran(jid);
     dec_beat(STAGE_DEMUX);
     let opened = audio_core::Decoder::open(alloc::boxed::Box::new(VfsSrc { path: path.clone(), off: 0 }));
+    #[cfg(all(feature = "wc", feature = "videoplayer"))]
+    let opened = opened.or_else(|e| crate::video::vplay::container_audio(&path).map(audio_core::Decoder::from_source).ok_or(e)); // VIDEOPLAYER (B434): a WebM's Vorbis track (demux_core packets → audio_core::vorbis), when audio_core reads no container
     let mut dec = match opened {
         Ok(d) => d,
         Err(e) => {
