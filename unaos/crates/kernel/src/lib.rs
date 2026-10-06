@@ -325,3 +325,6 @@ pub mod smallfix5;
 pub mod serialdoor;
 // HIDSTALL (rmbp-ledger B485, R103): the pointer's halt, stall and dock-release counters and `tests hidstall`. Tail statement.
 pub mod hidstall;
+// LOADERSTALL (rmbp-ledger B490): the loader's stage record read back — `:: LOADER:` and `tests loader`. Tail statement.
+#[cfg(target_arch = "x86_64")]
+pub mod loaderstage;

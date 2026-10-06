@@ -483,7 +483,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
             .map_or((0, 0), |m| (m.columns(), m.rows()));
         (cc, cr, wc, wr, n)
     });
-    log::info!("CON cur={}x{} wide={}x{} n={}", cur_c, cur_r, wide_c, wide_r, mode_n);
+    log::info!("CON cur={}x{} wide={}x{} n={}", cur_c, cur_r, wide_c, wide_r, mode_n); #[cfg(target_arch = "x86_64")] let _loader_watchdog = stages::start(tsc_loader_entry); // LOADERSTALL (B490): stage `firmware` ends; the watchdog is closed on every return (Drop) and before exit_boot_services.
 
     // Boot-time diagnostics (UNAOS_BOOTDIAG=1 → `bootdiag` feature). Additive and OFF by default
     // (byte-identical boot logs when off). Runs here — while boot services are live and before any
@@ -689,7 +689,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
         };
         fb_addr = fb_ptr;
         fb_size = fb_bytes;
-    }
+    } #[cfg(target_arch = "x86_64")] stages::gop(fb_addr, fb_size, fb_info); // LOADERSTALL: stage `gop` ends; the panel lines start.
 
     // Open the filesystem on the SAME device this bootloader image was loaded from. A real machine
     // exposes many SimpleFileSystem volumes (internal ESP, recovery, our USB stick, ...), and the
@@ -712,7 +712,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
             None => return boot_fail(fb_addr, fb_size, Status::LOAD_ERROR, "kernel.elf is not a regular file"),
         },
         Err(e) => return boot_fail(fb_addr, fb_size, e.status(), "open kernel.elf (missing on our volume?)"),
-    };
+    }; #[cfg(target_arch = "x86_64")] stages::volumes(); // LOADERSTALL: stage `volumes` ends.
 
     let mut file_info_buf = [0u8; 128];
     let file_info = match kernel_file.get_info::<uefi::proto::media::file::FileInfo>(&mut file_info_buf) {
@@ -737,10 +737,10 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
     };
 
     let kernel_buffer = unsafe { core::slice::from_raw_parts_mut(kernel_buffer_ptr.as_ptr(), kernel_size) };
-    if let Err(e) = kernel_file.read(kernel_buffer) {
+    if let Err(e) = { #[cfg(target_arch = "x86_64")] let r = stages::read_kernel(&mut kernel_file, kernel_buffer); #[cfg(not(target_arch = "x86_64"))] let r = kernel_file.read(kernel_buffer); r } { // LOADERSTALL: x86 reads in 1 MiB chunks, a failed chunk retried
         log::error!("Failed to read kernel.elf: {:?}", e);
         return Status::LOAD_ERROR;
-    } #[cfg(target_arch = "x86_64")] let tsc_loader_read: u64 = unsafe { core::arch::x86_64::_rdtsc() }; // BOOTCLOCK stamp 2 of 3 — the TSC once `kernel.elf` is in RAM. `tsc_loader_read - tsc_loader_entry` is the loader's OPEN+READ of the whole image (3.8 MB off the rMBP's SD slot on the bench, one volume in QEMU), which is the term A12 nominates as the plausible growth: the file gets bigger every arc and nothing has ever timed the read. Stamped after the error arm, so a failed read never produces a stamp at all. LINE-NEUTRAL fold on the closing brace, x86-gated — see the fold note on `fn main`.
+    } #[cfg(target_arch = "x86_64")] let tsc_loader_read: u64 = unsafe { core::arch::x86_64::_rdtsc() }; #[cfg(target_arch = "x86_64")] stages::end(stages::KERNEL, kernel_size as u32); // BOOTCLOCK stamp 2 of 3 — the TSC once `kernel.elf` is in RAM. `tsc_loader_read - tsc_loader_entry` is the loader's OPEN+READ of the whole image (3.8 MB off the rMBP's SD slot on the bench, one volume in QEMU), which is the term A12 nominates as the plausible growth: the file gets bigger every arc and nothing has ever timed the read. Stamped after the error arm, so a failed read never produces a stamp at all. LINE-NEUTRAL fold on the closing brace, x86-gated — see the fold note on `fn main`.
 
     let elf = match xmas_elf::ElfFile::new(kernel_buffer) {
         Ok(elf) => elf,
@@ -898,7 +898,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
         );
     }
 
-    let entry_point = elf.header.pt2.entry_point() - min_vaddr + load_base;
+    let entry_point = elf.header.pt2.entry_point() - min_vaddr + load_base; #[cfg(target_arch = "x86_64")] stages::end(stages::ELF, 0); // LOADERSTALL: stage `elf` ends.
 
     #[allow(unused_mut)]
     let mut dtb_addr = 0;
@@ -967,7 +967,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
             "boot volume FAT serial unavailable: {} — installer boot-device guard will disarm",
             bvs_reason
         );
-    }
+    } #[cfg(target_arch = "x86_64")] stages::end(stages::DISCOVER, boot_volume_serial); // LOADERSTALL: stage `discover` ends.
 
     let boot_info = alloc::boxed::Box::new(BootInfo {
         framebuffer_addr: fb_addr,
@@ -986,7 +986,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
         edid_block,
         edid_block_valid,
         edid_total_len,
-        boot_volume_serial, #[cfg(target_arch = "x86_64")] tsc_loader_entry, #[cfg(target_arch = "x86_64")] tsc_loader_read, #[cfg(target_arch = "x86_64")] tsc_loader_jump: 0, // BOOTCLOCK: stamps 1 and 2 ride the initialiser; stamp 3 is written into the leaked struct after `exit_boot_services`, exactly like `igpu_trace_2` below, so it is seeded 0 here. 0 is also the ABSENT sentinel the kernel prints as `absent`, which is what a pre-BOOTCLOCK `bootloader.efi` sitting on old boot media will produce. LINE-NEUTRAL fold, x86-gated — see the fold note on `fn main`.
+        boot_volume_serial, #[cfg(target_arch = "x86_64")] tsc_loader_entry, #[cfg(target_arch = "x86_64")] tsc_loader_read, #[cfg(target_arch = "x86_64")] tsc_loader_jump: 0, #[cfg(target_arch = "x86_64")] loader_stages: unaos_boot_info::LoaderStages::EMPTY, // BOOTCLOCK: stamps 1 and 2 ride the initialiser; stamp 3 is written into the leaked struct after `exit_boot_services`, exactly like `igpu_trace_2` below, so it is seeded 0 here. 0 is also the ABSENT sentinel the kernel prints as `absent`, which is what a pre-BOOTCLOCK `bootloader.efi` sitting on old boot media will produce. LINE-NEUTRAL fold, x86-gated — see the fold note on `fn main`.
         #[cfg(feature = "unaos_ivb")]
         igpu_trace_0: t0,
         #[cfg(feature = "unaos_ivb")]
@@ -1054,7 +1054,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
         boot_info_static.igpu_trace_1 = unsafe { read_igpu_trace() };
         log::info!("iGPU trace 1 (pre-EBS) collected.");
     }
-
+    #[cfg(target_arch = "x86_64")] stages::jumping(); // LOADERSTALL: the `jumping` line, the watchdog closed, before boot services go.
     let memory_map = unsafe { boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
 
     #[cfg(feature = "unaos_ivb")]
@@ -1092,7 +1092,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
     #[cfg(target_arch = "aarch64")]
     let kernel_entry: extern "C" fn(&'static mut BootInfo) -> ! = unsafe {
         core::mem::transmute(entry_point as usize)
-    }; #[cfg(target_arch = "x86_64")] { boot_info_static.tsc_loader_jump = unsafe { core::arch::x86_64::_rdtsc() }; } // BOOTCLOCK stamp 3 of 3 — the last instruction before the `transmute`d jump. `tsc_loader_jump - tsc_loader_read` covers ELF load + relocation, the I-cache maintenance, ACPI/EDID/boot-volume discovery, the memory-map walk and `exit_boot_services`. Written into the LEAKED struct (boot services are already gone; no allocation happens here) for the same reason `igpu_trace_2` is. LINE-NEUTRAL fold on the aarch64 `let`'s closing brace, x86-gated — see the fold note on `fn main`.
+    }; #[cfg(target_arch = "x86_64")] { boot_info_static.tsc_loader_jump = unsafe { core::arch::x86_64::_rdtsc() }; boot_info_static.loader_stages = stages::close(boot_info_static.tsc_loader_jump); } // BOOTCLOCK stamp 3 of 3 — the last instruction before the `transmute`d jump. `tsc_loader_jump - tsc_loader_read` covers ELF load + relocation, the I-cache maintenance, ACPI/EDID/boot-volume discovery, the memory-map walk and `exit_boot_services`. Written into the LEAKED struct (boot services are already gone; no allocation happens here) for the same reason `igpu_trace_2` is. LINE-NEUTRAL fold on the aarch64 `let`'s closing brace, x86-gated — see the fold note on `fn main`.
 
     kernel_entry(boot_info_static);
 }
@@ -1532,3 +1532,5 @@ pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
     }
 }
 
+// LOADERSTALL (rmbp-ledger B490): the loader's own lines and stage record — x86 only, so the aarch64 loader does not move.
+#[cfg(target_arch = "x86_64")] mod stages;
