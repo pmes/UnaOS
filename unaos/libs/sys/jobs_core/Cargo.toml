@@ -1,0 +1,14 @@
+[package]
+name = "jobs_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Jobs core (UNAOSVOLUME, rmbp-ledger B427): the record model of the jobs on the UnaOS volume — STATUS.tsv, the ledgers and the queues as typed records, their byte-identical export, verify and the query translation. Shared by Mica (Ring 3, the writer) and the kernel (the reader)."
+
+# The `midden_core` shape: `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies, a member of the
+# root host workspace, pulled by the kernel as a path dep with `default-features = false`.
+[dependencies]
+
+[features]
+default = ["std"]
+std = []
