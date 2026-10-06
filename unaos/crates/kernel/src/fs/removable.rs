@@ -204,7 +204,7 @@ fn reconcile() {
         gone
     };
     for v in gone.iter() {
-        serial_println!("[volumes] unmounted /volumes/{} reason=detached slot={} ::", v.name, v.slot_id);
+        serial_println!("[volumes] unmounted /volumes/{} reason=detached slot={} ::", v.name, v.slot_id); crate::video::notify(b"quarry", b"Disk ejected", alloc::format!("{} was removed", v.name).as_bytes(), b"", 0, b""); // NOTIFY (B418): the detach is a notification
         changed = true;
     }
     REFUSED.lock().retain(|(s, n)| live.iter().any(|(_, d)| d.slot_id == *s && d.num_blocks == *n));
@@ -232,7 +232,7 @@ fn reconcile() {
                     "[volumes] mounted /volumes/{} source={} slot={} fs={} removable=1 ::",
                     uniq, src.name(), d.slot_id, kind
                 );
-                MOUNTED.lock().push(RemVol { ix: *ix, slot_id: d.slot_id, num_blocks: d.num_blocks, name: uniq, fs: kind });
+                crate::video::notify(b"quarry", b"Disk mounted", alloc::format!("{} is in Volumes", uniq).as_bytes(), b"Open", 2, alloc::format!("{}/{}", crate::fs::bootdisk::VOLUMES, uniq).as_bytes()); MOUNTED.lock().push(RemVol { ix: *ix, slot_id: d.slot_id, num_blocks: d.num_blocks, name: uniq, fs: kind }); // NOTIFY (B418): the mount is a notification, `Open` = Quarry at the volume
                 changed = true;
             }
             Err(e) => {
@@ -245,7 +245,7 @@ fn reconcile() {
                         "[volumes] mounted /volumes/{} source={} slot={} fs=exfat removable=1 ::",
                         uniq, src.name(), d.slot_id
                     );
-                    MOUNTED.lock().push(RemVol { ix: *ix, slot_id: d.slot_id, num_blocks: d.num_blocks, name: uniq, fs: "exfat" });
+                    crate::video::notify(b"quarry", b"Disk mounted", alloc::format!("{} is in Volumes", uniq).as_bytes(), b"Open", 2, alloc::format!("{}/{}", crate::fs::bootdisk::VOLUMES, uniq).as_bytes()); MOUNTED.lock().push(RemVol { ix: *ix, slot_id: d.slot_id, num_blocks: d.num_blocks, name: uniq, fs: "exfat" }); // NOTIFY (B418)
                     changed = true;
                     continue;
                 }

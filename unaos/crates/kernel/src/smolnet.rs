@@ -631,6 +631,7 @@ fn dhcp_apply(stack: &mut SmolStack, cidr: Ipv4Cidr, router: Option<Ipv4Address>
         CURRENT_DNS.store(u32::from_be_bytes([o[0], o[1], o[2], o[3]]), Ordering::Relaxed);
     }
     let addr = cidr.address().octets();
+    crate::video::notify(b"system", b"Network connected", alloc::format!("Address {}.{}.{}.{} (DHCP lease)", addr[0], addr[1], addr[2], addr[3]).as_bytes(), b"", 0, b""); // NOTIFY (B418): NETCLOCK's lease is a notification
     serial_println!(
         ":: SOCK-5: smoltcp dhcpv4 lease {}.{}.{}.{}/{} gw {} — witness OK ::",
         addr[0], addr[1], addr[2], addr[3], cidr.prefix_len(),
