@@ -909,7 +909,7 @@ mod tests {
     use super::*;
     use alloc::string::ToString;
 
-    /// Produced by `principia::prefs::PrefStore::to_toml` (the `toml` crate's pretty serializer behind
+    /// Produced by `principia::prefs::PrefStore::to_toml` (once the `toml` crate's pretty serializer behind; since PRINCIPIAFILES B445 this crate's own emitter —
     /// Principia's header) for the tree in [`golden_tree`]; the principia test
     /// `prefs_core_accepts_every_to_toml_output` re-derives it live on every run.
     const PRINCIPIA_GOLDEN: &str = include_str!("../tests/principia_golden.toml");

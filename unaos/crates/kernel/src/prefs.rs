@@ -4,13 +4,13 @@
 //! CHARTER: Principia — shared-core
 //!
 //! PREFS (rmbp-ledger B300; AUDIT B287, R79) — the kernel reads and writes PRINCIPIA'S preference store.
-//! There is ONE store: `<home>/.config/unaos/preferences.toml`, the file `handlers/principia` owns on the
+//! There is ONE store (since R98 the `<home>/settings/` folder below; PRINCIPIAFILES B445 put Principia on it), the one `handlers/principia` owns on the
 //! host, in Principia's format (one TOML table per namespace, dotted keys, four scalar types). The value
 //! model and the codec are `unaos/libs/sys/prefs_core` — the same crate Principia links — so the two rings
 //! cannot drift: what the kernel writes, Principia reads unchanged, and the reverse (the cross-tests in
-//! `handlers/principia/src/prefs.rs` pin it). Before this file the kernel kept `<home>/.settings` and
-//! `<home>/.dock`, two private stores in two private formats; their reading is DELETED (a one-shot import
-//! on first load is the only thing that still opens them, and it deletes them: `[prefs] migrated=<n>`).
+//! `handlers/principia/src/prefs.rs` pin it). Before this file the kernel kept two private stores in two
+//! private formats in the home; their one-shot import ran at every login from B300 to B445 and is RETIRED
+//! (PRINCIPIAFILES, ARCHREVIEW F1): no kernel code opens them any more.
 //!
 //! # SETTINGSFILES (B407, R98) — the store is a FOLDER of files, one per domain
 //!
@@ -168,7 +168,7 @@ pub fn domain_path(d: &str) -> String {
 
 /// The single file before R98 (Principia's path), migrated ONCE into the domain files and deleted.
 pub fn legacy_path() -> String {
-    alloc::format!("{}/.config/unaos/preferences.toml", base())
+    alloc::format!("{}/{}", base(), prefs_core::files::LEGACY)
 }
 
 // ── VFS helpers (mount table, kernel principal) ─────────────────────────────────────────────────
@@ -247,11 +247,7 @@ fn by_of(d: &str) -> String {
     if let Some(b) = *BY.lock() {
         return String::from(b);
     }
-    if prefs_core::files::SYSTEM_DOMAINS.contains(&d) {
-        String::from(prefs_core::files::pane_of(d))
-    } else {
-        alloc::format!("the program {}", d)
-    }
+    prefs_core::files::writer_of(d)
 }
 
 fn now_iso() -> String {
@@ -386,7 +382,6 @@ fn load() {
     } else if clamped > 0 {
         let _ = save();
     }
-    migrate();
 }
 
 /// PREFSKERNEL M3: values the last load clamped into their schema range.
@@ -433,64 +428,6 @@ fn watch_deleted() -> Vec<String> {
         serial_println!("[prefs] settings/{} absent -> defaults (deleted by the user) keys={}", d, keys.len());
     }
     gone
-}
-
-// ── The one-shot import of the two retired private stores ───────────────────────────────────────
-
-/// `<home>/.settings` (`key=value`) and `<home>/.dock` (a name per line), if either still exists: every
-/// key the tree does not already hold is imported, the files are DELETED, the tree is saved. Their
-/// reading exists only here, and only until they are gone.
-fn migrate() {
-    let b = base();
-    let (sp, dp) = (alloc::format!("{}/.settings", b), alloc::format!("{}/.dock", b));
-    let (st, dt) = (read_all(&sp), read_all(&dp));
-    if st.is_none() && dt.is_none() {
-        return;
-    }
-    let mut n = 0u32;
-    {
-        let mut t = TREE.lock();
-        let mut put = |k: &str, v: PrefValue| {
-            if t.get(NS, k).is_none() && t.set(NS, k, v).is_ok() {
-                n += 1;
-            }
-        };
-        if let Some(text) = st.as_deref().and_then(|s| core::str::from_utf8(s).ok()) {
-            for line in text.lines() {
-                let Some((k, v)) = line.split_once('=') else { continue };
-                let (k, v) = (k.trim(), v.trim());
-                let num = v.parse::<i64>().ok();
-                match (k, num) {
-                    ("brightness", Some(x)) => put(key::BRIGHTNESS, PrefValue::Int(x)),
-                    ("volume", Some(x)) => put(key::VOLUME, PrefValue::Int(x)),
-                    ("mute", Some(x)) => put(key::MUTE, PrefValue::Bool(x != 0)),
-                    ("idle_min", Some(x)) => put(key::IDLE_MIN, PrefValue::Int(x)),
-                    ("pointer", Some(x)) => put(key::POINTER, PrefValue::Int(x)),
-                    ("tab", Some(x)) => put(key::SETTINGS_TAB, PrefValue::Int(x)),
-                    ("wallpaper", _) => put(key::WALLPAPER, PrefValue::Str(String::from(v))),
-                    _ => {}
-                }
-            }
-        }
-        if let Some(text) = dt.as_deref().and_then(|s| core::str::from_utf8(s).ok()) {
-            let names: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-            if !names.is_empty() {
-                put(key::DOCK_PINS, PrefValue::Str(names.join(",")));
-            }
-        }
-    }
-    let saved = save();
-    if saved.is_ok() {
-        let mt = crate::shell::vfs_mount_table();
-        let k = crate::fs::vfs::KERNEL_PRINCIPAL;
-        if st.is_some() {
-            let _ = mt.unlink(&sp, k);
-        }
-        if dt.is_some() {
-            let _ = mt.unlink(&dp, k);
-        }
-    }
-    serial_println!("[prefs] migrated={} from={}{} deleted={}", n, if st.is_some() { ".settings " } else { "" }, if dt.is_some() { ".dock" } else { "" }, saved.is_ok() as u8);
 }
 
 // ── Save ─────────────────────────────────────────────────────────────────────────────────────

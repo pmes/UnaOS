@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn missing_key_is_an_in_chat_error_naming_the_fix() {
         let dir = tempfile::tempdir().unwrap();
-        let slot = ProviderSlot::load_from(&dir.path().join("preferences.toml"), none);
+        let slot = ProviderSlot::load_from(&dir.path().join("settings"), none);
         assert_eq!(
             slot.status_line(),
             ":: BRAIN :: NO PROVIDER :: set ANTHROPIC_API_KEY, or choose a provider in Settings\n\n"
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn reads_the_vein_namespace_from_principias_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("preferences.toml");
+        let path = dir.path().join("settings");
         let mut store = PrefStore::empty(&path);
         store.set("vein", "provider", PrefValue::Str("gemini".into())).unwrap();
         store.set("vein", "gemini.auth", PrefValue::Str("api_key".into())).unwrap();
@@ -352,7 +352,7 @@ mod tests {
         let slot = ProviderSlot::load_from(&path, |k| (k == "MY_GEMINI").then(|| "g-key".to_string()));
         assert_eq!(slot.status_line(), ":: BRAIN :: ONLINE (gemini / gemini-test-model)\n\n");
         // The key is never written to the preference file.
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("g-key"));
+        assert!(!std::fs::read_to_string(path.join("vein")).unwrap().contains("g-key"));
 
         let slot = ProviderSlot::load_from(&path, none);
         assert_eq!(slot.status_line(), ":: BRAIN :: NO PROVIDER :: set MY_GEMINI, or choose a provider in Settings\n\n");
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn claudecode_is_selected_by_the_pref_and_needs_no_key() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("preferences.toml");
+        let path = dir.path().join("settings");
         let mut store = PrefStore::empty(&path);
         store.set("vein", "provider", PrefValue::Str("claudecode".into())).unwrap();
         let bin = dir.path().join("no-such-claude");
@@ -403,7 +403,7 @@ mod tests {
         let bin = dir.path().join("claude");
         std::fs::write(&bin, script).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = dir.path().join("preferences.toml");
+        let path = dir.path().join("settings");
         let mut store = PrefStore::empty(&path);
         store.set("vein", "provider", PrefValue::Str("claudecode".into())).unwrap();
         store.set("vein", "claudecode.bin", PrefValue::Str(bin.display().to_string())).unwrap();
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn settings_dropdown_writes_go_through_principia() {
         let dir = tempfile::tempdir().unwrap();
-        let mut p = principia::Principia::with_config_dir(dir.path());
+        let mut p = principia::Principia::with_home(dir.path());
         let writes = gneiss_pal::api::menu_choice_prefs("default (claudecode)").unwrap();
         for (key, value) in writes.iter().cloned() {
             let reply = p.process_impulse(&SMessage::Principia(PrincipiaCommand::PrefSet {
@@ -479,7 +479,7 @@ mod tests {
             let reply = reply.expect("a set is answered");
             assert!(is_vein_pref_change(&reply), "{reply:?}");
         }
-        let slot = ProviderSlot::load_from(&dir.path().join("preferences.toml"), none);
+        let slot = ProviderSlot::load_from(&dir.path().join("settings"), none);
         assert_eq!(slot.status(), "ONLINE (claudecode / default)");
         let get = |k: &str| p.prefs().get("vein", k);
         assert_eq!(gneiss_pal::api::probe_provider(get, none), slot.status());
@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn embed_slot_defaults_off_and_says_so() {
         let dir = tempfile::tempdir().unwrap();
-        let slot = EmbedSlot::load_from(&dir.path().join("preferences.toml"), none);
+        let slot = EmbedSlot::load_from(&dir.path().join("settings"), none);
         assert_eq!(
             slot.status_line(),
             ":: BRAIN :: EMBED off/none dims=0\n:: BRAIN :: RECALL OFF :: no embedder — set vein.embed.provider\n\n"

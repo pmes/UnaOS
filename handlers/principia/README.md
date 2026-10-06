@@ -53,17 +53,23 @@ the tree is missing from the table.
 
 ### File format
 
-`~/.config/unaos/preferences.toml` (resolved via `dirs::config_dir()`): one TOML
-table per namespace, dotted keys expanded into sub-tables. It is meant to be
-readable and hand-editable.
+`~/settings/<domain>` (resolved via `dirs::home_dir()`; PRINCIPIAFILES, rmbp-ledger
+B445): the SAME folder the kernel reads and writes, one human-readable TOML file per
+domain (`display`, `login`, `desktop`, `sound`, `trackpad`, `general`, or the
+program's own: `vein`, `aether`, `app.<name>.*` -> `<name>`). The domain rule, the
+split and the text are `prefs_core::files`; every file is parsed by
+`prefs_core::PrefTree::parse`, the kernel's reader. A set rewrites only its
+domain's file (`<domain>.new`, fsync, read back, rename). The pre-R98
+`~/.config/unaos/preferences.toml` is migrated once and deleted.
 
 ```toml
+# settings/aether — UnaOS settings, one file per domain (R98). ...
+# auto-saved 2026-10-06T12:00:00Z by the program aether
+
 [aether]
 homepage = "https://una.os/"
-
-[aether.window]
-height = 800
-width = 1280
+window.height = 800
+window.width = 1280
 ```
 
 Because a key expands into TOML tables, a key cannot be both a value and a
@@ -100,13 +106,13 @@ All carried on `SMessage::Principia(PrincipiaCommand)`:
 `principia::ignite(synapse)` subscribes and serves the loop. When a caller needs
 to fire commands immediately after spawning, `principia::serve(synapse, rx,
 handler)` takes a receiver the caller subscribed *before* the spawn, so nothing
-in between is missed. `Principia::with_config_dir(dir)` opens the handler against
-an explicit config lobe (tests, and any future multi-profile boot).
+in between is missed. `Principia::with_home(dir)` opens the handler against
+an explicit home (tests, and any future multi-profile boot).
 
 ### Queued
 
 - **Live update on external change.** Principia is the writer of record; an edit
-  made to `preferences.toml` underneath a running Principia is not noticed until
+  made to a `settings/<domain>` file underneath a running Principia is not noticed until
   the next load. A file watcher that reloads and emits `PrefChanged` per delta
   is the follow-up.
 - **The GUI surface.** Settings are served but have no face yet; a quartzite
