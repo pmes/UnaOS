@@ -74,9 +74,22 @@ pub const USER_CODE_SEL: u16 = 0x23;
 /// more cores.
 pub const MAX_CPUS: usize = 8;
 
-/// Per-CPU double-fault IST stack size. The handler only prints and panics, but `{:#?}`
-/// formatting of the stack frame wants some headroom, so give it 8 KiB.
-const IST_STACK_SIZE: usize = 4096 * 2;
+/// Per-CPU NMI / #DB / #MC IST stack size (leaf, GS-free handlers): 8 KiB usable.
+pub const IST_STACK_SIZE: usize = 4096 * 2;
+/// STACKGUARD2 (B403): the #DF IST is 32 KiB usable. A task overflow leaves it within ~200 bytes
+/// (`stackguard::on_kernel_fault` moves RSP to the dead task's slab); a FATAL #DF runs the panic path
+/// (panic_screen + fbcon + ftdi + the formatter) on it, which today fits the 32 KiB render task.
+/// The guard page under it cannot triple-fault (#DF delivery loads the mapped IST TOP); a #DF handler
+/// that still ran into it re-enters #DF and `stackguard` halts the core on its depth count.
+pub const DF_STACK_SIZE: usize = 4096 * 8;
+/// STACKGUARD2: every IST stack is page-aligned with an UNMAPPED 4 KiB guard page under it
+/// (`stackguard::arm_cpu`), so an IST overflow faults instead of writing the neighbour's stack.
+pub const IST_GUARD: usize = 4096;
+#[repr(C, align(4096))]
+pub struct IstStack<const N: usize> {
+    pub guard: [u8; IST_GUARD],
+    pub stack: [u8; N],
+}
 
 /// One CPU's segmentation control block. Kept small (the IST stacks live in a separate static
 /// so this array stays compact). `code_selector`/`tss_selector` are retained for the upcoming
@@ -108,8 +121,11 @@ static mut CPUS: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
 /// Per-CPU IST stacks: `NUM_IST` per CPU (kept out of `PerCpu` so that struct stays small).
 /// Index 0 = double fault, index 1 = NMI (see `DOUBLE_FAULT_IST_INDEX` / `NMI_IST_INDEX`).
 /// 8 KiB × NUM_IST × MAX_CPUS in `.bss`.
-static mut IST_STACKS: [[[u8; IST_STACK_SIZE]; NUM_IST]; MAX_CPUS] =
-    [[[0; IST_STACK_SIZE]; NUM_IST]; MAX_CPUS];
+/// STACKGUARD2: slot 0 (#DF) lives in `DF_STACKS`; `IST_STACKS[cpu][k]` holds slot k (1..=3; [0] unused).
+static mut IST_STACKS: [[IstStack<IST_STACK_SIZE>; NUM_IST]; MAX_CPUS] =
+    [const { [const { IstStack { guard: [0; IST_GUARD], stack: [0; IST_STACK_SIZE] } }; NUM_IST] }; MAX_CPUS];
+static mut DF_STACKS: [IstStack<DF_STACK_SIZE>; MAX_CPUS] =
+    [const { IstStack { guard: [0; IST_GUARD], stack: [0; DF_STACK_SIZE] } }; MAX_CPUS];
 
 /// Build and load this CPU's GDT + TSS. `cpu_index` selects the per-CPU block: the BSP passes
 /// 0; each AP passes the logical index it was assigned at discovery. Runs once per CPU, early
@@ -134,12 +150,12 @@ pub fn init_cpu(cpu_index: usize) {
         // 1. Point this CPU's IST entries at its own dedicated IST stacks (top = base + size).
         //    Slot 0 = double fault, slot 1 = NMI, slot 2 = #DB, slot 3 = #MC — separate stacks so a
         //    fault taken while another IST handler runs cannot scribble the other's frame.
-        let df_stack = &raw const IST_STACKS[cpu_index][DOUBLE_FAULT_IST_INDEX as usize];
-        let nmi_stack = &raw const IST_STACKS[cpu_index][NMI_IST_INDEX as usize];
-        let db_stack = &raw const IST_STACKS[cpu_index][DB_IST_INDEX as usize];
-        let mc_stack = &raw const IST_STACKS[cpu_index][MC_IST_INDEX as usize];
+        let df_stack = &raw const DF_STACKS[cpu_index].stack;
+        let nmi_stack = &raw const IST_STACKS[cpu_index][NMI_IST_INDEX as usize].stack;
+        let db_stack = &raw const IST_STACKS[cpu_index][DB_IST_INDEX as usize].stack;
+        let mc_stack = &raw const IST_STACKS[cpu_index][MC_IST_INDEX as usize].stack;
         (*cpu).tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-            VirtAddr::from_ptr(df_stack) + IST_STACK_SIZE as u64;
+            VirtAddr::from_ptr(df_stack) + DF_STACK_SIZE as u64;
         (*cpu).tss.interrupt_stack_table[NMI_IST_INDEX as usize] =
             VirtAddr::from_ptr(nmi_stack) + IST_STACK_SIZE as u64;
         (*cpu).tss.interrupt_stack_table[DB_IST_INDEX as usize] =
@@ -211,10 +227,28 @@ pub fn set_privilege_stack0(cpu_index: usize, rsp: u64) {
 /// its own CPU), so checking membership in any CPU's NMI stack is enough to witness the IST switch.
 pub fn rsp_in_nmi_ist(rsp: u64) -> bool {
     for cpu in 0..MAX_CPUS {
-        let base = unsafe { &raw const IST_STACKS[cpu][NMI_IST_INDEX as usize] } as u64;
+        let base = unsafe { &raw const IST_STACKS[cpu][NMI_IST_INDEX as usize].stack } as u64;
         if rsp > base && rsp <= base + IST_STACK_SIZE as u64 {
             return true;
         }
     }
     false
 }
+
+// ── STACKGUARD2 (rmbp-ledger B403): the IST stacks' bounds for `stackguard` ─────────────────────────────
+
+/// `(guard page, usable lo, usable top)` of `cpu`'s IST slot `k` (0 = #DF, 1 = NMI, 2 = #DB, 3 = #MC).
+pub fn ist_bounds(cpu: usize, k: usize) -> Option<(u64, u64, u64)> {
+    if cpu >= MAX_CPUS || k >= NUM_IST {
+        return None;
+    }
+    let (g, n) = if k == DOUBLE_FAULT_IST_INDEX as usize {
+        (unsafe { &raw const DF_STACKS[cpu] } as u64, DF_STACK_SIZE)
+    } else {
+        (unsafe { &raw const IST_STACKS[cpu][k] } as u64, IST_STACK_SIZE)
+    };
+    Some((g, g + IST_GUARD as u64, g + (IST_GUARD + n) as u64))
+}
+
+/// The number of IST slots per CPU.
+pub const IST_SLOTS: usize = NUM_IST;

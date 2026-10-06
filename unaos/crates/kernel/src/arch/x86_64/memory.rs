@@ -4703,3 +4703,9 @@ unsafe fn ovf_map(s: usize, k: usize, pages: usize, on: bool) {
     }
     bump_as_gen(); // SMPBAL-X86: the leaf edits above are core-local
 }
+
+/// STACKGUARD2 (rmbp-ledger B403): `[start, end)` of the `Reserved` UEFI descriptor holding `addr` (the
+/// bootloader writes one region per descriptor, unmerged), or `None`. The BSP's firmware stack lives in one.
+pub fn stackguard_reserved_region(addr: u64) -> Option<(u64, u64)> {
+    REGIONS.get()?.iter().find(|r| r.kind == MemoryRegionKind::Reserved && r.phys_start <= addr && addr < r.phys_start + r.page_count * 4096).map(|r| (r.phys_start, r.phys_start + r.page_count * 4096))
+}

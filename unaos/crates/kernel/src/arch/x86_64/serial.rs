@@ -273,7 +273,7 @@ pub fn drain_owner() -> u64 {
         return 0;
     }
     let t0 = crate::arch::now_cycles();
-    if let Some(mut guard) = SERIAL1.try_lock() {
+    if let Some(mut guard) = SERIAL1.try_lock() { let _own = crate::lockowner::own(crate::lockowner::UART); // STACKGUARD2 (B403): the holder (this drain runs IF=1)
         if let Some(uart) = guard.as_mut() {
             let mut sink = |s: &str| {
                 crate::serial_ring::tx_note_bytes(s.len());
@@ -422,4 +422,11 @@ pub fn pfwire_selftest() -> ! {
     // Unreachable: the store above faults into `page_fault_handler`, which never returns. Kept so the
     // `-> !` signature holds even if the optimizer cannot prove the store faults.
     crate::hlt_loop()
+}
+
+// ── STACKGUARD2 (rmbp-ledger B403) ───────────────────────────────────────────────────────────────────────
+
+/// Force-release `SERIAL1` — only from the overflow path, when `lockowner` names the dead task its holder.
+pub fn lockowner_release() {
+    unsafe { SERIAL1.force_unlock() };
 }

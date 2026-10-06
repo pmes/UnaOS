@@ -791,7 +791,7 @@ enum Attempt<R> {
 /// `Busy` is RESTARTED — see [`with_unafs`]'s restart loop and [`TXN_BUSY_ATTEMPTS`].
 fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R> {
     crate::arch::without_interrupts(|| {
-        let mut guard = MOUNT.lock();
+        let mut guard = MOUNT.lock(); let _own = crate::lockowner::own(crate::lockowner::UNAFS); // STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
         // UNAFSTXN: open the attempt's contention window, INSIDE the hold. Clearing it before the
         // acquire would be an SMP bug: a core waiting on `MOUNT` would wipe the latch belonging to
         // the transaction currently running under it. Under the lock the flag is serialized with
@@ -2867,4 +2867,20 @@ fn handle_write_multi(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Resul
 /// BOOT80: the read-ahead window the bound handle's device runs with (0 = none; the `tests boot80` line).
 pub fn ra_window_bound() -> u64 {
     mount_bound_handle().map(ra_window).unwrap_or(0)
+}
+
+// ── STACKGUARD2 (rmbp-ledger B403): the mount a stack-overflowed transaction took with it ─────────────────
+
+/// Force-release `MOUNT` and LEAK the bound instance — only from the overflow path, when `lockowner` names the
+/// dead task its holder. Not dropped: `Drop` writes the in-RAM metadata back, and a transaction that died mid-way
+/// leaves that metadata half-done. Copy-on-write: the medium is consistent at the last root flip, so the next
+/// `with_unafs` re-binds from it.
+pub fn lockowner_release() {
+    unsafe { MOUNT.force_unlock() };
+    crate::arch::without_interrupts(|| {
+        if let Some(m) = MOUNT.lock().take() {
+            core::mem::forget(m);
+        }
+    });
+    TXN_BUSY.store(false, Ordering::Relaxed);
 }

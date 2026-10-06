@@ -1257,3 +1257,9 @@ pub fn selftest2() {
     );
     crate::tests::tally(pass);
 }
+
+/// STACKGUARD2 (rmbp-ledger B403): the BSP's boot-stack top `_start` recorded (0 = not recorded).
+#[cfg(target_arch = "x86_64")]
+pub fn boot_stack_top() -> u64 {
+    BOOT_TOP.load(Relaxed)
+}

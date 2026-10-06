@@ -304,3 +304,6 @@ pub mod flightring;
 
 // WINDOWCAP3 (rmbp-ledger B399, R90): `SlotVec` — per-address-space sidecars keyed by slot, heap-grown, no `[_; USER_SLOTS]`. Tail statement, so no existing line moves.
 pub mod procslot;
+
+// STACKGUARD2 (rmbp-ledger B403): the holder registry a stack-overflowed task's locks are released from. Tail statement, so no existing line moves.
+pub mod lockowner;
