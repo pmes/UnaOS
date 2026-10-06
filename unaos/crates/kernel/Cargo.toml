@@ -3868,6 +3868,9 @@ amber_core = { path = "../../libs/sys/amber_core", default-features = false }
 # STORMFAULT (rmbp-ledger B351, R79): the ring-3 ELF segment plan — bss tails, PT_GNU_STACK, the args page,
 # the window edge, and the fault line's seg= classifier — the SAME crate the host tests link. no_std, zero deps.
 elf_core = { path = "../../libs/sys/elf_core" }
+# TYPECORE (rmbp-ledger B450, R79): the one extension-to-MIME table, the built-in sniff order and the ELF split —
+# `fs/filetype.rs` reads it, and so does the host's `libs/bandy`. no_std, no allocator; depends only on elf_core.
+type_core = { path = "../../libs/sys/type_core" }
 # SELFBUILD6 (B360): the dynamic loader core (`linuxabi/ldso.rs` fulfils its Space over the process VMAs; the host runner
 # `ldrun` runs the same core). no_std + alloc, no deps; `default-features = false` drops the host runner binary.
 ldso_core = { path = "../../libs/sys/ldso_core", default-features = false }

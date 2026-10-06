@@ -13,3 +13,5 @@ chrono = "0.4"
 anyhow = "1.0.104"
 tokio = { version = "1.53", features = ["sync", "rt", "macros"] }
 async-channel = "2.5.0"
+# TYPECORE (rmbp-ledger B450, R79): the one extension-to-MIME table the kernel's fs/filetype.rs reads too.
+type_core = { path = "../../unaos/libs/sys/type_core" }
