@@ -25,8 +25,10 @@
 //! Wire: `[appres] sighted <path> volume=<v> trust=<root|foreign>` (appres), `[apptrust] ask prog=<p> file=<f>
 //! volume=<v> posted=<0|1>`, `[apptrust] answer=<open|copy|cancel> prog=<p>`, `[apptrust] open prog=<p>
 //! granted=session`, `[apptrust] copy <src> -> <dst> registrant=<yes|no>` (or `refused=<why>`), and `tests apptrust`
-//! → `:: APPTRUST: foreign=listed registrant=refused asked=once copied=registrant -> PASS ::`.
-//! Design: `docs/dev/evidence/rmbp-1005/apptrust.md`.
+//! → `:: APPTRUST: foreign=listed registrant=refused asked=once copied=registrant rebind=asked icon=root launch=asked
+//! copy=rootacl -> PASS ::` (APPTRUST2 B478: the grant binds volume, path and stamp — `[apptrust] grant volume= path=
+//! stamp=`; a direct launch asks — `[apptrust] launch prog= -> ask`; Copy to Apps writes `via=rootacl`).
+//! Design: `docs/dev/evidence/rmbp-1005/apptrust.md`, `apptrust2.md`.
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -174,18 +176,37 @@ fn leaf(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
 }
 
-/// **Copy to Apps**: the administrator's act that makes a foreign program a registrant. Asks
-/// `users::admin_authority` (R100), refuses an existing `/apps/<leaf>` (never overwrites), copies the bytes as the
-/// kernel, then sights the copy (a ROOT sight: cached, published in `una:apps`). Returns the copy's path.
+/// APPTRUST2 (B478): the principal Copy to Apps writes as — the logged-in session's `user:<name>` when ROOTACL
+/// (B456) calls it the administrator (`rootacl::admin_principal`, R100); otherwise the copy is refused.
+pub fn copy_principal() -> Result<String, &'static str> {
+    let mut nb = [0u8; crate::fs::users::NAME_MAX];
+    let Some(n) = crate::fs::users::whoami(&mut nb) else { return Err("no-admin-session") };
+    let name = core::str::from_utf8(&nb[..n]).map_err(|_| "no-admin-session")?;
+    let p = alloc::format!("user:{}", name);
+    if crate::fs::rootacl::admin_principal(&p) { Ok(p) } else { Err("not-admin") }
+}
+
+/// **Copy to Apps**: the administrator's act that makes a foreign program a registrant. APPTRUST2 (B478): the
+/// write goes through ROOTACL's `/apps` writer — `create`/`write` run as the administrator's session principal
+/// ([`copy_principal`]) and `rootacl::write_verdict` decides; no administrator session → refused with the alert.
+/// Refuses an existing `/apps/<leaf>` (never overwrites), then sights the copy (a ROOT sight: cached, published in
+/// `una:apps`). Returns the copy's path.
 pub fn copy_to_apps(mt: &MountTable, src: &str) -> Result<String, &'static str> {
     let say = |why: &'static str| {
-        serial_println!("[apptrust] copy {} -> {}/{} refused={}", src, APPS_DIR, leaf(src), why);
+        serial_println!("[apptrust] copy {} -> {}/{} refused={} via=rootacl", src, APPS_DIR, leaf(src), why);
         why
     };
     if !is_foreign(mt, src) {
         return Err(say("not-foreign"));
     }
-    crate::fs::users::admin_authority("apptrust-copy").map_err(say)?;
+    let who = match copy_principal() {
+        Ok(p) => p,
+        Err(why) => {
+            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+            let _ = crate::video::dialog::refused(crate::video::dialog::WHAT_SYSTEM_FILES, b"Copy to Apps needs the administrator's session (log in as the administrator)");
+            return Err(say(why));
+        }
+    };
     let st = mt.stat(src).map_err(|_| say("no-source"))?;
     if !matches!(st.kind, NodeKind::File) {
         return Err(say("not-a-file"));
@@ -198,13 +219,13 @@ pub fn copy_to_apps(mt: &MountTable, src: &str) -> Result<String, &'static str> 
     if bytes.len() as u64 != st.size {
         return Err(say("short-read"));
     }
-    mt.create(&dst, NodeKind::File, KERNEL_PRINCIPAL).map_err(|_| say("create"))?;
-    if mt.write(&dst, 0, &bytes, KERNEL_PRINCIPAL).map(|n| n != bytes.len()).unwrap_or(true) {
-        let _ = mt.unlink(&dst, KERNEL_PRINCIPAL);
+    mt.create(&dst, NodeKind::File, &who).map_err(|e| say(if matches!(e, crate::fs::vfs::VfsError::Denied) { "rootacl-denied" } else { "create" }))?;
+    if mt.write(&dst, 0, &bytes, &who).map(|n| n != bytes.len()).unwrap_or(true) {
+        let _ = mt.unlink(&dst, &who);
         return Err(say("write"));
     }
     let reg = crate::fs::appres::sight_in(mt, &dst).map(|a| a.doctypes.iter().all(|m| crate::fs::assoc::registrants_in(mt, m).iter().any(|r| r.opener == dst))).unwrap_or(false);
-    serial_println!("[apptrust] copy {} -> {} bytes={} registrant={}", src, dst, bytes.len(), if reg { "yes" } else { "no" });
+    serial_println!("[apptrust] copy {} -> {} bytes={} registrant={} via=rootacl principal={}", src, dst, bytes.len(), if reg { "yes" } else { "no" }, who);
     Ok(dst)
 }
 
@@ -379,10 +400,17 @@ pub fn selftest() {
     crate::fs::appres::forget(fpath);
     crate::fs::appres::forget(rpath);
 
-    let ok = foreign_ok && refused && asked != "FAIL" && copied != "refused";
-    serial_println!(":: APPTRUST: foreign={} registrant={} asked={} copied={} -> {} :: classify={} volume={} planted={} asks={} grants={}",
-        if foreign_ok { "listed" } else { "MISSING" }, if refused { "refused" } else { "ACCEPTED" }, asked, copied,
-        if ok { "PASS" } else { "FAIL" }, classify, vol, planted, ASKS.load(Ordering::Relaxed), GRANTS.lock().len());
+    // APPTRUST2 (B478): rebind / icon / launch / copy.
+    let rebind = rebind_probe();
+    let icon = crate::fs::appres::icon_probe();
+    let launch = launch_probe(&mt);
+    let (copy, copy_admin) = copy_probe(&mt);
+    GRANTS.lock().retain(|g| !g.path.starts_with("/volumes/apptrust-probe/"));
+
+    let ok = foreign_ok && refused && asked != "FAIL" && copied != "refused" && rebind != "FAIL" && icon == "root" && launch != "FAIL" && copy != "REFUSED";
+    serial_println!(":: APPTRUST: foreign={} registrant={} asked={} copied={} rebind={} icon={} launch={} copy={} -> {} :: classify={} volume={} planted={} asks={} grants={} copy_admin={}",
+        if foreign_ok { "listed" } else { "MISSING" }, if refused { "refused" } else { "ACCEPTED" }, asked, copied, rebind, icon, launch, copy,
+        if ok { "PASS" } else { "FAIL" }, classify, vol, planted, ASKS.load(Ordering::Relaxed), GRANTS.lock().len(), copy_admin);
 }
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
@@ -414,6 +442,72 @@ fn ask_once(fpath: &str) -> &'static str {
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn ask_once(_fpath: &str) -> &'static str {
     "skip"
+}
+
+/// `rebind`: a grant at a path whose stamp/volume is not the program's now is dropped and the ask is posted again.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn rebind_probe() -> &'static str {
+    use crate::video::dialog::{self, Answer};
+    if dialog::is_up() {
+        return "skip";
+    }
+    let p3 = "/volumes/apptrust-probe/PROBE3.ELF";
+    let was = dialog::headless(true);
+    let a0 = ASKS.load(Ordering::Relaxed);
+    GRANTS.lock().push(Grant { path: String::from(p3), bind: Bind { vol: Some(1), stamp: String::from("0:1") } });
+    let r = request(Ask { prog: String::from(p3), file: String::from("/tmp/probe.txt"), mime: String::from(PROBE_MIME), volume: String::from("apptrust-probe") });
+    dialog::open_now();
+    dialog::answer(Answer::Default);
+    let ok = !r && ASKS.load(Ordering::Relaxed) - a0 == 1 && !granted(p3) && take_pending().is_none();
+    dialog::headless(was);
+    if ok { "asked" } else { "FAIL" }
+}
+
+/// `launch`: the direct-launch door asks for a foreign program (Cancel) and lets a root one through unasked.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn launch_probe(mt: &MountTable) -> &'static str {
+    use crate::video::dialog::{self, Answer};
+    if dialog::is_up() {
+        return "skip";
+    }
+    let was = dialog::headless(true);
+    let a0 = ASKS.load(Ordering::Relaxed);
+    let r = launch_gate(mt, "/volumes/apptrust-probe/PROBE4.ELF");
+    dialog::open_now();
+    dialog::answer(Answer::Default);
+    let root = launch_gate(mt, "/apps/APTPROBE.ELF");
+    let ok = !r && root && ASKS.load(Ordering::Relaxed) - a0 == 1 && take_pending().is_none();
+    dialog::headless(was);
+    if ok { "asked" } else { "FAIL" }
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn rebind_probe() -> &'static str {
+    "skip"
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn launch_probe(mt: &MountTable) -> &'static str {
+    if launch_gate(mt, "/volumes/apptrust-probe/PROBE4.ELF") { "FAIL" } else { "refused" }
+}
+
+/// `copy`: Copy to Apps' writer is ROOTACL's — with an administrator session a file is created and written under
+/// `/apps` as that principal (and `anon` is refused there); without one, [`copy_principal`] refuses (the copy is).
+/// `("rootacl" | "REFUSED", detail)`.
+fn copy_probe(mt: &MountTable) -> (&'static str, String) {
+    let p = match copy_principal() {
+        Ok(p) => p,
+        Err(why) => return ("rootacl", alloc::format!("none({})", why)),
+    };
+    const F: &str = "/apps/APTCOPY.TMP";
+    const G: &str = "/apps/APTANON.TMP";
+    let _ = mt.unlink(F, KERNEL_PRINCIPAL);
+    let _ = mt.unlink(G, KERNEL_PRINCIPAL);
+    let made = mt.create(F, NodeKind::File, &p).is_ok() && mt.write(F, 0, b"apptrust2", &p).is_ok();
+    let anon = matches!(mt.create(G, NodeKind::File, "anon"), Err(crate::fs::vfs::VfsError::Denied));
+    let _ = mt.unlink(G, KERNEL_PRINCIPAL);
+    let _ = mt.unlink(F, KERNEL_PRINCIPAL);
+    (if made { "rootacl" } else { "REFUSED" }, alloc::format!("{} anon={}", p, if anon { "refused" } else { "ADMITTED" }))
 }
 
 /// `tests apptrust` registration, once (rides `appres::ensure_tests`).
